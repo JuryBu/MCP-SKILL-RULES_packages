@@ -78,13 +78,13 @@ npm run build
 
 ## 配置
 
-在 `~/.gemini/antigravity/mcp_config.json` 中添加：
+在 `<MCP工具安装路径>/mcp_config.json` 中添加：
 
 ```json
 {
   "memory-store": {
     "command": "node",
-    "args": ["C:\\Users\\Stardust\\.gemini\\antigravity\\mcp-memory-store\\dist\\index.js"],
+    "args": ["C:\\Users\\<用户名>\\.gemini\\antigravity\\mcp-memory-store\\dist\\index.js"],
     "env": {},
     "disabled": false
   }
