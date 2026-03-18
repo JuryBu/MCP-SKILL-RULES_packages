@@ -1,0 +1,33 @@
+{
+  "name": "web-fetcher-mcp-server",
+  "version": "1.0.0",
+  "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rimraf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^25.0.0",
+    "playwright": "^1.49.0",
+    "sharp": "^0.34.5",
+    "turndown": "^7.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.10.0",
+    "@types/sharp": "^0.31.1",
+    "@types/turndown": "^5.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

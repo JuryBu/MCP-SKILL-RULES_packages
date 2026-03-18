@@ -1,0 +1,298 @@
+import { execSync } from "child_process";
+import fs from "fs";
+
+/**
+ * MCP Sandbox 环境探测器
+ * 
+ * 启动时探测一次，缓存到内存：
+ * - conda 环境列表
+ * - Python 系统版本和路径
+ * - Node.js 版本和路径
+ * - Git Bash（bash language 条件可用）
+ * - CUDA 信息（nvidia-smi）
+ * - DirectML 检测
+ */
+
+export interface CondaEnv {
+    name: string;
+    path: string;
+    pythonVersion: string;
+}
+
+export interface EnvironmentInfo {
+    conda: {
+        available: boolean;
+        envs: CondaEnv[];
+    };
+    python: {
+        available: boolean;
+        version: string;
+        path: string;
+    };
+    node: {
+        available: boolean;
+        version: string;
+        path: string;
+    };
+    bash: {
+        available: boolean;
+        path: string;
+    };
+    cuda: {
+        available: boolean;
+        version: string;
+        vramTotalMB: number;
+        vramUsedMB: number;
+        driverVersion: string;
+    };
+    directML: boolean;
+}
+
+// 缓存的环境信息
+let cachedEnvInfo: EnvironmentInfo | null = null;
+
+/**
+ * 安全执行命令，返回 stdout 或 null
+ */
+function safeExec(cmd: string, timeoutMs: number = 5000): string | null {
+    try {
+        return execSync(cmd, {
+            encoding: "utf-8",
+            timeout: timeoutMs,
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+        }).trim();
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * 探测 conda 环境
+ */
+function detectConda(): EnvironmentInfo["conda"] {
+    const result: EnvironmentInfo["conda"] = { available: false, envs: [] };
+
+    const jsonStr = safeExec("conda env list --json", 10000);
+    if (!jsonStr) return result;
+
+    try {
+        const data = JSON.parse(jsonStr);
+        result.available = true;
+
+        if (Array.isArray(data.envs)) {
+            for (const envPath of data.envs) {
+                const name = envPath.includes("envs")
+                    ? envPath.split(/[/\\]envs[/\\]/)[1] || "base"
+                    : "base";
+
+                // 尝试获取 Python 版本
+                const pythonPath = process.platform === "win32"
+                    ? `${envPath}\\python.exe`
+                    : `${envPath}/bin/python`;
+                const pyVer = safeExec(`"${pythonPath}" --version`, 3000);
+                const version = pyVer?.replace("Python ", "") || "unknown";
+
+                result.envs.push({ name, path: envPath, pythonVersion: version });
+            }
+        }
+    } catch { /* JSON 解析失败 */ }
+
+    return result;
+}
+
+/**
+ * 探测系统 Python
+ */
+function detectPython(): EnvironmentInfo["python"] {
+    const result: EnvironmentInfo["python"] = { available: false, version: "", path: "" };
+
+    const version = safeExec("python --version");
+    if (version) {
+        result.available = true;
+        result.version = version.replace("Python ", "");
+        const pyPath = safeExec("python -c \"import sys; print(sys.executable)\"");
+        result.path = pyPath || "python";
+    }
+
+    return result;
+}
+
+/**
+ * 探测 Node.js
+ */
+function detectNode(): EnvironmentInfo["node"] {
+    const result: EnvironmentInfo["node"] = { available: false, version: "", path: "" };
+
+    const version = safeExec("node --version");
+    if (version) {
+        result.available = true;
+        result.version = version.replace("v", "");
+        const nodePath = safeExec("node -e \"console.log(process.execPath)\"");
+        result.path = nodePath || "node";
+    }
+
+    return result;
+}
+
+/**
+ * 探测 Git Bash（bash language 条件可用）
+ */
+async function detectBash(): Promise<EnvironmentInfo["bash"]> {
+    const result: EnvironmentInfo["bash"] = { available: false, path: "" };
+
+    if (process.platform !== "win32") {
+        // Linux/macOS 原生支持 bash
+        const bashPath = safeExec("which bash");
+        if (bashPath) {
+            result.available = true;
+            result.path = bashPath;
+        }
+        return result;
+    }
+
+    // Windows: 检测 Git Bash
+    const commonPaths = [
+        "C:\\Program Files\\Git\\bin\\bash.exe",
+        "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+    ];
+
+    for (const p of commonPaths) {
+        if (fs.existsSync(p)) {
+            result.available = true;
+            result.path = p;
+            return result;
+        }
+    }
+
+    // 尝试 where bash
+    const bashPath = safeExec("where bash");
+    if (bashPath) {
+        result.available = true;
+        result.path = bashPath.split("\n")[0].trim();
+    }
+
+    return result;
+}
+
+/**
+ * 探测 CUDA/GPU
+ */
+function detectCuda(): EnvironmentInfo["cuda"] {
+    const result: EnvironmentInfo["cuda"] = {
+        available: false,
+        version: "",
+        vramTotalMB: 0,
+        vramUsedMB: 0,
+        driverVersion: "",
+    };
+
+    // nvidia-smi 方式
+    const smiOutput = safeExec(
+        "nvidia-smi --query-gpu=driver_version,memory.total,memory.used --format=csv,noheader,nounits",
+        5000
+    );
+
+    if (smiOutput) {
+        result.available = true;
+        const parts = smiOutput.split(",").map(s => s.trim());
+        if (parts.length >= 3) {
+            result.driverVersion = parts[0];
+            result.vramTotalMB = parseInt(parts[1]) || 0;
+            result.vramUsedMB = parseInt(parts[2]) || 0;
+        }
+
+        // 获取 CUDA 版本
+        const cudaVer = safeExec("nvidia-smi --query-gpu=driver_version --format=csv,noheader");
+        // 从完整输出中尝试提取 CUDA 版本
+        const fullOutput = safeExec("nvidia-smi");
+        if (fullOutput) {
+            const cudaMatch = fullOutput.match(/CUDA Version:\s*([\d.]+)/);
+            if (cudaMatch) {
+                result.version = cudaMatch[1];
+            }
+        }
+    }
+
+    return result;
+}
+
+/**
+ * 探测 DirectML
+ */
+function detectDirectML(): boolean {
+    // 检查是否有 AMD/Intel GPU 且支持 DirectML
+    const dxdiag = safeExec("dxdiag /t C:/tmp/dxdiag.txt", 10000);
+    // 简化：检查 Python ort 是否有 DirectML
+    const result = safeExec(
+        'python -c "import onnxruntime; print(\'DmlExecutionProvider\' in onnxruntime.get_available_providers())"',
+        5000
+    );
+    return result === "True";
+}
+
+/**
+ * 执行环境探测（启动时调用一次）
+ */
+export async function detectEnvironment(): Promise<EnvironmentInfo> {
+    if (cachedEnvInfo) return cachedEnvInfo;
+
+    console.error("[sandbox] 开始环境探测...");
+    const startTime = Date.now();
+
+    const info: EnvironmentInfo = {
+        conda: detectConda(),
+        python: detectPython(),
+        node: detectNode(),
+        bash: await detectBash(),
+        cuda: detectCuda(),
+        directML: detectDirectML(),
+    };
+
+    cachedEnvInfo = info;
+
+    const elapsed = Date.now() - startTime;
+    console.error(`[sandbox] 环境探测完成 (${elapsed}ms): python=${info.python.available} node=${info.node.available} conda=${info.conda.available} cuda=${info.cuda.available} bash=${info.bash.available}`);
+
+    return info;
+}
+
+/**
+ * 获取缓存的环境信息
+ */
+export function getCachedEnvInfo(): EnvironmentInfo | null {
+    return cachedEnvInfo;
+}
+
+/**
+ * 根据 env 参数获取正确的解释器路径
+ * @param env 格式: "conda:名称" / "venv:路径"
+ * @param language 语言
+ * @returns 解释器绝对路径，或 null 使用默认
+ */
+export function resolveInterpreter(env: string | undefined, language: string): string | null {
+    if (!env) return null;
+
+    if (env.startsWith("conda:")) {
+        const envName = env.slice(6);
+        const condaInfo = cachedEnvInfo?.conda;
+        if (condaInfo?.available) {
+            const found = condaInfo.envs.find(e => e.name === envName);
+            if (found) {
+                return process.platform === "win32"
+                    ? `${found.path}\\python.exe`
+                    : `${found.path}/bin/python`;
+            }
+        }
+        return null;
+    }
+
+    if (env.startsWith("venv:")) {
+        const venvPath = env.slice(5);
+        return process.platform === "win32"
+            ? `${venvPath}\\Scripts\\python.exe`
+            : `${venvPath}/bin/python`;
+    }
+
+    return null;
+}

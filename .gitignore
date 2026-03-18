@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Build output (uncomment if you want to track dist/)
+# dist/
+
+# IDE specific
+.idea/
+.vscode/
+*.sw?
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Dev files
+Plan_*.md
+Task.md
+
+# Data directories (user-specific, not shareable)
+memory-store/
+sandbox-data/
+mcp-web-fetcher/data/
+**/cookies/
+**/temp/
+*.cookie
+*.session
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
