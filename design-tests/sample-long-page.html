@@ -1,0 +1,39 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Portable Codex Toolkit Long Page Smoke Test</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 0; line-height: 1.65; color: #20242a; }
+    header { background: #0f5f4a; color: white; padding: 40px 8vw; }
+    main { padding: 32px 8vw; max-width: 920px; }
+    section { margin: 0 0 36px; }
+    .note { border-left: 6px solid #f28c28; padding: 16px 20px; background: #fff7ee; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Portable Codex 工具包测试页</h1>
+    <p>用于验证 web-fetcher 的正文提取、截图和摘要能力。</p>
+  </header>
+  <main>
+    <section>
+      <h2>背景</h2>
+      <p>这个页面没有外部资源，适合在离线或半离线环境里做基础 smoke test。</p>
+    </section>
+    <section>
+      <h2>测试内容</h2>
+      <p>页面包含标题、正文、提示块和足够的垂直高度，用于确认正文抽取和截图是否稳定。</p>
+      <div class="note">如果工具能读到这句话，说明本地 HTML 读取路径基本正常。</div>
+    </section>
+    <section>
+      <h2>长页面段落</h2>
+      <p>第一段：Codex 通过 MCP 调用工具时，应返回可理解、可追踪的结果。</p>
+      <p>第二段：本地工具包默认把数据放在用户目录下的独立数据根，避免污染安装目录。</p>
+      <p>第三段：测试结果不要求完全一致，但应能证明 endpoint、工具注册和基本 I/O 工作正常。</p>
+    </section>
+  </main>
+</body>
+</html>
+
+

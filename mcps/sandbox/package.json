@@ -1,0 +1,36 @@
+﻿{
+    "name": "sandbox-mcp-server",
+    "version": "1.13.1",
+    "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
+    "type": "module",
+    "main": "dist/index.js",
+    "scripts": {
+        "start": "node dist/index.js",
+        "dev": "tsx watch src/index.ts",
+        "build": "tsc",
+        "clean": "rimraf dist"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "dependencies": {
+        "@modelcontextprotocol/sdk": "^1.6.1",
+        "fuse.js": "^7.3.0",
+        "pidusage": "^3.0.2",
+        "web-tree-sitter": "^0.26.8",
+        "zod": "^3.23.8"
+    },
+    "devDependencies": {
+        "@types/node": "^22.10.0",
+        "@types/pidusage": "^2.0.5",
+        "tree-sitter-cli": "^0.26.8",
+        "tree-sitter-javascript": "^0.25.0",
+        "tree-sitter-python": "^0.25.0",
+        "tree-sitter-typescript": "^0.23.2",
+        "tsx": "^4.19.2",
+        "typescript": "^5.7.2"
+    }
+}
+
+
+

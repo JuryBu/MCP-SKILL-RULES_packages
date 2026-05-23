@@ -1,0 +1,50 @@
+{
+  "name": "memory-store-mcp-server",
+  "version": "1.14.0",
+  "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、三链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "test": "npm run test:chain-schema && npm run test:ls-model-defaults && npm run test:model-bridge && npm run test:model-bridge-claude-code && npm run test:record-generator-codex && npm run test:record-generator-coverage && npm run test:record-generator-parallel && npm run test:record-update-snapshot && npm run test:record-generator-phase-count && npm run test:background-tasks-progress && npm run test:codex-client && npm run test:claude-code-client && npm run test:codex-deep-locate && npm run test:codex-attachments && npm run test:conversation-context-probe && npm run test:conversation-list-fast-only && npm run test:conversation-attachments && npm run test:record-ownership && npm run test:record-reader && npm run test:record-reader-tools && npm run test:stage-guard-self-reference && npm run test:stage-guard-evidence && npm run test:stage-guard-evidence-index",
+    "test:chain-schema": "tsx tests/chain-schema.test.ts",
+    "test:ls-model-defaults": "tsx tests/ls-model-defaults.test.ts",
+    "test:model-bridge": "tsx tests/model-bridge.test.ts",
+    "test:model-bridge-claude-code": "tsx tests/model-bridge-claude-code.test.ts",
+    "test:record-generator-codex": "tsx tests/record-generator-codex.test.ts",
+    "test:record-generator-coverage": "tsx tests/record-generator-coverage.test.ts",
+    "test:record-generator-parallel": "tsx tests/record-generator-parallel.test.ts",
+    "test:record-update-snapshot": "tsx tests/record-update-snapshot.test.ts",
+    "test:record-generator-phase-count": "tsx tests/record-generator-phase-count.test.ts",
+    "test:background-tasks-progress": "tsx tests/background-tasks-progress.test.ts",
+    "test:codex-client": "tsx tests/codex-client.test.ts",
+    "test:claude-code-client": "tsx tests/claude-code-client.test.ts",
+    "test:codex-deep-locate": "tsx tests/codex-deep-locate.test.ts",
+    "test:codex-attachments": "tsx tests/codex-attachments.test.ts",
+    "test:conversation-context-probe": "tsx tests/conversation-context-probe.test.ts",
+    "test:conversation-list-fast-only": "tsx tests/conversation-list-fast-only.test.ts",
+    "test:conversation-attachments": "tsx tests/conversation-attachments.test.ts",
+    "test:record-ownership": "tsx tests/record-ownership.test.ts",
+    "test:record-reader": "tsx tests/record-reader.test.ts",
+    "test:record-reader-tools": "tsx tests/record-reader-tools.test.ts",
+    "test:stage-guard-self-reference": "tsx tests/guard-engine-self-reference.test.ts",
+    "test:stage-guard-evidence": "tsx tests/guard-engine-evidence.test.ts",
+    "test:stage-guard-evidence-index": "tsx tests/guard-evidence-index.test.ts",
+    "clean": "rimraf dist"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "fuse.js": "^7.0.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

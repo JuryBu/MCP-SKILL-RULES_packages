@@ -1,0 +1,278 @@
+﻿# MCP Memory Store v1.14.0
+
+AI 主动记忆管理系统 + 三链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
+
+## 功能
+
+- **多工作区记忆管理**：按工作区隔离，支持跨工作区发现
+- **三级搜索引擎** (v1.10+)：exact（多词分词AND）/ fuzzy（Fuse.js）/ smart（Flash语义）/ auto（exact→fuzzy fallback），覆盖 Record/Memory/Conversation 三大搜索场景
+- **智能搜索引擎**：fuse.js 模糊匹配 + 标签过滤 + 全文 grep
+- **三档深度控制**：index / summary / full，最小化上下文占用
+- **冷热分层**：LRU 索引缓存 + 冷工作区归档
+- **批量操作**：一次调用多个 write/read/query/update/delete
+- **内置去重**：写入时自动检测相似记忆
+- **置顶记忆**：每个工作区 3 条置顶精华，概览优先显示
+- **对话原文读取** (v1.4+)：绕过 CHECKPOINT 压缩读取对话完整内容，并支持按宿主链路取数
+- **Auto Summary 双轨制** (v1.5+)：AI 手写 searchSummary + Flash 自动生成 autoSummary，双路搜索提升召回率
+- **黄金片段提取** (v1.5+)：从对话中提取关键决策、发现、踩坑经验，与现有记忆自动去重
+- **与 LS 同生共死** (v1.6+)：MCP 进程绑定父 LS，窗口开着永不超时，窗口关闭 30s 内自动退出
+- **LS 注册表加速** (v1.6+)：跨窗口 LS 发现从 PowerShell 全量扫描 (2-5s) 降至注册表查询 (~5ms)
+- **三步查找路由** (v1.6+)：父 LS 直连 → 注册表 → PowerShell 兜底，跨窗口对话读取零额外延迟
+- **进程生命周期容错** (v1.7+)：ppid 连续 3 次失败容错 + stdin 断裂诊断增强 + 非 LS 环境 1h 空闲超时兜底
+- **对话记录 Record** (v1.8+)：Flash 自动生成对话过程日志，抗 LS 过期，500K prompt 分批处理，2 并发 worker 批量更新，全局自动监听（60s 节流）+ Flash 重试
+- **Stage Guard 任务完整性验证** (v1.9+)：四层防御网（RULES + 工具提醒 + 🔒标记 + 用户审计），审核模型比对 Plan/Task vs 执行记录，防止 CHECKPOINT 压缩导致任务遗漏。同一 Task.md 支持多个 conversationId 的独立锁块，pass/cancel 只移除当前 Guard 锁。
+- **Record 自动触发可靠性** (v1.10+)：MCP 退出时等待 pending Record 生成，阈值 5→3 轮
+- **Record Reader 读侧治理** (v1.12+)：Record markdown 仍是唯一事实源；新增 reader index、结构化 `read`、block 级 `search`、带来源 `guide`，支持只读 outline/state/outputs/phase 等局部内容，避免 70KB-100KB Record 每次整篇塞进上下文。
+- **Record Reader 归属治理** (v1.12+)：`scope="workspace"` 严格只读指定工作区，`includeGeneral=true` 才显式兼容旧的 workspace + general 读法；新增 `audit_ownership` / `repair_ownership(dryRun=true)`，按 Antigravity `workspaceUri`、Codex `cwd`、子线程 parent/root 派生关系和同 ID 副本检测归属，不根据标题或正文语义猜测。
+- **Record official home 止血** (v1.12.4+)：`C:\...`、`\\?\C:\...`、file URL、尾斜杠、大小写和分隔符差异不再制造不同 workspace hash；Record 读取、列表和搜索按覆盖轮次/更新时间/大小选择最可信副本，repair/update 会把旧 alias 或 `general` 副本 copy/upsert 到 official workspace，并用 sidecar 标记 `superseded`，默认视图不再展示已被取代副本。
+- **Record 单批增量止血** (v1.12.5+)：`parallelMode="auto"` 下，如果旧 Record 已经较大，即使新增内容只切出 1 个 chunk，也会走 RecordPatch + local compose 增量合成，避免回落到“旧 Record + 新增轮次 → 模型输出完整新版 Record”的单批超时路径；Record 头部的对话ID、工作区、总轮次和总步骤由代码按结构化元数据校正，模型仍可记录当前状态、关联工作区和产出文件等正文信息。
+- **Codex 超大 JSONL 流式读取** (v1.12.6+)：Codex 本地 rollout JSONL 分块逐行解析，不再一次性读成巨型字符串；超长元数据、加密 reasoning 与单条超大文本会在读取层丢弃或裁剪，避免 1GB+ 对话在 Record 更新或 `conversation_read_original` 前置读取阶段触发 V8 字符串上限。
+- **Record Local Compose 轮次范围解析修复** (v1.12.7+)：Local Compose 质量检查支持 `- 轮次范围：X-Y`、`- **轮次范围**：X-Y` 这类 Phase 内标签式写法，不再只依赖 Phase 标题中的 `轮次 X-Y`；同时粗体头部元数据会被原位替换，避免重复追加总轮次/工作区。
+- **Codex contextProbe 限时尾扫** (v1.12.8+)：`conversation_read_original(list, dataChain="codex", contextProbe=...)` 默认只扫描每个候选 JSONL 的尾部窗口，并带全局耗时预算，避免辅助定位当前线程时连续解析多个大 JSONL 拖穿 60 秒 MCP 客户端超时。可用 `MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES` 和 `MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS` 调整。
+- **Local Compose 旧 Phase 过滤** (v1.12.9+)：Record 本地合成解析结构化增量时，会丢弃结束轮次早于 `rewriteStartRound` 的旧 Phase，防止模型把稳定区重复吐进候选后造成 `59 -> 128` 这类轮次跳跃；质量检查仍保留，不接受缺口候选。
+- **Codex list 快查止血与 deep_locate 骨架** (v1.13.0+)：Codex `conversation_read_original(list, mode="auto")` 收紧为标题/ID/工作区/Record/reader index/contextProbe 快查；query 未命中时不再自动读取多个超大 JSONL 原文预览，也不再自动触发 smart 模型搜索。新增 `deep_locate` 后台骨架，用 exact/fuzzy 流式扫描 Codex JSONL 来定位正文片段，支持进度、预算、partial hits 和取消入口；smart rerank、checkpoint/resume 与轻索引在后续阶段推进。
+- **Record superseded 环、list ID 排序与阶段 ETA 修复** (v1.13.1+)：Record 归属 sidecar 若出现 `A → B → A` 这类 superseded 互指环，不再把所有副本都隐藏，列表和搜索会继续按覆盖轮次、更新时间和大小选择最可信副本；`conversation_read_original(list)` 用完整 ID 查询时真实 ID 命中优先于标题正文提及；后台任务预计剩余时间改按当前阶段开始时间估算，避免把上一阶段耗时算入新阶段。
+- **Guard/Record 链路失败分类与旧 Phase 范围标题兼容** (v1.13.2+)：`stage_guard` 遇到模型链路不可用、Codex 模型桥退出等基础设施失败时返回“审查未完成”，不再计入未通过次数或触发三次失败裁定；Record Local Compose 解析兼容 `## Phase 1-36` / `## Phase 37-61` 这类旧压缩范围标题，避免把范围起点误当 Phase 编号导致 `1 -> 37` 跳号。
+- **Stage Guard 索引驱动分段取证** (v1.13.4+)：`stage_guard(check)` 不再全量吞入超长 Plan/Task/Record；会按 `stageId`、标题、头部规则、尾部、小本本和证据窗口抽取局部内容，并固定注入命令、报告、run/obs ID、文件路径等证据清单。coverage 不足、锚点缺失或截断风险会返回“证据不足/未完成”，不计入未通过次数。
+- **Record 正文覆盖自愈** (v1.13.6+)：`record_manage(update)` 会校验旧 Record 正文实际覆盖轮次与索引 `lastUpdatedRound` 是否一致；若索引声称 97 轮但正文只覆盖 3 轮，会先向下修正索引并从未覆盖轮次继续生成。`force=true` 对单个 update 生效，会绕过“已是最新”短路并重新生成；结构化 read 会提示正文/索引覆盖不一致。
+- **RecordPatch 检查点与中文格式自愈** (v1.13.6+)：并行 Record 生成会把成功的 map / compress 中间 `RecordPatch` 写入检查点；后续重试可复用已完成区段，只隔离 timeout / failed / invalid 节点。Record 解析兼容旧 `Rounds X-Y`，写入前会把 Phase 标题规范为中文“轮次 X-Y”，避免英文格式漂移导致覆盖误判。
+- **Stage Guard 外部证据索引** (v1.13.7+)：`stage_guard(check)` 新增 `evidenceFiles` / `evidenceAssets` / `evidenceIndexMode`；PDF、Word、Excel、EPUB、图片、视频和复杂文件会先生成带 artifactPath/warnings 的纯文本索引，再进入 Guard prompt。索引走临时文件协议和大小校验，避免大文件、大 stdout 或完整二进制内容堆进主进程内存。
+- **Codex AGENTS/RULES 注入折叠** (v1.13.8+)：Codex 对话开始与压缩后自动注入的 `# AGENTS.md instructions for ...` 规则快照会在读取层折叠为带 path/chars/hash 的短占位符；`conversation_read_original`、Record、Stage Guard、Golden Extract、contextProbe 和 deep_locate 默认不再吞入完整 RULES 正文。
+- **Claude Code 三链路兼容** (v1.14.0+)：新增 `dataChain/modelChain="claude-code"` 与别名 `cc`。`conversation_read_original` 可读取 `.claude/projects/**/*.jsonl`，支持 `list/fetch/read/search/deep_locate/contextProbe`；Record、Golden Extract、Stage Guard 基于统一轮次工作。Claude Code 图片/文件附件只懒解析元信息或命中轮次临时化；Claude Code CLI 只在显式 `modelChain="claude-code"` 或允许 fallback 时使用，并带 timeout、进程树 kill 和输出预算。
+- **Codex 原文附件懒解析** (v1.12.2+)：Codex 图片可从 JSONL 内联 `data:image/...`、`local_images` 和 `Files mentioned` 文本块恢复为可读附件；`fetch` 只统计附件，`read/search` 命中轮次时才按需并行生成临时图片，带哈希缓存、数量上限和大小上限。
+- **Stage Guard 自指收口识别** (v1.12.3+)：当 Guard 明确承认实质产物、测试或用户裁定证据已充分，唯一缺口只是“本次 Guard 结果 / PASS 记录 / 完成标记”等后置记录时，自动按通过收口并保留 warning；混有真实代码、测试、文件缺口时仍保持失败。
+
+## 三链路访问说明
+
+- `chain="auto"`：优先使用当前宿主链路；当前宿主不可用时，才尝试其它链路
+- `chain="antigravity"`：强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错
+- `chain="codex"`：强制走 Codex 本地线程/模型桥链路；目标宿主不在线时直接报错
+- `chain="claude-code"` / `chain="cc"`：强制走 Claude Code 本地 JSONL / CLI 链路；`cc` 会在内部归一为 `claude-code`
+- `dataChain` / `modelChain`：把“读取数据”和“调用模型”拆到不同链路；未填时分别继承 `chain`
+- 兼容规则：`chain` 未填默认为 `auto`，`dataChain` 未填用 `chain`，`modelChain` 未填用 `chain`
+- `conversation_read_original` 的 `list/fetch/read/exact/fuzzy` 主要使用 `dataChain`；`list/search` 的 `smart` 模式用 `dataChain` 读取候选摘要、`modelChain` 调模型
+- `conversation_golden_extract` 用 `dataChain` 读取对话、`modelChain` 调模型提取黄金片段
+- 显式指定 `chain="antigravity"`、`chain="codex"` 或 `chain="claude-code"` 时，不做静默回退
+- Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`
+- Claude Code CLI 默认值：`MEMORY_STORE_CC_MODEL=sonnet`、`MEMORY_STORE_CC_EFFORT=medium`；普通 `modelChain="auto"` 不默认消耗 CC 额度，CC 相关非 Record 模型任务才允许按 `Antigravity > Codex > Claude Code CLI` fallback。
+- 可覆盖环境变量：`MEMORY_STORE_CODEX_MODEL`、`MEMORY_STORE_CODEX_REASONING`、`MEMORY_STORE_CODEX_SPEED`、`MEMORY_STORE_CC_MODEL`、`MEMORY_STORE_CC_EFFORT`、`MEMORY_STORE_CC_MODEL_TIMEOUT_MS`、`MEMORY_STORE_AUTOSUMMARY_MODEL`、`MEMORY_STORE_AUTOSUMMARY_TIMEOUT_MS`
+- `memory_query`、`memory_batch(query)`、`memory_write`、`memory_update`、`memory_stats(action="enhance")` 只涉及共享记忆数据与模型调用，支持 `modelChain`，旧 `chain` 继续作为兼容别名
+
+## 搜索模式
+
+`memory_query`、`memory_batch` 的 query 子操作、`record_manage(action="search")`、`conversation_read_original(action="list|search")` 都支持 `mode="auto|exact|fuzzy|smart"`；语义搜索建议使用 `modelChain` 指定模型链路。
+
+- `exact`：精确/分词匹配
+- `fuzzy`：模糊匹配
+- `smart`：模型语义搜索，使用 `modelChain` 选择 Antigravity LS、Codex 模型桥或显式 Claude Code CLI
+- `auto`：先本地 exact/fuzzy，必要时再走 smart
+
+### Record Reader 与 `general` 归属治理
+
+Record markdown 仍是唯一事实源。v1.12 的 Record Reader 方向只增强读取、搜索、导读和归属治理，不生成“Record 的 Record”，也不改变 Plan_11 稳定后的 Record 写入格式。
+
+结构化读取参数：
+
+- `record_manage(action="read", conversationId="...", view="outline", format="json")`：读取目录、Phase、section 统计和 warning。
+- `view="state|outputs|lessons|risks|verification"`：只读当前状态、产出文件、经验教训、风险或验证区块；`state/lessons/risks/verification` 默认按最新区块优先返回，便于小预算下先看到最新状态。
+- `view="phase", phaseIds=[1], exclude=["risks"]`：读取指定 Phase，并排除指定 section。
+- `sectionTypes=["outputs"]`、`include`、`exclude`、`maxChars`、`withCitations`、`indexMode="auto|reuse|rebuild|off"` 可进一步控制读取范围。
+- 结构化读取按标题层级形成 block：tail 区的 `# 产出文件总清单` 会包含其下 `## 源码与配置` 等子标题内容，不会只返回空父标题。
+- 发生截断时，文本与 JSON 都会给出 `nextReadHint`；可把其中的 `startBlockId` 传回 `record_manage(read, startBlockId="...")` 继续读取。
+- 不传 `view` / 结构化过滤参数时，旧 `read` 行为保持不变：短 Record 直接返回，长 Record 写临时文件。
+
+结构化搜索与导读：
+
+- 旧 `record_manage(action="search", query="...")` 默认仍按整份 Record 搜索。
+- 传 `conversationId`、`recordIds`、`phaseIds`、`sectionTypes`、`searchScope="record|phase|section|item"` 或 `format="json"` 时，会改用 reader index 的 block 级搜索，并返回 `recordId`、`phaseId`、`sectionType`、`blockId`、`lineRange`、`charRange` 和 `readHint`。
+- `record_manage(action="guide", goal="...", conversationId="...")` 只返回推荐阅读路径、搜索参数和来源位置，不生成事实摘要，也不写回正式 Record。
+- reader index sidecar 存在于同一 records 目录，文件名形如 `{conversationId}.record_index.json`；Record 写入后会构建，read/search/guide 缺失时会懒重建。
+
+`general` 的定位是无法确定真实工作区时的兜底区，不再作为每个 workspace 的隐式共享池：
+
+- `record_manage(action="list", scope="workspace", workspace="...")`：只列指定 workspace。
+- `record_manage(action="search", scope="workspace", workspace="...")`：只搜索指定 workspace。
+- `includeGeneral=true`：显式恢复旧的 workspace + general 合并视图。
+- `scope="global"`：搜索或列出所有 workspace 与 `general`。
+- `workspace="general"` 或 `scope="general"`：只处理 `general`。
+
+归属治理只使用结构来源，不做语义分类：
+
+- Antigravity：读取对话 steps 中的 `activeUserState.openDocuments[].workspaceUri`。
+- Codex：读取 thread `cwd`；子线程可使用 parent/root 派生关系。
+- Claude Code：读取 JSONL 中的 `cwd`，不按标题或正文语义猜测工作区。
+- 同一 `conversationId` 多副本：比较 `lastUpdatedRound`、`totalRounds`、`lastUpdatedAt`、`sizeBytes`，识别 duplicate / migratable / unknown / conflict。
+- `audit_ownership` 是只读审计。
+- 路径别名会先做保守规范化：`C:\project` 与 `\\?\C:\project` 会归为同一 workspace identity；已存在的旧 alias hash 作为兼容候选读取，但成功 repair/update 后会被标记为 `superseded`。
+- `repair_ownership` 默认 `dryRun=true`，只返回迁移计划；非 dry-run 首版只 copy/upsert 到目标 workspace，并写入 ownership sidecar 标记来源副本被取代，不删除来源副本。
+
+### Codex / Claude Code 对话原文来源
+
+当工具走 `chain="codex"` 时，对话原文来自 Codex 本地数据：
+
+- 线程索引：`~/.codex/state_5.sqlite`
+- 原始事件流：`~/.codex/sessions/**/*.jsonl`
+
+Codex 链路下的轮次是基于原始事件流的重建结果，目标是尽量贴近 Antigravity 的阅读体验。
+`depth="full"` 配合 `extraTypes=["thinking","tool_results","code_actions","code_diffs","file_views"]` 时，会尽量展开 Codex 的可读 reasoning 摘要、命令/MCP/custom tool 结果、`apply_patch` 统一 diff，以及 Plan 等文件/计划类事件；加密 reasoning 不会被输出。
+从 v1.12.6 起，Codex JSONL 使用流式读取；`session_meta` 里的超长 instructions、加密 reasoning 和单条超大文本会在读取层丢弃或裁剪，`fetch/read/search` 也会在构建输出时按预算提前截断并建议按轮次分段读取。
+
+Codex 附件读取从 v1.12.2 起按需处理：
+
+- 图片来源优先级：`event_msg.user_message.local_images` 本地路径优先；如果只剩 `response_item.message.content[].input_image` 的 `data:image/...;base64,...`，则在 `read/search` 真正输出该轮次时写入 `memory-store/temp/codex-attachments/<conversationId>/round-xxxxxx/sha256-*.png`。
+- 普通文件来源：从 `# Files mentioned by the user` 文本块解析 PDF / DOCX / Markdown 等路径，只做路径解析和存在性标注，不读取文件正文。
+- `fetch` 只返回附件数量、内联图片数量和本地路径存在性，不批量解码整条对话的图片。
+- `read/search` 只处理指定轮次或命中上下文轮次；过多附件按 `MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT` 限制数量，按 `MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY` 并行限流，按 `MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES` 限制单图大小，按 `MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES` 限制单次总解码量，并通过 SHA-256 文件名复用缓存。
+- Antigravity 的 `brain/<conversationId>/media__*.png` 媒体路径保持原样输出，不复制到 Codex 临时目录。
+
+Claude Code 链路下的原文来自 `~/.claude/projects/**/*.jsonl`。读取层会把 `user/assistant/system/attachment/ai-title/custom-title/last-prompt` 等事件归一为统一轮次：普通用户消息开启新轮次，纯 `tool_result` 回填到对应工具调用，`thinking.signature` 不输出。图片内联 base64 与本地附件路径沿用懒解析策略：`fetch/list` 只显示统计和元信息，`read/search` 命中轮次时再按需生成临时文件或标注原路径。
+
+### 对话定位
+
+`conversation_read_original(action="list")` 可按标题、工作区路径、ID 片段、已有 Record 摘要和近期上下文指纹列出候选对话，适合只知道界面标题、短 ID 或当前对话片段但不知道完整 `conversationId` 的场景。Codex 链路支持唯一 ID 前缀解析，Record 的 read/edit/delete 也支持唯一短前缀。
+
+从 v1.13.0 起，Codex 链路的 `list(mode="auto")` 是快查入口；v1.14.0 起 Claude Code 也走同类快查：会查标题/ID/工作区、Record / reader index 轻量内容和最近尾部 `contextProbe`，但 query 未命中时不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 搜索。若 query 实际是古老正文片段，`list` 会明确提示需要后续 deep locate 后台深搜，而不是把快查拖到 60 秒 MCP 超时。Antigravity 链路保持旧的 auto 兼容行为；显式 `mode="smart"` 只在轻量候选材料上使用 smart，不做全库原文扫描。
+
+有 query 时默认扫描 300 个候选目录，可用 `MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT` 调整；`MEMORY_STORE_CONVERSATION_LIST_RAW_SCAN_LIMIT` 仅用于保留旧链路和显式允许原文预览的路径，Codex `list(auto)` 不使用它做隐式深扫。
+
+古老正文片段反查使用后台 deep locate：
+
+```text
+conversation_read_original(
+  action="deep_locate",
+  dataChain="codex|claude-code",
+  query="某段正文片段",
+  mode="exact|fuzzy",
+  background=true
+)
+```
+
+启动后用 `conversation_read_original(action="deep_locate_status", taskId="...", waitSeconds=30)` 轮询；需要中止时用 `conversation_read_original(action="deep_locate_cancel", taskId="...")`。deep locate 支持 Codex 与 Claude Code，默认后台、低并发、预算受控，不使用 smart 做全库召回。
+
+Codex / Claude Code 链路的 `list` 额外支持 `contextProbe`：调用方可从当前可见对话截取 50-120 字有辨识度的上下文片段传入，工具会在最近本地 JSONL 中做 fixed-string 语义的硬匹配，并在候选列表中标记 `contextProbe` 命中项。Codex 命中子代理线程时会同时补标 parent/root 候选，且优先把可能的主线母线程排在子线程前；多个线程命中时只标记和排序，不自动选中或写入。Codex 可用 `MEMORY_STORE_CODEX_CONTEXT_PROBE_SCAN_LIMIT`、`MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES` 调整；Claude Code 可用 `MEMORY_STORE_CC_CONTEXT_PROBE_SCAN_LIMIT`、`MEMORY_STORE_CC_CONTEXT_PROBE_MAX_BYTES` 和 `MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS` 调整。
+
+Codex / Claude Code 侧通过共享后端或本地 JSONL 工作，不具备每个对话独立的“当前对话”状态。使用 `conversation_read_original(action="fetch|search|read")`、`record_manage(action="update")`、`conversation_golden_extract`、`stage_guard` 时必须显式传入稳定的 `conversationId`。如果只知道标题或关键词，先用 `conversation_read_original(action="list", dataChain="codex|claude-code", query="...")` 定位完整 ID；如果能从当前聊天复制一段独特上下文，可加 `contextProbe="..."` 辅助硬匹配当前线程。
+
+`conversation_read_original`、`conversation_golden_extract` 和 `record_manage(update)` 支持 `dataChain` / `modelChain` 拆分。例如 `dataChain="claude-code"` 可读取 Claude Code 对话，`modelChain="antigravity"` 可使用 Antigravity LS 模型能力执行 smart 搜索、黄金片段提取或 Record 生成。Record 首版仍是文本 Record，不默认调用 Claude Code CLI 解析多模态附件。未传新参数时保持旧 `chain` 行为。
+
+Antigravity LS 模型默认值：`MEMORY_STORE_LS_MODEL` 未设置时使用 `MODEL_PLACEHOLDER_M132`（Gemini 3.5 Flash High）；默认 fallback 为 `MODEL_PLACEHOLDER_M132,MODEL_PLACEHOLDER_M20,MODEL_PLACEHOLDER_M18,MODEL_PLACEHOLDER_M16,MODEL_PLACEHOLDER_M36`，可用 `MEMORY_STORE_LS_MODEL_FALLBACKS` 覆盖。`MODEL_PLACEHOLDER_M47` 已在 2026-04-28 实测返回 `unknown model key`，`MODEL_PLACEHOLDER_M37` 已在 2026-05-23 实测返回 `INVALID_ARGUMENT`，均不再放入默认链路。
+
+### Codex 子代理线程呈现策略
+
+- 主线程阅读结果默认保留子代理引用或摘要
+- `link="reference"` 只显示子线程 ID/昵称/角色；`link="summary"` 显示完成摘要；`link="expand_children"` 读取一级子线程全文
+- 只有显式要求展开时，才读取子线程全文；展开时会用 `thread_spawn_edges` 补充父线程事件里遗漏的子线程，并允许精确读取已归档但仍有 rollout 文件的子线程
+- 子线程索引缺失、rollout 文件缺失或解析失败时，会在“子代理线程诊断”里显式列出，不再静默跳过
+- Record、Guard、黄金片段提取等功能应明确区分主线程正文与外链附件
+
+## 11 个 MCP 工具
+
+| 工具 | 说明 |
+|------|------|
+| `memory_write` | 写入新记忆（含去重检测 + autoSummary 异步生成） |
+| `memory_query` | 查询记忆（fuse.js + grep + 三档 depth + autoSummary 搜索） |
+| `memory_read` | 读取单条记忆（支持行范围） |
+| `memory_update` | 更新/追加记忆（内容变化自动重生成 autoSummary） |
+| `memory_delete` | 删除记忆 |
+| `memory_batch` | 批量操作（最多 20 个） |
+| `memory_stats` | 统计/归档/导出/导入/enhance 批量增强 |
+| `conversation_read_original` | 读取对话原文（list/fetch/search/read + deep_locate 后台深搜） |
+| `conversation_golden_extract` | 黄金片段提取（对话关键信息 + 记忆去重对比） |
+| `record_manage` | 对话记录管理（update/list/read/search/guide/edit/delete/batch_update/batch_delete/task_status/audit_ownership/repair_ownership） |
+| `stage_guard` | 任务完整性验证（start/check/status/cancel，分段取证 + 四层防御网） |
+
+### Stage Guard 调用约束
+
+在 Codex / Claude Code 侧使用 `stage_guard` 时，必须显式传入稳定的 `conversationId`。如果不知道当前线程 ID，先调用 `conversation_read_original(action="list", dataChain="codex|claude-code", query="标题或关键词", contextProbe="当前可见对话片段")` 定位完整 ID，再把同一个 ID 用于后续 `start/status/check/cancel`。Guard 的对话数据固定绑定当前宿主的明确对话，只有审核模型通过 `modelChain` 选择。
+
+Codex / Claude Code 侧同步 MCP 调用存在宿主超时窗口。`record_manage(action="update")`、`stage_guard(action="check")`、`conversation_golden_extract` 这类长模型任务建议使用 `background=true` 先返回 `taskId`，再用同工具的状态查询参数配合 `waitSeconds=30-45` 轮询。Codex/Claude Code 本地模型桥 Record 生成会按实际轮次大小切批，避免单次 prompt 过重；Codex 后台每批默认允许 8 分钟，可用 `MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT` 覆盖；Claude Code 可用 `MEMORY_STORE_CC_RECORD_BACKGROUND_TIMEOUT_MS` 覆盖。单批 prompt 上限分别可用 `MEMORY_STORE_CODEX_RECORD_MAX_PROMPT_CHARS`、`MEMORY_STORE_CC_RECORD_MAX_PROMPT_CHARS` 覆盖。Codex/Claude Code 本地模型桥只会对输出为空、启动失败等快失败重试 1 次，完整超时不自动重试。实验性 `parallelMode="auto|force"` 会启用 RecordPatch 并行 map/reduce 管线，默认关闭；v1.12.5 起，`auto` 在旧 Record 已较大时允许单 chunk 也进入 local compose，避免模型重新输出完整旧 Record。v1.13.6 起，update 前会用正文 Phase/轮次标签校验旧 Record 实际覆盖范围，发现正文比索引旧时会修正索引并继续生成；并行管线会复用已完成 RecordPatch 检查点，只重跑缺失或失败区段。单个 `update` 可传 `force=true` 重新生成，不再被“已是最新”短路。`task_status` 会显示后台任务阶段、进度、当前批次/轮次和预计剩余时间，便于区分正常运行与卡死。
+
+后台任务本身带 deadline 与一次性结算保护：Record 默认 60 分钟，Stage Guard / Golden Extract 默认 15 分钟；可分别用 `MEMORY_STORE_RECORD_UPDATE_BACKGROUND_MAX_RUN_MS`、`MEMORY_STORE_STAGE_GUARD_BACKGROUND_MAX_RUN_MS`、`MEMORY_STORE_GOLDEN_EXTRACT_BACKGROUND_MAX_RUN_MS` 或通用 `MEMORY_STORE_BACKGROUND_TASK_MAX_RUN_MS` 覆盖。超时会把任务标记为 error，不会重启或杀掉 MCP 后端。
+
+Stage Guard 从 v1.13.4 起使用索引驱动分段取证：超长 `Task.md` / `Plan_x.md` 会先按当前 `stageId`、标题、头部规则、尾部、“待复核/小本本”和证据窗口裁剪；Record 使用 Reader 的 state/outputs/verification/risks 局部视图加少量锚点窗口；对话原文只保留从 Guard 开始轮次之后的工具结果、文件编辑、命令输出等高证据片段。工具会生成 coverage / evidence manifest 临时文件；若定位不到当前阶段、证据被截断或覆盖不足，返回“证据不足/审查未完成”，不累计 Guard 失败次数。
+
+Stage Guard 从 v1.13.7 起支持外部证据文件索引：
+
+- `evidenceFiles: string[]`：快速传入证据文件路径。
+- `evidenceAssets: [{ path, label?, type?, role?, range?, maxChars? }]`：带标签、类型、角色、范围和预算的结构化证据输入。
+- `evidenceIndexMode="auto|reuse|rebuild|off"`：控制复用、重建或关闭索引。
+- 纯文本/代码/Markdown/日志按字节预算读取，图片默认只生成元信息并明确“未做 OCR/视觉理解”。
+- PDF/视频默认优先尝试 Gemini CLI agentic 索引，再尝试 Codex CLI；Word/Excel/EPUB/PDF 可降级到 Python 结构化提取；失败时生成 unreadable stub 而不是让 Guard 崩溃。
+- 所有复杂索引落在 `memory-store/temp/stage-guard-evidence-indexes/`，必须包含 `<<<GUARD_EVIDENCE_INDEX>>>` / `<<<END_GUARD_EVIDENCE_INDEX>>>` 标记；宿主只读取标记区和短诊断，避免大文件或完整 stdout 进入内存。
+
+Record 读侧从 v1.12 起严格区分 workspace 与 `general`：`list/search` 在 `scope="workspace"` 下默认不混入 `general`；需要旧合并视图时显式传 `includeGeneral=true`。结构化 `read/search/guide` 使用 reader index sidecar，返回原文行号和 `readHint`，但不生成新的摘要事实源。`audit_ownership` 只读检测 duplicate / migratable / conflict / unknown；`repair_ownership` 默认 `dryRun=true`，首版非 dry-run 也只 copy/upsert，不删除来源副本。v1.12.4 起，路径别名副本和已标记 `superseded` 的旧副本不会进入默认 list/search 正式视图。
+
+## 目录结构
+
+```
+mcp-memory-store/         ← MCP 服务代码
+├── src/
+│   ├── index.ts          ← 入口 + 进程管理（v1.7 容错心跳 + 非 LS 兜底）
+│   ├── store.ts          ← 存储引擎（含 autoSummary 字段）
+│   ├── search.ts         ← 搜索引擎（fuse.js + autoSummary）
+│   ├── cache.ts          ← LRU 索引缓存
+│   ├── lifecycle.ts      ← 进程生命周期（ppid 3 次容错 + LS 环境检测）
+│   ├── temp-store.ts     ← 临时文件管理
+│   ├── ls-client.ts      ← LS 通信 + 三步查找路由（v1.6 重构）
+│   ├── ls-registry.ts    ← LS 注册表（v1.6 新增，跨窗口加速）
+│   ├── trajectory.ts     ← 对话数据解析（v1.4+）
+│   ├── conversation-attachments.ts ← Codex 原文附件懒解析与临时图片缓存（v1.12.2+）
+│   ├── search-engine.ts  ← 三级搜索引擎（exact/fuzzy/smart/auto，v1.10+）
+│   ├── record-reader.ts  ← Record Reader 索引、结构解析和局部读取（v1.12+）
+│   └── tools/
+│       ├── write.ts          ← 写入 + 异步 autoSummary
+│       ├── query.ts
+│       ├── read.ts
+│       ├── update.ts         ← 更新 + autoSummary 重生成
+│       ├── delete.ts
+│       ├── batch.ts
+│       ├── stats.ts          ← 统计 + enhance 批量增强
+│       ├── conversation.ts   ← 对话原文读取（v1.4+）
+│       ├── golden-extract.ts ← 黄金片段提取（v1.5+）
+│       ├── record.ts         ← 对话记录管理（v1.8+）
+│       └── stage-guard.ts    ← Stage Guard 任务完整性验证（v1.9+）
+│   ├── guard-store.ts    ← Guard 状态持久化 + 🔒标记管理（v1.9+）
+│   ├── guard-engine.ts   ← Flash 比对引擎（v1.9+）
+├── dist/                 ← 编译输出
+└── 工作记忆/              ← 开发过程工作记忆（旧版）
+
+memory-store/             ← 记忆数据（分离存储）
+├── _global_index.json
+├── config.json
+├── ls-registry.json      ← LS 注册表（v1.6 新增）
+├── temp/
+├── workspaces/
+│   └── {hash}/
+│       ├── memories/
+│       └── records/      ← Record 存储（v1.8+）；包含 *.record_index.json 读侧索引 sidecar（v1.12+）
+└── general/              ← 无法确定真实 workspace 的兜底区，不默认混入 workspace scope
+```
+
+## 开发
+
+```bash
+npm install
+npm run build
+npm run test:record-ownership
+npm test
+```
+
+测试需要避免污染真实数据时，可在启动 Node 前设置 `MEMORY_STORE_DATA_ROOT` 指向临时目录。`tests/record-ownership.test.ts` 会在 import 存储模块前自动设置隔离数据根。
+
+## 配置
+
+在接收方 MCP 配置中添加（路径按本工具包实际位置调整）：
+
+```json
+{
+  "memory-store": {
+    "command": "node",
+    "args": ["%USERPROFILE%\\.codex-toolkit\\mcps\\memory-store\\dist\\index.js"],
+    "env": {},
+    "disabled": false
+  }
+}
+```
+
+
+

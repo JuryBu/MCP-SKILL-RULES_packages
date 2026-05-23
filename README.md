@@ -1,150 +1,131 @@
-# MCP-Antigravity
+﻿# MCP-SKILL-RULES Packages
 
-**Custom MCP (Model Context Protocol) Servers** — 为 AI IDE 打造的增强工具集。
+Portable MCP + Rules package for AI coding environments.
 
-最初为 [Antigravity IDE](https://codeium.com) 开发，兼容 Cursor、Trae、Windsurf、VS Code 等支持 MCP 协议的 IDE。
+This repository packages a source-only MCP tool stack plus opinionated, privacy-scrubbed rules templates for three hosts:
 
----
+- Antigravity
+- Codex
+- Claude Code
 
-## 🛠️ 包含工具
+The current release focus is **MCP + Rules**. Skills are intentionally not bundled in this snapshot; the repository name keeps `SKILL` as a reserved slot for future public skill packaging.
 
-| Server | 版本 | 功能 |
-|--------|------|------|
-| **[memory-store](./mcp-memory-store/)** | v1.6.0 | AI 跨对话记忆管理（多工作区 / 搜索 / 冷热分层 / AutoSummary / 黄金片段提取） |
-| **[sandbox](./mcp-sandbox/)** | v1.5.0 | 代码执行沙箱（硬超时 / 内存限制 / REPL / 并行执行 / Codex CLI / 长任务脱离） |
-| **[web-fetcher](./mcp-web-fetcher/)** | v1.0.0 | 网页抓取与交互（截图 / 文本提取 / Cookie 管理 / 文件转换 / AI 摘要 / 录屏） |
+## What Is Included
 
-另外推荐搭配使用官方公共 MCP Server：
-- [`@modelcontextprotocol/server-sequential-thinking`](https://www.npmjs.com/package/@modelcontextprotocol/server-sequential-thinking) — 结构化深度推理
+| Area | Path | Notes |
+| --- | --- | --- |
+| MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, and a portable HTTP broker |
+| Host rules | `rules/` | Separate templates for Codex, Antigravity, and Claude Code |
+| Install scripts | `install/` | Windows PowerShell scripts for build, broker startup, config, and smoke tests |
+| Config templates | `templates/` | Codex, Antigravity, Claude Code, and environment examples |
+| Smoke tests | `design-tests/` | Local pages and MCP HTTP smoke test helpers |
 
----
+## Current Versions
 
-## 🚀 快速开始
+| Component | Version |
+| --- | --- |
+| `memory-store` | `1.14.0` |
+| `sandbox` | `1.13.1` |
+| `web-fetcher` | `7.0.0` |
+| `codex-mcp-http-broker` | `0.1.0` |
 
-### 环境要求
+## Three-Host Compatibility
 
-- **Node.js 18+**
-- npm 或其他包管理器
+The MCP stack has moved from an Antigravity-only experiment to a shared system that can work across:
 
-### 安装
+- `antigravity`
+- `codex`
+- `claude-code` / `cc`
 
-```bash
-# 克隆仓库
-git clone https://github.com/JuryBu/MCP-Antigravity.git
-cd MCP-Antigravity
+Where supported, tools accept `chain`, `dataChain`, and `modelChain` so conversation data and model calls can be routed independently.
 
-# 安装各工具依赖
-cd mcp-memory-store && npm install && cd ..
-cd mcp-sandbox && npm install && cd ..
-cd mcp-web-fetcher && npm install && npx playwright install chromium && cd ..
+Examples:
+
+- `dataChain="claude-code"` reads Claude Code local conversation data.
+- `modelChain="codex"` uses the Codex model bridge for model-assisted operations.
+- `modelChain="antigravity"` forces the Antigravity Language Server route.
+- `modelChain="claude-code"` explicitly uses Claude Code CLI; automatic CC fallback is intentionally conservative to avoid hidden quota use.
+
+## Quick Start On Windows
+
+Requirements:
+
+- Node.js 18+
+- npm
+- PowerShell
+- Codex, Antigravity, or Claude Code depending on which host you want to configure
+
+Build and smoke test:
+
+```powershell
+./install/Install-CodexToolkit.ps1
+./install/Start-CodexMcpBroker.ps1
+./install/Test-CodexToolkit.ps1
+./install/Stop-CodexMcpBroker.ps1
 ```
 
-### 配置 IDE
+The broker exposes these local endpoints by default:
 
-在你的 IDE 的 MCP 配置中添加：
-
-```jsonc
-{
-  "mcpServers": {
-    "memory-store": {
-      "command": "node",
-      "args": ["/path/to/MCP-Antigravity/mcp-memory-store/dist/index.js"]
-    },
-    "sandbox": {
-      "command": "node",
-      "args": ["/path/to/MCP-Antigravity/mcp-sandbox/dist/index.js"]
-    },
-    "web-fetcher": {
-      "command": "node",
-      "args": ["/path/to/MCP-Antigravity/mcp-web-fetcher/dist/index.js"]
-    },
-    "sequential-thinking": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-    }
-  }
-}
+```text
+http://127.0.0.1:14588/memory-store/mcp
+http://127.0.0.1:14588/web-fetcher/mcp
+http://127.0.0.1:14588/sandbox/mcp
+http://127.0.0.1:14588/exa/mcp          # optional, requires receiver-side Exa URL
 ```
 
-> **配置文件位置因 IDE 而异**：
-> - Antigravity: `~/.gemini/antigravity/mcp_config.json`
-> - Cursor: `~/.cursor/mcp.json`
-> - Windsurf: `~/.codeium/windsurf/mcp_config.json`
-> - Trae: 设置面板或 `~/.trae/mcp.json`
+## Rules Templates
 
----
+Rules are split by host:
 
-## 📦 各工具详情
+- Codex: `rules/codex/AGENTS.template.md`
+- Optional Codex system prompt: `rules/codex/system-prompt.template.md`
+- Antigravity: `rules/antigravity/GEMINI.template.md`
+- Claude Code: `rules/claude-code/CLAUDE.template.md`
 
-### memory-store — AI 记忆管理系统
+These are templates. Review and edit style, identity, model choices, and local paths before using them.
 
-让 AI 拥有跨对话的持久记忆。AI 可以主动保存和搜索知识，下次对话自动召回。
+## Privacy Boundary
 
-**工具列表**：
-- `memory_write` / `memory_query` / `memory_read` / `memory_update` / `memory_delete`
-- `memory_batch` — 批量操作
-- `memory_stats` — 统计/导入/导出/增强
+This repository should only contain source code, templates, docs, and test samples.
 
-**特性**：多工作区隔离、自然语言搜索、标签过滤、CJK 分词优化、冷热分层归档
+Do not commit:
 
-### sandbox — 代码执行沙箱
+- API keys or remote MCP URLs with embedded keys
+- cookies, browser profiles, auth files, sessions, or logs
+- real memory-store data or Record files
+- SQLite databases or JSONL conversation histories
+- machine-specific absolute paths
+- private account links or personal identifiers
 
-安全执行代码和命令，自带超时保护和内存限制。
+Run the package-clean smoke check before publishing changes:
 
-**工具列表**：
-- `sandbox_exec` — 执行代码/命令（Python/Node/PowerShell/cmd/bash）
-- `sandbox_session` — 持久 REPL 会话
-- `sandbox_batch` — 并行执行多任务
-- `sandbox_status` — 系统状态信息
-- `sandbox_codex` — 调用 OpenAI Codex CLI（需额外安装）
-- `sandbox_launch` — 长任务脱离执行
-
-### web-fetcher — 网页抓取与交互
-
-使用带 Cookie 的浏览器完成各种网页操作。
-
-**工具列表**：
-- 抓取：`web_fetch_page` / `web_fetch_screenshot` / `web_fetch_rich` / `web_fetch_html`
-- 提取：`web_extract_links` / `web_extract_tables`
-- 交互：`web_interact` / `web_pipeline`
-- 文件：`web_download` / `web_convert` / `web_batch_screenshot`
-- 其他：`web_login_browser` / `web_record_video` / `web_list_cookies`
-
----
-
-## ⚠️ IDE 兼容性
-
-| 功能 | 反重力 | Cursor/Trae/其他 |
-|------|--------|------------------|
-| 核心 MCP 工具 | ✅ | ✅ |
-| `conversation_read_original` | ✅ | ❌ 需适配 |
-| `conversation_golden_extract` | ✅ | ❌ 需适配 |
-| `ai_summary` 模式 | ✅ | ⚡ 自动降级 |
-| `sandbox_codex` | ✅ | ⚡ 需安装 Codex CLI |
-
-源码中部分路径硬编码为 `~/.gemini/antigravity/`，非反重力用户需搜索替换后 `npm run build`。
-
----
-
-## 🔧 开发
-
-```bash
-# 修改 TypeScript 源码后重新构建
-cd mcp-memory-store && npm run build
-cd ../mcp-sandbox && npm run build
-cd ../mcp-web-fetcher && npm run build
+```powershell
+$env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<add-your-private-markers-separated-by-semicolons>"
+./install/Test-CodexToolkit.ps1 -PackageClean
 ```
 
----
+## Repository Layout
 
-## 📄 License
+```text
+.
+├─ mcps/
+│  ├─ broker/
+│  ├─ memory-store/
+│  ├─ sandbox/
+│  └─ web-fetcher/
+├─ rules/
+│  ├─ codex/
+│  ├─ antigravity/
+│  └─ claude-code/
+├─ install/
+├─ templates/
+├─ design-tests/
+├─ PACKAGE_MANIFEST.md
+├─ PRIVATE_EXCLUDE_CHECKLIST.md
+├─ TOOLKIT_README.md
+└─ SETUP.md
+```
 
-[MIT](./LICENSE)
+## License
 
----
-
-## 🙏 致谢
-
-- [Model Context Protocol](https://modelcontextprotocol.io/) — MCP 协议规范
-- [Playwright](https://playwright.dev/) — 浏览器自动化
-- [Fuse.js](https://www.fusejs.io/) — 模糊搜索
+MIT. See `LICENSE`.

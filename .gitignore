@@ -1,36 +1,68 @@
-# Dependencies
+﻿# Dependencies
 node_modules/
 
-# Build output (uncomment if you want to track dist/)
-# dist/
+# Build output
+dist/
+**/dist/
+build/
+coverage/
 
-# IDE specific
-.idea/
-.vscode/
-*.sw?
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Dev files
-Plan_*.md
-Task.md
-
-# Data directories (user-specific, not shareable)
-memory-store/
-sandbox-data/
-mcp-web-fetcher/data/
+# Runtime data
+.codex-toolkit/
+/sandbox-data/
+/web-fetcher-profiles/
+/ms-playwright/
+.playwright-mcp/
 **/cookies/
 **/temp/
+**/tmp/
+**/sessions/
+**/archived_sessions/
+**/workspaces/
 *.cookie
 *.session
+*.har
+*.jsonl
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
+*.db-wal
+*.db-shm
 
 # Logs
 *.log
 npm-debug.log*
+broker-stdout.log
+broker-stderr.log
+broker-state.json
+broker.pid
 
-# Environment
+# Secrets / local env
 .env
 .env.local
 .env.*.local
+broker-private.env.json
+auth.json
+.cockpit_codex_auth.json
+cookies-backup.json
+localstorage-backup.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.sw?
+.DS_Store
+Thumbs.db
+
+# Planning/private scratch files
+Plan_*.md
+Task.md
+Task_*.md
+Analysis_*.md
+Phenomenon_*.md
+council_*.md
+council_*.json
+工作记忆/
+_archive/
+

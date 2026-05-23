@@ -1,0 +1,30 @@
+﻿# Add or merge these blocks into %USERPROFILE%/.codex/config.toml
+# Optional top-level setting:
+# If you run install/Install-SystemPromptTemplate.ps1, you may add:
+# model_instructions_file = "~/.codex/prompts/system-prompt.md"
+
+[mcp_servers.memory-store]
+url = "http://127.0.0.1:14588/memory-store/mcp"
+enabled = true
+
+[mcp_servers.web-fetcher]
+url = "http://127.0.0.1:14588/web-fetcher/mcp"
+enabled = true
+
+[mcp_servers.sandbox]
+url = "http://127.0.0.1:14588/sandbox/mcp"
+enabled = true
+
+[mcp_servers.playwright]
+url = "http://127.0.0.1:14588/playwright/mcp"
+enabled = true
+
+[mcp_servers.sequential-thinking]
+url = "http://127.0.0.1:14588/sequential-thinking/mcp"
+enabled = true
+
+# [mcp_servers.exa]
+# url = "http://127.0.0.1:14588/exa/mcp"
+# enabled = true
+
+

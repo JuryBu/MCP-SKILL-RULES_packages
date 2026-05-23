@@ -1,0 +1,24 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>Portable Codex Toolkit Overlap Smoke Test</title>
+  <style>
+    body { font-family: system-ui, "Microsoft YaHei", sans-serif; margin: 40px; color: #1f2933; }
+    .stage { position: relative; width: 760px; height: 420px; border: 1px solid #c9d2dc; overflow: hidden; }
+    .card { position: absolute; left: 80px; top: 90px; width: 300px; height: 120px; background: #d9f2ea; border: 2px solid #0f7a5f; padding: 18px; }
+    .bad { position: absolute; left: 220px; top: 130px; width: 360px; height: 90px; background: rgba(242, 140, 40, .88); padding: 18px; }
+    .overflow { position: absolute; left: 520px; top: 320px; width: 360px; height: 90px; background: #f7f3e8; border: 2px dashed #a15c00; padding: 12px; }
+  </style>
+</head>
+<body>
+  <h1>Overlap and Overflow Test</h1>
+  <div class="stage">
+    <div class="card">这张绿色卡片会被橙色块压住，用于测试 overlap。</div>
+    <div class="bad">这个橙色块故意覆盖前面的卡片文字。</div>
+    <div class="overflow">这个模块故意伸出右侧边界，用于测试 overflow。</div>
+  </div>
+</body>
+</html>
+
+

@@ -1,0 +1,54 @@
+{
+  "name": "web-fetcher-mcp-server",
+  "version": "7.0.0",
+  "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "clean": "rimraf dist",
+    "test": "npm run test:overlap && npm run test:human-verification && npm run test:human-audit && npm run test:borrowed-session && npm run test:pdf:python && npm run build && npm run test:ls-models && npm run test:model-bridge && npm run test:ai-summary && npm run test:ebook && npm run test:sessions && npm run test:inspect && npm run test:desktop && npm run test:human-browser && npm run test:pdf && npm run test:pdf:office && npm run test:pptx && npm run test:dom && npm run test:ai-review && npm run test:screenshot && npm run test:stage24",
+    "test:overlap": "tsx tests/overlap.test.ts",
+    "test:human-verification": "tsx tests/human-verification-detector.test.ts",
+    "test:human-audit": "tsx tests/human-audit.test.ts",
+    "test:borrowed-session": "tsx tests/borrowed-session-lifecycle.test.ts",
+    "test:human-browser": "node tests/human-browser-mcp.test.mjs",
+    "test:pdf:python": "powershell -NoProfile -ExecutionPolicy Bypass -File ./tests/pdf-inspector-python.test.ps1",
+    "test:ls-models": "node tests/ls-model-candidates.test.mjs",
+    "test:model-bridge": "node tests/model-bridge.test.mjs",
+    "test:ai-summary": "node tests/ai-summary-mcp.test.mjs",
+    "test:inspect": "node tests/inspect-framework.test.mjs",
+    "test:sessions": "node tests/session-management-mcp.test.mjs",
+    "test:desktop": "node tests/desktop-cdp-mcp.test.mjs",
+    "test:ebook": "node tests/ebook-mcp.test.mjs",
+    "test:pdf": "node tests/pdf-inspector-mcp.test.mjs",
+    "test:pdf:office": "node tests/office-to-pdf-mcp.test.mjs",
+    "test:pptx": "node tests/pptx-inspector-mcp.test.mjs",
+    "test:dom": "node tests/dom-inspector-mcp.test.mjs",
+    "test:ai-review": "node tests/ai-review-mcp.test.mjs",
+    "test:screenshot": "node tests/screenshot-stage19.test.mjs",
+    "test:stage24": "node tests/stage24-verification.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.6.1",
+    "@mozilla/readability": "^0.6.0",
+    "jsdom": "^25.0.0",
+    "playwright": "^1.49.0",
+    "sharp": "^0.34.5",
+    "turndown": "^7.2.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^22.10.0",
+    "@types/sharp": "^0.31.1",
+    "@types/turndown": "^5.0.5",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

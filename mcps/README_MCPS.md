@@ -1,0 +1,42 @@
+﻿# MCP Notes
+
+This package contains source-only MCP servers plus a portable HTTP broker.
+
+## Components
+
+- `memory-store` (`1.14.0`): shared memory, Record, conversation reading, Stage Guard, ownership tools. Supports `antigravity`, `codex`, and `claude-code` / `cc` chains.
+- `web-fetcher` (`7.0.0`): page fetch, rich extraction, screenshots, sessions, visual inspection, AI summary/review. `modelChain` supports the three hosts; Claude Code is explicit or opt-in fallback to avoid hidden quota use.
+- `sandbox` (`1.13.1`): code execution, long-running launches, smart search, `sandbox_codex`, `sandbox_council`. Council now includes Claude Code provider support, Gemini CLI indexing, large-input chunking, and pressure-timeout handling.
+- `exa`: optional remote endpoint through `mcp-remote`; receiver must provide `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`.
+- `broker`: Streamable HTTP bridge exposing `/memory-store/mcp`, `/web-fetcher/mcp`, `/sandbox/mcp`, optional `/exa/mcp`, plus optional Playwright and sequential-thinking endpoints.
+
+## Chain Values
+
+Use `auto | antigravity | codex | claude-code | cc` where supported.
+
+- `auto`: current host first; other hosts only when the tool explicitly supports fallback.
+- `antigravity`: force Antigravity Language Server / model route.
+- `codex`: force Codex local thread/model route.
+- `claude-code` / `cc`: force Claude Code local JSONL / CLI route.
+
+Prefer `dataChain` for conversation/source data and `modelChain` for model calls when a tool supports split routing.
+
+## Runtime Data
+
+Default portable data root:
+
+```text
+%USERPROFILE%/.codex-toolkit/
+```
+
+Useful environment variables:
+
+- `CODEX_TOOLKIT_DATA_ROOT`
+- `CODEX_TOOLKIT_MCP_ROOT`
+- `MEMORY_STORE_DATA_ROOT`
+- `SANDBOX_DATA_ROOT`
+- `WEB_FETCHER_PROFILES_DIR`
+- `ANTIGRAVITY_CONVERSATIONS_DIR` if Antigravity is installed in a non-default place
+- `EXA_MCP_REMOTE_URL` / `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL` for Exa only
+
+Do not package runtime data, private keys, sessions, SQLite databases, logs, or browser profiles.

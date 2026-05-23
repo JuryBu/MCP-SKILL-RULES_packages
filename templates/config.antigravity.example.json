@@ -1,0 +1,33 @@
+﻿{
+  "mcpServers": {
+    "memory-store": {
+      "command": "node",
+      "args": ["<toolkit-root>\\mcps\\memory-store\\dist\\index.js"],
+      "env": {
+        "MEMORY_STORE_DATA_ROOT": "%USERPROFILE%\\.codex-toolkit\\memory-store"
+      }
+    },
+    "web-fetcher": {
+      "command": "node",
+      "args": ["<toolkit-root>\\mcps\\web-fetcher\\dist\\index.js"],
+      "env": {
+        "WEB_FETCHER_PROFILES_DIR": "%USERPROFILE%\\.codex-toolkit\\web-fetcher-profiles"
+      }
+    },
+    "sandbox": {
+      "command": "node",
+      "args": ["<toolkit-root>\\mcps\\sandbox\\dist\\index.js"],
+      "env": {
+        "SANDBOX_DATA_ROOT": "%USERPROFILE%\\.codex-toolkit\\sandbox-data"
+      }
+    },
+    "exa": {
+      "command": "cmd.exe",
+      "args": ["/d", "/s", "/c", "npx.cmd -y mcp-remote %EXA_MCP_REMOTE_URL%"],
+      "env": {
+        "EXA_MCP_REMOTE_URL": "<set-on-receiver-machine-only>"
+      },
+      "disabled": true
+    }
+  }
+}
