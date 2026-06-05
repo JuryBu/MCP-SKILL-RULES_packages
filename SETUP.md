@@ -154,3 +154,7 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;you
 - `node_modules/` and `dist/` are intentionally not tracked.
 - Runtime folders such as `sandbox-data/`, browser profiles, logs, sessions, JSONL histories, and SQLite databases must stay out of git.
 - Claude Code fallback should usually be explicit-only to avoid hidden quota usage.
+
+## Windsurf / WSF
+
+Use `templates/config.windsurf.example.json` as a receiver-side example for %USERPROFILE%/.codeium/windsurf/mcp_config.json. Windsurf participates as a data source through dataChain=windsurf; model calls should use Codex, Antigravity, or Claude Code routes.

@@ -180,21 +180,23 @@
 
 ---
 
-## 三源互通体系
+## 四源互通体系
 
-当前环境已部署三个 AI 宿主的共享 MCP 体系：
+当前环境可部署四个 AI 宿主/数据源的共享 MCP 体系：
 - **Antigravity**（反重力 IDE，Claude 模型）
 - **Codex**（OpenAI Codex CLI，GPT 模型）
 - **Claude Code**（CC 桌面版，Claude 模型，即你自己）
+- **Windsurf**（WSF / Cascade，本包主要支持本地对话数据读取）
 
-三者通过共享 HTTP Broker 接入同一组 MCP 服务器，数据互通。
+四者通过共享 HTTP Broker 接入同一组 MCP 服务器；Windsurf 主要参与数据互通，模型调用仍走 Antigravity / Codex / Claude Code。
 
 ### 链路参数（chain / dataChain / modelChain）
 
 - `auto`（默认）：优先走当前宿主，不可用时尝试其它链路
 - `antigravity`：强制走 Antigravity 链路
 - `codex`：强制走 Codex 链路
-- `claude-code` / `cc`：强制走 Claude Code 链路
+- claude-code / cc：强制走 Claude Code 链路
+- windsurf / wsf：强制读取 Windsurf / Cascade 本地对话数据；不作为 modelChain
 
 支持 `dataChain`（数据来源）/ `modelChain`（模型调用）拆分的工具，未填时继承 `chain`。
 
@@ -304,4 +306,3 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它：
 - Codex 定位：大规模代码审核、跨文件重构、长链路代码生成、独立质量检查
 - 双重 Review 流程：Stage 完成后先调 Codex 独立 Review，等报告后自己再做一轮，两轮发现整合到最终反馈
 - 后台模式：`sandbox_codex(background=true)` 启动，`action="check", waitSeconds=45` 轮询
-

@@ -1,4 +1,4 @@
-# Private Exclude Checklist
+﻿# Private Exclude Checklist
 
 打包发送前，检查工具包内不应出现以下内容：
 
@@ -18,3 +18,5 @@ Select-String -Path .\**\* -Pattern '<发送方用户名>','<发送方生日>','
 Get-ChildItem -Recurse -Directory -Include node_modules,dist,sessions,workspaces,sandbox-data
 Get-ChildItem -Recurse -File -Include auth.json,*.sqlite,*.sqlite-wal,*.sqlite-shm
 ```
+
+- Windsurf / Cascade local conversation data and ~/.codeium/windsurf runtime state must not be packaged.

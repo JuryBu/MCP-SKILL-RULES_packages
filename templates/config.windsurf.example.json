@@ -1,0 +1,19 @@
+﻿{
+  "mcpServers": {
+    "memory-store": {
+      "serverUrl": "http://127.0.0.1:14588/memory-store/mcp"
+    },
+    "web-fetcher": {
+      "serverUrl": "http://127.0.0.1:14588/web-fetcher/mcp"
+    },
+    "sandbox": {
+      "serverUrl": "http://127.0.0.1:14588/sandbox/mcp"
+    },
+    "sequential-thinking": {
+      "serverUrl": "http://127.0.0.1:14588/sequential-thinking/mcp"
+    },
+    "exa": {
+      "serverUrl": "http://127.0.0.1:14588/exa/mcp"
+    }
+  }
+}

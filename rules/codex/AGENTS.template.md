@@ -623,7 +623,7 @@
 - Codex 侧本地 MCP 可通过 `%USERPROFILE%\\.codex\\mcp-http-broker` 或工具包内 broker 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
 - Codex HTTP broker 的后端进程是共享的，不具备每个对话独立的“当前对话”状态；凡是会读取或写入当前对话的工具调用，都必须显式传稳定 `conversationId`。
 - Codex HTTP broker 下的持久资源也应显式带稳定 `ownerId`：`web_interact` / `web_pipeline` 的 session，`sandbox_session`，`sandbox_launch`，`sandbox_codex` 后台任务，`smart_search(background=true)`，`sandbox_council(background=true)`。未传时按 `global` 兼容旧调用，但不要跨 owner 读写或 kill/close。
-- 当前共享 MCP 正在增加双向跨链路访问能力；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex` 三个取值。
+- 当前共享 MCP 支持跨链路访问；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex | claude-code | cc | windsurf | wsf`。
 - `chain="auto"` 表示优先使用当前宿主链路；当前宿主不可用或模型调用失败时才尝试另一侧链路。
 
 - `chain="antigravity"` 表示强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错。
@@ -837,6 +837,3 @@
 
 - 使用 Playwright 时应操控 Edge 浏览器。
 - Codex 侧会存在子代理线程和 exec 线程；涉及历史对话、审核报告或模型桥结果时，要明确它们是否属于主线程正文还是外链附件。
-
-
-

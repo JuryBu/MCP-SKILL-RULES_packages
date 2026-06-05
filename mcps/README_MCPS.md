@@ -4,20 +4,21 @@ This package contains source-only MCP servers plus a portable HTTP broker.
 
 ## Components
 
-- `memory-store` (`1.15.3`): shared memory, Record, conversation reading, Golden Extract, Stage Guard, ownership tools, and three-host conversation / model routing. Supports `antigravity`, `codex`, and `claude-code` / `cc` chains where applicable.
-- `web-fetcher` (`7.0.0`): headless browsing, page fetch, rich extraction, screenshots, sessions, local multi-format file handling, visual inspection, AI summary/review, and desktop / browser interaction helpers. `modelChain` supports the three hosts; Claude Code is explicit or opt-in fallback to avoid hidden quota use.
+- `memory-store` (`1.15.3`): shared memory, Record, conversation reading, Golden Extract, Stage Guard, ownership tools, and four-host conversation/data routing; model routing currently uses Antigravity, Codex, or Claude Code. Supports `antigravity`, `codex`, `claude-code` / `cc`, and `windsurf` / `wsf` chains where applicable.
+- `web-fetcher` (`7.0.0`): headless browsing, page fetch, rich extraction, screenshots, sessions, local multi-format file handling, visual inspection, AI summary/review, and desktop / browser interaction helpers. `modelChain` supports Antigravity, Codex, and Claude Code; Windsurf is dataChain-only in this package. Claude Code is explicit or opt-in fallback to avoid hidden quota use.
 - `sandbox` (`1.13.3`): code execution, persistent sessions, batch tasks, long-running launches, smart search, `sandbox_codex`, and `sandbox_council`. Council includes Claude Code provider support, Gemini CLI indexing, large-input chunking, complex-file indexing, provider fallback, and pressure-timeout handling.
 - `exa`: optional remote endpoint through `mcp-remote`; receiver must provide `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`.
 - `broker` (`0.1.0`): Streamable HTTP bridge exposing `/memory-store/mcp`, `/web-fetcher/mcp`, `/sandbox/mcp`, optional `/exa/mcp`, plus optional Playwright and sequential-thinking endpoints.
 
 ## Chain Values
 
-Use `auto | antigravity | codex | claude-code | cc` where supported.
+Use `auto | antigravity | codex | claude-code | cc | windsurf | wsf` where supported.
 
 - `auto`: current host first; other hosts only when the tool explicitly supports fallback.
 - `antigravity`: force Antigravity Language Server / model route.
 - `codex`: force Codex local thread/model route.
 - `claude-code` / `cc`: force Claude Code local JSONL / CLI route.
+- `windsurf` / `wsf`: force Windsurf / Cascade local conversation data route where supported; model calls should use another `modelChain` because this package does not expose a Windsurf model bridge.
 
 Prefer `dataChain` for conversation/source data and `modelChain` for model calls when a tool supports split routing.
 

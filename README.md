@@ -2,19 +2,19 @@
 
 面向 AI 编程环境的可移植 MCP + Skills + Rules 工具包。
 
-这套项目最早来自 Antigravity 内部自用 MCP，现在已经整理成 **Antigravity / Codex / Claude Code（CC）三源兼容、数据互通** 的工具体系。目标是让不同 AI 宿主共享同一套本地能力、同一套记忆/Record 数据和相近的工作习惯。
+这套项目最早来自 Antigravity 内部自用 MCP，现在已经整理成 **Antigravity / Codex / Claude Code（CC）/ Windsurf（WSF）四源兼容、数据互通** 的工具体系。目标是让不同 AI 宿主共享同一套本地能力、同一套记忆/Record 数据和相近的工作习惯。
 
 当前公开快照重点包含 **MCP + Rules**。`skills` 暂未随本次快照打包进仓库，但仓库名保留 `SKILL`，用于后续公开整理可迁移 Skills。
 
-> 2026-06-05 refresh: `memory-store` is now `1.15.3`, `sandbox` is now `1.13.3`, `web-fetcher` remains `7.0.0`, and the Codex / Claude Code rules templates were refreshed and privacy-scrubbed.
+> 2026-06-05 refresh: `memory-store` is now `1.15.3`, `sandbox` is now `1.13.3`, `web-fetcher` remains `7.0.0`, and the Codex / Claude Code rules templates were refreshed, Windsurf rules were added, and all rules were privacy-scrubbed.
 
 ---
 
 ## 核心特点
 
-### 三源数据互通
+### 四源数据互通
 
-- 支持 Antigravity、Codex、Claude Code（CC）三类宿主。
+- 支持 Antigravity、Codex、Claude Code（CC）、Windsurf（WSF）四类宿主。
 - 通过共享 HTTP broker 暴露同一组 MCP endpoint。
 - 通过统一数据目录让 memory、Record、会话读取、Stage Guard 等能力跨宿主复用。
 - 支持 `chain`、`dataChain`、`modelChain`，可以把「对话数据来源」和「模型调用来源」拆开。
@@ -22,6 +22,7 @@
 常见用法：
 
 - `dataChain="claude-code"`：读取 Claude Code 本地对话数据。
+- `dataChain="windsurf"`：读取 Windsurf / Cascade 本地对话数据；本包不提供 `modelChain="windsurf"`。
 - `dataChain="codex"`：读取 Codex 本地线程 / JSONL / SQLite 索引。
 - `dataChain="antigravity"`：读取 Antigravity Language Server 对话数据。
 - `modelChain="codex"`：使用 Codex 模型桥。
@@ -34,10 +35,10 @@
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
-| `memory-store` | `1.15.3` | 记忆库、对话读取、Record、Conversation、Golden Extract、Stage Guard、跨宿主链路 |
+| `memory-store` | `1.15.3` | 记忆库、对话读取、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
 | `sandbox` | `1.13.3` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
-| `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code 等宿主复用 |
+| `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
 
 #### memory-store：Conversation / Record / Guard 中枢
 
@@ -46,7 +47,7 @@
 重点能力：
 
 - `memory_query` / `memory_write` / `memory_update` / `memory_batch`：跨工作区记忆读写、查询和维护。
-- `conversation_read_original`：按 ID、标题、关键词读取 Antigravity / Codex / Claude Code 的原始对话。
+- `conversation_read_original`：按 ID、标题、关键词读取 Antigravity / Codex / Claude Code / Windsurf 的原始对话。
 - `conversation_golden_extract`：从长对话里提取高价值片段。
 - `record_manage`：生成和维护结构化 Record，把长对话沉淀成阶段、输出、风险、验证和经验。
 - `stage_guard`：按 `Task.md` 阶段做门禁检查，防止漏做、早报完成、证据不足和 Guard 自指循环。
@@ -101,6 +102,7 @@ Rules 覆盖三个宿主：
 - Codex 可选 system prompt：`rules/codex/system-prompt.template.md`
 - Antigravity：`rules/antigravity/GEMINI.template.md`
 - Claude Code（CC）：`rules/claude-code/CLAUDE.template.md`
+- Windsurf（WSF）：`rules/windsurf/Windsurf_Global_Rules.template.md`
 
 Rules 主要约束：
 
@@ -119,9 +121,9 @@ Rules 主要约束：
 | 模块 | 路径 | 说明 |
 | --- | --- | --- |
 | MCP servers | `mcps/` | `memory-store`、`web-fetcher`、`sandbox` 和可移植 HTTP broker |
-| Rules 模板 | `rules/` | Codex、Antigravity、Claude Code 三套独立模板 |
+| Rules 模板 | `rules/` | Codex、Antigravity、Claude Code、Windsurf 四套独立模板 |
 | 安装脚本 | `install/` | Windows PowerShell 构建、配置、broker 启停和 smoke test 脚本 |
-| 配置模板 | `templates/` | Codex、Antigravity、Claude Code 和环境变量示例 |
+| 配置模板 | `templates/` | Codex、Antigravity、Claude Code、Windsurf 和环境变量示例 |
 | 测试样例 | `design-tests/` | 本地测试页面和 MCP HTTP smoke test 辅助文件 |
 
 ## Windows 快速开始
@@ -203,7 +205,7 @@ MIT. See `LICENSE`.
 
 Portable MCP + Skills + Rules package for AI coding environments.
 
-This project started as an Antigravity-only internal MCP stack and has now been reorganized into a shared toolkit for **Antigravity / Codex / Claude Code (CC) with cross-host data interoperability**. The goal is to let different AI hosts share the same local capabilities, the same memory/Record data, and similar working habits.
+This project started as an Antigravity-only internal MCP stack and has now been reorganized into a shared toolkit for **Antigravity / Codex / Claude Code (CC) / Windsurf (WSF) with cross-host data interoperability**. The goal is to let different AI hosts share the same local capabilities, the same memory/Record data, and similar working habits.
 
 The current public snapshot focuses on **MCP + Rules**. Skills are not bundled in this snapshot yet; `SKILL` in the repository name is reserved for future public skill packaging.
 
@@ -219,6 +221,7 @@ The current public snapshot focuses on **MCP + Rules**. Skills are not bundled i
 Common examples:
 
 - `dataChain="claude-code"`: read Claude Code local conversation data.
+- `dataChain="windsurf"`: read Windsurf / Cascade local conversation data; this package does not expose `modelChain="windsurf"`.
 - `dataChain="codex"`: read Codex local thread / JSONL / SQLite index data.
 - `dataChain="antigravity"`: read Antigravity Language Server conversation data.
 - `modelChain="codex"`: use the Codex model bridge.
@@ -229,7 +232,7 @@ Common examples:
 
 | MCP | Version | Main capabilities |
 | --- | --- | --- |
-| `memory-store` | `1.15.3` | Memory, conversation reading, Records, Conversation, Golden Extract, Stage Guard, cross-host chains |
+| `memory-store` | `1.15.3` | Memory, conversation reading, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
 | `sandbox` | `1.13.3` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
 | `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code and other hosts |
@@ -292,6 +295,7 @@ Rules cover:
 - Optional Codex system prompt: `rules/codex/system-prompt.template.md`
 - Antigravity: `rules/antigravity/GEMINI.template.md`
 - Claude Code (CC): `rules/claude-code/CLAUDE.template.md`
+- Windsurf (WSF): `rules/windsurf/Windsurf_Global_Rules.template.md`
 
 Rules mainly define:
 
@@ -310,7 +314,7 @@ Rules mainly define:
 | MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, and a portable HTTP broker |
 | Host rules | `rules/` | Separate templates for Codex, Antigravity, and Claude Code |
 | Install scripts | `install/` | Windows PowerShell scripts for build, config, broker lifecycle, and smoke tests |
-| Config templates | `templates/` | Codex, Antigravity, Claude Code, and environment examples |
+| Config templates | `templates/` | Codex, Antigravity, Claude Code, Windsurf, and environment examples |
 | Smoke tests | `design-tests/` | Local pages and MCP HTTP smoke test helpers |
 
 ## Quick Start On Windows

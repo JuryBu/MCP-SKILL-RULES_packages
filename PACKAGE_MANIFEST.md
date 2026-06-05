@@ -9,11 +9,13 @@ Included:
 - `templates/config.codex.toml`
 - `templates/config.antigravity.example.json`
 - `templates/config.claude.example.json`
+- `templates/config.windsurf.example.json`
 - `templates/env.example.ps1`
 - `rules/codex/AGENTS.template.md`
 - `rules/codex/system-prompt.template.md`
 - `rules/antigravity/GEMINI.template.md`
 - `rules/claude-code/CLAUDE.template.md`
+- `rules/windsurf/Windsurf_Global_Rules.template.md`
 - `rules/README_RULES.md`
 - `rules/RULES_PORTING_NOTES.md`
 - `install/*.ps1`
@@ -24,8 +26,8 @@ Updated in this snapshot:
 - `memory-store` refreshed to `1.15.3`.
 - `sandbox` refreshed to `1.13.3`.
 - `web-fetcher` source refreshed from the current local tree; version remains `7.0.0`.
-- Codex and Claude Code rules refreshed from current local templates, then privacy-scrubbed.
-- Three-host wording remains Antigravity + Codex + Claude Code / CC with shared data and broker routing.
+- Codex and Claude Code rules refreshed from current local templates, Windsurf rules added from WSF config, then all rules privacy-scrubbed.
+- Four-host wording remains Antigravity + Codex + Claude Code / CC + Windsurf / WSF with shared data and broker routing.
 
 Excluded:
 
@@ -34,7 +36,6 @@ Excluded:
 - `.git/`, editor state, temp folders
 - API keys, auth files, cookies, browser profiles
 - real memory-store data and Record files
-- Codex / Antigravity / Claude Code sessions
+- Codex / Antigravity / Claude Code / Windsurf sessions
 - SQLite databases, logs, JSONL histories
 - sender-specific paths, birthday, account links, sender-specific project branding
-

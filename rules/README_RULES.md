@@ -6,7 +6,10 @@ This folder has one Rules template per host:
 - `codex/system-prompt.template.md` → optional Codex `model_instructions_file` target
 - `antigravity/GEMINI.template.md` → merge into Antigravity `GEMINI.md`
 - `claude-code/CLAUDE.template.md` → merge into `%USERPROFILE%/.claude/CLAUDE.md`
+- `windsurf/Windsurf_Global_Rules.template.md` → merge into Windsurf global rules, usually `%USERPROFILE%/.codeium/windsurf/memories/global_rules.md`
 
-All three templates are privacy-scrubbed handoff versions. They preserve work style, MCP usage rules, subagent/council habits, evidence discipline, PPT/document QA habits, and three-source chain conventions, but remove sender-specific birthday, account links, local private paths, private memories, and project branding.
+All four templates are privacy-scrubbed handoff versions. They preserve work style, MCP usage rules, subagent/council habits, evidence discipline, PPT/document QA habits, and four-source chain conventions, but remove sender-specific birthday, account links, local private paths, private memories, login-state claims, and project branding.
 
-Receiver should edit personal style, account references, model preferences, and host-specific paths after import.
+Windsurf support is data-chain oriented: `dataChain=windsurf` can read Cascade conversation data where supported, while `modelChain=windsurf` is intentionally not advertised because Windsurf has no stable local model bridge in this package.
+
+Receiver should edit personal style, account references, model preferences, host-specific paths, and Windsurf memory/config locations after import.
