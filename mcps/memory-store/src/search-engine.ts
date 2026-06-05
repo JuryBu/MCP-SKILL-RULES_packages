@@ -9,7 +9,7 @@
 
 import Fuse from "fuse.js";
 import { callModelResponse } from "./model-bridge.js";
-import { resolveChainSplit, type Chain, type ChainInput } from "./chain.js";
+import { resolveChainSplit, type Chain, type ChainInput, type DataChainInput } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 
 // ============= 类型定义 =============
@@ -45,7 +45,7 @@ export interface SearchOptions {
     contextLines?: number;  // exact 模式上下文行数，默认 2
     threshold?: number;     // fuzzy 阈值，默认 0.4
     chain?: ChainInput;     // 兼容旧参数：未指定 modelChain 时作为模型链路
-    dataChain?: ChainInput; // 入口兼容字段；通用搜索引擎本身不读取外部数据
+    dataChain?: DataChainInput; // 入口兼容字段；通用搜索引擎本身不读取外部数据
     modelChain?: ChainInput;// smart 模式模型链路
 }
 
@@ -229,7 +229,7 @@ function buildSmartSnippet(block: TextBlock, query: string, maxChars = 900): str
 async function searchSmart(
     blocks: TextBlock[],
     query: string,
-    opts: { limit?: number; chain?: ChainInput; dataChain?: ChainInput; modelChain?: ChainInput },
+    opts: { limit?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
 ): Promise<SearchResult[]> {
     if (blocks.length === 0) return [];
 

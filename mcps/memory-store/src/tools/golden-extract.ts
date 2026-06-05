@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { parseRounds, type ConversationRound } from "../trajectory.js";
@@ -8,8 +8,9 @@ import { type MemoryIndexEntry } from "../cache.js";
 import { loadConversationData } from "../conversation-bridge.js";
 import { callModelResponse } from "../model-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, type ChainInput } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, type ChainInput, type DataChainInput } from "../chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "../ls-model-defaults.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * conversation_golden_extract — 黄金片段提取
@@ -29,9 +30,9 @@ export function registerGoldenExtract(server: McpServer): void {
             stepEnd: z.number().optional().describe("结束步骤偏移"),
             autoCompare: z.boolean().optional().describe("是否自动与记忆对比去重（默认 true）"),
             workspace: z.string().optional().describe("搜索去重的目标工作区（默认搜索全部）"),
-            chain: z.enum(CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路，默认 auto"),
-            dataChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("读取对话数据的宿主链路；未填用 chain"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("调用模型提取片段的链路；未填用 chain"),
+            chain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain"),
+            dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("读取对话数据的宿主链路；未填用 chain，支持 windsurf"),
+            modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain。Windsurf 只支持 dataChain"),
             background: z.boolean().optional().describe("Codex 链路长模型调用建议设为 true，立即返回 taskId，后续用 taskId 查询"),
             taskId: z.string().optional().describe("查询后台提取任务的 taskId"),
             waitSeconds: z.number().optional().describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
@@ -75,8 +76,8 @@ type GoldenExtractArgs = {
     stepEnd?: number;
     autoCompare?: boolean;
     workspace?: string;
-    chain?: ChainInput;
-    dataChain?: ChainInput;
+    chain?: ChainInput | DataChainInput;
+    dataChain?: DataChainInput;
     modelChain?: ChainInput;
     background?: boolean;
     taskId?: string;

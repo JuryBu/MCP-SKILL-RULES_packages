@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { saveTempFile } from "../temp-store.js";
@@ -9,12 +9,14 @@ import {
     type Depth,
     type ExtraType,
     type ConversationRound,
+    type CompactionMode,
 } from "../trajectory.js";
 import { shouldAutoUpdateRecord } from "../record-generator.js";
 import { generateRecord, countPhasesInRecord } from "../record-generator.js";
 import { readRecord, writeRecord, resolveWorkspaceHashForRecord, findRecordHash, writeRecordSidecar } from "../record-store.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
-import { CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 import { listConversationsByMtime } from "../ls-client.js";
 import {
     deepLocateCodexConversations,
@@ -32,6 +34,8 @@ import {
     type ClaudeCodeDeepLocateResult,
     type ClaudeCodeThreadInfo,
 } from "../claude-code-client.js";
+import { listRecentWindsurfThreads, type WindsurfConversationSummary } from "../windsurf-client.js";
+import type { DataChain } from "../chain.js";
 import type { SearchMode, TextBlock } from "../search-engine.js";
 import { buildRecordReaderIndex } from "../record-reader.js";
 import { formatAttachmentOverview, materializeRoundAttachments } from "../conversation-attachments.js";
@@ -40,6 +44,26 @@ import { cancelBackgroundTask, formatBackgroundTask, startBackgroundTask, waitFo
 const CONVERSATION_FETCH_TEXT_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_FETCH_TEXT_MAX_CHARS || 2_000_000);
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS || 2_000_000);
 const CONVERSATION_SEARCH_BLOCK_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_SEARCH_BLOCK_MAX_CHARS || 60_000);
+const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read"]);
+
+export function shouldRequireExplicitConversationId(
+    action: string,
+    dataChain: DataChain,
+    conversationId?: string,
+): boolean {
+    return CONVERSATION_DIRECT_ACTIONS.has(action)
+        && !conversationId?.trim()
+        && dataChain !== "antigravity";
+}
+
+function formatMissingConversationIdMessage(action: string, dataChain: DataChain): string {
+    return [
+        `❌ conversation_read_original(${action}) 需要显式 conversationId`,
+        `当前 dataChain=${dataChain}，共享后端不能安全推断“当前对话”，否则可能读到别的宿主或别的窗口里的对话。`,
+        `做法：先用 conversation_read_original(action="list", dataChain="${dataChain === "auto" ? "codex|antigravity|claude-code|windsurf" : dataChain}", query="标题或关键词") 定位 ID，再把 conversationId 传给 ${action}。`,
+        `如果你确实要读取 Antigravity 当前窗口，请显式传 dataChain="antigravity"；工具会在结果里显示实际读取到的对话 ID。`,
+    ].join("\n");
+}
 
 function normalizeListQuery(input: string): string {
     return input
@@ -58,7 +82,7 @@ export interface ConversationListCandidate {
 }
 
 function buildConversationListLines(
-    resolved: "antigravity" | "codex" | "claude-code",
+    resolved: DataChain,
     shown: ConversationListCandidate[],
     total: number,
     query?: string,
@@ -109,6 +133,32 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): Conversation
             item.lastPrompt ? `lastPrompt=${item.lastPrompt.slice(0, 40)}` : "",
         ].filter(Boolean).join(" / "),
     };
+}
+
+function candidateFromWindsurfThread(item: WindsurfConversationSummary): ConversationListCandidate {
+    return {
+        id: item.id,
+        title: item.title || item.summary || "",
+        workspace: item.cwd || "",
+        updatedAt: item.lastModifiedTime || item.createdTime || "",
+        detail: [
+            "windsurf",
+            item.status,
+            item.stepCount ? `${item.stepCount} steps` : "",
+            item.lastGeneratorModelUid,
+        ].filter(Boolean).join(" / "),
+    };
+}
+
+function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof loadConversationData>>): string {
+    const skipped = loaded?.windsurfData?.skippedSteps || [];
+    if (!loaded?.windsurfData?.partial || skipped.length === 0) return "";
+    const shown = skipped.slice(0, 5).map(item => `offset ${item.offset}`).join(", ");
+    const more = skipped.length > 5 ? ` 等 ${skipped.length} 个` : "";
+    return [
+        `⚠️ WSF 读取已降级：跳过超大 step ${shown}${more}`,
+        "这些 step 超过 Windsurf LS 单步 4MB 限制，正文中会显示占位轮次；本次 fetch 不会自动触发 Record 更新，避免把不完整原文写成正式 Record。",
+    ].join("\n");
 }
 
 export function applyCodexContextProbeMatchesToCandidates(
@@ -261,7 +311,7 @@ export interface ConversationListFallbackPlan {
 }
 
 export function getConversationListFallbackPlan(
-    resolved: "antigravity" | "codex" | "claude-code",
+    resolved: DataChain,
     requestedMode: SearchMode,
     contextProbeHitCount: number,
 ): ConversationListFallbackPlan {
@@ -272,6 +322,20 @@ export function getConversationListFallbackPlan(
             returnContextProbeHitsFirst: false,
             deepSearchSuggested: false,
             skipped: [],
+        };
+    }
+
+    if (resolved === "windsurf") {
+        return {
+            includeRawPreview: false,
+            allowSmartSearch: requestedMode === "smart",
+            returnContextProbeHitsFirst: false,
+            deepSearchSuggested: false,
+            skipped: [
+                "raw-trajectory-preview",
+                requestedMode === "auto" ? "smart-auto" : "",
+                "deep-locate-unsupported",
+            ].filter(Boolean),
         };
     }
 
@@ -342,7 +406,7 @@ function contentHasQuerySignal(content: string, query: string): boolean {
 }
 
 async function buildListSearchBlocks(
-    resolved: "antigravity" | "codex" | "claude-code",
+    resolved: DataChain,
     candidates: ConversationListCandidate[],
     includeRawPreview: boolean,
     query = "",
@@ -396,6 +460,7 @@ function buildConversationText(
     extraTypes: ExtraType[] = [],
     expandedChildren: Array<{ thread: { id: string; title: string }; rounds: ConversationRound[] }> = [],
     childDiagnostics: Array<{ threadId: string; nickname?: string; reason: string; detail: string }> = [],
+    compactionMode: CompactionMode = "folded",
 ): string {
     const lines: string[] = [];
     let usedChars = 0;
@@ -418,7 +483,7 @@ function buildConversationText(
     pushLine("");
 
     for (const round of rounds) {
-        if (!pushLine(formatRound(round, depth, extraTypes))) break;
+        if (!pushLine(formatRound(round, depth, extraTypes, { compactionMode }))) break;
         if (!pushLine("")) break;
     }
 
@@ -429,7 +494,7 @@ function buildConversationText(
             if (!pushLine(`## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`)) break;
             if (!pushLine("")) break;
             for (const round of child.rounds) {
-                if (!pushLine(formatRound(round, depth, extraTypes))) break;
+                if (!pushLine(formatRound(round, depth, extraTypes, { compactionMode }))) break;
                 if (!pushLine("")) break;
             }
             if (truncated) break;
@@ -525,12 +590,12 @@ export function registerConversation(server: McpServer): void {
   search — 在对话中关键词搜索，返回匹配的上下文
   read — 读取指定轮次范围的对话内容
   deep_locate — Codex/Claude Code 后台深搜正文片段以定位 conversationId
-不填 conversationId 默认读取当前对话。`,
+fetch/search/read 在共享后端下必须传 conversationId；仅显式 dataChain="antigravity" 保留读取当前窗口的兼容路径。`,
         {
             action: z.enum(["list", "fetch", "search", "read", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
                 .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / deep_locate=后台深搜定位对话"),
             conversationId: z.string().optional()
-                .describe("对话 UUID（不填默认当前对话）"),
+                .describe("对话 UUID；fetch/search/read 建议总是显式传入，避免共享后端串到其它当前对话"),
             conversationIds: z.array(z.string()).optional()
                 .describe("deep_locate 可选：限制只扫描这些 Codex conversationId"),
             query: z.string().optional()
@@ -539,6 +604,8 @@ export function registerConversation(server: McpServer): void {
                 .describe("Codex/Claude Code list 模式：从当前可见对话截取的 50-120 字上下文指纹，用 fixed-string 语义的硬匹配标记候选；不会自动选中"),
             depth: z.enum(["brief", "normal", "full"]).default("normal")
                 .describe("返回详细度：brief=截断100字 / normal=完整文本 / full=含思考+工具结果"),
+            compactionMode: z.enum(["folded", "full", "omit"]).optional()
+                .describe("Claude Code 压缩续聊摘要读取方式：folded=默认折叠为临时文件 / full=展开但标记 / omit=仅保留省略标记；未传时 depth=full 自动 full，其余 folded"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
                 .describe("list/search 模式：auto/exact/fuzzy/smart，默认 auto"),
             contextRounds: z.number().default(2).optional()
@@ -563,12 +630,11 @@ export function registerConversation(server: McpServer): void {
                 .describe("read 模式：结束轮次"),
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
                 .describe("额外拉取的内容类型"),
-            chain: z.enum(CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路，默认 auto"),
-            dataChain: z.enum(CHAIN_INPUT_VALUES).optional()
-                .describe("读取对话数据的宿主链路；未填用 chain。支持 antigravity/codex/claude-code"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional()
-                .describe("smart 搜索调用模型的链路；未填用 chain"),
+            chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
+                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
+            dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
+                .describe("读取对话数据的宿主链路；未填用 chain。支持 antigravity/codex/claude-code/windsurf"),
+            modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain。Windsurf 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
         },
@@ -583,6 +649,7 @@ export function registerConversation(server: McpServer): void {
                     query,
                     contextProbe,
                     depth = "normal",
+                    compactionMode,
                     mode = "auto",
                     contextRounds = 2,
                     limit = 8,
@@ -602,6 +669,13 @@ export function registerConversation(server: McpServer): void {
                     link = DEFAULT_LINK_MODE,
                 } = params;
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
+                const effectiveCompactionMode: CompactionMode = compactionMode || (depth === "full" ? "full" : "folded");
+
+                if (shouldRequireExplicitConversationId(action, chains.dataChain, conversationId)) {
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: formatMissingConversationIdMessage(action, chains.dataChain) }],
+                    }, startTime);
+                }
 
                 if (action === "deep_locate_status") {
                     const task = await waitForBackgroundTask(taskId || "", waitSeconds || 0);
@@ -711,7 +785,8 @@ export function registerConversation(server: McpServer): void {
                         : Math.max(max * 3, 30);
                     let codexThreads: CodexThreadInfo[] = [];
                     let claudeCodeThreads: ClaudeCodeThreadInfo[] = [];
-                    const candidates: ConversationListCandidate[] = resolved === "antigravity"
+                    let windsurfThreads: WindsurfConversationSummary[] = [];
+                    let candidates: ConversationListCandidate[] = resolved === "antigravity"
                         ? listConversationsByMtime({ limit: candidateLimit }).map(item => ({
                             id: item.id,
                             title: item.title || "",
@@ -721,7 +796,32 @@ export function registerConversation(server: McpServer): void {
                         }))
                         : resolved === "codex"
                             ? (codexThreads = listRecentCodexThreads(candidateLimit)).map(candidateFromCodexThread)
-                            : (claudeCodeThreads = listRecentClaudeCodeThreads(candidateLimit)).map(candidateFromClaudeCodeThread);
+                            : resolved === "claude-code"
+                                ? (claudeCodeThreads = listRecentClaudeCodeThreads(candidateLimit)).map(candidateFromClaudeCodeThread)
+                                : (windsurfThreads = await listRecentWindsurfThreads(candidateLimit)).map(candidateFromWindsurfThread);
+                    if (resolved === "codex" && normalizedQuery) {
+                        const exactThread = getCodexThread(query || "");
+                        if (exactThread && !codexThreads.some(item => item.id === exactThread.id)) {
+                            codexThreads = [exactThread, ...codexThreads];
+                            candidates = [candidateFromCodexThread(exactThread), ...candidates];
+                        }
+                    }
+                    if (resolved === "claude-code" && normalizedQuery) {
+                        const exactThread = getClaudeCodeThread(query || "");
+                        if (exactThread && !claudeCodeThreads.some(item => item.id === exactThread.id)) {
+                            claudeCodeThreads = [exactThread, ...claudeCodeThreads];
+                            candidates = [candidateFromClaudeCodeThread(exactThread), ...candidates];
+                        }
+                    }
+                    if (resolved === "windsurf" && normalizedQuery) {
+                        const exactThread = windsurfThreads.find(item =>
+                            item.id.toLowerCase() === (query || "").toLowerCase() ||
+                            item.cascadeId.toLowerCase() === (query || "").toLowerCase()
+                        );
+                        if (exactThread && !candidates.some(item => item.id === exactThread.id)) {
+                            candidates = [candidateFromWindsurfThread(exactThread), ...candidates];
+                        }
+                    }
 
                     const probeResult = resolved === "codex"
                         ? annotateCodexContextProbeCandidates(candidates, codexThreads, contextProbe)
@@ -796,7 +896,7 @@ export function registerConversation(server: McpServer): void {
                             matchMode = "fuzzy";
                         }
 
-                        if (results.length === 0 && resolved !== "codex" && (requestedMode === "auto" || requestedMode === "smart")) {
+                        if (results.length === 0 && resolved === "antigravity" && (requestedMode === "auto" || requestedMode === "smart")) {
                             const smartBlocks = requestedMode === "smart"
                                 ? initialBlocks
                                 : await buildListSearchBlocks(resolved, probeResult.candidates, true, query || "");
@@ -834,7 +934,7 @@ export function registerConversation(server: McpServer): void {
                                 filtered = sortContextProbeFirst([...probeMatches, ...filtered]);
                                 matchMode = [matchMode, "context-probe"].filter(Boolean).join("+");
                             }
-                        } else if ((resolved === "codex" || resolved === "claude-code") && fallbackPlan.deepSearchSuggested) {
+                        } else if ((resolved === "codex" || resolved === "claude-code" || resolved === "windsurf") && fallbackPlan.deepSearchSuggested) {
                             const skipped = fallbackPlan.skipped.length ? `；已跳过 ${fallbackPlan.skipped.join(", ")}` : "";
                             listNotes.push(`⚠️ 快速定位未命中${skipped}；未执行 ${resolved} 原文全文扫描。`);
                             listNotes.push("💡 若 query 是正文片段，需使用后续 deep_locate 后台深搜；若已知对话，请传完整 conversationId。");
@@ -894,18 +994,24 @@ export function registerConversation(server: McpServer): void {
                     const tempPath = saveTempFile(
                         "conv",
                         cascadeId.slice(0, 8),
-                        buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics),
+                        buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics, "omit"),
                     );
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
+                    const partialWarning = formatWindsurfPartialWarning(loaded);
                     const cacheNote = loaded.chainUsed === "antigravity"
                         ? (loaded.fromCache ? " (从缓存)" : " (新拉取)")
                         : loaded.chainUsed === "codex"
                             ? " (Codex 本地会话)"
-                            : " (Claude Code 本地会话)";
+                            : loaded.chainUsed === "claude-code"
+                                ? " (Claude Code 本地会话)"
+                                : " (Windsurf Cascade)";
 
                     // v1.8: 自动触发 Record 更新检查
                     let recordNote = "";
                     try {
+                        if (loaded.windsurfData?.partial) {
+                            recordNote = "\n📋 Record 自动更新已跳过：WSF 本次原文读取不完整";
+                        } else {
                         const recordHash = findRecordHash(cascadeId) || resolveWorkspaceHashForRecord();
                         if (shouldAutoUpdateRecord(recordHash, cascadeId, rounds.length)) {
                             // 异步更新，不阻塞返回
@@ -933,12 +1039,13 @@ export function registerConversation(server: McpServer): void {
                                 .catch(err => console.error(`[record] 自动更新失败:`, err));
                             recordNote = "\n📋 Record 自动更新已触发（后台进行中）";
                         }
+                        }
                     } catch { /* 忽略 Record 检查错误 */ }
 
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${overview}${cacheNote}\n🔗 数据链路: ${loaded.chainUsed}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+                            text: `${overview}${cacheNote}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
                         }],
                     }, startTime);
                 }
@@ -956,7 +1063,7 @@ export function registerConversation(server: McpServer): void {
                         : [];
                     if (matches.length === 0 && mode === "exact") {
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `🔍 搜索 "${query}" — exact 模式未找到匹配` }],
+                                    content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
                         }, startTime);
                     }
                     if (matches.length === 0) {
@@ -986,7 +1093,7 @@ export function registerConversation(server: McpServer): void {
                             });
                             if (smartResults.length === 0) {
                                 return appendTiming({
-                                    content: [{ type: "text" as const, text: `🔍 搜索 "${query}" — 未找到匹配` }],
+                                    content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n🔍 搜索 "${query}" — 未找到匹配` }],
                                 }, startTime);
                             }
                             const smartRoundIndices = smartResults.map(r => Number(r.id));
@@ -998,14 +1105,14 @@ export function registerConversation(server: McpServer): void {
                             for (const ri of smartRoundIndices) {
                                 const round = displayRounds.find(item => item.roundIndex === ri);
                                 if (!round) continue;
-                                output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[]));
+                                output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
                                 output.push("");
                             }
                             if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
                             let text = output.join("\n");
                             if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
                             return appendTiming({
-                                content: [{ type: "text" as const, text: `🔗 数据链路: ${loaded.chainUsed} | 模型链路: ${chains.modelChain}\n\n${text}` }],
+                                content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed} | 模型链路: ${chains.modelChain}\n\n${text}` }],
                             }, startTime);
                         }
                         // 将 fuzzy 结果转换回轮次索引
@@ -1018,14 +1125,14 @@ export function registerConversation(server: McpServer): void {
                         for (const ri of fuzzyRoundIndices) {
                             const round = displayRounds.find(item => item.roundIndex === ri);
                             if (!round) continue;
-                            output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[]));
+                            output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
                             output.push("");
                         }
                         if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
                         let text = output.join("\n");
                         if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
+                            content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
                         }, startTime);
                     }
 
@@ -1049,7 +1156,7 @@ export function registerConversation(server: McpServer): void {
                     for (const ri of sortedRounds) {
                         const round = displayRounds.find(item => item.roundIndex === ri);
                         if (!round) continue;
-                        output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[]));
+                        output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
                         output.push("");
                     }
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
@@ -1061,7 +1168,7 @@ export function registerConversation(server: McpServer): void {
                         // full 深度不截断，写入临时文件
                         const slug = cascadeId.slice(0, 8);
                         const tmpPath = saveTempFile("search", slug, text);
-                        const summary = `🔗 数据链路: ${loaded.chainUsed}\n\n` + text.slice(0, 2000) + `\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`;
+                        const summary = `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n` + text.slice(0, 2000) + `\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`;
                         return appendTiming({
                             content: [{ type: "text" as const, text: summary }],
                         }, startTime);
@@ -1070,7 +1177,7 @@ export function registerConversation(server: McpServer): void {
                     }
 
                     return appendTiming({
-                        content: [{ type: "text" as const, text: `🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
+                        content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
                     }, startTime);
                 }
 
@@ -1095,7 +1202,7 @@ export function registerConversation(server: McpServer): void {
                     const selectedRounds = rounds.slice(start - 1, Math.min(end, rounds.length));
                     const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
                     for (let i = start; i <= Math.min(end, rounds.length); i++) {
-                        if (!pushOutputWithBuildBudget(output, formatRound(displayRounds[i - start], depth as Depth, extraTypes as ExtraType[]), buildState, "read 输出")) break;
+                        if (!pushOutputWithBuildBudget(output, formatRound(displayRounds[i - start], depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }), buildState, "read 输出")) break;
                         if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                     }
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
@@ -1108,7 +1215,7 @@ export function registerConversation(server: McpServer): void {
                             if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                             const { rounds: childDisplayRounds, truncated: childTruncated } = await materializeRoundAttachments(child.rounds, child.thread.id);
                             for (const round of childDisplayRounds) {
-                                if (!pushOutputWithBuildBudget(output, formatRound(round, depth as Depth, extraTypes as ExtraType[]), buildState, "read 输出")) break;
+                                if (!pushOutputWithBuildBudget(output, formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }), buildState, "read 输出")) break;
                                 if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                             }
                             if (childTruncated > 0) output.push(`⚠️ 子线程 ${child.thread.id.slice(0, 8)} 有 ${childTruncated} 个附件超过单次生成上限，未生成临时文件\n`);

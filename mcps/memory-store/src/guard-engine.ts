@@ -12,7 +12,7 @@ import {
 import type { GuardState } from "./guard-store.js";
 import { callModelResponse } from "./model-bridge.js";
 import { loadConversationData } from "./conversation-bridge.js";
-import type { Chain } from "./chain.js";
+import type { Chain, DataChain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 
 /**
@@ -136,7 +136,7 @@ async function callFlash(prompt: string): Promise<FlashCallResult> {
 async function callFlashWithChain(
     prompt: string,
     modelChain: Chain = "auto",
-    options: { background?: boolean; dataChain?: Chain } = {},
+    options: { background?: boolean; dataChain?: DataChain } = {},
 ): Promise<FlashCallResult> {
     const isCodexOnly = modelChain === "codex";
     const isClaudeCodeOnly = modelChain === "claude-code";
@@ -792,7 +792,7 @@ async function getConversationExecutionRecord(
     conversationId: string,
     startRound: number,
     charBudget: number,
-    dataChain: Chain = "auto",
+    dataChain: DataChain = "auto",
 ): Promise<string> {
     const parts: string[] = [];
     if (charBudget > 10_000) {
@@ -984,6 +984,12 @@ export function resolveGuardSelfReferenceResult(result: GuardCheckResult): Guard
 
 // ============= 核心检查入口 =============
 
+function resolveGuardModelChain(state: GuardState): Chain {
+    if (state.modelChain) return state.modelChain;
+    if (state.chain === "windsurf") return "auto";
+    return state.chain || "auto";
+}
+
 export async function runGuardCheck(
     state: GuardState,
     appealNote?: string,
@@ -996,7 +1002,7 @@ export async function runGuardCheck(
         state.planFiles,
         state.taskFiles,
         state.stageId,
-        state.modelChain || state.chain || "auto",
+        resolveGuardModelChain(state),
     );
     const planContent = inputBundle.planContent;
     const taskContent = inputBundle.taskContent;
@@ -1049,7 +1055,7 @@ export async function runGuardCheck(
 
     // 4. 构建 Prompt → 调用 Flash
     const prompt = buildGuardPrompt(planContent, taskContent, finalRecord, inputBundle.coverageText, evidenceText, externalEvidence.text, state.stageId, appealNote, evidence);
-    const response = await callFlashWithChain(prompt, state.modelChain || state.chain || "auto", { ...options, dataChain: state.chain });
+    const response = await callFlashWithChain(prompt, resolveGuardModelChain(state), { ...options, dataChain: state.chain });
 
     if (!response.text) {
         return {

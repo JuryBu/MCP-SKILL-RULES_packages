@@ -15,7 +15,8 @@ import {
     type MemoryFrontmatter,
 } from "../store.js";
 import { generateAutoSummary } from "../auto-summary.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit, type Chain } from "../chain.js";
+import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * memory_update — 更新/追加记忆
@@ -35,8 +36,8 @@ export function registerUpdate(server: McpServer): void {
             removeTags: z.array(z.string()).optional().describe("移除指定标签"),
             category: z.enum(["problem-solution", "technical-note", "conversation", "general"]).optional().describe("更新分类"),
             pinned: z.boolean().optional().describe("设置/取消置顶"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("autoSummary 模型链路；未填回退到 chain，再默认 auto"),
-            chain: z.enum(CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：autoSummary 模型链路，modelChain 未填时使用"),
+            modelChain: modelChainInputSchema("modelChain", "autoSummary 模型链路；未填回退到 chain，再默认 auto"),
+            chain: modelChainInputSchema("chain", "兼容旧参数：autoSummary 模型链路，modelChain 未填时使用"),
         },
         async ({ id, content, append, title, searchSummary, tags, removeTags, category, pinned, chain, modelChain }) => {
             touchActivity();
@@ -191,7 +192,7 @@ export function registerUpdate(server: McpServer): void {
                         newFrontmatter.title,
                         (Array.isArray(newFrontmatter.tags) ? newFrontmatter.tags : []) as string[],
                         body,
-                        resolveChainSplit({ chain, modelChain }).modelChain,
+                        resolveModelOnlyChainSplit({ chain, modelChain }).modelChain,
                     ).catch(() => {});
                 }
 

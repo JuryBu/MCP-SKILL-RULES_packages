@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.13.1
+ * MCP Sandbox Server v1.13.3
  * 
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  * 
@@ -38,7 +38,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.13.1",
+    version: "1.13.3",
 });
 
 // 注册所有 8 个工具
@@ -63,7 +63,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.13.1 使用指南
+                text: `# MCP Sandbox v1.13.3 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -299,8 +299,9 @@ MCP 进程与父 LS 进程绑定（ppid），与窗口同生共死：
 - exact / fuzzy 完全不受 modelChain/chain 参数影响，行为保持不变
 - modelChain=auto：当前宿主优先；Antigravity 宿主优先走 LS，Codex/其他宿主优先走 Codex bridge；不会自动调用 Claude Code CLI，避免静默消耗额度
 - modelChain=antigravity：强制走 Antigravity LS；未发现可连接 LS 时直接报错
-- modelChain=codex：强制走 Codex CLI bridge；未发现 codex 时直接报错
+- modelChain=codex：强制走 Codex CLI bridge；未发现 codex 时直接报错。短同步模型桥默认用 gpt-5.5 low + fast，并在超时、429/5xx、连接中断、空输出等可重试错误时按同 provider fallback 链降级到 gpt-5.4 low / gpt-5.4-mini low
 - modelChain=claude-code/cc：显式走本地 Claude Code CLI；未发现 claude 时直接报错。默认有小额预算保护，适合作为人工确认后的末端 fallback 或 CC 兼容验证
+- Windsurf/WSF 只是 MCP 客户端与对话数据来源，不提供 sandbox 模型链路；modelChain=windsurf 不在 schema 中，应被拒绝
 - modelChain 未填写时使用 chain，两者都未填写时使用 auto；chain 仅作为模型链路兼容参数保留，不代表数据链路，也不会引入 dataChain
 - 大目录或长文件的 smart + codex/claude-code 调用建议使用 background=true，再用 smart_search(taskId="...", waitSeconds=30-45) 轮询
 - smart_search 后台任务带 deadline/timedOut，默认 15 分钟超时标记 error，不重启或杀掉 sandbox 后端
@@ -354,6 +355,7 @@ Provider:
 - antigravity: GetModelResponse 文本链路；model 可传 M132/M20/M18/M16/M36/flash/pro-high/sonnet/opus 等别名，也可传 MODEL_* 编码
 - codex: Codex CLI bridge
 - claudeCode: 本地 Claude Code CLI，显式 provider；默认小额预算，transcript/JSON 会记录 sessionId、实际模型、耗时、预算消耗和临时 stdout/stderr 路径
+- Windsurf/WSF 不提供 council provider；需要在 WSF 中使用本工具时，请通过 broker 调用现有 provider，不要传 provider="windsurf"
 - openai: Responses API，支持 vision 输入
 - anthropic: Messages API，支持 vision 输入
 - gemini: generateContent，支持 vision 输入
@@ -426,6 +428,8 @@ Antigravity 常用别名:
 - v1.12.13 council 卡死兜底补强：geminiCli 正式参与者/主持链路复用 Gemini CLI 早退和孤儿进程清理；后台 worker 按 deadline 写入中断终态并退出，查询时发现 deadline 过期也会中断任务
 - v1.13.0 Claude Code 兼容：smart_search 支持显式 modelChain=claude-code/cc；sandbox_council 支持 provider=claudeCode，并记录 CC session/cost/model metadata。auto 仍只在 Antigravity/Codex 之间选择，不静默消耗 Claude Code 额度
 - v1.13.1 Antigravity auto 模型链更新：默认 GetModelResponse 顺序改为 M132 → M20 → M18 → M16 → M36；旧 M37/M47/2.5 flash 入口转到当前可用占位符。复杂推理任务建议显式选择 M16
+- v1.13.2 Windsurf/WSF MCP 客户端兼容：文档与 schema 说明 WSF 只通过 HTTP broker 调用 sandbox，不新增 modelChain/provider；新增 WSF 配置与验证文档
+- v1.13.3 Codex 模型桥稳定性：smart_search(modelChain="codex") 默认使用低 reasoning 快速首选，并在可重试错误时按 gpt-5.5 low → gpt-5.4 low → gpt-5.4-mini low 降级；sandbox_codex 因可能有副作用，不默认自动重试
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，拒绝 localhost / 私有地址
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -517,7 +521,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.13.1 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.13.3 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -539,7 +543,7 @@ console.error(`[sandbox] MCP Server v1.13.1 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.13.1 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.13.3 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -587,10 +591,3 @@ process.on("SIGTERM", async () => {
     await cleanup();
     process.exit(0);
 });
-
-
-
-
-
-
-

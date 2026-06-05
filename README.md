@@ -6,6 +6,8 @@
 
 当前公开快照重点包含 **MCP + Rules**。`skills` 暂未随本次快照打包进仓库，但仓库名保留 `SKILL`，用于后续公开整理可迁移 Skills。
 
+> 2026-06-05 refresh: `memory-store` is now `1.15.3`, `sandbox` is now `1.13.3`, `web-fetcher` remains `7.0.0`, and the Codex / Claude Code rules templates were refreshed and privacy-scrubbed.
+
 ---
 
 ## 核心特点
@@ -32,9 +34,9 @@
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
-| `memory-store` | `1.14.0` | 记忆库、对话读取、Record、Conversation、Golden Extract、Stage Guard、跨宿主链路 |
+| `memory-store` | `1.15.3` | 记忆库、对话读取、Record、Conversation、Golden Extract、Stage Guard、跨宿主链路 |
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
-| `sandbox` | `1.13.1` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
+| `sandbox` | `1.13.3` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
 | `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code 等宿主复用 |
 
 #### memory-store：Conversation / Record / Guard 中枢
@@ -227,9 +229,9 @@ Common examples:
 
 | MCP | Version | Main capabilities |
 | --- | --- | --- |
-| `memory-store` | `1.14.0` | Memory, conversation reading, Records, Conversation, Golden Extract, Stage Guard, cross-host chains |
+| `memory-store` | `1.15.3` | Memory, conversation reading, Records, Conversation, Golden Extract, Stage Guard, cross-host chains |
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
-| `sandbox` | `1.13.1` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
+| `sandbox` | `1.13.3` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
 | `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code and other hosts |
 
 #### memory-store: Conversation / Record / Guard hub

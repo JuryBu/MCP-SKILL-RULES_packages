@@ -1,7 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appendTiming } from "../constants.js";
-import { formatSessionList, normalizeOwnerId, sessionManager } from "../session.js";
+import { browserManager } from "../browser.js";
+import { formatPoolPressureHint, formatSessionList, normalizeOwnerId, sessionManager } from "../session.js";
 
 const ListSessionsInputSchema = z.object({
     ownerId: z
@@ -60,10 +61,15 @@ export function registerSessionTools(server: McpServer): void {
             const scope = params.includeAllOwners
                 ? "全部 ownerId"
                 : `ownerId="${normalizeOwnerId(params.ownerId)}"`;
+            const pool = browserManager.getPoolStats();
+            const pressureHint = formatPoolPressureHint(params.ownerId, {
+                includeAllOwners: params.includeAllOwners,
+                includeSessionList: false,
+            });
             return appendTiming({
                 content: [{
                     type: "text" as const,
-                    text: `活跃会话 (${sessions.length}) - ${scope}\n\n${formatSessionList(sessions)}`,
+                    text: `活跃会话 (${sessions.length}) - ${scope}\n页面池: ${pool.activePages}/${pool.maxConcurrentPages}\n\n${formatSessionList(sessions)}${pressureHint ? `\n${pressureHint}` : ""}`,
                 }],
             }, startTime);
         },

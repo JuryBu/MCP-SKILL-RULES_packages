@@ -3,6 +3,7 @@ import { promisify } from "util";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { pathToFileURL } from "url";
 import { fileHashKey, saveTempFile, getTempFile } from "./temp-store.js";
 
 const execFileAsync = promisify(execFile);
@@ -31,14 +32,20 @@ export async function detectConversionTools(): Promise<ConverterTools> {
     const tools: ConverterTools = {};
 
     // 检测 LibreOffice
+    const envLibreOffice = process.env.WEB_FETCHER_LIBREOFFICE_PATH?.trim();
+    if (envLibreOffice && fs.existsSync(envLibreOffice)) {
+        tools.libreoffice = envLibreOffice;
+    }
     const loSearchPaths = [
         "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
         "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe",
     ];
-    for (const p of loSearchPaths) {
-        if (fs.existsSync(p)) {
-            tools.libreoffice = p;
-            break;
+    if (!tools.libreoffice) {
+        for (const p of loSearchPaths) {
+            if (fs.existsSync(p)) {
+                tools.libreoffice = p;
+                break;
+            }
         }
     }
     if (!tools.libreoffice) {
@@ -178,24 +185,66 @@ async function convertWithLibreOffice(soffice: string, filePath: string, cacheKe
 
     const tempOutName = `lo_${cacheKey}`;
     const tempDir = path.join(outDir, tempOutName);
+    fs.rmSync(tempDir, { recursive: true, force: true });
     if (!fs.existsSync(tempDir)) fs.mkdirSync(tempDir, { recursive: true });
 
-    const args = ["--headless", "--convert-to", "pdf", "--outdir", tempDir, filePath];
-    console.error(`[web-fetcher] LibreOffice 转换: ${soffice} ${args.join(' ')}`);
+    const runAttempt = async (args: string[], label: string): Promise<Error | null> => {
+        console.error(`[web-fetcher] LibreOffice 转换(${label}): ${soffice} ${args.join(' ')}`);
+        try {
+            await execLibreOffice(soffice, args, 45000);
+            return null;
+        } catch (err: any) {
+            const message = err instanceof Error ? err.message : String(err);
+            console.error(`[web-fetcher] LibreOffice 转换(${label})返回异常，将检查是否已生成 PDF: ${message}`);
+            return new Error(message);
+        }
+    };
 
-    try {
-        await execFileAsync(soffice, args, { timeout: 30000 });
-    } catch (err: any) {
-        throw new Error(`LibreOffice 转换失败: ${err.message}`);
+    const baseArgs = ["--headless", "--convert-to", "pdf", "--outdir", tempDir, filePath];
+    const errors: Error[] = [];
+
+    const firstError = await runAttempt(baseArgs, "primary");
+    if (firstError) errors.push(firstError);
+
+    let generatedPdf = findUsableGeneratedPdf(tempDir);
+    if (!generatedPdf && firstError) {
+        fs.rmSync(tempDir, { recursive: true, force: true });
+        fs.mkdirSync(tempDir, { recursive: true });
+
+        const profileDir = path.join(outDir, `lo_profile_${cacheKey}_${Date.now().toString(36)}`);
+        fs.mkdirSync(profileDir, { recursive: true });
+        const isolatedArgs = [
+            `-env:UserInstallation=${pathToFileURL(profileDir).href}`,
+            "--headless",
+            "--nologo",
+            "--nofirststartwizard",
+            "--norestore",
+            "--nolockcheck",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            tempDir,
+            filePath,
+        ];
+
+        const retryError = await runAttempt(isolatedArgs, "isolated-profile-retry");
+        if (retryError) errors.push(retryError);
+        generatedPdf = findUsableGeneratedPdf(tempDir);
+
+        try {
+            fs.rmSync(profileDir, { recursive: true, force: true });
+        } catch { /* 忽略清理错误 */ }
     }
 
-    // 找到生成的 PDF 文件
-    const files = fs.readdirSync(tempDir).filter(f => f.endsWith(".pdf"));
-    if (files.length === 0) {
-        throw new Error("LibreOffice 转换完成但未找到输出 PDF 文件");
+    if (!generatedPdf) {
+        const details = errors.map((err, index) => `attempt ${index + 1}: ${err.message}`).join(" | ");
+        throw new Error(`LibreOffice 转换失败：未生成可用 PDF${details ? `；${details}` : ""}`);
     }
 
-    const generatedPdf = path.join(tempDir, files[0]);
+    if (errors.length > 0) {
+        console.error(`[web-fetcher] LibreOffice 虽返回异常，但已产出可用 PDF，按 warning 继续: ${generatedPdf}`);
+    }
+
     const pdfData = fs.readFileSync(generatedPdf);
 
     // 保存到统一的临时文件位置
@@ -208,6 +257,41 @@ async function convertWithLibreOffice(soffice: string, filePath: string, cacheKe
 
     console.error(`[web-fetcher] 转换完成: ${finalPath} (${(pdfData.length / 1024).toFixed(1)} KB)`);
     return finalPath;
+}
+
+async function execLibreOffice(soffice: string, args: string[], timeout: number): Promise<void> {
+    if (/\.[cm]?js$/i.test(soffice)) {
+        await execFileAsync(process.execPath, [soffice, ...args], { timeout });
+        return;
+    }
+    await execFileAsync(soffice, args, { timeout });
+}
+
+function findUsableGeneratedPdf(tempDir: string): string | null {
+    if (!fs.existsSync(tempDir)) return null;
+    const files = fs.readdirSync(tempDir)
+        .filter(file => file.toLowerCase().endsWith(".pdf"))
+        .map(file => path.join(tempDir, file))
+        .filter(isUsablePdfFile)
+        .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs);
+    return files[0] ?? null;
+}
+
+function isUsablePdfFile(filePath: string): boolean {
+    try {
+        const stat = fs.statSync(filePath);
+        if (stat.size <= 0) return false;
+        const fd = fs.openSync(filePath, "r");
+        try {
+            const header = Buffer.alloc(5);
+            const bytesRead = fs.readSync(fd, header, 0, header.length, 0);
+            return bytesRead === 5 && header.toString("utf-8") === "%PDF-";
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch {
+        return false;
+    }
 }
 
 /**

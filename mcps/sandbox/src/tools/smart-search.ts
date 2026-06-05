@@ -513,7 +513,7 @@ export function registerSmartSearch(server: McpServer): void {
         matchPerLine: z.boolean().optional(),
         context: z.number().optional(),
         files: z.array(z.object({ path: z.string(), range: z.string().optional() })).optional(),
-        modelChain: z.enum(MODEL_CHAIN_VALUES).optional().describe("smart: 模型链路选择，未填时回退到 chain，再默认 auto；claude-code/cc 必须显式指定，不进入 auto"),
+        modelChain: z.enum(MODEL_CHAIN_VALUES).optional().describe("smart: 模型链路选择，未填时回退到 chain，再默认 auto；claude-code/cc 必须显式指定，不进入 auto；Windsurf/WSF 没有 sandbox 模型链路，modelChain=windsurf 不受支持"),
         chain: z.enum(MODEL_CHAIN_VALUES).optional().describe("兼容旧参数：smart 模型链路选择，modelChain 未填时使用"),
     });
 
@@ -536,7 +536,7 @@ export function registerSmartSearch(server: McpServer): void {
                 range: z.string().optional(),
             })).optional().describe("smart: 指定文件+范围"),
             modelChain: z.enum(MODEL_CHAIN_VALUES).optional()
-                .describe("smart: 模型链路，auto=当前宿主优先且不会默认调用 Claude Code，antigravity=强制 LS，codex=强制 Codex bridge，claude-code/cc=显式 Claude Code CLI；未填回退到 chain"),
+                .describe("smart: 模型链路，auto=当前宿主优先且不会默认调用 Claude Code，antigravity=强制 LS，codex=强制 Codex bridge，claude-code/cc=显式 Claude Code CLI；未填回退到 chain；Windsurf/WSF 只能作为 MCP 客户端，不支持 modelChain=windsurf"),
             chain: z.enum(MODEL_CHAIN_VALUES).optional()
                 .describe("兼容旧参数：smart 模型链路，modelChain 未填时使用"),
             // 批量查询（v1.8+）

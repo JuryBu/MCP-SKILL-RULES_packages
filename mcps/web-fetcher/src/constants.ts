@@ -7,16 +7,13 @@ import os from "os";
 
 // v6.1: 多实例隔离 — 每个 MCP 进程使用独立的浏览器 profile
 // 基础目录（所有 profile 的父目录）
-export const BROWSER_PROFILES_BASE_DIR = process.env.WEB_FETCHER_PROFILES_DIR
-    || (process.env.CODEX_TOOLKIT_DATA_ROOT
-        ? path.join(process.env.CODEX_TOOLKIT_DATA_ROOT, "web-fetcher-profiles")
-        : path.join(
-            os.homedir(),
-            "AppData",
-            "Local",
-            "ms-playwright",
-            "mcp-web-fetcher-profiles"
-        ));
+export const BROWSER_PROFILES_BASE_DIR = path.join(
+    os.homedir(),
+    "AppData",
+    "Local",
+    "ms-playwright",
+    "mcp-web-fetcher-profiles"
+);
 
 // 当前实例的浏览器 profile 目录（按 PID 隔离，避免 Chromium SingletonLock 冲突）
 export const BROWSER_USER_DATA_DIR = path.join(

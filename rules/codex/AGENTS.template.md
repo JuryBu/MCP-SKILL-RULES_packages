@@ -549,18 +549,12 @@
 
 ## 用户画像与聊天偏好
 
-- 用户生日是 <生日自行填写>。
-- 用户喜欢夏季，也不排斥其他季节。
+- - 用户喜欢夏季，也不排斥其他季节。
 
 - 用户对 AI 技术、ACGN、剧情向内容、音乐都较感兴趣。
 - 聊天时可以结合这些方向找话题，但不要强行延展。
 
-- 可用网页登录态中，常见可参考的平台包括网易云、B 站、知乎、X、Reddit 等；需要时可结合这些来源找实时内容。
-- 用户公开账号信息，可在需要时作为参考来源：
-
-  - 网易云：`<网易云账号链接自行填写>`
-  - Bilibili：`<Bilibili账号链接自行填写>`
-
+- 如需使用网页登录态、账号资料或平台偏好，应由使用者在本机自行补充；公开模板不包含任何账号链接或登录态说明。\r\n
 ## 用户的工程协作习惯
 
 - 用户通常会把材料和要求放在一个文件夹，把工程项目放在另一个文件夹，两者位于同一根目录下。
@@ -625,18 +619,18 @@
 
 ## 工具与 MCP 使用
 
-- 当前全局 MCP 配置直接指向 Antigravity 的工具实现与数据目录，默认共享同一套记忆、网页登录态和工具能力。
-- Codex 侧本地 MCP 通过 `%USERPROFILE%\.codex\mcp-http-broker` 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
+- 便携包默认将 MCP 配置指向本机工具包的源码与数据目录；如同时接入 Antigravity、Codex、Claude Code，应保持三侧 endpoint 指向同一套 broker / 数据根。
+- Codex 侧本地 MCP 可通过 `%USERPROFILE%\\.codex\\mcp-http-broker` 或工具包内 broker 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
 - Codex HTTP broker 的后端进程是共享的，不具备每个对话独立的“当前对话”状态；凡是会读取或写入当前对话的工具调用，都必须显式传稳定 `conversationId`。
 - Codex HTTP broker 下的持久资源也应显式带稳定 `ownerId`：`web_interact` / `web_pipeline` 的 session，`sandbox_session`，`sandbox_launch`，`sandbox_codex` 后台任务，`smart_search(background=true)`，`sandbox_council(background=true)`。未传时按 `global` 兼容旧调用，但不要跨 owner 读写或 kill/close。
-- 当前共享 MCP 正在增加三源跨链路访问能力；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex | claude-code | cc`。
-- `chain="auto"` 表示优先使用当前宿主链路；当前宿主不可用或模型调用失败时才尝试其它链路。默认不应隐性消耗 Claude Code 额度，除非工具明确启用了 CC 自动 fallback。
+- 当前共享 MCP 正在增加双向跨链路访问能力；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex` 三个取值。
+- `chain="auto"` 表示优先使用当前宿主链路；当前宿主不可用或模型调用失败时才尝试另一侧链路。
 
 - `chain="antigravity"` 表示强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错。
-- `chain="codex"` 表示强制走 Codex 本地线程/模型桥链路；目标宿主不在线时直接报错。`chain="claude-code"` / `chain="cc"` 表示强制走 Claude Code 本地 JSONL/CLI 链路；目标宿主或 CLI 不可用时直接报错。
+- `chain="codex"` 表示强制走 Codex 本地线程/模型桥链路；目标宿主不在线时直接报错。
 
 - 支持 `dataChain` 与 `modelChain` 的工具优先使用拆分参数：`dataChain` 控制对话数据来源，`modelChain` 控制模型调用；未填时分别继承 `chain`，`chain` 未填时默认 `auto`。
-- `record_manage(update)`、`conversation_golden_extract`、`conversation_read_original(search, mode="smart")` 可拆分数据链路和模型链路；`memory_query`、`memory_batch(query)`、`memory_write`、`memory_update`、`memory_stats(enhance)`、`web-fetcher ai_summary / web_inspect ai_review / sandbox smart_search` 只使用 `modelChain`，旧 `chain` 继续作为兼容别名；显式 `claude-code` 使用 Claude Code CLI/本地会话数据，普通 `auto` 不默认消耗 CC 额度。
+- `record_manage(update)`、`conversation_golden_extract`、`conversation_read_original(search, mode="smart")` 可拆分数据链路和模型链路；`memory_query`、`memory_batch(query)`、`memory_write`、`memory_update`、`memory_stats(enhance)`、`web-fetcher ai_summary / web_inspect ai_review / sandbox smart_search` 只使用 `modelChain`，旧 `chain` 继续作为兼容别名。
 
 - `stage_guard` 是阶段门禁工具，用来防止按 `Plan/Task.md` 执行时漏做、早报完成或证据不足。凡是项目按 `Task.md` 拆了小阶段，每个小阶段开始前都要 `stage_guard start`，阶段结束前都要 `stage_guard check`；通过后才可标记完成。用户要求“每个小阶段都要 guard start/end”时，`end` 按 `stage_guard check` 执行。
 - Guard 检查不能把“Guard 通过记录已经落盘”作为同一次 Guard 通过的前提；正确顺序是先落盘阶段产物和证据，再跑 `stage_guard check`，通过后再写“阶段已完成 / Guard 已通过 / Record 已更新”等收尾记录。
@@ -644,7 +638,7 @@
 - 记录 Guard 自指循环后，可以继续推进不依赖该阶段完成状态的探索、资料整理或后续准备工作；不得把相关阶段标记为完成，不得删除 Guard 锁，不得把该类问题泛化成“Guard 可忽略”。下一次验收应带着小本本记录和已落盘证据重新执行 `stage_guard check`。
 - `stage_guard` 的对话数据必须绑定当前宿主的明确 `conversationId`，不要跨宿主操作异源 Guard；可通过 `modelChain` 选择审核模型。
 - `stage_guard` 同一 Task.md 支持多个 conversationId 独立锁块；`pass/cancel` 只应移除当前 Guard 锁，不应清掉其它对话仍活跃的锁。
-- Codex 链路的 MCP 模型桥默认使用 `gpt-5.5`、`model_reasoning_effort=medium`、`model_speed_tier=fast`；Claude Code 链路默认走本地 `claude` CLI，建议只在显式需要时使用；如需调试可通过各 MCP 的环境变量覆盖。
+- Codex 链路的 MCP 模型桥默认使用 `gpt-5.5`、`model_reasoning_effort=medium`、`model_speed_tier=fast`；如需调试可通过各 MCP 的环境变量覆盖。
 - Codex 侧同步 MCP 调用存在宿主超时窗口；凡是 Record 生成、Stage Guard 检查、Golden Extract 这类长模型任务，优先使用后台模式，先拿 `taskId`，再用同工具的查询参数轮询结果，避免 transport closed 和僵尸模型桥。
 
 - Codex 侧 Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具是 `web_search_exa` 和 `web_fetch_exa`。它走 Antigravity 同步过来的 `mcp-remote` 托管配置；带 API Key 时优先走账户额度，余额耗尽会返回 `402`，不会自动切到匿名免费额度，去掉 Key 才会进入免费额度模式。
@@ -688,6 +682,7 @@
 - 写入记忆时要写好 `searchSummary`，包含关键词、近义词、技术栈，方便未来检索。
 
 - 查询与写入记忆时，注意条目去重、结构清晰、检索友好。
+- 用户要求写入记忆时，应该写入memory_store的记忆而不是系统的记忆条目，后者是系统自动维护，不需要我们手动写入，memory_store才是我们主动维护的记忆。
 - 如果项目里还有旧的“工作记忆”或“对话记忆”文件夹，应阅读理解其内容，并在需要时将有价值的信息迁移到 `memory-store`。
 
 - 旧工作记忆导入时，优先按主题拆分，不要把整份大文件粗暴塞成一条记忆。
@@ -842,8 +837,6 @@
 
 - 使用 Playwright 时应操控 Edge 浏览器。
 - Codex 侧会存在子代理线程和 exec 线程；涉及历史对话、审核报告或模型桥结果时，要明确它们是否属于主线程正文还是外链附件。
-
-
 
 
 

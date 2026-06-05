@@ -1,4 +1,4 @@
-﻿# Portable MCP + Rules 工具包（2026-5-23）
+﻿# Portable MCP + Rules 工具包（2026-6-5）
 
 这是一份给 Windows 上的 Codex、Antigravity、Claude Code 共用的本地工具包，包含三源兼容 MCP 源码、HTTP broker、三套脱敏 Rules 模板和基础测试文件。本版不包含 skills。
 
@@ -11,9 +11,9 @@
 
 ## 当前 MCP 版本
 
-- `memory-store`：`1.14.0`
+- `memory-store`：`1.15.3`
 - `web-fetcher`：`7.0.0`
-- `sandbox`：`1.13.1`
+- `sandbox`：`1.13.3`
 - `broker`：`0.1.0`
 - `exa`：可选远程 MCP endpoint；需要接收方自己设置 `EXA_MCP_REMOTE_URL` 或 `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`。
 
@@ -65,3 +65,7 @@ Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.
 ## 隐私边界
 
 这个包只应包含源码、模板、说明和测试样例。不要包含发送方或接收方的 API Key、cookies、浏览器 profile、对话记录、记忆库、sqlite、sessions、日志、本机绝对路径或账户链接。
+
+## 2026-6-5 refresh
+
+This snapshot refreshes memory-store to 1.15.3, sandbox to 1.13.3, keeps web-fetcher at 7.0.0, and refreshes Codex / Claude Code rules from the current local templates after privacy scrubbing.

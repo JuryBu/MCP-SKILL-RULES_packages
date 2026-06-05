@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
-import type { Chain } from "./chain.js";
+import type { Chain, DataChain } from "./chain.js";
 
 /**
  * Stage Guard 状态持久化
@@ -32,7 +32,7 @@ export interface GuardState {
     active: boolean;
     conversationId: string;
     /** Data chain used to read the guarded conversation. */
-    chain?: Chain;
+    chain?: DataChain;
     /** Model chain used to run Guard checks. Falls back to chain for old states. */
     modelChain?: Chain;
     stageId: string;

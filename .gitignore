@@ -42,7 +42,7 @@ broker.pid
 .env
 .env.local
 .env.*.local
-broker-private.env.json
+broker-private*.json
 auth.json
 .cockpit_codex_auth.json
 cookies-backup.json
@@ -65,4 +65,3 @@ council_*.md
 council_*.json
 工作记忆/
 _archive/
-

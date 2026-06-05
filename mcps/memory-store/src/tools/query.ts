@@ -16,8 +16,9 @@ import { indexCache, type MemoryIndexEntry } from "../cache.js";
 import { saveTempFile } from "../temp-store.js";
 import { fuseSearch, grepInEntries, grepGlobal } from "../search.js";
 import { countRecords } from "../record-store.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit } from "../chain.js";
+import { resolveModelOnlyChainSplit } from "../chain.js";
 import type { SearchMode } from "../search-engine.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /** 携带来源 hash 的条目（用于全局查询） */
 interface EntryWithSource extends MemoryIndexEntry {
@@ -40,8 +41,8 @@ export function registerQuery(server: McpServer): void {
             workspace: z.string().optional().describe("工作区路径"),
             depth: z.enum(["index", "summary", "full"]).optional().describe("返回深度：index（默认）/ summary / full"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional().describe("query 搜索模式：auto/exact/fuzzy/smart，默认 auto"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("smart 搜索使用的模型链路；未填回退到 chain，再默认 auto"),
-            chain: z.enum(CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：smart 搜索使用的模型链路，modelChain 未填时使用"),
+            modelChain: modelChainInputSchema("modelChain", "smart 搜索使用的模型链路；未填回退到 chain，再默认 auto"),
+            chain: modelChainInputSchema("chain", "兼容旧参数：smart 搜索使用的模型链路，modelChain 未填时使用"),
             tags: z.array(z.string()).optional().describe("按标签过滤"),
             category: z.string().optional().describe("按类别过滤"),
             after: z.string().optional().describe("时间过滤：只返回此时间之后更新的记忆（ISO格式或 YYYY-MM-DD）"),
@@ -56,7 +57,7 @@ export function registerQuery(server: McpServer): void {
                 const depthMode = depth || "index";
                 const maxResults = limit || 10;
                 const searchScope = scope || "workspace";
-                const chains = resolveChainSplit({ chain, modelChain });
+                const chains = resolveModelOnlyChainSplit({ chain, modelChain });
 
                 // grep 模式
                 if (grep) {

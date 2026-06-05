@@ -22,8 +22,9 @@ import {
 import { type MemoryIndexEntry } from "../cache.js";
 import { saveTempFile } from "../temp-store.js";
 import { grepInEntries } from "../search.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit } from "../chain.js";
+import { resolveModelOnlyChainSplit } from "../chain.js";
 import type { SearchMode } from "../search-engine.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * memory_batch — 批量操作
@@ -51,8 +52,8 @@ const OperationSchema = z.object({
     grep: z.string().optional(),
     depth: z.enum(["index", "summary", "full"]).optional(),
     mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional(),
-    modelChain: z.enum(CHAIN_INPUT_VALUES).optional(),
-    chain: z.enum(CHAIN_INPUT_VALUES).optional(),
+    modelChain: modelChainInputSchema("modelChain"),
+    chain: modelChainInputSchema("chain"),
     limit: z.number().optional(),
     // pinned 参数
     pinned: z.boolean().optional(),
@@ -207,7 +208,7 @@ export function registerBatch(server: McpServer): void {
                                     tags: e.tags,
                                 }));
                                 const requestedMode = (op.mode || "auto") as SearchMode;
-                                const chains = resolveChainSplit({ chain: op.chain, modelChain: op.modelChain });
+                                const chains = resolveModelOnlyChainSplit({ chain: op.chain, modelChain: op.modelChain });
                                 let engineResults = await engineSearch(blocks, op.query, {
                                     mode: requestedMode,
                                     limit: op.limit || 5,

@@ -29,10 +29,7 @@ interface Registry {
 
 // ===== 路径 =====
 
-const REGISTRY_DIR = process.env.MEMORY_STORE_DATA_ROOT
-    || (process.env.CODEX_TOOLKIT_DATA_ROOT
-        ? path.join(process.env.CODEX_TOOLKIT_DATA_ROOT, "memory-store")
-        : path.join(os.homedir(), ".codex-toolkit", "memory-store"));
+const REGISTRY_DIR = path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
 const REGISTRY_PATH = path.join(REGISTRY_DIR, "ls-registry.json");
 
 // ===== Heartbeat 容忍 =====

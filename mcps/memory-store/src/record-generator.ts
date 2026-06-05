@@ -1312,6 +1312,30 @@ function inferRecordTotalRounds(content: string): number {
     return match ? Number(match[1]) : 0;
 }
 
+function validateRecordBeforeAccept(
+    content: string,
+    conversationId: string,
+    totalRounds: number,
+    expectedCoveredRound: number,
+): { ok: true } | { ok: false; error: string; candidatePath: string } {
+    const phaseCount = countPhasesInRecord(content);
+    const coveredRound = inferCoveredRoundFromRecord(content, totalRounds);
+    const errors: string[] = [];
+    if (phaseCount === 0) {
+        errors.push("候选 Record 未识别到任何 Phase");
+    }
+    if (expectedCoveredRound > 0 && coveredRound < expectedCoveredRound) {
+        errors.push(`候选 Record 只明确覆盖到第 ${coveredRound} 轮，目标至少第 ${expectedCoveredRound} 轮`);
+    }
+    if (errors.length === 0) return { ok: true };
+    const candidatePath = saveTempFile("record_candidate_rejected", conversationId.slice(0, 8), content);
+    return {
+        ok: false,
+        error: `${errors.join("; ")}；已拒绝覆盖正式 Record，候选已保存: ${candidatePath}`,
+        candidatePath,
+    };
+}
+
 /**
  * 从 Record 正文推断它实际覆盖到的轮次。
  *
@@ -2059,6 +2083,14 @@ export async function generateRecord(
 
         const { content: cleanedContent, tags } = cleanFlashResponse(response);
         const finalContent = enforceRecordHeaderMetadata(cleanedContent, { conversationId, workspace, totalRounds, totalSteps });
+        const validation = validateRecordBeforeAccept(finalContent, conversationId, totalRounds, totalRounds);
+        if (!validation.ok) {
+            return {
+                success: false,
+                error: validation.error,
+                pipeline: "serial",
+            };
+        }
         options.onProgress?.({
             stage: "生成完成",
             current: totalRounds,
@@ -2116,7 +2148,27 @@ export async function generateRecord(
         }
 
         const { content: batchContent, tags: batchTags } = cleanFlashResponse(response);
-        currentRecord = enforceRecordHeaderMetadata(batchContent, { conversationId, workspace, totalRounds, totalSteps });
+        const candidateRecord = enforceRecordHeaderMetadata(batchContent, { conversationId, workspace, totalRounds, totalSteps });
+        const validation = validateRecordBeforeAccept(candidateRecord, conversationId, totalRounds, chunk.endRound);
+        if (!validation.ok) {
+            if (currentRecord && currentRecord !== existingRecord) {
+                return {
+                    success: true,
+                    content: currentRecord,
+                    batches: batchCount,
+                    coveredRounds: chunk.startRound - 1,
+                    error: validation.error,
+                    pipeline: "serial",
+                    warnings,
+                };
+            }
+            return {
+                success: false,
+                error: validation.error,
+                pipeline: "serial",
+            };
+        }
+        currentRecord = candidateRecord;
         lastTags = batchTags;
         processedUpTo += chunk.rounds.length;
 

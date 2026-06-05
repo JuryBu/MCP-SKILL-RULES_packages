@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.14.0
+ * MCP Memory Store Server v1.15.3
  * 
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。
@@ -52,7 +52,7 @@ let isClosing = false; // 防止重复清理
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "memory-store-mcp-server",
-    version: "1.14.0",
+    version: "1.15.3",
 });
 
 // 注册所有 11 个工具
@@ -80,7 +80,7 @@ server.registerResource(
         contents: [
             {
                 uri: "memory-store://guide",
-                text: `# MCP Memory Store v1.14.0 使用指南
+                text: `# MCP Memory Store v1.15.3 使用指南
 
 ## 快速开始
 - 新对话开始: memory_query() 或 memory_query(workspace="工作区路径") 获取背景
@@ -162,15 +162,16 @@ server.registerResource(
 - list/search 均支持 mode="auto|exact|fuzzy|smart"；list 会综合标题、ID、工作区、Record 摘要和近期上下文指纹定位对话
 - list 有 query 时默认扫描 300 个候选目录，可用 MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT 覆盖
 - Codex list 快查止血(v1.13.0): dataChain="codex" 且 mode="auto" 时，query 未命中不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 模型搜索；若 query 是古老正文片段，会提示后续使用 deep_locate 后台深搜能力
-- deep_locate(v1.14.0): conversation_read_original(action="deep_locate", dataChain="codex|claude-code", query="...", background=true) 后台流式扫描 Codex/Claude Code JSONL，支持 exact/fuzzy、进度、预算、partial hits 和 cancel/status；不做 smart 全库召回
+- deep_locate(v1.14.0): conversation_read_original(action="deep_locate", dataChain="codex|claude-code", query="...", background=true) 后台流式扫描 Codex/Claude Code JSONL，支持 exact/fuzzy、进度、预算、partial hits 和 cancel/status；不做 smart 全库召回；Windsurf 首版不支持 deep_locate
 - Record list / list ID 排序 / ETA 修复(v1.13.1): Record 归属 sidecar 出现 superseded 互指环时不再把所有副本都隐藏，列表和搜索会继续按完整度去重显示；conversation list 用完整 ID 查询时真实 ID 命中优先于标题正文提及；后台任务预计剩余时间改按当前阶段开始时间估算，避免把前一阶段耗时算入新阶段。
 - Codex / Claude Code list 支持 contextProbe：从当前可见聊天截取 50-120 字独特上下文，硬匹配本地 JSONL 并标记候选；不会自动选中
 - 三级详细度：brief(截断100字) / normal(完整文本) / full(含思考+工具结果；Codex 链路会展开可读 reasoning、工具事件、patch diff 和文件/计划视图)
-- Antigravity LS 链路下，conversationId 不填可默认当前对话；Codex / Claude Code 通过共享后端或本地 JSONL 定位，必须显式传稳定 conversationId
+- Antigravity LS 链路下，conversationId 不填可默认当前对话；Codex / Claude Code / Windsurf 通过共享后端、本地 JSONL 或只读 LS 接口定位，必须显式传稳定 conversationId
 - extraTypes: 额外拉取 thinking/tool_results/code_actions/code_diffs/file_views
-- "chain=\"auto|antigravity|codex|claude-code|cc\"" 为兼容旧参数；cc 会归一为 claude-code，dataChain/modelChain 未填时沿用此链路
-- "dataChain=\"auto|antigravity|codex|claude-code|cc\"" 控制原文来源；list/fetch/read/exact/fuzzy 主要使用 dataChain
+- "chain=\"auto|antigravity|codex|claude-code|cc|windsurf|wsf\"" 为兼容旧参数；cc 会归一为 claude-code，wsf 会归一为 windsurf；chain="windsurf" 只作为 dataChain 兼容写法，modelChain 回落 auto
+- "dataChain=\"auto|antigravity|codex|claude-code|cc|windsurf|wsf\"" 控制原文来源；list/fetch/read/exact/fuzzy 主要使用 dataChain
 - "modelChain=\"auto|antigravity|codex|claude-code|cc\"" 控制 smart 搜索的模型调用链路；显式 claude-code 只走 Claude Code CLI
+- modelChain 不支持 windsurf/wsf；Windsurf 只提供对话数据，不提供模型调用链路
 - memory_query、memory_batch(query)、memory_write、memory_update、memory_stats(action="enhance") 也支持 modelChain；旧 chain 继续作为模型链路兼容别名
 - "chain=\"auto\"" 优先当前宿主链路；仅在当前宿主不可用时才尝试另一侧链路
 - 显式指定 "chain=\"antigravity\"" 或 "chain=\"codex\"" 时不静默回退
@@ -189,7 +190,12 @@ server.registerResource(
 - RecordPatch 检查点与中文格式自愈(v1.13.6): 并行生成会缓存成功的 map / compress 中间 RecordPatch，重试时复用已完成区段并隔离 timeout/failed/invalid 节点；旧 Record 的 "Rounds X-Y" 可容错读取，写入前会规范成中文“轮次 X-Y”。
 - Stage Guard 外部证据索引(v1.13.7): stage_guard(check) 支持 evidenceFiles / evidenceAssets / evidenceIndexMode；图片、PDF、Word、Excel、视频等复杂证据先写入临时索引 artifact，再把短索引喂给审核模型，避免把大文件或 base64 堆进内存。
 - Codex AGENTS/RULES 注入折叠(v1.13.8): Codex 对话开始和 context compact 后的 AGENTS.md/RULES 快照按事件结构识别并折叠为短占位符；默认读取、搜索、Record、Guard 与 Golden Extract 不再把完整规则正文当成真实用户消息。
-- Claude Code 三链路兼容(v1.14.0): 新增 dataChain/modelChain="claude-code" 与别名 "cc"；conversation_read_original 可读取 .claude/projects 下 JSONL，支持 list/fetch/read/search/deep_locate/contextProbe；Record/Golden Extract/Stage Guard 基于统一轮次工作，附件只懒解析元信息；Claude Code CLI 仅在显式 modelChain 或允许 fallback 时使用，并带 timeout/kill/输出预算。
+- Claude Code 对话与模型链路兼容(v1.14.0): 新增 dataChain/modelChain="claude-code" 与别名 "cc"；conversation_read_original 可读取 .claude/projects 下 JSONL，支持 list/fetch/read/search/deep_locate/contextProbe；Record/Golden Extract/Stage Guard 基于统一轮次工作，附件只懒解析元信息；Claude Code CLI 仅在显式 modelChain 或允许 fallback 时使用，并带 timeout/kill/输出预算。
+- Claude Code compact summary 折叠(v1.14.1): Claude Code compact_boundary + isCompactSummary 续聊摘要会作为压缩元信息处理；conversation_read_original(read) 默认按读取轮次懒导出临时 Markdown，depth="full" 或 compactionMode="full" 可展开但保留 marker，Record/Guard/Golden Extract/contextProbe/deep_locate 默认不把它当真实用户正文。
+- Windsurf 四数据链路兼容(v1.15.0): 新增 dataChain="windsurf" 与别名 "wsf"；conversation_read_original 通过 Windsurf Language Server 只读 Cascade 对话，支持 list/fetch/read/search；Record/Golden Extract/Stage Guard 可读取 WSF 对话并复用现有三模型链路；不调用 WSF 模型代理、发送消息接口或 ACP summary-agent。
+- Windsurf 超大 step 降级(v1.15.1): 若 WSF LS 返回单个 step 超过 4MB 限制，conversation_read_original 会插入占位轮次并继续读取后续 steps；partial 结果会明确警告，且不会自动或显式写入正式 Record。
+- Windsurf 工具证据归一化(v1.15.2): WSF run command、MCP tool、find、view file、code action、list directory、command status 等 step 会进入 toolCalls/fileViews/codeActions；conversation_read_original(depth="full") 和 Stage Guard 可看到真实执行证据，避免因 WSF 工具步骤不可见误判虚标。
+- conversation_read_original 防串读(v1.15.3): fetch/search/read 在 dataChain="auto|codex|claude-code|windsurf" 下必须显式传稳定 conversationId；只有显式 dataChain="antigravity" 保留当前窗口兼容路径。search 输出会显示实际读取的 conversationId，避免共享后端推断到其它窗口。
 - Codex HTTP broker 共享后端进程，fetch/search/read 必须显式传稳定 conversationId；只知道标题时先用 list 定位完整 ID，可补 contextProbe 辅助确认当前主线
 - Codex 如存在子代理线程，默认以引用或摘要方式呈现；link="expand_children" 时读取一级子线程全文，并用 thread_spawn_edges 补充父线程事件遗漏或已归档但仍可读的子线程；缺失子线程会输出诊断而不是静默跳过
 
@@ -207,7 +213,7 @@ server.registerResource(
 - 参数: conversationId（Antigravity 当前对话可选，Codex 链路必填）、stepStart/stepEnd（范围）、autoCompare（默认true）
 - 帮助发现对话中值得持久化但尚未保存的知识
 - 受宿主链路影响时，默认建议 "chain=\"auto\""；需要跨宿主显式取数时再指定链路
-- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 调模型提取；未填时保持旧 chain 行为
+- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 调模型提取；未填时保持旧 chain 行为；Windsurf 只允许作为 dataChain
 
 ## 进程生命周期 (v1.7+)
 
@@ -237,7 +243,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - general 审计: audit_ownership 只读检测 duplicate/migratable/conflict/unknown；repair_ownership 默认 dryRun=true，首版只 copy/upsert，不删除来源副本
 - official home 止血: C:\\ 与 \\\\?\\C:\\ 等路径别名会归一；repair/update 会把旧 alias/general 副本 copy/upsert 到 official workspace，并用 ownership sidecar 标记 superseded，默认 list/search 不展示已取代副本
 - 降级: LS 不可用时自动从 Record 读取
-- 三链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退
+- 四数据链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退；chain="windsurf" 只代表 dataChain，modelChain 回落 auto
 - 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 生成 Record；可读取 Codex/Claude Code 对话并用 Antigravity LS 模型生成
 - Codex 链路下，Record 读取的对话原文来自本地线程索引与事件流，子代理内容默认以摘要或引用纳入；Claude Code 链路来自 .claude/projects JSONL
 - Codex/Claude Code 侧 update 必须显式传 conversationId；长对话建议 background=true，再用 action="task_status" + taskId + waitSeconds=30-45 轮询
@@ -377,7 +383,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[memory-store] MCP Server v1.14.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[memory-store] MCP Server v1.15.3 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -390,7 +396,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[memory-store] MCP Server v1.14.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[memory-store] MCP Server v1.15.3 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -447,7 +453,3 @@ process.on("SIGTERM", async () => {
     await cleanup();
     process.exit(0);
 });
-
-
-
-

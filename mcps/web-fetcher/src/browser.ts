@@ -46,6 +46,13 @@ import {
 } from "./human-verification.js";
 import { logHumanVerificationAudit } from "./human-audit.js";
 
+function readPositiveIntEnv(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (!raw) return fallback;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 /**
  * 浏览器管理器 — 单例模式
  * 使用独立的 persistent context 保存登录态
@@ -53,8 +60,14 @@ import { logHumanVerificationAudit } from "./human-audit.js";
 class BrowserManager {
     private context: BrowserContext | null = null;
     private launching: Promise<BrowserContext> | null = null;
-    private activePages = 0;
-    private static readonly MAX_CONCURRENT_PAGES = 3;
+    private activePages = new Set<Page>();
+    private static readonly MAX_CONCURRENT_PAGES = readPositiveIntEnv("WEB_FETCHER_MAX_CONCURRENT_PAGES", 5);
+    private static readonly PAGE_POOL_WARNING_THRESHOLD = readPositiveIntEnv("WEB_FETCHER_PAGE_POOL_WARNING_THRESHOLD", 3);
+    private static readonly LOCAL_DEV_NO_CACHE_HEADERS = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    } as const;
     private idleTimer: ReturnType<typeof setTimeout> | null = null;
     private static readonly BROWSER_IDLE_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动关闭浏览器
     // 域名级请求时间记录 — 防止同域高频请求触发封禁
@@ -312,12 +325,12 @@ class BrowserManager {
         this.lastRetryCount = 0;
 
         // 并发控制
-        if (this.activePages >= BrowserManager.MAX_CONCURRENT_PAGES) {
+        this.pruneClosedActivePages();
+        if (this.activePages.size >= BrowserManager.MAX_CONCURRENT_PAGES) {
             throw new Error(
                 `已达到最大并发页面数 (${BrowserManager.MAX_CONCURRENT_PAGES})，请等待其他页面关闭后重试`
             );
         }
-        this.activePages++;
 
         let page;
         try {
@@ -328,17 +341,11 @@ class BrowserManager {
                 ? await this.getBareContext()
                 : await this.getContext();
             page = await context.newPage();
+            this.trackActivePage(page);
         } catch (err) {
-            // getContext 或 newPage 失败时回退计数器，防止服务锁死
-            this.activePages = Math.max(0, this.activePages - 1);
             throw err;
         }
         const timeout = options?.timeout ?? DEFAULT_TIMEOUT;
-
-        // 页面关闭时减少计数
-        page.on("close", () => {
-            this.activePages = Math.max(0, this.activePages - 1);
-        });
 
         // ========== 本地文件快捷通道 ==========
         const isFileProtocol = url.startsWith("file://") || url.startsWith("file:///");
@@ -642,36 +649,45 @@ class BrowserManager {
             }
         }
 
-        // ========== 域名级请求限速 ==========
-        const domain = this.extractDomain(url);
-        const isHighRisk = this.isHighRiskDomain(domain);
-        const lastReq = this.domainLastRequest.get(domain);
-        if (lastReq) {
-            const elapsed = Date.now() - lastReq;
-            const cooldown = isHighRisk ? DOMAIN_REQUEST_COOLDOWN * 2 : DOMAIN_REQUEST_COOLDOWN;
-            if (elapsed < cooldown) {
-                const wait = cooldown - elapsed + Math.random() * 500;
-                console.error(`[web-fetcher] 域名限速：${domain} 等待 ${Math.round(wait)}ms`);
-                await new Promise(r => setTimeout(r, wait));
+        try {
+            // ========== 域名级请求限速 ==========
+            const domain = this.extractDomain(url);
+            const isHighRisk = this.isHighRiskDomain(domain);
+            const isLocalDevUrl = this.isLocalDevUrl(url);
+            const lastReq = this.domainLastRequest.get(domain);
+            if (lastReq) {
+                const elapsed = Date.now() - lastReq;
+                const cooldown = isHighRisk ? DOMAIN_REQUEST_COOLDOWN * 2 : DOMAIN_REQUEST_COOLDOWN;
+                if (elapsed < cooldown) {
+                    const wait = cooldown - elapsed + Math.random() * 500;
+                    console.error(`[web-fetcher] 域名限速：${domain} 等待 ${Math.round(wait)}ms`);
+                    await new Promise(r => setTimeout(r, wait));
+                }
             }
-        }
-        this.domainLastRequest.set(domain, Date.now());
+            this.domainLastRequest.set(domain, Date.now());
 
-        // ========== 设置真实浏览器 Headers ==========
-        await page.setExtraHTTPHeaders({
-            ...BROWSER_ACCEPT_HEADERS,
-            // 高风控站点加 Referer，模拟从站内导航
-            ...(isHighRisk ? { 'Referer': `https://${domain}/` } : {}),
-        });
+            await this.prepareLocalDevCacheBypass(page, url);
 
-        // ========== 资源层兼容性拦截 ==========
+            // ========== 设置真实浏览器 Headers ==========
+            await page.setExtraHTTPHeaders({
+                ...BROWSER_ACCEPT_HEADERS,
+                // 高风控站点加 Referer，模拟从站内导航
+                ...(isHighRisk ? { 'Referer': `https://${domain}/` } : {}),
+            });
+
+            // ========== 资源层兼容性拦截 ==========
         // 解决无头浏览器 CDN 资源加载问题：
         //   1. 移除 SRI integrity → 防止 CDN 指纹差异导致 hash 不匹配（如 DeepSeek）
         //   2. 移除 CSP → 防止 Content-Security-Policy 干扰 stealth 注入脚本
         //   3. 移除 X-Frame-Options → 改善 iframe 兼容性
-        await page.route('**/*', async (route) => {
+            await page.route('**/*', async (route) => {
             try {
-                const response = await route.fetch();
+                const isLocalDevRequest = this.isLocalDevUrl(route.request().url());
+                const response = isLocalDevRequest
+                    ? await route.fetch({
+                        headers: this.withLocalDevNoCacheHeaders(route.request().headers()),
+                    })
+                    : await route.fetch();
                 const contentType = response.headers()['content-type'] || '';
 
                 if (contentType.includes('text/html')) {
@@ -726,15 +742,15 @@ class BrowserManager {
                 // 拦截失败则放行原始请求
                 await route.continue();
             }
-        });
+            });
 
-        // 网络导航（带瞬时故障自动重试）
-        let navigationAttempt = 0;
-        const maxNavigationAttempts = 2;
-        let lastNavigationError: unknown = null;
+            // 网络导航（带瞬时故障自动重试）
+            let navigationAttempt = 0;
+            const maxNavigationAttempts = 2;
+            let lastNavigationError: unknown = null;
 
-        while (navigationAttempt < maxNavigationAttempts) {
-            try {
+            while (navigationAttempt < maxNavigationAttempts) {
+                try {
                 const currentTimeout = navigationAttempt === 0 ? timeout : Math.min(timeout * 2, 120000);
 
                 // v6.4: 在 goto 之前预注入 localStorage — SPA 路由检查 token 在 JS 执行最早期
@@ -812,27 +828,27 @@ class BrowserManager {
 
                 lastNavigationError = null;
                 break; // 成功，跳出重试循环
-            } catch (navErr) {
-                lastNavigationError = navErr;
-                navigationAttempt++;
+                } catch (navErr) {
+                    lastNavigationError = navErr;
+                    navigationAttempt++;
 
-                if (navigationAttempt < maxNavigationAttempts && this.isTransientError(navErr)) {
-                    this.lastRetryCount++;
-                    const retryDelay = 3000;
-                    console.error(`[web-fetcher] ⚡ 导航瞬时故障 (${navErr instanceof Error ? navErr.message.slice(0, 60) : navErr})，${retryDelay / 1000}秒后重试...`);
-                    await page.waitForTimeout(retryDelay);
-                } else {
-                    throw navErr; // 确定性错误或已用完重试次数
+                    if (navigationAttempt < maxNavigationAttempts && this.isTransientError(navErr)) {
+                        this.lastRetryCount++;
+                        const retryDelay = 3000;
+                        console.error(`[web-fetcher] ⚡ 导航瞬时故障 (${navErr instanceof Error ? navErr.message.slice(0, 60) : navErr})，${retryDelay / 1000}秒后重试...`);
+                        await page.waitForTimeout(retryDelay);
+                    } else {
+                        throw navErr; // 确定性错误或已用完重试次数
+                    }
                 }
             }
-        }
-        if (lastNavigationError) throw lastNavigationError;
+            if (lastNavigationError) throw lastNavigationError;
 
-        // ========== v6.4: Stealth 自适应降级检测 ==========
+            // ========== v6.4: Stealth 自适应降级检测 ==========
         // WAF 拦截的典型表现：返回完全空白的 HTML（如 <html><head></head><body></body></html>）
         // 降级策略：Level 3 → Level 1，清除 Cookie 后用裸奔模式重试
-        const domainForStealth = this.extractDomain(url);
-        const isWafBlocked = await page.evaluate(() => {
+            const domainForStealth = this.extractDomain(url);
+            const isWafBlocked = await page.evaluate(() => {
             const html = document.documentElement?.outerHTML || '';
             const bodyText = (document.body?.innerText || '').trim();
             const title = (document.title || '').trim();
@@ -844,27 +860,26 @@ class BrowserManager {
                 if (/\b(400|403|412)\b/.test(combined) && /bad request|forbidden|precondition/i.test(combined)) return true;
             }
             return false;
-        }).catch(() => false);
+            }).catch(() => false);
 
-        if (isWafBlocked && !this.domainStealthLevel.has(domainForStealth)) {
+            if (isWafBlocked && !this.domainStealthLevel.has(domainForStealth)) {
             // v6.4 双 context 架构：WAF 拦截后，标记域名 → 用裸奔 context 重试
             // 主 context（L3 stealth）不受影响，其他域名继续正常 stealth
             console.error(`[web-fetcher] ⚠️ 检测到 WAF 拦截（空白页） → 切换到裸奔 context (${domainForStealth})`);
 
             // 关闭当前空白页
-            await page.close().catch(() => { });
-            this.activePages = Math.max(0, this.activePages - 1);
+                await this.closeFailedPage(page, "waf-stealth-retry");
 
-            // 标记该域名需要裸奔
-            this.domainStealthLevel.set(domainForStealth, 1);
+                // 标记该域名需要裸奔
+                this.domainStealthLevel.set(domainForStealth, 1);
 
-            // 使用裸奔 context 重新导航（递归调用会自动走 bareContext 分支）
-            this.lastRetryCount++;
-            console.error(`[web-fetcher] 🔄 使用裸奔 context 重新导航: ${url}`);
-            return this.navigateTo(url, options);
-        }
+                // 使用裸奔 context 重新导航（递归调用会自动走 bareContext 分支）
+                this.lastRetryCount++;
+                console.error(`[web-fetcher] 🔄 使用裸奔 context 重新导航: ${url}`);
+                return this.navigateTo(url, options);
+            }
 
-        try {
+            try {
 
             // 如果指定了等待选择器
             if (options?.waitFor) {
@@ -888,10 +903,100 @@ class BrowserManager {
             // 无论是 screenshot、fetch-page、fetch-rich 还是其他工具，都能自动触发 UAV
             const uavPage = await this.checkAndHandleVerification(page, url, options);
             return uavPage;
+            } catch (error) {
+                await this.closeFailedPage(page, "post-navigation-error");
+                throw error;
+            }
         } catch (error) {
-            await page.close().catch(() => { });
+            await this.closeFailedPage(page, "navigation-error");
             throw error;
         }
+    }
+
+    private trackActivePage(page: Page): void {
+        this.activePages.add(page);
+        page.once("close", () => {
+            this.activePages.delete(page);
+        });
+    }
+
+    private pruneClosedActivePages(): void {
+        for (const page of Array.from(this.activePages)) {
+            if (page.isClosed()) {
+                this.activePages.delete(page);
+            }
+        }
+    }
+
+    private async closeFailedPage(page: Page, reason: string): Promise<void> {
+        if (!this.activePages.has(page) && page.isClosed()) return;
+        try {
+            await page.close();
+        } catch {
+            this.activePages.delete(page);
+            return;
+        }
+        this.activePages.delete(page);
+        console.error(`[web-fetcher] 已关闭失败路径页面: ${reason}`);
+    }
+
+    private isLocalDevUrl(url: string): boolean {
+        try {
+            const parsed = new URL(url);
+            if (!["http:", "https:"].includes(parsed.protocol)) return false;
+            const hostname = parsed.hostname.toLowerCase();
+            return hostname === "localhost"
+                || hostname === "127.0.0.1"
+                || hostname === "::1"
+                || hostname === "[::1]";
+        } catch {
+            return false;
+        }
+    }
+
+    private withLocalDevNoCacheHeaders(headers: Record<string, string>): Record<string, string> {
+        const nextHeaders = { ...headers };
+        for (const key of Object.keys(nextHeaders)) {
+            const normalized = key.toLowerCase();
+            if (normalized === "cache-control" || normalized === "pragma" || normalized === "expires") {
+                delete nextHeaders[key];
+            }
+        }
+        return {
+            ...nextHeaders,
+            ...BrowserManager.LOCAL_DEV_NO_CACHE_HEADERS,
+        };
+    }
+
+    private async prepareLocalDevCacheBypass(page: Page, url: string): Promise<void> {
+        if (!this.isLocalDevUrl(url)) return;
+        let cdpSession: Awaited<ReturnType<ReturnType<Page["context"]>["newCDPSession"]>> | null = null;
+        try {
+            cdpSession = await page.context().newCDPSession(page);
+            await cdpSession.send("Network.enable");
+            await cdpSession.send("Network.setCacheDisabled", { cacheDisabled: true });
+            await cdpSession.send("Network.clearBrowserCache");
+            const sessionForClose = cdpSession;
+            page.once("close", () => {
+                sessionForClose.detach().catch(() => undefined);
+            });
+            cdpSession = null;
+            console.error(`[web-fetcher] 本地开发地址已禁用浏览器缓存: ${new URL(url).origin}`);
+        } catch (error) {
+            console.error(`[web-fetcher] 本地开发地址禁用缓存失败，继续按原流程访问: ${error instanceof Error ? error.message : String(error)}`);
+        } finally {
+            await cdpSession?.detach().catch(() => undefined);
+        }
+    }
+
+    getPoolStats(): { activePages: number; maxConcurrentPages: number; warningThreshold: number; isNearLimit: boolean } {
+        this.pruneClosedActivePages();
+        return {
+            activePages: this.activePages.size,
+            maxConcurrentPages: BrowserManager.MAX_CONCURRENT_PAGES,
+            warningThreshold: BrowserManager.PAGE_POOL_WARNING_THRESHOLD,
+            isNearLimit: this.activePages.size >= BrowserManager.PAGE_POOL_WARNING_THRESHOLD,
+        };
     }
 
     /**
@@ -1750,7 +1855,7 @@ class BrowserManager {
                 console.error(`[web-fetcher] 已清理 bare profile: ${bareProfileDir}`);
             }
         } catch { /* 忽略清理失败 */ }
-        this.activePages = 0;
+        this.activePages.clear();
         console.error("[web-fetcher] 浏览器已关闭");
     }
 
@@ -1782,11 +1887,11 @@ class BrowserManager {
                 // 忽略关闭错误
             }
             this.context = null;
-            this.activePages = 0;
+            this.activePages.clear();
             console.error("[web-fetcher] 浏览器空闲超时，已关闭释放内存");
         }
         this.launching = null;
-        this.activePages = 0;
+        this.activePages.clear();
         try {
             for (const profileDir of [BROWSER_USER_DATA_DIR, BROWSER_USER_DATA_DIR + '-bare']) {
                 if (fs.existsSync(profileDir)) {

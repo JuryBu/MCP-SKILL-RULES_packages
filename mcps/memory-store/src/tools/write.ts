@@ -19,7 +19,8 @@ import {
 import { type MemoryIndexEntry } from "../cache.js";
 import { checkDuplicates } from "../search.js";
 import { generateAutoSummary } from "../auto-summary.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit, type Chain } from "../chain.js";
+import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * memory_write — 写入新记忆
@@ -39,8 +40,8 @@ export function registerWrite(server: McpServer): void {
             category: z.enum(["problem-solution", "technical-note", "conversation", "general"]).optional().describe("分类，默认 general"),
             conversationId: z.string().optional().describe("来源对话 ID"),
             pinned: z.boolean().optional().describe("是否置顶（每个工作区/general 建议最多 3 条）"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("autoSummary 模型链路；未填回退到 chain，再默认 auto"),
-            chain: z.enum(CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：autoSummary 模型链路，modelChain 未填时使用"),
+            modelChain: modelChainInputSchema("modelChain", "autoSummary 模型链路；未填回退到 chain，再默认 auto"),
+            chain: modelChainInputSchema("chain", "兼容旧参数：autoSummary 模型链路，modelChain 未填时使用"),
         },
         async ({ title, content, searchSummary, tags, workspace, category, conversationId, pinned, chain, modelChain }) => {
             touchActivity();
@@ -131,7 +132,7 @@ export function registerWrite(server: McpServer): void {
                 const searchSummaryNote = actualSearchSummary ? "" : "\n🤖 autoSummary 正在后台生成...";
 
                 // v1.5: 异步生成 autoSummary（不阻塞返回）
-                triggerAutoSummary(hash, id, title, tags, content, resolveChainSplit({ chain, modelChain }).modelChain).catch(() => {});
+                triggerAutoSummary(hash, id, title, tags, content, resolveModelOnlyChainSplit({ chain, modelChain }).modelChain).catch(() => {});
 
                 return appendTiming({
                     content: [{

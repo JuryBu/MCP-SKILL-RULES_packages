@@ -19,10 +19,21 @@ interface CodexExecResult {
     error?: string;
 }
 
+interface CodexBridgeCandidate {
+    model: string;
+    reasoning: string;
+    speed?: string;
+}
+
 const LS_AUTO_MODEL = process.env.SANDBOX_LS_MODEL || "MODEL_PLACEHOLDER_M132";
 const CODEX_MODEL = process.env.SANDBOX_CODEX_MODEL || "gpt-5.5";
 const CODEX_REASONING = process.env.SANDBOX_CODEX_REASONING || "medium";
 const CODEX_SPEED_TIER = process.env.SANDBOX_CODEX_SPEED || "fast";
+const CODEX_BRIDGE_REASONING = process.env.SANDBOX_CODEX_BRIDGE_REASONING || "low";
+const CODEX_BRIDGE_FALLBACKS_ENABLED = !/^(0|false|off)$/iu.test(process.env.SANDBOX_CODEX_BRIDGE_FALLBACKS_ENABLED || "");
+const CODEX_BRIDGE_FALLBACKS = process.env.SANDBOX_CODEX_BRIDGE_FALLBACKS || "gpt-5.5:low,gpt-5.4:low,gpt-5.4-mini:low";
+const CODEX_BRIDGE_RETRIES = Math.max(0, Math.min(Number(process.env.SANDBOX_CODEX_BRIDGE_RETRIES ?? 0), 2));
+const CODEX_BRIDGE_RETRY_BACKOFF_MS = Math.max(0, Number(process.env.SANDBOX_CODEX_BRIDGE_RETRY_BACKOFF_MS || 500));
 const CODEX_DEFAULT_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_TIMEOUT || 5 * 60_000);
 const CODEX_KILL_TREE_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_KILL_TREE_TIMEOUT || 5_000);
 const CODEX_OUTPUT_PATH_KILL_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_OUTPUT_PATH_KILL_TIMEOUT || 5_000);
@@ -427,6 +438,87 @@ export async function callCodexText(prompt: string, timeoutMs: number, options: 
     return result.text;
 }
 
+function sleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function parseCodexBridgeCandidate(raw: string): CodexBridgeCandidate | null {
+    const value = raw.trim();
+    if (!value) return null;
+    const [modelPart, reasoningPart, speedPart] = value.split(":").map((part) => part.trim()).filter(Boolean);
+    if (!modelPart) return null;
+    return {
+        model: modelPart,
+        reasoning: reasoningPart || CODEX_BRIDGE_REASONING,
+        speed: speedPart || CODEX_SPEED_TIER,
+    };
+}
+
+function codexCandidateKey(candidate: CodexBridgeCandidate): string {
+    return `${candidate.model}\u0000${candidate.reasoning}\u0000${candidate.speed || ""}`;
+}
+
+function getCodexBridgeCandidates(): CodexBridgeCandidate[] {
+    const candidates: CodexBridgeCandidate[] = [{
+        model: CODEX_MODEL,
+        reasoning: CODEX_BRIDGE_REASONING,
+        speed: CODEX_SPEED_TIER,
+    }];
+
+    if (CODEX_BRIDGE_FALLBACKS_ENABLED) {
+        for (const item of CODEX_BRIDGE_FALLBACKS.split(",")) {
+            const candidate = parseCodexBridgeCandidate(item);
+            if (candidate) candidates.push(candidate);
+        }
+    }
+
+    const seen = new Set<string>();
+    return candidates.filter((candidate) => {
+        const key = codexCandidateKey(candidate);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+function isCodexBridgeRetryableError(message: string): boolean {
+    if (/Unknown option|invalid|认证失败|未登录|Missing or invalid access token|permission denied|拒绝访问|not found|ENOENT/iu.test(message)) {
+        return false;
+    }
+    return /timeout|timed out|HTTP (408|409|429|500|502|503|504)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|transport|channel closed|空输出|未返回|exited with code/iu.test(message);
+}
+
+async function callCodexTextForModelBridge(prompt: string, timeoutMs: number): Promise<string> {
+    if (!(await isCodexCliAvailable())) {
+        throw new Error("Codex 链路不可用：未发现 codex CLI");
+    }
+
+    const candidates = getCodexBridgeCandidates();
+    const errors: string[] = [];
+    for (let index = 0; index < candidates.length; index++) {
+        const candidate = candidates[index];
+        for (let attempt = 0; attempt <= CODEX_BRIDGE_RETRIES; attempt++) {
+            const result = await callCodexExec(prompt, timeoutMs, candidate);
+            if (result.text) return result.text;
+
+            const error = result.error || "Codex exec 未返回文本";
+            const label = `${candidate.model}(reasoning=${candidate.reasoning}${candidate.speed ? `, speed=${candidate.speed}` : ""})`;
+            errors.push(`${label} attempt ${attempt + 1}/${CODEX_BRIDGE_RETRIES + 1}: ${error}`);
+            const canRetry = attempt < CODEX_BRIDGE_RETRIES && isCodexBridgeRetryableError(error);
+            if (!canRetry) break;
+            if (CODEX_BRIDGE_RETRY_BACKOFF_MS > 0) {
+                await sleep(CODEX_BRIDGE_RETRY_BACKOFF_MS * (attempt + 1));
+            }
+        }
+
+        const lastError = errors[errors.length - 1] || "";
+        const canFallback = index < candidates.length - 1 && isCodexBridgeRetryableError(lastError);
+        if (!canFallback) break;
+    }
+
+    throw new Error(`Codex 链路模型调用失败，fallback 链已结束：${errors.join(" | ")}`);
+}
+
 export async function callModelBridge(
     chain: ModelChain,
     prompt: string,
@@ -451,6 +543,6 @@ export async function callModelBridge(
         return { chainUsed, text: result.text };
     }
 
-    const text = await callCodexText(prompt, timeoutMs);
+    const text = await callCodexTextForModelBridge(prompt, timeoutMs);
     return { chainUsed, text };
 }

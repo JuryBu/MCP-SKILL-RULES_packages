@@ -106,6 +106,8 @@ export interface CodexDeepLocateOptions {
 
 const CODEX_HOME = path.join(os.homedir(), ".codex");
 const STATE_DB = path.join(CODEX_HOME, "state_5.sqlite");
+const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, "sessions");
+const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_HOME, "archived_sessions");
 const CODEX_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CODEX_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
 const CODEX_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CODEX_JSONL_MAX_LINE_CHARS || 64 * 1024 * 1024);
 const CODEX_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CODEX_TEXT_FIELD_MAX_CHARS || 200_000);
@@ -113,6 +115,7 @@ const CODEX_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CODEX_CONT
 const CODEX_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CODEX_AGENTS_HEADER = "# AGENTS.md instructions for ";
 const CODEX_AGENTS_FOLDED_MARKER = "[Codex AGENTS/RULES 注入已折叠";
+const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu;
 
 function normalizePath(input: string): string {
     return input.replace(/^\\\\\?\\/u, "").replace(/\\/g, "/").toLowerCase();
@@ -132,6 +135,21 @@ function execPythonJson(script: string, args: string[]): any {
     return stdout.trim() ? JSON.parse(stdout.trim()) : null;
 }
 
+function threadFromSqliteRow(row: any): CodexThreadInfo {
+    return {
+        id: row.id,
+        rolloutPath: row.rollout_path,
+        cwd: row.cwd,
+        title: row.title,
+        source: row.source,
+        model: row.model,
+        reasoningEffort: row.reasoning_effort,
+        agentNickname: row.agent_nickname,
+        agentRole: row.agent_role,
+        updatedAtMs: row.updated_at_ms,
+    };
+}
+
 function readThreads(limit = 200, includeArchived = false): CodexThreadInfo[] {
     if (!fs.existsSync(STATE_DB)) return [];
     const script = `
@@ -149,18 +167,121 @@ rows = conn.execute(
 print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
 `;
     const rows = execPythonJson(script, [STATE_DB, String(limit), includeArchived ? "1" : "0"]) as any[] || [];
-    return rows.map((row) => ({
-        id: row.id,
-        rolloutPath: row.rollout_path,
-        cwd: row.cwd,
-        title: row.title,
-        source: row.source,
-        model: row.model,
-        reasoningEffort: row.reasoning_effort,
-        agentNickname: row.agent_nickname,
-        agentRole: row.agent_role,
-        updatedAtMs: row.updated_at_ms,
-    }));
+    return rows.map(threadFromSqliteRow);
+}
+
+function readThreadById(id: string): CodexThreadInfo | null {
+    if (!fs.existsSync(STATE_DB)) return null;
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+thread_id = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+row = conn.execute(
+    "select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads where id = ? limit 1",
+    (thread_id,)
+).fetchone()
+print(json.dumps(dict(row), ensure_ascii=False) if row else "")
+`;
+    const row = execPythonJson(script, [STATE_DB, id]) as any | null;
+    return row ? threadFromSqliteRow(row) : null;
+}
+
+function readThreadsByIdPrefix(prefix: string, limit = 2): CodexThreadInfo[] {
+    if (!fs.existsSync(STATE_DB)) return [];
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+prefix = sys.argv[2]
+limit = int(sys.argv[3])
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+rows = conn.execute(
+    "select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads where id like ? order by updated_at_ms desc limit ?",
+    (prefix + "%", limit)
+).fetchall()
+print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
+`;
+    const rows = execPythonJson(script, [STATE_DB, prefix, String(limit)]) as any[] || [];
+    return rows.map(threadFromSqliteRow);
+}
+
+function isLikelyCodexIdLookup(query: string): boolean {
+    return /^[0-9a-f-]{8,36}$/iu.test(query);
+}
+
+function readSessionMetaFromRollout(rolloutPath: string): any | null {
+    try {
+        const fd = fs.openSync(rolloutPath, "r");
+        try {
+            const buffer = Buffer.alloc(1024 * 1024);
+            const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
+            const firstLine = buffer.subarray(0, bytesRead).toString("utf8").split(/\r?\n/u, 1)[0] || "";
+            if (!firstLine.trim()) return null;
+            const event = JSON.parse(firstLine);
+            return event?.type === "session_meta" ? event.payload || null : null;
+        } finally {
+            fs.closeSync(fd);
+        }
+    } catch {
+        return null;
+    }
+}
+
+function threadFromRolloutPath(rolloutPath: string): CodexThreadInfo | null {
+    const match = path.basename(rolloutPath).match(CODEX_ROLLOUT_ID_RE);
+    if (!match) return null;
+    const meta = readSessionMetaFromRollout(rolloutPath);
+    const stat = fs.statSync(rolloutPath);
+    const id = String(meta?.id || match[1]);
+    return {
+        id,
+        rolloutPath,
+        cwd: typeof meta?.cwd === "string" ? meta.cwd : "",
+        title: typeof meta?.title === "string" ? meta.title : "",
+        source: typeof meta?.source === "string" ? meta.source : typeof meta?.originator === "string" ? meta.originator : "rollout",
+        model: typeof meta?.model === "string" ? meta.model : null,
+        reasoningEffort: typeof meta?.reasoning_effort === "string" ? meta.reasoning_effort : null,
+        agentNickname: null,
+        agentRole: null,
+        updatedAtMs: stat.mtimeMs,
+    };
+}
+
+function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
+    const normalized = query.trim().toLowerCase();
+    if (!isLikelyCodexIdLookup(normalized)) return [];
+    const roots = [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR].filter(root => fs.existsSync(root));
+    const matches: CodexThreadInfo[] = [];
+    const visit = (dir: string): boolean => {
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return false;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (visit(fullPath)) return true;
+                continue;
+            }
+            if (!entry.isFile()) continue;
+            const match = entry.name.match(CODEX_ROLLOUT_ID_RE);
+            if (!match) continue;
+            const id = match[1].toLowerCase();
+            if (!id.startsWith(normalized)) continue;
+            const thread = threadFromRolloutPath(fullPath);
+            if (thread) matches.push(thread);
+            if (id === normalized || matches.length >= 2) return true;
+        }
+        return false;
+    };
+    for (const root of roots) {
+        if (visit(root)) break;
+    }
+    return matches;
 }
 
 export function isCodexSessionStoreAvailable(): boolean {
@@ -175,6 +296,17 @@ export function resolveCodexThreadId(input: string): string | null {
     const query = input.trim();
     if (!query) return null;
     const queryLower = query.toLowerCase();
+
+    const exactById = isLikelyCodexIdLookup(queryLower) && queryLower.length === 36
+        ? readThreadById(queryLower)
+        : null;
+    if (exactById) return exactById.id;
+
+    if (isLikelyCodexIdLookup(queryLower)) {
+        const sqlitePrefixMatches = readThreadsByIdPrefix(queryLower, 2);
+        if (sqlitePrefixMatches.length === 1) return sqlitePrefixMatches[0].id;
+    }
+
     const threads = readThreads(1000, true);
 
     const exact = threads.find((thread) => thread.id === query);
@@ -186,14 +318,22 @@ export function resolveCodexThreadId(input: string): string | null {
     const titleMatches = threads.filter((thread) => (thread.title || "").toLowerCase() === queryLower);
     if (titleMatches.length === 1) return titleMatches[0].id;
 
+    const rolloutMatches = findRolloutThreadByIdLookup(queryLower);
+    if (rolloutMatches.length === 1) return rolloutMatches[0].id;
+
     return null;
 }
 
 export function getCodexThread(conversationId: string): CodexThreadInfo | null {
     const resolvedId = resolveCodexThreadId(conversationId);
     if (!resolvedId) return null;
+    const exactById = readThreadById(resolvedId);
+    if (exactById) return exactById;
     const threads = readThreads(1000, true);
-    return threads.find((thread) => thread.id === resolvedId) || null;
+    const recent = threads.find((thread) => thread.id === resolvedId);
+    if (recent) return recent;
+    const rolloutMatches = findRolloutThreadByIdLookup(resolvedId);
+    return rolloutMatches.length === 1 ? rolloutMatches[0] : null;
 }
 
 export function resolveCurrentCodexThreadId(cwd: string = process.cwd()): string | null {

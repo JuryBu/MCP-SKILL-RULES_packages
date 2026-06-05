@@ -1,4 +1,4 @@
-import fs from "fs";
+﻿import fs from "fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";
@@ -10,9 +10,10 @@ import {
     type GuardState,
     type GuardLockOperationResult,
 } from "../guard-store.js";
-import { CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type DataChain } from "../chain.js";
 import { loadConversationData } from "../conversation-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * Stage Guard — 任务完整性自动验证工具
@@ -35,12 +36,11 @@ const StageGuardSchema = z.object({
         .describe("start 时可选：Stage 标识，如 'Stage 3'"),
     conversationId: z.string().optional()
         .describe("可选：显式指定要守卫的对话 ID，跨宿主场景建议传入"),
-    chain: z.enum(CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
-        .describe("兼容旧参数：未传 modelChain 时作为模型链路；Guard 对话数据默认使用当前宿主链路"),
-    dataChain: z.enum(CHAIN_INPUT_VALUES).optional()
-        .describe("可选：Guard 读取执行记录的链路，支持 antigravity/codex/claude-code；未填默认 auto"),
-    modelChain: z.enum(CHAIN_INPUT_VALUES).optional()
-        .describe("模型链路：auto=当前宿主优先，claude-code=显式 Claude Code CLI"),
+    chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
+        .describe("兼容旧参数：chain=\"windsurf\" 只作为数据链路；模型链路仍默认 auto"),
+    dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
+        .describe("可选：Guard 读取执行记录的链路，支持 antigravity/codex/claude-code/windsurf；未填默认 auto"),
+    modelChain: modelChainInputSchema("modelChain", "模型链路：auto=当前宿主优先，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
     startRound: z.number().optional()
         .describe("start 时可选：起始轮次（默认当前轮次）。可手动设为更早的轮次以覆盖已完成的工作"),
     appealNote: z.string().optional()
@@ -80,7 +80,7 @@ function resolveModelChain(params: z.infer<typeof StageGuardSchema>): Chain {
     return resolveChainSplit({ chain: params.chain, modelChain: params.modelChain }).modelChain;
 }
 
-function resolveDataChain(params: z.infer<typeof StageGuardSchema>): Chain {
+function resolveDataChain(params: z.infer<typeof StageGuardSchema>): DataChain {
     return resolveChainSplit({ chain: DEFAULT_CHAIN, dataChain: params.dataChain }).dataChain;
 }
 

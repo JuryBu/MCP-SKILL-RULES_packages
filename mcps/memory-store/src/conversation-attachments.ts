@@ -11,7 +11,8 @@ export type ConversationAttachmentSource =
     | "files-mentioned"
     | "antigravity-uri"
     | "claude-code-data-url"
-    | "claude-code-local-file";
+    | "claude-code-local-file"
+    | "windsurf-data-url";
 
 export interface ConversationAttachment {
     kind: ConversationAttachmentKind;
@@ -276,7 +277,7 @@ async function materializeAttachment(
 ): Promise<ConversationAttachment> {
     if (
         attachment.kind !== "image" ||
-        (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url") ||
+        (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url" && attachment.source !== "windsurf-data-url") ||
         !attachment.dataUrl
     ) {
         return attachment;
@@ -298,7 +299,11 @@ async function materializeAttachment(
 
     const bytes = Buffer.from(parsed.base64, "base64");
     const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
-    const sourceDir = attachment.source === "claude-code-data-url" ? "claude-code-attachments" : "codex-attachments";
+    const sourceDir = attachment.source === "claude-code-data-url"
+        ? "claude-code-attachments"
+        : attachment.source === "windsurf-data-url"
+            ? "windsurf-attachments"
+            : "codex-attachments";
     const dir = path.join(TEMP_DIR, sourceDir, conversationId, `round-${String(roundIndex).padStart(6, "0")}`);
     const filename = `sha256-${sha256}${extensionFromMime(parsed.mimeType)}`;
     const tempPath = path.join(dir, filename);
@@ -360,7 +365,7 @@ export async function materializeRoundAttachments(
         ).length;
         const dataUrlImageCount = attachments.filter(attachment =>
             attachment.kind === "image" &&
-            attachment.source === "codex-data-url" &&
+            (attachment.source === "codex-data-url" || attachment.source === "claude-code-data-url" || attachment.source === "windsurf-data-url") &&
             attachment.dataUrl
         ).length;
         let preferLocalRemaining = existingImagePathCount >= dataUrlImageCount ? existingImagePathCount : 0;
@@ -368,7 +373,7 @@ export async function materializeRoundAttachments(
             const attachment = attachments[index];
             if (
                 attachment.kind !== "image" ||
-                (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url") ||
+                (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url" && attachment.source !== "windsurf-data-url") ||
                 !attachment.dataUrl
             ) continue;
             if (preferLocalRemaining > 0) {
@@ -420,7 +425,7 @@ export function summarizeAttachments(rounds: ConversationRound[]): AttachmentSum
             summary.total += 1;
             if (attachment.kind === "image") summary.images += 1;
             if (attachment.kind === "file") summary.files += 1;
-            if (attachment.source === "codex-data-url" || attachment.source === "claude-code-data-url") summary.codexInlineImages += 1;
+            if (attachment.source === "codex-data-url" || attachment.source === "claude-code-data-url" || attachment.source === "windsurf-data-url") summary.codexInlineImages += 1;
             if (attachment.originalPath) {
                 if (attachment.exists) summary.existingPaths += 1;
                 else summary.missingPaths += 1;
@@ -439,7 +444,7 @@ export function formatAttachmentOverview(rounds: ConversationRound[]): string {
     if (summary.total === 0) return "";
     const parts = [
         `📎 附件概览: 图片 ${summary.images} 张，文件路径引用 ${summary.files} 个`,
-        summary.codexInlineImages > 0 ? `JSONL 内联图片 ${summary.codexInlineImages} 张会在 read/search 命中轮次时按需生成临时文件` : "",
+        summary.codexInlineImages > 0 ? `内联图片 ${summary.codexInlineImages} 张会在 read/search 命中轮次时按需生成临时文件` : "",
         summary.existingPaths || summary.missingPaths ? `本地路径：${summary.existingPaths} 个存在，${summary.missingPaths} 个当前不可访问` : "",
     ].filter(Boolean);
     return parts.join("\n");

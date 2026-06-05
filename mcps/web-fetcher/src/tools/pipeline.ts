@@ -1,8 +1,8 @@
-import { z } from "zod";
+﻿import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
 import { touchActivity } from "../lifecycle.js";
-import { sessionManager } from "../session.js";
+import { formatPoolPressureHint, sessionManager } from "../session.js";
 import { extractContent, compactContent, safePageEvaluate, safePageContent, type OutputMode } from "../extractor.js";
 import { QUALITY_PRESETS, appendTiming } from "../constants.js";
 import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-store.js";
@@ -136,6 +136,24 @@ export function registerPipeline(server: McpServer): void {
 
             const timeout = params.timeout ?? 30000;
             const results: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+            const finalize = (
+                result: { content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; isError?: boolean },
+                _startTime?: number,
+                retryCount?: number,
+            ) => {
+                const hint = formatPoolPressureHint(params.ownerId);
+                if (hint && Array.isArray(result.content)) {
+                    const content = [...result.content];
+                    for (let i = content.length - 1; i >= 0; i--) {
+                        const item = content[i];
+                        if (item?.type === "text") {
+                            content[i] = { ...item, text: `${item.text}\n${hint}` };
+                            return appendTiming({ ...result, content }, startTime, retryCount);
+                        }
+                    }
+                }
+                return appendTiming(result, startTime, retryCount);
+            };
             let sessionId: string | null = null;
             let page: Awaited<ReturnType<typeof browserManager.navigateTo>> | null = null;
             let createdSession = false;
@@ -552,7 +570,7 @@ export function registerPipeline(server: McpServer): void {
                     });
                 }
 
-                return appendTiming({ content: results }, startTime, browserManager.lastRetryCount);
+                return finalize({ content: results }, startTime, browserManager.lastRetryCount);
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
 
@@ -569,7 +587,7 @@ export function registerPipeline(server: McpServer): void {
                         type: "text" as const,
                         text: `\n❌ Pipeline 异常终止: ${message}${hint}`,
                     });
-                    return appendTiming({ content: results }, startTime, browserManager.lastRetryCount);
+                    return finalize({ content: results }, startTime, browserManager.lastRetryCount);
                 }
 
                 return {

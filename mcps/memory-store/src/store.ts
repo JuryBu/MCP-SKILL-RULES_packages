@@ -20,9 +20,7 @@ import { indexCache, type WorkspaceIndex, type MemoryIndexEntry } from "./cache.
 // ============= 路径常量 =============
 
 const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || (process.env.CODEX_TOOLKIT_DATA_ROOT
-        ? path.join(process.env.CODEX_TOOLKIT_DATA_ROOT, "memory-store")
-        : path.join(os.homedir(), ".codex-toolkit", "memory-store"));
+    || path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
 const WORKSPACES_DIR = path.join(DATA_ROOT, "workspaces");
 const GENERAL_DIR = path.join(DATA_ROOT, "general");
 const GLOBAL_INDEX_PATH = path.join(DATA_ROOT, "_global_index.json");

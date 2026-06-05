@@ -20,7 +20,7 @@ const ModelConfigSchema = z.object({
         required_error: "模型配置必须包含 role，例如 红队 / 蓝队 / 主持人",
         invalid_type_error: "模型配置 role 必须是字符串，例如 红队 / 蓝队 / 主持人",
     }).min(1).describe("角色说明，如 红队、蓝队、黑队、主持人；moderator 也必须提供 role"),
-    provider: z.enum(PROVIDERS).describe("模型来源"),
+    provider: z.enum(PROVIDERS).describe("模型来源；Windsurf/WSF 没有 sandbox_council provider，WSF 中调用本工具时仍应选择现有 provider"),
     model: z.string().optional().describe("模型名；antigravity 可用 M132/M20/M18/M16/M36、flash、flash-medium、pro-high、sonnet、opus 等别名，也可直接传 MODEL_* 编码；旧 M37 转 M16、M47 转 M18；geminiCli 可用 auto-gemini-3/gemini-3.1-pro-preview/gemini-2.5-pro 等 Gemini CLI 模型；claudeCode 默认 sonnet；不填使用 provider 默认值"),
     params: z.record(z.unknown()).optional().describe("供应商参数。apiKeyEnv/endpoint/headers/body 可选；claudeCode 支持 maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools；fallbackModels 可传同 provider 降级链，如 [\"gemini-3-flash\"] 或 [{\"model\":\"gemini-3.1-pro\",\"params\":{\"reasoning\":\"low\"}}]；body 只能覆盖非核心字段，不能覆盖 auth/model/input/messages/contents"),
     supportsVision: z.boolean().optional().describe("该模型是否支持直接接收 images"),
@@ -152,6 +152,7 @@ export function registerCouncil(server: McpServer): void {
 - Codex provider 未显式传 fallbackModels 时默认按 gpt-5.4 high → medium → low → gpt-5.4-mini medium → low 降级，并跳过当前已使用档位；可用 SANDBOX_COUNCIL_CODEX_DEFAULT_FALLBACKS=0 关闭
 - Gemini CLI provider 可用 provider=geminiCli；这是本地 Gemini CLI 路线，不需要 GEMINI_API_KEY，支持让 supportsVision=true 的参与者直接处理图片路径。未显式传 fallbackModels 时默认按 auto-gemini-3 → gemini-3.1-pro-preview → gemini-2.5-pro → gemini-3.1-flash-lite-preview → gemini-2.5-flash-lite → gemini-2.5-flash 降级；可用 SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS=0 关闭
 - Claude Code provider 可用 provider=claudeCode；这是本地 claude CLI 路线，只在显式配置时调用，不进入 auto 或 Codex 默认 fallback。默认带小预算上限，可用 params.maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools 覆盖；transcript 会记录实际模型与 sessionId/费用摘要
+- Windsurf/WSF 不提供 sandbox_council provider；它只能作为 MCP 客户端通过 broker 调用现有 provider，provider="windsurf" 不在 schema 中，应被拒绝
 - moderator 调用失败时会先走 provider fallback；如果所有主持模型仍失败，会用规则兜底汇总已返回的参与者意见，并标明未经过主持模型二次综合
 - CLI 文件索引本身也有 retry/fallback：Gemini 默认优先 auto-gemini-3/gemini-3.1-pro-preview/gemini-2.5-pro，容量不稳的 gemini-2.5-flash 靠后；Codex 默认 gpt-5.4:medium → gpt-5.4:low → gpt-5.4-mini:medium → gpt-5.4-mini:low。可用 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS、SANDBOX_COUNCIL_CODEX_INDEX_MODELS、SANDBOX_COUNCIL_CLI_INDEX_RETRIES 覆盖
 - simpleScript v1.10 仅用于受限 Node/Python 子进程文本/JSON/CSV/统计处理；默认 language=node，Python 走 AST 白名单与最小环境，不是通用命令入口

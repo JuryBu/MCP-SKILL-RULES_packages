@@ -1,4 +1,4 @@
-import { execSync, execFileSync } from "child_process";
+﻿import { execSync, execFileSync } from "child_process";
 import http from "http";
 import path from "path";
 import os from "os";
@@ -718,16 +718,7 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
 
 // ===== 辅助 =====
 
-const MEMORY_DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || (process.env.CODEX_TOOLKIT_DATA_ROOT
-        ? path.join(process.env.CODEX_TOOLKIT_DATA_ROOT, "memory-store")
-        : path.join(os.homedir(), ".codex-toolkit", "memory-store"));
-const CONV_CACHE_DIR = path.join(MEMORY_DATA_ROOT, "temp");
-
-function getAntigravityConversationsDir(): string {
-    return process.env.ANTIGRAVITY_CONVERSATIONS_DIR
-        || path.join(os.homedir(), ".gemini", "antigravity", "conversations");
-}
+const CONV_CACHE_DIR = path.join(os.homedir(), ".gemini", "antigravity", "memory-store", "temp");
 
 function getConvCachePath(cascadeId: string): string {
     const safeId = cascadeId.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
@@ -790,7 +781,7 @@ export async function getCurrentCascadeId(): Promise<string | null> {
 
 /** .pb 修改时间猜测（旧逻辑，作为兜底） */
 function guessFromPb(): string | null {
-    const convDir = getAntigravityConversationsDir();
+    const convDir = path.join(os.homedir(), ".gemini", "antigravity", "conversations");
     if (!fs.existsSync(convDir)) return null;
     try {
         const files = fs.readdirSync(convDir)
@@ -853,7 +844,7 @@ async function findFallbackLsConnection(): Promise<ParentLsConnection | null> {
  * 列出所有可获取的对话 ID（从 conversations 目录）
  */
 export function listConversationIds(): string[] {
-    const convDir = getAntigravityConversationsDir();
+    const convDir = path.join(os.homedir(), ".gemini", "antigravity", "conversations");
     if (!fs.existsSync(convDir)) return [];
     try {
         return fs.readdirSync(convDir)
@@ -938,7 +929,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/Users/Example/Desktop/project"
+ * 返回去 URI 化后的本地路径，如 "%USERPROFILE%/Desktop/比赛"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {
@@ -1041,4 +1032,3 @@ export async function callGetModelResponse(model: string, prompt: string, timeou
         return null;
     }
 }
-

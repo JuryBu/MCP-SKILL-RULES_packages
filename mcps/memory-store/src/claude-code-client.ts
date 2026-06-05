@@ -3,7 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
-import type { ConversationRound } from "./trajectory.js";
+import type { CompactionSummaryInfo, ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 
 export interface ClaudeCodeThreadInfo {
@@ -82,6 +82,8 @@ const CLAUDE_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CC_JSONL_MAX
 const CLAUDE_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CC_TEXT_FIELD_MAX_CHARS || 200_000);
 const CLAUDE_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CLAUDE_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS || 12_000);
+const CLAUDE_CODE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
+const CLAUDE_COMPACT_FOLDED_MARKER = "[Claude Code compact summary folded";
 
 function claudeHome(): string {
     return process.env.MEMORY_STORE_CLAUDE_HOME || path.join(os.homedir(), ".claude");
@@ -119,6 +121,43 @@ function listJsonlFiles(root: string, limit = 1000): string[] {
         }
     }
     return result;
+}
+
+function isLikelyClaudeCodeIdLookup(query: string): boolean {
+    return /^[0-9a-f-]{8,36}$/iu.test(query);
+}
+
+function findClaudeCodeThreadsByIdLookup(query: string): ClaudeCodeThreadInfo[] {
+    const normalized = query.trim().toLowerCase();
+    if (!isLikelyClaudeCodeIdLookup(normalized)) return [];
+    const root = claudeProjectsDir();
+    if (!fs.existsSync(root)) return [];
+    const matches: ClaudeCodeThreadInfo[] = [];
+    const stack = [root];
+    while (stack.length && matches.length < 2) {
+        const dir = stack.pop()!;
+        let entries: fs.Dirent[] = [];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                stack.push(full);
+                continue;
+            }
+            if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".jsonl")) continue;
+            const id = path.basename(entry.name, ".jsonl").toLowerCase();
+            if (!CLAUDE_CODE_ID_RE.test(id) || !id.startsWith(normalized)) continue;
+            const thread = readThreadMetadata(full);
+            if (thread) matches.push(thread);
+            if (id === normalized) return matches;
+            if (matches.length >= 2) return matches;
+        }
+    }
+    return matches;
 }
 
 function parseJsonLine(line: string): any | null {
@@ -325,6 +364,80 @@ function extractMessageContent(content: any, cwd?: string): { text: string; thin
     };
 }
 
+interface PendingCompactBoundary {
+    uuid?: string;
+    lineNo?: number;
+    byteOffset?: number;
+    trigger?: string;
+    preTokens?: number;
+    postTokens?: number;
+    durationMs?: number;
+}
+
+function isClaudeCodeCompactBoundary(event: any): boolean {
+    return event?.type === "system" && event?.subtype === "compact_boundary";
+}
+
+function compactBoundaryFromEvent(event: any, lineNo?: number, byteOffset?: number): PendingCompactBoundary {
+    const metadata = event?.compactMetadata || {};
+    return {
+        uuid: typeof event?.uuid === "string" ? event.uuid : undefined,
+        lineNo,
+        byteOffset,
+        trigger: typeof metadata.trigger === "string" ? metadata.trigger : undefined,
+        preTokens: typeof metadata.preTokens === "number" ? metadata.preTokens : undefined,
+        postTokens: typeof metadata.postTokens === "number" ? metadata.postTokens : undefined,
+        durationMs: typeof metadata.durationMs === "number" ? metadata.durationMs : undefined,
+    };
+}
+
+function isClaudeCodeCompactSummaryEvent(event: any, pending?: PendingCompactBoundary | null): boolean {
+    if (event?.type !== "user") return false;
+    if (event?.isCompactSummary === true) return true;
+    if (!pending?.uuid) return false;
+    const parentUuid = typeof event?.parentUuid === "string" ? event.parentUuid : "";
+    const logicalParentUuid = typeof event?.logicalParentUuid === "string" ? event.logicalParentUuid : "";
+    if (parentUuid !== pending.uuid && logicalParentUuid !== pending.uuid) return false;
+    const text = typeof event?.message?.content === "string"
+        ? event.message.content
+        : "";
+    return text.startsWith("This session is being continued from a previous conversation that ran out of context.");
+}
+
+function buildCompactionSummaryInfo(
+    event: any,
+    text: string,
+    pending: PendingCompactBoundary | null,
+    jsonlPath: string,
+    lineNo?: number,
+    byteOffset?: number,
+): CompactionSummaryInfo {
+    const summarySha256 = createHash("sha256").update(text, "utf8").digest("hex");
+    return {
+        provider: "claude-code",
+        kind: "compact_summary",
+        text,
+        summaryChars: text.length,
+        summarySha256,
+        eventLineNo: lineNo,
+        eventByteOffset: byteOffset,
+        boundaryLineNo: pending?.lineNo,
+        boundaryByteOffset: pending?.byteOffset,
+        boundaryUuid: pending?.uuid,
+        trigger: pending?.trigger,
+        preTokens: pending?.preTokens,
+        postTokens: pending?.postTokens,
+        durationMs: pending?.durationMs,
+        jsonlPath,
+        conversationId: typeof event?.sessionId === "string" ? event.sessionId : path.basename(jsonlPath, ".jsonl"),
+        createdAt: typeof event?.timestamp === "string" ? event.timestamp : undefined,
+    };
+}
+
+function compactSummaryPlaceholder(info: CompactionSummaryInfo): string {
+    return `${CLAUDE_COMPACT_FOLDED_MARKER}: chars=${info.summaryChars}, sha256=${info.summarySha256.slice(0, 12)}, line=${info.eventLineNo ?? "?"}]`;
+}
+
 function readThreadMetadata(jsonlPath: string): ClaudeCodeThreadInfo | null {
     const id = path.basename(jsonlPath, ".jsonl");
     const stat = safeStat(jsonlPath);
@@ -383,6 +496,9 @@ export function resolveClaudeCodeThreadId(input: string): string | null {
     const query = input.trim();
     if (!query) return null;
     const queryLower = query.toLowerCase();
+    const exactByFile = findClaudeCodeThreadsByIdLookup(queryLower);
+    if (exactByFile.length === 1 && exactByFile[0].id.toLowerCase() === queryLower) return exactByFile[0].id;
+    if (exactByFile.length === 1 && isLikelyClaudeCodeIdLookup(queryLower)) return exactByFile[0].id;
     const threads = listRecentClaudeCodeThreads(1000);
     const exact = threads.find(thread => thread.id === query);
     if (exact) return exact.id;
@@ -396,6 +512,8 @@ export function resolveClaudeCodeThreadId(input: string): string | null {
 export function getClaudeCodeThread(conversationId: string): ClaudeCodeThreadInfo | null {
     const resolved = resolveClaudeCodeThreadId(conversationId);
     if (!resolved) return null;
+    const exactByFile = findClaudeCodeThreadsByIdLookup(resolved);
+    if (exactByFile.length === 1) return exactByFile[0];
     return listRecentClaudeCodeThreads(1000).find(thread => thread.id === resolved) || null;
 }
 
@@ -406,6 +524,7 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
     let roundIndex = 0;
     let stepIndex = 0;
     let pendingThinking = "";
+    let pendingCompactBoundary: PendingCompactBoundary | null = null;
 
     const pushCurrent = () => {
         if (!currentRound) return;
@@ -452,7 +571,7 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
         }
     };
 
-    readJsonlLines(jsonlPath, (line) => {
+    readJsonlLines(jsonlPath, (line, lineNo, byteOffset) => {
         stepIndex += 1;
         const event = parseJsonLine(line);
         if (!event) return;
@@ -467,20 +586,28 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
             }
             pushCurrent();
             roundIndex += 1;
+            const isCompactSummary = isClaudeCodeCompactSummaryEvent(event, pendingCompactBoundary);
+            const compactionInfo = isCompactSummary
+                ? buildCompactionSummaryInfo(event, extracted.text, pendingCompactBoundary, jsonlPath, lineNo, byteOffset)
+                : null;
             currentRound = {
                 roundIndex,
                 startStep: stepIndex,
                 endStep: stepIndex,
-                userMessage: extracted.text || "(无显式用户消息)",
+                userMessage: compactionInfo
+                    ? compactSummaryPlaceholder(compactionInfo)
+                    : (extracted.text || "(无显式用户消息)"),
                 mediaAttachments: [],
-                attachments: extracted.attachments,
+                attachments: compactionInfo ? [] : extracted.attachments,
                 aiResponses: [],
                 toolCalls: [],
                 taskBoundaries: [],
                 codeActions: [],
                 subagentSummaries: [],
                 fileViews: [],
+                compactionSummaries: compactionInfo ? [compactionInfo] : undefined,
             };
+            if (compactionInfo) pendingCompactBoundary = null;
             for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult);
             return;
         }
@@ -534,6 +661,22 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
         }
 
         if (type === "system") {
+            if (isClaudeCodeCompactBoundary(event)) {
+                pendingCompactBoundary = compactBoundaryFromEvent(event, lineNo, byteOffset);
+                const round = currentRound;
+                if (!round) return;
+                round.fileViews = round.fileViews || [];
+                round.fileViews.push({
+                    stepIndex,
+                    kind: "claude-code-compact-boundary",
+                    title: "Conversation compacted",
+                    textSummary: stringifyCompact({
+                        subtype: event.subtype,
+                        compactMetadata: event.compactMetadata,
+                    }, 500),
+                });
+                return;
+            }
             const round = currentRound;
             if (!round) return;
             round.fileViews = round.fileViews || [];
@@ -562,6 +705,9 @@ export function loadClaudeCodeConversation(conversationId: string): ClaudeCodeCo
 }
 
 function searchableTextsFromEvent(event: any): Array<{ role: ClaudeCodeContextProbeHit["role"]; text: string }> {
+    if (event?.type === "user" && event?.isCompactSummary === true) {
+        return [];
+    }
     const message = event?.message || {};
     const extracted = extractMessageContent(message.content, event.cwd);
     const result: Array<{ role: ClaudeCodeContextProbeHit["role"]; text: string }> = [];

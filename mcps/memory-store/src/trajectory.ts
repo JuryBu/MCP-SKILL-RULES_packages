@@ -1,5 +1,9 @@
 import { saveTempFile } from "./temp-store.js";
 
+import fs from "fs";
+import path from "path";
+import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
+
 /**
  * Trajectory 数据解析与提取
  *
@@ -22,6 +26,27 @@ export interface ConversationRound {
     codeActions: CodeActionInfo[]; // 代码编辑
     subagentSummaries: SubagentSummary[]; // 子代理线程摘要（Codex 链路）
     fileViews?: FileViewInfo[]; // 文件/计划类视图记录（Codex 链路）
+    compactionSummaries?: CompactionSummaryInfo[]; // Claude Code / 宿主压缩续聊摘要
+}
+
+export interface CompactionSummaryInfo {
+    provider: "claude-code";
+    kind: "compact_summary";
+    text: string;
+    summaryChars: number;
+    summarySha256: string;
+    eventLineNo?: number;
+    eventByteOffset?: number;
+    boundaryLineNo?: number;
+    boundaryByteOffset?: number;
+    boundaryUuid?: string;
+    trigger?: string;
+    preTokens?: number;
+    postTokens?: number;
+    durationMs?: number;
+    jsonlPath?: string;
+    conversationId?: string;
+    createdAt?: string;
 }
 
 export interface SubagentSummary {
@@ -78,6 +103,7 @@ interface CodeActionInfo {
 
 export type ExtraType = "thinking" | "tool_results" | "code_actions" | "code_diffs" | "file_views";
 export type Depth = "brief" | "normal" | "full";
+export type CompactionMode = "folded" | "full" | "omit";
 
 // ===== Trajectory 解析 =====
 
@@ -196,7 +222,8 @@ export function parseRounds(steps: any[]): ConversationRound[] {
 export function formatRound(
     round: ConversationRound,
     depth: Depth,
-    extraTypes: ExtraType[] = []
+    extraTypes: ExtraType[] = [],
+    options: { compactionMode?: CompactionMode } = {},
 ): string {
     const lines: string[] = [];
     const stepsRange = `steps ${round.startStep}-${round.endStep}`;
@@ -205,7 +232,9 @@ export function formatRound(
 
     // 用户消息
     lines.push(`### 👤 用户 (step ${round.startStep})`);
-    if (depth === "brief") {
+    if (round.compactionSummaries?.length) {
+        lines.push(formatCompactionUserMessage(round, depth, options.compactionMode || (depth === "full" ? "full" : "folded")));
+    } else if (depth === "brief") {
         lines.push(truncate(round.userMessage, 100));
     } else {
         lines.push(round.userMessage);
@@ -229,6 +258,10 @@ export function formatRound(
                 notes.push("Claude Code JSONL 内联图片，按需生成");
             } else if (attachment.source === "claude-code-data-url") {
                 notes.push("Claude Code JSONL 内联图片，read/search 时按需生成临时文件");
+            } else if (attachment.source === "windsurf-data-url" && attachment.tempPath) {
+                notes.push("Windsurf 内联图片，按需生成");
+            } else if (attachment.source === "windsurf-data-url") {
+                notes.push("Windsurf 内联图片，read/search 时按需生成临时文件");
             }
             if (attachment.originalPath && attachment.exists === false) {
                 notes.push("原路径当前不存在");
@@ -366,6 +399,98 @@ export function formatRound(
     }
 
     lines.push("---");
+    return lines.join("\n");
+}
+
+function safeFilePart(input: string): string {
+    return input.replace(/[^a-zA-Z0-9\u4e00-\u9fff_.-]/gu, "_").slice(0, 120);
+}
+
+function formatTokenNumber(value?: number): string {
+    return typeof value === "number" && Number.isFinite(value) ? String(value) : "?";
+}
+
+function formatDurationMs(value?: number): string {
+    if (typeof value !== "number" || !Number.isFinite(value)) return "?";
+    if (value < 1000) return `${value}ms`;
+    return `${(value / 1000).toFixed(1)}s`;
+}
+
+function materializeCompactionSummary(info: CompactionSummaryInfo): string {
+    ensureTempDir();
+    const ttlMs = Math.min(
+        Math.max(60_000, Number(process.env.MEMORY_STORE_CC_COMPACT_SUMMARY_CACHE_TTL_MS || 60 * 60 * 1000)),
+        24 * 60 * 60 * 1000,
+    );
+    const conversationSlug = safeFilePart((info.conversationId || "unknown").slice(0, 64)) || "unknown";
+    const dir = path.join(TEMP_DIR, "claude-code-compact-summaries", conversationSlug);
+    fs.mkdirSync(dir, { recursive: true });
+    const linePart = String(info.eventLineNo || 0).padStart(6, "0");
+    const offsetPart = String(info.eventByteOffset || 0).padStart(10, "0");
+    const hashPart = info.summarySha256.slice(0, 12);
+    const filePath = path.join(dir, `compact_line-${linePart}_off-${offsetPart}_sha256-${hashPart}.md`);
+    const now = Date.now();
+    try {
+        const stat = fs.statSync(filePath);
+        if (stat.isFile() && now - stat.mtimeMs <= ttlMs) return filePath;
+    } catch {
+        // cache miss
+    }
+    const metadata = [
+        "# Claude Code Compact Summary",
+        "",
+        "⚠️ 这是 Claude Code 在上下文压缩后注入的续聊摘要，不是用户真实输入的原始正文。",
+        "",
+        "## 元数据",
+        `- conversationId: ${info.conversationId || "(unknown)"}`,
+        `- jsonlPath: ${info.jsonlPath || "(unknown)"}`,
+        `- eventLineNo: ${info.eventLineNo ?? "(unknown)"}`,
+        `- eventByteOffset: ${info.eventByteOffset ?? "(unknown)"}`,
+        `- boundaryLineNo: ${info.boundaryLineNo ?? "(unknown)"}`,
+        `- trigger: ${info.trigger || "(unknown)"}`,
+        `- tokens: ${formatTokenNumber(info.preTokens)} → ${formatTokenNumber(info.postTokens)}`,
+        `- duration: ${formatDurationMs(info.durationMs)}`,
+        `- summaryChars: ${info.summaryChars}`,
+        `- summarySha256: ${info.summarySha256}`,
+        "",
+        "## 摘要正文",
+        "<<<CLAUDE_CODE_COMPACT_SUMMARY>>>",
+        info.text,
+        "<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>",
+        "",
+    ].join("\n");
+    const tmpPath = `${filePath}.${process.pid}.${now}.tmp`;
+    fs.writeFileSync(tmpPath, metadata, "utf-8");
+    fs.renameSync(tmpPath, filePath);
+    return filePath;
+}
+
+function formatCompactionUserMessage(round: ConversationRound, depth: Depth, mode: CompactionMode): string {
+    const items = round.compactionSummaries || [];
+    const lines: string[] = [];
+    for (const item of items) {
+        const meta = [
+            `chars=${item.summaryChars}`,
+            `sha256=${item.summarySha256.slice(0, 12)}`,
+            `tokens=${formatTokenNumber(item.preTokens)}→${formatTokenNumber(item.postTokens)}`,
+            `duration=${formatDurationMs(item.durationMs)}`,
+        ].join(", ");
+        if (mode === "omit") {
+            lines.push(`🧩 Claude Code 压缩续聊摘要已省略（${meta}）`);
+            continue;
+        }
+        if (mode === "full") {
+            lines.push(`🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
+            lines.push("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
+            lines.push(depth === "brief" ? truncate(item.text, 100) : item.text);
+            lines.push("<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>");
+            continue;
+        }
+        const artifactPath = materializeCompactionSummary(item);
+        lines.push(`🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`);
+        lines.push(`📄 完整压缩摘要临时文件: ${artifactPath}`);
+        lines.push("说明：这是上下文压缩后的 summary，不是原始用户发言；默认搜索、Record、Guard 不把它当事实正文。");
+    }
     return lines.join("\n");
 }
 

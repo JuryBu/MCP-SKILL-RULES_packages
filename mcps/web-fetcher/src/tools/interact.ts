@@ -1,8 +1,8 @@
-import { z } from "zod";
+﻿import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
 import { touchActivity } from "../lifecycle.js";
-import { sessionManager } from "../session.js";
+import { formatPoolPressureHint, sessionManager } from "../session.js";
 import { extractContent, safePageEvaluate, safePageContent } from "../extractor.js";
 import { QUALITY_PRESETS, appendTiming } from "../constants.js";
 import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-store.js";
@@ -141,6 +141,23 @@ export function registerInteract(server: McpServer): void {
                 }
 
                 const timeout = params.timeout ?? 30000;
+                const finalize = (
+                    result: { content?: Array<{ type: "text"; text: string }>; isError?: boolean },
+                    _startTime?: number,
+                    retryCount?: number,
+                ) => {
+                    const hint = formatPoolPressureHint(ownerId);
+                    if (hint && Array.isArray(result.content)) {
+                        const content = [...result.content];
+                        for (let i = content.length - 1; i >= 0; i--) {
+                            if (content[i]?.type === "text" && typeof content[i].text === "string") {
+                                content[i] = { ...content[i], text: `${content[i].text}\n${hint}` };
+                                return appendTiming({ ...result, content }, startTime, retryCount);
+                            }
+                        }
+                    }
+                    return appendTiming(result, startTime, retryCount);
+                };
 
                 // v6.7: iframe 穿透 — 解析 frame 参数
                 let frameLocator: import('playwright').FrameLocator | null = null;
@@ -240,7 +257,7 @@ export function registerInteract(server: McpServer): void {
                         if (popupUrl) resultText += `\n🔗 新窗口已打开: ${popupUrl}`;
                         if (popupSessionId) resultText += `\n🆕 可用 sessionId="${popupSessionId}" 继续操作新窗口`;
 
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -268,7 +285,7 @@ export function registerInteract(server: McpServer): void {
                         }
                         await page.waitForTimeout(500);
 
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -295,7 +312,7 @@ export function registerInteract(server: McpServer): void {
                                 await el.scrollIntoViewIfNeeded();
                             }
                             await page.waitForTimeout(1000);
-                            return appendTiming({
+                            return finalize({
                                 content: [
                                     {
                                         type: "text" as const,
@@ -309,7 +326,7 @@ export function registerInteract(server: McpServer): void {
                             const count = Math.abs(raw);
                             const dir: 'up' | 'down' = raw < 0 ? 'up' : 'down';
                             await browserManager.scrollPage(page, count, dir);
-                            return appendTiming({
+                            return finalize({
                                 content: [
                                     {
                                         type: "text" as const,
@@ -334,7 +351,7 @@ export function registerInteract(server: McpServer): void {
                             await page.waitForSelector(params.selector, { timeout });
                         }
 
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -363,7 +380,7 @@ export function registerInteract(server: McpServer): void {
                             const fileList = splitResult.paths.map((p, i) =>
                                 `  片 ${i + 1}/${splitResult.paths.length} (${splitResult.sizes[i]} KB): ${p}`
                             ).join("\n");
-                            return appendTiming({
+                            return finalize({
                                 content: [{
                                     type: "text" as const,
                                     text: `📐 ${splitResult.description}\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n\n${fileList}\n\n使用 view_file 工具按顺序查看各片`,
@@ -371,7 +388,7 @@ export function registerInteract(server: McpServer): void {
                             }, startTime);
                         }
 
-                        return appendTiming({
+                        return finalize({
                             content: [{
                                 type: "text" as const,
                                 text: `📸 截图 (${sizeKB} KB)\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n文件: ${splitResult.paths[0]}\n\n使用 view_file 工具查看此图片`,
@@ -419,7 +436,7 @@ export function registerInteract(server: McpServer): void {
                             resultText = extractedContent;
                         }
 
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -479,7 +496,7 @@ export function registerInteract(server: McpServer): void {
                             ? visibleText.slice(0, 10000) + "\n\n---\n*[内容已截断]*"
                             : visibleText;
 
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -491,7 +508,7 @@ export function registerInteract(server: McpServer): void {
 
                     case "snapshot": {
                         const snapshot = await buildPageSnapshot(page, { sessionId });
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,
@@ -548,7 +565,7 @@ export function registerInteract(server: McpServer): void {
                             resultText += `\n已定位到第 1 处匹配`;
                         }
 
-                        return appendTiming({
+                        return finalize({
                             content: [{
                                 type: "text" as const,
                                 text: `SessionId: ${sessionId}\n\n${resultText}`,
@@ -588,7 +605,7 @@ export function registerInteract(server: McpServer): void {
                             // keyboard.press() 发送快捷键
                             await page.keyboard.press(val);
                             await page.waitForTimeout(300);
-                            return appendTiming({
+                            return finalize({
                                 content: [{
                                     type: "text" as const,
                                     text: `⌨️ 已按下快捷键: ${val}\nSessionId: ${sessionId}`,
@@ -598,7 +615,7 @@ export function registerInteract(server: McpServer): void {
                             // keyboard.type() 逐字符增量输入
                             await page.keyboard.type(val, { delay: 30 });
                             await page.waitForTimeout(200);
-                            return appendTiming({
+                            return finalize({
                                 content: [{
                                     type: "text" as const,
                                     text: `⌨️ 已增量输入 ${val.length} 字符\nSessionId: ${sessionId}`,
@@ -647,7 +664,7 @@ export function registerInteract(server: McpServer): void {
                                     : typeof result === 'string' ? result
                                         : JSON.stringify(result, null, 2);
 
-                            return appendTiming({
+                            return finalize({
                                 content: [{
                                     type: "text" as const,
                                     text: `🔧 evaluate 完成 [${source}]\nSessionId: ${sessionId}\n\n${resultStr}`,
@@ -655,7 +672,7 @@ export function registerInteract(server: McpServer): void {
                             }, startTime);
                         } catch (evalError) {
                             const msg = evalError instanceof Error ? evalError.message : String(evalError);
-                            return appendTiming({
+                            return finalize({
                                 isError: true,
                                 content: [{
                                     type: "text" as const,
@@ -668,7 +685,7 @@ export function registerInteract(server: McpServer): void {
                     case "close": {
                         const closed = await sessionManager.close(sessionId!, ownerId);
                         if (!closed) {
-                            return appendTiming({
+                            return finalize({
                                 isError: true,
                                 content: [
                                     {
@@ -678,7 +695,7 @@ export function registerInteract(server: McpServer): void {
                                 ],
                             }, startTime);
                         }
-                        return appendTiming({
+                        return finalize({
                             content: [
                                 {
                                     type: "text" as const,

@@ -1,4 +1,4 @@
-import { normalizeChain, type Chain, type ConversationLinkMode } from "./chain.js";
+import { normalizeDataChain, type DataChain, type ConversationLinkMode } from "./chain.js";
 import {
     loadCodexConversation,
     resolveCurrentCodexThreadId,
@@ -12,11 +12,17 @@ import {
     isClaudeCodeStoreAvailable,
     type ClaudeCodeConversationData,
 } from "./claude-code-client.js";
+import {
+    loadWindsurfConversation,
+    resolveWindsurfThreadId,
+    isWindsurfStoreAvailable,
+    type WindsurfConversationReadResult,
+} from "./windsurf-client.js";
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable } from "./ls-client.js";
 import { parseRounds, type ConversationRound } from "./trajectory.js";
 
-export type ResolvedConversationChain = Exclude<Chain, "auto">;
+export type ResolvedConversationChain = Exclude<DataChain, "auto">;
 
 export interface ConversationLoadResult {
     chainUsed: ResolvedConversationChain;
@@ -26,11 +32,12 @@ export interface ConversationLoadResult {
     fromCache?: boolean;
     codexData?: CodexConversationData;
     claudeCodeData?: ClaudeCodeConversationData;
+    windsurfData?: WindsurfConversationReadResult;
     trajectory?: any;
 }
 
-export async function resolveConversationChain(chain: Chain = "auto"): Promise<ResolvedConversationChain | null> {
-    chain = normalizeChain(chain);
+export async function resolveConversationChain(chain: DataChain = "auto"): Promise<ResolvedConversationChain | null> {
+    chain = normalizeDataChain(chain);
     if (chain === "antigravity") {
         return (await isLsAvailable()) ? "antigravity" : null;
     }
@@ -39,6 +46,9 @@ export async function resolveConversationChain(chain: Chain = "auto"): Promise<R
     }
     if (chain === "claude-code") {
         return isClaudeCodeStoreAvailable() ? "claude-code" : null;
+    }
+    if (chain === "windsurf") {
+        return (await isWindsurfStoreAvailable()) ? "windsurf" : null;
     }
 
     const preferLs = await isAntigravityLS();
@@ -68,31 +78,45 @@ export async function resolveConversationId(
         if (requestedId) return resolveClaudeCodeThreadId(requestedId) || requestedId;
         return null;
     }
+    if (chain === "windsurf") {
+        if (requestedId) return await resolveWindsurfThreadId(requestedId) || requestedId;
+        return null;
+    }
     if (requestedId) return resolveCodexThreadId(requestedId) || requestedId;
     return resolveCurrentCodexThreadId(cwd);
 }
 
 export async function loadConversationData(
-    chain: Chain = "auto",
+    chain: DataChain = "auto",
     conversationId?: string,
     options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string } = {},
 ): Promise<ConversationLoadResult | null> {
-    chain = normalizeChain(chain);
+    chain = normalizeDataChain(chain);
     if (chain === "auto") {
         const preferLs = await isAntigravityLS();
         const candidates: ResolvedConversationChain[] = preferLs
             ? ["antigravity", "codex", "claude-code"]
             : ["codex", "antigravity", "claude-code"];
+        if (conversationId) {
+            candidates.push("windsurf");
+        }
 
         for (const candidate of candidates) {
             const isAvailable = candidate === "antigravity"
                 ? await isLsAvailable()
                 : candidate === "codex"
                     ? isCodexSessionStoreAvailable()
-                    : isClaudeCodeStoreAvailable();
+                    : candidate === "claude-code"
+                        ? isClaudeCodeStoreAvailable()
+                        : await isWindsurfStoreAvailable();
             if (!isAvailable) continue;
 
-            const loaded = await loadFromResolvedChain(candidate, conversationId, options);
+            let loaded: ConversationLoadResult | null = null;
+            try {
+                loaded = await loadFromResolvedChain(candidate, conversationId, options);
+            } catch {
+                loaded = null;
+            }
             if (loaded) return loaded;
         }
 
@@ -136,6 +160,18 @@ async function loadFromResolvedChain(
             rounds: claudeCodeData.rounds,
             totalSteps: claudeCodeData.totalSteps,
             claudeCodeData,
+        };
+    }
+
+    if (resolved === "windsurf") {
+        const windsurfData = await loadWindsurfConversation(effectiveId);
+        if (!windsurfData) return null;
+        return {
+            chainUsed: "windsurf",
+            conversationId: effectiveId,
+            rounds: windsurfData.rounds,
+            totalSteps: windsurfData.totalSteps,
+            windsurfData,
         };
     }
 

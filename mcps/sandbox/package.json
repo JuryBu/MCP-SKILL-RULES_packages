@@ -1,6 +1,6 @@
 ﻿{
     "name": "sandbox-mcp-server",
-    "version": "1.13.1",
+    "version": "1.13.3",
     "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
     "type": "module",
     "main": "dist/index.js",
@@ -31,6 +31,3 @@
         "typescript": "^5.7.2"
     }
 }
-
-
-

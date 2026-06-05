@@ -159,7 +159,7 @@ async function triggerRecordAutoCheck(): Promise<void> {
         }
 
         pendingRecordKeys.add(pendingKey);
-        const recordModelChain = loaded.chainUsed === "claude-code" ? "auto" : loaded.chainUsed;
+        const recordModelChain = (loaded.chainUsed === "claude-code" || loaded.chainUsed === "windsurf") ? "auto" : loaded.chainUsed;
         const p = generateRecord(recordHash, cascadeId, recordWorkspace, rounds, totalSteps, recordModelChain)
             .then(async (res) => {
                 if (res.success && res.content) {

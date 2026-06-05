@@ -1,4 +1,4 @@
-﻿# MCP Sandbox v1.13.1
+﻿# MCP Sandbox v1.13.3
 
 代码执行沙箱 MCP Server，解决 Antigravity IDE 中 run_command 的超时卡死、临时文件繁琐、输出管理粗糙等痛点。
 
@@ -44,6 +44,7 @@ MCP 进程与父 LS 进程绑定（ppid），容错管理：
 - `modelChain="antigravity"`：强制走 Antigravity LS 的 `GetModelResponse`
 - `modelChain="codex"`：强制走本地 `codex exec` 模型桥
 - `modelChain="claude-code"` / `modelChain="cc"`：显式走本地 Claude Code CLI，适合人工确认后做末端 fallback 或 CC 兼容测试
+- Windsurf / WSF 只是 MCP 客户端和对话数据来源，不提供 Sandbox 模型链路；`modelChain="windsurf"` 不在 schema 中，应被拒绝
 - `modelChain` 未填写时使用 `chain`，两者都未填写时使用 `auto`。
 - `chain` 仅作为模型链路兼容参数保留，不代表数据链路，也不会引入 `dataChain`。
 
@@ -53,7 +54,8 @@ MCP 进程与父 LS 进程绑定（ppid），容错管理：
 - `modelChain` 仅影响 `smart` 模式；`exact` / `fuzzy` 完全不受影响
 - `modelChain="antigravity"` 需要存在可连接的 Antigravity LS；`modelChain="codex"` 需要本机可调用 `codex` CLI；`modelChain="claude-code"` 需要本机可调用 `claude` CLI
 - Antigravity LS 模型默认值：`SANDBOX_LS_MODEL` 未设置时使用 `MODEL_PLACEHOLDER_M132`（Gemini 3.5 Flash High）；默认 fallback 为 `MODEL_PLACEHOLDER_M132,MODEL_PLACEHOLDER_M20,MODEL_PLACEHOLDER_M18,MODEL_PLACEHOLDER_M16,MODEL_PLACEHOLDER_M36`，可用 `SANDBOX_LS_MODEL_FALLBACKS` 覆盖。`MODEL_PLACEHOLDER_M37` 会转到当前 Pro High `M16`，`MODEL_PLACEHOLDER_M47` 会转到 `M18`，旧 `MODEL_GOOGLE_GEMINI_2_5_FLASH*` 会转到新 Flash 占位符。
-- Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`
+- Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=low` + `model_speed_tier=fast`，用于 `smart_search(modelChain="codex")` 这类短同步模型桥；可用 `SANDBOX_CODEX_BRIDGE_REASONING` 覆盖
+- Codex 模型桥稳定性：默认 fallback 链为 `gpt-5.5:low → gpt-5.4:low → gpt-5.4-mini:low`，只在超时、429/5xx、连接中断、空输出等可重试错误时降级；可用 `SANDBOX_CODEX_BRIDGE_FALLBACKS`、`SANDBOX_CODEX_BRIDGE_FALLBACKS_ENABLED=0`、`SANDBOX_CODEX_BRIDGE_RETRIES` 调整。`sandbox_codex` 是可执行 agent 入口，可能有文件写入副作用，不默认自动重试，长任务仍建议 `background=true`
 - Claude Code CLI 默认值：`SANDBOX_CLAUDE_CODE_MODEL` 未设置时使用 `sonnet`，默认预算上限 `SANDBOX_CLAUDE_CODE_MAX_BUDGET_USD=0.05`；可通过 `SANDBOX_CLAUDE_CODE_COMMAND`、`SANDBOX_CLAUDE_CODE_TIMEOUT_MS`、`SANDBOX_CLAUDE_CODE_PERMISSION_MODE` 覆盖
 - 可覆盖环境变量：`SANDBOX_CODEX_MODEL`、`SANDBOX_CODEX_REASONING`、`SANDBOX_CODEX_SPEED`、`SANDBOX_SMART_FILES_TIMEOUT_MS`、`SANDBOX_SMART_STAGE1_TIMEOUT_MS`、`SANDBOX_SMART_STAGE2_TIMEOUT_MS`、`SANDBOX_SMART_CLAUDE_CODE_FILES_TIMEOUT_MS`、`SANDBOX_SMART_CLAUDE_CODE_STAGE_TIMEOUT_MS`
 - 默认超时：文件定点 smart 120s、阶段一 90s、阶段二 120s。Codex CLI 首次启动和 gpt-5.5 推理可能超过 60s，不应按短超时判定链路失败。
@@ -90,6 +92,19 @@ smart_search(taskId="...", waitSeconds=30)
 - `sandbox_launch` 注册表会记录 `createdAtMs`、`commandHash`、`ownerId`、`exitMarkerPath`，状态优先读取 done marker；kill 前校验 PID 创建时间和命令特征，避免 PID 复用误杀。
 - `sandbox_launch` 是显式长期任务，不会因为后台超时自动杀；需要用 `status/list/kill/clean` 管理。
 
+## Windsurf / WSF MCP 客户端兼容
+
+Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任何 WSF 模型链路或 council provider。
+
+- WSF MCP 配置文件：`%USERPROFILE%\.codeium\windsurf\mcp_config.json`
+- 推荐配置：`mcpServers.sandbox.serverUrl = "http://127.0.0.1:14588/sandbox/mcp"`
+- 已验证 broker 端点：`/sandbox/mcp` 可完成 MCP `initialize` / `tools/list`，暴露 8 个 Sandbox 工具
+- 若 WSF 直连 Streamable HTTP `/mcp` 失败，fallback 是用 `mcp-remote` stdio 包装同一个 broker endpoint；不要把 Sandbox 改成 WSF 专属 stdio 后端
+- WSF 只作为 MCP 客户端；`modelChain="windsurf"` 和 `provider="windsurf"` 均不支持，也不应加入 schema
+- WSF 侧使用 `sandbox_session`、`sandbox_launch`、`smart_search(background=true)`、`sandbox_council(background=true)` 时必须显式传稳定 `ownerId`，建议形如 `wsf:<project-or-task>`，避免共享 broker 下与 Codex / Antigravity / Claude Code 串任务
+
+最小配置示例与验收步骤见 `docs/windsurf/`。
+
 ## sandbox_council 多模型审议
 
 `sandbox_council` 用于红蓝黑队讨论、设计审议、实验结果复盘、做题后审议和 Guard 式检查。它不是完整 agentic sandbox：参与模型只发言，只有 `moderator` 主持模型能决定调用有限工具、继续讨论、点名补充或终止。
@@ -99,6 +114,7 @@ smart_search(taskId="...", waitSeconds=30)
 - `participants[]`: 每个参与者配置 `id / role / provider / model / params / supportsVision`
 - `moderator`: 主持模型配置对象，必须包含 `id / role / provider`，可选 `model / params / supportsVision`；不能写成 `"gpt-5.4"` 字符串
 - `provider`: `antigravity`、`codex`、`claudeCode`、`openai`、`anthropic`、`gemini`、`geminiCli`、`customOpenAICompatible`
+- WSF 不提供 `provider="windsurf"`；在 WSF Cascade 中调用 council 时仍需显式选择现有 provider
 - `files[]`: 背景文件，支持 `range`；纯文本文件直接抽取，图片会自动提升到 `images[]`，PDF/Word/Excel/EPUB/视频等复杂文件优先走 Gemini CLI agentic 索引，失败后 fallback 到 Codex CLI，再不行会对常见 Office/EPUB/PDF 走本地结构化兜底。CLI 索引必须写入 `sandbox-data/temp/council-indexes` 下的临时 Markdown，stdout/stderr 只保留短状态和诊断；宿主会检查产物存在、大小上限和 `<<<COUNCIL_INDEX>>>` 标记，避免把大索引堆在内存里
 - `manualContext`: 手动粘贴的上下文
 - `largeInput`: 大输入处理配置。`input`、`manualContext`、超长纯文本文件和 CSV 超过阈值时，会写入 `sandbox-data/temp/council-large-inputs`，生成 source 原文、checkpoint JSON 和 LargeInputIndex Markdown；分块按真实字符计算，默认 `chunkSize=24000`、`overlap=1200`，模型上下文只收到索引摘录和临时文件路径
@@ -175,6 +191,8 @@ smart_search(taskId="...", waitSeconds=30)
 - v1.12.13 补齐 council 卡死兜底：`geminiCli` 正式参与者/主持链路复用 Gemini CLI 早退和孤儿进程清理；后台 worker 按 deadline 写入中断终态并退出，查询时发现 deadline 过期也会中断任务，避免长期停留在 running。
 - v1.13.0 增加 Claude Code 显式链路：`smart_search(modelChain="claude-code"|"cc")` 可走本地 `claude` CLI；`sandbox_council` 新增 `provider="claudeCode"`，并记录 CC session/cost/model metadata。`auto` 仍只在 Antigravity/Codex 之间选择，不会静默调用 Claude Code
 - v1.13.1 更新 Antigravity GetModelResponse auto 模型链：默认 `M132 → M20 → M18 → M16 → M36`；同步别名表，旧 `M37/M47/2.5 flash` 入口会转到当前可用占位符。复杂推理任务建议显式选择 `M16`
+- v1.13.2 增加 Windsurf / WSF MCP 客户端兼容文档和 schema 防呆说明：WSF 通过 `http://127.0.0.1:14588/sandbox/mcp` 调用 Sandbox，不新增 `modelChain="windsurf"` 或 `provider="windsurf"`
+- v1.13.3 增强 Codex 模型桥稳定性：`smart_search(modelChain="codex")` 默认改用低 reasoning 快速首选，并在可重试失败时按同 provider fallback 链降级；`sandbox_codex` 保持无默认自动重试以避免副作用
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例
 - v1.12.2 补充 `sandbox_council` 后台查询防呆：启动返回会直接给出带 `ownerId` 的查询示例；README、Resource guide 和 schema 明确查询必须复用同一个 `ownerId`，避免误判任务丢失后重复启动
@@ -198,13 +216,7 @@ npm run build
 - Plan_6_codex_upgrade.md — Codex 链路与 CLI 升级设计
 - Plan_8_claude_code_compat.md — Claude Code 兼容与三链路互通设计
 - docs/claude-code/ — Claude Code MCP 配置、CLAUDE 规则模板与验证说明
+- docs/windsurf/ — Windsurf / WSF MCP 配置示例与 Sandbox 验收说明
 - LS-Principles.md — LS 进程原理
 - LS-Update-Suggestion.md — LS 生命周期与双链路补充说明
 - Task.md — 执行任务清单
-
-
-
-
-
-
-

@@ -254,6 +254,31 @@ export function formatSessionList(sessions: SessionInfo[]): string {
     }).join("\n");
 }
 
+export function formatPoolPressureHint(ownerId?: string, options?: { includeAllOwners?: boolean; includeSessionList?: boolean }): string {
+    const pool = browserManager.getPoolStats();
+    if (!pool.isNearLimit) return "";
+
+    const owner = normalizeOwnerId(ownerId);
+    const sessions = sessionManager.list(ownerId, { includeAllOwners: options?.includeAllOwners ?? false });
+    const activeText = formatSessionList(sessions);
+    const scope = options?.includeAllOwners ? "全部 ownerId" : `ownerId="${owner}"`;
+    const includeSessionList = options?.includeSessionList ?? true;
+    const cleanupHint = sessions.length > 0
+        ? `可用 web_close_sessions(sessionId="...", ownerId="${owner}") 关闭不再需要的会话；如果确认该 owner 下都不用了，可用 web_close_sessions(ownerId="${owner}", closeAllForOwner=true)。`
+        : `可先调用 web_list_sessions(ownerId="${owner}", includeAllOwners=true) 查看全部占用，再关闭不再需要的会话。`;
+
+    const lines = [
+        "",
+        `⚠️ 页面池接近上限：${pool.activePages}/${pool.maxConcurrentPages}（提醒阈值 ${pool.warningThreshold}）。`,
+        "建议顺手清理旧会话，避免下一次页面创建触顶。",
+    ];
+    if (includeSessionList) {
+        lines.push(`当前 ${scope} 的保留会话:`, activeText);
+    }
+    lines.push(cleanupHint);
+    return lines.join("\n");
+}
+
 function formatDuration(ms: number): string {
     const seconds = Math.max(0, Math.round(ms / 1000));
     if (seconds < 60) return `${seconds}s`;

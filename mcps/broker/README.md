@@ -1,25 +1,14 @@
-﻿# Portable HTTP MCP Broker
+﻿# Portable MCP HTTP Broker
 
-This broker exposes the package MCP servers as Streamable HTTP endpoints for Codex, Claude Code, and other compatible hosts.
+This folder contains the source-only Streamable HTTP broker used by the portable toolkit.
 
-Default endpoints:
+## Endpoints
 
 - `/memory-store/mcp`
 - `/web-fetcher/mcp`
 - `/sandbox/mcp`
-- `/exa/mcp` optional, requires `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`
-- `/playwright/mcp` optional via `npx @playwright/mcp@latest`
-- `/sequential-thinking/mcp` optional via `npx @modelcontextprotocol/server-sequential-thinking`
+- `/exa/mcp` if Exa remote URL is configured
 
-Use the scripts in `install/` from the package root:
+## Notes
 
-```powershell
-./install/Start-CodexMcpBroker.ps1
-./install/Status-CodexMcpBroker.ps1
-./install/Stop-CodexMcpBroker.ps1
-./install/Test-CodexToolkit.ps1
-```
-
-The broker reads MCP source from `CODEX_TOOLKIT_MCP_ROOT` or `../` relative to this folder. Runtime logs/state are written under `CODEX_TOOLKIT_DATA_ROOT\mcp-http-broker` when started through the package scripts.
-
-Do not package local logs, pid files, private env files, browser profiles, API keys, session data, or SQLite databases.
+Use the scripts under `install/` to start, stop, check, and test the broker. The receiver should keep runtime logs, pid files, private environment files, and local screenshots outside the packaged source tree.

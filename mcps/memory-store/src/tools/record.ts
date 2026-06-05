@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
@@ -14,7 +14,8 @@ import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, type RecordParallelMode,
 } from "../record-generator.js";
 import { saveTempFile } from "../temp-store.js";
-import { CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type ChainInput } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type ChainInput, type DataChainInput, type DataChain } from "../chain.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
@@ -52,13 +53,14 @@ type OwnershipSourceType =
     | "antigravity_workspace_uri"
     | "codex_cwd"
     | "claude_code_cwd"
+    | "windsurf_cwd"
     | "child_parent"
     | "duplicate"
     | "unknown";
 type OwnershipStatus = "ok" | "duplicate" | "migratable" | "conflict" | "unknown";
 
 export interface RecordSourceSnapshot {
-    chain: Chain;
+    chain: DataChain;
     rounds: number;
     totalSteps: number;
     rolloutPath?: string;
@@ -191,12 +193,11 @@ action:
                 .describe("实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
             taskId: z.string().optional()
                 .describe("task_status: 后台任务 ID"),
-            chain: z.enum(CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未传时同时作为对话数据链路和模型链路"),
-            dataChain: z.enum(CHAIN_INPUT_VALUES).optional()
-                .describe("对话数据链路：auto=当前宿主优先，支持 antigravity/codex/claude-code"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional()
-                .describe("模型链路：auto=当前宿主优先，claude-code=显式 Claude Code CLI"),
+            chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
+                .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
+            dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
+                .describe("对话数据链路：auto=当前宿主优先，支持 antigravity/codex/claude-code/windsurf"),
+            modelChain: modelChainInputSchema("modelChain", "模型链路：auto=当前宿主优先，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
         },
         async (args) => {
             const startMs = Date.now();
@@ -422,7 +423,7 @@ export function listRecordsForScope(hash: string, scope: RecordManageScope | und
 
 async function handleUpdate(
     hash: string, conversationId: string | undefined,
-    workspace: string | undefined, dataChain: Chain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, startMs: number,
+    workspace: string | undefined, dataChain: DataChain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, startMs: number,
     options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void } = {},
 ) {
     options.onProgress?.({
@@ -431,6 +432,17 @@ async function handleUpdate(
     });
     const loaded = await loadConversationData(dataChain, conversationId, { link: "summary" });
     if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
+    if (loaded.windsurfData?.partial) {
+        const skipped = loaded.windsurfData.skippedSteps || [];
+        const shown = skipped.slice(0, 5).map(item => `offset ${item.offset}`).join(", ");
+        const more = skipped.length > 5 ? ` 等 ${skipped.length} 个` : "";
+        return rt([
+            "❌ Record 更新已中止：Windsurf 原文读取不完整",
+            `⚠️ 已跳过超大 step ${shown || "(未知)"}${more}`,
+            "原因：Windsurf Language Server 拒绝返回超过单步大小限制的内容；memory-store 可以降级 read/search，但不会把缺失原文写成正式 Record。",
+            "建议：先用 conversation_read_original(read/search, dataChain=\"windsurf\") 阅读可用部分；若需要完整 Record，请回到 Windsurf UI 或官方导出补齐该超大 step 后再生成。",
+        ].join("\n"), startMs);
+    }
 
     const cascadeId = loaded.conversationId;
     const rounds = loaded.rounds;
@@ -456,7 +468,7 @@ async function handleUpdate(
     if (hash === "general" && !workspace) {
         const detectedWs = loaded.chainUsed === "antigravity"
             ? detectWorkspaceFromSteps(loaded.trajectory?.steps || [])
-            : (loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd);
+            : (loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || loaded.windsurfData?.thread.cwd);
         if (detectedWs) {
             ensureWorkspace(detectedWs);
             effectiveHash = resolveWorkspaceHashForRecord(detectedWs);
@@ -541,7 +553,7 @@ function handleUpdateBackground(
     hash: string,
     conversationId: string | undefined,
     workspace: string | undefined,
-    dataChain: Chain,
+    dataChain: DataChain,
     modelChain: Chain,
     parallelMode: RecordParallelMode | undefined,
     force: boolean | undefined,
@@ -1242,7 +1254,7 @@ function isWorkspacePathAliasHash(currentHash: string, expectedHash: string): bo
     return canonicalHashForExistingRecordHash(currentHash) === expectedHash;
 }
 
-async function detectOwnershipSource(conversationId: string, dataChain: Chain): Promise<{
+async function detectOwnershipSource(conversationId: string, dataChain: DataChain): Promise<{
     expectedHash?: string;
     expectedWorkspace?: string;
     sourceType: OwnershipSourceType;
@@ -1252,6 +1264,7 @@ async function detectOwnershipSource(conversationId: string, dataChain: Chain): 
     const allowAntigravity = dataChain === "auto" || dataChain === "antigravity";
     const allowCodex = dataChain === "auto" || dataChain === "codex";
     const allowClaudeCode = dataChain === "auto" || dataChain === "claude-code";
+    const allowWindsurf = dataChain === "windsurf";
 
     if (allowAntigravity) {
         try {
@@ -1290,6 +1303,19 @@ async function detectOwnershipSource(conversationId: string, dataChain: Chain): 
         }
     }
 
+    if (allowWindsurf) {
+        try {
+            const { loadWindsurfConversation } = await import("../windsurf-client.js");
+            const conversation = await loadWindsurfConversation(conversationId);
+            const workspace = conversation?.thread.cwd;
+            if (workspace) {
+                sources.push({ workspace, hash: resolveWorkspaceHashForRecord(workspace), identityHash: workspaceHash(workspace), sourceType: "windsurf_cwd" });
+            }
+        } catch {
+            // keep unknown; audit must not fail because WSF LS is unavailable
+        }
+    }
+
     if (sources.length === 0) return { sourceType: "unknown" };
     const first = sources[0];
     const conflict = sources.find(s => s.identityHash !== first.identityHash);
@@ -1307,7 +1333,7 @@ async function detectOwnershipSource(conversationId: string, dataChain: Chain): 
 export async function auditRecordOwnership(
     hash: string,
     scope: RecordManageScope | undefined,
-    dataChain: Chain,
+    dataChain: DataChain,
     sourceResolver: typeof detectOwnershipSource = detectOwnershipSource,
 ): Promise<OwnershipAuditItem[]> {
     const locations = collectRecordLocations(hash, scope);
@@ -1448,12 +1474,12 @@ function summarizeOwnershipAudit(items: OwnershipAuditItem[], title: string): st
     return lines.join("\n");
 }
 
-async function handleAuditOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: Chain, startMs: number) {
+async function handleAuditOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, startMs: number) {
     const items = await auditRecordOwnership(hash, scope || "general", dataChain);
     return rt(summarizeOwnershipAudit(items, "🔎 Record 归属审计（只读）"), startMs);
 }
 
-async function handleRepairOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: Chain, dryRun: boolean, backup: boolean, startMs: number) {
+async function handleRepairOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, dryRun: boolean, backup: boolean, startMs: number) {
     const { moves } = await planOwnershipRepair(hash, scope || "general", dataChain);
     if (dryRun) {
         return rt(summarizeOwnershipAudit(moves, "🧭 Record 归属修复计划（dry-run，未改文件）"), startMs);
@@ -1488,7 +1514,7 @@ async function handleRepairOwnership(hash: string, scope: RecordManageScope | un
 export async function planOwnershipRepair(
     hash: string,
     scope: RecordManageScope | undefined,
-    dataChain: Chain,
+    dataChain: DataChain,
     sourceResolver: typeof detectOwnershipSource = detectOwnershipSource,
 ) {
     const items = await auditRecordOwnership(hash, scope || "general", dataChain, sourceResolver);
@@ -1577,7 +1603,7 @@ interface BatchConversationCandidate {
 
 async function handleBatchUpdate(
     hash: string,
-    args: { after?: string; before?: string; limit?: number; force?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput; dataChain?: ChainInput; modelChain?: ChainInput },
+    args: { after?: string; before?: string; limit?: number; force?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
     startMs: number,
 ) {
     // check 模式：查询进度
@@ -1647,7 +1673,7 @@ async function handleBatchUpdate(
             })
             .map(thread => ({ id: thread.id, workspace: thread.cwd }));
         if (candidates.length === 0) return rt("📦 无符合条件的对话", startMs);
-    } else {
+    } else if (resolvedChain === "claude-code") {
         const { listRecentClaudeCodeThreads } = await import("../claude-code-client.js");
         const afterMs = args.after ? new Date(args.after).getTime() : null;
         const beforeMs = args.before ? new Date(args.before).getTime() : null;
@@ -1665,6 +1691,25 @@ async function handleBatchUpdate(
             })
             .map(thread => ({ id: thread.id, workspace: thread.cwd }));
         if (candidates.length === 0) return rt("📦 无符合条件的对话", startMs);
+    } else {
+        const { listRecentWindsurfThreads } = await import("../windsurf-client.js");
+        const afterMs = args.after ? new Date(args.after).getTime() : null;
+        const beforeMs = args.before ? new Date(args.before).getTime() : null;
+        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
+        candidates = (await listRecentWindsurfThreads(maxLimit * 5))
+            .filter(thread => {
+                const updatedMs = Date.parse(thread.lastModifiedTime || thread.createdTime || "") || 0;
+                if (afterMs !== null && updatedMs < afterMs) return false;
+                if (beforeMs !== null && updatedMs > beforeMs) return false;
+                if (args.workspace && thread.cwd) {
+                    const threadWs = norm(thread.cwd || "");
+                    const targetWs = norm(args.workspace);
+                    if (!threadWs.includes(targetWs) && !targetWs.includes(threadWs)) return false;
+                }
+                return true;
+            })
+            .map(thread => ({ id: thread.id, workspace: thread.cwd }));
+        if (candidates.length === 0) return rt("📦 无符合条件的 WSF 对话", startMs);
     }
 
     const { readRecordsIndex } = await import("../record-store.js");
@@ -1731,7 +1776,7 @@ async function handleBatchUpdate(
                     // 自动检测对话所属工作区
                     const detectedWs = loaded.chainUsed === "antigravity"
                         ? detectWorkspaceFromSteps(loaded.trajectory?.steps || [])
-                        : (conv.workspace || loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || "");
+                        : (conv.workspace || loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || loaded.windsurfData?.thread.cwd || "");
                     const actualWs = detectedWs || args.workspace || "general";
 
                     // 工作区筛选（预扫描已过滤，这是双重保险）

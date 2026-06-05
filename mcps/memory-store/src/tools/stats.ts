@@ -26,7 +26,8 @@ import {
 import { indexCache } from "../cache.js";
 import { cleanOldTempFiles, TEMP_DIR } from "../temp-store.js";
 import { generateAutoSummary } from "../auto-summary.js";
-import { CHAIN_INPUT_VALUES, resolveChainSplit, type Chain } from "../chain.js";
+import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
  * 校验导入/解归档的文件名是否安全（防路径遍历攻击）
@@ -59,8 +60,8 @@ export function registerStats(server: McpServer): void {
             ids: z.array(z.string()).optional().describe("指定记忆 ID 列表（export 时使用）"),
             savePath: z.string().optional().describe("导出文件保存路径（export 时必须）"),
             zipPath: z.string().optional().describe("导入文件路径（import 时必须）"),
-            modelChain: z.enum(CHAIN_INPUT_VALUES).optional().describe("enhance 生成 autoSummary 时使用的模型链路；未填回退到 chain，再默认 auto"),
-            chain: z.enum(CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：enhance 生成 autoSummary 时使用的模型链路"),
+            modelChain: modelChainInputSchema("modelChain", "enhance 生成 autoSummary 时使用的模型链路；未填回退到 chain，再默认 auto"),
+            chain: modelChainInputSchema("chain", "兼容旧参数：enhance 生成 autoSummary 时使用的模型链路"),
         },
         async ({ action, workspace, ids, savePath, zipPath, chain, modelChain }) => {
             touchActivity();
@@ -83,7 +84,7 @@ export function registerStats(server: McpServer): void {
                     case "import":
                         return appendTiming(handleImport(zipPath), startTime);
                     case "enhance":
-                        return appendTiming(await handleEnhance(workspace, resolveChainSplit({ chain, modelChain }).modelChain), startTime);
+                        return appendTiming(await handleEnhance(workspace, resolveModelOnlyChainSplit({ chain, modelChain }).modelChain), startTime);
                     default:
                         return appendTiming({ content: [{ type: "text" as const, text: `❌ 未知 action` }] }, startTime);
                 }

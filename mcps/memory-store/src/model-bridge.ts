@@ -298,7 +298,7 @@ export async function resolveModelChainCandidates(
     chain: Chain = "auto",
     options: ModelBridgeOptions = {},
 ): Promise<ResolvedChain[]> {
-    chain = normalizeChain(chain);
+    chain = normalizeChain(chain as string);
     if (chain === "antigravity") {
         return (await isLsAvailable()) ? ["antigravity"] : [];
     }
@@ -611,23 +611,31 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
 export async function callModelResponse(
     model: string,
     prompt: string,
-    chain: Chain = "auto",
+    chain: Chain | string = "auto",
     timeoutMs: number = 30_000,
     options: ModelBridgeOptions = {},
 ): Promise<ModelBridgeResult> {
-    chain = normalizeChain(chain);
-    const candidates = await resolveModelChainCandidates(chain, options);
+    const rawChain = String(chain || "auto").trim().toLowerCase();
+    if (rawChain === "windsurf" || rawChain === "wsf") {
+        return {
+            text: null,
+            chainUsed: null,
+            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code",
+        };
+    }
+    const resolvedChain = normalizeChain(chain as string);
+    const candidates = await resolveModelChainCandidates(resolvedChain, options);
     if (candidates.length === 0) {
         return {
             text: null,
             chainUsed: null,
-            error: chain === "auto"
+            error: resolvedChain === "auto"
                 ? (options.allowClaudeCodeFallback ? "Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用" : "Antigravity LS 与 Codex 模型桥当前都不可用")
-                : chain === "codex"
+                : resolvedChain === "codex"
                     ? "Codex CLI 不可用或模型桥不可用"
-                    : chain === "claude-code"
+                    : resolvedChain === "claude-code"
                         ? "Claude Code CLI 不可用或模型桥不可用"
-                : `指定链路 ${chain} 当前不可用`,
+                : `指定链路 ${resolvedChain} 当前不可用`,
         };
     }
 

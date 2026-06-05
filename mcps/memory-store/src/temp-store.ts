@@ -17,10 +17,7 @@ import fs from "fs";
  */
 
 // 数据根目录（与 store.ts 共享）
-const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || (process.env.CODEX_TOOLKIT_DATA_ROOT
-        ? path.join(process.env.CODEX_TOOLKIT_DATA_ROOT, "memory-store")
-        : path.join(os.homedir(), ".codex-toolkit", "memory-store"));
+const DATA_ROOT = path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
 export const TEMP_DIR = path.join(DATA_ROOT, "temp");
 
 // 文件最大存活时间
