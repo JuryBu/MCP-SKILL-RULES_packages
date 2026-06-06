@@ -18,10 +18,15 @@ Included:
 - `rules/windsurf/Windsurf_Global_Rules.template.md`
 - `rules/README_RULES.md`
 - `rules/RULES_PORTING_NOTES.md`
+- `skills/README_SKILLS.md`
+- `skills/skills_manifest.md`
+- `skills/<portable user skill folders>`
 - `install/*.ps1`
 - `design-tests/*`
 
 Updated in this snapshot:
+
+- Skills refreshed on 2026-06-07: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
 
 - `memory-store` refreshed to `1.15.3`.
 - `sandbox` refreshed to `1.13.3`.
@@ -31,8 +36,8 @@ Updated in this snapshot:
 
 Excluded:
 
-- `skills/` runtime or private skill cache
-- `node_modules/`, `dist/`, build caches
+- `.system/` skills, plugin cache skills, restrictive-license Office skills (`docx`, `pptx`, `xlsx`), and unlicensed `doc-coauthoring`
+- `node_modules/`, `dist/`, build caches, `__pycache__`, generated skill test outputs
 - `.git/`, editor state, temp folders
 - API keys, auth files, cookies, browser profiles
 - real memory-store data and Record files

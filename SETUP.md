@@ -1,4 +1,4 @@
-﻿# Setup Guide
+# Setup Guide
 
 This guide is for setting up the portable MCP + Rules package on Windows.
 
@@ -158,3 +158,12 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;you
 ## Windsurf / WSF
 
 Use `templates/config.windsurf.example.json` as a receiver-side example for %USERPROFILE%/.codeium/windsurf/mcp_config.json. Windsurf participates as a data source through dataChain=windsurf; model calls should use Codex, Antigravity, or Claude Code routes.
+
+## Install Skills
+
+Copy selected folders from skills/ into %USERPROFILE%/.codex/skills/, then restart Codex or open a new session. Do not copy .system bundled skills or plugin cache folders from another machine.
+
+
+### Excluded Office skills
+
+docx, pptx, and xlsx are not bundled in this public repository because their local license files restrict copying / redistribution. Install official or licensed equivalents separately if needed.

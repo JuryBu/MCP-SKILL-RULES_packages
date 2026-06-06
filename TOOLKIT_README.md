@@ -1,6 +1,6 @@
-﻿# Portable MCP + Rules 工具包（2026-6-5）
+# Portable MCP + Rules 工具包（2026-6-5）
 
-这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板和基础测试文件。本版不包含 skills。
+这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板、portable user skills 和基础测试文件。
 
 ## 今日重点
 
@@ -8,6 +8,10 @@
 - `memory-store`、`web-fetcher`、`sandbox` 支持四源数据链路；`windsurf` / `wsf` 用于 Cascade 对话数据，模型调用仍走 Antigravity / Codex / Claude Code。
 - `exa` 作为可选远程 MCP endpoint，经 broker 暴露给 Codex / Claude Code / Windsurf；API Key 只应放接收方本机环境变量或私有配置。
 - Rules 分四套标记：`rules/codex/AGENTS.template.md`、`rules/antigravity/GEMINI.template.md`、`rules/claude-code/CLAUDE.template.md`、`rules/windsurf/Windsurf_Global_Rules.template.md`。
+
+## Skills refresh
+
+This snapshot now includes `skills/`: allow-listed portable user-side Codex skills copied from `%USERPROFILE%/.codex/skills`. It intentionally excludes `.system` bundled skills, plugin cache skills, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, generated test artifacts, credentials, browser state, and private session data. See `skills/README_SKILLS.md` and `skills/skills_manifest.md`.
 
 ## 当前 MCP 版本
 

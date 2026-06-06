@@ -1,12 +1,12 @@
-﻿# MCP-SKILL-RULES Packages
+# MCP-SKILL-RULES Packages
 
 面向 AI 编程环境的可移植 MCP + Skills + Rules 工具包。
 
 这套项目最早来自 Antigravity 内部自用 MCP，现在已经整理成 **Antigravity / Codex / Claude Code（CC）/ Windsurf（WSF）四源兼容、数据互通** 的工具体系。目标是让不同 AI 宿主共享同一套本地能力、同一套记忆/Record 数据和相近的工作习惯。
 
-当前公开快照重点包含 **MCP + Rules**。`skills` 暂未随本次快照打包进仓库，但仓库名保留 `SKILL`，用于后续公开整理可迁移 Skills。
+当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
 
-> 2026-06-05 refresh: `memory-store` is now `1.15.3`, `sandbox` is now `1.13.3`, `web-fetcher` remains `7.0.0`, and the Codex / Claude Code rules templates were refreshed, Windsurf rules were added, and all rules were privacy-scrubbed.
+> 2026-06-07 refresh: portable user-side `skills/` are now included; `memory-store` is `1.15.3`, `sandbox` is `1.13.3`, `web-fetcher` remains `7.0.0`, and all rules remain privacy-scrubbed for four-source support.
 
 ---
 
@@ -83,20 +83,20 @@
 
 ### Skills：可迁移工作流层
 
-本仓库名保留 `SKILL`，但当前公开快照没有直接打包 `skills/` 目录。
+本仓库现在包含 `skills/` 目录，收录从 `%USERPROFILE%/.codex/skills` 复制的便携 user-side skills。
 
-预期 Skills 方向：
+当前 Skills 内容：
 
-- 文档类：`docx`、`pptx`、`xlsx`、`pdf` 等。
+- 文档类：当前公开包包含 `pdf`；`docx` / `pptx` / `xlsx` 因本地许可证限制不随 GitHub 包再分发，接收方应自行安装授权版本。
 - 设计类：前端设计、画布设计、主题工厂等。
 - 工具构建类：MCP 构建、Skill 创建、Playwright / 浏览器测试等。
-- 同步策略：后续会优先整理可公开、可迁移、无私有缓存和无运行态数据的 skill 文件夹。
+- 打包边界：不包含 `.system/`、插件缓存、`node_modules`、`dist`、`__pycache__`、生成测试输出、日志、cookies、sessions、auth 文件或本机私有数据。Office skills（`docx` / `pptx` / `xlsx`）因许可证限制排除。
 
 ### Rules：让 AI 更像长期协作者
 
 当前 Rules 是「猫娘 / 朋友式协作」版本。核心目标不是角色扮演本身，而是让 AI **说人话、少一点伪人味**：少模板腔、少报告腔、少机械结尾，多自然反馈、边界意识、证据意识和任务收口能力。
 
-Rules 覆盖三个宿主：
+Rules 覆盖四个宿主：
 
 - Codex：`rules/codex/AGENTS.template.md`
 - Codex 可选 system prompt：`rules/codex/system-prompt.template.md`
@@ -124,6 +124,7 @@ Rules 主要约束：
 | Rules 模板 | `rules/` | Codex、Antigravity、Claude Code、Windsurf 四套独立模板 |
 | 安装脚本 | `install/` | Windows PowerShell 构建、配置、broker 启停和 smoke test 脚本 |
 | 配置模板 | `templates/` | Codex、Antigravity、Claude Code、Windsurf 和环境变量示例 |
+| Skills | `skills/` | 便携 user-side Codex skills、README 和 manifest |
 | 测试样例 | `design-tests/` | 本地测试页面和 MCP HTTP smoke test 辅助文件 |
 
 ## Windows 快速开始
@@ -187,6 +188,7 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<用分号分隔你的私有标记>"
 │  ├─ antigravity/
 │  └─ claude-code/
 ├─ install/
+├─ skills/
 ├─ templates/
 ├─ design-tests/
 ├─ PACKAGE_MANIFEST.md
@@ -207,7 +209,7 @@ Portable MCP + Skills + Rules package for AI coding environments.
 
 This project started as an Antigravity-only internal MCP stack and has now been reorganized into a shared toolkit for **Antigravity / Codex / Claude Code (CC) / Windsurf (WSF) with cross-host data interoperability**. The goal is to let different AI hosts share the same local capabilities, the same memory/Record data, and similar working habits.
 
-The current public snapshot focuses on **MCP + Rules**. Skills are not bundled in this snapshot yet; `SKILL` in the repository name is reserved for future public skill packaging.
+The current public snapshot now contains **MCP + Skills + Rules**. `skills/` contains portable user-side Codex skills; it excludes `.system` bundled skills, plugin cache, runtime caches, and private data.
 
 ## Key Features
 
@@ -276,14 +278,14 @@ Highlights:
 
 ### Skills: portable workflow layer
 
-The repository name reserves `SKILL`, but the current public snapshot does not bundle a `skills/` directory.
+This repository now includes a `skills/` directory copied from portable user-side `%USERPROFILE%/.codex/skills` entries.
 
 Planned Skill directions:
 
-- Document workflows: `docx`, `pptx`, `xlsx`, `pdf`.
+- Document workflows: this public package includes `pdf`; `docx` / `pptx` / `xlsx` are excluded from GitHub redistribution because their local licenses restrict copying, so receivers should install licensed equivalents themselves.
 - Design workflows: frontend design, canvas design, theme factory.
 - Tool-building workflows: MCP builder, skill creator, Playwright / browser testing.
-- Sync policy: future public skills should be portable, privacy-scrubbed, and free of caches or runtime state.
+- Packaging boundary: excludes `.system/`, plugin cache, `node_modules`, `dist`, `__pycache__`, generated test outputs, logs, cookies, sessions, auth files, and local private data. Office skills (`docx` / `pptx` / `xlsx`) are excluded due to redistribution restrictions.
 
 ### Rules: making AI a better long-term collaborator
 
@@ -315,6 +317,7 @@ Rules mainly define:
 | Host rules | `rules/` | Separate templates for Codex, Antigravity, and Claude Code |
 | Install scripts | `install/` | Windows PowerShell scripts for build, config, broker lifecycle, and smoke tests |
 | Config templates | `templates/` | Codex, Antigravity, Claude Code, Windsurf, and environment examples |
+| Skills | `skills/` | Portable user-side Codex skills, README, and manifest |
 | Smoke tests | `design-tests/` | Local pages and MCP HTTP smoke test helpers |
 
 ## Quick Start On Windows
@@ -378,6 +381,7 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<private markers separated by semicolons>"
 │  ├─ antigravity/
 │  └─ claude-code/
 ├─ install/
+├─ skills/
 ├─ templates/
 ├─ design-tests/
 ├─ PACKAGE_MANIFEST.md

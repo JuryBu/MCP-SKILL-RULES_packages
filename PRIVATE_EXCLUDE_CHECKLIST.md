@@ -1,4 +1,4 @@
-﻿# Private Exclude Checklist
+# Private Exclude Checklist
 
 打包发送前，检查工具包内不应出现以下内容：
 
@@ -20,3 +20,9 @@ Get-ChildItem -Recurse -File -Include auth.json,*.sqlite,*.sqlite-wal,*.sqlite-s
 ```
 
 - Windsurf / Cascade local conversation data and ~/.codeium/windsurf runtime state must not be packaged.
+
+## Skills-specific checks
+
+- Do not package `%USERPROFILE%/.codex/skills/.system`.
+- Do not package `%USERPROFILE%/.codex/plugins/cache`.
+- Remove `node_modules`, `dist`, `__pycache__`, generated tests, logs, auth files, cookies, sessions, and local outputs from skills.
