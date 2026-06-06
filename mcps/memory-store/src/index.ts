@@ -1,6 +1,6 @@
 ﻿#!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.15.3
+ * MCP Memory Store Server v1.15.4
  * 
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。
@@ -52,7 +52,7 @@ let isClosing = false; // 防止重复清理
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "memory-store-mcp-server",
-    version: "1.15.3",
+    version: "1.15.4",
 });
 
 // 注册所有 11 个工具
@@ -80,7 +80,7 @@ server.registerResource(
         contents: [
             {
                 uri: "memory-store://guide",
-                text: `# MCP Memory Store v1.15.3 使用指南
+                text: `# MCP Memory Store v1.15.4 使用指南
 
 ## 快速开始
 - 新对话开始: memory_query() 或 memory_query(workspace="工作区路径") 获取背景
@@ -158,7 +158,7 @@ server.registerResource(
 
 ### conversation_read_original — 读取对话原文 (v1.4+)
 - 绕过 CHECKPOINT 压缩机制，读取对话的真实完整内容
-- 五类操作：list(列出候选) / fetch(拉取缓存) / search(关键词搜索) / read(范围阅读) / deep_locate(后台深搜定位)
+- 六类操作：list(列出候选) / fetch(拉取缓存) / search(关键词搜索) / read(范围阅读) / export(持久导出 Markdown/PDF) / deep_locate(后台深搜定位)
 - list/search 均支持 mode="auto|exact|fuzzy|smart"；list 会综合标题、ID、工作区、Record 摘要和近期上下文指纹定位对话
 - list 有 query 时默认扫描 300 个候选目录，可用 MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT 覆盖
 - Codex list 快查止血(v1.13.0): dataChain="codex" 且 mode="auto" 时，query 未命中不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 模型搜索；若 query 是古老正文片段，会提示后续使用 deep_locate 后台深搜能力
@@ -195,7 +195,8 @@ server.registerResource(
 - Windsurf 四数据链路兼容(v1.15.0): 新增 dataChain="windsurf" 与别名 "wsf"；conversation_read_original 通过 Windsurf Language Server 只读 Cascade 对话，支持 list/fetch/read/search；Record/Golden Extract/Stage Guard 可读取 WSF 对话并复用现有三模型链路；不调用 WSF 模型代理、发送消息接口或 ACP summary-agent。
 - Windsurf 超大 step 降级(v1.15.1): 若 WSF LS 返回单个 step 超过 4MB 限制，conversation_read_original 会插入占位轮次并继续读取后续 steps；partial 结果会明确警告，且不会自动或显式写入正式 Record。
 - Windsurf 工具证据归一化(v1.15.2): WSF run command、MCP tool、find、view file、code action、list directory、command status 等 step 会进入 toolCalls/fileViews/codeActions；conversation_read_original(depth="full") 和 Stage Guard 可看到真实执行证据，避免因 WSF 工具步骤不可见误判虚标。
-- conversation_read_original 防串读(v1.15.3): fetch/search/read 在 dataChain="auto|codex|claude-code|windsurf" 下必须显式传稳定 conversationId；只有显式 dataChain="antigravity" 保留当前窗口兼容路径。search 输出会显示实际读取的 conversationId，避免共享后端推断到其它窗口。
+- conversation_read_original 防串读(v1.15.3): fetch/search/read/export 在 dataChain="auto|codex|claude-code|windsurf" 下必须显式传稳定 conversationId；只有显式 dataChain="antigravity" 保留当前窗口兼容路径。search 输出会显示实际读取的 conversationId，避免共享后端推断到其它窗口。
+- conversation_read_original 持久导出(v1.15.4): action="export" 可按 full/rounds/search 范围导出 conversation.md、manifest.json、assets/，并可选生成 conversation.pdf；PDF 使用 Edge/Chrome 无头隐藏打印，不弹出有头浏览器窗口。导出不触发 Record 更新，也不改变 fetch/read/search 旧行为。
 - Codex HTTP broker 共享后端进程，fetch/search/read 必须显式传稳定 conversationId；只知道标题时先用 list 定位完整 ID，可补 contextProbe 辅助确认当前主线
 - Codex 如存在子代理线程，默认以引用或摘要方式呈现；link="expand_children" 时读取一级子线程全文，并用 thread_spawn_edges 补充父线程事件遗漏或已归档但仍可读的子线程；缺失子线程会输出诊断而不是静默跳过
 
@@ -383,7 +384,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[memory-store] MCP Server v1.15.3 启动中... (ppid=${process.ppid})`);
+    console.error(`[memory-store] MCP Server v1.15.4 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -396,7 +397,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[memory-store] MCP Server v1.15.3 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[memory-store] MCP Server v1.15.4 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

@@ -40,11 +40,12 @@ import type { SearchMode, TextBlock } from "../search-engine.js";
 import { buildRecordReaderIndex } from "../record-reader.js";
 import { formatAttachmentOverview, materializeRoundAttachments } from "../conversation-attachments.js";
 import { cancelBackgroundTask, formatBackgroundTask, startBackgroundTask, waitForBackgroundTask } from "../background-tasks.js";
+import { exportConversation, formatConversationExportResult } from "../conversation-exporter.js";
 
 const CONVERSATION_FETCH_TEXT_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_FETCH_TEXT_MAX_CHARS || 2_000_000);
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS || 2_000_000);
 const CONVERSATION_SEARCH_BLOCK_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_SEARCH_BLOCK_MAX_CHARS || 60_000);
-const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read"]);
+const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "export"]);
 
 export function shouldRequireExplicitConversationId(
     action: string,
@@ -578,6 +579,7 @@ export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCod
  *   fetch  — 拉取对话数据到缓存并返回概览
  *   search — 在对话中关键词搜索
  *   read   — 读取指定轮次范围的对话内容
+ *   export — 将可读对话原文持久化导出为 Markdown / PDF
  *   deep_locate — 后台流式深搜 Codex / Claude Code JSONL，用正文片段定位 conversationId
  */
 export function registerConversation(server: McpServer): void {
@@ -589,13 +591,14 @@ export function registerConversation(server: McpServer): void {
   fetch — 拉取对话数据到缓存，返回概览统计
   search — 在对话中关键词搜索，返回匹配的上下文
   read — 读取指定轮次范围的对话内容
+  export — 将可读对话原文持久化导出为 Markdown / PDF
   deep_locate — Codex/Claude Code 后台深搜正文片段以定位 conversationId
-fetch/search/read 在共享后端下必须传 conversationId；仅显式 dataChain="antigravity" 保留读取当前窗口的兼容路径。`,
+fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 dataChain="antigravity" 保留读取当前窗口的兼容路径。`,
         {
-            action: z.enum(["list", "fetch", "search", "read", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
-                .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / deep_locate=后台深搜定位对话"),
+            action: z.enum(["list", "fetch", "search", "read", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
+                .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
             conversationId: z.string().optional()
-                .describe("对话 UUID；fetch/search/read 建议总是显式传入，避免共享后端串到其它当前对话"),
+                .describe("对话 UUID；fetch/search/read/export 建议总是显式传入，避免共享后端串到其它当前对话"),
             conversationIds: z.array(z.string()).optional()
                 .describe("deep_locate 可选：限制只扫描这些 Codex conversationId"),
             query: z.string().optional()
@@ -628,6 +631,18 @@ fetch/search/read 在共享后端下必须传 conversationId；仅显式 dataCha
                 .describe("read 模式：起始轮次（1-indexed）"),
             endRound: z.number().optional()
                 .describe("read 模式：结束轮次"),
+            exportFormat: z.enum(["markdown", "pdf", "both"]).optional()
+                .describe("export 模式：导出格式，markdown=只导出 Markdown，pdf=Markdown+PDF 且以 PDF 为目标，both=两者都生成"),
+            exportScope: z.enum(["full", "rounds", "search"]).optional()
+                .describe("export 模式：full=整篇对话，rounds=按 startRound/endRound，search=按 query 命中窗口"),
+            outputDir: z.string().optional()
+                .describe("export 模式：自定义导出目录；不存在时自动创建。未传则写入 memory-store/exports/conversations/..."),
+            overwrite: z.boolean().optional()
+                .describe("export 模式：true=允许覆盖 outputDir 下本工具生成的同名文件；默认创建时间戳子目录"),
+            includeAssets: z.boolean().optional()
+                .describe("export 模式：是否复制图片/文件到 assets 并重写链接，默认 true"),
+            pdfEmbedAttachments: z.enum(["off", "auto", "force"]).optional()
+                .describe("export 模式：PDF 原生附件嵌入策略；auto=可用时尝试，off=只生成链接/清单，force=失败时报 warning/失败状态"),
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
                 .describe("额外拉取的内容类型"),
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
@@ -655,6 +670,12 @@ fetch/search/read 在共享后端下必须传 conversationId；仅显式 dataCha
                     limit = 8,
                     startRound,
                     endRound,
+                    exportFormat,
+                    exportScope,
+                    outputDir,
+                    overwrite,
+                    includeAssets,
+                    pdfEmbedAttachments,
                     extraTypes = [],
                     background,
                     taskId,
@@ -987,6 +1008,37 @@ fetch/search/read 在共享后端下必须传 conversationId；仅显式 dataCha
                 const totalSteps = loaded.totalSteps;
                 const expandedChildren = loaded.codexData?.expandedChildren || [];
                 const childDiagnostics = loaded.codexData?.childDiagnostics || [];
+
+                if (action === "export") {
+                    const partialWarning = formatWindsurfPartialWarning(loaded);
+                    const result = await exportConversation({
+                        conversationId: cascadeId,
+                        chainUsed: loaded.chainUsed,
+                        rounds,
+                        totalSteps,
+                        expandedChildren,
+                        childDiagnostics,
+                        partialWarning,
+                        scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
+                        query,
+                        startRound,
+                        endRound,
+                        contextRounds,
+                        limit,
+                        mode: mode as SearchMode,
+                        depth: depth as Depth,
+                        extraTypes: extraTypes as ExtraType[],
+                        compactionMode: effectiveCompactionMode,
+                        outputDir,
+                        overwrite,
+                        format: exportFormat || "markdown",
+                        includeAssets,
+                        pdfEmbedAttachments: pdfEmbedAttachments || "auto",
+                    });
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: formatConversationExportResult(result) }],
+                    }, startTime);
+                }
 
                 // === fetch 模式 ===
                 if (action === "fetch") {

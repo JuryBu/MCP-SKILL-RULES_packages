@@ -2,7 +2,7 @@
 
 Included:
 
-- `mcps/memory-store` source-only portable MCP (`1.15.3`)
+- `mcps/memory-store` source-only portable MCP (`1.15.4`)
 - `mcps/web-fetcher` source-only portable MCP (`7.0.0`)
 - `mcps/sandbox` source-only portable MCP (`1.13.3`)
 - `mcps/broker` portable HTTP broker (`0.1.0`)
@@ -28,7 +28,7 @@ Updated in this snapshot:
 
 - Skills refreshed on 2026-06-07: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
 
-- `memory-store` refreshed to `1.15.3`.
+- `memory-store` refreshed to `1.15.4` with conversation export helper sources.
 - `sandbox` refreshed to `1.13.3`.
 - `web-fetcher` source refreshed from the current local tree; version remains `7.0.0`.
 - Codex and Claude Code rules refreshed from current local templates, Windsurf rules added from WSF config, then all rules privacy-scrubbed.
