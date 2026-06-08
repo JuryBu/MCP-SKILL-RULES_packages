@@ -26,5 +26,6 @@
 - Real MCP config paths for their host apps.
 - Whether Claude Code fallback is allowed automatically; default recommendation is explicit-only to avoid hidden CC quota use.
 - Windsurf global rules location and whether `dataChain=windsurf` should be enabled for local Cascade history.
+- Whether the receiver wants to enable the Windsurf-only `mcp-subagent`; if yes, run its dry-run, backup, apply, validation, and rollback flow locally instead of blindly copying the sender's broker/config state.
 - Exa URL/API key location. Keep it in private local env/config, never in package files.
 - Any model names unavailable on the receiver machine.

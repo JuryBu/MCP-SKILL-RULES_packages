@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.wsf-subagent/registry.schema.json",
+  "title": "WSF MCP Subagent Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "updated_at", "jobs"],
+  "properties": {
+    "version": { "type": "integer", "const": 1 },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "owner_workspace": { "type": "string" },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/job" }
+    },
+    "archives": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/archiveRef" }
+    }
+  },
+  "$defs": {
+    "jobState": {
+      "type": "string",
+      "enum": [
+        "creating",
+        "running",
+        "done",
+        "collecting",
+        "collected",
+        "collect_failed",
+        "timeout",
+        "archiving",
+        "archived",
+        "deleting",
+        "deleted",
+        "failed",
+        "missing",
+        "orphan",
+        "stale_queue"
+      ]
+    },
+    "collectMode": {
+      "type": "string",
+      "enum": ["queue", "interrupt", "force"]
+    },
+    "spawnMode": {
+      "type": "string",
+      "enum": ["code", "plan", "ask", "no_tool", "explore", "auto"]
+    },
+    "queueRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["queue_id", "main_id", "state", "created_at"],
+      "properties": {
+        "queue_id": { "type": "string", "minLength": 1 },
+        "main_id": { "type": "string", "minLength": 1 },
+        "state": {
+          "type": "string",
+          "enum": ["queued", "removed", "consumed", "unknown", "remove_failed"]
+        },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "remove_attempts": { "type": "integer", "minimum": 0 },
+        "last_error": { "type": "string" }
+      }
+    },
+    "stepBoundaryRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "index": { "type": "integer", "minimum": 0 },
+        "type": { "type": "string" },
+        "status": { "type": "string" },
+        "created_at": { "type": ["string", "null"] },
+        "key": { "type": "string" }
+      }
+    },
+    "job": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "sub_cid",
+        "main_id",
+        "owner_conversation_id",
+        "root_job_id",
+        "parent_job_id",
+        "depth",
+        "state",
+        "label",
+        "mode",
+        "model",
+        "collect_mode",
+        "allow_subagent",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "sub_cid": { "type": "string", "minLength": 1 },
+        "main_id": { "type": "string", "minLength": 1 },
+        "owner_conversation_id": { "type": "string", "minLength": 1 },
+        "root_job_id": { "type": "string", "minLength": 1 },
+        "parent_job_id": { "type": ["string", "null"] },
+        "depth": { "type": "integer", "minimum": 0 },
+        "state": { "$ref": "#/$defs/jobState" },
+        "label": { "type": "string" },
+        "title_best_effort": { "type": "string" },
+        "mode": { "$ref": "#/$defs/spawnMode" },
+        "model": { "type": "string" },
+        "model_profile": { "type": ["string", "null"] },
+        "model_requested": { "type": ["string", "null"] },
+        "model_resolved": { "type": ["string", "null"] },
+        "model_source": { "type": ["string", "null"] },
+        "model_note": { "type": ["string", "null"] },
+        "model_catalog_updated_at": { "type": ["string", "null"], "format": "date-time" },
+        "model_send_fallback_from": { "type": ["string", "null"] },
+        "model_send_error": { "type": ["string", "null"] },
+        "model_fallback_chain": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        },
+        "collect_mode": { "$ref": "#/$defs/collectMode" },
+        "auto_collect": { "type": "boolean" },
+        "auto_collect_state": { "type": "string" },
+        "auto_collect_result": { "type": "object" },
+        "allow_subagent": { "type": "boolean" },
+        "max_depth": { "type": "integer", "minimum": 0 },
+        "max_concurrent": { "type": "integer", "minimum": 1 },
+        "collect_nonce": { "type": "string" },
+        "turn": { "type": "integer", "minimum": 1 },
+        "last_reply_at": { "type": "string", "format": "date-time" },
+        "replies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "turn": { "type": "integer", "minimum": 1 },
+              "created_at": { "type": "string", "format": "date-time" },
+              "mode": { "$ref": "#/$defs/spawnMode" },
+              "model": { "type": "string" },
+              "model_profile": { "type": ["string", "null"] },
+              "model_requested": { "type": ["string", "null"] },
+              "model_resolved": { "type": ["string", "null"] },
+              "model_source": { "type": ["string", "null"] },
+              "model_note": { "type": ["string", "null"] },
+              "model_catalog_updated_at": { "type": ["string", "null"], "format": "date-time" },
+              "model_send_fallback_from": { "type": ["string", "null"] },
+              "model_send_error": { "type": ["string", "null"] },
+              "model_fallback_chain": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": true
+                }
+              },
+              "message_preview": { "type": "string" },
+              "image_count": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "queue": { "$ref": "#/$defs/queueRecord" },
+        "created_at": { "type": "string", "format": "date-time" },
+        "updated_at": { "type": "string", "format": "date-time" },
+        "deadline_at": { "type": "string", "format": "date-time" },
+        "completed_at": { "type": "string", "format": "date-time" },
+        "archived_at": { "type": "string", "format": "date-time" },
+        "archive_path": { "type": "string" },
+        "archive_export_path": { "type": "string" },
+        "archive_file_deleted_at": { "type": "string", "format": "date-time" },
+        "cleanup_reason": { "type": "string" },
+        "result_preview": { "type": "string" },
+        "result_text": { "type": "string" },
+        "result_step_count": { "type": "integer", "minimum": 0 },
+        "last_error": { "type": "string" },
+        "collect_result": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "delivered": { "type": "boolean" },
+            "when": { "type": "string" },
+            "mode_used": { "type": "string" },
+            "queue_id": { "type": "string" },
+            "turn": { "type": "integer", "minimum": 1 },
+            "fallback_from": { "type": "string" },
+            "last_error": { "type": "string" },
+            "confirmed": { "type": "boolean" },
+            "boundary_reason": { "type": ["string", "null"] },
+            "delivered_by": { "type": ["string", "null"] },
+            "watched_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] },
+            "completed_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] }
+          }
+        },
+        "collect_results": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "delivered": { "type": "boolean" },
+              "when": { "type": "string" },
+              "mode_used": { "type": "string" },
+              "queue_id": { "type": "string" },
+              "turn": { "type": "integer", "minimum": 1 },
+              "fallback_from": { "type": "string" },
+              "last_error": { "type": "string" },
+              "confirmed": { "type": "boolean" },
+              "boundary_reason": { "type": ["string", "null"] },
+              "delivered_by": { "type": ["string", "null"] },
+              "watched_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] },
+              "completed_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] }
+            }
+          }
+        },
+        "turn_results": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "turn": { "type": "integer", "minimum": 1 },
+              "state": { "type": "string" },
+              "status": { "type": "string" },
+              "step_count": { "type": "integer", "minimum": 0 },
+              "result_text": { "type": "string" },
+              "result_preview": { "type": "string" },
+              "updated_at": { "type": "string", "format": "date-time" }
+            }
+          }
+        },
+        "ls_binding": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "last_pid": { "type": "integer" },
+            "last_port": { "type": "integer" },
+            "resolved_by_main_id": { "type": "boolean" },
+            "resolved_at": { "type": "string", "format": "date-time" }
+          }
+        }
+      }
+    },
+    "archiveRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["job_id", "archive_path", "archived_at"],
+      "properties": {
+        "job_id": { "type": "string", "minLength": 1 },
+        "archive_path": { "type": "string", "minLength": 1 },
+        "archived_at": { "type": "string", "format": "date-time" },
+        "delete_after_archive": { "type": "boolean" },
+        "pruned_at": { "type": "string", "format": "date-time" },
+        "file_deleted_at": { "type": "string", "format": "date-time" },
+        "export_path": { "type": "string" }
+      }
+    }
+  }
+}

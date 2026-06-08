@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "subagent": {
+      "serverUrl": "http://127.0.0.1:14588/subagent/mcp"
+    }
+  },
+  "notes": {
+    "scope": "Windsurf-only optional MCP. Do not merge into other host configs by default.",
+    "beforeUse": [
+      "Build mcps/mcp-subagent with npm install && npm run build.",
+      "Run npm run install:config and npm run patch:codex-broker in dry-run mode first.",
+      "Apply only after confirming backups and rollback commands on the receiver machine."
+    ],
+    "stdioFallback": {
+      "command": "node",
+      "args": ["%USERPROFILE%\\.codeium\\windsurf\\mcp-subagent\\src\\index.js"],
+      "env": {
+        "SUBAGENT_DATA_DIR": "%USERPROFILE%\\.codeium\\windsurf\\mcp-subagent\\subagent-data"
+      }
+    }
+  }
+}

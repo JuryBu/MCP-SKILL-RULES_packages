@@ -6,7 +6,7 @@
 
 当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
 
-> 2026-06-07 refresh: portable user-side `skills/` are included; `memory-store` is bumped to `1.15.4` with conversation export helpers, `sandbox` is `1.13.3`, `web-fetcher` remains `7.0.0`, and all rules remain privacy-scrubbed for four-source support.
+> 2026-06-09 refresh: `mcp-subagent` is added as a Windsurf-only optional MCP, Windsurf Rules are refreshed and privacy-scrubbed, `memory-store` remains `1.15.4`, `sandbox` is `1.13.3`, and `web-fetcher` remains `7.0.0`.
 
 ---
 
@@ -31,7 +31,7 @@
 
 ### MCP：本地能力层
 
-当前包含三个核心 MCP 和一个 HTTP broker：
+当前包含三个共享核心 MCP、一个 HTTP broker，以及一个 Windsurf 专属可选 MCP：
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
@@ -39,6 +39,9 @@
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
 | `sandbox` | `1.13.3` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
 | `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
+| `mcp-subagent` | `0.0.1` | Windsurf 专属异步子代理：spawn / poll / reply / collect / interrupt / dispose；默认不作为四源共享 MCP 启用 |
+
+`mcp-subagent` 需要特别对待：它会通过 Windsurf / Devin Language Server 操作真实 Cascade 对话，属于 WSF 私有自动化能力。源码放在 `mcps/mcp-subagent/`，但默认安装脚本不会自动写入全局 broker 或 Windsurf 配置；需要接收方明确授权后，按 `mcps/mcp-subagent/README.md` 执行 dry-run、备份、apply 和 rollback。
 
 #### memory-store：Conversation / Record / Guard 中枢
 
@@ -120,7 +123,7 @@ Rules 主要约束：
 
 | 模块 | 路径 | 说明 |
 | --- | --- | --- |
-| MCP servers | `mcps/` | `memory-store`、`web-fetcher`、`sandbox` 和可移植 HTTP broker |
+| MCP servers | `mcps/` | `memory-store`、`web-fetcher`、`sandbox`、可移植 HTTP broker，以及 WSF 专属 `mcp-subagent` |
 | Rules 模板 | `rules/` | Codex、Antigravity、Claude Code、Windsurf 四套独立模板 |
 | 安装脚本 | `install/` | Windows PowerShell 构建、配置、broker 启停和 smoke test 脚本 |
 | 配置模板 | `templates/` | Codex、Antigravity、Claude Code、Windsurf 和环境变量示例 |
@@ -181,6 +184,7 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<用分号分隔你的私有标记>"
 ├─ mcps/
 │  ├─ broker/
 │  ├─ memory-store/
+│  ├─ mcp-subagent/
 │  ├─ sandbox/
 │  └─ web-fetcher/
 ├─ rules/
@@ -238,6 +242,9 @@ Common examples:
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
 | `sandbox` | `1.13.3` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
 | `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code and other hosts |
+| `mcp-subagent` | `0.0.1` | Windsurf-only async sub-agents: spawn / poll / reply / collect / interrupt / dispose; not enabled as a default shared MCP |
+
+`mcp-subagent` is special: it operates real Windsurf / Devin Cascade conversations through the local Language Server. The source is included under `mcps/mcp-subagent/`, but the default installer does not automatically patch the shared broker or Windsurf config. Receivers should follow `mcps/mcp-subagent/README.md` and run dry-run, backup, apply, and rollback steps only with explicit local authorization.
 
 #### memory-store: Conversation / Record / Guard hub
 
@@ -313,7 +320,7 @@ Rules mainly define:
 
 | Area | Path | Notes |
 | --- | --- | --- |
-| MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, and a portable HTTP broker |
+| MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, a portable HTTP broker, and WSF-only `mcp-subagent` |
 | Host rules | `rules/` | Separate templates for Codex, Antigravity, and Claude Code |
 | Install scripts | `install/` | Windows PowerShell scripts for build, config, broker lifecycle, and smoke tests |
 | Config templates | `templates/` | Codex, Antigravity, Claude Code, Windsurf, and environment examples |
@@ -374,6 +381,7 @@ $env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<private markers separated by semicolons>"
 ├─ mcps/
 │  ├─ broker/
 │  ├─ memory-store/
+│  ├─ mcp-subagent/
 │  ├─ sandbox/
 │  └─ web-fetcher/
 ├─ rules/

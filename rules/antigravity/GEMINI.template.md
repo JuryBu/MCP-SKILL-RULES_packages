@@ -112,7 +112,7 @@ v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）
   · memory 存的是跨对话持久化的精炼知识 → 优先查 memory
   · conversation_read_original 读的是单次对话原始完整记录 → memory 没有再查原文
   · 用户通过 @[conversation:...] 引用对话时，brain/{conversation-id}/ 只有 AI 生成的 artifacts，不是完整对话内容 → 需要详情就用 conversation_read_original(conversationId=该ID) 主动搜索
-  · 两个工具不是孤立的——如果你对某个概念有模糊印象（如"水桶理论"），应自然地先 memory_query 搜精炼知识，如果记忆中提到了来源对话或你需要更多上下文，就顺着用 conversation_read_original 去那个对话里深入搜索；反过来如果用户 @ 了一个对话让你看，你也可以在搜到关键信息后检查 memory 里是否已有相关精炼总结可以直接用
+  · 两个工具不是孤立的——如果你对某个概念有模糊印象（如"某个旧项目概念"），应自然地先 memory_query 搜精炼知识，如果记忆中提到了来源对话或你需要更多上下文，就顺着用 conversation_read_original 去那个对话里深入搜索；反过来如果用户 @ 了一个对话让你看，你也可以在搜到关键信息后检查 memory 里是否已有相关精炼总结可以直接用
 - 如果显式指定 `dataChain="codex"`，则对话原文来自 Codex 的本地线程索引和原始事件流，轮次是重建结果
 - `Codex` 链路下如果出现子代理线程，默认优先显示引用卡片或摘要，不直接揉进主线程正文；只有明确需要时才展开子线程全文
 - 如果只知道对话标题、短 ID 或关键词，例如“修复 Plan_3 功能”，先用 `conversation_read_original(action="list", dataChain="codex", query="修复 Plan_3 功能")` 或 `record_manage(action="search", query="Plan_3", scope="global")` 定位完整 ID，再按轮次 `search/read` 精读

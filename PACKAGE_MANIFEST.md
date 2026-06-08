@@ -1,4 +1,4 @@
-﻿# Package Manifest（2026-6-5）
+﻿# Package Manifest（2026-6-9）
 
 Included:
 
@@ -6,10 +6,12 @@ Included:
 - `mcps/web-fetcher` source-only portable MCP (`7.0.0`)
 - `mcps/sandbox` source-only portable MCP (`1.13.3`)
 - `mcps/broker` portable HTTP broker (`0.1.0`)
+- `mcps/mcp-subagent` source-only Windsurf-only optional MCP (`0.0.1`)
 - `templates/config.codex.toml`
 - `templates/config.antigravity.example.json`
 - `templates/config.claude.example.json`
 - `templates/config.windsurf.example.json`
+- `templates/config.windsurf.subagent.example.json`
 - `templates/env.example.ps1`
 - `rules/codex/AGENTS.template.md`
 - `rules/codex/system-prompt.template.md`
@@ -26,6 +28,9 @@ Included:
 
 Updated in this snapshot:
 
+- 2026-06-09: added `mcps/mcp-subagent` as a Windsurf-only optional MCP. It is not enabled by default in shared broker installs; receiver must explicitly run its dry-run/apply/rollback flow.
+- 2026-06-09: refreshed `rules/windsurf/Windsurf_Global_Rules.template.md` from current WSF global rules, preserving new subagent workflow guidance while removing personal info, account links, login-state claims, and sender-specific paths.
+
 - Skills refreshed on 2026-06-07: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
 
 - `memory-store` refreshed to `1.15.4` with conversation export helper sources.
@@ -38,6 +43,7 @@ Excluded:
 
 - `.system/` skills, plugin cache skills, restrictive-license Office skills (`docx`, `pptx`, `xlsx`), and unlicensed `doc-coauthoring`
 - `node_modules/`, `dist/`, build caches, `__pycache__`, generated skill test outputs
+- `mcps/mcp-subagent/subagent-data`, Cascade child job registry, audit logs, archive exports, generated handoff zips, and built `dist/`
 - `.git/`, editor state, temp folders
 - API keys, auth files, cookies, browser profiles
 - real memory-store data and Record files
