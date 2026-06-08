@@ -38,7 +38,7 @@ const InspectInputSchema = z.object({
         .number()
         .int()
         .min(1)
-        .max(300)
+        .max(600)
         .optional()
         .describe("check 时等待任务完成的秒数"),
     url: z

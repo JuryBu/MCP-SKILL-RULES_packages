@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import os from "node:os";
 
 export const projectRoot = path.resolve(import.meta.dirname, "..");
 export const serverEntry = path.join(projectRoot, "src", "index.js");

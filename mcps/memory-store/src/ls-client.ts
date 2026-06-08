@@ -929,7 +929,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/Users/you/Desktop/project"
+ * 返回去 URI 化后的本地路径，如 "c:/Users/example/Desktop/project"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {

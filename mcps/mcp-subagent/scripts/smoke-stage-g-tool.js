@@ -2,8 +2,7 @@ import { subagentCollect, subagentDispose, subagentPoll, subagentSpawn, waitForJ
 import path from "node:path";
 
 const mainId = process.argv[2];
-const projectRoot = path.resolve(import.meta.dirname, "..");
-const readmePath = path.join(projectRoot, "README.md");
+const readmePath = path.resolve(import.meta.dirname, "..", "README.md");
 
 if (!mainId) {
   console.error("usage: node scripts/smoke-stage-g-tool.js <main_id>");

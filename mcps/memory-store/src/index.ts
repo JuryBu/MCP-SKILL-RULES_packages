@@ -52,7 +52,7 @@ let isClosing = false; // 防止重复清理
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "memory-store-mcp-server",
-    version: "1.15.4",
+    version: "1.15.5",
 });
 
 // 注册所有 11 个工具
@@ -197,6 +197,7 @@ server.registerResource(
 - Windsurf 工具证据归一化(v1.15.2): WSF run command、MCP tool、find、view file、code action、list directory、command status 等 step 会进入 toolCalls/fileViews/codeActions；conversation_read_original(depth="full") 和 Stage Guard 可看到真实执行证据，避免因 WSF 工具步骤不可见误判虚标。
 - conversation_read_original 防串读(v1.15.3): fetch/search/read/export 在 dataChain="auto|codex|claude-code|windsurf" 下必须显式传稳定 conversationId；只有显式 dataChain="antigravity" 保留当前窗口兼容路径。search 输出会显示实际读取的 conversationId，避免共享后端推断到其它窗口。
 - conversation_read_original 持久导出(v1.15.4): action="export" 可按 full/rounds/search 范围导出 conversation.md、manifest.json、assets/，并可选生成 conversation.pdf；PDF 使用 Edge/Chrome 无头隐藏打印，不弹出有头浏览器窗口。导出不触发 Record 更新，也不改变 fetch/read/search 旧行为。
+- conversation_read_original 跨源过滤(v1.15.5): list/export 支持 dataChains、workspaces、workspaceMode、exportBatch；批量导出为每条对话创建独立目录和 batch_manifest.json。dataChain=auto+conversationId 默认全源唯一匹配，Antigravity/Windsurf 离线默认作为 warning。
 - Codex HTTP broker 共享后端进程，fetch/search/read 必须显式传稳定 conversationId；只知道标题时先用 list 定位完整 ID，可补 contextProbe 辅助确认当前主线
 - Codex 如存在子代理线程，默认以引用或摘要方式呈现；link="expand_children" 时读取一级子线程全文，并用 thread_spawn_edges 补充父线程事件遗漏或已归档但仍可读的子线程；缺失子线程会输出诊断而不是静默跳过
 

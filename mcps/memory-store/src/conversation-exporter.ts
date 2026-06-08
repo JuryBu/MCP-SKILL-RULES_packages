@@ -421,6 +421,7 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     for (const round of rounds) {
         lines.push(formatRound(round, options.depth || "normal", options.extraTypes || [], {
             compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
+            attachmentMode: "markdown",
         }));
         lines.push("");
     }
@@ -432,6 +433,7 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
             for (const round of child.rounds) {
                 lines.push(formatRound(round, options.depth || "normal", options.extraTypes || [], {
                     compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
+                    attachmentMode: "markdown",
                 }));
                 lines.push("");
             }

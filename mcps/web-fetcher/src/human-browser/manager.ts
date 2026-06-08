@@ -3,7 +3,9 @@ import {
     cleanupTempProfile,
     connectCDP,
     launchSystemChrome,
+    snapshotBrowserStorage,
     terminateOwnedChrome,
+    type BrowserStorageSnapshotResult,
     type ChromeLaunchResult,
 } from "../chrome-helper.js";
 import { desktopManager } from "../desktop/manager.js";
@@ -33,6 +35,12 @@ export interface HumanBrowserSessionInfo {
     lastAccess: number;
     alive: boolean;
     cookieCount?: number;
+    storageSnapshot?: {
+        cookieCount: number;
+        mergedCookieCount?: number;
+        localStorageDomains: Array<{ domain: string; keyCount: number }>;
+        errors: string[];
+    };
     pages: HumanBrowserPageInfo[];
 }
 
@@ -109,6 +117,7 @@ class HumanBrowserManager {
     async describe(humanSessionId: string, ownerId?: string): Promise<HumanBrowserSessionInfo> {
         const session = this.getSession(humanSessionId, ownerId);
         const pages = await this.refreshPages(session);
+        const storageSnapshot = await this.snapshotStorage(session, "human-status");
         session.lastAccess = Date.now();
         return {
             humanSessionId: session.id,
@@ -120,7 +129,8 @@ class HumanBrowserManager {
             createdAt: session.createdAt,
             lastAccess: session.lastAccess,
             alive: pages.some(page => page.alive),
-            cookieCount: await this.cookieCount(session),
+            cookieCount: storageSnapshot.cookieCount,
+            storageSnapshot: this.publicStorageSnapshot(storageSnapshot),
             pages,
         };
     }
@@ -159,6 +169,7 @@ class HumanBrowserManager {
                 closePolicy: "noop",
             },
         });
+        await this.snapshotStorage(session, "human-register-page");
         const refreshed = await this.describe(humanSessionId, session.ownerId);
         const refreshedPage = refreshed.pages.find(item => item.pageId === target.pageId) ?? target;
         return {
@@ -185,6 +196,7 @@ class HumanBrowserManager {
     async detach(humanSessionId: string, ownerId?: string): Promise<boolean> {
         const session = this.sessions.get(humanSessionId);
         if (!session || session.ownerId !== normalizeOwnerId(ownerId)) return false;
+        await this.snapshotStorage(session, "human-detach").catch(() => undefined);
         for (const sessionId of session.registeredSessionIds.values()) {
             await sessionManager.close(sessionId, session.ownerId).catch(() => false);
         }
@@ -285,13 +297,38 @@ class HumanBrowserManager {
         });
     }
 
-    private async cookieCount(session: HumanBrowserSession): Promise<number> {
+    private async snapshotStorage(session: HumanBrowserSession, reason: string): Promise<BrowserStorageSnapshotResult> {
+        const empty: BrowserStorageSnapshotResult = {
+            reason,
+            cookieCount: 0,
+            localStorageDomains: [],
+            errors: [],
+            cookies: [],
+        };
         try {
-            const counts = await Promise.all(session.cdpBrowser.contexts().map((context: any) => context.cookies().then((cookies: any[]) => cookies.length).catch(() => 0)));
-            return counts.reduce((sum, count) => sum + count, 0);
-        } catch {
-            return 0;
+            const contexts = session.cdpBrowser.contexts();
+            const snapshots = await Promise.all(contexts.map((context: any) => snapshotBrowserStorage(context, { reason })));
+            return snapshots.reduce<BrowserStorageSnapshotResult>((combined, snapshot) => ({
+                reason,
+                cookieCount: combined.cookieCount + snapshot.cookieCount,
+                mergedCookieCount: snapshot.mergedCookieCount ?? combined.mergedCookieCount,
+                localStorageDomains: [...combined.localStorageDomains, ...snapshot.localStorageDomains],
+                errors: [...combined.errors, ...snapshot.errors],
+                cookies: [...combined.cookies, ...snapshot.cookies],
+            }), empty);
+        } catch (error) {
+            empty.errors.push(error instanceof Error ? error.message : String(error));
+            return empty;
         }
+    }
+
+    private publicStorageSnapshot(snapshot: BrowserStorageSnapshotResult): HumanBrowserSessionInfo["storageSnapshot"] {
+        return {
+            cookieCount: snapshot.cookieCount,
+            mergedCookieCount: snapshot.mergedCookieCount,
+            localStorageDomains: snapshot.localStorageDomains,
+            errors: snapshot.errors,
+        };
     }
 }
 

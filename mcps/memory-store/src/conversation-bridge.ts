@@ -21,6 +21,11 @@ import {
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable } from "./ls-client.js";
 import { parseRounds, type ConversationRound } from "./trajectory.js";
+import {
+    resolveConversationIdAcrossSources,
+    type IdResolutionMode,
+    type SourceFailureMode,
+} from "./conversation-filter.js";
 
 export type ResolvedConversationChain = Exclude<DataChain, "auto">;
 
@@ -89,10 +94,35 @@ export async function resolveConversationId(
 export async function loadConversationData(
     chain: DataChain = "auto",
     conversationId?: string,
-    options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string } = {},
+    options: {
+        refresh?: boolean;
+        link?: ConversationLinkMode;
+        cwd?: string;
+        dataChains?: DataChain[];
+        idResolutionMode?: IdResolutionMode;
+        sourceFailureMode?: SourceFailureMode;
+    } = {},
 ): Promise<ConversationLoadResult | null> {
     chain = normalizeDataChain(chain);
     if (chain === "auto") {
+        if (conversationId && (options.idResolutionMode || "unique") === "unique") {
+            const resolvedAcrossSources = await resolveConversationIdAcrossSources(conversationId, {
+                dataChains: options.dataChains,
+                sourceFailureMode: options.sourceFailureMode || "warn",
+            });
+            if (resolvedAcrossSources.hits.length === 1) {
+                const hit = resolvedAcrossSources.hits[0];
+                return loadFromResolvedChain(hit.dataChain, hit.conversationId, options);
+            }
+            if (resolvedAcrossSources.hits.length > 1) {
+                const candidates = resolvedAcrossSources.hits
+                    .map(hit => `${hit.dataChain}:${hit.conversationId}${hit.title ? ` (${hit.title})` : ""}`)
+                    .join("；");
+                throw new Error(`conversationId 在多个数据源中命中，无法自动选择：${candidates}。请显式传 dataChain。`);
+            }
+            return null;
+        }
+
         const preferLs = await isAntigravityLS();
         const candidates: ResolvedConversationChain[] = preferLs
             ? ["antigravity", "codex", "claude-code"]

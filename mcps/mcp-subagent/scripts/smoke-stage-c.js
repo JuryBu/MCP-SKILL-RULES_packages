@@ -50,7 +50,7 @@ const archivePath = disposed.processed[0]?.archive_path;
 if (!archivePath || !fs.existsSync(archivePath)) {
   throw new Error(`archive missing: ${archivePath}`);
 }
-const archived = parseResult(await subagentList({ filter: "archived" }));
+const archived = parseResult(await subagentList({ filter: "archived", include_deleted: true }));
 console.log(`archived count=${archived.jobs.length} archiveExists=true`);
 if (!archived.jobs.some((job) => job.job_id === spawn.job_id)) {
   throw new Error("disposed job missing from archived list");

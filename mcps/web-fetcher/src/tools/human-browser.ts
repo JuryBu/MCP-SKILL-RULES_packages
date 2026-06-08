@@ -13,7 +13,7 @@ const HumanBrowserOpenInputSchema = z.object({
     waitMs: z.number().int().min(500).max(15000).optional().describe("等待 CDP 端点就绪的毫秒数，默认 2500"),
     background: z.boolean().optional().describe("Codex 侧可设为 true：后台启动 Chrome 并返回 taskId"),
     taskId: z.string().optional().describe("查询后台 open 任务的 taskId"),
-    waitSeconds: z.number().int().min(0).max(300).optional().describe("查询后台任务时等待秒数"),
+    waitSeconds: z.number().int().min(0).max(600).optional().describe("查询后台任务时等待秒数，最大 600 秒"),
 });
 
 const HumanBrowserAttachInputSchema = z.object({

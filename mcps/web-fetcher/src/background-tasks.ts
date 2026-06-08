@@ -24,6 +24,7 @@ export interface StartBackgroundTaskOptions {
 
 const tasks = new Map<string, BackgroundTask>();
 const TASK_TTL_MS = Number(process.env.WEB_FETCHER_BACKGROUND_TASK_TTL || 30 * 60 * 1000);
+const MAX_WAIT_SECONDS = 600;
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -122,7 +123,7 @@ export function startBackgroundTask(
 }
 
 export async function waitForBackgroundTask(taskId: string, waitSeconds = 0): Promise<BackgroundTask | null> {
-    const deadline = Date.now() + Math.max(0, Math.min(waitSeconds, 300)) * 1000;
+    const deadline = Date.now() + Math.max(0, Math.min(waitSeconds, MAX_WAIT_SECONDS)) * 1000;
     while (Date.now() < deadline) {
         const task = tasks.get(taskId) || null;
         if (!task || task.status !== "running") return task;

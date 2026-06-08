@@ -1,17 +1,21 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-const toolkitMcpRoot = process.env.CODEX_TOOLKIT_MCP_ROOT
-  || path.resolve(__dirname, "..");
+const toolkitMcpRoot = process.env.CODEX_TOOLKIT_MCP_ROOT || path.resolve(__dirname, "..");
+const toolkitDataRoot = process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit");
+const memoryStoreRoot = process.env.MEMORY_STORE_MCP_ROOT || path.join(toolkitMcpRoot, "memory-store");
+const webFetcherRoot = process.env.WEB_FETCHER_MCP_ROOT || path.join(toolkitMcpRoot, "web-fetcher");
+const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "sandbox");
+const subagentRoot = process.env.SUBAGENT_MCP_ROOT || path.join(toolkitMcpRoot, "mcp-subagent");
 const sdkRoot = path.join(
-  toolkitMcpRoot,
-  "memory-store",
+  memoryStoreRoot,
   "node_modules",
   "@modelcontextprotocol",
   "sdk",
@@ -93,8 +97,8 @@ const endpoints = {
   "memory-store": {
     path: "/memory-store/mcp",
     command: "node",
-    args: [path.join(toolkitMcpRoot, "memory-store", "dist", "index.js")],
-    cwd: path.join(toolkitMcpRoot, "memory-store"),
+    args: [path.join(memoryStoreRoot, "dist", "index.js")],
+    cwd: memoryStoreRoot,
     env: {
       CODEX_MCP_WRAPPER: "1",
       CODEX_MCP_TOOL_NAME: "memory-store",
@@ -104,8 +108,8 @@ const endpoints = {
   "web-fetcher": {
     path: "/web-fetcher/mcp",
     command: "node",
-    args: [path.join(toolkitMcpRoot, "web-fetcher", "dist", "index.js")],
-    cwd: path.join(toolkitMcpRoot, "web-fetcher"),
+    args: [path.join(webFetcherRoot, "dist", "index.js")],
+    cwd: webFetcherRoot,
     env: {
       CODEX_MCP_WRAPPER: "1",
       CODEX_MCP_TOOL_NAME: "web-fetcher",
@@ -115,12 +119,25 @@ const endpoints = {
   sandbox: {
     path: "/sandbox/mcp",
     command: "node",
-    args: [path.join(toolkitMcpRoot, "sandbox", "dist", "index.js")],
-    cwd: path.join(toolkitMcpRoot, "sandbox"),
+    args: [path.join(sandboxRoot, "dist", "index.js")],
+    cwd: sandboxRoot,
     env: {
       CODEX_MCP_WRAPPER: "1",
       CODEX_MCP_TOOL_NAME: "sandbox",
       SANDBOX_ENABLE_DUPLICATE_RETIREMENT: "0",
+    },
+  },
+  subagent: {
+    path: "/subagent/mcp",
+    command: "node",
+    args: [path.join(subagentRoot, "src", "index.js")],
+    cwd: subagentRoot,
+    env: {
+      CODEX_MCP_WRAPPER: "1",
+      CODEX_MCP_TOOL_NAME: "subagent",
+      SUBAGENT_DATA_DIR: process.env.SUBAGENT_DATA_DIR || path.join(toolkitDataRoot, "mcp-subagent"),
+      SUBAGENT_CLEANUP_INTERVAL_SEC: "3600",
+      SUBAGENT_IDLE_TTL_SEC: "86400",
     },
   },
 };
@@ -299,6 +316,12 @@ function hasTaskId(args) {
   return typeof args.taskId === "string" && args.taskId.trim().length > 0;
 }
 
+function isConversationBatchExport(args, action) {
+  if (action !== "export") return false;
+  if (args.exportBatch === true) return true;
+  return Array.isArray(args.dataChains) || Array.isArray(args.workspaces);
+}
+
 function toolError(text) {
   return {
     isError: true,
@@ -323,7 +346,7 @@ function validateMemoryStoreToolCall(params) {
   }
 
   const requiresConversationId =
-    (toolName === "conversation_read_original" && action !== "list") ||
+    (toolName === "conversation_read_original" && action !== "list" && !isConversationBatchExport(args, action)) ||
     toolName === "conversation_golden_extract" ||
     (toolName === "record_manage" && action === "update") ||
     toolName === "stage_guard";

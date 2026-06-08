@@ -85,7 +85,7 @@ const FetchPageInputSchema = z.object({
         .number()
         .int()
         .min(0)
-        .max(300)
+        .max(600)
         .optional()
         .describe("查询后台任务时等待秒数，任务完成时提前返回"),
 });

@@ -1,10 +1,9 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import os from "node:os";
 
-const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
 const defaultBundle = path.join(
-  localAppData,
+  process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
   "Programs",
   "Devin",
   "resources",

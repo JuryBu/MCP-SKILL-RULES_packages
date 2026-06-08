@@ -1,4 +1,4 @@
-# mcp-subagent
+﻿# mcp-subagent
 
 **Windsurf 专属 · 异步子代理 MCP server**
 
@@ -8,13 +8,13 @@
 
 ## 状态
 
-✅ **Stage A~J 已完成并自测** —— 当前已支持异步子代理、自动回插、多轮 reply、当前主对话绑定、模型列表与 `model_profile`。live broker 已写入并通过 reload / 工具列表 smoke，维护仓库交接包已生成并导入本地副本，后续由维护仓库流程 commit / push。
+✅ **Stage A~K 已完成并自测** —— 当前已支持异步子代理、自动回插、多轮 reply、当前主对话绑定、模型列表与 `model_profile`、`subagent_wait` 短等待、管理工具默认摘要和 per-turn collect 去重。live broker 已写入并通过 reload / 工具列表 smoke，维护仓库交接包已生成，后续由维护仓库流程 commit / push。
 
 ## 为什么放在 `.codeium\windsurf\mcp-subagent\`
 
 - **抗 IDE 更新**：用户数据目录不被程序更新覆盖（更新只冲安装目录 `Programs\Devin\`）
 - **语义贴合**：仿照 Antigravity 的 `.gemini\antigravity\mcp-sandbox\`，这是 WSF 的对等私有位
-- **卸载风险已兜底**：正式实现会纳入 `the portable toolkit repository` 维护体系，重装后一行安装/恢复即可
+- **卸载风险已兜底**：正式实现会纳入 `JuryBu/MCP-SKILL-RULES_packages` 维护体系，重装后一行安装/恢复即可
 - **进程托管**：采纳**挂全局 broker(14588) 托管进程**（单例、防泄漏），WSF 侧只用 `serverUrl` 引用；🟡 broker 可加载性待验证，fallback 为 stdio `command` + 孤儿进程防护（详见 Plan_1 §2）
 - **隔离**：工具面板可见性靠 WSF 配置控制；真正写权限靠 registry / 谱系 / `main_id` 授权校验，不把 broker 当权限边界（详见 Plan_1 §8 安全边界）
 
@@ -49,19 +49,23 @@ mcp-subagent/
 
 ```
 主模型 --调用(WSF serverUrl ─► 14588 broker)--> mcp-subagent(broker 托管 node, 单例)
-   current / models / spawn / poll / collect / interrupt / dispose / list / reconcile / move_queued / cleanup
+   current / models / spawn / poll / wait / collect / interrupt / dispose / list / reconcile / move_queued / cleanup
         └ 内部用 LS HTTP API 操作独立 Cascade 子对话（仅限自己 spawn 的谱系）
 ```
 
 ## MCP 工具
 
-`subagent_current`(列出当前可用真实 Cascade 候选，防模型编 `main_id`) · `subagent_models`(查看当前缓存模型与语义 `model_profile` 候选) · `subagent_spawn`(派发) · `subagent_poll`(查状态) · `subagent_reply`(继续回复同一子代理，多轮追问) · `subagent_collect`(三档回插: queue/interrupt@边界/force) · `subagent_interrupt`(强插) · `subagent_list`(盘点回档) · `subagent_dispose`(显式归档/清除, 先归档再删) · `subagent_reconcile`(registry/LS 状态修复) · `subagent_move_queued`(队列顺序调整) · `subagent_cleanup`(TTL 自动归档与归档保留)
+`subagent_current`(列出当前可用真实 Cascade 候选，防模型编 `main_id`) · `subagent_models`(查看当前缓存模型与语义 `model_profile` 候选) · `subagent_spawn`(派发) · `subagent_poll`(查状态) · `subagent_wait`(短等待指定子代理完成，可选完成后 collect) · `subagent_reply`(继续回复同一子代理，多轮追问) · `subagent_collect`(三档回插: queue/interrupt@边界/force) · `subagent_interrupt`(强插) · `subagent_list`(盘点回档) · `subagent_dispose`(显式归档/清除, 先归档再删) · `subagent_reconcile`(registry/LS 状态修复) · `subagent_move_queued`(队列顺序调整) · `subagent_cleanup`(TTL 自动归档与归档保留)
 
 `job_id` 由工具生成，`sub_cid` / `queue_id` 从真实 LS 返回并登记到 registry；`subagent_reply`、`subagent_collect`、`subagent_dispose` 等后续操作默认只需要 `job_id`，不应让模型手填 `sub_cid` / `queue_id`。`subagent_spawn` 的 `main_id` 必须是真实的当前 Windsurf/Devin Cascade 对话 ID，不是随便起的 job label；若不知道当前对话 ID，先调用 `subagent_current({ limit: 10 })` 看候选，再使用 `current_best_effort.main_id` 或明确候选。传入类似 `cascade-main-test-001` 的假 ID 会被拒绝，并提示先调用 `subagent_current`。
 
-`subagent_spawn` 默认 `auto_collect=true`：子代理完成后，MCP 常驻进程会按 `collect_mode` 自动调用回插 watchdog；测试或手动编排时可传 `auto_collect:false`。回插主对话时会从主对话最新 `USER_INPUT` 反查当前 `requestedModelUid` 与 `plannerMode`，再原样构造 `cascadeConfig`，避免把主对话的 Code / Ask / Plan 模式固定切成 Ask；子代理自身模式由 `spawn.mode` / `reply.mode` 控制，默认 `code`。
+`subagent_spawn` 默认 `auto_collect=true`：子代理完成后，MCP 常驻进程会按 `collect_mode` 自动调用回插 watchdog；测试或手动编排时可传 `auto_collect:false`。回插按 `job_id + turn` 单飞，collecting/collected/已有同轮 queue 都不会再次 `QueueCascadeMessage`；`interrupt` 失败默认清掉队列并标 `collect_failed`，只有显式 `fallback_to_queue:true` 才退化保留 queue。回插主对话时会从主对话最新 `USER_INPUT` 反查当前 `requestedModelUid` 与 `plannerMode`，再原样构造 `cascadeConfig`，避免把主对话的 Code / Ask / Plan 模式固定切成 Ask；子代理自身模式由 `spawn.mode` / `reply.mode` 控制，默认 `code`。
 
-`model` 是精确 WSF 模型 UID，`model_profile` 是语义档位：`cowork` / `explore` / `frontend` / `review` / `unblock`，并兼容 `fronted` / `brainstorm` 别名。`subagent_models({ purpose:"explore" })` 会读取 IDE 当前缓存的 Cascade 模型列表并归一化展示；这不是服务端实时全集，所以返回里会标 `source` 与 `updated_at`。普通 `spawn/reply` 只返回模型解析摘要；只有调用 `subagent_models`、模型不可用或发生 fallback 时才展示候选说明，不在 README 固化长模型清单。
+`subagent_wait({ job_id, wait_ms?, collect? })` 用于主对话短阻塞等待子代理反馈：默认最多等 30 秒，上限 45 秒，超时返回 `still_running:true`，避免撞上 broker / MCP 客户端传输超时；`collect:true` 只在子代理 done 后调用一次幂等 `subagent_collect`，不会绕过 auto-collect 单飞锁。
+
+`model` 是精确 WSF 模型 UID，`model_profile` 是语义档位：`cowork` / `explore` / `frontend` / `review` / `unblock`，并兼容 `fronted` / `brainstorm` 别名。`subagent_models()` 默认是摘要视图，只返回 profile 摘要、来源计数和少量候选；`subagent_models({ purpose:"explore", detail:"detail" })` 展开指定用途候选；只有 `detail:"full"` 或 `include_available:true` 才返回全量缓存模型清单。当前来源是 IDE 缓存的 Cascade 模型列表，不是服务端实时全集，所以返回里会标 `source` 与 `updated_at`。普通 `spawn/reply` 只返回模型解析摘要；只有调用 `subagent_models`、模型不可用或发生 fallback 时才展示候选说明，不在 README 固化长模型清单。
+
+`subagent_list()` 默认隐藏 `deleted/archived` 历史，`filter:"all"` 也优先保持可读；需要翻旧账时传 `include_deleted:true`、`include_archived:true` 或 `detail:"full"`。
 
 ## 清理策略
 
@@ -78,10 +82,12 @@ npm install
 npm run build
 npm run smoke:mcp-tools
 npm run smoke:models
+npm run smoke:list-defaults
 npm run smoke:model-fallback
 npm run smoke:model-profile -- <main_id>
 npm run smoke:current-binding -- <main_id>
 npm run smoke:auto-collect -- <main_id>
+npm run smoke:collect-dedupe -- <main_id>
 npm run smoke:stage-f
 npm run smoke:stage-g -- <main_id>
 npm run smoke:stage-g-tool -- <main_id>
@@ -96,7 +102,7 @@ npm run package:handoff
 Compress-Archive -Path 'dist/mcp-subagent-handoff\*' -DestinationPath 'dist/mcp-subagent-handoff.zip' -Force
 ```
 
-当前建议导入目标：本仓库的 `mcps/mcp-subagent`。交付包 manifest 位于 `dist/mcp-subagent-handoff/manifest.json`；公开包中不会包含 `dist/` 和运行态数据。
+当前建议导入目标：`JuryBu/MCP-SKILL-RULES_packages` 仓库的 `packages/mcp-subagent`。交付包 manifest 位于 `dist/mcp-subagent-handoff/manifest.json`。
 
 ## 配置接入
 
@@ -150,6 +156,10 @@ npm run smoke:stage-g -- <main_id>
 
 `smoke:auto-collect` 会验证默认 `auto_collect=true`：脚本只 `spawn`，不手动调用 `subagent_collect`，等待 MCP watcher 在子代理 done 后自动把结果插回临时主对话。
 
+`smoke:list-defaults` 会用临时 registry 验证 `subagent_list` 默认不把 deleted/archived 历史刷出来，显式 `detail:"full"` 才展开；`smoke:models` 会验证 `subagent_models()` 默认不会返回全量模型清单。
+
+`smoke:collect-dedupe` 会对同一 job/turn 并发调用三次 `subagent_collect({ mode:"queue" })`，验证只产生一个 `queue_id` 和一条 `queue_history`，用于防 auto-collect/watchdog 重复补队列。
+
 `smoke:stage-h` 会验证 `subagent_reply` 多轮追问：脚本会创建临时 running main，第一轮用 `interrupt` 的 active-step watchdog 等主输出 step 完成后回插，再继续回复同一个 `sub_cid`，第二轮再次回插并使用新的 `turn=2` 幂等记录，不被第一轮 `collect_result` 阻挡。Stage H 不接受单纯 `queue` 作为最终回插证据。
 
 `smoke:stage-h-tool` 会验证多轮工具 step 场景：临时主对话真实进入 `CORTEX_STEP_TYPE_RUN_COMMAND` 后，watchdog 锚定该工具 step，等待工具 step 完成后再回插子代理结果，证明 collect 不需要等整条主消息结束，也不会截断正在运行的工具 step。
@@ -158,4 +168,4 @@ npm run smoke:stage-g -- <main_id>
 
 所有底层机制（StartCascade / SendUserCascadeMessage / QueueCascadeMessage /
 InterruptWithQueuedMessage / step 状态检测 / 三档回收）均已在
-`local WSF exploration notes/` 下逐 stage 实测，结论见该目录 `02_模型调用探索.md` §7。
+历史探索目录下逐 stage 实测，结论已整理为本 README 的功能边界说明。

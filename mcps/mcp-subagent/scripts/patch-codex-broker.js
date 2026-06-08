@@ -1,12 +1,14 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
+import os from "node:os";
 import { defaults, parseArgs, pathExists, timestamp } from "./config-utils.js";
 
-const brokerPath = process.env.CODEX_MCP_BROKER_SCRIPT || path.join(os.homedir(), ".codex", "mcp-http-broker", "broker.mjs");
+const brokerPath =
+  process.env.CODEX_MCP_BROKER_SCRIPT ||
+  path.join(os.homedir(), ".codex", "mcp-http-broker", "broker.mjs");
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const serverEntry = path.join(projectRoot, "src", "index.js");
-const dataDir = path.join(projectRoot, "subagent-data");
+const dataDir = process.env.SUBAGENT_DATA_DIR || path.join(projectRoot, "subagent-data");
 
 function usage() {
   return [
@@ -18,11 +20,10 @@ function usage() {
 }
 
 function endpointSnippet() {
-  const nodeCommand = process.execPath;
   return [
     "  subagent: {",
     "    path: \"/subagent/mcp\",",
-    `    command: ${JSON.stringify(nodeCommand)},`,
+    "    command: \"node\",",
     `    args: [${JSON.stringify(serverEntry)}],`,
     `    cwd: ${JSON.stringify(projectRoot)},`,
     "    env: {",

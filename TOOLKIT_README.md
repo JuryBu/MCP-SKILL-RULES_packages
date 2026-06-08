@@ -16,7 +16,7 @@ This snapshot includes `skills/`: allow-listed portable user-side Codex skills c
 
 ## 当前 MCP 版本
 
-- `memory-store`：`1.15.4`
+- `memory-store`：`1.15.5`
 - `web-fetcher`：`7.0.0`
 - `sandbox`：`1.13.3`
 - `broker`：`0.1.0`
@@ -80,7 +80,7 @@ Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.
 
 ## 2026-6-9 refresh
 
-This snapshot adds the Windsurf-only `mcp-subagent` source package, refreshes the Windsurf Rules template with subagent workflow guidance, keeps memory-store at 1.15.4, sandbox at 1.13.3, and web-fetcher at 7.0.0.
+This snapshot adds the Windsurf-only `mcp-subagent` source package, refreshes the Windsurf Rules template with subagent workflow guidance, keeps memory-store at 1.15.5, sandbox at 1.13.3, and web-fetcher at 7.0.0.
 
 ## Windsurf / WSF refresh
 

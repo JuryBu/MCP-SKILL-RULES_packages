@@ -41,6 +41,13 @@ import { buildRecordReaderIndex } from "../record-reader.js";
 import { formatAttachmentOverview, materializeRoundAttachments } from "../conversation-attachments.js";
 import { cancelBackgroundTask, formatBackgroundTask, startBackgroundTask, waitForBackgroundTask } from "../background-tasks.js";
 import { exportConversation, formatConversationExportResult } from "../conversation-exporter.js";
+import {
+    listConversationCandidates,
+    formatSourceStatuses,
+    type SourceFailureMode,
+    type IdResolutionMode,
+} from "../conversation-filter.js";
+import { exportConversationBatch, formatConversationBatchExportResult } from "../conversation-batch-export.js";
 
 const CONVERSATION_FETCH_TEXT_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_FETCH_TEXT_MAX_CHARS || 2_000_000);
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS || 2_000_000);
@@ -571,6 +578,30 @@ export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCod
     return lines.join("\n");
 }
 
+function selectBalancedBatchCandidates<T extends { dataChain: string }>(candidates: T[], max: number, balanced: boolean): T[] {
+    if (!balanced) return candidates.slice(0, max);
+    const groups = new Map<string, T[]>();
+    for (const candidate of candidates) {
+        if (!groups.has(candidate.dataChain)) groups.set(candidate.dataChain, []);
+        groups.get(candidate.dataChain)?.push(candidate);
+    }
+    const selected: T[] = [];
+    const keys = [...groups.keys()];
+    while (selected.length < max && keys.length > 0) {
+        let progressed = false;
+        for (const key of keys) {
+            const item = groups.get(key)?.shift();
+            if (item) {
+                selected.push(item);
+                progressed = true;
+                if (selected.length >= max) break;
+            }
+        }
+        if (!progressed) break;
+    }
+    return selected;
+}
+
 /**
  * conversation_read_original — 读取对话原文
  *
@@ -649,6 +680,22 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("读取对话数据的宿主链路；未填用 chain。支持 antigravity/codex/claude-code/windsurf"),
+            dataChains: z.array(z.enum(DATA_CHAIN_INPUT_VALUES)).optional()
+                .describe("list/export 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\"]。未传时保持旧单 dataChain 行为"),
+            workspaces: z.array(z.string()).optional()
+                .describe("list/export 批量模式：按工作区路径过滤，可传一个或多个目录"),
+            workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
+                .describe("工作区过滤：contains=父子目录任意包含，exact=精确路径，under=候选在指定目录下，any/all=多工作区聚合；默认 contains"),
+            exportBatch: z.boolean().optional()
+                .describe("export 模式：true=按 dataChains/workspaces/query 过滤后批量导出多条对话，每条对话独立目录"),
+            batchLimit: z.number().optional()
+                .describe("exportBatch 模式：最多导出多少条候选，默认沿用 limit"),
+            batchConcurrency: z.number().optional()
+                .describe("exportBatch 模式：并发导出数，默认 2，最多 4"),
+            sourceFailureMode: z.enum(["warn", "fail"]).optional()
+                .describe("多源查询/导出：warn=单源失败只警告并继续，fail=任一源失败即整体失败；默认 warn"),
+            idResolutionMode: z.enum(["unique", "priority"]).optional()
+                .describe("dataChain=auto 且传 conversationId 时：unique=并行全源唯一匹配，priority=保留旧优先级顺序；默认 unique"),
             modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain。Windsurf 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
@@ -686,13 +733,22 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     conversationIds,
                     chain = DEFAULT_CHAIN,
                     dataChain,
+                    dataChains,
+                    workspaces,
+                    workspaceMode = "contains",
+                    exportBatch,
+                    batchLimit,
+                    batchConcurrency,
+                    sourceFailureMode = "warn",
+                    idResolutionMode = "unique",
                     modelChain,
                     link = DEFAULT_LINK_MODE,
                 } = params;
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
                 const effectiveCompactionMode: CompactionMode = compactionMode || (depth === "full" ? "full" : "folded");
+                const isBatchConversationExport = action === "export" && !conversationId?.trim() && Boolean(exportBatch || dataChains?.length || workspaces?.length);
 
-                if (shouldRequireExplicitConversationId(action, chains.dataChain, conversationId)) {
+                if (!isBatchConversationExport && shouldRequireExplicitConversationId(action, chains.dataChain, conversationId)) {
                     return appendTiming({
                         content: [{ type: "text" as const, text: formatMissingConversationIdMessage(action, chains.dataChain) }],
                     }, startTime);
@@ -792,6 +848,50 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 }
 
                 if (action === "list") {
+                    if (dataChains?.length || workspaces?.length) {
+                        const result = await listConversationCandidates({
+                            dataChains: dataChains?.length ? dataChains : [chains.dataChain],
+                            query,
+                            workspaces,
+                            workspaceMode,
+                            limit,
+                            sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                        });
+                        const failedSources = result.statuses.filter(item => item.status === "failed");
+                        if (sourceFailureMode === "fail" && failedSources.length > 0) {
+                            return appendTiming({
+                                content: [{
+                                    type: "text" as const,
+                                    text: [
+                                        "❌ 多源候选查询严格失败",
+                                        "sourceFailureMode=fail 要求任一数据源失败时停止使用候选结果；已保留诊断如下。",
+                                        "",
+                                        "🔗 数据源状态:",
+                                        ...formatSourceStatuses(result.statuses),
+                                    ].join("\n"),
+                                }],
+                            }, startTime);
+                        }
+                        const lines = [
+                            "🔎 多源候选查询",
+                            `候选对话: ${result.candidates.length}${query ? ` | 关键词: ${query}` : ""}`,
+                            workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode})` : "",
+                            "",
+                            "🔗 数据源状态:",
+                            ...formatSourceStatuses(result.statuses),
+                            "",
+                            ...result.candidates.map((item, idx) => {
+                                const title = item.title || "(无标题)";
+                                const workspaceLine = item.workspace ? `\n   工作区: ${item.workspace}` : "";
+                                const detail = item.detail ? ` | ${item.detail}` : "";
+                                return `${idx + 1}. [${item.dataChain}] ${title}\n   ID: ${item.id}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${workspaceLine}`;
+                            }),
+                        ].filter(Boolean);
+                        return appendTiming({
+                            content: [{ type: "text" as const, text: lines.join("\n") }],
+                        }, startTime);
+                    }
+
                     const resolved = await resolveConversationChain(chains.dataChain);
                     if (!resolved) {
                         return appendTiming({
@@ -993,9 +1093,98 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     }, startTime);
                 }
 
+                if (action === "export" && isBatchConversationExport) {
+                    const requestedBatchLimit = batchLimit || limit;
+                    const balancedBatch = Boolean(dataChains && dataChains.length > 1);
+                    const batchSources = dataChains?.length ? dataChains : [chains.dataChain];
+                    const listResult = balancedBatch
+                        ? {
+                            candidates: [],
+                            statuses: [],
+                        } as Awaited<ReturnType<typeof listConversationCandidates>>
+                        : await listConversationCandidates({
+                            dataChains: batchSources,
+                            query,
+                            workspaces,
+                            workspaceMode,
+                            limit: requestedBatchLimit,
+                            sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                        });
+                    if (balancedBatch) {
+                        const perSourceResults = await Promise.all(batchSources.map(source => listConversationCandidates({
+                            dataChains: [source],
+                            query,
+                            workspaces,
+                            workspaceMode,
+                            limit: requestedBatchLimit,
+                            sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                        })));
+                        listResult.candidates = perSourceResults.flatMap(result => result.candidates);
+                        listResult.statuses = perSourceResults.flatMap(result => result.statuses);
+                    }
+                    const failedSources = listResult.statuses.filter(item => item.status === "failed");
+                    if (sourceFailureMode === "fail" && failedSources.length > 0) {
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: [
+                                    "❌ 批量导出严格失败",
+                                    "sourceFailureMode=fail 要求任一数据源失败时不继续导出；已保留诊断如下。",
+                                    "",
+                                    "🔗 数据源状态:",
+                                    ...formatSourceStatuses(listResult.statuses),
+                                ].join("\n"),
+                            }],
+                        }, startTime);
+                    }
+                    if (listResult.candidates.length === 0) {
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: [
+                                    "❌ 批量导出未找到候选对话",
+                                    query ? `关键词: ${query}` : "",
+                                    workspaces?.length ? `工作区: ${workspaces.join(" | ")}` : "",
+                                    "",
+                                    "🔗 数据源状态:",
+                                    ...formatSourceStatuses(listResult.statuses),
+                                ].filter(Boolean).join("\n"),
+                            }],
+                        }, startTime);
+                    }
+                    const result = await exportConversationBatch({
+                        candidates: selectBalancedBatchCandidates(listResult.candidates, requestedBatchLimit, balancedBatch),
+                        batchLimit: requestedBatchLimit,
+                        batchConcurrency,
+                        sourceStatuses: listResult.statuses,
+                        link,
+                        scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
+                        query,
+                        startRound,
+                        endRound,
+                        contextRounds,
+                        limit,
+                        mode: mode as SearchMode,
+                        depth: depth as Depth,
+                        extraTypes: extraTypes as ExtraType[],
+                        compactionMode: effectiveCompactionMode,
+                        outputDir,
+                        overwrite,
+                        format: exportFormat || "markdown",
+                        includeAssets,
+                        pdfEmbedAttachments: pdfEmbedAttachments || "auto",
+                    });
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: formatConversationBatchExportResult(result) }],
+                    }, startTime);
+                }
+
                 const loaded = await loadConversationData(chains.dataChain, conversationId, {
                     refresh: action === "fetch",
                     link,
+                    dataChains: dataChains as DataChain[] | undefined,
+                    idResolutionMode: idResolutionMode as IdResolutionMode,
+                    sourceFailureMode: sourceFailureMode as SourceFailureMode,
                 });
                 if (!loaded) {
                     return appendTiming({

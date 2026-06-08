@@ -269,8 +269,19 @@ export function terminateOwnedChrome(chrome: ChromeLaunchResult): void {
  */
 export function waitForChromeClose(chromeProcess: ChildProcess): Promise<void> {
     return new Promise<void>((resolve) => {
-        chromeProcess.on("close", () => resolve());
-        chromeProcess.on("error", () => resolve());
+        if (chromeProcess.exitCode !== null || chromeProcess.signalCode !== null) {
+            resolve();
+            return;
+        }
+        let settled = false;
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            resolve();
+        };
+        chromeProcess.once("close", finish);
+        chromeProcess.once("exit", finish);
+        chromeProcess.once("error", finish);
     });
 }
 
@@ -314,4 +325,135 @@ export function loadLocalStorageBackup(domain: string): Record<string, string> |
     } catch {
         return null;
     }
+}
+
+export interface BrowserStorageSnapshotResult {
+    reason: string;
+    cookieCount: number;
+    mergedCookieCount?: number;
+    localStorageDomains: Array<{ domain: string; keyCount: number }>;
+    errors: string[];
+    cookies: any[];
+}
+
+export interface BrowserStorageSnapshotOptions {
+    reason?: string;
+    saveCookies?: boolean;
+    saveLocalStorage?: boolean;
+    cookieTimeoutMs?: number;
+    localStorageTimeoutMs?: number;
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`${label} timeout`)), timeoutMs);
+        promise
+            .then(value => {
+                clearTimeout(timer);
+                resolve(value);
+            })
+            .catch(error => {
+                clearTimeout(timer);
+                reject(error);
+            });
+    });
+}
+
+function safePageUrl(page: any): string {
+    try {
+        return typeof page?.url === "function" ? page.url() : "";
+    } catch {
+        return "";
+    }
+}
+
+function isUsableLocalStorageUrl(url: string): boolean {
+    if (!url || url === "about:blank") return false;
+    try {
+        const parsed = new URL(url);
+        return parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "file:";
+    } catch {
+        return false;
+    }
+}
+
+function localStorageDomainForUrl(url: string): string {
+    const parsed = new URL(url);
+    return parsed.protocol === "file:" ? "file" : parsed.hostname;
+}
+
+/**
+ * 从 CDP/Playwright BrowserContext 周期性快照 Cookie 与 localStorage，并立即写入共享备份。
+ *
+ * 这用于有头登录、UAV、人机验证和 Human Browser live session，避免用户主动关闭或超时关闭
+ * 之后再导出时 CDP 页面已经不可用，造成同一登录态下 Cookie/localStorage 导出结果不一致。
+ */
+export async function snapshotBrowserStorage(context: any, options?: BrowserStorageSnapshotOptions): Promise<BrowserStorageSnapshotResult> {
+    const reason = options?.reason ?? "manual";
+    const saveCookies = options?.saveCookies !== false;
+    const saveLocalStorage = options?.saveLocalStorage !== false;
+    const cookieTimeoutMs = options?.cookieTimeoutMs ?? 5000;
+    const localStorageTimeoutMs = options?.localStorageTimeoutMs ?? 5000;
+    const result: BrowserStorageSnapshotResult = {
+        reason,
+        cookieCount: 0,
+        localStorageDomains: [],
+        errors: [],
+        cookies: [],
+    };
+
+    if (saveCookies) {
+        try {
+            const cookies = await withTimeout(context.cookies(), cookieTimeoutMs, "cookie snapshot");
+            result.cookies = Array.isArray(cookies) ? cookies : [];
+            result.cookieCount = result.cookies.length;
+            if (result.cookies.length > 0) {
+                result.mergedCookieCount = saveCookiesToBackup(result.cookies);
+            }
+        } catch (error) {
+            result.errors.push(`cookies: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    if (saveLocalStorage) {
+        let pages: any[] = [];
+        try {
+            pages = typeof context.pages === "function" ? context.pages() : [];
+        } catch (error) {
+            result.errors.push(`pages: ${error instanceof Error ? error.message : String(error)}`);
+        }
+
+        for (const page of pages) {
+            try {
+                if (typeof page?.isClosed === "function" && page.isClosed()) continue;
+                const url = safePageUrl(page);
+                if (!isUsableLocalStorageUrl(url)) continue;
+                const domain = localStorageDomainForUrl(url);
+                const lsData = await withTimeout<Record<string, string>>(page.evaluate(() => {
+                    const data: Record<string, string> = {};
+                    for (let i = 0; i < localStorage.length; i++) {
+                        const key = localStorage.key(i);
+                        if (key) data[key] = localStorage.getItem(key) || "";
+                    }
+                    return data;
+                }), localStorageTimeoutMs, "localStorage snapshot");
+                const keyCount = Object.keys(lsData || {}).length;
+                if (keyCount > 0) {
+                    saveLocalStorageToBackup(domain, lsData);
+                    result.localStorageDomains.push({ domain, keyCount });
+                }
+            } catch (error) {
+                const url = safePageUrl(page);
+                result.errors.push(`localStorage${url ? `(${url})` : ""}: ${error instanceof Error ? error.message : String(error)}`);
+            }
+        }
+    }
+
+    console.error(
+        `[web-fetcher] 存储快照(${reason}): Cookie ${result.cookieCount}`
+        + (result.mergedCookieCount !== undefined ? ` -> 总 ${result.mergedCookieCount}` : "")
+        + `, localStorage ${result.localStorageDomains.length} 个域名`
+        + (result.errors.length ? `, errors=${result.errors.length}` : "")
+    );
+    return result;
 }

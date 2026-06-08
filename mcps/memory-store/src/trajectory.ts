@@ -216,6 +216,18 @@ export function parseRounds(steps: any[]): ConversationRound[] {
 
 // ===== 格式化输出 =====
 
+function escapeMarkdownLabel(input: string): string {
+    return input.replace(/[\[\]\r\n]/gu, " ").trim() || "attachment";
+}
+
+function formatMarkdownUrl(input: string): string {
+    const normalized = input.replace(/\\/gu, "/");
+    if (/[\s()<>]/u.test(normalized)) {
+        return `<${normalized.replace(/>/gu, "%3E")}>`;
+    }
+    return normalized;
+}
+
 /**
  * 格式化单个轮次为 markdown
  */
@@ -223,7 +235,7 @@ export function formatRound(
     round: ConversationRound,
     depth: Depth,
     extraTypes: ExtraType[] = [],
-    options: { compactionMode?: CompactionMode } = {},
+    options: { compactionMode?: CompactionMode; attachmentMode?: "text" | "markdown" } = {},
 ): string {
     const lines: string[] = [];
     const stepsRange = `steps ${round.startStep}-${round.endStep}`;
@@ -241,14 +253,20 @@ export function formatRound(
     }
     // 用户附件图片
     if (round.mediaAttachments.length > 0) {
-        for (const uri of round.mediaAttachments) {
-            lines.push(`📎 图片: ${uri}`);
+        for (const [index, uri] of round.mediaAttachments.entries()) {
+            if (options.attachmentMode === "markdown") {
+                const label = `round-${round.roundIndex}-media-${index + 1}`;
+                lines.push(`📎 图片 ${label}: ![${escapeMarkdownLabel(label)}](${formatMarkdownUrl(uri)})`);
+            } else {
+                lines.push(`📎 图片: ${uri}`);
+            }
         }
     }
     if (round.attachments?.length) {
         for (const attachment of round.attachments) {
             const label = attachment.kind === "image" ? "图片" : "文件";
             const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
+            const displayName = attachment.name || target.split(/[\\/]/u).pop() || `${label}-${round.roundIndex}`;
             const notes: string[] = [];
             if (attachment.source === "codex-data-url" && attachment.tempPath) {
                 notes.push("Codex JSONL 内联图片，按需生成");
@@ -269,7 +287,14 @@ export function formatRound(
             if (attachment.warning) {
                 notes.push(attachment.warning);
             }
-            lines.push(`📎 ${label}: ${target}${notes.length ? `（${notes.join("；")}）` : ""}`);
+            if (options.attachmentMode === "markdown") {
+                const link = attachment.kind === "image"
+                    ? `![${escapeMarkdownLabel(displayName)}](${formatMarkdownUrl(target)})`
+                    : `[${escapeMarkdownLabel(displayName)}](${formatMarkdownUrl(target)})`;
+                lines.push(`📎 ${label} ${displayName}: ${link}${notes.length ? `（${notes.join("；")}）` : ""}`);
+            } else {
+                lines.push(`📎 ${label}: ${target}${notes.length ? `（${notes.join("；")}）` : ""}`);
+            }
         }
     }
     lines.push("");

@@ -5,7 +5,7 @@ import iconv from "iconv-lite";
 import {
     launchSystemChrome, connectCDP,
     saveCookiesToBackup, cleanupTempProfile, waitForChromeClose,
-    terminateOwnedChrome,
+    terminateOwnedChrome, snapshotBrowserStorage,
 } from "./chrome-helper.js";
 import { getStealthScript, type StealthLevel } from "./stealth.js";
 import {
@@ -1518,8 +1518,8 @@ class BrowserManager {
 
     // ========== UAV: 用户辅助验证 (v6.0) ==========
 
-    /** UAV 超时时间（毫秒）— 240 秒 */
-    private static UAV_TIMEOUT = 240_000;
+    /** UAV 超时时间（毫秒）— 600 秒 */
+    private static UAV_TIMEOUT = 600_000;
 
     /**
      * 用户辅助验证（User-Assisted Verification）
@@ -1611,12 +1611,13 @@ class BrowserManager {
                             }
                         }
 
-                        // 定期快照 Cookie（每 5 秒）
+                        // 定期快照 Cookie + localStorage（每 2 秒立即落盘）
                         const interval = setInterval(async () => {
                             try {
-                                verifiedCookies = await ctx.cookies();
+                                const snapshot = await snapshotBrowserStorage(ctx, { reason: "uav-periodic" });
+                                verifiedCookies = snapshot.cookies;
                             } catch { /* Chrome 可能已关闭 */ }
-                        }, 5000);
+                        }, 2000);
 
                         // 5. 等待用户关闭浏览器 OR 超时
                         const closePromise = waitForChromeClose(chromeProcess);
@@ -1628,18 +1629,23 @@ class BrowserManager {
                         clearInterval(interval);
 
                         if (result === 'timeout') {
-                            console.error('[web-fetcher] \u{1F510} UAV 超时（240s），强制关闭 Chrome');
+                            console.error('[web-fetcher] \u{1F510} UAV 超时（600s），关闭 Chrome 前先导出最近 Cookie/localStorage');
+                            try {
+                                const timeoutSnapshot = await snapshotBrowserStorage(ctx, { reason: "uav-timeout-before-close" });
+                                if (timeoutSnapshot.cookies.length > 0) verifiedCookies = timeoutSnapshot.cookies;
+                            } catch { /* Chrome 可能已关闭 */ }
                             terminateOwnedChrome(chromeResult);
                             await waitForChromeClose(chromeProcess);
                         }
 
-                        // 最后一次导出（加超时保护）
+                        // 最后一次导出（加超时保护）；主动关闭后可能失败，周期快照已提前落盘
                         try {
-                            const cookiePromise = ctx.cookies();
-                            const cookieTimeout = new Promise<any[]>((_, reject) =>
-                                setTimeout(() => reject(new Error('cookie export timeout')), 5000)
-                            );
-                            verifiedCookies = await Promise.race([cookiePromise, cookieTimeout]);
+                            const finalSnapshot = await snapshotBrowserStorage(ctx, {
+                                reason: "uav-final",
+                                cookieTimeoutMs: 5000,
+                                localStorageTimeoutMs: 5000,
+                            });
+                            if (finalSnapshot.cookies.length > 0) verifiedCookies = finalSnapshot.cookies;
                         } catch { /* Chrome 已关闭或超时 */ }
                     }
                 } catch (cdpErr) {

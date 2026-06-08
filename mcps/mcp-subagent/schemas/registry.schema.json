@@ -56,10 +56,13 @@
         "main_id": { "type": "string", "minLength": 1 },
         "state": {
           "type": "string",
-          "enum": ["queued", "removed", "consumed", "unknown", "remove_failed"]
+          "enum": ["queued", "removed", "removed_after_collected", "consumed", "unknown", "remove_failed"]
         },
         "created_at": { "type": "string", "format": "date-time" },
         "updated_at": { "type": "string", "format": "date-time" },
+        "turn": { "type": "integer", "minimum": 1 },
+        "collect_nonce": { "type": ["string", "null"] },
+        "attempt": { "type": "integer", "minimum": 1 },
         "remove_attempts": { "type": "integer", "minimum": 0 },
         "last_error": { "type": "string" }
       }
@@ -132,6 +135,9 @@
         "max_concurrent": { "type": "integer", "minimum": 1 },
         "collect_nonce": { "type": "string" },
         "turn": { "type": "integer", "minimum": 1 },
+        "collecting_turn": { "type": "integer", "minimum": 1 },
+        "collecting_started_at": { "type": "string", "format": "date-time" },
+        "collect_attempts": { "type": "integer", "minimum": 0 },
         "last_reply_at": { "type": "string", "format": "date-time" },
         "replies": {
           "type": "array",
@@ -164,6 +170,10 @@
           }
         },
         "queue": { "$ref": "#/$defs/queueRecord" },
+        "queue_history": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/queueRecord" }
+        },
         "created_at": { "type": "string", "format": "date-time" },
         "updated_at": { "type": "string", "format": "date-time" },
         "deadline_at": { "type": "string", "format": "date-time" },

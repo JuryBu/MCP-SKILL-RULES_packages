@@ -40,6 +40,8 @@ const MODE_MAP = {
 };
 
 const autoCollectTimers = new Map();
+const autoCollectRuns = new Set();
+const collectRuns = new Set();
 
 function nowIso() {
   return new Date().toISOString();
@@ -258,19 +260,50 @@ export async function subagentCurrent(args = {}) {
 }
 
 export async function subagentModels(args = {}) {
+  const detail = args.detail || "summary";
+  const includeAvailable = Boolean(args.include_available) || detail === "full";
+  const candidateLimit = Number(args.candidate_limit ?? (args.purpose ? 6 : 3));
   const models = await getModelProfiles({
     purpose: args.purpose,
     refresh: Boolean(args.refresh),
     include_unverified: Boolean(args.include_unverified),
   });
+  const profiles = Object.fromEntries(Object.entries(models.profiles || {}).map(([name, profile]) => {
+    const candidates = profile.candidates || [];
+    if (detail === "full" || detail === "detail" || args.purpose) {
+      return [name, {
+        ...profile,
+        candidates: candidates.slice(0, Number.isFinite(candidateLimit) && candidateLimit > 0 ? candidateLimit : candidates.length),
+        candidate_count: candidates.length,
+      }];
+    }
+    return [name, {
+      name: profile.name,
+      description: profile.description,
+      aliases: profile.aliases || [],
+      first_available: profile.first_available,
+      candidate_count: candidates.length,
+      sample_candidates: candidates.slice(0, Number.isFinite(candidateLimit) && candidateLimit > 0 ? candidateLimit : 3).map((candidate) => ({
+        uid: candidate.uid,
+        label: candidate.label,
+        source: candidate.source,
+        available: candidate.available !== false,
+        note: candidate.profile_note || candidate.note || null,
+      })),
+    }];
+  }));
   return textResult({
     ok: true,
+    detail,
     updated_at: models.updated_at,
     sources: models.sources,
-    profiles: models.profiles,
-    available: models.available,
+    profiles,
+    available_count: models.available.length,
+    ...(includeAvailable ? { available: models.available } : {}),
     fallback_policy: models.fallback_policy,
-    note: "cached source is the IDE's current cached Cascade model list, not a guaranteed server realtime full list.",
+    note: includeAvailable
+      ? "cached source is the IDE's current cached Cascade model list, not a guaranteed server realtime full list."
+      : "summary view omits the full model list; pass detail:'full' or include_available:true to inspect all available models.",
   });
 }
 
@@ -460,6 +493,43 @@ export async function subagentPoll(args) {
   });
 }
 
+export async function subagentWait(args) {
+  const job = await getJob(args.job_id);
+  if (!job) return failResult(`Unknown job_id=${args.job_id}`);
+  const maxWaitMs = 45000;
+  const waitMs = Math.max(0, Math.min(Number(args.wait_ms ?? 30000), maxWaitMs));
+  const pollMs = Math.max(500, Math.min(Number(args.poll_ms ?? 2500), 10000));
+  const deadline = Date.now() + waitMs;
+  let latest = null;
+  do {
+    latest = parseTextResult(await subagentPoll({ job_id: job.job_id }));
+    if (latest.done || ["done", "collected", "collect_failed", "timeout", "archived", "deleted"].includes(latest.state)) {
+      if (args.collect === true && latest.done) {
+        const collect = parseTextResult(await subagentCollect({
+          job_id: job.job_id,
+          mode: args.collect_mode || job.collect_mode || "interrupt",
+          timeout_ms: Math.min(Number(args.collect_timeout_ms || 45000), maxWaitMs),
+          confirm_timeout_ms: Math.min(Number(args.confirm_timeout_ms || 30000), maxWaitMs),
+          fallback_to_queue: args.fallback_to_queue === true,
+        }));
+        return textResult({ ok: true, done: true, collected: collect.ok === true, collect, poll: latest });
+      }
+      return textResult({ ok: true, done: Boolean(latest.done), poll: latest });
+    }
+    if (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(pollMs, Math.max(0, deadline - Date.now()))));
+    }
+  } while (Date.now() < deadline);
+  return textResult({
+    ok: true,
+    done: false,
+    still_running: true,
+    wait_ms: waitMs,
+    poll: latest,
+    note: "subagent_wait uses short waits to avoid broker/MCP transport timeout; call again to continue waiting.",
+  });
+}
+
 export async function subagentReply(args) {
   const job = await getJob(args.job_id);
   if (!job) return failResult(`Unknown job_id=${args.job_id}`);
@@ -555,20 +625,45 @@ export async function subagentReply(args) {
 }
 
 export async function subagentList(args = {}) {
-  const jobs = await listJobs(args.filter || "active");
+  const rawJobs = await listJobs(args.filter || "active");
+  const includeDeleted = Boolean(args.include_deleted || args.detail === "full");
+  const includeArchived = Boolean(args.include_archived || args.detail === "full");
+  const limit = Number(args.limit ?? 50);
+  const jobs = rawJobs
+    .filter((job) => includeDeleted || job.state !== "deleted")
+    .filter((job) => includeArchived || job.state !== "archived")
+    .sort((left, right) => Date.parse(right.updated_at || right.created_at || 0) - Date.parse(left.updated_at || left.created_at || 0));
+  const visibleJobs = Number.isFinite(limit) && limit > 0 ? jobs.slice(0, limit) : jobs;
+  const counts = rawJobs.reduce((acc, job) => {
+    acc[job.state] = (acc[job.state] || 0) + 1;
+    return acc;
+  }, {});
   return textResult({
     ok: true,
-    jobs: jobs.map((job) => ({
+    filter: args.filter || "active",
+    count: visibleJobs.length,
+    total_matching_before_visibility_filter: rawJobs.length,
+    hidden: {
+      deleted: includeDeleted ? 0 : rawJobs.filter((job) => job.state === "deleted").length,
+      archived: includeArchived ? 0 : rawJobs.filter((job) => job.state === "archived").length,
+    },
+    counts_by_state: counts,
+    jobs: visibleJobs.map((job) => ({
       job_id: job.job_id,
       sub_cid: job.sub_cid,
       main_id: job.main_id,
       label: job.label,
       state: job.state,
+      turn: jobTurn(job),
       depth: job.depth,
       parent_job_id: job.parent_job_id,
       created_at: job.created_at,
+      updated_at: job.updated_at,
       title_best_effort: job.title_best_effort,
     })),
+    note: includeDeleted || includeArchived
+      ? "full visibility requested"
+      : "deleted/archived jobs are hidden by default; pass include_deleted/include_archived or detail:'full' for history.",
   });
 }
 
@@ -847,13 +942,36 @@ function parseTextResult(result) {
 }
 
 function isCollectTerminal(job) {
-  return !job || ["collected", "archived", "deleted", "missing", "stale_queue"].includes(job.state) || Boolean(collectResultForTurn(job));
+  return !job || ["collected", "archived", "deleted", "missing", "stale_queue", "collect_failed", "timeout"].includes(job.state) || Boolean(collectResultForTurn(job));
+}
+
+function collectKey(job) {
+  if (!job) return null;
+  return `${job.job_id}:turn:${jobTurn(job)}`;
+}
+
+function collectLockIsFresh(job) {
+  const ttlMs = Number(process.env.SUBAGENT_COLLECT_LOCK_TTL_MS || 900000);
+  const startedAt = job?.collecting_started_at || job?.updated_at;
+  const started = Date.parse(startedAt || "");
+  return Number.isFinite(started) && Date.now() - started <= ttlMs;
+}
+
+function isCollectBusy(job) {
+  if (!job) return false;
+  if (collectRuns.has(collectKey(job))) return true;
+  if (job.state === "collecting" || job.auto_collect_state === "collecting") {
+    return collectLockIsFresh(job);
+  }
+  return false;
 }
 
 function scheduleAutoCollect(jobId, delayMs = 1000) {
-  if (autoCollectTimers.has(jobId)) return;
+  if (autoCollectTimers.has(jobId) || autoCollectRuns.has(jobId)) return;
   const timer = setTimeout(async () => {
     autoCollectTimers.delete(jobId);
+    if (autoCollectRuns.has(jobId)) return;
+    autoCollectRuns.add(jobId);
     try {
       await runAutoCollect(jobId);
     } catch (error) {
@@ -865,6 +983,8 @@ function scheduleAutoCollect(jobId, delayMs = 1000) {
           current.updated_at = nowIso();
         });
       } catch {}
+    } finally {
+      autoCollectRuns.delete(jobId);
     }
   }, delayMs);
   timer.unref?.();
@@ -877,7 +997,7 @@ async function runAutoCollect(jobId) {
   const started = Date.now();
   while (Date.now() - started < maxRunMs) {
     const job = await getJob(jobId);
-    if (!job || job.auto_collect !== true || isCollectTerminal(job)) return;
+    if (!job || job.auto_collect !== true || isCollectTerminal(job) || isCollectBusy(job)) return;
     if (job.deadline_at && Date.parse(job.deadline_at) < Date.now() && ["creating", "running"].includes(job.state)) {
       await updateJob(jobId, (current) => {
         current.state = "timeout";
@@ -895,6 +1015,7 @@ async function runAutoCollect(jobId) {
     if (isCollectTerminal(refreshed)) return;
     if (poll.done || refreshed?.state === "done") {
       await updateJob(jobId, (current) => {
+        if (isCollectTerminal(current) || current.state === "collecting") return;
         current.auto_collect_state = "collecting";
         current.updated_at = nowIso();
       });
@@ -926,7 +1047,7 @@ export function startAutoCollectScheduler() {
     try {
       const jobs = await listJobs("active");
       for (const job of jobs) {
-        if (job.auto_collect === true && !isCollectTerminal(job) && !autoCollectTimers.has(job.job_id)) {
+        if (job.auto_collect === true && !isCollectTerminal(job) && !isCollectBusy(job) && !autoCollectTimers.has(job.job_id) && !autoCollectRuns.has(job.job_id)) {
           scheduleAutoCollect(job.job_id);
         }
       }
@@ -1196,14 +1317,67 @@ export async function subagentCollect(args) {
   if (!job.result_preview) {
     await subagentPoll({ job_id: job.job_id });
   }
-  const refreshed = await getJob(job.job_id);
+  let refreshed = await getJob(job.job_id);
+  const currentTurn = jobTurn(refreshed);
+  const lockKey = collectKey(refreshed);
+  if (collectRuns.has(lockKey)) {
+    return textResult({
+      ok: true,
+      in_progress: true,
+      job_id: refreshed.job_id,
+      turn: currentTurn,
+      queue_id: refreshed.queue?.queue_id || null,
+      note: "collect already running for this job turn; refusing to queue duplicate message",
+    });
+  }
+  collectRuns.add(lockKey);
+  let claim = { status: "claimed" };
+  try {
+    await updateJob(refreshed.job_id, (current) => {
+      const currentResult = collectResultForTurn(current);
+      if (currentResult) {
+        claim = { status: "collected", result: currentResult };
+        return;
+      }
+      const staleLock = !collectLockIsFresh(current);
+      if (current.state === "collecting" && jobTurn(current) === currentTurn && !staleLock) {
+        claim = { status: "in_progress", queue: current.queue || null };
+        return;
+      }
+      current.state = "collecting";
+      current.collecting_turn = currentTurn;
+      current.collecting_started_at = nowIso();
+      current.collect_attempts = (current.collect_attempts || 0) + 1;
+      if (current.auto_collect === true) current.auto_collect_state = "collecting";
+    });
+  } catch (error) {
+    collectRuns.delete(lockKey);
+    throw error;
+  }
+  if (claim.status === "collected") {
+    collectRuns.delete(lockKey);
+    return textResult({ ok: true, idempotent: true, ...claim.result });
+  }
+  if (claim.status === "in_progress") {
+    collectRuns.delete(lockKey);
+    return textResult({
+      ok: true,
+      in_progress: true,
+      job_id: refreshed.job_id,
+      turn: currentTurn,
+      queue_id: claim.queue?.queue_id || null,
+      note: "collect already claimed in registry; refusing to queue duplicate message",
+    });
+  }
+  refreshed = await getJob(job.job_id);
   const mode = args.mode || refreshed.collect_mode || "interrupt";
-  const metadata = await createMetadata();
+  let metadata = null;
   let queueId = null;
   let watchedStep = null;
   let boundaryInfo = null;
   let deliveredBy = null;
   try {
+    metadata = await createMetadata();
     await recordInjection(targetMainId);
     const collectMessage = renderCollectMessage(refreshed);
     const marker = `[subagent:${refreshed.job_id}:turn:${jobTurn(refreshed)}]`;
@@ -1233,40 +1407,61 @@ export async function subagentCollect(args) {
         };
         await updateJob(refreshed.job_id, (current) => {
           current.state = "collected";
+          delete current.collecting_turn;
+          delete current.collecting_started_at;
           current.collect_results = current.collect_results || {};
           current.collect_results[String(jobTurn(current))] = collectResult;
           current.collect_result = collectResult;
         });
+        collectRuns.delete(lockKey);
         return textResult({ ok: true, ...collectResult });
       } else {
         throw new Error(`active step anchor failed before queue: ${anchor.reason}`);
       }
     }
-    const queued = await queueMessage(targetMainId, targetMainId, metadata, collectMessage, {
-      cascadeConfig: mainCascadeConfig,
-    });
-    queueId = queued.queueId;
-    if (!queueId) throw new Error(`QueueCascadeMessage returned no queueId: ${JSON.stringify(queued)}`);
-    await updateJob(refreshed.job_id, (current) => {
-      current.state = "collecting";
-      current.queue = {
-        queue_id: queueId,
-        main_id: targetMainId,
-        state: "queued",
-        created_at: nowIso(),
-        updated_at: nowIso(),
-        remove_attempts: 0,
-      };
-    });
+    const activeQueue = refreshed.queue
+      && refreshed.queue.main_id === targetMainId
+      && refreshed.queue.turn === jobTurn(refreshed)
+      && ["queued", "unknown", "remove_failed"].includes(refreshed.queue.state)
+      ? refreshed.queue
+      : null;
+    if (activeQueue?.queue_id) {
+      queueId = activeQueue.queue_id;
+    } else {
+      const queued = await queueMessage(targetMainId, targetMainId, metadata, collectMessage, {
+        cascadeConfig: mainCascadeConfig,
+      });
+      queueId = queued.queueId;
+      if (!queueId) throw new Error(`QueueCascadeMessage returned no queueId: ${JSON.stringify(queued)}`);
+      await updateJob(refreshed.job_id, (current) => {
+        current.state = "collecting";
+        const queueRecord = {
+          queue_id: queueId,
+          main_id: targetMainId,
+          state: "queued",
+          turn: jobTurn(current),
+          collect_nonce: current.collect_nonce || null,
+          attempt: current.collect_attempts || 1,
+          created_at: nowIso(),
+          updated_at: nowIso(),
+          remove_attempts: 0,
+        };
+        current.queue = queueRecord;
+        current.queue_history = [...(current.queue_history || []), queueRecord].slice(-20);
+      });
+    }
 
     if (mode === "queue") {
       const collectResult = { delivered: true, when: "queued", mode_used: "queue", queue_id: queueId, turn: jobTurn(refreshed) };
       await updateJob(refreshed.job_id, (current) => {
         current.state = "collected";
+        delete current.collecting_turn;
+        delete current.collecting_started_at;
         current.collect_results = current.collect_results || {};
         current.collect_results[String(jobTurn(current))] = collectResult;
         current.collect_result = collectResult;
       });
+      collectRuns.delete(lockKey);
       return textResult({ ok: true, ...collectResult });
     }
 
@@ -1298,6 +1493,8 @@ export async function subagentCollect(args) {
     };
     await updateJob(refreshed.job_id, (current) => {
       current.state = "collected";
+      delete current.collecting_turn;
+      delete current.collecting_started_at;
       current.collect_results = current.collect_results || {};
       current.collect_results[String(jobTurn(current))] = collectResult;
       current.collect_result = collectResult;
@@ -1306,9 +1503,10 @@ export async function subagentCollect(args) {
         current.queue.updated_at = nowIso();
       }
     });
+    collectRuns.delete(lockKey);
     return textResult({ ok: true, ...collectResult });
   } catch (error) {
-    if (queueId && mode === "interrupt" && args.fallback_to_queue !== false) {
+    if (queueId && mode === "interrupt" && args.fallback_to_queue === true) {
       const collectResult = {
         delivered: true,
         when: "queued",
@@ -1321,6 +1519,8 @@ export async function subagentCollect(args) {
       };
       await updateJob(job.job_id, (current) => {
         current.state = "collected";
+        delete current.collecting_turn;
+        delete current.collecting_started_at;
         current.collect_results = current.collect_results || {};
         current.collect_results[String(jobTurn(current))] = collectResult;
         current.collect_result = collectResult;
@@ -1330,6 +1530,7 @@ export async function subagentCollect(args) {
           current.queue.updated_at = nowIso();
         }
       });
+      collectRuns.delete(lockKey);
       return textResult({ ok: true, ...collectResult });
     }
     if (queueId) {
@@ -1337,6 +1538,8 @@ export async function subagentCollect(args) {
         const removed = await removeFromQueue(targetMainId, targetMainId, metadata, queueId);
         await updateJob(job.job_id, (current) => {
           current.state = "collect_failed";
+          delete current.collecting_turn;
+          delete current.collecting_started_at;
           if (current.queue) {
             current.queue.state = removed.removed ? "removed" : "unknown";
             current.queue.updated_at = nowIso();
@@ -1347,6 +1550,8 @@ export async function subagentCollect(args) {
       } catch (removeError) {
         await updateJob(job.job_id, (current) => {
           current.state = "stale_queue";
+          delete current.collecting_turn;
+          delete current.collecting_started_at;
           if (current.queue) {
             current.queue.state = "remove_failed";
             current.queue.updated_at = nowIso();
@@ -1356,7 +1561,15 @@ export async function subagentCollect(args) {
           current.last_error = error.message;
         });
       }
+    } else {
+      await updateJob(job.job_id, (current) => {
+        current.state = "collect_failed";
+        delete current.collecting_turn;
+        delete current.collecting_started_at;
+        current.last_error = error.message;
+      });
     }
+    collectRuns.delete(lockKey);
     return failResult(error.message, { queue_id: queueId });
   }
 }
@@ -1399,6 +1612,30 @@ export async function subagentReconcile() {
           current.queue.remove_attempts = (current.queue.remove_attempts || 0) + 1;
         });
         changes.push({ job_id: job.job_id, queue_id: job.queue.queue_id, removed: removed.removed });
+      }
+      if (
+        job.queue?.queue_id
+        && ["queued", "unknown", "remove_failed"].includes(job.queue.state)
+        && job.state === "collected"
+        && collectResultForTurn(job)?.when !== "queued"
+      ) {
+        const metadata = await createMetadata();
+        const marker = `[subagent:${job.job_id}:turn:${job.queue.turn || jobTurn(job)}]`;
+        let removed = { removed: false };
+        try {
+          removed = await removeFromQueue(job.main_id, job.queue.main_id, metadata, job.queue.queue_id);
+        } catch (error) {
+          const steps = await getSteps(job.main_id, job.main_id, 0);
+          if (!stepsIncludeText(steps, marker)) throw error;
+        }
+        await updateJob(job.job_id, (current) => {
+          if (current.queue?.queue_id === job.queue.queue_id) {
+            current.queue.state = removed.removed ? "removed_after_collected" : "consumed";
+            current.queue.updated_at = nowIso();
+            current.queue.remove_attempts = (current.queue.remove_attempts || 0) + 1;
+          }
+        });
+        changes.push({ job_id: job.job_id, queue_id: job.queue.queue_id, cleanup: "collected_residual_queue", removed: removed.removed });
       }
     } catch (error) {
       await updateJob(job.job_id, (current) => {

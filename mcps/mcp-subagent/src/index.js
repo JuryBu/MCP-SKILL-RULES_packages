@@ -17,6 +17,7 @@ import {
   subagentReconcile,
   subagentReply,
   subagentSpawn,
+  subagentWait,
 } from "./tools.js";
 
 const server = new McpServer({
@@ -40,8 +41,11 @@ server.registerTool("subagent_models", {
   description: "List current cached Windsurf Cascade models and semantic model_profile candidates.",
   inputSchema: {
     purpose: z.enum(["cowork", "explore", "frontend", "fronted", "review", "unblock", "brainstorm"]).optional(),
+    detail: z.enum(["summary", "detail", "full"]).optional(),
+    include_available: z.boolean().optional(),
     refresh: z.boolean().optional(),
     include_unverified: z.boolean().optional(),
+    candidate_limit: z.number().optional(),
   },
 }, async (args) => await subagentModels(args));
 
@@ -86,11 +90,30 @@ server.registerTool("subagent_poll", {
   },
 }, async (args) => await subagentPoll(args));
 
+server.registerTool("subagent_wait", {
+  title: "Wait For WSF Subagent",
+  description: "Short-wait for a registered subagent to finish without exceeding broker/MCP timeout windows.",
+  inputSchema: {
+    job_id: z.string(),
+    wait_ms: z.number().optional(),
+    poll_ms: z.number().optional(),
+    collect: z.boolean().optional(),
+    collect_mode: z.enum(["queue", "interrupt", "force"]).optional(),
+    collect_timeout_ms: z.number().optional(),
+    confirm_timeout_ms: z.number().optional(),
+    fallback_to_queue: z.boolean().optional(),
+  },
+}, async (args) => await subagentWait(args));
+
 server.registerTool("subagent_list", {
   title: "List WSF Subagents",
   description: "List active, done, archived, or all registered subagent jobs.",
   inputSchema: {
     filter: z.enum(["active", "done", "archived", "all"]).optional(),
+    detail: z.enum(["summary", "full"]).optional(),
+    include_deleted: z.boolean().optional(),
+    include_archived: z.boolean().optional(),
+    limit: z.number().optional(),
   },
 }, async (args) => await subagentList(args));
 
