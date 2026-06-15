@@ -1,4 +1,4 @@
-﻿import fs from "fs";
+import fs from "fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";

@@ -1,4 +1,4 @@
-import http from "node:http";
+﻿import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -57,7 +57,79 @@ const logPath = process.env.CODEX_MCP_BROKER_LOG || path.join(__dirname, "broker
 const statePath = process.env.CODEX_MCP_BROKER_STATE || path.join(__dirname, "broker-state.json");
 const requestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS || 120000);
 const sessionIdleMs = Number(process.env.CODEX_MCP_BROKER_SESSION_IDLE_MS || 6 * 60 * 60 * 1000);
+
+function loadPrivateEnv() {
+  const privateEnvPath = path.join(__dirname, "broker-private.env.json");
+  if (!fs.existsSync(privateEnvPath)) {
+    return;
+  }
+  try {
+    const privateEnvText = fs.readFileSync(privateEnvPath, "utf8").replace(/^\uFEFF/, "");
+    const privateEnv = JSON.parse(privateEnvText);
+    let loaded = 0;
+    for (const [key, value] of Object.entries(privateEnv)) {
+      if (!key || value === undefined || value === null || String(value) === "") {
+        continue;
+      }
+      if (!process.env[key]) {
+        process.env[key] = String(value);
+        loaded += 1;
+      }
+    }
+    log("private env loaded", { keys: loaded });
+  } catch (error) {
+    log("private env load failed", { error: error.message });
+  }
+}
+
+loadPrivateEnv();
+
 const exaMcpRemoteUrl = process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL || "";
+
+const exaToolsListFallback = [
+  {
+    name: "web_search_exa",
+    description:
+      "Search the web for current information and return clean text content from top results.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Natural language search query. Describe the ideal page rather than only keywords.",
+        },
+        numResults: {
+          type: "number",
+          description: "Number of search results to return.",
+        },
+      },
+      required: ["query"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "web_fetch_exa",
+    description:
+      "Read one or more webpages as clean markdown after search results are insufficient or a URL is known.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        urls: {
+          type: "array",
+          description: "URLs to read. Batch multiple URLs in one call.",
+          items: { type: "string" },
+        },
+        maxCharacters: {
+          type: "number",
+          description: "Maximum characters to extract per page.",
+        },
+      },
+      required: ["urls"],
+      additionalProperties: false,
+    },
+  },
+];
 
 const endpoints = {
   playwright: {
@@ -88,6 +160,11 @@ const endpoints = {
     args: ["/d", "/s", "/c", "npx.cmd -y mcp-remote %EXA_MCP_REMOTE_URL%"],
     cwd: __dirname,
     resources: false,
+    cacheToolsList: true,
+    resetBackendOnToolsListError: true,
+    toolsListConnectTimeoutMs: Number(process.env.CODEX_MCP_BROKER_EXA_TOOLS_LIST_CONNECT_TIMEOUT_MS || 8000),
+    toolsListTimeoutMs: Number(process.env.CODEX_MCP_BROKER_EXA_TOOLS_LIST_TIMEOUT_MS || 8000),
+    toolsListFallback: exaMcpRemoteUrl ? exaToolsListFallback : null,
     env: {
       CODEX_MCP_WRAPPER: "1",
       CODEX_MCP_TOOL_NAME: "exa",
@@ -412,7 +489,7 @@ class BackendManager {
     };
   }
 
-  async ensureConnected() {
+  async ensureConnected(options = {}) {
     if (this.client) {
       return this.client;
     }
@@ -420,13 +497,13 @@ class BackendManager {
       return this.connecting;
     }
 
-    this.connecting = this.connect().finally(() => {
+    this.connecting = this.connect(options.connectTimeoutMs).finally(() => {
       this.connecting = null;
     });
     return this.connecting;
   }
 
-  async connect() {
+  async connect(connectTimeoutMs) {
     const env = {
       ...process.env,
       ...this.config.env,
@@ -463,7 +540,29 @@ class BackendManager {
       log("backend transport error", { endpoint: this.name, error: error.message });
     };
 
-    await client.connect(transport);
+    try {
+      await withTimeout(
+        client.connect(transport),
+        Number(connectTimeoutMs || requestTimeoutMs),
+        `${this.name} connect`,
+      );
+    } catch (error) {
+      this.lastError = error.message;
+      const failedPid = transport.pid ?? null;
+      log("backend connect failed", { endpoint: this.name, error: error.message, pid: failedPid });
+      void (async () => {
+        await client.close().catch((closeError) => {
+          log("backend close after connect failure failed", {
+            endpoint: this.name,
+            error: closeError.message,
+          });
+        });
+        if (failedPid) {
+          await killProcessTree(failedPid, `${this.name} backend connect failure`);
+        }
+      })();
+      throw error;
+    }
     this.client = client;
     this.transport = transport;
     this.generation += 1;
@@ -482,12 +581,13 @@ class BackendManager {
   }
 
   async request(request, resultSchema, options = {}) {
-    const client = await this.ensureConnected();
+    const client = await this.ensureConnected(options);
     this.lastActivityAt = new Date().toISOString();
+    const timeoutMs = Number(options.timeoutMs || requestTimeoutMs);
     try {
       return await withTimeout(
         client.request(request, resultSchema),
-        requestTimeoutMs,
+        timeoutMs,
         `${this.name} ${request.method}`,
       );
     } catch (error) {
@@ -520,6 +620,10 @@ class EndpointBroker {
     this.config = config;
     this.backend = new BackendManager(name, config);
     this.sessions = new Map();
+    this.cachedToolsList = Array.isArray(config.toolsListFallback)
+      ? { tools: config.toolsListFallback }
+      : null;
+    this.cachedToolsListAt = this.cachedToolsList ? "static-fallback" : null;
   }
 
   status() {
@@ -534,6 +638,7 @@ class EndpointBroker {
       sessionIdleMs,
       oldestSessionAt: sessions.map((session) => session.createdAt).sort()[0] ?? null,
       newestSessionSeenAt: sessions.map((session) => session.lastSeenAt).sort().at(-1) ?? null,
+      toolsListCacheAt: this.cachedToolsListAt,
       backend: this.backend.status(),
     };
   }
@@ -592,7 +697,37 @@ class EndpointBroker {
       });
     };
 
-    forward(ListToolsRequestSchema, ListToolsResultSchema);
+    server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+      try {
+        const result = await this.backend.request(
+          {
+            method: request.method,
+            params: request.params,
+          },
+          ListToolsResultSchema,
+          {
+            closeOnError: this.config.resetBackendOnToolsListError === true,
+            connectTimeoutMs: this.config.toolsListConnectTimeoutMs,
+            timeoutMs: this.config.toolsListTimeoutMs,
+          },
+        );
+        if (this.config.cacheToolsList === true) {
+          this.cachedToolsList = result;
+          this.cachedToolsListAt = new Date().toISOString();
+        }
+        return result;
+      } catch (error) {
+        if (this.cachedToolsList) {
+          log("tools/list fallback used", {
+            endpoint: this.name,
+            error: error.message,
+            cachedAt: this.cachedToolsListAt,
+          });
+          return this.cachedToolsList;
+        }
+        throw error;
+      }
+    });
     server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const validationError = validateToolCall(this.name, request.params);
       if (validationError) {

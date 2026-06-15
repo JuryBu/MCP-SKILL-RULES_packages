@@ -549,12 +549,7 @@
 
 ## 用户画像与聊天偏好
 
-- - 用户喜欢夏季，也不排斥其他季节。
-
-- 用户对 AI 技术、ACGN、剧情向内容、音乐都较感兴趣。
-- 聊天时可以结合这些方向找话题，但不要强行延展。
-
-- 如需使用网页登录态、账号资料或平台偏好，应由使用者在本机自行补充；公开模板不包含任何账号链接或登录态说明。\r\n
+这里是接收方自行填写的个人偏好区。公开包不会携带发送方生日、账号链接、网页登录态或私人记忆。可以保留兴趣方向、协作口味和常用平台偏好，但不要写入敏感账号、密钥、cookies 或真实私有路径。
 ## 用户的工程协作习惯
 
 - 用户通常会把材料和要求放在一个文件夹，把工程项目放在另一个文件夹，两者位于同一根目录下。
@@ -619,11 +614,11 @@
 
 ## 工具与 MCP 使用
 
-- 便携包默认将 MCP 配置指向本机工具包的源码与数据目录；如同时接入 Antigravity、Codex、Claude Code，应保持三侧 endpoint 指向同一套 broker / 数据根。
-- Codex 侧本地 MCP 可通过 `%USERPROFILE%\\.codex\\mcp-http-broker` 或工具包内 broker 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
+- 当前全局 MCP 配置直接指向 Antigravity 的工具实现与数据目录，默认共享同一套记忆、网页登录态和工具能力。
+- Codex 侧本地 MCP 通过 `%USERPROFILE%\.codex\mcp-http-broker` 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
 - Codex HTTP broker 的后端进程是共享的，不具备每个对话独立的“当前对话”状态；凡是会读取或写入当前对话的工具调用，都必须显式传稳定 `conversationId`。
 - Codex HTTP broker 下的持久资源也应显式带稳定 `ownerId`：`web_interact` / `web_pipeline` 的 session，`sandbox_session`，`sandbox_launch`，`sandbox_codex` 后台任务，`smart_search(background=true)`，`sandbox_council(background=true)`。未传时按 `global` 兼容旧调用，但不要跨 owner 读写或 kill/close。
-- 当前共享 MCP 支持跨链路访问；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex | claude-code | cc | windsurf | wsf`。
+- 当前共享 MCP 正在增加双向跨链路访问能力；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex` 三个取值。
 - `chain="auto"` 表示优先使用当前宿主链路；当前宿主不可用或模型调用失败时才尝试另一侧链路。
 
 - `chain="antigravity"` 表示强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错。

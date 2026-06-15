@@ -1,8 +1,8 @@
-﻿# Package Manifest（2026-6-9）
+﻿# Package Manifest（2026-6-16）
 
 Included:
 
-- `mcps/memory-store` source-only portable MCP (`1.15.5`)
+- `mcps/memory-store` source-only portable MCP (`1.15.13`)
 - `mcps/web-fetcher` source-only portable MCP (`7.0.0`)
 - `mcps/sandbox` source-only portable MCP (`1.13.3`)
 - `mcps/broker` portable HTTP broker (`0.1.0`)
@@ -28,12 +28,12 @@ Included:
 
 Updated in this snapshot:
 
-- 2026-06-09: added `mcps/mcp-subagent` as a Windsurf-only optional MCP. It is not enabled by default in shared broker installs; receiver must explicitly run its dry-run/apply/rollback flow.
-- 2026-06-09: refreshed `rules/windsurf/Windsurf_Global_Rules.template.md` from current WSF global rules, preserving new subagent workflow guidance while removing personal info, account links, login-state claims, and sender-specific paths.
+- 2026-06-16: refreshed latest MCP sources and rules templates; `memory-store` is now `1.15.13`, broker portability patches were retained, and `mcp-subagent` remains Windsurf-only optional.
+- 2026-06-16: refreshed Codex / Claude Code / Antigravity / Windsurf rules from local sources where newer, then scrubbed personal info, account links, login-state claims, and sender-specific paths.
 
 - Skills refreshed on 2026-06-07: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
 
-- `memory-store` refreshed to `1.15.5` with conversation export helper sources.
+- `memory-store` refreshed to `1.15.13` with conversation export helper sources.
 - `sandbox` refreshed to `1.13.3`.
 - `web-fetcher` source refreshed from the current local tree; version remains `7.0.0`.
 - Codex and Claude Code rules refreshed from current local templates, Windsurf rules added from WSF config, then all rules privacy-scrubbed.

@@ -1,7 +1,8 @@
 import { DATA_CHAIN_VALUES, normalizeDataChain, type DataChain, type DataChainInput } from "./chain.js";
 import {
     getCodexThread,
-    listRecentCodexThreads,
+    listCodexThreadsForMetadata,
+    readCodexThreadParentMap,
     type CodexThreadInfo,
 } from "./codex-client.js";
 import {
@@ -23,17 +24,27 @@ import { canonicalWorkspacePath } from "./store.js";
 
 export type ConversationSource = Exclude<DataChain, "auto">;
 export type WorkspaceMatchMode = "contains" | "exact" | "under" | "any" | "all";
+export type WorkspaceMatchScope = "any" | "primary";
 export type SourceFailureMode = "warn" | "fail";
 export type IdResolutionMode = "unique" | "priority";
+export type ConversationThreadMode = "main" | "children" | "all";
 
 export interface UnifiedConversationCandidate {
     id: string;
     dataChain: ConversationSource;
     title: string;
     workspace: string;
+    workspaces?: string[];
     updatedAt: string;
     detail: string;
     contextProbe?: string[];
+    agentRole?: string | null;
+    agentNickname?: string | null;
+    parentConversationId?: string | null;
+    rootConversationId?: string | null;
+    isChildThread?: boolean;
+    matchedChildConversationId?: string | null;
+    matchedChildTitle?: string | null;
 }
 
 export interface SourceStatus {
@@ -49,6 +60,11 @@ export interface ListConversationCandidatesOptions {
     query?: string;
     workspaces?: string[];
     workspaceMode?: WorkspaceMatchMode;
+    workspaceScope?: WorkspaceMatchScope;
+    threadMode?: ConversationThreadMode;
+    parentConversationId?: string;
+    parentQuery?: string;
+    parentDataChain?: DataChainInput | string;
     limit?: number;
     sourceFailureMode?: SourceFailureMode;
     adapters?: ConversationSourceAdapters;
@@ -99,7 +115,7 @@ const DEFAULT_SOURCE_ORDER: ConversationSource[] = ["codex", "antigravity", "cla
 
 const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     codex: {
-        list: limit => listRecentCodexThreads(limit),
+        list: limit => listCodexThreadsForMetadata(limit),
         get: id => getCodexThread(id),
     },
     "claude-code": {
@@ -139,18 +155,63 @@ export function normalizeConversationQuery(input: string | undefined): string {
         .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
+function isUsefulQueryTerm(term: string): boolean {
+    if (!term) return false;
+    if (/^[a-z0-9]$/u.test(term)) return false;
+    return term.length >= 2 || /[\u3400-\u9fff]/u.test(term);
+}
+
+export function splitConversationQueryTerms(input: string | undefined): string[] {
+    const seen = new Set<string>();
+    const terms: string[] = [];
+    for (const rawTerm of (input || "").trim().split(/\s+/u)) {
+        const term = normalizeConversationQuery(rawTerm);
+        if (!isUsefulQueryTerm(term) || seen.has(term)) continue;
+        seen.add(term);
+        terms.push(term);
+    }
+    return terms;
+}
+
 function isoFromMs(ms?: number): string {
     return ms ? new Date(ms).toISOString() : "";
 }
 
-function candidateFromCodexThread(item: CodexThreadInfo): UnifiedConversationCandidate {
+function rootConversationIdFor(itemId: string, parentMap: Map<string, string>): string | null {
+    let current = itemId;
+    let root: string | null = null;
+    const seen = new Set<string>();
+    for (let depth = 0; depth < 16; depth++) {
+        const parent = parentMap.get(current);
+        if (!parent || seen.has(parent)) return root;
+        seen.add(parent);
+        root = parent;
+        current = parent;
+    }
+    return root;
+}
+
+function candidateFromCodexThread(item: CodexThreadInfo, parentMap = new Map<string, string>()): UnifiedConversationCandidate {
+    const parentConversationId = item.parentConversationId || parentMap.get(item.id) || null;
+    const isChildThread = Boolean(parentConversationId);
     return {
         id: item.id,
         dataChain: "codex",
         title: item.title || "",
         workspace: item.cwd || "",
         updatedAt: isoFromMs(item.updatedAtMs || undefined),
-        detail: [item.agentRole ? `agent=${item.agentRole}` : "", item.model, item.reasoningEffort].filter(Boolean).join(" / "),
+        detail: [
+            item.agentRole ? `agent=${item.agentRole}` : "",
+            isChildThread ? "childThread" : "",
+            parentConversationId ? `parentConversationId=${parentConversationId}` : "",
+            item.model,
+            item.reasoningEffort,
+        ].filter(Boolean).join(" / "),
+        agentRole: item.agentRole || null,
+        agentNickname: item.agentNickname || null,
+        parentConversationId,
+        rootConversationId: rootConversationIdFor(item.id, parentMap),
+        isChildThread,
     };
 }
 
@@ -161,7 +222,15 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): UnifiedConve
         title: item.title || "",
         workspace: item.cwd || "",
         updatedAt: isoFromMs(item.updatedAtMs || undefined),
-        detail: ["claude-code", item.model, item.entrypoint].filter(Boolean).join(" / "),
+        detail: [
+            "claude-code",
+            item.accountId ? `account=${item.accountId}` : "",
+            item.organizationId ? `org=${item.organizationId}` : "",
+            item.isArchived === true ? "archived" : "",
+            item.desktopIndexPath ? "desktop-index" : "",
+            item.model,
+            item.entrypoint,
+        ].filter(Boolean).join(" / "),
     };
 }
 
@@ -171,27 +240,62 @@ function candidateFromWindsurfThread(item: WindsurfConversationSummary): Unified
         dataChain: "windsurf",
         title: item.title || item.summary || "",
         workspace: item.cwd || "",
+        workspaces: item.workspaceUris,
         updatedAt: item.lastModifiedTime || item.createdTime || "",
-        detail: ["windsurf", item.status, item.stepCount ? `${item.stepCount} steps` : "", item.lastGeneratorModelUid].filter(Boolean).join(" / "),
+        detail: [
+            "windsurf",
+            item.titleSource === "renamedTitle" ? "title=renamedTitle" : "",
+            item.workspaceUris?.length ? `workspaces=${item.workspaceUris.length}` : "",
+            item.referencedFiles?.length ? `referencedFiles=${item.referencedFiles.length}` : "",
+            item.status,
+            item.stepCount ? `${item.stepCount} steps` : "",
+            item.lastGeneratorModelUid,
+        ].filter(Boolean).join(" / "),
     };
 }
 
-function candidateMatchesQuery(item: UnifiedConversationCandidate, normalizedQuery: string): boolean {
-    if (!normalizedQuery) return true;
-    const haystack = normalizeConversationQuery(`${item.id}\n${item.title}\n${item.workspace}\n${item.detail}`);
-    return haystack.includes(normalizedQuery);
+function candidateSearchHaystack(item: UnifiedConversationCandidate): string {
+    return normalizeConversationQuery([
+        item.id,
+        item.title,
+        item.workspace,
+        ...(item.workspaces || []),
+        item.agentRole || "",
+        item.agentNickname || "",
+    ].join("\n"));
 }
 
-function candidateQueryPriority(item: UnifiedConversationCandidate, normalizedQuery: string): number {
+function queryTermsMatch(haystack: string, queryTerms: string[]): boolean {
+    return queryTerms.length > 1 && queryTerms.some(term => haystack.includes(term));
+}
+
+function candidateMatchesQuery(item: UnifiedConversationCandidate, normalizedQuery: string, queryTerms: string[] = []): boolean {
+    if (!normalizedQuery) return true;
+    const haystack = candidateSearchHaystack(item);
+    return haystack.includes(normalizedQuery) || queryTermsMatch(haystack, queryTerms);
+}
+
+function fieldIncludesAny(field: string, queryTerms: string[]): boolean {
+    return queryTerms.length > 1 && queryTerms.some(term => field.includes(term));
+}
+
+function candidateQueryPriority(item: UnifiedConversationCandidate, normalizedQuery: string, queryTerms: string[] = []): number {
     if (!normalizedQuery) return 9;
     const id = normalizeConversationQuery(item.id);
     const title = normalizeConversationQuery(item.title || "");
     const workspace = normalizeConversationQuery(item.workspace || "");
+    const workspaces = normalizeConversationQuery((item.workspaces || []).join("\n"));
+    const agent = normalizeConversationQuery([item.agentRole || "", item.agentNickname || ""].join("\n"));
+    const haystack = [id, title, workspace, workspaces, agent].join("\n");
     if (id === normalizedQuery) return 0;
     if (normalizedQuery.length >= 8 && id.startsWith(normalizedQuery)) return 1;
     if (title === normalizedQuery) return 2;
     if (title.includes(normalizedQuery)) return 3;
     if (workspace.includes(normalizedQuery)) return 4;
+    if (fieldIncludesAny(title, queryTerms)) return 5;
+    if (fieldIncludesAny(workspace, queryTerms) || fieldIncludesAny(workspaces, queryTerms)) return 6;
+    if (fieldIncludesAny(agent, queryTerms)) return 7;
+    if (queryTermsMatch(haystack, queryTerms)) return 8;
     return 9;
 }
 
@@ -205,17 +309,24 @@ function workspaceSingleMatch(candidate: string, requested: string, mode: Worksp
         || requested.startsWith(`${candidate}/`);
 }
 
-export function workspaceMatches(candidateWorkspace: string, requestedWorkspaces: string[] = [], mode: WorkspaceMatchMode = "contains"): boolean {
+export function workspaceMatches(candidateWorkspace: string | string[], requestedWorkspaces: string[] = [], mode: WorkspaceMatchMode = "contains"): boolean {
     if (requestedWorkspaces.length === 0) return true;
-    const candidate = canonicalWorkspacePath(candidateWorkspace || "");
-    if (!candidate) return false;
+    const candidates = (Array.isArray(candidateWorkspace) ? candidateWorkspace : [candidateWorkspace])
+        .map(item => canonicalWorkspacePath(item || ""))
+        .filter(Boolean);
+    if (candidates.length === 0) return false;
     const singleMode: WorkspaceMatchMode = mode === "any" || mode === "all" ? "contains" : mode;
     const checks = requestedWorkspaces
         .map(item => canonicalWorkspacePath(item || ""))
         .filter(Boolean)
-        .map(requested => workspaceSingleMatch(candidate, requested, singleMode));
+        .map(requested => candidates.some(candidate => workspaceSingleMatch(candidate, requested, singleMode)));
     if (checks.length === 0) return true;
     return mode === "all" ? checks.every(Boolean) : checks.some(Boolean);
+}
+
+function candidateWorkspacesForScope(item: UnifiedConversationCandidate, scope: WorkspaceMatchScope = "any"): string | string[] {
+    if (scope === "primary") return item.workspace;
+    return item.workspaces?.length ? item.workspaces : item.workspace;
 }
 
 function candidateWarnings(item: UnifiedConversationCandidate): string[] {
@@ -246,7 +357,8 @@ async function listSourceCandidates(
     probeWorkspace = false,
 ): Promise<UnifiedConversationCandidate[]> {
     if (source === "codex") {
-        return (await adapters.codex.list(limit)).map(candidateFromCodexThread);
+        const parentMap = readCodexThreadParentMap();
+        return (await adapters.codex.list(limit)).map(item => candidateFromCodexThread(item, parentMap));
     }
     if (source === "claude-code") {
         return (await adapters["claude-code"].list(limit)).map(candidateFromClaudeCodeThread);
@@ -282,25 +394,123 @@ async function listSourceCandidates(
     return candidates;
 }
 
+function conversationSourceFetchLimit(source: ConversationSource, sourceLimit: number, options: ListConversationCandidatesOptions): number {
+    const baseLimit = Math.max(sourceLimit * 3, 50);
+    if (source !== "codex") return baseLimit;
+    const needsMetadataLocate = Boolean(
+        options.query?.trim()
+        || options.workspaces?.length
+        || options.parentConversationId?.trim()
+        || options.parentQuery?.trim()
+        || options.threadMode === "children"
+        || options.threadMode === "all"
+    );
+    if (!needsMetadataLocate) return baseLimit;
+    return Math.max(baseLimit, Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000));
+}
+
+function cloneWithChildMatch(parent: UnifiedConversationCandidate, child: UnifiedConversationCandidate): UnifiedConversationCandidate {
+    const childTitle = child.title || child.agentNickname || child.id;
+    return {
+        ...parent,
+        matchedChildConversationId: child.id,
+        matchedChildTitle: childTitle,
+        detail: [
+            parent.detail,
+            `matchedChildConversationId=${child.id}`,
+            childTitle ? `matchedChildTitle=${childTitle.slice(0, 80)}` : "",
+        ].filter(Boolean).join(" / "),
+    };
+}
+
+function resolveParentForChildrenMode(
+    raw: UnifiedConversationCandidate[],
+    normalizedParentQuery: string,
+    parentQueryTerms: string[],
+    options: ListConversationCandidatesOptions,
+): { parentId?: string; warnings: string[] } {
+    if (options.parentConversationId?.trim()) {
+        return { parentId: options.parentConversationId.trim(), warnings: [] };
+    }
+    if (!normalizedParentQuery) {
+        return { warnings: ["threadMode=children 需要 parentConversationId 或 parentQuery"] };
+    }
+    const parentMatches = raw
+        .filter(item => !item.isChildThread)
+        .filter(item => candidateMatchesQuery(item, normalizedParentQuery, parentQueryTerms))
+        .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"));
+    if (parentMatches.length === 1) {
+        return { parentId: parentMatches[0].id, warnings: [] };
+    }
+    if (parentMatches.length === 0) {
+        return { warnings: [`parentQuery 未唯一定位父线程：0 个候选`] };
+    }
+    return { warnings: [`parentQuery 未唯一定位父线程：${parentMatches.length} 个候选，请传 parentConversationId`] };
+}
+
+function applyCodexThreadMode(
+    raw: UnifiedConversationCandidate[],
+    filtered: UnifiedConversationCandidate[],
+    normalizedQuery: string,
+    queryTerms: string[],
+    options: ListConversationCandidatesOptions,
+): { filtered: UnifiedConversationCandidate[]; warnings: string[] } {
+    const threadMode = options.threadMode || "main";
+    if (threadMode === "all") return { filtered, warnings: [] };
+
+    if (threadMode === "children") {
+        const { parentId, warnings } = resolveParentForChildrenMode(raw, normalizeConversationQuery(options.parentQuery), splitConversationQueryTerms(options.parentQuery), options);
+        if (!parentId) return { filtered: [], warnings };
+        return {
+            filtered: raw
+                .filter(item => item.isChildThread && item.parentConversationId === parentId)
+                .filter(item => candidateMatchesQuery(item, normalizedQuery, queryTerms))
+                .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any")),
+            warnings,
+        };
+    }
+
+    const main = filtered.filter(item => !item.isChildThread);
+    const byId = new Map(main.map(item => [item.id, item]));
+    const childHits = filtered.filter(item => item.isChildThread && item.parentConversationId);
+    for (const child of childHits) {
+        const parent = raw.find(item => item.id === child.parentConversationId);
+        if (!parent || parent.isChildThread || byId.has(parent.id)) continue;
+        if (!workspaceMatches(candidateWorkspacesForScope(parent, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any")) {
+            continue;
+        }
+        const promoted = cloneWithChildMatch(parent, child);
+        main.push(promoted);
+        byId.set(promoted.id, promoted);
+    }
+    return { filtered: main, warnings: [] };
+}
+
 export async function listConversationCandidates(options: ListConversationCandidatesOptions = {}): Promise<ListConversationCandidatesResult> {
     const adapters = options.adapters || DEFAULT_ADAPTERS;
     const sources = normalizeConversationSources(options.dataChains);
     const normalizedQuery = normalizeConversationQuery(options.query);
+    const queryTerms = splitConversationQueryTerms(options.query);
     const sourceLimit = Math.max(options.limit || 50, 1);
     const statuses: SourceStatus[] = [];
     const collected: UnifiedConversationCandidate[] = [];
 
     const settled = await Promise.allSettled(sources.map(async source => {
-        const raw = await listSourceCandidates(source, Math.max(sourceLimit * 3, 50), adapters, source === "antigravity" && Boolean(options.workspaces?.length));
+        const raw = await listSourceCandidates(source, conversationSourceFetchLimit(source, sourceLimit, options), adapters, source === "antigravity" && Boolean(options.workspaces?.length));
         const warnings = raw.flatMap(candidateWarnings);
-        const filtered = raw
-            .filter(item => candidateMatchesQuery(item, normalizedQuery))
-            .filter(item => workspaceMatches(item.workspace, options.workspaces || [], options.workspaceMode || "any"))
+        let filtered = raw
+            .filter(item => candidateMatchesQuery(item, normalizedQuery, queryTerms))
+            .filter(item => workspaceMatches(candidateWorkspacesForScope(item, options.workspaceScope || "any"), options.workspaces || [], options.workspaceMode || "any"))
             .sort((a, b) => {
-                const queryPriority = candidateQueryPriority(a, normalizedQuery) - candidateQueryPriority(b, normalizedQuery);
+                const queryPriority = candidateQueryPriority(a, normalizedQuery, queryTerms) - candidateQueryPriority(b, normalizedQuery, queryTerms);
                 if (queryPriority !== 0) return queryPriority;
                 return (Date.parse(b.updatedAt || "") || 0) - (Date.parse(a.updatedAt || "") || 0);
             });
+        if (source === "codex") {
+            const result = applyCodexThreadMode(raw, filtered, normalizedQuery, queryTerms, options);
+            filtered = result.filtered;
+            warnings.push(...result.warnings);
+        }
         return { source, filtered, warnings };
     }));
 

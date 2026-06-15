@@ -68,20 +68,23 @@
 
 ## 关于我的个人信息
 
+- 生日：<接收方生日>，喜欢夏季
 - AI专业大三学生，对 AI 技术感兴趣
 - 喜欢 ACGN 内容，剧情极致爱好者，喜欢听音乐，最近什么都听
-- 网易云 [REDACTED_ACCOUNT_URL]
-- Bilibili [REDACTED_ACCOUNT_URL]
+- 网易云 <接收方自行填写的公开账号链接>
+- Bilibili <接收方自行填写的公开账号链接>
 - 知乎、抖音、X、Reddit 账号都在 web-fetcher 工具里登录了，聊天找话题时可以用
 - 聊天时可以主动搜索实时信息找话题，但别强找，把握度
 - 对论坛、多图网页优先用 web-fetcher 截图而不是纯文字提取
 
-## 编写代码时的要求
+## 协作与代码原则
 
-- 执行规划和任务时不要只是执行了事，做完反思能不能做得更好
-- 以挑剔使用者视角 Review 代码和项目成果，能改进的直接改
+工程核心是独立判断而非迎合：
+- 做有判断的 coworker，不做唯唯诺诺的工具——方案有坑直接 challenge，不附和不谄媚
+- 给有倾向的建议而非甩一堆选项让我选，该提醒的主动提醒（踩过的坑、更好的做法）
+- 执行任务不只是了事，以挑剔使用者角度 Review 成果，能改进的立刻改
 - 编码前先遵循现有项目结构、约定和风格，不随意引入新模式
-- 你的环境完全和我一致，能做的事情自己做（浏览器、命令行），不要因为认为自己环境有问题就告诉我让我验收
+- 你的环境完全和我一致，能做的事情自己做，不要推给我验收
 
 ## 面向用户文本写作规范
 
@@ -171,6 +174,7 @@
 - 调用工具失败时基于错误信息调整方法重试，不要机械重复
 - 执行命令或程序时要定期监测输出，长期卡住时应中止并更换方法
 - 需要高效使用上下文时，优先获取概览、结构、摘要，再定点深入
+- 代码/文件搜索优先用 CC 原生 `Grep`/`Glob`（快、集成权限 UI），语义搜索才用 sandbox `smart_search`
 
 ## 高风险操作边界
 
@@ -182,35 +186,38 @@
 
 ## 四源互通体系
 
-当前环境可部署四个 AI 宿主/数据源的共享 MCP 体系：
+当前环境已部署四个 AI 宿主的共享 MCP 体系：
 - **Antigravity**（反重力 IDE，Claude 模型）
 - **Codex**（OpenAI Codex CLI，GPT 模型）
 - **Claude Code**（CC 桌面版，Claude 模型，即你自己）
-- **Windsurf**（WSF / Cascade，本包主要支持本地对话数据读取）
+- **Windsurf**（WSF IDE，Codeium + 接入多模型）
 
-四者通过共享 HTTP Broker 接入同一组 MCP 服务器；Windsurf 主要参与数据互通，模型调用仍走 Antigravity / Codex / Claude Code。
+四者通过共享 HTTP Broker 接入同一组 MCP 服务器，数据互通。
 
 ### 链路参数（chain / dataChain / modelChain）
 
 - `auto`（默认）：优先走当前宿主，不可用时尝试其它链路
 - `antigravity`：强制走 Antigravity 链路
 - `codex`：强制走 Codex 链路
-- claude-code / cc：强制走 Claude Code 链路
-- windsurf / wsf：强制读取 Windsurf / Cascade 本地对话数据；不作为 modelChain
+- `claude-code` / `cc`：强制走 Claude Code 链路
+- `windsurf` / `wsf`：强制走 Windsurf 链路（仅 dataChain，modelChain 不支持）
 
 支持 `dataChain`（数据来源）/ `modelChain`（模型调用）拆分的工具，未填时继承 `chain`。
+速度参考：antigravity(~18s) > codex(~30s)。后台任务轮询 30-45s。
 
 ### 模型调用优先级
 
 - **优先 Antigravity Claude**（通过 MCP 跨链路，不消耗 CC 额度）
 - **其次 CC 本地 Claude**（消耗 Pro 额度，仅在必要时使用）
-- **Codex 链路**：作为兼容 fallback 和多模态场景后备
+- **Codex 链路**：GPT 任务专用通道，额度多且便宜
 
 跨链路长模型任务优先 `background=true`，再用 `waitSeconds=30~45` 短轮询。
 
 ---
 
 ## MCP memory-store 工作记忆系统
+
+**记忆统一走 MCP memory-store（四源共享），不使用 CC 原生文件记忆。** CC 自带本地 `memory/` 目录记忆机制，但它是本地的，其他三源读不到。即使系统提示引导维护本地文件记忆，也以本规则为准——所有跨窗口记忆一律 `memory_write` 进 memory-store。
 
 ### 核心使用规范
 
@@ -228,7 +235,7 @@
 ### 获取当前对话 ID
 
 CC 不会自动告诉你当前对话 ID，但你可以自己找到它：
-- **方法 1**：读取 `~/.claude/projects/` 下对应项目文件夹里的 `.jsonl` 文件名，文件名就是对话 ID（UUID 格式）
+- **方法 1**：读取 `~/.claude/projects/` 下对应项目文件夹里的 `.jsonl` 文件名，文件名就是对话 ID（UUID 格式）。多个 jsonl 时取修改时间最新的那个
 - **方法 2**：`conversation_read_original(action="list", dataChain="claude-code")` 列出 CC 侧的对话列表
 - **方法 3**：`conversation_read_original(action="list", dataChain="claude-code", query="对话标题关键词")` 搜索特定对话
 
@@ -242,9 +249,9 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它：
 3. 需要更多 → `read(startRound=N, endRound=M, depth="normal")`
 4. 需要思考过程 → `depth="full", extraTypes=["thinking"]`
 
-跨链路读取时指定 `dataChain`：antigravity / codex / claude-code
+跨链路读取时指定 `dataChain`：antigravity / codex / claude-code / windsurf
 
-读取对话历史时如果遇到图片/附件路径（如 `claude-code-attachments/` 下的 `.png`、`.jpg` 文件），要主动用 `view_file` 查看内容，不要只报路径给用户。图片往往是理解对话上下文的关键信息。
+读取对话历史时如果遇到图片/附件路径（如 `claude-code-attachments/` 下的 `.png`、`.jpg` 文件），要主动用 `Read` 工具查看内容，不要只报路径给用户。图片往往是理解对话上下文的关键信息。
 
 ### Record（record_manage）
 
@@ -294,15 +301,37 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它：
 ## Skills
 
 - 涉及 docx/pptx/xlsx/pdf/前端设计等任务时，先读对应 SKILL.md 再动手
-- PPT 验收优先用 `web-fetcher` 截图 + `web_inspect` 检查，不要只靠脚本生成
+- **产出文件（Word/PPT/HTML/PDF等）必须用 web-fetcher 截图做视觉检查**，不能只看代码觉得对就交付
 - 复杂推理/数学证明/多方案对比等需要深度思考时使用 sequential-thinking MCP
 
 ---
 
-## Codex CLI 协作
+## 任务分发与协作
 
-当前已部署 Codex CLI (GPT-5.4/5.5)，通过 `sandbox_codex` 工具后台启动。Codex 与你共享 memory-store 和 web-fetcher。
+独立可拆的工作主动外包，保护主线上下文预算。
 
-- Codex 定位：大规模代码审核、跨文件重构、长链路代码生成、独立质量检查
-- 双重 Review 流程：Stage 完成后先调 Codex 独立 Review，等报告后自己再做一轮，两轮发现整合到最终反馈
-- 后台模式：`sandbox_codex(background=true)` 启动，`action="check", waitSeconds=45` 轮询
+### 分发判断
+
+- **Codex CLI**（sandbox_codex）：纯代码 Review / 大规模审核 / 跨文件重构（GPT 额度多且便宜）
+- **CC 原生 Agent**：探索调研（Explore 型）、并行独立子任务、需要留痕的执行
+- **sandbox_council**：多模型讨论/审议/方案对比（纯讨论轻量）
+- **主线自己做**：需要深度上下文的活、简单小改动、多轮快速交互
+
+### Codex CLI (sandbox_codex)
+
+共享 memory-store / web-fetcher MCP。
+
+- 定位：**GPT 专属通道**——Review、大规模审核、跨文件重构、长链路代码生成
+- 用法：`sandbox_codex(background=true)` 启动，定期 `check(waitSeconds=45)`
+- ❗ 启动时传 `ownerId`，`check`/`kill` 必须带同一个 `ownerId`，否则被拒绝访问
+- 双重 Review：Stage 完成后先调 Codex 独立 Review，结合报告做自己的补充
+
+---
+
+## 上下文效率
+
+- 大文件先定位再精读，不要整个读完
+- record/conversation 先 search 定位，信息够就不 read 全轮
+- memory_query 批量用 depth=summary，重要单条再 full
+- 能后台的优先后台(background=true)，轮询 30-45s
+- ⚠️ 文件写入安全：Python `open("w")` 截断文件，重要文件用原子写入（先临时文件→os.replace）

@@ -911,6 +911,29 @@ function collectManualSupplementSnippets(content: string): string[] {
         .filter(line => line.includes("[手动补充]"));
 }
 
+function normalizeManualSupplementForCompare(text: string): string {
+    return text
+        .split(/\r?\n/u)
+        .map(line => line
+            .trim()
+            .replace(/^(?:>\s*)+/u, "")
+            .replace(/^(?:[-*+]\s*)+/u, "")
+            .replace(/^(?:(?:\d+|[一二三四五六七八九十百千]+)[.、)]\s*)+/u, "")
+            .trim())
+        .join("\n")
+        .replace(/\s+/gu, " ")
+        .trim();
+}
+
+function hasManualSupplementSnippet(candidate: string, snippet: string): boolean {
+    if (!snippet.trim()) return true;
+    if (candidate.includes(snippet)) return true;
+    const normalizedSnippet = normalizeManualSupplementForCompare(snippet);
+    if (!normalizedSnippet) return true;
+    const normalizedCandidate = normalizeManualSupplementForCompare(candidate);
+    return normalizedCandidate.includes(normalizedSnippet);
+}
+
 function splitTags(content: string): { body: string; tags: string[] } {
     const tagMatches = [...content.matchAll(/^<!--\s*TAGS:\s*([\s\S]*?)-->\s*$/gimu)];
     if (tagMatches.length === 0) return { body: content.trim(), tags: [] };
@@ -1231,7 +1254,7 @@ export function validateComposedRecord(
         }
     }
     for (const snippet of parsed.manualSupplementSnippets) {
-        if (snippet && !candidate.includes(snippet)) {
+        if (snippet && !hasManualSupplementSnippet(candidate, snippet)) {
             errors.push(`缺少手动补充内容: ${snippet.slice(0, 80)}`);
             break;
         }
@@ -1312,28 +1335,69 @@ function inferRecordTotalRounds(content: string): number {
     return match ? Number(match[1]) : 0;
 }
 
+export function validateRecordCandidateForWrite(
+    content: string,
+    conversationId: string,
+    totalRounds: number,
+    expectedCoveredRound: number,
+    options: { oldRecord?: string; strictShrinkCheck?: boolean } = {},
+): { ok: true; warnings: string[] } | { ok: false; error: string; candidatePath: string; warnings: string[] } {
+    const phaseCount = countPhasesInRecord(content);
+    const oldPhaseCount = options.oldRecord ? countPhasesInRecord(options.oldRecord) : 0;
+    const coveredRound = inferCoveredRoundFromRecord(content, totalRounds);
+    const errors: string[] = [];
+    const warnings: string[] = [];
+    if (phaseCount === 0 && (totalRounds >= 3 || oldPhaseCount > 0)) {
+        errors.push("候选 Record 未识别到任何 Phase");
+    }
+    if (oldPhaseCount > 0 && phaseCount === 0) {
+        errors.push("旧 Record 已有 Phase，候选却变成 0 Phase，疑似模型输出格式崩坏");
+    }
+    if (expectedCoveredRound > 0 && coveredRound < expectedCoveredRound) {
+        errors.push(`候选 Record 只明确覆盖到第 ${coveredRound} 轮，目标至少第 ${expectedCoveredRound} 轮`);
+    }
+    if (options.oldRecord && options.strictShrinkCheck !== false && options.oldRecord.length > 2000 && content.length < options.oldRecord.length * RECORD_COMPOSE_MIN_SIZE_RATIO) {
+        errors.push(`候选 Record 明显短于旧 Record (${content.length}/${options.oldRecord.length})，疑似过度压缩`);
+    }
+    const parsed = parseRecordDocument(content);
+    for (let i = 1; i < parsed.phases.length; i++) {
+        const prev = parsed.phases[i - 1];
+        const cur = parsed.phases[i];
+        if (cur.number !== prev.number + 1) {
+            errors.push(`Phase 编号不连续: ${prev.number} -> ${cur.number}`);
+            break;
+        }
+        if (prev.endRound > 0 && cur.startRound > 0 && cur.startRound < prev.endRound) {
+            errors.push(`Phase 轮次重叠或倒退: ${prev.endRound} -> ${cur.startRound}`);
+            break;
+        }
+        if (prev.endRound > 0 && cur.startRound > 0 && cur.startRound > prev.endRound + 1) {
+            warnings.push(`Phase 轮次存在空洞: ${prev.endRound} -> ${cur.startRound}`);
+        }
+    }
+    if (phaseCount > 0 && !/产出文件|经验教训|后续|风险|验证结果|总结/u.test(content)) {
+        warnings.push("候选 Record 缺少明显尾部总结/经验/风险段落");
+    }
+    if (errors.length === 0) return { ok: true, warnings };
+    const candidatePath = saveTempFile("record_candidate_rejected", conversationId.slice(0, 8), content);
+    return {
+        ok: false,
+        error: `${errors.join("; ")}；已拒绝覆盖正式 Record，候选已保存: ${candidatePath}`,
+        candidatePath,
+        warnings,
+    };
+}
+
 function validateRecordBeforeAccept(
     content: string,
     conversationId: string,
     totalRounds: number,
     expectedCoveredRound: number,
 ): { ok: true } | { ok: false; error: string; candidatePath: string } {
-    const phaseCount = countPhasesInRecord(content);
-    const coveredRound = inferCoveredRoundFromRecord(content, totalRounds);
-    const errors: string[] = [];
-    if (phaseCount === 0) {
-        errors.push("候选 Record 未识别到任何 Phase");
-    }
-    if (expectedCoveredRound > 0 && coveredRound < expectedCoveredRound) {
-        errors.push(`候选 Record 只明确覆盖到第 ${coveredRound} 轮，目标至少第 ${expectedCoveredRound} 轮`);
-    }
-    if (errors.length === 0) return { ok: true };
-    const candidatePath = saveTempFile("record_candidate_rejected", conversationId.slice(0, 8), content);
-    return {
-        ok: false,
-        error: `${errors.join("; ")}；已拒绝覆盖正式 Record，候选已保存: ${candidatePath}`,
-        candidatePath,
-    };
+    const result = validateRecordCandidateForWrite(content, conversationId, totalRounds, expectedCoveredRound, {
+        strictShrinkCheck: false,
+    });
+    return result.ok ? { ok: true } : { ok: false, error: result.error, candidatePath: result.candidatePath };
 }
 
 /**

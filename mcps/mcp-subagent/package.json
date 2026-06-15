@@ -7,7 +7,7 @@
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
-    "build": "node --check src/index.js && node --check src/auth.js && node --check src/audit.js && node --check src/processGuard.js && node --check src/lsClient.js && node --check src/metadata.js && node --check src/cascadeOps.js && node --check src/registry.js && node --check src/tools.js && node --check scripts/config-utils.js && node --check scripts/install-config.js && node --check scripts/rollback-config.js && node --check scripts/patch-codex-broker.js && node --check scripts/package-handoff.js && node --check scripts/check-live-config.js && node --check scripts/smoke-ls.js && node --check scripts/test-auth.js && node --check scripts/smoke-recovery.js && node --check scripts/smoke-ls-restart.js && node --check scripts/inspect-stage-b-proto.js && node --check scripts/smoke-stage-b.js && node --check scripts/smoke-broker-dry-run.js && node --check scripts/smoke-broker-load.js && node --check scripts/smoke-broker-tools.js && node --check scripts/check-b0.js && node --check scripts/smoke-stage-c.js && node --check scripts/smoke-stage-d.js && node --check scripts/smoke-stage-e.js && node --check scripts/smoke-stage-f.js && node --check scripts/smoke-stage-g.js && node --check scripts/smoke-stage-g-tool.js && node --check scripts/smoke-stage-g-boundary.js && node --check scripts/smoke-stage-h.js && node --check scripts/smoke-stage-h-tool.js && node --check scripts/smoke-current-binding.js && node --check scripts/smoke-auto-collect.js && node --check scripts/smoke-mcp-tools.js && node --check src/modelCatalog.js && node --check scripts/smoke-models.js && node --check scripts/smoke-model-fallback.js && node --check scripts/smoke-model-profile.js && node --check scripts/smoke-list-defaults.js && node --check scripts/smoke-collect-dedupe.js",
+    "build": "node --check src/index.js && node --check src/auth.js && node --check src/audit.js && node --check src/processGuard.js && node --check src/lsClient.js && node --check src/metadata.js && node --check src/cascadeOps.js && node --check src/registry.js && node --check src/tools.js && node --check scripts/config-utils.js && node --check scripts/install-config.js && node --check scripts/rollback-config.js && node --check scripts/patch-codex-broker.js && node --check scripts/package-handoff.js && node --check scripts/check-live-config.js && node --check scripts/smoke-ls.js && node --check scripts/test-auth.js && node --check scripts/smoke-recovery.js && node --check scripts/smoke-ls-restart.js && node --check scripts/inspect-stage-b-proto.js && node --check scripts/smoke-stage-b.js && node --check scripts/smoke-broker-dry-run.js && node --check scripts/smoke-broker-load.js && node --check scripts/smoke-broker-tools.js && node --check scripts/smoke-broker-follower-lock.js && node --check scripts/check-b0.js && node --check scripts/smoke-stage-c.js && node --check scripts/smoke-stage-d.js && node --check scripts/smoke-stage-e.js && node --check scripts/smoke-stage-f.js && node --check scripts/smoke-stage-g.js && node --check scripts/smoke-stage-g-tool.js && node --check scripts/smoke-stage-g-boundary.js && node --check scripts/smoke-stage-h.js && node --check scripts/smoke-stage-h-tool.js && node --check scripts/smoke-current-binding.js && node --check scripts/smoke-auto-collect.js && node --check scripts/smoke-mcp-tools.js && node --check src/modelCatalog.js && node --check scripts/smoke-models.js && node --check scripts/smoke-model-fallback.js && node --check scripts/smoke-model-profile.js && node --check scripts/smoke-list-defaults.js && node --check scripts/smoke-collect-dedupe.js && node --check scripts/smoke-timeout-late-collect.js && node --check scripts/smoke-step-pagination.js",
     "test:auth": "node scripts/test-auth.js",
     "smoke:ls": "node scripts/smoke-ls.js",
     "smoke:recovery": "node scripts/smoke-recovery.js",
@@ -22,6 +22,7 @@
     "smoke:broker-dry-run": "node scripts/smoke-broker-dry-run.js",
     "smoke:broker-load": "node scripts/smoke-broker-load.js",
     "smoke:broker-tools": "node scripts/smoke-broker-tools.js",
+    "smoke:broker-follower-lock": "node scripts/smoke-broker-follower-lock.js",
     "check:b0": "node scripts/check-b0.js",
     "smoke:stage-c": "node scripts/smoke-stage-c.js",
     "smoke:mcp-tools": "node scripts/smoke-mcp-tools.js",
@@ -39,7 +40,9 @@
     "smoke:model-fallback": "node scripts/smoke-model-fallback.js",
     "smoke:model-profile": "node scripts/smoke-model-profile.js",
     "smoke:list-defaults": "node scripts/smoke-list-defaults.js",
-    "smoke:collect-dedupe": "node scripts/smoke-collect-dedupe.js"
+    "smoke:collect-dedupe": "node scripts/smoke-collect-dedupe.js",
+    "smoke:timeout-late-collect": "node scripts/smoke-timeout-late-collect.js",
+    "smoke:step-pagination": "node scripts/smoke-step-pagination.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1"

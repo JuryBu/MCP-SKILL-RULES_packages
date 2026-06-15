@@ -1,4 +1,4 @@
-﻿# Portable MCP + Rules 工具包（2026-6-9）
+﻿# Portable MCP + Rules 工具包（2026-6-16）
 
 这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板、portable user skills 和基础测试文件。
 
@@ -16,7 +16,7 @@ This snapshot includes `skills/`: allow-listed portable user-side Codex skills c
 
 ## 当前 MCP 版本
 
-- `memory-store`：`1.15.5`
+- `memory-store`：`1.15.13`
 - `web-fetcher`：`7.0.0`
 - `sandbox`：`1.13.3`
 - `broker`：`0.1.0`
@@ -78,9 +78,9 @@ Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.
 
 这个包只应包含源码、模板、说明和测试样例。不要包含发送方或接收方的 API Key、cookies、浏览器 profile、对话记录、记忆库、sqlite、sessions、日志、本机绝对路径或账户链接。
 
-## 2026-6-9 refresh
+## 2026-6-16 refresh
 
-This snapshot adds the Windsurf-only `mcp-subagent` source package, refreshes the Windsurf Rules template with subagent workflow guidance, keeps memory-store at 1.15.5, sandbox at 1.13.3, and web-fetcher at 7.0.0.
+This snapshot adds the Windsurf-only `mcp-subagent` source package, refreshes the Windsurf Rules template with subagent workflow guidance, keeps memory-store at 1.15.13, sandbox at 1.13.3, and web-fetcher at 7.0.0.
 
 ## Windsurf / WSF refresh
 

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import type { ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 
@@ -35,6 +36,8 @@ export interface WindsurfConversationSummary {
     cascadeId: string;
     trajectoryId?: string;
     title: string;
+    renamedTitle?: string;
+    titleSource?: "renamedTitle" | "summary" | "title" | "fallback";
     summary: string;
     stepCount: number;
     createdTime?: string;
@@ -43,6 +46,8 @@ export interface WindsurfConversationSummary {
     trajectoryType?: string;
     lastGeneratorModelUid?: string;
     cwd?: string;
+    workspaceUris?: string[];
+    referencedFiles?: string[];
 }
 
 export interface WindsurfConversationReadResult {
@@ -86,7 +91,44 @@ function toStringValue(value: unknown): string {
     return typeof value === "string" ? value : "";
 }
 
-function extractWorkspaceFromRecord(record: Record<string, any>): string | undefined {
+function decodePathLikeUri(value: unknown): string | undefined {
+    const raw = toStringValue(value).trim();
+    if (!raw) return undefined;
+    if (/^file:\/\//iu.test(raw)) {
+        try {
+            return fileURLToPath(raw);
+        } catch {
+            try {
+                return decodeURIComponent(raw.replace(/^file:\/\/\/?/iu, ""));
+            } catch {
+                return raw;
+            }
+        }
+    }
+    return raw;
+}
+
+function pushUniquePath(target: string[], value: unknown): void {
+    const decoded = decodePathLikeUri(value);
+    if (!decoded) return;
+    if (!target.some(item => item.toLowerCase() === decoded.toLowerCase())) {
+        target.push(decoded);
+    }
+}
+
+function extractWorkspaceUrisFromRecord(record: Record<string, any>): string[] {
+    const result: string[] = [];
+    for (const workspace of asArray(record.workspaces)) {
+        const workspaceRecord = asRecord(workspace);
+        pushUniquePath(
+            result,
+            workspaceRecord.workspaceFolderAbsoluteUri
+                ?? workspaceRecord.workspaceUri
+                ?? workspaceRecord.uri
+                ?? workspaceRecord.path
+                ?? workspaceRecord.workspace,
+        );
+    }
     const candidates = [
         record.workspaceUri,
         record.workspace,
@@ -97,10 +139,26 @@ function extractWorkspaceFromRecord(record: Record<string, any>): string | undef
         asRecord(record.localNodeState).workspaceUri,
     ];
     for (const candidate of candidates) {
-        const value = toStringValue(candidate).trim();
-        if (value) return value;
+        pushUniquePath(result, candidate);
     }
-    return undefined;
+    return result;
+}
+
+function extractWorkspaceFromRecord(record: Record<string, any>): string | undefined {
+    return extractWorkspaceUrisFromRecord(record)[0];
+}
+
+function extractReferencedFilesFromRecord(record: Record<string, any>): string[] {
+    const result: string[] = [];
+    for (const item of asArray(record.referencedFiles)) {
+        const itemRecord = asRecord(item);
+        if (Object.keys(itemRecord).length > 0) {
+            pushUniquePath(result, itemRecord.absolutePathUri ?? itemRecord.uri ?? itemRecord.path ?? itemRecord.filePath ?? itemRecord.name);
+        } else {
+            pushUniquePath(result, item);
+        }
+    }
+    return result;
 }
 
 function toNumberValue(value: unknown): number {
@@ -415,12 +473,27 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
     return entries.map(([cascadeId, info]) => {
         const record = asRecord(info);
         const id = toStringValue(record.cascadeId) || toStringValue(record.id) || cascadeId;
-        const summary = toStringValue(record.summary) || toStringValue(record.title) || "Untitled WSF Cascade";
+        const rawSummary = toStringValue(record.summary).trim();
+        const rawTitle = toStringValue(record.title).trim();
+        const renamedTitle = toStringValue(record.renamedTitle).trim();
+        const summary = rawSummary || rawTitle || "Untitled WSF Cascade";
+        const title = renamedTitle || summary;
+        const titleSource: WindsurfConversationSummary["titleSource"] = renamedTitle
+            ? "renamedTitle"
+            : rawSummary
+                ? "summary"
+                : rawTitle
+                    ? "title"
+                    : "fallback";
+        const workspaceUris = extractWorkspaceUrisFromRecord(record);
+        const referencedFiles = extractReferencedFilesFromRecord(record);
         return {
             id,
             cascadeId: id,
             trajectoryId: toStringValue(record.trajectoryId) || undefined,
-            title: summary,
+            title,
+            renamedTitle: renamedTitle || undefined,
+            titleSource,
             summary,
             stepCount: toNumberValue(record.stepCount),
             createdTime: toStringValue(record.createdTime) || undefined,
@@ -428,7 +501,9 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
             status: toStringValue(record.status) || undefined,
             trajectoryType: toStringValue(record.trajectoryType) || undefined,
             lastGeneratorModelUid: toStringValue(record.lastGeneratorModelUid) || undefined,
-            cwd: extractWorkspaceFromRecord(record),
+            cwd: workspaceUris[0] || extractWorkspaceFromRecord(record),
+            workspaceUris: workspaceUris.length ? workspaceUris : undefined,
+            referencedFiles: referencedFiles.length ? referencedFiles : undefined,
         };
     }).sort((left, right) => {
         const leftTime = Date.parse(left.lastModifiedTime || left.createdTime || "");

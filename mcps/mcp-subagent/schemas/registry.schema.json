@@ -138,6 +138,14 @@
         "collecting_turn": { "type": "integer", "minimum": 1 },
         "collecting_started_at": { "type": "string", "format": "date-time" },
         "collect_attempts": { "type": "integer", "minimum": 0 },
+        "timed_out_at": { "type": "string", "format": "date-time" },
+        "timeout_recheck_after": { "type": "string", "format": "date-time" },
+        "timeout_recheck_count": { "type": "integer", "minimum": 0 },
+        "timeout_notice_result": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "late_completed_after_timeout": { "type": "boolean" },
         "last_reply_at": { "type": "string", "format": "date-time" },
         "replies": {
           "type": "array",

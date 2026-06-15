@@ -15,7 +15,14 @@ async function pidExists(pid) {
 }
 
 export async function acquireProcessGuard() {
-  if (process.env.SUBAGENT_DISABLE_PROCESS_GUARD === "1") return null;
+  if (process.env.SUBAGENT_DISABLE_PROCESS_GUARD === "1") {
+    return {
+      acquired: true,
+      shouldStartSchedulers: true,
+      disabled: true,
+      mode: "disabled",
+    };
+  }
   await fs.mkdir(getDataDir(), { recursive: true });
   const lockPath = process.env.SUBAGENT_PROCESS_LOCK_PATH || path.join(getDataDir(), "process.lock");
   try {
@@ -41,6 +48,19 @@ export async function acquireProcessGuard() {
         replaced_stale_pid: lock.pid,
       }, null, 2));
     } else {
+      const brokerFollowerAllowed =
+        process.env.SUBAGENT_ALLOW_BROKER_FOLLOWER === "1"
+        || process.env.CODEX_MCP_BROKER === "1";
+      if (brokerFollowerAllowed) {
+        return {
+          acquired: false,
+          shouldStartSchedulers: false,
+          mode: "broker-follower",
+          lockPath,
+          ownerPid: lock?.pid || null,
+          ownerPpid: lock?.ppid || null,
+        };
+      }
       throw new Error(`mcp-subagent process already running; lock=${lockPath} pid=${lock?.pid || "unknown"}`);
     }
   }
@@ -73,5 +93,11 @@ export async function acquireProcessGuard() {
     }
   }, 30000);
   interval.unref?.();
-  return { lockPath, parentPid };
+  return {
+    acquired: true,
+    shouldStartSchedulers: true,
+    mode: "owner",
+    lockPath,
+    parentPid,
+  };
 }

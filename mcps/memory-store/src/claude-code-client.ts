@@ -16,6 +16,11 @@ export interface ClaudeCodeThreadInfo {
     entrypoint?: string | null;
     updatedAtMs?: number | null;
     lastPrompt?: string | null;
+    accountId?: string | null;
+    organizationId?: string | null;
+    desktopIndexPath?: string | null;
+    desktopIndexRoot?: string | null;
+    isArchived?: boolean | null;
 }
 
 export interface ClaudeCodeConversationData {
@@ -85,12 +90,39 @@ const CLAUDE_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CC_CONT
 const CLAUDE_CODE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const CLAUDE_COMPACT_FOLDED_MARKER = "[Claude Code compact summary folded";
 
+interface ClaudeCodeDesktopIndexEntry {
+    conversationId: string;
+    title?: string;
+    cwd?: string;
+    updatedAtMs?: number | null;
+    isArchived?: boolean | null;
+    accountId?: string | null;
+    organizationId?: string | null;
+    indexPath: string;
+    indexRoot: string;
+}
+
 function claudeHome(): string {
     return process.env.MEMORY_STORE_CLAUDE_HOME || path.join(os.homedir(), ".claude");
 }
 
 function claudeProjectsDir(): string {
     return path.join(claudeHome(), "projects");
+}
+
+function claudeDesktopIndexRoots(): string[] {
+    const envRoots = process.env.MEMORY_STORE_CLAUDE_DESKTOP_INDEX_ROOTS;
+    if (envRoots) {
+        return envRoots
+            .split(path.delimiter)
+            .map(item => item.trim())
+            .filter(Boolean);
+    }
+    const roaming = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    return [
+        path.join(roaming, "Claude", "claude-code-sessions"),
+        path.join(roaming, "Claude", "local-agent-mode-sessions"),
+    ];
 }
 
 function safeStat(filePath: string): fs.Stats | null {
@@ -123,6 +155,107 @@ function listJsonlFiles(root: string, limit = 1000): string[] {
     return result;
 }
 
+function firstString(...values: unknown[]): string | undefined {
+    for (const value of values) {
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return undefined;
+}
+
+function parseTimestampMs(value: unknown): number | null {
+    if (typeof value === "number" && Number.isFinite(value)) return value > 10_000_000_000 ? value : value * 1000;
+    if (typeof value === "string" && value.trim()) {
+        const parsed = Date.parse(value);
+        if (Number.isFinite(parsed)) return parsed;
+        const numeric = Number(value);
+        if (Number.isFinite(numeric)) return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+    }
+    return null;
+}
+
+function deriveDesktopIndexAccount(root: string, filePath: string): { accountId?: string | null; organizationId?: string | null } {
+    const relative = path.relative(root, filePath);
+    const parts = relative.split(/[\\/]+/u).filter(Boolean);
+    return {
+        accountId: parts.length >= 3 ? parts[0] : null,
+        organizationId: parts.length >= 3 ? parts[1] : null,
+    };
+}
+
+function parseClaudeCodeDesktopIndexFile(root: string, filePath: string): ClaudeCodeDesktopIndexEntry | null {
+    let raw = "";
+    try {
+        raw = fs.readFileSync(filePath, "utf8");
+    } catch {
+        return null;
+    }
+    let data: any;
+    try {
+        data = JSON.parse(raw);
+    } catch {
+        return null;
+    }
+    const conversationId = firstString(
+        data?.cliSessionId,
+        data?.sessionId,
+        data?.conversationId,
+        data?.id,
+        data?.transcriptId,
+    );
+    if (!conversationId || !CLAUDE_CODE_ID_RE.test(conversationId)) return null;
+    const derived = deriveDesktopIndexAccount(root, filePath);
+    return {
+        conversationId,
+        title: firstString(data?.title, data?.customTitle, data?.aiTitle, data?.name),
+        cwd: firstString(data?.cwd, data?.workspace, data?.projectPath, data?.projectRoot),
+        updatedAtMs: parseTimestampMs(data?.lastActivityAt ?? data?.updatedAt ?? data?.mtime ?? data?.createdAt),
+        isArchived: typeof data?.isArchived === "boolean" ? data.isArchived : null,
+        accountId: firstString(data?.accountId, data?.userId) || derived.accountId || null,
+        organizationId: firstString(data?.organizationId, data?.orgId, data?.workspaceId) || derived.organizationId || null,
+        indexPath: filePath,
+        indexRoot: root,
+    };
+}
+
+function listClaudeCodeDesktopIndexFiles(root: string, limit: number): string[] {
+    if (!fs.existsSync(root)) return [];
+    const result: string[] = [];
+    const stack = [root];
+    while (stack.length && result.length < limit) {
+        const dir = stack.pop()!;
+        let entries: fs.Dirent[] = [];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) stack.push(full);
+            else if (entry.isFile() && /^local_.*\.json$/iu.test(entry.name)) result.push(full);
+            if (result.length >= limit) break;
+        }
+    }
+    return result;
+}
+
+function readClaudeCodeDesktopIndexMap(): Map<string, ClaudeCodeDesktopIndexEntry> {
+    const maxFiles = Math.max(Number(process.env.MEMORY_STORE_CC_DESKTOP_INDEX_MAX_FILES || 5000), 1);
+    const map = new Map<string, ClaudeCodeDesktopIndexEntry>();
+    for (const root of claudeDesktopIndexRoots()) {
+        const remaining = maxFiles - map.size;
+        if (remaining <= 0) break;
+        for (const filePath of listClaudeCodeDesktopIndexFiles(root, remaining)) {
+            const entry = parseClaudeCodeDesktopIndexFile(root, filePath);
+            if (!entry) continue;
+            const key = entry.conversationId.toLowerCase();
+            const existing = map.get(key);
+            if (!existing || (entry.updatedAtMs || 0) > (existing.updatedAtMs || 0)) map.set(key, entry);
+        }
+    }
+    return map;
+}
+
 function isLikelyClaudeCodeIdLookup(query: string): boolean {
     return /^[0-9a-f-]{8,36}$/iu.test(query);
 }
@@ -132,6 +265,7 @@ function findClaudeCodeThreadsByIdLookup(query: string): ClaudeCodeThreadInfo[] 
     if (!isLikelyClaudeCodeIdLookup(normalized)) return [];
     const root = claudeProjectsDir();
     if (!fs.existsSync(root)) return [];
+    const desktopIndex = readClaudeCodeDesktopIndexMap();
     const matches: ClaudeCodeThreadInfo[] = [];
     const stack = [root];
     while (stack.length && matches.length < 2) {
@@ -151,7 +285,7 @@ function findClaudeCodeThreadsByIdLookup(query: string): ClaudeCodeThreadInfo[] 
             if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".jsonl")) continue;
             const id = path.basename(entry.name, ".jsonl").toLowerCase();
             if (!CLAUDE_CODE_ID_RE.test(id) || !id.startsWith(normalized)) continue;
-            const thread = readThreadMetadata(full);
+            const thread = readThreadMetadata(full, desktopIndex);
             if (thread) matches.push(thread);
             if (id === normalized) return matches;
             if (matches.length >= 2) return matches;
@@ -298,7 +432,17 @@ function isLikelyPath(input: string): boolean {
     return /^[a-zA-Z]:[\\/]/u.test(input) || /^\\\\/u.test(input) || /^[./~]/u.test(input);
 }
 
-function extractMessageContent(content: any, cwd?: string): { text: string; thinking: string; toolUses: any[]; toolResults: any[]; attachments: ConversationAttachment[] } {
+interface ExtractMessageContentOptions {
+    includeEncryptedThinkingPlaceholders?: boolean;
+    stepIndex?: number;
+}
+
+function encryptedThinkingPlaceholder(stepIndex?: number): string {
+    const stepLabel = typeof stepIndex === "number" ? ` step ${stepIndex}` : "";
+    return `🔒 加密思考块${stepLabel}：thinking 为空，signature 存在，明文不可读`;
+}
+
+function extractMessageContent(content: any, cwd?: string, options: ExtractMessageContentOptions = {}): { text: string; thinking: string; toolUses: any[]; toolResults: any[]; attachments: ConversationAttachment[] } {
     if (typeof content === "string") {
         return { text: truncate(content, CLAUDE_TEXT_FIELD_MAX_CHARS), thinking: "", toolUses: [], toolResults: [], attachments: [] };
     }
@@ -314,7 +458,11 @@ function extractMessageContent(content: any, cwd?: string): { text: string; thin
         if (item.type === "text" && typeof item.text === "string") {
             parts.push(item.text);
         } else if (item.type === "thinking" && typeof item.thinking === "string") {
-            thinking.push(item.thinking);
+            if (item.thinking.trim()) {
+                thinking.push(item.thinking);
+            } else if (options.includeEncryptedThinkingPlaceholders && typeof item.signature === "string" && item.signature.length > 0) {
+                thinking.push(encryptedThinkingPlaceholder(options.stepIndex));
+            }
         } else if (item.type === "tool_use") {
             toolUses.push(item);
         } else if (item.type === "tool_result") {
@@ -438,10 +586,11 @@ function compactSummaryPlaceholder(info: CompactionSummaryInfo): string {
     return `${CLAUDE_COMPACT_FOLDED_MARKER}: chars=${info.summaryChars}, sha256=${info.summarySha256.slice(0, 12)}, line=${info.eventLineNo ?? "?"}]`;
 }
 
-function readThreadMetadata(jsonlPath: string): ClaudeCodeThreadInfo | null {
+function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, ClaudeCodeDesktopIndexEntry>): ClaudeCodeThreadInfo | null {
     const id = path.basename(jsonlPath, ".jsonl");
     const stat = safeStat(jsonlPath);
     if (!stat?.isFile()) return null;
+    const desktop = desktopIndex?.get(id.toLowerCase());
     let cwd = "";
     let title = "";
     let aiTitle = "";
@@ -468,13 +617,18 @@ function readThreadMetadata(jsonlPath: string): ClaudeCodeThreadInfo | null {
     return {
         id,
         jsonlPath,
-        cwd,
-        title: customTitle || aiTitle || title || lastPrompt || id,
+        cwd: cwd || desktop?.cwd || "",
+        title: customTitle || aiTitle || desktop?.title || title || lastPrompt || id,
         source: "claude-code",
         model,
         entrypoint,
-        updatedAtMs: stat.mtimeMs,
+        updatedAtMs: desktop?.updatedAtMs || stat.mtimeMs,
         lastPrompt,
+        accountId: desktop?.accountId || null,
+        organizationId: desktop?.organizationId || null,
+        desktopIndexPath: desktop?.indexPath || null,
+        desktopIndexRoot: desktop?.indexRoot || null,
+        isArchived: desktop?.isArchived ?? null,
     };
 }
 
@@ -483,12 +637,13 @@ export function isClaudeCodeStoreAvailable(): boolean {
 }
 
 export function listRecentClaudeCodeThreads(limit = 50): ClaudeCodeThreadInfo[] {
+    const desktopIndex = readClaudeCodeDesktopIndexMap();
     return listJsonlFiles(claudeProjectsDir(), Math.max(limit * 10, 100))
         .map(filePath => ({ filePath, stat: safeStat(filePath) }))
         .filter((item): item is { filePath: string; stat: fs.Stats } => Boolean(item.stat?.isFile()))
         .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
         .slice(0, limit)
-        .map(item => readThreadMetadata(item.filePath))
+        .map(item => readThreadMetadata(item.filePath, desktopIndex))
         .filter((item): item is ClaudeCodeThreadInfo => Boolean(item));
 }
 
@@ -512,8 +667,12 @@ export function resolveClaudeCodeThreadId(input: string): string | null {
 export function getClaudeCodeThread(conversationId: string): ClaudeCodeThreadInfo | null {
     const resolved = resolveClaudeCodeThreadId(conversationId);
     if (!resolved) return null;
+    const desktopIndex = readClaudeCodeDesktopIndexMap();
     const exactByFile = findClaudeCodeThreadsByIdLookup(resolved);
     if (exactByFile.length === 1) return exactByFile[0];
+    const root = claudeProjectsDir();
+    const directMatches = listJsonlFiles(root, 5000).filter(filePath => path.basename(filePath, ".jsonl").toLowerCase() === resolved.toLowerCase());
+    if (directMatches.length === 1) return readThreadMetadata(directMatches[0], desktopIndex);
     return listRecentClaudeCodeThreads(1000).find(thread => thread.id === resolved) || null;
 }
 
@@ -577,7 +736,10 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
         if (!event) return;
         const type = event.type;
         const message = event.message || {};
-        const extracted = extractMessageContent(message.content, event.cwd || cwd);
+        const extracted = extractMessageContent(message.content, event.cwd || cwd, {
+            includeEncryptedThinkingPlaceholders: true,
+            stepIndex,
+        });
 
         if (type === "user") {
             if (extracted.toolResults.length > 0 && !extracted.text) {

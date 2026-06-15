@@ -1,4 +1,4 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { saveTempFile } from "../temp-store.js";
@@ -12,7 +12,7 @@ import {
     type CompactionMode,
 } from "../trajectory.js";
 import { shouldAutoUpdateRecord } from "../record-generator.js";
-import { generateRecord, countPhasesInRecord } from "../record-generator.js";
+import { generateRecord, countPhasesInRecord, validateRecordCandidateForWrite } from "../record-generator.js";
 import { readRecord, writeRecord, resolveWorkspaceHashForRecord, findRecordHash, writeRecordSidecar } from "../record-store.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
 import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
@@ -21,7 +21,9 @@ import { listConversationsByMtime } from "../ls-client.js";
 import {
     deepLocateCodexConversations,
     findCodexContextProbeMatches,
+    getCodexParentThread,
     getCodexThread,
+    listCodexThreadsForMetadata,
     listRecentCodexThreads,
     type CodexDeepLocateResult,
     type CodexThreadInfo,
@@ -46,12 +48,15 @@ import {
     formatSourceStatuses,
     type SourceFailureMode,
     type IdResolutionMode,
+    type WorkspaceMatchScope,
+    type ConversationThreadMode,
 } from "../conversation-filter.js";
 import { exportConversationBatch, formatConversationBatchExportResult } from "../conversation-batch-export.js";
 
 const CONVERSATION_FETCH_TEXT_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_FETCH_TEXT_MAX_CHARS || 2_000_000);
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS || 2_000_000);
 const CONVERSATION_SEARCH_BLOCK_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_SEARCH_BLOCK_MAX_CHARS || 60_000);
+const CONVERSATION_LIST_TITLE_MAX_CHARS = Math.max(Number(process.env.MEMORY_STORE_CONVERSATION_LIST_TITLE_MAX_CHARS || 120), 20);
 const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "export"]);
 
 export function shouldRequireExplicitConversationId(
@@ -73,20 +78,258 @@ function formatMissingConversationIdMessage(action: string, dataChain: DataChain
     ].join("\n");
 }
 
-function normalizeListQuery(input: string): string {
+export function normalizeListQuery(input: string): string {
     return input
         .toLowerCase()
         .normalize("NFKC")
         .replace(/[^\p{L}\p{N}]+/gu, "");
 }
 
+function isUsefulListQueryTerm(term: string): boolean {
+    if (!term) return false;
+    if (/^[a-z0-9]$/u.test(term)) return false;
+    return term.length >= 2 || /[\u3400-\u9fff]/u.test(term);
+}
+
+export function splitListQueryTerms(input: string): string[] {
+    const seen = new Set<string>();
+    const terms: string[] = [];
+    for (const rawTerm of input.trim().split(/\s+/u)) {
+        const term = normalizeListQuery(rawTerm);
+        if (!isUsefulListQueryTerm(term) || seen.has(term)) continue;
+        seen.add(term);
+        terms.push(term);
+    }
+    return terms;
+}
+
 export interface ConversationListCandidate {
     id: string;
     title: string;
     workspace: string;
+    workspaces?: string[];
     updatedAt: string;
     detail: string;
     contextProbe?: string[];
+    agentRole?: string | null;
+    agentNickname?: string | null;
+    parentConversationId?: string | null;
+    rootConversationId?: string | null;
+    isChildThread?: boolean;
+    matchedChildConversationId?: string | null;
+    matchedChildTitle?: string | null;
+}
+
+type ConversationMessageRole = "user" | "system" | "model" | "assistant" | "tool";
+
+function uniqueWorkspaceLines(primary?: string, all?: string[]): string[] {
+    const result: string[] = [];
+    for (const item of [primary, ...(all || [])]) {
+        const workspace = item?.trim();
+        if (!workspace) continue;
+        if (!result.some(existing => existing.toLowerCase() === workspace.toLowerCase())) {
+            result.push(workspace);
+        }
+    }
+    return result;
+}
+
+function formatWorkspaceLines(primary?: string, all?: string[]): string {
+    const workspaces = uniqueWorkspaceLines(primary, all);
+    if (workspaces.length === 0) return "";
+    if (workspaces.length === 1) return `\n   工作区: ${workspaces[0]}`;
+    return `\n   工作区: ${workspaces[0]}\n   关联工作区: ${workspaces.slice(1).join(" | ")}`;
+}
+
+function formatCodexSubagentSourceNote(loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null } }): string {
+    if (loaded.chainUsed !== "codex") return "";
+    const thread = loaded.codexData?.thread;
+    if (!thread?.agentRole && !thread?.agentNickname) return "";
+    const parentThread = loaded.codexData?.parentThread || getCodexParentThread(thread.id);
+    return [
+        "🤝 Codex 子代理线程",
+        parentThread?.id ? `源头对话ID: ${parentThread.id}` : "源头对话ID: (未找到)",
+        parentThread?.title ? `源头标题: ${formatConversationListTitleForTest(parentThread.title, 80)}` : "",
+        thread.agentRole ? `子代理角色: ${thread.agentRole}` : "",
+        thread.agentNickname ? `子代理名称: ${thread.agentNickname}` : "",
+    ].filter(Boolean).join("\n");
+}
+
+function formatConversationSearchHeader(
+    cascadeId: string,
+    loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null } },
+    modelChain?: string,
+): string {
+    const subagentNote = formatCodexSubagentSourceNote(loaded);
+    return [
+        `📂 对话: ${cascadeId}`,
+        `🔗 数据链路: ${loaded.chainUsed}${modelChain ? ` | 模型链路: ${modelChain}` : ""}`,
+        subagentNote,
+    ].filter(Boolean).join("\n");
+}
+
+export function formatConversationListTitleForTest(title: string, maxChars = CONVERSATION_LIST_TITLE_MAX_CHARS): string {
+    const normalized = (title || "(无标题)").replace(/\s+/gu, " ").trim() || "(无标题)";
+    if (normalized.length <= maxChars) return normalized;
+    return `${normalized.slice(0, Math.max(maxChars - 19, 1)).trimEnd()}… [titleTruncated]`;
+}
+
+export function formatConversationListDisplayTitleForTest(
+    title: string,
+    options: { dataChain?: string; agentRole?: string | null; agentNickname?: string | null } = {},
+    maxChars = CONVERSATION_LIST_TITLE_MAX_CHARS,
+): string {
+    const base = formatConversationListTitleForTest(title, maxChars);
+    if (options.dataChain === "codex" && (options.agentRole || options.agentNickname)) {
+        const role = options.agentRole || options.agentNickname || "subagent";
+        return `子代理对话(${role})：${base}`;
+    }
+    return base;
+}
+
+function truncateForRoleView(input: string, depth: Depth): string {
+    const text = input || "";
+    const limit = depth === "brief" ? 100 : depth === "normal" ? 20_000 : Number.POSITIVE_INFINITY;
+    if (text.length <= limit) return text;
+    return `${text.slice(0, limit)}\n\n⚠️ 本段过长已截断（${text.length}→${limit}字），可用 depth="full" 展开`;
+}
+
+function normalizeMessageRoles(input?: ConversationMessageRole[]): Set<ConversationMessageRole> {
+    const result = new Set<ConversationMessageRole>();
+    for (const role of input || []) {
+        if (role === "model" || role === "assistant") {
+            result.add("model");
+            result.add("assistant");
+        } else {
+            result.add(role);
+        }
+    }
+    return result;
+}
+
+function isSystemLikeRound(round: ConversationRound): boolean {
+    if (round.compactionSummaries?.length) return true;
+    const text = (round.userMessage || "").trimStart();
+    return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
+        || text.startsWith("# AGENTS.md instructions for ")
+        || text.startsWith("[Claude Code compact summary folded")
+        || text.includes("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
+}
+
+function formatRoundForMessageRoles(
+    round: ConversationRound,
+    depth: Depth,
+    extraTypes: ExtraType[],
+    roles: Set<ConversationMessageRole>,
+    compactionMode: CompactionMode,
+): string {
+    if (roles.size === 0) return formatRound(round, depth, extraTypes, { compactionMode });
+
+    const systemLike = isSystemLikeRound(round);
+    const includeUser = roles.has("user") && !systemLike;
+    const includeSystem = roles.has("system") && systemLike;
+    const includeModel = roles.has("model") || roles.has("assistant");
+    const includeTool = roles.has("tool");
+    const hasToolLike = round.toolCalls.length > 0
+        || round.taskBoundaries.length > 0
+        || round.codeActions.length > 0
+        || (round.fileViews?.length || 0) > 0
+        || round.subagentSummaries.length > 0;
+
+    if (!includeUser && !includeSystem && !(includeModel && round.aiResponses.length > 0) && !(includeTool && hasToolLike)) {
+        return "";
+    }
+
+    const lines: string[] = [`## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`];
+
+    if (includeUser || includeSystem) {
+        lines.push(includeSystem
+            ? `### 🧩 系统/压缩内容 (step ${round.startStep})`
+            : `### 👤 用户 (step ${round.startStep})`);
+        if (round.compactionSummaries?.length) {
+            for (const item of round.compactionSummaries) {
+                const meta = `chars=${item.summaryChars}, sha256=${item.summarySha256.slice(0, 12)}`;
+                if (compactionMode === "full" || depth === "full") {
+                    lines.push(`🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
+                    lines.push("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
+                    lines.push(truncateForRoleView(item.text, depth));
+                    lines.push("<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>");
+                } else if (compactionMode === "omit") {
+                    lines.push(`🧩 Claude Code 压缩续聊摘要已省略（${meta}）`);
+                } else {
+                    lines.push(`🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`);
+                    lines.push("说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。");
+                }
+            }
+        } else {
+            lines.push(truncateForRoleView(round.userMessage, depth));
+        }
+        if (includeUser && round.attachments?.length) {
+            for (const attachment of round.attachments) {
+                const label = attachment.kind === "image" ? "图片" : "文件";
+                const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
+                lines.push(`📎 ${label}: ${target}`);
+            }
+        }
+        if (includeUser && round.mediaAttachments.length > 0) {
+            for (const uri of round.mediaAttachments) lines.push(`📎 图片: ${uri}`);
+        }
+        lines.push("");
+    }
+
+    if (includeModel) {
+        for (const ai of round.aiResponses) {
+            lines.push(`### 🤖 AI (step ${ai.stepIndex})`);
+            lines.push(truncateForRoleView(ai.response, depth));
+            if (ai.thinking && (depth === "full" || extraTypes.includes("thinking"))) {
+                lines.push("");
+                lines.push(`<details><summary>💭 思考 (${ai.thinking.length}字)</summary>`);
+                lines.push("");
+                lines.push(ai.thinking);
+                lines.push("</details>");
+            }
+            lines.push("");
+        }
+    }
+
+    if (includeTool) {
+        if (round.toolCalls.length > 0) {
+            lines.push("#### 🔧 工具调用");
+            for (const tc of round.toolCalls) {
+                let line = `- ${tc.name}`;
+                if (depth === "full" || extraTypes.includes("tool_results")) {
+                    line += `(${tc.argsSummary})`;
+                    if (tc.resultSummary) line += ` → ${truncateForRoleView(tc.resultSummary, depth === "full" ? "normal" : depth)}`;
+                }
+                lines.push(line);
+            }
+            lines.push("");
+        }
+        if (round.taskBoundaries.length > 0 && depth !== "brief") {
+            const latest = round.taskBoundaries[round.taskBoundaries.length - 1];
+            lines.push(`📋 任务: ${latest.taskName} → ${latest.taskStatus}`);
+            lines.push("");
+        }
+        if (round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
+            lines.push("#### ✏️ 代码编辑");
+            for (const ca of round.codeActions) lines.push(`- **${ca.targetFile}**: ${ca.description}`);
+            lines.push("");
+        }
+        if (round.fileViews?.length && extraTypes.includes("file_views")) {
+            lines.push("#### 📄 文件/计划视图");
+            for (const view of round.fileViews) lines.push(`- ${view.kind}${view.title ? ` / ${view.title}` : ""}: ${view.textSummary}`);
+            lines.push("");
+        }
+        if (round.subagentSummaries.length > 0) {
+            lines.push("#### 🤝 子代理线程");
+            for (const subagent of round.subagentSummaries) {
+                lines.push(`- ${subagent.nickname || subagent.threadId} (${subagent.threadId})${subagent.role ? ` / ${subagent.role}` : ""}`);
+            }
+            lines.push("");
+        }
+    }
+
+    return lines.join("\n").trimEnd();
 }
 
 function buildConversationListLines(
@@ -103,8 +346,12 @@ function buildConversationListLines(
         ...(notes.length ? ["", ...notes] : []),
         "",
         ...shown.map((item, idx) => {
-            const title = item.title || "(无标题)";
-            const ws = item.workspace ? `\n   工作区: ${item.workspace}` : "";
+            const title = formatConversationListDisplayTitleForTest(item.title, {
+                dataChain: resolved,
+                agentRole: item.agentRole,
+                agentNickname: item.agentNickname,
+            });
+            const ws = formatWorkspaceLines(item.workspace, item.workspaces);
             const detail = item.detail ? ` | ${item.detail}` : "";
             const probe = item.contextProbe?.length
                 ? `\n   🎯 contextProbe: ${item.contextProbe.join("；")}`
@@ -115,6 +362,8 @@ function buildConversationListLines(
 }
 
 function candidateFromCodexThread(item: CodexThreadInfo): ConversationListCandidate {
+    const parentThread = item.parentConversationId ? null : ((item.agentRole || item.agentNickname) ? getCodexParentThread(item.id) : null);
+    const parentConversationId = item.parentConversationId || parentThread?.id || null;
     return {
         id: item.id,
         title: item.title || "",
@@ -122,10 +371,39 @@ function candidateFromCodexThread(item: CodexThreadInfo): ConversationListCandid
         updatedAt: item.updatedAtMs ? new Date(item.updatedAtMs).toISOString() : "",
         detail: [
             item.agentRole ? `agent=${item.agentRole}` : "",
+            parentConversationId ? "childThread" : "",
+            parentConversationId ? `parentConversationId=${parentConversationId}` : "",
             item.model,
             item.reasoningEffort,
         ].filter(Boolean).join(" / "),
+        agentRole: item.agentRole || null,
+        agentNickname: item.agentNickname || null,
+        parentConversationId,
+        rootConversationId: item.rootConversationId || parentConversationId,
+        isChildThread: Boolean(parentConversationId),
     };
+}
+
+function applyDefaultMainThreadMode(candidates: ConversationListCandidate[]): ConversationListCandidate[] {
+    const main = candidates.filter(item => !item.parentConversationId);
+    const byId = new Map(main.map(item => [item.id, item]));
+    for (const child of candidates.filter(item => item.parentConversationId)) {
+        const parent = candidates.find(item => item.id === child.parentConversationId);
+        if (!parent || byId.has(parent.id)) continue;
+        const promoted: ConversationListCandidate = {
+            ...parent,
+            matchedChildConversationId: child.id,
+            matchedChildTitle: child.title || child.agentNickname || child.id,
+            detail: [
+                parent.detail,
+                `matchedChildConversationId=${child.id}`,
+                child.title ? `matchedChildTitle=${child.title.slice(0, 80)}` : "",
+            ].filter(Boolean).join(" / "),
+        };
+        main.push(promoted);
+        byId.set(parent.id, promoted);
+    }
+    return main;
 }
 
 function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): ConversationListCandidate {
@@ -148,9 +426,13 @@ function candidateFromWindsurfThread(item: WindsurfConversationSummary): Convers
         id: item.id,
         title: item.title || item.summary || "",
         workspace: item.cwd || "",
+        workspaces: item.workspaceUris,
         updatedAt: item.lastModifiedTime || item.createdTime || "",
         detail: [
             "windsurf",
+            item.titleSource === "renamedTitle" ? "title=renamedTitle" : "",
+            item.workspaceUris?.length ? `workspaces=${item.workspaceUris.length}` : "",
+            item.referencedFiles?.length ? `referencedFiles=${item.referencedFiles.length}` : "",
             item.status,
             item.stepCount ? `${item.stepCount} steps` : "",
             item.lastGeneratorModelUid,
@@ -289,22 +571,54 @@ export function sortContextProbeFirst(items: ConversationListCandidate[]): Conve
     });
 }
 
-function listQueryPriority(item: ConversationListCandidate, normalizedQuery: string): number {
+function listCandidateHaystack(item: ConversationListCandidate): string {
+    return normalizeListQuery([
+        item.id,
+        item.title,
+        item.workspace,
+        ...(item.workspaces || []),
+        item.agentRole || "",
+        item.agentNickname || "",
+    ].join("\n"));
+}
+
+function listQueryTermsMatch(haystack: string, queryTerms: string[]): boolean {
+    return queryTerms.length > 1 && queryTerms.some(term => haystack.includes(term));
+}
+
+export function listCandidateMatchesQuery(item: ConversationListCandidate, normalizedQuery: string, queryTerms: string[] = []): boolean {
+    if (!normalizedQuery) return true;
+    const haystack = listCandidateHaystack(item);
+    return haystack.includes(normalizedQuery) || listQueryTermsMatch(haystack, queryTerms);
+}
+
+function listFieldIncludesAny(field: string, queryTerms: string[]): boolean {
+    return queryTerms.length > 1 && queryTerms.some(term => field.includes(term));
+}
+
+function listQueryPriority(item: ConversationListCandidate, normalizedQuery: string, queryTerms: string[] = []): number {
     if (!normalizedQuery) return 9;
     const id = normalizeListQuery(item.id);
     const title = normalizeListQuery(item.title || "");
     const workspace = normalizeListQuery(item.workspace || "");
+    const workspaces = normalizeListQuery((item.workspaces || []).join("\n"));
+    const agent = normalizeListQuery([item.agentRole || "", item.agentNickname || ""].join("\n"));
+    const haystack = [id, title, workspace, workspaces, agent].join("\n");
     if (id === normalizedQuery) return 0;
     if (normalizedQuery.length >= 8 && id.startsWith(normalizedQuery)) return 1;
     if (title === normalizedQuery) return 2;
     if (title.includes(normalizedQuery)) return 3;
     if (workspace.includes(normalizedQuery)) return 4;
+    if (listFieldIncludesAny(title, queryTerms)) return 5;
+    if (listFieldIncludesAny(workspace, queryTerms) || listFieldIncludesAny(workspaces, queryTerms)) return 6;
+    if (listFieldIncludesAny(agent, queryTerms)) return 7;
+    if (listQueryTermsMatch(haystack, queryTerms)) return 8;
     return 9;
 }
 
-export function sortListMatchesByQuery(items: ConversationListCandidate[], normalizedQuery: string): ConversationListCandidate[] {
+export function sortListMatchesByQuery(items: ConversationListCandidate[], normalizedQuery: string, queryTerms: string[] = []): ConversationListCandidate[] {
     return [...items].sort((a, b) => {
-        const priority = listQueryPriority(a, normalizedQuery) - listQueryPriority(b, normalizedQuery);
+        const priority = listQueryPriority(a, normalizedQuery, queryTerms) - listQueryPriority(b, normalizedQuery, queryTerms);
         if (priority !== 0) return priority;
         return (Date.parse(b.updatedAt || "") || 0) - (Date.parse(a.updatedAt || "") || 0);
     });
@@ -676,6 +990,8 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 .describe("export 模式：PDF 原生附件嵌入策略；auto=可用时尝试，off=只生成链接/清单，force=失败时报 warning/失败状态"),
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
                 .describe("额外拉取的内容类型"),
+            messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool"])).optional()
+                .describe("read 模式：按消息角色选择性读取。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
@@ -686,6 +1002,8 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 .describe("list/export 批量模式：按工作区路径过滤，可传一个或多个目录"),
             workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
                 .describe("工作区过滤：contains=父子目录任意包含，exact=精确路径，under=候选在指定目录下，any/all=多工作区聚合；默认 contains"),
+            workspaceScope: z.enum(["any", "primary"]).optional()
+                .describe("工作区过滤范围：any=主工作区或关联工作区任意命中，primary=只匹配主工作区；默认 any，保持旧行为"),
             exportBatch: z.boolean().optional()
                 .describe("export 模式：true=按 dataChains/workspaces/query 过滤后批量导出多条对话，每条对话独立目录"),
             batchLimit: z.number().optional()
@@ -696,6 +1014,14 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 .describe("多源查询/导出：warn=单源失败只警告并继续，fail=任一源失败即整体失败；默认 warn"),
             idResolutionMode: z.enum(["unique", "priority"]).optional()
                 .describe("dataChain=auto 且传 conversationId 时：unique=并行全源唯一匹配，priority=保留旧优先级顺序；默认 unique"),
+            threadMode: z.enum(["main", "children", "all"]).optional()
+                .describe("Codex list/export 线程过滤：main=默认只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程都返回"),
+            parentConversationId: z.string().optional()
+                .describe("threadMode=children 时指定父线程 conversationId"),
+            parentQuery: z.string().optional()
+                .describe("threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
+            parentDataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
+                .describe("预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤"),
             modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain。Windsurf 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
@@ -724,6 +1050,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     includeAssets,
                     pdfEmbedAttachments,
                     extraTypes = [],
+                    messageRoles,
                     background,
                     taskId,
                     waitSeconds,
@@ -736,11 +1063,16 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     dataChains,
                     workspaces,
                     workspaceMode = "contains",
+                    workspaceScope = "any",
                     exportBatch,
                     batchLimit,
                     batchConcurrency,
                     sourceFailureMode = "warn",
                     idResolutionMode = "unique",
+                    threadMode,
+                    parentConversationId,
+                    parentQuery,
+                    parentDataChain,
                     modelChain,
                     link = DEFAULT_LINK_MODE,
                 } = params;
@@ -848,12 +1180,17 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 }
 
                 if (action === "list") {
-                    if (dataChains?.length || workspaces?.length) {
+                    if (dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
                         const result = await listConversationCandidates({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
                             query,
                             workspaces,
                             workspaceMode,
+                            workspaceScope: workspaceScope as WorkspaceMatchScope,
+                            threadMode: threadMode as ConversationThreadMode | undefined,
+                            parentConversationId,
+                            parentQuery,
+                            parentDataChain,
                             limit,
                             sourceFailureMode: sourceFailureMode as SourceFailureMode,
                         });
@@ -875,14 +1212,19 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         const lines = [
                             "🔎 多源候选查询",
                             `候选对话: ${result.candidates.length}${query ? ` | 关键词: ${query}` : ""}`,
-                            workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode})` : "",
+                            workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode}, ${workspaceScope})` : "",
+                            threadMode ? `线程模式: ${threadMode}${parentConversationId ? ` | parent=${parentConversationId}` : ""}${parentQuery ? ` | parentQuery=${parentQuery}` : ""}` : "",
                             "",
                             "🔗 数据源状态:",
                             ...formatSourceStatuses(result.statuses),
                             "",
                             ...result.candidates.map((item, idx) => {
-                                const title = item.title || "(无标题)";
-                                const workspaceLine = item.workspace ? `\n   工作区: ${item.workspace}` : "";
+                                const title = formatConversationListDisplayTitleForTest(item.title, {
+                                    dataChain: item.dataChain,
+                                    agentRole: item.agentRole,
+                                    agentNickname: item.agentNickname,
+                                });
+                                const workspaceLine = formatWorkspaceLines(item.workspace, item.workspaces);
                                 const detail = item.detail ? ` | ${item.detail}` : "";
                                 return `${idx + 1}. [${item.dataChain}] ${title}\n   ID: ${item.id}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${workspaceLine}`;
                             }),
@@ -916,7 +1258,9 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             detail: `${item.sizeKB.toFixed(1)} KB`,
                         }))
                         : resolved === "codex"
-                            ? (codexThreads = listRecentCodexThreads(candidateLimit)).map(candidateFromCodexThread)
+                            ? (codexThreads = normalizedQuery
+                                ? listCodexThreadsForMetadata(Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000))
+                                : listRecentCodexThreads(candidateLimit)).map(candidateFromCodexThread)
                             : resolved === "claude-code"
                                 ? (claudeCodeThreads = listRecentClaudeCodeThreads(candidateLimit)).map(candidateFromClaudeCodeThread)
                                 : (windsurfThreads = await listRecentWindsurfThreads(candidateLimit)).map(candidateFromWindsurfThread);
@@ -950,15 +1294,16 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             ? annotateClaudeCodeContextProbeCandidates(candidates, claudeCodeThreads, contextProbe)
                         : { candidates, matchMode: "", hitCount: 0 };
 
+                    const queryTerms = splitListQueryTerms(query || "");
                     const directMatches = normalizedQuery
-                        ? probeResult.candidates.filter(item => {
-                            const haystack = normalizeListQuery(`${item.id}\n${item.title}\n${item.workspace}`);
-                            return haystack.includes(normalizedQuery);
-                        })
+                        ? probeResult.candidates.filter(item => listCandidateMatchesQuery(item, normalizedQuery, queryTerms))
                         : probeResult.candidates;
 
-                    let filtered = normalizedQuery ? sortListMatchesByQuery(directMatches, normalizedQuery) : directMatches;
-                    let matchMode = normalizedQuery ? "exact" : "";
+                    let filtered = normalizedQuery ? sortListMatchesByQuery(directMatches, normalizedQuery, queryTerms) : directMatches;
+                    if (resolved === "codex" && !threadMode) {
+                        filtered = applyDefaultMainThreadMode(filtered);
+                    }
+                    let matchMode = normalizedQuery ? (queryTerms.length > 1 ? "metadata-or" : "exact") : "";
                     const listNotes: string[] = [];
                     if (probeResult.matchMode) {
                         filtered = probeResult.hitCount > 0
@@ -1107,6 +1452,11 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             query,
                             workspaces,
                             workspaceMode,
+                            workspaceScope: workspaceScope as WorkspaceMatchScope,
+                            threadMode: threadMode as ConversationThreadMode | undefined,
+                            parentConversationId,
+                            parentQuery,
+                            parentDataChain,
                             limit: requestedBatchLimit,
                             sourceFailureMode: sourceFailureMode as SourceFailureMode,
                         });
@@ -1116,6 +1466,11 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             query,
                             workspaces,
                             workspaceMode,
+                            workspaceScope: workspaceScope as WorkspaceMatchScope,
+                            threadMode: threadMode as ConversationThreadMode | undefined,
+                            parentConversationId,
+                            parentQuery,
+                            parentDataChain,
                             limit: requestedBatchLimit,
                             sourceFailureMode: sourceFailureMode as SourceFailureMode,
                         })));
@@ -1145,6 +1500,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                                     "❌ 批量导出未找到候选对话",
                                     query ? `关键词: ${query}` : "",
                                     workspaces?.length ? `工作区: ${workspaces.join(" | ")}` : "",
+                                    workspaces?.length ? `工作区范围: ${workspaceScope}` : "",
                                     "",
                                     "🔗 数据源状态:",
                                     ...formatSourceStatuses(listResult.statuses),
@@ -1160,6 +1516,9 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         link,
                         scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
                         query,
+                        workspaces,
+                        workspaceMode,
+                        workspaceScope: workspaceScope as WorkspaceMatchScope,
                         startRound,
                         endRound,
                         contextRounds,
@@ -1238,6 +1597,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics, "omit"),
                     );
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
+                    const subagentNote = formatCodexSubagentSourceNote(loaded);
                     const partialWarning = formatWindsurfPartialWarning(loaded);
                     const cacheNote = loaded.chainUsed === "antigravity"
                         ? (loaded.fromCache ? " (从缓存)" : " (新拉取)")
@@ -1252,6 +1612,8 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     try {
                         if (loaded.windsurfData?.partial) {
                             recordNote = "\n📋 Record 自动更新已跳过：WSF 本次原文读取不完整";
+                        } else if (loaded.chainUsed === "codex" && (loaded.codexData?.thread.agentRole || loaded.codexData?.thread.agentNickname)) {
+                            recordNote = "\n📋 Record 自动更新已跳过：Codex 子代理线程默认由源头主对话统一记录";
                         } else {
                         const recordHash = findRecordHash(cascadeId) || resolveWorkspaceHashForRecord();
                         if (shouldAutoUpdateRecord(recordHash, cascadeId, rounds.length)) {
@@ -1261,6 +1623,13 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             })
                                 .then(async (res) => {
                                     if (res.success && res.content) {
+                                        const gate = validateRecordCandidateForWrite(res.content, cascadeId, rounds.length, res.coveredRounds || rounds.length, {
+                                            oldRecord: readRecord(recordHash, cascadeId) || "",
+                                        });
+                                        if (!gate.ok) {
+                                            console.error(`[record] 自动更新候选被拒绝: ${gate.error}`);
+                                            return;
+                                        }
                                         const phases = countPhasesInRecord(res.content);
                                         await writeRecord(recordHash, cascadeId, res.content, {
                                             totalRounds: rounds.length,
@@ -1286,7 +1655,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${overview}${cacheNote}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+                            text: `${overview}${cacheNote}${subagentNote ? `\n${subagentNote}` : ""}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
                         }],
                     }, startTime);
                 }
@@ -1302,9 +1671,10 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     const matches = (mode === "auto" || mode === "exact")
                         ? searchInRounds(rounds, query, limit)
                         : [];
+                    const searchHeader = formatConversationSearchHeader(cascadeId, loaded);
                     if (matches.length === 0 && mode === "exact") {
                         return appendTiming({
-                                    content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
+                                    content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
                         }, startTime);
                     }
                     if (matches.length === 0) {
@@ -1334,7 +1704,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             });
                             if (smartResults.length === 0) {
                                 return appendTiming({
-                                    content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n🔍 搜索 "${query}" — 未找到匹配` }],
+                                    content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — 未找到匹配` }],
                                 }, startTime);
                             }
                             const smartRoundIndices = smartResults.map(r => Number(r.id));
@@ -1353,7 +1723,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             let text = output.join("\n");
                             if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
                             return appendTiming({
-                                content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed} | 模型链路: ${chains.modelChain}\n\n${text}` }],
+                                content: [{ type: "text" as const, text: `${formatConversationSearchHeader(cascadeId, loaded, chains.modelChain)}\n\n${text}` }],
                             }, startTime);
                         }
                         // 将 fuzzy 结果转换回轮次索引
@@ -1373,7 +1743,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         let text = output.join("\n");
                         if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
+                            content: [{ type: "text" as const, text: `${searchHeader}\n\n${text}` }],
                         }, startTime);
                     }
 
@@ -1409,7 +1779,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         // full 深度不截断，写入临时文件
                         const slug = cascadeId.slice(0, 8);
                         const tmpPath = saveTempFile("search", slug, text);
-                        const summary = `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n` + text.slice(0, 2000) + `\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`;
+                        const summary = `${searchHeader}\n\n` + text.slice(0, 2000) + `\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`;
                         return appendTiming({
                             content: [{ type: "text" as const, text: summary }],
                         }, startTime);
@@ -1418,7 +1788,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     }
 
                     return appendTiming({
-                        content: [{ type: "text" as const, text: `📂 对话: ${cascadeId}\n🔗 数据链路: ${loaded.chainUsed}\n\n${text}` }],
+                        content: [{ type: "text" as const, text: `${searchHeader}\n\n${text}` }],
                     }, startTime);
                 }
 
@@ -1438,12 +1808,17 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
                     pushOutputWithBuildBudget(output, overview, buildState, "read 输出");
                     pushOutputWithBuildBudget(output, `🔗 数据链路: ${loaded.chainUsed}`, buildState, "read 输出");
-                    pushOutputWithBuildBudget(output, `📖 读取轮次 ${start}-${Math.min(end, rounds.length)}\n`, buildState, "read 输出");
+                    const subagentNote = formatCodexSubagentSourceNote(loaded);
+                    if (subagentNote) pushOutputWithBuildBudget(output, subagentNote, buildState, "read 输出");
+                    const roleFilter = normalizeMessageRoles(messageRoles as ConversationMessageRole[] | undefined);
+                    pushOutputWithBuildBudget(output, `📖 读取轮次 ${start}-${Math.min(end, rounds.length)}${roleFilter.size ? ` | 角色过滤: ${[...roleFilter].join(", ")}` : ""}\n`, buildState, "read 输出");
 
                     const selectedRounds = rounds.slice(start - 1, Math.min(end, rounds.length));
                     const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
                     for (let i = start; i <= Math.min(end, rounds.length); i++) {
-                        if (!pushOutputWithBuildBudget(output, formatRound(displayRounds[i - start], depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }), buildState, "read 输出")) break;
+                        const formatted = formatRoundForMessageRoles(displayRounds[i - start], depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
+                        if (!formatted) continue;
+                        if (!pushOutputWithBuildBudget(output, formatted, buildState, "read 输出")) break;
                         if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                     }
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
@@ -1456,7 +1831,9 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                             if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                             const { rounds: childDisplayRounds, truncated: childTruncated } = await materializeRoundAttachments(child.rounds, child.thread.id);
                             for (const round of childDisplayRounds) {
-                                if (!pushOutputWithBuildBudget(output, formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }), buildState, "read 输出")) break;
+                                const formatted = formatRoundForMessageRoles(round, depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
+                                if (!formatted) continue;
+                                if (!pushOutputWithBuildBudget(output, formatted, buildState, "read 输出")) break;
                                 if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
                             }
                             if (childTruncated > 0) output.push(`⚠️ 子线程 ${child.thread.id.slice(0, 8)} 有 ${childTruncated} 个附件超过单次生成上限，未生成临时文件\n`);

@@ -48,10 +48,12 @@ mcp-subagent/
 ## 架构一句话
 
 ```
-主模型 --调用(WSF serverUrl ─► 14588 broker)--> mcp-subagent(broker 托管 node, 单例)
+主模型 --调用(WSF serverUrl ─► 14588 broker)--> mcp-subagent(broker 托管 node, owner/follower)
    current / models / spawn / poll / wait / collect / interrupt / dispose / list / reconcile / move_queued / cleanup
         └ 内部用 LS HTTP API 操作独立 Cascade 子对话（仅限自己 spawn 的谱系）
 ```
+
+`mcp-subagent` 使用 `subagent-data/process.lock` 控制后台 watchdog 单例：拿到锁的 owner 才启动 auto-collect / cleanup 定时器。若 Antigravity 直连实例已经占锁，broker 通过 `CODEX_MCP_BROKER=1` 拉起的实例会以 follower 模式继续提供 MCP 工具列表和手动工具调用，但不启动后台定时器，避免 WSF 侧 marketplace 因单例锁直接显示 Error。
 
 ## MCP 工具
 
@@ -62,6 +64,8 @@ mcp-subagent/
 `subagent_spawn` 默认 `auto_collect=true`：子代理完成后，MCP 常驻进程会按 `collect_mode` 自动调用回插 watchdog；测试或手动编排时可传 `auto_collect:false`。回插按 `job_id + turn` 单飞，collecting/collected/已有同轮 queue 都不会再次 `QueueCascadeMessage`；`interrupt` 失败默认清掉队列并标 `collect_failed`，只有显式 `fallback_to_queue:true` 才退化保留 queue。回插主对话时会从主对话最新 `USER_INPUT` 反查当前 `requestedModelUid` 与 `plannerMode`，再原样构造 `cascadeConfig`，避免把主对话的 Code / Ask / Plan 模式固定切成 Ask；子代理自身模式由 `spawn.mode` / `reply.mode` 控制，默认 `code`。
 
 `subagent_wait({ job_id, wait_ms?, collect? })` 用于主对话短阻塞等待子代理反馈：默认最多等 30 秒，上限 45 秒，超时返回 `still_running:true`，避免撞上 broker / MCP 客户端传输超时；`collect:true` 只在子代理 done 后调用一次幂等 `subagent_collect`，不会绕过 auto-collect 单飞锁。
+
+`timeout_sec` 只表示子代理超过预期时限，不是静默终态。Stage L 后，auto-collect 会先回插 timeout 通知，并继续低频复查；如果子代理迟到完成，会自动按同一条 collect 链路回插最终结果。长主对话的 step 读取必须分页扫描，不能只看 `GetCascadeTrajectorySteps(stepOffset=0)` 的第一页，否则超过约 70 步后会误判 active step / marker 不存在。
 
 `model` 是精确 WSF 模型 UID，`model_profile` 是语义档位：`cowork` / `explore` / `frontend` / `review` / `unblock`，并兼容 `fronted` / `brainstorm` 别名。`subagent_models()` 默认是摘要视图，只返回 profile 摘要、来源计数和少量候选；`subagent_models({ purpose:"explore", detail:"detail" })` 展开指定用途候选；只有 `detail:"full"` 或 `include_available:true` 才返回全量缓存模型清单。当前来源是 IDE 缓存的 Cascade 模型列表，不是服务端实时全集，所以返回里会标 `source` 与 `updated_at`。普通 `spawn/reply` 只返回模型解析摘要；只有调用 `subagent_models`、模型不可用或发生 fallback 时才展示候选说明，不在 README 固化长模型清单。
 
@@ -88,6 +92,9 @@ npm run smoke:model-profile -- <main_id>
 npm run smoke:current-binding -- <main_id>
 npm run smoke:auto-collect -- <main_id>
 npm run smoke:collect-dedupe -- <main_id>
+npm run smoke:timeout-late-collect -- <main_id>
+npm run smoke:step-pagination -- <main_id> <marker>
+npm run smoke:broker-follower-lock
 npm run smoke:stage-f
 npm run smoke:stage-g -- <main_id>
 npm run smoke:stage-g-tool -- <main_id>
@@ -123,6 +130,7 @@ npm run patch:codex-broker -- --apply
 npm run check:live-config
 npm run smoke:broker-load
 npm run smoke:broker-tools
+npm run smoke:broker-follower-lock
 ```
 
 当前 Codex HTTP broker 的 `%USERPROFILE%\.codex\mcp-http-broker\broker.mjs` 是静态 endpoint 表；`patch:codex-broker -- --apply` 会先备份 `broker.mjs.before-subagent-*`，再加入 `/subagent/mcp`。如果 broker 未热加载 `/subagent/mcp`，重启 broker 宿主或 Antigravity/Codex 后再跑 `npm run smoke:broker-load` / `npm run smoke:broker-tools`。若不借用 broker，可改用 WSF stdio fallback：
@@ -159,6 +167,8 @@ npm run smoke:stage-g -- <main_id>
 `smoke:list-defaults` 会用临时 registry 验证 `subagent_list` 默认不把 deleted/archived 历史刷出来，显式 `detail:"full"` 才展开；`smoke:models` 会验证 `subagent_models()` 默认不会返回全量模型清单。
 
 `smoke:collect-dedupe` 会对同一 job/turn 并发调用三次 `subagent_collect({ mode:"queue" })`，验证只产生一个 `queue_id` 和一条 `queue_history`，用于防 auto-collect/watchdog 重复补队列。
+
+`smoke:timeout-late-collect` 会构造短 `timeout_sec` 子代理，验证它先进入 timeout、随后迟到完成仍会自动回插；`smoke:step-pagination` 会验证长对话 marker 可能不在第一页，watchdog 必须分页扫描完整 steps。
 
 `smoke:stage-h` 会验证 `subagent_reply` 多轮追问：脚本会创建临时 running main，第一轮用 `interrupt` 的 active-step watchdog 等主输出 step 完成后回插，再继续回复同一个 `sub_cid`，第二轮再次回插并使用新的 `turn=2` 幂等记录，不被第一轮 `collect_result` 阻挡。Stage H 不接受单纯 `queue` 作为最终回插证据。
 

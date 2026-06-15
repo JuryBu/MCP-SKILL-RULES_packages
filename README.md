@@ -6,7 +6,7 @@
 
 当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
 
-> 2026-06-09 refresh: `mcp-subagent` is added as a Windsurf-only optional MCP, Windsurf Rules are refreshed and privacy-scrubbed, `memory-store` is refreshed to `1.15.5`, `sandbox` is `1.13.3`, and `web-fetcher` remains `7.0.0`.
+> 2026-06-16 refresh: latest MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.15.13`, `sandbox` is `1.13.3`, `web-fetcher` remains `7.0.0`, and `mcp-subagent` remains Windsurf-only optional.
 
 ---
 
@@ -35,7 +35,7 @@
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
-| `memory-store` | `1.15.5` | 记忆库、对话读取、Conversation Export、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
+| `memory-store` | `1.15.13` | 记忆库、对话读取、Conversation Export、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
 | `sandbox` | `1.13.3` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
 | `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
@@ -238,7 +238,7 @@ Common examples:
 
 | MCP | Version | Main capabilities |
 | --- | --- | --- |
-| `memory-store` | `1.15.5` | Memory, conversation reading, Conversation Export, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
+| `memory-store` | `1.15.13` | Memory, conversation reading, Conversation Export, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
 | `sandbox` | `1.13.3` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
 | `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code and other hosts |

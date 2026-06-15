@@ -1,18 +1,8 @@
-import fs from "node:fs";
+﻿import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
-const defaultBundle = path.join(
-  process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"),
-  "Programs",
-  "Devin",
-  "resources",
-  "app",
-  "extensions",
-  "windsurf",
-  "dist",
-  "extension.js",
-);
+const defaultBundle = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Programs", "Devin", "resources", "app", "extensions", "windsurf", "dist", "extension.js");
 const bundlePath = process.env.WSF_EXTENSION_JS || defaultBundle;
 const text = fs.readFileSync(bundlePath, "utf8");
 

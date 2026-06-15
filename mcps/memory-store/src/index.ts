@@ -1,6 +1,6 @@
-﻿#!/usr/bin/env node
+#!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.15.4
+ * MCP Memory Store Server v1.15.13
  * 
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。
@@ -52,7 +52,7 @@ let isClosing = false; // 防止重复清理
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "memory-store-mcp-server",
-    version: "1.15.5",
+    version: "1.15.13",
 });
 
 // 注册所有 11 个工具
@@ -80,7 +80,7 @@ server.registerResource(
         contents: [
             {
                 uri: "memory-store://guide",
-                text: `# MCP Memory Store v1.15.4 使用指南
+                text: `# MCP Memory Store v1.15.13 使用指南
 
 ## 快速开始
 - 新对话开始: memory_query() 或 memory_query(workspace="工作区路径") 获取背景
@@ -160,7 +160,7 @@ server.registerResource(
 - 绕过 CHECKPOINT 压缩机制，读取对话的真实完整内容
 - 六类操作：list(列出候选) / fetch(拉取缓存) / search(关键词搜索) / read(范围阅读) / export(持久导出 Markdown/PDF) / deep_locate(后台深搜定位)
 - list/search 均支持 mode="auto|exact|fuzzy|smart"；list 会综合标题、ID、工作区、Record 摘要和近期上下文指纹定位对话
-- list 有 query 时默认扫描 300 个候选目录，可用 MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT 覆盖
+- list 的标题、ID、来源、工作区和主/子线程查询走轻量元数据定位；只有正文搜索才使用候选预算和 deep_locate
 - Codex list 快查止血(v1.13.0): dataChain="codex" 且 mode="auto" 时，query 未命中不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 模型搜索；若 query 是古老正文片段，会提示后续使用 deep_locate 后台深搜能力
 - deep_locate(v1.14.0): conversation_read_original(action="deep_locate", dataChain="codex|claude-code", query="...", background=true) 后台流式扫描 Codex/Claude Code JSONL，支持 exact/fuzzy、进度、预算、partial hits 和 cancel/status；不做 smart 全库召回；Windsurf 首版不支持 deep_locate
 - Record list / list ID 排序 / ETA 修复(v1.13.1): Record 归属 sidecar 出现 superseded 互指环时不再把所有副本都隐藏，列表和搜索会继续按完整度去重显示；conversation list 用完整 ID 查询时真实 ID 命中优先于标题正文提及；后台任务预计剩余时间改按当前阶段开始时间估算，避免把前一阶段耗时算入新阶段。
@@ -198,6 +198,15 @@ server.registerResource(
 - conversation_read_original 防串读(v1.15.3): fetch/search/read/export 在 dataChain="auto|codex|claude-code|windsurf" 下必须显式传稳定 conversationId；只有显式 dataChain="antigravity" 保留当前窗口兼容路径。search 输出会显示实际读取的 conversationId，避免共享后端推断到其它窗口。
 - conversation_read_original 持久导出(v1.15.4): action="export" 可按 full/rounds/search 范围导出 conversation.md、manifest.json、assets/，并可选生成 conversation.pdf；PDF 使用 Edge/Chrome 无头隐藏打印，不弹出有头浏览器窗口。导出不触发 Record 更新，也不改变 fetch/read/search 旧行为。
 - conversation_read_original 跨源过滤(v1.15.5): list/export 支持 dataChains、workspaces、workspaceMode、exportBatch；批量导出为每条对话创建独立目录和 batch_manifest.json。dataChain=auto+conversationId 默认全源唯一匹配，Antigravity/Windsurf 离线默认作为 warning。
+- Claude Code 多账号侧栏索引增强(v1.15.6): Claude Code 正文仍读取 .claude/projects JSONL；list 会额外合并 Claude 桌面 local_*.json 索引中的 accountId、organizationId、isArchived、标题和最后活跃时间，换账号导致侧栏索引隔离时仍不影响原文读取。
+- Conversation App 标题与 WSF 工作区元数据增强(v1.15.7): Codex list/get/resolve 优先使用 ~/.codex/session_index.jsonl 的 thread_name 作为 App 侧栏标题，SQLite title 只作 fallback；Windsurf list/export 优先使用 renamedTitle，并解析 workspaces[].workspaceFolderAbsoluteUri 参与工作区过滤和批量导出。
+- Conversation 工作区过滤范围与长标题展示治理(v1.15.8): conversation_read_original(list/export) 新增 workspaceScope="any|primary"；默认 any 匹配主工作区和关联工作区，primary 只匹配主工作区；list 展示超长标题会折叠并标记 [titleTruncated]，不影响搜索、读取和导出原始数据。
+- Codex 子代理线程标注(v1.15.9): Codex 子代理线程在 list 中显示为 子代理对话(role)，detail 标出 parentConversationId；fetch/read/search 子线程时会显示源头对话 ID 与源头标题；fetch 子代理线程不触发自动 Record 更新。
+- Claude Code 加密思考占位(v1.15.10): Claude Code JSONL 中 thinking 为空但 signature 存在的加密思考块，会在 read(depth="full", extraTypes=["thinking"]) 中显示“🔒 加密思考块 step N：thinking 为空，signature 存在，明文不可读”；完整 signature 不输出，也不进入 contextProbe/deep_locate/Record/Guard/Golden Extract 正文材料。
+- Conversation 主子线程与消息角色过滤(v1.15.11): conversation_read_original(list/export) 支持 threadMode="main|children|all"、parentConversationId、parentQuery；默认 main 会把命中子线程的标题回指父线程候选。read 支持 messageRoles=["user","system","model","assistant","tool"]，可只读用户、系统/压缩摘要、模型回复或工具证据。Codex 标题定位使用全量 session_index 轻量索引，不再被最近 300 条正文候选限制。
+- Record 最终写入质量门禁(v1.15.11): record_manage(update/batch_update) 与自动后台 Record 写入前会统一校验 Phase 数、覆盖轮次、长度比例和 Phase 范围；长对话或旧 Record 有 Phase 时，0 Phase 候选会被拒绝并保存到 temp，不覆盖正式 Record。
+- Record 手动补充保护修正(v1.15.12): Local Compose 质量检查保留旧 [手动补充] 硬约束，但比较前会忽略历史重复列表编号，避免 9. 3. 与 1. 这类编号变化误判为丢失。
+- Conversation list 多词查询修正(v1.15.13): conversation_read_original(list/export) 的标题/ID/工作区轻量定位中，空格分开的 query 词按 OR 匹配候选；完整 ID、ID 前缀和完整标题仍优先排序，正文片段仍应使用 search/deep_locate。
 - Codex HTTP broker 共享后端进程，fetch/search/read 必须显式传稳定 conversationId；只知道标题时先用 list 定位完整 ID，可补 contextProbe 辅助确认当前主线
 - Codex 如存在子代理线程，默认以引用或摘要方式呈现；link="expand_children" 时读取一级子线程全文，并用 thread_spawn_edges 补充父线程事件遗漏或已归档但仍可读的子线程；缺失子线程会输出诊断而不是静默跳过
 
@@ -385,7 +394,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[memory-store] MCP Server v1.15.4 启动中... (ppid=${process.ppid})`);
+console.error(`[memory-store] MCP Server v1.15.13 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -398,7 +407,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[memory-store] MCP Server v1.15.4 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[memory-store] MCP Server v1.15.13 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

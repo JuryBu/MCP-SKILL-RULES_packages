@@ -2,8 +2,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { exec } from "child_process";
-import { shouldAutoUpdateRecord, generateRecord, countPhasesInRecord } from "./record-generator.js";
-import { findRecordHash, resolveWorkspaceHashForRecord, writeRecord, writeRecordSidecar } from "./record-store.js";
+import { shouldAutoUpdateRecord, generateRecord, countPhasesInRecord, validateRecordCandidateForWrite } from "./record-generator.js";
+import { findRecordHash, resolveWorkspaceHashForRecord, readRecord, writeRecord, writeRecordSidecar } from "./record-store.js";
 import { loadConversationData } from "./conversation-bridge.js";
 import { detectWorkspaceFromSteps } from "./ls-client.js";
 import { buildRecordReaderIndex } from "./record-reader.js";
@@ -163,6 +163,13 @@ async function triggerRecordAutoCheck(): Promise<void> {
         const p = generateRecord(recordHash, cascadeId, recordWorkspace, rounds, totalSteps, recordModelChain)
             .then(async (res) => {
                 if (res.success && res.content) {
+                    const gate = validateRecordCandidateForWrite(res.content, cascadeId, rounds.length, res.coveredRounds || rounds.length, {
+                        oldRecord: readRecord(recordHash, cascadeId) || "",
+                    });
+                    if (!gate.ok) {
+                        console.error(`[record-auto] ❌ ${cascadeId.slice(0, 8)}... 候选被拒绝: ${gate.error}`);
+                        return;
+                    }
                     const phases = countPhasesInRecord(res.content);
                     await writeRecord(recordHash, cascadeId, res.content, {
                         totalRounds: rounds.length, totalSteps,

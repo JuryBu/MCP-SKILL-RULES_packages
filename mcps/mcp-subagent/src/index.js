@@ -25,7 +25,7 @@ const server = new McpServer({
   version: "0.1.0",
 });
 
-await acquireProcessGuard();
+const processGuard = await acquireProcessGuard();
 
 server.registerTool("subagent_current", {
   title: "Find Current WSF Cascade",
@@ -199,5 +199,7 @@ server.registerTool("subagent_dispose", {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-startCleanupScheduler();
-startAutoCollectScheduler();
+if (processGuard.shouldStartSchedulers !== false && process.env.SUBAGENT_DISABLE_SCHEDULERS !== "1") {
+  startCleanupScheduler();
+  startAutoCollectScheduler();
+}

@@ -456,15 +456,22 @@ export async function subagentSpawn(args) {
 export async function subagentPoll(args) {
   const job = await getJob(args.job_id);
   if (!job) return failResult(`Unknown job_id=${args.job_id}`);
-  const summary = await getSummary(job.main_id, job.sub_cid);
-  const steps = await getSteps(job.main_id, job.sub_cid, 0);
+  const steps = await getCompleteSteps(job.main_id, job.sub_cid);
+  const summary = steps.summary;
   const status = summary?.status || "missing";
   const done = String(status).includes("IDLE");
   const stepCount = summary?.stepCount || stepArray(steps).length || 0;
   const resultText = extractResultText(steps);
   const resultPreview = compactStepsPreview(steps, resultText);
   await updateJob(job.job_id, (current) => {
-    current.state = done && current.state === "running" ? "done" : current.state;
+    if (done && ["creating", "running", "timeout"].includes(current.state)) {
+      if (current.state === "timeout") {
+        current.auto_collect_state = "late_done";
+        current.late_completed_after_timeout = true;
+        delete current.timeout_recheck_after;
+      }
+      current.state = "done";
+    }
     current.result_step_count = stepCount;
     current.result_text = resultText;
     current.result_preview = resultPreview;
@@ -484,9 +491,9 @@ export async function subagentPoll(args) {
     ok: true,
     job_id: job.job_id,
     sub_cid: job.sub_cid,
-    state: done && job.state === "running" ? "done" : job.state,
     status,
     done,
+    state: done && ["creating", "running", "timeout"].includes(job.state) ? "done" : job.state,
     step_count: stepCount,
     result_text: resultText,
     result_preview: resultPreview,
@@ -675,7 +682,7 @@ async function archiveJob(job) {
   let steps = null;
   try {
     trajectory = await getTrajectory(job.main_id, job.sub_cid);
-    steps = await getSteps(job.main_id, job.sub_cid, 0);
+    steps = await getCompleteSteps(job.main_id, job.sub_cid);
   } catch (error) {
     trajectory = { error: error.message };
   }
@@ -942,7 +949,7 @@ function parseTextResult(result) {
 }
 
 function isCollectTerminal(job) {
-  return !job || ["collected", "archived", "deleted", "missing", "stale_queue", "collect_failed", "timeout"].includes(job.state) || Boolean(collectResultForTurn(job));
+  return !job || ["collected", "archived", "deleted", "missing", "stale_queue", "collect_failed"].includes(job.state) || Boolean(collectResultForTurn(job));
 }
 
 function collectKey(job) {
@@ -964,6 +971,29 @@ function isCollectBusy(job) {
     return collectLockIsFresh(job);
   }
   return false;
+}
+
+function timeoutRecheckDue(job) {
+  if (job?.state !== "timeout") return true;
+  const recheckAt = Date.parse(job.timeout_recheck_after || "");
+  return !Number.isFinite(recheckAt) || Date.now() >= recheckAt;
+}
+
+function nextTimeoutRecheck(job) {
+  const count = Number(job?.timeout_recheck_count || 0);
+  const baseMs = Number(process.env.SUBAGENT_TIMEOUT_RECHECK_BASE_MS || 30000);
+  const maxMs = Number(process.env.SUBAGENT_TIMEOUT_RECHECK_MAX_MS || 300000);
+  const delayMs = Math.min(maxMs, baseMs * (2 ** Math.min(count, 3)));
+  return new Date(Date.now() + delayMs).toISOString();
+}
+
+function shouldScheduleAutoCollect(job) {
+  return Boolean(
+    job?.auto_collect === true
+    && !isCollectTerminal(job)
+    && !isCollectBusy(job)
+    && timeoutRecheckDue(job),
+  );
 }
 
 function scheduleAutoCollect(jobId, delayMs = 1000) {
@@ -997,17 +1027,9 @@ async function runAutoCollect(jobId) {
   const started = Date.now();
   while (Date.now() - started < maxRunMs) {
     const job = await getJob(jobId);
-    if (!job || job.auto_collect !== true || isCollectTerminal(job) || isCollectBusy(job)) return;
-    if (job.deadline_at && Date.parse(job.deadline_at) < Date.now() && ["creating", "running"].includes(job.state)) {
-      await updateJob(jobId, (current) => {
-        current.state = "timeout";
-        current.auto_collect_state = "timeout";
-        current.updated_at = nowIso();
-      });
-      return;
-    }
+    if (!job || !shouldScheduleAutoCollect(job)) return;
     await updateJob(jobId, (current) => {
-      current.auto_collect_state = "polling";
+      current.auto_collect_state = current.state === "timeout" ? "timeout_rechecking" : "polling";
       current.updated_at = nowIso();
     });
     const poll = parseTextResult(await subagentPoll({ job_id: jobId }));
@@ -1024,10 +1046,31 @@ async function runAutoCollect(jobId) {
         mode: refreshed.collect_mode || "interrupt",
         timeout_ms: Number(process.env.SUBAGENT_AUTO_COLLECT_TIMEOUT_MS || 180000),
         confirm_timeout_ms: Number(process.env.SUBAGENT_AUTO_COLLECT_CONFIRM_TIMEOUT_MS || 90000),
+        fallback_to_queue: true,
       }));
       await updateJob(jobId, (current) => {
         current.auto_collect_state = collect.ok ? "collected" : "failed";
         current.auto_collect_result = collect;
+        current.updated_at = nowIso();
+      });
+      return;
+    }
+    if (refreshed?.deadline_at && Date.parse(refreshed.deadline_at) < Date.now() && ["creating", "running", "timeout"].includes(refreshed.state)) {
+      let timeoutNoticeResult = refreshed.timeout_notice_result || null;
+      if (!timeoutNoticeResult?.delivered) {
+        try {
+          timeoutNoticeResult = await sendTimeoutNotice(refreshed, poll);
+        } catch (error) {
+          timeoutNoticeResult = { delivered: false, error: error.message, attempted_at: nowIso() };
+        }
+      }
+      await updateJob(jobId, (current) => {
+        current.state = "timeout";
+        current.auto_collect_state = "timeout";
+        current.timed_out_at = current.timed_out_at || nowIso();
+        current.timeout_recheck_count = (current.timeout_recheck_count || 0) + 1;
+        current.timeout_recheck_after = nextTimeoutRecheck(current);
+        current.timeout_notice_result = timeoutNoticeResult;
         current.updated_at = nowIso();
       });
       return;
@@ -1047,7 +1090,7 @@ export function startAutoCollectScheduler() {
     try {
       const jobs = await listJobs("active");
       for (const job of jobs) {
-        if (job.auto_collect === true && !isCollectTerminal(job) && !isCollectBusy(job) && !autoCollectTimers.has(job.job_id) && !autoCollectRuns.has(job.job_id)) {
+        if (shouldScheduleAutoCollect(job) && !autoCollectTimers.has(job.job_id) && !autoCollectRuns.has(job.job_id)) {
           scheduleAutoCollect(job.job_id);
         }
       }
@@ -1072,12 +1115,213 @@ function renderCollectMessage(job) {
   ].join("\n");
 }
 
+function renderTimeoutMessage(job, poll = {}) {
+  return [
+    `[subagent-timeout:${job.job_id}:turn:${jobTurn(job)}] ${job.label}`,
+    `sub_cid=${job.sub_cid}`,
+    `state=timeout`,
+    `turn=${jobTurn(job)}`,
+    `deadline_at=${job.deadline_at || ""}`,
+    "",
+    "子代理已超过 timeout_sec，MCP 会继续低频复查；如果它之后完成，会再次自动回插最终结果。",
+    poll.result_preview || job.result_preview ? "" : "当前尚未捕获可用最终产出。",
+    poll.result_preview || job.result_preview || "",
+  ].filter((line) => line !== null && line !== undefined).join("\n");
+}
+
+async function sendTimeoutNotice(job, poll = {}) {
+  const marker = `[subagent-timeout:${job.job_id}:turn:${jobTurn(job)}]`;
+  const metadata = await createMetadata();
+  await recordInjection(job.main_id);
+  const message = renderTimeoutMessage(job, poll);
+  const mainCascadeConfig = await createMainCascadeConfig(job.main_id, job.model);
+  const snapshot = await readMainSnapshot(job.main_id);
+  if (!isMainRunning(snapshot.summary)) {
+    await sendMessage(job.main_id, job.main_id, metadata, message, {
+      cascadeConfig: mainCascadeConfig,
+      blocking: false,
+    });
+    const confirmed = await waitForTextInSteps(job.main_id, marker, 30000);
+    return {
+      delivered: confirmed,
+      when: "timeout_idle_sent",
+      delivered_by: "send_user_message_idle",
+      marker,
+      sent_at: nowIso(),
+    };
+  }
+  const queued = await queueMessage(job.main_id, job.main_id, metadata, message, {
+    cascadeConfig: mainCascadeConfig,
+  });
+  return {
+    delivered: Boolean(queued.queueId),
+    when: "timeout_queued",
+    delivered_by: "queue_timeout_notice",
+    queue_id: queued.queueId || null,
+    marker,
+    sent_at: nowIso(),
+  };
+}
+
+async function flushQueuedCollectIfIdle(job, existingCollect, targetMainId) {
+  if (
+    existingCollect?.when !== "queued"
+    || !job.queue?.queue_id
+    || !["queued", "unknown", "remove_failed"].includes(job.queue.state)
+  ) {
+    return null;
+  }
+  const turn = job.queue.turn || jobTurn(job);
+  const marker = `[subagent:${job.job_id}:turn:${turn}]`;
+  const steps = await getCompleteSteps(targetMainId, targetMainId);
+  if (stepsIncludeText(steps, marker)) {
+    const collectResult = {
+      ...existingCollect,
+      delivered: true,
+      when: "queued_consumed",
+      delivered_by: "queue_auto_consumed",
+      turn,
+    };
+    await updateJob(job.job_id, (current) => {
+      current.state = "collected";
+      if (current.auto_collect === true) current.auto_collect_state = "collected";
+      current.collect_results = current.collect_results || {};
+      current.collect_results[String(turn)] = collectResult;
+      current.collect_result = collectResult;
+      current.auto_collect_result = { ok: true, ...collectResult };
+      if (current.queue?.queue_id === job.queue.queue_id) {
+        current.queue.state = "consumed";
+        current.queue.updated_at = nowIso();
+      }
+      delete current.last_error;
+    });
+    return collectResult;
+  }
+  const summary = await getSummary(targetMainId, targetMainId);
+  if (isMainRunning(summary)) return null;
+
+  const metadata = await createMetadata();
+  let removed = { removed: false };
+  try {
+    removed = await removeFromQueue(targetMainId, job.queue.main_id, metadata, job.queue.queue_id);
+  } catch (error) {
+    const latestSteps = await getCompleteSteps(targetMainId, targetMainId);
+    if (stepsIncludeText(latestSteps, marker)) {
+      return await flushQueuedCollectIfIdle(job, existingCollect, targetMainId);
+    }
+    removed = { removed: false, error: error.message };
+  }
+  const mainCascadeConfig = await createMainCascadeConfig(targetMainId, job.model);
+  await sendMessage(targetMainId, targetMainId, metadata, renderCollectMessage(job), {
+    cascadeConfig: mainCascadeConfig,
+    blocking: false,
+  });
+  const confirmed = await waitForTextInSteps(targetMainId, marker, 30000);
+  if (!confirmed) return null;
+  const collectResult = {
+    ...existingCollect,
+    delivered: true,
+    when: "idle_sent_after_stale_queue",
+    mode_used: "queue_flush",
+    queue_id: job.queue.queue_id,
+    turn,
+    fallback_from: existingCollect.fallback_from || "queued",
+    boundary_reason: "main_idle_with_stale_queue",
+    confirmed: true,
+    delivered_by: "send_user_message_after_stale_queue",
+  };
+  await updateJob(job.job_id, (current) => {
+    current.state = "collected";
+    if (current.auto_collect === true) current.auto_collect_state = "collected";
+    current.collect_results = current.collect_results || {};
+    current.collect_results[String(turn)] = collectResult;
+    current.collect_result = collectResult;
+    if (current.queue?.queue_id === job.queue.queue_id) {
+      current.queue.state = removed.removed ? "removed_after_collected" : "unknown";
+      current.queue.updated_at = nowIso();
+      current.queue.remove_attempts = (current.queue.remove_attempts || 0) + 1;
+      if (removed.error) current.queue.last_error = removed.error;
+    }
+    current.auto_collect_result = { ok: true, ...collectResult };
+    delete current.last_error;
+  });
+  return collectResult;
+}
+
+async function ensureCollectedResultMirror(job, collectResult) {
+  if (!job?.job_id || !collectResult?.delivered) return;
+  const turn = collectResult.turn || jobTurn(job);
+  const shouldRepair =
+    job.state !== "collected"
+    || (job.auto_collect === true && (
+      job.auto_collect_state !== "collected"
+      || job.auto_collect_result?.ok !== true
+    ));
+  if (!shouldRepair) return;
+  await updateJob(job.job_id, (current) => {
+    current.state = "collected";
+    if (current.auto_collect === true) {
+      current.auto_collect_state = "collected";
+      current.auto_collect_result = { ok: true, ...collectResult };
+    }
+    current.collect_results = current.collect_results || {};
+    current.collect_results[String(turn)] = collectResult;
+    current.collect_result = collectResult;
+    delete current.last_error;
+  });
+}
+
 function stepStatus(step) {
   return String(step?.status || step?.step?.status || step?.state || "").toUpperCase();
 }
 
 function stepArrayFromBody(body) {
   return body?.steps || body?.trajectorySteps || body?.cascadeSteps || [];
+}
+
+async function getCompleteSteps(mainId, cascadeId) {
+  const summary = await getSummary(mainId, cascadeId);
+  const total = Number(summary?.stepCount || 0);
+  const offsets = new Set([0]);
+  const stride = 50;
+  const maxOffset = Math.max(total + 80, 120);
+  for (let offset = stride; offset <= maxOffset; offset += stride) {
+    offsets.add(offset);
+  }
+  if (total > 0) {
+    for (const near of [total - 80, total - 50, total - 30, total - 20, total - 10, total]) {
+      if (near > 0) offsets.add(near);
+    }
+  }
+  const merged = [];
+  const seen = new Set();
+  let lastBody = null;
+  for (const offset of [...offsets].filter((value) => value >= 0).sort((left, right) => left - right)) {
+    const body = await getSteps(mainId, cascadeId, offset);
+    lastBody = body;
+    for (const step of stepArrayFromBody(body)) {
+      const metadata = stepMetadata(step);
+      const stableKey = [
+        metadata.stepId || metadata.id || metadata.createdAt || "",
+        metadata.executionId || "",
+        stepType(step),
+        stepStatus(step),
+      ].join("|");
+      const dedupeKey = stableKey.replace(/\|/g, "").trim()
+        ? stableKey
+        : JSON.stringify(step).slice(0, 1000);
+      if (seen.has(dedupeKey)) continue;
+      seen.add(dedupeKey);
+      merged.push(step);
+    }
+  }
+  return {
+    ...(lastBody || {}),
+    steps: merged,
+    trajectorySteps: merged,
+    cascadeSteps: merged,
+    summary,
+  };
 }
 
 function isStepActive(step) {
@@ -1139,7 +1383,7 @@ function latestUserStepConfig(steps) {
 
 async function createMainCascadeConfig(mainId, fallbackModel) {
   const summary = await getSummary(mainId, mainId);
-  const stepsBody = await getSteps(mainId, mainId, 0);
+  const stepsBody = await getCompleteSteps(mainId, mainId);
   const latestUserConfig = latestUserStepConfig(stepArrayFromBody(stepsBody));
   return createCascadeConfig({
     model: latestUserConfig.model || summary?.lastGeneratorModelUid || fallbackModel,
@@ -1160,7 +1404,7 @@ function isMainRunning(summary) {
 
 async function readMainSnapshot(mainId) {
   const summary = await getSummary(mainId, mainId);
-  const stepsBody = await getSteps(mainId, mainId, 0);
+  const stepsBody = await getCompleteSteps(mainId, mainId);
   const steps = stepArrayFromBody(stepsBody);
   return {
     summary,
@@ -1228,7 +1472,7 @@ async function sendCollectAfterBoundary(mainId, metadata, queueId, collectMessag
   try {
     await removeFromQueue(mainId, mainId, metadata, queueId);
   } catch (error) {
-    if (stepsIncludeText(await getSteps(mainId, mainId, 0), marker)) {
+    if (stepsIncludeText(await getCompleteSteps(mainId, mainId), marker)) {
       return { delivered_by: "queue_auto_consumed" };
     }
     throw error;
@@ -1289,7 +1533,7 @@ async function interruptAtWatchedBoundary(mainId, metadata, queueId, watchedStep
 async function waitForTextInSteps(mainId, text, timeoutMs = 30000) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
-    const steps = await getSteps(mainId, mainId, 0);
+    const steps = await getCompleteSteps(mainId, mainId);
     if (JSON.stringify(steps).includes(text)) {
       return true;
     }
@@ -1311,6 +1555,11 @@ export async function subagentCollect(args) {
   }
   const existingCollect = collectResultForTurn(job);
   if (existingCollect) {
+    const flushedCollect = await flushQueuedCollectIfIdle(job, existingCollect, targetMainId);
+    if (flushedCollect) {
+      return textResult({ ok: true, idempotent: true, flushed: true, ...flushedCollect });
+    }
+    await ensureCollectedResultMirror(job, existingCollect);
     return textResult({ ok: true, idempotent: true, ...existingCollect });
   }
 
@@ -1356,6 +1605,12 @@ export async function subagentCollect(args) {
   }
   if (claim.status === "collected") {
     collectRuns.delete(lockKey);
+    const latestJob = await getJob(refreshed.job_id);
+    const flushedCollect = await flushQueuedCollectIfIdle(latestJob || refreshed, claim.result, targetMainId);
+    if (flushedCollect) {
+      return textResult({ ok: true, idempotent: true, flushed: true, ...flushedCollect });
+    }
+    await ensureCollectedResultMirror(latestJob || refreshed, claim.result);
     return textResult({ ok: true, idempotent: true, ...claim.result });
   }
   if (claim.status === "in_progress") {
@@ -1375,6 +1630,7 @@ export async function subagentCollect(args) {
   let queueId = null;
   let watchedStep = null;
   let boundaryInfo = null;
+  let anchorInfo = null;
   let deliveredBy = null;
   try {
     metadata = await createMetadata();
@@ -1384,6 +1640,7 @@ export async function subagentCollect(args) {
     const mainCascadeConfig = await createMainCascadeConfig(targetMainId, refreshed.model);
     if (mode === "interrupt") {
       const anchor = await waitForActiveStepAnchor(targetMainId, Math.min(Number(args.timeout_ms || 180000), 30000));
+      anchorInfo = anchor;
       if (anchor.hit) {
         watchedStep = anchor.watched_step;
       } else if (anchor.reason === "main_not_running") {
@@ -1407,6 +1664,7 @@ export async function subagentCollect(args) {
         };
         await updateJob(refreshed.job_id, (current) => {
           current.state = "collected";
+          if (current.auto_collect === true) current.auto_collect_state = "collected";
           delete current.collecting_turn;
           delete current.collecting_started_at;
           current.collect_results = current.collect_results || {};
@@ -1415,6 +1673,8 @@ export async function subagentCollect(args) {
         });
         collectRuns.delete(lockKey);
         return textResult({ ok: true, ...collectResult });
+      } else if (args.fallback_to_queue === true) {
+        watchedStep = null;
       } else {
         throw new Error(`active step anchor failed before queue: ${anchor.reason}`);
       }
@@ -1455,11 +1715,40 @@ export async function subagentCollect(args) {
       const collectResult = { delivered: true, when: "queued", mode_used: "queue", queue_id: queueId, turn: jobTurn(refreshed) };
       await updateJob(refreshed.job_id, (current) => {
         current.state = "collected";
+        if (current.auto_collect === true) current.auto_collect_state = "collected";
         delete current.collecting_turn;
         delete current.collecting_started_at;
         current.collect_results = current.collect_results || {};
         current.collect_results[String(jobTurn(current))] = collectResult;
         current.collect_result = collectResult;
+      });
+      collectRuns.delete(lockKey);
+      return textResult({ ok: true, ...collectResult });
+    }
+
+    if (mode === "interrupt" && !watchedStep && args.fallback_to_queue === true) {
+      const collectResult = {
+        delivered: true,
+        when: "queued",
+        mode_used: "queue",
+        queue_id: queueId,
+        turn: jobTurn(refreshed),
+        fallback_from: "interrupt",
+        boundary_reason: anchorInfo?.reason || "active_step_unavailable",
+        confirmed: false,
+      };
+      await updateJob(refreshed.job_id, (current) => {
+        current.state = "collected";
+        if (current.auto_collect === true) current.auto_collect_state = "collected";
+        delete current.collecting_turn;
+        delete current.collecting_started_at;
+        current.collect_results = current.collect_results || {};
+        current.collect_results[String(jobTurn(current))] = collectResult;
+        current.collect_result = collectResult;
+        if (current.queue) {
+          current.queue.state = "queued";
+          current.queue.updated_at = nowIso();
+        }
       });
       collectRuns.delete(lockKey);
       return textResult({ ok: true, ...collectResult });
@@ -1493,6 +1782,7 @@ export async function subagentCollect(args) {
     };
     await updateJob(refreshed.job_id, (current) => {
       current.state = "collected";
+      if (current.auto_collect === true) current.auto_collect_state = "collected";
       delete current.collecting_turn;
       delete current.collecting_started_at;
       current.collect_results = current.collect_results || {};
@@ -1519,6 +1809,7 @@ export async function subagentCollect(args) {
       };
       await updateJob(job.job_id, (current) => {
         current.state = "collected";
+        if (current.auto_collect === true) current.auto_collect_state = "collected";
         delete current.collecting_turn;
         delete current.collecting_started_at;
         current.collect_results = current.collect_results || {};
@@ -1625,7 +1916,7 @@ export async function subagentReconcile() {
         try {
           removed = await removeFromQueue(job.main_id, job.queue.main_id, metadata, job.queue.queue_id);
         } catch (error) {
-          const steps = await getSteps(job.main_id, job.main_id, 0);
+          const steps = await getCompleteSteps(job.main_id, job.main_id);
           if (!stepsIncludeText(steps, marker)) throw error;
         }
         await updateJob(job.job_id, (current) => {

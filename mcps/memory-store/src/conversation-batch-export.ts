@@ -3,7 +3,7 @@ import path from "path";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
 import { loadConversationData } from "./conversation-bridge.js";
 import { exportConversation, formatConversationExportResult, type ConversationExportOptions, type ConversationExportResult } from "./conversation-exporter.js";
-import type { UnifiedConversationCandidate, SourceStatus } from "./conversation-filter.js";
+import type { UnifiedConversationCandidate, SourceStatus, WorkspaceMatchMode, WorkspaceMatchScope } from "./conversation-filter.js";
 import type { ConversationLinkMode } from "./chain.js";
 
 export interface ConversationBatchExportOptions extends Omit<ConversationExportOptions, "conversationId" | "chainUsed" | "rounds" | "totalSteps" | "expandedChildren" | "childDiagnostics" | "partialWarning"> {
@@ -11,6 +11,9 @@ export interface ConversationBatchExportOptions extends Omit<ConversationExportO
     batchLimit?: number;
     batchConcurrency?: number;
     sourceStatuses?: SourceStatus[];
+    workspaces?: string[];
+    workspaceMode?: WorkspaceMatchMode;
+    workspaceScope?: WorkspaceMatchScope;
     link?: ConversationLinkMode;
 }
 
@@ -101,6 +104,9 @@ export async function exportConversationBatch(options: ConversationBatchExportOp
         scope: options.scope || "full",
         format: options.format || "markdown",
         query: options.query,
+        workspaces: options.workspaces,
+        workspaceMode: options.workspaceMode,
+        workspaceScope: options.workspaceScope,
         startRound: options.startRound,
         endRound: options.endRound,
         contextRounds: options.contextRounds,

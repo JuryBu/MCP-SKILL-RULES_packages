@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.15.5",
+  "version": "1.15.13",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、四数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -8,7 +8,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "test": "npm run test:chain-schema && npm run test:ls-model-defaults && npm run test:model-bridge && npm run test:model-bridge-claude-code && npm run test:record-generator-codex && npm run test:record-generator-coverage && npm run test:record-generator-parallel && npm run test:record-update-snapshot && npm run test:record-generator-phase-count && npm run test:background-tasks-progress && npm run test:codex-client && npm run test:claude-code-client && npm run test:windsurf-client && npm run test:codex-deep-locate && npm run test:codex-attachments && npm run test:conversation-context-probe && npm run test:conversation-list-fast-only && npm run test:conversation-filter && npm run test:conversation-attachments && npm run test:conversation-exporter && npm run test:record-ownership && npm run test:record-reader && npm run test:record-reader-tools && npm run test:stage-guard-self-reference && npm run test:stage-guard-evidence && npm run test:stage-guard-evidence-index",
+    "test": "npm run test:chain-schema && npm run test:ls-model-defaults && npm run test:model-bridge && npm run test:model-bridge-claude-code && npm run test:record-generator-codex && npm run test:record-generator-coverage && npm run test:record-generator-parallel && npm run test:record-update-snapshot && npm run test:record-generator-phase-count && npm run test:record-candidate-gate && npm run test:background-tasks-progress && npm run test:codex-client && npm run test:claude-code-client && npm run test:windsurf-client && npm run test:codex-deep-locate && npm run test:codex-attachments && npm run test:conversation-context-probe && npm run test:conversation-list-fast-only && npm run test:conversation-filter && npm run test:conversation-list-format && npm run test:conversation-attachments && npm run test:conversation-exporter && npm run test:record-ownership && npm run test:record-reader && npm run test:record-reader-tools && npm run test:stage-guard-self-reference && npm run test:stage-guard-evidence && npm run test:stage-guard-evidence-index",
     "test:chain-schema": "tsx tests/chain-schema.test.ts",
     "test:ls-model-defaults": "tsx tests/ls-model-defaults.test.ts",
     "test:model-bridge": "tsx tests/model-bridge.test.ts",
@@ -18,6 +18,7 @@
     "test:record-generator-parallel": "tsx tests/record-generator-parallel.test.ts",
     "test:record-update-snapshot": "tsx tests/record-update-snapshot.test.ts",
     "test:record-generator-phase-count": "tsx tests/record-generator-phase-count.test.ts",
+    "test:record-candidate-gate": "tsx tests/record-candidate-gate.test.ts",
     "test:background-tasks-progress": "tsx tests/background-tasks-progress.test.ts",
     "test:codex-client": "tsx tests/codex-client.test.ts",
     "test:claude-code-client": "tsx tests/claude-code-client.test.ts",
@@ -35,7 +36,8 @@
     "test:stage-guard-self-reference": "tsx tests/guard-engine-self-reference.test.ts",
     "test:stage-guard-evidence": "tsx tests/guard-engine-evidence.test.ts",
     "test:stage-guard-evidence-index": "tsx tests/guard-evidence-index.test.ts",
-    "clean": "rimraf dist"
+    "clean": "rimraf dist",
+    "test:conversation-list-format": "tsx tests/conversation-list-format.test.ts"
   },
   "engines": {
     "node": ">=18"

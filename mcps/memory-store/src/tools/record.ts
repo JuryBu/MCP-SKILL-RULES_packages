@@ -1,4 +1,4 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
@@ -11,7 +11,7 @@ import {
 } from "../record-store.js";
 import { ensureWorkspace, listWorkspaceHashes, readWorkspaceMeta, workspaceHash } from "../store.js";
 import {
-    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, type RecordParallelMode,
+    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
 import { saveTempFile } from "../temp-store.js";
 import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type ChainInput, type DataChainInput, type DataChain } from "../chain.js";
@@ -509,6 +509,14 @@ async function handleUpdate(
         onProgress: options.onProgress,
     });
     if (!result.success) return rt(`❌ Record 生成失败: ${result.error}`, startMs);
+
+    const oldRecordForGate = readRecord(effectiveHash, cascadeId) || "";
+    const gate = validateRecordCandidateForWrite(result.content!, cascadeId, rounds.length, result.coveredRounds || rounds.length, {
+        oldRecord: oldRecordForGate,
+    });
+    if (!gate.ok) {
+        return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
+    }
 
     const phases = countPhasesInRecord(result.content!);
     await writeRecord(effectiveHash, cascadeId, result.content!, {
@@ -1796,6 +1804,15 @@ async function handleBatchUpdate(
                     if (!result.success || !result.content) {
                         _batchTask.failed++;
                         _batchTask.errors.push(`${conv.id.slice(0, 8)}: ${result.error || "unknown"}`);
+                        continue;
+                    }
+
+                    const gate = validateRecordCandidateForWrite(result.content, conv.id, rounds.length, result.coveredRounds || rounds.length, {
+                        oldRecord: readRecord(actualHash, conv.id) || "",
+                    });
+                    if (!gate.ok) {
+                        _batchTask.failed++;
+                        _batchTask.errors.push(`${conv.id.slice(0, 8)}: ${gate.error}`);
                         continue;
                     }
 
