@@ -13,9 +13,9 @@
     ],
     "stdioFallback": {
       "command": "node",
-      "args": ["%USERPROFILE%\\.codeium\\windsurf\\mcp-subagent\\src\\index.js"],
+      "args": ["<toolkit-root>\\mcps\\mcp-subagent\\src\\index.js"],
       "env": {
-        "SUBAGENT_DATA_DIR": "%USERPROFILE%\\.codeium\\windsurf\\mcp-subagent\\subagent-data"
+        "SUBAGENT_DATA_DIR": "%USERPROFILE%\\.codex-toolkit\\mcp-subagent"
       }
     }
   }

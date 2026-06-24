@@ -1,4 +1,4 @@
-import fs from "fs";
+﻿import fs from "fs";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";
@@ -10,9 +10,10 @@ import {
     type GuardState,
     type GuardLockOperationResult,
 } from "../guard-store.js";
-import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type DataChain } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type DataChain } from "../chain.js";
 import { loadConversationData } from "../conversation-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
@@ -61,7 +62,7 @@ const StageGuardSchema = z.object({
     evidenceIndexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
         .describe("外部证据索引策略：auto=复用新鲜索引或重建，reuse=只复用缓存，rebuild=强制重建，off=只记录未读取提示"),
     background: z.boolean().optional()
-        .describe("Codex 链路长模型检查建议设为 true，立即返回 taskId，后续用同工具 taskId 查询"),
+        .describe("check 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时），后续用同工具 taskId 查询"),
     taskId: z.string().optional()
         .describe("查询后台 Guard 检查任务的 taskId"),
     waitSeconds: z.number().optional()
@@ -182,17 +183,21 @@ async function handleCheck(params: z.infer<typeof StageGuardSchema>, backgroundM
         return text(formatBackgroundTask(task));
     }
 
-    if (params.background) {
+    // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
+    // 仅 codex 这类 heavy 链路在 background 未传时自动转后台（避免 60s 超时），其余链路未传仍同步（行为不变）。
+    const decision = decideBackground(params.background, resolveModelChain(params));
+    if (decision.useBackground) {
         const task = startBackgroundTask("stage-guard-check", async () => {
             const result = await handleCheck({ ...params, background: false, taskId: undefined, waitSeconds: undefined }, true);
             return responseText(result);
         });
         return text([
             "🚀 Stage Guard 检查已转入后台任务",
+            decision.auto ? "（codex 重链路下未显式指定 background，已自动转后台以避免 60s 超时；如需同步请传 background=false）" : "",
             `🆔 taskId: ${task.id}`,
             `🧠 modelChain: ${resolveModelChain(params)}`,
             "💡 后续调用 stage_guard(action=\"check\", taskId=\"...\") 查询结果",
-        ].join("\n"));
+        ].filter(Boolean).join("\n"));
     }
 
     let convId = params.conversationId || "";
@@ -369,28 +374,45 @@ async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
 
 // ============= 工具注册 =============
 
+/**
+ * stage_guard 工具主入口（从注册回调抽出，便于单测直接调用）。
+ * ⚠️ C3 块A：注册回调原本没有顶层 try/catch——任一 handler 抛异常会冒泡到 MCP
+ * 协议层导致服务崩溃。这里补一层兜底，把异常转成结构化错误文本返回，绝不让它冒泡。
+ */
+export async function runStageGuard(params: z.infer<typeof StageGuardSchema>): Promise<ReturnType<typeof text>> {
+    touchActivity();
+    try {
+        switch (params.action) {
+            case "start":
+                return await handleStart(params);
+            case "check":
+                return await handleCheck(params);
+            case "status":
+                return handleStatus(params);
+            case "cancel":
+                return handleCancel(params);
+            default:
+                return text(`❌ 未知 action: ${params.action}`);
+        }
+    } catch (err) {
+        return text(formatToolError(`stage_guard(${params.action})`, err, {
+            action: params.action,
+            conversationId: params.conversationId,
+            stageId: params.stageId,
+            chain: params.chain,
+            dataChain: params.dataChain,
+            modelChain: params.modelChain,
+            background: params.background,
+        }));
+    }
+}
+
 export function registerStageGuard(server: McpServer): void {
     server.tool(
         "stage_guard",
         "任务完整性自动验证：start 注册守卫 → check Flash比对检查 → status 查看状态 → cancel 取消。" +
         "配合 RULES 强制调用，每个 Stage 完成前必须 check 通过后才能标记完成。",
         StageGuardSchema.shape,
-        async (params) => {
-            touchActivity();
-            const startTime = Date.now();
-
-            switch (params.action) {
-                case "start":
-                    return await handleStart(params);
-                case "check":
-                    return await handleCheck(params);
-                case "status":
-                    return handleStatus(params);
-                case "cancel":
-                    return handleCancel(params);
-                default:
-                    return text(`❌ 未知 action: ${params.action}`);
-            }
-        }
+        async (params) => runStageGuard(params),
     );
 }

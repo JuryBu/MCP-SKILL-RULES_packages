@@ -1,4 +1,4 @@
-﻿import { subagentCollect, subagentDispose, subagentPoll, subagentSpawn, waitForJobDone } from "../src/tools.js";
+import { subagentCollect, subagentDispose, subagentPoll, subagentSpawn, waitForJobDone } from "../src/tools.js";
 import path from "node:path";
 
 const mainId = process.argv[2];

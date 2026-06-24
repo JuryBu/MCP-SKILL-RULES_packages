@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { saveTempFile } from "../temp-store.js";
@@ -16,6 +16,7 @@ import { generateRecord, countPhasesInRecord, validateRecordCandidateForWrite } 
 import { readRecord, writeRecord, resolveWorkspaceHashForRecord, findRecordHash, writeRecordSidecar } from "../record-store.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
 import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 import { listConversationsByMtime } from "../ls-client.js";
 import {
@@ -37,7 +38,7 @@ import {
     type ClaudeCodeThreadInfo,
 } from "../claude-code-client.js";
 import { listRecentWindsurfThreads, type WindsurfConversationSummary } from "../windsurf-client.js";
-import type { DataChain } from "../chain.js";
+import type { DataChain, ConversationLogicalChainMode } from "../chain.js";
 import type { SearchMode, TextBlock } from "../search-engine.js";
 import { buildRecordReaderIndex } from "../record-reader.js";
 import { formatAttachmentOverview, materializeRoundAttachments } from "../conversation-attachments.js";
@@ -155,16 +156,38 @@ function formatCodexSubagentSourceNote(loaded: { chainUsed?: string; codexData?:
     ].filter(Boolean).join("\n");
 }
 
+function formatClaudeCodeLogicalChainNote(loaded: { chainUsed?: string; claudeCodeData?: any }): string {
+    if (loaded.chainUsed !== "claude-code") return "";
+    const info = loaded.claudeCodeData?.logicalChain;
+    if (!info || info.mode === "off") return "";
+    const candidates = (info.segments || [])
+        .filter((item: any) => item.role !== "target")
+        .slice(0, 5)
+        .map((item: any) => {
+            const role = item.role === "predecessor-merged" ? "已合并" : "候选";
+            const title = formatConversationListTitleForTest(item.thread?.title || "(无标题)", 60);
+            const negatives = item.negativeEvidence?.length ? `；否定证据: ${item.negativeEvidence.join(" / ")}` : "";
+            return `- ${role} ${item.thread?.id || "(未知)"} | ${title} | score=${item.score}${negatives}`;
+        });
+    return [
+        `🧩 Claude Code 逻辑续聊: mode=${info.mode}, ${info.merged ? "已合并恢复" : "未合并，保持物理对话"}`,
+        ...(info.warnings || []).map((item: string) => `⚠️ ${item}`),
+        ...candidates,
+    ].filter(Boolean).join("\n");
+}
+
 function formatConversationSearchHeader(
     cascadeId: string,
-    loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null } },
+    loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null }; claudeCodeData?: any },
     modelChain?: string,
 ): string {
     const subagentNote = formatCodexSubagentSourceNote(loaded);
+    const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
     return [
         `📂 对话: ${cascadeId}`,
         `🔗 数据链路: ${loaded.chainUsed}${modelChain ? ` | 模型链路: ${modelChain}` : ""}`,
         subagentNote,
+        logicalChainNote,
     ].filter(Boolean).join("\n");
 }
 
@@ -945,86 +968,88 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
             conversationId: z.string().optional()
                 .describe("对话 UUID；fetch/search/read/export 建议总是显式传入，避免共享后端串到其它当前对话"),
             conversationIds: z.array(z.string()).optional()
-                .describe("deep_locate 可选：限制只扫描这些 Codex conversationId"),
+                .describe("[deep_locate] 可选：限制只扫描这些 Codex conversationId"),
             query: z.string().optional()
-                .describe("list/search 模式：搜索关键词"),
+                .describe("[list/search] 搜索关键词"),
             contextProbe: z.string().optional()
-                .describe("Codex/Claude Code list 模式：从当前可见对话截取的 50-120 字上下文指纹，用 fixed-string 语义的硬匹配标记候选；不会自动选中"),
+                .describe("[list] Codex/Claude Code：从当前可见对话截取的 50-120 字上下文指纹，用 fixed-string 语义的硬匹配标记候选；不会自动选中"),
             depth: z.enum(["brief", "normal", "full"]).default("normal")
-                .describe("返回详细度：brief=截断100字 / normal=完整文本 / full=含思考+工具结果"),
+                .describe("[fetch/search/read] 返回详细度：brief=截断100字 / normal=完整文本 / full=含思考+工具结果"),
             compactionMode: z.enum(["folded", "full", "omit"]).optional()
-                .describe("Claude Code 压缩续聊摘要读取方式：folded=默认折叠为临时文件 / full=展开但标记 / omit=仅保留省略标记；未传时 depth=full 自动 full，其余 folded"),
+                .describe("[read] Claude Code 压缩续聊摘要读取方式：folded=默认折叠为临时文件 / full=展开但标记 / omit=仅保留省略标记；未传时 depth=full 自动 full，其余 folded"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
-                .describe("list/search 模式：auto/exact/fuzzy/smart，默认 auto"),
+                .describe("[list/search] 匹配模式：auto/exact/fuzzy/smart，默认 auto"),
             contextRounds: z.number().default(2).optional()
-                .describe("search 模式：匹配位置前后显示多少轮对话"),
+                .describe("[search] 匹配位置前后显示多少轮对话"),
             limit: z.number().default(8).optional()
-                .describe("search 模式：最多返回多少个匹配"),
+                .describe("[list/search] 最多返回多少个匹配"),
             background: z.boolean().optional()
-                .describe("deep_locate 必须使用后台模式；true=返回 taskId 后轮询"),
+                .describe("[deep_locate] 必须使用后台模式；true=返回 taskId 后轮询"),
             taskId: z.string().optional()
-                .describe("deep_locate_status / deep_locate_cancel 的后台任务 ID"),
+                .describe("[deep_locate_status/deep_locate_cancel] 后台任务 ID"),
             waitSeconds: z.number().optional()
-                .describe("deep_locate_status 等待秒数，建议 30-45"),
+                .describe("[deep_locate_status] 等待秒数，建议 30-45"),
             maxFiles: z.number().optional()
-                .describe("deep_locate 最大扫描文件数"),
+                .describe("[deep_locate] 最大扫描文件数"),
             maxBytes: z.number().optional()
-                .describe("deep_locate 最大扫描字节数"),
+                .describe("[deep_locate] 最大扫描字节数"),
             maxHits: z.number().optional()
-                .describe("deep_locate 最大命中数"),
+                .describe("[deep_locate] 最大命中数"),
             startRound: z.number().optional()
-                .describe("read 模式：起始轮次（1-indexed）"),
+                .describe("[read] 起始轮次（1-indexed）"),
             endRound: z.number().optional()
-                .describe("read 模式：结束轮次"),
+                .describe("[read] 结束轮次"),
             exportFormat: z.enum(["markdown", "pdf", "both"]).optional()
-                .describe("export 模式：导出格式，markdown=只导出 Markdown，pdf=Markdown+PDF 且以 PDF 为目标，both=两者都生成"),
+                .describe("[export] 导出格式，markdown=只导出 Markdown，pdf=Markdown+PDF 且以 PDF 为目标，both=两者都生成"),
             exportScope: z.enum(["full", "rounds", "search"]).optional()
-                .describe("export 模式：full=整篇对话，rounds=按 startRound/endRound，search=按 query 命中窗口"),
+                .describe("[export] full=整篇对话，rounds=按 startRound/endRound，search=按 query 命中窗口"),
             outputDir: z.string().optional()
-                .describe("export 模式：自定义导出目录；不存在时自动创建。未传则写入 memory-store/exports/conversations/..."),
+                .describe("[export] 自定义导出目录；不存在时自动创建。未传则写入 memory-store/exports/conversations/..."),
             overwrite: z.boolean().optional()
-                .describe("export 模式：true=允许覆盖 outputDir 下本工具生成的同名文件；默认创建时间戳子目录"),
+                .describe("[export] true=允许覆盖 outputDir 下本工具生成的同名文件；默认创建时间戳子目录"),
             includeAssets: z.boolean().optional()
-                .describe("export 模式：是否复制图片/文件到 assets 并重写链接，默认 true"),
+                .describe("[export] 是否复制图片/文件到 assets 并重写链接，默认 true"),
             pdfEmbedAttachments: z.enum(["off", "auto", "force"]).optional()
-                .describe("export 模式：PDF 原生附件嵌入策略；auto=可用时尝试，off=只生成链接/清单，force=失败时报 warning/失败状态"),
+                .describe("[export] PDF 原生附件嵌入策略；auto=可用时尝试，off=只生成链接/清单，force=失败时报 warning/失败状态"),
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
-                .describe("额外拉取的内容类型"),
+                .describe("[fetch/search/read] 额外拉取的内容类型"),
             messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool"])).optional()
-                .describe("read 模式：按消息角色选择性读取。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
+                .describe("[read] 按消息角色选择性读取。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("读取对话数据的宿主链路；未填用 chain。支持 antigravity/codex/claude-code/windsurf"),
             dataChains: z.array(z.enum(DATA_CHAIN_INPUT_VALUES)).optional()
-                .describe("list/export 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\"]。未传时保持旧单 dataChain 行为"),
+                .describe("[list/export] 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\"]。未传时保持旧单 dataChain 行为"),
             workspaces: z.array(z.string()).optional()
-                .describe("list/export 批量模式：按工作区路径过滤，可传一个或多个目录"),
+                .describe("[list/export] 批量模式：按工作区路径过滤，可传一个或多个目录"),
             workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
                 .describe("工作区过滤：contains=父子目录任意包含，exact=精确路径，under=候选在指定目录下，any/all=多工作区聚合；默认 contains"),
             workspaceScope: z.enum(["any", "primary"]).optional()
                 .describe("工作区过滤范围：any=主工作区或关联工作区任意命中，primary=只匹配主工作区；默认 any，保持旧行为"),
             exportBatch: z.boolean().optional()
-                .describe("export 模式：true=按 dataChains/workspaces/query 过滤后批量导出多条对话，每条对话独立目录"),
+                .describe("[export] true=按 dataChains/workspaces/query 过滤后批量导出多条对话，每条对话独立目录"),
             batchLimit: z.number().optional()
-                .describe("exportBatch 模式：最多导出多少条候选，默认沿用 limit"),
+                .describe("[export] exportBatch 时最多导出多少条候选，默认沿用 limit"),
             batchConcurrency: z.number().optional()
-                .describe("exportBatch 模式：并发导出数，默认 2，最多 4"),
+                .describe("[export] exportBatch 时并发导出数，默认 2，最多 4"),
             sourceFailureMode: z.enum(["warn", "fail"]).optional()
                 .describe("多源查询/导出：warn=单源失败只警告并继续，fail=任一源失败即整体失败；默认 warn"),
             idResolutionMode: z.enum(["unique", "priority"]).optional()
                 .describe("dataChain=auto 且传 conversationId 时：unique=并行全源唯一匹配，priority=保留旧优先级顺序；默认 unique"),
             threadMode: z.enum(["main", "children", "all"]).optional()
-                .describe("Codex list/export 线程过滤：main=默认只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程都返回"),
+                .describe("[list/export] Codex 线程过滤：main=默认只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程都返回"),
             parentConversationId: z.string().optional()
-                .describe("threadMode=children 时指定父线程 conversationId"),
+                .describe("[list/export] threadMode=children 时指定父线程 conversationId"),
             parentQuery: z.string().optional()
-                .describe("threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
+                .describe("[list/export] threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
             parentDataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤"),
             modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain。Windsurf 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
+            logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
+                .describe("Claude Code 链路：off=默认只读指定物理 ID；explain=只展示可能续聊候选；auto/strict=强证据时合并为逻辑对话"),
         },
         async (params) => {
             touchActivity();
@@ -1075,6 +1100,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     parentDataChain,
                     modelChain,
                     link = DEFAULT_LINK_MODE,
+                    logicalChain,
                 } = params;
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
                 const effectiveCompactionMode: CompactionMode = compactionMode || (depth === "full" ? "full" : "folded");
@@ -1544,6 +1570,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     dataChains: dataChains as DataChain[] | undefined,
                     idResolutionMode: idResolutionMode as IdResolutionMode,
                     sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                    logicalChain: logicalChain as ConversationLogicalChainMode | undefined,
                 });
                 if (!loaded) {
                     return appendTiming({
@@ -1598,6 +1625,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     );
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
                     const subagentNote = formatCodexSubagentSourceNote(loaded);
+                    const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
                     const partialWarning = formatWindsurfPartialWarning(loaded);
                     const cacheNote = loaded.chainUsed === "antigravity"
                         ? (loaded.fromCache ? " (从缓存)" : " (新拉取)")
@@ -1655,7 +1683,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${overview}${cacheNote}${subagentNote ? `\n${subagentNote}` : ""}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+                            text: `${overview}${cacheNote}${subagentNote ? `\n${subagentNote}` : ""}${logicalChainNote ? `\n${logicalChainNote}` : ""}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
                         }],
                     }, startTime);
                 }
@@ -1810,6 +1838,8 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     pushOutputWithBuildBudget(output, `🔗 数据链路: ${loaded.chainUsed}`, buildState, "read 输出");
                     const subagentNote = formatCodexSubagentSourceNote(loaded);
                     if (subagentNote) pushOutputWithBuildBudget(output, subagentNote, buildState, "read 输出");
+                    const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
+                    if (logicalChainNote) pushOutputWithBuildBudget(output, logicalChainNote, buildState, "read 输出");
                     const roleFilter = normalizeMessageRoles(messageRoles as ConversationMessageRole[] | undefined);
                     pushOutputWithBuildBudget(output, `📖 读取轮次 ${start}-${Math.min(end, rounds.length)}${roleFilter.size ? ` | 角色过滤: ${[...roleFilter].join(", ")}` : ""}\n`, buildState, "read 输出");
 
@@ -1877,7 +1907,15 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ conversation_read_original 失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError(`conversation_read_original(${params.action})`, error, {
+                            action: params.action,
+                            conversationId: params.conversationId,
+                            query: params.query,
+                            mode: params.mode,
+                            chain: params.chain,
+                            dataChain: params.dataChain,
+                            modelChain: params.modelChain,
+                        }),
                     }],
                 }, startTime);
             }

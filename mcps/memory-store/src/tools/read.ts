@@ -3,6 +3,7 @@ import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { readMemoryFile, findMemoryById } from "../store.js";
 import { saveTempFile } from "../temp-store.js";
+import { formatToolError } from "../error-format.js";
 
 /**
  * memory_read — 读取单条记忆
@@ -75,7 +76,7 @@ export function registerRead(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ 读取失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_read", error, { id }),
                     }],
                 }, startTime);
             }

@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { parseRounds, type ConversationRound } from "../trajectory.js";
@@ -8,8 +8,9 @@ import { type MemoryIndexEntry } from "../cache.js";
 import { loadConversationData } from "../conversation-bridge.js";
 import { callModelResponse } from "../model-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
-import { DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, type ChainInput, type DataChainInput } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, decideBackground, type ChainInput, type DataChainInput } from "../chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "../ls-model-defaults.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
@@ -33,7 +34,7 @@ export function registerGoldenExtract(server: McpServer): void {
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("读取对话数据的宿主链路；未填用 chain，支持 windsurf"),
             modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain。Windsurf 只支持 dataChain"),
-            background: z.boolean().optional().describe("Codex 链路长模型调用建议设为 true，立即返回 taskId，后续用 taskId 查询"),
+            background: z.boolean().optional().describe("三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时），后续用 taskId 查询"),
             taskId: z.string().optional().describe("查询后台提取任务的 taskId"),
             waitSeconds: z.number().optional().describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
         },
@@ -46,21 +47,24 @@ export function registerGoldenExtract(server: McpServer): void {
                     content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
                 }, startTime);
             }
-            if (args.background) {
+            // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
+            const chains = resolveChainSplit(args);
+            const decision = decideBackground(args.background, chains.modelChain);
+            if (decision.useBackground) {
                 const task = startBackgroundTask("golden-extract", async () => {
                     const result = await runGoldenExtract({ ...args, background: false, taskId: undefined, waitSeconds: undefined }, Date.now());
                     return result.content.map((item: { text: string }) => item.text).join("\n");
                 });
-                const chains = resolveChainSplit(args);
                 return appendTiming({
                     content: [{
                         type: "text" as const,
                         text: [
                             "🚀 黄金片段提取已转入后台任务",
+                            decision.auto ? "（codex 重链路下未显式指定 background，已自动转后台以避免 60s 超时；如需同步请传 background=false）" : "",
                             `🆔 taskId: ${task.id}`,
                             `🔗 ${formatChainSplit(chains)}`,
                             "💡 后续调用 conversation_golden_extract(taskId=\"...\") 查询结果",
-                        ].join("\n"),
+                        ].filter(Boolean).join("\n"),
                     }],
                 }, startTime);
             }
@@ -205,7 +209,7 @@ ${truncatedText}
         return appendTiming({
             content: [{
                 type: "text" as const,
-                text: `❌ 黄金片段提取失败: ${error instanceof Error ? error.message : String(error)}`,
+                text: formatToolError("conversation_golden_extract", error, { conversationId, workspace }),
             }],
         }, startTime);
     }

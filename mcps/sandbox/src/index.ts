@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.13.3
- * 
+ * MCP Sandbox Server v1.13.4
+ *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
- * 
+ *
  * 8 个 MCP 工具：
  *   - sandbox_exec: 执行代码片段或系统命令（硬超时、内存限制、输出截断）
  *   - sandbox_session: 持久 REPL 会话（变量状态跨调用保持）
@@ -38,7 +38,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.13.3",
+    version: "1.13.4",
 });
 
 // 注册所有 8 个工具
@@ -63,7 +63,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.13.3 使用指南
+                text: `# MCP Sandbox v1.13.4 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -430,6 +430,7 @@ Antigravity 常用别名:
 - v1.13.1 Antigravity auto 模型链更新：默认 GetModelResponse 顺序改为 M132 → M20 → M18 → M16 → M36；旧 M37/M47/2.5 flash 入口转到当前可用占位符。复杂推理任务建议显式选择 M16
 - v1.13.2 Windsurf/WSF MCP 客户端兼容：文档与 schema 说明 WSF 只通过 HTTP broker 调用 sandbox，不新增 modelChain/provider；新增 WSF 配置与验证文档
 - v1.13.3 Codex 模型桥稳定性：smart_search(modelChain="codex") 默认使用低 reasoning 快速首选，并在可重试错误时按 gpt-5.5 low → gpt-5.4 low → gpt-5.4-mini low 降级；sandbox_codex 因可能有副作用，不默认自动重试
+- v1.13.4 修复 sandbox_exec code/command 互斥校验：原 === undefined 判定会把客户端传入的空串 "" 误算成"已提供"，触发"必须二选一"错误；现改为非空判定（length > 0），空串归一为 undefined 往下传，顺手统一 handler/executor 两层口径。新增 npm run test:exec-mutex 5 用例锁回归。详见 plans/Plan_9_fix_exec_mutex/
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，拒绝 localhost / 私有地址
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -521,7 +522,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.13.3 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.13.4 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -543,7 +544,7 @@ console.error(`[sandbox] MCP Server v1.13.3 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.13.3 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.13.4 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

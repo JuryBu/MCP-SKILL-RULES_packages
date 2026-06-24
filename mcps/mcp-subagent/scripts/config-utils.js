@@ -1,11 +1,13 @@
-﻿import fs from "node:fs/promises";
-import path from "node:path";
+import fs from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
+
+const homeDir = os.homedir();
 
 export const projectRoot = path.resolve(import.meta.dirname, "..");
 export const serverEntry = path.join(projectRoot, "src", "index.js");
-export const dataDir = path.join(projectRoot, "subagent-data");
-const homeDir = os.homedir();
+export const dataDir = process.env.SUBAGENT_DATA_DIR
+  || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(homeDir, ".codex-toolkit"), "mcp-subagent");
 
 export const defaults = {
   key: process.env.WSF_SUBAGENT_KEY || "subagent",

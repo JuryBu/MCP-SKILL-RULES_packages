@@ -24,7 +24,8 @@ import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "..
 
 // ── 常量 ──
 
-const DATA_ROOT = path.join(os.homedir(), ".gemini", "antigravity", "sandbox-data");
+const DATA_ROOT = process.env.SANDBOX_DATA_ROOT
+    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data");
 const LAUNCH_DIR = path.join(DATA_ROOT, "launches");
 const REGISTRY_FILE = path.join(LAUNCH_DIR, "registry.json");
 const WRAPPER_FILE = path.join(LAUNCH_DIR, "launch-wrapper.cjs");

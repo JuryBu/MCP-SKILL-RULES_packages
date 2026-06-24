@@ -1,4 +1,4 @@
-﻿# Rules Porting Notes
+# Rules Porting Notes
 
 ## Preserved
 

@@ -10,10 +10,10 @@ import { execute } from "../executor.js";
  * 提供硬超时、内存限制、输出截断等保护。
  */
 
-// 参数 schema（注册工具用 shape，运行时用 refine 校验互斥）
+// 参数 schema（注册工具用 shape，运行时在 handler 内做 code/command 非空互斥校验）
 const ExecParamsShape = {
-    code: z.string().optional().describe("代码字符串（和 command 二选一）"),
-    command: z.string().optional().describe("系统命令（和 command 二选一）"),
+    code: z.string().optional().describe("代码字符串。和 command 互斥，二选一，另一个请勿传（空串也视为未提供）。"),
+    command: z.string().optional().describe("系统命令。和 code 互斥，二选一，另一个请勿传（空串也视为未提供）。"),
     language: z.enum(["python", "node", "powershell", "cmd", "bash"]).optional()
         .describe("语言：python(默认)/node/powershell/cmd/bash(需 Git Bash)"),
     cwd: z.string().optional().describe("工作目录"),
@@ -57,15 +57,21 @@ command 模式：执行系统命令，自动用 shell 包装
             const startTime = Date.now();
             touchActivity();
 
-            // 参数校验（含 code/command 互斥检查）
-            const code = params.code as string | undefined;
-            const command = params.command as string | undefined;
+            // 参数校验（含 code/command 非空互斥检查，空串视为未提供）
+            const codeRaw = params.code as string | undefined;
+            const commandRaw = params.command as string | undefined;
+            const hasCode = typeof codeRaw === "string" && codeRaw.length > 0;
+            const hasCommand = typeof commandRaw === "string" && commandRaw.length > 0;
 
-            if ((code === undefined) === (command === undefined)) {
+            if (hasCode === hasCommand) {  // XOR: 都没提供 或 都提供了 → 报错
                 return {
-                    content: [{ type: "text" as const, text: `❌ 参数错误: 必须且只能提供 code 或 command 之一` }],
+                    content: [{ type: "text" as const, text: `❌ 参数错误: 必须且只能提供 code 或 command 之一（空串视为未提供）` }],
                 };
             }
+
+            // 归一：空串归并为 undefined 往下传，统一 handler/executor 两层口径
+            const code = hasCode ? codeRaw : undefined;
+            const command = hasCommand ? commandRaw : undefined;
 
             const language = (params.language as string) || undefined;
             const cwd = params.cwd as string | undefined;

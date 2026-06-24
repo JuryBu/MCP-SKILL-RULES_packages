@@ -4,10 +4,10 @@ import { touchActivity, appendTiming } from "../lifecycle.js";
 import {
     findMemoryById,
     deleteMemoryFile,
-    readWorkspaceIndex,
-    writeWorkspaceIndex,
+    mutateWorkspaceIndex,
     syncGlobalIndexForWorkspace,
 } from "../store.js";
+import { formatToolError } from "../error-format.js";
 
 /**
  * memory_delete — 删除记忆
@@ -39,11 +39,11 @@ export function registerDelete(server: McpServer): void {
                 // 删除文件
                 deleteMemoryFile(hash, id);
 
-                // 更新索引
-                const wsIndex = readWorkspaceIndex(hash);
-                wsIndex.entries = wsIndex.entries.filter(e => e.id !== id);
-                writeWorkspaceIndex(hash, wsIndex);
-                syncGlobalIndexForWorkspace(hash);
+                // 更新索引（串行化读改写）
+                await mutateWorkspaceIndex(hash, (wsIndex) => {
+                    wsIndex.entries = wsIndex.entries.filter(e => e.id !== id);
+                });
+                await syncGlobalIndexForWorkspace(hash);
 
                 return appendTiming({
                     content: [{
@@ -55,7 +55,7 @@ export function registerDelete(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ 删除失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_delete", error, { id }),
                     }],
                 }, startTime);
             }

@@ -1,4 +1,4 @@
-﻿param(
+param(
     [switch]$PackageClean
 )
 
@@ -74,6 +74,12 @@ Test-ForbiddenRuntimeFiles
 Test-ExcludedDirectories -StrictPackage:$PackageClean
 
 if ($PackageClean) {
+    foreach ($name in @("memory-store", "web-fetcher", "sandbox", "broker", "mcp-subagent")) {
+        $pkg = Join-Path $mcpRoot "$name\package.json"
+        if (-not (Test-Path -LiteralPath $pkg)) {
+            throw "Missing MCP source package: $pkg"
+        }
+    }
     Write-Output "Portable Codex toolkit package-clean check completed."
     exit 0
 }

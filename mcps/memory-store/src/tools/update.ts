@@ -5,8 +5,7 @@ import {
     findMemoryById,
     readMemoryFile,
     writeMemoryFile,
-    readWorkspaceIndex,
-    writeWorkspaceIndex,
+    mutateWorkspaceIndex,
     syncGlobalIndexForWorkspace,
     parseMemoryFile,
     buildMemoryFile,
@@ -16,6 +15,7 @@ import {
 } from "../store.js";
 import { generateAutoSummary } from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
@@ -165,23 +165,23 @@ export function registerUpdate(server: McpServer): void {
                 const newContent = buildMemoryFile(newFrontmatter, body);
                 writeMemoryFile(hash, id, newContent);
 
-                // 更新索引
-                const wsIndex = readWorkspaceIndex(hash);
-                const indexEntry = wsIndex.entries.find(e => e.id === id);
-                if (indexEntry) {
-                    if (title !== undefined) indexEntry.title = title;
-                    if (searchSummary !== undefined) indexEntry.searchSummary = searchSummary;
-                    if (tags !== undefined) indexEntry.tags = [...new Set([...indexEntry.tags, ...tags])];
-                    if (removeTags !== undefined) indexEntry.tags = indexEntry.tags.filter(t => !removeTags.includes(t));
-                    if (category !== undefined) indexEntry.category = category;
-                    if (pinned !== undefined) indexEntry.pinned = pinned;
-                    indexEntry.updatedAt = now;
-                    indexEntry.lastAccessed = now;
-                    indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
-                    indexEntry.lineCount = countLines(newContent);
-                }
-                writeWorkspaceIndex(hash, wsIndex);
-                syncGlobalIndexForWorkspace(hash);
+                // 更新索引（串行化读改写）
+                await mutateWorkspaceIndex(hash, (wsIndex) => {
+                    const indexEntry = wsIndex.entries.find(e => e.id === id);
+                    if (indexEntry) {
+                        if (title !== undefined) indexEntry.title = title;
+                        if (searchSummary !== undefined) indexEntry.searchSummary = searchSummary;
+                        if (tags !== undefined) indexEntry.tags = [...new Set([...indexEntry.tags, ...tags])];
+                        if (removeTags !== undefined) indexEntry.tags = indexEntry.tags.filter(t => !removeTags.includes(t));
+                        if (category !== undefined) indexEntry.category = category;
+                        if (pinned !== undefined) indexEntry.pinned = pinned;
+                        indexEntry.updatedAt = now;
+                        indexEntry.lastAccessed = now;
+                        indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
+                        indexEntry.lineCount = countLines(newContent);
+                    }
+                });
+                await syncGlobalIndexForWorkspace(hash);
 
                 // v1.5: 内容变化时重新生成 autoSummary
                 if (contentChanged) {
@@ -206,7 +206,7 @@ export function registerUpdate(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ 更新失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_update", error, { id, category }),
                     }],
                 }, startTime);
             }
@@ -254,14 +254,14 @@ async function triggerAutoSummaryUpdate(
         const newContent = buildMemoryFile(newFrontmatter, parsed.body);
         writeMemoryFile(hash, memoryId, newContent);
 
-        // 更新索引
-        const wsIndex = readWorkspaceIndex(hash);
-        const indexEntry = wsIndex.entries.find(e => e.id === memoryId);
-        if (indexEntry) {
-            indexEntry.autoSummary = summary;
-            indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
-            writeWorkspaceIndex(hash, wsIndex);
-        }
+        // 更新索引（串行化读改写）
+        await mutateWorkspaceIndex(hash, (wsIndex) => {
+            const indexEntry = wsIndex.entries.find(e => e.id === memoryId);
+            if (indexEntry) {
+                indexEntry.autoSummary = summary;
+                indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
+            }
+        });
 
         console.error(`[memory-store] ✅ autoSummary 已重新生成: ${memoryId} (${summary.length}字)`);
     } catch (err) {

@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
@@ -14,7 +14,8 @@ import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
 import { saveTempFile } from "../temp-store.js";
-import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, type Chain, type ChainInput, type DataChainInput, type DataChain } from "../chain.js";
+import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
@@ -134,65 +135,67 @@ action:
             includeGeneral: z.boolean().optional()
                 .describe("list/search 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
             query: z.string().optional()
-                .describe("search 模式的搜索关键词"),
+                .describe("[search] 搜索关键词"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
-                .describe("search 模式：auto/exact/fuzzy/smart，默认 auto"),
+                .describe("[search] 搜索模式：auto/exact/fuzzy/smart，默认 auto"),
             content: z.string().optional()
-                .describe("edit 模式：替换全文"),
+                .describe("[edit] 替换全文"),
             append: z.string().optional()
-                .describe("edit 模式：追加到末尾"),
+                .describe("[edit] 追加到末尾"),
             startLine: z.number().optional()
-                .describe("read 模式：起始行号"),
+                .describe("[read] 起始行号"),
             endLine: z.number().optional()
-                .describe("read 模式：结束行号"),
+                .describe("[read] 结束行号"),
             view: z.enum(["raw", "outline", "state", "outputs", "lessons", "risks", "verification", "phase", "custom"]).optional()
-                .describe("read 模式：结构化视图。未传则保持旧全文读取行为"),
+                .describe("[read] 结构化视图。未传则保持旧全文读取行为"),
             phaseIds: z.array(z.union([z.string(), z.number()])).optional()
-                .describe("read/search：限定 Phase，例如 [1] 或 [\"phase-1\"]"),
+                .describe("[read/search] 限定 Phase，例如 [1] 或 [\"phase-1\"]"),
             startBlockId: z.string().optional()
-                .describe("read：从指定 reader block 继续读取，通常来自上次结构化读取的 nextReadHint.startBlockId"),
+                .describe("[read] 从指定 reader block 继续读取，通常来自上次结构化读取的 nextReadHint.startBlockId"),
             sectionTypes: z.array(z.enum(RECORD_SECTION_TYPES)).optional()
-                .describe("read/search：限定 Record 区块类型"),
+                .describe("[read/search] 限定 Record 区块类型"),
             include: z.array(z.enum(RECORD_SECTION_TYPES)).optional()
-                .describe("read：只包含指定区块类型"),
+                .describe("[read] 只包含指定区块类型"),
             exclude: z.array(z.enum(RECORD_SECTION_TYPES)).optional()
-                .describe("read：排除指定区块类型"),
+                .describe("[read] 排除指定区块类型"),
             maxChars: z.number().optional()
-                .describe("read/search/guide：最大输出字符数，结构化读取会按 block 边界截断"),
+                .describe("[read/search/guide] 最大输出字符数，结构化读取会按 block 边界截断"),
             format: z.enum(["text", "json"]).optional()
-                .describe("read/search/guide：返回格式，默认 text"),
+                .describe("[read/search/guide] 返回格式，默认 text"),
             withCitations: z.boolean().optional()
-                .describe("read：是否输出 block/行号来源，默认 true"),
+                .describe("[read] 是否输出 block/行号来源，默认 true"),
             indexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
-                .describe("read/search/guide：reader index 策略，auto=复用新鲜索引或懒重建"),
+                .describe("[read/search/guide] reader index 策略，auto=复用新鲜索引或懒重建"),
             recordIds: z.array(z.string()).optional()
-                .describe("search/guide：限定多个 Record ID"),
+                .describe("[search/guide] 限定多个 Record ID"),
             searchScope: z.enum(["record", "phase", "section", "item"]).optional()
-                .describe("search：结果粒度，不复用 scope，避免和 workspace/global/general 冲突"),
+                .describe("[search] 结果粒度，不复用 scope，避免和 workspace/global/general 冲突"),
             goal: z.string().optional()
-                .describe("guide：阅读目标，用于生成 read/search 建议"),
+                .describe("[guide] 阅读目标，用于生成 read/search 建议"),
             maxRecommendations: z.number().optional()
-                .describe("guide：最多返回建议数量，默认 5"),
+                .describe("[guide] 最多返回建议数量，默认 5"),
             after: z.string().optional()
-                .describe("batch_update: 只处理此时间之后的对话(ISO/YYYY-MM-DD)"),
+                .describe("[batch_update] 只处理此时间之后的对话(ISO/YYYY-MM-DD)"),
             before: z.string().optional()
-                .describe("batch_update: 只处理此时间之前的对话"),
+                .describe("[batch_update] 只处理此时间之前的对话"),
             limit: z.number().optional()
-                .describe("batch_update: 最大处理数量(默认10, 上限50)"),
+                .describe("[list/search/batch_update] 最大数量；list 默认 30/上限 200，search 默认 10，batch_update 默认 10/上限 50"),
             force: z.boolean().optional()
-                .describe("update/batch_update: 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
+                .describe("[update/batch_update] 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
             dryRun: z.boolean().optional()
-                .describe("repair_ownership: 默认 true，只报告计划不移动文件"),
+                .describe("[repair_ownership] 默认 true，只报告计划不移动文件"),
             backup: z.boolean().optional()
-                .describe("repair_ownership: 真正迁移前备份 Record 正文和索引，默认 true"),
+                .describe("[repair_ownership] 真正迁移前备份 Record 正文和索引，默认 true"),
             waitSeconds: z.number().optional()
-                .describe("后台任务查询等待秒数(1-300)，任务完成时提前返回"),
+                .describe("[task_status] 后台任务查询等待秒数(1-300)，任务完成时提前返回"),
             background: z.boolean().optional()
-                .describe("Codex 链路长模型调用建议设为 true，立即返回 taskId，后续用 task_status 查询"),
+                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时），后续用 task_status 查询"),
             parallelMode: z.enum(["off", "auto", "force"]).optional()
-                .describe("实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
+                .describe("[update] 实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
+            logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
+                .describe("[update] Claude Code Record 更新：off=只用指定物理 ID；auto=强证据时合并逻辑续聊链，默认 claude-code 使用 auto"),
             taskId: z.string().optional()
-                .describe("task_status: 后台任务 ID"),
+                .describe("[task_status] 后台任务 ID"),
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
                 .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
@@ -206,13 +209,17 @@ action:
                 const hash = resolveWorkspaceHashForRecord(args.workspace);
                 const chains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
                 switch (args.action) {
-                    case "update":
-                        if (args.background) {
-                            return handleUpdateBackground(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, startMs);
+                    case "update": {
+                        // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
+                        // 仅 codex 这类 heavy 链路在 background 未传时自动转后台（避免 60s 超时），其余链路未传仍同步（行为不变）。
+                        const decision = decideBackground(args.background, chains.modelChain);
+                        if (decision.useBackground) {
+                            return handleUpdateBackground(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, args.logicalChain as ConversationLogicalChainMode | undefined, startMs, decision.auto);
                         }
-                        return await handleUpdate(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, startMs);
+                        return await handleUpdate(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, args.logicalChain as ConversationLogicalChainMode | undefined, startMs);
+                    }
                     case "list":
-                        return handleList(hash, args.scope, args.includeGeneral, args.after, args.before, startMs);
+                        return handleList(hash, args.scope, args.includeGeneral, args.after, args.before, args.limit, startMs);
                     case "read":
                         return await handleRead(hash, args.conversationId, args.startLine, args.endLine, startMs, {
                             view: args.view,
@@ -265,8 +272,17 @@ action:
                         return r(`❌ 未知 action: ${args.action}`);
                 }
             } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                return rt(`❌ record_manage 错误: ${msg}`, startMs);
+                return rt(formatToolError(`record_manage(${args.action})`, err, {
+                    action: args.action,
+                    conversationId: args.conversationId,
+                    workspace: args.workspace,
+                    scope: args.scope,
+                    mode: args.mode,
+                    chain: args.chain,
+                    dataChain: args.dataChain,
+                    modelChain: args.modelChain,
+                    background: args.background,
+                }), startMs);
             }
         }
     );
@@ -423,14 +439,18 @@ export function listRecordsForScope(hash: string, scope: RecordManageScope | und
 
 async function handleUpdate(
     hash: string, conversationId: string | undefined,
-    workspace: string | undefined, dataChain: DataChain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, startMs: number,
-    options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void } = {},
+    workspace: string | undefined, dataChain: DataChain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, logicalChain: ConversationLogicalChainMode | undefined, startMs: number,
+    options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void; isSettled?: () => boolean } = {},
 ) {
     options.onProgress?.({
         stage: "加载对话",
         detail: `dataChain=${dataChain}`,
     });
-    const loaded = await loadConversationData(dataChain, conversationId, { link: "summary" });
+    const effectiveLogicalChain = logicalChain || (dataChain === "claude-code" ? "auto" : "off");
+    const loaded = await loadConversationData(dataChain, conversationId, {
+        link: "summary",
+        logicalChain: effectiveLogicalChain,
+    });
     if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
     if (loaded.windsurfData?.partial) {
         const skipped = loaded.windsurfData.skippedSteps || [];
@@ -518,6 +538,11 @@ async function handleUpdate(
         return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
     }
 
+    // A2：写回前自查任务是否已结算——后台超时只把任务标 error、本函数仍会跑到这里，若已结算则丢弃结果、
+    // 绝不覆盖正式 Record（防「报失败却偷偷改数据」的幽灵写回）。同步路径无 isSettled，行为不变。
+    if (options.isSettled?.()) {
+        return rt("⚠️ 后台任务已超时/取消，已丢弃本次生成结果，未覆盖正式 Record（请重跑）", startMs);
+    }
     const phases = countPhasesInRecord(result.content!);
     await writeRecord(effectiveHash, cascadeId, result.content!, {
         title: extractTitle(result.content!) || `对话 ${cascadeId.slice(0, 8)}`,
@@ -541,6 +566,12 @@ async function handleUpdate(
     out += `\n📝 对话: ${cascadeId.slice(0, 8)}...`;
     out += `\n🔗 对话链路: ${loaded.chainUsed}`;
     out += `\n🧠 模型链路: ${modelChain}`;
+    if (loaded.claudeCodeData?.logicalChain && loaded.claudeCodeData.logicalChain.mode !== "off") {
+        const info = loaded.claudeCodeData.logicalChain;
+        const merged = info.segments.filter(item => item.role === "predecessor-merged");
+        out += `\n🧩 Claude Code 逻辑续聊: ${info.merged ? `已合并 ${merged.length} 个前序片段` : "未发现可安全自动合并的前序片段"}`;
+        if (info.warnings?.length) out += `\n⚠️ ${info.warnings.join("\n⚠️ ")}`;
+    }
     if (parallelMode) out += `\n🧪 并行模式: ${parallelMode}`;
     if (force) out += `\n♻️ force: 已绕过“已是最新”短路`;
     if (result.warnings?.length) {
@@ -565,22 +596,27 @@ function handleUpdateBackground(
     modelChain: Chain,
     parallelMode: RecordParallelMode | undefined,
     force: boolean | undefined,
+    logicalChain: ConversationLogicalChainMode | undefined,
     startMs: number,
+    autoBackground = false,
 ) {
-    const task = startBackgroundTask("record-update", async ({ updateProgress }) => {
-        const result = await handleUpdate(hash, conversationId, workspace, dataChain, modelChain, parallelMode, force, Date.now(), {
+    const task = startBackgroundTask("record-update", async ({ updateProgress, isSettled }) => {
+        const result = await handleUpdate(hash, conversationId, workspace, dataChain, modelChain, parallelMode, force, logicalChain, Date.now(), {
             background: true,
             onProgress: updateProgress,
+            isSettled,
         });
         return responseText(result);
     });
     return rt([
         "🚀 Record 更新已转入后台任务",
+        autoBackground ? "（codex 重链路下未显式指定 background，已自动转后台以避免 60s 超时；如需同步请传 background=false）" : "",
         `🆔 taskId: ${task.id}`,
         `🔗 dataChain: ${dataChain}`,
         `🧠 modelChain: ${modelChain}`,
         parallelMode ? `🧪 parallelMode: ${parallelMode}` : "",
         force ? `♻️ force: true` : "",
+        logicalChain ? `🧩 logicalChain: ${logicalChain}` : "",
         "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询结果",
     ].filter(Boolean).join("\n"), startMs);
 }
@@ -593,7 +629,7 @@ async function handleTaskStatus(taskId: string | undefined, waitSeconds: number 
 
 // ============= list =============
 
-function handleList(hash: string, scope: RecordManageScope | undefined, includeGeneral: boolean | undefined, after: string | undefined, before: string | undefined, startMs: number) {
+function handleList(hash: string, scope: RecordManageScope | undefined, includeGeneral: boolean | undefined, after: string | undefined, before: string | undefined, limit: number | undefined, startMs: number) {
     const recordMap = new Map<string, ReturnType<typeof listRecords>[0] & { hash: string }>();
     for (const recordHash of recordHashesForScope(hash, scope, includeGeneral === true)) {
         for (const rec of listRecords(recordHash).filter(item => !isSupersededRecord(recordHash, item.conversationId))) {
@@ -620,8 +656,14 @@ function handleList(hash: string, scope: RecordManageScope | undefined, includeG
         records = records.filter(r => new Date(r.lastUpdatedAt).getTime() <= beforeMs);
     }
 
-    const lines = [`📋 Record 列表 (${records.length} 份):\n`];
-    for (const rec of records) {
+    // B1：默认 limit + 超长落盘，防 list 全量返回撑爆 token（截断在时间筛选之后）
+    const total = records.length;
+    const effectiveLimit = Math.min(Math.max(1, limit ?? 30), 200);
+    const shown = records.slice(0, effectiveLimit);
+    const lines = [total > shown.length
+        ? `📋 Record 列表 (显示最近 ${shown.length}/${total} 份，按更新时间倒序；需更多用 limit，上限 200)：\n`
+        : `📋 Record 列表 (${total} 份):\n`];
+    for (const rec of shown) {
         const readerIndex = readRecordSidecar<RecordReaderIndex>(rec.hash, rec.conversationId, RECORD_READER_SIDECAR);
         const sectionCounts = readerIndex?.blocks
             ? readerIndex.blocks.reduce((stats, block) => {
@@ -639,8 +681,14 @@ function handleList(hash: string, scope: RecordManageScope | undefined, includeG
             lines.push(`     🏷 ${rec.tags.join(", ")}`);
         }
     }
-    if (records.length === 0) lines.push("  (无 Record)");
-    return rt(lines.join("\n"), startMs);
+    if (total === 0) lines.push("  (无 Record)");
+    const body = lines.join("\n");
+    // 即便已 limit，内容仍可能超大（含 sections/tags）→ 落盘只返概览+路径，防撑爆 token
+    if (body.length > 8000) {
+        const tmpPath = saveTempFile("record-list", (hash || "all").slice(0, 8), body);
+        return rt(`📋 Record 列表共 ${total} 份（已显示 ${shown.length}），完整列表 ${body.length} 字超长已落盘：\n${tmpPath}\n建议用 record_manage(read/search) 定位具体 Record，或调小 limit / 加 after/before 时间筛选。`, startMs);
+    }
+    return rt(body, startMs);
 }
 
 // ============= read =============

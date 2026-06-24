@@ -9,6 +9,7 @@ export type DataChain = typeof DATA_CHAIN_VALUES[number];
 export type DataChainInput = typeof DATA_CHAIN_INPUT_VALUES[number];
 
 export type ConversationLinkMode = "reference" | "summary" | "expand_children";
+export type ConversationLogicalChainMode = "off" | "explain" | "auto" | "strict";
 
 export const DEFAULT_CHAIN: Chain = "auto";
 
@@ -76,6 +77,38 @@ export function resolveModelOnlyChainSplit(input: Pick<ChainSplitInput, "chain" 
     assertValidModelChainInput(input.chain, "chain");
     assertValidModelChainInput(input.modelChain, "modelChain");
     return resolveChainSplit(input);
+}
+
+/**
+ * 重链路判定（C3 块B）：codex 链路走本地 CLI 调用，长模型任务易撞 60s 硬超时，
+ * 因此判为 heavy；undefined background 时这类链路自动转后台。其余链路（antigravity/
+ * claude-code/auto）默认不算 heavy，行为保持同步不变。
+ */
+export function isHeavyChain(chain: Chain): boolean {
+    return chain === "codex";
+}
+
+export interface BackgroundDecision {
+    /** 是否走后台 */
+    useBackground: boolean;
+    /** 是否因 heavy 链路自动转的（用于给返回文案加提示） */
+    auto: boolean;
+}
+
+/**
+ * 三态 background 决策（C3 块B）——record update / stage_guard check / golden_extract 共用。
+ * ⚠️ 三态布尔陷阱：必须严格区分 `=== false` 与 `=== undefined`，不能写 `if(background)`
+ * 把两者混为一谈：
+ *   - background === true  → 强制后台
+ *   - background === false → 强制同步（即便 heavy 链路也同步）
+ *   - background === undefined → 仅当 heavy 链路（codex）才自动转后台；其余同步（行为不变）
+ */
+export function decideBackground(background: boolean | undefined, modelChain: Chain): BackgroundDecision {
+    if (background === true) return { useBackground: true, auto: false };
+    if (background === false) return { useBackground: false, auto: false };
+    // background === undefined
+    const auto = isHeavyChain(modelChain);
+    return { useBackground: auto, auto };
 }
 
 export function formatChainSplit(split: ChainSplit): string {

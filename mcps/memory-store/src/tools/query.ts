@@ -17,6 +17,7 @@ import { saveTempFile } from "../temp-store.js";
 import { fuseSearch, grepInEntries, grepGlobal } from "../search.js";
 import { countRecords } from "../record-store.js";
 import { resolveModelOnlyChainSplit } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import type { SearchMode } from "../search-engine.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
@@ -24,6 +25,9 @@ import { modelChainInputSchema } from "./schema-utils.js";
 interface EntryWithSource extends MemoryIndexEntry {
     _sourceHash?: string;
 }
+
+/** 搜索时每条记忆正文截断上限（字符），控内存与 token 成本 */
+const BODY_SNIPPET_LIMIT = 3000;
 
 /**
  * memory_query — 查询记忆
@@ -128,12 +132,17 @@ export function registerQuery(server: McpServer): void {
                     const requestedMode = (mode || "auto") as SearchMode;
                     if (requestedMode === "auto" && entries.length > 0) {
                         const { search: engineSearch } = await import("../search-engine.js");
-                        const blocks = entries.map(e => ({
-                            id: e.id,
-                            title: e.title,
-                            content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}`,
-                            tags: e.tags,
-                        }));
+                        const blocks = entries.map(e => {
+                            const srcHash = (e as EntryWithSource)._sourceHash || hash;
+                            const body = (readMemoryFile(srcHash, e.id) || "").slice(0, BODY_SNIPPET_LIMIT);
+                            return {
+                                id: e.id,
+                                title: e.title,
+                                content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}\n${body}`,
+                                tags: e.tags,
+                                metadata: { updatedAt: e.updatedAt }, // B2: smart 缓存指纹含版本，防脏读
+                            };
+                        });
                         let engineResults = await engineSearch(blocks, query, {
                             mode: "auto",
                             limit: maxResults,
@@ -153,12 +162,17 @@ export function registerQuery(server: McpServer): void {
                     } else if (entries.length > 0) {
                         try {
                             const { search: engineSearch } = await import("../search-engine.js");
-                            const blocks = entries.map(e => ({
-                                id: e.id,
-                                title: e.title,
-                                content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}`,
-                                tags: e.tags,
-                            }));
+                            const blocks = entries.map(e => {
+                                const srcHash = (e as EntryWithSource)._sourceHash || hash;
+                                const body = (readMemoryFile(srcHash, e.id) || "").slice(0, BODY_SNIPPET_LIMIT);
+                                return {
+                                    id: e.id,
+                                    title: e.title,
+                                    content: `${e.title}\n${e.searchSummary || ""}\n${(e as any).autoSummary || ""}\n${e.tags.join(" ")}\n${body}`,
+                                    tags: e.tags,
+                                    metadata: { updatedAt: e.updatedAt }, // B2: smart 缓存指纹含版本，防脏读
+                                };
+                            });
                             const engineResults = await engineSearch(blocks, query, {
                                 mode: requestedMode,
                                 limit: maxResults,
@@ -188,7 +202,7 @@ export function registerQuery(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ 查询失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_query", error, { query, scope, workspace, mode, limit }),
                     }],
                 }, startTime);
             }
@@ -417,7 +431,7 @@ function formatResults(
     // index / summary 模式
     const lines = results.map((r, i) => {
         const e = r.entry;
-        const scoreStr = r.score !== undefined ? ` (匹配: ${(1 - r.score).toFixed(2)})` : "";
+        const scoreStr = r.score !== undefined ? ` (匹配: ${Math.min(1, Math.max(0, r.score)).toFixed(2)})` : "";
 
         if (depth === "summary") {
             const catStr = e.category ? ` | ${e.category}` : "";

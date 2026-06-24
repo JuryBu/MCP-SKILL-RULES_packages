@@ -1,12 +1,9 @@
-﻿import fs from "node:fs/promises";
-import path from "node:path";
+import fs from "node:fs/promises";
 import os from "node:os";
-import { defaults, parseArgs, pathExists, timestamp } from "./config-utils.js";
+import path from "node:path";
+import { dataDir, defaults, parseArgs, pathExists, projectRoot, serverEntry, timestamp } from "./config-utils.js";
 
 const brokerPath = process.env.CODEX_MCP_BROKER_SCRIPT || path.join(os.homedir(), ".codex", "mcp-http-broker", "broker.mjs");
-const projectRoot = path.resolve(import.meta.dirname, "..");
-const serverEntry = path.join(projectRoot, "src", "index.js");
-const dataDir = process.env.SUBAGENT_DATA_DIR || path.join(projectRoot, "subagent-data");
 
 function usage() {
   return [

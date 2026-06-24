@@ -8,8 +8,7 @@ import {
     buildMemoryFile,
     writeMemoryFile,
     readMemoryFile,
-    readWorkspaceIndex,
-    writeWorkspaceIndex,
+    mutateWorkspaceIndex,
     syncGlobalIndexForWorkspace,
     countLines,
     readConfig,
@@ -20,6 +19,7 @@ import { type MemoryIndexEntry } from "../cache.js";
 import { checkDuplicates } from "../search.js";
 import { generateAutoSummary } from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
@@ -94,8 +94,7 @@ export function registerWrite(server: McpServer): void {
                 const fileContent = buildMemoryFile(frontmatter, content);
                 writeMemoryFile(hash, id, fileContent);
 
-                // 更新索引
-                const wsIndex = readWorkspaceIndex(hash);
+                // 更新索引（串行化读改写，防并发丢条目）
                 const indexEntry: MemoryIndexEntry = {
                     id,
                     title,
@@ -110,15 +109,17 @@ export function registerWrite(server: McpServer): void {
                     conversationId,
                     pinned,
                 };
-                wsIndex.entries.push(indexEntry);
-                writeWorkspaceIndex(hash, wsIndex);
+                let existingEntries: MemoryIndexEntry[] = [];
+                await mutateWorkspaceIndex(hash, (wsIndex) => {
+                    wsIndex.entries.push(indexEntry);
+                    existingEntries = wsIndex.entries.filter(e => e.id !== id); // 去重检测基线
+                });
 
-                // 同步全局索引
-                syncGlobalIndexForWorkspace(hash);
+                // 同步全局索引（在 per-hash 锁外、用独立全局锁串行化，避免锁嵌套死锁）
+                await syncGlobalIndexForWorkspace(hash);
 
                 // 去重检测
                 let dedupWarning = "";
-                const existingEntries = wsIndex.entries.filter(e => e.id !== id);
                 const duplicates = checkDuplicates(existingEntries, title, actualSearchSummary);
                 if (duplicates.length > 0) {
                     dedupWarning = "\n\n⚠️ 发现相似记忆：\n" +
@@ -144,7 +145,7 @@ export function registerWrite(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ 写入失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_write", error, { workspace, category }),
                     }],
                 }, startTime);
             }
@@ -193,14 +194,14 @@ async function triggerAutoSummary(
         const newContent = buildMemoryFile(newFrontmatter, parsed.body);
         writeMemoryFile(hash, memoryId, newContent);
 
-        // 更新索引中的 autoSummary
-        const wsIndex = readWorkspaceIndex(hash);
-        const indexEntry = wsIndex.entries.find(e => e.id === memoryId);
-        if (indexEntry) {
-            indexEntry.autoSummary = summary;
-            indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
-            writeWorkspaceIndex(hash, wsIndex);
-        }
+        // 更新索引中的 autoSummary（串行化读改写）
+        await mutateWorkspaceIndex(hash, (wsIndex) => {
+            const indexEntry = wsIndex.entries.find(e => e.id === memoryId);
+            if (indexEntry) {
+                indexEntry.autoSummary = summary;
+                indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
+            }
+        });
 
         console.error(`[memory-store] ✅ autoSummary 已生成: ${memoryId} (${summary.length}字)`);
     } catch (err) {

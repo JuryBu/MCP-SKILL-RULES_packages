@@ -1,4 +1,4 @@
-﻿import { execSync, execFileSync } from "child_process";
+import { execSync, execFileSync } from "child_process";
 import http from "http";
 import path from "path";
 import os from "os";
@@ -57,6 +57,15 @@ let parentLsInitDone = false;
  */
 export function getParentLs(): ParentLsConnection | null {
     return parentLs;
+}
+
+/**
+ * 测试专用：直接注入/清空父 LS 连接，使模型调用走指定连接而不触发注册表/PowerShell 发现。
+ * 仅供单测构造确定性场景（如 fake LS server）使用，生产代码不调用。
+ */
+export function __setParentLsForTest(conn: ParentLsConnection | null): void {
+    parentLs = conn;
+    parentLsInitDone = conn !== null;
 }
 
 /**
@@ -718,7 +727,9 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
 
 // ===== 辅助 =====
 
-const CONV_CACHE_DIR = path.join(os.homedir(), ".gemini", "antigravity", "memory-store", "temp");
+const MEMORY_STORE_DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
+    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
+const CONV_CACHE_DIR = path.join(MEMORY_STORE_DATA_ROOT, "temp");
 
 function getConvCachePath(cascadeId: string): string {
     const safeId = cascadeId.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
@@ -929,7 +940,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/Users/example/Desktop/project"
+ * 返回去 URI 化后的本地路径，如 "c:/Users/<user>/Desktop/project"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {
@@ -1009,26 +1020,105 @@ async function callGetModelResponseOn(
     return null;
 }
 
-export async function callGetModelResponse(model: string, prompt: string, timeoutMs?: number): Promise<string | null> {
+/** 结构化模型调用结果，透传真超时信号（区别于普通失败）。 */
+export interface LsModelResult {
+    text: string | null;
+    error?: string;
+    /** true 仅表示「真超时」（wall-clock 兜底或 socket inactivity 超时）；
+     *  连接被拒 / 进程死 / 空响应等普通失败一律 false，仍可由上层重试或换候选。 */
+    timedOut?: boolean;
+}
+
+/** 哨兵错误：wall-clock 兜底超时（区别于 socket "Request timeout"）。 */
+const LS_WALL_CLOCK_TIMEOUT = Symbol("ls-wall-clock-timeout");
+
+/** 判定一个错误是否属于「真超时」。
+ *  真超时来源有二：① 本层 wall-clock 兜底（LS_WALL_CLOCK_TIMEOUT 哨兵）；
+ *  ② httpPost 的 socket inactivity 超时（reject Error("Request timeout")）。
+ *  连接被拒（ECONNREFUSED）、进程死、解析失败等都不算超时。 */
+function isTimeoutError(err: unknown): boolean {
+    if (err === LS_WALL_CLOCK_TIMEOUT) return true;
+    const message = err instanceof Error ? err.message : String(err ?? "");
+    // 仅匹配 httpPost 显式抛出的超时文案，避免把含 "timeout" 的其它错误误判成真超时。
+    return /^Request timeout$/u.test(message);
+}
+
+/**
+ * 给一个 Promise 套上 wall-clock 超时兜底。
+ * socket inactivity 超时（httpPost 内的 req.timeout）在「连接活着但 LS 长时间不返回」时
+ * 不一定可靠触发（TCP keep-alive / 偶发数据会重置计时器），故在此再叠一层确定性 wall-clock 超时，
+ * 保证 timeoutMs 到点后必定以「真超时」收口，不会无限挂起、也不会把超时误压成普通失败。
+ */
+function withWallClockTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(LS_WALL_CLOCK_TIMEOUT);
+        }, timeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+        promise.then(
+            (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            },
+            (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            },
+        );
+    });
+}
+
+/**
+ * 结构化版：返回 {text, error, timedOut}，把「真超时」与「普通失败」区分开。
+ * v1.16 (C2)：新增此 detailed 版，旧版 callGetModelResponse 委托本函数（只取 text），
+ * 避免破坏现有 caller。上层（model-bridge）应优先用本函数以拿到 timedOut 信号。
+ */
+export async function callGetModelResponseDetailed(
+    model: string,
+    prompt: string,
+    timeoutMs?: number,
+): Promise<LsModelResult> {
     const timeout = timeoutMs || LIGHT_TIMEOUT;
     try {
-        if (parentLs) {
-            return await callGetModelResponseOn(parentLs.info, parentLs.port, model, prompt, timeout);
-        }
-
-        // parentLs 未初始化时降级
-        const lsInfo = discoverParentLs();
-        if (lsInfo) {
-            const port = await findHttpPort(lsInfo);
-            if (port) {
-                return await callGetModelResponseOn(lsInfo, port, model, prompt, timeout);
+        const text = await withWallClockTimeout((async () => {
+            if (parentLs) {
+                return await callGetModelResponseOn(parentLs.info, parentLs.port, model, prompt, timeout);
             }
-        }
 
-        const fallback = await findFallbackLsConnection();
-        if (!fallback) return null;
-        return await callGetModelResponseOn(fallback.info, fallback.port, model, prompt, timeout);
-    } catch {
-        return null;
+            // parentLs 未初始化时降级
+            const lsInfo = discoverParentLs();
+            if (lsInfo) {
+                const port = await findHttpPort(lsInfo);
+                if (port) {
+                    return await callGetModelResponseOn(lsInfo, port, model, prompt, timeout);
+                }
+            }
+
+            const fallback = await findFallbackLsConnection();
+            if (!fallback) return null;
+            return await callGetModelResponseOn(fallback.info, fallback.port, model, prompt, timeout);
+        })(), timeout);
+
+        if (text) return { text };
+        // 模型返回空：普通失败（非超时），上层可重试 / 换候选。
+        return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false };
+    } catch (err: any) {
+        const timedOut = isTimeoutError(err);
+        const message = err === LS_WALL_CLOCK_TIMEOUT
+            ? `Antigravity LS 模型调用超时（${timeout}ms）`
+            : (err?.message ? `Antigravity LS 模型调用失败: ${err.message}` : "Antigravity LS 模型调用失败");
+        return { text: null, error: message, timedOut };
     }
+}
+
+export async function callGetModelResponse(model: string, prompt: string, timeoutMs?: number): Promise<string | null> {
+    const result = await callGetModelResponseDetailed(model, prompt, timeoutMs);
+    return result.text;
 }

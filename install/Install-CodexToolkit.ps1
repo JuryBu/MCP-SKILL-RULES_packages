@@ -1,8 +1,15 @@
-﻿$ErrorActionPreference = "Stop"
+param(
+    [switch]$IncludeWindsurfSubagent
+)
+
+$ErrorActionPreference = "Stop"
 
 $toolkitRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 $mcpRoot = Join-Path $toolkitRoot "mcps"
 $components = @("memory-store", "web-fetcher", "sandbox", "broker")
+if ($IncludeWindsurfSubagent) {
+    $components += "mcp-subagent"
+}
 
 function Require-Command($name) {
     $cmd = Get-Command $name -ErrorAction SilentlyContinue

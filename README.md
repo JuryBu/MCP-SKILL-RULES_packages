@@ -1,4 +1,4 @@
-﻿# MCP-SKILL-RULES Packages
+# MCP-SKILL-RULES Packages
 
 面向 AI 编程环境的可移植 MCP + Skills + Rules 工具包。
 
@@ -6,7 +6,7 @@
 
 当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
 
-> 2026-06-16 refresh: latest MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.15.13`, `sandbox` is `1.13.3`, `web-fetcher` remains `7.0.0`, and `mcp-subagent` remains Windsurf-only optional.
+> 2026-06-24 refresh: MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.16.0`, `sandbox` is `1.13.4`, `web-fetcher` remains `7.0.0`, `mcp-subagent` remains Windsurf-only optional, and `broker` keeps portable path/data-root patches.
 
 ---
 
@@ -35,9 +35,9 @@
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
-| `memory-store` | `1.15.13` | 记忆库、对话读取、Conversation Export、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
+| `memory-store` | `1.16.0` | 记忆库、对话读取、Conversation Export、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
-| `sandbox` | `1.13.3` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
+| `sandbox` | `1.13.4` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
 | `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
 | `mcp-subagent` | `0.0.1` | Windsurf 专属异步子代理：spawn / poll / reply / collect / interrupt / dispose；默认不作为四源共享 MCP 启用 |
 
@@ -137,7 +137,7 @@ Rules 主要约束：
 - Node.js 18+
 - npm
 - PowerShell
-- 按需安装 Codex、Antigravity 或 Claude Code
+- 按需安装 Codex、Antigravity、Claude Code 或 Windsurf
 
 构建并测试：
 
@@ -147,6 +147,8 @@ Rules 主要约束：
 ./install/Test-CodexToolkit.ps1
 ./install/Stop-CodexMcpBroker.ps1
 ```
+
+如需同时构建 Windsurf 专属 `mcp-subagent` 源码，可运行 `./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent`；这个开关只构建源码，不会自动写入 Windsurf 或 broker 配置。
 
 broker 默认暴露以下本地 endpoint：
 
@@ -219,7 +221,7 @@ The current public snapshot now contains **MCP + Skills + Rules**. `skills/` con
 
 ### Cross-host data interoperability
 
-- Supports Antigravity, Codex, and Claude Code (CC).
+- Supports Antigravity, Codex, Claude Code (CC), and Windsurf (WSF).
 - Exposes the same MCP endpoints through a shared HTTP broker.
 - Uses a shared data root so memory, Records, conversation reading, and Stage Guard can work across hosts.
 - Supports `chain`, `dataChain`, and `modelChain` to split default routing, conversation data source, and model-call route.
@@ -238,10 +240,10 @@ Common examples:
 
 | MCP | Version | Main capabilities |
 | --- | --- | --- |
-| `memory-store` | `1.15.13` | Memory, conversation reading, Conversation Export, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
+| `memory-store` | `1.16.0` | Memory, conversation reading, Conversation Export, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
-| `sandbox` | `1.13.3` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
-| `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code and other hosts |
+| `sandbox` | `1.13.4` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
+| `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code / Windsurf and other hosts |
 | `mcp-subagent` | `0.0.1` | Windsurf-only async sub-agents: spawn / poll / reply / collect / interrupt / dispose; not enabled as a default shared MCP |
 
 `mcp-subagent` is special: it operates real Windsurf / Devin Cascade conversations through the local Language Server. The source is included under `mcps/mcp-subagent/`, but the default installer does not automatically patch the shared broker or Windsurf config. Receivers should follow `mcps/mcp-subagent/README.md` and run dry-run, backup, apply, and rollback steps only with explicit local authorization.
@@ -253,7 +255,7 @@ Common examples:
 Highlights:
 
 - `memory_query` / `memory_write` / `memory_update` / `memory_batch`: workspace-aware memory operations.
-- `conversation_read_original`: read original conversations by ID, title, or keyword across Antigravity / Codex / Claude Code.
+- `conversation_read_original`: read original conversations by ID, title, or keyword across Antigravity / Codex / Claude Code / Windsurf.
 - `conversation_golden_extract`: extract high-value snippets from long conversations.
 - `record_manage`: generate and maintain structured Records with phases, outputs, risks, verification, and lessons.
 - `stage_guard`: stage-level guardrails for `Task.md` workflows, preventing missing work, premature completion reports, weak evidence, and self-referential guard loops.
@@ -268,7 +270,7 @@ Highlights:
 - Login state, Cookie/localStorage backup, session reuse, and owner isolation.
 - Local file and multi-format inspection support: HTML, PDF, PPTX, EPUB, and Office conversion paths where local dependencies are available.
 - `web_inspect` for overlap, overflow, readability, screenshot, and AI visual review, useful for PPT / reports / web UI QA.
-- `ai_summary` / `ai_review` with `modelChain` support across Antigravity, Codex, and Claude Code.
+- `ai_summary` / `ai_review` with `modelChain` support across Antigravity, Codex, and Claude Code; Windsurf is currently data-chain oriented.
 
 #### sandbox: execution, search, and multi-model council
 
@@ -334,7 +336,7 @@ Requirements:
 - Node.js 18+
 - npm
 - PowerShell
-- Codex, Antigravity, or Claude Code depending on your target host
+- Codex, Antigravity, Claude Code, or Windsurf depending on your target host
 
 Build and smoke test:
 
@@ -344,6 +346,8 @@ Build and smoke test:
 ./install/Test-CodexToolkit.ps1
 ./install/Stop-CodexMcpBroker.ps1
 ```
+
+To also build the Windsurf-only `mcp-subagent` source, run `./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent`; it only builds source and does not auto-patch Windsurf or broker config.
 
 Default broker endpoints:
 

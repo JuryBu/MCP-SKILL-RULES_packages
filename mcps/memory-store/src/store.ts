@@ -19,8 +19,10 @@ import { indexCache, type WorkspaceIndex, type MemoryIndexEntry } from "./cache.
 
 // ============= 路径常量 =============
 
+const TOOLKIT_DATA_ROOT = process.env.CODEX_TOOLKIT_DATA_ROOT
+    || path.join(os.homedir(), ".codex-toolkit");
 const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
+    || path.join(TOOLKIT_DATA_ROOT, "memory-store");
 const WORKSPACES_DIR = path.join(DATA_ROOT, "workspaces");
 const GENERAL_DIR = path.join(DATA_ROOT, "general");
 const GLOBAL_INDEX_PATH = path.join(DATA_ROOT, "_global_index.json");
@@ -243,22 +245,61 @@ export function ensureDataDirs(): void {
 
 // ============= 原子写入 =============
 
-/**
- * 原子写入 JSON 文件（tmp + rename）
- */
-export function writeJsonAtomic(filePath: string, data: unknown): void {
-    const tmpPath = filePath + ".tmp";
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
-    fs.renameSync(tmpPath, filePath);
+/** 唯一临时文件名：带 pid + 随机后缀，防两个进程（四源）的临时文件互相覆盖。 */
+function uniqueTmpPath(filePath: string): string {
+    return `${filePath}.tmp.${process.pid}.${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** 同步阻塞睡眠（不空转 CPU）；用于 rename 重试的指数退避。写路径本就是同步调用，短暂阻塞可接受。 */
+function sleepSyncMs(ms: number): void {
+    if (ms <= 0) return;
+    try {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+    } catch {
+        const until = Date.now() + ms;
+        while (Date.now() < until) { /* fallback spin */ }
+    }
+}
+
+/** rename 重试：Windows 上目标被另一进程短暂占用（读取/杀软扫描）时 renameSync 偶发 EPERM/EACCES/EBUSY，
+ *  指数退避重试几次（总时长 ~150ms，远低于任何超时）；只对这几类瞬时错误重试，其它错误立即抛。
+ *  终态失败时尽量清掉临时文件、不留垃圾。 */
+function renameWithRetry(tmpPath: string, filePath: string): void {
+    const transient = new Set(["EPERM", "EACCES", "EBUSY"]);
+    const maxAttempts = 5;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            fs.renameSync(tmpPath, filePath);
+            return;
+        } catch (err) {
+            const code = (err as NodeJS.ErrnoException)?.code;
+            if (!code || !transient.has(code) || attempt >= maxAttempts) {
+                try { fs.rmSync(tmpPath, { force: true }); } catch { /* ignore */ }
+                throw err;
+            }
+            sleepSyncMs(10 * Math.pow(2, attempt - 1)); // 10/20/40/80ms
+        }
+    }
+}
+
+function atomicWrite(filePath: string, content: string): void {
+    const tmpPath = uniqueTmpPath(filePath);
+    fs.writeFileSync(tmpPath, content, "utf-8");
+    renameWithRetry(tmpPath, filePath);
 }
 
 /**
- * 原子写入文本文件（tmp + rename）
+ * 原子写入 JSON 文件（唯一 tmp + rename 重试）
+ */
+export function writeJsonAtomic(filePath: string, data: unknown): void {
+    atomicWrite(filePath, JSON.stringify(data, null, 2));
+}
+
+/**
+ * 原子写入文本文件（唯一 tmp + rename 重试）
  */
 export function writeTextAtomic(filePath: string, content: string): void {
-    const tmpPath = filePath + ".tmp";
-    fs.writeFileSync(tmpPath, content, "utf-8");
-    fs.renameSync(tmpPath, filePath);
+    atomicWrite(filePath, content);
 }
 
 // ============= 进程内索引锁 =============
@@ -416,6 +457,24 @@ export function writeWorkspaceIndex(hash: string, index: WorkspaceIndex): void {
     const indexPath = path.join(dir, "_index.json");
     writeJsonAtomic(indexPath, index);
     indexCache.set(hash, index); // 更新缓存
+}
+
+/**
+ * 串行化的索引「读→改→写」：把读取、修改、写回整段塞进同一把 per-hash 锁，杜绝并发 read-modify-write
+ * 互相覆盖导致的静默丢条目（write/update/delete/batch 的裸奔读改写都应改走这里）。
+ * mutator 拿到的是深拷贝草稿——不碰缓存里的 ref，并发只读者看到的快照始终完整；改完由 writeWorkspaceIndex
+ * 原子替换缓存并落盘。⚠️ 只取 per-hash 一把锁，mutator 内部不得再抢全局/别的索引锁，避免锁嵌套死锁。
+ */
+export async function mutateWorkspaceIndex(
+    hash: string,
+    mutator: (index: WorkspaceIndex) => void | Promise<void>,
+): Promise<void> {
+    await withIndexLock(hash, async () => {
+        const current = hash === "general" ? readGeneralIndex() : readWorkspaceIndex(hash);
+        const draft: WorkspaceIndex = structuredClone(current);
+        await mutator(draft);
+        writeWorkspaceIndex(hash, draft);
+    });
 }
 
 /**
@@ -632,35 +691,42 @@ export function findMemoryById(memoryId: string): { hash: string; entry: MemoryI
 
 /**
  * 更新全局索引中某工作区的统计信息
+ *
+ * 并发安全：整段「读全局索引 → 改 → 写」塞进 withGlobalIndexLock（独立 key "__global__"）串行化，
+ * 杜绝多个写操作并发 read-modify-write 互相覆盖导致的全局统计静默错乱。
+ * ⚠️ 死锁约束：本函数必须在 per-hash 锁（mutateWorkspaceIndex）返回**之后**调用——
+ * 二者用不同 key（per-hash vs "__global__"），无锁嵌套、无 ABBA 死锁。
  */
-export function syncGlobalIndexForWorkspace(hash: string): void {
-    const globalIndex = readGlobalIndex();
-    const wsIndex = readWorkspaceIndex(hash);
-    const meta = hash === "general" ? null : readWorkspaceMeta(hash);
+export async function syncGlobalIndexForWorkspace(hash: string): Promise<void> {
+    await withGlobalIndexLock(() => {
+        const globalIndex = readGlobalIndex();
+        const wsIndex = readWorkspaceIndex(hash);
+        const meta = hash === "general" ? null : readWorkspaceMeta(hash);
 
-    if (hash === "general") {
-        globalIndex.generalCount = wsIndex.entries.length;
-    } else if (globalIndex.workspaces[hash]) {
-        const ws = globalIndex.workspaces[hash];
-        ws.memoryCount = wsIndex.entries.length;
-        ws.totalSizeBytes = wsIndex.entries.reduce((sum, e) => sum + e.sizeBytes, 0);
-        ws.lastAccessed = new Date().toISOString();
-        ws.isArchived = meta?.isArchived ?? false;
+        if (hash === "general") {
+            globalIndex.generalCount = wsIndex.entries.length;
+        } else if (globalIndex.workspaces[hash]) {
+            const ws = globalIndex.workspaces[hash];
+            ws.memoryCount = wsIndex.entries.length;
+            ws.totalSizeBytes = wsIndex.entries.reduce((sum, e) => sum + e.sizeBytes, 0);
+            ws.lastAccessed = new Date().toISOString();
+            ws.isArchived = meta?.isArchived ?? false;
 
-        // 统计 topTags
-        const tagCount = new Map<string, number>();
-        for (const entry of wsIndex.entries) {
-            for (const tag of entry.tags) {
-                tagCount.set(tag, (tagCount.get(tag) || 0) + 1);
+            // 统计 topTags
+            const tagCount = new Map<string, number>();
+            for (const entry of wsIndex.entries) {
+                for (const tag of entry.tags) {
+                    tagCount.set(tag, (tagCount.get(tag) || 0) + 1);
+                }
             }
+            ws.topTags = Array.from(tagCount.entries())
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 5)
+                .map(([tag]) => tag);
         }
-        ws.topTags = Array.from(tagCount.entries())
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5)
-            .map(([tag]) => tag);
-    }
 
-    writeGlobalIndex(globalIndex);
+        writeGlobalIndex(globalIndex);
+    });
 }
 
 /**

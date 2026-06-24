@@ -1,6 +1,6 @@
-﻿# Skills Manifest
+# Skills Manifest
 
-Generated for the 2026-06-07 refresh. These are allow-listed portable user-side skills, not system bundled skills or plugin cache skills.
+Generated for the 2026-06-24 refresh. These are allow-listed portable user-side skills, not system bundled skills or plugin cache skills.
 
 | Skill | Files | Size KB | Notes |
 | --- | ---: | ---: | --- |

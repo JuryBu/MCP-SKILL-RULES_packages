@@ -27,6 +27,7 @@ import { indexCache } from "../cache.js";
 import { cleanOldTempFiles, TEMP_DIR } from "../temp-store.js";
 import { generateAutoSummary } from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
 /**
@@ -92,7 +93,7 @@ export function registerStats(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `❌ stats 操作失败: ${error instanceof Error ? error.message : String(error)}`,
+                        text: formatToolError("memory_stats", error, { action: action || "overview", workspace }),
                     }],
                 }, startTime);
             }
@@ -284,7 +285,8 @@ function handleArchive(workspace?: string) {
 
     // 从缓存驱逐
     indexCache.evict(hash);
-    syncGlobalIndexForWorkspace(hash);
+    // syncGlobalIndexForWorkspace 现为 async（A1 全局锁串行化）；此低频管理路径不阻塞返回，但须兜住 rejection 防 unhandledRejection 崩进程。
+    void syncGlobalIndexForWorkspace(hash).catch(err => console.error("[memory-store] archive 全局索引同步失败:", err));
 
     const ratio = ((1 - compressed.length / Buffer.byteLength(archiveData)) * 100).toFixed(1);
 
@@ -335,7 +337,7 @@ function handleUnarchive(workspace?: string) {
         writeWorkspaceMeta(hash, meta);
     }
 
-    syncGlobalIndexForWorkspace(hash);
+    void syncGlobalIndexForWorkspace(hash).catch(err => console.error("[memory-store] unarchive 全局索引同步失败:", err));
 
     return {
         content: [{
@@ -698,7 +700,7 @@ function rebuildWorkspaceIndex(hash: string): void {
     }
 
     writeWorkspaceIndex(hash, { version: 1, entries });
-    syncGlobalIndexForWorkspace(hash);
+    void syncGlobalIndexForWorkspace(hash).catch(err => console.error("[memory-store] rebuild 全局索引同步失败:", err));
 }
 
 // === 辅助 ===

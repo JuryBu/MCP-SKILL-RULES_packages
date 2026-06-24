@@ -16,8 +16,10 @@ import fs from "fs";
  * - 文件名含时间戳避免冲突
  */
 
-// 数据根目录（与 store.ts 共享）
-const DATA_ROOT = path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
+// 数据根目录（与 store.ts 共享，算法保持一致：优先读隔离 env，否则回退默认）
+// 测试隔离时设置 MEMORY_STORE_DATA_ROOT 后，失败/诊断路径的 saveTempFile 才不会污染真实库。
+const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
+    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
 export const TEMP_DIR = path.join(DATA_ROOT, "temp");
 
 // 文件最大存活时间

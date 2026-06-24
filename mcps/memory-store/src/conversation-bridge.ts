@@ -1,4 +1,4 @@
-import { normalizeDataChain, type DataChain, type ConversationLinkMode } from "./chain.js";
+import { normalizeDataChain, type DataChain, type ConversationLinkMode, type ConversationLogicalChainMode } from "./chain.js";
 import {
     loadCodexConversation,
     resolveCurrentCodexThreadId,
@@ -101,6 +101,7 @@ export async function loadConversationData(
         dataChains?: DataChain[];
         idResolutionMode?: IdResolutionMode;
         sourceFailureMode?: SourceFailureMode;
+        logicalChain?: ConversationLogicalChainMode;
     } = {},
 ): Promise<ConversationLoadResult | null> {
     chain = normalizeDataChain(chain);
@@ -161,7 +162,7 @@ export async function loadConversationData(
 async function loadFromResolvedChain(
     resolved: ResolvedConversationChain,
     conversationId: string | undefined,
-    options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string },
+    options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string; logicalChain?: ConversationLogicalChainMode },
 ): Promise<ConversationLoadResult | null> {
     const effectiveId = await resolveConversationId(conversationId, resolved, options.cwd);
     if (!effectiveId) return null;
@@ -182,7 +183,7 @@ async function loadFromResolvedChain(
     }
 
     if (resolved === "claude-code") {
-        const claudeCodeData = loadClaudeCodeConversation(effectiveId);
+        const claudeCodeData = loadClaudeCodeConversation(effectiveId, { logicalChain: options.logicalChain });
         if (!claudeCodeData) return null;
         return {
             chainUsed: "claude-code",

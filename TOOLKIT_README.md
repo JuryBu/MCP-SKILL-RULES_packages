@@ -1,4 +1,4 @@
-﻿# Portable MCP + Rules 工具包（2026-6-16）
+# Portable MCP + Skills + Rules 工具包（2026-6-24）
 
 这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板、portable user skills 和基础测试文件。
 
@@ -16,9 +16,9 @@ This snapshot includes `skills/`: allow-listed portable user-side Codex skills c
 
 ## 当前 MCP 版本
 
-- `memory-store`：`1.15.13`
+- `memory-store`：`1.16.0`
 - `web-fetcher`：`7.0.0`
-- `sandbox`：`1.13.3`
+- `sandbox`：`1.13.4`
 - `broker`：`0.1.0`
 - `mcp-subagent`：`0.0.1`（Windsurf-only optional）
 - `exa`：可选远程 MCP endpoint；需要接收方自己设置 `EXA_MCP_REMOTE_URL` 或 `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`。
@@ -31,6 +31,14 @@ This snapshot includes `skills/`: allow-listed portable user-side Codex skills c
 ./install/Start-CodexMcpBroker.ps1
 ./install/Test-CodexToolkit.ps1
 ```
+
+如需同时构建 Windsurf 专属 `mcp-subagent` 源码，可运行：
+
+```powershell
+./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent
+```
+
+这个开关只构建源码，不会自动写入 Windsurf 或 broker 配置。
 
 然后把 `rules/codex/AGENTS.template.md` 合并到 `%USERPROFILE%/.codex/AGENTS.md`。
 
@@ -78,9 +86,9 @@ Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.
 
 这个包只应包含源码、模板、说明和测试样例。不要包含发送方或接收方的 API Key、cookies、浏览器 profile、对话记录、记忆库、sqlite、sessions、日志、本机绝对路径或账户链接。
 
-## 2026-6-16 refresh
+## 2026-6-24 refresh
 
-This snapshot adds the Windsurf-only `mcp-subagent` source package, refreshes the Windsurf Rules template with subagent workflow guidance, keeps memory-store at 1.15.13, sandbox at 1.13.3, and web-fetcher at 7.0.0.
+This snapshot refreshes all portable MCP sources and host rules: memory-store 1.16.0, sandbox 1.13.4, web-fetcher 7.0.0, and the Windsurf-only mcp-subagent 0.0.1. Broker portability patches are retained instead of copying sender-specific paths.
 
 ## Windsurf / WSF refresh
 

@@ -1,4 +1,4 @@
-﻿# mcp-subagent
+# mcp-subagent
 
 **Windsurf 专属 · 异步子代理 MCP server**
 
@@ -8,26 +8,21 @@
 
 ## 状态
 
-✅ **Stage A~K 已完成并自测** —— 当前已支持异步子代理、自动回插、多轮 reply、当前主对话绑定、模型列表与 `model_profile`、`subagent_wait` 短等待、管理工具默认摘要和 per-turn collect 去重。live broker 已写入并通过 reload / 工具列表 smoke，维护仓库交接包已生成，后续由维护仓库流程 commit / push。
+当前源码包支持异步子代理、自动回插、多轮 reply、当前主对话绑定、模型列表与 `model_profile`、`subagent_wait` 短等待、管理工具默认摘要和 per-turn collect 去重。
 
-## 为什么放在 `.codeium\windsurf\mcp-subagent\`
+## 推荐放置方式
+
+公开工具包默认把源码放在 `<toolkit-root>\mcps\mcp-subagent\`，运行态数据放在 `%USERPROFILE%\.codex-toolkit\mcp-subagent\`。如果接收方希望按 Windsurf 用户目录长期安装，也可以自行复制到 `%USERPROFILE%\.codeium\windsurf\mcp-subagent\`，但不要把 `subagent-data/`、审计日志或真实 Cascade 数据打包分发。
 
 - **抗 IDE 更新**：用户数据目录不被程序更新覆盖（更新只冲安装目录 `Programs\Devin\`）
-- **语义贴合**：仿照 Antigravity 的 `.gemini\antigravity\mcp-sandbox\`，这是 WSF 的对等私有位
-- **卸载风险已兜底**：正式实现会纳入 `JuryBu/MCP-SKILL-RULES_packages` 维护体系，重装后一行安装/恢复即可
-- **进程托管**：采纳**挂全局 broker(14588) 托管进程**（单例、防泄漏），WSF 侧只用 `serverUrl` 引用；🟡 broker 可加载性待验证，fallback 为 stdio `command` + 孤儿进程防护（详见 Plan_1 §2）
-- **隔离**：工具面板可见性靠 WSF 配置控制；真正写权限靠 registry / 谱系 / `main_id` 授权校验，不把 broker 当权限边界（详见 Plan_1 §8 安全边界）
+- **进程托管**：推荐挂全局 broker(14588) 托管进程（单例、防泄漏），WSF 侧只用 `serverUrl` 引用；fallback 为 stdio `command` + 孤儿进程防护
+- **隔离**：工具面板可见性靠 WSF 配置控制；真正写权限靠 registry / 谱系 / `main_id` 授权校验，不把 broker 当权限边界
 
 ## 目录结构
 
 ```
 mcp-subagent/
 ├── README.md              本文件
-├── Plan/
-│   ├── Plan_1_架构与落点.md
-│   ├── Plan_2_工具与参数设计.md
-│   ├── Plan_3_认证实现与待验证.md
-│   └── Task.md            分 Stage 任务(面向 CODEX)
 ├── package.json           node 项目(MCP SDK)，含 build/smoke 脚本
 ├── .gitignore
 ├── schemas/
@@ -109,7 +104,7 @@ npm run package:handoff
 Compress-Archive -Path 'dist/mcp-subagent-handoff\*' -DestinationPath 'dist/mcp-subagent-handoff.zip' -Force
 ```
 
-当前建议导入目标：`JuryBu/MCP-SKILL-RULES_packages` 仓库的 `packages/mcp-subagent`。交付包 manifest 位于 `dist/mcp-subagent-handoff/manifest.json`。
+维护包 manifest 位于 `dist/mcp-subagent-handoff/manifest.json`。生成的 `dist/` 是本地交付产物，不应提交到公开工具包。
 
 ## 配置接入
 
@@ -178,4 +173,4 @@ npm run smoke:stage-g -- <main_id>
 
 所有底层机制（StartCascade / SendUserCascadeMessage / QueueCascadeMessage /
 InterruptWithQueuedMessage / step 状态检测 / 三档回收）均已在
-历史探索目录下逐 stage 实测，结论已整理为本 README 的功能边界说明。
+本地验证阶段逐 stage 实测；公开包只保留源码、smoke 脚本和可复现命令，不包含内部验证目录或真实 Cascade 记录。

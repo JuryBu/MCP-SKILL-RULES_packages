@@ -8,7 +8,7 @@ import {
     writeMemoryFile,
     readMemoryFile,
     readWorkspaceIndex,
-    writeWorkspaceIndex,
+    mutateWorkspaceIndex,
     syncGlobalIndexForWorkspace,
     findMemoryById,
     deleteMemoryFile,
@@ -23,6 +23,7 @@ import { type MemoryIndexEntry } from "../cache.js";
 import { saveTempFile } from "../temp-store.js";
 import { grepInEntries } from "../search.js";
 import { resolveModelOnlyChainSplit } from "../chain.js";
+import { formatToolError } from "../error-format.js";
 import type { SearchMode } from "../search-engine.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 
@@ -121,8 +122,8 @@ export function registerBatch(server: McpServer): void {
                             const fileContent = buildMemoryFile(fm, op.content);
                             writeMemoryFile(hash, id, fileContent);
 
-                            const wsIndex = readWorkspaceIndex(hash);
-                            wsIndex.entries.push({
+                            // 在 case 体内构造 entry（此处 op.* 已收窄），再进锁 push——避免闭包丢失类型收窄
+                            const batchEntry = {
                                 id, title: op.title, searchSummary: op.searchSummary,
                                 tags: op.tags, category: op.category || "general",
                                 createdAt: now, updatedAt: now, lastAccessed: now,
@@ -130,9 +131,11 @@ export function registerBatch(server: McpServer): void {
                                 lineCount: countLines(fileContent),
                                 conversationId: op.conversationId,
                                 pinned: op.pinned,
+                            };
+                            await mutateWorkspaceIndex(hash, (wsIndex) => {
+                                wsIndex.entries.push(batchEntry);
                             });
-                            writeWorkspaceIndex(hash, wsIndex);
-                            syncGlobalIndexForWorkspace(hash);
+                            await syncGlobalIndexForWorkspace(hash);
 
                             result = `✅ write: [${id}] "${op.title}"`;
                             successCount++;
@@ -164,10 +167,10 @@ export function registerBatch(server: McpServer): void {
                             const found = findMemoryById(op.id);
                             if (!found) { result = `❌ delete: 不存在 ${op.id}`; failCount++; break; }
                             deleteMemoryFile(found.hash, op.id);
-                            const wsIndex = readWorkspaceIndex(found.hash);
-                            wsIndex.entries = wsIndex.entries.filter(e => e.id !== op.id);
-                            writeWorkspaceIndex(found.hash, wsIndex);
-                            syncGlobalIndexForWorkspace(found.hash);
+                            await mutateWorkspaceIndex(found.hash, (wsIndex) => {
+                                wsIndex.entries = wsIndex.entries.filter(e => e.id !== op.id);
+                            });
+                            await syncGlobalIndexForWorkspace(found.hash);
                             result = `🗑️ delete: [${op.id}]`;
                             successCount++;
                             break;
@@ -281,19 +284,19 @@ export function registerBatch(server: McpServer): void {
                             const newContent = buildMemoryFile(newFm, body);
                             writeMemoryFile(found.hash, op.id, newContent);
 
-                            const wsIdx = readWorkspaceIndex(found.hash);
-                            const ie = wsIdx.entries.find(e => e.id === op.id);
-                            if (ie) {
-                                if (op.title) ie.title = op.title;
-                                if (op.searchSummary) ie.searchSummary = op.searchSummary;
-                                if (op.tags) ie.tags = [...new Set([...ie.tags, ...op.tags])];
-                                if (op.pinned !== undefined) ie.pinned = op.pinned;
-                                ie.updatedAt = String(fm.updated);
-                                ie.sizeBytes = Buffer.byteLength(newContent, "utf-8");
-                                ie.lineCount = countLines(newContent);
-                            }
-                            writeWorkspaceIndex(found.hash, wsIdx);
-                            syncGlobalIndexForWorkspace(found.hash);
+                            await mutateWorkspaceIndex(found.hash, (wsIdx) => {
+                                const ie = wsIdx.entries.find(e => e.id === op.id);
+                                if (ie) {
+                                    if (op.title) ie.title = op.title;
+                                    if (op.searchSummary) ie.searchSummary = op.searchSummary;
+                                    if (op.tags) ie.tags = [...new Set([...ie.tags, ...op.tags])];
+                                    if (op.pinned !== undefined) ie.pinned = op.pinned;
+                                    ie.updatedAt = String(fm.updated);
+                                    ie.sizeBytes = Buffer.byteLength(newContent, "utf-8");
+                                    ie.lineCount = countLines(newContent);
+                                }
+                            });
+                            await syncGlobalIndexForWorkspace(found.hash);
 
                             result = `✅ update: [${op.id}]`;
                             successCount++;
@@ -307,7 +310,16 @@ export function registerBatch(server: McpServer): void {
 
                     results.push(`${i + 1}. ${result}`);
                 } catch (error) {
-                    results.push(`${i + 1}. ❌ ${op.action} 失败: ${error instanceof Error ? error.message : String(error)}`);
+                    // 单 op 失败：用结构化错误格式（白名单过滤掉 op.content 等大字段），
+                    // 缩进并入编号行，保持批量结果可读。
+                    const structured = formatToolError(`memory_batch[${i + 1}] ${op.action}`, error, {
+                        action: op.action,
+                        id: op.id,
+                        workspace: op.workspace || workspace,
+                        mode: op.mode,
+                        query: op.query,
+                    });
+                    results.push(`${i + 1}. ${structured.replace(/\n/g, "\n   ")}`);
                     failCount++;
                 }
             }

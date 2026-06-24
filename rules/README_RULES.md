@@ -1,4 +1,4 @@
-﻿# Rules Templates
+# Rules Templates
 
 This folder has one Rules template per host:
 

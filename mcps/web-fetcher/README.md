@@ -1,4 +1,4 @@
-﻿# MCP Web Fetcher
+# MCP Web Fetcher
 
 使用带 Cookie 的浏览器抓取网页内容的 MCP Server。解决 AI 助手无法访问需要登录才能查看的网站内容问题。
 
@@ -335,8 +335,10 @@ web_login_browser(taskId="web-login-...", waitSeconds=30)
   "mcpServers": {
     "web-fetcher": {
       "command": "node",
-      "args": ["%USERPROFILE%\\.gemini\\antigravity\\mcp-web-fetcher\\dist\\index.js"],
-      "env": {}
+      "args": ["%USERPROFILE%\\path\\to\\toolkit\\mcps\\web-fetcher\\dist\\index.js"],
+      "env": {
+        "WEB_FETCHER_PROFILES_DIR": "%USERPROFILE%\\.codex-toolkit\\web-fetcher-profiles"
+      }
     }
   }
 }

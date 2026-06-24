@@ -3,7 +3,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { promisify } from "util";
-import { callGetModelResponse as callLsModel, isLsAvailable } from "./ls-client.js";
+import { callGetModelResponseDetailed as callLsModelDetailed, isLsAvailable } from "./ls-client.js";
 import { normalizeChain, type Chain } from "./chain.js";
 
 const execAsync = promisify(exec);
@@ -642,9 +642,19 @@ export async function callModelResponse(
     const errors: string[] = [];
     for (const resolved of candidates) {
         if (resolved === "antigravity") {
-            const text = await callLsModel(model, prompt, timeoutMs);
-            if (text) return { text, chainUsed: "antigravity" };
-            errors.push("Antigravity LS 模型调用失败");
+            const result = await callLsModelDetailed(model, prompt, timeoutMs);
+            if (result.text) return { text: result.text, chainUsed: "antigravity" };
+            errors.push(result.error || "Antigravity LS 模型调用失败");
+            // 真超时：与 codex 分支对齐早返回，透传 timedOut 让上层区分「超时」vs「普通失败」，
+            // 不再无条件落到下个候选 / 触发重试（避免一次真超时后又白等一整轮）。
+            if (result.timedOut) {
+                return {
+                    text: null,
+                    chainUsed: null,
+                    error: result.error || "Antigravity LS 模型调用超时",
+                    timedOut: true,
+                };
+            }
             continue;
         }
 

@@ -5,6 +5,7 @@ import path from "path";
 import { StringDecoder } from "string_decoder";
 import type { CompactionSummaryInfo, ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
+import type { ConversationLogicalChainMode } from "./chain.js";
 
 export interface ClaudeCodeThreadInfo {
     id: string;
@@ -27,6 +28,31 @@ export interface ClaudeCodeConversationData {
     thread: ClaudeCodeThreadInfo;
     rounds: ConversationRound[];
     totalSteps: number;
+    logicalChain?: ClaudeCodeLogicalChainInfo;
+}
+
+export interface ClaudeCodeLogicalChainSegment {
+    thread: ClaudeCodeThreadInfo;
+    role: "target" | "predecessor-candidate" | "predecessor-merged";
+    score: number;
+    evidence: string[];
+    negativeEvidence: string[];
+}
+
+export interface ClaudeCodeLogicalChainInfo {
+    mode: ConversationLogicalChainMode;
+    merged: boolean;
+    segments: ClaudeCodeLogicalChainSegment[];
+    warnings: string[];
+}
+
+interface ClaudeCodeLogicalSignals {
+    firstUserText: string;
+    lastUserText: string;
+    lastAssistantText: string;
+    compactSummaryText: string;
+    hasCompactSummary: boolean;
+    lines: number;
 }
 
 export interface ClaudeCodeContextProbeHit {
@@ -89,6 +115,9 @@ const CLAUDE_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CC_CONTEX
 const CLAUDE_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CLAUDE_CODE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 const CLAUDE_COMPACT_FOLDED_MARKER = "[Claude Code compact summary folded";
+const CLAUDE_LOGICAL_CHAIN_MAX_CANDIDATES = Number(process.env.MEMORY_STORE_CC_LOGICAL_CHAIN_MAX_CANDIDATES || 80);
+const CLAUDE_LOGICAL_CHAIN_AUTO_THRESHOLD = Number(process.env.MEMORY_STORE_CC_LOGICAL_CHAIN_AUTO_THRESHOLD || 85);
+const CLAUDE_LOGICAL_CHAIN_STRICT_THRESHOLD = Number(process.env.MEMORY_STORE_CC_LOGICAL_CHAIN_STRICT_THRESHOLD || 65);
 
 interface ClaudeCodeDesktopIndexEntry {
     conversationId: string;
@@ -676,6 +705,249 @@ export function getClaudeCodeThread(conversationId: string): ClaudeCodeThreadInf
     return listRecentClaudeCodeThreads(1000).find(thread => thread.id === resolved) || null;
 }
 
+function normalizeLogicalChainPath(input?: string): string {
+    return (input || "")
+        .trim()
+        .replace(/^\\\\\?\\/u, "")
+        .replace(/[\\/]+$/u, "")
+        .toLowerCase();
+}
+
+function normalizeLogicalChainTitle(input?: string): string {
+    return (input || "")
+        .normalize("NFKC")
+        .replace(/^(继续|接力|续聊|承接|重开|新对话|卡住|断了|恢复)+/gu, "")
+        .replace(/(对话|聊天|conversation|session)$/giu, "")
+        .replace(/\s+/gu, "")
+        .toLowerCase();
+}
+
+function isLikelyClaudeCodeSubagentJsonl(jsonlPath: string): boolean {
+    const normalized = jsonlPath.replace(/\\/gu, "/").toLowerCase();
+    return normalized.includes("/subagents/") || path.basename(jsonlPath).toLowerCase().startsWith("agent-");
+}
+
+function containsContinuationIntent(text: string): boolean {
+    return /(继续|接着|接上|接力|续聊|续上|上个对话|前一个对话|之前那个|卡住|崩了|断了|新对话继续|换个新对话继续)/u.test(text);
+}
+
+function containsNegativeContinuationIntent(text: string): boolean {
+    return /(从\s*0\s*开始|从零开始|重新开始|全新开始|不要继承|不继承|清理污染|干净状态|clean state|fresh start|不要带旧上下文|独立新对话)/iu.test(text);
+}
+
+function importantTextTokens(text: string): string[] {
+    const normalized = text
+        .normalize("NFKC")
+        .toLowerCase()
+        .replace(/[^\p{L}\p{N}]+/gu, " ");
+    const seen = new Set<string>();
+    const tokens: string[] = [];
+    for (const token of normalized.split(/\s+/u)) {
+        if (token.length < 2 || seen.has(token)) continue;
+        seen.add(token);
+        tokens.push(token);
+    }
+    return tokens.slice(0, 80);
+}
+
+function textOverlapRatio(a: string, b: string): number {
+    const tokensA = importantTextTokens(a);
+    const tokensB = new Set(importantTextTokens(b));
+    if (tokensA.length === 0 || tokensB.size === 0) return 0;
+    const hits = tokensA.filter(token => tokensB.has(token)).length;
+    return hits / Math.min(tokensA.length, tokensB.size);
+}
+
+function readClaudeCodeLogicalSignals(thread: ClaudeCodeThreadInfo): ClaudeCodeLogicalSignals {
+    const signals: ClaudeCodeLogicalSignals = {
+        firstUserText: "",
+        lastUserText: "",
+        lastAssistantText: "",
+        compactSummaryText: "",
+        hasCompactSummary: false,
+        lines: 0,
+    };
+    let pendingCompactBoundary: PendingCompactBoundary | null = null;
+    readJsonlLines(thread.jsonlPath, (line, lineNo, byteOffset) => {
+        signals.lines = lineNo;
+        const event = parseJsonLine(line);
+        if (!event) return;
+        if (isClaudeCodeCompactBoundary(event)) {
+            pendingCompactBoundary = compactBoundaryFromEvent(event, lineNo, byteOffset);
+            return;
+        }
+        const extracted = extractMessageContent(event.message?.content, event.cwd || thread.cwd);
+        if (event.type === "user") {
+            const isCompact = isClaudeCodeCompactSummaryEvent(event, pendingCompactBoundary);
+            if (isCompact) {
+                signals.hasCompactSummary = true;
+                signals.compactSummaryText = truncate([signals.compactSummaryText, extracted.text].filter(Boolean).join("\n\n"), 80_000);
+                pendingCompactBoundary = null;
+                return;
+            }
+            if (extracted.toolResults.length > 0 && !extracted.text) return;
+            if (extracted.text) {
+                if (!signals.firstUserText) signals.firstUserText = truncate(extracted.text, 4000);
+                signals.lastUserText = truncate(extracted.text, 4000);
+            }
+            return;
+        }
+        if (event.type === "assistant" && extracted.text) {
+            signals.lastAssistantText = truncate(extracted.text, 4000);
+        }
+    }, { maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS });
+    return signals;
+}
+
+function scoreClaudeCodePredecessor(
+    target: ClaudeCodeThreadInfo,
+    candidate: ClaudeCodeThreadInfo,
+    targetSignals: ClaudeCodeLogicalSignals,
+    candidateSignals: ClaudeCodeLogicalSignals,
+): ClaudeCodeLogicalChainSegment | null {
+    if (target.id === candidate.id) return null;
+    if (isLikelyClaudeCodeSubagentJsonl(candidate.jsonlPath)) return null;
+    const targetCwd = normalizeLogicalChainPath(target.cwd);
+    const candidateCwd = normalizeLogicalChainPath(candidate.cwd);
+    if (!targetCwd || !candidateCwd || targetCwd !== candidateCwd) return null;
+
+    const targetTime = target.updatedAtMs || safeStat(target.jsonlPath)?.mtimeMs || 0;
+    const candidateTime = candidate.updatedAtMs || safeStat(candidate.jsonlPath)?.mtimeMs || 0;
+    if (targetTime && candidateTime && candidateTime > targetTime + 1000) return null;
+
+    const evidence: string[] = ["同一 Claude Code 工作区"];
+    const negativeEvidence: string[] = [];
+    let score = 30;
+
+    const targetText = [targetSignals.firstUserText, targetSignals.compactSummaryText].filter(Boolean).join("\n");
+    const candidateText = [candidate.title, candidateSignals.lastUserText, candidateSignals.lastAssistantText].filter(Boolean).join("\n");
+    const targetTitle = normalizeLogicalChainTitle(target.title);
+    const candidateTitle = normalizeLogicalChainTitle(candidate.title);
+    if (targetTitle && candidateTitle && targetTitle === candidateTitle) {
+        score += 12;
+        evidence.push("标题归一化后相同");
+    }
+    if (target.accountId && candidate.accountId && target.accountId === candidate.accountId) {
+        score += 3;
+        evidence.push("同一 Claude 账号索引");
+    }
+    if (target.organizationId && candidate.organizationId && target.organizationId === candidate.organizationId) {
+        score += 2;
+        evidence.push("同一 Claude 组织索引");
+    }
+    if (targetTime && candidateTime) {
+        const gap = Math.abs(targetTime - candidateTime);
+        if (gap < 2 * 60 * 60_000) {
+            score += 12;
+            evidence.push("更新时间间隔小于 2 小时");
+        } else if (gap < 24 * 60 * 60_000) {
+            score += 8;
+            evidence.push("更新时间间隔小于 24 小时");
+        } else if (gap < 7 * 24 * 60 * 60_000) {
+            score += 4;
+            evidence.push("更新时间间隔小于 7 天");
+        }
+    }
+
+    const candidateShortId = candidate.id.slice(0, 8);
+    if (targetText.includes(candidate.id) || targetText.includes(candidateShortId)) {
+        score += 90;
+        evidence.push("目标开头或压缩摘要明确引用候选 ID");
+    }
+    if (candidate.title && candidate.title.length >= 4 && targetText.includes(candidate.title)) {
+        score += 28;
+        evidence.push("目标开头或压缩摘要明确引用候选标题");
+    }
+    if (containsContinuationIntent(targetSignals.firstUserText)) {
+        score += 16;
+        evidence.push("目标首条用户消息带续聊意图");
+    }
+    if (/(中断|卡住|失败|崩|断|开新对话|换新对话)/u.test(candidateSignals.lastUserText + candidateSignals.lastAssistantText)) {
+        score += 8;
+        evidence.push("候选尾部像被中断或要求换新对话");
+    }
+    const overlap = textOverlapRatio(targetText, candidateText);
+    if (overlap >= 0.25) {
+        score += Math.round(overlap * 40);
+        evidence.push(`首尾内容重叠 ${(overlap * 100).toFixed(0)}%`);
+    }
+    if (targetSignals.hasCompactSummary && overlap >= 0.12) {
+        score += 15;
+        evidence.push("压缩摘要与候选尾部存在重叠");
+    }
+    if (containsNegativeContinuationIntent(targetSignals.firstUserText)) {
+        score -= 90;
+        negativeEvidence.push("目标首条用户消息声明从零/干净状态开始");
+    }
+    if (containsNegativeContinuationIntent(candidateSignals.firstUserText)) {
+        score -= 80;
+        negativeEvidence.push("候选首条用户消息声明从零/干净状态开始");
+    }
+    if (score < 0) score = 0;
+
+    return {
+        thread: candidate,
+        role: "predecessor-candidate",
+        score,
+        evidence,
+        negativeEvidence,
+    };
+}
+
+export function discoverClaudeCodeLogicalChain(
+    conversationId: string,
+    mode: ConversationLogicalChainMode = "explain",
+): ClaudeCodeLogicalChainInfo | null {
+    const target = getClaudeCodeThread(conversationId);
+    if (!target) return null;
+    const targetSignals = readClaudeCodeLogicalSignals(target);
+    const candidates = listRecentClaudeCodeThreads(Math.max(CLAUDE_LOGICAL_CHAIN_MAX_CANDIDATES * 4, 200))
+        .filter(thread => thread.id !== target.id)
+        .filter(thread => !isLikelyClaudeCodeSubagentJsonl(thread.jsonlPath))
+        .filter(thread => normalizeLogicalChainPath(thread.cwd) === normalizeLogicalChainPath(target.cwd))
+        .slice(0, CLAUDE_LOGICAL_CHAIN_MAX_CANDIDATES);
+    const scored: ClaudeCodeLogicalChainSegment[] = [];
+    for (const candidate of candidates) {
+        const segment = scoreClaudeCodePredecessor(target, candidate, targetSignals, readClaudeCodeLogicalSignals(candidate));
+        if (segment && segment.score > 0) scored.push(segment);
+    }
+    scored.sort((a, b) => b.score - a.score);
+
+    const warnings: string[] = [];
+    const threshold = mode === "strict" ? CLAUDE_LOGICAL_CHAIN_STRICT_THRESHOLD : CLAUDE_LOGICAL_CHAIN_AUTO_THRESHOLD;
+    const hasStrongEvidence = (segment: ClaudeCodeLogicalChainSegment) =>
+        segment.evidence.some(item => /明确引用|首尾内容重叠|压缩摘要/u.test(item));
+    const selected = scored
+        .filter(segment => segment.score >= threshold && segment.negativeEvidence.length === 0 && hasStrongEvidence(segment))
+        .sort((a, b) => (a.thread.updatedAtMs || 0) - (b.thread.updatedAtMs || 0))
+        .slice(0, 3)
+        .map(segment => ({ ...segment, role: "predecessor-merged" as const }));
+    if ((mode === "auto" || mode === "strict") && selected.length === 0) {
+        warnings.push(mode === "strict"
+            ? "strict 模式未找到足够强的续聊证据，未合并。"
+            : "auto 模式未找到足够强的续聊证据，保持物理对话。");
+    }
+    const targetSegment: ClaudeCodeLogicalChainSegment = {
+        thread: target,
+        role: "target",
+        score: 100,
+        evidence: ["目标物理对话"],
+        negativeEvidence: [],
+    };
+    return {
+        mode,
+        merged: (mode === "auto" || mode === "strict") && selected.length > 0,
+        segments: [
+            ...selected,
+            targetSegment,
+            ...scored
+                .filter(segment => !selected.some(item => item.thread.id === segment.thread.id))
+                .slice(0, 5),
+        ],
+        warnings,
+    };
+}
+
 function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: ConversationRound[]; totalSteps: number } {
     const rounds: ConversationRound[] = [];
     const toolCallMap = new Map<string, { round: ConversationRound; index: number }>();
@@ -855,14 +1127,110 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
     return { rounds, totalSteps: stepIndex };
 }
 
-export function loadClaudeCodeConversation(conversationId: string): ClaudeCodeConversationData | null {
+function cloneRoundWithLogicalOffsets(
+    round: ConversationRound,
+    roundOffset: number,
+    stepOffset: number,
+): ConversationRound {
+    const cloned: ConversationRound = JSON.parse(JSON.stringify(round));
+    cloned.roundIndex = round.roundIndex + roundOffset;
+    cloned.startStep = round.startStep + stepOffset;
+    cloned.endStep = round.endStep + stepOffset;
+    cloned.aiResponses = (cloned.aiResponses || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    cloned.toolCalls = (cloned.toolCalls || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    cloned.taskBoundaries = (cloned.taskBoundaries || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    cloned.codeActions = (cloned.codeActions || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    cloned.fileViews = (cloned.fileViews || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    cloned.subagentSummaries = cloned.subagentSummaries || [];
+    return cloned;
+}
+
+function buildClaudeCodeLogicalConversation(
+    target: ClaudeCodeThreadInfo,
+    info: ClaudeCodeLogicalChainInfo,
+): { rounds: ConversationRound[]; totalSteps: number } {
+    const mergedSegments = info.segments.filter(segment => segment.role === "predecessor-merged");
+    const orderedThreads = [
+        ...mergedSegments
+            .sort((a, b) => (a.thread.updatedAtMs || 0) - (b.thread.updatedAtMs || 0))
+            .map(segment => segment.thread),
+        target,
+    ];
+    const rounds: ConversationRound[] = [];
+    let totalSteps = 0;
+    let roundOffset = 0;
+    let stepOffset = 0;
+    for (const thread of orderedThreads) {
+        const built = buildClaudeCodeRounds(thread.jsonlPath, thread.cwd);
+        const segmentLabel = thread.id === target.id
+            ? `目标物理对话 ${thread.id}`
+            : `前序续聊候选 ${thread.id}`;
+        const startRound = roundOffset + 1;
+        for (const [index, round] of built.rounds.entries()) {
+            const cloned = cloneRoundWithLogicalOffsets(round, roundOffset, stepOffset);
+            if (index === 0) {
+                cloned.fileViews = [
+                    {
+                        stepIndex: cloned.startStep,
+                        kind: "claude-code-logical-chain-segment",
+                        title: segmentLabel,
+                        textSummary: [
+                            `title=${thread.title || "(无标题)"}`,
+                            `cwd=${thread.cwd || "(未知)"}`,
+                        ].join(" | "),
+                    },
+                    ...(cloned.fileViews || []),
+                ];
+            }
+            rounds.push(cloned);
+        }
+        roundOffset += built.rounds.length;
+        stepOffset += built.totalSteps;
+        totalSteps += built.totalSteps;
+        if (built.rounds.length === 0) {
+            rounds.push({
+                roundIndex: startRound,
+                startStep: stepOffset,
+                endStep: stepOffset,
+                userMessage: `（逻辑续聊片段无可解析轮次：${thread.id}）`,
+                mediaAttachments: [],
+                attachments: [],
+                aiResponses: [],
+                toolCalls: [],
+                taskBoundaries: [],
+                codeActions: [],
+                subagentSummaries: [],
+                fileViews: [{
+                    stepIndex: stepOffset,
+                    kind: "claude-code-logical-chain-segment-empty",
+                    title: segmentLabel,
+                    textSummary: thread.jsonlPath,
+                }],
+            });
+            roundOffset += 1;
+        }
+    }
+    return { rounds, totalSteps };
+}
+
+export function loadClaudeCodeConversation(
+    conversationId: string,
+    options: { logicalChain?: ConversationLogicalChainMode } = {},
+): ClaudeCodeConversationData | null {
     const thread = getClaudeCodeThread(conversationId);
     if (!thread?.jsonlPath) return null;
-    const built = buildClaudeCodeRounds(thread.jsonlPath, thread.cwd);
+    const logicalMode = options.logicalChain || "off";
+    const logicalChain = logicalMode === "off"
+        ? undefined
+        : discoverClaudeCodeLogicalChain(thread.id, logicalMode);
+    const built = logicalChain?.merged
+        ? buildClaudeCodeLogicalConversation(thread, logicalChain)
+        : buildClaudeCodeRounds(thread.jsonlPath, thread.cwd);
     return {
         thread,
         rounds: built.rounds,
         totalSteps: built.totalSteps,
+        logicalChain: logicalChain || undefined,
     };
 }
 

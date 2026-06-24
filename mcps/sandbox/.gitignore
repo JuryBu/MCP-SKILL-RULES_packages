@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Build output (npm run build 可再生)
+dist/
+
+# Runtime data (沙箱运行时产生的临时数据、council 后台任务、claude-code 调用产物等)
+sandbox-data/
+
+# Test/Review reports (council review 历史报告,可再生)
+tests/reports/
+tests/council/
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Temp / backup files
+*.tmp
+*.bak
+*.orig
+
+# Env files (如果以后有的话)
+.env
+.env.local
+.env.*.local
