@@ -1,4 +1,4 @@
-# Portable MCP + Skills + Rules 工具包（2026-6-24）
+# Portable MCP + Skills + Rules 工具包（2026-7-4）
 
 这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板、portable user skills 和基础测试文件。
 
@@ -16,9 +16,9 @@ This snapshot includes `skills/`: allow-listed portable user-side Codex skills c
 
 ## 当前 MCP 版本
 
-- `memory-store`：`1.16.0`
+- `memory-store`：`1.17.1`
 - `web-fetcher`：`7.0.0`
-- `sandbox`：`1.13.4`
+- `sandbox`：`1.13.7`
 - `broker`：`0.1.0`
 - `mcp-subagent`：`0.0.1`（Windsurf-only optional）
 - `exa`：可选远程 MCP endpoint；需要接收方自己设置 `EXA_MCP_REMOTE_URL` 或 `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`。
@@ -86,9 +86,9 @@ Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.
 
 这个包只应包含源码、模板、说明和测试样例。不要包含发送方或接收方的 API Key、cookies、浏览器 profile、对话记录、记忆库、sqlite、sessions、日志、本机绝对路径或账户链接。
 
-## 2026-6-24 refresh
+## 2026-7-4 refresh
 
-This snapshot refreshes all portable MCP sources and host rules: memory-store 1.16.0, sandbox 1.13.4, web-fetcher 7.0.0, and the Windsurf-only mcp-subagent 0.0.1. Broker portability patches are retained instead of copying sender-specific paths.
+This snapshot refreshes the changed portable MCP sources and host rules: memory-store 1.17.1, sandbox 1.13.7, web-fetcher 7.0.0, and the Windsurf-only mcp-subagent 0.0.1. Broker portability patches are retained instead of copying sender-specific paths; the portable broker also keeps request timeout forwarding from the latest runtime broker. memory-store adds newer query/routing/concurrency internals for cross-source conversations; sandbox includes the 1.13.5-1.13.7 safety and lifecycle fixes.
 
 ## Windsurf / WSF refresh
 

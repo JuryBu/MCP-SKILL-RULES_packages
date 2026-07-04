@@ -2,7 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { spawn, spawnSync } from "child_process";
-import { callGetModelResponse } from "../ls-client.js";
+import { callGetModelResponseDetailed } from "../ls-client.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
 import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
@@ -101,6 +101,21 @@ interface SpawnResult {
     stdoutPath: string;
     stderrPath: string;
     earlyFailureReason?: string;
+}
+
+interface ProviderError extends Error {
+    retryable?: boolean;
+    timedOut?: boolean;
+}
+
+function makeProviderAbortError(): ProviderError {
+    const err = new Error("council model call cancelled by background abort") as ProviderError;
+    err.retryable = false;
+    return err;
+}
+
+function assertProviderNotAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw makeProviderAbortError();
 }
 
 function getStringParam(params: Record<string, unknown> | undefined, key: string): string | undefined {
@@ -241,6 +256,7 @@ async function spawnPowerShellScript(
     logBasePath: string,
     timeoutMs: number,
     earlyFailure?: (stderr: string) => string | undefined,
+    signal?: AbortSignal,
 ): Promise<SpawnResult> {
     const scriptPath = `${logBasePath}.ps1`;
     const stdoutPath = `${logBasePath}.stdout.txt`;
@@ -254,6 +270,7 @@ async function spawnPowerShellScript(
         const stderrFd = fs.openSync(stderrPath, "a");
         let settled = false;
         let timedOut = false;
+        let aborted = false;
         let earlyFailureReason: string | undefined;
         const child = spawn(getPowerShellCommand(), [
             "-NoProfile",
@@ -282,10 +299,19 @@ async function spawnPowerShellScript(
             child.kill();
         }, 1500) : null;
         earlyFailureTimer?.unref?.();
+        const onAbort = () => {
+            if (settled) return;
+            aborted = true;
+            killProcessTree(child.pid);
+            killProcessesByCommandNeedle(artifactNeedle);
+            child.kill();
+        };
         const clearTimers = () => {
             clearTimeout(timer);
             if (earlyFailureTimer) clearInterval(earlyFailureTimer);
+            signal?.removeEventListener("abort", onAbort);
         };
+        signal?.addEventListener("abort", onAbort, { once: true });
         child.on("error", (err) => {
             if (settled) return;
             settled = true;
@@ -302,6 +328,10 @@ async function spawnPowerShellScript(
             fs.closeSync(stderrFd);
             if (timedOut || earlyFailureReason) {
                 killProcessesByCommandNeedle(artifactNeedle);
+            }
+            if (aborted) {
+                reject(makeProviderAbortError());
+                return;
             }
             resolve({ exitCode, timedOut, stdoutPath, stderrPath, earlyFailureReason });
         });
@@ -504,11 +534,25 @@ async function withSourceLimit<T>(config: CouncilModelConfig, fn: () => Promise<
 }
 
 function isRetryableError(err: unknown): boolean {
+    if (err && typeof err === "object") {
+        const providerErr = err as ProviderError;
+        if (typeof providerErr.retryable === "boolean") return providerErr.retryable;
+        if (providerErr.timedOut === true) return true;
+    }
     const message = err instanceof Error ? err.message : String(err);
     if (/缺少 API key|需要 params\.baseUrl|不支持图片 MIME|图片过大|图片总大小过大|输出疑似被截断|内容被安全策略拦截|未登录|认证失败|max-budget|budget|额度耗尽|permission|权限|Unknown option|invalid/i.test(message)) {
         return false;
     }
-    return /HTTP (408|409|429|500|502|503|504)|timeout|timed out|abort|aborted|中止|超时|未返回文本|调用失败|CLI 未写入|Gemini CLI|Claude Code CLI|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND/iu.test(message);
+    if (/cancelled by background abort|background abort|已取消/iu.test(message)) {
+        return false;
+    }
+    if (/HTTP 4\d\d/iu.test(message) && !/HTTP (408|409|429)/iu.test(message)) {
+        return false;
+    }
+    if (/Antigravity LS 模型返回为空/iu.test(message)) {
+        return false;
+    }
+    return /HTTP (408|409|429|500|502|503|504)|timeout|timed out|abort|aborted|中止|超时|未返回文本|CLI 未写入|Gemini CLI|Claude Code CLI|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|Antigravity LS 模型调用超时/iu.test(message);
 }
 
 async function withRetry<T>(config: CouncilModelConfig, fn: () => Promise<T>): Promise<T> {
@@ -755,7 +799,9 @@ async function callGeminiCliText(
     prompt: string,
     imagePaths: string[],
     timeoutMs: number,
+    signal?: AbortSignal,
 ): Promise<ProviderCallResult> {
+    assertProviderNotAborted(signal);
     const model = getDefaultModel(config);
     const command = getStringParam(config.params, "command") || getStringParam(config.params, "cli") || "gemini";
     const approvalMode = getStringParam(config.params, "approvalMode") || getStringParam(config.params, "geminiApprovalMode") || DEFAULT_GEMINI_CLI_APPROVAL_MODE;
@@ -779,6 +825,7 @@ async function callGeminiCliText(
         `${base}.run`,
         timeoutMs,
         getEarlyCliFailureReason,
+        signal,
     );
     if (result.earlyFailureReason) {
         const stderr = readClip(result.stderrPath, 1200).trim();
@@ -801,8 +848,11 @@ async function callGeminiCliText(
     return { provider: config.provider, model, text };
 }
 
-async function postJson(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number): Promise<any> {
+async function postJson(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<any> {
+    assertProviderNotAborted(signal);
     const controller = new AbortController();
+    const onAbort = () => controller.abort();
+    signal?.addEventListener("abort", onAbort, { once: true });
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
         const response = await fetch(url, {
@@ -824,12 +874,16 @@ async function postJson(url: string, headers: Record<string, string>, body: unkn
         }
         return data;
     } catch (err) {
+        if (signal?.aborted) {
+            throw makeProviderAbortError();
+        }
         if (err instanceof Error && err.name === "AbortError") {
             throw new Error(`HTTP 请求超时或被中止 (${timeoutMs}ms)`);
         }
         throw err;
     } finally {
         clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
     }
 }
 
@@ -838,7 +892,9 @@ export async function callCouncilModel(
     prompt: string,
     imagePaths: string[] = [],
     timeoutMs = DEFAULT_COUNCIL_MODEL_TIMEOUT_MS,
+    signal?: AbortSignal,
 ): Promise<ProviderCallResult> {
+    assertProviderNotAborted(signal);
     const candidates = [config, ...getFallbackConfigs(config)];
     const errors: string[] = [];
     for (let index = 0; index < candidates.length; index++) {
@@ -847,7 +903,10 @@ export async function callCouncilModel(
             ?? getNumberParam(candidate.params, "modelTimeoutMs")
             ?? timeoutMs;
         try {
-            return await withSourceLimit(candidate, () => withRetry(candidate, () => callCouncilModelOnce(candidate, prompt, imagePaths, candidateTimeoutMs)));
+            return await withSourceLimit(candidate, () => withRetry(candidate, () => {
+                assertProviderNotAborted(signal);
+                return callCouncilModelOnce(candidate, prompt, imagePaths, candidateTimeoutMs, signal);
+            }));
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
             errors.push(`${describeModelConfig(candidate)} => ${message}`);
@@ -866,17 +925,22 @@ async function callCouncilModelOnce(
     prompt: string,
     imagePaths: string[] = [],
     timeoutMs = DEFAULT_COUNCIL_MODEL_TIMEOUT_MS,
+    signal?: AbortSignal,
 ): Promise<ProviderCallResult> {
+    assertProviderNotAborted(signal);
     const model = getDefaultModel(config);
     if (config.provider === "geminiCli") {
-        return await callGeminiCliText(config, prompt, imagePaths, timeoutMs);
+        return await callGeminiCliText(config, prompt, imagePaths, timeoutMs, signal);
     }
     const images = loadImages(imagePaths, Boolean(config.supportsVision), config.provider);
 
     if (config.provider === "antigravity") {
-        const text = await callGetModelResponse(model, prompt, timeoutMs);
-        if (!text) throw new Error("Antigravity GetModelResponse 调用失败");
-        return { provider: config.provider, model, text };
+        const result = await callGetModelResponseDetailed(model, prompt, timeoutMs);
+        if (result.text) return { provider: config.provider, model, text: result.text };
+        const err = new Error(result.error || "Antigravity LS 模型调用失败") as ProviderError;
+        err.timedOut = result.timedOut === true;
+        err.retryable = err.timedOut;
+        throw err;
     }
 
     if (config.provider === "codex") {
@@ -884,6 +948,7 @@ async function callCouncilModelOnce(
             model,
             reasoning: getCodexReasoningParam(config.params),
             speed: getStringParam(config.params, "speed"),
+            signal,
         });
         return { provider: config.provider, model, text };
     }
@@ -922,7 +987,7 @@ async function callCouncilModelOnce(
             model,
             input: [{ role: "user", content }],
         };
-        const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs);
+        const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
         assertNotTruncated(config.provider, data);
         const text = extractOpenAIText(data);
         if (!text) throw new Error("OpenAI Responses API 未返回文本");
@@ -949,7 +1014,7 @@ async function callCouncilModelOnce(
             "x-api-key": key,
             "anthropic-version": getStringParam(config.params, "anthropicVersion") || "2023-06-01",
             ...getHeadersParam(config.params),
-        }, body, timeoutMs);
+        }, body, timeoutMs, signal);
         assertNotTruncated(config.provider, data);
         const text = extractAnthropicText(data);
         if (!text) throw new Error("Anthropic Messages API 未返回文本");
@@ -969,7 +1034,7 @@ async function callCouncilModelOnce(
             ...getSafeBodyOverrides(config.params, ["contents"]),
             contents: [{ role: "user", parts }],
         };
-        const data = await postJson(endpoint, { "x-goog-api-key": key, ...getHeadersParam(config.params) }, body, timeoutMs);
+        const data = await postJson(endpoint, { "x-goog-api-key": key, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
         assertNotTruncated(config.provider, data);
         const text = extractGeminiText(data);
         if (!text) throw new Error("Gemini generateContent 未返回文本");
@@ -991,7 +1056,7 @@ async function callCouncilModelOnce(
         model,
         messages: [{ role: "user", content: messageContent }],
     };
-    const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs);
+    const data = await postJson(endpoint, { Authorization: `Bearer ${key}`, ...getHeadersParam(config.params) }, body, timeoutMs, signal);
     assertNotTruncated(config.provider, data);
     const text = extractChatText(data);
     if (!text) throw new Error("OpenAI-compatible endpoint 未返回文本");

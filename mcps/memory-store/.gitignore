@@ -1,0 +1,4 @@
+node_modules/
+dist/
+stage41_record_outputs/
+*.log

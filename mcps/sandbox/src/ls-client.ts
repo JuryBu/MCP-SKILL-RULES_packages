@@ -15,7 +15,7 @@ import http from "http";
 
 // ===== 类型 =====
 
-interface LsProcessInfo {
+export interface LsProcessInfo {
     pid: number;
     csrfToken: string;
     workspaceId: string;
@@ -29,15 +29,22 @@ interface RpcResult {
 }
 
 /** 父 LS 已确认的连接信息（含验证后的 HTTP 端口） */
-interface ParentLsConnection {
+export interface ParentLsConnection {
     info: LsProcessInfo;
     port: number;
+}
+
+export interface LsModelResult {
+    text: string | null;
+    error?: string;
+    timedOut?: boolean;
 }
 
 // ===== 模块状态 =====
 
 let parentLs: ParentLsConnection | null = null;
 let parentLsInitPromise: Promise<void> | null = null;
+let parentLsInjectedForTest = false;
 
 /** 获取已缓存的父 LS 连接（未就绪返回 null） */
 export function getParentLs(): ParentLsConnection | null {
@@ -47,6 +54,12 @@ export function getParentLs(): ParentLsConnection | null {
 /** 检查 LS 是否可用 */
 export function isLsReady(): boolean {
     return parentLs !== null;
+}
+
+export function __setParentLsForTest(connection: ParentLsConnection | null): void {
+    parentLs = connection;
+    parentLsInitPromise = null;
+    parentLsInjectedForTest = connection !== null;
 }
 
 // ===== 父 LS 发现 =====
@@ -285,6 +298,7 @@ export async function initParentLs(): Promise<void> {
 
 /** 默认超时 */
 const DEFAULT_TIMEOUT = 30000;
+const LS_WALL_CLOCK_TIMEOUT = Symbol("LS_WALL_CLOCK_TIMEOUT");
 const DEFAULT_LS_MODEL = "MODEL_PLACEHOLDER_M132";
 const DEFAULT_LS_MODEL_FALLBACKS = [
     "MODEL_PLACEHOLDER_M132",
@@ -368,6 +382,41 @@ function getConfiguredLsFallbacks(): string[] {
     return [...new Set(resolvedItems)];
 }
 
+function errorMessage(err: unknown): string {
+    return err instanceof Error ? err.message : String(err ?? "");
+}
+
+function isTimeoutError(err: unknown): boolean {
+    if (err === LS_WALL_CLOCK_TIMEOUT) return true;
+    return /(?:^|: )Request timeout(?:$|[ |])/u.test(errorMessage(err));
+}
+
+function withWallClockTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            reject(LS_WALL_CLOCK_TIMEOUT);
+        }, timeoutMs);
+        if (typeof timer.unref === "function") timer.unref();
+        promise.then(
+            (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                resolve(value);
+            },
+            (err) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+            },
+        );
+    });
+}
+
 /**
  * 调用 LS GetModelResponse 生成 AI 回复
  * @param model 模型名（如 "M132" / "flash" / "gemini-3.1-pro-high"）
@@ -406,17 +455,115 @@ async function callGetModelResponseOn(
     prompt: string,
     timeout: number
 ): Promise<string | null> {
+    const errors: string[] = [];
     for (const candidate of getLsModelCandidates(model)) {
-        const result = await rpcCall(info, port, "GetModelResponse", { model: candidate, prompt }, timeout);
-        const text = result.data?.response ?? null;
-        if (text) {
-            if (candidate !== model) {
-                console.error(`[ls-client] GetModelResponse model ${describeModelCandidate(model, candidate)}`);
+        try {
+            const result = await rpcCall(info, port, "GetModelResponse", { model: candidate, prompt }, timeout);
+            if (result.status < 200 || result.status >= 300) {
+                errors.push(`${candidate}: LS GetModelResponse HTTP ${result.status}`);
+                continue;
             }
-            return text;
+            const text = result.data?.response ?? null;
+            if (text) {
+                if (candidate !== model) {
+                    console.error(`[ls-client] GetModelResponse model ${describeModelCandidate(model, candidate)}`);
+                }
+                return text;
+            }
+            errors.push(`${candidate}: Antigravity LS 模型返回为空`);
+        } catch (err) {
+            errors.push(`${candidate}: ${errorMessage(err)}`);
         }
     }
-    return null;
+    throw new Error(`LS GetModelResponse 候选全部失败: ${errors.join(" | ")}`);
+}
+
+async function callGetModelResponseWithDiscovery(
+    model: string,
+    prompt: string,
+    timeout: number
+): Promise<string | null> {
+    const tried = new Set<number>();
+    const errors: string[] = [];
+    if (parentLs) {
+        const currentParent = parentLs;
+        try {
+            const text = await callGetModelResponseOn(currentParent.info, currentParent.port, model, prompt, timeout);
+            if (text) return text;
+            tried.add(currentParent.info.pid);
+        } catch (err) {
+            tried.add(currentParent.info.pid);
+            const message = `PID=${currentParent.info.pid} port=${currentParent.port}: ${errorMessage(err)}`;
+            errors.push(message);
+            console.error(`[ls-client] LS model call failed: ${message}`);
+            if (parentLsInjectedForTest) {
+                throw new Error(`Antigravity LS 候选全部失败: ${errors.join(" | ")}`);
+            }
+            parentLs = null;
+            parentLsInitPromise = null;
+        }
+    }
+
+    const candidates = discoverAllLsCandidates()
+        .filter((info) => !tried.has(info.pid));
+    for (const info of candidates) {
+        const port = await findHttpPort(info);
+        if (!port) {
+            tried.add(info.pid);
+            continue;
+        }
+        try {
+            const text = await callGetModelResponseOn(info, port, model, prompt, timeout);
+            if (text) {
+                parentLs = { info, port };
+                parentLsInitPromise = null;
+                return text;
+            }
+        } catch (err) {
+            tried.add(info.pid);
+            const message = `PID=${info.pid} port=${port}: ${errorMessage(err)}`;
+            errors.push(message);
+            console.error(`[ls-client] LS model call failed: ${message}`);
+        }
+    }
+
+    const best = await discoverBestLs();
+    if (!best || tried.has(best.info.pid)) {
+        if (errors.length > 0) {
+            throw new Error(`Antigravity LS 候选全部失败: ${errors.join(" | ")}`);
+        }
+        return null;
+    }
+    parentLs = best;
+    try {
+        return await callGetModelResponseOn(best.info, best.port, model, prompt, timeout);
+    } catch (err) {
+        const message = `PID=${best.info.pid} port=${best.port}: ${errorMessage(err)}`;
+        console.error(`[ls-client] LS model call failed: ${message}`);
+        throw new Error(`Antigravity LS 候选全部失败: ${[...errors, message].join(" | ")}`);
+    }
+}
+
+export async function callGetModelResponseDetailed(
+    model: string,
+    prompt: string,
+    timeoutMs?: number
+): Promise<LsModelResult> {
+    const timeout = timeoutMs || DEFAULT_TIMEOUT;
+    try {
+        const text = await withWallClockTimeout(
+            callGetModelResponseWithDiscovery(model, prompt, timeout),
+            timeout,
+        );
+        if (text) return { text };
+        return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false };
+    } catch (err) {
+        const timedOut = isTimeoutError(err);
+        const message = err === LS_WALL_CLOCK_TIMEOUT
+            ? `Antigravity LS 模型调用超时（${timeout}ms）`
+            : `Antigravity LS 模型调用失败: ${errorMessage(err)}`;
+        return { text: null, error: message, timedOut };
+    }
 }
 
 export async function callGetModelResponse(
@@ -424,43 +571,6 @@ export async function callGetModelResponse(
     prompt: string,
     timeoutMs?: number
 ): Promise<string | null> {
-    const timeout = timeoutMs || DEFAULT_TIMEOUT;
-    try {
-        const tried = new Set<number>();
-        if (parentLs) {
-            try {
-                const text = await callGetModelResponseOn(parentLs.info, parentLs.port, model, prompt, timeout);
-                if (text) return text;
-                tried.add(parentLs.info.pid);
-            } catch {
-                tried.add(parentLs.info.pid);
-                parentLs = null;
-                parentLsInitPromise = null;
-            }
-        }
-
-        const candidates = discoverAllLsCandidates()
-            .filter((info) => !tried.has(info.pid));
-        for (const info of candidates) {
-            const port = await findHttpPort(info);
-            if (!port) continue;
-            try {
-                const text = await callGetModelResponseOn(info, port, model, prompt, timeout);
-                if (text) {
-                    parentLs = { info, port };
-                    parentLsInitPromise = null;
-                    return text;
-                }
-            } catch {
-                // Try the next reachable LS. Some sessions accept Heartbeat but cannot serve model calls.
-            }
-        }
-
-        const best = await discoverBestLs();
-        if (!best || tried.has(best.info.pid)) return null;
-        parentLs = best;
-        return await callGetModelResponseOn(best.info, best.port, model, prompt, timeout);
-    } catch {
-        return null;
-    }
+    const result = await callGetModelResponseDetailed(model, prompt, timeoutMs);
+    return result.text;
 }

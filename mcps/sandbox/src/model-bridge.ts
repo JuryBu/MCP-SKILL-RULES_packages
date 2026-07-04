@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -38,11 +38,6 @@ const CODEX_DEFAULT_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_TIMEOUT || 5 *
 const CODEX_KILL_TREE_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_KILL_TREE_TIMEOUT || 5_000);
 const CODEX_OUTPUT_PATH_KILL_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_OUTPUT_PATH_KILL_TIMEOUT || 5_000);
 let cachedCodexAvailability: boolean | null = null;
-
-function shellQuote(arg: string): string {
-    const escaped = arg.replace(/%/g, "%%").replace(/"/g, '""');
-    return /[\s"]/u.test(escaped) ? `"${escaped}"` : escaped;
-}
 
 function extractLastAgentText(stdout: string): string | null {
     const lines = stdout
@@ -108,6 +103,55 @@ function cleanupOutputFile(outputPath: string): void {
     } catch {
         // Ignore cleanup failure.
     }
+}
+
+function parseCodexBinArgs(raw: string | undefined): string[] {
+    if (!raw?.trim()) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+            return parsed;
+        }
+    } catch {
+        // Fall through to whitespace split for simple local overrides.
+    }
+    return raw.split(/\s+/u).filter(Boolean);
+}
+
+function validateCodexSimpleArg(name: string, value: string): string {
+    if (!/^[a-zA-Z0-9._-]+$/u.test(value)) {
+        throw new Error(`Codex ${name} 参数格式非法: ${value}`);
+    }
+    return value;
+}
+
+function resolveCodexSpawnTarget(): { command: string; argsPrefix: string[] } {
+    const override = process.env.SANDBOX_CODEX_BIN?.trim();
+    if (override) {
+        return { command: override, argsPrefix: parseCodexBinArgs(process.env.SANDBOX_CODEX_BIN_ARGS) };
+    }
+    if (process.platform !== "win32") {
+        return { command: "codex", argsPrefix: [] };
+    }
+    const probe = spawnSync("where.exe", ["codex"], {
+        windowsHide: true,
+        encoding: "utf-8",
+    });
+    const candidates = (probe.stdout || "")
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    const executable = candidates.find((candidate) => /\.(exe|com)$/iu.test(candidate));
+    if (executable) return { command: executable, argsPrefix: [] };
+    const cmdShim = candidates.find((candidate) => /\.cmd$/iu.test(candidate))
+        || path.join(process.env.APPDATA || "", "npm", "codex.cmd");
+    const shimDir = path.dirname(cmdShim);
+    const npmCodexJs = path.join(shimDir, "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (fs.existsSync(npmCodexJs)) {
+        const localNode = path.join(shimDir, "node.exe");
+        return { command: fs.existsSync(localNode) ? localNode : process.execPath, argsPrefix: [npmCodexJs] };
+    }
+    return { command: "codex.exe", argsPrefix: [] };
 }
 
 function killCodexProcessTree(pid: number): Promise<string> {
@@ -211,6 +255,10 @@ if ($stopped.Count -gt 0) { [Console]::Out.Write(($stopped -join ",")) }
 
 async function isCodexCliAvailable(): Promise<boolean> {
     if (cachedCodexAvailability !== null) return cachedCodexAvailability;
+    if (process.env.SANDBOX_CODEX_BIN?.trim()) {
+        cachedCodexAvailability = true;
+        return true;
+    }
 
     const candidates = [
         path.join(process.env.APPDATA || "", "npm", "codex.cmd"),
@@ -222,9 +270,8 @@ async function isCodexCliAvailable(): Promise<boolean> {
     }
 
     cachedCodexAvailability = await new Promise<boolean>((resolve) => {
-        const probe = spawn("where", ["codex"], {
+        const probe = spawn(process.platform === "win32" ? "where.exe" : "which", ["codex"], {
             windowsHide: true,
-            shell: true,
             stdio: ["ignore", "pipe", "ignore"],
         });
         let stdout = "";
@@ -280,6 +327,7 @@ interface CodexTextOptions {
     model?: string;
     reasoning?: string;
     speed?: string;
+    signal?: AbortSignal;
 }
 
 async function callCodexExec(prompt: string, timeoutMs: number, options: CodexTextOptions = {}): Promise<CodexExecResult> {
@@ -291,33 +339,39 @@ async function callCodexExec(prompt: string, timeoutMs: number, options: CodexTe
     const model = options.model || CODEX_MODEL;
     const reasoning = options.reasoning || CODEX_REASONING;
     const speed = options.speed || CODEX_SPEED_TIER;
+    const signal = options.signal;
+    const codexTarget = resolveCodexSpawnTarget();
+    if (signal?.aborted) {
+        return { text: null, error: "Codex exec cancelled by background abort" };
+    }
 
-    const cmdParts = [
-        "codex", "exec",
+    const cmdArgs = [
+        ...codexTarget.argsPrefix,
+        "exec",
         "--skip-git-repo-check",
         "--json",
         "--ephemeral",
         "--ignore-rules",
         "--ignore-user-config",
         "--sandbox", "read-only",
-        "-m", shellQuote(model),
-        "-c", shellQuote(`model_reasoning_effort=${reasoning}`),
-        "-c", shellQuote(`model_speed_tier=${speed}`),
-        "-C", shellQuote(process.cwd()),
-        "-o", shellQuote(tempFile),
+        "-m", validateCodexSimpleArg("model", model),
+        "-c", `model_reasoning_effort=${validateCodexSimpleArg("reasoning", reasoning)}`,
+        "-c", `model_speed_tier=${validateCodexSimpleArg("speed", speed)}`,
+        "-C", process.cwd(),
+        "-o", tempFile,
         "-",
     ];
-    const commandString = cmdParts.join(" ");
 
     return new Promise((resolve) => {
         const proc = spawn(
-            process.platform === "win32" ? "cmd.exe" : "sh",
-            process.platform === "win32" ? ["/d", "/s", "/c", commandString] : ["-lc", commandString],
+            codexTarget.command,
+            cmdArgs,
             {
                 cwd: process.cwd(),
                 env: { ...process.env },
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
+                shell: false,
             }
         );
 
@@ -328,11 +382,13 @@ async function callCodexExec(prompt: string, timeoutMs: number, options: CodexTe
         let killTreePending = false;
         let closeCode: number | null = null;
         let killTreeResult = "";
+        let abortCleanupStarted = false;
 
         const finish = (result: CodexExecResult) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            signal?.removeEventListener("abort", onAbort);
             try {
                 cleanupOutputFile(tempFile);
             } finally {
@@ -348,6 +404,27 @@ async function callCodexExec(prompt: string, timeoutMs: number, options: CodexTe
                 resolve(result);
             }
         };
+
+        const cleanupAfterAbort = (error: string) => {
+            if (settled || abortCleanupStarted) return;
+            abortCleanupStarted = true;
+            timedOut = false;
+            console.error(`[sandbox-model-bridge] Codex bridge aborted pid=${proc.pid ?? "?"} outputPath=${tempFile}`);
+            if (!proc.pid) {
+                finish({ text: null, error });
+                return;
+            }
+            killTreePending = true;
+            void killCodexProcessTree(proc.pid).then(async (message) => {
+                killTreePending = false;
+                const byOutputPath = await killProcessesByOutputPath(tempFile);
+                killTreeResult = [message, byOutputPath].filter(Boolean).join("; ");
+                finish({ text: null, error });
+            });
+        };
+
+        const onAbort = () => cleanupAfterAbort("Codex exec cancelled by background abort");
+        signal?.addEventListener("abort", onAbort, { once: true });
 
         const timer = setTimeout(() => {
             timedOut = true;
@@ -379,6 +456,11 @@ async function callCodexExec(prompt: string, timeoutMs: number, options: CodexTe
         proc.on("close", (code) => {
             void (async () => {
             closeCode = code;
+            if (abortCleanupStarted) {
+                if (killTreePending) return;
+                finish({ text: null, error: "Codex exec cancelled by background abort" });
+                return;
+            }
             if (timedOut) {
                 if (killTreePending) return;
                 finish({ text: null, error: `Codex exec timed out after ${effectiveTimeoutMs}ms` });
@@ -485,10 +567,13 @@ function isCodexBridgeRetryableError(message: string): boolean {
     if (/Unknown option|invalid|认证失败|未登录|Missing or invalid access token|permission denied|拒绝访问|not found|ENOENT/iu.test(message)) {
         return false;
     }
+    if (/cancelled by background abort|background abort|已取消/iu.test(message)) {
+        return false;
+    }
     return /timeout|timed out|HTTP (408|409|429|500|502|503|504)|ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|transport|channel closed|空输出|未返回|exited with code/iu.test(message);
 }
 
-async function callCodexTextForModelBridge(prompt: string, timeoutMs: number): Promise<string> {
+async function callCodexTextForModelBridge(prompt: string, timeoutMs: number, signal?: AbortSignal): Promise<string> {
     if (!(await isCodexCliAvailable())) {
         throw new Error("Codex 链路不可用：未发现 codex CLI");
     }
@@ -498,7 +583,10 @@ async function callCodexTextForModelBridge(prompt: string, timeoutMs: number): P
     for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
         for (let attempt = 0; attempt <= CODEX_BRIDGE_RETRIES; attempt++) {
-            const result = await callCodexExec(prompt, timeoutMs, candidate);
+            if (signal?.aborted) {
+                throw new Error("Codex 链路模型调用已取消：background abort");
+            }
+            const result = await callCodexExec(prompt, timeoutMs, { ...candidate, signal });
             if (result.text) return result.text;
 
             const error = result.error || "Codex exec 未返回文本";
@@ -525,6 +613,10 @@ export async function callModelBridge(
     timeoutMs: number,
     params?: Record<string, unknown>
 ): Promise<BridgeResult> {
+    const signal = params?.signal instanceof AbortSignal ? params.signal : undefined;
+    if (signal?.aborted) {
+        throw new Error("模型调用已取消：background abort");
+    }
     const chainUsed = await resolveModelChain(chain);
 
     if (chainUsed === "antigravity") {
@@ -543,6 +635,6 @@ export async function callModelBridge(
         return { chainUsed, text: result.text };
     }
 
-    const text = await callCodexTextForModelBridge(prompt, timeoutMs);
+    const text = await callCodexTextForModelBridge(prompt, timeoutMs, signal);
     return { chainUsed, text };
 }

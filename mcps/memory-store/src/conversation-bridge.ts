@@ -20,6 +20,7 @@ import {
 } from "./windsurf-client.js";
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable } from "./ls-client.js";
+import { setCurrentContext } from "./conversation-router.js";
 import { parseRounds, type ConversationRound } from "./trajectory.js";
 import {
     resolveConversationIdAcrossSources,
@@ -164,6 +165,16 @@ async function loadFromResolvedChain(
     conversationId: string | undefined,
     options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string; logicalChain?: ConversationLogicalChainMode },
 ): Promise<ConversationLoadResult | null> {
+    // 方案 D 注入点（见蓝图步骤 7）：把已知 conversationId / workspace 指纹喂给路由大脑，
+    // 让 getCurrentCascadeId（无 id 旁路）能精确绑定当前窗口，而非「连第一个 LS 猜全局最新」。
+    // 仅 antigravity/windsurf 受益；codex/claude-code 分支不消费 ctx，零影响。
+    if (resolved === "antigravity" || resolved === "windsurf") {
+        setCurrentContext({
+            conversationId: conversationId || undefined,
+            workspaceRoot: options.cwd || undefined,
+        });
+    }
+
     const effectiveId = await resolveConversationId(conversationId, resolved, options.cwd);
     if (!effectiveId) return null;
 

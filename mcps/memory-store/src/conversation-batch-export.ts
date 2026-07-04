@@ -1,8 +1,8 @@
 import fs from "fs";
 import path from "path";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
-import { loadConversationData } from "./conversation-bridge.js";
-import { exportConversation, formatConversationExportResult, type ConversationExportOptions, type ConversationExportResult } from "./conversation-exporter.js";
+import { loadConversationData as defaultLoadConversationData } from "./conversation-bridge.js";
+import { exportConversation as defaultExportConversation, type ConversationExportOptions, type ConversationExportResult } from "./conversation-exporter.js";
 import type { UnifiedConversationCandidate, SourceStatus, WorkspaceMatchMode, WorkspaceMatchScope } from "./conversation-filter.js";
 import type { ConversationLinkMode } from "./chain.js";
 
@@ -42,6 +42,11 @@ export interface ConversationBatchExportResult {
     items: ConversationBatchExportItemResult[];
 }
 
+export interface ConversationBatchExportDeps {
+    loadConversationData: typeof defaultLoadConversationData;
+    exportConversation: typeof defaultExportConversation;
+}
+
 function timestamp(): string {
     const now = new Date();
     return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
@@ -65,7 +70,7 @@ function resolveBatchExportDirectory(outputDir?: string): string {
     return target;
 }
 
-function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof loadConversationData>>): string {
+function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof defaultLoadConversationData>>): string {
     const skipped = loaded?.windsurfData?.skippedSteps || [];
     if (!loaded?.windsurfData?.partial || skipped.length === 0) return "";
     const shown = skipped.slice(0, 5).map(item => `offset ${item.offset}`).join(", ");
@@ -90,7 +95,14 @@ async function runWithConcurrency<T, R>(
     return results;
 }
 
-export async function exportConversationBatch(options: ConversationBatchExportOptions): Promise<ConversationBatchExportResult> {
+export async function exportConversationBatch(
+    options: ConversationBatchExportOptions,
+    deps: Partial<ConversationBatchExportDeps> = {},
+): Promise<ConversationBatchExportResult> {
+    const activeDeps: ConversationBatchExportDeps = {
+        loadConversationData: deps.loadConversationData || defaultLoadConversationData,
+        exportConversation: deps.exportConversation || defaultExportConversation,
+    };
     const batchDir = resolveBatchExportDirectory(options.outputDir);
     const selected = options.candidates.slice(0, Math.max(options.batchLimit || options.candidates.length, 0));
     const concurrency = Math.max(1, Math.min(options.batchConcurrency || 2, 4));
@@ -113,6 +125,7 @@ export async function exportConversationBatch(options: ConversationBatchExportOp
         limit: options.limit,
         mode: options.mode,
         depth: options.depth,
+        messageRoles: options.messageRoles,
         includeAssets: options.includeAssets,
         pdfEmbedAttachments: options.pdfEmbedAttachments,
         candidates: selected.map(item => ({
@@ -132,7 +145,7 @@ export async function exportConversationBatch(options: ConversationBatchExportOp
     const items = await runWithConcurrency(selected, concurrency, async (candidate) => {
         const childDir = path.join(batchDir, `${safeSegment(candidate.dataChain)}_${safeSegment(candidate.id.slice(0, 8))}`);
         try {
-            const loaded = await loadConversationData(candidate.dataChain, candidate.id, { link: options.link });
+            const loaded = await activeDeps.loadConversationData(candidate.dataChain, candidate.id, { link: options.link });
             if (!loaded) {
                 return {
                     conversationId: candidate.id,
@@ -144,7 +157,7 @@ export async function exportConversationBatch(options: ConversationBatchExportOp
                     error: "无法读取对话数据",
                 };
             }
-            const result: ConversationExportResult = await exportConversation({
+            const result: ConversationExportResult = await activeDeps.exportConversation({
                 ...options,
                 conversationId: loaded.conversationId,
                 chainUsed: loaded.chainUsed,

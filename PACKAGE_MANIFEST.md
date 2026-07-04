@@ -1,10 +1,10 @@
-# Package Manifest（2026-6-24）
+# Package Manifest（2026-7-4）
 
 Included:
 
-- `mcps/memory-store` source-only portable MCP (`1.16.0`)
+- `mcps/memory-store` source-only portable MCP (`1.17.1`)
 - `mcps/web-fetcher` source-only portable MCP (`7.0.0`)
-- `mcps/sandbox` source-only portable MCP (`1.13.4`)
+- `mcps/sandbox` source-only portable MCP (`1.13.7`)
 - `mcps/broker` portable HTTP broker (`0.1.0`)
 - `mcps/mcp-subagent` source-only Windsurf-only optional MCP (`0.0.1`)
 - `templates/config.codex.toml`
@@ -28,15 +28,15 @@ Included:
 
 Updated in this snapshot:
 
-- 2026-06-24: refreshed latest MCP sources and rules templates; `memory-store` is now `1.16.0`, broker portability patches were retained, and `mcp-subagent` remains Windsurf-only optional.
-- 2026-06-24: refreshed Codex / Claude Code / Antigravity / Windsurf rules from local sources where newer, then scrubbed personal info, account links, login-state claims, and sender-specific paths.
+- 2026-07-04: refreshed changed MCP sources and rules templates; `memory-store` is now `1.17.1`, `sandbox` is now `1.13.7`, broker portability patches plus request timeout forwarding were retained, and `mcp-subagent` remains Windsurf-only optional.
+- 2026-07-04: refreshed Claude Code and Windsurf rule deltas, rechecked Codex / Antigravity templates, then scrubbed personal info, account links, login-state claims, and sender-specific paths.
 
-- Skills refreshed on 2026-06-24: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
+- Skills rechecked on 2026-07-04: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
 
-- `memory-store` refreshed to `1.16.0` with conversation export helper sources.
-- `sandbox` refreshed to `1.13.4`.
-- `web-fetcher` source refreshed from the current local tree; version remains `7.0.0`.
-- Codex and Claude Code rules refreshed from current local templates, Windsurf rules added from WSF config, then all rules privacy-scrubbed.
+- `memory-store` refreshed to `1.17.1` with query parsing, relevance scoring, tool concurrency, WSF Cascade routing, and local fallback sources.
+- `sandbox` refreshed to `1.13.7` with SSRF / shell injection hardening, batch/launch/session lifecycle fixes, background abort, and per-task registry.
+- `web-fetcher` rechecked against the current local `7.0.0` tree; no functional source change was needed, and portable README examples were kept scrubbed.
+- Codex / Antigravity / Claude Code / Windsurf rules refreshed or rechecked from current local templates, then all rules privacy-scrubbed.
 - Four-host wording remains Antigravity + Codex + Claude Code / CC + Windsurf / WSF with shared data and broker routing.
 
 Excluded:

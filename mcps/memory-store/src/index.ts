@@ -17,7 +17,7 @@
  *   - memory_stats: 统计/归档/导出/导入/enhance 批量增强
  *   - conversation_read_original: 读取对话原文（绕过上下文压缩）
  *   - conversation_golden_extract: 黄金片段提取（对话关键信息 + 记忆去重）
- *   - record_manage: 对话记录管理（update/list/read/search/guide/edit/delete/batch_update/batch_delete/task_status/audit_ownership/repair_ownership）
+ *   - record_manage: 对话记录管理（update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/audit_ownership/repair_ownership）
  *   - stage_guard: 任务完整性验证（start/check/status/cancel，支持外部文件证据索引）
  */
 
@@ -34,6 +34,7 @@ import { initParentLs } from "./ls-client.js";
 import { cleanupRegistryOnExit } from "./ls-registry.js";
 import { VERSION } from "./version.js";
 import { GUIDE_TEXT } from "./guide-text.js";
+import { installToolConcurrency } from "./tool-concurrency.js";
 
 // 工具注册
 import { registerWrite } from "./tools/write.js";
@@ -78,6 +79,8 @@ const server = new McpServer({
     name: "memory-store-mcp-server",
     version: VERSION,
 });
+
+installToolConcurrency(server);
 
 // 注册所有 11 个工具
 registerWrite(server);

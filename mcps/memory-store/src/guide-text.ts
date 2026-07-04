@@ -133,7 +133,7 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - Codex 子代理线程标注(v1.15.9): Codex 子代理线程在 list 中显示为 子代理对话(role)，detail 标出 parentConversationId；fetch/read/search 子线程时会显示源头对话 ID 与源头标题；fetch 子代理线程不触发自动 Record 更新。
 - Claude Code 加密思考占位(v1.15.10): Claude Code JSONL 中 thinking 为空但 signature 存在的加密思考块，会在 read(depth="full", extraTypes=["thinking"]) 中显示“🔒 加密思考块 step N：thinking 为空，signature 存在，明文不可读”；完整 signature 不输出，也不进入 contextProbe/deep_locate/Record/Guard/Golden Extract 正文材料。
 - Conversation 主子线程与消息角色过滤(v1.15.11): conversation_read_original(list/export) 支持 threadMode="main|children|all"、parentConversationId、parentQuery；默认 main 会把命中子线程的标题回指父线程候选。read 支持 messageRoles=["user","system","model","assistant","tool"]，可只读用户、系统/压缩摘要、模型回复或工具证据。Codex 标题定位使用全量 session_index 轻量索引，不再被最近 300 条正文候选限制。
-- Record 最终写入质量门禁(v1.15.11): record_manage(update/batch_update) 与自动后台 Record 写入前会统一校验 Phase 数、覆盖轮次、长度比例和 Phase 范围；长对话或旧 Record 有 Phase 时，0 Phase 候选会被拒绝并保存到 temp，不覆盖正式 Record。
+- Record 最终写入质量门禁(v1.15.11): record_manage(update/batch_update/bulk_update) 与自动后台 Record 写入前会统一校验 Phase 数、覆盖轮次、长度比例和 Phase 范围；长对话或旧 Record 有 Phase 时，0 Phase 候选会被拒绝并保存到 temp，不覆盖正式 Record。
 - Record 手动补充保护修正(v1.15.12): Local Compose 质量检查保留旧 [手动补充] 硬约束，但比较前会忽略历史重复列表编号，避免 9. 3. 与 1. 这类编号变化误判为丢失。
 - Conversation list 多词查询修正(v1.15.13): conversation_read_original(list/export) 的标题/ID/工作区轻量定位中，空格分开的 query 词按 OR 匹配候选；完整 ID、ID 前缀和完整标题仍优先排序，正文片段仍应使用 search/deep_locate。
 - Claude Code 逻辑续聊链与 Record 防缩水(v1.15.14): conversation_read_original(fetch/read/search/export, dataChain="claude-code") 支持 logicalChain="off|explain|auto|strict"；默认 off 只读指定物理 JSONL，explain 只展示同工作区前序候选，auto/strict 仅在明确引用 ID/标题、压缩摘要或首尾内容重叠等强证据成立且无“从 0 开始/不要继承”信号时合并。record_manage(update, dataChain="claude-code") 默认 logicalChain="auto"，证据不足只给 warning，不按标题语义强行合并；最终写入门禁会容忍旧 Record 已存在且完全一致的稳定区 Phase 范围重叠，但仍拒绝新生成部分新增的重叠或倒退。
@@ -166,10 +166,10 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 
 ### record_manage — 对话记录管理 (v1.8+ / Reader v1.12+)
 - Record 是对话过程日志，Flash 自动生成，永久存于 records/，抗 LS 过期
-- action: update/list/read/search/guide/edit/delete/batch_update/batch_delete/task_status/audit_ownership/repair_ownership
+- action: update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/audit_ownership/repair_ownership
 - 自动触发: Antigravity LS 环境下所有工具调用自动节流检查（60s 间隔），轮次增量≥3 后台更新；同一对话同一工作区已有 pending 时跳过重复触发
 - Codex wrapper 环境默认关闭后台自动 Record，避免普通查询隐式拉起模型桥；需要时可设 MEMORY_STORE_CODEX_AUTO_RECORD=1 显式开启
-- 显式更新: record_manage update / batch_update 会跳过入口自动检查，避免手动更新与后台自动更新重复生成
+- 显式更新: record_manage update / batch_update / bulk_update 会跳过入口自动检查，避免手动更新与后台自动更新重复生成
 - 工作区落点: 自动更新优先使用当前宿主/线程检测到的工作区，避免历史异常 Record hash 污染新写入
 - 模型重试: Antigravity LS 链路首次失败自动等 5s 重试 1 次；Codex 链路只对输出为空/启动失败等快失败重试 1 次，完整超时不重试，避免拖穿宿主 MCP 超时
 - 分批处理超长对话：按实际轮次大小切批，避免高密工具轮次被平均值低估
@@ -228,6 +228,6 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - MCP 退出时等待所有 pending Record 生成完成（90s 超时保底）
 - 自动触发阈值从 5 轮降至 3 轮
 - 自动更新使用 per workspace + conversation 去重，避免重复模型桥进程
-- Codex wrapper 环境默认只响应显式 record_manage update / batch_update，不在普通工具调用入口后台生成 Record
+- Codex wrapper 环境默认只响应显式 record_manage update / batch_update / bulk_update，不在普通工具调用入口后台生成 Record
 - 显式 Record 更新不会同时触发后台自动更新
 - 当前宿主检测到的 workspace hash 优先级高于历史 Record 所在 hash`;

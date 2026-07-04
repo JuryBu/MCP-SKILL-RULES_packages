@@ -1,4 +1,4 @@
-﻿import http from "node:http";
+import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -586,7 +586,7 @@ class BackendManager {
     const timeoutMs = Number(options.timeoutMs || requestTimeoutMs);
     try {
       return await withTimeout(
-        client.request(request, resultSchema),
+        client.request(request, resultSchema, { timeout: timeoutMs }),
         timeoutMs,
         `${this.name} ${request.method}`,
       );

@@ -8,7 +8,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import path from "path";
 import fs from "fs";
 import Fuse from "fuse.js";
@@ -35,19 +35,35 @@ function resolveModelChainParam(chain?: ModelChain, modelChain?: ModelChain): Mo
     return modelChain ?? chain ?? "auto";
 }
 
+function assertNotAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) {
+        throw new Error("smart_search 后台任务已取消：background abort");
+    }
+}
+
 // ===== ripgrep 路径发现 =====
 
 let rgPath: string | null = null;
 
 function findRipgrep(): string | null {
     if (rgPath !== null) return rgPath;
+    if (/^(1|true|yes)$/iu.test(process.env.SANDBOX_TEST_DISABLE_RG || "")) {
+        rgPath = "";
+        return null;
+    }
 
     // 1. PATH 中的 rg
     try {
-        const { execSync } = require("child_process");
-        execSync("rg --version", { stdio: "pipe", timeout: 3000 });
-        rgPath = "rg";
-        return rgPath;
+        const probe = spawnSync("rg", ["--version"], {
+            stdio: "ignore",
+            timeout: 3000,
+            windowsHide: true,
+            shell: false,
+        });
+        if (probe.status === 0) {
+            rgPath = "rg";
+            return rgPath;
+        }
     } catch { /* not in PATH */ }
 
     // 2. Antigravity 内置 rg
@@ -86,8 +102,10 @@ async function searchExact(
         includes?: string[];
         excludes?: string[];
         maxResults?: number;
+        signal?: AbortSignal;
     }
 ): Promise<{ results: ExactResult[]; fileOnly: string[]; engine: string }> {
+    assertNotAborted(opts.signal);
     const rg = findRipgrep();
     if (rg) {
         return searchWithRipgrep(rg, query, searchPath, opts);
@@ -129,9 +147,16 @@ async function searchWithRipgrep(
         let stdout = "";
         let stderr = "";
 
+        const onAbort = () => {
+            try { child.kill(); } catch { /* ignore */ }
+            resolve({ results: [], fileOnly: [], engine: "ripgrep (cancelled)" });
+        };
+        opts.signal?.addEventListener("abort", onAbort, { once: true });
+
         child.stdout.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
         child.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
         child.on("close", (code) => {
+            opts.signal?.removeEventListener("abort", onAbort);
             // 非法正则等错误：rg 返回非 0/1 exit code
             if (code && code > 1 && stderr) {
                 resolve({
@@ -170,6 +195,7 @@ async function searchWithRipgrep(
         });
 
         child.on("error", () => {
+            opts.signal?.removeEventListener("abort", onAbort);
             resolve({ results: [], fileOnly: [], engine: "ripgrep (error)" });
         });
     });
@@ -188,6 +214,7 @@ async function searchWithNodeFallback(
         : null;
 
     function searchDir(dir: string): void {
+        assertNotAborted(opts.signal);
         if (results.length >= maxResults) return;
         let entries;
         try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
@@ -199,6 +226,7 @@ async function searchWithNodeFallback(
         ];
         const includes = opts.includes as string[] | undefined;
         for (const entry of entries) {
+            assertNotAborted(opts.signal);
             if (results.length >= maxResults) break;
             if (excludes.includes(entry.name)) continue;
 
@@ -246,12 +274,14 @@ async function searchWithNodeFallback(
 async function searchFuzzy(
     query: string,
     searchPath: string,
-    opts: { includes?: string[]; excludes?: string[]; maxResults?: number }
+    opts: { includes?: string[]; excludes?: string[]; maxResults?: number; signal?: AbortSignal }
 ): Promise<Array<SymbolInfo & { file: string; score: number }>> {
+    assertNotAborted(opts.signal);
     const index = await scanDirectory(searchPath, {
         includes: opts.includes,
         excludes: opts.excludes,
     });
+    assertNotAborted(opts.signal);
 
     const allSymbols = flattenSymbols(index);
     const fuse = new Fuse(allSymbols, {
@@ -282,11 +312,13 @@ async function searchSmart(
         maxResults?: number;
         files?: Array<{ path: string; range?: string }>;
         background?: boolean;
+        signal?: AbortSignal;
     }
 ): Promise<{ chainUsed: "antigravity" | "codex" | "claude-code"; text: string }> {
+    assertNotAborted(opts.signal);
     // 入口1：有 files 参数 → 直接读文件分析
     if (opts.files && opts.files.length > 0) {
-        return smartWithFiles(query, searchPath, opts.files, resolveModelChainParam(opts.chain, opts.modelChain), opts.background);
+        return smartWithFiles(query, searchPath, opts.files, resolveModelChainParam(opts.chain, opts.modelChain), opts.background, opts.signal);
     }
     // 入口2：两阶段自动定位
     return smartTwoStage(query, searchPath, opts);
@@ -298,10 +330,12 @@ async function smartWithFiles(
     files: Array<{ path: string; range?: string }>,
     chain: ModelChain,
     background = false,
+    signal?: AbortSignal,
 ): Promise<{ chainUsed: "antigravity" | "codex" | "claude-code"; text: string }> {
     const contents: string[] = [];
 
     for (const f of files) {
+        assertNotAborted(signal);
         const fullPath = path.isAbsolute(f.path) ? f.path : path.join(basePath, f.path);
         // 🔴 路径遍历防护：确保文件在 basePath 内
         const resolved = path.resolve(fullPath);
@@ -352,15 +386,16 @@ ${contents.join("\n\n")}`;
         : (chain === "claude-code" || chain === "cc")
             ? (background ? SMART_CLAUDE_CODE_BACKGROUND_FILES_TIMEOUT_MS : SMART_CLAUDE_CODE_FILES_TIMEOUT_MS)
         : SMART_FILES_TIMEOUT_MS;
-    const result = await callModelBridge(chain, prompt, timeoutMs);
+    const result = await callModelBridge(chain, prompt, timeoutMs, { signal });
     return { chainUsed: result.chainUsed, text: result.text };
 }
 
 async function smartTwoStage(
     query: string,
     searchPath: string,
-    opts: { modelChain?: ModelChain; chain?: ModelChain; includes?: string[]; excludes?: string[]; maxResults?: number; background?: boolean }
+    opts: { modelChain?: ModelChain; chain?: ModelChain; includes?: string[]; excludes?: string[]; maxResults?: number; background?: boolean; signal?: AbortSignal }
 ): Promise<{ chainUsed: "antigravity" | "codex" | "claude-code"; text: string }> {
+    assertNotAborted(opts.signal);
     // 阶段1：符号索引 + fuzzy 线索 → 当前模型链路快速选文件
     const index = await scanDirectory(searchPath, {
         includes: opts.includes,
@@ -402,7 +437,7 @@ ${fileOverview.substring(0, 8000)}
         : (requestedChain === "claude-code" || requestedChain === "cc")
             ? (opts.background ? SMART_CLAUDE_CODE_BACKGROUND_STAGE_TIMEOUT_MS : SMART_CLAUDE_CODE_STAGE_TIMEOUT_MS)
         : SMART_STAGE1_TIMEOUT_MS;
-    const stage1 = await callModelBridge(requestedChain, stage1Prompt, stage1TimeoutMs);
+    const stage1 = await callModelBridge(requestedChain, stage1Prompt, stage1TimeoutMs, { signal: opts.signal });
     const stage1Result = stage1.text;
 
     // 解析候选文件
@@ -424,6 +459,7 @@ ${fileOverview.substring(0, 8000)}
     // 阶段2：读候选文件全文 → 同链路深度分析；Antigravity auto 会按 M132→M20→M18→M16→M36 fallback
     const fileContents: string[] = [];
     for (const relPath of candidateFiles.slice(0, 5)) {
+        assertNotAborted(opts.signal);
         const fullPath = path.resolve(path.join(searchPath, relPath));
         const base = path.resolve(searchPath);
         // 🔴 路径遍历防护
@@ -454,7 +490,7 @@ ${fileContents.join("\n\n")}
         : stage1.chainUsed === "claude-code"
             ? (opts.background ? SMART_CLAUDE_CODE_BACKGROUND_STAGE_TIMEOUT_MS : SMART_CLAUDE_CODE_STAGE_TIMEOUT_MS)
         : SMART_STAGE2_TIMEOUT_MS;
-    const stage2 = await callModelBridge(stage1.chainUsed, stage2Prompt, stage2TimeoutMs);
+    const stage2 = await callModelBridge(stage1.chainUsed, stage2Prompt, stage2TimeoutMs, { signal: opts.signal });
     return { chainUsed: stage2.chainUsed, text: stage2.text };
 }
 
@@ -571,6 +607,7 @@ export function registerSmartSearch(server: McpServer): void {
                 modelChain?: ModelChain;
                 chain?: ModelChain;
                 background?: boolean;
+                signal?: AbortSignal;
             }): Promise<string> {
                 switch (q.mode) {
                     case "exact": {
@@ -582,6 +619,7 @@ export function registerSmartSearch(server: McpServer): void {
                             includes: q.includes,
                             excludes: q.excludes,
                             maxResults: q.maxResults ?? 50,
+                            signal: q.signal,
                         });
                         return formatExactResult(q.query, data, q.matchPerLine !== false);
                     }
@@ -590,6 +628,7 @@ export function registerSmartSearch(server: McpServer): void {
                             includes: q.includes,
                             excludes: q.excludes,
                             maxResults: q.maxResults ?? 20,
+                            signal: q.signal,
                         });
                         return formatFuzzyResult(q.query, results);
                     }
@@ -602,6 +641,7 @@ export function registerSmartSearch(server: McpServer): void {
                             maxResults: q.maxResults,
                             files: q.files,
                             background: q.background,
+                            signal: q.signal,
                         });
                         return `🧠 语义搜索 "${q.query}" (chain=${smartOutput.chainUsed})\n\n${smartOutput.text}`;
                     }
@@ -628,7 +668,7 @@ export function registerSmartSearch(server: McpServer): void {
                 if (!args.query || !args.mode || !args.searchPath) {
                     return { content: [{ type: "text" as const, text: "❌ 后台模式需要提供 query、mode、searchPath 参数" }] };
                 }
-                const task = startBackgroundTask("smart-search", async () => {
+                const task = startBackgroundTask("smart-search", async (_progress, signal) => {
                     const start = Date.now();
                     const output = await executeSingleQuery({
                         query: args.query!,
@@ -645,6 +685,7 @@ export function registerSmartSearch(server: McpServer): void {
                         modelChain: args.modelChain as ModelChain | undefined,
                         chain: args.chain as ModelChain | undefined,
                         background: true,
+                        signal,
                     });
                     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
                     return `${output}\n\n⏱ 耗时: ${elapsed}s`;
@@ -701,6 +742,7 @@ export function registerSmartSearch(server: McpServer): void {
                                 modelChain: (q.modelChain as ModelChain | undefined) ?? (args.modelChain as ModelChain | undefined),
                                 chain: (q.chain as ModelChain | undefined) ?? (args.chain as ModelChain | undefined),
                                 background: false,
+                                signal: undefined,
                             };
                             const start = Date.now();
                             try {
@@ -747,6 +789,7 @@ export function registerSmartSearch(server: McpServer): void {
                     modelChain: args.modelChain as ModelChain | undefined,
                     chain: args.chain as ModelChain | undefined,
                     background: false,
+                    signal: undefined,
                 });
 
                 const elapsed = Date.now() - globalStart;
@@ -758,4 +801,3 @@ export function registerSmartSearch(server: McpServer): void {
         }
     );
 }
-

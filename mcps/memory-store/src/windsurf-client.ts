@@ -1,9 +1,18 @@
 import { execFile } from "node:child_process";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
+import {
+    resolveEndpointForConversation,
+    invalidateMapping,
+    type RouterEndpoint,
+} from "./conversation-router.js";
+import { windsurfCascadeExistsLocally } from "./windsurf-local-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -37,7 +46,12 @@ export interface WindsurfConversationSummary {
     trajectoryId?: string;
     title: string;
     renamedTitle?: string;
-    titleSource?: "renamedTitle" | "summary" | "title" | "fallback";
+    titleBestEffort?: string;
+    titleSource?: "renamedTitle" | "titleBestEffort" | "summary" | "title" | "fallback";
+    isChildThread?: boolean;
+    parentConversationId?: string | null;
+    agentRole?: string | null;
+    agentNickname?: string | null;
     summary: string;
     stepCount: number;
     createdTime?: string;
@@ -81,6 +95,31 @@ interface RunCommandOptions {
 }
 
 type RunCommand = (file: string, args: string[], options?: RunCommandOptions) => Promise<{ stdout: string; stderr: string }>;
+
+interface WindsurfSubagentJobsCache {
+    path: string;
+    mtimeMs: number;
+    jobs: Map<string, WindsurfSubagentJobInfo>;
+}
+
+let windsurfSubagentJobsCache: WindsurfSubagentJobsCache | null = null;
+
+export interface WindsurfSubagentJobInfo {
+    jobId: string;
+    subCid: string;
+    mainId: string;
+    label?: string;
+    titleBestEffort?: string;
+    state?: string;
+    mode?: string;
+    model?: string;
+    createdAt?: string;
+    updatedAt?: string;
+    completedAt?: string;
+    resultStepCount?: number;
+    resultPreview?: string;
+    archivePath?: string;
+}
 
 function truncate(input: string, maxChars: number): string {
     if (input.length <= maxChars) return input;
@@ -173,6 +212,114 @@ function asRecord(value: unknown): Record<string, any> {
 
 function asArray(value: unknown): any[] {
     return Array.isArray(value) ? value : [];
+}
+
+function defaultWindsurfSubagentJobsPath(): string {
+    return process.env.MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH
+        || path.join(os.homedir(), ".codeium", "windsurf", "mcp-subagent", "subagent-data", "jobs.json");
+}
+
+function firstStringField(record: Record<string, any>, fields: string[]): string {
+    for (const field of fields) {
+        const value = toStringValue(record[field]).trim();
+        if (value) return value;
+    }
+    return "";
+}
+
+function jobInfoFromRecord(record: Record<string, any>): WindsurfSubagentJobInfo | null {
+    const subCid = firstStringField(record, [
+        "sub_cid",
+        "subCid",
+        "subCascadeId",
+        "subConversationId",
+        "childConversationId",
+        "child_cid",
+    ]);
+    const mainId = firstStringField(record, [
+        "main_id",
+        "mainCid",
+        "mainCascadeId",
+        "mainConversationId",
+        "parentConversationId",
+        "parent_cid",
+        "owner_conversation_id",
+    ]);
+    if (!subCid || !mainId || subCid === mainId) return null;
+    return {
+        jobId: firstStringField(record, ["job_id", "jobId", "id"]) || subCid,
+        subCid,
+        mainId,
+        label: firstStringField(record, ["label", "name"]) || undefined,
+        titleBestEffort: firstStringField(record, ["title_best_effort", "titleBestEffort", "title"]) || undefined,
+        state: firstStringField(record, ["state", "status"]) || undefined,
+        mode: firstStringField(record, ["mode"]) || undefined,
+        model: firstStringField(record, ["model", "model_id", "modelId"]) || undefined,
+        createdAt: firstStringField(record, ["created_at", "createdAt"]) || undefined,
+        updatedAt: firstStringField(record, ["updated_at", "updatedAt"]) || undefined,
+        completedAt: firstStringField(record, ["completed_at", "completedAt"]) || undefined,
+        resultStepCount: toNumberValue(record.result_step_count ?? record.resultStepCount) || undefined,
+        resultPreview: firstStringField(record, ["result_preview", "resultPreview"]) || undefined,
+        archivePath: firstStringField(record, ["archive_path", "archivePath"]) || undefined,
+    };
+}
+
+function collectWindsurfSubagentJobs(value: unknown, target: Map<string, WindsurfSubagentJobInfo>, depth = 0): void {
+    if (depth > 5 || !value) return;
+    if (Array.isArray(value)) {
+        for (const item of value) collectWindsurfSubagentJobs(item, target, depth + 1);
+        return;
+    }
+    const record = asRecord(value);
+    if (Object.keys(record).length === 0) return;
+
+    const info = jobInfoFromRecord(record);
+    if (info) target.set(info.subCid, info);
+
+    const nested = record.jobs ?? record.items ?? record.data ?? record.records;
+    if (nested) {
+        collectWindsurfSubagentJobs(nested, target, depth + 1);
+        return;
+    }
+    for (const value of Object.values(record)) {
+        collectWindsurfSubagentJobs(value, target, depth + 1);
+    }
+}
+
+export function readWindsurfSubagentJobs(): Map<string, WindsurfSubagentJobInfo> {
+    const jobsPath = defaultWindsurfSubagentJobsPath();
+    try {
+        const stat = fs.statSync(jobsPath);
+        if (!stat.isFile()) return new Map();
+        if (
+            windsurfSubagentJobsCache
+            && windsurfSubagentJobsCache.path === jobsPath
+            && windsurfSubagentJobsCache.mtimeMs === stat.mtimeMs
+        ) {
+            return new Map(windsurfSubagentJobsCache.jobs);
+        }
+        const parsed = JSON.parse(fs.readFileSync(jobsPath, "utf8"));
+        const jobs = new Map<string, WindsurfSubagentJobInfo>();
+        collectWindsurfSubagentJobs(parsed, jobs);
+        windsurfSubagentJobsCache = { path: jobsPath, mtimeMs: stat.mtimeMs, jobs };
+        return new Map(jobs);
+    } catch {
+        return new Map();
+    }
+}
+
+export function readWindsurfSubagentParentMap(): Map<string, string> {
+    return new Map([...readWindsurfSubagentJobs().values()].map(job => [job.subCid, job.mainId]));
+}
+
+function isWindsurfSubagentTitle(input: string): boolean {
+    return /^\s*\[subagent\]/iu.test(input);
+}
+
+function windsurfSubagentRoleFromTitle(input: string): string | null {
+    const match = input.match(/^\s*\[subagent\]\s*([^：:\-|]+)?/iu);
+    const role = match?.[1]?.trim();
+    return role || null;
 }
 
 function parseJsonOutput(stdout: string): unknown {
@@ -390,47 +537,96 @@ public static class WindsurfProcessEnvironmentReader {
     }
 }
 
-export async function discoverWindsurfLsEndpoint(runCommand: RunCommand = defaultRunCommand): Promise<WindsurfLsEndpoint | undefined> {
+/**
+ * 发现「全部」活跃 WSF LS 端点（Heartbeat 通），不再只取第一个（核心修复 ④）。
+ * discoverWindsurfLsEndpoint 内部改为「全量枚举取 [0]」（语义不变，供 list/可用性探测）。
+ */
+export async function discoverAllWindsurfLsEndpoints(runCommand: RunCommand = defaultRunCommand): Promise<WindsurfLsEndpoint[]> {
+    if (endpointResolverOverride) return endpointResolverOverride();
+
     const candidates = await findWindsurfLsProcessCandidates(runCommand);
+    const endpoints: WindsurfLsEndpoint[] = [];
+    const seen = new Set<string>();
     for (const candidate of candidates) {
         const csrfToken = await readWindsurfCsrfToken(candidate.pid, runCommand);
         if (!csrfToken) continue;
         const ports = await findWindsurfListenPorts(candidate, runCommand);
         for (const port of ports) {
             const endpoint: WindsurfLsEndpoint = { ...candidate, port, csrfToken };
-            const transport = createWindsurfLsTransport(endpoint);
+            const transport = makeTransport(endpoint);
             try {
                 await transport("Heartbeat");
-                return endpoint;
             } catch {
                 continue;
             }
+            const key = `${endpoint.pid}:${endpoint.port}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            endpoints.push(endpoint);
+            // 同一进程多端口只保留第一个 Heartbeat 通的（与原 discoverWindsurfLsEndpoint 语义一致）
+            break;
         }
     }
-    return undefined;
+    return endpoints;
 }
 
-let cachedEndpoint: { endpoint: WindsurfLsEndpoint; cachedAt: number } | null = null;
+/** 端点池短缓存（替换旧的全局单一 cachedEndpoint，见失败路径 ⑤） */
+let cachedEndpointPool: { endpoints: WindsurfLsEndpoint[]; cachedAt: number } | null = null;
 const ENDPOINT_CACHE_TTL_MS = 30_000;
 
-async function getWindsurfEndpoint(): Promise<WindsurfLsEndpoint | undefined> {
+/** 测试注入：替换端点发现（返回固定端点池，离线 mock 不依赖真实 WSF） */
+let endpointResolverOverride: (() => Promise<WindsurfLsEndpoint[]>) | null = null;
+/** 测试注入：替换 transport 工厂（按 endpoint 返回桩 transport） */
+let transportFactoryOverride: ((endpoint: WindsurfLsEndpoint) => WindsurfLsTransport) | null = null;
+
+/** 内部统一 transport 构造入口（受测试工厂覆盖）。导出供路由大脑构造 WSF endpoint 复用，
+ *  使 __setWindsurfTransportFactoryForTest 注入对路由广播同样生效。 */
+export function makeWindsurfTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
+    return transportFactoryOverride ? transportFactoryOverride(endpoint) : createWindsurfLsTransport(endpoint);
+}
+
+/** 内部别名（保持原有调用点不变） */
+function makeTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
+    return makeWindsurfTransport(endpoint);
+}
+
+/**
+ * 测试专用：注入端点解析器（返回固定端点池）。传 null 还原真实发现。生产代码不调用。
+ */
+export function __setWindsurfEndpointResolverForTest(fn: (() => Promise<WindsurfLsEndpoint[]>) | null): void {
+    endpointResolverOverride = fn;
+    cachedEndpointPool = null;
+}
+
+/**
+ * 测试专用：注入 transport 工厂（按 endpoint 返回桩 transport）。传 null 还原真实工厂。
+ */
+export function __setWindsurfTransportFactoryForTest(fn: ((endpoint: WindsurfLsEndpoint) => WindsurfLsTransport) | null): void {
+    transportFactoryOverride = fn;
+}
+
+/**
+ * 测试专用：重置端点池短缓存（避免跨用例污染）。
+ */
+export function __resetWindsurfEndpointCacheForTest(): void {
+    cachedEndpointPool = null;
+}
+
+/** 获取端点池（带短缓存） */
+async function getWindsurfEndpointPool(): Promise<WindsurfLsEndpoint[]> {
     const now = Date.now();
-    if (cachedEndpoint && now - cachedEndpoint.cachedAt < ENDPOINT_CACHE_TTL_MS) {
-        return cachedEndpoint.endpoint;
+    if (cachedEndpointPool && now - cachedEndpointPool.cachedAt < ENDPOINT_CACHE_TTL_MS) {
+        return cachedEndpointPool.endpoints;
     }
-    const endpoint = await discoverWindsurfLsEndpoint();
-    cachedEndpoint = endpoint ? { endpoint, cachedAt: now } : null;
-    return endpoint;
+    const endpoints = await discoverAllWindsurfLsEndpoints();
+    cachedEndpointPool = endpoints.length ? { endpoints, cachedAt: now } : null;
+    return endpoints;
 }
 
 export async function isWindsurfStoreAvailable(): Promise<boolean> {
-    return Boolean(await getWindsurfEndpoint());
+    return (await getWindsurfEndpointPool()).length > 0 || readWindsurfSubagentJobs().size > 0;
 }
 
-async function defaultTransport(): Promise<WindsurfLsTransport | undefined> {
-    const endpoint = await getWindsurfEndpoint();
-    return endpoint ? createWindsurfLsTransport(endpoint) : undefined;
-}
 
 export function createWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
     return async (method: string, payload: Record<string, unknown> = {}) => {
@@ -466,6 +662,7 @@ export function createWindsurfLsTransport(endpoint: WindsurfLsEndpoint): Windsur
 export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConversationSummary[] {
     const root = asRecord(response);
     const summaries = root.trajectorySummaries;
+    const subagentJobs = readWindsurfSubagentJobs();
     const entries = Array.isArray(summaries)
         ? summaries.map((info, index) => [asRecord(info).cascadeId || asRecord(info).trajectoryId || String(index), info] as const)
         : Object.entries(asRecord(summaries));
@@ -476,6 +673,8 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
         const rawSummary = toStringValue(record.summary).trim();
         const rawTitle = toStringValue(record.title).trim();
         const renamedTitle = toStringValue(record.renamedTitle).trim();
+        const job = subagentJobs.get(id);
+        const titleBestEffort = (toStringValue(record.title_best_effort) || toStringValue(record.titleBestEffort) || job?.titleBestEffort || "").trim();
         const summary = rawSummary || rawTitle || "Untitled WSF Cascade";
         const title = renamedTitle || summary;
         const titleSource: WindsurfConversationSummary["titleSource"] = renamedTitle
@@ -487,20 +686,29 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
                     : "fallback";
         const workspaceUris = extractWorkspaceUrisFromRecord(record);
         const referencedFiles = extractReferencedFilesFromRecord(record);
+        const parentConversationId = job?.mainId || null;
+        const subagentMarkerTitle = [titleBestEffort, renamedTitle, rawTitle, rawSummary].find(isWindsurfSubagentTitle) || "";
+        const isChildThread = Boolean(parentConversationId) || Boolean(subagentMarkerTitle);
+        const subagentRole = job?.label || windsurfSubagentRoleFromTitle(subagentMarkerTitle) || (isChildThread ? "windsurf-subagent" : null);
         return {
             id,
             cascadeId: id,
             trajectoryId: toStringValue(record.trajectoryId) || undefined,
             title,
             renamedTitle: renamedTitle || undefined,
+            titleBestEffort: titleBestEffort || undefined,
             titleSource,
+            isChildThread,
+            parentConversationId,
+            agentRole: subagentRole,
+            agentNickname: subagentMarkerTitle || undefined,
             summary,
             stepCount: toNumberValue(record.stepCount),
             createdTime: toStringValue(record.createdTime) || undefined,
             lastModifiedTime: toStringValue(record.lastModifiedTime) || undefined,
-            status: toStringValue(record.status) || undefined,
+            status: toStringValue(record.status) || job?.state || undefined,
             trajectoryType: toStringValue(record.trajectoryType) || undefined,
-            lastGeneratorModelUid: toStringValue(record.lastGeneratorModelUid) || undefined,
+            lastGeneratorModelUid: toStringValue(record.lastGeneratorModelUid) || job?.model || undefined,
             cwd: workspaceUris[0] || extractWorkspaceFromRecord(record),
             workspaceUris: workspaceUris.length ? workspaceUris : undefined,
             referencedFiles: referencedFiles.length ? referencedFiles : undefined,
@@ -516,10 +724,98 @@ export async function listWindsurfConversations(transport: WindsurfLsTransport):
     return normalizeWindsurfTrajectoryList(await transport("GetAllCascadeTrajectories"));
 }
 
+function windsurfSummaryFromSubagentJob(
+    job: WindsurfSubagentJobInfo,
+    parent?: WindsurfConversationSummary,
+): WindsurfConversationSummary {
+    const titleBestEffort = job.titleBestEffort || (job.label ? `[subagent] ${job.label}` : "[subagent] Windsurf subagent");
+    const label = job.label || windsurfSubagentRoleFromTitle(titleBestEffort) || "windsurf-subagent";
+    return {
+        id: job.subCid,
+        cascadeId: job.subCid,
+        title: titleBestEffort,
+        titleBestEffort,
+        titleSource: "titleBestEffort",
+        isChildThread: true,
+        parentConversationId: job.mainId,
+        agentRole: label,
+        agentNickname: titleBestEffort,
+        summary: titleBestEffort,
+        stepCount: job.resultStepCount || 0,
+        createdTime: job.createdAt,
+        lastModifiedTime: job.updatedAt || job.completedAt || job.createdAt,
+        status: job.state,
+        lastGeneratorModelUid: job.model,
+        cwd: parent?.cwd,
+        workspaceUris: parent?.workspaceUris,
+        referencedFiles: parent?.referencedFiles,
+    };
+}
+
+/**
+ * 判定某 GetAllCascadeTrajectories 响应是否包含指定 cascadeId（供路由大脑 holds 判定）。
+ * 复用 normalizeWindsurfTrajectoryList，summaries 数组/对象两形态均判对。
+ */
+export function windsurfListContainsId(data: unknown, cascadeId: string): boolean {
+    if (!cascadeId) return false;
+    const summaries = normalizeWindsurfTrajectoryList(data);
+    return summaries.some(item => item.id === cascadeId || item.cascadeId === cascadeId);
+}
+
+/**
+ * 列出近期 WSF 对话：跨「全部」活跃 WSF LS 端点聚合去重（同 cascadeId 取 stepCount 最大），
+ * 修「list 只看一个窗口」（失败路径 ④ 连带）。
+ */
 export async function listRecentWindsurfThreads(limit = 50): Promise<WindsurfConversationSummary[]> {
-    const transport = await defaultTransport();
-    if (!transport) return [];
-    return (await listWindsurfConversations(transport)).slice(0, Math.max(0, limit));
+    const endpoints = await getWindsurfEndpointPool();
+
+    const merged = new Map<string, WindsurfConversationSummary>();
+    const lists = endpoints.length
+        ? await Promise.all(endpoints.map(async ep => {
+            try {
+                return await listWindsurfConversations(makeTransport(ep));
+            } catch {
+                return [] as WindsurfConversationSummary[];
+            }
+        }))
+        : [];
+
+    for (const list of lists) {
+        for (const item of list) {
+            const existing = merged.get(item.id);
+            if (!existing || (item.stepCount || 0) > (existing.stepCount || 0)) {
+                merged.set(item.id, item);
+            }
+        }
+    }
+
+    for (const job of readWindsurfSubagentJobs().values()) {
+        const parent = merged.get(job.mainId);
+        const existing = merged.get(job.subCid);
+        const synthesized = windsurfSummaryFromSubagentJob(job, parent);
+        if (existing) {
+            merged.set(job.subCid, {
+                ...existing,
+                titleBestEffort: existing.titleBestEffort || synthesized.titleBestEffort,
+                isChildThread: true,
+                parentConversationId: existing.parentConversationId || job.mainId,
+                agentRole: existing.agentRole || synthesized.agentRole,
+                agentNickname: existing.agentNickname || synthesized.agentNickname,
+                status: existing.status || synthesized.status,
+                lastGeneratorModelUid: existing.lastGeneratorModelUid || synthesized.lastGeneratorModelUid,
+            });
+        } else {
+            merged.set(job.subCid, synthesized);
+        }
+    }
+
+    return Array.from(merged.values())
+        .sort((left, right) => {
+            const leftTime = Date.parse(left.lastModifiedTime || left.createdTime || "");
+            const rightTime = Date.parse(right.lastModifiedTime || right.createdTime || "");
+            return (Number.isFinite(rightTime) ? rightTime : 0) - (Number.isFinite(leftTime) ? leftTime : 0);
+        })
+        .slice(0, Math.max(0, limit));
 }
 
 export async function resolveWindsurfThreadId(input: string): Promise<string | null> {
@@ -538,6 +834,62 @@ function extractSteps(response: unknown): unknown[] {
     if (Array.isArray(record.trajectorySteps)) return record.trajectorySteps;
     if (Array.isArray(record.cascadeTrajectorySteps)) return record.cascadeTrajectorySteps;
     return [];
+}
+
+function extractStepsFromNestedPreview(value: unknown, depth = 0): unknown[] {
+    if (depth > 5 || value == null) return [];
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if (!trimmed) return [];
+        try {
+            return extractStepsFromNestedPreview(JSON.parse(trimmed), depth + 1);
+        } catch {
+            return [];
+        }
+    }
+    const direct = extractSteps(value);
+    if (direct.length > 0) return direct;
+    const record = asRecord(value);
+    for (const key of ["result_preview", "resultPreview", "result", "payload", "data", "response"]) {
+        const nested = record[key];
+        const steps = extractStepsFromNestedPreview(nested, depth + 1);
+        if (steps.length > 0) return steps;
+    }
+    return [];
+}
+
+function readWindsurfSubagentArchive(job: WindsurfSubagentJobInfo): unknown | null {
+    if (!job.archivePath) return null;
+    try {
+        const parsed = JSON.parse(fs.readFileSync(job.archivePath, "utf8"));
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function windsurfSubagentJobSteps(job: WindsurfSubagentJobInfo): unknown[] {
+    const archived = readWindsurfSubagentArchive(job);
+    const archiveSteps = extractStepsFromNestedPreview(archived);
+    if (archiveSteps.length > 0) return archiveSteps;
+    return extractStepsFromNestedPreview(job.resultPreview);
+}
+
+function loadWindsurfSubagentJobConversation(cascadeId: string): WindsurfConversationReadResult | null {
+    const job = readWindsurfSubagentJobs().get(cascadeId);
+    if (!job) return null;
+    const steps = windsurfSubagentJobSteps(job);
+    const thread = windsurfSummaryFromSubagentJob(job);
+    return {
+        cascadeId: job.subCid,
+        thread,
+        steps,
+        rounds: windsurfStepsToConversationRounds(steps),
+        pagesRead: steps.length > 0 ? 1 : 0,
+        totalSteps: Math.max(steps.length, job.resultStepCount || 0),
+        skippedSteps: [],
+        partial: steps.length === 0 && Boolean(job.resultStepCount),
+    };
 }
 
 function nextOffsetFromResponse(response: unknown, currentOffset: number, pageLength: number): number {
@@ -669,25 +1021,100 @@ export async function readWindsurfConversation(
     };
 }
 
+/**
+ * 用持有者 endpoint 的 list 给 read 结果补 thread 摘要（标题/stepCount/workspace 等）。
+ */
+async function enrichThreadSummary(
+    result: WindsurfConversationReadResult,
+    transport: WindsurfLsTransport,
+    resolvedId: string,
+): Promise<void> {
+    try {
+        const summaries = await listWindsurfConversations(transport);
+        const summary = summaries.find(item => item.id === resolvedId || item.cascadeId === resolvedId);
+        if (summary) {
+            result.thread = summary;
+            result.totalSteps = Math.max(result.totalSteps, summary.stepCount || 0);
+        } else {
+            const job = readWindsurfSubagentJobs().get(resolvedId);
+            if (job) {
+                result.thread = windsurfSummaryFromSubagentJob(job);
+                result.totalSteps = Math.max(result.totalSteps, job.resultStepCount || 0);
+            }
+        }
+    } catch { /* 摘要补全失败不影响正文 */ }
+}
+
+/**
+ * 本地兜底空壳：活跃 LS 都不持有但本地 .pb 存在 → partial:true 明确提示（失败路径 ⑥-a）。
+ * 本地无 .pb → 返回 null（对话确实不存在）。
+ */
+function localFallbackResult(cascadeId: string): WindsurfConversationReadResult | null {
+    if (!windsurfCascadeExistsLocally(cascadeId)) return null;
+    return {
+        cascadeId,
+        thread: {
+            id: cascadeId,
+            cascadeId,
+            title: cascadeId,
+            summary: "当前没有持有此 WSF 对话的活跃 Windsurf 窗口（对话曾存在于本地，可能窗口已关闭）。请重新打开对应 Windsurf 窗口后重试。",
+            stepCount: 0,
+        },
+        steps: [],
+        rounds: [],
+        pagesRead: 0,
+        totalSteps: 0,
+        partial: true,
+    };
+}
+
+/**
+ * 薄壳化：先问路由大脑要「已验证持有该对话」的 endpoint，再用它的 transport 读正文。
+ *   - 读空且 stepCount>0 → 映射可能粘错，invalidate + 换持有者重试一次。
+ *   - 全不持有 + 本地有 .pb → localFallbackResult(partial:true) 明确提示。
+ *   - 全不持有 + 本地无 .pb → null。
+ */
 export async function loadWindsurfConversation(cascadeId: string): Promise<WindsurfConversationReadResult | null> {
-    const transport = await defaultTransport();
-    if (!transport) return null;
-    const summaries = await listWindsurfConversations(transport);
     const resolvedId = await resolveWindsurfThreadId(cascadeId) || cascadeId;
-    const result = await readWindsurfConversation(transport, resolvedId);
-    const summary = summaries.find(item => item.id === resolvedId || item.cascadeId === resolvedId);
-    if (summary) {
-        result.thread = summary;
-        result.totalSteps = Math.max(result.totalSteps, summary.stepCount || 0);
+
+    const attempt = async (): Promise<{ result: WindsurfConversationReadResult | null; endpoint: RouterEndpoint | null; stepCount: number }> => {
+        const resolved = await resolveEndpointForConversation(resolvedId, "windsurf");
+        if (!resolved.endpoint) {
+            return { result: null, endpoint: null, stepCount: resolved.stepCount };
+        }
+        const transport: WindsurfLsTransport = (method, payload = {}) => resolved.endpoint!.transport(method, payload);
+        const result = await readWindsurfConversation(transport, resolvedId);
+        await enrichThreadSummary(result, transport, resolvedId);
+        return { result, endpoint: resolved.endpoint, stepCount: resolved.stepCount };
+    };
+
+    let { result, endpoint, stepCount } = await attempt();
+
+    // 读空且权威 stepCount>0 → 映射可能粘到滞后/错误 LS，剔除后换持有者重试一次。
+    // S1 修复：守卫看真实正文量 result.steps.length，而非被 enrichThreadSummary 用 summary.stepCount
+    // 抬高过的 result.totalSteps（否则守卫永不成立 → 重试失效 + 空壳冒充成功）。
+    // `&& stepCount > 0` 保留：区分「合法空对话 stepCount=0」与「desync 读空 stepCount>0」。
+    if (endpoint && result && result.steps.length === 0 && stepCount > 0) {
+        invalidateMapping(resolvedId, "windsurf");
+        ({ result, endpoint, stepCount } = await attempt());
     }
-    return result;
+
+    if (endpoint && result) {
+        return result;
+    }
+
+    const subagentJobResult = loadWindsurfSubagentJobConversation(resolvedId);
+    if (subagentJobResult) return subagentJobResult;
+
+    // 无持有者：本地兜底（partial 空壳）或 null。
+    return localFallbackResult(resolvedId);
 }
 
 function extractUserText(userInput: Record<string, any>): string {
-    const chunks: string[] = [];
     const direct = toStringValue(userInput.userResponse).trim();
-    if (direct) chunks.push(direct);
+    if (direct) return direct;
 
+    const chunks: string[] = [];
     for (const item of asArray(userInput.items)) {
         const text = toStringValue(asRecord(item).text).trim();
         if (text && !chunks.includes(text)) chunks.push(text);
@@ -731,6 +1158,7 @@ function buildImageAttachment(image: unknown, stepIndex: number, imageIndex: num
         name,
         mimeType,
         sizeBytes: estimateBase64Bytes(base64),
+        stepIndex,
     };
 
     if (base64) {

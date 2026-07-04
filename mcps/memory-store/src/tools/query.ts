@@ -52,8 +52,22 @@ export function registerQuery(server: McpServer): void {
             after: z.string().optional().describe("时间过滤：只返回此时间之后更新的记忆（ISO格式或 YYYY-MM-DD）"),
             before: z.string().optional().describe("时间过滤：只返回此时间之前更新的记忆（ISO格式或 YYYY-MM-DD）"),
             limit: z.number().optional().describe("返回条数，默认 10"),
+            // ===== EP-S 分层置信度 / AND-OR（全 optional，纯字符串 query 零感知）=====
+            tiers: z.object({
+                high: z.array(z.string()).optional().describe("高置信词（默认权重 2.0）"),
+                med: z.array(z.string()).optional().describe("中置信词（基准权重 1.0）"),
+                low: z.array(z.string()).optional().describe("低置信词（默认权重 0.3，微弱加分）"),
+                required: z.array(z.string()).optional().describe("必含词（硬 AND 过滤，等价 query 里 +词）"),
+                exclude: z.array(z.string()).optional().describe("排除词（硬过滤，等价 query 里 -词）"),
+            }).optional().describe("分层置信度结构化输入；与 query 行内 +/-/^ 合流，同词取高优先档"),
+            tierWeights: z.object({
+                high: z.number().optional(),
+                med: z.number().optional(),
+                low: z.number().optional(),
+            }).optional().describe("覆盖各置信层的 default 权重"),
+            parseInline: z.boolean().optional().describe("是否解析 query 行内 +/-/^/AND/OR/NOT 操作符，默认 true"),
         },
-        async ({ query, grep, scope, workspace, depth, mode, chain, modelChain, tags, category, after, before, limit }) => {
+        async ({ query, grep, scope, workspace, depth, mode, chain, modelChain, tags, category, after, before, limit, tiers, tierWeights, parseInline }) => {
             touchActivity();
             const startTime = Date.now();
 
@@ -147,12 +161,14 @@ export function registerQuery(server: McpServer): void {
                             mode: "auto",
                             limit: maxResults,
                             modelChain: chains.modelChain,
+                            tiers, tierWeights, parseInline,
                         });
                         if (engineResults.length === 0) {
                             engineResults = await engineSearch(blocks, query, {
                                 mode: "smart",
                                 limit: maxResults,
                                 modelChain: chains.modelChain,
+                                tiers, tierWeights, parseInline,
                             });
                         }
                         results = engineResults.map(sr => ({
@@ -177,6 +193,7 @@ export function registerQuery(server: McpServer): void {
                                 mode: requestedMode,
                                 limit: maxResults,
                                 modelChain: chains.modelChain,
+                                tiers, tierWeights, parseInline,
                             });
                             results = engineResults.map(sr => ({
                                 entry: entries.find(e => e.id === sr.id)!,

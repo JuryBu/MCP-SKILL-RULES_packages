@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.13.4
+ * MCP Sandbox Server v1.13.7
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -11,6 +11,7 @@
  *   - sandbox_status: 查看系统状态（环境、GPU、资源、会话）
  *   - sandbox_codex: Codex CLI 专用调用（后台模式、报告检查、进程树清理）
  *   - sandbox_launch: 长任务脱离执行（模型训练、大规模数据处理，进程独立于 MCP）
+ *   - smart_search: 三模式代码搜索（exact/fuzzy/smart，支持后台与模型链路）
  *   - sandbox_council: 多模型审议（主持模型控节奏、有限工具、讨论副本落盘）
  */
 
@@ -38,7 +39,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.13.4",
+    version: "1.13.7",
 });
 
 // 注册所有 8 个工具
@@ -63,7 +64,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.13.4 使用指南
+                text: `# MCP Sandbox v1.13.7 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -431,18 +432,21 @@ Antigravity 常用别名:
 - v1.13.2 Windsurf/WSF MCP 客户端兼容：文档与 schema 说明 WSF 只通过 HTTP broker 调用 sandbox，不新增 modelChain/provider；新增 WSF 配置与验证文档
 - v1.13.3 Codex 模型桥稳定性：smart_search(modelChain="codex") 默认使用低 reasoning 快速首选，并在可重试错误时按 gpt-5.5 low → gpt-5.4 low → gpt-5.4-mini low 降级；sandbox_codex 因可能有副作用，不默认自动重试
 - v1.13.4 修复 sandbox_exec code/command 互斥校验：原 === undefined 判定会把客户端传入的空串 "" 误算成"已提供"，触发"必须二选一"错误；现改为非空判定（length > 0），空串归一为 undefined 往下传，顺手统一 handler/executor 两层口径。新增 npm run test:exec-mutex 5 用例锁回归。详见 plans/Plan_9_fix_exec_mutex/
-- webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，拒绝 localhost / 私有地址
+- v1.13.5 修复 webFetchText redirect SSRF：direct backend 改为 redirect:"manual" 并对每一跳重新做公网校验，公网 URL 302 到 localhost/私网会被拒绝；显式 backend=exa / backend=webFetcher 在未证明逐跳私网校验前暂停。同步修复 Codex CLI 启动面，sandbox_codex 与 Codex model bridge 改为 spawn(..., {shell:false}) raw argv，并新增 npm run test:ssrf-redirect / npm run test:shell-injection。
+- v1.13.6 修复 batch/executor/exec 互斥一致性、Antigravity LS detailed 错误与 wall-clock 超时、launch cwd 预校验、wrapper spawn error 失败落盘，以及 command 模式 descendant tree 内存汇总。新增 npm run test:batch-mutex / test:council-antigravity / test:launch-cwd。
+- v1.13.7 清理 Plan_12 P2/P3 设计风险：smart_search ESM 下改用 shellless spawnSync 探测 rg；background 超时向 runner/model bridge/provider 传播 AbortSignal 并清理 Codex 子进程；sandbox_launch registry 改为 per-task 文件并兼容 legacy registry.json tombstone；sandbox_session 总内存改为按 maxMemoryMB 额度预留；stderr 截断时 tempFile 保留 stdout/stderr 完整原文；缺失图片文件走 unreadable stub；同步修正 guide/status 文档。新增 npm run test:smart-search-rg / test:background-abort / test:session-memory-reservation / test:exec-stderr-tempfile / test:council-missing-image。
+- webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，默认走 sandbox direct 安全路径，手动跟随重定向并逐跳拒绝 localhost / 私有地址；显式 backend=exa/webFetcher 暂停，待补等价逐跳私网校验证明后再恢复
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
 - v1.11 诊断：识别常见输出截断/安全拦截信号；主持模型非 JSON 输出会在摘要中显式标记为兜底处理
 
-## stage_guard — 任务完整性验证
+## 外部配套：stage_guard
 
-⚠️ 项目有 Plan_x + Task.md 时，每个 Stage 必须使用 Guard:
+stage_guard 属于 memory-store / broker 提供的阶段完整性验证工具，不是本 sandbox MCP 自身注册的工具。项目有 Plan_x + Task.md 时仍建议配套使用：
 - Stage 开始前: stage_guard(action="start", taskFiles=[...], planFiles=[...])
-- Stage 完成后: stage_guard(action="check") — Flash 自动比对，通过才能标记完成
+- Stage 完成后: stage_guard(action="check") — 自动比对，通过后再标记完成
 - 连续 3 次 check 未通过必须上报用户
-- 如认为 Flash 误判，可传入 appealNote 说明理由
+- 如认为检查误判，可传入 appealNote 说明理由
 - 建议 start 时传 stageId（如 "Stage 3"）聚焦检查范围`,
                 mimeType: "text/plain",
             },
@@ -522,7 +526,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.13.4 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.13.7 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -544,7 +548,7 @@ console.error(`[sandbox] MCP Server v1.13.4 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.13.4 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.13.7 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

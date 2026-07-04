@@ -24,7 +24,7 @@ action:
 - overview (默认): 系统资源 + 活跃会话 + 临时文件
 - envs: 可用语言环境列表（Python/Node/conda/bash）
 - gpu: GPU/CUDA/DirectML 详细信息
-- gc: 清理临时文件 + 关闭空闲会话`,
+- gc: 清理过期临时文件；空闲会话由 idle checker 自动关闭`,
         StatusParamsSchema.shape,
         async (params) => {
             const startTime = Date.now();

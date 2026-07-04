@@ -45,7 +45,7 @@ function cleanupTasks(): void {
 
 export function startBackgroundTask(
     kind: string,
-    run: (progress: BackgroundTaskProgress) => Promise<string>,
+    run: (progress: BackgroundTaskProgress, signal: AbortSignal) => Promise<string>,
     options: StartBackgroundTaskOptions = {},
 ): BackgroundTask {
     cleanupTasks();
@@ -64,6 +64,7 @@ export function startBackgroundTask(
     };
     tasks.set(task.id, task);
 
+    const abortController = new AbortController();
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
 
@@ -83,10 +84,11 @@ export function startBackgroundTask(
 
     if (maxRunMs) {
         timeoutTimer = setTimeout(() => {
+            abortController.abort(new Error(`后台任务超过最大运行时间 ${maxRunMs}ms，已取消底层任务`));
             settle({
                 status: "error",
                 timedOut: true,
-                error: `后台任务超过最大运行时间 ${maxRunMs}ms，已一次性结算为超时`,
+                error: `后台任务超过最大运行时间 ${maxRunMs}ms，已取消底层任务`,
             });
         }, maxRunMs);
         timeoutTimer.unref?.();
@@ -94,7 +96,7 @@ export function startBackgroundTask(
 
     void (async () => {
         try {
-            const result = await run(updateProgress);
+            const result = await run(updateProgress, abortController.signal);
             settle({ status: "done", result });
         } catch (err) {
             settle({

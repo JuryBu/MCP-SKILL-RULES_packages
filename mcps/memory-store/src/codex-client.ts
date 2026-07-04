@@ -121,7 +121,8 @@ const CODEX_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CODEX_JSONL_M
 const CODEX_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CODEX_TEXT_FIELD_MAX_CHARS || 200_000);
 const CODEX_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CODEX_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS || 12_000);
-const CODEX_AGENTS_HEADER = "# AGENTS.md instructions for ";
+const CODEX_AGENTS_HEADER_PREFIX = "# AGENTS.md instructions";
+const CODEX_AGENTS_HEADER_LEGACY = "# AGENTS.md instructions for ";
 const CODEX_AGENTS_FOLDED_MARKER = "[Codex AGENTS/RULES 注入已折叠";
 const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu;
 
@@ -518,14 +519,19 @@ function sha256Short(text: string): string {
 }
 
 function getCodexAgentsInstructionsBlock(text: string): { block: string; rest: string; agentsPath: string } | null {
-    if (!text.startsWith(CODEX_AGENTS_HEADER)) return null;
+    // Support both legacy format ("# AGENTS.md instructions for /path")
+    // and new format ("# AGENTS.md instructions" without path suffix)
+    if (!text.startsWith(CODEX_AGENTS_HEADER_PREFIX)) return null;
     const endMarker = "</INSTRUCTIONS>";
     const endIndex = text.indexOf(endMarker);
     if (endIndex < 0) return null;
     const beforeEnd = text.slice(0, endIndex);
     if (!beforeEnd.includes("<INSTRUCTIONS>")) return null;
     const firstLine = text.split(/\r?\n/u, 1)[0] || "";
-    const agentsPath = firstLine.slice(CODEX_AGENTS_HEADER.length).trim() || "(unknown)";
+    // Extract path from legacy header; new format has no path
+    const agentsPath = firstLine.startsWith(CODEX_AGENTS_HEADER_LEGACY)
+        ? firstLine.slice(CODEX_AGENTS_HEADER_LEGACY.length).trim() || "(unknown)"
+        : "(unknown)";
     const blockEnd = endIndex + endMarker.length;
     return {
         block: text.slice(0, blockEnd),
@@ -1473,7 +1479,7 @@ export function buildCodexRoundsForTest(
             if (payload.role === "user") {
                 pushCurrent();
                 roundIndex += 1;
-                const attachments = extractCodexMessageAttachments(payload.content || [], text, { cwd: options.cwd });
+                const attachments = extractCodexMessageAttachments(payload.content || [], text, { cwd: options.cwd, stepIndex: syntheticStep });
                 currentRound = {
                     roundIndex,
                     startStep: syntheticStep,
@@ -1503,7 +1509,7 @@ export function buildCodexRoundsForTest(
 
         if (type === "event_msg" && payload.type === "user_message") {
             const text = truncateCodexTextField(extractEventMessageText(payload), "user_message");
-            const attachments = extractCodexEventUserAttachments(payload, { cwd: options.cwd });
+            const attachments = extractCodexEventUserAttachments(payload, { cwd: options.cwd, stepIndex: syntheticStep });
             const normalized = normalizeProbeText(text);
             const currentNormalized = currentRound ? normalizeProbeText(currentRound.userMessage) : "";
             if (

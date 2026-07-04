@@ -13,6 +13,21 @@ import { callModelResponse } from "./model-bridge.js";
 import { resolveChainSplit, type Chain, type ChainInput, type DataChainInput } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 import { getSmartCache, setSmartCache } from "./smart-cache.js";
+import {
+    parseQuery,
+    type ParsedQuery,
+    type QueryTerm,
+    type TierInput,
+    type TierWeightsInput,
+} from "./query-parser.js";
+import {
+    buildIdfTable,
+    weightedCoverage,
+    dynamicCutoffCount,
+    fuzzyMinScore,
+    fuzzyMustSim,
+    type IdfTable,
+} from "./relevance-scoring.js";
 
 // ============= 召回/排序可调常量（E2-B1） =============
 // 影响召回松紧与排序的硬编码数集中提成 env 可调常量。
@@ -78,6 +93,47 @@ export interface SearchOptions {
     chain?: ChainInput;     // 兼容旧参数：未指定 modelChain 时作为模型链路
     dataChain?: DataChainInput; // 入口兼容字段；通用搜索引擎本身不读取外部数据
     modelChain?: ChainInput;// smart 模式模型链路
+    // ===== EP-S 新增（全 optional，纯字符串调用零感知）=====
+    tiers?: TierInput;            // 分层/必含/排除（痛点 a+c）
+    tierWeights?: TierWeightsInput; // 覆盖各层 default 权重
+    parseInline?: boolean;       // 是否解析行内 +/-/^/AND/OR/NOT 操作符，默认 true
+}
+
+/** 把 SearchOptions 的 EP-S 字段收敛成 parseQuery 的入参。 */
+function epsParseOpts(opts: {
+    tiers?: TierInput;
+    tierWeights?: TierWeightsInput;
+    parseInline?: boolean;
+}) {
+    return {
+        tiers: opts.tiers,
+        tierWeights: opts.tierWeights,
+        parseInline: opts.parseInline,
+    };
+}
+
+/** must term 对单文档的命中判定（CJK 两档：整串子串命中；整串召不到回退 bigram 覆盖率≥0.7 软命中）。
+ *  短语强制整串相邻（即整 raw 子串），关 bigram 回退。 */
+function mustTermHits(term: QueryTerm, fullLower: string): boolean {
+    // 整串（raw）命中：最稳妥，短语只走这一档。
+    if (fullLower.includes(term.raw)) return true;
+    if (term.isPhrase) return false;
+    // 非短语回退：bigram 子 token 覆盖率 ≥ 0.7 视为软命中（容错局部错字/语序）。
+    const subs = term.tokens.filter(t => t !== term.raw);
+    if (subs.length === 0) return false; // 无 bigram（英文整词）→ 整串没中就是没中
+    let hit = 0;
+    for (const s of subs) if (fullLower.includes(s)) hit++;
+    return hit / subs.length >= 0.7;
+}
+
+/** mustNot 命中判定（从严：仅整串 raw 子串命中即排除，不用 bigram 回退避免误伤）。 */
+function mustNotTermHits(term: QueryTerm, fullLower: string): boolean {
+    return fullLower.includes(term.raw);
+}
+
+/** 该 ParsedQuery 是否带任何硬过滤/结构化输入（决定是否走新加权 pipeline）。 */
+function hasAdvancedQuery(parsed: ParsedQuery): boolean {
+    return !parsed.isPlain;
 }
 
 // ============= exact 模式 =============
@@ -128,8 +184,23 @@ const EXACT_SHORT_SINGLE_WORD_MAX_CHARS = 3;
 export function searchExact(
     blocks: TextBlock[],
     query: string,
-    opts: { limit?: number; contextLines?: number },
+    opts: {
+        limit?: number;
+        contextLines?: number;
+        tiers?: TierInput;
+        tierWeights?: TierWeightsInput;
+        parseInline?: boolean;
+    } = {},
 ): SearchResult[] {
+    // EP-S：先解析。isPlain（纯空格、无操作符、无结构化输入）→ 走旧逻辑快路径，行为字节级等价。
+    const parsed = parseQuery(query, epsParseOpts(opts));
+    // 三桶全空（纯空白 query 或纯无效操作符）→ 对齐旧 `tokens.length===0` 返回空。
+    if (parsed.must.length === 0 && parsed.should.length === 0 && parsed.mustNot.length === 0) return [];
+    if (hasAdvancedQuery(parsed)) {
+        return searchExactAdvanced(blocks, query, parsed, opts);
+    }
+
+    // ===== 以下为改造前的 exact 逻辑，isPlain 时一字不改（兼容锚点）=====
     // 切词与 fuzzy 共用一套（整词 + CJK 重叠 bigram，已去重并上限 32）
     const tokens = buildQueryTokens(query);
     if (tokens.length === 0) return [];
@@ -226,6 +297,112 @@ export function searchExact(
     return results.slice(0, opts.limit ?? 10);
 }
 
+/**
+ * EP-S exact 三阶段管线（含操作符/结构化输入时走此路径）。
+ *   阶段① 硬过滤：must 全命中（CJK 两档）且不含任何 mustNot。
+ *   阶段② 软排序：should-only 加权覆盖率 + 加权行内共现，融合 0.7/0.3（系数不动）。
+ *   阶段③ 双闸截断：加权覆盖率 ≥ minCoverage（加权语义）+ 动态阈值砍噪声尾。
+ * should 为空（纯 +A +B）：score 恒 1.0，按 matches.length 二级排序。
+ */
+function searchExactAdvanced(
+    blocks: TextBlock[],
+    query: string,
+    parsed: ParsedQuery,
+    opts: { limit?: number; contextLines?: number },
+): SearchResult[] {
+    const ctx = opts.contextLines ?? 2;
+    const minCoverage = exactMinCoverage();
+    const limit = opts.limit ?? 10;
+
+    // should token 全集（构 IDF 表用）
+    const shouldTokensAll = parsed.should.flatMap(t => t.tokens);
+    const docTextsLower = blocks.map(b => b.content.toLowerCase());
+    const idfTable: IdfTable | null =
+        shouldTokensAll.length > 0 ? buildIdfTable(docTextsLower, shouldTokensAll) : null;
+
+    const collectMatches = (lines: string[], hitTokens: string[]): MatchDetail[] => {
+        const seenLine = new Set<number>();
+        const out: MatchDetail[] = [];
+        for (const token of hitTokens) {
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].toLowerCase().includes(token)) {
+                    if (!seenLine.has(i)) {
+                        seenLine.add(i);
+                        const ctxStart = Math.max(0, i - ctx);
+                        const ctxEnd = Math.min(lines.length - 1, i + ctx);
+                        out.push({
+                            lineNum: i + 1,
+                            line: lines[i],
+                            context: lines.slice(ctxStart, ctxEnd + 1).join("\n"),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        out.sort((a, b) => (a.lineNum ?? 0) - (b.lineNum ?? 0));
+        return out;
+    };
+
+    const scored: SearchResult[] = [];
+    for (const block of blocks) {
+        const lines = block.content.split(/\r?\n/);
+        const fullLower = block.content.toLowerCase();
+
+        // ── 阶段① 硬过滤 ──
+        let pass = true;
+        for (const m of parsed.must) {
+            if (!mustTermHits(m, fullLower)) { pass = false; break; }
+        }
+        if (!pass) continue;
+        for (const x of parsed.mustNot) {
+            if (mustNotTermHits(x, fullLower)) { pass = false; break; }
+        }
+        if (!pass) continue;
+
+        // ── 阶段② 软排序 ──
+        // should 为空（纯 must）：恒 1.0，仅用 must token 收集匹配行。
+        if (parsed.should.length === 0) {
+            const mustTokens = parsed.must.flatMap(t => t.tokens).filter(t => fullLower.includes(t));
+            const matches = collectMatches(lines, mustTokens.length > 0 ? mustTokens : parsed.must.map(t => t.raw));
+            scored.push({
+                id: block.id, title: block.title, score: 1.0,
+                matchType: "exact", matches, metadata: block.metadata,
+            });
+            continue;
+        }
+
+        const wc = weightedCoverage(parsed.should, idfTable, tok => fullLower.includes(tok));
+        // 阶段③ 闸一：加权覆盖率门槛（加权语义复用 minCoverage）
+        if (wc.coverage < minCoverage) continue;
+
+        // 加权行内共现：单行内命中 should token 的加权和 / weightedTotal（行内挤占质量信号）
+        let bestLineCoverage = 0;
+        if (wc.weightedTotal > 0) {
+            for (const line of lines) {
+                const lineLower = line.toLowerCase();
+                const lc = weightedCoverage(parsed.should, idfTable, tok => lineLower.includes(tok));
+                if (lc.coverage > bestLineCoverage) bestLineCoverage = lc.coverage;
+            }
+        }
+        const score = Math.min(1, wc.coverage * EXACT_SCORE_COVERAGE_WEIGHT + bestLineCoverage * EXACT_SCORE_LINE_WEIGHT);
+
+        const hitShouldTokens = shouldTokensAll.filter(t => fullLower.includes(t));
+        const matches = collectMatches(lines, hitShouldTokens);
+        if (matches.length === 0 && parsed.must.length === 0) continue; // 纯 should 但零匹配行
+        scored.push({
+            id: block.id, title: block.title, score,
+            matchType: "exact", matches, metadata: block.metadata,
+        });
+    }
+
+    scored.sort((a, b) => b.score - a.score || b.matches.length - a.matches.length);
+
+    // 阶段③ 闸二：动态截断（对最终 score 砍噪声尾）
+    const cutoff = dynamicCutoffCount(scored.map(r => r.score));
+    return scored.slice(0, Math.min(cutoff, limit));
+}
+
 // ============= fuzzy 模式 =============
 
 /**
@@ -237,9 +414,22 @@ export function searchExact(
 function searchFuzzy(
     blocks: TextBlock[],
     query: string,
-    opts: { limit?: number; threshold?: number },
+    opts: {
+        limit?: number;
+        threshold?: number;
+        tiers?: TierInput;
+        tierWeights?: TierWeightsInput;
+        parseInline?: boolean;
+    } = {},
 ): SearchResult[] {
     if (blocks.length === 0) return [];
+
+    // EP-S：isPlain → 旧逻辑快路径（一字不改）；advanced → 三阶段。
+    const parsed = parseQuery(query, epsParseOpts(opts));
+    if (parsed.must.length === 0 && parsed.should.length === 0 && parsed.mustNot.length === 0) return [];
+    if (hasAdvancedQuery(parsed)) {
+        return searchFuzzyAdvanced(blocks, query, parsed, opts);
+    }
 
     const entries = blocks.map(b => ({
         id: b.id,
@@ -290,6 +480,133 @@ function searchFuzzy(
 
     return scored.slice(0, limit).map(a => ({
         id: a.item.id,
+        title: a.item.title,
+        score: a.score,
+        matchType: "fuzzy" as SearchMode,
+        matches: [{ line: buildFuzzyMatchLine(a.item.preview, query) }],
+        metadata: a.item.metadata,
+    }));
+}
+
+/**
+ * EP-S fuzzy 三阶段（含操作符/结构化输入时）。
+ *   阶段① must/mustNot 是「模糊硬约束」：
+ *     - must term 须有 fuse 命中且相似度 ≥ 收紧阈值(fuzzyMustSim)；多 must 取交集（AND）。
+ *     - mustNot 模糊命中超阈 → 差集淘汰。
+ *   阶段② should 逐 token fuse，按 effWeight 加权累加（非计数）：
+ *       score = min(1, matchedWeight/weightedTotal)*0.7 + best*0.3
+ *   阶段③ FUZZY_MIN_SCORE 砍尾 + 动态截断。
+ *   must 交集为空 → 返回空（必含召不到就是空，不放宽不退化）。
+ */
+function searchFuzzyAdvanced(
+    blocks: TextBlock[],
+    query: string,
+    parsed: ParsedQuery,
+    opts: { limit?: number; threshold?: number },
+): SearchResult[] {
+    const limit = opts.limit ?? 10;
+    const entries = blocks.map(b => ({
+        id: b.id,
+        title: b.title,
+        tagsStr: (b.tags || []).join(" "),
+        preview: b.content.slice(0, 2000),
+        metadata: b.metadata,
+        block: b,
+    }));
+    const fuse = new Fuse(entries, {
+        keys: [
+            { name: "title", weight: 0.35 },
+            { name: "tagsStr", weight: 0.3 },
+            { name: "preview", weight: 0.35 },
+        ],
+        threshold: opts.threshold ?? FUZZY_DEFAULT_THRESHOLD,
+        ignoreLocation: true,
+        includeScore: true,
+    });
+    const perTermLimit = Math.max(FUZZY_PER_TERM_LIMIT_MIN, limit * 4);
+    const byId = new Map(entries.map(e => [e.id, e]));
+
+    /** 一个 term（按其整 raw）模糊命中的文档 id → 最佳相似度。 */
+    const fuzzyHitsFor = (raw: string): Map<string, number> => {
+        const out = new Map<string, number>();
+        for (const r of fuse.search(raw, { limit: perTermLimit }) as any[]) {
+            const sim = 1 - (r.score ?? 1);
+            const prev = out.get(r.item.id);
+            if (prev === undefined || sim > prev) out.set(r.item.id, sim);
+        }
+        return out;
+    };
+
+    // ── 阶段① must 交集（相似度 ≥ fuzzyMustSim）──
+    const mustSim = fuzzyMustSim();
+    let candidateIds: Set<string> | null = null;
+    for (const m of parsed.must) {
+        const hits = fuzzyHitsFor(m.raw);
+        const passing = new Set<string>();
+        for (const [id, sim] of hits) if (sim >= mustSim) passing.add(id);
+        if (candidateIds === null) {
+            candidateIds = passing;
+        } else {
+            const prev: Set<string> = candidateIds;
+            candidateIds = new Set([...prev].filter((id: string) => passing.has(id)));
+        }
+        if (candidateIds.size === 0) return []; // must 交集空 → 明确返回空，不放宽
+    }
+    // 无 must：候选为全集
+    if (candidateIds === null) candidateIds = new Set<string>(entries.map(e => e.id));
+
+    // ── 阶段① mustNot 差集 ──
+    for (const x of parsed.mustNot) {
+        const hits = fuzzyHitsFor(x.raw);
+        for (const [id, sim] of hits) if (sim >= mustSim) candidateIds.delete(id);
+    }
+    if (candidateIds.size === 0) return [];
+
+    // ── 阶段② should 加权聚合 ──
+    // should 为空（纯 must）：候选都恒 1.0，按 must 命中质量无差别，保留候选。
+    const docTextsLower = blocks.map(b => b.content.toLowerCase());
+    const shouldTokensAll = parsed.should.flatMap(t => t.tokens);
+    const idfTable: IdfTable | null =
+        shouldTokensAll.length > 0 ? buildIdfTable(docTextsLower, shouldTokensAll) : null;
+
+    // 每个 should token 的模糊命中 id→best 质量
+    const tokenHitQuality = new Map<string, Map<string, number>>();
+    if (parsed.should.length > 0) {
+        for (const tok of new Set(shouldTokensAll)) {
+            tokenHitQuality.set(tok, fuzzyHitsFor(tok));
+        }
+    }
+
+    const scoredAll: { id: string; item: any; score: number }[] = [];
+    for (const id of candidateIds) {
+        const item = byId.get(id)!;
+        if (parsed.should.length === 0) {
+            scoredAll.push({ id, item, score: 1.0 });
+            continue;
+        }
+        // 加权覆盖率：token 命中 = 该 token 的模糊命中集含此 id
+        let best = 0;
+        const wc = weightedCoverage(parsed.should, idfTable, tok => {
+            const hits = tokenHitQuality.get(tok);
+            if (hits && hits.has(id)) {
+                const q = hits.get(id)!;
+                if (q > best) best = q;
+                return true;
+            }
+            return false;
+        });
+        const score = Math.min(1, wc.coverage * FUZZY_SCORE_COVERAGE_WEIGHT + best * FUZZY_SCORE_BEST_WEIGHT);
+        scoredAll.push({ id, item, score });
+    }
+
+    // ── 阶段③ FUZZY_MIN_SCORE 砍尾 + 排序 + 动态截断 ──
+    const minScore = fuzzyMinScore();
+    const filtered = scoredAll.filter(s => s.score >= minScore);
+    filtered.sort((a, b) => b.score - a.score);
+    const cutoff = dynamicCutoffCount(filtered.map(s => s.score));
+
+    return filtered.slice(0, Math.min(cutoff, limit)).map(a => ({
+        id: a.id,
         title: a.item.title,
         score: a.score,
         matchType: "fuzzy" as SearchMode,
@@ -370,6 +687,13 @@ function buildSmartSnippet(block: TextBlock, query: string, maxChars = 900): str
     return parts.join("\n").slice(0, maxChars);
 }
 
+/**
+ * smart 缓存键内部字段分隔符：故意用 NUL 哨兵（U+0000）——它不可能出现在 query/limit/指纹里，
+ * 比空格更防字段拼接碰撞。务必用 String.fromCharCode 显式构造，不在源码写裸 NUL 字节
+ * （裸 NUL 会让 git/grep 把文件判为 binary，且 formatter 可能把它静默换成空格、破坏缓存键分隔）。
+ */
+const SMART_CACHE_KEY_SEP = String.fromCharCode(0);
+
 /** smart 缓存键：query + limit + 候选集指纹。指纹按 id:updatedAt 排序聚合——任一条目版本变化即失效（防脏读）；
  *  任一 block 缺 updatedAt 则返回 null（不缓存，宁可慢也不脏读）。 */
 export function buildSmartCacheKey(blocks: TextBlock[], query: string, limit: number): string | null {
@@ -381,13 +705,16 @@ export function buildSmartCacheKey(blocks: TextBlock[], query: string, limit: nu
     }
     parts.sort();
     const fingerprint = crypto.createHash("sha1").update(parts.join("|")).digest("hex");
-    return `${query} ${limit} ${fingerprint}`;
+    return `${query}${SMART_CACHE_KEY_SEP}${limit}${SMART_CACHE_KEY_SEP}${fingerprint}`;
 }
 
 async function searchSmart(
     blocks: TextBlock[],
     query: string,
-    opts: { limit?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
+    opts: {
+        limit?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput;
+        tiers?: TierInput; tierWeights?: TierWeightsInput; parseInline?: boolean;
+    },
 ): Promise<SearchResult[]> {
     if (blocks.length === 0) return [];
 
@@ -400,24 +727,45 @@ async function searchSmart(
         if (cached) return cached;
     }
 
+    // EP-S：解析以便预筛带操作符（must/mustNot 在预筛即硬过滤）+ prompt 增强。
+    const parsed = parseQuery(query, epsParseOpts(opts));
+
     // 候选预筛：先用 fuzzy 取 Top-N 相关候选，只把这批喂给模型
     // —— 提速（prompt 从最多 100K 字缩到几十条候选）+ 降噪（不再把全库无关项塞给模型）
+    //    EP-S：透传 EP-S 字段 → advanced fuzzy 让候选已满足 must/mustNot 布尔约束。
     const prefilterN = Math.max(SMART_PREFILTER_MIN, limit * 6);
-    const prefiltered = searchFuzzy(blocks, query, { limit: prefilterN });
+    const prefiltered = searchFuzzy(blocks, query, {
+        limit: prefilterN,
+        tiers: opts.tiers, tierWeights: opts.tierWeights,
+        parseInline: opts.parseInline,
+    });
     // 预筛兜底：fuzzy 零命中时不直接放弃（否则 smart 的纯语义召回被 fuzzy 完全封顶），
     // 退化为把前 N 条全库候选喂给模型做语义匹配。
+    //   ⚠️ EP-S：有 must/mustNot 硬约束时，零命中是「确实没有满足约束的」→ 不退化为全库（否则会喂入违反约束的项）。
+    const hasHardConstraint = parsed.must.length > 0 || parsed.mustNot.length > 0;
     const fuzzyScore = new Map(prefiltered.map(r => [r.id, r.score]));
     const candidateBlocks = prefiltered.length > 0
         ? prefiltered.map(r => blocks.find(b => b.id === r.id)).filter((b): b is TextBlock => !!b)
-        : blocks.slice(0, prefilterN);
+        : (hasHardConstraint ? [] : blocks.slice(0, prefilterN));
+    if (candidateBlocks.length === 0) return [];
     const candidateIds = new Set(candidateBlocks.map(b => b.id));
 
     const candidates = candidateBlocks.map(b => `[${b.id}] ${b.title}\n${buildSmartSnippet(b, query)}`);
 
+    // EP-S prompt 增强：显式告知模型必含/排除/高置信词，提升语义排序贴合度。
+    const mustWords = parsed.must.map(t => t.raw).join("、");
+    const mustNotWords = parsed.mustNot.map(t => t.raw).join("、");
+    const highWords = parsed.should.filter(t => t.tier === "high").map(t => t.raw).join("、");
+    const constraintHints = [
+        mustWords ? `结果必须涉及: ${mustWords}` : "",
+        mustNotWords ? `结果绝不涉及: ${mustNotWords}` : "",
+        highWords ? `优先关注（高置信）: ${highWords}` : "",
+    ].filter(Boolean).join("\n");
+
     const prompt = `你是一个搜索排序助手。
 
 用户搜索: "${query}"
-
+${constraintHints ? `\n约束:\n${constraintHints}\n` : ""}
 以下是 ${candidates.length} 个候选文档，每个以 [ID] 开头：
 
 ${candidates.join("\n---\n")}
@@ -509,23 +857,29 @@ export async function search(
 ): Promise<SearchResult[]> {
     const mode = opts.mode ?? "auto";
     const limit = opts.limit ?? 10;
+    // EP-S 字段统一透传（纯字符串调用方不传 → 子函数 parseQuery 出 isPlain → 旧逻辑）。
+    const eps = {
+        tiers: opts.tiers,
+        tierWeights: opts.tierWeights,
+        parseInline: opts.parseInline,
+    };
 
     switch (mode) {
         case "exact":
-            return searchExact(blocks, query, { limit, contextLines: opts.contextLines });
+            return searchExact(blocks, query, { limit, contextLines: opts.contextLines, ...eps });
         case "fuzzy":
-            return searchFuzzy(blocks, query, { limit, threshold: opts.threshold });
+            return searchFuzzy(blocks, query, { limit, threshold: opts.threshold, ...eps });
         case "smart":
-            return await searchSmart(blocks, query, { limit, chain: opts.chain, dataChain: opts.dataChain, modelChain: opts.modelChain });
+            return await searchSmart(blocks, query, { limit, chain: opts.chain, dataChain: opts.dataChain, modelChain: opts.modelChain, ...eps });
         case "auto": {
             // 先 exact
-            const exactResults = searchExact(blocks, query, { limit, contextLines: opts.contextLines });
+            const exactResults = searchExact(blocks, query, { limit, contextLines: opts.contextLines, ...eps });
             if (exactResults.length > 0) return exactResults;
-            // exact 无结果 → fuzzy
-            const fuzzyResults = searchFuzzy(blocks, query, { limit, threshold: opts.threshold });
+            // exact 无结果 → fuzzy（带同样 must 约束，不放宽）
+            const fuzzyResults = searchFuzzy(blocks, query, { limit, threshold: opts.threshold, ...eps });
             return fuzzyResults;
         }
         default:
-            return searchExact(blocks, query, { limit, contextLines: opts.contextLines });
+            return searchExact(blocks, query, { limit, contextLines: opts.contextLines, ...eps });
     }
 }

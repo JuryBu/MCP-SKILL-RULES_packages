@@ -1,11 +1,14 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { saveTempFile } from "../temp-store.js";
 import {
     formatRound,
     formatOverview,
+    formatRoundForMessageRoles,
+    normalizeMessageRoles,
     searchInRounds,
+    type ConversationMessageRole,
     type Depth,
     type ExtraType,
     type ConversationRound,
@@ -75,7 +78,7 @@ function formatMissingConversationIdMessage(action: string, dataChain: DataChain
         `❌ conversation_read_original(${action}) 需要显式 conversationId`,
         `当前 dataChain=${dataChain}，共享后端不能安全推断“当前对话”，否则可能读到别的宿主或别的窗口里的对话。`,
         `做法：先用 conversation_read_original(action="list", dataChain="${dataChain === "auto" ? "codex|antigravity|claude-code|windsurf" : dataChain}", query="标题或关键词") 定位 ID，再把 conversationId 传给 ${action}。`,
-        `如果你确实要读取 Antigravity 当前窗口，请显式传 dataChain="antigravity"；工具会在结果里显示实际读取到的对话 ID。`,
+        `注意：共享 broker 后端会拦截所有无 conversationId 的调用（含 antigravity）——跨 session 共享后端无法安全推断「当前对话」（与多窗口路由同源），「读当前窗口」兼容路径在 broker 下不可用，务必先 list 定位 ID 再显式传入。`,
     ].join("\n");
 }
 
@@ -112,6 +115,7 @@ export interface ConversationListCandidate {
     updatedAt: string;
     detail: string;
     contextProbe?: string[];
+    searchAliases?: string[];
     agentRole?: string | null;
     agentNickname?: string | null;
     parentConversationId?: string | null;
@@ -120,8 +124,6 @@ export interface ConversationListCandidate {
     matchedChildConversationId?: string | null;
     matchedChildTitle?: string | null;
 }
-
-type ConversationMessageRole = "user" | "system" | "model" | "assistant" | "tool";
 
 function uniqueWorkspaceLines(primary?: string, all?: string[]): string[] {
     const result: string[] = [];
@@ -149,11 +151,59 @@ function formatCodexSubagentSourceNote(loaded: { chainUsed?: string; codexData?:
     const parentThread = loaded.codexData?.parentThread || getCodexParentThread(thread.id);
     return [
         "🤝 Codex 子代理线程",
-        parentThread?.id ? `源头对话ID: ${parentThread.id}` : "源头对话ID: (未找到)",
+        parentThread?.id ? `parentConversationId: ${parentThread.id}` : "parentConversationId: (未找到)",
         parentThread?.title ? `源头标题: ${formatConversationListTitleForTest(parentThread.title, 80)}` : "",
         thread.agentRole ? `子代理角色: ${thread.agentRole}` : "",
         thread.agentNickname ? `子代理名称: ${thread.agentNickname}` : "",
     ].filter(Boolean).join("\n");
+}
+
+function formatSubagentSourceNote(loaded: {
+    chainUsed?: string;
+    codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null };
+    claudeCodeData?: { thread?: ClaudeCodeThreadInfo };
+    windsurfData?: { thread?: WindsurfConversationSummary };
+}): string {
+    if (loaded.chainUsed === "codex") return formatCodexSubagentSourceNote(loaded);
+    if (loaded.chainUsed === "claude-code") {
+        const thread = loaded.claudeCodeData?.thread;
+        if (!thread?.isChildThread && !thread?.parentConversationId) return "";
+        return [
+            "🤝 Claude Code 子代理线程",
+            `parentConversationId: ${thread?.parentConversationId || "(未找到)"}`,
+            thread?.agentRole ? `子代理角色: ${thread.agentRole}` : "",
+            thread?.agentNickname ? `子代理名称: ${thread.agentNickname}` : "",
+        ].filter(Boolean).join("\n");
+    }
+    if (loaded.chainUsed === "windsurf") {
+        const thread = loaded.windsurfData?.thread;
+        if (!thread?.isChildThread && !thread?.parentConversationId) return "";
+        return [
+            "🤝 Windsurf 子代理线程",
+            `parentConversationId: ${thread?.parentConversationId || "(未找到)"}`,
+            thread?.agentRole ? `子代理角色: ${thread.agentRole}` : "",
+            thread?.agentNickname ? `子代理名称: ${formatConversationListTitleForTest(thread.agentNickname, 80)}` : "",
+        ].filter(Boolean).join("\n");
+    }
+    return "";
+}
+
+function isLoadedSubagentThread(loaded: {
+    chainUsed?: string;
+    codexData?: { thread?: CodexThreadInfo };
+    claudeCodeData?: { thread?: ClaudeCodeThreadInfo };
+    windsurfData?: { thread?: WindsurfConversationSummary };
+}): boolean {
+    if (loaded.chainUsed === "codex") {
+        return Boolean(loaded.codexData?.thread?.agentRole || loaded.codexData?.thread?.agentNickname || loaded.codexData?.thread?.parentConversationId);
+    }
+    if (loaded.chainUsed === "claude-code") {
+        return Boolean(loaded.claudeCodeData?.thread?.isChildThread || loaded.claudeCodeData?.thread?.parentConversationId);
+    }
+    if (loaded.chainUsed === "windsurf") {
+        return Boolean(loaded.windsurfData?.thread?.isChildThread || loaded.windsurfData?.thread?.parentConversationId);
+    }
+    return false;
 }
 
 function formatClaudeCodeLogicalChainNote(loaded: { chainUsed?: string; claudeCodeData?: any }): string {
@@ -178,10 +228,10 @@ function formatClaudeCodeLogicalChainNote(loaded: { chainUsed?: string; claudeCo
 
 function formatConversationSearchHeader(
     cascadeId: string,
-    loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null }; claudeCodeData?: any },
+    loaded: { chainUsed?: string; codexData?: { thread?: CodexThreadInfo; parentThread?: CodexThreadInfo | null }; claudeCodeData?: any; windsurfData?: any },
     modelChain?: string,
 ): string {
-    const subagentNote = formatCodexSubagentSourceNote(loaded);
+    const subagentNote = formatSubagentSourceNote(loaded);
     const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
     return [
         `📂 对话: ${cascadeId}`,
@@ -203,156 +253,11 @@ export function formatConversationListDisplayTitleForTest(
     maxChars = CONVERSATION_LIST_TITLE_MAX_CHARS,
 ): string {
     const base = formatConversationListTitleForTest(title, maxChars);
-    if (options.dataChain === "codex" && (options.agentRole || options.agentNickname)) {
+    if (options.agentRole || options.agentNickname) {
         const role = options.agentRole || options.agentNickname || "subagent";
         return `子代理对话(${role})：${base}`;
     }
     return base;
-}
-
-function truncateForRoleView(input: string, depth: Depth): string {
-    const text = input || "";
-    const limit = depth === "brief" ? 100 : depth === "normal" ? 20_000 : Number.POSITIVE_INFINITY;
-    if (text.length <= limit) return text;
-    return `${text.slice(0, limit)}\n\n⚠️ 本段过长已截断（${text.length}→${limit}字），可用 depth="full" 展开`;
-}
-
-function normalizeMessageRoles(input?: ConversationMessageRole[]): Set<ConversationMessageRole> {
-    const result = new Set<ConversationMessageRole>();
-    for (const role of input || []) {
-        if (role === "model" || role === "assistant") {
-            result.add("model");
-            result.add("assistant");
-        } else {
-            result.add(role);
-        }
-    }
-    return result;
-}
-
-function isSystemLikeRound(round: ConversationRound): boolean {
-    if (round.compactionSummaries?.length) return true;
-    const text = (round.userMessage || "").trimStart();
-    return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
-        || text.startsWith("# AGENTS.md instructions for ")
-        || text.startsWith("[Claude Code compact summary folded")
-        || text.includes("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
-}
-
-function formatRoundForMessageRoles(
-    round: ConversationRound,
-    depth: Depth,
-    extraTypes: ExtraType[],
-    roles: Set<ConversationMessageRole>,
-    compactionMode: CompactionMode,
-): string {
-    if (roles.size === 0) return formatRound(round, depth, extraTypes, { compactionMode });
-
-    const systemLike = isSystemLikeRound(round);
-    const includeUser = roles.has("user") && !systemLike;
-    const includeSystem = roles.has("system") && systemLike;
-    const includeModel = roles.has("model") || roles.has("assistant");
-    const includeTool = roles.has("tool");
-    const hasToolLike = round.toolCalls.length > 0
-        || round.taskBoundaries.length > 0
-        || round.codeActions.length > 0
-        || (round.fileViews?.length || 0) > 0
-        || round.subagentSummaries.length > 0;
-
-    if (!includeUser && !includeSystem && !(includeModel && round.aiResponses.length > 0) && !(includeTool && hasToolLike)) {
-        return "";
-    }
-
-    const lines: string[] = [`## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`];
-
-    if (includeUser || includeSystem) {
-        lines.push(includeSystem
-            ? `### 🧩 系统/压缩内容 (step ${round.startStep})`
-            : `### 👤 用户 (step ${round.startStep})`);
-        if (round.compactionSummaries?.length) {
-            for (const item of round.compactionSummaries) {
-                const meta = `chars=${item.summaryChars}, sha256=${item.summarySha256.slice(0, 12)}`;
-                if (compactionMode === "full" || depth === "full") {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
-                    lines.push("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
-                    lines.push(truncateForRoleView(item.text, depth));
-                    lines.push("<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>");
-                } else if (compactionMode === "omit") {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要已省略（${meta}）`);
-                } else {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`);
-                    lines.push("说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。");
-                }
-            }
-        } else {
-            lines.push(truncateForRoleView(round.userMessage, depth));
-        }
-        if (includeUser && round.attachments?.length) {
-            for (const attachment of round.attachments) {
-                const label = attachment.kind === "image" ? "图片" : "文件";
-                const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
-                lines.push(`📎 ${label}: ${target}`);
-            }
-        }
-        if (includeUser && round.mediaAttachments.length > 0) {
-            for (const uri of round.mediaAttachments) lines.push(`📎 图片: ${uri}`);
-        }
-        lines.push("");
-    }
-
-    if (includeModel) {
-        for (const ai of round.aiResponses) {
-            lines.push(`### 🤖 AI (step ${ai.stepIndex})`);
-            lines.push(truncateForRoleView(ai.response, depth));
-            if (ai.thinking && (depth === "full" || extraTypes.includes("thinking"))) {
-                lines.push("");
-                lines.push(`<details><summary>💭 思考 (${ai.thinking.length}字)</summary>`);
-                lines.push("");
-                lines.push(ai.thinking);
-                lines.push("</details>");
-            }
-            lines.push("");
-        }
-    }
-
-    if (includeTool) {
-        if (round.toolCalls.length > 0) {
-            lines.push("#### 🔧 工具调用");
-            for (const tc of round.toolCalls) {
-                let line = `- ${tc.name}`;
-                if (depth === "full" || extraTypes.includes("tool_results")) {
-                    line += `(${tc.argsSummary})`;
-                    if (tc.resultSummary) line += ` → ${truncateForRoleView(tc.resultSummary, depth === "full" ? "normal" : depth)}`;
-                }
-                lines.push(line);
-            }
-            lines.push("");
-        }
-        if (round.taskBoundaries.length > 0 && depth !== "brief") {
-            const latest = round.taskBoundaries[round.taskBoundaries.length - 1];
-            lines.push(`📋 任务: ${latest.taskName} → ${latest.taskStatus}`);
-            lines.push("");
-        }
-        if (round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
-            lines.push("#### ✏️ 代码编辑");
-            for (const ca of round.codeActions) lines.push(`- **${ca.targetFile}**: ${ca.description}`);
-            lines.push("");
-        }
-        if (round.fileViews?.length && extraTypes.includes("file_views")) {
-            lines.push("#### 📄 文件/计划视图");
-            for (const view of round.fileViews) lines.push(`- ${view.kind}${view.title ? ` / ${view.title}` : ""}: ${view.textSummary}`);
-            lines.push("");
-        }
-        if (round.subagentSummaries.length > 0) {
-            lines.push("#### 🤝 子代理线程");
-            for (const subagent of round.subagentSummaries) {
-                lines.push(`- ${subagent.nickname || subagent.threadId} (${subagent.threadId})${subagent.role ? ` / ${subagent.role}` : ""}`);
-            }
-            lines.push("");
-        }
-    }
-
-    return lines.join("\n").trimEnd();
 }
 
 function buildConversationListLines(
@@ -430,6 +335,8 @@ function applyDefaultMainThreadMode(candidates: ConversationListCandidate[]): Co
 }
 
 function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): ConversationListCandidate {
+    const isChildThread = Boolean(item.isChildThread || item.parentConversationId);
+    const parentConversationId = item.parentConversationId || null;
     return {
         id: item.id,
         title: item.title || "",
@@ -437,29 +344,49 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): Conversation
         updatedAt: item.updatedAtMs ? new Date(item.updatedAtMs).toISOString() : "",
         detail: [
             "claude-code",
+            isChildThread ? "childThread" : "",
+            parentConversationId ? `parentConversationId=${parentConversationId}` : "",
+            item.agentRole ? `agent=${item.agentRole}` : "",
+            item.agentNickname ? `agentNickname=${item.agentNickname}` : "",
             item.model,
             item.entrypoint,
             item.lastPrompt ? `lastPrompt=${item.lastPrompt.slice(0, 40)}` : "",
         ].filter(Boolean).join(" / "),
+        agentRole: item.agentRole || null,
+        agentNickname: item.agentNickname || null,
+        parentConversationId,
+        isChildThread,
+        searchAliases: item.titleAliases,
     };
 }
 
 function candidateFromWindsurfThread(item: WindsurfConversationSummary): ConversationListCandidate {
+    const isChildThread = Boolean(item.isChildThread || item.parentConversationId);
+    const parentConversationId = item.parentConversationId || null;
     return {
         id: item.id,
-        title: item.title || item.summary || "",
+        title: item.titleBestEffort || item.title || item.summary || "",
         workspace: item.cwd || "",
         workspaces: item.workspaceUris,
         updatedAt: item.lastModifiedTime || item.createdTime || "",
         detail: [
             "windsurf",
             item.titleSource === "renamedTitle" ? "title=renamedTitle" : "",
+            item.titleBestEffort ? "title=titleBestEffort" : "",
+            isChildThread ? "childThread" : "",
+            parentConversationId ? `parentConversationId=${parentConversationId}` : "",
+            item.agentRole ? `agent=${item.agentRole}` : "",
+            item.agentNickname ? `agentNickname=${item.agentNickname}` : "",
             item.workspaceUris?.length ? `workspaces=${item.workspaceUris.length}` : "",
             item.referencedFiles?.length ? `referencedFiles=${item.referencedFiles.length}` : "",
             item.status,
             item.stepCount ? `${item.stepCount} steps` : "",
             item.lastGeneratorModelUid,
         ].filter(Boolean).join(" / "),
+        agentRole: item.agentRole || null,
+        agentNickname: item.agentNickname || null,
+        parentConversationId,
+        isChildThread,
     };
 }
 
@@ -600,6 +527,7 @@ function listCandidateHaystack(item: ConversationListCandidate): string {
         item.title,
         item.workspace,
         ...(item.workspaces || []),
+        ...(item.searchAliases || []),
         item.agentRole || "",
         item.agentNickname || "",
     ].join("\n"));
@@ -625,18 +553,21 @@ function listQueryPriority(item: ConversationListCandidate, normalizedQuery: str
     const title = normalizeListQuery(item.title || "");
     const workspace = normalizeListQuery(item.workspace || "");
     const workspaces = normalizeListQuery((item.workspaces || []).join("\n"));
+    const aliases = normalizeListQuery((item.searchAliases || []).join("\n"));
     const agent = normalizeListQuery([item.agentRole || "", item.agentNickname || ""].join("\n"));
-    const haystack = [id, title, workspace, workspaces, agent].join("\n");
+    const haystack = [id, title, aliases, workspace, workspaces, agent].join("\n");
     if (id === normalizedQuery) return 0;
     if (normalizedQuery.length >= 8 && id.startsWith(normalizedQuery)) return 1;
     if (title === normalizedQuery) return 2;
     if (title.includes(normalizedQuery)) return 3;
-    if (workspace.includes(normalizedQuery)) return 4;
-    if (listFieldIncludesAny(title, queryTerms)) return 5;
-    if (listFieldIncludesAny(workspace, queryTerms) || listFieldIncludesAny(workspaces, queryTerms)) return 6;
-    if (listFieldIncludesAny(agent, queryTerms)) return 7;
-    if (listQueryTermsMatch(haystack, queryTerms)) return 8;
-    return 9;
+    if (aliases === normalizedQuery) return 4;
+    if (aliases.includes(normalizedQuery)) return 5;
+    if (workspace.includes(normalizedQuery)) return 6;
+    if (listFieldIncludesAny(title, queryTerms) || listFieldIncludesAny(aliases, queryTerms)) return 7;
+    if (listFieldIncludesAny(workspace, queryTerms) || listFieldIncludesAny(workspaces, queryTerms)) return 8;
+    if (listFieldIncludesAny(agent, queryTerms)) return 9;
+    if (listQueryTermsMatch(haystack, queryTerms)) return 10;
+    return 11;
 }
 
 export function sortListMatchesByQuery(items: ConversationListCandidate[], normalizedQuery: string, queryTerms: string[] = []): ConversationListCandidate[] {
@@ -785,6 +716,7 @@ async function buildListSearchBlocks(
             content: [
                 `ID: ${item.id}`,
                 `标题: ${item.title}`,
+                item.searchAliases?.length ? `标题别名: ${item.searchAliases.join(" | ")}` : "",
                 `工作区: ${item.workspace}`,
                 `详情: ${item.detail}`,
                 recordPreview ? `Record:\n${recordPreview}` : "",
@@ -961,7 +893,7 @@ export function registerConversation(server: McpServer): void {
   read — 读取指定轮次范围的对话内容
   export — 将可读对话原文持久化导出为 Markdown / PDF
   deep_locate — Codex/Claude Code 后台深搜正文片段以定位 conversationId
-fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 dataChain="antigravity" 保留读取当前窗口的兼容路径。`,
+fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
             action: z.enum(["list", "fetch", "search", "read", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
                 .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
@@ -1014,7 +946,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
                 .describe("[fetch/search/read] 额外拉取的内容类型"),
             messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool"])).optional()
-                .describe("[read] 按消息角色选择性读取。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
+                .describe("[read/export] 按消息角色选择性读取或导出。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
             chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
@@ -1272,6 +1204,12 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     const candidateLimit = normalizedQuery
                         ? Math.max(max * 3, Number(process.env.MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT || 300))
                         : Math.max(max * 3, 30);
+                    const claudeCodeCandidateLimit = normalizedQuery
+                        ? Math.max(
+                            candidateLimit,
+                            Number(process.env.MEMORY_STORE_CLAUDE_CODE_METADATA_THREAD_LIMIT || process.env.MEMORY_STORE_CONVERSATION_METADATA_THREAD_LIMIT || 20_000),
+                        )
+                        : candidateLimit;
                     let codexThreads: CodexThreadInfo[] = [];
                     let claudeCodeThreads: ClaudeCodeThreadInfo[] = [];
                     let windsurfThreads: WindsurfConversationSummary[] = [];
@@ -1288,7 +1226,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                                 ? listCodexThreadsForMetadata(Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000))
                                 : listRecentCodexThreads(candidateLimit)).map(candidateFromCodexThread)
                             : resolved === "claude-code"
-                                ? (claudeCodeThreads = listRecentClaudeCodeThreads(candidateLimit)).map(candidateFromClaudeCodeThread)
+                                ? (claudeCodeThreads = listRecentClaudeCodeThreads(claudeCodeCandidateLimit)).map(candidateFromClaudeCodeThread)
                                 : (windsurfThreads = await listRecentWindsurfThreads(candidateLimit)).map(candidateFromWindsurfThread);
                     if (resolved === "codex" && normalizedQuery) {
                         const exactThread = getCodexThread(query || "");
@@ -1326,7 +1264,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         : probeResult.candidates;
 
                     let filtered = normalizedQuery ? sortListMatchesByQuery(directMatches, normalizedQuery, queryTerms) : directMatches;
-                    if (resolved === "codex" && !threadMode) {
+                    if ((resolved === "codex" || resolved === "claude-code" || resolved === "windsurf") && !threadMode) {
                         filtered = applyDefaultMainThreadMode(filtered);
                     }
                     let matchMode = normalizedQuery ? (queryTerms.length > 1 ? "metadata-or" : "exact") : "";
@@ -1552,6 +1490,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         mode: mode as SearchMode,
                         depth: depth as Depth,
                         extraTypes: extraTypes as ExtraType[],
+                        messageRoles: messageRoles as ConversationMessageRole[] | undefined,
                         compactionMode: effectiveCompactionMode,
                         outputDir,
                         overwrite,
@@ -1603,6 +1542,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         mode: mode as SearchMode,
                         depth: depth as Depth,
                         extraTypes: extraTypes as ExtraType[],
+                        messageRoles: messageRoles as ConversationMessageRole[] | undefined,
                         compactionMode: effectiveCompactionMode,
                         outputDir,
                         overwrite,
@@ -1624,7 +1564,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                         buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics, "omit"),
                     );
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
-                    const subagentNote = formatCodexSubagentSourceNote(loaded);
+                    const subagentNote = formatSubagentSourceNote(loaded);
                     const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
                     const partialWarning = formatWindsurfPartialWarning(loaded);
                     const cacheNote = loaded.chainUsed === "antigravity"
@@ -1640,8 +1580,8 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     try {
                         if (loaded.windsurfData?.partial) {
                             recordNote = "\n📋 Record 自动更新已跳过：WSF 本次原文读取不完整";
-                        } else if (loaded.chainUsed === "codex" && (loaded.codexData?.thread.agentRole || loaded.codexData?.thread.agentNickname)) {
-                            recordNote = "\n📋 Record 自动更新已跳过：Codex 子代理线程默认由源头主对话统一记录";
+                        } else if (isLoadedSubagentThread(loaded)) {
+                            recordNote = "\n📋 Record 自动更新已跳过：子代理线程默认由源头主对话统一记录";
                         } else {
                         const recordHash = findRecordHash(cascadeId) || resolveWorkspaceHashForRecord();
                         if (shouldAutoUpdateRecord(recordHash, cascadeId, rounds.length)) {
@@ -1836,7 +1776,7 @@ fetch/search/read/export 在共享后端下必须传 conversationId；仅显式 
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
                     pushOutputWithBuildBudget(output, overview, buildState, "read 输出");
                     pushOutputWithBuildBudget(output, `🔗 数据链路: ${loaded.chainUsed}`, buildState, "read 输出");
-                    const subagentNote = formatCodexSubagentSourceNote(loaded);
+                    const subagentNote = formatSubagentSourceNote(loaded);
                     if (subagentNote) pushOutputWithBuildBudget(output, subagentNote, buildState, "read 输出");
                     const logicalChainNote = formatClaudeCodeLogicalChainNote(loaded);
                     if (logicalChainNote) pushOutputWithBuildBudget(output, logicalChainNote, buildState, "read 输出");

@@ -6,8 +6,11 @@ import { DATA_ROOT, writeJsonAtomic, writeTextAtomic } from "./store.js";
 import {
     formatOverview,
     formatRound,
+    formatRoundForMessageRoles,
+    normalizeMessageRoles,
     searchInRounds,
     type CompactionMode,
+    type ConversationMessageRole,
     type ConversationRound,
     type Depth,
     type ExtraType,
@@ -38,6 +41,7 @@ export interface ConversationExportOptions {
     mode?: SearchMode;
     depth?: Depth;
     extraTypes?: ExtraType[];
+    messageRoles?: ConversationMessageRole[];
     compactionMode?: CompactionMode;
     outputDir?: string;
     overwrite?: boolean;
@@ -57,6 +61,7 @@ export interface ConversationExportAsset {
     sizeBytes?: number;
     sha256?: string;
     warning?: string;
+    stepIndex?: number;   // 新增：图片归属 step，写入 manifest.json 供核验
 }
 
 export interface ConversationExportResult {
@@ -137,7 +142,17 @@ function cloneRound(round: ConversationRound): ConversationRound {
     };
 }
 
-function buildSearchBlockContent(round: ConversationRound): string {
+function buildSearchBlockContent(round: ConversationRound, options?: ConversationExportOptions): string {
+    const roleFilter = normalizeMessageRoles(options?.messageRoles);
+    if (roleFilter.size > 0 && options) {
+        return formatRoundForMessageRoles(
+            round,
+            options.depth || "normal",
+            options.extraTypes || [],
+            roleFilter,
+            options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
+        );
+    }
     return [
         round.userMessage,
         ...round.aiResponses.map(item => item.response),
@@ -152,20 +167,36 @@ async function selectRounds(options: ConversationExportOptions): Promise<{ round
             warnings.push("scope=search 未提供 query，已导出空范围");
             return { rounds: [], warnings, rangeLabel: "search(empty)" };
         }
-        const exactMatches = searchInRounds(options.rounds, options.query, options.limit || 8);
-        let roundIndices = exactMatches.map(item => item.roundIndex);
-        if (roundIndices.length === 0 && options.mode !== "exact") {
+        const roleFilter = normalizeMessageRoles(options.messageRoles);
+        let roundIndices: number[];
+        if (roleFilter.size > 0) {
             const { search } = await import("./search-engine.js");
             const blocks = options.rounds.map(round => ({
                 id: String(round.roundIndex),
                 title: `轮次 ${round.roundIndex}`,
-                content: buildSearchBlockContent(round),
+                content: buildSearchBlockContent(round, options),
                 tags: [] as string[],
             }));
             const requestedMode = options.mode === "smart" ? "fuzzy" : (options.mode === "auto" ? "fuzzy" : options.mode || "fuzzy");
             if (options.mode === "smart") warnings.push("export scope=search 不默认调用模型，smart 已降级为 fuzzy");
             const fuzzy = await search(blocks, options.query, { mode: requestedMode, limit: options.limit || 8 });
             roundIndices = fuzzy.map(item => Number(item.id)).filter(Number.isFinite);
+        } else {
+            const exactMatches = searchInRounds(options.rounds, options.query, options.limit || 8);
+            roundIndices = exactMatches.map(item => item.roundIndex);
+            if (roundIndices.length === 0 && options.mode !== "exact") {
+                const { search } = await import("./search-engine.js");
+                const blocks = options.rounds.map(round => ({
+                    id: String(round.roundIndex),
+                    title: `轮次 ${round.roundIndex}`,
+                    content: buildSearchBlockContent(round),
+                    tags: [] as string[],
+                }));
+                const requestedMode = options.mode === "smart" ? "fuzzy" : (options.mode === "auto" ? "fuzzy" : options.mode || "fuzzy");
+                if (options.mode === "smart") warnings.push("export scope=search 不默认调用模型，smart 已降级为 fuzzy");
+                const fuzzy = await search(blocks, options.query, { mode: requestedMode, limit: options.limit || 8 });
+                roundIndices = fuzzy.map(item => Number(item.id)).filter(Number.isFinite);
+            }
         }
         const context = Math.max(0, options.contextRounds ?? 2);
         const selected = new Set<number>();
@@ -342,6 +373,7 @@ function collectAndRewriteAssets(
                 source: "mediaAttachments",
                 displayName: `round-${round.roundIndex}-media-${index + 1}`,
                 originalPath: sourcePath || uri,
+                stepIndex: round.startStep,
             } satisfies Omit<ConversationExportAsset, "exportPath" | "relativePath" | "sizeBytes" | "sha256">;
             const copied = sourcePath
                 ? copyAsset(sourcePath, descriptor, exportDir, budget)
@@ -359,6 +391,7 @@ function collectAndRewriteAssets(
                 source: attachment.source,
                 displayName: attachment.name || path.basename(sourcePath || attachment.tempPath || attachment.originalPath || "attachment"),
                 originalPath: sourcePath || attachment.originalPath || attachment.tempPath,
+                stepIndex: attachment.stepIndex,
             }, exportDir, budget);
             assets.push(copied);
             if (copied.warning) warnings.push(`R${round.roundIndex} ${attachment.kind === "image" ? "图片" : "文件"}附件：${copied.warning}`);
@@ -392,6 +425,10 @@ function formatAssetAppendix(assets: ConversationExportAsset[]): string {
 
 function buildMarkdown(options: ConversationExportOptions, rounds: ConversationRound[], assets: ConversationExportAsset[], warnings: string[], rangeLabel: string): string {
     const lines: string[] = [];
+    const depth = options.depth || "normal";
+    const extraTypes = options.extraTypes || [];
+    const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
+    const roleFilter = normalizeMessageRoles(options.messageRoles);
     lines.push("# Conversation Export");
     lines.push("");
     lines.push("## Export Metadata");
@@ -402,9 +439,10 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     lines.push(`- scope: ${options.scope || "full"}`);
     lines.push(`- rounds: ${rangeLabel} / total ${options.rounds.length}`);
     lines.push(`- totalSteps: ${options.totalSteps}`);
-    lines.push(`- depth: ${options.depth || "normal"}`);
-    lines.push(`- extraTypes: ${(options.extraTypes || []).join(", ") || "(none)"}`);
-    lines.push(`- compactionMode: ${options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded")}`);
+    lines.push(`- depth: ${depth}`);
+    lines.push(`- extraTypes: ${extraTypes.join(", ") || "(none)"}`);
+    lines.push(`- messageRoles: ${(options.messageRoles || []).join(", ") || "(all)"}`);
+    lines.push(`- compactionMode: ${compactionMode}`);
     lines.push("");
     if (warnings.length || options.partialWarning) {
         lines.push("## Warnings");
@@ -419,10 +457,14 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     lines.push(`🔗 数据链路: ${options.chainUsed}`);
     lines.push("");
     for (const round of rounds) {
-        lines.push(formatRound(round, options.depth || "normal", options.extraTypes || [], {
-            compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
-            attachmentMode: "markdown",
-        }));
+        const formatted = roleFilter.size > 0
+            ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
+            : formatRound(round, depth, extraTypes, {
+                compactionMode,
+                attachmentMode: "markdown",
+            });
+        if (!formatted) continue;
+        lines.push(formatted);
         lines.push("");
     }
     if (options.expandedChildren?.length) {
@@ -431,10 +473,14 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
         for (const child of options.expandedChildren) {
             lines.push(`## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`);
             for (const round of child.rounds) {
-                lines.push(formatRound(round, options.depth || "normal", options.extraTypes || [], {
-                    compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
-                    attachmentMode: "markdown",
-                }));
+                const formatted = roleFilter.size > 0
+                    ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
+                    : formatRound(round, depth, extraTypes, {
+                        compactionMode,
+                        attachmentMode: "markdown",
+                    });
+                if (!formatted) continue;
+                lines.push(formatted);
                 lines.push("");
             }
         }
@@ -505,6 +551,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         scope: options.scope || "full",
         depth: options.depth || "normal",
         extraTypes: options.extraTypes || [],
+        messageRoles: options.messageRoles || [],
         compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
         startRound: selected.rounds[0]?.roundIndex || null,
         endRound: selected.rounds[selected.rounds.length - 1]?.roundIndex || null,

@@ -31,7 +31,26 @@ interface Registry {
 
 const REGISTRY_DIR = process.env.MEMORY_STORE_DATA_ROOT
     || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
-const REGISTRY_PATH = path.join(REGISTRY_DIR, "ls-registry.json");
+const DEFAULT_REGISTRY_PATH = path.join(REGISTRY_DIR, "ls-registry.json");
+
+/** 测试注入的注册表路径覆盖（null=用真实路径） */
+let registryPathOverride: string | null = null;
+
+/**
+ * 测试专用：覆盖注册表文件路径（注销/注册测试不污染真实文件）。
+ * 传 null 还原真实路径。生产代码不调用。
+ */
+export function __setRegistryPathForTest(p: string | null): void {
+    registryPathOverride = p;
+}
+
+function registryPath(): string {
+    return registryPathOverride ?? DEFAULT_REGISTRY_PATH;
+}
+
+function registryDir(): string {
+    return path.dirname(registryPath());
+}
 
 // ===== Heartbeat 容忍 =====
 
@@ -40,6 +59,18 @@ const heartbeatFailCounts = new Map<string, number>();
 /** 连续失败 3 次才从注册表删除，避免瞬时繁忙误删 */
 const MAX_HEARTBEAT_FAILURES = 3;
 
+/**
+ * 模块级变量：本进程实际注册过的真实 LS pid 集合（用于退出时精确注销）。
+ * 旧 bug：cleanupRegistryOnExit 写死删 String(process.ppid)，但 broker 环境下 ppid=broker pid，
+ * 与真实注册的 LS pid 不同，导致删不掉真实条目（见失败路径 ⑥-b）。改为按本集合删除。
+ */
+const registeredPids = new Set<string>();
+
+/** 测试专用：清空本进程注册痕迹（避免跨用例污染）。 */
+export function __resetRegisteredPidsForTest(): void {
+    registeredPids.clear();
+}
+
 // ===== 基础读写 =====
 
 /**
@@ -47,8 +78,8 @@ const MAX_HEARTBEAT_FAILURES = 3;
  */
 export function readRegistry(): Registry {
     try {
-        if (fs.existsSync(REGISTRY_PATH)) {
-            const content = fs.readFileSync(REGISTRY_PATH, "utf-8");
+        if (fs.existsSync(registryPath())) {
+            const content = fs.readFileSync(registryPath(), "utf-8");
             const parsed = JSON.parse(content);
             if (parsed && typeof parsed.processes === "object") {
                 return parsed;
@@ -66,14 +97,14 @@ function updateRegistry(fn: (data: Registry) => void): void {
     fn(data);
 
     // 确保目录存在
-    if (!fs.existsSync(REGISTRY_DIR)) {
-        fs.mkdirSync(REGISTRY_DIR, { recursive: true });
+    if (!fs.existsSync(registryDir())) {
+        fs.mkdirSync(registryDir(), { recursive: true });
     }
 
     // 原子写入：写临时文件 → rename
-    const tmpPath = REGISTRY_PATH + ".tmp." + process.pid;
+    const tmpPath = registryPath() + ".tmp." + process.pid;
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
-    fs.renameSync(tmpPath, REGISTRY_PATH);
+    fs.renameSync(tmpPath, registryPath());
 }
 
 // ===== 注册 / 注销 =====
@@ -91,6 +122,8 @@ export function registerLsEntry(entry: RegistryEntry): boolean {
             // 读回验证
             const readBack = readRegistry();
             if (readBack.processes[pidStr]) {
+                // 记入本进程注册痕迹，供退出时精确注销（修 ⑥-b 注销 key 错位）。
+                registeredPids.add(pidStr);
                 return true;
             }
             console.error(`[registry] 注册写入后读回验证失败，重试 (${attempt + 1}/3)`);
@@ -103,36 +136,45 @@ export function registerLsEntry(entry: RegistryEntry): boolean {
 }
 
 /**
- * 退出时注销父 LS 的注册表条目（3 次重试）
- * 在 cleanup 路径调用，容忍失败
+ * 退出时注销本进程注册过的 LS 条目（3 次重试）
+ * 在 cleanup 路径调用，容忍失败。
+ *
+ * 修 ⑥-b：旧逻辑删写死的 String(process.ppid)，broker 环境下 ppid=broker pid ≠ 真实 LS pid，
+ * 导致删不掉真实条目、泄漏死条目。改为按 registeredPids（本进程实际注册过的真实 LS pid 集合）删除。
  */
 export function cleanupRegistryOnExit(): void {
-    const myPid = String(process.ppid);
+    const myPids = Array.from(registeredPids);
+    if (myPids.length === 0) return; // 本进程没注册过任何 LS，无需注销
 
     for (let attempt = 0; attempt < 3; attempt++) {
         try {
             const data = readRegistry();
-            if (!data.processes[myPid]) break; // 已不在表中
+            let changed = false;
+            for (const pidStr of myPids) {
+                if (data.processes[pidStr]) {
+                    delete data.processes[pidStr];
+                    changed = true;
+                }
+            }
+            if (!changed) break; // 已全部不在表中
 
-            delete data.processes[myPid];
-
-            // 如果是最后一条 → 删除整个文件
+            // 如果删空了 → 删除整个文件
             if (Object.keys(data.processes).length === 0) {
-                try { fs.unlinkSync(REGISTRY_PATH); } catch { /* 文件可能已被删 */ }
+                try { fs.unlinkSync(registryPath()); } catch { /* 文件可能已被删 */ }
                 break;
             }
 
             // 否则写回
-            if (!fs.existsSync(REGISTRY_DIR)) {
-                fs.mkdirSync(REGISTRY_DIR, { recursive: true });
+            if (!fs.existsSync(registryDir())) {
+                fs.mkdirSync(registryDir(), { recursive: true });
             }
-            const tmp = REGISTRY_PATH + ".tmp." + process.pid;
+            const tmp = registryPath() + ".tmp." + process.pid;
             fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-            fs.renameSync(tmp, REGISTRY_PATH);
+            fs.renameSync(tmp, registryPath());
 
-            // 读回验证
+            // 读回验证：本进程注册的 pid 应全部消失
             const readBack = readRegistry();
-            if (!readBack.processes[myPid]) break; // 确认删除成功
+            if (myPids.every(pidStr => !readBack.processes[pidStr])) break;
             console.error(`[registry] 注销后读回验证失败，重试 (${attempt + 1}/3)`);
         } catch (err) {
             console.error(`[registry] 注销失败 (${attempt + 1}/3): ${err}`);
@@ -200,15 +242,33 @@ export function cleanDeadEntries(): void {
         }
         if (changed) {
             if (Object.keys(data.processes).length === 0) {
-                try { fs.unlinkSync(REGISTRY_PATH); } catch { /* */ }
+                try { fs.unlinkSync(registryPath()); } catch { /* */ }
             } else {
-                if (!fs.existsSync(REGISTRY_DIR)) {
-                    fs.mkdirSync(REGISTRY_DIR, { recursive: true });
+                if (!fs.existsSync(registryDir())) {
+                    fs.mkdirSync(registryDir(), { recursive: true });
                 }
-                const tmp = REGISTRY_PATH + ".tmp." + process.pid;
+                const tmp = registryPath() + ".tmp." + process.pid;
                 fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-                fs.renameSync(tmp, REGISTRY_PATH);
+                fs.renameSync(tmp, registryPath());
             }
         }
     } catch { /* 启动时清理容忍失败 */ }
+}
+
+/**
+ * 列出当前存活的注册条目（read + process.kill(pid,0) 过滤，供路由大脑复用）。
+ * 死条目触发 markHeartbeatFailure 累计，达阈值后被自动移除。
+ */
+export function listLiveEntries(): RegistryEntry[] {
+    const data = readRegistry();
+    const live: RegistryEntry[] = [];
+    for (const [pidStr, entry] of Object.entries(data.processes)) {
+        try {
+            process.kill(parseInt(pidStr, 10), 0);
+            live.push(entry);
+        } catch {
+            markHeartbeatFailure(pidStr);
+        }
+    }
+    return live;
 }

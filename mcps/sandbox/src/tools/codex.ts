@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from "child_process";
+import { spawn, spawnSync, ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
 import fs from "fs";
 import path from "path";
@@ -108,14 +108,77 @@ export function getCodexTaskCount(): { running: number; total: number } {
 
 // ── 工具函数 ──
 
-/**
- * 在 cmd.exe shell 中安全引用参数
- * 双引号包裹，内部双引号转义为两个双引号
- */
-function shellQuote(arg: string): string {
-    // 1. % → %% 防止 cmd.exe 变量展开（如 %CD% → 实际目录）
-    // 2. 双引号 → 两个双引号
-    return `"${arg.replace(/%/g, "%%").replace(/"/g, '""')}"`;
+function parseCodexBinArgs(raw: string | undefined): string[] {
+    if (!raw?.trim()) return [];
+    try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed) && parsed.every((item) => typeof item === "string")) {
+            return parsed;
+        }
+    } catch {
+        // Fall through to whitespace split for simple local overrides.
+    }
+    return raw.split(/\s+/u).filter(Boolean);
+}
+
+function resolveCodexSpawnTarget(): { command: string; argsPrefix: string[] } {
+    const override = process.env.SANDBOX_CODEX_BIN?.trim();
+    if (override) {
+        return { command: override, argsPrefix: parseCodexBinArgs(process.env.SANDBOX_CODEX_BIN_ARGS) };
+    }
+    if (process.platform !== "win32") {
+        return { command: "codex", argsPrefix: [] };
+    }
+    const probe = spawnSync("where.exe", ["codex"], {
+        windowsHide: true,
+        encoding: "utf-8",
+    });
+    const candidates = (probe.stdout || "")
+        .split(/\r?\n/u)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    const executable = candidates.find((candidate) => /\.(exe|com)$/iu.test(candidate));
+    if (executable) return { command: executable, argsPrefix: [] };
+    const cmdShim = candidates.find((candidate) => /\.cmd$/iu.test(candidate))
+        || path.join(process.env.APPDATA || "", "npm", "codex.cmd");
+    const shimDir = path.dirname(cmdShim);
+    const npmCodexJs = path.join(shimDir, "node_modules", "@openai", "codex", "bin", "codex.js");
+    if (fs.existsSync(npmCodexJs)) {
+        const localNode = path.join(shimDir, "node.exe");
+        return { command: fs.existsSync(localNode) ? localNode : process.execPath, argsPrefix: [npmCodexJs] };
+    }
+    return { command: "codex.exe", argsPrefix: [] };
+}
+
+function assertNoNul(name: string, value: string): string {
+    if (value.includes("\0")) {
+        throw new Error(`${name} 不能包含 NUL 字符`);
+    }
+    return value;
+}
+
+function validateSimpleCodexValue(name: string, value: string): string {
+    assertNoNul(name, value);
+    if (!/^[a-zA-Z0-9._-]+$/u.test(value)) {
+        throw new Error(`${name} 参数格式非法: ${value}`);
+    }
+    return value;
+}
+
+function validateCodexConfigOverride(value: string): string {
+    assertNoNul("configOverrides", value);
+    if (!/^[a-zA-Z0-9_.-]+=[a-zA-Z0-9_./:@,+-]+$/u.test(value)) {
+        throw new Error(`configOverrides 参数格式非法: ${value}`);
+    }
+    return value;
+}
+
+function validateGitRefLike(name: string, value: string): string {
+    assertNoNul(name, value);
+    if (!/^[a-zA-Z0-9._/@:+-]+$/u.test(value)) {
+        throw new Error(`${name} 参数格式非法: ${value}`);
+    }
+    return value;
 }
 
 /**
@@ -302,32 +365,33 @@ function startCodexProcess(params: {
     const taskId = generateTaskId();
     const startTime = Date.now();
 
-    // 构建命令字符串
-    const cmdParts: string[] = [
-        "codex", "exec",
+    const codexTarget = resolveCodexSpawnTarget();
+    const cmdArgs: string[] = [
+        ...codexTarget.argsPrefix,
+        "exec",
     ];
 
     // exec review 子命令
     if (reviewMode) {
-        cmdParts.push("review");
-        if (reviewMode.uncommitted) cmdParts.push("--uncommitted");
-        if (reviewMode.base) cmdParts.push("--base", shellQuote(reviewMode.base));
-        if (reviewMode.commit) cmdParts.push("--commit", shellQuote(reviewMode.commit));
-        if (reviewMode.title) cmdParts.push("--title", shellQuote(reviewMode.title));
+        cmdArgs.push("review");
+        if (reviewMode.uncommitted) cmdArgs.push("--uncommitted");
+        if (reviewMode.base) cmdArgs.push("--base", validateGitRefLike("review.base", reviewMode.base));
+        if (reviewMode.commit) cmdArgs.push("--commit", validateGitRefLike("review.commit", reviewMode.commit));
+        if (reviewMode.title) cmdArgs.push("--title", assertNoNul("review.title", reviewMode.title));
     }
 
-    cmdParts.push(
+    cmdArgs.push(
         "--dangerously-bypass-approvals-and-sandbox",
         "--ephemeral",
         "--skip-git-repo-check",
     );
 
     if (model) {
-        cmdParts.push("-m", shellQuote(model));
+        cmdArgs.push("-m", validateSimpleCodexValue("model", model));
     }
 
     if (configOverrides) {
-        cmdParts.push("-c", shellQuote(configOverrides));
+        cmdArgs.push("-c", validateCodexConfigOverride(configOverrides));
     }
 
     // 新参数映射
@@ -335,15 +399,15 @@ function startCodexProcess(params: {
         if (!fs.existsSync(image)) {
             throw new Error(`图片文件不存在: ${image}`);
         }
-        cmdParts.push("-i", shellQuote(image));
+        cmdArgs.push("-i", assertNoNul("image", image));
     }
-    if (jsonMode) cmdParts.push("--json");
-    if (outputSchema) cmdParts.push("--output-schema", shellQuote(outputSchema));
+    if (jsonMode) cmdArgs.push("--json");
+    if (outputSchema) cmdArgs.push("--output-schema", assertNoNul("outputSchema", outputSchema));
     if (enableFeatures) {
-        for (const f of enableFeatures) cmdParts.push("--enable", f);
+        for (const f of enableFeatures) cmdArgs.push("--enable", validateSimpleCodexValue("enableFeatures", f));
     }
     if (disableFeatures) {
-        for (const f of disableFeatures) cmdParts.push("--disable", f);
+        for (const f of disableFeatures) cmdArgs.push("--disable", validateSimpleCodexValue("disableFeatures", f));
     }
 
     if (outputFile) {
@@ -351,7 +415,7 @@ function startCodexProcess(params: {
         if (!fs.existsSync(outputDir)) {
             try { fs.mkdirSync(outputDir, { recursive: true }); } catch { /* ignore */ }
         }
-        cmdParts.push("-o", shellQuote(outputFile));
+        cmdArgs.push("-o", assertNoNul("outputFile", outputFile));
     }
 
     // 自动附加 outputFile 提示到 prompt（减少手动重复）
@@ -362,7 +426,7 @@ function startCodexProcess(params: {
         if (outputFile) {
             finalPrompt += `\n\n请将报告输出保存到: ${outputFile}`;
         }
-        cmdParts.push(shellQuote(finalPrompt));
+        cmdArgs.push(assertNoNul("prompt", finalPrompt));
     } else if (outputFile) {
         // review 模式下仍然需要 -o 参数，但 prompt 不传
         // outputFile 已在上面 push 过了，这里只做日志提示
@@ -379,12 +443,12 @@ function startCodexProcess(params: {
     }
 
     // 启动进程
-    const proc = spawn(cmdParts.join(" "), [], {
+    const proc = spawn(codexTarget.command, cmdArgs, {
         cwd: cwd || process.cwd(),
         env: { ...process.env },
         stdio: ["pipe", "pipe", "pipe"],
         windowsHide: true,
-        shell: true,
+        shell: false,
     });
 
     // 🔴 修复 Codex CLI 0.124.0 stdin 挂起：新版 exec 会等待 stdin EOF

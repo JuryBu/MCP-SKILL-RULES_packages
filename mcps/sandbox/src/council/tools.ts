@@ -12,6 +12,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_FETCH_TIMEOU
 const DEFAULT_SEARCH_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_SEARCH_TIMEOUT_MS || 6000);
 const DEFAULT_EXA_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_EXA_TIMEOUT_MS || 10000);
 const DEFAULT_WEB_FETCHER_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_WEB_FETCHER_TIMEOUT_MS || 15000);
+const FETCH_TEXT_MAX_REDIRECTS = 5;
 const DEFAULT_EXA_MCP_URL = process.env.SANDBOX_COUNCIL_EXA_MCP_URL
     || process.env.EXA_MCP_REMOTE_URL
     || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL
@@ -407,25 +408,40 @@ function describeFetchError(url: string, err: unknown): string {
 }
 
 async function fetchText(url: string, timeoutMs = DEFAULT_FETCH_TIMEOUT_MS): Promise<string> {
-    await assertPublicHttpUrl(url);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    try {
-        const response = await fetch(url, {
-            signal: controller.signal,
-            headers: {
-                "User-Agent": "Mozilla/5.0 (compatible; sandbox-council/1.0; +text-fetch)",
-                "Accept": "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
-            },
-        });
-        const text = await response.text();
-        if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
-        return text;
-    } catch (err) {
-        throw new Error(describeFetchError(url, err));
-    } finally {
-        clearTimeout(timer);
+    let currentUrl = url;
+    for (let redirectCount = 0; redirectCount <= FETCH_TEXT_MAX_REDIRECTS; redirectCount++) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            await assertPublicHttpUrl(currentUrl);
+            const controller = new AbortController();
+            timer = setTimeout(() => controller.abort(), timeoutMs);
+            const response = await fetch(currentUrl, {
+                redirect: "manual",
+                signal: controller.signal,
+                headers: {
+                    "User-Agent": "Mozilla/5.0 (compatible; sandbox-council/1.0; +text-fetch)",
+                    "Accept": "text/html,application/xhtml+xml,application/xml,text/plain;q=0.9,*/*;q=0.8",
+                },
+            });
+            if (response.status >= 300 && response.status < 400) {
+                if (redirectCount === FETCH_TEXT_MAX_REDIRECTS) {
+                    throw new Error(`重定向次数超限（>${FETCH_TEXT_MAX_REDIRECTS}）: ${url}`);
+                }
+                const location = response.headers.get("location");
+                if (!location) throw new Error(`重定向无 Location header (HTTP ${response.status})`);
+                currentUrl = new URL(location, currentUrl).href;
+                continue;
+            }
+            const text = await response.text();
+            if (!response.ok) throw new Error(`HTTP ${response.status}: ${text.slice(0, 300)}`);
+            return text;
+        } catch (err) {
+            throw new Error(describeFetchError(currentUrl, err));
+        } finally {
+            if (timer) clearTimeout(timer);
+        }
     }
+    throw new Error(`重定向次数超限（>${FETCH_TEXT_MAX_REDIRECTS}）: ${url}`);
 }
 
 function isPrivateHostname(hostname: string): boolean {
@@ -608,46 +624,13 @@ async function runWebFetchText(args: Record<string, unknown>): Promise<string> {
     const maxChars = Math.max(500, Math.min(getNumberArg(args, "maxChars", 8000), 20000));
     const extract = getStringArg(args, "extract") || getStringArg(args, "mode") || "text";
     const backend = getStringArg(args, "backend") || "auto";
-    const notes: string[] = [];
     await assertPublicHttpUrl(url);
 
-    if (extract === "text" && (backend === "auto" || backend === "exa")) {
-        try {
-            const text = await callExaViaChild("web_fetch_exa", {
-                urls: [url],
-                maxCharacters: maxChars,
-            }, DEFAULT_EXA_TIMEOUT_MS);
-            return `webFetchText ${url} extract=text backend=exa\n${text}`;
-        } catch (err) {
-            notes.push(`Exa fetch 失败: ${compactErrorMessage(err)}`);
-            if (backend === "exa") {
-                return `webFetchText ${url} extract=text backend=exa 失败\n- ${notes.join("\n- ")}`;
-            }
-        }
+    if (backend === "exa" || backend === "webFetcher") {
+        throw new Error(`webFetchText backend=${backend} 暂未启用：无法在 sandbox 侧证明委托后端会逐跳校验重定向私网地址，请使用 backend=direct`);
     }
-
-    if (backend === "auto" || backend === "webFetcher") {
-        try {
-            const text = await withPromiseTimeout((async () => {
-                if (extract === "html") {
-                    return await callWebFetcherViaChild("web_fetch_html", { url }, DEFAULT_WEB_FETCHER_TIMEOUT_MS);
-                }
-                if (extract === "links") {
-                    return await callWebFetcherViaChild("web_extract_links", { url }, DEFAULT_WEB_FETCHER_TIMEOUT_MS);
-                }
-                if (extract === "tables") {
-                    return await callWebFetcherViaChild("web_extract_tables", { url, format: "markdown" }, DEFAULT_WEB_FETCHER_TIMEOUT_MS);
-                }
-                return await callWebFetcherViaChild("web_fetch_page", { url, outputMode: "full" }, DEFAULT_WEB_FETCHER_TIMEOUT_MS);
-            })(), DEFAULT_WEB_FETCHER_TIMEOUT_MS + 5000, "web-fetcher");
-            const suffix = notes.length > 0 ? `\n\nfallback 说明:\n- ${notes.join("\n- ")}` : "";
-            return `webFetchText ${url} extract=${extract} backend=web-fetcher\n${clip(text, maxChars)}${suffix}`;
-        } catch (err) {
-            notes.push(`web-fetcher 失败: ${compactErrorMessage(err)}`);
-            if (backend === "webFetcher") {
-                return `webFetchText ${url} extract=${extract} backend=web-fetcher 失败\n- ${notes.join("\n- ")}`;
-            }
-        }
+    if (backend !== "auto" && backend !== "direct") {
+        throw new Error(`webFetchText backend 不支持: ${backend}`);
     }
 
     const html = await fetchText(url);
@@ -686,7 +669,6 @@ async function runWebFetchText(args: Record<string, unknown>): Promise<string> {
             title ? `标题: ${title}` : "",
             "",
             html.slice(0, maxChars),
-            notes.length > 0 ? `\nfallback 说明:\n- ${notes.join("\n- ")}` : "",
         ].filter(Boolean).join("\n");
     }
     if (extract === "links") {
@@ -694,7 +676,6 @@ async function runWebFetchText(args: Record<string, unknown>): Promise<string> {
             `webFetchText ${url} extract=links backend=direct`,
             title ? `标题: ${title}` : "",
             links.length > 0 ? links.join("\n") : "未提取到链接",
-            notes.length > 0 ? `\nfallback 说明:\n- ${notes.join("\n- ")}` : "",
         ].filter(Boolean).join("\n");
     }
     if (extract === "tables") {
@@ -702,7 +683,6 @@ async function runWebFetchText(args: Record<string, unknown>): Promise<string> {
             `webFetchText ${url} extract=tables backend=direct`,
             title ? `标题: ${title}` : "",
             tables.length > 0 ? tables.join("\n\n") : "未提取到 HTML table",
-            notes.length > 0 ? `\nfallback 说明:\n- ${notes.join("\n- ")}` : "",
         ].filter(Boolean).join("\n");
     }
     return [
@@ -712,7 +692,6 @@ async function runWebFetchText(args: Record<string, unknown>): Promise<string> {
         "正文摘录:",
         text,
         links.length > 0 ? "\n链接摘录:\n" + links.join("\n") : "",
-        notes.length > 0 ? `\nfallback 说明:\n- ${notes.join("\n- ")}` : "",
     ].filter(Boolean).join("\n");
 }
 

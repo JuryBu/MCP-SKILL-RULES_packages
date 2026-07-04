@@ -7,7 +7,7 @@ import { formatElapsed } from "./lifecycle.js";
 
 /**
  * MCP Sandbox 子进程执行引擎
- * 
+ *
  * 核心职责：
  * - spawn 子进程执行代码/命令
  * - 硬超时管理（自动杀进程树）
@@ -50,6 +50,44 @@ export interface ExecResult {
     tempFile: string | null;
 }
 
+export interface NormalizedExecutionInput {
+    code?: string;
+    command?: string;
+    error?: string;
+}
+
+export function normalizeExecutionInput(code?: string, command?: string): NormalizedExecutionInput {
+    const normalizedCode = typeof code === "string" && code.trim().length > 0 ? code : undefined;
+    const normalizedCommand = typeof command === "string" && command.trim().length > 0 ? command : undefined;
+    const hasCode = normalizedCode !== undefined;
+    const hasCommand = normalizedCommand !== undefined;
+
+    if (hasCode && hasCommand) {
+        return { error: "错误：code 和 command 不能同时提供，请只填其一" };
+    }
+    if (!hasCode && !hasCommand) {
+        return { error: "错误：必须提供 code 或 command 之一" };
+    }
+
+    return { code: normalizedCode, command: normalizedCommand };
+}
+
+export function makeParamErrorResult(stderr: string): ExecResult {
+    return {
+        stdout: "",
+        stderr,
+        exitCode: 1,
+        elapsed: "0ms",
+        killed: false,
+        killReason: null,
+        peakMemoryMB: 0,
+        truncated: false,
+        originalBytes: 0,
+        returnedBytes: 0,
+        tempFile: null,
+    };
+}
+
 // 默认值
 const DEFAULTS = {
     language: "python",
@@ -83,6 +121,164 @@ export function killProcessTree(pid: number): void {
             process.kill(pid, "SIGKILL");
         } catch { /* 已退出 */ }
     }
+}
+
+function getProcessTreePids(rootPid: number): number[] {
+    const seen = new Set<number>([rootPid]);
+    try {
+        if (process.platform === "win32") {
+            const psScript = [
+                `$ProgressPreference = 'SilentlyContinue'`,
+                `$root = ${rootPid}`,
+                `$rows = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId`,
+                `$children = @{}`,
+                `foreach ($row in $rows) {`,
+                `  $ppid = [int]$row.ParentProcessId`,
+                `  if (-not $children.ContainsKey($ppid)) { $children[$ppid] = New-Object System.Collections.Generic.List[int] }`,
+                `  $children[$ppid].Add([int]$row.ProcessId)`,
+                `}`,
+                `$queue = New-Object System.Collections.Generic.Queue[int]`,
+                `$visited = New-Object System.Collections.Generic.HashSet[int]`,
+                `$queue.Enqueue($root)`,
+                `while ($queue.Count -gt 0) {`,
+                `  $currentPid = $queue.Dequeue()`,
+                `  if ($visited.Add($currentPid) -and $children.ContainsKey($currentPid)) {`,
+                `    foreach ($child in $children[$currentPid]) { $queue.Enqueue($child) }`,
+                `  }`,
+                `}`,
+                `[string]::Join(',', $visited)`,
+            ].join("\n");
+            const encodedCmd = Buffer.from(psScript, "utf16le").toString("base64");
+            const stdout = execSync(`powershell -NoProfile -EncodedCommand ${encodedCmd}`, {
+                encoding: "utf-8",
+                timeout: 3000,
+                windowsHide: true,
+            }).trim();
+            for (const item of stdout.split(",")) {
+                const pid = Number(item.trim());
+                if (Number.isInteger(pid) && pid > 0) seen.add(pid);
+            }
+            return [...seen];
+        }
+
+        const stdout = execSync("ps -eo pid=,ppid=", {
+            encoding: "utf-8",
+            timeout: 3000,
+            windowsHide: true,
+        });
+        const children = new Map<number, number[]>();
+        for (const line of stdout.split(/\r?\n/u)) {
+            const [pidRaw, ppidRaw] = line.trim().split(/\s+/u);
+            const pid = Number(pidRaw);
+            const ppid = Number(ppidRaw);
+            if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+            const list = children.get(ppid) || [];
+            list.push(pid);
+            children.set(ppid, list);
+        }
+        const queue = [rootPid];
+        for (let index = 0; index < queue.length; index++) {
+            const pid = queue[index];
+            for (const childPid of children.get(pid) || []) {
+                if (!seen.has(childPid)) {
+                    seen.add(childPid);
+                    queue.push(childPid);
+                }
+            }
+        }
+    } catch (err) {
+        console.warn(`[executor] process tree enumeration failed, fallback to root PID only: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return [...seen];
+}
+
+async function getProcessTreeMemoryMB(rootPid: number): Promise<number> {
+    try {
+        if (process.platform === "win32") {
+            const psScript = [
+                `$ProgressPreference = 'SilentlyContinue'`,
+                `$root = ${rootPid}`,
+                `$rows = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Select-Object ProcessId,ParentProcessId`,
+                `$workingSet = @{}`,
+                `Get-Process -ErrorAction SilentlyContinue | ForEach-Object { $workingSet[[int]$_.Id] = [int64]$_.WorkingSet64 }`,
+                `$children = @{}`,
+                `foreach ($row in $rows) {`,
+                `  $ppid = [int]$row.ParentProcessId`,
+                `  if (-not $children.ContainsKey($ppid)) { $children[$ppid] = New-Object System.Collections.Generic.List[int] }`,
+                `  $children[$ppid].Add([int]$row.ProcessId)`,
+                `}`,
+                `$queue = New-Object System.Collections.Generic.Queue[int]`,
+                `$visited = New-Object System.Collections.Generic.HashSet[int]`,
+                `$total = [int64]0`,
+                `$queue.Enqueue($root)`,
+                `while ($queue.Count -gt 0) {`,
+                `  $currentPid = $queue.Dequeue()`,
+                `  if ($visited.Add($currentPid)) {`,
+                `    if ($workingSet.ContainsKey($currentPid)) { $total += [int64]$workingSet[$currentPid] }`,
+                `    if ($children.ContainsKey($currentPid)) {`,
+                `      foreach ($child in $children[$currentPid]) { $queue.Enqueue($child) }`,
+                `    }`,
+                `  }`,
+                `}`,
+                `$total`,
+            ].join("\n");
+            const encodedCmd = Buffer.from(psScript, "utf16le").toString("base64");
+            const stdout = execSync(`powershell -NoProfile -EncodedCommand ${encodedCmd}`, {
+                encoding: "utf-8",
+                timeout: 3000,
+                windowsHide: true,
+            }).trim();
+            const totalBytes = Number(stdout.split(/\r?\n/u).pop()?.trim());
+            if (Number.isFinite(totalBytes) && totalBytes > 0) {
+                return totalBytes / (1024 * 1024);
+            }
+        } else {
+            const stdout = execSync("ps -eo pid=,ppid=,rss=", {
+                encoding: "utf-8",
+                timeout: 3000,
+                windowsHide: true,
+            });
+            const children = new Map<number, number[]>();
+            const rssByPid = new Map<number, number>();
+            for (const line of stdout.split(/\r?\n/u)) {
+                const [pidRaw, ppidRaw, rssRaw] = line.trim().split(/\s+/u);
+                const pid = Number(pidRaw);
+                const ppid = Number(ppidRaw);
+                const rssKb = Number(rssRaw);
+                if (!Number.isInteger(pid) || !Number.isInteger(ppid) || !Number.isFinite(rssKb)) continue;
+                rssByPid.set(pid, rssKb);
+                const list = children.get(ppid) || [];
+                list.push(pid);
+                children.set(ppid, list);
+            }
+            const seen = new Set<number>();
+            const queue = [rootPid];
+            let totalKb = 0;
+            for (let index = 0; index < queue.length; index++) {
+                const pid = queue[index];
+                if (seen.has(pid)) continue;
+                seen.add(pid);
+                totalKb += rssByPid.get(pid) || 0;
+                for (const childPid of children.get(pid) || []) {
+                    if (!seen.has(childPid)) queue.push(childPid);
+                }
+            }
+            if (totalKb > 0) return totalKb / 1024;
+        }
+    } catch (err) {
+        console.warn(`[executor] process tree memory snapshot failed, fallback to pidusage: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    const pids = getProcessTreePids(rootPid);
+    const stats = await Promise.all(pids.map(async (pid) => {
+        try {
+            return await pidusage(pid);
+        } catch {
+            return null;
+        }
+    }));
+    const totalBytes = stats.reduce((sum, stat) => sum + (stat?.memory || 0), 0);
+    return totalBytes / (1024 * 1024);
 }
 
 /**
@@ -151,7 +347,7 @@ function isShortCode(code: string): boolean {
 
 /**
  * 折叠连续重复的输出块
- * 
+ *
  * 检测连续相同的行或多行块（如 PowerShell 管道中每个元素重复报错），
  * 将 N 次重复折叠为 1 次 + 折叠提示行。
  */
@@ -283,6 +479,13 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         gpu,
     } = options;
 
+    const normalizedInput = normalizeExecutionInput(code, command);
+    if (normalizedInput.error) {
+        return makeParamErrorResult(normalizedInput.error);
+    }
+    const normalizedCode = normalizedInput.code;
+    const normalizedCommand = normalizedInput.command;
+
     const effectiveTimeout = timeout === 0 ? 0 : Math.min(timeout, DEFAULTS.maxTimeout);
     const effectiveMemory = Math.min(maxMemoryMB, DEFAULTS.maxMemoryLimit);
 
@@ -297,8 +500,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
     let execArgs: string[];
     let effectiveCwd = cwd;
 
-    if (command) {
-        let effectiveCommand = command;
+    if (normalizedCommand !== undefined) {
+        let effectiveCommand = normalizedCommand;
 
         // === 层1: 自动检测 cd/pushd 开头 + && 模式，拆分为 cwd + command ===
         if (!effectiveCwd) {
@@ -341,39 +544,27 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             execCmd = "sh";
             execArgs = ["-c", effectiveCommand];
         }
-    } else if (code) {
+    } else if (normalizedCode !== undefined) {
         // code 模式
-        if (language === "powershell" && code.length < 8000) {
+        if (language === "powershell" && normalizedCode.length < 8000) {
             // PowerShell 必须走 -Command 内联执行（-File 的 stdout 输出仍用 GBK）
-            const interp = getInterpreterArgs(language, null, code, envParam);
+            const interp = getInterpreterArgs(language, null, normalizedCode, envParam);
             execCmd = interp.cmd;
             execArgs = interp.args;
-        } else if (isShortCode(code) && (language === "python" || language === "node")) {
+        } else if (isShortCode(normalizedCode) && (language === "python" || language === "node")) {
             // Python/Node 短代码直接 -c/-e 执行
-            const interp = getInterpreterArgs(language, null, code, envParam);
+            const interp = getInterpreterArgs(language, null, normalizedCode, envParam);
             execCmd = interp.cmd;
             execArgs = interp.args;
         } else {
             // 长代码写临时文件
-            scriptPath = saveTempScript(language, code);
+            scriptPath = saveTempScript(language, normalizedCode);
             const interp = getInterpreterArgs(language, scriptPath, null, envParam);
             execCmd = interp.cmd;
             execArgs = interp.args;
         }
     } else {
-        return {
-            stdout: "",
-            stderr: "错误：必须提供 code 或 command 参数",
-            exitCode: 1,
-            elapsed: "0ms",
-            killed: false,
-            killReason: null,
-            peakMemoryMB: 0,
-            truncated: false,
-            originalBytes: 0,
-            returnedBytes: 0,
-            tempFile: null,
-        };
+        return makeParamErrorResult("错误：必须提供 code 或 command 之一");
     }
 
     return new Promise<ExecResult>((resolve) => {
@@ -420,8 +611,13 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
 
             // 大输出写临时文件
             let tempFile: string | null = null;
-            if (stdoutResult.truncated && stdoutResult.originalBytes > maxOutput) {
-                tempFile = saveTempOutput(stdoutBuf);
+            if (stdoutResult.truncated || stderrResult.truncated) {
+                tempFile = saveTempOutput([
+                    "--- stdout ---",
+                    stdoutBuf,
+                    "--- stderr ---",
+                    stderrBuf,
+                ].join("\n"));
             }
 
             const result: ExecResult = {
@@ -482,8 +678,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             if (resolved || !proc.pid) return;
 
             try {
-                const stats = await pidusage(proc.pid);
-                const memMB = stats.memory / (1024 * 1024);
+                const memMB = await getProcessTreeMemoryMB(proc.pid);
                 if (memMB > peakMemoryMB) {
                     peakMemoryMB = memMB;
                 }

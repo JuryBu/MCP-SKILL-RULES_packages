@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
+import { backgroundTaskQueueClass, withToolConcurrency } from "./tool-concurrency.js";
 
 export type BackgroundTaskStatus = "running" | "done" | "error" | "cancelled";
 
@@ -236,11 +237,15 @@ export function startBackgroundTask(
 
     void (async () => {
         try {
-            const result = await run({
+            const context: BackgroundTaskContext = {
                 updateProgress,
                 isCancelled: () => task.status === "cancelled",
                 isSettled: () => task.status !== "running",
-            });
+            };
+            const queueClass = backgroundTaskQueueClass(kind);
+            const result = queueClass
+                ? await withToolConcurrency(queueClass, `background:${kind}`, () => run(context))
+                : await run(context);
             settle("done", { result });
         } catch (err) {
             settle("error", { error: err instanceof Error ? err.message : String(err) });

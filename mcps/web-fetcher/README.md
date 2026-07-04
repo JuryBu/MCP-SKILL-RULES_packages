@@ -335,10 +335,8 @@ web_login_browser(taskId="web-login-...", waitSeconds=30)
   "mcpServers": {
     "web-fetcher": {
       "command": "node",
-      "args": ["%USERPROFILE%\\path\\to\\toolkit\\mcps\\web-fetcher\\dist\\index.js"],
-      "env": {
-        "WEB_FETCHER_PROFILES_DIR": "%USERPROFILE%\\.codex-toolkit\\web-fetcher-profiles"
-      }
+      "args": ["<toolkit-root>\\mcps\\web-fetcher\\dist\\index.js"],
+      "env": {}
     }
   }
 }

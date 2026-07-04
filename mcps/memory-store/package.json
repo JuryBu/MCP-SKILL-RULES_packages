@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.16.0",
+  "version": "1.17.1",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、四数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -8,8 +8,9 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
-    "test": "npm run test:chain-schema && npm run test:ls-model-defaults && npm run test:model-bridge && npm run test:model-bridge-claude-code && npm run test:record-generator-codex && npm run test:record-generator-coverage && npm run test:record-generator-parallel && npm run test:record-update-snapshot && npm run test:record-generator-phase-count && npm run test:record-candidate-gate && npm run test:background-tasks-progress && npm run test:codex-client && npm run test:claude-code-client && npm run test:windsurf-client && npm run test:codex-deep-locate && npm run test:codex-attachments && npm run test:conversation-context-probe && npm run test:conversation-list-fast-only && npm run test:conversation-filter && npm run test:conversation-list-format && npm run test:conversation-attachments && npm run test:conversation-exporter && npm run test:record-ownership && npm run test:record-reader && npm run test:record-reader-tools && npm run test:stage-guard-self-reference && npm run test:stage-guard-evidence && npm run test:stage-guard-evidence-index && npm run test:concurrent-index-lock && npm run test:background-ghost-writeback && npm run test:smart-cache && npm run test:record-round-split && npm run test:search-exact-recall && npm run test:serial-open-phase-context && npm run test:background-task-persist && npm run test:ls-timeout-passthrough && npm run test:error-format && npm run test:auto-background && npm run test:memory-core && npm run test:record-reader-real-regression",
+    "test": "npm run test:chain-schema && npm run test:ls-model-defaults && npm run test:model-bridge && npm run test:model-bridge-claude-code && npm run test:record-generator-codex && npm run test:record-generator-coverage && npm run test:record-generator-parallel && npm run test:record-update-snapshot && npm run test:record-generator-phase-count && npm run test:record-candidate-gate && npm run test:record-bulk-update-alias && npm run test:tool-concurrency && npm run test:background-tasks-progress && npm run test:codex-client && npm run test:claude-code-client && npm run test:windsurf-client && npm run test:codex-deep-locate && npm run test:codex-attachments && npm run test:conversation-context-probe && npm run test:conversation-list-fast-only && npm run test:conversation-filter && npm run test:conversation-list-format && npm run test:conversation-attachments && npm run test:conversation-exporter && npm run test:conversation-batch-export && npm run test:record-ownership && npm run test:record-reader && npm run test:record-reader-tools && npm run test:stage-guard-self-reference && npm run test:stage-guard-evidence && npm run test:stage-guard-evidence-index && npm run test:concurrent-index-lock && npm run test:background-ghost-writeback && npm run test:smart-cache && npm run test:record-round-split && npm run test:search-exact-recall && npm run test:serial-open-phase-context && npm run test:background-task-persist && npm run test:ls-timeout-passthrough && npm run test:error-format && npm run test:auto-background && npm run test:memory-core && npm run test:record-reader-real-regression && npm run test:conversation-router && npm run test:ls-fetch-stale-cache && npm run test:windsurf-endpoint-select && npm run test:ls-current-cascade-binding && npm run test:ls-registry-cleanup && npm run test:query-parser && npm run test:relevance-scoring && npm run test:search-confidence && npm run test:antigravity-tool-image",
     "test:chain-schema": "tsx tests/chain-schema.test.ts",
+    "test:antigravity-tool-image": "tsx tests/antigravity-tool-image.test.ts",
     "test:ls-model-defaults": "tsx tests/ls-model-defaults.test.ts",
     "test:model-bridge": "tsx tests/model-bridge.test.ts",
     "test:model-bridge-claude-code": "tsx tests/model-bridge-claude-code.test.ts",
@@ -19,6 +20,8 @@
     "test:record-update-snapshot": "tsx tests/record-update-snapshot.test.ts",
     "test:record-generator-phase-count": "tsx tests/record-generator-phase-count.test.ts",
     "test:record-candidate-gate": "tsx tests/record-candidate-gate.test.ts",
+    "test:record-bulk-update-alias": "tsx tests/record-bulk-update-alias.test.ts",
+    "test:tool-concurrency": "tsx tests/tool-concurrency.test.ts",
     "test:background-tasks-progress": "tsx tests/background-tasks-progress.test.ts",
     "test:codex-client": "tsx tests/codex-client.test.ts",
     "test:claude-code-client": "tsx tests/claude-code-client.test.ts",
@@ -30,6 +33,7 @@
     "test:conversation-filter": "tsx tests/conversation-filter.test.ts",
     "test:conversation-attachments": "tsx tests/conversation-attachments.test.ts",
     "test:conversation-exporter": "tsx tests/conversation-exporter.test.ts",
+    "test:conversation-batch-export": "tsx tests/conversation-batch-export.test.ts",
     "test:record-ownership": "tsx tests/record-ownership.test.ts",
     "test:record-reader": "tsx tests/record-reader.test.ts",
     "test:record-reader-tools": "tsx tests/record-reader-tools.test.ts",
@@ -49,7 +53,15 @@
     "test:memory-core": "tsx tests/memory-core.test.ts",
     "test:record-reader-real-regression": "tsx tests/record-reader-real-regression.test.ts",
     "clean": "rimraf dist",
-    "test:conversation-list-format": "tsx tests/conversation-list-format.test.ts"
+    "test:conversation-list-format": "tsx tests/conversation-list-format.test.ts",
+    "test:conversation-router": "tsx tests/conversation-router.test.ts",
+    "test:ls-fetch-stale-cache": "tsx tests/ls-fetch-stale-cache.test.ts",
+    "test:windsurf-endpoint-select": "tsx tests/windsurf-endpoint-select.test.ts",
+    "test:ls-current-cascade-binding": "tsx tests/ls-current-cascade-binding.test.ts",
+    "test:ls-registry-cleanup": "tsx tests/ls-registry-cleanup.test.ts",
+    "test:query-parser": "tsx tests/query-parser.test.ts",
+    "test:relevance-scoring": "tsx tests/relevance-scoring.test.ts",
+    "test:search-confidence": "tsx tests/search-confidence.test.ts"
   },
   "engines": {
     "node": ">=18"
@@ -57,9 +69,13 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "fuse.js": "^7.0.0",
+    "katex": "^0.17.0",
+    "markdown-it": "^14.2.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/katex": "^0.16.8",
+    "@types/markdown-it": "^14.1.2",
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"

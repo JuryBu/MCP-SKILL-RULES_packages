@@ -13,6 +13,10 @@ export interface ClaudeCodeThreadInfo {
     cwd: string;
     title: string;
     source: "claude-code";
+    isChildThread?: boolean;
+    parentConversationId?: string | null;
+    agentRole?: string | null;
+    agentNickname?: string | null;
     model?: string | null;
     entrypoint?: string | null;
     updatedAtMs?: number | null;
@@ -22,6 +26,7 @@ export interface ClaudeCodeThreadInfo {
     desktopIndexPath?: string | null;
     desktopIndexRoot?: string | null;
     isArchived?: boolean | null;
+    titleAliases?: string[];
 }
 
 export interface ClaudeCodeConversationData {
@@ -148,10 +153,34 @@ function claudeDesktopIndexRoots(): string[] {
             .filter(Boolean);
     }
     const roaming = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
-    return [
+    const roots = [
         path.join(roaming, "Claude", "claude-code-sessions"),
         path.join(roaming, "Claude", "local-agent-mode-sessions"),
     ];
+    const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    const packagesDir = path.join(localAppData, "Packages");
+    try {
+        for (const entry of fs.readdirSync(packagesDir, { withFileTypes: true })) {
+            if (!entry.isDirectory()) continue;
+            if (!entry.name.toLowerCase().startsWith("claude")) continue;
+            const packagedRoaming = path.join(packagesDir, entry.name, "LocalCache", "Roaming", "Claude");
+            for (const candidateRoot of [
+                path.join(packagedRoaming, "claude-code-sessions"),
+                path.join(packagedRoaming, "local-agent-mode-sessions"),
+            ]) {
+                if (fs.existsSync(candidateRoot)) roots.push(candidateRoot);
+            }
+        }
+    } catch {
+        // Windows Store package path is optional.
+    }
+    const seen = new Set<string>();
+    return roots.filter(root => {
+        const key = root.toLowerCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 function safeStat(filePath: string): fs.Stats | null {
@@ -506,6 +535,7 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                     mimeType,
                     dataUrl: `data:${mimeType};base64,${source.data}`,
                     sizeBytes: estimateBase64Bytes(source.data),
+                    stepIndex: options.stepIndex,
                 });
             } else if (typeof source.path === "string" || typeof item.path === "string") {
                 const rawPath = source.path || item.path;
@@ -516,6 +546,7 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                     name: path.basename(resolved),
                     originalPath: resolved,
                     exists: fs.existsSync(resolved),
+                    stepIndex: options.stepIndex,
                 });
             }
         } else if ((item.type === "file" || item.type === "document") && (typeof item.path === "string" || typeof item.name === "string")) {
@@ -528,6 +559,7 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                 originalPath: resolved || undefined,
                 exists: resolved ? fs.existsSync(resolved) : undefined,
                 mimeType: item.mime_type || item.mimeType,
+                stepIndex: options.stepIndex,
             });
         }
     }
@@ -620,6 +652,8 @@ function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, Claude
     const stat = safeStat(jsonlPath);
     if (!stat?.isFile()) return null;
     const desktop = desktopIndex?.get(id.toLowerCase());
+    const parentConversationId = extractClaudeCodeSubagentParentConversationId(jsonlPath);
+    const isChildThread = Boolean(parentConversationId) || isLikelyClaudeCodeSubagentJsonl(jsonlPath);
     let cwd = "";
     let title = "";
     let aiTitle = "";
@@ -627,28 +661,54 @@ function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, Claude
     let lastPrompt = "";
     let model: string | null = null;
     let entrypoint: string | null = null;
+    const titleAliases: string[] = [];
+    const pushTitleAlias = (value: unknown) => {
+        if (typeof value !== "string") return;
+        const alias = value.replace(/\s+/gu, " ").trim();
+        if (!alias) return;
+        if (!titleAliases.some(existing => existing.toLowerCase() === alias.toLowerCase())) titleAliases.push(alias);
+    };
+    pushTitleAlias(desktop?.title);
 
     readJsonlLines(jsonlPath, (line) => {
         const event = parseJsonLine(line);
         if (!event) return;
         if (!cwd && typeof event.cwd === "string") cwd = event.cwd;
         if (!entrypoint && typeof event.entrypoint === "string") entrypoint = event.entrypoint;
-        if (event.type === "ai-title" && typeof event.aiTitle === "string") aiTitle = event.aiTitle;
-        if (event.type === "custom-title" && typeof event.customTitle === "string") customTitle = event.customTitle;
-        if (event.type === "last-prompt" && typeof event.lastPrompt === "string") lastPrompt = event.lastPrompt;
+        if (event.type === "ai-title" && typeof event.aiTitle === "string") {
+            aiTitle = event.aiTitle;
+            pushTitleAlias(event.aiTitle);
+        }
+        if (event.type === "custom-title" && typeof event.customTitle === "string") {
+            customTitle = event.customTitle;
+            pushTitleAlias(event.customTitle);
+        }
+        if (event.type === "last-prompt" && typeof event.lastPrompt === "string") {
+            lastPrompt = event.lastPrompt;
+            pushTitleAlias(event.lastPrompt);
+        }
         if (!model && typeof event?.message?.model === "string") model = event.message.model;
         if (!title && event.type === "user") {
             const extracted = extractMessageContent(event.message?.content, cwd);
-            if (extracted.text) title = extracted.text.slice(0, 80);
+            if (extracted.text) {
+                title = extracted.text.slice(0, 80);
+                pushTitleAlias(title);
+            }
         }
     }, { maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS });
 
+    const displayTitle = customTitle || aiTitle || desktop?.title || title || lastPrompt || id;
+    pushTitleAlias(displayTitle);
     return {
         id,
         jsonlPath,
         cwd: cwd || desktop?.cwd || "",
-        title: customTitle || aiTitle || desktop?.title || title || lastPrompt || id,
+        title: displayTitle,
         source: "claude-code",
+        isChildThread,
+        parentConversationId,
+        agentRole: isChildThread ? "claude-code-subagent" : null,
+        agentNickname: isChildThread ? path.basename(jsonlPath, ".jsonl") : null,
         model,
         entrypoint,
         updatedAtMs: desktop?.updatedAtMs || stat.mtimeMs,
@@ -658,6 +718,7 @@ function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, Claude
         desktopIndexPath: desktop?.indexPath || null,
         desktopIndexRoot: desktop?.indexRoot || null,
         isArchived: desktop?.isArchived ?? null,
+        titleAliases,
     };
 }
 
@@ -688,7 +749,9 @@ export function resolveClaudeCodeThreadId(input: string): string | null {
     if (exact) return exact.id;
     const prefixMatches = threads.filter(thread => thread.id.startsWith(query));
     if (prefixMatches.length === 1) return prefixMatches[0].id;
-    const titleMatches = threads.filter(thread => (thread.title || "").toLowerCase() === queryLower);
+    const titleMatches = threads.filter(thread =>
+        [thread.title, ...(thread.titleAliases || [])].some(title => (title || "").toLowerCase() === queryLower)
+    );
     if (titleMatches.length === 1) return titleMatches[0].id;
     return null;
 }
@@ -725,6 +788,20 @@ function normalizeLogicalChainTitle(input?: string): string {
 function isLikelyClaudeCodeSubagentJsonl(jsonlPath: string): boolean {
     const normalized = jsonlPath.replace(/\\/gu, "/").toLowerCase();
     return normalized.includes("/subagents/") || path.basename(jsonlPath).toLowerCase().startsWith("agent-");
+}
+
+function extractClaudeCodeSubagentParentConversationId(jsonlPath: string): string | null {
+    const parts = jsonlPath.replace(/\\/gu, "/").split("/").filter(Boolean);
+    let subagentsIndex = -1;
+    for (let index = parts.length - 1; index >= 0; index--) {
+        if (parts[index].toLowerCase() === "subagents") {
+            subagentsIndex = index;
+            break;
+        }
+    }
+    if (subagentsIndex <= 0) return null;
+    const parent = parts[subagentsIndex - 1]?.trim();
+    return parent || null;
 }
 
 function containsContinuationIntent(text: string): boolean {
@@ -1141,6 +1218,11 @@ function cloneRoundWithLogicalOffsets(
     cloned.taskBoundaries = (cloned.taskBoundaries || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
     cloned.codeActions = (cloned.codeActions || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
     cloned.fileViews = (cloned.fileViews || []).map((item: any) => ({ ...item, stepIndex: item.stepIndex + stepOffset }));
+    // attachments.stepIndex 也是物理步坐标，续聊归并时必须与 startStep/aiResponses 一起偏移成全局坐标，
+    // 否则 bucketAttachmentsByStep 会把图错配到用户段顶部（E-SEV-2）。
+    // mediaAttachments 是路径字符串数组、无 stepIndex，不需偏移。
+    cloned.attachments = (cloned.attachments || []).map((item: any) =>
+        item.stepIndex != null ? { ...item, stepIndex: item.stepIndex + stepOffset } : item);
     cloned.subagentSummaries = cloned.subagentSummaries || [];
     return cloned;
 }

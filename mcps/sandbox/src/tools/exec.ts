@@ -5,7 +5,7 @@ import { execute } from "../executor.js";
 
 /**
  * sandbox_exec 工具 — 代码/命令执行
- * 
+ *
  * 支持 code（直接代码字符串）和 command（系统命令）两种模式。
  * 提供硬超时、内存限制、输出截断等保护。
  */
@@ -60,8 +60,8 @@ command 模式：执行系统命令，自动用 shell 包装
             // 参数校验（含 code/command 非空互斥检查，空串视为未提供）
             const codeRaw = params.code as string | undefined;
             const commandRaw = params.command as string | undefined;
-            const hasCode = typeof codeRaw === "string" && codeRaw.length > 0;
-            const hasCommand = typeof commandRaw === "string" && commandRaw.length > 0;
+            const hasCode = typeof codeRaw === "string" && codeRaw.trim().length > 0;
+            const hasCommand = typeof commandRaw === "string" && commandRaw.trim().length > 0;
 
             if (hasCode === hasCommand) {  // XOR: 都没提供 或 都提供了 → 报错
                 return {
@@ -70,8 +70,8 @@ command 模式：执行系统命令，自动用 shell 包装
             }
 
             // 归一：空串归并为 undefined 往下传，统一 handler/executor 两层口径
-            const code = hasCode ? codeRaw : undefined;
-            const command = hasCommand ? commandRaw : undefined;
+            const code = codeRaw?.trim() ? codeRaw : undefined;
+            const command = commandRaw?.trim() ? commandRaw : undefined;
 
             const language = (params.language as string) || undefined;
             const cwd = params.cwd as string | undefined;

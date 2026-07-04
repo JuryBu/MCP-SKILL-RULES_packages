@@ -1,15 +1,30 @@
 import { execSync, execFileSync } from "child_process";
-import http from "http";
 import path from "path";
 import os from "os";
 import fs from "fs";
 import {
-    readRegistry, registerLsEntry, removeFromRegistry,
-    markHeartbeatSuccess, markHeartbeatFailure,
+    registerLsEntry,
     cleanDeadEntries,
-    type RegistryEntry,
 } from "./ls-registry.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL_FALLBACKS } from "./ls-model-defaults.js";
+import {
+    type LsProcessInfo,
+    rpcCall,
+    findHttpPort,
+    getStepCountLight,
+    HEAVY_TIMEOUT,
+    LIGHT_TIMEOUT,
+} from "./ls-rpc.js";
+import {
+    resolveEndpointForConversation,
+    enumerateActiveLs,
+    rememberMapping,
+    invalidateMapping,
+    getCurrentContext,
+    type RouterEndpoint,
+} from "./conversation-router.js";
+
+export type { LsProcessInfo } from "./ls-rpc.js";
 
 /**
  * Language Server connect-rpc 客户端
@@ -25,19 +40,8 @@ import { DEFAULT_ANTIGRAVITY_LS_MODEL_FALLBACKS } from "./ls-model-defaults.js";
  */
 
 // ===== 类型 =====
-
-export interface LsProcessInfo {
-    pid: number;
-    csrfToken: string;
-    workspaceId: string;
-    ports: number[];
-}
-
-interface RpcResult {
-    status: number;
-    data: any;
-    rawSize: number;
-}
+// LsProcessInfo / RpcResult / rpcCall / findHttpPort / getStepCountLight /
+// HEAVY_TIMEOUT / LIGHT_TIMEOUT 已抽到 ls-rpc.ts（见蓝图步骤 1），此处 import 复用。
 
 /** 父 LS 已确认的连接信息（含验证后的 HTTP 端口） */
 interface ParentLsConnection {
@@ -176,7 +180,19 @@ export async function initParentLs(): Promise<void> {
  * 发现所有 LS 进程（PowerShell 全量扫描）
  * v1.6: 降级为三步查找的 Step 3 兜底手段
  */
+/** 测试注入的 LS 进程发现替身（null=用真实 PowerShell 扫描）。生产代码不调用。 */
+let lsDiscoveryOverride: (() => LsProcessInfo[]) | null = null;
+
+/**
+ * 测试专用：注入 discoverLsProcesses 替身，让 conversation-router 的 PowerShell 兜底分支
+ * 可离线触发（不真跑 PowerShell）。传 null 还原真实扫描。生产代码不调用。
+ */
+export function __setLsDiscoveryForTest(fn: (() => LsProcessInfo[]) | null): void {
+    lsDiscoveryOverride = fn;
+}
+
 export function discoverLsProcesses(): LsProcessInfo[] {
+    if (lsDiscoveryOverride) return lsDiscoveryOverride();
     try {
         const psScript = [
             "$ProgressPreference = 'SilentlyContinue'",
@@ -221,137 +237,12 @@ export function discoverLsProcesses(): LsProcessInfo[] {
     }
 }
 
-/** 注册表条目转 LsProcessInfo */
-function entryToLsInfo(entry: RegistryEntry): LsProcessInfo {
-    return {
-        pid: entry.pid,
-        csrfToken: entry.csrfToken,
-        workspaceId: entry.workspaceId,
-        ports: [entry.port],
-    };
-}
-
-// ===== connect-rpc 调用 =====
-
-/**
- * 底层 HTTP POST 请求
- */
-function httpPost(
-    host: string,
-    port: number,
-    urlPath: string,
-    body: string,
-    headers: Record<string, string>,
-    timeoutMs = 15000
-): Promise<{ status: number; body: string }> {
-    return new Promise((resolve, reject) => {
-        const req = http.request(
-            {
-                hostname: host,
-                port,
-                path: urlPath,
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "Content-Length": Buffer.byteLength(body),
-                    ...headers,
-                },
-                timeout: timeoutMs,
-            },
-            (res) => {
-                const chunks: Buffer[] = [];
-                res.on("data", (chunk: Buffer) => chunks.push(chunk));
-                res.on("end", () => {
-                    const responseBody = Buffer.concat(chunks).toString("utf-8");
-                    resolve({ status: res.statusCode || 0, body: responseBody });
-                });
-            }
-        );
-        req.on("error", reject);
-        req.on("timeout", () => {
-            req.destroy();
-            reject(new Error("Request timeout"));
-        });
-        req.write(body);
-        req.end();
-    });
-}
-
-/**
- * 调用 LS 的 connect-rpc 方法
- * @param timeoutMs 自定义超时（默认 15s，大数据操作建议 60-120s）
- */
-async function rpcCall(
-    lsInfo: LsProcessInfo,
-    port: number,
-    method: string,
-    payload: Record<string, unknown> = {},
-    timeoutMs = 15000
-): Promise<RpcResult> {
-    const rpcPath = `/exa.language_server_pb.LanguageServerService/${method}`;
-    const body = JSON.stringify(payload);
-    const headers = {
-        "x-codeium-csrf-token": lsInfo.csrfToken,
-        "Connect-Protocol-Version": "1",
-    };
-
-    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs);
-
-    let data: any;
-    try {
-        data = resp.body ? JSON.parse(resp.body) : {};
-    } catch {
-        data = resp.body;
-    }
-
-    return { status: resp.status, data, rawSize: resp.body?.length ?? 0 };
-}
-
-/**
- * 找到 LS 的有效 HTTP 端口（通过 Heartbeat 验证）
- */
-async function findHttpPort(lsInfo: LsProcessInfo): Promise<number | null> {
-    for (const port of lsInfo.ports) {
-        try {
-            const result = await rpcCall(lsInfo, port, "Heartbeat", {}, 5000);
-            if (result.status === 200) return port;
-        } catch { /* try next */ }
-    }
-    return null;
-}
-
 // ===== 对话数据获取 =====
+// rpcCall / findHttpPort / getStepCountLight / HEAVY_TIMEOUT / LIGHT_TIMEOUT
+// 已抽到 ls-rpc.ts（见蓝图步骤 1）。
 
-/** 每页预估步数（用于并行分页计算） */
-const STEPS_PER_PAGE = 750;
 /** 尾部校验步数（用于检测回溯） */
 const TAIL_VERIFY_STEPS = 30;
-/** 重量级操作超时 */
-const HEAVY_TIMEOUT = 120000;
-/** 轻量级操作超时 */
-const LIGHT_TIMEOUT = 30000;
-
-/**
- * 轻量级获取指定对话的 stepCount
- * 用 GetAllCascadeTrajectories（~46KB/1s）替代 GetCascadeTrajectory（~7MB/14s）
- * @returns stepCount，若该 LS 没有此对话则返回 -1
- */
-async function getStepCountLight(
-    lsInfo: LsProcessInfo,
-    port: number,
-    cascadeId: string
-): Promise<{ stepCount: number; lastModifiedTime?: string }> {
-    const result = await rpcCall(lsInfo, port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
-    if (result.status !== 200) return { stepCount: -1 };
-    const summaries = result.data?.trajectorySummaries;
-    if (!summaries || typeof summaries !== "object") return { stepCount: -1 };
-    const info = summaries[cascadeId];
-    if (!info) return { stepCount: -1 };
-    return {
-        stepCount: info.stepCount ?? 0,
-        lastModifiedTime: info.lastModifiedTime,
-    };
-}
 
 /** 安全间隔基准：2.5MB（LS 实际返回 ~5MB/页，但步骤大小递增导致后续页步数减少，需留足容错） */
 const SAFE_PAGE_SIZE_KB = 2560;
@@ -526,17 +417,13 @@ async function verifyTail(
 }
 
 /**
- * 获取指定对话的完整 trajectory 数据
+ * 获取指定对话的完整 trajectory 数据（薄壳化，见蓝图步骤 5）
  *
- * v1.6 三步查找策略：
- * Step 1: 父 LS（ppid 直连，0 发现开销）→ 大多数场景直接命中
- * Step 2: 注册表中其他 LS（~5ms）→ 跨窗口对话
- * Step 3: PowerShell 全量发现（极罕见兜底）→ 刚开的窗口未注册时
- *
- * 数据获取策略（在找到 LS 后）：
- * 1. 轻量 check → stepCount 没变 → 用缓存
- * 2. stepCount 变了 → 增量 + 尾部校验
- * 3. 回溯或校验失败 → 并行分页全量重拉
+ * Phase 0（保留，单反重力 / 非 broker 回归快路径）：父 LS（ppid 直连）先试，
+ *   命中持有则直接拉数据（开销≈直连），命中后顺手 rememberMapping（纯内存写）。
+ * Phase 1（broker / 多 LS）：交给路由大脑 resolveEndpointForConversation：
+ *   映射命中再确认（快路径）/ 枚举活跃 LS 并发广播 holds 取真持有者（慢路径，永不连错）。
+ *   拿到 endpoint + 权威 stepCount → fetchFromLs（endpoint 指纹 + 权威 stepCount 缓存复核，方案 C）。
  */
 export async function fetchTrajectory(
     cascadeId: string,
@@ -545,86 +432,105 @@ export async function fetchTrajectory(
     const cachePath = getConvCachePath(cascadeId);
     const errors: string[] = [];
 
-    // ===== Step 1: 父 LS（ppid 直连）=====
+    // ===== Phase 0: 父 LS（ppid 直连，单反重力 / 非 broker 回归快路径）=====
     if (parentLs) {
+        const pls = parentLs;
         try {
-            const result = await fetchFromLs(parentLs.info, parentLs.port, cascadeId, cachePath, forceRefresh);
-            if (result) return result;
-        } catch (err: any) {
-            errors.push(`父LS PID=${parentLs.info.pid}: ${err.message}`);
-        }
-    }
-
-    // ===== Step 2: 注册表中其他 LS =====
-    const registry = readRegistry();
-    const parentPidStr = String(process.ppid);
-    for (const [pidStr, entry] of Object.entries(registry.processes)) {
-        if (pidStr === parentPidStr) continue; // 跳过父 LS（已在 Step 1 查过）
-
-        // 进程存活快速检测（微秒级）
-        try { process.kill(parseInt(pidStr, 10), 0); } catch {
-            markHeartbeatFailure(pidStr);
-            continue;
-        }
-
-        // Heartbeat 验证（网络级）
-        const lsInfo = entryToLsInfo(entry);
-        try {
-            const hb = await rpcCall(lsInfo, entry.port, "Heartbeat", {}, 5000);
-            if (hb.status !== 200) {
-                const shouldRemove = markHeartbeatFailure(pidStr);
-                if (shouldRemove) continue;
-                continue;
+            // 持有性校验：父 LS 确实持有此对话才走直连（避免对错对话误命中父 LS）
+            const { stepCount } = await getStepCountLight(pls.info, pls.port, cascadeId);
+            if (stepCount >= 0) {
+                const result = await fetchFromLs(pls.info, pls.port, cascadeId, cachePath, forceRefresh, stepCount);
+                if (result) {
+                    // L1 修复：命中后写映射用真 transport（rpcCall），后续重读走快路径能真加速；
+                    // 旧 placeholder reject 会让快路径每次 holds 必失败→失效落慢路径，等于死映射。
+                    rememberMapping(cascadeId, "antigravity", {
+                        kind: "antigravity",
+                        pid: pls.info.pid,
+                        port: pls.port,
+                        csrfToken: pls.info.csrfToken,
+                        workspaceId: pls.info.workspaceId,
+                        key: `antigravity:${pls.info.pid}:${pls.port}`,
+                        transport: (method, payload = {}, timeoutMs = LIGHT_TIMEOUT) =>
+                            rpcCall(pls.info, pls.port, method, payload, timeoutMs).then(r => {
+                                if (r.status < 200 || r.status >= 300) throw new Error(`antigravity rpc ${method} status ${r.status}`);
+                                return r.data;
+                            }),
+                    }, stepCount);
+                    return result;
+                }
             }
-            markHeartbeatSuccess(pidStr);
-        } catch {
-            markHeartbeatFailure(pidStr);
-            continue;
-        }
-
-        try {
-            const result = await fetchFromLs(lsInfo, entry.port, cascadeId, cachePath, forceRefresh);
-            if (result) return result;
         } catch (err: any) {
-            errors.push(`注册表 PID=${pidStr}: ${err.message}`);
+            errors.push(`父LS PID=${pls.info.pid}: ${err.message}`);
         }
     }
 
-    // ===== Step 3: PowerShell 全量发现（极罕见兜底）=====
-    const freshProcesses = discoverLsProcesses()
-        .filter(ls => ls.pid !== process.ppid); // 父 LS 已在 Step 1 查过
-
-    for (const ls of freshProcesses) {
-        const port = await findHttpPort(ls);
-        if (!port) continue;
-
-        // 顺便注册到注册表
-        registerLsEntry({
-            pid: ls.pid,
-            port,
-            csrfToken: ls.csrfToken,
-            workspaceId: ls.workspaceId,
-            registeredAt: new Date().toISOString(),
-        });
-
-        try {
-            const result = await fetchFromLs(ls, port, cascadeId, cachePath, forceRefresh);
-            if (result) return result;
-        } catch (err: any) {
-            errors.push(`全量扫描 PID=${ls.pid}: ${err.message}`);
+    // ===== Phase 1: 路由大脑（broker / 多 LS，持有性广播，永不连错）=====
+    let probedCount = 0;
+    try {
+        const resolved = await resolveEndpointForConversation(cascadeId, "antigravity");
+        probedCount = resolved.probedCount;
+        if (resolved.endpoint) {
+            const ep = resolved.endpoint;
+            // RouterEndpoint 平铺为 fetchFromLs 需要的 lsInfo,port（见蓝图 §7-D 裁决）。
+            const lsInfo: LsProcessInfo = {
+                pid: ep.pid,
+                csrfToken: ep.csrfToken,
+                workspaceId: ep.workspaceId ?? "",
+                ports: [ep.port],
+            };
+            try {
+                const result = await fetchFromLs(lsInfo, ep.port, cascadeId, cachePath, forceRefresh, resolved.stepCount);
+                if (result) return result;
+                // 持有者读不出数据（极罕见）→ 剔除映射避免下次再粘
+                invalidateMapping(cascadeId, "antigravity");
+            } catch (err: any) {
+                invalidateMapping(cascadeId, "antigravity");
+                errors.push(`持有者 PID=${ep.pid}: ${err.message}`);
+            }
+        } else if (resolved.reason === "no_ls") {
+            errors.push("无活跃反重力 LS");
+        } else {
+            errors.push("活跃反重力 LS 均不持有热列表");
         }
+    } catch (err: any) {
+        errors.push(`路由解析失败: ${err.message}`);
     }
 
-    // 所有步骤都失败
-    const totalSearched = (parentLs ? 1 : 0)
-        + Object.keys(registry.processes).filter(p => p !== parentPidStr).length
-        + freshProcesses.length;
-    throw new Error(`无法从任何 LS 获取对话 ${cascadeId}（共尝试 ${totalSearched} 个 LS）：\n${errors.join("\n")}`);
+    // ===== Phase 2: .pb 历史兜底（恢复 EP-X 前的历史对话读取能力）=====
+    // 活跃 LS 的热列表都不持有此 cascadeId（典型场景：窗口已关闭的历史对话），但磁盘 .pb 文件可能仍在。
+    // 任意活跃 LS 都能按需加载 .pb（fetchFromLs 内 stepCount<0 → fetchAllStepsPaged 触发 LS 加载 .pb）。
+    // 遍历活跃 LS 逐个尝试，任一拉到即返回。多窗口正常路径不受影响（真持有者已在 Phase 1 命中返回，不会走到这里）。
+    try {
+        const activeLs = await enumerateActiveLs("antigravity");
+        for (const ep of activeLs) {
+            const lsInfo: LsProcessInfo = { pid: ep.pid, csrfToken: ep.csrfToken, workspaceId: ep.workspaceId ?? "", ports: [ep.port] };
+            try {
+                const result = await fetchFromLs(lsInfo, ep.port, cascadeId, cachePath, forceRefresh);
+                if (result) return result;
+            } catch (err: any) {
+                errors.push(`.pb 兜底 PID=${ep.pid}: ${err.message}`);
+            }
+        }
+    } catch (err: any) {
+        errors.push(`.pb 兜底枚举失败: ${err.message}`);
+    }
+
+    // 所有步骤都失败（活跃 LS 都不持有热列表，且 .pb 也拉不到 → 对话确实不可达）
+    throw new Error(`无法从任何 LS 获取对话 ${cascadeId}（路由广播探测 ${probedCount} 个 LS + .pb 兜底）：\n${errors.join("\n")}`);
 }
 
 /**
  * 从指定 LS 获取对话数据（内部方法）
  * 封装了热列表检查 → 缓存 → 增量/全量 的完整逻辑
+ *
+ * 方案 C（见蓝图 §3.3）：缓存复核加 endpoint 指纹。
+ *   complete三连（全满足才直接信缓存）：
+ *     ① cachedStepCount === currentStepCount  ② cachedSteps.length > 0  ③ cachedEndpoint === thisEndpoint
+ *   若 ②满足但 endpoint 不一致 → 强制 verifyTail 二次确认后才返并刷指纹。
+ *   新增显式分支 currentStepCount < cachedStepCount → 强制全量（旧代码无此分支）。
+ *   currentStepCount 此刻保证来自路由大脑确认的真持有者，②号失败路径根因消除。
+ *
+ * @param knownStepCount 路由大脑广播已拿到时复用，省一次 getStepCountLight。
  * @returns trajectory 或 null（该 LS 不持有此对话）
  */
 async function fetchFromLs(
@@ -632,10 +538,19 @@ async function fetchFromLs(
     port: number,
     cascadeId: string,
     cachePath: string,
-    forceRefresh: boolean
+    forceRefresh: boolean,
+    knownStepCount?: number,
 ): Promise<{ trajectory: any; fromCache: boolean } | null> {
-    // 检查热列表
-    let { stepCount: currentStepCount } = await getStepCountLight(lsInfo, port, cascadeId);
+    // 本次 endpoint 指纹（写入者身份）
+    const thisEndpoint = `${lsInfo.pid}:${port}`;
+
+    // 检查热列表（复用路由大脑已拿到的权威 stepCount，省一次 RPC）
+    let currentStepCount: number;
+    if (typeof knownStepCount === "number") {
+        currentStepCount = knownStepCount;
+    } else {
+        ({ stepCount: currentStepCount } = await getStepCountLight(lsInfo, port, cascadeId));
+    }
 
     if (currentStepCount < 0) {
         // 不在热列表，尝试直接拉取（LS 会自动加载 .pb）
@@ -643,7 +558,7 @@ async function fetchFromLs(
             const allSteps = await fetchAllStepsPaged(lsInfo, port, cascadeId);
             if (allSteps.length > 0) {
                 const trajectory = { steps: allSteps };
-                saveConvCache(cascadeId, { stepCount: allSteps.length, trajectory });
+                saveConvCache(cascadeId, { stepCount: allSteps.length, trajectory, endpoint: thisEndpoint });
                 return { trajectory, fromCache: false };
             }
         } catch { /* 500 = .pb 不存在 */ }
@@ -656,13 +571,27 @@ async function fetchFromLs(
             const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8"));
             const cachedStepCount = cached?.stepCount ?? cached?.numTotalSteps ?? 0;
             const cachedSteps = cached?.trajectory?.steps ?? [];
+            const cachedEndpoint = typeof cached?.endpoint === "string" ? cached.endpoint : "";
+            const sameEndpoint = cachedEndpoint === thisEndpoint;
 
             if (cachedStepCount === currentStepCount && cachedSteps.length > 0) {
-                return { trajectory: cached.trajectory, fromCache: true };
-            }
-
-            // stepCount 变了 → 智能更新
-            if (cachedSteps.length > 0 && currentStepCount > cachedStepCount) {
+                if (sameEndpoint) {
+                    // ①②③ 全满足，同源直接返缓存
+                    return { trajectory: cached.trajectory, fromCache: true };
+                }
+                // ②满足但 endpoint 不一致（跨端点 / 老缓存无指纹）→ 强制 verifyTail 二次确认。
+                const tailOk = await verifyTail(lsInfo, port, cascadeId, cachedSteps, TAIL_VERIFY_STEPS);
+                if (tailOk) {
+                    // 确认一致 → 返缓存并刷指纹（补写 endpoint）
+                    saveConvCache(cascadeId, { stepCount: currentStepCount, trajectory: cached.trajectory, endpoint: thisEndpoint });
+                    return { trajectory: cached.trajectory, fromCache: true };
+                }
+                // 尾部不一致 → fallthrough 到全量
+            } else if (cachedSteps.length > 0 && currentStepCount < cachedStepCount) {
+                // 新增显式分支：真持有者步数比缓存还少（回溯 / 缓存来自别的更长对话）→ 强制全量，不信缓存。
+                // fallthrough 到全量
+            } else if (cachedSteps.length > 0 && currentStepCount > cachedStepCount) {
+                // stepCount 增长 → 智能增量更新
                 const [tailOk, newSteps] = await Promise.all([
                     verifyTail(lsInfo, port, cascadeId, cachedSteps, TAIL_VERIFY_STEPS),
                     fetchStepsIncremental(lsInfo, port, cascadeId, cachedSteps.length),
@@ -672,7 +601,7 @@ async function fetchFromLs(
                     const mergedSteps = [...cachedSteps, ...newSteps];
                     const trajectory = cached.trajectory;
                     trajectory.steps = mergedSteps;
-                    saveConvCache(cascadeId, { stepCount: currentStepCount, trajectory });
+                    saveConvCache(cascadeId, { stepCount: currentStepCount, trajectory, endpoint: thisEndpoint });
                     return { trajectory, fromCache: false };
                 }
                 // 尾部不一致 → fallthrough 到全量
@@ -685,7 +614,7 @@ async function fetchFromLs(
     if (allSteps.length === 0) return null;
 
     const trajectory = { steps: allSteps };
-    saveConvCache(cascadeId, { stepCount: currentStepCount, trajectory });
+    saveConvCache(cascadeId, { stepCount: currentStepCount, trajectory, endpoint: thisEndpoint });
     return { trajectory, fromCache: false };
 }
 
@@ -694,8 +623,6 @@ async function fetchFromLs(
  * 比 fetchTrajectory 快很多（1-3s vs 10-30s）
  */
 export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | null> {
-    // 复用 fetchTrajectory 的多 LS 查找策略，但只拉第一页
-
     // 尝试从单个 LS 拉第一页
     const tryLs = async (info: LsProcessInfo, port: number): Promise<any[] | null> => {
         try {
@@ -706,21 +633,24 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
         } catch { return null; }
     };
 
-    // Step 1: 父 LS
+    // Phase 0: 父 LS（直连快路径）
     if (parentLs) {
         const steps = await tryLs(parentLs.info, parentLs.port);
         if (steps) return steps;
     }
 
-    // Step 2: 注册表中其他 LS
-    const registry = readRegistry();
-    for (const [pidStr, entry] of Object.entries(registry.processes)) {
-        if (pidStr === String(process.ppid)) continue;
-        try { process.kill(parseInt(pidStr, 10), 0); } catch { continue; }
-        const lsInfo = entryToLsInfo(entry);
-        const steps = await tryLs(lsInfo, entry.port);
-        if (steps) return steps;
-    }
+    // Phase 1: 路由大脑解析真持有者（只拉第一页，命中即返）
+    try {
+        const resolved = await resolveEndpointForConversation(cascadeId, "antigravity");
+        if (resolved.endpoint) {
+            const ep = resolved.endpoint;
+            const steps = await tryLs(
+                { pid: ep.pid, csrfToken: ep.csrfToken, workspaceId: ep.workspaceId ?? "", ports: [ep.port] },
+                ep.port,
+            );
+            if (steps) return steps;
+        }
+    } catch { /* swallow，预扫描要求快，失败返 null */ }
 
     return null; // 不走 PowerShell 兜底（太慢，预扫描要求快）
 }
@@ -731,62 +661,180 @@ const MEMORY_STORE_DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
     || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
 const CONV_CACHE_DIR = path.join(MEMORY_STORE_DATA_ROOT, "temp");
 
+/** 测试注入的缓存目录覆盖（null=用真实目录） */
+let convCacheDirOverride: string | null = null;
+
+/**
+ * 测试专用：覆盖对话缓存目录（避免污染真实 temp 目录、可控构造 stale 缓存）。
+ * 传 null 还原真实目录。生产代码不调用。
+ */
+export function __setConvCacheDirForTest(dir: string | null): void {
+    convCacheDirOverride = dir;
+}
+
+function convCacheDir(): string {
+    return convCacheDirOverride ?? CONV_CACHE_DIR;
+}
+
 function getConvCachePath(cascadeId: string): string {
     const safeId = cascadeId.replace(/[^a-zA-Z0-9-]/g, "").slice(0, 40);
-    return path.join(CONV_CACHE_DIR, `conv_${safeId}.json`);
+    return path.join(convCacheDir(), `conv_${safeId}.json`);
 }
 
 function saveConvCache(cascadeId: string, data: any): void {
     try {
-        if (!fs.existsSync(CONV_CACHE_DIR)) {
-            fs.mkdirSync(CONV_CACHE_DIR, { recursive: true });
+        const dir = convCacheDir();
+        if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
         }
         fs.writeFileSync(getConvCachePath(cascadeId), JSON.stringify(data), "utf-8");
     } catch { /* non-critical */ }
 }
 
 /**
- * 获取当前对话的 cascadeId
- * v1.6: 从父 LS 热列表获取（精确），兜底用 .pb 修改时间猜测
+ * 从一个 LS 的热列表中取「最新」对话 id（合并旧 751-767/770-785 两段重复逻辑）。
+ * @returns 该 LS 上 lastModifiedTime 最大的 cascadeId，无则 null
+ */
+async function latestCascadeOn(info: LsProcessInfo, port: number): Promise<string | null> {
+    try {
+        const result = await rpcCall(info, port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+        const summaries = result.data?.trajectorySummaries;
+        if (summaries && typeof summaries === "object") {
+            // M2 修复：lastModifiedTime 是 protobuf Timestamp JSON（整秒 ...09Z / 小数秒 ...09.300Z 宽度不一），
+            // 字典序里 '.'(0x2E) < 'Z'(0x5A) 会把带小数秒的「真更新」误判为更旧。统一用 Date.parse 数值比。
+            let latest: { id: string; ms: number } | null = null;
+            for (const [id, sInfo] of Object.entries(summaries)) {
+                const ms = Date.parse((sInfo as any).lastModifiedTime || "") || 0;
+                if (!latest || ms > latest.ms) {
+                    latest = { id, ms };
+                }
+            }
+            if (latest) return latest.id;
+        }
+    } catch { /* swallow */ }
+    return null;
+}
+
+/**
+ * 方案 D 增强（最后兜底分支）：当 conversationId / workspaceId 指纹都缺时，
+ * 用 workspaceRoot 反查——多拉一页 step 比对 detectWorkspaceFromSteps。
+ * 接口 + 实现一并落地（见蓝图 §4 注），仅在指纹都缺时被调用。
+ * @returns 工作区根匹配的 cascadeId，无则 null
+ */
+async function matchByWorkspaceRoot(
+    endpoints: RouterEndpoint[],
+    workspaceRoot: string,
+): Promise<string | null> {
+    const target = workspaceRoot.replace(/[\\/]+$/u, "").toLowerCase();
+    if (!target) return null;
+
+    for (const ep of endpoints) {
+        const info: LsProcessInfo = {
+            pid: ep.pid,
+            csrfToken: ep.csrfToken,
+            workspaceId: ep.workspaceId ?? "",
+            ports: [ep.port],
+        };
+        // 取该 LS 上按时间排序的候选，逐个拉第一页 step 比对工作区
+        let summaries: Record<string, any> | null = null;
+        try {
+            const result = await rpcCall(info, ep.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+            const s = result.data?.trajectorySummaries;
+            if (s && typeof s === "object") summaries = s as Record<string, any>;
+        } catch { continue; }
+        if (!summaries) continue;
+
+        const ids = Object.entries(summaries)
+            // M2 修复：同 latestCascadeOn，用 Date.parse 数值比，避免小数秒宽度不一致的字典序错排。
+            .sort(([, a], [, b]) => (Date.parse(String((b as any).lastModifiedTime || "")) || 0) - (Date.parse(String((a as any).lastModifiedTime || "")) || 0))
+            .map(([id]) => id);
+
+        for (const id of ids) {
+            try {
+                const stepResult = await rpcCall(info, ep.port, "GetCascadeTrajectorySteps",
+                    { cascadeId: id, stepOffset: 0 }, LIGHT_TIMEOUT);
+                const steps = stepResult.data?.steps ?? [];
+                const ws = detectWorkspaceFromSteps(steps);
+                if (ws && ws.replace(/[\\/]+$/u, "").toLowerCase() === target) {
+                    return id;
+                }
+            } catch { /* try next id */ }
+        }
+    }
+    return null;
+}
+
+/**
+ * 获取当前对话的 cascadeId（方案 D：先用 ctx 指纹，杜绝「连第一个 LS 取全局最新」）。
+ *
+ * 顺序：
+ *   1. ctx.conversationId 锚点（最准）→ 直接返回。
+ *   2. ctx.workspaceId 指纹 → 在 enumerateActiveLs 里挑对应 workspaceId 的 LS，只在它内部取最新。
+ *   3. parentLs 直连（非 broker 单窗口仍精确）。
+ *   4. ctx.workspaceRoot 反查（matchByWorkspaceRoot，最后增强分支）。
+ *   5. 指纹全缺 → 显式 ambiguous 告警后退化（取活跃 LS 全局最新），不静默猜。
+ *   6. 无 LS → .pb 修改时间猜测兜底。
  */
 export async function getCurrentCascadeId(): Promise<string | null> {
-    // 优先从父 LS 热列表获取
+    const ctx = getCurrentContext();
+
+    // 1. conversationId 锚点（最准）
+    if (ctx.conversationId) return ctx.conversationId;
+
+    // 2. workspaceId 指纹：挑对应 LS 内取最新
+    let endpoints: RouterEndpoint[] = [];
+    try {
+        endpoints = await enumerateActiveLs("antigravity");
+    } catch { endpoints = []; }
+
+    if (ctx.workspaceId) {
+        const match = endpoints.find(ep => ep.workspaceId && ep.workspaceId === ctx.workspaceId);
+        if (match) {
+            const id = await latestCascadeOn(
+                { pid: match.pid, csrfToken: match.csrfToken, workspaceId: match.workspaceId ?? "", ports: [match.port] },
+                match.port,
+            );
+            if (id) return id;
+        }
+    }
+
+    // 3. parentLs 直连（非 broker 单窗口精确）
     if (parentLs) {
-        try {
-            const result = await rpcCall(parentLs.info, parentLs.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
-            const summaries = result.data?.trajectorySummaries;
-            if (summaries && typeof summaries === "object") {
-                let latest: { id: string; time: string } | null = null;
-                for (const [id, info] of Object.entries(summaries)) {
-                    const t = (info as any).lastModifiedTime;
-                    if (!latest || t > latest.time) {
-                        latest = { id, time: t };
-                    }
-                }
-                if (latest) return latest.id;
-            }
-        } catch { /* fallback to .pb guessing */ }
+        const id = await latestCascadeOn(parentLs.info, parentLs.port);
+        if (id) return id;
     }
 
-    const fallbackLs = await findFallbackLsConnection();
-    if (fallbackLs) {
-        try {
-            const result = await rpcCall(fallbackLs.info, fallbackLs.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
-            const summaries = result.data?.trajectorySummaries;
-            if (summaries && typeof summaries === "object") {
-                let latest: { id: string; time: string } | null = null;
-                for (const [id, info] of Object.entries(summaries)) {
-                    const t = (info as any).lastModifiedTime;
-                    if (!latest || t > latest.time) {
-                        latest = { id, time: t };
-                    }
-                }
-                if (latest) return latest.id;
-            }
-        } catch { /* fallback to .pb guessing */ }
+    // 4. workspaceRoot 反查（最后增强分支）
+    if (ctx.workspaceRoot && endpoints.length > 0) {
+        const id = await matchByWorkspaceRoot(endpoints, ctx.workspaceRoot);
+        if (id) return id;
     }
 
-    // 兜底：.pb 修改时间猜测
+    // 5. 指纹全缺 → 显式告警后退化取全局最新（不静默猜）
+    if (endpoints.length > 0) {
+        if (!ctx.conversationId && !ctx.workspaceId && !ctx.workspaceRoot) {
+            console.error("[ls-client] getCurrentCascadeId: 当前上下文无 conversationId/workspaceId/workspaceRoot 指纹，"
+                + "多窗口下无法精确绑定当前对话，退化为取活跃 LS 的全局最新（可能不是你正在看的窗口）。");
+        }
+        let best: { id: string; ms: number } | null = null;
+        for (const ep of endpoints) {
+            const info: LsProcessInfo = { pid: ep.pid, csrfToken: ep.csrfToken, workspaceId: ep.workspaceId ?? "", ports: [ep.port] };
+            try {
+                const result = await rpcCall(info, ep.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+                const summaries = result.data?.trajectorySummaries;
+                if (summaries && typeof summaries === "object") {
+                    for (const [id, sInfo] of Object.entries(summaries)) {
+                        // M2 修复：Date.parse 数值比，避免小数秒字典序错排。
+                        const ms = Date.parse(String((sInfo as any).lastModifiedTime || "")) || 0;
+                        if (!best || ms > best.ms) best = { id, ms };
+                    }
+                }
+            } catch { /* try next */ }
+        }
+        if (best) return best.id;
+    }
+
+    // 6. 兜底：.pb 修改时间猜测
     return guessFromPb();
 }
 
@@ -808,47 +856,21 @@ function guessFromPb(): string | null {
     }
 }
 
+/**
+ * 找一个可用的反重力 LS 连接（不要求持有特定对话，用于可用性探测 / 模型调用降级）。
+ * 改用路由大脑 enumerateActiveLs（指纹优先，含注册表 + PowerShell 兜底 + Heartbeat 校验）。
+ */
 async function findFallbackLsConnection(): Promise<ParentLsConnection | null> {
-    const registry = readRegistry();
-    const parentPidStr = String(process.ppid);
-
-    for (const [pidStr, entry] of Object.entries(registry.processes)) {
-        if (pidStr === parentPidStr) continue;
-        try {
-            process.kill(parseInt(pidStr, 10), 0);
-        } catch {
-            markHeartbeatFailure(pidStr);
-            continue;
-        }
-
-        const lsInfo = entryToLsInfo(entry);
-        try {
-            const hb = await rpcCall(lsInfo, entry.port, "Heartbeat", {}, 5000);
-            if (hb.status === 200) {
-                markHeartbeatSuccess(pidStr);
-                return { info: lsInfo, port: entry.port };
-            }
-            markHeartbeatFailure(pidStr);
-        } catch {
-            markHeartbeatFailure(pidStr);
-        }
-    }
-
-    const freshProcesses = discoverLsProcesses();
-    for (const ls of freshProcesses) {
-        const port = await findHttpPort(ls);
-        if (!port) continue;
-        registerLsEntry({
-            pid: ls.pid,
-            port,
-            csrfToken: ls.csrfToken,
-            workspaceId: ls.workspaceId,
-            registeredAt: new Date().toISOString(),
-        });
-        return { info: ls, port };
-    }
-
-    return null;
+    let endpoints: RouterEndpoint[] = [];
+    try {
+        endpoints = await enumerateActiveLs("antigravity");
+    } catch { return null; }
+    if (endpoints.length === 0) return null;
+    const ep = endpoints[0];
+    return {
+        info: { pid: ep.pid, csrfToken: ep.csrfToken, workspaceId: ep.workspaceId ?? "", ports: [ep.port] },
+        port: ep.port,
+    };
 }
 
 /**
@@ -940,7 +962,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/Users/<user>/Desktop/project"
+ * 返回去 URI 化后的本地路径，如 "c:/Users/example/Desktop/project"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {

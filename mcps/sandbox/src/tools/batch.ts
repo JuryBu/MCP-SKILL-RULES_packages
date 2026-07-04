@@ -1,18 +1,18 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
-import { execute, ExecResult } from "../executor.js";
+import { execute, ExecResult, normalizeExecutionInput } from "../executor.js";
 
 /**
  * sandbox_batch 工具 — 并行执行多任务
- * 
+ *
  * 每个任务独立计时、独立超时、独立内存限制。
  * 返回每个任务的完整独立状态。
  */
 
 const TaskItemSchema = z.object({
-    code: z.string().optional(),
-    command: z.string().optional(),
+    code: z.string().optional().describe("代码字符串。和 command 互斥，只填其一；空串或纯空白视为未提供。"),
+    command: z.string().optional().describe("系统命令。和 code 互斥，只填其一；空串或纯空白视为未提供。"),
     language: z.enum(["python", "node", "powershell", "cmd", "bash"]).optional(),
     cwd: z.string().optional(),
     env: z.string().optional(),
@@ -199,9 +199,25 @@ async function executeTask(
     task: z.infer<typeof TaskItemSchema>,
     index: number
 ): Promise<BatchTaskResult> {
+    const normalizedInput = normalizeExecutionInput(task.code, task.command);
+    if (normalizedInput.error) {
+        return {
+            index,
+            exitCode: 1,
+            stdout: "",
+            stderr: `任务 #${index} 参数错误: ${normalizedInput.error}`,
+            elapsed: "0ms",
+            killed: false,
+            killReason: null,
+            peakMemoryMB: 0,
+            truncated: false,
+            tempFile: null,
+        };
+    }
+
     const result: ExecResult = await execute({
-        code: task.code,
-        command: task.command,
+        code: normalizedInput.code,
+        command: normalizedInput.command,
         language: task.language,
         cwd: task.cwd,
         env: task.env,

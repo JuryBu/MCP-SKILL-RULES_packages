@@ -1,6 +1,6 @@
 {
     "name": "sandbox-mcp-server",
-    "version": "1.13.4",
+    "version": "1.13.7",
     "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
     "type": "module",
     "main": "dist/index.js",
@@ -9,7 +9,17 @@
         "dev": "tsx watch src/index.ts",
         "build": "tsc",
         "clean": "rimraf dist",
-        "test:exec-mutex": "npm run build && node tests/exec_mutex.test.mjs"
+        "test:exec-mutex": "npm run build && node tests/exec_mutex.test.mjs",
+        "test:batch-mutex": "npm run build && node tests/batch_mutex.test.mjs",
+        "test:council-antigravity": "npm run build && node tests/council_antigravity.test.mjs",
+        "test:council-missing-image": "npm run build && node tests/council_missing_image.test.mjs",
+        "test:exec-stderr-tempfile": "npm run build && node tests/exec_stderr_tempfile.test.mjs",
+        "test:launch-cwd": "npm run build && node tests/launch_cwd.test.mjs",
+        "test:session-memory-reservation": "npm run build && node tests/session_memory_reservation.test.mjs",
+        "test:smart-search-rg": "npm run build && node tests/smart_search_rg.test.mjs",
+        "test:background-abort": "npm run build && node tests/background_abort.test.mjs",
+        "test:ssrf-redirect": "npm run build && node tests/ssrf_redirect.test.mjs",
+        "test:shell-injection": "npm run build && node tests/shell_injection.test.mjs"
     },
     "engines": {
         "node": ">=18"

@@ -290,6 +290,11 @@ export async function prepareCouncilFiles(options: PrepareCouncilFilesOptions): 
         const resolved = path.resolve(input.path);
         const kind = classifyByExtension(resolved);
         options.onProgress?.(`准备读取背景文件：${path.basename(resolved)} (${kind})`);
+        if (!fs.existsSync(resolved)) {
+            prepared.push(buildUnreadableStub(input, resolved, kind, "文件不存在"));
+            continue;
+        }
+
         if (kind === "image") {
             promotedImages.push(resolved);
             prepared.push({
@@ -302,11 +307,6 @@ export async function prepareCouncilFiles(options: PrepareCouncilFilesOptions): 
                 ingestMode: "promoted_image",
                 parser: "image-promotion",
             });
-            continue;
-        }
-
-        if (!fs.existsSync(resolved)) {
-            prepared.push(buildUnreadableStub(input, resolved, kind, "文件不存在"));
             continue;
         }
 

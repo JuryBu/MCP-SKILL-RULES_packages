@@ -1,6 +1,7 @@
 import { callModelResponse } from "./model-bridge.js";
 import type { Chain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
+import { withToolConcurrency } from "./tool-concurrency.js";
 
 const AUTO_SUMMARY_MODEL = process.env.MEMORY_STORE_AUTOSUMMARY_MODEL || process.env.MEMORY_STORE_LS_MODEL || DEFAULT_ANTIGRAVITY_LS_MODEL;
 const AUTO_SUMMARY_TIMEOUT_MS = Number(process.env.MEMORY_STORE_AUTOSUMMARY_TIMEOUT_MS || "30000");
@@ -29,6 +30,10 @@ export async function generateAutoSummary(
 内容:
 ${truncatedContent}`;
 
-    const result = await callModelResponse(AUTO_SUMMARY_MODEL, prompt, chain, AUTO_SUMMARY_TIMEOUT_MS);
+    const result = await withToolConcurrency(
+        "mixed",
+        "autoSummary",
+        () => callModelResponse(AUTO_SUMMARY_MODEL, prompt, chain, AUTO_SUMMARY_TIMEOUT_MS),
+    );
     return result.text?.trim() || null;
 }

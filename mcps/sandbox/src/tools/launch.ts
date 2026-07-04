@@ -28,6 +28,7 @@ const DATA_ROOT = process.env.SANDBOX_DATA_ROOT
     || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data");
 const LAUNCH_DIR = path.join(DATA_ROOT, "launches");
 const REGISTRY_FILE = path.join(LAUNCH_DIR, "registry.json");
+const TASK_REGISTRY_DIR = path.join(LAUNCH_DIR, "tasks");
 const WRAPPER_FILE = path.join(LAUNCH_DIR, "launch-wrapper.cjs");
 
 // ── 类型 ──
@@ -48,6 +49,12 @@ interface LaunchTask {
     startTime: number;
     status: "running" | "done" | "failed";
     exitCode: number | null;
+}
+
+interface LaunchTombstone {
+    id: string;
+    deleted: true;
+    deletedAtMs: number;
 }
 
 interface ExitMarker {
@@ -72,18 +79,103 @@ function ensureLaunchDir(): void {
     }
 }
 
-function loadRegistry(): LaunchTask[] {
+function ensureTaskRegistryDir(): void {
+    ensureLaunchDir();
+    if (!fs.existsSync(TASK_REGISTRY_DIR)) {
+        fs.mkdirSync(TASK_REGISTRY_DIR, { recursive: true });
+    }
+}
+
+function safeTaskFileName(taskId: string): string {
+    return taskId.replace(/[^a-zA-Z0-9._-]/gu, "_") || "unknown";
+}
+
+function taskRegistryPath(taskId: string): string {
+    return path.join(TASK_REGISTRY_DIR, `${safeTaskFileName(taskId)}.json`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeLaunchTask(value: unknown): LaunchTask | null {
+    if (!isRecord(value) || value.deleted === true) return null;
+    if (typeof value.id !== "string" || !value.id) return null;
+    if (typeof value.pid !== "number") return null;
+    if (typeof value.command !== "string") return null;
+    if (typeof value.cwd !== "string") return null;
+    if (typeof value.stdoutLog !== "string" || typeof value.stderrLog !== "string") return null;
+    if (typeof value.startTime !== "number") return null;
+    if (value.status !== "running" && value.status !== "done" && value.status !== "failed") return null;
+    if (typeof value.exitCode !== "number" && value.exitCode !== null) return null;
+    return value as unknown as LaunchTask;
+}
+
+function readLegacyRegistry(): LaunchTask[] {
     try {
         if (fs.existsSync(REGISTRY_FILE)) {
-            return JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
+            const parsed = JSON.parse(fs.readFileSync(REGISTRY_FILE, "utf-8"));
+            if (!Array.isArray(parsed)) return [];
+            return parsed.map(normalizeLaunchTask).filter((task): task is LaunchTask => Boolean(task));
         }
     } catch { /* 损坏则重建 */ }
     return [];
 }
 
-function saveRegistry(tasks: LaunchTask[]): void {
-    ensureLaunchDir();
-    fs.writeFileSync(REGISTRY_FILE, JSON.stringify(tasks, null, 2), "utf-8");
+function readTaskRegistryFiles(): { tasks: LaunchTask[]; tombstones: Set<string> } {
+    const tasks: LaunchTask[] = [];
+    const tombstones = new Set<string>();
+    try {
+        if (!fs.existsSync(TASK_REGISTRY_DIR)) return { tasks, tombstones };
+        for (const entry of fs.readdirSync(TASK_REGISTRY_DIR, { withFileTypes: true })) {
+            if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+            try {
+                const parsed = JSON.parse(fs.readFileSync(path.join(TASK_REGISTRY_DIR, entry.name), "utf-8"));
+                if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") {
+                    tombstones.add(parsed.id);
+                    continue;
+                }
+                const task = normalizeLaunchTask(parsed);
+                if (task) tasks.push(task);
+            } catch {
+                // 单个 task 文件损坏时跳过，避免影响其它任务。
+            }
+        }
+    } catch {
+        // 注册目录不可读时回退到 legacy registry。
+    }
+    return { tasks, tombstones };
+}
+
+function readAllTasks(): LaunchTask[] {
+    const current = readTaskRegistryFiles();
+    const byId = new Map<string, LaunchTask>();
+    for (const task of current.tasks) byId.set(task.id, task);
+    for (const task of readLegacyRegistry()) {
+        if (current.tombstones.has(task.id) || byId.has(task.id)) continue;
+        byId.set(task.id, task);
+    }
+    return [...byId.values()];
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): void {
+    ensureTaskRegistryDir();
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(value, null, 2), "utf-8");
+    fs.renameSync(tmp, filePath);
+}
+
+function writeTask(task: LaunchTask): void {
+    writeJsonAtomic(taskRegistryPath(task.id), task);
+}
+
+function deleteTask(taskId: string): void {
+    const tombstone: LaunchTombstone = {
+        id: taskId,
+        deleted: true,
+        deletedAtMs: Date.now(),
+    };
+    writeJsonAtomic(taskRegistryPath(taskId), tombstone);
 }
 
 function generateId(): string {
@@ -92,6 +184,48 @@ function generateId(): string {
 
 function commandHash(command: string, cwd: string): string {
     return createHash("sha256").update(command).update("\0").update(cwd).digest("hex");
+}
+
+function validateLaunchCwd(cwd: string): string | null {
+    try {
+        const stat = fs.statSync(cwd, { throwIfNoEntry: false });
+        if (!stat) return `工作目录不存在: ${cwd}`;
+        if (!stat.isDirectory()) return `工作目录不是目录: ${cwd}`;
+        return null;
+    } catch (err) {
+        return `工作目录不可访问: ${cwd} (${err instanceof Error ? err.message : String(err)})`;
+    }
+}
+
+function writeExitMarker(markerPath: string, data: ExitMarker): void {
+    const tmp = `${markerPath}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
+    fs.renameSync(tmp, markerPath);
+}
+
+function markLaunchSpawnError(task: LaunchTask, err: Error): void {
+    const finishedAtMs = Date.now();
+    try {
+        if (task.exitMarkerPath) {
+            writeExitMarker(task.exitMarkerPath, {
+                done: true,
+                exitCode: null,
+                signal: null,
+                error: err.message,
+                startedAtMs: task.startTime,
+                finishedAtMs,
+            });
+        }
+    } catch { /* best effort */ }
+    try {
+        if (task.specPath) fs.unlinkSync(task.specPath);
+    } catch { /* best effort */ }
+    writeTask({
+        ...task,
+        status: "failed",
+        exitCode: null,
+        finishedAtMs,
+    });
 }
 
 function ensureWrapperFile(): void {
@@ -321,7 +455,7 @@ function getFileSize(filePath: string): number {
 // ── 导出（供 status 工具调用） ──
 
 export function getLaunchTaskCount(): { running: number; total: number } {
-    const tasks = loadRegistry();
+    const tasks = readAllTasks();
     tasks.forEach(refreshTaskStatus);
     return {
         running: tasks.filter(t => t.status === "running").length,
@@ -383,9 +517,9 @@ export function registerLaunch(server: McpServer): void {
 
             // ── list ──
             if (action === "list") {
-                const tasks = loadRegistry();
+                const tasks = readAllTasks();
                 tasks.forEach(refreshTaskStatus);
-                saveRegistry(tasks);
+                tasks.forEach(writeTask);
                 const visibleTasks = tasks.filter(t => hasOwnerAccess(t.ownerId, ownerId));
 
                 if (visibleTasks.length === 0) {
@@ -407,7 +541,7 @@ export function registerLaunch(server: McpServer): void {
 
             // ── clean ──
             if (action === "clean") {
-                const tasks = loadRegistry();
+                const tasks = readAllTasks();
                 tasks.forEach(refreshTaskStatus);
                 const taskId = params.taskId as string | undefined;
 
@@ -421,11 +555,12 @@ export function registerLaunch(server: McpServer): void {
                     try { fs.unlinkSync(t.stderrLog); } catch { /* */ }
                     try { if (t.exitMarkerPath) fs.unlinkSync(t.exitMarkerPath); } catch { /* */ }
                     try { if (t.specPath) fs.unlinkSync(t.specPath); } catch { /* */ }
+                    deleteTask(t.id);
                     cleaned++;
                 }
 
                 const remaining = tasks.filter(t => !toClean.includes(t));
-                saveRegistry(remaining);
+                remaining.forEach(writeTask);
 
                 return appendTiming({
                     content: [{ type: "text" as const, text: `🧹 清理了 ${cleaned} 个已完成任务（剩余 ${remaining.length} 个）\n` }],
@@ -441,7 +576,7 @@ export function registerLaunch(server: McpServer): void {
                     });
                 }
 
-                const tasks = loadRegistry();
+                const tasks = readAllTasks();
                 const task = tasks.find(t => t.id === taskId);
                 if (!task) {
                     const available = tasks.map(t => t.id);
@@ -477,7 +612,8 @@ export function registerLaunch(server: McpServer): void {
                         killProcessTree(task.pid);
                         task.status = "failed";
                         task.exitCode = -1;
-                        saveRegistry(tasks);
+                        task.finishedAtMs = Date.now();
+                        writeTask(task);
                         return appendTiming({
                             content: [{ type: "text" as const, text: `🛑 已终止任务 ${taskId} (PID ${task.pid})\n` }],
                         });
@@ -497,7 +633,7 @@ export function registerLaunch(server: McpServer): void {
 
                 // 刷新状态
                 refreshTaskStatus(task);
-                saveRegistry(tasks);
+                writeTask(task);
 
                 const elapsed = formatElapsed(Date.now() - task.startTime);
                 const logTail = tailFile(task.stdoutLog, tailLines);
@@ -530,10 +666,17 @@ export function registerLaunch(server: McpServer): void {
                 });
             }
 
+            const cwd = (params.cwd as string | undefined) || process.cwd();
+            const cwdError = validateLaunchCwd(cwd);
+            if (cwdError) {
+                return appendTiming({
+                    content: [{ type: "text" as const, text: `❌ ${cwdError}\n` }],
+                });
+            }
+
             ensureLaunchDir();
             ensureWrapperFile();
             const taskId = generateId();
-            const cwd = (params.cwd as string | undefined) || process.cwd();
             const logDirParam = params.logDir as string | undefined;
             const logDir = logDirParam || LAUNCH_DIR;
 
@@ -565,8 +708,6 @@ export function registerLaunch(server: McpServer): void {
                     env: { ...process.env, PYTHONUNBUFFERED: "1" },
                 });
 
-                proc.unref();
-
                 const task: LaunchTask = {
                     id: taskId,
                     pid: proc.pid || 0,
@@ -584,10 +725,14 @@ export function registerLaunch(server: McpServer): void {
                     exitCode: null,
                 };
 
-                // 追加到注册表
-                const tasks = loadRegistry();
-                tasks.push(task);
-                saveRegistry(tasks);
+                proc.on("error", (err: Error) => {
+                    console.error(`[launch] spawn error for task ${taskId}: ${err.message}`);
+                    markLaunchSpawnError(task, err);
+                });
+
+                proc.unref();
+
+                writeTask(task);
 
                 return appendTiming({
                     content: [{

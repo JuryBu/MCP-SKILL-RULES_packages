@@ -6,7 +6,7 @@
 
 当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
 
-> 2026-06-24 refresh: MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.16.0`, `sandbox` is `1.13.4`, `web-fetcher` remains `7.0.0`, `mcp-subagent` remains Windsurf-only optional, and `broker` keeps portable path/data-root patches.
+> 2026-07-04 refresh: latest MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.17.1`, `sandbox` is `1.13.7`, `web-fetcher` remains `7.0.0`, `mcp-subagent` remains Windsurf-only optional, and `broker` keeps portable path/data-root patches plus upstream request timeout handling.
 
 ---
 
@@ -35,9 +35,9 @@
 
 | MCP | 当前版本 | 主要能力 |
 | --- | --- | --- |
-| `memory-store` | `1.16.0` | 记忆库、对话读取、Conversation Export、Record、Conversation、Golden Extract、Stage Guard、四源数据链路 |
+| `memory-store` | `1.17.1` | 记忆库、对话读取、Conversation Export、Record、Golden Extract、Stage Guard、四源数据链路、查询解析/相关性评分、WSF Cascade 路由与本地 fallback |
 | `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
-| `sandbox` | `1.13.4` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council |
+| `sandbox` | `1.13.7` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council、SSRF/注入修复、后台 abort 与 per-task registry |
 | `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
 | `mcp-subagent` | `0.0.1` | Windsurf 专属异步子代理：spawn / poll / reply / collect / interrupt / dispose；默认不作为四源共享 MCP 启用 |
 
@@ -53,8 +53,9 @@
 - `conversation_read_original`：按 ID、标题、关键词读取 Antigravity / Codex / Claude Code / Windsurf 的原始对话。
 - `conversation_golden_extract`：从长对话里提取高价值片段。
 - `record_manage`：生成和维护结构化 Record，把长对话沉淀成阶段、输出、风险、验证和经验。
-- `stage_guard`：按 `Task.md` 阶段做门禁检查，防止漏做、早报完成、证据不足和 Guard 自指循环。
+- `stage_guard`：按 `Task.md` 阶段做门禁检查，支持外部证据索引，防止漏做、早报完成、证据不足和 Guard 自指循环。
 - 显式 `conversationId` / `ownerId`：让跨宿主、跨对话、后台任务和共享 broker 场景更稳定。
+- 查询解析、相关性评分、Windsurf Cascade 多窗口路由和本地 `.pb` fallback：提升跨源对话定位与读取可靠性。
 
 #### web-fetcher：网页、浏览器和本地文件理解
 
@@ -75,11 +76,11 @@
 
 重点能力：
 
-- `sandbox_exec`：执行短代码或命令，支持 Python / Node / PowerShell / cmd / bash 等。
+- `sandbox_exec`：执行短代码或命令，支持 Python / Node / PowerShell / cmd / bash 等，并包含 code/command 互斥校验回归。
 - `sandbox_session`：持久 REPL 会话。
 - `sandbox_batch`：批量并行执行任务。
-- `sandbox_launch`：长任务脱离执行，日志和状态落盘。
-- `smart_search`：大目录 / 长文件智能搜索。
+- `sandbox_launch`：长任务脱离执行，日志和状态落盘；per-task registry、cwd 校验、spawn error 落盘和后台 abort 清理更稳。
+- `smart_search`：大目录 / 长文件智能搜索，`rg` 探测改为 shellless，降低注入和 ESM 兼容风险。
 - `sandbox_codex`：调用 Codex CLI 做后台任务。
 - `sandbox_council`：多模型会审，支持 Antigravity、Codex、Claude Code、Gemini CLI、OpenAI/Anthropic/Gemini/custom provider 等路线。
 - council 支持大输入分块、复杂文件索引、Gemini CLI / Codex CLI fallback、压力输入超时和参与者/主持人分工。
@@ -240,9 +241,9 @@ Common examples:
 
 | MCP | Version | Main capabilities |
 | --- | --- | --- |
-| `memory-store` | `1.16.0` | Memory, conversation reading, Conversation Export, Records, Conversation, Golden Extract, Stage Guard, four-source data chains |
+| `memory-store` | `1.17.1` | Memory, conversation reading, Conversation Export, Records, Golden Extract, Stage Guard, four-source data chains, query parsing / relevance scoring, WSF Cascade routing, and local fallback |
 | `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
-| `sandbox` | `1.13.4` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council |
+| `sandbox` | `1.13.7` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council, SSRF/injection fixes, background abort, and per-task registry |
 | `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code / Windsurf and other hosts |
 | `mcp-subagent` | `0.0.1` | Windsurf-only async sub-agents: spawn / poll / reply / collect / interrupt / dispose; not enabled as a default shared MCP |
 
@@ -258,8 +259,9 @@ Highlights:
 - `conversation_read_original`: read original conversations by ID, title, or keyword across Antigravity / Codex / Claude Code / Windsurf.
 - `conversation_golden_extract`: extract high-value snippets from long conversations.
 - `record_manage`: generate and maintain structured Records with phases, outputs, risks, verification, and lessons.
-- `stage_guard`: stage-level guardrails for `Task.md` workflows, preventing missing work, premature completion reports, weak evidence, and self-referential guard loops.
+- `stage_guard`: stage-level guardrails for `Task.md` workflows with external evidence indexing, preventing missing work, premature completion reports, weak evidence, and self-referential guard loops.
 - Explicit `conversationId` / `ownerId`: stabilizes cross-host, cross-conversation, background-task, and shared-broker usage.
+- Query parsing, relevance scoring, Windsurf Cascade multi-window routing, and local `.pb` fallback improve cross-source conversation lookup and reads.
 
 #### web-fetcher: web, browser, and local file understanding
 
@@ -276,11 +278,11 @@ Highlights:
 
 Highlights:
 
-- `sandbox_exec`: run short code or commands, including Python / Node / PowerShell / cmd / bash.
+- `sandbox_exec`: run short code or commands, including Python / Node / PowerShell / cmd / bash, with code/command mutex regression coverage.
 - `sandbox_session`: persistent REPL sessions.
 - `sandbox_batch`: parallel batch execution.
-- `sandbox_launch`: detached long-running tasks with logs and status on disk.
-- `smart_search`: smart search over large directories or long files.
+- `sandbox_launch`: detached long-running tasks with logs and status on disk; per-task registry, cwd validation, spawn-error persistence, and background abort cleanup are improved.
+- `smart_search`: smart search over large directories or long files; `rg` probing is shellless for safer ESM/runtime behavior.
 - `sandbox_codex`: background tasks through Codex CLI.
 - `sandbox_council`: multi-model council with Antigravity, Codex, Claude Code, Gemini CLI, OpenAI/Anthropic/Gemini/custom providers.
 - Council support for large-input chunking, complex-file indexing, Gemini CLI / Codex CLI fallback, pressure timeouts, and moderator/participant separation.
@@ -323,7 +325,7 @@ Rules mainly define:
 | Area | Path | Notes |
 | --- | --- | --- |
 | MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, a portable HTTP broker, and WSF-only `mcp-subagent` |
-| Host rules | `rules/` | Separate templates for Codex, Antigravity, and Claude Code |
+| Host rules | `rules/` | Separate templates for Codex, Antigravity, Claude Code, and Windsurf |
 | Install scripts | `install/` | Windows PowerShell scripts for build, config, broker lifecycle, and smoke tests |
 | Config templates | `templates/` | Codex, Antigravity, Claude Code, Windsurf, and environment examples |
 | Skills | `skills/` | Portable user-side Codex skills, README, and manifest |

@@ -8,7 +8,7 @@ import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "./
 
 /**
  * MCP Sandbox REPL 会话管理器
- * 
+ *
  * 核心设计：
  * - Sentinel 标记法输出边界检测
  * - 持续读取 stdout/stderr 防管道堵塞
@@ -141,10 +141,10 @@ export function createSession(
         return { error: `已达最大会话数量限制 (${MAX_SESSIONS})。请先关闭不需要的会话。` };
     }
 
-    // 检查总内存限制
-    const currentTotalMemory = getTotalMemoryUsage();
-    if (currentTotalMemory + maxMemoryMB > MAX_TOTAL_MEMORY_MB) {
-        return { error: `总内存将超限：当前 ${Math.round(currentTotalMemory)}MB + 新会话 ${maxMemoryMB}MB > 上限 ${MAX_TOTAL_MEMORY_MB}MB` };
+    // 检查总内存额度预留，避免新会话刚启动时 currentMemoryMB≈0 导致超卖。
+    const reservedMemory = getReservedSessionMemory();
+    if (reservedMemory + maxMemoryMB > MAX_TOTAL_MEMORY_MB) {
+        return { error: `总内存额度将超限：当前已预留 ${Math.round(reservedMemory)}MB + 新会话额度 ${maxMemoryMB}MB > 上限 ${MAX_TOTAL_MEMORY_MB}MB` };
     }
 
     const id = newUuid();
@@ -469,13 +469,13 @@ function cleanDeadSessions(): void {
 }
 
 /**
- * 获取总内存使用量
+ * 获取活跃会话的总内存预留额度
  */
-function getTotalMemoryUsage(): number {
+function getReservedSessionMemory(): number {
     let total = 0;
     for (const [, session] of sessions) {
         if (session.alive) {
-            total += session.currentMemoryMB;
+            total += session.maxMemoryMB;
         }
     }
     return total;

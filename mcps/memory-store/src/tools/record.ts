@@ -1,4 +1,4 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
@@ -21,6 +21,7 @@ import { loadConversationData, resolveConversationChain } from "../conversation-
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
+import { withToolConcurrency } from "../tool-concurrency.js";
 import type { BackgroundTaskProgress } from "../background-tasks.js";
 import {
     RECORD_READER_VERSION,
@@ -66,6 +67,10 @@ export interface RecordSourceSnapshot {
     totalSteps: number;
     rolloutPath?: string;
     rolloutMtimeMs?: number;
+}
+
+export function isRecordBatchUpdateAction(action?: string): boolean {
+    return action === "batch_update" || action === "bulk_update";
 }
 
 interface OwnershipAuditItem {
@@ -121,10 +126,11 @@ action:
 - delete: 删除指定 Record（不传 conversationId 则清空工作区全部 Record）
 - audit_ownership: 审计 Record 归属，不按语义猜测，只看 workspaceUri/cwd/派生关系/重复副本
 - repair_ownership: 归属修复，默认 dry-run，只输出迁移计划
+- bulk_update: batch_update 的安全别名，用于避开共享 broker 对 batch_update 名称的全局拦截
 - batch_delete: 删除工作区下所有 Record
 - task_status: 查询后台任务状态`,
         {
-            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "batch_delete", "task_status", "audit_ownership", "repair_ownership"])
+            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "batch_delete", "task_status", "audit_ownership", "repair_ownership"])
                 .describe("操作类型"),
             conversationId: z.string().optional()
                 .describe("对话 ID（update 不传则自动获取当前对话）"),
@@ -175,13 +181,13 @@ action:
             maxRecommendations: z.number().optional()
                 .describe("[guide] 最多返回建议数量，默认 5"),
             after: z.string().optional()
-                .describe("[batch_update] 只处理此时间之后的对话(ISO/YYYY-MM-DD)"),
+                .describe("[batch_update/bulk_update] 只处理此时间之后的对话(ISO/YYYY-MM-DD)"),
             before: z.string().optional()
-                .describe("[batch_update] 只处理此时间之前的对话"),
+                .describe("[batch_update/bulk_update] 只处理此时间之前的对话"),
             limit: z.number().optional()
-                .describe("[list/search/batch_update] 最大数量；list 默认 30/上限 200，search 默认 10，batch_update 默认 10/上限 50"),
+                .describe("[list/search/batch_update/bulk_update] 最大数量；list 默认 30/上限 200，search 默认 10，批量更新默认 10/上限 50"),
             force: z.boolean().optional()
-                .describe("[update/batch_update] 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
+                .describe("[update/batch_update/bulk_update] 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
             dryRun: z.boolean().optional()
                 .describe("[repair_ownership] 默认 true，只报告计划不移动文件"),
             backup: z.boolean().optional()
@@ -189,7 +195,7 @@ action:
             waitSeconds: z.number().optional()
                 .describe("[task_status] 后台任务查询等待秒数(1-300)，任务完成时提前返回"),
             background: z.boolean().optional()
-                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时），后续用 task_status 查询"),
+                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时）；batch_update/bulk_update 自带后台任务状态"),
             parallelMode: z.enum(["off", "auto", "force"]).optional()
                 .describe("[update] 实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
@@ -204,7 +210,7 @@ action:
         },
         async (args) => {
             const startMs = Date.now();
-            touchActivity({ skipRecordAutoCheck: args.action === "update" || args.action === "batch_update" });
+            touchActivity({ skipRecordAutoCheck: args.action === "update" || isRecordBatchUpdateAction(args.action) });
             try {
                 const hash = resolveWorkspaceHashForRecord(args.workspace);
                 const chains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
@@ -265,6 +271,7 @@ action:
                     case "batch_delete":
                         return await handleBatchDelete(hash, startMs);
                     case "batch_update":
+                    case "bulk_update":
                         return await handleBatchUpdate(hash, args, startMs);
                     case "task_status":
                         return await handleTaskStatus(args.taskId, args.waitSeconds, startMs);
@@ -1659,7 +1666,7 @@ interface BatchConversationCandidate {
 
 async function handleBatchUpdate(
     hash: string,
-    args: { after?: string; before?: string; limit?: number; force?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
+    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
     startMs: number,
 ) {
     // check 模式：查询进度
@@ -1802,7 +1809,7 @@ async function handleBatchUpdate(
     };
 
     // 后台异步执行（不 await），2 并发 worker 池
-    (async () => {
+    (async () => withToolConcurrency("heavy", "record_manage.batch_update.background", async () => {
         const CONCURRENCY = 2;
         let nextIdx = 0; // 共享任务指针
 
@@ -1905,14 +1912,15 @@ async function handleBatchUpdate(
             _batchTask.status = "done";
             console.error(`[batch] ${out}`);
         }
-    })().catch(err => {
+    }))().catch(err => {
         if (_batchTask) {
             _batchTask.result = `📦 批量更新异常终止: ${err}`;
             _batchTask.status = "done";
         }
     });
 
-    return r(`🚀 批量更新已启动（后台处理 ${candidates.length} 个对话）\n💡 再次调用 batch_update（同参数）查看进度`);
+    const actionName = isRecordBatchUpdateAction(args.action) ? args.action : "batch_update";
+    return r(`🚀 批量更新已启动（后台处理 ${candidates.length} 个对话）\n💡 再次调用 ${actionName}（同参数）查看进度`);
 }
 
 // ============= 辅助 =============

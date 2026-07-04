@@ -9,7 +9,8 @@ export type ConversationAttachmentSource =
     | "codex-data-url"
     | "codex-local-image"
     | "files-mentioned"
-    | "antigravity-uri"
+    | "antigravity-uri"            // 复用：反重力工具结果里的 file:// / 本地路径图
+    | "antigravity-tool-image"     // 新增：反重力工具结果 base64 内嵌截图（需 materialize）
     | "claude-code-data-url"
     | "claude-code-local-file"
     | "windsurf-data-url";
@@ -26,6 +27,7 @@ export interface ConversationAttachment {
     exists?: boolean;
     tempPath?: string;
     warning?: string;
+    stepIndex?: number;   // 新增：附件在 trajectory 中的原始 step；export 时定位时序，缺失回退旧行为
 }
 
 export interface AttachmentSummary {
@@ -104,6 +106,14 @@ function isImagePath(filePath: string): boolean {
     return [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"].includes(path.extname(filePath).toLowerCase());
 }
 
+/** 哪些 source 的内联 data-url 图需要落盘（materialize）。反重力工具截图同样需要。 */
+function isMaterializableDataUrlSource(source: ConversationAttachmentSource): boolean {
+    return source === "codex-data-url"
+        || source === "claude-code-data-url"
+        || source === "windsurf-data-url"
+        || source === "antigravity-tool-image";
+}
+
 function dedupeAttachments(attachments: ConversationAttachment[]): ConversationAttachment[] {
     const seen = new Set<string>();
     const result: ConversationAttachment[] = [];
@@ -121,9 +131,10 @@ function dedupeAttachments(attachments: ConversationAttachment[]): ConversationA
 export function extractCodexMessageAttachments(
     content: any[],
     messageText: string,
-    options: { cwd?: string } = {},
+    options: { cwd?: string; stepIndex?: number } = {},
 ): ConversationAttachment[] {
     const attachments: ConversationAttachment[] = [];
+    const stepIndex = options.stepIndex;
 
     for (const item of content || []) {
         const imageUrl = typeof item?.image_url === "string"
@@ -142,6 +153,7 @@ export function extractCodexMessageAttachments(
                     mimeType: parsed.mimeType,
                     dataUrl: imageUrl,
                     sizeBytes: parsed.sizeBytes,
+                    stepIndex,
                 });
             } else {
                 const resolved = resolveMentionPath(imageUrl, options.cwd);
@@ -151,6 +163,7 @@ export function extractCodexMessageAttachments(
                     originalPath: resolved,
                     name: path.basename(resolved),
                     exists: fileExists(resolved),
+                    stepIndex,
                 });
             }
         }
@@ -162,9 +175,10 @@ export function extractCodexMessageAttachments(
 
 export function extractCodexEventUserAttachments(
     payload: any,
-    options: { cwd?: string } = {},
+    options: { cwd?: string; stepIndex?: number } = {},
 ): ConversationAttachment[] {
     const attachments: ConversationAttachment[] = [];
+    const stepIndex = options.stepIndex;
     const localImages = Array.isArray(payload?.local_images) ? payload.local_images : [];
     for (const imagePath of localImages) {
         if (typeof imagePath !== "string" || !imagePath.trim()) continue;
@@ -175,6 +189,7 @@ export function extractCodexEventUserAttachments(
             originalPath: resolved,
             name: path.basename(resolved),
             exists: fileExists(resolved),
+            stepIndex,
         });
     }
 
@@ -196,6 +211,7 @@ export function extractCodexEventUserAttachments(
                 mimeType: parsed.mimeType,
                 dataUrl: url,
                 sizeBytes: parsed.sizeBytes,
+                stepIndex,
             });
         }
     }
@@ -219,7 +235,7 @@ function extractPayloadText(payload: any): string {
 
 export function extractFilesMentionedAttachments(
     text: string,
-    options: { cwd?: string } = {},
+    options: { cwd?: string; stepIndex?: number } = {},
 ): ConversationAttachment[] {
     const marker = "# Files mentioned by the user:";
     const markerIndex = text.indexOf(marker);
@@ -241,10 +257,44 @@ export function extractFilesMentionedAttachments(
             name: displayName || path.basename(resolved),
             originalPath: resolved,
             exists: fileExists(resolved),
+            stepIndex: options.stepIndex,
         });
     }
 
     return dedupeAttachments(attachments);
+}
+
+/**
+ * E3：从反重力工具结果（mcpTool）里提取 AI 当时看到的图片。
+ * 探针实测：反重力 mcpTool **没有** image content block；看图类工具（web_fetch_screenshot/view_file 等）
+ * 的结果只在 resultString 文本里留了本地文件路径（如「截图完成 ... 文件: C:\\...\\screenshots\\xxx.jpg 使用 view_file...」）。
+ * 故从**原始** resultString（parseRounds 里 mt.resultString 未截断）正则提取图片绝对路径，文件存在才提取
+ * （临时截图可能已被清理 → 降级不提取，不污染产物）。用 antigravity-uri source（本地路径图、无需 materialize）。
+ */
+export function extractAntigravityToolImages(mt: any, stepIndex: number): ConversationAttachment[] {
+    const resultString = typeof mt?.resultString === "string" ? mt.resultString : "";
+    if (!resultString) return [];
+    const attachments: ConversationAttachment[] = [];
+    const seen = new Set<string>();
+    // Windows 绝对路径 + 图片扩展名；路径可含空格/中文，非贪婪到扩展名，排除引号/换行/非法路径符做定界。
+    const pathRegex = /[a-zA-Z]:[\\/][^\r\n"'<>|*?]+?\.(?:png|jpe?g|webp|gif|bmp)/giu;
+    const matches = resultString.match(pathRegex) || [];
+    for (const raw of matches) {
+        const normalized = path.normalize(raw.trim());
+        const key = normalizePathKey(normalized);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        if (!fileExists(normalized)) continue; // 临时文件已清理 → 降级
+        attachments.push({
+            kind: "image",
+            source: "antigravity-uri",
+            name: path.basename(normalized),
+            originalPath: normalized,
+            exists: true,
+            stepIndex,
+        });
+    }
+    return attachments;
 }
 
 export function mergeRoundAttachments(round: ConversationRound, attachments: ConversationAttachment[]): void {
@@ -277,7 +327,7 @@ async function materializeAttachment(
 ): Promise<ConversationAttachment> {
     if (
         attachment.kind !== "image" ||
-        (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url" && attachment.source !== "windsurf-data-url") ||
+        !isMaterializableDataUrlSource(attachment.source) ||
         !attachment.dataUrl
     ) {
         return attachment;
@@ -303,7 +353,9 @@ async function materializeAttachment(
         ? "claude-code-attachments"
         : attachment.source === "windsurf-data-url"
             ? "windsurf-attachments"
-            : "codex-attachments";
+            : attachment.source === "antigravity-tool-image"
+                ? "antigravity-tool-attachments"
+                : "codex-attachments";
     const dir = path.join(TEMP_DIR, sourceDir, conversationId, `round-${String(roundIndex).padStart(6, "0")}`);
     const filename = `sha256-${sha256}${extensionFromMime(parsed.mimeType)}`;
     const tempPath = path.join(dir, filename);
@@ -358,27 +410,36 @@ export async function materializeRoundAttachments(
 
     for (const round of cloned) {
         const attachments = round.attachments || [];
-        const existingImagePathCount = attachments.filter(attachment =>
-            attachment.kind === "image" &&
-            attachment.originalPath &&
-            attachment.exists !== false
-        ).length;
-        const dataUrlImageCount = attachments.filter(attachment =>
-            attachment.kind === "image" &&
-            (attachment.source === "codex-data-url" || attachment.source === "claude-code-data-url" || attachment.source === "windsurf-data-url") &&
-            attachment.dataUrl
-        ).length;
-        let preferLocalRemaining = existingImagePathCount >= dataUrlImageCount ? existingImagePathCount : 0;
+        // E2 判重前置：收集本轮「已有本地路径图」的 sha256，用于识别 data-url 是否同一张物理图。
+        // 注意：本地路径图的 sha256 多为空 → 集合多为空 → 默认偏向落盘（不误杀 AI 内嵌图）。
+        const localImageSha256 = new Set<string>();
+        for (const attachment of attachments) {
+            if (
+                attachment.kind === "image" &&
+                attachment.originalPath &&
+                attachment.exists !== false &&
+                typeof attachment.sha256 === "string" &&
+                attachment.sha256.length > 0
+            ) {
+                localImageSha256.add(attachment.sha256.toLowerCase());
+            }
+        }
         for (let index = 0; index < attachments.length; index++) {
             const attachment = attachments[index];
             if (
                 attachment.kind !== "image" ||
-                (attachment.source !== "codex-data-url" && attachment.source !== "claude-code-data-url" && attachment.source !== "windsurf-data-url") ||
+                !isMaterializableDataUrlSource(attachment.source) ||
                 !attachment.dataUrl
             ) continue;
-            if (preferLocalRemaining > 0) {
+            // E4 快路径：同一附件自身既有可用本地路径又有 data-url → 本地路径已够，跳过 data-url。
+            if (attachment.originalPath && attachment.exists !== false) {
                 attachments[index] = { ...attachment, warning: "已有本地图片路径，未生成临时文件" };
-                preferLocalRemaining -= 1;
+                continue;
+            }
+            // E2 跨对象判重：data-url 的 sha256 已知且命中本轮本地路径图的 sha256 → 确属同一张，跳过。
+            if (typeof attachment.sha256 === "string" && attachment.sha256.length > 0
+                && localImageSha256.has(attachment.sha256.toLowerCase())) {
+                attachments[index] = { ...attachment, warning: "已有同一张本地图片（sha256 命中），未生成临时文件" };
                 continue;
             }
             const parsed = parseDataUrl(attachment.dataUrl);
@@ -425,7 +486,7 @@ export function summarizeAttachments(rounds: ConversationRound[]): AttachmentSum
             summary.total += 1;
             if (attachment.kind === "image") summary.images += 1;
             if (attachment.kind === "file") summary.files += 1;
-            if (attachment.source === "codex-data-url" || attachment.source === "claude-code-data-url" || attachment.source === "windsurf-data-url") summary.codexInlineImages += 1;
+            if (isMaterializableDataUrlSource(attachment.source)) summary.codexInlineImages += 1;
             if (attachment.originalPath) {
                 if (attachment.exists) summary.existingPaths += 1;
                 else summary.missingPaths += 1;
