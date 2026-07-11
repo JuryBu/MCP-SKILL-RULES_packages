@@ -1,45 +1,66 @@
 import fs from "fs";
 import path from "path";
 import os from "os";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { fileURLToPath } from "url";
 import { TEMP_DIR } from "../temp-store.js";
 import { formatElapsed } from "../lifecycle.js";
 import { hasOwnerAccess, normalizeOwnerId, ownerMismatchText, newUuid } from "../owner.js";
-import type { CouncilCheckpoint, CouncilRunParams, CouncilTranscript } from "./types.js";
+import { normalizeCouncilModelConfig, type CouncilCheckpoint, type CouncilRunParams, type CouncilTranscript } from "./types.js";
+import {
+    councilArtifactPath,
+    councilTaskDirectory,
+    createCouncilArtifactRun,
+    finishCouncilArtifactRun,
+    listCouncilArtifactManifests,
+    readCouncilArtifactManifest,
+    validCouncilIdentifier,
+} from "./artifact-store.js";
+import { formatCouncilArtifactSummary } from "./transcript.js";
+import { councilRuntimeTempRoot } from "./paths.js";
 
 const WORKER_PATH = fileURLToPath(new URL("./worker.js", import.meta.url));
 const SERVER_ROOT = path.resolve(path.dirname(WORKER_PATH), "..", "..");
-const COUNCIL_TEMP_DIR = TEMP_DIR;
-const TASK_ROOT = process.env.SANDBOX_COUNCIL_TASK_ROOT
+const CONFIGURED_TASK_ROOT = process.env.SANDBOX_COUNCIL_TASK_ROOT
     ? path.resolve(process.env.SANDBOX_COUNCIL_TASK_ROOT)
-    : path.join(COUNCIL_TEMP_DIR, "council-tasks");
+    : undefined;
 const LEGACY_WORKER_CWD_TASK_ROOT = path.join(path.dirname(WORKER_PATH), "sandbox-data", "temp", "council-tasks");
 const LEGACY_PROCESS_CWD_TASK_ROOT = path.join(TEMP_DIR, "council-tasks");
 const LEGACY_ANTIGRAVITY_APP_CWD_TASK_ROOT = path.join(os.homedir(), "AppData", "Local", "Programs", "Antigravity", "sandbox-data", "temp", "council-tasks");
 const DEFAULT_BACKGROUND_MAX_RUN_MS = Number(process.env.SANDBOX_COUNCIL_BACKGROUND_MAX_RUN_MS || 45 * 60_000);
+const configuredAbortGraceMs = Number(process.env.SANDBOX_COUNCIL_BACKGROUND_ABORT_GRACE_MS || 15_000);
+const BACKGROUND_ABORT_GRACE_MS = Number.isFinite(configuredAbortGraceMs)
+    ? Math.max(1_000, Math.min(configuredAbortGraceMs, 5 * 60_000))
+    : 15_000;
 
 export interface PersistentCouncilSpec {
     taskId: string;
+    runId: string;
+    artifactManifestPath: string;
     ownerId: string;
     startedAt: string;
     deadlineAt?: string;
     checkpointPath?: string;
     transcriptPath?: string;
     outputDir?: string;
+    workerIdentity?: CouncilWorkerIdentity;
     resume?: {
         sourceTaskId: string;
+        sourceRunId?: string;
         checkpointPath: string;
         transcriptJsonPath: string;
     };
-    params: Omit<CouncilRunParams, "onProgress">;
+    params: Omit<CouncilRunParams, "onProgress" | "signal">;
 }
 
 interface PersistentCouncilProgress {
-    status: "running" | "done" | "error";
+    status: "running" | "done" | "error" | "interrupted";
     taskId: string;
+    runId: string;
+    artifactManifestPath: string;
     ownerId: string;
     pid?: number;
+    workerIdentity?: CouncilWorkerIdentity;
     startedAt: string;
     updatedAt: string;
     deadlineAt?: string;
@@ -49,6 +70,8 @@ interface PersistentCouncilProgress {
 interface PersistentCouncilDone {
     status: "done" | "error" | "interrupted";
     taskId: string;
+    runId: string;
+    artifactManifestPath: string;
     ownerId: string;
     startedAt: string;
     finishedAt: string;
@@ -56,12 +79,16 @@ interface PersistentCouncilDone {
     transcript?: CouncilTranscript;
     error?: string;
     pid?: number;
+    workerIdentity?: CouncilWorkerIdentity;
     resumedBy?: string;
     newTaskId?: string;
+    newRunId?: string;
 }
 
 export interface CouncilResumeSource {
     sourceTaskId: string;
+    sourceRunId?: string;
+    sourceArtifactManifestPath?: string;
     spec: PersistentCouncilSpec;
     checkpoint: CouncilCheckpoint;
     checkpointPath: string;
@@ -71,6 +98,8 @@ export interface CouncilResumeSource {
 
 export interface PersistentCouncilQueryResult {
     taskId: string;
+    runId?: string;
+    artifactManifestPath?: string;
     ownerId: string;
     status: "running" | "done" | "error" | "interrupted" | "missing" | "owner_mismatch";
     startedAt?: string;
@@ -83,15 +112,21 @@ export interface PersistentCouncilQueryResult {
     pid?: number;
     resumedBy?: string;
     newTaskId?: string;
+    newRunId?: string;
 }
 
 function ensureTaskRoot(): void {
-    fs.mkdirSync(COUNCIL_TEMP_DIR, { recursive: true });
-    fs.mkdirSync(TASK_ROOT, { recursive: true });
+    if (CONFIGURED_TASK_ROOT) fs.mkdirSync(CONFIGURED_TASK_ROOT, { recursive: true });
+    else fs.mkdirSync(path.join(councilRuntimeTempRoot(), "council-tasks"), { recursive: true });
+}
+
+function taskRootDirectory(): string {
+    return CONFIGURED_TASK_ROOT || path.join(councilRuntimeTempRoot(), "council-tasks");
 }
 
 function getTaskDir(taskId: string): string {
-    return path.join(TASK_ROOT, taskId);
+    const safeTaskId = validCouncilIdentifier(taskId, "taskId");
+    return CONFIGURED_TASK_ROOT ? path.join(CONFIGURED_TASK_ROOT, safeTaskId) : councilTaskDirectory(safeTaskId);
 }
 
 function getTaskPaths(taskId: string) {
@@ -178,6 +213,18 @@ function recoverLegacyWorkerCwdTask(taskId: string): void {
     }
 }
 
+export interface CouncilWorkerIdentity {
+    pid: number;
+    startId: string;
+}
+
+export type CouncilWorkerTerminationResult = "not_required" | "terminated" | "not_running" | "identity_missing" | "identity_mismatch";
+
+export interface CouncilWorkerTerminationDependencies {
+    observeIdentity?: (pid: number) => CouncilWorkerIdentity | undefined;
+    terminateProcessTree?: (pid: number) => void;
+}
+
 function isPidAlive(pid?: number): boolean {
     if (!pid) return false;
     try {
@@ -201,6 +248,65 @@ function killProcessTree(pid?: number): void {
     }
 }
 
+function getPowerShellCommand(): string {
+    const systemRoot = process.env.SystemRoot || process.env.WINDIR;
+    if (systemRoot) {
+        const candidate = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        if (fs.existsSync(candidate)) return candidate;
+    }
+    return "powershell.exe";
+}
+
+function workerProcessStartId(pid: number): string | undefined {
+    if (!Number.isInteger(pid) || pid <= 0) return undefined;
+    try {
+        if (process.platform === "win32") {
+            const result = spawnSync(getPowerShellCommand(), ["-NoProfile", "-NonInteractive", "-Command", `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`], {
+                encoding: "utf-8",
+                windowsHide: true,
+                timeout: 3_000,
+            });
+            return result.status === 0 ? String(result.stdout || "").trim() || undefined : undefined;
+        }
+        if (process.platform === "linux") {
+            const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+            const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+            return fields[19] || undefined;
+        }
+        const result = spawnSync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", timeout: 3_000 });
+        return result.status === 0 ? String(result.stdout || "").trim() || undefined : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+export function readCouncilWorkerIdentity(pid?: number): CouncilWorkerIdentity | undefined {
+    if (!pid || !isPidAlive(pid)) return undefined;
+    const startId = workerProcessStartId(pid);
+    return startId ? { pid, startId } : undefined;
+}
+
+export function terminateCouncilWorkerIfIdentityMatches(
+    expected: CouncilWorkerIdentity | undefined,
+    dependencies: CouncilWorkerTerminationDependencies = {},
+): CouncilWorkerTerminationResult {
+    if (!expected) return "identity_missing";
+    const observed = (dependencies.observeIdentity || readCouncilWorkerIdentity)(expected.pid);
+    if (!observed) return "not_running";
+    if (observed.pid !== expected.pid || observed.startId !== expected.startId) return "identity_mismatch";
+    (dependencies.terminateProcessTree || killProcessTree)(expected.pid);
+    return "terminated";
+}
+
+export function reclaimCouncilWorkerAfterDeadline(
+    status: "running" | "done" | "error" | "interrupted",
+    workerIdentity: CouncilWorkerIdentity | undefined,
+    dependencies: CouncilWorkerTerminationDependencies = {},
+): CouncilWorkerTerminationResult {
+    if (status === "done" || status === "error") return "not_required";
+    return terminateCouncilWorkerIfIdentityMatches(workerIdentity, dependencies);
+}
+
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -209,8 +315,67 @@ function nowIso(): string {
     return new Date().toISOString();
 }
 
+function normalizeCouncilRunParams(params: CouncilRunParams): CouncilRunParams {
+    return {
+        ...params,
+        participants: params.participants.map(normalizeCouncilModelConfig),
+        moderator: normalizeCouncilModelConfig(params.moderator),
+        transcriptionModel: params.transcriptionModel ? normalizeCouncilModelConfig(params.transcriptionModel) : undefined,
+        textProjectionModel: params.textProjectionModel ? normalizeCouncilModelConfig(params.textProjectionModel) : undefined,
+    };
+}
+
+function serializeCouncilRunParams(params: CouncilRunParams): Omit<CouncilRunParams, "onProgress" | "signal"> {
+    const { onProgress: _onProgress, signal: _signal, ...serializableParams } = params;
+    return serializableParams;
+}
+
+function forceKillResultText(result: CouncilWorkerTerminationResult): string {
+    if (result === "terminated") return "已强制回收匹配身份的 worker 进程树";
+    if (result === "not_running") return "worker 已退出，无需强制回收";
+    if (result === "not_required") return "任务已正常结束，无需强制回收";
+    return "worker 身份无法确认，未强制结束 PID";
+}
+
+function scheduleCouncilWorkerForceKill(taskId: string, ownerId: string, deadlineAt: string): void {
+    const graceMs = Math.max(0, new Date(deadlineAt).getTime() - Date.now()) + BACKGROUND_ABORT_GRACE_MS;
+    const timer = setTimeout(() => {
+        const paths = getTaskPaths(taskId);
+        const spec = readJson<PersistentCouncilSpec>(paths.spec);
+        const progress = readJson<PersistentCouncilProgress>(paths.progress);
+        const done = readJson<PersistentCouncilDone>(paths.done);
+        const workerIdentity = done?.workerIdentity || progress?.workerIdentity || spec?.workerIdentity;
+        const termination = reclaimCouncilWorkerAfterDeadline(done?.status || "running", workerIdentity);
+        if (termination === "not_required") return;
+        if (!done) {
+            finalizeCouncilTask(taskId, ownerId, {
+                status: "interrupted",
+                error: `后台 worker 在 deadline 后 ${BACKGROUND_ABORT_GRACE_MS}ms 内未退出，${forceKillResultText(termination)}`,
+                pid: workerIdentity?.pid || progress?.pid,
+                startedAt: progress?.startedAt || spec?.startedAt,
+            });
+        }
+    }, graceMs);
+    timer.unref?.();
+}
+
+function normalizeCouncilTranscript(transcript: CouncilTranscript): CouncilTranscript {
+    return {
+        ...transcript,
+        participants: transcript.participants.map(normalizeCouncilModelConfig),
+        moderator: normalizeCouncilModelConfig(transcript.moderator),
+        rounds: transcript.rounds.map((round) => ({
+            ...round,
+            messages: round.messages.map((message) => ({
+                ...message,
+                provider: normalizeCouncilModelConfig({ id: message.participantId, role: message.role, provider: message.provider }).provider,
+            })),
+        })),
+    };
+}
+
 function isTaskDirInsideRoot(taskDir: string): boolean {
-    const root = path.resolve(TASK_ROOT);
+    const root = path.resolve(taskRootDirectory());
     const resolved = path.resolve(taskDir);
     return resolved === root || resolved.startsWith(`${root}${path.sep}`);
 }
@@ -218,7 +383,7 @@ function isTaskDirInsideRoot(taskDir: string): boolean {
 function listCouncilTaskDirs(): fs.Dirent[] {
     ensureTaskRoot();
     try {
-        return fs.readdirSync(TASK_ROOT, { withFileTypes: true }).filter((entry) => entry.isDirectory());
+        return fs.readdirSync(taskRootDirectory(), { withFileTypes: true }).filter((entry) => entry.isDirectory());
     } catch {
         return [];
     }
@@ -226,9 +391,15 @@ function listCouncilTaskDirs(): fs.Dirent[] {
 
 export function cleanOldCouncilTasks(maxAgeDays = 15): number {
     const cutoffMs = Date.now() - Math.max(0, maxAgeDays) * 24 * 60 * 60 * 1000;
+    const dependentTaskIds = new Set(
+        listCouncilArtifactManifests()
+            .filter((record) => record.state === "valid")
+            .flatMap((record) => record.manifest.dependsOn.map((dependency) => dependency.taskId).filter((taskId): taskId is string => Boolean(taskId))),
+    );
     let removed = 0;
 
     for (const entry of listCouncilTaskDirs()) {
+        if (dependentTaskIds.has(entry.name)) continue;
         const paths = getTaskPaths(entry.name);
         if (!isTaskDirInsideRoot(paths.dir)) continue;
         if (fs.existsSync(path.join(paths.dir, ".preserve"))) continue;
@@ -294,28 +465,58 @@ export function readCouncilResumeSource(taskId: string, requestOwnerId: string):
     const ownerId = normalizeOwnerId(requestOwnerId);
     const paths = getTaskPaths(taskId);
     recoverLegacyWorkerCwdTask(taskId);
-    const spec = readJson<PersistentCouncilSpec>(paths.spec);
+    const loadedSpec = readJson<PersistentCouncilSpec>(paths.spec);
+    const spec = loadedSpec ? { ...loadedSpec, params: normalizeCouncilRunParams(loadedSpec.params) } : undefined;
     if (!spec) {
         throw new Error(`❌ 未找到可恢复的 council 任务 ${taskId}`);
     }
     if (!hasOwnerAccess(spec.ownerId, ownerId)) {
         throw new Error(ownerMismatchText("后台任务", taskId));
     }
-    const checkpoint = readJson<CouncilCheckpoint>(paths.checkpoint);
-    if (!checkpoint) {
-        throw new Error(`❌ council 任务 ${taskId} 缺少 checkpoint.json，无法 resume`);
+    const progress = readJson<PersistentCouncilProgress>(paths.progress);
+    const done = readJson<PersistentCouncilDone>(paths.done);
+    if (!done && progress?.status === "running" && isPidAlive(progress.pid)) {
+        throw new Error(`❌ council 任务 ${taskId} 的 worker 仍在运行，不能并发 resume；请等待任务结束或先中止旧任务`);
     }
     const transcriptPath = spec.transcriptPath || spec.params.transcriptPath;
     if (!transcriptPath) {
         throw new Error(`❌ council 任务 ${taskId} 缺少 transcriptPath，无法 resume`);
     }
     const transcriptJsonPath = transcriptJsonPathFromMarkdown(transcriptPath);
-    const transcript = readJson<CouncilTranscript>(transcriptJsonPath);
+    let checkpoint: CouncilCheckpoint | undefined;
+    let transcript: CouncilTranscript | undefined;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        const checkpointBefore = readJson<CouncilCheckpoint>(paths.checkpoint);
+        const loadedTranscript = readJson<CouncilTranscript>(transcriptJsonPath);
+        const checkpointAfter = readJson<CouncilCheckpoint>(paths.checkpoint);
+        if (!checkpointBefore || !checkpointAfter || !loadedTranscript) continue;
+        if (checkpointBefore.updatedAt !== checkpointAfter.updatedAt) continue;
+        const candidateTranscript = normalizeCouncilTranscript(loadedTranscript);
+        const lastRound = candidateTranscript.rounds.at(-1)?.round || 0;
+        const requiredRound = checkpointAfter.roundComplete || checkpointAfter.phase === "moderator"
+            ? checkpointAfter.currentRound
+            : checkpointAfter.lastCompletedRound || 0;
+        if (checkpointAfter.transcriptId !== candidateTranscript.id || lastRound < requiredRound) continue;
+        checkpoint = checkpointAfter;
+        transcript = candidateTranscript;
+        break;
+    }
+    if (!checkpoint) {
+        throw new Error(`❌ council 任务 ${taskId} 缺少稳定 checkpoint 快照，无法 resume；请稍后重试`);
+    }
     if (!transcript) {
-        throw new Error(`❌ council 任务 ${taskId} 缺少 transcript JSON，无法 resume: ${transcriptJsonPath}`);
+        throw new Error(`❌ council 任务 ${taskId} 缺少稳定 transcript JSON，无法 resume: ${transcriptJsonPath}`);
+    }
+    const sourceRunId = spec.runId || transcript.runId;
+    const sourceArtifactRun = sourceRunId ? readCouncilArtifactManifest(sourceRunId, { touch: "resume" }) : undefined;
+    if (sourceArtifactRun) {
+        transcript.runId = sourceArtifactRun.runId;
+        transcript.artifactManifestPath = sourceArtifactRun.artifactManifestPath;
     }
     return {
         sourceTaskId: taskId,
+        sourceRunId,
+        sourceArtifactManifestPath: sourceArtifactRun?.artifactManifestPath,
         spec,
         checkpoint,
         checkpointPath: paths.checkpoint,
@@ -324,7 +525,7 @@ export function readCouncilResumeSource(taskId: string, requestOwnerId: string):
     };
 }
 
-export function markCouncilTaskResumed(sourceTaskId: string, requestOwnerId: string, newTaskId: string): void {
+export function markCouncilTaskResumed(sourceTaskId: string, requestOwnerId: string, newTaskId: string, newRunId: string): void {
     const ownerId = normalizeOwnerId(requestOwnerId);
     const paths = getTaskPaths(sourceTaskId);
     recoverLegacyWorkerCwdTask(sourceTaskId);
@@ -338,6 +539,8 @@ export function markCouncilTaskResumed(sourceTaskId: string, requestOwnerId: str
     const payload: PersistentCouncilDone = {
         status: done?.status || "interrupted",
         taskId: sourceTaskId,
+        runId: done?.runId || spec?.runId || progress?.runId || "legacy",
+        artifactManifestPath: done?.artifactManifestPath || spec?.artifactManifestPath || progress?.artifactManifestPath || "",
         ownerId: sourceOwnerId,
         startedAt: done?.startedAt || progress?.startedAt || spec?.startedAt || nowIso(),
         finishedAt: done?.finishedAt || nowIso(),
@@ -345,20 +548,26 @@ export function markCouncilTaskResumed(sourceTaskId: string, requestOwnerId: str
         transcript: done?.transcript,
         error: done?.error || "任务已被 resume 接管",
         pid: done?.pid ?? progress?.pid,
+        workerIdentity: done?.workerIdentity || progress?.workerIdentity || spec?.workerIdentity,
         resumedBy: ownerId,
         newTaskId,
+        newRunId,
     };
     writeJsonAtomic(paths.done, payload);
 }
 
-export function writeCouncilTaskProgress(taskId: string, ownerId: string, progressText: string, pid?: number, startedAt?: string, deadlineAt?: string): void {
+export function writeCouncilTaskProgress(taskId: string, ownerId: string, progressText: string, pid?: number, startedAt?: string, deadlineAt?: string, workerIdentity?: CouncilWorkerIdentity): void {
     const paths = getTaskPaths(taskId);
     const current = readJson<PersistentCouncilProgress>(paths.progress);
+    const spec = readJson<PersistentCouncilSpec>(paths.spec);
     const payload: PersistentCouncilProgress = {
         status: "running",
         taskId,
+        runId: current?.runId || spec?.runId || "legacy",
+        artifactManifestPath: current?.artifactManifestPath || spec?.artifactManifestPath || "",
         ownerId,
         pid: pid ?? current?.pid,
+        workerIdentity: workerIdentity ?? current?.workerIdentity ?? spec?.workerIdentity,
         startedAt: startedAt || current?.startedAt || nowIso(),
         updatedAt: nowIso(),
         deadlineAt: deadlineAt || current?.deadlineAt,
@@ -377,9 +586,12 @@ export function finalizeCouncilTask(taskId: string, ownerId: string, result: {
 }): void {
     const paths = getTaskPaths(taskId);
     const current = readJson<PersistentCouncilProgress>(paths.progress);
+    const spec = readJson<PersistentCouncilSpec>(paths.spec);
     const payload: PersistentCouncilDone = {
         status: result.status,
         taskId,
+        runId: current?.runId || spec?.runId || result.transcript?.runId || "legacy",
+        artifactManifestPath: current?.artifactManifestPath || spec?.artifactManifestPath || result.transcript?.artifactManifestPath || "",
         ownerId,
         startedAt: result.startedAt || current?.startedAt || nowIso(),
         finishedAt: nowIso(),
@@ -387,23 +599,33 @@ export function finalizeCouncilTask(taskId: string, ownerId: string, result: {
         resultText: result.resultText,
         error: result.error,
         pid: result.pid ?? current?.pid,
+        workerIdentity: current?.workerIdentity ?? spec?.workerIdentity,
     };
     writeJsonAtomic(paths.done, payload);
+    if (payload.runId !== "legacy") {
+        const artifactRun = readCouncilArtifactManifest(payload.runId);
+        if (artifactRun.manifest.status === "running") finishCouncilArtifactRun(payload.runId, result.status);
+    }
     const progressPayload: PersistentCouncilProgress = {
-        status: result.status === "done" ? "done" : "error",
+        status: result.status,
         taskId,
+        runId: payload.runId,
+        artifactManifestPath: payload.artifactManifestPath,
         ownerId,
         pid: payload.pid,
+        workerIdentity: payload.workerIdentity,
         startedAt: payload.startedAt,
         updatedAt: payload.finishedAt,
+        deadlineAt: current?.deadlineAt,
         progressText: result.error || result.resultText,
     };
     writeJsonAtomic(paths.progress, progressPayload);
 }
 
-export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdInput?: string, maxRunMs = DEFAULT_BACKGROUND_MAX_RUN_MS, resumeSource?: CouncilResumeSource): { id: string; ownerId: string; deadlineAt: string } {
+export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdInput?: string, maxRunMs = DEFAULT_BACKGROUND_MAX_RUN_MS, resumeSource?: CouncilResumeSource): { id: string; ownerId: string; deadlineAt: string; runId: string; artifactManifestPath: string } {
     ensureTaskRoot();
     const taskId = `council-${newUuid()}`;
+    runParams = normalizeCouncilRunParams(runParams);
     const ownerId = normalizeOwnerId(ownerIdInput || runParams.ownerId);
     const startedAt = nowIso();
     const deadlineAt = new Date(Date.now() + maxRunMs).toISOString();
@@ -411,11 +633,35 @@ export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdI
     const shouldUseProvidedTranscriptPath = Boolean(runParams.transcriptPath && (!resumeSource || runParams.transcriptPath !== resumeSource.spec.transcriptPath));
     const shouldUseProvidedOutputDir = Boolean(runParams.outputDir && (!resumeSource || runParams.outputDir !== resumeSource.spec.outputDir));
     const shouldUseProvidedCheckpointPath = Boolean(runParams.checkpointPath && (!resumeSource || runParams.checkpointPath !== resumeSource.checkpointPath));
-    const transcriptPath = shouldUseProvidedTranscriptPath ? runParams.transcriptPath as string : path.join(paths.dir, "transcript.md");
+    const artifactRun = createCouncilArtifactRun({
+        taskId,
+        ownerId,
+        dependsOn: resumeSource ? [{ taskId: resumeSource.sourceTaskId, runId: resumeSource.sourceRunId }] : undefined,
+    });
+    runParams = {
+        ...runParams,
+        ownerId,
+        taskId,
+        runId: artifactRun.runId,
+        artifactManifestPath: artifactRun.artifactManifestPath,
+    };
+    const transcriptPath = shouldUseProvidedTranscriptPath
+        ? runParams.transcriptPath as string
+        : shouldUseProvidedOutputDir
+            ? path.join(path.resolve(runParams.outputDir as string), `council_${taskId}.md`)
+        : councilArtifactPath(artifactRun.runId, "transcript", "council.md");
     const checkpointPath = shouldUseProvidedCheckpointPath ? runParams.checkpointPath as string : paths.checkpoint;
-    const outputDir = shouldUseProvidedOutputDir ? runParams.outputDir as string : paths.dir;
+    const outputDir = shouldUseProvidedOutputDir ? runParams.outputDir as string : undefined;
+    const resumeTranscriptJsonPath = resumeSource ? path.join(paths.dir, "resume-transcript.json") : undefined;
+    const resumeCheckpointPath = resumeSource ? path.join(paths.dir, "resume-checkpoint.json") : undefined;
+    const serializedParams = serializeCouncilRunParams(runParams);
+    if (shouldUseProvidedTranscriptPath || shouldUseProvidedOutputDir) serializedParams.transcriptPath = transcriptPath;
+    else delete serializedParams.transcriptPath;
+    if (!shouldUseProvidedOutputDir) delete serializedParams.outputDir;
     const spec: PersistentCouncilSpec = {
         taskId,
+        runId: artifactRun.runId,
+        artifactManifestPath: artifactRun.artifactManifestPath,
         ownerId,
         startedAt,
         deadlineAt,
@@ -424,31 +670,46 @@ export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdI
         outputDir,
         resume: resumeSource ? {
             sourceTaskId: resumeSource.sourceTaskId,
-            checkpointPath: resumeSource.checkpointPath,
-            transcriptJsonPath: resumeSource.transcriptJsonPath,
+            sourceRunId: resumeSource.sourceRunId,
+            checkpointPath: resumeCheckpointPath as string,
+            transcriptJsonPath: resumeTranscriptJsonPath as string,
         } : undefined,
         params: {
-            ...runParams,
+            ...serializedParams,
             ownerId,
+            taskId,
+            runId: artifactRun.runId,
+            artifactManifestPath: artifactRun.artifactManifestPath,
             checkpointPath,
-            transcriptPath,
-            outputDir,
         },
     };
-    writeJsonAtomic(paths.spec, spec);
-    if (resumeSource) {
-        markCouncilTaskResumed(resumeSource.sourceTaskId, ownerId, taskId);
+    try {
+        if (resumeSource && resumeTranscriptJsonPath && resumeCheckpointPath) {
+            writeJsonAtomic(resumeTranscriptJsonPath, normalizeCouncilTranscript(resumeSource.transcript));
+            writeJsonAtomic(resumeCheckpointPath, resumeSource.checkpoint);
+        }
+        writeJsonAtomic(paths.spec, spec);
+        if (resumeSource) {
+            markCouncilTaskResumed(resumeSource.sourceTaskId, ownerId, taskId, artifactRun.runId);
+        }
+        writeCouncilTaskProgress(taskId, ownerId, "任务已启动，等待 worker 接管。", undefined, startedAt, deadlineAt);
+        const child = spawn(process.execPath, [WORKER_PATH, paths.spec], {
+            cwd: SERVER_ROOT,
+            detached: true,
+            stdio: "ignore",
+            windowsHide: true,
+        });
+        child.unref();
+        const workerIdentity = readCouncilWorkerIdentity(child.pid);
+        if (workerIdentity) writeJsonAtomic(paths.spec, { ...spec, workerIdentity });
+        writeCouncilTaskProgress(taskId, ownerId, "worker 已启动，准备执行 council。", child.pid, startedAt, deadlineAt, workerIdentity);
+        scheduleCouncilWorkerForceKill(taskId, ownerId, deadlineAt);
+    } catch (error) {
+        const current = readCouncilArtifactManifest(artifactRun.runId);
+        if (current.manifest.status === "running") finishCouncilArtifactRun(artifactRun.runId, "error");
+        throw error;
     }
-    writeCouncilTaskProgress(taskId, ownerId, "任务已启动，等待 worker 接管。", undefined, startedAt, deadlineAt);
-    const child = spawn(process.execPath, [WORKER_PATH, paths.spec], {
-        cwd: SERVER_ROOT,
-        detached: true,
-        stdio: "ignore",
-        windowsHide: true,
-    });
-    child.unref();
-    writeCouncilTaskProgress(taskId, ownerId, "worker 已启动，准备执行 council。", child.pid, startedAt, deadlineAt);
-    return { id: taskId, ownerId, deadlineAt };
+    return { id: taskId, ownerId, deadlineAt, runId: artifactRun.runId, artifactManifestPath: artifactRun.artifactManifestPath };
 }
 
 function readTask(taskId: string, requestOwnerId: string): PersistentCouncilQueryResult {
@@ -464,49 +725,78 @@ function readTask(taskId: string, requestOwnerId: string): PersistentCouncilQuer
     }
     const done = readJson<PersistentCouncilDone>(paths.done);
     if (done) {
+        const deadlineAtMs = spec.deadlineAt ? new Date(spec.deadlineAt).getTime() : Number.NaN;
+        if (done.status === "interrupted" && Number.isFinite(deadlineAtMs) && Date.now() > deadlineAtMs + BACKGROUND_ABORT_GRACE_MS) {
+            reclaimCouncilWorkerAfterDeadline(done.status, done.workerIdentity || spec.workerIdentity);
+        }
         return {
             taskId,
+            runId: done.runId || spec.runId,
+            artifactManifestPath: done.artifactManifestPath || spec.artifactManifestPath,
             ownerId: done.ownerId,
             status: done.status,
             startedAt: done.startedAt,
             finishedAt: done.finishedAt,
             resultText: done.resultText,
             transcript: done.transcript,
+            deadlineAt: spec.deadlineAt,
             error: done.error,
             pid: done.pid,
             resumedBy: done.resumedBy,
             newTaskId: done.newTaskId,
+            newRunId: done.newRunId,
         };
     }
     const progress = readJson<PersistentCouncilProgress>(paths.progress);
     if (progress) {
-        if (progress.deadlineAt && Date.now() > new Date(progress.deadlineAt).getTime()) {
-            killProcessTree(progress.pid);
+        const deadlineAtMs = progress.deadlineAt ? new Date(progress.deadlineAt).getTime() : Number.NaN;
+        if (Number.isFinite(deadlineAtMs) && Date.now() > deadlineAtMs + BACKGROUND_ABORT_GRACE_MS) {
+            const termination = reclaimCouncilWorkerAfterDeadline(progress.status, progress.workerIdentity || spec.workerIdentity);
+            const error = `后台任务在 deadline 后 ${BACKGROUND_ABORT_GRACE_MS}ms 仍未结束，${forceKillResultText(termination)}`;
+            finalizeCouncilTask(taskId, progress.ownerId, {
+                status: "interrupted",
+                error,
+                pid: progress.pid,
+                startedAt: progress.startedAt,
+            });
             return {
                 taskId,
+                runId: progress.runId || spec.runId,
+                artifactManifestPath: progress.artifactManifestPath || spec.artifactManifestPath,
                 ownerId: progress.ownerId,
                 status: "interrupted",
                 startedAt: progress.startedAt,
                 deadlineAt: progress.deadlineAt,
                 pid: progress.pid,
-                error: "后台任务已超过 deadline，已按超时中断处理",
+                error,
                 progressText: progress.progressText,
             };
         }
         if (progress.pid && !isPidAlive(progress.pid)) {
+            const error = "后台 worker 已退出，但未写入完成标记";
+            finalizeCouncilTask(taskId, progress.ownerId, {
+                status: "interrupted",
+                error,
+                pid: progress.pid,
+                startedAt: progress.startedAt,
+            });
             return {
                 taskId,
+                runId: progress.runId || spec.runId,
+                artifactManifestPath: progress.artifactManifestPath || spec.artifactManifestPath,
                 ownerId: progress.ownerId,
                 status: "interrupted",
                 startedAt: progress.startedAt,
                 deadlineAt: progress.deadlineAt,
                 pid: progress.pid,
-                error: "后台 worker 已退出，但未写入完成标记",
+                error,
                 progressText: progress.progressText,
             };
         }
         return {
             taskId,
+            runId: progress.runId || spec.runId,
+            artifactManifestPath: progress.artifactManifestPath || spec.artifactManifestPath,
             ownerId: progress.ownerId,
             status: "running",
             startedAt: progress.startedAt,
@@ -550,6 +840,8 @@ export function formatPersistentCouncilTask(result: PersistentCouncilQueryResult
             "",
             "## 当前进度",
             result.progressText || "暂无进度文本",
+            "",
+            result.runId ? formatCouncilArtifactSummary(result.runId) : "",
         ].filter(Boolean).join("\n");
     }
     if (result.status === "interrupted") {
@@ -561,7 +853,11 @@ export function formatPersistentCouncilTask(result: PersistentCouncilQueryResult
             result.pid ? `🧵 pid: ${result.pid}` : "",
             result.error || "worker 已退出",
             result.progressText ? `\n## 最后进度\n${result.progressText}` : "",
+            "",
+            result.runId ? formatCouncilArtifactSummary(result.runId) : "",
         ].filter(Boolean).join("\n");
     }
-    return result.resultText || result.error || `✅ 后台任务 ${result.taskId} 已完成`;
+    const text = result.resultText || result.error || `✅ 后台任务 ${result.taskId} 已完成`;
+    if (!result.runId || text.includes("## 产物路径")) return text;
+    return `${text}\n\n${formatCouncilArtifactSummary(result.runId)}`;
 }

@@ -73,7 +73,7 @@ function Test-ForbiddenRuntimeFiles {
     $badFiles = Get-ChildItem -LiteralPath $toolkitRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
             $lowerName = $_.Name.ToLowerInvariant()
-            $_.FullName -notmatch '\\.git\\' -and (
+            $_.FullName -notmatch '\\.git\\|\\node_modules\\|\\dist\\|\\build\\|\\coverage\\' -and (
                 $lowerName -in $exactNames -or
                 $lowerName -like "broker-private*.json" -or
                 $lowerName -like ".env.*" -or
@@ -97,7 +97,9 @@ function Test-ExcludedDirectories {
         "sessions", "archived_sessions", "workspaces", "sandbox-data", "subagent-data", ".test-data",
         "ms-playwright", "__pycache__", ".cache", "logs", "tmp", "temp", "profiles", "browser-profile",
         "web-fetcher-profiles", "user-data-dir", "playwright-report", "test-results", "cookies",
-        "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp"
+        "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp",
+        "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
+        "council-large-inputs", "council-model-calls", "agy-runtime"
     )
     if ($StrictPackage) {
         $names += @("node_modules", "dist", "build", "coverage")
@@ -134,6 +136,20 @@ function Test-PackageStructure {
         if (-not $packageJson.scripts.'test:portable') { throw "Missing portable build test script: $name" }
         $scriptText = $packageJson.scripts | ConvertTo-Json -Compress
         if ($scriptText -match 'tests[/\\]') { throw "Public package exposes an internal test path that is not bundled: $name" }
+    }
+
+    foreach ($path in @(
+        "mcps\sandbox\src\council\agy-runtime.ts",
+        "mcps\sandbox\src\council\artifact-gc.ts",
+        "mcps\sandbox\src\council\artifact-store.ts",
+        "mcps\sandbox\src\council\paths.ts"
+    )) {
+        $full = Join-Path $toolkitRoot $path
+        if (-not (Test-Path -LiteralPath $full)) { throw "Missing Sandbox Council lifecycle source: $full" }
+    }
+    $sandboxPaths = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\sandbox\src\council\paths.ts") -Raw -Encoding UTF8
+    if (-not $sandboxPaths.Contains("process.env.SANDBOX_DATA_ROOT")) {
+        throw "Portable Sandbox Council paths must follow SANDBOX_DATA_ROOT instead of the source tree."
     }
 
     foreach ($path in @(
@@ -178,7 +194,10 @@ function Test-PackageStructure {
     Write-Output "Portable skills verified: $($skillDirs.Count)"
 
     foreach ($jsonPath in @("templates\config.antigravity.example.json", "templates\config.claude.example.json", "templates\config.windsurf.example.json", "templates\config.windsurf.subagent.example.json")) {
-        Get-Content -LiteralPath (Join-Path $toolkitRoot $jsonPath) -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null
+        $jsonFullPath = Join-Path $toolkitRoot $jsonPath
+        $jsonText = Get-Content -LiteralPath $jsonFullPath -Raw -Encoding UTF8
+        if ($jsonText.Length -gt 0 -and [int]$jsonText[0] -eq 0xFEFF) { throw "JSON template contains a UTF-8 BOM: $jsonFullPath" }
+        $jsonText | ConvertFrom-Json | Out-Null
     }
     $codexConfig = Get-Content -LiteralPath (Join-Path $toolkitRoot "templates\config.codex.toml") -Raw -Encoding UTF8
     foreach ($requiredBlock in @("[mcp_servers.memory-store]", "[mcp_servers.web-fetcher]", "[mcp_servers.sandbox]")) {

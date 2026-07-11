@@ -6,6 +6,11 @@ import { runCouncilTool } from "./tools.js";
 import { saveCouncilTranscript } from "./transcript.js";
 import { prepareCouncilFiles } from "./file-input.js";
 import { prepareCouncilLargeInputs } from "./large-input.js";
+import {
+    createCouncilArtifactRun,
+    finishCouncilArtifactRun,
+    readCouncilArtifactManifest,
+} from "./artifact-store.js";
 import type {
     CouncilModelConfig,
     CouncilModeratorDecision,
@@ -16,6 +21,7 @@ import type {
     CouncilTranscript,
     CouncilTurnMessage,
 } from "./types.js";
+import { normalizeCouncilModelConfig, normalizeCouncilProvider } from "./types.js";
 
 const DEFAULT_MAX_ROUNDS = Number(process.env.SANDBOX_COUNCIL_MAX_ROUNDS || 4);
 const DEFAULT_MAX_TOOL_CALLS = Number(process.env.SANDBOX_COUNCIL_MAX_TOOL_CALLS || 6);
@@ -32,12 +38,41 @@ function clip(text: string, maxChars: number): string {
 
 function supportsDirectImageInput(config: CouncilRunParams["participants"][number] | CouncilRunParams["moderator"]): boolean {
     if (!config.supportsVision) return false;
-    return ["openai", "anthropic", "gemini", "geminiCli", "grok", "customOpenAICompatible"].includes(config.provider);
+    const provider = normalizeCouncilProvider(config.provider);
+    return ["openai", "anthropic", "gemini", "antigravityCli", "grok", "customOpenAICompatible"].includes(provider);
 }
 
 function normalizeTimeoutMs(value: unknown): number | undefined {
     if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
     return Math.max(10_000, Math.min(Math.trunc(value), 30 * 60_000));
+}
+
+function throwIfCouncilAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return;
+    const error = new Error(signal.reason instanceof Error ? signal.reason.message : "council 已中止");
+    error.name = "AbortError";
+    throw error;
+}
+
+function ensureCouncilArtifactRun(params: CouncilRunParams): CouncilRunParams {
+    if (!params.runId) {
+        const created = createCouncilArtifactRun({
+            taskId: params.taskId,
+            ownerId: params.ownerId?.trim() || "global",
+            dependsOn: params.resumeState ? [{ taskId: params.resumeState.sourceTaskId, runId: params.resumeState.sourceRunId }] : undefined,
+        });
+        return { ...params, runId: created.runId, artifactManifestPath: created.artifactManifestPath };
+    }
+    const existing = readCouncilArtifactManifest(params.runId);
+    if (params.artifactManifestPath && path.resolve(params.artifactManifestPath) !== path.resolve(existing.artifactManifestPath)) {
+        throw new Error(`artifactManifestPath 与 runId 不匹配: ${params.runId}`);
+    }
+    return { ...params, artifactManifestPath: existing.artifactManifestPath };
+}
+
+function finishCouncilRunIfRunning(runId: string, status: "done" | "error" | "interrupted"): void {
+    const current = readCouncilArtifactManifest(runId);
+    if (current.manifest.status === "running") finishCouncilArtifactRun(runId, status);
 }
 
 function hasPressureInputs(files: CouncilTranscript["files"], largeInputs: CouncilTranscript["largeInputs"] = [], imagePaths: string[] = []): boolean {
@@ -290,7 +325,6 @@ function writeCheckpoint(params: CouncilRunParams, transcript: CouncilTranscript
 }
 
 function savePartialTranscript(params: CouncilRunParams, transcript: CouncilTranscript): CouncilTranscript {
-    if (!params.transcriptPath) return transcript;
     return saveCouncilTranscript(transcript, params.transcriptPath, params.outputDir);
 }
 
@@ -408,6 +442,7 @@ function buildModeratorFailureDecision(messages: CouncilTurnMessage[], err: unkn
 }
 
 async function buildImageObservations(params: CouncilRunParams): Promise<string> {
+    throwIfCouncilAborted(params.signal);
     const imagePaths = params.images || [];
     if (imagePaths.length === 0) return "";
     const model = (params.transcriptionModel && supportsDirectImageInput(params.transcriptionModel) ? params.transcriptionModel : undefined)
@@ -421,9 +456,10 @@ async function buildImageObservations(params: CouncilRunParams): Promise<string>
             "请把这些图片转述成可供多模型文本讨论使用的观察记录。",
             "要求：描述可见文字、布局、数据、异常、可能不确定处；不要做身份识别。",
         ].join("\n");
-        const result = await callCouncilModel({ ...model, supportsVision: true }, prompt, imagePaths);
+        const result = await callCouncilModel({ ...model, supportsVision: true }, prompt, imagePaths, DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId);
         return result.text;
     } catch (err) {
+        throwIfCouncilAborted(params.signal);
         return `多模态转述失败: ${err instanceof Error ? err.message : String(err)}`;
     }
 }
@@ -437,9 +473,9 @@ function defaultTextProjectionModel(): CouncilModelConfig {
         id: "text_projection",
         role: "纯文本输入转述器",
         provider: "codex",
-        model: process.env.SANDBOX_COUNCIL_TEXT_PROJECTION_MODEL || "gpt-5.4-mini",
+        model: process.env.SANDBOX_COUNCIL_TEXT_PROJECTION_MODEL || "gpt-5.6-luna",
         params: {
-            reasoning: process.env.SANDBOX_COUNCIL_TEXT_PROJECTION_REASONING || "medium",
+            reasoning: process.env.SANDBOX_COUNCIL_TEXT_PROJECTION_REASONING || "high",
             speed: process.env.SANDBOX_COUNCIL_TEXT_PROJECTION_SPEED || "fast",
         },
     };
@@ -451,6 +487,7 @@ async function buildOnlyTextProjection(
     files: CouncilTranscript["files"],
     imageObservations: string,
 ): Promise<string> {
+    throwIfCouncilAborted(params.signal);
     if ((files.length === 0 && (!params.images || params.images.length === 0)) || !hasOnlyTextActors(params)) {
         return "";
     }
@@ -466,9 +503,10 @@ async function buildOnlyTextProjection(
     ].filter(Boolean).join("\n\n");
     const model = params.textProjectionModel || defaultTextProjectionModel();
     try {
-        const result = await callCouncilModel(model, prompt, []);
+        const result = await callCouncilModel(model, prompt, [], DEFAULT_COUNCIL_MODEL_TIMEOUT_MS, params.signal, params.runId);
         return result.text;
     } catch (err) {
+        throwIfCouncilAborted(params.signal);
         const fallbackSections = [
             "纯文本输入转述生成失败，以下为原始可用材料回退。",
             err instanceof Error ? `错误: ${err.message}` : `错误: ${String(err)}`,
@@ -479,10 +517,18 @@ async function buildOnlyTextProjection(
     }
 }
 
-export async function runCouncil(params: CouncilRunParams): Promise<CouncilTranscript> {
+async function runCouncilWithinArtifactRun(params: CouncilRunParams): Promise<CouncilTranscript> {
+    throwIfCouncilAborted(params.signal);
     if (!params.participants || params.participants.length === 0) {
         throw new Error("sandbox_council 需要至少 1 个 participant");
     }
+    params = {
+        ...params,
+        participants: params.participants.map(normalizeCouncilModelConfig),
+        moderator: normalizeCouncilModelConfig(params.moderator),
+        transcriptionModel: params.transcriptionModel ? normalizeCouncilModelConfig(params.transcriptionModel) : undefined,
+        textProjectionModel: params.textProjectionModel ? normalizeCouncilModelConfig(params.textProjectionModel) : undefined,
+    };
     const maxRounds = Math.max(1, Math.min(params.maxRounds || DEFAULT_MAX_ROUNDS, 8));
     const maxToolCalls = Math.max(0, Math.min(params.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS, 10));
     let effectiveParams: CouncilRunParams;
@@ -503,6 +549,8 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         effectiveParams = { ...params, images: resumedTranscript.images };
         transcript = {
             ...resumedTranscript,
+            runId: params.runId as string,
+            artifactManifestPath: params.artifactManifestPath as string,
             mode: effectiveParams.mode || resumedTranscript.mode,
             input: effectiveParams.input,
             contextMode: effectiveParams.contextMode || resumedTranscript.contextMode,
@@ -522,8 +570,11 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         const prepared = await prepareCouncilFiles({
             files: runParams.files,
             largeInput: runParams.largeInput,
+            runId: runParams.runId,
+            signal: runParams.signal,
             onProgress: (message) => params.onProgress?.(`## 当前进度\n${message}`),
         });
+        throwIfCouncilAborted(params.signal);
         files = prepared.files;
         largeInputs = [...largePrepared.largeInputs, ...prepared.largeInputs];
         imagePaths = [...new Set([...(runParams.images || []).map((item) => path.resolve(item)), ...prepared.promotedImages])];
@@ -535,6 +586,8 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         textProjection = await buildOnlyTextProjection(effectiveParams, sharedContextForProjection, files, imageObservations);
         transcript = {
             id: newUuid(),
+            runId: params.runId as string,
+            artifactManifestPath: params.artifactManifestPath as string,
             mode: effectiveParams.mode || "review",
             input: effectiveParams.input,
             contextMode: effectiveParams.contextMode || "summary",
@@ -554,7 +607,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
     }
 
     writeCheckpoint(params, transcript, {
-        taskId: params.resumeState?.sourceTaskId,
+        taskId: params.taskId,
         currentRound: startRound,
         lastCompletedRound: transcript.rounds.at(-1)?.round || 0,
         phase: "prepared",
@@ -575,6 +628,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
     let { toolCallsUsed, askTarget, askInstruction, afterToolInstruction } = restoreLoopState(transcript.rounds);
 
     for (let round = startRound; round <= maxRounds; round++) {
+        throwIfCouncilAborted(effectiveParams.signal);
         writeCheckpoint(params, transcript, {
             taskId: params.resumeState?.sourceTaskId,
             currentRound: round,
@@ -593,7 +647,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         const messages = await Promise.all(participantsToCall.map(async (participant): Promise<CouncilTurnMessage> => {
             try {
                 const prompt = participantPrompt(effectiveParams, participant.id, participant.role, participantContexts.get(participant.id) || sharedContext, history, extraInstruction);
-                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? imagePaths : [], modelTimeoutMs);
+                const result = await callCouncilModel(participant, prompt, supportsDirectImageInput(participant) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId);
                 completedParticipants++;
                 params.onProgress?.(`Round ${round}: ${participant.id}/${participant.role} 已返回 (${completedParticipants}/${participantsToCall.length})，模型=${result.model}\n摘要: ${summarizeForProgress(result.text)}`);
                 return {
@@ -606,6 +660,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
                     metadata: result.metadata,
                 };
             } catch (err) {
+                throwIfCouncilAborted(effectiveParams.signal);
                 completedParticipants++;
                 params.onProgress?.(`Round ${round}: ${participant.id}/${participant.role} 调用失败 (${completedParticipants}/${participantsToCall.length})\n错误: ${err instanceof Error ? err.message : String(err)}`);
                 return {
@@ -631,7 +686,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         partialTranscript.rounds.push(partialRoundEntry);
         savePartialTranscript(params, partialTranscript);
         writeCheckpoint(params, transcript, {
-            taskId: params.resumeState?.sourceTaskId,
+            taskId: params.taskId,
             currentRound: round,
             lastCompletedRound: transcript.rounds.at(-1)?.round || 0,
             phase: "moderator",
@@ -650,11 +705,12 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
             moderatorStep++;
             const modPrompt = moderatorPrompt(effectiveParams, moderatorContext, history, messages, toolCallsUsed, maxToolCalls, roundToolResults, moderatorStep);
             try {
-                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? imagePaths : [], modelTimeoutMs);
+                const moderatorResult = await callCouncilModel(effectiveParams.moderator, modPrompt, supportsDirectImageInput(effectiveParams.moderator) ? imagePaths : [], modelTimeoutMs, effectiveParams.signal, effectiveParams.runId);
                 moderator = parseModeratorDecision(moderatorResult.text);
                 moderator.metadata = moderatorResult.metadata;
                 params.onProgress?.(`Round ${round} / 主持步骤 ${moderatorStep}: 主持模型已返回，动作=${moderator.action}，模型=${moderatorResult.model}\n摘要: ${summarizeForProgress(moderator.summary)}`);
             } catch (err) {
+                throwIfCouncilAborted(effectiveParams.signal);
                 moderator = buildModeratorFailureDecision(messages, err);
                 moderatorSteps.push(moderator);
                 params.onProgress?.(`Round ${round}: 主持模型调用失败，已使用规则兜底提前终止\n错误: ${err instanceof Error ? err.message : String(err)}`);
@@ -687,8 +743,10 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
             const droppedCount = requestedToolCalls.length - toolCallsForRound.length;
             const stepToolResults: CouncilToolResult[] = [];
             for (const toolCall of toolCallsForRound) {
+                throwIfCouncilAborted(effectiveParams.signal);
                 params.onProgress?.(`Round ${round}: 正在执行工具 ${toolCall.tool}\n原因: ${toolCall.reason || "未提供"}`);
                 const toolResult = await runCouncilTool(toolCall, effectiveParams.tools);
+                throwIfCouncilAborted(effectiveParams.signal);
                 toolCallsUsed++;
                 stepToolResults.push(toolResult);
                 roundToolResults.push(toolResult);
@@ -736,7 +794,7 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         transcript.rounds.push(roundEntry);
         transcript = savePartialTranscript(params, transcript);
         writeCheckpoint(params, transcript, {
-            taskId: params.resumeState?.sourceTaskId,
+            taskId: params.taskId,
             currentRound: round,
             lastCompletedRound: round,
             phase: "round_complete",
@@ -761,6 +819,18 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
     }
     const saved = saveCouncilTranscript(transcript, params.transcriptPath, params.outputDir);
     return saved;
+}
+
+export async function runCouncil(params: CouncilRunParams): Promise<CouncilTranscript> {
+    const runParams = ensureCouncilArtifactRun(params);
+    try {
+        const result = await runCouncilWithinArtifactRun(runParams);
+        finishCouncilRunIfRunning(result.runId, "done");
+        return result;
+    } catch (error) {
+        finishCouncilRunIfRunning(runParams.runId as string, runParams.signal?.aborted || (error instanceof Error && error.name === "AbortError") ? "interrupted" : "error");
+        throw error;
+    }
 }
 
 export async function resumeCouncil(params: CouncilRunParams): Promise<CouncilTranscript> {

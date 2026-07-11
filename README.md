@@ -4,7 +4,7 @@
 
 这套项目最初用于 Antigravity，后来扩展为 Codex、Claude Code 与 Windsurf 共用同一套 MCP 源码、数据目录约定和模型路由。当前版本同时保留「单独安装一个宿主也能使用」与「多个宿主共享数据」两种模式。
 
-> 2026-07-11 refresh：memory-store 1.19.3、sandbox 1.14.0、web-fetcher 7.0.0、portable broker 0.1.0、Windsurf-only subagent 1.1.0。
+> 2026-07-12 refresh：memory-store 1.19.3、sandbox 1.15.1、web-fetcher 7.0.0、portable broker 0.1.0、Windsurf-only subagent 1.1.0。
 
 ## 这套工具解决什么问题
 
@@ -19,7 +19,7 @@
 | 组件 | 版本 | 主要用途 |
 | --- | ---: | --- |
 | `memory-store` | 1.19.3 | 记忆、Conversation、Record、Golden Extract、Stage Guard、后台任务与跨宿主路由 |
-| `sandbox` | 1.14.0 | 隔离执行、持久会话、批处理、智能搜索、Codex 任务与多模型 Council |
+| `sandbox` | 1.15.1 | 隔离执行、持久会话、批处理、智能搜索、Codex 任务与多模型 Council |
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
@@ -29,6 +29,7 @@
 ### memory-store：Conversation 与 Record 系列
 
 - `conversation_read_original` 可列出、定位、搜索、分轮读取和导出 Codex、Antigravity、Claude Code、Windsurf 对话。
+- 跨宿主 Conversation 需要接收方自行授权访问对应宿主的本地对话目录；工具包不会携带发送方数据，也不会把读取权限扩展到未配置的机器或账户。
 - `conversation_golden_extract` 从长对话中提取可复用的高价值片段。
 - `record_manage` 维护结构化工作记录，支持读取视图、阶段更新、所有权审计与后台生成。
 - `stage_guard` 在阶段结束前对照 Plan、Task 和执行证据检查是否漏项。
@@ -38,6 +39,7 @@
 ### web-fetcher：网页、文件与视觉检查
 
 - 可抓取公开网页，也可通过接收方自己的浏览器 profile 使用已登录站点。
+- 启用持久浏览器 profile 会在接收方数据根保存 Cookie 与 localStorage，可能包含登录态；不要把 profile、备份或运行数据再次打包分享。
 - 支持 HTML、PDF、DOCX、PPTX、XLSX、EPUB、图片等本地文件的读取与转换流程。
 - `web_fetch_screenshot`、`web_inspect` 可检查重叠、溢出、可读性和页面结构。
 - `web_interact`、`web_pipeline` 支持持久 session、点击、输入、DOM 检查和批量流水线。
@@ -46,8 +48,11 @@
 ### sandbox：执行、搜索与 Council
 
 - `sandbox_exec`、`sandbox_batch`、`sandbox_session`、`sandbox_launch` 覆盖短代码、并行任务、持久会话和后台进程。
+- 名称里的「sandbox」指硬超时、内存约束、任务管理与输出治理，不是 Windows AppContainer 或虚拟机级隔离；命令仍以接收方当前用户权限访问本机文件和环境变量。
 - `smart_search` 提供精确、模糊和模型语义搜索，可选择 Grok、Antigravity、Codex 或显式 Claude Code 模型链路。
-- `sandbox_council` 让多个模型独立审议同一问题，支持文件和图片输入、后台任务、owner 隔离与 provider fallback。
+- `sandbox_council` 让多个模型独立审议同一问题，支持文件和图片输入、后台任务、owner 隔离、可中止续跑与同 provider fallback。
+- Council 1.15.1 为每次运行建立带 `manifest.json` 的托管产物目录，统一追踪 transcript、索引和大输入；`sandbox_status` 提供只读预演、隔离、恢复与受保护清理，避免误删运行中或仍被依赖的产物。
+- Antigravity CLI（`agy`）模型调用和文件索引共享跨 worker 租约池，并加强代理继承、终止错误分类、超时中止与进程树回收；公开版仍把所有运行数据放到接收方的数据根，不写回源码目录。
 - 公开版 ProGrok 集成只连接接收方已经运行的 OpenAI-compatible API，不安装、不启动、不 patch ProGrok。
 
 ### HTTP broker
@@ -152,7 +157,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | Component | Version | Purpose |
 | --- | ---: | --- |
 | `memory-store` | 1.19.3 | Memory, Conversation, Record, Golden Extract, Stage Guard, background tasks, and host routing |
-| `sandbox` | 1.14.0 | Isolated execution, sessions, batch jobs, smart search, Codex tasks, and multi-model Council |
+| `sandbox` | 1.15.1 | Isolated execution, sessions, batch jobs, smart search, Codex tasks, and multi-model Council |
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
@@ -160,9 +165,11 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 ## Highlights
 
 - Conversation tools can locate, search, read by round, and export conversations from all four hosts.
+- Cross-host conversation access requires receiver-granted access to each host's local conversation directory; no sender data or remote account access is bundled.
 - Record, Golden Extract, Stage Guard, ownership checks, background recovery, and stable task IDs support long engineering workflows.
 - Web Fetcher handles local HTML, PDF, DOCX, PPTX, XLSX, EPUB, images, real browser sessions, screenshots, visual inspection, and DOM interaction.
-- Sandbox provides short execution, parallel batches, persistent sessions, background launches, smart code search, and Council reviews across Grok, Antigravity, Codex, and explicit Claude Code routes.
+- Persistent browser profiles store receiver-side cookies and localStorage and must never be repackaged. Sandbox adds timeouts, memory limits, and task governance but is not an OS-level VM or AppContainer; commands retain the receiver user's file and environment access.
+- Sandbox provides short execution, parallel batches, persistent sessions, background launches, smart code search, and Council reviews across Grok, Antigravity, Codex, and explicit Claude Code routes. Council 1.15.1 adds manifest-governed artifacts, abort/resume hardening, guarded garbage collection, and a cross-worker `agy` lease pool while keeping runtime data outside the source tree.
 - The broker forwards long-task timeouts, writes shutdown state reliably, and includes an optional stateless Exa bridge.
 - Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Windsurf uses a short global rule plus five system-rule fragments.
 - Sixteen allow-listed portable skills are included and validated during package checks.

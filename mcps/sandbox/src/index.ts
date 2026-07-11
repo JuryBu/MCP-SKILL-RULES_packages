@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.14.0
+ * MCP Sandbox Server v1.15.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -33,6 +33,7 @@ import { registerLaunch } from "./tools/launch.js";
 import { registerSmartSearch } from "./tools/smart-search.js";
 import { registerCouncil } from "./tools/council.js";
 import { cleanOldCouncilTasks, scanCouncilTasksOnStartup } from "./council/background.js";
+import { runCouncilArtifactGc } from "./council/artifact-gc.js";
 import { initParentLs } from "./ls-client.js";
 
 // === 进程生命周期 ===
@@ -41,7 +42,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.14.0",
+    version: "1.15.1",
 });
 
 // 注册所有 8 个工具
@@ -66,7 +67,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.14.0 使用指南
+                text: `# MCP Sandbox v1.15.1 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -301,7 +302,7 @@ MCP 进程与父 LS 进程绑定（ppid），与窗口同生共死：
 说明：
 - exact / fuzzy 完全不受 modelChain/chain 参数影响，行为保持不变
 - modelChain=auto：按 Grok → Antigravity → Codex 自动选择；Grok 通过本机 progrok OpenAI-compatible API（默认 http://127.0.0.1:18645）调用；不会自动调用 Claude Code CLI，避免静默消耗额度
-- modelChain=grok：强制走 progrok API；不可用时直接报错，不静默降级。便携公开版只连接接收方已启动的 proxy，不自动启动或修改 progrok 安装
+- modelChain=grok：强制走接收方已经运行的 progrok API；不可用时直接报错，不静默降级。公开版不安装、不启动、不 patch ProGrok
 - smart_search 的 Grok 三阶段默认传 reasoning_effort=low；可用 SANDBOX_PROGROK_REASONING_EFFORT / SANDBOX_SMART_GROK_REASONING_EFFORT 覆盖。progrok 超时、截断、429、5xx 时会在 Grok 桥内用 fallback 模型重试一次，默认 grok-4.20-non-reasoning，可用 SANDBOX_PROGROK_FALLBACK_MODEL / SANDBOX_SMART_GROK_FALLBACK_MODEL 覆盖；max_tokens 保持 4096
 - progrok 可用性探测默认 8s、瞬态失败重试 1 次，且响应必须包含 ok 才算可用；可用 SANDBOX_PROGROK_PROBE_TIMEOUT_MS / SANDBOX_PROGROK_PROBE_RETRIES 覆盖，避免 Clash/progrok 短暂波动时过早降级到 Codex
 - modelChain=antigravity：强制走 Antigravity LS；未发现可连接 LS 时直接报错
@@ -333,9 +334,14 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 - participants 只能发言，不能直接调用工具
 - moderator 主持模型决定继续、调用工具、点名补充或 TERMINATE
 - Antigravity provider 只走 GetModelResponse，不使用 Cascade
+- 本机服务或凭据可用时，推荐常用链路是 antigravityCli（本地 Antigravity CLI / agy，Gemini 系列）或 grok（本机 progrok，默认 grok-4.5）；这不保证外部容量、登录态或本机服务始终可用
 - 支持 background/taskId/waitSeconds/ownerId，长讨论建议后台运行；任务未完成时会返回当前讨论进度。启动时使用了 ownerId，后续 taskId 查询必须传同一个 ownerId，避免误以为任务丢失而重复启动
 - 支持 resume/resumeTaskId：interrupted 的 council 后台任务会读取 checkpoint 断点继续；上一轮未完整提交时会重试该轮，已完成轮次不会重复
 - 完整副本同时写 Markdown + JSON
+- 每个 council run 使用稳定 council-artifacts/<runId>/ 根目录和 manifest.json；显式 transcriptPath/outputDir 只登记为外部引用，不由 council GC 删除
+- sandbox-data/temp/council-tasks/<taskId>/ 只保存后台状态、checkpoint 和 resume transcript 快照，核心文件包括 spec/progress/done，用于查询、恢复和结束状态，不是完整 artifact 根目录
+- 服务默认不自动修改 Council 持久产物；先用 sandbox_status(action="gc", gcScope="council", gcMode="dryRun") 预演，用户授权后再显式 apply。仅设置 SANDBOX_COUNCIL_AUTO_GC=1 时，启动才会 apply 托管产物（includeLegacy=false）并按 15 天清理过期 task；legacy 迁移始终需要人工调用
+- sandbox_status 的 council GC 支持 dryRun/apply/restore/purge；TTL 默认 14 天且最小 7 天，只处理终态 run 组，每次最多 100 个，并保护 dependsOn、running、文件名恰为 .preserve 的标记文件与损坏 manifest；legacy apply 会把旧产物逐文件隔离到 council-quarantine/<quarantineId>/，可用 restore 复原或 purge 清除
 
 常用参数:
 | 参数 | 说明 |
@@ -343,7 +349,7 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 | participants | 参与模型数组：id/role/provider/model/params/supportsVision |
 | moderator | 主持模型配置对象，必须包含 id/role/provider；不能写成 "gpt-5.4" 字符串 |
 | input | 审议输入文本 |
-| files | 背景文件，可带 range；纯文本直接抽取；PDF/Word/Excel/EPUB/视频优先 Gemini CLI agentic 索引，失败 fallback 到 Codex CLI，再失败时常见格式走本地结构化兜底；CLI 索引和兜底产物统一写入 sandbox-data/temp/council-indexes 临时目录 |
+| files | 背景文件，可带 range；纯文本直接抽取。PDF/Word/Excel/EPUB/PPTX 默认由 Antigravity CLI (agy) 索引后再走本地结构化解析；PPTX 硬隔离，永不进入 Codex。PDF/Word/Excel/EPUB 仅在 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 时才允许 Codex 作为最后兜底，视频与未知二进制可在 agy 失败后由 Codex CLI 尝试。索引产物统一写入 sandbox-data/temp/council-indexes 临时目录 |
 | images | 图片路径；supportsVision=true 的模型可直接接收，纯文本模型会额外收到 only-text 转述 |
 | contextMode | none/summary/full/manual |
 | manualContext | 手动附加上下文 |
@@ -351,7 +357,7 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 | modelTimeoutMs/pressureModelTimeoutMs | 正式模型调用超时；普通任务默认 120s，压力输入默认 600s；单模型可用 params.timeoutMs 覆盖 |
 | roles | 角色补充说明 |
 | transcriptionModel | 图片观察转述模型 |
-| textProjectionModel | 纯文本参与者的专用转述模型，默认 codex/gpt-5.4-mini |
+| textProjectionModel | 纯文本参与者的专用转述模型，默认 codex/gpt-5.6-luna（reasoning=high、speed=fast） |
 | background/taskId/waitSeconds/ownerId | 后台任务与归属查询；taskId 查询需复用启动时的 ownerId |
 | mode | red_blue_black/design/review/guard_check/custom |
 | tools | webSearch/webFetchText/simpleScript 开关 |
@@ -368,19 +374,23 @@ Provider:
 - openai: Responses API，支持 vision 输入
 - anthropic: Messages API，支持 vision 输入
 - gemini: generateContent，支持 vision 输入
-- geminiCli: 本地 Gemini CLI，支持作为 council 参与者/主持人；supportsVision=true 时直接处理图片路径，响应写入 sandbox-data/temp/council-model-calls 临时文件后由宿主校验读取
+- antigravityCli: 本地 Antigravity CLI (agy) 的主名称，支持作为 council 参与者/主持人；supportsVision=true 时直接处理图片路径，响应写入 sandbox-data/temp/council-model-calls 临时文件后由宿主校验读取。geminiCli 是一个版本周期的弃用别名，调用同一 agy 实现
 - customOpenAICompatible: OpenAI-compatible chat/completions
   - 通过 params.baseUrl 指向 /v1；本地代理建议用 params.body.max_tokens 明确控制输出长度
+- agy 代理只注入 agy 子进程环境，不修改宿主环境、注册表、任务计划或登录态。SANDBOX_COUNCIL_ANTIGRAVITY_CLI_PROXY_MODE 支持 off/inherit/system/auto，默认 auto：off 清除子进程代理变量并直连，inherit 只继承已有环境，system 只读 Windows 固定代理，auto 按 HTTP/HTTPS 分协议依次使用专用 SANDBOX_COUNCIL_ANTIGRAVITY_CLI_HTTP_PROXY/HTTPS_PROXY、已有 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY（含小写）、无 PAC 时的 Windows 固定代理，最后直连；NO_PROXY 与 ProxyOverride 合并去重，PAC 不转换为 HTTP_PROXY，代理地址和凭据不写入日志
+- agy provider 调用与文件索引共用跨 worker 的全局租约池，默认硬上限为 2；单次 params.concurrency 不能绕过该上限，租约等待可被 AbortSignal 中止，只有确认租约过期且 PID 不存在或进程启动标识不匹配时才回收，身份无法确认时保守保留并报告
 - params.fallbackModels: 同 provider 降级链。主模型按 params.retries 重试仍失败，且错误属于超时、429、5xx、空输出、连接中断这类临时问题时，按顺序尝试备用模型；API key 缺失、参数错误、安全拦截、输出截断等不会自动降级
 - Antigravity/OpenAI/Anthropic/Gemini/custom provider 的 fallbackModels 必须显式写在对应 participant/moderator 的 params 里；不会因为 model 写了 sonnet/opus 就自动选择备用模型。Antigravity Claude/Sonnet/Opus 不稳定时可传 "params": {"retries": 1, "fallbackModels": ["M132", "M20", "M18", "M16", "M36"]}，否则只重试当前模型。复杂推理/Guard/审议类任务可显式指定 M16 或把 M16 放到自定义 fallback 前段
 - Codex provider 未显式传 fallbackModels 时默认按 gpt-5.4 high → medium → low → gpt-5.4-mini medium → low 降级，并跳过当前已使用档位；可用 SANDBOX_COUNCIL_CODEX_DEFAULT_FALLBACKS=0 关闭
 - Grok provider 默认不臆造备用模型；只有显式 params.fallbackModels 或 SANDBOX_COUNCIL_GROK_MODEL_CHAIN 才启用同 provider 降级。默认同源并发 2，可用 SANDBOX_COUNCIL_GROK_CONCURRENCY 覆盖
 - Claude Code provider 不进入 auto 或 Codex 默认 fallback；只有显式 provider="claudeCode" 才会调用，可用 params.maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools 控制
-- Gemini CLI provider 未显式传 fallbackModels 时默认按 auto-gemini-3 → gemini-3.1-pro-preview → gemini-2.5-pro → gemini-3.1-flash-lite-preview → gemini-2.5-flash-lite 降级；可用 SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS=0 关闭。Gemini CLI provider 默认 approvalMode=yolo，可用 params.approvalMode 或 SANDBOX_COUNCIL_GEMINI_CLI_APPROVAL_MODE 覆盖；provider/indexer 的临时 prompt/artifact 会写到 Gemini 允许访问的项目临时目录。若超时时标记结果已经写好，宿主会直接收结果并清理进程树
+- Antigravity CLI provider 未显式传 fallbackModels 时默认按 Gemini 3.1 Pro (High) → Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low) → Gemini 3.5 Flash (Medium) 降级；可用 SANDBOX_COUNCIL_ANTIGRAVITY_CLI_DEFAULT_FALLBACKS=0 关闭。命令默认是 agy，可用 params.command/params.cli 或 SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND 覆盖。SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL、_MODEL_CHAIN、_DEFAULT_FALLBACKS、_COMMAND、_TEMP_DIR、_CONCURRENCY、_MAX_BYTES 和 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS 为新名称，旧 SANDBOX_COUNCIL_GEMINI_CLI_* 与 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS 兼容一个版本周期且新名称优先。超时或中止会回收 PowerShell 与 agy 进程树
+- antigravityCli 的认证/命令缺失/路径拒绝等 terminal failure 会停止 agy 模型重试：PDF/Word/Excel/EPUB 进入本地 Python fallback，PPTX 也进入 Python fallback 且永远不进 Codex，视频与未知二进制可按既有链路尝试 Codex；capacity、timeout、瞬态错误和空产物只按既有同 provider/同 agy 链重试或降级，provider fallback 不跨 provider
 - moderator 调用失败时会先走 provider fallback；如果所有主持模型仍失败，会用规则兜底汇总已返回的参与者意见，并标明未经过主持模型二次综合
-- CLI 文件索引：Gemini CLI 和 Codex CLI 都必须把完整索引写入临时 Markdown，stdout/stderr 只保留短状态；宿主会校验临时文件存在、大小上限和 <<<COUNCIL_INDEX>>> 标记，避免大索引走内存。索引模型链可用 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS、SANDBOX_COUNCIL_GEMINI_INDEX_APPROVAL_MODES、SANDBOX_COUNCIL_CODEX_INDEX_MODELS、SANDBOX_COUNCIL_CLI_INDEX_RETRIES 覆盖
+- CLI 文件索引：Antigravity CLI (agy) 和 Codex CLI 都必须把完整索引写入临时 Markdown，stdout/stderr 只保留短状态；宿主会校验临时文件存在、大小上限和 <<<COUNCIL_INDEX>>> 标记。agy 索引模型链为多模态 Gemini 3.5 Flash (High) → Gemini 3.1 Pro (Low) → Gemini 3.5 Flash (Medium)，其他文件 Gemini 3.5 Flash (Low) → Gemini 3.5 Flash (Medium) → Gemini 3.1 Pro (Low)，可用 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS 覆盖。PPTX 始终禁止进入 Codex；PDF/Word/Excel/EPUB 默认也不进入，仅 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 才允许作为最后兜底
 - 大输入处理：默认超过 60000 真实字符的 input、manualContext、纯文本文件或 CSV 文件会写入 sandbox-data/temp/council-large-inputs；source 原文、checkpoint JSON 和 LargeInputIndex Markdown 都落临时文件，注入模型的只是索引摘录和路径。默认 chunkSize=24000、overlap=1200，可用 largeInput 或 SANDBOX_COUNCIL_LARGE_INPUT_* 环境变量覆盖
 - 压力输入超时：当存在 large_input_index、agentic_index、structured_extract、promoted_image 或 images 时，正式模型调用默认从 120s 放宽到 600s；可用 pressureModelTimeoutMs / SANDBOX_COUNCIL_PRESSURE_MODEL_TIMEOUT_MS 覆盖，单模型可用 params.timeoutMs 覆盖；后台任务默认 deadline 为 45 分钟
+- 前台调用沿链路传递同一 AbortSignal；后台 worker 根据 deadline 创建本地取消控制器，先中止并写入 interrupted，等待清理宽限期后仍存活才由父进程或状态查询强制结束整个 worker 进程树。系统不检查桌面进程名，也不注册桌面自启
 
 最小示例:
 \`\`\`json
@@ -396,6 +406,7 @@ Provider:
   "background": true,
   "ownerId": "example-owner"
 }
+
 \`\`\`
 
 后台查询时请复用启动返回的 ownerId：
@@ -446,6 +457,7 @@ Antigravity 常用别名:
 - v1.13.7 清理 Plan_12 P2/P3 设计风险：smart_search ESM 下改用 shellless spawnSync 探测 rg；background 超时向 runner/model bridge/provider 传播 AbortSignal 并清理 Codex 子进程；sandbox_launch registry 改为 per-task 文件并兼容 legacy registry.json tombstone；sandbox_session 总内存改为按 maxMemoryMB 额度预留；stderr 截断时 tempFile 保留 stdout/stderr 完整原文；缺失图片文件走 unreadable stub；同步修正 guide/status 文档。新增 npm run test:smart-search-rg / test:background-abort / test:session-memory-reservation / test:exec-stderr-tempfile / test:council-missing-image。
 - v1.14.0 Plan_13 P0/P1/P2：broker 关机 best-effort 落状态；council 历史清理、启动扫描和 checkpoint resume；普通 background tasks 写入 sandbox-data/bg-tasks，后端重启后可查询 done/error/interrupted。新增 npm run test:council-maintenance / test:council-resume / test:bg-tasks-persist / test:bg-tasks-cleanup。
 - v1.14.0 Plan_13 D-11：sandbox_council 新增 provider=grok，复用 progrok API，支持 vision image_url、同源并发限制、显式同 provider fallback 和 fake server 回归测试。
+- v1.15.0 Plan_14：本地 CLI 主名称迁移为 antigravityCli（agy），geminiCli 和旧 SANDBOX_COUNCIL_GEMINI_* 环境变量保留一个版本周期兼容；新增 agy 模型链和专项回归脚本。PPTX 改为 agy → Python 的硬隔离路径，永不进入 Codex；其他结构化文件需显式 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 才允许 Codex 最后兜底。only-text 默认转述器升级为 codex/gpt-5.6-luna，reasoning=high、speed=fast。
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，默认走 sandbox direct 安全路径，手动跟随重定向并逐跳拒绝 localhost / 私有地址；显式 backend=exa/webFetcher 暂停，待补等价逐跳私网校验证明后再恢复
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -537,7 +549,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[sandbox] MCP Server v1.14.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[sandbox] MCP Server v1.15.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -547,9 +559,15 @@ async function main(): Promise<void> {
     cleanOldTempFiles();
 
     void Promise.resolve().then(() => {
-        const cleaned = cleanOldCouncilTasks();
-        if (cleaned > 0) {
-            console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
+        if (process.env.SANDBOX_COUNCIL_AUTO_GC === "1") {
+            const artifactGc = runCouncilArtifactGc({ mode: "apply", includeLegacy: false });
+            if (artifactGc.changed > 0) {
+                console.error(`[sandbox] 已清理 ${artifactGc.changed} 个过期 council artifact run`);
+            }
+            const cleaned = cleanOldCouncilTasks();
+            if (cleaned > 0) {
+                console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
+            }
         }
         scanCouncilTasksOnStartup((message) => console.error(message));
     }).catch((err) => {
@@ -579,7 +597,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[sandbox] MCP Server v1.14.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.15.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

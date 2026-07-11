@@ -4,6 +4,7 @@ import { touchActivity, appendTiming } from "../lifecycle.js";
 import { getCachedEnvInfo, detectEnvironment } from "../env-detector.js";
 import { listSessions, closeSession, getActiveSessionCount } from "../session-manager.js";
 import { cleanOldTempFiles, getTempStats } from "../temp-store.js";
+import { runCouncilArtifactGc, type CouncilGcMode } from "../council/artifact-gc.js";
 import os from "os";
 
 /**
@@ -13,20 +14,23 @@ import os from "os";
 const StatusParamsSchema = z.object({
     action: z.enum(["overview", "envs", "gpu", "gc"]).optional()
         .describe("操作：overview(默认)/envs/gpu/gc"),
-});
+    gcScope: z.enum(["council"]).optional()
+        .describe("gc 范围：不传保持临时文件清理兼容；council 清理托管 council artifact 与受控 legacy 产物"),
+    gcMode: z.enum(["dryRun", "apply", "restore", "purge"]).optional()
+        .describe("council gc 模式：dryRun(默认)/apply/restore/purge"),
+    quarantineId: z.string().min(1).max(160).optional()
+        .describe("restore 或指定 purge 的隔离组 ID"),
+}).strict();
 
 export function registerStatus(server: McpServer): void {
-    server.tool(
-        "sandbox_status",
-        `查看沙箱系统状态。包括可用环境列表、CUDA 信息、资源占用、活跃会话列表。
+    const description = `查看沙箱系统状态。包括可用环境列表、CUDA 信息、资源占用、活跃会话列表。
 
 action:
 - overview (默认): 系统资源 + 活跃会话 + 临时文件
 - envs: 可用语言环境列表（Python/Node/conda/bash）
 - gpu: GPU/CUDA/DirectML 详细信息
-- gc: 清理过期临时文件；空闲会话由 idle checker 自动关闭`,
-        StatusParamsSchema.shape,
-        async (params) => {
+- gc: 不传 gcScope 时清理过期临时文件；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务默认不自动执行 council GC；先用 dryRun 审核，确认后再显式 apply。仅设置 SANDBOX_COUNCIL_AUTO_GC=1 才会在启动时 apply 托管 artifact（includeLegacy=false）并按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;
+    const handleStatus = async (params: Record<string, unknown>) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -37,7 +41,7 @@ action:
                 };
             }
 
-            const { action = "overview" } = parsed.data;
+            const { action = "overview", gcScope, gcMode, quarantineId } = parsed.data;
 
             try {
                 switch (action) {
@@ -48,7 +52,7 @@ action:
                     case "gpu":
                         return appendTiming(await buildGpu(), startTime);
                     case "gc":
-                        return appendTiming(await buildGc(), startTime);
+                        return appendTiming(await buildGc(gcScope, gcMode, quarantineId), startTime);
                     default:
                         return {
                             content: [{ type: "text" as const, text: `❌ 未知操作: ${action}` }],
@@ -59,8 +63,20 @@ action:
                     content: [{ type: "text" as const, text: `❌ 异常: ${err instanceof Error ? err.message : String(err)}` }],
                 };
             }
-        }
-    );
+        };
+    const compatibleServer = server as unknown as {
+        registerTool?: (name: string, config: { description: string; inputSchema: typeof StatusParamsSchema }, handler: typeof handleStatus) => unknown;
+        tool?: (name: string, description: string, shape: typeof StatusParamsSchema.shape, handler: typeof handleStatus) => unknown;
+    };
+    if (typeof compatibleServer.registerTool === "function") {
+        compatibleServer.registerTool("sandbox_status", { description, inputSchema: StatusParamsSchema }, handleStatus);
+        return;
+    }
+    if (typeof compatibleServer.tool === "function") {
+        compatibleServer.tool("sandbox_status", description, StatusParamsSchema.shape, handleStatus);
+        return;
+    }
+    throw new Error("MCP server 不支持 registerTool/tool 注册接口");
 }
 
 async function buildOverview() {
@@ -189,7 +205,22 @@ async function buildGpu() {
     };
 }
 
-async function buildGc() {
+async function buildGc(gcScope?: "council", gcMode?: CouncilGcMode, quarantineId?: string) {
+    if (gcScope === "council") {
+        const result = runCouncilArtifactGc({ mode: gcMode || "dryRun", quarantineId });
+        const lines = [
+            `🧹 Council GC ${result.mode}`,
+            `  TTL: ${result.ttlDays} 天 | 扫描: ${result.scanned} | 可处理: ${result.eligible} | 已变更: ${result.changed}`,
+            ...(result.quarantineId ? [`  隔离组: ${result.quarantineId}`] : []),
+            ...result.diagnostics.map((diagnostic) => `  ⚠️ ${diagnostic}`),
+        ];
+        for (const item of result.items.slice(0, 100)) {
+            const detail = item.reasons.length > 0 ? ` (${item.reasons.join("；")})` : "";
+            lines.push(`  ${item.action}: ${item.path}${detail}`);
+        }
+        if (result.items.length > 100) lines.push(`  …其余 ${result.items.length - 100} 项未展开`);
+        return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    }
     const cleaned = cleanOldTempFiles();
     const sessions = await listSessions();
 

@@ -8,4 +8,8 @@
 
 council 可在已配置且确有价值时混合不同模型来源，优先使用配置明确的 Grok/ProGrok 或其他可用 provider 形成视角差异。它可后台执行，启动和轮询都使用相同 `ownerId`；主线程可做不重叠的检查，但不重复 council 已承担的审议。fallback 仅用于临时传输或服务错误，参数错误、权限不足、安全拦截与输出截断应直接报告。
 
+Antigravity CLI / Gemini 系列使用 `provider="antigravityCli"`；旧 `geminiCli` 只是兼容别名，接收方未安装或未登录 `agy` 时不要假设可用。
+
+Council 的 transcript、索引和大输入由 manifest 统一管理，不要手工删除 artifact、task 或 quarantine 目录。需要清理时先用 `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 预演，任何会移动、恢复或永久删除持久数据的模式都要先说明影响与回滚方式并取得明确授权。
+
 子代理结束后主动回收。对需要理解完整上下文的任务传递必要的对话材料；只读小任务则提供精确输入，避免无关上下文膨胀。

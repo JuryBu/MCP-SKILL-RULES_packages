@@ -11,7 +11,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance.
 - `windsurf/Windsurf_Global_Rules.template.md` → condensed compatibility entry for older import scripts; use the new split layout for full coverage.
 
-The templates preserve work style, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, and background-task rules. They remove sender-specific identity, account data, local paths, credentials, active sessions, real-time service claims, model defaults, pricing, and quota promises.
+The templates preserve work style, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, background-task rules, and Council artifact safety (`dryRun` before approved cleanup). They remove sender-specific identity, account data, local paths, credentials, active sessions, real-time service claims, model defaults, pricing, and quota promises.
 
 Shared MCP capabilities vary by host. Use `chain`, `dataChain`, and `modelChain` only when the installed tool documents them, and treat Windsurf-specific automation as opt-in rather than a default shared capability.
 

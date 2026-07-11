@@ -1,16 +1,22 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn, spawnSync } from "child_process";
-import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
+import { buildAntigravityCliEnvironment, spawnPowerShellScript, withAntigravityCliLease } from "./agy-runtime.js";
+import { councilRuntimeDirectory } from "./paths.js";
+import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
 
 const INDEX_START = "<<<COUNCIL_INDEX>>>";
 const INDEX_END = "<<<END_COUNCIL_INDEX>>>";
 const DEFAULT_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_CLI_INDEX_TIMEOUT_MS || 240_000);
 const MAX_ARTIFACT_BYTES = Number(process.env.SANDBOX_COUNCIL_CLI_INDEX_MAX_BYTES || 768 * 1024);
 const ATTEMPTS_PER_MODEL = Math.max(1, Number(process.env.SANDBOX_COUNCIL_CLI_INDEX_RETRIES || 1) + 1);
+const LEGACY_MODEL_LABELS: Record<string, string> = {
+    "auto-gemini-3": "Gemini 3.5 Flash (Medium)",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro (Low)",
+    "gemini-3.1-flash-lite-preview": "Gemini 3.5 Flash (Low)",
+};
 
-export type CouncilIndexerCli = "gemini" | "codex";
+export type CouncilIndexerCli = "antigravity" | "codex";
 
 export interface CouncilCliIndexResult {
     cli: CouncilIndexerCli;
@@ -23,26 +29,26 @@ interface BuildCouncilFileIndexRequest {
     filePath: string;
     label?: string;
     range?: string;
-    preferredCli?: CouncilIndexerCli;
+    preferredCli?: CouncilIndexerCli | "gemini";
     onProgress?: (message: string) => void;
+    signal?: AbortSignal;
+    timeoutMs?: number;
+    imagePaths?: string[];
+    command?: string;
+    cli?: string;
+    params?: {
+        command?: string;
+        cli?: string;
+    };
+    runId?: string;
 }
 
-interface SpawnResult {
-    exitCode: number | null;
-    timedOut: boolean;
-    stdoutPath: string;
-    stderrPath: string;
-    earlyFailureReason?: string;
-}
+type FailureKind = "terminal" | "capacity" | "timeout" | "empty" | "transient";
 
-interface GeminiAttempt {
-    model: string;
-    approvalMode: string;
-}
-
-interface CodexAttempt {
-    model: string;
-    reasoning: string;
+class CliIndexerFailure extends Error {
+    constructor(message: string, readonly kind: FailureKind) {
+        super(message);
+    }
 }
 
 function clip(text: string, maxChars: number): string {
@@ -53,97 +59,58 @@ function safeName(input: string): string {
     return input.replace(/[^\w.-]+/gu, "_").slice(0, 80) || "index";
 }
 
-function safeGeminiTempProjectName(cwd: string): string {
-    const basename = path.basename(path.resolve(cwd)) || "mcp-sandbox";
-    const ascii = basename
-        .normalize("NFKD")
-        .replace(/[^\w.-]+/gu, "")
-        .toLowerCase()
-        .slice(0, 48);
-    return ascii || "mcp-sandbox";
-}
-
 function nowStamp(): string {
     const now = new Date();
     const random = Math.random().toString(36).slice(2, 8);
     return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}${String(now.getMilliseconds()).padStart(3, "0")}-${process.pid}-${random}`;
 }
 
-export function councilIndexDir(): string {
-    ensureTempDir();
-    const dir = path.join(TEMP_DIR, "council-indexes");
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
+function redactSensitive(text: string): string {
+    const home = os.homedir().replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    return text
+        .replace(new RegExp(home, "giu"), "<user-home>")
+        .replace(/[A-Za-z]:\\Users\\[^\\\s"']+/gu, "<user-dir>")
+        .replace(/(authorization|bearer|api[_-]?key|access[_-]?token|refresh[_-]?token|token)\s*[:=]\s*([^\s,;]+)/giu, "$1=<redacted>")
+        .replace(/https?:\/\/[^\s"']+(?:[?&](?:token|code|state|key|auth|access_token)=[^\s"']*)?/giu, "<authentication-url>");
 }
 
-function buildArtifactPath(filePath: string, cli: CouncilIndexerCli, suffix: string): string {
-    const dir = cli === "gemini"
-        ? geminiCliAccessibleTempDir(path.dirname(filePath), "council-indexes")
-        : councilIndexDir();
+function redactRunLogs(stdoutPath: string, stderrPath: string): void {
+    for (const logPath of [stdoutPath, stderrPath]) {
+        let contents = "";
+        try {
+            contents = fs.readFileSync(logPath, "utf-8");
+        } catch {}
+        try {
+            fs.writeFileSync(logPath, redactSensitive(contents), "utf-8");
+        } catch {}
+    }
+}
+
+function councilIndexDir(runId?: string): string {
+    if (runId) return path.dirname(councilArtifactPath(runId, "indexes", "artifact"));
+    return councilRuntimeDirectory("council-indexes");
+}
+
+export { councilIndexDir };
+
+function antigravityCliAccessibleTempDir(runId?: string): string {
+    return runId ? councilIndexDir(runId) : councilRuntimeDirectory("council-indexes");
+}
+
+function buildArtifactPath(filePath: string, cli: CouncilIndexerCli, suffix: string, runId?: string): string {
+    const dir = cli === "antigravity" ? antigravityCliAccessibleTempDir(runId) : councilIndexDir(runId);
     return path.join(dir, `${safeName(path.basename(filePath))}_${cli}_${safeName(suffix)}_${nowStamp()}.md`);
 }
 
-function geminiCliAccessibleTempDir(cwd: string, childDir: string): string {
-    const configured = process.env.SANDBOX_COUNCIL_GEMINI_CLI_TEMP_DIR;
-    const base = configured && configured.trim()
-        ? configured.trim()
-        : path.join(
-            process.env.SANDBOX_DATA_ROOT
-                || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data"),
-            "temp",
-            "gemini-cli",
-            safeGeminiTempProjectName(cwd),
-        );
-    const dir = path.join(base, childDir);
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
-}
-
-function killProcessTree(pid?: number): void {
-    if (!pid) return;
-    try {
-        const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-            windowsHide: true,
-            stdio: "ignore",
-        });
-        killer.unref();
-    } catch {
-        // Best-effort cleanup; child.kill() is still called by the timeout path.
+function registerExistingRunArtifacts(runId: string | undefined, paths: string[]): void {
+    if (!runId) return;
+    for (const artifactPath of paths) {
+        if (fs.existsSync(artifactPath)) registerCouncilArtifact(runId, artifactPath);
     }
 }
 
 function psSingleQuoted(text: string): string {
     return `'${text.replace(/'/gu, "''")}'`;
-}
-
-function getPowerShellCommand(): string {
-    const systemRoot = process.env.SystemRoot || process.env.WINDIR;
-    if (systemRoot) {
-        const candidate = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (fs.existsSync(candidate)) return candidate;
-    }
-    return "powershell.exe";
-}
-
-function killProcessesByCommandNeedle(needle: string): void {
-    if (!needle || needle.length < 12) return;
-    const escaped = needle.replace(/'/gu, "''");
-    const script = [
-        `$needle = '${escaped}'`,
-        "$self = $PID",
-        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -like \"*$needle*\" } | ForEach-Object {",
-        "  try { taskkill.exe /PID $_.ProcessId /T /F | Out-Null } catch {}",
-        "}",
-    ].join("\n");
-    try {
-        spawnSync(getPowerShellCommand(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-            windowsHide: true,
-            stdio: "ignore",
-            timeout: 5000,
-        });
-    } catch {
-        // Best-effort cleanup only.
-    }
 }
 
 function splitCsvEnv(name: string, fallback: string[]): string[] {
@@ -153,46 +120,41 @@ function splitCsvEnv(name: string, fallback: string[]): string[] {
     return items.length > 0 ? items : fallback;
 }
 
-function geminiAttempts(filePath: string): GeminiAttempt[] {
+function antigravityAttempts(filePath: string, notes: string[], onProgress?: (message: string) => void): string[] {
+    const newEnv = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS;
+    const oldEnv = process.env.SANDBOX_COUNCIL_GEMINI_INDEX_MODELS;
     const ext = path.extname(filePath).toLowerCase();
-    const defaultModels = ext === ".pdf" || [".mp4", ".mov", ".mkv", ".avi", ".webm"].includes(ext)
-        ? ["gemini-3.1-pro-preview", "auto-gemini-3", "gemini-2.5-pro", "gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"]
-        : ["auto-gemini-3", "gemini-3.1-pro-preview", "gemini-2.5-pro", "gemini-3.1-flash-lite-preview", "gemini-2.5-flash-lite"];
-    const models = splitCsvEnv("SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", defaultModels);
-    const approvalModes = splitCsvEnv("SANDBOX_COUNCIL_GEMINI_INDEX_APPROVAL_MODES", ["yolo", "auto_edit"]);
-    return models.flatMap((model) => approvalModes.map((approvalMode) => ({ model, approvalMode })));
+    const multimodal = [".pdf", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".mp4", ".mov", ".mkv", ".avi", ".webm"].includes(ext);
+    const defaults = multimodal
+        ? ["Gemini 3.5 Flash (High)", "Gemini 3.1 Pro (Low)", "Gemini 3.5 Flash (Medium)"]
+        : ["Gemini 3.5 Flash (Low)", "Gemini 3.5 Flash (Medium)", "Gemini 3.1 Pro (Low)"];
+    const rawModels = newEnv ? splitCsvEnv("SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS", defaults) : oldEnv ? splitCsvEnv("SANDBOX_COUNCIL_GEMINI_INDEX_MODELS", defaults) : defaults;
+    if (!newEnv && oldEnv) {
+        const warning = "弃用环境变量 SANDBOX_COUNCIL_GEMINI_INDEX_MODELS 已映射到 Antigravity CLI；请迁移到 SANDBOX_COUNCIL_ANTIGRAVITY_INDEX_MODELS。";
+        notes.push(warning);
+        onProgress?.(warning);
+    }
+    return rawModels.map((model) => LEGACY_MODEL_LABELS[model.toLowerCase()] || model);
 }
 
-function codexAttempts(): CodexAttempt[] {
-    const rawItems = splitCsvEnv("SANDBOX_COUNCIL_CODEX_INDEX_MODELS", [
-        "gpt-5.4:medium",
-        "gpt-5.4:low",
-        "gpt-5.4-mini:medium",
-        "gpt-5.4-mini:low",
-    ]);
+function codexAttempts(): Array<{ model: string; reasoning: string }> {
+    const rawItems = splitCsvEnv("SANDBOX_COUNCIL_CODEX_INDEX_MODELS", ["gpt-5.4:medium", "gpt-5.4:low", "gpt-5.4-mini:medium", "gpt-5.4-mini:low"]);
     return rawItems.map((item) => {
         const [model, reasoning] = item.split(":");
-        return {
-            model: model || "gpt-5.4",
-            reasoning: reasoning || process.env.SANDBOX_COUNCIL_CODEX_INDEX_REASONING || "medium",
-        };
+        return { model: model || "gpt-5.4", reasoning: reasoning || process.env.SANDBOX_COUNCIL_CODEX_INDEX_REASONING || "medium" };
     });
 }
 
-function extractMarkedSection(text: string, artifactPath: string): string {
+function extractMarkedSection(text: string): string {
     const end = text.lastIndexOf(INDEX_END);
     const start = end >= 0 ? text.lastIndexOf(INDEX_START, end) : -1;
-    if (start >= 0 && end > start) {
-        return text.slice(start + INDEX_START.length, end).trim();
-    }
-    throw new Error(`${artifactPath} 未找到 ${INDEX_START}/${INDEX_END} 标记`);
+    if (start >= 0 && end > start) return text.slice(start + INDEX_START.length, end).trim();
+    throw new CliIndexerFailure(`未找到 ${INDEX_START}/${INDEX_END} 标记`, "empty");
 }
 
 function readFileIfSmall(filePath: string, maxBytes: number): string {
     const stat = fs.statSync(filePath);
-    if (stat.size > maxBytes) {
-        throw new Error(`${filePath} 过大 (${stat.size} bytes > ${maxBytes} bytes)，拒绝读入内存`);
-    }
+    if (stat.size > maxBytes) throw new Error(`索引文件过大 (${stat.size} bytes > ${maxBytes} bytes)`);
     return fs.readFileSync(filePath, "utf-8");
 }
 
@@ -214,48 +176,34 @@ function readClip(filePath: string, maxChars: number): string {
     }
 }
 
-function getEarlyCliFailureReason(text: string): string | undefined {
-    if (/MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available/iu.test(text)) {
-        return "Gemini CLI model capacity exhausted";
-    }
-    if (/Path not in workspace|resolves outside the allowed workspace directories/iu.test(text)) {
-        return "Gemini CLI workspace path rejected";
-    }
-    if (/AttachConsole failed/iu.test(text)) {
-        return "Gemini CLI terminal attachment failed";
-    }
-    return undefined;
-}
-
-function isGeminiCapacityError(text: string): boolean {
-    return /MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available/iu.test(text);
+function classifyAntigravityFailure(text: string): FailureKind {
+    if (/You are not logged into Antigravity|Opening authentication page|Do you want to continue|Path not in workspace|resolves outside the allowed workspace directories|not recognized as the name of a cmdlet|command not found|ENOENT/iu.test(text)) return "terminal";
+    if (/MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available|\b429\b|rate limit/iu.test(text)) return "capacity";
+    if (/timed out|timeout|索引文件为空|未找到 <<<COUNCIL_INDEX>>>/iu.test(text)) return /timed out|timeout/iu.test(text) ? "timeout" : "empty";
+    return "transient";
 }
 
 function validateArtifact(artifactPath: string): string {
-    if (!fs.existsSync(artifactPath)) {
-        throw new Error(`CLI 未写入索引文件: ${artifactPath}`);
-    }
+    if (!fs.existsSync(artifactPath)) throw new CliIndexerFailure("CLI 索引文件为空或未写入", "empty");
     const raw = readFileIfSmall(artifactPath, MAX_ARTIFACT_BYTES);
-    const text = extractMarkedSection(raw, artifactPath);
-    if (text.length < 120) {
-        throw new Error(`CLI 索引过短 (${text.length} chars): ${artifactPath}`);
-    }
+    if (!raw.trim()) throw new CliIndexerFailure("CLI 索引文件为空", "empty");
+    const text = extractMarkedSection(raw);
+    if (text.length < 120) throw new CliIndexerFailure(`CLI 索引过短 (${text.length} chars)`, "empty");
     return text;
 }
 
-function buildIndexPrompt(input: {
-    filePath: string;
-    artifactPath: string;
-    label?: string;
-    range?: string;
-    cli: CouncilIndexerCli;
-}): string {
+function buildIndexPrompt(input: { filePath: string; artifactPath: string; label?: string; range?: string; cli: CouncilIndexerCli }): string {
     const fileName = path.basename(input.filePath);
     const title = input.label || fileName;
     const rangeText = input.range ? `用户额外要求的范围提示：${input.range}` : "用户没有给定行号范围；你应自行选择最有价值的结构化读取方式。";
-    const cliNote = input.cli === "gemini"
-        ? "你可以使用 Gemini CLI 的文件读取、搜索、子任务和多模态能力；遇到 PDF/视频/图片时优先利用原生多模态理解，再写成纯文本索引。"
-        : "你可以使用 Codex CLI 的本地工具、MCP、shell 和子代理能力；复杂文件可先做结构化抽取或让子代理并行读文件，但最终索引必须落盘。";
+    const cliNote = input.cli === "antigravity"
+        ? "你可以使用 Antigravity CLI 的文件读取、搜索、子任务和多模态能力；遇到 PDF、视频或图片时优先利用原生多模态理解，再写成纯文本索引。"
+        : [
+            "你可以使用 Codex CLI 的本地工具、shell 和子代理能力；复杂文件可先做结构化抽取或让子代理并行读文件，但最终索引必须落盘。",
+            "严禁使用 COM、win32com 或任何 Office 自动化接口，严禁启动 PowerPoint、Word、Excel 或其它有头 GUI 应用。",
+            "只可使用 python-pptx、python-docx、openpyxl 等无头解析库读取 Office 文件。",
+            ...(process.env.SANDBOX_COUNCIL_CODEX_INDEX_ALLOW_WEB_FETCHER === "1" ? ["允许在可用时显式调用 web-fetcher MCP 读取文件。"] : []),
+        ].join("\n");
     return [
         "你在为 sandbox_council 准备文件索引材料。",
         "目标：对一个文件做 agentic 读取，产出给多模型讨论直接使用的结构化纯文本索引。",
@@ -303,85 +251,12 @@ function buildIndexPrompt(input: {
     ].join("\n");
 }
 
-async function spawnPowerShellScript(
-    script: string,
-    cwd: string,
-    logBasePath: string,
-    timeoutMs = DEFAULT_TIMEOUT_MS,
-    earlyFailure?: (stderr: string) => string | undefined,
-): Promise<SpawnResult> {
-    const scriptPath = `${logBasePath}.ps1`;
-    const stdoutPath = `${logBasePath}.stdout.txt`;
-    const stderrPath = `${logBasePath}.stderr.txt`;
-    const artifactNeedle = path.basename(logBasePath).replace(/\.run$/u, "");
-    fs.writeFileSync(scriptPath, script, "utf-8");
-    fs.writeFileSync(stdoutPath, "", "utf-8");
-    fs.writeFileSync(stderrPath, "", "utf-8");
-    return await new Promise<SpawnResult>((resolve, reject) => {
-        const stdoutFd = fs.openSync(stdoutPath, "a");
-        const stderrFd = fs.openSync(stderrPath, "a");
-        let settled = false;
-        let timedOut = false;
-        let earlyFailureReason: string | undefined;
-        const child = spawn(getPowerShellCommand(), [
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            scriptPath,
-        ], {
-            cwd,
-            windowsHide: true,
-            stdio: ["ignore", stdoutFd, stderrFd],
-        });
-        const timer = setTimeout(() => {
-            timedOut = true;
-            killProcessTree(child.pid);
-            child.kill();
-        }, timeoutMs);
-        const earlyFailureTimer = earlyFailure ? setInterval(() => {
-            const stderr = readClip(stderrPath, 4096);
-            const reason = earlyFailure(stderr);
-            if (!reason) return;
-            earlyFailureReason = reason;
-            killProcessTree(child.pid);
-            killProcessesByCommandNeedle(artifactNeedle);
-            child.kill();
-        }, 1500) : null;
-        earlyFailureTimer?.unref?.();
-        const clearTimers = () => {
-            clearTimeout(timer);
-            if (earlyFailureTimer) clearInterval(earlyFailureTimer);
-        };
-        child.on("error", (err) => {
-            if (settled) return;
-            settled = true;
-            clearTimers();
-            fs.closeSync(stdoutFd);
-            fs.closeSync(stderrFd);
-            reject(err);
-        });
-        child.on("close", (exitCode) => {
-            if (settled) return;
-            settled = true;
-            clearTimers();
-            fs.closeSync(stdoutFd);
-            fs.closeSync(stderrFd);
-            if (timedOut || earlyFailureReason) {
-                killProcessesByCommandNeedle(artifactNeedle);
-            }
-            resolve({ exitCode, timedOut, stdoutPath, stderrPath, earlyFailureReason });
-        });
-    });
-}
-
-function buildGeminiScript(promptPath: string, artifactPath: string, model: string, approvalMode: string): string {
-    const prompt = `Read and follow the full UTF-8 instructions in ${promptPath}. Write the final sandbox_council index to ${artifactPath}. Do not print the full index to stdout.`;
+function buildAntigravityScript(promptPath: string, artifactPath: string, model: string, command: string, addDirs: string[]): string {
+    const prompt = `Read and follow the full UTF-8 instructions in ${promptPath}. You must write the final sandbox_council index to ${artifactPath}. Do not print the full index to stdout.`;
+    const addDirArgs = addDirs.map((dir) => `--add-dir ${psSingleQuoted(dir)}`).join(" ");
     return [
-        "$ErrorActionPreference = 'Continue'",
         `$prompt = ${psSingleQuoted(prompt)}`,
-        `& gemini --skip-trust --approval-mode ${psSingleQuoted(approvalMode)} -m ${psSingleQuoted(model)} -p $prompt --output-format text`,
+        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions --model ${psSingleQuoted(model)} ${addDirArgs}`,
         "exit $LASTEXITCODE",
     ].join("\n");
 }
@@ -396,115 +271,163 @@ function buildCodexScript(promptPath: string, artifactPath: string, model: strin
     ].join("\n");
 }
 
-async function runGeminiIndexer(filePath: string, label?: string, range?: string, onProgress?: (message: string) => void): Promise<CouncilCliIndexResult> {
-    const cwd = path.dirname(filePath);
+function resolveAntigravityCommand(request: BuildCouncilFileIndexRequest): string {
+    return request.params?.command?.trim() || request.params?.cli?.trim() || request.command?.trim() || request.cli?.trim() || process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND?.trim() || "agy";
+}
+
+function authorizedDirectories(filePath: string, promptPath: string, artifactPath: string, imagePaths: string[]): string[] {
+    return [...new Set([path.dirname(filePath), path.dirname(promptPath), path.dirname(artifactPath), ...imagePaths.map((imagePath) => path.dirname(imagePath))].map((dir) => path.resolve(dir)))];
+}
+
+function isAbortError(error: unknown): boolean {
+    return error instanceof Error && error.name === "AbortError";
+}
+
+async function runAntigravityIndexer(request: BuildCouncilFileIndexRequest): Promise<CouncilCliIndexResult> {
+    const cwd = path.dirname(request.filePath);
     const notes: string[] = [];
     const exhaustedModels = new Set<string>();
-    for (const attempt of geminiAttempts(filePath)) {
-        if (exhaustedModels.has(attempt.model)) continue;
+    const command = resolveAntigravityCommand(request);
+    const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const models = antigravityAttempts(request.filePath, notes, request.onProgress);
+    const childEnvironment = buildAntigravityCliEnvironment();
+    notes.push(...childEnvironment.diagnostics);
+    for (const model of models) {
+        if (exhaustedModels.has(model)) continue;
         for (let retry = 1; retry <= ATTEMPTS_PER_MODEL; retry += 1) {
-            const suffix = `${attempt.model}_${attempt.approvalMode}_try${retry}`;
-            const artifactPath = buildArtifactPath(filePath, "gemini", suffix);
+            const artifactPath = buildArtifactPath(request.filePath, "antigravity", `${model}_try${retry}`, request.runId);
             const promptPath = `${artifactPath}.prompt.txt`;
-            const prompt = buildIndexPrompt({ filePath, artifactPath, label, range, cli: "gemini" });
-            fs.writeFileSync(promptPath, prompt, "utf-8");
             const logBase = `${artifactPath}.run`;
             try {
-                onProgress?.(`正在用 Gemini CLI 索引文件 ${path.basename(filePath)}：model=${attempt.model}, approval=${attempt.approvalMode}, attempt=${retry}`);
-                const result = await spawnPowerShellScript(
-                    buildGeminiScript(promptPath, artifactPath, attempt.model, attempt.approvalMode),
+                fs.writeFileSync(promptPath, buildIndexPrompt({ ...request, artifactPath, cli: "antigravity" }), "utf-8");
+                request.onProgress?.(`正在用 Antigravity CLI 索引文件 ${path.basename(request.filePath)}：model=${model}, attempt=${retry}`);
+                const result = await withAntigravityCliLease(request.signal, async () => await spawnPowerShellScript(
+                    buildAntigravityScript(promptPath, artifactPath, model, command, authorizedDirectories(request.filePath, promptPath, artifactPath, request.imagePaths || [])),
                     cwd,
                     logBase,
-                    DEFAULT_TIMEOUT_MS,
-                    getEarlyCliFailureReason,
-                );
-                if (result.earlyFailureReason) {
-                    throw new Error(`${result.earlyFailureReason}; stderr=${result.stderrPath}`);
-                }
+                    { timeoutMs, signal: request.signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: (stderr) => classifyAntigravityFailure(stderr) === "terminal" ? redactSensitive(clip(stderr, 320)) : undefined },
+                ));
+                if (result.aborted) throw Object.assign(new Error("CLI 索引已中止"), { name: "AbortError" });
+                if (result.timedOut) throw new CliIndexerFailure("Antigravity CLI 索引超时", "timeout");
+                if (result.earlyFailureReason) throw new CliIndexerFailure(`Antigravity CLI terminal failure: ${result.earlyFailureReason}`, "terminal");
                 const text = validateArtifact(artifactPath);
-                const stderr = readClip(result.stderrPath, 900).trim();
+                const stderr = redactSensitive(readClip(result.stderrPath, 900).trim());
                 return {
-                    cli: "gemini",
+                    cli: "antigravity",
                     text,
                     artifactPath,
                     notes: [
-                        `Gemini CLI index ok: model=${attempt.model}, approvalMode=${attempt.approvalMode}, attempt=${retry}`,
-                        `stdout=${result.stdoutPath}`,
-                        `stderr=${result.stderrPath}`,
+                        ...notes,
+                        `Antigravity CLI index ok: model=${model}, attempt=${retry}`,
+                        `stdout=${path.basename(result.stdoutPath)}`,
+                        `stderr=${path.basename(result.stderrPath)}`,
                         ...(stderr ? [stderr] : []),
                     ],
                 };
-            } catch (err) {
-                const stderr = readClip(`${logBase}.stderr.txt`, 900).trim();
-                const message = err instanceof Error ? err.message : String(err);
-                notes.push(`gemini model=${attempt.model} approval=${attempt.approvalMode} attempt=${retry} failed: ${message}${stderr ? ` | stderr: ${stderr}` : ""}`);
-                onProgress?.(`Gemini CLI 索引失败，准备降级/重试：model=${attempt.model}, approval=${attempt.approvalMode}, reason=${clip(message, 180)}`);
-                if (isGeminiCapacityError(`${message}\n${stderr}`)) {
-                    exhaustedModels.add(attempt.model);
+            } catch (error) {
+                if (isAbortError(error) || request.signal?.aborted) throw error;
+                const stderr = redactSensitive(readClip(`${logBase}.stderr.txt`, 900).trim());
+                const message = redactSensitive(error instanceof Error ? error.message : String(error));
+                const detectedKind = classifyAntigravityFailure(`${message}\n${stderr}`);
+                const kind = detectedKind === "terminal" || detectedKind === "capacity"
+                    ? detectedKind
+                    : error instanceof CliIndexerFailure ? error.kind : detectedKind;
+                notes.push(`antigravity model=${model} attempt=${retry} failed (${kind}): ${message}${stderr ? ` | stderr: ${stderr}` : ""}`);
+                request.onProgress?.(`Antigravity CLI 索引失败，准备降级/重试：model=${model}, reason=${clip(message, 180)}`);
+                if (kind === "terminal") throw new Error(notes.join("\n"));
+                if (kind === "capacity") {
+                    exhaustedModels.add(model);
                     break;
                 }
+            } finally {
+                registerExistingRunArtifacts(request.runId, [promptPath, artifactPath, `${logBase}.ps1`, `${logBase}.stdout.txt`, `${logBase}.stderr.txt`]);
             }
         }
     }
-    throw new Error(notes.length > 0 ? notes.join("\n") : "Gemini CLI 索引失败");
+    throw new Error(notes.length > 0 ? notes.join("\n") : "Antigravity CLI 索引失败");
 }
 
-async function runCodexIndexer(filePath: string, label?: string, range?: string, onProgress?: (message: string) => void): Promise<CouncilCliIndexResult> {
-    const cwd = path.dirname(filePath);
+async function runCodexIndexer(request: BuildCouncilFileIndexRequest): Promise<CouncilCliIndexResult> {
+    const cwd = path.dirname(request.filePath);
     const notes: string[] = [];
+    const timeoutMs = request.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     for (const attempt of codexAttempts()) {
         for (let retry = 1; retry <= ATTEMPTS_PER_MODEL; retry += 1) {
-            const suffix = `${attempt.model}_${attempt.reasoning}_try${retry}`;
-            const artifactPath = buildArtifactPath(filePath, "codex", suffix);
+            const artifactPath = buildArtifactPath(request.filePath, "codex", `${attempt.model}_${attempt.reasoning}_try${retry}`, request.runId);
             const promptPath = `${artifactPath}.prompt.txt`;
-            const prompt = buildIndexPrompt({ filePath, artifactPath, label, range, cli: "codex" });
-            fs.writeFileSync(promptPath, prompt, "utf-8");
             const logBase = `${artifactPath}.run`;
             try {
-                onProgress?.(`正在用 Codex CLI 索引文件 ${path.basename(filePath)}：model=${attempt.model}, reasoning=${attempt.reasoning}, attempt=${retry}`);
-                const result = await spawnPowerShellScript(
-                    buildCodexScript(promptPath, artifactPath, attempt.model, attempt.reasoning),
-                    cwd,
-                    logBase,
-                );
+                fs.writeFileSync(promptPath, buildIndexPrompt({ ...request, artifactPath, cli: "codex" }), "utf-8");
+                request.onProgress?.(`正在用 Codex CLI 索引文件 ${path.basename(request.filePath)}：model=${attempt.model}, reasoning=${attempt.reasoning}, attempt=${retry}`);
+                const result = await spawnPowerShellScript(buildCodexScript(promptPath, artifactPath, attempt.model, attempt.reasoning), cwd, logBase, { timeoutMs, signal: request.signal });
+                if (result.aborted) throw Object.assign(new Error("CLI 索引已中止"), { name: "AbortError" });
+                if (result.timedOut) throw new CliIndexerFailure("Codex CLI 索引超时", "timeout");
                 const text = validateArtifact(artifactPath);
-                const stderr = readClip(result.stderrPath, 900).trim();
+                const stderr = redactSensitive(readClip(result.stderrPath, 900).trim());
                 return {
                     cli: "codex",
                     text,
                     artifactPath,
                     notes: [
                         `Codex CLI index ok: model=${attempt.model}, reasoning=${attempt.reasoning}, attempt=${retry}`,
-                        `stdout=${result.stdoutPath}`,
-                        `stderr=${result.stderrPath}`,
+                        `stdout=${path.basename(result.stdoutPath)}`,
+                        `stderr=${path.basename(result.stderrPath)}`,
                         ...(stderr ? [stderr] : []),
                     ],
                 };
-            } catch (err) {
-                const stderr = readClip(`${logBase}.stderr.txt`, 900).trim();
-                const message = err instanceof Error ? err.message : String(err);
+            } catch (error) {
+                if (isAbortError(error) || request.signal?.aborted) throw error;
+                const stderr = redactSensitive(readClip(`${logBase}.stderr.txt`, 900).trim());
+                const message = redactSensitive(error instanceof Error ? error.message : String(error));
                 notes.push(`codex model=${attempt.model} reasoning=${attempt.reasoning} attempt=${retry} failed: ${message}${stderr ? ` | stderr: ${stderr}` : ""}`);
-                onProgress?.(`Codex CLI 索引失败，准备降级/重试：model=${attempt.model}, reasoning=${attempt.reasoning}, reason=${clip(message, 180)}`);
+                request.onProgress?.(`Codex CLI 索引失败，准备降级/重试：model=${attempt.model}, reasoning=${attempt.reasoning}, reason=${clip(message, 180)}`);
+            } finally {
+                registerExistingRunArtifacts(request.runId, [promptPath, artifactPath, `${logBase}.ps1`, `${logBase}.stdout.txt`, `${logBase}.stderr.txt`]);
             }
         }
     }
     throw new Error(notes.length > 0 ? notes.join("\n") : "Codex CLI 索引失败");
 }
 
+function isStructuredFile(filePath: string): boolean {
+    return [".pdf", ".doc", ".docx", ".odt", ".rtf", ".xls", ".xlsx", ".ods", ".csv", ".epub", ".ppt", ".pptx"].includes(path.extname(filePath).toLowerCase());
+}
+
+function isPptxFile(filePath: string): boolean {
+    return path.extname(filePath).toLowerCase() === ".pptx";
+}
+
+function allowsStructuredCodexFallback(filePath: string): boolean {
+    return [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ods", ".epub"].includes(path.extname(filePath).toLowerCase());
+}
+
+function structuredCodexFallbackEnabled(): boolean {
+    return process.env.SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK === "1";
+}
+
 export async function buildCouncilFileIndex(request: BuildCouncilFileIndexRequest): Promise<CouncilCliIndexResult> {
-    const plan: CouncilIndexerCli[] = request.preferredCli === "codex"
-        ? ["codex", "gemini"]
-        : ["gemini", "codex"];
+    if (request.signal?.aborted) throw Object.assign(new Error("CLI 索引已中止"), { name: "AbortError" });
+    const preferredCli = request.preferredCli === "gemini" ? "antigravity" : request.preferredCli;
+    const plan: CouncilIndexerCli[] = isPptxFile(request.filePath)
+        ? ["antigravity"]
+        : isStructuredFile(request.filePath)
+            ? allowsStructuredCodexFallback(request.filePath) && structuredCodexFallbackEnabled()
+                ? ["antigravity", "codex"]
+                : ["antigravity"]
+        : preferredCli === "codex" ? ["codex", "antigravity"] : ["antigravity", "codex"];
     const failures: string[] = [];
     for (const cli of plan) {
         try {
-            request.onProgress?.(`开始 ${cli === "gemini" ? "Gemini CLI" : "Codex CLI"} 文件索引：${path.basename(request.filePath)}`);
-            return cli === "gemini"
-                ? await runGeminiIndexer(request.filePath, request.label, request.range, request.onProgress)
-                : await runCodexIndexer(request.filePath, request.label, request.range, request.onProgress);
-        } catch (err) {
-            failures.push(`${cli}: ${err instanceof Error ? err.message : String(err)}`);
-            request.onProgress?.(`${cli === "gemini" ? "Gemini CLI" : "Codex CLI"} 文件索引整体失败，切换下一条索引链路：${path.basename(request.filePath)}`);
+            request.onProgress?.(`开始 ${cli === "antigravity" ? "Antigravity CLI" : "Codex CLI"} 文件索引：${path.basename(request.filePath)}`);
+            const result = cli === "antigravity" ? await runAntigravityIndexer(request) : await runCodexIndexer(request);
+            if (cli === "codex" && allowsStructuredCodexFallback(request.filePath)) {
+                result.notes.unshift("结构化文件已启用 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1，Codex CLI 作为最后兜底运行");
+            }
+            return result;
+        } catch (error) {
+            if (isAbortError(error) || request.signal?.aborted) throw error;
+            failures.push(`${cli}: ${redactSensitive(error instanceof Error ? error.message : String(error))}`);
+            request.onProgress?.(`${cli === "antigravity" ? "Antigravity CLI" : "Codex CLI"} 文件索引整体失败，切换下一条索引链路：${path.basename(request.filePath)}`);
         }
     }
     throw new Error(`文件索引失败\n- ${failures.join("\n- ")}`);

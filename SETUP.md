@@ -153,7 +153,19 @@ $env:SANDBOX_PROGROK_MODEL = "<receiver-supported-model>"
 
 Use `modelChain="grok"` to force this route. `dataChain` never uses Grok because Grok does not own conversation data.
 
-## 10. Optional Exa Endpoint
+## 10. Sandbox Council Artifacts
+
+Council 1.15.1 stores managed transcripts, indexes, large-input chunks, checkpoints, and quarantine data below `SANDBOX_DATA_ROOT`. The portable build does not run artifact GC automatically. Inspect candidates first:
+
+```text
+sandbox_status(action="gc", gcScope="council", gcMode="dryRun")
+```
+
+`apply` may move expired managed artifacts into quarantine, `restore` moves a selected quarantine group back, and `purge` permanently removes an eligible quarantine group. These modes modify persistent receiver data, so explain the scope and recovery path and obtain explicit approval before using them. A receiver may opt into startup cleanup with `SANDBOX_COUNCIL_AUTO_GC=1` only after accepting that behavior.
+
+For Antigravity CLI / Gemini-family Council participants, use `provider="antigravityCli"`; `geminiCli` is a temporary compatibility alias. The `agy` command, login state, proxy, and model capacity are receiver-managed and are not included in this package.
+
+## 11. Optional Exa Endpoint
 
 Set the private remote URL only on the receiver machine:
 
@@ -163,7 +175,7 @@ $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
 
 The broker uses `exa-stateless-stdio.mjs` for stable tools/list fallback and retry behavior. Do not commit `broker-private.env.json` or the real URL.
 
-## 11. Install Skills
+## 12. Install Skills
 
 Copy selected folders from `skills/` into:
 
@@ -175,7 +187,7 @@ Restart Codex or open a new task. Other hosts may use the `SKILL.md` files as wo
 
 Office skills with redistribution-restricted local licenses and Codex system/plugin-cache skills are intentionally excluded. See `skills/skills_manifest.md`.
 
-## 12. Smoke Tests
+## 13. Smoke Tests
 
 Core endpoints:
 
@@ -195,7 +207,7 @@ Windsurf subagent is not included in generic smoke tests because a real check wo
 
 ```powershell
 $env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-private-marker"
-./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-11" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-11.zip"
+./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-12" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-12.zip"
 ```
 
 The command refuses to overwrite an existing output directory or archive, validates both source and copied package, and prints SHA256.

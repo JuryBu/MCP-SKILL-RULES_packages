@@ -10,6 +10,18 @@ $env:CODEX_MCP_BROKER_WAIT_TIMEOUT_MS = "1800000"
 $env:MEMORY_STORE_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\memory-store"
 $env:SANDBOX_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\sandbox-data"
 $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-profiles"
+
+# Optional Council retention controls. Managed artifacts default to 14 days; values below 7 are clamped to 7.
+# Always preview receiver data with gcMode=dryRun before apply, restore, or purge.
+# $env:SANDBOX_COUNCIL_ARTIFACT_TTL_DAYS = "14"
+# $env:SANDBOX_COUNCIL_TASK_RETENTION_DAYS = "15"
+# $env:SANDBOX_COUNCIL_AUTO_GC = "0" # Set to 1 only after accepting startup apply behavior.
+
+# Optional Antigravity CLI (agy) Council route. The default command is "agy" when installed.
+# Proxy settings are injected only into agy child processes and never persisted by this toolkit.
+# $env:SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND = "agy"
+# $env:SANDBOX_COUNCIL_ANTIGRAVITY_CLI_CONCURRENCY = "2"
+# $env:SANDBOX_COUNCIL_ANTIGRAVITY_CLI_PROXY_MODE = "auto"
 # Optional: enable the Exa remote MCP endpoint through broker.
 # Keep the real key on the receiver machine; do not write it into files you send around.
 # $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"

@@ -1,7 +1,8 @@
 import crypto from "crypto";
 import fs from "fs/promises";
 import path from "path";
-import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
+import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
+import { councilRuntimeDirectory } from "./paths.js";
 import type { CouncilLargeInputArtifact, CouncilLargeInputConfig, CouncilRunParams } from "./types.js";
 
 export const DEFAULT_LARGE_INPUT_CHUNK_SIZE = 24_000;
@@ -84,6 +85,7 @@ export interface LargeInputIndexMarkdownOptions {
 
 export interface LargeInputArtifactOptions extends LargeInputChunkOptions, LargeInputIndexMarkdownOptions {
     outputDir?: string;
+    runId?: string;
     checkpointName?: string;
     indexName?: string;
 }
@@ -470,8 +472,8 @@ export async function writeLargeInputArtifacts(text: string, options: LargeInput
     const chunks = chunkLargeInput(text, normalized);
     const quality = checkLargeInputQuality(text, chunks, normalized);
     const markdown = buildLargeInputIndexMarkdown({ sourceId, text, chunks, quality }, options);
-    const outputDir = options.outputDir ?? path.join(TEMP_DIR, "council-large-input");
-    ensureTempDir();
+    const outputDir = options.outputDir
+        ?? (options.runId ? path.dirname(councilArtifactPath(options.runId, "large-inputs", "artifact")) : councilRuntimeDirectory("council-large-input"));
     await fs.mkdir(outputDir, { recursive: true });
 
     const baseName = safeFilename(sourceId);
@@ -498,6 +500,11 @@ export async function writeLargeInputArtifacts(text: string, options: LargeInput
         indexPath,
     }, null, 2), "utf8");
     await fs.writeFile(indexPath, markdown, "utf8");
+    if (options.runId) {
+        registerCouncilArtifact(options.runId, sourceTextPath);
+        registerCouncilArtifact(options.runId, checkpointPath);
+        registerCouncilArtifact(options.runId, indexPath);
+    }
 
     return {
         sourceId,
@@ -521,6 +528,7 @@ export async function prepareLargeInputReference(input: {
     label?: string;
     sourcePath?: string;
     config?: CouncilLargeInputConfig;
+    runId?: string;
 }): Promise<PreparedLargeInputReference> {
     const config = normalizeRuntimeConfig(input.config);
     const result = await writeLargeInputArtifacts(input.text, {
@@ -532,7 +540,8 @@ export async function prepareLargeInputReference(input: {
         maxChunks: config.maxChunks,
         previewChars: config.previewChars,
         includeChunkText: config.includeChunkText,
-        outputDir: path.join(TEMP_DIR, "council-large-inputs"),
+        runId: input.runId,
+        outputDir: input.runId ? undefined : councilRuntimeDirectory("council-large-inputs"),
     });
     const artifact: CouncilLargeInputArtifact = {
         id: result.sourceId,
@@ -588,6 +597,7 @@ export async function prepareCouncilLargeInputs(params: CouncilRunParams): Promi
             sourceKind: "input",
             label: "用户输入",
             config: params.largeInput,
+            runId: params.runId,
         });
         input = prepared.contextText;
         largeInputs.push(prepared.artifact);
@@ -600,6 +610,7 @@ export async function prepareCouncilLargeInputs(params: CouncilRunParams): Promi
             sourceKind: "manualContext",
             label: "手动上下文",
             config: params.largeInput,
+            runId: params.runId,
         });
         manualContext = prepared.contextText;
         largeInputs.push(prepared.artifact);

@@ -1,6 +1,11 @@
 import fs from "fs";
 import path from "path";
-import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
+import {
+    councilArtifactPath,
+    readCouncilArtifactManifest,
+    registerCouncilArtifact,
+    registerCouncilExternalReference,
+} from "./artifact-store.js";
 import type { CouncilTranscript } from "./types.js";
 
 function safeName(input: string): string {
@@ -161,14 +166,29 @@ export function formatCouncilMarkdown(transcript: CouncilTranscript): string {
     return lines.join("\n");
 }
 
+export function formatCouncilArtifactSummary(runId: string): string {
+    const artifactRun = readCouncilArtifactManifest(runId);
+    return [
+        "## 产物路径",
+        `- runId: ${artifactRun.runId}`,
+        `- manifest: ${artifactRun.artifactManifestPath}`,
+        `- 主要产物数: ${artifactRun.manifest.artifactPaths.length}`,
+        `- expiresAt: ${artifactRun.manifest.expiresAt}`,
+    ].join("\n");
+}
+
 export function saveCouncilTranscript(transcript: CouncilTranscript, transcriptPath?: string, outputDir?: string): CouncilTranscript {
-    ensureTempDir();
-    const baseDir = outputDir ? path.resolve(outputDir) : TEMP_DIR;
-    fs.mkdirSync(baseDir, { recursive: true });
+    const externalOutput = Boolean(transcriptPath || outputDir);
+    const baseDir = outputDir ? path.resolve(outputDir) : undefined;
+    if (baseDir) fs.mkdirSync(baseDir, { recursive: true });
+
+    const defaultMdPath = councilArtifactPath(transcript.runId, "transcript", "council.md");
 
     const mdPath = transcriptPath
         ? path.resolve(transcriptPath)
-        : path.join(baseDir, `${safeName(`council_${nowStamp()}_${transcript.mode}`)}.md`);
+        : baseDir
+            ? path.join(baseDir, `${safeName(`council_${transcript.id}_${transcript.mode}`)}.md`)
+            : defaultMdPath;
     const jsonPath = mdPath.toLowerCase().endsWith(".md")
         ? mdPath.slice(0, -3) + ".json"
         : `${mdPath}.json`;
@@ -177,5 +197,12 @@ export function saveCouncilTranscript(transcript: CouncilTranscript, transcriptP
     const withPaths = { ...transcript, markdownPath: mdPath, jsonPath };
     fs.writeFileSync(mdPath, formatCouncilMarkdown(withPaths), "utf-8");
     fs.writeFileSync(jsonPath, JSON.stringify(withPaths, null, 2), "utf-8");
+    if (externalOutput) {
+        registerCouncilExternalReference(transcript.runId, mdPath);
+        registerCouncilExternalReference(transcript.runId, jsonPath);
+    } else {
+        registerCouncilArtifact(transcript.runId, mdPath);
+        registerCouncilArtifact(transcript.runId, jsonPath);
+    }
     return withPaths;
 }

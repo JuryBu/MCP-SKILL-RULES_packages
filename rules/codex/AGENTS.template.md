@@ -651,8 +651,10 @@
   - 后台模式：`sandbox_council(background=true, ownerId="...")` 启动后，用同一个 `ownerId` 查询：`sandbox_council(taskId="...", ownerId="...", waitSeconds=45)`；不要因为漏传 `ownerId` 查不到任务或进度，就重复启动新的 council。
   - council 在后台运行时，主线程可以继续做不重叠的本地检查、读文件、构建、整理证据或修补规则；不要重复做 council 已承担的模型审议，等它返回后再合并观点并由主代理自行验证取舍。
   - provider 的并发数、重试与工具权限由接收方当前安装决定；不把运行环境的实际限制、模型名、临时目录或凭据写进公开模板。
+  - Antigravity CLI / Gemini 系列使用 `provider="antigravityCli"`；旧 `geminiCli` 只是兼容别名，接收方未安装或未登录 `agy` 时不要假设可用。
   - `params.fallbackModels` 可配置同 provider 的降级链，仅在临时网络、超时或空输出错误后使用；参数错误、权限不足、安全拦截和输出截断应直接报告。
   - 大输入或复杂文件先建立受控索引或摘要，避免把全文塞进上下文；临时产物留在接收方可清理的工作目录。
+  - Council 的 transcript、索引和大输入由 manifest 统一管理；不要手工删除 artifact/task/quarantine 目录，需要清理时先用 `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 查看范围，再取得用户授权执行会移动或删除数据的操作。
   - 主持者与参与者能否调用搜索、抓取或受限脚本，以当前接口声明为准。
 
 - 除非用户明确要求，不要修改 Antigravity 侧的 MCP 源码、配置文件或运行时数据结构。

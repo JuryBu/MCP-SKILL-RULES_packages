@@ -11,6 +11,7 @@
 - Exa-first search discipline, with fallback only after explicit unavailability or no-result evidence.
 - PPT/PDF/DOCX/XLSX skill and visual QA expectations where applicable.
 - Stage Guard / Record / conversation-reading discipline.
+- Council manifest ownership, stable `ownerId`, `antigravityCli` naming, and `dryRun` before any artifact cleanup.
 
 ## Removed or Replaced
 

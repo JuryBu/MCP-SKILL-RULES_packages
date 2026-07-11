@@ -1,20 +1,70 @@
 import fs from "fs";
 import os from "os";
 import path from "path";
-import { spawn, spawnSync } from "child_process";
 import { callGetModelResponseDetailed } from "../ls-client.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
 import { callProgrokAPI } from "../grok-bridge.js";
-import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
-import type { CouncilModelConfig } from "./types.js";
+import { normalizeCouncilModelConfig, normalizeCouncilProvider, type CouncilModelConfig } from "./types.js";
+import { buildAntigravityCliEnvironment, spawnPowerShellScript, withAntigravityCliLease } from "./agy-runtime.js";
+import { councilRuntimeDirectory } from "./paths.js";
+import { councilArtifactPath, registerCouncilArtifact } from "./artifact-store.js";
 
 const DEFAULT_OPENAI_MODEL = "gpt-5.4";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-20250514";
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
-const DEFAULT_GEMINI_CLI_MODEL = process.env.SANDBOX_COUNCIL_GEMINI_CLI_MODEL || "auto-gemini-3";
+const deprecatedWarnings = new Set<string>();
+
+function getCompatibleEnv(primary: string, legacy: string, fallback: string): string {
+    const primaryValue = process.env[primary]?.trim();
+    if (primaryValue) return primaryValue;
+    const legacyValue = process.env[legacy]?.trim();
+    if (legacyValue) {
+        if (!deprecatedWarnings.has(legacy)) {
+            deprecatedWarnings.add(legacy);
+            console.warn(`[sandbox] ${legacy} 已弃用，请改用 ${primary}。`);
+        }
+        return legacyValue;
+    }
+    return fallback;
+}
+
+const LEGACY_ANTIGRAVITY_CLI_MODEL_LABELS: Record<string, string> = {
+    "auto-gemini-3": "Gemini 3.5 Flash (Medium)",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro (Low)",
+    "gemini-2.5-flash": "Gemini 3.5 Flash (High)",
+    "gemini-2.5-flash-lite": "Gemini 3.5 Flash (Medium)",
+    "gemini-2.5-pro": "Gemini 3.1 Pro (High)",
+};
+
+function normalizeLegacyAntigravityCliModel(model: string): string {
+    const normalized = model.trim();
+    const key = normalized.toLowerCase();
+    if (LEGACY_ANTIGRAVITY_CLI_MODEL_LABELS[key]) return LEGACY_ANTIGRAVITY_CLI_MODEL_LABELS[key];
+    if (key.startsWith("gemini-2.5-pro")) return "Gemini 3.1 Pro (High)";
+    if (key.startsWith("gemini-2.5-") && key.includes("lite")) return "Gemini 3.5 Flash (Medium)";
+    if (key.startsWith("gemini-2.5-")) return "Gemini 3.5 Flash (High)";
+    return normalized;
+}
+
+function getCompatibleAntigravityCliModelEnv(primary: string, legacy: string, fallback: string): string {
+    const primaryValue = process.env[primary]?.trim();
+    if (primaryValue) return primaryValue;
+    const legacyValue = process.env[legacy]?.trim();
+    if (!legacyValue) return fallback;
+    if (!deprecatedWarnings.has(legacy)) {
+        deprecatedWarnings.add(legacy);
+        console.warn(`[sandbox] ${legacy} 已弃用，请改用 ${primary}。`);
+    }
+    return legacyValue.split(",").map(normalizeLegacyAntigravityCliModel).join(",");
+}
+
+const DEFAULT_ANTIGRAVITY_CLI_MODEL = getCompatibleAntigravityCliModelEnv(
+    "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL",
+    "SANDBOX_COUNCIL_GEMINI_CLI_MODEL",
+    "Gemini 3.1 Pro (High)",
+);
 const DEFAULT_CLAUDE_CODE_MODEL = process.env.SANDBOX_COUNCIL_CLAUDE_CODE_MODEL || process.env.SANDBOX_CLAUDE_CODE_MODEL || "sonnet";
-const DEFAULT_GEMINI_CLI_APPROVAL_MODE = process.env.SANDBOX_COUNCIL_GEMINI_CLI_APPROVAL_MODE || "yolo";
 const DEFAULT_ANTIGRAVITY_MODEL = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_MODEL || process.env.SANDBOX_LS_MODEL || "MODEL_PLACEHOLDER_M132";
 const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_MINI_MODEL = "gpt-5.4-mini";
@@ -24,17 +74,31 @@ export const DEFAULT_COUNCIL_MODEL_TIMEOUT_MS = Number(process.env.SANDBOX_COUNC
 const DEFAULT_RETRIES = Math.max(0, Math.min(Number(process.env.SANDBOX_COUNCIL_MODEL_RETRIES ?? 1), 3));
 const DEFAULT_RETRY_BACKOFF_MS = Math.max(0, Number(process.env.SANDBOX_COUNCIL_MODEL_RETRY_BACKOFF_MS || 600));
 const DEFAULT_CODEX_FALLBACKS_ENABLED = !/^(0|false|off)$/iu.test(process.env.SANDBOX_COUNCIL_CODEX_DEFAULT_FALLBACKS || "");
-const DEFAULT_GEMINI_CLI_FALLBACKS_ENABLED = !/^(0|false|off)$/iu.test(process.env.SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS || "");
-const GEMINI_CLI_RESPONSE_START = "<<<COUNCIL_GEMINI_CLI_RESPONSE>>>";
-const GEMINI_CLI_RESPONSE_END = "<<<END_COUNCIL_GEMINI_CLI_RESPONSE>>>";
-const GEMINI_CLI_MAX_OUTPUT_BYTES = Number(process.env.SANDBOX_COUNCIL_GEMINI_CLI_MAX_BYTES || 768 * 1024);
+const DEFAULT_ANTIGRAVITY_CLI_FALLBACKS_ENABLED = !/^(0|false|off)$/iu.test(getCompatibleEnv(
+    "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_DEFAULT_FALLBACKS",
+    "SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS",
+    "",
+));
+const ANTIGRAVITY_CLI_RESPONSE_START = "<<<COUNCIL_ANTIGRAVITY_CLI_RESPONSE>>>";
+const ANTIGRAVITY_CLI_RESPONSE_END = "<<<END_COUNCIL_ANTIGRAVITY_CLI_RESPONSE>>>";
+const LEGACY_GEMINI_CLI_RESPONSE_START = "<<<COUNCIL_GEMINI_CLI_RESPONSE>>>";
+const LEGACY_GEMINI_CLI_RESPONSE_END = "<<<END_COUNCIL_GEMINI_CLI_RESPONSE>>>";
+const ANTIGRAVITY_CLI_MAX_OUTPUT_BYTES = Number(getCompatibleEnv(
+    "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MAX_BYTES",
+    "SANDBOX_COUNCIL_GEMINI_CLI_MAX_BYTES",
+    String(768 * 1024),
+));
 const DEFAULT_SOURCE_LIMITS: Record<string, number> = {
     antigravity: Math.max(1, Number(process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CONCURRENCY || 2)),
     codex: Math.max(1, Number(process.env.SANDBOX_COUNCIL_CODEX_CONCURRENCY || 2)),
     openai: Math.max(1, Number(process.env.SANDBOX_COUNCIL_OPENAI_CONCURRENCY || 4)),
     anthropic: Math.max(1, Number(process.env.SANDBOX_COUNCIL_ANTHROPIC_CONCURRENCY || 4)),
     gemini: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GEMINI_CONCURRENCY || 4)),
-    geminiCli: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GEMINI_CLI_CONCURRENCY || 2)),
+    antigravityCli: Math.max(1, Number(getCompatibleEnv(
+        "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_CONCURRENCY",
+        "SANDBOX_COUNCIL_GEMINI_CLI_CONCURRENCY",
+        "2",
+    ))),
     grok: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GROK_CONCURRENCY || 2)),
     claudeCode: Math.max(1, Number(process.env.SANDBOX_COUNCIL_CLAUDE_CODE_CONCURRENCY || 1)),
     customOpenAICompatible: Math.max(1, Number(process.env.SANDBOX_COUNCIL_CUSTOM_OPENAI_CONCURRENCY || 2)),
@@ -98,14 +162,6 @@ interface FallbackModelObject {
     supportsVision?: unknown;
 }
 
-interface SpawnResult {
-    exitCode: number | null;
-    timedOut: boolean;
-    stdoutPath: string;
-    stderrPath: string;
-    earlyFailureReason?: string;
-}
-
 interface ProviderError extends Error {
     retryable?: boolean;
     timedOut?: boolean;
@@ -143,89 +199,23 @@ function safeName(input: string): string {
     return input.replace(/[^\w.-]+/gu, "_").slice(0, 80) || "model";
 }
 
-function safeGeminiTempProjectName(cwd: string): string {
-    const basename = path.basename(path.resolve(cwd)) || "mcp-sandbox";
-    return basename
-        .normalize("NFKD")
-        .replace(/[^\w.-]+/gu, "")
-        .toLowerCase()
-        .slice(0, 48) || "mcp-sandbox";
-}
-
 function nowStamp(): string {
     const now = new Date();
     const random = Math.random().toString(36).slice(2, 8);
     return `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}${String(now.getMilliseconds()).padStart(3, "0")}-${process.pid}-${random}`;
 }
 
-function geminiCliAccessibleTempDir(cwd: string, childDir: string): string {
-    const configured = process.env.SANDBOX_COUNCIL_GEMINI_CLI_TEMP_DIR;
-    const base = configured && configured.trim()
-        ? configured.trim()
-        : path.join(
-            process.env.SANDBOX_DATA_ROOT
-                || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data"),
-            "temp",
-            "gemini-cli",
-            safeGeminiTempProjectName(cwd),
-        );
-    const dir = path.join(base, childDir);
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
+function antigravityCliAccessibleTempDir(_cwd: string, childDir: string, runId?: string): string {
+    return runId ? path.dirname(councilArtifactPath(runId, "provider", "artifact")) : councilRuntimeDirectory(childDir);
 }
 
-function killProcessTree(pid?: number): void {
-    if (!pid) return;
-    try {
-        const killer = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
-            windowsHide: true,
-            stdio: "ignore",
-        });
-        killer.unref();
-    } catch {
-        // Best-effort cleanup; the direct child kill below is still attempted.
-    }
-}
-
-function councilModelCallDir(): string {
-    ensureTempDir();
-    const dir = path.join(TEMP_DIR, "council-model-calls");
-    fs.mkdirSync(dir, { recursive: true });
-    return dir;
+function councilModelCallDir(runId?: string): string {
+    if (runId) return path.dirname(councilArtifactPath(runId, "provider", "artifact"));
+    return councilRuntimeDirectory("council-model-calls");
 }
 
 function psSingleQuoted(text: string): string {
     return `'${text.replace(/'/gu, "''")}'`;
-}
-
-function getPowerShellCommand(): string {
-    const systemRoot = process.env.SystemRoot || process.env.WINDIR;
-    if (systemRoot) {
-        const candidate = path.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-        if (fs.existsSync(candidate)) return candidate;
-    }
-    return "powershell.exe";
-}
-
-function killProcessesByCommandNeedle(needle: string): void {
-    if (!needle || needle.length < 12) return;
-    const escaped = needle.replace(/'/gu, "''");
-    const script = [
-        `$needle = '${escaped}'`,
-        "$self = $PID",
-        "Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $self -and $_.CommandLine -like \"*$needle*\" } | ForEach-Object {",
-        "  try { taskkill.exe /PID $_.ProcessId /T /F | Out-Null } catch {}",
-        "}",
-    ].join("\n");
-    try {
-        spawnSync(getPowerShellCommand(), ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script], {
-            windowsHide: true,
-            stdio: "ignore",
-            timeout: 5000,
-        });
-    } catch {
-        // Best-effort cleanup only.
-    }
 }
 
 function readClip(filePath: string, maxChars: number): string {
@@ -246,105 +236,33 @@ function readClip(filePath: string, maxChars: number): string {
     }
 }
 
-function getEarlyCliFailureReason(text: string): string | undefined {
-    if (/MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available/iu.test(text)) {
-        return "Gemini CLI model capacity exhausted";
-    }
-    if (/Path not in workspace|resolves outside the allowed workspace directories/iu.test(text)) {
-        return "Gemini CLI workspace path rejected";
-    }
-    if (/AttachConsole failed/iu.test(text)) {
-        return "Gemini CLI terminal attachment failed";
-    }
-    return undefined;
+function redactSensitiveText(text: string): string {
+    const home = os.homedir().replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    return text
+        .replace(new RegExp(home, "giu"), "~")
+        .replace(/[A-Za-z]:\\Users\\[^\\\s"']+/gu, "<user-dir>")
+        .replace(/(Bearer\s+|(?:api[_-]?key|token|access[_-]?token|refresh[_-]?token)\s*[=:]\s*)[^\s'"&]+/giu, "$1[REDACTED]")
+        .replace(/https?:\/\/[^\s'"]*(?:oauth|auth|token)[^\s'"]*/giu, "[REDACTED_AUTH_URL]")
+        .replace(/(https?:\/\/[^\s'"]+)[?&](?:access_token|token|api_key|key)=[^\s'"]*/giu, "$1?[REDACTED_QUERY]");
 }
 
-async function spawnPowerShellScript(
-    script: string,
-    cwd: string,
-    logBasePath: string,
-    timeoutMs: number,
-    earlyFailure?: (stderr: string) => string | undefined,
-    signal?: AbortSignal,
-): Promise<SpawnResult> {
-    const scriptPath = `${logBasePath}.ps1`;
-    const stdoutPath = `${logBasePath}.stdout.txt`;
-    const stderrPath = `${logBasePath}.stderr.txt`;
-    const artifactNeedle = path.basename(logBasePath).replace(/\.run$/u, "");
-    fs.writeFileSync(scriptPath, script, "utf-8");
-    fs.writeFileSync(stdoutPath, "", "utf-8");
-    fs.writeFileSync(stderrPath, "", "utf-8");
-    return await new Promise<SpawnResult>((resolve, reject) => {
-        const stdoutFd = fs.openSync(stdoutPath, "a");
-        const stderrFd = fs.openSync(stderrPath, "a");
-        let settled = false;
-        let timedOut = false;
-        let aborted = false;
-        let earlyFailureReason: string | undefined;
-        const child = spawn(getPowerShellCommand(), [
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            scriptPath,
-        ], {
-            cwd,
-            windowsHide: true,
-            stdio: ["ignore", stdoutFd, stderrFd],
-        });
-        const timer = setTimeout(() => {
-            timedOut = true;
-            killProcessTree(child.pid);
-            child.kill();
-        }, timeoutMs);
-        const earlyFailureTimer = earlyFailure ? setInterval(() => {
-            const stderr = readClip(stderrPath, 4096);
-            const reason = earlyFailure(stderr);
-            if (!reason) return;
-            earlyFailureReason = reason;
-            killProcessTree(child.pid);
-            killProcessesByCommandNeedle(artifactNeedle);
-            child.kill();
-        }, 1500) : null;
-        earlyFailureTimer?.unref?.();
-        const onAbort = () => {
-            if (settled) return;
-            aborted = true;
-            killProcessTree(child.pid);
-            killProcessesByCommandNeedle(artifactNeedle);
-            child.kill();
-        };
-        const clearTimers = () => {
-            clearTimeout(timer);
-            if (earlyFailureTimer) clearInterval(earlyFailureTimer);
-            signal?.removeEventListener("abort", onAbort);
-        };
-        signal?.addEventListener("abort", onAbort, { once: true });
-        child.on("error", (err) => {
-            if (settled) return;
-            settled = true;
-            clearTimers();
-            fs.closeSync(stdoutFd);
-            fs.closeSync(stderrFd);
-            reject(err);
-        });
-        child.on("close", (exitCode) => {
-            if (settled) return;
-            settled = true;
-            clearTimers();
-            fs.closeSync(stdoutFd);
-            fs.closeSync(stderrFd);
-            if (timedOut || earlyFailureReason) {
-                killProcessesByCommandNeedle(artifactNeedle);
-            }
-            if (aborted) {
-                reject(makeProviderAbortError());
-                return;
-            }
-            resolve({ exitCode, timedOut, stdoutPath, stderrPath, earlyFailureReason });
-        });
-    });
+function getEarlyCliFailureReason(text: string): string | undefined {
+    if (/MODEL_CAPACITY_EXHAUSTED|RESOURCE_EXHAUSTED|No capacity available/iu.test(text)) {
+        return "Antigravity CLI model capacity exhausted";
+    }
+    if (/Path not in workspace|resolves outside the allowed workspace directories/iu.test(text)) {
+        return "Antigravity CLI workspace path rejected";
+    }
+    if (/AttachConsole failed/iu.test(text)) {
+        return "Antigravity CLI terminal attachment failed";
+    }
+    if (/is not recognized as the name of a cmdlet|command not found|ENOENT/iu.test(text)) {
+        return "Antigravity CLI command not found";
+    }
+    if (/You are not logged into Antigravity|Opening authentication page|Do you want to continue/iu.test(text)) {
+        return "Antigravity CLI authentication required";
+    }
+    return undefined;
 }
 
 function getRetryCount(params: Record<string, unknown> | undefined): number {
@@ -362,7 +280,7 @@ function getDefaultModel(config: CouncilModelConfig): string {
         config.provider === "openai" ? DEFAULT_OPENAI_MODEL :
         config.provider === "anthropic" ? DEFAULT_ANTHROPIC_MODEL :
         config.provider === "gemini" ? DEFAULT_GEMINI_MODEL :
-        config.provider === "geminiCli" ? DEFAULT_GEMINI_CLI_MODEL :
+        config.provider === "antigravityCli" ? DEFAULT_ANTIGRAVITY_CLI_MODEL :
         config.provider === "grok" ? DEFAULT_GROK_MODEL :
         config.provider === "claudeCode" ? DEFAULT_CLAUDE_CODE_MODEL :
         config.provider === "codex" ? DEFAULT_CODEX_MODEL :
@@ -395,6 +313,7 @@ function withoutFallbackParams(params: Record<string, unknown> | undefined): Rec
 }
 
 function getFallbackConfig(config: CouncilModelConfig, spec: unknown): CouncilModelConfig {
+    config = normalizeCouncilModelConfig(config);
     const baseParams = withoutFallbackParams(config.params);
     if (typeof spec === "string" && spec.trim()) {
         return { ...config, model: spec.trim(), params: baseParams };
@@ -404,7 +323,7 @@ function getFallbackConfig(config: CouncilModelConfig, spec: unknown): CouncilMo
     }
     const fallback = spec as FallbackModelObject;
     const provider = typeof fallback.provider === "string" && fallback.provider.trim()
-        ? fallback.provider.trim()
+        ? normalizeCouncilProvider(fallback.provider.trim())
         : config.provider;
     if (provider !== config.provider) {
         throw new Error(`fallbackModels 只支持同 provider 降级：${config.provider} 不能 fallback 到 ${provider}`);
@@ -419,17 +338,21 @@ function getFallbackConfig(config: CouncilModelConfig, spec: unknown): CouncilMo
 }
 
 function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConfig[] {
-    if (config.provider === "geminiCli") {
-        if (!DEFAULT_GEMINI_CLI_FALLBACKS_ENABLED) return [];
+    config = normalizeCouncilModelConfig(config);
+    if (config.provider === "antigravityCli") {
+        if (!DEFAULT_ANTIGRAVITY_CLI_FALLBACKS_ENABLED) return [];
         const model = getDefaultModel(config);
         const baseParams = withoutFallbackParams(config.params) || {};
-        const chain = (process.env.SANDBOX_COUNCIL_GEMINI_CLI_MODEL_CHAIN || [
-            "auto-gemini-3",
-            "gemini-3.1-pro-preview",
-            "gemini-2.5-pro",
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-        ].join(",")).split(",").map((item) => item.trim()).filter(Boolean);
+        const chain = getCompatibleAntigravityCliModelEnv(
+            "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_MODEL_CHAIN",
+            "SANDBOX_COUNCIL_GEMINI_CLI_MODEL_CHAIN",
+            [
+                "Gemini 3.1 Pro (High)",
+                "Gemini 3.5 Flash (High)",
+                "Gemini 3.1 Pro (Low)",
+                "Gemini 3.5 Flash (Medium)",
+            ].join(","),
+        ).split(",").map((item) => item.trim()).filter(Boolean);
         const currentIndex = chain.findIndex((item) => item === model);
         const candidates = currentIndex >= 0 ? chain.slice(currentIndex + 1) : chain.filter((item) => item !== model);
         const seen = new Set([model]);
@@ -508,6 +431,7 @@ function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConf
 }
 
 function getFallbackConfigs(config: CouncilModelConfig): CouncilModelConfig[] {
+    config = normalizeCouncilModelConfig(config);
     const raw = config.params?.fallbackModels ?? config.params?.fallbacks ?? config.params?.fallbackModel;
     if (raw === undefined) return getDefaultFallbackConfigs(config);
     const specs = Array.isArray(raw) ? raw : [raw];
@@ -517,6 +441,7 @@ function getFallbackConfigs(config: CouncilModelConfig): CouncilModelConfig[] {
 }
 
 function describeModelConfig(config: CouncilModelConfig): string {
+    config = normalizeCouncilModelConfig(config);
     if (config.provider === "codex") {
         return `${config.provider}:${getDefaultModel(config)}(reasoning=${getCodexReasoning(config)})`;
     }
@@ -524,6 +449,7 @@ function describeModelConfig(config: CouncilModelConfig): string {
 }
 
 function getConcurrencyLimit(config: CouncilModelConfig): number {
+    config = normalizeCouncilModelConfig(config);
     const explicit = getNumberParam(config.params, "maxConcurrency") ?? getNumberParam(config.params, "concurrency");
     if (explicit) return Math.max(1, Math.min(explicit, 8));
     return DEFAULT_SOURCE_LIMITS[config.provider] || 2;
@@ -540,6 +466,7 @@ function normalizeSource(value: string | undefined): string {
 }
 
 function getSourceKey(config: CouncilModelConfig): string {
+    config = normalizeCouncilModelConfig(config);
     const explicitSource = getStringParam(config.params, "sourceKey") || getStringParam(config.params, "source");
     if (explicitSource) return `${config.provider}:${explicitSource}`;
     if (config.provider === "grok") {
@@ -675,7 +602,8 @@ function getSafeBodyOverrides(params: Record<string, unknown> | undefined, denie
 function assertProviderImageMime(provider: string, mimeType: string): void {
     const common = ["image/jpeg", "image/png", "image/webp", "image/gif"];
     const gemini = [...common, "image/heic", "image/heif"];
-    const allowed = provider === "gemini" || provider === "geminiCli" ? gemini : common;
+    const canonicalProvider = normalizeCouncilProvider(provider);
+    const allowed = canonicalProvider === "gemini" || canonicalProvider === "antigravityCli" ? gemini : common;
     if (!allowed.includes(mimeType)) {
         throw new Error(`${provider} 不支持图片 MIME: ${mimeType}`);
     }
@@ -788,21 +716,33 @@ function extractMarkedSection(text: string, startMarker: string, endMarker: stri
     throw new Error(`${artifactPath} 未找到 ${startMarker}/${endMarker} 标记`);
 }
 
-function readGeminiCliArtifact(artifactPath: string): string {
+function readAntigravityCliArtifact(artifactPath: string): string {
     if (!fs.existsSync(artifactPath)) {
-        throw new Error(`Gemini CLI 未写入响应文件: ${artifactPath}`);
+        throw new Error(`Antigravity CLI 未写入响应文件: ${redactSensitiveText(artifactPath)}`);
     }
     const stat = fs.statSync(artifactPath);
-    if (stat.size > GEMINI_CLI_MAX_OUTPUT_BYTES) {
-        throw new Error(`Gemini CLI 响应文件过大 (${stat.size} bytes > ${GEMINI_CLI_MAX_OUTPUT_BYTES} bytes)，拒绝读入内存`);
+    if (stat.size > ANTIGRAVITY_CLI_MAX_OUTPUT_BYTES) {
+        throw new Error(`Antigravity CLI 响应文件过大 (${stat.size} bytes > ${ANTIGRAVITY_CLI_MAX_OUTPUT_BYTES} bytes)，拒绝读入内存`);
     }
     const raw = fs.readFileSync(artifactPath, "utf-8");
-    const text = extractMarkedSection(raw, GEMINI_CLI_RESPONSE_START, GEMINI_CLI_RESPONSE_END, artifactPath);
-    if (!text) throw new Error("Gemini CLI 未返回文本");
-    return text;
+    for (const [startMarker, endMarker] of [
+        [ANTIGRAVITY_CLI_RESPONSE_START, ANTIGRAVITY_CLI_RESPONSE_END],
+        [LEGACY_GEMINI_CLI_RESPONSE_START, LEGACY_GEMINI_CLI_RESPONSE_END],
+    ]) {
+        try {
+            const text = extractMarkedSection(raw, startMarker, endMarker, artifactPath);
+            if (text) return redactSensitiveText(text);
+        } catch {
+            continue;
+        }
+    }
+    if (raw.trim()) {
+        throw createAntigravityCliError("Antigravity CLI 响应文件格式错误：未找到新旧响应标记");
+    }
+    throw createAntigravityCliError("Antigravity CLI 未返回文本");
 }
 
-function buildGeminiCliPromptFile(input: {
+function buildAntigravityCliPromptFile(input: {
     prompt: string;
     imagePaths: string[];
     artifactPath: string;
@@ -812,19 +752,19 @@ function buildGeminiCliPromptFile(input: {
         ? input.imagePaths.map((imagePath, index) => `- image ${index + 1}: ${path.resolve(imagePath)}`).join("\n")
         : "- 无";
     return [
-        "你是 sandbox_council 的 Gemini CLI 参与模型。",
+        "你是 sandbox_council 的 Antigravity CLI 参与模型。",
         "你需要阅读下面的讨论提示，并把最终回答写入指定临时文件。",
         "不要把完整回答打印到 stdout；stdout/stderr 只允许短状态或错误诊断。",
         "输出文件必须包含下面两个标记，宿主只读取标记之间的内容：",
-        GEMINI_CLI_RESPONSE_START,
+        ANTIGRAVITY_CLI_RESPONSE_START,
         "...你的中文回答...",
-        GEMINI_CLI_RESPONSE_END,
+        ANTIGRAVITY_CLI_RESPONSE_END,
         "",
         `模型：${input.model}`,
         `临时输出文件：${input.artifactPath}`,
         "",
         "# 图片输入",
-        "如果列出了图片路径，请使用 Gemini CLI 可用的多模态/文件读取能力直接观察这些图片；不要只复述路径。",
+        "如果列出了图片路径，请使用 Antigravity CLI 可用的多模态/文件读取能力直接观察这些图片；不要只复述路径。",
         images,
         "",
         "# 讨论提示",
@@ -832,68 +772,91 @@ function buildGeminiCliPromptFile(input: {
     ].join("\n");
 }
 
-function buildGeminiCliScript(promptPath: string, artifactPath: string, model: string, approvalMode: string, command: string): string {
+function buildAntigravityCliScript(promptPath: string, artifactPath: string, model: string, command: string, addDirs: string[]): string {
     const prompt = `Read and follow the full UTF-8 instructions in ${promptPath}. Write the final sandbox_council response to ${artifactPath}. Do not print the full response to stdout.`;
     return [
-        "$ErrorActionPreference = 'Continue'",
         `$prompt = ${psSingleQuoted(prompt)}`,
-        `& ${psSingleQuoted(command)} --skip-trust --approval-mode ${psSingleQuoted(approvalMode)} -m ${psSingleQuoted(model)} -p $prompt --output-format text`,
+        `& ${psSingleQuoted(command)} -p $prompt --dangerously-skip-permissions --model ${psSingleQuoted(model)}${addDirs.map((dir) => ` --add-dir ${psSingleQuoted(dir)}`).join("")}`,
         "exit $LASTEXITCODE",
     ].join("\n");
 }
 
-async function callGeminiCliText(
+function createAntigravityCliError(message: string): ProviderError {
+    const error = new Error(redactSensitiveText(message)) as ProviderError;
+    error.retryable = /model capacity|RESOURCE_EXHAUSTED|MODEL_CAPACITY_EXHAUSTED|timeout|超时|未返回文本|未找到新旧响应标记|未写入响应文件|调用失败 exit=/iu.test(message)
+        && !/authentication|required|workspace path rejected|terminal attachment|not recognized|not found/iu.test(message);
+    return error;
+}
+
+async function callAntigravityCliText(
     config: CouncilModelConfig,
     prompt: string,
     imagePaths: string[],
     timeoutMs: number,
     signal?: AbortSignal,
+    runId?: string,
 ): Promise<ProviderCallResult> {
     assertProviderNotAborted(signal);
     const model = getDefaultModel(config);
-    const command = getStringParam(config.params, "command") || getStringParam(config.params, "cli") || "gemini";
-    const approvalMode = getStringParam(config.params, "approvalMode") || getStringParam(config.params, "geminiApprovalMode") || DEFAULT_GEMINI_CLI_APPROVAL_MODE;
+    const command = getStringParam(config.params, "command") || getStringParam(config.params, "cli") || getCompatibleEnv(
+        "SANDBOX_COUNCIL_ANTIGRAVITY_CLI_COMMAND",
+        "SANDBOX_COUNCIL_GEMINI_CLI_COMMAND",
+        "agy",
+    );
     const cwd = path.resolve(getStringParam(config.params, "cwd") || process.cwd());
-    const dir = config.provider === "geminiCli"
-        ? geminiCliAccessibleTempDir(cwd, "council-model-calls")
-        : councilModelCallDir();
+    const dir = config.provider === "antigravityCli"
+        ? antigravityCliAccessibleTempDir(cwd, "council-model-calls", runId)
+        : councilModelCallDir(runId);
     const base = path.join(dir, `${safeName(config.id)}_${safeName(model)}_${nowStamp()}`);
     const artifactPath = `${base}.md`;
     const promptPath = `${base}.prompt.txt`;
-    const promptFile = buildGeminiCliPromptFile({
+    const promptFile = buildAntigravityCliPromptFile({
         prompt,
         imagePaths: config.supportsVision ? imagePaths : [],
         artifactPath,
         model,
     });
     fs.writeFileSync(promptPath, promptFile, "utf-8");
-    const result = await spawnPowerShellScript(
-        buildGeminiCliScript(promptPath, artifactPath, model, approvalMode, command),
-        cwd,
-        `${base}.run`,
-        timeoutMs,
-        getEarlyCliFailureReason,
-        signal,
-    );
-    if (result.earlyFailureReason) {
-        const stderr = readClip(result.stderrPath, 1200).trim();
-        throw new Error(`${result.earlyFailureReason}${stderr ? `: ${stderr}` : ""}`);
-    }
-    if (result.timedOut) {
-        try {
-            const text = readGeminiCliArtifact(artifactPath);
-            return { provider: config.provider, model, text };
-        } catch {
-            // Fall through to the timeout error with stdout/stderr paths.
+    try {
+        const childEnvironment = buildAntigravityCliEnvironment();
+        const result = await withAntigravityCliLease(signal, async () => await spawnPowerShellScript(
+            buildAntigravityCliScript(promptPath, artifactPath, model, command, [...new Set([
+                path.dirname(promptPath),
+                path.dirname(artifactPath),
+                ...(config.supportsVision ? imagePaths.map((imagePath) => path.dirname(path.resolve(imagePath))) : []),
+            ])]),
+            cwd,
+            `${base}.run`,
+            { timeoutMs, signal, env: childEnvironment.env, diagnostics: childEnvironment.diagnostics, earlyFailure: getEarlyCliFailureReason },
+        ));
+        if (result.aborted) throw makeProviderAbortError();
+        if (result.earlyFailureReason) {
+            const stderr = readClip(result.stderrPath, 1200).trim();
+            throw createAntigravityCliError(`${result.earlyFailureReason}${stderr ? `: ${stderr}` : ""}`);
         }
-        throw new Error(`Gemini CLI 调用超时 (${timeoutMs}ms) stdout=${result.stdoutPath} stderr=${result.stderrPath}`);
+        if (result.timedOut) {
+            try {
+                const text = readAntigravityCliArtifact(artifactPath);
+                return { provider: config.provider, model, text };
+            } catch {
+                // Fall through to the timeout error with stdout/stderr paths.
+            }
+            throw createAntigravityCliError(`Antigravity CLI 调用超时 (${timeoutMs}ms) stdout=${redactSensitiveText(result.stdoutPath)} stderr=${redactSensitiveText(result.stderrPath)}`);
+        }
+        if (result.exitCode !== 0 && !fs.existsSync(artifactPath)) {
+            const stderr = readClip(result.stderrPath, 1200).trim();
+            const failureReason = getEarlyCliFailureReason(stderr);
+            throw createAntigravityCliError(`${failureReason || `Antigravity CLI 调用失败 exit=${result.exitCode}`}${stderr ? `: ${stderr}` : ""}`);
+        }
+        const text = readAntigravityCliArtifact(artifactPath);
+        return { provider: config.provider, model, text };
+    } finally {
+        if (runId) {
+            for (const artifact of [promptPath, artifactPath, `${base}.run.ps1`, `${base}.run.stdout.txt`, `${base}.run.stderr.txt`]) {
+                if (fs.existsSync(artifact)) registerCouncilArtifact(runId, artifact);
+            }
+        }
     }
-    if (result.exitCode !== 0 && !fs.existsSync(artifactPath)) {
-        const stderr = readClip(result.stderrPath, 1200).trim();
-        throw new Error(`Gemini CLI 调用失败 exit=${result.exitCode}${stderr ? `: ${stderr}` : ""}`);
-    }
-    const text = readGeminiCliArtifact(artifactPath);
-    return { provider: config.provider, model, text };
 }
 
 async function postJson(url: string, headers: Record<string, string>, body: unknown, timeoutMs: number, signal?: AbortSignal): Promise<any> {
@@ -941,9 +904,11 @@ export async function callCouncilModel(
     imagePaths: string[] = [],
     timeoutMs = DEFAULT_COUNCIL_MODEL_TIMEOUT_MS,
     signal?: AbortSignal,
+    runId?: string,
 ): Promise<ProviderCallResult> {
     assertProviderNotAborted(signal);
-    const candidates = [config, ...getFallbackConfigs(config)];
+    config = normalizeCouncilModelConfig(config);
+    const candidates = [config, ...getFallbackConfigs(config)].map(normalizeCouncilModelConfig);
     const errors: string[] = [];
     for (let index = 0; index < candidates.length; index++) {
         const candidate = candidates[index];
@@ -953,7 +918,7 @@ export async function callCouncilModel(
         try {
             return await withSourceLimit(candidate, () => withRetry(candidate, () => {
                 assertProviderNotAborted(signal);
-                return callCouncilModelOnce(candidate, prompt, imagePaths, candidateTimeoutMs, signal);
+                return callCouncilModelOnce(candidate, prompt, imagePaths, candidateTimeoutMs, signal, runId);
             }));
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
@@ -974,11 +939,13 @@ async function callCouncilModelOnce(
     imagePaths: string[] = [],
     timeoutMs = DEFAULT_COUNCIL_MODEL_TIMEOUT_MS,
     signal?: AbortSignal,
+    runId?: string,
 ): Promise<ProviderCallResult> {
     assertProviderNotAborted(signal);
+    config = normalizeCouncilModelConfig(config);
     const model = getDefaultModel(config);
-    if (config.provider === "geminiCli") {
-        return await callGeminiCliText(config, prompt, imagePaths, timeoutMs, signal);
+    if (config.provider === "antigravityCli") {
+        return await callAntigravityCliText(config, prompt, imagePaths, timeoutMs, signal, runId);
     }
     const images = loadImages(imagePaths, Boolean(config.supportsVision), config.provider);
 
@@ -1104,6 +1071,9 @@ async function callCouncilModelOnce(
         return { provider: config.provider, model, text };
     }
 
+    if (config.provider !== "customOpenAICompatible") {
+        throw new Error(`未知 council provider: ${config.provider}`);
+    }
     const key = readApiKey(config, "OPENAI_API_KEY");
     const baseUrl = getStringParam(config.params, "baseUrl") || getStringParam(config.params, "endpoint");
     if (!baseUrl) throw new Error("customOpenAICompatible 需要 params.baseUrl 或 params.endpoint");

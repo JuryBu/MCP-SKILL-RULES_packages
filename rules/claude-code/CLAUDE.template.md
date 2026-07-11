@@ -359,7 +359,8 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 - `moderator` 必须是模型配置对象，不能是字符串
 - 后台模式：`background=true, ownerId="..."` 启动后用同 `ownerId` + `waitSeconds=45` 轮询
 - provider fallback 只在接收方已配置的同源模型之间使用；临时传输失败可降级，参数、权限或安全错误应直接报告。
-- Gemini 优先用 `provider="geminiCli"`（本地 CLI 路线）
+- Antigravity CLI / Gemini 系列优先用 `provider="antigravityCli"`（本地 `agy` 路线）；旧 `geminiCli` 仅作兼容别名，接收方未安装或未登录时不要假设可用。
+- Council 的 transcript、索引和大输入由 manifest 统一管理；不要手工删除 artifact/task/quarantine 目录。清理前先用 `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 预演，`apply`、`restore`、`purge` 需要用户明确授权。
 
 ---
 

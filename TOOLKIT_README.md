@@ -4,7 +4,7 @@
 
 ## 你会得到什么
 
-- 三个通用 MCP：memory-store 1.19.3、web-fetcher 7.0.0、sandbox 1.14.0。
+- 三个通用 MCP：memory-store 1.19.3、web-fetcher 7.0.0、sandbox 1.15.1。
 - 一个 portable HTTP broker 0.1.0，用于 Codex 和其他支持 HTTP MCP 的宿主。
 - 一个 Windsurf-only subagent 1.1.0，只在你明确安装并登录 Windsurf 后使用。
 - Codex、Antigravity、Claude Code、Windsurf 四套脱敏 Rules。

@@ -1,13 +1,23 @@
-export type CouncilProvider =
-    | "antigravity"
-    | "codex"
-    | "openai"
-    | "anthropic"
-    | "gemini"
-    | "geminiCli"
-    | "grok"
-    | "claudeCode"
-    | "customOpenAICompatible";
+export const COUNCIL_PROVIDERS = [
+    "antigravity",
+    "antigravityCli",
+    "codex",
+    "openai",
+    "anthropic",
+    "gemini",
+    "geminiCli",
+    "grok",
+    "claudeCode",
+    "customOpenAICompatible",
+] as const;
+
+export type CouncilProvider = typeof COUNCIL_PROVIDERS[number];
+
+export function normalizeCouncilProvider(provider: string): CouncilProvider {
+    if (provider === "geminiCli") return "antigravityCli";
+    if ((COUNCIL_PROVIDERS as readonly string[]).includes(provider)) return provider as CouncilProvider;
+    throw new Error(`未知 council provider: ${provider}`);
+}
 
 export type CouncilMode = "red_blue_black" | "design" | "review" | "guard_check" | "custom";
 export type CouncilContextMode = "none" | "summary" | "full" | "manual";
@@ -20,6 +30,11 @@ export interface CouncilModelConfig {
     model?: string;
     params?: Record<string, unknown>;
     supportsVision?: boolean;
+}
+
+export function normalizeCouncilModelConfig(config: CouncilModelConfig): CouncilModelConfig {
+    const provider = normalizeCouncilProvider(config.provider);
+    return provider === config.provider ? config : { ...config, provider };
 }
 
 export interface CouncilFileInput {
@@ -104,6 +119,8 @@ export interface CouncilModeratorDecision {
 
 export interface CouncilTranscript {
     id: string;
+    runId: string;
+    artifactManifestPath: string;
     mode: CouncilMode;
     input: string;
     contextMode: CouncilContextMode;
@@ -155,6 +172,7 @@ export interface CouncilCheckpoint {
 
 export interface CouncilResumeState {
     sourceTaskId: string;
+    sourceRunId?: string;
     checkpoint: CouncilCheckpoint;
     transcript: CouncilTranscript;
 }
@@ -182,5 +200,9 @@ export interface CouncilRunParams {
     checkpointPath?: string;
     resumeState?: CouncilResumeState;
     ownerId?: string;
+    taskId?: string;
+    runId?: string;
+    artifactManifestPath?: string;
+    signal?: AbortSignal;
     onProgress?: (progress: string) => void;
 }

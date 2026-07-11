@@ -21,6 +21,9 @@
 - `sample-overlap.html` 的视觉检查应报告 overlap、overflow 或 readability 问题。
 - sandbox 可执行短代码，smart search 可完成 exact 模式；模型语义搜索只在接收方已配置对应 modelChain 时测试。
 - Grok Council 只在接收方 ProGrok proxy 可用时测试，公开包不保证特定模型名或账户额度。
+- `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 只报告候选项，不改动数据；托管 Council 产物根应位于 `SANDBOX_DATA_ROOT\temp`，不应出现在工具包源码目录。
+- 未设置 `SANDBOX_COUNCIL_AUTO_GC=1` 时，启动 Sandbox 不应自动执行会移动或删除持久产物的 Council GC。
+- Council 的 `apply`、`restore` 与 `purge` 会改动持久数据，只在接收方理解预演结果并明确同意后测试。
 
 ## Troubleshooting
 
