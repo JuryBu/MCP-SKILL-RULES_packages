@@ -8,6 +8,24 @@ import { execFile } from "node:child_process";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+function bootstrapPrivateEnv() {
+  const privateEnvPath = path.join(__dirname, "broker-private.env.json");
+  if (!fs.existsSync(privateEnvPath)) return;
+  try {
+    const privateEnv = JSON.parse(fs.readFileSync(privateEnvPath, "utf8").replace(/^\uFEFF/, ""));
+    for (const [key, value] of Object.entries(privateEnv)) {
+      if (key && value !== undefined && value !== null && String(value) !== "" && !process.env[key]) {
+        process.env[key] = String(value);
+      }
+    }
+  } catch (error) {
+    console.error(`[codex-mcp-broker] private env load failed: ${error.message}`);
+  }
+}
+
+bootstrapPrivateEnv();
+
 const toolkitMcpRoot = process.env.CODEX_TOOLKIT_MCP_ROOT || path.resolve(__dirname, "..");
 const toolkitDataRoot = process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit");
 const memoryStoreRoot = process.env.MEMORY_STORE_MCP_ROOT || path.join(toolkitMcpRoot, "memory-store");
@@ -53,36 +71,18 @@ const {
 
 const port = Number(process.env.CODEX_MCP_BROKER_PORT || 14588);
 const host = process.env.CODEX_MCP_BROKER_HOST || "127.0.0.1";
-const logPath = process.env.CODEX_MCP_BROKER_LOG || path.join(__dirname, "broker.log");
-const statePath = process.env.CODEX_MCP_BROKER_STATE || path.join(__dirname, "broker-state.json");
-const requestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS || 120000);
+const brokerDataRoot = path.join(toolkitDataRoot, "broker");
+const logPath = process.env.CODEX_MCP_BROKER_LOG || path.join(brokerDataRoot, "broker.log");
+const statePath = process.env.CODEX_MCP_BROKER_STATE || path.join(brokerDataRoot, "broker-state.json");
+const configuredRequestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS || 120000);
+const requestTimeoutMs = Number.isFinite(configuredRequestTimeoutMs) && configuredRequestTimeoutMs > 0
+  ? Math.floor(configuredRequestTimeoutMs)
+  : 120000;
+const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 1800000);
+const waitTimeoutCapMs = Number.isFinite(configuredWaitTimeoutCapMs) && configuredWaitTimeoutCapMs > 0
+  ? Math.max(requestTimeoutMs, Math.floor(configuredWaitTimeoutCapMs))
+  : Math.max(requestTimeoutMs, 1800000);
 const sessionIdleMs = Number(process.env.CODEX_MCP_BROKER_SESSION_IDLE_MS || 6 * 60 * 60 * 1000);
-
-function loadPrivateEnv() {
-  const privateEnvPath = path.join(__dirname, "broker-private.env.json");
-  if (!fs.existsSync(privateEnvPath)) {
-    return;
-  }
-  try {
-    const privateEnvText = fs.readFileSync(privateEnvPath, "utf8").replace(/^\uFEFF/, "");
-    const privateEnv = JSON.parse(privateEnvText);
-    let loaded = 0;
-    for (const [key, value] of Object.entries(privateEnv)) {
-      if (!key || value === undefined || value === null || String(value) === "") {
-        continue;
-      }
-      if (!process.env[key]) {
-        process.env[key] = String(value);
-        loaded += 1;
-      }
-    }
-    log("private env loaded", { keys: loaded });
-  } catch (error) {
-    log("private env load failed", { error: error.message });
-  }
-}
-
-loadPrivateEnv();
 
 const exaMcpRemoteUrl = process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL || "";
 
@@ -156,8 +156,8 @@ const endpoints = {
   },
   exa: {
     path: "/exa/mcp",
-    command: "cmd.exe",
-    args: ["/d", "/s", "/c", "npx.cmd -y mcp-remote %EXA_MCP_REMOTE_URL%"],
+    command: "node",
+    args: [path.join(__dirname, "exa-stateless-stdio.mjs")],
     cwd: __dirname,
     resources: false,
     cacheToolsList: true,
@@ -738,13 +738,23 @@ class EndpointBroker {
         });
         return toolError(validationError);
       }
+      const args = request.params?.arguments || {};
+      let callTimeoutMs = requestTimeoutMs;
+      if (typeof args.waitSeconds === "number" && args.waitSeconds > 0) {
+        callTimeoutMs = Math.min(
+          Math.max(args.waitSeconds * 1000 + 15000, requestTimeoutMs),
+          waitTimeoutCapMs,
+        );
+      } else if (typeof args.timeout === "number" && args.timeout > requestTimeoutMs) {
+        callTimeoutMs = Math.min(args.timeout + 15000, waitTimeoutCapMs);
+      }
       return this.backend.request(
         {
           method: request.method,
           params: request.params,
         },
         CallToolResultSchema,
-        { closeOnError: false },
+        { closeOnError: false, timeoutMs: callTimeoutMs },
       );
     });
     forwardOptionalList(ListResourcesRequestSchema, ListResourcesResultSchema, { resources: [] });
@@ -853,6 +863,14 @@ const brokers = Object.fromEntries(
   Object.entries(endpoints).map(([name, config]) => [name, new EndpointBroker(name, config)]),
 );
 
+function writeStateBestEffort(reason) {
+  try {
+    writeState(brokers);
+  } catch (error) {
+    log("broker state write failed", { reason, error: error.message });
+  }
+}
+
 setInterval(() => {
   Promise.all(Object.values(brokers).map((broker) => broker.cleanupIdleSessions()))
     .then(() => writeState(brokers))
@@ -903,15 +921,33 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
+let isShuttingDown = false;
+
 async function shutdown(signal) {
+  if (isShuttingDown) {
+    return;
+  }
+  isShuttingDown = true;
   log("shutting down", { signal });
-  await Promise.all(Object.values(brokers).map((broker) => broker.close()));
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 5000).unref();
+  try {
+    await Promise.all(Object.values(brokers).map((broker) => broker.close()));
+  } finally {
+    writeStateBestEffort(`shutdown:${signal}`);
+  }
+  server.close(() => {
+    writeStateBestEffort(`server-close:${signal}`);
+    process.exit(0);
+  });
+  setTimeout(() => {
+    writeStateBestEffort(`shutdown-timeout:${signal}`);
+    process.exit(1);
+  }, 5000).unref();
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGBREAK", () => shutdown("SIGBREAK"));
+process.on("beforeExit", () => writeStateBestEffort("beforeExit"));
 
 server.listen(port, host, () => {
   log("broker listening", { host, port, pid: process.pid });

@@ -11,6 +11,7 @@ import {
   subagentCurrent,
   subagentInterrupt,
   subagentList,
+  subagentListSubcids,
   subagentModels,
   subagentMoveQueuedMessage,
   subagentPoll,
@@ -22,7 +23,7 @@ import {
 
 const server = new McpServer({
   name: "windsurf-subagent",
-  version: "0.1.0",
+  version: "1.1.0",
 });
 
 const processGuard = await acquireProcessGuard();
@@ -46,6 +47,7 @@ server.registerTool("subagent_models", {
     refresh: z.boolean().optional(),
     include_unverified: z.boolean().optional(),
     candidate_limit: z.number().optional(),
+    query: z.string().optional(),
   },
 }, async (args) => await subagentModels(args));
 
@@ -117,6 +119,15 @@ server.registerTool("subagent_list", {
   },
 }, async (args) => await subagentList(args));
 
+server.registerTool("subagent_list_subcids", {
+  title: "List WSF Subagent Cascade IDs",
+  description: "Return registered subagent cascade IDs for memory-store to distinguish main conversations from subagent conversations.",
+  inputSchema: {
+    main_id: z.string().optional(),
+    include_archived: z.boolean().optional(),
+  },
+}, async (args) => await subagentListSubcids(args));
+
 server.registerTool("subagent_collect", {
   title: "Collect WSF Subagent",
   description: "Queue or interrupt a registered main cascade with the subagent result.",
@@ -175,6 +186,11 @@ server.registerTool("subagent_cleanup", {
     max_archive_per_run: z.number().optional(),
     retain_archives: z.number().optional(),
     hard_delete_archives: z.boolean().optional(),
+    prune_deleted: z.boolean().optional(),
+    deleted_ttl_sec: z.number().optional(),
+    retain_deleted: z.number().optional(),
+    max_prune_per_run: z.number().optional(),
+    hard_delete_deleted_archives: z.boolean().optional(),
   },
 }, async (args) => await subagentCleanup(args));
 
@@ -199,7 +215,16 @@ server.registerTool("subagent_dispose", {
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
-if (processGuard.shouldStartSchedulers !== false && process.env.SUBAGENT_DISABLE_SCHEDULERS !== "1") {
+let schedulersStarted = false;
+function startSchedulersOnce() {
+  if (schedulersStarted || process.env.SUBAGENT_DISABLE_SCHEDULERS === "1") return;
+  schedulersStarted = true;
   startCleanupScheduler();
   startAutoCollectScheduler();
 }
+if (processGuard.shouldStartSchedulers !== false) {
+  startSchedulersOnce();
+}
+processGuard.onOwnerAcquired?.(async () => {
+  startSchedulersOnce();
+});

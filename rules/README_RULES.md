@@ -1,15 +1,18 @@
 # Rules Templates
 
-This folder has one Rules template per host:
+This folder contains privacy-scrubbed Rules templates for each host:
 
-- `codex/AGENTS.template.md` → merge into `%USERPROFILE%/.codex/AGENTS.md`
-- `codex/system-prompt.template.md` → optional Codex `model_instructions_file` target
-- `antigravity/GEMINI.template.md` → merge into Antigravity `GEMINI.md`
-- `claude-code/CLAUDE.template.md` → merge into `%USERPROFILE%/.claude/CLAUDE.md`
-- `windsurf/Windsurf_Global_Rules.template.md` → merge into Windsurf global rules, usually `%USERPROFILE%/.codeium/windsurf/memories/global_rules.md`
+- `codex/AGENTS.template.md` → merge into the receiver's Codex rules file.
+- `codex/system-prompt.template.md` → optional Codex model-instructions target.
+- `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
+- `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
+- `windsurf/global_rules.template.md` → short per-conversation Windsurf rules.
+- `windsurf/system_rules/*.template.md` → long-lived Windsurf system rules, split by concern.
+- `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance.
+- `windsurf/Windsurf_Global_Rules.template.md` → condensed compatibility entry for older import scripts; use the new split layout for full coverage.
 
-All four templates are privacy-scrubbed handoff versions. They preserve work style, MCP usage rules, subagent/council habits, evidence discipline, PPT/document QA habits, and four-source chain conventions, but remove sender-specific birthday, account links, local private paths, private memories, login-state claims, and project branding.
+The templates preserve work style, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, and background-task rules. They remove sender-specific identity, account data, local paths, credentials, active sessions, real-time service claims, model defaults, pricing, and quota promises.
 
-Windsurf support is data-chain oriented for shared MCPs: `dataChain=windsurf` can read Cascade conversation data where supported, while `modelChain=windsurf` is intentionally not advertised. The separate `mcps/mcp-subagent` package is Windsurf-only automation for Cascade sub-agents and should be enabled explicitly, not treated as a default shared MCP.
+Shared MCP capabilities vary by host. Use `chain`, `dataChain`, and `modelChain` only when the installed tool documents them, and treat Windsurf-specific automation as opt-in rather than a default shared capability.
 
-Receiver should edit personal style, account references, model preferences, host-specific paths, and Windsurf memory/config locations after import.
+After import, the receiver should set personal style, host-specific paths, installed tools, model preferences, and authorization locally.

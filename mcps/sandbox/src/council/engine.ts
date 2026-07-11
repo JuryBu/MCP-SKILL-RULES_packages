@@ -1,3 +1,4 @@
+import fs from "fs";
 import path from "path";
 import { newUuid } from "../owner.js";
 import { callCouncilModel, DEFAULT_COUNCIL_MODEL_TIMEOUT_MS } from "./providers.js";
@@ -8,6 +9,7 @@ import { prepareCouncilLargeInputs } from "./large-input.js";
 import type {
     CouncilModelConfig,
     CouncilModeratorDecision,
+    CouncilCheckpoint,
     CouncilRunParams,
     CouncilToolCall,
     CouncilToolResult,
@@ -30,7 +32,7 @@ function clip(text: string, maxChars: number): string {
 
 function supportsDirectImageInput(config: CouncilRunParams["participants"][number] | CouncilRunParams["moderator"]): boolean {
     if (!config.supportsVision) return false;
-    return ["openai", "anthropic", "gemini", "geminiCli", "customOpenAICompatible"].includes(config.provider);
+    return ["openai", "anthropic", "gemini", "geminiCli", "grok", "customOpenAICompatible"].includes(config.provider);
 }
 
 function normalizeTimeoutMs(value: unknown): number | undefined {
@@ -271,6 +273,71 @@ function emitProgress(params: CouncilRunParams, transcript: CouncilTranscript, m
     params.onProgress?.(formatProgressLine(transcript, message));
 }
 
+function writeJsonAtomic(filePath: string, value: unknown): void {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const temp = `${filePath}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(value, null, 2), "utf-8");
+    fs.renameSync(temp, filePath);
+}
+
+function writeCheckpoint(params: CouncilRunParams, transcript: CouncilTranscript, checkpoint: Omit<CouncilCheckpoint, "transcriptId" | "updatedAt">): void {
+    if (!params.checkpointPath) return;
+    writeJsonAtomic(params.checkpointPath, {
+        ...checkpoint,
+        transcriptId: transcript.id,
+        updatedAt: new Date().toISOString(),
+    });
+}
+
+function savePartialTranscript(params: CouncilRunParams, transcript: CouncilTranscript): CouncilTranscript {
+    if (!params.transcriptPath) return transcript;
+    return saveCouncilTranscript(transcript, params.transcriptPath, params.outputDir);
+}
+
+function cloneTranscript(transcript: CouncilTranscript): CouncilTranscript {
+    return JSON.parse(JSON.stringify(transcript)) as CouncilTranscript;
+}
+
+function roundsBeforeResumePoint(rounds: CouncilTranscript["rounds"], checkpoint: CouncilCheckpoint): CouncilTranscript["rounds"] {
+    if (checkpoint.roundComplete) {
+        const completedRound = Math.max(checkpoint.lastCompletedRound || 0, checkpoint.currentRound || 0);
+        return rounds.filter((round) => round.round <= completedRound);
+    }
+    return rounds.filter((round) => round.round < checkpoint.currentRound);
+}
+
+function getNextRoundFromCheckpoint(transcript: CouncilTranscript, checkpoint?: CouncilCheckpoint): number {
+    if (!checkpoint) {
+        return transcript.rounds.length > 0
+            ? Math.max(...transcript.rounds.map((round) => round.round)) + 1
+            : 1;
+    }
+    if (checkpoint.roundComplete) {
+        return Math.max(checkpoint.lastCompletedRound || 0, checkpoint.currentRound || 0) + 1;
+    }
+    return Math.max(1, checkpoint.currentRound);
+}
+
+function restoreLoopState(rounds: CouncilTranscript["rounds"]): {
+    toolCallsUsed: number;
+    askTarget?: string;
+    askInstruction?: string;
+    afterToolInstruction?: string;
+} {
+    const lastRound = rounds.at(-1);
+    const lastModerator = lastRound?.moderator;
+    const lastSteps = lastRound?.moderatorSteps && lastRound.moderatorSteps.length > 0
+        ? lastRound.moderatorSteps
+        : lastModerator ? [lastModerator] : [];
+    const lastAfterToolInstruction = [...lastSteps].reverse().find((step) => step.afterToolInstruction)?.afterToolInstruction;
+    return {
+        toolCallsUsed: rounds.reduce((total, round) => total + getRoundToolResults(round).length, 0),
+        askTarget: lastModerator?.action === "ask" ? lastModerator.targetParticipantId : undefined,
+        askInstruction: lastModerator?.action === "ask" ? lastModerator.instruction : undefined,
+        afterToolInstruction: lastAfterToolInstruction,
+    };
+}
+
 function parseModeratorDecision(rawText: string): CouncilModeratorDecision {
     const parsed = extractJsonObject(rawText);
     if (!parsed) {
@@ -418,57 +485,103 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
     }
     const maxRounds = Math.max(1, Math.min(params.maxRounds || DEFAULT_MAX_ROUNDS, 8));
     const maxToolCalls = Math.max(0, Math.min(params.maxToolCalls ?? DEFAULT_MAX_TOOL_CALLS, 10));
-    const largePrepared = await prepareCouncilLargeInputs(params);
-    const runParams = largePrepared.params;
-    const prepared = await prepareCouncilFiles({
-        files: runParams.files,
-        largeInput: runParams.largeInput,
-        onProgress: (message) => params.onProgress?.(`## 当前进度\n${message}`),
+    let effectiveParams: CouncilRunParams;
+    let transcript: CouncilTranscript;
+    let files: CouncilTranscript["files"];
+    let largeInputs: NonNullable<CouncilTranscript["largeInputs"]>;
+    let imagePaths: string[];
+    let imageObservations: string;
+    let textProjection: string | undefined;
+    let startRound = 1;
+
+    if (params.resumeState) {
+        const checkpoint = params.resumeState.checkpoint;
+        const resumedTranscript = cloneTranscript(params.resumeState.transcript);
+        resumedTranscript.rounds = roundsBeforeResumePoint(resumedTranscript.rounds, checkpoint);
+        resumedTranscript.terminationReason = "not-finished";
+        resumedTranscript.finalAnswer = "";
+        effectiveParams = { ...params, images: resumedTranscript.images };
+        transcript = {
+            ...resumedTranscript,
+            mode: effectiveParams.mode || resumedTranscript.mode,
+            input: effectiveParams.input,
+            contextMode: effectiveParams.contextMode || resumedTranscript.contextMode,
+            participants: effectiveParams.participants,
+            moderator: effectiveParams.moderator,
+        };
+        files = transcript.files;
+        largeInputs = transcript.largeInputs || [];
+        imagePaths = transcript.images;
+        imageObservations = transcript.imageObservations;
+        textProjection = transcript.textProjection;
+        startRound = getNextRoundFromCheckpoint(transcript, checkpoint);
+        emitProgress(params, transcript, `council resume 已读取旧任务 ${params.resumeState.sourceTaskId}，将从 Round ${startRound} 继续。`);
+    } else {
+        const largePrepared = await prepareCouncilLargeInputs(params);
+        const runParams = largePrepared.params;
+        const prepared = await prepareCouncilFiles({
+            files: runParams.files,
+            largeInput: runParams.largeInput,
+            onProgress: (message) => params.onProgress?.(`## 当前进度\n${message}`),
+        });
+        files = prepared.files;
+        largeInputs = [...largePrepared.largeInputs, ...prepared.largeInputs];
+        imagePaths = [...new Set([...(runParams.images || []).map((item) => path.resolve(item)), ...prepared.promotedImages])];
+        effectiveParams = imagePaths.length === (runParams.images || []).length
+            ? runParams
+            : { ...runParams, images: imagePaths };
+        imageObservations = await buildImageObservations(effectiveParams);
+        const sharedContextForProjection = buildSharedContext(effectiveParams);
+        textProjection = await buildOnlyTextProjection(effectiveParams, sharedContextForProjection, files, imageObservations);
+        transcript = {
+            id: newUuid(),
+            mode: effectiveParams.mode || "review",
+            input: effectiveParams.input,
+            contextMode: effectiveParams.contextMode || "summary",
+            participants: effectiveParams.participants,
+            moderator: effectiveParams.moderator,
+            files,
+            largeInputs,
+            images: imagePaths,
+            imageObservations,
+            textProjection,
+            rounds: [],
+            terminationReason: "not-finished",
+            finalAnswer: "",
+            createdAt: new Date().toISOString(),
+        };
+        emitProgress(params, transcript, "council 已完成输入、文件和图片准备；纯文本参与者的专用转述也已生成，准备开始第 1 轮参与者发言。");
+    }
+
+    writeCheckpoint(params, transcript, {
+        taskId: params.resumeState?.sourceTaskId,
+        currentRound: startRound,
+        lastCompletedRound: transcript.rounds.at(-1)?.round || 0,
+        phase: "prepared",
+        roundComplete: false,
     });
-    const files = prepared.files;
-    const largeInputs = [...largePrepared.largeInputs, ...prepared.largeInputs];
-    const imagePaths = [...new Set([...(runParams.images || []).map((item) => path.resolve(item)), ...prepared.promotedImages])];
-    const effectiveParams: CouncilRunParams = imagePaths.length === (runParams.images || []).length
-        ? runParams
-        : { ...runParams, images: imagePaths };
-    const imageObservations = await buildImageObservations(effectiveParams);
     const sharedContext = buildSharedContext(effectiveParams);
-    const textProjection = await buildOnlyTextProjection(effectiveParams, sharedContext, files, imageObservations);
     const participantContexts = new Map(effectiveParams.participants.map((participant) => [
         participant.id,
-        buildParticipantContext(effectiveParams, participant, sharedContext, files, imageObservations, textProjection),
+        buildParticipantContext(effectiveParams, participant, sharedContext, files, imageObservations, textProjection || ""),
     ]));
-    const moderatorContext = buildParticipantContext(effectiveParams, effectiveParams.moderator, sharedContext, files, imageObservations, textProjection);
-    const transcript: CouncilTranscript = {
-        id: newUuid(),
-        mode: effectiveParams.mode || "review",
-        input: effectiveParams.input,
-        contextMode: effectiveParams.contextMode || "summary",
-        participants: effectiveParams.participants,
-        moderator: effectiveParams.moderator,
-        files,
-        largeInputs,
-        images: imagePaths,
-        imageObservations,
-        textProjection,
-        rounds: [],
-        terminationReason: "not-finished",
-        finalAnswer: "",
-        createdAt: new Date().toISOString(),
-    };
-    emitProgress(params, transcript, "council 已完成输入、文件和图片准备；纯文本参与者的专用转述也已生成，准备开始第 1 轮参与者发言。");
+    const moderatorContext = buildParticipantContext(effectiveParams, effectiveParams.moderator, sharedContext, files, imageObservations, textProjection || "");
     const pressureInputs = hasPressureInputs(files, largeInputs, imagePaths);
     const modelTimeoutMs = getRunModelTimeoutMs(effectiveParams, pressureInputs);
     if (pressureInputs) {
         emitProgress(params, transcript, `检测到大输入/复杂文件/图片压力输入，正式模型调用超时已放宽到 ${Math.round(modelTimeoutMs / 1000)}s；仍可用 modelTimeoutMs、pressureModelTimeoutMs 或单个模型 params.timeoutMs 覆盖。`);
     }
 
-    let toolCallsUsed = 0;
-    let askTarget: string | undefined;
-    let askInstruction: string | undefined;
-    let afterToolInstruction: string | undefined;
+    let { toolCallsUsed, askTarget, askInstruction, afterToolInstruction } = restoreLoopState(transcript.rounds);
 
-    for (let round = 1; round <= maxRounds; round++) {
+    for (let round = startRound; round <= maxRounds; round++) {
+        writeCheckpoint(params, transcript, {
+            taskId: params.resumeState?.sourceTaskId,
+            currentRound: round,
+            lastCompletedRound: transcript.rounds.at(-1)?.round || 0,
+            phase: "participants",
+            roundComplete: false,
+        });
         const history = formatHistory(transcript.rounds);
         const activeParticipants = askTarget
             ? effectiveParams.participants.filter((p) => p.id === askTarget)
@@ -508,6 +621,22 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         askTarget = undefined;
         askInstruction = undefined;
         afterToolInstruction = undefined;
+        // 参与者返回后立即落盘半完成轮，确保 moderator 阶段被中断时 transcript 可 resume
+        const partialRoundEntry: CouncilTranscript["rounds"][number] = {
+            round,
+            messages,
+            moderator: { action: "continue", summary: "", rawText: "" },
+        };
+        const partialTranscript = cloneTranscript(transcript);
+        partialTranscript.rounds.push(partialRoundEntry);
+        savePartialTranscript(params, partialTranscript);
+        writeCheckpoint(params, transcript, {
+            taskId: params.resumeState?.sourceTaskId,
+            currentRound: round,
+            lastCompletedRound: transcript.rounds.at(-1)?.round || 0,
+            phase: "moderator",
+            roundComplete: false,
+        });
 
         let moderator: CouncilModeratorDecision = {
             action: "continue",
@@ -605,6 +734,14 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
         }
 
         transcript.rounds.push(roundEntry);
+        transcript = savePartialTranscript(params, transcript);
+        writeCheckpoint(params, transcript, {
+            taskId: params.resumeState?.sourceTaskId,
+            currentRound: round,
+            lastCompletedRound: round,
+            phase: "round_complete",
+            roundComplete: true,
+        });
         emitProgress(params, transcript, `Round ${round}: 已写入本轮讨论进度。`);
 
         if (moderator.action === "terminate") {
@@ -624,4 +761,11 @@ export async function runCouncil(params: CouncilRunParams): Promise<CouncilTrans
     }
     const saved = saveCouncilTranscript(transcript, params.transcriptPath, params.outputDir);
     return saved;
+}
+
+export async function resumeCouncil(params: CouncilRunParams): Promise<CouncilTranscript> {
+    if (!params.resumeState) {
+        throw new Error("resumeCouncil 需要 resumeState");
+    }
+    return runCouncil(params);
 }

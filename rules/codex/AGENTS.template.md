@@ -536,16 +536,16 @@
 ## 聊天与信息获取
 
 - 聊天时，如果用户提到的名词、现象、事件可能涉及实时信息，不要想当然，优先主动查证。
-- 需要网络搜索时，必须先使用 Exa MCP 的 `web_search_exa` 获取原始、结构化搜索结果；不要把可能先生成总结、容易混入幻觉的原生 web search / `search_web` / `web.run` 当作第一搜索入口。
+- 已配置且当前可见 Exa MCP 时，优先用 `web_search_exa` 获取原始、结构化搜索结果；未配置、不可用或无结果时，说明降级原因后使用宿主可用的搜索工具，不要因此阻塞任务。
 - `web-fetcher` 仍优先用于官方页面读取、网页正文提取、截图、登录态页面、文件下载和视觉检查；Exa 负责“找资料/找入口”，`web-fetcher` 负责“打开并核验证据”。
-- 对 OpenAI / ChatGPT / API / 模型发布 / 灰度传闻这类问题，也必须先用 Exa 搜索官方域名入口（如 `site:openai.com`、`site:developers.openai.com`、`site:help.openai.com`），再用官方文档、`openai-docs` skill 或 `web-fetcher` 核对；“官方文档优先”不等于可以跳过 Exa 直接用原生搜索。
+- 对 OpenAI / ChatGPT / API / 模型发布 / 灰度传闻这类问题，优先查官方域名入口，再用官方文档、`openai-docs` skill 或 `web-fetcher` 核对；Exa 可用时用它找入口，不可用时直接使用宿主可用搜索并限定官方域名。
 
 - 对论坛、多图网页、需要视觉判断的内容，优先考虑截图或结构化提取，而不是只依赖纯文本。
 - 能通过 MCP 复合操作提高效率时，优先用 MCP，不要无意义来回切换工具。
 
 - 如果一个问题明显具有时效性，就把“先查证”作为默认动作，而不是等用户特别提醒。
-- 触发 Exa 网络搜索时，优先把搜索意图翻译成英文，或翻译成更匹配目标资料来源的非中文语言后再检索；搜到结果后仍要打开关键来源核对，不要只复述搜索摘要。
-- 如果刚回答完就被用户指出“你又用了原生搜索 / 没按 Exa 规则”，必须先承认流程错误，然后按 Exa → 官方页 / `web-fetcher` 的正确链路重跑；不要只解释上一轮结论“大概仍可用”。
+- 使用 Exa 网络搜索时，优先把搜索意图翻译成英文，或翻译成更匹配目标资料来源的非中文语言后再检索；搜到结果后仍要打开关键来源核对，不要只复述搜索摘要。
+- 若用户要求使用 Exa 而上一轮错误降级，先承认流程错误，再按 Exa → 官方页 / `web-fetcher` 的链路重跑；如果 Exa 确实不可用，要把检查结果和替代链路说清楚。
 
 ## 用户画像与聊天偏好
 
@@ -601,8 +601,8 @@
 - worker 子代理必须明确写入范围和责任边界，并提醒其不要回退他人更改；多个 worker 的写入范围应尽量互不重叠。
 
 - explorer 子代理适合并行探索具体问题；主代理等待结果后要整合共识和冲突点，而不是重复做完全相同的探索。
-- 默认子代理配置优先使用 `gpt-5.4`、`reasoning_effort=high`；如果调用通道支持 speed tier，则开启 `fast`。仅在任务很轻、机械、低风险时才降级模型或思考额度。
-- Codex 当前限制：`fork_context=true` 会让子代理继承完整上下文，此时不要同时手动指定 `model` 或 `reasoning_effort`，否则 `spawn_agent` 会被拦截。需要指定 `gpt-5.4` / `reasoning_effort=high` 时，优先用 `fork_context=false`，再通过 `items` 或精简 `message` 只传必要材料；如果完整上下文比指定模型更重要，就保留 `fork_context=true`，让模型配置继承系统默认。
+- 子代理应显式选择接收方当前可用的模型与思考档位；探索任务优先轻量且可靠的模型，跨模块实现、视觉审查和高风险决策再提高能力档位。不要把发送方的模型名、价格或默认配额写进公开模板。
+- `fork_context=true` 会让子代理继承完整上下文；若当前接口不允许同时指定模型或思考档位，改用 `fork_context=false`，再通过 `items` 或精简 `message` 只传必要材料。完整背景比模型选择更重要时，保留上下文继承并接受宿主默认配置。
 - `fork_context` 用于让子代理继承当前对话上下文。复杂任务、需要理解用户长期偏好、需要沿用本轮讨论结论、需要处理用户中途提醒的 A+B+C+D 范围时，默认倾向开启 `fork_context=true`。
 - 独立小任务不必默认继承全量上下文，例如只读某个文件、只跑某条测试、只检查一个目录、只提取一段日志时，可以用 `fork_context=false`，再通过明确任务说明和 `items` 精准传入材料。
 - `items` 是给子代理的结构化输入，能用时应主动使用；适合传 `text` 摘录、`image` / `local_image` 截图或设计图、`skill` 工作流、`mention` 插件或连接器资源。它比把材料混在长提示里更清楚，也更利于子代理聚焦。
@@ -615,11 +615,10 @@
 
 ## 工具与 MCP 使用
 
-- 便携工具包默认将 MCP 源码放在 `<toolkit-root>\mcps`，运行数据放在 `%USERPROFILE%\.codex-toolkit`。如果接收方同时使用 Antigravity、Codex、Claude Code、Windsurf，可按说明配置四源数据互通；不要假设接收方拥有发送方的 Antigravity 数据目录。
-- Codex 侧本地 MCP 可通过 `%USERPROFILE%\.codex\mcp-http-broker` 或本工具包自带便携 broker 暴露为 Streamable HTTP；该 broker 全局复用每个 MCP 的后端进程，用于避免每个对话/子代理重复拉起 stdio wrapper。
-- Codex HTTP broker 的后端进程是共享的，不具备每个对话独立的“当前对话”状态；凡是会读取或写入当前对话的工具调用，都必须显式传稳定 `conversationId`。
-- Codex HTTP broker 下的持久资源也应显式带稳定 `ownerId`：`web_interact` / `web_pipeline` 的 session，`sandbox_session`，`sandbox_launch`，`sandbox_codex` 后台任务，`smart_search(background=true)`，`sandbox_council(background=true)`。未传时按 `global` 兼容旧调用，但不要跨 owner 读写或 kill/close。
-- 当前共享 MCP 正在增加双向跨链路访问能力；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex` 三个取值。
+- 接收方可按自己的安装说明配置 Codex、Antigravity、Claude Code 与 Windsurf 的共享 MCP；不要假设任何本机目录、端口、服务、账号或模型已经存在。
+- 共享 broker 的后端进程可能跨会话复用，不具备每个对话独立的「当前对话」状态；凡是会读取或写入当前对话的工具调用，都必须显式传稳定 `conversationId`。
+- 持久资源应显式带稳定 `ownerId`，例如网页 session、沙盒会话、长任务、后台搜索与 council；不要跨 owner 读写、关闭或终止资源。
+- 当工具支持 `chain` 参数时，只使用接收方已启用并声明支持的宿主值，例如 `auto`、`antigravity`、`codex`。
 - `chain="auto"` 表示优先使用当前宿主链路；当前宿主不可用或模型调用失败时才尝试另一侧链路。
 
 - `chain="antigravity"` 表示强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错。
@@ -634,38 +633,27 @@
 - 记录 Guard 自指循环后，可以继续推进不依赖该阶段完成状态的探索、资料整理或后续准备工作；不得把相关阶段标记为完成，不得删除 Guard 锁，不得把该类问题泛化成“Guard 可忽略”。下一次验收应带着小本本记录和已落盘证据重新执行 `stage_guard check`。
 - `stage_guard` 的对话数据必须绑定当前宿主的明确 `conversationId`，不要跨宿主操作异源 Guard；可通过 `modelChain` 选择审核模型。
 - `stage_guard` 同一 Task.md 支持多个 conversationId 独立锁块；`pass/cancel` 只应移除当前 Guard 锁，不应清掉其它对话仍活跃的锁。
-- Codex 链路的 MCP 模型桥默认使用 `gpt-5.5`、`model_reasoning_effort=medium`、`model_speed_tier=fast`；如需调试可通过各 MCP 的环境变量覆盖。
 - Codex 侧同步 MCP 调用存在宿主超时窗口；凡是 Record 生成、Stage Guard 检查、Golden Extract 这类长模型任务，优先使用后台模式，先拿 `taskId`，再用同工具的查询参数轮询结果，避免 transport closed 和僵尸模型桥。
 
-- Codex 侧 Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具是 `web_search_exa` 和 `web_fetch_exa`。它走 Antigravity 同步过来的 `mcp-remote` 托管配置；带 API Key 时优先走账户额度，余额耗尽会返回 `402`，不会自动切到匿名免费额度，去掉 Key 才会进入免费额度模式。
-- 对时效信息、泛网页资料、技术资料入口、公司/人物/论文/新闻搜索，默认且强制优先用 Exa；只有确认 Exa 工具不可见、连接失败、额度耗尽、无相关结果或需要交叉验证时，才允许降级到内置 web search / `search_web` / `web.run`、搜索引擎网页或其它搜索工具，并且必须在回复中说明降级原因和已尝试的 Exa 路径。
-- 当前会话暂时看不到 `web_search_exa` 时，不要立刻用原生 web search 顶上；先用可用的工具发现 / MCP 状态检查确认 Exa 是否已加载，或提示需要重载 / 新开会话。只有确认本轮确实无法使用 Exa，才可以带说明降级。
+- 已安装 Exa 时，对时效信息、泛网页资料、技术资料入口、公司、人物、论文和新闻优先使用其语义搜索，再打开关键页面核对。未安装、不可用、无结果或需要交叉验证时，说明原因后再使用宿主可用的搜索工具。
+- 当前会话看不到预期搜索工具时，不要无说明地换用另一个工具；先通过工具发现或状态检查确认能力边界，再带着降级原因继续。
 - 复杂项目任务开始前，优先用 `memory-store` 查询当前工作区背景；简单自包含任务可跳过。
 - 产生可复用的决策、踩坑经验、方案结论时，写回 `memory-store`，并尽量带上 `codex` 标签。
 
 - Codex wrapper 环境下不依赖 memory-store 的后台自动 Record；`conversation_read_original(action="fetch")` 可能触发后台 Record 刷新，但需要正式更新对话记录时仍要显式调用 `record_manage(action="update", dataChain="codex", modelChain="codex", conversationId="...", background=true)`，再用 `record_manage(action="task_status", taskId="...", waitSeconds=45)` 查询。
-- 需要当前信息的“搜索入口”时优先使用 Exa；需要网页截图、登录态页面、结构化网页抽取、本地文件网页化查看、下载或视觉检查时，优先使用 `web-fetcher`。
+- 需要当前信息时，优先使用接收方已安装的语义搜索；需要网页截图、受限页面、结构化网页抽取、本地文件网页化查看、下载或视觉检查时，优先使用已安装的 `web-fetcher`。
 
 - 复杂推理、多方案比较、长链分析时，优先使用 `sequential-thinking`。
 - 需要隔离执行、持久会话、并行执行或长任务托管时，优先使用 `sandbox`。
 - `sandbox_council` 是多模型会审工具，用来获取建议、方向和盲点；适合不需要用户先决策的局部方案设计、需要延展性的设计讨论、架构取舍、风险盲点排查和 Guard 式复核。
-- 使用 `sandbox_council` 时，优先混用不同模型来源形成视角差异，例如 Claude、Gemini、GPT/Codex 或 Antigravity 可用模型；它输出的是建议材料，不替代主代理的最终判断、取舍、验证和落地。
+- 使用 `sandbox_council` 时，优先混用接收方已配置的模型来源形成视角差异，例如 Grok/ProGrok、Claude、Gemini 或 Codex；它输出的是建议材料，不替代主代理的最终判断、取舍、验证和落地。
 - 需要多模型交叉验证、红蓝黑对抗审题、设计审议或 Guard 式检查时，使用 `sandbox_council`。
   - 后台模式：`sandbox_council(background=true, ownerId="...")` 启动后，用同一个 `ownerId` 查询：`sandbox_council(taskId="...", ownerId="...", waitSeconds=45)`；不要因为漏传 `ownerId` 查不到任务或进度，就重复启动新的 council。
   - council 在后台运行时，主线程可以继续做不重叠的本地检查、读文件、构建、整理证据或修补规则；不要重复做 council 已承担的模型审议，等它返回后再合并观点并由主代理自行验证取舍。
-  - provider 并发限制：antigravity 默认同源并发 2，codex 默认同源并发 2；超限会排队，不会报错。
-  - HTTP/空输出/超时类错误会自动有限重试。
-  - provider fallback：`params.fallbackModels` 可配置同 provider 降级链；主模型 retry 后仍遇到超时、429、5xx、空输出、连接中断这类临时错误时，才切到备用模型。API key 缺失、参数错误、安全拦截、输出截断等不要自动降级。
-  - Antigravity/OpenAI/Anthropic/Gemini/custom provider 的 fallback 不会凭模型名自动发生，必须在对应 participant/moderator 的 `params.fallbackModels` 显式写出；例如 Antigravity Claude/Sonnet 不稳定时可用 `{"model":"sonnet","provider":"antigravity","params":{"retries":1,"fallbackModels":["M37","M18","flash"]}}`。没有 `params.fallbackModels` 时只重试当前模型。
-  - Codex provider 未显式传 `params.fallbackModels` 时会自动按 `gpt-5.4 high → gpt-5.4 medium → gpt-5.4 low → gpt-5.4-mini medium → gpt-5.4-mini low` 降级，并跳过当前已使用档位；主持模型失败时先走 provider fallback，全部失败后再用规则兜底汇总已有参与者意见。
-  - Gemini 优先链路：需要 Gemini 作为 council 正式参与者或主持人时，优先考虑 `provider="geminiCli"`，这是本地 Gemini CLI 路线；`supportsVision=true` 时可直接处理图片路径，响应落到 `sandbox-data/temp/council-model-calls` 临时文件。旧 `provider="gemini"` 仍保留为 Gemini API 路线，需要 `GEMINI_API_KEY`。
-  - Gemini CLI provider 未显式传 `params.fallbackModels` 时会自动按 `auto-gemini-3 → gemini-3.1-pro-preview → gemini-2.5-pro → gemini-3.1-flash-lite-preview → gemini-2.5-flash-lite` 降级；可用 `SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS=0` 关闭。Gemini CLI provider 默认 `approvalMode=yolo`，可用 `params.approvalMode` 或 `SANDBOX_COUNCIL_GEMINI_CLI_APPROVAL_MODE` 覆盖；provider/indexer 的临时 prompt/artifact 会写到 Gemini 允许访问的项目临时目录。若超时时标记结果已经写好，宿主会直接收结果并清理进程树。
-  - 复杂文件索引：PDF/Word/Excel/EPUB/视频等复杂文件优先用 Gemini CLI agentic 建临时索引，失败后 fallback 到 Codex CLI，再失败时常见格式走本地结构化兜底；两种 CLI 的完整索引都必须写入 `sandbox-data/temp/council-indexes` 临时 Markdown，stdout/stderr 只保留短状态，宿主会校验文件存在、大小上限和 `<<<COUNCIL_INDEX>>>` 标记，避免把大索引堆在内存里。
-  - 大输入分块索引：`input`、`manualContext`、超长纯文本文件和 CSV 超过阈值时，council 会写入 `sandbox-data/temp/council-large-inputs`，生成 source 原文、checkpoint JSON 和 LargeInputIndex Markdown；chunk 按真实字符切分并保留相邻 overlap，模型上下文只收到索引摘录和临时文件路径，避免把全文堆进上下文。可用 `largeInput` 参数或 `SANDBOX_COUNCIL_LARGE_INPUT_*` 环境变量调整阈值、chunk 大小、overlap 和索引摘录长度。
-  - 压力输入超时：当存在大输入索引、复杂文件索引或图片时，正式模型调用默认从 120s 放宽到 600s；可用 `modelTimeoutMs`、`pressureModelTimeoutMs`、`SANDBOX_COUNCIL_MODEL_TIMEOUT_MS`、`SANDBOX_COUNCIL_PRESSURE_MODEL_TIMEOUT_MS` 或单模型 `params.timeoutMs` 覆盖。后台任务默认 deadline 为 45 分钟，可用 `SANDBOX_COUNCIL_BACKGROUND_MAX_RUN_MS` 覆盖。
-  - CLI 文件索引也有独立 retry/fallback：Gemini 默认优先 `auto-gemini-3` / `gemini-3.1-pro-preview` / `gemini-2.5-pro`，实测慢挂的 `gemini-2.5-flash` 已从默认链移除；Codex 默认 `gpt-5.4:medium → gpt-5.4:low → gpt-5.4-mini:medium → gpt-5.4-mini:low`。可用 `SANDBOX_COUNCIL_GEMINI_INDEX_MODELS`、`SANDBOX_COUNCIL_GEMINI_INDEX_APPROVAL_MODES`、`SANDBOX_COUNCIL_CODEX_INDEX_MODELS`、`SANDBOX_COUNCIL_CLI_INDEX_RETRIES` 覆盖。
-  - 主持人可调用 `webSearch`（默认优先 Exa MCP，失败或无结果时降级到 360/Bing HTML fallback）、`webFetchText`、`simpleScript`（Node/Python 受限沙盒）。
-  - 参与者不能调用工具，只有主持人能发起工具调用和决定讨论终止。
+  - provider 的并发数、重试与工具权限由接收方当前安装决定；不把运行环境的实际限制、模型名、临时目录或凭据写进公开模板。
+  - `params.fallbackModels` 可配置同 provider 的降级链，仅在临时网络、超时或空输出错误后使用；参数错误、权限不足、安全拦截和输出截断应直接报告。
+  - 大输入或复杂文件先建立受控索引或摘要，避免把全文塞进上下文；临时产物留在接收方可清理的工作目录。
+  - 主持者与参与者能否调用搜索、抓取或受限脚本，以当前接口声明为准。
 
 - 除非用户明确要求，不要修改 Antigravity 侧的 MCP 源码、配置文件或运行时数据结构。
 
@@ -687,18 +675,18 @@
 - 在 Codex 侧使用 `conversation_read_original(action="fetch|search|read")`、`conversation_golden_extract`、`record_manage(action="update")`、`stage_guard(action="start|status|check|cancel")` 时必须显式传入稳定的 `conversationId`；HTTP broker 会硬拦截缺少 `conversationId` 的高风险调用。
 - 如果不知道当前线程 ID，先用 `conversation_read_original(action="list", dataChain="codex", query="标题或关键词", contextProbe="当前可见聊天中50-120字独特片段")` 定位完整 ID；`contextProbe` 会硬匹配 Codex 本地 JSONL 并标记 direct/parent/root/child 候选，但不会自动选中。定位后再把同一个 ID 用于后续 `fetch/search/read/update/start/status/check/cancel`。
 
-- 在 Codex 侧需要持久化当前对话过程时，先定位稳定 `conversationId`，再显式调用 `record_manage(action="update", dataChain="codex", modelChain="codex", conversationId="...", background=true, parallelMode="auto")`；Codex 后台 Record 单批模型调用默认允许 8 分钟，可用 `MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT` 覆盖；不要假设普通 memory-store 查询会自动触发 Record 更新。
+- 在 Codex 侧需要持久化当前对话过程时，先定位稳定 `conversationId`，再显式调用 `record_manage` 的后台更新；不要假设普通 memory-store 查询会自动触发 Record 更新。
 - 读取超长 Record 时，优先用 `record_manage(read)` 的结构化参数，而不是整篇读取：`view="outline|state|outputs|lessons|risks|verification|phase|custom"`、`phaseIds`、`sectionTypes`、`include/exclude`、`maxChars`、`withCitations`、`indexMode` 可按 Phase / section 局部读取；Record markdown 仍是唯一事实源，reader index / guide 只是派生导航。
 - 在指定 Record 内搜索时，优先用 `record_manage(search, conversationId|recordIds, sectionTypes, phaseIds, searchScope="record|phase|section|item")` 获取 block 级 provenance 与 `readHint`；不带结构化参数时保持旧整篇 Record 搜索。
 - `record_manage(action="guide")` 只用于长 Record 的带读导航，输出推荐 `readHint` / `searchHint` / provenance；禁止把 guide 当成事实摘要或写回正式 Record。
 - `record_manage(list/search, scope="workspace")` 默认严格只读指定 workspace，不再混入 `general`；需要旧的 workspace + general 合并视图时必须显式传 `includeGeneral=true`。`general` 记录不会被默认强迁移到当前 workspace，修复前先用 `audit_ownership` / `repair_ownership(dryRun=true)` 看证据，不要口头声称已经迁移。
-- `audit_ownership` 只读检测 duplicate / migratable / conflict / unknown；`repair_ownership` 默认 `dryRun=true`，首版只 copy/upsert，不删除来源副本，归属判断只看 `workspaceUri`、Codex `cwd`、parent/root 派生关系和同 ID 副本，不按标题或正文语义猜测。看到 `\\?\C:\...` 与普通 `C:\...`、大小写或分隔符差异时，先按路径别名归一化理解，不要直接当成两个工作区。
+- `audit_ownership` 用于只读检测 duplicate / migratable / conflict / unknown；`repair_ownership` 应先以 `dryRun=true` 预览，首版只 copy/upsert，不删除来源副本。归属判断只看工作区标识、派生关系和同 ID 副本，不按标题或正文语义猜测。
 - 在 Codex 侧执行 `stage_guard(action="check", modelChain="codex", conversationId="...")` 时，优先传 `background=true`；随后用 `stage_guard(action="check", taskId="...", waitSeconds=45)` 轮询。同步 `check` 只作为短任务或快速失败兜底。
 
 - 在 Codex 侧执行 `conversation_golden_extract(dataChain="codex", modelChain="codex", conversationId="...")` 时，长对话优先传 `background=true`；随后用 `conversation_golden_extract(taskId="...", waitSeconds=45)` 轮询。
 - 在 Codex 侧执行 `web_fetch_page(outputMode="ai_summary", modelChain="codex")` 时，长网页优先传 `background=true`；随后用 `web_fetch_page(taskId="...", waitSeconds=45)` 轮询摘要结果。
 - 在 Codex 侧执行 `smart_search(mode="smart", modelChain="codex")` 时，大目录或长文件优先传 `background=true`；随后用 `smart_search(taskId="...", waitSeconds=45)` 轮询结果。`sandbox_codex` 本身已有独立后台任务机制。
-- `web-fetcher` 的 Cookie/localStorage 是全局共享登录态；`sandbox_launch` 是显式长期任务。不要把这些持久资源当作普通僵尸进程自动清理，应通过对应 `status/list/close/kill/clean` 管理。
+- 网页会话与长任务都是持久资源，不要把它们当作普通僵尸进程自动清理，应通过对应的 `status/list/close/kill/clean` 管理，并按 `ownerId` 隔离。
 - 后台任务轮询不要把 `waitSeconds` 设到 60 秒以上；Codex MCP 客户端自身通常有约 60 秒请求上限，建议用 30-45 秒短轮询。
 - 在 Codex 侧不要使用 `record_manage(action="batch_update|batch_delete", chain="codex")`；这类批量操作在共享后端里是全局任务，容易跨对话影响。需要更新记录时按单个 `conversationId` 执行。
 
@@ -732,7 +720,7 @@
 
 ## web-fetcher 与浏览器能力
 
-- 默认优先使用 `web-fetcher` 处理网页和本地文件操作，因为它更快，并且可复用持久化登录态。
+- 默认优先使用已安装的 `web-fetcher` 处理网页和本地文件操作；是否可复用会话或访问受限内容取决于接收方的授权与配置。
 - 目标明确的网页文本提取、截图、文件预览、表格提取、页面交互、本地文件查看，优先用 `web-fetcher`。
 
 - 需要检查网页、PDF、PPTX 的结构、重叠、溢出、可读性、一致性或 AI 视觉审查时，优先用 `web_inspect`；需要局域截图或截图对比时，优先用 `web_fetch_screenshot` 的 `target`、`scale`、`diff` 参数。
@@ -746,15 +734,15 @@
 - Electron / Chromium / CEF 应用推荐：`desktop_launch(kind="native")` 启动 + `--remote-debugging-port` + `desktop_connect_cdp` 附着，获得 DOM、结构树、截图、点击输入、evaluate 等接近网页测试的能力。
 - 普通 Windows exe 走 Windows UI Automation 控件树 + 截图 + 坐标点击 + 快捷键，能力为 best-effort / partial。
 - `desktop_register_window` 可将 Electron renderer 注册为 `web_interact` session，复用网页侧 content/click/type/evaluate 等动作。关闭 web alias 不会误关真实桌面窗口。
-- Desktop 状态独立于 `browserManager`，不污染网页会话、Cookie、profile。
+- Desktop 状态独立于浏览器管理器，不污染网页会话或接收方配置。
 
 ### Session 管理与 Pipeline 复用
 
 - `web_list_sessions`：列出当前 ownerId 下的活跃 session（URL、创建时间等）。
 - `web_close_sessions`：按 sessionId 或 `closeAllForOwner=true` 关闭会话，按 ownerId 隔离，不会跨 owner 关闭。
-- `web_pipeline(sessionId=...)` 支持复用已有 session，避免每次创建新页面丢失登录态或弹窗上下文。
+- `web_pipeline(sessionId=...)` 支持复用已有 session，避免每次创建新页面丢失弹窗或交互上下文。
 - `web_interact(action="snapshot")` 一次返回截图、可见文本和 DOM 摘要，减少多次调用往返。
-- `web_login_browser` 支持后台模式（`background=true` + `taskId` + `waitSeconds`），Codex 侧推荐优先使用后台模式避免同步调用 60 秒超时截断。
+- 需要用户授权的浏览器配置操作应由接收方自行完成；若当前接口支持后台模式，优先用 `background=true`、`taskId` 与短轮询避免同步超时。
 
 ## Skills
 
@@ -778,8 +766,8 @@
 - 调用工具失败时可以重试，但要基于错误信息调整方法，不要机械重复。
 - 工具失败时必须按能力边界降级，而不是随机换工具：
   - `web-fetcher` 抽取/截图失败时，先看错误和页面类型，再换 Browser Use / Playwright 做真实浏览器操作。
-  - Exa MCP 搜索失败、额度耗尽或当前会话暂时看不到 `web_search_exa` 时，先确认 broker 是否有 `/exa/mcp` endpoint，并优先尝试工具发现 / 重载 / 新开 Codex 会话；不能一边知道 Exa 规则存在，一边无说明地直接使用内置 web search / `search_web` / `web.run`。
-  - 因 Exa 不可用而必须降级时，要在动手前或结果中明确说“Exa 当前不可用/未加载/无结果，所以临时降级到 X”，并保留后续用 Exa 复核的待办；用户质疑工具链时，应立即重跑正确链路。
+  - Exa 或其他首选搜索工具失败、未安装或当前会话暂时不可见时，先做工具发现或状态检查；确认不可用后说明原因，再临时使用宿主可用的搜索工具。
+  - 因首选工具不可用而必须降级时，要在动手前或结果中说明原因和替代方案，并保留必要的后续复核。
   - `smart_search` 语义搜索失败或过慢时，先用 `rg` / 文件结构搜索缩小范围，再必要时回到 smart。
   - MCP 后台任务超时先查 `taskId` 状态，不要重复启动同一长任务。
   - 子代理结果证据不足时，优先让原子代理补充或另派独立子代理复核；如果结论影响主线决策，主代理必须亲自抽样验证。
@@ -829,7 +817,7 @@
 - 默认编码是 UTF-8。
 
 - 可以且应当使用 `rg` 命令进行代码搜索。
-- 可以并且应更积极地派遣子 agent。默认采用 `gpt-5.4`、`reasoning_effort=high`；如果工具或模型桥支持 speed tier，则开启 `fast`。使用子 agent 时应耐心等待返回，可中途查看进度，并深度复核其工作成果。
+- 可以并且应更积极地派遣子 agent。根据当前可用模型和任务复杂度显式选择思考档位；使用子 agent 时应耐心等待返回，可中途查看进度，并深度复核其工作成果。
 
 - 使用 Playwright 时应操控 Edge 浏览器。
 - Codex 侧会存在子代理线程和 exec 线程；涉及历史对话、审核报告或模型桥结果时，要明确它们是否属于主线程正文还是外链附件。

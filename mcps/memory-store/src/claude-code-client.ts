@@ -115,6 +115,7 @@ export interface ClaudeCodeDeepLocateOptions {
 
 const CLAUDE_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CC_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
 const CLAUDE_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CC_JSONL_MAX_LINE_CHARS || 16 * 1024 * 1024);
+const CLAUDE_JSONL_YIELD_EVERY_LINES = Math.max(1, Number(process.env.MEMORY_STORE_CC_JSONL_YIELD_EVERY_LINES || 256) || 256);
 const CLAUDE_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CC_TEXT_FIELD_MAX_CHARS || 200_000);
 const CLAUDE_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CLAUDE_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS || 12_000);
@@ -186,6 +187,14 @@ function claudeDesktopIndexRoots(): string[] {
 function safeStat(filePath: string): fs.Stats | null {
     try {
         return fs.statSync(filePath);
+    } catch {
+        return null;
+    }
+}
+
+async function safeStatAsync(filePath: string): Promise<fs.Stats | null> {
+    try {
+        return await fs.promises.stat(filePath);
     } catch {
         return null;
     }
@@ -362,10 +371,22 @@ function parseJsonLine(line: string): any | null {
     }
 }
 
+interface JsonlLineReadOptions {
+    maxBytes?: number;
+    tailOnly?: boolean;
+    maxLineChars?: number;
+}
+
+type JsonlLineCallback = (line: string, lineNo: number, byteOffset: number) => boolean | void;
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise(resolve => globalThis.setImmediate(resolve));
+}
+
 function readJsonlLines(
     filePath: string,
-    onLine: (line: string, lineNo: number, byteOffset: number) => boolean | void,
-    options: { maxBytes?: number; tailOnly?: boolean; maxLineChars?: number } = {},
+    onLine: JsonlLineCallback,
+    options: JsonlLineReadOptions = {},
 ): { scannedBytes: number; lines: number } {
     const stat = safeStat(filePath);
     if (!stat?.isFile()) return { scannedBytes: 0, lines: 0 };
@@ -419,6 +440,78 @@ function readJsonlLines(
         }
     } finally {
         fs.closeSync(fd);
+    }
+
+    return { scannedBytes, lines: lineNo };
+}
+
+async function readJsonlLinesAsync(
+    filePath: string,
+    onLine: JsonlLineCallback,
+    options: JsonlLineReadOptions = {},
+): Promise<{ scannedBytes: number; lines: number }> {
+    const stat = await safeStatAsync(filePath);
+    if (!stat?.isFile()) return { scannedBytes: 0, lines: 0 };
+    const maxBytes = options.maxBytes && options.maxBytes > 0 ? Math.min(options.maxBytes, stat.size) : stat.size;
+    const startOffset = options.tailOnly && stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const handle = await fs.promises.open(filePath, "r");
+    const buffer = Buffer.alloc(Math.max(64 * 1024, CLAUDE_JSONL_READ_CHUNK_BYTES));
+    const decoder = new StringDecoder("utf8");
+    let position = startOffset;
+    let pending = "";
+    let lineNo = 0;
+    let lineOffset = startOffset;
+    let scannedBytes = 0;
+    let linesSinceYield = 0;
+    let keepGoing = true;
+
+    const maybeYield = async (force = false) => {
+        if (!force && linesSinceYield < CLAUDE_JSONL_YIELD_EVERY_LINES) return;
+        linesSinceYield = 0;
+        await yieldToEventLoop();
+    };
+
+    try {
+        while (keepGoing && scannedBytes < maxBytes) {
+            const toRead = Math.min(buffer.length, maxBytes - scannedBytes);
+            const { bytesRead } = await handle.read(buffer, 0, toRead, position);
+            if (bytesRead <= 0) break;
+            const chunk = decoder.write(buffer.subarray(0, bytesRead));
+            pending += chunk;
+            position += bytesRead;
+            scannedBytes += bytesRead;
+
+            let newlineIndex = pending.indexOf("\n");
+            while (newlineIndex >= 0) {
+                let rawLine = pending.slice(0, newlineIndex);
+                if (rawLine.endsWith("\r")) rawLine = rawLine.slice(0, -1);
+                const rawWithNl = pending.slice(0, newlineIndex + 1);
+                const currentOffset = lineOffset;
+                lineOffset += Buffer.byteLength(rawWithNl, "utf8");
+                pending = pending.slice(newlineIndex + 1);
+                lineNo += 1;
+                if (rawLine.length <= (options.maxLineChars || CLAUDE_JSONL_MAX_LINE_CHARS)) {
+                    keepGoing = onLine(rawLine, lineNo, currentOffset) !== false;
+                    linesSinceYield += 1;
+                    if (!keepGoing) break;
+                    await maybeYield();
+                }
+                newlineIndex = pending.indexOf("\n");
+            }
+            if (pending.length > (options.maxLineChars || CLAUDE_JSONL_MAX_LINE_CHARS)) {
+                lineOffset += Buffer.byteLength(pending, "utf8");
+                pending = "";
+            }
+            if (keepGoing) await maybeYield(true);
+        }
+        const tail = decoder.end();
+        if (keepGoing && tail) pending += tail;
+        if (keepGoing && pending.trim()) {
+            lineNo += 1;
+            onLine(pending.replace(/\r$/u, ""), lineNo, lineOffset);
+        }
+    } finally {
+        await handle.close();
     }
 
     return { scannedBytes, lines: lineNo };
@@ -1025,7 +1118,17 @@ export function discoverClaudeCodeLogicalChain(
     };
 }
 
-function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: ConversationRound[]; totalSteps: number } {
+interface ClaudeCodeRoundBuildResult {
+    rounds: ConversationRound[];
+    totalSteps: number;
+}
+
+interface ClaudeCodeRoundsBuilder {
+    handleLine: JsonlLineCallback;
+    finish: () => ClaudeCodeRoundBuildResult;
+}
+
+function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeCodeRoundsBuilder {
     const rounds: ConversationRound[] = [];
     const toolCallMap = new Map<string, { round: ConversationRound; index: number }>();
     let currentRound: ConversationRound | null = null;
@@ -1079,7 +1182,7 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
         }
     };
 
-    readJsonlLines(jsonlPath, (line, lineNo, byteOffset) => {
+    const handleLine: JsonlLineCallback = (line, lineNo, byteOffset) => {
         stepIndex += 1;
         const event = parseJsonLine(line);
         if (!event) return;
@@ -1198,10 +1301,27 @@ function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): { rounds: Conve
                 textSummary: stringifyCompact(event, 500),
             });
         }
-    });
+    };
 
-    pushCurrent();
-    return { rounds, totalSteps: stepIndex };
+    return {
+        handleLine,
+        finish: () => {
+            pushCurrent();
+            return { rounds, totalSteps: stepIndex };
+        },
+    };
+}
+
+function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): ClaudeCodeRoundBuildResult {
+    const builder = createClaudeCodeRoundsBuilder(jsonlPath, cwd);
+    readJsonlLines(jsonlPath, builder.handleLine);
+    return builder.finish();
+}
+
+async function buildClaudeCodeRoundsAsync(jsonlPath: string, cwd?: string): Promise<ClaudeCodeRoundBuildResult> {
+    const builder = createClaudeCodeRoundsBuilder(jsonlPath, cwd);
+    await readJsonlLinesAsync(jsonlPath, builder.handleLine);
+    return builder.finish();
 }
 
 function cloneRoundWithLogicalOffsets(
@@ -1230,7 +1350,7 @@ function cloneRoundWithLogicalOffsets(
 function buildClaudeCodeLogicalConversation(
     target: ClaudeCodeThreadInfo,
     info: ClaudeCodeLogicalChainInfo,
-): { rounds: ConversationRound[]; totalSteps: number } {
+): ClaudeCodeRoundBuildResult {
     const mergedSegments = info.segments.filter(segment => segment.role === "predecessor-merged");
     const orderedThreads = [
         ...mergedSegments
@@ -1295,6 +1415,74 @@ function buildClaudeCodeLogicalConversation(
     return { rounds, totalSteps };
 }
 
+async function buildClaudeCodeLogicalConversationAsync(
+    target: ClaudeCodeThreadInfo,
+    info: ClaudeCodeLogicalChainInfo,
+): Promise<ClaudeCodeRoundBuildResult> {
+    const mergedSegments = info.segments.filter(segment => segment.role === "predecessor-merged");
+    const orderedThreads = [
+        ...mergedSegments
+            .sort((a, b) => (a.thread.updatedAtMs || 0) - (b.thread.updatedAtMs || 0))
+            .map(segment => segment.thread),
+        target,
+    ];
+    const rounds: ConversationRound[] = [];
+    let totalSteps = 0;
+    let roundOffset = 0;
+    let stepOffset = 0;
+    for (const thread of orderedThreads) {
+        const built = await buildClaudeCodeRoundsAsync(thread.jsonlPath, thread.cwd);
+        const segmentLabel = thread.id === target.id
+            ? `目标物理对话 ${thread.id}`
+            : `前序续聊候选 ${thread.id}`;
+        const startRound = roundOffset + 1;
+        for (const [index, round] of built.rounds.entries()) {
+            const cloned = cloneRoundWithLogicalOffsets(round, roundOffset, stepOffset);
+            if (index === 0) {
+                cloned.fileViews = [
+                    {
+                        stepIndex: cloned.startStep,
+                        kind: "claude-code-logical-chain-segment",
+                        title: segmentLabel,
+                        textSummary: [
+                            `title=${thread.title || "(无标题)"}`,
+                            `cwd=${thread.cwd || "(未知)"}`,
+                        ].join(" | "),
+                    },
+                    ...(cloned.fileViews || []),
+                ];
+            }
+            rounds.push(cloned);
+        }
+        roundOffset += built.rounds.length;
+        stepOffset += built.totalSteps;
+        totalSteps += built.totalSteps;
+        if (built.rounds.length === 0) {
+            rounds.push({
+                roundIndex: startRound,
+                startStep: stepOffset,
+                endStep: stepOffset,
+                userMessage: `（逻辑续聊片段无可解析轮次：${thread.id}）`,
+                mediaAttachments: [],
+                attachments: [],
+                aiResponses: [],
+                toolCalls: [],
+                taskBoundaries: [],
+                codeActions: [],
+                subagentSummaries: [],
+                fileViews: [{
+                    stepIndex: stepOffset,
+                    kind: "claude-code-logical-chain-segment-empty",
+                    title: segmentLabel,
+                    textSummary: thread.jsonlPath,
+                }],
+            });
+            roundOffset += 1;
+        }
+    }
+    return { rounds, totalSteps };
+}
+
 export function loadClaudeCodeConversation(
     conversationId: string,
     options: { logicalChain?: ConversationLogicalChainMode } = {},
@@ -1308,6 +1496,27 @@ export function loadClaudeCodeConversation(
     const built = logicalChain?.merged
         ? buildClaudeCodeLogicalConversation(thread, logicalChain)
         : buildClaudeCodeRounds(thread.jsonlPath, thread.cwd);
+    return {
+        thread,
+        rounds: built.rounds,
+        totalSteps: built.totalSteps,
+        logicalChain: logicalChain || undefined,
+    };
+}
+
+export async function loadClaudeCodeConversationAsync(
+    conversationId: string,
+    options: { logicalChain?: ConversationLogicalChainMode } = {},
+): Promise<ClaudeCodeConversationData | null> {
+    const thread = getClaudeCodeThread(conversationId);
+    if (!thread?.jsonlPath) return null;
+    const logicalMode = options.logicalChain || "off";
+    const logicalChain = logicalMode === "off"
+        ? undefined
+        : discoverClaudeCodeLogicalChain(thread.id, logicalMode);
+    const built = logicalChain?.merged
+        ? await buildClaudeCodeLogicalConversationAsync(thread, logicalChain)
+        : await buildClaudeCodeRoundsAsync(thread.jsonlPath, thread.cwd);
     return {
         thread,
         rounds: built.rounds,

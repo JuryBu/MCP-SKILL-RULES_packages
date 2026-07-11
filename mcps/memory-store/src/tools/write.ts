@@ -7,17 +7,20 @@ import {
     generateMemoryId,
     buildMemoryFile,
     writeMemoryFile,
-    readMemoryFile,
     mutateWorkspaceIndex,
     syncGlobalIndexForWorkspace,
     countLines,
     readConfig,
-    parseMemoryFile,
     type MemoryFrontmatter,
 } from "../store.js";
 import { type MemoryIndexEntry } from "../cache.js";
 import { checkDuplicates } from "../search.js";
-import { generateAutoSummary } from "../auto-summary.js";
+import {
+    captureAutoSummarySnapshot,
+    generateAutoSummary,
+    writeAutoSummaryIfUnchanged,
+    type AutoSummarySnapshot,
+} from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
@@ -93,6 +96,12 @@ export function registerWrite(server: McpServer): void {
                 // 构建并写入文件
                 const fileContent = buildMemoryFile(frontmatter, content);
                 writeMemoryFile(hash, id, fileContent);
+                const autoSummarySnapshot = captureAutoSummarySnapshot({
+                    title: frontmatter.title,
+                    tags: frontmatter.tags,
+                    updated: frontmatter.updated,
+                    body: content,
+                });
 
                 // 更新索引（串行化读改写，防并发丢条目）
                 const indexEntry: MemoryIndexEntry = {
@@ -133,7 +142,7 @@ export function registerWrite(server: McpServer): void {
                 const searchSummaryNote = actualSearchSummary ? "" : "\n🤖 autoSummary 正在后台生成...";
 
                 // v1.5: 异步生成 autoSummary（不阻塞返回）
-                triggerAutoSummary(hash, id, title, tags, content, resolveModelOnlyChainSplit({ chain, modelChain }).modelChain).catch(() => {});
+                triggerAutoSummary(hash, id, autoSummarySnapshot, resolveModelOnlyChainSplit({ chain, modelChain }).modelChain).catch(() => {});
 
                 return appendTiming({
                     content: [{
@@ -160,50 +169,29 @@ export function registerWrite(server: McpServer): void {
 async function triggerAutoSummary(
     hash: string,
     memoryId: string,
-    title: string,
-    tags: string[],
-    content: string,
+    snapshot: AutoSummarySnapshot,
     chain: Chain
 ): Promise<void> {
     try {
-        const summary = await generateAutoSummary(title, tags, content, chain);
+        const summary = await generateAutoSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
         if (!summary) return; // LS 不可用，静默跳过
 
-        // 读取当前文件并重建（加入 autoSummary）
-        const fileContent = readMemoryFile(hash, memoryId);
-        if (!fileContent) return;
-
-        const parsed = parseMemoryFile(fileContent);
-        if (!parsed) return;
-
-        const fm = parsed.frontmatter;
-        const newFrontmatter: MemoryFrontmatter = {
-            id: String(fm.id || memoryId),
-            title: String(fm.title || title),
-            tags: (Array.isArray(fm.tags) ? fm.tags : tags) as string[],
-            category: String(fm.category || "general"),
-            created: String(fm.created || new Date().toISOString()),
-            updated: String(fm.updated || new Date().toISOString()),
-            workspace: String(fm.workspace || "general"),
-            conversationId: fm.conversationId ? String(fm.conversationId) : undefined,
-            searchSummary: String(fm.searchSummary || ""),
-            autoSummary: summary,
-            pinned: fm.pinned === true ? true : undefined,
-        };
-
-        const newContent = buildMemoryFile(newFrontmatter, parsed.body);
-        writeMemoryFile(hash, memoryId, newContent);
-
-        // 更新索引中的 autoSummary（串行化读改写）
-        await mutateWorkspaceIndex(hash, (wsIndex) => {
-            const indexEntry = wsIndex.entries.find(e => e.id === memoryId);
-            if (indexEntry) {
-                indexEntry.autoSummary = summary;
-                indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
-            }
+        const result = await writeAutoSummaryIfUnchanged({
+            hash,
+            memoryId,
+            summary,
+            expectedFingerprint: snapshot.fingerprint,
+            fallbackTitle: snapshot.title,
+            fallbackTags: snapshot.tags,
         });
+        if (result === "written") {
+            console.error(`[memory-store] ✅ autoSummary 已生成: ${memoryId} (${summary.length}字)`);
+            return;
+        }
 
-        console.error(`[memory-store] ✅ autoSummary 已生成: ${memoryId} (${summary.length}字)`);
+        if (result !== "existing") {
+            console.error(`[memory-store] autoSummary 已跳过: ${memoryId} (${result})`);
+        }
     } catch (err) {
         console.error(`[memory-store] autoSummary 生成失败: ${err instanceof Error ? err.message : String(err)}`);
     }

@@ -87,7 +87,13 @@ function geminiCliAccessibleTempDir(cwd: string, childDir: string): string {
     const configured = process.env.SANDBOX_COUNCIL_GEMINI_CLI_TEMP_DIR;
     const base = configured && configured.trim()
         ? configured.trim()
-        : path.join(os.homedir(), ".gemini", "tmp", safeGeminiTempProjectName(cwd));
+        : path.join(
+            process.env.SANDBOX_DATA_ROOT
+                || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data"),
+            "temp",
+            "gemini-cli",
+            safeGeminiTempProjectName(cwd),
+        );
     const dir = path.join(base, childDir);
     fs.mkdirSync(dir, { recursive: true });
     return dir;

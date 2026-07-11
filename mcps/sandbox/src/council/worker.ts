@@ -1,16 +1,22 @@
 #!/usr/bin/env node
 import fs from "fs";
-import { runCouncil } from "./engine.js";
+import { resumeCouncil, runCouncil } from "./engine.js";
 import { finalizeCouncilTask, writeCouncilTaskProgress } from "./background.js";
-import type { CouncilRunParams } from "./types.js";
+import type { CouncilCheckpoint, CouncilRunParams, CouncilTranscript } from "./types.js";
 
 interface WorkerSpec {
     taskId: string;
     ownerId: string;
     startedAt: string;
     deadlineAt?: string;
+    checkpointPath?: string;
     transcriptPath?: string;
     outputDir?: string;
+    resume?: {
+        sourceTaskId: string;
+        checkpointPath: string;
+        transcriptJsonPath: string;
+    };
     params: Omit<CouncilRunParams, "onProgress">;
 }
 
@@ -35,6 +41,10 @@ function formatCouncilResult(result: Awaited<ReturnType<typeof runCouncil>>): st
     ].filter(Boolean).join("\n");
 }
 
+function readJson<T>(filePath: string): T {
+    return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
+}
+
 async function main(): Promise<void> {
     const specPath = process.argv[2];
     if (!specPath) throw new Error("缺少 spec.json 路径");
@@ -55,14 +65,25 @@ async function main(): Promise<void> {
     }, deadlineMs) : null;
     deadlineTimer?.unref?.();
     try {
-        writeCouncilTaskProgress(spec.taskId, spec.ownerId, "worker 已接管任务，准备进入 council 主循环。", pid, spec.startedAt);
-        const result = await runCouncil({
+        writeCouncilTaskProgress(spec.taskId, spec.ownerId, spec.resume ? "worker 已接管 resume 任务，准备恢复 council。" : "worker 已接管任务，准备进入 council 主循环。", pid, spec.startedAt);
+        const runParams: CouncilRunParams = {
             ...spec.params,
             ownerId: spec.ownerId,
+            checkpointPath: spec.checkpointPath || spec.params.checkpointPath,
             transcriptPath: spec.transcriptPath || spec.params.transcriptPath,
             outputDir: spec.outputDir || spec.params.outputDir,
             onProgress: (progress) => writeCouncilTaskProgress(spec.taskId, spec.ownerId, progress, pid, spec.startedAt),
-        });
+        };
+        const result = spec.resume
+            ? await resumeCouncil({
+                ...runParams,
+                resumeState: {
+                    sourceTaskId: spec.resume.sourceTaskId,
+                    checkpoint: readJson<CouncilCheckpoint>(spec.resume.checkpointPath),
+                    transcript: readJson<CouncilTranscript>(spec.resume.transcriptJsonPath),
+                },
+            })
+            : await runCouncil(runParams);
         if (finalized) return;
         finalized = true;
         if (deadlineTimer) clearTimeout(deadlineTimer);

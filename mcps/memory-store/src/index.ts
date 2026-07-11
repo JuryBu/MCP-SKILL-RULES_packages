@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.15.14
+ * MCP Memory Store Server v1.17.3
  *
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。
  *
  * v1.8: 对话记录 Record 系统 — 对话过程日志 + Flash 自动生成 + 分批处理
  *
- * 11 个 MCP 工具：
+ * 13 个 MCP 工具：
  *   - memory_write: 写入新记忆（含去重检测 + autoSummary 异步生成）
  *   - memory_query: 查询记忆（fuse.js + grep + 三档 depth + autoSummary 搜索）
  *   - memory_read: 读取单条记忆（支持行范围）
@@ -17,8 +17,10 @@
  *   - memory_stats: 统计/归档/导出/导入/enhance 批量增强
  *   - conversation_read_original: 读取对话原文（绕过上下文压缩）
  *   - conversation_golden_extract: 黄金片段提取（对话关键信息 + 记忆去重）
- *   - record_manage: 对话记录管理（update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/audit_ownership/repair_ownership）
+ *   - record_manage: 对话记录管理（update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/audit_ownership/repair_ownership/stale_check）
  *   - stage_guard: 任务完整性验证（start/check/status/cancel，支持外部文件证据索引）
+ *   - background_task_status: 统一查询后台任务状态
+ *   - background_task_cancel: 统一取消后台任务
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -35,6 +37,7 @@ import { cleanupRegistryOnExit } from "./ls-registry.js";
 import { VERSION } from "./version.js";
 import { GUIDE_TEXT } from "./guide-text.js";
 import { installToolConcurrency } from "./tool-concurrency.js";
+import { cleanOldTasks, scanOrphanedTasks } from "./background-tasks.js";
 
 // 工具注册
 import { registerWrite } from "./tools/write.js";
@@ -48,6 +51,7 @@ import { registerConversation } from "./tools/conversation.js";
 import { registerGoldenExtract } from "./tools/golden-extract.js";
 import { registerRecord } from "./tools/record.js";
 import { registerStageGuard } from "./tools/stage-guard.js";
+import { registerBackgroundTask } from "./tools/background-task.js";
 
 // === 进程生命周期 ===
 let isClosing = false; // 防止重复清理
@@ -82,7 +86,7 @@ const server = new McpServer({
 
 installToolConcurrency(server);
 
-// 注册所有 11 个工具
+// 注册所有 13 个工具
 registerWrite(server);
 registerQuery(server);
 registerRead(server);
@@ -94,6 +98,7 @@ registerConversation(server);
 registerGoldenExtract(server);
 registerRecord(server);
 registerStageGuard(server);
+registerBackgroundTask(server);
 
 // === 使用指南 Resource ===
 server.registerResource(
@@ -206,6 +211,16 @@ console.error(`[memory-store] MCP Server v${VERSION} 启动中... (ppid=${proces
 
     console.error(`[memory-store] MCP Server v${VERSION} 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
+
+    void Promise.resolve().then(async () => {
+        const cleanupSummary = cleanOldTasks();
+        const recoverySummary = await scanOrphanedTasks();
+        console.error(
+            `[memory-store] 后台任务恢复扫描完成：scanned=${recoverySummary.scanned}, resumed=${recoverySummary.resumed}, restarted=${recoverySummary.restarted}, error=${recoverySummary.errored}, ignored=${recoverySummary.ignored}; cleanup=${cleanupSummary.deletedTaskIds.length}`,
+        );
+    }).catch(error => {
+        console.error("[memory-store] 后台任务恢复扫描异常:", error);
+    });
 
     // === 非 LS 环境兜底超时 ===
     const isLS = await isAntigravityLS();

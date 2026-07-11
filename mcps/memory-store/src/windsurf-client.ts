@@ -7,6 +7,9 @@ import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import type { ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
+import { AdaptiveConcurrencyGate } from "./adaptive-concurrency.js";
+import type { CallOutcome } from "./call-outcome.js";
+import { FifoConcurrencyGate, type ConcurrencyGateRequestClass } from "./concurrency-gate.js";
 import {
     resolveEndpointForConversation,
     invalidateMapping,
@@ -22,6 +25,12 @@ const DEFAULT_MAX_PAGES = 200;
 const DEFAULT_MAX_OVERSIZED_STEP_SKIPS = 50;
 const POWERSHELL_TIMEOUT_MS = 10_000;
 const FETCH_TIMEOUT_MS = 30_000;
+const DEFAULT_WINDSURF_CACHE_TTL_MS = 30 * 60_000;
+const DEFAULT_WINDSURF_CACHE_MAX_ENTRIES = 10;
+const DEFAULT_WINDSURF_CACHE_REVALIDATE_MS = 5_000;
+const DEFAULT_WINDSURF_LS_CONCURRENCY = 6;
+const DEFAULT_WINDSURF_LS_RESERVED_SLOTS = 2;
+const DEFAULT_WINDSURF_TIMING_SLOW_MS = 250;
 const READ_ONLY_METHODS = new Set([
     "Heartbeat",
     "GetAllCascadeTrajectories",
@@ -73,15 +82,135 @@ export interface WindsurfConversationReadResult {
     totalSteps: number;
     partial?: boolean;
     skippedSteps?: WindsurfSkippedStep[];
+    warnings?: string[];
+    metadata?: WindsurfConversationMetadata;
 }
 
-export type WindsurfLsTransport = (method: string, payload?: Record<string, unknown>) => Promise<unknown>;
+export interface WindsurfLsTransportDiagnostics {
+    method: string;
+    requestClass: ConcurrencyGateRequestClass;
+    queueWaitMs: number;
+    active: number;
+    pending: number;
+    limit: number;
+    current: number;
+    max: number;
+    min: number;
+    successes: number;
+    failures: number;
+    configuredReserved: number;
+    effectiveReserved: number;
+    activeForeground: number;
+    activeBackground: number;
+    pendingForeground: number;
+    pendingBackground: number;
+    borrowing: boolean;
+}
+
+export interface WindsurfLsTransportCallOptions {
+    timeoutMs?: number;
+    deadlineAt?: number;
+    shouldCancel?: () => boolean;
+    cancelMessage?: string;
+    timeoutMessage?: string;
+    requestClass?: ConcurrencyGateRequestClass;
+    onConcurrencyEvent?: (diagnostics: WindsurfLsTransportDiagnostics) => void;
+}
+
+export type WindsurfLsTransport = (
+    method: string,
+    payload?: Record<string, unknown>,
+    options?: WindsurfLsTransportCallOptions,
+) => Promise<unknown>;
+
+const windsurfLsOutcomeReporter = Symbol("windsurfLsOutcomeReporter");
+
+type InternalWindsurfLsTransportCallOptions = WindsurfLsTransportCallOptions & {
+    [windsurfLsOutcomeReporter]?: (outcome: CallOutcome) => void;
+};
 
 interface ReadStepsOptions {
     maxPages?: number;
     startOffset?: number;
     maxSkippedOversizedSteps?: number;
+    timingCollector?: WindsurfTimingCollector;
 }
+
+export interface WindsurfStepPageTiming {
+    offset: number;
+    durationMs: number;
+    stepCount: number;
+}
+
+export interface WindsurfTimingBreakdown {
+    totalMs: number;
+    resolveEndpointMs?: number;
+    stepsReadMs?: number;
+    enrichMs?: number;
+    roundConversionMs?: number;
+    stepPages?: WindsurfStepPageTiming[];
+}
+
+export interface WindsurfConversationMetadata {
+    cache?: {
+        status: "hit" | "miss" | "refresh" | "stale-fallback";
+        refreshRequested: boolean;
+        ttlMs: number;
+        maxEntries: number;
+        cachedAt?: string;
+        ageMs?: number;
+        lastValidatedAt?: string;
+        revalidateWindowMs?: number;
+        authoritativeStepCount?: number;
+        cachedStepCount?: number;
+        reason?: string;
+    };
+    lsConcurrency?: {
+        calls: number;
+        queueWaitMs: number;
+        maxQueueWaitMs: number;
+        active: number;
+        pending: number;
+        limit: number;
+        current: number;
+        max: number;
+        min: number;
+        successes: number;
+        failures: number;
+        configuredReserved: number;
+        effectiveReserved: number;
+        activeForeground: number;
+        activeBackground: number;
+        pendingForeground: number;
+        pendingBackground: number;
+        borrowing: boolean;
+    };
+    source?: {
+        reason?: "ok" | "not_held" | "no_ls";
+        fromMapping?: boolean;
+        endpointPid?: number;
+        endpointPort?: number;
+        retriedAfterInvalidate?: boolean;
+    };
+    timings?: WindsurfTimingBreakdown;
+}
+
+interface WindsurfTimingCollector {
+    resolveEndpointMs?: number;
+    stepsReadMs?: number;
+    enrichMs?: number;
+    roundConversionMs?: number;
+    pageReads: WindsurfStepPageTiming[];
+}
+
+interface WindsurfConversationCacheEntry {
+    cachedAt: number;
+    lastValidatedAt: number;
+    result: WindsurfConversationReadResult;
+    authoritativeStepCount: number;
+}
+
+type WindsurfLsConcurrencyAccumulator = NonNullable<WindsurfConversationMetadata["lsConcurrency"]>;
 
 export interface WindsurfSkippedStep {
     offset: number;
@@ -206,6 +335,319 @@ function toNumberValue(value: unknown): number {
     return 0;
 }
 
+function readPositiveEnvNumber(name: string, fallback: number, min = 1): number {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && value >= min ? value : fallback;
+}
+
+function readNonNegativeEnvNumber(name: string, fallback: number): number {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function getWindsurfConversationCacheTtlMs(): number {
+    return readPositiveEnvNumber("MEMORY_STORE_WINDSURF_CACHE_TTL_MS", DEFAULT_WINDSURF_CACHE_TTL_MS);
+}
+
+function getWindsurfConversationCacheMaxEntries(): number {
+    return Math.max(1, readPositiveEnvNumber("MEMORY_STORE_WINDSURF_CACHE_MAX_ENTRIES", DEFAULT_WINDSURF_CACHE_MAX_ENTRIES));
+}
+
+function getWindsurfCacheRevalidateMs(): number {
+    return readNonNegativeEnvNumber("MEMORY_STORE_WINDSURF_CACHE_REVALIDATE_MS", DEFAULT_WINDSURF_CACHE_REVALIDATE_MS);
+}
+
+function getWindsurfLsConcurrencyMax(): number {
+    return Math.max(1, readPositiveEnvNumber("MEMORY_STORE_WINDSURF_LS_CONCURRENCY", DEFAULT_WINDSURF_LS_CONCURRENCY));
+}
+
+function getWindsurfLsReservedSlots(): number {
+    const value = Number(process.env.MEMORY_STORE_WINDSURF_LS_RESERVED_SLOTS);
+    return Number.isFinite(value) && value >= 0
+        ? Math.floor(value)
+        : DEFAULT_WINDSURF_LS_RESERVED_SLOTS;
+}
+
+function createWindsurfLsAdaptiveGate(): AdaptiveConcurrencyGate {
+    return new AdaptiveConcurrencyGate(getWindsurfLsConcurrencyMax(), 1, 1);
+}
+
+let windsurfLsAdaptiveGate = createWindsurfLsAdaptiveGate();
+
+function getWindsurfLsConcurrency(): number {
+    return windsurfLsAdaptiveGate.limit;
+}
+
+const windsurfLsConcurrencyGate = new FifoConcurrencyGate(
+    () => getWindsurfLsConcurrency(),
+    { reservedSlots: getWindsurfLsReservedSlots },
+);
+
+let windsurfLsGateAcquireCount = 0;
+let windsurfLsGateQueueWaitMsTotal = 0;
+let windsurfLsGateMaxQueueWaitMs = 0;
+let windsurfLsGateLastQueueWaitMs = 0;
+
+function resolveWindsurfCallDeadlineAt(options: WindsurfLsTransportCallOptions = {}, startedAt = Date.now()): number {
+    const requestedTimeoutMs = Number.isFinite(options.timeoutMs) && Number(options.timeoutMs) >= 0
+        ? Number(options.timeoutMs)
+        : FETCH_TIMEOUT_MS;
+    const deadlineCandidates = [startedAt + requestedTimeoutMs];
+    if (Number.isFinite(options.deadlineAt)) {
+        deadlineCandidates.push(Number(options.deadlineAt));
+    }
+    return Math.min(...deadlineCandidates);
+}
+
+function remainingTimeoutMs(deadlineAt: number, now = Date.now()): number {
+    return Math.max(0, deadlineAt - now);
+}
+
+function normalizeWindsurfTransportError(method: string, error: unknown): Error {
+    const message = error instanceof Error ? redactSensitive(error.message) : redactSensitive(String(error));
+    if (message.startsWith(`WSF LS ${method} failed:`)) {
+        return new Error(message);
+    }
+    return new Error(`WSF LS ${method} failed: ${message}`);
+}
+
+function isAbortLikeError(error: unknown): boolean {
+    if (error instanceof Error) {
+        if (error.name === "AbortError") return true;
+        if (/aborted/iu.test(error.message)) return true;
+    }
+    return false;
+}
+
+function wasWindsurfCallCancelled(options: WindsurfLsTransportCallOptions, error: unknown): boolean {
+    try {
+        if (options.shouldCancel?.()) return true;
+    } catch {
+        return true;
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return /\bcancell?ed\b|\bcancellation\b/iu.test(message);
+}
+
+function reportWindsurfLsTransportOutcome(options: WindsurfLsTransportCallOptions, outcome: CallOutcome): void {
+    (options as InternalWindsurfLsTransportCallOptions)[windsurfLsOutcomeReporter]?.(outcome);
+}
+
+function recordWindsurfLsTransportOutcome(outcome: CallOutcome): void {
+    if (outcome.success) {
+        if (windsurfLsAdaptiveGate.onSuccess()) {
+            windsurfLsConcurrencyGate.notifyCapacityIncrease();
+        }
+        return;
+    }
+    if (
+        outcome.errorKind === "rate_limit"
+        || outcome.errorKind === "server_error"
+        || outcome.errorKind === "timeout"
+        || outcome.errorKind === "network"
+    ) {
+        windsurfLsAdaptiveGate.onFailure();
+    }
+}
+
+function mergeConcurrencyEvent(
+    outer: WindsurfLsTransportCallOptions["onConcurrencyEvent"],
+    inner: WindsurfLsTransportCallOptions["onConcurrencyEvent"],
+): WindsurfLsTransportCallOptions["onConcurrencyEvent"] {
+    if (!outer) return inner;
+    if (!inner) return outer;
+    return (diagnostics) => {
+        outer(diagnostics);
+        inner(diagnostics);
+    };
+}
+
+function createWindsurfLsConcurrencyAccumulator(): WindsurfLsConcurrencyAccumulator {
+    const adaptive = windsurfLsAdaptiveGate.snapshot();
+    const gate = windsurfLsConcurrencyGate.stats();
+    return {
+        calls: 0,
+        queueWaitMs: 0,
+        maxQueueWaitMs: 0,
+        active: 0,
+        pending: 0,
+        limit: adaptive.current,
+        current: adaptive.current,
+        max: adaptive.max,
+        min: adaptive.min,
+        successes: adaptive.successes,
+        failures: adaptive.failures,
+        configuredReserved: gate.configuredReserved ?? 0,
+        effectiveReserved: gate.effectiveReserved ?? 0,
+        activeForeground: gate.activeForeground ?? 0,
+        activeBackground: gate.activeBackground ?? 0,
+        pendingForeground: gate.pendingForeground ?? 0,
+        pendingBackground: gate.pendingBackground ?? 0,
+        borrowing: gate.borrowing ?? false,
+    };
+}
+
+function recordWindsurfLsConcurrency(
+    target: WindsurfLsConcurrencyAccumulator,
+    diagnostics: WindsurfLsTransportDiagnostics,
+): void {
+    target.calls += 1;
+    target.queueWaitMs += diagnostics.queueWaitMs;
+    target.maxQueueWaitMs = Math.max(target.maxQueueWaitMs, diagnostics.queueWaitMs);
+    target.active = Math.max(target.active, diagnostics.active);
+    target.pending = Math.max(target.pending, diagnostics.pending);
+    target.limit = diagnostics.limit;
+    target.current = diagnostics.current;
+    target.max = diagnostics.max;
+    target.min = diagnostics.min;
+    target.successes = diagnostics.successes;
+    target.failures = diagnostics.failures;
+    target.configuredReserved = diagnostics.configuredReserved;
+    target.effectiveReserved = diagnostics.effectiveReserved;
+    target.activeForeground = Math.max(target.activeForeground, diagnostics.activeForeground);
+    target.activeBackground = Math.max(target.activeBackground, diagnostics.activeBackground);
+    target.pendingForeground = Math.max(target.pendingForeground, diagnostics.pendingForeground);
+    target.pendingBackground = Math.max(target.pendingBackground, diagnostics.pendingBackground);
+    target.borrowing ||= diagnostics.borrowing;
+}
+
+function cloneWindsurfLsConcurrency(
+    value: WindsurfConversationMetadata["lsConcurrency"],
+): WindsurfConversationMetadata["lsConcurrency"] {
+    return value ? { ...value } : undefined;
+}
+
+function isWindsurfCacheFresh(entry: WindsurfConversationCacheEntry, now = Date.now()): boolean {
+    const revalidateMs = getWindsurfCacheRevalidateMs();
+    return revalidateMs > 0 && now - entry.lastValidatedAt <= revalidateMs;
+}
+
+function refreshCachedWindsurfConversationValidation(
+    cascadeId: string,
+    authoritativeStepCount?: number,
+    now = Date.now(),
+): WindsurfConversationCacheEntry | null {
+    const entry = windsurfConversationCache.get(cascadeId);
+    if (!entry) return null;
+    entry.lastValidatedAt = now;
+    if (Number.isFinite(authoritativeStepCount) && Number(authoritativeStepCount) > 0) {
+        entry.authoritativeStepCount = Math.max(entry.authoritativeStepCount, Number(authoritativeStepCount));
+    }
+    windsurfConversationCache.delete(cascadeId);
+    windsurfConversationCache.set(cascadeId, entry);
+    return entry;
+}
+
+function isWindsurfTimingDebugEnabled(): boolean {
+    return process.env.MEMORY_STORE_WINDSURF_READ_TIMING_DEBUG === "1";
+}
+
+function shouldExposeWindsurfTimings(timings: WindsurfTimingCollector): boolean {
+    if (isWindsurfTimingDebugEnabled()) return true;
+    const slowMs = readPositiveEnvNumber("MEMORY_STORE_WINDSURF_READ_TIMING_SLOW_MS", DEFAULT_WINDSURF_TIMING_SLOW_MS);
+    if ((timings.resolveEndpointMs || 0) >= slowMs) return true;
+    if ((timings.stepsReadMs || 0) >= slowMs) return true;
+    if ((timings.enrichMs || 0) >= slowMs) return true;
+    if ((timings.roundConversionMs || 0) >= slowMs) return true;
+    return timings.pageReads.some(page => page.durationMs >= slowMs);
+}
+
+function createTimingCollector(): WindsurfTimingCollector {
+    return { pageReads: [] };
+}
+
+function buildTimingBreakdown(timings: WindsurfTimingCollector): WindsurfTimingBreakdown | undefined {
+    const durations = [
+        timings.resolveEndpointMs || 0,
+        timings.stepsReadMs || 0,
+        timings.enrichMs || 0,
+        timings.roundConversionMs || 0,
+    ];
+    if (!shouldExposeWindsurfTimings(timings)) {
+        return undefined;
+    }
+    const stepPages = timings.pageReads.map(page => ({ ...page }));
+    const totalMs = durations.reduce((sum, item) => sum + item, 0);
+    return {
+        totalMs,
+        resolveEndpointMs: timings.resolveEndpointMs,
+        stepsReadMs: timings.stepsReadMs,
+        enrichMs: timings.enrichMs,
+        roundConversionMs: timings.roundConversionMs,
+        stepPages,
+    };
+}
+
+function authoritativeStepCountFromResult(
+    result: Pick<WindsurfConversationReadResult, "thread" | "totalSteps" | "rounds">,
+    stepCountHint = 0,
+): number {
+    return Math.max(
+        stepCountHint,
+        result.thread.stepCount || 0,
+        result.totalSteps || 0,
+        result.rounds.length > 0 ? result.totalSteps || result.thread.stepCount || 0 : 0,
+    );
+}
+
+function cloneWindsurfConversationResult(result: WindsurfConversationReadResult): WindsurfConversationReadResult {
+    return {
+        ...result,
+        steps: result.steps.slice(),
+        rounds: result.rounds.slice(),
+        skippedSteps: result.skippedSteps?.map(item => ({ ...item })),
+        warnings: result.warnings ? [...result.warnings] : undefined,
+        metadata: result.metadata
+            ? {
+                ...result.metadata,
+                cache: result.metadata.cache ? { ...result.metadata.cache } : undefined,
+                lsConcurrency: cloneWindsurfLsConcurrency(result.metadata.lsConcurrency),
+                source: result.metadata.source ? { ...result.metadata.source } : undefined,
+                timings: result.metadata.timings
+                    ? {
+                        ...result.metadata.timings,
+                        stepPages: result.metadata.timings.stepPages?.map(page => ({ ...page })),
+                    }
+                    : undefined,
+            }
+            : undefined,
+    };
+}
+
+function attachWindsurfMetadata(
+    result: WindsurfConversationReadResult,
+    options: {
+        warnings?: string[];
+        cache?: WindsurfConversationMetadata["cache"];
+        lsConcurrency?: WindsurfConversationMetadata["lsConcurrency"];
+        source?: WindsurfConversationMetadata["source"];
+        timings?: WindsurfTimingCollector;
+    },
+): WindsurfConversationReadResult {
+    const cloned = cloneWindsurfConversationResult(result);
+    const mergedWarnings = [...(cloned.warnings || []), ...(options.warnings || [])]
+        .map(item => item.trim())
+        .filter(Boolean);
+    cloned.warnings = mergedWarnings.length ? [...new Set(mergedWarnings)] : undefined;
+    const timings = options.timings ? buildTimingBreakdown(options.timings) : cloned.metadata?.timings;
+    cloned.metadata = {
+        ...(cloned.metadata || {}),
+        cache: options.cache ?? cloned.metadata?.cache,
+        lsConcurrency: options.lsConcurrency ?? cloned.metadata?.lsConcurrency,
+        source: options.source ?? cloned.metadata?.source,
+        timings,
+    };
+    return cloned;
+}
+
+function shouldKeepLastGoodCache(
+    result: WindsurfConversationReadResult,
+    authoritativeStepCount: number,
+): boolean {
+    if (result.partial) return true;
+    return authoritativeStepCount > 0 && result.rounds.length === 0;
+}
+
 function asRecord(value: unknown): Record<string, any> {
     return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
 }
@@ -264,25 +706,32 @@ function jobInfoFromRecord(record: Record<string, any>): WindsurfSubagentJobInfo
     };
 }
 
-function collectWindsurfSubagentJobs(value: unknown, target: Map<string, WindsurfSubagentJobInfo>, depth = 0): void {
+function collectWindsurfSubagentJobs(value: unknown, target: Map<string, WindsurfSubagentJobInfo>, depth = 0, deletedSubCids = new Set<string>()): void {
     if (depth > 5 || !value) return;
     if (Array.isArray(value)) {
-        for (const item of value) collectWindsurfSubagentJobs(item, target, depth + 1);
+        for (const item of value) collectWindsurfSubagentJobs(item, target, depth + 1, deletedSubCids);
         return;
     }
     const record = asRecord(value);
     if (Object.keys(record).length === 0) return;
 
     const info = jobInfoFromRecord(record);
-    if (info) target.set(info.subCid, info);
+    if (info) {
+        if ((info.state || "").toLowerCase() === "deleted") {
+            deletedSubCids.add(info.subCid);
+            target.delete(info.subCid);
+        } else if (!deletedSubCids.has(info.subCid)) {
+            target.set(info.subCid, info);
+        }
+    }
 
     const nested = record.jobs ?? record.items ?? record.data ?? record.records;
     if (nested) {
-        collectWindsurfSubagentJobs(nested, target, depth + 1);
+        collectWindsurfSubagentJobs(nested, target, depth + 1, deletedSubCids);
         return;
     }
     for (const value of Object.values(record)) {
-        collectWindsurfSubagentJobs(value, target, depth + 1);
+        collectWindsurfSubagentJobs(value, target, depth + 1, deletedSubCids);
     }
 }
 
@@ -572,6 +1021,7 @@ export async function discoverAllWindsurfLsEndpoints(runCommand: RunCommand = de
 
 /** 端点池短缓存（替换旧的全局单一 cachedEndpoint，见失败路径 ⑤） */
 let cachedEndpointPool: { endpoints: WindsurfLsEndpoint[]; cachedAt: number } | null = null;
+let windsurfConversationCache = new Map<string, WindsurfConversationCacheEntry>();
 const ENDPOINT_CACHE_TTL_MS = 30_000;
 
 /** 测试注入：替换端点发现（返回固定端点池，离线 mock 不依赖真实 WSF） */
@@ -582,7 +1032,8 @@ let transportFactoryOverride: ((endpoint: WindsurfLsEndpoint) => WindsurfLsTrans
 /** 内部统一 transport 构造入口（受测试工厂覆盖）。导出供路由大脑构造 WSF endpoint 复用，
  *  使 __setWindsurfTransportFactoryForTest 注入对路由广播同样生效。 */
 export function makeWindsurfTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
-    return transportFactoryOverride ? transportFactoryOverride(endpoint) : createWindsurfLsTransport(endpoint);
+    const rawTransport = transportFactoryOverride ? transportFactoryOverride(endpoint) : createRawWindsurfLsTransport(endpoint);
+    return withWindsurfLsConcurrencyGate(rawTransport);
 }
 
 /** 内部别名（保持原有调用点不变） */
@@ -610,6 +1061,99 @@ export function __setWindsurfTransportFactoryForTest(fn: ((endpoint: WindsurfLsE
  */
 export function __resetWindsurfEndpointCacheForTest(): void {
     cachedEndpointPool = null;
+    windsurfConversationCache.clear();
+    __resetWindsurfLsGateStatsForTest();
+}
+
+export function __resetWindsurfConversationCacheForTest(): void {
+    windsurfConversationCache.clear();
+    __resetWindsurfLsGateStatsForTest();
+}
+
+export function __getWindsurfLsGateStatsForTest(): {
+    active: number;
+    pending: number;
+    peakActive: number;
+    limit: number;
+    current: number;
+    max: number;
+    min: number;
+    successes: number;
+    failures: number;
+    configuredReserved: number;
+    effectiveReserved: number;
+    activeForeground: number;
+    activeBackground: number;
+    pendingForeground: number;
+    pendingBackground: number;
+    borrowing: boolean;
+    acquireCount: number;
+    queueWaitMsTotal: number;
+    maxQueueWaitMs: number;
+    lastQueueWaitMs: number;
+} {
+    const stats = windsurfLsConcurrencyGate.stats();
+    const adaptive = windsurfLsAdaptiveGate.snapshot();
+    return {
+        ...stats,
+        configuredReserved: stats.configuredReserved ?? 0,
+        effectiveReserved: stats.effectiveReserved ?? 0,
+        activeForeground: stats.activeForeground ?? 0,
+        activeBackground: stats.activeBackground ?? 0,
+        pendingForeground: stats.pendingForeground ?? 0,
+        pendingBackground: stats.pendingBackground ?? 0,
+        borrowing: stats.borrowing ?? false,
+        current: adaptive.current,
+        max: adaptive.max,
+        min: adaptive.min,
+        successes: adaptive.successes,
+        failures: adaptive.failures,
+        acquireCount: windsurfLsGateAcquireCount,
+        queueWaitMsTotal: windsurfLsGateQueueWaitMsTotal,
+        maxQueueWaitMs: windsurfLsGateMaxQueueWaitMs,
+        lastQueueWaitMs: windsurfLsGateLastQueueWaitMs,
+    };
+}
+
+export function __resetWindsurfLsGateStatsForTest(): void {
+    windsurfLsAdaptiveGate = createWindsurfLsAdaptiveGate();
+    windsurfLsGateAcquireCount = 0;
+    windsurfLsGateQueueWaitMsTotal = 0;
+    windsurfLsGateMaxQueueWaitMs = 0;
+    windsurfLsGateLastQueueWaitMs = 0;
+    windsurfLsConcurrencyGate.resetPeakForTest();
+}
+
+function getCachedWindsurfConversation(cascadeId: string, now = Date.now()): WindsurfConversationCacheEntry | null {
+    const entry = windsurfConversationCache.get(cascadeId);
+    if (!entry) return null;
+    const ttlMs = getWindsurfConversationCacheTtlMs();
+    if (now - entry.cachedAt > ttlMs) {
+        windsurfConversationCache.delete(cascadeId);
+        return null;
+    }
+    windsurfConversationCache.delete(cascadeId);
+    windsurfConversationCache.set(cascadeId, entry);
+    return entry;
+}
+
+function setCachedWindsurfConversation(
+    cascadeId: string,
+    result: WindsurfConversationReadResult,
+    authoritativeStepCount: number,
+): void {
+    windsurfConversationCache.delete(cascadeId);
+    windsurfConversationCache.set(cascadeId, {
+        cachedAt: Date.now(),
+        lastValidatedAt: Date.now(),
+        result: cloneWindsurfConversationResult(result),
+        authoritativeStepCount,
+    });
+    while (windsurfConversationCache.size > getWindsurfConversationCacheMaxEntries()) {
+        const oldest = windsurfConversationCache.keys().next().value;
+        if (oldest === undefined) break;
+        windsurfConversationCache.delete(oldest);
+    }
 }
 
 /** 获取端点池（带短缓存） */
@@ -628,14 +1172,106 @@ export async function isWindsurfStoreAvailable(): Promise<boolean> {
 }
 
 
-export function createWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
-    return async (method: string, payload: Record<string, unknown> = {}) => {
+function withWindsurfLsConcurrencyGate(rawTransport: WindsurfLsTransport): WindsurfLsTransport {
+    return async (method: string, payload: Record<string, unknown> = {}, options: WindsurfLsTransportCallOptions = {}) => {
         if (!READ_ONLY_METHODS.has(method)) {
             throw new Error(`WSF client is read-only; method ${method} is not allowed`);
         }
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+        const requestClass = options.requestClass || "foreground";
+        const deadlineAt = resolveWindsurfCallDeadlineAt(options);
+        const permit = await windsurfLsConcurrencyGate.acquire({
+            deadlineAt,
+            shouldCancel: options.shouldCancel,
+            cancelMessage: options.cancelMessage || `WSF LS ${method} failed: cancelled while waiting for concurrency gate`,
+            timeoutMessage: options.timeoutMessage || `WSF LS ${method} failed: timed out while waiting for concurrency gate`,
+            requestClass,
+        });
+        let rawTransportStarted = false;
+        let rawOutcome: CallOutcome | null = null;
+        const captureRawOutcome = (outcome: CallOutcome): void => {
+            if (rawOutcome === null) rawOutcome = outcome;
+        };
         try {
+            windsurfLsGateAcquireCount += 1;
+            windsurfLsGateQueueWaitMsTotal += permit.queueWaitMs;
+            windsurfLsGateMaxQueueWaitMs = Math.max(windsurfLsGateMaxQueueWaitMs, permit.queueWaitMs);
+            windsurfLsGateLastQueueWaitMs = permit.queueWaitMs;
+            const adaptive = windsurfLsAdaptiveGate.snapshot();
+            const diagnostics: WindsurfLsTransportDiagnostics = {
+                method,
+                requestClass,
+                queueWaitMs: permit.queueWaitMs,
+                active: permit.snapshot.active,
+                pending: permit.snapshot.pending,
+                limit: adaptive.current,
+                ...adaptive,
+                configuredReserved: permit.snapshot.configuredReserved ?? 0,
+                effectiveReserved: permit.snapshot.effectiveReserved ?? 0,
+                activeForeground: permit.snapshot.activeForeground ?? 0,
+                activeBackground: permit.snapshot.activeBackground ?? 0,
+                pendingForeground: permit.snapshot.pendingForeground ?? 0,
+                pendingBackground: permit.snapshot.pendingBackground ?? 0,
+                borrowing: permit.snapshot.borrowing ?? false,
+            };
+            options.onConcurrencyEvent?.(diagnostics);
+            const remainingMs = remainingTimeoutMs(deadlineAt);
+            if (remainingMs <= 0) {
+                throw new Error(options.timeoutMessage || `WSF LS ${method} failed: timed out before request started`);
+            }
+            rawTransportStarted = true;
+            const rawOptions: InternalWindsurfLsTransportCallOptions = {
+                ...options,
+                requestClass,
+                deadlineAt,
+                timeoutMs: remainingMs,
+                [windsurfLsOutcomeReporter]: captureRawOutcome,
+            };
+            const result = await rawTransport(method, payload, rawOptions);
+            recordWindsurfLsTransportOutcome(rawOutcome || { success: true });
+            return result;
+        } catch (error) {
+            if (rawTransportStarted) {
+                recordWindsurfLsTransportOutcome(rawOutcome || { success: false, errorKind: "unknown" });
+            }
+            throw normalizeWindsurfTransportError(method, error);
+        } finally {
+            permit.release();
+        }
+    };
+}
+
+function createRawWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
+    return async (method: string, payload: Record<string, unknown> = {}, options: WindsurfLsTransportCallOptions = {}) => {
+        let reportedOutcome = false;
+        const reportOutcome = (outcome: CallOutcome): void => {
+            if (reportedOutcome) return;
+            reportedOutcome = true;
+            reportWindsurfLsTransportOutcome(options, outcome);
+        };
+        const deadlineAt = resolveWindsurfCallDeadlineAt(options);
+        if (options.shouldCancel?.()) {
+            reportOutcome({ success: false, errorKind: "cancelled" });
+            throw new Error(options.cancelMessage || "cancelled before request started");
+        }
+        const remainingMs = remainingTimeoutMs(deadlineAt);
+        if (remainingMs <= 0) {
+            throw new Error(options.timeoutMessage || "timed out before request started");
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), remainingMs);
+        timer.unref?.();
+        const cancelWatcher = options.shouldCancel
+            ? setInterval(() => {
+                if (options.shouldCancel?.()) {
+                    controller.abort();
+                }
+            }, 25)
+            : undefined;
+        cancelWatcher?.unref?.();
+        let fetchStarted = false;
+        let responseBodyComplete = false;
+        try {
+            fetchStarted = true;
             const response = await fetch(`http://127.0.0.1:${endpoint.port}/${WINDSURF_SERVICE_PREFIX}/${method}`, {
                 method: "POST",
                 headers: {
@@ -646,17 +1282,44 @@ export function createWindsurfLsTransport(endpoint: WindsurfLsEndpoint): Windsur
                 signal: controller.signal,
             });
             const text = await response.text();
+            responseBodyComplete = true;
             if (!response.ok) {
+                reportOutcome({
+                    success: false,
+                    errorKind: response.status === 429
+                        ? "rate_limit"
+                        : response.status >= 500 && response.status <= 599
+                            ? "server_error"
+                            : "unknown",
+                });
                 throw new Error(`HTTP ${response.status}: ${truncate(redactSensitive(text), 500)}`);
             }
-            return text.trim() ? JSON.parse(text) : {};
+            const result = text.trim() ? JSON.parse(text) : {};
+            reportOutcome({ success: true });
+            return result;
         } catch (error) {
-            const message = error instanceof Error ? redactSensitive(error.message) : String(error);
-            throw new Error(`WSF LS ${method} failed: ${message}`);
+            if (wasWindsurfCallCancelled(options, error)) {
+                reportOutcome({ success: false, errorKind: "cancelled" });
+                throw new Error(options.cancelMessage || "cancelled during request");
+            }
+            if (isAbortLikeError(error) || Date.now() >= deadlineAt) {
+                if (fetchStarted) reportOutcome({ success: false, errorKind: "timeout" });
+                throw new Error(options.timeoutMessage || `timed out after ${Math.max(0, remainingMs)}ms`);
+            }
+            reportOutcome({
+                success: false,
+                errorKind: fetchStarted && !responseBodyComplete ? "network" : "unknown",
+            });
+            throw error;
         } finally {
             clearTimeout(timer);
+            if (cancelWatcher) clearInterval(cancelWatcher);
         }
     };
+}
+
+export function createWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsTransport {
+    return withWindsurfLsConcurrencyGate(createRawWindsurfLsTransport(endpoint));
 }
 
 export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConversationSummary[] {
@@ -720,8 +1383,11 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
     });
 }
 
-export async function listWindsurfConversations(transport: WindsurfLsTransport): Promise<WindsurfConversationSummary[]> {
-    return normalizeWindsurfTrajectoryList(await transport("GetAllCascadeTrajectories"));
+export async function listWindsurfConversations(
+    transport: WindsurfLsTransport,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<WindsurfConversationSummary[]> {
+    return normalizeWindsurfTrajectoryList(await transport("GetAllCascadeTrajectories", {}, options));
 }
 
 function windsurfSummaryFromSubagentJob(
@@ -766,14 +1432,17 @@ export function windsurfListContainsId(data: unknown, cascadeId: string): boolea
  * 列出近期 WSF 对话：跨「全部」活跃 WSF LS 端点聚合去重（同 cascadeId 取 stepCount 最大），
  * 修「list 只看一个窗口」（失败路径 ④ 连带）。
  */
-export async function listRecentWindsurfThreads(limit = 50): Promise<WindsurfConversationSummary[]> {
+export async function listRecentWindsurfThreads(
+    limit = 50,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<WindsurfConversationSummary[]> {
     const endpoints = await getWindsurfEndpointPool();
 
     const merged = new Map<string, WindsurfConversationSummary>();
     const lists = endpoints.length
         ? await Promise.all(endpoints.map(async ep => {
             try {
-                return await listWindsurfConversations(makeTransport(ep));
+                return await listWindsurfConversations(makeTransport(ep), options);
             } catch {
                 return [] as WindsurfConversationSummary[];
             }
@@ -818,10 +1487,13 @@ export async function listRecentWindsurfThreads(limit = 50): Promise<WindsurfCon
         .slice(0, Math.max(0, limit));
 }
 
-export async function resolveWindsurfThreadId(input: string): Promise<string | null> {
+export async function resolveWindsurfThreadId(
+    input: string,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<string | null> {
     const query = input.trim().toLowerCase();
     if (!query) return null;
-    const threads = await listRecentWindsurfThreads(500);
+    const threads = await listRecentWindsurfThreads(500, options);
     const exact = threads.find(item => item.id.toLowerCase() === query || item.cascadeId.toLowerCase() === query);
     if (exact) return exact.id;
     const prefix = threads.filter(item => item.id.toLowerCase().startsWith(query) || item.cascadeId.toLowerCase().startsWith(query));
@@ -968,11 +1640,14 @@ export async function readWindsurfCascadeSteps(
         seenOffsets.add(offset);
 
         let response: unknown;
+        const startedAt = Date.now();
         try {
             response = await transport("GetCascadeTrajectorySteps", { cascadeId, stepOffset: offset });
         } catch (error) {
+            const durationMs = Date.now() - startedAt;
             const oversized = parseOversizedStepError(error, offset);
             if (!oversized) throw error;
+            options.timingCollector?.pageReads.push({ offset, durationMs, stepCount: 0 });
             if (skippedSteps.length >= maxSkippedOversizedSteps) {
                 steps.push(buildOversizedStepPlaceholder({
                     ...oversized,
@@ -986,6 +1661,11 @@ export async function readWindsurfCascadeSteps(
             continue;
         }
         const pageSteps = extractSteps(response);
+        options.timingCollector?.pageReads.push({
+            offset,
+            durationMs: Date.now() - startedAt,
+            stepCount: pageSteps.length,
+        });
         if (pageSteps.length === 0) {
             return { steps, pagesRead: seenOffsets.size, skippedSteps, partial: skippedSteps.length > 0 };
         }
@@ -1002,7 +1682,17 @@ export async function readWindsurfConversation(
     cascadeId: string,
     options: ReadStepsOptions = {},
 ): Promise<WindsurfConversationReadResult> {
+    const timingCollector = options.timingCollector;
+    const stepsStartedAt = Date.now();
     const { steps, pagesRead, skippedSteps, partial } = await readWindsurfCascadeSteps(transport, cascadeId, options);
+    if (timingCollector) {
+        timingCollector.stepsReadMs = Date.now() - stepsStartedAt;
+    }
+    const roundStartedAt = Date.now();
+    const rounds = windsurfStepsToConversationRounds(steps);
+    if (timingCollector) {
+        timingCollector.roundConversionMs = Date.now() - roundStartedAt;
+    }
     return {
         cascadeId,
         thread: {
@@ -1013,7 +1703,7 @@ export async function readWindsurfConversation(
             stepCount: steps.length,
         },
         steps,
-        rounds: windsurfStepsToConversationRounds(steps),
+        rounds,
         pagesRead,
         totalSteps: steps.length,
         skippedSteps,
@@ -1068,39 +1758,221 @@ function localFallbackResult(cascadeId: string): WindsurfConversationReadResult 
     };
 }
 
+function buildCacheMetadata(
+    status: NonNullable<WindsurfConversationMetadata["cache"]>["status"],
+    refreshRequested: boolean,
+    cacheEntry: WindsurfConversationCacheEntry | null,
+    authoritativeStepCount: number,
+    reason?: string,
+): NonNullable<WindsurfConversationMetadata["cache"]> {
+    const ttlMs = getWindsurfConversationCacheTtlMs();
+    const revalidateWindowMs = getWindsurfCacheRevalidateMs();
+    const maxEntries = getWindsurfConversationCacheMaxEntries();
+    const ageMs = cacheEntry ? Math.max(0, Date.now() - cacheEntry.cachedAt) : undefined;
+    return {
+        status,
+        refreshRequested,
+        ttlMs,
+        maxEntries,
+        cachedAt: cacheEntry ? new Date(cacheEntry.cachedAt).toISOString() : undefined,
+        ageMs,
+        lastValidatedAt: cacheEntry ? new Date(cacheEntry.lastValidatedAt).toISOString() : undefined,
+        revalidateWindowMs,
+        authoritativeStepCount,
+        cachedStepCount: cacheEntry?.authoritativeStepCount,
+        reason,
+    };
+}
+
+function buildSourceMetadata(
+    resolved: { endpoint: RouterEndpoint | null; reason: "ok" | "not_held" | "no_ls"; fromMapping: boolean } | null,
+    retriedAfterInvalidate = false,
+): WindsurfConversationMetadata["source"] | undefined {
+    if (!resolved) return undefined;
+    return {
+        reason: resolved.reason,
+        fromMapping: resolved.fromMapping,
+        endpointPid: resolved.endpoint?.pid,
+        endpointPort: resolved.endpoint?.port,
+        retriedAfterInvalidate,
+    };
+}
+
 /**
  * 薄壳化：先问路由大脑要「已验证持有该对话」的 endpoint，再用它的 transport 读正文。
  *   - 读空且 stepCount>0 → 映射可能粘错，invalidate + 换持有者重试一次。
  *   - 全不持有 + 本地有 .pb → localFallbackResult(partial:true) 明确提示。
  *   - 全不持有 + 本地无 .pb → null。
  */
-export async function loadWindsurfConversation(cascadeId: string): Promise<WindsurfConversationReadResult | null> {
-    const resolvedId = await resolveWindsurfThreadId(cascadeId) || cascadeId;
+export async function loadWindsurfConversation(
+    cascadeId: string,
+    refresh = false,
+    loadOptions: { requestClass?: ConcurrencyGateRequestClass } = {},
+): Promise<WindsurfConversationReadResult | null> {
+    const requestedId = cascadeId.trim();
+    const directCachedEntry = requestedId ? getCachedWindsurfConversation(requestedId) : null;
+    const requestClass = loadOptions.requestClass || "foreground";
+    const resolvedId = directCachedEntry
+        ? requestedId
+        : (await resolveWindsurfThreadId(requestedId, { requestClass }) || requestedId);
+    const cachedEntry = directCachedEntry && resolvedId === requestedId
+        ? directCachedEntry
+        : getCachedWindsurfConversation(resolvedId);
+    const timingCollector = createTimingCollector();
+    const lsConcurrency = createWindsurfLsConcurrencyAccumulator();
 
-    const attempt = async (): Promise<{ result: WindsurfConversationReadResult | null; endpoint: RouterEndpoint | null; stepCount: number }> => {
-        const resolved = await resolveEndpointForConversation(resolvedId, "windsurf");
-        if (!resolved.endpoint) {
-            return { result: null, endpoint: null, stepCount: resolved.stepCount };
-        }
-        const transport: WindsurfLsTransport = (method, payload = {}) => resolved.endpoint!.transport(method, payload);
-        const result = await readWindsurfConversation(transport, resolvedId);
-        await enrichThreadSummary(result, transport, resolvedId);
-        return { result, endpoint: resolved.endpoint, stepCount: resolved.stepCount };
-    };
-
-    let { result, endpoint, stepCount } = await attempt();
-
-    // 读空且权威 stepCount>0 → 映射可能粘到滞后/错误 LS，剔除后换持有者重试一次。
-    // S1 修复：守卫看真实正文量 result.steps.length，而非被 enrichThreadSummary 用 summary.stepCount
-    // 抬高过的 result.totalSteps（否则守卫永不成立 → 重试失效 + 空壳冒充成功）。
-    // `&& stepCount > 0` 保留：区分「合法空对话 stepCount=0」与「desync 读空 stepCount>0」。
-    if (endpoint && result && result.steps.length === 0 && stepCount > 0) {
-        invalidateMapping(resolvedId, "windsurf");
-        ({ result, endpoint, stepCount } = await attempt());
+    if (!refresh && cachedEntry && isWindsurfCacheFresh(cachedEntry)) {
+        return attachWindsurfMetadata(cachedEntry.result, {
+            cache: buildCacheMetadata("hit", false, cachedEntry, cachedEntry.authoritativeStepCount, "fresh-cache-within-revalidate-window"),
+            lsConcurrency,
+            timings: timingCollector,
+        });
     }
 
-    if (endpoint && result) {
+    const resolveWithTiming = async () => {
+        const startedAt = Date.now();
+        const resolved = await resolveEndpointForConversation(resolvedId, "windsurf", {
+            requestClass,
+        });
+        timingCollector.resolveEndpointMs = (timingCollector.resolveEndpointMs || 0) + (Date.now() - startedAt);
+        for (const diagnostics of resolved.transportDiagnostics || []) {
+            recordWindsurfLsConcurrency(lsConcurrency, diagnostics);
+        }
+        return resolved;
+    };
+
+    let resolved = await resolveWithTiming();
+    let retriedAfterInvalidate = false;
+
+    if (cachedEntry && !resolved.endpoint) {
+        const duringRefresh = refresh ? "（强制刷新期间）" : "";
+        return attachWindsurfMetadata(cachedEntry.result, {
+            warnings: [`WSF 源端${duringRefresh}当前不可用（${resolved.reason}），已返回 last-good 缓存。`],
+            cache: buildCacheMetadata(
+                "stale-fallback",
+                refresh,
+                cachedEntry,
+                Math.max(0, resolved.stepCount),
+                refresh ? "source-unavailable-during-refresh" : "source-unavailable",
+            ),
+            lsConcurrency,
+            source: buildSourceMetadata(resolved),
+            timings: timingCollector,
+        });
+    }
+
+    if (!refresh && cachedEntry) {
+        const authoritativeStepCount = Math.max(0, resolved.stepCount);
+        const cachedStepCount = cachedEntry.authoritativeStepCount;
+        if (authoritativeStepCount <= 0 || authoritativeStepCount === cachedStepCount) {
+            const freshenedEntry = refreshCachedWindsurfConversationValidation(resolvedId, authoritativeStepCount) || cachedEntry;
+            return attachWindsurfMetadata(cachedEntry.result, {
+                cache: buildCacheMetadata("hit", false, freshenedEntry, authoritativeStepCount, "authoritative-step-count-unchanged"),
+                lsConcurrency,
+                source: buildSourceMetadata(resolved),
+                timings: timingCollector,
+            });
+        }
+    }
+
+    const attemptRead = async (): Promise<WindsurfConversationReadResult | null> => {
+        if (!resolved.endpoint) return null;
+        const endpointTransport = makeWindsurfTransport({
+            pid: resolved.endpoint.pid,
+            port: resolved.endpoint.port,
+            csrfToken: resolved.endpoint.csrfToken,
+            executablePath: resolved.endpoint.executablePath,
+        });
+        const transport: WindsurfLsTransport = (method, payload = {}, options = {}) => endpointTransport(method, payload, {
+            ...options,
+            requestClass: options.requestClass || loadOptions.requestClass,
+            onConcurrencyEvent: mergeConcurrencyEvent(options.onConcurrencyEvent, diagnostics => {
+                recordWindsurfLsConcurrency(lsConcurrency, diagnostics);
+            }),
+        });
+        const result = await readWindsurfConversation(transport, resolvedId, { timingCollector });
+        const enrichStartedAt = Date.now();
+        await enrichThreadSummary(result, transport, resolvedId);
+        timingCollector.enrichMs = (timingCollector.enrichMs || 0) + (Date.now() - enrichStartedAt);
         return result;
+    };
+
+    let result: WindsurfConversationReadResult | null = null;
+    let fetchError: unknown = null;
+    try {
+        result = await attemptRead();
+    } catch (error) {
+        fetchError = error;
+    }
+
+    if (
+        resolved.endpoint
+        && result
+        && result.steps.length === 0
+        && resolved.stepCount > 0
+    ) {
+        invalidateMapping(resolvedId, "windsurf");
+        retriedAfterInvalidate = true;
+        resolved = await resolveWithTiming();
+        try {
+            result = await attemptRead();
+            fetchError = null;
+        } catch (error) {
+            fetchError = error;
+        }
+    }
+
+    if (fetchError) {
+        if (cachedEntry) {
+            const message = fetchError instanceof Error ? fetchError.message : String(fetchError);
+            return attachWindsurfMetadata(cachedEntry.result, {
+                warnings: [`WSF 源读取失败，已保留 last-good 缓存：${truncate(message, 300)}`],
+                cache: buildCacheMetadata("stale-fallback", refresh, cachedEntry, Math.max(0, resolved.stepCount), "source-error"),
+                lsConcurrency,
+                source: buildSourceMetadata(resolved, retriedAfterInvalidate),
+                timings: timingCollector,
+            });
+        }
+        throw fetchError;
+    }
+
+    if (resolved.endpoint && result) {
+        const authoritativeStepCount = authoritativeStepCountFromResult(result, resolved.stepCount);
+        const cacheStatus = refresh ? "refresh" : cachedEntry ? "miss" : "miss";
+        if (shouldKeepLastGoodCache(result, authoritativeStepCount)) {
+            if (cachedEntry) {
+                const warning = result.partial
+                    ? "WSF 源结果为 partial，已保留 last-good 缓存。"
+                    : "WSF 源返回 stepCount>0 但 rounds=0，已保留 last-good 缓存。";
+                return attachWindsurfMetadata(cachedEntry.result, {
+                    warnings: [warning.replace(/^WSF/u, "WSF LS")],
+                    cache: buildCacheMetadata("stale-fallback", refresh, cachedEntry, authoritativeStepCount, result.partial ? "partial-source-result" : "zero-rounds-with-authoritative-steps"),
+                    lsConcurrency,
+                    source: buildSourceMetadata(resolved, retriedAfterInvalidate),
+                    timings: timingCollector,
+                });
+            }
+            return attachWindsurfMetadata(result, {
+                warnings: [
+                    result.partial
+                        ? "WSF LS 读取不完整（partial），当前返回未写入 last-good 缓存。"
+                        : "WSF LS 返回 stepCount>0 但 rounds=0，当前返回未写入 last-good 缓存。",
+                ],
+                cache: buildCacheMetadata(cacheStatus, refresh, null, authoritativeStepCount, result.partial ? "partial-source-result" : "zero-rounds-with-authoritative-steps"),
+                lsConcurrency,
+                source: buildSourceMetadata(resolved, retriedAfterInvalidate),
+                timings: timingCollector,
+            });
+        }
+
+        setCachedWindsurfConversation(resolvedId, result, authoritativeStepCount);
+        const freshEntry = getCachedWindsurfConversation(resolvedId);
+        return attachWindsurfMetadata(result, {
+            cache: buildCacheMetadata(refresh ? "refresh" : "miss", refresh, freshEntry, authoritativeStepCount, refresh ? "forced-refresh" : "fetched-from-source"),
+            lsConcurrency,
+            source: buildSourceMetadata(resolved, retriedAfterInvalidate),
+            timings: timingCollector,
+        });
     }
 
     const subagentJobResult = loadWindsurfSubagentJobConversation(resolvedId);

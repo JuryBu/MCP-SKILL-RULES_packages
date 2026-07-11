@@ -11,9 +11,6 @@
     },
     "sequential-thinking": {
       "serverUrl": "http://127.0.0.1:14588/sequential-thinking/mcp"
-    },
-    "exa": {
-      "serverUrl": "http://127.0.0.1:14588/exa/mcp"
     }
   }
 }

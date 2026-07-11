@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node broker.mjs",
-    "check": "node --check broker.mjs",
-    "health": "powershell -NoProfile -ExecutionPolicy Bypass -File ./Test-CodexMcpBrokerHealth.ps1"
+    "check": "node --check broker.mjs && node --check exa-stateless-stdio.mjs",
+    "health": "npm run check"
   }
 }

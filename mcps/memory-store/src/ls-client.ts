@@ -55,6 +55,17 @@ interface ParentLsConnection {
 let parentLs: ParentLsConnection | null = null;
 let parentLsInitPromise: Promise<void> | null = null;
 let parentLsInitDone = false;
+let lsDisabledForTest = false;
+
+/**
+ * 测试专用：完全禁用 LS 发现路径，使 isLsAvailable() 返回 false。
+ * 与 __setParentLsForTest(null) 不同，此函数阻止 discoverParentLs 重新发现真实 LS。
+ */
+export function __disableLsForTest(): void {
+    lsDisabledForTest = true;
+    parentLs = null;
+    parentLsInitDone = true;
+}
 
 /**
  * 获取已缓存的父 LS 连接（未就绪返回 null）
@@ -70,6 +81,18 @@ export function getParentLs(): ParentLsConnection | null {
 export function __setParentLsForTest(conn: ParentLsConnection | null): void {
     parentLs = conn;
     parentLsInitDone = conn !== null;
+    if (conn === null) lsDisabledForTest = false;
+}
+
+/**
+ * 测试专用：复位全部 LS 测试覆盖状态（lsDisabledForTest、parentLs、init 标志）。
+ * 在 finally 块中调用此函数可确保后续同进程用例不受残留影响。
+ */
+export function __resetLsTestOverridesForTest(): void {
+    lsDisabledForTest = false;
+    parentLs = null;
+    parentLsInitDone = false;
+    parentLsInitPromise = null;
 }
 
 /**
@@ -450,11 +473,13 @@ export async function fetchTrajectory(
                         csrfToken: pls.info.csrfToken,
                         workspaceId: pls.info.workspaceId,
                         key: `antigravity:${pls.info.pid}:${pls.port}`,
-                        transport: (method, payload = {}, timeoutMs = LIGHT_TIMEOUT) =>
-                            rpcCall(pls.info, pls.port, method, payload, timeoutMs).then(r => {
+                        transport: (method, payload = {}, options = LIGHT_TIMEOUT) => {
+                            const timeoutMs = typeof options === "number" ? options : options.timeoutMs ?? LIGHT_TIMEOUT;
+                            return rpcCall(pls.info, pls.port, method, payload, timeoutMs).then(r => {
                                 if (r.status < 200 || r.status >= 300) throw new Error(`antigravity rpc ${method} status ${r.status}`);
                                 return r.data;
-                            }),
+                            });
+                        },
                     }, stepCount);
                     return result;
                 }
@@ -657,9 +682,11 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
 
 // ===== 辅助 =====
 
-const MEMORY_STORE_DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
-const CONV_CACHE_DIR = path.join(MEMORY_STORE_DATA_ROOT, "temp");
+const CONV_CACHE_DIR = path.join(
+    process.env.MEMORY_STORE_DATA_ROOT
+        || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store"),
+    "temp",
+);
 
 /** 测试注入的缓存目录覆盖（null=用真实目录） */
 let convCacheDirOverride: string | null = null;
@@ -962,7 +989,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/Users/example/Desktop/project"
+ * 返回去 URI 化后的本地路径，如 "c:/workspace/project"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {
@@ -971,7 +998,7 @@ export function detectWorkspaceFromSteps(steps: any[]): string | null {
         for (const doc of docs) {
             const ws = doc?.workspaceUri;
             if (typeof ws === "string" && ws.startsWith("file:///")) {
-                // file:///c:/Users/... → c:/Users/...
+                // file:///c:/workspace/... → c:/workspace/...
                 const decoded = decodeURIComponent(ws.replace("file:///", ""));
                 if (decoded && decoded.length > 3) return decoded;
             }
@@ -987,6 +1014,7 @@ export function detectWorkspaceFromSteps(steps: any[]): string | null {
  * v1.6: 直接检查 parentLs
  */
 export async function isLsAvailable(): Promise<boolean> {
+    if (lsDisabledForTest) return false;
     if (parentLs) return true;
 
     try {

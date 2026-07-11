@@ -269,16 +269,93 @@ export function selectLocalComposeBoundary(
     return { stablePhases, rollbackPhases, stableEndRound, rewriteStartRound, rollbackCount, reason };
 }
 
+function decodeJsonishStringFragment(value: string): string {
+    return value
+        .replace(/\\r\\n/g, "\n")
+        .replace(/\\n/g, "\n")
+        .replace(/\\r/g, "\r")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, "\"")
+        .replace(/\\\\/g, "\\")
+        .trim();
+}
+
+function parseJsonishStringField(response: string, field: string): string | null {
+    const closedPattern = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`, "u");
+    const closedMatch = response.match(closedPattern);
+    if (closedMatch) return decodeJsonishStringFragment(closedMatch[1]);
+
+    const startPattern = new RegExp(`"${field}"\\s*:\\s*"`, "u");
+    const startMatch = startPattern.exec(response);
+    if (!startMatch) return null;
+
+    const rest = response.slice(startMatch.index + startMatch[0].length);
+    const stops = [
+        rest.search(/\r?\n\s*"(?:rewriteStartRound|rewriteEndRound|phaseMarkdown|tailMarkdown|tags|warnings)"\s*:/u),
+        rest.search(/\r?\n#\s/u),
+        rest.search(/\r?\n```/u),
+    ].filter(index => index >= 0);
+    const end = stops.length > 0 ? Math.min(...stops) : rest.length;
+    return decodeJsonishStringFragment(rest.slice(0, end));
+}
+
+function parseJsonishNumberField(response: string, field: string): number | null {
+    const match = response.match(new RegExp(`"${field}"\\s*:\\s*(\\d+)`, "u"));
+    if (!match) return null;
+    const value = Number(match[1]);
+    return Number.isFinite(value) ? value : null;
+}
+
+function parseJsonishArrayField(response: string, field: string): string[] {
+    const match = response.match(new RegExp(`"${field}"\\s*:\\s*(\\[[\\s\\S]*?\\])`, "u"));
+    if (!match) return [];
+    try {
+        const parsed = JSON.parse(match[1]);
+        return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+    } catch {
+        return [];
+    }
+}
+
+function extractMarkdownTailAfterPhaseField(response: string): string {
+    const phaseStart = /"phaseMarkdown"\s*:\s*"/u.exec(response);
+    if (!phaseStart) return "";
+    const rest = response.slice(phaseStart.index + phaseStart[0].length);
+    const marker = rest.search(/\r?\n#\s/u);
+    if (marker < 0) return "";
+    return rest.slice(marker).replace(/\r?\n```\s*$/u, "").trim();
+}
+
+function salvageJsonishLocalComposeResponse(response: string): Partial<LocalComposeDelta> | null {
+    if (!/"phaseMarkdown"\s*:/u.test(response)) return null;
+    const phaseMarkdown = parseJsonishStringField(response, "phaseMarkdown");
+    if (!phaseMarkdown) return null;
+    const tailMarkdown = parseJsonishStringField(response, "tailMarkdown") || extractMarkdownTailAfterPhaseField(response);
+    return {
+        rewriteStartRound: parseJsonishNumberField(response, "rewriteStartRound") ?? undefined,
+        rewriteEndRound: parseJsonishNumberField(response, "rewriteEndRound") ?? undefined,
+        phaseMarkdown,
+        tailMarkdown,
+        tags: parseJsonishArrayField(response, "tags"),
+        warnings: parseJsonishArrayField(response, "warnings"),
+    };
+}
+
 export function parseLocalComposeResponse(response: string, fallbackStartRound: number, fallbackEndRound: number): LocalComposeDelta {
     const trimmed = response.trim();
     const jsonMatch = trimmed.match(/```json\s*([\s\S]*?)```/iu) || trimmed.match(/(\{[\s\S]*\})/u);
     let parsed: any = {};
+    let parsedOk = false;
     if (jsonMatch) {
         try {
             parsed = JSON.parse(jsonMatch[1]);
+            parsedOk = true;
         } catch {
             parsed = {};
         }
+    }
+    if (!parsedOk) {
+        parsed = salvageJsonishLocalComposeResponse(trimmed) || parsed;
     }
     const markdownFallback = jsonMatch ? trimmed.replace(jsonMatch[0], "").trim() : trimmed;
     const rawPhaseMarkdown = typeof parsed.phaseMarkdown === "string" && parsed.phaseMarkdown.trim()

@@ -8,14 +8,15 @@
     "scope": "Windsurf-only optional MCP. Do not merge into other host configs by default.",
     "beforeUse": [
       "Build mcps/mcp-subagent with npm install && npm run build.",
-      "Run npm run install:config and npm run patch:codex-broker in dry-run mode first.",
-      "Apply only after confirming backups and rollback commands on the receiver machine."
+      "Keep the default install:config dry-run first; it updates only the receiver's Windsurf MCP configuration when --apply is supplied.",
+      "Confirm the backup and rollback path before applying, and use only with an active signed-in Windsurf Cascade session."
     ],
     "stdioFallback": {
       "command": "node",
       "args": ["<toolkit-root>\\mcps\\mcp-subagent\\src\\index.js"],
       "env": {
-        "SUBAGENT_DATA_DIR": "%USERPROFILE%\\.codex-toolkit\\mcp-subagent"
+        "SUBAGENT_DATA_DIR": "%USERPROFILE%\\.codex-toolkit\\mcp-subagent",
+        "WSF_CASCADE_HOST": "127.0.0.1"
       }
     }
   }

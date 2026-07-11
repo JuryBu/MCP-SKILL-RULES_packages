@@ -1,9 +1,10 @@
-import { execFileSync } from "child_process";
+import { execFile, execFileSync } from "child_process";
 import { createHash } from "crypto";
 import fs from "fs";
 import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
+import { promisify } from "util";
 import type { ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
@@ -123,15 +124,53 @@ const CODEX_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CODEX_CONT
 const CODEX_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CODEX_AGENTS_HEADER_PREFIX = "# AGENTS.md instructions";
 const CODEX_AGENTS_HEADER_LEGACY = "# AGENTS.md instructions for ";
+const CODEX_RECOMMENDED_PLUGINS_OPEN = "<recommended_plugins>";
+const CODEX_RECOMMENDED_PLUGINS_CLOSE = "</recommended_plugins>";
 const CODEX_AGENTS_FOLDED_MARKER = "[Codex AGENTS/RULES 注入已折叠";
 const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu;
+const execFileAsync = promisify(execFile);
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+    const value = Number(process.env[name]);
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+const CODEX_JSONL_ASYNC_YIELD_INTERVAL = readPositiveIntEnv("MEMORY_STORE_CODEX_JSONL_YIELD_INTERVAL", 128);
+const CODEX_JSONL_ASYNC_CHUNK_YIELD_INTERVAL = readPositiveIntEnv("MEMORY_STORE_CODEX_JSONL_CHUNK_YIELD_INTERVAL", 4);
 
 function normalizePath(input: string): string {
     return input.replace(/^\\\\\?\\/u, "").replace(/\\/g, "/").toLowerCase();
 }
 
+function eventLoopYield(): Promise<void> {
+    return new Promise(resolve => setImmediate(resolve));
+}
+
+async function pathExistsAsync(targetPath: string): Promise<boolean> {
+    try {
+        await fs.promises.access(targetPath);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
 function execPythonJson(script: string, args: string[]): any {
     const stdout = execFileSync("python", ["-c", script, ...args], {
+        encoding: "utf-8",
+        windowsHide: true,
+        timeout: 15_000,
+        maxBuffer: Number(process.env.MEMORY_STORE_CODEX_PYTHON_JSON_MAX_BUFFER || 64 * 1024 * 1024),
+        env: {
+            ...process.env,
+            PYTHONIOENCODING: "utf-8",
+        },
+    });
+    return stdout.trim() ? JSON.parse(stdout.trim()) : null;
+}
+
+async function execPythonJsonAsync(script: string, args: string[]): Promise<any> {
+    const { stdout } = await execFileAsync("python", ["-c", script, ...args], {
         encoding: "utf-8",
         windowsHide: true,
         timeout: 15_000,
@@ -189,6 +228,93 @@ function parseCodexSessionIndexLine(line: string): [string, CodexSessionIndexEnt
     }
 }
 
+async function forEachCodexJsonlLineAsync(
+    filePath: string,
+    onLine: (line: string) => void | Promise<void>,
+    options: {
+        maxLineChars?: number;
+        onOversizedLine?: (chars: number, isTail: boolean) => void | Promise<void>;
+    } = {},
+): Promise<void> {
+    const handle = await fs.promises.open(filePath, "r");
+    const decoder = new StringDecoder("utf8");
+    const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
+    const maxLineChars = options.maxLineChars || CODEX_JSONL_MAX_LINE_CHARS;
+    let pending = "";
+    let skippingOversizedLine = false;
+    let skippedChars = 0;
+    let linesSinceYield = 0;
+    let chunksSinceYield = 0;
+
+    const yieldAfterLine = async () => {
+        linesSinceYield += 1;
+        if (linesSinceYield >= CODEX_JSONL_ASYNC_YIELD_INTERVAL) {
+            linesSinceYield = 0;
+            await eventLoopYield();
+        }
+    };
+    const yieldAfterChunk = async () => {
+        chunksSinceYield += 1;
+        if (chunksSinceYield >= CODEX_JSONL_ASYNC_CHUNK_YIELD_INTERVAL) {
+            chunksSinceYield = 0;
+            await eventLoopYield();
+        }
+    };
+    const processLine = async (line: string) => {
+        const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
+        if (trimmed.trim()) await onLine(trimmed);
+        await yieldAfterLine();
+    };
+
+    try {
+        while (true) {
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+            if (bytesRead === 0) break;
+            let chunk = decoder.write(buffer.subarray(0, bytesRead));
+
+            if (skippingOversizedLine) {
+                const newlineIndex = chunk.indexOf("\n");
+                if (newlineIndex < 0) {
+                    skippedChars += chunk.length;
+                    await yieldAfterChunk();
+                    continue;
+                }
+                skippedChars += newlineIndex;
+                await options.onOversizedLine?.(skippedChars, false);
+                chunk = chunk.slice(newlineIndex + 1);
+                skippingOversizedLine = false;
+                skippedChars = 0;
+            }
+
+            pending += chunk;
+            let newlineIndex = pending.indexOf("\n");
+            while (newlineIndex >= 0) {
+                await processLine(pending.slice(0, newlineIndex));
+                pending = pending.slice(newlineIndex + 1);
+                newlineIndex = pending.indexOf("\n");
+            }
+
+            if (pending.length > maxLineChars) {
+                skippingOversizedLine = true;
+                skippedChars = pending.length;
+                pending = "";
+            }
+            await yieldAfterChunk();
+        }
+
+        const tail = decoder.end();
+        if (tail) pending += tail;
+        if (skippingOversizedLine) {
+            skippedChars += pending.length;
+            await options.onOversizedLine?.(skippedChars, true);
+        } else if (pending) {
+            await processLine(pending);
+        }
+    } finally {
+        await handle.close();
+    }
+}
+
 function readCodexSessionIndexMap(): Map<string, CodexSessionIndexEntry> {
     try {
         if (!fs.existsSync(SESSION_INDEX)) return new Map();
@@ -202,6 +328,24 @@ function readCodexSessionIndexMap(): Map<string, CodexSessionIndexEntry> {
             const parsed = parseCodexSessionIndexLine(line);
             if (parsed) entries.set(parsed[0], parsed[1]);
         }
+        sessionIndexCache = { mtimeMs: stat.mtimeMs, size: stat.size, entries };
+        return entries;
+    } catch {
+        return new Map();
+    }
+}
+
+async function readCodexSessionIndexMapAsync(): Promise<Map<string, CodexSessionIndexEntry>> {
+    try {
+        const stat = await fs.promises.stat(SESSION_INDEX);
+        if (sessionIndexCache && sessionIndexCache.mtimeMs === stat.mtimeMs && sessionIndexCache.size === stat.size) {
+            return sessionIndexCache.entries;
+        }
+        const entries = new Map<string, CodexSessionIndexEntry>();
+        await forEachCodexJsonlLineAsync(SESSION_INDEX, (line) => {
+            const parsed = parseCodexSessionIndexLine(line);
+            if (parsed) entries.set(parsed[0], parsed[1]);
+        });
         sessionIndexCache = { mtimeMs: stat.mtimeMs, size: stat.size, entries };
         return entries;
     } catch {
@@ -240,7 +384,10 @@ export function applyCodexSessionIndexTitleForTest(
     return applyCodexSessionIndexTitle(thread, index);
 }
 
-function threadFromSqliteRow(row: any): CodexThreadInfo {
+function threadFromSqliteRow(
+    row: any,
+    sessionIndex?: Map<string, CodexSessionIndexEntry>,
+): CodexThreadInfo {
     return applyCodexSessionIndexTitle({
         id: row.id,
         rolloutPath: row.rollout_path,
@@ -254,7 +401,7 @@ function threadFromSqliteRow(row: any): CodexThreadInfo {
         agentNickname: row.agent_nickname,
         agentRole: row.agent_role,
         updatedAtMs: row.updated_at_ms,
-    });
+    }, sessionIndex);
 }
 
 function readThreads(limit = 200, includeArchived = false): CodexThreadInfo[] {
@@ -274,7 +421,30 @@ rows = conn.execute(
 print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
 `;
     const rows = execPythonJson(script, [STATE_DB, String(limit), includeArchived ? "1" : "0"]) as any[] || [];
-    return rows.map(threadFromSqliteRow);
+    return rows.map(row => threadFromSqliteRow(row));
+}
+
+async function readThreadsAsync(limit = 200, includeArchived = false): Promise<CodexThreadInfo[]> {
+    if (!await pathExistsAsync(STATE_DB)) return [];
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+limit = int(sys.argv[2])
+include_archived = sys.argv[3] == "1"
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+where = "" if include_archived else "where archived=0"
+rows = conn.execute(
+    f"select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads {where} order by updated_at_ms desc limit ?",
+    (limit,)
+).fetchall()
+print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
+`;
+    const [rows, sessionIndex] = await Promise.all([
+        execPythonJsonAsync(script, [STATE_DB, String(limit), includeArchived ? "1" : "0"]),
+        readCodexSessionIndexMapAsync(),
+    ]);
+    return (rows as any[] || []).map(row => threadFromSqliteRow(row, sessionIndex));
 }
 
 function readThreadById(id: string): CodexThreadInfo | null {
@@ -295,6 +465,24 @@ print(json.dumps(dict(row), ensure_ascii=False) if row else "")
     return row ? threadFromSqliteRow(row) : null;
 }
 
+async function readThreadByIdAsync(id: string): Promise<CodexThreadInfo | null> {
+    if (!await pathExistsAsync(STATE_DB)) return null;
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+thread_id = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+row = conn.execute(
+    "select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads where id = ? limit 1",
+    (thread_id,)
+).fetchone()
+print(json.dumps(dict(row), ensure_ascii=False) if row else "")
+`;
+    const row = await execPythonJsonAsync(script, [STATE_DB, id]) as any | null;
+    return row ? threadFromSqliteRow(row, await readCodexSessionIndexMapAsync()) : null;
+}
+
 function readThreadsByIdPrefix(prefix: string, limit = 2): CodexThreadInfo[] {
     if (!fs.existsSync(STATE_DB)) return [];
     const script = `
@@ -311,7 +499,29 @@ rows = conn.execute(
 print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
 `;
     const rows = execPythonJson(script, [STATE_DB, prefix, String(limit)]) as any[] || [];
-    return rows.map(threadFromSqliteRow);
+    return rows.map(row => threadFromSqliteRow(row));
+}
+
+async function readThreadsByIdPrefixAsync(prefix: string, limit = 2): Promise<CodexThreadInfo[]> {
+    if (!await pathExistsAsync(STATE_DB)) return [];
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+prefix = sys.argv[2]
+limit = int(sys.argv[3])
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+rows = conn.execute(
+    "select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads where id like ? order by updated_at_ms desc limit ?",
+    (prefix + "%", limit)
+).fetchall()
+print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
+`;
+    const [rows, sessionIndex] = await Promise.all([
+        execPythonJsonAsync(script, [STATE_DB, prefix, String(limit)]),
+        readCodexSessionIndexMapAsync(),
+    ]);
+    return (rows as any[] || []).map(row => threadFromSqliteRow(row, sessionIndex));
 }
 
 function isLikelyCodexIdLookup(query: string): boolean {
@@ -330,6 +540,24 @@ function readSessionMetaFromRollout(rolloutPath: string): any | null {
             return event?.type === "session_meta" ? event.payload || null : null;
         } finally {
             fs.closeSync(fd);
+        }
+    } catch {
+        return null;
+    }
+}
+
+async function readSessionMetaFromRolloutAsync(rolloutPath: string): Promise<any | null> {
+    try {
+        const handle = await fs.promises.open(rolloutPath, "r");
+        try {
+            const buffer = Buffer.alloc(1024 * 1024);
+            const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+            const firstLine = buffer.subarray(0, bytesRead).toString("utf8").split(/\r?\n/u, 1)[0] || "";
+            if (!firstLine.trim()) return null;
+            const event = JSON.parse(firstLine);
+            return event?.type === "session_meta" ? event.payload || null : null;
+        } finally {
+            await handle.close();
         }
     } catch {
         return null;
@@ -355,6 +583,30 @@ function threadFromRolloutPath(rolloutPath: string): CodexThreadInfo | null {
         agentRole: null,
         updatedAtMs: stat.mtimeMs,
     });
+}
+
+async function threadFromRolloutPathAsync(rolloutPath: string): Promise<CodexThreadInfo | null> {
+    const match = path.basename(rolloutPath).match(CODEX_ROLLOUT_ID_RE);
+    if (!match) return null;
+    const [meta, stat, sessionIndex] = await Promise.all([
+        readSessionMetaFromRolloutAsync(rolloutPath),
+        fs.promises.stat(rolloutPath),
+        readCodexSessionIndexMapAsync(),
+    ]);
+    const id = String(meta?.id || match[1]);
+    return applyCodexSessionIndexTitle({
+        id,
+        rolloutPath,
+        cwd: typeof meta?.cwd === "string" ? meta.cwd : "",
+        title: typeof meta?.title === "string" ? meta.title : "",
+        titleSource: typeof meta?.title === "string" ? "session_meta" : "rollout",
+        source: typeof meta?.source === "string" ? meta.source : typeof meta?.originator === "string" ? meta.originator : "rollout",
+        model: typeof meta?.model === "string" ? meta.model : null,
+        reasoningEffort: typeof meta?.reasoning_effort === "string" ? meta.reasoning_effort : null,
+        agentNickname: null,
+        agentRole: null,
+        updatedAtMs: stat.mtimeMs,
+    }, sessionIndex);
 }
 
 function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
@@ -392,6 +644,51 @@ function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
     return matches;
 }
 
+async function findRolloutThreadByIdLookupAsync(query: string): Promise<CodexThreadInfo[]> {
+    const normalized = query.trim().toLowerCase();
+    if (!isLikelyCodexIdLookup(normalized)) return [];
+    const roots = [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR];
+    const matches: CodexThreadInfo[] = [];
+    let entriesSinceYield = 0;
+
+    const visit = async (dir: string): Promise<boolean> => {
+        let entries: fs.Dirent[];
+        try {
+            entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        } catch {
+            return false;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (await visit(fullPath)) return true;
+            } else if (entry.isFile()) {
+                const match = entry.name.match(CODEX_ROLLOUT_ID_RE);
+                if (match) {
+                    const id = match[1].toLowerCase();
+                    if (id.startsWith(normalized)) {
+                        const thread = await threadFromRolloutPathAsync(fullPath);
+                        if (thread) matches.push(thread);
+                        if (id === normalized || matches.length >= 2) return true;
+                    }
+                }
+            }
+            entriesSinceYield += 1;
+            if (entriesSinceYield >= CODEX_JSONL_ASYNC_YIELD_INTERVAL) {
+                entriesSinceYield = 0;
+                await eventLoopYield();
+            }
+        }
+        return false;
+    };
+
+    for (const root of roots) {
+        if (!await pathExistsAsync(root)) continue;
+        if (await visit(root)) break;
+    }
+    return matches;
+}
+
 export function isCodexSessionStoreAvailable(): boolean {
     return fs.existsSync(STATE_DB);
 }
@@ -400,12 +697,27 @@ export function listRecentCodexThreads(limit = 50): CodexThreadInfo[] {
     return readThreads(limit);
 }
 
+export async function listRecentCodexThreadsAsync(limit = 50): Promise<CodexThreadInfo[]> {
+    return readThreadsAsync(limit);
+}
+
 export function listCodexThreadsForMetadata(
     limit = Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000),
     includeArchived = false,
 ): CodexThreadInfo[] {
     const parentMap = readCodexThreadParentMap();
     return readThreads(Math.max(Math.floor(limit), 1), includeArchived).map(thread => applyCodexThreadRelations(thread, parentMap));
+}
+
+export async function listCodexThreadsForMetadataAsync(
+    limit = Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000),
+    includeArchived = false,
+): Promise<CodexThreadInfo[]> {
+    const [parentMap, threads] = await Promise.all([
+        readCodexThreadParentMapAsync(),
+        readThreadsAsync(Math.max(Math.floor(limit), 1), includeArchived),
+    ]);
+    return threads.map(thread => applyCodexThreadRelations(thread, parentMap));
 }
 
 export function readCodexThreadParentMap(): Map<string, string> {
@@ -422,6 +734,23 @@ else:
     print(json.dumps([{"child": r[0], "parent": r[1]} for r in rows if r[0] and r[1]], ensure_ascii=False))
 `;
     const rows = execPythonJson(script, [STATE_DB]) as Array<{ child: string; parent: string }> || [];
+    return new Map(rows.map(row => [row.child, row.parent]));
+}
+
+export async function readCodexThreadParentMapAsync(): Promise<Map<string, string>> {
+    if (!await pathExistsAsync(STATE_DB)) return new Map();
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+exists = conn.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone()
+if not exists:
+    print("[]")
+else:
+    rows = conn.execute("select child_thread_id, parent_thread_id from thread_spawn_edges").fetchall()
+    print(json.dumps([{\"child\": r[0], \"parent\": r[1]} for r in rows if r[0] and r[1]], ensure_ascii=False))
+`;
+    const rows = await execPythonJsonAsync(script, [STATE_DB]) as Array<{ child: string; parent: string }> || [];
     return new Map(rows.map(row => [row.child, row.parent]));
 }
 
@@ -476,6 +805,38 @@ export function resolveCodexThreadId(input: string): string | null {
     return null;
 }
 
+export async function resolveCodexThreadIdAsync(input: string): Promise<string | null> {
+    const query = input.trim();
+    if (!query) return null;
+    const queryLower = query.toLowerCase();
+
+    const exactById = isLikelyCodexIdLookup(queryLower) && queryLower.length === 36
+        ? await readThreadByIdAsync(queryLower)
+        : null;
+    if (exactById) return exactById.id;
+
+    if (isLikelyCodexIdLookup(queryLower)) {
+        const sqlitePrefixMatches = await readThreadsByIdPrefixAsync(queryLower, 2);
+        if (sqlitePrefixMatches.length === 1) return sqlitePrefixMatches[0].id;
+    }
+
+    const threads = await listCodexThreadsForMetadataAsync(undefined, true);
+
+    const exact = threads.find((thread) => thread.id === query);
+    if (exact) return exact.id;
+
+    const prefixMatches = threads.filter((thread) => thread.id.startsWith(query));
+    if (prefixMatches.length === 1) return prefixMatches[0].id;
+
+    const titleMatches = threads.filter((thread) => (thread.title || "").toLowerCase() === queryLower);
+    if (titleMatches.length === 1) return titleMatches[0].id;
+
+    const rolloutMatches = await findRolloutThreadByIdLookupAsync(queryLower);
+    if (rolloutMatches.length === 1) return rolloutMatches[0].id;
+
+    return null;
+}
+
 export function getCodexThread(conversationId: string): CodexThreadInfo | null {
     const resolvedId = resolveCodexThreadId(conversationId);
     if (!resolvedId) return null;
@@ -488,8 +849,35 @@ export function getCodexThread(conversationId: string): CodexThreadInfo | null {
     return rolloutMatches.length === 1 ? rolloutMatches[0] : null;
 }
 
+export async function getCodexThreadAsync(conversationId: string): Promise<CodexThreadInfo | null> {
+    const resolvedId = await resolveCodexThreadIdAsync(conversationId);
+    if (!resolvedId) return null;
+    const exactById = await readThreadByIdAsync(resolvedId);
+    if (exactById) return exactById;
+    const threads = await listCodexThreadsForMetadataAsync(undefined, true);
+    const recent = threads.find((thread) => thread.id === resolvedId);
+    if (recent) return recent;
+    const rolloutMatches = await findRolloutThreadByIdLookupAsync(resolvedId);
+    return rolloutMatches.length === 1 ? rolloutMatches[0] : null;
+}
+
 export function resolveCurrentCodexThreadId(cwd: string = process.cwd()): string | null {
     const threads = readThreads(200);
+    if (threads.length === 0) return null;
+
+    const target = normalizePath(cwd);
+    const exact = threads.find((thread) => normalizePath(thread.cwd || "") === target);
+    if (exact) return exact.id;
+
+    const nested = threads.find((thread) => {
+        const threadCwd = normalizePath(thread.cwd || "");
+        return target.startsWith(threadCwd) || threadCwd.startsWith(target);
+    });
+    return nested?.id || threads[0]?.id || null;
+}
+
+export async function resolveCurrentCodexThreadIdAsync(cwd: string = process.cwd()): Promise<string | null> {
+    const threads = await listRecentCodexThreadsAsync(200);
     if (threads.length === 0) return null;
 
     const target = normalizePath(cwd);
@@ -518,17 +906,26 @@ function sha256Short(text: string): string {
     return createHash("sha256").update(text).digest("hex").slice(0, 12);
 }
 
+function getCodexAgentsHeaderStart(text: string): number | null {
+    if (text.startsWith(CODEX_AGENTS_HEADER_PREFIX)) return 0;
+    if (!text.startsWith(CODEX_RECOMMENDED_PLUGINS_OPEN)) return null;
+    const pluginsEnd = text.indexOf(CODEX_RECOMMENDED_PLUGINS_CLOSE, CODEX_RECOMMENDED_PLUGINS_OPEN.length);
+    if (pluginsEnd < 0) return null;
+    const prefixEnd = pluginsEnd + CODEX_RECOMMENDED_PLUGINS_CLOSE.length;
+    const separatorLength = text.slice(prefixEnd).match(/^\s*/u)?.[0].length || 0;
+    const agentsStart = prefixEnd + separatorLength;
+    return text.startsWith(CODEX_AGENTS_HEADER_PREFIX, agentsStart) ? agentsStart : null;
+}
+
 function getCodexAgentsInstructionsBlock(text: string): { block: string; rest: string; agentsPath: string } | null {
-    // Support both legacy format ("# AGENTS.md instructions for /path")
-    // and new format ("# AGENTS.md instructions" without path suffix)
-    if (!text.startsWith(CODEX_AGENTS_HEADER_PREFIX)) return null;
+    const agentsStart = getCodexAgentsHeaderStart(text);
+    if (agentsStart === null) return null;
     const endMarker = "</INSTRUCTIONS>";
-    const endIndex = text.indexOf(endMarker);
+    const endIndex = text.indexOf(endMarker, agentsStart + CODEX_AGENTS_HEADER_PREFIX.length);
     if (endIndex < 0) return null;
-    const beforeEnd = text.slice(0, endIndex);
+    const beforeEnd = text.slice(agentsStart, endIndex);
     if (!beforeEnd.includes("<INSTRUCTIONS>")) return null;
-    const firstLine = text.split(/\r?\n/u, 1)[0] || "";
-    // Extract path from legacy header; new format has no path
+    const firstLine = text.slice(agentsStart).split(/\r?\n/u, 1)[0] || "";
     const agentsPath = firstLine.startsWith(CODEX_AGENTS_HEADER_LEGACY)
         ? firstLine.slice(CODEX_AGENTS_HEADER_LEGACY.length).trim() || "(unknown)"
         : "(unknown)";
@@ -580,8 +977,7 @@ function shouldFoldCodexAgentsMessage(events: any[] | undefined, eventIndex: num
 function isCodexAgentsUserMessageEvent(event: any): boolean {
     const payload = event?.payload || {};
     if (event?.type !== "response_item" || payload.type !== "message" || payload.role !== "user") return false;
-    const firstText = extractTextFromCodexContentItem(Array.isArray(payload.content) ? payload.content[0] : null);
-    return Boolean(getCodexAgentsInstructionsBlock(firstText));
+    return Boolean(getCodexAgentsInstructionsBlock(extractRawCodexMessageText(payload)));
 }
 
 function extractRawCodexMessageText(payload: any): string {
@@ -593,18 +989,14 @@ function extractCodexMessageText(
     options: { events?: any[]; eventIndex?: number } = {},
 ): string {
     const content = Array.isArray(payload?.content) ? payload.content : [];
-    const parts = content.map((item: any, index: number) => {
-        const text = extractTextFromCodexContentItem(item);
-        if (
-            index === 0 &&
-            payload?.role === "user" &&
-            shouldFoldCodexAgentsMessage(options.events, options.eventIndex, text)
-        ) {
-            return foldCodexAgentsInstructionsText(text);
-        }
-        return text;
-    });
-    return parts.join("");
+    const text = content.map((item: any) => extractTextFromCodexContentItem(item)).join("");
+    if (
+        payload?.role === "user" &&
+        shouldFoldCodexAgentsMessage(options.events, options.eventIndex, text)
+    ) {
+        return foldCodexAgentsInstructionsText(text);
+    }
+    return text;
 }
 
 function truncate(text: string, maxLen: number): string {
@@ -806,6 +1198,33 @@ export function readRolloutEvents(rolloutPath: string): any[] {
         fs.closeSync(fd);
     }
 
+    return events;
+}
+
+export async function readRolloutEventsAsync(rolloutPath: string): Promise<any[]> {
+    const events: any[] = [];
+    try {
+        await forEachCodexJsonlLineAsync(
+            rolloutPath,
+            (line) => {
+                try {
+                    events.push(sanitizeCodexEvent(JSON.parse(line)));
+                } catch {
+                }
+            },
+            {
+                onOversizedLine: (chars, isTail) => {
+                    events.push(makeSkippedRolloutLineEvent(
+                        isTail ? "Codex rollout 尾部单行超过安全上限" : "Codex rollout 单行超过安全上限",
+                        chars,
+                    ));
+                },
+            },
+        );
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+        throw error;
+    }
     return events;
 }
 
@@ -1384,6 +1803,35 @@ print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
     })).filter((item) => item.threadId);
 }
 
+async function readSpawnChildrenAsync(parentThreadId: string): Promise<CodexSubagentSummary[]> {
+    if (!await pathExistsAsync(STATE_DB)) return [];
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+parent = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+rows = conn.execute(
+    """
+    select e.child_thread_id, e.status, t.agent_nickname, t.agent_role, t.title
+    from thread_spawn_edges e
+    left join threads t on t.id = e.child_thread_id
+    where e.parent_thread_id = ?
+    order by coalesce(t.updated_at_ms, t.updated_at, 0) desc
+    """,
+    (parent,)
+).fetchall()
+print(json.dumps([dict(r) for r in rows], ensure_ascii=False))
+`;
+    const rows = await execPythonJsonAsync(script, [STATE_DB, parentThreadId]) as any[] || [];
+    return rows.map((row) => ({
+        threadId: row.child_thread_id,
+        nickname: row.agent_nickname || row.title || "subagent",
+        role: row.agent_role || "",
+        summary: row.status ? `数据库边状态: ${row.status}` : undefined,
+    })).filter((item) => item.threadId);
+}
+
 export function getCodexParentThread(threadId: string): CodexThreadInfo | null {
     const resolvedId = resolveCodexThreadId(threadId);
     if (!resolvedId || !fs.existsSync(STATE_DB)) return null;
@@ -1410,6 +1858,34 @@ print(json.dumps(dict(row), ensure_ascii=False) if row else "null")
     const row = execPythonJson(script, [STATE_DB, resolvedId]) as any | null;
     if (!row) return null;
     return threadFromSqliteRow(row);
+}
+
+export async function getCodexParentThreadAsync(threadId: string): Promise<CodexThreadInfo | null> {
+    const resolvedId = await resolveCodexThreadIdAsync(threadId);
+    if (!resolvedId || !await pathExistsAsync(STATE_DB)) return null;
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+child = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+row = conn.execute(
+    """
+    select t.id, t.rollout_path, t.cwd, t.title, t.source, t.model, t.reasoning_effort,
+           t.agent_nickname, t.agent_role, t.updated_at_ms
+    from thread_spawn_edges e
+    join threads t on t.id = e.parent_thread_id
+    where e.child_thread_id = ?
+    order by coalesce(t.updated_at_ms, t.updated_at, 0) desc
+    limit 1
+    """,
+    (child,)
+).fetchone()
+print(json.dumps(dict(row), ensure_ascii=False) if row else "null")
+`;
+    const row = await execPythonJsonAsync(script, [STATE_DB, resolvedId]) as any | null;
+    if (!row) return null;
+    return threadFromSqliteRow(row, await readCodexSessionIndexMapAsync());
 }
 
 export function getCodexRootThread(threadId: string): CodexThreadInfo | null {
@@ -1780,6 +2256,75 @@ export function loadCodexConversation(
                 continue;
             }
             const childConv = loadCodexConversation(child.threadId, "summary", depth + 1);
+            if (!childConv) {
+                childDiagnostics.push({
+                    threadId: child.threadId,
+                    nickname: child.nickname,
+                    reason: "load_failed",
+                    detail: "子线程 rollout 存在，但解析失败",
+                });
+                continue;
+            }
+            expandedChildren.push({ thread: childThread, rounds: childConv.rounds });
+        }
+    }
+
+    return {
+        thread,
+        parentThread,
+        rounds: built.rounds,
+        totalSteps: events.length,
+        childThreads: built.childThreads,
+        expandedChildren,
+        childDiagnostics,
+    };
+}
+
+export async function loadCodexConversationAsync(
+    conversationId: string,
+    link: ConversationLinkMode = "summary",
+    depth = 0,
+): Promise<CodexConversationData | null> {
+    const thread = await getCodexThreadAsync(conversationId);
+    if (!thread || !thread.rolloutPath) return null;
+    const [parentThread, events, edgeChildren] = await Promise.all([
+        getCodexParentThreadAsync(thread.id),
+        readRolloutEventsAsync(thread.rolloutPath),
+        readSpawnChildrenAsync(thread.id),
+    ]);
+    const built = buildCodexRoundsForTest(events, link, { cwd: thread.cwd });
+    for (const child of edgeChildren) {
+        if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
+            built.childThreads.push(child);
+        }
+    }
+
+    const expandedChildren: Array<{ thread: CodexThreadInfo; rounds: ConversationRound[] }> = [];
+    const childDiagnostics: CodexChildThreadDiagnostic[] = [];
+
+    if (link === "expand_children" && depth < 1) {
+        for (const [index, child] of built.childThreads.entries()) {
+            if (index > 0 && index % CODEX_JSONL_ASYNC_YIELD_INTERVAL === 0) await eventLoopYield();
+            const childThread = await getCodexThreadAsync(child.threadId);
+            if (!childThread) {
+                childDiagnostics.push({
+                    threadId: child.threadId,
+                    nickname: child.nickname,
+                    reason: "thread_not_found",
+                    detail: "子线程不在 Codex 线程索引中，可能已被清理",
+                });
+                continue;
+            }
+            if (!childThread.rolloutPath || !await pathExistsAsync(childThread.rolloutPath)) {
+                childDiagnostics.push({
+                    threadId: child.threadId,
+                    nickname: child.nickname,
+                    reason: "rollout_missing",
+                    detail: "子线程索引存在，但 rollout 事件文件不存在",
+                });
+                continue;
+            }
+            const childConv = await loadCodexConversationAsync(child.threadId, "summary", depth + 1);
             if (!childConv) {
                 childDiagnostics.push({
                     threadId: child.threadId,

@@ -14,6 +14,9 @@ export const MAX_PROMPT_CHARS = 500_000;
 /** Codex CLI 模型桥不适合一次吞超长上下文，按较小批次稳定生成。 */
 export const CODEX_RECORD_MAX_PROMPT_CHARS = Number(process.env.MEMORY_STORE_CODEX_RECORD_MAX_PROMPT_CHARS || 60_000);
 
+/** Grok Record 模型上下文较大，但仍保留预算保护，避免把 1M 上下文误当无限制。 */
+export const GROK_RECORD_MAX_PROMPT_CHARS = Number(process.env.MEMORY_STORE_GROK_RECORD_MAX_PROMPT_CHARS || 200_000);
+
 /** Codex 更新 Record 时携带的已有 Record 上下文上限，避免后期 Record 变长拖垮单批 prompt。 */
 export const CODEX_RECORD_CONTEXT_CHARS = Number(process.env.MEMORY_STORE_CODEX_RECORD_CONTEXT_CHARS || 30_000);
 
@@ -32,6 +35,8 @@ export const CODEX_RECORD_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CODEX_REC
 export const CODEX_RECORD_BACKGROUND_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT || 8 * 60_000);
 /** Antigravity/LS Record 模型调用超时，独立于其它轻量模型调用。 */
 export const RECORD_MODEL_TIMEOUT_MS = Number(process.env.MEMORY_STORE_RECORD_MODEL_TIMEOUT || 180_000);
+/** Grok Record 模型调用超时，独立于默认 Grok 轻量调用。 */
+export const GROK_RECORD_TIMEOUT_MS = Number(process.env.MEMORY_STORE_GROK_RECORD_TIMEOUT || 120_000);
 /** 长模型调用阶段的后台进度心跳间隔。 */
 export const RECORD_PROGRESS_HEARTBEAT_MS = Number(process.env.MEMORY_STORE_RECORD_PROGRESS_HEARTBEAT_MS || 30_000);
 /** Codex 模型桥只对快失败轻量重试，完整超时不重试。 */
@@ -63,7 +68,7 @@ export const RECORD_PARALLEL_SINGLE_CHUNK_RECORD_CHARS = Number(process.env.MEMO
 export const RECORD_ADJACENT_CONTEXT_ROUNDS = Number(process.env.MEMORY_STORE_RECORD_ADJACENT_CONTEXT_ROUNDS || 1);
 export const RECORD_ADJACENT_CONTEXT_CHARS = Number(process.env.MEMORY_STORE_RECORD_ADJACENT_CONTEXT_CHARS || 6_000);
 export const RECORD_PATCH_CHECKPOINT_ENABLED = process.env.MEMORY_STORE_RECORD_PATCH_CHECKPOINT !== "0";
-export const RECORD_PATCH_CHECKPOINT_VERSION = 1;
+export const RECORD_PATCH_CHECKPOINT_VERSION = 3;
 /** 本地合成重写区估算字数超过此阈值时，改走串行累积管线避免单次长输出超时。
  *  1M 上下文模型输入不是瓶颈，瓶颈是「单次输出」长度，故从宽默认 ~40K。 */
 export const RECORD_COMPOSE_SERIAL_THRESHOLD_CHARS = Number(process.env.MEMORY_STORE_RECORD_COMPOSE_SERIAL_THRESHOLD_CHARS || 40_000);

@@ -39,6 +39,8 @@ import {
     windsurfListContainsId,
     makeWindsurfTransport,
     type WindsurfLsEndpoint,
+    type WindsurfLsTransportCallOptions,
+    type WindsurfLsTransportDiagnostics,
 } from "./windsurf-client.js";
 import {
     MappingStore,
@@ -62,7 +64,11 @@ export interface RouterEndpoint {
     executablePath?: string;
     /** 统一调用入口（只读白名单内）。反重力→rpcCall；WSF→createWindsurfLsTransport。
      *  约定：非 2xx/连接失败一律 reject，便于广播 Promise 隔离。 */
-    transport: (method: string, payload?: Record<string, unknown>, timeoutMs?: number) => Promise<any>;
+    transport: (
+        method: string,
+        payload?: Record<string, unknown>,
+        options?: number | WindsurfLsTransportCallOptions,
+    ) => Promise<any>;
     /** 端点稳定身份键 `${kind}:${pid}:${port}`，映射/去重/日志用。 */
     key: string;
 }
@@ -76,6 +82,7 @@ export interface ResolveResult {
     probedCount: number;
     /** true=映射命中再确认通过（快路径） */
     fromMapping: boolean;
+    transportDiagnostics?: WindsurfLsTransportDiagnostics[];
 }
 
 /** 当前窗口上下文指纹（方案 D 注入用） */
@@ -95,6 +102,11 @@ const PROBE_TIMEOUT_MS = 5_000;
 /** 广播整体兜底超时（墙钟，unref 不阻止进程退出） */
 const BROADCAST_OVERALL_TIMEOUT_MS = 15_000;
 
+function getProbeTimeoutMs(): number {
+    const value = Number(process.env.MEMORY_STORE_ROUTER_PROBE_TIMEOUT_MS);
+    return Number.isFinite(value) && value > 0 ? value : PROBE_TIMEOUT_MS;
+}
+
 // ===== 模块级状态 =====
 
 const mappingStore = new MappingStore();
@@ -107,6 +119,7 @@ let currentContext: CurrentContext = {};
 
 /** 测试注入的枚举器（覆盖 enumerateActiveLs 的真实实现） */
 let enumeratorOverride: ((kind?: LsKind) => Promise<RouterEndpoint[]>) | null = null;
+let broadcastOverallTimeoutOverride: number | null = null;
 
 // ===== 上下文 API（方案 D） =====
 
@@ -146,6 +159,16 @@ export function __setEnumeratorForTest(fn: ((kind?: LsKind) => Promise<RouterEnd
     enumeratorOverride = fn;
 }
 
+export function __setBroadcastOverallTimeoutForTest(timeoutMs: number | null): void {
+    broadcastOverallTimeoutOverride = timeoutMs;
+}
+
+function getBroadcastOverallTimeoutMs(): number {
+    return broadcastOverallTimeoutOverride !== null
+        ? Math.max(1, broadcastOverallTimeoutOverride)
+        : BROADCAST_OVERALL_TIMEOUT_MS;
+}
+
 // ===== RouterEndpoint 构造 =====
 
 /** 反重力 RegistryEntry / LsProcessInfo → RouterEndpoint */
@@ -157,14 +180,16 @@ function antigravityEndpoint(info: LsProcessInfo, port: number): RouterEndpoint 
         csrfToken: info.csrfToken,
         workspaceId: info.workspaceId,
         key: endpointKey("antigravity", info.pid, port),
-        transport: (method, payload = {}, timeoutMs = LIGHT_TIMEOUT) =>
-            rpcCall(info, port, method, payload, timeoutMs).then(r => {
+        transport: (method, payload = {}, options = LIGHT_TIMEOUT) => {
+            const timeoutMs = typeof options === "number" ? options : options.timeoutMs ?? LIGHT_TIMEOUT;
+            return rpcCall(info, port, method, payload, timeoutMs).then(r => {
                 // 约定：非 2xx 一律 reject，便于广播 Promise 隔离。
                 if (r.status < 200 || r.status >= 300) {
                     throw new Error(`antigravity rpc ${method} status ${r.status}`);
                 }
                 return r.data;
-            }),
+            });
+        },
     };
 }
 
@@ -178,7 +203,11 @@ function windsurfEndpoint(ep: WindsurfLsEndpoint): RouterEndpoint {
         csrfToken: ep.csrfToken,
         executablePath: ep.executablePath,
         key: endpointKey("windsurf", ep.pid, ep.port),
-        transport: (method, payload = {}) => transportFn(method, payload),
+        transport: (method, payload = {}, options) => transportFn(
+            method,
+            payload,
+            typeof options === "number" ? { timeoutMs: options } : options,
+        ),
     };
 }
 
@@ -299,9 +328,33 @@ interface HoldsResult {
  * 探测某 endpoint 是否持有 cascadeId（统一走 GetAllCascadeTrajectories，只读白名单内）。
  * 反重力 summaries 是对象（{cascadeId: info}）；WSF summaries 数组/对象两形态均判对。
  */
-async function holdsConversation(endpoint: RouterEndpoint, cascadeId: string): Promise<HoldsResult> {
-    const probe = (async (): Promise<HoldsResult> => {
-        const data = await endpoint.transport("GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+async function holdsConversation(
+    endpoint: RouterEndpoint,
+    cascadeId: string,
+    onConcurrencyEvent?: (diagnostics: WindsurfLsTransportDiagnostics) => void,
+    overallDeadlineAt?: number,
+    requestClass?: WindsurfLsTransportCallOptions["requestClass"],
+): Promise<HoldsResult> {
+    try {
+        const probeTimeoutMs = Math.min(
+            getProbeTimeoutMs(),
+            overallDeadlineAt === undefined
+                ? Number.POSITIVE_INFINITY
+                : Math.max(1, overallDeadlineAt - Date.now()),
+        );
+        const data = await endpoint.transport(
+            "GetAllCascadeTrajectories",
+            {},
+            endpoint.kind === "windsurf"
+                ? {
+                    timeoutMs: probeTimeoutMs,
+                    deadlineAt: Date.now() + probeTimeoutMs,
+                    timeoutMessage: "WSF LS GetAllCascadeTrajectories probe timed out",
+                    onConcurrencyEvent,
+                    requestClass,
+                }
+                : probeTimeoutMs,
+        );
         if (endpoint.kind === "windsurf") {
             const held = windsurfListContainsId(data, cascadeId);
             const stepCount = held ? extractStepCount(data, cascadeId) : -1;
@@ -315,8 +368,9 @@ async function holdsConversation(endpoint: RouterEndpoint, cascadeId: string): P
         const info = (summaries as Record<string, any>)[cascadeId];
         if (!info) return { endpoint, held: false, stepCount: -1 };
         return { endpoint, held: true, stepCount: typeof info.stepCount === "number" ? info.stepCount : (Number(info.stepCount) || 0) };
-    })();
-    return withProbeTimeout(probe, PROBE_TIMEOUT_MS, { endpoint, held: false, stepCount: -1 });
+    } catch {
+        return { endpoint, held: false, stepCount: -1 };
+    }
 }
 
 /** 从 summaries（数组/对象两形态）抽指定 cascadeId 的 stepCount */
@@ -348,29 +402,41 @@ function extractStepCount(data: unknown, cascadeId: string): number {
  * 慢路径：枚举活跃 LS → 并发广播 holds → 取持有者（多持有者取 stepCount 最大）。
  * single-flight：per-mapKey 去重，同 id 并发只跑一次广播。
  */
-export async function resolveEndpointForConversation(cascadeId: string, kind: LsKind): Promise<ResolveResult> {
-    const key = mapKey(cascadeId, kind);
+export async function resolveEndpointForConversation(
+    cascadeId: string,
+    kind: LsKind,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<ResolveResult> {
+    const key = `${mapKey(cascadeId, kind)}:${kind === "windsurf" ? (options.requestClass || "foreground") : "default"}`;
     const existing = inflight.get(key);
     if (existing) return existing;
 
-    const task = doResolve(cascadeId, kind).finally(() => {
+    const task = doResolve(cascadeId, kind, options).finally(() => {
         inflight.delete(key);
     });
     inflight.set(key, task);
     return task;
 }
 
-async function doResolve(cascadeId: string, kind: LsKind): Promise<ResolveResult> {
+async function doResolve(
+    cascadeId: string,
+    kind: LsKind,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<ResolveResult> {
+    const transportDiagnostics: WindsurfLsTransportDiagnostics[] = [];
+    const onConcurrencyEvent = kind === "windsurf"
+        ? (diagnostics: WindsurfLsTransportDiagnostics) => transportDiagnostics.push(diagnostics)
+        : undefined;
     // ===== 快路径：映射命中 → 仅对该 endpoint 做轻量 holds 再确认（不调全量枚举）=====
     // 映射中缓存了上次命中的 RouterEndpoint（纯进程内引用，transport 在 LS 存活期间有效）。
     // 再确认只发一次 GetAllCascadeTrajectories；连失败/不再持有立即剔除重探，杜绝静默返旧。
     const mapped = mappingStore.get(cascadeId, kind);
     if (mapped && mapped.endpoint) {
         const mappedEndpoint = mapped.endpoint as RouterEndpoint;
-        const holds = await holdsConversation(mappedEndpoint, cascadeId);
+        const holds = await holdsConversation(mappedEndpoint, cascadeId, onConcurrencyEvent, undefined, options.requestClass);
         if (holds.held) {
             rememberMapping(cascadeId, kind, mappedEndpoint, holds.stepCount);
-            return { endpoint: mappedEndpoint, reason: "ok", stepCount: holds.stepCount, probedCount: 1, fromMapping: true };
+            return { endpoint: mappedEndpoint, reason: "ok", stepCount: holds.stepCount, probedCount: 1, fromMapping: true, transportDiagnostics };
         }
         // 不再持有 / 端点已死 → 剔除映射，落入慢路径重探
         mappingStore.invalidate(cascadeId, kind);
@@ -380,19 +446,27 @@ async function doResolve(cascadeId: string, kind: LsKind): Promise<ResolveResult
     // ===== 慢路径：枚举 + 并发广播 holds =====
     const endpoints = await enumerateActiveLs(kind);
     if (endpoints.length === 0) {
-        return { endpoint: null, reason: "no_ls", stepCount: -1, probedCount: 0, fromMapping: false };
+        return { endpoint: null, reason: "no_ls", stepCount: -1, probedCount: 0, fromMapping: false, transportDiagnostics };
     }
 
-    const broadcast = Promise.all(endpoints.map(ep => holdsConversation(ep, cascadeId)));
+    const broadcastTimeoutMs = getBroadcastOverallTimeoutMs();
+    const broadcastDeadlineAt = Date.now() + broadcastTimeoutMs;
+    const broadcast = Promise.all(endpoints.map(ep => holdsConversation(
+        ep,
+        cascadeId,
+        onConcurrencyEvent,
+        broadcastDeadlineAt,
+        options.requestClass,
+    )));
     const results = await withProbeTimeout(
         broadcast,
-        BROADCAST_OVERALL_TIMEOUT_MS,
+        broadcastTimeoutMs + 50,
         endpoints.map(ep => ({ endpoint: ep, held: false, stepCount: -1 })),
     );
 
     const holders = results.filter(r => r.held);
     if (holders.length === 0) {
-        return { endpoint: null, reason: "not_held", stepCount: -1, probedCount: endpoints.length, fromMapping: false };
+        return { endpoint: null, reason: "not_held", stepCount: -1, probedCount: endpoints.length, fromMapping: false, transportDiagnostics };
     }
 
     // 多持有者取 stepCount 最大（最新者，见方案 B）。
@@ -408,5 +482,6 @@ async function doResolve(cascadeId: string, kind: LsKind): Promise<ResolveResult
         stepCount: winner.stepCount,
         probedCount: endpoints.length,
         fromMapping: false,
+        transportDiagnostics,
     };
 }

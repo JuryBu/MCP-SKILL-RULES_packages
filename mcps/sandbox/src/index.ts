@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.13.7
+ * MCP Sandbox Server v1.14.0
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -21,6 +21,7 @@ import { isParentAlive, checkParentAliveWithTolerance, isAntigravityLS, logStdin
 import { ensureDataDirs, cleanOldTempFiles } from "./temp-store.js";
 import { detectEnvironment } from "./env-detector.js";
 import { closeAllSessions } from "./session-manager.js";
+import { cleanOldBgTasks, restoreBackgroundTasksOnStartup } from "./background-tasks.js";
 
 // 工具注册
 import { registerExec } from "./tools/exec.js";
@@ -31,6 +32,7 @@ import { registerCodex, cleanupCodexTasks } from "./tools/codex.js";
 import { registerLaunch } from "./tools/launch.js";
 import { registerSmartSearch } from "./tools/smart-search.js";
 import { registerCouncil } from "./tools/council.js";
+import { cleanOldCouncilTasks, scanCouncilTasksOnStartup } from "./council/background.js";
 import { initParentLs } from "./ls-client.js";
 
 // === 进程生命周期 ===
@@ -39,7 +41,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.13.7",
+    version: "1.14.0",
 });
 
 // 注册所有 8 个工具
@@ -64,7 +66,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.13.7 使用指南
+                text: `# MCP Sandbox v1.14.0 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -288,9 +290,9 @@ MCP 进程与父 LS 进程绑定（ppid），与窗口同生共死：
 | matchPerLine | true | exact: 行级/文件级 |
 | context | 2 | exact: 上下文行数 |
 | files | - | smart: 指定文件+范围 |
-| modelChain | auto | smart: 模型链路，auto/antigravity/codex/claude-code/cc；未填回退到 chain |
+| modelChain | auto | smart: 模型链路，auto/grok/antigravity/codex/claude-code/cc；未填回退到 chain |
 | chain | auto | 兼容旧参数：smart 模型链路，modelChain 未填时使用 |
-| background | false | smart 单查询可后台执行，先返回 taskId |
+| background | smart默认true | smart 单查询默认后台，先返回 taskId；设 false 可强制前台 |
 | taskId | - | 查询后台 smart_search 任务 |
 | waitSeconds | 0 | 查询后台任务时等待秒数 |
 | ownerId | global | 后台任务归属 ID |
@@ -298,14 +300,18 @@ MCP 进程与父 LS 进程绑定（ppid），与窗口同生共死：
 
 说明：
 - exact / fuzzy 完全不受 modelChain/chain 参数影响，行为保持不变
-- modelChain=auto：当前宿主优先；Antigravity 宿主优先走 LS，Codex/其他宿主优先走 Codex bridge；不会自动调用 Claude Code CLI，避免静默消耗额度
+- modelChain=auto：按 Grok → Antigravity → Codex 自动选择；Grok 通过本机 progrok OpenAI-compatible API（默认 http://127.0.0.1:18645）调用；不会自动调用 Claude Code CLI，避免静默消耗额度
+- modelChain=grok：强制走 progrok API；不可用时直接报错，不静默降级。便携公开版只连接接收方已启动的 proxy，不自动启动或修改 progrok 安装
+- smart_search 的 Grok 三阶段默认传 reasoning_effort=low；可用 SANDBOX_PROGROK_REASONING_EFFORT / SANDBOX_SMART_GROK_REASONING_EFFORT 覆盖。progrok 超时、截断、429、5xx 时会在 Grok 桥内用 fallback 模型重试一次，默认 grok-4.20-non-reasoning，可用 SANDBOX_PROGROK_FALLBACK_MODEL / SANDBOX_SMART_GROK_FALLBACK_MODEL 覆盖；max_tokens 保持 4096
+- progrok 可用性探测默认 8s、瞬态失败重试 1 次，且响应必须包含 ok 才算可用；可用 SANDBOX_PROGROK_PROBE_TIMEOUT_MS / SANDBOX_PROGROK_PROBE_RETRIES 覆盖，避免 Clash/progrok 短暂波动时过早降级到 Codex
 - modelChain=antigravity：强制走 Antigravity LS；未发现可连接 LS 时直接报错
 - modelChain=codex：强制走 Codex CLI bridge；未发现 codex 时直接报错。短同步模型桥默认用 gpt-5.5 low + fast，并在超时、429/5xx、连接中断、空输出等可重试错误时按同 provider fallback 链降级到 gpt-5.4 low / gpt-5.4-mini low
 - modelChain=claude-code/cc：显式走本地 Claude Code CLI；未发现 claude 时直接报错。默认有小额预算保护，适合作为人工确认后的末端 fallback 或 CC 兼容验证
 - Windsurf/WSF 只是 MCP 客户端与对话数据来源，不提供 sandbox 模型链路；modelChain=windsurf 不在 schema 中，应被拒绝
 - modelChain 未填写时使用 chain，两者都未填写时使用 auto；chain 仅作为模型链路兼容参数保留，不代表数据链路，也不会引入 dataChain
-- 大目录或长文件的 smart + codex/claude-code 调用建议使用 background=true，再用 smart_search(taskId="...", waitSeconds=30-45) 轮询
-- smart_search 后台任务带 deadline/timedOut，默认 15 分钟超时标记 error，不重启或杀掉 sandbox 后端
+- 大目录或长文件的 smart 单查询默认 background=true；调用方会先拿 taskId，再用 smart_search(taskId="...", waitSeconds=30-45) 轮询
+- smart_search 后台任务带 deadline/timedOut，默认 15 分钟超时标记 error；任务状态会写入 sandbox-data/bg-tasks，后端重启后仍可用 taskId 查询，仍在 running 的旧任务会标记为 interrupted
+- smart 自动定位默认最多分析 12 个 SearchUnit，可用 maxResults 或 SANDBOX_SMART_DEFAULT_MAX_RESULTS 覆盖；索引阶段先走模型 JSON 索引，失败后拆段 retry，再退化到本地 fuzzy；候选较多时，broad 阶段会跳过完全没有本地证据的 unit，并通过 SANDBOX_SMART_LOCAL_EVIDENCE_EXPLORATION_UNITS 保留少量探索名额；deep 阶段默认最多深挖 8 个 yes/maybe unit，可用 SANDBOX_SMART_DEEP_MAX_UNITS 覆盖
 - files[].range 支持 "620-650" 与 "#620-650" 两种写法；无法识别的 range 会回退全文传给模型
 - 批量搜索时，顶层 modelChain 可作为默认值，queries[i].modelChain 可单独覆盖；未填时按 chain 兼容规则回退
 
@@ -328,6 +334,7 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 - moderator 主持模型决定继续、调用工具、点名补充或 TERMINATE
 - Antigravity provider 只走 GetModelResponse，不使用 Cascade
 - 支持 background/taskId/waitSeconds/ownerId，长讨论建议后台运行；任务未完成时会返回当前讨论进度。启动时使用了 ownerId，后续 taskId 查询必须传同一个 ownerId，避免误以为任务丢失而重复启动
+- 支持 resume/resumeTaskId：interrupted 的 council 后台任务会读取 checkpoint 断点继续；上一轮未完整提交时会重试该轮，已完成轮次不会重复
 - 完整副本同时写 Markdown + JSON
 
 常用参数:
@@ -355,6 +362,7 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 Provider:
 - antigravity: GetModelResponse 文本链路；model 可传 M132/M20/M18/M16/M36/flash/pro-high/sonnet/opus 等别名，也可传 MODEL_* 编码
 - codex: Codex CLI bridge
+- grok: 本机 progrok OpenAI-compatible API；默认模型 grok-4.5，supportsVision=true 时支持 image_url 输入
 - claudeCode: 本地 Claude Code CLI，显式 provider；默认小额预算，transcript/JSON 会记录 sessionId、实际模型、耗时、预算消耗和临时 stdout/stderr 路径
 - Windsurf/WSF 不提供 council provider；需要在 WSF 中使用本工具时，请通过 broker 调用现有 provider，不要传 provider="windsurf"
 - openai: Responses API，支持 vision 输入
@@ -366,6 +374,7 @@ Provider:
 - params.fallbackModels: 同 provider 降级链。主模型按 params.retries 重试仍失败，且错误属于超时、429、5xx、空输出、连接中断这类临时问题时，按顺序尝试备用模型；API key 缺失、参数错误、安全拦截、输出截断等不会自动降级
 - Antigravity/OpenAI/Anthropic/Gemini/custom provider 的 fallbackModels 必须显式写在对应 participant/moderator 的 params 里；不会因为 model 写了 sonnet/opus 就自动选择备用模型。Antigravity Claude/Sonnet/Opus 不稳定时可传 "params": {"retries": 1, "fallbackModels": ["M132", "M20", "M18", "M16", "M36"]}，否则只重试当前模型。复杂推理/Guard/审议类任务可显式指定 M16 或把 M16 放到自定义 fallback 前段
 - Codex provider 未显式传 fallbackModels 时默认按 gpt-5.4 high → medium → low → gpt-5.4-mini medium → low 降级，并跳过当前已使用档位；可用 SANDBOX_COUNCIL_CODEX_DEFAULT_FALLBACKS=0 关闭
+- Grok provider 默认不臆造备用模型；只有显式 params.fallbackModels 或 SANDBOX_COUNCIL_GROK_MODEL_CHAIN 才启用同 provider 降级。默认同源并发 2，可用 SANDBOX_COUNCIL_GROK_CONCURRENCY 覆盖
 - Claude Code provider 不进入 auto 或 Codex 默认 fallback；只有显式 provider="claudeCode" 才会调用，可用 params.maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools 控制
 - Gemini CLI provider 未显式传 fallbackModels 时默认按 auto-gemini-3 → gemini-3.1-pro-preview → gemini-2.5-pro → gemini-3.1-flash-lite-preview → gemini-2.5-flash-lite 降级；可用 SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS=0 关闭。Gemini CLI provider 默认 approvalMode=yolo，可用 params.approvalMode 或 SANDBOX_COUNCIL_GEMINI_CLI_APPROVAL_MODE 覆盖；provider/indexer 的临时 prompt/artifact 会写到 Gemini 允许访问的项目临时目录。若超时时标记结果已经写好，宿主会直接收结果并清理进程树
 - moderator 调用失败时会先走 provider fallback；如果所有主持模型仍失败，会用规则兜底汇总已返回的参与者意见，并标明未经过主持模型二次综合
@@ -435,6 +444,8 @@ Antigravity 常用别名:
 - v1.13.5 修复 webFetchText redirect SSRF：direct backend 改为 redirect:"manual" 并对每一跳重新做公网校验，公网 URL 302 到 localhost/私网会被拒绝；显式 backend=exa / backend=webFetcher 在未证明逐跳私网校验前暂停。同步修复 Codex CLI 启动面，sandbox_codex 与 Codex model bridge 改为 spawn(..., {shell:false}) raw argv，并新增 npm run test:ssrf-redirect / npm run test:shell-injection。
 - v1.13.6 修复 batch/executor/exec 互斥一致性、Antigravity LS detailed 错误与 wall-clock 超时、launch cwd 预校验、wrapper spawn error 失败落盘，以及 command 模式 descendant tree 内存汇总。新增 npm run test:batch-mutex / test:council-antigravity / test:launch-cwd。
 - v1.13.7 清理 Plan_12 P2/P3 设计风险：smart_search ESM 下改用 shellless spawnSync 探测 rg；background 超时向 runner/model bridge/provider 传播 AbortSignal 并清理 Codex 子进程；sandbox_launch registry 改为 per-task 文件并兼容 legacy registry.json tombstone；sandbox_session 总内存改为按 maxMemoryMB 额度预留；stderr 截断时 tempFile 保留 stdout/stderr 完整原文；缺失图片文件走 unreadable stub；同步修正 guide/status 文档。新增 npm run test:smart-search-rg / test:background-abort / test:session-memory-reservation / test:exec-stderr-tempfile / test:council-missing-image。
+- v1.14.0 Plan_13 P0/P1/P2：broker 关机 best-effort 落状态；council 历史清理、启动扫描和 checkpoint resume；普通 background tasks 写入 sandbox-data/bg-tasks，后端重启后可查询 done/error/interrupted。新增 npm run test:council-maintenance / test:council-resume / test:bg-tasks-persist / test:bg-tasks-cleanup。
+- v1.14.0 Plan_13 D-11：sandbox_council 新增 provider=grok，复用 progrok API，支持 vision image_url、同源并发限制、显式同 provider fallback 和 fake server 回归测试。
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，默认走 sandbox direct 安全路径，手动跟随重定向并逐跳拒绝 localhost / 私有地址；显式 backend=exa/webFetcher 暂停，待补等价逐跳私网校验证明后再恢复
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -526,7 +537,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.13.7 启动中... (ppid=${process.ppid})`);
+    console.error(`[sandbox] MCP Server v1.14.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -534,6 +545,26 @@ console.error(`[sandbox] MCP Server v1.13.7 启动中... (ppid=${process.ppid})`
 
     // 清理过期临时文件
     cleanOldTempFiles();
+
+    void Promise.resolve().then(() => {
+        const cleaned = cleanOldCouncilTasks();
+        if (cleaned > 0) {
+            console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
+        }
+        scanCouncilTasksOnStartup((message) => console.error(message));
+    }).catch((err) => {
+        console.error(`[sandbox] council任务启动维护失败: ${err}`);
+    });
+
+    void Promise.resolve().then(() => {
+        const cleaned = cleanOldBgTasks();
+        if (cleaned > 0) {
+            console.error(`[sandbox] 已清理 ${cleaned} 个过期后台任务状态`);
+        }
+        restoreBackgroundTasksOnStartup((message) => console.error(message));
+    }).catch((err) => {
+        console.error(`[sandbox] 后台任务启动恢复失败: ${err}`);
+    });
 
     // 环境探测（异步，不阻塞启动）
     detectEnvironment().catch((err) => {
@@ -548,7 +579,7 @@ console.error(`[sandbox] MCP Server v1.13.7 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[sandbox] MCP Server v1.13.7 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.14.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

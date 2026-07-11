@@ -1,6 +1,9 @@
+import fs from "fs";
+import path from "path";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "./owner.js";
+import { DATA_ROOT } from "./temp-store.js";
 
-export type BackgroundTaskStatus = "running" | "done" | "error";
+export type BackgroundTaskStatus = "running" | "done" | "error" | "interrupted";
 
 export interface BackgroundTask {
     id: string;
@@ -20,6 +23,9 @@ export interface BackgroundTask {
 
 const tasks = new Map<string, BackgroundTask>();
 const TASK_TTL_MS = Number(process.env.SANDBOX_BACKGROUND_TASK_TTL || 30 * 60 * 1000);
+const BG_TASKS_DIR = process.env.SANDBOX_BG_TASKS_DIR
+    ? path.resolve(process.env.SANDBOX_BG_TASKS_DIR)
+    : path.join(DATA_ROOT, "bg-tasks");
 
 export interface StartBackgroundTaskOptions {
     ownerId?: string;
@@ -30,6 +36,58 @@ export type BackgroundTaskProgress = (progress: string) => void;
 
 function nowIso(): string {
     return new Date().toISOString();
+}
+
+function ensureBgTasksDir(): void {
+    fs.mkdirSync(BG_TASKS_DIR, { recursive: true });
+}
+
+function getTaskPath(taskId: string): string {
+    return path.join(BG_TASKS_DIR, `${taskId}.json`);
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): void {
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const temp = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(value, null, 2), "utf-8");
+    fs.renameSync(temp, filePath);
+}
+
+function writeTask(task: BackgroundTask): void {
+    writeJsonAtomic(getTaskPath(task.id), task);
+}
+
+function readTaskFile(taskId: string): BackgroundTask | null {
+    try {
+        const filePath = getTaskPath(taskId);
+        if (!fs.existsSync(filePath)) return null;
+        return JSON.parse(fs.readFileSync(filePath, "utf-8")) as BackgroundTask;
+    } catch {
+        return null;
+    }
+}
+
+function markInterrupted(task: BackgroundTask, reason = "后台任务进程已退出，无法恢复执行"): BackgroundTask {
+    if (task.status !== "running") return task;
+    const updatedAt = nowIso();
+    const updated: BackgroundTask = {
+        ...task,
+        status: "interrupted",
+        error: reason,
+        finishedAt: updatedAt,
+        updatedAt,
+    };
+    tasks.set(updated.id, updated);
+    writeTask(updated);
+    return updated;
+}
+
+function hydrateDiskTask(task: BackgroundTask): BackgroundTask {
+    if (task.status === "running") {
+        return markInterrupted(task);
+    }
+    tasks.set(task.id, task);
+    return task;
 }
 
 function cleanupTasks(): void {
@@ -43,12 +101,60 @@ function cleanupTasks(): void {
     }
 }
 
+export function cleanOldBgTasks(maxAgeDays = 15): number {
+    ensureBgTasksDir();
+    const cutoffMs = Date.now() - Math.max(0, maxAgeDays) * 24 * 60 * 60 * 1000;
+    let removed = 0;
+    for (const entry of fs.readdirSync(BG_TASKS_DIR, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const filePath = path.join(BG_TASKS_DIR, entry.name);
+        const taskId = path.basename(entry.name, ".json");
+        const preservePaths = [
+            path.join(BG_TASKS_DIR, `${taskId}.preserve`),
+            path.join(BG_TASKS_DIR, `${entry.name}.preserve`),
+        ];
+        if (preservePaths.some((preservePath) => fs.existsSync(preservePath))) continue;
+        const task = readTaskFile(taskId);
+        if (!task || task.status === "running") continue;
+        const updatedMs = Date.parse(task.finishedAt || task.updatedAt);
+        if (!Number.isFinite(updatedMs) || updatedMs >= cutoffMs) continue;
+        try {
+            fs.rmSync(filePath, { force: true });
+            tasks.delete(task.id);
+            removed += 1;
+        } catch {
+            // Best-effort cleanup.
+        }
+    }
+    return removed;
+}
+
+export function restoreBackgroundTasksOnStartup(logger: (message: string) => void = console.error): { restored: number; interrupted: number } {
+    ensureBgTasksDir();
+    const summary = { restored: 0, interrupted: 0 };
+    for (const entry of fs.readdirSync(BG_TASKS_DIR, { withFileTypes: true })) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const task = readTaskFile(path.basename(entry.name, ".json"));
+        if (!task) continue;
+        if (task.status === "running") {
+            markInterrupted(task);
+            summary.interrupted += 1;
+        } else {
+            tasks.set(task.id, task);
+            summary.restored += 1;
+        }
+    }
+    logger(`[sandbox] 恢复 ${summary.restored} 个后台任务状态，${summary.interrupted} 个标记中断`);
+    return summary;
+}
+
 export function startBackgroundTask(
     kind: string,
     run: (progress: BackgroundTaskProgress, signal: AbortSignal) => Promise<string>,
     options: StartBackgroundTaskOptions = {},
 ): BackgroundTask {
     cleanupTasks();
+    cleanOldBgTasks();
     const startedMs = Date.now();
     const maxRunMs = options.maxRunMs && options.maxRunMs > 0 ? options.maxRunMs : undefined;
     const task: BackgroundTask = {
@@ -63,6 +169,7 @@ export function startBackgroundTask(
         timedOut: false,
     };
     tasks.set(task.id, task);
+    writeTask(task);
 
     const abortController = new AbortController();
     let settled = false;
@@ -75,11 +182,13 @@ export function startBackgroundTask(
         Object.assign(task, patch);
         task.finishedAt = nowIso();
         task.updatedAt = task.finishedAt;
+        writeTask(task);
     };
     const updateProgress: BackgroundTaskProgress = (progress: string) => {
         if (settled) return;
         task.progress = progress;
         task.updatedAt = nowIso();
+        writeTask(task);
     };
 
     if (maxRunMs) {
@@ -115,14 +224,20 @@ export async function waitForBackgroundTask(
     ownerId?: string,
 ): Promise<BackgroundTask | null | { forbidden: true; text: string }> {
     const requestOwner = normalizeOwnerId(ownerId);
-    const initialTask = tasks.get(taskId) || null;
+    let initialTask = tasks.get(taskId) || readTaskFile(taskId);
+    if (initialTask && !tasks.has(taskId)) {
+        initialTask = hydrateDiskTask(initialTask);
+    }
     if (initialTask && !hasOwnerAccess(initialTask.ownerId, requestOwner)) {
         return { forbidden: true, text: ownerMismatchText("后台任务", taskId) };
     }
 
     const deadline = Date.now() + Math.max(0, Math.min(waitSeconds, 300)) * 1000;
     while (Date.now() < deadline) {
-        const task = tasks.get(taskId) || null;
+        let task = tasks.get(taskId) || readTaskFile(taskId);
+        if (task && !tasks.has(taskId)) {
+            task = hydrateDiskTask(task);
+        }
         if (task && !hasOwnerAccess(task.ownerId, requestOwner)) {
             return { forbidden: true, text: ownerMismatchText("后台任务", taskId) };
         }
@@ -130,7 +245,10 @@ export async function waitForBackgroundTask(
         await new Promise(resolve => setTimeout(resolve, 1000));
     }
     cleanupTasks();
-    const task = tasks.get(taskId) || null;
+    let task = tasks.get(taskId) || readTaskFile(taskId);
+    if (task && !tasks.has(taskId)) {
+        task = hydrateDiskTask(task);
+    }
     if (task && !hasOwnerAccess(task.ownerId, requestOwner)) {
         return { forbidden: true, text: ownerMismatchText("后台任务", taskId) };
     }
@@ -152,9 +270,9 @@ export function formatBackgroundTask(task: BackgroundTask | null | { forbidden: 
             task.progress ? `\n## 当前进度\n${task.progress}` : "",
         ].join("\n");
     }
-    if (task.status === "error") {
+    if (task.status === "error" || task.status === "interrupted") {
         return [
-            task.timedOut ? "⏱ 后台任务超时" : "❌ 后台任务失败",
+            task.status === "interrupted" ? "⚠️ 后台任务中断" : task.timedOut ? "⏱ 后台任务超时" : "❌ 后台任务失败",
             `🆔 taskId: ${task.id}`,
             `📌 类型: ${task.kind}`,
             `👤 ownerId: ${task.ownerId}`,

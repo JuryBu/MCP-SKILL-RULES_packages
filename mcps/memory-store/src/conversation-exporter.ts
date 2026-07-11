@@ -17,6 +17,7 @@ import {
 } from "./trajectory.js";
 import { materializeRoundAttachments, type ConversationAttachment } from "./conversation-attachments.js";
 import { renderConversationPdf } from "./conversation-pdf.js";
+import type { BackgroundTaskContext } from "./background-tasks.js";
 import type { ResolvedConversationChain } from "./conversation-bridge.js";
 import type { SearchMode } from "./search-engine.js";
 
@@ -48,6 +49,8 @@ export interface ConversationExportOptions {
     format?: ConversationExportFormat;
     includeAssets?: boolean;
     pdfEmbedAttachments?: PdfEmbedAttachmentsMode;
+    isCancelled?: BackgroundTaskContext["isCancelled"];
+    isSettled?: BackgroundTaskContext["isSettled"];
 }
 
 export interface ConversationExportAsset {
@@ -103,6 +106,18 @@ function safeSegment(input: string): string {
 function atomicWriteText(filePath: string, content: string): void {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomic(filePath, content);
+}
+
+function throwIfExportAborted(
+    options: Pick<ConversationExportOptions, "isCancelled" | "isSettled">,
+    stage: string,
+): void {
+    if (options.isCancelled?.()) {
+        throw new Error(`conversation export cancelled before ${stage}`);
+    }
+    if (options.isSettled?.()) {
+        throw new Error(`conversation export settled before ${stage}`);
+    }
 }
 
 function resolveExportDirectory(options: ConversationExportOptions): string {
@@ -266,7 +281,9 @@ function writeInlineImageAsset(
     asset: Omit<ConversationExportAsset, "exportPath" | "relativePath" | "sizeBytes" | "sha256">,
     exportDir: string,
     budget: { remainingCount: number; remainingBytes: number; maxBytes: number; copiedByKey: Map<string, ConversationExportAsset> },
+    shouldAbort?: () => boolean,
 ): ConversationExportAsset {
+    if (shouldAbort?.()) throw new Error("conversation export cancelled during inline asset copy");
     const parsed = parseInlineImage(uri);
     if (!parsed) return { ...asset, warning: "内联图片不是可识别的 base64 image data URL，未复制" };
     const sizeBytes = parsed.bytes.length;
@@ -283,6 +300,7 @@ function writeInlineImageAsset(
     const ext = extensionForAsset("", "image", parsed.mimeType);
     const filename = `round-${String(asset.roundIndex).padStart(6, "0")}_${sha256.slice(0, 12)}${ext}`;
     const targetPath = path.join(directory, filename);
+    if (shouldAbort?.()) throw new Error("conversation export cancelled during inline asset write");
     if (!fs.existsSync(targetPath) || fs.statSync(targetPath).size !== sizeBytes) {
         const tmpPath = `${targetPath}.${process.pid}.tmp`;
         fs.writeFileSync(tmpPath, parsed.bytes);
@@ -306,7 +324,9 @@ function copyAsset(
     asset: Omit<ConversationExportAsset, "exportPath" | "relativePath" | "sizeBytes" | "sha256">,
     exportDir: string,
     budget: { remainingCount: number; remainingBytes: number; maxBytes: number; copiedByKey: Map<string, ConversationExportAsset> },
+    shouldAbort?: () => boolean,
 ): ConversationExportAsset {
+    if (shouldAbort?.()) throw new Error("conversation export cancelled during asset copy");
     if (!sourcePath) return { ...asset, warning: "附件不是本地文件路径，未复制" };
     let stat: fs.Stats;
     try {
@@ -329,6 +349,7 @@ function copyAsset(
     const ext = extensionForAsset(sourcePath, asset.kind);
     const filename = `round-${String(asset.roundIndex).padStart(6, "0")}_${sha256.slice(0, 12)}${ext}`;
     const targetPath = path.join(directory, filename);
+    if (shouldAbort?.()) throw new Error("conversation export cancelled during asset write");
     if (!fs.existsSync(targetPath) || fs.statSync(targetPath).size !== sizeBytes) {
         const tmpPath = `${targetPath}.${process.pid}.tmp`;
         fs.copyFileSync(sourcePath, tmpPath);
@@ -352,6 +373,7 @@ function collectAndRewriteAssets(
     rounds: ConversationRound[],
     exportDir: string,
     includeAssets: boolean,
+    shouldAbort?: () => boolean,
 ): { rounds: ConversationRound[]; assets: ConversationExportAsset[]; warnings: string[] } {
     const warnings: string[] = [];
     const cloned = rounds.map(cloneRound);
@@ -365,7 +387,9 @@ function collectAndRewriteAssets(
     const assets: ConversationExportAsset[] = [];
 
     for (const round of cloned) {
+        if (shouldAbort?.()) throw new Error("conversation export cancelled during asset collection");
         round.mediaAttachments = round.mediaAttachments.map((uri, index) => {
+            if (shouldAbort?.()) throw new Error("conversation export cancelled during media asset collection");
             const sourcePath = pathFromUriOrPath(uri);
             const descriptor = {
                 roundIndex: round.roundIndex,
@@ -376,14 +400,15 @@ function collectAndRewriteAssets(
                 stepIndex: round.startStep,
             } satisfies Omit<ConversationExportAsset, "exportPath" | "relativePath" | "sizeBytes" | "sha256">;
             const copied = sourcePath
-                ? copyAsset(sourcePath, descriptor, exportDir, budget)
-                : writeInlineImageAsset(uri, descriptor, exportDir, budget);
+                ? copyAsset(sourcePath, descriptor, exportDir, budget, shouldAbort)
+                : writeInlineImageAsset(uri, descriptor, exportDir, budget, shouldAbort);
             assets.push(copied);
             if (copied.warning) warnings.push(`R${round.roundIndex} 图片附件：${copied.warning}`);
             return copied.relativePath || uri;
         });
 
         for (const attachment of round.attachments || []) {
+            if (shouldAbort?.()) throw new Error("conversation export cancelled during attachment collection");
             const sourcePath = pathFromUriOrPath(attachment.tempPath || attachment.originalPath || "");
             const copied = copyAsset(sourcePath, {
                 roundIndex: round.roundIndex,
@@ -392,7 +417,7 @@ function collectAndRewriteAssets(
                 displayName: attachment.name || path.basename(sourcePath || attachment.tempPath || attachment.originalPath || "attachment"),
                 originalPath: sourcePath || attachment.originalPath || attachment.tempPath,
                 stepIndex: attachment.stepIndex,
-            }, exportDir, budget);
+            }, exportDir, budget, shouldAbort);
             assets.push(copied);
             if (copied.warning) warnings.push(`R${round.roundIndex} ${attachment.kind === "image" ? "图片" : "文件"}附件：${copied.warning}`);
             if (copied.relativePath) {
@@ -502,13 +527,24 @@ export async function exportConversation(options: ConversationExportOptions): Pr
     const format = options.format || "markdown";
     const includeAssets = options.includeAssets !== false;
     const warnings: string[] = [];
+    throwIfExportAborted(options, "export directory setup");
     const exportDir = resolveExportDirectory(options);
+    throwIfExportAborted(options, "round selection");
     const selected = await selectRounds(options);
     warnings.push(...selected.warnings);
 
-    const materialized = await materializeRoundAttachments(selected.rounds, options.conversationId);
+    throwIfExportAborted(options, "attachment materialization");
+    const materialized = await materializeRoundAttachments(selected.rounds, options.conversationId, {
+        shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+    });
     if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
-    const assetResult = collectAndRewriteAssets(materialized.rounds, exportDir, includeAssets);
+    throwIfExportAborted(options, "asset rewrite");
+    const assetResult = collectAndRewriteAssets(
+        materialized.rounds,
+        exportDir,
+        includeAssets,
+        () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+    );
     warnings.push(...assetResult.warnings);
 
     let markdown = buildMarkdown(options, assetResult.rounds, assetResult.assets, warnings, selected.rangeLabel);
@@ -519,12 +555,14 @@ export async function exportConversation(options: ConversationExportOptions): Pr
     }
 
     const markdownPath = path.join(exportDir, "conversation.md");
+    throwIfExportAborted(options, "markdown write");
     atomicWriteText(markdownPath, markdown);
 
     let pdfPath: string | undefined;
     let htmlPath: string | undefined;
     let embeddedPdfAttachments = 0;
     if (format === "pdf" || format === "both") {
+        throwIfExportAborted(options, "pdf render");
         const targetPdfPath = path.join(exportDir, "conversation.pdf");
         const pdf = await renderConversationPdf({
             title: `Conversation ${options.conversationId}`,
@@ -574,6 +612,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             embeddedPdfAttachments,
         },
     };
+    throwIfExportAborted(options, "manifest write");
     writeJsonAtomic(manifestPath, manifest);
 
     return {

@@ -1,28 +1,40 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
+import path from "path";
+import crypto from "node:crypto";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
 import { listConversationsByMtime, detectWorkspaceFromSteps, fetchFirstPageSteps } from "../ls-client.js";
 import {
-    readRecord, writeRecord, deleteRecord, listRecords, copyRecordToHash,
+    readRecord, readRecordAsync, writeRecord, upsertRecordIndex, deleteRecord, listRecords, copyRecordToHash,
     searchRecordsGlobal,
-    resolveWorkspaceHashForRecord, readRecordsIndex, findRecordHash, resolveRecordConversationId,
-    readRecordSidecar, writeRecordSidecar,
+    resolveWorkspaceHashForRecord, readRecordsIndex, readRecordsIndexAsync, findRecordHash, findRecordHashAsync, resolveRecordConversationId,
+    readRecordSidecar, readRecordSidecarAsync, writeRecordSidecar, type RecordIndexEntry,
 } from "../record-store.js";
-import { ensureWorkspace, listWorkspaceHashes, readWorkspaceMeta, workspaceHash } from "../store.js";
+import { DATA_ROOT, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
 import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
-import { saveTempFile } from "../temp-store.js";
-import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
+import { saveTempFile, saveTempFileAsync } from "../temp-store.js";
+import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
-import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
+import { loadConversationData, resolveConversationChain, resolveConversationId, type ResolvedConversationChain } from "../conversation-bridge.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
-import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
-import { withToolConcurrency } from "../tool-concurrency.js";
-import type { BackgroundTaskProgress } from "../background-tasks.js";
+import {
+    BACKGROUND_TASK_RESUME_VERSION,
+    cancelBackgroundTask,
+    formatBackgroundTask,
+    getBackgroundTaskRecoveryHandler,
+    inspectBackgroundTaskRecovery,
+    isValidBackgroundTaskId,
+    recoverBackgroundTask,
+    registerBackgroundTaskRecoveryHandler,
+    startBackgroundTask,
+    waitForBackgroundTask,
+} from "../background-tasks.js";
+import type { BackgroundTask, BackgroundTaskContext, BackgroundTaskProgress } from "../background-tasks.js";
 import {
     RECORD_READER_VERSION,
     RECORD_SECTION_TYPES,
@@ -39,6 +51,24 @@ import {
     type RecordSectionType,
 } from "../record-reader.js";
 import { search, type SearchMode, type SearchResult, type TextBlock } from "../search-engine.js";
+import {
+    RecordSingleFlightAbortError,
+    RecordUpdatePoolAbortError,
+    __recordUpdateCoordinationTest,
+    acquireRecordSingleFlightPermit,
+    buildAndPersistRecordReaderIndex,
+    formatRecordUpdatePoolDetail,
+    getRecordPersistenceConcurrencySnapshot,
+    getRecordTaskAbortReason,
+    getRecordUpdateConcurrencyLimit,
+    isRecordPersistenceCongestionError,
+    withRecordPersistenceWrite,
+    withRecordUpdateSharedPermit,
+    type RecordGateAcquireOptions,
+    type RecordUpdateSharedPermit,
+} from "../record-update-coordination.js";
+import type { ConcurrencyGateAcquireOptions, ConcurrencyGatePermit, ConcurrencyGateSnapshot } from "../concurrency-gate.js";
+import type { GrokExecDiagnostics } from "../grok-client.js";
 
 type RecordManageScope = "workspace" | "global" | "general";
 type RecordSearchScope = "record" | "phase" | "section" | "item";
@@ -69,8 +99,741 @@ export interface RecordSourceSnapshot {
     rolloutMtimeMs?: number;
 }
 
+const RECORD_RESUME_MODEL_CHAINS = ["auto", "antigravity", "codex", "grok", "claude-code"] as const;
+const RECORD_RESUME_DATA_CHAINS = ["antigravity", "codex", "claude-code", "windsurf"] as const;
+const RECORD_RESUME_PARALLEL_MODES = ["off", "auto", "force"] as const;
+const RECORD_RESUME_LOGICAL_CHAINS = ["off", "explain", "auto", "strict"] as const;
+const RECORD_RECOVERABLE_TASK_KINDS = new Set(["record-update", "record-batch-update"]);
+const RECORD_BATCH_TIMEOUT_MESSAGE = "batch_update 后台批量更新超时；可缩小 limit/时间范围后重试";
+const RECORD_RECOVERY_DIR = path.join(DATA_ROOT, "record-task-recovery");
+const RECORD_BATCH_LEDGER_VERSION = 2;
+
+const RecordUpdateResumePayloadSchema = z.object({
+    kind: z.literal("record-update"),
+    conversationId: z.string().min(1),
+    workspace: z.string().min(1).optional(),
+    dataChain: z.enum(RECORD_RESUME_DATA_CHAINS),
+    modelChain: z.enum(RECORD_RESUME_MODEL_CHAINS),
+    parallelMode: z.enum(RECORD_RESUME_PARALLEL_MODES).optional(),
+    force: z.boolean().optional(),
+    logicalChain: z.enum(RECORD_RESUME_LOGICAL_CHAINS).optional(),
+});
+
+const BatchCandidateSnapshotSchema = z.object({
+    id: z.string().min(1),
+    workspace: z.string().min(1),
+    chain: z.enum(RECORD_RESUME_DATA_CHAINS),
+    lastModifiedMs: z.number().finite().nonnegative(),
+    stepCount: z.number().int().positive().optional(),
+});
+
+const BatchConversationCandidateSchema = BatchCandidateSnapshotSchema.extend({
+    selectionKind: z.enum(["stale", "missing", "fresh"]),
+    refreshExisting: z.boolean(),
+});
+
+const LegacyBatchConversationCandidateSchema = z.object({
+    id: z.string().min(1),
+    workspace: z.string().min(1),
+}).passthrough();
+
+const RecordBatchCandidateDiagnosticsSchema = z.object({
+    scanned: z.number().int().nonnegative(),
+    eligible: z.number().int().nonnegative(),
+    selected: z.number().int().nonnegative(),
+    truncated: z.number().int().nonnegative(),
+    conflicts: z.number().int().nonnegative(),
+    sourceEnumerationLimited: z.boolean(),
+    workspaceUnresolved: z.number().int().nonnegative().default(0),
+});
+
+const RecordBatchResumeBaseSchema = z.object({
+    kind: z.literal("record-batch-update"),
+    actionName: z.enum(["batch_update", "bulk_update"]),
+    resumeKey: z.string().min(1),
+    dataChain: z.enum(RECORD_RESUME_DATA_CHAINS),
+    modelChain: z.enum(RECORD_RESUME_MODEL_CHAINS),
+    force: z.boolean().optional(),
+    stale_only: z.boolean().optional(),
+});
+
+const RecordBatchRequestSchema = z.object({
+    after: z.string().optional(),
+    before: z.string().optional(),
+    limit: z.number().int().min(1).max(200).optional(),
+    workspace: z.string().optional(),
+});
+
+const LegacyRecordBatchRequestSchema = RecordBatchRequestSchema.extend({
+    limit: z.number().finite().optional(),
+});
+
+const RecordBatchReadyResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+    phase: z.literal("ready").optional(),
+    candidates: z.array(BatchConversationCandidateSchema),
+    diagnostics: RecordBatchCandidateDiagnosticsSchema.optional(),
+});
+
+const RecordBatchPreparingResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+    phase: z.literal("preparing"),
+    request: RecordBatchRequestSchema,
+});
+
+const LegacyRecordBatchPreparingResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+    phase: z.literal("preparing"),
+    request: LegacyRecordBatchRequestSchema,
+});
+
+const RecordBatchResumePayloadSchema = z.union([
+    RecordBatchReadyResumePayloadSchema,
+    RecordBatchPreparingResumePayloadSchema,
+]);
+
+const LegacyRecordBatchReadyResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+    phase: z.literal("ready").optional(),
+    candidates: z.array(z.object({
+        id: z.string().min(1),
+        workspace: z.string().min(1),
+    })),
+});
+
+type RecordUpdateResumePayload = z.infer<typeof RecordUpdateResumePayloadSchema>;
+type BatchCandidateSnapshot = z.infer<typeof BatchCandidateSnapshotSchema>;
+type FrozenBatchConversationCandidate = z.infer<typeof BatchConversationCandidateSchema>;
+type RecordBatchCandidateDiagnostics = z.infer<typeof RecordBatchCandidateDiagnosticsSchema>;
+type RecordBatchResumePayload = z.infer<typeof RecordBatchResumePayloadSchema>;
+type RecordBatchReadyResumePayload = z.infer<typeof RecordBatchReadyResumePayloadSchema>;
+type RecordBatchPreparingResumePayload = z.infer<typeof RecordBatchPreparingResumePayloadSchema>;
+
+function normalizeLegacyRecordBatchLimit(limit: number | undefined): number | undefined {
+    if (limit === undefined) return undefined;
+    const wholeLimit = Math.trunc(limit);
+    if (wholeLimit < 1) return undefined;
+    return Math.min(wholeLimit, 200);
+}
+
+function normalizeLegacyRecordBatchRequest(
+    request: z.infer<typeof LegacyRecordBatchRequestSchema>,
+): z.infer<typeof RecordBatchRequestSchema> {
+    const { limit, ...rest } = request;
+    const normalizedLimit = normalizeLegacyRecordBatchLimit(limit);
+    return {
+        ...rest,
+        ...(normalizedLimit !== undefined ? { limit: normalizedLimit } : {}),
+    };
+}
+
+function emptyRecordBatchCandidateDiagnostics(
+    overrides: Partial<RecordBatchCandidateDiagnostics> = {},
+): RecordBatchCandidateDiagnostics {
+    return {
+        scanned: 0,
+        eligible: 0,
+        selected: 0,
+        truncated: 0,
+        conflicts: 0,
+        sourceEnumerationLimited: false,
+        workspaceUnresolved: 0,
+        ...overrides,
+    };
+}
+
+export function formatRecordBatchCandidateDiagnostics(diagnostics: RecordBatchCandidateDiagnostics): string {
+    let out = `🔎 候选诊断: scanned=${diagnostics.scanned} eligible=${diagnostics.eligible} selected=${diagnostics.selected} truncated=${diagnostics.truncated} source-limit=${diagnostics.sourceEnumerationLimited ? "yes" : "no"} conflicts=${diagnostics.conflicts}`;
+    if (diagnostics.conflicts > 0) out += "(来源链路冲突已跳过)";
+    if (diagnostics.sourceEnumerationLimited) out += "（源枚举达到上限，本次仅覆盖采样集合）";
+    if (diagnostics.workspaceUnresolved > 0) {
+        out += ` workspace-unresolved=${diagnostics.workspaceUnresolved}(Antigravity workspace 未解析，已跳过)`;
+    }
+    return out;
+}
+
+export function normalizeFrozenBatchCandidate(
+    candidate: unknown,
+    fallbackChain: ResolvedConversationChain,
+): FrozenBatchConversationCandidate {
+    const legacy = LegacyBatchConversationCandidateSchema.parse(candidate);
+    const raw = legacy as z.infer<typeof LegacyBatchConversationCandidateSchema> & {
+        chain?: unknown;
+        lastModifiedMs?: unknown;
+        stepCount?: unknown;
+        selectionKind?: unknown;
+    };
+    const parsedChain = z.enum(RECORD_RESUME_DATA_CHAINS).safeParse(raw.chain);
+    const parsedModified = z.number().finite().nonnegative().safeParse(raw.lastModifiedMs);
+    const parsedStepCount = z.number().int().positive().safeParse(raw.stepCount);
+    const parsedSelectionKind = z.enum(["stale", "missing", "fresh"]).safeParse(raw.selectionKind);
+    const selectionKind = parsedSelectionKind.success ? parsedSelectionKind.data : "fresh";
+    return {
+        id: legacy.id,
+        workspace: legacy.workspace,
+        chain: parsedChain.success ? parsedChain.data : fallbackChain,
+        lastModifiedMs: parsedModified.success ? parsedModified.data : 0,
+        ...(parsedStepCount.success ? { stepCount: parsedStepCount.data } : {}),
+        selectionKind,
+        refreshExisting: selectionKind !== "missing",
+    };
+}
+
+function normalizeRecordBatchReadyPayload(payload: {
+    kind: "record-batch-update";
+    actionName: "batch_update" | "bulk_update";
+    resumeKey: string;
+    dataChain: DataChain;
+    modelChain: Chain;
+    force?: boolean;
+    stale_only?: boolean;
+    diagnostics?: RecordBatchCandidateDiagnostics;
+    candidates: unknown[];
+}): RecordBatchReadyResumePayload {
+    return {
+        ...payload,
+        phase: "ready",
+        candidates: payload.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, payload.dataChain as ResolvedConversationChain)),
+    } as RecordBatchReadyResumePayload;
+}
+
+interface RecordBatchLedgerEntry {
+    id: string;
+    workspace: string;
+    recordedAt: string;
+    reason?: string;
+    isNew?: boolean;
+}
+
+type RecordBatchIndexMetadata = Omit<RecordIndexEntry, "lastUpdatedAt" | "sizeBytes">;
+
+interface RecordBatchInFlightEntry extends RecordBatchLedgerEntry {
+    contentHash: string;
+    metadata?: RecordBatchIndexMetadata;
+}
+
+interface RecordBatchResumeLedger {
+    version: number;
+    resumeKey: string;
+    updatedAt: string;
+    candidates: FrozenBatchConversationCandidate[];
+    completed: RecordBatchLedgerEntry[];
+    skipped: RecordBatchLedgerEntry[];
+    failed: RecordBatchLedgerEntry[];
+    inFlight: RecordBatchInFlightEntry[];
+}
+
+type RecordUpdatePoolSummary = {
+    peakActive: number;
+    peakPending: number;
+    maxQueueWaitMs: number;
+};
+
+type GrokBatchRuntimeSummary = {
+    latest: GrokExecDiagnostics;
+    maxBatchQueueWaitMs: number;
+    maxGlobalQueueWaitMs: number;
+    maxQueueAttempts: number;
+};
+
+function updateGrokBatchRuntimeSummary(summary: GrokBatchRuntimeSummary | undefined, diagnostics: GrokExecDiagnostics): GrokBatchRuntimeSummary {
+    return {
+        latest: diagnostics,
+        maxBatchQueueWaitMs: Math.max(summary?.maxBatchQueueWaitMs || 0, diagnostics.batchQueueWaitMs),
+        maxGlobalQueueWaitMs: Math.max(summary?.maxGlobalQueueWaitMs || 0, diagnostics.globalQueueWaitMs),
+        maxQueueAttempts: Math.max(summary?.maxQueueAttempts || 0, diagnostics.queueAttempts),
+    };
+}
+
+function getRecordBatchWorkerConcurrency(): number {
+    const raw = Number(process.env.MEMORY_STORE_RECORD_BATCH_CONCURRENCY || "");
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : getRecordUpdateConcurrencyLimit();
+}
+
+type RecordPersistenceTestHook = (event: { stage: string; conversationId: string }) => void | Promise<void>;
+
+let recordPersistenceTestHook: RecordPersistenceTestHook | null = null;
+
+async function runRecordPersistenceTestHook(stage: string, conversationId: string): Promise<void> {
+    await recordPersistenceTestHook?.({ stage, conversationId });
+}
+
+async function withRecordManagementSingleFlight<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
+    const singleFlightPermit = await acquireRecordSingleFlightPermit(conversationId);
+    try {
+        return await operation();
+    } finally {
+        singleFlightPermit.release();
+    }
+}
+
+
+function updateRecordUpdatePoolSummary(
+    summary: RecordUpdatePoolSummary,
+    snapshot: ConcurrencyGateSnapshot,
+    queueWaitMs: number,
+): void {
+    summary.peakActive = Math.max(summary.peakActive, snapshot.active);
+    summary.peakPending = Math.max(summary.peakPending, snapshot.pending);
+    summary.maxQueueWaitMs = Math.max(summary.maxQueueWaitMs, queueWaitMs);
+}
+
+function recordUpdatePoolAbortResponse(
+    startMs: number,
+    error: RecordUpdatePoolAbortError,
+    stage: string,
+) {
+    const prefix = error.reason === "cancelled"
+        ? "🛑 Record 更新已取消"
+        : error.reason === "settled"
+            ? "⚠️ 后台任务已结算"
+            : "⚠️ Record 共享池等待超时";
+    return rt(`${prefix}：${stage} | ${formatRecordUpdatePoolDetail(error.snapshot)}`, startMs);
+}
+
 export function isRecordBatchUpdateAction(action?: string): boolean {
     return action === "batch_update" || action === "bulk_update";
+}
+
+function recordTasksDirPath(): string {
+    return path.join(DATA_ROOT, "tasks");
+}
+
+function recordTaskFilePath(taskId: string): string {
+    return path.join(recordTasksDirPath(), `${taskId}.json`);
+}
+
+function recordTaskClaimPath(taskId: string): string {
+    return path.join(recordTasksDirPath(), `${taskId}.claim`);
+}
+
+function recordBatchLedgerPath(resumeKey: string): string {
+    return path.join(RECORD_RECOVERY_DIR, `record-batch-${resumeKey}.json`);
+}
+
+function ensureRecordRecoveryDir(): void {
+    fs.mkdirSync(RECORD_RECOVERY_DIR, { recursive: true });
+}
+
+function readPersistedRecordTask(taskId: string): BackgroundTask | null {
+    if (!isValidBackgroundTaskId(taskId)) return null;
+    try {
+        const raw = fs.readFileSync(recordTaskFilePath(taskId), "utf-8");
+        const parsed = JSON.parse(raw) as BackgroundTask;
+        if (!parsed || typeof parsed.id !== "string" || typeof parsed.kind !== "string" || typeof parsed.status !== "string") {
+            return null;
+        }
+        return parsed;
+    } catch {
+        return null;
+    }
+}
+
+function listPersistedRecordTasks(): BackgroundTask[] {
+    try {
+        if (!fs.existsSync(recordTasksDirPath())) return [];
+        return fs.readdirSync(recordTasksDirPath())
+            .filter(entry => entry.endsWith(".json"))
+            .map(entry => readPersistedRecordTask(entry.slice(0, -5)))
+            .filter((task): task is BackgroundTask => Boolean(task));
+    } catch {
+        return [];
+    }
+}
+
+function tryParseRecordUpdateResumePayload(payload: unknown): RecordUpdateResumePayload | null {
+    const parsed = RecordUpdateResumePayloadSchema.safeParse(payload);
+    return parsed.success ? parsed.data : null;
+}
+
+function tryParseRecordBatchResumePayload(payload: unknown): RecordBatchResumePayload | null {
+    const parsed = RecordBatchResumePayloadSchema.safeParse(payload);
+    if (parsed.success) {
+        if (!("candidates" in parsed.data)) return parsed.data;
+        return {
+            ...parsed.data,
+            candidates: parsed.data.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, parsed.data.dataChain as ResolvedConversationChain)),
+        };
+    }
+    const legacy = LegacyRecordBatchReadyResumePayloadSchema.safeParse(payload);
+    if (legacy.success) {
+        return {
+            ...legacy.data,
+            phase: "ready",
+            candidates: legacy.data.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, legacy.data.dataChain as ResolvedConversationChain)),
+        };
+    }
+
+    const legacyPreparing = LegacyRecordBatchPreparingResumePayloadSchema.safeParse(payload);
+    if (!legacyPreparing.success) return null;
+    return {
+        ...legacyPreparing.data,
+        request: normalizeLegacyRecordBatchRequest(legacyPreparing.data.request),
+    };
+}
+
+function parseRecordUpdateResumePayload(payload: unknown): RecordUpdateResumePayload {
+    return RecordUpdateResumePayloadSchema.parse(payload);
+}
+
+function parseRecordBatchResumePayload(payload: unknown): RecordBatchResumePayload {
+    const parsed = tryParseRecordBatchResumePayload(payload);
+    if (!parsed) throw new Error("无效的 Record batch resumePayload");
+    return parsed;
+}
+
+function makeRecordBatchResumeKey(): string {
+    return `${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function createEmptyRecordBatchLedger(payload: RecordBatchReadyResumePayload): RecordBatchResumeLedger {
+    return {
+        version: RECORD_BATCH_LEDGER_VERSION,
+        resumeKey: payload.resumeKey,
+        updatedAt: new Date().toISOString(),
+        candidates: payload.candidates.map(candidate => ({ ...candidate })),
+        completed: [],
+        skipped: [],
+        failed: [],
+        inFlight: [],
+    };
+}
+
+function matchesLegacyBatchCandidateSnapshot(
+    legacyCandidates: unknown[],
+    candidates: FrozenBatchConversationCandidate[],
+): boolean {
+    return legacyCandidates.length === candidates.length && legacyCandidates.every((candidate, index) => {
+        if (!candidate || typeof candidate !== "object") return false;
+        const legacy = candidate as { id?: unknown; workspace?: unknown; selectionKind?: unknown; refreshExisting?: unknown };
+        return legacy.selectionKind === undefined
+            && legacy.refreshExisting === undefined
+            && legacy.id === candidates[index].id
+            && legacy.workspace === candidates[index].workspace;
+    });
+}
+
+function normalizeRecordBatchLedgerCandidates(
+    ledger: RecordBatchResumeLedger,
+    fallbackChain: ResolvedConversationChain,
+): boolean {
+    const normalized = ledger.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, fallbackChain));
+    if (JSON.stringify(normalized) === JSON.stringify(ledger.candidates)) return false;
+    ledger.candidates = normalized;
+    return true;
+}
+
+function normalizeRecordBatchLedger(raw: unknown, resumeKey: string): RecordBatchResumeLedger | null {
+    if (!raw || typeof raw !== "object") return null;
+    const parsed = raw as Partial<RecordBatchResumeLedger> & { version?: unknown };
+    if ((parsed.version !== 1 && parsed.version !== RECORD_BATCH_LEDGER_VERSION) || parsed.resumeKey !== resumeKey) return null;
+    if (!Array.isArray(parsed.candidates) || !Array.isArray(parsed.completed) || !Array.isArray(parsed.skipped) || !Array.isArray(parsed.failed)) return null;
+    return {
+        version: RECORD_BATCH_LEDGER_VERSION,
+        resumeKey,
+        updatedAt: typeof parsed.updatedAt === "string" ? parsed.updatedAt : new Date(0).toISOString(),
+        candidates: parsed.candidates,
+        completed: parsed.completed,
+        skipped: parsed.skipped,
+        failed: parsed.failed,
+        inFlight: Array.isArray(parsed.inFlight) ? parsed.inFlight : [],
+    };
+}
+
+function readRecordBatchLedger(resumeKey: string): RecordBatchResumeLedger | null {
+    try {
+        const raw = fs.readFileSync(recordBatchLedgerPath(resumeKey), "utf-8");
+        return normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
+    } catch {
+        return null;
+    }
+}
+
+function writeRecordBatchLedger(ledger: RecordBatchResumeLedger): RecordBatchResumeLedger {
+    ensureRecordRecoveryDir();
+    ledger.version = RECORD_BATCH_LEDGER_VERSION;
+    ledger.updatedAt = new Date().toISOString();
+    writeJsonAtomic(recordBatchLedgerPath(ledger.resumeKey), ledger);
+    return ledger;
+}
+
+function ensureRecordBatchLedger(payload: RecordBatchReadyResumePayload): RecordBatchResumeLedger {
+    const normalizedPayload = normalizeRecordBatchReadyPayload(payload);
+    const existing = readRecordBatchLedger(normalizedPayload.resumeKey);
+    if (!existing) return writeRecordBatchLedger(createEmptyRecordBatchLedger(normalizedPayload));
+    normalizeRecordBatchLedgerCandidates(existing, normalizedPayload.dataChain as ResolvedConversationChain);
+    const expected = JSON.stringify(normalizedPayload.candidates);
+    const actual = JSON.stringify(existing.candidates);
+    if (actual !== expected) {
+        if (matchesLegacyBatchCandidateSnapshot(existing.candidates, normalizedPayload.candidates)) {
+            existing.candidates = normalizedPayload.candidates.map(candidate => ({ ...candidate }));
+            return writeRecordBatchLedger(existing);
+        }
+        throw new Error(`Record batch ledger 候选快照与 resumePayload 不匹配：${payload.resumeKey}`);
+    }
+    return existing;
+}
+
+async function ensureRecordRecoveryDirAsync(): Promise<void> {
+    await fs.promises.mkdir(RECORD_RECOVERY_DIR, { recursive: true });
+}
+
+async function readRecordBatchLedgerAsync(resumeKey: string): Promise<RecordBatchResumeLedger | null> {
+    try {
+        const raw = await fs.promises.readFile(recordBatchLedgerPath(resumeKey), "utf-8");
+        return normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
+    } catch {
+        return null;
+    }
+}
+
+async function writeRecordBatchLedgerAsync(ledger: RecordBatchResumeLedger): Promise<RecordBatchResumeLedger> {
+    await ensureRecordRecoveryDirAsync();
+    ledger.version = RECORD_BATCH_LEDGER_VERSION;
+    ledger.updatedAt = new Date().toISOString();
+    await writeJsonAtomicAsync(recordBatchLedgerPath(ledger.resumeKey), ledger);
+    return ledger;
+}
+
+async function ensureRecordBatchLedgerUnlocked(payload: RecordBatchReadyResumePayload): Promise<RecordBatchResumeLedger> {
+    const normalizedPayload = normalizeRecordBatchReadyPayload(payload);
+    const existing = await readRecordBatchLedgerAsync(normalizedPayload.resumeKey);
+    if (!existing) return writeRecordBatchLedgerAsync(createEmptyRecordBatchLedger(normalizedPayload));
+    normalizeRecordBatchLedgerCandidates(existing, normalizedPayload.dataChain as ResolvedConversationChain);
+    const expected = JSON.stringify(normalizedPayload.candidates);
+    const actual = JSON.stringify(existing.candidates);
+    if (actual !== expected) {
+        if (matchesLegacyBatchCandidateSnapshot(existing.candidates, normalizedPayload.candidates)) {
+            existing.candidates = normalizedPayload.candidates.map(candidate => ({ ...candidate }));
+            return writeRecordBatchLedgerAsync(existing);
+        }
+        throw new Error(`Record batch ledger 候选快照与 resumePayload 不匹配：${payload.resumeKey}`);
+    }
+    return existing;
+}
+
+async function withRecordBatchLedger<T>(
+    payload: RecordBatchReadyResumePayload,
+    operation: (ledger: RecordBatchResumeLedger) => Promise<T>,
+): Promise<T> {
+    return withIndexLock(`record_batch_ledger_${payload.resumeKey}`, async () => {
+        const ledger = await ensureRecordBatchLedgerUnlocked(payload);
+        return operation(ledger);
+    });
+}
+
+async function ensureRecordBatchLedgerAsync(payload: RecordBatchReadyResumePayload): Promise<RecordBatchResumeLedger> {
+    return withRecordBatchLedger(payload, async ledger => ledger);
+}
+
+function recordContentHash(content: string): string {
+    return crypto.createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function normalizeRecordBatchLedgerEntries(entries: RecordBatchLedgerEntry[], entry: RecordBatchLedgerEntry): RecordBatchLedgerEntry[] {
+    const next = entries.filter(item => item.id !== entry.id);
+    next.push(entry);
+    next.sort((a, b) => a.id.localeCompare(b.id, "en"));
+    return next;
+}
+
+function recordBatchLedgerEntry(
+    candidate: Pick<FrozenBatchConversationCandidate, "id" | "workspace">,
+    reason?: string,
+    isNew?: boolean,
+): RecordBatchLedgerEntry {
+    return {
+        id: candidate.id,
+        workspace: candidate.workspace,
+        recordedAt: new Date().toISOString(),
+        ...(reason ? { reason } : {}),
+        ...(isNew !== undefined ? { isNew } : {}),
+    };
+}
+
+async function updateRecordBatchLedger(
+    payload: RecordBatchReadyResumePayload,
+    kind: "completed" | "skipped" | "failed",
+    candidate: Pick<FrozenBatchConversationCandidate, "id" | "workspace">,
+    reason?: string,
+    isNew?: boolean,
+): Promise<RecordBatchResumeLedger> {
+    return withRecordBatchLedger(payload, async ledger => {
+        const entry = recordBatchLedgerEntry(candidate, reason, isNew);
+        ledger.completed = ledger.completed.filter(item => item.id !== candidate.id);
+        ledger.skipped = ledger.skipped.filter(item => item.id !== candidate.id);
+        ledger.failed = ledger.failed.filter(item => item.id !== candidate.id);
+        ledger.inFlight = ledger.inFlight.filter(item => item.id !== candidate.id);
+        ledger[kind] = normalizeRecordBatchLedgerEntries(ledger[kind], entry);
+        return writeRecordBatchLedgerAsync(ledger);
+    });
+}
+
+async function markRecordBatchCandidateInFlight(
+    payload: RecordBatchReadyResumePayload,
+    candidate: Pick<FrozenBatchConversationCandidate, "id" | "workspace">,
+    content: string,
+    metadata?: RecordBatchIndexMetadata,
+    isNew?: boolean,
+): Promise<RecordBatchResumeLedger> {
+    return withRecordBatchLedger(payload, async ledger => {
+        const entry: RecordBatchInFlightEntry = {
+            ...recordBatchLedgerEntry(candidate, undefined, isNew),
+            contentHash: recordContentHash(content),
+            ...(metadata ? { metadata } : {}),
+        };
+        ledger.completed = ledger.completed.filter(item => item.id !== candidate.id);
+        ledger.skipped = ledger.skipped.filter(item => item.id !== candidate.id);
+        ledger.failed = ledger.failed.filter(item => item.id !== candidate.id);
+        ledger.inFlight = ledger.inFlight.filter(item => item.id !== candidate.id);
+        ledger.inFlight.push(entry);
+        ledger.inFlight.sort((a, b) => a.id.localeCompare(b.id, "en"));
+        return writeRecordBatchLedgerAsync(ledger);
+    });
+}
+
+async function clearRecordBatchCandidateInFlight(
+    payload: RecordBatchReadyResumePayload,
+    candidate: Pick<FrozenBatchConversationCandidate, "id" | "workspace">,
+): Promise<RecordBatchResumeLedger> {
+    return withRecordBatchLedger(payload, async ledger => {
+        ledger.inFlight = ledger.inFlight.filter(item => item.id !== candidate.id);
+        return writeRecordBatchLedgerAsync(ledger);
+    });
+}
+
+async function reconcileRecordBatchInFlight(
+    payload: RecordBatchReadyResumePayload,
+    ledger: RecordBatchResumeLedger,
+    options: Pick<RecordGateAcquireOptions, "isCancelled" | "isSettled" | "onProgress">,
+): Promise<RecordBatchResumeLedger> {
+    if (ledger.inFlight.length === 0) return ledger;
+    for (const entry of [...ledger.inFlight]) {
+        const candidate = payload.candidates.find(item => item.id === entry.id && item.workspace === entry.workspace);
+        if (!candidate) {
+            await withRecordBatchLedger(payload, async current => {
+                current.inFlight = current.inFlight.filter(item => item.id !== entry.id);
+                return writeRecordBatchLedgerAsync(current);
+            });
+            continue;
+        }
+        const hash = resolveWorkspaceHashForRecord(candidate.workspace);
+        const singleFlightPermit = await acquireRecordSingleFlightPermit(candidate.id, options);
+        try {
+            const existing = await readRecordAsync(hash, candidate.id);
+            if (existing && recordContentHash(existing) === entry.contentHash) {
+                const indexed = (await readRecordsIndexAsync(hash)).records[candidate.id];
+                if (entry.metadata) {
+                    await upsertRecordIndex(hash, candidate.id, existing, entry.metadata);
+                } else if (!indexed) {
+                    await clearRecordBatchCandidateInFlight(payload, candidate);
+                    continue;
+                }
+
+                const readerIndex = await withRecordUpdateSharedPermit({
+                    ...options,
+                    waitingStage: "等待 Record 写入许可",
+                    acquiredStage: "batch_reconcile",
+                    waitingDetail: "等待 batch recovery 的 Reader Index 写入许可",
+                    acquiredDetail: "已获取 batch recovery 的 Reader Index 写入许可",
+                }, async () => buildAndPersistRecordReaderIndex(hash, candidate.id, existing));
+                if (readerIndex.value.error) {
+                    throw readerIndex.value.error;
+                }
+                await updateRecordBatchLedger(payload, "completed", candidate, "reconciled after record write", entry.isNew);
+                continue;
+            }
+            await clearRecordBatchCandidateInFlight(payload, candidate);
+        } finally {
+            singleFlightPermit.release();
+        }
+    }
+    return ensureRecordBatchLedgerAsync(payload);
+}
+
+function settledRecordBatchCandidateIds(ledger: RecordBatchResumeLedger): Set<string> {
+    return new Set([
+        ...ledger.completed.map(item => item.id),
+        ...ledger.skipped.map(item => item.id),
+        ...ledger.failed.map(item => item.id),
+        ...ledger.inFlight.map(item => item.id),
+    ]);
+}
+
+function pendingRecordBatchCandidates(payload: RecordBatchReadyResumePayload, ledger: RecordBatchResumeLedger): FrozenBatchConversationCandidate[] {
+    const settledIds = settledRecordBatchCandidateIds(ledger);
+    return payload.candidates.filter(candidate => !settledIds.has(candidate.id));
+}
+
+function isRecoverableRecordTask(task: BackgroundTask): boolean {
+    if (task.status !== "running") return false;
+    if (!RECORD_RECOVERABLE_TASK_KINDS.has(task.kind)) return false;
+    if (task.resumeVersion !== BACKGROUND_TASK_RESUME_VERSION || typeof task.resumeHash !== "string") return false;
+    if (!inspectBackgroundTaskRecovery(task).recoverable) return false;
+    if (task.kind === "record-update") return tryParseRecordUpdateResumePayload(task.resumePayload) !== null;
+    if (task.kind === "record-batch-update") return tryParseRecordBatchResumePayload(task.resumePayload) !== null;
+    return false;
+}
+
+function listRecoverableRecordTasks(): BackgroundTask[] {
+    return listPersistedRecordTasks()
+        .filter(isRecoverableRecordTask)
+        .sort((a, b) => Date.parse(b.updatedAt || "") - Date.parse(a.updatedAt || ""));
+}
+
+function formatRecoverableRecordTasks(tasks: BackgroundTask[]): string {
+    if (tasks.length === 0) return "📦 当前没有可恢复的 Record 后台任务";
+    const lines = [`♻️ 可恢复的 Record 后台任务 (${tasks.length} 个)`];
+    for (const task of tasks) {
+        const claimed = fs.existsSync(recordTaskClaimPath(task.id)) ? " | claim=held" : "";
+        const progressBits: string[] = [];
+        if (task.progress?.stage) progressBits.push(`stage=${task.progress.stage}`);
+        if (task.progress?.current !== undefined && task.progress?.total !== undefined) {
+            progressBits.push(`progress=${task.progress.current}/${task.progress.total}`);
+        }
+        lines.push(
+            `- ${task.id} | ${task.kind} | updated=${task.updatedAt}${claimed}${progressBits.length ? ` | ${progressBits.join(" | ")}` : ""}`,
+        );
+    }
+    lines.push("💡 调用 record_manage(action=\"recover\", taskId=\"...\") 可尝试恢复指定任务");
+    return lines.join("\n");
+}
+
+function ensureRecordRecoveryHandlersRegistered(): void {
+    if (!getBackgroundTaskRecoveryHandler("record-update")) {
+        registerBackgroundTaskRecoveryHandler("record-update", async task => {
+            const payload = parseRecordUpdateResumePayload(task.resumePayload);
+            return {
+                mode: "resume",
+                maxRunMs: task.maxRunMs,
+                run: async ({ updateProgress, isCancelled, isSettled }) => {
+                    const hash = resolveWorkspaceHashForRecord(payload.workspace);
+                    const result = await handleUpdate(
+                        hash,
+                        payload.conversationId,
+                        payload.workspace,
+                        payload.dataChain,
+                        payload.modelChain,
+                        payload.parallelMode,
+                        payload.force,
+                        payload.logicalChain,
+                        Date.now(),
+                        { background: true, onProgress: updateProgress, isCancelled, isSettled },
+                    );
+                    return responseText(result);
+                },
+            };
+        });
+    }
+    if (!getBackgroundTaskRecoveryHandler("record-batch-update")) {
+        registerBackgroundTaskRecoveryHandler("record-batch-update", async task => {
+            const payload = parseRecordBatchResumePayload(task.resumePayload);
+            return {
+                mode: "resume",
+                maxRunMs: task.maxRunMs,
+                timeoutMessage: RECORD_BATCH_TIMEOUT_MESSAGE,
+                run: async ({ updateProgress, isCancelled, isSettled }) => (
+                    prepareAndRunRecordBatchUpdate(payload, updateProgress, isCancelled, isSettled)
+                ),
+            };
+        });
+    }
 }
 
 interface OwnershipAuditItem {
@@ -86,6 +849,32 @@ interface OwnershipAuditItem {
 }
 
 const RECORD_OWNERSHIP_SIDECAR = "ownership.json";
+
+type RecordWorkspaceMeta = { originalPath?: string; canonicalPath?: string };
+
+async function readRecordWorkspaceMetaAsync(hash: string): Promise<RecordWorkspaceMeta | null> {
+    if (hash === "general") return null;
+    try {
+        return JSON.parse(await fs.promises.readFile(path.join(DATA_ROOT, "workspaces", hash, "_meta.json"), "utf-8")) as RecordWorkspaceMeta;
+    } catch {
+        return null;
+    }
+}
+
+async function resolveWorkspaceHashForRecordAsync(workspace?: string): Promise<string> {
+    if (!workspace) return "general";
+    const requestedHash = workspaceHash(workspace);
+    const hashes = await listWorkspaceHashesAsync();
+    if (hashes.includes(requestedHash)) return requestedHash;
+    for (const hash of hashes) {
+        const meta = await readRecordWorkspaceMetaAsync(hash);
+        if (!meta) continue;
+        if ([meta.originalPath, meta.canonicalPath].some(candidate => candidate && workspaceHash(candidate) === requestedHash)) {
+            return hash;
+        }
+    }
+    return requestedHash;
+}
 
 function readOwnershipSidecar(hash: string, conversationId: string): { status?: string; supersededBy?: string } | null {
     return readRecordSidecar<{ status?: string; supersededBy?: string }>(hash, conversationId, RECORD_OWNERSHIP_SIDECAR);
@@ -109,10 +898,33 @@ function isSupersededRecord(hash: string, conversationId: string): boolean {
     return Boolean(resolveSupersededTargetHash(hash, conversationId));
 }
 
+async function readOwnershipSidecarAsync(hash: string, conversationId: string): Promise<{ status?: string; supersededBy?: string } | null> {
+    return readRecordSidecarAsync<{ status?: string; supersededBy?: string }>(hash, conversationId, RECORD_OWNERSHIP_SIDECAR);
+}
+
+async function resolveSupersededTargetHashAsync(hash: string, conversationId: string, visited = new Set<string>()): Promise<string | null> {
+    if (visited.has(hash)) return null;
+    visited.add(hash);
+    const sidecar = await readOwnershipSidecarAsync(hash, conversationId);
+    if (sidecar?.status !== "superseded" || !sidecar.supersededBy) return null;
+    const targetHash = sidecar.supersededBy;
+    if (visited.has(targetHash) || !await readRecordAsync(targetHash, conversationId)) return null;
+    const targetSidecar = await readOwnershipSidecarAsync(targetHash, conversationId);
+    if (targetSidecar?.status === "superseded") {
+        return resolveSupersededTargetHashAsync(targetHash, conversationId, visited);
+    }
+    return targetHash;
+}
+
+async function isSupersededRecordAsync(hash: string, conversationId: string): Promise<boolean> {
+    return Boolean(await resolveSupersededTargetHashAsync(hash, conversationId));
+}
+
 /**
  * record_manage — 对话记录管理工具 v1.8
  */
 export function registerRecord(server: McpServer): void {
+    ensureRecordRecoveryHandlersRegistered();
     server.tool(
         "record_manage",
         `管理对话记录（Record）。Record 是对话的结构化过程日志，由 Flash 自动生成，抗 LS 过期。
@@ -126,20 +938,24 @@ action:
 - delete: 删除指定 Record（不传 conversationId 则清空工作区全部 Record）
 - audit_ownership: 审计 Record 归属，不按语义猜测，只看 workspaceUri/cwd/派生关系/重复副本
 - repair_ownership: 归属修复，默认 dry-run，只输出迁移计划
+- batch_update: 批量更新工作区内多个对话的 Record（按时间/源/工作区筛选候选，后台执行）
 - bulk_update: batch_update 的安全别名，用于避开共享 broker 对 batch_update 名称的全局拦截
+- recover: 列出或恢复可恢复的 Record 后台任务
 - batch_delete: 删除工作区下所有 Record
-- task_status: 查询后台任务状态`,
+- task_status: 查询后台任务状态（update/batch_update/bulk_update/guide 返回 taskId 后用此查询）
+- cancel: 兼容入口，按 taskId 取消 Record 后台任务；其它后台任务优先使用 background_task_cancel
+- stale_check: 检测范围内哪些 Record 已过期（对话有新内容但 Record 未跟进）；近期列表未找到的 Record 标为 unresolved，仅统计不改动`,
         {
-            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "batch_delete", "task_status", "audit_ownership", "repair_ownership"])
+            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "recover", "batch_delete", "task_status", "cancel", "audit_ownership", "repair_ownership", "stale_check"])
                 .describe("操作类型"),
             conversationId: z.string().optional()
                 .describe("对话 ID（update 不传则自动获取当前对话）"),
             workspace: z.string().optional()
                 .describe("工作区路径（不传则 general）"),
             scope: z.enum(["workspace", "global", "general"]).optional()
-                .describe("search/list/audit 范围，默认 workspace；workspace 严格只读指定工作区"),
+                .describe("[search/list/audit/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
             includeGeneral: z.boolean().optional()
-                .describe("list/search 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
+                .describe("[list/search/stale_check] 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
             query: z.string().optional()
                 .describe("[search] 搜索关键词"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
@@ -184,10 +1000,12 @@ action:
                 .describe("[batch_update/bulk_update] 只处理此时间之后的对话(ISO/YYYY-MM-DD)"),
             before: z.string().optional()
                 .describe("[batch_update/bulk_update] 只处理此时间之前的对话"),
-            limit: z.number().optional()
-                .describe("[list/search/batch_update/bulk_update] 最大数量；list 默认 30/上限 200，search 默认 10，批量更新默认 10/上限 50"),
+            limit: z.number().int().min(1).max(200).optional()
+                .describe("[list/search/batch_update/bulk_update/stale_check] 1..200 的正整数；批量更新有效上限为非 force 50、force 200，默认分别为 10、200"),
             force: z.boolean().optional()
                 .describe("[update/batch_update/bulk_update] 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
+            stale_only: z.boolean().optional()
+                .describe("[batch_update/bulk_update] 始终只选择已过期的 Record；优先级高于 force"),
             dryRun: z.boolean().optional()
                 .describe("[repair_ownership] 默认 true，只报告计划不移动文件"),
             backup: z.boolean().optional()
@@ -195,30 +1013,29 @@ action:
             waitSeconds: z.number().optional()
                 .describe("[task_status] 后台任务查询等待秒数(1-300)，任务完成时提前返回"),
             background: z.boolean().optional()
-                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时）；batch_update/bulk_update 自带后台任务状态"),
+                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时自动后台；batch_update/bulk_update 始终返回 taskId"),
             parallelMode: z.enum(["off", "auto", "force"]).optional()
                 .describe("[update] 实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
                 .describe("[update] Claude Code Record 更新：off=只用指定物理 ID；auto=强证据时合并逻辑续聊链，默认 claude-code 使用 auto"),
             taskId: z.string().optional()
-                .describe("[task_status] 后台任务 ID"),
-            chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
+                .describe("[task_status/cancel/recover] 后台任务 ID"),
+            chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
+                .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\" 只作为 modelChain"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("对话数据链路：auto=当前宿主优先，支持 antigravity/codex/claude-code/windsurf"),
-            modelChain: modelChainInputSchema("modelChain", "模型链路：auto=当前宿主优先，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
+            modelChain: modelChainInputSchema("modelChain", "模型链路：auto=优先 Grok/progrok 再 fallback，grok=本机 progrok proxy，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
         },
         async (args) => {
             const startMs = Date.now();
             touchActivity({ skipRecordAutoCheck: args.action === "update" || isRecordBatchUpdateAction(args.action) });
             try {
-                const hash = resolveWorkspaceHashForRecord(args.workspace);
+                const hash = await resolveWorkspaceHashForRecordAsync(args.workspace);
                 const chains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
                 switch (args.action) {
                     case "update": {
-                        // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
-                        // 仅 codex 这类 heavy 链路在 background 未传时自动转后台（避免 60s 超时），其余链路未传仍同步（行为不变）。
-                        const decision = decideBackground(args.background, chains.modelChain);
+                        // Plan_30：record update 默认自动后台排队；显式 background=false 才同步执行。
+                        const decision = decideBackground(args.background, chains.modelChain, "always");
                         if (decision.useBackground) {
                             return handleUpdateBackground(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, args.logicalChain as ConversationLogicalChainMode | undefined, startMs, decision.auto);
                         }
@@ -273,8 +1090,14 @@ action:
                     case "batch_update":
                     case "bulk_update":
                         return await handleBatchUpdate(hash, args, startMs);
+                    case "recover":
+                        return await handleRecover(args.taskId, startMs);
                     case "task_status":
                         return await handleTaskStatus(args.taskId, args.waitSeconds, startMs);
+                    case "cancel":
+                        return rt(formatBackgroundTask(cancelBackgroundTask(args.taskId || "", "用户取消 Record 任务")), startMs);
+                    case "stale_check":
+                        return await handleStaleCheck(hash, args.scope, args.includeGeneral, chains.dataChain, args.limit, startMs);
                     default:
                         return r(`❌ 未知 action: ${args.action}`);
                 }
@@ -303,6 +1126,17 @@ function rt(text: string, startMs: number) {
     return r(`${text}\n⏱ 耗时 ${elapsed}s`);
 }
 
+function buildRecordTaskAbortResponse(
+    startMs: number,
+    options: { isCancelled?: () => boolean; isSettled?: () => boolean } = {},
+    stage = "停止后续 Record 处理",
+) {
+    const reason = getRecordTaskAbortReason(options);
+    if (!reason) return null;
+    const prefix = reason === "cancelled" ? "🛑 Record 更新已取消" : "⚠️ 后台任务已超时/结算";
+    return rt(`${prefix}：${stage}，未继续模型调用或写回半成品`, startMs);
+}
+
 function responseText(response: ReturnType<typeof r>): string {
     return response.content.map(item => item.text).join("\n");
 }
@@ -322,6 +1156,150 @@ export function buildSourceChangedWarning(snapshot: RecordSourceSnapshot, latest
     return `目标 Codex 对话在 Record 生成期间继续追加；本次按启动快照覆盖 ${snapshot.rounds} 轮 / ${snapshot.totalSteps} 步。若要纳入新尾巴，请再执行一次 update。`;
 }
 
+async function statMtimeMsAsync(filePath: string | undefined): Promise<number | undefined> {
+    if (!filePath) return undefined;
+    try {
+        return (await fs.promises.stat(filePath)).mtimeMs;
+    } catch {
+        return undefined;
+    }
+}
+
+export const __recordConcurrencyTest = {
+    stats(): ConcurrencyGateSnapshot {
+        return __recordUpdateCoordinationTest.persistenceStats();
+    },
+    resetPeak(): void {
+        __recordUpdateCoordinationTest.resetPersistencePeak();
+    },
+    async acquire(options: ConcurrencyGateAcquireOptions = {}): Promise<ConcurrencyGatePermit> {
+        return __recordUpdateCoordinationTest.acquirePersistenceGate(options);
+    },
+    async runUpdate(
+        args: {
+            hash: string;
+            conversationId?: string;
+            workspace?: string;
+            dataChain: DataChain;
+            modelChain: Chain;
+            parallelMode?: RecordParallelMode;
+            force?: boolean;
+            logicalChain?: ConversationLogicalChainMode;
+            startMs?: number;
+            options?: {
+                background?: boolean;
+                onProgress?: (progress: BackgroundTaskProgress) => void;
+                isCancelled?: () => boolean;
+                isSettled?: () => boolean;
+            };
+        },
+    ) {
+        return handleUpdate(
+            args.hash,
+            args.conversationId,
+            args.workspace,
+            args.dataChain,
+            args.modelChain,
+            args.parallelMode,
+            args.force,
+            args.logicalChain,
+            args.startMs ?? Date.now(),
+            args.options,
+        );
+    },
+    async runBatchUpdate(
+        payload: {
+            kind: "record-batch-update";
+            actionName: "batch_update" | "bulk_update";
+            resumeKey: string;
+            dataChain: DataChain;
+            modelChain: Chain;
+            force?: boolean;
+            candidates: Array<{ id: string; workspace: string }>;
+        },
+        options: {
+            updateProgress?: (progress: BackgroundTaskProgress) => void;
+            isCancelled?: () => boolean;
+            isSettled?: () => boolean;
+        } = {},
+    ): Promise<string> {
+        const normalizedPayload = normalizeRecordBatchReadyPayload(payload);
+        return runRecordBatchUpdateFromPayload(
+            normalizedPayload,
+            options.updateProgress || (() => undefined),
+            options.isCancelled || (() => false),
+            options.isSettled || (() => false),
+        );
+    },
+    setBatchCandidateCollector(collector: BatchCandidateCollector | null): void {
+        batchCandidateCollectorOverride = collector;
+    },
+    parseBatchResumePayload(payload: unknown): RecordBatchResumePayload | null {
+        return tryParseRecordBatchResumePayload(payload);
+    },
+    async prepareBatchPayload(payload: unknown): Promise<{ payload?: RecordBatchReadyResumePayload; result?: string }> {
+        return prepareRecordBatchPayload(
+            parseRecordBatchResumePayload(payload),
+            () => undefined,
+            () => false,
+            () => false,
+        );
+    },
+    async ensureBatchLedger(payload: unknown): Promise<RecordBatchResumeLedger> {
+        const parsed = parseRecordBatchResumePayload(payload);
+        if (!("candidates" in parsed)) throw new Error("Record batch ledger requires ready payload");
+        return ensureRecordBatchLedgerAsync(parsed);
+    },
+    setPersistenceHook(hook: RecordPersistenceTestHook | null): void {
+        recordPersistenceTestHook = hook;
+    },
+    async mutateBatchLedger(
+        payload: {
+            kind: "record-batch-update";
+            actionName: "batch_update" | "bulk_update";
+            resumeKey: string;
+            dataChain: DataChain;
+            modelChain: Chain;
+            force?: boolean;
+            candidates: Array<{ id: string; workspace: string }>;
+        },
+        mutation: "completed" | "skipped" | "failed" | "inFlight",
+        candidate: { id: string; workspace: string },
+        reason?: string,
+        details?: { isNew?: boolean; metadata?: RecordBatchIndexMetadata },
+    ): Promise<RecordBatchResumeLedger> {
+        const readyPayload = normalizeRecordBatchReadyPayload(payload);
+        if (mutation === "inFlight") {
+            return markRecordBatchCandidateInFlight(readyPayload, candidate, reason || candidate.id, details?.metadata, details?.isNew);
+        }
+        return updateRecordBatchLedger(readyPayload, mutation, candidate, reason, details?.isNew);
+    },
+    async readBatchLedger(
+        payload: {
+            kind: "record-batch-update";
+            actionName: "batch_update" | "bulk_update";
+            resumeKey: string;
+            dataChain: DataChain;
+            modelChain: Chain;
+            force?: boolean;
+            candidates: Array<{ id: string; workspace: string }>;
+        },
+    ): Promise<RecordBatchResumeLedger> {
+        return ensureRecordBatchLedgerAsync(normalizeRecordBatchReadyPayload(payload));
+    },
+    formatBatchResult(
+        ledger: RecordBatchResumeLedger,
+        total = ledger.candidates.length,
+        resumeSummary = { hadPriorState: false, initialSettledCount: 0 },
+        grokSummary?: GrokBatchRuntimeSummary,
+    ): string {
+        return buildRecordBatchResultText(ledger, total, 0, resumeSummary, undefined, undefined, grokSummary);
+    },
+    dedupeCandidates(candidates: Array<{ id: string; workspace?: string }>): Array<{ id: string; workspace?: string }> {
+        return dedupeBatchConversationCandidates(candidates);
+    },
+};
+
 function recordCompletenessScore(hash: string, conversationId: string, content?: string) {
     const entry = readRecordsIndex(hash).records[conversationId];
     return {
@@ -338,6 +1316,32 @@ function compareRecordCandidate(
 ): number {
     const as = recordCompletenessScore(a.hash, a.conversationId, a.content);
     const bs = recordCompletenessScore(b.hash, b.conversationId, b.content);
+    if (as.coveredRounds !== bs.coveredRounds) return as.coveredRounds - bs.coveredRounds;
+    if (as.updatedAt !== bs.updatedAt) return as.updatedAt - bs.updatedAt;
+    if (as.sizeBytes !== bs.sizeBytes) return as.sizeBytes - bs.sizeBytes;
+    return as.nonGeneral - bs.nonGeneral;
+}
+
+async function compareRecordCandidateAsync(
+    a: { hash: string; conversationId: string; content?: string },
+    b: { hash: string; conversationId: string; content?: string },
+): Promise<number> {
+    const [aEntry, bEntry] = await Promise.all([
+        readRecordsIndexAsync(a.hash).then(index => index.records[a.conversationId]),
+        readRecordsIndexAsync(b.hash).then(index => index.records[b.conversationId]),
+    ]);
+    const as = {
+        coveredRounds: aEntry?.lastUpdatedRound || aEntry?.totalRounds || 0,
+        updatedAt: Date.parse(aEntry?.lastUpdatedAt || "") || 0,
+        sizeBytes: aEntry?.sizeBytes || (a.content ? Buffer.byteLength(a.content, "utf-8") : 0),
+        nonGeneral: a.hash === "general" ? 0 : 1,
+    };
+    const bs = {
+        coveredRounds: bEntry?.lastUpdatedRound || bEntry?.totalRounds || 0,
+        updatedAt: Date.parse(bEntry?.lastUpdatedAt || "") || 0,
+        sizeBytes: bEntry?.sizeBytes || (b.content ? Buffer.byteLength(b.content, "utf-8") : 0),
+        nonGeneral: b.hash === "general" ? 0 : 1,
+    };
     if (as.coveredRounds !== bs.coveredRounds) return as.coveredRounds - bs.coveredRounds;
     if (as.updatedAt !== bs.updatedAt) return as.updatedAt - bs.updatedAt;
     if (as.sizeBytes !== bs.sizeBytes) return as.sizeBytes - bs.sizeBytes;
@@ -366,28 +1370,86 @@ function resolveRecordLocation(hash: string, convId: string): { hash: string; co
     return candidates.sort((a, b) => compareRecordCandidate(b, a))[0] || null;
 }
 
-const RECORD_READER_SIDECAR = "record_index.json";
+async function resolveRecordConversationIdAsync(input: string, preferredHash?: string): Promise<string | null> {
+    const query = input.trim();
+    if (!query) return null;
+    const queryLower = query.toLowerCase();
+    const hashes = [
+        ...(preferredHash ? [preferredHash] : []),
+        "general",
+        ...await listWorkspaceHashesAsync(),
+    ].filter((recordHash, index, entries) => recordHash && entries.indexOf(recordHash) === index);
+    const indexes = await Promise.all(hashes.map(async recordHash => readRecordsIndexAsync(recordHash)));
+    const entries = indexes.flatMap(index => Object.values(index.records));
+    const exact = entries.find(entry => entry.conversationId === query);
+    if (exact) return exact.conversationId;
+    const prefixMatches = entries.filter(entry => entry.conversationId.startsWith(query));
+    if (prefixMatches.length === 1) return prefixMatches[0].conversationId;
+    const titleMatches = entries.filter(entry => entry.title.toLowerCase() === queryLower);
+    return titleMatches.length === 1 ? titleMatches[0].conversationId : null;
+}
 
-async function writeReaderIndexForRecord(hash: string, conversationId: string, content: string): Promise<RecordReaderIndex> {
-    const index = buildRecordReaderIndex(conversationId, content);
-    await writeRecordSidecar(hash, conversationId, RECORD_READER_SIDECAR, index);
-    return index;
+async function resolveRecordLocationAsync(hash: string, convId: string): Promise<{ hash: string; conversationId: string; content: string } | null> {
+    const resolvedId = await resolveRecordConversationIdAsync(convId, hash) || convId;
+    const candidateHashes = [
+        hash,
+        ...(hash !== "general" ? ["general"] : []),
+        await findRecordHashAsync(resolvedId),
+    ].filter((recordHash): recordHash is string => Boolean(recordHash))
+        .filter((recordHash, index, entries) => entries.indexOf(recordHash) === index);
+    const candidates = (await Promise.all(candidateHashes.map(async candidateHash => {
+        const [content, superseded] = await Promise.all([
+            readRecordAsync(candidateHash, resolvedId),
+            isSupersededRecordAsync(candidateHash, resolvedId),
+        ]);
+        return content && !superseded ? { hash: candidateHash, conversationId: resolvedId, content } : null;
+    }))).filter((candidate): candidate is { hash: string; conversationId: string; content: string } => Boolean(candidate));
+    let best: { hash: string; conversationId: string; content: string } | null = null;
+    for (const candidate of candidates) {
+        if (!best || await compareRecordCandidateAsync(candidate, best) > 0) best = candidate;
+    }
+    return best;
 }
 
 async function readOrBuildReaderIndex(hash: string, conversationId: string, content: string, mode: RecordReaderIndexMode = "auto") {
     if (mode !== "rebuild" && mode !== "off") {
-        const cached = readRecordSidecar<RecordReaderIndex>(hash, conversationId, RECORD_READER_SIDECAR);
-        if (cached?.version === RECORD_READER_VERSION && isRecordReaderIndexFresh(cached, content)) {
+        const [cached, rebuildMarker] = await Promise.all([
+            readRecordSidecarAsync<RecordReaderIndex>(hash, conversationId, "record_index.json"),
+            readRecordSidecarAsync(hash, conversationId, "record_index.rebuild.json"),
+        ]);
+        if (!rebuildMarker && cached?.version === RECORD_READER_VERSION && isRecordReaderIndexFresh(cached, content)) {
             return { index: cached, indexStatus: "fresh" as const };
         }
         if (mode === "reuse" && cached) {
             return { index: buildRecordReaderIndex(conversationId, content), indexStatus: "rebuilt_in_memory_stale_cache" as const };
         }
     }
-    const index = buildRecordReaderIndex(conversationId, content);
-    if (mode === "off") return { index, indexStatus: "rebuilt_in_memory" as const };
-    await writeRecordSidecar(hash, conversationId, RECORD_READER_SIDECAR, index);
-    return { index, indexStatus: "rebuilt" as const };
+    if (mode === "off") {
+        return { index: buildRecordReaderIndex(conversationId, content), indexStatus: "rebuilt_in_memory" as const };
+    }
+    await runRecordPersistenceTestHook("before_reader_index_single_flight", conversationId);
+    const persisted = await withRecordManagementSingleFlight(conversationId, async () => {
+        const currentContent = await readRecordAsync(hash, conversationId);
+        if (currentContent !== content) {
+            return {
+                index: buildRecordReaderIndex(conversationId, content),
+                error: null,
+                indexStatus: currentContent ? "rebuilt_in_memory_stale_record" as const : "rebuilt_in_memory_missing_record" as const,
+            };
+        }
+        const result = await withRecordPersistenceWrite(async () => buildAndPersistRecordReaderIndex(hash, conversationId, content, {
+            beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", conversationId),
+        }));
+        return {
+            ...result,
+            indexStatus: result.error ? "rebuilt_in_memory_pending" as const : "rebuilt" as const,
+        };
+    });
+    if (!persisted.index) throw persisted.error || new Error("Reader Index 构建失败");
+    return {
+        index: persisted.index,
+        indexStatus: persisted.indexStatus,
+    };
 }
 
 function recordCoverageWarning(hash: string, conversationId: string, content: string): string | null {
@@ -436,6 +1498,31 @@ export function recordHashesForScope(hash: string, scope: RecordManageScope | un
     return includeGeneral ? [...workspaceHashes, "general"] : workspaceHashes;
 }
 
+async function canonicalHashForExistingRecordHashAsync(hash: string): Promise<string | null> {
+    if (hash === "general") return "general";
+    const meta = await readRecordWorkspaceMetaAsync(hash);
+    const workspace = meta?.canonicalPath || meta?.originalPath;
+    return workspace ? workspaceHash(workspace) : null;
+}
+
+async function recordHashesForScopeAsync(hash: string, scope: RecordManageScope | undefined, includeGeneral = false): Promise<string[]> {
+    const workspaceHashes = await listWorkspaceHashesAsync();
+    if (scope === "global") {
+        return ["general", ...workspaceHashes].filter((recordHash, index, entries) => entries.indexOf(recordHash) === index);
+    }
+    if (scope === "general" || hash === "general") return ["general"];
+    const canonicalHash = await canonicalHashForExistingRecordHashAsync(hash) || hash;
+    const canonicalHashes = await Promise.all(workspaceHashes.map(async recordHash => ({
+        hash: recordHash,
+        canonicalHash: await canonicalHashForExistingRecordHashAsync(recordHash),
+    })));
+    const matchingHashes = [hash, ...canonicalHashes
+        .filter(item => item.hash !== hash && item.canonicalHash === canonicalHash)
+        .map(item => item.hash)]
+        .filter((recordHash, index, entries) => entries.indexOf(recordHash) === index);
+    return includeGeneral ? [...matchingHashes, "general"] : matchingHashes;
+}
+
 export function listRecordsForScope(hash: string, scope: RecordManageScope | undefined, includeGeneral = false) {
     const records = recordHashesForScope(hash, scope, includeGeneral)
         .flatMap(h => listRecords(h).filter(rec => !isSupersededRecord(h, rec.conversationId)));
@@ -447,155 +1534,265 @@ export function listRecordsForScope(hash: string, scope: RecordManageScope | und
 async function handleUpdate(
     hash: string, conversationId: string | undefined,
     workspace: string | undefined, dataChain: DataChain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, logicalChain: ConversationLogicalChainMode | undefined, startMs: number,
-    options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void; isSettled?: () => boolean } = {},
+    options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void; isCancelled?: () => boolean; isSettled?: () => boolean } = {},
 ) {
-    options.onProgress?.({
-        stage: "加载对话",
-        detail: `dataChain=${dataChain}`,
-    });
+    const preflightAbort = buildRecordTaskAbortResponse(startMs, options, "开始加载对话前检查到任务已终止");
+    if (preflightAbort) return preflightAbort;
     const effectiveLogicalChain = logicalChain || (dataChain === "claude-code" ? "auto" : "off");
-    const loaded = await loadConversationData(dataChain, conversationId, {
-        link: "summary",
-        logicalChain: effectiveLogicalChain,
-    });
-    if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
-    if (loaded.windsurfData?.partial) {
-        const skipped = loaded.windsurfData.skippedSteps || [];
-        const shown = skipped.slice(0, 5).map(item => `offset ${item.offset}`).join(", ");
-        const more = skipped.length > 5 ? ` 等 ${skipped.length} 个` : "";
-        return rt([
-            "❌ Record 更新已中止：Windsurf 原文读取不完整",
-            `⚠️ 已跳过超大 step ${shown || "(未知)"}${more}`,
-            "原因：Windsurf Language Server 拒绝返回超过单步大小限制的内容；memory-store 可以降级 read/search，但不会把缺失原文写成正式 Record。",
-            "建议：先用 conversation_read_original(read/search, dataChain=\"windsurf\") 阅读可用部分；若需要完整 Record，请回到 Windsurf UI 或官方导出补齐该超大 step 后再生成。",
-        ].join("\n"), startMs);
-    }
-
-    const cascadeId = loaded.conversationId;
-    const rounds = loaded.rounds;
-    const totalSteps = loaded.totalSteps;
-    const sourceSnapshot: RecordSourceSnapshot = {
-        chain: loaded.chainUsed,
-        rounds: rounds.length,
-        totalSteps,
-        rolloutPath: loaded.codexData?.thread.rolloutPath,
-        rolloutMtimeMs: statMtimeMs(loaded.codexData?.thread.rolloutPath),
-    };
-    options.onProgress?.({
-        stage: "解析完成",
-        current: 0,
-        total: rounds.length,
-        unit: "轮",
-        detail: `${rounds.length} 轮 / ${totalSteps} 步，开始检查 Record 索引`,
-    });
-
-    // B修复：无 workspace 时从对话元数据自动检测工作区
+    let sharedPool: Pick<RecordUpdateSharedPermit, "queueWaitMs" | "snapshot"> | null = null;
+    let loaded: Awaited<ReturnType<typeof loadConversationData>> | null = null;
+    let result: Awaited<ReturnType<typeof generateRecord>> | null = null;
+    let singleFlightPermit: Awaited<ReturnType<typeof acquireRecordSingleFlightPermit>> | null = null;
     let effectiveHash = hash;
     let effectiveWs = workspace || "general";
-    if (hash === "general" && !workspace) {
-        const detectedWs = loaded.chainUsed === "antigravity"
-            ? detectWorkspaceFromSteps(loaded.trajectory?.steps || [])
-            : (loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || loaded.windsurfData?.thread.cwd);
-        if (detectedWs) {
-            ensureWorkspace(detectedWs);
-            effectiveHash = resolveWorkspaceHashForRecord(detectedWs);
-            effectiveWs = detectedWs;
-        }
-    }
-    if (effectiveWs !== "general") {
-        ensureWorkspace(effectiveWs);
-        effectiveHash = resolveWorkspaceHashForRecord(effectiveWs);
-    }
-
-    const existingBestHash = findRecordHash(cascadeId);
-    if (existingBestHash && existingBestHash !== effectiveHash) {
-        const currentContent = readRecord(effectiveHash, cascadeId);
-        const bestContent = readRecord(existingBestHash, cascadeId);
-        const shouldSeedOfficial = bestContent && (
-            !currentContent ||
-            compareRecordCandidate(
-                { hash: existingBestHash, conversationId: cascadeId, content: bestContent },
-                { hash: effectiveHash, conversationId: cascadeId, content: currentContent },
-            ) > 0
-        );
-        if (shouldSeedOfficial) {
-            await copyRecordToHash(existingBestHash, effectiveHash, cascadeId, { lastUpdatedAt: new Date().toISOString() }, { backup: true });
-            await writeRecordSidecar(existingBestHash, cascadeId, RECORD_OWNERSHIP_SIDECAR, {
-                status: "superseded",
-                supersededBy: effectiveHash,
-                reason: "record update remapped existing alias/general copy to official workspace",
-                updatedAt: new Date().toISOString(),
-            });
-        }
-    }
-
-    const result = await generateRecord(effectiveHash, cascadeId, effectiveWs, rounds, totalSteps, modelChain, {
-        background: options.background,
-        parallelMode,
-        force,
-        onProgress: options.onProgress,
-    });
-    if (!result.success) return rt(`❌ Record 生成失败: ${result.error}`, startMs);
-
-    const oldRecordForGate = readRecord(effectiveHash, cascadeId) || "";
-    const gate = validateRecordCandidateForWrite(result.content!, cascadeId, rounds.length, result.coveredRounds || rounds.length, {
-        oldRecord: oldRecordForGate,
-    });
-    if (!gate.ok) {
-        return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
-    }
-
-    // A2：写回前自查任务是否已结算——后台超时只把任务标 error、本函数仍会跑到这里，若已结算则丢弃结果、
-    // 绝不覆盖正式 Record（防「报失败却偷偷改数据」的幽灵写回）。同步路径无 isSettled，行为不变。
-    if (options.isSettled?.()) {
-        return rt("⚠️ 后台任务已超时/取消，已丢弃本次生成结果，未覆盖正式 Record（请重跑）", startMs);
-    }
-    const phases = countPhasesInRecord(result.content!);
-    await writeRecord(effectiveHash, cascadeId, result.content!, {
-        title: extractTitle(result.content!) || `对话 ${cascadeId.slice(0, 8)}`,
-        totalRounds: rounds.length,
-        totalSteps,
-        lastUpdatedRound: result.coveredRounds || rounds.length,
-        phases,
-        tags: result.tags,
-    });
-    let readerIndexStatus = "rebuilt";
+    let sourceSnapshot: RecordSourceSnapshot | null = null;
     try {
-        await writeReaderIndexForRecord(effectiveHash, cascadeId, result.content!);
-    } catch (err) {
-        readerIndexStatus = `error: ${err instanceof Error ? err.message : String(err)}`;
+        loaded = await loadConversationData(dataChain, conversationId, {
+            link: "summary",
+            logicalChain: effectiveLogicalChain,
+            requestClass: options.background ? "background" : "foreground",
+        });
+        if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
+        if (loaded.windsurfData?.partial) {
+            const skipped = loaded.windsurfData.skippedSteps || [];
+            const shown = skipped.slice(0, 5).map(item => `offset ${item.offset}`).join(", ");
+            const more = skipped.length > 5 ? ` 等 ${skipped.length} 个` : "";
+            return rt([
+                "❌ Record 更新已中止：Windsurf 原文读取不完整",
+                `⚠️ 已跳过超大 step ${shown || "(未知)"}${more}`,
+                "原因：Windsurf Language Server 拒绝返回超过单步大小限制的内容；memory-store 可以降级 read/search，但不会把缺失原文写成正式 Record。",
+                "建议：先用 conversation_read_original(read/search, dataChain=\"windsurf\") 阅读可用部分；若需要完整 Record，请回到 Windsurf UI 或官方导出补齐该超大 step 后再生成。",
+            ].join("\n"), startMs);
+        }
+
+        const rounds = loaded.rounds;
+        const totalSteps = loaded.totalSteps;
+        const afterLoadAbort = buildRecordTaskAbortResponse(startMs, options, "对话已加载，停止后续 Record 生成");
+        if (afterLoadAbort) return afterLoadAbort;
+        options.onProgress?.({
+            stage: "解析完成",
+            current: 0,
+            total: rounds.length,
+            unit: "轮",
+            detail: `${rounds.length} 轮 / ${totalSteps} 步，开始检查 Record 索引`,
+        });
+
+        if (hash === "general" && !workspace) {
+            const detectedWs = loaded.chainUsed === "antigravity"
+                ? detectWorkspaceFromSteps(loaded.trajectory?.steps || [])
+                : (loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || loaded.windsurfData?.thread.cwd);
+            if (detectedWs) effectiveWs = detectedWs;
+        }
+        if (effectiveWs !== "general") {
+            effectiveHash = (await ensureWorkspaceAsync(effectiveWs)).hash;
+        }
+
+        const cascadeId = loaded.conversationId;
+        sourceSnapshot = {
+            chain: loaded.chainUsed,
+            rounds: rounds.length,
+            totalSteps,
+            rolloutPath: loaded.codexData?.thread.rolloutPath,
+            rolloutMtimeMs: await statMtimeMsAsync(loaded.codexData?.thread.rolloutPath),
+        };
+        singleFlightPermit = await acquireRecordSingleFlightPermit(cascadeId, options);
+        const existingBestHash = await findRecordHashAsync(cascadeId);
+        if (existingBestHash && existingBestHash !== effectiveHash) {
+            const [currentContent, bestContent] = await Promise.all([
+                readRecordAsync(effectiveHash, cascadeId),
+                readRecordAsync(existingBestHash, cascadeId),
+            ]);
+            const shouldSeedOfficial = bestContent && (
+                !currentContent ||
+                await compareRecordCandidateAsync(
+                    { hash: existingBestHash, conversationId: cascadeId, content: bestContent },
+                    { hash: effectiveHash, conversationId: cascadeId, content: currentContent },
+                ) > 0
+            );
+            if (shouldSeedOfficial) {
+                const seeded = await withRecordUpdateSharedPermit({
+                    isCancelled: options.isCancelled,
+                    isSettled: options.isSettled,
+                    onProgress: options.onProgress,
+                    waitingStage: "等待 Record 写入许可",
+                    acquiredStage: "迁移 Record 副本",
+                    waitingDetail: `等待 Record 迁移写入许可（dataChain=${dataChain}）`,
+                    acquiredDetail: `已获取 Record 迁移写入许可（dataChain=${dataChain}）`,
+                }, async () => {
+                    await runRecordPersistenceTestHook("before_copy", cascadeId);
+                    await copyRecordToHash(existingBestHash, effectiveHash, cascadeId, { lastUpdatedAt: new Date().toISOString() }, { backup: true });
+                    await writeRecordSidecar(existingBestHash, cascadeId, RECORD_OWNERSHIP_SIDECAR, {
+                        status: "superseded",
+                        supersededBy: effectiveHash,
+                        reason: "record update remapped existing alias/general copy to official workspace",
+                        updatedAt: new Date().toISOString(),
+                    });
+                });
+                sharedPool = { queueWaitMs: seeded.permit.queueWaitMs, snapshot: seeded.permit.snapshot };
+            }
+        }
+
+        result = await generateRecord(effectiveHash, cascadeId, effectiveWs, rounds, totalSteps, modelChain, {
+            background: options.background,
+            parallelMode,
+            force,
+            isCancelled: options.isCancelled,
+            isSettled: options.isSettled,
+            onProgress: options.onProgress,
+        });
+    } catch (error) {
+        if (error instanceof RecordUpdatePoolAbortError) {
+            return recordUpdatePoolAbortResponse(startMs, error, "写入许可排队中止，未继续迁移或生成 Record");
+        }
+        if (error instanceof RecordSingleFlightAbortError) {
+            return rt(`⚠️ ${error.message} | ${formatRecordUpdatePoolDetail(error.snapshot)}`, startMs);
+        }
+        throw error;
+    } finally {
+        if (!result) singleFlightPermit?.release();
+    }
+    if (!loaded || !result) {
+        return rt("❌ Record 更新失败：共享池执行结束后未拿到完整结果", startMs);
     }
 
-    const sizeKB = (Buffer.byteLength(result.content!, "utf-8") / 1024).toFixed(1);
-    let out = result.upToDate
-        ? "✅ Record 已是最新（索引已刷新）"
-        : `✅ Record 已${conversationId ? "更新" : "生成"}`;
-    out += `\n📝 对话: ${cascadeId.slice(0, 8)}...`;
-    out += `\n🔗 对话链路: ${loaded.chainUsed}`;
-    out += `\n🧠 模型链路: ${modelChain}`;
-    if (loaded.claudeCodeData?.logicalChain && loaded.claudeCodeData.logicalChain.mode !== "off") {
-        const info = loaded.claudeCodeData.logicalChain;
-        const merged = info.segments.filter(item => item.role === "predecessor-merged");
-        out += `\n🧩 Claude Code 逻辑续聊: ${info.merged ? `已合并 ${merged.length} 个前序片段` : "未发现可安全自动合并的前序片段"}`;
-        if (info.warnings?.length) out += `\n⚠️ ${info.warnings.join("\n⚠️ ")}`;
+    try {
+        const cascadeId = loaded.conversationId;
+        const rounds = loaded.rounds;
+        const totalSteps = loaded.totalSteps;
+        if (result.aborted) {
+            return rt(
+                result.abortReason === "cancelled"
+                    ? `🛑 Record 更新已取消：${result.error || "已停止后续模型调用和写回"}`
+                    : `⚠️ 后台任务已超时/结算：${result.error || "已停止后续模型调用和写回"}`,
+                startMs,
+            );
+        }
+        if (!result.success) return rt(`❌ Record 生成失败: ${result.error}`, startMs);
+
+        const beforeWriteAbort = buildRecordTaskAbortResponse(startMs, options, "写回正式 Record 前检查到任务已终止");
+        if (beforeWriteAbort) return beforeWriteAbort;
+        const oldRecordForGate = await readRecordAsync(effectiveHash, cascadeId) || "";
+        const gate = validateRecordCandidateForWrite(result.content!, cascadeId, rounds.length, result.coveredRounds || rounds.length, {
+            oldRecord: oldRecordForGate,
+        });
+        if (!gate.ok) return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
+        const phases = countPhasesInRecord(result.content!);
+        let readerIndexStatus = "rebuilt";
+        try {
+            const committed = await withRecordUpdateSharedPermit({
+                isCancelled: options.isCancelled,
+                isSettled: options.isSettled,
+                onProgress: options.onProgress,
+                waitingStage: "等待 Record 写入许可",
+                acquiredStage: "写回 Record",
+                waitingDetail: `等待 Record 写回许可（dataChain=${dataChain}）`,
+                acquiredDetail: `已获取 Record 写回许可（dataChain=${dataChain}）`,
+            }, async permit => {
+                const abortReason = getRecordTaskAbortReason(options);
+                if (abortReason) throw new RecordUpdatePoolAbortError(abortReason, permit.snapshot);
+                await runRecordPersistenceTestHook("before_write", cascadeId);
+                const beforeCommitReason = getRecordTaskAbortReason(options);
+                if (beforeCommitReason) throw new RecordUpdatePoolAbortError(beforeCommitReason, permit.snapshot);
+                await writeRecord(effectiveHash, cascadeId, result.content!, {
+                    title: extractTitle(result.content!) || `对话 ${cascadeId.slice(0, 8)}`,
+                    totalRounds: rounds.length,
+                    totalSteps,
+                    lastUpdatedRound: result.coveredRounds || rounds.length,
+                    phases,
+                    tags: result.tags,
+                    chain: loaded.chainUsed,
+                });
+                const readerIndex = await buildAndPersistRecordReaderIndex(effectiveHash, cascadeId, result.content!, {
+                    beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", cascadeId),
+                });
+                if (readerIndex.error) {
+                    readerIndexStatus = `error: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`;
+                }
+            });
+            sharedPool = { queueWaitMs: committed.permit.queueWaitMs, snapshot: committed.permit.snapshot };
+        } catch (error) {
+            if (error instanceof RecordUpdatePoolAbortError) {
+                return recordUpdatePoolAbortResponse(startMs, error, "写回 Record 前已中止");
+            }
+            throw error;
+        }
+
+        const sizeKB = (Buffer.byteLength(result.content!, "utf-8") / 1024).toFixed(1);
+        let out = result.upToDate
+            ? "✅ Record 已是最新（索引已刷新）"
+            : `✅ Record 已${conversationId ? "更新" : "生成"}`;
+        out += `\n📝 对话: ${cascadeId.slice(0, 8)}...`;
+        out += `\n🔗 对话链路: ${loaded.chainUsed}`;
+        out += `\n🧠 模型链路: ${modelChain}`;
+        if (result.modelChainsUsed?.length) {
+            out += `\n🧠 实际模型链路: ${result.modelChainsUsed.join(", ")}`;
+        }
+        if (result.modelModelsUsed?.length) {
+            out += `\n🧠 实际模型: ${result.modelModelsUsed.join(", ")}`;
+        }
+        if (loaded.claudeCodeData?.logicalChain && loaded.claudeCodeData.logicalChain.mode !== "off") {
+            const info = loaded.claudeCodeData.logicalChain;
+            const merged = info.segments.filter(item => item.role === "predecessor-merged");
+            out += `\n🧩 Claude Code 逻辑续聊: ${info.merged ? `已合并 ${merged.length} 个前序片段` : "未发现可安全自动合并的前序片段"}`;
+            if (info.warnings?.length) out += `\n⚠️ ${info.warnings.join("\n⚠️ ")}`;
+        }
+        if (parallelMode) out += `\n🧪 并行模式: ${parallelMode}`;
+        if (force) out += `\n♻️ force: 已绕过“已是最新”短路`;
+        if (result.warnings?.length) {
+            out += `\n⚠️ ${result.warnings.join("\n⚠️ ")}`;
+        }
+        const sourceChangedWarning = sourceSnapshot
+            ? buildSourceChangedWarning(sourceSnapshot, await statMtimeMsAsync(sourceSnapshot.rolloutPath))
+            : null;
+        if (sourceChangedWarning) out += `\n⚠️ ${sourceChangedWarning}`;
+        if (sharedPool) out += `\n🚦 共享池: ${formatRecordUpdatePoolDetail(sharedPool.snapshot, sharedPool.queueWaitMs)}`;
+        out += `\n📊 ${rounds.length} 轮 / ${totalSteps} 步骤 → ${phases} 个 Phase`;
+        out += `\n💾 大小: ${sizeKB}KB`;
+        out += `\n🔎 Reader Index: ${readerIndexStatus}`;
+        if (result.batches && result.batches > 1) {
+            out += `\n🔄 分 ${result.batches} 批生成，覆盖到第 ${result.coveredRounds} 轮`;
+        }
+        return rt(out, startMs);
+    } finally {
+        singleFlightPermit?.release();
     }
-    if (parallelMode) out += `\n🧪 并行模式: ${parallelMode}`;
-    if (force) out += `\n♻️ force: 已绕过“已是最新”短路`;
-    if (result.warnings?.length) {
-        out += `\n⚠️ ${result.warnings.join("\n⚠️ ")}`;
-    }
-    const sourceChangedWarning = buildSourceChangedWarning(sourceSnapshot);
-    if (sourceChangedWarning) out += `\n⚠️ ${sourceChangedWarning}`;
-    out += `\n📊 ${rounds.length} 轮 / ${totalSteps} 步骤 → ${phases} 个 Phase`;
-    out += `\n💾 大小: ${sizeKB}KB`;
-    out += `\n🔎 Reader Index: ${readerIndexStatus}`;
-    if (result.batches && result.batches > 1) {
-        out += `\n🔄 分 ${result.batches} 批生成，覆盖到第 ${result.coveredRounds} 轮`;
-    }
-    return rt(out, startMs);
 }
 
-function handleUpdateBackground(
+async function recordCoverageWarningAsync(hash: string, conversationId: string, content: string): Promise<string | null> {
+    const entry = (await readRecordsIndexAsync(hash)).records[conversationId];
+    const indexedRound = entry?.lastUpdatedRound || entry?.totalRounds || 0;
+    if (!indexedRound) return null;
+    const coveredRound = inferCoveredRoundFromRecord(content, indexedRound);
+    if (coveredRound >= indexedRound) return null;
+    return `⚠️ Record 正文疑似只覆盖 ${coveredRound}/${indexedRound} 轮；下次 update 会先修正索引并继续生成。`;
+}
+
+async function buildRecordUpdateResumePayload(
+    conversationId: string | undefined,
+    workspace: string | undefined,
+    dataChain: DataChain,
+    modelChain: Chain,
+    parallelMode: RecordParallelMode | undefined,
+    force: boolean | undefined,
+    logicalChain: ConversationLogicalChainMode | undefined,
+): Promise<RecordUpdateResumePayload | null> {
+    const resolvedChain = await resolveConversationChain(dataChain);
+    if (!resolvedChain) return null;
+    const resolvedConversationId = await resolveConversationId(conversationId, resolvedChain, process.cwd(), "background");
+    if (!resolvedConversationId) return null;
+    return {
+        kind: "record-update",
+        conversationId: resolvedConversationId,
+        ...(workspace ? { workspace } : {}),
+        dataChain: resolvedChain,
+        modelChain,
+        ...(parallelMode ? { parallelMode } : {}),
+        ...(force !== undefined ? { force } : {}),
+        ...(logicalChain ? { logicalChain } : {}),
+    };
+}
+
+async function handleUpdateBackground(
     hash: string,
     conversationId: string | undefined,
     workspace: string | undefined,
@@ -607,23 +1804,51 @@ function handleUpdateBackground(
     startMs: number,
     autoBackground = false,
 ) {
-    const task = startBackgroundTask("record-update", async ({ updateProgress, isSettled }) => {
-        const result = await handleUpdate(hash, conversationId, workspace, dataChain, modelChain, parallelMode, force, logicalChain, Date.now(), {
+    const resumePayload = await buildRecordUpdateResumePayload(
+        conversationId,
+        workspace,
+        dataChain,
+        modelChain,
+        parallelMode,
+        force,
+        logicalChain,
+    );
+    if (!resumePayload) {
+        return rt(`❌ 无法为 dataChain=${dataChain} 冻结可恢复的 conversationId`, startMs);
+    }
+    const resumeHash = resolveWorkspaceHashForRecord(resumePayload.workspace);
+    const task = startBackgroundTask("record-update", async ({ updateProgress, isCancelled, isSettled }) => {
+        const result = await handleUpdate(
+            resumeHash,
+            resumePayload.conversationId,
+            resumePayload.workspace,
+            resumePayload.dataChain,
+            resumePayload.modelChain,
+            resumePayload.parallelMode,
+            resumePayload.force,
+            resumePayload.logicalChain,
+            Date.now(),
+            {
             background: true,
             onProgress: updateProgress,
+            isCancelled,
             isSettled,
-        });
+            },
+        );
         return responseText(result);
+    }, {
+        resumePayload,
     });
     return rt([
         "🚀 Record 更新已转入后台任务",
-        autoBackground ? "（codex 重链路下未显式指定 background，已自动转后台以避免 60s 超时；如需同步请传 background=false）" : "",
+        autoBackground ? "（未显式指定 background，已自动转后台排队；如需同步请传 background=false）" : "",
         `🆔 taskId: ${task.id}`,
         `🔗 dataChain: ${dataChain}`,
         `🧠 modelChain: ${modelChain}`,
         parallelMode ? `🧪 parallelMode: ${parallelMode}` : "",
         force ? `♻️ force: true` : "",
         logicalChain ? `🧩 logicalChain: ${logicalChain}` : "",
+        `🧷 resume conversationId: ${resumePayload.conversationId}`,
         "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询结果",
     ].filter(Boolean).join("\n"), startMs);
 }
@@ -632,6 +1857,37 @@ async function handleTaskStatus(taskId: string | undefined, waitSeconds: number 
     if (!taskId) return rt("❌ task_status 需要 taskId 参数", startMs);
     const task = await waitForBackgroundTask(taskId, waitSeconds || 0);
     return rt(formatBackgroundTask(task), startMs);
+}
+
+async function handleRecover(taskId: string | undefined, startMs: number) {
+    if (!taskId) {
+        return rt(formatRecoverableRecordTasks(listRecoverableRecordTasks()), startMs);
+    }
+    const persistedTask = readPersistedRecordTask(taskId);
+    if (!persistedTask) {
+        return rt(`❌ 未找到可读取的后台任务：${taskId}`, startMs);
+    }
+    if (!RECORD_RECOVERABLE_TASK_KINDS.has(persistedTask.kind)) {
+        return rt(`❌ record_manage(recover) 仅恢复 Record 任务；${taskId} 的类型为 ${persistedTask.kind}`, startMs);
+    }
+    const result = await recoverBackgroundTask(taskId);
+    const summaryLines = [
+        result.outcome === "resumed"
+            ? `♻️ Record 后台任务已恢复：${result.taskId}`
+            : result.outcome === "loaded"
+                ? `ℹ️ Record 后台任务无需恢复：${result.taskId}`
+                : result.outcome === "claimed"
+                    ? `⏭ Record 后台任务已被其他进程 claim：${result.taskId}`
+                    : result.outcome === "restarted"
+                        ? `♻️ Record 后台任务已重启：${result.taskId}`
+                        : `❌ Record 后台任务恢复失败：${result.taskId}`,
+        `📌 类型: ${result.kind}`,
+        result.recoveredTaskId ? `🆔 recoveredTaskId: ${result.recoveredTaskId}` : "",
+        result.reason ? `📋 原因: ${result.reason}` : "",
+        "",
+        formatBackgroundTask(result.task),
+    ].filter(Boolean);
+    return rt(summaryLines.join("\n"), startMs);
 }
 
 // ============= list =============
@@ -671,7 +1927,7 @@ function handleList(hash: string, scope: RecordManageScope | undefined, includeG
         ? `📋 Record 列表 (显示最近 ${shown.length}/${total} 份，按更新时间倒序；需更多用 limit，上限 200)：\n`
         : `📋 Record 列表 (${total} 份):\n`];
     for (const rec of shown) {
-        const readerIndex = readRecordSidecar<RecordReaderIndex>(rec.hash, rec.conversationId, RECORD_READER_SIDECAR);
+        const readerIndex = readRecordSidecar<RecordReaderIndex>(rec.hash, rec.conversationId, "record_index.json");
         const sectionCounts = readerIndex?.blocks
             ? readerIndex.blocks.reduce((stats, block) => {
                 stats[block.sectionType] = (stats[block.sectionType] || 0) + 1;
@@ -698,6 +1954,171 @@ function handleList(hash: string, scope: RecordManageScope | undefined, includeG
     return rt(body, startMs);
 }
 
+// ============= stale_check =============
+
+interface ConversationMtimeInfo {
+    id: string;
+    lastModifiedMs: number;
+    title?: string;
+    stepCount?: number; // Windsurf LS 返回，用于区分 rename vs 真正内容更新
+}
+
+async function fetchConversationListForChain(chain: string, limit: number): Promise<Map<string, ConversationMtimeInfo>> {
+    const map = new Map<string, ConversationMtimeInfo>();
+    if (chain === "antigravity") {
+        const conversations = listConversationsByMtime({ limit: Math.max(limit * 3, 50) });
+        for (const conv of conversations) {
+            map.set(conv.id, { id: conv.id, lastModifiedMs: conv.mtime.getTime(), title: conv.title });
+        }
+    } else if (chain === "codex") {
+        for (const thread of listRecentCodexThreads(Math.max(limit * 3, 50))) {
+            map.set(thread.id, { id: thread.id, lastModifiedMs: thread.updatedAtMs || 0, title: thread.title });
+        }
+    } else if (chain === "claude-code") {
+        const { listRecentClaudeCodeThreads } = await import("../claude-code-client.js");
+        for (const thread of listRecentClaudeCodeThreads(Math.max(limit * 3, 50))) {
+            map.set(thread.id, { id: thread.id, lastModifiedMs: thread.updatedAtMs || 0, title: thread.title });
+        }
+    } else if (chain === "windsurf") {
+        const { listRecentWindsurfThreads } = await import("../windsurf-client.js");
+        for (const thread of await listRecentWindsurfThreads(Math.max(limit * 3, 50))) {
+            const ms = Date.parse(thread.lastModifiedTime || thread.createdTime || "") || 0;
+            map.set(thread.id, { id: thread.id, lastModifiedMs: ms, title: thread.title, stepCount: thread.stepCount });
+        }
+    }
+    return map;
+}
+
+function isRenameOnly(conv: ConversationMtimeInfo, rec: { totalSteps: number }): boolean {
+    // Windsurf LS 返回 stepCount：如果步数没变，说明只是 rename/元数据变化，不算过期
+    return conv.stepCount !== undefined && conv.stepCount > 0 && conv.stepCount === rec.totalSteps;
+}
+
+const STALE_THRESHOLD_MS = 60_000; // 60s 容差，避免 mtime 精度/record 生成延迟误报
+
+async function handleStaleCheck(
+    hash: string,
+    scope: RecordManageScope | undefined,
+    includeGeneral: boolean | undefined,
+    dataChain: string | undefined,
+    limit: number | undefined,
+    startMs: number,
+) {
+    const records = listRecordsForScope(hash, scope, includeGeneral === true);
+    if (records.length === 0) return rt("📦 范围内无 Record", startMs);
+
+    // 确定要检查的源
+    const chainsToCheck = dataChain && dataChain !== "auto"
+        ? [dataChain]
+        : ["codex", "claude-code", "windsurf", "antigravity"];
+
+    // 按 chain 分组 record（无 chain 的归入 unknown）
+    const byChain = new Map<string, typeof records>();
+    for (const rec of records) {
+        const chain = rec.chain || "unknown";
+        if (!byChain.has(chain)) byChain.set(chain, []);
+        byChain.get(chain)!.push(rec);
+    }
+
+    const stale: Array<{ conversationId: string; title: string; chain: string; recordUpdatedAt: string; convUpdatedAt: string; gapMs: number }> = [];
+    let checked = 0;
+    let unresolved = 0;
+    const unknownResolved = new Set<string>(); // 已在某个源找到的 unknown record
+
+    for (const chain of chainsToCheck) {
+        const chainRecords = byChain.get(chain) || [];
+        const unknownRecords = byChain.get("unknown") || [];
+
+        if (chainRecords.length === 0 && unknownRecords.length === 0) continue;
+
+        let convMap: Map<string, ConversationMtimeInfo>;
+        try {
+            convMap = await fetchConversationListForChain(chain, Math.max(records.length, 50));
+        } catch {
+            continue; // 源不可用，跳过
+        }
+
+        // 检查有 chain 标记的 record
+        for (const rec of chainRecords) {
+            checked++;
+            const conv = convMap.get(rec.conversationId);
+            if (!conv) { unresolved++; continue; }
+            const recordMs = new Date(rec.lastUpdatedAt).getTime();
+            if (conv.lastModifiedMs > recordMs + STALE_THRESHOLD_MS && !isRenameOnly(conv, rec)) {
+                stale.push({
+                    conversationId: rec.conversationId,
+                    title: conv.title || rec.title,
+                    chain,
+                    recordUpdatedAt: rec.lastUpdatedAt.slice(0, 16),
+                    convUpdatedAt: new Date(conv.lastModifiedMs).toISOString().slice(0, 16),
+                    gapMs: conv.lastModifiedMs - recordMs,
+                });
+            }
+        }
+
+        // unknown chain 的 record：尝试在每个源里找，找到就判定
+        for (const rec of unknownRecords) {
+            if (unknownResolved.has(rec.conversationId)) continue; // 已在之前的源找到
+            const conv = convMap.get(rec.conversationId);
+            if (conv) {
+                unknownResolved.add(rec.conversationId);
+                checked++;
+                const recordMs = new Date(rec.lastUpdatedAt).getTime();
+                if (conv.lastModifiedMs > recordMs + STALE_THRESHOLD_MS && !isRenameOnly(conv, rec)) {
+                    stale.push({
+                        conversationId: rec.conversationId,
+                        title: conv.title || rec.title,
+                        chain,
+                        recordUpdatedAt: rec.lastUpdatedAt.slice(0, 16),
+                        convUpdatedAt: new Date(conv.lastModifiedMs).toISOString().slice(0, 16),
+                        gapMs: conv.lastModifiedMs - recordMs,
+                    });
+                }
+            }
+        }
+    }
+
+    // unknown record 在所有源都没找到时保留为 unresolved，不算过期
+    const unknownRecords = byChain.get("unknown") || [];
+    for (const rec of unknownRecords) {
+        if (!unknownResolved.has(rec.conversationId)) {
+            checked++;
+            unresolved++;
+        }
+    }
+
+    stale.sort((a, b) => b.gapMs - a.gapMs);
+    const effectiveLimit = Math.min(Math.max(1, limit ?? 50), 200);
+    const shown = stale.slice(0, effectiveLimit);
+
+    const lines: string[] = [];
+    const scopeDesc = scope === "global" ? "全局" : scope === "general" ? "general" : (hash.slice(0, 8));
+    const chainDesc = dataChain && dataChain !== "auto" ? dataChain : "全源";
+    lines.push(`📋 Record 过期检查 (范围: ${scopeDesc}, 源: ${chainDesc})`);
+    lines.push(`检查了 ${checked} 份 Record，其中 ${stale.length} 份已过期，${unresolved} 份近期列表未找到 / unresolved（仅统计，不更新、不改动）：\n`);
+
+    if (stale.length === 0) {
+        lines.push(formatStaleCheckNoStaleSummary(unresolved));
+    } else {
+        for (const item of shown) {
+            const gapHours = Math.round(item.gapMs / 3_600_000);
+            const gapDesc = gapHours > 0 ? `${gapHours}h` : `${Math.round(item.gapMs / 60_000)}min`;
+            lines.push(`  📌 ${item.conversationId} | ${item.title}`);
+            lines.push(`     源: ${item.chain} | Record: ${item.recordUpdatedAt} | 对话: ${item.convUpdatedAt} | 落后: ${gapDesc}`);
+        }
+        if (stale.length > shown.length) {
+            lines.push(`\n  ... 还有 ${stale.length - shown.length} 份未显示（用 limit=N 查看更多）`);
+        }
+    }
+
+    const body = lines.join("\n");
+    if (body.length > 8000) {
+        const tmpPath = saveTempFile("stale-check", (hash || "all").slice(0, 8), body);
+        return rt(`📋 Record 过期检查：${stale.length} 份已过期，完整列表已落盘：\n${tmpPath}`, startMs);
+    }
+    return rt(body, startMs);
+}
+
 // ============= read =============
 
 async function handleRead(
@@ -718,7 +2139,7 @@ async function handleRead(
 ) {
     if (!conversationId) return rt("❌ read 需要 conversationId 参数", startMs);
 
-    const location = resolveRecordLocation(hash, conversationId);
+    const location = await resolveRecordLocationAsync(hash, conversationId);
     if (!location) return rt(`❌ 未找到 ${conversationId} 的 Record`, startMs);
     const { conversationId: resolvedId, content } = location;
     const hasStructuredRead = Boolean(
@@ -740,7 +2161,7 @@ async function handleRead(
 
     if (!hasStructuredRead) {
         if (content.length > 8000) {
-            const tmpPath = saveTempFile("record", resolvedId.slice(0, 8), content);
+            const tmpPath = await saveTempFileAsync("record", resolvedId.slice(0, 8), content);
             return rt(`📄 Record ${resolvedId.slice(0, 8)}... (${content.split(/\r?\n/).length}行, ${(Buffer.byteLength(content) / 1024).toFixed(1)}KB)\n已保存到临时文件: ${tmpPath}\n请用 view_file 查看。`, startMs);
         }
 
@@ -748,7 +2169,7 @@ async function handleRead(
     }
 
     const { index, indexStatus } = await readOrBuildReaderIndex(location.hash, resolvedId, content, options.indexMode || "auto");
-    const coverageWarning = recordCoverageWarning(location.hash, resolvedId, content);
+    const coverageWarning = await recordCoverageWarningAsync(location.hash, resolvedId, content);
     if (options.view === "outline") {
         const outline = buildOutline(index);
         const payload = { recordId: resolvedId, hash: location.hash, indexStatus, view: "outline", warning: coverageWarning || undefined, outline };
@@ -802,7 +2223,7 @@ async function handleRead(
     }
     const suffix = result.truncated ? `\n\n⚠️ 已按 block 边界截断：${result.nextReadHint}` : "";
     if (result.text.length > 8000 && !options.maxChars) {
-        const tmpPath = saveTempFile("record-reader", resolvedId.slice(0, 8), result.text);
+        const tmpPath = await saveTempFileAsync("record-reader", resolvedId.slice(0, 8), result.text);
         return rt(`📄 Record ${resolvedId.slice(0, 8)}... 结构化读取结果过长，已保存结构化结果到临时文件: ${tmpPath}${coverageWarning ? `\n${coverageWarning}` : ""}\n建议补传 maxChars / phaseIds / sectionTypes 缩小读取范围。`, startMs);
     }
     return rt(`📄 Record ${resolvedId.slice(0, 8)}... 结构化读取 (${viewOptions.view}, index=${indexStatus})${coverageWarning ? `\n${coverageWarning}` : ""}\n\n${result.text}${suffix}`, startMs);
@@ -845,7 +2266,7 @@ async function handleSearch(
 
     const blocks = hasStructuredSearch
         ? await buildStructuredRecordSearchBlocks(hash, scope, includeGeneral === true, options)
-        : buildRecordSearchBlocksForScope(hash, scope, includeGeneral === true);
+        : await buildRecordSearchBlocksForScopeAsync(hash, scope, includeGeneral === true);
 
     if (blocks.length === 0) return rt("📭 当前工作区无 Record", startMs);
 
@@ -857,7 +2278,12 @@ async function handleSearch(
     if (results.length === 0) return rt(`🔍 搜索 "${query}" — 无匹配`, startMs);
 
     if (hasStructuredSearch) {
-        return rt(formatStructuredSearchResults(query, results, options.format || "text", options.maxChars), startMs);
+        const body = formatStructuredSearchResults(query, results, options.format || "text", options.maxChars);
+        if (body.length > 8000) {
+            const tmpPath = await saveTempFileAsync("record-search", (options.conversationId || hash || "all").slice(0, 8), body);
+            return rt(`🔍 Record 搜索结果 ${body.length} 字超长已保存到临时文件: ${tmpPath}`, startMs);
+        }
+        return rt(body, startMs);
     }
 
     const lines = [`🔍 搜索 "${query}" — ${results.length} 份 Record 命中 (${results[0].matchType} 模式):\n`];
@@ -868,16 +2294,28 @@ async function handleSearch(
             lines.push(`  ${lineInfo}${m.line.trim().slice(0, 100)}`);
         }
     }
-    return rt(lines.join("\n"), startMs);
+    const body = lines.join("\n");
+    if (body.length > 8000) {
+        const tmpPath = await saveTempFileAsync("record-search", (options.conversationId || hash || "all").slice(0, 8), body);
+        return rt(`🔍 Record 搜索结果 ${body.length} 字超长已保存到临时文件: ${tmpPath}`, startMs);
+    }
+    return rt(body, startMs);
 }
 
 interface RecordSearchTarget {
     hash: string;
     conversationId: string;
     title: string;
-    tags?: string[];
-    updatedAt?: number;
+    tags: string[];
+    updatedAt: number;
     content: string;
+}
+
+export function formatStaleCheckNoStaleSummary(unresolved: number): string {
+    if (unresolved > 0) {
+        return `  ⚠️ 未发现确认过期，仍有 ${unresolved} 份 unresolved（近期列表未找到，仅统计，不更新、不改动）`;
+    }
+    return "  ✅ 所有 Record 均已跟进到最新";
 }
 
 function collectRecordSearchTargets(
@@ -926,11 +2364,70 @@ function collectRecordSearchTargets(
     return dedupeSearchTargets(targets);
 }
 
+async function collectRecordSearchTargetsAsync(
+    hash: string,
+    scope: RecordManageScope | undefined,
+    includeGeneral: boolean,
+    conversationId?: string,
+    recordIds?: string[],
+): Promise<RecordSearchTarget[]> {
+    const ids = [...(conversationId ? [conversationId] : []), ...(recordIds || [])].filter(Boolean);
+    if (ids.length > 0) {
+        const targets = (await Promise.all(ids.map(async id => {
+            const location = await resolveRecordLocationAsync(hash, id);
+            if (!location) return null;
+            const entry = (await readRecordsIndexAsync(location.hash)).records[location.conversationId];
+            return {
+                hash: location.hash,
+                conversationId: location.conversationId,
+                title: entry?.title || location.conversationId,
+                tags: entry?.tags || [],
+                updatedAt: Date.parse(entry?.lastUpdatedAt || "") || 0,
+                content: location.content,
+            } satisfies RecordSearchTarget;
+        }))).filter((target): target is RecordSearchTarget => Boolean(target));
+        return dedupeSearchTargetsAsync(targets);
+    }
+
+    const hashes = await recordHashesForScopeAsync(hash, scope, includeGeneral);
+    const targets = (await Promise.all(hashes.map(async recordHash => {
+        const index = await readRecordsIndexAsync(recordHash);
+        return Promise.all(Object.values(index.records).map(async entry => {
+            if (await isSupersededRecordAsync(recordHash, entry.conversationId)) return null;
+            const content = await readRecordAsync(recordHash, entry.conversationId);
+            if (!content) return null;
+            return {
+                hash: recordHash,
+                conversationId: entry.conversationId,
+                title: entry.title,
+                tags: entry.tags || [],
+                updatedAt: Date.parse(entry.lastUpdatedAt || "") || 0,
+                content,
+            } satisfies RecordSearchTarget;
+        }));
+    }))).flat().filter((target): target is RecordSearchTarget => Boolean(target));
+    return dedupeSearchTargetsAsync(targets);
+}
+
 function dedupeSearchTargets(targets: RecordSearchTarget[]): RecordSearchTarget[] {
     const map = new Map<string, RecordSearchTarget>();
     for (const target of targets) {
         const existing = map.get(target.conversationId);
         if (!existing || compareRecordCandidate(
+            { hash: target.hash, conversationId: target.conversationId, content: target.content },
+            { hash: existing.hash, conversationId: existing.conversationId, content: existing.content },
+        ) > 0) {
+            map.set(target.conversationId, target);
+        }
+    }
+    return Array.from(map.values());
+}
+
+async function dedupeSearchTargetsAsync(targets: RecordSearchTarget[]): Promise<RecordSearchTarget[]> {
+    const map = new Map<string, RecordSearchTarget>();
+    for (const target of targets) {
+        const existing = map.get(target.conversationId);
+        if (!existing || await compareRecordCandidateAsync(
             { hash: target.hash, conversationId: target.conversationId, content: target.content },
             { hash: existing.hash, conversationId: existing.conversationId, content: existing.content },
         ) > 0) {
@@ -954,7 +2451,7 @@ export async function buildStructuredRecordSearchBlocks(
     } = {},
 ): Promise<TextBlock[]> {
     const blocks: TextBlock[] = [];
-    const targets = collectRecordSearchTargets(hash, scope, includeGeneral, options.conversationId, options.recordIds);
+    const targets = await collectRecordSearchTargetsAsync(hash, scope, includeGeneral, options.conversationId, options.recordIds);
     for (const target of targets) {
         const { index, indexStatus } = await readOrBuildReaderIndex(target.hash, target.conversationId, target.content, options.indexMode || "auto");
         const selected = blocksForSearchScope(index, options.searchScope || "section")
@@ -1107,11 +2604,18 @@ export async function handleGuide(
         format?: RecordReadFormat;
         indexMode?: RecordReaderIndexMode;
         background?: boolean;
+        isCancelled?: BackgroundTaskContext["isCancelled"];
+        isSettled?: BackgroundTaskContext["isSettled"];
     } = {},
 ) {
     if (options.background) {
-        const task = startBackgroundTask("record-guide", async () => {
-            const result = await handleGuide(hash, conversationId, recordIds, scope, includeGeneral, goal, maxRecommendations, chain, Date.now(), { ...options, background: false });
+        const task = startBackgroundTask("record-guide", async ({ isCancelled, isSettled }) => {
+            const result = await handleGuide(hash, conversationId, recordIds, scope, includeGeneral, goal, maxRecommendations, chain, Date.now(), {
+                ...options,
+                background: false,
+                isCancelled,
+                isSettled,
+            });
             return responseText(result);
         });
         return rt([
@@ -1120,6 +2624,10 @@ export async function handleGuide(
             `🧭 goal: ${goal || "(未提供，输出默认阅读路线)"}`,
             "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询结果",
         ].join("\n"), startMs);
+    }
+
+    if (options.isCancelled?.() || options.isSettled?.()) {
+        return rt("⚠️ Record guide 后台任务已取消/结算，未继续生成阅读建议", startMs);
     }
 
     const recommendations = await buildRecordGuideRecommendations(hash, scope, includeGeneral === true, {
@@ -1132,6 +2640,9 @@ export async function handleGuide(
         indexMode: options.indexMode,
         chain,
     });
+    if (options.isCancelled?.() || options.isSettled?.()) {
+        return rt("⚠️ Record guide 后台任务已取消/结算，已丢弃生成结果", startMs);
+    }
     const payload = {
         goal: goal || null,
         note: "guide 只给阅读路线、搜索路线和来源定位；不生成 Record 事实摘要，也不作为新的事实源。",
@@ -1215,7 +2726,7 @@ export async function buildRecordGuideRecommendations(
     }
 
     if (recommendations.length === 0) {
-        const targets = collectRecordSearchTargets(hash, scope, includeGeneral, options.conversationId, ids);
+        const targets = await collectRecordSearchTargetsAsync(hash, scope, includeGeneral, options.conversationId, ids);
         for (const target of targets) {
             const { index } = await readOrBuildReaderIndex(target.hash, target.conversationId, target.content, options.indexMode || "auto");
             recommendations.push({
@@ -1270,6 +2781,35 @@ export function buildRecordSearchBlocksForScope(hash: string, scope: RecordManag
     };
 
     for (const h of recordHashesForScope(hash, scope, includeGeneral)) addBlocks(h);
+    return Array.from(blockMap.values());
+}
+
+async function buildRecordSearchBlocksForScopeAsync(hash: string, scope: RecordManageScope | undefined, includeGeneral = false): Promise<TextBlock[]> {
+    const blockMap = new Map<string, TextBlock>();
+    const hashes = await recordHashesForScopeAsync(hash, scope, includeGeneral);
+    const indexedBlocks = await Promise.all(hashes.map(async recordHash => {
+        const index = await readRecordsIndexAsync(recordHash);
+        return Promise.all(Object.entries(index.records).map(async ([conversationId, entry]) => {
+            if (await isSupersededRecordAsync(recordHash, conversationId)) return null;
+            const content = await readRecordAsync(recordHash, conversationId);
+            if (!content) return null;
+            return { recordHash, conversationId, entry, content };
+        }));
+    }));
+    for (const item of indexedBlocks.flat().filter((entry): entry is { recordHash: string; conversationId: string; entry: Awaited<ReturnType<typeof readRecordsIndexAsync>>["records"][string]; content: string } => Boolean(entry))) {
+        const existing = blockMap.get(item.conversationId);
+        const updatedAt = Date.parse(item.entry.lastUpdatedAt || "") || 0;
+        const existingUpdatedAt = existing ? Number(existing.metadata?.updatedAt || 0) : 0;
+        if (!existing || updatedAt > existingUpdatedAt || (updatedAt === existingUpdatedAt && item.content.length > existing.content.length)) {
+            blockMap.set(item.conversationId, {
+                id: item.conversationId,
+                title: item.entry.title,
+                content: item.content,
+                tags: item.entry.tags || [],
+                metadata: { hash: item.recordHash, updatedAt },
+            });
+        }
+    }
     return Array.from(blockMap.values());
 }
 
@@ -1552,17 +3092,26 @@ async function handleRepairOwnership(hash: string, scope: RecordManageScope | un
     let moved = 0;
     for (const item of moves) {
         if (!item.expectedHash || !item.expectedWorkspace) continue;
-        ensureWorkspace(item.expectedWorkspace);
-        const stamp = new Date().toISOString();
-        const ok = await copyRecordToHash(item.currentHash, item.expectedHash, item.conversationId, { lastUpdatedAt: stamp }, { backup });
-        if (ok) {
-            await writeRecordSidecar(item.currentHash, item.conversationId, RECORD_OWNERSHIP_SIDECAR, {
-                status: "superseded",
-                supersededBy: item.expectedHash,
-                sourceType: item.sourceType,
-                reason: item.reason,
-                updatedAt: stamp,
+        const ok = await withRecordManagementSingleFlight(item.conversationId, async () => {
+            const source = await readRecordAsync(item.currentHash, item.conversationId);
+            if (!source) return false;
+            ensureWorkspace(item.expectedWorkspace!);
+            const stamp = new Date().toISOString();
+            return withRecordPersistenceWrite(async () => {
+                await runRecordPersistenceTestHook("before_copy", item.conversationId);
+                const copied = await copyRecordToHash(item.currentHash, item.expectedHash!, item.conversationId, { lastUpdatedAt: stamp }, { backup });
+                if (!copied) return false;
+                await writeRecordSidecar(item.currentHash, item.conversationId, RECORD_OWNERSHIP_SIDECAR, {
+                    status: "superseded",
+                    supersededBy: item.expectedHash,
+                    sourceType: item.sourceType,
+                    reason: item.reason,
+                    updatedAt: stamp,
+                });
+                return true;
             });
+        });
+        if (ok) {
             moved++;
             lines.push(`✅ ${item.conversationId.slice(0, 8)} ${item.currentHash} → ${item.expectedHash}`);
         } else {
@@ -1593,28 +3142,33 @@ async function handleEdit(
 ) {
     if (!conversationId) return rt("❌ edit 需要 conversationId 参数", startMs);
     const resolvedId = resolveRecordConversationId(conversationId, hash) || conversationId;
+    return withRecordManagementSingleFlight(resolvedId, async () => {
+        const existing = await readRecordAsync(hash, resolvedId);
+        if (!existing && !content) return rt(`❌ 未找到 ${conversationId} 的 Record，且未提供 content`, startMs);
 
-    const existing = readRecordFallback(hash, resolvedId);
-    if (!existing && !content) return rt(`❌ 未找到 ${conversationId} 的 Record，且未提供 content`, startMs);
+        let newContent: string;
+        if (content) {
+            newContent = content;
+        } else if (append) {
+            newContent = (existing || "") + "\n\n" + `[手动补充] ${new Date().toISOString().slice(0, 16)}\n\n` + append;
+        } else {
+            return rt("❌ edit 需要 content 或 append 参数", startMs);
+        }
 
-    let newContent: string;
-    if (content) {
-        newContent = content;
-    } else if (append) {
-        newContent = (existing || "") + "\n\n" + `[手动补充] ${new Date().toISOString().slice(0, 16)}\n\n` + append;
-    } else {
-        return rt("❌ edit 需要 content 或 append 参数", startMs);
-    }
-
-    const phases = countPhasesInRecord(newContent);
-    await writeRecord(hash, resolvedId, newContent, { phases });
-    let readerIndexStatus = "rebuilt";
-    try {
-        await writeReaderIndexForRecord(hash, resolvedId, newContent);
-    } catch (err) {
-        readerIndexStatus = `error: ${err instanceof Error ? err.message : String(err)}`;
-    }
-    return rt(`✅ Record ${resolvedId.slice(0, 8)}... 已更新 (${phases} Phase, ${(Buffer.byteLength(newContent) / 1024).toFixed(1)}KB)\n🔎 Reader Index: ${readerIndexStatus}`, startMs);
+        const phases = countPhasesInRecord(newContent);
+        let readerIndexStatus = "rebuilt";
+        await withRecordPersistenceWrite(async () => {
+            await runRecordPersistenceTestHook("before_write", resolvedId);
+            await writeRecord(hash, resolvedId, newContent, { phases });
+            const readerIndex = await buildAndPersistRecordReaderIndex(hash, resolvedId, newContent, {
+                beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", resolvedId),
+            });
+            if (readerIndex.error) {
+                readerIndexStatus = `error: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`;
+            }
+        });
+        return rt(`✅ Record ${resolvedId.slice(0, 8)}... 已更新 (${phases} Phase, ${(Buffer.byteLength(newContent) / 1024).toFixed(1)}KB)\n🔎 Reader Index: ${readerIndexStatus}`, startMs);
+    });
 }
 
 // ============= delete =============
@@ -1625,7 +3179,10 @@ async function handleDelete(hash: string, conversationId: string | undefined, st
         return await handleBatchDelete(hash, startMs);
     }
     const resolvedId = resolveRecordConversationId(conversationId, hash) || conversationId;
-    const deleted = await deleteRecord(hash, resolvedId);
+    const deleted = await withRecordManagementSingleFlight(resolvedId, async () => {
+        if (!await readRecordAsync(hash, resolvedId)) return false;
+        return withRecordPersistenceWrite(async () => deleteRecord(hash, resolvedId));
+    });
     if (!deleted) return rt(`❌ 未找到 ${conversationId} 的 Record`, startMs);
     return rt(`✅ Record ${resolvedId.slice(0, 8)}... 已删除`, startMs);
 }
@@ -1637,7 +3194,11 @@ async function handleBatchDelete(hash: string, startMs: number) {
     if (records.length === 0) return rt("📦 该工作区下无 Record", startMs);
     let count = 0;
     for (const rec of records) {
-        await deleteRecord(hash, rec.conversationId);
+        const deleted = await withRecordManagementSingleFlight(rec.conversationId, async () => {
+            if (!await readRecordAsync(hash, rec.conversationId)) return false;
+            return withRecordPersistenceWrite(async () => deleteRecord(hash, rec.conversationId));
+        });
+        if (!deleted) continue;
         count++;
     }
     return rt(`✅ 已删除 ${count} 份 Record`, startMs);
@@ -1645,65 +3206,710 @@ async function handleBatchDelete(hash: string, startMs: number) {
 
 // ============= batch_update（后台模式）=============
 
-interface BatchTask {
-    status: "running" | "done";
-    startMs: number;
-    total: number;
-    success: number;
-    failed: number;
-    skipped: number;
-    current: string;  // 当前处理的对话 ID
-    errors: string[];
-    result?: string;
-}
-
-let _batchTask: BatchTask | null = null;
-
 interface BatchConversationCandidate {
     id: string;
     workspace?: string;
+    workspaceUris?: string[];
+    chain: ResolvedConversationChain;
+    lastModifiedMs: number;
+    stepCount?: number;
+}
+
+type BatchCandidateCollectionArgs = {
+    after?: string;
+    before?: string;
+    limit?: number;
+    workspace?: string;
+    force?: boolean;
+    stale_only?: boolean;
+};
+
+type BatchCandidateCollectionResult = {
+    candidates: FrozenBatchConversationCandidate[];
+    emptyReason?: string;
+    diagnostics?: RecordBatchCandidateDiagnostics;
+};
+
+type BatchCandidateCollector = (
+    resolvedChain: ResolvedConversationChain,
+    args: BatchCandidateCollectionArgs,
+    hash: string,
+) => Promise<BatchCandidateCollectionResult>;
+
+let batchCandidateCollectorOverride: BatchCandidateCollector | null = null;
+
+function normalizeWorkspaceForMatch(workspace: string): string {
+    return workspace.replace(/\\/g, "/").toLowerCase();
+}
+
+function workspaceMatchesFilter(workspace: string | undefined, workspaceFilter: string | undefined): boolean {
+    if (!workspaceFilter) return true;
+    const target = normalizeWorkspaceForMatch(workspaceFilter);
+    const current = normalizeWorkspaceForMatch(workspace || "");
+    if (!current) return false;
+    return current.includes(target) || target.includes(current);
+}
+
+function dedupeBatchConversationCandidates<T extends { id: string }>(candidates: T[]): T[] {
+    const seen = new Set<string>();
+    return candidates.filter(candidate => {
+        if (seen.has(candidate.id)) return false;
+        seen.add(candidate.id);
+        return true;
+    });
+}
+
+type RecordBatchCandidateCategory = "stale" | "missing" | "fresh" | "conflict";
+type RecordBatchSelectionKind = Exclude<RecordBatchCandidateCategory, "conflict">;
+
+export interface RecordBatchExistingRecord {
+    chain?: string;
+    lastUpdatedAt?: string;
+    totalSteps?: number;
+}
+
+export interface RecordBatchCandidateClassification {
+    candidate: BatchCandidateSnapshot;
+    category: RecordBatchCandidateCategory;
+    record?: RecordBatchExistingRecord;
+}
+
+export interface RecordBatchCandidateSelection {
+    classifications: RecordBatchCandidateClassification[];
+    candidates: FrozenBatchConversationCandidate[];
+    diagnostics: RecordBatchCandidateDiagnostics;
+}
+
+export function effectiveRecordBatchLimit(limit: number | undefined, force: boolean | undefined): number {
+    return Math.min(limit ?? (force ? 200 : 10), force ? 200 : 50);
+}
+
+function isWindsurfRenameOnly(candidate: BatchCandidateSnapshot, record: RecordBatchExistingRecord): boolean {
+    return candidate.chain === "windsurf"
+        && Number.isInteger(candidate.stepCount)
+        && (candidate.stepCount || 0) > 0
+        && candidate.stepCount === record.totalSteps;
+}
+
+function classifyRecordBatchCandidate(
+    candidate: BatchCandidateSnapshot,
+    record: RecordBatchExistingRecord | undefined,
+): RecordBatchCandidateClassification {
+    if (!record) return { candidate, category: "missing" };
+    if (record.chain && candidate.chain && record.chain !== candidate.chain) {
+        return { candidate, category: "conflict", record };
+    }
+    const recordUpdatedMs = Date.parse(record.lastUpdatedAt || "");
+    const stale = !Number.isFinite(recordUpdatedMs)
+        || (candidate.lastModifiedMs > recordUpdatedMs + STALE_THRESHOLD_MS && !isWindsurfRenameOnly(candidate, record));
+    return { candidate, category: stale ? "stale" : "fresh", record };
+}
+
+export function selectRecordBatchCandidates(
+    candidates: BatchCandidateSnapshot[],
+    recordsByWorkspaceHash: Record<string, Record<string, RecordBatchExistingRecord>>,
+    options: { force?: boolean; stale_only?: boolean; limit?: number; sourceEnumerationLimited?: boolean } = {},
+): RecordBatchCandidateSelection {
+    const classifications = candidates.map(candidate => classifyRecordBatchCandidate(
+        candidate,
+        recordsByWorkspaceHash[resolveWorkspaceHashForRecord(candidate.workspace)]?.[candidate.id],
+    ));
+    const rank: Record<RecordBatchCandidateCategory, number> = { stale: 0, missing: 1, fresh: 2, conflict: 3 };
+    classifications.sort((a, b) => {
+        const categoryOrder = rank[a.category] - rank[b.category];
+        if (categoryOrder !== 0) return categoryOrder;
+        const modifiedOrder = b.candidate.lastModifiedMs - a.candidate.lastModifiedMs;
+        return modifiedOrder !== 0 ? modifiedOrder : a.candidate.id.localeCompare(b.candidate.id);
+    });
+    const eligibleCategories = options.stale_only
+        ? new Set<RecordBatchCandidateCategory>(["stale"])
+        : options.force
+            ? new Set<RecordBatchCandidateCategory>(["stale", "missing", "fresh"])
+            : new Set<RecordBatchCandidateCategory>(["stale", "missing"]);
+    const eligible = classifications.filter(item => eligibleCategories.has(item.category));
+    const selected = eligible.slice(0, effectiveRecordBatchLimit(options.limit, options.force));
+    return {
+        classifications,
+        candidates: selected.map(item => ({
+            ...item.candidate,
+            selectionKind: item.category as RecordBatchSelectionKind,
+            refreshExisting: item.category !== "missing",
+        })),
+        diagnostics: {
+            scanned: classifications.length,
+            eligible: eligible.length,
+            selected: selected.length,
+            truncated: Math.max(0, eligible.length - selected.length),
+            conflicts: classifications.filter(item => item.category === "conflict").length,
+            sourceEnumerationLimited: options.sourceEnumerationLimited === true,
+            workspaceUnresolved: 0,
+        },
+    };
+}
+
+export function recordBatchGenerateForce(candidate: Pick<FrozenBatchConversationCandidate, "refreshExisting">): boolean {
+    return candidate.refreshExisting;
+}
+
+async function resolveFrozenBatchWorkspace(
+    candidate: BatchConversationCandidate,
+    resolvedChain: ResolvedConversationChain,
+    workspaceFilter: string | undefined,
+): Promise<{ workspace: string | null; workspaceUnresolved: boolean }> {
+    if (resolvedChain === "antigravity") {
+        const steps = await fetchFirstPageSteps(candidate.id);
+        const detectedWorkspace = steps ? detectWorkspaceFromSteps(steps) : "";
+        if (!detectedWorkspace) return { workspace: null, workspaceUnresolved: true };
+        return {
+            workspace: resolveBatchCandidateWorkspace(candidate, resolvedChain, workspaceFilter, detectedWorkspace),
+            workspaceUnresolved: false,
+        };
+    }
+    return {
+        workspace: resolveBatchCandidateWorkspace(candidate, resolvedChain, workspaceFilter),
+        workspaceUnresolved: false,
+    };
+}
+
+export function resolveBatchCandidateWorkspace(
+    candidate: Pick<BatchConversationCandidate, "workspace" | "workspaceUris">,
+    resolvedChain: ResolvedConversationChain,
+    workspaceFilter: string | undefined,
+    detectedWorkspace?: string,
+): string | null {
+    if (resolvedChain === "antigravity") {
+        if (!detectedWorkspace) return null;
+        return workspaceMatchesFilter(detectedWorkspace, workspaceFilter) ? detectedWorkspace : null;
+    }
+    const workspaces = resolvedChain === "windsurf"
+        ? [candidate.workspace, ...(candidate.workspaceUris || [])]
+        : [candidate.workspace];
+    const actualWorkspace = workspaces.find(workspace => typeof workspace === "string" && workspaceMatchesFilter(workspace, workspaceFilter));
+    return actualWorkspace || null;
+}
+
+async function collectBatchConversationCandidates(
+    resolvedChain: ResolvedConversationChain,
+    args: BatchCandidateCollectionArgs,
+    hash: string,
+): Promise<BatchCandidateCollectionResult> {
+    if (batchCandidateCollectorOverride) {
+        const overridden = await batchCandidateCollectorOverride(resolvedChain, args, hash);
+        return {
+            ...overridden,
+            diagnostics: emptyRecordBatchCandidateDiagnostics(overridden.diagnostics),
+        };
+    }
+    const maxLimit = effectiveRecordBatchLimit(args.limit, args.force);
+    const sourceEnumerationLimit = maxLimit * (resolvedChain === "antigravity" ? 3 : 5);
+    let rawCandidates: BatchConversationCandidate[] = [];
+    let sourceEnumerationLimited = false;
+
+    if (resolvedChain === "antigravity") {
+        const conversations = listConversationsByMtime({
+            after: args.after,
+            before: args.before,
+            limit: sourceEnumerationLimit,
+        });
+        if (conversations.length === 0) {
+            return {
+                candidates: [],
+                emptyReason: "📦 无符合条件的对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics(),
+            };
+        }
+        sourceEnumerationLimited = conversations.length >= sourceEnumerationLimit;
+        rawCandidates = conversations.map(conv => ({
+            id: conv.id,
+            chain: "antigravity",
+            lastModifiedMs: conv.mtime.getTime(),
+        }));
+    } else if (resolvedChain === "codex") {
+        const afterMs = args.after ? new Date(args.after).getTime() : null;
+        const beforeMs = args.before ? new Date(args.before).getTime() : null;
+        const threads = listRecentCodexThreads(sourceEnumerationLimit);
+        sourceEnumerationLimited = threads.length >= sourceEnumerationLimit;
+        rawCandidates = threads
+            .filter(thread => {
+                if (afterMs !== null && (thread.updatedAtMs || 0) < afterMs) return false;
+                if (beforeMs !== null && (thread.updatedAtMs || 0) > beforeMs) return false;
+                return workspaceMatchesFilter(thread.cwd, args.workspace);
+            })
+            .map(thread => ({
+                id: thread.id,
+                workspace: thread.cwd,
+                chain: "codex",
+                lastModifiedMs: thread.updatedAtMs || 0,
+            }));
+        if (rawCandidates.length === 0) {
+            return {
+                candidates: [],
+                emptyReason: "📦 无符合条件的对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
+            };
+        }
+    } else if (resolvedChain === "claude-code") {
+        const { listRecentClaudeCodeThreads } = await import("../claude-code-client.js");
+        const afterMs = args.after ? new Date(args.after).getTime() : null;
+        const beforeMs = args.before ? new Date(args.before).getTime() : null;
+        const threads = listRecentClaudeCodeThreads(sourceEnumerationLimit);
+        sourceEnumerationLimited = threads.length >= sourceEnumerationLimit;
+        rawCandidates = threads
+            .filter(thread => {
+                if (afterMs !== null && (thread.updatedAtMs || 0) < afterMs) return false;
+                if (beforeMs !== null && (thread.updatedAtMs || 0) > beforeMs) return false;
+                return workspaceMatchesFilter(thread.cwd, args.workspace);
+            })
+            .map(thread => ({
+                id: thread.id,
+                workspace: thread.cwd,
+                chain: "claude-code",
+                lastModifiedMs: thread.updatedAtMs || 0,
+            }));
+        if (rawCandidates.length === 0) {
+            return {
+                candidates: [],
+                emptyReason: "📦 无符合条件的对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
+            };
+        }
+    } else {
+        const { listRecentWindsurfThreads } = await import("../windsurf-client.js");
+        const afterMs = args.after ? new Date(args.after).getTime() : null;
+        const beforeMs = args.before ? new Date(args.before).getTime() : null;
+        const threads = await listRecentWindsurfThreads(sourceEnumerationLimit);
+        sourceEnumerationLimited = threads.length >= sourceEnumerationLimit;
+        rawCandidates = threads
+            .filter(thread => {
+                const updatedMs = Date.parse(thread.lastModifiedTime || thread.createdTime || "") || 0;
+                if (afterMs !== null && updatedMs < afterMs) return false;
+                if (beforeMs !== null && updatedMs > beforeMs) return false;
+                return workspaceMatchesFilter(thread.cwd, args.workspace)
+                    || (thread.workspaceUris || []).some(workspace => workspaceMatchesFilter(workspace, args.workspace));
+            })
+            .map(thread => ({
+                id: thread.id,
+                workspace: thread.cwd,
+                workspaceUris: thread.workspaceUris,
+                chain: "windsurf",
+                lastModifiedMs: Date.parse(thread.lastModifiedTime || thread.createdTime || "") || 0,
+                ...(Number.isInteger(thread.stepCount) && thread.stepCount > 0 ? { stepCount: thread.stepCount } : {}),
+            }));
+        if (rawCandidates.length === 0) {
+            return {
+                candidates: [],
+                emptyReason: "📦 无符合条件的 WSF 对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
+            };
+        }
+    }
+
+    rawCandidates = dedupeBatchConversationCandidates(rawCandidates);
+
+    const candidateSnapshots: BatchCandidateSnapshot[] = [];
+    let workspaceUnresolved = 0;
+    for (const candidate of rawCandidates) {
+        const resolution = await resolveFrozenBatchWorkspace(candidate, resolvedChain, args.workspace);
+        if (!resolution.workspace) {
+            if (resolution.workspaceUnresolved) workspaceUnresolved++;
+            continue;
+        }
+        candidateSnapshots.push({
+            id: candidate.id,
+            workspace: resolution.workspace,
+            chain: candidate.chain,
+            lastModifiedMs: candidate.lastModifiedMs,
+            ...(candidate.stepCount !== undefined ? { stepCount: candidate.stepCount } : {}),
+        });
+    }
+
+    if (candidateSnapshots.length === 0) {
+        const unresolvedSuffix = workspaceUnresolved > 0
+            ? `；${workspaceUnresolved} 个 Antigravity 对话 workspace 未解析，已跳过`
+            : "";
+        return {
+            candidates: [],
+            emptyReason: `${args.workspace ? `📦 无属于 ${args.workspace} 的对话` : "📦 无符合条件的对话"}${unresolvedSuffix}`,
+            diagnostics: emptyRecordBatchCandidateDiagnostics({
+                scanned: rawCandidates.length,
+                sourceEnumerationLimited,
+                workspaceUnresolved,
+            }),
+        };
+    }
+
+    const hashes = [...new Set(candidateSnapshots.map(candidate => resolveWorkspaceHashForRecord(candidate.workspace)))];
+    const indexes = await Promise.all(hashes.map(async workspaceHash => [workspaceHash, await readRecordsIndexAsync(workspaceHash)] as const));
+    const recordsByWorkspaceHash: Record<string, Record<string, RecordBatchExistingRecord>> = Object.fromEntries(
+        indexes.map(([workspaceHash, index]) => [workspaceHash, index.records]),
+    );
+    const selection = selectRecordBatchCandidates(candidateSnapshots, recordsByWorkspaceHash, {
+        force: args.force,
+        stale_only: args.stale_only,
+        limit: args.limit,
+        sourceEnumerationLimited,
+    });
+    const diagnostics = {
+        ...selection.diagnostics,
+        workspaceUnresolved,
+    };
+    if (selection.candidates.length === 0) {
+        const conflictSuffix = diagnostics.conflicts > 0
+            ? `；${diagnostics.conflicts} 个来源链路冲突已跳过`
+            : "";
+        return {
+            candidates: [],
+            diagnostics,
+            emptyReason: `${args.stale_only ? "📦 无 stale Record" : "📦 无可更新的 stale 或 missing 对话"}${conflictSuffix}`,
+        };
+    }
+
+    return { candidates: selection.candidates, diagnostics };
+}
+
+function readyRecordBatchPayload(
+    payload: RecordBatchResumePayload,
+    candidates: FrozenBatchConversationCandidate[],
+    diagnostics?: RecordBatchCandidateDiagnostics,
+): RecordBatchReadyResumePayload {
+    return {
+        kind: "record-batch-update",
+        actionName: payload.actionName,
+        resumeKey: payload.resumeKey,
+        dataChain: payload.dataChain,
+        modelChain: payload.modelChain,
+        ...(payload.force !== undefined ? { force: payload.force } : {}),
+        ...(payload.stale_only !== undefined ? { stale_only: payload.stale_only } : {}),
+        phase: "ready",
+        candidates: candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, payload.dataChain as ResolvedConversationChain)),
+        ...(diagnostics ? { diagnostics } : {}),
+    };
+}
+
+async function prepareRecordBatchPayload(
+    payload: RecordBatchResumePayload,
+    updateProgress: (progress: BackgroundTaskProgress) => void,
+    isCancelled: () => boolean,
+    isSettled: () => boolean,
+): Promise<{ payload?: RecordBatchReadyResumePayload; result?: string }> {
+    if ("candidates" in payload) return { payload };
+
+    const existingLedger = await readRecordBatchLedgerAsync(payload.resumeKey);
+    if (existingLedger) {
+        return { payload: readyRecordBatchPayload(payload, existingLedger.candidates) };
+    }
+
+    updateProgress({
+        stage: "batch_prepare",
+        current: 0,
+        total: effectiveRecordBatchLimit(payload.request.limit, payload.force),
+        unit: "个候选",
+        detail: `后台准备 ${payload.dataChain} 批量候选`,
+    });
+    if (isCancelled() || isSettled()) {
+        return { result: "🛑 批量更新在候选准备前已取消或结算" };
+    }
+
+    const hash = resolveWorkspaceHashForRecord(payload.request.workspace);
+    const { candidates, diagnostics, emptyReason } = await collectBatchConversationCandidates(
+        payload.dataChain as ResolvedConversationChain,
+        { ...payload.request, force: payload.force, stale_only: payload.stale_only },
+        hash,
+    );
+    if (isCancelled() || isSettled()) {
+        return { result: "🛑 批量更新在候选准备后已取消或结算" };
+    }
+    if (candidates.length === 0) {
+        const diagnosticText = diagnostics ? `\n  ${formatRecordBatchCandidateDiagnostics(diagnostics)}` : "";
+        return { result: `${emptyReason || "📦 无符合条件的对话"}${diagnosticText}` };
+    }
+
+    const readyPayload = readyRecordBatchPayload(payload, candidates, diagnostics);
+    await ensureRecordBatchLedgerAsync(readyPayload);
+    updateProgress({
+        stage: "batch_prepare",
+        current: candidates.length,
+        total: candidates.length,
+        unit: "个候选",
+        detail: `候选快照已冻结：${candidates.length} 个对话${diagnostics ? `，scanned=${diagnostics.scanned} eligible=${diagnostics.eligible} selected=${diagnostics.selected}` : ""}`,
+    });
+    return { payload: readyPayload };
+}
+
+async function prepareAndRunRecordBatchUpdate(
+    payload: RecordBatchResumePayload,
+    updateProgress: (progress: BackgroundTaskProgress) => void,
+    isCancelled: () => boolean,
+    isSettled: () => boolean,
+): Promise<string> {
+    const prepared = await prepareRecordBatchPayload(payload, updateProgress, isCancelled, isSettled);
+    if (!prepared.payload) return prepared.result || "📦 无符合条件的对话";
+    return runRecordBatchUpdateFromPayload(prepared.payload, updateProgress, isCancelled, isSettled);
+}
+
+function buildRecordBatchResultText(
+    ledger: RecordBatchResumeLedger,
+    total: number,
+    elapsedSeconds: number,
+    resumeSummary: { hadPriorState: boolean; initialSettledCount: number },
+    poolSummary?: RecordUpdatePoolSummary,
+    diagnostics?: RecordBatchCandidateDiagnostics,
+    grokSummary?: GrokBatchRuntimeSummary,
+): string {
+    const failedMessages = ledger.failed
+        .map(item => `${item.id.slice(0, 8)}: ${item.reason || "unknown"}`);
+    const created = ledger.completed.filter(item => item.isNew === true).length;
+    const updated = ledger.completed.filter(item => item.isNew === false).length;
+    const unclassified = ledger.completed.length - created - updated;
+    let out = `📦 批量更新完成\n  ✅ 本 batch 成功: ${ledger.completed.length} 份（新建 ${created} / 更新 ${updated} / 未分类 ${unclassified}）`;
+    if (ledger.failed.length > 0) out += `\n  ❌ 失败: ${ledger.failed.length} 份`;
+    if (ledger.skipped.length > 0) out += `\n  ⏭ 跳过: ${ledger.skipped.length} 份`;
+    if (ledger.inFlight.length > 0) out += `\n  ♻️ 待恢复: ${ledger.inFlight.length} 份（正文、主索引或 Reader Index 尚未全部确认）`;
+    if (resumeSummary.hadPriorState) {
+        const finalSettledCount = ledger.completed.length + ledger.failed.length + ledger.skipped.length;
+        const processedThisRun = Math.max(0, finalSettledCount - resumeSummary.initialSettledCount);
+        out += `\n  ♻️ 恢复续跑: 本次处理 ${processedThisRun} 份；以上数字仍为同一 resumeKey 的最终 ledger 总计 ${finalSettledCount}/${total}`;
+    }
+    if (failedMessages.length > 0) out += `\n  📋 错误: ${failedMessages.join("; ")}`;
+    if (poolSummary) {
+        const adaptive = getRecordPersistenceConcurrencySnapshot();
+        out += `\n  🚦 进程内 AIMD 累计: activePeak=${poolSummary.peakActive} pendingPeak=${poolSummary.peakPending} queueWaitMsMax=${poolSummary.maxQueueWaitMs}ms limit=${adaptive.limit} current=${adaptive.current} max=${adaptive.max} min=${adaptive.min} successes=${adaptive.successes}（成功持久化事务） failures=${adaptive.failures}（拥塞反馈失败；均非本 batch ledger 数字）`;
+    }
+    if (diagnostics) {
+        out += `\n  ${formatRecordBatchCandidateDiagnostics(diagnostics)}`;
+    }
+    if (grokSummary) {
+        const grok = grokSummary.latest;
+        out += `\n  🌐 Grok 请求级保护（仅当前 memory-store Node 进程 pid=${grok.pid}）: trafficClass=${grok.trafficClass} batchQueueWaitMsMax=${grokSummary.maxBatchQueueWaitMs} globalQueueWaitMsMax=${grokSummary.maxGlobalQueueWaitMs} queueAttemptsMax=${grokSummary.maxQueueAttempts} batchActive=${grok.batchActive} batchPending=${grok.batchPending} batchLimit=${grok.batchLimit} globalActive=${grok.globalActive} globalPending=${grok.globalPending} globalLimit=${grok.globalLimit} AIMD=${grok.current}/${grok.max} failures=${grok.failures}`;
+    }
+    out += `\n  📊 总耗时: ${elapsedSeconds.toFixed(0)}s`;
+    return out;
+}
+
+async function runRecordBatchUpdateFromPayload(
+    payload: RecordBatchReadyResumePayload,
+    updateProgress: (progress: BackgroundTaskProgress) => void,
+    isCancelled: () => boolean,
+    isSettled: () => boolean,
+): Promise<string> {
+    const taskStartMs = Date.now();
+    const poolSummary: RecordUpdatePoolSummary = {
+        peakActive: 0,
+        peakPending: 0,
+        maxQueueWaitMs: 0,
+    };
+    let grokSummary: GrokBatchRuntimeSummary | undefined;
+    let ledger = await ensureRecordBatchLedgerAsync(payload);
+    const resumeSummary = {
+        hadPriorState: ledger.completed.length + ledger.failed.length + ledger.skipped.length + ledger.inFlight.length > 0,
+        initialSettledCount: ledger.completed.length + ledger.failed.length + ledger.skipped.length,
+    };
+    if (ledger.inFlight.length > 0) {
+        try {
+            ledger = await reconcileRecordBatchInFlight(payload, ledger, {
+                isCancelled,
+                isSettled,
+                onProgress: updateProgress,
+            });
+        } catch (error) {
+            if (error instanceof RecordUpdatePoolAbortError || error instanceof RecordSingleFlightAbortError) {
+                return `⚠️ ${error.message} | ${formatRecordUpdatePoolDetail(error.snapshot)}`;
+            }
+            throw error;
+        }
+    }
+    const total = payload.candidates.length;
+    let pending = pendingRecordBatchCandidates(payload, ledger);
+    let current = "";
+
+    const updateBatchProgress = (detail?: string) => {
+        updateProgress({
+            stage: "batch_update",
+            current: Math.min(ledger.completed.length + ledger.failed.length + ledger.skipped.length, total),
+            total,
+            unit: "个对话",
+            detail: detail || (current ? `当前: ${current}` : undefined),
+        });
+    };
+
+    updateBatchProgress(
+        pending.length === total
+            ? `准备批量更新 ${total} 个对话`
+            : `恢复批量更新，剩余 ${pending.length}/${total} 个对话待处理`,
+    );
+
+    if (pending.length === 0) {
+        return buildRecordBatchResultText(ledger, total, (Date.now() - taskStartMs) / 1000, resumeSummary, poolSummary, payload.diagnostics, grokSummary);
+    }
+
+    const concurrency = Math.min(getRecordBatchWorkerConcurrency(), pending.length);
+    let nextIndex = 0;
+
+    const worker = async (workerId: number) => {
+        while (true) {
+            if (isCancelled() || isSettled()) break;
+            const idx = nextIndex++;
+            if (idx >= pending.length) break;
+
+            const candidate = pending[idx];
+            current = `${candidate.id.slice(0, 8)}...`;
+            updateBatchProgress(`worker ${workerId + 1} 处理 ${current} (${idx + 1}/${pending.length})`);
+            let candidateInFlight = false;
+
+            try {
+                if (isCancelled() || isSettled()) break;
+                const startedAt = Date.now();
+                let singleFlightPermit: Awaited<ReturnType<typeof acquireRecordSingleFlightPermit>> | null = null;
+                try {
+                    const loaded = await loadConversationData(payload.dataChain, candidate.id, {
+                        link: "summary",
+                        requestClass: "background",
+                    });
+                    const fetchMs = Date.now() - startedAt;
+                    if (!loaded) {
+                        ledger = await updateRecordBatchLedger(payload, "skipped", candidate, "无法加载对话");
+                        updateBatchProgress(`跳过 ${current}: 无法加载对话`);
+                        continue;
+                    }
+
+                    const rounds = loaded.rounds;
+                    const parseMs = Date.now() - startedAt - fetchMs;
+                    if (rounds.length < 3) {
+                        ledger = await updateRecordBatchLedger(payload, "skipped", candidate, "轮次不足");
+                        updateBatchProgress(`跳过 ${current}: 轮次不足`);
+                        continue;
+                    }
+
+                    const totalSteps = loaded.totalSteps;
+                    const actualWorkspace = candidate.workspace || "general";
+                    const actualHash = resolveWorkspaceHashForRecord(actualWorkspace);
+                    singleFlightPermit = await acquireRecordSingleFlightPermit(candidate.id, {
+                        isCancelled,
+                        isSettled,
+                        onProgress: updateProgress,
+                    });
+                    const flashStartedAt = Date.now();
+                    const result = await generateRecord(actualHash, candidate.id, actualWorkspace, rounds, totalSteps, payload.modelChain, {
+                        background: true,
+                        trafficClass: "record-batch",
+                        force: recordBatchGenerateForce(candidate),
+                        isCancelled,
+                        isSettled,
+                    });
+                    const flashMs = Date.now() - flashStartedAt;
+                    if (result.grokDiagnostics) {
+                        grokSummary = updateGrokBatchRuntimeSummary(grokSummary, result.grokDiagnostics);
+                    }
+                    if (result.aborted) {
+                        updateBatchProgress(`停止 ${current}: ${result.error || "任务已终止"}`);
+                        break;
+                    }
+                    if (!result.success || !result.content) {
+                        ledger = await updateRecordBatchLedger(payload, "failed", candidate, result.error || "unknown");
+                        updateBatchProgress(`失败 ${current}: ${result.error || "unknown"}`);
+                        continue;
+                    }
+
+                    const content = result.content;
+                    const oldRecord = await readRecordAsync(actualHash, candidate.id) || "";
+                    const gate = validateRecordCandidateForWrite(content, candidate.id, rounds.length, result.coveredRounds || rounds.length, {
+                        oldRecord,
+                    });
+                    if (!gate.ok) {
+                        ledger = await updateRecordBatchLedger(payload, "failed", candidate, gate.error);
+                        updateBatchProgress(`失败 ${current}: ${gate.error}`);
+                        continue;
+                    }
+                    const phases = countPhasesInRecord(content);
+                    const committed = await withRecordUpdateSharedPermit({
+                        isCancelled,
+                        isSettled,
+                        onProgress: updateProgress,
+                        waitingStage: "等待 Record 写入许可",
+                        acquiredStage: "batch_update",
+                        waitingDetail: `worker ${workerId + 1} 等待 ${current} 的写回`,
+                        acquiredDetail: `worker ${workerId + 1} 获取 ${current} 的写回许可`,
+                    }, async permit => {
+                        const abortReason = getRecordTaskAbortReason({ isCancelled, isSettled });
+                        if (abortReason) throw new RecordUpdatePoolAbortError(abortReason, permit.snapshot);
+                        const existingIndexEntry = (await readRecordsIndexAsync(actualHash)).records[candidate.id];
+                        const metadata: RecordBatchIndexMetadata = {
+                            conversationId: candidate.id,
+                            title: extractTitle(content) || `对话 ${candidate.id.slice(0, 8)}`,
+                            timeSpan: existingIndexEntry?.timeSpan || "",
+                            totalRounds: rounds.length,
+                            totalSteps,
+                            lastUpdatedRound: result.coveredRounds || rounds.length,
+                            phases,
+                            tags: result.tags ?? existingIndexEntry?.tags ?? [],
+                            chain: loaded.chainUsed || payload.dataChain || existingIndexEntry?.chain,
+                        };
+                        ledger = await markRecordBatchCandidateInFlight(payload, candidate, content, metadata, !existingIndexEntry);
+                        candidateInFlight = true;
+                        await runRecordPersistenceTestHook("before_write", candidate.id);
+                        const beforeCommitReason = getRecordTaskAbortReason({ isCancelled, isSettled });
+                        if (beforeCommitReason) throw new RecordUpdatePoolAbortError(beforeCommitReason, permit.snapshot);
+                        const writeResult = await writeRecord(actualHash, candidate.id, content, metadata, {
+                            afterContentWrite: () => runRecordPersistenceTestHook("after_record_body", candidate.id),
+                        });
+                        await runRecordPersistenceTestHook("after_record_index", candidate.id);
+                        const readerIndex = await buildAndPersistRecordReaderIndex(actualHash, candidate.id, content, {
+                            beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", candidate.id),
+                        });
+                        if (readerIndex.error) {
+                            throw readerIndex.error;
+                        }
+                        ledger = await updateRecordBatchLedger(payload, "completed", candidate, undefined, writeResult.outcome === "created");
+                        candidateInFlight = false;
+                        return true;
+                    });
+                    updateRecordUpdatePoolSummary(poolSummary, committed.permit.snapshot, committed.permit.queueWaitMs);
+                    if (!committed.value) continue;
+                    updateBatchProgress(`完成 ${current}: ${((Date.now() - startedAt) / 1000).toFixed(1)}s | ${formatRecordUpdatePoolDetail(committed.permit.snapshot, committed.permit.queueWaitMs)}`);
+                    console.error(
+                        `[batch-w${workerId + 1}] ✅ ${candidate.id.slice(0, 8)}: fetch=${(fetchMs / 1000).toFixed(1)}s parse=${(parseMs / 1000).toFixed(1)}s flash=${(flashMs / 1000).toFixed(1)}s (${rounds.length}轮/${totalSteps}步) | ${formatRecordUpdatePoolDetail(committed.permit.snapshot, committed.permit.queueWaitMs)}`,
+                    );
+                } finally {
+                    singleFlightPermit?.release();
+                }
+            } catch (error) {
+                if (error instanceof RecordUpdatePoolAbortError) {
+                    updateBatchProgress(`停止 ${current}: ${error.message} | ${formatRecordUpdatePoolDetail(error.snapshot)}`);
+                    break;
+                }
+                if (error instanceof RecordSingleFlightAbortError) {
+                    updateBatchProgress(`停止 ${current}: ${error.message} | ${formatRecordUpdatePoolDetail(error.snapshot)}`);
+                    break;
+                }
+                const message = error instanceof Error ? error.message : String(error);
+                if (candidateInFlight) {
+                    ledger = await ensureRecordBatchLedgerAsync(payload);
+                    updateBatchProgress(`待恢复 ${current}: ${message}`);
+                } else {
+                    ledger = await updateRecordBatchLedger(payload, "failed", candidate, message);
+                    updateBatchProgress(`失败 ${current}: ${message}`);
+                }
+            }
+        }
+    };
+
+    await Promise.allSettled(
+        Array.from({ length: concurrency }, (_, index) => worker(index)),
+    );
+
+    ledger = await ensureRecordBatchLedgerAsync(payload);
+    pending = pendingRecordBatchCandidates(payload, ledger);
+    const out = buildRecordBatchResultText(ledger, total, (Date.now() - taskStartMs) / 1000, resumeSummary, poolSummary, payload.diagnostics, grokSummary);
+    console.error(`[batch] ${out}`);
+    return out;
 }
 
 async function handleBatchUpdate(
-    hash: string,
-    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
+    _hash: string,
+    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; stale_only?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
     startMs: number,
 ) {
-    // check 模式：查询进度
-    if (_batchTask) {
-        // force=true 取消当前任务
-        if (args.force && _batchTask.status === "running") {
-            const elapsed = ((Date.now() - _batchTask.startMs) / 1000).toFixed(0);
-            const progress = _batchTask.success + _batchTask.failed + _batchTask.skipped;
-            const out = `🛑 批量更新已取消 (${progress}/${_batchTask.total})\n  ✅ ${_batchTask.success} ❌ ${_batchTask.failed} ⏭ ${_batchTask.skipped}\n  ⏱ 已用 ${elapsed}s`;
-            _batchTask = null;  // 循环中 if (!_batchTask) break 会触发
-            return r(out);
-        }
-        // waitSeconds: 等待任务完成再返回
-        const ws = Math.min(Math.max(args.waitSeconds || 0, 0), 300);
-        if (ws > 0 && _batchTask.status === "running") {
-            await new Promise<void>(resolve => {
-                const deadline = Date.now() + ws * 1000;
-                const poll = () => {
-                    if (!_batchTask || _batchTask.status === "done" || Date.now() >= deadline) { resolve(); return; }
-                    setTimeout(poll, 2000);
-                };
-                poll();
-            });
-        }
-        if (_batchTask && _batchTask.status === "running") {
-            const elapsed = ((Date.now() - _batchTask.startMs) / 1000).toFixed(0);
-            const progress = _batchTask.success + _batchTask.failed + _batchTask.skipped;
-            return r(`⏳ 批量更新进行中 (${progress}/${_batchTask.total})\n  ✅ ${_batchTask.success} ❌ ${_batchTask.failed} ⏭ ${_batchTask.skipped}\n  🔄 当前: ${_batchTask.current}\n  ⏱ 已用 ${elapsed}s`);
-        }
-        // done：返回最终结果并清理
-        const result = _batchTask?.result || "完成";
-        _batchTask = null;
-        return r(result);
-    }
-
-    // 启动模式：筛选候选对话 + 后台执行
-    const maxLimit = Math.min(args.limit || 10, 50);
+    const actionName: "batch_update" | "bulk_update" = args.action === "bulk_update" ? "bulk_update" : "batch_update";
     const batchChains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
     const requestedDataChain = batchChains.dataChain;
     const requestedModelChain = batchChains.modelChain;
@@ -1712,215 +3918,38 @@ async function handleBatchUpdate(
         return rt(`❌ 指定 dataChain ${requestedDataChain} 当前不可用`, startMs);
     }
 
-    let candidates: BatchConversationCandidate[] = [];
-    if (resolvedChain === "antigravity") {
-        const conversations = listConversationsByMtime({
-            after: args.after, before: args.before, limit: maxLimit * 3,
-        });
-        if (conversations.length === 0) return rt("📦 无符合条件的对话", startMs);
-        candidates = conversations.map(conv => ({ id: conv.id }));
-    } else if (resolvedChain === "codex") {
-        const afterMs = args.after ? new Date(args.after).getTime() : null;
-        const beforeMs = args.before ? new Date(args.before).getTime() : null;
-        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
-        candidates = listRecentCodexThreads(maxLimit * 5)
-            .filter(thread => {
-                if (afterMs !== null && (thread.updatedAtMs || 0) < afterMs) return false;
-                if (beforeMs !== null && (thread.updatedAtMs || 0) > beforeMs) return false;
-                if (args.workspace) {
-                    const threadWs = norm(thread.cwd || "");
-                    const targetWs = norm(args.workspace);
-                    if (!threadWs.includes(targetWs) && !targetWs.includes(threadWs)) return false;
-                }
-                return true;
-            })
-            .map(thread => ({ id: thread.id, workspace: thread.cwd }));
-        if (candidates.length === 0) return rt("📦 无符合条件的对话", startMs);
-    } else if (resolvedChain === "claude-code") {
-        const { listRecentClaudeCodeThreads } = await import("../claude-code-client.js");
-        const afterMs = args.after ? new Date(args.after).getTime() : null;
-        const beforeMs = args.before ? new Date(args.before).getTime() : null;
-        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
-        candidates = listRecentClaudeCodeThreads(maxLimit * 5)
-            .filter(thread => {
-                if (afterMs !== null && (thread.updatedAtMs || 0) < afterMs) return false;
-                if (beforeMs !== null && (thread.updatedAtMs || 0) > beforeMs) return false;
-                if (args.workspace) {
-                    const threadWs = norm(thread.cwd || "");
-                    const targetWs = norm(args.workspace);
-                    if (!threadWs.includes(targetWs) && !targetWs.includes(threadWs)) return false;
-                }
-                return true;
-            })
-            .map(thread => ({ id: thread.id, workspace: thread.cwd }));
-        if (candidates.length === 0) return rt("📦 无符合条件的对话", startMs);
-    } else {
-        const { listRecentWindsurfThreads } = await import("../windsurf-client.js");
-        const afterMs = args.after ? new Date(args.after).getTime() : null;
-        const beforeMs = args.before ? new Date(args.before).getTime() : null;
-        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
-        candidates = (await listRecentWindsurfThreads(maxLimit * 5))
-            .filter(thread => {
-                const updatedMs = Date.parse(thread.lastModifiedTime || thread.createdTime || "") || 0;
-                if (afterMs !== null && updatedMs < afterMs) return false;
-                if (beforeMs !== null && updatedMs > beforeMs) return false;
-                if (args.workspace && thread.cwd) {
-                    const threadWs = norm(thread.cwd || "");
-                    const targetWs = norm(args.workspace);
-                    if (!threadWs.includes(targetWs) && !targetWs.includes(threadWs)) return false;
-                }
-                return true;
-            })
-            .map(thread => ({ id: thread.id, workspace: thread.cwd }));
-        if (candidates.length === 0) return rt("📦 无符合条件的 WSF 对话", startMs);
-    }
-
-    const { readRecordsIndex } = await import("../record-store.js");
-    const index = readRecordsIndex(hash);
-    candidates = args.force ? candidates : candidates.filter(c => !index.records[c.id]);
-
-    if (candidates.length === 0) return rt("📦 所有对话已有 Record（使用 force=true 强制更新）", startMs);
-
-    // 工作区预扫描：并行检查所有候选对话的工作区归属
-    if (args.workspace && resolvedChain === "antigravity") {
-        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
-        const targetWs = norm(args.workspace);
-        const scanResults = await Promise.allSettled(
-            candidates.map(async conv => {
-                const steps = await fetchFirstPageSteps(conv.id);
-                if (!steps) return null;
-                const ws = detectWorkspaceFromSteps(steps);
-                if (ws && (norm(ws).includes(targetWs) || targetWs.includes(norm(ws)))) return conv;
-                return null;
-            })
-        );
-        candidates = scanResults
-            .filter((r): r is PromiseFulfilledResult<typeof candidates[0]> => r.status === "fulfilled" && r.value !== null)
-            .map(r => r.value);
-        if (candidates.length === 0) return rt(`📦 无属于 ${args.workspace} 的对话`, startMs);
-    }
-
-    candidates = candidates.slice(0, maxLimit);
-
-    // 初始化后台任务
-    _batchTask = {
-        status: "running", startMs, total: candidates.length,
-        success: 0, failed: 0, skipped: 0, current: "", errors: [],
+    const resumePayload: RecordBatchPreparingResumePayload = {
+        kind: "record-batch-update",
+        actionName,
+        resumeKey: makeRecordBatchResumeKey(),
+        dataChain: resolvedChain,
+        modelChain: requestedModelChain,
+        ...(args.force !== undefined ? { force: args.force } : {}),
+        ...(args.stale_only !== undefined ? { stale_only: args.stale_only } : {}),
+        phase: "preparing",
+        request: {
+            ...(args.after !== undefined ? { after: args.after } : {}),
+            ...(args.before !== undefined ? { before: args.before } : {}),
+            ...(args.limit !== undefined ? { limit: args.limit } : {}),
+            ...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
+        },
     };
 
-    // 后台异步执行（不 await），2 并发 worker 池
-    (async () => withToolConcurrency("heavy", "record_manage.batch_update.background", async () => {
-        const CONCURRENCY = 2;
-        let nextIdx = 0; // 共享任务指针
-
-        // 单个 worker：从共享队列取任务，执行完整流程
-        const worker = async (workerId: number) => {
-            while (true) {
-                if (!_batchTask) break;
-                const idx = nextIdx++;
-                if (idx >= candidates.length) break;
-
-                const conv = candidates[idx];
-                _batchTask.current = conv.id.slice(0, 8) + "...";
-                try {
-                    console.error(`[batch-w${workerId}] 处理 ${conv.id.slice(0, 8)}... (${idx + 1}/${candidates.length})`);
-                    const t0 = Date.now();
-                    const loaded = await loadConversationData(resolvedChain, conv.id, { link: "summary" });
-                    const fetchMs = Date.now() - t0;
-                    if (!loaded) { _batchTask.skipped++; continue; }
-
-                    const t1 = Date.now();
-                    const rounds = loaded.rounds;
-                    const parseMs = Date.now() - t1;
-                    if (rounds.length < 3) { _batchTask.skipped++; continue; }
-
-                    const totalSteps = loaded.totalSteps;
-
-                    // 自动检测对话所属工作区
-                    const detectedWs = loaded.chainUsed === "antigravity"
-                        ? detectWorkspaceFromSteps(loaded.trajectory?.steps || [])
-                        : (conv.workspace || loaded.codexData?.thread.cwd || loaded.claudeCodeData?.thread.cwd || loaded.windsurfData?.thread.cwd || "");
-                    const actualWs = detectedWs || args.workspace || "general";
-
-                    // 工作区筛选（预扫描已过滤，这是双重保险）
-                    if (args.workspace && detectedWs) {
-                        const norm = (s: string) => s.replace(/\\/g, "/").toLowerCase();
-                        if (!norm(detectedWs).includes(norm(args.workspace)) && !norm(args.workspace).includes(norm(detectedWs))) {
-                            _batchTask.skipped++;
-                            continue;
-                        }
-                    }
-
-                    const actualHash = resolveWorkspaceHashForRecord(actualWs);
-
-                    const t2 = Date.now();
-                    const result = await generateRecord(actualHash, conv.id, actualWs, rounds, totalSteps, requestedModelChain);
-                    const flashMs = Date.now() - t2;
-                    if (!result.success || !result.content) {
-                        _batchTask.failed++;
-                        _batchTask.errors.push(`${conv.id.slice(0, 8)}: ${result.error || "unknown"}`);
-                        continue;
-                    }
-
-                    const gate = validateRecordCandidateForWrite(result.content, conv.id, rounds.length, result.coveredRounds || rounds.length, {
-                        oldRecord: readRecord(actualHash, conv.id) || "",
-                    });
-                    if (!gate.ok) {
-                        _batchTask.failed++;
-                        _batchTask.errors.push(`${conv.id.slice(0, 8)}: ${gate.error}`);
-                        continue;
-                    }
-
-                    const phases = countPhasesInRecord(result.content);
-                    await writeRecord(actualHash, conv.id, result.content, {
-                        title: extractTitle(result.content) || `对话 ${conv.id.slice(0, 8)}`,
-                        totalRounds: rounds.length,
-                        totalSteps,
-                        lastUpdatedRound: result.coveredRounds || rounds.length,
-                        phases,
-                        tags: result.tags,
-                    });
-                    try {
-                        await writeReaderIndexForRecord(actualHash, conv.id, result.content);
-                    } catch (err) {
-                        console.error(`[batch-w${workerId}] reader index build failed: ${err instanceof Error ? err.message : String(err)}`);
-                    }
-                    _batchTask.success++;
-                    const totalMs = Date.now() - t0;
-                    console.error(`[batch-w${workerId}] ✅ ${conv.id.slice(0, 8)}: fetch=${(fetchMs / 1000).toFixed(1)}s parse=${(parseMs / 1000).toFixed(1)}s flash=${(flashMs / 1000).toFixed(1)}s total=${(totalMs / 1000).toFixed(1)}s (${rounds.length}轮/${totalSteps}步)`);
-                } catch (err) {
-                    _batchTask.failed++;
-                    _batchTask.errors.push(`${conv.id.slice(0, 8)}: ${err instanceof Error ? err.message : String(err)}`);
-                }
-            }
-        };
-
-        // 启动 worker 池
-        await Promise.allSettled(
-            Array.from({ length: Math.min(CONCURRENCY, candidates.length) }, (_, i) => worker(i))
-        );
-
-        // 完成
-        if (_batchTask) {
-            const elapsed = ((Date.now() - _batchTask.startMs) / 1000).toFixed(0);
-            let out = `📦 批量更新完成\n  ✅ 成功: ${_batchTask.success} 份`;
-            if (_batchTask.failed > 0) out += `\n  ❌ 失败: ${_batchTask.failed} 份`;
-            if (_batchTask.skipped > 0) out += `\n  ⏭ 跳过: ${_batchTask.skipped} 份`;
-            if (_batchTask.errors.length > 0) out += `\n  📋 错误: ${_batchTask.errors.join("; ")}`;
-            out += `\n  📊 总耗时: ${elapsed}s`;
-            _batchTask.result = out;
-            _batchTask.status = "done";
-            console.error(`[batch] ${out}`);
-        }
-    }))().catch(err => {
-        if (_batchTask) {
-            _batchTask.result = `📦 批量更新异常终止: ${err}`;
-            _batchTask.status = "done";
-        }
+    const task = startBackgroundTask("record-batch-update", async ({ updateProgress, isCancelled, isSettled }) => (
+        prepareAndRunRecordBatchUpdate(resumePayload, updateProgress, isCancelled, isSettled)
+    ), {
+        timeoutMessage: RECORD_BATCH_TIMEOUT_MESSAGE,
+        resumePayload,
     });
 
-    const actionName = isRecordBatchUpdateAction(args.action) ? args.action : "batch_update";
-    return r(`🚀 批量更新已启动（后台处理 ${candidates.length} 个对话）\n💡 再次调用 ${actionName}（同参数）查看进度`);
+    return r([
+        `🚀 ${actionName} 已转入后台任务（候选准备与更新均在后台执行）`,
+        `🆔 taskId: ${task.id}`,
+        `🔗 dataChain: ${resolvedChain}`,
+        `🤖 modelChain: ${requestedModelChain}`,
+        `🧷 resumeKey: ${resumePayload.resumeKey}`,
+        "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询进度",
+    ].join("\n"));
 }
 
 // ============= 辅助 =============

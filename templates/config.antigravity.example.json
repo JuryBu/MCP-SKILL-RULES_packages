@@ -11,7 +11,7 @@
       "command": "node",
       "args": ["<toolkit-root>\\mcps\\web-fetcher\\dist\\index.js"],
       "env": {
-        "WEB_FETCHER_PROFILES_DIR": "%USERPROFILE%\\.codex-toolkit\\web-fetcher-profiles"
+        "WEB_FETCHER_PROFILE_BASE_DIR": "%USERPROFILE%\\.codex-toolkit\\web-fetcher-profiles"
       }
     },
     "sandbox": {

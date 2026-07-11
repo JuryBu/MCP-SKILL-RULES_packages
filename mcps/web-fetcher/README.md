@@ -211,7 +211,7 @@ web_inspect(action="check", taskId="...", waitSeconds=30)
 - `web_pipeline` 可传 `sessionId` 复用已登录页面、弹窗 session 或 `desktop_register_window` 注册来的 Electron renderer；不传 `sessionId` 时仍按旧行为用 `url` 新建页面。
 - `web_interact(action="snapshot")` 与 `web_pipeline(steps=[{action:"snapshot"}])` 会一次返回截图文件、视口可见文本和 DOM 摘要，适合动态课程平台、登录后页面和复杂单页应用的定位。
 - 页面池默认允许 5 个并发页面（可用 `WEB_FETCHER_MAX_CONCURRENT_PAGES` 覆盖）；达到 3 个活跃页面起会在 `web_interact`、`web_pipeline`、`web_list_sessions` 输出中提示接近上限，并建议用 `web_close_sessions` 顺手清理旧会话（提醒阈值可用 `WEB_FETCHER_PAGE_POOL_WARNING_THRESHOLD` 覆盖）。
-- Cookie 与 localStorage 是全局共享资源，会通过文件锁和临时文件 rename 合并写入；它们不按对话隔离。
+- Cookie 与 localStorage 是全局共享资源，会通过文件锁和临时文件 rename 合并写入；它们不按对话或项目隔离。首次启用登录态功能前，应确认同一 Windows 账户下的四个宿主都被允许访问这些站点身份；需要隔离时使用不同的 `CODEX_TOOLKIT_DATA_ROOT`，不要共享 profile。
 - 有头登录 / UAV 会使用动态空闲 CDP 端口，并只清理带匹配临时 profile 或 lockfile owner 的自有 Chrome，不按固定端口粗暴杀进程。
 - 浏览器主 context 与 bareContext 在 `close()` / `closeBrowser()` 时都会关闭并清理各自临时 profile。
 - 本地开发地址（`localhost` / `127.0.0.1` / `[::1]`）会自动走 no-cache 访问，避免同一 profile 下旧 Vite/开发服务器响应导致白屏；远程登录态站点仍保持原有缓存与 Cookie 行为。

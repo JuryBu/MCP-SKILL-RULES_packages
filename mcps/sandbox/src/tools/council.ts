@@ -3,10 +3,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { normalizeOwnerId } from "../owner.js";
 import { runCouncil } from "../council/engine.js";
-import { formatPersistentCouncilTask, startPersistentCouncilTask, waitForPersistentCouncilTask } from "../council/background.js";
+import { formatPersistentCouncilTask, readCouncilResumeSource, startPersistentCouncilTask, waitForPersistentCouncilTask } from "../council/background.js";
 import type { CouncilProvider, CouncilRunParams } from "../council/types.js";
 
-const PROVIDERS = ["antigravity", "codex", "openai", "anthropic", "gemini", "geminiCli", "claudeCode", "customOpenAICompatible"] as const;
+const PROVIDERS = ["antigravity", "codex", "openai", "anthropic", "gemini", "geminiCli", "grok", "claudeCode", "customOpenAICompatible"] as const;
 const MODES = ["red_blue_black", "design", "review", "guard_check", "custom"] as const;
 const CONTEXT_MODES = ["none", "summary", "full", "manual"] as const;
 const COUNCIL_BACKGROUND_MAX_RUN_MS = Number(process.env.SANDBOX_COUNCIL_BACKGROUND_MAX_RUN_MS || 45 * 60_000);
@@ -20,9 +20,9 @@ const ModelConfigSchema = z.object({
         required_error: "模型配置必须包含 role，例如 红队 / 蓝队 / 主持人",
         invalid_type_error: "模型配置 role 必须是字符串，例如 红队 / 蓝队 / 主持人",
     }).min(1).describe("角色说明，如 红队、蓝队、黑队、主持人；moderator 也必须提供 role"),
-    provider: z.enum(PROVIDERS).describe("模型来源；Windsurf/WSF 没有 sandbox_council provider，WSF 中调用本工具时仍应选择现有 provider"),
-    model: z.string().optional().describe("模型名；antigravity 可用 M132/M20/M18/M16/M36、flash、flash-medium、pro-high、sonnet、opus 等别名，也可直接传 MODEL_* 编码；旧 M37 转 M16、M47 转 M18；geminiCli 可用 auto-gemini-3/gemini-3.1-pro-preview/gemini-2.5-pro 等 Gemini CLI 模型；claudeCode 默认 sonnet；不填使用 provider 默认值"),
-    params: z.record(z.unknown()).optional().describe("供应商参数。apiKeyEnv/endpoint/headers/body 可选；claudeCode 支持 maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools；fallbackModels 可传同 provider 降级链，如 [\"gemini-3-flash\"] 或 [{\"model\":\"gemini-3.1-pro\",\"params\":{\"reasoning\":\"low\"}}]；body 只能覆盖非核心字段，不能覆盖 auth/model/input/messages/contents"),
+    provider: z.enum(PROVIDERS).describe("模型来源；grok 走本机 progrok OpenAI-compatible API；Windsurf/WSF 没有 sandbox_council provider，WSF 中调用本工具时仍应选择现有 provider"),
+    model: z.string().optional().describe("模型名；antigravity 可用 M132/M20/M18/M16/M36、flash、flash-medium、pro-high、sonnet、opus 等别名，也可直接传 MODEL_* 编码；旧 M37 转 M16、M47 转 M18；geminiCli 可用 auto-gemini-3/gemini-3.1-pro-preview/gemini-2.5-pro 等 Gemini CLI 模型；grok 默认 grok-4.5；claudeCode 默认 sonnet；不填使用 provider 默认值"),
+    params: z.record(z.unknown()).optional().describe("供应商参数。apiKeyEnv/baseUrl/endpoint/headers/body 可选；grok 可用 baseUrl/endpoint 指向 progrok、fallbackModels 或 SANDBOX_COUNCIL_GROK_MODEL_CHAIN 做显式同 provider 降级；claudeCode 支持 maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools；fallbackModels 可传同 provider 降级链，如 [\"gemini-3-flash\"] 或 [{\"model\":\"gemini-3.1-pro\",\"params\":{\"reasoning\":\"low\"}}]；body 只能覆盖非核心字段，不能覆盖 auth/model/input/messages/contents"),
     supportsVision: z.boolean().optional().describe("该模型是否支持直接接收 images"),
 });
 
@@ -67,6 +67,8 @@ const CouncilParamsShape = {
     textProjectionModel: ModelConfigSchema.optional().describe("纯文本参与者的专用转述模型；默认使用 codex 链路 gpt-5.4-mini 生成 only-text dossier"),
     background: z.boolean().optional().describe("后台模式：true=启动后立刻返回 taskId"),
     taskId: z.string().optional().describe("查询后台 sandbox_council 任务；若启动时传 ownerId，查询必须带同一个 ownerId"),
+    resume: z.boolean().optional().describe("恢复模式：true 时从 resumeTaskId 指向的旧后台任务继续，创建新的后台 taskId"),
+    resumeTaskId: z.string().optional().describe("要恢复的旧 sandbox_council 后台任务 ID；会读取旧 spec/checkpoint/transcript，不需要重新传 participants/moderator/input"),
     waitSeconds: z.number().min(1).max(300).optional().describe("查询后台任务前等待秒数"),
     ownerId: z.string().optional().describe("ownerId 任务归属 ID；后台启动和 taskId 查询必须保持一致；未传按 global 兼容旧调用"),
 };
@@ -125,6 +127,46 @@ function toRunParams(args: Record<string, unknown>, ownerId: string): CouncilRun
     };
 }
 
+const RESUME_OVERRIDE_KEYS = [
+    "participants",
+    "moderator",
+    "input",
+    "files",
+    "images",
+    "contextMode",
+    "manualContext",
+    "mode",
+    "roles",
+    "tools",
+    "maxRounds",
+    "maxToolCalls",
+    "transcriptPath",
+    "outputDir",
+    "transcriptionModel",
+    "textProjectionModel",
+    "largeInput",
+    "modelTimeoutMs",
+    "pressureModelTimeoutMs",
+] as const;
+
+function toResumeRunParams(args: Record<string, unknown>, ownerId: string): { runParams: CouncilRunParams; resumeSource: ReturnType<typeof readCouncilResumeSource> } {
+    const resumeTaskId = args.resumeTaskId as string | undefined;
+    if (!resumeTaskId) {
+        throw new Error("resume 模式需要 resumeTaskId");
+    }
+    const resumeSource = readCouncilResumeSource(resumeTaskId, ownerId);
+    const runParams: CouncilRunParams = {
+        ...resumeSource.spec.params,
+        ownerId,
+    };
+    for (const key of RESUME_OVERRIDE_KEYS) {
+        if (args[key] !== undefined) {
+            (runParams as unknown as Record<string, unknown>)[key] = args[key];
+        }
+    }
+    return { runParams, resumeSource };
+}
+
 export function registerCouncil(server: McpServer): void {
     server.tool(
         "sandbox_council",
@@ -146,10 +188,11 @@ export function registerCouncil(server: McpServer): void {
 - council 后台运行时，主线程可继续做不重叠的本地检查、读文件、构建或整理证据；等待结果后合并观点并自行验证取舍，不要重复启动相同审议
 - webSearch 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback。DuckDuckGo 默认跳过，可传 duckDuckGo=true 强制尝试
 - webFetchText 现默认优先走 Exa 或 web-fetcher，再 fallback 到轻量直抓；可做文本、HTML、链接、表格这类非视觉抽取，不做截图、不点击网页
-- provider 调用有轻量稳定性保护：antigravity 默认同源并发 2，codex 默认同源并发 2，geminiCli 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；HTTP/空输出/超时类错误会有限 retry
+- provider 调用有轻量稳定性保护：antigravity 默认同源并发 2，codex 默认同源并发 2，grok 默认同源并发 2，geminiCli 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；HTTP/空输出/超时类错误会有限 retry
 - v1.12.3 支持 params.fallbackModels：同一模型 retry 仍失败且错误可降级时，按同 provider 链路切到备用模型，例如 Claude Opus → Sonnet、Gemini Pro high → Pro low / Flash；API key 缺失、图片不支持、安全拦截、输出截断等非临时错误不会自动降级
 - Antigravity/OpenAI/Anthropic/Gemini/custom provider 的 fallbackModels 必须显式写在对应 participant/moderator 的 params 里；不会因为 model 写了 sonnet/opus 就自动选择备用模型。Antigravity 默认 GetModelResponse 链为 M132 → M20 → M18 → M16 → M36；Claude/Sonnet/Opus 不稳定时可传 params: {"retries":1,"fallbackModels":["M132","M20","M18","M16","M36"]}。复杂推理/Guard/审议类任务可显式指定 M16 或把 M16 放到自定义 fallback 前段
 - Codex provider 未显式传 fallbackModels 时默认按 gpt-5.4 high → medium → low → gpt-5.4-mini medium → low 降级，并跳过当前已使用档位；可用 SANDBOX_COUNCIL_CODEX_DEFAULT_FALLBACKS=0 关闭
+- Grok provider 可用 provider=grok；这是本机 progrok OpenAI-compatible API 路线，默认模型 grok-4.5，supportsVision=true 时支持 image_url。默认不臆造备用模型；只有显式 params.fallbackModels 或 SANDBOX_COUNCIL_GROK_MODEL_CHAIN 才启用同 provider 降级；可用 SANDBOX_COUNCIL_GROK_CONCURRENCY 覆盖同源并发
 - Gemini CLI provider 可用 provider=geminiCli；这是本地 Gemini CLI 路线，不需要 GEMINI_API_KEY，支持让 supportsVision=true 的参与者直接处理图片路径。未显式传 fallbackModels 时默认按 auto-gemini-3 → gemini-3.1-pro-preview → gemini-2.5-pro → gemini-3.1-flash-lite-preview → gemini-2.5-flash-lite → gemini-2.5-flash 降级；可用 SANDBOX_COUNCIL_GEMINI_CLI_DEFAULT_FALLBACKS=0 关闭
 - Claude Code provider 可用 provider=claudeCode；这是本地 claude CLI 路线，只在显式配置时调用，不进入 auto 或 Codex 默认 fallback。默认带小预算上限，可用 params.maxBudgetUsd/sessionId/permissionMode/timeoutMs/allowedTools/disallowedTools 覆盖；transcript 会记录实际模型与 sessionId/费用摘要
 - Windsurf/WSF 不提供 sandbox_council provider；它只能作为 MCP 客户端通过 broker 调用现有 provider，provider="windsurf" 不在 schema 中，应被拒绝
@@ -185,6 +228,30 @@ export function registerCouncil(server: McpServer): void {
                 return appendTiming({
                     content: [{ type: "text" as const, text: formatPersistentCouncilTask(task) }],
                 }, startTime);
+            }
+
+            if (args.resume || args.resumeTaskId) {
+                try {
+                    const { runParams, resumeSource } = toResumeRunParams(args, ownerId);
+                    const task = startPersistentCouncilTask(runParams, ownerId, COUNCIL_BACKGROUND_MAX_RUN_MS, resumeSource);
+                    return appendTiming({
+                        content: [{
+                            type: "text" as const,
+                            text: [
+                                "🚀 sandbox_council resume 已转入后台任务",
+                                `🆔 taskId: ${task.id}`,
+                                `🔁 resumeFrom: ${resumeSource.sourceTaskId}`,
+                                `👤 ownerId: ${task.ownerId}`,
+                                `⏳ deadlineAt: ${task.deadlineAt}`,
+                                `💡 后续用 sandbox_council(taskId="${task.id}", ownerId="${task.ownerId}", waitSeconds=45) 查询；ownerId 必须与启动时一致`,
+                            ].join("\n"),
+                        }],
+                    }, startTime);
+                } catch (err) {
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: `❌ sandbox_council resume 失败: ${err instanceof Error ? err.message : String(err)}` }],
+                    }, startTime);
+                }
             }
 
             if (args.background) {

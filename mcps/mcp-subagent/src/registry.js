@@ -1,7 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const DATA_DIR = process.env.SUBAGENT_DATA_DIR || path.resolve("subagent-data");
+const userProfile = process.env.USERPROFILE || process.env.HOME || process.cwd();
+const DATA_DIR = process.env.SUBAGENT_DATA_DIR || path.join(userProfile, ".codex-toolkit", "subagent-data");
 const REGISTRY_PATH = process.env.SUBAGENT_REGISTRY_PATH || path.join(DATA_DIR, "jobs.json");
 const LOCK_PATH = process.env.SUBAGENT_REGISTRY_LOCK_PATH || path.join(DATA_DIR, "jobs.lock");
 
@@ -170,4 +171,90 @@ export async function listJobs(filter = "active") {
   if (filter === "archived") return jobs.filter((job) => job.state === "archived" || job.state === "deleted");
   if (filter === "done") return jobs.filter((job) => ["done", "collected", "collect_failed", "timeout"].includes(job.state));
   return jobs.filter((job) => !["archived", "deleted"].includes(job.state));
+}
+
+function deletedAgeAnchor(job) {
+  return job.archive_file_deleted_at
+    || job.archived_at
+    || job.updated_at
+    || job.completed_at
+    || job.created_at;
+}
+
+export async function pruneDeletedJobs({
+  deleted_ttl_sec = 7 * 86400,
+  retain_deleted = 20,
+  max_prune_per_run = 100,
+  dry_run = false,
+} = {}) {
+  const ttlMs = Number(deleted_ttl_sec) * 1000;
+  const retain = Number(retain_deleted);
+  const maxPrune = Number(max_prune_per_run);
+  if (!Number.isFinite(ttlMs) || ttlMs < 0) {
+    throw new Error("deleted_ttl_sec must be a non-negative number");
+  }
+  const collect = (registry) => {
+    const deleted = Object.values(registry.jobs || {})
+      .filter((job) => job.state === "deleted")
+      .sort((left, right) => Date.parse(deletedAgeAnchor(right) || 0) - Date.parse(deletedAgeAnchor(left) || 0));
+    const retainedByCount = new Set(
+      Number.isFinite(retain) && retain > 0
+        ? deleted.slice(0, retain).map((job) => job.job_id)
+        : [],
+    );
+    const cutoff = Date.now() - ttlMs;
+    const candidates = deleted
+      .filter((job) => !retainedByCount.has(job.job_id))
+      .filter((job) => {
+        const anchor = Date.parse(deletedAgeAnchor(job) || "");
+        return Number.isFinite(anchor) && anchor < cutoff;
+      })
+      .slice(0, Number.isFinite(maxPrune) && maxPrune > 0 ? maxPrune : deleted.length);
+    return { deleted, retainedByCount, candidates };
+  };
+  if (dry_run) {
+    const registry = await readRegistry();
+    const { deleted, retainedByCount, candidates } = collect(registry);
+    return {
+      pruned: candidates.map((job) => {
+        const archiveRef = registry.archives?.[job.job_id] || null;
+        return {
+          job_id: job.job_id,
+          sub_cid: job.sub_cid,
+          main_id: job.main_id,
+          deleted_at: deletedAgeAnchor(job) || null,
+          archive_path: archiveRef?.archive_path || job.archive_path || null,
+        };
+      }),
+      total_deleted_before: deleted.length,
+      retained_by_count: retainedByCount.size,
+      deleted_ttl_sec: Number(deleted_ttl_sec),
+      retain_deleted: Number.isFinite(retain) ? retain : null,
+      dry_run: true,
+    };
+  }
+  return await mutateRegistry("pruneDeletedJobs", async (registry) => {
+    const { deleted, retainedByCount, candidates } = collect(registry);
+    const pruned = [];
+    for (const job of candidates) {
+      const archiveRef = registry.archives?.[job.job_id] || null;
+      pruned.push({
+        job_id: job.job_id,
+        sub_cid: job.sub_cid,
+        main_id: job.main_id,
+        deleted_at: deletedAgeAnchor(job) || null,
+        archive_path: archiveRef?.archive_path || job.archive_path || null,
+      });
+      delete registry.jobs[job.job_id];
+      if (registry.archives) delete registry.archives[job.job_id];
+    }
+    return {
+      pruned,
+      total_deleted_before: deleted.length,
+      retained_by_count: retainedByCount.size,
+      deleted_ttl_sec: Number(deleted_ttl_sec),
+      retain_deleted: Number.isFinite(retain) ? retain : null,
+      dry_run: false,
+    };
+  });
 }

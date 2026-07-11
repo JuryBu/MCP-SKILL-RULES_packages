@@ -21,11 +21,14 @@ import {
     parseMemoryFile,
     ensureDataDirs,
     writeJsonAtomic,
-    buildMemoryFile,
 } from "../store.js";
 import { indexCache } from "../cache.js";
 import { cleanOldTempFiles, TEMP_DIR } from "../temp-store.js";
-import { generateAutoSummary } from "../auto-summary.js";
+import {
+    captureAutoSummarySnapshot,
+    generateAutoSummary,
+    writeAutoSummaryIfUnchanged,
+} from "../auto-summary.js";
 import { resolveModelOnlyChainSplit, type Chain } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
@@ -596,6 +599,7 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
 
     let success = 0;
     let failed = 0;
+    let staleSkipped = 0;
 
     for (const target of targets) {
         try {
@@ -610,39 +614,37 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
             const parsed = parseMemoryFile(fileContent);
             if (!parsed) { failed++; continue; }
 
-            const summary = await generateAutoSummary(target.entry.title, target.entry.tags, parsed.body, chain);
+            const snapshot = captureAutoSummarySnapshot({
+                title: String(parsed.frontmatter.title || target.entry.title),
+                tags: Array.isArray(parsed.frontmatter.tags) ? parsed.frontmatter.tags as string[] : target.entry.tags,
+                updated: String(parsed.frontmatter.updated || ""),
+                body: parsed.body,
+            });
+            const summary = await generateAutoSummary(snapshot.title, snapshot.tags, snapshot.body, chain);
             if (!summary) { failed++; continue; }
 
-            // 重建文件
-            const fm = parsed.frontmatter;
-            const newFm: any = {
-                id: String(fm.id || target.entry.id),
-                title: String(fm.title || target.entry.title),
-                tags: Array.isArray(fm.tags) ? fm.tags : target.entry.tags,
-                category: String(fm.category || "general"),
-                created: String(fm.created || new Date().toISOString()),
-                updated: String(fm.updated || new Date().toISOString()),
-                workspace: String(fm.workspace || "general"),
-                conversationId: fm.conversationId ? String(fm.conversationId) : undefined,
-                searchSummary: String(fm.searchSummary || ""),
-                autoSummary: summary,
-                pinned: fm.pinned === true ? true : undefined,
-            };
+            const writeResult = await writeAutoSummaryIfUnchanged({
+                hash: target.hash,
+                memoryId: target.entry.id,
+                summary,
+                expectedFingerprint: snapshot.fingerprint,
+                fallbackTitle: snapshot.title,
+                fallbackTags: snapshot.tags,
+            });
 
-            const newContent = buildMemoryFile(newFm, parsed.body);
-            fs.writeFileSync(filePath, newContent, "utf-8");
-
-            // 更新索引
-            const wsIndex = readWorkspaceIndex(target.hash);
-            const indexEntry = wsIndex.entries.find(e => e.id === target.entry.id);
-            if (indexEntry) {
-                indexEntry.autoSummary = summary;
-                indexEntry.sizeBytes = Buffer.byteLength(newContent, "utf-8");
+            if (writeResult === "written") {
+                success++;
+                console.error(`[memory-store] enhance: ${target.entry.id} ✅`);
+                continue;
             }
-            writeWorkspaceIndex(target.hash, wsIndex);
 
-            success++;
-            console.error(`[memory-store] enhance: ${target.entry.id} ✅`);
+            if (writeResult === "stale" || writeResult === "missing" || writeResult === "existing") {
+                staleSkipped++;
+                console.error(`[memory-store] enhance: ${target.entry.id} skipped (${writeResult})`);
+                continue;
+            }
+
+            failed++;
         } catch {
             failed++;
         }
@@ -651,7 +653,7 @@ async function handleEnhance(workspace?: string, chain: Chain = "auto") {
     return {
         content: [{
             type: "text" as const,
-            text: `🔄 增强完成: 成功 ${success} / 跳过 ${skipped} (已有) / 失败 ${failed}`,
+            text: `🔄 增强完成: 成功 ${success} / 跳过 ${skipped} (已有) / 过期跳过 ${staleSkipped} / 失败 ${failed}`,
         }],
     };
 }

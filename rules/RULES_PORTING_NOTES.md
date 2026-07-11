@@ -18,14 +18,12 @@
 - Sender-specific absolute paths.
 - Private memory, local project paths, and historical private workspace references where they would identify the sender.
 - sender-specific project branding.
-- API key material and private broker env contents.
+- Credential material, private broker settings, and runtime environment details.
 
 ## Receiver Must Adjust
 
 - Personal speaking style and identity details.
-- Real MCP config paths for their host apps.
-- Whether Claude Code fallback is allowed automatically; default recommendation is explicit-only to avoid hidden CC quota use.
-- Windsurf global rules location and whether `dataChain=windsurf` should be enabled for local Cascade history.
-- Whether the receiver wants to enable the Windsurf-only `mcp-subagent`; if yes, run its dry-run, backup, apply, validation, and rollback flow locally instead of blindly copying the sender's broker/config state.
-- Exa URL/API key location. Keep it in private local env/config, never in package files.
-- Any model names unavailable on the receiver machine.
+- Real host configuration paths and installed MCP capabilities.
+- Whether model fallback, cross-chain routing, and Windsurf-only automation are enabled locally.
+- Which search provider, models, and background-task limits are available in the receiver's environment.
+- Local authorization and credential storage; keep it outside package files.

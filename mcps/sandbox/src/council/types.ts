@@ -5,6 +5,7 @@ export type CouncilProvider =
     | "anthropic"
     | "gemini"
     | "geminiCli"
+    | "grok"
     | "claudeCode"
     | "customOpenAICompatible";
 
@@ -140,6 +141,24 @@ export interface CouncilTranscript {
     jsonPath?: string;
 }
 
+export type CouncilCheckpointPhase = "prepared" | "participants" | "moderator" | "round_complete";
+
+export interface CouncilCheckpoint {
+    taskId?: string;
+    transcriptId: string;
+    currentRound: number;
+    lastCompletedRound: number;
+    phase: CouncilCheckpointPhase;
+    roundComplete: boolean;
+    updatedAt: string;
+}
+
+export interface CouncilResumeState {
+    sourceTaskId: string;
+    checkpoint: CouncilCheckpoint;
+    transcript: CouncilTranscript;
+}
+
 export interface CouncilRunParams {
     participants: CouncilModelConfig[];
     moderator: CouncilModelConfig;
@@ -160,6 +179,8 @@ export interface CouncilRunParams {
     largeInput?: CouncilLargeInputConfig;
     modelTimeoutMs?: number;
     pressureModelTimeoutMs?: number;
+    checkpointPath?: string;
+    resumeState?: CouncilResumeState;
     ownerId?: string;
     onProgress?: (progress: string) => void;
 }

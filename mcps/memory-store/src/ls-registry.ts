@@ -29,9 +29,9 @@ interface Registry {
 
 // ===== 路径 =====
 
-const REGISTRY_DIR = process.env.MEMORY_STORE_DATA_ROOT
+const DEFAULT_REGISTRY_DIR = process.env.MEMORY_STORE_DATA_ROOT
     || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
-const DEFAULT_REGISTRY_PATH = path.join(REGISTRY_DIR, "ls-registry.json");
+const DEFAULT_REGISTRY_PATH = path.join(DEFAULT_REGISTRY_DIR, "ls-registry.json");
 
 /** 测试注入的注册表路径覆盖（null=用真实路径） */
 let registryPathOverride: string | null = null;

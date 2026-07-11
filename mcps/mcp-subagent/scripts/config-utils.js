@@ -1,35 +1,22 @@
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 
-const homeDir = os.homedir();
-
 export const projectRoot = path.resolve(import.meta.dirname, "..");
+export const userProfile = process.env.USERPROFILE || process.env.HOME || projectRoot;
 export const serverEntry = path.join(projectRoot, "src", "index.js");
-export const dataDir = process.env.SUBAGENT_DATA_DIR
-  || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(homeDir, ".codex-toolkit"), "mcp-subagent");
+export const dataDir = process.env.SUBAGENT_DATA_DIR || path.join(userProfile, ".codex-toolkit", "subagent-data");
 
 export const defaults = {
   key: process.env.WSF_SUBAGENT_KEY || "subagent",
-  route: process.env.WSF_SUBAGENT_BROKER_ROUTE || "http://127.0.0.1:14588/subagent/mcp",
-  brokerConfig: process.env.WSF_BROKER_CONFIG || path.join(homeDir, ".gemini", "antigravity", "mcp_config.json"),
-  windsurfConfig: process.env.WSF_CONFIG || path.join(homeDir, ".codeium", "windsurf", "mcp_config.json"),
+  windsurfConfig: process.env.WSF_CONFIG || path.join(userProfile, ".codeium", "windsurf", "mcp_config.json"),
 };
 
 export function parseArgs(argv) {
-  const args = {
-    apply: false,
-    target: "both",
-    fallback: "broker",
-    backup: null,
-  };
+  const args = { apply: false, backup: null };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--apply") args.apply = true;
     else if (arg === "--dry-run") args.apply = false;
-    else if (arg === "--target") args.target = argv[++index] || args.target;
-    else if (arg === "--stdio-fallback") args.fallback = "stdio";
-    else if (arg === "--broker") args.fallback = "broker";
     else if (arg === "--backup") args.backup = argv[++index] || null;
     else if (arg === "--help" || arg === "-h") args.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
@@ -84,12 +71,6 @@ export function commandEntry() {
       SUBAGENT_IDLE_TTL_SEC: process.env.SUBAGENT_IDLE_TTL_SEC || "86400",
     },
     disabled: false,
-  };
-}
-
-export function brokerReferenceEntry() {
-  return {
-    serverUrl: defaults.route,
   };
 }
 

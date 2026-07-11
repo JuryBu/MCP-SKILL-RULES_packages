@@ -130,7 +130,7 @@ You are producing plain text that will later be styled by the CLI. Follow these 
 
 **Monospace**: Wrap all commands, file paths, env vars, and code identifiers in backticks. Never mix monospace and bold markers.
 
-**File References**: Use inline code to make file paths clickable. Do not use URIs like file://, vscode://, or https://.
+**File References**: Use inline code to make file paths clickable. Do not use URI schemes for local or remote links.
 
 **Structure**: Place related bullets together. Order sections from general → specific → supporting info.
 

@@ -2,11 +2,32 @@
 // 由 record-generator.ts 拆分而来（E2-B2），纯结构搬运、零行为变更。
 import type { ConversationRound } from "./trajectory.js";
 import type { Chain } from "./chain.js";
+import type { GrokExecDiagnostics } from "./grok-client.js";
 
 export interface RecordModelCallResult {
     text: string | null;
     error?: string;
     timedOut?: boolean;
+    cancelled?: boolean;
+    chainUsed?: Chain | null;
+    modelUsed?: string | null;
+    grokDiagnostics?: GrokExecDiagnostics;
+}
+
+export type RecordAbortReason = "cancelled" | "settled";
+
+export class RecordGenerationAbortedError extends Error {
+    readonly reason: RecordAbortReason;
+
+    constructor(reason: RecordAbortReason, message?: string) {
+        super(message || (reason === "cancelled" ? "Record 更新已取消" : "后台任务已结算，停止后续 Record 生成"));
+        this.name = "RecordGenerationAbortedError";
+        this.reason = reason;
+    }
+}
+
+export function isRecordGenerationAbortedError(error: unknown): error is RecordGenerationAbortedError {
+    return error instanceof RecordGenerationAbortedError;
 }
 
 export interface FormattedRecordRound {
@@ -42,13 +63,23 @@ export interface RecordPatchCheckpoint {
     status: "done" | "failed" | "timeout" | "invalid";
     conversationId: string;
     workspace: string;
+    requestedChain: Chain;
     modelChain: Chain;
+    modelName: string;
+    grokContext?: string;
     startRound: number;
     endRound: number;
     promptHash: string;
     savedAt: string;
     patch?: RecordPatch;
     error?: string;
+}
+
+export interface RecordCheckpointScope {
+    requestedChain: Chain;
+    modelChain: Chain;
+    modelName: string;
+    grokContext?: string;
 }
 
 export interface ParsedRecordPhase {
@@ -115,13 +146,21 @@ export interface GenerateRecordResult {
     pipeline?: "serial" | "parallel";
     upToDate?: boolean;
     warnings?: string[];
+    modelChainsUsed?: Chain[];
+    modelModelsUsed?: string[];
+    grokDiagnostics?: GrokExecDiagnostics;
+    aborted?: boolean;
+    abortReason?: RecordAbortReason;
 }
 
 export interface GenerateRecordOptions {
     background?: boolean;
+    trafficClass?: "foreground" | "record-batch";
     allowClaudeCodeFallback?: boolean;
     parallelMode?: RecordParallelMode;
     force?: boolean;
+    isCancelled?: () => boolean;
+    isSettled?: () => boolean;
     onProgress?: (progress: {
         stage?: string;
         detail?: string;

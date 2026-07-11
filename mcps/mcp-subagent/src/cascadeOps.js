@@ -13,6 +13,7 @@ const WRITE_METHODS = new Set([
   "MoveQueuedMessage",
   "RenameCascadeTrajectory",
   "CancelCascadeInvocationAndWait",
+  "ArchiveCascadeTrajectory",
   "DeleteCascadeTrajectory",
 ]);
 
@@ -138,6 +139,13 @@ export async function renameCascade(mainId, cascadeId, name) {
   return await lsCall(mainId, "RenameCascadeTrajectory", {
     cascadeId,
     name,
+  });
+}
+
+export async function archiveCascadeTrajectory(mainId, cascadeId, isArchived = true) {
+  return await lsCall(mainId, "ArchiveCascadeTrajectory", {
+    cascadeId,
+    isArchived,
   });
 }
 

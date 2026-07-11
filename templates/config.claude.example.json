@@ -11,10 +11,6 @@
     "sandbox": {
       "type": "http",
       "url": "http://127.0.0.1:14588/sandbox/mcp"
-    },
-    "exa": {
-      "type": "http",
-      "url": "http://127.0.0.1:14588/exa/mcp"
     }
   }
 }

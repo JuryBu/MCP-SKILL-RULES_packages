@@ -1,52 +1,36 @@
-# Package Manifest（2026-7-4）
+# Package Manifest（2026-07-11）
 
-Included:
+## Included
 
-- `mcps/memory-store` source-only portable MCP (`1.17.1`)
-- `mcps/web-fetcher` source-only portable MCP (`7.0.0`)
-- `mcps/sandbox` source-only portable MCP (`1.13.7`)
-- `mcps/broker` portable HTTP broker (`0.1.0`)
-- `mcps/mcp-subagent` source-only Windsurf-only optional MCP (`0.0.1`)
-- `templates/config.codex.toml`
-- `templates/config.antigravity.example.json`
-- `templates/config.claude.example.json`
-- `templates/config.windsurf.example.json`
-- `templates/config.windsurf.subagent.example.json`
-- `templates/env.example.ps1`
-- `rules/codex/AGENTS.template.md`
-- `rules/codex/system-prompt.template.md`
-- `rules/antigravity/GEMINI.template.md`
-- `rules/claude-code/CLAUDE.template.md`
-- `rules/windsurf/Windsurf_Global_Rules.template.md`
-- `rules/README_RULES.md`
-- `rules/RULES_PORTING_NOTES.md`
-- `skills/README_SKILLS.md`
-- `skills/skills_manifest.md`
-- `skills/<portable user skill folders>`
-- `install/*.ps1`
-- `design-tests/*`
+| Area | Contents |
+| --- | --- |
+| MCP | memory-store 1.19.3, web-fetcher 7.0.0, sandbox 1.14.0, broker 0.1.0 |
+| Optional MCP | Windsurf-only mcp-subagent 1.1.0 |
+| Rules | Codex, Antigravity, Claude Code, Windsurf global + five system fragments |
+| Skills | 16 allow-listed portable user skills plus manifest |
+| Setup | PowerShell build, broker, config, validation, and packaging scripts |
+| Templates | Four host configs and receiver-private environment example |
+| Tests | HTTP smoke helper, local pages, memory workspace, expected results |
 
-Updated in this snapshot:
+## 2026-07-11 Changes
 
-- 2026-07-04: refreshed changed MCP sources and rules templates; `memory-store` is now `1.17.1`, `sandbox` is now `1.13.7`, broker portability patches plus request timeout forwarding were retained, and `mcp-subagent` remains Windsurf-only optional.
-- 2026-07-04: refreshed Claude Code and Windsurf rule deltas, rechecked Codex / Antigravity templates, then scrubbed personal info, account links, login-state claims, and sender-specific paths.
+- memory-store upgraded from 1.17.1 to 1.19.3 with Grok model routing, split data/model chains, adaptive concurrency, background recovery, Record coordination, stable task status, and expanded Conversation / Stage Guard workflows.
+- sandbox upgraded from 1.13.7 to 1.14.0 with ProGrok model bridge, Grok Council provider, vision input, provider concurrency, smarter search stages, and stronger background lifecycle behavior.
+- web-fetcher kept version 7.0.0 and synchronized the current interaction and pipeline behavior.
+- broker added dynamic long-call timeout forwarding, a 30-minute default cap, reliable shutdown state writes, and a portable Exa stateless bridge.
+- Windsurf-only subagent upgraded from 0.0.1 to 1.1.0; cross-client broker patch and handoff scripts were removed from the public package.
+- Windsurf Rules changed from one large template to a short global rule plus `tools`, `memory`, `collaboration`, `efficiency`, and `rendering` system fragments.
+- Package validation now verifies Skills, Rules, config templates, forbidden runtime files, credential-shaped text, and absolute user paths.
+- Added `install/New-PortableToolkitPackage.ps1` to create a verified directory, zip, and SHA256 without omitting Skills.
 
-- Skills rechecked on 2026-07-04: allow-listed portable user-side skills copied from `%USERPROFILE%/.codex/skills`, excluding `.system`, plugin cache, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, and generated test artifacts.
+## Excluded
 
-- `memory-store` refreshed to `1.17.1` with query parsing, relevance scoring, tool concurrency, WSF Cascade routing, and local fallback sources.
-- `sandbox` refreshed to `1.13.7` with SSRF / shell injection hardening, batch/launch/session lifecycle fixes, background abort, and per-task registry.
-- `web-fetcher` rechecked against the current local `7.0.0` tree; no functional source change was needed, and portable README examples were kept scrubbed.
-- Codex / Antigravity / Claude Code / Windsurf rules refreshed or rechecked from current local templates, then all rules privacy-scrubbed.
-- Four-host wording remains Antigravity + Codex + Claude Code / CC + Windsurf / WSF with shared data and broker routing.
+上游开发仓库中依赖本机 fixture、登录态或宿主内部数据的单元测试不属于分发内容。公开包保留 `npm run test:portable` 构建验证、HTTP smoke test（基础功能验证测试）和页面样例。
 
-Excluded:
-
-- `.system/` skills, plugin cache skills, restrictive-license Office skills (`docx`, `pptx`, `xlsx`), and unlicensed `doc-coauthoring`
-- `node_modules/`, `dist/`, build caches, `__pycache__`, generated skill test outputs
-- `mcps/mcp-subagent/subagent-data`, Cascade child job registry, audit logs, archive exports, generated handoff zips, and built `dist/`
-- `.git/`, editor state, temp folders
-- API keys, auth files, cookies, browser profiles
-- real memory-store data and Record files
-- Codex / Antigravity / Claude Code / Windsurf sessions
-- SQLite databases, logs, JSONL histories
-- sender-specific paths, birthday, account links, sender-specific project branding
+- API keys, private remote URLs, credentials, cookies, browser profiles, localStorage, sessions, auth files
+- Real memory-store data, Records, conversations, workspaces, Cascade registries, archives
+- SQLite / DB / JSONL files, logs, HAR files, state and PID files
+- `node_modules`, `dist`, build output, coverage, test profiles, cache, temp, backup files
+- Sender-specific identity, account links, paths, project history, model quota claims
+- Codex `.system` skills, plugin cache skills, and skills whose local licenses do not allow redistribution
+- ProGrok binaries, configuration, upstream account, and private proxy environment

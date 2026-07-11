@@ -106,6 +106,15 @@ export type ExtraType = "thinking" | "tool_results" | "code_actions" | "code_dif
 export type Depth = "brief" | "normal" | "full";
 export type CompactionMode = "folded" | "full" | "omit";
 export type ConversationMessageRole = "user" | "system" | "model" | "assistant" | "tool";
+export type FormatRoundForMessageRolesOptions = {
+    deadlineAt?: number;
+    shouldAbort?: () => boolean;
+    onBudgetExceeded?: () => void;
+};
+export type FormatRoundForMessageRolesBudgetResult = {
+    text: string;
+    budgetExceeded: boolean;
+};
 
 // ===== Trajectory 解析 =====
 
@@ -248,8 +257,12 @@ function thinkingSummaryLabel(thinking: string): string {
         : `💭 思考 (${thinking.length}字)`;
 }
 
+function formatAiHeading(stepIndex: number): string {
+    return Number.isFinite(stepIndex) ? `### 🤖 AI (step ${stepIndex})` : "### 🤖 AI";
+}
+
 /**
- * 渲染单条附件为一行 markdown / 文本（从 formatRound 原内联逻辑搬出，行为逐字节一致）。
+ * 渲染单条附件为一行 markdown / 文本（从 formatRound 原内联逻辑搬出，保持输出兼容）。
  * attachmentMode==="markdown" 时输出 `![]()` / `[]()`，否则输出纯路径。
  */
 function renderAttachmentLine(
@@ -300,9 +313,9 @@ function renderAiResponseLines(
 ): void {
     const showThinking = Boolean(ai.thinking) && (depth === "full" || extraTypes.includes("thinking"));
     // 空 step 抑制（问题2）：AI step 既无正文、也无可显示的思考 → 不输出空标题。
-    // 该 step 的工具调用作为独立事件单独渲染并带 step 号，时序与语义不丢。仅 export interleave 路径生效，不影响 read/search。
+    // 该 step 的工具调用仍作为独立事件按 step 号渲染，时序与语义不丢。
     if (!ai.response && !showThinking) return;
-    lines.push(`### 🤖 AI (step ${ai.stepIndex})`);
+    lines.push(formatAiHeading(ai.stepIndex));
     if (ai.response) {
         lines.push(depth === "brief" ? truncate(ai.response, 100) : ai.response);
     }
@@ -316,7 +329,7 @@ function renderAiResponseLines(
     lines.push("");
 }
 
-/** 渲染单条工具调用（非 brief）。与旧分支单行格式逐字节一致。 */
+/** 渲染单条工具调用（非 brief），保持旧分支的单行输出格式。 */
 function renderToolCallLine(lines: string[], tc: ToolCallInfo, depth: Depth, extraTypes: ExtraType[]): void {
     let line = `- ${tc.name}`;
     if (depth === "full" || extraTypes.includes("tool_results")) {
@@ -406,12 +419,11 @@ export function formatRound(
             }
         }
     }
-    // 严格门控（蓝图冲突1/2 裁决）：仅 export 的 markdown 且非 brief 走交错时间线，
-    // read/search/guard/record/brief 一律走旧分支，逐字节不变。
+    // 附件渲染分支：markdown normal/full 将附件纳入时间线；其它输出保持既有附件布局。
     const interleave = options.attachmentMode === "markdown" && depth !== "brief";
 
     if (!interleave) {
-        // ===== 旧路径：read/search/guard/record/brief，逐字节不变 =====
+        // 非附件时间线分支：normal/full 的 AI 与工具仍按 stepIndex 交替渲染。
         if (round.attachments?.length) {
             for (const attachment of round.attachments) {
                 const label = attachment.kind === "image" ? "图片" : "文件";
@@ -449,30 +461,12 @@ export function formatRound(
         }
         lines.push("");
 
-        // AI 回复
-        for (const ai of round.aiResponses) {
-            lines.push(`### 🤖 AI (step ${ai.stepIndex})`);
-            if (depth === "brief") {
-                lines.push(truncate(ai.response, 100));
-            } else {
-                lines.push(ai.response);
+        // AI 回复 + 工具调用：按 stepIndex 交替渲染
+        if (depth === "brief") {
+            for (const ai of round.aiResponses) {
+                renderAiResponseLines(lines, ai, depth, extraTypes);
             }
-
-            // thinking
-            if (ai.thinking && (depth === "full" || extraTypes.includes("thinking"))) {
-                lines.push("");
-                lines.push(`<details><summary>${thinkingSummaryLabel(ai.thinking)}</summary>`);
-                lines.push("");
-                lines.push(ai.thinking);
-                lines.push("</details>");
-            }
-
-            lines.push("");
-        }
-
-        // 工具调用
-        if (round.toolCalls.length > 0) {
-            if (depth === "brief") {
+            if (round.toolCalls.length > 0) {
                 const names = round.toolCalls.map((tc) => tc.name);
                 const unique = [...new Set(names)];
                 const counts = unique.map(n => {
@@ -480,23 +474,41 @@ export function formatRound(
                     return c > 1 ? `${n} ×${c}` : n;
                 });
                 lines.push(`🔧 工具: ${counts.join(", ")}`);
-            } else {
-                lines.push("#### 🔧 工具调用");
-                for (const tc of round.toolCalls) {
-                    let line = `- ${tc.name}`;
-                    if (depth === "full" || extraTypes.includes("tool_results")) {
-                        line += `(${tc.argsSummary})`;
-                        if (tc.resultSummary) {
-                            line += ` → ${truncate(tc.resultSummary, depth === "full" ? 500 : 200)}`;
-                        }
+                lines.push("");
+            }
+        } else {
+            type Ev = { step: number; seq: number; isTool: boolean; render: (l: string[]) => void };
+            const events: Ev[] = [];
+            let seq = 0;
+            const SENTINEL = round.endStep + 1_000_000;
+            const safeStep = (s: number) => (Number.isFinite(s) ? s : SENTINEL);
+            for (const ai of round.aiResponses) {
+                events.push({ step: safeStep(ai.stepIndex), seq: seq++, isTool: false, render: (l) => renderAiResponseLines(l, ai, depth, extraTypes) });
+            }
+            for (const tc of round.toolCalls) {
+                events.push({ step: safeStep(tc.stepIndex), seq: seq++, isTool: true, render: (l) => renderToolCallLine(l, tc, depth, extraTypes) });
+            }
+            events.sort((a, b) => a.step - b.step || a.seq - b.seq);
+            let prevToolStep: number | null = null;
+            for (const ev of events) {
+                if (ev.isTool) {
+                    if (prevToolStep !== ev.step) {
+                        lines.push(`#### 🔧 工具调用 (step ${Number.isFinite(ev.step) && ev.step < SENTINEL ? ev.step : "?"})`);
+                        prevToolStep = ev.step;
                     }
-                    lines.push(line);
+                    ev.render(lines);
+                } else {
+                    if (prevToolStep !== null) {
+                        lines.push("");
+                        prevToolStep = null;
+                    }
+                    ev.render(lines);
                 }
             }
-            lines.push("");
+            if (prevToolStep !== null) lines.push("");
         }
     } else {
-        // ===== 新路径：export normal/full，按 stepIndex 交错时间线 =====
+        // 附件时间线分支：markdown normal/full 将附件与事件按 stepIndex 交错渲染。
         const buckets = bucketAttachmentsByStep(round);
 
         // 用户段附件：用户桶 + legacy 桶（紧跟用户消息，在事件流之前）。
@@ -660,7 +672,7 @@ function isSystemLikeRound(round: ConversationRound): boolean {
     if (round.compactionSummaries?.length) return true;
     const text = (round.userMessage || "").trimStart();
     return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
-        || text.startsWith("# AGENTS.md instructions for ")
+        || text.startsWith("# AGENTS.md instructions")
         || text.startsWith("[Claude Code compact summary folded")
         || text.includes("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
 }
@@ -671,8 +683,71 @@ export function formatRoundForMessageRoles(
     extraTypes: ExtraType[],
     roles: Set<ConversationMessageRole>,
     compactionMode: CompactionMode,
-): string {
-    if (roles.size === 0) return formatRound(round, depth, extraTypes, { compactionMode });
+): string;
+export function formatRoundForMessageRoles(
+    round: ConversationRound,
+    depth: Depth,
+    extraTypes: ExtraType[],
+    roles: Set<ConversationMessageRole>,
+    compactionMode: CompactionMode,
+    options: FormatRoundForMessageRolesOptions,
+): FormatRoundForMessageRolesBudgetResult;
+export function formatRoundForMessageRoles(
+    round: ConversationRound,
+    depth: Depth,
+    extraTypes: ExtraType[],
+    roles: Set<ConversationMessageRole>,
+    compactionMode: CompactionMode,
+    options?: FormatRoundForMessageRolesOptions,
+): string | FormatRoundForMessageRolesBudgetResult {
+    const budgetState = {
+        exceeded: false,
+        notified: false,
+        warningAppended: false,
+    };
+    const hasSoftBudget = Boolean(options?.shouldAbort) || Number.isFinite(options?.deadlineAt);
+    const markBudgetExceeded = (): void => {
+        if (budgetState.exceeded) return;
+        budgetState.exceeded = true;
+        if (!budgetState.notified) {
+            budgetState.notified = true;
+            options?.onBudgetExceeded?.();
+        }
+    };
+    const isBudgetExceeded = (): boolean => {
+        if (!options) return false;
+        if (budgetState.exceeded) return true;
+        if (options.shouldAbort?.()) {
+            markBudgetExceeded();
+            return true;
+        }
+        if (Number.isFinite(options.deadlineAt) && Date.now() >= Number(options.deadlineAt)) {
+            markBudgetExceeded();
+            return true;
+        }
+        return false;
+    };
+    const pushLine = (lines: string[], line: string): boolean => {
+        if (isBudgetExceeded()) return false;
+        lines.push(line);
+        return true;
+    };
+    const appendBudgetWarning = (lines: string[]): void => {
+        if (!budgetState.exceeded || budgetState.warningAppended || lines.length === 0) return;
+        budgetState.warningAppended = true;
+        lines.push("");
+        lines.push("⚠️ 当前轮次格式化达到时间预算，剩余内容未展开");
+    };
+    const finalizeResult = (text: string): string | FormatRoundForMessageRolesBudgetResult => {
+        if (!options) return text;
+        return { text, budgetExceeded: budgetState.exceeded || isBudgetExceeded() };
+    };
+
+    if (roles.size === 0) {
+        if (!options) return formatRound(round, depth, extraTypes, { compactionMode });
+        if (isBudgetExceeded()) return finalizeResult("");
+        return finalizeResult(formatRound(round, depth, extraTypes, { compactionMode }));
+    }
 
     const systemLike = isSystemLikeRound(round);
     const includeUser = roles.has("user") && !systemLike;
@@ -686,81 +761,89 @@ export function formatRoundForMessageRoles(
         || round.subagentSummaries.length > 0;
 
     if (!includeUser && !includeSystem && !(includeModel && round.aiResponses.length > 0) && !(includeTool && hasToolLike)) {
-        return "";
+        return finalizeResult("");
     }
 
-    const lines: string[] = [`## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`];
+    const lines: string[] = [];
+    pushLine(lines, `## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`);
 
     if (includeUser || includeSystem) {
-        lines.push(includeSystem
+        if (!pushLine(lines, includeSystem
             ? `### 🧩 系统/压缩内容 (step ${round.startStep})`
-            : `### 👤 用户 (step ${round.startStep})`);
+            : `### 👤 用户 (step ${round.startStep})`)) {
+            appendBudgetWarning(lines);
+            return finalizeResult(lines.join("\n").trimEnd());
+        }
         if (round.compactionSummaries?.length) {
             for (const item of round.compactionSummaries) {
                 const meta = `chars=${item.summaryChars}, sha256=${item.summarySha256.slice(0, 12)}`;
                 if (compactionMode === "full" || depth === "full") {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
-                    lines.push("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
-                    lines.push(truncateForRoleView(item.text, depth));
-                    lines.push("<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>");
+                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`)) break;
+                    if (!pushLine(lines, "<<<CLAUDE_CODE_COMPACT_SUMMARY>>>")) break;
+                    if (!pushLine(lines, truncateForRoleView(item.text, depth))) break;
+                    if (!pushLine(lines, "<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>")) break;
                 } else if (compactionMode === "omit") {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要已省略（${meta}）`);
+                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要已省略（${meta}）`)) break;
                 } else {
-                    lines.push(`🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`);
-                    lines.push("说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。");
+                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`)) break;
+                    if (!pushLine(lines, "说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。")) break;
                 }
             }
-        } else {
-            lines.push(truncateForRoleView(round.userMessage, depth));
+        } else if (!pushLine(lines, truncateForRoleView(round.userMessage, depth))) {
+            appendBudgetWarning(lines);
+            return finalizeResult(lines.join("\n").trimEnd());
         }
-        if (includeUser && round.attachments?.length) {
+        if (!budgetState.exceeded && includeUser && round.attachments?.length) {
             for (const attachment of round.attachments) {
                 const label = attachment.kind === "image" ? "图片" : "文件";
                 const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
-                lines.push(`📎 ${label}: ${target}`);
+                if (!pushLine(lines, `📎 ${label}: ${target}`)) break;
             }
         }
-        if (includeUser && round.mediaAttachments.length > 0) {
-            for (const uri of round.mediaAttachments) lines.push(`📎 图片: ${uri}`);
+        if (!budgetState.exceeded && includeUser && round.mediaAttachments.length > 0) {
+            for (const uri of round.mediaAttachments) {
+                if (!pushLine(lines, `📎 图片: ${uri}`)) break;
+            }
         }
-        lines.push("");
+        if (!budgetState.exceeded) pushLine(lines, "");
     }
 
-    // 修正 A：当同时请求 model + tool 角色时，按 stepIndex 把 AI 回复与工具调用归并成一条
-    // 时间线，避免「AI 全渲完再渲所有工具」导致的时序错乱与空 step。空 response 的 AI step
-    // 不单独出空文本行（与其工具合并成一个 step 块）。单角色（只 model 或只 tool）维持分段。
     const mergeAiTool = includeModel && includeTool;
 
-    const renderAiBlock = (ai: ConversationRound["aiResponses"][number]): void => {
-        lines.push(`### 🤖 AI (step ${ai.stepIndex})`);
-        if (ai.response) lines.push(truncateForRoleView(ai.response, depth));
+    const renderAiBlock = (ai: ConversationRound["aiResponses"][number]): boolean => {
+        const showThinking = Boolean(ai.thinking) && (depth === "full" || extraTypes.includes("thinking"));
+        if (!ai.response && !showThinking) return true;
+        if (!pushLine(lines, formatAiHeading(ai.stepIndex))) return false;
+        if (ai.response && !pushLine(lines, truncateForRoleView(ai.response, depth))) return false;
         if (ai.thinking && (depth === "full" || extraTypes.includes("thinking"))) {
-            lines.push("");
-            lines.push(`<details><summary>${thinkingSummaryLabelForRoleView(ai.thinking)}</summary>`);
-            lines.push("");
-            lines.push(ai.thinking);
-            lines.push("</details>");
+            if (!pushLine(lines, "")) return false;
+            if (!pushLine(lines, `<details><summary>${thinkingSummaryLabelForRoleView(ai.thinking)}</summary>`)) return false;
+            if (!pushLine(lines, "")) return false;
+            if (!pushLine(lines, ai.thinking)) return false;
+            if (!pushLine(lines, "</details>")) return false;
         }
-        lines.push("");
+        return pushLine(lines, "");
     };
 
-    const renderToolLine = (tc: ConversationRound["toolCalls"][number]): void => {
+    const renderToolLine = (tc: ConversationRound["toolCalls"][number]): boolean => {
         let line = `- ${tc.name}`;
         if (depth === "full" || extraTypes.includes("tool_results")) {
             line += `(${tc.argsSummary})`;
             if (tc.resultSummary) line += ` → ${truncateForRoleView(tc.resultSummary, depth === "full" ? "normal" : depth)}`;
         }
-        lines.push(line);
+        return pushLine(lines, line);
     };
 
-    if (mergeAiTool) {
-        type Ev = { step: number; seq: number; isTool: boolean; render: () => void };
+    if (!budgetState.exceeded && (mergeAiTool || includeTool)) {
+        type Ev = { step: number; seq: number; isTool: boolean; render: () => boolean };
         const events: Ev[] = [];
         let seq = 0;
         const SENTINEL = round.endStep + 1_000_000;
         const safeStep = (s: number) => (Number.isFinite(s) ? s : SENTINEL);
-        for (const ai of round.aiResponses) {
-            events.push({ step: safeStep(ai.stepIndex), seq: seq++, isTool: false, render: () => renderAiBlock(ai) });
+        if (includeModel) {
+            for (const ai of round.aiResponses) {
+                events.push({ step: safeStep(ai.stepIndex), seq: seq++, isTool: false, render: () => renderAiBlock(ai) });
+            }
         }
         for (const tc of round.toolCalls) {
             events.push({ step: safeStep(tc.stepIndex), seq: seq++, isTool: true, render: () => renderToolLine(tc) });
@@ -768,52 +851,70 @@ export function formatRoundForMessageRoles(
         events.sort((a, b) => a.step - b.step || a.seq - b.seq);
         let prevToolStep: number | null = null;
         for (const ev of events) {
+            if (budgetState.exceeded) break;
             if (ev.isTool) {
                 if (prevToolStep !== ev.step) {
-                    lines.push(`#### 🔧 工具调用 (step ${Number.isFinite(ev.step) && ev.step < SENTINEL ? ev.step : "?"})`);
+                    if (!pushLine(lines, `#### 🔧 工具调用 (step ${Number.isFinite(ev.step) && ev.step < SENTINEL ? ev.step : "?"})`)) break;
                     prevToolStep = ev.step;
                 }
-                ev.render();
+                if (!ev.render()) break;
             } else {
-                if (prevToolStep !== null) { lines.push(""); prevToolStep = null; }
-                ev.render();
+                if (prevToolStep !== null) {
+                    if (!pushLine(lines, "")) break;
+                    prevToolStep = null;
+                }
+                if (!ev.render()) break;
             }
         }
-        if (prevToolStep !== null) lines.push("");
-    } else if (includeModel) {
-        for (const ai of round.aiResponses) renderAiBlock(ai);
-    } else if (includeTool && round.toolCalls.length > 0) {
-        lines.push("#### 🔧 工具调用");
-        for (const tc of round.toolCalls) renderToolLine(tc);
-        lines.push("");
+        if (!budgetState.exceeded && prevToolStep !== null) pushLine(lines, "");
+    } else if (!budgetState.exceeded && includeModel) {
+        for (const ai of round.aiResponses) {
+            if (!renderAiBlock(ai)) break;
+        }
+    } else if (!budgetState.exceeded && includeTool && round.toolCalls.length > 0) {
+        if (pushLine(lines, "#### 🔧 工具调用")) {
+            for (const tc of round.toolCalls) {
+                if (!renderToolLine(tc)) break;
+            }
+            if (!budgetState.exceeded) pushLine(lines, "");
+        }
     }
 
-    if (includeTool) {
+    if (!budgetState.exceeded && includeTool) {
         if (round.taskBoundaries.length > 0 && depth !== "brief") {
             const latest = round.taskBoundaries[round.taskBoundaries.length - 1];
-            lines.push(`📋 任务: ${latest.taskName} → ${latest.taskStatus}`);
-            lines.push("");
-        }
-        if (round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
-            lines.push("#### ✏️ 代码编辑");
-            for (const ca of round.codeActions) lines.push(`- **${ca.targetFile}**: ${ca.description}`);
-            lines.push("");
-        }
-        if (round.fileViews?.length && extraTypes.includes("file_views")) {
-            lines.push("#### 📄 文件/计划视图");
-            for (const view of round.fileViews) lines.push(`- ${view.kind}${view.title ? ` / ${view.title}` : ""}: ${view.textSummary}`);
-            lines.push("");
-        }
-        if (round.subagentSummaries.length > 0) {
-            lines.push("#### 🤝 子代理线程");
-            for (const subagent of round.subagentSummaries) {
-                lines.push(`- ${subagent.nickname || subagent.threadId} (${subagent.threadId})${subagent.role ? ` / ${subagent.role}` : ""}`);
+            if (pushLine(lines, `📋 任务: ${latest.taskName} → ${latest.taskStatus}`)) {
+                pushLine(lines, "");
             }
-            lines.push("");
+        }
+        if (!budgetState.exceeded && round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
+            if (pushLine(lines, "#### ✏️ 代码编辑")) {
+                for (const ca of round.codeActions) {
+                    if (!pushLine(lines, `- **${ca.targetFile}**: ${ca.description}`)) break;
+                }
+                if (!budgetState.exceeded) pushLine(lines, "");
+            }
+        }
+        if (!budgetState.exceeded && round.fileViews?.length && extraTypes.includes("file_views")) {
+            if (pushLine(lines, "#### 📄 文件/计划视图")) {
+                for (const view of round.fileViews) {
+                    if (!pushLine(lines, `- ${view.kind}${view.title ? ` / ${view.title}` : ""}: ${view.textSummary}`)) break;
+                }
+                if (!budgetState.exceeded) pushLine(lines, "");
+            }
+        }
+        if (!budgetState.exceeded && round.subagentSummaries.length > 0) {
+            if (pushLine(lines, "#### 🤝 子代理线程")) {
+                for (const subagent of round.subagentSummaries) {
+                    if (!pushLine(lines, `- ${subagent.nickname || subagent.threadId} (${subagent.threadId})${subagent.role ? ` / ${subagent.role}` : ""}`)) break;
+                }
+                if (!budgetState.exceeded) pushLine(lines, "");
+            }
         }
     }
 
-    return lines.join("\n").trimEnd();
+    if (hasSoftBudget && budgetState.exceeded) appendBudgetWarning(lines);
+    return finalizeResult(lines.join("\n").trimEnd());
 }
 
 function safeFilePart(input: string): string {

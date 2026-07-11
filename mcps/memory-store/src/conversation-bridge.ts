@@ -1,13 +1,13 @@
 import { normalizeDataChain, type DataChain, type ConversationLinkMode, type ConversationLogicalChainMode } from "./chain.js";
 import {
-    loadCodexConversation,
-    resolveCurrentCodexThreadId,
-    resolveCodexThreadId,
+    loadCodexConversationAsync,
+    resolveCurrentCodexThreadIdAsync,
+    resolveCodexThreadIdAsync,
     isCodexSessionStoreAvailable,
     type CodexConversationData,
 } from "./codex-client.js";
 import {
-    loadClaudeCodeConversation,
+    loadClaudeCodeConversationAsync,
     resolveClaudeCodeThreadId,
     isClaudeCodeStoreAvailable,
     type ClaudeCodeConversationData,
@@ -18,6 +18,7 @@ import {
     isWindsurfStoreAvailable,
     type WindsurfConversationReadResult,
 } from "./windsurf-client.js";
+import type { ConcurrencyGateRequestClass } from "./concurrency-gate.js";
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable } from "./ls-client.js";
 import { setCurrentContext } from "./conversation-router.js";
@@ -75,6 +76,7 @@ export async function resolveConversationId(
     requestedId: string | undefined,
     chain: ResolvedConversationChain,
     cwd: string = process.cwd(),
+    requestClass?: ConcurrencyGateRequestClass,
 ): Promise<string | null> {
     if (chain === "antigravity") {
         if (requestedId) return requestedId;
@@ -85,11 +87,11 @@ export async function resolveConversationId(
         return null;
     }
     if (chain === "windsurf") {
-        if (requestedId) return await resolveWindsurfThreadId(requestedId) || requestedId;
+        if (requestedId) return await resolveWindsurfThreadId(requestedId, { requestClass }) || requestedId;
         return null;
     }
-    if (requestedId) return resolveCodexThreadId(requestedId) || requestedId;
-    return resolveCurrentCodexThreadId(cwd);
+    if (requestedId) return await resolveCodexThreadIdAsync(requestedId) || requestedId;
+    return resolveCurrentCodexThreadIdAsync(cwd);
 }
 
 export async function loadConversationData(
@@ -103,6 +105,7 @@ export async function loadConversationData(
         idResolutionMode?: IdResolutionMode;
         sourceFailureMode?: SourceFailureMode;
         logicalChain?: ConversationLogicalChainMode;
+        requestClass?: ConcurrencyGateRequestClass;
     } = {},
 ): Promise<ConversationLoadResult | null> {
     chain = normalizeDataChain(chain);
@@ -163,7 +166,7 @@ export async function loadConversationData(
 async function loadFromResolvedChain(
     resolved: ResolvedConversationChain,
     conversationId: string | undefined,
-    options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string; logicalChain?: ConversationLogicalChainMode },
+    options: { refresh?: boolean; link?: ConversationLinkMode; cwd?: string; logicalChain?: ConversationLogicalChainMode; requestClass?: ConcurrencyGateRequestClass },
 ): Promise<ConversationLoadResult | null> {
     // 方案 D 注入点（见蓝图步骤 7）：把已知 conversationId / workspace 指纹喂给路由大脑，
     // 让 getCurrentCascadeId（无 id 旁路）能精确绑定当前窗口，而非「连第一个 LS 猜全局最新」。
@@ -175,7 +178,7 @@ async function loadFromResolvedChain(
         });
     }
 
-    const effectiveId = await resolveConversationId(conversationId, resolved, options.cwd);
+    const effectiveId = await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass);
     if (!effectiveId) return null;
 
     if (resolved === "antigravity") {
@@ -194,7 +197,7 @@ async function loadFromResolvedChain(
     }
 
     if (resolved === "claude-code") {
-        const claudeCodeData = loadClaudeCodeConversation(effectiveId, { logicalChain: options.logicalChain });
+        const claudeCodeData = await loadClaudeCodeConversationAsync(effectiveId, { logicalChain: options.logicalChain });
         if (!claudeCodeData) return null;
         return {
             chainUsed: "claude-code",
@@ -206,7 +209,7 @@ async function loadFromResolvedChain(
     }
 
     if (resolved === "windsurf") {
-        const windsurfData = await loadWindsurfConversation(effectiveId);
+        const windsurfData = await loadWindsurfConversation(effectiveId, options.refresh, { requestClass: options.requestClass });
         if (!windsurfData) return null;
         return {
             chainUsed: "windsurf",
@@ -217,7 +220,7 @@ async function loadFromResolvedChain(
         };
     }
 
-    const codexData = loadCodexConversation(effectiveId, options.link || "summary");
+    const codexData = await loadCodexConversationAsync(effectiveId, options.link || "summary");
     if (!codexData) return null;
     return {
         chainUsed: "codex",

@@ -59,7 +59,7 @@ $envVars = @{
     CODEX_MCP_BROKER_STATE = $statePath
     MEMORY_STORE_DATA_ROOT = (Join-Path $dataRoot "memory-store")
     SANDBOX_DATA_ROOT = (Join-Path $dataRoot "sandbox-data")
-    WEB_FETCHER_PROFILES_DIR = (Join-Path $dataRoot "web-fetcher-profiles")
+    WEB_FETCHER_PROFILE_BASE_DIR = (Join-Path $dataRoot "web-fetcher-profiles")
 }
 foreach ($entry in $envVars.GetEnumerator()) {
     $previousEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")

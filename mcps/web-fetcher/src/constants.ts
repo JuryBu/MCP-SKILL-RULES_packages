@@ -8,7 +8,7 @@ import os from "os";
 // v6.1: 多实例隔离 — 每个 MCP 进程使用独立的浏览器 profile
 // 基础目录（所有 profile 的父目录）
 export const BROWSER_PROFILES_BASE_DIR = path.join(
-    process.env.WEB_FETCHER_PROFILE_BASE_DIR || path.join(
+    process.env.WEB_FETCHER_PROFILE_BASE_DIR || process.env.WEB_FETCHER_PROFILES_DIR || path.join(
         os.homedir(),
         "AppData",
         "Local",

@@ -3,6 +3,7 @@ import os from "os";
 import fs from "fs";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { setTimeout as sleep } from "timers/promises";
 import { indexCache, type WorkspaceIndex, type MemoryIndexEntry } from "./cache.js";
 
 /**
@@ -282,10 +283,34 @@ function renameWithRetry(tmpPath: string, filePath: string): void {
     }
 }
 
+export async function renameWithRetryAsync(tmpPath: string, filePath: string): Promise<void> {
+    const transient = new Set(["EPERM", "EACCES", "EBUSY"]);
+    const maxAttempts = 5;
+    for (let attempt = 1; ; attempt++) {
+        try {
+            await fs.promises.rename(tmpPath, filePath);
+            return;
+        } catch (error) {
+            const code = (error as NodeJS.ErrnoException)?.code;
+            if (!code || !transient.has(code) || attempt >= maxAttempts) {
+                try { await fs.promises.rm(tmpPath, { force: true }); } catch {}
+                throw error;
+            }
+            await sleep(10 * Math.pow(2, attempt - 1));
+        }
+    }
+}
+
 function atomicWrite(filePath: string, content: string): void {
     const tmpPath = uniqueTmpPath(filePath);
     fs.writeFileSync(tmpPath, content, "utf-8");
     renameWithRetry(tmpPath, filePath);
+}
+
+async function atomicWriteAsync(filePath: string, content: string): Promise<void> {
+    const tmpPath = uniqueTmpPath(filePath);
+    await fs.promises.writeFile(tmpPath, content, "utf-8");
+    await renameWithRetryAsync(tmpPath, filePath);
 }
 
 /**
@@ -295,11 +320,19 @@ export function writeJsonAtomic(filePath: string, data: unknown): void {
     atomicWrite(filePath, JSON.stringify(data, null, 2));
 }
 
+export async function writeJsonAtomicAsync(filePath: string, data: unknown): Promise<void> {
+    await atomicWriteAsync(filePath, JSON.stringify(data, null, 2));
+}
+
 /**
  * 原子写入文本文件（唯一 tmp + rename 重试）
  */
 export function writeTextAtomic(filePath: string, content: string): void {
     atomicWrite(filePath, content);
+}
+
+export async function writeTextAtomicAsync(filePath: string, content: string): Promise<void> {
+    await atomicWriteAsync(filePath, content);
 }
 
 // ============= 进程内索引锁 =============
@@ -349,6 +382,42 @@ export function readGlobalIndex(): GlobalIndex {
 export function writeGlobalIndex(index: GlobalIndex): void {
     index.lastUpdated = new Date().toISOString();
     writeJsonAtomic(GLOBAL_INDEX_PATH, index);
+}
+
+async function readGlobalIndexAsync(): Promise<GlobalIndex> {
+    try {
+        return JSON.parse(await fs.promises.readFile(GLOBAL_INDEX_PATH, "utf-8")) as GlobalIndex;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") {
+            return { version: 1, lastUpdated: new Date().toISOString(), workspaces: {}, generalCount: 0 };
+        }
+        throw error;
+    }
+}
+
+async function writeGlobalIndexAsync(index: GlobalIndex): Promise<void> {
+    index.lastUpdated = new Date().toISOString();
+    await writeJsonAtomicAsync(GLOBAL_INDEX_PATH, index);
+}
+
+async function pathExistsAsync(filePath: string): Promise<boolean> {
+    try {
+        await fs.promises.access(filePath);
+        return true;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return false;
+        throw error;
+    }
+}
+
+async function readWorkspaceMetaAsync(hash: string): Promise<WorkspaceMeta | null> {
+    const metaPath = path.join(WORKSPACES_DIR, hash, "_meta.json");
+    try {
+        return JSON.parse(await fs.promises.readFile(metaPath, "utf-8")) as WorkspaceMeta;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return null;
+        throw error;
+    }
 }
 
 // ============= 工作区操作 =============
@@ -406,6 +475,68 @@ export function ensureWorkspace(workspacePath: string): { hash: string; dir: str
     } else {
         rememberWorkspaceAlias(hash, workspacePath);
     }
+
+    return { hash, dir: wsDir };
+}
+
+export async function ensureWorkspaceAsync(workspacePath: string): Promise<{ hash: string; dir: string }> {
+    const hash = workspaceHash(workspacePath);
+    const wsDir = path.join(WORKSPACES_DIR, hash);
+    const entriesDir = path.join(wsDir, "entries");
+    const indexPath = path.join(wsDir, "_index.json");
+    const metaPath = path.join(wsDir, "_meta.json");
+
+    await withIndexLock(`workspace_setup_${hash}`, async () => {
+        await fs.promises.mkdir(entriesDir, { recursive: true });
+        const meta = await readWorkspaceMetaAsync(hash);
+        if (!meta) {
+            await writeJsonAtomicAsync(metaPath, {
+                hash,
+                originalPath: workspacePath,
+                canonicalPath: canonicalWorkspacePath(workspacePath),
+                aliases: [workspacePath],
+                name: path.basename(workspacePath),
+                createdAt: new Date().toISOString(),
+                lastAccessed: new Date().toISOString(),
+                isArchived: false,
+            } satisfies WorkspaceMeta);
+        } else {
+            const aliases = new Set([...(meta.aliases || []), workspacePath]);
+            const nextAliases = Array.from(aliases);
+            if (nextAliases.length !== (meta.aliases || []).length || !meta.canonicalPath) {
+                meta.canonicalPath = meta.canonicalPath || canonicalWorkspacePath(meta.originalPath);
+                meta.aliases = nextAliases;
+                await writeJsonAtomicAsync(metaPath, meta);
+            }
+        }
+        if (!await pathExistsAsync(indexPath)) {
+            await writeJsonAtomicAsync(indexPath, { version: 1, entries: [] } satisfies WorkspaceIndex);
+        }
+    });
+
+    await withGlobalIndexLock(async () => {
+        const globalIndex = await readGlobalIndexAsync();
+        const summary = globalIndex.workspaces[hash];
+        if (!summary) {
+            globalIndex.workspaces[hash] = {
+                name: path.basename(workspacePath),
+                originalPath: workspacePath,
+                canonicalPath: canonicalWorkspacePath(workspacePath),
+                aliases: [workspacePath],
+                memoryCount: 0,
+                totalSizeBytes: 0,
+                lastAccessed: new Date().toISOString(),
+                isArchived: false,
+                topTags: [],
+            };
+        } else {
+            const aliases = new Set([...(summary.aliases || []), workspacePath]);
+            summary.canonicalPath = summary.canonicalPath || canonicalWorkspacePath(summary.originalPath);
+            summary.aliases = Array.from(aliases);
+            summary.lastAccessed = new Date().toISOString();
+        }
+        await writeGlobalIndexAsync(globalIndex);
+    });
 
     return { hash, dir: wsDir };
 }
@@ -520,6 +651,16 @@ export function listWorkspaceHashes(): string[] {
     return fs.readdirSync(WORKSPACES_DIR).filter(entry => {
         return fs.statSync(path.join(WORKSPACES_DIR, entry)).isDirectory();
     });
+}
+
+export async function listWorkspaceHashesAsync(): Promise<string[]> {
+    try {
+        const entries = await fs.promises.readdir(WORKSPACES_DIR, { withFileTypes: true });
+        return entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+        throw error;
+    }
 }
 
 // ============= 记忆文件操作 =============

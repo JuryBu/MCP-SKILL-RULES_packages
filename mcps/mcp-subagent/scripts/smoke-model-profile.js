@@ -7,7 +7,6 @@ if (!mainId) {
   console.error("usage: node scripts/smoke-model-profile.js <main_id>");
   process.exit(2);
 }
-
 function parseResult(result) {
   return JSON.parse(result.content[0].text);
 }

@@ -5,9 +5,16 @@ import path from "path";
 import { callGetModelResponse, initParentLs, isLsReady } from "./ls-client.js";
 import { isAntigravityLS } from "./lifecycle.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams, isClaudeCodeCliAvailable } from "./claude-code-bridge.js";
+import {
+    callProgrokAPI,
+    DEFAULT_PROGROK_FALLBACK_MODEL,
+    DEFAULT_PROGROK_REASONING_EFFORT,
+    normalizeProgrokReasoningEffort,
+    type ProgrokCallOptions,
+} from "./grok-bridge.js";
 
-export type ModelChain = "auto" | "antigravity" | "codex" | "claude-code" | "cc";
-export type ResolvedModelChain = "antigravity" | "codex" | "claude-code";
+export type ModelChain = "auto" | "grok" | "antigravity" | "codex" | "claude-code" | "cc";
+export type ResolvedModelChain = "grok" | "antigravity" | "codex" | "claude-code";
 
 interface BridgeResult {
     chainUsed: ResolvedModelChain;
@@ -38,6 +45,28 @@ const CODEX_DEFAULT_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_TIMEOUT || 5 *
 const CODEX_KILL_TREE_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_KILL_TREE_TIMEOUT || 5_000);
 const CODEX_OUTPUT_PATH_KILL_TIMEOUT_MS = Number(process.env.SANDBOX_CODEX_OUTPUT_PATH_KILL_TIMEOUT || 5_000);
 let cachedCodexAvailability: boolean | null = null;
+
+function getStringParam(params: Record<string, unknown> | undefined, ...keys: string[]): string | undefined {
+    for (const key of keys) {
+        const value = params?.[key];
+        if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return undefined;
+}
+
+function grokFallbackModelFromParams(params: Record<string, unknown> | undefined): string | false {
+    const explicit = params?.fallbackModel ?? params?.fallback_model;
+    if (explicit === false) return false;
+    if (typeof explicit === "string" && explicit.trim()) return explicit.trim();
+    return DEFAULT_PROGROK_FALLBACK_MODEL;
+}
+
+function grokReasoningEffortFromParams(params: Record<string, unknown> | undefined): ProgrokCallOptions["reasoningEffort"] {
+    return normalizeProgrokReasoningEffort(
+        getStringParam(params, "reasoningEffort", "reasoning_effort", "model_reasoning_effort"),
+        DEFAULT_PROGROK_REASONING_EFFORT,
+    );
+}
 
 function extractLastAgentText(stdout: string): string | null {
     const lines = stdout
@@ -253,7 +282,7 @@ if ($stopped.Count -gt 0) { [Console]::Out.Write(($stopped -join ",")) }
     });
 }
 
-async function isCodexCliAvailable(): Promise<boolean> {
+export async function isCodexCliAvailable(): Promise<boolean> {
     if (cachedCodexAvailability !== null) return cachedCodexAvailability;
     if (process.env.SANDBOX_CODEX_BIN?.trim()) {
         cachedCodexAvailability = true;
@@ -299,6 +328,10 @@ async function resolveModelChain(requested: ModelChain): Promise<ResolvedModelCh
             throw new Error("Codex 链路不可用：未发现 codex CLI");
         }
         return "codex";
+    }
+
+    if (normalized === "grok") {
+        return "grok";
     }
 
     if (normalized === "claude-code") {
@@ -633,6 +666,15 @@ export async function callModelBridge(
             timeoutMs: typeof params?.timeoutMs === "number" ? params.timeoutMs : timeoutMs,
         });
         return { chainUsed, text: result.text };
+    }
+
+    if (chainUsed === "grok") {
+        const text = await callProgrokAPI(prompt, timeoutMs, {
+            signal,
+            reasoningEffort: grokReasoningEffortFromParams(params),
+            fallbackModel: grokFallbackModelFromParams(params),
+        });
+        return { chainUsed, text };
     }
 
     const text = await callCodexTextForModelBridge(prompt, timeoutMs, signal);

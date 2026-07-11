@@ -173,7 +173,11 @@
                 }
               },
               "message_preview": { "type": "string" },
-              "image_count": { "type": "integer", "minimum": 0 }
+              "image_count": { "type": "integer", "minimum": 0 },
+              "rename_before_reply": {
+                "type": "object",
+                "additionalProperties": true
+              }
             }
           }
         },
@@ -190,6 +194,7 @@
         "archive_path": { "type": "string" },
         "archive_export_path": { "type": "string" },
         "archive_file_deleted_at": { "type": "string", "format": "date-time" },
+        "ls_archived": { "type": "boolean" },
         "cleanup_reason": { "type": "string" },
         "result_preview": { "type": "string" },
         "result_text": { "type": "string" },
@@ -209,6 +214,10 @@
             "confirmed": { "type": "boolean" },
             "boundary_reason": { "type": ["string", "null"] },
             "delivered_by": { "type": ["string", "null"] },
+            "rename_before_collect": {
+              "type": "object",
+              "additionalProperties": true
+            },
             "watched_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] },
             "completed_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] }
           }
@@ -229,6 +238,10 @@
               "confirmed": { "type": "boolean" },
               "boundary_reason": { "type": ["string", "null"] },
               "delivered_by": { "type": ["string", "null"] },
+              "rename_before_collect": {
+                "type": "object",
+                "additionalProperties": true
+              },
               "watched_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] },
               "completed_step": { "anyOf": [{ "$ref": "#/$defs/stepBoundaryRecord" }, { "type": "null" }] }
             }
@@ -271,6 +284,7 @@
         "archive_path": { "type": "string", "minLength": 1 },
         "archived_at": { "type": "string", "format": "date-time" },
         "delete_after_archive": { "type": "boolean" },
+        "ls_archived": { "type": "boolean" },
         "pruned_at": { "type": "string", "format": "date-time" },
         "file_deleted_at": { "type": "string", "format": "date-time" },
         "export_path": { "type": "string" }

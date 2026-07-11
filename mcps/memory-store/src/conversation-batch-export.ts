@@ -15,6 +15,14 @@ export interface ConversationBatchExportOptions extends Omit<ConversationExportO
     workspaceMode?: WorkspaceMatchMode;
     workspaceScope?: WorkspaceMatchScope;
     link?: ConversationLinkMode;
+    /** 内部恢复用：显式固定本次 batch 输出目录，避免恢复后生成新目录。 */
+    batchDir?: string;
+}
+
+export interface ConversationBatchExportResumePayload {
+    version: 1;
+    batchDir: string;
+    options: ConversationBatchExportOptions;
 }
 
 export interface ConversationBatchExportItemResult {
@@ -70,6 +78,117 @@ function resolveBatchExportDirectory(outputDir?: string): string {
     return target;
 }
 
+function cloneBatchExportOptions(options: ConversationBatchExportOptions): ConversationBatchExportOptions {
+    return {
+        ...options,
+        candidates: options.candidates.map(candidate => ({ ...candidate })),
+        sourceStatuses: options.sourceStatuses?.map(status => ({ ...status, warnings: status.warnings ? [...status.warnings] : undefined })),
+        workspaces: options.workspaces ? [...options.workspaces] : undefined,
+        messageRoles: options.messageRoles ? [...options.messageRoles] : undefined,
+        extraTypes: options.extraTypes ? [...options.extraTypes] : undefined,
+    };
+}
+
+export function createConversationBatchExportResumePayload(
+    options: ConversationBatchExportOptions,
+): ConversationBatchExportResumePayload {
+    const batchDir = options.batchDir || resolveBatchExportDirectory(options.outputDir);
+    return {
+        version: 1,
+        batchDir,
+        options: {
+            ...cloneBatchExportOptions(options),
+            batchDir,
+        },
+    };
+}
+
+function listTmpArtifacts(rootDir: string): string[] {
+    if (!fs.existsSync(rootDir)) return [];
+    const pending: string[] = [rootDir];
+    const found: string[] = [];
+    while (pending.length > 0) {
+        const current = pending.pop()!;
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(current, { withFileTypes: true });
+        } catch {
+            continue;
+        }
+        for (const entry of entries) {
+            const fullPath = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+                pending.push(fullPath);
+                continue;
+            }
+            if (/\.tmp(?:\.|$)/iu.test(entry.name) || entry.name.endsWith(".pending.json")) {
+                found.push(fullPath);
+            }
+        }
+    }
+    return found;
+}
+
+function childDirForCandidate(batchDir: string, candidate: Pick<UnifiedConversationCandidate, "dataChain" | "id">): string {
+    return path.join(batchDir, `${safeSegment(candidate.dataChain)}_${safeSegment(candidate.id)}`);
+}
+
+function isCompletedChildExport(childDir: string): boolean {
+    const manifestPath = path.join(childDir, "manifest.json");
+    if (!fs.existsSync(manifestPath)) return false;
+    try {
+        const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf-8")) as {
+            files?: { markdown?: string | null; pdf?: string | null; html?: string | null };
+        };
+        const referencedFiles = [
+            manifest.files?.markdown,
+            manifest.files?.pdf,
+            manifest.files?.html,
+        ].filter((value): value is string => Boolean(value));
+        return referencedFiles.every(filePath => fs.existsSync(filePath));
+    } catch {
+        return false;
+    }
+}
+
+export function cleanupConversationBatchExportForRestart(payload: ConversationBatchExportResumePayload): void {
+    fs.mkdirSync(payload.batchDir, { recursive: true });
+
+    for (const filePath of [
+        path.join(payload.batchDir, "batch_manifest.pending.json"),
+        path.join(payload.batchDir, "batch_manifest.json"),
+        ...listTmpArtifacts(payload.batchDir),
+    ]) {
+        try {
+            fs.rmSync(filePath, { recursive: true, force: true });
+        } catch {
+            // cleanup is best-effort; restart will overwrite stable artifacts again.
+        }
+    }
+
+    for (const candidate of payload.options.candidates) {
+        const childDir = childDirForCandidate(payload.batchDir, candidate);
+        if (!fs.existsSync(childDir)) continue;
+        if (isCompletedChildExport(childDir)) continue;
+        try {
+            fs.rmSync(childDir, { recursive: true, force: true });
+        } catch {
+            // ignore cleanup error and let the restart overwrite as much as it can
+        }
+    }
+}
+
+export async function resumeConversationBatchExport(
+    payload: ConversationBatchExportResumePayload,
+    deps: Partial<ConversationBatchExportDeps> = {},
+): Promise<ConversationBatchExportResult> {
+    cleanupConversationBatchExportForRestart(payload);
+    return exportConversationBatch({
+        ...cloneBatchExportOptions(payload.options),
+        batchDir: payload.batchDir,
+    }, deps);
+}
+
 function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof defaultLoadConversationData>>): string {
     const skipped = loaded?.windsurfData?.skippedSteps || [];
     if (!loaded?.windsurfData?.partial || skipped.length === 0) return "";
@@ -103,7 +222,7 @@ export async function exportConversationBatch(
         loadConversationData: deps.loadConversationData || defaultLoadConversationData,
         exportConversation: deps.exportConversation || defaultExportConversation,
     };
-    const batchDir = resolveBatchExportDirectory(options.outputDir);
+    const batchDir = options.batchDir || resolveBatchExportDirectory(options.outputDir);
     const selected = options.candidates.slice(0, Math.max(options.batchLimit || options.candidates.length, 0));
     const concurrency = Math.max(1, Math.min(options.batchConcurrency || 2, 4));
     const pendingManifestPath = path.join(batchDir, "batch_manifest.pending.json");
@@ -143,7 +262,7 @@ export async function exportConversationBatch(
     });
 
     const items = await runWithConcurrency(selected, concurrency, async (candidate) => {
-        const childDir = path.join(batchDir, `${safeSegment(candidate.dataChain)}_${safeSegment(candidate.id.slice(0, 8))}`);
+        const childDir = childDirForCandidate(batchDir, candidate);
         try {
             const loaded = await activeDeps.loadConversationData(candidate.dataChain, candidate.id, { link: options.link });
             if (!loaded) {

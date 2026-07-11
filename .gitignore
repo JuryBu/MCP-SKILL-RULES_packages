@@ -26,9 +26,14 @@ coverage/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 *.db
 *.db-wal
 *.db-shm
+*.vscdb
+*.pb
 
 # Logs
 *.log
@@ -45,8 +50,19 @@ broker.pid
 broker-private*.json
 auth.json
 .cockpit_codex_auth.json
+credentials.json
+.credentials.json
+token.json
+tokens.json
 cookies-backup.json
 localstorage-backup.json
+*.pem
+*.key
+*.p12
+*.pfx
+**/profiles/
+**/browser-profile/
+**/user-data-dir/
 
 # IDE / OS
 .idea/
@@ -54,6 +70,8 @@ localstorage-backup.json
 *.sw?
 .DS_Store
 Thumbs.db
+*.bak
+*.before-*
 
 # Planning/private scratch files
 Plan_*.md

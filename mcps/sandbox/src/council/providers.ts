@@ -5,6 +5,7 @@ import { spawn, spawnSync } from "child_process";
 import { callGetModelResponseDetailed } from "../ls-client.js";
 import { callCodexText } from "../model-bridge.js";
 import { callClaudeCodeText, claudeCodeOptionsFromParams } from "../claude-code-bridge.js";
+import { callProgrokAPI } from "../grok-bridge.js";
 import { TEMP_DIR, ensureTempDir } from "../temp-store.js";
 import type { CouncilModelConfig } from "./types.js";
 
@@ -17,6 +18,7 @@ const DEFAULT_GEMINI_CLI_APPROVAL_MODE = process.env.SANDBOX_COUNCIL_GEMINI_CLI_
 const DEFAULT_ANTIGRAVITY_MODEL = process.env.SANDBOX_COUNCIL_ANTIGRAVITY_MODEL || process.env.SANDBOX_LS_MODEL || "MODEL_PLACEHOLDER_M132";
 const DEFAULT_CODEX_MODEL = "gpt-5.4";
 const DEFAULT_CODEX_MINI_MODEL = "gpt-5.4-mini";
+const DEFAULT_GROK_MODEL = process.env.SANDBOX_COUNCIL_GROK_MODEL || process.env.SANDBOX_PROGROK_MODEL || "grok-4.5";
 const DEFAULT_CODEX_REASONING = process.env.SANDBOX_CODEX_REASONING || "medium";
 export const DEFAULT_COUNCIL_MODEL_TIMEOUT_MS = Number(process.env.SANDBOX_COUNCIL_MODEL_TIMEOUT_MS || 120000);
 const DEFAULT_RETRIES = Math.max(0, Math.min(Number(process.env.SANDBOX_COUNCIL_MODEL_RETRIES ?? 1), 3));
@@ -33,6 +35,7 @@ const DEFAULT_SOURCE_LIMITS: Record<string, number> = {
     anthropic: Math.max(1, Number(process.env.SANDBOX_COUNCIL_ANTHROPIC_CONCURRENCY || 4)),
     gemini: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GEMINI_CONCURRENCY || 4)),
     geminiCli: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GEMINI_CLI_CONCURRENCY || 2)),
+    grok: Math.max(1, Number(process.env.SANDBOX_COUNCIL_GROK_CONCURRENCY || 2)),
     claudeCode: Math.max(1, Number(process.env.SANDBOX_COUNCIL_CLAUDE_CODE_CONCURRENCY || 1)),
     customOpenAICompatible: Math.max(1, Number(process.env.SANDBOX_COUNCIL_CUSTOM_OPENAI_CONCURRENCY || 2)),
 };
@@ -159,7 +162,13 @@ function geminiCliAccessibleTempDir(cwd: string, childDir: string): string {
     const configured = process.env.SANDBOX_COUNCIL_GEMINI_CLI_TEMP_DIR;
     const base = configured && configured.trim()
         ? configured.trim()
-        : path.join(os.homedir(), ".gemini", "tmp", safeGeminiTempProjectName(cwd));
+        : path.join(
+            process.env.SANDBOX_DATA_ROOT
+                || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data"),
+            "temp",
+            "gemini-cli",
+            safeGeminiTempProjectName(cwd),
+        );
     const dir = path.join(base, childDir);
     fs.mkdirSync(dir, { recursive: true });
     return dir;
@@ -354,6 +363,7 @@ function getDefaultModel(config: CouncilModelConfig): string {
         config.provider === "anthropic" ? DEFAULT_ANTHROPIC_MODEL :
         config.provider === "gemini" ? DEFAULT_GEMINI_MODEL :
         config.provider === "geminiCli" ? DEFAULT_GEMINI_CLI_MODEL :
+        config.provider === "grok" ? DEFAULT_GROK_MODEL :
         config.provider === "claudeCode" ? DEFAULT_CLAUDE_CODE_MODEL :
         config.provider === "codex" ? DEFAULT_CODEX_MODEL :
         DEFAULT_ANTIGRAVITY_MODEL
@@ -420,6 +430,28 @@ function getDefaultFallbackConfigs(config: CouncilModelConfig): CouncilModelConf
             "gemini-3.1-flash-lite-preview",
             "gemini-2.5-flash-lite",
         ].join(",")).split(",").map((item) => item.trim()).filter(Boolean);
+        const currentIndex = chain.findIndex((item) => item === model);
+        const candidates = currentIndex >= 0 ? chain.slice(currentIndex + 1) : chain.filter((item) => item !== model);
+        const seen = new Set([model]);
+        return candidates
+            .filter((item) => {
+                if (seen.has(item)) return false;
+                seen.add(item);
+                return true;
+            })
+            .map((item) => ({
+                ...config,
+                model: item,
+                params: baseParams,
+            }));
+    }
+
+    if (config.provider === "grok") {
+        const raw = process.env.SANDBOX_COUNCIL_GROK_MODEL_CHAIN;
+        if (!raw?.trim()) return [];
+        const model = getDefaultModel(config);
+        const baseParams = withoutFallbackParams(config.params) || {};
+        const chain = raw.split(",").map((item) => item.trim()).filter(Boolean);
         const currentIndex = chain.findIndex((item) => item === model);
         const candidates = currentIndex >= 0 ? chain.slice(currentIndex + 1) : chain.filter((item) => item !== model);
         const seen = new Set([model]);
@@ -510,6 +542,12 @@ function normalizeSource(value: string | undefined): string {
 function getSourceKey(config: CouncilModelConfig): string {
     const explicitSource = getStringParam(config.params, "sourceKey") || getStringParam(config.params, "source");
     if (explicitSource) return `${config.provider}:${explicitSource}`;
+    if (config.provider === "grok") {
+        const baseUrl = getStringParam(config.params, "baseUrl")
+            || getStringParam(config.params, "endpoint")
+            || process.env.SANDBOX_PROGROK_BASE_URL;
+        return `${config.provider}:${normalizeSource(baseUrl)}`;
+    }
     if (config.provider === "customOpenAICompatible") {
         const baseUrl = getStringParam(config.params, "baseUrl") || getStringParam(config.params, "endpoint");
         return `${config.provider}:${normalizeSource(baseUrl)}`;
@@ -538,6 +576,11 @@ function isRetryableError(err: unknown): boolean {
         const providerErr = err as ProviderError;
         if (typeof providerErr.retryable === "boolean") return providerErr.retryable;
         if (providerErr.timedOut === true) return true;
+        const code = (err as { code?: unknown }).code;
+        if (typeof code === "string") {
+            if (["timeout", "rate_limited", "upstream_unreachable", "port_not_listening"].includes(code)) return true;
+            if (["invalid_response", "http_error"].includes(code)) return false;
+        }
     }
     const message = err instanceof Error ? err.message : String(err);
     if (/缺少 API key|需要 params\.baseUrl|不支持图片 MIME|图片过大|图片总大小过大|输出疑似被截断|内容被安全策略拦截|未登录|认证失败|max-budget|budget|额度耗尽|permission|权限|Unknown option|invalid/i.test(message)) {
@@ -573,7 +616,12 @@ async function withRetry<T>(config: CouncilModelConfig, fn: () => Promise<T>): P
         }
     }
     const message = lastErr instanceof Error ? lastErr.message : String(lastErr);
-    throw new Error(retries > 0 ? `${message} (attempts=${attempts}/${retries + 1})` : message);
+    const wrapped = new Error(retries > 0 ? `${message} (attempts=${attempts}/${retries + 1})` : message) as ProviderError;
+    wrapped.retryable = isRetryableError(lastErr);
+    if (lastErr && typeof lastErr === "object" && (lastErr as ProviderError).timedOut === true) {
+        wrapped.timedOut = true;
+    }
+    throw wrapped;
 }
 
 function readApiKey(config: CouncilModelConfig, defaultEnv: string): string {
@@ -697,10 +745,10 @@ function assertNotTruncated(provider: string, data: any): void {
         }
         return;
     }
-    if (provider === "customOpenAICompatible") {
+    if (provider === "customOpenAICompatible" || provider === "grok") {
         const reasons = (data?.choices || []).map((choice: any) => choice?.finish_reason).filter(Boolean);
         if (reasons.some((reason: string) => /length|max_tokens/iu.test(reason))) {
-            throw new Error(`OpenAI-compatible endpoint 输出疑似被截断: ${reasons.join(", ")}`);
+            throw new Error(`${provider} 输出疑似被截断: ${reasons.join(", ")}`);
         }
     }
 }
@@ -973,6 +1021,21 @@ async function callCouncilModelOnce(
                 jsonlHint: result.jsonlHint,
             },
         };
+    }
+
+    if (config.provider === "grok") {
+        const text = await callProgrokAPI(prompt, timeoutMs, {
+            model,
+            signal,
+            baseUrl: getStringParam(config.params, "baseUrl") || getStringParam(config.params, "endpoint"),
+            maxTokens: getNumberParam(config.params, "max_tokens") || getNumberParam(config.params, "maxTokens"),
+            fallbackModel: false,
+            images: images.map((image) => ({
+                url: image.dataUrl,
+                mimeType: image.mimeType,
+            })),
+        });
+        return { provider: config.provider, model, text };
     }
 
     if (config.provider === "openai") {

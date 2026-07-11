@@ -47,12 +47,15 @@ export interface GuardCheckResult {
     missingItems: string[];
     rawResponse: string;
     reportPath?: string;
+    cancelled?: boolean;
     infrastructureError?: boolean;
     evidenceInsufficient?: boolean;
     evidenceInsufficientReason?: string;
     selfReferenceResolved?: boolean;
     selfReferenceItems?: string[];
     evidenceIndexManifestPath?: string;
+    modelChainUsed?: Chain | null;
+    modelUsed?: string | null;
 }
 
 interface GuardExtractionSegment {
@@ -117,6 +120,8 @@ interface FlashCallResult {
     text: string | null;
     error?: string;
     infrastructureError?: boolean;
+    chainUsed?: Chain | null;
+    modelUsed?: string | null;
 }
 
 export function isGuardInfrastructureError(result: GuardCheckResult): boolean {
@@ -125,6 +130,22 @@ export function isGuardInfrastructureError(result: GuardCheckResult): boolean {
 
 export function isGuardEvidenceInsufficient(result: GuardCheckResult): boolean {
     return result.evidenceInsufficient === true;
+}
+
+function shouldAbortGuardRun(
+    options: { isCancelled?: () => boolean; isSettled?: () => boolean },
+): boolean {
+    return Boolean(options.isCancelled?.() || options.isSettled?.());
+}
+
+function createAbortedGuardResult(cancelled: boolean): GuardCheckResult {
+    return {
+        passed: false,
+        summary: cancelled ? "后台 Guard 检查已取消" : "后台 Guard 检查已结束，已跳过后续写回",
+        missingItems: [],
+        rawResponse: "",
+        cancelled: true,
+    };
 }
 
 // ============= Flash 调用（带重试） =============
@@ -136,7 +157,12 @@ async function callFlash(prompt: string): Promise<FlashCallResult> {
 async function callFlashWithChain(
     prompt: string,
     modelChain: Chain = "auto",
-    options: { background?: boolean; dataChain?: DataChain } = {},
+    options: {
+        background?: boolean;
+        dataChain?: DataChain;
+        isCancelled?: () => boolean;
+        isSettled?: () => boolean;
+    } = {},
 ): Promise<FlashCallResult> {
     const isCodexOnly = modelChain === "codex";
     const isClaudeCodeOnly = modelChain === "claude-code";
@@ -145,21 +171,35 @@ async function callFlashWithChain(
         : isClaudeCodeOnly
             ? Number(process.env.MEMORY_STORE_CC_GUARD_TIMEOUT_MS || FLASH_TIMEOUT)
         : FLASH_TIMEOUT;
-    const resp = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", timeoutMs, { allowClaudeCodeFallback: options.dataChain === "claude-code" });
-    if (resp.text) return { text: resp.text };
+    const bridgeOptions = {
+        allowClaudeCodeFallback: options.dataChain === "claude-code",
+        grokContext: "guard" as const,
+        shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+    };
+    const resp = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", timeoutMs, bridgeOptions);
+    if (resp.text) {
+        console.error(`[guard-engine] Guard model call success requestedChain=${modelChain || "auto"} actualChain=${resp.chainUsed || "unknown"} actualModel=${resp.modelUsed || "unknown"} grokContext=guard`);
+        return { text: resp.text, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
+    }
+
+    if (resp.cancelled) {
+        return { text: null, error: resp.error || "Guard 模型调用已取消", infrastructureError: true, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
+    }
 
     if (isCodexOnly || isClaudeCodeOnly || resp.error?.includes("Codex 模型桥") || resp.error?.includes("Claude Code CLI")) {
         console.error(`[guard-engine] 模型桥失败，不重试: ${resp.error || "unknown error"}`);
-        return { text: null, error: resp.error || "模型桥调用失败", infrastructureError: true };
+        return { text: null, error: resp.error || "模型桥调用失败", infrastructureError: true, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
     }
 
     console.error(`[guard-engine] Flash 首次失败，5s 后重试...`);
     await new Promise(r => setTimeout(r, 5000));
-    const retry = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", FLASH_TIMEOUT, { allowClaudeCodeFallback: options.dataChain === "claude-code" });
+    const retry = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", FLASH_TIMEOUT, bridgeOptions);
     return {
         text: retry.text,
         error: retry.text ? undefined : retry.error || resp.error || "Flash 模型调用失败",
         infrastructureError: !retry.text,
+        chainUsed: retry.chainUsed || resp.chainUsed,
+        modelUsed: retry.modelUsed || resp.modelUsed,
     };
 }
 
@@ -231,6 +271,66 @@ function parseHeadings(lines: string[]): HeadingLine[] {
         headings.push({ lineNumber: index + 1, level: match[1].length, text: match[2].trim() });
     });
     return headings;
+}
+
+function normalizeGuardScopeSelectors(scopeSelectors?: string[]): string[] {
+    return [...new Set((scopeSelectors || []).map(selector => selector.trim()).filter(Boolean))];
+}
+
+function findScopeSelectorRanges(
+    lines: string[],
+    headings: HeadingLine[],
+    scopeSelectors: string[],
+): Array<{ startLine: number; endLine: number; label: string; reason: string }> {
+    const ranges: Array<{ startLine: number; endLine: number; label: string; reason: string }> = [];
+    const lockLines = new Set<number>();
+    let insideGuardLock = false;
+    for (let index = 0; index < lines.length; index += 1) {
+        if (lines[index].includes("<!-- STAGE_GUARD_LOCK_BEGIN ")) insideGuardLock = true;
+        if (insideGuardLock) lockLines.add(index);
+        if (insideGuardLock && lines[index].includes("<!-- STAGE_GUARD_LOCK_END -->")) insideGuardLock = false;
+    }
+    for (const selector of normalizeGuardScopeSelectors(scopeSelectors)) {
+        const selectorLower = selector.toLocaleLowerCase();
+        const matchingIndexes = lines
+            .map((line, index) => ({ line, index }))
+            .filter(item => !lockLines.has(item.index) && item.line.toLocaleLowerCase().includes(selectorLower))
+            .map(item => item.index);
+        const lineIndex = matchingIndexes.find(index => (
+            /^#{1,6}\s/u.test(lines[index])
+            || /^(\s*)(?:[-*+]|\d+[.)])\s/u.test(lines[index])
+        )) ?? matchingIndexes[0] ?? -1;
+        if (lineIndex < 0) continue;
+        const lineNumber = lineIndex + 1;
+        const heading = headings.find(item => item.lineNumber === lineNumber);
+        if (heading) {
+            const nextHeading = headings.find(item => item.lineNumber > heading.lineNumber && item.level <= heading.level);
+            ranges.push({
+                startLine: heading.lineNumber,
+                endLine: (nextHeading?.lineNumber || lines.length + 1) - 1,
+                label: "scope-selector",
+                reason: `scope selector heading: ${selector}`,
+            });
+            continue;
+        }
+
+        const bullet = lines[lineIndex].match(/^(\s*)(?:[-*+]|\d+[.)])\s/u);
+        const indent = bullet?.[1].length;
+        let endLine = lineNumber;
+        for (let index = lineIndex + 1; index < lines.length; index += 1) {
+            if (/^#{1,6}\s/u.test(lines[index])) break;
+            const nextBullet = lines[index].match(/^(\s*)(?:[-*+]|\d+[.)])\s/u);
+            if (nextBullet && indent !== undefined && nextBullet[1].length <= indent) break;
+            endLine = index + 1;
+        }
+        ranges.push({
+            startLine: lineNumber,
+            endLine,
+            label: "scope-selector",
+            reason: `scope selector item: ${selector}`,
+        });
+    }
+    return ranges;
 }
 
 function lineMatchesAnyAnchor(line: string, anchors: string[]): boolean {
@@ -346,17 +446,26 @@ function formatDocumentSegment(basename: string, label: string, startLine: numbe
     };
 }
 
-function extractGuardDocument(filePath: string, mode: "task" | "plan", stageId?: string, maxChars = mode === "task" ? TASK_DOC_BUDGET : PLAN_DOC_BUDGET): { text: string; coverage: GuardSourceCoverage; evidenceSourceText: string } | null {
+function extractGuardDocument(
+    filePath: string,
+    mode: "task" | "plan",
+    stageId?: string,
+    maxChars = mode === "task" ? TASK_DOC_BUDGET : PLAN_DOC_BUDGET,
+    scopeSelectors?: string[],
+): { text: string; coverage: GuardSourceCoverage; evidenceSourceText: string } | null {
     if (!fs.existsSync(filePath)) return null;
     const content = fs.readFileSync(filePath, "utf-8");
     const lines = content.split(/\r?\n/u);
     const basename = path.basename(filePath);
     const headings = parseHeadings(lines);
     const anchors = deriveGuardAnchors(stageId);
+    const normalizedSelectors = normalizeGuardScopeSelectors(scopeSelectors);
     const ranges: Array<{ startLine: number; endLine: number; label: string; reason: string }> = [];
 
-    const isShortDensePlan = mode === "plan" && lines.length <= 260 && content.length <= 60_000;
-    if (isShortDensePlan) {
+    const isShortDensePlan = normalizedSelectors.length === 0 && mode === "plan" && lines.length <= 260 && content.length <= 60_000;
+    if (normalizedSelectors.length > 0) {
+        ranges.push(...findScopeSelectorRanges(lines, headings, normalizedSelectors));
+    } else if (isShortDensePlan) {
         ranges.push({ startLine: 1, endLine: lines.length, label: "full-map", reason: "short dense plan/map file" });
     } else {
         const headEnd = mode === "task" ? Math.min(120, lines.length) : Math.min(60, lines.length);
@@ -439,7 +548,7 @@ function extractGuardDocument(filePath: string, mode: "task" | "plan", stageId?:
         mode,
         segments,
         unreadRanges: unreadRanges(lines.length, segments),
-        anchors,
+        anchors: [...anchors, ...normalizedSelectors],
         fallbackUsed: segments.some(segment => segment.label.includes("anchor-window")) || segments.length === 0,
         truncated,
     };
@@ -535,7 +644,7 @@ function computeCoverage(sources: GuardSourceCoverage[]) {
         if (source.segments.length === 0) coverageGaps.push(`${source.basename}: no segments extracted`);
         if (source.fallbackUsed) coverageGaps.push(`${source.basename}: fallback extraction used`);
         if (source.truncated) coverageGaps.push(`${source.basename}: segment truncated`);
-        if (!source.segments.some(segment => segment.label.includes("stage-section") || segment.label.includes("full-map"))) {
+        if (!source.segments.some(segment => segment.label.includes("stage-section") || segment.label.includes("full-map") || segment.label.includes("scope-selector"))) {
             coverageGaps.push(`${source.basename}: no stage section/full map`);
         }
     }
@@ -552,12 +661,17 @@ function computeCoverage(sources: GuardSourceCoverage[]) {
     return { confidence, truncationRisk, sources, coverageGaps } as GuardInputBundle["coverage"];
 }
 
-export function buildGuardInputBundle(planFiles: string[], taskFiles: string[], stageId?: string): GuardInputBundle {
+export function buildGuardInputBundle(
+    planFiles: string[],
+    taskFiles: string[],
+    stageId?: string,
+    scopeSelectors?: string[],
+): GuardInputBundle {
     const taskResults = taskFiles
-        .map(file => extractGuardDocument(file, "task", stageId, TASK_DOC_BUDGET))
+        .map(file => extractGuardDocument(file, "task", stageId, TASK_DOC_BUDGET, scopeSelectors))
         .filter((item): item is NonNullable<typeof item> => Boolean(item));
     const planResults = planFiles
-        .map(file => extractGuardDocument(file, "plan", stageId, PLAN_DOC_BUDGET))
+        .map(file => extractGuardDocument(file, "plan", stageId, PLAN_DOC_BUDGET, scopeSelectors))
         .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
     const sources = [...taskResults, ...planResults].map(item => item.coverage);
@@ -690,7 +804,7 @@ async function enhanceGuardInputBundleWithModelLocator(
         `输出格式：{"suggestions":[]}`,
     ].join("\n");
 
-    const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000));
+    const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), { grokContext: "default" });
     if (!response.text) {
         return {
             ...bundle,
@@ -712,6 +826,7 @@ async function enhanceGuardInputBundleWithModelLocator(
     const evidenceManifest = mergeEvidenceManifest([bundle.evidenceManifest, locatorEvidence]);
     const locatorNote = [
         `modelLocator: applied`,
+        `modelLocatorActual: chain=${response.chainUsed || "unknown"}, model=${response.modelUsed || "unknown"}, grokContext=default`,
         `modelLocatorRanges: ${[...taskSegments, ...planSegments].length}`,
         `modelLocatorRule: model suggested line ranges, then local file/path/range validation and bounded reread`,
     ].join("\n");
@@ -736,17 +851,24 @@ async function enhanceGuardInputBundleWithModelLocator(
  * @param startRound 起始轮次（0=全部）
  * @param charBudget 剩余字符预算
  */
-function getRecordContext(conversationId: string, stageId: string | undefined, charBudget: number): string {
+function getRecordContext(
+    conversationId: string,
+    stageId: string | undefined,
+    charBudget: number,
+    scopeSelectors?: string[],
+): string {
     const hash = findRecordHash(conversationId) || resolveWorkspaceHashForRecord();
     const record = readRecord(hash, conversationId);
     if (!record) return "";
     const anchors = deriveGuardAnchors(stageId);
+    const normalizedSelectors = normalizeGuardScopeSelectors(scopeSelectors);
     const lines = record.split(/\r?\n/u);
+    const headings = parseHeadings(lines);
     const ranges: Array<{ startLine: number; endLine: number; label: string; reason: string }> = [];
     const parts: string[] = [];
     let used = 0;
 
-    try {
+    if (normalizedSelectors.length === 0) try {
         const index = buildRecordReaderIndex(conversationId, record);
         const readerViews = [
             { label: "state", maxChars: Math.max(4_000, Math.floor(charBudget * 0.25)) },
@@ -772,10 +894,17 @@ function getRecordContext(conversationId: string, stageId: string | undefined, c
         console.error(`[guard-engine] Record Reader view failed, fallback to local slices: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    ranges.push({ startLine: 1, endLine: Math.min(80, lines.length), label: "record-head", reason: "record metadata and opening context" });
-    ranges.push({ startLine: Math.max(1, lines.length - 220), endLine: lines.length, label: "record-tail", reason: "latest state / risks / outputs" });
-    for (const window of findEvidenceWindows(lines, anchors, 12)) {
-        ranges.push({ startLine: window.startLine, endLine: window.endLine, label: "record-evidence", reason: window.anchor });
+    if (normalizedSelectors.length > 0) {
+        ranges.push(...findScopeSelectorRanges(lines, headings, normalizedSelectors).map(range => ({
+            ...range,
+            label: "record-scope-selector",
+        })));
+    } else {
+        ranges.push({ startLine: 1, endLine: Math.min(80, lines.length), label: "record-head", reason: "record metadata and opening context" });
+        ranges.push({ startLine: Math.max(1, lines.length - 220), endLine: lines.length, label: "record-tail", reason: "latest state / risks / outputs" });
+        for (const window of findEvidenceWindows(lines, anchors, 12)) {
+            ranges.push({ startLine: window.startLine, endLine: window.endLine, label: "record-evidence", reason: window.anchor });
+        }
     }
     const merged = mergeRanges(ranges);
     for (const range of merged) {
@@ -843,6 +972,7 @@ function buildGuardPrompt(
     evidenceText: string,
     evidenceIndexText: string,
     stageId?: string,
+    scopeSelectors?: string[],
     appealNote?: string,
     evidence?: string,
 ): string {
@@ -851,6 +981,7 @@ function buildGuardPrompt(
 ## 任务
 对比【计划要求】和【实际执行记录】，检查任务是否被真正完成。
 ${stageId ? `\n**重点关注范围**：${stageId}。只检查与 ${stageId} 直接相关的任务项，忽略其他 Stage 的历史遗留未完成项。\n` : ""}
+${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("；")}。只把这些选择器命中的任务项视为本次审核义务，同一 Stage 中未命中的任务项必须忽略，不能作为缺口。\n` : ""}
 ## 核心原则（最重要）
 **执行记录是 ground truth，Task.md 标记不可信。**
 - AI 可能标记了 [x] 但实际没做——你必须在执行记录中找到对应的代码修改、工具调用或文件操作作为证据
@@ -994,16 +1125,26 @@ export async function runGuardCheck(
     state: GuardState,
     appealNote?: string,
     evidence?: string,
-    options: { background?: boolean; evidenceAssets?: GuardEvidenceAssetInput[]; evidenceIndexMode?: GuardEvidenceIndexMode } = {},
+    options: {
+        background?: boolean;
+        evidenceAssets?: GuardEvidenceAssetInput[];
+        evidenceIndexMode?: GuardEvidenceIndexMode;
+        isCancelled?: () => boolean;
+        isSettled?: () => boolean;
+    } = {},
 ): Promise<GuardCheckResult> {
     // 1. 分段读取 Plan + Task 文件并生成 coverage / evidence manifest
-    const inputBundle = await enhanceGuardInputBundleWithModelLocator(
-        buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId),
-        state.planFiles,
-        state.taskFiles,
-        state.stageId,
-        resolveGuardModelChain(state),
-    );
+    const scopeSelectors = normalizeGuardScopeSelectors(state.scopeSelectors);
+    const initialInputBundle = buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId, scopeSelectors);
+    const inputBundle = scopeSelectors.length > 0
+        ? initialInputBundle
+        : await enhanceGuardInputBundleWithModelLocator(
+            initialInputBundle,
+            state.planFiles,
+            state.taskFiles,
+            state.stageId,
+            resolveGuardModelChain(state),
+        );
     const planContent = inputBundle.planContent;
     const taskContent = inputBundle.taskContent;
 
@@ -1015,10 +1156,13 @@ export async function runGuardCheck(
             rawResponse: "",
         };
     }
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
 
     // 2. 获取 Record 局部视图 + 对话原文执行记录（固定预算，不被 Plan/Task 挤掉）
     const recordContext = state.conversationId
-        ? getRecordContext(state.conversationId, state.stageId, RECORD_CONTEXT_BUDGET)
+        ? getRecordContext(state.conversationId, state.stageId, RECORD_CONTEXT_BUDGET, scopeSelectors)
         : "";
     const conversationExecution = state.conversationId
         ? await getConversationExecutionRecord(state.conversationId, state.startRound, EXECUTION_RECORD_BUDGET, state.chain || "auto")
@@ -1027,12 +1171,18 @@ export async function runGuardCheck(
     const externalEvidence = await buildGuardEvidenceIndexes(options.evidenceAssets, {
         indexMode: options.evidenceIndexMode || "auto",
     });
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
 
     const executionRecord = [recordContext, conversationExecution].filter(Boolean).join("\n\n===\n\n");
     const runtimeEvidence = extractEvidenceManifest(executionRecord);
     const externalEvidenceManifest = extractEvidenceManifest(externalEvidence.text);
     const mergedEvidenceManifest = mergeEvidenceManifest([inputBundle.evidenceManifest, runtimeEvidence, externalEvidenceManifest]);
     const evidenceText = formatEvidenceManifest(mergedEvidenceManifest);
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
     const evidenceManifestPath = saveTempFile(
         `stage_guard_evidence_manifest_${Date.now()}`,
         "Stage Guard Evidence Manifest",
@@ -1054,8 +1204,14 @@ export async function runGuardCheck(
     }
 
     // 4. 构建 Prompt → 调用 Flash
-    const prompt = buildGuardPrompt(planContent, taskContent, finalRecord, inputBundle.coverageText, evidenceText, externalEvidence.text, state.stageId, appealNote, evidence);
+    const prompt = buildGuardPrompt(planContent, taskContent, finalRecord, inputBundle.coverageText, evidenceText, externalEvidence.text, state.stageId, scopeSelectors, appealNote, evidence);
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
     const response = await callFlashWithChain(prompt, resolveGuardModelChain(state), { ...options, dataChain: state.chain });
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
 
     if (!response.text) {
         return {
@@ -1064,12 +1220,16 @@ export async function runGuardCheck(
             missingItems: [],
             rawResponse: "",
             infrastructureError: response.infrastructureError ?? true,
+            modelChainUsed: response.chainUsed,
+            modelUsed: response.modelUsed,
         };
     }
 
     // 5. 解析结果
     const result = resolveGuardSelfReferenceResult(parseGuardResult(response.text));
     result.evidenceIndexManifestPath = externalEvidence.manifestPath;
+    result.modelChainUsed = response.chainUsed;
+    result.modelUsed = response.modelUsed;
 
     // 6. 生成详细报告写入临时文件
     const reportLines = [
@@ -1077,9 +1237,13 @@ export async function runGuardCheck(
         ``,
         `- **时间**: ${new Date().toISOString()}`,
         `- **Stage**: ${state.stageId || "未指定"}`,
+        `- **Guard Id**: ${state.guardId}`,
+        `- **Child Scope**: ${state.childScopeId || "main"}`,
+        scopeSelectors.length > 0 ? `- **Scope Selectors**: ${scopeSelectors.join("; ")}` : "",
         `- **结果**: ${result.passed ? "✅ PASS" : "❌ FAIL"}`,
         `- **总结**: ${result.summary}`,
         `- **Coverage**: confidence=${inputBundle.coverage.confidence}, truncationRisk=${inputBundle.coverage.truncationRisk}`,
+        `- **Model Chain**: requested=${resolveGuardModelChain(state)}, actual=${response.chainUsed || "unknown"}, model=${response.modelUsed || "unknown"}, grokContext=guard`,
         `- **Extraction Manifest**: ${extractionManifestPath}`,
         `- **Evidence Manifest**: ${evidenceManifestPath}`,
         externalEvidence.items.length > 0 ? `- **External Evidence Index Manifest**: ${externalEvidence.manifestPath}` : "",
@@ -1111,6 +1275,9 @@ export async function runGuardCheck(
     reportLines.push(`## Flash 原始返回`, ``, "```", result.rawResponse, "```");
 
     const reportContent = reportLines.join("\n");
+    if (shouldAbortGuardRun(options)) {
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    }
     result.reportPath = saveTempFile(
         `stage_guard_report_${Date.now()}`,
         "Stage Guard 检查报告",

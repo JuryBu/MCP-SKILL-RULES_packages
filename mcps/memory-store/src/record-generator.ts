@@ -1,12 +1,14 @@
 import fs from "fs";
 import { formatRound, type ConversationRound } from "./trajectory.js";
 import {
-    readRecord, readRecordsIndex, writeRecordsIndex,
+    readRecordAsync, readRecordsIndex, readRecordsIndexAsync,
     type RecordIndexEntry,
 } from "./record-store.js";
-import { callModelResponse } from "./model-bridge.js";
+import { callModelResponse, resolveModelChainCandidates, type ModelBridgeResult } from "./model-bridge.js";
 import type { Chain } from "./chain.js";
 import { saveTempFile } from "./temp-store.js";
+import { mapGrokModel, type GrokExecDiagnostics } from "./grok-client.js";
+import { FifoConcurrencyGate, type ConcurrencyGatePermit } from "./concurrency-gate.js";
 
 /**
  * Record 生成引擎
@@ -31,8 +33,9 @@ export * from "./record-parse.js";
 // ===== 本模块内部使用的子模块符号 import =====
 import {
     FLASH_MODEL, MAX_PROMPT_CHARS, CODEX_RECORD_MAX_PROMPT_CHARS, CODEX_RECORD_CONTEXT_CHARS,
+    GROK_RECORD_MAX_PROMPT_CHARS,
     PROMPT_TEMPLATE_OVERHEAD, MIN_BATCH_ROUNDS, RECORD_AUTO_THRESHOLD,
-    CODEX_RECORD_TIMEOUT_MS, CODEX_RECORD_BACKGROUND_TIMEOUT_MS, RECORD_MODEL_TIMEOUT_MS,
+    CODEX_RECORD_TIMEOUT_MS, CODEX_RECORD_BACKGROUND_TIMEOUT_MS, RECORD_MODEL_TIMEOUT_MS, GROK_RECORD_TIMEOUT_MS,
     RECORD_PROGRESS_HEARTBEAT_MS, CODEX_RECORD_RETRY_DELAY_MS,
     CC_RECORD_MAX_PROMPT_CHARS, CC_RECORD_CONTEXT_CHARS, CC_RECORD_TIMEOUT_MS, CC_RECORD_BACKGROUND_TIMEOUT_MS,
     RECORD_PARALLEL_MODE, RECORD_PARALLEL_CONCURRENCY, RECORD_PARALLEL_RETRIES,
@@ -50,6 +53,11 @@ import type {
     RecordModelCallResult, FormattedRecordRound, RecordChunk, RecordPatch, RecordParallelMode,
     ParsedRecordDocument, LocalComposeBoundary, LocalComposeDelta, RoundSplitPart,
     SerialComposeAccumulator, SerialStepDelta, GenerateRecordResult, GenerateRecordOptions,
+    RecordCheckpointScope,
+} from "./record-types.js";
+import {
+    RecordGenerationAbortedError,
+    isRecordGenerationAbortedError,
 } from "./record-types.js";
 import {
     buildNewRecordPrompt, buildUpdateRecordPrompt, buildRecordPatchPrompt, buildReduceRecordPrompt,
@@ -58,8 +66,9 @@ import {
     summarizeClosedPhasesOutline,
 } from "./record-prompts.js";
 import {
-    readRecordPatchCheckpoint, writeRecordPatchCheckpoint,
+    readRecordPatchCheckpointAsync, writeRecordPatchCheckpointAsync,
 } from "./record-checkpoint.js";
+import { RECORD_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 import {
     parseRecordPatchResponse, normalizeCanonicalRecordLanguage, parseRecordDocument,
     selectLocalComposeBoundary, parseLocalComposeResponse, enforceRecordHeaderMetadata,
@@ -86,8 +95,389 @@ function localBridgeRecordFailureHint(modelChain: Chain, detail: string): string
     return detail;
 }
 
+function recordChainLabel(modelChain: Chain): string {
+    if (modelChain === "grok") return "Grok";
+    if (modelChain === "antigravity") return "Antigravity";
+    if (modelChain === "codex") return "Codex";
+    if (modelChain === "claude-code") return "Claude Code CLI";
+    return "自动链路";
+}
+
+function recordFailureSubject(modelChain: Exclude<Chain, "auto">): string {
+    if (modelChain === "codex") return "Codex Record 模型桥";
+    if (modelChain === "claude-code") return "Claude Code CLI Record 模型桥";
+    if (modelChain === "grok") return "Grok Record 模型";
+    return "Antigravity Record 模型";
+}
+
+function autoRecordFailurePrefix(actualChain: Chain | null): string {
+    if (actualChain && actualChain !== "auto") {
+        return `自动链路全部失败（最后尝试 ${recordChainLabel(actualChain)}）`;
+    }
+    return "自动链路全部失败";
+}
+
 function isLocalTextModelBridge(modelChain: Chain): boolean {
     return modelChain === "codex" || modelChain === "claude-code";
+}
+
+type RecordModelFailureMeta = {
+    requestedChain: Chain;
+    actualChain: Chain | null;
+};
+
+type RecordRuntimeOptions = GenerateRecordOptions & {
+    __modelChainsUsed?: Set<Chain>;
+    __modelModelsUsed?: Set<string>;
+    __recordModelScope?: RecordModelScope;
+    __lastRecordModelFailure?: RecordModelFailureMeta | null;
+    __grokDiagnostics?: GrokExecDiagnostics;
+};
+
+function captureGrokDiagnostics(response: Pick<ModelBridgeResult, "grokDiagnostics">, options: GenerateRecordOptions): void {
+    if (response.grokDiagnostics) {
+        (options as RecordRuntimeOptions).__grokDiagnostics = response.grokDiagnostics;
+    }
+}
+
+function setLastRecordModelFailure(
+    requestedChain: Chain,
+    actualChain: Chain | null,
+    options: GenerateRecordOptions = {},
+): void {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    runtimeOptions.__lastRecordModelFailure = { requestedChain, actualChain };
+}
+
+function clearLastRecordModelFailure(options: GenerateRecordOptions = {}): void {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    runtimeOptions.__lastRecordModelFailure = null;
+}
+
+function getLastRecordModelFailureActualChain(
+    requestedChain: Chain,
+    options: GenerateRecordOptions = {},
+): Chain | null {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    if (runtimeOptions.__lastRecordModelFailure?.requestedChain === requestedChain) {
+        return runtimeOptions.__lastRecordModelFailure.actualChain;
+    }
+    return requestedChain === "auto" ? null : requestedChain;
+}
+
+function formatRecordFailureMessage(
+    requestedChain: Chain,
+    detail: string,
+    options: GenerateRecordOptions = {},
+): string {
+    if (requestedChain === "auto") {
+        return `${autoRecordFailurePrefix(getLastRecordModelFailureActualChain(requestedChain, options))}：${detail}`;
+    }
+    if (isLocalTextModelBridge(requestedChain)) {
+        if (detail === "Record 模型调用失败或超时") {
+            return localBridgeRecordFailureHint(requestedChain, `${recordFailureSubject(requestedChain)}调用失败或超时`);
+        }
+        if (detail.startsWith("在第 ")) {
+            return localBridgeRecordFailureHint(requestedChain, `${recordFailureSubject(requestedChain)}${detail}`);
+        }
+        return localBridgeRecordFailureHint(requestedChain, detail);
+    }
+    return `${recordFailureSubject(requestedChain)}：${detail}`;
+}
+
+function formatRecordBatchFailureMessage(
+    requestedChain: Chain,
+    batchCount: number,
+    coveredRound: number,
+    options: GenerateRecordOptions = {},
+): string {
+    if (requestedChain === "auto") {
+        return `${autoRecordFailurePrefix(getLastRecordModelFailureActualChain(requestedChain, options))}：第 ${batchCount} 批失败，Record 仅覆盖到第 ${coveredRound} 轮`;
+    }
+    return `${recordFailureSubject(requestedChain as Exclude<Chain, "auto">)}在第 ${batchCount} 批失败，Record 仅覆盖到第 ${coveredRound} 轮`;
+}
+
+export type RecordModelScope = RecordCheckpointScope & {
+    timeoutMs: number;
+};
+
+const RECORD_GROK_CONTEXT = "record" as const;
+
+function recordModelBridgeOptions(options: GenerateRecordOptions = {}) {
+    return {
+        allowClaudeCodeFallback: options.allowClaudeCodeFallback,
+        grokContext: RECORD_GROK_CONTEXT,
+        trafficClass: options.trafficClass,
+        antigravityModelOverride: RECORD_ANTIGRAVITY_LS_MODEL,
+        shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+    };
+}
+
+function recordModelNameForChain(modelChain: Chain): string {
+    if (modelChain === "grok") return mapGrokModel(FLASH_MODEL, RECORD_GROK_CONTEXT);
+    if (modelChain === "antigravity") return RECORD_ANTIGRAVITY_LS_MODEL;
+    return FLASH_MODEL;
+}
+
+function recordTimeoutForChain(modelChain: Chain): number {
+    if (modelChain === "grok") return GROK_RECORD_TIMEOUT_MS;
+    return RECORD_MODEL_TIMEOUT_MS;
+}
+
+function getRecordCallTimeout(modelChain: Chain, requestedTimeout: number, options: GenerateRecordOptions = {}): number {
+    const baseTimeout = requestedTimeout === RECORD_MODEL_TIMEOUT_MS
+        ? recordTimeoutForChain(modelChain)
+        : requestedTimeout;
+    if (!isLocalTextModelBridge(modelChain)) {
+        return baseTimeout;
+    }
+    const localTimeoutLimit = modelChain === "claude-code"
+        ? (options.background ? CC_RECORD_BACKGROUND_TIMEOUT_MS : CC_RECORD_TIMEOUT_MS)
+        : (options.background ? CODEX_RECORD_BACKGROUND_TIMEOUT_MS : CODEX_RECORD_TIMEOUT_MS);
+    return options.background
+        ? Math.max(1, localTimeoutLimit)
+        : Math.max(1, Math.min(baseTimeout, localTimeoutLimit));
+}
+
+function fallbackRecordModelScope(requestedChain: Chain, modelChain: Chain = requestedChain): RecordModelScope {
+    return {
+        requestedChain,
+        modelChain,
+        modelName: recordModelNameForChain(modelChain),
+        grokContext: RECORD_GROK_CONTEXT,
+        timeoutMs: recordTimeoutForChain(modelChain),
+    };
+}
+
+export async function resolveRecordModelScope(
+    requestedChain: Chain,
+    options: GenerateRecordOptions = {},
+): Promise<RecordModelScope> {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    if (runtimeOptions.__recordModelScope?.requestedChain === requestedChain) {
+        return runtimeOptions.__recordModelScope;
+    }
+    const candidates = requestedChain === "auto"
+        ? await resolveModelChainCandidates(requestedChain, recordModelBridgeOptions(options))
+        : [];
+    const modelChain = candidates[0] || requestedChain;
+    const scope = fallbackRecordModelScope(requestedChain, modelChain);
+    runtimeOptions.__recordModelScope = scope;
+    return scope;
+}
+
+function getCachedRecordModelScope(
+    requestedChain: Chain,
+    options: GenerateRecordOptions = {},
+): RecordModelScope | null {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    if (runtimeOptions.__recordModelScope?.requestedChain === requestedChain) {
+        return runtimeOptions.__recordModelScope;
+    }
+    if (requestedChain === "auto") return null;
+    return fallbackRecordModelScope(requestedChain);
+}
+
+function checkpointScopeFromResponse(
+    requestedChain: Chain,
+    response: Pick<RecordModelCallResult, "chainUsed" | "modelUsed">,
+    options: GenerateRecordOptions = {},
+): RecordCheckpointScope {
+    const fallbackScope = getCachedRecordModelScope(requestedChain, options) || fallbackRecordModelScope(requestedChain);
+    const modelChain = response.chainUsed || fallbackScope.modelChain;
+    return {
+        requestedChain,
+        modelChain,
+        modelName: response.modelUsed || recordModelNameForChain(modelChain) || fallbackScope.modelName,
+        grokContext: RECORD_GROK_CONTEXT,
+    };
+}
+
+function reportRecordModelSuccess(
+    requestedChain: Chain,
+    result: Pick<RecordModelCallResult, "chainUsed" | "modelUsed">,
+    options: GenerateRecordOptions = {},
+): void {
+    clearLastRecordModelFailure(options);
+    const actualChain = result.chainUsed || "unknown";
+    const actualModel = result.modelUsed || "unknown";
+    const runtimeOptions = options as RecordRuntimeOptions;
+    if (result.chainUsed) {
+        runtimeOptions.__modelChainsUsed ??= new Set();
+        runtimeOptions.__modelChainsUsed.add(result.chainUsed);
+    }
+    if (result.modelUsed) {
+        runtimeOptions.__modelModelsUsed ??= new Set();
+        runtimeOptions.__modelModelsUsed.add(result.modelUsed);
+    }
+    console.error(`[record-generator] Record model call success requestedChain=${requestedChain} actualChain=${actualChain} actualModel=${actualModel} grokContext=record`);
+    options.onProgress?.({
+        stage: "模型链路",
+        detail: `Record 模型调用成功：requested=${requestedChain}, actual=${actualChain}, model=${actualModel}, grokContext=record`,
+    });
+}
+
+function getRecordAbortReason(options: GenerateRecordOptions = {}): "cancelled" | "settled" | null {
+    if (options.isCancelled?.()) return "cancelled";
+    if (options.isSettled?.()) return "settled";
+    return null;
+}
+
+function throwIfRecordRunAborted(options: GenerateRecordOptions = {}, detail = "停止后续 Record 生成"): void {
+    const reason = getRecordAbortReason(options);
+    if (!reason) return;
+    throw new RecordGenerationAbortedError(
+        reason,
+        reason === "cancelled"
+            ? `Record 更新已取消：${detail}`
+            : `后台任务已结算：${detail}`,
+    );
+}
+
+function readPositiveIntEnv(name: string, fallback: number): number {
+    const raw = Number(process.env[name] || "");
+    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : fallback;
+}
+
+const RECORD_GENERATION_QUEUE_TIMEOUT_MS = 30 * 60_000;
+const recordGenerationGate = new FifoConcurrencyGate(() => readPositiveIntEnv("MEMORY_STORE_RECORD_GENERATION_CONCURRENCY", 8));
+
+async function acquireRecordGenerationPermit(options: GenerateRecordOptions): Promise<ConcurrencyGatePermit> {
+    try {
+        return await recordGenerationGate.acquire({
+            timeoutMs: readPositiveIntEnv("MEMORY_STORE_RECORD_GENERATION_QUEUE_TIMEOUT_MS", RECORD_GENERATION_QUEUE_TIMEOUT_MS),
+            shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+            cancelMessage: "record generation gate cancelled",
+            timeoutMessage: "record generation gate timed out",
+        });
+    } catch (error) {
+        const reason = getRecordAbortReason(options);
+        if (reason) throw new RecordGenerationAbortedError(reason, `Record 生成并发等待期间已${reason === "cancelled" ? "取消" : "结算"}`);
+        if (error instanceof Error && error.message === "record generation gate timed out") {
+            throw new Error("Record 生成并发等待超时");
+        }
+        throw error;
+    }
+}
+
+export const __recordGenerationConcurrencyTest = {
+    stats(): ReturnType<FifoConcurrencyGate["stats"]> {
+        return recordGenerationGate.stats();
+    },
+    resetPeak(): void {
+        recordGenerationGate.resetPeakForTest();
+    },
+};
+
+function throwRecordModelCancelled(
+    result: Pick<RecordModelCallResult, "error">,
+    options: GenerateRecordOptions = {},
+): never {
+    const reason = getRecordAbortReason(options) || "cancelled";
+    throw new RecordGenerationAbortedError(
+        reason,
+        result.error || (reason === "settled" ? "后台任务已结算，Record 模型调用已停止" : "Record 模型调用已取消"),
+    );
+}
+
+async function callRecordModelBridgeOnce(
+    model: string,
+    prompt: string,
+    modelChain: Chain,
+    timeout: number,
+    options: GenerateRecordOptions = {},
+): Promise<RecordModelCallResult> {
+    const bridgeOptions = recordModelBridgeOptions(options);
+    if (modelChain !== "auto") {
+        throwIfRecordRunAborted(options, `准备调用 ${modelChain} 模型`);
+        const scopedTimeout = getRecordCallTimeout(modelChain, timeout, options);
+        const resp = await callModelResponse(model, prompt, modelChain, scopedTimeout, bridgeOptions);
+        captureGrokDiagnostics(resp, options);
+        return {
+            text: resp.text,
+            error: resp.error,
+            timedOut: resp.timedOut,
+            cancelled: resp.cancelled,
+            chainUsed: resp.chainUsed || modelChain,
+            modelUsed: resp.modelUsed,
+            grokDiagnostics: resp.grokDiagnostics,
+        };
+    }
+
+    const candidates = await resolveModelChainCandidates("auto", bridgeOptions);
+    if (candidates.length === 0) {
+        return {
+            text: null,
+            chainUsed: null,
+            error: options.allowClaudeCodeFallback
+                ? "Grok、Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用"
+                : "Grok、Antigravity LS 与 Codex 模型桥当前都不可用",
+        };
+    }
+
+    const errors: string[] = [];
+    const logicalDeadlineAt = Date.now() + Math.max(0, timeout);
+    for (const candidate of candidates) {
+        throwIfRecordRunAborted(options, `准备调用 ${candidate} 模型`);
+        const remainingMs = Math.max(0, logicalDeadlineAt - Date.now());
+        if (remainingMs <= 0) {
+            return {
+                text: null,
+                error: errors.join("；") || "Record auto 模型调用总预算已耗尽",
+                timedOut: true,
+                chainUsed: candidate,
+            };
+        }
+        const scopedTimeout = Math.min(getRecordCallTimeout(candidate, timeout, options), remainingMs);
+        const resp = await callModelResponse(model, prompt, candidate, scopedTimeout, bridgeOptions);
+        captureGrokDiagnostics(resp, options);
+        if (resp.cancelled) {
+            return {
+                text: null,
+                error: resp.error,
+                cancelled: true,
+                chainUsed: resp.chainUsed || candidate,
+                modelUsed: resp.modelUsed,
+                grokDiagnostics: resp.grokDiagnostics,
+            };
+        }
+        if (resp.text) {
+            return {
+                text: resp.text,
+                chainUsed: resp.chainUsed,
+                modelUsed: resp.modelUsed,
+                grokDiagnostics: resp.grokDiagnostics,
+            };
+        }
+        errors.push(resp.error || `${candidate} 模型桥调用失败`);
+        if (resp.timedOut && candidate !== "grok") {
+            return {
+                text: null,
+                error: resp.error,
+                timedOut: true,
+                chainUsed: resp.chainUsed || candidate,
+                modelUsed: resp.modelUsed,
+                grokDiagnostics: resp.grokDiagnostics,
+            };
+        }
+    }
+    return {
+        text: null,
+        chainUsed: candidates[candidates.length - 1] || null,
+        error: errors.join("；") || "模型桥调用失败",
+    };
+}
+
+function withRecordModelUsage<T extends GenerateRecordResult>(result: T, options: GenerateRecordOptions): T {
+    const runtimeOptions = options as RecordRuntimeOptions;
+    const modelChainsUsed = runtimeOptions.__modelChainsUsed ? Array.from(runtimeOptions.__modelChainsUsed) : [];
+    const modelModelsUsed = runtimeOptions.__modelModelsUsed ? Array.from(runtimeOptions.__modelModelsUsed) : [];
+    return {
+        ...result,
+        ...(modelChainsUsed.length > 0 ? { modelChainsUsed } : {}),
+        ...(modelModelsUsed.length > 0 ? { modelModelsUsed } : {}),
+        ...(runtimeOptions.__grokDiagnostics ? { grokDiagnostics: runtimeOptions.__grokDiagnostics } : {}),
+    };
 }
 
 async function callRecordModelWithRetry(
@@ -97,28 +487,26 @@ async function callRecordModelWithRetry(
     timeout: number,
     options: GenerateRecordOptions = {},
 ): Promise<RecordModelCallResult> {
-    const localTimeoutLimit = modelChain === "claude-code"
-        ? (options.background ? CC_RECORD_BACKGROUND_TIMEOUT_MS : CC_RECORD_TIMEOUT_MS)
-        : (options.background ? CODEX_RECORD_BACKGROUND_TIMEOUT_MS : CODEX_RECORD_TIMEOUT_MS);
-    const effectiveTimeout = isLocalTextModelBridge(modelChain)
-        ? (options.background
-            ? Math.max(1, localTimeoutLimit)
-            : Math.max(1, Math.min(timeout, localTimeoutLimit)))
-        : timeout;
-    const bridgeName = modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
-    const resp = await callModelResponse(model, prompt, modelChain, effectiveTimeout, {
-        allowClaudeCodeFallback: options.allowClaudeCodeFallback,
-    });
-    if (resp.text) return { text: resp.text };
+    throwIfRecordRunAborted(options, "模型调用前检查到任务已终止");
+    const scope = await resolveRecordModelScope(modelChain, options);
+    const bridgeName = scope.modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
+    const resp = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+    if (resp.text) {
+        reportRecordModelSuccess(modelChain, resp, options);
+        return { text: resp.text, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
+    }
+    if (resp.cancelled) throwRecordModelCancelled(resp, options);
     // 守卫放宽（C2）：凡是「真超时」一律不重试，无论本地文本桥（Codex/CC）还是 antigravity/Flash 链路。
     // 真超时已经白等满了整个 timeout，再无条件重试只会把总耗时翻倍（如 antigravity 180s → 360s）。
     // 连接拒/进程死/空响应等普通失败 timedOut=false，仍走下方原有重试逻辑（可重试 / 换候选）。
     if (resp.timedOut) {
-        const label = isLocalTextModelBridge(modelChain) ? bridgeName : "Antigravity/Flash";
+        const actualChain = resp.chainUsed || scope.modelChain;
+        const label = modelChain === "auto" ? autoRecordFailurePrefix(actualChain) : recordChainLabel(actualChain);
+        setLastRecordModelFailure(modelChain, actualChain, options);
         console.error(`[record-generator] ${label} 模型调用超时，不重试: ${resp.error || "unknown error"}`);
-        return { text: null, error: resp.error, timedOut: true };
+        return { text: null, error: resp.error, timedOut: true, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
     }
-    if (isLocalTextModelBridge(modelChain)) {
+    if (isLocalTextModelBridge(scope.modelChain)) {
         console.error(`[record-generator] ${bridgeName} 模型调用快失败，${CODEX_RECORD_RETRY_DELAY_MS}ms 后重试 1 次: ${resp.error || "unknown error"}`);
         options.onProgress?.({
             stage: "模型生成重试",
@@ -127,20 +515,35 @@ async function callRecordModelWithRetry(
         if (CODEX_RECORD_RETRY_DELAY_MS > 0) {
             await new Promise(r => setTimeout(r, CODEX_RECORD_RETRY_DELAY_MS));
         }
-        const retry = await callModelResponse(model, prompt, modelChain, effectiveTimeout, {
-            allowClaudeCodeFallback: options.allowClaudeCodeFallback,
-        });
-        if (retry.text) return { text: retry.text };
+        throwIfRecordRunAborted(options, `${bridgeName} 模型桥重试前检查到任务已终止`);
+        const retry = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+        if (retry.cancelled) throwRecordModelCancelled(retry, options);
+        if (retry.text) {
+            reportRecordModelSuccess(modelChain, retry, options);
+            return { text: retry.text, chainUsed: retry.chainUsed, modelUsed: retry.modelUsed };
+        }
+        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options);
         console.error(`[record-generator] ${bridgeName} 模型调用重试失败: ${retry.error || "unknown error"}`);
-        return { text: null, error: retry.error || resp.error, timedOut: retry.timedOut };
+        return { text: null, error: retry.error || resp.error, timedOut: retry.timedOut, chainUsed: retry.chainUsed || resp.chainUsed, modelUsed: retry.modelUsed || resp.modelUsed };
     }
     // 第一次失败，等 5 秒重试
-    console.error(`[record-generator] Flash 首次失败，5s 后重试...`);
+    const retryLabel = modelChain === "auto" ? "自动链路" : recordChainLabel(scope.modelChain);
+    console.error(`[record-generator] ${retryLabel} 首次失败，5s 后重试...`);
     await new Promise(r => setTimeout(r, 5000));
-    const retry = await callModelResponse(model, prompt, modelChain, timeout, {
-        allowClaudeCodeFallback: options.allowClaudeCodeFallback,
-    });
-    return { text: retry.text, error: retry.error || resp.error, timedOut: retry.timedOut || resp.timedOut };
+    throwIfRecordRunAborted(options, `${retryLabel} 重试前检查到任务已终止`);
+    const retry = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+    if (retry.cancelled) throwRecordModelCancelled(retry, options);
+    if (retry.text) reportRecordModelSuccess(modelChain, retry, options);
+    if (!retry.text) {
+        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options);
+    }
+    return {
+        text: retry.text,
+        error: retry.error || resp.error,
+        timedOut: retry.timedOut || resp.timedOut,
+        chainUsed: retry.chainUsed || resp.chainUsed,
+        modelUsed: retry.modelUsed || resp.modelUsed,
+    };
 }
 
 async function callFlashWithRetryChain(
@@ -199,20 +602,39 @@ function capSingleRoundText(text: string, roundIndex: number): string {
  * 降级 100% 兜底：任一 part 的模型调用失败 / 空返回 → 该轮整体退回 `capSingleRoundText(rawText)`，
  * 绝不抛异常、绝不让整条 Record 生成失败（沿用「降级不中止」原则）。
  */
+function readNonNegativeIntEnv(name: string, fallback: number): number {
+    const raw = process.env[name];
+    if (raw == null) return fallback;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 0) return fallback;
+    return n;
+}
+
+const RECORD_FORMAT_YIELD_INTERVAL = readNonNegativeIntEnv("MEMORY_STORE_RECORD_FORMAT_YIELD_INTERVAL", 5);
+
+function eventLoopYield(): Promise<void> {
+    return new Promise(resolve => setImmediate(resolve));
+}
+
 export async function formatRoundsForRecordAsync(
     rounds: ConversationRound[],
     modelChain: Chain = "auto",
     options: GenerateRecordOptions = {},
 ): Promise<FormattedRecordRound[]> {
     const result: FormattedRecordRound[] = [];
-    for (const round of rounds) {
+    for (let i = 0; i < rounds.length; i++) {
+        const round = rounds[i];
         const rawText = formatRound(round, "normal");
         if (rawText.length <= RECORD_MAX_SINGLE_ROUND_CHARS) {
             result.push({ round, text: rawText, chars: charCount(rawText) });
-            continue;
+        } else {
+            const text = await compressOversizedRound(round, rawText, modelChain, options);
+            result.push({ round, text, chars: charCount(text) });
         }
-        const text = await compressOversizedRound(round, rawText, modelChain, options);
-        result.push({ round, text, chars: charCount(text) });
+        if (RECORD_FORMAT_YIELD_INTERVAL > 0 && (i + 1) % RECORD_FORMAT_YIELD_INTERVAL === 0) {
+            await eventLoopYield();
+            throwIfRecordRunAborted(options, `格式化轮次 ${round.roundIndex} 让步后检查到任务已终止`);
+        }
     }
     return result;
 }
@@ -326,6 +748,7 @@ async function compressOversizedRound(
         const compressedParts: string[] = [];
         let prevSummary = "";
         for (let i = 0; i < parts.length; i++) {
+            throwIfRecordRunAborted(options, `压缩超大轮 ${round.roundIndex} 的第 ${i + 1}/${parts.length} 段前检查到任务已终止`);
             const part = parts[i];
             const prompt = buildRoundPartCompressionPrompt(
                 round.roundIndex,
@@ -366,6 +789,7 @@ async function compressOversizedRound(
             .join("\n\n");
         return merged;
     } catch (err) {
+        if (isRecordGenerationAbortedError(err)) throw err;
         // 任何意外都降级，绝不冒泡到 Record 生成主流程。
         console.error(`[record-generator] 轮次 ${round.roundIndex} 超大轮压缩异常，整轮降级 capSingleRoundText: ${err instanceof Error ? err.message : String(err)}`);
         return capSingleRoundText(rawText, round.roundIndex);
@@ -485,13 +909,14 @@ function buildAdjacentContext(allFormatted: FormattedRecordRound[], chunk: Recor
     return parts.join("\n\n---\n\n");
 }
 
-function getMaxPromptChars(modelChain: Chain): number {
+export function getMaxPromptChars(modelChain: Chain): number {
+    if (modelChain === "grok") return GROK_RECORD_MAX_PROMPT_CHARS;
     if (modelChain === "codex") return CODEX_RECORD_MAX_PROMPT_CHARS;
     if (modelChain === "claude-code") return CC_RECORD_MAX_PROMPT_CHARS;
     return MAX_PROMPT_CHARS;
 }
 
-function getMinBatchRounds(modelChain: Chain): number {
+export function getMinBatchRounds(modelChain: Chain): number {
     return isLocalTextModelBridge(modelChain) ? 1 : MIN_BATCH_ROUNDS;
 }
 
@@ -531,7 +956,7 @@ async function reconcileRecordIndexCoverage(
     existingRecord: string,
     totalRounds: number,
 ): Promise<RecordIndexEntry | undefined> {
-    const index = readRecordsIndex(hash);
+    const index = await readRecordsIndexAsync(hash);
     const existingIndex = index.records[conversationId];
     const inferredCoveredRound = inferCoveredRoundFromRecord(existingRecord, totalRounds);
     const indexedRound = Math.min(Math.max(existingIndex?.lastUpdatedRound ?? 0, 0), totalRounds);
@@ -555,10 +980,8 @@ async function reconcileRecordIndexCoverage(
         tags: existingIndex?.tags || [],
     };
 
-    index.records[conversationId] = repaired;
-    await writeRecordsIndex(hash, index);
     console.error(
-        `[record-generator] 修正 Record 索引覆盖轮次: ${conversationId.slice(0, 8)} ${indexedRound} → ${inferredCoveredRound}`
+        `[record-generator] 按 Record 正文修正索引覆盖轮次: ${conversationId.slice(0, 8)} ${indexedRound} → ${inferredCoveredRound}`
     );
     return repaired;
 }
@@ -567,11 +990,13 @@ async function mapWithConcurrency<T, R>(
     items: T[],
     concurrency: number,
     worker: (item: T, index: number) => Promise<R>,
+    options: GenerateRecordOptions = {},
 ): Promise<R[]> {
     const results: R[] = new Array(items.length);
     let next = 0;
     const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
         while (next < items.length) {
+            throwIfRecordRunAborted(options, "并行任务取下一个批次前检查到任务已终止");
             const index = next++;
             results[index] = await worker(items[index], index);
         }
@@ -590,7 +1015,9 @@ async function generatePatchForChunk(
     chunkIndex: number,
     totalChunks: number,
 ): Promise<RecordPatch> {
-    const cached = readRecordPatchCheckpoint("map", conversationId, modelChain, chunk.startRound, chunk.endRound, prompt);
+    throwIfRecordRunAborted(options, `生成 RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 前检查到任务已终止`);
+    const readScope = getCachedRecordModelScope(modelChain, options);
+    const cached = await readRecordPatchCheckpointAsync("map", conversationId, readScope, chunk.startRound, chunk.endRound, prompt);
     if (cached) {
         options.onProgress?.({
             stage: "并行生成 RecordPatch",
@@ -602,6 +1029,7 @@ async function generatePatchForChunk(
         return cached;
     }
     let lastError = "";
+    let lastCheckpointScope: RecordCheckpointScope = readScope || fallbackRecordModelScope(modelChain);
     for (let attempt = 0; attempt <= RECORD_PARALLEL_RETRIES; attempt++) {
         options.onProgress?.({
             stage: "并行生成 RecordPatch",
@@ -611,14 +1039,16 @@ async function generatePatchForChunk(
             detail: `第 ${chunkIndex + 1}/${totalChunks} 个区段，${roundRangeLabel(chunk.startRound, chunk.endRound)}，尝试 ${attempt + 1}/${RECORD_PARALLEL_RETRIES + 1}`,
         });
         const response = await callRecordModelWithRetry(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        lastCheckpointScope = checkpointScopeFromResponse(modelChain, response, options);
         if (response.text) {
+            throwIfRecordRunAborted(options, `RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 已生成，写 checkpoint 前检查到任务已终止`);
             const patch = parseRecordPatchResponse(response.text, chunk.startRound, chunk.endRound);
             const status = patch.status === "parse_fallback" ? "invalid" : "done";
-            writeRecordPatchCheckpoint(
+            await writeRecordPatchCheckpointAsync(
                 "map",
                 conversationId,
                 workspace,
-                modelChain,
+                lastCheckpointScope,
                 chunk.startRound,
                 chunk.endRound,
                 prompt,
@@ -633,12 +1063,14 @@ async function generatePatchForChunk(
         }
         if (response.timedOut && isLocalTextModelBridge(modelChain)) {
             const bridgeName = modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
-            writeRecordPatchCheckpoint("map", conversationId, workspace, modelChain, chunk.startRound, chunk.endRound, prompt, "timeout", undefined, response.error);
+            throwIfRecordRunAborted(options, `RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 超时后写 checkpoint 前检查到任务已终止`);
+            await writeRecordPatchCheckpointAsync("map", conversationId, workspace, lastCheckpointScope, chunk.startRound, chunk.endRound, prompt, "timeout", undefined, response.error);
             throw new Error(`RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} ${bridgeName} 模型桥完整超时，不自动重试`);
         }
         lastError = `RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 生成失败`;
     }
-    writeRecordPatchCheckpoint("map", conversationId, workspace, modelChain, chunk.startRound, chunk.endRound, prompt, "failed", undefined, lastError);
+    throwIfRecordRunAborted(options, `RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 失败后写 checkpoint 前检查到任务已终止`);
+    await writeRecordPatchCheckpointAsync("map", conversationId, workspace, lastCheckpointScope, chunk.startRound, chunk.endRound, prompt, "failed", undefined, lastError);
     throw new Error(`${lastError}；可缩小 chunk 或改用 dataChain=${modelChain === "claude-code" ? "claude-code" : "codex"}, modelChain=antigravity`);
 }
 
@@ -656,6 +1088,7 @@ async function compressRecordPatchGroup(
 ): Promise<RecordPatch> {
     const startRound = patches[0]?.startRound ?? 0;
     const endRound = patches[patches.length - 1]?.endRound ?? startRound;
+    throwIfRecordRunAborted(options, `压缩 RecordPatch ${roundRangeLabel(startRound, endRound)} 前检查到任务已终止`);
     const prompt = buildCompressRecordPatchesPrompt(
         conversationId,
         workspace,
@@ -665,7 +1098,8 @@ async function compressRecordPatchGroup(
         groupIndex,
         totalGroups,
     );
-    const cached = readRecordPatchCheckpoint("compress", conversationId, modelChain, startRound, endRound, prompt);
+    const readScope = getCachedRecordModelScope(modelChain, options);
+    const cached = await readRecordPatchCheckpointAsync("compress", conversationId, readScope, startRound, endRound, prompt);
     if (cached) {
         options.onProgress?.({
             stage: "压缩 RecordPatch",
@@ -677,6 +1111,7 @@ async function compressRecordPatchGroup(
         return cached;
     }
     let lastError = "";
+    let lastCheckpointScope: RecordCheckpointScope = readScope || fallbackRecordModelScope(modelChain);
     for (let attempt = 0; attempt <= RECORD_PARALLEL_RETRIES; attempt++) {
         options.onProgress?.({
             stage: "压缩 RecordPatch",
@@ -686,14 +1121,16 @@ async function compressRecordPatchGroup(
             detail: `第 ${level} 层，第 ${groupIndex + 1}/${totalGroups} 组，${roundRangeLabel(startRound, endRound)}，尝试 ${attempt + 1}/${RECORD_PARALLEL_RETRIES + 1}`,
         });
         const response = await callRecordModelWithRetry(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        lastCheckpointScope = checkpointScopeFromResponse(modelChain, response, options);
         if (response.text) {
+            throwIfRecordRunAborted(options, `压缩 RecordPatch ${roundRangeLabel(startRound, endRound)} 已生成，写 checkpoint 前检查到任务已终止`);
             const patch = parseRecordPatchResponse(response.text, startRound, endRound);
             const status = patch.status === "parse_fallback" ? "invalid" : "done";
-            writeRecordPatchCheckpoint(
+            await writeRecordPatchCheckpointAsync(
                 "compress",
                 conversationId,
                 workspace,
-                modelChain,
+                lastCheckpointScope,
                 startRound,
                 endRound,
                 prompt,
@@ -708,12 +1145,14 @@ async function compressRecordPatchGroup(
         }
         if (response.timedOut && isLocalTextModelBridge(modelChain)) {
             const bridgeName = modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
-            writeRecordPatchCheckpoint("compress", conversationId, workspace, modelChain, startRound, endRound, prompt, "timeout", undefined, response.error);
+            throwIfRecordRunAborted(options, `压缩 RecordPatch ${roundRangeLabel(startRound, endRound)} 超时后写 checkpoint 前检查到任务已终止`);
+            await writeRecordPatchCheckpointAsync("compress", conversationId, workspace, lastCheckpointScope, startRound, endRound, prompt, "timeout", undefined, response.error);
             throw new Error(`RecordPatch 压缩组 ${groupIndex + 1}/${totalGroups} ${bridgeName} 模型桥完整超时，不自动重试`);
         }
         lastError = response.error || `RecordPatch 压缩组 ${groupIndex + 1}/${totalGroups} 生成失败`;
     }
-    writeRecordPatchCheckpoint("compress", conversationId, workspace, modelChain, startRound, endRound, prompt, "failed", undefined, lastError);
+    throwIfRecordRunAborted(options, `压缩 RecordPatch ${roundRangeLabel(startRound, endRound)} 失败后写 checkpoint 前检查到任务已终止`);
+    await writeRecordPatchCheckpointAsync("compress", conversationId, workspace, lastCheckpointScope, startRound, endRound, prompt, "failed", undefined, lastError);
     throw new Error(lastError || `RecordPatch 压缩组 ${groupIndex + 1}/${totalGroups} 生成失败`);
 }
 
@@ -775,6 +1214,7 @@ async function compressPatchesIfNeeded(
     let level = 0;
 
     while (current.length > directLimit && level < Math.max(1, RECORD_REDUCE_MAX_LEVELS)) {
+        throwIfRecordRunAborted(options, `第 ${level + 1} 层 RecordPatch 压缩前检查到任务已终止`);
         level++;
         const groups = groupPatchesForCompression(current, groupSize, targetChars);
         if (groups.length >= current.length) break;
@@ -803,7 +1243,7 @@ async function compressPatchesIfNeeded(
                 detail: `第 ${level} 层第 ${index + 1}/${groups.length} 组完成，${roundRangeLabel(patch.startRound, patch.endRound)}`,
             });
             return patch;
-        });
+        }, options);
         current = current.sort((a, b) => a.startRound - b.startRound);
     }
 
@@ -850,6 +1290,7 @@ async function composeDeltaSerially(
     };
 
     for (let i = 0; i < windows.length; i++) {
+        throwIfRecordRunAborted(options, `本地合成子窗口 ${i + 1}/${windows.length} 前检查到任务已终止`);
         const window = windows[i];
         const windowStartRound = window[0].startRound;
         // 用 max 防止上游某天传入 endRound 非单调的 patches 导致少覆盖
@@ -1012,6 +1453,7 @@ async function composeDeltaSerially(
     let tailMarkdown = "";
     let tailTags: string[] = [];
     try {
+        throwIfRecordRunAborted(options, "本地合成尾部生成前检查到任务已终止");
         options.onProgress?.({
             stage: "本地合成尾部生成",
             current: totalRounds,
@@ -1063,6 +1505,7 @@ async function generateRecordWithLocalCompose(
     modelChain: Chain,
     options: GenerateRecordOptions,
 ): Promise<GenerateRecordResult> {
+    throwIfRecordRunAborted(options, "进入 Local Compose 前检查到任务已终止");
     const parsedRaw = parseRecordDocument(existingRecord);
     // 从零 / 0-Phase（损坏旧 Record，或 force 重建后 existingRecord 为空）：不再硬判败，
     // 而是构造从零边界（stableEndRound=0 / rewriteStartRound=1，selectLocalComposeBoundary 对 0 Phase 已内建）
@@ -1106,12 +1549,11 @@ async function generateRecordWithLocalCompose(
                 boundary, parsed, rollbackPhaseText, rewritePatches, modelChain, options,
             );
         } catch (err) {
+            if (isRecordGenerationAbortedError(err)) throw err;
             const msg = err instanceof Error ? err.message : String(err);
             return {
                 success: false,
-                error: isLocalTextModelBridge(modelChain)
-                    ? localBridgeRecordFailureHint(modelChain, `串行本地合成失败：${msg}`)
-                    : `串行本地合成失败：${msg}`,
+                error: formatRecordFailureMessage(modelChain, `串行本地合成失败：${msg}`, options),
                 batches: patches.length,
                 pipeline: "parallel",
             };
@@ -1151,9 +1593,7 @@ async function generateRecordWithLocalCompose(
         if (!response.text) {
             return {
                 success: false,
-                error: isLocalTextModelBridge(modelChain)
-                    ? localBridgeRecordFailureHint(modelChain, "Local Compose 增量生成失败或超时")
-                    : "Flash Local Compose 增量生成失败",
+                error: formatRecordFailureMessage(modelChain, "Local Compose 增量生成失败或超时", options),
                 batches: patches.length,
                 pipeline: "parallel",
             };
@@ -1256,6 +1696,7 @@ async function generateRecordParallel(
     options: GenerateRecordOptions,
     resumeFromRound = 0,
 ): Promise<GenerateRecordResult> {
+    throwIfRecordRunAborted(options, "进入并行 Record 生成前检查到任务已终止");
     const recordSummary = summarizeRecordStructure(existingRecord);
     const concurrency = Math.max(1, RECORD_PARALLEL_CONCURRENCY);
     options.onProgress?.({
@@ -1290,7 +1731,7 @@ async function generateRecordParallel(
             detail: `区段 ${chunk.startRound}-${chunk.endRound} 完成`,
         });
         return patch;
-    });
+    }, options);
 
     // 大重写区且将走串行本地合成时，跳过压缩——串行循环需要细粒度的原始 patch（每个约 10 轮），
     // 压缩会把它们合并成少数大 patch，导致串行退化成单次大输出；顺带省掉一次压缩耗时。
@@ -1308,6 +1749,7 @@ async function generateRecordParallel(
             modelChain,
             options,
         );
+    throwIfRecordRunAborted(options, "RecordPatch 阶段完成后、整合前检查到任务已终止");
 
     // local-compose 现在也接管「从零 / 无旧 Record」生成：parsed.phases===0 时由 selectLocalComposeBoundary
     // 给出从零边界，走结构化串行合成 + 代码骨架兜底。从零场景不再掉进下方 reduce 老路（模型自由写整篇、
@@ -1370,9 +1812,7 @@ async function generateRecordParallel(
     if (!response) {
         return {
             success: false,
-            error: isLocalTextModelBridge(modelChain)
-                ? localBridgeRecordFailureHint(modelChain, "RecordPatch 整合失败或超时")
-                : "Flash RecordPatch 整合失败",
+            error: formatRecordFailureMessage(modelChain, "RecordPatch 整合失败或超时", options),
             batches: chunks.length,
             pipeline: "parallel",
         };
@@ -1407,36 +1847,39 @@ export async function generateRecord(
     modelChain: Chain = "auto",
     options: GenerateRecordOptions = {},
 ): Promise<GenerateRecordResult> {
-    if (rounds.length === 0) {
-        return { success: false, error: "对话无内容" };
-    }
+    let generationPermit: ConcurrencyGatePermit | null = null;
+    try {
+        if (rounds.length === 0) {
+            return { success: false, error: "对话无内容" };
+        }
+        throwIfRecordRunAborted(options, "Record 生成启动前检查到任务已终止");
 
-    // 读取已有 Record。force=true 默认表示“强制刷新”，但不再丢弃可解析旧 Record。
-    // 超长对话直接从 0 全量重建容易把高质量旧 Record 压缩成少数 Phase；
-    // 如确实需要旧式全量重建，可显式设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1。
-    const storedRecord = readRecord(hash, conversationId) || "";
-    const forceRequested = options.force === true;
-    const storedParsedForForce = storedRecord ? parseRecordDocument(storedRecord) : null;
-    const preserveExistingForForce = forceRequested
-        && !RECORD_FORCE_FULL_REBUILD
-        && storedParsedForForce !== null
-        && storedParsedForForce.phases.length > 0;
-    const forceRebuild = forceRequested && !preserveExistingForForce;
-    let existingRecord = forceRebuild ? "" : storedRecord;
-    let currentRecord = existingRecord;
-    const totalRounds = rounds.length;
-    const indexBeforeRepair = readRecordsIndex(hash).records[conversationId];
-    const indexedBeforeRepair = Math.min(Math.max(indexBeforeRepair?.lastUpdatedRound ?? 0, 0), totalRounds);
-    const inferredBeforeRepair = storedRecord ? inferCoveredRoundFromRecord(storedRecord, totalRounds) : 0;
-    const existingIndex = existingRecord
-        ? await reconcileRecordIndexCoverage(hash, conversationId, existingRecord, totalRounds)
-        : forceRebuild ? undefined : indexBeforeRepair;
-    let resumeFromRound = existingRecord
-        ? Math.min(Math.max(existingIndex?.lastUpdatedRound ?? 0, 0), totalRounds)
-        : 0;
-    const forcePreserveWarning = preserveExistingForForce
-        ? "force=true 已按安全刷新处理：保留旧 Record 稳定 Phase，仅回滚尾部并继续增量合成；若确需丢弃旧 Record 全量重建，请设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1"
-        : undefined;
+        // 读取已有 Record。force=true 默认表示“强制刷新”，但不再丢弃可解析旧 Record。
+        // 超长对话直接从 0 全量重建容易把高质量旧 Record 压缩成少数 Phase；
+        // 如确实需要旧式全量重建，可显式设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1。
+        const storedRecord = await readRecordAsync(hash, conversationId) || "";
+        const forceRequested = options.force === true;
+        const storedParsedForForce = storedRecord ? parseRecordDocument(storedRecord) : null;
+        const preserveExistingForForce = forceRequested
+            && !RECORD_FORCE_FULL_REBUILD
+            && storedParsedForForce !== null
+            && storedParsedForForce.phases.length > 0;
+        const forceRebuild = forceRequested && !preserveExistingForForce;
+        let existingRecord = forceRebuild ? "" : storedRecord;
+        let currentRecord = existingRecord;
+        const totalRounds = rounds.length;
+        const indexBeforeRepair = (await readRecordsIndexAsync(hash)).records[conversationId];
+        const indexedBeforeRepair = Math.min(Math.max(indexBeforeRepair?.lastUpdatedRound ?? 0, 0), totalRounds);
+        const inferredBeforeRepair = storedRecord ? inferCoveredRoundFromRecord(storedRecord, totalRounds) : 0;
+        const existingIndex = existingRecord
+            ? await reconcileRecordIndexCoverage(hash, conversationId, existingRecord, totalRounds)
+            : forceRebuild ? undefined : indexBeforeRepair;
+        let resumeFromRound = existingRecord
+            ? Math.min(Math.max(existingIndex?.lastUpdatedRound ?? 0, 0), totalRounds)
+            : 0;
+        const forcePreserveWarning = preserveExistingForForce
+            ? "force=true 已按安全刷新处理：保留旧 Record 稳定 Phase，仅回滚尾部并继续增量合成；若确需丢弃旧 Record 全量重建，请设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1"
+            : undefined;
     // 只要会走 local-compose（force=true 安全刷新 / force=false 增量），就要把 resumeFromRound
     // 预先拉齐到 boundary.stableEndRound——否则 chunks 从旧 lastUpdatedRound 起，会跳过 boundary
     // 决定回滚的 Phase 所覆盖的轮次（如 lastUpdatedRound=43，回滚 2 个 Phase 后 stableEndRound=41，
@@ -1445,18 +1888,18 @@ export async function generateRecord(
         && Boolean(existingRecord)
         && storedParsedForForce !== null
         && storedParsedForForce.phases.length > 0
-        && resumeFromRound < totalRounds; // 旧 Record 已覆盖到最新轮时保持 upToDate 短路，不再拉齐
+        && (resumeFromRound < totalRounds || preserveExistingForForce);
     if (willRunLocalCompose) {
         const boundary = selectLocalComposeBoundary(storedParsedForForce!, resumeFromRound, totalRounds);
         // 仅当 boundary 留下了非空稳定区且回滚跨越了原 resumeFromRound（旧 Record 末段 Phase 被回滚导致空洞）才拉齐；
-        // 否则保持原行为，避免把"短旧 Record 索引错乱、只需补未覆盖轮"等场景误退到 0。
-        if (boundary.stablePhases.length > 0 && boundary.stableEndRound < resumeFromRound) {
+        // force=true 的安全刷新还必须允许单 Phase Record 回滚到 0，确保 stale/fresh 强刷会真实调用模型而非 upToDate 短路。
+        if ((boundary.stablePhases.length > 0 || preserveExistingForForce) && boundary.stableEndRound < resumeFromRound) {
             resumeFromRound = Math.max(0, boundary.stableEndRound);
         }
     }
     const roundsToProcess = rounds.slice(resumeFromRound);
     const repairedCoverageWarning = storedRecord && !forceRebuild && indexBeforeRepair && inferredBeforeRepair !== indexedBeforeRepair
-        ? `Record 正文实际覆盖 ${inferredBeforeRepair}/${totalRounds} 轮，索引原为 ${indexedBeforeRepair}/${totalRounds} 轮，已修正并继续更新`
+        ? `Record 正文实际覆盖 ${inferredBeforeRepair}/${totalRounds} 轮，索引原为 ${indexedBeforeRepair}/${totalRounds} 轮，提交时会刷新索引`
         : undefined;
     const warnings = [repairedCoverageWarning, forcePreserveWarning].filter((item): item is string => Boolean(item));
     options.onProgress?.({
@@ -1481,16 +1924,20 @@ export async function generateRecord(
         };
     }
 
+    generationPermit = await acquireRecordGenerationPermit(options);
+    throwIfRecordRunAborted(options, "开始格式化轮次前检查到任务已终止");
     // 只把未覆盖的新轮次送进模型；全量重写会让超长对话每次更新都超时。
     // 方案1：超大轮（>RECORD_MAX_SINGLE_ROUND_CHARS）走「step 切分→逐段压缩→合并」保内容，
     // 普通轮原样返回；任一段压缩失败整轮降级到有损截断，绝不让 Record 生成失败。
+    const recordModelScope = await resolveRecordModelScope(modelChain, options);
+    const budgetChain = recordModelScope.modelChain;
     const formattedRounds = await formatRoundsForRecordAsync(roundsToProcess, modelChain, options);
-    const maxPromptChars = getMaxPromptChars(modelChain);
+    const maxPromptChars = getMaxPromptChars(budgetChain);
 
     // 计算可用空间，并按实际轮次大小切批。
-    const promptRecord = trimRecordForPrompt(currentRecord, modelChain);
+    const promptRecord = trimRecordForPrompt(currentRecord, budgetChain);
     const recordChars = charCount(promptRecord);
-    const minBatchRounds = getMinBatchRounds(modelChain);
+    const minBatchRounds = getMinBatchRounds(budgetChain);
     const availableChars = Math.max(5_000, maxPromptChars - recordChars - PROMPT_TEMPLATE_OVERHEAD);
     const parallelMode = resolveParallelMode(options.parallelMode);
     const chunkBudget = parallelMode === "off"
@@ -1499,7 +1946,7 @@ export async function generateRecord(
     const chunks = createRecordChunks(formattedRounds, chunkBudget, parallelMode === "off" ? minBatchRounds : 1);
     const totalChars = formattedRounds.reduce((sum, item) => sum + item.chars, 0);
 
-    console.error(`[record-generator] modelChain=${modelChain} background=${options.background ? "1" : "0"} parallelMode=${parallelMode} roundsToProcess=${roundsToProcess.length} totalChars=${totalChars} maxPromptChars=${maxPromptChars} chunkBudget=${chunkBudget} chunks=${chunks.length}`);
+    console.error(`[record-generator] modelChain=${modelChain} budgetChain=${budgetChain} budgetModel=${recordModelScope.modelName} background=${options.background ? "1" : "0"} parallelMode=${parallelMode} roundsToProcess=${roundsToProcess.length} totalChars=${totalChars} maxPromptChars=${maxPromptChars} chunkBudget=${chunkBudget} chunks=${chunks.length}`);
     options.onProgress?.({
         stage: "计算批次",
         current: resumeFromRound,
@@ -1526,17 +1973,19 @@ export async function generateRecord(
                 options,
                 resumeFromRound,
             );
-            return warnings.length && parallelResult.success
+            const mergedParallelResult = warnings.length && parallelResult.success
                 ? { ...parallelResult, warnings: [...(parallelResult.warnings || []), ...warnings] }
                 : parallelResult;
+            return withRecordModelUsage(mergedParallelResult, options);
         } catch (err) {
+            if (isRecordGenerationAbortedError(err)) throw err;
             const message = err instanceof Error ? err.message : String(err);
-            return {
+            return withRecordModelUsage({
                 success: false,
                 error: isLocalTextModelBridge(modelChain) ? localBridgeRecordFailureHint(modelChain, message) : message,
                 batches: chunks.length,
                 pipeline: "parallel",
-            };
+            }, options);
         }
     }
 
@@ -1551,29 +2000,28 @@ export async function generateRecord(
             unit: "轮",
             detail: `单批处理${roundRangeLabel(onlyChunk.startRound, onlyChunk.endRound)}，${onlyChunk.chars} 字`,
         });
+        throwIfRecordRunAborted(options, `单批 ${roundRangeLabel(onlyChunk.startRound, onlyChunk.endRound)} 模型调用前检查到任务已终止`);
         const prompt = promptRecord
             ? buildUpdateRecordPrompt(conversationId, workspace, totalRounds, totalSteps, promptRecord, onlyChunk.text)
             : buildNewRecordPrompt(conversationId, workspace, totalRounds, totalSteps, onlyChunk.text);
 
         const response = await callFlashWithRetryChain(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
         if (!response) {
-            return {
+            return withRecordModelUsage({
                 success: false,
-                error: isLocalTextModelBridge(modelChain)
-                    ? localBridgeRecordFailureHint(modelChain, "Record 模型桥调用失败或超时")
-                    : "Flash 模型调用失败（LS 不可用或超时）",
-            };
+                error: formatRecordFailureMessage(modelChain, "Record 模型调用失败或超时", options),
+            }, options);
         }
 
         const { content: cleanedContent, tags } = cleanFlashResponse(response);
         const finalContent = enforceRecordHeaderMetadata(cleanedContent, { conversationId, workspace, totalRounds, totalSteps });
         const validation = validateRecordBeforeAccept(finalContent, conversationId, totalRounds, totalRounds, existingRecord);
         if (!validation.ok) {
-            return {
+            return withRecordModelUsage({
                 success: false,
                 error: validation.error,
                 pipeline: "serial",
-            };
+            }, options);
         }
         options.onProgress?.({
             stage: "生成完成",
@@ -1582,7 +2030,7 @@ export async function generateRecord(
             unit: "轮",
             detail: `已覆盖到第 ${totalRounds} 轮`,
         });
-        return { success: true, content: finalContent, batches: 1, coveredRounds: totalRounds, tags, pipeline: "serial", warnings };
+        return withRecordModelUsage({ success: true, content: finalContent, batches: 1, coveredRounds: totalRounds, tags, pipeline: "serial", warnings }, options);
     }
 
     // 分批处理
@@ -1592,7 +2040,8 @@ export async function generateRecord(
 
     while (processedUpTo < formattedRounds.length) {
         batchCount++;
-        const curPromptRecord = trimRecordForPrompt(currentRecord, modelChain);
+        throwIfRecordRunAborted(options, `第 ${batchCount}/${chunks.length} 批开始前检查到任务已终止`);
+        const curPromptRecord = trimRecordForPrompt(currentRecord, budgetChain);
         const curRecordChars = charCount(curPromptRecord);
         const curAvailable = Math.max(5_000, maxPromptChars - curRecordChars - PROMPT_TEMPLATE_OVERHEAD);
         const [chunk] = createRecordChunks(formattedRounds.slice(processedUpTo), curAvailable, minBatchRounds);
@@ -1614,21 +2063,19 @@ export async function generateRecord(
         if (!response) {
             // 部分完成
             if (currentRecord && currentRecord !== existingRecord) {
-                return {
+                return withRecordModelUsage({
                     success: true,
                     content: currentRecord,
                     batches: batchCount,
                     coveredRounds: chunk.startRound - 1,
-                    error: `${isLocalTextModelBridge(modelChain) ? "本地模型桥" : "Flash"} 在第 ${batchCount} 批失败，Record 仅覆盖到第 ${chunk.startRound - 1} 轮`,
+                    error: formatRecordBatchFailureMessage(modelChain, batchCount, chunk.startRound - 1, options),
                     pipeline: "serial",
-                };
+                }, options);
             }
-            return {
+            return withRecordModelUsage({
                 success: false,
-                error: isLocalTextModelBridge(modelChain)
-                    ? localBridgeRecordFailureHint(modelChain, `Record 模型桥在第 ${batchCount} 批调用失败或超时`)
-                    : `Flash 模型在第 ${batchCount} 批调用失败`,
-            };
+                error: formatRecordFailureMessage(modelChain, `在第 ${batchCount} 批调用失败或超时`, options),
+            }, options);
         }
 
         const { content: batchContent, tags: batchTags } = cleanFlashResponse(response);
@@ -1636,7 +2083,7 @@ export async function generateRecord(
         const validation = validateRecordBeforeAccept(candidateRecord, conversationId, totalRounds, chunk.endRound, currentRecord || existingRecord);
         if (!validation.ok) {
             if (currentRecord && currentRecord !== existingRecord) {
-                return {
+                return withRecordModelUsage({
                     success: true,
                     content: currentRecord,
                     batches: batchCount,
@@ -1644,13 +2091,13 @@ export async function generateRecord(
                     error: validation.error,
                     pipeline: "serial",
                     warnings,
-                };
+                }, options);
             }
-            return {
+            return withRecordModelUsage({
                 success: false,
                 error: validation.error,
                 pipeline: "serial",
-            };
+            }, options);
         }
         currentRecord = candidateRecord;
         lastTags = batchTags;
@@ -1673,7 +2120,37 @@ export async function generateRecord(
         unit: "轮",
         detail: `分 ${batchCount} 批完成`,
     });
-    return { success: true, content: currentRecord, batches: batchCount, coveredRounds: totalRounds, tags: lastTags, pipeline: "serial", warnings };
+    return withRecordModelUsage({ success: true, content: currentRecord, batches: batchCount, coveredRounds: totalRounds, tags: lastTags, pipeline: "serial", warnings }, options);
+    } catch (err) {
+        if (isRecordGenerationAbortedError(err)) {
+            return withRecordModelUsage({
+                success: false,
+                error: err.message,
+                aborted: true,
+                abortReason: err.reason,
+            }, options);
+        }
+        throw err;
+    } finally {
+        generationPermit?.release();
+    }
+}
+
+/**
+ * 异步检查是否需要自动触发 Record 更新，供会话读取与生命周期热路径使用。
+ * 保留 shouldAutoUpdateRecord 的同步兼容 API 给非热路径调用方。
+ */
+export async function shouldAutoUpdateRecordAsync(
+    hash: string,
+    conversationId: string,
+    currentTotalRounds: number,
+): Promise<boolean> {
+    const index = await readRecordsIndexAsync(hash);
+    const entry = index.records[conversationId];
+    if (!entry) {
+        return currentTotalRounds >= RECORD_AUTO_THRESHOLD;
+    }
+    return (currentTotalRounds - entry.lastUpdatedRound) >= RECORD_AUTO_THRESHOLD;
 }
 
 /**

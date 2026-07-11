@@ -5,6 +5,7 @@ import path from "path";
 import { promisify } from "util";
 import { callGetModelResponseDetailed as callLsModelDetailed, isLsAvailable } from "./ls-client.js";
 import { normalizeChain, type Chain } from "./chain.js";
+import { callGrokExec, isGrokBridgeAvailable, mapGrokMaxTokens, mapGrokModel, type GrokContext, type GrokExecDiagnostics, type GrokTrafficClass } from "./grok-client.js";
 
 const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
@@ -26,15 +27,17 @@ let codexAvailableCache: boolean | null = null;
 let codexAvailableAt = 0;
 let ccAvailableCache: boolean | null = null;
 let ccAvailableAt = 0;
-let antigravityHostCache: boolean | null = null;
 
 type ResolvedChain = Exclude<Chain, "auto">;
 
 export interface ModelBridgeResult {
     text: string | null;
     chainUsed: ResolvedChain | null;
+    modelUsed?: string | null;
     error?: string;
     timedOut?: boolean;
+    cancelled?: boolean;
+    grokDiagnostics?: GrokExecDiagnostics;
 }
 
 export interface CodexExecResult {
@@ -51,6 +54,20 @@ export interface ClaudeCodeExecResult {
 
 export interface ModelBridgeOptions {
     allowClaudeCodeFallback?: boolean;
+    grokContext?: GrokContext;
+    trafficClass?: GrokTrafficClass;
+    antigravityModelOverride?: string;
+    shouldCancel?: () => boolean;
+    signal?: AbortSignal;
+}
+
+function isModelBridgeCancelled(options: ModelBridgeOptions): boolean {
+    if (options.signal?.aborted) return true;
+    try {
+        return options.shouldCancel?.() === true;
+    } catch {
+        return true;
+    }
 }
 
 function getCodexCommand(): string {
@@ -65,27 +82,6 @@ function quoteForCmd(arg: string): string {
     if (arg === "") return "\"\"";
     if (!/[\s"]/u.test(arg)) return arg;
     return `"${arg.replace(/"/g, "\"\"")}"`;
-}
-
-async function isLikelyAntigravityHost(): Promise<boolean> {
-    if (antigravityHostCache !== null) return antigravityHostCache;
-    if (process.platform !== "win32") {
-        antigravityHostCache = false;
-        return false;
-    }
-
-    try {
-        const result = await execAsync(`wmic process where ProcessId=${process.ppid} get Name /value`, {
-            timeout: 5000,
-            windowsHide: true,
-            maxBuffer: 1024 * 1024,
-        });
-        antigravityHostCache = result.stdout.toLowerCase().includes("language_server");
-        return antigravityHostCache;
-    } catch {
-        antigravityHostCache = false;
-        return false;
-    }
 }
 
 function extractLastAgentText(stdout: string): string | null {
@@ -308,16 +304,14 @@ export async function resolveModelChainCandidates(
     if (chain === "claude-code") {
         return (await isClaudeCodeBridgeAvailable()) ? ["claude-code"] : [];
     }
-
-    const preferLs = await isLikelyAntigravityHost();
-    const candidates: ResolvedChain[] = [];
-    if (preferLs) {
-        if (await isLsAvailable()) candidates.push("antigravity");
-        if (await isCodexBridgeAvailable()) candidates.push("codex");
-    } else {
-        if (await isCodexBridgeAvailable()) candidates.push("codex");
-        if (await isLsAvailable()) candidates.push("antigravity");
+    if (chain === "grok") {
+        return (await isGrokBridgeAvailable()) ? ["grok"] : [];
     }
+
+    const candidates: ResolvedChain[] = [];
+    if (await isGrokBridgeAvailable()) candidates.push("grok");
+    if (await isLsAvailable()) candidates.push("antigravity");
+    if (await isCodexBridgeAvailable()) candidates.push("codex");
     if (options.allowClaudeCodeFallback && await isClaudeCodeBridgeAvailable()) candidates.push("claude-code");
     return candidates;
 }
@@ -615,12 +609,15 @@ export async function callModelResponse(
     timeoutMs: number = 30_000,
     options: ModelBridgeOptions = {},
 ): Promise<ModelBridgeResult> {
+    if (isModelBridgeCancelled(options)) {
+        return { text: null, chainUsed: null, error: "模型调用已取消", cancelled: true };
+    }
     const rawChain = String(chain || "auto").trim().toLowerCase();
     if (rawChain === "windsurf" || rawChain === "wsf") {
         return {
             text: null,
             chainUsed: null,
-            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code",
+            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code|grok",
         };
     }
     const resolvedChain = normalizeChain(chain as string);
@@ -630,20 +627,62 @@ export async function callModelResponse(
             text: null,
             chainUsed: null,
             error: resolvedChain === "auto"
-                ? (options.allowClaudeCodeFallback ? "Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用" : "Antigravity LS 与 Codex 模型桥当前都不可用")
+                ? (options.allowClaudeCodeFallback ? "Grok、Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用" : "Grok、Antigravity LS 与 Codex 模型桥当前都不可用")
                 : resolvedChain === "codex"
                     ? "Codex CLI 不可用或模型桥不可用"
                     : resolvedChain === "claude-code"
                         ? "Claude Code CLI 不可用或模型桥不可用"
-                : `指定链路 ${resolvedChain} 当前不可用`,
+                        : resolvedChain === "grok"
+                            ? "Grok 模型桥不可用或 progrok proxy 不可用"
+                            : `指定链路 ${resolvedChain} 当前不可用`,
         };
     }
 
     const errors: string[] = [];
+    let grokDiagnostics: GrokExecDiagnostics | undefined;
     for (const resolved of candidates) {
+        if (isModelBridgeCancelled(options)) {
+            return { text: null, chainUsed: null, error: "模型调用已取消", cancelled: true };
+        }
+        if (resolved === "grok") {
+            const grokContext = options.grokContext || "default";
+            const grokModel = mapGrokModel(model, grokContext);
+            const result = await callGrokExec(prompt, grokModel, timeoutMs, mapGrokMaxTokens(grokContext), {
+                context: grokContext,
+                trafficClass: options.trafficClass,
+                shouldCancel: options.shouldCancel,
+                signal: options.signal,
+            });
+            grokDiagnostics = result.diagnostics;
+            if (result.text) return { text: result.text, chainUsed: "grok", modelUsed: grokModel, grokDiagnostics: result.diagnostics };
+            if (result.cancelled) {
+                return {
+                    text: null,
+                    chainUsed: "grok",
+                    modelUsed: grokModel,
+                    error: result.error || "Grok 模型桥调用已取消",
+                    cancelled: true,
+                    grokDiagnostics: result.diagnostics,
+                };
+            }
+            errors.push(result.error || "Grok 模型桥调用失败");
+            if (result.timedOut && resolvedChain === "grok") {
+                return {
+                    text: null,
+                    chainUsed: null,
+                    modelUsed: grokModel,
+                    error: result.error || "Grok 模型桥超时",
+                    timedOut: true,
+                    grokDiagnostics: result.diagnostics,
+                };
+            }
+            continue;
+        }
+
         if (resolved === "antigravity") {
-            const result = await callLsModelDetailed(model, prompt, timeoutMs);
-            if (result.text) return { text: result.text, chainUsed: "antigravity" };
+            const lsModel = options.antigravityModelOverride || model;
+            const result = await callLsModelDetailed(lsModel, prompt, timeoutMs);
+            if (result.text) return { text: result.text, chainUsed: "antigravity", modelUsed: lsModel };
             errors.push(result.error || "Antigravity LS 模型调用失败");
             // 真超时：与 codex 分支对齐早返回，透传 timedOut 让上层区分「超时」vs「普通失败」，
             // 不再无条件落到下个候选 / 触发重试（避免一次真超时后又白等一整轮）。
@@ -651,6 +690,7 @@ export async function callModelResponse(
                 return {
                     text: null,
                     chainUsed: null,
+                    modelUsed: lsModel,
                     error: result.error || "Antigravity LS 模型调用超时",
                     timedOut: true,
                 };
@@ -660,12 +700,13 @@ export async function callModelResponse(
 
         if (resolved === "codex") {
             const result = await callCodexExec(prompt, model, timeoutMs);
-            if (result.text) return { text: result.text, chainUsed: "codex" };
+            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: model };
             errors.push(result.error || "Codex 模型桥调用失败");
             if (result.timedOut || chain === "codex") {
                 return {
                     text: null,
                     chainUsed: null,
+                    modelUsed: model,
                     error: result.error || "Codex 模型桥调用失败",
                     timedOut: result.timedOut,
                 };
@@ -674,11 +715,12 @@ export async function callModelResponse(
         }
 
         const result = await callClaudeCodeExec(prompt, model, timeoutMs);
-        if (result.text) return { text: result.text, chainUsed: "claude-code" };
+        if (result.text) return { text: result.text, chainUsed: "claude-code", modelUsed: model };
         errors.push(result.error || "Claude Code CLI 模型桥调用失败");
         return {
             text: null,
             chainUsed: null,
+            modelUsed: model,
             error: result.error || "Claude Code CLI 模型桥调用失败",
             timedOut: result.timedOut,
         };
@@ -688,5 +730,6 @@ export async function callModelResponse(
         text: null,
         chainUsed: null,
         error: errors.join("；") || "模型桥调用失败",
+        ...(grokDiagnostics ? { grokDiagnostics } : {}),
     };
 }

@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
-import { saveTempFile } from "../temp-store.js";
+import { saveTempFileAsync } from "../temp-store.js";
 import {
     formatRound,
     formatOverview,
@@ -14,11 +14,11 @@ import {
     type ConversationRound,
     type CompactionMode,
 } from "../trajectory.js";
-import { shouldAutoUpdateRecord } from "../record-generator.js";
-import { generateRecord, countPhasesInRecord, validateRecordCandidateForWrite } from "../record-generator.js";
-import { readRecord, writeRecord, resolveWorkspaceHashForRecord, findRecordHash, writeRecordSidecar } from "../record-store.js";
+import { generateRecord, countPhasesInRecord, shouldAutoUpdateRecordAsync, validateRecordCandidateForWrite } from "../record-generator.js";
+import { readRecordAsync, writeRecord, resolveWorkspaceHashForRecord, findRecordHashAsync } from "../record-store.js";
+import { acquireRecordSingleFlightPermit, buildAndPersistRecordReaderIndex, withRecordPersistenceWrite } from "../record-update-coordination.js";
 import { loadConversationData, resolveConversationChain } from "../conversation-bridge.js";
-import { DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
+import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
 import { listConversationsByMtime } from "../ls-client.js";
@@ -43,9 +43,15 @@ import {
 import { listRecentWindsurfThreads, type WindsurfConversationSummary } from "../windsurf-client.js";
 import type { DataChain, ConversationLogicalChainMode } from "../chain.js";
 import type { SearchMode, TextBlock } from "../search-engine.js";
-import { buildRecordReaderIndex } from "../record-reader.js";
 import { formatAttachmentOverview, materializeRoundAttachments } from "../conversation-attachments.js";
-import { cancelBackgroundTask, formatBackgroundTask, startBackgroundTask, waitForBackgroundTask } from "../background-tasks.js";
+import {
+    cancelBackgroundTask,
+    formatBackgroundTask,
+    registerBackgroundTaskRecoveryHandler,
+    startBackgroundTask,
+    waitForBackgroundTask,
+} from "../background-tasks.js";
+import type { BackgroundTaskContext, BackgroundTaskProgress } from "../background-tasks.js";
 import { exportConversation, formatConversationExportResult } from "../conversation-exporter.js";
 import {
     listConversationCandidates,
@@ -55,13 +61,24 @@ import {
     type WorkspaceMatchScope,
     type ConversationThreadMode,
 } from "../conversation-filter.js";
-import { exportConversationBatch, formatConversationBatchExportResult } from "../conversation-batch-export.js";
+import {
+    createConversationBatchExportResumePayload,
+    exportConversationBatch,
+    formatConversationBatchExportResult,
+    resumeConversationBatchExport,
+    type ConversationBatchExportResumePayload,
+} from "../conversation-batch-export.js";
+import type { ResumePayloadValue } from "../background-recovery.js";
 
 const CONVERSATION_FETCH_TEXT_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_FETCH_TEXT_MAX_CHARS || 2_000_000);
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS || 2_000_000);
 const CONVERSATION_SEARCH_BLOCK_MAX_CHARS = Number(process.env.MEMORY_STORE_CONVERSATION_SEARCH_BLOCK_MAX_CHARS || 60_000);
 const CONVERSATION_LIST_TITLE_MAX_CHARS = Math.max(Number(process.env.MEMORY_STORE_CONVERSATION_LIST_TITLE_MAX_CHARS || 120), 20);
 const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "export"]);
+
+function isBackgroundTaskAborted(taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">): boolean {
+    return Boolean(taskContext?.isCancelled() || taskContext?.isSettled());
+}
 
 export function shouldRequireExplicitConversationId(
     action: string,
@@ -401,6 +418,162 @@ function formatWindsurfPartialWarning(loaded: Awaited<ReturnType<typeof loadConv
     ].join("\n");
 }
 
+type ConversationReadSegmentTiming = {
+    label: "附件物化" | "格式化" | "临时文件";
+    ms: number;
+};
+
+type ConversationReadTimingState = {
+    action: "fetch" | "search" | "read";
+    segments: ConversationReadSegmentTiming[];
+};
+
+function readPositiveEnvMs(name: string, fallback: number): number {
+    const raw = Number(process.env[name]);
+    return Number.isFinite(raw) && raw >= 0 ? raw : fallback;
+}
+
+function isWindsurfReadTimingDebugEnabled(): boolean {
+    return process.env.MEMORY_STORE_WINDSURF_READ_TIMING_DEBUG === "1";
+}
+
+function getWindsurfReadTimingSlowMs(): number {
+    return readPositiveEnvMs("MEMORY_STORE_WINDSURF_READ_TIMING_SLOW_MS", 250);
+}
+
+function getReadAttachmentBudgetMs(): number {
+    return readPositiveEnvMs("MEMORY_STORE_READ_ATTACHMENT_BUDGET_MS", 30_000);
+}
+
+function getReadFormatBudgetMs(): number {
+    return readPositiveEnvMs("MEMORY_STORE_READ_FORMAT_BUDGET_MS", 60_000);
+}
+
+function createConversationReadTimingState(action: "fetch" | "search" | "read"): ConversationReadTimingState {
+    return { action, segments: [] };
+}
+
+async function measureConversationReadSegment<T>(
+    timing: ConversationReadTimingState,
+    label: ConversationReadSegmentTiming["label"],
+    work: () => Promise<T>,
+): Promise<T> {
+    const startedAt = Date.now();
+    const result = await work();
+    timing.segments.push({ label, ms: Math.max(0, Date.now() - startedAt) });
+    return result;
+}
+
+const CONVERSATION_FORMAT_YIELD_INTERVAL = 5;
+
+function yieldConversationEventLoop(): Promise<void> {
+    return new Promise(resolve => setImmediate(resolve));
+}
+
+async function yieldConversationFormatIfNeeded(processed: number): Promise<void> {
+    if (processed > 0 && processed % CONVERSATION_FORMAT_YIELD_INTERVAL === 0) {
+        await yieldConversationEventLoop();
+    }
+}
+
+function formatSegmentDuration(ms: number): string {
+    if (ms >= 10_000) return `${(ms / 1000).toFixed(0)}s`;
+    if (ms >= 1_000) return `${(ms / 1000).toFixed(1)}s`;
+    return `${ms}ms`;
+}
+
+function formatConversationReadSegmentTiming(timing: ConversationReadTimingState): string {
+    if (timing.segments.length === 0) return "";
+    const shouldShow = isWindsurfReadTimingDebugEnabled()
+        || timing.segments.some(item => item.ms >= getWindsurfReadTimingSlowMs());
+    if (!shouldShow) return "";
+    return `⏱ ${timing.action} 分段: ${timing.segments.map(item => `${item.label} ${formatSegmentDuration(item.ms)}`).join(" | ")}`;
+}
+
+function appendConversationReadDetail(text: string, detail?: string): string {
+    if (!detail) return text;
+    return `${text}\n${detail}`;
+}
+
+async function materializeRoundAttachmentsWithOptionalBudget(
+    rounds: ConversationRound[],
+    conversationId: string,
+    options: Parameters<typeof materializeRoundAttachments>[2] & { deadlineAt?: number } = {},
+): Promise<Required<Pick<Awaited<ReturnType<typeof materializeRoundAttachments>>, "rounds" | "truncated">> & { budgetExceeded: boolean }> {
+    const result = await materializeRoundAttachments(rounds, conversationId, options);
+    return {
+        rounds: result.rounds,
+        truncated: result.truncated,
+        budgetExceeded: Boolean(result.budgetExceeded),
+    };
+}
+
+function formatRoundForMessageRolesWithOptionalBudget(
+    round: ConversationRound,
+    depth: Depth,
+    extraTypes: ExtraType[],
+    roles: Set<ConversationMessageRole>,
+    compactionMode: CompactionMode,
+    budgetOptions: { deadlineAt?: number } = {},
+): { text: string; budgetExceeded: boolean } {
+    const result = formatRoundForMessageRoles(round, depth, extraTypes, roles, compactionMode, budgetOptions);
+    return {
+        text: result.text,
+        budgetExceeded: result.budgetExceeded,
+    };
+}
+
+function formatWindsurfSourceDiagnostics(loaded: NonNullable<Awaited<ReturnType<typeof loadConversationData>>>): string {
+    if (loaded.chainUsed !== "windsurf" || !loaded.windsurfData) return "";
+    const lines: string[] = [];
+    const warnings = loaded.windsurfData.warnings || [];
+    if (warnings.length > 0) {
+        lines.push(...warnings.map(warning => `⚠️ WSF 源: ${warning}`));
+    }
+    const cache = loaded.windsurfData.metadata?.cache;
+    if (cache) {
+        const details = [
+            `status=${cache.status}`,
+            `refresh=${cache.refreshRequested}`,
+            Number.isFinite(cache.ageMs) ? `ageMs=${cache.ageMs}` : "",
+            cache.reason ? `reason=${cache.reason}` : "",
+        ].filter(Boolean);
+        lines.push(`🧠 WSF 缓存: ${details.join(" | ")}`);
+    }
+    const timings = loaded.windsurfData.metadata?.timings;
+    if (timings) {
+        const details = [
+            Number.isFinite(timings.resolveEndpointMs) ? `endpoint ${formatSegmentDuration(timings.resolveEndpointMs || 0)}` : "",
+            Number.isFinite(timings.stepsReadMs) ? `steps ${formatSegmentDuration(timings.stepsReadMs || 0)}` : "",
+            Number.isFinite(timings.enrichMs) ? `enrich ${formatSegmentDuration(timings.enrichMs || 0)}` : "",
+            Number.isFinite(timings.roundConversionMs) ? `rounds ${formatSegmentDuration(timings.roundConversionMs || 0)}` : "",
+            `total ${formatSegmentDuration(timings.totalMs)}`,
+        ].filter(Boolean);
+        lines.push(`⏱ WSF 源分段: ${details.join(" | ")}`);
+    }
+    const concurrency = loaded.windsurfData.metadata?.lsConcurrency;
+    if (concurrency) {
+        lines.push(`🚦 WSF LS: calls=${concurrency.calls} | activePeak=${concurrency.active} | pendingPeak=${concurrency.pending} | queueWaitMs=${concurrency.queueWaitMs} | maxQueueWaitMs=${concurrency.maxQueueWaitMs} | current=${concurrency.current} | max=${concurrency.max} | min=${concurrency.min} | limit=${concurrency.limit} | reserved=${concurrency.effectiveReserved}/${concurrency.configuredReserved} | active(fg/bg)=${concurrency.activeForeground}/${concurrency.activeBackground} | pending(fg/bg)=${concurrency.pendingForeground}/${concurrency.pendingBackground} | borrowing=${concurrency.borrowing}`);
+    }
+    return lines.join("\n");
+}
+
+function formatWindsurfIncompleteReadWarning(loaded: NonNullable<Awaited<ReturnType<typeof loadConversationData>>>): string {
+    if (loaded.chainUsed !== "windsurf" || loaded.rounds.length > 0) return "";
+    const partial = loaded.windsurfData?.partial === true;
+    const totalSteps = loaded.totalSteps || 0;
+    const stepCount = loaded.windsurfData?.thread?.stepCount || 0;
+    if (!partial && totalSteps <= 0 && stepCount <= 0) return "";
+    const stateBits = ["rounds=0"];
+    if (partial) stateBits.push("partial=true");
+    if (totalSteps > 0) stateBits.push(`totalSteps=${totalSteps}`);
+    if (stepCount > 0) stateBits.push(`stepCount=${stepCount}`);
+    return [
+        `⚠️ Windsurf 源读取暂不完整：当前没有拿到可读轮次（${stateBits.join("，")}）`,
+        "💡 先调用 fetch 强制 refresh；若仍为空，请稍后重试或回到对应 Windsurf 窗口再试。",
+    ].join("\n");
+}
+
 export function applyCodexContextProbeMatchesToCandidates(
     candidates: ConversationListCandidate[],
     matches: ReturnType<typeof findCodexContextProbeMatches>,
@@ -695,8 +868,8 @@ async function buildListSearchBlocks(
 
     for (let i = 0; i < candidates.length; i++) {
         const item = candidates[i];
-        const hash = findRecordHash(item.id);
-        const recordPreview = hash ? (readRecord(hash, item.id) || "").slice(0, 2500) : "";
+        const hash = await findRecordHashAsync(item.id);
+        const recordPreview = hash ? ((await readRecordAsync(hash, item.id)) || "").slice(0, 2500) : "";
         let rawPreview = "";
 
         if (includeRawPreview && i < rawScanLimit && (recordPreview.length === 0 || !contentHasQuerySignal(recordPreview, query))) {
@@ -729,7 +902,7 @@ async function buildListSearchBlocks(
     return blocks;
 }
 
-function buildConversationText(
+async function buildConversationText(
     conversationId: string,
     rounds: ConversationRound[],
     totalSteps: number,
@@ -738,7 +911,7 @@ function buildConversationText(
     expandedChildren: Array<{ thread: { id: string; title: string }; rounds: ConversationRound[] }> = [],
     childDiagnostics: Array<{ threadId: string; nickname?: string; reason: string; detail: string }> = [],
     compactionMode: CompactionMode = "folded",
-): string {
+): Promise<string> {
     const lines: string[] = [];
     let usedChars = 0;
     let truncated = false;
@@ -759,9 +932,11 @@ function buildConversationText(
     pushLine(`> 步骤: ${totalSteps} | 轮次: ${rounds.length}`);
     pushLine("");
 
-    for (const round of rounds) {
+    for (let index = 0; index < rounds.length; index++) {
+        const round = rounds[index];
         if (!pushLine(formatRound(round, depth, extraTypes, { compactionMode }))) break;
         if (!pushLine("")) break;
+        await yieldConversationFormatIfNeeded(index + 1);
     }
 
     if (!truncated && expandedChildren.length > 0) {
@@ -770,9 +945,11 @@ function buildConversationText(
         for (const child of expandedChildren) {
             if (!pushLine(`## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`)) break;
             if (!pushLine("")) break;
-            for (const round of child.rounds) {
+            for (let index = 0; index < child.rounds.length; index++) {
+                const round = child.rounds[index];
                 if (!pushLine(formatRound(round, depth, extraTypes, { compactionMode }))) break;
                 if (!pushLine("")) break;
+                await yieldConversationFormatIfNeeded(index + 1);
             }
             if (truncated) break;
         }
@@ -871,6 +1048,75 @@ function selectBalancedBatchCandidates<T extends { dataChain: string }>(candidat
     return selected;
 }
 
+interface DeepLocateResumePayload {
+    version: 1;
+    query: string;
+    dataChain: "codex" | "claude-code";
+    mode: "exact" | "fuzzy";
+    conversationIds?: string[];
+    maxFiles: number;
+    maxBytes: number;
+    maxHits: number;
+}
+
+function buildDeepLocateResumePayload(args: {
+    query: string;
+    dataChain: "codex" | "claude-code";
+    mode: "exact" | "fuzzy";
+    conversationIds?: string[];
+    maxFiles: number;
+    maxBytes: number;
+    maxHits: number;
+}): DeepLocateResumePayload {
+    return {
+        version: 1,
+        query: args.query,
+        dataChain: args.dataChain,
+        mode: args.mode,
+        conversationIds: args.conversationIds?.length ? [...args.conversationIds] : undefined,
+        maxFiles: args.maxFiles,
+        maxBytes: args.maxBytes,
+        maxHits: args.maxHits,
+    };
+}
+
+function isConversationBatchExportResumePayload(value: unknown): value is ConversationBatchExportResumePayload {
+    if (!value || typeof value !== "object") return false;
+    const batchDir = (value as { batchDir?: unknown }).batchDir;
+    const options = (value as { options?: unknown }).options;
+    return typeof batchDir === "string"
+        && Boolean(options)
+        && typeof options === "object"
+        && Array.isArray((options as { candidates?: unknown }).candidates);
+}
+
+registerBackgroundTaskRecoveryHandler("conversation-batch-export", async (task) => {
+    if (!isConversationBatchExportResumePayload(task.resumePayload)) {
+        throw new Error("conversation-batch-export 缺少可恢复的 batchDir/options payload");
+    }
+    const payload = task.resumePayload;
+    return {
+        mode: "restart",
+        run: async ({ isCancelled, isSettled }) => {
+            const result = await resumeConversationBatchExport(payload, {
+                exportConversation: async (exportOptions) => {
+                    if (isCancelled() || isSettled()) {
+                        throw new Error(isCancelled()
+                            ? "conversation batch export cancelled before item export"
+                            : "conversation batch export settled before item export");
+                    }
+                    return exportConversation({
+                        ...exportOptions,
+                        isCancelled,
+                        isSettled,
+                    });
+                },
+            });
+            return formatConversationBatchExportResult(result);
+        },
+    };
+});
+
 /**
  * conversation_read_original — 读取对话原文
  *
@@ -916,7 +1162,7 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
             limit: z.number().default(8).optional()
                 .describe("[list/search] 最多返回多少个匹配"),
             background: z.boolean().optional()
-                .describe("[deep_locate] 必须使用后台模式；true=返回 taskId 后轮询"),
+                .describe("[deep_locate/exportBatch] 三态后台：true=强制后台 / false=同步兜底（deep_locate 不支持）/ 不传时自动后台返回 taskId"),
             taskId: z.string().optional()
                 .describe("[deep_locate_status/deep_locate_cancel] 后台任务 ID"),
             waitSeconds: z.number().optional()
@@ -947,8 +1193,8 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 .describe("[fetch/search/read] 额外拉取的内容类型"),
             messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool"])).optional()
                 .describe("[read/export] 按消息角色选择性读取或导出。user=用户输入，system=规则/压缩/系统注入类内容，model/assistant=模型回复，tool=工具/代码/任务事件"),
-            chain: z.enum(DATA_CHAIN_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，modelChain 仍默认 auto"),
+            chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
+                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\" 只作为 modelChain"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("读取对话数据的宿主链路；未填用 chain。支持 antigravity/codex/claude-code/windsurf"),
             dataChains: z.array(z.enum(DATA_CHAIN_INPUT_VALUES)).optional()
@@ -977,7 +1223,7 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 .describe("[list/export] threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
             parentDataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
                 .describe("预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤"),
-            modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain。Windsurf 只支持 dataChain"),
+            modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain；grok=本机 progrok proxy。Windsurf 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
@@ -1070,12 +1316,21 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                             content: [{ type: "text" as const, text: "❌ deep_locate 需要 query 正文片段" }],
                         }, startTime);
                     }
-                    if (!background) {
+                    if (background === false) {
                         return appendTiming({
-                            content: [{ type: "text" as const, text: "❌ deep_locate 必须 background=true；这是可能扫描大 JSONL 的后台重任务，不能同步执行。" }],
+                            content: [{ type: "text" as const, text: "❌ deep_locate 不支持 background=false；这是可能扫描大 JSONL 的后台重任务，请省略 background 或设为 true。" }],
                         }, startTime);
                     }
                     const requestedMode = (mode === "fuzzy" ? "fuzzy" : "exact") as "exact" | "fuzzy";
+                    const deepLocatePayload = buildDeepLocateResumePayload({
+                        query,
+                        dataChain: resolved,
+                        mode: requestedMode,
+                        conversationIds: conversationIds?.length ? [...conversationIds] : undefined,
+                        maxFiles: maxFiles || 20,
+                        maxBytes: maxBytes || 512 * 1024 * 1024,
+                        maxHits: maxHits || limit || 20,
+                    });
                     const task = startBackgroundTask("conversation-deep-locate", async ({ updateProgress, isCancelled }) => {
                         const threads = resolved === "codex"
                             ? (conversationIds?.length
@@ -1119,12 +1374,13 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     }, {
                         maxRunMs: Number(process.env.MEMORY_STORE_DEEP_LOCATE_BACKGROUND_MAX_RUN_MS || 10 * 60 * 1000),
                         timeoutMessage: "deep_locate 后台扫描超时；可缩小 conversationIds/maxFiles/maxBytes 后重试",
+                        resumePayload: deepLocatePayload as unknown as ResumePayloadValue,
                     });
                     return appendTiming({
                         content: [{
                             type: "text" as const,
                             text: [
-                                "🚀 deep_locate 已转入后台任务",
+                                background === true ? "🚀 deep_locate 已转入后台任务" : "🚀 deep_locate 未显式指定 background，已自动转入后台任务",
                                 `🆔 taskId: ${task.id}`,
                                 `🔗 dataChain: ${resolved}`,
                                 `🔎 mode: ${requestedMode}`,
@@ -1403,15 +1659,174 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 }
 
                 if (action === "export" && isBatchConversationExport) {
-                    const requestedBatchLimit = batchLimit || limit;
                     const balancedBatch = Boolean(dataChains && dataChains.length > 1);
-                    const batchSources = dataChains?.length ? dataChains : [chains.dataChain];
-                    const listResult = balancedBatch
-                        ? {
-                            candidates: [],
-                            statuses: [],
-                        } as Awaited<ReturnType<typeof listConversationCandidates>>
-                        : await listConversationCandidates({
+                    const runBatchExport = async (
+                        updateProgress?: (progress: BackgroundTaskProgress) => void,
+                        taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">,
+                    ): Promise<string> => {
+                        const requestedBatchLimit = batchLimit || limit;
+                        const batchSources = dataChains?.length ? dataChains : [chains.dataChain];
+                        updateProgress?.({
+                            stage: "list_candidates",
+                            detail: `查询批量导出候选 (${batchSources.join(", ")})`,
+                            current: 0,
+                            total: requestedBatchLimit,
+                            unit: "条",
+                        });
+                        const listResult = balancedBatch
+                            ? {
+                                candidates: [],
+                                statuses: [],
+                            } as Awaited<ReturnType<typeof listConversationCandidates>>
+                            : await listConversationCandidates({
+                                dataChains: batchSources,
+                                query,
+                                workspaces,
+                                workspaceMode,
+                                workspaceScope: workspaceScope as WorkspaceMatchScope,
+                                threadMode: threadMode as ConversationThreadMode | undefined,
+                                parentConversationId,
+                                parentQuery,
+                                parentDataChain,
+                                limit: requestedBatchLimit,
+                                sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                            });
+                        if (balancedBatch) {
+                            const perSourceResults = await Promise.all(batchSources.map(source => listConversationCandidates({
+                                dataChains: [source],
+                                query,
+                                workspaces,
+                                workspaceMode,
+                                workspaceScope: workspaceScope as WorkspaceMatchScope,
+                                threadMode: threadMode as ConversationThreadMode | undefined,
+                                parentConversationId,
+                                parentQuery,
+                                parentDataChain,
+                                limit: requestedBatchLimit,
+                                sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                            })));
+                            listResult.candidates = perSourceResults.flatMap(result => result.candidates);
+                            listResult.statuses = perSourceResults.flatMap(result => result.statuses);
+                        }
+                        const buildFrozenBatchExport = (): { message: string } | {
+                            options: Parameters<typeof exportConversationBatch>[0];
+                            selectedCount: number;
+                        } => {
+                            const failedSources = listResult.statuses.filter(item => item.status === "failed");
+                            if (sourceFailureMode === "fail" && failedSources.length > 0) {
+                                return {
+                                    message: [
+                                        "❌ 批量导出严格失败",
+                                        "sourceFailureMode=fail 要求任一数据源失败时不继续导出；已保留诊断如下。",
+                                        "",
+                                        "🔗 数据源状态:",
+                                        ...formatSourceStatuses(listResult.statuses),
+                                    ].join("\n"),
+                                };
+                            }
+                            if (listResult.candidates.length === 0) {
+                                return {
+                                    message: [
+                                        "❌ 批量导出未找到候选对话",
+                                        query ? `关键词: ${query}` : "",
+                                        workspaces?.length ? `工作区: ${workspaces.join(" | ")}` : "",
+                                        workspaces?.length ? `工作区范围: ${workspaceScope}` : "",
+                                        "",
+                                        "🔗 数据源状态:",
+                                        ...formatSourceStatuses(listResult.statuses),
+                                    ].filter(Boolean).join("\n"),
+                                };
+                            }
+                            const selected = selectBalancedBatchCandidates(listResult.candidates, requestedBatchLimit, balancedBatch);
+                            return {
+                                options: {
+                                    candidates: selected,
+                                    batchLimit: requestedBatchLimit,
+                                    batchConcurrency,
+                                    sourceStatuses: listResult.statuses,
+                                    link,
+                                    scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
+                                    query,
+                                    workspaces,
+                                    workspaceMode,
+                                    workspaceScope: workspaceScope as WorkspaceMatchScope,
+                                    startRound,
+                                    endRound,
+                                    contextRounds,
+                                    limit,
+                                    mode: mode as SearchMode,
+                                    depth: depth as Depth,
+                                    extraTypes: extraTypes as ExtraType[],
+                                    messageRoles: messageRoles as ConversationMessageRole[] | undefined,
+                                    compactionMode: effectiveCompactionMode,
+                                    outputDir,
+                                    overwrite,
+                                    format: exportFormat || "markdown",
+                                    includeAssets,
+                                    pdfEmbedAttachments: pdfEmbedAttachments || "auto",
+                                },
+                                selectedCount: selected.length,
+                            };
+                        };
+
+                        const runFrozenBatchExport = async (
+                            frozenOptions: Parameters<typeof exportConversationBatch>[0],
+                            selectedCount: number,
+                            taskProgress?: (progress: BackgroundTaskProgress) => void,
+                            runTaskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">,
+                        ) => {
+                            taskProgress?.({
+                                stage: "export_batch",
+                                detail: `开始导出 ${selectedCount} 条对话`,
+                                current: 0,
+                                total: selectedCount,
+                                unit: "条",
+                            });
+                            if (isBackgroundTaskAborted(runTaskContext)) {
+                                return runTaskContext?.isCancelled()
+                                    ? "🛑 批量导出后台任务已取消，已停止后续文件导出"
+                                    : "🛑 批量导出后台任务已结束，已停止后续文件导出";
+                            }
+                            const result = await exportConversationBatch(frozenOptions, {
+                                exportConversation: async (exportOptions) => {
+                                    if (isBackgroundTaskAborted(runTaskContext)) {
+                                        throw new Error(runTaskContext?.isCancelled()
+                                            ? "conversation batch export cancelled before item export"
+                                            : "conversation batch export settled before item export");
+                                    }
+                                    return exportConversation({
+                                        ...exportOptions,
+                                        isCancelled: runTaskContext?.isCancelled,
+                                        isSettled: runTaskContext?.isSettled,
+                                    });
+                                },
+                            });
+                            taskProgress?.({
+                                stage: "export_batch",
+                                detail: "批量导出已完成",
+                                current: selectedCount,
+                                total: selectedCount,
+                                unit: "条",
+                            });
+                            return formatConversationBatchExportResult(result);
+                        };
+
+                        const frozen = buildFrozenBatchExport();
+                        if (!("options" in frozen)) return frozen.message || "❌ 批量导出准备失败";
+                        return runFrozenBatchExport(frozen.options, frozen.selectedCount, updateProgress, taskContext);
+                    };
+
+                    if (background === false) {
+                        const text = await runBatchExport();
+                        return appendTiming({
+                            content: [{ type: "text" as const, text }],
+                        }, startTime);
+                    }
+
+                    const listResult = await (async () => {
+                        const batchSources = dataChains?.length ? dataChains : [chains.dataChain];
+                        const requestedBatchLimit = Math.max(1, Math.min(batchLimit || limit || 10, 50));
+                        let result = await listConversationCandidates({
                             dataChains: batchSources,
                             query,
                             workspaces,
@@ -1424,24 +1839,26 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                             limit: requestedBatchLimit,
                             sourceFailureMode: sourceFailureMode as SourceFailureMode,
                         });
-                    if (balancedBatch) {
-                        const perSourceResults = await Promise.all(batchSources.map(source => listConversationCandidates({
-                            dataChains: [source],
-                            query,
-                            workspaces,
-                            workspaceMode,
-                            workspaceScope: workspaceScope as WorkspaceMatchScope,
-                            threadMode: threadMode as ConversationThreadMode | undefined,
-                            parentConversationId,
-                            parentQuery,
-                            parentDataChain,
-                            limit: requestedBatchLimit,
-                            sourceFailureMode: sourceFailureMode as SourceFailureMode,
-                        })));
-                        listResult.candidates = perSourceResults.flatMap(result => result.candidates);
-                        listResult.statuses = perSourceResults.flatMap(result => result.statuses);
-                    }
-                    const failedSources = listResult.statuses.filter(item => item.status === "failed");
+                        if (balancedBatch) {
+                            const perSourceResults = await Promise.all(batchSources.map(source => listConversationCandidates({
+                                dataChains: [source],
+                                query,
+                                workspaces,
+                                workspaceMode,
+                                workspaceScope: workspaceScope as WorkspaceMatchScope,
+                                threadMode: threadMode as ConversationThreadMode | undefined,
+                                parentConversationId,
+                                parentQuery,
+                                parentDataChain,
+                                limit: requestedBatchLimit,
+                                sourceFailureMode: sourceFailureMode as SourceFailureMode,
+                            })));
+                            result.candidates = perSourceResults.flatMap(item => item.candidates);
+                            result.statuses = perSourceResults.flatMap(item => item.statuses);
+                        }
+                        return { result, requestedBatchLimit };
+                    })();
+                    const failedSources = listResult.result.statuses.filter(item => item.status === "failed");
                     if (sourceFailureMode === "fail" && failedSources.length > 0) {
                         return appendTiming({
                             content: [{
@@ -1451,12 +1868,12 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                                     "sourceFailureMode=fail 要求任一数据源失败时不继续导出；已保留诊断如下。",
                                     "",
                                     "🔗 数据源状态:",
-                                    ...formatSourceStatuses(listResult.statuses),
+                                    ...formatSourceStatuses(listResult.result.statuses),
                                 ].join("\n"),
                             }],
                         }, startTime);
                     }
-                    if (listResult.candidates.length === 0) {
+                    if (listResult.result.candidates.length === 0) {
                         return appendTiming({
                             content: [{
                                 type: "text" as const,
@@ -1467,16 +1884,17 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                                     workspaces?.length ? `工作区范围: ${workspaceScope}` : "",
                                     "",
                                     "🔗 数据源状态:",
-                                    ...formatSourceStatuses(listResult.statuses),
+                                    ...formatSourceStatuses(listResult.result.statuses),
                                 ].filter(Boolean).join("\n"),
                             }],
                         }, startTime);
                     }
-                    const result = await exportConversationBatch({
-                        candidates: selectBalancedBatchCandidates(listResult.candidates, requestedBatchLimit, balancedBatch),
-                        batchLimit: requestedBatchLimit,
+                    const selected = selectBalancedBatchCandidates(listResult.result.candidates, listResult.requestedBatchLimit, balancedBatch);
+                    const frozenBatchOptions: Parameters<typeof exportConversationBatch>[0] = {
+                        candidates: selected,
+                        batchLimit: listResult.requestedBatchLimit,
                         batchConcurrency,
-                        sourceStatuses: listResult.statuses,
+                        sourceStatuses: listResult.result.statuses,
                         link,
                         scope: exportScope || (query ? "search" : (startRound || endRound ? "rounds" : "full")),
                         query,
@@ -1497,9 +1915,46 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                         format: exportFormat || "markdown",
                         includeAssets,
                         pdfEmbedAttachments: pdfEmbedAttachments || "auto",
+                    };
+                    const resumePayload = createConversationBatchExportResumePayload(frozenBatchOptions);
+                    const task = startBackgroundTask("conversation-batch-export", async (taskContext) => {
+                        const result = await resumeConversationBatchExport(resumePayload, {
+                            exportConversation: async (exportOptions) => {
+                                if (isBackgroundTaskAborted(taskContext)) {
+                                    throw new Error(taskContext?.isCancelled()
+                                        ? "conversation batch export cancelled before item export"
+                                        : "conversation batch export settled before item export");
+                                }
+                                return exportConversation({
+                                    ...exportOptions,
+                                    isCancelled: taskContext?.isCancelled,
+                                    isSettled: taskContext?.isSettled,
+                                });
+                            },
+                        });
+                        taskContext.updateProgress({
+                            stage: "export_batch",
+                            detail: "批量导出已完成",
+                            current: selected.length,
+                            total: selected.length,
+                            unit: "条",
+                        });
+                        return formatConversationBatchExportResult(result);
+                    }, {
+                        timeoutMessage: "conversation batch export 后台导出超时；可缩小 batchLimit/筛选范围后重试",
+                        resumePayload: resumePayload as unknown as ResumePayloadValue,
                     });
                     return appendTiming({
-                        content: [{ type: "text" as const, text: formatConversationBatchExportResult(result) }],
+                        content: [{
+                            type: "text" as const,
+                            text: [
+                                "🚀 批量导出已转入后台任务",
+                                `🆔 taskId: ${task.id}`,
+                                `🔗 dataChains: ${(dataChains?.length ? dataChains : [chains.dataChain]).join(", ")}`,
+                                `📦 batchLimit: ${listResult.requestedBatchLimit}`,
+                                "💡 后续调用 conversation_read_original(action=\"deep_locate_status\", taskId=\"...\") 查询进度",
+                            ].join("\n"),
+                        }],
                     }, startTime);
                 }
 
@@ -1520,6 +1975,7 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 const cascadeId = loaded.conversationId;
                 const rounds = loaded.rounds;
                 const totalSteps = loaded.totalSteps;
+                const windsurfSourceDiagnostics = formatWindsurfSourceDiagnostics(loaded);
                 const expandedChildren = loaded.codexData?.expandedChildren || [];
                 const childDiagnostics = loaded.codexData?.childDiagnostics || [];
 
@@ -1557,11 +2013,21 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
 
                 // === fetch 模式 ===
                 if (action === "fetch") {
+                    const fetchTiming = createConversationReadTimingState("fetch");
                     const attachmentOverview = formatAttachmentOverview(rounds);
-                    const tempPath = saveTempFile(
-                        "conv",
-                        cascadeId.slice(0, 8),
-                        buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics, "omit"),
+                    const fetchTempText = await measureConversationReadSegment(
+                        fetchTiming,
+                        "格式化",
+                        () => buildConversationText(cascadeId, rounds, totalSteps, "normal", [], expandedChildren, childDiagnostics, "omit"),
+                    );
+                    const tempPath = await measureConversationReadSegment(
+                        fetchTiming,
+                        "临时文件",
+                        () => saveTempFileAsync(
+                            "conv",
+                            cascadeId.slice(0, 8),
+                            fetchTempText,
+                        ),
                     );
                     const overview = formatOverview(cascadeId, rounds, totalSteps);
                     const subagentNote = formatSubagentSourceNote(loaded);
@@ -1583,53 +2049,65 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                         } else if (isLoadedSubagentThread(loaded)) {
                             recordNote = "\n📋 Record 自动更新已跳过：子代理线程默认由源头主对话统一记录";
                         } else {
-                        const recordHash = findRecordHash(cascadeId) || resolveWorkspaceHashForRecord();
-                        if (shouldAutoUpdateRecord(recordHash, cascadeId, rounds.length)) {
+                        const recordHash = await findRecordHashAsync(cascadeId) || resolveWorkspaceHashForRecord();
+                        if (await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) {
                             // 异步更新，不阻塞返回
-                            generateRecord(recordHash, cascadeId, "auto", rounds, totalSteps, chains.modelChain, {
-                                background: chains.modelChain === "codex",
-                            })
-                                .then(async (res) => {
-                                    if (res.success && res.content) {
-                                        const gate = validateRecordCandidateForWrite(res.content, cascadeId, rounds.length, res.coveredRounds || rounds.length, {
-                                            oldRecord: readRecord(recordHash, cascadeId) || "",
-                                        });
-                                        if (!gate.ok) {
-                                            console.error(`[record] 自动更新候选被拒绝: ${gate.error}`);
-                                            return;
-                                        }
-                                        const phases = countPhasesInRecord(res.content);
-                                        await writeRecord(recordHash, cascadeId, res.content, {
+                            void (async () => {
+                                const singleFlightPermit = await acquireRecordSingleFlightPermit(cascadeId);
+                                try {
+                                    if (!await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) return;
+                                    const res = await generateRecord(recordHash, cascadeId, "auto", rounds, totalSteps, chains.modelChain, {
+                                        background: chains.modelChain === "codex",
+                                    });
+                                    if (!res.success || !res.content) return;
+                                    const content = res.content;
+                                    const oldRecord = await readRecordAsync(recordHash, cascadeId) || "";
+                                    const gate = validateRecordCandidateForWrite(content, cascadeId, rounds.length, res.coveredRounds || rounds.length, {
+                                        oldRecord,
+                                    });
+                                    if (!gate.ok) {
+                                        console.error(`[record] 自动更新候选被拒绝: ${gate.error}`);
+                                        return;
+                                    }
+                                    const phases = countPhasesInRecord(content);
+                                    await withRecordPersistenceWrite(async () => {
+                                        await writeRecord(recordHash, cascadeId, content, {
                                             totalRounds: rounds.length,
                                             totalSteps,
                                             lastUpdatedRound: res.coveredRounds || rounds.length,
                                             phases,
                                             tags: res.tags,
                                         });
-                                        try {
-                                            await writeRecordSidecar(recordHash, cascadeId, "record_index.json", buildRecordReaderIndex(cascadeId, res.content));
-                                        } catch (err) {
-                                            console.error(`[record] reader index build failed: ${err instanceof Error ? err.message : String(err)}`);
+                                        const readerIndex = await buildAndPersistRecordReaderIndex(recordHash, cascadeId, content);
+                                        if (readerIndex.error) {
+                                            console.error(`[record] reader index rebuild degraded: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`);
                                         }
-                                        console.error(`[record] 自动更新完成: ${cascadeId.slice(0, 8)}... (${phases} Phase)`);
-                                    }
-                                })
-                                .catch(err => console.error(`[record] 自动更新失败:`, err));
+                                    });
+                                    console.error(`[record] 自动更新完成: ${cascadeId.slice(0, 8)}... (${phases} Phase)`);
+                                } finally {
+                                    singleFlightPermit.release();
+                                }
+                            })().catch(err => console.error(`[record] 自动更新失败:`, err));
                             recordNote = "\n📋 Record 自动更新已触发（后台进行中）";
                         }
                         }
                     } catch { /* 忽略 Record 检查错误 */ }
 
+                    const fetchText = appendConversationReadDetail(
+                        `${overview}${cacheNote}${subagentNote ? `\n${subagentNote}` : ""}${logicalChainNote ? `\n${logicalChainNote}` : ""}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${windsurfSourceDiagnostics ? `\n${windsurfSourceDiagnostics}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+                        formatConversationReadSegmentTiming(fetchTiming),
+                    );
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${overview}${cacheNote}${subagentNote ? `\n${subagentNote}` : ""}${logicalChainNote ? `\n${logicalChainNote}` : ""}\n🔗 数据链路: ${loaded.chainUsed}${partialWarning ? `\n${partialWarning}` : ""}${attachmentOverview ? `\n${attachmentOverview}` : ""}\n📁 临时文件: ${tempPath}\n💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+                            text: fetchText,
                         }],
                     }, startTime);
                 }
 
                 // === search 模式 ===
                 if (action === "search") {
+                    const searchTiming = createConversationReadTimingState("search");
                     if (!query) {
                         return appendTiming({
                             content: [{ type: "text" as const, text: "❌ search 模式需要提供 query 参数" }],
@@ -1680,16 +2158,25 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                             const selectedRounds = smartRoundIndices
                                 .map(ri => rounds[ri - 1])
                                 .filter((round): round is ConversationRound => Boolean(round));
-                            const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
-                            for (const ri of smartRoundIndices) {
-                                const round = displayRounds.find(item => item.roundIndex === ri);
-                                if (!round) continue;
-                                output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                                output.push("");
-                            }
+                            const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
+                                searchTiming,
+                                "附件物化",
+                                () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
+                            );
+                            await measureConversationReadSegment(searchTiming, "格式化", async () => {
+                                for (let index = 0; index < smartRoundIndices.length; index++) {
+                                    const ri = smartRoundIndices[index];
+                                    const round = displayRounds.find(item => item.roundIndex === ri);
+                                    if (!round) continue;
+                                    output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
+                                    output.push("");
+                                    await yieldConversationFormatIfNeeded(index + 1);
+                                }
+                            });
                             if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
                             let text = output.join("\n");
                             if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
+                            text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
                             return appendTiming({
                                 content: [{ type: "text" as const, text: `${formatConversationSearchHeader(cascadeId, loaded, chains.modelChain)}\n\n${text}` }],
                             }, startTime);
@@ -1700,16 +2187,25 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                         const selectedRounds = fuzzyRoundIndices
                             .map(ri => rounds[ri - 1])
                             .filter((round): round is ConversationRound => Boolean(round));
-                        const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
-                        for (const ri of fuzzyRoundIndices) {
-                            const round = displayRounds.find(item => item.roundIndex === ri);
-                            if (!round) continue;
-                            output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                            output.push("");
-                        }
+                        const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
+                            searchTiming,
+                            "附件物化",
+                            () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
+                        );
+                        await measureConversationReadSegment(searchTiming, "格式化", async () => {
+                            for (let index = 0; index < fuzzyRoundIndices.length; index++) {
+                                const ri = fuzzyRoundIndices[index];
+                                const round = displayRounds.find(item => item.roundIndex === ri);
+                                if (!round) continue;
+                                output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
+                                output.push("");
+                                await yieldConversationFormatIfNeeded(index + 1);
+                            }
+                        });
                         if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
                         let text = output.join("\n");
                         if (text.length > 8000) text = text.slice(0, 8000) + "\n\n⚠️ 结果过长已截断";
+                        text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
                         return appendTiming({
                             content: [{ type: "text" as const, text: `${searchHeader}\n\n${text}` }],
                         }, startTime);
@@ -1731,13 +2227,21 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     const selectedRounds = sortedRounds
                         .map(ri => rounds[ri - 1])
                         .filter((round): round is ConversationRound => Boolean(round));
-                    const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
-                    for (const ri of sortedRounds) {
-                        const round = displayRounds.find(item => item.roundIndex === ri);
-                        if (!round) continue;
-                        output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                        output.push("");
-                    }
+                    const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
+                        searchTiming,
+                        "附件物化",
+                        () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
+                    );
+                    await measureConversationReadSegment(searchTiming, "格式化", async () => {
+                        for (let index = 0; index < sortedRounds.length; index++) {
+                            const ri = sortedRounds[index];
+                            const round = displayRounds.find(item => item.roundIndex === ri);
+                            if (!round) continue;
+                            output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
+                            output.push("");
+                            await yieldConversationFormatIfNeeded(index + 1);
+                        }
+                    });
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
 
                     // 上下文大小控制
@@ -1746,14 +2250,18 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     if (depth === "full" && text.length > MAX_SEARCH) {
                         // full 深度不截断，写入临时文件
                         const slug = cascadeId.slice(0, 8);
-                        const tmpPath = saveTempFile("search", slug, text);
-                        const summary = `${searchHeader}\n\n` + text.slice(0, 2000) + `\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`;
+                        const tmpPath = await measureConversationReadSegment(searchTiming, "临时文件", () => saveTempFileAsync("search", slug, text));
+                        const summary = appendConversationReadDetail(
+                            `${searchHeader}\n\n${text.slice(0, 2000)}\n\n📄 完整搜索结果已写入: ${tmpPath}\n(共 ${text.length} 字)`,
+                            formatConversationReadSegmentTiming(searchTiming),
+                        );
                         return appendTiming({
                             content: [{ type: "text" as const, text: summary }],
                         }, startTime);
                     } else if (text.length > MAX_SEARCH) {
                         text = text.slice(0, MAX_SEARCH) + `\n\n⚠️ 结果过长已截断（${text.length}→${MAX_SEARCH}字），请用更精确的关键词或 depth=brief`;
                     }
+                    text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
 
                     return appendTiming({
                         content: [{ type: "text" as const, text: `${searchHeader}\n\n${text}` }],
@@ -1762,8 +2270,21 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
 
                 // === read 模式 ===
                 if (action === "read") {
+                    const readTiming = createConversationReadTimingState("read");
                     const start = startRound || 1;
                     const end = endRound || rounds.length;
+                    const incompleteWindsurfWarning = formatWindsurfIncompleteReadWarning(loaded);
+                    if (incompleteWindsurfWarning) {
+                        const output = [
+                            formatOverview(cascadeId, rounds, totalSteps),
+                            `🔗 数据链路: ${loaded.chainUsed}`,
+                            windsurfSourceDiagnostics,
+                            incompleteWindsurfWarning,
+                        ].filter(Boolean).join("\n");
+                        return appendTiming({
+                            content: [{ type: "text" as const, text: appendConversationReadDetail(output, formatConversationReadSegmentTiming(readTiming)) }],
+                        }, startTime);
+                    }
 
                     if (start > rounds.length) {
                         return appendTiming({
@@ -1782,16 +2303,49 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     if (logicalChainNote) pushOutputWithBuildBudget(output, logicalChainNote, buildState, "read 输出");
                     const roleFilter = normalizeMessageRoles(messageRoles as ConversationMessageRole[] | undefined);
                     pushOutputWithBuildBudget(output, `📖 读取轮次 ${start}-${Math.min(end, rounds.length)}${roleFilter.size ? ` | 角色过滤: ${[...roleFilter].join(", ")}` : ""}\n`, buildState, "read 输出");
+                    if (windsurfSourceDiagnostics) {
+                        pushOutputWithBuildBudget(output, windsurfSourceDiagnostics, buildState, "read 输出");
+                        pushOutputWithBuildBudget(output, "", buildState, "read 输出");
+                    }
 
                     const selectedRounds = rounds.slice(start - 1, Math.min(end, rounds.length));
-                    const { rounds: displayRounds, truncated } = await materializeRoundAttachments(selectedRounds, cascadeId);
-                    for (let i = start; i <= Math.min(end, rounds.length); i++) {
-                        const formatted = formatRoundForMessageRoles(displayRounds[i - start], depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
-                        if (!formatted) continue;
-                        if (!pushOutputWithBuildBudget(output, formatted, buildState, "read 输出")) break;
-                        if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
-                    }
+                    const attachmentDeadlineAt = Date.now() + getReadAttachmentBudgetMs();
+                    const { rounds: displayRounds, truncated, budgetExceeded: attachmentBudgetExceeded } = await measureConversationReadSegment(
+                        readTiming,
+                        "附件物化",
+                        () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId, { deadlineAt: attachmentDeadlineAt }),
+                    );
+                    const formatDeadlineAt = Date.now() + getReadFormatBudgetMs();
+                    let formatBudgetExceeded = false;
+                    await measureConversationReadSegment(readTiming, "格式化", async () => {
+                        for (let i = start; i <= Math.min(end, rounds.length); i++) {
+                            const round = displayRounds[i - start];
+                            if (!round) continue;
+                            const formatted = formatRoundForMessageRolesWithOptionalBudget(
+                                round,
+                                depth as Depth,
+                                extraTypes as ExtraType[],
+                                roleFilter,
+                                effectiveCompactionMode,
+                                { deadlineAt: formatDeadlineAt },
+                            );
+                            if (formatted.budgetExceeded) {
+                                formatBudgetExceeded = true;
+                            }
+                            if (!formatted.text) {
+                                if (formatted.budgetExceeded) break;
+                                continue;
+                            }
+                            if (!pushOutputWithBuildBudget(output, formatted.text, buildState, "read 输出")) break;
+                            if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
+                            if (formatted.budgetExceeded) break;
+                            await yieldConversationFormatIfNeeded(i - start + 1);
+                        }
+                    });
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
+                    if (attachmentBudgetExceeded || formatBudgetExceeded) {
+                        output.push("⚠️ 本次 read 在预算内先返回了部分结果；请缩小轮次范围后重试（例如减小 endRound-startRound）。\n");
+                    }
 
                     if (!buildState.truncated && expandedChildren.length > 0) {
                         pushOutputWithBuildBudget(output, "# 子代理线程展开", buildState, "read 输出");
@@ -1799,12 +2353,14 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                         for (const child of expandedChildren) {
                             if (!pushOutputWithBuildBudget(output, `## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`, buildState, "read 输出")) break;
                             if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
-                            const { rounds: childDisplayRounds, truncated: childTruncated } = await materializeRoundAttachments(child.rounds, child.thread.id);
-                            for (const round of childDisplayRounds) {
-                                const formatted = formatRoundForMessageRoles(round, depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
-                                if (!formatted) continue;
-                                if (!pushOutputWithBuildBudget(output, formatted, buildState, "read 输出")) break;
+                            const { rounds: childDisplayRounds, truncated: childTruncated } = await materializeRoundAttachmentsWithOptionalBudget(child.rounds, child.thread.id);
+                            for (let index = 0; index < childDisplayRounds.length; index++) {
+                                const round = childDisplayRounds[index];
+                                const formatted = formatRoundForMessageRolesWithOptionalBudget(round, depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
+                                if (!formatted.text) continue;
+                                if (!pushOutputWithBuildBudget(output, formatted.text, buildState, "read 输出")) break;
                                 if (!pushOutputWithBuildBudget(output, "", buildState, "read 输出")) break;
+                                await yieldConversationFormatIfNeeded(index + 1);
                             }
                             if (childTruncated > 0) output.push(`⚠️ 子线程 ${child.thread.id.slice(0, 8)} 有 ${childTruncated} 个附件超过单次生成上限，未生成临时文件\n`);
                             if (buildState.truncated) break;
@@ -1825,14 +2381,18 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     if (depth === "full" && text.length > MAX_READ) {
                         // full 深度不截断，写入临时文件供完整阅读
                         const slug = cascadeId.slice(0, 8);
-                        const tmpPath = saveTempFile("read", slug, text);
-                        const summary = text.slice(0, 2000) + `\n\n📄 完整内容已写入: ${tmpPath}\n(共 ${text.length} 字，${output.length} 段)`;
+                        const tmpPath = await measureConversationReadSegment(readTiming, "临时文件", () => saveTempFileAsync("read", slug, text));
+                        const summary = appendConversationReadDetail(
+                            `${text.slice(0, 2000)}\n\n📄 完整内容已写入: ${tmpPath}\n(共 ${text.length} 字，${output.length} 段)`,
+                            formatConversationReadSegmentTiming(readTiming),
+                        );
                         return appendTiming({
                             content: [{ type: "text" as const, text: summary }],
                         }, startTime);
                     } else if (text.length > MAX_READ) {
                         text = text.slice(0, MAX_READ) + `\n\n⚠️ 结果过长已截断（${text.length}→${MAX_READ}字），请用更小的轮次范围或 brief 深度`;
                     }
+                    text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(readTiming));
 
                     return appendTiming({
                         content: [{ type: "text" as const, text }],

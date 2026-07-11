@@ -23,17 +23,20 @@ const PROFILE_DEFINITIONS = {
     description: "强协作 / 高质量主力子代理",
     candidates: [
       { uid: "claude-opus-4-8-xhigh", note: "优先强协作，适合复杂实现和长期维护判断" },
+      { uid: "glm-5-2-max-1m", label: "GLM 5.2 Max 1M", note: "高质量协作；不支持多模态（supports_images=false）" },
+      { uid: "claude-opus-4-6-thinking-1m", label: "Claude Opus 4.6 Thinking 1M", note: "长上下文强协作备用" },
       { uid: "claude-opus-4-8-high", note: "强协作备用" },
       { uid: "claude-opus-4-8-medium", note: "强协作中档备用" },
       { uid: "claude-sonnet-4-6-thinking", note: "高质量代码协作备用" },
-      { uid: "glm-5-1", label: "GLM 5.1", source: "unverified", note: "用户偏好项；仅在当前 WSF 缓存出现时可直接使用" },
       { uid: "gpt-5-4", label: "GPT-5.4", source: "unverified", note: "用户偏好项；一般慎用，当前 WSF 缓存未必存在" },
     ],
   },
   explore: {
     description: "低成本 / 高性价比探索",
     candidates: [
-      { uid: "kimi-k2-6", note: "探索与资料梳理优先，低成本候选" },
+      { uid: "glm-5-2-max-1m", label: "GLM 5.2 Max 1M", note: "高质量探索；不支持多模态（supports_images=false）" },
+      { uid: "kimi-k2-7", label: "Kimi K2.7", note: "探索与资料梳理，低成本候选" },
+      { uid: "kimi-k2-6", note: "探索备用" },
       { uid: "swe-1-6-fast", note: "快速代码探索" },
       { uid: "swe-1-6", note: "Windsurf 自家探索备用" },
       { uid: "gemini-3-5-flash-medium", note: "长上下文、低成本探索备用" },
@@ -53,6 +56,7 @@ const PROFILE_DEFINITIONS = {
   review: {
     description: "审查 / 找风险 / 挑错",
     candidates: [
+      { uid: "glm-5-2-max-1m", label: "GLM 5.2 Max 1M", note: "高质量审查；不支持多模态（supports_images=false）" },
       { uid: "gpt-5-3-codex", label: "GPT-5.3-Codex", source: "unverified", note: "Codex 审查偏好项；若 WSF 缓存没有，不伪装成可用" },
       { uid: "deepseek-v4-pro", label: "DeepSeek V4 Pro", source: "unverified", note: "审查偏好项；若 WSF 缓存没有，不伪装成可用" },
       { uid: "claude-opus-4-8-xhigh", note: "WSF 可用时的高质量审查 fallback" },
@@ -173,6 +177,108 @@ function modelIndex(models) {
     index.set(model.uid.toLowerCase(), model);
   }
   return index;
+}
+
+function normalizeSearchText(value) {
+  return String(value || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+}
+
+function inferFamily(model) {
+  const uid = String(model.uid || "").toLowerCase();
+  const label = String(model.label || "").toLowerCase();
+  const raw = String(model.family || "").trim();
+  const text = `${uid} ${label} ${raw}`.toLowerCase();
+  if (text.includes("claude") || text.includes("anthropic") || text.includes("opus") || text.includes("sonnet") || text.includes("fable")) return "Claude";
+  if (text.includes("gpt") || text.includes("openai")) return "GPT";
+  if (text.includes("gemini") || text.includes("google")) return "Gemini";
+  if (text.includes("glm") || text.includes("zhipu") || text.includes("zai")) return "GLM";
+  if (text.includes("kimi") || text.includes("moonshot")) return "Kimi";
+  if (text.includes("deepseek")) return "DeepSeek";
+  if (text.includes("minimax")) return "Minimax";
+  if (text.includes("adaptive") || text.includes("arena") || text.includes("windsurf")) return "Windsurf";
+  if (text.includes("swe")) return "SWE";
+  if (text.includes("grok") || text.includes("xai")) return "Grok";
+  if (text.includes("qwen")) return "Qwen";
+  if (text.includes("llama")) return "Llama";
+  return raw || model.provider || "Other";
+}
+
+function familyKey(name) {
+  return normalizeSearchText(name);
+}
+
+function familySummary(familyName, models) {
+  const sorted = sortModels(models);
+  return {
+    family: familyName,
+    key: familyKey(familyName),
+    count: sorted.length,
+    first_available: sorted[0]?.uid || null,
+    sample_models: sorted.slice(0, 5).map((model) => ({
+      uid: model.uid,
+      label: model.label,
+      source: model.source,
+      supports_images: model.supports_images,
+      cost: model.cost,
+    })),
+  };
+}
+
+export function getModelFamilies(catalog, { limit = 5 } = {}) {
+  const groups = new Map();
+  for (const model of catalog.available || []) {
+    const family = inferFamily(model);
+    groups.set(family, [...(groups.get(family) || []), model]);
+  }
+  return [...groups.entries()]
+    .map(([family, models]) => familySummary(family, models))
+    .map((entry) => ({
+      ...entry,
+      sample_models: entry.sample_models.slice(0, Number.isFinite(limit) && limit > 0 ? limit : 5),
+    }))
+    .sort((left, right) => left.family.localeCompare(right.family));
+}
+
+function modelMatchesQuery(model, query) {
+  const compactQuery = normalizeSearchText(query);
+  if (!compactQuery) return true;
+  const family = inferFamily(model);
+  const searchFields = [
+    model.uid,
+    model.label,
+    model.provider,
+    model.family,
+    family,
+  ];
+  return searchFields.some((field) => {
+    const raw = String(field || "").toLowerCase();
+    return raw.includes(String(query || "").toLowerCase()) || normalizeSearchText(raw).includes(compactQuery);
+  });
+}
+
+export async function queryModels({ query, refresh = false, limit = 30 } = {}) {
+  const catalog = await getModelCatalog({ refresh });
+  const max = Number(limit);
+  const matches = sortModels((catalog.available || []).filter((model) => modelMatchesQuery(model, query)))
+    .slice(0, Number.isFinite(max) && max > 0 ? max : 30)
+    .map((model) => ({
+      uid: model.uid,
+      label: model.label,
+      family: inferFamily(model),
+      provider: model.provider,
+      cost: model.cost,
+      source: model.source,
+      supports_images: model.supports_images,
+      supports_tool_calls: model.supports_tool_calls,
+      supports_thinking: model.supports_thinking,
+      max_tokens: model.max_tokens,
+    }));
+  return {
+    ...catalog,
+    query: String(query || ""),
+    matches,
+    match_count: matches.length,
+  };
 }
 
 async function readCachedCascadeModels(errors) {

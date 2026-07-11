@@ -3,8 +3,8 @@ import fs from "fs";
 import Fuse from "fuse.js";
 import {
     DATA_ROOT, WORKSPACES_DIR, GENERAL_DIR,
-    writeJsonAtomic, writeTextAtomic,
-    workspaceHash, findWorkspaceHash, listWorkspaceHashes,
+    writeJsonAtomicAsync, writeTextAtomicAsync,
+    workspaceHash, findWorkspaceHash, listWorkspaceHashes, listWorkspaceHashesAsync,
     withIndexLock,
 } from "./store.js";
 
@@ -32,12 +32,22 @@ export interface RecordIndexEntry {
     phases: number;           // Phase 数量
     sizeBytes: number;
     tags?: string[];          // v1.8.1: 自动提取的标签
+    chain?: string;           // v1.17.2: 对话来源 (codex/claude-code/windsurf/antigravity)，用于 stale_check
 }
 
 /** Record 索引文件 */
 export interface RecordsIndex {
     version: number;
     records: Record<string, RecordIndexEntry>;
+}
+
+export interface RecordIndexWriteResult {
+    entry: RecordIndexEntry;
+    outcome: "created" | "updated";
+}
+
+export interface WriteRecordOptions {
+    afterContentWrite?: () => void | Promise<void>;
 }
 
 // ============= 路径工具 =============
@@ -68,6 +78,32 @@ export function ensureRecordsDir(hash: string): void {
     fs.mkdirSync(dir, { recursive: true });
 }
 
+export async function ensureRecordsDirAsync(hash: string): Promise<void> {
+    await fs.promises.mkdir(getRecordsDir(hash), { recursive: true });
+}
+
+function isNotFoundError(error: unknown): boolean {
+    return (error as NodeJS.ErrnoException)?.code === "ENOENT";
+}
+
+async function unlinkIfExists(filePath: string): Promise<boolean> {
+    try {
+        await fs.promises.unlink(filePath);
+        return true;
+    } catch (error) {
+        if (isNotFoundError(error)) return false;
+        throw error;
+    }
+}
+
+async function copyFileIfExists(sourcePath: string, targetPath: string): Promise<void> {
+    try {
+        await fs.promises.copyFile(sourcePath, targetPath);
+    } catch (error) {
+        if (!isNotFoundError(error)) throw error;
+    }
+}
+
 // ============= 索引操作 =============
 
 /**
@@ -85,13 +121,21 @@ export function readRecordsIndex(hash: string): RecordsIndex {
     }
 }
 
+export async function readRecordsIndexAsync(hash: string): Promise<RecordsIndex> {
+    try {
+        return JSON.parse(await fs.promises.readFile(getRecordsIndexPath(hash), "utf-8")) as RecordsIndex;
+    } catch {
+        return { version: 1, records: {} };
+    }
+}
+
 /**
  * 写入 Record 索引（原子写入，带锁）
  */
 export async function writeRecordsIndex(hash: string, index: RecordsIndex): Promise<void> {
-    await withIndexLock(`records_${hash}`, () => {
-        ensureRecordsDir(hash);
-        writeJsonAtomic(getRecordsIndexPath(hash), index);
+    await withIndexLock(`records_${hash}`, async () => {
+        await ensureRecordsDirAsync(hash);
+        await writeJsonAtomicAsync(getRecordsIndexPath(hash), index);
     });
 }
 
@@ -105,6 +149,15 @@ export function readRecord(hash: string, conversationId: string): string | null 
     const filePath = getRecordPath(hash, conversationId);
     if (!fs.existsSync(filePath)) return null;
     return fs.readFileSync(filePath, "utf-8");
+}
+
+export async function readRecordAsync(hash: string, conversationId: string): Promise<string | null> {
+    try {
+        return await fs.promises.readFile(getRecordPath(hash, conversationId), "utf-8");
+    } catch (error) {
+        if (isNotFoundError(error)) return null;
+        throw error;
+    }
 }
 
 function getRecordSidecarPath(hash: string, conversationId: string, suffix: string): string {
@@ -121,20 +174,26 @@ export function readRecordSidecar<T = unknown>(hash: string, conversationId: str
     }
 }
 
+export async function readRecordSidecarAsync<T = unknown>(hash: string, conversationId: string, suffix: string): Promise<T | null> {
+    try {
+        return JSON.parse(await fs.promises.readFile(getRecordSidecarPath(hash, conversationId, suffix), "utf-8")) as T;
+    } catch {
+        return null;
+    }
+}
+
 export async function writeRecordSidecar(hash: string, conversationId: string, suffix: string, data: unknown): Promise<void> {
-    await withIndexLock(`record_sidecar_${hash}_${conversationId}_${suffix}`, () => {
-        ensureRecordsDir(hash);
-        writeJsonAtomic(getRecordSidecarPath(hash, conversationId, suffix), data);
+    await withIndexLock(`record_sidecar_${hash}_${conversationId}_${suffix}`, async () => {
+        await ensureRecordsDirAsync(hash);
+        await writeJsonAtomicAsync(getRecordSidecarPath(hash, conversationId, suffix), data);
     });
 }
 
 export async function deleteRecordSidecar(hash: string, conversationId: string, suffix: string): Promise<boolean> {
     const filePath = getRecordSidecarPath(hash, conversationId, suffix);
-    if (!fs.existsSync(filePath)) return false;
-    await withIndexLock(`record_sidecar_${hash}_${conversationId}_${suffix}`, () => {
-        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    return withIndexLock(`record_sidecar_${hash}_${conversationId}_${suffix}`, async () => {
+        return unlinkIfExists(filePath);
     });
-    return true;
 }
 
 /**
@@ -145,27 +204,47 @@ export async function writeRecord(
     conversationId: string,
     content: string,
     meta: Partial<RecordIndexEntry>,
-): Promise<void> {
-    ensureRecordsDir(hash);
+    options: WriteRecordOptions = {},
+): Promise<RecordIndexWriteResult> {
+    await ensureRecordsDirAsync(hash);
     const filePath = getRecordPath(hash, conversationId);
-    writeTextAtomic(filePath, content);
+    await writeTextAtomicAsync(filePath, content);
+    await options.afterContentWrite?.();
 
-    // 更新索引
-    const index = readRecordsIndex(hash);
-    const existing = index.records[conversationId] || {};
-    index.records[conversationId] = {
-        conversationId,
-        title: meta.title || existing.title || "Untitled",
-        timeSpan: meta.timeSpan || existing.timeSpan || "",
-        totalRounds: meta.totalRounds ?? existing.totalRounds ?? 0,
-        totalSteps: meta.totalSteps ?? existing.totalSteps ?? 0,
-        lastUpdatedRound: meta.lastUpdatedRound ?? existing.lastUpdatedRound ?? 0,
-        lastUpdatedAt: new Date().toISOString(),
-        phases: meta.phases ?? existing.phases ?? 0,
-        sizeBytes: Buffer.byteLength(content, "utf-8"),
-        tags: meta.tags || (existing as RecordIndexEntry).tags || [],
-    };
-    await writeRecordsIndex(hash, index);
+    return upsertRecordIndex(hash, conversationId, content, meta);
+}
+
+export async function upsertRecordIndex(
+    hash: string,
+    conversationId: string,
+    content: string,
+    meta: Partial<RecordIndexEntry>,
+): Promise<RecordIndexWriteResult> {
+    await ensureRecordsDirAsync(hash);
+    // 更新索引（read-modify-write 必须在锁内原子执行，防并发互相覆盖导致 list 延迟丢失条目）
+    return withIndexLock(`records_${hash}`, async () => {
+        const index = await readRecordsIndexAsync(hash);
+        const existing = index.records[conversationId];
+        const entry: RecordIndexEntry = {
+            conversationId,
+            title: meta.title || existing?.title || "Untitled",
+            timeSpan: meta.timeSpan || existing?.timeSpan || "",
+            totalRounds: meta.totalRounds ?? existing?.totalRounds ?? 0,
+            totalSteps: meta.totalSteps ?? existing?.totalSteps ?? 0,
+            lastUpdatedRound: meta.lastUpdatedRound ?? existing?.lastUpdatedRound ?? 0,
+            lastUpdatedAt: new Date().toISOString(),
+            phases: meta.phases ?? existing?.phases ?? 0,
+            sizeBytes: Buffer.byteLength(content, "utf-8"),
+            tags: meta.tags || existing?.tags || [],
+            chain: meta.chain || existing?.chain,
+        };
+        index.records[conversationId] = entry;
+        await writeJsonAtomicAsync(getRecordsIndexPath(hash), index);
+        return {
+            entry,
+            outcome: existing ? "updated" : "created",
+        };
+    });
 }
 
 /**
@@ -179,43 +258,48 @@ export async function copyRecordToHash(
     metaPatch: Partial<RecordIndexEntry> = {},
     options: { backup?: boolean } = {},
 ): Promise<boolean> {
-    const content = readRecord(sourceHash, conversationId);
+    const content = await readRecordAsync(sourceHash, conversationId);
     if (!content) return false;
 
     if (options.backup !== false) {
         const stamp = new Date().toISOString().replace(/[:.]/g, "-");
         const backupDir = path.join(DATA_ROOT, "record-ownership-backups", `${stamp}_${conversationId.slice(0, 8)}_${sourceHash}_to_${targetHash}`);
-        fs.mkdirSync(backupDir, { recursive: true });
+        await fs.promises.mkdir(backupDir, { recursive: true });
         const sourcePath = getRecordPath(sourceHash, conversationId);
         const targetPath = getRecordPath(targetHash, conversationId);
-        if (fs.existsSync(sourcePath)) fs.copyFileSync(sourcePath, path.join(backupDir, `${sourceHash}_${conversationId}.md`));
-        if (fs.existsSync(targetPath)) fs.copyFileSync(targetPath, path.join(backupDir, `${targetHash}_${conversationId}.md`));
         const sourceIndexPath = getRecordsIndexPath(sourceHash);
         const targetIndexPath = getRecordsIndexPath(targetHash);
-        if (fs.existsSync(sourceIndexPath)) fs.copyFileSync(sourceIndexPath, path.join(backupDir, `${sourceHash}_records_index.json`));
-        if (fs.existsSync(targetIndexPath)) fs.copyFileSync(targetIndexPath, path.join(backupDir, `${targetHash}_records_index.json`));
+        await Promise.all([
+            copyFileIfExists(sourcePath, path.join(backupDir, `${sourceHash}_${conversationId}.md`)),
+            copyFileIfExists(targetPath, path.join(backupDir, `${targetHash}_${conversationId}.md`)),
+            copyFileIfExists(sourceIndexPath, path.join(backupDir, `${sourceHash}_records_index.json`)),
+            copyFileIfExists(targetIndexPath, path.join(backupDir, `${targetHash}_records_index.json`)),
+        ]);
     }
 
-    ensureRecordsDir(targetHash);
-    writeTextAtomic(getRecordPath(targetHash, conversationId), content);
+    await ensureRecordsDirAsync(targetHash);
+    await writeTextAtomicAsync(getRecordPath(targetHash, conversationId), content);
 
-    const sourceEntry = readRecordsIndex(sourceHash).records[conversationId];
-    const targetIndex = readRecordsIndex(targetHash);
-    const existing = targetIndex.records[conversationId] || {};
-    const entry: RecordIndexEntry = {
-        conversationId,
-        title: metaPatch.title || sourceEntry?.title || existing.title || "Untitled",
-        timeSpan: metaPatch.timeSpan || sourceEntry?.timeSpan || existing.timeSpan || "",
-        totalRounds: metaPatch.totalRounds ?? sourceEntry?.totalRounds ?? existing.totalRounds ?? 0,
-        totalSteps: metaPatch.totalSteps ?? sourceEntry?.totalSteps ?? existing.totalSteps ?? 0,
-        lastUpdatedRound: metaPatch.lastUpdatedRound ?? sourceEntry?.lastUpdatedRound ?? existing.lastUpdatedRound ?? 0,
-        lastUpdatedAt: metaPatch.lastUpdatedAt || sourceEntry?.lastUpdatedAt || existing.lastUpdatedAt || new Date().toISOString(),
-        phases: metaPatch.phases ?? sourceEntry?.phases ?? existing.phases ?? 0,
-        sizeBytes: Buffer.byteLength(content, "utf-8"),
-        tags: metaPatch.tags || sourceEntry?.tags || existing.tags || [],
-    };
-    targetIndex.records[conversationId] = entry;
-    await writeRecordsIndex(targetHash, targetIndex);
+    const sourceEntry = (await readRecordsIndexAsync(sourceHash)).records[conversationId];
+    await withIndexLock(`records_${targetHash}`, async () => {
+        const targetIndex = await readRecordsIndexAsync(targetHash);
+        const existing = targetIndex.records[conversationId] || {};
+        const entry: RecordIndexEntry = {
+            conversationId,
+            title: metaPatch.title || sourceEntry?.title || existing.title || "Untitled",
+            timeSpan: metaPatch.timeSpan || sourceEntry?.timeSpan || existing.timeSpan || "",
+            totalRounds: metaPatch.totalRounds ?? sourceEntry?.totalRounds ?? existing.totalRounds ?? 0,
+            totalSteps: metaPatch.totalSteps ?? sourceEntry?.totalSteps ?? existing.totalSteps ?? 0,
+            lastUpdatedRound: metaPatch.lastUpdatedRound ?? sourceEntry?.lastUpdatedRound ?? existing.lastUpdatedRound ?? 0,
+            lastUpdatedAt: metaPatch.lastUpdatedAt || sourceEntry?.lastUpdatedAt || existing.lastUpdatedAt || new Date().toISOString(),
+            phases: metaPatch.phases ?? sourceEntry?.phases ?? existing.phases ?? 0,
+            sizeBytes: Buffer.byteLength(content, "utf-8"),
+            tags: metaPatch.tags || sourceEntry?.tags || existing.tags || [],
+            chain: metaPatch.chain || sourceEntry?.chain || existing.chain,
+        };
+        targetIndex.records[conversationId] = entry;
+        await writeJsonAtomicAsync(getRecordsIndexPath(targetHash), targetIndex);
+    });
     return true;
 }
 
@@ -224,20 +308,28 @@ export async function copyRecordToHash(
  */
 export async function deleteRecord(hash: string, conversationId: string): Promise<boolean> {
     const filePath = getRecordPath(hash, conversationId);
-    if (!fs.existsSync(filePath)) return false;
-    fs.unlinkSync(filePath);
+    if (!await unlinkIfExists(filePath)) return false;
     const sidecarPrefix = path.join(getRecordsDir(hash), `${conversationId}.`);
-    for (const item of fs.readdirSync(getRecordsDir(hash))) {
+    let recordFiles: string[];
+    try {
+        recordFiles = await fs.promises.readdir(getRecordsDir(hash));
+    } catch (error) {
+        if (isNotFoundError(error)) recordFiles = [];
+        else throw error;
+    }
+    await Promise.all(recordFiles.map(async (item) => {
         const itemPath = path.join(getRecordsDir(hash), item);
         if (itemPath.startsWith(sidecarPrefix) && itemPath !== filePath) {
-            try { fs.unlinkSync(itemPath); } catch { /* best effort */ }
+            try { await fs.promises.unlink(itemPath); } catch {}
         }
-    }
+    }));
 
-    // 更新索引
-    const index = readRecordsIndex(hash);
-    delete index.records[conversationId];
-    await writeRecordsIndex(hash, index);
+    // 更新索引（read-modify-write 在锁内原子执行）
+    await withIndexLock(`records_${hash}`, async () => {
+        const index = await readRecordsIndexAsync(hash);
+        delete index.records[conversationId];
+        await writeJsonAtomicAsync(getRecordsIndexPath(hash), index);
+    });
     return true;
 }
 
@@ -348,6 +440,30 @@ export function findRecordHash(conversationId: string): string | null {
     for (const hash of hashes) {
         const idx = readRecordsIndex(hash);
         const entry = idx.records[conversationId];
+        if (!entry) continue;
+        const updatedAt = Date.parse(entry.lastUpdatedAt || "") || 0;
+        const coveredRounds = entry.lastUpdatedRound || entry.totalRounds || 0;
+        const sizeBytes = entry.sizeBytes || 0;
+        if (
+            !best ||
+            coveredRounds > best.coveredRounds ||
+            (coveredRounds === best.coveredRounds && updatedAt > best.updatedAt) ||
+            (coveredRounds === best.coveredRounds && updatedAt === best.updatedAt && sizeBytes > best.sizeBytes)
+        ) {
+            best = { hash, updatedAt, coveredRounds, sizeBytes };
+        }
+    }
+
+    return best?.hash || null;
+}
+
+export async function findRecordHashAsync(conversationId: string): Promise<string | null> {
+    let best: { hash: string; updatedAt: number; coveredRounds: number; sizeBytes: number } | null = null;
+    const hashes = ["general", ...await listWorkspaceHashesAsync()];
+    const indexes = await Promise.all(hashes.map(async hash => ({ hash, index: await readRecordsIndexAsync(hash) })));
+
+    for (const { hash, index } of indexes) {
+        const entry = index.records[conversationId];
         if (!entry) continue;
         const updatedAt = Date.parse(entry.lastUpdatedAt || "") || 0;
         const coveredRounds = entry.lastUpdatedRound || entry.totalRounds || 0;

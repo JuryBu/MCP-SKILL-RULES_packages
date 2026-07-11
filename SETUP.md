@@ -1,91 +1,106 @@
 # Setup Guide
 
-This guide is for setting up the portable MCP + Rules package on Windows.
+Windows receiver-side setup for the portable MCP + Skills + Rules toolkit.
 
-## 1. Build MCP Servers
+## 1. Prerequisites
 
-From the repository root:
+- Windows PowerShell 5.1 or PowerShell 7
+- Node.js 18 or newer
+- A writable data directory; default: `%USERPROFILE%\.codex-toolkit`
+- At least one supported host: Codex, Antigravity, Claude Code, or Windsurf
+
+Copy `templates/env.example.ps1` to a private local file outside the repository, edit only the values required by the receiver, and load it before starting the broker.
+
+## 2. Validate The Source Package
+
+```powershell
+./install/Test-CodexToolkit.ps1 -PackageClean
+```
+
+This verifies required MCP packages, four-host Rules, all 16 portable Skills, JSON config templates, absolute-path safety, and forbidden runtime files.
+
+## 3. Build MCP Servers
 
 ```powershell
 ./install/Install-CodexToolkit.ps1
 ```
 
-This installs dependencies and builds:
+This installs dependencies and builds `memory-store`, `web-fetcher`, `sandbox`, and the portable broker.
 
-- `mcps/memory-store`
-- `mcps/web-fetcher`
-- `mcps/sandbox`
-- `mcps/broker`
+Optional Windsurf-only subagent:
 
-## 2. Start The HTTP Broker
+```powershell
+./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent
+```
+
+Building it does not edit Windsurf configuration. Follow `mcps/mcp-subagent/README.md` separately.
+
+## 4. Start The HTTP Broker
 
 ```powershell
 ./install/Start-CodexMcpBroker.ps1
 ./install/Status-CodexMcpBroker.ps1
 ```
 
-Default broker URL:
+Default URL: `http://127.0.0.1:14588`
 
-```text
-http://127.0.0.1:14588
-```
+Default data root: `%USERPROFILE%\.codex-toolkit`
 
-Default runtime data root:
-
-```text
-%USERPROFILE%\.codex-toolkit
-```
-
-Override with:
+Important overrides:
 
 ```powershell
-$env:CODEX_TOOLKIT_DATA_ROOT = "D:\\ai-tools-data"
+$env:CODEX_TOOLKIT_DATA_ROOT = "D:\ai-tools-data"
+$env:CODEX_TOOLKIT_MCP_ROOT = "D:\tools\mcps"
 $env:CODEX_MCP_BROKER_PORT = "14588"
+$env:CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS = "120000"
+$env:CODEX_MCP_BROKER_WAIT_TIMEOUT_MS = "1800000"
 ```
 
-## 3. Configure Codex
-
-Apply the Codex HTTP MCP config block:
+## 5. Configure Codex
 
 ```powershell
 ./install/Apply-CodexConfig.ps1
 ```
 
-Then merge the rules template manually:
+The script backs up `%USERPROFILE%\.codex\config.toml` before merging HTTP MCP endpoints.
+
+Rules:
 
 ```text
 rules/codex/AGENTS.template.md -> %USERPROFILE%/.codex/AGENTS.md
 ```
 
-Optional Codex system prompt:
+Optional system prompt emphasis:
 
 ```powershell
 ./install/Install-SystemPromptTemplate.ps1
 ```
 
-Make sure `%USERPROFILE%/.codex/config.toml` contains:
+Then configure:
 
 ```toml
 model_instructions_file = "~/.codex/prompts/system-prompt.md"
 ```
 
-## 4. Configure Antigravity
+The system prompt only points Codex back to AGENTS-style instructions; it does not contain credentials or private data.
+
+## 6. Configure Antigravity
 
 Rules:
 
 ```text
-rules/antigravity/GEMINI.template.md -> your Antigravity GEMINI.md
+rules/antigravity/GEMINI.template.md -> receiver Antigravity GEMINI.md
 ```
 
-MCP config example:
+MCP example:
 
 ```text
 templates/config.antigravity.example.json
 ```
 
-If you run the MCP servers directly through Antigravity instead of through the HTTP broker, update all `<toolkit-root>` placeholders and keep runtime data outside the repository.
+Antigravity can run the MCP servers directly or use the same HTTP broker. When running directly, replace `<toolkit-root>` and keep runtime data outside the source directory.
 
-## 5. Configure Claude Code
+## 7. Configure Claude Code
 
 Rules:
 
@@ -93,77 +108,94 @@ Rules:
 rules/claude-code/CLAUDE.template.md -> %USERPROFILE%/.claude/CLAUDE.md
 ```
 
-User-scope MCP example:
+MCP example:
 
 ```text
 templates/config.claude.example.json
 ```
 
-Use Claude Code's own MCP configuration flow, or manually merge the HTTP endpoints into the user config. Keep secrets outside the repository.
+Claude Code model fallback remains explicit by default to avoid hidden quota use.
 
-## 6. Optional Exa Endpoint
+## 8. Configure Windsurf
 
-The `/exa/mcp` endpoint is disabled in practice unless the receiver provides a private Exa remote URL.
+MCP example:
 
-Set one of these on the receiver machine only:
+```text
+templates/config.windsurf.example.json
+```
+
+Rules are split into a short global rule and system fragments:
+
+```text
+rules/windsurf/global_rules.template.md
+rules/windsurf/system_rules/tools.template.md
+rules/windsurf/system_rules/memory.template.md
+rules/windsurf/system_rules/collaboration.template.md
+rules/windsurf/system_rules/efficiency.template.md
+rules/windsurf/system_rules/rendering.template.md
+```
+
+Follow `rules/windsurf/DEPLOYMENT.md`. `Windsurf_Global_Rules.template.md` is retained only as a compatibility entry.
+
+The optional subagent MCP is Windsurf-only because it creates and controls real Cascade conversations. Its runtime registry must remain outside the package.
+
+## 9. Optional Grok / ProGrok Model Route
+
+The package does not install, start, patch, or authenticate ProGrok. If the receiver already runs a compatible local proxy:
+
+```powershell
+$env:MEMORY_STORE_GROK_PROXY_URL = "http://127.0.0.1:18645"
+$env:MEMORY_STORE_GROK_API_KEY = "<receiver-private-key>"
+$env:SANDBOX_PROGROK_BASE_URL = "http://127.0.0.1:18645"
+$env:SANDBOX_PROGROK_API_KEY = "<receiver-private-key>"
+$env:SANDBOX_PROGROK_MODEL = "<receiver-supported-model>"
+```
+
+Use `modelChain="grok"` to force this route. `dataChain` never uses Grok because Grok does not own conversation data.
+
+## 10. Optional Exa Endpoint
+
+Set the private remote URL only on the receiver machine:
 
 ```powershell
 $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
-# or
-$env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
 ```
 
-Never commit the real URL or API key.
+The broker uses `exa-stateless-stdio.mjs` for stable tools/list fallback and retry behavior. Do not commit `broker-private.env.json` or the real URL.
 
-## 7. Smoke Test
+## 11. Install Skills
+
+Copy selected folders from `skills/` into:
+
+```text
+%USERPROFILE%/.codex/skills/
+```
+
+Restart Codex or open a new task. Other hosts may use the `SKILL.md` files as workflow references if their skill mechanism differs.
+
+Office skills with redistribution-restricted local licenses and Codex system/plugin-cache skills are intentionally excluded. See `skills/skills_manifest.md`.
+
+## 12. Smoke Tests
+
+Core endpoints:
 
 ```powershell
 ./install/Test-CodexToolkit.ps1
 ```
 
-Expected output includes initialized MCP endpoints for:
-
-- `memory-store`
-- `web-fetcher`
-- `sandbox`
-
-Optional Exa smoke test:
+Optional Playwright, sequential-thinking, and configured Exa endpoints:
 
 ```powershell
-$env:CODEX_TOOLKIT_SMOKE_OPTIONAL = "1"
-./install/Test-CodexToolkit.ps1
+./install/Test-CodexToolkit.ps1 -IncludeOptionalEndpoints
 ```
 
-## 8. Package Clean Check
+Windsurf subagent is not included in generic smoke tests because a real check would require a signed-in Windsurf session and create Cascade state.
 
-Before pushing public changes:
+## 13. Build A Shareable Zip
 
 ```powershell
-./install/Test-CodexToolkit.ps1 -PackageClean
+$env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-private-marker"
+./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-11" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-11.zip"
 ```
 
-Also scan for private markers:
-
-```powershell
-$env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-api-key-prefix"
-./install/Test-CodexToolkit.ps1 -PackageClean
-```
-
-## Notes
-
-- `node_modules/` and `dist/` are intentionally not tracked.
-- Runtime folders such as `sandbox-data/`, browser profiles, logs, sessions, JSONL histories, and SQLite databases must stay out of git.
-- Claude Code fallback should usually be explicit-only to avoid hidden quota usage.
-
-## Windsurf / WSF
-
-Use `templates/config.windsurf.example.json` as a receiver-side example for %USERPROFILE%/.codeium/windsurf/mcp_config.json. Windsurf participates as a data source through dataChain=windsurf; model calls should use Codex, Antigravity, or Claude Code routes.
-
-## Install Skills
-
-Copy selected folders from skills/ into %USERPROFILE%/.codex/skills/, then restart Codex or open a new session. Do not copy .system bundled skills or plugin cache folders from another machine.
-
-
-### Excluded Office skills
-
-docx, pptx, and xlsx are not bundled in this public repository because their local license files restrict copying / redistribution. Install official or licensed equivalents separately if needed.
+The command refuses to overwrite an existing output directory or archive, validates both source and copied package, and prints SHA256.

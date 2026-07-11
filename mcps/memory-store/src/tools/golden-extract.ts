@@ -1,17 +1,24 @@
-﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { parseRounds, type ConversationRound } from "../trajectory.js";
 import { fuseSearch } from "../search.js";
 import { readWorkspaceIndex, readGeneralIndex, listWorkspaceHashes, workspaceHash } from "../store.js";
 import { type MemoryIndexEntry } from "../cache.js";
-import { loadConversationData } from "../conversation-bridge.js";
+import { loadConversationData, resolveConversationChain, resolveConversationId } from "../conversation-bridge.js";
 import { callModelResponse } from "../model-bridge.js";
-import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
-import { DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, decideBackground, type ChainInput, type DataChainInput } from "../chain.js";
+import {
+    formatBackgroundTask,
+    registerBackgroundTaskRecoveryHandler,
+    startBackgroundTask,
+    waitForBackgroundTask,
+} from "../background-tasks.js";
+import type { BackgroundTaskContext } from "../background-tasks.js";
+import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, decideBackground, type Chain, type ChainInput, type DataChain, type DataChainInput } from "../chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "../ls-model-defaults.js";
 import { formatToolError } from "../error-format.js";
 import { modelChainInputSchema } from "./schema-utils.js";
+import type { ResumePayloadValue } from "../background-recovery.js";
 
 /**
  * conversation_golden_extract — 黄金片段提取
@@ -21,6 +28,68 @@ import { modelChainInputSchema } from "./schema-utils.js";
  * 
  * v1.5 新增工具
  */
+
+interface GoldenExtractResumePayload {
+    version: 1;
+    conversationId: string;
+    stepStart?: number;
+    stepEnd?: number;
+    autoCompare?: boolean;
+    workspace?: string;
+    dataChain: DataChain;
+    modelChain: Chain;
+}
+
+async function buildGoldenExtractResumePayload(args: GoldenExtractArgs): Promise<GoldenExtractResumePayload | null> {
+    const chains = resolveChainSplit(args);
+    const dataChain = await resolveConversationChain(chains.dataChain);
+    if (!dataChain) return null;
+    const conversationId = await resolveConversationId(args.conversationId, dataChain);
+    if (!conversationId) return null;
+    return {
+        version: 1,
+        conversationId,
+        stepStart: args.stepStart,
+        stepEnd: args.stepEnd,
+        autoCompare: args.autoCompare,
+        workspace: args.workspace,
+        dataChain,
+        modelChain: chains.modelChain,
+    };
+}
+
+function isGoldenExtractResumePayload(value: unknown): value is GoldenExtractResumePayload {
+    if (!value || typeof value !== "object") return false;
+    const payload = value as Partial<GoldenExtractResumePayload>;
+    return payload.version === 1
+        && typeof payload.conversationId === "string"
+        && typeof payload.dataChain === "string"
+        && typeof payload.modelChain === "string";
+}
+
+registerBackgroundTaskRecoveryHandler("golden-extract", async (task) => {
+    if (!isGoldenExtractResumePayload(task.resumePayload)) {
+        throw new Error("golden-extract 缺少可恢复的最小 resumePayload");
+    }
+    const payload = task.resumePayload as GoldenExtractResumePayload;
+    return {
+        mode: "restart",
+        run: async (taskContext) => {
+            const result = await runGoldenExtract(
+                {
+                    ...payload,
+                    background: false,
+                    taskId: undefined,
+                    waitSeconds: undefined,
+                },
+                Date.now(),
+                taskContext,
+            );
+            return result.content.map((item: { text: string }) => item.text).join("\n");
+        },
+    };
+});
+
 export function registerGoldenExtract(server: McpServer): void {
     server.tool(
         "conversation_golden_extract",
@@ -31,10 +100,10 @@ export function registerGoldenExtract(server: McpServer): void {
             stepEnd: z.number().optional().describe("结束步骤偏移"),
             autoCompare: z.boolean().optional().describe("是否自动与记忆对比去重（默认 true）"),
             workspace: z.string().optional().describe("搜索去重的目标工作区（默认搜索全部）"),
-            chain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain"),
+            chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\" 只作为 modelChain"),
             dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("读取对话数据的宿主链路；未填用 chain，支持 windsurf"),
-            modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain。Windsurf 只支持 dataChain"),
-            background: z.boolean().optional().describe("三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时仅 codex 链路自动转后台（避免 60s 超时），后续用 taskId 查询"),
+            modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain；grok=本机 progrok proxy。Windsurf 只支持 dataChain"),
+            background: z.boolean().optional().describe("三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时自动后台排队，后续用 taskId 查询"),
             taskId: z.string().optional().describe("查询后台提取任务的 taskId"),
             waitSeconds: z.number().optional().describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
         },
@@ -49,18 +118,30 @@ export function registerGoldenExtract(server: McpServer): void {
             }
             // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
             const chains = resolveChainSplit(args);
-            const decision = decideBackground(args.background, chains.modelChain);
+            const decision = decideBackground(args.background, chains.modelChain, "always");
             if (decision.useBackground) {
-                const task = startBackgroundTask("golden-extract", async () => {
-                    const result = await runGoldenExtract({ ...args, background: false, taskId: undefined, waitSeconds: undefined }, Date.now());
+                const resumePayload = await buildGoldenExtractResumePayload(args);
+                if (!resumePayload) {
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: `❌ 无法为 dataChain=${chains.dataChain} 冻结可恢复的 conversationId` }],
+                    }, startTime);
+                }
+                const task = startBackgroundTask("golden-extract", async (taskContext) => {
+                    const result = await runGoldenExtract(
+                        { ...args, background: false, taskId: undefined, waitSeconds: undefined },
+                        Date.now(),
+                        taskContext,
+                    );
                     return result.content.map((item: { text: string }) => item.text).join("\n");
+                }, {
+                    resumePayload: resumePayload as unknown as ResumePayloadValue,
                 });
                 return appendTiming({
                     content: [{
                         type: "text" as const,
                         text: [
                             "🚀 黄金片段提取已转入后台任务",
-                            decision.auto ? "（codex 重链路下未显式指定 background，已自动转后台以避免 60s 超时；如需同步请传 background=false）" : "",
+                            decision.auto ? "（未显式指定 background，已自动转后台排队；如需同步请传 background=false）" : "",
                             `🆔 taskId: ${task.id}`,
                             `🔗 ${formatChainSplit(chains)}`,
                             "💡 后续调用 conversation_golden_extract(taskId=\"...\") 查询结果",
@@ -88,9 +169,25 @@ type GoldenExtractArgs = {
     waitSeconds?: number;
 };
 
+function isGoldenTaskAborted(taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">): boolean {
+    return Boolean(taskContext?.isCancelled() || taskContext?.isSettled());
+}
+
+function formatGoldenTaskAborted(startTime: number, taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">) {
+    return appendTiming({
+        content: [{
+            type: "text" as const,
+            text: taskContext?.isCancelled()
+                ? "🛑 黄金片段提取后台任务已取消，已跳过后续模型提取"
+                : "🛑 黄金片段提取后台任务已结束，已跳过后续模型提取",
+        }],
+    }, startTime);
+}
+
 async function runGoldenExtract(
     { conversationId, stepStart, stepEnd, autoCompare, workspace, chain, dataChain, modelChain }: GoldenExtractArgs,
     startTime: number,
+    taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">,
 ) {
     try {
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
@@ -143,14 +240,20 @@ async function runGoldenExtract(
 ${truncatedText}
 
 请直接输出提取结果，每行一条，不要加序号或其他格式。如果没有值得提取的信息，输出"无"。`;
+                if (isGoldenTaskAborted(taskContext)) {
+                    return formatGoldenTaskAborted(startTime, taskContext);
+                }
 
                 const flashResponse = await callModelResponse(
                     process.env.MEMORY_STORE_LS_MODEL || DEFAULT_ANTIGRAVITY_LS_MODEL,
                     prompt,
                     chains.modelChain,
                     30_000,
-                    { allowClaudeCodeFallback: chains.dataChain === "claude-code" },
+                    { allowClaudeCodeFallback: chains.dataChain === "claude-code", grokContext: "default" },
                 );
+                if (isGoldenTaskAborted(taskContext)) {
+                    return formatGoldenTaskAborted(startTime, taskContext);
+                }
                 if (!flashResponse.text || flashResponse.text.trim() === "无") {
                     return appendTiming({
                         content: [{ type: "text" as const, text: "ℹ️ 对话中未发现需要提取的关键信息。" }],
@@ -167,7 +270,10 @@ ${truncatedText}
 
                 // 构建结果
                 const shouldCompare = autoCompare !== false;
-                let resultText = `🔍 黄金片段提取 — ${cascadeId.slice(0, 8)}... (data=${loaded.chainUsed}, model=${chains.modelChain}, ${loaded.totalSteps}步, ${rounds.length}轮)\n\n`;
+                const modelLabel = flashResponse.chainUsed
+                    ? `${chains.modelChain}/${flashResponse.chainUsed}:${flashResponse.modelUsed || "unknown"}`
+                    : chains.modelChain;
+                let resultText = `🔍 黄金片段提取 — ${cascadeId.slice(0, 8)}... (data=${loaded.chainUsed}, model=${modelLabel}, grokContext=default, ${loaded.totalSteps}步, ${rounds.length}轮)\n\n`;
                 resultText += `提取到 ${fragments.length} 条关键信息:\n\n`;
 
                 if (shouldCompare) {

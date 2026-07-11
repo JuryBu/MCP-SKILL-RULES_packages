@@ -2,6 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { writeAudit } from "./audit.js";
 import {
+  archiveCascadeTrajectory,
   cancelCascade,
   deleteCascade,
   getSteps,
@@ -18,7 +19,7 @@ import {
 } from "./cascadeOps.js";
 import { getAllCascadeTrajectories } from "./lsClient.js";
 import { createCascadeConfig, createMetadata } from "./metadata.js";
-import { getModelProfiles, resolveModelSelection } from "./modelCatalog.js";
+import { getModelFamilies, getModelProfiles, queryModels, resolveModelSelection } from "./modelCatalog.js";
 import {
   createJobId,
   getDataDir,
@@ -26,6 +27,7 @@ import {
   readRegistry,
   listJobs,
   mutateRegistry,
+  pruneDeletedJobs,
   updateJob,
   upsertJob,
 } from "./registry.js";
@@ -68,6 +70,42 @@ function textResult(data) {
 
 function failResult(message, extra = {}) {
   return textResult({ ok: false, error: message, ...extra });
+}
+
+function jobTitle(job) {
+  return String(job?.title_best_effort || `[subagent] ${job?.label || job?.job_id || "worker"}`).slice(0, 120);
+}
+
+async function renameSubagentBestEffort(job, reason) {
+  if (!job?.main_id || !job?.sub_cid) return { ok: false, skipped: true, reason: "missing main_id/sub_cid" };
+  const title = jobTitle(job);
+  try {
+    await renameCascade(job.main_id, job.sub_cid, title);
+    await writeAudit({
+      category: "rename",
+      ok: true,
+      operation: "best_effort_rename",
+      reason,
+      job_id: job.job_id,
+      main_id: job.main_id,
+      sub_cid: job.sub_cid,
+      title,
+    });
+    return { ok: true, title };
+  } catch (error) {
+    await writeAudit({
+      category: "rename",
+      ok: false,
+      operation: "best_effort_rename",
+      reason,
+      job_id: job.job_id,
+      main_id: job.main_id,
+      sub_cid: job.sub_cid,
+      title,
+      error: error.message,
+    });
+    return { ok: false, title, error: error.message };
+  }
 }
 
 async function fileExists(target) {
@@ -263,10 +301,30 @@ export async function subagentModels(args = {}) {
   const detail = args.detail || "summary";
   const includeAvailable = Boolean(args.include_available) || detail === "full";
   const candidateLimit = Number(args.candidate_limit ?? (args.purpose ? 6 : 3));
+  if (args.query) {
+    const queried = await queryModels({
+      query: args.query,
+      refresh: Boolean(args.refresh),
+      limit: Number.isFinite(candidateLimit) && candidateLimit > 0 ? Math.max(candidateLimit, 20) : 30,
+    });
+    return textResult({
+      ok: true,
+      detail: "query",
+      query: queried.query,
+      updated_at: queried.updated_at,
+      sources: queried.sources,
+      match_count: queried.match_count,
+      matches: queried.matches,
+      note: "query matches family name, model uid, label, provider, and raw family fields; use no query for family summary.",
+    });
+  }
   const models = await getModelProfiles({
     purpose: args.purpose,
     refresh: Boolean(args.refresh),
     include_unverified: Boolean(args.include_unverified),
+  });
+  const families = getModelFamilies(models, {
+    limit: Number.isFinite(candidateLimit) && candidateLimit > 0 ? candidateLimit : 5,
   });
   const profiles = Object.fromEntries(Object.entries(models.profiles || {}).map(([name, profile]) => {
     const candidates = profile.candidates || [];
@@ -297,13 +355,14 @@ export async function subagentModels(args = {}) {
     detail,
     updated_at: models.updated_at,
     sources: models.sources,
+    families,
     profiles,
     available_count: models.available.length,
     ...(includeAvailable ? { available: models.available } : {}),
     fallback_policy: models.fallback_policy,
     note: includeAvailable
       ? "cached source is the IDE's current cached Cascade model list, not a guaranteed server realtime full list."
-      : "summary view omits the full model list; pass detail:'full' or include_available:true to inspect all available models.",
+      : "summary view returns family/profile summaries and omits the full model list; pass query:'glm' for concrete models or detail:'full'/include_available:true for all models.",
   });
 }
 
@@ -439,6 +498,9 @@ export async function subagentSpawn(args) {
       model_catalog_updated_at: resolvedSelection.catalog?.updated_at || null,
       model_send_fallback_from: resolvedSelection.model_send_fallback_from || null,
       model_send_error: resolvedSelection.model_send_error || null,
+      model_supports_images: resolvedSelection.catalog?.available?.find(
+        (m) => m.uid?.toLowerCase() === String(resolvedSelection.model_resolved || "").toLowerCase()
+      )?.supports_images ?? null,
     });
   } catch (error) {
     if (cascadeId) {
@@ -555,6 +617,7 @@ export async function subagentReply(args) {
   const metadata = await createMetadata();
   const images = await normalizeImages(args.images || []);
   const mode = args.mode || job.mode || "code";
+  const renameResult = await renameSubagentBestEffort(job, "reply");
   const modelSelection = await resolveModelSelection({
     model: args.model || (args.model_profile ? null : job.model),
     model_profile: args.model_profile || job.model_profile,
@@ -609,6 +672,7 @@ export async function subagentReply(args) {
         model_send_error: resolvedSelection.model_send_error || null,
         message_preview: message.length > 500 ? `${message.slice(0, 500)}...` : message,
         image_count: images.length,
+        rename_before_reply: renameResult,
       },
     ];
   });
@@ -628,6 +692,7 @@ export async function subagentReply(args) {
     model_catalog_updated_at: resolvedSelection.catalog?.updated_at || null,
     model_send_fallback_from: resolvedSelection.model_send_fallback_from || null,
     model_send_error: resolvedSelection.model_send_error || null,
+    rename_before_reply: renameResult,
   });
 }
 
@@ -671,6 +736,43 @@ export async function subagentList(args = {}) {
     note: includeDeleted || includeArchived
       ? "full visibility requested"
       : "deleted/archived jobs are hidden by default; pass include_deleted/include_archived or detail:'full' for history.",
+  });
+}
+
+export async function subagentListSubcids(args = {}) {
+  const mainId = args.main_id ? String(args.main_id).trim() : null;
+  const includeArchived = args.include_archived !== false;
+  const jobs = (await listJobs("all"))
+    .filter((job) => job.sub_cid && job.state !== "deleted")
+    .filter((job) => includeArchived || job.state !== "archived")
+    .filter((job) => !mainId || job.main_id === mainId)
+    .sort((left, right) => Date.parse(right.updated_at || right.created_at || 0) - Date.parse(left.updated_at || left.created_at || 0));
+  const item = (job) => ({
+    job_id: job.job_id,
+    sub_cid: job.sub_cid,
+    main_id: job.main_id,
+    label: job.label,
+    state: job.state,
+    turn: jobTurn(job),
+    title_best_effort: job.title_best_effort || null,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+  });
+  const active = jobs.filter((job) => job.state !== "archived").map(item);
+  const archived = jobs.filter((job) => job.state === "archived").map(item);
+  return textResult({
+    ok: true,
+    main_id: mainId,
+    include_archived: includeArchived,
+    active,
+    archived,
+    sub_cids: [...active, ...archived].map((entry) => entry.sub_cid),
+    counts: {
+      active: active.length,
+      archived: archived.length,
+      total: active.length + archived.length,
+    },
+    note: "deleted jobs are intentionally omitted because their cascades should no longer appear in LS conversation fetches.",
   });
 }
 
@@ -754,6 +856,10 @@ export async function subagentDispose(args) {
   const processed = [];
   for (const target of targets.sort((left, right) => right.depth - left.depth)) {
     const archivePath = await archiveJob(target);
+    let lsArchive = null;
+    if (mode === "archive") {
+      lsArchive = await archiveCascadeTrajectory(target.main_id, target.sub_cid, true);
+    }
     if (mode === "delete") {
       try {
         await cancelCascade(target.main_id, target.sub_cid);
@@ -765,14 +871,16 @@ export async function subagentDispose(args) {
       current.state = mode === "delete" ? "deleted" : "archived";
       current.archive_path = archivePath;
       current.archived_at = nowIso();
+      current.ls_archived = mode === "archive" ? true : undefined;
       registry.archives[target.job_id] = {
         job_id: target.job_id,
         archive_path: archivePath,
         archived_at: current.archived_at,
         delete_after_archive: mode === "delete",
+        ls_archived: mode === "archive" ? true : undefined,
       };
     });
-    processed.push({ job_id: target.job_id, cid: target.sub_cid, action: mode, archive_path: archivePath });
+    processed.push({ job_id: target.job_id, cid: target.sub_cid, action: mode, archive_path: archivePath, ls_archive: lsArchive });
   }
   return textResult({
     ok: true,
@@ -823,6 +931,8 @@ async function cleanupOldJobs(args = {}) {
     ? Number(process.env.SUBAGENT_RETAIN_ARCHIVES || 200)
     : Number(args.retain_archives);
   const hardDeleteArchives = Boolean(args.hard_delete_archives);
+  const pruneDeleted = Boolean(args.prune_deleted);
+  const hardDeleteDeletedArchives = Boolean(args.hard_delete_deleted_archives);
   const registry = await readRegistry();
   const candidates = Object.values(registry.jobs)
     .filter((job) => ["done", "timeout"].includes(job.state))
@@ -913,6 +1023,44 @@ async function cleanupOldJobs(args = {}) {
     }
   }
 
+  const deleted_prune = {
+    enabled: pruneDeleted,
+    dry_run: dryRun,
+    hard_delete_deleted_archives: hardDeleteDeletedArchives,
+    result: null,
+    deleted_archive_files: [],
+    export_path: null,
+  };
+  if (pruneDeleted) {
+    deleted_prune.result = await pruneDeletedJobs({
+      deleted_ttl_sec: Number(args.deleted_ttl_sec ?? 7 * 86400),
+      retain_deleted: Number(args.retain_deleted ?? 20),
+      max_prune_per_run: Number(args.max_prune_per_run ?? 100),
+      dry_run: dryRun,
+    });
+    const archiveRefs = (deleted_prune.result.pruned || [])
+      .filter((entry) => entry.archive_path)
+      .map((entry) => ({
+        job_id: entry.job_id,
+        archive_path: entry.archive_path,
+        archived_at: entry.deleted_at || nowIso(),
+      }));
+    if (!dryRun && hardDeleteDeletedArchives && archiveRefs.length) {
+      const exportPath = await exportArchiveCopies(archiveRefs);
+      deleted_prune.export_path = exportPath;
+      for (const archiveRef of archiveRefs) {
+        if (await fileExists(archiveRef.archive_path)) {
+          await fs.rm(archiveRef.archive_path, { force: true });
+          deleted_prune.deleted_archive_files.push({
+            job_id: archiveRef.job_id,
+            archive_path: archiveRef.archive_path,
+            export_path: exportPath,
+          });
+        }
+      }
+    }
+  }
+
   return {
     ok: true,
     dry_run: dryRun,
@@ -920,6 +1068,7 @@ async function cleanupOldJobs(args = {}) {
     archived,
     skipped,
     retention,
+    deleted_prune,
   };
 }
 
@@ -1626,6 +1775,7 @@ export async function subagentCollect(args) {
   }
   refreshed = await getJob(job.job_id);
   const mode = args.mode || refreshed.collect_mode || "interrupt";
+  const renameResult = await renameSubagentBestEffort(refreshed, "collect");
   let metadata = null;
   let queueId = null;
   let watchedStep = null;
@@ -1661,6 +1811,7 @@ export async function subagentCollect(args) {
           watched_step: null,
           completed_step: null,
           delivered_by: "send_user_message_idle",
+          rename_before_collect: renameResult,
         };
         await updateJob(refreshed.job_id, (current) => {
           current.state = "collected";
@@ -1713,6 +1864,7 @@ export async function subagentCollect(args) {
 
     if (mode === "queue") {
       const collectResult = { delivered: true, when: "queued", mode_used: "queue", queue_id: queueId, turn: jobTurn(refreshed) };
+      collectResult.rename_before_collect = renameResult;
       await updateJob(refreshed.job_id, (current) => {
         current.state = "collected";
         if (current.auto_collect === true) current.auto_collect_state = "collected";
@@ -1736,6 +1888,7 @@ export async function subagentCollect(args) {
         fallback_from: "interrupt",
         boundary_reason: anchorInfo?.reason || "active_step_unavailable",
         confirmed: false,
+        rename_before_collect: renameResult,
       };
       await updateJob(refreshed.job_id, (current) => {
         current.state = "collected";
@@ -1779,6 +1932,7 @@ export async function subagentCollect(args) {
       watched_step: watchedStep,
       completed_step: boundaryInfo?.watched_step || null,
       delivered_by: deliveredBy,
+      rename_before_collect: renameResult,
     };
     await updateJob(refreshed.job_id, (current) => {
       current.state = "collected";
@@ -1806,6 +1960,7 @@ export async function subagentCollect(args) {
         fallback_from: "interrupt",
         last_error: error.message,
         confirmed: false,
+        rename_before_collect: renameResult,
       };
       await updateJob(job.job_id, (current) => {
         current.state = "collected";

@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
-export type ToolQueueClass = "light" | "mixed" | "heavy";
+export type ToolQueueClass = "light" | "mixed";
+export type ToolRequestClass = ToolQueueClass | "auto-background";
 
 type ReleaseFn = () => void;
 type QueuedAcquire = {
@@ -80,8 +81,7 @@ function envLimit(names: string | string[], fallback: number): number {
 
 function queueLimit(queueClass: ToolQueueClass): number {
     if (queueClass === "light") return envLimit(["MEMORY_STORE_TOOL_LIGHT_LIMIT", "MEMORY_STORE_LIGHT_CONCURRENCY"], 8);
-    if (queueClass === "mixed") return envLimit(["MEMORY_STORE_TOOL_MIXED_LIMIT", "MEMORY_STORE_MIXED_CONCURRENCY"], 6);
-    return envLimit(["MEMORY_STORE_TOOL_HEAVY_LIMIT", "MEMORY_STORE_HEAVY_CONCURRENCY"], 3);
+    return envLimit(["MEMORY_STORE_TOOL_MIXED_LIMIT", "MEMORY_STORE_MIXED_CONCURRENCY"], 6);
 }
 
 export function defaultToolQueueTimeoutMs(): number {
@@ -140,38 +140,40 @@ export async function withToolConcurrency<T>(
     }
 }
 
-export function classifyToolRequest(name: string, args: Record<string, unknown> = {}): ToolQueueClass {
+export function classifyToolRequest(name: string, args: Record<string, unknown> = {}): ToolRequestClass {
+    if (name === "background_task_status" || name === "background_task_cancel") return "light";
     if (name === "memory_read" || name === "memory_delete") return "light";
     if (name === "memory_write" || name === "memory_update" || name === "memory_batch") return "mixed";
-    if (name === "memory_stats") return args.action === "enhance" ? "heavy" : "light";
+    if (name === "memory_stats") return args.action === "enhance" ? "mixed" : "light";
     if (name === "memory_query") {
         const mode = typeof args.mode === "string" ? args.mode : "auto";
         return args.query && (mode === "auto" || mode === "smart") ? "mixed" : "light";
     }
     if (name === "record_manage") {
         const action = typeof args.action === "string" ? args.action : "";
-        if (action === "update" || action === "batch_update" || action === "bulk_update") return "heavy";
+        if (action === "update" || action === "batch_update" || action === "bulk_update") return "auto-background";
         if (action === "search" || action === "guide") return "mixed";
         return "light";
     }
-    if (name === "conversation_golden_extract") return args.taskId ? "light" : "heavy";
-    if (name === "stage_guard") return args.action === "check" && !args.taskId ? "heavy" : "light";
+    if (name === "conversation_golden_extract") return args.taskId ? "light" : "auto-background";
+    if (name === "stage_guard") return args.action === "check" && !args.taskId ? "mixed" : "light";
     if (name === "conversation_read_original") {
-        if (args.action === "deep_locate") return "heavy";
+        if (args.action === "deep_locate") return "auto-background";
         if (args.action === "deep_locate_status" || args.action === "deep_locate_cancel") return "light";
-        if (args.action === "export" && (args.exportBatch === true || args.exportFormat === "pdf" || args.exportFormat === "both")) return "heavy";
-        if ((args.dataChain === "claude-code" || args.dataChain === "cc" || args.dataChain === "windsurf" || args.dataChain === "wsf") && args.query) return "heavy";
+        if (args.action === "export" && args.exportBatch === true) return "auto-background";
         return "mixed";
     }
     return "mixed";
 }
 
-export function backgroundTaskQueueClass(kind: string): ToolQueueClass | null {
-    if (kind === "record-update") return "heavy";
-    if (kind === "stage-guard-check") return "heavy";
-    if (kind === "golden-extract") return "heavy";
-    if (kind === "conversation-deep-locate") return "heavy";
-    if (kind === "record-guide") return "mixed";
+export function backgroundTaskQueueClass(kind: string): "background" | null {
+    if (kind === "record-update") return "background";
+    if (kind === "record-batch-update") return "background";
+    if (kind === "stage-guard-check") return "background";
+    if (kind === "golden-extract") return "background";
+    if (kind === "conversation-deep-locate") return "background";
+    if (kind === "conversation-batch-export") return "background";
+    if (kind === "record-guide") return "background";
     return null;
 }
 
@@ -181,6 +183,9 @@ export function installToolConcurrency(server: { tool: (...args: any[]) => unkno
         const wrapped = async (args: Record<string, unknown> = {}, extra?: unknown) => {
             const queueClass = classifyToolRequest(name, args);
             const action = typeof args.action === "string" ? `.${args.action}` : "";
+            if (queueClass === "auto-background") {
+                return handler(args, extra);
+            }
             return withToolConcurrency(
                 queueClass,
                 `${name}${action}`,

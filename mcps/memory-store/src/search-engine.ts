@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import { callModelResponse } from "./model-bridge.js";
 import { resolveChainSplit, type Chain, type ChainInput, type DataChainInput } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
+import { mapGrokModel, type GrokContext } from "./grok-client.js";
 import { getSmartCache, setSmartCache } from "./smart-cache.js";
 import {
     parseQuery,
@@ -693,10 +694,18 @@ function buildSmartSnippet(block: TextBlock, query: string, maxChars = 900): str
  * （裸 NUL 会让 git/grep 把文件判为 binary，且 formatter 可能把它静默换成空格、破坏缓存键分隔）。
  */
 const SMART_CACHE_KEY_SEP = String.fromCharCode(0);
+const SMART_MODEL_CONTEXT: GrokContext = "default";
+
+export interface SmartCacheModelScope {
+    modelChain: string;
+    modelName: string;
+    grokContext: GrokContext;
+}
 
 /** smart 缓存键：query + limit + 候选集指纹。指纹按 id:updatedAt 排序聚合——任一条目版本变化即失效（防脏读）；
- *  任一 block 缺 updatedAt 则返回 null（不缓存，宁可慢也不脏读）。 */
-export function buildSmartCacheKey(blocks: TextBlock[], query: string, limit: number): string | null {
+  *  任一 block 缺 updatedAt 则返回 null（不缓存，宁可慢也不脏读）。 */
+export function buildSmartCacheKey(blocks: TextBlock[], query: string, limit: number, scope: SmartCacheModelScope | null): string | null {
+    if (!scope) return null;
     const parts: string[] = [];
     for (const b of blocks) {
         const v = b.metadata?.updatedAt;
@@ -705,7 +714,26 @@ export function buildSmartCacheKey(blocks: TextBlock[], query: string, limit: nu
     }
     parts.sort();
     const fingerprint = crypto.createHash("sha1").update(parts.join("|")).digest("hex");
-    return `${query}${SMART_CACHE_KEY_SEP}${limit}${SMART_CACHE_KEY_SEP}${fingerprint}`;
+    return [
+        query,
+        String(limit),
+        safeCacheField(scope.modelChain),
+        safeCacheField(scope.modelName),
+        safeCacheField(scope.grokContext),
+        fingerprint,
+    ].join(SMART_CACHE_KEY_SEP);
+}
+
+function safeCacheField(value: string): string {
+    return value.replaceAll(SMART_CACHE_KEY_SEP, "\\0");
+}
+
+function smartCacheScope(modelChain: Chain, modelName: string, grokContext: GrokContext): SmartCacheModelScope {
+    return {
+        modelChain,
+        modelName: modelChain === "grok" ? mapGrokModel(modelName, grokContext) : modelName,
+        grokContext,
+    };
 }
 
 async function searchSmart(
@@ -719,9 +747,14 @@ async function searchSmart(
     if (blocks.length === 0) return [];
 
     const limit = opts.limit ?? 5;
+    const chains = resolveChainSplit({ chain: opts.chain, dataChain: opts.dataChain, modelChain: opts.modelChain });
+    const modelName = process.env.MEMORY_STORE_LS_MODEL || DEFAULT_ANTIGRAVITY_LS_MODEL;
 
-    // 命中缓存即跳过冷模型调用（指纹含版本，库变自然失效）
-    const cacheKey = buildSmartCacheKey(blocks, query, limit);
+    // 命中缓存即跳过冷模型调用（指纹含版本，库变自然失效）。
+    // auto 需要等模型桥返回 actual chain 后才能安全确定缓存域，因此不预读旧缓存，避免 auto→grok / auto→antigravity 串用。
+    const cacheKey = chains.modelChain === "auto"
+        ? null
+        : buildSmartCacheKey(blocks, query, limit, smartCacheScope(chains.modelChain, modelName, SMART_MODEL_CONTEXT));
     if (cacheKey) {
         const cached = getSmartCache(cacheKey);
         if (cached) return cached;
@@ -798,15 +831,17 @@ ${candidates.join("\n---\n")}
         prefiltered.slice(0, limit).map(r => ({ ...r, matchType: "fuzzy" as SearchMode }));
 
     try {
-        const chains = resolveChainSplit({ chain: opts.chain, modelChain: opts.modelChain });
         const response = await callModelResponse(
-            process.env.MEMORY_STORE_LS_MODEL || DEFAULT_ANTIGRAVITY_LS_MODEL,
+            modelName,
             prompt,
             chains.modelChain,
             30_000,
-            { allowClaudeCodeFallback: resolveChainSplit({ chain: opts.chain, dataChain: opts.dataChain, modelChain: opts.modelChain }).dataChain === "claude-code" },
+            { allowClaudeCodeFallback: chains.dataChain === "claude-code", grokContext: SMART_MODEL_CONTEXT },
         );
         if (!response.text) return prefilterAsResults();
+        if (response.chainUsed) {
+            console.error(`[search-engine] smart modelChain=${chains.modelChain} actualChain=${response.chainUsed} actualModel=${response.modelUsed || "unknown"} grokContext=${SMART_MODEL_CONTEXT}`);
+        }
 
         const ids: string[] = [];
         for (const line of response.text.split("\n")) {
@@ -835,7 +870,14 @@ ${candidates.join("\n---\n")}
 
         const results = finalize(ids);
         if (results.length > 0) {
-            if (cacheKey) setSmartCache(cacheKey, results); // 只缓存真走了模型且非空的结果
+            const actualCacheKey = response.chainUsed
+                ? buildSmartCacheKey(blocks, query, limit, {
+                    modelChain: response.chainUsed,
+                    modelName: response.modelUsed || smartCacheScope(response.chainUsed, modelName, SMART_MODEL_CONTEXT).modelName,
+                    grokContext: SMART_MODEL_CONTEXT,
+                })
+                : cacheKey;
+            if (actualCacheKey) setSmartCache(actualCacheKey, results); // 只缓存真走了模型且非空的结果
             return results;
         }
         return prefilterAsResults();

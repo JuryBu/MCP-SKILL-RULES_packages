@@ -458,6 +458,31 @@ export function flattenSymbols(index: Map<string, FileIndex>): Array<SymbolInfo 
     return result;
 }
 
+export interface FunctionBound {
+    name: string;
+    type: string;
+    filePath: string;
+    startLine: number;
+    endLine: number;
+}
+
+export function flattenFunctionBounds(index: Map<string, FileIndex>): FunctionBound[] {
+    const result: FunctionBound[] = [];
+    for (const [filePath, fileIndex] of index) {
+        for (const sym of fileIndex.symbols) {
+            if (!["func", "method", "class"].includes(sym.type)) continue;
+            result.push({
+                name: sym.name,
+                type: sym.type,
+                filePath,
+                startLine: sym.line,
+                endLine: Math.max(sym.endLine, sym.line),
+            });
+        }
+    }
+    return result;
+}
+
 /**
  * 清除缓存
  */

@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
-import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
+import { TEMP_DIR } from "./temp-store.js";
 import type { ConversationRound } from "./trajectory.js";
 
 export type ConversationAttachmentKind = "image" | "file";
@@ -43,6 +43,20 @@ const DEFAULT_MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MATERIALIZE_LIMIT = 20;
 const DEFAULT_MATERIALIZE_CONCURRENCY = 4;
+const LARGE_BASE64_DECODE_YIELD_BYTES = 1024 * 1024;
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise(resolve => setImmediate(resolve));
+}
+
+async function hasExpectedFileSize(filePath: string, expectedSize: number): Promise<boolean> {
+    try {
+        const stat = await fs.promises.stat(filePath);
+        return stat.isFile() && stat.size === expectedSize;
+    } catch {
+        return false;
+    }
+}
 
 function normalizePathKey(input: string): string {
     return path.normalize(input).toLowerCase();
@@ -323,8 +337,9 @@ async function materializeAttachment(
     attachment: ConversationAttachment,
     conversationId: string,
     roundIndex: number,
-    options: { maxBytes: number; cache: Map<string, ConversationAttachment> },
+    options: { maxBytes: number; cache: Map<string, ConversationAttachment>; shouldAbort?: () => boolean },
 ): Promise<ConversationAttachment> {
+    if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
     if (
         attachment.kind !== "image" ||
         !isMaterializableDataUrlSource(attachment.source) ||
@@ -347,6 +362,11 @@ async function materializeAttachment(
         return { ...attachment, mimeType: parsed.mimeType, sizeBytes: parsed.sizeBytes, warning: `超过大小限制 ${options.maxBytes} bytes` };
     }
 
+    if (parsed.sizeBytes >= LARGE_BASE64_DECODE_YIELD_BYTES) {
+        if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
+        await yieldToEventLoop();
+        if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
+    }
     const bytes = Buffer.from(parsed.base64, "base64");
     const sha256 = crypto.createHash("sha256").update(bytes).digest("hex");
     const sourceDir = attachment.source === "claude-code-data-url"
@@ -360,12 +380,17 @@ async function materializeAttachment(
     const filename = `sha256-${sha256}${extensionFromMime(parsed.mimeType)}`;
     const tempPath = path.join(dir, filename);
 
-    ensureTempDir();
-    fs.mkdirSync(dir, { recursive: true });
-    if (!fs.existsSync(tempPath) || fs.statSync(tempPath).size !== bytes.length) {
-        const tmpPath = path.join(dir, `${safeFileName(filename)}.${process.pid}.tmp`);
-        fs.writeFileSync(tmpPath, bytes);
-        fs.renameSync(tmpPath, tempPath);
+    if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
+    await fs.promises.mkdir(dir, { recursive: true });
+    if (!await hasExpectedFileSize(tempPath, bytes.length)) {
+        const tmpPath = path.join(dir, `${safeFileName(filename)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+        try {
+            await fs.promises.writeFile(tmpPath, bytes);
+            await fs.promises.rename(tmpPath, tempPath);
+        } catch (error) {
+            await fs.promises.rm(tmpPath, { force: true }).catch(() => undefined);
+            throw error;
+        }
     }
 
     const resolved: ConversationAttachment = {
@@ -394,21 +419,35 @@ export async function materializeRoundAttachments(
         maxBytes?: number;
         maxTotalBytes?: number;
         concurrency?: number;
+        deadlineAt?: number;
+        shouldAbort?: () => boolean;
     } = {},
-): Promise<{ rounds: ConversationRound[]; truncated: number }> {
+): Promise<{ rounds: ConversationRound[]; truncated: number; budgetExceeded?: boolean }> {
     const limit = Math.max(0, options.limit ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT || DEFAULT_MATERIALIZE_LIMIT));
     const maxBytes = Math.max(1, options.maxBytes ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES || DEFAULT_MAX_ATTACHMENT_BYTES));
     const maxTotalBytes = Math.max(1, options.maxTotalBytes ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES || DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES));
     const concurrency = Math.max(1, options.concurrency ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY || DEFAULT_MATERIALIZE_CONCURRENCY));
     const cache = new Map<string, ConversationAttachment>();
     let remainingTotalBytes = maxTotalBytes;
+    let budgetExceeded = false;
 
     let remaining = limit;
     let truncated = 0;
     const cloned = rounds.map(round => ({ ...round, attachments: round.attachments ? [...round.attachments] : undefined }));
     const jobs: Array<{ round: ConversationRound; attachment: ConversationAttachment; index: number }> = [];
+    const hasBudgetExpired = (): boolean => Number.isFinite(options.deadlineAt) && Date.now() >= Number(options.deadlineAt);
+    const markBudgetExceeded = (): void => {
+        budgetExceeded = true;
+    };
+    const applyBudgetWarning = (attachment: ConversationAttachment): ConversationAttachment => {
+        const warning = "达到附件物化时间预算，未生成临时文件";
+        if (attachment.warning?.includes(warning)) return attachment;
+        if (attachment.warning) return { ...attachment, warning: `${attachment.warning}；${warning}` };
+        return { ...attachment, warning };
+    };
 
     for (const round of cloned) {
+        if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
         const attachments = round.attachments || [];
         // E2 判重前置：收集本轮「已有本地路径图」的 sha256，用于识别 data-url 是否同一张物理图。
         // 注意：本地路径图的 sha256 多为空 → 集合多为空 → 默认偏向落盘（不误杀 AI 内嵌图）。
@@ -425,12 +464,18 @@ export async function materializeRoundAttachments(
             }
         }
         for (let index = 0; index < attachments.length; index++) {
+            if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
             const attachment = attachments[index];
             if (
                 attachment.kind !== "image" ||
                 !isMaterializableDataUrlSource(attachment.source) ||
                 !attachment.dataUrl
             ) continue;
+            if (budgetExceeded || hasBudgetExpired()) {
+                markBudgetExceeded();
+                attachments[index] = applyBudgetWarning(attachment);
+                continue;
+            }
             // E4 快路径：同一附件自身既有可用本地路径又有 data-url → 本地路径已够，跳过 data-url。
             if (attachment.originalPath && attachment.exists !== false) {
                 attachments[index] = { ...attachment, warning: "已有本地图片路径，未生成临时文件" };
@@ -460,15 +505,25 @@ export async function materializeRoundAttachments(
         }
     }
 
-    const materialized = await mapLimit(jobs, concurrency, async (job) =>
-        materializeAttachment(job.attachment, conversationId, job.round.roundIndex, { maxBytes, cache }));
+    const materialized = await mapLimit(jobs, concurrency, async (job) => {
+        if (options.shouldAbort?.()) throw new Error("attachment materialization cancelled");
+        if (budgetExceeded || hasBudgetExpired()) {
+            markBudgetExceeded();
+            return applyBudgetWarning(job.attachment);
+        }
+        return materializeAttachment(job.attachment, conversationId, job.round.roundIndex, {
+            maxBytes,
+            cache,
+            shouldAbort: options.shouldAbort,
+        });
+    });
 
     for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
         if (job.round.attachments) job.round.attachments[job.index] = materialized[i];
     }
 
-    return { rounds: cloned, truncated };
+    return { rounds: cloned, truncated, budgetExceeded: budgetExceeded || hasBudgetExpired() };
 }
 
 export function summarizeAttachments(rounds: ConversationRound[]): AttachmentSummary {

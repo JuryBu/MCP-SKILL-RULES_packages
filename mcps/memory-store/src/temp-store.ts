@@ -59,6 +59,14 @@ export function saveTempFile(prefix: string, slug: string, content: string): str
     return filePath;
 }
 
+export async function saveTempFileAsync(prefix: string, slug: string, content: string): Promise<string> {
+    await fs.promises.mkdir(TEMP_DIR, { recursive: true });
+    const filename = generateTempFilename(prefix, slug);
+    const filePath = path.join(TEMP_DIR, filename);
+    await fs.promises.writeFile(filePath, content, "utf-8");
+    return filePath;
+}
+
 /**
  * 清理过期临时文件
  */

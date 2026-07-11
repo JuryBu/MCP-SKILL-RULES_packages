@@ -1,95 +1,46 @@
-# Portable MCP + Skills + Rules 工具包（2026-7-4）
+# Receiver Guide / 接收方说明
 
-这是一份给 Windows 上的 Codex、Antigravity、Claude Code、Windsurf 共用的本地工具包，包含四源兼容 MCP 源码、HTTP broker、四套脱敏 Rules 模板、portable user skills 和基础测试文件。
+这是一份源码型工具包，不包含发送者的登录态、记忆、对话或 API Key。
 
-## 今日重点
+## 你会得到什么
 
-- MCP 已从 Codex + Antigravity 双链路升级为 Antigravity / Codex / Claude Code / Windsurf 四源兼容。
-- `memory-store`、`web-fetcher`、`sandbox` 支持四源数据链路；`windsurf` / `wsf` 用于 Cascade 对话数据，模型调用仍走 Antigravity / Codex / Claude Code。
-- 新增 `mcps/mcp-subagent`：这是 Windsurf 专属异步子代理 MCP，支持 spawn / poll / reply / collect / interrupt / dispose，但默认不随共享 MCP 安装自动启用。
-- `exa` 作为可选远程 MCP endpoint，经 broker 暴露给 Codex / Claude Code / Windsurf；API Key 只应放接收方本机环境变量或私有配置。
-- Rules 分四套标记：`rules/codex/AGENTS.template.md`、`rules/antigravity/GEMINI.template.md`、`rules/claude-code/CLAUDE.template.md`、`rules/windsurf/Windsurf_Global_Rules.template.md`。
+- 三个通用 MCP：memory-store 1.19.3、web-fetcher 7.0.0、sandbox 1.14.0。
+- 一个 portable HTTP broker 0.1.0，用于 Codex 和其他支持 HTTP MCP 的宿主。
+- 一个 Windsurf-only subagent 1.1.0，只在你明确安装并登录 Windsurf 后使用。
+- Codex、Antigravity、Claude Code、Windsurf 四套脱敏 Rules。
+- 16 个可迁移 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
 
-## Skills refresh
-
-This snapshot includes `skills/`: allow-listed portable user-side Codex skills copied from `%USERPROFILE%/.codex/skills`. It intentionally excludes `.system` bundled skills, plugin cache skills, Office skills with restrictive local licenses (`docx`, `pptx`, `xlsx`), unlicensed `doc-coauthoring`, runtime caches, build outputs, generated test artifacts, credentials, browser state, and private session data. See `skills/README_SKILLS.md` and `skills/skills_manifest.md`.
-
-## 当前 MCP 版本
-
-- `memory-store`：`1.17.1`
-- `web-fetcher`：`7.0.0`
-- `sandbox`：`1.13.7`
-- `broker`：`0.1.0`
-- `mcp-subagent`：`0.0.1`（Windsurf-only optional）
-- `exa`：可选远程 MCP endpoint；需要接收方自己设置 `EXA_MCP_REMOTE_URL` 或 `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`。
-
-## Codex 安装
+## 最短安装路径
 
 ```powershell
+./install/Test-CodexToolkit.ps1 -PackageClean
 ./install/Install-CodexToolkit.ps1
-./install/Apply-CodexConfig.ps1
 ./install/Start-CodexMcpBroker.ps1
+./install/Apply-CodexConfig.ps1
 ./install/Test-CodexToolkit.ps1
 ```
 
-如需同时构建 Windsurf 专属 `mcp-subagent` 源码，可运行：
+然后把 `rules/codex/AGENTS.template.md` 合并到自己的 `%USERPROFILE%/.codex/AGENTS.md`，按需复制 `skills/` 中的技能目录。
 
-```powershell
-./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent
-```
+## 单宿主与多宿主
 
-这个开关只构建源码，不会自动写入 Windsurf 或 broker 配置。
+- 只有 Codex：可以直接使用，数据默认写入 `%USERPROFILE%\.codex-toolkit`。
+- 安装多个宿主：memory-store 可按 `dataChain` 读取对应宿主对话，再按 `modelChain` 选择执行摘要或审查的模型。
+- Windsurf 只提供对话数据链路；本工具包不提供 Windsurf 模型桥。
+- Grok / ProGrok 只提供模型链路，必须由你自己运行兼容 proxy 并提供私有凭据。
 
-然后把 `rules/codex/AGENTS.template.md` 合并到 `%USERPROFILE%/.codex/AGENTS.md`。
+## 不会自动做的事
 
-如需同步 Codex system prompt：
+- 不会复制发送者数据。
+- 不会安装或启动 ProGrok。
+- 不会自动登录任何网站或宿主。
+- 不会自动修改 Windsurf 配置或创建 Cascade 子代理。
+- 不会安装缺失的授权受限 Office skills。
 
-```powershell
-./install/Install-SystemPromptTemplate.ps1
-```
+完整配置见 `SETUP.md`，组件细节见 `mcps/README_MCPS.md`，Rules 部署见 `rules/README_RULES.md`。
 
-并确认 `%USERPROFILE%/.codex/config.toml` 顶层包含：
+---
 
-```toml
-model_instructions_file = "~/.codex/prompts/system-prompt.md"
-```
+This is a source-only receiver package. It includes portable MCP servers, broker scripts, four-host rules, sixteen allow-listed skills, configuration examples, and smoke tests. It does not include sender credentials, browser state, memories, conversations, logs, or databases.
 
-## Antigravity Rules
-
-把 `rules/antigravity/GEMINI.template.md` 合并到接收方 Antigravity 使用的 `GEMINI.md`。
-
-如果接收方也要让 Antigravity 直接跑这些 MCP，可参考 `templates/config.antigravity.example.json`，但不要把 API Key、cookies、登录态、真实 memory 数据写进要发送的文件。
-
-## Claude Code Rules
-
-把 `rules/claude-code/CLAUDE.template.md` 合并到 `%USERPROFILE%/.claude/CLAUDE.md`。
-
-Claude Code 的 MCP user-scope 配置可参考 `templates/config.claude.example.json`。实际写入时推荐在接收方机器上用 Claude Code 自己的 MCP 配置命令或手动合并到用户配置，不要把私钥写进项目文件。
-
-## Windsurf-only subagent MCP
-
-`mcps/mcp-subagent` 会操作真实 Windsurf / Devin Cascade 对话，所以按高风险可选能力处理：先在接收方机器上 `npm install && npm run build`，再按 `mcps/mcp-subagent/README.md` 运行 dry-run；只有确认备份和回滚路径后，才执行 `install:config -- --apply` 或 `patch:codex-broker -- --apply`。
-
-它不包含 `subagent-data/`、audit、archive、job registry、真实 Cascade 记录、`node_modules/` 或 `dist/`。
-
-## 数据目录
-
-默认运行态数据写到：
-
-```text
-%USERPROFILE%/.codex-toolkit/
-```
-
-可以通过 `templates/env.example.ps1` 改位置。Antigravity / Codex / Claude Code / Windsurf 共享同一套 MCP 时，要让它们指向同一个 broker 和同一个数据目录，才能实现记忆、Record、会话读取等能力互通。
-
-## 隐私边界
-
-这个包只应包含源码、模板、说明和测试样例。不要包含发送方或接收方的 API Key、cookies、浏览器 profile、对话记录、记忆库、sqlite、sessions、日志、本机绝对路径或账户链接。
-
-## 2026-7-4 refresh
-
-This snapshot refreshes the changed portable MCP sources and host rules: memory-store 1.17.1, sandbox 1.13.7, web-fetcher 7.0.0, and the Windsurf-only mcp-subagent 0.0.1. Broker portability patches are retained instead of copying sender-specific paths; the portable broker also keeps request timeout forwarding from the latest runtime broker. memory-store adds newer query/routing/concurrency internals for cross-source conversations; sandbox includes the 1.13.5-1.13.7 safety and lifecycle fixes.
-
-## Windsurf / WSF refresh
-
-This snapshot includes `rules/windsurf/Windsurf_Global_Rules.template.md`, `templates/config.windsurf.example.json`, and source-only `mcps/mcp-subagent`. Windsurf is supported as a fourth data source for Cascade conversation history where shared MCP tools expose `dataChain=windsurf`; `mcp-subagent` is a separate WSF-only automation layer.
+Run `install/Test-CodexToolkit.ps1 -PackageClean` first, then follow `SETUP.md`. ProGrok, Exa credentials, signed-in browser profiles, and Windsurf Cascade access are receiver-managed optional dependencies.

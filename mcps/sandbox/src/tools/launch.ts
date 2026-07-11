@@ -26,7 +26,7 @@ import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "..
 
 const DATA_ROOT = process.env.SANDBOX_DATA_ROOT
     || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data");
-const LAUNCH_DIR = path.join(DATA_ROOT, "launches");
+const LAUNCH_DIR = process.env.SANDBOX_LAUNCH_DIR || path.join(DATA_ROOT, "launches");
 const REGISTRY_FILE = path.join(LAUNCH_DIR, "registry.json");
 const TASK_REGISTRY_DIR = path.join(LAUNCH_DIR, "tasks");
 const WRAPPER_FILE = path.join(LAUNCH_DIR, "launch-wrapper.cjs");

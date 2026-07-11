@@ -1,409 +1,195 @@
 # MCP-SKILL-RULES Packages
 
-面向 AI 编程环境的可移植 MCP + Skills + Rules 工具包。
+面向 Windows AI 编程环境的可移植 MCP、Skills 与 Rules 工具包。
 
-这套项目最早来自 Antigravity 内部自用 MCP，现在已经整理成 **Antigravity / Codex / Claude Code（CC）/ Windsurf（WSF）四源兼容、数据互通** 的工具体系。目标是让不同 AI 宿主共享同一套本地能力、同一套记忆/Record 数据和相近的工作习惯。
+这套项目最初用于 Antigravity，后来扩展为 Codex、Claude Code 与 Windsurf 共用同一套 MCP 源码、数据目录约定和模型路由。当前版本同时保留「单独安装一个宿主也能使用」与「多个宿主共享数据」两种模式。
 
-当前公开快照现在包含 **MCP + Skills + Rules**。`skills/` 收录便携 user-side Codex skills；不包含 `.system` bundled skills、插件缓存、运行态缓存或私有数据。
+> 2026-07-11 refresh：memory-store 1.19.3、sandbox 1.14.0、web-fetcher 7.0.0、portable broker 0.1.0、Windsurf-only subagent 1.1.0。
 
-> 2026-07-04 refresh: latest MCP sources and rules templates are refreshed and privacy-scrubbed; `memory-store` is now `1.17.1`, `sandbox` is `1.13.7`, `web-fetcher` remains `7.0.0`, `mcp-subagent` remains Windsurf-only optional, and `broker` keeps portable path/data-root patches plus upstream request timeout handling.
+## 这套工具解决什么问题
 
----
+- 同一台电脑上的 Codex、Antigravity、Claude Code、Windsurf 可以访问同一份便携 MCP 数据，而不需要复制多套记忆库。
+- `dataChain` 负责选择对话数据来源，`modelChain` 负责选择执行摘要、审查或搜索的模型，两者可以分开。
+- 只有 Codex 时也能运行，默认数据写入 `%USERPROFILE%\.codex-toolkit`，不会依赖 Antigravity 目录。
+- 安装多个宿主后，可按能力启用跨宿主对话读取与模型 fallback；缺失的宿主不会被伪装成可用。
+- 公开包只包含源码、模板、说明和测试，不包含登录态、真实记忆、对话、密钥、日志或数据库。
 
-## 核心特点
+## 当前组件
 
-### 四源数据互通
+| 组件 | 版本 | 主要用途 |
+| --- | ---: | --- |
+| `memory-store` | 1.19.3 | 记忆、Conversation、Record、Golden Extract、Stage Guard、后台任务与跨宿主路由 |
+| `sandbox` | 1.14.0 | 隔离执行、持久会话、批处理、智能搜索、Codex 任务与多模型 Council |
+| `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
+| `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
+| `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
 
-- 支持 Antigravity、Codex、Claude Code（CC）、Windsurf（WSF）四类宿主。
-- 通过共享 HTTP broker 暴露同一组 MCP endpoint。
-- 通过统一数据目录让 memory、Record、会话读取、Stage Guard 等能力跨宿主复用。
-- 支持 `chain`、`dataChain`、`modelChain`，可以把「对话数据来源」和「模型调用来源」拆开。
+## 重点能力
 
-常见用法：
+### memory-store：Conversation 与 Record 系列
 
-- `dataChain="claude-code"`：读取 Claude Code 本地对话数据。
-- `dataChain="windsurf"`：读取 Windsurf / Cascade 本地对话数据；本包不提供 `modelChain="windsurf"`。
-- `dataChain="codex"`：读取 Codex 本地线程 / JSONL / SQLite 索引。
-- `dataChain="antigravity"`：读取 Antigravity Language Server 对话数据。
-- `modelChain="codex"`：使用 Codex 模型桥。
-- `modelChain="antigravity"`：使用 Antigravity 模型链路。
-- `modelChain="claude-code"`：显式调用 Claude Code CLI；默认不建议隐藏式消耗 CC 额度。
+- `conversation_read_original` 可列出、定位、搜索、分轮读取和导出 Codex、Antigravity、Claude Code、Windsurf 对话。
+- `conversation_golden_extract` 从长对话中提取可复用的高价值片段。
+- `record_manage` 维护结构化工作记录，支持读取视图、阶段更新、所有权审计与后台生成。
+- `stage_guard` 在阶段结束前对照 Plan、Task 和执行证据检查是否漏项。
+- 后台任务支持稳定 `taskId`、取消、重启恢复、进度查询和并发控制。
+- Grok / ProGrok 是可选模型链路，只负责模型调用，不读取对话数据；`auto` 不可用时会按工具允许的顺序 fallback。
 
-### MCP：本地能力层
+### web-fetcher：网页、文件与视觉检查
 
-当前包含三个共享核心 MCP、一个 HTTP broker，以及一个 Windsurf 专属可选 MCP：
+- 可抓取公开网页，也可通过接收方自己的浏览器 profile 使用已登录站点。
+- 支持 HTML、PDF、DOCX、PPTX、XLSX、EPUB、图片等本地文件的读取与转换流程。
+- `web_fetch_screenshot`、`web_inspect` 可检查重叠、溢出、可读性和页面结构。
+- `web_interact`、`web_pipeline` 支持持久 session、点击、输入、DOM 检查和批量流水线。
+- desktop 工具可连接 Electron / Chromium / CEF 应用进行调试和截图。
 
-| MCP | 当前版本 | 主要能力 |
-| --- | --- | --- |
-| `memory-store` | `1.17.1` | 记忆库、对话读取、Conversation Export、Record、Golden Extract、Stage Guard、四源数据链路、查询解析/相关性评分、WSF Cascade 路由与本地 fallback |
-| `web-fetcher` | `7.0.0` | 无头浏览、网页抓取、截图、交互、登录态、文件读取/转换、多格式视觉检查 |
-| `sandbox` | `1.13.7` | 代码执行、持久 REPL、批量任务、长任务托管、智能搜索、Codex/CC 调用、多模型 council、SSRF/注入修复、后台 abort 与 per-task registry |
-| `broker` | `0.1.0` | 将 stdio MCP 统一暴露为 Streamable HTTP，供 Codex / Claude Code / Windsurf 等宿主复用 |
-| `mcp-subagent` | `0.0.1` | Windsurf 专属异步子代理：spawn / poll / reply / collect / interrupt / dispose；默认不作为四源共享 MCP 启用 |
+### sandbox：执行、搜索与 Council
 
-`mcp-subagent` 需要特别对待：它会通过 Windsurf / Devin Language Server 操作真实 Cascade 对话，属于 WSF 私有自动化能力。源码放在 `mcps/mcp-subagent/`，但默认安装脚本不会自动写入全局 broker 或 Windsurf 配置；需要接收方明确授权后，按 `mcps/mcp-subagent/README.md` 执行 dry-run、备份、apply 和 rollback。
+- `sandbox_exec`、`sandbox_batch`、`sandbox_session`、`sandbox_launch` 覆盖短代码、并行任务、持久会话和后台进程。
+- `smart_search` 提供精确、模糊和模型语义搜索，可选择 Grok、Antigravity、Codex 或显式 Claude Code 模型链路。
+- `sandbox_council` 让多个模型独立审议同一问题，支持文件和图片输入、后台任务、owner 隔离与 provider fallback。
+- 公开版 ProGrok 集成只连接接收方已经运行的 OpenAI-compatible API，不安装、不启动、不 patch ProGrok。
 
-#### memory-store：Conversation / Record / Guard 中枢
+### HTTP broker
 
-`memory-store` 是这套工具的长期记忆和对话数据核心。
+默认监听 `127.0.0.1:14588`，提供：
 
-重点能力：
+- `/memory-store/mcp`
+- `/web-fetcher/mcp`
+- `/sandbox/mcp`
+- `/playwright/mcp`
+- `/sequential-thinking/mcp`
+- `/exa/mcp`，仅在接收方配置 Exa remote URL 时可用
+- `/subagent/mcp`，仅适用于已安装并登录 Windsurf 的接收方
 
-- `memory_query` / `memory_write` / `memory_update` / `memory_batch`：跨工作区记忆读写、查询和维护。
-- `conversation_read_original`：按 ID、标题、关键词读取 Antigravity / Codex / Claude Code / Windsurf 的原始对话。
-- `conversation_golden_extract`：从长对话里提取高价值片段。
-- `record_manage`：生成和维护结构化 Record，把长对话沉淀成阶段、输出、风险、验证和经验。
-- `stage_guard`：按 `Task.md` 阶段做门禁检查，支持外部证据索引，防止漏做、早报完成、证据不足和 Guard 自指循环。
-- 显式 `conversationId` / `ownerId`：让跨宿主、跨对话、后台任务和共享 broker 场景更稳定。
-- 查询解析、相关性评分、Windsurf Cascade 多窗口路由和本地 `.pb` fallback：提升跨源对话定位与读取可靠性。
+broker 会为普通请求使用 120 秒默认超时，并根据工具参数中的 `waitSeconds` / `timeout` 放宽长任务等待，上限默认 30 分钟。状态文件在退出、`SIGBREAK` 和 `beforeExit` 时尽力落盘。
 
-#### web-fetcher：网页、浏览器和本地文件理解
+### Rules：四宿主的人类化工作规则
 
-`web-fetcher` 是网页和视觉检查入口。
+Rules 保留了猫娘式自然表达、少汇报腔、解释技术概念、Plan / Task / Stage Guard、子代理证据、Office 视觉验收和隐私边界等工作习惯，目标是让 AI 说人话并减少模板化伪人感。
 
-重点能力：
+| 宿主 | 模板 |
+| --- | --- |
+| Codex | `rules/codex/AGENTS.template.md` 与可选 `system-prompt.template.md` |
+| Antigravity | `rules/antigravity/GEMINI.template.md` |
+| Claude Code | `rules/claude-code/CLAUDE.template.md` |
+| Windsurf | `rules/windsurf/global_rules.template.md` 与五个 `system_rules` 分片 |
 
-- 基于 Playwright / Chromium 的无头浏览，适合全网页抓取、截图、页面交互和自动化检查。
-- 支持 `web_fetch_page`、`web_fetch_rich`、`web_fetch_screenshot`、`web_interact`、`web_pipeline` 等网页工具。
-- 支持登录态、Cookie/localStorage 备份、session 复用和 owner 隔离。
-- 支持本地文件和多格式内容检查：HTML、PDF、PPTX、EPUB、Office 转换路径等，具体能力取决于本机依赖。
-- 支持 `web_inspect` 做重叠、溢出、可读性、截图和 AI 视觉审查，适合 PPT / 报告 / 网页 UI QA。
-- `ai_summary` / `ai_review` 支持 `modelChain`，可在 Antigravity、Codex、Claude Code 间选择模型链路。
+Rules 已删除生日、学业、账号链接、登录态、本机路径、真实服务额度和私人项目上下文。接收方应根据自己的环境再修改。
 
-#### sandbox：执行、搜索和多模型 council
+### Skills：完整的可迁移技能包
 
-`sandbox` 是隔离执行与多模型协作层。
+`skills/` 当前包含 16 个经过 allow-list 筛选的用户侧技能。`install/Test-CodexToolkit.ps1 -PackageClean` 会逐个检查技能目录、`SKILL.md` 和 manifest，避免压缩包漏掉 Skills。
 
-重点能力：
+没有打包 Codex `.system` 技能、插件缓存、运行产物，以及本机许可证不允许再分发的 Office skills。详情见 `skills/skills_manifest.md`。
 
-- `sandbox_exec`：执行短代码或命令，支持 Python / Node / PowerShell / cmd / bash 等，并包含 code/command 互斥校验回归。
-- `sandbox_session`：持久 REPL 会话。
-- `sandbox_batch`：批量并行执行任务。
-- `sandbox_launch`：长任务脱离执行，日志和状态落盘；per-task registry、cwd 校验、spawn error 落盘和后台 abort 清理更稳。
-- `smart_search`：大目录 / 长文件智能搜索，`rg` 探测改为 shellless，降低注入和 ESM 兼容风险。
-- `sandbox_codex`：调用 Codex CLI 做后台任务。
-- `sandbox_council`：多模型会审，支持 Antigravity、Codex、Claude Code、Gemini CLI、OpenAI/Anthropic/Gemini/custom provider 等路线。
-- council 支持大输入分块、复杂文件索引、Gemini CLI / Codex CLI fallback、压力输入超时和参与者/主持人分工。
+## 快速安装
 
-### Skills：可迁移工作流层
-
-本仓库现在包含 `skills/` 目录，收录从 `%USERPROFILE%/.codex/skills` 复制的便携 user-side skills。
-
-当前 Skills 内容：
-
-- 文档类：当前公开包包含 `pdf`；`docx` / `pptx` / `xlsx` 因本地许可证限制不随 GitHub 包再分发，接收方应自行安装授权版本。
-- 设计类：前端设计、画布设计、主题工厂等。
-- 工具构建类：MCP 构建、Skill 创建、Playwright / 浏览器测试等。
-- 打包边界：不包含 `.system/`、插件缓存、`node_modules`、`dist`、`__pycache__`、生成测试输出、日志、cookies、sessions、auth 文件或本机私有数据。Office skills（`docx` / `pptx` / `xlsx`）因许可证限制排除。
-
-### Rules：让 AI 更像长期协作者
-
-当前 Rules 是「猫娘 / 朋友式协作」版本。核心目标不是角色扮演本身，而是让 AI **说人话、少一点伪人味**：少模板腔、少报告腔、少机械结尾，多自然反馈、边界意识、证据意识和任务收口能力。
-
-Rules 覆盖四个宿主：
-
-- Codex：`rules/codex/AGENTS.template.md`
-- Codex 可选 system prompt：`rules/codex/system-prompt.template.md`
-- Antigravity：`rules/antigravity/GEMINI.template.md`
-- Claude Code（CC）：`rules/claude-code/CLAUDE.template.md`
-- Windsurf（WSF）：`rules/windsurf/Windsurf_Global_Rules.template.md`
-
-Rules 主要约束：
-
-- 中文优先、自然口语、降低模板化和伪人味。
-- 区分聊天模式和任务模式。
-- 更积极但有边界地使用子代理 / council。
-- 对复杂任务先读记忆和上下文，必要时更新 Record。
-- 对 PPT、文档、网页、UI 等产物做视觉和结构 QA。
-- 高风险操作先讲清影响、备份和回滚路径。
-- 对 Exa、web-fetcher、sandbox、memory-store 的使用顺序和降级路径做明确约束。
-
----
-
-## 包含内容
-
-| 模块 | 路径 | 说明 |
-| --- | --- | --- |
-| MCP servers | `mcps/` | `memory-store`、`web-fetcher`、`sandbox`、可移植 HTTP broker，以及 WSF 专属 `mcp-subagent` |
-| Rules 模板 | `rules/` | Codex、Antigravity、Claude Code、Windsurf 四套独立模板 |
-| 安装脚本 | `install/` | Windows PowerShell 构建、配置、broker 启停和 smoke test 脚本 |
-| 配置模板 | `templates/` | Codex、Antigravity、Claude Code、Windsurf 和环境变量示例 |
-| Skills | `skills/` | 便携 user-side Codex skills、README 和 manifest |
-| 测试样例 | `design-tests/` | 本地测试页面和 MCP HTTP smoke test 辅助文件 |
-
-## Windows 快速开始
-
-环境要求：
-
-- Node.js 18+
-- npm
-- PowerShell
-- 按需安装 Codex、Antigravity、Claude Code 或 Windsurf
-
-构建并测试：
+要求：Windows、PowerShell、Node.js 18 或更高版本。
 
 ```powershell
 ./install/Install-CodexToolkit.ps1
 ./install/Start-CodexMcpBroker.ps1
+./install/Status-CodexMcpBroker.ps1
+./install/Apply-CodexConfig.ps1
 ./install/Test-CodexToolkit.ps1
-./install/Stop-CodexMcpBroker.ps1
 ```
 
-如需同时构建 Windsurf 专属 `mcp-subagent` 源码，可运行 `./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent`；这个开关只构建源码，不会自动写入 Windsurf 或 broker 配置。
-
-broker 默认暴露以下本地 endpoint：
-
-```text
-http://127.0.0.1:14588/memory-store/mcp
-http://127.0.0.1:14588/web-fetcher/mcp
-http://127.0.0.1:14588/sandbox/mcp
-http://127.0.0.1:14588/exa/mcp          # 可选，需要接收方自行配置 Exa URL
-```
-
-## 隐私边界
-
-本仓库只应包含源码、模板、文档和测试样例。
-
-不要提交：
-
-- API Key 或带 Key 的远程 MCP URL
-- cookies、浏览器 profile、auth 文件、sessions、日志
-- 真实 memory-store 数据或 Record 文件
-- SQLite 数据库或 JSONL 对话历史
-- 本机绝对路径
-- 私人账号链接或个人标识信息
-
-发布前建议运行：
+构建 Windsurf 专属 subagent：
 
 ```powershell
-$env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<用分号分隔你的私有标记>"
-./install/Test-CodexToolkit.ps1 -PackageClean
+./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent
 ```
+
+它不会自动修改 Windsurf 或其他宿主配置。请按 `mcps/mcp-subagent/README.md` 单独部署。
+
+完整步骤见 `SETUP.md`，接收方快速说明见 `TOOLKIT_README.md`。
+
+## Grok / ProGrok 配置边界
+
+本仓库不包含 ProGrok 程序、上游账号或 API Key。接收方需要自行运行兼容 OpenAI Chat Completions 的本地 proxy，并在私有环境中设置：
+
+```powershell
+$env:MEMORY_STORE_GROK_PROXY_URL = "http://127.0.0.1:18645"
+$env:MEMORY_STORE_GROK_API_KEY = "<receiver-private-key>"
+$env:SANDBOX_PROGROK_BASE_URL = "http://127.0.0.1:18645"
+$env:SANDBOX_PROGROK_API_KEY = "<receiver-private-key>"
+```
+
+不要把真实值写入仓库、共享 zip 或 Rules。
+
+## 打包与隐私检查
+
+```powershell
+$env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-private-marker"
+./install/Test-CodexToolkit.ps1 -PackageClean
+./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit"
+```
+
+打包脚本会验证 MCP、Rules、Skills、配置模板和禁止文件，再创建 zip 与 SHA256。它不会复制 `.git`、`node_modules`、`dist`、浏览器 profile、sessions、日志、SQLite、真实 memory 或私有 env。
 
 ## 仓库结构
 
 ```text
-.
-├─ mcps/
-│  ├─ broker/
-│  ├─ memory-store/
-│  ├─ mcp-subagent/
-│  ├─ sandbox/
-│  └─ web-fetcher/
-├─ rules/
-│  ├─ codex/
-│  ├─ antigravity/
-│  └─ claude-code/
-├─ install/
-├─ skills/
-├─ templates/
-├─ design-tests/
-├─ PACKAGE_MANIFEST.md
-├─ PRIVATE_EXCLUDE_CHECKLIST.md
-├─ TOOLKIT_README.md
-└─ SETUP.md
+mcps/          portable MCP source and broker
+rules/         Codex / Antigravity / Claude Code / Windsurf templates
+skills/        allow-listed portable skills
+install/       build, config, broker, validation, packaging scripts
+templates/     host config and environment examples
+design-tests/  local pages and smoke-test helpers
 ```
-
-## License
-
-MIT. See `LICENSE`.
 
 ---
 
 # English
 
-Portable MCP + Skills + Rules package for AI coding environments.
+Portable MCP, Skills, and Rules toolkit for Windows AI coding environments.
 
-This project started as an Antigravity-only internal MCP stack and has now been reorganized into a shared toolkit for **Antigravity / Codex / Claude Code (CC) / Windsurf (WSF) with cross-host data interoperability**. The goal is to let different AI hosts share the same local capabilities, the same memory/Record data, and similar working habits.
+The project started as an Antigravity toolset and now supports Codex, Antigravity, Claude Code, and Windsurf. A single host can run independently with data under `%USERPROFILE%\.codex-toolkit`; multi-host installations can share data and split conversation access (`dataChain`) from model execution (`modelChain`).
 
-The current public snapshot now contains **MCP + Skills + Rules**. `skills/` contains portable user-side Codex skills; it excludes `.system` bundled skills, plugin cache, runtime caches, and private data.
+## Included components
 
-## Key Features
+| Component | Version | Purpose |
+| --- | ---: | --- |
+| `memory-store` | 1.19.3 | Memory, Conversation, Record, Golden Extract, Stage Guard, background tasks, and host routing |
+| `sandbox` | 1.14.0 | Isolated execution, sessions, batch jobs, smart search, Codex tasks, and multi-model Council |
+| `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
+| `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
+| `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
 
-### Cross-host data interoperability
+## Highlights
 
-- Supports Antigravity, Codex, Claude Code (CC), and Windsurf (WSF).
-- Exposes the same MCP endpoints through a shared HTTP broker.
-- Uses a shared data root so memory, Records, conversation reading, and Stage Guard can work across hosts.
-- Supports `chain`, `dataChain`, and `modelChain` to split default routing, conversation data source, and model-call route.
+- Conversation tools can locate, search, read by round, and export conversations from all four hosts.
+- Record, Golden Extract, Stage Guard, ownership checks, background recovery, and stable task IDs support long engineering workflows.
+- Web Fetcher handles local HTML, PDF, DOCX, PPTX, XLSX, EPUB, images, real browser sessions, screenshots, visual inspection, and DOM interaction.
+- Sandbox provides short execution, parallel batches, persistent sessions, background launches, smart code search, and Council reviews across Grok, Antigravity, Codex, and explicit Claude Code routes.
+- The broker forwards long-task timeouts, writes shutdown state reliably, and includes an optional stateless Exa bridge.
+- Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Windsurf uses a short global rule plus five system-rule fragments.
+- Sixteen allow-listed portable skills are included and validated during package checks.
 
-Common examples:
+## Installation
 
-- `dataChain="claude-code"`: read Claude Code local conversation data.
-- `dataChain="windsurf"`: read Windsurf / Cascade local conversation data; this package does not expose `modelChain="windsurf"`.
-- `dataChain="codex"`: read Codex local thread / JSONL / SQLite index data.
-- `dataChain="antigravity"`: read Antigravity Language Server conversation data.
-- `modelChain="codex"`: use the Codex model bridge.
-- `modelChain="antigravity"`: use the Antigravity model route.
-- `modelChain="claude-code"`: explicitly use Claude Code CLI; hidden automatic CC quota usage is intentionally avoided by default.
-
-### MCP: local capability layer
-
-| MCP | Version | Main capabilities |
-| --- | --- | --- |
-| `memory-store` | `1.17.1` | Memory, conversation reading, Conversation Export, Records, Golden Extract, Stage Guard, four-source data chains, query parsing / relevance scoring, WSF Cascade routing, and local fallback |
-| `web-fetcher` | `7.0.0` | Headless browsing, web fetch, screenshots, interactions, login state, local file / multi-format inspection |
-| `sandbox` | `1.13.7` | Code execution, persistent REPL, batch jobs, long-running tasks, smart search, Codex/CC calls, multi-model council, SSRF/injection fixes, background abort, and per-task registry |
-| `broker` | `0.1.0` | Exposes stdio MCP servers as Streamable HTTP endpoints for Codex / Claude Code / Windsurf and other hosts |
-| `mcp-subagent` | `0.0.1` | Windsurf-only async sub-agents: spawn / poll / reply / collect / interrupt / dispose; not enabled as a default shared MCP |
-
-`mcp-subagent` is special: it operates real Windsurf / Devin Cascade conversations through the local Language Server. The source is included under `mcps/mcp-subagent/`, but the default installer does not automatically patch the shared broker or Windsurf config. Receivers should follow `mcps/mcp-subagent/README.md` and run dry-run, backup, apply, and rollback steps only with explicit local authorization.
-
-#### memory-store: Conversation / Record / Guard hub
-
-`memory-store` is the long-term memory and conversation-data core.
-
-Highlights:
-
-- `memory_query` / `memory_write` / `memory_update` / `memory_batch`: workspace-aware memory operations.
-- `conversation_read_original`: read original conversations by ID, title, or keyword across Antigravity / Codex / Claude Code / Windsurf.
-- `conversation_golden_extract`: extract high-value snippets from long conversations.
-- `record_manage`: generate and maintain structured Records with phases, outputs, risks, verification, and lessons.
-- `stage_guard`: stage-level guardrails for `Task.md` workflows with external evidence indexing, preventing missing work, premature completion reports, weak evidence, and self-referential guard loops.
-- Explicit `conversationId` / `ownerId`: stabilizes cross-host, cross-conversation, background-task, and shared-broker usage.
-- Query parsing, relevance scoring, Windsurf Cascade multi-window routing, and local `.pb` fallback improve cross-source conversation lookup and reads.
-
-#### web-fetcher: web, browser, and local file understanding
-
-Highlights:
-
-- Playwright / Chromium based headless browsing for web fetch, screenshots, page interactions, and automated checks.
-- Tools such as `web_fetch_page`, `web_fetch_rich`, `web_fetch_screenshot`, `web_interact`, and `web_pipeline`.
-- Login state, Cookie/localStorage backup, session reuse, and owner isolation.
-- Local file and multi-format inspection support: HTML, PDF, PPTX, EPUB, and Office conversion paths where local dependencies are available.
-- `web_inspect` for overlap, overflow, readability, screenshot, and AI visual review, useful for PPT / reports / web UI QA.
-- `ai_summary` / `ai_review` with `modelChain` support across Antigravity, Codex, and Claude Code; Windsurf is currently data-chain oriented.
-
-#### sandbox: execution, search, and multi-model council
-
-Highlights:
-
-- `sandbox_exec`: run short code or commands, including Python / Node / PowerShell / cmd / bash, with code/command mutex regression coverage.
-- `sandbox_session`: persistent REPL sessions.
-- `sandbox_batch`: parallel batch execution.
-- `sandbox_launch`: detached long-running tasks with logs and status on disk; per-task registry, cwd validation, spawn-error persistence, and background abort cleanup are improved.
-- `smart_search`: smart search over large directories or long files; `rg` probing is shellless for safer ESM/runtime behavior.
-- `sandbox_codex`: background tasks through Codex CLI.
-- `sandbox_council`: multi-model council with Antigravity, Codex, Claude Code, Gemini CLI, OpenAI/Anthropic/Gemini/custom providers.
-- Council support for large-input chunking, complex-file indexing, Gemini CLI / Codex CLI fallback, pressure timeouts, and moderator/participant separation.
-
-### Skills: portable workflow layer
-
-This repository now includes a `skills/` directory copied from portable user-side `%USERPROFILE%/.codex/skills` entries.
-
-Planned Skill directions:
-
-- Document workflows: this public package includes `pdf`; `docx` / `pptx` / `xlsx` are excluded from GitHub redistribution because their local licenses restrict copying, so receivers should install licensed equivalents themselves.
-- Design workflows: frontend design, canvas design, theme factory.
-- Tool-building workflows: MCP builder, skill creator, Playwright / browser testing.
-- Packaging boundary: excludes `.system/`, plugin cache, `node_modules`, `dist`, `__pycache__`, generated test outputs, logs, cookies, sessions, auth files, and local private data. Office skills (`docx` / `pptx` / `xlsx`) are excluded due to redistribution restrictions.
-
-### Rules: making AI a better long-term collaborator
-
-The current Rules are a catgirl / friendly-collaborator variant. The point is not roleplay for its own sake; the practical goal is to make AI agents **sound more human and less uncanny or template-like**, while preserving directness, evidence discipline, boundary awareness, and useful progress updates.
-
-Rules cover:
-
-- Codex: `rules/codex/AGENTS.template.md`
-- Optional Codex system prompt: `rules/codex/system-prompt.template.md`
-- Antigravity: `rules/antigravity/GEMINI.template.md`
-- Claude Code (CC): `rules/claude-code/CLAUDE.template.md`
-- Windsurf (WSF): `rules/windsurf/Windsurf_Global_Rules.template.md`
-
-Rules mainly define:
-
-- Chinese-first, natural conversation style with fewer template-like reports.
-- Chat mode vs task mode distinction.
-- More proactive but bounded subagent / council usage.
-- Memory and context lookup before complex work, with Record updates when useful.
-- Visual and structural QA for PPT, documents, webpages, and UI artifacts.
-- High-risk operation boundaries: explain impact, backup, and rollback first.
-- Clear tool usage and fallback rules for Exa, web-fetcher, sandbox, and memory-store.
-
-## Included
-
-| Area | Path | Notes |
-| --- | --- | --- |
-| MCP servers | `mcps/` | `memory-store`, `web-fetcher`, `sandbox`, a portable HTTP broker, and WSF-only `mcp-subagent` |
-| Host rules | `rules/` | Separate templates for Codex, Antigravity, Claude Code, and Windsurf |
-| Install scripts | `install/` | Windows PowerShell scripts for build, config, broker lifecycle, and smoke tests |
-| Config templates | `templates/` | Codex, Antigravity, Claude Code, Windsurf, and environment examples |
-| Skills | `skills/` | Portable user-side Codex skills, README, and manifest |
-| Smoke tests | `design-tests/` | Local pages and MCP HTTP smoke test helpers |
-
-## Quick Start On Windows
-
-Requirements:
-
-- Node.js 18+
-- npm
-- PowerShell
-- Codex, Antigravity, Claude Code, or Windsurf depending on your target host
-
-Build and smoke test:
+Requirements: Windows, PowerShell, and Node.js 18 or newer.
 
 ```powershell
 ./install/Install-CodexToolkit.ps1
 ./install/Start-CodexMcpBroker.ps1
+./install/Apply-CodexConfig.ps1
 ./install/Test-CodexToolkit.ps1
-./install/Stop-CodexMcpBroker.ps1
 ```
 
-To also build the Windsurf-only `mcp-subagent` source, run `./install/Install-CodexToolkit.ps1 -IncludeWindsurfSubagent`; it only builds source and does not auto-patch Windsurf or broker config.
+Use `SETUP.md` for host-specific installation and `TOOLKIT_README.md` for the receiver handoff guide.
 
-Default broker endpoints:
+## Grok / ProGrok boundary
 
-```text
-http://127.0.0.1:14588/memory-store/mcp
-http://127.0.0.1:14588/web-fetcher/mcp
-http://127.0.0.1:14588/sandbox/mcp
-http://127.0.0.1:14588/exa/mcp          # optional, requires receiver-side Exa URL
-```
+ProGrok itself, upstream accounts, and credentials are not bundled. The portable source only probes a receiver-managed OpenAI-compatible local endpoint. Keep all real URLs and API keys in the receiver's private environment.
 
-## Privacy Boundary
+## Privacy
 
-This repository should only contain source code, templates, docs, and test samples.
+The repository and generated package exclude credentials, cookies, browser profiles, sessions, conversations, real memory data, SQLite databases, JSONL history, logs, `node_modules`, build output, and sender-specific paths or identity details.
 
-Do not commit:
-
-- API keys or remote MCP URLs with embedded keys
-- cookies, browser profiles, auth files, sessions, or logs
-- real memory-store data or Record files
-- SQLite databases or JSONL conversation histories
-- machine-specific absolute paths
-- private account links or personal identifiers
-
-Recommended pre-publish check:
+Run before publishing:
 
 ```powershell
-$env:CODEX_TOOLKIT_PRIVATE_PATTERNS="<private markers separated by semicolons>"
 ./install/Test-CodexToolkit.ps1 -PackageClean
 ```
-
-## Repository Layout
-
-```text
-.
-├─ mcps/
-│  ├─ broker/
-│  ├─ memory-store/
-│  ├─ mcp-subagent/
-│  ├─ sandbox/
-│  └─ web-fetcher/
-├─ rules/
-│  ├─ codex/
-│  ├─ antigravity/
-│  └─ claude-code/
-├─ install/
-├─ skills/
-├─ templates/
-├─ design-tests/
-├─ PACKAGE_MANIFEST.md
-├─ PRIVATE_EXCLUDE_CHECKLIST.md
-├─ TOOLKIT_README.md
-└─ SETUP.md
-```
-
-## License
-
-MIT. See `LICENSE`.

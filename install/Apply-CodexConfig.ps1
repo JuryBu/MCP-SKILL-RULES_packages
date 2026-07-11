@@ -33,6 +33,14 @@ $legacyPattern = "(?s)\r?\n?" + [regex]::Escape($legacyBegin) + ".*?" + [regex]:
 $current = [regex]::Replace($current, $legacyPattern, "").TrimEnd()
 $pattern = "(?s)\r?\n?# BEGIN PORTABLE CODEX TOOLKIT MCP.*?# END PORTABLE CODEX TOOLKIT MCP\r?\n?"
 $clean = [regex]::Replace($current, $pattern, "").TrimEnd()
+$managedServerNames = @("memory-store", "web-fetcher", "sandbox", "playwright", "sequential-thinking")
+if ($env:EXA_MCP_REMOTE_URL -or $env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL) { $managedServerNames += "exa" }
+$duplicates = @($managedServerNames | Where-Object {
+    $clean -match "(?m)^\s*\[mcp_servers\." + [regex]::Escape($_) + "\]\s*$"
+})
+if ($duplicates.Count -gt 0) {
+    throw "Existing Codex config already defines toolkit MCP tables: $($duplicates -join ', '). No changes were written; merge those tables manually or remove the duplicates, then rerun."
+}
 $next = if ($clean.Length -gt 0) { "$clean`r`n`r`n$block`r`n" } else { "$block`r`n" }
 
 Set-Content -LiteralPath $configPath -Value $next -Encoding UTF8
