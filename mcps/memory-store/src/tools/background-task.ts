@@ -1,12 +1,27 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { cancelBackgroundTask, formatBackgroundTask, waitForBackgroundTask } from "../background-tasks.js";
+import {
+    cancelBackgroundTask,
+    formatBackgroundTask,
+    getRecordSchedulerProjectionHint,
+    waitForBackgroundTask,
+} from "../background-tasks.js";
 import { touchActivity } from "../lifecycle.js";
+import {
+    formatRecordSchedulerCancel,
+    formatRecordSchedulerTaskStatus,
+    getRecordSchedulerRuntime,
+} from "../record-scheduler-runtime.js";
+import { isTerminalTaskState } from "../record-scheduler-contracts.js";
 
 function textResponse(text: string) {
     return {
         content: [{ type: "text" as const, text }],
     };
+}
+
+function schedulerProjectionRepairRequired(task: { id: string; kind: string }): string {
+    return `⚠️ Record scheduler ${task.kind} ${task.id} 的持久 projection 仍存在，但权威 scheduler ledger 不可读取；拒绝回退 generic status/cancel，需按 RepairRequired 处理`;
 }
 
 const BackgroundTaskStatusSchema = {
@@ -23,16 +38,34 @@ export async function handleBackgroundTaskStatus(
     taskId: string,
     waitSeconds?: number,
 ): Promise<{ content: Array<{ type: "text"; text: string }> }> {
-    touchActivity();
-    const task = await waitForBackgroundTask(taskId, waitSeconds || 0);
+    touchActivity({ skipRecordAutoCheck: true });
+    const runtime = getRecordSchedulerRuntime();
+    const schedulerStatus = runtime.status(taskId);
+    if (schedulerStatus) {
+        const settled = await runtime.waitForTerminal(taskId, waitSeconds || 0);
+        const persistedTask = await waitForBackgroundTask(taskId, settled && isTerminalTaskState(settled.state) ? 1 : 0);
+        return textResponse(formatRecordSchedulerTaskStatus(settled, persistedTask?.error));
+    }
+    const projectionHint = getRecordSchedulerProjectionHint(taskId);
+    if (projectionHint) {
+        return textResponse(schedulerProjectionRepairRequired(projectionHint));
+    }
+    const immediate = await waitForBackgroundTask(taskId, 0);
+    const task = waitSeconds ? await waitForBackgroundTask(taskId, waitSeconds) : immediate;
     return textResponse(formatBackgroundTask(task));
 }
 
-export function handleBackgroundTaskCancel(
+export async function handleBackgroundTaskCancel(
     taskId: string,
     reason?: string,
-): { content: Array<{ type: "text"; text: string }> } {
-    touchActivity();
+): Promise<{ content: Array<{ type: "text"; text: string }> }> {
+    touchActivity({ skipRecordAutoCheck: true });
+    const scheduler = await getRecordSchedulerRuntime().cancel(taskId);
+    if (scheduler) return textResponse(formatRecordSchedulerCancel(scheduler));
+    const projectionHint = getRecordSchedulerProjectionHint(taskId);
+    if (projectionHint) {
+        return textResponse(schedulerProjectionRepairRequired(projectionHint));
+    }
     const task = cancelBackgroundTask(taskId, reason || "用户取消");
     return textResponse(formatBackgroundTask(task));
 }

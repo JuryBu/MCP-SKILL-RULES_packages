@@ -1,4 +1,4 @@
-import fs from "fs";
+﻿import fs from "fs";
 import { z } from "zod";
 import path from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,7 +22,7 @@ import {
 } from "../background-tasks.js";
 import type { BackgroundTaskContext } from "../background-tasks.js";
 import { formatToolError } from "../error-format.js";
-import { modelChainInputSchema } from "./schema-utils.js";
+import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
 import type { ResumePayloadValue } from "../background-recovery.js";
 import { DATA_ROOT, writeJsonAtomic } from "../store.js";
 
@@ -56,10 +56,9 @@ const StageGuardSchema = z.object({
     conversationId: z.string().optional()
         .describe("可选：显式指定要守卫的对话 ID，跨宿主场景建议传入"),
     chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
-        .describe("兼容旧参数：chain=\"windsurf\" 只作为数据链路；chain=\"grok\" 只作为模型链路"),
-    dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
-        .describe("可选：Guard 读取执行记录的链路，支持 antigravity/codex/claude-code/windsurf；未填默认 auto"),
-    modelChain: modelChainInputSchema("modelChain", "模型链路：auto=优先 Grok/progrok 再 fallback，grok=本机 progrok proxy，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
+        .describe("兼容旧参数：chain=\"windsurf\" 只作为数据链路；chain=\"grok\"/\"agy\" 只作为模型链路"),
+    dataChain: dataChainInputSchema("dataChain", "可选：Guard 读取执行记录的链路，支持 antigravity/codex/claude-code/windsurf；agy 与 Grok 只支持 modelChain，未填默认 auto"),
+    modelChain: modelChainInputSchema("modelChain", "模型链路：auto=Grok→（MEMORY_STORE_AGY_AUTO_ENABLED=1 时）agy→Antigravity→Codex→可选 Claude Code CLI；agy=本地 CLI 的三模型内部 fallback；Windsurf 只支持 dataChain"),
     startRound: z.number().optional()
         .describe("start 时可选：起始轮次（默认当前轮次）。可手动设为更早的轮次以覆盖已完成的工作"),
     appealNote: z.string().optional()
@@ -100,7 +99,7 @@ function resolveModelChain(params: z.infer<typeof StageGuardSchema>): Chain {
 }
 
 function resolveDataChain(params: z.infer<typeof StageGuardSchema>): DataChain {
-    return resolveChainSplit({ chain: params.chain, dataChain: params.dataChain }).dataChain;
+    return resolveChainSplit({ chain: DEFAULT_CHAIN, dataChain: params.dataChain }).dataChain;
 }
 
 function normalizeScopeSelectors(scopeSelectors?: string[]): string[] {

@@ -6,6 +6,20 @@ import { StringDecoder } from "string_decoder";
 import type { CompactionSummaryInfo, ConversationRound } from "./trajectory.js";
 import type { ConversationAttachment } from "./conversation-attachments.js";
 import type { ConversationLogicalChainMode } from "./chain.js";
+import {
+    buildExactFetchEvidence,
+    buildFullSourceReadEvidence,
+    buildRecordSourceSnapshot,
+    buildSourceEnumerationEvidence,
+    classifySourceEvidence,
+    SOURCE_EVIDENCE_ADAPTER_VERSION,
+    type ExactFetchEvidence,
+    type FullSourceReadEvidence,
+    type RecordSourceSnapshot as SourceEvidenceRecordSnapshot,
+    type SourceEnumerationEvidence,
+    type SourceEvidenceClassification,
+    type SourceEvidenceIssue,
+} from "./source-evidence-contracts.js";
 
 export interface ClaudeCodeThreadInfo {
     id: string;
@@ -117,6 +131,11 @@ const CLAUDE_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CC_JSONL_R
 const CLAUDE_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CC_JSONL_MAX_LINE_CHARS || 16 * 1024 * 1024);
 const CLAUDE_JSONL_YIELD_EVERY_LINES = Math.max(1, Number(process.env.MEMORY_STORE_CC_JSONL_YIELD_EVERY_LINES || 256) || 256);
 const CLAUDE_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CC_TEXT_FIELD_MAX_CHARS || 200_000);
+const CLAUDE_ATTACHMENT_MAX_BYTES = (() => {
+    const configured = process.env.MEMORY_STORE_CC_ATTACHMENT_MAX_BYTES;
+    const value = configured === undefined ? 4 * 1024 * 1024 : Number(configured);
+    return Number.isSafeInteger(value) && value >= 0 ? value : 4 * 1024 * 1024;
+})();
 const CLAUDE_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CLAUDE_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CLAUDE_CODE_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
@@ -530,6 +549,37 @@ function truncate(text: string, maxLen: number): string {
     return text.slice(0, maxLen) + `... [truncated ${text.length - maxLen} chars]`;
 }
 
+function truncateTextParts(parts: string[], maxLen: number): { value: string; truncated: boolean } {
+    if (parts.length === 0) return { value: "", truncated: false };
+    let totalLength = 0;
+    for (let index = 0; index < parts.length; index += 1) {
+        totalLength += parts[index].length + (index > 0 ? 1 : 0);
+    }
+    if (totalLength <= maxLen) return { value: parts.join("\n"), truncated: false };
+
+    let remaining = maxLen;
+    let value = "";
+    for (let index = 0; index < parts.length && remaining > 0; index += 1) {
+        if (index > 0) {
+            value += "\n";
+            remaining -= 1;
+            if (remaining === 0) break;
+        }
+        const part = parts[index];
+        if (part.length <= remaining) {
+            value += part;
+            remaining -= part.length;
+        } else {
+            value += part.slice(0, remaining);
+            remaining = 0;
+        }
+    }
+    return {
+        value: value + `... [truncated ${totalLength - maxLen} chars]`,
+        truncated: true,
+    };
+}
+
 function stringifyCompact(value: any, maxLen = 500): string {
     if (value === undefined || value === null) return "";
     if (typeof value === "string") return truncate(value, maxLen);
@@ -573,10 +623,16 @@ function summarizeToolResult(event: any, content: any): string {
 }
 
 function estimateBase64Bytes(base64: string): number {
-    const clean = base64.replace(/\s+/gu, "");
-    if (!clean) return 0;
-    const padding = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
-    return Math.max(0, Math.floor((clean.length * 3) / 4) - padding);
+    let encodedChars = 0;
+    let padding = 0;
+    for (let index = 0; index < base64.length; index += 1) {
+        const charCode = base64.charCodeAt(index);
+        if (charCode === 9 || charCode === 10 || charCode === 12 || charCode === 13 || charCode === 32) continue;
+        encodedChars += 1;
+        if (charCode === 61) padding += 1;
+    }
+    if (encodedChars === 0) return 0;
+    return Math.max(0, Math.floor((encodedChars * 3) / 4) - Math.min(padding, 2));
 }
 
 function isLikelyPath(input: string): boolean {
@@ -593,19 +649,43 @@ function encryptedThinkingPlaceholder(stepIndex?: number): string {
     return `🔒 加密思考块${stepLabel}：thinking 为空，signature 存在，明文不可读`;
 }
 
-function extractMessageContent(content: any, cwd?: string, options: ExtractMessageContentOptions = {}): { text: string; thinking: string; toolUses: any[]; toolResults: any[]; attachments: ConversationAttachment[] } {
+function unknownContentBlockPlaceholder(type: unknown): string {
+    const value = typeof type === "string" && type.length > 0 ? type.slice(0, 120) : "unknown";
+    return `[Claude Code unknown content block type=${JSON.stringify(value)}]`;
+}
+
+function extractMessageContent(content: any, cwd?: string, options: ExtractMessageContentOptions = {}): { text: string; thinking: string; toolUses: any[]; toolResults: any[]; attachments: ConversationAttachment[]; truncated: boolean } {
     if (typeof content === "string") {
-        return { text: truncate(content, CLAUDE_TEXT_FIELD_MAX_CHARS), thinking: "", toolUses: [], toolResults: [], attachments: [] };
+        return {
+            text: truncate(content, CLAUDE_TEXT_FIELD_MAX_CHARS),
+            thinking: "",
+            toolUses: [],
+            toolResults: [],
+            attachments: [],
+            truncated: content.length > CLAUDE_TEXT_FIELD_MAX_CHARS,
+        };
     }
     const parts: string[] = [];
     const thinking: string[] = [];
     const toolUses: any[] = [];
     const toolResults: any[] = [];
     const attachments: ConversationAttachment[] = [];
-    if (!Array.isArray(content)) return { text: "", thinking: "", toolUses, toolResults, attachments };
+    if (!Array.isArray(content)) {
+        return {
+            text: content === undefined || content === null ? "" : unknownContentBlockPlaceholder("non-array"),
+            thinking: "",
+            toolUses,
+            toolResults,
+            attachments,
+            truncated: false,
+        };
+    }
 
     for (const item of content) {
-        if (!item || typeof item !== "object") continue;
+        if (!item || typeof item !== "object") {
+            parts.push(unknownContentBlockPlaceholder("invalid"));
+            continue;
+        }
         if (item.type === "text" && typeof item.text === "string") {
             parts.push(item.text);
         } else if (item.type === "thinking" && typeof item.thinking === "string") {
@@ -622,14 +702,25 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
             const source = item.source || {};
             if (source.type === "base64" && typeof source.data === "string") {
                 const mimeType = source.media_type || source.mimeType || "image/png";
-                attachments.push({
+                const sizeBytes = estimateBase64Bytes(source.data);
+                const attachment = {
                     kind: "image",
                     source: "claude-code-data-url",
                     mimeType,
-                    dataUrl: `data:${mimeType};base64,${source.data}`,
-                    sizeBytes: estimateBase64Bytes(source.data),
+                    sizeBytes,
                     stepIndex: options.stepIndex,
-                });
+                } as const;
+                if (sizeBytes > CLAUDE_ATTACHMENT_MAX_BYTES) {
+                    attachments.push({
+                        ...attachment,
+                        warning: `Claude Code base64 image estimated at ${sizeBytes} bytes exceeds configured ${CLAUDE_ATTACHMENT_MAX_BYTES}-byte limit; data URL was not materialized`,
+                    });
+                } else {
+                    attachments.push({
+                        ...attachment,
+                        dataUrl: `data:${mimeType};base64,${source.data}`,
+                    });
+                }
             } else if (typeof source.path === "string" || typeof item.path === "string") {
                 const rawPath = source.path || item.path;
                 const resolved = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd || process.cwd(), rawPath);
@@ -639,6 +730,14 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                     name: path.basename(resolved),
                     originalPath: resolved,
                     exists: fs.existsSync(resolved),
+                    stepIndex: options.stepIndex,
+                });
+            } else {
+                attachments.push({
+                    kind: "image",
+                    source: "claude-code-data-url",
+                    mimeType: source.media_type || source.mimeType,
+                    warning: "Claude Code image attachment could not be resolved to base64 or a local path",
                     stepIndex: options.stepIndex,
                 });
             }
@@ -654,16 +753,40 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                 mimeType: item.mime_type || item.mimeType,
                 stepIndex: options.stepIndex,
             });
+        } else if (item.type === "file" || item.type === "document") {
+            attachments.push({
+                kind: "file",
+                source: "files-mentioned",
+                mimeType: item.mime_type || item.mimeType,
+                warning: "Claude Code file attachment could not be resolved to a path or name",
+                stepIndex: options.stepIndex,
+            });
+        } else {
+            parts.push(unknownContentBlockPlaceholder(item.type));
         }
     }
 
+    const text = truncateTextParts(parts, CLAUDE_TEXT_FIELD_MAX_CHARS);
+    const thinkingText = truncateTextParts(thinking, CLAUDE_TEXT_FIELD_MAX_CHARS);
     return {
-        text: truncate(parts.join("\n"), CLAUDE_TEXT_FIELD_MAX_CHARS),
-        thinking: truncate(thinking.join("\n\n"), CLAUDE_TEXT_FIELD_MAX_CHARS),
+        text: text.value,
+        thinking: thinkingText.value,
         toolUses,
         toolResults,
         attachments,
+        truncated: text.truncated || thinkingText.truncated,
     };
+}
+
+function claudeCodeToolOnlyMessageContent(content: unknown): boolean {
+    if (!Array.isArray(content) || content.length === 0) return false;
+    return content.every(item => item && typeof item === "object" && ["tool_use", "tool_result"].includes(String((item as Record<string, unknown>).type || "")));
+}
+
+function claudeCodeSourceEvidenceAttachments(attachments: ConversationAttachment[]): ConversationAttachment[] {
+    return attachments.map(attachment => Object.fromEntries(
+        Object.entries(attachment).filter(([, value]) => value !== undefined),
+    ) as ConversationAttachment);
 }
 
 interface PendingCompactBoundary {
@@ -1720,3 +1843,994 @@ export function deepLocateClaudeCodeConversations(
         reason: budgetExhausted ? "budget_exhausted" : undefined,
     };
 }
+
+export interface ClaudeCodeSourceEvidenceFileSystem {
+    readdirSync(directory: string): fs.Dirent[];
+    statSync(filePath: string): fs.Stats;
+    readFileSync(filePath: string): string | Buffer;
+    openSync(filePath: string, flags: string): number;
+    readSync(fileDescriptor: number, buffer: Buffer, offset: number, length: number, position: number): number;
+    closeSync(fileDescriptor: number): void;
+}
+
+export interface ClaudeCodeSourceEvidenceOptions {
+    conversationId: string;
+    projectsRoot?: string;
+    workspaceId?: string;
+    workspacePath?: string | null;
+    scanId?: string;
+    sequence?: number;
+    limit?: number;
+    cacheBypassed?: boolean;
+    snapshotId?: string;
+    readChunkBytes?: number;
+    maxLineBytes?: number;
+    now?: () => Date;
+    fileSystem?: Partial<ClaudeCodeSourceEvidenceFileSystem>;
+}
+
+export interface ClaudeCodeSourceSession {
+    conversationId: string;
+    jsonlPath: string;
+    projectPath: string;
+    isSubagent: boolean;
+    parentConversationId: string | null;
+}
+
+export interface ClaudeCodeSourceEnumerationResult {
+    enumeration: SourceEnumerationEvidence;
+    session: ClaudeCodeSourceSession | null;
+    sessions: ClaudeCodeSourceSession[];
+}
+
+export interface ClaudeCodeExactFetchResult {
+    exactFetch: ExactFetchEvidence;
+    session: ClaudeCodeSourceSession | null;
+}
+
+export interface ClaudeCodeSourceContentMessage {
+    role: "user" | "assistant";
+    text: string;
+    attachments?: ConversationAttachment[];
+}
+
+export interface ClaudeCodeFullSourceReadResult {
+    fullSourceRead: FullSourceReadEvidence | null;
+    snapshot: SourceEvidenceRecordSnapshot | null;
+    reason: string | null;
+    contentTruncated?: boolean;
+    sourceMessages?: ClaudeCodeSourceContentMessage[];
+}
+
+export interface ClaudeCodeSourceEvidenceResult {
+    enumeration: SourceEnumerationEvidence;
+    exactFetch: ExactFetchEvidence;
+    fullSourceRead: FullSourceReadEvidence | null;
+    snapshot: SourceEvidenceRecordSnapshot | null;
+    classification: SourceEvidenceClassification;
+    session: ClaudeCodeSourceSession | null;
+    contentTruncated?: boolean;
+    sourceMessages?: ClaudeCodeSourceContentMessage[];
+}
+
+interface ClaudeCodeJsonlScanResult {
+    sessions: ClaudeCodeSourceSession[];
+    errors: SourceEvidenceIssue[];
+    pagination: {
+        cursor: string | null;
+        pages: number;
+        limit: number | null;
+        truncated: boolean;
+    };
+    enumerationComplete: boolean;
+}
+
+interface ClaudeCodeSourceContentScan {
+    byteLength: number;
+    contentHash: string;
+    contentCursor: string;
+    eventWatermark: string;
+    roundRange: { start: number; end: number };
+    messages: ClaudeCodeSourceContentMessage[];
+    truncated: boolean;
+    errors: SourceEvidenceIssue[];
+}
+
+let claudeCodeSourceEvidenceScanSequence = 0;
+
+const DEFAULT_CLAUDE_CODE_SOURCE_EVIDENCE_FILE_SYSTEM: ClaudeCodeSourceEvidenceFileSystem = {
+    readdirSync: (directory) => fs.readdirSync(directory, { withFileTypes: true }) as fs.Dirent[],
+    statSync: (filePath) => fs.statSync(filePath),
+    readFileSync: (filePath) => fs.readFileSync(filePath),
+    openSync: (filePath, flags) => fs.openSync(filePath, flags),
+    readSync: (fileDescriptor, buffer, offset, length, position) => fs.readSync(fileDescriptor, buffer, offset, length, position),
+    closeSync: (fileDescriptor) => fs.closeSync(fileDescriptor),
+};
+
+function claudeCodeSourceEvidenceFileSystem(
+    override?: Partial<ClaudeCodeSourceEvidenceFileSystem>,
+): ClaudeCodeSourceEvidenceFileSystem {
+    return {
+        ...DEFAULT_CLAUDE_CODE_SOURCE_EVIDENCE_FILE_SYSTEM,
+        ...override,
+    };
+}
+
+function claudeCodeSourceEvidenceRoot(options: ClaudeCodeSourceEvidenceOptions): string {
+    return path.resolve(options.projectsRoot || claudeProjectsDir());
+}
+
+function claudeCodeSourceEvidenceNow(options: ClaudeCodeSourceEvidenceOptions): Date {
+    const current = options.now ? options.now() : new Date();
+    if (!(current instanceof Date) || !Number.isFinite(current.getTime())) {
+        throw new Error("Claude Code source evidence now() must return a valid Date");
+    }
+    return current;
+}
+
+function claudeCodeSourceEvidenceScanId(options: ClaudeCodeSourceEvidenceOptions): string {
+    if (options.scanId?.trim()) return options.scanId.trim();
+    claudeCodeSourceEvidenceScanSequence += 1;
+    return `claude-code-${Date.now().toString(36)}-${claudeCodeSourceEvidenceScanSequence}`;
+}
+
+function claudeCodeSourceEvidenceLimit(limit: number | undefined): number | null {
+    if (limit === undefined) return null;
+    if (!Number.isSafeInteger(limit) || limit < 1) throw new Error("Claude Code source evidence limit must be a positive safe integer");
+    return limit;
+}
+
+function claudeCodeSourceEvidenceIssue(error: unknown, context: string): SourceEvidenceIssue {
+    const code = typeof (error as NodeJS.ErrnoException | undefined)?.code === "string"
+        ? (error as NodeJS.ErrnoException).code
+        : "";
+    const issueCode = code === "EACCES" || code === "EPERM"
+        ? "permission_denied"
+        : "source_unavailable";
+    const detail = error instanceof Error && error.message ? error.message : String(error || "unknown error");
+    return { code: issueCode, message: `${context}: ${detail}` };
+}
+
+function claudeCodeSourceEvidenceParseIssue(filePath: string, line: number, error: unknown): SourceEvidenceIssue {
+    const detail = error instanceof Error && error.message ? error.message : String(error || "invalid JSON");
+    return { code: "parse_error", message: `JSONL parse failed at ${path.resolve(filePath)} line ${line}: ${detail}` };
+}
+
+function uniqueClaudeCodeSourceEvidenceIssues(issues: SourceEvidenceIssue[]): SourceEvidenceIssue[] {
+    const seen = new Set<string>();
+    return issues.filter((issue) => {
+        const key = `${issue.code}\u0000${issue.message}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+}
+
+function sourceEvidenceDigest(value: string | Buffer): string {
+    return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function canonicalClaudeCodeSourcePath(filePath: string): string {
+    return path.resolve(filePath);
+}
+
+function claudeCodeStatFingerprint(stat: fs.Stats): string {
+    return [
+        `size=${stat.size}`,
+        `mtimeMs=${Math.trunc(stat.mtimeMs)}`,
+        `ctimeMs=${Math.trunc(stat.ctimeMs)}`,
+        `birthtimeMs=${Math.trunc(stat.birthtimeMs)}`,
+        `ino=${typeof stat.ino === "number" ? stat.ino : 0}`,
+    ].join(";");
+}
+
+function sameClaudeCodeStat(left: fs.Stats, right: fs.Stats): boolean {
+    return claudeCodeStatFingerprint(left) === claudeCodeStatFingerprint(right);
+}
+
+function claudeCodeSessionFromPath(projectsRoot: string, jsonlPath: string): ClaudeCodeSourceSession {
+    const normalized = canonicalClaudeCodeSourcePath(jsonlPath);
+    const parentConversationId = extractClaudeCodeSubagentParentConversationId(normalized);
+    const normalizedParts = normalized.replace(/\\/gu, "/").split("/").filter(Boolean);
+    const subagentIndex = normalizedParts.findIndex((part) => part.toLowerCase() === "subagents");
+    const projectPath = subagentIndex > 0
+        ? path.dirname(path.dirname(path.dirname(normalized)))
+        : path.dirname(normalized);
+    return {
+        conversationId: path.basename(normalized, ".jsonl"),
+        jsonlPath: normalized,
+        projectPath: canonicalClaudeCodeSourcePath(projectPath || projectsRoot),
+        isSubagent: Boolean(parentConversationId) || isLikelyClaudeCodeSubagentJsonl(normalized),
+        parentConversationId,
+    };
+}
+
+function claudeCodeScanCursor(projectsRoot: string, filePath: string | null): string | null {
+    if (!filePath) return null;
+    const relative = path.relative(projectsRoot, filePath).replace(/\\/gu, "/");
+    return `jsonl:${relative || path.basename(filePath)}`;
+}
+
+function scanClaudeCodeSourceJsonl(
+    options: ClaudeCodeSourceEvidenceOptions,
+    requestedLimit: number | null,
+): ClaudeCodeJsonlScanResult {
+    const projectsRoot = claudeCodeSourceEvidenceRoot(options);
+    const io = claudeCodeSourceEvidenceFileSystem(options.fileSystem);
+    const sessions: ClaudeCodeSourceSession[] = [];
+    const errors: SourceEvidenceIssue[] = [];
+    const queue = [projectsRoot];
+    let pages = 0;
+    let cursor: string | null = null;
+    let truncated = false;
+
+    while (queue.length > 0 && !truncated) {
+        const directory = queue.shift()!;
+        let entries: fs.Dirent[];
+        try {
+            entries = io.readdirSync(directory);
+            pages += 1;
+        } catch (error) {
+            pages += 1;
+            errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to enumerate ${canonicalClaudeCodeSourcePath(directory)}`));
+            cursor = claudeCodeScanCursor(projectsRoot, directory);
+            truncated = true;
+            continue;
+        }
+
+        for (const entry of [...entries].sort((left, right) => left.name.localeCompare(right.name, "en"))) {
+            const childPath = path.join(directory, entry.name);
+            if (entry.isDirectory()) {
+                queue.push(childPath);
+                continue;
+            }
+            if (!entry.isFile() || !entry.name.toLowerCase().endsWith(".jsonl")) continue;
+            sessions.push(claudeCodeSessionFromPath(projectsRoot, childPath));
+            cursor = claudeCodeScanCursor(projectsRoot, childPath);
+            if (requestedLimit !== null && sessions.length >= requestedLimit) {
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    return {
+        sessions,
+        errors: uniqueClaudeCodeSourceEvidenceIssues(errors),
+        pagination: {
+            cursor: truncated ? cursor || `jsonl:${projectsRoot.replace(/\\/gu, "/")}` : null,
+            pages,
+            limit: requestedLimit,
+            truncated,
+        },
+        enumerationComplete: !truncated && errors.length === 0,
+    };
+}
+
+function claudeCodeSourceRevisionForSession(session: ClaudeCodeSourceSession, stat: fs.Stats): {
+    revision: string;
+    contentCursor: string | null;
+    eventWatermark: string | null;
+} {
+    const fingerprint = claudeCodeStatFingerprint(stat);
+    return {
+        revision: sourceEvidenceDigest(`claude-code-jsonl-session\u0000${session.jsonlPath}\u0000${fingerprint}`),
+        contentCursor: null,
+        eventWatermark: `stat:${fingerprint}`,
+    };
+}
+
+function claudeCodeSourceRevisionForScan(
+    projectsRoot: string,
+    sessions: ClaudeCodeSourceSession[],
+    io: ClaudeCodeSourceEvidenceFileSystem,
+): { revision: string; contentCursor: string | null; eventWatermark: string | null } {
+    const entries: string[] = [];
+    for (const session of sessions) {
+        try {
+            const stat = io.statSync(session.jsonlPath);
+            entries.push(`${session.jsonlPath}\u0000${claudeCodeStatFingerprint(stat)}`);
+        } catch {
+            entries.push(`${session.jsonlPath}\u0000unreadable`);
+        }
+    }
+    entries.sort((left, right) => left.localeCompare(right, "en"));
+    const watermark = sourceEvidenceDigest(entries.join("\n"));
+    return {
+        revision: sourceEvidenceDigest(`claude-code-jsonl-root\u0000${projectsRoot}\u0000${watermark}`),
+        contentCursor: null,
+        eventWatermark: watermark,
+    };
+}
+
+function claudeCodeSourceIdentity(
+    options: ClaudeCodeSourceEvidenceOptions,
+    session: ClaudeCodeSourceSession | null,
+): {
+    workspace: { workspaceId: string; canonicalPath: string | null };
+    source: { kind: "filesystem"; authority: string; authoritativeRoot: string; canonicalPath: string | null };
+    conversationId: string;
+} {
+    const projectsRoot = claudeCodeSourceEvidenceRoot(options);
+    const workspacePath = options.workspacePath
+        ? canonicalClaudeCodeSourcePath(options.workspacePath)
+        : (session ? session.projectPath : null);
+    return {
+        workspace: {
+            workspaceId: options.workspaceId?.trim() || workspacePath || projectsRoot,
+            canonicalPath: workspacePath,
+        },
+        source: {
+            kind: "filesystem",
+            authority: "claude-code-jsonl",
+            authoritativeRoot: projectsRoot,
+            canonicalPath: session?.jsonlPath || null,
+        },
+        conversationId: options.conversationId.trim(),
+    };
+}
+
+function claudeCodePaginationForIncompleteRead(
+    pagination: { cursor: string | null; pages: number; limit: number | null; truncated: boolean },
+    filePath: string,
+): { cursor: string | null; pages: number; limit: number | null; truncated: boolean } {
+    return {
+        cursor: pagination.cursor || `jsonl:${canonicalClaudeCodeSourcePath(filePath).replace(/\\/gu, "/")}`,
+        pages: Math.max(1, pagination.pages),
+        limit: pagination.limit,
+        truncated: true,
+    };
+}
+
+function isClaudeCodeSourceCacheBypassed(options: ClaudeCodeSourceEvidenceOptions): boolean {
+    return options.cacheBypassed !== false;
+}
+
+function cacheOnlyWarning(options: ClaudeCodeSourceEvidenceOptions): SourceEvidenceIssue[] {
+    return isClaudeCodeSourceCacheBypassed(options)
+        ? []
+        : [{ code: "cache_only", message: "Claude Code source evidence was requested without a cache bypass" }];
+}
+
+function limitReachedWarning(scan: ClaudeCodeJsonlScanResult): SourceEvidenceIssue[] {
+    return scan.pagination.limit !== null && scan.pagination.truncated
+        ? [{ code: "limit_reached", message: `Claude Code JSONL enumeration reached limit ${scan.pagination.limit}` }]
+        : [];
+}
+
+export function enumerateClaudeCodeSourceEvidence(
+    options: ClaudeCodeSourceEvidenceOptions,
+): ClaudeCodeSourceEnumerationResult {
+    const startedAt = claudeCodeSourceEvidenceNow(options);
+    const scanId = claudeCodeSourceEvidenceScanId(options);
+    const limit = claudeCodeSourceEvidenceLimit(options.limit);
+    const scan = scanClaudeCodeSourceJsonl(options, limit);
+    const matches = scan.sessions.filter((session) => session.conversationId === options.conversationId);
+    const session = matches.length === 1 ? matches[0] : null;
+    const duplicateIssue = matches.length > 1
+        ? [{ code: "source_unavailable" as const, message: `Multiple Claude Code JSONL files match conversation ${options.conversationId}` }]
+        : [];
+    const errors = uniqueClaudeCodeSourceEvidenceIssues([...scan.errors, ...duplicateIssue]);
+    const io = claudeCodeSourceEvidenceFileSystem(options.fileSystem);
+    let sourceRevision = claudeCodeSourceRevisionForScan(claudeCodeSourceEvidenceRoot(options), scan.sessions, io);
+    if (session) {
+        try {
+            sourceRevision = claudeCodeSourceRevisionForSession(session, io.statSync(session.jsonlPath));
+        } catch (error) {
+            errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to stat enumerated JSONL ${session.jsonlPath}`));
+        }
+    }
+    const enumerationComplete = scan.enumerationComplete && errors.length === 0;
+    const targetStatus = session
+        ? "present" as const
+        : (enumerationComplete ? "absent" as const : "unknown" as const);
+    const completedAt = claudeCodeSourceEvidenceNow(options);
+    const enumeration = buildSourceEnumerationEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "claude-code",
+        identity: claudeCodeSourceIdentity(options, session),
+        sourceRevision,
+        pagination: {
+            ...scan.pagination,
+            truncated: scan.pagination.truncated || errors.length > 0,
+            cursor: scan.pagination.truncated || errors.length > 0
+                ? scan.pagination.cursor || `jsonl:${claudeCodeSourceEvidenceRoot(options).replace(/\\/gu, "/")}`
+                : null,
+        },
+        enumerationComplete,
+        cacheBypassed: isClaudeCodeSourceCacheBypassed(options),
+        exactFetchResult: targetStatus === "present" ? "present" : (targetStatus === "absent" ? "not_found" : "unresolved"),
+        errors,
+        warnings: uniqueClaudeCodeSourceEvidenceIssues([
+            ...cacheOnlyWarning(options),
+            ...limitReachedWarning(scan),
+        ]),
+        observedAt: {
+            scanId,
+            sequence: options.sequence || 1,
+            startedAt: startedAt.toISOString(),
+            completedAt: completedAt.toISOString(),
+        },
+        targetStatus,
+    });
+    return { enumeration, session, sessions: scan.sessions };
+}
+
+function probeClaudeCodeSourceFile(
+    session: ClaudeCodeSourceSession,
+    stat: fs.Stats,
+    io: ClaudeCodeSourceEvidenceFileSystem,
+): void {
+    const fileDescriptor = io.openSync(session.jsonlPath, "r");
+    try {
+        if (stat.size <= 0) return;
+        const probe = Buffer.allocUnsafe(1);
+        const bytesRead = io.readSync(fileDescriptor, probe, 0, 1, 0);
+        if (bytesRead !== 1) {
+            const error = Object.assign(new Error(`Expected one probe byte, received ${bytesRead}`), { code: "EIO" });
+            throw error;
+        }
+    } finally {
+        io.closeSync(fileDescriptor);
+    }
+}
+
+export function fetchClaudeCodeSourceEvidence(
+    options: ClaudeCodeSourceEvidenceOptions,
+): ClaudeCodeExactFetchResult {
+    const startedAt = claudeCodeSourceEvidenceNow(options);
+    const scanId = claudeCodeSourceEvidenceScanId(options);
+    const scan = scanClaudeCodeSourceJsonl(options, null);
+    const matches = scan.sessions.filter((session) => session.conversationId === options.conversationId);
+    const session = matches.length === 1 ? matches[0] : null;
+    const io = claudeCodeSourceEvidenceFileSystem(options.fileSystem);
+    const errors = [...scan.errors];
+    let exactFetchResult: "present" | "not_found" | "unresolved";
+    let sourceRevision = claudeCodeSourceRevisionForScan(claudeCodeSourceEvidenceRoot(options), scan.sessions, io);
+
+    if (matches.length > 1) {
+        exactFetchResult = "unresolved";
+        errors.push({ code: "source_unavailable", message: `Multiple Claude Code JSONL files match conversation ${options.conversationId}` });
+    } else if (!scan.enumerationComplete) {
+        exactFetchResult = "unresolved";
+    } else if (!session) {
+        exactFetchResult = "not_found";
+    } else {
+        try {
+            const before = io.statSync(session.jsonlPath);
+            probeClaudeCodeSourceFile(session, before, io);
+            const after = io.statSync(session.jsonlPath);
+            sourceRevision = claudeCodeSourceRevisionForSession(session, after);
+            if (!sameClaudeCodeStat(before, after)) {
+                exactFetchResult = "unresolved";
+                errors.push({ code: "revision_drift", message: `Claude Code JSONL changed during exact fetch: ${session.jsonlPath}` });
+            } else {
+                exactFetchResult = "present";
+            }
+        } catch (error) {
+            exactFetchResult = "unresolved";
+            errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to exact-fetch ${session.jsonlPath}`));
+        }
+    }
+
+    const finalErrors = uniqueClaudeCodeSourceEvidenceIssues(errors);
+    const complete = scan.enumerationComplete && finalErrors.length === 0;
+    const pagination = finalErrors.length > 0
+        ? claudeCodePaginationForIncompleteRead(scan.pagination, session?.jsonlPath || claudeCodeSourceEvidenceRoot(options))
+        : scan.pagination;
+    const completedAt = claudeCodeSourceEvidenceNow(options);
+    return {
+        exactFetch: buildExactFetchEvidence({
+            adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+            host: "claude-code",
+            identity: claudeCodeSourceIdentity(options, session),
+            sourceRevision,
+            pagination,
+            enumerationComplete: complete,
+            cacheBypassed: isClaudeCodeSourceCacheBypassed(options),
+            exactFetchResult,
+            errors: finalErrors,
+            warnings: cacheOnlyWarning(options),
+            observedAt: {
+                scanId,
+                sequence: (options.sequence || 1) + 1,
+                startedAt: startedAt.toISOString(),
+                completedAt: completedAt.toISOString(),
+            },
+        }),
+        session,
+    };
+}
+
+interface ClaudeCodeSourceForwardScan {
+    byteLength: number;
+    contentHash: string;
+    roundRange: { start: number; end: number };
+    messages: ClaudeCodeSourceContentMessage[];
+    truncated: boolean;
+    errors: SourceEvidenceIssue[];
+}
+
+interface ClaudeCodeTailMeaningfulEvent {
+    role: "user" | "assistant";
+    startOffset: number;
+    endOffset: number;
+    text: string;
+}
+
+function claudeCodeSourceReadChunkBytes(options: ClaudeCodeSourceEvidenceOptions): number {
+    const value = options.readChunkBytes ?? CLAUDE_JSONL_READ_CHUNK_BYTES;
+    if (!Number.isSafeInteger(value) || value < 1 || value > 16 * 1024 * 1024) {
+        throw new Error("Claude Code source evidence readChunkBytes must be between 1 and 16777216");
+    }
+    return value;
+}
+
+function claudeCodeSourceMaxLineBytes(options: ClaudeCodeSourceEvidenceOptions): number {
+    const value = options.maxLineBytes ?? CLAUDE_JSONL_MAX_LINE_CHARS;
+    if (!Number.isSafeInteger(value) || value < 1 || value > 64 * 1024 * 1024) {
+        throw new Error("Claude Code source evidence maxLineBytes must be between 1 and 67108864");
+    }
+    return value;
+}
+
+function readClaudeCodeChunk(
+    io: ClaudeCodeSourceEvidenceFileSystem,
+    fileDescriptor: number,
+    length: number,
+    position: number,
+): Buffer {
+    const buffer = Buffer.allocUnsafe(length);
+    let totalRead = 0;
+    while (totalRead < length) {
+        const bytesRead = io.readSync(fileDescriptor, buffer, totalRead, length - totalRead, position + totalRead);
+        if (bytesRead <= 0) break;
+        totalRead += bytesRead;
+    }
+    return totalRead === buffer.length ? buffer : buffer.subarray(0, totalRead);
+}
+
+function scanClaudeCodeSourceForward(
+    session: ClaudeCodeSourceSession,
+    io: ClaudeCodeSourceEvidenceFileSystem,
+    expectedBytes: number,
+    chunkBytes: number,
+    maxLineBytes: number,
+): ClaudeCodeSourceForwardScan {
+    const errors: SourceEvidenceIssue[] = [];
+    const contentHash = createHash("sha256");
+    let fileDescriptor: number | null = null;
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let discardingOversizedLine = false;
+    let lineNumber = 0;
+    let round = 0;
+    let bytesReadTotal = 0;
+    let pendingCompactBoundary: PendingCompactBoundary | null = null;
+    let truncated = false;
+    const messages: ClaudeCodeSourceContentMessage[] = [];
+
+    const recordOversizedLine = () => {
+        errors.push({
+            code: "parse_error",
+            message: `JSONL line ${lineNumber + 1} exceeds ${maxLineBytes} bytes at ${session.jsonlPath}`,
+        });
+    };
+    const processLine = (lineBuffer: Buffer, currentLineNumber: number) => {
+        const withoutCarriageReturn = lineBuffer.length > 0 && lineBuffer[lineBuffer.length - 1] === 13
+            ? lineBuffer.subarray(0, lineBuffer.length - 1)
+            : lineBuffer;
+        const line = withoutCarriageReturn.toString("utf8");
+        if (!line.trim()) return;
+        let event: any;
+        try {
+            event = JSON.parse(line);
+        } catch (error) {
+            errors.push(claudeCodeSourceEvidenceParseIssue(session.jsonlPath, currentLineNumber, error));
+            return;
+        }
+        if (isClaudeCodeCompactBoundary(event)) {
+            pendingCompactBoundary = compactBoundaryFromEvent(event, currentLineNumber);
+            return;
+        }
+        const rawContent = event?.message?.content;
+        const extracted = extractMessageContent(rawContent, event?.cwd);
+        if (extracted.truncated) {
+            truncated = true;
+            errors.push({
+                code: "limit_reached",
+                message: `Claude Code content at JSONL line ${currentLineNumber} was truncated to ${CLAUDE_TEXT_FIELD_MAX_CHARS} characters`,
+            });
+        }
+        if (event?.type === "assistant") {
+            if (!claudeCodeToolOnlyMessageContent(rawContent)) {
+                messages.push({
+                    role: "assistant",
+                    text: extracted.text,
+                    ...(extracted.attachments.length > 0 ? { attachments: claudeCodeSourceEvidenceAttachments(extracted.attachments) } : {}),
+                });
+            }
+            return;
+        }
+        if (event?.type !== "user") return;
+        if (isClaudeCodeCompactSummaryEvent(event, pendingCompactBoundary)) {
+            pendingCompactBoundary = null;
+            return;
+        }
+        if (claudeCodeToolOnlyMessageContent(rawContent)) return;
+        if (extracted.toolResults.length > 0 && !extracted.text && extracted.attachments.length === 0) return;
+        round += 1;
+        messages.push({
+            role: "user",
+            text: extracted.text,
+            ...(extracted.attachments.length > 0 ? { attachments: claudeCodeSourceEvidenceAttachments(extracted.attachments) } : {}),
+        });
+    };
+    const consumeChunk = (chunk: Buffer) => {
+        let cursor = 0;
+        while (cursor < chunk.length) {
+            if (discardingOversizedLine) {
+                const newlineIndex = chunk.indexOf(10, cursor);
+                if (newlineIndex < 0) return;
+                lineNumber += 1;
+                discardingOversizedLine = false;
+                cursor = newlineIndex + 1;
+                continue;
+            }
+            const newlineIndex = chunk.indexOf(10, cursor);
+            if (newlineIndex < 0) {
+                const tail = chunk.subarray(cursor);
+                if (pending.length + tail.length > maxLineBytes) {
+                    recordOversizedLine();
+                    pending = Buffer.alloc(0);
+                    discardingOversizedLine = true;
+                } else {
+                    pending = pending.length > 0 ? Buffer.concat([pending, tail]) : Buffer.from(tail);
+                }
+                return;
+            }
+            const linePart = chunk.subarray(cursor, newlineIndex);
+            if (pending.length + linePart.length > maxLineBytes) {
+                recordOversizedLine();
+            } else {
+                const completeLine = pending.length > 0 ? Buffer.concat([pending, linePart]) : linePart;
+                processLine(completeLine, lineNumber + 1);
+            }
+            pending = Buffer.alloc(0);
+            lineNumber += 1;
+            cursor = newlineIndex + 1;
+        }
+    };
+
+    try {
+        fileDescriptor = io.openSync(session.jsonlPath, "r");
+        while (bytesReadTotal < expectedBytes) {
+            const requested = Math.min(chunkBytes, expectedBytes - bytesReadTotal);
+            const chunk = readClaudeCodeChunk(io, fileDescriptor, requested, bytesReadTotal);
+            if (chunk.length === 0) {
+                errors.push({ code: "source_unavailable", message: `Unexpected EOF while reading ${session.jsonlPath}` });
+                break;
+            }
+            contentHash.update(chunk);
+            bytesReadTotal += chunk.length;
+            consumeChunk(chunk);
+            if (chunk.length < requested) {
+                errors.push({ code: "source_unavailable", message: `Short read while reading ${session.jsonlPath}` });
+                break;
+            }
+        }
+        if (!discardingOversizedLine && pending.length > 0) {
+            lineNumber += 1;
+            processLine(pending, lineNumber);
+        }
+    } catch (error) {
+        errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to stream-read ${session.jsonlPath}`));
+    } finally {
+        if (fileDescriptor !== null) {
+            try {
+                io.closeSync(fileDescriptor);
+            } catch (error) {
+                errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to close ${session.jsonlPath}`));
+            }
+        }
+    }
+
+    return {
+        byteLength: bytesReadTotal,
+        contentHash: `sha256:${contentHash.digest("hex")}`,
+        roundRange: { start: 1, end: Math.max(round, 1) },
+        messages,
+        truncated,
+        errors: uniqueClaudeCodeSourceEvidenceIssues(errors),
+    };
+}
+
+function isClaudeCodeReverseCompactSummary(event: any, text: string): boolean {
+    return event?.isCompactSummary === true
+        || text.startsWith("This session is being continued from a previous conversation that ran out of context.");
+}
+
+function scanClaudeCodeMeaningfulTailReverse(
+    session: ClaudeCodeSourceSession,
+    io: ClaudeCodeSourceEvidenceFileSystem,
+    expectedBytes: number,
+    chunkBytes: number,
+    maxLineBytes: number,
+): { contentCursor: string; eventWatermark: string; errors: SourceEvidenceIssue[] } {
+    const errors: SourceEvidenceIssue[] = [];
+    const events: ClaudeCodeTailMeaningfulEvent[] = [];
+    let fileDescriptor: number | null = null;
+    let position = expectedBytes;
+    let pending: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+    let discardingOversizedLine = false;
+    let foundUserBoundary = false;
+
+    const processLine = (lineBuffer: Buffer, startOffset: number, endOffset: number): boolean => {
+        if (lineBuffer.length === 0 || lineBuffer.length > maxLineBytes) return false;
+        const withoutCarriageReturn = lineBuffer[lineBuffer.length - 1] === 13
+            ? lineBuffer.subarray(0, lineBuffer.length - 1)
+            : lineBuffer;
+        const line = withoutCarriageReturn.toString("utf8");
+        if (!line.trim()) return false;
+        let event: any;
+        try {
+            event = JSON.parse(line);
+        } catch {
+            return false;
+        }
+        const extracted = extractMessageContent(event?.message?.content, event?.cwd);
+        if (event?.type === "assistant" && extracted.text) {
+            events.push({ role: "assistant", startOffset, endOffset, text: extracted.text });
+            return false;
+        }
+        if (event?.type !== "user" || isClaudeCodeReverseCompactSummary(event, extracted.text)) return false;
+        if (extracted.toolResults.length > 0 && !extracted.text) return false;
+        if (!extracted.text) return false;
+        events.push({ role: "user", startOffset, endOffset, text: extracted.text });
+        return true;
+    };
+
+    try {
+        fileDescriptor = io.openSync(session.jsonlPath, "r");
+        reverseScan: while (position > 0 && !foundUserBoundary) {
+            const start = Math.max(0, position - chunkBytes);
+            let chunk = readClaudeCodeChunk(io, fileDescriptor, position - start, start);
+            if (chunk.length !== position - start) {
+                errors.push({ code: "source_unavailable", message: `Short reverse read while reading ${session.jsonlPath}` });
+                break;
+            }
+            if (discardingOversizedLine) {
+                const newlineIndex = chunk.lastIndexOf(10);
+                if (newlineIndex < 0) {
+                    position = start;
+                    continue;
+                }
+                chunk = chunk.subarray(0, newlineIndex + 1);
+                pending = Buffer.alloc(0);
+                discardingOversizedLine = false;
+            }
+            const combined = pending.length > 0 ? Buffer.concat([chunk, pending]) : chunk;
+            let lineEnd = combined.length;
+            while (lineEnd > 0) {
+                const newlineIndex = combined.lastIndexOf(10, lineEnd - 1);
+                if (newlineIndex < 0) break;
+                const line = combined.subarray(newlineIndex + 1, lineEnd);
+                const lineStartOffset = start + newlineIndex + 1;
+                const lineEndOffset = start + lineEnd;
+                if (processLine(line, lineStartOffset, lineEndOffset)) {
+                    foundUserBoundary = true;
+                    break reverseScan;
+                }
+                lineEnd = newlineIndex;
+            }
+            pending = combined.subarray(0, lineEnd);
+            if (pending.length > maxLineBytes) {
+                pending = Buffer.alloc(0);
+                discardingOversizedLine = true;
+            }
+            position = start;
+        }
+        if (!foundUserBoundary && position === 0 && !discardingOversizedLine && pending.length > 0) {
+            processLine(pending, 0, pending.length);
+        }
+    } catch (error) {
+        errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to reverse-read ${session.jsonlPath}`));
+    } finally {
+        if (fileDescriptor !== null) {
+            try {
+                io.closeSync(fileDescriptor);
+            } catch (error) {
+                errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to close reverse read ${session.jsonlPath}`));
+            }
+        }
+    }
+
+    const chronological = [...events].sort((left, right) => left.startOffset - right.startOffset);
+    const latest = chronological[chronological.length - 1];
+    return {
+        contentCursor: sourceEvidenceDigest(chronological.map((event) =>
+            `${event.role}\u0000${event.startOffset}\u0000${event.endOffset}\u0000${event.text}`).join("\n")),
+        eventWatermark: latest ? `byte:${latest.endOffset}` : "byte:0",
+        errors: uniqueClaudeCodeSourceEvidenceIssues(errors),
+    };
+}
+
+function scanClaudeCodeSourceContent(
+    session: ClaudeCodeSourceSession,
+    io: ClaudeCodeSourceEvidenceFileSystem,
+    options: ClaudeCodeSourceEvidenceOptions,
+    expectedBytes: number,
+): ClaudeCodeSourceContentScan {
+    const chunkBytes = claudeCodeSourceReadChunkBytes(options);
+    const maxLineBytes = claudeCodeSourceMaxLineBytes(options);
+    const forward = scanClaudeCodeSourceForward(session, io, expectedBytes, chunkBytes, maxLineBytes);
+    const tail = scanClaudeCodeMeaningfulTailReverse(session, io, expectedBytes, chunkBytes, maxLineBytes);
+    return {
+        byteLength: forward.byteLength,
+        contentHash: forward.contentHash,
+        contentCursor: tail.contentCursor,
+        eventWatermark: tail.eventWatermark,
+        roundRange: forward.roundRange,
+        messages: forward.messages,
+        truncated: forward.truncated,
+        errors: uniqueClaudeCodeSourceEvidenceIssues([...forward.errors, ...tail.errors]),
+    };
+}
+
+export function readClaudeCodeFullSourceEvidence(
+    options: ClaudeCodeSourceEvidenceOptions,
+    enumerationResult?: ClaudeCodeSourceEnumerationResult,
+    exactFetchResult?: ClaudeCodeExactFetchResult,
+): ClaudeCodeFullSourceReadResult {
+    const sharedOptions = options.scanId ? options : { ...options, scanId: claudeCodeSourceEvidenceScanId(options) };
+    const enumerationResultValue = enumerationResult || enumerateClaudeCodeSourceEvidence(sharedOptions);
+    const exactFetchResultValue = exactFetchResult || fetchClaudeCodeSourceEvidence(sharedOptions);
+    const enumeration = enumerationResultValue.enumeration;
+    const exactFetch = exactFetchResultValue.exactFetch;
+    const session = exactFetchResultValue.session || enumerationResultValue.session;
+    if (!session || exactFetch.exactFetchResult !== "present") {
+        return { fullSourceRead: null, snapshot: null, reason: "exact-fetch-not-present" };
+    }
+    const preReadClassification = classifySourceEvidence({ enumeration, exactFetch });
+    if (["identity-mismatch", "revision-drift", "scan-mismatch", "enumeration-exact-contradiction", "adapter-error"].includes(preReadClassification.reason)) {
+        return { fullSourceRead: null, snapshot: null, reason: preReadClassification.reason };
+    }
+
+    const startedAt = claudeCodeSourceEvidenceNow(sharedOptions);
+    const io = claudeCodeSourceEvidenceFileSystem(sharedOptions.fileSystem);
+    let before: fs.Stats | null = null;
+    let after: fs.Stats | null = null;
+    const errors: SourceEvidenceIssue[] = [];
+    try {
+        before = io.statSync(session.jsonlPath);
+    } catch (error) {
+        errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to stat before full read ${session.jsonlPath}`));
+    }
+    const content = scanClaudeCodeSourceContent(session, io, sharedOptions, before?.size || 0);
+    errors.push(...content.errors);
+    try {
+        after = io.statSync(session.jsonlPath);
+    } catch (error) {
+        errors.push(claudeCodeSourceEvidenceIssue(error, `Unable to stat after full read ${session.jsonlPath}`));
+    }
+    if (before && after && !sameClaudeCodeStat(before, after)) {
+        errors.push({ code: "revision_drift", message: `Claude Code JSONL changed during full read: ${session.jsonlPath}` });
+    }
+    if (after && claudeCodeSourceRevisionForSession(session, after).revision !== exactFetch.sourceRevision.revision) {
+        errors.push({ code: "revision_drift", message: `Claude Code JSONL revision changed after exact fetch: ${session.jsonlPath}` });
+    }
+    const finalErrors = uniqueClaudeCodeSourceEvidenceIssues([...enumeration.errors, ...exactFetch.errors, ...errors]);
+    const enumerationComplete = enumeration.enumerationComplete
+        && exactFetch.enumerationComplete
+        && !content.truncated
+        && finalErrors.length === 0;
+    const cacheBypassed = enumeration.cacheBypassed && exactFetch.cacheBypassed && isClaudeCodeSourceCacheBypassed(sharedOptions);
+    const sourceRevision = after
+        ? {
+            ...claudeCodeSourceRevisionForSession(session, after),
+            contentCursor: content.contentCursor,
+            eventWatermark: content.eventWatermark,
+        }
+        : exactFetch.sourceRevision;
+    const pagination = enumerationComplete
+        ? { cursor: null, pages: Math.max(enumeration.pagination.pages, exactFetch.pagination.pages, 1), limit: null, truncated: false }
+        : claudeCodePaginationForIncompleteRead(enumeration.pagination, session.jsonlPath);
+    if (!cacheBypassed) {
+        return { fullSourceRead: null, snapshot: null, reason: "cache-not-bypassed" };
+    }
+    const completedAt = claudeCodeSourceEvidenceNow(sharedOptions);
+    const fullSourceRead = buildFullSourceReadEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "claude-code",
+        identity: claudeCodeSourceIdentity(sharedOptions, session),
+        sourceRevision,
+        pagination,
+        enumerationComplete,
+        cacheBypassed,
+        exactFetchResult: "present",
+        errors: finalErrors,
+        warnings: uniqueClaudeCodeSourceEvidenceIssues([
+            ...enumeration.warnings,
+            ...exactFetch.warnings,
+            ...cacheOnlyWarning(sharedOptions),
+        ]),
+        observedAt: {
+            scanId: exactFetch.observedAt.scanId,
+            sequence: exactFetch.observedAt.sequence + 1,
+            startedAt: startedAt.toISOString(),
+            completedAt: completedAt.toISOString(),
+        },
+        content: {
+            mode: "full",
+            byteLength: content.byteLength,
+            contentHash: content.contentHash,
+            roundRange: content.roundRange,
+            truncated: false,
+            staleCache: !cacheBypassed,
+        },
+    });
+    const eligibleForSnapshot = fullSourceRead.enumerationComplete
+        && fullSourceRead.cacheBypassed
+        && fullSourceRead.errors.length === 0
+        && !fullSourceRead.content.truncated
+        && !fullSourceRead.content.staleCache;
+    if (!eligibleForSnapshot) {
+        return {
+            fullSourceRead,
+            snapshot: null,
+            reason: "full-read-not-complete",
+            ...(content.truncated ? { contentTruncated: true } : {}),
+            sourceMessages: content.messages,
+        };
+    }
+    return {
+        fullSourceRead,
+        snapshot: buildRecordSourceSnapshot({
+            snapshotId: sharedOptions.snapshotId?.trim() || `claude-code:${sharedOptions.conversationId}:${fullSourceRead.evidenceHash}`,
+            fullSourceRead,
+        }),
+        reason: null,
+        ...(content.truncated ? { contentTruncated: true } : {}),
+        sourceMessages: content.messages,
+    };
+}
+
+export function inspectClaudeCodeSourceEvidence(
+    options: ClaudeCodeSourceEvidenceOptions,
+): ClaudeCodeSourceEvidenceResult {
+    const scanId = claudeCodeSourceEvidenceScanId(options);
+    const sharedOptions = { ...options, scanId };
+    const enumerationResult = enumerateClaudeCodeSourceEvidence(sharedOptions);
+    const exactFetchResult = fetchClaudeCodeSourceEvidence(sharedOptions);
+    const fullReadResult = readClaudeCodeFullSourceEvidence(sharedOptions, enumerationResult, exactFetchResult);
+    const baseClassification = classifySourceEvidence({
+        enumeration: enumerationResult.enumeration,
+        exactFetch: exactFetchResult.exactFetch,
+    });
+    const fullRead = fullReadResult.fullSourceRead;
+    const classification = fullRead?.errors.some((issue) => issue.code === "revision_drift")
+        ? { state: "Unresolved" as const, reason: "revision-drift" as const }
+        : (fullRead?.errors.length
+            ? { state: "Unresolved" as const, reason: "adapter-error" as const }
+            : (!fullRead && fullReadResult.reason === "cache-not-bypassed" && baseClassification.state === "Present"
+                ? { state: "Unresolved" as const, reason: "cache-not-bypassed" as const }
+                : (fullRead && !fullRead.enumerationComplete && baseClassification.state === "Present"
+                ? {
+                    state: "Unresolved" as const,
+                    reason: fullRead.pagination.limit !== null ? "pagination-limit" as const : "enumeration-incomplete" as const,
+                }
+                : baseClassification)));
+    return {
+        enumeration: enumerationResult.enumeration,
+        exactFetch: exactFetchResult.exactFetch,
+        fullSourceRead: fullReadResult.fullSourceRead,
+        snapshot: fullReadResult.snapshot,
+        classification,
+        session: exactFetchResult.session || enumerationResult.session,
+        ...(fullReadResult.contentTruncated ? { contentTruncated: true } : {}),
+        sourceMessages: fullReadResult.sourceMessages,
+    };
+}
+
+export const enumerateClaudeCodeSource = enumerateClaudeCodeSourceEvidence;
+export const exactFetchClaudeCodeSource = fetchClaudeCodeSourceEvidence;
+export const readClaudeCodeSource = readClaudeCodeFullSourceEvidence;

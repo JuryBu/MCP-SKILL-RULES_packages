@@ -29,7 +29,7 @@ action:
 - overview (默认): 系统资源 + 活跃会话 + 临时文件
 - envs: 可用语言环境列表（Python/Node/conda/bash）
 - gpu: GPU/CUDA/DirectML 详细信息
-- gc: 不传 gcScope 时清理过期临时文件；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务默认不自动执行 council GC；先用 dryRun 审核，确认后再显式 apply。仅设置 SANDBOX_COUNCIL_AUTO_GC=1 才会在启动时 apply 托管 artifact（includeLegacy=false）并按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;
+- gc: 不传 gcScope 时清理过期临时文件；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务启动会自动先 apply 托管 council artifact（includeLegacy=false），再按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;
     const handleStatus = async (params: Record<string, unknown>) => {
             const startTime = Date.now();
             touchActivity();

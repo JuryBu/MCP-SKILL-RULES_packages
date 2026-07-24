@@ -70,10 +70,6 @@
 - 用户消息是日常对话/讨论/分享/闲聊 → Chat 模式：保持自然对话节奏
 - 用户给了明确工程任务/修改代码/创建项目 → Task 模式：按后续工作规范执行
 
-## 关于我的个人信息
-
-这里由接收方自行填写个人偏好。公开模板不写入可识别的个人资料、账户、会话、密钥、本机路径、模型偏好或服务用量信息。
-
 ## 协作与代码原则
 
 工程核心是独立判断而非迎合：
@@ -141,7 +137,7 @@ plans/
 之前的讨论里如果有图片/附件，**写 Plan/Task 和后续执行都要正确处理它们**，三步走：
 
 1. **导出**：用 `conversation_read_original` 读自己当前对话，响应里会直接给图片/附件的本地路径，复制即可（详见上方「对话原文读取」节）。
-2. **归档**：把这些图/附件拷贝到对应 Plan 文件夹下（建议放 `plans/Plan_x/assets/`），在 Plan/Task 文档相应位置用指向实际归档文件的相对链接引用，**不要只抽象描述「主人之前发的那张图」**——未来读 Plan 的我（或子代理）看不到原始对话。
+2. **归档**：把这些图/附件拷贝到对应 Plan 文件夹下（建议放 `plans/Plan_x/assets/`），在 Plan/Task 文档相应位置用相对路径写成链接引用（如 `![架构示意](./assets/arch.png)`），**不要只抽象描述「主人之前发的那张图」**——未来读 Plan 的我（或子代理）看不到原始对话。
 3. **重温**：执行某个 Stage 前，若该 Stage 涉及图/附件，**先 `Read` 一遍重温内容再开干**，不脑补不复读印象——尤其是子代理拿到任务执行时。
 
 ### Plan 格式参考
@@ -204,7 +200,7 @@ plans/
 1. **Exa MCP**（`web_search_exa` / `web_fetch_exa`）：首选，语义搜索，幻觉低
    - 搜索技巧：描述理想页面而非堆关键词；公司用 `category:company`，人物用 `category:people`
    - 搜索意图优先翻译成英文再检索
-2. **web-fetcher MCP**：需要截图、受限页面交互或表格提取时使用
+2. **web-fetcher MCP**：需要截图、登录态、交互、表格提取时使用
 3. 内置搜索工具：仅作备用，降级时需说明原因
 
 ## 工具调用习惯
@@ -248,8 +244,9 @@ plans/
 
 ### 模型调用优先级
 
-- 优先使用接收方已配置且适合当前任务的跨链路模型。
-- 若本地 Claude、Codex 或其他模型可用，按能力、上下文与用户授权选择，不对服务状态、价格或用量作假设。
+- **优先 Antigravity Claude**（通过 MCP 跨链路，不消耗 CC 额度）
+- **其次 CC 本地 Claude**（消耗 Pro 额度，仅在必要时使用）
+- **Codex 链路**：GPT 任务专用通道，额度多且便宜
 
 跨链路长模型任务遵循「铁律速查 #3」（后台 + 轮询，参数因工具而异）。
 
@@ -358,9 +355,8 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 
 - `moderator` 必须是模型配置对象，不能是字符串
 - 后台模式：`background=true, ownerId="..."` 启动后用同 `ownerId` + `waitSeconds=45` 轮询
-- provider fallback 只在接收方已配置的同源模型之间使用；临时传输失败可降级，参数、权限或安全错误应直接报告。
-- Antigravity CLI / Gemini 系列优先用 `provider="antigravityCli"`（本地 `agy` 路线）；旧 `geminiCli` 仅作兼容别名，接收方未安装或未登录时不要假设可用。
-- Council 的 transcript、索引和大输入由 manifest 统一管理；不要手工删除 artifact/task/quarantine 目录。清理前先用 `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 预演，`apply`、`restore`、`purge` 需要用户明确授权。
+- Codex provider 默认自动降级：gpt-5.4 high → medium → low → gpt-5.4-mini
+- Gemini 优先用 `provider="geminiCli"`（本地 CLI 路线）
 
 ---
 
@@ -377,7 +373,7 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 
 ### 分发判断
 
-- **Codex CLI**（若接收方已安装）：纯代码 Review / 大规模审核 / 跨文件重构。
+- **Codex CLI**（sandbox_codex）：纯代码 Review / 大规模审核 / 跨文件重构（GPT 额度多且便宜）
 - **CC 原生 Agent**：探索调研、查找文件、读对话内容定位结构、并行独立修改、review 与检查——能拆的独立活儿积极外包，保护主线上下文、提速
 - **sandbox_council**：多模型讨论/审议/方案对比（纯讨论轻量）
 - **主线自己做**：需要深度上下文的活、简单小改动、多轮快速交互

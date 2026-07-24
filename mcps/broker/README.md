@@ -9,7 +9,9 @@ Endpoints:
 - `http://127.0.0.1:14588/sandbox/mcp`
 - `http://127.0.0.1:14588/playwright/mcp`
 - `http://127.0.0.1:14588/sequential-thinking/mcp`
-- `http://127.0.0.1:14588/exa/mcp`
+- `http://127.0.0.1:14588/exa/mcp` (optional remote URL)
+- `http://127.0.0.1:14588/subagent/mcp` (Windsurf-only backend)
+- `http://127.0.0.1:14588/napcat/mcp` (optional; disabled by default)
 
 The daemon keeps Codex config stable with `url` transports while it manages backend stdio MCP child processes internally.
 
@@ -44,6 +46,12 @@ Exa stateless bridge:
 - `/exa/mcp` starts `exa-stateless-stdio.mjs`, a small stdio MCP bridge that forwards calls to `EXA_MCP_REMOTE_URL` (or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`).
 - The bridge uses the MCP SDK bundled with the portable `memory-store` package, returns a local fallback tool list when remote listing is disabled or unavailable, and retries transient network failures within its configured request deadline.
 - Configure optional behavior with `EXA_STATELESS_LIST_TIMEOUT_MS`, `EXA_STATELESS_CALL_TIMEOUT_MS`, `EXA_STATELESS_MAX_ATTEMPTS`, `EXA_STATELESS_CALL_MAX_ATTEMPTS`, `EXA_STATELESS_LIST_MAX_ATTEMPTS`, `EXA_STATELESS_RETRY_DELAY_MS`, and `EXA_STATELESS_REMOTE_TOOLS_LIST=1`.
+
+NapCat QQ group bridge:
+
+- `/napcat/mcp` is added only when `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP=1`; the source package remains inert otherwise.
+- The receiver must install NapCat separately, provide a loopback `NAPCAT_HTTP_URL`, keep `NAPCAT_ACCESS_TOKEN` private, and place a receiver-owned fixed-group binding below `%USERPROFILE%\.codex-toolkit\napcat-mcp` or set `NAPCAT_MCP_BINDING_PATH` explicitly.
+- The broker never bundles QQ login state, a real binding, heartbeat state, QR codes, or NapCat binaries. See `../napcat-mcp/README.md`.
 
 Local secrets:
 

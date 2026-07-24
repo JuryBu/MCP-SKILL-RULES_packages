@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
+import type { RecordSchedulerAdmissionReceipt } from "./record-scheduler-contracts.js";
 
-export type BackgroundTaskStatus = "running" | "done" | "error" | "cancelled";
+export type BackgroundTaskStatus = "running" | "suspended" | "done" | "error" | "cancelled";
 
 export interface BackgroundTaskProgress {
     stage?: string;
@@ -20,6 +21,11 @@ export type ResumePayloadValue =
     | ResumePayloadValue[]
     | { [key: string]: ResumePayloadValue };
 
+export interface RecordSchedulerTaskEnvelope {
+    admission: RecordSchedulerAdmissionReceipt;
+    projection?: ResumePayloadValue;
+}
+
 export interface RecoveryCandidateTask {
     id: string;
     kind: string;
@@ -28,6 +34,10 @@ export interface RecoveryCandidateTask {
     updatedAt: string;
     finishedAt?: string;
     deadlineAt?: string;
+    wakeAt?: string;
+    waitingReason?: string;
+    suspensionRevision?: number;
+    suspensionLedgerRevision?: number;
     maxRunMs?: number;
     timedOut?: boolean;
     progress?: BackgroundTaskProgress;
@@ -36,6 +46,7 @@ export interface RecoveryCandidateTask {
     resumePayload?: ResumePayloadValue;
     resumeVersion?: number;
     resumeHash?: string;
+    schedulerAdmission?: RecordSchedulerTaskEnvelope;
     recovered?: boolean;
     recoveredFrom?: string;
     recoveredBy?: string;

@@ -5,7 +5,11 @@ import path from "path";
 import { promisify } from "util";
 import { callGetModelResponseDetailed as callLsModelDetailed, isLsAvailable } from "./ls-client.js";
 import { normalizeChain, type Chain } from "./chain.js";
+import { callAgyWithFallback, type AgyAttempt } from "./agy-client.js";
 import { callGrokExec, isGrokBridgeAvailable, mapGrokMaxTokens, mapGrokModel, type GrokContext, type GrokExecDiagnostics, type GrokTrafficClass } from "./grok-client.js";
+import { getProviderTransportAdapter, mapProviderTrafficClass, type ProviderTransportLease, type ProviderTransportSettlementKind } from "./provider-transport-adapter.js";
+import type { ProviderTrafficClass } from "./provider-control-contracts.js";
+import type { FailureClass } from "./record-scheduler-contracts.js";
 
 const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
@@ -22,13 +26,18 @@ const CC_DEFAULT_EFFORT = process.env.MEMORY_STORE_CC_EFFORT || "medium";
 const CC_DEFAULT_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CC_MODEL_TIMEOUT_MS || 3 * 60_000);
 const CC_MAX_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CC_MAX_TIMEOUT_MS || Math.max(CC_DEFAULT_TIMEOUT_MS, 8 * 60_000));
 const CC_OUTPUT_MAX_BYTES = Number(process.env.MEMORY_STORE_CC_OUTPUT_MAX_BYTES || 2 * 1024 * 1024);
+const AGY_STATUS_TTL = 60_000;
 
 let codexAvailableCache: boolean | null = null;
 let codexAvailableAt = 0;
 let ccAvailableCache: boolean | null = null;
 let ccAvailableAt = 0;
+let agyAvailableCache: boolean | null = null;
+let agyAvailableAt = 0;
 
 type ResolvedChain = Exclude<Chain, "auto">;
+
+export type ModelBridgeRetryStrategy = "provider-fallback-exhausted";
 
 export interface ModelBridgeResult {
     text: string | null;
@@ -38,24 +47,35 @@ export interface ModelBridgeResult {
     timedOut?: boolean;
     cancelled?: boolean;
     grokDiagnostics?: GrokExecDiagnostics;
+    failureClass?: FailureClass;
+    retryStrategy?: ModelBridgeRetryStrategy;
+    agyAttempts?: readonly AgyAttempt[];
 }
 
 export interface CodexExecResult {
     text: string | null;
     error?: string;
     timedOut?: boolean;
+    failureClass?: FailureClass;
 }
 
 export interface ClaudeCodeExecResult {
     text: string | null;
     error?: string;
     timedOut?: boolean;
+    failureClass?: FailureClass;
 }
 
 export interface ModelBridgeOptions {
     allowClaudeCodeFallback?: boolean;
+    agyCommand?: string;
+    agyCommandArgs?: readonly string[];
     grokContext?: GrokContext;
     trafficClass?: GrokTrafficClass;
+    providerTrafficClass?: ProviderTrafficClass;
+    providerLease?: ProviderTransportLease;
+    attemptId?: string;
+    idempotencyKey?: string;
     antigravityModelOverride?: string;
     shouldCancel?: () => boolean;
     signal?: AbortSignal;
@@ -70,12 +90,26 @@ function isModelBridgeCancelled(options: ModelBridgeOptions): boolean {
     }
 }
 
+async function cancelUnusedProviderLease(lease: ProviderTransportLease | undefined): Promise<string | null> {
+    if (!lease) return null;
+    try {
+        await getProviderTransportAdapter().cancel(lease);
+        return null;
+    } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+    }
+}
+
 function getCodexCommand(): string {
     return process.env.MEMORY_STORE_CODEX_COMMAND || "codex";
 }
 
 function getClaudeCodeCommand(): string {
     return process.env.MEMORY_STORE_CC_COMMAND || "claude";
+}
+
+function getAgyCommand(options: Pick<ModelBridgeOptions, "agyCommand"> = {}): string {
+    return options.agyCommand || process.env.MEMORY_STORE_AGY_COMMAND || "agy";
 }
 
 function quoteForCmd(arg: string): string {
@@ -149,6 +183,107 @@ export async function isClaudeCodeBridgeAvailable(): Promise<boolean> {
 
     ccAvailableAt = now;
     return ccAvailableCache;
+}
+
+function probeAgyCommand(command: string, commandArgs: readonly string[] = []): Promise<void> {
+    const signal = AbortSignal.timeout(8_000);
+    return getProviderTransportAdapter().execute(
+        "agy",
+        { trafficClass: "foreground", signal, probe: true },
+        () => new Promise((resolve, reject) => {
+            let child;
+            try {
+                child = spawn(command, [...commandArgs, "--help"], {
+                    stdio: "ignore",
+                    shell: false,
+                    windowsHide: true,
+                });
+            } catch (error) {
+                reject(error);
+                return;
+            }
+
+            let settled = false;
+            const finish = (error?: Error) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timeout);
+                if (error) reject(error);
+                else resolve();
+            };
+            const timeout = setTimeout(() => {
+                try {
+                    child.kill();
+                } catch {
+                    // ignore probe kill failure
+                }
+                finish(new Error("agy --help probe timed out"));
+            }, 8_000);
+            timeout.unref?.();
+            child.once("error", error => finish(error));
+            child.once("close", code => {
+                if (code === 0) finish();
+                else finish(new Error(`agy --help exited with code ${code ?? "unknown"}`));
+            });
+        }),
+        () => "success",
+        error => classifyAgyProbeError(error),
+    );
+}
+
+function classifyAgyProbeError(error: unknown): ProviderTransportSettlementKind {
+    return error instanceof Error && /timed out/u.test(error.message) ? "unknown" : "availability";
+}
+
+export async function isAgyBridgeAvailable(options: Pick<ModelBridgeOptions, "agyCommand" | "agyCommandArgs"> = {}): Promise<boolean> {
+    const now = Date.now();
+    const canUseCache = !options.agyCommand;
+    if (canUseCache && agyAvailableCache !== null && now - agyAvailableAt < AGY_STATUS_TTL) {
+        return agyAvailableCache;
+    }
+
+    let available = false;
+    try {
+        await probeAgyCommand(getAgyCommand(options), options.agyCommandArgs);
+        available = true;
+    } catch {
+        available = false;
+    }
+
+    if (canUseCache) {
+        agyAvailableCache = available;
+        agyAvailableAt = now;
+    }
+    return available;
+}
+
+function isAgyAutoEnabled(): boolean {
+    return process.env.MEMORY_STORE_AGY_AUTO_ENABLED === "1";
+}
+
+function createAgyCancellationBridge(options: ModelBridgeOptions): { signal: AbortSignal; dispose: () => void } {
+    const controller = new AbortController();
+    const abort = () => {
+        if (!controller.signal.aborted) controller.abort();
+    };
+    const onAbort = () => abort();
+    if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
+    if (isModelBridgeCancelled(options)) abort();
+
+    const cancelPoller = options.shouldCancel && !controller.signal.aborted
+        ? setInterval(() => {
+            if (isModelBridgeCancelled(options)) abort();
+        }, 50)
+        : undefined;
+    cancelPoller?.unref?.();
+
+    return {
+        signal: controller.signal,
+        dispose: () => {
+            if (cancelPoller) clearInterval(cancelPoller);
+            options.signal?.removeEventListener("abort", onAbort);
+        },
+    };
 }
 
 function previewStderr(stderr: string): string {
@@ -307,9 +442,13 @@ export async function resolveModelChainCandidates(
     if (chain === "grok") {
         return (await isGrokBridgeAvailable()) ? ["grok"] : [];
     }
+    if (chain === "agy") {
+        return (await isAgyBridgeAvailable(options)) ? ["agy"] : [];
+    }
 
     const candidates: ResolvedChain[] = [];
     if (await isGrokBridgeAvailable()) candidates.push("grok");
+    if (isAgyAutoEnabled() && await isAgyBridgeAvailable(options)) candidates.push("agy");
     if (await isLsAvailable()) candidates.push("antigravity");
     if (await isCodexBridgeAvailable()) candidates.push("codex");
     if (options.allowClaudeCodeFallback && await isClaudeCodeBridgeAvailable()) candidates.push("claude-code");
@@ -380,8 +519,8 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            const finalResult = timedOut && !result.timedOut
-                ? { ...result, timedOut: true, error: result.error || "Codex 模型桥超时" }
+            const finalResult = timedOut
+                ? { ...result, timedOut: true, error: result.error || "Codex 模型桥超时", failureClass: "Availability" as const }
                 : result;
             try {
                 cleanupOutputFile(outputPath);
@@ -403,7 +542,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             timedOut = true;
             console.error(`[model-bridge] Codex bridge timeout pid=${child.pid ?? "?"} timeoutMs=${effectiveTimeoutMs} outputPath=${outputPath}`);
             if (!child.pid) {
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
                 return;
             }
             killTreePending = true;
@@ -411,7 +550,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
                 killTreePending = false;
                 const byOutputPath = await killProcessesByOutputPath(outputPath);
                 killTreeResult = [message, byOutputPath].filter(Boolean).join("; ");
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
             });
         }, effectiveTimeoutMs);
 
@@ -428,7 +567,7 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         });
 
         child.on("error", (err) => {
-            finish({ text: null, error: `Codex 模型桥启动失败: ${err.message}` });
+            finish({ text: null, error: `Codex 模型桥启动失败: ${err.message}`, failureClass: "Availability" });
         });
 
         child.on("close", (code) => {
@@ -436,17 +575,18 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             closeCode = code;
             if (timedOut) {
                 if (killTreePending) return;
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
                 return;
             }
 
             let fileText: string | null = null;
+            let outputReadError: unknown;
             try {
                 if (fs.existsSync(outputPath)) {
                     fileText = fs.readFileSync(outputPath, "utf-8").trim();
                 }
-            } catch {
-                // ignore read failure
+            } catch (error) {
+                outputReadError = error;
             }
 
             const text = fileText || extractLastAgentText(stdout);
@@ -461,14 +601,20 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             }
 
             if (code === 0) {
-                finish({ text: null, error: "Codex 模型桥输出为空" });
+                if (outputReadError) {
+                    const detail = outputReadError instanceof Error ? `: ${outputReadError.message}` : "";
+                    finish({ text: null, error: `Codex 模型桥输出文件读取失败${detail}`, failureClass: "Availability" });
+                    return;
+                }
+                finish({ text: null, error: "Codex 模型桥输出为空", failureClass: "Quality" });
                 return;
             }
 
             const stderrSummary = previewStderr(stderr);
             finish({
-                text: text || null,
+                text: null,
                 error: stderrSummary ? `Codex 模型桥调用失败: ${stderrSummary}` : `Codex 模型桥调用失败，退出码 ${code}`,
+                failureClass: "Availability",
             });
             })();
         });
@@ -509,7 +655,7 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
             );
         } catch (err) {
             const message = err instanceof Error ? err.message : String(err);
-            resolve({ text: null, error: `Claude Code CLI 模型桥启动失败: ${message}` });
+            resolve({ text: null, error: `Claude Code CLI 模型桥启动失败: ${message}`, failureClass: "Availability" });
             return;
         }
 
@@ -525,8 +671,8 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            const finalResult = timedOut && !result.timedOut
-                ? { ...result, timedOut: true, error: result.error || "Claude Code CLI 模型桥超时" }
+            const finalResult = timedOut
+                ? { ...result, timedOut: true, error: result.error || "Claude Code CLI 模型桥超时", failureClass: "Availability" as const }
                 : result;
             const stderrSummary = previewStderr(stderr);
             if (finalResult.error) {
@@ -543,14 +689,14 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
         const timer = setTimeout(() => {
             timedOut = true;
             if (!child.pid) {
-                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true, failureClass: "Availability" });
                 return;
             }
             killTreePending = true;
             void killProcessTree(child.pid).then((message) => {
                 killTreePending = false;
                 killTreeResult = message;
-                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true, failureClass: "Availability" });
             });
         }, effectiveTimeoutMs);
 
@@ -571,14 +717,14 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
         });
 
         child.on("error", (err) => {
-            finish({ text: null, error: `Claude Code CLI 模型桥启动失败: ${err.message}` });
+            finish({ text: null, error: `Claude Code CLI 模型桥启动失败: ${err.message}`, failureClass: "Availability" });
         });
 
         child.on("close", (code) => {
             closeCode = code;
             if (timedOut) {
                 if (killTreePending) return;
-                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true });
+                finish({ text: null, error: "Claude Code CLI 模型桥超时", timedOut: true, failureClass: "Availability" });
                 return;
             }
             const text = stdout.trim();
@@ -587,13 +733,14 @@ export async function callClaudeCodeExec(prompt: string, model: string, timeoutM
                 return;
             }
             if (code === 0) {
-                finish({ text: null, error: "Claude Code CLI 模型桥输出为空" });
+                finish({ text: null, error: "Claude Code CLI 模型桥输出为空", failureClass: "Quality" });
                 return;
             }
             const stderrSummary = previewStderr(stderr);
             finish({
-                text: text || null,
+                text: null,
                 error: stderrSummary ? `Claude Code CLI 模型桥调用失败: ${stderrSummary}` : `Claude Code CLI 模型桥调用失败，退出码 ${code}`,
+                failureClass: "Availability",
             });
         });
 
@@ -609,37 +756,60 @@ export async function callModelResponse(
     timeoutMs: number = 30_000,
     options: ModelBridgeOptions = {},
 ): Promise<ModelBridgeResult> {
+    try {
     if (isModelBridgeCancelled(options)) {
-        return { text: null, chainUsed: null, error: "模型调用已取消", cancelled: true };
+        const releaseError = await cancelUnusedProviderLease(options.providerLease);
+        return {
+            text: null,
+            chainUsed: null,
+            error: releaseError ? `模型调用已取消；预授予 provider lease 回收失败: ${releaseError}` : "模型调用已取消",
+            cancelled: true,
+        };
     }
     const rawChain = String(chain || "auto").trim().toLowerCase();
     if (rawChain === "windsurf" || rawChain === "wsf") {
         return {
             text: null,
             chainUsed: null,
-            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code|grok",
+            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code|grok|agy",
         };
     }
     const resolvedChain = normalizeChain(chain as string);
-    const candidates = await resolveModelChainCandidates(resolvedChain, options);
+    if (options.providerLease && resolvedChain !== "auto" && resolvedChain !== options.providerLease.provider) {
+        const releaseError = await cancelUnusedProviderLease(options.providerLease);
+        return {
+            text: null,
+            chainUsed: null,
+            error: `预授予 provider=${options.providerLease.provider} lease 不能用于 modelChain=${resolvedChain}`
+                + (releaseError ? `；lease 回收失败: ${releaseError}` : ""),
+        };
+    }
+    const candidates = options.providerLease
+        ? [options.providerLease.provider]
+        : await resolveModelChainCandidates(resolvedChain, options);
     if (candidates.length === 0) {
         return {
             text: null,
             chainUsed: null,
             error: resolvedChain === "auto"
-                ? (options.allowClaudeCodeFallback ? "Grok、Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用" : "Grok、Antigravity LS 与 Codex 模型桥当前都不可用")
+                ? (options.allowClaudeCodeFallback ? "Grok、agy CLI、Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用" : "Grok、agy CLI、Antigravity LS 与 Codex 模型桥当前都不可用")
                 : resolvedChain === "codex"
                     ? "Codex CLI 不可用或模型桥不可用"
                     : resolvedChain === "claude-code"
                         ? "Claude Code CLI 不可用或模型桥不可用"
                         : resolvedChain === "grok"
                             ? "Grok 模型桥不可用或 progrok proxy 不可用"
+                            : resolvedChain === "agy"
+                                ? "agy CLI 不可用或 --help 检查失败"
                             : `指定链路 ${resolvedChain} 当前不可用`,
+            failureClass: "Availability",
         };
     }
 
     const errors: string[] = [];
     let grokDiagnostics: GrokExecDiagnostics | undefined;
+    let singleCandidateFailureClass: FailureClass | undefined;
+    const providerTrafficClass = mapProviderTrafficClass(options.providerTrafficClass || options.trafficClass);
     for (const resolved of candidates) {
         if (isModelBridgeCancelled(options)) {
             return { text: null, chainUsed: null, error: "模型调用已取消", cancelled: true };
@@ -650,10 +820,15 @@ export async function callModelResponse(
             const result = await callGrokExec(prompt, grokModel, timeoutMs, mapGrokMaxTokens(grokContext), {
                 context: grokContext,
                 trafficClass: options.trafficClass,
+                providerTrafficClass,
+                providerLease: options.providerLease,
+                attemptId: options.attemptId,
+                idempotencyKey: options.idempotencyKey,
                 shouldCancel: options.shouldCancel,
                 signal: options.signal,
             });
             grokDiagnostics = result.diagnostics;
+            if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "grok", modelUsed: grokModel, grokDiagnostics: result.diagnostics };
             if (result.cancelled) {
                 return {
@@ -662,6 +837,7 @@ export async function callModelResponse(
                     modelUsed: grokModel,
                     error: result.error || "Grok 模型桥调用已取消",
                     cancelled: true,
+                    failureClass: result.failureClass,
                     grokDiagnostics: result.diagnostics,
                 };
             }
@@ -673,7 +849,64 @@ export async function callModelResponse(
                     modelUsed: grokModel,
                     error: result.error || "Grok 模型桥超时",
                     timedOut: true,
+                    failureClass: result.failureClass,
                     grokDiagnostics: result.diagnostics,
+                };
+            }
+            continue;
+        }
+
+        if (resolved === "agy") {
+            const cancellationBridge = createAgyCancellationBridge(options);
+            const result = await (async () => {
+                try {
+                    return await callAgyWithFallback(prompt, {
+                        command: options.agyCommand,
+                        commandArgs: options.agyCommandArgs,
+                        timeoutMs,
+                        signal: cancellationBridge.signal,
+                        trafficClass: providerTrafficClass,
+                        providerLease: options.providerLease,
+                        attemptId: options.attemptId,
+                    });
+                } finally {
+                    cancellationBridge.dispose();
+                }
+            })();
+            if (result.text) return { text: result.text, chainUsed: "agy", modelUsed: result.model };
+            if (result.cancelled) {
+                return {
+                    text: null,
+                    chainUsed: "agy",
+                    modelUsed: result.model,
+                    error: result.error || "agy CLI 模型调用已取消",
+                    cancelled: true,
+                    failureClass: result.failureClass,
+                    agyAttempts: result.attempts,
+                };
+            }
+            errors.push(result.error || "agy CLI 模型调用失败");
+            if (result.timedOut && resolvedChain === "agy") {
+                return {
+                    text: null,
+                    chainUsed: null,
+                    modelUsed: result.model,
+                    error: result.error || "agy CLI 模型调用超时",
+                    timedOut: true,
+                    failureClass: result.failureClass,
+                    retryStrategy: "provider-fallback-exhausted",
+                    agyAttempts: result.attempts,
+                };
+            }
+            if (resolvedChain === "agy") {
+                return {
+                    text: null,
+                    chainUsed: null,
+                    modelUsed: result.model,
+                    error: result.error || "agy CLI 模型调用失败",
+                    failureClass: result.failureClass,
+                    retryStrategy: "provider-fallback-exhausted",
+                    agyAttempts: result.attempts,
                 };
             }
             continue;
@@ -682,6 +915,7 @@ export async function callModelResponse(
         if (resolved === "antigravity") {
             const lsModel = options.antigravityModelOverride || model;
             const result = await callLsModelDetailed(lsModel, prompt, timeoutMs);
+            if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "antigravity", modelUsed: lsModel };
             errors.push(result.error || "Antigravity LS 模型调用失败");
             // 真超时：与 codex 分支对齐早返回，透传 timedOut 让上层区分「超时」vs「普通失败」，
@@ -693,6 +927,7 @@ export async function callModelResponse(
                     modelUsed: lsModel,
                     error: result.error || "Antigravity LS 模型调用超时",
                     timedOut: true,
+                    failureClass: result.failureClass,
                 };
             }
             continue;
@@ -700,6 +935,7 @@ export async function callModelResponse(
 
         if (resolved === "codex") {
             const result = await callCodexExec(prompt, model, timeoutMs);
+            if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
             if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: model };
             errors.push(result.error || "Codex 模型桥调用失败");
             if (result.timedOut || chain === "codex") {
@@ -709,12 +945,14 @@ export async function callModelResponse(
                     modelUsed: model,
                     error: result.error || "Codex 模型桥调用失败",
                     timedOut: result.timedOut,
+                    failureClass: result.failureClass,
                 };
             }
             continue;
         }
 
         const result = await callClaudeCodeExec(prompt, model, timeoutMs);
+        if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
         if (result.text) return { text: result.text, chainUsed: "claude-code", modelUsed: model };
         errors.push(result.error || "Claude Code CLI 模型桥调用失败");
         return {
@@ -723,6 +961,7 @@ export async function callModelResponse(
             modelUsed: model,
             error: result.error || "Claude Code CLI 模型桥调用失败",
             timedOut: result.timedOut,
+            failureClass: result.failureClass,
         };
     }
 
@@ -730,6 +969,10 @@ export async function callModelResponse(
         text: null,
         chainUsed: null,
         error: errors.join("；") || "模型桥调用失败",
+        ...(singleCandidateFailureClass ? { failureClass: singleCandidateFailureClass } : {}),
         ...(grokDiagnostics ? { grokDiagnostics } : {}),
     };
+    } finally {
+        await cancelUnusedProviderLease(options.providerLease);
+    }
 }

@@ -1,6 +1,7 @@
 param(
     [switch]$PackageClean,
-    [switch]$IncludeOptionalEndpoints
+    [switch]$IncludeOptionalEndpoints,
+    [switch]$IncludeNapCatEndpoint
 )
 
 $ErrorActionPreference = "Stop"
@@ -68,7 +69,8 @@ function Test-ForbiddenRuntimeFiles {
         "auth.json", ".cockpit_codex_auth.json", "cookies-backup.json", "localstorage-backup.json",
         "credentials.json", ".credentials.json", "token.json", "tokens.json", "broker-private.env.json",
         ".env", ".env.local", ".env.production", ".env.development", "cookies", "cookie",
-        "web data", "login data", "local state"
+        "web data", "login data", "local state", "binding.json", "heartbeat.json",
+        "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input"
     )
     $badFiles = Get-ChildItem -LiteralPath $toolkitRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
@@ -80,7 +82,7 @@ function Test-ForbiddenRuntimeFiles {
                 $lowerName -match '\.env($|\.)' -or
                 $lowerName -match '\.(cookie|cookies|session)$' -or
                 $_.Name -match '\.(sqlite|sqlite3|db)(-wal|-shm)?$' -or
-                $_.Name -match '\.(jsonl|har|vscdb|pb|pem|key|p12|pfx|log|bak)$' -or
+                $_.Name -match '\.(jsonl|har|vscdb|pb|pem|key|p12|pfx|log|bak|zip|7z|exe|dll)$' -or
                 $_.Name -like "*.before-*"
             )
         }
@@ -99,7 +101,7 @@ function Test-ExcludedDirectories {
         "web-fetcher-profiles", "user-data-dir", "playwright-report", "test-results", "cookies",
         "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp",
         "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
-        "council-large-inputs", "council-model-calls", "agy-runtime"
+        "council-large-inputs", "council-model-calls", "agy-runtime", "state", "napcat-runtime"
     )
     if ($StrictPackage) {
         $names += @("node_modules", "dist", "build", "coverage")
@@ -127,7 +129,7 @@ function Test-PackageRootAllowList {
 
 function Test-PackageStructure {
     Write-Output "Checking package structure..."
-    foreach ($name in @("memory-store", "web-fetcher", "sandbox", "broker", "mcp-subagent")) {
+    foreach ($name in @("memory-store", "web-fetcher", "sandbox", "broker", "mcp-subagent", "napcat-mcp")) {
         $pkg = Join-Path $mcpRoot "$name\package.json"
         if (-not (Test-Path -LiteralPath $pkg)) { throw "Missing MCP source package: $pkg" }
     }
@@ -136,6 +138,10 @@ function Test-PackageStructure {
         if (-not $packageJson.scripts.'test:portable') { throw "Missing portable build test script: $name" }
         $scriptText = $packageJson.scripts | ConvertTo-Json -Compress
         if ($scriptText -match 'tests[/\\]') { throw "Public package exposes an internal test path that is not bundled: $name" }
+    }
+    $napcatPackage = Get-Content -LiteralPath (Join-Path $mcpRoot "napcat-mcp\package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+    if (-not $napcatPackage.scripts.check -or -not $napcatPackage.scripts.test) {
+        throw "NapCat source package must expose both syntax and unit-test scripts."
     }
 
     foreach ($path in @(
@@ -148,8 +154,8 @@ function Test-PackageStructure {
         if (-not (Test-Path -LiteralPath $full)) { throw "Missing Sandbox Council lifecycle source: $full" }
     }
     $sandboxPaths = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\sandbox\src\council\paths.ts") -Raw -Encoding UTF8
-    if (-not $sandboxPaths.Contains("process.env.SANDBOX_DATA_ROOT")) {
-        throw "Portable Sandbox Council paths must follow SANDBOX_DATA_ROOT instead of the source tree."
+    if (-not $sandboxPaths.Contains('import { TEMP_DIR } from "../temp-store.js"') -or -not $sandboxPaths.Contains("configuredRuntimeTempRoot() || TEMP_DIR")) {
+        throw "Portable Sandbox Council paths must follow the shared temp-store data root instead of the source tree."
     }
 
     foreach ($path in @(
@@ -163,6 +169,11 @@ function Test-PackageStructure {
         "rules\windsurf\system_rules\collaboration.template.md",
         "rules\windsurf\system_rules\efficiency.template.md",
         "rules\windsurf\system_rules\rendering.template.md",
+        "mcps\napcat-mcp\binding.example.json",
+        "mcps\napcat-mcp\heartbeat.example.json",
+        "mcps\napcat-mcp\ops\start-napcat-login.ps1",
+        "mcps\napcat-mcp\ops\start-napcat-heartbeat.ps1",
+        "mcps\napcat-mcp\test\core.test.mjs",
         "skills\skills_manifest.md",
         "templates\config.codex.toml",
         "templates\env.example.ps1"
@@ -172,7 +183,7 @@ function Test-PackageStructure {
     }
 
     $allowedSkills = @(
-        "algorithmic-art", "brand-guidelines", "canvas-design", "frontend-design", "imagegen",
+        "algorithmic-art", "brand-guidelines", "canvas-design", "frontend-design", "hatch-pet", "imagegen",
         "internal-comms", "jupyter-notebook", "mcp-builder", "pdf", "playwright", "screenshot",
         "skill-creator", "slack-gif-creator", "theme-factory", "webapp-testing", "web-artifacts-builder"
     )
@@ -193,7 +204,7 @@ function Test-PackageStructure {
     }
     Write-Output "Portable skills verified: $($skillDirs.Count)"
 
-    foreach ($jsonPath in @("templates\config.antigravity.example.json", "templates\config.claude.example.json", "templates\config.windsurf.example.json", "templates\config.windsurf.subagent.example.json")) {
+    foreach ($jsonPath in @("templates\config.antigravity.example.json", "templates\config.claude.example.json", "templates\config.windsurf.example.json", "templates\config.windsurf.subagent.example.json", "mcps\napcat-mcp\binding.example.json", "mcps\napcat-mcp\heartbeat.example.json")) {
         $jsonFullPath = Join-Path $toolkitRoot $jsonPath
         $jsonText = Get-Content -LiteralPath $jsonFullPath -Raw -Encoding UTF8
         if ($jsonText.Length -gt 0 -and [int]$jsonText[0] -eq 0xFEFF) { throw "JSON template contains a UTF-8 BOM: $jsonFullPath" }
@@ -203,6 +214,7 @@ function Test-PackageStructure {
     foreach ($requiredBlock in @("[mcp_servers.memory-store]", "[mcp_servers.web-fetcher]", "[mcp_servers.sandbox]")) {
         if (-not $codexConfig.Contains($requiredBlock)) { throw "Codex config template missing block: $requiredBlock" }
     }
+    if (-not $codexConfig.Contains("[mcp_servers.napcat]")) { throw "Codex config template missing optional NapCat block." }
 }
 
 Test-PrivatePatterns
@@ -242,6 +254,7 @@ try {
 
 if (-not $env:CODEX_TOOLKIT_MCP_BASE_URL) { $env:CODEX_TOOLKIT_MCP_BASE_URL = "http://127.0.0.1:$port" }
 if ($IncludeOptionalEndpoints) { $env:CODEX_TOOLKIT_SMOKE_OPTIONAL = "1" }
+if ($IncludeNapCatEndpoint) { $env:CODEX_TOOLKIT_SMOKE_NAPCAT = "1" }
 node (Join-Path $toolkitRoot "design-tests\smoke-mcp-http.mjs")
 if ($LASTEXITCODE -ne 0) { throw "MCP HTTP smoke test failed with exit code $LASTEXITCODE" }
 

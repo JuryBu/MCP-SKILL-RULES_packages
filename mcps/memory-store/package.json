@@ -1,9 +1,15 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.19.3",
+  "version": "1.21.1",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、四数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "README.md",
+    "CHANGELOG.md"
+  ],
   "scripts": {
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",

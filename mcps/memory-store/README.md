@@ -1,4 +1,6 @@
-# MCP Memory Store v1.19.3
+# MCP Memory Store v1.21.1
+
+v1.21.1 在 v1.19.3 的批量筛选与账本基础上补充生产级 Record 调度、来源证据、启动屏障、提交协议、provider admission/control、AGY 路由、未知链路迁移和后台任务暂停恢复。下文保留 v1.19.3+ 的兼容行为说明。
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。
 

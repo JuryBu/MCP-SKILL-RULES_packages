@@ -2,7 +2,7 @@
   "name": "mcp-subagent",
   "version": "1.1.0",
   "private": true,
-  "description": "Windsurf-only optional async sub-agent MCP server (spawn/poll/collect/interrupt/dispose)",
+  "description": "Windsurf-private async sub-agent MCP server (spawn/poll/collect/interrupt/dispose)",
   "type": "module",
   "main": "src/index.js",
   "scripts": {
@@ -41,8 +41,7 @@
     "smoke:plan4-archive": "node scripts/smoke-plan4-archive.js"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.6.1",
-    "zod": "^4.4.3"
+    "@modelcontextprotocol/sdk": "^1.6.1"
   },
   "engines": {
     "node": ">=18"

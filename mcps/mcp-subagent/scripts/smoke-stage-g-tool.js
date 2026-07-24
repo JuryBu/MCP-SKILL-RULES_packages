@@ -1,11 +1,8 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { subagentCollect, subagentDispose, subagentPoll, subagentSpawn, waitForJobDone } from "../src/tools.js";
-
-const projectRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const readmePath = path.join(projectRoot, "README.md");
+import { fileURLToPath } from "node:url";
 
 const mainId = process.argv[2];
+const readmePath = fileURLToPath(new URL("../README.md", import.meta.url));
 
 if (!mainId) {
   console.error("usage: node scripts/smoke-stage-g-tool.js <main_id>");
@@ -19,7 +16,7 @@ function parseResult(result) {
 const spawned = parseResult(await subagentSpawn({
   prompt: [
     "Stage G tool-output smoke：你必须真实读取当前仓库文件后再回答。",
-    `请读取 \`${readmePath}\`，确认 README 里是否出现 \`subagent_cleanup\`。`,
+    `请读取 ${JSON.stringify(readmePath)}，确认 README 里是否出现 \`subagent_cleanup\`。`,
     "",
     "最终回复必须满足：",
     "1. 第一行写 `STAGE_G_TOOL_RESULT`",

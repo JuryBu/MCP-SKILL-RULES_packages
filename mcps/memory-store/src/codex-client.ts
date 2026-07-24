@@ -8,9 +8,24 @@ import { promisify } from "util";
 import type { ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
+    buildExactFetchEvidence,
+    buildFullSourceReadEvidence,
+    buildRecordSourceSnapshot,
+    buildSourceEnumerationEvidence,
+    canonicalSerialize,
+    type ExactFetchEvidence,
+    type FullSourceReadEvidence,
+    type RecordSourceSnapshot,
+    type SourceConversationIdentity,
+    type SourceEvidenceIssue,
+    type SourceEnumerationEvidence,
+    type SourceRevision,
+} from "./source-evidence-contracts.js";
+import {
     extractCodexEventUserAttachments,
     extractCodexMessageAttachments,
     mergeRoundAttachments,
+    type ConversationAttachment,
 } from "./conversation-attachments.js";
 
 export interface CodexThreadInfo {
@@ -893,13 +908,22 @@ export async function resolveCurrentCodexThreadIdAsync(cwd: string = process.cwd
 
 function extractText(items: any[]): string {
     return (items || [])
-        .filter((item: any) => typeof item?.text === "string")
-        .map((item: any) => item.text)
+        .map((item: any) => extractTextFromCodexContentItem(item))
         .join("");
 }
 
 function extractTextFromCodexContentItem(item: any): string {
-    return typeof item?.text === "string" ? item.text : "";
+    if (typeof item?.text === "string") return item.text;
+    const itemType = typeof item?.type === "string" ? item.type.trim() : "";
+    const imageUrl = typeof item?.image_url === "string"
+        ? item.image_url
+        : typeof item?.imageUrl === "string"
+            ? item.imageUrl
+            : typeof item?.url === "string"
+                ? item.url
+                : "";
+    if (itemType === "input_image" && imageUrl) return "";
+    return `[Codex 未识别内容块：type=${(itemType || "untyped").slice(0, 120)}]`;
 }
 
 function sha256Short(text: string): string {
@@ -2347,4 +2371,965 @@ export async function loadCodexConversationAsync(
         expandedChildren,
         childDiagnostics,
     };
+}
+
+export interface CodexSourceEvidencePaths {
+    stateDbPath?: string;
+    rolloutRoots?: string[];
+}
+
+export interface CodexSourceEvidenceOptions {
+    conversationId: string;
+    workspace: {
+        workspaceId: string;
+        canonicalPath: string | null;
+    };
+    scanId: string;
+    sequence: number;
+    cacheBypassed?: boolean;
+    enumerationLimit?: number;
+    paths?: CodexSourceEvidencePaths;
+    now?: () => Date;
+}
+
+export interface CodexSourceEnumerationResult {
+    evidence: SourceEnumerationEvidence;
+    threads: CodexThreadInfo[];
+}
+
+export interface CodexSourceExactFetchResult {
+    evidence: ExactFetchEvidence;
+    thread: CodexThreadInfo | null;
+    parentThread: CodexThreadInfo | null;
+}
+
+export interface CodexSourceContentMessage {
+    role: "user" | "assistant";
+    text: string;
+    attachments?: ConversationAttachment[];
+}
+
+export interface CodexSourceFullReadResult extends CodexSourceExactFetchResult {
+    fullSourceRead?: FullSourceReadEvidence;
+    sourceSnapshot?: RecordSourceSnapshot;
+    sourceMessages?: CodexSourceContentMessage[];
+}
+
+export interface CodexSourceEvidenceResult extends CodexSourceFullReadResult {
+    enumeration: SourceEnumerationEvidence;
+}
+
+interface CodexEvidenceDatabaseResult {
+    threads: CodexThreadInfo[];
+    parentMap: Map<string, string>;
+    errors: SourceEvidenceIssue[];
+    limitReached: boolean;
+}
+
+interface CodexEvidenceRollout {
+    rolloutPath: string;
+    conversationId: string | null;
+    sessionMeta: Record<string, unknown> | null;
+    byteLength: number;
+    revisionSequence: number | null;
+    contentCursor: string | null;
+    contentHash: string;
+    roundEnd: number;
+    messages: CodexSourceContentMessage[];
+    errors: SourceEvidenceIssue[];
+}
+
+interface CodexEvidenceScan {
+    stateDbPath: string;
+    rolloutRoots: string[];
+    allowedRolloutRoots: CodexEvidenceRolloutRoot[];
+    threads: CodexThreadInfo[];
+    parentMap: Map<string, string>;
+    rolloutsByPath: Map<string, CodexEvidenceRollout>;
+    rolloutsByConversationId: Map<string, CodexEvidenceRollout>;
+    errors: SourceEvidenceIssue[];
+    pagination: {
+        cursor: null;
+        pages: number;
+        limit: number | null;
+        truncated: boolean;
+    };
+    enumerationComplete: boolean;
+}
+
+interface CodexEvidenceRolloutRoot {
+    configuredPath: string;
+    realPath: string;
+}
+
+interface CodexEvidenceExactLookup {
+    thread: CodexThreadInfo | null;
+    parentThread: CodexThreadInfo | null;
+    errors: SourceEvidenceIssue[];
+}
+
+interface CodexEvidenceContext {
+    scan: CodexEvidenceScan;
+    exact: CodexEvidenceExactLookup;
+    exactFetchResult: "present" | "not_found" | "unresolved";
+    identity: SourceConversationIdentity;
+    sourceRevision: SourceRevision;
+    observedAt: {
+        scanId: string;
+        sequence: number;
+        startedAt: string;
+        completedAt: string;
+    };
+    cacheBypassed: boolean;
+}
+
+interface CodexEvidenceMessages {
+    messages: CodexSourceContentMessage[];
+    roundEnd: number;
+}
+
+function codexEvidenceSha256(value: unknown): string {
+    return `sha256:${createHash("sha256").update(canonicalSerialize(value), "utf8").digest("hex")}`;
+}
+
+function codexEvidenceIssue(code: SourceEvidenceIssue["code"], message: string): SourceEvidenceIssue {
+    return { code, message };
+}
+
+function codexEvidenceIoIssue(error: unknown, context: string): SourceEvidenceIssue {
+    const code = (error as NodeJS.ErrnoException | undefined)?.code;
+    return codexEvidenceIssue(
+        code === "EACCES" || code === "EPERM" ? "permission_denied" : "source_unavailable",
+        `${context}无法读取`,
+    );
+}
+
+function dedupeCodexEvidenceIssues(issues: SourceEvidenceIssue[]): SourceEvidenceIssue[] {
+    const byKey = new Map<string, SourceEvidenceIssue>();
+    for (const issue of issues) byKey.set(`${issue.code}\u0000${issue.message}`, issue);
+    return [...byKey.values()].sort((left, right) => left.code === right.code
+        ? left.message.localeCompare(right.message, "en")
+        : left.code.localeCompare(right.code, "en"));
+}
+
+function resolveCodexEvidencePaths(options: CodexSourceEvidenceOptions): { stateDbPath: string; rolloutRoots: string[]; rootsExplicit: boolean } {
+    const stateDbPath = path.resolve(options.paths?.stateDbPath || STATE_DB);
+    const rootsExplicit = options.paths?.rolloutRoots !== undefined;
+    const rolloutRoots = (options.paths?.rolloutRoots || [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR])
+        .map(root => path.resolve(root));
+    return {
+        stateDbPath,
+        rolloutRoots: [...new Set(rolloutRoots)],
+        rootsExplicit,
+    };
+}
+
+function codexEvidencePathIsWithinRoot(root: string, candidate: string): boolean {
+    const relative = path.relative(root, candidate);
+    return relative === "" || (
+        relative !== ".."
+        && !relative.startsWith(`..${path.sep}`)
+        && !path.isAbsolute(relative)
+    );
+}
+
+async function resolveCodexEvidenceRolloutRoots(
+    rolloutRoots: string[],
+    rootsExplicit: boolean,
+    issues: SourceEvidenceIssue[],
+): Promise<CodexEvidenceRolloutRoot[]> {
+    const allowedRoots: CodexEvidenceRolloutRoot[] = [];
+    if (rootsExplicit && rolloutRoots.length === 0) {
+        issues.push(codexEvidenceIssue("source_unavailable", "Codex rollout 未配置允许根目录"));
+    }
+    for (const configuredPath of rolloutRoots) {
+        try {
+            const stat = await fs.promises.stat(configuredPath);
+            if (!stat.isDirectory()) {
+                if (rootsExplicit) issues.push(codexEvidenceIssue("source_unavailable", "Codex rollout 根路径不是目录"));
+                continue;
+            }
+            const realPath = await fs.promises.realpath(configuredPath);
+            if (!allowedRoots.some(root => root.configuredPath === configuredPath && root.realPath === realPath)) {
+                allowedRoots.push({ configuredPath, realPath });
+            }
+        } catch (error) {
+            if (rootsExplicit) issues.push(codexEvidenceIoIssue(error, "Codex rollout 根目录"));
+        }
+    }
+    return allowedRoots;
+}
+
+async function authorizeCodexEvidenceRolloutPath(
+    rolloutPath: string,
+    allowedRoots: CodexEvidenceRolloutRoot[],
+): Promise<{ rolloutPath: string | null; errors: SourceEvidenceIssue[] }> {
+    const resolvedPath = path.resolve(rolloutPath);
+    const lexicalRoots = allowedRoots.filter(root => codexEvidencePathIsWithinRoot(root.configuredPath, resolvedPath));
+    if (lexicalRoots.length === 0) {
+        return {
+            rolloutPath: null,
+            errors: [codexEvidenceIssue("source_unavailable", "Codex state SQLite rollout 路径不在配置的允许根目录内")],
+        };
+    }
+    let realPath: string;
+    try {
+        realPath = await fs.promises.realpath(resolvedPath);
+    } catch (error) {
+        return {
+            rolloutPath: null,
+            errors: [codexEvidenceIoIssue(error, "Codex state SQLite rollout 文件")],
+        };
+    }
+    if (!lexicalRoots.some(root => codexEvidencePathIsWithinRoot(root.realPath, realPath))) {
+        return {
+            rolloutPath: null,
+            errors: [codexEvidenceIssue("source_unavailable", "Codex state SQLite rollout 实路径越出配置的允许根目录")],
+        };
+    }
+    try {
+        const stat = await fs.promises.stat(realPath);
+        if (!stat.isFile()) {
+            return {
+                rolloutPath: null,
+                errors: [codexEvidenceIssue("source_unavailable", "Codex state SQLite rollout 路径不是文件")],
+            };
+        }
+    } catch (error) {
+        return {
+            rolloutPath: null,
+            errors: [codexEvidenceIoIssue(error, "Codex state SQLite rollout 文件")],
+        };
+    }
+    return { rolloutPath: realPath, errors: [] };
+}
+
+async function authorizeCodexEvidenceThread(
+    thread: CodexThreadInfo | null,
+    allowedRoots: CodexEvidenceRolloutRoot[],
+): Promise<{ thread: CodexThreadInfo | null; errors: SourceEvidenceIssue[] }> {
+    if (!thread) return { thread: null, errors: [] };
+    const authorizedPath = await authorizeCodexEvidenceRolloutPath(thread.rolloutPath, allowedRoots);
+    return {
+        thread: authorizedPath.rolloutPath ? { ...thread, rolloutPath: authorizedPath.rolloutPath } : null,
+        errors: authorizedPath.errors,
+    };
+}
+
+function codexEvidenceThreadFromRow(row: unknown, parentMap: Map<string, string>): CodexThreadInfo | null {
+    if (!row || typeof row !== "object" || Array.isArray(row)) return null;
+    const fields = row as Record<string, unknown>;
+    const id = typeof fields.id === "string" ? fields.id : "";
+    const rolloutPath = typeof fields.rollout_path === "string" ? fields.rollout_path : "";
+    if (!id || !rolloutPath) return null;
+    const updatedAtMs = typeof fields.updated_at_ms === "number" && Number.isFinite(fields.updated_at_ms)
+        ? fields.updated_at_ms
+        : null;
+    return applyCodexThreadRelations({
+        id,
+        rolloutPath,
+        cwd: typeof fields.cwd === "string" ? fields.cwd : "",
+        title: typeof fields.title === "string" ? fields.title : "",
+        sqliteTitle: typeof fields.title === "string" ? fields.title : "",
+        titleSource: "sqlite",
+        source: typeof fields.source === "string" && fields.source.trim() ? fields.source : "sqlite",
+        model: typeof fields.model === "string" ? fields.model : null,
+        reasoningEffort: typeof fields.reasoning_effort === "string" ? fields.reasoning_effort : null,
+        agentNickname: typeof fields.agent_nickname === "string" ? fields.agent_nickname : null,
+        agentRole: typeof fields.agent_role === "string" ? fields.agent_role : null,
+        updatedAtMs,
+    }, parentMap);
+}
+
+async function readCodexEvidenceDatabase(
+    stateDbPath: string,
+    enumerationLimit: number | undefined,
+): Promise<CodexEvidenceDatabaseResult> {
+    try {
+        await fs.promises.stat(stateDbPath);
+    } catch (error) {
+        return {
+            threads: [],
+            parentMap: new Map(),
+            errors: [codexEvidenceIoIssue(error, "Codex state SQLite")],
+            limitReached: false,
+        };
+    }
+    const requestedLimit = enumerationLimit && enumerationLimit > 0 ? Math.floor(enumerationLimit) : null;
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+limit = int(sys.argv[2])
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+exists = conn.execute("select name from sqlite_master where type='table' and name='threads'").fetchone()
+if not exists:
+    raise RuntimeError("threads table is missing")
+query = "select id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms from threads order by updated_at_ms desc"
+if limit >= 0:
+    query += " limit ?"
+    thread_rows = conn.execute(query, (limit + 1,)).fetchall()
+else:
+    thread_rows = conn.execute(query).fetchall()
+edge_exists = conn.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone()
+edge_rows = conn.execute("select child_thread_id, parent_thread_id from thread_spawn_edges").fetchall() if edge_exists else []
+print(json.dumps({"threads": [dict(row) for row in thread_rows], "edges": [{"child": row[0], "parent": row[1]} for row in edge_rows if row[0] and row[1]]}, ensure_ascii=False))
+`;
+    try {
+        const data = await execPythonJsonAsync(script, [stateDbPath, String(requestedLimit ?? -1)]) as unknown;
+        const fields = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+        const rawEdges = Array.isArray(fields.edges) ? fields.edges : [];
+        const parentMap = new Map<string, string>();
+        for (const edge of rawEdges) {
+            if (!edge || typeof edge !== "object" || Array.isArray(edge)) continue;
+            const edgeFields = edge as Record<string, unknown>;
+            if (typeof edgeFields.child === "string" && typeof edgeFields.parent === "string") {
+                parentMap.set(edgeFields.child, edgeFields.parent);
+            }
+        }
+        const rawThreads = Array.isArray(fields.threads) ? fields.threads : [];
+        const limitReached = requestedLimit !== null && rawThreads.length > requestedLimit;
+        const errors: SourceEvidenceIssue[] = [];
+        const threads: CodexThreadInfo[] = [];
+        for (const row of rawThreads.slice(0, requestedLimit ?? rawThreads.length)) {
+            const thread = codexEvidenceThreadFromRow(row, parentMap);
+            if (thread) {
+                threads.push(thread);
+            } else {
+                errors.push(codexEvidenceIssue("parse_error", "Codex state SQLite thread 记录缺少 id 或 rollout 路径"));
+            }
+        }
+        return { threads, parentMap, errors, limitReached };
+    } catch (error) {
+        return {
+            threads: [],
+            parentMap: new Map(),
+            errors: [codexEvidenceIoIssue(error, "Codex state SQLite")],
+            limitReached: false,
+        };
+    }
+}
+
+async function readCodexEvidenceExactThread(
+    stateDbPath: string,
+    conversationId: string,
+    allowedRoots: CodexEvidenceRolloutRoot[],
+): Promise<CodexEvidenceExactLookup> {
+    try {
+        await fs.promises.stat(stateDbPath);
+    } catch (error) {
+        return {
+            thread: null,
+            parentThread: null,
+            errors: [codexEvidenceIoIssue(error, "Codex state SQLite")],
+        };
+    }
+    const script = `
+import json, sqlite3, sys
+db_path = sys.argv[1]
+thread_id = sys.argv[2]
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+exists = conn.execute("select name from sqlite_master where type='table' and name='threads'").fetchone()
+if not exists:
+    raise RuntimeError("threads table is missing")
+columns = "id, rollout_path, cwd, title, source, model, reasoning_effort, agent_nickname, agent_role, updated_at_ms"
+thread = conn.execute(f"select {columns} from threads where id = ? limit 1", (thread_id,)).fetchone()
+edge_exists = conn.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone()
+edges = conn.execute("select child_thread_id, parent_thread_id from thread_spawn_edges").fetchall() if edge_exists else []
+parent = None
+if edge_exists:
+    parent = conn.execute(f"select t.{columns.replace(', ', ', t.')} from thread_spawn_edges e join threads t on t.id = e.parent_thread_id where e.child_thread_id = ? limit 1", (thread_id,)).fetchone()
+print(json.dumps({"thread": dict(thread) if thread else None, "parent": dict(parent) if parent else None, "edges": [{"child": row[0], "parent": row[1]} for row in edges if row[0] and row[1]]}, ensure_ascii=False))
+`;
+    try {
+        const data = await execPythonJsonAsync(script, [stateDbPath, conversationId]) as unknown;
+        const fields = data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : {};
+        const parentMap = new Map<string, string>();
+        const rawEdges = Array.isArray(fields.edges) ? fields.edges : [];
+        for (const edge of rawEdges) {
+            if (!edge || typeof edge !== "object" || Array.isArray(edge)) continue;
+            const edgeFields = edge as Record<string, unknown>;
+            if (typeof edgeFields.child === "string" && typeof edgeFields.parent === "string") {
+                parentMap.set(edgeFields.child, edgeFields.parent);
+            }
+        }
+        const [thread, parentThread] = await Promise.all([
+            authorizeCodexEvidenceThread(codexEvidenceThreadFromRow(fields.thread, parentMap), allowedRoots),
+            authorizeCodexEvidenceThread(codexEvidenceThreadFromRow(fields.parent, parentMap), allowedRoots),
+        ]);
+        return {
+            thread: thread.thread,
+            parentThread: parentThread.thread,
+            errors: dedupeCodexEvidenceIssues([...thread.errors, ...parentThread.errors]),
+        };
+    } catch (error) {
+        return {
+            thread: null,
+            parentThread: null,
+            errors: [codexEvidenceIoIssue(error, "Codex exact SQLite 查询")],
+        };
+    }
+}
+
+function codexEvidenceMessageMirrorId(event: unknown, payload: Record<string, unknown>): string | null {
+    const eventFields = event && typeof event === "object" && !Array.isArray(event)
+        ? event as Record<string, unknown>
+        : {};
+    for (const candidate of [
+        payload.message_id,
+        payload.messageId,
+        payload.item_id,
+        payload.itemId,
+        payload.id,
+        eventFields.message_id,
+        eventFields.messageId,
+        eventFields.item_id,
+        eventFields.itemId,
+    ]) {
+        if (typeof candidate === "string" && candidate.trim()) return candidate;
+    }
+    return null;
+}
+
+function codexEvidenceToolOnlyContent(content: unknown[]): boolean {
+    if (content.length === 0) return false;
+    const toolOnlyTypes = new Set([
+        "function_call",
+        "function_call_output",
+        "tool_result",
+        "custom_tool_call",
+        "custom_tool_call_output",
+        "computer_call",
+        "computer_call_output",
+    ]);
+    return content.every((item) => item && typeof item === "object" && toolOnlyTypes.has(String((item as Record<string, unknown>).type || "")));
+}
+
+function mergeCodexEvidenceAttachments(
+    current: ConversationAttachment[] | undefined,
+    incoming: ConversationAttachment[],
+): ConversationAttachment[] | undefined {
+    if (incoming.length === 0) return current;
+    const merged = [...(current || [])];
+    const keys = new Set(merged.map(attachment => `${attachment.kind}\u0000${attachment.source}\u0000${attachment.sha256 || attachment.dataUrl || attachment.originalPath || attachment.name || ""}`));
+    for (const attachment of incoming) {
+        const key = `${attachment.kind}\u0000${attachment.source}\u0000${attachment.sha256 || attachment.dataUrl || attachment.originalPath || attachment.name || ""}`;
+        if (keys.has(key)) continue;
+        keys.add(key);
+        merged.push(attachment);
+    }
+    return merged.length > 0 ? merged : undefined;
+}
+
+function codexEvidenceAttachments(attachments: ConversationAttachment[]): ConversationAttachment[] {
+    return attachments.map(attachment => Object.fromEntries(
+        Object.entries(attachment).filter(([, value]) => value !== undefined),
+    ) as ConversationAttachment);
+}
+
+function collectCodexEvidenceMessages(events: unknown[]): CodexEvidenceMessages {
+    const messages: CodexSourceContentMessage[] = [];
+    const sourceIndexesByMirrorId = new Map<string, number[]>();
+    const mirrorIdOccurrences = new Map<string, number>();
+    const ambiguousMirrorIds = new Set<string>();
+    let roundEnd = 0;
+    const add = (
+        role: "user" | "assistant",
+        rawText: string,
+        attachments: ConversationAttachment[],
+        source: "response_item" | "event_msg",
+        mirrorId: string | null,
+    ) => {
+        const text = rawText.normalize("NFC");
+        const sourceMirrorKey = mirrorId ? `${source}\u0000${role}\u0000${mirrorId}` : null;
+        const mirrorIdentity = mirrorId ? `${role}\u0000${mirrorId}` : null;
+        if (sourceMirrorKey && mirrorIdentity) {
+            const occurrenceCount = (mirrorIdOccurrences.get(sourceMirrorKey) || 0) + 1;
+            mirrorIdOccurrences.set(sourceMirrorKey, occurrenceCount);
+            if (occurrenceCount > 1) ambiguousMirrorIds.add(mirrorIdentity);
+        }
+        const counterpartMirrorKey = mirrorId ? `${source === "response_item" ? "event_msg" : "response_item"}\u0000${role}\u0000${mirrorId}` : null;
+        const mirroredIndexes = counterpartMirrorKey === null ? [] : sourceIndexesByMirrorId.get(counterpartMirrorKey) || [];
+        if (mirrorIdentity && !ambiguousMirrorIds.has(mirrorIdentity) && mirroredIndexes.length === 1) {
+            const mirrored = messages[mirroredIndexes[0]];
+            if (mirrored && mirrored.text === text) {
+                mirrored.attachments = mergeCodexEvidenceAttachments(mirrored.attachments, attachments);
+                sourceIndexesByMirrorId.delete(counterpartMirrorKey!);
+                return;
+            }
+        }
+        if (role === "user") roundEnd += 1;
+        if (role === "assistant" && roundEnd === 0) roundEnd = 1;
+        messages.push({ role, text, ...(attachments.length > 0 ? { attachments } : {}) });
+        if (sourceMirrorKey) {
+            const indexes = sourceIndexesByMirrorId.get(sourceMirrorKey) || [];
+            indexes.push(messages.length - 1);
+            sourceIndexesByMirrorId.set(sourceMirrorKey, indexes);
+        }
+    };
+    for (const event of events) {
+        const payload = event && typeof event === "object" && !Array.isArray(event)
+            ? (event as Record<string, unknown>).payload
+            : undefined;
+        const eventType = event && typeof event === "object" && !Array.isArray(event)
+            ? (event as Record<string, unknown>).type
+            : undefined;
+        const payloadFields = payload && typeof payload === "object" && !Array.isArray(payload)
+            ? payload as Record<string, unknown>
+            : {};
+        if (eventType === "response_item" && payloadFields.type === "message") {
+            const role = payloadFields.role === "user" || payloadFields.role === "assistant" ? payloadFields.role : null;
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            const text = extractText(content);
+            const attachments = codexEvidenceAttachments(extractCodexMessageAttachments(content, text));
+            if (role && !codexEvidenceToolOnlyContent(content)) {
+                add(role, text, attachments, "response_item", codexEvidenceMessageMirrorId(event, payloadFields));
+            }
+            continue;
+        }
+        if (eventType === "event_msg" && payloadFields.type === "user_message") {
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            if (!codexEvidenceToolOnlyContent(content)) {
+                add(
+                    "user",
+                    extractEventMessageText(payloadFields),
+                    codexEvidenceAttachments(extractCodexEventUserAttachments(payloadFields)),
+                    "event_msg",
+                    codexEvidenceMessageMirrorId(event, payloadFields),
+                );
+            }
+            continue;
+        }
+        if (eventType === "event_msg" && payloadFields.type === "agent_message") {
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            if (!codexEvidenceToolOnlyContent(content)) {
+                add(
+                    "assistant",
+                    extractEventMessageText(payloadFields),
+                    [],
+                    "event_msg",
+                    codexEvidenceMessageMirrorId(event, payloadFields),
+                );
+            }
+        }
+    }
+    return { messages, roundEnd: Math.max(roundEnd, 1) };
+}
+
+function codexEvidenceRolloutId(filePath: string, sessionMeta: Record<string, unknown> | null): string | null {
+    if (typeof sessionMeta?.id === "string" && sessionMeta.id.trim()) return sessionMeta.id;
+    return path.basename(filePath).match(CODEX_ROLLOUT_ID_RE)?.[1] || null;
+}
+
+async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvidenceRollout> {
+    const errors: SourceEvidenceIssue[] = [];
+    const events: unknown[] = [];
+    let byteLength = 0;
+    let revisionSequence: number | null = null;
+    let before: fs.Stats | null = null;
+    try {
+        before = await fs.promises.stat(rolloutPath);
+        byteLength = before.size;
+        revisionSequence = Number.isFinite(before.mtimeMs) && before.mtimeMs >= 0
+            ? Math.floor(before.mtimeMs)
+            : null;
+    } catch (error) {
+        return {
+            rolloutPath,
+            conversationId: null,
+            sessionMeta: null,
+            byteLength,
+            revisionSequence,
+            contentCursor: null,
+            contentHash: codexEvidenceSha256({ messages: [] }),
+            roundEnd: 1,
+            messages: [],
+            errors: [codexEvidenceIoIssue(error, "Codex rollout 文件")],
+        };
+    }
+    let lineNumber = 0;
+    try {
+        await forEachCodexJsonlLineAsync(
+            rolloutPath,
+            (line) => {
+                lineNumber += 1;
+                try {
+                    events.push(JSON.parse(line));
+                } catch {
+                    errors.push(codexEvidenceIssue("parse_error", `Codex rollout 第 ${lineNumber} 个非空 JSONL 行无法解析`));
+                }
+            },
+            {
+                onOversizedLine: () => {
+                    errors.push(codexEvidenceIssue("limit_reached", "Codex rollout 存在超过安全上限的 JSONL 行"));
+                },
+            },
+        );
+    } catch (error) {
+        errors.push(codexEvidenceIoIssue(error, "Codex rollout 文件"));
+    }
+    try {
+        const after = await fs.promises.stat(rolloutPath);
+        if (!before || before.size !== after.size || before.mtimeMs !== after.mtimeMs) {
+            errors.push(codexEvidenceIssue("revision_drift", "Codex rollout 在扫描期间发生变化"));
+        }
+    } catch (error) {
+        errors.push(codexEvidenceIoIssue(error, "Codex rollout 文件"));
+    }
+    const sessionMetaEvent = events.find((event) => {
+        if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+        return (event as Record<string, unknown>).type === "session_meta";
+    });
+    const sessionMetaPayload = sessionMetaEvent && typeof sessionMetaEvent === "object" && !Array.isArray(sessionMetaEvent)
+        ? (sessionMetaEvent as Record<string, unknown>).payload
+        : null;
+    const sessionMeta = sessionMetaPayload && typeof sessionMetaPayload === "object" && !Array.isArray(sessionMetaPayload)
+        ? sessionMetaPayload as Record<string, unknown>
+        : null;
+    const content = collectCodexEvidenceMessages(events);
+    const contentHash = codexEvidenceSha256({ messages: content.messages });
+    return {
+        rolloutPath,
+        conversationId: codexEvidenceRolloutId(rolloutPath, sessionMeta),
+        sessionMeta,
+        byteLength,
+        revisionSequence,
+        contentCursor: content.messages.length > 0 ? contentHash : null,
+        contentHash,
+        roundEnd: content.roundEnd,
+        messages: content.messages,
+        errors: dedupeCodexEvidenceIssues(errors),
+    };
+}
+
+async function listCodexEvidenceRolloutPaths(
+    root: string,
+    issues: SourceEvidenceIssue[],
+): Promise<string[]> {
+    const files: string[] = [];
+    const visit = async (directory: string): Promise<void> => {
+        let entries: fs.Dirent[];
+        try {
+            entries = await fs.promises.readdir(directory, { withFileTypes: true });
+        } catch (error) {
+            issues.push(codexEvidenceIoIssue(error, "Codex rollout 目录"));
+            return;
+        }
+        for (const entry of entries) {
+            const targetPath = path.join(directory, entry.name);
+            if (entry.isDirectory()) {
+                await visit(targetPath);
+            } else if (entry.isFile() && CODEX_ROLLOUT_ID_RE.test(entry.name)) {
+                files.push(targetPath);
+            }
+        }
+    };
+    await visit(root);
+    return files;
+}
+
+function codexEvidenceThreadFromRollout(rollout: CodexEvidenceRollout, parentMap: Map<string, string>): CodexThreadInfo | null {
+    if (!rollout.conversationId) return null;
+    const meta = rollout.sessionMeta || {};
+    return applyCodexThreadRelations({
+        id: rollout.conversationId,
+        rolloutPath: rollout.rolloutPath,
+        cwd: typeof meta.cwd === "string" ? meta.cwd : "",
+        title: typeof meta.title === "string" ? meta.title : "",
+        titleSource: typeof meta.title === "string" ? "session_meta" : "rollout",
+        source: typeof meta.source === "string" && meta.source.trim()
+            ? meta.source
+            : typeof meta.originator === "string" && meta.originator.trim()
+                ? meta.originator
+                : "rollout",
+        model: typeof meta.model === "string" ? meta.model : null,
+        reasoningEffort: typeof meta.reasoning_effort === "string" ? meta.reasoning_effort : null,
+        agentNickname: null,
+        agentRole: null,
+        updatedAtMs: null,
+    }, parentMap);
+}
+
+async function scanCodexSourceEvidence(options: CodexSourceEvidenceOptions): Promise<CodexEvidenceScan> {
+    const paths = resolveCodexEvidencePaths(options);
+    const database = await readCodexEvidenceDatabase(paths.stateDbPath, options.enumerationLimit);
+    const issues = [...database.errors];
+    const allowedRolloutRoots = await resolveCodexEvidenceRolloutRoots(paths.rolloutRoots, paths.rootsExplicit, issues);
+    const rolloutPaths = new Set<string>();
+    for (const root of allowedRolloutRoots) {
+        for (const rolloutPath of await listCodexEvidenceRolloutPaths(root.configuredPath, issues)) {
+            const authorizedPath = await authorizeCodexEvidenceRolloutPath(rolloutPath, allowedRolloutRoots);
+            issues.push(...authorizedPath.errors);
+            if (authorizedPath.rolloutPath) rolloutPaths.add(authorizedPath.rolloutPath);
+        }
+    }
+    const threads: CodexThreadInfo[] = [];
+    for (const thread of database.threads) {
+        const authorizedThread = await authorizeCodexEvidenceThread(thread, allowedRolloutRoots);
+        issues.push(...authorizedThread.errors);
+        if (authorizedThread.thread) {
+            threads.push(authorizedThread.thread);
+            rolloutPaths.add(authorizedThread.thread.rolloutPath);
+        }
+    }
+    const sortedRolloutPaths = [...rolloutPaths].sort((left, right) => left.localeCompare(right, "en"));
+    const requestedLimit = options.enumerationLimit && options.enumerationLimit > 0 ? Math.floor(options.enumerationLimit) : null;
+    const rolloutLimitReached = requestedLimit !== null && sortedRolloutPaths.length > requestedLimit;
+    if (database.limitReached || rolloutLimitReached) {
+        issues.push(codexEvidenceIssue("limit_reached", "Codex rollout 枚举达到调用方限制"));
+    }
+    const selectedPaths = requestedLimit === null ? sortedRolloutPaths : sortedRolloutPaths.slice(0, requestedLimit);
+    const rolloutsByPath = new Map<string, CodexEvidenceRollout>();
+    const rolloutsByConversationId = new Map<string, CodexEvidenceRollout>();
+    for (const rolloutPath of selectedPaths) {
+        const rollout = await readCodexEvidenceRollout(rolloutPath);
+        rolloutsByPath.set(path.resolve(rolloutPath), rollout);
+        if (rollout.conversationId) rolloutsByConversationId.set(rollout.conversationId, rollout);
+        issues.push(...rollout.errors);
+    }
+    for (const rollout of rolloutsByPath.values()) {
+        const fallbackThread = codexEvidenceThreadFromRollout(rollout, database.parentMap);
+        if (fallbackThread && !threads.some(thread => thread.id === fallbackThread.id)) threads.push(fallbackThread);
+    }
+    const complete = issues.length === 0 && !database.limitReached && !rolloutLimitReached;
+    return {
+        stateDbPath: paths.stateDbPath,
+        rolloutRoots: paths.rolloutRoots,
+        allowedRolloutRoots,
+        threads,
+        parentMap: database.parentMap,
+        rolloutsByPath,
+        rolloutsByConversationId,
+        errors: dedupeCodexEvidenceIssues(issues),
+        pagination: {
+            cursor: null,
+            pages: complete || threads.length > 0 ? 1 : 0,
+            limit: requestedLimit,
+            truncated: database.limitReached || rolloutLimitReached,
+        },
+        enumerationComplete: complete,
+    };
+}
+
+function codexEvidenceRevision(
+    scan: CodexEvidenceScan,
+    conversationId: string,
+    thread: CodexThreadInfo | null,
+): SourceRevision {
+    const targetRollout = thread
+        ? scan.rolloutsByPath.get(path.resolve(thread.rolloutPath)) || scan.rolloutsByConversationId.get(conversationId)
+        : scan.rolloutsByConversationId.get(conversationId);
+    if (targetRollout) {
+        const contentCursor = targetRollout.contentCursor;
+        const revision = contentCursor || codexEvidenceSha256({ conversationId, emptyContent: true });
+        return { revision, contentCursor, eventWatermark: contentCursor, sequence: targetRollout.revisionSequence };
+    }
+    const watermark = codexEvidenceSha256({
+        conversationId,
+        rollouts: [...scan.rolloutsByConversationId.values()]
+            .map(rollout => ({ conversationId: rollout.conversationId, contentCursor: rollout.contentCursor }))
+            .sort((left, right) => String(left.conversationId).localeCompare(String(right.conversationId), "en")),
+    });
+    return { revision: watermark, contentCursor: null, eventWatermark: watermark };
+}
+
+function codexEvidenceIdentity(options: CodexSourceEvidenceOptions, scan: CodexEvidenceScan): SourceConversationIdentity {
+    const authoritativeRoot = scan.rolloutRoots[0] || path.dirname(scan.stateDbPath);
+    return {
+        workspace: options.workspace,
+        source: {
+            kind: "hybrid",
+            authority: "codex-local-state-db-rollout-jsonl",
+            authoritativeRoot,
+            canonicalPath: authoritativeRoot,
+        },
+        conversationId: options.conversationId,
+    };
+}
+
+async function collectCodexEvidenceContext(options: CodexSourceEvidenceOptions): Promise<CodexEvidenceContext> {
+    const startedAt = (options.now || (() => new Date()))().toISOString();
+    const scan = await scanCodexSourceEvidence(options);
+    const directExact = await readCodexEvidenceExactThread(
+        scan.stateDbPath,
+        options.conversationId,
+        scan.allowedRolloutRoots,
+    );
+    const fallbackThread = scan.threads.find(thread => thread.id === options.conversationId)
+        || codexEvidenceThreadFromRollout(scan.rolloutsByConversationId.get(options.conversationId) || {
+            rolloutPath: "",
+            conversationId: null,
+            sessionMeta: null,
+            byteLength: 0,
+            revisionSequence: null,
+            contentCursor: null,
+            contentHash: codexEvidenceSha256({ messages: [] }),
+            roundEnd: 1,
+            messages: [],
+            errors: [],
+        }, scan.parentMap);
+    const thread = directExact.thread || fallbackThread || null;
+    const parentThread = directExact.parentThread || (thread?.parentConversationId
+        ? scan.threads.find(candidate => candidate.id === thread.parentConversationId) || null
+        : null);
+    const errors = dedupeCodexEvidenceIssues([...scan.errors, ...directExact.errors]);
+    const exactFetchResult = thread
+        ? "present"
+        : errors.length > 0 || !scan.enumerationComplete
+            ? "unresolved"
+            : "not_found";
+    return {
+        scan,
+        exact: { thread, parentThread, errors },
+        exactFetchResult,
+        identity: codexEvidenceIdentity(options, scan),
+        sourceRevision: codexEvidenceRevision(scan, options.conversationId, thread),
+        observedAt: {
+            scanId: options.scanId,
+            sequence: options.sequence,
+            startedAt,
+            completedAt: (options.now || (() => new Date()))().toISOString(),
+        },
+        cacheBypassed: options.cacheBypassed ?? true,
+    };
+}
+
+export async function enumerateCodexSourceEvidence(options: CodexSourceEvidenceOptions): Promise<CodexSourceEnumerationResult> {
+    const context = await collectCodexEvidenceContext(options);
+    const targetStatus = context.exactFetchResult === "present"
+        ? "present"
+        : context.exactFetchResult === "not_found" && context.scan.enumerationComplete
+            ? "absent"
+            : "unknown";
+    return {
+        evidence: buildSourceEnumerationEvidence({
+            adapterVersion: "source-evidence/v1",
+            host: "codex",
+            identity: context.identity,
+            sourceRevision: context.sourceRevision,
+            pagination: context.scan.pagination,
+            enumerationComplete: context.scan.enumerationComplete,
+            cacheBypassed: context.cacheBypassed,
+            exactFetchResult: context.exactFetchResult,
+            errors: context.exact.errors,
+            warnings: [],
+            observedAt: context.observedAt,
+            targetStatus,
+        }),
+        threads: context.scan.threads,
+    };
+}
+
+export async function fetchCodexSourceEvidence(options: CodexSourceEvidenceOptions): Promise<CodexSourceExactFetchResult> {
+    const context = await collectCodexEvidenceContext(options);
+    return {
+        evidence: buildExactFetchEvidence({
+            adapterVersion: "source-evidence/v1",
+            host: "codex",
+            identity: context.identity,
+            sourceRevision: context.sourceRevision,
+            pagination: context.scan.pagination,
+            enumerationComplete: context.scan.enumerationComplete,
+            cacheBypassed: context.cacheBypassed,
+            exactFetchResult: context.exactFetchResult,
+            errors: context.exact.errors,
+            warnings: [],
+            observedAt: context.observedAt,
+        }),
+        thread: context.exact.thread,
+        parentThread: context.exact.parentThread,
+    };
+}
+
+export async function readCodexFullSourceEvidence(options: CodexSourceEvidenceOptions): Promise<CodexSourceFullReadResult> {
+    const context = await collectCodexEvidenceContext(options);
+    const exactFetch = buildExactFetchEvidence({
+        adapterVersion: "source-evidence/v1",
+        host: "codex",
+        identity: context.identity,
+        sourceRevision: context.sourceRevision,
+        pagination: context.scan.pagination,
+        enumerationComplete: context.scan.enumerationComplete,
+        cacheBypassed: context.cacheBypassed,
+        exactFetchResult: context.exactFetchResult,
+        errors: context.exact.errors,
+        warnings: [],
+        observedAt: context.observedAt,
+    });
+    if (context.exactFetchResult !== "present" || !context.exact.thread) {
+        return { evidence: exactFetch, thread: context.exact.thread, parentThread: context.exact.parentThread };
+    }
+    const rollout = await readCodexEvidenceRollout(context.exact.thread.rolloutPath);
+    const fullErrors = dedupeCodexEvidenceIssues([...context.exact.errors, ...rollout.errors]);
+    const fullRevision = rollout.contentCursor || codexEvidenceSha256({
+        conversationId: options.conversationId,
+        emptyContent: true,
+    });
+    const sourceRevision: SourceRevision = {
+        revision: fullRevision,
+        contentCursor: rollout.contentCursor,
+        eventWatermark: rollout.contentCursor,
+        sequence: rollout.revisionSequence,
+    };
+    if (canonicalSerialize(sourceRevision) !== canonicalSerialize(context.sourceRevision)) {
+        fullErrors.push(codexEvidenceIssue("revision_drift", "Codex rollout 在精确定位与完整读取之间发生内容变化"));
+    }
+    const fullSourceRead = buildFullSourceReadEvidence({
+        adapterVersion: "source-evidence/v1",
+        host: "codex",
+        identity: context.identity,
+        sourceRevision,
+        pagination: context.scan.pagination,
+        enumerationComplete: context.scan.enumerationComplete && fullErrors.length === 0,
+        cacheBypassed: context.cacheBypassed,
+        exactFetchResult: "present",
+        errors: dedupeCodexEvidenceIssues(fullErrors),
+        warnings: [],
+        observedAt: context.observedAt,
+        content: {
+            mode: "full",
+            byteLength: rollout.byteLength,
+            contentHash: rollout.contentHash,
+            roundRange: { start: 1, end: rollout.roundEnd },
+            truncated: false,
+            staleCache: false,
+        },
+    });
+    let sourceSnapshot: RecordSourceSnapshot | undefined;
+    if (
+        fullSourceRead.errors.length === 0
+        && exactFetch.errors.length === 0
+        && context.scan.enumerationComplete
+        && canonicalSerialize(fullSourceRead.sourceRevision) === canonicalSerialize(exactFetch.sourceRevision)
+    ) {
+        sourceSnapshot = buildRecordSourceSnapshot({
+            snapshotId: `codex:${options.conversationId}:${fullSourceRead.sourceRevision.revision}`,
+            fullSourceRead,
+        });
+    }
+    return {
+        evidence: exactFetch,
+        thread: context.exact.thread,
+        parentThread: context.exact.parentThread,
+        fullSourceRead,
+        sourceSnapshot,
+        sourceMessages: rollout.messages,
+    };
+}
+
+export async function collectCodexSourceEvidence(options: CodexSourceEvidenceOptions): Promise<CodexSourceEvidenceResult> {
+    const enumeration = await enumerateCodexSourceEvidence(options);
+    const fullRead = await readCodexFullSourceEvidence(options);
+    if (
+        canonicalSerialize(enumeration.evidence.sourceRevision) !== canonicalSerialize(fullRead.evidence.sourceRevision)
+        || enumeration.evidence.exactFetchResult !== fullRead.evidence.exactFetchResult
+    ) {
+        return {
+            ...fullRead,
+            enumeration: enumeration.evidence,
+            sourceSnapshot: undefined,
+        };
+    }
+    return { ...fullRead, enumeration: enumeration.evidence };
 }

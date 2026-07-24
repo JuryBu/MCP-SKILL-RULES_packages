@@ -97,13 +97,13 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - 三级详细度：brief(截断100字) / normal(完整文本) / full(含思考+工具结果；Codex 链路会展开可读 reasoning、工具事件、patch diff 和文件/计划视图)
 - Antigravity LS 链路下，conversationId 不填可默认当前对话；Codex / Claude Code / Windsurf 通过共享后端、本地 JSONL 或只读 LS 接口定位，必须显式传稳定 conversationId
 - extraTypes: 额外拉取 thinking/tool_results/code_actions/code_diffs/file_views
-- "chain=\"auto|antigravity|codex|claude-code|cc|grok|windsurf|wsf\"" 为兼容旧参数；cc 会归一为 claude-code，wsf 会归一为 windsurf；chain="windsurf" 只作为 dataChain 兼容写法，modelChain 回落 auto；chain="grok" 只作为 modelChain 兼容写法，dataChain 回落 auto
+- "chain=\"auto|antigravity|codex|claude-code|cc|grok|agy|windsurf|wsf\"" 为兼容旧参数；cc 会归一为 claude-code，wsf 会归一为 windsurf；chain="windsurf" 只作为 dataChain 兼容写法，modelChain 回落 auto；chain="grok"/"agy" 只作为 modelChain 兼容写法，dataChain 回落 auto
 - "dataChain=\"auto|antigravity|codex|claude-code|cc|windsurf|wsf\"" 控制原文来源；list/fetch/read/exact/fuzzy 主要使用 dataChain
-- "modelChain=\"auto|antigravity|codex|claude-code|cc|grok\"" 控制 smart 搜索的模型调用链路；显式 claude-code 只走 Claude Code CLI；显式 grok 只走本机 progrok proxy
-- modelChain 不支持 windsurf/wsf，dataChain 不支持 grok；Windsurf 只提供对话数据，Grok 只提供模型调用链路
+- "modelChain=\"auto|antigravity|codex|claude-code|cc|grok|agy\"" 控制 smart 搜索的模型调用链路；显式 claude-code 只走 Claude Code CLI，显式 grok 只走本机 progrok proxy，显式 agy 只走本地 agy CLI 的三模型内部 fallback
+- modelChain 不支持 windsurf/wsf，dataChain 不支持 grok 或 agy；Windsurf 只提供对话数据，Grok 与 agy 都只提供模型调用链路
 - memory_query、memory_batch(query)、memory_write、memory_update、memory_stats(action="enhance") 也支持 modelChain；旧 chain 继续作为模型链路兼容别名
-- "chain=\"auto\"" 优先当前宿主链路；模型调用会先探测 Grok，再按 Antigravity/Codex/可选 Claude Code fallback
-- 显式指定 "modelChain=\"grok\"" 或 "chain=\"grok\"" 时只使用 Grok 模型桥，不可用直接报错；显式指定 "chain=\"antigravity\""、"chain=\"codex\"" 或 "chain=\"claude-code\"" 时不静默回退
+- "chain=\"auto\"" 优先当前宿主链路；模型调用按 Grok →（仅 MEMORY_STORE_AGY_AUTO_ENABLED=1 时）agy → Antigravity → Codex → 可选 Claude Code CLI 探测
+- 显式指定 "modelChain=\"grok\""、"modelChain=\"agy\"" 或对应旧 chain 时只使用该模型链路，不可用直接报错；agy 内部仅按「Gemini 3.5 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」fallback，不会跨到其它宿主模型链路；显式指定 "chain=\"antigravity\""、"chain=\"codex\"" 或 "chain=\"claude-code\"" 时同样不静默回退
 - Antigravity 链路通过 Language Server 本地 API 获取解密数据，无需手动解密 .pb 文件
 - Codex 链路通过本地线程索引与原始事件流重建轮次
 - Codex 附件懒解析(v1.12.2): fetch 只返回附件统计；read/search 只对实际输出轮次按需处理图片和文件路径。local_images 本地路径优先；仅当图片只存在于 JSONL 的 data:image base64 时，才并行限流写入 memory-store/temp/codex-attachments/<conversationId>/round-xxxxxx/sha256-*.png。普通 PDF/DOCX/Markdown 文件从 Files mentioned 文本块解析路径并标注存在性，不读取正文。可用 MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT / MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY / MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES / MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES 控制数量、并发、单图大小和单次总解码量。
@@ -141,9 +141,14 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - Claude Code 逻辑续聊链与 Record 防缩水(v1.15.14): conversation_read_original(fetch/read/search/export, dataChain="claude-code") 支持 logicalChain="off|explain|auto|strict"；默认 off 只读指定物理 JSONL，explain 只展示同工作区前序候选，auto/strict 仅在明确引用 ID/标题、压缩摘要或首尾内容重叠等强证据成立且无“从 0 开始/不要继承”信号时合并。record_manage(update, dataChain="claude-code") 默认 logicalChain="auto"，证据不足只给 warning，不按标题语义强行合并；最终写入门禁会容忍旧 Record 已存在且完全一致的稳定区 Phase 范围重叠，但仍拒绝新生成部分新增的重叠或倒退。
 - Grok/progrok 模型链路(v1.18.0): 新增 modelChain="grok" 与 chain="grok" 兼容写法；Grok 只作为模型链路，不作为 dataChain。auto 模型路由优先探测本机 progrok proxy，默认顺序为 grok → antigravity → codex → 可选 claude-code；Record 场景使用 grok-4.3 与 Antigravity M20 fallback，Stage Guard 使用 grok-4.5；输出 token 上限 default/Record/Guard 默认 800/8192/4096，可用 MEMORY_STORE_GROK_MAX_TOKENS / MEMORY_STORE_GROK_RECORD_MAX_TOKENS / MEMORY_STORE_GROK_GUARD_MAX_TOKENS 覆盖，finish_reason=length 视为截断失败。proxy 默认 http://127.0.0.1:18645，认证 key 默认 grok-local-proxy，可用 MEMORY_STORE_GROK_PROXY_URL / MEMORY_STORE_GROK_API_KEY 覆盖；工具只探测 proxy，不会自动启动 progrok。
 - 后台任务生命周期(v1.19.0): background_task_status / background_task_cancel 统一查询和取消 task-backed 任务；Record、Guard check、Golden Extract、批量导出与 deep locate 传播取消并阻止幽灵写回。后端启动扫描持久任务，Record 按 checkpoint/ledger 续跑，其余类型按幂等规则恢复或明确转 error；任务默认保留 15 天。
-- Broker/WSF/三层并发: 共享 broker 按 waitSeconds/timeout 参数动态放宽请求窗口，普通调用仍默认 120 秒，wait 上限默认 30 分钟；长任务建议 background=true + waitSeconds=30-45 短轮询。Record 普通轮格式化每 N 轮用 setImmediate 让出事件循环（MEMORY_STORE_RECORD_FORMAT_YIELD_INTERVAL 默认 5，0 禁用），让步后重查取消状态。WSF LS 使用 AIMD，max=6、min=1、initial=1，并由 MEMORY_STORE_WINDSURF_LS_RESERVED_SLOTS（默认 2）提供非抢占前台保留槽；后台空闲时可借用，前台在下一槽释放时优先，effectiveReserved 随 current limit 动态钳制。Grok 与 Record 短持久化使用 AIMD，max=8、min=1、initial=2。三个 CONCURRENCY 环境变量现在都表示 max，不再表示固定并发。
+- Broker、WSF 与 provider admission: 共享 broker 按 waitSeconds/timeout 参数动态放宽请求窗口，普通调用仍默认 120 秒，wait 上限默认 30 分钟；长任务建议 background=true + waitSeconds=30-45 短轮询。Record 普通轮格式化每 N 轮用 setImmediate 让出事件循环（MEMORY_STORE_RECORD_FORMAT_YIELD_INTERVAL 默认 5，0 禁用），让步后重查取消状态。WSF LS 使用 AIMD，max=6、min=1、initial=1，并由 MEMORY_STORE_WINDSURF_LS_RESERVED_SLOTS（默认 2）提供非抢占前台保留槽；后台空闲时可借用，前台在下一槽释放时优先，effectiveReserved 随 current limit 动态钳制。模型 provider 的统一 admission 默认 enforced：同一 provider 的 foreground 与 Record 请求共享一个物理池，必须先取得 permit，才会发 HTTP 请求或启动 CLI。
 - 对话渲染边缘修复(v1.19.2): brief 空 AI step 不再输出标题；messageRoles=["tool"] 按 step/seq 稳定分组；NaN/undefined stepIndex 在 normal/full、brief、messageRoles 三条路径统一降级为无 step 的 AI 标题。
-- Record 批量筛选、账本与 Grok 调度(v1.19.3): batch_update/bulk_update 先分类、排序后才应用 limit；force/stale_only 矩阵为 false/false=stale+missing、true/false=stale+missing+fresh、false/true 与 true/true 均只选 stale。近期列表未命中的既有 Record 保留为 unresolved，来源链路冲突安全跳过；batch taskId 绑定 resumeKey 与 v2 ledger，业务总计只看 ledger，AIMD 仅是当前 memory-store Node 进程的运行诊断。
+- Record 批量筛选、账本与 provider 调度(v1.19.3): batch_update/bulk_update 先分类、排序后才应用 limit；force/stale_only 矩阵为 false/false=stale+missing、true/false=stale+missing+fresh、false/true 与 true/true 均只选 stale。近期列表未命中的既有 Record 保留为 unresolved，来源链路冲突安全跳过；batch taskId 绑定 scheduler ledger，业务总计只看 ledger；provider admission 的 AIMD、breaker、owner lease 与 loss epoch 持久化到 provider control，旧进程内共享池诊断不再授予物理模型许可。
+- Record scheduler 真实生产闭环(v1.21.0): 四宿主来源枚举、exact/full read 与 immutable evidence 统一进入生产 runtime；一个逻辑模型调用只物化一个 route Unit，Grok/agy/Codex 等 provider 调用作为同 Unit 的 Attempt。Availability/Congestion/LocalResource 在同 Unit retry/fallback，Quality/Complexity 才允许一次 split；有 durable resultRef 的 ResultReady 可放行后续 continuation，但只有 local-finalize 全部 verified 才能把 Task 投影为 Succeeded。
+- 非阻塞接力、4+4 与重启恢复(v1.21.0): blocked provider 候选持久挂起并释放 background lane，事件/CAS 唤醒后沿同 taskId、Unit、attemptId 继续；agy first-run overflow 与 fallback 各保障 4，任一类空闲时另一类可非抢占借用，但物理合计始终最多 8。same-identity admission 使用跨进程 namespace lock，foreign owner 通过 PID/启动时间/lease fencing 接管；pending discovery 在 spool 创建前允许连续热重启，不会误报 missing_task_manifest。
+- force 发布换代与可见 artifact 门禁(v1.21.0): force 仅在正文、主索引、Reader Index 全部匹配旧 publication claim 时推进 recordCommitEpoch 并保留历史；coherently absent、ownerless legacy、部分发布、混合 owner 或 unresolved 均 fail closed 为 RepairRequired。普通非 force 的同 revision/不同 body 继续冲突，repair_divergence 仍走独立修复路径。
+- Record 手动修改发布围栏(v1.21.0): record_manage(edit/delete) 按 artifact→registry 锁序先推进 epoch/fencing token、清除旧 lease/claim 并持久记录 retiredTaskIds，再修改正文与索引；旧 Task 不得重新挂接或取得 lease，同 revision 的新 Task 仍可继续。索引已有 chain 时该宿主唯一权威，外宿主状态、chain 缺失后的多候选或残缺候选均 RepairRequired。
+- Record 调度原始意图收尾(v1.21.1): auto 单 Unit 在 Grok permit 满载且尚未调用 provider 时，以同一 attemptId 尝试 agy first-run overflow；Grok 真失败后的 agy 仍走 fallback。Antigravity/Codex/Claude Code 的启动、连接、超时与非零退出为 Availability，成功调用空输出为 Quality。Windsurf Record ownership 预探测走 background；single-flight 与持久化 gate 的容量等待无终止性 queue timeout，只因取消或任务结算退出，旧 MEMORY_STORE_RECORD_UPDATE_QUEUE_TIMEOUT_MS 不再生效。
 - Codex HTTP broker 共享后端进程，fetch/search/read 必须显式传稳定 conversationId；只知道标题时先用 list 定位完整 ID，可补 contextProbe 辅助确认当前主线
 - Codex 如存在子代理线程，默认以引用或摘要方式呈现；link="expand_children" 时读取一级子线程全文，并用 thread_spawn_edges 补充父线程事件遗漏或已归档但仍可读的子线程；缺失子线程会输出诊断而不是静默跳过
 
@@ -173,7 +178,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 
 ### record_manage — 对话记录管理 (v1.8+ / Reader v1.12+)
 - Record 是对话过程日志，Flash 自动生成，永久存于 records/，抗 LS 过期
-- action: update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/cancel/recover/audit_ownership/repair_ownership/stale_check
+- action: update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/cancel/recover/audit_ownership/repair_ownership/migrate_unknown_chain/stale_check
 - 自动触发: Antigravity LS 环境下所有工具调用自动节流检查（60s 间隔），轮次增量≥3 后台更新；同一对话同一工作区已有 pending 时跳过重复触发
 - Codex wrapper 环境默认关闭后台自动 Record，避免普通查询隐式拉起模型桥；需要时可设 MEMORY_STORE_CODEX_AUTO_RECORD=1 显式开启
 - 显式更新: record_manage update / batch_update / bulk_update 会跳过入口自动检查，避免手动更新与后台自动更新重复生成
@@ -191,17 +196,18 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - 过期检查(v1.17.3 / 批量筛选 v1.19.3): record_manage(stale_check, scope, dataChain, limit) 检测范围内哪些 Record 已过期（对话有新内容但 Record 未跟进）；近期有限列表未命中的 Record 标为 unresolved，仅统计、不更新、不删除，不能误称确定丢失。批量候选的来源链路若与既有 Record 冲突同样安全跳过；Windsurf 源用 stepCount 对比排除 rename-only 误报；RecordIndexEntry 的 chain 字段记录对话来源
 - 读侧归属治理: list/search 的 scope="workspace" 严格只读指定 workspace；includeGeneral=true 才显式兼容旧的 workspace + general 合并读法
 - general 审计: audit_ownership 只读检测 duplicate/migratable/conflict/unknown；repair_ownership 默认 dryRun=true，首版只 copy/upsert，不删除来源副本
+- unknown 链迁移: record_manage(migrate_unknown_chain, scope, apply=false) 默认只读扫描 Codex、Claude Code、Windsurf、Antigravity 的权威 enumeration/exact-fetch/full-read 证据。仅一个宿主完整匹配且其余宿主可证明不存在时才提出 Patch；apply=true 才按 index revision/hash CAS 写入 chain。任一证据不完整或多宿主命中均保持 Unresolved/Conflict，不改索引，也不作为 batch_update 前置步骤
 - official home 止血: C:\\ 与 \\\\?\\C:\\ 等路径别名会归一；repair/update 会把旧 alias/general 副本 copy/upsert 到 official workspace，并用 ownership sidecar 标记 superseded，默认 list/search 不展示已取代副本
 - 降级: LS 不可用时自动从 Record 读取
-- 四数据链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退；chain="windsurf" 只代表 dataChain，modelChain 回落 auto；chain="grok" 只代表 modelChain，dataChain 回落 auto
-- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 生成 Record；可读取 Codex/Claude Code/Windsurf 对话并用 Grok/progrok、Antigravity LS、Codex 或 Claude Code 模型生成
+- 四数据链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退；chain="windsurf" 只代表 dataChain，modelChain 回落 auto；chain="grok"/"agy" 只代表 modelChain，dataChain 回落 auto
+- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 生成 Record；可读取 Codex/Claude Code/Windsurf 对话并用 Grok/progrok、agy CLI、Antigravity LS、Codex 或 Claude Code 模型生成。agy 不能填入 dataChain
 - Codex 链路下，Record 读取的对话原文来自本地线程索引与事件流，子代理内容默认以摘要或引用纳入；Claude Code 链路来自 .claude/projects JSONL
-- Codex/Claude Code 侧 update 必须显式传 conversationId；未传 background 时默认进入独立后台 FIFO 队列并返回 taskId；如需同步执行需显式传 background=false；后续用 action="task_status" + taskId + waitSeconds=30-45 轮询
-- Grok Record 使用 grok-4.3，默认 prompt 上限 200000、输出上限 8192 tokens、超时 120000ms，可用 MEMORY_STORE_GROK_RECORD_MAX_PROMPT_CHARS / MEMORY_STORE_GROK_RECORD_MAX_TOKENS / MEMORY_STORE_GROK_RECORD_TIMEOUT 覆盖；Codex/Claude Code 本地模型桥 Record 会按较小 prompt 批次生成，Codex 后台单批默认允许 8 分钟，可用 MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT 覆盖；Claude Code 可用 MEMORY_STORE_CC_RECORD_BACKGROUND_TIMEOUT_MS 覆盖
+- Codex/Claude Code 侧 update 必须显式传 conversationId；未传 background 时默认创建持久 scheduler Task 并返回 taskId，单更新与 batch 分别进入至少 8 槽的专用 materialization lane；lane 只编排任务，不拥有模型 permit。后续用 action="task_status" + taskId + waitSeconds=30-45 轮询
+- Grok Record 使用 grok-4.3，默认 prompt 上限 200000、输出上限 8192 tokens、超时 120000ms，可用 MEMORY_STORE_GROK_RECORD_MAX_PROMPT_CHARS / MEMORY_STORE_GROK_RECORD_MAX_TOKENS / MEMORY_STORE_GROK_RECORD_TIMEOUT 覆盖；agy Record 默认 prompt 上限 24000、总超时 5 分钟，可用 MEMORY_STORE_AGY_RECORD_MAX_PROMPT_CHARS / MEMORY_STORE_AGY_RECORD_TIMEOUT 覆盖，三模型内部 fallback 共用同一预算；Codex/Claude Code 本地模型桥 Record 会按较小 prompt 批次生成，Codex 后台单批默认允许 8 分钟，可用 MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT 覆盖；Claude Code 可用 MEMORY_STORE_CC_RECORD_BACKGROUND_TIMEOUT_MS 覆盖
 - task_status 会展示后台任务阶段、x/y 轮进度、当前批次/轮次和预计剩余时间，便于判断任务是否正常推进；cancel + taskId 是 Record 兼容入口
 - recover 不传 taskId 时只读列出可恢复的 Record 后台任务；传 taskId 时执行安全恢复。单条 Record update 沿用原 taskId 和已有 RecordPatch checkpoint；批量 taskId 绑定 resumeKey，ledger 未冻结前按原 request 重扫，冻结后只续跑快照。v2 ledger 会保留 inFlight 的正文哈希、归因和索引元数据，恢复按正文、主索引、Reader Index 的顺序补齐，全部完成后才转 completed；旧 v1 ledger 会在下一次锁内 mutation 规范化回写
-- 同一 conversationId 的 Record 更新先进入 per-conversation single-flight；完成对话加载后才进入 process-wide 生成门（MEMORY_STORE_RECORD_GENERATION_CONCURRENCY，默认 8），最终写入 Record 和 Reader Index 时才短暂进入持久化门。
-- MEMORY_STORE_RECORD_UPDATE_CONCURRENCY 是持久化 AIMD 的 max（默认 max=8、min=1、initial=2），不再表示固定更新并发；生成和模型等待不占持久化许可。batch worker 默认继承该上限（MEMORY_STORE_RECORD_BATCH_CONCURRENCY），batch orchestrator 可经专用 lane（MEMORY_STORE_RECORD_BATCH_UPDATE_BACKGROUND_CONCURRENCY）同时排队；更新与 single-flight 队列默认最多等待 30 分钟（MEMORY_STORE_RECORD_UPDATE_QUEUE_TIMEOUT_MS），生成队列用 MEMORY_STORE_RECORD_GENERATION_QUEUE_TIMEOUT_MS（默认同为 30 分钟）。
+- scheduler-backed Record 更新会冻结来源并物化 Task → Record → Unit → Attempt；Record work registry 按 canonical conversation + desiredRevision 去重，global coordinator 持久化公平顺序、claim phase 与 owner fencing。生产执行设置 schedulerManagedExecution，不再经过 legacy process-wide generation gate。
+- 单更新与 batch materialization lane 分别由 MEMORY_STORE_RECORD_UPDATE_BACKGROUND_CONCURRENCY / MEMORY_STORE_RECORD_BATCH_UPDATE_BACKGROUND_CONCURRENCY 配置，但有效值不得低于 provider physical max=8；scheduler Task 的 background maxRunMs=0，长时间排队、time_frozen 或重启恢复不会被旧总墙钟误判失败。模型 active 只由统一 provider admission 决定。
 
 ### background_task_status / background_task_cancel — 统一后台任务生命周期入口 (v1.19+)
 - background_task_status(taskId, waitSeconds?) 可查询任意 task-backed 后台任务，返回统一进度/结果格式
@@ -209,11 +215,11 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - stage_guard(action="cancel") 仍表示取消当前 Guard 并按 guardId 精确移除对应锁块，不能用来取消后台 check task；后台 check 使用 background_task_cancel
 - conversation_read_original(action="deep_locate_cancel") 和 record_manage(action="cancel") 作为兼容别名继续保留
 - autoSummary 仍是 fire-and-forget，不属于 task-backed 后台任务；写回前使用内容指纹防止旧摘要覆盖新内容
-- MCP 后端启动后会异步扫描 tasks/：Record 类按 checkpoint 续传；Golden Extract、Stage Guard check、conversation batch export 按各自幂等规则恢复；deep_locate 明确转 error，不自动重跑
+- MCP 后端启动后会异步扫描 tasks/：带 schedulerAdmission 的 Record 只按 scheduler ledger 与 owner lease 恢复，缺少 admission 的 legacy Record 保留原 taskId/resumePayload 并转 error，不再调用旧 handler 重跑；Golden Extract、Stage Guard check、conversation batch export 按各自幂等规则恢复；deep_locate 明确转 error，不自动重跑
 - 恢复元数据只持久化白名单 JSON 参数并校验 resumeVersion/resumeHash；任务文件默认保留 15 天，旁置同名 .preserve 可阻止自动清理
 - Codex HTTP broker 对普通调用保持默认 120 秒；参数含 waitSeconds>0 时使用 waitSeconds*1000+15 秒余量，参数 timeout 大于普通上限时使用 timeout+15 秒余量，两者均受 CODEX_MCP_BROKER_WAIT_TIMEOUT_MS（默认 30 分钟）约束
 - WSF 缓存默认 TTL 30 分钟、LRU 10 条、5 秒 revalidation window；MEMORY_STORE_WINDSURF_CACHE_TTL_MS / MEMORY_STORE_WINDSURF_CACHE_MAX_ENTRIES / MEMORY_STORE_WINDSURF_CACHE_REVALIDATE_MS 可调。fresh hit 不占 LS 位，过窗 summary 与刷新才进入 MEMORY_STORE_WINDSURF_LS_CONCURRENCY AIMD 门控（默认 max=6、min=1、initial=1）；MEMORY_STORE_WINDSURF_LS_RESERVED_SLOTS 默认 2，诊断包含 configured/effective reserved、前后台 active/pending 与 borrowing；partial/坏 0 轮不覆盖 last-good。
-- Grok/progrok 所有 context 共用唯一的 MEMORY_STORE_GROK_CALL_CONCURRENCY AIMD 门控（默认 max=8、min=1、initial=2）。record-batch 先受固定的 MEMORY_STORE_GROK_BATCH_CONCURRENCY 准入上限（默认 4）约束，再进入全局门；前台请求在全局门优先，batch 不新建第二套 AIMD。Grok 诊断会给出 trafficClass、PID、batch/global queueWaitMs 和 timeoutKind=batch_queue|global_queue|transport；global_queue 每次超时只向全局 AIMD 反馈一次，batch_queue 不收缩它，transport timeout 不重发 POST。所有门和诊断仅限当前一个 memory-store Node 进程，不承诺跨进程协调。
+- 模型 provider 只使用统一 admission，而不再使用旧 Grok 的 global/batch gate。每个 provider 的 foreground 与 Record 共享物理池，排队始终受本次调用的总 deadline 和取消信号控制，不再单设 Grok queue timeout/retry；因此排队中的请求若被取消或 deadline 到期，不会启动真实 HTTP/CLI 调用。provider control 首次安装只能以 exclusive-install 独占初始化；控制文件、初始化标记或 install manifest 损坏或不一致时会进入 dispatchBlocked，停止模型派发，必须修复后才恢复。旧 MEMORY_STORE_GROK_QUEUE_*、MEMORY_STORE_GROK_CALL_CONCURRENCY 与 MEMORY_STORE_GROK_BATCH_CONCURRENCY 不再提供物理并发或排队控制，不能据此调节 admission。
 
 ### stage_guard — 任务完整性验证 (v1.9+ / 分段取证 v1.13.4+ / 外部证据 v1.13.7+)
 - ⚠️ 当项目有 Plan_x 和 Task.md 时，每个 Stage 开始前必须 start，完成后必须 check 通过才能标记完成
@@ -238,10 +244,10 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - 按 GuardKey 隔离：同一对话、同一 Stage 的不同 childScope 可以并存，不会互相覆盖
 - 同一 Task.md 支持多个 Guard 独立锁块；pass/cancel/force 按 guardId 精确处理，保留其它活跃 Guard 锁
 - Guard 对话数据固定绑定当前宿主的明确 conversationId，不跨宿主操作异源 Guard
-- "modelChain=\"auto|antigravity|codex|claude-code|cc|grok\"" 只控制审核模型；旧 chain 参数继续作为 modelChain 兼容别名；显式 grok 使用 progrok proxy，显式 claude-code 使用 Claude Code CLI，普通 auto 不默认消耗 CC 额度
+- "modelChain=\"auto|antigravity|codex|claude-code|cc|grok|agy\"" 只控制审核模型；旧 chain 参数继续作为 modelChain 兼容别名；显式 grok 使用 progrok proxy，显式 agy 使用本地三模型 fallback，显式 claude-code 使用 Claude Code CLI，普通 auto 不默认消耗 CC 额度
 - Codex 链路下，审核上下文来自本地线程索引与事件流重建结果，子代理线程默认作为引用或摘要处理
 - Codex HTTP broker 下，start/status/check/cancel 必须显式传 conversationId；check 默认同步作为门禁特例，只有显式 background=true 才进入后台任务；后台检查后用 taskId + waitSeconds=30-45 轮询
-- 后台任务使用独立 FIFO 队列，默认并发 2（MEMORY_STORE_BACKGROUND_MAX_CONCURRENCY / MEMORY_STORE_BACKGROUND_TASK_CONCURRENCY 可调），并带 deadline 与 timedOut 状态：Record update/batch update 默认 60 分钟，conversation batch export 默认 30 分钟，Guard/Golden Extract 默认 15 分钟；超时只标记任务 error，不重启 MCP 后端
+- 后台任务使用独立 FIFO 队列，默认 lane 并发 2（MEMORY_STORE_BACKGROUND_MAX_CONCURRENCY / MEMORY_STORE_BACKGROUND_TASK_CONCURRENCY 可调），并带 deadline 与 timedOut 状态。Record update 与 batch update 各有独立的有界 materialization/任务执行 lane，可用 MEMORY_STORE_RECORD_UPDATE_BACKGROUND_CONCURRENCY / MEMORY_STORE_RECORD_BATCH_UPDATE_BACKGROUND_CONCURRENCY 调高，但有效并发不会低于 provider 物理上限 8；这两个 lane 不是模型许可，真实模型 active 仍只由 provider adapter/pump 控制。Record update/batch update 默认 60 分钟，conversation batch export 默认 30 分钟，Guard/Golden Extract 默认 15 分钟；超时只标记任务 error，不重启 MCP 后端
 
 ## 三级搜索引擎 (v1.10+)
 - Record search / conversation list+search / memory_query / memory_batch(query) 均已升级

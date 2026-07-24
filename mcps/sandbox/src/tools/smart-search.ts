@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Smart Search 工具 — 三模式代码搜索
  *
  * exact:  ripgrep 精确匹配（替代 grep_search）
@@ -59,7 +59,6 @@ interface SmartBridgeOptions extends Record<string, unknown> {
     reasoningEffort?: ProgrokReasoningEffort;
     fallbackModel?: string | false;
 }
-
 function resolveModelChainParam(chain?: ModelChain, modelChain?: ModelChain): ModelChain {
     return modelChain ?? chain ?? "auto";
 }

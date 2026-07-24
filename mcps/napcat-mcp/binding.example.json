@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "bindingName": "example-group-notify",
+  "expectedSelfId": "1000000001",
+  "expectedNickname": "ExampleBot",
+  "groupId": "2000000001",
+  "groupName": "ExampleGroup",
+  "expectedMemberCount": 4,
+  "allowedEvents": [
+    "started",
+    "heartbeat",
+    "paused",
+    "resumed",
+    "stopped",
+    "recovery",
+    "completed",
+    "test"
+  ],
+  "minimumHeartbeatMinutes": 5,
+  "dedupeRetentionDays": 30,
+  "requireGroupIdentityCheckBeforeSend": true,
+  "requireMessageVerification": true
+}

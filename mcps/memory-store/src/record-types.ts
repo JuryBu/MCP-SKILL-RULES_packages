@@ -3,16 +3,89 @@
 import type { ConversationRound } from "./trajectory.js";
 import type { Chain } from "./chain.js";
 import type { GrokExecDiagnostics } from "./grok-client.js";
+import type { ProviderTransportLease } from "./provider-transport-adapter.js";
+import type { FailureClass } from "./record-scheduler-contracts.js";
 
 export interface RecordModelCallResult {
     text: string | null;
     error?: string;
     timedOut?: boolean;
     cancelled?: boolean;
+    failureClass?: FailureClass;
     chainUsed?: Chain | null;
     modelUsed?: string | null;
     grokDiagnostics?: GrokExecDiagnostics;
 }
+
+export interface RecordModelCallInvokeOptions {
+    transportLease?: ProviderTransportLease;
+    attemptId?: string;
+    idempotencyKey?: string;
+}
+
+export interface RecordSchedulerModelCallRecipe {
+    recipeVersion: 1;
+    templateId: string;
+    range: {
+        axis: "round" | "step";
+        start: number;
+        end: number;
+    };
+    composeOrder: number;
+    continuationKey?: string;
+}
+
+export interface RecordSchedulerProviderCall {
+    provider: Exclude<Chain, "auto">;
+    model: string;
+    logicalTimeout: number;
+    invokeTimeout: number;
+    invoke: (options?: RecordModelCallInvokeOptions) => Promise<RecordModelCallResult>;
+    invokePrompt: (prompt: string, options?: RecordModelCallInvokeOptions) => Promise<RecordModelCallResult>;
+}
+
+export interface RecordSchedulerLegacyProviderCallProjection {
+    provider: Exclude<Chain, "auto">;
+    model: string;
+    invokeTimeout: number;
+    retryOrdinal: number;
+    invoke: (options?: RecordModelCallInvokeOptions) => Promise<RecordModelCallResult>;
+}
+
+export interface RecordSchedulerModelCallContext extends RecordSchedulerLegacyProviderCallProjection {
+    logicalCallKey: string;
+    prompt: string;
+    logicalTimeout: number;
+    routePlan: readonly Exclude<Chain, "auto">[];
+    providerCalls: readonly RecordSchedulerProviderCall[];
+    recipe: RecordSchedulerModelCallRecipe;
+    retryBudget: number;
+    splitPrompt: (range: RecordSchedulerModelCallRecipe["range"]) => string;
+    trafficClass?: "foreground" | "record-batch";
+    context: {
+        requestedChain: Chain;
+        background: boolean;
+        providerTrafficClass: "record";
+        grokContext: "record";
+    };
+}
+
+export interface RecordModelCallLogicalIdentity {
+    prompt: string;
+    logicalTimeout: number;
+    routePlan: readonly Exclude<Chain, "auto">[];
+    recipe: RecordSchedulerModelCallRecipe;
+    retryBudget: number;
+    trafficClass?: "foreground" | "record-batch";
+    context: {
+        requestedChain: Chain;
+        background: boolean;
+        providerTrafficClass: "record";
+        grokContext: "record";
+    };
+}
+
+export type RecordSchedulerModelCallHook = (call: RecordSchedulerModelCallContext) => Promise<RecordModelCallResult>;
 
 export type RecordAbortReason = "cancelled" | "settled";
 
@@ -156,6 +229,9 @@ export interface GenerateRecordResult {
 export interface GenerateRecordOptions {
     background?: boolean;
     trafficClass?: "foreground" | "record-batch";
+    schedulerManagedExecution?: boolean;
+    schedulerModelCall?: RecordSchedulerModelCallHook;
+    schedulerRetryBudget?: number;
     allowClaudeCodeFallback?: boolean;
     parallelMode?: RecordParallelMode;
     force?: boolean;

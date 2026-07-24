@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { parseRounds, type ConversationRound } from "../trajectory.js";
@@ -17,7 +17,7 @@ import type { BackgroundTaskContext } from "../background-tasks.js";
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, resolveChainSplit, formatChainSplit, decideBackground, type Chain, type ChainInput, type DataChain, type DataChainInput } from "../chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "../ls-model-defaults.js";
 import { formatToolError } from "../error-format.js";
-import { modelChainInputSchema } from "./schema-utils.js";
+import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
 import type { ResumePayloadValue } from "../background-recovery.js";
 
 /**
@@ -100,9 +100,9 @@ export function registerGoldenExtract(server: McpServer): void {
             stepEnd: z.number().optional().describe("结束步骤偏移"),
             autoCompare: z.boolean().optional().describe("是否自动与记忆对比去重（默认 true）"),
             workspace: z.string().optional().describe("搜索去重的目标工作区（默认搜索全部）"),
-            chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\" 只作为 modelChain"),
-            dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional().describe("读取对话数据的宿主链路；未填用 chain，支持 windsurf"),
-            modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain；grok=本机 progrok proxy。Windsurf 只支持 dataChain"),
+            chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).optional().describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
+            dataChain: dataChainInputSchema("dataChain", "读取对话数据的宿主链路；未填用 chain，支持 windsurf；agy 与 Grok 只支持 modelChain"),
+            modelChain: modelChainInputSchema("modelChain", "调用模型提取片段的链路；未填用 chain；agy=本地 CLI 的三模型内部 fallback，Grok=本机 progrok proxy。Windsurf 只支持 dataChain"),
             background: z.boolean().optional().describe("三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时自动后台排队，后续用 taskId 查询"),
             taskId: z.string().optional().describe("查询后台提取任务的 taskId"),
             waitSeconds: z.number().optional().describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),

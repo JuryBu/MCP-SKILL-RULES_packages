@@ -16,6 +16,22 @@ import {
     type RouterEndpoint,
 } from "./conversation-router.js";
 import { windsurfCascadeExistsLocally } from "./windsurf-local-store.js";
+import {
+    buildExactFetchEvidence,
+    buildFullSourceReadEvidence,
+    buildRecordSourceSnapshot,
+    buildSourceEnumerationEvidence,
+    classifySourceEvidence,
+    SOURCE_EVIDENCE_ADAPTER_VERSION,
+    type ExactFetchEvidence,
+    type FullSourceReadEvidence,
+    type RecordSourceSnapshot,
+    type SourceConversationIdentity,
+    type SourceEvidenceClassification,
+    type SourceEvidenceIssue,
+    type SourceEnumerationEvidence,
+    type SourceRevision,
+} from "./source-evidence-contracts.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -31,6 +47,9 @@ const DEFAULT_WINDSURF_CACHE_REVALIDATE_MS = 5_000;
 const DEFAULT_WINDSURF_LS_CONCURRENCY = 6;
 const DEFAULT_WINDSURF_LS_RESERVED_SLOTS = 2;
 const DEFAULT_WINDSURF_TIMING_SLOW_MS = 250;
+const DEFAULT_WINDSURF_SOURCE_EVIDENCE_MAX_PAGES = 200;
+const WINDSURF_IMAGE_ATTACHMENT_MAX_ENCODED_CHARS = 8 * 1024 * 1024;
+const WINDSURF_IMAGE_ATTACHMENT_MAX_DECODED_BYTES = Math.floor((WINDSURF_IMAGE_ATTACHMENT_MAX_ENCODED_CHARS * 3) / 4);
 const READ_ONLY_METHODS = new Set([
     "Heartbeat",
     "GetAllCascadeTrajectories",
@@ -1337,7 +1356,8 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
         const rawTitle = toStringValue(record.title).trim();
         const renamedTitle = toStringValue(record.renamedTitle).trim();
         const job = subagentJobs.get(id);
-        const titleBestEffort = (toStringValue(record.title_best_effort) || toStringValue(record.titleBestEffort) || job?.titleBestEffort || "").trim();
+        const subagent = asRecord(record.subagent);
+        const titleBestEffort = (toStringValue(record.title_best_effort) || toStringValue(record.titleBestEffort) || toStringValue(subagent.title_best_effort) || toStringValue(subagent.titleBestEffort) || job?.titleBestEffort || "").trim();
         const summary = rawSummary || rawTitle || "Untitled WSF Cascade";
         const title = renamedTitle || summary;
         const titleSource: WindsurfConversationSummary["titleSource"] = renamedTitle
@@ -1349,10 +1369,27 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
                     : "fallback";
         const workspaceUris = extractWorkspaceUrisFromRecord(record);
         const referencedFiles = extractReferencedFilesFromRecord(record);
-        const parentConversationId = job?.mainId || null;
+        const parentConversationId = job?.mainId
+            || firstStringField(record, ["parentConversationId", "parent_conversation_id", "parentCascadeId", "parent_cascade_id", "mainId", "main_id"])
+            || firstStringField(subagent, ["parentConversationId", "parent_conversation_id", "parentCascadeId", "parent_cascade_id", "mainId", "main_id"])
+            || null;
         const subagentMarkerTitle = [titleBestEffort, renamedTitle, rawTitle, rawSummary].find(isWindsurfSubagentTitle) || "";
-        const isChildThread = Boolean(parentConversationId) || Boolean(subagentMarkerTitle);
-        const subagentRole = job?.label || windsurfSubagentRoleFromTitle(subagentMarkerTitle) || (isChildThread ? "windsurf-subagent" : null);
+        const explicitSubagent = record.isChildThread === true
+            || record.is_child_thread === true
+            || record.isSubagent === true
+            || record.is_subagent === true
+            || record.subagent === true
+            || Object.keys(subagent).length > 0;
+        const isChildThread = explicitSubagent || Boolean(parentConversationId) || Boolean(subagentMarkerTitle);
+        const subagentRole = job?.label
+            || firstStringField(record, ["agentRole", "agent_role", "subagentRole", "subagent_role"])
+            || firstStringField(subagent, ["agentRole", "agent_role", "subagentRole", "subagent_role", "label"])
+            || windsurfSubagentRoleFromTitle(subagentMarkerTitle)
+            || (isChildThread ? "windsurf-subagent" : null);
+        const agentNickname = firstStringField(record, ["agentNickname", "agent_nickname", "subagentNickname", "subagent_nickname"])
+            || firstStringField(subagent, ["agentNickname", "agent_nickname", "subagentNickname", "subagent_nickname", "nickname"])
+            || subagentMarkerTitle
+            || undefined;
         return {
             id,
             cascadeId: id,
@@ -1364,7 +1401,7 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
             isChildThread,
             parentConversationId,
             agentRole: subagentRole,
-            agentNickname: subagentMarkerTitle || undefined,
+            agentNickname,
             summary,
             stepCount: toNumberValue(record.stepCount),
             createdTime: toStringValue(record.createdTime) || undefined,
@@ -1982,24 +2019,753 @@ export async function loadWindsurfConversation(
     return localFallbackResult(resolvedId);
 }
 
+export interface WindsurfSourceEvidenceScanOptions {
+    transport?: WindsurfLsTransport;
+    endpoint?: Pick<WindsurfLsEndpoint, "pid" | "port">;
+    workspaceId?: string;
+    workspacePath?: string | null;
+    sourceAuthority?: string;
+    authoritativeRoot?: string;
+    sourceCanonicalPath?: string | null;
+    scanId?: string;
+    sequence?: number;
+    now?: () => Date;
+    maxPages?: number;
+    requestClass?: ConcurrencyGateRequestClass;
+}
+
+export interface WindsurfSourceEvidenceScanResult {
+    scanId: string;
+    cacheBypassed: true;
+    identity: SourceConversationIdentity;
+    enumeration: SourceEnumerationEvidence;
+    exactFetch: ExactFetchEvidence;
+    classification: SourceEvidenceClassification;
+    fullSourceRead?: FullSourceReadEvidence;
+    sourceSnapshot?: RecordSourceSnapshot;
+    thread?: WindsurfConversationSummary;
+    readResult?: WindsurfConversationReadResult;
+    exactFetchAttempted: boolean;
+}
+
+interface WindsurfSourceEvidenceTransport {
+    transport: WindsurfLsTransport;
+    endpoint?: Pick<WindsurfLsEndpoint, "pid" | "port">;
+}
+
+interface WindsurfSourceEvidencePagination {
+    cursor: string | null;
+    pages: number;
+    limit: number | null;
+    truncated: boolean;
+}
+
+interface WindsurfSourceEvidenceListing {
+    threads: WindsurfConversationSummary[];
+    owners: Map<string, WindsurfSourceEvidenceTransport>;
+    pagination: WindsurfSourceEvidencePagination;
+    issues: SourceEvidenceIssue[];
+    complete: boolean;
+    fingerprint: string;
+}
+
+interface WindsurfSourceEvidenceSteps {
+    steps: unknown[];
+    pagesRead: number;
+    partial: boolean;
+    limit: number | null;
+    issues: SourceEvidenceIssue[];
+}
+
+interface WindsurfSourceEvidenceListPage {
+    threads: WindsurfConversationSummary[];
+    nextCursor: string | null;
+    partial: boolean;
+    missingCursor: boolean;
+}
+
+interface WindsurfSourceEvidenceStepPage {
+    steps: unknown[];
+    partial: boolean;
+}
+
+export async function scanWindsurfSourceEvidence(
+    cascadeId: string,
+    options: WindsurfSourceEvidenceScanOptions = {},
+): Promise<WindsurfSourceEvidenceScanResult> {
+    const requestedId = cascadeId.trim();
+    if (!requestedId) throw new Error("Windsurf source evidence 需要非空 cascadeId");
+
+    const now = options.now || (() => new Date());
+    const scanId = options.scanId?.trim() || crypto.randomUUID();
+    const initialSequence = Math.max(1, Math.floor(options.sequence || 1));
+    const sources = await resolveWindsurfSourceEvidenceTransports(options);
+    const enumerationStartedAt = windsurfSourceEvidenceTimestamp(now);
+    const initialListing = await collectWindsurfSourceEvidenceListing(sources.transports, options);
+    const enumerationCompletedAt = windsurfSourceEvidenceTimestamp(now);
+    const initialThread = initialListing.threads.find(thread => thread.id === requestedId || thread.cascadeId === requestedId);
+    const initialTargetStatus = initialThread
+        ? "present" as const
+        : initialListing.complete
+            ? "absent" as const
+            : "unknown" as const;
+    const targetIssues = initialThread ? validateWindsurfSourceEvidenceThread(initialThread) : [];
+    const sharedIssues = mergeWindsurfSourceEvidenceIssues(sources.issues, initialListing.issues, targetIssues);
+    const exactStartedAt = windsurfSourceEvidenceTimestamp(now);
+    let exactFetchAttempted = false;
+    let exactFetchResult: ExactFetchEvidence["exactFetchResult"] = "unresolved";
+    let exactIssues: SourceEvidenceIssue[] = [];
+    let exactReadResult: WindsurfConversationReadResult | undefined;
+    const exactSource = initialThread
+        ? initialListing.owners.get(initialThread.id) || initialListing.owners.get(initialThread.cascadeId) || sources.transports[0]
+        : sources.transports[0];
+
+    if (exactSource && (initialTargetStatus === "present" || initialTargetStatus === "absent")) {
+        exactFetchAttempted = true;
+        try {
+            const steps = await readWindsurfSourceEvidenceSteps(exactSource.transport, requestedId, options);
+            const thread = initialThread || createWindsurfSourceEvidenceFallbackThread(requestedId);
+            const rounds = windsurfStepsToConversationRounds(steps.steps);
+            exactIssues = mergeWindsurfSourceEvidenceIssues(exactIssues, steps.issues);
+            exactFetchResult = steps.partial ? "unresolved" : "present";
+            exactReadResult = {
+                cascadeId: requestedId,
+                thread,
+                steps: steps.steps,
+                rounds,
+                pagesRead: steps.pagesRead,
+                totalSteps: Math.max(steps.steps.length, thread.stepCount),
+                partial: steps.partial,
+                warnings: steps.issues.map(issue => issue.message),
+            };
+            if (initialThread && steps.steps.length !== initialThread.stepCount) {
+                exactIssues = mergeWindsurfSourceEvidenceIssues(exactIssues, [
+                    windsurfSourceEvidenceIssue(
+                        "pagination_incomplete",
+                        `WSF exact steps 数量 ${steps.steps.length} 与列表 stepCount ${initialThread.stepCount} 不一致`,
+                    ),
+                ]);
+            }
+        } catch (error) {
+            if (isWindsurfSourceEvidenceNotFound(error)) {
+                exactFetchResult = "not_found";
+            } else {
+                exactFetchResult = "unresolved";
+                exactIssues = mergeWindsurfSourceEvidenceIssues(exactIssues, [windsurfSourceEvidenceIssueFromError(error, "exact")]);
+            }
+        }
+    }
+
+    let verificationListing: WindsurfSourceEvidenceListing | undefined;
+    if (exactFetchAttempted) {
+        verificationListing = await collectWindsurfSourceEvidenceListing(sources.transports, options);
+        sharedIssues.push(...verificationListing.issues);
+        if (verificationListing.fingerprint !== initialListing.fingerprint) {
+            sharedIssues.push(windsurfSourceEvidenceIssue("revision_drift", "WSF 枚举在 exact fetch 前后发生变化"));
+        }
+    }
+
+    const allSharedIssues = mergeWindsurfSourceEvidenceIssues(sharedIssues);
+    const allExactIssues = mergeWindsurfSourceEvidenceIssues(allSharedIssues, exactIssues);
+    const pagination = mergeWindsurfSourceEvidencePagination(initialListing.pagination, verificationListing?.pagination);
+    const enumerationComplete = sources.transports.length > 0
+        && initialListing.complete
+        && (!verificationListing || verificationListing.complete)
+        && !allSharedIssues.some(issue => issue.code === "timeout" || issue.code === "limit_reached" || issue.code === "pagination_incomplete" || issue.code === "parse_error" || issue.code === "source_unavailable" || issue.code === "revision_drift");
+    const resolvedThread = verificationListing?.threads.find(thread => thread.id === requestedId || thread.cascadeId === requestedId) || initialThread;
+    if (exactReadResult && resolvedThread) exactReadResult.thread = resolvedThread;
+    const identity = buildWindsurfSourceEvidenceIdentity(requestedId, resolvedThread, sources.transports, options);
+    const sourceRevision = buildWindsurfSourceEvidenceRevision(identity, initialListing, verificationListing, exactReadResult, initialTargetStatus);
+    const exactCompletedAt = windsurfSourceEvidenceTimestamp(now);
+
+    const enumeration = buildSourceEnumerationEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "windsurf",
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete,
+        cacheBypassed: true,
+        exactFetchResult,
+        errors: allSharedIssues,
+        warnings: [],
+        observedAt: {
+            scanId,
+            sequence: initialSequence,
+            startedAt: enumerationStartedAt,
+            completedAt: enumerationCompletedAt,
+        },
+        targetStatus: initialTargetStatus,
+    });
+    const exactFetch = buildExactFetchEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "windsurf",
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete,
+        cacheBypassed: true,
+        exactFetchResult,
+        errors: allExactIssues,
+        warnings: [],
+        observedAt: {
+            scanId,
+            sequence: initialSequence + 1,
+            startedAt: exactStartedAt,
+            completedAt: exactCompletedAt,
+        },
+    });
+    const classification = classifySourceEvidence({ enumeration, exactFetch });
+    const fullSourceRead = buildWindsurfFullSourceReadEvidence(
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete,
+        exactFetchResult,
+        allExactIssues,
+        exactFetch.observedAt,
+        exactReadResult,
+    );
+    const sourceSnapshot = fullSourceRead
+        ? buildRecordSourceSnapshot({ snapshotId: `windsurf:${requestedId}:${sourceRevision.revision}`, fullSourceRead })
+        : undefined;
+
+    return {
+        scanId,
+        cacheBypassed: true,
+        identity,
+        enumeration,
+        exactFetch,
+        classification,
+        fullSourceRead,
+        sourceSnapshot,
+        thread: resolvedThread,
+        readResult: exactReadResult,
+        exactFetchAttempted,
+    };
+}
+
+async function resolveWindsurfSourceEvidenceTransports(options: WindsurfSourceEvidenceScanOptions): Promise<{
+    transports: WindsurfSourceEvidenceTransport[];
+    issues: SourceEvidenceIssue[];
+}> {
+    if (options.transport) return { transports: [{ transport: options.transport, endpoint: options.endpoint }], issues: [] };
+    try {
+        const endpoints = await getWindsurfEndpointPool();
+        if (!endpoints.length) {
+            return {
+                transports: [],
+                issues: [windsurfSourceEvidenceIssue("source_unavailable", "未发现可用于 WSF source evidence 的活动 Language Server endpoint")],
+            };
+        }
+        return {
+            transports: endpoints.map(endpoint => ({ transport: makeWindsurfTransport(endpoint), endpoint })),
+            issues: [],
+        };
+    } catch (error) {
+        return { transports: [], issues: [windsurfSourceEvidenceIssueFromError(error, "list")] };
+    }
+}
+
+async function collectWindsurfSourceEvidenceListing(
+    sources: WindsurfSourceEvidenceTransport[],
+    options: WindsurfSourceEvidenceScanOptions,
+): Promise<WindsurfSourceEvidenceListing> {
+    const threads = new Map<string, WindsurfConversationSummary>();
+    const owners = new Map<string, WindsurfSourceEvidenceTransport>();
+    const issues: SourceEvidenceIssue[] = [];
+    const paginations: WindsurfSourceEvidencePagination[] = [];
+
+    for (const source of sources) {
+        const listing = await listWindsurfSourceEvidenceFromTransport(source.transport, options);
+        paginations.push(listing.pagination);
+        issues.push(...listing.issues);
+        for (const thread of listing.threads) {
+            const existing = threads.get(thread.id) || threads.get(thread.cascadeId);
+            if (existing && windsurfSourceEvidenceHash(windsurfSourceEvidenceThreadProjection(existing)) !== windsurfSourceEvidenceHash(windsurfSourceEvidenceThreadProjection(thread))) {
+                issues.push(windsurfSourceEvidenceIssue("revision_drift", `多个 WSF endpoint 对 ${thread.id} 返回不同摘要`));
+                continue;
+            }
+            threads.set(thread.id, thread);
+            owners.set(thread.id, source);
+            if (thread.cascadeId) {
+                threads.set(thread.cascadeId, thread);
+                owners.set(thread.cascadeId, source);
+            }
+        }
+    }
+
+    const uniqueThreads = [...new Map([...threads.values()].map(thread => [thread.id, thread])).values()]
+        .sort((left, right) => left.id.localeCompare(right.id, "en"));
+    const pagination = mergeWindsurfSourceEvidencePagination(...paginations);
+    const normalizedIssues = mergeWindsurfSourceEvidenceIssues(issues);
+    const complete = sources.length > 0
+        && !pagination.truncated
+        && pagination.cursor === null
+        && pagination.limit === null
+        && normalizedIssues.length === 0;
+    return {
+        threads: uniqueThreads,
+        owners,
+        pagination,
+        issues: normalizedIssues,
+        complete,
+        fingerprint: windsurfSourceEvidenceHash(uniqueThreads.map(windsurfSourceEvidenceThreadProjection)),
+    };
+}
+
+async function listWindsurfSourceEvidenceFromTransport(
+    transport: WindsurfLsTransport,
+    options: WindsurfSourceEvidenceScanOptions,
+): Promise<{ threads: WindsurfConversationSummary[]; pagination: WindsurfSourceEvidencePagination; issues: SourceEvidenceIssue[] }> {
+    const maxPages = normalizeWindsurfSourceEvidenceMaxPages(options.maxPages);
+    let cursor: string | null = null;
+    let pages = 0;
+    const threads: WindsurfConversationSummary[] = [];
+    const issues: SourceEvidenceIssue[] = [];
+    const seenCursors = new Set<string>();
+
+    while (pages < maxPages) {
+        try {
+            const payload = cursor === null ? {} : { cursor };
+            const response = await transport("GetAllCascadeTrajectories", payload, { requestClass: options.requestClass });
+            const page = parseWindsurfSourceEvidenceListPage(response);
+            pages += 1;
+            threads.push(...page.threads);
+            if (page.partial) issues.push(windsurfSourceEvidenceIssue("pagination_incomplete", "WSF list 响应标记为 partial 或 truncated"));
+            if (page.missingCursor) issues.push(windsurfSourceEvidenceIssue("pagination_incomplete", "WSF list 声明存在后续页但没有 nextCursor"));
+            if (page.partial || page.missingCursor || page.nextCursor === null) {
+                return {
+                    threads,
+                    pagination: { cursor: page.nextCursor, pages, limit: null, truncated: page.partial || page.missingCursor },
+                    issues: mergeWindsurfSourceEvidenceIssues(issues),
+                };
+            }
+            if (seenCursors.has(page.nextCursor)) {
+                issues.push(windsurfSourceEvidenceIssue("pagination_incomplete", "WSF list pagination cursor 重复，无法证明枚举完整"));
+                return {
+                    threads,
+                    pagination: { cursor: page.nextCursor, pages, limit: null, truncated: true },
+                    issues: mergeWindsurfSourceEvidenceIssues(issues),
+                };
+            }
+            seenCursors.add(page.nextCursor);
+            cursor = page.nextCursor;
+        } catch (error) {
+            issues.push(windsurfSourceEvidenceIssueFromError(error, "list"));
+            return {
+                threads,
+                pagination: { cursor, pages, limit: null, truncated: true },
+                issues: mergeWindsurfSourceEvidenceIssues(issues),
+            };
+        }
+    }
+
+    issues.push(windsurfSourceEvidenceIssue("limit_reached", `WSF list 达到 ${maxPages} 页安全上限，不能将 partial 当成完整枚举`));
+    return {
+        threads,
+        pagination: { cursor, pages, limit: maxPages, truncated: true },
+        issues: mergeWindsurfSourceEvidenceIssues(issues),
+    };
+}
+
+function parseWindsurfSourceEvidenceListPage(value: unknown): WindsurfSourceEvidenceListPage {
+    const response = windsurfSourceEvidenceRecord(value, "WSF list response");
+    if (!Object.prototype.hasOwnProperty.call(response, "trajectorySummaries")) {
+        throw new Error("WSF list response 缺少 trajectorySummaries");
+    }
+    const summaries = response.trajectorySummaries;
+    if (Array.isArray(summaries)) {
+        summaries.forEach((summary, index) => windsurfSourceEvidenceRecord(summary, `WSF list trajectorySummaries[${index}]`));
+    } else {
+        const summaryRecord = windsurfSourceEvidenceRecord(summaries, "WSF list trajectorySummaries");
+        for (const [cascadeId, summary] of Object.entries(summaryRecord)) {
+            windsurfSourceEvidenceRecord(summary, `WSF list trajectorySummaries.${cascadeId}`);
+        }
+    }
+    const nextCursor = windsurfSourceEvidenceOptionalString(response.nextCursor, "WSF list nextCursor")
+        || windsurfSourceEvidenceOptionalString(response.nextPageToken, "WSF list nextPageToken")
+        || windsurfSourceEvidenceOptionalString(response.continuationToken, "WSF list continuationToken");
+    const partial = windsurfSourceEvidenceOptionalBoolean(response.partial, "WSF list partial")
+        || windsurfSourceEvidenceOptionalBoolean(response.truncated, "WSF list truncated")
+        || windsurfSourceEvidenceOptionalBoolean(response.incomplete, "WSF list incomplete");
+    const hasMore = windsurfSourceEvidenceOptionalBoolean(response.hasMore, "WSF list hasMore")
+        || windsurfSourceEvidenceOptionalBoolean(response.more, "WSF list more");
+    return {
+        threads: normalizeWindsurfTrajectoryList(response),
+        nextCursor,
+        partial,
+        missingCursor: hasMore && nextCursor === null,
+    };
+}
+
+async function readWindsurfSourceEvidenceSteps(
+    transport: WindsurfLsTransport,
+    cascadeId: string,
+    options: WindsurfSourceEvidenceScanOptions,
+): Promise<WindsurfSourceEvidenceSteps> {
+    const maxPages = normalizeWindsurfSourceEvidenceMaxPages(options.maxPages);
+    const steps: unknown[] = [];
+    const seenOffsets = new Set<number>();
+    let offset = 0;
+
+    for (let page = 0; page < maxPages; page++) {
+        if (seenOffsets.has(offset)) {
+            return {
+                steps,
+                pagesRead: seenOffsets.size,
+                partial: true,
+                limit: null,
+                issues: [windsurfSourceEvidenceIssue("pagination_incomplete", "WSF exact fetch stepOffset 重复，无法证明 trajectory 完整")],
+            };
+        }
+        seenOffsets.add(offset);
+        const response = await transport("GetCascadeTrajectorySteps", { cascadeId, stepOffset: offset }, { requestClass: options.requestClass });
+            const page = parseWindsurfSourceEvidenceStepPage(response);
+            steps.push(...page.steps);
+            if (page.steps.some(step => hasOversizedWindsurfImageBase64(step))) {
+                return {
+                    steps,
+                    pagesRead: seenOffsets.size,
+                    partial: true,
+                    limit: null,
+                    issues: [windsurfSourceEvidenceIssue("limit_reached", "WSF exact fetch 包含超过附件安全上限的 base64，不能生成完整 source snapshot")],
+                };
+            }
+            if (page.partial) {
+                return {
+                    steps,
+                    pagesRead: seenOffsets.size,
+                    partial: true,
+                    limit: null,
+                    issues: [windsurfSourceEvidenceIssue("pagination_incomplete", "WSF exact fetch 响应标记为 partial、truncated 或 incomplete")],
+                };
+            }
+            if (page.steps.length === 0) {
+                return { steps, pagesRead: seenOffsets.size, partial: false, limit: null, issues: [] };
+            }
+            offset = nextOffsetFromResponse(response, offset, page.steps.length);
+    }
+
+    return {
+        steps,
+        pagesRead: seenOffsets.size,
+        partial: true,
+        limit: maxPages,
+        issues: [windsurfSourceEvidenceIssue("limit_reached", `WSF exact fetch 达到 ${maxPages} 页安全上限，不能生成完整 source snapshot`)],
+    };
+}
+
+function parseWindsurfSourceEvidenceStepPage(value: unknown): WindsurfSourceEvidenceStepPage {
+    const response = windsurfSourceEvidenceRecord(value, "WSF exact fetch response");
+    const partial = windsurfSourceEvidenceOptionalBoolean(response.partial, "WSF exact fetch partial")
+        || windsurfSourceEvidenceOptionalBoolean(response.truncated, "WSF exact fetch truncated")
+        || windsurfSourceEvidenceOptionalBoolean(response.incomplete, "WSF exact fetch incomplete");
+    const fields = ["steps", "trajectorySteps", "cascadeTrajectorySteps"];
+    for (const field of fields) {
+        if (!Object.prototype.hasOwnProperty.call(response, field)) continue;
+        if (!Array.isArray(response[field])) throw new Error(`WSF exact fetch ${field} 必须是数组`);
+        return { steps: response[field] as unknown[], partial };
+    }
+    if (Object.keys(response).length === 0) return { steps: [], partial };
+    throw new Error("WSF exact fetch response 缺少 steps");
+}
+
+function buildWindsurfSourceEvidenceIdentity(
+    conversationId: string,
+    thread: WindsurfConversationSummary | undefined,
+    sources: WindsurfSourceEvidenceTransport[],
+    options: WindsurfSourceEvidenceScanOptions,
+): SourceConversationIdentity {
+    const endpointIdentity = sources
+        .map(source => source.endpoint ? `${source.endpoint.pid}:${source.endpoint.port}` : "direct-transport")
+        .sort((left, right) => left.localeCompare(right, "en"));
+    const canonicalPath = options.workspacePath ?? thread?.cwd ?? thread?.workspaceUris?.[0] ?? null;
+    const workspaceId = options.workspaceId?.trim() || canonicalPath || "windsurf:workspace:unknown";
+    return {
+        workspace: {
+            workspaceId,
+            canonicalPath,
+        },
+        source: {
+            kind: sources.length > 1 ? "hybrid" : "endpoint",
+            authority: options.sourceAuthority?.trim() || "windsurf-language-server",
+            authoritativeRoot: options.authoritativeRoot?.trim() || `windsurf://endpoint-pool/${endpointIdentity.join(",") || "unavailable"}`,
+            canonicalPath: options.sourceCanonicalPath ?? null,
+        },
+        conversationId,
+    };
+}
+
+function buildWindsurfSourceEvidenceRevision(
+    identity: SourceConversationIdentity,
+    initialListing: WindsurfSourceEvidenceListing,
+    verificationListing: WindsurfSourceEvidenceListing | undefined,
+    readResult: WindsurfConversationReadResult | undefined,
+    targetStatus: "present" | "absent" | "unknown",
+): SourceRevision {
+    const completeReadResult = readResult && !readResult.partial ? readResult : undefined;
+    const contentHash = completeReadResult
+        ? windsurfSourceEvidenceHash({ steps: completeReadResult.steps, rounds: completeReadResult.rounds })
+        : windsurfSourceEvidenceHash({ listing: initialListing.fingerprint, targetStatus });
+    const contentCursor = completeReadResult
+        ? windsurfSourceEvidenceHash({ stepCount: completeReadResult.steps.length, contentHash, lastStep: completeReadResult.steps.at(-1) ?? null })
+        : null;
+    const eventWatermark = windsurfSourceEvidenceHash({
+        initialListing: initialListing.fingerprint,
+        verificationListing: verificationListing?.fingerprint ?? null,
+        sourceIdentity: identity.source,
+    });
+    return {
+        revision: windsurfSourceEvidenceHash({ identity, contentHash, contentCursor, eventWatermark, targetStatus }),
+        contentCursor,
+        eventWatermark,
+    };
+}
+
+function buildWindsurfFullSourceReadEvidence(
+    identity: SourceConversationIdentity,
+    sourceRevision: SourceRevision,
+    pagination: WindsurfSourceEvidencePagination,
+    enumerationComplete: boolean,
+    exactFetchResult: ExactFetchEvidence["exactFetchResult"],
+    issues: SourceEvidenceIssue[],
+    observedAt: ExactFetchEvidence["observedAt"],
+    readResult: WindsurfConversationReadResult | undefined,
+): FullSourceReadEvidence | undefined {
+    if (!readResult || exactFetchResult !== "present" || !enumerationComplete || issues.length > 0) return undefined;
+    if (readResult.partial || readResult.steps.length !== readResult.thread.stepCount || readResult.rounds.length === 0) return undefined;
+    const serialized = windsurfSourceEvidenceSerialize({ steps: readResult.steps, rounds: readResult.rounds });
+    return buildFullSourceReadEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "windsurf",
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete: true,
+        cacheBypassed: true,
+        exactFetchResult: "present",
+        errors: [],
+        warnings: [],
+        observedAt,
+        content: {
+            mode: "full",
+            byteLength: Buffer.byteLength(serialized, "utf8"),
+            contentHash: windsurfSourceEvidenceHash({ steps: readResult.steps, rounds: readResult.rounds }),
+            roundRange: { start: 1, end: readResult.rounds.length },
+            truncated: false,
+            staleCache: false,
+        },
+    });
+}
+
+function createWindsurfSourceEvidenceFallbackThread(cascadeId: string): WindsurfConversationSummary {
+    return {
+        id: cascadeId,
+        cascadeId,
+        title: cascadeId,
+        summary: cascadeId,
+        stepCount: 0,
+    };
+}
+
+function validateWindsurfSourceEvidenceThread(thread: WindsurfConversationSummary): SourceEvidenceIssue[] {
+    const issues: SourceEvidenceIssue[] = [];
+    if (!Number.isSafeInteger(thread.stepCount) || thread.stepCount < 0) {
+        issues.push(windsurfSourceEvidenceIssue("parse_error", `WSF list ${thread.id} 缺少有效 stepCount`));
+    }
+    if (!thread.lastModifiedTime) {
+        issues.push(windsurfSourceEvidenceIssue("parse_error", `WSF list ${thread.id} 缺少 lastModifiedTime`));
+    }
+    return issues;
+}
+
+function mergeWindsurfSourceEvidencePagination(...paginations: Array<WindsurfSourceEvidencePagination | undefined>): WindsurfSourceEvidencePagination {
+    const values = paginations.filter((pagination): pagination is WindsurfSourceEvidencePagination => Boolean(pagination));
+    return {
+        cursor: values.find(pagination => pagination.cursor !== null)?.cursor || null,
+        pages: values.reduce((total, pagination) => total + pagination.pages, 0),
+        limit: values.reduce<number | null>((current, pagination) => {
+            if (pagination.limit === null) return current;
+            return current === null ? pagination.limit : Math.max(current, pagination.limit);
+        }, null),
+        truncated: values.some(pagination => pagination.truncated),
+    };
+}
+
+function mergeWindsurfSourceEvidenceIssues(...groups: Array<readonly SourceEvidenceIssue[]>): SourceEvidenceIssue[] {
+    const deduplicated = new Map<string, SourceEvidenceIssue>();
+    for (const group of groups) {
+        for (const issue of group) deduplicated.set(`${issue.code}\u0000${issue.message}`, issue);
+    }
+    return [...deduplicated.values()].sort((left, right) => left.code === right.code ? left.message.localeCompare(right.message, "en") : left.code.localeCompare(right.code, "en"));
+}
+
+function windsurfSourceEvidenceIssue(code: SourceEvidenceIssue["code"], message: string): SourceEvidenceIssue {
+    return { code, message };
+}
+
+function windsurfSourceEvidenceIssueFromError(error: unknown, phase: "list" | "exact"): SourceEvidenceIssue {
+    const message = error instanceof Error ? error.message : String(error);
+    if (/\btimeout\b|timed out|abort(?:ed)?/iu.test(message)) return windsurfSourceEvidenceIssue("timeout", `WSF ${phase} 超时: ${truncate(message, 400)}`);
+    if (/^WSF (?:list response|list trajectorySummaries|exact fetch response|exact fetch (?:steps|trajectorySteps|cascadeTrajectorySteps))/u.test(message)) {
+        return windsurfSourceEvidenceIssue("parse_error", `WSF ${phase} payload 无法解析: ${truncate(message, 400)}`);
+    }
+    if (phase === "exact") return windsurfSourceEvidenceIssue("exact_fetch_failed", `WSF exact fetch 失败: ${truncate(message, 400)}`);
+    return windsurfSourceEvidenceIssue("source_unavailable", `WSF list 失败: ${truncate(message, 400)}`);
+}
+
+function isWindsurfSourceEvidenceNotFound(error: unknown): boolean {
+    const message = error instanceof Error ? error.message : String(error);
+    return /\b404\b|not[ _-]?found|does not exist|unknown cascade/iu.test(message);
+}
+
+function normalizeWindsurfSourceEvidenceMaxPages(value: number | undefined): number {
+    if (value === undefined) return DEFAULT_WINDSURF_SOURCE_EVIDENCE_MAX_PAGES;
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error("Windsurf source evidence maxPages 必须是正整数");
+    return value;
+}
+
+function windsurfSourceEvidenceRecord(value: unknown, label: string): Record<string, unknown> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} 必须是对象`);
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new Error(`${label} 必须是普通对象`);
+    return value as Record<string, unknown>;
+}
+
+function windsurfSourceEvidenceOptionalString(value: unknown, label: string): string | null {
+    if (value === undefined || value === null || value === "") return null;
+    if (typeof value !== "string") throw new Error(`${label} 必须是字符串`);
+    const normalized = value.trim();
+    if (!normalized) throw new Error(`${label} 不能为空白`);
+    return normalized;
+}
+
+function windsurfSourceEvidenceOptionalBoolean(value: unknown, label: string): boolean {
+    if (value === undefined || value === null) return false;
+    if (typeof value !== "boolean") throw new Error(`${label} 必须是布尔值`);
+    return value;
+}
+
+function windsurfSourceEvidenceThreadProjection(thread: WindsurfConversationSummary): Record<string, unknown> {
+    return {
+        id: thread.id,
+        cascadeId: thread.cascadeId,
+        trajectoryId: thread.trajectoryId || null,
+        title: thread.title,
+        renamedTitle: thread.renamedTitle || null,
+        titleBestEffort: thread.titleBestEffort || null,
+        titleSource: thread.titleSource || null,
+        isChildThread: Boolean(thread.isChildThread),
+        parentConversationId: thread.parentConversationId || null,
+        agentRole: thread.agentRole || null,
+        agentNickname: thread.agentNickname || null,
+        summary: thread.summary,
+        stepCount: thread.stepCount,
+        createdTime: thread.createdTime || null,
+        lastModifiedTime: thread.lastModifiedTime || null,
+        status: thread.status || null,
+        trajectoryType: thread.trajectoryType || null,
+        lastGeneratorModelUid: thread.lastGeneratorModelUid || null,
+        cwd: thread.cwd || null,
+        workspaceUris: thread.workspaceUris || [],
+        referencedFiles: thread.referencedFiles || [],
+    };
+}
+
+function windsurfSourceEvidenceTimestamp(now: () => Date): string {
+    const value = now();
+    if (!(value instanceof Date) || !Number.isFinite(value.getTime())) throw new Error("Windsurf source evidence now() 必须返回有效 Date");
+    return value.toISOString();
+}
+
+function windsurfSourceEvidenceHash(value: unknown): string {
+    return `sha256:${crypto.createHash("sha256").update(windsurfSourceEvidenceSerialize(value), "utf8").digest("hex")}`;
+}
+
+function windsurfSourceEvidenceSerialize(value: unknown): string {
+    if (value === null) return "null";
+    if (value === undefined) return "undefined";
+    if (typeof value === "string") return JSON.stringify(value.normalize("NFC"));
+    if (typeof value === "boolean") return value ? "true" : "false";
+    if (typeof value === "number") return Number.isFinite(value) && !Object.is(value, -0) ? JSON.stringify(value) : JSON.stringify(String(value));
+    if (typeof value === "bigint") return JSON.stringify(value.toString());
+    if (Array.isArray(value)) return `[${value.map(item => windsurfSourceEvidenceSerialize(item)).join(",")}]`;
+    if (typeof value === "object") {
+        const record = value as Record<string, unknown>;
+        return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key.normalize("NFC"))}:${windsurfSourceEvidenceSerialize(record[key])}`).join(",")}}`;
+    }
+    return JSON.stringify(String(value));
+}
+
 function extractUserText(userInput: Record<string, any>): string {
-    const direct = toStringValue(userInput.userResponse).trim();
-    if (direct) return direct;
+    const direct = toStringValue(userInput.userResponse);
+    if (direct.length > 0) return direct;
 
     const chunks: string[] = [];
     for (const item of asArray(userInput.items)) {
-        const text = toStringValue(asRecord(item).text).trim();
-        if (text && !chunks.includes(text)) chunks.push(text);
+        const text = toStringValue(asRecord(item).text);
+        if (text.length > 0 && !chunks.includes(text)) chunks.push(text);
     }
 
     return chunks.join("\n\n");
 }
 
 function estimateBase64Bytes(base64: string): number {
-    const clean = base64.replace(/\s+/gu, "");
-    if (!clean) return 0;
-    const padding = clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0;
-    return Math.max(0, Math.floor((clean.length * 3) / 4) - padding);
+    let encodedChars = 0;
+    let trailingPadding = 0;
+    for (let index = base64.length - 1; index >= 0; index -= 1) {
+        const character = base64.charCodeAt(index);
+        if (character === 9 || character === 10 || character === 11 || character === 12 || character === 13 || character === 32) continue;
+        encodedChars += 1;
+        if (encodedChars === trailingPadding + 1 && character === 61) {
+            trailingPadding += 1;
+        }
+    }
+    return Math.max(0, Math.floor((encodedChars * 3) / 4) - Math.min(trailingPadding, 2));
+}
+
+function exceedsWindsurfAttachmentBase64Limit(base64: string): boolean {
+    return base64.length > WINDSURF_IMAGE_ATTACHMENT_MAX_ENCODED_CHARS
+        || estimateBase64Bytes(base64) > WINDSURF_IMAGE_ATTACHMENT_MAX_DECODED_BYTES;
+}
+
+function hasOversizedWindsurfImageBase64(value: unknown, seen = new Set<object>()): boolean {
+    if (!value || typeof value !== "object") return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) return value.some(item => hasOversizedWindsurfImageBase64(item, seen));
+    for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+        if (key === "base64Data" && typeof nested === "string" && exceedsWindsurfAttachmentBase64Limit(nested)) return true;
+        if (hasOversizedWindsurfImageBase64(nested, seen)) return true;
+    }
+    return false;
+}
+
+function prepareWindsurfAttachmentBase64(value: unknown): { base64: string | null; sizeBytes: number; warning?: string } {
+    const raw = toStringValue(value);
+    if (!raw) return { base64: null, sizeBytes: 0 };
+
+    const sizeBytes = estimateBase64Bytes(raw);
+    if (exceedsWindsurfAttachmentBase64Limit(raw)) {
+        return {
+            base64: null,
+            sizeBytes,
+            warning: `WSF image base64 omitted because its encoded input exceeds the ${WINDSURF_IMAGE_ATTACHMENT_MAX_ENCODED_CHARS}-character safety limit`,
+        };
+    }
+
+    const base64 = raw.normalize("NFC").replace(/\s+/gu, "");
+    const normalizedSizeBytes = estimateBase64Bytes(base64);
+    if (exceedsWindsurfAttachmentBase64Limit(base64)) {
+        return {
+            base64: null,
+            sizeBytes: normalizedSizeBytes,
+            warning: `WSF image base64 omitted because its normalized payload exceeds the ${WINDSURF_IMAGE_ATTACHMENT_MAX_ENCODED_CHARS}-character safety limit`,
+        };
+    }
+
+    return { base64, sizeBytes: normalizedSizeBytes };
 }
 
 function extensionFromMime(mimeType: string): string {
@@ -2022,21 +2788,28 @@ function extensionFromMime(mimeType: string): string {
 function buildImageAttachment(image: unknown, stepIndex: number, imageIndex: number): ConversationAttachment {
     const record = asRecord(image);
     const mimeType = toStringValue(record.mimeType) || "image/png";
-    const base64 = toStringValue(record.base64Data).replace(/\s+/gu, "");
+    const preparedBase64 = prepareWindsurfAttachmentBase64(record.base64Data);
     const name = `wsf-step-${stepIndex}-image-${imageIndex + 1}${extensionFromMime(mimeType)}`;
     const descriptor: Record<string, unknown> = {
         kind: "image",
         source: "windsurf-data-url",
         name,
         mimeType,
-        sizeBytes: estimateBase64Bytes(base64),
+        sizeBytes: preparedBase64.sizeBytes,
         stepIndex,
     };
 
-    if (base64) {
-        descriptor.dataUrl = `data:${mimeType};base64,${base64}`;
+    if (preparedBase64.warning) {
+        descriptor.warning = preparedBase64.warning;
+    } else if (preparedBase64.base64) {
         try {
-            descriptor.sha256 = crypto.createHash("sha256").update(Buffer.from(base64, "base64")).digest("hex");
+            const decoded = Buffer.from(preparedBase64.base64, "base64");
+            if (decoded.byteLength > WINDSURF_IMAGE_ATTACHMENT_MAX_DECODED_BYTES) {
+                descriptor.warning = `WSF image base64 omitted because its decoded payload exceeds the ${WINDSURF_IMAGE_ATTACHMENT_MAX_DECODED_BYTES}-byte safety limit`;
+            } else {
+                descriptor.dataUrl = `data:${mimeType};base64,${preparedBase64.base64}`;
+                descriptor.sha256 = crypto.createHash("sha256").update(decoded).digest("hex");
+            }
         } catch {
             descriptor.warning = "WSF image base64 could not be hashed";
         }
@@ -2052,7 +2825,10 @@ function extractImageAttachments(step: Record<string, any>, stepIndex: number): 
 }
 
 function extractPlannerText(plannerResponse: Record<string, any>): string {
-    return toStringValue(plannerResponse.modifiedResponse).trim() || toStringValue(plannerResponse.response).trim();
+    if (typeof plannerResponse.modifiedResponse === "string" && plannerResponse.modifiedResponse.length > 0) {
+        return plannerResponse.modifiedResponse;
+    }
+    return typeof plannerResponse.response === "string" ? plannerResponse.response : "";
 }
 
 function extractMetadataToolCall(step: Record<string, any>): Record<string, any> {

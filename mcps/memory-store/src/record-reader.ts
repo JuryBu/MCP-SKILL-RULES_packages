@@ -84,6 +84,26 @@ export interface ReaderAggregates {
     decisions: ReaderAggregateItem[];
 }
 
+export interface RecordReaderCommitArtifactIdentity {
+    conversationId: string;
+    recordId: string;
+    commitId: string;
+    coveredRevision: string;
+    bodyHash: string;
+    recordCommitEpoch: number;
+}
+
+export interface RecordReaderCommitArtifact {
+    identity: RecordReaderCommitArtifactIdentity;
+    readerIndex: {
+        commitId: string;
+        bodyHash: string;
+        coveredRevision: string;
+        conversationId: string;
+        recordId: string;
+    };
+}
+
 export interface RecordReaderIndex {
     version: number;
     parserVersion: string;
@@ -100,6 +120,7 @@ export interface RecordReaderIndex {
     blocks: ReaderBlock[];
     aggregates: ReaderAggregates;
     warnings: string[];
+    commitArtifact?: RecordReaderCommitArtifact;
 }
 
 export interface SelectReaderBlocksOptions {

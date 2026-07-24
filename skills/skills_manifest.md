@@ -1,6 +1,6 @@
 # Skills Manifest
 
-Verified for the 2026-07-12 refresh. These are allow-listed portable user-side skills, not system bundled skills or plugin cache skills. Package validation checks every listed skill directory and its `SKILL.md`; byte-size snapshots are intentionally omitted because they become stale after harmless documentation edits.
+Verified for the 2026-07-24 refresh. These are license-reviewed portable user-side skills, not system bundled skills or plugin cache skills. Package validation checks every listed skill directory and its `SKILL.md`; byte-size snapshots are intentionally omitted because they become stale after harmless documentation edits.
 
 | Skill | Files | Notes |
 | --- | ---: | --- |
@@ -8,6 +8,7 @@ Verified for the 2026-07-12 refresh. These are allow-listed portable user-side s
 | `brand-guidelines` | 2 | Applies Anthropic brand colors and typography when that visual identity is appropriate. |
 | `canvas-design` | 83 | Creates polished static visual art in PNG and PDF formats. |
 | `frontend-design` | 2 | Builds distinctive production-grade web interfaces and components. |
+| `hatch-pet` | 29 | Creates, repairs, validates, visually checks, and packages Codex-compatible animated pets. |
 | `imagegen` | 11 | Generates and edits images through an OpenAI Image API workflow. |
 | `internal-comms` | 6 | Provides reusable internal-communication formats and workflows. |
 | `jupyter-notebook` | 12 | Creates and edits reproducible Jupyter notebooks. |

@@ -1,15 +1,37 @@
-## 执行、子代理与 council
+## 代码执行
 
-代码与命令优先使用已配置的安全沙盒。重要文件写入要避免中途截断：采用原子替换或仓库既有的安全写入机制。危险删除、全局配置、Git 历史、持久数据、登录状态和后台任务清理，先说明范围、回滚方式与备份，再取得明确授权。
+- 所有执行优先 MCP sandbox（硬超时+内存限制+输出截断），run_command 仅限需用户审批的危险操作
+  · exec/session/batch 三种模式，长任务用 sandbox_launch
+- ⚠️ 文件写入安全：Python open("w") 截断文件，重要文件用原子写入（先临时文件→os.replace）
 
-子代理负责可独立产出的探索、实现、测试、文案校对或视觉初筛；`sandbox_council` 负责多模型提供建议、方案审议和盲点发现，不能替代主线的判断、实现和验证。主代理保留范围拆分、方案收敛、集成、验收与用户沟通。
+## 任务分发与协作
 
-派发前划清读写边界，多个 worker 不得重叠修改或回退他人改动。要求 explorer 说明查过与未查范围、依据和不确定点；worker 说明改动文件、意图和验证；tester 说明命令、环境与失败复现线索。收回后抽样核对路径、行号、输出或实际文件，证据不足就补查。
+WSF 按对话长度计价。独立可拆的活优先拆子代理，保护主线上下文预算。
 
-council 可在已配置且确有价值时混合不同模型来源，优先使用配置明确的 Grok/ProGrok 或其他可用 provider 形成视角差异。它可后台执行，启动和轮询都使用相同 `ownerId`；主线程可做不重叠的检查，但不重复 council 已承担的审议。fallback 仅用于临时传输或服务错误，参数错误、权限不足、安全拦截与输出截断应直接报告。
+### 分发判断
 
-Antigravity CLI / Gemini 系列使用 `provider="antigravityCli"`；旧 `geminiCli` 只是兼容别名，接收方未安装或未登录 `agy` 时不要假设可用。
+- **Codex CLI**：纯代码 Review / 大规模审核 / 跨文件重构（GPT 额度多且便宜）
+- **子代理**：执行留痕（跑测试/截图验证）、探索调研、脏活外包（扫目录/读长文/批量分析）、并行独立模块——独立可拆就优先拆出去
+- **sandbox_council**：多模型讨论/审议/方案对比（纯讨论轻量）
+- **主线自己做**：需要深度上下文的活、简单小改动、多轮快速交互
 
-Council 的 transcript、索引和大输入由 manifest 统一管理，不要手工删除 artifact、task 或 quarantine 目录。需要清理时先用 `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 预演，任何会移动、恢复或永久删除持久数据的模式都要先说明影响与回滚方式并取得明确授权。
+### Codex
 
-子代理结束后主动回收。对需要理解完整上下文的任务传递必要的对话材料；只读小任务则提供精确输入，避免无关上下文膨胀。
+日常说的「Codex」= 本地客户端（大规模协同实现/Review/材料搜索/核查），通过报对话ID中转协作，我启动不了只能用户操作。
+Codex CLI (sandbox_codex)：GPT专属通道，background=true启动+check(waitSeconds=45)。GPT需求优先走CLI不要spawn GPT子代理。
+
+### 子代理 (subagent)
+
+MCP subagent 可 spawn 独立 Cascade 窗口并行工作，完成后回收结果。
+
+spawn 规范：
+- 明确指定**输出路径**（报告存哪、文件写哪）
+- 需要了解背景时，告诉子代理「读 main_id 对应的对话原文」，不要在 prompt 里复述上下文
+- 被 spawn 为子代理时：收到 main_id 主动读对话原文相关段落和材料文件，完整不缺地完成任务
+- **mode 选择**：只读任务用 explore / ask，需要动手才用 code
+- ⚠️ 多模态：spawn返回model_supports_images；GLM系列不支持图片，涉及截图/看图别用GLM
+- model_profile：优先用语义档（cowork/explore/frontend/review），不硬编码模型名。subagent_models 不带query看family概览，带query查具体模型
+
+生命周期：
+- spawn 的子代理用完主动 dispose（archive归档LS/delete彻底删），不留僵尸占对话位
+- max_concurrent 别贪多，默认 4

@@ -1,9 +1,23 @@
-## 搜索、工具与跨链路
+## 搜索和工具使用
 
-对时效性、模糊名词或陌生事件先查证，不要凭记忆猜。已安装 Exa 时，优先用语义搜索寻找可信来源，再打开关键页面核对；未安装、不可用或无结果时，说明原因后改用宿主可用的搜索工具。多图网页、论坛和需要视觉判断的内容优先截图或结构化提取。
+聊天时对你可能比较模糊的名词、现象或事件要积极搜索，知识库有时间差，不能想当然。
 
-网页文本、截图、表格、文件预览和目标明确的页面交互可优先使用已安装的 web-fetcher；动态页面或该工具失败时，按错误原因改用浏览器自动化。文档、表格、PDF、演示文稿任务先读对应 Skill，交付前做实际视觉检查，不能只看生成代码。
+搜索优先级：Exa MCP 首选（语义搜索，描述理想页面而非堆关键词）→ search_web 备用 → read_url_content 已知URL → web-fetcher（截图/登录态/交互/下载转换）
 
-共享 MCP 可能支持 `chain`、`dataChain`、`modelChain`：`chain` 选宿主链路，`dataChain` 决定对话数据来源，`modelChain` 决定模型调用来源。优先使用宿主声明支持的值；未明确支持时保持默认或先做只读验证。读取或写入当前对话的工具必须传稳定 `conversationId`，持久会话、浏览器 session 与后台任务必须传稳定 `ownerId`，禁止跨所有者读写、关闭或终止资源。
+工具通用规范：
+- 代码搜索用 smart_search（exact/fuzzy/smart三模式），禁用 grep_search
+- 调用失败可重试；执行时监测输出别干等；卡住换方法
+- docx/pptx/xlsx/pdf 任务先读对应 skill 的 SKILL.md 再动手
+- 产出文件（Word/PPT/HTML/PDF等）必须用 web-fetcher 截图做视觉检查，不能只看代码觉得对就交付
+  · Office 直接 file:// 截不用转PDF；别并发截（LibreOffice抢目录EPERM）；首次渲染慢~45s注意超时
+- 多模型交叉验证、红蓝对抗审题用 sandbox_council
+- 复杂推理/数学证明/多方案对比用 sequential-thinking MCP
 
-复杂推理可使用已安装的思考工具。隔离执行、并发命令或长任务优先使用安全沙盒。工具失败后根据错误调整方法，不要机械重试；耗时任务用后台启动与短轮询，先查询已有 `taskId`，不要重复启动同一个任务。
+## MCP 跨链路访问
+
+共享 MCP 支持跨宿主：chain=auto|antigravity|codex|claude-code|windsurf，支持 dataChain/modelChain 拆分。
+dataChain=windsurf 读 WSF 对话；modelChain 不支持 windsurf。速度：antigravity(~18s)>codex(~30s)。后台轮询 30-45s。
+
+## MCP web-fetcher
+
+网页截图/文本/交互/表格/链接提取、file://查看Office/PDF/图片/视频、格式转换(web_convert)、桌面应用调试(desktop_*)。需要登录态的网站由接收方在自己的设备上独立登录，模板不携带任何 Cookie 或账号状态。

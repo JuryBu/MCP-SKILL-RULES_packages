@@ -1,9 +1,10 @@
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
-const bundlePath = process.env.WSF_EXTENSION_BUNDLE;
-if (!bundlePath) {
-  throw new Error("WSF_EXTENSION_BUNDLE must point to the local Windsurf extension.js bundle");
-}
+const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+const defaultBundle = path.join(localAppData, "Programs", "Devin", "resources", "app", "extensions", "windsurf", "dist", "extension.js");
+const bundlePath = process.env.WSF_EXTENSION_JS || defaultBundle;
 const text = fs.readFileSync(bundlePath, "utf8");
 
 function extractType(typeName) {

@@ -21,6 +21,7 @@ import { councilRuntimeTempRoot } from "./paths.js";
 
 const WORKER_PATH = fileURLToPath(new URL("./worker.js", import.meta.url));
 const SERVER_ROOT = path.resolve(path.dirname(WORKER_PATH), "..", "..");
+const COUNCIL_TEMP_DIR = path.join(SERVER_ROOT, "sandbox-data", "temp");
 const CONFIGURED_TASK_ROOT = process.env.SANDBOX_COUNCIL_TASK_ROOT
     ? path.resolve(process.env.SANDBOX_COUNCIL_TASK_ROOT)
     : undefined;

@@ -5,11 +5,34 @@ import {
     getBackgroundTaskRecoveryHandler,
     normalizeResumePayload,
     stableJsonHash,
+    stableJsonStringify,
     type BackgroundTaskProgress,
+    type RecordSchedulerTaskEnvelope,
     type RecoveryHandlerAction,
     type ResumePayloadValue,
 } from "./background-recovery.js";
+import {
+    isBackgroundTaskSuspension,
+    type BackgroundTaskSuspensionDetails,
+} from "./background-task-suspension.js";
 import { DATA_ROOT, writeJsonAtomic } from "./store.js";
+import {
+    listRecordSchedulerLedgerTaskIds,
+    markRecordSchedulerAdmissionRepairRequired,
+    refreshRecordSchedulerAdmissionReceiptSync,
+    recordSchedulerLedgerPath,
+    readRecordSchedulerLedgerStoreSync,
+    verifyOrRecoverTaskAdmission,
+    verifyRecordSchedulerAdmissionReceipt,
+} from "./record-scheduler-store.js";
+import {
+    isTerminalTaskState,
+    type RecordSchedulerAdmissionReceipt,
+    type SchedulerAdmissionBackgroundProjection,
+    type SchedulerAdmissionCapsule,
+    type TaskState,
+} from "./record-scheduler-contracts.js";
+import { PROVIDER_CONTROL_PHYSICAL_MAX } from "./provider-control-contracts.js";
 
 export {
     BACKGROUND_TASK_RESUME_VERSION,
@@ -21,10 +44,18 @@ export {
     registerBackgroundTaskRecoveryHandler,
     stableJsonHash,
     stableJsonStringify,
+    type RecordSchedulerTaskEnvelope,
     unregisterBackgroundTaskRecoveryHandler,
 } from "./background-recovery.js";
+export {
+    BackgroundTaskSuspension,
+    createBackgroundTaskSuspension,
+    isBackgroundTaskSuspension,
+    suspendBackgroundTask,
+    type BackgroundTaskSuspensionDetails,
+} from "./background-task-suspension.js";
 
-export type BackgroundTaskStatus = "running" | "done" | "error" | "cancelled";
+export type BackgroundTaskStatus = "running" | "suspended" | "done" | "error" | "cancelled";
 
 export interface BackgroundTask {
     id: string;
@@ -34,6 +65,10 @@ export interface BackgroundTask {
     updatedAt: string;
     finishedAt?: string;
     deadlineAt?: string;
+    wakeAt?: string;
+    waitingReason?: string;
+    suspensionRevision?: number;
+    suspensionLedgerRevision?: number;
     maxRunMs?: number;
     timedOut?: boolean;
     progress?: BackgroundTaskProgress;
@@ -42,6 +77,7 @@ export interface BackgroundTask {
     resumePayload?: ResumePayloadValue;
     resumeVersion?: number;
     resumeHash?: string;
+    schedulerAdmission?: RecordSchedulerTaskEnvelope;
     recovered?: boolean;
     recoveredFrom?: string;
     recoveredBy?: string;
@@ -65,6 +101,46 @@ export interface BackgroundTaskOptions {
     resumeHash?: string;
 }
 
+export interface RecordSchedulerBackgroundTaskOptions extends Omit<BackgroundTaskOptions, "maxRunMs"> {
+    admissionReceipt: RecordSchedulerAdmissionReceipt;
+    projection?: unknown;
+}
+
+export class RecordSchedulerTerminalProjectionError extends Error {
+    readonly code = "RECORD_SCHEDULER_TERMINAL_PROJECTION";
+
+    constructor(
+        readonly taskId: string,
+        readonly state: TaskState,
+        readonly ledgerRevision: number,
+        readonly ledgerHash: string,
+    ) {
+        super(`Record scheduler taskId=${taskId} 已是终态 state=${state}，禁止创建或重启 mutable background projection`);
+        this.name = "RecordSchedulerTerminalProjectionError";
+    }
+}
+
+function readAuthoritativeTerminalRecordSchedulerLedger(taskId: string) {
+    const stored = readRecordSchedulerLedgerStoreSync(taskId, { expectPublished: true });
+    if (stored.kind !== "current" || !isTerminalTaskState(stored.ledger.task.state)) return null;
+    return stored.ledger;
+}
+
+function assertRecordSchedulerProjectionCanStart(taskId: string): void {
+    const stored = readRecordSchedulerLedgerStoreSync(taskId, { expectPublished: true });
+    if (stored.kind !== "current") {
+        throw new Error(`Record scheduler taskId=${taskId} 的权威 ledger 不可读取，禁止创建或重启 mutable background projection`);
+    }
+    const terminalLedger = stored.ledger;
+    if (!isTerminalTaskState(terminalLedger.task.state)) return;
+    throw new RecordSchedulerTerminalProjectionError(
+        taskId,
+        terminalLedger.task.state,
+        terminalLedger.revision,
+        terminalLedger.persistedHash,
+    );
+}
+
 const tasks = new Map<string, BackgroundTask>();
 const DEFAULT_TTL_MS = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_TTL || 30 * 60 * 1000);
 const DEFAULT_MAX_RUN_MS = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_MAX_RUN_MS || 15 * 60 * 1000);
@@ -73,18 +149,18 @@ const DEFAULT_BACKGROUND_CONCURRENCY = Number(
     || process.env.MEMORY_STORE_BACKGROUND_MAX_CONCURRENCY
     || 2,
 );
+const DEFAULT_RECORD_UPDATE_LANE_CONCURRENCY = Number(
+    process.env.MEMORY_STORE_RECORD_UPDATE_BACKGROUND_CONCURRENCY
+    || PROVIDER_CONTROL_PHYSICAL_MAX,
+);
 const DEFAULT_RECORD_BATCH_UPDATE_LANE_CONCURRENCY = Number(
     process.env.MEMORY_STORE_RECORD_BATCH_UPDATE_BACKGROUND_CONCURRENCY
-    || Math.max(
-        4,
-        Number.isFinite(DEFAULT_BACKGROUND_CONCURRENCY) && DEFAULT_BACKGROUND_CONCURRENCY > 0
-            ? Math.floor(DEFAULT_BACKGROUND_CONCURRENCY)
-            : 2,
-    ),
+    || PROVIDER_CONTROL_PHYSICAL_MAX,
 );
+const MAX_SUSPENSION_TIMER_DELAY_MS = 2_147_483_647;
 
 type QueuedBackgroundRun = () => Promise<void>;
-type BackgroundTaskLaneName = "default" | "recordBatchUpdate";
+type BackgroundTaskLaneName = "default" | "recordUpdate" | "recordBatchUpdate";
 
 interface BackgroundTaskQueueStats {
     active: number;
@@ -93,6 +169,7 @@ interface BackgroundTaskQueueStats {
 
 interface BackgroundTaskQueueLaneStats {
     default: BackgroundTaskQueueStats;
+    recordUpdate: BackgroundTaskQueueStats;
     recordBatchUpdate: BackgroundTaskQueueStats;
 }
 
@@ -101,8 +178,28 @@ interface QueuedBackgroundTask {
     run: QueuedBackgroundRun;
 }
 
+interface BackgroundTaskExecution {
+    task: BackgroundTask;
+    enqueue: () => void;
+}
+
+interface BackgroundTaskSuspensionTimer {
+    timer: ReturnType<typeof setTimeout>;
+    suspensionRevision: number;
+    ledgerRevision: number;
+}
+
+interface RecordSchedulerRecoveryWatch {
+    ownerPid: number;
+    timer?: ReturnType<typeof setTimeout>;
+}
+
 function normalizeConcurrencyLimit(value: number, fallback: number): number {
     return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function normalizeRecordSchedulerLaneConcurrency(value: number): number {
+    return Math.max(PROVIDER_CONTROL_PHYSICAL_MAX, normalizeConcurrencyLimit(value, PROVIDER_CONTROL_PHYSICAL_MAX));
 }
 
 class BackgroundTaskQueue {
@@ -131,6 +228,10 @@ class BackgroundTaskQueue {
             default: {
                 active: this.activeByLane.get("default") || 0,
                 pending: this.pendingByLane.get("default") || 0,
+            },
+            recordUpdate: {
+                active: this.activeByLane.get("recordUpdate") || 0,
+                pending: this.pendingByLane.get("recordUpdate") || 0,
             },
             recordBatchUpdate: {
                 active: this.activeByLane.get("recordBatchUpdate") || 0,
@@ -162,7 +263,9 @@ class BackgroundTaskQueue {
             this.active++;
             this.pendingByLane.set(lane, Math.max(0, (this.pendingByLane.get(lane) || 0) - 1));
             this.activeByLane.set(lane, (this.activeByLane.get(lane) || 0) + 1);
-            void run().finally(() => {
+            void run().catch(error => {
+                console.error("后台任务队列执行失败：", error instanceof Error ? error.message : String(error));
+            }).finally(() => {
                 this.active = Math.max(0, this.active - 1);
                 this.activeByLane.set(lane, Math.max(0, (this.activeByLane.get(lane) || 0) - 1));
                 this.drain();
@@ -177,15 +280,22 @@ class BackgroundTaskQueue {
 }
 
 function getBackgroundTaskLane(kind: string): BackgroundTaskLaneName {
-    return kind === "record-batch-update" ? "recordBatchUpdate" : "default";
+    if (kind === "record-update") return "recordUpdate";
+    if (kind === "record-batch-update") return "recordBatchUpdate";
+    return "default";
 }
 
 const backgroundQueue = new BackgroundTaskQueue(
     {
         default: normalizeConcurrencyLimit(DEFAULT_BACKGROUND_CONCURRENCY, 2),
-        recordBatchUpdate: normalizeConcurrencyLimit(DEFAULT_RECORD_BATCH_UPDATE_LANE_CONCURRENCY, 4),
+        recordUpdate: normalizeRecordSchedulerLaneConcurrency(DEFAULT_RECORD_UPDATE_LANE_CONCURRENCY),
+        recordBatchUpdate: normalizeRecordSchedulerLaneConcurrency(DEFAULT_RECORD_BATCH_UPDATE_LANE_CONCURRENCY),
     },
 );
+const backgroundTaskExecutions = new Map<string, BackgroundTaskExecution>();
+const suspensionTimers = new Map<string, BackgroundTaskSuspensionTimer>();
+const recordSchedulerRecoveryWatches = new Map<string, RecordSchedulerRecoveryWatch>();
+let recordSchedulerRecoveryRescanTail: Promise<void> = Promise.resolve();
 
 export function getBackgroundTaskQueueStatsForTest(): { active: number; pending: number } {
     return { active: backgroundQueue.activeCount, pending: backgroundQueue.pendingCount };
@@ -199,6 +309,94 @@ export function resetBackgroundTaskQueueForTest(): void {
     backgroundQueue.resetForTest();
 }
 
+function clearSuspensionTimer(taskId: string): void {
+    const timer = suspensionTimers.get(taskId);
+    if (!timer) return;
+    clearTimeout(timer.timer);
+    suspensionTimers.delete(taskId);
+}
+
+function discardBackgroundTaskExecution(taskId: string, task?: BackgroundTask): void {
+    const execution = backgroundTaskExecutions.get(taskId);
+    if (task && execution?.task !== task) return;
+    backgroundTaskExecutions.delete(taskId);
+    clearSuspensionTimer(taskId);
+}
+
+function scheduleSuspensionTimer(task: BackgroundTask): void {
+    const suspensionRevision = task.suspensionRevision;
+    const ledgerRevision = task.suspensionLedgerRevision;
+    if (
+        task.status !== "suspended"
+        || typeof suspensionRevision !== "number"
+        || !Number.isSafeInteger(suspensionRevision)
+        || suspensionRevision <= 0
+        || typeof ledgerRevision !== "number"
+        || !Number.isSafeInteger(ledgerRevision)
+        || ledgerRevision < 0
+    ) return;
+    const wakeAtMs = Date.parse(task.wakeAt || "");
+    if (!Number.isFinite(wakeAtMs)) return;
+
+    clearSuspensionTimer(task.id);
+    const timer = setTimeout(() => {
+        suspensionTimers.delete(task.id);
+        const current = tasks.get(task.id) || readPersistedTask(task.id);
+        if (
+            !current
+            || current.status !== "suspended"
+            || current.suspensionRevision !== suspensionRevision
+            || current.suspensionLedgerRevision !== ledgerRevision
+        ) return;
+        const currentWakeAtMs = Date.parse(current.wakeAt || "");
+        if (Number.isFinite(currentWakeAtMs) && currentWakeAtMs > Date.now()) {
+            scheduleSuspensionTimer(current);
+            return;
+        }
+        void wakeBackgroundTask(task.id, { suspensionRevision, ledgerRevision });
+    }, Math.min(Math.max(0, wakeAtMs - Date.now()), MAX_SUSPENSION_TIMER_DELAY_MS));
+    if (typeof (timer as { unref?: () => void }).unref === "function") {
+        (timer as { unref: () => void }).unref();
+    }
+    suspensionTimers.set(task.id, { timer, suspensionRevision, ledgerRevision });
+}
+
+function suspendBackgroundTaskExecution(task: BackgroundTask, signal: BackgroundTaskSuspensionDetails): void {
+    if (signal.taskId !== task.id) {
+        throw new Error(`后台任务挂起信号 taskId=${signal.taskId} 与当前任务 ${task.id} 不一致`);
+    }
+    const previousTask = { ...task };
+    const updatedAt = nowIso();
+    const priorRevision = Number.isSafeInteger(task.suspensionRevision) && task.suspensionRevision! >= 0
+        ? task.suspensionRevision!
+        : 0;
+    task.status = "suspended";
+    task.wakeAt = signal.wakeAt;
+    task.waitingReason = signal.waitingReason;
+    task.suspensionRevision = priorRevision + 1;
+    task.suspensionLedgerRevision = signal.ledgerRevision;
+    task.deadlineAt = undefined;
+    task.timedOut = undefined;
+    task.result = undefined;
+    task.error = undefined;
+    task.finishedAt = undefined;
+    task.updatedAt = updatedAt;
+    task.progress = {
+        ...(task.progress || {}),
+        stage: "suspended",
+        detail: signal.waitingReason,
+        updatedAt,
+        stageStartedAt: updatedAt,
+    };
+    try {
+        persistTask(task, "suspend");
+    } catch (error) {
+        Object.assign(task, previousTask);
+        throw error;
+    }
+    scheduleSuspensionTimer(task);
+}
+
 // ============= 文件持久化（跨进程可见） =============
 // 内存 Map 仍是「本进程活任务」的真相源；这里叠一层文件态，让同机同 DATA_ROOT
 // 的另一个进程也能查到任务状态（A 源拿 taskId、B 源查得到；进程重启后历史可见）。
@@ -210,6 +408,10 @@ const DEFAULT_CLEAN_OLD_TASK_DAYS = Number(process.env.MEMORY_STORE_BACKGROUND_T
 const MAX_TASK_FILE_BYTES = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_FILE_MAX_BYTES || 2 * 1024 * 1024);
 const RECOVERY_ORPHAN_GRACE_MS = Number(process.env.MEMORY_STORE_BACKGROUND_RECOVERY_ORPHAN_GRACE_MS || 30_000);
 const RECOVERY_CLAIM_TTL_MS = Number(process.env.MEMORY_STORE_BACKGROUND_RECOVERY_CLAIM_TTL_MS || 10 * 60 * 1000);
+const configuredRecordSchedulerRecoveryWatchPollMs = Number(process.env.MEMORY_STORE_RECORD_SCHEDULER_RECOVERY_WATCH_POLL_MS || 250);
+const RECORD_SCHEDULER_RECOVERY_WATCH_POLL_MS = Number.isFinite(configuredRecordSchedulerRecoveryWatchPollMs)
+    ? Math.max(25, configuredRecordSchedulerRecoveryWatchPollMs)
+    : 250;
 // 进度落盘节流间隔：高频 updateProgress 不必每次写盘，~1s 落一次即可。
 const PERSIST_THROTTLE_MS = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_PERSIST_THROTTLE_MS || 1000);
 // 孤儿陈旧判定的额外宽限倍数：文件态 running 但 updatedAt 距今超过 maxRunMs × 此倍数，
@@ -218,8 +420,12 @@ const STALE_FACTOR = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_STALE_FACTO
 // 即便 maxRunMs=0（不限时）或异常，也至少给一个保守的兜底陈旧阈值。
 const STALE_FLOOR_MS = Number(process.env.MEMORY_STORE_BACKGROUND_TASK_STALE_FLOOR_MS || 60 * 60 * 1000);
 const TERMINAL_TASK_STATUSES = new Set<BackgroundTaskStatus>(["done", "error", "cancelled"]);
-const BACKGROUND_TASK_STATUSES = new Set<BackgroundTaskStatus>(["running", "done", "error", "cancelled"]);
+const BACKGROUND_TASK_STATUSES = new Set<BackgroundTaskStatus>(["running", "suspended", "done", "error", "cancelled"]);
 const BACKGROUND_TASK_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/u;
+const RECORD_SCHEDULER_TASK_KINDS = new Set(["record-update", "record-batch-update"]);
+const MAX_RECORD_SCHEDULER_ENVELOPE_BYTES = Number(
+    process.env.MEMORY_STORE_RECORD_SCHEDULER_ENVELOPE_MAX_BYTES || 16 * 1024,
+);
 
 export interface BackgroundTaskRecoveryResult {
     outcome: "loaded" | "resumed" | "restarted" | "error" | "claimed" | "ignored";
@@ -235,6 +441,17 @@ export interface BackgroundTaskRecoveryEligibility {
     reason?: string;
 }
 
+export interface WakeBackgroundTaskOptions {
+    suspensionRevision: number;
+    ledgerRevision: number;
+}
+
+export interface WakeBackgroundTaskResult {
+    outcome: "woken" | "ignored" | "claimed" | "missing";
+    task: BackgroundTask | null;
+    reason?: string;
+}
+
 export interface ScanOrphanedTasksSummary {
     scanned: number;
     loaded: number;
@@ -244,6 +461,32 @@ export interface ScanOrphanedTasksSummary {
     claimed: number;
     ignored: number;
     results: BackgroundTaskRecoveryResult[];
+}
+
+export interface RecordSchedulerStartupRecoveryResult {
+    outcome: "loaded" | "rebuilt" | "terminal" | "claimed" | "unadmitted" | "repair_required" | "unknown_outcome";
+    taskId: string;
+    kind: "record-update" | "record-batch-update" | "unknown";
+    task: BackgroundTask | null;
+    reason?: string;
+    quarantinedPath?: string;
+}
+
+export interface ScanRecordSchedulerTasksSummary {
+    scanned: number;
+    loaded: number;
+    rebuilt: number;
+    terminal: number;
+    claimed: number;
+    unadmitted: number;
+    repairRequired: number;
+    unknownOutcome: number;
+    results: RecordSchedulerStartupRecoveryResult[];
+}
+
+export interface BackgroundTaskStartupRecoverySummary {
+    generic: ScanOrphanedTasksSummary;
+    recordScheduler: ScanRecordSchedulerTasksSummary;
 }
 
 export interface CleanOldTasksSummary {
@@ -306,14 +549,70 @@ function prepareResumeMetadata(options: BackgroundTaskOptions): Pick<BackgroundT
     };
 }
 
-/** 把任务最新态原子落盘。任何 IO 异常都吞掉——持久化是「尽力而为」，绝不影响任务主流程。 */
-function persistTask(task: BackgroundTask): void {
+type BackgroundTaskPersistencePhase = "admission" | "admission-before-write" | "admission-after-write" | "dispatch" | "progress" | "suspend" | "wake" | "settle" | "cancel" | "recovery" | "test";
+type BackgroundTaskPersistFaultInjector = (task: BackgroundTask, phase: BackgroundTaskPersistencePhase) => void;
+
+export class BackgroundTaskPersistenceError extends Error {
+    constructor(readonly taskId: string, readonly phase: BackgroundTaskPersistencePhase, cause: unknown) {
+        super(`后台任务 ${taskId} 在 ${phase} 持久化失败：${cause instanceof Error ? cause.message : String(cause)}`);
+        this.name = "BackgroundTaskPersistenceError";
+    }
+}
+
+let persistFaultInjector: BackgroundTaskPersistFaultInjector | undefined;
+
+export function isRecordSchedulerTask(task: Pick<BackgroundTask, "kind" | "schedulerAdmission">): boolean {
+    return RECORD_SCHEDULER_TASK_KINDS.has(task.kind)
+        && task.schedulerAdmission !== undefined;
+}
+
+function getRecordTaskGenericRecoveryBlockReason(task: Pick<BackgroundTask, "id" | "kind" | "schedulerAdmission">): string | undefined {
+    if (!RECORD_SCHEDULER_TASK_KINDS.has(task.kind)) return undefined;
+    if (task.schedulerAdmission !== undefined) {
+        return "Record scheduler 任务由 ledger owner lease 恢复";
+    }
+    return `历史 Record 任务 taskId=${task.id} 缺少 schedulerAdmission，拒绝通过 generic handler 自动恢复；原 resumePayload 已保留，需迁移到 scheduler admission 或人工 RepairRequired 处理`;
+}
+
+function normalizeRecordSchedulerEnvelope(envelope: RecordSchedulerTaskEnvelope): RecordSchedulerTaskEnvelope {
+    if (!envelope || typeof envelope !== "object") {
+        throw new Error("Record scheduler envelope 必须是对象");
+    }
+    if (!envelope.admission || typeof envelope.admission !== "object") {
+        throw new Error("Record scheduler envelope 缺少 admission receipt");
+    }
+    const projection = envelope.projection === undefined
+        ? undefined
+        : normalizeResumePayload(envelope.projection);
+    const normalized: RecordSchedulerTaskEnvelope = {
+        admission: structuredClone(envelope.admission),
+        ...(projection === undefined ? {} : { projection }),
+    };
+    const bytes = Buffer.byteLength(stableJsonStringify(normalized), "utf8");
+    if (!Number.isFinite(MAX_RECORD_SCHEDULER_ENVELOPE_BYTES) || MAX_RECORD_SCHEDULER_ENVELOPE_BYTES <= 0) {
+        throw new Error("MEMORY_STORE_RECORD_SCHEDULER_ENVELOPE_MAX_BYTES 必须是正数");
+    }
+    if (bytes > MAX_RECORD_SCHEDULER_ENVELOPE_BYTES) {
+        throw new Error(`Record scheduler envelope 大小 ${bytes} bytes 超过 ${MAX_RECORD_SCHEDULER_ENVELOPE_BYTES}`);
+    }
+    return normalized;
+}
+
+/** 将任务最新态写入 envelope。通用任务维持 best-effort，scheduler 边界必须同步确认。 */
+function persistTask(
+    task: BackgroundTask,
+    phase: BackgroundTaskPersistencePhase = "progress",
+    strict = isRecordSchedulerTask(task),
+): void {
     try {
+        persistFaultInjector?.(task, phase);
+        if (phase === "admission") persistFaultInjector?.(task, "admission-before-write");
         fs.mkdirSync(TASKS_DIR, { recursive: true });
         writeJsonAtomic(taskFilePath(task.id), task);
+        if (phase === "admission") persistFaultInjector?.(task, "admission-after-write");
         lastPersistMs.set(task.id, Date.now());
-    } catch {
-        // 落盘失败不致命：内存态仍是本进程真相源，下次 settle/进度还会再试。
+    } catch (error) {
+        if (strict) throw new BackgroundTaskPersistenceError(task.id, phase, error);
     }
 }
 
@@ -321,11 +620,10 @@ function persistTask(task: BackgroundTask): void {
 function persistTaskThrottled(task: BackgroundTask): void {
     const last = lastPersistMs.get(task.id) || 0;
     if (Date.now() - last < PERSIST_THROTTLE_MS) return;
-    persistTask(task);
+    persistTask(task, "progress");
 }
 
-/** 从文件读取任务态（跨进程兜底）。文件不存在或解析失败均返回 null。 */
-function readPersistedTask(taskId: string): BackgroundTask | null {
+function readPersistedTaskUnchecked(taskId: string): BackgroundTask | null {
     try {
         const stats = fs.statSync(taskFilePath(taskId));
         if (!stats.isFile() || stats.size > MAX_TASK_FILE_BYTES) return null;
@@ -347,19 +645,53 @@ function readPersistedTask(taskId: string): BackgroundTask | null {
     }
 }
 
+export function getRecordSchedulerProjectionHint(taskId: string): Pick<BackgroundTask, "id" | "kind"> | null {
+    if (!isValidBackgroundTaskId(taskId)) return null;
+    const candidate = tasks.get(taskId) || readPersistedTaskUnchecked(taskId);
+    if (!candidate || !isRecordSchedulerTask(candidate)) return null;
+    return { id: candidate.id, kind: candidate.kind };
+}
+
+/** 从文件读取任务态（跨进程兜底）。scheduler envelope 还必须重读真实 ledger/capsule。 */
+function readPersistedTask(taskId: string): BackgroundTask | null {
+    const parsed = readPersistedTaskUnchecked(taskId);
+    if (!parsed) return null;
+    if (parsed.schedulerAdmission === undefined) {
+        if (RECORD_SCHEDULER_TASK_KINDS.has(parsed.kind) && fs.existsSync(recordSchedulerLedgerPath(taskId))) return null;
+        return parsed;
+    }
+    if (!RECORD_SCHEDULER_TASK_KINDS.has(parsed.kind)) return null;
+    try {
+        const kind = parsed.kind as "record-update" | "record-batch-update";
+        const envelope = normalizeRecordSchedulerEnvelope(parsed.schedulerAdmission);
+        const admission = refreshRecordSchedulerAdmissionReceiptSync(envelope.admission, kind);
+        return {
+            ...parsed,
+            schedulerAdmission: {
+                admission,
+                ...(envelope.projection === undefined ? {} : { projection: envelope.projection }),
+            },
+        };
+    } catch {
+        return null;
+    }
+}
+
 /**
  * 若另一进程已把同 taskId 写成 settled/cancelled，这里把本进程内存态同步到最新终态。
- * 只接收终态，避免用文件态 running 覆盖本进程更鲜活的内存进度。
+ * 只接收终态或已持久挂起，避免用文件态 running 覆盖本进程更鲜活的内存进度。
  */
 function syncTaskFromPersistedState(task: BackgroundTask): boolean {
     const persisted = readPersistedTask(task.id);
-    if (!persisted || !TERMINAL_TASK_STATUSES.has(persisted.status)) return false;
+    if (!persisted || (!TERMINAL_TASK_STATUSES.has(persisted.status) && persisted.status !== "suspended")) return false;
     if (
         task.status === persisted.status
         && task.updatedAt === persisted.updatedAt
         && task.finishedAt === persisted.finishedAt
         && task.result === persisted.result
         && task.error === persisted.error
+        && task.suspensionRevision === persisted.suspensionRevision
+        && task.suspensionLedgerRevision === persisted.suspensionLedgerRevision
     ) {
         return false;
     }
@@ -372,6 +704,11 @@ function syncTaskFromPersistedState(task: BackgroundTask): boolean {
     task.progress = persisted.progress ?? task.progress;
     task.result = persisted.result;
     task.error = persisted.error;
+    task.wakeAt = persisted.wakeAt;
+    task.waitingReason = persisted.waitingReason;
+    task.suspensionRevision = persisted.suspensionRevision;
+    task.suspensionLedgerRevision = persisted.suspensionLedgerRevision;
+    if (task.status === "suspended") scheduleSuspensionTimer(task);
     return true;
 }
 
@@ -384,6 +721,7 @@ function syncTaskFromPersistedState(task: BackgroundTask): boolean {
  */
 function reconcileStaleTask(task: BackgroundTask): BackgroundTask {
     if (task.status !== "running") return task;
+    if (isRecordSchedulerTask(task)) return task;
     const baseMaxRun = task.maxRunMs && task.maxRunMs > 0 ? task.maxRunMs : getBackgroundTaskMaxRunMs(task.kind);
     const staleMs = Math.max(baseMaxRun * STALE_FACTOR, STALE_FLOOR_MS);
     const updatedMs = new Date(task.updatedAt).getTime();
@@ -465,12 +803,86 @@ function isProcessAlive(pid: number): boolean {
     try {
         process.kill(pid, 0);
         return true;
-    } catch {
-        return false;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException)?.code === "EPERM";
     }
 }
 
+function hasLiveRecordSchedulerOwnerLease(
+    ledger: { schedulerOwner?: { expiresAt?: string } },
+    nowMs = Date.now(),
+): boolean {
+    const expiresAtMs = Date.parse(ledger.schedulerOwner?.expiresAt || "");
+    return Number.isFinite(expiresAtMs) && expiresAtMs > nowMs;
+}
+
+function clearRecordSchedulerRecoveryWatch(taskId: string): void {
+    const watch = recordSchedulerRecoveryWatches.get(taskId);
+    if (!watch) return;
+    if (watch.timer) clearTimeout(watch.timer);
+    recordSchedulerRecoveryWatches.delete(taskId);
+}
+
+function evictForeignRecordSchedulerProjection(taskId: string, ownerPid: number): void {
+    const inMemory = tasks.get(taskId);
+    if (!inMemory || inMemory.ownerPid !== ownerPid || backgroundTaskExecutions.has(taskId)) return;
+    tasks.delete(taskId);
+    lastPersistMs.delete(taskId);
+}
+
+function enqueueRecordSchedulerRecoveryRescan(taskId: string, ownerPid: number): void {
+    const operation = recordSchedulerRecoveryRescanTail.then(async () => {
+        evictForeignRecordSchedulerProjection(taskId, ownerPid);
+        await scanRecordSchedulerTasks();
+    });
+    recordSchedulerRecoveryRescanTail = operation.then(() => undefined, () => undefined);
+    void operation.catch(() => {
+        const ledger = readRecordSchedulerLedgerStoreSync(taskId, { expectPublished: true });
+        if (ledger.kind === "current" && !isTerminalTaskState(ledger.ledger.task.state)) {
+            registerRecordSchedulerRecoveryWatch(taskId, ownerPid, RECORD_SCHEDULER_RECOVERY_WATCH_POLL_MS * 4);
+        }
+    });
+}
+
+function armRecordSchedulerRecoveryWatch(
+    taskId: string,
+    watch: RecordSchedulerRecoveryWatch,
+    delayMs: number,
+): void {
+    if (recordSchedulerRecoveryWatches.get(taskId) !== watch) return;
+    if (watch.timer) clearTimeout(watch.timer);
+    watch.timer = setTimeout(() => {
+        if (recordSchedulerRecoveryWatches.get(taskId) !== watch) return;
+        const persisted = readPersistedTask(taskId);
+        const ledger = readRecordSchedulerLedgerStoreSync(taskId, { expectPublished: true });
+        const nonterminalLedger = ledger.kind === "current" && !isTerminalTaskState(ledger.ledger.task.state);
+        const ownerLeaseLive = nonterminalLedger && hasLiveRecordSchedulerOwnerLease(ledger.ledger);
+        if (ownerLeaseLive) {
+            const expiresAtMs = Date.parse(ledger.ledger.schedulerOwner?.expiresAt || "");
+            armRecordSchedulerRecoveryWatch(
+                taskId,
+                watch,
+                Math.min(RECORD_SCHEDULER_RECOVERY_WATCH_POLL_MS, Math.max(1, expiresAtMs - Date.now())),
+            );
+            return;
+        }
+        clearRecordSchedulerRecoveryWatch(taskId);
+        enqueueRecordSchedulerRecoveryRescan(taskId, watch.ownerPid);
+    }, Math.max(1, delayMs));
+    watch.timer.unref?.();
+}
+
+function registerRecordSchedulerRecoveryWatch(taskId: string, ownerPid: number, delayMs = RECORD_SCHEDULER_RECOVERY_WATCH_POLL_MS): void {
+    const existing = recordSchedulerRecoveryWatches.get(taskId);
+    if (existing?.ownerPid === ownerPid) return;
+    clearRecordSchedulerRecoveryWatch(taskId);
+    const watch: RecordSchedulerRecoveryWatch = { ownerPid };
+    recordSchedulerRecoveryWatches.set(taskId, watch);
+    armRecordSchedulerRecoveryWatch(taskId, watch, delayMs);
+}
+
 function isTaskStaleForRecovery(task: BackgroundTask): boolean {
+    if (isRecordSchedulerTask(task)) return false;
     const updatedMs = Date.parse(task.updatedAt);
     if (!Number.isFinite(updatedMs)) return true;
     const baseMaxRun = task.maxRunMs && task.maxRunMs > 0 ? task.maxRunMs : getBackgroundTaskMaxRunMs(task.kind);
@@ -491,7 +903,21 @@ function shouldRecoverRunningTask(task: BackgroundTask): { ok: true } | { ok: fa
 }
 
 export function inspectBackgroundTaskRecovery(task: BackgroundTask): BackgroundTaskRecoveryEligibility {
+    if (task.status === "suspended") {
+        const suspension = validateSuspendedTask(task);
+        if (!suspension.ok) return { recoverable: false, reason: suspension.reason };
+        const validation = validateRecoverableTask(task);
+        if (!validation.ok) return { recoverable: false, reason: validation.reason };
+        if (!getBackgroundTaskRecoveryHandler(task.kind)) {
+            return { recoverable: false, reason: `未注册 kind=${task.kind} 的恢复 handler` };
+        }
+        return { recoverable: true };
+    }
     if (task.status !== "running") return { recoverable: false, reason: `任务状态为 ${task.status}` };
+    const recordTaskBlockReason = getRecordTaskGenericRecoveryBlockReason(task);
+    if (recordTaskBlockReason) {
+        return { recoverable: false, reason: recordTaskBlockReason };
+    }
     const liveness = shouldRecoverRunningTask(task);
     if (!liveness.ok) return { recoverable: false, reason: liveness.reason };
     const validation = validateRecoverableTask(task);
@@ -500,6 +926,121 @@ export function inspectBackgroundTaskRecovery(task: BackgroundTask): BackgroundT
         return { recoverable: false, reason: `未注册 kind=${task.kind} 的恢复 handler` };
     }
     return { recoverable: true };
+}
+
+function validateSuspendedTask(task: BackgroundTask): { ok: true } | { ok: false; reason: string } {
+    if (!Number.isFinite(Date.parse(task.wakeAt || ""))) {
+        return { ok: false, reason: "suspended 任务缺少有效 wakeAt" };
+    }
+    if (!task.waitingReason?.trim()) return { ok: false, reason: "suspended 任务缺少 waitingReason" };
+    const suspensionRevision = task.suspensionRevision;
+    if (typeof suspensionRevision !== "number" || !Number.isSafeInteger(suspensionRevision) || suspensionRevision <= 0) {
+        return { ok: false, reason: "suspended 任务缺少有效 suspensionRevision" };
+    }
+    const suspensionLedgerRevision = task.suspensionLedgerRevision;
+    if (
+        typeof suspensionLedgerRevision !== "number"
+        || !Number.isSafeInteger(suspensionLedgerRevision)
+        || suspensionLedgerRevision < 0
+    ) {
+        return { ok: false, reason: "suspended 任务缺少有效 suspensionLedgerRevision" };
+    }
+    return { ok: true };
+}
+
+async function recoverSuspendedBackgroundTask(persistedTask: BackgroundTask): Promise<BackgroundTaskRecoveryResult> {
+    const suspension = validateSuspendedTask(persistedTask);
+    if (!suspension.ok) {
+        return {
+            outcome: "loaded",
+            taskId: persistedTask.id,
+            kind: persistedTask.kind,
+            task: loadTaskIntoMemory(persistedTask),
+            reason: `${suspension.reason}；保留 suspended，等待显式人工修复`,
+        };
+    }
+    const validation = validateRecoverableTask(persistedTask);
+    if (!validation.ok) {
+        return {
+            outcome: "loaded",
+            taskId: persistedTask.id,
+            kind: persistedTask.kind,
+            task: loadTaskIntoMemory(persistedTask),
+            reason: `${validation.reason}；保留 suspended，等待显式人工修复`,
+        };
+    }
+    const handler = getBackgroundTaskRecoveryHandler(persistedTask.kind);
+    if (!handler) {
+        return {
+            outcome: "loaded",
+            taskId: persistedTask.id,
+            kind: persistedTask.kind,
+            task: loadTaskIntoMemory(persistedTask),
+            reason: `未注册 kind=${persistedTask.kind} 的恢复 handler；保留 suspended`,
+        };
+    }
+    const releaseClaim = tryClaimRecovery(persistedTask.id);
+    if (!releaseClaim) {
+        return {
+            outcome: "claimed",
+            taskId: persistedTask.id,
+            kind: persistedTask.kind,
+            task: getBackgroundTask(persistedTask.id),
+            reason: "已被其他进程占用 suspended task 恢复",
+        };
+    }
+    try {
+        const latestTask = readPersistedTask(persistedTask.id) || persistedTask;
+        if (latestTask.status !== "suspended") {
+            return {
+                outcome: "loaded",
+                taskId: latestTask.id,
+                kind: latestTask.kind,
+                task: loadTaskIntoMemory(latestTask),
+            };
+        }
+        const action = await handler(latestTask);
+        if (!action || action.mode !== "resume") {
+            return {
+                outcome: "loaded",
+                taskId: latestTask.id,
+                kind: latestTask.kind,
+                task: loadTaskIntoMemory(latestTask),
+                reason: "suspended task 只能以同 taskId resume，恢复 handler 未提供 resume action",
+            };
+        }
+        const recoveredAt = nowIso();
+        const suspendedTask: BackgroundTask = {
+            ...latestTask,
+            recovered: true,
+            recoveredAt,
+            ownerPid: process.pid,
+        };
+        const attachedTask = scheduleBackgroundTask(suspendedTask, action.run, {
+            maxRunMs: action.maxRunMs ?? suspendedTask.maxRunMs,
+            timeoutMessage: action.timeoutMessage,
+            resumePayload: suspendedTask.resumePayload,
+            resumeVersion: suspendedTask.resumeVersion,
+            resumeHash: suspendedTask.resumeHash,
+        }, undefined, false);
+        return {
+            outcome: "loaded",
+            taskId: attachedTask.id,
+            kind: attachedTask.kind,
+            task: attachedTask,
+            reason: "已重建 suspended task 的唤醒计时器",
+        };
+    } catch (error) {
+        return {
+            outcome: "loaded",
+            taskId: persistedTask.id,
+            kind: persistedTask.kind,
+            task: loadTaskIntoMemory(persistedTask),
+            reason: `suspended task 恢复器重建失败，保留挂起：${error instanceof Error ? error.message : String(error)}`,
+        };
+    } finally {
+        releaseClaim();
+    }
 }
 
 function settleTaskAsError(
@@ -518,8 +1059,14 @@ function settleTaskAsError(
         updatedAt,
         deadlineAt: undefined,
     };
-    persistTask(loadTaskIntoMemory(nextTask));
-    return nextTask;
+    try {
+        // 先让磁盘接受终态，再更新内存，避免「内存 error、磁盘仍 running」的分叉。
+        persistTask(nextTask, "recovery");
+        return loadTaskIntoMemory(nextTask);
+    } catch (persistError) {
+        console.error("后台任务恢复结算未持久化，保留原状态等待后续恢复：", persistError instanceof Error ? persistError.message : String(persistError));
+        return task;
+    }
 }
 
 function nowIso(): string {
@@ -560,7 +1107,7 @@ export function getBackgroundTaskMaxRunMs(kind: string): number {
 function cleanupExpiredTasksFromMemory(): void {
     const now = Date.now();
     for (const [id, task] of tasks) {
-        if (task.status === "running") continue;
+        if (!TERMINAL_TASK_STATUSES.has(task.status)) continue;
         const updatedMs = new Date(task.updatedAt).getTime();
         if (Number.isFinite(updatedMs) && now - updatedMs > DEFAULT_TTL_MS) {
             tasks.delete(id);
@@ -575,99 +1122,197 @@ function scheduleBackgroundTask(
     run: (context: BackgroundTaskContext) => Promise<string>,
     options: BackgroundTaskOptions = {},
     onSettled?: () => void,
+    startImmediately = true,
 ): BackgroundTask {
     cleanupExpiredTasksFromMemory();
     loadTaskIntoMemory(task);
-    persistTask(task);
+    try {
+        persistTask(task, "admission");
+    } catch (error) {
+        tasks.delete(task.id);
+        lastPersistMs.delete(task.id);
+        throw error;
+    }
 
-    let timeout: ReturnType<typeof setTimeout> | undefined;
-    let settled = false;
-    const syncSharedTaskState = (): void => {
-        const changed = syncTaskFromPersistedState(task);
-        if (!changed || task.status === "running") return;
-        settled = true;
-        if (timeout) {
-            clearTimeout(timeout);
-            timeout = undefined;
-        }
-    };
-
-    const updateProgress = (progress: BackgroundTaskProgress) => {
-        syncSharedTaskState();
-        if (task.status !== "running") return;
-        const updatedAt = nowIso();
-        const previous = task.progress;
-        const stageChanged = progress.stage !== undefined && progress.stage !== previous?.stage;
-        const progressShapeChanged = progress.total !== undefined && previous?.total !== undefined && progress.total !== previous.total;
-        task.progress = {
-            ...(previous || {}),
-            ...progress,
-            stageStartedAt: progress.stageStartedAt
-                || (stageChanged || progressShapeChanged ? updatedAt : previous?.stageStartedAt)
-                || updatedAt,
-            updatedAt,
-        };
-        task.updatedAt = updatedAt;
-        persistTaskThrottled(task);
-    };
-
-    const settle = (status: Exclude<BackgroundTaskStatus, "running">, payload: { result?: string; error?: string; timedOut?: boolean }) => {
-        syncSharedTaskState();
-        if (settled || task.status !== "running") return;
-        settled = true;
-        if (timeout) clearTimeout(timeout);
-        task.status = status;
-        task.result = payload.result;
-        task.error = payload.error;
-        task.timedOut = payload.timedOut;
-        task.finishedAt = nowIso();
-        task.updatedAt = task.finishedAt;
-        persistTask(task);
-    };
-
-    backgroundQueue.enqueue(getBackgroundTaskLane(task.kind), async () => {
-        try {
-            syncSharedTaskState();
-            if (task.status !== "running") return;
-            const maxRunMs = task.maxRunMs ?? options.maxRunMs ?? getBackgroundTaskMaxRunMs(task.kind);
-            task.maxRunMs = maxRunMs;
-            if (maxRunMs > 0) {
-                task.deadlineAt = new Date(Date.now() + maxRunMs).toISOString();
-                timeout = setTimeout(() => {
-                    settle("error", {
-                        timedOut: true,
-                        error: options.timeoutMessage || `后台任务超时（${Math.round(maxRunMs / 1000)}s）`,
-                    });
-                }, maxRunMs);
-                if (typeof (timeout as { unref?: () => void }).unref === "function") {
-                    (timeout as { unref: () => void }).unref();
+    const enqueue = (): void => {
+        backgroundQueue.enqueue(getBackgroundTaskLane(task.kind), async () => {
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            let settled = false;
+            const syncSharedTaskState = (): void => {
+                const changed = syncTaskFromPersistedState(task);
+                if (!changed || task.status === "running") return;
+                settled = true;
+                if (timeout) {
+                    clearTimeout(timeout);
+                    timeout = undefined;
                 }
-            }
-            const context: BackgroundTaskContext = {
-                taskId: task.id,
-                updateProgress,
-                isCancelled: () => {
-                    syncSharedTaskState();
-                    return task.status === "cancelled";
-                },
-                isSettled: () => {
-                    syncSharedTaskState();
-                    return task.status !== "running";
-                },
+                if (TERMINAL_TASK_STATUSES.has(task.status)) discardBackgroundTaskExecution(task.id, task);
             };
-            updateProgress({ stage: "running", detail: task.recovered ? "后台任务恢复后继续执行" : "后台任务已开始执行" });
-            if (task.status !== "running") return;
-            persistTask(task);
-            const result = await run(context);
-            settle("done", { result });
-        } catch (err) {
-            settle("error", { error: err instanceof Error ? err.message : String(err) });
-        } finally {
-            onSettled?.();
-        }
-    });
+
+            const updateProgress = (progress: BackgroundTaskProgress) => {
+                syncSharedTaskState();
+                if (task.status !== "running") return;
+                const updatedAt = nowIso();
+                const previous = task.progress;
+                const stageChanged = progress.stage !== undefined && progress.stage !== previous?.stage;
+                const progressShapeChanged = progress.total !== undefined && previous?.total !== undefined && progress.total !== previous.total;
+                task.progress = {
+                    ...(previous || {}),
+                    ...progress,
+                    stageStartedAt: progress.stageStartedAt
+                        || (stageChanged || progressShapeChanged ? updatedAt : previous?.stageStartedAt)
+                        || updatedAt,
+                    updatedAt,
+                };
+                task.updatedAt = updatedAt;
+                persistTaskThrottled(task);
+            };
+
+            const settle = (status: Exclude<BackgroundTaskStatus, "running" | "suspended">, payload: { result?: string; error?: string; timedOut?: boolean }): boolean => {
+                syncSharedTaskState();
+                if (settled || task.status !== "running") return true;
+                const previousTask = { ...task };
+                if (timeout) clearTimeout(timeout);
+                task.status = status;
+                task.result = payload.result;
+                task.error = payload.error;
+                task.timedOut = payload.timedOut;
+                task.finishedAt = nowIso();
+                task.updatedAt = task.finishedAt;
+                try {
+                    persistTask(task, "settle");
+                    settled = true;
+                    discardBackgroundTaskExecution(task.id, task);
+                    return true;
+                } catch (error) {
+                    Object.assign(task, previousTask);
+                    console.error("后台任务结算未持久化，保留 running 供恢复处理：", error instanceof Error ? error.message : String(error));
+                    return false;
+                }
+            };
+
+            try {
+                syncSharedTaskState();
+                if (task.status !== "running") return;
+                const maxRunMs = task.maxRunMs ?? options.maxRunMs ?? getBackgroundTaskMaxRunMs(task.kind);
+                task.maxRunMs = maxRunMs;
+                if (maxRunMs > 0) {
+                    task.deadlineAt = new Date(Date.now() + maxRunMs).toISOString();
+                    timeout = setTimeout(() => {
+                        settle("error", {
+                            timedOut: true,
+                            error: options.timeoutMessage || `后台任务超时（${Math.round(maxRunMs / 1000)}s）`,
+                        });
+                    }, maxRunMs);
+                    if (typeof (timeout as { unref?: () => void }).unref === "function") {
+                        (timeout as { unref: () => void }).unref();
+                    }
+                }
+                const context: BackgroundTaskContext = {
+                    taskId: task.id,
+                    updateProgress,
+                    isCancelled: () => {
+                        syncSharedTaskState();
+                        return task.status === "cancelled";
+                    },
+                    isSettled: () => {
+                        syncSharedTaskState();
+                        return task.status !== "running";
+                    },
+                };
+                updateProgress({ stage: "running", detail: task.recovered ? "后台任务恢复后继续执行" : "后台任务已开始执行" });
+                if (task.status !== "running") return;
+                persistTask(task, "dispatch");
+                const result = await run(context);
+                settle("done", { result });
+            } catch (err) {
+                if (isBackgroundTaskSuspension(err)) {
+                    suspendBackgroundTaskExecution(task, err);
+                    return;
+                }
+                settle("error", { error: err instanceof Error ? err.message : String(err) });
+            } finally {
+                if (timeout) clearTimeout(timeout);
+                onSettled?.();
+            }
+        });
+    };
+
+    clearSuspensionTimer(task.id);
+    backgroundTaskExecutions.set(task.id, { task, enqueue });
+    if (task.status === "suspended") scheduleSuspensionTimer(task);
+    else if (startImmediately) enqueue();
 
     return task;
+}
+
+export function wakeBackgroundTask(taskId: string, options: WakeBackgroundTaskOptions): WakeBackgroundTaskResult {
+    if (!isValidBackgroundTaskId(taskId)) {
+        return { outcome: "missing", task: null, reason: "taskId 格式非法" };
+    }
+    const persistedTask = readPersistedTask(taskId);
+    if (!persistedTask) return { outcome: "missing", task: null, reason: "任务文件不存在或损坏" };
+    if (
+        persistedTask.status !== "suspended"
+        || persistedTask.suspensionRevision !== options.suspensionRevision
+        || persistedTask.suspensionLedgerRevision !== options.ledgerRevision
+    ) {
+        return { outcome: "ignored", task: persistedTask, reason: "任务状态或挂起 revision 已变化" };
+    }
+    const execution = backgroundTaskExecutions.get(taskId);
+    if (!execution) {
+        return { outcome: "ignored", task: persistedTask, reason: "当前进程尚未重建 suspended task 的执行器" };
+    }
+    const releaseClaim = tryClaimRecovery(taskId);
+    if (!releaseClaim) return { outcome: "claimed", task: persistedTask, reason: "已被其他进程占用唤醒" };
+
+    try {
+        const latestTask = readPersistedTask(taskId);
+        if (
+            !latestTask
+            || latestTask.status !== "suspended"
+            || latestTask.suspensionRevision !== options.suspensionRevision
+            || latestTask.suspensionLedgerRevision !== options.ledgerRevision
+        ) {
+            return { outcome: "ignored", task: latestTask, reason: "任务状态或挂起 revision 已变化" };
+        }
+        const updatedAt = nowIso();
+        const wokenTask: BackgroundTask = {
+            ...latestTask,
+            status: "running",
+            wakeAt: undefined,
+            waitingReason: undefined,
+            suspensionLedgerRevision: undefined,
+            deadlineAt: undefined,
+            timedOut: undefined,
+            result: undefined,
+            error: undefined,
+            finishedAt: undefined,
+            updatedAt,
+            ownerPid: process.pid,
+            progress: {
+                ...(latestTask.progress || {}),
+                stage: "queued",
+                detail: "后台任务已唤醒，等待队列调度",
+                updatedAt,
+                stageStartedAt: updatedAt,
+            },
+        };
+        persistTask(wokenTask, "wake");
+        clearSuspensionTimer(taskId);
+        Object.assign(execution.task, wokenTask);
+        loadTaskIntoMemory(execution.task);
+        execution.enqueue();
+        return { outcome: "woken", task: execution.task };
+    } catch (error) {
+        return {
+            outcome: "ignored",
+            task: getBackgroundTask(taskId),
+            reason: error instanceof Error ? error.message : String(error),
+        };
+    } finally {
+        releaseClaim();
+    }
 }
 
 function resumeBackgroundTaskWithSameId(
@@ -733,6 +1378,150 @@ export function startBackgroundTask(
     return scheduleBackgroundTask(task, run, options);
 }
 
+export async function startRecordSchedulerBackgroundTask(
+    kind: "record-update" | "record-batch-update",
+    run: (context: BackgroundTaskContext) => Promise<string>,
+    options: RecordSchedulerBackgroundTaskOptions,
+): Promise<BackgroundTask> {
+    if (!RECORD_SCHEDULER_TASK_KINDS.has(kind)) {
+        throw new Error(`不支持的 Record scheduler task kind=${kind}`);
+    }
+    const admissionReceipt = await verifyRecordSchedulerAdmissionReceipt(options.admissionReceipt, kind);
+    assertRecordSchedulerProjectionCanStart(admissionReceipt.taskId);
+    if (!isValidBackgroundTaskId(admissionReceipt.taskId)) {
+        throw new Error("Record scheduler taskId 格式非法");
+    }
+    if (tasks.has(admissionReceipt.taskId) || fs.existsSync(taskFilePath(admissionReceipt.taskId))) {
+        throw new Error(`Record scheduler taskId=${admissionReceipt.taskId} 已有 envelope，拒绝覆盖`);
+    }
+    const projection = options.projection === undefined ? undefined : normalizeResumePayload(options.projection);
+    const schedulerAdmission = normalizeRecordSchedulerEnvelope({
+        admission: admissionReceipt,
+        ...(projection === undefined ? {} : { projection }),
+    });
+
+    const startedAt = nowIso();
+    const task: BackgroundTask = {
+        id: admissionReceipt.taskId,
+        kind,
+        status: "running",
+        startedAt,
+        updatedAt: startedAt,
+        maxRunMs: 0,
+        progress: {
+            stage: "queued",
+            detail: "Record scheduler 已持久接纳，等待 owner lease 调度",
+            updatedAt: startedAt,
+            stageStartedAt: startedAt,
+        },
+        ...prepareResumeMetadata(options),
+        schedulerAdmission,
+        ownerPid: process.pid,
+    };
+    return scheduleBackgroundTask(task, async context => {
+        assertRecordSchedulerProjectionCanStart(admissionReceipt.taskId);
+        return run(context);
+    }, { ...options, maxRunMs: 0 });
+}
+
+export interface EnsureRecordSchedulerBackgroundProjectionOptions extends RecordSchedulerBackgroundTaskOptions {
+    replacePersistedTerminal?: boolean;
+}
+
+export interface EnsureRecordSchedulerBackgroundProjectionResult {
+    disposition: "loaded" | "rebuilt";
+    task: BackgroundTask;
+    quarantinedPath?: string;
+}
+
+export async function ensureRecordSchedulerBackgroundProjection(
+    kind: "record-update" | "record-batch-update",
+    run: (context: BackgroundTaskContext) => Promise<string>,
+    options: EnsureRecordSchedulerBackgroundProjectionOptions,
+): Promise<EnsureRecordSchedulerBackgroundProjectionResult> {
+    const admissionReceipt = await verifyRecordSchedulerAdmissionReceipt(options.admissionReceipt, kind);
+    assertRecordSchedulerProjectionCanStart(admissionReceipt.taskId);
+    const inMemory = tasks.get(admissionReceipt.taskId);
+    if (inMemory) {
+        if (!hasSameImmutableAdmissionBinding(inMemory, admissionReceipt, kind)) {
+            throw new Error(`Record scheduler taskId=${admissionReceipt.taskId} 的内存 projection admission binding 冲突`);
+        }
+        return { disposition: "loaded", task: inMemory };
+    }
+
+    const unchecked = readPersistedTaskUnchecked(admissionReceipt.taskId);
+    const persisted = readPersistedTask(admissionReceipt.taskId);
+    if (persisted && hasSameImmutableAdmissionBinding(persisted, admissionReceipt, kind)) {
+        const ownerAlive = typeof persisted.ownerPid === "number"
+            && persisted.ownerPid !== process.pid
+            && isProcessAlive(persisted.ownerPid);
+        if (persisted.status !== "running" && !options.replacePersistedTerminal) {
+            return { disposition: "loaded", task: loadTaskIntoMemory(persisted) };
+        }
+        if (persisted.status === "running" && ownerAlive) {
+            return { disposition: "loaded", task: loadTaskIntoMemory(persisted) };
+        }
+    }
+
+    const quarantinedPath = unchecked || fs.existsSync(taskFilePath(admissionReceipt.taskId))
+        ? quarantineRecordSchedulerProjection(admissionReceipt.taskId)
+        : undefined;
+    const task = await startRecordSchedulerBackgroundTask(kind, run, {
+        admissionReceipt,
+        projection: options.projection,
+        resumePayload: options.resumePayload,
+        resumeVersion: options.resumeVersion,
+        resumeHash: options.resumeHash,
+        timeoutMessage: options.timeoutMessage,
+    });
+    return {
+        disposition: "rebuilt",
+        task,
+        ...(quarantinedPath ? { quarantinedPath } : {}),
+    };
+}
+
+export async function rebuildRecordSchedulerBackgroundProjection(
+    kind: "record-update" | "record-batch-update",
+    run: (context: BackgroundTaskContext) => Promise<string>,
+    options: RecordSchedulerBackgroundTaskOptions,
+): Promise<BackgroundTask> {
+    return startRecordSchedulerBackgroundTask(kind, run, options);
+}
+
+function hasSameImmutableAdmissionBinding(
+    task: BackgroundTask,
+    receipt: RecordSchedulerAdmissionReceipt,
+    kind: "record-update" | "record-batch-update",
+): boolean {
+    const candidate = task.schedulerAdmission?.admission;
+    return task.id === receipt.taskId
+        && task.kind === kind
+        && candidate !== undefined
+        && candidate.taskId === receipt.taskId
+        && candidate.taskKind === receipt.taskKind
+        && candidate.admissionIdentity !== undefined
+        && candidate.admissionIdentity.requestKey === receipt.admissionIdentity.requestKey
+        && candidate.admissionIdentity.requestHash === receipt.admissionIdentity.requestHash
+        && path.resolve(candidate.ledgerAnchor.path) === path.resolve(receipt.ledgerAnchor.path)
+        && candidate.ledgerAnchor.revision === receipt.ledgerAnchor.revision
+        && candidate.ledgerAnchor.hash === receipt.ledgerAnchor.hash
+        && path.resolve(candidate.capsuleRef.path) === path.resolve(receipt.capsuleRef.path)
+        && candidate.capsuleRef.hash === receipt.capsuleRef.hash
+        && candidate.capsuleRef.byteLength === receipt.capsuleRef.byteLength;
+}
+
+function quarantineRecordSchedulerProjection(taskId: string): string | undefined {
+    const source = taskFilePath(taskId);
+    if (!fs.existsSync(source)) return undefined;
+    fs.mkdirSync(TASKS_DIR, { recursive: true });
+    const quarantinedPath = `${source}.corrupt.${Date.now()}.${process.pid}.${Math.random().toString(16).slice(2)}`;
+    fs.renameSync(source, quarantinedPath);
+    tasks.delete(taskId);
+    lastPersistMs.delete(taskId);
+    return quarantinedPath;
+}
+
 export function getBackgroundTask(taskId: string): BackgroundTask | null {
     if (!isValidBackgroundTaskId(taskId)) return null;
     cleanupExpiredTasksFromMemory();
@@ -771,7 +1560,7 @@ export function cleanOldTasks(maxAgeDays = DEFAULT_CLEAN_OLD_TASK_DAYS): CleanOl
             summary.invalidTaskFiles.push(entry);
             continue;
         }
-        if (task.status === "running") {
+        if (!TERMINAL_TASK_STATUSES.has(task.status)) {
             summary.keptRunningTaskIds.push(taskId);
             continue;
         }
@@ -849,12 +1638,36 @@ export async function recoverBackgroundTask(taskId: string): Promise<BackgroundT
         };
     }
 
+    if (persistedTask.status === "suspended") {
+        return recoverSuspendedBackgroundTask(persistedTask);
+    }
+
     if (persistedTask.status !== "running") {
         return {
             outcome: "loaded",
             taskId,
             kind: persistedTask.kind,
             task: loadTaskIntoMemory(persistedTask),
+        };
+    }
+
+    const recordTaskBlockReason = getRecordTaskGenericRecoveryBlockReason(persistedTask);
+    if (recordTaskBlockReason) {
+        if (!isRecordSchedulerTask(persistedTask)) {
+            return {
+                outcome: "error",
+                taskId,
+                kind: persistedTask.kind,
+                task: settleTaskAsError(persistedTask, `后台任务恢复失败：${recordTaskBlockReason}`),
+                reason: recordTaskBlockReason,
+            };
+        }
+        return {
+            outcome: "ignored",
+            taskId,
+            kind: persistedTask.kind,
+            task: persistedTask,
+            reason: "Record scheduler 任务不按 background stale/max-run 结案，等待后续 ledger owner lease 恢复",
         };
     }
 
@@ -949,7 +1762,7 @@ export async function recoverBackgroundTask(taskId: string): Promise<BackgroundT
         restartedTask.recovered = true;
         restartedTask.recoveredFrom = latestTask.id;
         restartedTask.recoveredAt = nowIso();
-        persistTask(restartedTask);
+        persistTask(restartedTask, "recovery");
         const oldTask = settleTaskAsError(
             latestTask,
             `后台任务已恢复到新 taskId=${restartedTask.id}`,
@@ -1009,16 +1822,353 @@ export async function scanOrphanedTasks(): Promise<ScanOrphanedTasksSummary> {
     return summary;
 }
 
+export async function scanRecordSchedulerTasks(): Promise<ScanRecordSchedulerTasksSummary> {
+    const summary: ScanRecordSchedulerTasksSummary = {
+        scanned: 0,
+        loaded: 0,
+        rebuilt: 0,
+        terminal: 0,
+        claimed: 0,
+        unadmitted: 0,
+        repairRequired: 0,
+        unknownOutcome: 0,
+        results: [],
+    };
+    for (const taskId of listRecordSchedulerLedgerTaskIds()) {
+        summary.scanned++;
+        const terminalLedger = readAuthoritativeTerminalRecordSchedulerLedger(taskId);
+        if (terminalLedger) {
+            clearRecordSchedulerRecoveryWatch(taskId);
+            const persisted = readPersistedTask(taskId);
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "terminal",
+                taskId,
+                kind: taskKindFromRequestMode(terminalLedger.task.requestMode),
+                task: persisted,
+                reason: `ledger task state=${terminalLedger.task.state}`,
+            });
+            continue;
+        }
+        const verification = await verifyOrRecoverTaskAdmission(taskId);
+        if (verification.kind === "unadmitted") {
+            const releaseClaim = tryClaimRecovery(taskId);
+            if (!releaseClaim) {
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "claimed",
+                    taskId,
+                    kind: taskKindFromRequestMode(verification.ledger.task.requestMode),
+                    task: null,
+                    reason: "已被其他进程 claim，跳过 L1 projection 隔离",
+                });
+                continue;
+            }
+            try {
+                const quarantinedPath = quarantineRecordSchedulerProjection(taskId);
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "unadmitted",
+                    taskId,
+                    kind: taskKindFromRequestMode(verification.ledger.task.requestMode),
+                    task: null,
+                    reason: verification.reason,
+                    ...(quarantinedPath ? { quarantinedPath } : {}),
+                });
+            } finally {
+                releaseClaim();
+            }
+            continue;
+        }
+        if (verification.kind === "repair_required") {
+            const releaseClaim = tryClaimRecovery(taskId);
+            if (!releaseClaim) {
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "claimed",
+                    taskId,
+                    kind: verification.ledger ? taskKindFromRequestMode(verification.ledger.task.requestMode) : "unknown",
+                    task: null,
+                    reason: "已被其他进程 claim，跳过 RepairRequired 转换",
+                });
+                continue;
+            }
+            try {
+                const quarantinedPath = quarantineRecordSchedulerProjection(taskId);
+                let reason = verification.reason;
+                if (verification.ledger) {
+                    try {
+                        await markRecordSchedulerAdmissionRepairRequired(taskId, reason);
+                    } catch (error) {
+                        reason = `${reason}; repair transition failed: ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                }
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "repair_required",
+                    taskId,
+                    kind: verification.ledger ? taskKindFromRequestMode(verification.ledger.task.requestMode) : "unknown",
+                    task: null,
+                    reason,
+                    ...(quarantinedPath ? { quarantinedPath } : {}),
+                });
+            } finally {
+                releaseClaim();
+            }
+            continue;
+        }
+
+        const kind = verification.receipt.taskKind;
+        if (isTerminalTaskState(verification.ledger.task.state)) {
+            const persisted = readPersistedTask(taskId);
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "terminal",
+                taskId,
+                kind,
+                task: persisted,
+                reason: `ledger task state=${verification.ledger.task.state}`,
+            });
+            continue;
+        }
+
+        const inMemory = tasks.get(taskId);
+        if (inMemory
+            && hasSameImmutableAdmissionBinding(inMemory, verification.receipt, kind)
+            && (inMemory.status === "running" || inMemory.status === "suspended")) {
+            const localExecution = backgroundTaskExecutions.get(taskId)?.task === inMemory;
+            const foreignOwner = typeof inMemory.ownerPid === "number" && inMemory.ownerPid !== process.pid;
+            if (inMemory.status === "suspended" || localExecution || !foreignOwner) {
+                clearRecordSchedulerRecoveryWatch(taskId);
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "loaded",
+                    taskId,
+                    kind,
+                    task: inMemory,
+                    reason: inMemory.status === "suspended"
+                        ? "本进程 scheduler projection 已挂起，保留同 taskId 等待唤醒"
+                        : "本进程 scheduler projection 仍在运行",
+                });
+                continue;
+            }
+            if (hasLiveRecordSchedulerOwnerLease(verification.ledger)) {
+                registerRecordSchedulerRecoveryWatch(taskId, inMemory.ownerPid!);
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "loaded",
+                    taskId,
+                    kind,
+                    task: inMemory,
+                    reason: `projection owner PID=${inMemory.ownerPid} 与 owner lease 仍有效，已登记非阻塞 watch/rescan`,
+                });
+                continue;
+            }
+            clearRecordSchedulerRecoveryWatch(taskId);
+            evictForeignRecordSchedulerProjection(taskId, inMemory.ownerPid!);
+        }
+        const persisted = readPersistedTask(taskId);
+        if (
+            persisted
+            && hasSameImmutableAdmissionBinding(persisted, verification.receipt, kind)
+            && persisted.status === "suspended"
+        ) {
+            clearRecordSchedulerRecoveryWatch(taskId);
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "loaded",
+                taskId,
+                kind,
+                task: loadTaskIntoMemory(persisted),
+                reason: "scheduler projection 已挂起，等待 generic suspended recovery 重建 timer",
+            });
+            continue;
+        }
+        if (persisted
+            && hasSameImmutableAdmissionBinding(persisted, verification.receipt, kind)
+            && persisted.status === "running"
+            && typeof persisted.ownerPid === "number"
+            && persisted.ownerPid !== process.pid
+            && hasLiveRecordSchedulerOwnerLease(verification.ledger)) {
+            registerRecordSchedulerRecoveryWatch(taskId, persisted.ownerPid);
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "loaded",
+                taskId,
+                kind,
+                task: loadTaskIntoMemory(persisted),
+                reason: `projection owner PID=${persisted.ownerPid} 与 owner lease 仍有效，已登记非阻塞 watch/rescan`,
+            });
+            continue;
+        }
+
+        const handler = getBackgroundTaskRecoveryHandler(kind);
+        const releaseClaim = tryClaimRecovery(taskId);
+        if (!releaseClaim) {
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "claimed",
+                taskId,
+                kind,
+                task: getBackgroundTask(taskId),
+                reason: "已被其他进程 claim，跳过重复 scheduler 恢复",
+            });
+            continue;
+        }
+        let quarantinedPath: string | undefined;
+        try {
+            quarantinedPath = fs.existsSync(taskFilePath(taskId))
+                ? quarantineRecordSchedulerProjection(taskId)
+                : undefined;
+            if (!handler) {
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "unknown_outcome",
+                    taskId,
+                    kind,
+                    task: null,
+                    reason: `admission 已验证，但未注册 kind=${kind} 的恢复 handler`,
+                    ...(quarantinedPath ? { quarantinedPath } : {}),
+                });
+                continue;
+            }
+            const candidate = createSchedulerRecoveryCandidate(verification.capsule, verification.receipt, verification.ledger.task.createdAt);
+            const action = await handler(candidate);
+            if (!action) {
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "unknown_outcome",
+                    taskId,
+                    kind,
+                    task: null,
+                    reason: `恢复 handler 未返回 action（kind=${kind}）`,
+                    ...(quarantinedPath ? { quarantinedPath } : {}),
+                });
+                continue;
+            }
+            if (action.kind !== undefined && action.kind !== kind) {
+                pushRecordSchedulerRecoveryResult(summary, {
+                    outcome: "unknown_outcome",
+                    taskId,
+                    kind,
+                    task: null,
+                    reason: `恢复 handler 试图把 scheduler kind 改为 ${action.kind}`,
+                    ...(quarantinedPath ? { quarantinedPath } : {}),
+                });
+                continue;
+            }
+            const background = verification.capsule.backgroundProjection;
+            const ensured = await ensureRecordSchedulerBackgroundProjection(kind, action.run, {
+                admissionReceipt: verification.receipt,
+                ...backgroundTaskOptionsFromCapsule(background),
+                timeoutMessage: action.timeoutMessage,
+                replacePersistedTerminal: true,
+            });
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: ensured.disposition,
+                taskId,
+                kind,
+                task: ensured.task,
+                ...(ensured.quarantinedPath || quarantinedPath
+                    ? { quarantinedPath: ensured.quarantinedPath || quarantinedPath }
+                    : {}),
+            });
+        } catch (error) {
+            pushRecordSchedulerRecoveryResult(summary, {
+                outcome: "unknown_outcome",
+                taskId,
+                kind,
+                task: null,
+                reason: error instanceof Error ? error.message : String(error),
+                ...(quarantinedPath ? { quarantinedPath } : {}),
+            });
+        } finally {
+            releaseClaim();
+        }
+    }
+    return summary;
+}
+
+export async function runBackgroundTaskStartupRecovery(): Promise<BackgroundTaskStartupRecoverySummary> {
+    const generic = await scanOrphanedTasks();
+    const recordScheduler = await scanRecordSchedulerTasks();
+    return { generic, recordScheduler };
+}
+
+function createSchedulerRecoveryCandidate(
+    capsule: SchedulerAdmissionCapsule,
+    admissionReceipt: RecordSchedulerAdmissionReceipt,
+    startedAt: string,
+): BackgroundTask {
+    const background = capsule.backgroundProjection;
+    const now = nowIso();
+    return {
+        id: capsule.taskId,
+        kind: capsule.taskKind,
+        status: "running",
+        startedAt,
+        updatedAt: now,
+        maxRunMs: 0,
+        progress: {
+            stage: "recovery",
+            detail: "从 immutable admission capsule 重建 projection",
+            updatedAt: now,
+            stageStartedAt: now,
+        },
+        ...(background.resumePayload === undefined ? {} : {
+            resumePayload: normalizeResumePayload(background.resumePayload),
+            resumeVersion: background.resumeVersion,
+            resumeHash: background.resumeHash,
+        }),
+        schedulerAdmission: {
+            admission: admissionReceipt,
+            ...(background.projection === undefined
+                ? {}
+                : { projection: normalizeResumePayload(background.projection) }),
+        },
+    };
+}
+
+function backgroundTaskOptionsFromCapsule(
+    background: SchedulerAdmissionBackgroundProjection,
+): Pick<RecordSchedulerBackgroundTaskOptions, "projection" | "resumePayload" | "resumeVersion" | "resumeHash"> {
+    return {
+        ...(background.projection === undefined ? {} : { projection: background.projection }),
+        ...(background.resumePayload === undefined ? {} : {
+            resumePayload: background.resumePayload,
+            resumeVersion: background.resumeVersion,
+            resumeHash: background.resumeHash,
+        }),
+    };
+}
+
+function taskKindFromRequestMode(requestMode: "update" | "batch_update"): "record-update" | "record-batch-update" {
+    return requestMode === "update" ? "record-update" : "record-batch-update";
+}
+
+function pushRecordSchedulerRecoveryResult(
+    summary: ScanRecordSchedulerTasksSummary,
+    result: RecordSchedulerStartupRecoveryResult,
+): void {
+    summary.results.push(result);
+    if (result.outcome === "loaded") summary.loaded++;
+    else if (result.outcome === "rebuilt") summary.rebuilt++;
+    else if (result.outcome === "terminal") summary.terminal++;
+    else if (result.outcome === "claimed") summary.claimed++;
+    else if (result.outcome === "unadmitted") summary.unadmitted++;
+    else if (result.outcome === "repair_required") summary.repairRequired++;
+    else summary.unknownOutcome++;
+}
+
 export function cancelBackgroundTask(taskId: string, reason = "用户取消"): BackgroundTask | null {
     const task = getBackgroundTask(taskId);
     if (!task) return null;
-    if (task.status !== "running") return task;
+    if (isRecordSchedulerTask(task)) {
+        throw new Error(
+            `Record scheduler ${task.kind} ${task.id} 必须由权威 scheduler ledger 取消；generic cancel 已拒绝，ledger 不可读取时需按 RepairRequired 处理`,
+        );
+    }
+    if (task.status !== "running" && task.status !== "suspended") return task;
+    const previousTask = { ...task };
     task.status = "cancelled";
     task.error = reason;
     task.finishedAt = nowIso();
     task.updatedAt = task.finishedAt;
-    // 取消态落盘；同 DATA_ROOT 的活任务会在下一次同步检查时感知该终态并停止写回。
-    persistTask(task);
+    try {
+        // 取消态落盘；同 DATA_ROOT 的活任务会在下一次同步检查时感知该终态并停止写回。
+        persistTask(task, "cancel");
+        discardBackgroundTaskExecution(task.id, task);
+    } catch (error) {
+        Object.assign(task, previousTask);
+        throw error;
+    }
     return task;
 }
 
@@ -1080,6 +2230,17 @@ export function formatBackgroundTask(task: BackgroundTask | null): string {
             task.deadlineAt ? `⏳ 截止: ${task.deadlineAt}` : "",
         ].filter(Boolean).join("\n");
     }
+    if (task.status === "suspended") {
+        return [
+            `⏸️ 后台任务已挂起`,
+            `🆔 taskId: ${task.id}`,
+            `📌 类型: ${task.kind}`,
+            task.wakeAt ? `⏰ 唤醒时间: ${task.wakeAt}` : "",
+            task.waitingReason ? `🧩 等待原因: ${task.waitingReason}` : "",
+            task.suspensionRevision !== undefined ? `🔐 挂起 revision: ${task.suspensionRevision}` : "",
+            ...formatProgress(task),
+        ].filter(Boolean).join("\n");
+    }
     if (task.status === "error") {
         return [
             `❌ 后台任务失败`,
@@ -1111,7 +2272,11 @@ export function __testEvictFromMemory(taskId: string): void {
 
 /** 直接往 tasks/{id}.json 写入一个任意文件态——模拟「另一进程/重启前残留」的孤儿任务。 */
 export function __testWritePersistedTask(task: BackgroundTask): void {
-    persistTask(task);
+    persistTask(task, "test", false);
+}
+
+export function __testSetBackgroundTaskPersistFaultInjector(injector?: BackgroundTaskPersistFaultInjector): void {
+    persistFaultInjector = injector;
 }
 
 export function __testHasTaskInMemory(taskId: string): boolean {
@@ -1126,8 +2291,17 @@ export function __testTaskPreservePath(taskId: string): string {
     return taskPreservePath(taskId);
 }
 
+export function __testRecordSchedulerRecoveryWatchTaskIds(): string[] {
+    return [...recordSchedulerRecoveryWatches.keys()].sort();
+}
+
 export function __testResetBackgroundTasksForTest(): void {
+    for (const taskId of suspensionTimers.keys()) clearSuspensionTimer(taskId);
+    for (const taskId of recordSchedulerRecoveryWatches.keys()) clearRecordSchedulerRecoveryWatch(taskId);
+    backgroundTaskExecutions.clear();
     tasks.clear();
     lastPersistMs.clear();
+    persistFaultInjector = undefined;
+    recordSchedulerRecoveryRescanTail = Promise.resolve();
     resetBackgroundTaskQueueForTest();
 }

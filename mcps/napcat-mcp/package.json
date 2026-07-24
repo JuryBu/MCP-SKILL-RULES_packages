@@ -1,0 +1,13 @@
+{
+  "name": "codex-napcat-training-notifier",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

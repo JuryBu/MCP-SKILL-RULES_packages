@@ -1,7 +1,18 @@
-## 上下文与效率
+## 上下文效率
 
-大文件先用目录、符号或精确搜索定位，再定点阅读。语义搜索只在关键词不足时使用，并优先后台运行。对话与记录先搜索，命中信息足够就不要整轮或整篇展开。长任务、模型调用和文件渲染使用后台模式与约 30–45 秒短轮询，轮询前先检查既有任务状态。
+- 大文件（>300行）先 smart_search 定位再精读，不要整个 read_file
+- smart_search 模式选择：
+  · exact：知道精确符号名/关键词（函数名、类名、字符串），<1秒
+  · fuzzy：记不清名称拼个大概（拼写模糊、部分匹配），<2秒
+  · smart：语义搜索，描述意图而非关键词（"处理超时的逻辑在哪"），45-110秒，grok low reasoning，默认后台
+  · 批量查询用 queries 数组并行，maxResults 控制返回条数
+- record/conversation 先 search 定位，信息够就不 read 全轮
+- memory_query 批量用 depth=summary，重要单条再 full
+- ⚠️ MCP 60s硬超时：耗时操作一律 background=true + 短轮询(waitSeconds=30-45)，别同步死等
+- 脏活（扫目录/批量分析/长文摘要）拆子代理，不占主线
 
-可并行且互不写入同一范围的调研、测试、截图检查可交给子代理。主线程集中保留决策、整合和验证所需的上下文，定期把长期有效的结果写入 memory-store。
+## Windsurf 特有功能
 
-Windsurf 特有能力（例如历史轨迹搜索、预览或子代理管理）仅在当前 IDE 明确提供时使用。需要当前对话 ID 时，优先用宿主提供的当前会话接口，或通过只读列表与上下文线索定位；不要省略 `conversationId` 后再依赖工具猜测。
+- trajectory_search：搜索历史对话
+- browser_preview：预览本地 Web 服务
+- 获取当前对话 ID（不要说「获取不到」）：首选 subagent_current（直接列出活跃Cascade ID，多个RUNNING时按标题/时间确认哪个是自己）/ 用户@mention自带 / conversation_read_original(action="list",dataChain="windsurf",query="关键词")。⚠️不要 fetch 不传 conversationId

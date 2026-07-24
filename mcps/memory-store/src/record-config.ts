@@ -17,6 +17,9 @@ export const CODEX_RECORD_MAX_PROMPT_CHARS = Number(process.env.MEMORY_STORE_COD
 /** Grok Record 模型上下文较大，但仍保留预算保护，避免把 1M 上下文误当无限制。 */
 export const GROK_RECORD_MAX_PROMPT_CHARS = Number(process.env.MEMORY_STORE_GROK_RECORD_MAX_PROMPT_CHARS || 200_000);
 
+/** agy CLI 通过 Windows 命令行传入 prompt，Record 必须留在客户端的 UTF-16 安全预算内。 */
+export const AGY_RECORD_MAX_PROMPT_CHARS = Number(process.env.MEMORY_STORE_AGY_RECORD_MAX_PROMPT_CHARS || 24_000);
+
 /** Codex 更新 Record 时携带的已有 Record 上下文上限，避免后期 Record 变长拖垮单批 prompt。 */
 export const CODEX_RECORD_CONTEXT_CHARS = Number(process.env.MEMORY_STORE_CODEX_RECORD_CONTEXT_CHARS || 30_000);
 
@@ -37,6 +40,8 @@ export const CODEX_RECORD_BACKGROUND_TIMEOUT_MS = Number(process.env.MEMORY_STOR
 export const RECORD_MODEL_TIMEOUT_MS = Number(process.env.MEMORY_STORE_RECORD_MODEL_TIMEOUT || 180_000);
 /** Grok Record 模型调用超时，独立于默认 Grok 轻量调用。 */
 export const GROK_RECORD_TIMEOUT_MS = Number(process.env.MEMORY_STORE_GROK_RECORD_TIMEOUT || 120_000);
+/** agy CLI Record 调用总超时，内部三模型 fallback 共用这份预算。 */
+export const AGY_RECORD_TIMEOUT_MS = Number(process.env.MEMORY_STORE_AGY_RECORD_TIMEOUT || 5 * 60_000);
 /** 长模型调用阶段的后台进度心跳间隔。 */
 export const RECORD_PROGRESS_HEARTBEAT_MS = Number(process.env.MEMORY_STORE_RECORD_PROGRESS_HEARTBEAT_MS || 30_000);
 /** Codex 模型桥只对快失败轻量重试，完整超时不重试。 */

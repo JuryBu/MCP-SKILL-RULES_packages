@@ -1,10 +1,12 @@
 import { AdaptiveConcurrencyGate } from "./adaptive-concurrency.js";
 import type { CallOutcome } from "./call-outcome.js";
-import { FifoConcurrencyGate, type ConcurrencyGatePermit } from "./concurrency-gate.js";
+import { getProviderTransportAdapter, mapProviderTrafficClass, type ProviderTransportLease, type ProviderTransportSettlementKind } from "./provider-transport-adapter.js";
+import type { ProviderTrafficClass } from "./provider-control-contracts.js";
+import type { FailureClass } from "./record-scheduler-contracts.js";
 
 export type GrokContext = "default" | "record" | "guard";
 export type GrokTrafficClass = "foreground" | "record-batch";
-export type GrokTimeoutKind = "batch_queue" | "global_queue" | "transport";
+export type GrokTimeoutKind = "provider_admission" | "transport";
 
 export interface GrokExecDiagnostics {
     concurrencyScope: "process";
@@ -41,11 +43,16 @@ export interface GrokExecResult {
     status?: number;
     finishReason?: string;
     diagnostics?: GrokExecDiagnostics;
+    failureClass?: FailureClass;
 }
 
 export interface GrokExecOptions {
     context?: GrokContext;
     trafficClass?: GrokTrafficClass;
+    providerTrafficClass?: ProviderTrafficClass;
+    providerLease?: ProviderTransportLease;
+    attemptId?: string;
+    idempotencyKey?: string;
     queueTimeoutMs?: number;
     queueRetryLimit?: number;
     queueRetryBackoffMs?: number;
@@ -67,30 +74,15 @@ const DEFAULT_GROK_RECORD_MAX_TOKENS = 8192;
 const DEFAULT_GROK_GUARD_MAX_TOKENS = 4096;
 const DEFAULT_GROK_CALL_CONCURRENCY = 8;
 const INITIAL_GROK_CALL_CONCURRENCY = 2;
-const DEFAULT_GROK_BATCH_CONCURRENCY = 4;
-const DEFAULT_GROK_FOREGROUND_RESERVED_SLOTS = 1;
-const DEFAULT_GROK_QUEUE_TIMEOUT_MS = 30_000;
-const DEFAULT_GROK_QUEUE_RETRY_LIMIT = 1;
-const DEFAULT_GROK_QUEUE_RETRY_BACKOFF_MS = 100;
 const GROK_STATUS_TTL_MS = 60_000;
 const GROK_STATUS_TIMEOUT_MS = 3_000;
 const GROK_CALL_CANCEL_MESSAGE = "Grok 模型桥调用已取消";
-const GROK_CALL_QUEUE_TIMEOUT_MESSAGE = "Grok 模型桥排队超时";
-const GROK_BATCH_QUEUE_TIMEOUT_MESSAGE = "Grok batch 准入排队超时";
-const GROK_GLOBAL_QUEUE_TIMEOUT_MESSAGE = "Grok 全局队列排队超时";
 const GROK_CALL_TIMEOUT_MESSAGE = "Grok 模型桥超时";
 const GROK_CALL_POLL_MS = 25;
 
 let grokAvailableCache: boolean | null = null;
 let grokAvailableAt = 0;
 let grokCallAdaptiveGate: { max: number; gate: AdaptiveConcurrencyGate } | null = null;
-const grokCallGate = new FifoConcurrencyGate(
-    () => getGrokCallAdaptiveGate().limit,
-    { reservedSlots: () => readNonNegativeIntEnv("MEMORY_STORE_GROK_FOREGROUND_RESERVED_SLOTS", DEFAULT_GROK_FOREGROUND_RESERVED_SLOTS) },
-);
-const grokBatchAdmissionGate = new FifoConcurrencyGate(
-    () => readPositiveIntEnv("MEMORY_STORE_GROK_BATCH_CONCURRENCY", DEFAULT_GROK_BATCH_CONCURRENCY),
-);
 
 function grokProxyUrl(): string {
     return (process.env.MEMORY_STORE_GROK_PROXY_URL || DEFAULT_GROK_PROXY_URL).replace(/\/+$/u, "");
@@ -103,11 +95,6 @@ function grokApiKey(): string {
 function readPositiveIntEnv(name: string, fallback: number): number {
     const value = Math.floor(Number(process.env[name] || ""));
     return Number.isFinite(value) && value > 0 ? value : fallback;
-}
-
-function readNonNegativeIntEnv(name: string, fallback: number): number {
-    const value = Math.floor(Number(process.env[name] || ""));
-    return Number.isFinite(value) && value >= 0 ? value : fallback;
 }
 
 function parseJsonBody<T>(body: string): JsonParseResult<T> {
@@ -129,10 +116,6 @@ function getGrokCallAdaptiveGate(): AdaptiveConcurrencyGate {
     return grokCallAdaptiveGate.gate;
 }
 
-function getGrokBatchAdmissionGate(): FifoConcurrencyGate {
-    return grokBatchAdmissionGate;
-}
-
 function normalizeExecOptions(options?: GrokContext | GrokExecOptions): GrokExecOptions {
     return typeof options === "string" ? { context: options } : (options || {});
 }
@@ -144,6 +127,13 @@ function safeShouldCancel(options: GrokExecOptions): boolean {
     } catch {
         return true;
     }
+}
+
+async function cancelUnusedProviderLease(lease: ProviderTransportLease | undefined): Promise<void> {
+    if (!lease) return;
+    try {
+        await getProviderTransportAdapter().cancel(lease);
+    } catch {}
 }
 
 function resolveDeadline(timeoutMs: number): number {
@@ -164,14 +154,12 @@ function buildDiagnostics(
     queue: GrokQueueMetrics,
     adaptiveGate: AdaptiveConcurrencyGate,
 ): GrokExecDiagnostics {
-    const concurrency = grokCallGate.stats();
-    const batch = getGrokBatchAdmissionGate().stats();
     const adaptive = adaptiveGate.snapshot();
     return {
         concurrencyScope: "process",
         context,
-        active: concurrency.active,
-        pending: concurrency.pending,
+        active: 0,
+        pending: 0,
         limit: adaptive.current,
         current: adaptive.current,
         max: adaptive.max,
@@ -184,13 +172,13 @@ function buildDiagnostics(
         queueAttempts: queue.queueAttempts,
         trafficClass,
         pid: process.pid,
-        globalActive: concurrency.active,
-        globalPending: concurrency.pending,
+        globalActive: 0,
+        globalPending: 0,
         globalLimit: adaptive.current,
         ...(queue.timeoutKind ? { timeoutKind: queue.timeoutKind } : {}),
-        batchActive: batch.active,
-        batchPending: batch.pending,
-        batchLimit: batch.limit,
+        batchActive: 0,
+        batchPending: 0,
+        batchLimit: 0,
     };
 }
 
@@ -203,7 +191,7 @@ function timeoutResult(
     error = GROK_CALL_TIMEOUT_MESSAGE,
 ): GrokExecResult {
     const metrics = { ...queue, timeoutKind };
-    return { text: null, error, timedOut: true, timeoutKind, diagnostics: buildDiagnostics(context, trafficClass, metrics, adaptiveGate) };
+    return { text: null, error, timedOut: true, timeoutKind, failureClass: "Availability", diagnostics: buildDiagnostics(context, trafficClass, metrics, adaptiveGate) };
 }
 
 function cancelledResult(
@@ -218,7 +206,7 @@ function cancelledResult(
 
 function recordTransportOutcome(outcome: CallOutcome, adaptiveGate: AdaptiveConcurrencyGate): void {
     if (outcome.success) {
-        if (adaptiveGate.onSuccess()) grokCallGate.notifyCapacityIncrease();
+        adaptiveGate.onSuccess();
         return;
     }
     if (
@@ -229,6 +217,27 @@ function recordTransportOutcome(outcome: CallOutcome, adaptiveGate: AdaptiveConc
     ) {
         adaptiveGate.onFailure();
     }
+}
+
+function failureClassForOutcome(outcome: CallOutcome): FailureClass | undefined {
+    if (outcome.success) return undefined;
+    if (outcome.errorKind === "rate_limit" || outcome.errorKind === "server_error") return "Congestion";
+    if (outcome.errorKind === "timeout" || outcome.errorKind === "network") return "Availability";
+    if (outcome.errorKind === "content_truncated") return "Complexity";
+    return "Quality";
+}
+
+type GrokTransportResponse = { response: Response; body: string };
+
+function classifyGrokResponse(response: Response): ProviderTransportSettlementKind {
+    if (response.ok) return "success";
+    if (response.status === 429) return "rate-limit";
+    if (response.status >= 500) return "congestion";
+    return "availability";
+}
+
+function classifyGrokTransportResponse({ response }: GrokTransportResponse): ProviderTransportSettlementKind {
+    return classifyGrokResponse(response);
 }
 
 function createFetchAbortController(timeoutMs: number, options: GrokExecOptions): {
@@ -276,45 +285,6 @@ function createFetchAbortController(timeoutMs: number, options: GrokExecOptions)
     };
 }
 
-function resolveQueueTimeoutMs(options: GrokExecOptions, trafficClass: GrokTrafficClass, timeoutMs: number): number {
-    if (Number.isFinite(options.queueTimeoutMs) && Number(options.queueTimeoutMs) >= 0) {
-        return Math.floor(Number(options.queueTimeoutMs));
-    }
-    if (trafficClass === "record-batch") {
-        return readPositiveIntEnv("MEMORY_STORE_GROK_QUEUE_TIMEOUT_MS", DEFAULT_GROK_QUEUE_TIMEOUT_MS);
-    }
-    return Number.isFinite(timeoutMs) ? Math.max(0, Math.floor(timeoutMs)) : 0;
-}
-
-function resolveQueueRetryLimit(options: GrokExecOptions, trafficClass: GrokTrafficClass): number {
-    if (trafficClass !== "record-batch") return 0;
-    if (Number.isFinite(options.queueRetryLimit) && Number(options.queueRetryLimit) >= 0) {
-        return Math.min(1, Math.floor(Number(options.queueRetryLimit)));
-    }
-    return Math.min(1, readNonNegativeIntEnv("MEMORY_STORE_GROK_QUEUE_RETRY_LIMIT", DEFAULT_GROK_QUEUE_RETRY_LIMIT));
-}
-
-function resolveQueueRetryBackoffMs(options: GrokExecOptions): number {
-    if (Number.isFinite(options.queueRetryBackoffMs) && Number(options.queueRetryBackoffMs) >= 0) {
-        return Math.floor(Number(options.queueRetryBackoffMs));
-    }
-    return readNonNegativeIntEnv("MEMORY_STORE_GROK_QUEUE_RETRY_BACKOFF_MS", DEFAULT_GROK_QUEUE_RETRY_BACKOFF_MS);
-}
-
-async function waitForQueueRetry(
-    delayMs: number,
-    logicalDeadlineAt: number,
-    options: GrokExecOptions,
-): Promise<"ready" | "cancelled" | "deadline"> {
-    const targetAt = Math.min(logicalDeadlineAt, Date.now() + Math.max(0, delayMs));
-    while (Date.now() < targetAt) {
-        if (safeShouldCancel(options)) return "cancelled";
-        await new Promise(resolve => setTimeout(resolve, Math.min(GROK_CALL_POLL_MS, Math.max(1, targetAt - Date.now()))));
-    }
-    if (safeShouldCancel(options)) return "cancelled";
-    return Date.now() >= logicalDeadlineAt ? "deadline" : "ready";
-}
-
 export function mapGrokModel(model: string, context: GrokContext = "default"): string {
     if (context === "record") return process.env.MEMORY_STORE_GROK_RECORD_MODEL || DEFAULT_GROK_RECORD_MODEL;
     if (context === "guard") return process.env.MEMORY_STORE_GROK_GUARD_MODEL || DEFAULT_GROK_GUARD_MODEL;
@@ -337,127 +307,20 @@ export async function callGrokExec(
     options?: GrokContext | GrokExecOptions,
 ): Promise<GrokExecResult> {
     const execOptions = normalizeExecOptions(options);
+    try {
     const context = execOptions.context || "default";
     const trafficClass = execOptions.trafficClass || "foreground";
+    const providerTrafficClass = mapProviderTrafficClass(execOptions.providerTrafficClass || trafficClass);
     const logicalDeadlineAt = resolveDeadline(timeoutMs);
     const adaptiveGate = getGrokCallAdaptiveGate();
-    const queueTimeoutMs = resolveQueueTimeoutMs(execOptions, trafficClass, timeoutMs);
-    const queueRetryLimit = resolveQueueRetryLimit(execOptions, trafficClass);
-    const queueRetryBackoffMs = resolveQueueRetryBackoffMs(execOptions);
     const queue: GrokQueueMetrics = {
         batchQueueWaitMs: 0,
         globalQueueWaitMs: 0,
-        queueAttempts: 0,
+        queueAttempts: 1,
     };
 
     if (safeShouldCancel(execOptions)) {
         return cancelledResult(context, trafficClass, queue, adaptiveGate);
-    }
-
-    let batchPermit: ConcurrencyGatePermit | null = null;
-    let permit: ConcurrencyGatePermit | null = null;
-    for (let attempt = 0; ; attempt++) {
-        queue.queueAttempts = attempt + 1;
-        const attemptDeadlineAt = Math.min(logicalDeadlineAt, Date.now() + queueTimeoutMs);
-        let queueTimeoutKind: Exclude<GrokTimeoutKind, "transport"> | null = null;
-
-        if (trafficClass === "record-batch") {
-            const batchWaitStartedAt = Date.now();
-            try {
-                batchPermit = await getGrokBatchAdmissionGate().acquire({
-                    deadlineAt: attemptDeadlineAt,
-                    shouldCancel: () => safeShouldCancel(execOptions),
-                    cancelMessage: GROK_CALL_CANCEL_MESSAGE,
-                    timeoutMessage: GROK_BATCH_QUEUE_TIMEOUT_MESSAGE,
-                    requestClass: "background",
-                });
-                queue.batchQueueWaitMs += batchPermit.queueWaitMs;
-                if (Date.now() >= attemptDeadlineAt) {
-                    batchPermit.release();
-                    batchPermit = null;
-                    queueTimeoutKind = "batch_queue";
-                }
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                queue.batchQueueWaitMs += Math.max(0, Date.now() - batchWaitStartedAt);
-                if (message === GROK_CALL_CANCEL_MESSAGE || safeShouldCancel(execOptions)) {
-                    return cancelledResult(context, trafficClass, queue, adaptiveGate);
-                }
-                if (message === GROK_BATCH_QUEUE_TIMEOUT_MESSAGE) {
-                    queueTimeoutKind = "batch_queue";
-                } else {
-                    return {
-                        text: null,
-                        error: `Grok 模型桥调用失败: ${message}`,
-                        diagnostics: buildDiagnostics(context, trafficClass, queue, adaptiveGate),
-                    };
-                }
-            }
-        }
-
-        if (!queueTimeoutKind) {
-            const globalWaitStartedAt = Date.now();
-            try {
-                permit = await grokCallGate.acquire({
-                    deadlineAt: attemptDeadlineAt,
-                    shouldCancel: () => safeShouldCancel(execOptions),
-                    cancelMessage: GROK_CALL_CANCEL_MESSAGE,
-                    timeoutMessage: GROK_GLOBAL_QUEUE_TIMEOUT_MESSAGE,
-                    requestClass: trafficClass === "record-batch" ? "background" : "foreground",
-                });
-                queue.globalQueueWaitMs += permit.queueWaitMs;
-            } catch (error) {
-                const message = error instanceof Error ? error.message : String(error);
-                queue.globalQueueWaitMs += Math.max(0, Date.now() - globalWaitStartedAt);
-                batchPermit?.release();
-                batchPermit = null;
-                if (message === GROK_CALL_CANCEL_MESSAGE || safeShouldCancel(execOptions)) {
-                    return cancelledResult(context, trafficClass, queue, adaptiveGate);
-                }
-                if (message === GROK_GLOBAL_QUEUE_TIMEOUT_MESSAGE) {
-                    adaptiveGate.onFailure();
-                    queueTimeoutKind = "global_queue";
-                } else {
-                    return {
-                        text: null,
-                        error: `Grok 模型桥调用失败: ${message}`,
-                        diagnostics: buildDiagnostics(context, trafficClass, queue, adaptiveGate),
-                    };
-                }
-            }
-        }
-
-        if (!queueTimeoutKind && permit) break;
-
-        permit?.release();
-        permit = null;
-        batchPermit?.release();
-        batchPermit = null;
-        const canRetry = attempt < queueRetryLimit && Date.now() < logicalDeadlineAt;
-        if (!canRetry) {
-            return timeoutResult(
-                context,
-                trafficClass,
-                queue,
-                adaptiveGate,
-                queueTimeoutKind || "global_queue",
-                `${GROK_CALL_QUEUE_TIMEOUT_MESSAGE} (${queueTimeoutKind || "global_queue"})`,
-            );
-        }
-        const retryWait = await waitForQueueRetry(queueRetryBackoffMs, logicalDeadlineAt, execOptions);
-        if (retryWait === "cancelled") {
-            return cancelledResult(context, trafficClass, queue, adaptiveGate);
-        }
-        if (retryWait === "deadline") {
-            return timeoutResult(
-                context,
-                trafficClass,
-                queue,
-                adaptiveGate,
-                queueTimeoutKind || "global_queue",
-                `${GROK_CALL_QUEUE_TIMEOUT_MESSAGE}（重试前总预算不足）`,
-            );
-        }
     }
 
     let fetchAbortReason: "timeout" | "cancel" | null = null;
@@ -471,9 +334,11 @@ export async function callGrokExec(
     ): GrokExecResult => {
         recordTransportOutcome(outcome, adaptiveGate);
         const metrics = timeoutKind ? { ...queue, timeoutKind } : queue;
+        const failureClass = failureClassForOutcome(outcome);
         return {
             ...result,
             ...(timeoutKind ? { timeoutKind } : {}),
+            ...(failureClass ? { failureClass } : {}),
             diagnostics: buildDiagnostics(context, trafficClass, metrics, adaptiveGate),
         };
     };
@@ -490,34 +355,58 @@ export async function callGrokExec(
                 trafficClass,
                 queue,
                 adaptiveGate,
-                "global_queue",
-                `${GROK_CALL_TIMEOUT_MESSAGE}（排队后剩余预算不足）`,
+                "provider_admission",
+                `${GROK_CALL_TIMEOUT_MESSAGE}（provider admission 等待后剩余预算不足）`,
             );
         }
 
         const fetchAbort = createFetchAbortController(remainingMs, execOptions);
         try {
-            fetchStarted = true;
-            const resp = await fetch(`${grokProxyUrl()}/v1/chat/completions`, {
-                method: "POST",
-                headers: {
-                    "content-type": "application/json",
-                    authorization: `Bearer ${grokApiKey()}`,
-                },
-                body: JSON.stringify({
-                    model,
-                    messages: [{ role: "user", content: prompt }],
-                    temperature: 0.3,
-                    max_tokens: maxTokens,
-                }),
-                signal: fetchAbort.signal,
-            });
-            receivedResponse = true;
-            if (!resp.ok) {
-                const body = (await resp.text()).trim();
+            const adapter = getProviderTransportAdapter();
+            const executeTransport = async (): Promise<GrokTransportResponse> => {
+                fetchStarted = true;
+                const response = await fetch(`${grokProxyUrl()}/v1/chat/completions`, {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/json",
+                        authorization: `Bearer ${grokApiKey()}`,
+                        ...(execOptions.idempotencyKey === undefined ? {} : { "Idempotency-Key": execOptions.idempotencyKey }),
+                    },
+                    body: JSON.stringify({
+                        model,
+                        messages: [{ role: "user", content: prompt }],
+                        temperature: 0.3,
+                        max_tokens: maxTokens,
+                    }),
+                    signal: fetchAbort.signal,
+                });
+                receivedResponse = true;
+                const body = await response.text();
                 bodyComplete = true;
+                return { response, body };
+            };
+            const classifyError = () => fetchStarted && (fetchAbort.getReason() !== null || receivedResponse)
+                ? "unknown"
+                : "availability";
+            const transportResponse = execOptions.providerLease
+                ? await adapter.executeGranted(
+                    execOptions.providerLease,
+                    executeTransport,
+                    classifyGrokTransportResponse,
+                    classifyError,
+                )
+                : await adapter.execute(
+                    "grok",
+                    { trafficClass: providerTrafficClass, signal: fetchAbort.signal, attemptId: execOptions.attemptId },
+                    executeTransport,
+                    classifyGrokTransportResponse,
+                    classifyError,
+                );
+            const { response: resp, body } = transportResponse;
+            if (!resp.ok) {
+                const detailBody = body.trim();
                 const transient = resp.status === 429 ? "限流" : resp.status === 502 ? "上游不可用" : "HTTP 错误";
-                const detail = body ? `: ${body.slice(0, 200)}` : "";
+                const detail = detailBody ? `: ${detailBody.slice(0, 200)}` : "";
                 return finishTransport(
                     {
                         text: null,
@@ -535,8 +424,6 @@ export async function callGrokExec(
                 );
             }
 
-            const body = await resp.text();
-            bodyComplete = true;
             const parsedBody = parseJsonBody<{
                 choices?: Array<{ message?: { content?: unknown }; finish_reason?: string }>;
             }>(body);
@@ -584,6 +471,16 @@ export async function callGrokExec(
             return cancelledResult(context, trafficClass, queue, adaptiveGate);
         }
         if (fetchAbortReason === "timeout") {
+            if (!fetchStarted) {
+                return timeoutResult(
+                    context,
+                    trafficClass,
+                    queue,
+                    adaptiveGate,
+                    "provider_admission",
+                    `${GROK_CALL_TIMEOUT_MESSAGE}（provider admission 排队）`,
+                );
+            }
             return finishTransport(
                 { text: null, error: GROK_CALL_TIMEOUT_MESSAGE, timedOut: true, timeoutKind: "transport" },
                 { success: false, errorKind: "timeout" },
@@ -595,9 +492,9 @@ export async function callGrokExec(
             { text: null, error: `Grok 模型桥调用失败: ${message}` },
             { success: false, errorKind: fetchStarted && (!receivedResponse || !bodyComplete) ? "network" : "unknown" },
         );
+    }
     } finally {
-        permit?.release();
-        batchPermit?.release();
+        await cancelUnusedProviderLease(execOptions.providerLease);
     }
 }
 
@@ -608,11 +505,24 @@ export async function isGrokBridgeAvailable(): Promise<boolean> {
     }
 
     try {
-        const resp = await fetch(`${grokProxyUrl()}/v1/models`, {
-            method: "GET",
-            headers: { authorization: `Bearer ${grokApiKey()}` },
-            signal: AbortSignal.timeout(Number(process.env.MEMORY_STORE_GROK_STATUS_TIMEOUT_MS || GROK_STATUS_TIMEOUT_MS)),
-        });
+        const signal = AbortSignal.timeout(Number(process.env.MEMORY_STORE_GROK_STATUS_TIMEOUT_MS || GROK_STATUS_TIMEOUT_MS));
+        let probeStarted = false;
+        const resp = await getProviderTransportAdapter().execute(
+            "grok",
+            { trafficClass: "foreground", signal, probe: true },
+            async () => {
+                probeStarted = true;
+                const response = await fetch(`${grokProxyUrl()}/v1/models`, {
+                    method: "GET",
+                    headers: { authorization: `Bearer ${grokApiKey()}` },
+                    signal,
+                });
+                await response.arrayBuffer();
+                return response;
+            },
+            response => classifyGrokResponse(response),
+            () => probeStarted && signal.aborted ? "unknown" : "availability",
+        );
         grokAvailableCache = resp.ok;
     } catch {
         grokAvailableCache = false;
@@ -628,14 +538,4 @@ export function resetGrokBridgeAvailabilityForTest(): void {
 
 export function resetGrokCallConcurrencyForTest(): void {
     grokCallAdaptiveGate = null;
-    grokCallGate.resetPeakForTest();
-    grokBatchAdmissionGate.resetPeakForTest();
-}
-
-export function getGrokCallConcurrencyForTest() {
-    return {
-        global: grokCallGate.stats(),
-        batch: getGrokBatchAdmissionGate().stats(),
-        adaptive: getGrokCallAdaptiveGate().snapshot(),
-    };
 }

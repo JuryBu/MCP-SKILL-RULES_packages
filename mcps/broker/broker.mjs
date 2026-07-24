@@ -32,6 +32,8 @@ const memoryStoreRoot = process.env.MEMORY_STORE_MCP_ROOT || path.join(toolkitMc
 const webFetcherRoot = process.env.WEB_FETCHER_MCP_ROOT || path.join(toolkitMcpRoot, "web-fetcher");
 const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "sandbox");
 const subagentRoot = process.env.SUBAGENT_MCP_ROOT || path.join(toolkitMcpRoot, "mcp-subagent");
+const napcatRoot = process.env.NAPCAT_MCP_ROOT || path.join(toolkitMcpRoot, "napcat-mcp");
+const napcatEnabled = process.env.CODEX_TOOLKIT_ENABLE_NAPCAT_MCP === "1";
 const sdkRoot = path.join(
   memoryStoreRoot,
   "node_modules",
@@ -204,6 +206,21 @@ const endpoints = {
       SANDBOX_ENABLE_DUPLICATE_RETIREMENT: "0",
     },
   },
+  ...(napcatEnabled ? {
+    napcat: {
+      path: "/napcat/mcp",
+      command: "node",
+      args: [path.join(napcatRoot, "src", "index.mjs")],
+      cwd: napcatRoot,
+      env: {
+        CODEX_MCP_WRAPPER: "1",
+        CODEX_MCP_TOOL_NAME: "napcat",
+        MCP_SDK_ROOT: sdkRoot,
+        NAPCAT_MCP_BINDING_PATH: process.env.NAPCAT_MCP_BINDING_PATH || path.join(toolkitDataRoot, "napcat-mcp", "binding.json"),
+        NAPCAT_MCP_STATE_PATH: process.env.NAPCAT_MCP_STATE_PATH || path.join(toolkitDataRoot, "napcat-mcp", "state", "dedupe.json"),
+      },
+    },
+  } : {}),
   subagent: {
     path: "/subagent/mcp",
     command: "node",

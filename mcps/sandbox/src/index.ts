@@ -302,7 +302,7 @@ MCP 进程与父 LS 进程绑定（ppid），与窗口同生共死：
 说明：
 - exact / fuzzy 完全不受 modelChain/chain 参数影响，行为保持不变
 - modelChain=auto：按 Grok → Antigravity → Codex 自动选择；Grok 通过本机 progrok OpenAI-compatible API（默认 http://127.0.0.1:18645）调用；不会自动调用 Claude Code CLI，避免静默消耗额度
-- modelChain=grok：强制走接收方已经运行的 progrok API；不可用时直接报错，不静默降级。公开版不安装、不启动、不 patch ProGrok
+- modelChain=grok：强制走 progrok API；不可用时直接报错，不静默降级。SANDBOX_PROGROK_AUTOSTART=1 才会尝试自动启动 proxy；SANDBOX_PROGROK_PATCH=1 才会写入 progrok ProxyAgent patch
 - smart_search 的 Grok 三阶段默认传 reasoning_effort=low；可用 SANDBOX_PROGROK_REASONING_EFFORT / SANDBOX_SMART_GROK_REASONING_EFFORT 覆盖。progrok 超时、截断、429、5xx 时会在 Grok 桥内用 fallback 模型重试一次，默认 grok-4.20-non-reasoning，可用 SANDBOX_PROGROK_FALLBACK_MODEL / SANDBOX_SMART_GROK_FALLBACK_MODEL 覆盖；max_tokens 保持 4096
 - progrok 可用性探测默认 8s、瞬态失败重试 1 次，且响应必须包含 ok 才算可用；可用 SANDBOX_PROGROK_PROBE_TIMEOUT_MS / SANDBOX_PROGROK_PROBE_RETRIES 覆盖，避免 Clash/progrok 短暂波动时过早降级到 Codex
 - modelChain=antigravity：强制走 Antigravity LS；未发现可连接 LS 时直接报错
@@ -340,7 +340,7 @@ exact/fuzzy 最大并发 5，smart 限并发 2
 - 完整副本同时写 Markdown + JSON
 - 每个 council run 使用稳定 council-artifacts/<runId>/ 根目录和 manifest.json；显式 transcriptPath/outputDir 只登记为外部引用，不由 council GC 删除
 - sandbox-data/temp/council-tasks/<taskId>/ 只保存后台状态、checkpoint 和 resume transcript 快照，核心文件包括 spec/progress/done，用于查询、恢复和结束状态，不是完整 artifact 根目录
-- 服务默认不自动修改 Council 持久产物；先用 sandbox_status(action="gc", gcScope="council", gcMode="dryRun") 预演，用户授权后再显式 apply。仅设置 SANDBOX_COUNCIL_AUTO_GC=1 时，启动才会 apply 托管产物（includeLegacy=false）并按 15 天清理过期 task；legacy 迁移始终需要人工调用
+- 服务启动时自动先执行托管产物的 apply GC（includeLegacy=false），再按 15 天清理过期 council task；legacy 迁移不会自动执行，仍需人工调用 sandbox_status(action="gc", gcScope="council", gcMode="apply")
 - sandbox_status 的 council GC 支持 dryRun/apply/restore/purge；TTL 默认 14 天且最小 7 天，只处理终态 run 组，每次最多 100 个，并保护 dependsOn、running、文件名恰为 .preserve 的标记文件与损坏 manifest；legacy apply 会把旧产物逐文件隔离到 council-quarantine/<quarantineId>/，可用 restore 复原或 purge 清除
 
 常用参数:
@@ -406,7 +406,6 @@ Provider:
   "background": true,
   "ownerId": "example-owner"
 }
-
 \`\`\`
 
 后台查询时请复用启动返回的 ownerId：
@@ -559,15 +558,13 @@ async function main(): Promise<void> {
     cleanOldTempFiles();
 
     void Promise.resolve().then(() => {
-        if (process.env.SANDBOX_COUNCIL_AUTO_GC === "1") {
-            const artifactGc = runCouncilArtifactGc({ mode: "apply", includeLegacy: false });
-            if (artifactGc.changed > 0) {
-                console.error(`[sandbox] 已清理 ${artifactGc.changed} 个过期 council artifact run`);
-            }
-            const cleaned = cleanOldCouncilTasks();
-            if (cleaned > 0) {
-                console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
-            }
+        const artifactGc = runCouncilArtifactGc({ mode: "apply", includeLegacy: false });
+        if (artifactGc.changed > 0) {
+            console.error(`[sandbox] 已清理 ${artifactGc.changed} 个过期 council artifact run`);
+        }
+        const cleaned = cleanOldCouncilTasks();
+        if (cleaned > 0) {
+            console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
         }
         scanCouncilTasksOnStartup((message) => console.error(message));
     }).catch((err) => {

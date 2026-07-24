@@ -2,13 +2,13 @@
 
 ## Components
 
-### memory-store 1.19.3
+### memory-store 1.21.1
 
-Shared memory, Conversation reading/export, Record management, Golden Extract, Stage Guard, ownership repair, trajectories, smart search, background recovery, and stable task status.
+Shared memory, Conversation reading/export, Record management, Golden Extract, Stage Guard, ownership repair, trajectories, smart search, background recovery, stable task status, source evidence, provider control and production Record scheduling.
 
 Data routes: `auto | antigravity | codex | claude-code | cc | windsurf | wsf`.
 
-Model routes: `auto | antigravity | codex | claude-code | cc | grok`.
+Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 
 `chain="windsurf"` is a compatibility shortcut for data only. `chain="grok"` is a compatibility shortcut for model execution only.
 
@@ -28,11 +28,15 @@ Headless web access, authenticated browser profiles, local multi-format document
 
 ### broker 0.1.0
 
-Streamable HTTP bridge exposing memory-store, web-fetcher, sandbox, Playwright, sequential-thinking, optional Exa, and optional Windsurf subagent endpoints. Long calls inherit `waitSeconds` / `timeout` with a configurable cap.
+Streamable HTTP bridge exposing memory-store, web-fetcher, sandbox, Playwright, sequential-thinking, optional Exa, optional Windsurf subagent, and optional NapCat endpoints. Long calls inherit `waitSeconds` / `timeout` with a configurable cap.
 
 ### mcp-subagent 1.1.0
 
 Optional Windsurf Cascade-only async subagent controller. It is not a shared four-host MCP and must not be presented as a Codex, Antigravity, or Claude Code native subagent service.
+
+### napcat-mcp 0.1.0
+
+Optional fixed-QQ-group collaboration MCP for status checks, target discovery, recent-message reads, structured `task_id` messages, training notifications, group-file upload/download, and heartbeat management. It is source-only and disabled by default; the receiver must supply NapCat OneBot, a private token, QQ login state, and a private `binding.json`.
 
 ## Portable Data
 
@@ -52,10 +56,13 @@ Main overrides:
 - `ANTIGRAVITY_CONVERSATIONS_DIR`
 - `CLAUDE_CODE_CONVERSATIONS_DIR`
 - `WSF_CASCADE_ENDPOINT`
+- `NAPCAT_MCP_BINDING_PATH`
+- `NAPCAT_MCP_STATE_PATH`
 
 ## Optional Model / Search Services
 
 - ProGrok: `MEMORY_STORE_GROK_PROXY_URL`, `MEMORY_STORE_GROK_API_KEY`, `SANDBOX_PROGROK_BASE_URL`, `SANDBOX_PROGROK_API_KEY`
 - Exa: `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`
+- NapCat: `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP`, `NAPCAT_HTTP_URL`, `NAPCAT_ACCESS_TOKEN`
 
 Real values belong in the receiver's private environment, never in source or zip files.

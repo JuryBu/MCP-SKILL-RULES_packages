@@ -27,4 +27,10 @@ enabled = true
 # url = "http://127.0.0.1:14588/exa/mcp"
 # enabled = true
 
+# Optional QQ group collaboration endpoint. Enable the broker module and configure
+# a receiver-owned NapCat installation before uncommenting this block.
+# [mcp_servers.napcat]
+# url = "http://127.0.0.1:14588/napcat/mcp"
+# enabled = true
+
 

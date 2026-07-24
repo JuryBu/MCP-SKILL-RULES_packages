@@ -29,12 +29,13 @@ $excludeDirectories = @(
     "cookies", "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp",
     "tmp", "temp", "logs", ".cache", "__pycache__", "playwright-report", "test-results",
     "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
-    "council-large-inputs", "council-model-calls", "agy-runtime"
+    "council-large-inputs", "council-model-calls", "agy-runtime", "state", "napcat-runtime"
 )
 $excludeNames = @(
     "broker-private.env.json", "auth.json", ".cockpit_codex_auth.json", "credentials.json",
     ".credentials.json", "token.json", "tokens.json", ".env", ".env.local", ".env.production",
-    ".env.development", "cookies", "cookie", "web data", "login data", "local state"
+    ".env.development", "cookies", "cookie", "web data", "login data", "local state",
+    "binding.json", "heartbeat.json", "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input"
 )
 
 New-Item -ItemType Directory -Path $outputFullPath -Force | Out-Null
@@ -51,7 +52,7 @@ foreach ($rootEntry in $allowedRootEntries) {
     $parts = $relative.Split("\")
     if ($parts | Where-Object { $_ -in $excludeDirectories }) { return }
     $lowerName = $_.Name.ToLowerInvariant()
-    if ($lowerName -in $excludeNames -or $lowerName -like "broker-private*.json" -or $lowerName -like ".env.*" -or $lowerName -match '\.env($|\.)' -or $lowerName -match '\.(cookie|cookies|session)$' -or $_.Name -match '\.(log|sqlite3?|db|jsonl|har|vscdb|pb|pem|key|p12|pfx|bak)$' -or $_.Name -like "*.before-*") { return }
+    if ($lowerName -in $excludeNames -or $lowerName -like "broker-private*.json" -or $lowerName -like ".env.*" -or $lowerName -match '\.env($|\.)' -or $lowerName -match '\.(cookie|cookies|session)$' -or $_.Name -match '\.(log|sqlite3?|db|jsonl|har|vscdb|pb|pem|key|p12|pfx|bak|zip|7z|exe|dll)$' -or $_.Name -like "*.before-*") { return }
     $target = Join-Path $outputFullPath $relative
     New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
     Copy-Item -LiteralPath $_.FullName -Destination $target

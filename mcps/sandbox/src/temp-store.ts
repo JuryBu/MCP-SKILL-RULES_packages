@@ -17,7 +17,10 @@ import fs from "fs";
  */
 
 // 数据根目录
-export const DATA_ROOT = path.resolve(process.env.SANDBOX_DATA_ROOT || path.join(process.cwd(), "sandbox-data"));
+export const DATA_ROOT = path.resolve(
+    process.env.SANDBOX_DATA_ROOT
+    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "sandbox-data"),
+);
 export const TEMP_DIR = path.join(DATA_ROOT, "temp");
 
 // 文件最大存活时间

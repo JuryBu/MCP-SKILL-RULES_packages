@@ -1,25 +1,77 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import path from "path";
 import crypto from "node:crypto";
+import os from "node:os";
 import { z } from "zod";
 import { touchActivity } from "../lifecycle.js";
 import { listConversationsByMtime, detectWorkspaceFromSteps, fetchFirstPageSteps } from "../ls-client.js";
 import {
-    readRecord, readRecordAsync, writeRecord, upsertRecordIndex, deleteRecord, listRecords, copyRecordToHash,
+    readRecord, readRecordAsync, writeRecord, writeRecordWithCommitArtifactLockHeld, upsertRecordIndex,
+    deleteRecord, deleteRecordWithCommitArtifactLockHeld, withRecordCommitArtifactLock, listRecords, copyRecordToHash,
     searchRecordsGlobal,
     resolveWorkspaceHashForRecord, readRecordsIndex, readRecordsIndexAsync, findRecordHash, findRecordHashAsync, resolveRecordConversationId,
     readRecordSidecar, readRecordSidecarAsync, writeRecordSidecar, type RecordIndexEntry,
 } from "../record-store.js";
-import { DATA_ROOT, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
+import { DATA_ROOT, GENERAL_DIR, WORKSPACES_DIR, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
 import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
 import { saveTempFile, saveTempFileAsync } from "../temp-store.js";
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
+import type { ConcurrencyGateRequestClass } from "../concurrency-gate.js";
 import { formatToolError } from "../error-format.js";
-import { modelChainInputSchema } from "./schema-utils.js";
-import { loadConversationData, resolveConversationChain, resolveConversationId, type ResolvedConversationChain } from "../conversation-bridge.js";
+import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
+import {
+    formatRecordSchedulerCancel,
+    formatRecordSchedulerRecovery,
+    formatRecordSchedulerTaskStatus,
+    getRecordSchedulerRuntime,
+    RecordSchedulerRepairRequiredError,
+    recordSchedulerRequestKey,
+    type RecordSchedulerRuntimeDiscoveryRecord,
+    type RecordSchedulerRuntimeDiscoveryRequest,
+    type RecordSchedulerRuntime,
+    type RecordSchedulerRuntimeRecoveryDescriptor,
+    type FrozenRuntimeSource,
+    type FrozenRuntimeSourceSet,
+} from "../record-scheduler-runtime.js";
+import {
+    createRecordSchedulerProductionSession,
+    type RecordSchedulerProductionSession,
+} from "../record-scheduler-production-pump.js";
+import { verifyOrRecoverTaskAdmission } from "../record-scheduler-store.js";
+import { SOURCE_CHAINS, isTerminalTaskState, type SourceChain } from "../record-scheduler-contracts.js";
+import {
+    recordWorkIdentityManifestPath,
+    recordWorkRegistryPath,
+    withRecordWorkManualMutationAuthority,
+    type RecordWorkManualMutationKind,
+} from "../record-work-registry.js";
+import {
+    createProductionSourceReader,
+    PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION,
+    isSupportedProductionSourceFormatterVersion,
+    type ProductionSourceReadRequest,
+    type ProductionSourceReader,
+} from "../record-production-source-readers.js";
+import { PROVIDER_CONTROL_PHYSICAL_MAX } from "../provider-control-contracts.js";
+import type { RecordCommitStorageAdapterHooks } from "../record-commit-storage-adapter.js";
+import {
+    inspectUnknownChainMigration,
+    type HistoricalRecordIndexEntry,
+    type UnknownChainMigrationReaders,
+    type UnknownChainMigrationResult,
+} from "../record-unknown-chain-migration.js";
+import { SOURCE_EVIDENCE_HOSTS, type SourceEvidenceHost } from "../source-evidence-contracts.js";
+import {
+    loadConversationData,
+    resolveConversationChain,
+    resolveConversationId,
+    type ConversationLoadResult,
+    type ResolvedConversationChain,
+} from "../conversation-bridge.js";
+import type { ConversationRound } from "../trajectory.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
 import {
@@ -27,6 +79,7 @@ import {
     cancelBackgroundTask,
     formatBackgroundTask,
     getBackgroundTaskRecoveryHandler,
+    getRecordSchedulerProjectionHint,
     inspectBackgroundTaskRecovery,
     isValidBackgroundTaskId,
     recoverBackgroundTask,
@@ -35,6 +88,7 @@ import {
     waitForBackgroundTask,
 } from "../background-tasks.js";
 import type { BackgroundTask, BackgroundTaskContext, BackgroundTaskProgress } from "../background-tasks.js";
+import { isBackgroundTaskSuspension } from "../background-task-suspension.js";
 import {
     RECORD_READER_VERSION,
     RECORD_SECTION_TYPES,
@@ -68,6 +122,7 @@ import {
     type RecordUpdateSharedPermit,
 } from "../record-update-coordination.js";
 import type { ConcurrencyGateAcquireOptions, ConcurrencyGatePermit, ConcurrencyGateSnapshot } from "../concurrency-gate.js";
+import { waitForRecordMutationReadiness } from "../record-startup-barrier.js";
 import type { GrokExecDiagnostics } from "../grok-client.js";
 
 type RecordManageScope = "workspace" | "global" | "general";
@@ -99,7 +154,7 @@ export interface RecordSourceSnapshot {
     rolloutMtimeMs?: number;
 }
 
-const RECORD_RESUME_MODEL_CHAINS = ["auto", "antigravity", "codex", "grok", "claude-code"] as const;
+const RECORD_RESUME_MODEL_CHAINS = ["auto", "antigravity", "codex", "grok", "agy", "claude-code"] as const;
 const RECORD_RESUME_DATA_CHAINS = ["antigravity", "codex", "claude-code", "windsurf"] as const;
 const RECORD_RESUME_PARALLEL_MODES = ["off", "auto", "force"] as const;
 const RECORD_RESUME_LOGICAL_CHAINS = ["off", "explain", "auto", "strict"] as const;
@@ -107,11 +162,22 @@ const RECORD_RECOVERABLE_TASK_KINDS = new Set(["record-update", "record-batch-up
 const RECORD_BATCH_TIMEOUT_MESSAGE = "batch_update 后台批量更新超时；可缩小 limit/时间范围后重试";
 const RECORD_RECOVERY_DIR = path.join(DATA_ROOT, "record-task-recovery");
 const RECORD_BATCH_LEDGER_VERSION = 2;
+const RECORD_SCHEDULER_COORDINATOR_OWNER_ID = `record-tools:${process.pid}:${crypto.randomUUID()}`;
+
+class RecordBatchLedgerRepairRequiredError extends Error {
+    readonly code = "SCHEDULER_REPAIR_REQUIRED";
+
+    constructor(resumeKey: string, reason: string) {
+        super(`RepairRequired: Record batch ledger ${resumeKey} 无法安全读取：${reason}`);
+        this.name = "RecordBatchLedgerRepairRequiredError";
+    }
+}
 
 const RecordUpdateResumePayloadSchema = z.object({
     kind: z.literal("record-update"),
     conversationId: z.string().min(1),
     workspace: z.string().min(1).optional(),
+    workspaceHash: z.string().min(1),
     dataChain: z.enum(RECORD_RESUME_DATA_CHAINS),
     modelChain: z.enum(RECORD_RESUME_MODEL_CHAINS),
     parallelMode: z.enum(RECORD_RESUME_PARALLEL_MODES).optional(),
@@ -122,6 +188,7 @@ const RecordUpdateResumePayloadSchema = z.object({
 const BatchCandidateSnapshotSchema = z.object({
     id: z.string().min(1),
     workspace: z.string().min(1),
+    workspaceHash: z.string().min(1),
     chain: z.enum(RECORD_RESUME_DATA_CHAINS),
     lastModifiedMs: z.number().finite().nonnegative(),
     stepCount: z.number().int().positive().optional(),
@@ -151,10 +218,15 @@ const RecordBatchResumeBaseSchema = z.object({
     kind: z.literal("record-batch-update"),
     actionName: z.enum(["batch_update", "bulk_update"]),
     resumeKey: z.string().min(1),
+    workspaceHash: z.string().min(1),
     dataChain: z.enum(RECORD_RESUME_DATA_CHAINS),
     modelChain: z.enum(RECORD_RESUME_MODEL_CHAINS),
     force: z.boolean().optional(),
     stale_only: z.boolean().optional(),
+});
+
+const LegacyRecordBatchResumeBaseSchema = RecordBatchResumeBaseSchema.extend({
+    workspaceHash: z.string().min(1).optional(),
 });
 
 const RecordBatchRequestSchema = z.object({
@@ -171,6 +243,7 @@ const LegacyRecordBatchRequestSchema = RecordBatchRequestSchema.extend({
 const RecordBatchReadyResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
     phase: z.literal("ready").optional(),
     candidates: z.array(BatchConversationCandidateSchema),
+    sourceSelectionHash: z.string().min(1).optional(),
     diagnostics: RecordBatchCandidateDiagnosticsSchema.optional(),
 });
 
@@ -179,7 +252,7 @@ const RecordBatchPreparingResumePayloadSchema = RecordBatchResumeBaseSchema.exte
     request: RecordBatchRequestSchema,
 });
 
-const LegacyRecordBatchPreparingResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+const LegacyRecordBatchPreparingResumePayloadSchema = LegacyRecordBatchResumeBaseSchema.extend({
     phase: z.literal("preparing"),
     request: LegacyRecordBatchRequestSchema,
 });
@@ -189,7 +262,7 @@ const RecordBatchResumePayloadSchema = z.union([
     RecordBatchPreparingResumePayloadSchema,
 ]);
 
-const LegacyRecordBatchReadyResumePayloadSchema = RecordBatchResumeBaseSchema.extend({
+const LegacyRecordBatchReadyResumePayloadSchema = LegacyRecordBatchResumeBaseSchema.extend({
     phase: z.literal("ready").optional(),
     candidates: z.array(z.object({
         id: z.string().min(1),
@@ -251,15 +324,18 @@ export function formatRecordBatchCandidateDiagnostics(diagnostics: RecordBatchCa
 export function normalizeFrozenBatchCandidate(
     candidate: unknown,
     fallbackChain: ResolvedConversationChain,
+    fallbackWorkspaceHash: string,
 ): FrozenBatchConversationCandidate {
     const legacy = LegacyBatchConversationCandidateSchema.parse(candidate);
     const raw = legacy as z.infer<typeof LegacyBatchConversationCandidateSchema> & {
         chain?: unknown;
+        workspaceHash?: unknown;
         lastModifiedMs?: unknown;
         stepCount?: unknown;
         selectionKind?: unknown;
     };
     const parsedChain = z.enum(RECORD_RESUME_DATA_CHAINS).safeParse(raw.chain);
+    const parsedWorkspaceHash = z.string().min(1).safeParse(raw.workspaceHash);
     const parsedModified = z.number().finite().nonnegative().safeParse(raw.lastModifiedMs);
     const parsedStepCount = z.number().int().positive().safeParse(raw.stepCount);
     const parsedSelectionKind = z.enum(["stale", "missing", "fresh"]).safeParse(raw.selectionKind);
@@ -267,6 +343,7 @@ export function normalizeFrozenBatchCandidate(
     return {
         id: legacy.id,
         workspace: legacy.workspace,
+        workspaceHash: parsedWorkspaceHash.success ? parsedWorkspaceHash.data : fallbackWorkspaceHash,
         chain: parsedChain.success ? parsedChain.data : fallbackChain,
         lastModifiedMs: parsedModified.success ? parsedModified.data : 0,
         ...(parsedStepCount.success ? { stepCount: parsedStepCount.data } : {}),
@@ -279,6 +356,7 @@ function normalizeRecordBatchReadyPayload(payload: {
     kind: "record-batch-update";
     actionName: "batch_update" | "bulk_update";
     resumeKey: string;
+    workspaceHash: string;
     dataChain: DataChain;
     modelChain: Chain;
     force?: boolean;
@@ -289,7 +367,11 @@ function normalizeRecordBatchReadyPayload(payload: {
     return {
         ...payload,
         phase: "ready",
-        candidates: payload.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, payload.dataChain as ResolvedConversationChain)),
+        candidates: payload.candidates.map(candidate => normalizeFrozenBatchCandidate(
+            candidate,
+            payload.dataChain as ResolvedConversationChain,
+            payload.workspaceHash,
+        )),
     } as RecordBatchReadyResumePayload;
 }
 
@@ -332,6 +414,145 @@ type GrokBatchRuntimeSummary = {
     maxQueueAttempts: number;
 };
 
+type UnknownChainMigrationApplyOutcome = "applied" | "conflict";
+
+let unknownChainMigrationReadersOverride: UnknownChainMigrationReaders | null = null;
+let unknownChainMigrationSourceReaderOverride: ProductionSourceReader | null = null;
+
+function recordUnknownChainMigrationIndexPath(hash: string): string {
+    const base = hash === "general" ? GENERAL_DIR : path.join(WORKSPACES_DIR, hash);
+    return path.join(base, "records", "_records_index.json");
+}
+
+function recordUnknownChainMigrationHash(value: unknown): string {
+    return `sha256:${crypto.createHash("sha256").update(JSON.stringify(value), "utf8").digest("hex")}`;
+}
+
+function recordUnknownChainMigrationWorkspace(hash: string): { workspaceId: string; canonicalPath: string | null } {
+    if (hash === "general") return { workspaceId: hash, canonicalPath: null };
+    const meta = readWorkspaceMeta(hash);
+    return {
+        workspaceId: hash,
+        canonicalPath: meta?.canonicalPath || meta?.originalPath || null,
+    };
+}
+
+function recordUnknownChainMigrationEntries(hash: string): HistoricalRecordIndexEntry[] {
+    const index = readRecordsIndex(hash);
+    const workspace = recordUnknownChainMigrationWorkspace(hash);
+    const indexRevision = recordUnknownChainMigrationHash(index);
+    return Object.values(index.records).map(entry => ({
+        recordId: entry.conversationId,
+        chain: entry.chain,
+        workspace,
+        conversationId: entry.conversationId,
+        indexRevision,
+        entryEvidenceHash: recordUnknownChainMigrationHash(entry),
+    }));
+}
+
+function recordUnknownChainMigrationAntigravitySource(): { endpoint: string; pbRoot: string; vscdbPath: string } {
+    const appData = process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming");
+    return {
+        endpoint: "antigravity-production",
+        pbRoot: path.join(os.homedir(), ".gemini", "antigravity", "conversations"),
+        vscdbPath: path.join(appData, "Antigravity", "User", "globalStorage", "state.vscdb"),
+    };
+}
+
+function recordUnknownChainMigrationSourceRequest(
+    entry: HistoricalRecordIndexEntry,
+    host: SourceEvidenceHost,
+): ProductionSourceReadRequest {
+    if (host === "codex") {
+        return {
+            host,
+            conversationId: entry.conversationId,
+            workspace: entry.workspace,
+        };
+    }
+    if (host === "claude-code") {
+        return {
+            host,
+            conversationId: entry.conversationId,
+            workspaceId: entry.workspace.workspaceId,
+            workspacePath: entry.workspace.canonicalPath,
+        };
+    }
+    if (host === "windsurf") {
+        return {
+            host,
+            conversationId: entry.conversationId,
+            workspaceId: entry.workspace.workspaceId,
+            workspacePath: entry.workspace.canonicalPath,
+            requestClass: "background",
+        };
+    }
+    return {
+        host,
+        conversationId: entry.conversationId,
+        workspaceId: entry.workspace.workspaceId,
+        workspacePath: entry.workspace.canonicalPath,
+        source: recordUnknownChainMigrationAntigravitySource(),
+    };
+}
+
+function createRecordUnknownChainMigrationReaders(sourceReader: ProductionSourceReader): UnknownChainMigrationReaders {
+    const readerForHost = (host: SourceEvidenceHost): NonNullable<UnknownChainMigrationReaders[SourceEvidenceHost]> => ({
+        host,
+        scan: async ({ entry, signal }) => {
+            if (signal?.aborted) throw Object.assign(new Error("unknown-chain migration scan cancelled"), { name: "AbortError" });
+            const result = await sourceReader.scan(recordUnknownChainMigrationSourceRequest(entry, host));
+            if (signal?.aborted) throw Object.assign(new Error("unknown-chain migration scan cancelled"), { name: "AbortError" });
+            return {
+                enumeration: result.enumeration,
+                exactFetch: result.exactFetch,
+                fullSourceRead: result.fullSourceRead.evidence,
+            };
+        },
+    });
+    return {
+        codex: readerForHost("codex"),
+        "claude-code": readerForHost("claude-code"),
+        windsurf: readerForHost("windsurf"),
+        antigravity: readerForHost("antigravity"),
+    };
+}
+
+function recordUnknownChainMigrationReaders(): UnknownChainMigrationReaders {
+    if (unknownChainMigrationReadersOverride) return unknownChainMigrationReadersOverride;
+    return createRecordUnknownChainMigrationReaders(
+        unknownChainMigrationSourceReaderOverride || createProductionSourceReader(),
+    );
+}
+
+async function applyUnknownChainMigrationPatch(
+    workspaceHashValue: string,
+    result: Extract<UnknownChainMigrationResult, { status: "Patched" }>,
+): Promise<UnknownChainMigrationApplyOutcome> {
+    const patch = result.patch;
+    if (patch.replacement.workspace.workspaceId !== workspaceHashValue
+        || patch.replacement.conversationId !== patch.recordId) {
+        return "conflict";
+    }
+    return withIndexLock(`records_${workspaceHashValue}`, async () => {
+        const index = await readRecordsIndexAsync(workspaceHashValue);
+        const entry = index.records[patch.recordId];
+        if (!entry
+            || entry.chain !== patch.cas.expectedChain
+            || recordUnknownChainMigrationHash(index) !== patch.cas.expectedIndexRevision
+            || recordUnknownChainMigrationHash(entry) !== patch.cas.expectedEntryEvidenceHash) {
+            return "conflict";
+        }
+        index.records[patch.recordId] = {
+            ...entry,
+            chain: patch.replacement.chain,
+        };
+        await writeJsonAtomicAsync(recordUnknownChainMigrationIndexPath(workspaceHashValue), index);
+        return "applied";
+    });
+}
+
 function updateGrokBatchRuntimeSummary(summary: GrokBatchRuntimeSummary | undefined, diagnostics: GrokExecDiagnostics): GrokBatchRuntimeSummary {
     return {
         latest: diagnostics,
@@ -343,15 +564,39 @@ function updateGrokBatchRuntimeSummary(summary: GrokBatchRuntimeSummary | undefi
 
 function getRecordBatchWorkerConcurrency(): number {
     const raw = Number(process.env.MEMORY_STORE_RECORD_BATCH_CONCURRENCY || "");
-    return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : getRecordUpdateConcurrencyLimit();
+    const configured = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : getRecordUpdateConcurrencyLimit();
+    return Math.max(PROVIDER_CONTROL_PHYSICAL_MAX, configured);
 }
 
-type RecordPersistenceTestHook = (event: { stage: string; conversationId: string }) => void | Promise<void>;
+type RecordPersistenceTestHook = (event: {
+    stage: string;
+    conversationId: string;
+    persistencePath: "legacy" | "scheduler";
+}) => void | Promise<void>;
 
 let recordPersistenceTestHook: RecordPersistenceTestHook | null = null;
 
-async function runRecordPersistenceTestHook(stage: string, conversationId: string): Promise<void> {
-    await recordPersistenceTestHook?.({ stage, conversationId });
+async function runRecordPersistenceTestHook(
+    stage: string,
+    conversationId: string,
+    persistencePath: "legacy" | "scheduler" = "legacy",
+): Promise<void> {
+    await recordPersistenceTestHook?.({ stage, conversationId, persistencePath });
+}
+
+function schedulerRecordPersistenceTestHooks(conversationId: string): RecordCommitStorageAdapterHooks | undefined {
+    if (!recordPersistenceTestHook) return undefined;
+    return {
+        onFaultPoint: async ({ stage, point }) => {
+            if (point !== "before_write") return;
+            if (stage === "BodyPublished") {
+                await runRecordPersistenceTestHook("before_write", conversationId, "scheduler");
+            }
+        },
+        onReaderIndexWritePoint: async ({ point }) => {
+            if (point === "before_replace") await runRecordPersistenceTestHook("before_reader_index", conversationId, "scheduler");
+        },
+    };
 }
 
 async function withRecordManagementSingleFlight<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
@@ -381,9 +626,7 @@ function recordUpdatePoolAbortResponse(
 ) {
     const prefix = error.reason === "cancelled"
         ? "🛑 Record 更新已取消"
-        : error.reason === "settled"
-            ? "⚠️ 后台任务已结算"
-            : "⚠️ Record 共享池等待超时";
+        : "⚠️ 后台任务已结算";
     return rt(`${prefix}：${stage} | ${formatRecordUpdatePoolDetail(error.snapshot)}`, startMs);
 }
 
@@ -448,15 +691,25 @@ function tryParseRecordBatchResumePayload(payload: unknown): RecordBatchResumePa
         if (!("candidates" in parsed.data)) return parsed.data;
         return {
             ...parsed.data,
-            candidates: parsed.data.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, parsed.data.dataChain as ResolvedConversationChain)),
+            candidates: parsed.data.candidates.map(candidate => normalizeFrozenBatchCandidate(
+                candidate,
+                parsed.data.dataChain as ResolvedConversationChain,
+                parsed.data.workspaceHash,
+            )),
         };
     }
     const legacy = LegacyRecordBatchReadyResumePayloadSchema.safeParse(payload);
     if (legacy.success) {
+        const workspaceHash = legacy.data.workspaceHash || resolveWorkspaceHashForRecord(legacy.data.candidates[0]?.workspace);
         return {
             ...legacy.data,
+            workspaceHash,
             phase: "ready",
-            candidates: legacy.data.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, legacy.data.dataChain as ResolvedConversationChain)),
+            candidates: legacy.data.candidates.map(candidate => normalizeFrozenBatchCandidate(
+                candidate,
+                legacy.data.dataChain as ResolvedConversationChain,
+                workspaceHash,
+            )),
         };
     }
 
@@ -464,6 +717,7 @@ function tryParseRecordBatchResumePayload(payload: unknown): RecordBatchResumePa
     if (!legacyPreparing.success) return null;
     return {
         ...legacyPreparing.data,
+        workspaceHash: legacyPreparing.data.workspaceHash || resolveWorkspaceHashForRecord(legacyPreparing.data.request.workspace),
         request: normalizeLegacyRecordBatchRequest(legacyPreparing.data.request),
     };
 }
@@ -495,6 +749,16 @@ function createEmptyRecordBatchLedger(payload: RecordBatchReadyResumePayload): R
     };
 }
 
+function isFullySettledRecordBatchLedger(ledger: RecordBatchResumeLedger): boolean {
+    if (ledger.inFlight.length > 0) return false;
+    const candidateIds = ledger.candidates.map(candidate => candidate.id);
+    const settledIds = [...ledger.completed, ...ledger.skipped, ...ledger.failed].map(item => item.id);
+    if (new Set(candidateIds).size !== candidateIds.length || new Set(settledIds).size !== settledIds.length) return false;
+    if (candidateIds.length !== settledIds.length) return false;
+    const settled = new Set(settledIds);
+    return candidateIds.every(candidateId => settled.has(candidateId));
+}
+
 function matchesLegacyBatchCandidateSnapshot(
     legacyCandidates: unknown[],
     candidates: FrozenBatchConversationCandidate[],
@@ -513,7 +777,11 @@ function normalizeRecordBatchLedgerCandidates(
     ledger: RecordBatchResumeLedger,
     fallbackChain: ResolvedConversationChain,
 ): boolean {
-    const normalized = ledger.candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, fallbackChain));
+    const normalized = ledger.candidates.map(candidate => normalizeFrozenBatchCandidate(
+        candidate,
+        fallbackChain,
+        resolveWorkspaceHashForRecord(candidate.workspace),
+    ));
     if (JSON.stringify(normalized) === JSON.stringify(ledger.candidates)) return false;
     ledger.candidates = normalized;
     return true;
@@ -537,11 +805,16 @@ function normalizeRecordBatchLedger(raw: unknown, resumeKey: string): RecordBatc
 }
 
 function readRecordBatchLedger(resumeKey: string): RecordBatchResumeLedger | null {
+    const ledgerPath = recordBatchLedgerPath(resumeKey);
     try {
-        const raw = fs.readFileSync(recordBatchLedgerPath(resumeKey), "utf-8");
-        return normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
-    } catch {
-        return null;
+        const raw = fs.readFileSync(ledgerPath, "utf-8");
+        const normalized = normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
+        if (!normalized) throw new RecordBatchLedgerRepairRequiredError(resumeKey, "内容为 null、版本不受支持或结构无效");
+        return normalized;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        if (error instanceof RecordBatchLedgerRepairRequiredError) throw error;
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, error instanceof Error ? error.message : String(error));
     }
 }
 
@@ -565,7 +838,7 @@ function ensureRecordBatchLedger(payload: RecordBatchReadyResumePayload): Record
             existing.candidates = normalizedPayload.candidates.map(candidate => ({ ...candidate }));
             return writeRecordBatchLedger(existing);
         }
-        throw new Error(`Record batch ledger 候选快照与 resumePayload 不匹配：${payload.resumeKey}`);
+        throw new RecordBatchLedgerRepairRequiredError(payload.resumeKey, "候选快照与 resumePayload 不匹配");
     }
     return existing;
 }
@@ -575,11 +848,16 @@ async function ensureRecordRecoveryDirAsync(): Promise<void> {
 }
 
 async function readRecordBatchLedgerAsync(resumeKey: string): Promise<RecordBatchResumeLedger | null> {
+    const ledgerPath = recordBatchLedgerPath(resumeKey);
     try {
-        const raw = await fs.promises.readFile(recordBatchLedgerPath(resumeKey), "utf-8");
-        return normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
-    } catch {
-        return null;
+        const raw = await fs.promises.readFile(ledgerPath, "utf-8");
+        const normalized = normalizeRecordBatchLedger(JSON.parse(raw), resumeKey);
+        if (!normalized) throw new RecordBatchLedgerRepairRequiredError(resumeKey, "内容为 null、版本不受支持或结构无效");
+        return normalized;
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        if (error instanceof RecordBatchLedgerRepairRequiredError) throw error;
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, error instanceof Error ? error.message : String(error));
     }
 }
 
@@ -589,6 +867,49 @@ async function writeRecordBatchLedgerAsync(ledger: RecordBatchResumeLedger): Pro
     ledger.updatedAt = new Date().toISOString();
     await writeJsonAtomicAsync(recordBatchLedgerPath(ledger.resumeKey), ledger);
     return ledger;
+}
+
+async function validateLegacyRecordBatchLedgerForScheduler(payload: RecordBatchReadyResumePayload): Promise<void> {
+    const resumeKey = payload.resumeKey;
+    const ledgerPath = recordBatchLedgerPath(resumeKey);
+    let raw: string;
+    try {
+        raw = await fs.promises.readFile(ledgerPath, "utf-8");
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, error instanceof Error ? error.message : String(error));
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(raw);
+    } catch (error) {
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, error instanceof Error ? error.message : String(error));
+    }
+    const normalized = normalizeRecordBatchLedger(parsed, resumeKey);
+    if (!normalized) {
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, "内容为 null、版本不受支持、身份漂移或结构无效");
+    }
+    const version = (parsed as { version?: unknown }).version;
+    const expectedCandidates = payload.candidates.map(candidate => ({ ...candidate }));
+    if (version === 1) {
+        const exactMatch = JSON.stringify(normalized.candidates) === JSON.stringify(expectedCandidates);
+        if (!exactMatch && !matchesLegacyBatchCandidateSnapshot(normalized.candidates, expectedCandidates)) {
+            throw new RecordBatchLedgerRepairRequiredError(resumeKey, "v1 候选身份与 scheduler 冻结快照漂移");
+        }
+        normalized.candidates = expectedCandidates;
+        await writeRecordBatchLedgerAsync(normalized);
+        return;
+    }
+    const currentCandidates = z.array(BatchConversationCandidateSchema).safeParse(normalized.candidates);
+    if (!currentCandidates.success) {
+        throw new RecordBatchLedgerRepairRequiredError(resumeKey, "v2 候选身份与 scheduler 冻结快照漂移");
+    }
+    if (JSON.stringify(currentCandidates.data) === JSON.stringify(expectedCandidates)) return;
+    if (isFullySettledRecordBatchLedger(normalized)) {
+        await writeRecordBatchLedgerAsync(createEmptyRecordBatchLedger(payload));
+        return;
+    }
+    throw new RecordBatchLedgerRepairRequiredError(resumeKey, "v2 候选身份与 scheduler 冻结快照漂移");
 }
 
 async function ensureRecordBatchLedgerUnlocked(payload: RecordBatchReadyResumePayload): Promise<RecordBatchResumeLedger> {
@@ -603,7 +924,7 @@ async function ensureRecordBatchLedgerUnlocked(payload: RecordBatchReadyResumePa
             existing.candidates = normalizedPayload.candidates.map(candidate => ({ ...candidate }));
             return writeRecordBatchLedgerAsync(existing);
         }
-        throw new Error(`Record batch ledger 候选快照与 resumePayload 不匹配：${payload.resumeKey}`);
+        throw new RecordBatchLedgerRepairRequiredError(payload.resumeKey, "候选快照与 resumePayload 不匹配");
     }
     return existing;
 }
@@ -761,6 +1082,47 @@ function pendingRecordBatchCandidates(payload: RecordBatchReadyResumePayload, le
     return payload.candidates.filter(candidate => !settledIds.has(candidate.id));
 }
 
+function schedulerBatchCandidates(
+    payload: RecordBatchReadyResumePayload,
+    frozenSources: FrozenRuntimeSourceSet,
+): FrozenBatchConversationCandidate[] {
+    if (frozenSources.phase !== "sealed") {
+        throw new RecordSchedulerRepairRequiredError("scheduler-managed batch 只能使用 sealed frozen sources");
+    }
+    return frozenSources.sources.map(source => {
+        const candidate = payload.candidates.find(item => (
+            item.id === source.snapshot.conversationId
+            && item.chain === source.snapshot.chain
+            && item.workspaceHash === source.snapshot.workspaceHash
+        ));
+        if (!candidate) {
+            throw new RecordSchedulerRepairRequiredError(
+                `scheduler-managed batch 的 frozen source ${frozenRuntimeSourceKey(source.snapshot)} 未匹配 admission 冻结候选`,
+            );
+        }
+        return candidate;
+    });
+}
+
+function projectRecordBatchOutcomeInMemory(
+    ledger: RecordBatchResumeLedger,
+    kind: "completed" | "skipped" | "failed",
+    candidate: Pick<FrozenBatchConversationCandidate, "id" | "workspace">,
+    reason?: string,
+    isNew?: boolean,
+): RecordBatchResumeLedger {
+    const entry = recordBatchLedgerEntry(candidate, reason, isNew);
+    const next = {
+        ...ledger,
+        completed: ledger.completed.filter(item => item.id !== candidate.id),
+        skipped: ledger.skipped.filter(item => item.id !== candidate.id),
+        failed: ledger.failed.filter(item => item.id !== candidate.id),
+        inFlight: ledger.inFlight.filter(item => item.id !== candidate.id),
+    };
+    next[kind] = normalizeRecordBatchLedgerEntries(next[kind], entry);
+    return next;
+}
+
 function isRecoverableRecordTask(task: BackgroundTask): boolean {
     if (task.status !== "running") return false;
     if (!RECORD_RECOVERABLE_TASK_KINDS.has(task.kind)) return false;
@@ -769,6 +1131,16 @@ function isRecoverableRecordTask(task: BackgroundTask): boolean {
     if (task.kind === "record-update") return tryParseRecordUpdateResumePayload(task.resumePayload) !== null;
     if (task.kind === "record-batch-update") return tryParseRecordBatchResumePayload(task.resumePayload) !== null;
     return false;
+}
+
+function isSchedulerBackedRecordTask(task: Pick<BackgroundTask, "kind" | "schedulerAdmission">): boolean {
+    return RECORD_RECOVERABLE_TASK_KINDS.has(task.kind) && task.schedulerAdmission !== undefined;
+}
+
+function schedulerRecoveryRequired(task: Pick<BackgroundTask, "id" | "kind">): RecordSchedulerRepairRequiredError {
+    return new RecordSchedulerRepairRequiredError(
+        `Record scheduler ${task.kind} ${task.id} 的持久 admission envelope 仍存在，但权威 scheduler ledger 不可读取；拒绝回退旧执行路径（generic status/cancel/recovery）或重新枚举`,
+    );
 }
 
 function listRecoverableRecordTasks(): BackgroundTask[] {
@@ -795,17 +1167,136 @@ function formatRecoverableRecordTasks(tasks: BackgroundTask[]): string {
     return lines.join("\n");
 }
 
+type VerifiedRecordSchedulerAdmissionCapsule = Extract<
+    Awaited<ReturnType<typeof verifyOrRecoverTaskAdmission>>,
+    { kind: "verified" }
+>["capsule"];
+
+interface SchedulerRecoveryPayload {
+    readonly capsule: VerifiedRecordSchedulerAdmissionCapsule;
+    readonly payload: RecordUpdateResumePayload | RecordBatchPreparingResumePayload;
+}
+
+async function schedulerRecoveryPayload(task: BackgroundTask): Promise<SchedulerRecoveryPayload> {
+    const verified = await verifyOrRecoverTaskAdmission(task.id);
+    if (verified.kind !== "verified") {
+        throw new RecordSchedulerRepairRequiredError(
+            `Record scheduler ${task.kind} ${task.id} 的 admission capsule 无法验证：${verified.reason}`,
+        );
+    }
+    if (verified.capsule.taskKind !== task.kind) {
+        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${task.id} 的 capsule taskKind 与 projection 不一致`);
+    }
+    const persistedPayload = verified.capsule.backgroundProjection.resumePayload;
+    if (task.kind === "record-update") {
+        const payload = tryParseRecordUpdateResumePayload(persistedPayload);
+        if (!payload) {
+            throw new RecordSchedulerRepairRequiredError(`Record scheduler update ${task.id} 缺少新版本 workspaceHash resumePayload`);
+        }
+        return { capsule: verified.capsule, payload };
+    }
+    const payload = tryParseRecordBatchResumePayload(persistedPayload);
+    if (!payload || !("request" in payload)) {
+        throw new RecordSchedulerRepairRequiredError(`Record scheduler batch ${task.id} 缺少新版本 workspaceHash/preparing resumePayload`);
+    }
+    return { capsule: verified.capsule, payload };
+}
+
+function schedulerRecoveryDescriptor(
+    task: BackgroundTask,
+    recovery: SchedulerRecoveryPayload,
+): RecordSchedulerRuntimeRecoveryDescriptor {
+    const { capsule, payload } = recovery;
+    if (payload.kind === "record-update") {
+        return {
+            kind: "record-update",
+            requestKey: capsule.admissionIdentity.requestKey,
+            requestSummary: capsule.requestSummary,
+            resumePayload: capsule.backgroundProjection.resumePayload,
+            requestMode: payload.force ? "force" : "normal",
+            ...(capsule.backgroundProjection.projection === undefined ? {} : {
+                backgroundProjection: capsule.backgroundProjection.projection as Record<string, unknown>,
+            }),
+            discovery: buildRecordSchedulerDiscoveryRequest({
+                kind: "record-update",
+                selector: payload.force ? "force" : "normal",
+                hash: payload.workspaceHash,
+                workspace: payload.workspace,
+                dataChain: payload.dataChain,
+                limit: 1,
+                targetConversationId: payload.conversationId,
+            }),
+        };
+    }
+    const selector = payload.stale_only ? "stale_only" : payload.force ? "force" : "normal";
+    return {
+        kind: "record-batch-update",
+        requestKey: capsule.admissionIdentity.requestKey,
+        requestSummary: capsule.requestSummary,
+        resumePayload: capsule.backgroundProjection.resumePayload,
+        requestMode: selector,
+        ...(capsule.backgroundProjection.projection === undefined ? {} : {
+            backgroundProjection: capsule.backgroundProjection.projection as Record<string, unknown>,
+        }),
+        discovery: buildRecordSchedulerDiscoveryRequest({
+            kind: "record-batch-update",
+            selector,
+            hash: payload.workspaceHash,
+            workspace: payload.request.workspace,
+            dataChain: payload.dataChain,
+            limit: recordBatchDiscoveryScanLimit(payload.force),
+            selectionLimit: effectiveRecordBatchLimit(payload.request.limit, payload.force),
+            after: payload.request.after,
+            before: payload.request.before,
+        }),
+        validateLegacyState: schedulerLegacyBatchStateValidator(payload, selector),
+    };
+}
+
+function formatSchedulerResumeResult(result: Awaited<ReturnType<RecordSchedulerRuntime["resumeExecution"]>>): string {
+    if (!result) {
+        throw new RecordSchedulerRepairRequiredError("Record scheduler resume 未找到权威 task 状态");
+    }
+    if (result.kind === "blocked") {
+        throw new Error(`Record scheduler owner blocked：${result.reason || "owner lease 仍由其他进程持有"}`);
+    }
+    if (result.kind === "repair_required" || result.kind === "missing") {
+        throw new RecordSchedulerRepairRequiredError(
+            `Record scheduler resume ${result.kind}：${result.reason || result.result || "权威 ledger 无法安全继续"}`,
+        );
+    }
+    if (result.status.repairState === "Blocked") {
+        throw new Error(`Record scheduler owner fenced/blocked：${result.status.repairState}`);
+    }
+    if (result.kind === "terminal") return formatRecordSchedulerTaskStatus(result.status);
+    if (result.kind === "cancelled") return formatRecordSchedulerCancel(result.cancellation);
+    if (result.kind === "resumed" || result.kind === "settled") return result.result;
+    throw new RecordSchedulerRepairRequiredError("Record scheduler resume 返回了不可结算状态");
+}
+
 function ensureRecordRecoveryHandlersRegistered(): void {
     if (!getBackgroundTaskRecoveryHandler("record-update")) {
-        registerBackgroundTaskRecoveryHandler("record-update", async task => {
-            const payload = parseRecordUpdateResumePayload(task.resumePayload);
-            return {
-                mode: "resume",
-                maxRunMs: task.maxRunMs,
-                run: async ({ updateProgress, isCancelled, isSettled }) => {
-                    const hash = resolveWorkspaceHashForRecord(payload.workspace);
-                    const result = await handleUpdate(
-                        hash,
+        registerBackgroundTaskRecoveryHandler("record-update", async task => ({
+            mode: "resume",
+            maxRunMs: task.maxRunMs,
+            run: async context => {
+                const scheduler = getRecordSchedulerRuntime();
+                let recoveryPayload: RecordUpdateResumePayload | RecordBatchPreparingResumePayload | null = null;
+                const resumed = await scheduler.resumeExecution(task.id, context, async (executionContext, _discovery, frozenSources) => {
+                    const payload = recoveryPayload;
+                    if (!payload || payload.kind !== "record-update") {
+                        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${task.id} 的 update recovery descriptor kind 不匹配`);
+                    }
+                    const frozenSource = frozenSources?.sources.find(source => (
+                        source.snapshot.conversationId === payload.conversationId
+                        && source.snapshot.chain === payload.dataChain
+                        && source.snapshot.workspaceHash === payload.workspaceHash
+                    ));
+                    if (!frozenSource) {
+                        throw new RecordSchedulerRepairRequiredError(`Record scheduler update ${task.id} 缺少匹配的 sealed frozen source`);
+                    }
+                    return responseText(await handleUpdate(
+                        payload.workspaceHash,
                         payload.conversationId,
                         payload.workspace,
                         payload.dataChain,
@@ -814,25 +1305,72 @@ function ensureRecordRecoveryHandlersRegistered(): void {
                         payload.force,
                         payload.logicalChain,
                         Date.now(),
-                        { background: true, onProgress: updateProgress, isCancelled, isSettled },
-                    );
-                    return responseText(result);
-                },
-            };
-        });
+                        {
+                            background: true,
+                            onProgress: executionContext.updateProgress,
+                            isCancelled: executionContext.isCancelled,
+                            isSettled: executionContext.isSettled,
+                            frozenSource,
+                            schedulerExecution: {
+                                taskId: executionContext.taskId,
+                                frozenSources: frozenSources!,
+                                sourceSnapshotId: frozenSource.snapshot.sourceSnapshotId,
+                                runtime: scheduler,
+                            },
+                        },
+                    ));
+                }, async () => {
+                    const recovery = await schedulerRecoveryPayload(task);
+                    recoveryPayload = recovery.payload;
+                    return schedulerRecoveryDescriptor(task, recovery);
+                });
+                return formatSchedulerResumeResult(resumed);
+            },
+        }));
     }
     if (!getBackgroundTaskRecoveryHandler("record-batch-update")) {
-        registerBackgroundTaskRecoveryHandler("record-batch-update", async task => {
-            const payload = parseRecordBatchResumePayload(task.resumePayload);
-            return {
-                mode: "resume",
-                maxRunMs: task.maxRunMs,
-                timeoutMessage: RECORD_BATCH_TIMEOUT_MESSAGE,
-                run: async ({ updateProgress, isCancelled, isSettled }) => (
-                    prepareAndRunRecordBatchUpdate(payload, updateProgress, isCancelled, isSettled)
-                ),
-            };
-        });
+        registerBackgroundTaskRecoveryHandler("record-batch-update", async task => ({
+            mode: "resume",
+            maxRunMs: task.maxRunMs,
+            timeoutMessage: RECORD_BATCH_TIMEOUT_MESSAGE,
+            run: async context => {
+                const scheduler = getRecordSchedulerRuntime();
+                let recoveryPayload: RecordUpdateResumePayload | RecordBatchPreparingResumePayload | null = null;
+                const resumed = await scheduler.resumeExecution(task.id, context, async (executionContext, discovery, frozenSources) => {
+                    const payload = recoveryPayload;
+                    if (!payload || payload.kind !== "record-batch-update" || !("request" in payload)) {
+                        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${task.id} 的 batch recovery descriptor kind 不匹配`);
+                    }
+                    const requestMode = payload.stale_only ? "stale_only" : payload.force ? "force" : "normal";
+                    if (!frozenSources || frozenSources.phase !== "sealed" || !discovery) {
+                        throw new RecordSchedulerRepairRequiredError(`Record scheduler batch ${task.id} 缺少 sealed recovery evidence`);
+                    }
+                    const readyPayload = recordBatchReadyPayloadFromScheduler(
+                        payload,
+                        discovery,
+                        scheduler.selectDiscoveryCandidates(discovery, requestMode),
+                        frozenSources,
+                    );
+                    return runRecordBatchUpdateFromPayload(
+                        readyPayload,
+                        executionContext.updateProgress,
+                        executionContext.isCancelled,
+                        executionContext.isSettled,
+                        frozenSources,
+                        {
+                            taskId: executionContext.taskId,
+                            frozenSources,
+                            runtime: scheduler,
+                        },
+                    );
+                }, async () => {
+                    const recovery = await schedulerRecoveryPayload(task);
+                    recoveryPayload = recovery.payload;
+                    return schedulerRecoveryDescriptor(task, recovery);
+                });
+                return formatSchedulerResumeResult(resumed);
+            },
+        }));
     }
 }
 
@@ -938,6 +1476,7 @@ action:
 - delete: 删除指定 Record（不传 conversationId 则清空工作区全部 Record）
 - audit_ownership: 审计 Record 归属，不按语义猜测，只看 workspaceUri/cwd/派生关系/重复副本
 - repair_ownership: 归属修复，默认 dry-run，只输出迁移计划
+- migrate_unknown_chain: 扫描 chain="unknown" 的历史索引，默认只读；仅四宿主权威证据唯一且完整时可显式 apply
 - batch_update: 批量更新工作区内多个对话的 Record（按时间/源/工作区筛选候选，后台执行）
 - bulk_update: batch_update 的安全别名，用于避开共享 broker 对 batch_update 名称的全局拦截
 - recover: 列出或恢复可恢复的 Record 后台任务
@@ -946,14 +1485,14 @@ action:
 - cancel: 兼容入口，按 taskId 取消 Record 后台任务；其它后台任务优先使用 background_task_cancel
 - stale_check: 检测范围内哪些 Record 已过期（对话有新内容但 Record 未跟进）；近期列表未找到的 Record 标为 unresolved，仅统计不改动`,
         {
-            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "recover", "batch_delete", "task_status", "cancel", "audit_ownership", "repair_ownership", "stale_check"])
+            action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "recover", "batch_delete", "task_status", "cancel", "audit_ownership", "repair_ownership", "migrate_unknown_chain", "stale_check"])
                 .describe("操作类型"),
             conversationId: z.string().optional()
                 .describe("对话 ID（update 不传则自动获取当前对话）"),
             workspace: z.string().optional()
                 .describe("工作区路径（不传则 general）"),
             scope: z.enum(["workspace", "global", "general"]).optional()
-                .describe("[search/list/audit/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
+                .describe("[search/list/audit/migrate_unknown_chain/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
             includeGeneral: z.boolean().optional()
                 .describe("[list/search/stale_check] 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
             query: z.string().optional()
@@ -1008,12 +1547,14 @@ action:
                 .describe("[batch_update/bulk_update] 始终只选择已过期的 Record；优先级高于 force"),
             dryRun: z.boolean().optional()
                 .describe("[repair_ownership] 默认 true，只报告计划不移动文件"),
+            apply: z.boolean().optional()
+                .describe("[migrate_unknown_chain] 默认 false，只读扫描四宿主权威 source evidence；true 时仅对唯一完整 Match 的 Patch 逐条执行 index revision/hash CAS，Conflict/Unresolved 永不写入"),
             backup: z.boolean().optional()
                 .describe("[repair_ownership] 真正迁移前备份 Record 正文和索引，默认 true"),
             waitSeconds: z.number().optional()
                 .describe("[task_status] 后台任务查询等待秒数(1-300)，任务完成时提前返回"),
             background: z.boolean().optional()
-                .describe("[update] 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时自动后台；batch_update/bulk_update 始终返回 taskId"),
+                .describe("[update/batch_update/bulk_update] 三态后台：true=接纳后立即返回 taskId / false=先完成 scheduler L2 接纳，再等待同一 ledger 终态 / 不传时保持自动后台"),
             parallelMode: z.enum(["off", "auto", "force"]).optional()
                 .describe("[update] 实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
@@ -1021,25 +1562,50 @@ action:
             taskId: z.string().optional()
                 .describe("[task_status/cancel/recover] 后台任务 ID"),
             chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\" 只作为 modelChain"),
-            dataChain: z.enum(DATA_CHAIN_INPUT_VALUES).optional()
-                .describe("对话数据链路：auto=当前宿主优先，支持 antigravity/codex/claude-code/windsurf"),
-            modelChain: modelChainInputSchema("modelChain", "模型链路：auto=优先 Grok/progrok 再 fallback，grok=本机 progrok proxy，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
+                .describe("兼容旧参数：dataChain/modelChain 未传时沿用；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
+            dataChain: dataChainInputSchema("dataChain", "对话数据链路：auto=当前宿主优先，支持 antigravity/codex/claude-code/windsurf；agy 与 Grok 只支持 modelChain"),
+            modelChain: modelChainInputSchema("modelChain", "模型链路：auto=Grok→（MEMORY_STORE_AGY_AUTO_ENABLED=1 时）agy→Antigravity→Codex→可选 Claude Code CLI；agy=本地 CLI 的三模型内部 fallback，claude-code=显式 Claude Code CLI；Windsurf 只支持 dataChain"),
         },
         async (args) => {
             const startMs = Date.now();
-            touchActivity({ skipRecordAutoCheck: args.action === "update" || isRecordBatchUpdateAction(args.action) });
+            touchActivity({
+                skipRecordAutoCheck: args.action === "update"
+                    || isRecordBatchUpdateAction(args.action)
+                    || args.action === "task_status"
+                    || args.action === "cancel"
+                    || args.action === "recover"
+                    || args.action === "stale_check",
+            });
             try {
                 const hash = await resolveWorkspaceHashForRecordAsync(args.workspace);
                 const chains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
+                if (
+                    args.action === "update"
+                    || isRecordBatchUpdateAction(args.action)
+                    || args.action === "edit"
+                    || args.action === "delete"
+                    || args.action === "batch_delete"
+                    || (args.action === "repair_ownership" && args.dryRun === false)
+                    || (args.action === "migrate_unknown_chain" && args.apply === true)
+                ) {
+                    await waitForRecordMutationReadiness();
+                }
                 switch (args.action) {
                     case "update": {
-                        // Plan_30：record update 默认自动后台排队；显式 background=false 才同步执行。
                         const decision = decideBackground(args.background, chains.modelChain, "always");
-                        if (decision.useBackground) {
-                            return handleUpdateBackground(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, args.logicalChain as ConversationLogicalChainMode | undefined, startMs, decision.auto);
-                        }
-                        return await handleUpdate(hash, args.conversationId, args.workspace, chains.dataChain, chains.modelChain, args.parallelMode, args.force, args.logicalChain as ConversationLogicalChainMode | undefined, startMs);
+                        return await handleRecordSchedulerUpdate(
+                            hash,
+                            args.conversationId,
+                            args.workspace,
+                            chains.dataChain,
+                            chains.modelChain,
+                            args.parallelMode,
+                            args.force,
+                            args.logicalChain as ConversationLogicalChainMode | undefined,
+                            startMs,
+                            decision.useBackground,
+                            decision.auto,
+                        );
                     }
                     case "list":
                         return handleList(hash, args.scope, args.includeGeneral, args.after, args.before, args.limit, startMs);
@@ -1081,6 +1647,8 @@ action:
                         return await handleAuditOwnership(hash, args.scope, chains.dataChain, startMs);
                     case "repair_ownership":
                         return await handleRepairOwnership(hash, args.scope, chains.dataChain, args.dryRun ?? true, args.backup ?? true, startMs);
+                    case "migrate_unknown_chain":
+                        return await handleUnknownChainMigration(hash, args.scope, args.includeGeneral, args.apply, startMs);
                     case "edit":
                         return await handleEdit(hash, args.conversationId, args.content, args.append, startMs);
                     case "delete":
@@ -1095,9 +1663,12 @@ action:
                     case "task_status":
                         return await handleTaskStatus(args.taskId, args.waitSeconds, startMs);
                     case "cancel":
-                        return rt(formatBackgroundTask(cancelBackgroundTask(args.taskId || "", "用户取消 Record 任务")), startMs);
+                        return await handleRecordCancel(args.taskId, startMs);
                     case "stale_check":
-                        return await handleStaleCheck(hash, args.scope, args.includeGeneral, chains.dataChain, args.limit, startMs);
+                        if (args.recordIds?.length) {
+                            return r("❌ record_manage(stale_check) 不支持 recordIds；请使用 workspace/scope/includeGeneral/dataChain/limit 限定检查范围，避免误以为只检查了指定 Record。");
+                        }
+                        return await handleStaleCheck(hash, args.workspace, args.scope, args.includeGeneral, chains.dataChain, args.limit, startMs);
                     default:
                         return r(`❌ 未知 action: ${args.action}`);
                 }
@@ -1166,6 +1737,9 @@ async function statMtimeMsAsync(filePath: string | undefined): Promise<number | 
 }
 
 export const __recordConcurrencyTest = {
+    loadFrozenSource(source: FrozenRuntimeSource): ConversationLoadResult {
+        return conversationLoadFromFrozenSource(source);
+    },
     stats(): ConcurrencyGateSnapshot {
         return __recordUpdateCoordinationTest.persistenceStats();
     },
@@ -1207,11 +1781,33 @@ export const __recordConcurrencyTest = {
             args.options,
         );
     },
+    async buildUpdateResumePayload(args: {
+        workspaceHash: string;
+        conversationId?: string;
+        workspace?: string;
+        dataChain: DataChain;
+        modelChain: Chain;
+        parallelMode?: RecordParallelMode;
+        force?: boolean;
+        logicalChain?: ConversationLogicalChainMode;
+    }): Promise<RecordUpdateResumePayload | null> {
+        return buildRecordUpdateResumePayload(
+            args.workspaceHash,
+            args.conversationId,
+            args.workspace,
+            args.dataChain,
+            args.modelChain,
+            args.parallelMode,
+            args.force,
+            args.logicalChain,
+        );
+    },
     async runBatchUpdate(
         payload: {
             kind: "record-batch-update";
             actionName: "batch_update" | "bulk_update";
             resumeKey: string;
+            workspaceHash?: string;
             dataChain: DataChain;
             modelChain: Chain;
             force?: boolean;
@@ -1223,7 +1819,10 @@ export const __recordConcurrencyTest = {
             isSettled?: () => boolean;
         } = {},
     ): Promise<string> {
-        const normalizedPayload = normalizeRecordBatchReadyPayload(payload);
+        const normalizedPayload = normalizeRecordBatchReadyPayload({
+            ...payload,
+            workspaceHash: payload.workspaceHash || resolveWorkspaceHashForRecord(payload.candidates[0]?.workspace),
+        });
         return runRecordBatchUpdateFromPayload(
             normalizedPayload,
             options.updateProgress || (() => undefined),
@@ -1253,11 +1852,18 @@ export const __recordConcurrencyTest = {
     setPersistenceHook(hook: RecordPersistenceTestHook | null): void {
         recordPersistenceTestHook = hook;
     },
+    setUnknownChainMigrationReaders(readers: UnknownChainMigrationReaders | null): void {
+        unknownChainMigrationReadersOverride = readers;
+    },
+    setUnknownChainMigrationProductionSourceReader(reader: ProductionSourceReader | null): void {
+        unknownChainMigrationSourceReaderOverride = reader;
+    },
     async mutateBatchLedger(
         payload: {
             kind: "record-batch-update";
             actionName: "batch_update" | "bulk_update";
             resumeKey: string;
+            workspaceHash?: string;
             dataChain: DataChain;
             modelChain: Chain;
             force?: boolean;
@@ -1268,7 +1874,10 @@ export const __recordConcurrencyTest = {
         reason?: string,
         details?: { isNew?: boolean; metadata?: RecordBatchIndexMetadata },
     ): Promise<RecordBatchResumeLedger> {
-        const readyPayload = normalizeRecordBatchReadyPayload(payload);
+        const readyPayload = normalizeRecordBatchReadyPayload({
+            ...payload,
+            workspaceHash: payload.workspaceHash || resolveWorkspaceHashForRecord(payload.candidates[0]?.workspace),
+        });
         if (mutation === "inFlight") {
             return markRecordBatchCandidateInFlight(readyPayload, candidate, reason || candidate.id, details?.metadata, details?.isNew);
         }
@@ -1279,13 +1888,17 @@ export const __recordConcurrencyTest = {
             kind: "record-batch-update";
             actionName: "batch_update" | "bulk_update";
             resumeKey: string;
+            workspaceHash?: string;
             dataChain: DataChain;
             modelChain: Chain;
             force?: boolean;
             candidates: Array<{ id: string; workspace: string }>;
         },
     ): Promise<RecordBatchResumeLedger> {
-        return ensureRecordBatchLedgerAsync(normalizeRecordBatchReadyPayload(payload));
+        return ensureRecordBatchLedgerAsync(normalizeRecordBatchReadyPayload({
+            ...payload,
+            workspaceHash: payload.workspaceHash || resolveWorkspaceHashForRecord(payload.candidates[0]?.workspace),
+        }));
     },
     formatBatchResult(
         ledger: RecordBatchResumeLedger,
@@ -1529,12 +2142,402 @@ export function listRecordsForScope(hash: string, scope: RecordManageScope | und
     return dedupeRecordsByCompleteness(records);
 }
 
+function recordDiscoveryHosts(dataChain: string | undefined): SourceEvidenceHost[] {
+    return dataChain && dataChain !== "auto" && SOURCE_EVIDENCE_HOSTS.includes(dataChain as SourceEvidenceHost)
+        ? [dataChain as SourceEvidenceHost]
+        : [...SOURCE_EVIDENCE_HOSTS];
+}
+
+function buildRecordSchedulerDiscoveryRequest(input: {
+    kind: "stale_check" | "record-update" | "record-batch-update";
+    selector: "normal" | "stale_only" | "force";
+    hash: string;
+    workspace?: string;
+    scope?: RecordManageScope;
+    includeGeneral?: boolean;
+    dataChain?: string;
+    limit?: number;
+    selectionLimit?: number;
+    after?: string;
+    before?: string;
+    targetConversationId?: string;
+}): RecordSchedulerRuntimeDiscoveryRequest {
+    const records: RecordSchedulerRuntimeDiscoveryRecord[] = listRecordsForScope(
+        input.hash,
+        input.scope,
+        input.includeGeneral === true,
+    ).filter(record => !input.targetConversationId || record.conversationId === input.targetConversationId).map(record => {
+        const identity = record.commitArtifact?.identity;
+        const mainIndex = record.commitArtifact?.mainIndex;
+        const coveredRevision = identity
+            && mainIndex
+            && identity.conversationId === record.conversationId
+            && mainIndex.conversationId === record.conversationId
+            && identity.commitId === mainIndex.commitId
+            && identity.coveredRevision === mainIndex.coveredRevision
+            && identity.recordId === mainIndex.recordId
+            ? identity.coveredRevision
+            : undefined;
+        return {
+            conversationId: record.conversationId,
+            title: record.title,
+            workspaceHash: input.hash,
+            workspacePath: input.workspace || null,
+            ...(record.chain && SOURCE_EVIDENCE_HOSTS.includes(record.chain as SourceEvidenceHost)
+                ? { host: record.chain as SourceEvidenceHost }
+                : {}),
+            lastUpdatedAt: record.lastUpdatedAt,
+            recordBodyHash: `sha256:${crypto.createHash("sha256").update(JSON.stringify(record), "utf8").digest("hex")}`,
+            ...(coveredRevision ? { coveredRevision } : {}),
+            ...(coveredRevision && Number.isSafeInteger(record.coveredRevisionSequence) && (record.coveredRevisionSequence ?? -1) >= 0
+                ? { coveredRevisionSequence: record.coveredRevisionSequence }
+                : {}),
+        };
+    });
+    const hosts = recordDiscoveryHosts(input.dataChain);
+    const limit = Math.max(1, Math.min(200, Math.floor(input.limit || 50)));
+    const selectionLimit = input.selectionLimit === undefined
+        ? undefined
+        : Math.max(1, Math.min(200, Math.floor(input.selectionLimit)));
+    const filters = {
+        scope: input.scope || "workspace",
+        includeGeneral: input.includeGeneral === true,
+        ...(input.after ? { after: input.after } : {}),
+        ...(input.before ? { before: input.before } : {}),
+        ...(selectionLimit !== undefined ? { selectionLimit } : {}),
+    };
+    const identity = {
+        selector: input.selector,
+        workspaceHash: input.hash,
+        workspacePath: input.workspace || null,
+        hosts,
+        limit,
+        ...(selectionLimit !== undefined ? { selectionLimit } : {}),
+        filters,
+        records: records.map(record => ({
+            conversationId: record.conversationId,
+            workspaceHash: record.workspaceHash,
+            host: record.host || null,
+            lastUpdatedAt: record.lastUpdatedAt,
+            recordBodyHash: record.recordBodyHash,
+            coveredRevision: record.coveredRevision || null,
+            coveredRevisionSequence: record.coveredRevisionSequence ?? null,
+        })),
+    };
+    return {
+        kind: input.kind,
+        selector: input.selector,
+        requestKey: `record-discovery:${crypto.createHash("sha256").update(JSON.stringify(identity), "utf8").digest("hex")}`,
+        workspaceHash: input.hash,
+        workspacePath: input.workspace || null,
+        hosts,
+        limit,
+        ...(selectionLimit !== undefined ? { selectionLimit } : {}),
+        filters,
+        records,
+        ...(input.targetConversationId ? {
+            targets: hosts.map(host => ({
+                conversationId: input.targetConversationId!,
+                host,
+                workspaceHash: input.hash,
+                workspacePath: input.workspace || null,
+                title: records.find(record => record.conversationId === input.targetConversationId)?.title,
+            })),
+        } : {}),
+    };
+}
+
 // ============= update =============
+
+function frozenRuntimeSourceKey(source: Pick<FrozenRuntimeSource["snapshot"], "chain" | "workspaceHash" | "conversationId">): string {
+    return `${source.chain}\u0000${source.workspaceHash}\u0000${source.conversationId}`;
+}
+
+interface RecordSchedulerExecutionContext {
+    taskId: string;
+    frozenSources: FrozenRuntimeSourceSet;
+    sourceSnapshotId: string;
+    runtime: RecordSchedulerRuntime;
+}
+
+interface RecordSchedulerBatchExecutionContext {
+    taskId: string;
+    frozenSources: FrozenRuntimeSourceSet;
+    runtime: RecordSchedulerRuntime;
+}
+
+function stableFirstPublicationToken(source: Pick<FrozenRuntimeSource["snapshot"], "chain" | "workspaceHash" | "conversationId">): string {
+    const canonicalIdentity = JSON.stringify({
+        version: 1,
+        chain: source.chain,
+        workspaceHash: source.workspaceHash,
+        conversationId: source.conversationId,
+    });
+    return `record-first-publication:v1:${crypto.createHash("sha256").update(canonicalIdentity, "utf8").digest("hex")}`;
+}
+
+function createSchedulerProductionSession(
+    execution: RecordSchedulerExecutionContext,
+    source: FrozenRuntimeSource,
+): RecordSchedulerProductionSession {
+    if (execution.frozenSources.phase !== "sealed") {
+        throw new RecordSchedulerRepairRequiredError("Record scheduler execution 只能使用 sealed frozen source set");
+    }
+    if (execution.sourceSnapshotId !== source.snapshot.sourceSnapshotId
+        || !execution.frozenSources.sources.some(item => item.snapshot.sourceSnapshotId === execution.sourceSnapshotId)) {
+        throw new RecordSchedulerRepairRequiredError("Record scheduler execution sourceSnapshotId 与 sealed source set 不匹配");
+    }
+    return createRecordSchedulerProductionSession({
+        taskId: execution.taskId,
+        frozenSources: execution.frozenSources,
+        sourceSnapshotId: execution.sourceSnapshotId,
+        recordStoreHash: source.snapshot.workspaceHash,
+        schedulerOwner: { ownerId: execution.runtime.ownerId },
+        control: execution.runtime.control,
+        spool: execution.runtime.control.spool,
+        firstPublicationToken: stableFirstPublicationToken(source.snapshot),
+    }, {
+        coordinatorOwnerId: RECORD_SCHEDULER_COORDINATOR_OWNER_ID,
+    });
+}
+
+async function finalizeSchedulerLocalRecord(
+    session: RecordSchedulerProductionSession,
+    input: Parameters<RecordSchedulerProductionSession["finalizeLocalRecord"]>[0],
+): Promise<Awaited<ReturnType<RecordSchedulerProductionSession["finalizeLocalRecord"]>>> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+            return await session.finalizeLocalRecord(input);
+        } catch (error) {
+            const code = (error as { code?: unknown })?.code;
+            if ((code !== "REVISION_CONFLICT" && code !== "SCHEDULER_LEDGER_CONFLICT") || attempt === 3) throw error;
+            await new Promise(resolve => setTimeout(resolve, 10 * (attempt + 1)));
+        }
+    }
+    throw new Error("local-finalize retry loop 未返回结果");
+}
+
+function completeRecordMetadata(input: {
+    conversationId: string;
+    content: string;
+    rounds: number;
+    totalSteps: number;
+    coveredRounds: number;
+    phases: number;
+    title?: string;
+    timeSpan?: string;
+    tags?: string[];
+    chain?: string;
+    coveredRevisionSequence?: number;
+}): RecordIndexEntry {
+    return {
+        conversationId: input.conversationId,
+        title: input.title || extractTitle(input.content) || `对话 ${input.conversationId.slice(0, 8)}`,
+        timeSpan: input.timeSpan || "",
+        totalRounds: input.rounds,
+        totalSteps: input.totalSteps,
+        lastUpdatedRound: input.coveredRounds,
+        lastUpdatedAt: new Date().toISOString(),
+        phases: input.phases,
+        sizeBytes: Buffer.byteLength(input.content, "utf8"),
+        ...(input.tags ? { tags: input.tags } : {}),
+        ...(input.chain ? { chain: input.chain } : {}),
+        ...(Number.isSafeInteger(input.coveredRevisionSequence) && (input.coveredRevisionSequence ?? -1) >= 0
+            ? { coveredRevisionSequence: input.coveredRevisionSequence }
+            : {}),
+    };
+}
+
+type FrozenConversationAttachment = NonNullable<ConversationRound["attachments"]>[number];
+
+const FROZEN_CANONICAL_ATTACHMENT_SOURCES = new Set<FrozenConversationAttachment["source"]>([
+    "claude-code-data-url",
+    "claude-code-local-file",
+    "codex-data-url",
+    "codex-local-file",
+    "files-mentioned",
+    "windsurf-data-url",
+    "windsurf-media-attachment",
+    "antigravity-raw-attachment",
+    "attachment-metadata-redacted",
+]);
+
+const FROZEN_CANONICAL_ATTACHMENT_WARNINGS = new Set([
+    "attachment descriptor could not be parsed",
+    "attachment descriptor could not be fully resolved",
+    "attachment data URL could not be decoded",
+    "attachment data URL is not a supported base64 descriptor",
+    "attachment base64 descriptor is invalid",
+    "attachment base64 exceeds safe decode limit",
+    "attachment base64 decoded length verification failed",
+    "attachment has no stable data URL or path reference",
+    "attachment metadata warning redacted",
+]);
+
+function frozenCanonicalAttachmentName(value: unknown): string {
+    const extension = typeof value === "string" ? /\.([a-z0-9]{1,16})$/iu.exec(value.trim())?.[1]?.toLowerCase() : undefined;
+    return extension ? `attachment.${extension}` : "attachment";
+}
+
+function frozenCanonicalAttachmentMimeType(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const mimeType = value.trim().toLowerCase();
+    return mimeType.length <= 128 && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/u.test(mimeType) ? mimeType : undefined;
+}
+
+function frozenCanonicalAttachmentHash(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const match = /^(?:sha256:)?([a-f0-9]{64})$/iu.exec(value.trim());
+    return match ? `sha256:${match[1].toLowerCase()}` : undefined;
+}
+
+function frozenCanonicalAttachmentReference(value: unknown): string | undefined {
+    if (typeof value !== "string") return undefined;
+    const reference = value.trim().toLowerCase();
+    return /^(?:path-sha256|attachment-sha256):[a-f0-9]{64}$/u.test(reference)
+        || /^attachment-policy:sha256:[a-f0-9]{64}$/u.test(reference)
+        ? reference
+        : undefined;
+}
+
+function frozenCanonicalAttachments(attachments: unknown, stepIndex: number): FrozenConversationAttachment[] {
+    if (!Array.isArray(attachments)) return [];
+    return attachments.flatMap(rawAttachment => {
+        if (!rawAttachment || typeof rawAttachment !== "object" || Array.isArray(rawAttachment)) return [];
+        const raw = rawAttachment as Record<string, unknown>;
+        const source = typeof raw.source === "string" && FROZEN_CANONICAL_ATTACHMENT_SOURCES.has(raw.source as FrozenConversationAttachment["source"])
+            ? raw.source as FrozenConversationAttachment["source"]
+            : "attachment-metadata-redacted";
+        const reference = frozenCanonicalAttachmentReference(raw.reference);
+        const sha256 = frozenCanonicalAttachmentHash(raw.sha256);
+        const mimeType = frozenCanonicalAttachmentMimeType(raw.mimeType);
+        const sizeBytes = typeof raw.sizeBytes === "number" && Number.isSafeInteger(raw.sizeBytes) && raw.sizeBytes >= 0
+            ? raw.sizeBytes
+            : undefined;
+        const exists = typeof raw.exists === "boolean" ? raw.exists : undefined;
+        const warning = typeof raw.warning === "string"
+            ? FROZEN_CANONICAL_ATTACHMENT_WARNINGS.has(raw.warning) ? raw.warning : "attachment metadata warning redacted"
+            : undefined;
+        const metadata = [
+            `source=${source}`,
+            ...(reference ? [`reference=${reference}`] : []),
+            ...(sha256 ? [`sha256=${sha256}`] : []),
+            ...(mimeType ? [`mime=${mimeType}`] : []),
+            ...(sizeBytes !== undefined ? [`sizeBytes=${sizeBytes}`] : []),
+            ...(exists !== undefined ? [`exists=${exists}`] : []),
+        ];
+        return [{
+            kind: raw.kind === "image" ? "image" : "file",
+            source,
+            name: `${frozenCanonicalAttachmentName(raw.name)} [${metadata.join("; ")}]`,
+            ...(mimeType ? { mimeType } : {}),
+            ...(reference ? { reference } : {}),
+            ...(sizeBytes !== undefined ? { sizeBytes } : {}),
+            ...(sha256 ? { sha256 } : {}),
+            ...(exists !== undefined ? { exists } : {}),
+            ...(warning ? { warning } : {}),
+            stepIndex,
+        }];
+    });
+}
+
+function assertFrozenCanonicalDocument(source: FrozenRuntimeSource): void {
+    if (source.document.schemaVersion !== PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION) {
+        throw new RecordSchedulerRepairRequiredError(
+            `frozen source ${source.snapshot.sourceSnapshotId} 的 schemaVersion 不受支持: ${source.document.schemaVersion}`,
+        );
+    }
+    if (!isSupportedProductionSourceFormatterVersion(source.document.formatterVersion)) {
+        throw new RecordSchedulerRepairRequiredError(
+            `frozen source ${source.snapshot.sourceSnapshotId} 的 formatterVersion 不受支持: ${source.document.formatterVersion}`,
+        );
+    }
+    if (!Array.isArray(source.document.messages)
+        || source.document.source.host !== source.snapshot.chain
+        || source.document.source.conversationId !== source.snapshot.conversationId
+        || !source.snapshot.contentHash
+        || source.snapshot.contentHash !== source.snapshot.contentRef.hash
+        || source.document.messages.some((message, index) => (
+            message.order !== index + 1
+            || (message.role !== "user" && message.role !== "assistant")
+            || typeof message.content !== "string"
+        ))) {
+        throw new RecordSchedulerRepairRequiredError(
+            `frozen source ${source.snapshot.sourceSnapshotId} 的 canonical document/version/content binding 无法验证`,
+        );
+    }
+}
+
+function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): ConversationLoadResult {
+    assertFrozenCanonicalDocument(source);
+    const rounds: ConversationRound[] = [];
+    let current: ConversationRound | null = null;
+    const publishCurrent = () => {
+        if (!current) return;
+        current.roundIndex = rounds.length + 1;
+        rounds.push(current);
+        current = null;
+    };
+    for (const message of source.document.messages) {
+        if (message.role === "user") {
+            publishCurrent();
+            current = {
+                roundIndex: rounds.length + 1,
+                startStep: message.order,
+                endStep: message.order,
+                userMessage: message.content,
+                mediaAttachments: [],
+                attachments: frozenCanonicalAttachments(message.attachments, message.order),
+                aiResponses: [],
+                toolCalls: [],
+                taskBoundaries: [],
+                codeActions: [],
+                subagentSummaries: [],
+            };
+            continue;
+        }
+        current ||= {
+            roundIndex: rounds.length + 1,
+            startStep: message.order,
+            endStep: message.order,
+            userMessage: "",
+            mediaAttachments: [],
+            attachments: [],
+            aiResponses: [],
+            toolCalls: [],
+            taskBoundaries: [],
+            codeActions: [],
+            subagentSummaries: [],
+        };
+        current.endStep = message.order;
+        current.attachments!.push(...frozenCanonicalAttachments(message.attachments, message.order));
+        current.aiResponses.push({
+            stepIndex: message.order,
+            response: message.content,
+            thinking: "",
+            toolCalls: [],
+        });
+    }
+    publishCurrent();
+    return {
+        chainUsed: source.snapshot.chain,
+        conversationId: source.snapshot.conversationId,
+        rounds,
+        totalSteps: source.document.messages.length,
+    };
+}
 
 async function handleUpdate(
     hash: string, conversationId: string | undefined,
     workspace: string | undefined, dataChain: DataChain, modelChain: Chain, parallelMode: RecordParallelMode | undefined, force: boolean | undefined, logicalChain: ConversationLogicalChainMode | undefined, startMs: number,
-    options: { background?: boolean; onProgress?: (progress: BackgroundTaskProgress) => void; isCancelled?: () => boolean; isSettled?: () => boolean } = {},
+    options: {
+        background?: boolean;
+        onProgress?: (progress: BackgroundTaskProgress) => void;
+        isCancelled?: () => boolean;
+        isSettled?: () => boolean;
+        frozenSource?: FrozenRuntimeSource;
+        schedulerExecution?: RecordSchedulerExecutionContext;
+    } = {},
 ) {
     const preflightAbort = buildRecordTaskAbortResponse(startMs, options, "开始加载对话前检查到任务已终止");
     if (preflightAbort) return preflightAbort;
@@ -1543,15 +2546,18 @@ async function handleUpdate(
     let loaded: Awaited<ReturnType<typeof loadConversationData>> | null = null;
     let result: Awaited<ReturnType<typeof generateRecord>> | null = null;
     let singleFlightPermit: Awaited<ReturnType<typeof acquireRecordSingleFlightPermit>> | null = null;
+    let schedulerSession: RecordSchedulerProductionSession | undefined;
     let effectiveHash = hash;
     let effectiveWs = workspace || "general";
     let sourceSnapshot: RecordSourceSnapshot | null = null;
     try {
-        loaded = await loadConversationData(dataChain, conversationId, {
-            link: "summary",
-            logicalChain: effectiveLogicalChain,
-            requestClass: options.background ? "background" : "foreground",
-        });
+        loaded = options.frozenSource
+            ? conversationLoadFromFrozenSource(options.frozenSource)
+            : await loadConversationData(dataChain, conversationId, {
+                link: "summary",
+                logicalChain: effectiveLogicalChain,
+                requestClass: options.background ? "background" : "foreground",
+            });
         if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
         if (loaded.windsurfData?.partial) {
             const skipped = loaded.windsurfData.skippedSteps || [];
@@ -1588,6 +2594,16 @@ async function handleUpdate(
         }
 
         const cascadeId = loaded.conversationId;
+        if (options.schedulerExecution) {
+            if (!options.frozenSource
+                || options.frozenSource.snapshot.sourceSnapshotId !== options.schedulerExecution.sourceSnapshotId
+                || options.frozenSource.snapshot.conversationId !== cascadeId
+                || options.frozenSource.snapshot.chain !== loaded.chainUsed
+                || options.frozenSource.snapshot.workspaceHash !== hash) {
+                throw new RecordSchedulerRepairRequiredError("scheduler-managed update 缺少匹配的 sealed frozen source");
+            }
+            effectiveHash = options.frozenSource.snapshot.workspaceHash;
+        }
         sourceSnapshot = {
             chain: loaded.chainUsed,
             rounds: rounds.length,
@@ -1597,7 +2613,7 @@ async function handleUpdate(
         };
         singleFlightPermit = await acquireRecordSingleFlightPermit(cascadeId, options);
         const existingBestHash = await findRecordHashAsync(cascadeId);
-        if (existingBestHash && existingBestHash !== effectiveHash) {
+        if (!options.schedulerExecution && existingBestHash && existingBestHash !== effectiveHash) {
             const [currentContent, bestContent] = await Promise.all([
                 readRecordAsync(effectiveHash, cascadeId),
                 readRecordAsync(existingBestHash, cascadeId),
@@ -1632,6 +2648,9 @@ async function handleUpdate(
             }
         }
 
+        schedulerSession = options.schedulerExecution && options.frozenSource
+            ? createSchedulerProductionSession(options.schedulerExecution, options.frozenSource)
+            : undefined;
         result = await generateRecord(effectiveHash, cascadeId, effectiveWs, rounds, totalSteps, modelChain, {
             background: options.background,
             parallelMode,
@@ -1639,6 +2658,10 @@ async function handleUpdate(
             isCancelled: options.isCancelled,
             isSettled: options.isSettled,
             onProgress: options.onProgress,
+            ...(schedulerSession ? {
+                schedulerManagedExecution: true,
+                schedulerModelCall: schedulerSession.schedulerModelCall,
+            } : {}),
         });
     } catch (error) {
         if (error instanceof RecordUpdatePoolAbortError) {
@@ -1677,6 +2700,19 @@ async function handleUpdate(
         });
         if (!gate.ok) return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
         const phases = countPhasesInRecord(result.content!);
+        const existingIndexEntry = (await readRecordsIndexAsync(effectiveHash)).records[cascadeId];
+        const recordMeta = completeRecordMetadata({
+            conversationId: cascadeId,
+            content: result.content!,
+            rounds: rounds.length,
+            totalSteps,
+            coveredRounds: result.coveredRounds || rounds.length,
+            phases,
+            timeSpan: existingIndexEntry?.timeSpan,
+            tags: result.tags ?? existingIndexEntry?.tags,
+            chain: loaded.chainUsed,
+            coveredRevisionSequence: options.frozenSource?.snapshot.sourceRevisionSequence,
+        });
         let readerIndexStatus = "rebuilt";
         try {
             const committed = await withRecordUpdateSharedPermit({
@@ -1690,18 +2726,23 @@ async function handleUpdate(
             }, async permit => {
                 const abortReason = getRecordTaskAbortReason(options);
                 if (abortReason) throw new RecordUpdatePoolAbortError(abortReason, permit.snapshot);
-                await runRecordPersistenceTestHook("before_write", cascadeId);
                 const beforeCommitReason = getRecordTaskAbortReason(options);
                 if (beforeCommitReason) throw new RecordUpdatePoolAbortError(beforeCommitReason, permit.snapshot);
-                await writeRecord(effectiveHash, cascadeId, result.content!, {
-                    title: extractTitle(result.content!) || `对话 ${cascadeId.slice(0, 8)}`,
-                    totalRounds: rounds.length,
-                    totalSteps,
-                    lastUpdatedRound: result.coveredRounds || rounds.length,
-                    phases,
-                    tags: result.tags,
-                    chain: loaded.chainUsed,
-                });
+                if (schedulerSession) {
+                    const finalized = await finalizeSchedulerLocalRecord(schedulerSession, {
+                        content: result.content!,
+                        commit: {
+                            firstPublicationToken: stableFirstPublicationToken(options.frozenSource!.snapshot),
+                            recordMeta,
+                            hooks: schedulerRecordPersistenceTestHooks(cascadeId),
+                        },
+                    });
+                    if (finalized.kind === "cancelled") throw new RecordUpdatePoolAbortError("cancelled", permit.snapshot);
+                    readerIndexStatus = "verified";
+                    return;
+                }
+                await runRecordPersistenceTestHook("before_write", cascadeId);
+                await writeRecord(effectiveHash, cascadeId, result.content!, recordMeta);
                 const readerIndex = await buildAndPersistRecordReaderIndex(effectiveHash, cascadeId, result.content!, {
                     beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", cascadeId),
                 });
@@ -1768,6 +2809,7 @@ async function recordCoverageWarningAsync(hash: string, conversationId: string, 
 }
 
 async function buildRecordUpdateResumePayload(
+    workspaceHash: string,
     conversationId: string | undefined,
     workspace: string | undefined,
     dataChain: DataChain,
@@ -1780,10 +2822,17 @@ async function buildRecordUpdateResumePayload(
     if (!resolvedChain) return null;
     const resolvedConversationId = await resolveConversationId(conversationId, resolvedChain, process.cwd(), "background");
     if (!resolvedConversationId) return null;
+    let resolvedWorkspaceHash = workspaceHash;
+    if (workspace) {
+        resolvedWorkspaceHash = resolveWorkspaceHashForRecord(workspace);
+    } else if (workspaceHash === "general") {
+        resolvedWorkspaceHash = (await detectOwnershipSource(resolvedConversationId, resolvedChain, "background")).expectedHash || workspaceHash;
+    }
     return {
         kind: "record-update",
         conversationId: resolvedConversationId,
         ...(workspace ? { workspace } : {}),
+        workspaceHash: resolvedWorkspaceHash,
         dataChain: resolvedChain,
         modelChain,
         ...(parallelMode ? { parallelMode } : {}),
@@ -1792,7 +2841,7 @@ async function buildRecordUpdateResumePayload(
     };
 }
 
-async function handleUpdateBackground(
+async function handleRecordSchedulerUpdate(
     hash: string,
     conversationId: string | undefined,
     workspace: string | undefined,
@@ -1802,9 +2851,12 @@ async function handleUpdateBackground(
     force: boolean | undefined,
     logicalChain: ConversationLogicalChainMode | undefined,
     startMs: number,
-    autoBackground = false,
+    background: boolean,
+    autoBackground: boolean,
 ) {
+    await waitForRecordMutationReadiness();
     const resumePayload = await buildRecordUpdateResumePayload(
+        hash,
         conversationId,
         workspace,
         dataChain,
@@ -1816,47 +2868,173 @@ async function handleUpdateBackground(
     if (!resumePayload) {
         return rt(`❌ 无法为 dataChain=${dataChain} 冻结可恢复的 conversationId`, startMs);
     }
-    const resumeHash = resolveWorkspaceHashForRecord(resumePayload.workspace);
-    const task = startBackgroundTask("record-update", async ({ updateProgress, isCancelled, isSettled }) => {
-        const result = await handleUpdate(
-            resumeHash,
-            resumePayload.conversationId,
-            resumePayload.workspace,
-            resumePayload.dataChain,
-            resumePayload.modelChain,
-            resumePayload.parallelMode,
-            resumePayload.force,
-            resumePayload.logicalChain,
-            Date.now(),
-            {
-            background: true,
-            onProgress: updateProgress,
-            isCancelled,
-            isSettled,
-            },
-        );
-        return responseText(result);
-    }, {
-        resumePayload,
+    const requestSummary = {
+        operation: "record-update",
+        conversationId: resumePayload.conversationId,
+        workspace: resumePayload.workspace || "general",
+        workspaceHash: resumePayload.workspaceHash,
+        dataChain: resumePayload.dataChain,
+        modelChain: resumePayload.modelChain,
+        parallelMode: resumePayload.parallelMode || "off",
+        force: resumePayload.force === true,
+        logicalChain: resumePayload.logicalChain || "off",
+    };
+    const runtime = getRecordSchedulerRuntime();
+    const discoveryRequest = buildRecordSchedulerDiscoveryRequest({
+        kind: "record-update",
+        selector: force ? "force" : "normal",
+        hash: resumePayload.workspaceHash,
+        workspace: resumePayload.workspace,
+        dataChain: resumePayload.dataChain,
+        limit: 1,
+        targetConversationId: resumePayload.conversationId,
     });
+    const admission = await runtime.admit({
+        kind: "record-update",
+        requestKey: recordSchedulerRequestKey("record-update", requestSummary),
+        requestSummary,
+        resumePayload,
+        requestMode: force ? "force" : "normal",
+        backgroundProjection: { background, autoBackground },
+        replayTerminal: false,
+        discovery: discoveryRequest,
+        execute: async ({ taskId, updateProgress, isCancelled, isSettled }, _discovery, sourceSnapshots) => {
+            const frozenSource = sourceSnapshots?.sources.find(source => (
+                source.snapshot.conversationId === resumePayload.conversationId
+                && source.snapshot.chain === resumePayload.dataChain
+                && source.snapshot.workspaceHash === resumePayload.workspaceHash
+            ));
+            if (!sourceSnapshots || sourceSnapshots.phase !== "sealed" || !frozenSource) {
+                const issue = sourceSnapshots?.unresolved.find(item => (
+                    item.conversationId === resumePayload.conversationId
+                    && item.chain === resumePayload.dataChain
+                    && item.workspaceHash === resumePayload.workspaceHash
+                ));
+                const availableSources = sourceSnapshots
+                    ? [
+                        ...sourceSnapshots.sources.map(source => `source:${source.snapshot.chain}/${source.snapshot.workspaceHash}/${source.snapshot.conversationId}`),
+                        ...sourceSnapshots.unresolved.map(item => `${item.kind}:${item.chain}/${item.workspaceHash}/${item.conversationId}:${item.reason}`),
+                    ].join(" | ") || "empty"
+                    : "missing";
+                throw new RecordSchedulerRepairRequiredError(
+                    `Record scheduler update ${taskId} 缺少 ${resumePayload.dataChain}/${resumePayload.workspaceHash}/${resumePayload.conversationId} 的 sealed frozen source：${issue?.reason || "完整源读取未形成可回读 immutable spool"}；available=${availableSources}`,
+                );
+            }
+            const result = await handleUpdate(
+                resumePayload.workspaceHash,
+                resumePayload.conversationId,
+                resumePayload.workspace,
+                resumePayload.dataChain,
+                resumePayload.modelChain,
+                resumePayload.parallelMode,
+                resumePayload.force,
+                resumePayload.logicalChain,
+                Date.now(),
+                {
+                    background: true,
+                    onProgress: updateProgress,
+                    isCancelled,
+                    isSettled,
+                    frozenSource,
+                    schedulerExecution: {
+                        taskId: taskId,
+                        frozenSources: sourceSnapshots,
+                        sourceSnapshotId: frozenSource.snapshot.sourceSnapshotId,
+                        runtime,
+                    },
+                },
+            );
+            return responseText(result);
+        },
+    });
+    if (admission.outcome === "UnknownOutcome") {
+        return rt([
+            "⚠️ Record scheduler 接纳结果未确定，未返回成功 taskId",
+            `候选 ledger: ${admission.candidateTaskIds.join(", ") || "无"}`,
+            `原因: ${admission.reasons.join("; ") || "未知"}`,
+        ].join("\n"), startMs);
+    }
+    if (!background) {
+        const status = await runtime.waitForTerminal(admission.taskId);
+        const persistedTask = await waitForBackgroundTask(admission.taskId, 1);
+        return rt(persistedTask?.result || formatRecordSchedulerTaskStatus(status, persistedTask?.error), startMs);
+    }
     return rt([
-        "🚀 Record 更新已转入后台任务",
-        autoBackground ? "（未显式指定 background，已自动转后台排队；如需同步请传 background=false）" : "",
-        `🆔 taskId: ${task.id}`,
-        `🔗 dataChain: ${dataChain}`,
-        `🧠 modelChain: ${modelChain}`,
-        parallelMode ? `🧪 parallelMode: ${parallelMode}` : "",
-        force ? `♻️ force: true` : "",
-        logicalChain ? `🧩 logicalChain: ${logicalChain}` : "",
+        `🚀 Record scheduler 已接纳更新 (${admission.outcome === "Replayed" ? "复用既有任务" : "新任务"})`,
+        autoBackground ? "（未显式指定 background，保持自动后台）" : "",
+        `🆔 taskId: ${admission.taskId}`,
+        `🔗 dataChain: ${resumePayload.dataChain}`,
+        `🧠 modelChain: ${resumePayload.modelChain}`,
         `🧷 resume conversationId: ${resumePayload.conversationId}`,
-        "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询结果",
+        "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询账本状态",
     ].filter(Boolean).join("\n"), startMs);
+}
+
+export interface RecordAutoUpdateAdmissionInput {
+    workspaceHash: string;
+    conversationId: string;
+    workspace?: string;
+    dataChain: DataChain;
+    modelChain: Chain;
+    logicalChain?: ConversationLogicalChainMode;
+}
+
+export async function admitRecordAutoUpdate(input: RecordAutoUpdateAdmissionInput): Promise<string> {
+    const response = await handleRecordSchedulerUpdate(
+        input.workspaceHash,
+        input.conversationId,
+        input.workspace,
+        input.dataChain,
+        input.modelChain,
+        undefined,
+        false,
+        input.logicalChain,
+        Date.now(),
+        true,
+        true,
+    );
+    return responseText(response);
 }
 
 async function handleTaskStatus(taskId: string | undefined, waitSeconds: number | undefined, startMs: number) {
     if (!taskId) return rt("❌ task_status 需要 taskId 参数", startMs);
+    const runtime = getRecordSchedulerRuntime();
+    const schedulerStatus = runtime.status(taskId);
+    if (schedulerStatus) {
+        const settled = await runtime.waitForTerminal(taskId, waitSeconds || 0);
+        const persistedTask = await waitForBackgroundTask(taskId, settled && isTerminalTaskState(settled.state) ? 1 : 0);
+        return rt(formatRecordSchedulerTaskStatus(settled, persistedTask?.error), startMs);
+    }
+    const projectionHint = getRecordSchedulerProjectionHint(taskId);
+    if (projectionHint) {
+        return rt(`⚠️ ${schedulerRecoveryRequired(projectionHint).message}`, startMs);
+    }
     const task = await waitForBackgroundTask(taskId, waitSeconds || 0);
     return rt(formatBackgroundTask(task), startMs);
+}
+
+async function resumeSchedulerBackgroundTask(task: BackgroundTask): Promise<string> {
+    if (!getRecordSchedulerRuntime().status(task.id)) {
+        throw schedulerRecoveryRequired(task);
+    }
+    ensureRecordRecoveryHandlersRegistered();
+    const handler = getBackgroundTaskRecoveryHandler(task.kind);
+    if (!handler) {
+        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${task.id} 未注册 background recovery handler`);
+    }
+    const action = await handler(task);
+    if (!action || action.mode !== "resume") {
+        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${task.id} recovery handler 未返回同 taskId resume action`);
+    }
+    return await action.run({
+        taskId: task.id,
+        updateProgress: () => undefined,
+        isCancelled: () => readPersistedRecordTask(task.id)?.status === "cancelled",
+        isSettled: () => {
+            const latest = readPersistedRecordTask(task.id);
+            return latest === null || latest.status !== "running";
+        },
+    });
 }
 
 async function handleRecover(taskId: string | undefined, startMs: number) {
@@ -1864,11 +3042,23 @@ async function handleRecover(taskId: string | undefined, startMs: number) {
         return rt(formatRecoverableRecordTasks(listRecoverableRecordTasks()), startMs);
     }
     const persistedTask = readPersistedRecordTask(taskId);
+    if (persistedTask && isSchedulerBackedRecordTask(persistedTask)) {
+        const result = await resumeSchedulerBackgroundTask(persistedTask);
+        return rt(`♻️ Record scheduler 已通过 background recovery handler 继续执行：${taskId}\n${result}`, startMs);
+    }
+    const runtime = getRecordSchedulerRuntime();
+    const schedulerStatus = runtime.status(taskId);
+    if (schedulerStatus) {
+        throw new RecordSchedulerRepairRequiredError(`Record scheduler ${taskId} 缺少持久 background admission envelope，禁止仅抢 owner 后伪造恢复成功`);
+    }
     if (!persistedTask) {
         return rt(`❌ 未找到可读取的后台任务：${taskId}`, startMs);
     }
     if (!RECORD_RECOVERABLE_TASK_KINDS.has(persistedTask.kind)) {
         return rt(`❌ record_manage(recover) 仅恢复 Record 任务；${taskId} 的类型为 ${persistedTask.kind}`, startMs);
+    }
+    if (isSchedulerBackedRecordTask(persistedTask)) {
+        return rt(`⚠️ ${schedulerRecoveryRequired(persistedTask).message}`, startMs);
     }
     const result = await recoverBackgroundTask(taskId);
     const summaryLines = [
@@ -1888,6 +3078,18 @@ async function handleRecover(taskId: string | undefined, startMs: number) {
         formatBackgroundTask(result.task),
     ].filter(Boolean);
     return rt(summaryLines.join("\n"), startMs);
+}
+
+async function handleRecordCancel(taskId: string | undefined, startMs: number) {
+    if (!taskId) return rt("❌ cancel 需要 taskId 参数", startMs);
+    const runtime = getRecordSchedulerRuntime();
+    const cancelled = await runtime.cancel(taskId);
+    if (cancelled) return rt(formatRecordSchedulerCancel(cancelled), startMs);
+    const projectionHint = getRecordSchedulerProjectionHint(taskId);
+    if (projectionHint) {
+        return rt(`⚠️ ${schedulerRecoveryRequired(projectionHint).message}`, startMs);
+    }
+    return rt(formatBackgroundTask(cancelBackgroundTask(taskId, "用户取消 Record 任务")), startMs);
 }
 
 // ============= list =============
@@ -1998,125 +3200,38 @@ const STALE_THRESHOLD_MS = 60_000; // 60s 容差，避免 mtime 精度/record �
 
 async function handleStaleCheck(
     hash: string,
+    workspace: string | undefined,
     scope: RecordManageScope | undefined,
     includeGeneral: boolean | undefined,
     dataChain: string | undefined,
     limit: number | undefined,
     startMs: number,
 ) {
-    const records = listRecordsForScope(hash, scope, includeGeneral === true);
-    if (records.length === 0) return rt("📦 范围内无 Record", startMs);
-
-    // 确定要检查的源
-    const chainsToCheck = dataChain && dataChain !== "auto"
-        ? [dataChain]
-        : ["codex", "claude-code", "windsurf", "antigravity"];
-
-    // 按 chain 分组 record（无 chain 的归入 unknown）
-    const byChain = new Map<string, typeof records>();
-    for (const rec of records) {
-        const chain = rec.chain || "unknown";
-        if (!byChain.has(chain)) byChain.set(chain, []);
-        byChain.get(chain)!.push(rec);
-    }
-
-    const stale: Array<{ conversationId: string; title: string; chain: string; recordUpdatedAt: string; convUpdatedAt: string; gapMs: number }> = [];
-    let checked = 0;
-    let unresolved = 0;
-    const unknownResolved = new Set<string>(); // 已在某个源找到的 unknown record
-
-    for (const chain of chainsToCheck) {
-        const chainRecords = byChain.get(chain) || [];
-        const unknownRecords = byChain.get("unknown") || [];
-
-        if (chainRecords.length === 0 && unknownRecords.length === 0) continue;
-
-        let convMap: Map<string, ConversationMtimeInfo>;
-        try {
-            convMap = await fetchConversationListForChain(chain, Math.max(records.length, 50));
-        } catch {
-            continue; // 源不可用，跳过
-        }
-
-        // 检查有 chain 标记的 record
-        for (const rec of chainRecords) {
-            checked++;
-            const conv = convMap.get(rec.conversationId);
-            if (!conv) { unresolved++; continue; }
-            const recordMs = new Date(rec.lastUpdatedAt).getTime();
-            if (conv.lastModifiedMs > recordMs + STALE_THRESHOLD_MS && !isRenameOnly(conv, rec)) {
-                stale.push({
-                    conversationId: rec.conversationId,
-                    title: conv.title || rec.title,
-                    chain,
-                    recordUpdatedAt: rec.lastUpdatedAt.slice(0, 16),
-                    convUpdatedAt: new Date(conv.lastModifiedMs).toISOString().slice(0, 16),
-                    gapMs: conv.lastModifiedMs - recordMs,
-                });
-            }
-        }
-
-        // unknown chain 的 record：尝试在每个源里找，找到就判定
-        for (const rec of unknownRecords) {
-            if (unknownResolved.has(rec.conversationId)) continue; // 已在之前的源找到
-            const conv = convMap.get(rec.conversationId);
-            if (conv) {
-                unknownResolved.add(rec.conversationId);
-                checked++;
-                const recordMs = new Date(rec.lastUpdatedAt).getTime();
-                if (conv.lastModifiedMs > recordMs + STALE_THRESHOLD_MS && !isRenameOnly(conv, rec)) {
-                    stale.push({
-                        conversationId: rec.conversationId,
-                        title: conv.title || rec.title,
-                        chain,
-                        recordUpdatedAt: rec.lastUpdatedAt.slice(0, 16),
-                        convUpdatedAt: new Date(conv.lastModifiedMs).toISOString().slice(0, 16),
-                        gapMs: conv.lastModifiedMs - recordMs,
-                    });
-                }
-            }
-        }
-    }
-
-    // unknown record 在所有源都没找到时保留为 unresolved，不算过期
-    const unknownRecords = byChain.get("unknown") || [];
-    for (const rec of unknownRecords) {
-        if (!unknownResolved.has(rec.conversationId)) {
-            checked++;
-            unresolved++;
-        }
-    }
-
-    stale.sort((a, b) => b.gapMs - a.gapMs);
+    const schedulerRuntime = getRecordSchedulerRuntime();
+    const discoveryRequest = buildRecordSchedulerDiscoveryRequest({
+        kind: "stale_check",
+        selector: "stale_only",
+        hash,
+        workspace,
+        scope,
+        includeGeneral,
+        dataChain,
+        limit,
+    });
+    const schedulerSnapshot = await schedulerRuntime.discover(discoveryRequest);
+    const candidates = schedulerRuntime.selectDiscoveryCandidates(schedulerSnapshot, "stale_only");
+    const unresolvedCandidates = schedulerSnapshot.candidates.filter(candidate => candidate.classification === "Unresolved");
+    const unresolved = unresolvedCandidates.length;
+    const lost = schedulerSnapshot.candidates.filter(candidate => candidate.classification === "Lost").length;
     const effectiveLimit = Math.min(Math.max(1, limit ?? 50), 200);
-    const shown = stale.slice(0, effectiveLimit);
-
-    const lines: string[] = [];
-    const scopeDesc = scope === "global" ? "全局" : scope === "general" ? "general" : (hash.slice(0, 8));
-    const chainDesc = dataChain && dataChain !== "auto" ? dataChain : "全源";
-    lines.push(`📋 Record 过期检查 (范围: ${scopeDesc}, 源: ${chainDesc})`);
-    lines.push(`检查了 ${checked} 份 Record，其中 ${stale.length} 份已过期，${unresolved} 份近期列表未找到 / unresolved（仅统计，不更新、不改动）：\n`);
-
-    if (stale.length === 0) {
-        lines.push(formatStaleCheckNoStaleSummary(unresolved));
-    } else {
-        for (const item of shown) {
-            const gapHours = Math.round(item.gapMs / 3_600_000);
-            const gapDesc = gapHours > 0 ? `${gapHours}h` : `${Math.round(item.gapMs / 60_000)}min`;
-            lines.push(`  📌 ${item.conversationId} | ${item.title}`);
-            lines.push(`     源: ${item.chain} | Record: ${item.recordUpdatedAt} | 对话: ${item.convUpdatedAt} | 落后: ${gapDesc}`);
-        }
-        if (stale.length > shown.length) {
-            lines.push(`\n  ... 还有 ${stale.length - shown.length} 份未显示（用 limit=N 查看更多）`);
-        }
-    }
-
-    const body = lines.join("\n");
-    if (body.length > 8000) {
-        const tmpPath = saveTempFile("stale-check", (hash || "all").slice(0, 8), body);
-        return rt(`📋 Record 过期检查：${stale.length} 份已过期，完整列表已落盘：\n${tmpPath}`, startMs);
-    }
-    return rt(body, startMs);
+    const lines = [
+        `🔎 scheduler stale_check：冻结快照 ${schedulerSnapshot.snapshotId}`,
+        `📦 共扫描 ${schedulerSnapshot.candidates.length} 份，其中 ${candidates.length} 份已过期；Unresolved ${unresolved}；Lost ${lost}`,
+        ...candidates.slice(0, effectiveLimit).map(candidate => `- ${candidate.source.host}:${candidate.source.identity.conversationId}`),
+        ...unresolvedCandidates.slice(0, effectiveLimit).map(candidate => `- ⚠️ ${candidate.source.host}:${candidate.source.identity.conversationId}：${candidate.classificationReason.code}`),
+    ];
+    if (candidates.length > effectiveLimit) lines.push(`…其余 ${candidates.length - effectiveLimit} 份已省略`);
+    return rt(lines.join("\n"), startMs);
 }
 
 // ============= read =============
@@ -2857,7 +3972,11 @@ function isWorkspacePathAliasHash(currentHash: string, expectedHash: string): bo
     return canonicalHashForExistingRecordHash(currentHash) === expectedHash;
 }
 
-async function detectOwnershipSource(conversationId: string, dataChain: DataChain): Promise<{
+async function detectOwnershipSource(
+    conversationId: string,
+    dataChain: DataChain,
+    requestClass?: ConcurrencyGateRequestClass,
+): Promise<{
     expectedHash?: string;
     expectedWorkspace?: string;
     sourceType: OwnershipSourceType;
@@ -2909,7 +4028,7 @@ async function detectOwnershipSource(conversationId: string, dataChain: DataChai
     if (allowWindsurf) {
         try {
             const { loadWindsurfConversation } = await import("../windsurf-client.js");
-            const conversation = await loadWindsurfConversation(conversationId);
+            const conversation = await loadWindsurfConversation(conversationId, false, { requestClass });
             const workspace = conversation?.thread.cwd;
             if (workspace) {
                 sources.push({ workspace, hash: resolveWorkspaceHashForRecord(workspace), identityHash: workspaceHash(workspace), sourceType: "windsurf_cwd" });
@@ -3134,7 +4253,145 @@ export async function planOwnershipRepair(
     return { items, moves };
 }
 
+function unknownChainMigrationWorkspaceHashes(
+    hash: string,
+    scope: RecordManageScope | undefined,
+    includeGeneral: boolean | undefined,
+): string[] {
+    if (scope === "general") return ["general"];
+    if (scope === "global") {
+        return [...new Set([
+            ...listWorkspaceHashes(),
+            ...(includeGeneral ? ["general"] : []),
+        ])];
+    }
+    return [hash];
+}
+
+function formatUnknownChainMigrationResult(result: UnknownChainMigrationResult): string {
+    if (result.status === "Patched") {
+        return `🧭 ${result.recordId}: 可迁移到 ${result.patch.replacement.chain}（patch=${result.patch.patchId.slice(-16)}）`;
+    }
+    if (result.status === "Conflict") {
+        return `⚠️ ${result.recordId}: Conflict，多 host 同时匹配 ${result.matchingHosts.join(", ")}，未改动`;
+    }
+    if (result.status === "Unresolved") {
+        const observations = result.observations
+            .map(observation => `${observation.host}=${observation.status}(${observation.reason})`)
+            .join("; ");
+        return `⚠️ ${result.recordId}: Unresolved，${result.reason}，未改动${observations ? `；evidence: ${observations}` : ""}`;
+    }
+    if (result.status === "Cancelled") return `🛑 ${result.recordId}: 扫描已取消，未改动`;
+    return `⏭ ${result.recordId}: 已有已知 chain，跳过`;
+}
+
+async function handleUnknownChainMigration(
+    hash: string,
+    scope: RecordManageScope | undefined,
+    includeGeneral: boolean | undefined,
+    apply: boolean | undefined,
+    startMs: number,
+) {
+    const workspaceHashes = unknownChainMigrationWorkspaceHashes(hash, scope, includeGeneral);
+    const readers = recordUnknownChainMigrationReaders();
+    const lines = [apply === true
+        ? "🛠 Unknown-chain 迁移执行（逐条 index revision/hash CAS）"
+        : "🔎 Unknown-chain 迁移 dry-run（只读，传 apply=true 才写入）"];
+    let inspected = 0;
+    let proposed = 0;
+    let applied = 0;
+    let conflicts = 0;
+    let unresolved = 0;
+
+    for (const workspaceHashValue of workspaceHashes) {
+        const entries = recordUnknownChainMigrationEntries(workspaceHashValue)
+            .filter(entry => entry.chain === "unknown");
+        for (const entry of entries) {
+            inspected++;
+            const result = await inspectUnknownChainMigration(entry, readers);
+            if (result.status === "Patched") {
+                proposed++;
+                if (apply === true) {
+                    const outcome = await applyUnknownChainMigrationPatch(workspaceHashValue, result);
+                    if (outcome === "applied") {
+                        applied++;
+                        lines.push(`✅ ${entry.recordId}: chain → ${result.patch.replacement.chain}`);
+                        continue;
+                    }
+                    conflicts++;
+                    lines.push(`⚠️ ${entry.recordId}: CAS Conflict，索引在扫描后变化，未改动`);
+                    continue;
+                }
+            } else if (result.status === "Conflict") {
+                conflicts++;
+            } else if (result.status === "Unresolved") {
+                unresolved++;
+            }
+            lines.push(formatUnknownChainMigrationResult(result));
+        }
+    }
+    lines.push(`📊 inspected=${inspected} proposed=${proposed} applied=${applied} conflict=${conflicts} unresolved=${unresolved}`);
+    return rt(lines.join("\n"), startMs);
+}
+
 // ============= edit =============
+
+async function withRecordManagementPublicationFenceWithinArtifactLock<Value>(
+    hash: string,
+    conversationId: string,
+    mutationKind: RecordWorkManualMutationKind,
+    operation: () => Promise<Value>,
+): Promise<Value> {
+    const entry = (await readRecordsIndexAsync(hash)).records[conversationId];
+    const hintedChain = SOURCE_CHAINS.find(chain => chain === entry?.chain);
+    const pathExists = async (filePath: string): Promise<boolean> => {
+        try {
+            await fs.promises.access(filePath, fs.constants.F_OK);
+            return true;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
+        }
+    };
+    const discoverRegistryCandidates = async (chains: readonly SourceChain[]) => (await Promise.all(chains.map(async chain => {
+        const location = { identity: { chain, workspaceHash: hash, conversationId } };
+        const [manifestExists, registryExists] = await Promise.all([
+            pathExists(recordWorkIdentityManifestPath(location)),
+            pathExists(recordWorkRegistryPath(location)),
+        ]);
+        return manifestExists || registryExists ? location : null;
+    }))).filter((location): location is { identity: { chain: SourceChain; workspaceHash: string; conversationId: string } } => location !== null);
+    let location: { identity: { chain: SourceChain; workspaceHash: string; conversationId: string } } | null;
+    if (hintedChain) {
+        const foreignCandidates = await discoverRegistryCandidates(SOURCE_CHAINS.filter(chain => chain !== hintedChain));
+        if (foreignCandidates.length > 0) {
+            throw new RecordSchedulerRepairRequiredError(
+                `Record 手动修改发现索引宿主 ${hintedChain} 之外的发布注册表: ${foreignCandidates.map(candidate => candidate.identity.chain).join(", ")}`,
+            );
+        }
+        location = { identity: { chain: hintedChain, workspaceHash: hash, conversationId } };
+    } else {
+        const registryCandidates = await discoverRegistryCandidates(SOURCE_CHAINS);
+        if (registryCandidates.length > 1) {
+            throw new RecordSchedulerRepairRequiredError(
+                `Record 手动修改发现多个宿主发布注册表: ${registryCandidates.map(candidate => candidate.identity.chain).join(", ")}`,
+            );
+        }
+        location = registryCandidates[0] || null;
+    }
+    if (!location) return operation();
+    const mutation = await withRecordWorkManualMutationAuthority({
+        ...location,
+        mutationKind,
+        artifactLockHeld: true,
+    }, operation);
+    if (mutation.kind === "repair_required") {
+        throw new RecordSchedulerRepairRequiredError(
+            `Record 手动修改无法安全围栏发布状态: ${mutation.reason} (${mutation.path})`,
+        );
+    }
+    return mutation.value;
+}
 
 async function handleEdit(
     hash: string, conversationId: string | undefined,
@@ -3158,14 +4415,18 @@ async function handleEdit(
         const phases = countPhasesInRecord(newContent);
         let readerIndexStatus = "rebuilt";
         await withRecordPersistenceWrite(async () => {
-            await runRecordPersistenceTestHook("before_write", resolvedId);
-            await writeRecord(hash, resolvedId, newContent, { phases });
-            const readerIndex = await buildAndPersistRecordReaderIndex(hash, resolvedId, newContent, {
-                beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", resolvedId),
+            await withRecordCommitArtifactLock(hash, async () => {
+                await withRecordManagementPublicationFenceWithinArtifactLock(hash, resolvedId, "manual_edit", async () => {
+                    await runRecordPersistenceTestHook("before_write", resolvedId);
+                    await writeRecordWithCommitArtifactLockHeld(hash, resolvedId, newContent, { phases });
+                    const readerIndex = await buildAndPersistRecordReaderIndex(hash, resolvedId, newContent, {
+                        beforeWrite: () => runRecordPersistenceTestHook("before_reader_index", resolvedId),
+                    });
+                    if (readerIndex.error) {
+                        readerIndexStatus = `error: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`;
+                    }
+                });
             });
-            if (readerIndex.error) {
-                readerIndexStatus = `error: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`;
-            }
         });
         return rt(`✅ Record ${resolvedId.slice(0, 8)}... 已更新 (${phases} Phase, ${(Buffer.byteLength(newContent) / 1024).toFixed(1)}KB)\n🔎 Reader Index: ${readerIndexStatus}`, startMs);
     });
@@ -3181,7 +4442,13 @@ async function handleDelete(hash: string, conversationId: string | undefined, st
     const resolvedId = resolveRecordConversationId(conversationId, hash) || conversationId;
     const deleted = await withRecordManagementSingleFlight(resolvedId, async () => {
         if (!await readRecordAsync(hash, resolvedId)) return false;
-        return withRecordPersistenceWrite(async () => deleteRecord(hash, resolvedId));
+        return withRecordPersistenceWrite(async () => {
+            return withRecordCommitArtifactLock(hash, async () => {
+                return withRecordManagementPublicationFenceWithinArtifactLock(hash, resolvedId, "manual_delete", async () => {
+                    return deleteRecordWithCommitArtifactLockHeld(hash, resolvedId);
+                });
+            });
+        });
     });
     if (!deleted) return rt(`❌ 未找到 ${conversationId} 的 Record`, startMs);
     return rt(`✅ Record ${resolvedId.slice(0, 8)}... 已删除`, startMs);
@@ -3196,7 +4463,13 @@ async function handleBatchDelete(hash: string, startMs: number) {
     for (const rec of records) {
         const deleted = await withRecordManagementSingleFlight(rec.conversationId, async () => {
             if (!await readRecordAsync(hash, rec.conversationId)) return false;
-            return withRecordPersistenceWrite(async () => deleteRecord(hash, rec.conversationId));
+            return withRecordPersistenceWrite(async () => {
+                return withRecordCommitArtifactLock(hash, async () => {
+                    return withRecordManagementPublicationFenceWithinArtifactLock(hash, rec.conversationId, "manual_delete", async () => {
+                        return deleteRecordWithCommitArtifactLockHeld(hash, rec.conversationId);
+                    });
+                });
+            });
         });
         if (!deleted) continue;
         count++;
@@ -3284,6 +4557,10 @@ export function effectiveRecordBatchLimit(limit: number | undefined, force: bool
     return Math.min(limit ?? (force ? 200 : 10), force ? 200 : 50);
 }
 
+export function recordBatchDiscoveryScanLimit(force: boolean | undefined): number {
+    return force ? 200 : 50;
+}
+
 function isWindsurfRenameOnly(candidate: BatchCandidateSnapshot, record: RecordBatchExistingRecord): boolean {
     return candidate.chain === "windsurf"
         && Number.isInteger(candidate.stepCount)
@@ -3312,7 +4589,7 @@ export function selectRecordBatchCandidates(
 ): RecordBatchCandidateSelection {
     const classifications = candidates.map(candidate => classifyRecordBatchCandidate(
         candidate,
-        recordsByWorkspaceHash[resolveWorkspaceHashForRecord(candidate.workspace)]?.[candidate.id],
+        recordsByWorkspaceHash[candidate.workspaceHash]?.[candidate.id],
     ));
     const rank: Record<RecordBatchCandidateCategory, number> = { stale: 0, missing: 1, fresh: 2, conflict: 3 };
     classifications.sort((a, b) => {
@@ -3517,6 +4794,7 @@ async function collectBatchConversationCandidates(
         candidateSnapshots.push({
             id: candidate.id,
             workspace: resolution.workspace,
+            workspaceHash: resolveWorkspaceHashForRecord(resolution.workspace),
             chain: candidate.chain,
             lastModifiedMs: candidate.lastModifiedMs,
             ...(candidate.stepCount !== undefined ? { stepCount: candidate.stepCount } : {}),
@@ -3538,7 +4816,7 @@ async function collectBatchConversationCandidates(
         };
     }
 
-    const hashes = [...new Set(candidateSnapshots.map(candidate => resolveWorkspaceHashForRecord(candidate.workspace)))];
+    const hashes = [...new Set(candidateSnapshots.map(candidate => candidate.workspaceHash))];
     const indexes = await Promise.all(hashes.map(async workspaceHash => [workspaceHash, await readRecordsIndexAsync(workspaceHash)] as const));
     const recordsByWorkspaceHash: Record<string, Record<string, RecordBatchExistingRecord>> = Object.fromEntries(
         indexes.map(([workspaceHash, index]) => [workspaceHash, index.records]),
@@ -3576,12 +4854,17 @@ function readyRecordBatchPayload(
         kind: "record-batch-update",
         actionName: payload.actionName,
         resumeKey: payload.resumeKey,
+        workspaceHash: payload.workspaceHash,
         dataChain: payload.dataChain,
         modelChain: payload.modelChain,
         ...(payload.force !== undefined ? { force: payload.force } : {}),
         ...(payload.stale_only !== undefined ? { stale_only: payload.stale_only } : {}),
         phase: "ready",
-        candidates: candidates.map(candidate => normalizeFrozenBatchCandidate(candidate, payload.dataChain as ResolvedConversationChain)),
+        candidates: candidates.map(candidate => normalizeFrozenBatchCandidate(
+            candidate,
+            payload.dataChain as ResolvedConversationChain,
+            payload.workspaceHash,
+        )),
         ...(diagnostics ? { diagnostics } : {}),
     };
 }
@@ -3636,17 +4919,6 @@ async function prepareRecordBatchPayload(
     return { payload: readyPayload };
 }
 
-async function prepareAndRunRecordBatchUpdate(
-    payload: RecordBatchResumePayload,
-    updateProgress: (progress: BackgroundTaskProgress) => void,
-    isCancelled: () => boolean,
-    isSettled: () => boolean,
-): Promise<string> {
-    const prepared = await prepareRecordBatchPayload(payload, updateProgress, isCancelled, isSettled);
-    if (!prepared.payload) return prepared.result || "📦 无符合条件的对话";
-    return runRecordBatchUpdateFromPayload(prepared.payload, updateProgress, isCancelled, isSettled);
-}
-
 function buildRecordBatchResultText(
     ledger: RecordBatchResumeLedger,
     total: number,
@@ -3691,6 +4963,8 @@ async function runRecordBatchUpdateFromPayload(
     updateProgress: (progress: BackgroundTaskProgress) => void,
     isCancelled: () => boolean,
     isSettled: () => boolean,
+    sourceSnapshots?: FrozenRuntimeSourceSet,
+    schedulerExecution?: RecordSchedulerBatchExecutionContext,
 ): Promise<string> {
     const taskStartMs = Date.now();
     const poolSummary: RecordUpdatePoolSummary = {
@@ -3699,12 +4973,15 @@ async function runRecordBatchUpdateFromPayload(
         maxQueueWaitMs: 0,
     };
     let grokSummary: GrokBatchRuntimeSummary | undefined;
-    let ledger = await ensureRecordBatchLedgerAsync(payload);
+    const schedulerManaged = schedulerExecution !== undefined;
+    let ledger = schedulerManaged
+        ? createEmptyRecordBatchLedger(payload)
+        : await ensureRecordBatchLedgerAsync(payload);
     const resumeSummary = {
-        hadPriorState: ledger.completed.length + ledger.failed.length + ledger.skipped.length + ledger.inFlight.length > 0,
-        initialSettledCount: ledger.completed.length + ledger.failed.length + ledger.skipped.length,
+        hadPriorState: !schedulerManaged && ledger.completed.length + ledger.failed.length + ledger.skipped.length + ledger.inFlight.length > 0,
+        initialSettledCount: schedulerManaged ? 0 : ledger.completed.length + ledger.failed.length + ledger.skipped.length,
     };
-    if (ledger.inFlight.length > 0) {
+    if (!schedulerManaged && ledger.inFlight.length > 0) {
         try {
             ledger = await reconcileRecordBatchInFlight(payload, ledger, {
                 isCancelled,
@@ -3718,8 +4995,10 @@ async function runRecordBatchUpdateFromPayload(
             throw error;
         }
     }
-    const total = payload.candidates.length;
-    let pending = pendingRecordBatchCandidates(payload, ledger);
+    let pending = schedulerManaged
+        ? schedulerBatchCandidates(payload, schedulerExecution.frozenSources)
+        : pendingRecordBatchCandidates(payload, ledger);
+    const total = schedulerManaged ? pending.length : payload.candidates.length;
     let current = "";
 
     const updateBatchProgress = (detail?: string) => {
@@ -3761,13 +5040,45 @@ async function runRecordBatchUpdateFromPayload(
                 const startedAt = Date.now();
                 let singleFlightPermit: Awaited<ReturnType<typeof acquireRecordSingleFlightPermit>> | null = null;
                 try {
-                    const loaded = await loadConversationData(payload.dataChain, candidate.id, {
-                        link: "summary",
-                        requestClass: "background",
-                    });
+                    const frozenSource = schedulerManaged
+                        ? schedulerExecution!.frozenSources.sources.find(source => (
+                            source.snapshot.conversationId === candidate.id
+                            && source.snapshot.chain === candidate.chain
+                            && source.snapshot.workspaceHash === candidate.workspaceHash
+                        ))
+                        : sourceSnapshots?.sources.find(source => (
+                            source.snapshot.conversationId === candidate.id
+                            && source.snapshot.chain === candidate.chain
+                        ));
+                    if (!schedulerManaged && sourceSnapshots && !frozenSource) {
+                        const issue = sourceSnapshots.unresolved.find(item => (
+                            item.conversationId === candidate.id && item.chain === candidate.chain
+                        ));
+                        ledger = await updateRecordBatchLedger(
+                            payload,
+                            "skipped",
+                            candidate,
+                            `source snapshot unresolved: ${issue?.reason || "durable source snapshot missing"}`,
+                        );
+                        updateBatchProgress(`跳过 ${current}: source snapshot unresolved`);
+                        continue;
+                    }
+                    if (schedulerManaged && !frozenSource) {
+                        throw new RecordSchedulerRepairRequiredError(
+                            `scheduler-managed batch 缺少 ${candidate.chain}/${candidate.workspaceHash}/${candidate.id} 的 frozen source`,
+                        );
+                    }
+                    const loaded = frozenSource
+                        ? conversationLoadFromFrozenSource(frozenSource)
+                        : await loadConversationData(payload.dataChain, candidate.id, {
+                            link: "summary",
+                            requestClass: "background",
+                        });
                     const fetchMs = Date.now() - startedAt;
                     if (!loaded) {
-                        ledger = await updateRecordBatchLedger(payload, "skipped", candidate, "无法加载对话");
+                        ledger = schedulerManaged
+                            ? projectRecordBatchOutcomeInMemory(ledger, "skipped", candidate, "无法加载冻结对话")
+                            : await updateRecordBatchLedger(payload, "skipped", candidate, "无法加载对话");
                         updateBatchProgress(`跳过 ${current}: 无法加载对话`);
                         continue;
                     }
@@ -3775,26 +5086,46 @@ async function runRecordBatchUpdateFromPayload(
                     const rounds = loaded.rounds;
                     const parseMs = Date.now() - startedAt - fetchMs;
                     if (rounds.length < 3) {
-                        ledger = await updateRecordBatchLedger(payload, "skipped", candidate, "轮次不足");
+                        ledger = schedulerManaged
+                            ? projectRecordBatchOutcomeInMemory(ledger, "skipped", candidate, "轮次不足")
+                            : await updateRecordBatchLedger(payload, "skipped", candidate, "轮次不足");
                         updateBatchProgress(`跳过 ${current}: 轮次不足`);
                         continue;
                     }
 
                     const totalSteps = loaded.totalSteps;
                     const actualWorkspace = candidate.workspace || "general";
-                    const actualHash = resolveWorkspaceHashForRecord(actualWorkspace);
+                    const actualHash = frozenSource?.snapshot.workspaceHash || candidate.workspaceHash;
+                    if (schedulerManaged && actualHash !== candidate.workspaceHash) {
+                        throw new RecordSchedulerRepairRequiredError(
+                            `scheduler-managed batch 的 frozen source ${candidate.id} workspaceHash 与候选快照不一致`,
+                        );
+                    }
                     singleFlightPermit = await acquireRecordSingleFlightPermit(candidate.id, {
                         isCancelled,
                         isSettled,
                         onProgress: updateProgress,
                     });
                     const flashStartedAt = Date.now();
+                    const schedulerSession = schedulerManaged && frozenSource
+                        ? createSchedulerProductionSession({
+                            ...schedulerExecution!,
+                            sourceSnapshotId: frozenSource.snapshot.sourceSnapshotId,
+                        }, frozenSource)
+                        : undefined;
+                    if (schedulerManaged && !schedulerSession) {
+                        throw new RecordSchedulerRepairRequiredError(`scheduler-managed batch 缺少 ${candidate.id} 的 production session`);
+                    }
                     const result = await generateRecord(actualHash, candidate.id, actualWorkspace, rounds, totalSteps, payload.modelChain, {
                         background: true,
                         trafficClass: "record-batch",
                         force: recordBatchGenerateForce(candidate),
                         isCancelled,
                         isSettled,
+                        ...(schedulerSession ? {
+                            schedulerManagedExecution: true,
+                            schedulerModelCall: schedulerSession.schedulerModelCall,
+                        } : {}),
                     });
                     const flashMs = Date.now() - flashStartedAt;
                     if (result.grokDiagnostics) {
@@ -3805,7 +5136,9 @@ async function runRecordBatchUpdateFromPayload(
                         break;
                     }
                     if (!result.success || !result.content) {
-                        ledger = await updateRecordBatchLedger(payload, "failed", candidate, result.error || "unknown");
+                        ledger = schedulerManaged
+                            ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, result.error || "unknown")
+                            : await updateRecordBatchLedger(payload, "failed", candidate, result.error || "unknown");
                         updateBatchProgress(`失败 ${current}: ${result.error || "unknown"}`);
                         continue;
                     }
@@ -3816,7 +5149,9 @@ async function runRecordBatchUpdateFromPayload(
                         oldRecord,
                     });
                     if (!gate.ok) {
-                        ledger = await updateRecordBatchLedger(payload, "failed", candidate, gate.error);
+                        ledger = schedulerManaged
+                            ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, gate.error)
+                            : await updateRecordBatchLedger(payload, "failed", candidate, gate.error);
                         updateBatchProgress(`失败 ${current}: ${gate.error}`);
                         continue;
                     }
@@ -3833,17 +5168,36 @@ async function runRecordBatchUpdateFromPayload(
                         const abortReason = getRecordTaskAbortReason({ isCancelled, isSettled });
                         if (abortReason) throw new RecordUpdatePoolAbortError(abortReason, permit.snapshot);
                         const existingIndexEntry = (await readRecordsIndexAsync(actualHash)).records[candidate.id];
-                        const metadata: RecordBatchIndexMetadata = {
+                        const metadata = completeRecordMetadata({
                             conversationId: candidate.id,
-                            title: extractTitle(content) || `对话 ${candidate.id.slice(0, 8)}`,
-                            timeSpan: existingIndexEntry?.timeSpan || "",
-                            totalRounds: rounds.length,
+                            content,
+                            rounds: rounds.length,
                             totalSteps,
-                            lastUpdatedRound: result.coveredRounds || rounds.length,
+                            coveredRounds: result.coveredRounds || rounds.length,
                             phases,
                             tags: result.tags ?? existingIndexEntry?.tags ?? [],
                             chain: loaded.chainUsed || payload.dataChain || existingIndexEntry?.chain,
-                        };
+                            timeSpan: existingIndexEntry?.timeSpan,
+                            coveredRevisionSequence: frozenSource?.snapshot.sourceRevisionSequence,
+                        });
+                        if (schedulerSession) {
+                            const finalized = await finalizeSchedulerLocalRecord(schedulerSession, {
+                                content,
+                                commit: {
+                                    firstPublicationToken: stableFirstPublicationToken(frozenSource!.snapshot),
+                                    recordMeta: metadata,
+                                    hooks: schedulerRecordPersistenceTestHooks(candidate.id),
+                                },
+                            });
+                            if (finalized.kind === "cancelled") throw new RecordUpdatePoolAbortError("cancelled", permit.snapshot);
+                            ledger = projectRecordBatchOutcomeInMemory(ledger, "completed", candidate, undefined, !existingIndexEntry);
+                            try {
+                                await updateRecordBatchLedger(payload, "completed", candidate, undefined, !existingIndexEntry);
+                            } catch (projectionError) {
+                                console.error(`[record-batch] legacy ledger projection failed after scheduler Verified commit for ${candidate.id}: ${projectionError instanceof Error ? projectionError.message : String(projectionError)}`);
+                            }
+                            return true;
+                        }
                         ledger = await markRecordBatchCandidateInFlight(payload, candidate, content, metadata, !existingIndexEntry);
                         candidateInFlight = true;
                         await runRecordPersistenceTestHook("before_write", candidate.id);
@@ -3873,6 +5227,7 @@ async function runRecordBatchUpdateFromPayload(
                     singleFlightPermit?.release();
                 }
             } catch (error) {
+                if (isBackgroundTaskSuspension(error)) throw error;
                 if (error instanceof RecordUpdatePoolAbortError) {
                     updateBatchProgress(`停止 ${current}: ${error.message} | ${formatRecordUpdatePoolDetail(error.snapshot)}`);
                     break;
@@ -3886,29 +5241,152 @@ async function runRecordBatchUpdateFromPayload(
                     ledger = await ensureRecordBatchLedgerAsync(payload);
                     updateBatchProgress(`待恢复 ${current}: ${message}`);
                 } else {
-                    ledger = await updateRecordBatchLedger(payload, "failed", candidate, message);
+                    ledger = schedulerManaged
+                        ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, message)
+                        : await updateRecordBatchLedger(payload, "failed", candidate, message);
                     updateBatchProgress(`失败 ${current}: ${message}`);
                 }
             }
         }
     };
 
-    await Promise.allSettled(
+    const workerSettlements = await Promise.allSettled(
         Array.from({ length: concurrency }, (_, index) => worker(index)),
     );
+    const rejectedWorker = workerSettlements.find(
+        (settlement): settlement is PromiseRejectedResult => settlement.status === "rejected",
+    );
+    if (rejectedWorker) throw rejectedWorker.reason;
 
-    ledger = await ensureRecordBatchLedgerAsync(payload);
-    pending = pendingRecordBatchCandidates(payload, ledger);
+    if (!schedulerManaged) {
+        ledger = await ensureRecordBatchLedgerAsync(payload);
+        pending = pendingRecordBatchCandidates(payload, ledger);
+    }
     const out = buildRecordBatchResultText(ledger, total, (Date.now() - taskStartMs) / 1000, resumeSummary, poolSummary, payload.diagnostics, grokSummary);
     console.error(`[batch] ${out}`);
     return out;
 }
 
+interface ReadonlySchedulerBatchCandidate {
+    readonly source: {
+        readonly host: SourceEvidenceHost;
+        readonly identity: {
+            readonly conversationId: string;
+            readonly workspace: { readonly workspaceId: string; readonly canonicalPath: string | null };
+        };
+    };
+    readonly sourceRevision: { readonly sequence: number | null } | null;
+    readonly discoveredAtSequence: number;
+    readonly classification: string;
+}
+
+interface ReadonlySchedulerBatchSnapshot {
+    readonly candidates: readonly { readonly classification: string }[];
+    readonly sourceEnumerations: readonly {
+        readonly evidence: { readonly pagination: { readonly truncated: boolean } };
+    }[];
+}
+
+function recordBatchReadyPayloadFromScheduler(
+    payload: RecordBatchPreparingResumePayload,
+    snapshot: ReadonlySchedulerBatchSnapshot,
+    candidates: readonly ReadonlySchedulerBatchCandidate[],
+    frozenSources: FrozenRuntimeSourceSet,
+): RecordBatchReadyResumePayload {
+    if (frozenSources.phase !== "sealed") {
+        throw new RecordBatchLedgerRepairRequiredError(payload.resumeKey, "scheduler source materialization 尚未 sealed");
+    }
+    const selectedKeys = new Set([
+        ...frozenSources.sources.map(source => frozenRuntimeSourceKey(source.snapshot)),
+        ...frozenSources.unresolved.map(source => `${source.chain}\u0000${source.workspaceHash}\u0000${source.conversationId}`),
+    ]);
+    const selected = candidates.filter(candidate => selectedKeys.has(frozenRuntimeSourceKey({
+        chain: candidate.source.host,
+        workspaceHash: candidate.source.identity.workspace.workspaceId,
+        conversationId: candidate.source.identity.conversationId,
+    })));
+    if (selected.length !== frozenSources.selectedCount || selectedKeys.size !== frozenSources.selectedCount) {
+        throw new RecordBatchLedgerRepairRequiredError(payload.resumeKey, "scheduler frozen source set 与 CandidateSnapshot selected set 不一致");
+    }
+    const ready = recordBatchReadyPayloadFromSelectedCandidates(payload, snapshot, selected);
+    return {
+        ...ready,
+        diagnostics: {
+            scanned: snapshot.candidates.length,
+            eligible: candidates.length,
+            selected: selected.length,
+            truncated: Math.max(0, candidates.length - selected.length),
+            conflicts: snapshot.candidates.filter(candidate => candidate.classification === "Conflict").length,
+            sourceEnumerationLimited: snapshot.sourceEnumerations.some(envelope => envelope.evidence.pagination.truncated),
+            workspaceUnresolved: 0,
+        },
+        ...(frozenSources.selectionHash ? { sourceSelectionHash: frozenSources.selectionHash } : {}),
+    };
+}
+
+function recordBatchReadyPayloadFromSelectedCandidates(
+    payload: RecordBatchPreparingResumePayload,
+    snapshot: ReadonlySchedulerBatchSnapshot,
+    selected: readonly ReadonlySchedulerBatchCandidate[],
+): RecordBatchReadyResumePayload {
+    const frozen = selected.map((candidate): FrozenBatchConversationCandidate => {
+        const workspace = candidate.source.identity.workspace.canonicalPath || payload.request.workspace;
+        if (!workspace) {
+            throw new RecordBatchLedgerRepairRequiredError(
+                payload.resumeKey,
+                `scheduler 候选 ${candidate.source.identity.conversationId} 缺少可执行 workspace`,
+            );
+        }
+        let selectionKind: RecordBatchSelectionKind;
+        if (candidate.classification === "Stale") selectionKind = "stale";
+        else if (candidate.classification === "Missing") selectionKind = "missing";
+        else if (candidate.classification === "Fresh") selectionKind = "fresh";
+        else {
+            throw new RecordBatchLedgerRepairRequiredError(
+                payload.resumeKey,
+                `scheduler 候选 ${candidate.source.identity.conversationId} 状态 ${candidate.classification} 不可执行`,
+            );
+        }
+        return {
+            id: candidate.source.identity.conversationId,
+            workspace,
+            workspaceHash: candidate.source.identity.workspace.workspaceId,
+            chain: candidate.source.host,
+            lastModifiedMs: Math.max(0, candidate.sourceRevision?.sequence ?? candidate.discoveredAtSequence),
+            selectionKind,
+            refreshExisting: selectionKind !== "missing",
+        };
+    });
+    return {
+        ...readyRecordBatchPayload(payload, frozen, {
+            scanned: snapshot.candidates.length,
+            eligible: selected.length,
+            selected: frozen.length,
+            truncated: 0,
+            conflicts: snapshot.candidates.filter(candidate => candidate.classification === "Conflict").length,
+            sourceEnumerationLimited: snapshot.sourceEnumerations.some(envelope => envelope.evidence.pagination.truncated),
+            workspaceUnresolved: 0,
+        }),
+    };
+}
+
+function schedulerLegacyBatchStateValidator(
+    payload: RecordBatchPreparingResumePayload,
+    selector: "normal" | "force" | "stale_only",
+): (snapshot?: ReadonlySchedulerBatchSnapshot) => Promise<void> {
+    return async snapshot => {
+        if (!snapshot) throw new RecordBatchLedgerRepairRequiredError(payload.resumeKey, "scheduler legacy boundary 缺少 CandidateSnapshot");
+        const selected = getRecordSchedulerRuntime().selectDiscoveryCandidates(snapshot as never, selector) as readonly ReadonlySchedulerBatchCandidate[];
+        await validateLegacyRecordBatchLedgerForScheduler(recordBatchReadyPayloadFromSelectedCandidates(payload, snapshot, selected));
+    };
+}
+
 async function handleBatchUpdate(
     _hash: string,
-    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; stale_only?: boolean; workspace?: string; waitSeconds?: number; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
+    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; stale_only?: boolean; workspace?: string; waitSeconds?: number; background?: boolean; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
     startMs: number,
 ) {
+    await waitForRecordMutationReadiness();
     const actionName: "batch_update" | "bulk_update" = args.action === "bulk_update" ? "bulk_update" : "batch_update";
     const batchChains = resolveChainSplit({ chain: args.chain, dataChain: args.dataChain, modelChain: args.modelChain });
     const requestedDataChain = batchChains.dataChain;
@@ -3918,38 +5396,97 @@ async function handleBatchUpdate(
         return rt(`❌ 指定 dataChain ${requestedDataChain} 当前不可用`, startMs);
     }
 
+    const request = {
+        ...(args.after !== undefined ? { after: args.after } : {}),
+        ...(args.before !== undefined ? { before: args.before } : {}),
+        ...(args.limit !== undefined ? { limit: args.limit } : {}),
+        ...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
+    };
+    const requestSummary = {
+        operation: "record-batch-update",
+        actionName,
+        workspaceHash: _hash,
+        dataChain: resolvedChain,
+        modelChain: requestedModelChain,
+        force: args.force === true,
+        staleOnly: args.stale_only === true,
+        request,
+    };
+    const requestKey = recordSchedulerRequestKey("record-batch-update", requestSummary);
     const resumePayload: RecordBatchPreparingResumePayload = {
         kind: "record-batch-update",
         actionName,
-        resumeKey: makeRecordBatchResumeKey(),
+        resumeKey: `scheduler-${requestKey.slice("record-batch-update:".length)}`,
+        workspaceHash: _hash,
         dataChain: resolvedChain,
         modelChain: requestedModelChain,
         ...(args.force !== undefined ? { force: args.force } : {}),
         ...(args.stale_only !== undefined ? { stale_only: args.stale_only } : {}),
         phase: "preparing",
-        request: {
-            ...(args.after !== undefined ? { after: args.after } : {}),
-            ...(args.before !== undefined ? { before: args.before } : {}),
-            ...(args.limit !== undefined ? { limit: args.limit } : {}),
-            ...(args.workspace !== undefined ? { workspace: args.workspace } : {}),
-        },
+        request,
     };
-
-    const task = startBackgroundTask("record-batch-update", async ({ updateProgress, isCancelled, isSettled }) => (
-        prepareAndRunRecordBatchUpdate(resumePayload, updateProgress, isCancelled, isSettled)
-    ), {
-        timeoutMessage: RECORD_BATCH_TIMEOUT_MESSAGE,
-        resumePayload,
+    const runtime = getRecordSchedulerRuntime();
+    const discoveryRequest = buildRecordSchedulerDiscoveryRequest({
+        kind: "record-batch-update",
+        selector: args.stale_only ? "stale_only" : args.force ? "force" : "normal",
+        hash: _hash,
+        workspace: args.workspace,
+        dataChain: requestedDataChain,
+        limit: recordBatchDiscoveryScanLimit(args.force),
+        selectionLimit: effectiveRecordBatchLimit(args.limit, args.force),
+        after: args.after,
+        before: args.before,
     });
-
-    return r([
-        `🚀 ${actionName} 已转入后台任务（候选准备与更新均在后台执行）`,
-        `🆔 taskId: ${task.id}`,
+    const admission = await runtime.admit({
+        kind: "record-batch-update",
+        requestKey,
+        requestSummary,
+        resumePayload,
+        requestMode: args.stale_only ? "stale_only" : args.force ? "force" : "normal",
+        backgroundProjection: { background: args.background !== false, actionName },
+        replayTerminal: false,
+        discovery: discoveryRequest,
+        validateLegacyState: schedulerLegacyBatchStateValidator(
+            resumePayload,
+            args.stale_only ? "stale_only" : args.force ? "force" : "normal",
+        ),
+        execute: async ({ taskId, updateProgress, isCancelled, isSettled }, discovery, sourceSnapshots) => {
+            if (!sourceSnapshots || sourceSnapshots.phase !== "sealed" || !discovery) {
+                throw new RecordSchedulerRepairRequiredError("scheduler-managed batch 缺少 sealed frozen source set");
+            }
+            const readyResumePayload = recordBatchReadyPayloadFromScheduler(
+                resumePayload,
+                discovery,
+                runtime.selectDiscoveryCandidates(discovery, discoveryRequest.selector),
+                sourceSnapshots,
+            );
+            return runRecordBatchUpdateFromPayload(readyResumePayload, updateProgress, isCancelled, isSettled, sourceSnapshots, {
+                taskId,
+                frozenSources: sourceSnapshots,
+                runtime,
+            });
+        },
+    });
+    if (admission.outcome === "UnknownOutcome") {
+        return rt([
+            `⚠️ ${actionName} scheduler 接纳结果未确定，未返回成功 taskId`,
+            `候选 ledger: ${admission.candidateTaskIds.join(", ") || "无"}`,
+            `原因: ${admission.reasons.join("; ") || "未知"}`,
+        ].join("\n"), startMs);
+    }
+    if (args.background === false) {
+        const status = await runtime.waitForTerminal(admission.taskId);
+        const persistedTask = await waitForBackgroundTask(admission.taskId, 1);
+        return rt(persistedTask?.result || formatRecordSchedulerTaskStatus(status, persistedTask?.error), startMs);
+    }
+    return rt([
+        `🚀 ${actionName} 已由 Record scheduler 接纳（候选、来源与提交均由 scheduler ledger 驱动）`,
+        `🆔 taskId: ${admission.taskId}`,
         `🔗 dataChain: ${resolvedChain}`,
         `🤖 modelChain: ${requestedModelChain}`,
         `🧷 resumeKey: ${resumePayload.resumeKey}`,
-        "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询进度",
-    ].join("\n"));
+        "💡 后续调用 record_manage(action=\"task_status\", taskId=\"...\") 查询账本状态",
+    ].join("\n"), startMs);
 }
 
 // ============= 辅助 =============

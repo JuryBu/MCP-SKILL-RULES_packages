@@ -1,5 +1,6 @@
 param(
-    [switch]$IncludeWindsurfSubagent
+    [switch]$IncludeWindsurfSubagent,
+    [switch]$IncludeNapCat
 )
 
 $ErrorActionPreference = "Stop"
@@ -9,6 +10,9 @@ $mcpRoot = Join-Path $toolkitRoot "mcps"
 $components = @("memory-store", "web-fetcher", "sandbox", "broker")
 if ($IncludeWindsurfSubagent) {
     $components += "mcp-subagent"
+}
+if ($IncludeNapCat) {
+    $components += "napcat-mcp"
 }
 
 function Require-Command($name) {
@@ -42,9 +46,14 @@ foreach ($name in $components) {
         throw "Missing package.json for component: $name"
     }
 
-    Write-Output "Installing dependencies: $name"
+    Write-Output "Installing/checking component: $name"
     Push-Location $dir
     try {
+        if ($name -eq "napcat-mcp") {
+            Invoke-NpmChecked @("run", "check")
+            Invoke-NpmChecked @("test")
+            continue
+        }
         if (Test-Path -LiteralPath (Join-Path $dir "package-lock.json")) {
             Invoke-NpmChecked @("ci")
         } else {

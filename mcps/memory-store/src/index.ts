@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.17.3
+ * MCP Memory Store Server v1.21.1
  *
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。
@@ -37,7 +37,17 @@ import { cleanupRegistryOnExit } from "./ls-registry.js";
 import { VERSION } from "./version.js";
 import { GUIDE_TEXT } from "./guide-text.js";
 import { installToolConcurrency } from "./tool-concurrency.js";
-import { cleanOldTasks, scanOrphanedTasks } from "./background-tasks.js";
+import { cleanOldTasks, runBackgroundTaskStartupRecovery } from "./background-tasks.js";
+import {
+    assertRecordMutationStartupRecoverySafe,
+    recordMutationReadinessBarrier,
+} from "./record-startup-barrier.js";
+import { initializeProviderControlStore, readProviderControlStore } from "./provider-control-store.js";
+import { getProviderTransportAdapter } from "./provider-transport-adapter.js";
+import {
+    closeRecordSchedulerProductionSessions,
+    type RecordSchedulerProductionSessionsHandoff,
+} from "./record-scheduler-production-pump.js";
 
 // 工具注册
 import { registerWrite } from "./tools/write.js";
@@ -56,14 +66,75 @@ import { registerBackgroundTask } from "./tools/background-task.js";
 // === 进程生命周期 ===
 let isClosing = false; // 防止重复清理
 
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 12_000;
+const DEFAULT_SCHEDULER_SHUTDOWN_TIMEOUT_MS = 4_000;
+const DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS = 6_000;
+const DEFAULT_LEGACY_CLEANUP_TIMEOUT_MS = 1_000;
+
+type ShutdownStepResult<Value> =
+    | { kind: "completed"; value: Value }
+    | { kind: "timed-out"; timeoutMs: number }
+    | { kind: "failed"; error: unknown };
+
+function shutdownTimeoutFromEnv(name: string, fallback: number, minimum = 0): number {
+    const raw = process.env[name];
+    if (raw === undefined) return fallback;
+    const parsed = Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed >= minimum) return parsed;
+    console.error(`[memory-store] 忽略无效的 ${name}=${JSON.stringify(raw)}，使用 ${fallback}ms`);
+    return fallback;
+}
+
+function remainingShutdownMs(deadlineAt: number, capMs: number): number {
+    return Math.max(0, Math.min(capMs, deadlineAt - Date.now()));
+}
+
+async function waitForShutdownStep<Value>(
+    operation: Promise<Value>,
+    deadlineAt: number,
+    capMs: number,
+): Promise<ShutdownStepResult<Value>> {
+    const timeoutMs = remainingShutdownMs(deadlineAt, capMs);
+    let timer: NodeJS.Timeout | undefined;
+    try {
+        return await Promise.race<ShutdownStepResult<Value>>([
+            operation.then(
+                value => ({ kind: "completed", value }) as const,
+                error => ({ kind: "failed", error }) as const,
+            ),
+            new Promise<ShutdownStepResult<Value>>(resolve => {
+                timer = setTimeout(() => resolve({ kind: "timed-out", timeoutMs }), timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) clearTimeout(timer);
+    }
+}
+
+function logSchedulerHandoff(handoff: RecordSchedulerProductionSessionsHandoff): void {
+    console.error(`[memory-store] shutdown scheduler handoff ${JSON.stringify({
+        acceptingDispatches: handoff.acceptingDispatches,
+        closed: handoff.closed,
+        timedOut: handoff.timedOut,
+        active: handoff.activePendingAttemptIds,
+        invoking: handoff.invokingAttemptIds,
+        persisted: handoff.persisted,
+    })}`);
+}
+
+function logShutdownStepFailure(name: string, result: Extract<ShutdownStepResult<unknown>, { kind: "failed" }>): void {
+    const message = result.error instanceof Error ? result.error.stack || result.error.message : String(result.error);
+    console.error(`[memory-store] shutdown ${name} failed: ${message}`);
+}
+
 /**
  * 统一的优雅退出路径：合并 SIGINT/SIGTERM/beforeExit 类信号、stdin end/close/error、
  * 心跳确认父进程死亡、重复实例让位、非 LS 空闲兜底等多条退出分支里逐字重复的
- * 「isClosing 守卫 + cleanupRegistryOnExit() + await cleanup() + process.exit(0)」尾部。
+ * 「isClosing 守卫 + scheduler/provider handoff + legacy cleanup + process.exit()」尾部。
  *
  * - logBeforeCleanup：各分支专属日志（在 isClosing 守卫通过后、清理前执行，与原行为时序一致；
  *   重复触发时守卫先拦截，不会再打印日志，保持原「早 return 不打日志」语义）。
- * - diagnose：可选诊断钩子，仅 stdin end 用它保留「cleanupRegistryOnExit 后等 3s 再二次探测父 LS」特例。
+ * - diagnose：可选诊断钩子，仅 stdin end 用它保留二次探测父 LS；它也受统一退出 deadline 限制。
  */
 async function gracefulExit(
     logBeforeCleanup?: () => void,
@@ -72,10 +143,73 @@ async function gracefulExit(
     if (isClosing) return;
     isClosing = true;
     logBeforeCleanup?.();
+
+    const shutdownTimeoutMs = shutdownTimeoutFromEnv("MEMORY_STORE_SHUTDOWN_TIMEOUT_MS", DEFAULT_SHUTDOWN_TIMEOUT_MS, 1);
+    const schedulerTimeoutMs = shutdownTimeoutFromEnv(
+        "MEMORY_STORE_SCHEDULER_SHUTDOWN_TIMEOUT_MS",
+        DEFAULT_SCHEDULER_SHUTDOWN_TIMEOUT_MS,
+    );
+    const providerTimeoutMs = shutdownTimeoutFromEnv(
+        "MEMORY_STORE_PROVIDER_SHUTDOWN_TIMEOUT_MS",
+        DEFAULT_PROVIDER_SHUTDOWN_TIMEOUT_MS,
+    );
+    const legacyCleanupTimeoutMs = shutdownTimeoutFromEnv(
+        "MEMORY_STORE_LEGACY_CLEANUP_TIMEOUT_MS",
+        DEFAULT_LEGACY_CLEANUP_TIMEOUT_MS,
+    );
+    const deadlineAt = Date.now() + shutdownTimeoutMs;
+    let exitCode = 0;
+
+    console.error(`[memory-store] shutdown scheduler close begin; totalTimeoutMs=${shutdownTimeoutMs}, schedulerTimeoutMs=${schedulerTimeoutMs}`);
+    const schedulerClose = closeRecordSchedulerProductionSessions({
+        timeoutMs: Math.min(schedulerTimeoutMs, shutdownTimeoutMs),
+    });
+
+    // Scheduler 先同步关闭新派发，再立即关闭 provider 入口，避免 legacy 调用在 handoff 等待期继续取得许可。
+    console.error(`[memory-store] shutdown provider close begin; providerTimeoutMs=${providerTimeoutMs}`);
+    const providerClose = getProviderTransportAdapter().close();
+
+    const schedulerResult = await waitForShutdownStep(schedulerClose, deadlineAt, schedulerTimeoutMs);
+    if (schedulerResult.kind === "completed") {
+        logSchedulerHandoff(schedulerResult.value);
+    } else if (schedulerResult.kind === "timed-out") {
+        console.error(`[memory-store] shutdown scheduler close timed out after ${schedulerResult.timeoutMs}ms; handoff unavailable before process exit`);
+    } else {
+        exitCode = 1;
+        logShutdownStepFailure("scheduler close", schedulerResult);
+    }
+
+    const providerResult = await waitForShutdownStep(providerClose, deadlineAt, providerTimeoutMs);
+    if (providerResult.kind === "completed") {
+        console.error("[memory-store] shutdown provider close completed");
+    } else if (providerResult.kind === "timed-out") {
+        console.error(`[memory-store] shutdown provider close timed out after ${providerResult.timeoutMs}ms; invoking RPC is left un-aborted and process exit continues`);
+    } else {
+        exitCode = 1;
+        logShutdownStepFailure("provider close", providerResult);
+    }
+
+    if (diagnose) {
+        const diagnoseResult = await waitForShutdownStep(diagnose(), deadlineAt, remainingShutdownMs(deadlineAt, shutdownTimeoutMs));
+        if (diagnoseResult.kind === "timed-out") {
+            console.error(`[memory-store] shutdown stdin diagnostic timed out after ${diagnoseResult.timeoutMs}ms`);
+        } else if (diagnoseResult.kind === "failed") {
+            exitCode = 1;
+            logShutdownStepFailure("stdin diagnostic", diagnoseResult);
+        }
+    }
+
+    console.error("[memory-store] shutdown legacy cleanup begin");
     cleanupRegistryOnExit();
-    if (diagnose) await diagnose();
-    await cleanup();
-    process.exit(0);
+    const cleanupResult = await waitForShutdownStep(cleanup(), deadlineAt, legacyCleanupTimeoutMs);
+    if (cleanupResult.kind === "timed-out") {
+        console.error(`[memory-store] shutdown legacy cleanup timed out after ${cleanupResult.timeoutMs}ms; process exit continues`);
+    } else if (cleanupResult.kind === "failed") {
+        exitCode = 1;
+        logShutdownStepFailure("legacy cleanup", cleanupResult);
+    }
+    console.error(`[memory-store] shutdown process exit; code=${exitCode}`);
+    process.exit(exitCode);
 }
 
 // 创建 MCP Server 实例
@@ -206,21 +340,31 @@ console.error(`[memory-store] MCP Server v${VERSION} 启动中... (ppid=${proces
     ensureTempDir();
     cleanOldTempFiles();
 
+    const providerControl = await readProviderControlStore();
+    if (providerControl.kind === "repair-required" && providerControl.repair.reason === "first_install_required") {
+        await initializeProviderControlStore({ initialization: "exclusive-install" });
+        console.error("[memory-store] provider control 首次独占初始化完成");
+    } else if (providerControl.kind === "repair-required") {
+        console.error(`[memory-store] provider control 需要修复，模型派发保持阻塞: ${providerControl.repair.reason}`);
+    }
+
+    const startupRecovery = recordMutationReadinessBarrier.start(async () => {
+        const cleanupSummary = cleanOldTasks();
+        const recoverySummary = await runBackgroundTaskStartupRecovery();
+        console.error(
+            `[memory-store] 后台任务恢复扫描完成：generic.scanned=${recoverySummary.generic.scanned}, generic.resumed=${recoverySummary.generic.resumed}, generic.restarted=${recoverySummary.generic.restarted}, generic.error=${recoverySummary.generic.errored}, scheduler.scanned=${recoverySummary.recordScheduler.scanned}, scheduler.rebuilt=${recoverySummary.recordScheduler.rebuilt}, scheduler.repair=${recoverySummary.recordScheduler.repairRequired}, scheduler.unknown=${recoverySummary.recordScheduler.unknownOutcome}; cleanup=${cleanupSummary.deletedTaskIds.length}`,
+        );
+        assertRecordMutationStartupRecoverySafe(recoverySummary);
+    });
+    void startupRecovery.catch(error => {
+        console.error("[memory-store] 后台任务恢复扫描异常，Record 写入保持阻塞:", error);
+    });
+
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
     console.error(`[memory-store] MCP Server v${VERSION} 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
-
-    void Promise.resolve().then(async () => {
-        const cleanupSummary = cleanOldTasks();
-        const recoverySummary = await scanOrphanedTasks();
-        console.error(
-            `[memory-store] 后台任务恢复扫描完成：scanned=${recoverySummary.scanned}, resumed=${recoverySummary.resumed}, restarted=${recoverySummary.restarted}, error=${recoverySummary.errored}, ignored=${recoverySummary.ignored}; cleanup=${cleanupSummary.deletedTaskIds.length}`,
-        );
-    }).catch(error => {
-        console.error("[memory-store] 后台任务恢复扫描异常:", error);
-    });
 
     // === 非 LS 环境兜底超时 ===
     const isLS = await isAntigravityLS();

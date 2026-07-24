@@ -64,7 +64,7 @@ npm run check:live-config
 | --- | --- | --- |
 | `WSF_CONFIG` | `%USERPROFILE%\.codeium\windsurf\mcp_config.json` | Windsurf MCP 配置文件路径 |
 | `WSF_SUBAGENT_KEY` | `subagent` | MCP 服务键名 |
-| `SUBAGENT_DATA_DIR` | `%USERPROFILE%\.codex-toolkit\subagent-data` | registry、审计和归档目录，必须放在包外 |
+| `SUBAGENT_DATA_DIR` | `%USERPROFILE%\.codex-toolkit\mcp-subagent` | registry、审计和归档目录，必须放在包外 |
 | `WSF_CASCADE_HOST` | `127.0.0.1` | Windsurf Language Server 主机 |
 | `WSF_CASCADE_ENDPOINT` | 未设置 | 完整 Cascade HTTP 基地址，可使用 `{port}` 占位符 |
 | `SUBAGENT_CLEANUP_INTERVAL_SEC` | `3600` | 清理检查间隔（秒） |

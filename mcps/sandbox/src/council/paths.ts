@@ -1,10 +1,6 @@
 import fs from "fs";
 import path from "path";
-import { fileURLToPath } from "url";
-
-function packageRoot(): string {
-    return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-}
+import { TEMP_DIR } from "../temp-store.js";
 
 function configuredRuntimeTempRoot(): string | undefined {
     return process.env.SANDBOX_COUNCIL_ANTIGRAVITY_CLI_TEMP_DIR?.trim()
@@ -12,11 +8,7 @@ function configuredRuntimeTempRoot(): string | undefined {
         || undefined;
 }
 
-const configuredDataRoot = process.env.SANDBOX_DATA_ROOT?.trim();
-const defaultRuntimeTempRoot = configuredDataRoot
-    ? path.join(configuredDataRoot, "temp")
-    : path.join(packageRoot(), "sandbox-data", "temp");
-const RUNTIME_TEMP_ROOT = path.resolve(configuredRuntimeTempRoot() || defaultRuntimeTempRoot);
+const RUNTIME_TEMP_ROOT = path.resolve(configuredRuntimeTempRoot() || TEMP_DIR);
 
 function isContainedPath(root: string, candidate: string): boolean {
     const relative = path.relative(root, candidate);

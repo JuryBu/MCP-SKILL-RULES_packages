@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "taskId": "replace-with-training-task-id",
+  "runId": "replace-with-run-id",
+  "intervalMinutes": 30,
+  "summary": "训练进程仍在运行",
+  "progress": "请由训练监督者更新当前进度",
+  "checkpointAt": "请填写最近一次可恢复存档"
+}

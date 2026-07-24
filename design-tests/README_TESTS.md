@@ -12,11 +12,11 @@
 
 检查内容：
 
-- 五个 MCP 源码包存在且 package.json 可读。
+- 六个 MCP 源码包存在且 package.json 可读，包括默认关闭的 NapCat 可选模块。
 - Codex、Antigravity、Claude Code、Windsurf Rules 结构完整。
 - Windsurf 的 global rule 和五个 system rule 分片齐全。
-- 16 个 Skills 均有 `SKILL.md` 且出现在 manifest。
-- 四个 JSON 配置模板能解析。
+- 17 个 Skills 均有 `SKILL.md` 且出现在 manifest。
+- 四宿主 JSON 配置模板与两个 NapCat 示例 JSON 均能解析。
 - 不含绝对用户路径、credential-shaped 文本、数据库、日志、profile、session、构建产物。
 
 ## HTTP Smoke Test
@@ -36,6 +36,8 @@
 ```
 
 Windsurf subagent 不进入通用 smoke，因为真实调用需要登录态并会创建 Cascade 状态。
+
+NapCat 也不进入默认 smoke，因为真实初始化需要接收方自己的 OneBot、QQ 登录、私有 token 和群绑定。配置完成后可运行 `./install/Test-CodexToolkit.ps1 -IncludeNapCatEndpoint`。
 
 ## Local Design Fixtures
 

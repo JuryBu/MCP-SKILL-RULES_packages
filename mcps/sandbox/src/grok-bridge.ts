@@ -1,3 +1,8 @@
+import { spawn, type ChildProcess } from "child_process";
+import fs from "fs";
+import os from "os";
+import path from "path";
+
 export type ProgrokAvailabilityStatus =
     | "ok"
     | "port_not_listening"
@@ -30,6 +35,22 @@ export interface ProgrokCallOptions {
     fallbackModel?: string | false;
 }
 
+export interface ProgrokPatchResult {
+    root: string;
+    filePath: string;
+    patched: boolean;
+    hasPatch: boolean;
+    backupPath?: string;
+    message: string;
+}
+
+export interface ProgrokProxyProcess {
+    started: boolean;
+    pid?: number;
+    process?: ChildProcess;
+    message: string;
+}
+
 export class ProgrokError extends Error {
     code: ProgrokAvailabilityStatus;
     httpStatus?: number;
@@ -50,6 +71,9 @@ export const DEFAULT_PROGROK_FALLBACK_MODEL = (process.env.SANDBOX_PROGROK_FALLB
 const DEFAULT_PROGROK_PROBE_TIMEOUT_MS = Number(process.env.SANDBOX_PROGROK_PROBE_TIMEOUT_MS || 8000);
 const DEFAULT_PROGROK_PROBE_RETRIES = Math.max(0, Math.min(3, Number(process.env.SANDBOX_PROGROK_PROBE_RETRIES ?? 1)));
 const DEFAULT_PROGROK_PROBE_BACKOFF_MS = Number(process.env.SANDBOX_PROGROK_PROBE_BACKOFF_MS || 250);
+const DEFAULT_PROGROK_ROOT = process.env.SANDBOX_PROGROK_ROOT
+    || path.join(os.homedir(), ".progrok");
+
 export function normalizeProgrokReasoningEffort(value: unknown, fallback: ProgrokReasoningEffort = "low"): ProgrokReasoningEffort {
     if (value === "low" || value === "medium" || value === "high") return value;
     return fallback;
@@ -237,4 +261,80 @@ export async function isProgrokAvailable(
         }
     }
     return last || { ok: false, status: "invalid_response", detail: "progrok probe failed without error" };
+}
+
+function resolveProgrokIndex(root = DEFAULT_PROGROK_ROOT): string {
+    return path.join(root, "dist", "index.js");
+}
+
+export function ensureProgrokPatch(opts: { root?: string; patchProgrok?: boolean } = {}): ProgrokPatchResult {
+    const root = opts.root || DEFAULT_PROGROK_ROOT;
+    const filePath = resolveProgrokIndex(root);
+    if (!fs.existsSync(filePath)) {
+        return {
+            root,
+            filePath,
+            patched: false,
+            hasPatch: false,
+            message: "progrok dist/index.js not found",
+        };
+    }
+    const source = fs.readFileSync(filePath, "utf-8");
+    const hasPatch = source.includes("ProxyAgent") && source.includes("HTTP_PROXY");
+    const allowed = opts.patchProgrok || /^(1|true|yes)$/iu.test(process.env.SANDBOX_PROGROK_PATCH || "");
+    if (hasPatch || !allowed) {
+        return {
+            root,
+            filePath,
+            patched: false,
+            hasPatch,
+            message: hasPatch ? "progrok proxy patch detected" : "progrok proxy patch missing; set SANDBOX_PROGROK_PATCH=1 to patch",
+        };
+    }
+
+    const backupPath = `${filePath}.before-sandbox-${new Date().toISOString().replace(/[:.]/gu, "")}`;
+    fs.copyFileSync(filePath, backupPath);
+    const patch = [
+        "import { ProxyAgent, setGlobalDispatcher } from 'undici';",
+        "const sandboxProxy = process.env.HTTPS_PROXY || process.env.HTTP_PROXY;",
+        "if (sandboxProxy) setGlobalDispatcher(new ProxyAgent(sandboxProxy));",
+        "",
+    ].join("\n");
+    fs.writeFileSync(filePath, `${patch}${source}`, "utf-8");
+    return {
+        root,
+        filePath,
+        patched: true,
+        hasPatch: true,
+        backupPath,
+        message: "progrok proxy patch applied",
+    };
+}
+
+export function maybeStartProgrokProxy(opts: { root?: string; proxyEnvBat?: string } = {}): ProgrokProxyProcess {
+    if (!/^(1|true|yes)$/iu.test(process.env.SANDBOX_PROGROK_AUTOSTART || "")) {
+        return { started: false, message: "SANDBOX_PROGROK_AUTOSTART is not enabled" };
+    }
+    const root = opts.root || DEFAULT_PROGROK_ROOT;
+    const proxyEnvBat = opts.proxyEnvBat || path.join(root, "proxy-env.bat");
+    if (!fs.existsSync(root)) {
+        return { started: false, message: `progrok root not found: ${root}` };
+    }
+    const command = process.platform === "win32" && fs.existsSync(proxyEnvBat)
+        ? `call "${proxyEnvBat}" && node dist\\index.js proxy`
+        : "node dist/index.js proxy";
+    const child = spawn(command, {
+        cwd: root,
+        shell: true,
+        detached: true,
+        stdio: "ignore",
+        windowsHide: true,
+    });
+    child.unref();
+    return {
+        started: true,
+        pid: child.pid,
+        process: child,
+        message: `progrok proxy started from ${root}`,
+    };
 }

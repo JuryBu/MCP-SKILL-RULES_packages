@@ -8,18 +8,23 @@ export type ConversationAttachmentKind = "image" | "file";
 export type ConversationAttachmentSource =
     | "codex-data-url"
     | "codex-local-image"
+    | "codex-local-file"
     | "files-mentioned"
     | "antigravity-uri"            // 复用：反重力工具结果里的 file:// / 本地路径图
     | "antigravity-tool-image"     // 新增：反重力工具结果 base64 内嵌截图（需 materialize）
+    | "antigravity-raw-attachment"
     | "claude-code-data-url"
     | "claude-code-local-file"
-    | "windsurf-data-url";
+    | "windsurf-data-url"
+    | "windsurf-media-attachment"
+    | "attachment-metadata-redacted";
 
 export interface ConversationAttachment {
     kind: ConversationAttachmentKind;
     source: ConversationAttachmentSource;
     name?: string;
     mimeType?: string;
+    reference?: string;
     originalPath?: string;
     dataUrl?: string;
     sizeBytes?: number;

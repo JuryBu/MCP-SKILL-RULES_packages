@@ -1,8 +1,8 @@
-export const CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "grok"] as const;
-export const CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "grok"] as const;
+export const CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "grok", "agy"] as const;
+export const CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "grok", "agy"] as const;
 export const DATA_CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "windsurf"] as const;
 export const DATA_CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf"] as const;
-export const CHAIN_COMPAT_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf", "grok"] as const;
+export const CHAIN_COMPAT_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf", "grok", "agy"] as const;
 
 export type Chain = typeof CHAIN_VALUES[number];
 export type ChainInput = typeof CHAIN_INPUT_VALUES[number];
@@ -39,15 +39,23 @@ export function isGrokAlias(input: unknown): boolean {
     return value === "grok";
 }
 
+export function isAgyAlias(input: unknown): boolean {
+    const value = String(input || "").trim().toLowerCase();
+    return value === "agy";
+}
+
 export function assertValidModelChainInput(input: unknown, parameterName = "modelChain"): void {
     if (isWindsurfAlias(input)) {
-        throw new Error(`${parameterName} 不支持 windsurf/wsf：Windsurf 只提供对话数据链路。请使用 dataChain="windsurf"，并把 modelChain 设为 auto|antigravity|codex|claude-code|cc|grok`);
+        throw new Error(`${parameterName} 不支持 windsurf/wsf：Windsurf 只提供对话数据链路。请使用 dataChain="windsurf"，并把 modelChain 设为 auto|antigravity|codex|claude-code|cc|grok|agy`);
     }
 }
 
 export function assertValidDataChainInput(input: unknown, parameterName = "dataChain"): void {
     if (isGrokAlias(input)) {
         throw new Error(`${parameterName} 不支持 grok：Grok 只提供模型链路。请使用 modelChain="grok"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf`);
+    }
+    if (isAgyAlias(input)) {
+        throw new Error(`${parameterName} 不支持 agy：agy CLI 只提供模型链路。请使用 modelChain="agy"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf`);
     }
 }
 
@@ -74,13 +82,15 @@ export function normalizeDataChain(input: DataChainInput | ChainInput | string |
  * - dataChain defaults to chain.
  * - modelChain defaults to chain.
  * - chain="windsurf"/"wsf" only affects dataChain; modelChain falls back to auto.
- * - chain="grok" only affects modelChain; dataChain falls back to auto.
+ * - chain="grok"/"agy" only affects modelChain; dataChain falls back to auto.
  */
 export function resolveChainSplit(input: ChainSplitInput = {}): ChainSplit {
     assertValidModelChainInput(input.modelChain, "modelChain");
     assertValidDataChainInput(input.dataChain, "dataChain");
     const chain = normalizeChain(input.chain);
-    const dataFallback = isGrokAlias(input.chain) ? DEFAULT_CHAIN : normalizeDataChain(input.chain, chain === "grok" ? DEFAULT_CHAIN : chain);
+    const dataFallback = isGrokAlias(input.chain) || isAgyAlias(input.chain)
+        ? DEFAULT_CHAIN
+        : normalizeDataChain(input.chain, chain === "grok" || chain === "agy" ? DEFAULT_CHAIN : chain);
     return {
         chain,
         dataChain: normalizeDataChain(input.dataChain, dataFallback),

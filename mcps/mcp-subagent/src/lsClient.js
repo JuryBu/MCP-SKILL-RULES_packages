@@ -2,13 +2,6 @@ import { discoverLanguageServerCandidates } from "./auth.js";
 
 const SERVICE = "exa.language_server_pb.LanguageServerService";
 
-function languageServerBaseUrl(port) {
-  const endpoint = process.env.WSF_CASCADE_ENDPOINT;
-  if (endpoint) return endpoint.replace(/\/$/, "").replace("{port}", String(port));
-  const host = process.env.WSF_CASCADE_HOST || "127.0.0.1";
-  return `http://${host}:${port}`;
-}
-
 function withTimeout(ms) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), ms);
@@ -18,7 +11,7 @@ function withTimeout(ms) {
 export async function callLanguageServer({ port, csrf, method, payload = {}, timeoutMs = 10000 }) {
   const { controller, timer } = withTimeout(timeoutMs);
   try {
-    const response = await fetch(`${languageServerBaseUrl(port)}/${SERVICE}/${method}`, {
+    const response = await fetch(`http://127.0.0.1:${port}/${SERVICE}/${method}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",

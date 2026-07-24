@@ -1,4 +1,5 @@
 import { execSync, execFileSync } from "child_process";
+import { createHash } from "node:crypto";
 import path from "path";
 import os from "os";
 import fs from "fs";
@@ -15,6 +16,7 @@ import {
     HEAVY_TIMEOUT,
     LIGHT_TIMEOUT,
 } from "./ls-rpc.js";
+import type { FailureClass } from "./record-scheduler-contracts.js";
 import {
     resolveEndpointForConversation,
     enumerateActiveLs,
@@ -23,6 +25,22 @@ import {
     getCurrentContext,
     type RouterEndpoint,
 } from "./conversation-router.js";
+import {
+    SOURCE_EVIDENCE_ADAPTER_VERSION,
+    buildExactFetchEvidence,
+    buildFullSourceReadEvidence,
+    buildRecordSourceSnapshot,
+    buildSourceEnumerationEvidence,
+    type ExactFetchEvidence,
+    type ExactFetchResult,
+    type FullSourceReadEvidence,
+    type RecordSourceSnapshot,
+    type SourceConversationIdentity,
+    type SourceEvidenceIssue,
+    type SourceEvidenceIssueCode,
+    type SourceEnumerationEvidence,
+    type SourceRevision,
+} from "./source-evidence-contracts.js";
 
 export type { LsProcessInfo } from "./ls-rpc.js";
 
@@ -647,6 +665,100 @@ async function fetchFromLs(
  * 轻量级：只拉第一页 steps（用于快速检测工作区，不拉全量数据）
  * 比 fetchTrajectory 快很多（1-3s vs 10-30s）
  */
+export interface AntigravityLiveConversationListing {
+    ids: string[];
+    endpointIds: string[];
+    eventWatermarks: Record<string, string | null>;
+}
+
+export interface AntigravityLiveConversationFetch {
+    trajectory: { steps: any[] };
+    endpointId: string;
+    eventWatermark: string | null;
+}
+
+interface AntigravityLiveLsConnection {
+    info: LsProcessInfo;
+    port: number;
+    endpointId: string;
+}
+
+async function resolveAntigravityLiveLsConnections(): Promise<AntigravityLiveLsConnection[]> {
+    const connections = new Map<string, AntigravityLiveLsConnection>();
+    const add = (info: LsProcessInfo, port: number) => {
+        const endpointId = `${info.pid}:${port}`;
+        connections.set(endpointId, { info, port, endpointId });
+    };
+    if (parentLs) add(parentLs.info, parentLs.port);
+    try {
+        for (const endpoint of await enumerateActiveLs("antigravity")) {
+            add({
+                pid: endpoint.pid,
+                csrfToken: endpoint.csrfToken,
+                workspaceId: endpoint.workspaceId ?? "",
+                ports: [endpoint.port],
+            }, endpoint.port);
+        }
+    } catch (error) {
+        if (connections.size === 0) throw error;
+    }
+    if (connections.size === 0) throw new Error("没有可用的 Antigravity Language Server endpoint");
+    return [...connections.values()].sort((left, right) => left.endpointId.localeCompare(right.endpointId, "en"));
+}
+
+function antigravityLiveTrajectorySummaries(value: unknown): Record<string, any> {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("Antigravity LS GetAllCascadeTrajectories 返回缺少 trajectorySummaries");
+    }
+    const summaries = (value as Record<string, unknown>).trajectorySummaries;
+    if (!summaries || typeof summaries !== "object" || Array.isArray(summaries)) {
+        throw new Error("Antigravity LS GetAllCascadeTrajectories 返回无效 trajectorySummaries");
+    }
+    return summaries as Record<string, any>;
+}
+
+export async function listLiveAntigravityConversationIds(): Promise<AntigravityLiveConversationListing> {
+    const connections = await resolveAntigravityLiveLsConnections();
+    const ids = new Set<string>();
+    const eventWatermarks: Record<string, string | null> = {};
+    for (const connection of connections) {
+        const result = await rpcCall(connection.info, connection.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+        for (const [id, summary] of Object.entries(antigravityLiveTrajectorySummaries(result.data))) {
+            ids.add(id);
+            const watermark = typeof summary?.lastModifiedTime === "string" ? summary.lastModifiedTime : null;
+            if (eventWatermarks[id] === undefined) eventWatermarks[id] = watermark;
+            else if (eventWatermarks[id] !== watermark) throw new Error(`Antigravity LS 对话 ${id} 的 lastModifiedTime 不一致`);
+        }
+    }
+    return {
+        ids: [...ids].sort((left, right) => left.localeCompare(right, "en")),
+        endpointIds: connections.map(connection => connection.endpointId),
+        eventWatermarks,
+    };
+}
+
+export async function fetchLiveAntigravityConversation(cascadeId: string): Promise<AntigravityLiveConversationFetch | null> {
+    const connections = await resolveAntigravityLiveLsConnections();
+    for (const connection of connections) {
+        const result = await rpcCall(connection.info, connection.port, "GetAllCascadeTrajectories", {}, LIGHT_TIMEOUT);
+        const summary = antigravityLiveTrajectorySummaries(result.data)[cascadeId];
+        if (!summary) continue;
+        const declaredStepCount = Number.isSafeInteger(summary.stepCount) && summary.stepCount >= 0
+            ? summary.stepCount
+            : undefined;
+        const steps = await fetchAllStepsPaged(connection.info, connection.port, cascadeId, declaredStepCount);
+        if (declaredStepCount !== undefined && steps.length !== declaredStepCount) {
+            throw new Error(`Antigravity LS ${connection.endpointId} 对话 ${cascadeId} 的步骤数量不一致`);
+        }
+        return {
+            trajectory: { steps },
+            endpointId: connection.endpointId,
+            eventWatermark: typeof summary.lastModifiedTime === "string" ? summary.lastModifiedTime : null,
+        };
+    }
+    return null;
+}
+
 export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | null> {
     // 尝试从单个 LS 拉第一页
     const tryLs = async (info: LsProcessInfo, port: number): Promise<any[] | null> => {
@@ -682,11 +794,7 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
 
 // ===== 辅助 =====
 
-const CONV_CACHE_DIR = path.join(
-    process.env.MEMORY_STORE_DATA_ROOT
-        || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store"),
-    "temp",
-);
+const CONV_CACHE_DIR = path.join(os.homedir(), ".gemini", "antigravity", "memory-store", "temp");
 
 /** 测试注入的缓存目录覆盖（null=用真实目录） */
 let convCacheDirOverride: string | null = null;
@@ -947,6 +1055,16 @@ export function readVscdbTitles(): Map<string, { summary: string; steps: number 
     return result;
 }
 
+export function readVscdbTitlesFresh(): Map<string, { summary: string; steps: number | null }> {
+    const cached = _vscdbCache;
+    _vscdbCache = null;
+    try {
+        return readVscdbTitles();
+    } finally {
+        _vscdbCache = cached;
+    }
+}
+
 /**
  * 列出对话，带 mtime 筛选 + vscdb 有效性验证（用于批量 Record 更新）
  */
@@ -989,7 +1107,7 @@ export function listConversationsByMtime(opts: {
 /**
  * 从已拉取的 steps 数据中提取 workspaceUri
  * 扫描所有 USER_INPUT step 的 activeUserState.openDocuments[].workspaceUri
- * 返回去 URI 化后的本地路径，如 "c:/workspace/project"
+ * 返回去 URI 化后的本地路径，如 "c:/example/<user>/Desktop/比赛"
  */
 export function detectWorkspaceFromSteps(steps: any[]): string | null {
     for (const step of steps) {
@@ -998,7 +1116,7 @@ export function detectWorkspaceFromSteps(steps: any[]): string | null {
         for (const doc of docs) {
             const ws = doc?.workspaceUri;
             if (typeof ws === "string" && ws.startsWith("file:///")) {
-                // file:///c:/workspace/... → c:/workspace/...
+                // file:///c:/example/<user>/... → c:/example/<user>/...
                 const decoded = decodeURIComponent(ws.replace("file:///", ""));
                 if (decoded && decoded.length > 3) return decoded;
             }
@@ -1054,11 +1172,18 @@ async function callGetModelResponseOn(
     prompt: string,
     timeout: number
 ): Promise<string | null> {
+    let lastHttpFailure: number | undefined;
+    let receivedSuccessfulResponse = false;
     for (const candidate of getLsModelCandidates(model)) {
         const result = await rpcCall(info, port, "GetModelResponse", {
             model: candidate,
             prompt,
         }, timeout);
+        if (result.status !== 200) {
+            lastHttpFailure = result.status;
+            continue;
+        }
+        receivedSuccessfulResponse = true;
         const text = result.data?.response ?? null;
         if (text) {
             if (candidate !== model) {
@@ -1066,6 +1191,9 @@ async function callGetModelResponseOn(
             }
             return text;
         }
+    }
+    if (!receivedSuccessfulResponse && lastHttpFailure !== undefined) {
+        throw new Error(`GetModelResponse HTTP ${lastHttpFailure}`);
     }
     return null;
 }
@@ -1077,6 +1205,7 @@ export interface LsModelResult {
     /** true 仅表示「真超时」（wall-clock 兜底或 socket inactivity 超时）；
      *  连接被拒 / 进程死 / 空响应等普通失败一律 false，仍可由上层重试或换候选。 */
     timedOut?: boolean;
+    failureClass?: FailureClass;
 }
 
 /** 哨兵错误：wall-clock 兜底超时（区别于 socket "Request timeout"）。 */
@@ -1136,9 +1265,11 @@ export async function callGetModelResponseDetailed(
     timeoutMs?: number,
 ): Promise<LsModelResult> {
     const timeout = timeoutMs || LIGHT_TIMEOUT;
+    let attemptedLsCall = false;
     try {
         const text = await withWallClockTimeout((async () => {
             if (parentLs) {
+                attemptedLsCall = true;
                 return await callGetModelResponseOn(parentLs.info, parentLs.port, model, prompt, timeout);
             }
 
@@ -1147,25 +1278,654 @@ export async function callGetModelResponseDetailed(
             if (lsInfo) {
                 const port = await findHttpPort(lsInfo);
                 if (port) {
+                    attemptedLsCall = true;
                     return await callGetModelResponseOn(lsInfo, port, model, prompt, timeout);
                 }
             }
 
             const fallback = await findFallbackLsConnection();
             if (!fallback) return null;
+            attemptedLsCall = true;
             return await callGetModelResponseOn(fallback.info, fallback.port, model, prompt, timeout);
         })(), timeout);
 
         if (text) return { text };
-        // 模型返回空：普通失败（非超时），上层可重试 / 换候选。
-        return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false };
+        if (attemptedLsCall) {
+            return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false, failureClass: "Quality" };
+        }
+        return { text: null, error: "Antigravity LS 连接或进程不可用", timedOut: false, failureClass: "Availability" };
     } catch (err: any) {
         const timedOut = isTimeoutError(err);
         const message = err === LS_WALL_CLOCK_TIMEOUT
             ? `Antigravity LS 模型调用超时（${timeout}ms）`
             : (err?.message ? `Antigravity LS 模型调用失败: ${err.message}` : "Antigravity LS 模型调用失败");
-        return { text: null, error: message, timedOut };
+        return { text: null, error: message, timedOut, failureClass: "Availability" };
     }
+}
+
+export type AntigravityEvidenceCacheState = "bypassed" | "used" | "stale";
+export type AntigravityEvidenceFailureCode = "missing" | "parse" | "timeout" | "permission" | "cache" | "unavailable" | "io";
+
+export interface AntigravityEvidenceFailure {
+    code: AntigravityEvidenceFailureCode;
+    message: string;
+}
+
+export type AntigravityEvidenceCallResult<T> =
+    | {
+        kind: "ok";
+        value: T;
+        revision: string;
+        contentCursor: string | null;
+        cache: AntigravityEvidenceCacheState;
+    }
+    | {
+        kind: "not_found";
+        revision: string;
+        contentCursor: string | null;
+        cache: AntigravityEvidenceCacheState;
+    }
+    | {
+        kind: "error";
+        failure: AntigravityEvidenceFailure;
+        revision?: string | null;
+        contentCursor?: string | null;
+        cache?: AntigravityEvidenceCacheState;
+    };
+
+export interface AntigravityLsEvidencePage {
+    ids: string[];
+    nextCursor: string | null;
+    truncated?: boolean;
+}
+
+export interface AntigravityLsEvidenceExactValue {
+    eventWatermark?: string | null;
+}
+
+export interface AntigravityLsEvidenceFullValue {
+    content: string;
+    roundRange: {
+        start: number;
+        end: number;
+    };
+    truncated?: boolean;
+}
+
+export interface AntigravityLsEvidenceCallInput {
+    cascadeId: string;
+    cursor: string | null;
+    bypassCache: boolean;
+}
+
+export interface AntigravityLsEvidenceReader {
+    listLsPage(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidencePage>>;
+    listPb(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidencePage>>;
+    listVscdb(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidencePage>>;
+    fetchLs(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>>;
+    fetchPb(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>>;
+    fetchVscdb(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>>;
+    readFullLs(input: AntigravityLsEvidenceCallInput): Promise<AntigravityEvidenceCallResult<AntigravityLsEvidenceFullValue>>;
+}
+
+export interface AntigravityLsEvidenceScan {
+    scanId: string;
+    sequence: number;
+    startedAt: string;
+    completedAt: string;
+}
+
+export interface AntigravityLsEvidenceRequest {
+    cascadeId: string;
+    workspaceId: string;
+    workspacePath: string | null;
+    source: {
+        endpoint: string;
+        pbRoot: string;
+        vscdbPath: string;
+    };
+    scan: AntigravityLsEvidenceScan;
+    pageLimit?: number;
+}
+
+export interface AntigravityFullSourceEvidenceResult {
+    state: "Present" | "Unresolved";
+    enumeration: SourceEnumerationEvidence;
+    evidence: FullSourceReadEvidence | null;
+    exactFetch: ExactFetchEvidence;
+    snapshot: RecordSourceSnapshot | null;
+    content: string | null;
+    errors: SourceEvidenceIssue[];
+}
+
+export interface AntigravityLsSourceEvidenceAdapter {
+    enumerate(request: AntigravityLsEvidenceRequest): Promise<SourceEnumerationEvidence>;
+    fetchExact(request: AntigravityLsEvidenceRequest): Promise<ExactFetchEvidence>;
+    readFull(request: AntigravityLsEvidenceRequest, snapshotId: string): Promise<AntigravityFullSourceEvidenceResult>;
+}
+
+interface AntigravityEnumerationRuntime {
+    calls: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>[];
+    ids: Set<string>;
+    errors: SourceEvidenceIssue[];
+    pages: number;
+    cursor: string | null;
+    truncated: boolean;
+    limitReached: boolean;
+    complete: boolean;
+}
+
+interface AntigravityExactRuntime {
+    evidence: ExactFetchEvidence;
+    ls: AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>;
+    pb: AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>;
+    vscdb: AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>;
+}
+
+export function createAntigravityLsSourceEvidenceAdapter(reader: AntigravityLsEvidenceReader): AntigravityLsSourceEvidenceAdapter {
+    return {
+        enumerate: (request) => enumerateAntigravityLsEvidence(reader, request),
+        fetchExact: async (request) => (await observeAntigravityExact(reader, request)).evidence,
+        readFull: (request, snapshotId) => readAntigravityLsEvidence(reader, request, snapshotId),
+    };
+}
+
+async function enumerateAntigravityLsEvidence(
+    reader: AntigravityLsEvidenceReader,
+    request: AntigravityLsEvidenceRequest,
+): Promise<SourceEnumerationEvidence> {
+    const ls = await enumerateAntigravityLsPages(reader, request);
+    const callInput = evidenceCallInput(request, null);
+    const [pb, vscdb] = await Promise.all([
+        invokeAntigravityReader(".pb enumeration", () => reader.listPb(callInput), isAntigravityEvidencePage),
+        invokeAntigravityReader("vscdb enumeration", () => reader.listVscdb(callInput), isAntigravityEvidencePage),
+    ]);
+    const storageCalls = [pb, vscdb];
+    const errors = [
+        ...ls.errors,
+        ...listCallIssues(".pb enumeration", pb),
+        ...listCallIssues("vscdb enumeration", vscdb),
+    ];
+    const allCalls = [...ls.calls, ...storageCalls];
+    errors.push(...cacheEvidenceIssues(allCalls));
+    const exactFetchResult = listTargetResult(request.cascadeId, ls, pb, vscdb, errors);
+    const targetStatus = exactFetchResult === "present"
+        ? "present"
+        : exactFetchResult === "not_found"
+            ? "absent"
+            : "unknown";
+    const enumerationComplete = ls.complete
+        && !ls.truncated
+        && !ls.limitReached
+        && pb.kind === "ok"
+        && vscdb.kind === "ok"
+        && errors.length === 0;
+
+    return buildSourceEnumerationEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "antigravity",
+        identity: antigravityEvidenceIdentity(request),
+        sourceRevision: jointAntigravityRevision(lastAntigravityCall(ls.calls), pb, vscdb),
+        pagination: {
+            cursor: ls.cursor,
+            pages: ls.pages,
+            limit: ls.limitReached ? request.pageLimit ?? null : null,
+            truncated: ls.truncated,
+        },
+        enumerationComplete,
+        cacheBypassed: allEvidenceCallsBypassed(allCalls),
+        exactFetchResult,
+        errors,
+        warnings: [],
+        observedAt: antigravityObservation(request),
+        targetStatus,
+    });
+}
+
+async function observeAntigravityExact(
+    reader: AntigravityLsEvidenceReader,
+    request: AntigravityLsEvidenceRequest,
+): Promise<AntigravityExactRuntime> {
+    const callInput = evidenceCallInput(request, null);
+    const [ls, pb, vscdb] = await Promise.all([
+        invokeAntigravityReader("LS exact fetch", () => reader.fetchLs(callInput), isAntigravityEvidenceExactValue),
+        invokeAntigravityReader(".pb exact fetch", () => reader.fetchPb(callInput), isAntigravityEvidenceExactValue),
+        invokeAntigravityReader("vscdb exact fetch", () => reader.fetchVscdb(callInput), isAntigravityEvidenceExactValue),
+    ]);
+    const calls = [ls, pb, vscdb];
+    const errors = calls.flatMap((call, index) => exactCallIssues(["LS exact fetch", ".pb exact fetch", "vscdb exact fetch"][index], call));
+    errors.push(...cacheEvidenceIssues(calls));
+    const exactFetchResult = exactTargetResult(calls);
+
+    return {
+        ls,
+        pb,
+        vscdb,
+        evidence: buildExactFetchEvidence({
+            adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+            host: "antigravity",
+            identity: antigravityEvidenceIdentity(request),
+            sourceRevision: jointAntigravityRevision(ls, pb, vscdb),
+            pagination: {
+                cursor: null,
+                pages: 1,
+                limit: null,
+                truncated: false,
+            },
+            enumerationComplete: errors.length === 0,
+            cacheBypassed: allEvidenceCallsBypassed(calls),
+            exactFetchResult,
+            errors,
+            warnings: [],
+            observedAt: antigravityObservation(request),
+        }),
+    };
+}
+
+async function readAntigravityLsEvidence(
+    reader: AntigravityLsEvidenceReader,
+    request: AntigravityLsEvidenceRequest,
+    snapshotId: string,
+): Promise<AntigravityFullSourceEvidenceResult> {
+    const enumeration = await enumerateAntigravityLsEvidence(reader, request);
+    const exact = await observeAntigravityExact(reader, request);
+    const eligibilityErrors = antigravityFullReadEligibilityIssues(enumeration, exact);
+    if (eligibilityErrors.length > 0 || exact.ls.kind !== "ok") {
+        return {
+            state: "Unresolved",
+            enumeration,
+            evidence: null,
+            exactFetch: exact.evidence,
+            snapshot: null,
+            content: null,
+            errors: eligibilityErrors,
+        };
+    }
+
+    const full = await invokeAntigravityReader(
+        "LS full source read",
+        () => reader.readFullLs(evidenceCallInput(request, null)),
+        isAntigravityEvidenceFullValue,
+    );
+    const errors = [...exact.evidence.errors, ...exactCallIssues("LS full source read", full)];
+    errors.push(...cacheEvidenceIssues([full]));
+
+    if (full.kind === "ok") {
+        const revisionChanged = full.revision !== exact.ls.revision;
+        const cursorChanged = full.contentCursor !== exact.ls.contentCursor;
+        if (revisionChanged || cursorChanged) {
+            errors.push(issue(
+                "revision_drift",
+                `LS revision/content cursor changed during full read (exact=${exact.ls.revision}/${exact.ls.contentCursor ?? "null"}, full=${full.revision}/${full.contentCursor ?? "null"})`,
+            ));
+        }
+        if (full.value.truncated === true) {
+            errors.push(issue("pagination_incomplete", "LS full source read was truncated"));
+        }
+    }
+
+    if (full.kind !== "ok" || errors.length > 0 || full.value.truncated === true || full.cache !== "bypassed") {
+        return { state: "Unresolved", enumeration, evidence: null, exactFetch: exact.evidence, snapshot: null, content: null, errors };
+    }
+
+    const content = {
+        mode: "full" as const,
+        byteLength: Buffer.byteLength(full.value.content, "utf8"),
+        contentHash: `sha256:${createHash("sha256").update(full.value.content, "utf8").digest("hex")}`,
+        roundRange: full.value.roundRange,
+        truncated: false,
+        staleCache: false,
+    };
+    const evidence = buildFullSourceReadEvidence({
+        adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+        host: "antigravity",
+        identity: antigravityEvidenceIdentity(request),
+        sourceRevision: exact.evidence.sourceRevision,
+        pagination: enumeration.pagination,
+        enumerationComplete: enumeration.enumerationComplete,
+        cacheBypassed: enumeration.cacheBypassed && exact.evidence.cacheBypassed && full.cache === "bypassed",
+        exactFetchResult: exact.evidence.exactFetchResult,
+        errors: [],
+        warnings: [...enumeration.warnings, ...exact.evidence.warnings],
+        observedAt: antigravityObservation(request),
+        content,
+    });
+
+    return {
+        state: "Present",
+        enumeration,
+        evidence,
+        exactFetch: exact.evidence,
+        snapshot: buildRecordSourceSnapshot({ snapshotId, fullSourceRead: evidence }),
+        content: full.value.content,
+        errors: [],
+    };
+}
+
+function antigravityFullReadEligibilityIssues(
+    enumeration: SourceEnumerationEvidence,
+    exact: AntigravityExactRuntime,
+): SourceEvidenceIssue[] {
+    const errors = [...enumeration.errors, ...exact.evidence.errors];
+    const add = (code: SourceEvidenceIssueCode, message: string): void => {
+        if (!errors.some((entry) => entry.code === code && entry.message === message)) errors.push(issue(code, message));
+    };
+
+    if (!enumeration.enumerationComplete) {
+        add("pagination_incomplete", "full source read requires a complete LS/.pb/vscdb enumeration");
+    }
+    if (enumeration.pagination.limit !== null) {
+        add("limit_reached", "full source read cannot use a limited enumeration");
+    }
+    if (enumeration.pagination.truncated || enumeration.pagination.cursor !== null) {
+        add("pagination_incomplete", "full source read cannot use a partial enumeration");
+    }
+    if (!enumeration.cacheBypassed || !exact.evidence.cacheBypassed) {
+        add("cache_only", "full source read requires cache-bypassed enumeration and exact fetch evidence");
+    }
+    if (enumeration.observedAt.scanId !== exact.evidence.observedAt.scanId) {
+        add("exact_fetch_failed", "enumeration and exact fetch must share the same scanId");
+    }
+    if (JSON.stringify(enumeration.identity) !== JSON.stringify(exact.evidence.identity)
+        || enumeration.host !== exact.evidence.host
+        || enumeration.adapterVersion !== exact.evidence.adapterVersion) {
+        add("exact_fetch_failed", "enumeration and exact fetch source identity do not match");
+    }
+    if (JSON.stringify(enumeration.sourceRevision) !== JSON.stringify(exact.evidence.sourceRevision)) {
+        add("revision_drift", "source revision changed between enumeration and exact fetch");
+    }
+    if (enumeration.targetStatus !== "present"
+        || enumeration.exactFetchResult !== "present"
+        || exact.evidence.exactFetchResult !== "present"
+        || exact.ls.kind !== "ok") {
+        add("exact_fetch_failed", "full source read requires matching present enumeration and exact fetch evidence");
+    }
+
+    return errors;
+}
+
+async function enumerateAntigravityLsPages(
+    reader: AntigravityLsEvidenceReader,
+    request: AntigravityLsEvidenceRequest,
+): Promise<AntigravityEnumerationRuntime> {
+    const calls: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>[] = [];
+    const ids = new Set<string>();
+    const errors: SourceEvidenceIssue[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | null = null;
+    let pages = 0;
+    let truncated = false;
+    let limitReached = false;
+    let complete = false;
+
+    while (true) {
+        if (request.pageLimit !== undefined && pages >= request.pageLimit) {
+            limitReached = true;
+            errors.push(issue("limit_reached", `LS enumeration reached page limit ${request.pageLimit}`));
+            break;
+        }
+        const page = await invokeAntigravityReader(
+            "LS enumeration",
+            () => reader.listLsPage(evidenceCallInput(request, cursor)),
+            isAntigravityEvidencePage,
+        );
+        calls.push(page);
+        pages += 1;
+        if (page.kind !== "ok") {
+            errors.push(...listCallIssues("LS enumeration", page));
+            break;
+        }
+        const previousPage = calls.length > 1 ? calls[calls.length - 2] : undefined;
+        if (previousPage?.kind === "ok"
+            && (previousPage.revision !== page.revision || previousPage.contentCursor !== page.contentCursor)) {
+            truncated = true;
+            cursor = page.value.nextCursor;
+            errors.push(issue(
+                "revision_drift",
+                `LS enumeration revision/content cursor changed between pages (${previousPage.revision}/${previousPage.contentCursor ?? "null"} -> ${page.revision}/${page.contentCursor ?? "null"})`,
+            ));
+            break;
+        }
+        for (const id of page.value.ids) ids.add(id);
+        if (page.value.truncated === true) {
+            truncated = true;
+            errors.push(issue("pagination_incomplete", "LS enumeration page was truncated"));
+            cursor = page.value.nextCursor;
+            break;
+        }
+        if (page.value.nextCursor === null) {
+            cursor = null;
+            complete = true;
+            break;
+        }
+        if (seenCursors.has(page.value.nextCursor)) {
+            cursor = page.value.nextCursor;
+            truncated = true;
+            errors.push(issue("pagination_incomplete", "LS enumeration repeated a pagination cursor"));
+            break;
+        }
+        seenCursors.add(page.value.nextCursor);
+        cursor = page.value.nextCursor;
+    }
+
+    return { calls, ids, errors, pages, cursor, truncated, limitReached, complete };
+}
+
+function evidenceCallInput(request: AntigravityLsEvidenceRequest, cursor: string | null): AntigravityLsEvidenceCallInput {
+    return { cascadeId: request.cascadeId, cursor, bypassCache: true };
+}
+
+function antigravityEvidenceIdentity(request: AntigravityLsEvidenceRequest): SourceConversationIdentity {
+    return {
+        workspace: {
+            workspaceId: request.workspaceId,
+            canonicalPath: request.workspacePath,
+        },
+        source: {
+            kind: "hybrid",
+            authority: `ls:${request.source.endpoint}|vscdb:${request.source.vscdbPath}`,
+            authoritativeRoot: request.source.pbRoot,
+            canonicalPath: request.workspacePath,
+        },
+        conversationId: request.cascadeId,
+    };
+}
+
+function antigravityObservation(request: AntigravityLsEvidenceRequest) {
+    return {
+        scanId: request.scan.scanId,
+        sequence: request.scan.sequence,
+        startedAt: request.scan.startedAt,
+        completedAt: request.scan.completedAt,
+    };
+}
+
+function jointAntigravityRevision(
+    ls: AntigravityEvidenceCallResult<unknown> | undefined,
+    pb: AntigravityEvidenceCallResult<unknown>,
+    vscdb: AntigravityEvidenceCallResult<unknown>,
+): SourceRevision {
+    const lsRevision = evidenceCallRevision(ls);
+    const pbRevision = evidenceCallRevision(pb);
+    const vscdbRevision = evidenceCallRevision(vscdb);
+    return {
+        revision: `ls=${lsRevision};pb=${pbRevision};vscdb=${vscdbRevision}`,
+        contentCursor: ls?.contentCursor ?? null,
+        eventWatermark: ls?.kind === "ok" && typeof ls.value === "object" && ls.value !== null && "eventWatermark" in ls.value
+            ? ((ls.value as AntigravityLsEvidenceExactValue).eventWatermark ?? null)
+            : null,
+    };
+}
+
+function evidenceCallRevision(call: AntigravityEvidenceCallResult<unknown> | undefined): string {
+    if (!call) return "unobserved";
+    return call.kind === "error" ? call.revision ?? `error:${call.failure.code}` : call.revision;
+}
+
+function lastAntigravityCall(
+    calls: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>[],
+): AntigravityEvidenceCallResult<AntigravityLsEvidencePage> | undefined {
+    return calls.at(-1);
+}
+
+function listTargetResult(
+    cascadeId: string,
+    ls: AntigravityEnumerationRuntime,
+    pb: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>,
+    vscdb: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>,
+    errors: SourceEvidenceIssue[],
+): ExactFetchResult {
+    if (!ls.complete || ls.truncated || ls.limitReached || errors.length > 0 || pb.kind !== "ok" || vscdb.kind !== "ok") return "unresolved";
+    const present = [ls.ids.has(cascadeId), pb.value.ids.includes(cascadeId), vscdb.value.ids.includes(cascadeId)];
+    return present.every(Boolean) ? "present" : present.every((value) => !value) ? "not_found" : "unresolved";
+}
+
+function exactTargetResult(
+    calls: AntigravityEvidenceCallResult<AntigravityLsEvidenceExactValue>[],
+): ExactFetchResult {
+    if (calls.every((call) => call.kind === "ok")) return "present";
+    if (calls.every((call) => call.kind === "not_found")) return "not_found";
+    return "unresolved";
+}
+
+function allEvidenceCallsBypassed(calls: AntigravityEvidenceCallResult<unknown>[]): boolean {
+    return calls.length > 0 && calls.every((call) => call.cache === "bypassed");
+}
+
+function cacheEvidenceIssues(calls: AntigravityEvidenceCallResult<unknown>[]): SourceEvidenceIssue[] {
+    return calls
+        .filter((call) => call.cache !== undefined && call.cache !== "bypassed")
+        .map((call) => issue("cache_only", `source observation used ${call.cache} cache instead of a bypassed read`));
+}
+
+function listCallIssues(
+    label: string,
+    call: AntigravityEvidenceCallResult<AntigravityLsEvidencePage>,
+): SourceEvidenceIssue[] {
+    if (call.kind === "error") return [issueForEvidenceFailure(label, call.failure)];
+    if (call.kind === "not_found") return [issue("source_unavailable", `${label} returned not_found instead of a storage enumeration`)];
+    return [];
+}
+
+function exactCallIssues(label: string, call: AntigravityEvidenceCallResult<unknown>): SourceEvidenceIssue[] {
+    return call.kind === "error" ? [issueForEvidenceFailure(label, call.failure)] : [];
+}
+
+function issueForEvidenceFailure(label: string, failure: AntigravityEvidenceFailure): SourceEvidenceIssue {
+    const codeByFailure: Record<AntigravityEvidenceFailureCode, SourceEvidenceIssueCode> = {
+        missing: "source_unavailable",
+        parse: "parse_error",
+        timeout: "timeout",
+        permission: "permission_denied",
+        cache: "cache_only",
+        unavailable: "source_unavailable",
+        io: "exact_fetch_failed",
+    };
+    return issue(codeByFailure[failure.code], `${label}: ${failure.message}`);
+}
+
+function issue(code: SourceEvidenceIssueCode, message: string): SourceEvidenceIssue {
+    return { code, message };
+}
+
+async function invokeAntigravityReader<T>(
+    label: string,
+    operation: () => Promise<AntigravityEvidenceCallResult<T>>,
+    isValue: (value: unknown) => value is T,
+): Promise<AntigravityEvidenceCallResult<T>> {
+    try {
+        const result = await operation();
+        if (!isAntigravityEvidenceCallResult(result, isValue)) {
+            return { kind: "error", failure: { code: "parse", message: `${label} returned a malformed result` } };
+        }
+        return result;
+    } catch (error) {
+        return {
+            kind: "error",
+            failure: {
+                code: "io",
+                message: `${label} threw ${error instanceof Error ? error.message : String(error)}`,
+            },
+        };
+    }
+}
+
+function isAntigravityEvidenceCallResult<T>(
+    value: unknown,
+    isValue: (candidate: unknown) => candidate is T,
+): value is AntigravityEvidenceCallResult<T> {
+    if (!isAntigravityEvidenceRecord(value) || !isAntigravityCacheState(value.cache) && value.kind !== "error") return false;
+    if (value.kind === "ok") {
+        return typeof value.revision === "string"
+            && value.revision.length > 0
+            && isAntigravityCursor(value.contentCursor)
+            && isValue(value.value);
+    }
+    if (value.kind === "not_found") {
+        return typeof value.revision === "string"
+            && value.revision.length > 0
+            && isAntigravityCursor(value.contentCursor);
+    }
+    if (value.kind === "error") {
+        return isAntigravityEvidenceRecord(value.failure)
+            && isAntigravityFailureCode(value.failure.code)
+            && typeof value.failure.message === "string"
+            && value.failure.message.length > 0
+            && (value.cache === undefined || isAntigravityCacheState(value.cache))
+            && (value.revision === undefined || value.revision === null || typeof value.revision === "string")
+            && (value.contentCursor === undefined || isAntigravityCursor(value.contentCursor));
+    }
+    return false;
+}
+
+function isAntigravityEvidencePage(value: unknown): value is AntigravityLsEvidencePage {
+    return isAntigravityEvidenceRecord(value)
+        && Array.isArray(value.ids)
+        && value.ids.every((id) => typeof id === "string")
+        && isAntigravityCursor(value.nextCursor)
+        && (value.truncated === undefined || typeof value.truncated === "boolean");
+}
+
+function isAntigravityEvidenceExactValue(value: unknown): value is AntigravityLsEvidenceExactValue {
+    return isAntigravityEvidenceRecord(value)
+        && (value.eventWatermark === undefined || isAntigravityCursor(value.eventWatermark));
+}
+
+function isAntigravityEvidenceFullValue(value: unknown): value is AntigravityLsEvidenceFullValue {
+    if (!isAntigravityEvidenceRecord(value) || typeof value.content !== "string" || !isAntigravityEvidenceRecord(value.roundRange)) {
+        return false;
+    }
+    const start = value.roundRange.start;
+    const end = value.roundRange.end;
+    return typeof start === "number"
+        && typeof end === "number"
+        && Number.isInteger(start)
+        && Number.isInteger(end)
+        && start >= 0
+        && end >= start
+        && (value.truncated === undefined || typeof value.truncated === "boolean");
+}
+
+function isAntigravityEvidenceRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isAntigravityCursor(value: unknown): value is string | null {
+    return value === null || typeof value === "string";
+}
+
+function isAntigravityCacheState(value: unknown): value is AntigravityEvidenceCacheState {
+    return value === "bypassed" || value === "used" || value === "stale";
+}
+
+function isAntigravityFailureCode(value: unknown): value is AntigravityEvidenceFailureCode {
+    return value === "missing"
+        || value === "parse"
+        || value === "timeout"
+        || value === "permission"
+        || value === "cache"
+        || value === "unavailable"
+        || value === "io";
 }
 
 export async function callGetModelResponse(model: string, prompt: string, timeoutMs?: number): Promise<string | null> {

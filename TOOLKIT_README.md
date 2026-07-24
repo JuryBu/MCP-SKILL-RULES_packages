@@ -4,11 +4,12 @@
 
 ## 你会得到什么
 
-- 三个通用 MCP：memory-store 1.19.3、web-fetcher 7.0.0、sandbox 1.15.1。
+- 三个通用 MCP：memory-store 1.21.1、web-fetcher 7.0.0、sandbox 1.15.1。
 - 一个 portable HTTP broker 0.1.0，用于 Codex 和其他支持 HTTP MCP 的宿主。
 - 一个 Windsurf-only subagent 1.1.0，只在你明确安装并登录 Windsurf 后使用。
+- 一个可选 NapCat MCP 0.1.0，用于 QQ 群通知、跨设备任务消息和群文件传输；需要你自己的 NapCat、QQ 登录与群绑定。
 - Codex、Antigravity、Claude Code、Windsurf 四套脱敏 Rules。
-- 16 个可迁移 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
+- 17 个许可证允许迁移的 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
 
 ## 最短安装路径
 
@@ -35,12 +36,13 @@
 - 不会安装或启动 ProGrok。
 - 不会自动登录任何网站或宿主。
 - 不会自动修改 Windsurf 配置或创建 Cascade 子代理。
+- 不会安装 NapCat、登录 QQ、绑定群聊或启用 `/napcat/mcp`。
 - 不会安装缺失的授权受限 Office skills。
 
 完整配置见 `SETUP.md`，组件细节见 `mcps/README_MCPS.md`，Rules 部署见 `rules/README_RULES.md`。
 
 ---
 
-This is a source-only receiver package. It includes portable MCP servers, broker scripts, four-host rules, sixteen allow-listed skills, configuration examples, and smoke tests. It does not include sender credentials, browser state, memories, conversations, logs, or databases.
+This is a source-only receiver package. It includes portable MCP servers, broker scripts, four-host rules, seventeen license-reviewed skills, configuration examples, and smoke tests. It does not include sender credentials, browser state, memories, conversations, logs, databases, NapCat binaries, QQ login state, or real group bindings.
 
-Run `install/Test-CodexToolkit.ps1 -PackageClean` first, then follow `SETUP.md`. ProGrok, Exa credentials, signed-in browser profiles, and Windsurf Cascade access are receiver-managed optional dependencies.
+Run `install/Test-CodexToolkit.ps1 -PackageClean` first, then follow `SETUP.md`. ProGrok, Exa credentials, signed-in browser profiles, Windsurf Cascade access, and NapCat OneBot are receiver-managed optional dependencies.

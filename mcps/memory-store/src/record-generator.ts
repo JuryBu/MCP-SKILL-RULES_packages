@@ -1,14 +1,17 @@
 import fs from "fs";
+import { createHash } from "crypto";
 import { formatRound, type ConversationRound } from "./trajectory.js";
+import { AGY_MODEL_SEQUENCE } from "./agy-client.js";
 import {
     readRecordAsync, readRecordsIndex, readRecordsIndexAsync,
     type RecordIndexEntry,
 } from "./record-store.js";
-import { callModelResponse, resolveModelChainCandidates, type ModelBridgeResult } from "./model-bridge.js";
+import { callModelResponse, resolveModelChainCandidates, type ModelBridgeResult, type ModelBridgeRetryStrategy } from "./model-bridge.js";
 import type { Chain } from "./chain.js";
 import { saveTempFile } from "./temp-store.js";
 import { mapGrokModel, type GrokExecDiagnostics } from "./grok-client.js";
 import { FifoConcurrencyGate, type ConcurrencyGatePermit } from "./concurrency-gate.js";
+import { isBackgroundTaskSuspension } from "./background-task-suspension.js";
 
 /**
  * Record 生成引擎
@@ -33,9 +36,9 @@ export * from "./record-parse.js";
 // ===== 本模块内部使用的子模块符号 import =====
 import {
     FLASH_MODEL, MAX_PROMPT_CHARS, CODEX_RECORD_MAX_PROMPT_CHARS, CODEX_RECORD_CONTEXT_CHARS,
-    GROK_RECORD_MAX_PROMPT_CHARS,
+    GROK_RECORD_MAX_PROMPT_CHARS, AGY_RECORD_MAX_PROMPT_CHARS,
     PROMPT_TEMPLATE_OVERHEAD, MIN_BATCH_ROUNDS, RECORD_AUTO_THRESHOLD,
-    CODEX_RECORD_TIMEOUT_MS, CODEX_RECORD_BACKGROUND_TIMEOUT_MS, RECORD_MODEL_TIMEOUT_MS, GROK_RECORD_TIMEOUT_MS,
+    CODEX_RECORD_TIMEOUT_MS, CODEX_RECORD_BACKGROUND_TIMEOUT_MS, RECORD_MODEL_TIMEOUT_MS, GROK_RECORD_TIMEOUT_MS, AGY_RECORD_TIMEOUT_MS,
     RECORD_PROGRESS_HEARTBEAT_MS, CODEX_RECORD_RETRY_DELAY_MS,
     CC_RECORD_MAX_PROMPT_CHARS, CC_RECORD_CONTEXT_CHARS, CC_RECORD_TIMEOUT_MS, CC_RECORD_BACKGROUND_TIMEOUT_MS,
     RECORD_PARALLEL_MODE, RECORD_PARALLEL_CONCURRENCY, RECORD_PARALLEL_RETRIES,
@@ -53,7 +56,8 @@ import type {
     RecordModelCallResult, FormattedRecordRound, RecordChunk, RecordPatch, RecordParallelMode,
     ParsedRecordDocument, LocalComposeBoundary, LocalComposeDelta, RoundSplitPart,
     SerialComposeAccumulator, SerialStepDelta, GenerateRecordResult, GenerateRecordOptions,
-    RecordCheckpointScope,
+    RecordCheckpointScope, RecordModelCallInvokeOptions, RecordModelCallLogicalIdentity,
+    RecordSchedulerModelCallContext, RecordSchedulerModelCallRecipe, RecordSchedulerProviderCall,
 } from "./record-types.js";
 import {
     RecordGenerationAbortedError,
@@ -92,6 +96,10 @@ function localBridgeRecordFailureHint(modelChain: Chain, detail: string): string
         const message = detail.includes("Claude Code") ? detail : `Claude Code CLI ${detail}`;
         return `${message}；Claude Code CLI 完整超时不会自动重试，如需保留 Claude Code 对话数据源，可改用 dataChain=claude-code, modelChain=antigravity 重新更新 Record`;
     }
+    if (modelChain === "agy") {
+        const message = detail.includes("agy") ? detail : `agy CLI ${detail}`;
+        return `${message}；agy CLI 只会按内置三模型顺序 fallback，不会切换到其它宿主模型链路`;
+    }
     return detail;
 }
 
@@ -100,6 +108,7 @@ function recordChainLabel(modelChain: Chain): string {
     if (modelChain === "antigravity") return "Antigravity";
     if (modelChain === "codex") return "Codex";
     if (modelChain === "claude-code") return "Claude Code CLI";
+    if (modelChain === "agy") return "agy CLI";
     return "自动链路";
 }
 
@@ -107,6 +116,7 @@ function recordFailureSubject(modelChain: Exclude<Chain, "auto">): string {
     if (modelChain === "codex") return "Codex Record 模型桥";
     if (modelChain === "claude-code") return "Claude Code CLI Record 模型桥";
     if (modelChain === "grok") return "Grok Record 模型";
+    if (modelChain === "agy") return "agy CLI Record 模型";
     return "Antigravity Record 模型";
 }
 
@@ -124,6 +134,17 @@ function isLocalTextModelBridge(modelChain: Chain): boolean {
 type RecordModelFailureMeta = {
     requestedChain: Chain;
     actualChain: Chain | null;
+    failureClass?: ModelBridgeResult["failureClass"];
+    retryStrategy?: ModelBridgeRetryStrategy;
+    agyAttempts?: ModelBridgeResult["agyAttempts"];
+};
+
+type RecordModelBridgeCallResult = RecordModelCallResult & Pick<
+    ModelBridgeResult,
+    "failureClass" | "retryStrategy" | "agyAttempts"
+> & {
+    retryExcludedChains?: readonly Exclude<Chain, "auto">[];
+    attemptedChains?: readonly Exclude<Chain, "auto">[];
 };
 
 type RecordRuntimeOptions = GenerateRecordOptions & {
@@ -132,7 +153,45 @@ type RecordRuntimeOptions = GenerateRecordOptions & {
     __recordModelScope?: RecordModelScope;
     __lastRecordModelFailure?: RecordModelFailureMeta | null;
     __grokDiagnostics?: GrokExecDiagnostics;
+    __agyCommand?: string;
+    __agyCommandArgs?: readonly string[];
 };
+
+type RecordModelResponseInvoker = (
+    model: string,
+    prompt: string,
+    provider: Exclude<Chain, "auto">,
+    timeout: number,
+    bridgeOptions: ReturnType<typeof recordModelBridgeOptions>,
+) => Promise<RecordModelCallResult>;
+
+type RecordModelCandidateResolver = (
+    modelChain: Chain,
+    bridgeOptions: ReturnType<typeof recordModelBridgeOptions>,
+) => Promise<readonly Exclude<Chain, "auto">[]>;
+
+export interface RecordGeneratorSchedulerHookTestInput {
+    model?: string;
+    prompt: string;
+    modelChain: Chain;
+    timeout?: number;
+    options?: GenerateRecordOptions;
+    retryOrdinal?: number;
+    retryExcludedChains?: readonly Exclude<Chain, "auto">[];
+    candidates?: readonly Exclude<Chain, "auto">[];
+    resolveCandidates?: () => Promise<readonly Exclude<Chain, "auto">[]>;
+    recipe?: RecordSchedulerModelCallRecipe;
+    now?: () => number;
+    invoke: (input: {
+        model: string;
+        prompt: string;
+        provider: Exclude<Chain, "auto">;
+        timeout: number;
+        providerLease?: unknown;
+        attemptId?: string;
+        idempotencyKey?: string;
+    }) => Promise<RecordModelCallResult>;
+}
 
 function captureGrokDiagnostics(response: Pick<ModelBridgeResult, "grokDiagnostics">, options: GenerateRecordOptions): void {
     if (response.grokDiagnostics) {
@@ -144,9 +203,16 @@ function setLastRecordModelFailure(
     requestedChain: Chain,
     actualChain: Chain | null,
     options: GenerateRecordOptions = {},
+    result: Pick<RecordModelBridgeCallResult, "failureClass" | "retryStrategy" | "agyAttempts"> = {},
 ): void {
     const runtimeOptions = options as RecordRuntimeOptions;
-    runtimeOptions.__lastRecordModelFailure = { requestedChain, actualChain };
+    runtimeOptions.__lastRecordModelFailure = {
+        requestedChain,
+        actualChain,
+        ...(result.failureClass ? { failureClass: result.failureClass } : {}),
+        ...(result.retryStrategy ? { retryStrategy: result.retryStrategy } : {}),
+        ...(result.agyAttempts ? { agyAttempts: result.agyAttempts } : {}),
+    };
 }
 
 function clearLastRecordModelFailure(options: GenerateRecordOptions = {}): void {
@@ -204,23 +270,33 @@ export type RecordModelScope = RecordCheckpointScope & {
 const RECORD_GROK_CONTEXT = "record" as const;
 
 function recordModelBridgeOptions(options: GenerateRecordOptions = {}) {
+    const runtimeOptions = options as RecordRuntimeOptions;
     return {
         allowClaudeCodeFallback: options.allowClaudeCodeFallback,
         grokContext: RECORD_GROK_CONTEXT,
         trafficClass: options.trafficClass,
+        providerTrafficClass: "record" as const,
         antigravityModelOverride: RECORD_ANTIGRAVITY_LS_MODEL,
+        agyCommand: runtimeOptions.__agyCommand,
+        agyCommandArgs: runtimeOptions.__agyCommandArgs,
         shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
     };
 }
 
 function recordModelNameForChain(modelChain: Chain): string {
-    if (modelChain === "grok") return mapGrokModel(FLASH_MODEL, RECORD_GROK_CONTEXT);
+    return recordProviderModelName(FLASH_MODEL, modelChain);
+}
+
+function recordProviderModelName(model: string, modelChain: Chain): string {
+    if (modelChain === "grok") return mapGrokModel(model, RECORD_GROK_CONTEXT);
     if (modelChain === "antigravity") return RECORD_ANTIGRAVITY_LS_MODEL;
-    return FLASH_MODEL;
+    if (modelChain === "agy") return AGY_MODEL_SEQUENCE[0];
+    return model;
 }
 
 function recordTimeoutForChain(modelChain: Chain): number {
     if (modelChain === "grok") return GROK_RECORD_TIMEOUT_MS;
+    if (modelChain === "agy") return AGY_RECORD_TIMEOUT_MS;
     return RECORD_MODEL_TIMEOUT_MS;
 }
 
@@ -237,6 +313,283 @@ function getRecordCallTimeout(modelChain: Chain, requestedTimeout: number, optio
     return options.background
         ? Math.max(1, localTimeoutLimit)
         : Math.max(1, Math.min(baseTimeout, localTimeoutLimit));
+}
+
+export function createRecordModelLogicalCallKey(input: RecordModelCallLogicalIdentity): string {
+    const canonicalPayload = JSON.stringify([
+        "record-model-route/v1",
+        input.prompt,
+        input.logicalTimeout,
+        input.routePlan,
+        input.recipe.recipeVersion,
+        input.recipe.templateId,
+        input.recipe.range.axis,
+        input.recipe.range.start,
+        input.recipe.range.end,
+        input.recipe.composeOrder,
+        input.recipe.continuationKey ?? null,
+        Math.max(1, input.retryBudget),
+        input.trafficClass ?? null,
+        input.context.requestedChain,
+        input.context.background,
+        input.context.providerTrafficClass,
+        input.context.grokContext,
+    ]);
+    return `record-model:${createHash("sha256").update(canonicalPayload, "utf8").digest("hex")}`;
+}
+
+function recordModelRecipe(
+    templateId: string,
+    range: RecordSchedulerModelCallRecipe["range"],
+    composeOrder: number,
+    continuationKey?: string,
+): RecordSchedulerModelCallRecipe {
+    return {
+        recipeVersion: 1,
+        templateId,
+        range,
+        composeOrder,
+        ...(continuationKey ? { continuationKey } : {}),
+    };
+}
+
+function defaultRecordModelRecipe(): RecordSchedulerModelCallRecipe {
+    return recordModelRecipe("record-model/unspecified", { axis: "round", start: 0, end: 0 }, 0);
+}
+
+function schedulerRetryBudget(options: GenerateRecordOptions): number {
+    return Number.isSafeInteger(options.schedulerRetryBudget) && options.schedulerRetryBudget! >= 1
+        ? options.schedulerRetryBudget!
+        : 1;
+}
+
+function createRecordProviderInvoke(
+    model: string,
+    prompt: string,
+    provider: Exclude<Chain, "auto">,
+    invokeTimeout: number,
+    bridgeOptions: ReturnType<typeof recordModelBridgeOptions>,
+    invokeModelResponse: RecordModelResponseInvoker,
+): RecordSchedulerProviderCall["invoke"] {
+    return async (invokeOptions: RecordModelCallInvokeOptions = {}): Promise<RecordModelCallResult> => {
+        const invokeBridgeOptions = invokeOptions.transportLease === undefined
+            && invokeOptions.attemptId === undefined
+            && invokeOptions.idempotencyKey === undefined
+            ? bridgeOptions
+            : {
+                ...bridgeOptions,
+                ...(invokeOptions.transportLease === undefined ? {} : { providerLease: invokeOptions.transportLease }),
+                ...(invokeOptions.attemptId === undefined ? {} : { attemptId: invokeOptions.attemptId }),
+                ...(invokeOptions.idempotencyKey === undefined ? {} : { idempotencyKey: invokeOptions.idempotencyKey }),
+            };
+        return invokeModelResponse(model, prompt, provider, invokeTimeout, invokeBridgeOptions);
+    };
+}
+
+function createRecordProviderCall(
+    model: string,
+    prompt: string,
+    provider: Exclude<Chain, "auto">,
+    logicalTimeout: number,
+    invokeTimeout: number,
+    bridgeOptions: ReturnType<typeof recordModelBridgeOptions>,
+    invokeModelResponse: RecordModelResponseInvoker,
+): RecordSchedulerProviderCall {
+    return {
+        provider,
+        model: recordProviderModelName(model, provider),
+        logicalTimeout,
+        invokeTimeout,
+        invoke: createRecordProviderInvoke(model, prompt, provider, invokeTimeout, bridgeOptions, invokeModelResponse),
+        invokePrompt: (splitPrompt, invokeOptions) => createRecordProviderInvoke(
+            model,
+            splitPrompt,
+            provider,
+            invokeTimeout,
+            bridgeOptions,
+            invokeModelResponse,
+        )(invokeOptions),
+    };
+}
+
+function buildRecordSchedulerSplitPrompt(
+    prompt: string,
+    parentRange: RecordSchedulerModelCallRecipe["range"],
+    childRange: RecordSchedulerModelCallRecipe["range"],
+): string {
+    if (childRange.axis !== parentRange.axis
+        || childRange.start < parentRange.start
+        || childRange.end > parentRange.end
+        || childRange.start > childRange.end) {
+        throw new TypeError("scheduler split range 必须位于 parent recipe range 内");
+    }
+    const parentSteps = parentRange.end - parentRange.start + 1;
+    if (parentSteps <= 1 || prompt.length < 4_096) {
+        return [
+            `【Record scheduler split】仅处理 ${childRange.axis} ${childRange.start}-${childRange.end}，忽略范围外内容。`,
+            prompt,
+        ].join("\n\n");
+    }
+    const headChars = Math.min(6_144, Math.floor(prompt.length * 0.2));
+    const tailChars = Math.min(3_072, Math.floor(prompt.length * 0.1));
+    const bodyStart = headChars;
+    const bodyEnd = Math.max(bodyStart, prompt.length - tailChars);
+    const bodyChars = bodyEnd - bodyStart;
+    const relativeStart = (childRange.start - parentRange.start) / parentSteps;
+    const relativeEnd = (childRange.end - parentRange.start + 1) / parentSteps;
+    const sliceStart = bodyStart + Math.floor(bodyChars * relativeStart);
+    const sliceEnd = bodyStart + Math.ceil(bodyChars * relativeEnd);
+    return [
+        `【Record scheduler split】仅处理 ${childRange.axis} ${childRange.start}-${childRange.end}，这是父任务 ${parentRange.start}-${parentRange.end} 的确定性子区间。`,
+        prompt.slice(0, headChars),
+        `【子区间正文 ${childRange.start}-${childRange.end}】`,
+        prompt.slice(sliceStart, sliceEnd),
+        prompt.slice(bodyEnd),
+    ].join("\n\n");
+}
+
+async function callRecordModelProviderAttempt(
+    model: string,
+    prompt: string,
+    provider: Exclude<Chain, "auto">,
+    logicalTimeout: number,
+    invokeTimeout: number,
+    requestedChain: Chain,
+    retryOrdinal: number,
+    options: GenerateRecordOptions,
+    bridgeOptions: ReturnType<typeof recordModelBridgeOptions>,
+    invokeModelResponse: RecordModelResponseInvoker,
+    routeLogicalTimeout: number,
+    recipe: RecordSchedulerModelCallRecipe,
+    routePlan: readonly Exclude<Chain, "auto">[],
+): Promise<RecordModelBridgeCallResult> {
+    const providerCalls = routePlan.map(routeProvider => createRecordProviderCall(
+        model,
+        prompt,
+        routeProvider,
+        routeProvider === provider ? logicalTimeout : getRecordCallTimeout(routeProvider, logicalTimeout, options),
+        routeProvider === provider ? invokeTimeout : getRecordCallTimeout(routeProvider, logicalTimeout, options),
+        bridgeOptions,
+        invokeModelResponse,
+    ));
+    const providerCall = providerCalls.find(call => call.provider === provider);
+    if (!providerCall) throw new Error(`Record provider ${provider} 不在 routePlan 中`);
+    const context = {
+        requestedChain,
+        background: Boolean(options.background),
+        providerTrafficClass: "record" as const,
+        grokContext: RECORD_GROK_CONTEXT,
+    };
+    const hook = options.schedulerModelCall;
+    const response = hook
+        ? await hook({
+            logicalCallKey: createRecordModelLogicalCallKey({
+                prompt,
+                logicalTimeout: routeLogicalTimeout,
+                routePlan,
+                recipe,
+                retryBudget: 1,
+                trafficClass: options.trafficClass,
+                context,
+            }),
+            routePlan,
+            providerCalls,
+            recipe,
+            retryBudget: 1,
+            splitPrompt: range => buildRecordSchedulerSplitPrompt(prompt, recipe.range, range),
+            provider: providerCall.provider,
+            model: providerCall.model,
+            prompt,
+            logicalTimeout,
+            invokeTimeout: providerCall.invokeTimeout,
+            retryOrdinal,
+            trafficClass: options.trafficClass,
+            context,
+            invoke: providerCall.invoke,
+        })
+        : await providerCall.invoke();
+    const bridgeResponse = response as RecordModelBridgeCallResult;
+    return {
+        ...bridgeResponse,
+        chainUsed: bridgeResponse.chainUsed || provider,
+    };
+}
+
+async function callRecordModelSchedulerRoute(
+    model: string,
+    prompt: string,
+    modelChain: Chain,
+    timeout: number,
+    options: GenerateRecordOptions,
+    recipe: RecordSchedulerModelCallRecipe,
+    invokeModelResponse: RecordModelResponseInvoker,
+    resolveCandidates: RecordModelCandidateResolver,
+): Promise<RecordModelBridgeCallResult> {
+    const hook = options.schedulerModelCall;
+    if (!hook) {
+        return {
+            text: null,
+            chainUsed: null,
+            error: "schedulerManagedExecution 要求 schedulerModelCall，已阻止底层模型调用",
+        };
+    }
+    const bridgeOptions = recordModelBridgeOptions(options);
+    const routePlan = modelChain === "auto"
+        ? await resolveCandidates("auto", bridgeOptions)
+        : [modelChain];
+    if (routePlan.length === 0) {
+        return {
+            text: null,
+            chainUsed: null,
+            error: options.allowClaudeCodeFallback
+                ? "Grok、Antigravity LS、Codex 模型桥与 Claude Code CLI 当前都不可用"
+                : "Grok、Antigravity LS 与 Codex 模型桥当前都不可用",
+        };
+    }
+    const providerCalls = routePlan.map(provider => {
+        const logicalTimeout = getRecordCallTimeout(provider, timeout, options);
+        const invokeTimeout = modelChain === "auto"
+            ? Math.min(logicalTimeout, Math.max(0, timeout))
+            : logicalTimeout;
+        return createRecordProviderCall(model, prompt, provider, logicalTimeout, invokeTimeout, bridgeOptions, invokeModelResponse);
+    });
+    const primaryCall = providerCalls[0];
+    const context = {
+        requestedChain: modelChain,
+        background: Boolean(options.background),
+        providerTrafficClass: "record" as const,
+        grokContext: RECORD_GROK_CONTEXT,
+    };
+    const response = await hook({
+        logicalCallKey: createRecordModelLogicalCallKey({
+            prompt,
+            logicalTimeout: timeout,
+            routePlan,
+            recipe,
+            retryBudget: schedulerRetryBudget(options),
+            trafficClass: options.trafficClass,
+            context,
+        }),
+        routePlan,
+        providerCalls,
+        recipe,
+        retryBudget: schedulerRetryBudget(options),
+        splitPrompt: range => buildRecordSchedulerSplitPrompt(prompt, recipe.range, range),
+        provider: primaryCall.provider,
+        model: primaryCall.model,
+        prompt,
+        logicalTimeout: timeout,
+        invokeTimeout: primaryCall.invokeTimeout,
+        retryOrdinal: 0,
+        trafficClass: options.trafficClass,
+        context,
+        invoke: primaryCall.invoke,
+    });
+    const bridgeResponse = response as RecordModelBridgeCallResult;
+    return {
+        ...bridgeResponse,
+        chainUsed: bridgeResponse.chainUsed || primaryCall.provider,
+    };
 }
 
 function fallbackRecordModelScope(requestedChain: Chain, modelChain: Chain = requestedChain): RecordModelScope {
@@ -386,25 +739,38 @@ async function callRecordModelBridgeOnce(
     modelChain: Chain,
     timeout: number,
     options: GenerateRecordOptions = {},
-): Promise<RecordModelCallResult> {
+    recipe: RecordSchedulerModelCallRecipe = defaultRecordModelRecipe(),
+    retryExcludedChains: readonly Exclude<Chain, "auto">[] = [],
+    retryOrdinal = 0,
+    invokeModelResponse: RecordModelResponseInvoker = callModelResponse,
+    resolveCandidates: RecordModelCandidateResolver = resolveModelChainCandidates,
+    now: () => number = Date.now,
+): Promise<RecordModelBridgeCallResult> {
+    if (options.schedulerManagedExecution) {
+        return await callRecordModelSchedulerRoute(
+            model,
+            prompt,
+            modelChain,
+            timeout,
+            options,
+            recipe,
+            invokeModelResponse,
+            resolveCandidates,
+        );
+    }
     const bridgeOptions = recordModelBridgeOptions(options);
     if (modelChain !== "auto") {
         throwIfRecordRunAborted(options, `准备调用 ${modelChain} 模型`);
-        const scopedTimeout = getRecordCallTimeout(modelChain, timeout, options);
-        const resp = await callModelResponse(model, prompt, modelChain, scopedTimeout, bridgeOptions);
+        const logicalTimeout = getRecordCallTimeout(modelChain, timeout, options);
+        const resp = await callRecordModelProviderAttempt(
+            model, prompt, modelChain, logicalTimeout, logicalTimeout, modelChain, retryOrdinal,
+            options, bridgeOptions, invokeModelResponse, timeout, recipe, [modelChain],
+        );
         captureGrokDiagnostics(resp, options);
-        return {
-            text: resp.text,
-            error: resp.error,
-            timedOut: resp.timedOut,
-            cancelled: resp.cancelled,
-            chainUsed: resp.chainUsed || modelChain,
-            modelUsed: resp.modelUsed,
-            grokDiagnostics: resp.grokDiagnostics,
-        };
+        return resp;
     }
 
-    const candidates = await resolveModelChainCandidates("auto", bridgeOptions);
+    const candidates = await resolveCandidates("auto", bridgeOptions);
     if (candidates.length === 0) {
         return {
             text: null,
@@ -416,21 +782,37 @@ async function callRecordModelBridgeOnce(
     }
 
     const errors: string[] = [];
-    const logicalDeadlineAt = Date.now() + Math.max(0, timeout);
+    const attemptedChains: Exclude<Chain, "auto">[] = [];
+    const retryExclusions = new Set<Exclude<Chain, "auto">>(retryExcludedChains);
+    let lastFailure: RecordModelBridgeCallResult | null = null;
+    let agyAttempts: ModelBridgeResult["agyAttempts"];
+    const logicalDeadlineAt = now() + Math.max(0, timeout);
     for (const candidate of candidates) {
+        if (retryExclusions.has(candidate)) continue;
         throwIfRecordRunAborted(options, `准备调用 ${candidate} 模型`);
-        const remainingMs = Math.max(0, logicalDeadlineAt - Date.now());
+        attemptedChains.push(candidate);
+        const remainingMs = Math.max(0, logicalDeadlineAt - now());
         if (remainingMs <= 0) {
             return {
                 text: null,
                 error: errors.join("；") || "Record auto 模型调用总预算已耗尽",
                 timedOut: true,
                 chainUsed: candidate,
+                attemptedChains,
+                retryExcludedChains: Array.from(retryExclusions),
             };
         }
-        const scopedTimeout = Math.min(getRecordCallTimeout(candidate, timeout, options), remainingMs);
-        const resp = await callModelResponse(model, prompt, candidate, scopedTimeout, bridgeOptions);
+        const logicalTimeout = getRecordCallTimeout(candidate, timeout, options);
+        const invokeTimeout = Math.min(logicalTimeout, remainingMs);
+        const resp = await callRecordModelProviderAttempt(
+            model, prompt, candidate, logicalTimeout, invokeTimeout, modelChain, retryOrdinal,
+            options, bridgeOptions, invokeModelResponse, timeout, recipe, candidates,
+        );
         captureGrokDiagnostics(resp, options);
+        if (resp.agyAttempts) agyAttempts = resp.agyAttempts;
+        if (resp.retryStrategy === "provider-fallback-exhausted") {
+            retryExclusions.add(candidate);
+        }
         if (resp.cancelled) {
             return {
                 text: null,
@@ -439,6 +821,11 @@ async function callRecordModelBridgeOnce(
                 chainUsed: resp.chainUsed || candidate,
                 modelUsed: resp.modelUsed,
                 grokDiagnostics: resp.grokDiagnostics,
+                failureClass: resp.failureClass,
+                retryStrategy: resp.retryStrategy,
+                agyAttempts,
+                attemptedChains,
+                retryExcludedChains: Array.from(retryExclusions),
             };
         }
         if (resp.text) {
@@ -450,6 +837,17 @@ async function callRecordModelBridgeOnce(
             };
         }
         errors.push(resp.error || `${candidate} 模型桥调用失败`);
+        lastFailure = {
+            text: null,
+            error: resp.error,
+            timedOut: resp.timedOut,
+            chainUsed: resp.chainUsed || candidate,
+            modelUsed: resp.modelUsed,
+            grokDiagnostics: resp.grokDiagnostics,
+            failureClass: resp.failureClass,
+            retryStrategy: resp.retryStrategy,
+            agyAttempts,
+        };
         if (resp.timedOut && candidate !== "grok") {
             return {
                 text: null,
@@ -458,13 +856,24 @@ async function callRecordModelBridgeOnce(
                 chainUsed: resp.chainUsed || candidate,
                 modelUsed: resp.modelUsed,
                 grokDiagnostics: resp.grokDiagnostics,
+                failureClass: resp.failureClass,
+                retryStrategy: resp.retryStrategy,
+                agyAttempts,
+                attemptedChains,
+                retryExcludedChains: Array.from(retryExclusions),
             };
         }
     }
     return {
         text: null,
-        chainUsed: candidates[candidates.length - 1] || null,
+        chainUsed: lastFailure?.chainUsed || candidates[candidates.length - 1] || null,
+        modelUsed: lastFailure?.modelUsed,
         error: errors.join("；") || "模型桥调用失败",
+        failureClass: lastFailure?.failureClass,
+        retryStrategy: lastFailure?.retryStrategy,
+        agyAttempts,
+        attemptedChains,
+        retryExcludedChains: Array.from(retryExclusions),
     };
 }
 
@@ -486,25 +895,53 @@ async function callRecordModelWithRetry(
     modelChain: Chain,
     timeout: number,
     options: GenerateRecordOptions = {},
-): Promise<RecordModelCallResult> {
+    recipe: RecordSchedulerModelCallRecipe = defaultRecordModelRecipe(),
+    retryOrdinal = 0,
+    invokeModelResponse: RecordModelResponseInvoker = callModelResponse,
+    resolveCandidates: RecordModelCandidateResolver = resolveModelChainCandidates,
+    now: () => number = Date.now,
+): Promise<RecordModelBridgeCallResult> {
     throwIfRecordRunAborted(options, "模型调用前检查到任务已终止");
-    const scope = await resolveRecordModelScope(modelChain, options);
+    const scope = options.schedulerManagedExecution
+        ? fallbackRecordModelScope(modelChain)
+        : await resolveRecordModelScope(modelChain, options);
     const bridgeName = scope.modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
-    const resp = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+    const resp = await callRecordModelBridgeOnce(
+        model, prompt, modelChain, timeout, options, recipe, [], retryOrdinal,
+        invokeModelResponse, resolveCandidates, now,
+    );
     if (resp.text) {
         reportRecordModelSuccess(modelChain, resp, options);
         return { text: resp.text, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
     }
     if (resp.cancelled) throwRecordModelCancelled(resp, options);
+    if (options.schedulerManagedExecution) {
+        setLastRecordModelFailure(modelChain, resp.chainUsed || scope.modelChain, options, resp);
+        return { ...resp, text: null };
+    }
     // 守卫放宽（C2）：凡是「真超时」一律不重试，无论本地文本桥（Codex/CC）还是 antigravity/Flash 链路。
     // 真超时已经白等满了整个 timeout，再无条件重试只会把总耗时翻倍（如 antigravity 180s → 360s）。
     // 连接拒/进程死/空响应等普通失败 timedOut=false，仍走下方原有重试逻辑（可重试 / 换候选）。
     if (resp.timedOut) {
         const actualChain = resp.chainUsed || scope.modelChain;
         const label = modelChain === "auto" ? autoRecordFailurePrefix(actualChain) : recordChainLabel(actualChain);
-        setLastRecordModelFailure(modelChain, actualChain, options);
+        setLastRecordModelFailure(modelChain, actualChain, options, resp);
         console.error(`[record-generator] ${label} 模型调用超时，不重试: ${resp.error || "unknown error"}`);
-        return { text: null, error: resp.error, timedOut: true, chainUsed: resp.chainUsed, modelUsed: resp.modelUsed };
+        return { ...resp, text: null, timedOut: true };
+    }
+    if (modelChain === "agy" && resp.retryStrategy === "provider-fallback-exhausted") {
+        setLastRecordModelFailure(modelChain, resp.chainUsed || scope.modelChain, options, resp);
+        console.error(`[record-generator] agy CLI 内部三模型 fallback 已结束，不再触发 Record 外层重试: ${resp.error || "unknown error"}`);
+        return { ...resp, text: null };
+    }
+    const retryExcludedChains = modelChain === "auto" ? (resp.retryExcludedChains || []) : [];
+    const hasRetryableAutoCandidate = modelChain !== "auto"
+        || !resp.attemptedChains
+        || resp.attemptedChains.some(candidate => !retryExcludedChains.includes(candidate));
+    if (!hasRetryableAutoCandidate) {
+        setLastRecordModelFailure(modelChain, resp.chainUsed || scope.modelChain, options, resp);
+        console.error(`[record-generator] 自动链路中 agy CLI 内部三模型 fallback 已结束，剩余候选为空，不重放 agy 序列: ${resp.error || "unknown error"}`);
+        return { ...resp, text: null };
     }
     if (isLocalTextModelBridge(scope.modelChain)) {
         console.error(`[record-generator] ${bridgeName} 模型调用快失败，${CODEX_RECORD_RETRY_DELAY_MS}ms 后重试 1 次: ${resp.error || "unknown error"}`);
@@ -516,28 +953,41 @@ async function callRecordModelWithRetry(
             await new Promise(r => setTimeout(r, CODEX_RECORD_RETRY_DELAY_MS));
         }
         throwIfRecordRunAborted(options, `${bridgeName} 模型桥重试前检查到任务已终止`);
-        const retry = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+        const retry = await callRecordModelBridgeOnce(
+            model, prompt, modelChain, timeout, options, recipe, retryExcludedChains, retryOrdinal + 1,
+            invokeModelResponse, resolveCandidates, now,
+        );
         if (retry.cancelled) throwRecordModelCancelled(retry, options);
         if (retry.text) {
             reportRecordModelSuccess(modelChain, retry, options);
             return { text: retry.text, chainUsed: retry.chainUsed, modelUsed: retry.modelUsed };
         }
-        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options);
+        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options, retry);
         console.error(`[record-generator] ${bridgeName} 模型调用重试失败: ${retry.error || "unknown error"}`);
-        return { text: null, error: retry.error || resp.error, timedOut: retry.timedOut, chainUsed: retry.chainUsed || resp.chainUsed, modelUsed: retry.modelUsed || resp.modelUsed };
+        return {
+            ...retry,
+            text: null,
+            error: retry.error || resp.error,
+            chainUsed: retry.chainUsed || resp.chainUsed,
+            modelUsed: retry.modelUsed || resp.modelUsed,
+        };
     }
     // 第一次失败，等 5 秒重试
     const retryLabel = modelChain === "auto" ? "自动链路" : recordChainLabel(scope.modelChain);
     console.error(`[record-generator] ${retryLabel} 首次失败，5s 后重试...`);
     await new Promise(r => setTimeout(r, 5000));
     throwIfRecordRunAborted(options, `${retryLabel} 重试前检查到任务已终止`);
-    const retry = await callRecordModelBridgeOnce(model, prompt, modelChain, timeout, options);
+    const retry = await callRecordModelBridgeOnce(
+        model, prompt, modelChain, timeout, options, recipe, retryExcludedChains, retryOrdinal + 1,
+        invokeModelResponse, resolveCandidates, now,
+    );
     if (retry.cancelled) throwRecordModelCancelled(retry, options);
     if (retry.text) reportRecordModelSuccess(modelChain, retry, options);
     if (!retry.text) {
-        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options);
+        setLastRecordModelFailure(modelChain, retry.chainUsed || resp.chainUsed || scope.modelChain, options, retry);
     }
     return {
+        ...retry,
         text: retry.text,
         error: retry.error || resp.error,
         timedOut: retry.timedOut || resp.timedOut,
@@ -546,14 +996,65 @@ async function callRecordModelWithRetry(
     };
 }
 
+function makeRecordModelResponseInvoker(input: RecordGeneratorSchedulerHookTestInput): RecordModelResponseInvoker {
+    return async (model, prompt, provider, timeout, bridgeOptions) => input.invoke({
+        model,
+        prompt,
+        provider,
+        timeout,
+        providerLease: (bridgeOptions as { providerLease?: unknown }).providerLease,
+        attemptId: (bridgeOptions as { attemptId?: string }).attemptId,
+        idempotencyKey: (bridgeOptions as { idempotencyKey?: string }).idempotencyKey,
+    });
+}
+
+function makeRecordModelCandidateResolver(input: RecordGeneratorSchedulerHookTestInput): RecordModelCandidateResolver {
+    if (input.resolveCandidates) return async () => await input.resolveCandidates!();
+    if (!input.candidates) return resolveModelChainCandidates;
+    return async () => input.candidates || [];
+}
+
+export const __recordGeneratorSchedulerHookTest = {
+    callOnce(input: RecordGeneratorSchedulerHookTestInput): Promise<RecordModelBridgeCallResult> {
+        return callRecordModelBridgeOnce(
+            input.model || "test-model",
+            input.prompt,
+            input.modelChain,
+            input.timeout || 1_000,
+            input.options || {},
+            input.recipe || defaultRecordModelRecipe(),
+            input.retryExcludedChains || [],
+            input.retryOrdinal || 0,
+            makeRecordModelResponseInvoker(input),
+            makeRecordModelCandidateResolver(input),
+            input.now || Date.now,
+        );
+    },
+    callWithRetry(input: RecordGeneratorSchedulerHookTestInput): Promise<RecordModelBridgeCallResult> {
+        return callRecordModelWithRetry(
+            input.model || "test-model",
+            input.prompt,
+            input.modelChain,
+            input.timeout || 1_000,
+            input.options || {},
+            input.recipe || defaultRecordModelRecipe(),
+            input.retryOrdinal || 0,
+            makeRecordModelResponseInvoker(input),
+            makeRecordModelCandidateResolver(input),
+            input.now || Date.now,
+        );
+    },
+};
+
 async function callFlashWithRetryChain(
     model: string,
     prompt: string,
     modelChain: Chain,
     timeout: number,
     options: GenerateRecordOptions = {},
+    recipe: RecordSchedulerModelCallRecipe = defaultRecordModelRecipe(),
 ): Promise<string | null> {
-    const result = await callRecordModelWithRetry(model, prompt, modelChain, timeout, options);
+    const result = await callRecordModelWithRetry(model, prompt, modelChain, timeout, options, recipe);
     return result.text;
 }
 
@@ -769,6 +1270,12 @@ async function compressOversizedRound(
                 modelChain,
                 RECORD_MODEL_TIMEOUT_MS,
                 options,
+                recordModelRecipe(
+                    "round-part-compress/v1",
+                    { axis: "step", start: part.startStep, end: part.endStep },
+                    i,
+                    `round:${round.roundIndex}`,
+                ),
             );
             const summary = (resp.text || "").trim();
             if (!summary) {
@@ -789,6 +1296,7 @@ async function compressOversizedRound(
             .join("\n\n");
         return merged;
     } catch (err) {
+        if (isBackgroundTaskSuspension(err)) throw err;
         if (isRecordGenerationAbortedError(err)) throw err;
         // 任何意外都降级，绝不冒泡到 Record 生成主流程。
         console.error(`[record-generator] 轮次 ${round.roundIndex} 超大轮压缩异常，整轮降级 capSingleRoundText: ${err instanceof Error ? err.message : String(err)}`);
@@ -911,6 +1419,7 @@ function buildAdjacentContext(allFormatted: FormattedRecordRound[], chunk: Recor
 
 export function getMaxPromptChars(modelChain: Chain): number {
     if (modelChain === "grok") return GROK_RECORD_MAX_PROMPT_CHARS;
+    if (modelChain === "agy") return AGY_RECORD_MAX_PROMPT_CHARS;
     if (modelChain === "codex") return CODEX_RECORD_MAX_PROMPT_CHARS;
     if (modelChain === "claude-code") return CC_RECORD_MAX_PROMPT_CHARS;
     return MAX_PROMPT_CHARS;
@@ -1030,15 +1539,28 @@ async function generatePatchForChunk(
     }
     let lastError = "";
     let lastCheckpointScope: RecordCheckpointScope = readScope || fallbackRecordModelScope(modelChain);
-    for (let attempt = 0; attempt <= RECORD_PARALLEL_RETRIES; attempt++) {
+    const retryLimit = options.schedulerManagedExecution ? 0 : RECORD_PARALLEL_RETRIES;
+    for (let attempt = 0; attempt <= retryLimit; attempt++) {
         options.onProgress?.({
             stage: "并行生成 RecordPatch",
             current: chunkIndex,
             total: totalChunks,
             unit: "批",
-            detail: `第 ${chunkIndex + 1}/${totalChunks} 个区段，${roundRangeLabel(chunk.startRound, chunk.endRound)}，尝试 ${attempt + 1}/${RECORD_PARALLEL_RETRIES + 1}`,
+            detail: `第 ${chunkIndex + 1}/${totalChunks} 个区段，${roundRangeLabel(chunk.startRound, chunk.endRound)}，尝试 ${attempt + 1}/${retryLimit + 1}`,
         });
-        const response = await callRecordModelWithRetry(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        const response = await callRecordModelWithRetry(
+            FLASH_MODEL,
+            prompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                "parallel-map/v1",
+                { axis: "round", start: chunk.startRound, end: chunk.endRound },
+                chunkIndex,
+                `chunks:${totalChunks}`,
+            ),
+        );
         lastCheckpointScope = checkpointScopeFromResponse(modelChain, response, options);
         if (response.text) {
             throwIfRecordRunAborted(options, `RecordPatch ${roundRangeLabel(chunk.startRound, chunk.endRound)} 已生成，写 checkpoint 前检查到任务已终止`);
@@ -1112,15 +1634,28 @@ async function compressRecordPatchGroup(
     }
     let lastError = "";
     let lastCheckpointScope: RecordCheckpointScope = readScope || fallbackRecordModelScope(modelChain);
-    for (let attempt = 0; attempt <= RECORD_PARALLEL_RETRIES; attempt++) {
+    const retryLimit = options.schedulerManagedExecution ? 0 : RECORD_PARALLEL_RETRIES;
+    for (let attempt = 0; attempt <= retryLimit; attempt++) {
         options.onProgress?.({
             stage: "压缩 RecordPatch",
             current: groupIndex,
             total: totalGroups,
             unit: "组",
-            detail: `第 ${level} 层，第 ${groupIndex + 1}/${totalGroups} 组，${roundRangeLabel(startRound, endRound)}，尝试 ${attempt + 1}/${RECORD_PARALLEL_RETRIES + 1}`,
+            detail: `第 ${level} 层，第 ${groupIndex + 1}/${totalGroups} 组，${roundRangeLabel(startRound, endRound)}，尝试 ${attempt + 1}/${retryLimit + 1}`,
         });
-        const response = await callRecordModelWithRetry(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        const response = await callRecordModelWithRetry(
+            FLASH_MODEL,
+            prompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                "parallel-compress/v1",
+                { axis: "round", start: startRound, end: endRound },
+                groupIndex,
+                `level:${level}/groups:${totalGroups}`,
+            ),
+        );
         lastCheckpointScope = checkpointScopeFromResponse(modelChain, response, options);
         if (response.text) {
             throwIfRecordRunAborted(options, `压缩 RecordPatch ${roundRangeLabel(startRound, endRound)} 已生成，写 checkpoint 前检查到任务已终止`);
@@ -1338,7 +1873,19 @@ async function composeDeltaSerially(
 
         let response: RecordModelCallResult;
         try {
-            response = await callRecordModelWithRetry(FLASH_MODEL, stepPrompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+            response = await callRecordModelWithRetry(
+                FLASH_MODEL,
+                stepPrompt,
+                modelChain,
+                RECORD_MODEL_TIMEOUT_MS,
+                options,
+                recordModelRecipe(
+                    "local-compose-serial-step/v1",
+                    { axis: "round", start: windowStartRound, end: windowEndRound },
+                    i,
+                    `rewrite:${boundary.rewriteStartRound}`,
+                ),
+            );
         } finally {
             if (heartbeat) clearInterval(heartbeat);
         }
@@ -1358,9 +1905,24 @@ async function composeDeltaSerially(
                     `[window] ${i + 1}/${windows.length} rounds ${windowStartRound}-${windowEndRound}\n[response.text length] ${response.text.length}\n[response.error] ${response.error ?? ""}\n\n=== RAW RESPONSE ===\n${response.text}\n\n=== STEP PROMPT ===\n${stepPrompt}`);
                 console.error(`[record-generator] 串行子窗口 ${i + 1} 首次无有效 phases，已落盘诊断: ${diag}`);
             } catch { /* 诊断失败不影响主流程 */ }
-            acc.warnings.push(`子窗口 ${i + 1}/${windows.length} 首次未产出有效 phases，已重试一次`);
-            const retryResp = await callRecordModelWithRetry(FLASH_MODEL, stepPrompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
-            if (retryResp.text) step = parseSerialComposeStep(retryResp.text);
+            if (!options.schedulerManagedExecution) {
+                acc.warnings.push(`子窗口 ${i + 1}/${windows.length} 首次未产出有效 phases，已重试一次`);
+                const retryResp = await callRecordModelWithRetry(
+                    FLASH_MODEL,
+                    stepPrompt,
+                    modelChain,
+                    RECORD_MODEL_TIMEOUT_MS,
+                    options,
+                    recordModelRecipe(
+                        "local-compose-serial-step-repair/v1",
+                        { axis: "round", start: windowStartRound, end: windowEndRound },
+                        i,
+                        `rewrite:${boundary.rewriteStartRound}`,
+                    ),
+                    1,
+                );
+                if (retryResp.text) step = parseSerialComposeStep(retryResp.text);
+            }
             if (effectivePhaseCount(step) === 0) {
                 throw new Error(`串行子窗口 ${i + 1}/${windows.length} 解析失败：未产出任何有效 phases（已重试，仍无可解析结构）`);
             }
@@ -1469,7 +2031,19 @@ async function composeDeltaSerially(
             fileHints,
             parsed.manualSupplementSnippets,
         );
-        const tailResp = await callRecordModelWithRetry(FLASH_MODEL, tailPrompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        const tailResp = await callRecordModelWithRetry(
+            FLASH_MODEL,
+            tailPrompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                "local-compose-serial-tail/v1",
+                { axis: "round", start: boundary.rewriteStartRound, end: totalRounds },
+                windows.length,
+                "tail",
+            ),
+        );
         if (tailResp.text) {
             const parsedTail = parseSerialComposeTail(tailResp.text);
             tailMarkdown = parsedTail.tailMarkdown;
@@ -1478,6 +2052,7 @@ async function composeDeltaSerially(
             acc.warnings.push(`全局尾部生成失败，使用旧 tail 兜底${tailResp.error ? `：${tailResp.error}` : ""}`);
         }
     } catch (err) {
+        if (isBackgroundTaskSuspension(err)) throw err;
         acc.warnings.push(`全局尾部生成异常，使用旧 tail 兜底：${err instanceof Error ? err.message : String(err)}`);
     }
 
@@ -1549,6 +2124,7 @@ async function generateRecordWithLocalCompose(
                 boundary, parsed, rollbackPhaseText, rewritePatches, modelChain, options,
             );
         } catch (err) {
+            if (isBackgroundTaskSuspension(err)) throw err;
             if (isRecordGenerationAbortedError(err)) throw err;
             const msg = err instanceof Error ? err.message : String(err);
             return {
@@ -1586,7 +2162,19 @@ async function generateRecordWithLocalCompose(
             : null;
         let response: RecordModelCallResult;
         try {
-            response = await callRecordModelWithRetry(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+            response = await callRecordModelWithRetry(
+                FLASH_MODEL,
+                prompt,
+                modelChain,
+                RECORD_MODEL_TIMEOUT_MS,
+                options,
+                recordModelRecipe(
+                    "local-compose-delta/v1",
+                    { axis: "round", start: boundary.rewriteStartRound, end: totalRounds },
+                    0,
+                    `stable:${boundary.stableEndRound}`,
+                ),
+            );
         } finally {
             if (heartbeat) clearInterval(heartbeat);
         }
@@ -1653,7 +2241,19 @@ async function generateRecordWithLocalCompose(
                 : null;
             let repairResponse: RecordModelCallResult;
             try {
-                repairResponse = await callRecordModelWithRetry(FLASH_MODEL, repairPrompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+                repairResponse = await callRecordModelWithRetry(
+                    FLASH_MODEL,
+                    repairPrompt,
+                    modelChain,
+                    RECORD_MODEL_TIMEOUT_MS,
+                    options,
+                    recordModelRecipe(
+                        "local-compose-repair/v1",
+                        { axis: "round", start: boundary.rewriteStartRound, end: totalRounds },
+                        1,
+                        `stable:${boundary.stableEndRound}`,
+                    ),
+                );
             } finally {
                 if (repairHeartbeat) clearInterval(repairHeartbeat);
             }
@@ -1805,7 +2405,23 @@ async function generateRecordParallel(
         : null;
     let response: string | null;
     try {
-        response = await callFlashWithRetryChain(FLASH_MODEL, reducePrompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        response = await callFlashWithRetryChain(
+            FLASH_MODEL,
+            reducePrompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                "parallel-reduce/v1",
+                {
+                    axis: "round",
+                    start: chunks[0]?.startRound ?? Math.max(1, resumeFromRound + 1),
+                    end: chunks[chunks.length - 1]?.endRound ?? totalRounds,
+                },
+                0,
+                `patches:${patchesForReduce.length}`,
+            ),
+        );
     } finally {
         if (heartbeat) clearInterval(heartbeat);
     }
@@ -1924,12 +2540,16 @@ export async function generateRecord(
         };
     }
 
-    generationPermit = await acquireRecordGenerationPermit(options);
+    if (!options.schedulerManagedExecution) {
+        generationPermit = await acquireRecordGenerationPermit(options);
+    }
     throwIfRecordRunAborted(options, "开始格式化轮次前检查到任务已终止");
     // 只把未覆盖的新轮次送进模型；全量重写会让超长对话每次更新都超时。
     // 方案1：超大轮（>RECORD_MAX_SINGLE_ROUND_CHARS）走「step 切分→逐段压缩→合并」保内容，
     // 普通轮原样返回；任一段压缩失败整轮降级到有损截断，绝不让 Record 生成失败。
-    const recordModelScope = await resolveRecordModelScope(modelChain, options);
+    const recordModelScope = options.schedulerManagedExecution
+        ? fallbackRecordModelScope(modelChain)
+        : await resolveRecordModelScope(modelChain, options);
     const budgetChain = recordModelScope.modelChain;
     const formattedRounds = await formatRoundsForRecordAsync(roundsToProcess, modelChain, options);
     const maxPromptChars = getMaxPromptChars(budgetChain);
@@ -1978,6 +2598,7 @@ export async function generateRecord(
                 : parallelResult;
             return withRecordModelUsage(mergedParallelResult, options);
         } catch (err) {
+            if (isBackgroundTaskSuspension(err)) throw err;
             if (isRecordGenerationAbortedError(err)) throw err;
             const message = err instanceof Error ? err.message : String(err);
             return withRecordModelUsage({
@@ -2005,7 +2626,19 @@ export async function generateRecord(
             ? buildUpdateRecordPrompt(conversationId, workspace, totalRounds, totalSteps, promptRecord, onlyChunk.text)
             : buildNewRecordPrompt(conversationId, workspace, totalRounds, totalSteps, onlyChunk.text);
 
-        const response = await callFlashWithRetryChain(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        const response = await callFlashWithRetryChain(
+            FLASH_MODEL,
+            prompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                promptRecord ? "serial-single-update/v1" : "serial-single-new/v1",
+                { axis: "round", start: onlyChunk.startRound, end: onlyChunk.endRound },
+                0,
+                `resume:${resumeFromRound}`,
+            ),
+        );
         if (!response) {
             return withRecordModelUsage({
                 success: false,
@@ -2059,7 +2692,19 @@ export async function generateRecord(
             ? buildUpdateRecordPrompt(conversationId, workspace, totalRounds, totalSteps, curPromptRecord, chunk.text)
             : buildNewRecordPrompt(conversationId, workspace, chunk.endRound, totalSteps, chunk.text);
 
-        const response = await callFlashWithRetryChain(FLASH_MODEL, prompt, modelChain, RECORD_MODEL_TIMEOUT_MS, options);
+        const response = await callFlashWithRetryChain(
+            FLASH_MODEL,
+            prompt,
+            modelChain,
+            RECORD_MODEL_TIMEOUT_MS,
+            options,
+            recordModelRecipe(
+                curPromptRecord ? "serial-batch-update/v1" : "serial-batch-new/v1",
+                { axis: "round", start: chunk.startRound, end: chunk.endRound },
+                batchCount - 1,
+                `resume:${resumeFromRound}`,
+            ),
+        );
         if (!response) {
             // 部分完成
             if (currentRecord && currentRecord !== existingRecord) {

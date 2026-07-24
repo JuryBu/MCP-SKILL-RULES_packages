@@ -2,7 +2,7 @@
 
 ## Package-clean
 
-- 输出 `Portable skills verified: 16`。
+- 输出 `Portable skills verified: 17`。
 - 输出 `Portable toolkit package-clean check completed.`。
 - 不报告绝对用户路径、凭据、SQLite、日志、profile、session、node_modules 或 dist。
 
@@ -12,6 +12,7 @@
 - memory-store、web-fetcher、sandbox 均可 initialize。
 - 每个核心 endpoint 的 `tools/list` 至少返回一个工具。
 - `-IncludeOptionalEndpoints` 下，Playwright 与 sequential-thinking 可 initialize；只有配置 Exa remote URL 时才测试 Exa。
+- `-IncludeNapCatEndpoint` 只在接收方已经安装 NapCat、登录 QQ、提供私有 token 和绑定群后测试 `/napcat/mcp`；公开包默认不启动也不探测真实 QQ 服务。
 - 长任务参数 `waitSeconds` / `timeout` 不应被 broker 的 120 秒普通调用上限提前截断，默认总上限为 30 分钟。
 
 ## Functional Fixtures
@@ -23,6 +24,7 @@
 - Grok Council 只在接收方 ProGrok proxy 可用时测试，公开包不保证特定模型名或账户额度。
 - `sandbox_status(action="gc", gcScope="council", gcMode="dryRun")` 只报告候选项，不改动数据；托管 Council 产物根应位于 `SANDBOX_DATA_ROOT\temp`，不应出现在工具包源码目录。
 - 未设置 `SANDBOX_COUNCIL_AUTO_GC=1` 时，启动 Sandbox 不应自动执行会移动或删除持久产物的 Council GC。
+- NapCat 的示例绑定必须使用假账号与假群，真实 `binding.json`、二维码、heartbeat、dedupe state 和 NapCat runtime 不得出现在源码或 zip。
 - Council 的 `apply`、`restore` 与 `purge` 会改动持久数据，只在接收方理解预演结果并明确同意后测试。
 
 ## Troubleshooting

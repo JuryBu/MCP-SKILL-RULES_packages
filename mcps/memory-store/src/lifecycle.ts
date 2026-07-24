@@ -2,11 +2,10 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { exec } from "child_process";
-import { shouldAutoUpdateRecordAsync, generateRecord, countPhasesInRecord, validateRecordCandidateForWrite } from "./record-generator.js";
-import { findRecordHashAsync, resolveWorkspaceHashForRecord, readRecordAsync, writeRecord } from "./record-store.js";
+import { shouldAutoUpdateRecordAsync } from "./record-generator.js";
+import { findRecordHashAsync, resolveWorkspaceHashForRecord } from "./record-store.js";
 import { loadConversationData } from "./conversation-bridge.js";
 import { detectWorkspaceFromSteps } from "./ls-client.js";
-import { acquireRecordSingleFlightPermit, buildAndPersistRecordReaderIndex, withRecordPersistenceWrite } from "./record-update-coordination.js";
 
 /**
  * MCP Memory Store 进程生命周期管理 v1.7
@@ -142,7 +141,6 @@ async function triggerRecordAutoCheck(): Promise<void> {
         const existingHash = await findRecordHashAsync(cascadeId);
         // 自动更新时当前宿主/线程检测到的工作区优先，避免历史异常 hash 持续污染新写入。
         const recordHash = detectedHash || existingHash || resolveWorkspaceHashForRecord();
-        const recordWorkspace = detectedWs || (recordHash === "general" ? "general" : recordHash);
 
         if (existingHash && detectedHash && existingHash !== detectedHash) {
             console.error(
@@ -151,7 +149,6 @@ async function triggerRecordAutoCheck(): Promise<void> {
         }
         const rounds = loaded.rounds;
         if (!await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) return;
-        const totalSteps = loaded.totalSteps;
         const pendingKey = `${recordHash}:${cascadeId}`;
         if (pendingRecordKeys.has(pendingKey)) {
             console.error(`[record-auto] skip duplicate pending update: ${cascadeId.slice(0, 8)}...`);
@@ -161,39 +158,16 @@ async function triggerRecordAutoCheck(): Promise<void> {
         pendingRecordKeys.add(pendingKey);
         const recordModelChain = (loaded.chainUsed === "claude-code" || loaded.chainUsed === "windsurf") ? "auto" : loaded.chainUsed;
         const p = (async () => {
-            const singleFlightPermit = await acquireRecordSingleFlightPermit(cascadeId);
-            try {
-                if (!await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) return;
-                const res = await generateRecord(recordHash, cascadeId, recordWorkspace, rounds, totalSteps, recordModelChain);
-                if (res.success && res.content) {
-                    const content = res.content;
-                    const oldRecord = await readRecordAsync(recordHash, cascadeId) || "";
-                    const gate = validateRecordCandidateForWrite(content, cascadeId, rounds.length, res.coveredRounds || rounds.length, {
-                        oldRecord,
-                    });
-                    if (!gate.ok) {
-                        console.error(`[record-auto] ❌ ${cascadeId.slice(0, 8)}... 候选被拒绝: ${gate.error}`);
-                        return;
-                    }
-                    const phases = countPhasesInRecord(content);
-                    await withRecordPersistenceWrite(async () => {
-                        await writeRecord(recordHash, cascadeId, content, {
-                            totalRounds: rounds.length, totalSteps,
-                            lastUpdatedRound: res.coveredRounds || rounds.length,
-                            phases, tags: res.tags,
-                        });
-                        const readerIndex = await buildAndPersistRecordReaderIndex(recordHash, cascadeId, content);
-                        if (readerIndex.error) {
-                            console.error(`[record-auto] reader index rebuild degraded: ${readerIndex.error instanceof Error ? readerIndex.error.message : String(readerIndex.error)}`);
-                        }
-                    });
-                    console.error(`[record-auto] ✅ ${cascadeId.slice(0, 8)}... (${phases} Phase)`);
-                } else if (res.error) {
-                    console.error(`[record-auto] ❌ ${cascadeId.slice(0, 8)}... ${res.error}`);
-                }
-            } finally {
-                singleFlightPermit.release();
-            }
+            if (!await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) return;
+            const { admitRecordAutoUpdate } = await import("./tools/record.js");
+            const result = await admitRecordAutoUpdate({
+                workspaceHash: recordHash,
+                conversationId: cascadeId,
+                ...(detectedWs ? { workspace: detectedWs } : {}),
+                dataChain: loaded.chainUsed,
+                modelChain: recordModelChain,
+            });
+            console.error(`[record-auto] ${result.replace(/\n/gu, " | ")}`);
         })()
             .catch(error => console.error(`[record-auto] ❌ ${cascadeId.slice(0, 8)}... ${error instanceof Error ? error.message : String(error)}`))
             .finally(() => {

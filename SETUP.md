@@ -17,7 +17,7 @@ Copy `templates/env.example.ps1` to a private local file outside the repository,
 ./install/Test-CodexToolkit.ps1 -PackageClean
 ```
 
-This verifies required MCP packages, four-host Rules, all 16 portable Skills, JSON config templates, absolute-path safety, and forbidden runtime files.
+This verifies required MCP packages, four-host Rules, all 17 portable Skills, JSON config templates, absolute-path safety, and forbidden runtime files.
 
 ## 3. Build MCP Servers
 
@@ -34,6 +34,14 @@ Optional Windsurf-only subagent:
 ```
 
 Building it does not edit Windsurf configuration. Follow `mcps/mcp-subagent/README.md` separately.
+
+Optional NapCat source check:
+
+```powershell
+./install/Install-CodexToolkit.ps1 -IncludeNapCat
+```
+
+This does not install NapCat or log in to QQ. It only validates the bundled source and unit tests.
 
 ## 4. Start The HTTP Broker
 
@@ -175,7 +183,28 @@ $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
 
 The broker uses `exa-stateless-stdio.mjs` for stable tools/list fallback and retry behavior. Do not commit `broker-private.env.json` or the real URL.
 
-## 12. Install Skills
+## 12. Optional NapCat QQ Group Endpoint
+
+Install and log in to a receiver-owned NapCat instance separately. Then copy the example binding to the private data root and replace every example identity:
+
+```powershell
+New-Item -ItemType Directory -Force "$env:USERPROFILE\.codex-toolkit\napcat-mcp" | Out-Null
+Copy-Item ".\mcps\napcat-mcp\binding.example.json" "$env:USERPROFILE\.codex-toolkit\napcat-mcp\binding.json"
+```
+
+Keep the OneBot token in a private environment file outside the repository:
+
+```powershell
+$env:CODEX_TOOLKIT_ENABLE_NAPCAT_MCP = "1"
+$env:NAPCAT_HTTP_URL = "http://127.0.0.1:3010"
+$env:NAPCAT_ACCESS_TOKEN = "<receiver-private-onebot-token>"
+```
+
+Restart the broker, then uncomment the optional NapCat block in `templates/config.codex.toml`. The endpoint supports fixed-group notifications, structured `task_id` messages, recent-message reads, file upload/download, and heartbeat scripts. It never accepts an arbitrary group ID from a tool call.
+
+Do not share NapCat binaries, QQ login state, QR codes, `binding.json`, OneBot tokens, heartbeat state, or dedupe files. Full details are in `mcps/napcat-mcp/README.md`.
+
+## 13. Install Skills
 
 Copy selected folders from `skills/` into:
 
@@ -187,7 +216,7 @@ Restart Codex or open a new task. Other hosts may use the `SKILL.md` files as wo
 
 Office skills with redistribution-restricted local licenses and Codex system/plugin-cache skills are intentionally excluded. See `skills/skills_manifest.md`.
 
-## 13. Smoke Tests
+## 14. Smoke Tests
 
 Core endpoints:
 
@@ -203,11 +232,17 @@ Optional Playwright, sequential-thinking, and configured Exa endpoints:
 
 Windsurf subagent is not included in generic smoke tests because a real check would require a signed-in Windsurf session and create Cascade state.
 
-## 13. Build A Shareable Zip
+NapCat is also excluded from generic smoke tests because a live check requires a receiver-owned QQ login and bound group. After configuring it explicitly:
+
+```powershell
+./install/Test-CodexToolkit.ps1 -IncludeNapCatEndpoint
+```
+
+## 15. Build A Shareable Zip
 
 ```powershell
 $env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-private-marker"
-./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-12" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-12.zip"
+./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-24" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-24.zip"
 ```
 
 The command refuses to overwrite an existing output directory or archive, validates both source and copied package, and prints SHA256.

@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 
-const userProfile = process.env.USERPROFILE || process.env.HOME || process.cwd();
-const DATA_DIR = process.env.SUBAGENT_DATA_DIR || path.join(userProfile, ".codex-toolkit", "subagent-data");
+const DATA_DIR = process.env.SUBAGENT_DATA_DIR
+  || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "mcp-subagent");
 const REGISTRY_PATH = process.env.SUBAGENT_REGISTRY_PATH || path.join(DATA_DIR, "jobs.json");
 const LOCK_PATH = process.env.SUBAGENT_REGISTRY_LOCK_PATH || path.join(DATA_DIR, "jobs.lock");
 

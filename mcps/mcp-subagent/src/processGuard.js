@@ -108,7 +108,9 @@ export async function acquireProcessGuard() {
     if (lock?.pid && !(await pidExists(lock.pid))) {
       await claimStaleOwnerLock(lockPath, lock);
     } else {
-      const brokerFollowerAllowed = process.env.SUBAGENT_ALLOW_BROKER_FOLLOWER === "1";
+      const brokerFollowerAllowed =
+        process.env.SUBAGENT_ALLOW_BROKER_FOLLOWER === "1"
+        || process.env.CODEX_MCP_BROKER === "1";
       if (brokerFollowerAllowed) {
         let upgradeTimer = null;
         let upgraded = false;

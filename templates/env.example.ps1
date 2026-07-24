@@ -26,6 +26,14 @@ $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-pr
 # Keep the real key on the receiver machine; do not write it into files you send around.
 # $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
 
+# Optional NapCat QQ group collaboration MCP. NapCat itself and QQ login state are not bundled.
+# Copy mcps\napcat-mcp\binding.example.json to the private data root and replace all example values.
+# $env:CODEX_TOOLKIT_ENABLE_NAPCAT_MCP = "1"
+# $env:NAPCAT_HTTP_URL = "http://127.0.0.1:3010"
+# $env:NAPCAT_ACCESS_TOKEN = "<receiver-private-onebot-token>"
+# $env:NAPCAT_MCP_BINDING_PATH = "$env:CODEX_TOOLKIT_DATA_ROOT\napcat-mcp\binding.json"
+# $env:NAPCAT_MCP_STATE_PATH = "$env:CODEX_TOOLKIT_DATA_ROOT\napcat-mcp\state\dedupe.json"
+
 # Optional Grok / ProGrok OpenAI-compatible model bridge.
 # The toolkit only probes this endpoint. It does not install, start, patch, or authenticate ProGrok.
 # Keep the real API key in the receiver's private environment, never in this repository or a shared zip.

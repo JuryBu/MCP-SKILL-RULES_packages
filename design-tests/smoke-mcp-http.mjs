@@ -4,6 +4,7 @@ if (process.env.CODEX_TOOLKIT_SMOKE_OPTIONAL === "1") {
   if (process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL) endpoints.push("exa");
   if (process.env.CODEX_TOOLKIT_SMOKE_SUBAGENT === "1") endpoints.push("subagent");
 }
+if (process.env.CODEX_TOOLKIT_SMOKE_NAPCAT === "1") endpoints.push("napcat");
 
 const base = process.env.CODEX_TOOLKIT_MCP_BASE_URL || "http://127.0.0.1:14588";
 
