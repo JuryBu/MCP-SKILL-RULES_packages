@@ -101,7 +101,29 @@ async function cancelUnusedProviderLease(lease: ProviderTransportLease | undefin
 }
 
 function getCodexCommand(): string {
-    return process.env.MEMORY_STORE_CODEX_COMMAND || "codex";
+    const configuredCommand = process.env.MEMORY_STORE_CODEX_COMMAND;
+    if (configuredCommand) {
+        const looksLikePath = path.isAbsolute(configuredCommand) || /[\\/]/u.test(configuredCommand);
+        if (!looksLikePath || fs.existsSync(configuredCommand)) return configuredCommand;
+    }
+
+    if (process.platform === "win32") {
+        const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+        const binRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
+        try {
+            const candidates = fs.readdirSync(binRoot, { withFileTypes: true })
+                .filter((entry) => entry.isDirectory())
+                .map((entry) => path.join(binRoot, entry.name, "codex.exe"))
+                .filter((candidate) => fs.existsSync(candidate))
+                .map((candidate) => ({ candidate, modifiedAt: fs.statSync(candidate).mtimeMs }))
+                .sort((left, right) => right.modifiedAt - left.modifiedAt);
+            if (candidates[0]) return candidates[0].candidate;
+        } catch {
+            return "codex";
+        }
+    }
+
+    return "codex";
 }
 
 function getClaudeCodeCommand(): string {

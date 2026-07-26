@@ -215,7 +215,12 @@ function lineRangeLabel(startLine: number, endLine: number): string {
 
 function truncateText(text: string, maxChars: number): string {
     if (text.length <= maxChars) return text;
-    return `${text.slice(0, Math.max(0, maxChars - 80))}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
+    let end = Math.max(0, maxChars - 80);
+    if (end > 0) {
+        const lastCodeUnit = text.charCodeAt(end - 1);
+        if (lastCodeUnit >= 0xD800 && lastCodeUnit <= 0xDBFF) end -= 1;
+    }
+    return `${text.slice(0, end)}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
 }
 
 function deriveGuardAnchors(stageId?: string): string[] {

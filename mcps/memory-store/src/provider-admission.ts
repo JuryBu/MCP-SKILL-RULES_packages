@@ -819,31 +819,36 @@ export class ProviderAdmission {
         const nowMs = this.currentTime();
         if (this.ownerFence) {
             if (this.ownerLeaseExpiresAtMs === null) throw new ProviderAdmissionFencedError("provider owner 本地 lease expiry 缺失");
-            if (this.ownerLeaseExpiresAtMs - nowMs >= requiredValidityMs) return;
-            let renewed: Awaited<ReturnType<typeof renewProviderControlOwner>>;
-            try {
-                renewed = await renewProviderControlOwner({
-                    ...this.storeOptions,
-                    ...this.ownerFence,
-                    leaseDurationMs: this.ownerLeaseDurationMs,
-                    nowMs,
-                });
-            } catch (error) {
-                if (error instanceof ProviderControlFencedError) {
-                    throw new ProviderAdmissionFencedError(`provider owner 续租被 fence：${error.message}`);
+            if (this.ownerLeaseExpiresAtMs <= nowMs) {
+                this.ownerFence = null;
+                this.ownerLeaseExpiresAtMs = null;
+            } else {
+                if (this.ownerLeaseExpiresAtMs - nowMs >= requiredValidityMs) return;
+                let renewed: Awaited<ReturnType<typeof renewProviderControlOwner>>;
+                try {
+                    renewed = await renewProviderControlOwner({
+                        ...this.storeOptions,
+                        ...this.ownerFence,
+                        leaseDurationMs: this.ownerLeaseDurationMs,
+                        nowMs,
+                    });
+                } catch (error) {
+                    if (error instanceof ProviderControlFencedError) {
+                        throw new ProviderAdmissionFencedError(`provider owner 续租被 fence：${error.message}`);
+                    }
+                    throw error;
                 }
-                throw error;
+                if (!await verifyProviderControlDurabilityReceipt(renewed.receipt, { ...this.storeOptions, nowMs })) {
+                    throw new ProviderAdmissionFencedError("owner renew receipt 已被其他 owner 取代");
+                }
+                if (renewed.state.ownerEpoch !== this.ownerFence.ownerEpoch
+                    || renewed.value.leaseId !== this.ownerFence.ownerLeaseId
+                    || renewed.value.expiresAtMs <= nowMs) {
+                    throw new ProviderAdmissionFencedError("owner renew 回读的 fence/expiry 不一致");
+                }
+                this.ownerLeaseExpiresAtMs = renewed.value.expiresAtMs;
+                return;
             }
-            if (!await verifyProviderControlDurabilityReceipt(renewed.receipt, { ...this.storeOptions, nowMs })) {
-                throw new ProviderAdmissionFencedError("owner renew receipt 已被其他 owner 取代");
-            }
-            if (renewed.state.ownerEpoch !== this.ownerFence.ownerEpoch
-                || renewed.value.leaseId !== this.ownerFence.ownerLeaseId
-                || renewed.value.expiresAtMs <= nowMs) {
-                throw new ProviderAdmissionFencedError("owner renew 回读的 fence/expiry 不一致");
-            }
-            this.ownerLeaseExpiresAtMs = renewed.value.expiresAtMs;
-            return;
         }
         let current = await readProviderControlStore(this.storeOptions);
         if (current.kind === "repair-required") {
