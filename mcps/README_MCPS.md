@@ -36,7 +36,7 @@ Optional Windsurf Cascade-only async subagent controller. It is not a shared fou
 
 ### napcat-mcp 0.1.0
 
-Optional fixed-QQ-group collaboration MCP for status checks, target discovery, recent-message reads, structured `task_id` messages, training notifications, group-file upload/download, and heartbeat management. It is source-only and disabled by default; the receiver must supply NapCat OneBot, a private token, QQ login state, and a private `binding.json`.
+Optional fixed-QQ-group collaboration MCP for status checks, structured task messages, verified file indexes, task ledger registration, trusted-peer routing, Codex conversation wakeups, heartbeat management, a process supervisor, and per-user autostart. It is source-only and disabled by default; the receiver must supply NapCat OneBot, a private token, QQ login state, and a private `binding.json`.
 
 ## Portable Data
 
@@ -58,6 +58,9 @@ Main overrides:
 - `WSF_CASCADE_ENDPOINT`
 - `NAPCAT_MCP_BINDING_PATH`
 - `NAPCAT_MCP_STATE_PATH`
+- `NAPCAT_TASK_REGISTRY_PATH`
+- `NAPCAT_TASK_ROUTER_RUNTIME_PATH`
+- `NAPCAT_TASK_ROUTER_LOG_PATH`
 
 ## Optional Model / Search Services
 

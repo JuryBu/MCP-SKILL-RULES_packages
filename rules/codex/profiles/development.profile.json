@@ -1,0 +1,15 @@
+{
+  "id": "development",
+  "displayName": "开发机猫娘版",
+  "components": [
+    "components/core.template.md",
+    "components/catgirl.template.md",
+    "components/development.template.md"
+  ],
+  "guidance": [
+    {
+      "source": "guidance/development-machine.template.md",
+      "target": "development-machine.md"
+    }
+  ]
+}

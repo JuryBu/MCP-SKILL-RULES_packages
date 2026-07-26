@@ -6,15 +6,13 @@ param(
   [string]$Summary = "训练进程仍在运行",
   [string]$Progress = "",
   [string]$CheckpointAt = "",
-  [string]$DataRoot = (Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"),
-  [string]$BrokerRoot = ""
+  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
 )
 
 $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
-  $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker"
-}
+if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker" }
 $RunnerPath = Join-Path $NapCatMcpRoot "src\heartbeat-runner.mjs"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
 $BindingPath = Join-Path $DataRoot "binding.json"

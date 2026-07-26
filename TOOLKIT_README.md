@@ -7,8 +7,8 @@
 - 三个通用 MCP：memory-store 1.21.1、web-fetcher 7.0.0、sandbox 1.15.1。
 - 一个 portable HTTP broker 0.1.0，用于 Codex 和其他支持 HTTP MCP 的宿主。
 - 一个 Windsurf-only subagent 1.1.0，只在你明确安装并登录 Windsurf 后使用。
-- 一个可选 NapCat MCP 0.1.0，用于 QQ 群通知、跨设备任务消息和群文件传输；需要你自己的 NapCat、QQ 登录与群绑定。
-- Codex、Antigravity、Claude Code、Windsurf 四套脱敏 Rules。
+- 一个可选 NapCat MCP 0.1.0，用于 QQ 群通知、跨设备任务账本、可信路由、Codex 对话唤醒和群文件传输；需要你自己的 NapCat、QQ 登录与群绑定。
+- Codex、Antigravity、Claude Code、Windsurf 四宿主脱敏 Rules；Codex 额外提供中性、普通猫娘、开发机猫娘、训练机猫娘四种组合。
 - 17 个许可证允许迁移的 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
 
 ## 最短安装路径
@@ -21,7 +21,13 @@
 ./install/Test-CodexToolkit.ps1
 ```
 
-然后把 `rules/codex/AGENTS.template.md` 合并到自己的 `%USERPROFILE%/.codex/AGENTS.md`，按需复制 `skills/` 中的技能目录。
+然后按自己的使用方式安装 Codex Rules，例如保留原有自然猫娘表达：
+
+```powershell
+./install/Install-CodexRulesProfile.ps1 -Profile catgirl
+```
+
+可选值还有 `neutral`、`development`、`training`。脚本会先备份已有 `%USERPROFILE%/.codex/AGENTS.md`，再由公共工程核心和所选角色组件生成新文件；开发机、训练机的真实账号、路径和群绑定应放在仓库外的私有覆盖文件中，通过 `-LocalOverridePath` 传入。最后按需复制 `skills/` 中的技能目录。
 
 ## 单宿主与多宿主
 
@@ -43,6 +49,6 @@
 
 ---
 
-This is a source-only receiver package. It includes portable MCP servers, broker scripts, four-host rules, seventeen license-reviewed skills, configuration examples, and smoke tests. It does not include sender credentials, browser state, memories, conversations, logs, databases, NapCat binaries, QQ login state, or real group bindings.
+This is a source-only receiver package. It includes portable MCP servers, broker scripts, four-host rules, four composable Codex profiles, seventeen license-reviewed skills, configuration examples, and smoke tests. It does not include sender credentials, browser state, memories, conversations, logs, databases, NapCat binaries, QQ login state, or real group bindings.
 
 Run `install/Test-CodexToolkit.ps1 -PackageClean` first, then follow `SETUP.md`. ProGrok, Exa credentials, signed-in browser profiles, Windsurf Cascade access, and NapCat OneBot are receiver-managed optional dependencies.

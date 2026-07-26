@@ -56,11 +56,15 @@ token.json
 tokens.json
 cookies-backup.json
 localstorage-backup.json
+rules/codex/local-overrides.md
+rules/codex/*.local.md
 *.pem
 *.key
 *.p12
 *.pfx
 **/profiles/
+!rules/codex/profiles/
+!rules/codex/profiles/*.json
 **/browser-profile/
 **/user-data-dir/
 
@@ -74,6 +78,8 @@ Thumbs.db
 *.before-*
 
 # Planning/private scratch files
+/plans/
+/profile-preview/
 Plan_*.md
 Task.md
 Task_*.md

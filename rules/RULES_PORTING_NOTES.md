@@ -12,6 +12,7 @@
 - PPT/PDF/DOCX/XLSX skill and visual QA expectations where applicable.
 - Stage Guard / Record / conversation-reading discipline.
 - Council manifest ownership, stable `ownerId`, `antigravityCli` naming, and `dryRun` before any artifact cleanup.
+- A shared Codex engineering core, with optional catgirl, development-machine, and training-machine overlays.
 
 ## Removed or Replaced
 
@@ -20,6 +21,7 @@
 - Private memory, local project paths, and historical private workspace references where they would identify the sender.
 - sender-specific project branding.
 - Credential material, private broker settings, and runtime environment details.
+- Real dual-machine identities, trusted peer accounts, fixed group bindings, and machine-specific absolute paths.
 
 ## Receiver Must Adjust
 
@@ -29,3 +31,4 @@
 - Whether the optional NapCat endpoint is enabled; the receiver must supply a private OneBot token and fixed-group binding.
 - Which search provider, models, and background-task limits are available in the receiver's environment.
 - Local authorization and credential storage; keep it outside package files.
+- Which Codex profile to install. Put machine-private facts in a repository-external override copied from `codex/local-overrides.example.md`.

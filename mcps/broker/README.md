@@ -50,6 +50,8 @@ Exa stateless bridge:
 NapCat QQ group bridge:
 
 - `/napcat/mcp` is added only when `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP=1`; the source package remains inert otherwise.
+- Task registry, router runtime, log, stop, and lock files are rooted below the receiver's `.codex-toolkit/napcat-mcp/state` directory unless their individual `NAPCAT_TASK_*` paths are overridden.
+- The endpoint includes a task ledger, fixed-group router, Codex wake bridge, supervisor, and per-user autostart scripts. All remain inactive until the receiver configures NapCat and registers an open task.
 - The receiver must install NapCat separately, provide a loopback `NAPCAT_HTTP_URL`, keep `NAPCAT_ACCESS_TOKEN` private, and place a receiver-owned fixed-group binding below `%USERPROFILE%\.codex-toolkit\napcat-mcp` or set `NAPCAT_MCP_BINDING_PATH` explicitly.
 - The broker never bundles QQ login state, a real binding, heartbeat state, QR codes, or NapCat binaries. See `../napcat-mcp/README.md`.
 

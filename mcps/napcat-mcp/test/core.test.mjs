@@ -21,9 +21,11 @@ async function createFixture(options = {}) {
   const calls = [];
   const messages = new Map();
   const groupFiles = [];
+  const primedFileIds = new Set();
   const downloadContent = Buffer.from("NapCat fixed-group download test\n", "utf8");
   let downloadBaseUrl = "";
   let messageSequence = 1000;
+  let taskFileIndexFailureCount = 0;
   const runtime = {
     selfId: options.selfId ?? "1000000001",
     nickname: options.nickname ?? "ExampleBot",
@@ -36,8 +38,8 @@ async function createFixture(options = {}) {
     message_seq: "900",
     group_id: runtime.groupId,
     time: 1784869200,
-    user_id: "2027801584",
-    sender: { user_id: "2027801584", nickname: "群成员", card: "成员备注" },
+    user_id: "1000000004",
+    sender: { user_id: "1000000004", nickname: "群成员", card: "成员备注" },
     message: [{ type: "text", data: { text: "历史消息" } }],
     raw_message: "历史消息",
   });
@@ -47,10 +49,10 @@ async function createFixture(options = {}) {
       message_seq: "901",
       group_id: runtime.groupId,
       time: 1784869260,
-      user_id: "3000000001",
-      sender: { user_id: "3000000001", nickname: "ExampleUser", card: "ExampleMachine" },
-      message: "[CQ:file,file=训练回包&#44;v1.zip,file_id=/history-file-1,file_size=33]",
-      raw_message: "[CQ:file,file=训练回包&#44;v1.zip,file_id=/history-file-1,file_size=33]",
+      user_id: "1000000003",
+      sender: { user_id: "1000000003", nickname: "ExampleUser", card: "开发机" },
+      message: "[CQ:file,file=训练回包&#44;v1.zip,file_id=/history-file-1,file_size=33,busid=102]",
+      raw_message: "[CQ:file,file=训练回包&#44;v1.zip,file_id=/history-file-1,file_size=33,busid=102]",
     });
   }
   if (options.includeTaskMessages) {
@@ -59,8 +61,8 @@ async function createFixture(options = {}) {
       message_seq: "902",
       group_id: runtime.groupId,
       time: 1784869320,
-      user_id: "3000000001",
-      sender: { user_id: "3000000001", nickname: "ExampleUser", card: "ExampleMachine" },
+      user_id: "1000000003",
+      sender: { user_id: "1000000003", nickname: "ExampleUser", card: "开发机" },
       message: "[Codex][TASK_MESSAGE]\n任务：语音处理\n来源机器：development\n目标机器：training\n正文：新主包已发送",
       raw_message: "[Codex][TASK_MESSAGE]\n任务：语音处理\n来源机器：development\n目标机器：training\n正文：新主包已发送",
     });
@@ -69,8 +71,8 @@ async function createFixture(options = {}) {
       message_seq: "903",
       group_id: runtime.groupId,
       time: 1784869380,
-      user_id: "3000000001",
-      sender: { user_id: "3000000001", nickname: "ExampleUser", card: "ExampleMachine" },
+      user_id: "1000000003",
+      sender: { user_id: "1000000003", nickname: "ExampleUser", card: "开发机" },
       message: "[Codex][TASK_MESSAGE]\n任务：数字图像处理\n来源机器：development\n目标机器：training\n正文：等待处理",
       raw_message: "[Codex][TASK_MESSAGE]\n任务：数字图像处理\n来源机器：development\n目标机器：training\n正文：等待处理",
     });
@@ -125,6 +127,13 @@ async function createFixture(options = {}) {
         member_count: runtime.memberCount,
       };
     } else if (action === "send_group_msg") {
+      const isTaskFileIndex = String(body.message ?? "").includes("[Codex][TASK_FILE_INDEX]");
+      if (options.failTaskFileIndexOnce && isTaskFileIndex && taskFileIndexFailureCount === 0) {
+        taskFileIndexFailureCount += 1;
+        response.statusCode = 400;
+        response.end(JSON.stringify({ status: "failed", retcode: 1400, data: null }));
+        return;
+      }
       messageSequence += 1;
       const messageId = String(messageSequence);
       messages.set(messageId, {
@@ -150,11 +159,26 @@ async function createFixture(options = {}) {
         .filter((message) => String(message.group_id) === String(body.group_id))
         .filter((message) => Number(message.message_seq) <= cursor)
         .sort((left, right) => Number(left.message_seq) - Number(right.message_seq));
-      data = {
-        messages: body.reverse_order === true
+      const returnedMessages = body.reverse_order === true
           ? history.slice(-count).reverse()
-          : history.slice(-count),
-      };
+          : history.slice(-count);
+      for (const message of returnedMessages) {
+        if (Array.isArray(message.message)) {
+          for (const segment of message.message) {
+            if (segment?.type === "file" && segment?.data?.file_id) {
+              primedFileIds.add(String(segment.data.file_id));
+            }
+          }
+        }
+        const rawMessage = String(message.raw_message ?? "");
+        for (const match of rawMessage.matchAll(/\[CQ:file,([^\]]+)\]/g)) {
+          for (const part of match[1].split(",")) {
+            const [name, ...valueParts] = part.split("=");
+            if (name === "file_id") primedFileIds.add(valueParts.join("="));
+          }
+        }
+      }
+      data = { messages: returnedMessages };
     } else if (action === "get_msg") {
       const stored = messages.get(String(body.message_id)) ?? null;
       if (options.getMsgMode === "null") {
@@ -171,14 +195,37 @@ async function createFixture(options = {}) {
         data = stored;
       }
     } else if (action === "upload_group_file") {
-      const fileId = `file-${groupFiles.length + 1}`;
+      const ordinal = groupFiles.length + 1;
+      const fileId = `raw-file-uuid-${ordinal}`;
+      const rootFileId = `root-cache-file-${ordinal}`;
       const fileSize = fs.statSync(body.file).size;
+      messageSequence += 1;
+      const messageId = String(messageSequence);
+      messages.set(messageId, {
+        message_id: messageId,
+        message_seq: messageId,
+        group_id: Number(runtime.groupId),
+        time: 1784869200,
+        user_id: runtime.selfId,
+        sender: { user_id: runtime.selfId, nickname: runtime.nickname },
+        message: [{
+          type: "file",
+          data: {
+            file: body.name,
+            file_id: fileId,
+            file_size: fileSize,
+            busid: 102,
+          },
+        }],
+        raw_message: `[CQ:file,file=${body.name},file_id=${fileId},file_size=${fileSize},busid=102]`,
+      });
       groupFiles.unshift({
         group_id: Number(runtime.groupId),
-        file_id: fileId,
+        file_id: rootFileId,
         file_name: body.name,
         file_size: fileSize,
         size: fileSize,
+        busid: 102,
         uploader: Number(runtime.selfId),
         uploader_name: runtime.nickname,
       });
@@ -186,6 +233,16 @@ async function createFixture(options = {}) {
     } else if (action === "get_group_root_files") {
       data = { files: groupFiles, folders: [] };
     } else if (action === "get_group_file_url") {
+      if (!primedFileIds.has(String(body.file_id))) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({
+          status: "failed",
+          retcode: 1400,
+          data: null,
+          message: "real fileUUID not found!",
+        }));
+        return;
+      }
       data = { url: `${downloadBaseUrl}/download/history-file-1` };
     } else {
       response.end(JSON.stringify({ status: "failed", retcode: 1404, data: null }));
@@ -226,6 +283,7 @@ async function createFixture(options = {}) {
     statePath,
     temporaryRoot,
     createNotifier,
+    clearFileUrlCache: () => primedFileIds.clear(),
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
@@ -260,7 +318,7 @@ test("status verifies OneBot identity and fixed group", async () => {
   }
 });
 
-test("discoverTarget returns only exact bound-group candidate", async () => {
+test("discoverTarget returns only exact ExampleGroup candidate", async () => {
   const fixture = await createFixture({ bindingGroupId: "" });
   try {
     const result = await fixture.notifier.discoverTarget();
@@ -324,6 +382,7 @@ test("read recent messages extracts CQ file metadata", async () => {
       fileId: "/history-file-1",
       fileName: "训练回包,v1.zip",
       fileBytes: 33,
+      busId: 102,
       downloadable: true,
     }]);
   } finally {
@@ -340,17 +399,21 @@ test("read recent messages filters exact structured task id", async () => {
     assert.equal(result.returnedCount, 1);
     assert.equal(result.messages[0].messageId, "902");
     assert.equal(result.messages[0].taskId, "语音处理");
+    assert.equal(result.messages[0].sourceMachine, "development");
+    assert.equal(result.messages[0].targetMachine, "training");
   } finally {
     await fixture.close();
   }
 });
 
-test("download file uses the bound group and returns local hash", async () => {
-  const fixture = await createFixture();
+test("download file refreshes group history after a NapCat fileUuid cache miss", async () => {
+  const fixture = await createFixture({ includeHistoryFile: true });
   try {
     const destinationDirectory = path.join(fixture.temporaryRoot, "downloads");
     const result = await fixture.notifier.downloadFile({
       file_id: "/history-file-1",
+      message_seq: "901",
+      busid: 102,
       destination_dir: destinationDirectory,
       name: "received.zip",
     });
@@ -359,9 +422,13 @@ test("download file uses the bound group and returns local hash", async () => {
     assert.equal(result.fileBytes, Buffer.byteLength("NapCat fixed-group download test\n"));
     assert.equal(fs.readFileSync(result.filePath, "utf8"), "NapCat fixed-group download test\n");
     assert.equal(result.sha256, createHash("sha256").update("NapCat fixed-group download test\n").digest("hex"));
-    const urlCall = fixture.calls.find((call) => call.action === "get_group_file_url");
+    assert.equal(result.cacheRefresh.matched, true);
+    const urlCalls = fixture.calls.filter((call) => call.action === "get_group_file_url");
+    assert.equal(urlCalls.length, 2);
+    const urlCall = urlCalls.at(-1);
     assert.equal(String(urlCall.body.group_id), "123456789");
     assert.equal(urlCall.body.file_id, "/history-file-1");
+    assert.equal(urlCall.body.busid, 102);
     await assert.rejects(
       () => fixture.notifier.downloadFile({
         file_id: "/history-file-1",
@@ -505,6 +572,178 @@ test("file preview hashes locally and fixed-group upload verifies by file list",
     assert.equal(second.sent, false);
     assert.equal(second.duplicateSuppressed, true);
     assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("task file upload publishes a verified index readable by task id", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "task-return.zip");
+    const content = "task-file-index-content";
+    fs.writeFileSync(filePath, content, "utf8");
+    const input = {
+      file_path: filePath,
+      name: "任务回包.zip",
+      task_id: "tgt-20260724-task-file",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "tgt-20260724-task-file:return-package",
+    };
+
+    const result = await fixture.notifier.sendFile(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.taskIndex.status, "sent_verified");
+    assert.equal(result.taskIndex.sent, true);
+    assert.equal(result.taskIndex.verified, true);
+    assert.notEqual(result.taskIndex.dedupeKey, input.dedupe_key);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    const indexCall = fixture.calls.find((call) => call.action === "send_group_msg");
+    assert.match(indexCall.body.message, /\[Codex\]\[TASK_FILE_INDEX\]/);
+    assert.match(indexCall.body.message, /任务：tgt-20260724-task-file/);
+    assert.match(indexCall.body.message, /来源机器：development/);
+    assert.match(indexCall.body.message, /目标机器：training/);
+    assert.match(indexCall.body.message, /file_id：raw-file-uuid-1/);
+    assert.match(indexCall.body.message, /file_message_seq：1001/);
+    assert.match(indexCall.body.message, /busid：102/);
+    assert.match(indexCall.body.message, /文件名：任务回包\.zip/);
+    assert.match(indexCall.body.message, new RegExp(`字节数：${Buffer.byteLength(content)}`));
+    assert.match(indexCall.body.message, new RegExp(`sha256：${createHash("sha256").update(content).digest("hex")}`));
+
+    const recent = await fixture.notifier.readRecentMessages({ count: 10, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 1);
+    assert.equal(recent.messages[0].taskId, input.task_id);
+    assert.equal(recent.messages[0].sourceMachine, input.source_machine);
+    assert.equal(recent.messages[0].targetMachine, input.target_machine);
+    assert.match(recent.messages[0].text, /file_id：raw-file-uuid-1/);
+
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "sent_verified");
+    assert.equal(state.entries[input.dedupe_key].fileId, "raw-file-uuid-1");
+    assert.equal(state.entries[input.dedupe_key].verifiedFileId, "root-cache-file-1");
+    assert.equal(state.entries[input.dedupe_key].fileMessageSeq, "1001");
+    assert.equal(state.entries[result.taskIndex.dedupeKey].status, "sent_verified");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("task file index stays downloadable after the receiving NapCat cache is cleared", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "cross-machine-return.zip");
+    fs.writeFileSync(filePath, "cross-machine-download", "utf8");
+    const sent = await fixture.notifier.sendFile({
+      file_path: filePath,
+      name: "跨机回包.zip",
+      task_id: "tgt-20260724-cross-machine",
+      source_machine: "training",
+      target_machine: "development",
+      dedupe_key: "tgt-20260724-cross-machine:return-package",
+    });
+    assert.equal(sent.fileId, "raw-file-uuid-1");
+    assert.equal(sent.verifiedFileId, "root-cache-file-1");
+    assert.equal(sent.fileMessageSeq, "1001");
+
+    fixture.clearFileUrlCache();
+    const destinationDirectory = path.join(fixture.temporaryRoot, "received");
+    const downloaded = await fixture.notifier.downloadFile({
+      file_id: sent.fileId,
+      message_seq: sent.fileMessageSeq,
+      busid: sent.fileBusId,
+      destination_dir: destinationDirectory,
+      name: "received-cross-machine.zip",
+    });
+    assert.equal(downloaded.downloaded, true);
+    assert.equal(downloaded.cacheRefresh.matched, true);
+    assert.equal(fs.readFileSync(downloaded.filePath, "utf8"), "NapCat fixed-group download test\n");
+    const finalUrlCall = fixture.calls.filter((call) => call.action === "get_group_file_url").at(-1);
+    assert.equal(finalUrlCall.body.file_id, "raw-file-uuid-1");
+    assert.equal(finalUrlCall.body.file_id.includes("root-cache-file"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("task file retry only resends the failed index", async () => {
+  const fixture = await createFixture({ failTaskFileIndexOnce: true });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "task-retry.zip");
+    fs.writeFileSync(filePath, "task-file-index-retry", "utf8");
+    const input = {
+      file_path: filePath,
+      name: "索引重试.zip",
+      task_id: "tgt-20260724-index-retry",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "tgt-20260724-index-retry:return-package",
+    };
+
+    const first = await fixture.notifier.sendFile(input);
+    assert.equal(first.sent, true);
+    assert.equal(first.verified, true);
+    assert.equal(first.taskIndex.status, "failed_before_ack");
+    assert.equal(first.taskIndex.sent, false);
+    assert.equal(first.taskIndex.error.code, "ONEBOT_HTTP_ERROR");
+    assert.equal(first.taskIndex.error.outcomeUnknown, false);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+
+    const second = await fixture.notifier.sendFile(input);
+    assert.equal(second.sent, false);
+    assert.equal(second.reason, "file_already_uploaded");
+    assert.equal(second.taskIndex.status, "sent_verified");
+    assert.equal(second.taskIndex.sent, true);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 2);
+
+    const third = await fixture.notifier.sendFile(input);
+    assert.equal(third.taskIndex.status, "sent_verified");
+    assert.equal(third.taskIndex.sent, false);
+    assert.equal(third.taskIndex.duplicateSuppressed, true);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 2);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("file without task id keeps ordinary upload and emits no index", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "ordinary-upload.zip");
+    fs.writeFileSync(filePath, "ordinary-file-upload", "utf8");
+    const result = await fixture.notifier.sendFile({
+      file_path: filePath,
+      name: "普通文件.zip",
+      dedupe_key: "ordinary-file-upload:no-task",
+    });
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(Object.hasOwn(result, "taskIndex"), false);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 0);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("task file requires explicit source and target machines", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "missing-route.zip");
+    fs.writeFileSync(filePath, "missing-route", "utf8");
+    await assert.rejects(
+      () => fixture.notifier.sendFile({
+        file_path: filePath,
+        task_id: "missing-route",
+        dedupe_key: "missing-route:file",
+      }),
+      (error) => error.code === "INVALID_ARGUMENT" && /source_machine/.test(error.message),
+    );
+    assert.equal(fixture.calls.length, 0);
   } finally {
     await fixture.close();
   }

@@ -1,4 +1,4 @@
-# Package Manifest（2026-07-24）
+# Package Manifest（2026-07-27）
 
 ## Included
 
@@ -6,13 +6,20 @@
 | --- | --- |
 | MCP | memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.15.1, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.1.0 |
-| Rules | Codex, Antigravity, Claude Code, Windsurf global + five system fragments |
+| Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 17 license-reviewed portable user skills plus manifest |
 | Setup | PowerShell build, broker, config, validation, and packaging scripts |
 | Templates | Four host configs and receiver-private environment example |
 | Tests | HTTP smoke helper, local pages, memory workspace, expected results |
 
-## 2026-07-24 Changes
+## 2026-07-27 Changes
+
+- Codex Rules now separate a shared engineering core from optional catgirl, development-machine, and training-machine overlays. Four profile manifests build `neutral`, `catgirl`, `development`, and `training` configurations without duplicating the engineering workflow.
+- Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
+- Common MCP versions remain memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.15.1, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- NapCat public source is refreshed to the current task-ledger, router, supervisor, and Codex wake-bridge snapshot while keeping runtime state, real bindings, login data, and credentials excluded.
+
+## 2026-07-24 Baseline
 
 - memory-store upgraded from 1.19.3 to 1.21.1 with production Record scheduling, source evidence, startup barriers, commit protocols, provider admission/control, AGY routing, unknown-chain migration, background-task suspension and expanded multi-host recovery behavior.
 - sandbox remains 1.15.1 while synchronizing the current Grok bridge, Council background handling, smart-search routing, executor/session fixes and portable data-root behavior.

@@ -12,6 +12,7 @@
 - 不含 Codex `.system` skills、插件缓存或许可证不允许再分发的技能。
 - 不含 ProGrok 安装、proxy 私有环境、上游账户或发送方模型配额信息。
 - 不含 NapCat 安装包或运行目录、QQ 登录态、二维码、真实 `binding.json`、真实群号/账号、OneBot token、heartbeat 与 dedupe state。
+- 不含真实 `rules/codex/local-overrides.md` 或其他机器私有 Rules 覆盖文件；仓库只保留无真实值的 `local-overrides.example.md`。
 
 推荐命令：
 

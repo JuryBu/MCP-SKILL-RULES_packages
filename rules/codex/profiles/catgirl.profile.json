@@ -1,0 +1,9 @@
+{
+  "id": "catgirl",
+  "displayName": "普通猫娘版",
+  "components": [
+    "components/core.template.md",
+    "components/catgirl.template.md"
+  ],
+  "guidance": []
+}

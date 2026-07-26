@@ -50,7 +50,7 @@ function Test-PrivatePatterns {
 function Test-PortableText {
     Write-Output "Checking absolute user paths and credential-shaped text..."
     $regexes = @(
-        'C:\\Users\\(?!<user>|USERNAME|YourName|Public)[^\\\s"'']+',
+        '(?i)C:[\\/]+Users[\\/]+(?!<user>|USERNAME|YourName|Public|ExampleUser)[^\\/\s"'']+',
         '(?i)authorization\s*[:=]\s*bearer\s+[A-Za-z0-9._-]{16,}',
         '(?i)(api[_-]?key|access[_-]?token|secret)\s*[:=]\s*["''][A-Za-z0-9_./+=-]{24,}["'']'
     )
@@ -69,8 +69,10 @@ function Test-ForbiddenRuntimeFiles {
         "auth.json", ".cockpit_codex_auth.json", "cookies-backup.json", "localstorage-backup.json",
         "credentials.json", ".credentials.json", "token.json", "tokens.json", "broker-private.env.json",
         ".env", ".env.local", ".env.production", ".env.development", "cookies", "cookie",
-        "web data", "login data", "local state", "binding.json", "heartbeat.json",
-        "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input"
+        "web data", "login data", "local state", "binding.json", "heartbeat.json", "local-overrides.md",
+        "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input",
+        "broker-state.json", "broker.pid", "dedupe.json", "dedupe-state.json", "task-registry.json",
+        "router-runtime.json", "task-router-runtime.json", "supervisor-runtime.json", "napcat-runtime.json"
     )
     $badFiles = Get-ChildItem -LiteralPath $toolkitRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object {
@@ -80,7 +82,8 @@ function Test-ForbiddenRuntimeFiles {
                 $lowerName -like "broker-private*.json" -or
                 $lowerName -like ".env.*" -or
                 $lowerName -match '\.env($|\.)' -or
-                $lowerName -match '\.(cookie|cookies|session)$' -or
+                $lowerName -match '\.(cookie|cookies|session|pid)$' -or
+                $lowerName -match '(^|[-_.])(state|runtime)\.json$' -or
                 $_.Name -match '\.(sqlite|sqlite3|db)(-wal|-shm)?$' -or
                 $_.Name -match '\.(jsonl|har|vscdb|pb|pem|key|p12|pfx|log|bak|zip|7z|exe|dll)$' -or
                 $_.Name -like "*.before-*"
@@ -107,7 +110,12 @@ function Test-ExcludedDirectories {
         $names += @("node_modules", "dist", "build", "coverage")
     }
     $badDirs = Get-ChildItem -LiteralPath $toolkitRoot -Recurse -Directory -Force -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch '\\.git(\\|$)' -and $_.Name -in $names }
+        Where-Object {
+            $relative = $_.FullName.Substring($toolkitRoot.Length).TrimStart("\")
+            $_.FullName -notmatch '\\.git(\\|$)' -and
+                $_.Name -in $names -and
+                $relative -ne "rules\codex\profiles"
+        }
     if ($badDirs) {
         $badDirs | Select-Object FullName | Format-Table -AutoSize
         throw "Excluded directory check failed."
@@ -159,7 +167,17 @@ function Test-PackageStructure {
     }
 
     foreach ($path in @(
-        "rules\codex\AGENTS.template.md",
+        "rules\codex\components\core.template.md",
+        "rules\codex\components\catgirl.template.md",
+        "rules\codex\components\development.template.md",
+        "rules\codex\components\training.template.md",
+        "rules\codex\profiles\neutral.profile.json",
+        "rules\codex\profiles\catgirl.profile.json",
+        "rules\codex\profiles\development.profile.json",
+        "rules\codex\profiles\training.profile.json",
+        "rules\codex\guidance\development-machine.template.md",
+        "rules\codex\guidance\training-machine.template.md",
+        "rules\codex\local-overrides.example.md",
         "rules\codex\system-prompt.template.md",
         "rules\antigravity\GEMINI.template.md",
         "rules\claude-code\CLAUDE.template.md",
@@ -180,6 +198,121 @@ function Test-PackageStructure {
     )) {
         $full = Join-Path $toolkitRoot $path
         if (-not (Test-Path -LiteralPath $full)) { throw "Missing required portable file: $full" }
+    }
+
+    foreach ($path in @(
+        "mcps\\napcat-mcp\\src\\codex-thread-bridge.mjs",
+        "mcps\\napcat-mcp\\src\\supervisor-runner.mjs",
+        "mcps\\napcat-mcp\\src\\task-registry.mjs",
+        "mcps\\napcat-mcp\\src\\task-router-controller.mjs",
+        "mcps\\napcat-mcp\\src\\task-router-runner.mjs",
+        "mcps\\napcat-mcp\\src\\task-router.mjs",
+        "mcps\\napcat-mcp\\ops\\get-napcat-supervisor-status.ps1",
+        "mcps\\napcat-mcp\\ops\\get-napcat-task-router-status.ps1",
+        "mcps\\napcat-mcp\\ops\\install-napcat-autostart.ps1",
+        "mcps\\napcat-mcp\\ops\\remove-napcat-autostart.ps1",
+        "mcps\\napcat-mcp\\ops\\start-napcat-supervisor.ps1",
+        "mcps\\napcat-mcp\\ops\\start-napcat-task-router.ps1",
+        "mcps\\napcat-mcp\\ops\\stop-napcat-supervisor.ps1",
+        "mcps\\napcat-mcp\\ops\\stop-napcat-task-router.ps1",
+        "mcps\\napcat-mcp\\test\\codex-thread-bridge.test.mjs",
+        "mcps\\napcat-mcp\\test\\index-task-tools.test.mjs",
+        "mcps\\napcat-mcp\\test\\supervisor-runner.test.mjs",
+        "mcps\\napcat-mcp\\test\\task-registry.test.mjs",
+        "mcps\\napcat-mcp\\test\\task-router-controller.test.mjs",
+        "mcps\\napcat-mcp\\test\\task-router-runner.test.mjs",
+        "mcps\\napcat-mcp\\test\\task-router.test.mjs"
+    )) {
+        $full = Join-Path $toolkitRoot $path
+        if (-not (Test-Path -LiteralPath $full)) { throw "Missing current NapCat task-routing file: $full" }
+    }
+
+    $profileIds = @("neutral", "catgirl", "development", "training")
+    $buildScript = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"
+    $profileTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-profile-test-" + [guid]::NewGuid().ToString("N"))
+    try {
+        foreach ($profileId in $profileIds) {
+            $outputRoot = Join-Path $profileTestRoot $profileId
+            & $buildScript -Profile $profileId -OutputDirectory $outputRoot | Out-Null
+            $agentsPath = Join-Path $outputRoot "AGENTS.md"
+            if (-not (Test-Path -LiteralPath $agentsPath)) { throw "Profile did not produce AGENTS.md: $profileId" }
+            $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
+            if (-not ($agentsText.Contains("stage_guard")) -or -not ($agentsText.Contains("sandbox_council"))) {
+                throw "Profile lost shared engineering rules: $profileId"
+            }
+            if ($profileId -eq "neutral" -and ($agentsText.Contains("kaomoji"))) {
+                throw "Neutral profile unexpectedly contains the catgirl component."
+            }
+            if ($profileId -ne "neutral" -and -not ($agentsText.Contains("kaomoji"))) {
+                throw "Catgirl profile is missing the catgirl component: $profileId"
+            }
+            if ($profileId -eq "development") {
+                if (-not ($agentsText.Contains("local_role=development"))) { throw "Development profile missing its component." }
+                if (-not (Test-Path -LiteralPath (Join-Path $outputRoot "guidance\development-machine.md"))) {
+                    throw "Development profile missing generated guidance."
+                }
+            }
+            if ($profileId -eq "training") {
+                if (-not ($agentsText.Contains("local_role=training"))) { throw "Training profile missing its component." }
+                if (-not (Test-Path -LiteralPath (Join-Path $outputRoot "guidance\training-machine.md"))) {
+                    throw "Training profile missing generated guidance."
+                }
+            }
+        }
+
+        $reuseRoot = Join-Path $profileTestRoot "reuse"
+        & $buildScript -Profile "development" -OutputDirectory $reuseRoot | Out-Null
+        & $buildScript -Profile "catgirl" -OutputDirectory $reuseRoot | Out-Null
+        if (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) {
+            throw "Reused build directory kept stale development guidance."
+        }
+        & $buildScript -Profile "training" -OutputDirectory $reuseRoot | Out-Null
+        if (-not (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\training-machine.md"))) {
+            throw "Reused build directory lost selected training guidance."
+        }
+        if (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) {
+            throw "Reused build directory mixed development and training guidance."
+        }
+        & $buildScript -Profile "neutral" -OutputDirectory $reuseRoot | Out-Null
+        if (
+            (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) -or
+            (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\training-machine.md"))
+        ) {
+            throw "Reused build directory kept role guidance for neutral profile."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $profileTestRoot) {
+            Remove-Item -LiteralPath $profileTestRoot -Recurse -Force
+        }
+    }
+
+    $installScript = Join-Path $toolkitRoot "install\Install-CodexRulesProfile.ps1"
+    $profileInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-install-test-" + [guid]::NewGuid().ToString("N"))
+    try {
+        & $installScript -Profile "development" -CodexHome $profileInstallRoot | Out-Null
+        $developmentGuidance = Join-Path $profileInstallRoot "guidance\development-machine.md"
+        if (-not (Test-Path -LiteralPath $developmentGuidance)) {
+            throw "Development profile install did not create role guidance."
+        }
+
+        & $installScript -Profile "catgirl" -CodexHome $profileInstallRoot | Out-Null
+        if (Test-Path -LiteralPath $developmentGuidance) {
+            throw "Profile switch left stale development role guidance."
+        }
+        $backedUpGuidance = @(
+            Get-ChildItem -LiteralPath (Join-Path $profileInstallRoot "backups") -Recurse -File -Filter "development-machine.md" -ErrorAction SilentlyContinue
+        )
+        if ($backedUpGuidance.Count -lt 1) {
+            throw "Profile switch did not back up stale development role guidance."
+        }
+        $installedAgents = Get-Content -LiteralPath (Join-Path $profileInstallRoot "AGENTS.md") -Raw -Encoding UTF8
+        if (-not ($installedAgents.Contains("kaomoji")) -or $installedAgents.Contains("local_role=development")) {
+            throw "Profile switch did not replace AGENTS.md with the selected profile."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $profileInstallRoot) {
+            Remove-Item -LiteralPath $profileInstallRoot -Recurse -Force
+        }
     }
 
     $allowedSkills = @(

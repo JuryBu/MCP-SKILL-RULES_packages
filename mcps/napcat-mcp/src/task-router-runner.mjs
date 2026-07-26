@@ -1,0 +1,613 @@
+import fs from "node:fs";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { createNapCatNotifier } from "./core.mjs";
+import { createCodexThreadBridge } from "./codex-thread-bridge.mjs";
+import { createTaskRegistry } from "./task-registry.mjs";
+import { createTaskRouter } from "./task-router.mjs";
+
+export const DEFAULT_SCAN_INTERVAL_MS = 30_000;
+export const DEFAULT_MAX_BACKOFF_MS = 300_000;
+export const DEFAULT_STOP_POLL_MS = 250;
+
+const CLI_OPTIONS = new Set([
+  "registry",
+  "binding",
+  "state",
+  "runtime-state",
+  "log",
+  "stop-file",
+  "lock",
+  "interval-ms",
+  "private-env",
+]);
+
+function normalizePositiveInteger(value, name, fallback = undefined) {
+  const candidate = value === undefined || value === null || value === "" ? fallback : value;
+  const parsed = Number(candidate);
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} 必须是大于 0 的整数`);
+  }
+  return parsed;
+}
+
+function resolveRequiredPath(value, name) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    throw new Error(`${name} 不能为空`);
+  }
+  return path.resolve(String(value));
+}
+
+function resolveOptionalPath(value) {
+  return value === undefined || value === null || String(value).trim() === ""
+    ? null
+    : path.resolve(String(value));
+}
+
+function readJsonFile(filePath, description) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
+  } catch (error) {
+    throw new Error(`无法读取 ${description}：${filePath}`, { cause: error });
+  }
+}
+
+export function parseArguments(argv) {
+  const values = {};
+  for (let index = 0; index < argv.length; index += 1) {
+    const item = argv[index];
+    if (!item.startsWith("--")) throw new Error(`无效参数：${item}`);
+    const name = item.slice(2);
+    if (!CLI_OPTIONS.has(name)) throw new Error(`不支持参数：${item}`);
+    if (index + 1 >= argv.length || argv[index + 1].startsWith("--")) {
+      throw new Error(`参数缺少值：${item}`);
+    }
+    values[name] = argv[index + 1];
+    index += 1;
+  }
+
+  const required = [
+    ["registry", "--registry"],
+    ["binding", "--binding"],
+    ["state", "--state"],
+    ["runtime-state", "--runtime-state"],
+    ["log", "--log"],
+    ["stop-file", "--stop-file"],
+    ["lock", "--lock"],
+  ];
+  for (const [name, flag] of required) {
+    if (values[name] === undefined) throw new Error(`缺少参数 ${flag}`);
+  }
+
+  return {
+    registryPath: resolveRequiredPath(values.registry, "--registry"),
+    bindingPath: resolveRequiredPath(values.binding, "--binding"),
+    statePath: resolveRequiredPath(values.state, "--state"),
+    runtimeStatePath: resolveRequiredPath(values["runtime-state"], "--runtime-state"),
+    logPath: resolveRequiredPath(values.log, "--log"),
+    stopFilePath: resolveRequiredPath(values["stop-file"], "--stop-file"),
+    lockPath: resolveRequiredPath(values.lock, "--lock"),
+    scanIntervalMs: normalizePositiveInteger(
+      values["interval-ms"],
+      "--interval-ms",
+      DEFAULT_SCAN_INTERVAL_MS,
+    ),
+    privateEnvPath: resolveOptionalPath(values["private-env"]),
+  };
+}
+
+export function readPrivateEnvironment(filePath) {
+  const raw = readJsonFile(filePath, "private-env");
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error(`private-env 必须是 JSON 对象：${filePath}`);
+  }
+  return Object.fromEntries(
+    Object.entries(raw)
+      .filter(([name]) => name.startsWith("NAPCAT_"))
+      .map(([name, value]) => [name, String(value ?? "")]),
+  );
+}
+
+function readExistingJson(filePath, fsImpl) {
+  if (!fsImpl.existsSync(filePath)) return {};
+  try {
+    const value = JSON.parse(fsImpl.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+}
+
+function atomicWriteJson(filePath, value, fsImpl = fs) {
+  fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
+  let descriptor;
+  try {
+    descriptor = fsImpl.openSync(temporaryPath, "wx", 0o600);
+    fsImpl.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    if (typeof fsImpl.fsyncSync === "function") fsImpl.fsyncSync(descriptor);
+    fsImpl.closeSync(descriptor);
+    descriptor = undefined;
+    fsImpl.renameSync(temporaryPath, filePath);
+  } catch (error) {
+    if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+    try {
+      fsImpl.unlinkSync(temporaryPath);
+    } catch {
+    }
+    throw error;
+  }
+}
+
+export function writeRuntimeState(runtimeStatePath, patch = {}, options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const current = readExistingJson(runtimeStatePath, fsImpl);
+  const definedPatch = Object.fromEntries(
+    Object.entries(patch).filter(([, value]) => value !== undefined),
+  );
+  const next = {
+    schemaVersion: 1,
+    ...current,
+    ...definedPatch,
+  };
+  const defaults = {
+    pid: options.pid ?? current.pid ?? process.pid,
+    startedAt: current.startedAt ?? null,
+    lastScanAt: current.lastScanAt ?? null,
+    nextScanAt: current.nextScanAt ?? null,
+    openTaskCount: current.openTaskCount ?? 0,
+    lastError: current.lastError ?? null,
+    state: current.state ?? "starting",
+  };
+  for (const [name, value] of Object.entries(defaults)) {
+    if (next[name] === undefined) next[name] = value;
+  }
+  atomicWriteJson(runtimeStatePath, next, fsImpl);
+  return next;
+}
+
+export function publicError(error, fallbackCode = "TASK_ROUTER_ERROR") {
+  return {
+    code: error?.code ?? fallbackCode,
+    message: error?.message ?? String(error),
+    outcomeUnknown: Boolean(error?.outcomeUnknown),
+  };
+}
+
+export function isProcessAlive(processId, processImpl = process) {
+  const pid = Number(processId);
+  if (!Number.isSafeInteger(pid) || pid < 1) return false;
+  try {
+    processImpl.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function readLockSnapshot(lockPath, fsImpl) {
+  try {
+    const raw = fsImpl.readFileSync(lockPath, "utf8");
+    let metadata = null;
+    try {
+      metadata = JSON.parse(raw.replace(/^\uFEFF/, ""));
+    } catch {
+    }
+    return { raw, metadata };
+  } catch {
+    return { raw: null, metadata: null };
+  }
+}
+
+export function acquireInstanceLock(lockPath, options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const processId = options.pid ?? process.pid;
+  const now = options.now ?? (() => new Date());
+  const isAlive = options.isProcessAlive ?? ((pid) => isProcessAlive(pid, options.processObject ?? process));
+  const normalizedLockPath = path.resolve(lockPath);
+  const startedAt = new Date(now()).toISOString();
+  const token = randomUUID();
+  fsImpl.mkdirSync(path.dirname(normalizedLockPath), { recursive: true });
+
+  while (true) {
+    let descriptor;
+    const metadata = { pid: processId, startedAt, token };
+    try {
+      descriptor = fsImpl.openSync(normalizedLockPath, "wx", 0o600);
+      fsImpl.writeFileSync(descriptor, `${JSON.stringify(metadata)}\n`, "utf8");
+      if (typeof fsImpl.fsyncSync === "function") fsImpl.fsyncSync(descriptor);
+      fsImpl.closeSync(descriptor);
+      descriptor = undefined;
+      return {
+        acquired: true,
+        lockPath: normalizedLockPath,
+        metadata,
+        release() {
+          const current = readLockSnapshot(normalizedLockPath, fsImpl).metadata;
+          if (current?.token !== token) return;
+          try {
+            fsImpl.unlinkSync(normalizedLockPath);
+          } catch (error) {
+            if (error?.code !== "ENOENT") throw error;
+          }
+        },
+      };
+    } catch (error) {
+      if (descriptor !== undefined) fsImpl.closeSync(descriptor);
+      if (error?.code !== "EEXIST") throw error;
+
+      const snapshot = readLockSnapshot(normalizedLockPath, fsImpl);
+      const existingPid = snapshot.metadata?.pid;
+      if (existingPid !== undefined && isAlive(existingPid)) {
+        return {
+          acquired: false,
+          lockPath: normalizedLockPath,
+          existingLock: snapshot.metadata,
+        };
+      }
+
+      const currentSnapshot = readLockSnapshot(normalizedLockPath, fsImpl);
+      if (currentSnapshot.raw !== snapshot.raw) continue;
+      try {
+        fsImpl.unlinkSync(normalizedLockPath);
+      } catch (unlinkError) {
+        if (unlinkError?.code === "ENOENT") continue;
+        throw unlinkError;
+      }
+    }
+  }
+}
+
+export function calculateBackoffMs(scanIntervalMs, failureCount, maxBackoffMs = DEFAULT_MAX_BACKOFF_MS) {
+  const interval = normalizePositiveInteger(scanIntervalMs, "scanIntervalMs");
+  const failures = normalizePositiveInteger(failureCount, "failureCount");
+  const maximum = Math.max(interval, normalizePositiveInteger(maxBackoffMs, "maxBackoffMs"));
+  return Math.min(maximum, interval * (2 ** Math.min(failures - 1, 30)));
+}
+
+function fileExists(filePath, fsImpl) {
+  try {
+    return Boolean(filePath && fsImpl.existsSync(filePath));
+  } catch {
+    return false;
+  }
+}
+
+function nowDate(now) {
+  const value = now();
+  const date = value instanceof Date ? new Date(value.getTime()) : new Date(value);
+  if (!Number.isFinite(date.getTime())) throw new Error("now 返回了无效时间");
+  return date;
+}
+
+function nowIso(now) {
+  return nowDate(now).toISOString();
+}
+
+function nextTimeIso(now, delayMs) {
+  return new Date(nowDate(now).getTime() + delayMs).toISOString();
+}
+
+function appendLog(logPath, entry, fsImpl) {
+  if (!logPath) return;
+  try {
+    fsImpl.mkdirSync(path.dirname(logPath), { recursive: true });
+    fsImpl.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+  }
+}
+
+export function waitForNextScan(milliseconds, options = {}) {
+  const delayMs = Math.max(0, Number(milliseconds));
+  const fsImpl = options.fsImpl ?? fs;
+  const stopFilePath = options.stopFilePath;
+  const pollMs = Math.max(1, Number(options.pollMs ?? DEFAULT_STOP_POLL_MS));
+  const isStopRequested = options.isStopRequested ?? (() => fileExists(stopFilePath, fsImpl));
+  return new Promise((resolve) => {
+    const deadline = Date.now() + delayMs;
+    let timer;
+    const check = () => {
+      if (isStopRequested() || Date.now() >= deadline) {
+        if (timer !== undefined) clearTimeout(timer);
+        resolve();
+        return;
+      }
+      timer = setTimeout(check, Math.min(pollMs, Math.max(1, deadline - Date.now())));
+    };
+    check();
+  });
+}
+
+function installSignalHandlers(processObject, requestStop) {
+  if (!processObject || typeof processObject.on !== "function") return () => {};
+  const handlers = new Map();
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    const handler = () => requestStop(`signal:${signal}`);
+    processObject.on(signal, handler);
+    handlers.set(signal, handler);
+  }
+  return () => {
+    if (typeof processObject.removeListener !== "function") return;
+    for (const [signal, handler] of handlers) processObject.removeListener(signal, handler);
+  };
+}
+
+export function createTaskRouterDependencies(options = {}) {
+  const registryPath = resolveRequiredPath(options.registryPath ?? options.registry, "registryPath");
+  const bindingPath = resolveRequiredPath(options.bindingPath ?? options.binding, "bindingPath");
+  const statePath = resolveRequiredPath(options.statePath ?? options.state, "statePath");
+  const privateEnvironment = options.privateEnvironment
+    ?? (options.privateEnvPath ? readPrivateEnvironment(options.privateEnvPath) : {});
+  const env = {
+    ...process.env,
+    ...(options.env ?? {}),
+    ...privateEnvironment,
+    NAPCAT_MCP_BINDING_PATH: bindingPath,
+    NAPCAT_MCP_STATE_PATH: statePath,
+  };
+  const cwd = options.cwd ?? path.dirname(bindingPath);
+  const registryFactory = options.createRegistry ?? createTaskRegistry;
+  const notifierFactory = options.createNotifier ?? createNapCatNotifier;
+  const bridgeFactory = options.createBridge ?? createCodexThreadBridge;
+  const routerFactory = options.createRouter ?? createTaskRouter;
+  const registry = options.registry ?? registryFactory({
+    statePath: registryPath,
+    ...(options.registryOptions ?? {}),
+  });
+  const notifier = options.notifier ?? notifierFactory({ cwd, env });
+  const bridge = options.bridge ?? bridgeFactory({
+    ...(options.bridgeOptions ?? {}),
+    cwd,
+    env,
+  });
+  const router = options.router ?? routerFactory({
+    ...(options.routerOptions ?? {}),
+    registry,
+    notifier,
+    bridge,
+  });
+  if (!router || typeof router.scanOnce !== "function") {
+    throw new Error("task router 必须提供 scanOnce() 方法");
+  }
+  return { router, registry, notifier, bridge };
+}
+
+function parseOpenTaskCount(scanResult) {
+  const count = Number(scanResult?.openTaskCount);
+  if (!Number.isSafeInteger(count) || count < 0) {
+    const error = new Error("scanOnce 返回的 openTaskCount 无效");
+    error.code = "INVALID_SCAN_RESULT";
+    throw error;
+  }
+  return count;
+}
+
+function scanResultError(scanResult) {
+  if (!Array.isArray(scanResult?.results)) return null;
+  const failedResult = scanResult.results.find((result) => result?.outcome === "scan_error");
+  if (!failedResult) return null;
+  const error = new Error(failedResult.error?.message ?? "任务扫描失败");
+  error.code = failedResult.error?.code ?? "TASK_SCAN_ERROR";
+  error.outcomeUnknown = Boolean(failedResult.error?.outcomeUnknown);
+  error.openTaskCount = Number(scanResult.openTaskCount);
+  error.scanAt = typeof scanResult.scannedAt === "string" && scanResult.scannedAt
+    ? scanResult.scannedAt
+    : null;
+  return error;
+}
+
+async function closeBridge(components) {
+  if (!components?.bridge || typeof components.bridge.close !== "function") return;
+  await components.bridge.close();
+}
+
+export async function runTaskRouterService(options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const processObject = options.processObject ?? process;
+  const pid = options.pid ?? processObject.pid ?? process.pid;
+  const now = options.now ?? (() => new Date());
+  const runtimeStatePath = resolveRequiredPath(options.runtimeStatePath ?? options["runtime-state"], "runtimeStatePath");
+  const stopFilePath = resolveRequiredPath(options.stopFilePath ?? options["stop-file"], "stopFilePath");
+  const lockPath = resolveRequiredPath(options.lockPath ?? options.lock ?? options["lock"], "lockPath");
+  const logPath = resolveOptionalPath(options.logPath ?? options.log);
+  const scanIntervalMs = normalizePositiveInteger(
+    options.scanIntervalMs ?? options["interval-ms"],
+    "scanIntervalMs",
+    DEFAULT_SCAN_INTERVAL_MS,
+  );
+  const maxBackoffMs = Math.max(
+    scanIntervalMs,
+    normalizePositiveInteger(options.maxBackoffMs, "maxBackoffMs", DEFAULT_MAX_BACKOFF_MS),
+  );
+  const startedAt = nowIso(now);
+  const lock = acquireInstanceLock(lockPath, {
+    fsImpl,
+    pid,
+    now: () => new Date(startedAt),
+    isProcessAlive: options.isProcessAlive,
+    processObject,
+  });
+  if (!lock.acquired) {
+    return {
+      state: "duplicate",
+      pid,
+      lockPath,
+      existingLock: lock.existingLock,
+    };
+  }
+
+  let status = {
+    schemaVersion: 1,
+    pid,
+    startedAt,
+    lastScanAt: null,
+    nextScanAt: null,
+    openTaskCount: 0,
+    lastError: null,
+    state: "starting",
+    stopFilePath,
+    lockPath,
+    scanIntervalMs,
+  };
+  let components = null;
+  let componentsClosed = false;
+  let signalCleanup = () => {};
+  let stopReason = null;
+  let stopRequested = false;
+  let failureCount = 0;
+  let scanCount = 0;
+
+  const persist = (patch) => {
+    status = { ...status, ...patch };
+    status = writeRuntimeState(runtimeStatePath, status, { fsImpl, pid });
+    return status;
+  };
+  const requestStop = (reason) => {
+    stopRequested = true;
+    if (!stopReason) stopReason = reason;
+  };
+  const detectStop = () => {
+    if (stopRequested) return true;
+    if (fileExists(stopFilePath, fsImpl)) {
+      requestStop("stop_file");
+      return true;
+    }
+    return false;
+  };
+
+  try {
+    persist({ state: "running", lastError: null, nextScanAt: null, lastScanAt: null, openTaskCount: 0 });
+    signalCleanup = options.installSignalHandlers === false
+      ? () => {}
+      : installSignalHandlers(processObject, requestStop);
+    appendLog(logPath, { at: startedAt, type: "runner_started", pid, scanIntervalMs }, fsImpl);
+
+    if (!detectStop()) {
+      components = options.router
+        ? { router: options.router, bridge: options.bridge ?? null }
+        : createTaskRouterDependencies({
+          ...options,
+          registryPath: options.registryPath ?? options.registry,
+          bindingPath: options.bindingPath ?? options.binding,
+          statePath: options.statePath ?? options.state,
+        });
+      if (!components.router || typeof components.router.scanOnce !== "function") {
+        throw new Error("task router 必须提供 scanOnce() 方法");
+      }
+    }
+
+    while (!detectStop()) {
+      scanCount += 1;
+      try {
+        const scanResult = await components.router.scanOnce();
+        const openTaskCount = parseOpenTaskCount(scanResult);
+        const scanAt = typeof scanResult?.scannedAt === "string" && scanResult.scannedAt
+          ? scanResult.scannedAt
+          : nowIso(now);
+        const taskScanError = scanResultError(scanResult);
+        if (taskScanError) throw taskScanError;
+        failureCount = 0;
+        status = {
+          ...status,
+          lastScanAt: scanAt,
+          nextScanAt: openTaskCount > 0 ? nextTimeIso(now, scanIntervalMs) : null,
+          openTaskCount,
+          lastError: null,
+          state: "running",
+        };
+        persist(status);
+        appendLog(logPath, {
+          at: scanAt,
+          type: "scan",
+          pid,
+          openTaskCount,
+          wakeCount: Number(scanResult?.wakeCount ?? 0),
+        }, fsImpl);
+        if (openTaskCount === 0) {
+          stopReason = "no_open_tasks";
+          break;
+        }
+      } catch (error) {
+        failureCount += 1;
+        const errorValue = publicError(error);
+        const delayMs = calculateBackoffMs(scanIntervalMs, failureCount, maxBackoffMs);
+        const scanAt = error.scanAt ?? nowIso(now);
+        persist({
+          lastScanAt: scanAt,
+          nextScanAt: nextTimeIso(now, delayMs),
+          ...(Number.isSafeInteger(error.openTaskCount) && error.openTaskCount >= 0
+            ? { openTaskCount: error.openTaskCount }
+            : {}),
+          lastError: errorValue,
+          state: "running",
+        });
+        appendLog(logPath, {
+          at: scanAt,
+          type: "scan_error",
+          pid,
+          error: errorValue,
+          delayMs,
+        }, fsImpl);
+        if (detectStop()) break;
+        await (options.wait ?? waitForNextScan)(delayMs, {
+          fsImpl,
+          stopFilePath,
+          pollMs: options.stopPollMs,
+          isStopRequested: () => stopRequested || fileExists(stopFilePath, fsImpl),
+        });
+        continue;
+      }
+
+      if (detectStop()) break;
+      await (options.wait ?? waitForNextScan)(scanIntervalMs, {
+        fsImpl,
+        stopFilePath,
+        pollMs: options.stopPollMs,
+        isStopRequested: () => stopRequested || fileExists(stopFilePath, fsImpl),
+      });
+    }
+
+    if (!stopReason) stopReason = "stop_requested";
+    await closeBridge(components);
+    componentsClosed = true;
+    const stoppedAt = nowIso(now);
+    persist({ state: "stopped", nextScanAt: null, stoppedAt, stopReason });
+    appendLog(logPath, { at: stoppedAt, type: "runner_stopped", pid, stopReason }, fsImpl);
+    return { ...status, scanCount, failureCount, stopReason };
+  } catch (error) {
+    const errorValue = publicError(error, "TASK_ROUTER_RUNNER_FAILED");
+    if (!componentsClosed) {
+      try {
+        await closeBridge(components);
+      } catch {
+      }
+    }
+    const failedAt = nowIso(now);
+    try {
+      persist({ state: "failed", nextScanAt: null, lastError: errorValue, failedAt });
+    } catch {
+      status = { ...status, state: "failed", nextScanAt: null, lastError: errorValue, failedAt };
+    }
+    appendLog(logPath, { at: failedAt, type: "runner_failed", pid, error: errorValue }, fsImpl);
+    return { ...status, scanCount, failureCount, error: errorValue };
+  } finally {
+    signalCleanup();
+    lock.release();
+  }
+}
+
+export async function main(argv = process.argv.slice(2), dependencies = {}) {
+  const parsed = parseArguments(argv);
+  return runTaskRouterService({ ...parsed, ...dependencies });
+}
+
+const currentFilePath = fileURLToPath(import.meta.url);
+if (process.argv[1] && path.resolve(process.argv[1]) === currentFilePath) {
+  main().then((result) => {
+    if (result.state === "failed") process.exitCode = 1;
+  }).catch((error) => {
+    console.error(`[task-router-runner] ${error?.message || String(error)}`);
+    process.exitCode = 1;
+  });
+}

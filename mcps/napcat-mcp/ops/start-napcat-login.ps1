@@ -1,17 +1,25 @@
 ﻿[CmdletBinding()]
 param(
-  [string]$NapCatRoot = (Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"),
-  [string]$DataRoot = (Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"),
-  [string]$BrokerRoot = "",
+  [string]$NapCatRoot = "",
+  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
+  [string]$CodexHome = "",
   [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
   [switch]$NoQr
 )
 
 $ErrorActionPreference = "Stop"
-$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
-  $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker"
+if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
+  $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
+  if (Test-Path -LiteralPath $RuntimeStateFile) {
+    try { $NapCatRoot = [string](Get-Content -LiteralPath $RuntimeStateFile -Raw -Encoding UTF8 | ConvertFrom-Json).napCatRoot } catch { $NapCatRoot = "" }
+  }
+  if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
+    $NapCatRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"
+  }
 }
+$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker" }
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
 $QrCodePath = Join-Path $NapCatRoot "cache\qrcode.png"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
@@ -56,7 +64,14 @@ function New-QrWindow {
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
   $Form = New-Object System.Windows.Forms.Form
-  $Form.Text = "NapCat 登录 - 请使用 $ExpectedNickname 扫码"
+  $DisplayIdentity = if ([string]::IsNullOrWhiteSpace($ExpectedNickname)) {
+    $ExpectedSelfId
+  } elseif ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+    $ExpectedNickname
+  } else {
+    "$ExpectedNickname / $ExpectedSelfId"
+  }
+  $Form.Text = "NapCat 登录 - 请使用 $DisplayIdentity 扫码"
   $Form.StartPosition = "CenterScreen"
   $Form.ClientSize = New-Object System.Drawing.Size(420, 470)
   $Form.TopMost = $true
@@ -77,6 +92,15 @@ function Close-QrWindow {
   if ($null -ne $Window.Picture.Image) { $Window.Picture.Image.Dispose() }
   $Window.Form.Close()
   $Window.Form.Dispose()
+}
+
+function Stop-LaunchedProcessTree {
+  param([int]$RootProcessId)
+  if ($RootProcessId -le 0) { return }
+  try {
+    & "$env:SystemRoot\System32\taskkill.exe" /PID $RootProcessId /T /F 2>$null | Out-Null
+  } catch {
+  }
 }
 
 try {
@@ -111,7 +135,13 @@ if (-not (Test-Path -LiteralPath $EmptyInputPath)) {
 $StartupInfo = ([WmiClass]"Win32_ProcessStartup").CreateInstance()
 $StartupInfo.ShowWindow = 0
 $ProcessClass = [WmiClass]"Win32_Process"
-$CommandLine = "$env:ComSpec /d /c `"`"$Launcher`" < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+$LauncherArguments = ""
+if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+  $LauncherArguments = " `"$ExpectedSelfId`""
+} elseif ($NoQr) {
+  throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
+}
+$CommandLine = "$env:ComSpec /d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 $CreateResult = $ProcessClass.Create($CommandLine, $NapCatRoot, $StartupInfo)
 if ([int]$CreateResult.ReturnValue -ne 0 -or [int]$CreateResult.ProcessId -le 0) {
   throw "NapCat 无窗口进程启动失败，WMI returnValue=$($CreateResult.ReturnValue)"
@@ -147,6 +177,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
   } catch {
     if ($_.Exception.Message -like "NapCat 登录了错误*") {
       Close-QrWindow -Window $QrWindow
+      Stop-LaunchedProcessTree -RootProcessId $ProcessId
       throw
     }
   }
@@ -160,4 +191,15 @@ while ([DateTime]::UtcNow -lt $Deadline) {
 }
 
 Close-QrWindow -Window $QrWindow
-throw "NapCat 在 $TimeoutSeconds 秒内没有以 $ExpectedNickname / $ExpectedSelfId 登录成功，日志：$LogPath"
+Stop-LaunchedProcessTree -RootProcessId $ProcessId
+$DisplayIdentity = if ([string]::IsNullOrWhiteSpace($ExpectedNickname)) {
+  $ExpectedSelfId
+} elseif ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+  $ExpectedNickname
+} else {
+  "$ExpectedNickname / $ExpectedSelfId"
+}
+if ($NoQr) {
+  throw "NapCat 快速登录在 $TimeoutSeconds 秒内没有恢复 $DisplayIdentity；快速登录记录不可用或启动器未接受该账号，本次未弹二维码。请在有人值守时运行不带 -NoQr 的登录脚本重新扫码。日志：$LogPath"
+}
+throw "NapCat 在 $TimeoutSeconds 秒内没有以 $DisplayIdentity 登录成功，日志：$LogPath"

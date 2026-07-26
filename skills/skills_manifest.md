@@ -1,6 +1,6 @@
 # Skills Manifest
 
-Verified for the 2026-07-24 refresh. These are license-reviewed portable user-side skills, not system bundled skills or plugin cache skills. Package validation checks every listed skill directory and its `SKILL.md`; byte-size snapshots are intentionally omitted because they become stale after harmless documentation edits.
+Verified for the 2026-07-27 refresh. These are license-reviewed portable user-side skills, not system bundled skills or plugin cache skills. Package validation checks every listed skill directory and its `SKILL.md`; byte-size snapshots are intentionally omitted because they become stale after harmless documentation edits.
 
 | Skill | Files | Notes |
 | --- | ---: | --- |

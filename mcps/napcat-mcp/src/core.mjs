@@ -76,7 +76,7 @@ function normalizeBinding(raw) {
   if (raw.requireGroupIdentityCheckBeforeSend === false) {
     throw new NapCatNotifierError(
       "UNSAFE_BINDING",
-      "固定绑定群的身份校验不能关闭",
+      "固定 ExampleGroup 群的身份校验不能关闭",
     );
   }
   const allowedEvents = Array.isArray(raw.allowedEvents) && raw.allowedEvents.length
@@ -233,14 +233,16 @@ function decodeCqValue(value) {
 }
 
 function summarizeFileAttachment(data = {}) {
-  const fileId = String(data.file_id ?? data.fileId ?? "");
+  const fileId = String(data.file_id ?? data.fileId ?? data.file_uuid ?? data.fileUuid ?? "");
   const fileName = decodeCqValue(data.file_name ?? data.name ?? data.file ?? "");
   const rawSize = Number(data.file_size ?? data.size ?? 0);
+  const rawBusId = Number(data.busid ?? data.bus_id ?? data.file_biz_id ?? data.fileBizId ?? Number.NaN);
   return {
     type: "file",
     fileId,
     fileName,
     fileBytes: Number.isFinite(rawSize) && rawSize > 0 ? rawSize : null,
+    busId: Number.isSafeInteger(rawBusId) && rawBusId >= 0 ? rawBusId : null,
     downloadable: Boolean(fileId),
   };
 }
@@ -269,17 +271,27 @@ function oneBotFileAttachments(message) {
   return [...unique.values()];
 }
 
-function structuredTaskId(text) {
+function structuredTaskMetadata(text) {
+  const metadata = {
+    taskId: "",
+    sourceMachine: "",
+    targetMachine: "",
+  };
   for (const line of normalizeComparableText(text).split("\n")) {
-    const match = line.match(/^(?:任务|task_id)\s*[：:]\s*(.+)$/i);
-    if (match) return match[1].trim().slice(0, 128);
+    const taskMatch = line.match(/^(?:任务|task_id)\s*[：:]\s*(.+)$/i);
+    if (taskMatch) metadata.taskId = taskMatch[1].trim().slice(0, 128);
+    const sourceMatch = line.match(/^(?:来源机器|source_machine)\s*[：:]\s*(.+)$/i);
+    if (sourceMatch) metadata.sourceMachine = sourceMatch[1].trim().slice(0, 64);
+    const targetMatch = line.match(/^(?:目标机器|target_machine)\s*[：:]\s*(.+)$/i);
+    if (targetMatch) metadata.targetMachine = targetMatch[1].trim().slice(0, 64);
   }
-  return "";
+  return metadata;
 }
 
 function summarizeGroupMessage(message, expectedSelfId) {
   const timestamp = Number(message?.time ?? 0);
   const text = oneBotReadableText(message);
+  const taskMetadata = structuredTaskMetadata(text);
   return {
     messageId: String(message?.message_id ?? ""),
     messageSeq: String(message?.message_seq ?? message?.message_id ?? ""),
@@ -288,7 +300,9 @@ function summarizeGroupMessage(message, expectedSelfId) {
     senderName: String(message?.sender?.card ?? message?.sender?.nickname ?? ""),
     isSelf: String(message?.sender?.user_id ?? message?.user_id ?? "") === expectedSelfId,
     text,
-    taskId: structuredTaskId(text),
+    taskId: taskMetadata.taskId,
+    sourceMachine: taskMetadata.sourceMachine,
+    targetMachine: taskMetadata.targetMachine,
     attachments: oneBotFileAttachments(message),
   };
 }
@@ -373,6 +387,30 @@ function buildTextMessage(normalizedInput, nowDate) {
   ].join("\n");
 }
 
+function buildTaskFileIndexMessage(normalizedInput, file, nowDate) {
+  const lines = [
+    "[Codex][TASK_FILE_INDEX]",
+    `任务：${normalizedInput.taskId}`,
+    `来源机器：${normalizedInput.sourceMachine || "未指定"}`,
+    `目标机器：${normalizedInput.targetMachine || "未指定"}`,
+    `file_id：${file.fileId}`,
+  ];
+  if (file.messageSeq) lines.push(`file_message_seq：${file.messageSeq}`);
+  if (Number.isSafeInteger(file.busId) && file.busId >= 0) lines.push(`busid：${file.busId}`);
+  lines.push(
+    `文件名：${file.fileName}`,
+    `字节数：${file.fileBytes}`,
+    `sha256：${file.sha256}`,
+    `时间：${nowDate.toISOString()}`,
+  );
+  return lines.join("\n");
+}
+
+function taskFileIndexDedupeKey(fileDedupeKey) {
+  const digest = createHash("sha256").update(fileDedupeKey, "utf8").digest("hex");
+  return `task-file-index:${digest}`;
+}
+
 function normalizeFileInput(input, maximumFileBytes) {
   const requestedPath = boundedString(input.file_path, "file_path", 4096, true);
   if (!path.isAbsolute(requestedPath)) {
@@ -399,14 +437,20 @@ function normalizeFileInput(input, maximumFileBytes) {
   if (requestedName !== path.basename(requestedName) || requestedName === "." || requestedName === "..") {
     throw new NapCatNotifierError("INVALID_FILE_NAME", "name 只能是文件名，不能包含目录");
   }
+  const taskId = boundedString(input.task_id, "task_id", 128);
+  const sourceMachine = boundedString(input.source_machine, "source_machine", 64, Boolean(taskId));
+  const targetMachine = boundedString(input.target_machine, "target_machine", 64, Boolean(taskId));
   return {
     event: "file",
-    taskId: "fixed-group-file",
+    taskId: taskId || "fixed-group-file",
+    hasTaskId: Boolean(taskId),
     runId: "",
     dedupeKey: boundedString(input.dedupe_key, "dedupe_key", 200, true),
     filePath,
     fileName: requestedName,
     fileBytes: fileStat.size,
+    sourceMachine,
+    targetMachine,
   };
 }
 
@@ -420,7 +464,22 @@ function normalizeDownloadInput(input) {
   if (requestedName && (requestedName !== path.basename(requestedName) || requestedName === "." || requestedName === "..")) {
     throw new NapCatNotifierError("INVALID_FILE_NAME", "name 只能是文件名，不能包含目录");
   }
-  return { fileId, destinationDirectory: path.resolve(destinationDirectory), requestedName };
+  const messageSeq = boundedString(input.message_seq, "message_seq", 64);
+  let busId = null;
+  if (input.busid !== undefined && input.busid !== null && input.busid !== "") {
+    const parsedBusId = Number(input.busid);
+    if (!Number.isSafeInteger(parsedBusId) || parsedBusId < 0) {
+      throw new NapCatNotifierError("INVALID_BUS_ID", "busid 必须是非负安全整数");
+    }
+    busId = parsedBusId;
+  }
+  return {
+    fileId,
+    destinationDirectory: path.resolve(destinationDirectory),
+    requestedName,
+    messageSeq,
+    busId,
+  };
 }
 
 function sha256File(filePath) {
@@ -514,7 +573,7 @@ export function createNapCatNotifier(options = {}) {
     }
     if (!response.ok) {
       throw new NapCatNotifierError("ONEBOT_HTTP_ERROR", `OneBot ${action} 返回 HTTP ${response.status}`, {
-        outcomeUnknown: action === "send_group_msg" || action === "upload_group_file",
+        outcomeUnknown: (action === "send_group_msg" || action === "upload_group_file") && response.status >= 500,
         details: { status: response.status, retcode: envelope?.retcode ?? null },
       });
     }
@@ -755,14 +814,59 @@ export function createNapCatNotifier(options = {}) {
     };
   }
 
+  async function primeGroupFileLookup(binding, normalizedInput) {
+    try {
+      const history = await callOneBot("get_group_msg_history", {
+        group_id: binding.groupId,
+        ...(normalizedInput.messageSeq ? { message_seq: normalizedInput.messageSeq } : {}),
+        count: 50,
+        reverse_order: false,
+        disable_get_url: true,
+        parse_mult_msg: false,
+        quick_reply: false,
+      });
+      const messages = Array.isArray(history?.messages) ? history.messages : [];
+      const matchingMessage = messages
+        .map((message) => summarizeGroupMessage(message, binding.expectedSelfId))
+        .find((message) => message.attachments.some((attachment) => attachment.fileId === normalizedInput.fileId));
+      return {
+        attempted: true,
+        matched: Boolean(matchingMessage),
+        messageSeq: matchingMessage?.messageSeq ?? null,
+      };
+    } catch (error) {
+      return {
+        attempted: true,
+        matched: false,
+        messageSeq: null,
+        error: publicError(error),
+      };
+    }
+  }
+
   async function downloadFile(input) {
     const binding = loadBinding();
     const normalizedInput = normalizeDownloadInput(input);
     const targetCheck = await checkTarget(binding);
-    const urlData = await callOneBot("get_group_file_url", {
+    const lookupPayload = {
       group_id: binding.groupId,
       file_id: normalizedInput.fileId,
-    });
+      ...(normalizedInput.busId !== null ? { busid: normalizedInput.busId } : {}),
+    };
+    let urlData;
+    let cacheRefresh = null;
+    try {
+      urlData = await callOneBot("get_group_file_url", lookupPayload);
+    } catch (firstError) {
+      cacheRefresh = await primeGroupFileLookup(binding, normalizedInput);
+      try {
+        urlData = await callOneBot("get_group_file_url", lookupPayload);
+      } catch (retryError) {
+        retryError.initialLookupError = publicError(firstError);
+        retryError.cacheRefresh = cacheRefresh;
+        throw retryError;
+      }
+    }
     const downloadUrl = String(urlData?.url ?? "");
     let parsedUrl;
     try {
@@ -825,6 +929,7 @@ export function createNapCatNotifier(options = {}) {
         sha256: digest.digest("hex"),
         target: targetCheck.group,
         identity: targetCheck.login,
+        cacheRefresh,
       };
     } catch (error) {
       try {
@@ -843,6 +948,43 @@ export function createNapCatNotifier(options = {}) {
     }
   }
 
+  async function sendTaskFileIndex(binding, normalizedInput, file) {
+    const dedupeKey = taskFileIndexDedupeKey(normalizedInput.dedupeKey);
+    try {
+      const result = await sendFixedMessage(binding, {
+        event: "task_file_index",
+        taskId: normalizedInput.taskId,
+        runId: "",
+        dedupeKey,
+        message: buildTaskFileIndexMessage(normalizedInput, file, now()),
+      });
+      const existing = result.existing ?? {};
+      return {
+        status: result.sent ? (result.verified ? "sent_verified" : "sent_unverified") : (existing.status || result.reason || "not_sent"),
+        sent: Boolean(result.sent),
+        verified: result.verified ?? Boolean(existing.verified),
+        duplicateSuppressed: Boolean(result.duplicateSuppressed),
+        reason: result.reason ?? null,
+        messageId: result.messageId ?? String(existing.messageId ?? ""),
+        dedupeKey,
+        verificationError: result.verificationError ?? existing.verificationError ?? null,
+        error: null,
+      };
+    } catch (error) {
+      return {
+        status: error.outcomeUnknown ? "pending_send" : "failed_before_ack",
+        sent: false,
+        verified: false,
+        duplicateSuppressed: false,
+        reason: null,
+        messageId: "",
+        dedupeKey,
+        verificationError: null,
+        error: publicError(error),
+      };
+    }
+  }
+
   async function sendFile(input) {
     const binding = loadBinding();
     const normalizedInput = normalizeFileInput(input, maximumFileBytes);
@@ -850,6 +992,49 @@ export function createNapCatNotifier(options = {}) {
     const state = loadState(statePath);
     pruneState(state, binding.dedupeRetentionDays, currentTime);
     const existing = state.entries[normalizedInput.dedupeKey];
+      if (normalizedInput.hasTaskId && existing && existing.status !== "failed_before_ack") {
+      if (existing.status === "sent_verified" && existing.fileId) {
+        const file = {
+          fileId: String(existing.fileId),
+          messageSeq: String(existing.fileMessageSeq || ""),
+          busId: Number.isSafeInteger(existing.fileBusId) ? existing.fileBusId : null,
+          fileName: String(existing.fileName || normalizedInput.fileName),
+          fileBytes: Number(existing.fileBytes ?? normalizedInput.fileBytes),
+          sha256: String(existing.sha256 || await sha256File(normalizedInput.filePath)),
+        };
+        return {
+          sent: false,
+          duplicateSuppressed: true,
+          reason: "file_already_uploaded",
+          verified: true,
+          fileId: file.fileId,
+          verifiedFileId: String(existing.verifiedFileId ?? ""),
+          verificationError: existing.verificationError ?? null,
+          fileName: file.fileName,
+          fileBytes: file.fileBytes,
+          sha256: file.sha256,
+          dedupeKey: normalizedInput.dedupeKey,
+          taskIndex: await sendTaskFileIndex(binding, normalizedInput, file),
+        };
+      }
+      return {
+        sent: false,
+        duplicateSuppressed: true,
+        reason: existing.status === "pending_send" ? "previous_outcome_unknown" : "already_sent",
+        existing,
+        taskIndex: {
+          status: "blocked",
+          sent: false,
+          verified: false,
+          duplicateSuppressed: false,
+          reason: existing.status === "pending_send" ? "file_upload_pending" : "file_unverified",
+          messageId: "",
+          dedupeKey: taskFileIndexDedupeKey(normalizedInput.dedupeKey),
+          verificationError: null,
+          error: null,
+        },
+      };
+    }
     if (existing && existing.status !== "failed_before_ack") {
       return {
         sent: false,
@@ -902,6 +1087,8 @@ export function createNapCatNotifier(options = {}) {
         fileName: normalizedInput.fileName,
         fileBytes: normalizedInput.fileBytes,
         sha256: fileSha256,
+        sourceMachine: normalizedInput.sourceMachine,
+        targetMachine: normalizedInput.targetMachine,
       };
       atomicWriteJson(statePath, claimedState);
 
@@ -974,6 +1161,45 @@ export function createNapCatNotifier(options = {}) {
         verificationError = publicError(error);
       }
 
+      let fileMessage = null;
+      let fileMessageLookupError = null;
+      if (normalizedInput.hasTaskId) {
+        try {
+          const history = await callOneBot("get_group_msg_history", {
+            group_id: binding.groupId,
+            count: 50,
+            reverse_order: true,
+            disable_get_url: true,
+            parse_mult_msg: false,
+            quick_reply: false,
+          });
+          const candidates = (Array.isArray(history?.messages) ? history.messages : [])
+            .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+          fileMessage = candidates.find((message) =>
+            message.isSelf
+            && message.attachments.some((attachment) =>
+              attachment.fileId === fileId
+              || (
+                attachment.fileName === normalizedInput.fileName
+                && attachment.fileBytes === normalizedInput.fileBytes
+              )
+            )
+          ) ?? null;
+        } catch (error) {
+          fileMessageLookupError = publicError(error);
+        }
+      }
+      const messageAttachment = fileMessage?.attachments.find((attachment) =>
+        attachment.fileId === fileId
+        || (
+          attachment.fileName === normalizedInput.fileName
+          && attachment.fileBytes === normalizedInput.fileBytes
+        )
+      ) ?? null;
+      const fileBusId = Number.isSafeInteger(messageAttachment?.busId)
+        ? messageAttachment.busId
+        : (Number.isSafeInteger(Number(verifiedFile?.busid)) ? Number(verifiedFile.busid) : null);
+
       const finalState = loadState(statePath);
       finalState.entries[normalizedInput.dedupeKey] = {
         ...finalState.entries[normalizedInput.dedupeKey],
@@ -981,9 +1207,36 @@ export function createNapCatNotifier(options = {}) {
         verified,
         verificationError,
         verifiedFileId: String(verifiedFile?.file_id ?? ""),
+        fileMessageId: String(fileMessage?.messageId ?? ""),
+        fileMessageSeq: String(fileMessage?.messageSeq ?? ""),
+        fileBusId,
+        fileMessageLookupError,
         updatedAt: now().toISOString(),
       };
       atomicWriteJson(statePath, finalState);
+
+      const taskIndex = normalizedInput.hasTaskId
+        ? (verified
+          ? await sendTaskFileIndex(binding, normalizedInput, {
+            fileId,
+            messageSeq: String(fileMessage?.messageSeq ?? ""),
+            busId: fileBusId,
+            fileName: normalizedInput.fileName,
+            fileBytes: normalizedInput.fileBytes,
+            sha256: fileSha256,
+          })
+          : {
+            status: "blocked",
+            sent: false,
+            verified: false,
+            duplicateSuppressed: false,
+            reason: "file_unverified",
+            messageId: "",
+            dedupeKey: taskFileIndexDedupeKey(normalizedInput.dedupeKey),
+            verificationError,
+            error: null,
+          })
+        : null;
 
       return {
         sent: true,
@@ -991,12 +1244,17 @@ export function createNapCatNotifier(options = {}) {
         fileId,
         verifiedFileId: String(verifiedFile?.file_id ?? ""),
         verificationError,
+        fileMessageId: String(fileMessage?.messageId ?? ""),
+        fileMessageSeq: String(fileMessage?.messageSeq ?? ""),
+        fileBusId,
+        fileMessageLookupError,
         fileName: normalizedInput.fileName,
         fileBytes: normalizedInput.fileBytes,
         sha256: fileSha256,
         target: targetCheck.group,
         identity: targetCheck.login,
         dedupeKey: normalizedInput.dedupeKey,
+        ...(taskIndex ? { taskIndex } : {}),
       };
     } finally {
       if (releaseDedupeLock) releaseDedupeLock();
@@ -1147,7 +1405,7 @@ export function createNapCatNotifier(options = {}) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_ID_MISMATCH", "get_msg 返回的 message_id 不一致");
           }
           if (verifiedGroupId !== binding.groupId) {
-            throw new NapCatNotifierError("MESSAGE_VERIFY_GROUP_MISMATCH", "get_msg 返回的群号不是已绑定群");
+            throw new NapCatNotifierError("MESSAGE_VERIFY_GROUP_MISMATCH", "get_msg 返回的群号不是已绑定 ExampleGroup 群");
           }
           if (!verifiedText || verifiedText !== expectedText) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_TEXT_MISMATCH", "get_msg 返回的通知正文与发送内容不一致");

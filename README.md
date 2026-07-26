@@ -4,7 +4,7 @@
 
 这套项目最初用于 Antigravity，后来扩展为 Codex、Claude Code 与 Windsurf 共用同一套 MCP 源码、数据目录约定和模型路由。当前版本同时保留「单独安装一个宿主也能使用」与「多个宿主共享数据」两种模式。
 
-> 2026-07-24 refresh：memory-store 1.21.1、sandbox 1.15.1、web-fetcher 7.0.0、portable broker 0.1.0、Windsurf-only subagent 1.1.0，并新增可选 NapCat QQ 群协作 MCP 0.1.0。
+> 2026-07-27 refresh：通用 MCP 版本保持不变；Codex Rules 改为四种可组合配置，并同步 NapCat 任务账本、路由、监督器和自动唤醒相关的最新公开源码。
 
 ## 这套工具解决什么问题
 
@@ -23,7 +23,7 @@
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
-| `napcat-mcp` | 0.1.0 | 可选 QQ 群通知、结构化任务消息、近期消息读取和群文件传输 |
+| `napcat-mcp` | 0.1.0 | 可选 QQ 群通知、任务账本、可信路由、Codex 对话唤醒、群文件传输与监督器 |
 
 ## 重点能力
 
@@ -74,14 +74,16 @@ broker 会为普通请求使用 120 秒默认超时，并根据工具参数中�
 
 ### Rules：四宿主的人类化工作规则
 
-Rules 保留了猫娘式自然表达、少汇报腔、解释技术概念、Plan / Task / Stage Guard、子代理证据、Office 视觉验收和隐私边界等工作习惯，主要目标是让 AI 说人话并减少模板化伪人感。Codex 还附带 `system-prompt.template.md`，用于在宿主支持时强调 AGENTS 用户规则的优先采用方式；它是接收方主动部署的模板，不会自动覆盖系统文件。
+Rules 保留少汇报腔、解释技术概念、Plan / Task / Stage Guard、子代理证据、Office 视觉验收和隐私边界等工作习惯，主要目标是让 AI 说人话并减少模板化伪人感。猫娘表达已从 Codex 核心工程规则中拆成可选组件：不喜欢角色风格时可安装中性版，喜欢原有表达时可安装普通猫娘版，双机协作环境则选择开发机或训练机版。
 
-| 宿主 | 模板 |
+| 宿主 | Rules 入口 |
 | --- | --- |
-| Codex | `rules/codex/AGENTS.template.md` 与可选 `system-prompt.template.md` |
+| Codex | `rules/codex/profiles/` 中的中性、普通猫娘、开发机猫娘、训练机猫娘四种组合 |
 | Antigravity | `rules/antigravity/GEMINI.template.md` |
 | Claude Code | `rules/claude-code/CLAUDE.template.md` |
 | Windsurf | `rules/windsurf/global_rules.template.md` 与五个 `system_rules` 分片 |
+
+Codex 四种配置都复用 `components/core.template.md`，所以工程流程、工具说明和证据要求不会因角色风格变化而丢失。`system-prompt.template.md` 是四种配置共用的可选模板，用于在宿主支持时强调 AGENTS 用户规则；它不会自动覆盖系统文件。开发机与训练机的真实账号、群号、路径和信任边界必须写入仓库外的私有覆盖文件，公开示例不能直接当真实配置安装。
 
 Rules 已删除生日、学业、账号链接、登录态、本机路径、真实服务额度和私人项目上下文。接收方应根据自己的环境再修改。
 
@@ -100,8 +102,11 @@ Rules 已删除生日、学业、账号链接、登录态、本机路径、真�
 ./install/Start-CodexMcpBroker.ps1
 ./install/Status-CodexMcpBroker.ps1
 ./install/Apply-CodexConfig.ps1
+./install/Install-CodexRulesProfile.ps1 -Profile catgirl
 ./install/Test-CodexToolkit.ps1
 ```
+
+Codex Rules 还可选择 `neutral`、`development` 或 `training`。需要部署公共 `system-prompt.template.md` 时追加 `-InstallSystemPrompt`；需要机器私有配置时先把 `rules/codex/local-overrides.example.md` 复制到仓库外，再通过 `-LocalOverridePath` 传入。
 
 构建 Windsurf 专属 subagent：
 
@@ -172,7 +177,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
-| `napcat-mcp` | 0.1.0 | Optional QQ group notifications, structured task messages, recent-message reads, and file transfer |
+| `napcat-mcp` | 0.1.0 | Optional QQ group messaging, task ledger, trusted routing, Codex conversation wakeups, file transfer, and supervisor |
 
 ## Highlights
 
@@ -184,7 +189,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 - Persistent browser profiles store receiver-side cookies and localStorage and must never be repackaged. Sandbox adds timeouts, memory limits, and task governance but is not an OS-level VM or AppContainer; commands retain the receiver user's file and environment access.
 - Sandbox provides short execution, parallel batches, persistent sessions, background launches, smart code search, and Council reviews across Grok, Antigravity, Codex, and explicit Claude Code routes. Council 1.15.1 adds manifest-governed artifacts, abort/resume hardening, guarded garbage collection, and a cross-worker `agy` lease pool while keeping runtime data outside the source tree.
 - The broker forwards long-task timeouts, writes shutdown state reliably, and includes optional Exa, Windsurf subagent, and NapCat endpoints. NapCat remains disabled until the receiver supplies a local OneBot service and private binding.
-- Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Windsurf uses a short global rule plus five system-rule fragments.
+- Rules templates focus on natural human communication, evidence-based engineering work, privacy, and visual QA. Codex Rules are composed from a shared engineering core plus optional catgirl, development-machine, or training-machine overlays; Windsurf uses a short global rule plus five system-rule fragments.
 - Seventeen license-reviewed portable skills are included and validated during package checks, including the new `hatch-pet` workflow.
 
 ## Installation

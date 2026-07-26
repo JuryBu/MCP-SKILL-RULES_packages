@@ -2,7 +2,12 @@
 
 This folder contains privacy-scrubbed Rules templates for each host:
 
-- `codex/AGENTS.template.md` → merge into the receiver's Codex rules file.
+- `codex/components/core.template.md` → shared Codex engineering behavior.
+- `codex/components/catgirl.template.md` → optional natural catgirl voice.
+- `codex/components/development.template.md` and `training.template.md` → optional dual-machine role overlays.
+- `codex/profiles/*.profile.json` → four installable compositions: `neutral`, `catgirl`, `development`, and `training`.
+- `codex/guidance/*.template.md` → profile-specific machine-role guidance copied only by the corresponding profile.
+- `codex/local-overrides.example.md` → placeholder schema; copy it outside the repository before adding private values.
 - `codex/system-prompt.template.md` → optional Codex model-instructions target.
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
 - `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
@@ -11,9 +16,11 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance.
 - `windsurf/Windsurf_Global_Rules.template.md` → condensed compatibility entry for older import scripts; use the new split layout for full coverage.
 
-The templates preserve the current catgirl-style natural Chinese voice, anti-report-writing guidance, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, background-task rules, and Council artifact safety (`dryRun` before approved cleanup). They remove sender-specific identity, account data, local paths, credentials, active sessions, real-time service claims, model defaults, pricing, and quota promises.
+The templates preserve natural Chinese communication, anti-report-writing guidance, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, background-task rules, and Council artifact safety (`dryRun` before approved cleanup). The Codex catgirl voice is optional rather than embedded in the shared engineering core. General model-selection guidance may remain as a receiver-editable workflow preference; sender-specific identity, account data, local paths, credentials, active sessions, private entitlements, pricing claims, and quota promises are removed.
 
-The Codex `system-prompt.template.md` is an optional receiver-installed model-instructions file that reinforces following AGENTS user rules when the host supports this setting. It is included as a template only and never overwrites a host configuration automatically.
+Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. A real local override remains receiver-private and is ignored by package creation.
+
+The Codex `system-prompt.template.md` is an optional receiver-installed model-instructions file shared by all four profiles. It reinforces following AGENTS user rules when the host supports this setting and never overwrites a host configuration automatically.
 
 Shared MCP capabilities vary by host. Use `chain`, `dataChain`, and `modelChain` only when the installed tool documents them, and treat Windsurf-specific automation as opt-in rather than a default shared capability.
 

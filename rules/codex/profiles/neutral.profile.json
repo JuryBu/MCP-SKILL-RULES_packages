@@ -1,0 +1,8 @@
+{
+  "id": "neutral",
+  "displayName": "通用中性版",
+  "components": [
+    "components/core.template.md"
+  ],
+  "guidance": []
+}

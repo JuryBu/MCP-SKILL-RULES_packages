@@ -17,7 +17,6 @@ if (Test-Path -LiteralPath $outputFullPath) {
 }
 
 & (Join-Path $toolkitRoot "install\Test-CodexToolkit.ps1") -PackageClean
-if ($LASTEXITCODE -ne 0) { throw "Package-clean verification failed." }
 
 $allowedRootEntries = @(
     ".gitignore", "LICENSE", "PACKAGE_MANIFEST.md", "PRIVATE_EXCLUDE_CHECKLIST.md", "README.md",
@@ -35,7 +34,10 @@ $excludeNames = @(
     "broker-private.env.json", "auth.json", ".cockpit_codex_auth.json", "credentials.json",
     ".credentials.json", "token.json", "tokens.json", ".env", ".env.local", ".env.production",
     ".env.development", "cookies", "cookie", "web data", "login data", "local state",
-    "binding.json", "heartbeat.json", "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png", ".codex-empty-input"
+    "binding.json", "heartbeat.json", "heartbeat-runtime.json", "heartbeat.stop", "qrcode.png",
+    "local-overrides.md", ".codex-empty-input", "broker-state.json", "broker.pid",
+    "dedupe.json", "dedupe-state.json", "task-registry.json", "router-runtime.json",
+    "task-router-runtime.json", "supervisor-runtime.json", "napcat-runtime.json"
 )
 
 New-Item -ItemType Directory -Path $outputFullPath -Force | Out-Null
@@ -50,9 +52,10 @@ foreach ($rootEntry in $allowedRootEntries) {
     $files | ForEach-Object {
     $relative = $_.FullName.Substring($resolvedToolkitRoot.Length).TrimStart("\")
     $parts = $relative.Split("\")
-    if ($parts | Where-Object { $_ -in $excludeDirectories }) { return }
+    $isCodexRulesProfile = $relative -like "rules\codex\profiles\*.json"
+    if (-not $isCodexRulesProfile -and ($parts | Where-Object { $_ -in $excludeDirectories })) { return }
     $lowerName = $_.Name.ToLowerInvariant()
-    if ($lowerName -in $excludeNames -or $lowerName -like "broker-private*.json" -or $lowerName -like ".env.*" -or $lowerName -match '\.env($|\.)' -or $lowerName -match '\.(cookie|cookies|session)$' -or $_.Name -match '\.(log|sqlite3?|db|jsonl|har|vscdb|pb|pem|key|p12|pfx|bak|zip|7z|exe|dll)$' -or $_.Name -like "*.before-*") { return }
+    if ($lowerName -in $excludeNames -or $lowerName -like "broker-private*.json" -or $lowerName -like ".env.*" -or $lowerName -match '\.env($|\.)' -or $lowerName -match '\.(cookie|cookies|session|pid)$' -or $lowerName -match '(^|[-_.])(state|runtime)\.json$' -or $_.Name -match '\.(log|sqlite3?|db|jsonl|har|vscdb|pb|pem|key|p12|pfx|bak|zip|7z|exe|dll)$' -or $_.Name -like "*.before-*") { return }
     $target = Join-Path $outputFullPath $relative
     New-Item -ItemType Directory -Path (Split-Path -Parent $target) -Force | Out-Null
     Copy-Item -LiteralPath $_.FullName -Destination $target
@@ -60,7 +63,6 @@ foreach ($rootEntry in $allowedRootEntries) {
 }
 
 & (Join-Path $outputFullPath "install\Test-CodexToolkit.ps1") -PackageClean
-if ($LASTEXITCODE -ne 0) { throw "Copied package verification failed." }
 
 $archivePath = Join-Path (Split-Path -Parent $outputFullPath) $ArchiveName
 if (Test-Path -LiteralPath $archivePath) { throw "Archive already exists: $archivePath" }

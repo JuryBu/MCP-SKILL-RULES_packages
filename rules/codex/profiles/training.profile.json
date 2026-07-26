@@ -1,0 +1,15 @@
+{
+  "id": "training",
+  "displayName": "训练机猫娘版",
+  "components": [
+    "components/core.template.md",
+    "components/catgirl.template.md",
+    "components/training.template.md"
+  ],
+  "guidance": [
+    {
+      "source": "guidance/training-machine.template.md",
+      "target": "training-machine.md"
+    }
+  ]
+}

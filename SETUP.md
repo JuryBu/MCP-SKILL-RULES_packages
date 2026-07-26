@@ -72,16 +72,41 @@ $env:CODEX_MCP_BROKER_WAIT_TIMEOUT_MS = "1800000"
 
 The script backs up `%USERPROFILE%\.codex\config.toml` before merging HTTP MCP endpoints.
 
-Rules:
-
-```text
-rules/codex/AGENTS.template.md -> %USERPROFILE%/.codex/AGENTS.md
-```
-
-Optional system prompt emphasis:
+Choose one Codex Rules profile:
 
 ```powershell
-./install/Install-SystemPromptTemplate.ps1
+./install/Install-CodexRulesProfile.ps1 -Profile catgirl
+```
+
+Available profiles:
+
+| Profile | Composition | Intended use |
+| --- | --- | --- |
+| `neutral` | shared engineering core | no character voice |
+| `catgirl` | core + natural catgirl voice | normal single-machine use |
+| `development` | core + catgirl + development role | dual-machine development side |
+| `training` | core + catgirl + training role | dual-machine training side |
+
+The installer backs up files that it overwrites under `%USERPROFILE%\\.codex\\backups\\rules-profile-<timestamp>`. To preview a profile without installing it:
+
+```powershell
+./install/Build-CodexRulesProfile.ps1 -Profile development -OutputDirectory ".\\profile-preview"
+```
+
+Machine-specific accounts, trusted peers, group IDs, absolute paths, and credentials must stay outside the repository. Copy `rules/codex/local-overrides.example.md` to a private location, edit that private copy, and install it explicitly:
+
+```powershell
+./install/Install-CodexRulesProfile.ps1 `
+  -Profile development `
+  -LocalOverridePath "D:\\private\\codex-local-overrides.md"
+```
+
+Do not pass `local-overrides.example.md` itself: the scripts reject it to prevent placeholder values from being mistaken for a working binding.
+
+Optional common system-prompt emphasis:
+
+```powershell
+./install/Install-CodexRulesProfile.ps1 -Profile catgirl -InstallSystemPrompt
 ```
 
 Then configure:
@@ -90,7 +115,7 @@ Then configure:
 model_instructions_file = "~/.codex/prompts/system-prompt.md"
 ```
 
-The system prompt only points Codex back to AGENTS-style instructions; it does not contain credentials or private data.
+The system prompt only points Codex back to AGENTS-style instructions; it is shared by all four profiles and does not contain credentials or private data. `Install-SystemPromptTemplate.ps1` remains available for receivers who want to install only that template.
 
 ## 6. Configure Antigravity
 
@@ -200,9 +225,21 @@ $env:NAPCAT_HTTP_URL = "http://127.0.0.1:3010"
 $env:NAPCAT_ACCESS_TOKEN = "<receiver-private-onebot-token>"
 ```
 
-Restart the broker, then uncomment the optional NapCat block in `templates/config.codex.toml`. The endpoint supports fixed-group notifications, structured `task_id` messages, recent-message reads, file upload/download, and heartbeat scripts. It never accepts an arbitrary group ID from a tool call.
+Restart the broker, then uncomment the optional NapCat block in `templates/config.codex.toml`. The endpoint supports fixed-group notifications, structured `task_id` messages, a persistent task ledger, trusted-peer routing, Codex conversation wakeups, file upload/download, and heartbeat scripts. It never accepts an arbitrary group ID from a tool call.
 
-Do not share NapCat binaries, QQ login state, QR codes, `binding.json`, OneBot tokens, heartbeat state, or dedupe files. Full details are in `mcps/napcat-mcp/README.md`.
+Task routing state is written below the receiver's `.codex-toolkit/napcat-mcp/state` directory. Each participating Codex conversation must call `napcat_task_register` with a stable `task_id`, its own `conversation_id`, machine role, source/target labels, and trusted peer QQ. After processing messages, call `napcat_task_ack` with the actual maximum handled `message_seq`; close completed tasks with `napcat_task_close`.
+
+To install the optional hidden per-user supervisor after configuration:
+
+```powershell
+./mcps/napcat-mcp/ops/install-napcat-autostart.ps1 -StartNow
+./mcps/napcat-mcp/ops/get-napcat-supervisor-status.ps1
+./mcps/napcat-mcp/ops/get-napcat-task-router-status.ps1
+```
+
+The supervisor starts the router only when the broker, NapCat OneBot, the expected account, NapCat process, Codex process, and at least one open task are all present. Remove it with `remove-napcat-autostart.ps1`; the script backs up and restores a previous task with the same fixed name.
+
+Do not share NapCat binaries, QQ login state, QR codes, `binding.json`, OneBot tokens, task registry, router runtime, heartbeat state, or dedupe files. Verify the file upload → index → message read → download loop against the receiver's exact NapCat version because OneBot builds may disagree on `file_id` versus attachment UUID handling. Full details are in `mcps/napcat-mcp/README.md`.
 
 ## 13. Install Skills
 
@@ -242,7 +279,7 @@ NapCat is also excluded from generic smoke tests because a live check requires a
 
 ```powershell
 $env:CODEX_TOOLKIT_PRIVATE_PATTERNS = "C:\\Users\\YourName;your-account-link;your-private-marker"
-./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-24" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-24.zip"
+./install/New-PortableToolkitPackage.ps1 -OutputDirectory "D:\releases\toolkit-2026-07-27" -ArchiveName "Portable-MCP-SKILL-RULES-Toolkit-2026-07-27.zip"
 ```
 
 The command refuses to overwrite an existing output directory or archive, validates both source and copied package, and prints SHA256.
