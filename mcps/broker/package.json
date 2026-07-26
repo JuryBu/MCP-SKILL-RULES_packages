@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node broker.mjs",
-    "check": "node --check broker.mjs && node --check exa-stateless-stdio.mjs",
+    "check": "node --check broker.mjs && node --check exa-stateless-stdio.mjs && node test/startup-smoke.mjs",
     "health": "npm run check"
   }
 }

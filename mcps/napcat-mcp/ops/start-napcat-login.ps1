@@ -1,14 +1,40 @@
 ﻿[CmdletBinding()]
 param(
   [string]$NapCatRoot = "",
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
-  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
+  [string]$DataRoot = "",
+  [string]$BrokerRoot = "",
   [string]$CodexHome = "",
   [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
   [switch]$NoQr
 )
 
 $ErrorActionPreference = "Stop"
+$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($CodexHome)) { $CodexHome = Join-Path $env:USERPROFILE ".codex" }
+if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
+  if (-not [string]::IsNullOrWhiteSpace($env:CODEX_TOOLKIT_BROKER_ROOT)) {
+    $BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
+  } else {
+    $LegacyBrokerRoot = Join-Path $CodexHome "mcp-http-broker"
+    $BrokerRoot = if (Test-Path -LiteralPath (Join-Path $LegacyBrokerRoot "broker-private.env.json")) {
+      $LegacyBrokerRoot
+    } else {
+      Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker"
+    }
+  }
+}
+if ([string]::IsNullOrWhiteSpace($DataRoot)) {
+  if (-not [string]::IsNullOrWhiteSpace($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT)) {
+    $DataRoot = $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT
+  } else {
+    $LegacyDataRoot = Join-Path $BrokerRoot "napcat-mcp"
+    $DataRoot = if (Test-Path -LiteralPath (Join-Path $LegacyDataRoot "binding.json")) {
+      $LegacyDataRoot
+    } else {
+      Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"
+    }
+  }
+}
 if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
   $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
   if (Test-Path -LiteralPath $RuntimeStateFile) {
@@ -18,8 +44,6 @@ if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
     $NapCatRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"
   }
 }
-$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker" }
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
 $QrCodePath = Join-Path $NapCatRoot "cache\qrcode.png"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"

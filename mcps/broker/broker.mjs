@@ -28,6 +28,7 @@ bootstrapPrivateEnv();
 
 const toolkitMcpRoot = process.env.CODEX_TOOLKIT_MCP_ROOT || path.resolve(__dirname, "..");
 const toolkitDataRoot = process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit");
+const brokerRoot = process.env.CODEX_TOOLKIT_BROKER_ROOT || __dirname;
 const memoryStoreRoot = process.env.MEMORY_STORE_MCP_ROOT || path.join(toolkitMcpRoot, "memory-store");
 const webFetcherRoot = process.env.WEB_FETCHER_MCP_ROOT || path.join(toolkitMcpRoot, "web-fetcher");
 const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "sandbox");
