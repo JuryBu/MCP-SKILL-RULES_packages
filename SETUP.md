@@ -70,7 +70,7 @@ $env:CODEX_MCP_BROKER_WAIT_TIMEOUT_MS = "1800000"
 ./install/Apply-CodexConfig.ps1
 ```
 
-The script backs up `%USERPROFILE%\.codex\config.toml` before merging HTTP MCP endpoints.
+The script backs up `%USERPROFILE%\.codex\config.toml`, ensures the top-level `project_doc_max_bytes` setting is at least `65536`, and then merges HTTP MCP endpoints. The 64K minimum prevents the larger development and training profiles from being truncated by Codex's common 32K project-document limit.
 
 Choose one Codex Rules profile:
 
@@ -87,7 +87,7 @@ Available profiles:
 | `development` | core + catgirl + development role | dual-machine development side |
 | `training` | core + catgirl + training role | dual-machine training side |
 
-The installer backs up files that it overwrites under `%USERPROFILE%\\.codex\\backups\\rules-profile-<timestamp>`. To preview a profile without installing it:
+The installer backs up files that it overwrites under `%USERPROFILE%\\.codex\\backups\\rules-profile-<timestamp>` and independently ensures `project_doc_max_bytes >= 65536`. To preview a profile without installing it:
 
 ```powershell
 ./install/Build-CodexRulesProfile.ps1 -Profile development -OutputDirectory ".\\profile-preview"

@@ -245,6 +245,22 @@ function Test-PackageStructure {
         throw "NapCat autostart install/remove must stop an existing watchdog task before replacement or supervisor shutdown."
     }
 
+    $configHelperPath = Join-Path $toolkitRoot "install\\CodexConfigHelpers.ps1"
+    if (-not (Test-Path -LiteralPath $configHelperPath)) {
+        throw "Missing Codex config helper: $configHelperPath"
+    }
+    . $configHelperPath
+    foreach ($highLimit in @("131072", "131_072", "+131072")) {
+        $preservedHighLimit = Set-CodexProjectDocMaxBytes -Content "project_doc_max_bytes = $highLimit" -MinimumBytes 65536
+        if (-not $preservedHighLimit.Contains("project_doc_max_bytes = $highLimit")) {
+            throw "Codex config helper lowered or rewrote an existing higher project document limit: $highLimit"
+        }
+    }
+    $insertedRootLimit = Set-CodexProjectDocMaxBytes -Content "[features]`r`ntest_feature = true" -MinimumBytes 65536
+    if ($insertedRootLimit.IndexOf("project_doc_max_bytes") -gt $insertedRootLimit.IndexOf("[features]")) {
+        throw "Codex config helper inserted project_doc_max_bytes inside a TOML table."
+    }
+
     $profileIds = @("neutral", "catgirl", "development", "training")
     $buildScript = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"
     $profileTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-profile-test-" + [guid]::NewGuid().ToString("N"))
@@ -254,6 +270,9 @@ function Test-PackageStructure {
             & $buildScript -Profile $profileId -OutputDirectory $outputRoot | Out-Null
             $agentsPath = Join-Path $outputRoot "AGENTS.md"
             if (-not (Test-Path -LiteralPath $agentsPath)) { throw "Profile did not produce AGENTS.md: $profileId" }
+            if ((Get-Item -LiteralPath $agentsPath).Length -gt 65536) {
+                throw "Profile exceeds the default installed 64K project document limit: $profileId"
+            }
             $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
             if (-not ($agentsText.Contains("stage_guard")) -or -not ($agentsText.Contains("sandbox_council"))) {
                 throw "Profile lost shared engineering rules: $profileId"
@@ -308,12 +327,28 @@ function Test-PackageStructure {
     $profileInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-install-test-" + [guid]::NewGuid().ToString("N"))
     try {
         & $installScript -Profile "development" -CodexHome $profileInstallRoot | Out-Null
+        $installedConfigPath = Join-Path $profileInstallRoot "config.toml"
+        $installedConfig = Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8
+        $installedLimit = [regex]::Match($installedConfig, "(?m)^project_doc_max_bytes\s*=\s*(\d+)\s*$")
+        if (-not $installedLimit.Success -or [long]$installedLimit.Groups[1].Value -lt 65536) {
+            throw "Rules profile install did not ensure a 64K Codex project document limit."
+        }
         $developmentGuidance = Join-Path $profileInstallRoot "guidance\development-machine.md"
         if (-not (Test-Path -LiteralPath $developmentGuidance)) {
             throw "Development profile install did not create role guidance."
         }
 
+        Set-Content -LiteralPath $installedConfigPath -Encoding UTF8 -Value @(
+            "project_doc_max_bytes = 131_072",
+            "",
+            "[features]",
+            "test_feature = true"
+        )
         & $installScript -Profile "catgirl" -CodexHome $profileInstallRoot | Out-Null
+        $preservedInstalledConfig = Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8
+        if (-not $preservedInstalledConfig.Contains("project_doc_max_bytes = 131_072")) {
+            throw "Rules profile install did not preserve an existing higher TOML-formatted project document limit."
+        }
         if (Test-Path -LiteralPath $developmentGuidance) {
             throw "Profile switch left stale development role guidance."
         }
@@ -327,9 +362,73 @@ function Test-PackageStructure {
         if (-not ($installedAgents.Contains("kaomoji")) -or $installedAgents.Contains("local_role=development")) {
             throw "Profile switch did not replace AGENTS.md with the selected profile."
         }
+        $limitCount = [regex]::Matches(
+            (Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8),
+            "(?m)^project_doc_max_bytes\s*="
+        ).Count
+        if ($limitCount -ne 1) {
+            throw "Repeated Rules profile installs duplicated project_doc_max_bytes."
+        }
     } finally {
         if (Test-Path -LiteralPath $profileInstallRoot) {
             Remove-Item -LiteralPath $profileInstallRoot -Recurse -Force
+        }
+    }
+
+    $applyConfigScript = Join-Path $toolkitRoot "install\\Apply-CodexConfig.ps1"
+    $configApplyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-config-apply-test-" + [guid]::NewGuid().ToString("N"))
+    try {
+        $fakeUserProfile = Join-Path $configApplyRoot "user"
+        $fakeCodexHome = Join-Path $fakeUserProfile ".codex"
+        New-Item -ItemType Directory -Force -Path $fakeCodexHome | Out-Null
+        $configApplyPath = Join-Path $fakeCodexHome "config.toml"
+        Set-Content -LiteralPath $configApplyPath -Encoding UTF8 -Value @(
+            "project_doc_max_bytes = 32768",
+            "",
+            "[features]",
+            "test_feature = true"
+        )
+        $originalUserProfile = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $fakeUserProfile
+            & $applyConfigScript | Out-Null
+            & $applyConfigScript | Out-Null
+        } finally {
+            $env:USERPROFILE = $originalUserProfile
+        }
+        $appliedConfig = Get-Content -LiteralPath $configApplyPath -Raw -Encoding UTF8
+        if (-not $appliedConfig.Contains("project_doc_max_bytes = 65536")) {
+            throw "Apply-CodexConfig did not raise project_doc_max_bytes to 65536."
+        }
+        if (-not $appliedConfig.Contains("[features]") -or -not $appliedConfig.Contains("test_feature = true")) {
+            throw "Apply-CodexConfig did not preserve existing Codex configuration."
+        }
+        if ([regex]::Matches($appliedConfig, "(?m)^project_doc_max_bytes\s*=").Count -ne 1) {
+            throw "Apply-CodexConfig duplicated project_doc_max_bytes."
+        }
+        if ($appliedConfig.IndexOf("project_doc_max_bytes") -gt $appliedConfig.IndexOf("[features]")) {
+            throw "Apply-CodexConfig placed project_doc_max_bytes inside a TOML table."
+        }
+        Set-Content -LiteralPath $configApplyPath -Encoding UTF8 -Value @(
+            "project_doc_max_bytes = 131_072",
+            "",
+            "[features]",
+            "test_feature = true"
+        )
+        $originalUserProfile = $env:USERPROFILE
+        try {
+            $env:USERPROFILE = $fakeUserProfile
+            & $applyConfigScript | Out-Null
+        } finally {
+            $env:USERPROFILE = $originalUserProfile
+        }
+        $preservedAppliedConfig = Get-Content -LiteralPath $configApplyPath -Raw -Encoding UTF8
+        if (-not $preservedAppliedConfig.Contains("project_doc_max_bytes = 131_072")) {
+            throw "Apply-CodexConfig did not preserve an existing higher TOML-formatted project document limit."
+        }
+    } finally {
+        if (Test-Path -LiteralPath $configApplyRoot) {
+            Remove-Item -LiteralPath $configApplyRoot -Recurse -Force
         }
     }
 

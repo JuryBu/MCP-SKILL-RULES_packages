@@ -21,6 +21,8 @@
 ./install/Test-CodexToolkit.ps1
 ```
 
+`Apply-CodexConfig.ps1` 与 `Install-CodexRulesProfile.ps1` 都会保证 Codex 的 `project_doc_max_bytes` 至少为 `65536`，避免较长的开发机或训练机 Rules 在 32K 附近被截断。
+
 然后按自己的使用方式安装 Codex Rules，例如保留原有自然猫娘表达：
 
 ```powershell

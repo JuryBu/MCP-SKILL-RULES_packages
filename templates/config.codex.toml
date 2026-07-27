@@ -1,4 +1,5 @@
 ﻿# Add or merge these blocks into %USERPROFILE%/.codex/config.toml
+# Apply-CodexConfig.ps1 separately ensures the top-level project_doc_max_bytes is at least 65536.
 # Optional top-level setting:
 # If you run install/Install-SystemPromptTemplate.ps1, you may add:
 # model_instructions_file = "~/.codex/prompts/system-prompt.md"

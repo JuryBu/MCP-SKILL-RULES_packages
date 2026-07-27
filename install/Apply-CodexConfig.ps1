@@ -3,6 +3,8 @@
 $codexDir = Join-Path $env:USERPROFILE ".codex"
 $configPath = Join-Path $codexDir "config.toml"
 $backupDir = Join-Path $codexDir "backups"
+$toolkitRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+. (Join-Path $toolkitRoot "install\\CodexConfigHelpers.ps1")
 $templatePath = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) "templates\config.codex.toml"
 
 New-Item -ItemType Directory -Force -Path $codexDir, $backupDir | Out-Null
@@ -33,6 +35,7 @@ $legacyPattern = "(?s)\r?\n?" + [regex]::Escape($legacyBegin) + ".*?" + [regex]:
 $current = [regex]::Replace($current, $legacyPattern, "").TrimEnd()
 $pattern = "(?s)\r?\n?# BEGIN PORTABLE CODEX TOOLKIT MCP.*?# END PORTABLE CODEX TOOLKIT MCP\r?\n?"
 $clean = [regex]::Replace($current, $pattern, "").TrimEnd()
+$clean = Set-CodexProjectDocMaxBytes -Content $clean -MinimumBytes 65536
 $managedServerNames = @("memory-store", "web-fetcher", "sandbox", "playwright", "sequential-thinking")
 if ($env:EXA_MCP_REMOTE_URL -or $env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL) { $managedServerNames += "exa" }
 $duplicates = @($managedServerNames | Where-Object {
@@ -43,7 +46,8 @@ if ($duplicates.Count -gt 0) {
 }
 $next = if ($clean.Length -gt 0) { "$clean`r`n`r`n$block`r`n" } else { "$block`r`n" }
 
-Set-Content -LiteralPath $configPath -Value $next -Encoding UTF8
+Set-Content -LiteralPath $configPath -Value $next -Encoding UTF8 -NoNewline
 Write-Output "Updated Codex config: $configPath"
+Write-Output "Ensured project_doc_max_bytes is at least 65536."
 Write-Output "Restart Codex after applying this config."
 

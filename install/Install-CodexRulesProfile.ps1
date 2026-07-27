@@ -9,6 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $toolkitRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
+. (Join-Path $toolkitRoot "install\\CodexConfigHelpers.ps1")
 $builder = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"
 $resolvedCodexHome = [System.IO.Path]::GetFullPath($CodexHome)
 $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-profile-" + [guid]::NewGuid().ToString("N"))
@@ -27,8 +28,18 @@ try {
     if (-not (Test-Path -LiteralPath (Join-Path $tempRoot "AGENTS.md"))) {
         throw "Codex Rules profile build failed."
     }
+    $agentsBytes = (Get-Item -LiteralPath (Join-Path $tempRoot "AGENTS.md")).Length
+    $requiredProjectDocBytes = [Math]::Max(65536, $agentsBytes + 8192)
 
     New-Item -ItemType Directory -Force -Path $resolvedCodexHome | Out-Null
+    $configPath = Join-Path $resolvedCodexHome "config.toml"
+    $currentConfig = if (Test-Path -LiteralPath $configPath) {
+        Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    } else {
+        ""
+    }
+    $nextConfig = Set-CodexProjectDocMaxBytes -Content $currentConfig -MinimumBytes $requiredProjectDocBytes
+    $configNeedsUpdate = $nextConfig -ne $currentConfig
     $copies = @(
         [pscustomobject]@{
             Source = (Join-Path $tempRoot "AGENTS.md")
@@ -68,6 +79,9 @@ try {
             [pscustomobject]@{ Source = $null; Target = $_ }
         }
     )
+    if ($configNeedsUpdate -and (Test-Path -LiteralPath $configPath)) {
+        $existingTargets += [pscustomobject]@{ Source = $null; Target = $configPath }
+    }
     if ($existingTargets.Count -gt 0) {
         New-Item -ItemType Directory -Force -Path $backupRoot | Out-Null
         foreach ($copy in $existingTargets) {
@@ -86,9 +100,13 @@ try {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $copy.Target) | Out-Null
         Copy-Item -LiteralPath $copy.Source -Destination $copy.Target -Force
     }
+    if ($configNeedsUpdate) {
+        Set-Content -LiteralPath $configPath -Value $nextConfig -Encoding UTF8 -NoNewline
+    }
 
     Write-Output "Installed Codex Rules profile: $Profile"
     Write-Output "Codex home: $resolvedCodexHome"
+    Write-Output "Ensured project_doc_max_bytes is at least $requiredProjectDocBytes."
     Write-Output "Removed stale role guidance: $($staleGuidanceTargets.Count)"
     if ($existingTargets.Count -gt 0) {
         Write-Output "Backup: $backupRoot"
