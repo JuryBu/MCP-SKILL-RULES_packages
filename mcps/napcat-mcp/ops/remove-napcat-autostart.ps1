@@ -16,9 +16,22 @@ if (Test-Path -LiteralPath $StatePath) {
   if (-not [string]::IsNullOrWhiteSpace([string]$InstallState.taskName)) { $TaskName = [string]$InstallState.taskName }
 }
 
-if ((Test-Path -LiteralPath $StopScript) -and $PSCmdlet.ShouldProcess($TaskName, "stop NapCat/Codex supervisor")) {
-  try { & $StopScript -DataRoot $DataRoot | Out-Null } catch { Write-Warning "Supervisor stop request failed: $($_.Exception.Message)" }
+function Stop-TaskInstance {
+  param([string]$Name)
+
+  $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  if ($null -eq $Task -or [string]$Task.State -ne "Running") { return }
+  Stop-ScheduledTask -TaskName $Name -ErrorAction Stop
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  do {
+    Start-Sleep -Milliseconds 250
+    $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  } while ($null -ne $Task -and [string]$Task.State -eq "Running" -and [DateTime]::UtcNow -lt $Deadline)
+  if ($null -ne $Task -and [string]$Task.State -eq "Running") {
+    throw "Scheduled task is still running after the stop request: $Name"
+  }
 }
+
 $CurrentTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $Removed = $false
 if ($null -ne $CurrentTask) {
@@ -27,9 +40,14 @@ if ($null -ne $CurrentTask) {
     $RemovalBackup = Join-Path $DataRoot ("backups\napcat-supervisor-remove-" + $Stamp)
     New-Item -ItemType Directory -Force -Path $RemovalBackup | Out-Null
     Export-ScheduledTask -TaskName $TaskName | Set-Content -LiteralPath (Join-Path $RemovalBackup "scheduled-task.xml") -Encoding UTF8
+    Stop-TaskInstance -Name $TaskName
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     $Removed = $true
   }
+}
+
+if ((Test-Path -LiteralPath $StopScript) -and $PSCmdlet.ShouldProcess($TaskName, "stop NapCat/Codex supervisor")) {
+  try { & $StopScript -DataRoot $DataRoot | Out-Null } catch { Write-Warning "Supervisor stop request failed: $($_.Exception.Message)" }
 }
 
 $RestoredPrevious = $false

@@ -1,0 +1,64 @@
+[CmdletBinding()]
+param(
+  [ValidateRange(10, 300)][int]$IntervalSeconds = 30,
+  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+)
+
+$ErrorActionPreference = "Stop"
+$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
+$StartScript = Join-Path $PSScriptRoot "start-napcat-supervisor.ps1"
+$WatchdogStatePath = Join-Path $DataRoot "supervisor-watchdog.json"
+$WatchdogLogPath = Join-Path $DataRoot "supervisor-watchdog.jsonl"
+$NormalizedDataRoot = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\').ToLowerInvariant()
+$HashProvider = [System.Security.Cryptography.SHA256]::Create()
+try {
+  $HashBytes = $HashProvider.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($NormalizedDataRoot))
+  $MutexSuffix = ([System.BitConverter]::ToString($HashBytes)).Replace("-", "").Substring(0, 16)
+} finally {
+  $HashProvider.Dispose()
+}
+$Mutex = New-Object System.Threading.Mutex($false, "Local\CodexNapCatSupervisorWatchdog-$MutexSuffix")
+$OwnsMutex = $false
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+function Write-WatchdogRecord {
+  param([string]$Status, [string]$Message)
+
+  if ((Test-Path -LiteralPath $WatchdogLogPath) -and (Get-Item -LiteralPath $WatchdogLogPath).Length -gt 1048576) {
+    Move-Item -LiteralPath $WatchdogLogPath -Destination "$WatchdogLogPath.previous" -Force
+  }
+  $Record = [ordered]@{
+    at = (Get-Date).ToString("o")
+    pid = $PID
+    status = $Status
+    message = $Message
+  }
+  $Line = ($Record | ConvertTo-Json -Compress -Depth 5)
+  [System.IO.File]::AppendAllText($WatchdogLogPath, "$Line`n", $Utf8NoBom)
+  [System.IO.File]::WriteAllText($WatchdogStatePath, (($Record | ConvertTo-Json -Depth 5) + "`n"), $Utf8NoBom)
+}
+
+try {
+  $OwnsMutex = $Mutex.WaitOne(0)
+  if (-not $OwnsMutex) { exit 0 }
+  if (-not (Test-Path -LiteralPath $StartScript)) {
+    throw "NapCat supervisor start script is missing: $StartScript"
+  }
+  if (-not (Test-Path -LiteralPath $NapCatMcpRoot)) {
+    throw "NapCat MCP root is missing: $NapCatMcpRoot"
+  }
+
+  New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
+  while ($true) {
+    try {
+      & $StartScript -DataRoot $DataRoot | Out-Null
+      Write-WatchdogRecord -Status "healthy" -Message "Supervisor verified."
+    } catch {
+      Write-WatchdogRecord -Status "retrying" -Message $_.Exception.Message
+    }
+    Start-Sleep -Seconds $IntervalSeconds
+  }
+} finally {
+  if ($OwnsMutex) { $Mutex.ReleaseMutex() }
+  $Mutex.Dispose()
+}

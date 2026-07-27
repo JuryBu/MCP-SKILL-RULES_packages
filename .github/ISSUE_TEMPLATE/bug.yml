@@ -1,0 +1,64 @@
+name: Bug or compatibility problem
+description: Report a reproducible MCP, rules, broker, or installer defect.
+title: "[bug] "
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - memory-store
+        - sandbox
+        - web-fetcher
+        - broker
+        - napcat-mcp
+        - mcp-subagent
+        - Codex rules or installer
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: machines
+    attributes:
+      label: Affected machines
+      options:
+        - Development machine
+        - Training machine
+        - Both machines
+        - Unknown
+    validations:
+      required: true
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Describe the observed behavior and its impact.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use public-safe sample values and include the relevant version or commit.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Verification evidence
+      description: Include sanitized errors, commands, test results, and anything not yet checked.
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: I removed tokens, accounts, group IDs, login state, private absolute paths, task data, and private logs.
+          required: true
+        - label: The reproduction uses synthetic or otherwise public-safe data.
+          required: true

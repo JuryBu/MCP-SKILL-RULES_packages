@@ -19,7 +19,7 @@ if (Test-Path -LiteralPath $outputFullPath) {
 & (Join-Path $toolkitRoot "install\Test-CodexToolkit.ps1") -PackageClean
 
 $allowedRootEntries = @(
-    ".gitignore", "LICENSE", "PACKAGE_MANIFEST.md", "PRIVATE_EXCLUDE_CHECKLIST.md", "README.md",
+    ".github", ".gitignore", "LICENSE", "PACKAGE_MANIFEST.md", "PRIVATE_EXCLUDE_CHECKLIST.md", "README.md",
     "SETUP.md", "TOOLKIT_README.md", "design-tests", "install", "mcps", "rules", "skills", "templates"
 )
 $excludeDirectories = @(

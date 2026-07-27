@@ -1,0 +1,55 @@
+name: Feature request
+description: Propose a reusable MCP, rules, broker, or installer improvement.
+title: "[feature] "
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - memory-store
+        - sandbox
+        - web-fetcher
+        - broker
+        - napcat-mcp
+        - mcp-subagent
+        - Codex rules or installer
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Maintenance problem
+      description: Explain the recurring problem or missing capability.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest reusable improvement and its acceptance criteria.
+    validations:
+      required: true
+  - type: dropdown
+    id: machines
+    attributes:
+      label: Intended machines
+      options:
+        - Development machine
+        - Training machine
+        - Both machines
+        - Any installation
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives or trade-offs
+  - type: checkboxes
+    id: disclosure
+    attributes:
+      label: Public disclosure check
+      options:
+        - label: This request contains no credentials, private identifiers, task data, or private logs.
+          required: true

@@ -10,8 +10,13 @@ param(
 
 $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-$StartScript = Join-Path $NapCatMcpRoot "ops\start-napcat-supervisor.ps1"
-if (-not (Test-Path -LiteralPath $StartScript)) { throw "Installed supervisor start script not found: $StartScript" }
+$SupervisorStartScript = Join-Path $NapCatMcpRoot "ops\start-napcat-supervisor.ps1"
+$WatchdogScript = Join-Path $NapCatMcpRoot "ops\Run-NapCatSupervisorWatchdog.ps1"
+$HiddenLauncher = Join-Path $NapCatMcpRoot "ops\Run-HiddenPowerShell.vbs"
+if (-not (Test-Path -LiteralPath $SupervisorStartScript)) { throw "Installed supervisor start script not found: $SupervisorStartScript" }
+if (-not (Test-Path -LiteralPath $WatchdogScript)) { throw "Installed supervisor watchdog not found: $WatchdogScript" }
+if (-not (Test-Path -LiteralPath $HiddenLauncher)) { throw "Hidden PowerShell launcher not found: $HiddenLauncher" }
+if ($DataRoot.Contains('"')) { throw "DataRoot cannot contain a double quote." }
 
 $StatePath = Join-Path $DataRoot "napcat-supervisor-autostart.json"
 $Stamp = (Get-Date -Format "yyyyMMdd-HHmmss-fff") + "-" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -20,10 +25,26 @@ $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyConti
 $TaskExisted = $null -ne $ExistingTask
 $ExistingTaskXml = $null
 
+function Stop-TaskInstance {
+  param([string]$Name)
+
+  $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  if ($null -eq $Task -or [string]$Task.State -ne "Running") { return }
+  Stop-ScheduledTask -TaskName $Name -ErrorAction Stop
+  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
+  do {
+    Start-Sleep -Milliseconds 250
+    $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
+  } while ($null -ne $Task -and [string]$Task.State -eq "Running" -and [DateTime]::UtcNow -lt $Deadline)
+  if ($null -ne $Task -and [string]$Task.State -eq "Running") {
+    throw "Scheduled task is still running after the stop request: $Name"
+  }
+}
+
 $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$StartScript`""
+$Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$HiddenLauncher`" `"$WatchdogScript`" -DataRoot `"$DataRoot`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
-$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 0) -MultipleInstances IgnoreNew -Hidden
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 0) -MultipleInstances IgnoreNew -Hidden -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
 
 if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor at user logon")) {
@@ -36,6 +57,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
     Copy-Item -LiteralPath $StatePath -Destination (Join-Path $BackupDir "napcat-supervisor-autostart.json") -Force
   }
+  if ($TaskExisted) { Stop-TaskInstance -Name $TaskName }
   Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
   $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
   $InstallState = [ordered]@{
@@ -43,7 +65,9 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     installedAt = (Get-Date).ToString("o")
     taskName = $TaskName
     userId = $UserId
-    startScript = $StartScript
+    startScript = $WatchdogScript
+    supervisorStartScript = $SupervisorStartScript
+    hiddenLauncher = $HiddenLauncher
     previousTaskExisted = $TaskExisted
     previousTaskXml = $ExistingTaskXml
     backupDir = if (Test-Path -LiteralPath $BackupDir) { $BackupDir } else { $null }
@@ -56,6 +80,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
   installed = (-not $WhatIfPreference)
   taskName = $TaskName
   userId = $UserId
+  startScript = $WatchdogScript
   startNow = [bool]$StartNow
   previousTaskExisted = $TaskExisted
   backupDir = if (Test-Path -LiteralPath $BackupDir) { $BackupDir } else { $null }

@@ -124,7 +124,7 @@ function Test-ExcludedDirectories {
 
 function Test-PackageRootAllowList {
     $allowedRootEntries = @(
-        ".gitignore", "LICENSE", "PACKAGE_MANIFEST.md", "PRIVATE_EXCLUDE_CHECKLIST.md", "README.md",
+        ".github", ".gitignore", "LICENSE", "PACKAGE_MANIFEST.md", "PRIVATE_EXCLUDE_CHECKLIST.md", "README.md",
         "SETUP.md", "TOOLKIT_README.md", "design-tests", "install", "mcps", "rules", "skills", "templates"
     )
     $unexpected = Get-ChildItem -LiteralPath $toolkitRoot -Force -ErrorAction SilentlyContinue |
@@ -211,6 +211,8 @@ function Test-PackageStructure {
         "mcps\\napcat-mcp\\ops\\get-napcat-task-router-status.ps1",
         "mcps\\napcat-mcp\\ops\\install-napcat-autostart.ps1",
         "mcps\\napcat-mcp\\ops\\remove-napcat-autostart.ps1",
+        "mcps\\napcat-mcp\\ops\\Run-HiddenPowerShell.vbs",
+        "mcps\\napcat-mcp\\ops\\Run-NapCatSupervisorWatchdog.ps1",
         "mcps\\napcat-mcp\\ops\\start-napcat-supervisor.ps1",
         "mcps\\napcat-mcp\\ops\\start-napcat-task-router.ps1",
         "mcps\\napcat-mcp\\ops\\stop-napcat-supervisor.ps1",
@@ -225,6 +227,14 @@ function Test-PackageStructure {
     )) {
         $full = Join-Path $toolkitRoot $path
         if (-not (Test-Path -LiteralPath $full)) { throw "Missing current NapCat task-routing file: $full" }
+    }
+    $napcatAutostart = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\install-napcat-autostart.ps1") -Raw -Encoding UTF8
+    foreach ($requiredText in @("wscript.exe", "Run-HiddenPowerShell.vbs", "Run-NapCatSupervisorWatchdog.ps1", "RestartCount")) {
+        if (-not $napcatAutostart.Contains($requiredText)) { throw "NapCat autostart is missing hidden watchdog behavior: $requiredText" }
+    }
+    $napcatAutostartRemoval = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\remove-napcat-autostart.ps1") -Raw -Encoding UTF8
+    if (-not $napcatAutostart.Contains("Stop-ScheduledTask") -or -not $napcatAutostartRemoval.Contains("Stop-ScheduledTask")) {
+        throw "NapCat autostart install/remove must stop an existing watchdog task before replacement or supervisor shutdown."
     }
 
     $profileIds = @("neutral", "catgirl", "development", "training")
