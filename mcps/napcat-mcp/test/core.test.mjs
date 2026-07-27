@@ -55,6 +55,28 @@ async function createFixture(options = {}) {
       raw_message: "[CQ:file,file=训练回包&#44;v1.zip,file_id=/history-file-1,file_size=33,busid=102]",
     });
   }
+  if (options.includeLegacyTaskFileIndex) {
+    messages.set("904", {
+      message_id: "904",
+      message_seq: "904",
+      group_id: runtime.groupId,
+      time: 1784869440,
+      user_id: "1000000003",
+      sender: { user_id: "1000000003", nickname: "ExampleUser", card: "训练机" },
+      message: "[CQ:file,file=旧索引回包.zip,file_id=/legacy-real-file-uuid,file_size=33,busid=103]",
+      raw_message: "[CQ:file,file=旧索引回包.zip,file_id=/legacy-real-file-uuid,file_size=33,busid=103]",
+    });
+    messages.set("905", {
+      message_id: "905",
+      message_seq: "905",
+      group_id: runtime.groupId,
+      time: 1784869440,
+      user_id: "1000000003",
+      sender: { user_id: "1000000003", nickname: "ExampleUser", card: "训练机" },
+      message: "[Codex][TASK_FILE_INDEX]\n任务：旧索引兼容\n来源机器：training\n目标机器：development\nfile_id：legacy-root-cache-id\n文件名：旧索引回包.zip\n字节数：33\nsha256：fixture",
+      raw_message: "[Codex][TASK_FILE_INDEX]\n任务：旧索引兼容\n来源机器：training\n目标机器：development\nfile_id：legacy-root-cache-id\n文件名：旧索引回包.zip\n字节数：33\nsha256：fixture",
+    });
+  }
   if (options.includeTaskMessages) {
     messages.set("902", {
       message_id: "902",
@@ -437,6 +459,36 @@ test("download file refreshes group history after a NapCat fileUuid cache miss",
       }),
       (error) => error.code === "DOWNLOAD_TARGET_EXISTS",
     );
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("download file resolves a legacy task index internal id to the adjacent real fileUuid", async () => {
+  const fixture = await createFixture({ includeLegacyTaskFileIndex: true });
+  try {
+    const destinationDirectory = path.join(fixture.temporaryRoot, "legacy-downloads");
+    const result = await fixture.notifier.downloadFile({
+      file_id: "legacy-root-cache-id",
+      message_seq: "905",
+      destination_dir: destinationDirectory,
+      name: "旧索引回包.zip",
+    });
+    assert.equal(result.downloaded, true);
+    assert.equal(result.fileId, "legacy-root-cache-id");
+    assert.equal(result.resolvedFileId, "/legacy-real-file-uuid");
+    assert.equal(result.resolvedBusId, 103);
+    assert.equal(result.cacheRefresh.matched, true);
+    assert.equal(result.cacheRefresh.resolution, "legacy_task_index");
+    assert.equal(result.cacheRefresh.messageSeq, "904");
+    const urlCalls = fixture.calls.filter((call) => call.action === "get_group_file_url");
+    assert.equal(urlCalls.length, 2);
+    assert.equal(urlCalls[0].body.file_id, "legacy-root-cache-id");
+    assert.equal(urlCalls[1].body.file_id, "/legacy-real-file-uuid");
+    assert.equal(urlCalls[1].body.busid, 103);
+    const historyCall = fixture.calls.find((call) => call.action === "get_group_msg_history");
+    assert.equal(historyCall.body.message_seq, "905");
+    assert.equal(historyCall.body.reverse_order, true);
   } finally {
     await fixture.close();
   }

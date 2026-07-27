@@ -60,9 +60,13 @@ test("register is idempotent and rejects silent conversation changes", () => {
       "status",
       "lastSeenSeq",
       "lastAckedSeq",
+      "lastSeenAt",
+      "lastAckedAt",
       "wakeCooldownMs",
       "wakePending",
       "wakeSentAt",
+      "wakeMessageSeq",
+      "wakeMessageAt",
       "lastWakeAt",
       "createdAt",
       "updatedAt",
@@ -71,9 +75,13 @@ test("register is idempotent and rejects silent conversation changes", () => {
     assert.equal(first.status, "open");
     assert.equal(first.lastSeenSeq, 0);
     assert.equal(first.lastAckedSeq, 0);
+    assert.equal(first.lastSeenAt, null);
+    assert.equal(first.lastAckedAt, null);
     assert.equal(first.wakeCooldownMs, 600_000);
     assert.equal(first.wakePending, false);
     assert.equal(first.wakeSentAt, null);
+    assert.equal(first.wakeMessageSeq, null);
+    assert.equal(first.wakeMessageAt, null);
     assert.equal(first.lastWakeAt, null);
     assert.equal(first.createdAt, BASE_TIME);
     assert.equal(first.updatedAt, BASE_TIME);
@@ -89,6 +97,30 @@ test("register is idempotent and rejects silent conversation changes", () => {
     assert.deepEqual(fixture.registry.get("task-001"), first);
     const stateDirectory = path.dirname(fixture.statePath);
     assert.deepEqual(fs.readdirSync(stateDirectory).filter((name) => name.endsWith(".tmp")), []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy sequence-only tasks migrate without inventing message timestamps", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    stored.tasks["task-001"].lastSeenSeq = 8;
+    stored.tasks["task-001"].lastAckedSeq = 8;
+    delete stored.tasks["task-001"].lastSeenAt;
+    delete stored.tasks["task-001"].lastAckedAt;
+    delete stored.tasks["task-001"].wakeMessageSeq;
+    delete stored.tasks["task-001"].wakeMessageAt;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+    const migrated = fixture.createRegistry().get("task-001");
+    assert.equal(migrated.lastSeenSeq, 8);
+    assert.equal(migrated.lastAckedSeq, 8);
+    assert.equal(migrated.lastSeenAt, null);
+    assert.equal(migrated.lastAckedAt, null);
+    assert.equal(migrated.wakeMessageSeq, null);
+    assert.equal(migrated.wakeMessageAt, null);
   } finally {
     fixture.cleanup();
   }
@@ -173,27 +205,72 @@ test("close is idempotent and list/get return complete public records", () => {
   }
 });
 
-test("markSeen is monotonic and ack rejects regression", () => {
+test("markSeen follows message time instead of numeric message_seq ordering", () => {
   const fixture = createFixture();
   try {
     fixture.registry.register(taskInput());
-    const seen = fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 8 });
+    const seen = fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 8,
+      at: "2026-07-24T08:00:08.000Z",
+    });
     assert.equal(seen.lastSeenSeq, 8);
-    assert.equal(fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 3 }).lastSeenSeq, 8);
-    assert.equal(fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 8 }).lastAckedSeq, 8);
+    assert.equal(seen.lastSeenAt, "2026-07-24T08:00:08.000Z");
+    const laterWithSmallerSequence = fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 3,
+      at: "2026-07-24T08:00:09.000Z",
+    });
+    assert.equal(laterWithSmallerSequence.lastSeenSeq, 3);
+    assert.equal(laterWithSmallerSequence.lastSeenAt, "2026-07-24T08:00:09.000Z");
+    assert.equal(fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 11,
+      at: "2026-07-24T08:00:07.000Z",
+    }).lastSeenSeq, 3);
     assertRegistryError(
-      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 7 }),
-      "ACK_REGRESSION",
+      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 8 }),
+      "ACK_NOT_ACTIVE_WAKE",
+    );
+    const acquired = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 3,
+      at: "2026-07-24T08:00:09.000Z",
+    });
+    assert.equal(acquired.wakeMessageSeq, 3);
+    const acknowledged = fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 3 });
+    assert.equal(acknowledged.lastAckedSeq, 3);
+    assert.equal(acknowledged.lastAckedAt, "2026-07-24T08:00:09.000Z");
+    fixture.registry.releaseWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: acquired.wakeSentAt,
+    });
+    fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 2,
+      at: "2026-07-24T08:00:10.000Z",
+    });
+    fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 2,
+      at: "2026-07-24T08:00:10.000Z",
+    });
+    assertRegistryError(
+      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 3 }),
+      "ACK_NOT_ACTIVE_WAKE",
     );
     assertRegistryError(
-      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 11 }),
-      "ACK_AHEAD_OF_SEEN",
-    );
-    assertRegistryError(
-      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 2, seq: 8 }),
+      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 2, seq: 3 }),
       "GENERATION_MISMATCH",
     );
-    assert.equal(fixture.registry.get("task-001").lastSeenSeq, 8);
+    assert.equal(fixture.registry.get("task-001").lastSeenSeq, 2);
   } finally {
     fixture.cleanup();
   }
@@ -208,6 +285,8 @@ test("wake lease acquisition, release, and timeout are persisted", () => {
     assert.equal(acquired.reason, "acquired");
     assert.equal(acquired.wakePending, true);
     assert.equal(acquired.wakeSentAt, BASE_TIME);
+    assert.equal(acquired.wakeMessageSeq, null);
+    assert.equal(acquired.wakeMessageAt, null);
     assert.equal(acquired.leaseExpiresAt, "2026-07-24T08:00:01.000Z");
 
     const blocked = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
@@ -226,6 +305,8 @@ test("wake lease acquisition, release, and timeout are persisted", () => {
     });
     assert.equal(released.wakePending, false);
     assert.equal(released.wakeSentAt, null);
+    assert.equal(released.wakeMessageSeq, null);
+    assert.equal(released.wakeMessageAt, null);
     assert.deepEqual(fixture.registry.releaseWakeLease({ taskId: "task-001", expectedGeneration: 1 }), released);
   } finally {
     fixture.cleanup();
@@ -256,6 +337,48 @@ test("a confirmed wake remains cooldown-limited after ACK releases its lease", (
     const reacquired = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
     assert.equal(reacquired.acquired, true);
     assert.equal(reacquired.wakeSentAt, "2026-07-24T08:01:00.000Z");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("later scans do not invalidate the token already delivered by an active wake", () => {
+  const fixture = createFixture({ wakeLeaseMs: 300_000 });
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+      at: "2026-07-24T08:00:10.000Z",
+    });
+    const acquired = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+      at: "2026-07-24T08:00:10.000Z",
+    });
+    fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 7,
+      at: "2026-07-24T08:00:11.000Z",
+    });
+    const acknowledged = fixture.registry.ack({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+    });
+    assert.equal(acknowledged.lastSeenSeq, 7);
+    assert.equal(acknowledged.lastAckedSeq, 10);
+    assert.equal(acknowledged.lastAckedAt, "2026-07-24T08:00:10.000Z");
+    const released = fixture.registry.releaseWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: acquired.wakeSentAt,
+    });
+    assert.equal(released.wakeMessageSeq, null);
+    assert.equal(released.wakeMessageAt, null);
   } finally {
     fixture.cleanup();
   }

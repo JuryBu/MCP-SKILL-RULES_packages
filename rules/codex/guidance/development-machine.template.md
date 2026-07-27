@@ -32,9 +32,9 @@
 
 文本和文件索引都带 `task_id`、来源机器和目标机器。普通群聊、其他任务、错误目标或非可信发送者不得进入当前任务。
 
-文件索引记录原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、字节数、SHA256 和可下载标识；不得把只对发送端 NapCat 当前进程有效的根文件临时 `file_id` 当作跨机索引。接收端下载后必须重新计算大小与哈希，不以「接口返回成功」代替文件验证。
+文件索引记录原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、字节数、SHA256 和可下载标识；不得把只对发送端 NapCat 当前进程有效的根文件临时 `file_id` 当作跨机索引。接收端下载后必须重新计算大小与哈希，不以「接口返回成功」代替文件验证。兼容旧索引时，只能按固定群中同一发送者、文件名、字节数和五分钟内相邻附件受约束地恢复真实 `fileUuid`。
 
-收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务未确认消息，处理到明确最大 `message_seq` 后再调用 `napcat_task_ack`。
+`message_seq` 是不保证数字递增的消息标识。收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务未确认消息，处理到提示中的 `pending_through_message_seq` 后，使用该原值调用 `napcat_task_ack`，不得自行取数字最大值。处理租约内后续到达的消息进入下一批队列，不会改写当前唤醒的确认令牌。
 
 ## 问题回收
 

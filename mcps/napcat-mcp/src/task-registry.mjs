@@ -21,9 +21,13 @@ const PUBLIC_FIELDS = [
   "status",
   "lastSeenSeq",
   "lastAckedSeq",
+  "lastSeenAt",
+  "lastAckedAt",
   "wakeCooldownMs",
   "wakePending",
   "wakeSentAt",
+  "wakeMessageSeq",
+  "wakeMessageAt",
   "lastWakeAt",
   "createdAt",
   "updatedAt",
@@ -144,6 +148,10 @@ function normalizeStoredTask(task) {
   if (!isPlainObject(task)) return task;
   if (!hasOwn(task, "wakeCooldownMs")) task.wakeCooldownMs = DEFAULT_WAKE_COOLDOWN_MS;
   if (!hasOwn(task, "lastWakeAt")) task.lastWakeAt = task.wakeSentAt ?? null;
+  if (!hasOwn(task, "lastSeenAt")) task.lastSeenAt = null;
+  if (!hasOwn(task, "lastAckedAt")) task.lastAckedAt = null;
+  if (!hasOwn(task, "wakeMessageSeq")) task.wakeMessageSeq = null;
+  if (!hasOwn(task, "wakeMessageAt")) task.wakeMessageAt = null;
   return task;
 }
 
@@ -184,6 +192,12 @@ function validateStoredTask(task, taskId, statePath) {
       invalidState(statePath, `任务游标无效（${taskId}.${field}）`);
     }
   }
+  if (task.lastSeenAt !== null) storedDate(task.lastSeenAt, `${taskId}.lastSeenAt`, statePath);
+  if (task.lastAckedAt !== null) storedDate(task.lastAckedAt, `${taskId}.lastAckedAt`, statePath);
+  if (task.wakeMessageSeq !== null && (!Number.isSafeInteger(task.wakeMessageSeq) || task.wakeMessageSeq < 0)) {
+    invalidState(statePath, `唤醒消息标识无效（${taskId}.wakeMessageSeq）`);
+  }
+  if (task.wakeMessageAt !== null) storedDate(task.wakeMessageAt, `${taskId}.wakeMessageAt`, statePath);
   if (
     !Number.isSafeInteger(task.wakeCooldownMs)
     || task.wakeCooldownMs < MINIMUM_WAKE_COOLDOWN_MS
@@ -436,9 +450,13 @@ class TaskRegistry {
         status: "open",
         lastSeenSeq: 0,
         lastAckedSeq: 0,
+        lastSeenAt: null,
+        lastAckedAt: null,
         wakeCooldownMs: wakeCooldownNumber(input.wakeCooldownMs, this.wakeCooldownMs),
         wakePending: false,
         wakeSentAt: null,
+        wakeMessageSeq: null,
+        wakeMessageAt: null,
         lastWakeAt: null,
         createdAt: now,
         updatedAt: now,
@@ -483,9 +501,11 @@ class TaskRegistry {
       const changed = routingChanged || nextTask.wakeCooldownMs !== task.wakeCooldownMs;
       if (!changed) return { changed: false, value: clonePublicTask(task) };
       nextTask.updatedAt = resolveNow(this.now, input).toISOString();
-      if (nextConversationId !== task.conversationId) {
+      if (routingChanged) {
         nextTask.wakePending = false;
         nextTask.wakeSentAt = null;
+        nextTask.wakeMessageSeq = null;
+        nextTask.wakeMessageAt = null;
         nextTask.lastWakeAt = null;
       }
       state.tasks[taskId] = nextTask;
@@ -505,6 +525,8 @@ class TaskRegistry {
         status: "closed",
         wakePending: false,
         wakeSentAt: null,
+        wakeMessageSeq: null,
+        wakeMessageAt: null,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -538,16 +560,28 @@ class TaskRegistry {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
     const sequence = parseSequence(input, "seq", ["seq", "lastSeenSeq", "sequence"]);
+    const observedAt = toDate(input.at ?? input.messageTime ?? resolveNow(this.now, input), "at").toISOString();
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       if (task.status === "closed") {
         throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
       }
-      if (sequence <= task.lastSeenSeq) return { changed: false, value: clonePublicTask(task) };
+      const previousTimestamp = task.lastSeenAt === null ? null : Date.parse(task.lastSeenAt);
+      const observedTimestamp = Date.parse(observedAt);
+      if (
+        previousTimestamp !== null
+        && (
+          observedTimestamp < previousTimestamp
+          || (observedTimestamp === previousTimestamp && sequence === task.lastSeenSeq)
+        )
+      ) {
+        return { changed: false, value: clonePublicTask(task) };
+      }
       const nextTask = {
         ...task,
         lastSeenSeq: sequence,
+        lastSeenAt: observedAt,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -565,24 +599,34 @@ class TaskRegistry {
       if (task.status === "closed") {
         throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
       }
-      if (sequence < task.lastAckedSeq) {
+      if (
+        !task.wakePending
+        && task.wakeMessageSeq === null
+        && sequence === task.lastAckedSeq
+      ) {
+        return { changed: false, value: clonePublicTask(task) };
+      }
+      if (
+        !task.wakePending
+        || task.wakeMessageSeq === null
+        || task.wakeMessageAt === null
+        || sequence !== task.wakeMessageSeq
+      ) {
         throw new TaskRegistryError(
-          "ACK_REGRESSION",
-          `ACK 不能回退：${taskId}`,
-          { taskId, lastAckedSeq: task.lastAckedSeq, requestedSeq: sequence },
+          "ACK_NOT_ACTIVE_WAKE",
+          `ACK 必须使用最近一次唤醒给出的 pending_through_message_seq：${taskId}`,
+          {
+            taskId,
+            wakeMessageSeq: task.wakeMessageSeq,
+            lastSeenSeq: task.lastSeenSeq,
+            requestedSeq: sequence,
+          },
         );
       }
-      if (sequence > task.lastSeenSeq) {
-        throw new TaskRegistryError(
-          "ACK_AHEAD_OF_SEEN",
-          `ACK 不能超过已扫描消息：${taskId}`,
-          { taskId, lastSeenSeq: task.lastSeenSeq, requestedSeq: sequence },
-        );
-      }
-      if (sequence === task.lastAckedSeq) return { changed: false, value: clonePublicTask(task) };
       const nextTask = {
         ...task,
         lastAckedSeq: sequence,
+        lastAckedAt: task.wakeMessageAt,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -593,6 +637,18 @@ class TaskRegistry {
   acquireWakeLease(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
+    const hasMessageSequence = ["seq", "messageSeq", "pendingThroughSequence"]
+      .some((field) => hasOwn(input, field));
+    const requestedMessageSequence = hasMessageSequence
+      ? parseSequence(input, "seq", ["seq", "messageSeq", "pendingThroughSequence"])
+      : null;
+    const requestedMessageAtValue = input.at ?? input.messageTime;
+    const requestedMessageAt = requestedMessageAtValue === undefined
+      ? null
+      : toDate(requestedMessageAtValue, "at").toISOString();
+    if ((requestedMessageSequence === null) !== (requestedMessageAt === null)) {
+      invalidArgument("唤醒消息的 seq 和 at 必须同时提供");
+    }
     const leaseMs = optionNumber(
       input.leaseMs ?? input.wakeLeaseMs,
       "leaseMs",
@@ -633,6 +689,8 @@ class TaskRegistry {
         ...task,
         wakePending: true,
         wakeSentAt: now.toISOString(),
+        wakeMessageSeq: requestedMessageSequence ?? (task.lastSeenAt === null ? null : task.lastSeenSeq),
+        wakeMessageAt: requestedMessageAt ?? task.lastSeenAt,
         updatedAt: now.toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -687,13 +745,20 @@ class TaskRegistry {
           { taskId, expectedWakeSentAt, actualWakeSentAt: task.wakeSentAt },
         );
       }
-      if (!task.wakePending && task.wakeSentAt === null) {
+      if (
+        !task.wakePending
+        && task.wakeSentAt === null
+        && task.wakeMessageSeq === null
+        && task.wakeMessageAt === null
+      ) {
         return { changed: false, value: clonePublicTask(task) };
       }
       const nextTask = {
         ...task,
         wakePending: false,
         wakeSentAt: null,
+        wakeMessageSeq: null,
+        wakeMessageAt: null,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;

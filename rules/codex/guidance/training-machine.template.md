@@ -54,9 +54,9 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 进入任务对话后调用 `napcat_task_register`，显式登记 `task_id`、稳定 `conversation_id`、`local_role=training`、来源/目标机器和可信对端。
 
-后台路由只接受固定群、已登记任务、正确目标机器和可信发送者同时匹配的消息。同一扫描内多条消息合并到最大 `message_seq`，只唤醒绑定对话一次。
+后台路由只接受固定群、已登记任务、正确目标机器和可信发送者同时匹配的消息。`message_seq` 不保证数字递增，同一扫描内多条消息按消息时间与群历史顺序合并，只唤醒绑定对话一次。
 
-收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件，处理到明确最大序号后再调用 `napcat_task_ack`。不得 ACK 未读取或未处理的消息。
+收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件，处理到提示中的 `pending_through_message_seq` 后，使用该原值调用 `napcat_task_ack`。不得自行取数字最大值，也不得 ACK 未读取或未处理的消息。处理租约内后续到达的消息只进入下一批队列，不会改写当前唤醒的确认令牌。
 
 处理租约和任务级冷却期间不重入。模型可以通过 `napcat_task_update` 调整当前任务的 `wake_cooldown_ms`，但不能跳过可信身份、代次和 ACK 约束。
 
@@ -66,7 +66,7 @@ Heartbeat 只表示长跑存活，不等于任务 ACK，也不负责恢复 Codex
 
 ## 文件与回包
 
-收到任务文件索引后，核对同一 `task_id` 的原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、大小、发送者和 SHA256，再下载并重新计算哈希。若 NapCat 重启后第一次文件 URL 查询失败，允许工具按消息序号刷新群历史并重试一次，不要改用来源不明的 URL。
+收到任务文件索引后，核对同一 `task_id` 的原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、大小、发送者和 SHA256，再下载并重新计算哈希。若 NapCat 重启后第一次文件 URL 查询失败，允许工具按消息序号刷新群历史并重试一次；兼容旧索引时，只能按固定群中同一发送者、文件名、字节数和五分钟内相邻附件受约束地恢复真实 `fileUuid`，不要改用来源不明的 URL。
 
 主人、任务 manifest、工具调用参数或本机/当前任务已有稳定目录约定时，严格沿用该位置，不启用默认下载规则。只有这些来源都没有给出位置时，有任务代次就下载到当前任务根目录的 `intake/g<generation>/`；没有任务代次时使用 manifest 中明确的轮次目录，不得把 `<generation>` 等占位符当成真实目录名。
 

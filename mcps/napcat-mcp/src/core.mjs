@@ -288,6 +288,37 @@ function structuredTaskMetadata(text) {
   return metadata;
 }
 
+function taskFileIndexMetadata(text) {
+  const normalizedText = normalizeComparableText(text);
+  if (!normalizedText.includes("[Codex][TASK_FILE_INDEX]")) return null;
+  const metadata = {
+    fileId: "",
+    fileMessageSeq: "",
+    busId: null,
+    fileName: "",
+    fileBytes: null,
+  };
+  for (const line of normalizedText.split("\n")) {
+    const fileIdMatch = line.match(/^file_id\s*[：:]\s*(.+)$/i);
+    if (fileIdMatch) metadata.fileId = fileIdMatch[1].trim();
+    const messageSeqMatch = line.match(/^file_message_seq\s*[：:]\s*(.+)$/i);
+    if (messageSeqMatch) metadata.fileMessageSeq = messageSeqMatch[1].trim();
+    const busIdMatch = line.match(/^busid\s*[：:]\s*(.+)$/i);
+    if (busIdMatch) {
+      const parsedBusId = Number(busIdMatch[1].trim());
+      if (Number.isSafeInteger(parsedBusId) && parsedBusId >= 0) metadata.busId = parsedBusId;
+    }
+    const fileNameMatch = line.match(/^文件名\s*[：:]\s*(.+)$/);
+    if (fileNameMatch) metadata.fileName = fileNameMatch[1].trim();
+    const fileBytesMatch = line.match(/^字节数\s*[：:]\s*(.+)$/);
+    if (fileBytesMatch) {
+      const parsedFileBytes = Number(fileBytesMatch[1].trim());
+      if (Number.isSafeInteger(parsedFileBytes) && parsedFileBytes > 0) metadata.fileBytes = parsedFileBytes;
+    }
+  }
+  return metadata.fileId ? metadata : null;
+}
+
 function summarizeGroupMessage(message, expectedSelfId) {
   const timestamp = Number(message?.time ?? 0);
   const text = oneBotReadableText(message);
@@ -820,25 +851,100 @@ export function createNapCatNotifier(options = {}) {
         group_id: binding.groupId,
         ...(normalizedInput.messageSeq ? { message_seq: normalizedInput.messageSeq } : {}),
         count: 50,
-        reverse_order: false,
+        reverse_order: true,
         disable_get_url: true,
         parse_mult_msg: false,
         quick_reply: false,
       });
       const messages = Array.isArray(history?.messages) ? history.messages : [];
-      const matchingMessage = messages
+      const summarizedMessages = messages
         .map((message) => summarizeGroupMessage(message, binding.expectedSelfId))
+        .sort((left, right) => {
+          const leftTimestamp = Date.parse(left.time ?? "");
+          const rightTimestamp = Date.parse(right.time ?? "");
+          if (!Number.isFinite(leftTimestamp) || !Number.isFinite(rightTimestamp)) return 0;
+          return leftTimestamp - rightTimestamp;
+        });
+      const matchingMessage = summarizedMessages
         .find((message) => message.attachments.some((attachment) => attachment.fileId === normalizedInput.fileId));
+      const matchingAttachment = matchingMessage?.attachments
+        .find((attachment) => attachment.fileId === normalizedInput.fileId) ?? null;
+      if (matchingAttachment) {
+        return {
+          attempted: true,
+          matched: true,
+          resolution: "exact_file_id",
+          messageSeq: matchingMessage.messageSeq,
+          resolvedFileId: matchingAttachment.fileId,
+          resolvedBusId: matchingAttachment.busId,
+        };
+      }
+
+      const anchorIndex = normalizedInput.messageSeq
+        ? summarizedMessages.findIndex((message) => message.messageSeq === normalizedInput.messageSeq)
+        : -1;
+      const anchorMessage = anchorIndex >= 0 ? summarizedMessages[anchorIndex] : null;
+      const indexMetadata = anchorMessage ? taskFileIndexMetadata(anchorMessage.text) : null;
+      const expectedFileName = indexMetadata?.fileName || normalizedInput.requestedName;
+      const requestedNameMatches = !normalizedInput.requestedName
+        || !indexMetadata?.fileName
+        || normalizedInput.requestedName === indexMetadata.fileName;
+      let resolvedMessage = null;
+      let resolvedAttachment = null;
+      if (
+        anchorMessage
+        && indexMetadata?.fileId === normalizedInput.fileId
+        && expectedFileName
+        && indexMetadata.fileBytes !== null
+        && requestedNameMatches
+      ) {
+        const anchorTimestamp = Date.parse(anchorMessage.time ?? "");
+        const candidateMessages = summarizedMessages
+          .map((message, index) => ({
+            message,
+            index,
+            timestamp: Date.parse(message.time ?? ""),
+          }))
+          .filter((candidate) => candidate.index !== anchorIndex)
+          .filter((candidate) =>
+            Number.isFinite(anchorTimestamp)
+            && Number.isFinite(candidate.timestamp)
+            && anchorTimestamp - candidate.timestamp >= 0
+            && anchorTimestamp - candidate.timestamp <= 300000
+          )
+          .sort((left, right) =>
+            (anchorTimestamp - left.timestamp) - (anchorTimestamp - right.timestamp)
+            || Math.abs(left.index - anchorIndex) - Math.abs(right.index - anchorIndex)
+          );
+        for (const candidate of candidateMessages) {
+          const candidateMessage = candidate.message;
+          if (candidateMessage.senderId !== anchorMessage.senderId) continue;
+          const candidateAttachment = candidateMessage.attachments.find((attachment) =>
+            attachment.fileName === expectedFileName
+            && attachment.fileBytes === indexMetadata.fileBytes
+          );
+          if (!candidateAttachment) continue;
+          resolvedMessage = candidateMessage;
+          resolvedAttachment = candidateAttachment;
+          break;
+        }
+      }
       return {
         attempted: true,
-        matched: Boolean(matchingMessage),
-        messageSeq: matchingMessage?.messageSeq ?? null,
+        matched: Boolean(resolvedAttachment),
+        resolution: resolvedAttachment ? "legacy_task_index" : null,
+        messageSeq: resolvedMessage?.messageSeq ?? null,
+        resolvedFileId: resolvedAttachment?.fileId ?? null,
+        resolvedBusId: resolvedAttachment?.busId ?? null,
       };
     } catch (error) {
       return {
         attempted: true,
         matched: false,
+        resolution: null,
         messageSeq: null,
+        resolvedFileId: null,
+        resolvedBusId: null,
         error: publicError(error),
       };
     }
@@ -848,7 +954,7 @@ export function createNapCatNotifier(options = {}) {
     const binding = loadBinding();
     const normalizedInput = normalizeDownloadInput(input);
     const targetCheck = await checkTarget(binding);
-    const lookupPayload = {
+    let lookupPayload = {
       group_id: binding.groupId,
       file_id: normalizedInput.fileId,
       ...(normalizedInput.busId !== null ? { busid: normalizedInput.busId } : {}),
@@ -859,6 +965,13 @@ export function createNapCatNotifier(options = {}) {
       urlData = await callOneBot("get_group_file_url", lookupPayload);
     } catch (firstError) {
       cacheRefresh = await primeGroupFileLookup(binding, normalizedInput);
+      if (cacheRefresh.resolvedFileId && cacheRefresh.resolvedFileId !== normalizedInput.fileId) {
+        lookupPayload = {
+          group_id: binding.groupId,
+          file_id: cacheRefresh.resolvedFileId,
+          ...(cacheRefresh.resolvedBusId !== null ? { busid: cacheRefresh.resolvedBusId } : {}),
+        };
+      }
       try {
         urlData = await callOneBot("get_group_file_url", lookupPayload);
       } catch (retryError) {
@@ -923,6 +1036,8 @@ export function createNapCatNotifier(options = {}) {
       return {
         downloaded: true,
         fileId: normalizedInput.fileId,
+        resolvedFileId: lookupPayload.file_id,
+        resolvedBusId: lookupPayload.busid ?? null,
         fileName,
         filePath: destinationPath,
         fileBytes,

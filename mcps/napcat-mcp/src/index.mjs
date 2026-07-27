@@ -122,7 +122,7 @@ const downloadInputSchema = {
   type: "object",
   properties: {
     file_id: { type: "string", minLength: 1, maxLength: 2048, description: "从固定 ExampleGroup 群消息附件或任务文件索引中读取到的原始 file_id/fileUuid。" },
-    message_seq: { type: "string", minLength: 1, maxLength: 64, description: "可选文件消息序号；NapCat 重启或缓存失效时用于刷新对应历史并恢复 fileUuid 映射。" },
+    message_seq: { type: "string", minLength: 1, maxLength: 64, description: "可选文件附件消息或旧 TASK_FILE_INDEX 消息序号；NapCat 重启、缓存失效或旧索引使用内部 ID 时用于刷新历史并恢复真实 fileUuid。" },
     busid: { type: "integer", minimum: 0, description: "可选群文件 busid；从附件或任务文件索引中原样传入。" },
     destination_dir: { type: "string", minLength: 1, maxLength: 4096, description: "本机保存目录的绝对路径；目录不存在时自动创建。" },
     name: { type: "string", minLength: 1, maxLength: 255, description: "可选本地文件名，不能包含目录；目标已存在时拒绝覆盖。" },
@@ -288,7 +288,7 @@ const tools = [
   },
   {
     name: "napcat_task_ack",
-    description: "目标对话处理完消息后确认最大 message_seq；ACK 不能回退、不能超过扫描游标，也不能由旧 generation 提交。",
+    description: "目标对话处理完消息后确认最近一次唤醒给出的 pending_through_message_seq 原值；message_seq 是不保证数字递增的消息标识，不能自行取最大值，也不能由旧 generation 提交。",
     inputSchema: taskAckInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
