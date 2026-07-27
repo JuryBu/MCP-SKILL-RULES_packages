@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
   [ValidateRange(10, 300)][int]$IntervalSeconds = 30,
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,7 +52,11 @@ try {
   New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
   while ($true) {
     try {
-      & $StartScript -DataRoot $DataRoot | Out-Null
+      $StartArguments = @{ DataRoot = $DataRoot }
+      if (-not [string]::IsNullOrWhiteSpace($BrokerRoot)) {
+        $StartArguments.BrokerRoot = $BrokerRoot
+      }
+      & $StartScript @StartArguments | Out-Null
       Write-WatchdogRecord -Status "healthy" -Message "Supervisor verified."
     } catch {
       Write-WatchdogRecord -Status "retrying" -Message $_.Exception.Message

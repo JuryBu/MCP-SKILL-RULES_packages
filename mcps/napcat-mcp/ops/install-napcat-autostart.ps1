@@ -4,6 +4,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
   [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$BrokerRoot = (if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
   [string]$TaskName = "CodexNapCatSupervisor",
   [switch]$StartNow
 )
@@ -17,6 +18,7 @@ if (-not (Test-Path -LiteralPath $SupervisorStartScript)) { throw "Installed sup
 if (-not (Test-Path -LiteralPath $WatchdogScript)) { throw "Installed supervisor watchdog not found: $WatchdogScript" }
 if (-not (Test-Path -LiteralPath $HiddenLauncher)) { throw "Hidden PowerShell launcher not found: $HiddenLauncher" }
 if ($DataRoot.Contains('"')) { throw "DataRoot cannot contain a double quote." }
+if ($BrokerRoot.Contains('"')) { throw "BrokerRoot cannot contain a double quote." }
 
 $StatePath = Join-Path $DataRoot "napcat-supervisor-autostart.json"
 $Stamp = (Get-Date -Format "yyyyMMdd-HHmmss-fff") + "-" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -42,7 +44,7 @@ function Stop-TaskInstance {
 }
 
 $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$HiddenLauncher`" `"$WatchdogScript`" -DataRoot `"$DataRoot`""
+$Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$HiddenLauncher`" `"$WatchdogScript`" -DataRoot `"$DataRoot`" -BrokerRoot `"$BrokerRoot`""
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 0) -MultipleInstances IgnoreNew -Hidden -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
@@ -68,6 +70,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     startScript = $WatchdogScript
     supervisorStartScript = $SupervisorStartScript
     hiddenLauncher = $HiddenLauncher
+    brokerRoot = $BrokerRoot
     previousTaskExisted = $TaskExisted
     previousTaskXml = $ExistingTaskXml
     backupDir = if (Test-Path -LiteralPath $BackupDir) { $BackupDir } else { $null }

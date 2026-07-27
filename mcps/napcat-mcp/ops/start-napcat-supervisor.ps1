@@ -8,7 +8,22 @@ param(
 
 $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker" }
+$NapCatParent = Split-Path -Parent $NapCatMcpRoot
+if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
+  $PortableBrokerRoot = Join-Path $NapCatParent "broker"
+  $FlatBrokerRoot = $NapCatParent
+  $PortablePrivateEnvPath = Join-Path $PortableBrokerRoot "broker-private.env.json"
+  $FlatPrivateEnvPath = Join-Path $FlatBrokerRoot "broker-private.env.json"
+  $BrokerRoot = if (Test-Path -LiteralPath $PortablePrivateEnvPath) {
+    $PortableBrokerRoot
+  } elseif (Test-Path -LiteralPath $FlatPrivateEnvPath) {
+    $FlatBrokerRoot
+  } elseif (Test-Path -LiteralPath (Join-Path $PortableBrokerRoot "broker.mjs")) {
+    $PortableBrokerRoot
+  } else {
+    $FlatBrokerRoot
+  }
+}
 if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
   $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
   if (Test-Path -LiteralPath $RuntimeStateFile) {
@@ -18,7 +33,7 @@ if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
     $NapCatRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"
   }
 }
-$ToolkitRoot = Split-Path -Parent (Split-Path -Parent $NapCatMcpRoot)
+$ToolkitRoot = Split-Path -Parent $NapCatParent
 $RunnerPath = Join-Path $NapCatMcpRoot "src\supervisor-runner.mjs"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
 $BindingPath = Join-Path $DataRoot "binding.json"
@@ -27,7 +42,13 @@ $RuntimeStatePath = Join-Path $DataRoot "state\supervisor-runtime.json"
 $LogPath = Join-Path $DataRoot "state\supervisor.jsonl"
 $StopFilePath = Join-Path $DataRoot "state\supervisor.stop"
 $LockPath = Join-Path $DataRoot "state\supervisor.lock"
-$BrokerStartScript = Join-Path $ToolkitRoot "install\Start-CodexMcpBroker.ps1"
+$PortableBrokerStartScript = Join-Path $ToolkitRoot "install\Start-CodexMcpBroker.ps1"
+$FlatBrokerStartScript = Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1"
+$BrokerStartScript = if (Test-Path -LiteralPath $PortableBrokerStartScript) {
+  $PortableBrokerStartScript
+} else {
+  $FlatBrokerStartScript
+}
 $LoginScript = Join-Path $NapCatMcpRoot "ops\start-napcat-login.ps1"
 $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT = $DataRoot
 $env:CODEX_TOOLKIT_BROKER_ROOT = $BrokerRoot

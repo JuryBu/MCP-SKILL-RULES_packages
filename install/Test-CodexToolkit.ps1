@@ -229,8 +229,16 @@ function Test-PackageStructure {
         if (-not (Test-Path -LiteralPath $full)) { throw "Missing current NapCat task-routing file: $full" }
     }
     $napcatAutostart = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\install-napcat-autostart.ps1") -Raw -Encoding UTF8
-    foreach ($requiredText in @("wscript.exe", "Run-HiddenPowerShell.vbs", "Run-NapCatSupervisorWatchdog.ps1", "RestartCount")) {
+    foreach ($requiredText in @("wscript.exe", "Run-HiddenPowerShell.vbs", "Run-NapCatSupervisorWatchdog.ps1", "RestartCount", "-BrokerRoot")) {
         if (-not $napcatAutostart.Contains($requiredText)) { throw "NapCat autostart is missing hidden watchdog behavior: $requiredText" }
+    }
+    $napcatWatchdog = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\Run-NapCatSupervisorWatchdog.ps1") -Raw -Encoding UTF8
+    if (-not $napcatWatchdog.Contains('$StartArguments.BrokerRoot')) {
+        throw "NapCat watchdog must forward the explicit broker root to the supervisor start script."
+    }
+    $napcatSupervisorStart = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\start-napcat-supervisor.ps1") -Raw -Encoding UTF8
+    foreach ($requiredText in @("PortablePrivateEnvPath", "FlatPrivateEnvPath", "FlatBrokerStartScript")) {
+        if (-not $napcatSupervisorStart.Contains($requiredText)) { throw "NapCat supervisor start script is missing flat/portable layout compatibility: $requiredText" }
     }
     $napcatAutostartRemoval = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\remove-napcat-autostart.ps1") -Raw -Encoding UTF8
     if (-not $napcatAutostart.Contains("Stop-ScheduledTask") -or -not $napcatAutostartRemoval.Contains("Stop-ScheduledTask")) {
