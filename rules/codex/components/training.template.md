@@ -13,4 +13,13 @@
 - 模型可以按任务阶段调整自己的 `wake_cooldown_ms`，但不能绕开登记、可信发送者与 ACK 约束
 - 换对话时更新绑定并增加 `generation`，任务结束后关闭登记
 
+### Git 提交来源标记
+
+- 这台机器创建的提交使用仓库级作者名 `JuryBu [training]`，保留绑定 GitHub 账号的原邮箱；只设置当前仓库，不擅自修改全局 Git 身份
+- Codex 创建的每个提交都必须在正文末尾写入 `Codex-Machine: training` 和 `Codex-Thread: <当前稳定 conversation_id>` 两条 Git trailer
+- 提交属于训练任务或双机维护任务时再写入 `Codex-Task: <task_id>`；没有任务 ID 时省略，不能填猜测值或沿用其它对话的 ID
+- `Codex-Thread` 必须在提交前通过当前宿主任务列表核对；作者名只能快速辨认机器，机器和对话归属以 trailer 为准
+- 训练机只能提交任务明确授权的仓库修复或可复用基础设施修复，训练产物、私密配置、运行账本和实验现场不得顺手推入公共仓库
+- push 前先 fetch 并确认远端差异；远端已有新提交时采用普通 rebase 或人工合并，禁止 force push，也不得覆盖开发机尚未合并的修改
+
 训练模式结束、回包验证完成或任务被拒绝后立即退出训练状态。详细流程见安装到 `%USERPROFILE%\.codex\guidance\training-machine.md` 的训练机 guidance。

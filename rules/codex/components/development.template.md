@@ -13,6 +13,15 @@
 - 只有实际读取并处理到明确最大 `message_seq` 后才能 ACK，不能确认未处理消息
 - 任务换对话时更新绑定并增加 `generation`；任务结束后关闭登记
 
+### Git 提交来源标记
+
+- 这台机器创建的提交使用仓库级作者名 `JuryBu [development]`，保留绑定 GitHub 账号的原邮箱；只设置当前仓库，不擅自修改全局 Git 身份
+- Codex 创建的每个提交都必须在正文末尾写入 `Codex-Machine: development` 和 `Codex-Thread: <当前稳定 conversation_id>` 两条 Git trailer
+- 提交属于双机任务时再写入 `Codex-Task: <task_id>`；没有任务 ID 时省略，不能填猜测值或沿用其它对话的 ID
+- `Codex-Thread` 必须在提交前通过当前宿主任务列表核对；作者名只能快速辨认机器，机器和对话归属以 trailer 为准
+- 缺少来源 trailer 的既有提交只能标为来源未知，不得仅凭时间、提交内容或同一 GitHub 账号强行归因
+- push 前先 fetch 并确认远端差异；远端已有新提交时采用普通 rebase 或人工合并，禁止为抢写覆盖而 force push
+
 ### 主包与回包
 
 - 主包明确写清必做、禁做、可调整项、成功标准、暂停条件和回包清单
