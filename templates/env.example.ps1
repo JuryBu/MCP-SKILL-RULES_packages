@@ -23,8 +23,15 @@ $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-pr
 # $env:SANDBOX_COUNCIL_ANTIGRAVITY_CLI_CONCURRENCY = "2"
 # $env:SANDBOX_COUNCIL_ANTIGRAVITY_CLI_PROXY_MODE = "auto"
 # Optional: enable the Exa remote MCP endpoint through broker.
-# Keep the real key on the receiver machine; do not write it into files you send around.
+# Keep real keys on the receiver machine; do not write them into files you send around.
+# A legacy key may remain inside EXA_MCP_REMOTE_URL. Add more keys as a comma-separated pool.
 # $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
+# $env:EXA_MCP_API_KEYS = "<receiver-private-key-2>,<receiver-private-key-3>"
+# $env:EXA_MCP_REMOTE_BASE_URL = "https://mcp.exa.ai/mcp"
+# $env:EXA_MCP_PUBLIC_FALLBACK_ENABLED = "1"
+# $env:EXA_MCP_KEY_COOLDOWN_MS = "86400000"
+# $env:EXA_MCP_KEY_COOLDOWN_JITTER_MS = "900000"
+# $env:EXA_MCP_RATE_LIMIT_COOLDOWN_MS = "60000"
 
 # Optional NapCat QQ group collaboration MCP. NapCat itself and QQ login state are not bundled.
 # Copy mcps\napcat-mcp\binding.example.json to the private data root and replace all example values.

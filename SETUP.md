@@ -200,13 +200,16 @@ For Antigravity CLI / Gemini-family Council participants, use `provider="antigra
 
 ## 11. Optional Exa Endpoint
 
-Set the private remote URL only on the receiver machine:
+Set the private remote URL and any additional API keys only on the receiver machine:
 
 ```powershell
 $env:EXA_MCP_REMOTE_URL = "<receiver-private-exa-remote-url>"
+$env:EXA_MCP_API_KEYS = "<receiver-private-key-2>,<receiver-private-key-3>"
+$env:EXA_MCP_REMOTE_BASE_URL = "https://mcp.exa.ai/mcp"
+$env:EXA_MCP_PUBLIC_FALLBACK_ENABLED = "1"
 ```
 
-The broker uses `exa-stateless-stdio.mjs` for stable tools/list fallback and retry behavior. Do not commit `broker-private.env.json` or the real URL.
+The broker uses `exa-key-pool.mjs` and `exa-stateless-stdio.mjs` for deterministic key rotation, MCP-body 402 detection, persistent circuit breaking, half-open recovery, public no-key fallback, stable tools/list fallback, and transport retries. The default quota cooldown is 24 hours with up to 15 minutes of jitter. Do not commit `broker-private.env.json`, real URLs, API keys, or `exa-key-pool-state.json`.
 
 ## 12. Optional NapCat QQ Group Endpoint
 

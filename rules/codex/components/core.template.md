@@ -105,10 +105,11 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 **零散任务（逐个派发）**：适合单个独立任务，按需派发，等回结果再决定下一步。
 
 **系统任务（Workflow 派发）**：适合复杂工程任务，按阶段结构化批量派发。
-- 派发前向用户简要说明原因和准备分几个阶段、每阶段几个子代理
-- 按阶段推进：调研（x 个）→ 并行实现（x 个）→ 对抗审查（x 个）→ 修复（x 个），结构自主决定
-- 每阶段全部子代理结束后收回结果，再开下一阶段的并发
+- 启动 Workflow 前必须在当前交互中向用户说明为什么值得使用、预计分几个阶段以及每阶段几个子代理；简单任务、少量读取或主线更快的工作不得随意开启高消耗 Workflow
+- 按阶段推进，例如：调研（x 个）→ 并行实现（x 个）→ 对抗审查（x 个）→ 修复（x 个），具体结构自主决定
+- 每阶段全部子代理结束后收回结果，再开下一阶段的并发；等待期间主线可以继续做不重叠的读取、验证、构建或整理工作，不必原地干等
 - 并行修改任务不要互相冲突交叉修改范围，给每个子代理明确写入边界
+- 每阶段批量派发前必须在当前交互中向用户说明本阶段的 `service_tier` 策略；档位不确定时先派发一个最小子代理核对，再启动整批并发
 
 ### 模型选择
 
@@ -123,14 +124,17 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 
 - 前端视觉任务（截图审查、UI 验收、视觉对比）：推荐 `gpt-5.6-sol` xhigh 或 max
 - `gpt-5.6-sol` 是最高级别思考模型，仅用于超级复杂、需要强规划的任务和前端视觉任务；非超级复杂的任务不使用 sol
-- ⚠️ 派发子代理时务必显式指定 model 和 reasoning effort，不要不填——不填时 Codex 会默认使用主线程的 sol，浪费额度。`service_tier` 字段也要注意
-- `service_tier="priority"` 是 fast 模式：1.5 倍速度、2.5 倍额度消耗。一般可以开，但 workflow 并发过多时尽量不要同时开
+- 子代理的模型与推理强度按派发模式决定：`fork_context=true` 继承主线且不得另填；`fork_context=false` 应显式指定 `model` 和 `reasoning_effort`，避免无意使用主线程的 Sol
+- 当前子代理接口不接受字面量 `service_tier="default"`；需要默认或继承语义时必须省略该字段，不能传入 `default`
+- `service_tier="priority"` 会显式启用 Fast：约 1.5 倍速度、2.5 倍额度消耗，仅在明确需要加速并接受额外消耗时填写
+- 省略 `service_tier` 不等于强制非 Fast，而是沿用有效配置；`config.toml` 与主线均为普通档时才得到普通档，任一处为 Fast 时子代理仍可能继承 Fast
 - reasoning effort：5.6 系列全部支持 `low/medium/high/xhigh/max/ultra` 六档；其余任务默认 `high` 级别
 
 ### spawn 规范
 
 - `fork_context=true` 让子代理继承完整上下文，此时不要同时手动指定 `model` 或 `reasoning_effort`，否则 `spawn_agent` 会被拦截
 - 需要指定模型/思考额度时用 `fork_context=false`，通过 `items` 精准传入材料
+- 明确要求非 Fast 时，先确认 `config.toml` 与当前主线均为普通档，再省略 `service_tier`；不要把省略字段误写成 `service_tier="default"`
 - 复杂任务、需要理解用户长期偏好、需要沿用本轮讨论结论时，默认 `fork_context=true`
 - 独立小任务（只读文件、跑测试、检查目录）用 `fork_context=false` + `items` 投喂必要证据
 - 需要子代理看截图、报告、网页状态时，优先通过 `items` 传图片

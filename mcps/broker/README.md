@@ -43,9 +43,14 @@ Call timeout behavior:
 
 Exa stateless bridge:
 
-- `/exa/mcp` starts `exa-stateless-stdio.mjs`, a small stdio MCP bridge that forwards calls to `EXA_MCP_REMOTE_URL` (or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`).
+- `/exa/mcp` starts `exa-stateless-stdio.mjs`, a small stdio MCP bridge that forwards calls to Exa's remote MCP.
+- The legacy credential embedded in `EXA_MCP_REMOTE_URL` is combined with additional comma-separated `EXA_MCP_API_KEYS`. Credentials are deduplicated and sent through the `x-api-key` header.
+- HTTP 402/429/401/403 and matching MCP error bodies drive a persistent circuit breaker. Quota failures cool down for 24 hours with optional jitter, rate limits use a short cooldown, and expired entries receive one half-open probe.
+- Circuit-breaker state is persisted without URLs or credentials. The default path is `exa-key-pool-state.json` beside `CODEX_MCP_BROKER_STATE`; override it with `EXA_MCP_POOL_STATE_PATH`.
+- When no credential is eligible, `EXA_MCP_PUBLIC_FALLBACK_ENABLED=1` forwards the call to the same MCP URL without a credential.
 - The bridge uses the MCP SDK bundled with the portable `memory-store` package, returns a local fallback tool list when remote listing is disabled or unavailable, and retries transient network failures within its configured request deadline.
-- Configure optional behavior with `EXA_STATELESS_LIST_TIMEOUT_MS`, `EXA_STATELESS_CALL_TIMEOUT_MS`, `EXA_STATELESS_MAX_ATTEMPTS`, `EXA_STATELESS_CALL_MAX_ATTEMPTS`, `EXA_STATELESS_LIST_MAX_ATTEMPTS`, `EXA_STATELESS_RETRY_DELAY_MS`, and `EXA_STATELESS_REMOTE_TOOLS_LIST=1`.
+- Configure pool behavior with `EXA_MCP_REMOTE_BASE_URL`, `EXA_MCP_API_KEYS`, `EXA_MCP_PUBLIC_FALLBACK_ENABLED`, `EXA_MCP_KEY_COOLDOWN_MS`, `EXA_MCP_KEY_COOLDOWN_JITTER_MS`, `EXA_MCP_RATE_LIMIT_COOLDOWN_MS`, and `EXA_MCP_POOL_STATE_PATH`.
+- Configure request behavior with `EXA_STATELESS_LIST_TIMEOUT_MS`, `EXA_STATELESS_CALL_TIMEOUT_MS`, `EXA_STATELESS_MAX_ATTEMPTS`, `EXA_STATELESS_CALL_MAX_ATTEMPTS`, `EXA_STATELESS_LIST_MAX_ATTEMPTS`, `EXA_STATELESS_RETRY_DELAY_MS`, and `EXA_STATELESS_REMOTE_TOOLS_LIST=1`.
 
 NapCat QQ group bridge:
 

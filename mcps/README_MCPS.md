@@ -65,7 +65,7 @@ Main overrides:
 ## Optional Model / Search Services
 
 - ProGrok: `MEMORY_STORE_GROK_PROXY_URL`, `MEMORY_STORE_GROK_API_KEY`, `SANDBOX_PROGROK_BASE_URL`, `SANDBOX_PROGROK_API_KEY`
-- Exa: `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`
+- Exa: `EXA_MCP_REMOTE_URL` or `CODEX_TOOLKIT_EXA_MCP_REMOTE_URL`, plus optional `EXA_MCP_API_KEYS`, `EXA_MCP_REMOTE_BASE_URL`, `EXA_MCP_PUBLIC_FALLBACK_ENABLED`, and cooldown/state overrides documented in `broker/README.md`
 - NapCat: `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP`, `NAPCAT_HTTP_URL`, `NAPCAT_ACCESS_TOKEN`
 
 Real values belong in the receiver's private environment, never in source or zip files.

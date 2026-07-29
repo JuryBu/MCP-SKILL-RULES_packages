@@ -1,6 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import {
+  ExaKeyPool,
+  buildExaEndpointConfig,
+  classifyExaFailure,
+  classifyExaToolResult,
+} from "./exa-key-pool.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -154,10 +160,9 @@ function isRetryableTransportError(error) {
   });
 }
 
-async function postRemoteMcpOnce(method, params, timeoutMs) {
-  const url = process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL;
-  if (!url) {
-    throw new Error("EXA_MCP_REMOTE_URL is not configured");
+async function postRemoteMcpOnce(endpoint, method, params, timeoutMs) {
+  if (!endpoint?.url) {
+    throw new Error("Exa remote endpoint is not configured");
   }
 
   const controller = new AbortController();
@@ -166,12 +171,16 @@ async function postRemoteMcpOnce(method, params, timeoutMs) {
   }, timeoutMs);
 
   try {
-    const response = await fetch(url, {
+    const headers = {
+      accept: "application/json, text/event-stream",
+      "content-type": "application/json",
+    };
+    if (endpoint.apiKey) {
+      headers["x-api-key"] = endpoint.apiKey;
+    }
+    const response = await fetch(endpoint.url, {
       method: "POST",
-      headers: {
-        accept: "application/json, text/event-stream",
-        "content-type": "application/json",
-      },
+      headers,
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -182,7 +191,10 @@ async function postRemoteMcpOnce(method, params, timeoutMs) {
     });
     const text = await response.text().catch(() => "");
     if (!response.ok) {
-      throw new Error(redactSecrets(`Exa HTTP ${response.status}: ${text.slice(0, 500)}`));
+      const error = new Error(redactSecrets(`Exa HTTP ${response.status}: ${text.slice(0, 500)}`));
+      error.exaStatus = response.status;
+      error.exaBody = text;
+      throw error;
     }
     const message = parseMcpResponse(text);
     if (message.error) {
@@ -195,7 +207,7 @@ async function postRemoteMcpOnce(method, params, timeoutMs) {
   }
 }
 
-async function postRemoteMcp(method, params, timeoutMs, options = {}) {
+async function postRemoteMcp(endpoint, method, params, timeoutMs, options = {}) {
   const maxAttempts = Math.max(
     1,
     Number(options.maxAttempts ?? process.env.EXA_STATELESS_MAX_ATTEMPTS ?? 3),
@@ -213,7 +225,7 @@ async function postRemoteMcp(method, params, timeoutMs, options = {}) {
     const elapsedMs = Date.now() - startedAt;
     const remainingMs = Math.max(1, timeoutMs - elapsedMs);
     try {
-      return await postRemoteMcpOnce(method, params, remainingMs);
+      return await postRemoteMcpOnce(endpoint, method, params, remainingMs);
     } catch (error) {
       lastError = error;
       const canRetry =
@@ -224,7 +236,7 @@ async function postRemoteMcp(method, params, timeoutMs, options = {}) {
         break;
       }
       console.error(
-        `[exa-stateless] ${method} retry ${attempt + 1}/${maxAttempts} after ${describeError(error)}`,
+        `[exa-stateless] ${endpoint.name} ${method} retry ${attempt + 1}/${maxAttempts} after ${describeError(error)}`,
       );
       await sleep(retryDelayMs * attempt);
     }
@@ -237,6 +249,14 @@ async function postRemoteMcp(method, params, timeoutMs, options = {}) {
 
 loadPrivateEnv();
 
+const endpointConfig = buildExaEndpointConfig(process.env);
+const keyPool = new ExaKeyPool({
+  endpoints: endpointConfig.endpoints,
+  statePath: endpointConfig.statePath,
+  cooldownMs: endpointConfig.cooldownMs,
+  cooldownJitterMs: endpointConfig.cooldownJitterMs,
+  rateLimitCooldownMs: endpointConfig.rateLimitCooldownMs,
+});
 const listTimeoutMs = Number(process.env.EXA_STATELESS_LIST_TIMEOUT_MS || 5000);
 const callTimeoutMs = Number(process.env.EXA_STATELESS_CALL_TIMEOUT_MS || 70000);
 const listMaxAttempts = Math.max(1, Number(process.env.EXA_STATELESS_LIST_MAX_ATTEMPTS || 1));
@@ -246,8 +266,77 @@ const callMaxAttempts = Math.max(
 );
 const remoteToolsListEnabled = process.env.EXA_STATELESS_REMOTE_TOOLS_LIST === "1";
 
+console.error(
+  `[exa-stateless] endpoint pool ready: credentials=${endpointConfig.endpoints.length} publicFallback=${Boolean(endpointConfig.publicEndpoint)} state=${endpointConfig.statePath}`,
+);
+
+async function postRemoteMcpWithPool(method, params, timeoutMs, options = {}) {
+  const attemptedIds = new Set();
+  const startedAt = Date.now();
+  let lastResult;
+  let lastError;
+
+  while (true) {
+    const selection = keyPool.select(attemptedIds);
+    if (!selection) {
+      break;
+    }
+    attemptedIds.add(selection.endpoint.id);
+    const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    try {
+      const result = await postRemoteMcp(selection.endpoint, method, params, remainingMs, options);
+      const failure = classifyExaToolResult(result);
+      if (!failure) {
+        keyPool.reportSuccess(selection);
+        return result;
+      }
+      if (failure.kind === "quota" || failure.kind === "rate_limit" || failure.kind === "auth") {
+        keyPool.reportFailure(selection, failure);
+        console.error(
+          `[exa-stateless] ${selection.endpoint.name} ${failure.kind} -> ${failure.reason}`,
+        );
+        lastResult = result;
+        continue;
+      }
+      keyPool.reportSuccess(selection);
+      return result;
+    } catch (error) {
+      const failure = classifyExaFailure(error.exaBody || error.message, error.exaStatus);
+      if (failure) {
+        keyPool.reportFailure(selection, failure);
+        console.error(
+          `[exa-stateless] ${selection.endpoint.name} ${failure.kind} -> ${failure.reason}`,
+        );
+        lastError = error;
+        continue;
+      }
+      keyPool.release(selection);
+      throw error;
+    }
+  }
+
+  if (endpointConfig.publicEndpoint) {
+    const remainingMs = Math.max(1, timeoutMs - (Date.now() - startedAt));
+    console.error(`[exa-stateless] ${method} using public fallback`);
+    return postRemoteMcp(
+      endpointConfig.publicEndpoint,
+      method,
+      params,
+      remainingMs,
+      options,
+    );
+  }
+  if (lastResult) {
+    return lastResult;
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error("No Exa endpoint is currently available");
+}
+
 const server = new Server(
-  { name: "codex-exa-stateless-bridge", version: "0.1.0" },
+  { name: "codex-exa-stateless-bridge", version: "0.2.0" },
   {
     capabilities: {
       tools: { listChanged: true },
@@ -261,7 +350,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     return { tools: fallbackTools };
   }
   try {
-    const result = await postRemoteMcp("tools/list", {}, listTimeoutMs, {
+    const result = await postRemoteMcpWithPool("tools/list", {}, listTimeoutMs, {
       maxAttempts: listMaxAttempts,
     });
     if (Array.isArray(result?.tools) && result.tools.length > 0) {
@@ -274,7 +363,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  return postRemoteMcp("tools/call", request.params, callTimeoutMs, {
+  return postRemoteMcpWithPool("tools/call", request.params, callTimeoutMs, {
     maxAttempts: callMaxAttempts,
   });
 });
