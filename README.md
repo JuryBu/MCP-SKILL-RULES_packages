@@ -4,7 +4,7 @@
 
 这套项目最初用于 Antigravity，后来扩展为 Codex、Claude Code 与 Windsurf 共用同一套 MCP 源码、数据目录约定和模型路由。当前版本同时保留「单独安装一个宿主也能使用」与「多个宿主共享数据」两种模式。
 
-> 2026-07-27 refresh：通用 MCP 版本保持不变；Codex Rules 改为四种可组合配置，并同步 NapCat 任务账本、路由、监督器和自动唤醒相关的最新公开源码。
+> 2026-08-02 refresh：NapCat 自动唤醒接入 Codex Desktop 当前 App Server 连接，新增原生未读状态、任务级幂等、上游自恢复、自动化暂停告警、候选验证、局部 backend 热重载和可回滚升级流程。
 
 ## 这套工具解决什么问题
 
@@ -23,7 +23,7 @@
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
-| `napcat-mcp` | 0.1.0 | 可选 QQ 群通知、任务账本、可信路由、Codex 对话唤醒、群文件传输与监督器 |
+| `napcat-mcp` | 0.2.0 | 可选 QQ 群通知、任务账本、可信路由、Codex 原生未读唤醒、群文件传输、监督器与安全更新 |
 
 ## 重点能力
 
@@ -177,7 +177,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
-| `napcat-mcp` | 0.1.0 | Optional QQ group messaging, task ledger, trusted routing, Codex conversation wakeups, file transfer, and supervisor |
+| `napcat-mcp` | 0.2.0 | Optional QQ group messaging, task ledger, trusted routing, native Codex unread wakeups, file transfer, supervisor, and guarded updates |
 
 ## Highlights
 

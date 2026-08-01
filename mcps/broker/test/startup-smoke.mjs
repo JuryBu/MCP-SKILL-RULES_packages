@@ -53,7 +53,35 @@ function readHealth(port) {
   });
 }
 
+function postJson(port, pathname, body, token) {
+  return new Promise((resolve, reject) => {
+    const payload = Buffer.from(JSON.stringify(body));
+    const request = http.request({
+      host: "127.0.0.1",
+      port,
+      path: pathname,
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "content-length": payload.length,
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+      },
+    }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => resolve({
+        statusCode: response.statusCode,
+        body: JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"),
+      }));
+    });
+    request.setTimeout(2000, () => request.destroy(new Error("control request timed out")));
+    request.once("error", reject);
+    request.end(payload);
+  });
+}
+
 const port = await reservePort();
+const controlToken = "startup-smoke-control-token";
 const child = spawn(process.execPath, [path.join(brokerRoot, "broker.mjs")], {
   cwd: brokerRoot,
   env: {
@@ -63,6 +91,7 @@ const child = spawn(process.execPath, [path.join(brokerRoot, "broker.mjs")], {
     CODEX_TOOLKIT_DATA_ROOT: dataRoot,
     CODEX_TOOLKIT_BROKER_ROOT: brokerRoot,
     CODEX_TOOLKIT_ENABLE_NAPCAT_MCP: "1",
+    CODEX_MCP_BROKER_CONTROL_TOKEN: controlToken,
     MEMORY_STORE_MCP_ROOT: memoryStoreRoot,
   },
   stdio: ["ignore", "pipe", "pipe"],
@@ -93,6 +122,17 @@ try {
   const health = JSON.parse(healthBody);
   if (!Array.isArray(health?.endpoints) || !health.endpoints.includes("napcat")) {
     throw new Error("NapCat endpoint was not enabled during startup smoke test");
+  }
+  const unauthorized = await postJson(port, "/__control/reload-backend", { endpoint: "napcat" }, "wrong-token");
+  if (unauthorized.statusCode !== 401) {
+    throw new Error(`Broker control endpoint did not reject the wrong token: ${unauthorized.statusCode}`);
+  }
+  const reload = await postJson(port, "/__control/reload-backend", { endpoint: "napcat", timeoutMs: 5000 }, controlToken);
+  if (reload.statusCode !== 200 || reload.body?.ok !== true || reload.body?.endpoint !== "napcat") {
+    throw new Error(`Scoped NapCat backend reload failed: ${JSON.stringify(reload)}`);
+  }
+  if (reload.body?.brokerPid !== child.pid) {
+    throw new Error("Scoped backend reload changed or misreported the broker PID");
   }
   console.log("Broker startup smoke passed with NapCat enabled.");
 } finally {

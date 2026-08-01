@@ -6,7 +6,7 @@ param(
   [string]$Summary = "训练进程仍在运行",
   [string]$Progress = "",
   [string]$CheckpointAt = "",
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
 )
 

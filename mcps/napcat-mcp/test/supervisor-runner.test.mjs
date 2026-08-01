@@ -424,7 +424,7 @@ test("陈旧锁可恢复，活锁会返回 duplicate，runtime JSON 始终原子
   const liveFixture = createFixture();
   try {
     fs.mkdirSync(path.dirname(liveFixture.lockPath), { recursive: true });
-    fs.writeFileSync(liveFixture.lockPath, JSON.stringify({ pid: 9002, startedAt: "live" }), "utf8");
+    fs.writeFileSync(liveFixture.lockPath, JSON.stringify({ pid: 9002, startedAt: "2026-07-24T08:00:00.000Z" }), "utf8");
     const duplicate = await runSupervisorService(baseOptions(liveFixture, {
       isProcessAlive: (pid) => pid === 9002,
     }));

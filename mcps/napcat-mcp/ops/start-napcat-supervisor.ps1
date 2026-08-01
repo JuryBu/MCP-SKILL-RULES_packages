@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
   [ValidateRange(0, 3600)][int]$IntervalSeconds = 0,
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
   [string]$NapCatRoot = ""
 )
@@ -42,6 +42,8 @@ $RuntimeStatePath = Join-Path $DataRoot "state\supervisor-runtime.json"
 $LogPath = Join-Path $DataRoot "state\supervisor.jsonl"
 $StopFilePath = Join-Path $DataRoot "state\supervisor.stop"
 $LockPath = Join-Path $DataRoot "state\supervisor.lock"
+$AutomationMaintenancePath = Join-Path $DataRoot "state\task-router.maintenance.json"
+$AutomationAlertPath = Join-Path $DataRoot "state\automation-alert.json"
 $PortableBrokerStartScript = Join-Path $ToolkitRoot "install\Start-CodexMcpBroker.ps1"
 $FlatBrokerStartScript = Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1"
 $BrokerStartScript = if (Test-Path -LiteralPath $PortableBrokerStartScript) {
@@ -69,11 +71,27 @@ foreach ($RequiredPath in @($RunnerPath, $PrivateEnvPath, $BindingPath, $BrokerS
   if (-not (Test-Path -LiteralPath $RequiredPath)) { throw "Missing supervisor runtime file: $RequiredPath" }
 }
 
+function Test-ExpectedSupervisorRuntime {
+  param($RuntimeState, $ProcessInfo)
+  if ($null -eq $RuntimeState -or $null -eq $ProcessInfo -or [string]$RuntimeState.state -ne "running") { return $false }
+  $CommandLine = [string]$ProcessInfo.CommandLine
+  if ($CommandLine.IndexOf($RunnerPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  if ($CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  if ($CommandLine.IndexOf($LockPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
+  try {
+    $LockState = Get-Content -LiteralPath $LockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    return [int]$LockState.pid -eq [int]$RuntimeState.pid -and [string]$LockState.token -eq [string]$RuntimeState.instanceToken -and -not [string]::IsNullOrWhiteSpace([string]$RuntimeState.instanceToken)
+  } catch {
+    return $false
+  }
+}
+
 if (Test-Path -LiteralPath $RuntimeStatePath) {
   try {
     $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $ExistingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$ExistingState.pid)" -ErrorAction SilentlyContinue
-    if ($null -ne $ExistingProcess -and [string]$ExistingProcess.CommandLine -like "*$RunnerPath*") {
+    if (Test-ExpectedSupervisorRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
       [pscustomobject]@{
         started = $false
         reason = "already_running"
@@ -108,7 +126,9 @@ $Arguments = @(
   "--broker-health-url", "http://127.0.0.1:14588/health",
   "--broker-start-script", $BrokerStartScript,
   "--login-script", $LoginScript,
-  "--napcat-root", $NapCatRoot
+  "--napcat-root", $NapCatRoot,
+  "--maintenance-file", $AutomationMaintenancePath,
+  "--alert-file", $AutomationAlertPath
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
@@ -119,9 +139,10 @@ do {
   Start-Sleep -Milliseconds 200
   if (Test-Path -LiteralPath $RuntimeStatePath) {
     try {
-      $RuntimeState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-      $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$RuntimeState.pid)" -ErrorAction SilentlyContinue
-      if ($null -ne $RuntimeProcess -and [string]$RuntimeProcess.CommandLine -like "*$RunnerPath*") { break }
+      $CandidateState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$CandidateState.pid)" -ErrorAction SilentlyContinue
+      if (Test-ExpectedSupervisorRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
+      $RuntimeState = $null
     } catch {
       $RuntimeState = $null
     }

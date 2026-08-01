@@ -19,6 +19,8 @@ const CLI_OPTIONS = new Set([
   "log",
   "stop-file",
   "lock",
+  "maintenance-file",
+  "alert-file",
   "interval-ms",
   "private-env",
 ]);
@@ -88,6 +90,8 @@ export function parseArguments(argv) {
     logPath: resolveRequiredPath(values.log, "--log"),
     stopFilePath: resolveRequiredPath(values["stop-file"], "--stop-file"),
     lockPath: resolveRequiredPath(values.lock, "--lock"),
+    maintenanceFilePath: resolveOptionalPath(values["maintenance-file"]),
+    alertFilePath: resolveOptionalPath(values["alert-file"]),
     scanIntervalMs: normalizePositiveInteger(
       values["interval-ms"],
       "--interval-ms",
@@ -104,7 +108,7 @@ export function readPrivateEnvironment(filePath) {
   }
   return Object.fromEntries(
     Object.entries(raw)
-      .filter(([name]) => name.startsWith("NAPCAT_"))
+      .filter(([name]) => name.startsWith("NAPCAT_") || name.startsWith("CODEX_APP_SERVER_PROXY_"))
       .map(([name, value]) => [name, String(value ?? "")]),
   );
 }
@@ -138,6 +142,40 @@ function atomicWriteJson(filePath, value, fsImpl = fs) {
     }
     throw error;
   }
+}
+
+function pauseAutomation(options, failure, fsImpl, now) {
+  if (!options.maintenanceFilePath) return null;
+  const at = nowIso(now);
+  const maintenance = readExistingJson(options.maintenanceFilePath, fsImpl);
+  const reasons = maintenance.reasons && typeof maintenance.reasons === "object"
+    ? { ...maintenance.reasons }
+    : {};
+  reasons.automationBridge = {
+    at,
+    taskId: failure.taskId ?? null,
+    outcome: failure.outcome ?? null,
+    code: failure.error?.code ?? failure.threadStatus ?? "AUTOMATION_BRIDGE_FAILED",
+    message: failure.error?.message ?? `Codex 自动唤醒失败：${failure.outcome ?? "unknown"}`,
+    outcomeUnknown: Boolean(failure.error?.outcomeUnknown),
+    wakeId: failure.wakeId ?? null,
+    pendingThroughSequence: failure.pendingThroughSequence ?? null,
+  };
+  const nextMaintenance = { schemaVersion: 1, reasons };
+  atomicWriteJson(options.maintenanceFilePath, nextMaintenance, fsImpl);
+  if (options.alertFilePath) {
+    const currentAlert = readExistingJson(options.alertFilePath, fsImpl);
+    if (!currentAlert.pending) {
+      atomicWriteJson(options.alertFilePath, {
+        schemaVersion: 1,
+        pending: true,
+        createdAt: at,
+        source: "task-router",
+        ...reasons.automationBridge,
+      }, fsImpl);
+    }
+  }
+  return reasons.automationBridge;
 }
 
 export function writeRuntimeState(runtimeStatePath, patch = {}, options = {}) {
@@ -239,7 +277,15 @@ export function acquireInstanceLock(lockPath, options = {}) {
 
       const snapshot = readLockSnapshot(normalizedLockPath, fsImpl);
       const existingPid = snapshot.metadata?.pid;
-      if (existingPid !== undefined && isAlive(existingPid)) {
+      let existingOwnerValid = existingPid !== undefined && isAlive(existingPid);
+      if (existingOwnerValid && typeof options.validateExistingLock === "function") {
+        try {
+          existingOwnerValid = options.validateExistingLock(snapshot.metadata) !== false;
+        } catch {
+          existingOwnerValid = false;
+        }
+      }
+      if (existingOwnerValid) {
         return {
           acquired: false,
           lockPath: normalizedLockPath,
@@ -366,6 +412,14 @@ export function createTaskRouterDependencies(options = {}) {
     registry,
     notifier,
     bridge,
+    isMaintenanceActive: () => {
+      if (!options.maintenanceFilePath) return false;
+      const maintenance = readExistingJson(options.maintenanceFilePath, options.fsImpl ?? fs);
+      const reasons = maintenance.reasons && typeof maintenance.reasons === "object"
+        ? maintenance.reasons
+        : {};
+      return Object.keys(reasons).length > 0;
+    },
   });
   if (!router || typeof router.scanOnce !== "function") {
     throw new Error("task router 必须提供 scanOnce() 方法");
@@ -427,6 +481,18 @@ export async function runTaskRouterService(options = {}) {
     now: () => new Date(startedAt),
     isProcessAlive: options.isProcessAlive,
     processObject,
+    validateExistingLock: (metadata) => {
+      const lockStartedAt = Date.parse(metadata?.startedAt ?? "");
+      const currentMs = new Date(now()).getTime();
+      if (Number.isFinite(lockStartedAt) && currentMs >= lockStartedAt && currentMs - lockStartedAt < 15_000) return true;
+      const runtime = readExistingJson(runtimeStatePath, fsImpl);
+      const updatedAt = Date.parse(runtime.updatedAt ?? runtime.lastScanAt ?? runtime.startedAt ?? "");
+      return Number(runtime.pid) === Number(metadata?.pid)
+        && runtime.instanceToken === metadata?.token
+        && ["starting", "running"].includes(runtime.state)
+        && Number.isFinite(updatedAt)
+        && currentMs - updatedAt < Math.max(300_000, scanIntervalMs * 4);
+    },
   });
   if (!lock.acquired) {
     return {
@@ -440,6 +506,7 @@ export async function runTaskRouterService(options = {}) {
   let status = {
     schemaVersion: 1,
     pid,
+    instanceToken: lock.metadata.token,
     startedAt,
     lastScanAt: null,
     nextScanAt: null,
@@ -457,9 +524,10 @@ export async function runTaskRouterService(options = {}) {
   let stopRequested = false;
   let failureCount = 0;
   let scanCount = 0;
+  let lastMaintenanceFingerprint = null;
 
   const persist = (patch) => {
-    status = { ...status, ...patch };
+    status = { ...status, ...patch, updatedAt: nowIso(now) };
     status = writeRuntimeState(runtimeStatePath, status, { fsImpl, pid });
     return status;
   };
@@ -477,7 +545,7 @@ export async function runTaskRouterService(options = {}) {
   };
 
   try {
-    persist({ state: "running", lastError: null, nextScanAt: null, lastScanAt: null, openTaskCount: 0 });
+    persist({ state: "running", lastError: null, nextScanAt: null, lastScanAt: null, openTaskCount: 0, inFlightScan: false, maintenance: null });
     signalCleanup = options.installSignalHandlers === false
       ? () => {}
       : installSignalHandlers(processObject, requestStop);
@@ -498,8 +566,48 @@ export async function runTaskRouterService(options = {}) {
     }
 
     while (!detectStop()) {
+      const maintenance = options.maintenanceFilePath
+        ? readExistingJson(options.maintenanceFilePath, fsImpl)
+        : {};
+      const maintenanceReasons = maintenance.reasons && typeof maintenance.reasons === "object"
+        ? maintenance.reasons
+        : {};
+      if (Object.keys(maintenanceReasons).length > 0) {
+        const openTaskCount = components.registry && typeof components.registry.list === "function"
+          ? components.registry.list({ status: "open" }).length
+          : status.openTaskCount;
+        const fingerprint = JSON.stringify(maintenanceReasons);
+        persist({
+          state: "maintenance",
+          inFlightScan: false,
+          maintenance: maintenanceReasons,
+          openTaskCount,
+          nextScanAt: nextTimeIso(now, scanIntervalMs),
+          lastError: null,
+        });
+        if (fingerprint !== lastMaintenanceFingerprint) {
+          appendLog(logPath, {
+            at: nowIso(now),
+            type: "maintenance",
+            pid,
+            openTaskCount,
+            reasons: maintenanceReasons,
+          }, fsImpl);
+          lastMaintenanceFingerprint = fingerprint;
+        }
+        if (detectStop()) break;
+        await (options.wait ?? waitForNextScan)(scanIntervalMs, {
+          fsImpl,
+          stopFilePath,
+          pollMs: options.stopPollMs,
+          isStopRequested: () => stopRequested || fileExists(stopFilePath, fsImpl),
+        });
+        continue;
+      }
+      lastMaintenanceFingerprint = null;
       scanCount += 1;
       try {
+        persist({ state: "running", inFlightScan: true, maintenance: null });
         const scanResult = await components.router.scanOnce();
         const openTaskCount = parseOpenTaskCount(scanResult);
         const scanAt = typeof scanResult?.scannedAt === "string" && scanResult.scannedAt
@@ -507,6 +615,12 @@ export async function runTaskRouterService(options = {}) {
           : nowIso(now);
         const taskScanError = scanResultError(scanResult);
         if (taskScanError) throw taskScanError;
+        const automationFailure = Array.isArray(scanResult?.results)
+          ? scanResult.results.find((result) => ["wake_failed", "wake_unknown", "thread_unavailable"].includes(result?.outcome))
+          : null;
+        const automationPause = automationFailure
+          ? pauseAutomation(options, automationFailure, fsImpl, now)
+          : null;
         failureCount = 0;
         status = {
           ...status,
@@ -514,7 +628,9 @@ export async function runTaskRouterService(options = {}) {
           nextScanAt: openTaskCount > 0 ? nextTimeIso(now, scanIntervalMs) : null,
           openTaskCount,
           lastError: null,
-          state: "running",
+          state: automationPause ? "maintenance" : "running",
+          inFlightScan: false,
+          maintenance: automationPause ? { automationBridge: automationPause } : null,
         };
         persist(status);
         appendLog(logPath, {
@@ -541,6 +657,8 @@ export async function runTaskRouterService(options = {}) {
             : {}),
           lastError: errorValue,
           state: "running",
+          inFlightScan: false,
+          maintenance: null,
         });
         appendLog(logPath, {
           at: scanAt,
@@ -572,7 +690,7 @@ export async function runTaskRouterService(options = {}) {
     await closeBridge(components);
     componentsClosed = true;
     const stoppedAt = nowIso(now);
-    persist({ state: "stopped", nextScanAt: null, stoppedAt, stopReason });
+    persist({ state: "stopped", nextScanAt: null, stoppedAt, stopReason, inFlightScan: false });
     appendLog(logPath, { at: stoppedAt, type: "runner_stopped", pid, stopReason }, fsImpl);
     return { ...status, scanCount, failureCount, stopReason };
   } catch (error) {
@@ -585,7 +703,7 @@ export async function runTaskRouterService(options = {}) {
     }
     const failedAt = nowIso(now);
     try {
-      persist({ state: "failed", nextScanAt: null, lastError: errorValue, failedAt });
+      persist({ state: "failed", nextScanAt: null, lastError: errorValue, failedAt, inFlightScan: false });
     } catch {
       status = { ...status, state: "failed", nextScanAt: null, lastError: errorValue, failedAt };
     }

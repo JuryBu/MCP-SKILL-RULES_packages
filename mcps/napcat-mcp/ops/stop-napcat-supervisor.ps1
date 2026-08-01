@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
   [ValidateRange(1, 120)][int]$WaitSeconds = 20,
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,10 +31,12 @@ do {
   Start-Sleep -Milliseconds 250
 } while ([DateTime]::UtcNow -lt $Deadline)
 
+$OutputPid = if ($PidValue -gt 0) { $PidValue } else { $null }
+$OutputNote = if ($Alive) { "Supervisor is still shutting down; no force kill was used" } else { "Supervisor stopped" }
 [pscustomobject]@{
   stopRequested = $true
   stopped = (-not $Alive)
-  pid = if ($PidValue -gt 0) { $PidValue } else { $null }
+  pid = $OutputPid
   stopFilePath = $StopFilePath
-  note = if ($Alive) { "Supervisor is still shutting down; no force kill was used" } else { "Supervisor stopped" }
+  note = $OutputNote
 } | ConvertTo-Json -Depth 6

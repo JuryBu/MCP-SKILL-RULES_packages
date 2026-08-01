@@ -36,8 +36,11 @@ $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-pr
 # Optional NapCat QQ group collaboration MCP. NapCat itself and QQ login state are not bundled.
 # Copy mcps\napcat-mcp\binding.example.json to the private data root and replace all example values.
 # $env:CODEX_TOOLKIT_ENABLE_NAPCAT_MCP = "1"
+# $env:NAPCAT_MCP_ROOT = "$env:USERPROFILE\.codex\services\napcat-bridge\current"
+# $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\napcat-mcp"
 # $env:NAPCAT_HTTP_URL = "http://127.0.0.1:3010"
 # $env:NAPCAT_ACCESS_TOKEN = "<receiver-private-onebot-token>"
+# $env:CODEX_MCP_BROKER_CONTROL_TOKEN = "<receiver-random-local-control-token>"
 # $env:NAPCAT_MCP_BINDING_PATH = "$env:CODEX_TOOLKIT_DATA_ROOT\napcat-mcp\binding.json"
 # $env:NAPCAT_MCP_STATE_PATH = "$env:CODEX_TOOLKIT_DATA_ROOT\napcat-mcp\state\dedupe.json"
 

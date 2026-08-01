@@ -57,6 +57,8 @@ NapCat QQ group bridge:
 - `/napcat/mcp` is added only when `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP=1`; the source package remains inert otherwise.
 - Task registry, router runtime, log, stop, and lock files are rooted below the receiver's `.codex-toolkit/napcat-mcp/state` directory unless their individual `NAPCAT_TASK_*` paths are overridden.
 - The endpoint includes a task ledger, fixed-group router, Codex wake bridge, supervisor, and per-user autostart scripts. All remain inactive until the receiver configures NapCat and registers an open task.
+- A loopback-only `POST /__control/reload-backend` endpoint can drain and restart one named backend while preserving the broker PID, other backends, and frontend MCP sessions. It is disabled unless `CODEX_MCP_BROKER_CONTROL_TOKEN` is set; legacy NapCat installations may temporarily use their existing private NapCat MCP token during the first migration.
+- A NapCat reload refreshes only allowlisted code/data paths from this broker's private environment file before closing the child. Request bodies cannot inject commands, paths, environment variables, or arbitrary endpoint names.
 - The receiver must install NapCat separately, provide a loopback `NAPCAT_HTTP_URL`, keep `NAPCAT_ACCESS_TOKEN` private, and place a receiver-owned fixed-group binding below `%USERPROFILE%\.codex-toolkit\napcat-mcp` or set `NAPCAT_MCP_BINDING_PATH` explicitly.
 - The broker never bundles QQ login state, a real binding, heartbeat state, QR codes, or NapCat binaries. See `../napcat-mcp/README.md`.
 
@@ -64,6 +66,7 @@ Local secrets:
 
 - The broker and Exa bridge may optionally load `broker-private.env.json` from this directory when it exists. Environment variables supplied by the shell always win.
 - This file is for local credentials and endpoints only. It is ignored by Git and must never be committed. Do not copy a private file from another installation.
+- Generate a unique `CODEX_MCP_BROKER_CONTROL_TOKEN` per receiver. The token is never returned by health, state, logs, or the reload response.
 
 Commands:
 

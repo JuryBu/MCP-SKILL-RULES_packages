@@ -1,30 +1,30 @@
 ﻿[CmdletBinding()]
 param(
-  [ValidateRange(1, 3600)][int]$IntervalSeconds = 30,
   [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
-  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
+  [ValidateRange(1, 65535)][int]$DownstreamPort = 18432,
+  [ValidateRange(1, 65535)][int]$ControlPort = 18431,
+  [ValidateRange(1, 65535)][int]$UpstreamPort = 18433,
+  [ValidateRange(1, 65535)][int]$ProbePort = 18434
 )
 
 $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path (Split-Path -Parent $NapCatMcpRoot) "broker" }
-$RunnerPath = Join-Path $NapCatMcpRoot "src\task-router-runner.mjs"
-$PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
-$BindingPath = Join-Path $DataRoot "binding.json"
-$DedupeStatePath = Join-Path $DataRoot "state\dedupe.json"
-$RegistryPath = Join-Path $DataRoot "state\task-registry.json"
-$RuntimeStatePath = Join-Path $DataRoot "state\task-router-runtime.json"
-$LogPath = Join-Path $DataRoot "state\task-router.jsonl"
-$StopFilePath = Join-Path $DataRoot "state\task-router.stop"
-$LockPath = Join-Path $DataRoot "state\task-router.lock"
-$MaintenanceFilePath = Join-Path $DataRoot "state\task-router.maintenance.json"
-$AlertFilePath = Join-Path $DataRoot "state\automation-alert.json"
+$RunnerPath = Join-Path $NapCatMcpRoot "src\codex-app-server-proxy-runner.mjs"
+$StateRoot = Join-Path $DataRoot "state"
+$RuntimeStatePath = Join-Path $StateRoot "codex-app-server-proxy-runtime.json"
+$LogPath = Join-Path $StateRoot "codex-app-server-proxy.jsonl"
+$StopFilePath = Join-Path $StateRoot "codex-app-server-proxy.stop"
+$LockPath = Join-Path $StateRoot "codex-app-server-proxy.lock"
+$JournalPath = Join-Path $StateRoot "codex-app-server-wake-journal.json"
+$TokenFilePath = Join-Path $StateRoot "codex-app-server-proxy-token.txt"
+$MaintenanceFilePath = Join-Path $StateRoot "task-router.maintenance.json"
+$AlertFilePath = Join-Path $StateRoot "automation-alert.json"
+$FallbackFilePath = Join-Path $StateRoot "codex-app-server-proxy-fallback.json"
 
-foreach ($RequiredPath in @($RunnerPath, $PrivateEnvPath, $BindingPath)) {
-  if (-not (Test-Path -LiteralPath $RequiredPath)) { throw "缺少任务路由运行文件：$RequiredPath" }
-}
+if (-not (Test-Path -LiteralPath $RunnerPath)) { throw "Missing Codex App Server proxy runner: $RunnerPath" }
+New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
-function Test-ExpectedTaskRouterRuntime {
+function Test-ExpectedProxyRuntime {
   param($RuntimeState, $ProcessInfo)
   if ($null -eq $RuntimeState -or $null -eq $ProcessInfo -or [string]$RuntimeState.state -ne "running") { return $false }
   $CommandLine = [string]$ProcessInfo.CommandLine
@@ -44,20 +44,19 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
   try {
     $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $ExistingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$ExistingState.pid)" -ErrorAction SilentlyContinue
-    if (Test-ExpectedTaskRouterRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
+    if (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
       [pscustomobject]@{
         started = $false
         reason = "already_running"
         pid = [int]$ExistingState.pid
         runtimeState = $ExistingState
-      } | ConvertTo-Json -Depth 8
+      } | ConvertTo-Json -Depth 12
       return
     }
   } catch {
   }
 }
 
-New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot "state") | Out-Null
 if (Test-Path -LiteralPath $StopFilePath) { Remove-Item -LiteralPath $StopFilePath -Force }
 $NodePath = (Get-Command node -ErrorAction Stop).Source
 
@@ -68,45 +67,52 @@ function Quote-Argument {
 
 $Arguments = @(
   $RunnerPath,
-  "--registry", $RegistryPath,
-  "--binding", $BindingPath,
-  "--state", $DedupeStatePath,
   "--runtime-state", $RuntimeStatePath,
   "--log", $LogPath,
   "--stop-file", $StopFilePath,
   "--lock", $LockPath,
+  "--journal", $JournalPath,
+  "--token-file", $TokenFilePath,
   "--maintenance-file", $MaintenanceFilePath,
   "--alert-file", $AlertFilePath,
-  "--interval-ms", ([string]($IntervalSeconds * 1000)),
-  "--private-env", $PrivateEnvPath
+  "--fallback-file", $FallbackFilePath,
+  "--downstream-port", ([string]$DownstreamPort),
+  "--control-port", ([string]$ControlPort),
+  "--upstream-port", ([string]$UpstreamPort),
+  "--probe-port", ([string]$ProbePort)
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
 
 $RuntimeState = $null
-$Deadline = [DateTime]::UtcNow.AddSeconds(10)
+$Deadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
   Start-Sleep -Milliseconds 200
   if (Test-Path -LiteralPath $RuntimeStatePath) {
     try {
       $CandidateState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
       $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$CandidateState.pid)" -ErrorAction SilentlyContinue
-      if (Test-ExpectedTaskRouterRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
-      $RuntimeState = $null
+       if (Test-ExpectedProxyRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
+       if ([string]$CandidateState.state -eq "degraded") {
+         $FailureMessage = if ($CandidateState.lastError.message) { [string]$CandidateState.lastError.message } else { "unknown proxy failure" }
+         throw "Codex App Server proxy entered degraded mode: $FailureMessage"
+       }
+       $RuntimeState = $null
     } catch {
       $RuntimeState = $null
     }
   }
-  if ($Process.HasExited -and $null -eq $RuntimeState) {
-    throw "任务路由进程启动后立即退出，exitCode=$($Process.ExitCode)"
-  }
+  if ($Process.HasExited -and $null -eq $RuntimeState) { throw "Codex App Server proxy exited immediately, exitCode=$($Process.ExitCode)" }
 } while ([DateTime]::UtcNow -lt $Deadline)
 
-if ($null -eq $RuntimeState) { throw "任务路由进程未在 10 秒内写出运行状态" }
+if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not publish runtime state within 30 seconds" }
 [pscustomobject]@{
   started = $true
   pid = [int]$RuntimeState.pid
-  intervalSeconds = $IntervalSeconds
+  state = [string]$RuntimeState.state
+  downstreamUrl = [string]$RuntimeState.downstreamUrl
+  controlUrl = [string]$RuntimeState.controlUrl
   runtimeStatePath = $RuntimeStatePath
-  logPath = $LogPath
-} | ConvertTo-Json -Depth 8
+  tokenFilePath = $TokenFilePath
+  fallbackRequired = [bool]$RuntimeState.fallbackRequired
+} | ConvertTo-Json -Depth 12

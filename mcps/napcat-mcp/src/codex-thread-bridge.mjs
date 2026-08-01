@@ -779,6 +779,169 @@ class CodexThreadBridge {
   }
 }
 
+class CodexProxyThreadBridge {
+  constructor(options = {}) {
+    this.env = options.env ?? process.env;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+    this.controlUrl = optionalString(
+      options.controlUrl ?? this.env.CODEX_APP_SERVER_PROXY_CONTROL_URL,
+      "http://127.0.0.1:18431",
+    ).replace(/\/$/, "");
+    this.controlToken = optionalString(options.controlToken ?? this.env.CODEX_APP_SERVER_PROXY_TOKEN);
+    const tokenFilePath = optionalString(options.tokenFilePath ?? this.env.CODEX_APP_SERVER_PROXY_TOKEN_FILE);
+    if (!this.controlToken && tokenFilePath) {
+      try {
+        this.controlToken = fs.readFileSync(tokenFilePath, "utf8").trim();
+      } catch (cause) {
+        throw new CodexThreadBridgeError(
+          "PROXY_TOKEN_READ_FAILED",
+          `无法读取 Codex 代理控制口令：${tokenFilePath}`,
+          { cause },
+        );
+      }
+    }
+    if (!this.controlToken) {
+      throw new CodexThreadBridgeError("PROXY_TOKEN_MISSING", "Codex 代理控制口令未配置");
+    }
+    this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000);
+    this.closed = false;
+    this.lastStatus = null;
+    this.lastError = null;
+  }
+
+  async inspectThread(threadId) {
+    const normalizedThreadId = requiredString(threadId, "threadId", 256);
+    const response = await this.#request("/subscribe", { threadId: normalizedThreadId });
+    return {
+      threadId: normalizedThreadId,
+      status: "unknown",
+      busy: null,
+      found: true,
+      source: "proxy/thread/resume",
+      raw: response,
+    };
+  }
+
+  async wake(input) {
+    if (!isObject(input)) {
+      throw new CodexThreadBridgeError("INVALID_ARGUMENT", "wake 必须接收 { threadId, prompt, wakeId }");
+    }
+    const threadId = requiredString(input.threadId, "threadId", 256);
+    const prompt = requiredString(input.prompt, "prompt", 100000);
+    const wakeId = requiredString(input.wakeId, "wakeId", 256);
+    const taskId = requiredString(input.taskId, "taskId", 128);
+    const generation = positiveInteger(input.generation, 0, 1, Number.MAX_SAFE_INTEGER);
+    const subscription = {
+      taskId,
+      generation,
+      threadId,
+      localRole: requiredString(input.localRole, "localRole", 128),
+      sourceMachine: requiredString(input.sourceMachine, "sourceMachine", 128),
+      targetMachine: requiredString(input.targetMachine, "targetMachine", 128),
+      trustedPeerQq: requiredString(input.trustedPeerQq, "trustedPeerQq", 64),
+    };
+    try {
+      await this.#request("/v1/subscriptions", subscription);
+      const response = await this.#request("/v1/wakes", {
+        ...subscription,
+        prompt,
+        wakeId,
+        pendingThroughSequence: input.pendingThroughSequence,
+        pendingThroughTime: input.pendingThroughTime,
+        promptSha256: input.promptSha256,
+      }, { mutating: true });
+      return {
+        threadId,
+        status: response.outcome === "completed" ? "idle" : response.outcome === "accepted" ? "busy" : "unknown",
+        outcome: response.outcome ?? "unknown",
+        started: response.started ?? null,
+        duplicateSuppressed: Boolean(response.duplicateSuppressed),
+        recovered: Boolean(response.recovered),
+        turn: response.turn ?? null,
+        raw: response,
+        ...(response.error ? { error: response.error } : {}),
+      };
+    } catch (error) {
+      if (error?.outcomeUnknown) {
+        return {
+          threadId,
+          status: "unknown",
+          outcome: "unknown",
+          started: null,
+          error: errorSummary(error),
+        };
+      }
+      throw error;
+    }
+  }
+
+  status() {
+    return {
+      closed: this.closed,
+      mode: "transparent_proxy",
+      controlUrl: this.controlUrl,
+      lastStatus: this.lastStatus,
+      lastError: this.lastError,
+    };
+  }
+
+  async close() {
+    this.closed = true;
+    return { closed: true };
+  }
+
+  async #request(route, body, options = {}) {
+    if (this.closed) throw new CodexThreadBridgeError("BRIDGE_CLOSED", "Codex 线程桥已关闭");
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    let response;
+    try {
+      response = await this.fetchImpl(`${this.controlUrl}${route}`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.controlToken}`,
+          "content-type": "application/json; charset=utf-8",
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({}));
+      this.lastStatus = { at: new Date().toISOString(), route, status: response.status };
+      if (!response.ok || payload.ok === false) {
+        const remoteError = payload.error ?? {};
+        throw new CodexThreadBridgeError(
+          remoteError.code ?? "PROXY_REQUEST_FAILED",
+          remoteError.message ?? `Codex 代理请求失败：HTTP ${response.status}`,
+          {
+            outcomeUnknown: Boolean(remoteError.outcomeUnknown),
+            details: { route, status: response.status, remoteError },
+          },
+        );
+      }
+      this.lastError = null;
+      return payload;
+    } catch (cause) {
+      const error = cause instanceof CodexThreadBridgeError
+        ? cause
+        : new CodexThreadBridgeError(
+          cause?.name === "AbortError" ? "PROXY_TIMEOUT" : "PROXY_UNREACHABLE",
+          cause?.name === "AbortError"
+            ? `Codex 代理在 ${this.requestTimeoutMs}ms 内未响应`
+            : `无法连接 Codex 代理：${cause?.message ?? String(cause)}`,
+          { cause, outcomeUnknown: Boolean(options.mutating), details: { route } },
+        );
+      this.lastError = errorSummary(error);
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+}
+
 export function createCodexThreadBridge(options = {}) {
+  const env = options.env ?? process.env;
+  const proxyEnabled = options.mode === "transparent_proxy"
+    || optionalString(options.controlUrl ?? env.CODEX_APP_SERVER_PROXY_CONTROL_URL) !== "";
+  if (proxyEnabled) return new CodexProxyThreadBridge(options);
   return new CodexThreadBridge(options);
 }

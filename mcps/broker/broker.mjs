@@ -9,18 +9,29 @@ import { execFile } from "node:child_process";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function bootstrapPrivateEnv() {
-  const privateEnvPath = path.join(__dirname, "broker-private.env.json");
+const privateEnvPath = path.join(__dirname, "broker-private.env.json");
+
+function readPrivateEnvSnapshot() {
   if (!fs.existsSync(privateEnvPath)) return;
   try {
-    const privateEnv = JSON.parse(fs.readFileSync(privateEnvPath, "utf8").replace(/^\uFEFF/, ""));
+    return JSON.parse(fs.readFileSync(privateEnvPath, "utf8").replace(/^\uFEFF/, ""));
+  } catch (error) {
+    console.error(`[codex-mcp-broker] private env load failed: ${error.message}`);
+    return null;
+  }
+}
+
+function bootstrapPrivateEnv() {
+  const privateEnv = readPrivateEnvSnapshot();
+  if (!privateEnv) return;
+  try {
     for (const [key, value] of Object.entries(privateEnv)) {
       if (key && value !== undefined && value !== null && String(value) !== "" && !process.env[key]) {
         process.env[key] = String(value);
       }
     }
   } catch (error) {
-    console.error(`[codex-mcp-broker] private env load failed: ${error.message}`);
+    console.error(`[codex-mcp-broker] private env apply failed: ${error.message}`);
   }
 }
 
@@ -35,6 +46,7 @@ const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "s
 const subagentRoot = process.env.SUBAGENT_MCP_ROOT || path.join(toolkitMcpRoot, "mcp-subagent");
 const napcatRoot = process.env.NAPCAT_MCP_ROOT || path.join(toolkitMcpRoot, "napcat-mcp");
 const napcatEnabled = process.env.CODEX_TOOLKIT_ENABLE_NAPCAT_MCP === "1";
+const brokerControlToken = process.env.CODEX_MCP_BROKER_CONTROL_TOKEN || process.env.NAPCAT_MCP_TOKEN || "";
 const sdkRoot = path.join(
   memoryStoreRoot,
   "node_modules",
@@ -243,6 +255,28 @@ const endpoints = {
     },
   },
 };
+
+function refreshEndpointConfigFromPrivateEnv(name, config) {
+  if (name !== "napcat") return { refreshed: false };
+  const privateEnv = readPrivateEnvSnapshot() || {};
+  const refreshedRoot = privateEnv.NAPCAT_MCP_ROOT || config.cwd;
+  const refreshedDataRoot = privateEnv.CODEX_TOOLKIT_NAPCAT_DATA_ROOT || config.env.CODEX_TOOLKIT_NAPCAT_DATA_ROOT;
+  config.cwd = refreshedRoot;
+  config.args = [path.join(refreshedRoot, "src", "index.mjs")];
+  config.env = {
+    ...config.env,
+    NAPCAT_MCP_BINDING_PATH: privateEnv.NAPCAT_MCP_BINDING_PATH || process.env.NAPCAT_MCP_BINDING_PATH || path.join(refreshedDataRoot, "binding.json"),
+    NAPCAT_MCP_STATE_PATH: privateEnv.NAPCAT_MCP_STATE_PATH || process.env.NAPCAT_MCP_STATE_PATH || path.join(refreshedDataRoot, "state", "dedupe.json"),
+    NAPCAT_TASK_REGISTRY_PATH: privateEnv.NAPCAT_TASK_REGISTRY_PATH || process.env.NAPCAT_TASK_REGISTRY_PATH || path.join(refreshedDataRoot, "state", "task-registry.json"),
+    NAPCAT_TASK_ROUTER_RUNTIME_PATH: privateEnv.NAPCAT_TASK_ROUTER_RUNTIME_PATH || process.env.NAPCAT_TASK_ROUTER_RUNTIME_PATH || path.join(refreshedDataRoot, "state", "task-router-runtime.json"),
+    NAPCAT_TASK_ROUTER_LOG_PATH: privateEnv.NAPCAT_TASK_ROUTER_LOG_PATH || process.env.NAPCAT_TASK_ROUTER_LOG_PATH || path.join(refreshedDataRoot, "state", "task-router.jsonl"),
+    NAPCAT_TASK_ROUTER_STOP_PATH: privateEnv.NAPCAT_TASK_ROUTER_STOP_PATH || process.env.NAPCAT_TASK_ROUTER_STOP_PATH || path.join(refreshedDataRoot, "state", "task-router.stop"),
+    NAPCAT_TASK_ROUTER_LOCK_PATH: privateEnv.NAPCAT_TASK_ROUTER_LOCK_PATH || process.env.NAPCAT_TASK_ROUTER_LOCK_PATH || path.join(refreshedDataRoot, "state", "task-router.lock"),
+    CODEX_TOOLKIT_NAPCAT_DATA_ROOT: refreshedDataRoot,
+    CODEX_TOOLKIT_BROKER_ROOT: privateEnv.CODEX_TOOLKIT_BROKER_ROOT || config.env.CODEX_TOOLKIT_BROKER_ROOT,
+  };
+  return { refreshed: true, cwd: refreshedRoot, dataRoot: refreshedDataRoot };
+}
 
 function log(message, details = undefined) {
   const entry = {
@@ -649,6 +683,10 @@ class EndpointBroker {
       ? { tools: config.toolsListFallback }
       : null;
     this.cachedToolsListAt = this.cachedToolsList ? "static-fallback" : null;
+    this.inFlight = 0;
+    this.reloading = false;
+    this.reloadCount = 0;
+    this.lastReloadAt = null;
   }
 
   status() {
@@ -664,6 +702,10 @@ class EndpointBroker {
       oldestSessionAt: sessions.map((session) => session.createdAt).sort()[0] ?? null,
       newestSessionSeenAt: sessions.map((session) => session.lastSeenAt).sort().at(-1) ?? null,
       toolsListCacheAt: this.cachedToolsListAt,
+      inFlight: this.inFlight,
+      reloading: this.reloading,
+      reloadCount: this.reloadCount,
+      lastReloadAt: this.lastReloadAt,
       backend: this.backend.status(),
     };
   }
@@ -812,6 +854,12 @@ class EndpointBroker {
   }
 
   async handle(req, res, parsedBody) {
+    if (this.reloading) {
+      sendJson(res, 503, { error: `MCP backend ${this.name} is reloading; retry this request.` });
+      return;
+    }
+    this.inFlight += 1;
+    try {
     const sessionId = req.headers["mcp-session-id"];
     if (typeof sessionId === "string" && this.sessions.has(sessionId)) {
       const session = this.sessions.get(sessionId);
@@ -832,6 +880,40 @@ class EndpointBroker {
     }
 
     sendJson(res, sessionId ? 404 : 400, { error: "Missing or invalid MCP session. Send initialize first." });
+    } finally {
+      this.inFlight = Math.max(0, this.inFlight - 1);
+    }
+  }
+
+  async reloadBackend(options = {}) {
+    if (this.reloading) throw new Error(`MCP backend ${this.name} is already reloading`);
+    this.reloading = true;
+    const timeoutMs = Math.max(1000, Math.min(Number(options.timeoutMs || 30000), 300000));
+    const deadline = Date.now() + timeoutMs;
+    try {
+      while (this.inFlight > 0 && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (this.inFlight > 0) {
+        throw new Error(`Timed out waiting for ${this.inFlight} in-flight ${this.name} request(s)`);
+      }
+      const before = this.backend.status();
+      const configRefresh = refreshEndpointConfigFromPrivateEnv(this.name, this.config);
+      await this.backend.close();
+      this.reloadCount += 1;
+      this.lastReloadAt = new Date().toISOString();
+      log("backend reloaded", { endpoint: this.name, reloadCount: this.reloadCount, before });
+      return {
+        endpoint: this.name,
+        before,
+        after: this.backend.status(),
+        configRefresh,
+        reloadCount: this.reloadCount,
+        reloadedAt: this.lastReloadAt,
+      };
+    } finally {
+      this.reloading = false;
+    }
   }
 
   async cleanupIdleSessions(nowMs = Date.now()) {
@@ -904,6 +986,42 @@ setInterval(() => {
 
 const server = http.createServer(async (req, res) => {
   try {
+    if (req.url === "/__control/reload-backend") {
+      if (!brokerControlToken) {
+        sendJson(res, 404, { error: "Broker control endpoint is disabled" });
+        return;
+      }
+      const remoteAddress = String(req.socket.remoteAddress || "");
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remoteAddress)) {
+        sendJson(res, 403, { error: "Broker control endpoint is loopback-only" });
+        return;
+      }
+      if (req.method !== "POST") {
+        sendJson(res, 405, { error: "Method not allowed" });
+        return;
+      }
+      if (String(req.headers.authorization || "") !== `Bearer ${brokerControlToken}`) {
+        sendJson(res, 401, { error: "Unauthorized" });
+        return;
+      }
+      let input;
+      try {
+        input = await readJsonBody(req);
+      } catch {
+        sendJson(res, 400, { error: "Invalid JSON request body" });
+        return;
+      }
+      const endpoint = String(input?.endpoint || "");
+      const broker = brokers[endpoint];
+      if (!broker) {
+        sendJson(res, 400, { error: "Unknown or disabled backend endpoint" });
+        return;
+      }
+      const result = await broker.reloadBackend({ timeoutMs: input?.timeoutMs });
+      writeState(brokers);
+      sendJson(res, 200, { ok: true, brokerPid: process.pid, ...result });
+      return;
+    }
     if (req.url === "/health") {
       writeState(brokers);
       sendJson(res, 200, { ok: true, pid: process.pid, endpoints: Object.keys(endpoints) });

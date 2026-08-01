@@ -67,6 +67,8 @@ test("register is idempotent and rejects silent conversation changes", () => {
       "wakeSentAt",
       "wakeMessageSeq",
       "wakeMessageAt",
+      "activeWakeId",
+      "wakePromptSha256",
       "lastWakeAt",
       "createdAt",
       "updatedAt",
@@ -82,17 +84,23 @@ test("register is idempotent and rejects silent conversation changes", () => {
     assert.equal(first.wakeSentAt, null);
     assert.equal(first.wakeMessageSeq, null);
     assert.equal(first.wakeMessageAt, null);
+    assert.equal(first.activeWakeId, null);
+    assert.equal(first.wakePromptSha256, null);
     assert.equal(first.lastWakeAt, null);
     assert.equal(first.createdAt, BASE_TIME);
     assert.equal(first.updatedAt, BASE_TIME);
 
-    const repeated = fixture.registry.register(taskInput({ localRole: "training" }));
+    const repeated = fixture.registry.register(taskInput());
     assert.deepEqual(repeated, first);
     assert.deepEqual(fixture.registry.get("task-001"), first);
 
     assertRegistryError(
       () => fixture.registry.register(taskInput({ conversationId: "conversation-002" })),
-      "TASK_CONVERSATION_CONFLICT",
+      "TASK_ROUTE_CONFLICT",
+    );
+    assertRegistryError(
+      () => fixture.registry.register(taskInput({ localRole: "training" })),
+      "TASK_ROUTE_CONFLICT",
     );
     assert.deepEqual(fixture.registry.get("task-001"), first);
     const stateDirectory = path.dirname(fixture.statePath);
@@ -379,6 +387,49 @@ test("later scans do not invalidate the token already delivered by an active wak
     });
     assert.equal(released.wakeMessageSeq, null);
     assert.equal(released.wakeMessageAt, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("acknowledgeWake atomically confirms only the matching wake_id and releases its lease", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+      at: "2026-07-24T08:00:10.000Z",
+    });
+    const acquired = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+      at: "2026-07-24T08:00:10.000Z",
+      wakeId: "wake-a",
+      promptSha256: "a".repeat(64),
+    });
+    assert.equal(acquired.activeWakeId, "wake-a");
+    assertRegistryError(
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        seq: 10,
+        wakeId: "wake-b",
+      }),
+      "ACK_WAKE_ID_MISMATCH",
+    );
+    const acknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 10,
+      wakeId: "wake-a",
+    });
+    assert.equal(acknowledged.lastAckedSeq, 10);
+    assert.equal(acknowledged.wakePending, false);
+    assert.equal(acknowledged.activeWakeId, null);
+    assert.equal(acknowledged.wakePromptSha256, null);
   } finally {
     fixture.cleanup();
   }

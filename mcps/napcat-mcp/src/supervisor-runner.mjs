@@ -32,6 +32,14 @@ const CLI_OPTIONS = new Set([
   "login-timeout-ms",
   "login-cooldown-ms",
   "broker-start-cooldown-ms",
+  "automation-maintenance",
+  "automation-alert",
+  "automation-maintenance-path",
+  "automation-alert-path",
+  "maintenance-file",
+  "alert-file",
+  "maintenance",
+  "alert",
   "once",
 ]);
 
@@ -97,6 +105,175 @@ function readJsonObject(filePath, fsImpl) {
   } catch {
     return {};
   }
+}
+
+function readAutomationFile(filePath, fsImpl) {
+  if (!filePath || !fileExists(filePath, fsImpl)) {
+    return { path: filePath ?? null, present: false, value: {}, error: null };
+  }
+  try {
+    const value = JSON.parse(fsImpl.readFileSync(filePath, "utf8").replace(/^\uFEFF/, ""));
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("自动化控制文件必须是 JSON 对象");
+    }
+    return { path: filePath, present: true, value, error: null };
+  } catch (error) {
+    return {
+      path: filePath,
+      present: true,
+      value: {},
+      error: publicError(error, "AUTOMATION_FILE_INVALID"),
+    };
+  }
+}
+
+function textValue(value, fallback = "") {
+  return value === undefined || value === null ? fallback : String(value).trim();
+}
+
+function booleanValue(value) {
+  if (typeof value === "boolean") return value;
+  const normalized = textValue(value).toLowerCase();
+  if (["true", "1", "yes", "active", "on"].includes(normalized)) return true;
+  if (["false", "0", "no", "inactive", "off"].includes(normalized)) return false;
+  return null;
+}
+
+function normalizeMaintenanceFile(filePath, fsImpl) {
+  const file = readAutomationFile(filePath, fsImpl);
+  if (!file.present) {
+    return {
+      path: filePath,
+      present: false,
+      known: true,
+      active: false,
+      status: "inactive",
+      reason: null,
+      reasons: [],
+      lastError: null,
+    };
+  }
+  if (file.error) {
+    return {
+      path: filePath,
+      present: true,
+      known: false,
+      active: true,
+      status: "invalid",
+      reason: "invalid_file",
+      reasons: [],
+      lastError: file.error,
+    };
+  }
+  const rawStatus = textValue(file.value.status ?? file.value.state ?? file.value.mode).toLowerCase();
+  const reasons = file.value.reasons && typeof file.value.reasons === "object"
+    ? (Array.isArray(file.value.reasons)
+      ? file.value.reasons.map((reason) => textValue(reason)).filter(Boolean)
+      : Object.keys(file.value.reasons))
+    : [];
+  const active = booleanValue(file.value.active) === true
+    || booleanValue(file.value.maintenance) === true
+    || booleanValue(file.value.paused) === true
+    || reasons.length > 0
+    || ["active", "maintenance", "paused", "pause"].includes(rawStatus);
+  return {
+    path: filePath,
+    present: true,
+    known: true,
+    active,
+    status: active ? "active" : (rawStatus || "inactive"),
+    reason: textValue(file.value.reason ?? file.value.message ?? file.value.summary) || null,
+    reasons,
+    updatedAt: textValue(file.value.updatedAt ?? file.value.updated_at) || null,
+    lastError: null,
+  };
+}
+
+function normalizeAlertFile(filePath, fsImpl) {
+  const file = readAutomationFile(filePath, fsImpl);
+  if (!file.present) {
+    return {
+      path: filePath,
+      present: false,
+      known: true,
+      raw: {},
+      status: "none",
+      pending: false,
+      incidentKey: null,
+      text: "",
+      attempts: 0,
+      lastAttemptAt: null,
+      sentAt: null,
+      lastError: null,
+    };
+  }
+  if (file.error) {
+    return {
+      path: filePath,
+      present: true,
+      known: false,
+      raw: {},
+      status: "invalid",
+      pending: false,
+      incidentKey: null,
+      text: "",
+      attempts: 0,
+      lastAttemptAt: null,
+      sentAt: null,
+      lastError: file.error,
+    };
+  }
+  const nested = file.value.alert && typeof file.value.alert === "object" && !Array.isArray(file.value.alert)
+    ? file.value.alert
+    : {};
+  const readValue = (...keys) => {
+    for (const key of keys) {
+      if (file.value[key] !== undefined && file.value[key] !== null) return file.value[key];
+      if (nested[key] !== undefined && nested[key] !== null) return nested[key];
+    }
+    return undefined;
+  };
+  const status = textValue(readValue("status", "state")).toLowerCase();
+  const sent = booleanValue(readValue("sent")) === true || ["sent", "delivered"].includes(status);
+  const explicitIncidentKey = textValue(readValue("incidentKey", "incident_key", "key"));
+  const source = textValue(readValue("source"));
+  const taskId = textValue(readValue("taskId", "task_id"));
+  const outcome = textValue(readValue("outcome"));
+  const code = textValue(readValue("code"));
+  const incidentKey = explicitIncidentKey || (
+    source && (taskId || outcome || code)
+      ? [source, taskId || "no-task", outcome || "no-outcome", code || "no-code"].join(":")
+      : ""
+  );
+  const text = textValue(readValue("text", "message", "alertText", "summary"));
+  const pending = !sent && (
+    booleanValue(readValue("pending")) === true
+    || ["pending", "retry", "queued"].includes(status)
+    || Boolean(incidentKey)
+  );
+  const attemptsValue = Number(readValue("attempts", "retryCount", "retry_count") ?? 0);
+  const attempts = Number.isSafeInteger(attemptsValue) && attemptsValue >= 0 ? attemptsValue : 0;
+  return {
+    path: filePath,
+    present: true,
+    known: true,
+    raw: file.value,
+    status: sent ? "sent" : (pending ? "pending" : (status || "none")),
+    pending,
+    incidentKey: incidentKey || null,
+    text,
+    attempts,
+    lastAttemptAt: textValue(readValue("lastAttemptAt", "last_attempt_at")) || null,
+    sentAt: textValue(readValue("sentAt", "sent_at")) || null,
+    lastError: readValue("lastError", "last_error") ?? null,
+  };
+}
+
+function normalizeSentIncidentKeys(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key, sentAt]) => textValue(key) && textValue(sentAt))
+    .slice(-100));
 }
 
 function sanitizeText(value) {
@@ -220,6 +397,18 @@ export function parseArguments(argv) {
     "--broker-start-cooldown-ms",
     DEFAULT_BROKER_START_COOLDOWN_MS,
   );
+  const automationMaintenancePath = resolveOptionalPath(
+    values["automation-maintenance"]
+      ?? values["automation-maintenance-path"]
+      ?? values["maintenance-file"]
+      ?? values.maintenance,
+  );
+  const automationAlertPath = resolveOptionalPath(
+    values["automation-alert"]
+      ?? values["automation-alert-path"]
+      ?? values["alert-file"]
+      ?? values.alert,
+  );
 
   return {
     privateEnvPath: resolveOptionalPath(values["private-env"]),
@@ -235,6 +424,12 @@ export function parseArguments(argv) {
     loginTimeoutMs,
     loginCooldownMs,
     brokerStartCooldownMs,
+    automationMaintenancePath,
+    automationAlertPath,
+    maintenanceFilePath: automationMaintenancePath,
+    alertFilePath: automationAlertPath,
+    maintenancePath: automationMaintenancePath,
+    alertPath: automationAlertPath,
     brokerHealthUrl: String(values["broker-health-url"]).trim(),
     brokerStartScriptPath: resolveOptionalPath(values["broker-start-script"]),
     loginScriptPath: resolveOptionalPath(values["login-script"]),
@@ -586,6 +781,22 @@ export function createSupervisorDependencies(options = {}) {
     ?? (privateEnvPath ? readPrivateEnvironment(privateEnvPath) : {});
   const rootDir = path.resolve(options.rootDir ?? path.dirname(bindingPath));
   const statePath = path.resolve(options.statePath ?? path.join(rootDir, "state", "dedupe.json"));
+  const automationMaintenancePath = path.resolve(
+    options.automationMaintenancePath
+      ?? options.maintenancePath
+      ?? options["automation-maintenance"]
+      ?? options.maintenanceFilePath
+      ?? options["maintenance-file"]
+      ?? path.join(rootDir, "state", "task-router.maintenance.json"),
+  );
+  const automationAlertPath = path.resolve(
+    options.automationAlertPath
+      ?? options.alertPath
+      ?? options["automation-alert"]
+      ?? options.alertFilePath
+      ?? options["alert-file"]
+      ?? path.join(rootDir, "state", "automation-alert.json"),
+  );
   const taskRouterRuntimePath = path.resolve(options.taskRouterRuntimePath ?? path.join(rootDir, "state", "task-router-runtime.json"));
   const taskRouterLogPath = path.resolve(options.taskRouterLogPath ?? path.join(rootDir, "state", "task-router.jsonl"));
   const taskRouterStopPath = path.resolve(options.taskRouterStopPath ?? path.join(rootDir, "state", "task-router.stop"));
@@ -628,6 +839,10 @@ export function createSupervisorDependencies(options = {}) {
     environment,
     rootDir,
     statePath,
+    automationMaintenancePath,
+    automationAlertPath,
+    maintenanceFilePath: automationMaintenancePath,
+    alertFilePath: automationAlertPath,
     codexHome: options.codexHome ?? deriveCodexHome(privateEnvPath),
     brokerStartScriptPath: resolveOptionalPath(options.brokerStartScriptPath ?? options["broker-start-script"]),
     loginScriptPath: resolveOptionalPath(options.loginScriptPath ?? options["login-script"]),
@@ -718,6 +933,24 @@ export async function runSupervisorService(options = {}) {
   const bindingPath = resolveRequiredPath(options.bindingPath ?? options.binding, "bindingPath");
   const registryPath = resolveRequiredPath(options.registryPath ?? options.registry, "registryPath");
   const privateEnvPath = resolveOptionalPath(options.privateEnvPath ?? options["private-env"]);
+  const automationMaintenancePath = resolveOptionalPath(
+    options.automationMaintenancePath
+      ?? options.maintenancePath
+      ?? options["automation-maintenance"]
+      ?? options["automation-maintenance-path"]
+      ?? options.maintenanceFilePath
+      ?? options["maintenance-file"]
+      ?? options.maintenance,
+  ) ?? path.join(path.dirname(runtimeStatePath), "task-router.maintenance.json");
+  const automationAlertPath = resolveOptionalPath(
+    options.automationAlertPath
+      ?? options.alertPath
+      ?? options["automation-alert"]
+      ?? options["automation-alert-path"]
+      ?? options.alertFilePath
+      ?? options["alert-file"]
+      ?? options.alert,
+  ) ?? path.join(path.dirname(runtimeStatePath), "automation-alert.json");
   const brokerHealthUrl = String(options.brokerHealthUrl ?? options["broker-health-url"] ?? "").trim();
   const scanIntervalMs = normalizePositiveInteger(
     options.scanIntervalMs ?? options.intervalMs ?? options["interval-ms"],
@@ -739,6 +972,18 @@ export async function runSupervisorService(options = {}) {
     now: () => new Date(startedAt),
     isProcessAlive: options.isProcessAlive,
     processObject,
+    validateExistingLock: (metadata) => {
+      const lockStartedAt = Date.parse(metadata?.startedAt ?? "");
+      const currentMs = nowMs(clock);
+      if (Number.isFinite(lockStartedAt) && currentMs >= lockStartedAt && currentMs - lockStartedAt < 15_000) return true;
+      const runtime = readJsonObject(runtimeStatePath, fsImpl);
+      const updatedAt = Date.parse(runtime.updatedAt ?? runtime.lastCheckAt ?? runtime.startedAt ?? "");
+      return Number(runtime.pid) === Number(metadata?.pid)
+        && runtime.instanceToken === metadata?.token
+        && ["starting", "running"].includes(runtime.state)
+        && Number.isFinite(updatedAt)
+        && currentMs - updatedAt < Math.max(300_000, scanIntervalMs * 4);
+    },
   });
   if (!lock.acquired) {
     return {
@@ -777,9 +1022,14 @@ export async function runSupervisorService(options = {}) {
   const previousBrokerStart = previousRuntime.brokerStart && typeof previousRuntime.brokerStart === "object"
     ? previousRuntime.brokerStart
     : {};
+  const previousAlert = previousRuntime.alert && typeof previousRuntime.alert === "object"
+    ? previousRuntime.alert
+    : {};
+  const sentIncidentKeys = normalizeSentIncidentKeys(previousAlert.sentIncidentKeys);
   let status = {
     schemaVersion: 1,
     pid,
+    instanceToken: lock.metadata.token,
     startedAt,
     lastCheckAt: null,
     nextCheckAt: null,
@@ -799,6 +1049,29 @@ export async function runSupervisorService(options = {}) {
       nextAllowedAt: previousBrokerStart.nextAllowedAt ?? null,
       lastResult: previousBrokerStart.lastResult ?? null,
     },
+    maintenance: {
+      path: automationMaintenancePath,
+      present: false,
+      known: true,
+      active: false,
+      status: "inactive",
+      reason: null,
+      lastError: null,
+    },
+    alert: {
+      path: automationAlertPath,
+      present: false,
+      known: true,
+      status: "none",
+      pending: false,
+      incidentKey: null,
+      attempts: 0,
+      retryCount: 0,
+      lastAttemptAt: previousAlert.lastAttemptAt ?? null,
+      sentAt: previousAlert.sentAt ?? null,
+      lastError: previousAlert.lastError ?? null,
+      sentIncidentKeys,
+    },
     runtimeStatePath,
     stopFilePath,
     lockPath,
@@ -814,7 +1087,7 @@ export async function runSupervisorService(options = {}) {
   let brokerNextAllowedAt = previousBrokerStart.nextAllowedAt ?? null;
 
   const persist = (patch) => {
-    status = { ...status, ...patch };
+    status = { ...status, ...patch, updatedAt: nowIso(clock) };
     atomicWriteJson(runtimeStatePath, status, { fsImpl, pid, now: clock });
     return status;
   };
@@ -866,6 +1139,12 @@ export async function runSupervisorService(options = {}) {
         timeoutMs: probeTimeoutMs,
       })
       : null);
+
+  const writeAlertState = (raw, patch) => {
+    const next = { ...raw, ...patch };
+    atomicWriteJson(automationAlertPath, next, { fsImpl, pid, now: clock });
+    return next;
+  };
 
   let processSnapshotPromise = null;
   const getProcessSnapshot = async () => {
@@ -958,7 +1237,29 @@ export async function runSupervisorService(options = {}) {
       ));
       if (router.error) errors.push({ source: "router", error: router.error });
 
+      const maintenance = normalizeMaintenanceFile(automationMaintenancePath, fsImpl);
+      const alert = normalizeAlertFile(automationAlertPath, fsImpl);
+      let maintenanceSummary = maintenance;
+      let alertSummary = {
+        path: alert.path,
+        present: alert.present,
+        known: alert.known,
+        status: alert.status,
+        pending: alert.pending,
+        incidentKey: alert.incidentKey,
+        attempts: alert.attempts,
+        retryCount: alert.attempts,
+        lastAttemptAt: alert.lastAttemptAt,
+        sentAt: alert.sentAt,
+        lastError: alert.lastError,
+        sentIncidentKeys: { ...sentIncidentKeys },
+      };
       const actions = {};
+      actions.maintenance = {
+        active: maintenance.active,
+        reason: maintenance.reason,
+        reasons: maintenance.reasons,
+      };
       if (
         !broker.healthy
         && brokerProcess.known
@@ -1026,6 +1327,115 @@ export async function runSupervisorService(options = {}) {
         actions.quickLogin = { attempted: false, reason: "cooldown", noQr: true };
       }
 
+      if (alert.pending) {
+        const alreadySent = Boolean(alert.incidentKey && sentIncidentKeys[alert.incidentKey]);
+        if (!napcat.ready) {
+          actions.alert = {
+            attempted: false,
+            reason: "napcat_not_ready",
+            incidentKey: alert.incidentKey,
+          };
+        } else if (alreadySent) {
+          actions.alert = {
+            attempted: false,
+            reason: "incident_already_sent",
+            incidentKey: alert.incidentKey,
+          };
+        } else if (!alert.incidentKey || !alert.text) {
+          actions.alert = {
+            attempted: false,
+            reason: "invalid_alert",
+            incidentKey: alert.incidentKey,
+          };
+        } else {
+          const attempts = alert.attempts + 1;
+          try {
+            if (typeof dependencies.notifier?.sendTextMessage !== "function") {
+              const missingNotifier = new Error("NapCat notifier 未提供 sendTextMessage");
+              missingNotifier.code = "ALERT_NOTIFIER_MISSING";
+              throw missingNotifier;
+            }
+            const sendResult = await dependencies.notifier.sendTextMessage({
+              dedupe_key: alert.incidentKey,
+              text: alert.text,
+            });
+            if (sendResult?.sent !== true) {
+              const notSent = new Error(`告警发送未确认成功：${sendResult?.reason ?? "unknown"}`);
+              notSent.code = "ALERT_NOT_SENT";
+              throw notSent;
+            }
+            const sentAt = checkAt;
+            writeAlertState(alert.raw, {
+              status: "sent",
+              pending: false,
+              sent: true,
+              incidentKey: alert.incidentKey,
+              attempts,
+              retryCount: attempts,
+              lastAttemptAt: checkAt,
+              lastError: null,
+              sentAt,
+            });
+            sentIncidentKeys[alert.incidentKey] = sentAt;
+            const limitedSentIncidentKeys = normalizeSentIncidentKeys(sentIncidentKeys);
+            for (const key of Object.keys(sentIncidentKeys)) {
+              if (!(key in limitedSentIncidentKeys)) delete sentIncidentKeys[key];
+            }
+            alertSummary = {
+              ...alertSummary,
+              status: "sent",
+              pending: false,
+              attempts,
+              retryCount: attempts,
+              lastAttemptAt: checkAt,
+              sentAt,
+              lastError: null,
+              sentIncidentKeys: { ...sentIncidentKeys },
+            };
+            actions.alert = {
+              attempted: true,
+              succeeded: true,
+              incidentKey: alert.incidentKey,
+              attempts,
+            };
+          } catch (error) {
+            const errorValue = publicError(error, "ALERT_SEND_FAILED");
+            try {
+              writeAlertState(alert.raw, {
+                status: "pending",
+                pending: true,
+                sent: false,
+                incidentKey: alert.incidentKey,
+                attempts,
+                retryCount: attempts,
+                lastAttemptAt: checkAt,
+                lastError: errorValue,
+              });
+            } catch (stateError) {
+              errors.push({ source: "alert_state", error: publicError(stateError, "ALERT_STATE_WRITE_FAILED") });
+            }
+            alertSummary = {
+              ...alertSummary,
+              status: "pending",
+              pending: true,
+              attempts,
+              retryCount: attempts,
+              lastAttemptAt: checkAt,
+              lastError: errorValue,
+              sentIncidentKeys: { ...sentIncidentKeys },
+            };
+            actions.alert = {
+              attempted: true,
+              succeeded: false,
+              incidentKey: alert.incidentKey,
+              attempts,
+              error: errorValue,
+            };
+            errors.push({ source: "alert", error: errorValue });
+          }
+        }
+      }
+
       const gate = Boolean(
         broker.known
         && broker.healthy
@@ -1038,7 +1448,8 @@ export async function runSupervisorService(options = {}) {
         && codexProcess.known
         && codexProcess.present
         && tasksKnown
-        && openTaskCount > 0,
+        && openTaskCount > 0
+        && !maintenance.active,
       );
       let finalRouter = router;
       if (gate && router.known && !router.alive) {
@@ -1064,7 +1475,10 @@ export async function runSupervisorService(options = {}) {
           errors.push({ source: "task_router_start", error: value });
         }
       } else if (!gate) {
-        actions.taskRouter = { attempted: false, reason: "gate_closed" };
+        actions.taskRouter = {
+          attempted: false,
+          reason: maintenance.active ? "maintenance_active" : "gate_closed",
+        };
       } else {
         actions.taskRouter = { attempted: false, reason: "already_running" };
       }
@@ -1077,6 +1491,8 @@ export async function runSupervisorService(options = {}) {
         brokerProcess: summarizeCheck(brokerProcess),
         tasks: { known: tasksKnown, openTaskCount },
         router: summarizeCheck(finalRouter),
+        maintenance: maintenanceSummary,
+        alert: alertSummary,
         gate,
       };
       const cycleError = errors.length > 0
@@ -1099,6 +1515,8 @@ export async function runSupervisorService(options = {}) {
         checks: checkSummary,
         actions,
         openTaskCount,
+        maintenance: maintenanceSummary,
+        alert: alertSummary,
         lastError: cycleError,
       });
       appendLog(logPath, {
@@ -1109,6 +1527,8 @@ export async function runSupervisorService(options = {}) {
         openTaskCount,
         checks: checkSummary,
         actions,
+        maintenance: maintenanceSummary,
+        alert: alertSummary,
         error: cycleError ? { code: cycleError.code, message: cycleError.message } : null,
       }, fsImpl);
 

@@ -28,6 +28,8 @@ const PUBLIC_FIELDS = [
   "wakeSentAt",
   "wakeMessageSeq",
   "wakeMessageAt",
+  "activeWakeId",
+  "wakePromptSha256",
   "lastWakeAt",
   "createdAt",
   "updatedAt",
@@ -152,6 +154,8 @@ function normalizeStoredTask(task) {
   if (!hasOwn(task, "lastAckedAt")) task.lastAckedAt = null;
   if (!hasOwn(task, "wakeMessageSeq")) task.wakeMessageSeq = null;
   if (!hasOwn(task, "wakeMessageAt")) task.wakeMessageAt = null;
+  if (!hasOwn(task, "activeWakeId")) task.activeWakeId = null;
+  if (!hasOwn(task, "wakePromptSha256")) task.wakePromptSha256 = null;
   return task;
 }
 
@@ -198,6 +202,11 @@ function validateStoredTask(task, taskId, statePath) {
     invalidState(statePath, `唤醒消息标识无效（${taskId}.wakeMessageSeq）`);
   }
   if (task.wakeMessageAt !== null) storedDate(task.wakeMessageAt, `${taskId}.wakeMessageAt`, statePath);
+  for (const field of ["activeWakeId", "wakePromptSha256"]) {
+    if (task[field] !== null && (typeof task[field] !== "string" || !task[field].trim())) {
+      invalidState(statePath, `唤醒字段无效（${taskId}.${field}）`);
+    }
+  }
   if (
     !Number.isSafeInteger(task.wakeCooldownMs)
     || task.wakeCooldownMs < MINIMUM_WAKE_COOLDOWN_MS
@@ -422,17 +431,26 @@ class TaskRegistry {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = requiredString(input.taskId, "taskId");
     const conversationId = requiredString(input.conversationId, "conversationId");
+    const requestedRoute = {
+      conversationId,
+      localRole: optionalString(input.localRole, "localRole"),
+      sourceMachine: optionalString(input.sourceMachine, "sourceMachine"),
+      targetMachine: optionalString(input.targetMachine, "targetMachine"),
+      trustedPeerQq: optionalString(input.trustedPeerQq, "trustedPeerQq"),
+    };
     return this.#write((state) => {
       const existing = state.tasks[taskId];
       if (existing) {
-        if (existing.conversationId !== conversationId) {
+        const conflictingFields = ROUTING_FIELDS.filter((field) => existing[field] !== requestedRoute[field]);
+        if (conflictingFields.length) {
           throw new TaskRegistryError(
-            "TASK_CONVERSATION_CONFLICT",
-            `taskId 已绑定其他 conversationId：${taskId}`,
+            "TASK_ROUTE_CONFLICT",
+            `taskId 已登记不同的任务路由：${taskId}`,
             {
               taskId,
-              existingConversationId: existing.conversationId,
-              requestedConversationId: conversationId,
+              conflictingFields,
+              existing: Object.fromEntries(ROUTING_FIELDS.map((field) => [field, existing[field]])),
+              requested: requestedRoute,
             },
           );
         }
@@ -441,11 +459,7 @@ class TaskRegistry {
       const now = resolveNow(this.now, input).toISOString();
       const task = {
         taskId,
-        conversationId,
-        localRole: optionalString(input.localRole, "localRole"),
-        sourceMachine: optionalString(input.sourceMachine, "sourceMachine"),
-        targetMachine: optionalString(input.targetMachine, "targetMachine"),
-        trustedPeerQq: optionalString(input.trustedPeerQq, "trustedPeerQq"),
+        ...requestedRoute,
         generation: 1,
         status: "open",
         lastSeenSeq: 0,
@@ -457,6 +471,8 @@ class TaskRegistry {
         wakeSentAt: null,
         wakeMessageSeq: null,
         wakeMessageAt: null,
+        activeWakeId: null,
+        wakePromptSha256: null,
         lastWakeAt: null,
         createdAt: now,
         updatedAt: now,
@@ -506,6 +522,8 @@ class TaskRegistry {
         nextTask.wakeSentAt = null;
         nextTask.wakeMessageSeq = null;
         nextTask.wakeMessageAt = null;
+        nextTask.activeWakeId = null;
+        nextTask.wakePromptSha256 = null;
         nextTask.lastWakeAt = null;
       }
       state.tasks[taskId] = nextTask;
@@ -527,6 +545,8 @@ class TaskRegistry {
         wakeSentAt: null,
         wakeMessageSeq: null,
         wakeMessageAt: null,
+        activeWakeId: null,
+        wakePromptSha256: null,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -634,6 +654,60 @@ class TaskRegistry {
     });
   }
 
+  acknowledgeWake(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const taskId = parseTaskId(input);
+    const sequence = parseSequence(input, "seq", ["seq", "lastAckedSeq", "sequence"]);
+    const wakeId = optionalString(input.wakeId, "wakeId");
+    return this.#write((state) => {
+      const task = this.#requireTask(state, taskId);
+      requireGenerationMatch(task, input);
+      if (task.status === "closed") {
+        throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
+      }
+      if (
+        !task.wakePending
+        && task.wakeMessageSeq === null
+        && sequence === task.lastAckedSeq
+      ) {
+        return { changed: false, value: clonePublicTask(task) };
+      }
+      if (
+        !task.wakePending
+        || task.wakeMessageSeq === null
+        || task.wakeMessageAt === null
+        || sequence !== task.wakeMessageSeq
+      ) {
+        throw new TaskRegistryError(
+          "ACK_NOT_ACTIVE_WAKE",
+          `ACK 必须使用最近一次唤醒给出的 pending_through_message_seq：${taskId}`,
+          { taskId, wakeMessageSeq: task.wakeMessageSeq, requestedSeq: sequence },
+        );
+      }
+      if (task.activeWakeId !== null && wakeId !== task.activeWakeId) {
+        throw new TaskRegistryError(
+          "ACK_WAKE_ID_MISMATCH",
+          `ACK 必须使用最近一次唤醒给出的 wake_id：${taskId}`,
+          { taskId, expectedWakeId: task.activeWakeId, requestedWakeId: wakeId },
+        );
+      }
+      const nextTask = {
+        ...task,
+        lastAckedSeq: sequence,
+        lastAckedAt: task.wakeMessageAt,
+        wakePending: false,
+        wakeSentAt: null,
+        wakeMessageSeq: null,
+        wakeMessageAt: null,
+        activeWakeId: null,
+        wakePromptSha256: null,
+        updatedAt: resolveNow(this.now, input).toISOString(),
+      };
+      state.tasks[taskId] = nextTask;
+      return { changed: true, value: clonePublicTask(nextTask) };
+    });
+  }
+
   acquireWakeLease(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
@@ -648,6 +722,11 @@ class TaskRegistry {
       : toDate(requestedMessageAtValue, "at").toISOString();
     if ((requestedMessageSequence === null) !== (requestedMessageAt === null)) {
       invalidArgument("唤醒消息的 seq 和 at 必须同时提供");
+    }
+    const requestedWakeId = optionalString(input.wakeId, "wakeId");
+    const requestedPromptSha256 = optionalString(input.promptSha256, "promptSha256");
+    if ((requestedWakeId === null) !== (requestedPromptSha256 === null)) {
+      invalidArgument("wakeId 和 promptSha256 必须同时提供");
     }
     const leaseMs = optionNumber(
       input.leaseMs ?? input.wakeLeaseMs,
@@ -669,6 +748,23 @@ class TaskRegistry {
       const leaseExpiresAt = sentAtMs === null
         ? null
         : new Date(sentAtMs + leaseMs).toISOString();
+      if (task.wakePending && task.activeWakeId !== null) {
+        if (requestedWakeId !== task.activeWakeId || requestedPromptSha256 !== task.wakePromptSha256) {
+          return {
+            changed: false,
+            value: wakeLeaseResult(task, false, "wake_unresolved", leaseExpiresAt),
+          };
+        }
+        if (
+          requestedMessageSequence !== task.wakeMessageSeq
+          || requestedMessageAt !== task.wakeMessageAt
+        ) {
+          return {
+            changed: false,
+            value: wakeLeaseResult(task, false, "wake_boundary_conflict", leaseExpiresAt),
+          };
+        }
+      }
       if (task.wakePending && sentAtMs !== null && now.getTime() < sentAtMs + leaseMs) {
         return {
           changed: false,
@@ -691,6 +787,8 @@ class TaskRegistry {
         wakeSentAt: now.toISOString(),
         wakeMessageSeq: requestedMessageSequence ?? (task.lastSeenAt === null ? null : task.lastSeenSeq),
         wakeMessageAt: requestedMessageAt ?? task.lastSeenAt,
+        activeWakeId: requestedWakeId,
+        wakePromptSha256: requestedPromptSha256,
         updatedAt: now.toISOString(),
       };
       state.tasks[taskId] = nextTask;
@@ -708,6 +806,7 @@ class TaskRegistry {
       input.expectedWakeSentAt ?? input.wakeSentAt,
       "expectedWakeSentAt",
     );
+    const expectedWakeId = optionalString(input.expectedWakeId ?? input.wakeId, "expectedWakeId");
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
@@ -716,6 +815,13 @@ class TaskRegistry {
           "WAKE_LEASE_MISMATCH",
           `唤醒租约已变化：${taskId}`,
           { taskId, expectedWakeSentAt, actualWakeSentAt: task.wakeSentAt },
+        );
+      }
+      if (expectedWakeId !== null && task.activeWakeId !== expectedWakeId) {
+        throw new TaskRegistryError(
+          "WAKE_LEASE_MISMATCH",
+          `唤醒租约 wakeId 已变化：${taskId}`,
+          { taskId, expectedWakeId, actualWakeId: task.activeWakeId },
         );
       }
       if (task.lastWakeAt === task.wakeSentAt) {
@@ -735,6 +841,7 @@ class TaskRegistry {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
     const expectedWakeSentAt = input.expectedWakeSentAt ?? input.wakeSentAt;
+    const expectedWakeId = input.expectedWakeId ?? input.wakeId;
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
@@ -743,6 +850,13 @@ class TaskRegistry {
           "WAKE_LEASE_MISMATCH",
           `唤醒租约已变化：${taskId}`,
           { taskId, expectedWakeSentAt, actualWakeSentAt: task.wakeSentAt },
+        );
+      }
+      if (expectedWakeId !== undefined && expectedWakeId !== task.activeWakeId) {
+        throw new TaskRegistryError(
+          "WAKE_LEASE_MISMATCH",
+          `唤醒租约 wakeId 已变化：${taskId}`,
+          { taskId, expectedWakeId, actualWakeId: task.activeWakeId },
         );
       }
       if (
@@ -759,6 +873,8 @@ class TaskRegistry {
         wakeSentAt: null,
         wakeMessageSeq: null,
         wakeMessageAt: null,
+        activeWakeId: null,
+        wakePromptSha256: null,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;

@@ -304,3 +304,26 @@ test("锁释放只删除自己持有的锁", () => {
     fixture.cleanup();
   }
 });
+
+test("PID 存活但实例身份校验失败时回收陈旧锁", () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.dirname(fixture.lockPath), { recursive: true });
+    fs.writeFileSync(fixture.lockPath, JSON.stringify({
+      pid: 9001,
+      startedAt: "2026-07-24T07:00:00.000Z",
+      token: "stale-token",
+    }), "utf8");
+    const lock = acquireInstanceLock(fixture.lockPath, {
+      pid: 7,
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      isProcessAlive: () => true,
+      validateExistingLock: () => false,
+    });
+    assert.equal(lock.acquired, true);
+    assert.equal(JSON.parse(fs.readFileSync(fixture.lockPath, "utf8")).pid, 7);
+    lock.release();
+  } finally {
+    fixture.cleanup();
+  }
+});

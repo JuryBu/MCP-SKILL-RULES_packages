@@ -1,13 +1,15 @@
 [CmdletBinding()]
 param(
   [ValidateRange(10, 300)][int]$IntervalSeconds = 30,
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
 )
 
 $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $StartScript = Join-Path $PSScriptRoot "start-napcat-supervisor.ps1"
+$ProxyStartScript = Join-Path $PSScriptRoot "start-codex-app-server-proxy.ps1"
+$ProxyFallbackPath = Join-Path $DataRoot "state\codex-app-server-proxy-fallback.json"
 $WatchdogStatePath = Join-Path $DataRoot "supervisor-watchdog.json"
 $WatchdogLogPath = Join-Path $DataRoot "supervisor-watchdog.jsonl"
 $NormalizedDataRoot = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\').ToLowerInvariant()
@@ -39,11 +41,38 @@ function Write-WatchdogRecord {
   [System.IO.File]::WriteAllText($WatchdogStatePath, (($Record | ConvertTo-Json -Depth 5) + "`n"), $Utf8NoBom)
 }
 
+function Apply-ProxyFallbackRequest {
+  if (-not (Test-Path -LiteralPath $ProxyFallbackPath)) { return }
+  try {
+    $Fallback = Get-Content -LiteralPath $ProxyFallbackPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($Fallback.pending -ne $true) { return }
+    $CurrentValue = [Environment]::GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", "User")
+    $ExpectedValue = [string]$Fallback.expectedProxyUrl
+    $Cleared = $false
+    if (-not [string]::IsNullOrWhiteSpace($ExpectedValue) -and $CurrentValue -eq $ExpectedValue) {
+      [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $null, "User")
+      $Cleared = $true
+    }
+    $Fallback.pending = $false
+    $Fallback.handledAt = (Get-Date).ToString("o")
+    $Fallback.previousUserValue = $CurrentValue
+    $Fallback.userValueCleared = $Cleared
+    [System.IO.File]::WriteAllText($ProxyFallbackPath, (($Fallback | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
+    $FallbackMessage = if ($Cleared) { "Cleared CODEX_APP_SERVER_WS_URL for the next Codex launch." } else { "Fallback request recorded; user environment already differed." }
+    Write-WatchdogRecord -Status "fallback" -Message $FallbackMessage
+  } catch {
+    Write-WatchdogRecord -Status "fallback_error" -Message $_.Exception.Message
+  }
+}
+
 try {
   $OwnsMutex = $Mutex.WaitOne(0)
   if (-not $OwnsMutex) { exit 0 }
   if (-not (Test-Path -LiteralPath $StartScript)) {
     throw "NapCat supervisor start script is missing: $StartScript"
+  }
+  if (-not (Test-Path -LiteralPath $ProxyStartScript)) {
+    throw "Codex App Server proxy start script is missing: $ProxyStartScript"
   }
   if (-not (Test-Path -LiteralPath $NapCatMcpRoot)) {
     throw "NapCat MCP root is missing: $NapCatMcpRoot"
@@ -52,6 +81,8 @@ try {
   New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
   while ($true) {
     try {
+      & $ProxyStartScript -DataRoot $DataRoot | Out-Null
+      Apply-ProxyFallbackRequest
       $StartArguments = @{ DataRoot = $DataRoot }
       if (-not [string]::IsNullOrWhiteSpace($BrokerRoot)) {
         $StartArguments.BrokerRoot = $BrokerRoot

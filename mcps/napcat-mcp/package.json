@@ -1,11 +1,14 @@
 {
   "name": "codex-napcat-training-notifier",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs && node --check src/task-registry.mjs && node --check src/task-router.mjs && node --check src/task-router-controller.mjs && node --check src/task-router-runner.mjs && node --check src/codex-thread-bridge.mjs && node --check src/supervisor-runner.mjs",
+    "check": "node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs && node --check src/task-registry.mjs && node --check src/task-router.mjs && node --check src/task-router-controller.mjs && node --check src/task-router-runner.mjs && node --check src/codex-thread-bridge.mjs && node --check src/codex-app-server-proxy.mjs && node --check src/codex-app-server-proxy-runner.mjs && node --check src/supervisor-runner.mjs",
     "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
   },
   "engines": {
     "node": ">=18"

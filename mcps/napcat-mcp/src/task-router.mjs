@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 function messageSequence(message) {
   const sequence = Number(message?.messageSeq ?? message?.messageId ?? -1);
   return Number.isSafeInteger(sequence) && sequence >= 0 ? sequence : null;
@@ -18,19 +20,33 @@ function eligibleMessage(task, message) {
   if (!message || message.isSelf) return false;
   if (String(message.taskId ?? "") !== task.taskId) return false;
   if (String(message.senderId ?? "") !== task.trustedPeerQq) return false;
-  if (message.targetMachine && task.localRole && message.targetMachine !== task.localRole) return false;
+  if (task.localRole && message.targetMachine !== task.localRole) return false;
   const peerMachine = expectedPeerMachine(task);
-  if (message.sourceMachine && peerMachine && message.sourceMachine !== peerMachine) return false;
+  if (peerMachine && message.sourceMachine !== peerMachine) return false;
   return messageSequence(message) !== null && messageTimestamp(message) !== null;
 }
 
-function buildWakePrompt(task, pendingThroughSequence) {
+export function buildWakeId(task, pendingThroughSequence, pendingThroughTime) {
+  return crypto.createHash("sha256").update([
+    "wake:v1",
+    task.taskId,
+    String(task.generation),
+    task.conversationId,
+    String(task.lastAckedSeq),
+    String(task.lastAckedAt ?? ""),
+    String(pendingThroughSequence),
+    String(pendingThroughTime),
+  ].join("\0"), "utf8").digest("hex");
+}
+
+function buildWakePrompt(task, pendingThroughSequence, wakeId) {
   return [
     "[NAPCAT_TASK_WAKE]",
     `task_id=${task.taskId}`,
     `generation=${task.generation}`,
     `pending_through_message_seq=${pendingThroughSequence}`,
-    "ExampleGroup 固定群有尚未确认的新消息。请调用 napcat_read_recent 按 task_id 读取并处理；完成后调用 napcat_task_ack，使用本提示中的 generation 和 pending_through_message_seq 原值。message_seq 是不保证数字递增的消息标识，不能自行取最大值。",
+    `wake_id=${wakeId}`,
+    "ExampleGroup 固定群有尚未确认的新消息。请调用 napcat_read_recent 按 task_id 读取并处理；完成后调用 napcat_task_ack，使用本提示中的 generation、pending_through_message_seq 和 wake_id 原值。message_seq 是不保证数字递增的消息标识，不能自行取最大值。",
   ].join("\n");
 }
 
@@ -49,6 +65,9 @@ export function createTaskRouter(options = {}) {
   if (!registry || !notifier || !bridge) throw new Error("task router 需要 registry、notifier 和 bridge");
   const historyCount = Math.max(1, Math.min(50, Number(options.historyCount ?? 50)));
   const wakeLeaseMs = Math.max(1000, Number(options.wakeLeaseMs ?? 300000));
+  const isMaintenanceActive = typeof options.isMaintenanceActive === "function"
+    ? options.isMaintenanceActive
+    : () => false;
 
   async function scanTask(task, sharedHistory = null) {
     try {
@@ -76,44 +95,88 @@ export function createTaskRouter(options = {}) {
         seq: pendingThroughSequence,
         at: pendingThroughMessage.time,
       });
+      const continuingWake = task.wakePending
+        && task.activeWakeId
+        && task.wakeMessageSeq !== null
+        && task.wakeMessageAt !== null;
+      const wakeBoundarySequence = continuingWake ? task.wakeMessageSeq : pendingThroughSequence;
+      const wakeBoundaryTime = continuingWake ? task.wakeMessageAt : pendingThroughMessage.time;
+      const wakeId = continuingWake
+        ? task.activeWakeId
+        : buildWakeId(seenTask, wakeBoundarySequence, wakeBoundaryTime);
+      const prompt = buildWakePrompt(seenTask, wakeBoundarySequence, wakeId);
+      const promptHash = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
       const lease = registry.acquireWakeLease({
         taskId: task.taskId,
         expectedGeneration: task.generation,
         leaseMs: wakeLeaseMs,
-        seq: pendingThroughSequence,
-        at: pendingThroughMessage.time,
+        seq: wakeBoundarySequence,
+        at: wakeBoundaryTime,
+        wakeId,
+        promptSha256: promptHash,
       });
       if (!lease.acquired) {
         return {
           taskId: task.taskId,
           outcome: lease.reason,
           pendingCount: pending.length,
-          pendingThroughSequence,
+          pendingThroughSequence: wakeBoundarySequence,
+          wakeId,
         };
       }
-      const prompt = buildWakePrompt(seenTask, pendingThroughSequence);
+      if (await isMaintenanceActive()) {
+        registry.releaseWakeLease({
+          taskId: task.taskId,
+          expectedGeneration: task.generation,
+          expectedWakeSentAt: lease.wakeSentAt,
+          expectedWakeId: wakeId,
+        });
+        return {
+          taskId: task.taskId,
+          outcome: "automation_paused",
+          pendingCount: pending.length,
+          pendingThroughSequence: wakeBoundarySequence,
+          wakeId,
+        };
+      }
       let wake;
       try {
-        wake = await bridge.wake({ threadId: seenTask.conversationId, prompt });
+        wake = await bridge.wake({
+          threadId: seenTask.conversationId,
+          prompt,
+          wakeId,
+          taskId: seenTask.taskId,
+          generation: seenTask.generation,
+          localRole: seenTask.localRole,
+          sourceMachine: seenTask.sourceMachine,
+          targetMachine: seenTask.targetMachine,
+          trustedPeerQq: seenTask.trustedPeerQq,
+          pendingThroughSequence: wakeBoundarySequence,
+          pendingThroughTime: wakeBoundaryTime,
+          promptSha256: promptHash,
+        });
       } catch (error) {
         registry.releaseWakeLease({
           taskId: task.taskId,
           expectedGeneration: task.generation,
           expectedWakeSentAt: lease.wakeSentAt,
+          expectedWakeId: wakeId,
         });
-        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingThroughSequence };
+        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingThroughSequence: wakeBoundarySequence, wakeId };
       }
       if (wake.outcome === "accepted" || wake.outcome === "completed") {
         registry.confirmWakeSent({
           taskId: task.taskId,
           expectedGeneration: task.generation,
           expectedWakeSentAt: lease.wakeSentAt,
+          expectedWakeId: wakeId,
         });
         return {
           taskId: task.taskId,
           outcome: wake.outcome,
           pendingCount: pending.length,
-          pendingThroughSequence,
+          pendingThroughSequence: wakeBoundarySequence,
+          wakeId,
           turnId: wake.turn?.id ?? wake.turn?.turnId ?? null,
         };
       }
@@ -122,12 +185,14 @@ export function createTaskRouter(options = {}) {
           taskId: task.taskId,
           expectedGeneration: task.generation,
           expectedWakeSentAt: lease.wakeSentAt,
+          expectedWakeId: wakeId,
         });
         return {
           taskId: task.taskId,
           outcome: "wake_unknown",
           pendingCount: pending.length,
-          pendingThroughSequence,
+          pendingThroughSequence: wakeBoundarySequence,
+          wakeId,
           error: wake.error,
         };
       }
@@ -135,12 +200,14 @@ export function createTaskRouter(options = {}) {
         taskId: task.taskId,
         expectedGeneration: task.generation,
         expectedWakeSentAt: lease.wakeSentAt,
+        expectedWakeId: wakeId,
       });
       return {
         taskId: task.taskId,
         outcome: wake.outcome === "busy" ? "thread_busy" : "thread_unavailable",
         pendingCount: pending.length,
-        pendingThroughSequence,
+        pendingThroughSequence: wakeBoundarySequence,
+        wakeId,
         threadStatus: wake.status,
       };
     } catch (error) {

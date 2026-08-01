@@ -3,8 +3,8 @@
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
-  [string]$BrokerRoot = (if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$BrokerRoot = $(if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Split-Path -Parent (Split-Path -Parent $PSScriptRoot) }),
   [string]$TaskName = "CodexNapCatSupervisor",
   [switch]$StartNow
 )
@@ -26,6 +26,7 @@ $BackupDir = Join-Path $DataRoot ("backups\napcat-supervisor-" + $Stamp)
 $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $TaskExisted = $null -ne $ExistingTask
 $ExistingTaskXml = $null
+$BackupDirValue = $null
 
 function Stop-TaskInstance {
   param([string]$Name)
@@ -59,6 +60,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     New-Item -ItemType Directory -Force -Path $BackupDir | Out-Null
     Copy-Item -LiteralPath $StatePath -Destination (Join-Path $BackupDir "napcat-supervisor-autostart.json") -Force
   }
+  if (Test-Path -LiteralPath $BackupDir) { $BackupDirValue = $BackupDir }
   if ($TaskExisted) { Stop-TaskInstance -Name $TaskName }
   Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
   $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
@@ -73,7 +75,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     brokerRoot = $BrokerRoot
     previousTaskExisted = $TaskExisted
     previousTaskXml = $ExistingTaskXml
-    backupDir = if (Test-Path -LiteralPath $BackupDir) { $BackupDir } else { $null }
+    backupDir = $BackupDirValue
   }
   [System.IO.File]::WriteAllText($StatePath, (($InstallState | ConvertTo-Json -Depth 8) + "`n"), $Utf8NoBom)
   if ($StartNow) { Start-ScheduledTask -TaskName $TaskName }
@@ -86,6 +88,6 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
   startScript = $WatchdogScript
   startNow = [bool]$StartNow
   previousTaskExisted = $TaskExisted
-  backupDir = if (Test-Path -LiteralPath $BackupDir) { $BackupDir } else { $null }
+  backupDir = $BackupDirValue
   rollbackScript = Join-Path $NapCatMcpRoot "ops\remove-napcat-autostart.ps1"
 } | ConvertTo-Json -Depth 8

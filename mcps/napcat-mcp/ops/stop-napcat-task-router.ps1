@@ -1,7 +1,7 @@
 ﻿[CmdletBinding()]
 param(
   [ValidateRange(1, 120)][int]$WaitSeconds = 15,
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,10 +30,12 @@ do {
   Start-Sleep -Milliseconds 250
 } while ([DateTime]::UtcNow -lt $Deadline)
 
+$OutputPid = if ($PidValue -gt 0) { $PidValue } else { $null }
+$OutputNote = if ($Alive) { "Router is still shutting down; no force kill was used" } else { "Task router stopped" }
 [pscustomobject]@{
   stopRequested = $true
   stopped = (-not $Alive)
-  pid = if ($PidValue -gt 0) { $PidValue } else { $null }
+  pid = $OutputPid
   stopFilePath = $StopFilePath
-  note = if ($Alive) { "进程仍在收尾；未强制终止，请稍后再查状态" } else { "任务路由已停止" }
+  note = $OutputNote
 } | ConvertTo-Json -Depth 6

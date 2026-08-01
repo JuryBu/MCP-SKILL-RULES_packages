@@ -207,6 +207,7 @@ const taskAckInputSchema = {
     task_id: { type: "string", minLength: 1, maxLength: 128 },
     expected_generation: { type: "integer", minimum: 1 },
     message_seq: { type: "integer", minimum: 0, maximum: 9007199254740991 },
+    wake_id: { type: "string", minLength: 1, maxLength: 256, description: "最近一次 [NAPCAT_TASK_WAKE] 提示中的 wake_id；新协议唤醒必须原样回传。" },
   },
   required: ["task_id", "expected_generation", "message_seq"],
   additionalProperties: false,
@@ -288,7 +289,7 @@ const tools = [
   },
   {
     name: "napcat_task_ack",
-    description: "目标对话处理完消息后确认最近一次唤醒给出的 pending_through_message_seq 原值；message_seq 是不保证数字递增的消息标识，不能自行取最大值，也不能由旧 generation 提交。",
+    description: "目标对话处理完消息后原子确认并释放最近一次唤醒；使用提示中的 generation、pending_through_message_seq 与 wake_id 原值。message_seq 不保证数字递增，不能自行取最大值。",
     inputSchema: taskAckInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -440,16 +441,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({ ok: true, router: taskRouterController.status() });
     }
     if (name === "napcat_task_ack") {
-      const task = taskRegistry.ack({
+      const task = taskRegistry.acknowledgeWake({
         taskId: args.task_id,
         expectedGeneration: args.expected_generation,
         seq: args.message_seq,
+        wakeId: args.wake_id,
       });
-      const releasedTask = taskRegistry.releaseWakeLease({
-        taskId: args.task_id,
-        expectedGeneration: args.expected_generation,
-      });
-      return textResult({ ok: true, task: releasedTask });
+      return textResult({ ok: true, task });
     }
     if (name === "napcat_preview_training_event") {
       return textResult({ ok: true, ...notifier.previewTrainingEvent(args) });

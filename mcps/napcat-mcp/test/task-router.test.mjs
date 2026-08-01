@@ -19,6 +19,10 @@ function task(overrides = {}) {
     wakeCooldownMs: 600_000,
     wakePending: false,
     wakeSentAt: null,
+    wakeMessageSeq: null,
+    wakeMessageAt: null,
+    activeWakeId: null,
+    wakePromptSha256: null,
     lastWakeAt: null,
     ...overrides,
   };
@@ -55,7 +59,15 @@ function fixture(options = {}) {
       if (options.leaseBlocked) {
         return { ...currentTask, acquired: false, reason: options.leaseReason ?? "lease_active" };
       }
-      currentTask = { ...currentTask, wakePending: true, wakeSentAt: "2026-07-24T08:00:00.000Z" };
+      currentTask = {
+        ...currentTask,
+        wakePending: true,
+        wakeSentAt: "2026-07-24T08:00:00.000Z",
+        wakeMessageSeq: input.seq,
+        wakeMessageAt: input.at,
+        activeWakeId: input.wakeId,
+        wakePromptSha256: input.promptSha256,
+      };
       return { ...currentTask, acquired: true, reason: "acquired" };
     },
     confirmWakeSent: (input) => {
@@ -82,7 +94,14 @@ function fixture(options = {}) {
       return options.wakeResult ?? { outcome: "accepted", status: "busy", started: true, turn: { id: "turn-1" } };
     },
   };
-  return { registry, notifier, bridge, calls, getTask: () => currentTask };
+  return {
+    registry,
+    notifier,
+    bridge,
+    calls,
+    getTask: () => currentTask,
+    isMaintenanceActive: async () => Boolean(options.maintenanceActive),
+  };
 }
 
 test("multiple eligible messages coalesce into one wake", async () => {
@@ -92,19 +111,48 @@ test("multiple eligible messages coalesce into one wake", async () => {
   assert.equal(result.wakeCount, 1);
   assert.equal(result.results[0].pendingThroughSequence, 12);
   assert.equal(current.calls.filter((call) => call.type === "wake").length, 1);
-  assert.deepEqual(
-    current.calls.find((call) => call.type === "acquireWakeLease").input,
-    {
-      taskId: "语音处理",
-      expectedGeneration: 1,
-      leaseMs: 300_000,
-      seq: 12,
-      at: message(12).time,
-    },
-  );
+  const leaseInput = current.calls.find((call) => call.type === "acquireWakeLease").input;
+  assert.equal(leaseInput.taskId, "语音处理");
+  assert.equal(leaseInput.expectedGeneration, 1);
+  assert.equal(leaseInput.leaseMs, 300_000);
+  assert.equal(leaseInput.seq, 12);
+  assert.equal(leaseInput.at, message(12).time);
+  assert.match(leaseInput.wakeId, /^[a-f0-9]{64}$/);
+  assert.match(leaseInput.promptSha256, /^[a-f0-9]{64}$/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /task_id=语音处理/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /pending_through_message_seq=12/);
+  assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /wake_id=/);
   assert.equal(current.getTask().wakePending, true);
+});
+
+test("new messages stay queued behind an unresolved active wake", async () => {
+  const originalTime = message(10).time;
+  const current = fixture({
+    task: {
+      wakePending: true,
+      wakeSentAt: "2026-07-24T08:00:00.000Z",
+      wakeMessageSeq: 10,
+      wakeMessageAt: originalTime,
+      activeWakeId: "wake-existing",
+      wakePromptSha256: "b".repeat(64),
+    },
+    messages: [message(10), message(11)],
+  });
+  await createTaskRouter(current).scanOnce();
+  const leaseInput = current.calls.find((call) => call.type === "acquireWakeLease").input;
+  assert.equal(leaseInput.seq, 10);
+  assert.equal(leaseInput.at, originalTime);
+  assert.equal(leaseInput.wakeId, "wake-existing");
+  assert.equal(current.calls.find((call) => call.type === "markSeen").input.seq, 11);
+});
+
+test("maintenance recheck after lease acquisition prevents the final wake write", async () => {
+  const current = fixture({ maintenanceActive: true, messages: [message(10)] });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "automation_paused");
+  assert.equal(current.calls.some((call) => call.type === "wake"), false);
+  const released = current.calls.find((call) => call.type === "releaseWakeLease").input;
+  assert.match(released.expectedWakeId, /^[a-f0-9]{64}$/);
 });
 
 test("self, untrusted, wrong-task, and wrong-machine messages never wake", async () => {

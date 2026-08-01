@@ -63,7 +63,39 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
 
-成功提交唤醒后默认保留 5 分钟处理租约，并应用每任务默认 10 分钟成功唤醒冷却。`napcat_task_ack` 只确认当前对话实际处理到的最大 `message_seq` 并释放租约，不绕过成功冷却；`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务结束必须调用 `napcat_task_close`。
+成功提交唤醒后默认保留 5 分钟处理租约，并应用每任务默认 10 分钟成功唤醒冷却。每次唤醒都有确定的 `wake_id` 和固定消息边界；`napcat_task_ack` 必须同时回传该 `wake_id`、当前 generation 与实际处理到的 `pending_through_message_seq`。ACK、租约释放和游标推进在同一次账本写入中完成，后续新消息只进入下一批，不能改写已经送达的确认令牌。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务结束必须调用 `napcat_task_close`。
+
+## Codex App Server 透明中转
+
+原生蓝点和侧边栏未读状态只会出现在 Codex Desktop 自己持有的 App Server 连接上。直接启动另一份 App Server 虽然能把文字写进对话存储，却不能通知当前 Desktop 刷新。可选透明中转使用下面的连接方式，把 Desktop 的原始流量双向转发给官方 App Server，同时允许 NapCat 在同一条已初始化连接上先恢复已登记任务，再提交一条带 `wake_id` 的唤醒消息：
+
+```text
+Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官方 App Server
+NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
+```
+
+控制端口只监听回环地址并要求随机 Bearer token。任务订阅同时绑定 `task_id`、generation、conversation ID、本机角色、来源/目标机器和可信 QQ；同一个 `wake_id` 在任何并发、超时或重启情况下最多提交一次。若 App Server 在正常会话中退出，透明中转保留 Desktop WebSocket，暂停自动唤醒，按退避重启官方进程，并在恢复后使用缓存的初始化参数重建上游连接。已经写出但没有得到确定结果的 `turn/start` 记为 `unknown`，不会自动补发。proxy、supervisor 和 task router 的单实例恢复同时核对 PID、runner 路径、runtime/lock 路径、随机实例 token 与状态新鲜度，不能只因某个 PID 仍存在就认定旧实例健康。
+
+协议探针、唤醒日志、控制 token、运行状态和 fallback 请求都保存在私有 data root。唤醒日志损坏、协议不兼容、代理连续恢复失败或维护状态不可读时，系统采取两层降级：当前自动唤醒立即暂停；监督器在固定群发送一条去重告警并保留本地 incident 状态。看门狗随后清除用户级 `CODEX_APP_SERVER_WS_URL`，让下一次普通 Codex 启动回到官方原生路径。这个设计保证代理故障不会持续阻止 Codex 打开，但无法承诺未来任意 Codex 版本永不改变内部协议；不兼容时必须以「暂停自动化、保留任务、恢复原生启动」结束，不能猜协议继续写入。
+
+## 安全更新与回滚
+
+公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。
+
+```powershell
+# 在仓库根目录执行；首次迁移计划任务时加 -MigrateAutostart
+./mcps/napcat-mcp/ops/update-codex-napcat-bridge.ps1 `
+  -SourceCommit "<git-commit>" -MigrateAutostart
+
+# 检查代理、监督器和任务路由
+./mcps/napcat-mcp/ops/get-codex-app-server-proxy-status.ps1
+./mcps/napcat-mcp/ops/get-napcat-supervisor-status.ps1
+./mcps/napcat-mcp/ops/get-napcat-task-router-status.ps1
+```
+
+更新器先备份代码、任务账本、维护状态和 broker 私有环境，再写入维护暂停，等待所有 `wakePending/activeWakeId` 清空，随后在候选目录执行 `npm ci`、语法检查和完整测试。候选通过后才替换公开代码，停止并恢复 router/supervisor/proxy，最后只重载 broker 的 NapCat backend；broker PID 和其他 MCP 前端 session 保持不变。更新前后会比较每个任务的对话绑定、角色、可信对端、generation、open/closed 状态、last seen/ACK、冷却、租约和 active wake，任何意外变化都会停止完成流程并留下告警。
+
+首次启用透明中转后需要彻底退出并正常打开 Codex 一次，让 Desktop 继承新的 `CODEX_APP_SERVER_WS_URL`。以后仍按原方式启动 Codex。更新失败时不要手工删除 task；运行 `rollback-codex-napcat-bridge.ps1` 恢复上一个代码备份，或者保留维护状态等待排查。若上一个代理也无法恢复，更新器会清除用户级代理 URL、写入 fallback 请求，并让下一次 Codex 启动走官方原生路径；回滚同样只重载 NapCat backend，不重启整个 broker。
 
 ## 心跳进程
 

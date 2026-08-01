@@ -274,4 +274,48 @@ if (fakeArgumentIndex >= 0) {
     );
   });
 
+  test("transparent proxy bridge registers the full task subscription before wake", async () => {
+    const calls = [];
+    const bridge = createCodexThreadBridge({
+      mode: "transparent_proxy",
+      controlUrl: "http://127.0.0.1:18431",
+      controlToken: "proxy-test-token",
+      fetchImpl: async (url, options) => {
+        const route = new URL(url).pathname;
+        const body = JSON.parse(options.body);
+        calls.push({ route, body });
+        return new Response(JSON.stringify(route === "/v1/wakes"
+          ? { ok: true, outcome: "accepted", started: true, turn: { id: "turn-proxy" } }
+          : { ok: true, created: true }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    try {
+      const result = await bridge.wake({
+        taskId: "task-proxy",
+        generation: 3,
+        threadId: "thread-proxy",
+        localRole: "development",
+        sourceMachine: "training",
+        targetMachine: "development",
+        trustedPeerQq: "1000000001",
+        wakeId: "wake-proxy",
+        pendingThroughSequence: 99,
+        pendingThroughTime: "2026-08-02T00:00:00.000Z",
+        promptSha256: "c".repeat(64),
+        prompt: "wake prompt",
+      });
+      assert.equal(result.outcome, "accepted");
+      assert.deepEqual(calls.map((call) => call.route), ["/v1/subscriptions", "/v1/wakes"]);
+      assert.equal(calls[0].body.taskId, "task-proxy");
+      assert.equal(calls[0].body.generation, 3);
+      assert.equal(calls[1].body.pendingThroughSequence, 99);
+      assert.equal(calls[1].body.wakeId, "wake-proxy");
+    } finally {
+      await bridge.close();
+    }
+  });
+
 }

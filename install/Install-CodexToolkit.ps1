@@ -50,6 +50,11 @@ foreach ($name in $components) {
     Push-Location $dir
     try {
         if ($name -eq "napcat-mcp") {
+            if (Test-Path -LiteralPath (Join-Path $dir "package-lock.json")) {
+                Invoke-NpmChecked @("ci")
+            } else {
+                Invoke-NpmChecked @("install")
+            }
             Invoke-NpmChecked @("run", "check")
             Invoke-NpmChecked @("test")
             continue

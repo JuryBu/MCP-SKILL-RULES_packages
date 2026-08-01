@@ -226,21 +226,25 @@ Keep the OneBot token in a private environment file outside the repository:
 $env:CODEX_TOOLKIT_ENABLE_NAPCAT_MCP = "1"
 $env:NAPCAT_HTTP_URL = "http://127.0.0.1:3010"
 $env:NAPCAT_ACCESS_TOKEN = "<receiver-private-onebot-token>"
+$env:CODEX_MCP_BROKER_CONTROL_TOKEN = "<receiver-random-local-control-token>"
 ```
 
-Restart the broker, then uncomment the optional NapCat block in `templates/config.codex.toml`. The endpoint supports fixed-group notifications, structured `task_id` messages, a persistent task ledger, trusted-peer routing, Codex conversation wakeups, file upload/download, and heartbeat scripts. It never accepts an arbitrary group ID from a tool call.
+Uncomment the optional NapCat block in `templates/config.codex.toml`. The endpoint supports fixed-group notifications, structured `task_id` messages, a persistent task ledger, trusted-peer routing, native Codex Desktop unread wakeups, file upload/download, and heartbeat scripts. It never accepts an arbitrary group ID from a tool call.
 
 Task routing state is written below the receiver's `.codex-toolkit/napcat-mcp/state` directory. Each participating Codex conversation must call `napcat_task_register` with a stable `task_id`, its own `conversation_id`, machine role, source/target labels, and trusted peer QQ. After processing messages, call `napcat_task_ack` with the actual maximum handled `message_seq`; close completed tasks with `napcat_task_close`.
 
-To install the optional hidden per-user supervisor after configuration:
+Install or update the code with the guarded updater. It keeps source code separate from private state, validates a candidate before replacement, pauses automatic wake during the switch, preserves task fields, and reloads only the NapCat backend. Existing legacy installs can use the documented one-time mixed-root flag after making the generated backup; fresh installs should keep the default separate roots.
 
 ```powershell
-./mcps/napcat-mcp/ops/install-napcat-autostart.ps1 -StartNow
+./mcps/napcat-mcp/ops/update-codex-napcat-bridge.ps1 -SourceCommit "<git-commit>" -MigrateAutostart
+./mcps/napcat-mcp/ops/get-codex-app-server-proxy-status.ps1
 ./mcps/napcat-mcp/ops/get-napcat-supervisor-status.ps1
 ./mcps/napcat-mcp/ops/get-napcat-task-router-status.ps1
 ```
 
-The supervisor starts the router only when the broker, NapCat OneBot, the expected account, NapCat process, Codex process, and at least one open task are all present. Remove it with `remove-napcat-autostart.ps1`; the script backs up and restores a previous task with the same fixed name.
+After the first successful transparent-proxy installation, fully exit and normally open Codex once. The user experience and launch shortcut remain unchanged; the restart only lets Desktop inherit the loopback App Server URL. The supervisor starts the router only when the broker, NapCat OneBot, expected account, NapCat process, Codex process, at least one open task, and an inactive maintenance state all agree. Remove the logon task with `remove-napcat-autostart.ps1`; restore a failed code update with `rollback-codex-napcat-bridge.ps1`.
+
+If the internal App Server protocol changes or the proxy repeatedly fails, automatic wake is paused before any further task write. A deduplicated incident is kept locally and sent to the fixed group after NapCat is online. The watchdog removes the proxy URL from the user environment so the next Codex launch uses the native App Server. This fallback protects normal Codex startup and existing tasks; it does not pretend an unknown future protocol is compatible.
 
 Do not share NapCat binaries, QQ login state, QR codes, `binding.json`, OneBot tokens, task registry, router runtime, heartbeat state, or dedupe files. Verify the file upload → index → message read → download loop against the receiver's exact NapCat version because OneBot builds may disagree on `file_id` versus attachment UUID handling. Full details are in `mcps/napcat-mcp/README.md`.
 

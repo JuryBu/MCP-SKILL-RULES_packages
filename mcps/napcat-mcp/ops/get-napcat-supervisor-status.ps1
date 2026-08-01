@@ -1,6 +1,6 @@
 ﻿[CmdletBinding()]
 param(
-  [string]$DataRoot = (if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$TaskName = "CodexNapCatSupervisor"
 )
 
@@ -19,18 +19,20 @@ if ($null -ne $RuntimeState -and [int]$RuntimeState.pid -gt 0) {
 }
 $ScheduledTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $ScheduledTaskInfo = if ($null -ne $ScheduledTask) { Get-ScheduledTaskInfo -TaskName $TaskName -ErrorAction SilentlyContinue } else { $null }
+$ScheduledTaskPayload = $null
+if ($null -ne $ScheduledTask) {
+  $ScheduledTaskPayload = [ordered]@{
+    name = $TaskName
+    state = [string]$ScheduledTask.State
+    lastRunTime = $ScheduledTaskInfo.LastRunTime
+    lastTaskResult = $ScheduledTaskInfo.LastTaskResult
+    nextRunTime = $ScheduledTaskInfo.NextRunTime
+  }
+}
 
 [pscustomobject]@{
   alive = ($null -ne $Process -and [string]$Process.CommandLine -like "*$RunnerPath*")
   runtimeState = $RuntimeState
   runtimeStatePath = $RuntimeStatePath
-  scheduledTask = if ($null -eq $ScheduledTask) { $null } else {
-    [ordered]@{
-      name = $TaskName
-      state = [string]$ScheduledTask.State
-      lastRunTime = $ScheduledTaskInfo.LastRunTime
-      lastTaskResult = $ScheduledTaskInfo.LastTaskResult
-      nextRunTime = $ScheduledTaskInfo.NextRunTime
-    }
-  }
+  scheduledTask = $ScheduledTaskPayload
 } | ConvertTo-Json -Depth 12
