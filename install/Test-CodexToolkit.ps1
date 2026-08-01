@@ -261,6 +261,12 @@ function Test-PackageStructure {
         throw "Codex config helper inserted project_doc_max_bytes inside a TOML table."
     }
 
+    $utf8 = [System.Text.Encoding]::UTF8
+    $timeboxHeading = $utf8.GetString([Convert]::FromBase64String("IyMjIOiuoeWIkuaXtumXtOebkg=="))
+    $boundedFlexibility = $utf8.GetString([Convert]::FromBase64String("5pyJ6L6555WM55qE54G15rS75oCn"))
+    $noForcedCutoff = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LuF5Zug5Yiw5pe25bCx5by66KGM5Lit5pat"))
+    $noPassiveWaiting = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LiA55u0562J5Yiw5Y6f6aKE6K6h5pe26Ze06ICX5bC9"))
+    $noMechanicalAnnotationReply = $utf8.GetString([Convert]::FromBase64String("5LiN6KaB6buY6K6k5py65qKw6L6T5Ye6"))
     $profileIds = @("neutral", "catgirl", "development", "training")
     $buildScript = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"
     $profileTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-profile-test-" + [guid]::NewGuid().ToString("N"))
@@ -276,6 +282,20 @@ function Test-PackageStructure {
             $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
             if (-not ($agentsText.Contains("stage_guard")) -or -not ($agentsText.Contains("sandbox_council"))) {
                 throw "Profile lost shared engineering rules: $profileId"
+            }
+            if (
+                -not ($agentsText.Contains($timeboxHeading)) -or
+                -not ($agentsText.Contains($boundedFlexibility)) -or
+                -not ($agentsText.Contains($noForcedCutoff)) -or
+                -not ($agentsText.Contains($noPassiveWaiting))
+            ) {
+                throw "Profile lost bounded planning timebox rules: $profileId"
+            }
+            if (
+                -not ($agentsText.Contains("response annotations")) -or
+                -not ($agentsText.Contains($noMechanicalAnnotationReply))
+            ) {
+                throw "Profile lost natural response annotation rules: $profileId"
             }
             if ($profileId -eq "neutral" -and ($agentsText.Contains("kaomoji"))) {
                 throw "Neutral profile unexpectedly contains the catgirl component."
