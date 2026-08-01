@@ -118,6 +118,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-test-"));
   const token = "test-token-that-is-long-enough";
   let turnStartCount = 0;
+  let threadResumeCount = 0;
   const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
   upstream.on("connection", (socket) => {
     socket.on("message", (data) => {
@@ -125,6 +126,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
       if (message.method === "initialize") {
         socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { serverInfo: { name: "fake" } } }));
       } else if (message.method === "thread/resume") {
+        threadResumeCount += 1;
         socket.send(JSON.stringify({
           jsonrpc: "2.0",
           id: message.id,
@@ -189,6 +191,14 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
     pendingThroughTime: "2026-08-02T00:00:00.000Z",
     prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-test-1",
   };
+  const subscription = await fetch(`http://127.0.0.1:${controlPort}/v1/subscriptions`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(wakeBody),
+  }).then((response) => response.json());
+  assert.equal(subscription.ok, true);
+  assert.equal(subscription.readyClientCount, 1);
+  assert.equal(threadResumeCount, 0);
   const first = await fetch(`http://127.0.0.1:${controlPort}/v1/wakes`, {
     method: "POST",
     headers,
@@ -199,6 +209,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   assert.equal(first.started, true);
   assert.equal(first.turn.id, "turn-1");
   assert.equal(turnStartCount, 1);
+  assert.equal(threadResumeCount, 1);
 
   const concurrentBody = {
     ...wakeBody,

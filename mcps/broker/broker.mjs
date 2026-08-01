@@ -5,6 +5,7 @@ import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
+import { shouldTrackBackendWork } from "./request-lifecycle.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -858,7 +859,8 @@ class EndpointBroker {
       sendJson(res, 503, { error: `MCP backend ${this.name} is reloading; retry this request.` });
       return;
     }
-    this.inFlight += 1;
+    const tracksBackendWork = shouldTrackBackendWork(req.method);
+    if (tracksBackendWork) this.inFlight += 1;
     try {
     const sessionId = req.headers["mcp-session-id"];
     if (typeof sessionId === "string" && this.sessions.has(sessionId)) {
@@ -881,7 +883,7 @@ class EndpointBroker {
 
     sendJson(res, sessionId ? 404 : 400, { error: "Missing or invalid MCP session. Send initialize first." });
     } finally {
-      this.inFlight = Math.max(0, this.inFlight - 1);
+      if (tracksBackendWork) this.inFlight = Math.max(0, this.inFlight - 1);
     }
   }
 

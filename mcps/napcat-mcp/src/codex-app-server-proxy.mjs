@@ -382,9 +382,19 @@ export class CodexAppServerProxy {
       throw new CodexAppServerProxyError("WAKE_JOURNAL_REQUIRED", "任务订阅需要持久化唤醒日志");
     }
     const subscription = normalizeSubscription(input);
+    const readyClients = this.#readyClients();
+    if (!readyClients.length) {
+      throw new CodexAppServerProxyError(
+        "NO_DESKTOP_CLIENT",
+        "没有已初始化且上下游均在线的 Codex Desktop 连接",
+      );
+    }
     const registration = this.journal.registerSubscription(subscription);
-    const resumed = await this.subscribeThread(subscription.threadId);
-    return { ...registration, ...resumed };
+    return {
+      ...registration,
+      threadId: subscription.threadId,
+      readyClientCount: readyClients.length,
+    };
   }
 
   async wakeThread(input) {

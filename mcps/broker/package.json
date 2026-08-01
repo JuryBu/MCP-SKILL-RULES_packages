@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "node broker.mjs",
-    "check": "node --check broker.mjs && node --check exa-key-pool.mjs && node --check exa-stateless-stdio.mjs && node --test test/exa-key-pool.test.mjs test/exa-bridge-failover.test.mjs && node test/startup-smoke.mjs",
+    "check": "node --check broker.mjs && node --check request-lifecycle.mjs && node --check exa-key-pool.mjs && node --check exa-stateless-stdio.mjs && node --test test/request-lifecycle.test.mjs test/exa-key-pool.test.mjs test/exa-bridge-failover.test.mjs && node test/startup-smoke.mjs",
     "health": "npm run check"
   }
 }

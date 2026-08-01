@@ -74,9 +74,11 @@ Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官�
 NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ```
 
-控制端口只监听回环地址并要求随机 Bearer token。任务订阅同时绑定 `task_id`、generation、conversation ID、本机角色、来源/目标机器和可信 QQ；同一个 `wake_id` 在任何并发、超时或重启情况下最多提交一次。若 App Server 在正常会话中退出，透明中转保留 Desktop WebSocket，暂停自动唤醒，按退避重启官方进程，并在恢复后使用缓存的初始化参数重建上游连接。已经写出但没有得到确定结果的 `turn/start` 记为 `unknown`，不会自动补发。proxy、supervisor 和 task router 的单实例恢复同时核对 PID、runner 路径、runtime/lock 路径、随机实例 token 与状态新鲜度，不能只因某个 PID 仍存在就认定旧实例健康。
+控制端口只监听回环地址并要求随机 Bearer token。task router 会从任务账本所在的 `state` 目录自动发现 `codex-app-server-proxy-runtime.json` 与 `codex-app-server-proxy-token.txt`；发现任一代理产物后必须走透明中转，配置残缺或代理不可达时暂停自动唤醒并报错，禁止静默退回独立 App Server。任务订阅同时绑定 `task_id`、generation、conversation ID、本机角色、来源/目标机器和可信 QQ，订阅接口只登记绑定并确认 Desktop 在线，真正唤醒时才执行一次 `thread/resume`。同一个 `wake_id` 在任何并发、超时或重启情况下最多提交一次。若 App Server 在正常会话中退出，透明中转保留 Desktop WebSocket，暂停自动唤醒，按退避重启官方进程，并在恢复后使用缓存的初始化参数重建上游连接。已经写出但没有得到确定结果的 `turn/start` 记为 `unknown`，不会自动补发。proxy、supervisor 和 task router 的单实例恢复同时核对 PID、runner 路径、runtime/lock 路径、随机实例 token 与状态新鲜度，不能只因某个 PID 仍存在就认定旧实例健康。
 
 协议探针、唤醒日志、控制 token、运行状态和 fallback 请求都保存在私有 data root。唤醒日志损坏、协议不兼容、代理连续恢复失败或维护状态不可读时，系统采取两层降级：当前自动唤醒立即暂停；监督器在固定群发送一条去重告警并保留本地 incident 状态。看门狗随后清除用户级 `CODEX_APP_SERVER_WS_URL`，让下一次普通 Codex 启动回到官方原生路径。这个设计保证代理故障不会持续阻止 Codex 打开，但无法承诺未来任意 Codex 版本永不改变内部协议；不兼容时必须以「暂停自动化、保留任务、恢复原生启动」结束，不能猜协议继续写入。
+
+升级验收必须使用两端各自独立登记的测试 task 和测试对话，不能拿正式 open task 试错。两台机器同步同一公开提交并正常重启 Codex 后，由两端维护对话互发唯一测试消息；主人需要在目标测试对话尚未打开时亲眼确认侧边栏未读标记，随后确认消息实时可见、只出现一次、测试对话能正常处理并 ACK。两端都通过后才能恢复正式自动路由；只有后端日志、对话存储写入或重启后才看见消息，均不算通过。测试 task 完成后应关闭，正式 task 的 generation、游标、租约和绑定保持不变。
 
 ## 安全更新与回滚
 

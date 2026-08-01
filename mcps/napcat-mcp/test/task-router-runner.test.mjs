@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   acquireInstanceLock,
   calculateBackoffMs,
+  createTaskRouterDependencies,
   parseArguments,
   readPrivateEnvironment,
   runTaskRouterService,
@@ -97,6 +98,98 @@ test("CLI 固定参数解析并加载 private-env 的 NapCat 配置", () => {
       "--lock", fixture.lockPath,
     ]);
     assert.equal(defaultInterval.scanIntervalMs, 30000);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("task router 自动使用同一 state 目录的透明代理控制面", () => {
+  const fixture = createFixture();
+  const stateRoot = path.dirname(fixture.registryPath);
+  const runtimePath = path.join(stateRoot, "codex-app-server-proxy-runtime.json");
+  const tokenFilePath = path.join(stateRoot, "codex-app-server-proxy-token.txt");
+  let capturedBridgeOptions;
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(runtimePath, JSON.stringify({ controlUrl: "http://127.0.0.1:19431" }), "utf8");
+  fs.writeFileSync(tokenFilePath, "test-token\n", "utf8");
+  try {
+    createTaskRouterDependencies({
+      registryPath: fixture.registryPath,
+      bindingPath: fixture.bindingPath,
+      statePath: fixture.statePath,
+      createRegistry: () => ({}),
+      createNotifier: () => ({}),
+      createBridge: (options) => {
+        capturedBridgeOptions = options;
+        return { async close() {} };
+      },
+      createRouter: () => ({ async scanOnce() { return { openTaskCount: 0 }; } }),
+      env: {},
+    });
+    assert.equal(capturedBridgeOptions.mode, "transparent_proxy");
+    assert.equal(capturedBridgeOptions.controlUrl, "http://127.0.0.1:19431");
+    assert.equal(capturedBridgeOptions.tokenFilePath, tokenFilePath);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("空白桥配置不会绕过透明代理自动发现", () => {
+  const fixture = createFixture();
+  const stateRoot = path.dirname(fixture.registryPath);
+  const tokenFilePath = path.join(stateRoot, "codex-app-server-proxy-token.txt");
+  let capturedBridgeOptions;
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(tokenFilePath, "test-token\n", "utf8");
+  try {
+    createTaskRouterDependencies({
+      registryPath: fixture.registryPath,
+      bindingPath: fixture.bindingPath,
+      statePath: fixture.statePath,
+      bridgeOptions: { controlUrl: " ", controlToken: "", tokenFilePath: "\t" },
+      createRegistry: () => ({}),
+      createNotifier: () => ({}),
+      createBridge: (options) => {
+        capturedBridgeOptions = options;
+        return { async close() {} };
+      },
+      createRouter: () => ({ async scanOnce() { return { openTaskCount: 0 }; } }),
+      env: {},
+    });
+    assert.equal(capturedBridgeOptions.mode, "transparent_proxy");
+    assert.equal(capturedBridgeOptions.controlUrl, "http://127.0.0.1:18431");
+    assert.equal(capturedBridgeOptions.tokenFilePath, tokenFilePath);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("task router 发现不完整代理产物时不静默回退旧桥", () => {
+  const fixture = createFixture();
+  const stateRoot = path.dirname(fixture.registryPath);
+  let capturedBridgeOptions;
+  fs.mkdirSync(stateRoot, { recursive: true });
+  fs.writeFileSync(path.join(stateRoot, "codex-app-server-proxy-runtime.json"), "{}", "utf8");
+  try {
+    createTaskRouterDependencies({
+      registryPath: fixture.registryPath,
+      bindingPath: fixture.bindingPath,
+      statePath: fixture.statePath,
+      createRegistry: () => ({}),
+      createNotifier: () => ({}),
+      createBridge: (options) => {
+        capturedBridgeOptions = options;
+        return { async close() {} };
+      },
+      createRouter: () => ({ async scanOnce() { return { openTaskCount: 0 }; } }),
+      env: {},
+    });
+    assert.equal(capturedBridgeOptions.mode, "transparent_proxy");
+    assert.equal(capturedBridgeOptions.controlUrl, "http://127.0.0.1:18431");
+    assert.equal(
+      capturedBridgeOptions.tokenFilePath,
+      path.join(stateRoot, "codex-app-server-proxy-token.txt"),
+    );
   } finally {
     fixture.cleanup();
   }

@@ -123,6 +123,32 @@ function readExistingJson(filePath, fsImpl) {
   }
 }
 
+function resolveAutomaticProxyBridgeOptions(registryPath, bridgeOptions = {}, fsImpl = fs) {
+  const hasExplicitString = (value) => typeof value === "string" && value.trim().length > 0;
+  const explicitProxyConfiguration = bridgeOptions.mode === "transparent_proxy"
+    || hasExplicitString(bridgeOptions.controlUrl)
+    || hasExplicitString(bridgeOptions.controlToken)
+    || hasExplicitString(bridgeOptions.tokenFilePath);
+  if (explicitProxyConfiguration) return { ...bridgeOptions };
+
+  const stateRoot = path.dirname(registryPath);
+  const runtimePath = path.join(stateRoot, "codex-app-server-proxy-runtime.json");
+  const tokenFilePath = path.join(stateRoot, "codex-app-server-proxy-token.txt");
+  const proxyArtifactsPresent = fsImpl.existsSync(runtimePath) || fsImpl.existsSync(tokenFilePath);
+  if (!proxyArtifactsPresent) return { ...bridgeOptions };
+
+  const runtime = readExistingJson(runtimePath, fsImpl);
+  const controlUrl = typeof runtime.controlUrl === "string" && runtime.controlUrl.trim()
+    ? runtime.controlUrl.trim()
+    : "http://127.0.0.1:18431";
+  return {
+    ...bridgeOptions,
+    mode: "transparent_proxy",
+    controlUrl,
+    tokenFilePath,
+  };
+}
+
 function atomicWriteJson(filePath, value, fsImpl = fs) {
   fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}-${randomUUID()}`;
@@ -397,13 +423,18 @@ export function createTaskRouterDependencies(options = {}) {
   const notifierFactory = options.createNotifier ?? createNapCatNotifier;
   const bridgeFactory = options.createBridge ?? createCodexThreadBridge;
   const routerFactory = options.createRouter ?? createTaskRouter;
+  const bridgeOptions = resolveAutomaticProxyBridgeOptions(
+    registryPath,
+    options.bridgeOptions,
+    options.fsImpl ?? fs,
+  );
   const registry = options.registry ?? registryFactory({
     statePath: registryPath,
     ...(options.registryOptions ?? {}),
   });
   const notifier = options.notifier ?? notifierFactory({ cwd, env });
   const bridge = options.bridge ?? bridgeFactory({
-    ...(options.bridgeOptions ?? {}),
+    ...bridgeOptions,
     cwd,
     env,
   });
