@@ -60,6 +60,37 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
 if (Test-Path -LiteralPath $StopFilePath) { Remove-Item -LiteralPath $StopFilePath -Force }
 $NodePath = (Get-Command node -ErrorAction Stop).Source
 
+function Test-LoopbackPortAvailable {
+  param([int]$Port)
+  $Listener = $null
+  try {
+    $Listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $Port)
+    $Listener.Start()
+    return $true
+  } catch {
+    return $false
+  } finally {
+    if ($null -ne $Listener) {
+      try { $Listener.Stop() } catch {}
+    }
+  }
+}
+
+if (-not (Test-LoopbackPortAvailable -Port $UpstreamPort)) {
+  $SelectedUpstreamPort = $null
+  foreach ($CandidatePort in (($UpstreamPort + 2)..([Math]::Min(65535, $UpstreamPort + 32)))) {
+    if ($CandidatePort -eq $DownstreamPort -or $CandidatePort -eq $ControlPort -or $CandidatePort -eq $ProbePort) { continue }
+    if (Test-LoopbackPortAvailable -Port $CandidatePort) {
+      $SelectedUpstreamPort = $CandidatePort
+      break
+    }
+  }
+  if ($null -eq $SelectedUpstreamPort) {
+    throw "No free loopback port is available for the managed Codex App Server."
+  }
+  $UpstreamPort = $SelectedUpstreamPort
+}
+
 function Quote-Argument {
   param([string]$Value)
   return '"' + $Value.Replace('"', '\"') + '"'

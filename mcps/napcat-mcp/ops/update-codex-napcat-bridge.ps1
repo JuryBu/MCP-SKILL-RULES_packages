@@ -262,8 +262,15 @@ try {
     foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
       $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
       if (Test-Path -LiteralPath $ScriptPath) {
-        $StopResult = & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
+        $StopResult = if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
+          & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | ConvertFrom-Json
+        } else {
+          & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
+        }
         if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process within the guarded timeout." }
+        if ($ScriptName -eq "stop-codex-app-server-proxy.ps1" -and $StopResult.clean -ne $true) {
+          throw "$ScriptName left a managed App Server process or listener behind."
+        }
       }
     }
     if ($MigrateAutostart) {
@@ -314,7 +321,13 @@ try {
   foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
     $ScriptPath = Join-Path $CandidateRoot "ops\$ScriptName"
     if (Test-Path -LiteralPath $ScriptPath) {
-      try { & $ScriptPath -DataRoot $DataRoot | Out-Null } catch {}
+      try {
+        if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
+          & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | Out-Null
+        } else {
+          & $ScriptPath -DataRoot $DataRoot | Out-Null
+        }
+      } catch {}
     }
   }
   if ((Test-Path -LiteralPath $PreviousCodeRoot) -and (Test-Path -LiteralPath $CodeRoot)) {

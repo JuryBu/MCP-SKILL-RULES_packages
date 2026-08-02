@@ -53,10 +53,10 @@ function Apply-ProxyFallbackRequest {
       [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $null, "User")
       $Cleared = $true
     }
-    $Fallback.pending = $false
-    $Fallback.handledAt = (Get-Date).ToString("o")
-    $Fallback.previousUserValue = $CurrentValue
-    $Fallback.userValueCleared = $Cleared
+    $Fallback | Add-Member -NotePropertyName pending -NotePropertyValue $false -Force
+    $Fallback | Add-Member -NotePropertyName handledAt -NotePropertyValue ((Get-Date).ToString("o")) -Force
+    $Fallback | Add-Member -NotePropertyName previousUserValue -NotePropertyValue $CurrentValue -Force
+    $Fallback | Add-Member -NotePropertyName userValueCleared -NotePropertyValue $Cleared -Force
     [System.IO.File]::WriteAllText($ProxyFallbackPath, (($Fallback | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
     $FallbackMessage = if ($Cleared) { "Cleared CODEX_APP_SERVER_WS_URL for the next Codex launch." } else { "Fallback request recorded; user environment already differed." }
     Write-WatchdogRecord -Status "fallback" -Message $FallbackMessage

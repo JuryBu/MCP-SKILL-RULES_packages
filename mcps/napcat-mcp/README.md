@@ -74,6 +74,10 @@ Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官�
 NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ```
 
+`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时必须同时确认子进程和监听端口都已消失，确认前不得写入 `stopped` 或清空 PID。默认上游端口若被无法识别的历史监听占用，代理会选择空闲回环端口并在运行状态中记录实际地址，避免影响 Codex 启动；后续受管实例仍执行精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。
+
+更新脚本不会终止 Codex Desktop。便携包会启动隐藏激活器，等待当前 Codex 与代理连接自然断开后，再干净重启受管代理并热重载 NapCat backend；用户只需正常退出 Codex、等待约 10 秒后重新打开，不需要重启 Windows。
+
 控制端口只监听回环地址并要求随机 Bearer token。task router 会从任务账本所在的 `state` 目录自动发现 `codex-app-server-proxy-runtime.json` 与 `codex-app-server-proxy-token.txt`；发现任一代理产物后必须走透明中转，配置残缺或代理不可达时暂停自动唤醒并报错，禁止静默退回独立 App Server。任务订阅同时绑定 `task_id`、generation、conversation ID、本机角色、来源/目标机器和可信 QQ，订阅接口只登记绑定并确认 Desktop 在线，真正唤醒时才执行一次 `thread/resume`。同一个 `wake_id` 在任何并发、超时或重启情况下最多提交一次。若 App Server 在正常会话中退出，透明中转保留 Desktop WebSocket，暂停自动唤醒，按退避重启官方进程，并在恢复后使用缓存的初始化参数重建上游连接。已经写出但没有得到确定结果的 `turn/start` 记为 `unknown`，不会自动补发。proxy、supervisor 和 task router 的单实例恢复同时核对 PID、runner 路径、runtime/lock 路径、随机实例 token 与状态新鲜度，不能只因某个 PID 仍存在就认定旧实例健康。
 
 协议探针、唤醒日志、控制 token、运行状态和 fallback 请求都保存在私有 data root。唤醒日志损坏、协议不兼容、代理连续恢复失败或维护状态不可读时，系统采取两层降级：当前自动唤醒立即暂停；监督器在固定群发送一条去重告警并保留本地 incident 状态。看门狗随后清除用户级 `CODEX_APP_SERVER_WS_URL`，让下一次普通 Codex 启动回到官方原生路径。这个设计保证代理故障不会持续阻止 Codex 打开，但无法承诺未来任意 Codex 版本永不改变内部协议；不兼容时必须以「暂停自动化、保留任务、恢复原生启动」结束，不能猜协议继续写入。
@@ -83,6 +87,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ## 安全更新与回滚
 
 公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。
+
+面向日常使用者的安装应优先采用「先准备、后重启」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，再由一次 Windows 重启统一清理旧代理与旧 App Server，登录后正常打开 Codex。运行中的无感热切换只保留给明确知道当前进程边界的维护场景，不能作为同步包默认行为。
 
 ```powershell
 # 在仓库根目录执行；首次迁移计划任务时加 -MigrateAutostart

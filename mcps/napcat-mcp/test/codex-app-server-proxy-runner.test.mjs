@@ -1,13 +1,19 @@
 import assert from "node:assert/strict";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { EventEmitter } from "node:events";
+import { promisify } from "node:util";
 import {
   acquireInstanceLock,
   parseArguments,
   runCodexAppServerProxyService,
 } from "../src/codex-app-server-proxy-runner.mjs";
+
+const execFileAsync = promisify(execFile);
 
 function runtimePaths(root) {
   return {
@@ -26,6 +32,47 @@ function runtimePaths(root) {
     probePort: 18454,
     startTimeoutMs: 1000,
     requestTimeoutMs: 1000,
+  };
+}
+
+function createProxyStub() {
+  return {
+    startedAt: null,
+    async start() {
+      this.startedAt = new Date().toISOString();
+    },
+    async close() {},
+    status() {
+      return { state: "running" };
+    },
+  };
+}
+
+function createChildThatRequiresForceVerification(onForceKill = () => {}) {
+  const child = new EventEmitter();
+  child.pid = 43210;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = (signal) => {
+    if (signal === "SIGKILL") onForceKill(child);
+    return true;
+  };
+  return child;
+}
+
+function createStoppingServiceOptions(paths, child, terminateChild) {
+  return {
+    ...paths,
+    executablePath: process.execPath,
+    pid: process.pid,
+    probeExecutable: async () => {},
+    createProxy: createProxyStub,
+    spawnAppServer: () => ({ child, stderr: () => "" }),
+    waitForWebSocketReady: async () => {
+      fs.writeFileSync(paths.stopFilePath, "stop\n", "utf8");
+    },
+    ...(terminateChild ? { terminateChild } : {}),
+    verifyPortReleased: async () => true,
   };
 }
 
@@ -87,5 +134,76 @@ test("proxy lock rejects a live PID whose instance token is stale", () => {
     lock.release();
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("does not write stopped state or clear appServerPid while child exit is unconfirmed", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-stop-test-"));
+  const paths = runtimePaths(root);
+  const child = createChildThatRequiresForceVerification();
+  try {
+    await runCodexAppServerProxyService(createStoppingServiceOptions(paths, child, async () => {
+      const error = new Error("child exit remains unconfirmed");
+      error.code = "APP_SERVER_TERMINATION_FAILED";
+      throw error;
+    }));
+    const runtime = JSON.parse(fs.readFileSync(paths.runtimeStatePath, "utf8"));
+
+    assert.notEqual(runtime.state, "stopped");
+    assert.equal(runtime.appServerPid, child.pid);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("waits for a forced child termination to be confirmed before completing shutdown", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-force-stop-test-"));
+  const paths = runtimePaths(root);
+  let forceExitConfirmed = false;
+  const child = createChildThatRequiresForceVerification((processHandle) => {
+    setTimeout(() => {
+      forceExitConfirmed = true;
+      processHandle.exitCode = 137;
+      processHandle.emit("exit", 137, "SIGKILL");
+    }, 25);
+  });
+  try {
+    await runCodexAppServerProxyService(createStoppingServiceOptions(paths, child, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      forceExitConfirmed = true;
+      child.exitCode = 137;
+      child.emit("exit", 137, "SIGKILL");
+    }));
+    assert.equal(forceExitConfirmed, true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("start script selects a backup loopback port when the default upstream port is occupied", { skip: process.platform !== "win32" }, async () => {
+  const holder = net.createServer();
+  await new Promise((resolve) => holder.listen(0, "127.0.0.1", resolve));
+  const occupiedPort = holder.address().port;
+  const startScriptPath = path.resolve("ops/start-codex-app-server-proxy.ps1");
+  const startScript = fs.readFileSync(startScriptPath, "utf8");
+  const selection = startScript.match(/function Test-LoopbackPortAvailable[\s\S]*?\n(?=function Quote-Argument)/)?.[0];
+  assert.ok(selection, "start script must contain the upstream loopback-port selection block");
+
+  try {
+    const command = [
+      `$DownstreamPort = ${occupiedPort + 1}`,
+      `$ControlPort = ${occupiedPort + 3}`,
+      `$UpstreamPort = ${occupiedPort}`,
+      `$ProbePort = ${occupiedPort + 4}`,
+      selection,
+      "[Console]::Out.Write($UpstreamPort)",
+    ].join("; ");
+    const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide: true });
+    const selectedPort = Number(stdout.trim());
+
+    assert.notEqual(selectedPort, occupiedPort);
+    assert.equal(selectedPort, occupiedPort + 2);
+  } finally {
+    await new Promise((resolve, reject) => holder.close((error) => error ? reject(error) : resolve()));
   }
 });

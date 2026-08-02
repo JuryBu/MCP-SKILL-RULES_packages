@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -197,18 +198,64 @@ function waitForExit(child) {
 }
 
 async function terminateChild(child, timeoutMs = 3000) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
+  if (!child || child.exitCode !== null || child.signalCode !== null) return true;
+  const pid = Number(child.pid);
   try {
     child.kill();
   } catch {
   }
-  await Promise.race([waitForExit(child), wait(timeoutMs)]);
-  if (child.exitCode === null && child.signalCode === null) {
+  const deadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < deadline) await wait(50);
+  if (processAlive(pid) && process.platform === "win32") {
+    try {
+      const taskkill = spawn("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      await Promise.race([waitForExit(taskkill), wait(timeoutMs)]);
+    } catch {
+    }
+  } else if (processAlive(pid)) {
     try {
       child.kill("SIGKILL");
     } catch {
     }
   }
+  const forceDeadline = Date.now() + timeoutMs;
+  while (processAlive(pid) && Date.now() < forceDeadline) await wait(50);
+  if (processAlive(pid)) {
+    throw new CodexAppServerProxyError(
+      "APP_SERVER_TERMINATION_FAILED",
+      `Codex App Server 子进程 ${pid} 未能在受控退出后终止`,
+      { details: { pid } },
+    );
+  }
+  await Promise.race([waitForExit(child), wait(250)]);
+  return true;
+}
+
+function loopbackPortAvailable(port) {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.unref();
+    server.once("error", () => resolve(false));
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close(() => resolve(true));
+    });
+  });
+}
+
+async function terminateManagedAppServer(child, port, options = {}) {
+  await (options.terminateChild ?? terminateChild)(child);
+  const released = await (options.verifyPortReleased ?? loopbackPortAvailable)(port);
+  if (!released) {
+    throw new CodexAppServerProxyError(
+      "APP_SERVER_PORT_STILL_OCCUPIED",
+      `受管 Codex App Server 退出后仍有进程监听回环端口 ${port}`,
+      { details: { pid: child?.pid ?? null, port } },
+    );
+  }
+  return true;
 }
 
 function spawnAppServer(executablePath, port, options = {}) {
@@ -324,7 +371,7 @@ async function probeExecutable(executablePath, port, options = {}) {
     }
     throw lastError ?? new CodexAppServerProxyError("APP_SERVER_PROBE_TIMEOUT", "App Server 探针超时");
   } finally {
-    await terminateChild(launched.child);
+    await terminateManagedAppServer(launched.child, port, options);
   }
 }
 
@@ -405,6 +452,7 @@ export async function runCodexAppServerProxyService(options = {}) {
   let stopReason = null;
   let signalCleanup = () => {};
   let restartFailureCount = 0;
+  let shutdownError = null;
   let status = {
     schemaVersion: 1,
     pid,
@@ -560,6 +608,10 @@ export async function runCodexAppServerProxyService(options = {}) {
     while (!stopRequested && !fsImpl.existsSync(options.stopFilePath)) {
       const launched = (options.spawnAppServer ?? spawnAppServer)(currentExecutable, options.upstreamPort, options);
       appServer = launched.child;
+      persist({
+        appServerPid: appServer.pid ?? null,
+        appServerStartedAt: now().toISOString(),
+      });
       try {
         await (options.waitForWebSocketReady ?? waitForWebSocketReady)(status.upstreamUrl, {
           ...options,
@@ -616,8 +668,9 @@ export async function runCodexAppServerProxyService(options = {}) {
         });
         log("app_server_start_failed", { error: publicError(error), restartFailureCount });
       } finally {
-        await terminateChild(appServer);
+        await terminateManagedAppServer(appServer, options.upstreamPort, options);
         appServer = null;
+        persist({ appServerPid: null });
       }
       if (restartFailureCount >= DEFAULT_RESTART_BACKOFF_MS.length) {
         markFatal(new CodexAppServerProxyError(
@@ -639,10 +692,20 @@ export async function runCodexAppServerProxyService(options = {}) {
   } finally {
     signalCleanup();
     await proxy?.close().catch(() => {});
-    await terminateChild(appServer);
+    try {
+      await terminateManagedAppServer(appServer, options.upstreamPort, options);
+      appServer = null;
+    } catch (error) {
+      shutdownError = error;
+      markFatal(error);
+      log("app_server_termination_failed", {
+        appServerPid: appServer?.pid ?? status.appServerPid ?? null,
+        error: publicError(error),
+      });
+    }
     fsImpl.rmSync(options.stopFilePath, { force: true });
     lock.release();
-    if (status.state !== "degraded") {
+    if (!shutdownError && status.state !== "degraded") {
       persist({
         state: "stopped",
         automationEnabled: false,
@@ -651,9 +714,15 @@ export async function runCodexAppServerProxyService(options = {}) {
         stopReason: stopReason ?? "completed",
       });
     }
-    log("proxy_service_stopped", { stopReason: stopReason ?? "completed" });
+    log(shutdownError ? "proxy_service_degraded" : "proxy_service_stopped", {
+      stopReason: stopReason ?? "completed",
+      appServerPid: shutdownError ? (appServer?.pid ?? status.appServerPid ?? null) : null,
+      error: shutdownError ? publicError(shutdownError) : null,
+    });
   }
-  return { state: "stopped", pid, stopReason };
+  return shutdownError
+    ? { state: "failed", pid, stopReason, error: publicError(shutdownError) }
+    : { state: "stopped", pid, stopReason };
 }
 
 async function main() {
