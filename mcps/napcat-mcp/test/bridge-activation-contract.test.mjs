@@ -42,6 +42,16 @@ test("staged updates keep automatic wake paused until live activation succeeds",
   assert.match(script, /Write-JsonAtomic -Path \$LastKnownGoodPointerPath/);
 });
 
+test("successful idle activation resolves the persisted pending-update metadata", () => {
+  const script = read("ops/activate-codex-app-server-when-idle.ps1");
+  assert.match(script, /napcat-bridge-last-update\.json/);
+  assert.match(script, /activated[^\r\n]+\$true/);
+  assert.match(script, /pendingActivation[^\r\n]+\$false/);
+  assert.match(script, /restartCodexRequired[^\r\n]+\$false/);
+  assert.match(script, /activatedProxyUrl/);
+  assert.match(script, /activationCompletedAt/);
+});
+
 test("task router startup accepts the intentional maintenance state", () => {
   const script = read("ops/start-napcat-task-router.ps1");
   assert.match(script, /state -notin @\("running", "maintenance"\)/);

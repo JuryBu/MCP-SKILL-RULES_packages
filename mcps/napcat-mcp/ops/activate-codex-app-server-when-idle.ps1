@@ -14,6 +14,7 @@ $ActivationStatePath = Join-Path $StateRoot "codex-app-server-pending-activation
 $ActivationLockPath = Join-Path $StateRoot "napcat-bridge-update.lock"
 $AlertPath = Join-Path $StateRoot "automation-alert.json"
 $MaintenancePath = Join-Path $StateRoot "task-router.maintenance.json"
+$UpdateStatePath = Join-Path $StateRoot "napcat-bridge-last-update.json"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 
@@ -118,6 +119,15 @@ try {
     $ActivePointer = Get-Content -LiteralPath $ActivePointerPath -Raw -Encoding UTF8 | ConvertFrom-Json
     $ActivePointer | Add-Member -NotePropertyName verifiedAt -NotePropertyValue ((Get-Date).ToString("o")) -Force
     [System.IO.File]::WriteAllText($LastKnownGoodPointerPath, (($ActivePointer | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
+  }
+  if (Test-Path -LiteralPath $UpdateStatePath) {
+    $UpdateState = Get-Content -LiteralPath $UpdateStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $UpdateState | Add-Member -NotePropertyName activated -NotePropertyValue $true -Force
+    $UpdateState | Add-Member -NotePropertyName pendingActivation -NotePropertyValue $false -Force
+    $UpdateState | Add-Member -NotePropertyName restartCodexRequired -NotePropertyValue $false -Force
+    $UpdateState | Add-Member -NotePropertyName activatedProxyUrl -NotePropertyValue ([string]$FinalStatus.runtime.downstreamUrl) -Force
+    $UpdateState | Add-Member -NotePropertyName activationCompletedAt -NotePropertyValue ((Get-Date).ToString("o")) -Force
+    [System.IO.File]::WriteAllText($UpdateStatePath, (($UpdateState | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
   }
   Write-State -State "ready" -Message "NapCat bridge activation completed; Codex may be opened normally." -Details ([ordered]@{
     proxyPid = $FinalStatus.runtime.pid
