@@ -28,7 +28,7 @@ function Test-ExpectedTaskRouterRuntime {
   param($RuntimeState, $ProcessInfo)
   if ($null -eq $RuntimeState -or $null -eq $ProcessInfo -or [string]$RuntimeState.state -ne "running") { return $false }
   $CommandLine = [string]$ProcessInfo.CommandLine
-  if ($CommandLine.IndexOf($RunnerPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  if ($CommandLine.IndexOf("task-router-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($LockPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if (-not (Test-Path -LiteralPath $LockPath)) { return $false }

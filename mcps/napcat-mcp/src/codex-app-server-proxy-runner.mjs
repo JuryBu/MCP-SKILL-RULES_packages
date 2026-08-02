@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import {
@@ -97,20 +97,80 @@ function processAlive(pid) {
   }
 }
 
+function processCommandLine(pid) {
+  if (process.platform !== "win32" || !processAlive(pid)) return "";
+  const executable = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = `(Get-CimInstance Win32_Process -Filter \"ProcessId = ${Number(pid)}\" -ErrorAction SilentlyContinue).CommandLine`;
+  const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 5000,
+  });
+  return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+}
+
+function sameLockOwner(left, right) {
+  return Number(left?.pid) === Number(right?.pid)
+    && left?.token === right?.token
+    && left?.startedAt === right?.startedAt;
+}
+
+function createLockFile(lockPath, metadata, fsImpl) {
+  const temporaryPath = `${lockPath}.${metadata.pid}.${metadata.token}.candidate`;
+  fsImpl.writeFileSync(temporaryPath, `${JSON.stringify(metadata)}\n`, "utf8");
+  try {
+    fsImpl.linkSync(temporaryPath, lockPath);
+    return true;
+  } catch (error) {
+    if (error?.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    fsImpl.rmSync(temporaryPath, { force: true });
+  }
+}
+
+function acquireRecoveryGuard(lockPath, options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const guardPath = `${lockPath}.recovery`;
+  const metadata = { pid: Number(options.pid ?? process.pid), token: crypto.randomUUID(), createdAt: new Date().toISOString() };
+  try {
+    const descriptor = fsImpl.openSync(guardPath, "wx");
+    fsImpl.writeFileSync(descriptor, `${JSON.stringify(metadata)}\n`, "utf8");
+    fsImpl.closeSync(descriptor);
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const existing = readJsonObject(guardPath, fsImpl);
+    const ageMs = Date.now() - fsImpl.statSync(guardPath).mtimeMs;
+    if (!processAlive(Number(existing.pid)) && ageMs > 30_000) {
+      fsImpl.rmSync(guardPath, { force: true });
+      return acquireRecoveryGuard(lockPath, options);
+    }
+    return null;
+  }
+  return {
+    release() {
+      const current = readJsonObject(guardPath, fsImpl);
+      if (current.pid === metadata.pid && current.token === metadata.token) fsImpl.rmSync(guardPath, { force: true });
+    },
+  };
+}
+
 export function acquireInstanceLock(lockPath, options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const pid = Number(options.pid ?? process.pid);
   const startedAt = options.startedAt ?? new Date().toISOString();
   const token = crypto.randomUUID();
+  const metadata = { pid, startedAt, token };
   fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true });
-  try {
-    const descriptor = fsImpl.openSync(lockPath, "wx");
-    fsImpl.writeFileSync(descriptor, `${JSON.stringify({ pid, startedAt, token })}\n`, "utf8");
-    fsImpl.closeSync(descriptor);
-  } catch (error) {
-    if (error?.code !== "EEXIST") throw error;
-    const existing = readJsonObject(lockPath, fsImpl);
-    let existingOwnerValid = processAlive(Number(existing.pid));
+  const validateOwner = (existing) => {
+    let existingOwnerValid = processAlive(Number(existing?.pid));
+    if (existingOwnerValid && typeof options.validateExistingProcess === "function") {
+      try {
+        existingOwnerValid = options.validateExistingProcess(existing) !== false;
+      } catch {
+        existingOwnerValid = false;
+      }
+    }
     if (existingOwnerValid && typeof options.validateExistingLock === "function") {
       try {
         existingOwnerValid = options.validateExistingLock(existing) !== false;
@@ -118,17 +178,36 @@ export function acquireInstanceLock(lockPath, options = {}) {
         existingOwnerValid = false;
       }
     }
-    if (existingOwnerValid) return { acquired: false, existing };
-    const stalePath = `${lockPath}.stale-${Date.now()}-${crypto.randomUUID()}`;
-    fsImpl.renameSync(lockPath, stalePath);
-    return acquireInstanceLock(lockPath, options);
+    return existingOwnerValid;
+  };
+  if (!createLockFile(lockPath, metadata, fsImpl)) {
+    const existing = readJsonObject(lockPath, fsImpl);
+    if (validateOwner(existing)) return { acquired: false, existing };
+    const recovery = acquireRecoveryGuard(lockPath, { fsImpl, pid });
+    if (!recovery) return { acquired: false, existing: { ...existing, recoveryInProgress: true } };
+    try {
+      const current = readJsonObject(lockPath, fsImpl);
+      if (validateOwner(current)) return { acquired: false, existing: current };
+      if (fsImpl.existsSync(lockPath)) {
+        const stalePath = `${lockPath}.stale-${Date.now()}-${crypto.randomUUID()}`;
+        fsImpl.renameSync(lockPath, stalePath);
+      }
+      if (!createLockFile(lockPath, metadata, fsImpl)) {
+        return { acquired: false, existing: readJsonObject(lockPath, fsImpl) };
+      }
+    } finally {
+      recovery.release();
+    }
   }
   return {
     acquired: true,
-    metadata: { pid, startedAt, token },
+    metadata,
+    isOwner() {
+      return sameLockOwner(readJsonObject(lockPath, fsImpl), metadata);
+    },
     release() {
       const current = readJsonObject(lockPath, fsImpl);
-      if (current.pid === pid && current.token === token) fsImpl.rmSync(lockPath, { force: true });
+      if (sameLockOwner(current, metadata)) fsImpl.rmSync(lockPath, { force: true });
     },
   };
 }
@@ -145,6 +224,23 @@ function updateMaintenance(filePath, reasonKey, reasonValue, fsImpl = fs) {
   const next = { schemaVersion: 1, reasons };
   atomicWriteJson(filePath, next, fsImpl);
   return next;
+}
+
+function resolveProxyFailureArtifacts(options, status, fsImpl = fs, now = () => new Date()) {
+  const alert = readJsonObject(options.alertFilePath, fsImpl);
+  if (alert.pending === true && alert.source === "codex-app-server-proxy") {
+    atomicWriteJson(options.alertFilePath, {
+      ...alert,
+      pending: false,
+      status: "superseded",
+      supersededAt: now().toISOString(),
+      supersededBy: `healthy-proxy:${status.instanceToken}`,
+    }, fsImpl);
+  }
+  const fallback = readJsonObject(options.fallbackFilePath, fsImpl);
+  if (fallback.pending === true && fallback.expectedProxyUrl === status.downstreamUrl) {
+    fsImpl.rmSync(options.fallbackFilePath, { force: true });
+  }
 }
 
 function ensureControlToken(tokenFilePath, fsImpl = fs) {
@@ -428,17 +524,23 @@ export async function runCodexAppServerProxyService(options = {}) {
     fsImpl,
     pid,
     startedAt,
+    validateExistingProcess: (metadata) => {
+      const commandLine = (options.processCommandLine ?? processCommandLine)(Number(metadata?.pid));
+      const normalized = commandLine.toLowerCase();
+      return normalized.includes("codex-app-server-proxy-runner.mjs")
+        && normalized.includes(options.runtimeStatePath.toLowerCase())
+        && normalized.includes(options.lockPath.toLowerCase());
+    },
     validateExistingLock: (metadata) => {
       const lockStartedAt = Date.parse(metadata?.startedAt ?? "");
       const currentMs = new Date(now()).getTime();
-      if (Number.isFinite(lockStartedAt) && currentMs >= lockStartedAt && currentMs - lockStartedAt < 15_000) return true;
+      if (Number.isFinite(lockStartedAt) && currentMs >= lockStartedAt && currentMs - lockStartedAt <= (options.startupGraceMs ?? 60_000)) return true;
       const runtime = readJsonObject(options.runtimeStatePath, fsImpl);
-      const updatedAt = Date.parse(runtime.updatedAt ?? runtime.startedAt ?? "");
       return Number(runtime.pid) === Number(metadata?.pid)
         && runtime.instanceToken === metadata?.token
+        && runtime.startedAt === metadata?.startedAt
         && ["starting", "running"].includes(runtime.state)
-        && Number.isFinite(updatedAt)
-        && currentMs - updatedAt < 300_000;
+        && processAlive(Number(metadata?.pid));
     },
   });
   if (!lock.acquired) return { state: "duplicate", pid, existingLock: lock.existing };
@@ -473,7 +575,9 @@ export async function runCodexAppServerProxyService(options = {}) {
     lastError: null,
     stopReason: null,
   };
+  const ownsLock = () => lock.isOwner();
   const persist = (patch = {}) => {
+    if (!ownsLock()) throw new CodexAppServerProxyError("INSTANCE_LOCK_LOST", "Codex App Server proxy instance no longer owns the lifecycle lock");
     status = { ...status, ...patch, updatedAt: now().toISOString() };
     atomicWriteJson(options.runtimeStatePath, status, fsImpl);
     return status;
@@ -500,6 +604,7 @@ export async function runCodexAppServerProxyService(options = {}) {
     };
   };
   const markFatal = (error) => {
+    if (!ownsLock()) return false;
     const errorValue = publicError(error, "CODEX_PROXY_INCOMPATIBLE");
     const at = now().toISOString();
     updateMaintenance(options.maintenanceFilePath, "codexAppServerProxy", {
@@ -534,10 +639,12 @@ export async function runCodexAppServerProxyService(options = {}) {
       lastError: errorValue,
     });
     log("proxy_fatal", { error: errorValue });
+    return true;
   };
 
   try {
     signalCleanup = installSignals();
+    persist();
     const candidates = codexCandidates({
       fsImpl,
       executablePath: options.executablePath,
@@ -571,16 +678,14 @@ export async function runCodexAppServerProxyService(options = {}) {
       fallbackRequired: false,
       lastError: null,
     });
-    updateMaintenance(options.maintenanceFilePath, "codexAppServerProxy", null, fsImpl);
-
     const journal = options.journal ?? createWakeJournal({ filePath: options.journalPath, fsImpl, now });
-    const pauseForUpstream = (code, message) => updateMaintenance(
+    const pauseForUpstream = (code, message) => ownsLock() && updateMaintenance(
       options.maintenanceFilePath,
       "codexAppServerProxyUpstream",
       { at: now().toISOString(), code, message },
       fsImpl,
     );
-    const resumeAfterUpstream = () => updateMaintenance(
+    const resumeAfterUpstream = () => ownsLock() && updateMaintenance(
       options.maintenanceFilePath,
       "codexAppServerProxyUpstream",
       null,
@@ -632,6 +737,10 @@ export async function runCodexAppServerProxyService(options = {}) {
           restartFailureCount,
           lastError: null,
         });
+        if (ownsLock()) {
+          updateMaintenance(options.maintenanceFilePath, "codexAppServerProxy", null, fsImpl);
+          resolveProxyFailureArtifacts(options, status, fsImpl, now);
+        }
         log("app_server_started", { executablePath: currentExecutable, appServerPid: appServer.pid ?? null });
         const exit = await Promise.race([
           waitForExit(appServer),
@@ -703,9 +812,8 @@ export async function runCodexAppServerProxyService(options = {}) {
         error: publicError(error),
       });
     }
-    fsImpl.rmSync(options.stopFilePath, { force: true });
-    lock.release();
-    if (!shutdownError && status.state !== "degraded") {
+    if (ownsLock()) fsImpl.rmSync(options.stopFilePath, { force: true });
+    if (ownsLock() && !shutdownError && status.state !== "degraded") {
       persist({
         state: "stopped",
         automationEnabled: false,
@@ -714,11 +822,12 @@ export async function runCodexAppServerProxyService(options = {}) {
         stopReason: stopReason ?? "completed",
       });
     }
-    log(shutdownError ? "proxy_service_degraded" : "proxy_service_stopped", {
+    log(ownsLock() ? (shutdownError ? "proxy_service_degraded" : "proxy_service_stopped") : "proxy_service_lock_lost", {
       stopReason: stopReason ?? "completed",
       appServerPid: shutdownError ? (appServer?.pid ?? status.appServerPid ?? null) : null,
       error: shutdownError ? publicError(shutdownError) : null,
     });
+    lock.release();
   }
   return shutdownError
     ? { state: "failed", pid, stopReason, error: publicError(shutdownError) }

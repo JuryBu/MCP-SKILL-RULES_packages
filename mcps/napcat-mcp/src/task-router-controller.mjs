@@ -45,6 +45,8 @@ export function createTaskRouterController(options = {}) {
     log: path.resolve(environment.NAPCAT_TASK_ROUTER_LOG_PATH ?? path.join(stateDir, "task-router.jsonl")),
     stopFile: path.resolve(environment.NAPCAT_TASK_ROUTER_STOP_PATH ?? path.join(stateDir, "task-router.stop")),
     lock: path.resolve(environment.NAPCAT_TASK_ROUTER_LOCK_PATH ?? path.join(stateDir, "task-router.lock")),
+    maintenance: path.resolve(environment.NAPCAT_TASK_ROUTER_MAINTENANCE_PATH ?? path.join(stateDir, "task-router.maintenance.json")),
+    alert: path.resolve(environment.NAPCAT_TASK_ROUTER_ALERT_PATH ?? path.join(stateDir, "automation-alert.json")),
   };
   const intervalMs = Math.max(1000, Number(environment.NAPCAT_TASK_ROUTER_INTERVAL_MS ?? 30000));
 
@@ -87,6 +89,8 @@ export function createTaskRouterController(options = {}) {
       "--log", paths.log,
       "--stop-file", paths.stopFile,
       "--lock", paths.lock,
+      "--maintenance-file", paths.maintenance,
+      "--alert-file", paths.alert,
       "--interval-ms", String(intervalMs),
     ];
     const child = spawnProcess(nodePath, argumentsList, {

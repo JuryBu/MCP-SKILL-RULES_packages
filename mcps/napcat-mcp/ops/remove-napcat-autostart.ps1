@@ -10,37 +10,23 @@ $ErrorActionPreference = "Stop"
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $StatePath = Join-Path $DataRoot "napcat-supervisor-autostart.json"
 $StopScript = Join-Path $NapCatMcpRoot "ops\stop-napcat-supervisor.ps1"
+$StopWatchdogScript = Join-Path $NapCatMcpRoot "ops\stop-napcat-supervisor-watchdog.ps1"
 $InstallState = $null
 if (Test-Path -LiteralPath $StatePath) {
   $InstallState = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
   if (-not [string]::IsNullOrWhiteSpace([string]$InstallState.taskName)) { $TaskName = [string]$InstallState.taskName }
 }
 
-function Stop-TaskInstance {
-  param([string]$Name)
-
-  $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
-  if ($null -eq $Task -or [string]$Task.State -ne "Running") { return }
-  Stop-ScheduledTask -TaskName $Name -ErrorAction Stop
-  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
-  do {
-    Start-Sleep -Milliseconds 250
-    $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
-  } while ($null -ne $Task -and [string]$Task.State -eq "Running" -and [DateTime]::UtcNow -lt $Deadline)
-  if ($null -ne $Task -and [string]$Task.State -eq "Running") {
-    throw "Scheduled task is still running after the stop request: $Name"
-  }
-}
-
 $CurrentTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $Removed = $false
+if (-not (Test-Path -LiteralPath $StopWatchdogScript)) { throw "Supervisor watchdog stop script not found: $StopWatchdogScript" }
+& $StopWatchdogScript -DataRoot $DataRoot -TaskName $TaskName | Out-Null
 if ($null -ne $CurrentTask) {
   if ($PSCmdlet.ShouldProcess($TaskName, "remove NapCat/Codex logon task")) {
     $Stamp = (Get-Date -Format "yyyyMMdd-HHmmss-fff") + "-" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
     $RemovalBackup = Join-Path $DataRoot ("backups\napcat-supervisor-remove-" + $Stamp)
     New-Item -ItemType Directory -Force -Path $RemovalBackup | Out-Null
     Export-ScheduledTask -TaskName $TaskName | Set-Content -LiteralPath (Join-Path $RemovalBackup "scheduled-task.xml") -Encoding UTF8
-    Stop-TaskInstance -Name $TaskName
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
     $Removed = $true
   }

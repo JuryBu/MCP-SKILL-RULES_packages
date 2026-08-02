@@ -34,7 +34,11 @@ test("autostart launches one hidden detached runner with fixed paths", () => {
   assert.equal(calls[0].options.windowsHide, true);
   assert.equal(calls[0].options.stdio, "ignore");
   assert.equal(calls[0].unref, true);
-  assert.deepEqual(calls[0].args.slice(-2), ["--interval-ms", "45000"]);
+  assert.deepEqual(calls[0].args.slice(-6), [
+    "--maintenance-file", path.join(rootDir, "state", "task-router.maintenance.json"),
+    "--alert-file", path.join(rootDir, "state", "automation-alert.json"),
+    "--interval-ms", "45000",
+  ]);
 });
 
 test("live runtime suppresses duplicate spawn", () => {

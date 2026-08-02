@@ -1,0 +1,43 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
+import test from "node:test";
+
+function read(relativePath) {
+  return fs.readFileSync(path.resolve(relativePath), "utf8");
+}
+
+test("update, activation, and rollback share one lifecycle lock", () => {
+  for (const scriptPath of [
+    "ops/update-codex-napcat-bridge.ps1",
+    "ops/activate-codex-app-server-when-idle.ps1",
+    "ops/rollback-codex-napcat-bridge.ps1",
+  ]) {
+    assert.match(read(scriptPath), /napcat-bridge-update\.lock/);
+  }
+});
+
+test("idle activation fails closed and replaces every managed component", () => {
+  const script = read("ops/activate-codex-app-server-when-idle.ps1");
+  assert.match(script, /\$Status\.ok -ne \$true -or \$null -eq \$Status\.control/);
+  assert.match(script, /continue/);
+  for (const scriptName of [
+    "stop-napcat-task-router.ps1",
+    "stop-napcat-supervisor.ps1",
+    "stop-codex-app-server-proxy.ps1",
+    "start-codex-app-server-proxy.ps1",
+    "start-napcat-supervisor.ps1",
+    "start-napcat-task-router.ps1",
+  ]) {
+    assert.ok(script.includes(scriptName), `activation must call ${scriptName}`);
+  }
+  assert.match(script, /Start-ScheduledTask -TaskName \$SupervisorTaskName/);
+});
+
+test("staged updates keep automatic wake paused until live activation succeeds", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  assert.match(script, /pendingActivation = \(-not \$Activated\)/);
+  assert.match(script, /PACKAGE_UPDATE_PENDING_ACTIVATION/);
+  assert.match(script, /if \(\$Activated\) \{/);
+  assert.match(script, /Write-JsonAtomic -Path \$LastKnownGoodPointerPath/);
+});

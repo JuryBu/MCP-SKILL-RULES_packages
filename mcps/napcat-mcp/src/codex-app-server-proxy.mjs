@@ -165,19 +165,27 @@ export function createWakeJournal(options = {}) {
     const subscription = normalizeSubscription(input);
     const state = readJournal(filePath, fsImpl);
     const existing = state.subscriptions[subscription.taskId] ?? null;
-    if (existing && !sameFields(existing, subscription, SUBSCRIPTION_FIELDS)) {
+    if (existing && sameFields(existing, subscription, SUBSCRIPTION_FIELDS)) {
+      return { subscription: existing, created: false, updated: false };
+    }
+    if (existing && subscription.generation > Number(existing.generation)) {
+      const next = { ...subscription, createdAt: existing.createdAt, updatedAt: now().toISOString() };
+      state.subscriptions[subscription.taskId] = next;
+      atomicWriteJson(filePath, state, fsImpl);
+      return { subscription: next, created: false, updated: true };
+    }
+    if (existing) {
       throw new CodexAppServerProxyError(
         "SUBSCRIPTION_CONFLICT",
         `taskId 已登记不同的 Codex 订阅：${subscription.taskId}`,
         { details: { existing, requested: subscription } },
       );
     }
-    if (existing) return { subscription: existing, created: false };
     const nowIso = now().toISOString();
     const next = { ...subscription, createdAt: nowIso, updatedAt: nowIso };
     state.subscriptions[subscription.taskId] = next;
     atomicWriteJson(filePath, state, fsImpl);
-    return { subscription: next, created: true };
+    return { subscription: next, created: true, updated: false };
   }
 
   function claimWake(input) {

@@ -28,9 +28,12 @@ function Test-ExpectedProxyRuntime {
   param($RuntimeState, $ProcessInfo)
   if ($null -eq $RuntimeState -or $null -eq $ProcessInfo -or [string]$RuntimeState.state -ne "running") { return $false }
   $CommandLine = [string]$ProcessInfo.CommandLine
-  if ($CommandLine.IndexOf($RunnerPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  if ($CommandLine.IndexOf("codex-app-server-proxy-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($LockPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  $DownstreamOwner = Get-NetTCPConnection -State Listen -LocalPort $DownstreamPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @("127.0.0.1", "::1") } | Select-Object -First 1 -ExpandProperty OwningProcess
+  $ControlOwner = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @("127.0.0.1", "::1") } | Select-Object -First 1 -ExpandProperty OwningProcess
+  if ([int]$DownstreamOwner -ne [int]$RuntimeState.pid -or [int]$ControlOwner -ne [int]$RuntimeState.pid) { return $false }
   if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
   try {
     $LockState = Get-Content -LiteralPath $LockPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -120,16 +123,19 @@ $Deadline = [DateTime]::UtcNow.AddSeconds(30)
 do {
   Start-Sleep -Milliseconds 200
   if (Test-Path -LiteralPath $RuntimeStatePath) {
+    $CandidateState = $null
     try {
       $CandidateState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-      $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$CandidateState.pid)" -ErrorAction SilentlyContinue
-       if (Test-ExpectedProxyRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
-       if ([string]$CandidateState.state -eq "degraded") {
-         $FailureMessage = if ($CandidateState.lastError.message) { [string]$CandidateState.lastError.message } else { "unknown proxy failure" }
-         throw "Codex App Server proxy entered degraded mode: $FailureMessage"
-       }
-       $RuntimeState = $null
     } catch {
+      $RuntimeState = $null
+    }
+    if ($null -ne $CandidateState) {
+      $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$CandidateState.pid)" -ErrorAction SilentlyContinue
+      if (Test-ExpectedProxyRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
+      if ([string]$CandidateState.state -eq "degraded") {
+        $FailureMessage = if ($CandidateState.lastError.message) { [string]$CandidateState.lastError.message } else { "unknown proxy failure" }
+        throw "Codex App Server proxy entered degraded mode: $FailureMessage"
+      }
       $RuntimeState = $null
     }
   }

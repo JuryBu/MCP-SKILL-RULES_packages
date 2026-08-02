@@ -5,9 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $RuntimeStatePath = Join-Path $DataRoot "state\supervisor-runtime.json"
-$RunnerPath = Join-Path $NapCatMcpRoot "src\supervisor-runner.mjs"
 
 $RuntimeState = $null
 if (Test-Path -LiteralPath $RuntimeStatePath) {
@@ -27,12 +25,26 @@ if ($null -ne $ScheduledTask) {
     lastRunTime = $ScheduledTaskInfo.LastRunTime
     lastTaskResult = $ScheduledTaskInfo.LastTaskResult
     nextRunTime = $ScheduledTaskInfo.NextRunTime
+    actions = @($ScheduledTask.Actions | ForEach-Object { [ordered]@{ execute = $_.Execute; arguments = $_.Arguments } })
   }
 }
+$CommandLine = if ($null -ne $Process) { [string]$Process.CommandLine } else { "" }
+$SupervisorAlive = $null -ne $Process -and
+  $CommandLine.IndexOf("supervisor-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+  $CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+$NormalizedDataRoot = [System.IO.Path]::GetFullPath($DataRoot)
+$Watchdogs = @(Get-CimInstance Win32_Process | Where-Object {
+  $CandidateCommandLine = [string]$_.CommandLine
+  $_.Name -in @("powershell.exe", "pwsh.exe", "wscript.exe") -and
+  $CandidateCommandLine.IndexOf("Run-NapCatSupervisorWatchdog.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+  $CandidateCommandLine.IndexOf($NormalizedDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+} | Select-Object ProcessId, Name, CommandLine)
 
 [pscustomobject]@{
-  alive = ($null -ne $Process -and [string]$Process.CommandLine -like "*$RunnerPath*")
+  alive = $SupervisorAlive
   runtimeState = $RuntimeState
   runtimeStatePath = $RuntimeStatePath
   scheduledTask = $ScheduledTaskPayload
+  watchdogCount = $Watchdogs.Count
+  watchdogProcesses = $Watchdogs
 } | ConvertTo-Json -Depth 12

@@ -39,6 +39,32 @@ function waitFor(predicate, timeoutMs = 5000) {
   });
 }
 
+test("wake journal replaces a subscription only when generation increases", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-subscription-generation-test-"));
+  const journal = createWakeJournal({ filePath: path.join(root, "wake-journal.json") });
+  const base = {
+    taskId: "task-generation-test",
+    generation: 1,
+    threadId: "thread-g1",
+    localRole: "development",
+    sourceMachine: "training",
+    targetMachine: "development",
+    trustedPeerQq: "1000000001",
+  };
+  try {
+    assert.equal(journal.registerSubscription(base).created, true);
+    const replaced = journal.registerSubscription({ ...base, generation: 2, threadId: "thread-g2" });
+    assert.equal(replaced.updated, true);
+    assert.equal(replaced.subscription.threadId, "thread-g2");
+    assert.throws(
+      () => journal.registerSubscription({ ...base, threadId: "thread-stale" }),
+      (error) => error.code === "SUBSCRIPTION_CONFLICT",
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("transparent proxy keeps Desktop connected while App Server restarts", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   let upstream = null;

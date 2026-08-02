@@ -5,6 +5,7 @@ param(
   [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $(if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Join-Path $env:USERPROFILE ".codex\mcp-http-broker" }),
   [string]$SourceCommit = "unknown",
+  [string]$SupervisorTaskName = "CodexNapCatSupervisor",
   [ValidateRange(10, 600)][int]$QuiesceTimeoutSeconds = 120,
   [bool]$ActivateNow = $true,
   [switch]$MigrateAutostart,
@@ -250,6 +251,8 @@ try {
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_LOG_PATH -NotePropertyValue (Join-Path $StateRoot "task-router.jsonl") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_STOP_PATH -NotePropertyValue (Join-Path $StateRoot "task-router.stop") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_LOCK_PATH -NotePropertyValue (Join-Path $StateRoot "task-router.lock") -Force
+  $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_MAINTENANCE_PATH -NotePropertyValue $MaintenancePath -Force
+  $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_ALERT_PATH -NotePropertyValue $AlertPath -Force
   if ([string]::IsNullOrWhiteSpace([string]$PrivateEnv.CODEX_MCP_BROKER_CONTROL_TOKEN)) {
     [byte[]]$ControlTokenBytes = New-Object byte[] 32
     $Random = [System.Security.Cryptography.RandomNumberGenerator]::Create()
@@ -259,6 +262,25 @@ try {
   Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 
   if ($ActivateNow) {
+    $ExistingProxyRuntimePath = Join-Path $StateRoot "codex-app-server-proxy-runtime.json"
+    $ExistingProxyStatusScript = Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1"
+    if (Test-Path -LiteralPath $ExistingProxyRuntimePath) {
+      if (-not (Test-Path -LiteralPath $ExistingProxyStatusScript)) {
+        throw "Cannot prove that the current Codex proxy is idle; stage the update with -ActivateNow:`$false."
+      }
+      $ExistingProxyStatus = & $ExistingProxyStatusScript -DataRoot $DataRoot | ConvertFrom-Json
+      if ($ExistingProxyStatus.ok -ne $true) {
+        throw "Cannot prove that the current Codex proxy is idle; stage the update with -ActivateNow:`$false."
+      }
+      if ([int]$ExistingProxyStatus.control.clientCount -gt 0) {
+        throw "Codex Desktop is still connected to the managed proxy; stage the update with -ActivateNow:`$false and activate after Codex exits normally."
+      }
+    }
+    $StopWatchdogScript = Join-Path $CodeRoot "ops\stop-napcat-supervisor-watchdog.ps1"
+    if (-not (Test-Path -LiteralPath $StopWatchdogScript)) {
+      throw "Installed watchdog stop script is missing: $StopWatchdogScript"
+    }
+    & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
     foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
       $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
       if (Test-Path -LiteralPath $ScriptPath) {
@@ -274,7 +296,7 @@ try {
       }
     }
     if ($MigrateAutostart) {
-      & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -StartNow | Out-Null
+      & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -TaskName $SupervisorTaskName | Out-Null
     }
     & (Join-Path $CodeRoot "ops\reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null
     & (Join-Path $CodeRoot "ops\start-codex-app-server-proxy.ps1") -DataRoot $DataRoot | Out-Null
@@ -288,13 +310,18 @@ try {
   if ((Get-SnapshotJson $BeforeSnapshot) -ne (Get-SnapshotJson $AfterSnapshot)) {
     throw "Protected task routing or progress fields changed during the guarded update."
   }
-  Write-JsonAtomic -Path $LastKnownGoodPointerPath -Value ([ordered]@{
-    schemaVersion = 1; releaseId = $ReleaseId; releaseRoot = $ReleaseRoot; codeRoot = $CodeRoot; verifiedAt = (Get-Date).ToString("o"); sourceCommit = $SourceCommit
-  })
-  Set-UpdateMaintenance -Active $false
-  Resolve-StaleUpdateAlert
   if ($Activated) {
+    Write-JsonAtomic -Path $LastKnownGoodPointerPath -Value ([ordered]@{
+      schemaVersion = 1; releaseId = $ReleaseId; releaseRoot = $ReleaseRoot; codeRoot = $CodeRoot; verifiedAt = (Get-Date).ToString("o"); sourceCommit = $SourceCommit
+    })
+    Set-UpdateMaintenance -Active $false
+    Resolve-StaleUpdateAlert
     & (Join-Path $CodeRoot "ops\start-napcat-supervisor.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null
+    if ($null -ne (Get-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue)) {
+      Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction Stop
+    }
+  } else {
+    Set-UpdateMaintenance -Active $true -Code "PACKAGE_UPDATE_PENDING_ACTIVATION" -Message "Validated code is staged; automatic wake remains paused until guarded activation completes."
   }
   $ActivatedProxyUrl = if ($Activated) { [string]$ProxyStatus.runtime.downstreamUrl } else { $null }
   $Result = [ordered]@{
@@ -304,11 +331,13 @@ try {
     sourceRoot = $SourceRoot
     codeRoot = $CodeRoot
     dataRoot = $DataRoot
+    brokerRoot = $BrokerRoot
     backupRoot = $BackupRoot
     releaseId = $ReleaseId
     releaseRoot = $ReleaseRoot
     activated = $Activated
-    restartCodexRequired = $Activated
+    pendingActivation = (-not $Activated)
+    restartCodexRequired = $true
     protectedTaskCount = @($AfterSnapshot).Count
     previousUserAppServerWsUrl = $PreviousUserAppServerWsUrl
     activatedProxyUrl = $ActivatedProxyUrl
@@ -375,6 +404,7 @@ try {
   if (Test-Path -LiteralPath $PreviousSupervisorStartScript) {
     try { & $PreviousSupervisorStartScript -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null } catch {}
   }
+  try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue } catch {}
   throw
 } finally {
   if ($null -ne $LockStream) { $LockStream.Dispose() }

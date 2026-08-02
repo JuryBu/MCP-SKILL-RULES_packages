@@ -137,6 +137,70 @@ test("proxy lock rejects a live PID whose instance token is stale", () => {
   }
 });
 
+test("proxy lock remains valid for a matching live instance after long idle time", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-live-lock-test-"));
+  const paths = runtimePaths(root);
+  const startedAt = "2026-07-24T07:00:00.000Z";
+  const token = "matching-live-token";
+  try {
+    fs.writeFileSync(paths.lockPath, `${JSON.stringify({ pid: process.pid, startedAt, token })}\n`, "utf8");
+    fs.writeFileSync(paths.runtimeStatePath, `${JSON.stringify({
+      pid: process.pid,
+      instanceToken: token,
+      startedAt,
+      state: "running",
+    })}\n`, "utf8");
+
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      now: () => new Date("2026-07-24T09:00:00.000Z"),
+      processCommandLine: () => `node codex-app-server-proxy-runner.mjs --runtime-state ${paths.runtimeStatePath} --lock ${paths.lockPath}`,
+    });
+
+    assert.equal(result.state, "duplicate");
+    assert.equal(JSON.parse(fs.readFileSync(paths.lockPath, "utf8")).token, token);
+    assert.equal(fs.readdirSync(root).some((name) => name.includes(".stale-")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("proxy startup grace keeps a matching live owner while runtime state is not published yet", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-startup-lock-test-"));
+  const paths = runtimePaths(root);
+  const startedAt = "2026-07-24T08:59:30.000Z";
+  try {
+    fs.writeFileSync(paths.lockPath, `${JSON.stringify({ pid: process.pid, startedAt, token: "starting-token" })}\n`, "utf8");
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      now: () => new Date("2026-07-24T09:00:00.000Z"),
+      processCommandLine: () => `node codex-app-server-proxy-runner.mjs --runtime-state ${paths.runtimeStatePath} --lock ${paths.lockPath}`,
+    });
+    assert.equal(result.state, "duplicate");
+    assert.equal(fs.readdirSync(root).some((name) => name.includes(".stale-")), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an old lock owner cannot release a replacement owner lock", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-lock-fence-test-"));
+  const lockPath = path.join(root, "proxy.lock");
+  try {
+    const first = acquireInstanceLock(lockPath, { pid: process.pid, startedAt: "2026-07-24T09:00:00.000Z" });
+    assert.equal(first.acquired, true);
+    fs.rmSync(lockPath, { force: true });
+    const second = acquireInstanceLock(lockPath, { pid: process.pid, startedAt: "2026-07-24T09:00:01.000Z" });
+    assert.equal(second.acquired, true);
+    assert.equal(first.isOwner(), false);
+    first.release();
+    assert.equal(second.isOwner(), true);
+    second.release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("does not write stopped state or clear appServerPid while child exit is unconfirmed", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-stop-test-"));
   const paths = runtimePaths(root);
@@ -180,6 +244,35 @@ test("waits for a forced child termination to be confirmed before completing shu
   }
 });
 
+test("a healthy managed App Server supersedes stale proxy alerts and fallback requests", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-recovery-artifacts-test-"));
+  const paths = runtimePaths(root);
+  const child = createChildThatRequiresForceVerification((processHandle) => {
+    processHandle.exitCode = 137;
+    processHandle.emit("exit", 137, "SIGKILL");
+  });
+  fs.writeFileSync(paths.alertFilePath, `${JSON.stringify({
+    pending: true,
+    status: "pending",
+    source: "codex-app-server-proxy",
+    code: "APP_SERVER_RESTART_EXHAUSTED",
+  })}\n`, "utf8");
+  fs.writeFileSync(paths.fallbackFilePath, `${JSON.stringify({
+    pending: true,
+    expectedProxyUrl: `ws://127.0.0.1:${paths.downstreamPort}`,
+  })}\n`, "utf8");
+  try {
+    const result = await runCodexAppServerProxyService(createStoppingServiceOptions(paths, child));
+    assert.equal(result.state, "stopped");
+    const alert = JSON.parse(fs.readFileSync(paths.alertFilePath, "utf8"));
+    assert.equal(alert.pending, false);
+    assert.equal(alert.status, "superseded");
+    assert.equal(fs.existsSync(paths.fallbackFilePath), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("start script selects a backup loopback port when the default upstream port is occupied", { skip: process.platform !== "win32" }, async () => {
   const holder = net.createServer();
   await new Promise((resolve) => holder.listen(0, "127.0.0.1", resolve));
@@ -201,8 +294,10 @@ test("start script selects a backup loopback port when the default upstream port
     const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide: true });
     const selectedPort = Number(stdout.trim());
 
-    assert.notEqual(selectedPort, occupiedPort);
-    assert.equal(selectedPort, occupiedPort + 2);
+    assert.ok(selectedPort > occupiedPort && selectedPort <= occupiedPort + 32);
+    assert.notEqual(selectedPort, occupiedPort + 1);
+    assert.notEqual(selectedPort, occupiedPort + 3);
+    assert.notEqual(selectedPort, occupiedPort + 4);
   } finally {
     await new Promise((resolve, reject) => holder.close((error) => error ? reject(error) : resolve()));
   }

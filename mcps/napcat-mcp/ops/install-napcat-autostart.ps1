@@ -14,35 +14,23 @@ $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $SupervisorStartScript = Join-Path $NapCatMcpRoot "ops\start-napcat-supervisor.ps1"
 $WatchdogScript = Join-Path $NapCatMcpRoot "ops\Run-NapCatSupervisorWatchdog.ps1"
 $HiddenLauncher = Join-Path $NapCatMcpRoot "ops\Run-HiddenPowerShell.vbs"
+$StopWatchdogScript = Join-Path $NapCatMcpRoot "ops\stop-napcat-supervisor-watchdog.ps1"
 if (-not (Test-Path -LiteralPath $SupervisorStartScript)) { throw "Installed supervisor start script not found: $SupervisorStartScript" }
 if (-not (Test-Path -LiteralPath $WatchdogScript)) { throw "Installed supervisor watchdog not found: $WatchdogScript" }
 if (-not (Test-Path -LiteralPath $HiddenLauncher)) { throw "Hidden PowerShell launcher not found: $HiddenLauncher" }
+if (-not (Test-Path -LiteralPath $StopWatchdogScript)) { throw "Supervisor watchdog stop script not found: $StopWatchdogScript" }
 if ($DataRoot.Contains('"')) { throw "DataRoot cannot contain a double quote." }
 if ($BrokerRoot.Contains('"')) { throw "BrokerRoot cannot contain a double quote." }
+New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
 
 $StatePath = Join-Path $DataRoot "napcat-supervisor-autostart.json"
 $Stamp = (Get-Date -Format "yyyyMMdd-HHmmss-fff") + "-" + ([guid]::NewGuid().ToString("N").Substring(0, 8))
 $BackupDir = Join-Path $DataRoot ("backups\napcat-supervisor-" + $Stamp)
 $ExistingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $TaskExisted = $null -ne $ExistingTask
+$TaskWasRunning = $TaskExisted -and [string]$ExistingTask.State -eq "Running"
 $ExistingTaskXml = $null
 $BackupDirValue = $null
-
-function Stop-TaskInstance {
-  param([string]$Name)
-
-  $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
-  if ($null -eq $Task -or [string]$Task.State -ne "Running") { return }
-  Stop-ScheduledTask -TaskName $Name -ErrorAction Stop
-  $Deadline = [DateTime]::UtcNow.AddSeconds(10)
-  do {
-    Start-Sleep -Milliseconds 250
-    $Task = Get-ScheduledTask -TaskName $Name -ErrorAction SilentlyContinue
-  } while ($null -ne $Task -and [string]$Task.State -eq "Running" -and [DateTime]::UtcNow -lt $Deadline)
-  if ($null -ne $Task -and [string]$Task.State -eq "Running") {
-    throw "Scheduled task is still running after the stop request: $Name"
-  }
-}
 
 $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$HiddenLauncher`" `"$WatchdogScript`" -DataRoot `"$DataRoot`" -BrokerRoot `"$BrokerRoot`""
@@ -61,24 +49,48 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
     Copy-Item -LiteralPath $StatePath -Destination (Join-Path $BackupDir "napcat-supervisor-autostart.json") -Force
   }
   if (Test-Path -LiteralPath $BackupDir) { $BackupDirValue = $BackupDir }
-  if ($TaskExisted) { Stop-TaskInstance -Name $TaskName }
-  Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
-  $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-  $InstallState = [ordered]@{
-    schemaVersion = 1
-    installedAt = (Get-Date).ToString("o")
-    taskName = $TaskName
-    userId = $UserId
-    startScript = $WatchdogScript
-    supervisorStartScript = $SupervisorStartScript
-    hiddenLauncher = $HiddenLauncher
-    brokerRoot = $BrokerRoot
-    previousTaskExisted = $TaskExisted
-    previousTaskXml = $ExistingTaskXml
-    backupDir = $BackupDirValue
+  try {
+    & $StopWatchdogScript -DataRoot $DataRoot -TaskName $TaskName | Out-Null
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
+    $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $InstallState = [ordered]@{
+      schemaVersion = 1
+      installedAt = (Get-Date).ToString("o")
+      taskName = $TaskName
+      userId = $UserId
+      startScript = $WatchdogScript
+      supervisorStartScript = $SupervisorStartScript
+      hiddenLauncher = $HiddenLauncher
+      brokerRoot = $BrokerRoot
+      dataRoot = $DataRoot
+      previousTaskExisted = $TaskExisted
+      previousTaskXml = $ExistingTaskXml
+      backupDir = $BackupDirValue
+    }
+    [System.IO.File]::WriteAllText($StatePath, (($InstallState | ConvertTo-Json -Depth 8) + "`n"), $Utf8NoBom)
+    if ($StartNow) { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+  } catch {
+    $InstallFailure = $_.Exception.Message
+    $RollbackFailure = $null
+    try {
+      if ($TaskExisted -and $ExistingTaskXml -and (Test-Path -LiteralPath $ExistingTaskXml)) {
+        Register-ScheduledTask -TaskName $TaskName -Xml (Get-Content -LiteralPath $ExistingTaskXml -Raw -Encoding UTF8) -Force | Out-Null
+        if ($TaskWasRunning) { Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop }
+      } else {
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+      }
+      $PreviousStatePath = if ($BackupDirValue) { Join-Path $BackupDirValue "napcat-supervisor-autostart.json" } else { $null }
+      if ($PreviousStatePath -and (Test-Path -LiteralPath $PreviousStatePath)) {
+        Copy-Item -LiteralPath $PreviousStatePath -Destination $StatePath -Force
+      } else {
+        Remove-Item -LiteralPath $StatePath -Force -ErrorAction SilentlyContinue
+      }
+    } catch {
+      $RollbackFailure = $_.Exception.Message
+    }
+    if ($RollbackFailure) { throw "NapCat supervisor task installation failed: $InstallFailure; rollback also failed: $RollbackFailure" }
+    throw "NapCat supervisor task installation failed and the previous task was restored: $InstallFailure"
   }
-  [System.IO.File]::WriteAllText($StatePath, (($InstallState | ConvertTo-Json -Depth 8) + "`n"), $Utf8NoBom)
-  if ($StartNow) { Start-ScheduledTask -TaskName $TaskName }
 }
 
 [pscustomobject]@{

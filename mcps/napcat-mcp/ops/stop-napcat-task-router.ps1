@@ -25,7 +25,11 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
 $Deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
 do {
   $Process = if ($PidValue -gt 0) { Get-CimInstance Win32_Process -Filter "ProcessId = $PidValue" -ErrorAction SilentlyContinue } else { $null }
-  $Alive = $null -ne $Process -and [string]$Process.CommandLine -like "*$RunnerPath*"
+  $CommandLine = if ($null -ne $Process) { [string]$Process.CommandLine } else { "" }
+  $Alive = $null -ne $Process -and
+    $CommandLine.IndexOf("task-router-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+    $CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
+    $CommandLine.IndexOf($StopFilePath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
   if (-not $Alive) { break }
   Start-Sleep -Milliseconds 250
 } while ([DateTime]::UtcNow -lt $Deadline)

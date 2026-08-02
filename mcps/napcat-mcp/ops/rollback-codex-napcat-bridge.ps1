@@ -2,6 +2,7 @@
 param(
   [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $(if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Join-Path $env:USERPROFILE ".codex\mcp-http-broker" }),
+  [string]$SupervisorTaskName = "CodexNapCatSupervisor",
   [ValidateRange(10, 600)][int]$QuiesceTimeoutSeconds = 120
 )
 
@@ -122,6 +123,18 @@ try {
   $LockStream = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
   Set-RollbackMaintenance -Active $true -Code "PACKAGE_ROLLBACK" -Message "NapCat bridge rollback is in progress; automatic wake is paused."
 
+  $ProxyStatusScript = Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1"
+  if (Test-Path -LiteralPath $ProxyStatusScript) {
+    $ProxyStatus = & $ProxyStatusScript -DataRoot $DataRoot | ConvertFrom-Json
+    if ($ProxyStatus.ok -eq $true -and $null -ne $ProxyStatus.control -and [int]$ProxyStatus.control.clientCount -gt 0) {
+      throw "Codex Desktop is still connected to the managed proxy; exit Codex normally before rollback."
+    }
+  }
+  $StopWatchdogScript = Join-Path $CodeRoot "ops\stop-napcat-supervisor-watchdog.ps1"
+  if (Test-Path -LiteralPath $StopWatchdogScript) {
+    & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
+  }
+
   $Deadline = [DateTime]::UtcNow.AddSeconds($QuiesceTimeoutSeconds)
   do {
     $Current = Get-ProtectedTaskSnapshot -Path $RegistryPath
@@ -133,7 +146,17 @@ try {
 
   foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
     $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
-    if (Test-Path -LiteralPath $ScriptPath) { & $ScriptPath -DataRoot $DataRoot | Out-Null }
+    if (Test-Path -LiteralPath $ScriptPath) {
+      $StopResult = if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
+        & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | ConvertFrom-Json
+      } else {
+        & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
+      }
+      if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process." }
+      if ($ScriptName -eq "stop-codex-app-server-proxy.ps1" -and $StopResult.clean -ne $true) {
+        throw "$ScriptName left a managed process or listener behind."
+      }
+    }
   }
   $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
 
@@ -182,6 +205,9 @@ try {
   if (Test-Path -LiteralPath $RestoredTaskRouterScript) {
     & $RestoredTaskRouterScript -DataRoot $DataRoot | Out-Null
   }
+  if ($null -ne (Get-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue)) {
+    Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction Stop
+  }
 
   [pscustomobject]@{
     ok = $true
@@ -210,5 +236,6 @@ try {
   })
   throw
 } finally {
+  try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue } catch {}
   if ($null -ne $LockStream) { $LockStream.Dispose() }
 }
