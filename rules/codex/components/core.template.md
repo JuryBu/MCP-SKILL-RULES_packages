@@ -168,6 +168,8 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 
 Codex 侧 MCP 通过 HTTP broker（`127.0.0.1:14588`）暴露。broker 后端进程是共享的，不具备每对话独立的「当前对话」状态。
 
+固定消息路由的真实群、账号和可信对端只存在于本机私有 binding，公开 Rules 不得写死。两端迁移固定群时先约定带时区的绝对切换时间，短暂停止结构化发送并处理或留证旧群待确认消息，备份 binding 后同时原子切换；验证新群身份、路由和原有 open task 均正常再恢复，失败立即回滚，不能靠重建任务账本掩盖迁移问题。
+
 凡是会读取或写入当前对话的工具调用，必须显式传稳定 `conversationId`。持久资源（web_interact session、sandbox_session、sandbox_launch、sandbox_codex 后台任务等）也应显式带 `ownerId`。
 
 ### chain 参数

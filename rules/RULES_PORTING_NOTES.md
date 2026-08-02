@@ -29,6 +29,7 @@
 - Real host configuration paths and installed MCP capabilities.
 - Whether model fallback, cross-chain routing, and Windsurf-only automation are enabled locally.
 - Whether the optional NapCat endpoint is enabled; the receiver must supply a private OneBot token and fixed-group binding.
+- Fixed-group migrations are coordinated through private bindings and a shared cutover time; old and new group identities must not be committed to the public Rules.
 - Which search provider, models, and background-task limits are available in the receiver's environment.
 - Local authorization and credential storage; keep it outside package files.
 - Which Codex profile to install. Put machine-private facts in a repository-external override copied from `codex/local-overrides.example.md`.
