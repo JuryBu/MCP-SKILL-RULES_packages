@@ -276,10 +276,15 @@ if (fakeArgumentIndex >= 0) {
 
   test("transparent proxy bridge registers the full task subscription before wake", async () => {
     const calls = [];
+    let configuredVisibility = "visible";
     const bridge = createCodexThreadBridge({
       mode: "transparent_proxy",
       controlUrl: "http://127.0.0.1:18431",
       controlToken: "proxy-test-token",
+      bindingPath: "test-binding.json",
+      fsImpl: {
+        readFileSync: () => JSON.stringify({ codexWakeMessageVisibility: configuredVisibility }),
+      },
       fetchImpl: async (url, options) => {
         const route = new URL(url).pathname;
         const body = JSON.parse(options.body);
@@ -313,6 +318,24 @@ if (fakeArgumentIndex >= 0) {
       assert.equal(calls[0].body.generation, 3);
       assert.equal(calls[1].body.pendingThroughSequence, 99);
       assert.equal(calls[1].body.wakeId, "wake-proxy");
+      assert.equal(calls[1].body.messageVisibility, "visible");
+
+      configuredVisibility = "hidden";
+      await bridge.wake({
+        taskId: "task-proxy",
+        generation: 3,
+        threadId: "thread-proxy",
+        localRole: "development",
+        sourceMachine: "training",
+        targetMachine: "development",
+        trustedPeerQq: "1000000001",
+        wakeId: "wake-proxy-hidden",
+        pendingThroughSequence: 100,
+        pendingThroughTime: "2026-08-02T00:00:01.000Z",
+        promptSha256: "d".repeat(64),
+        prompt: "hidden wake prompt",
+      });
+      assert.equal(calls[3].body.messageVisibility, "hidden");
     } finally {
       await bridge.close();
     }

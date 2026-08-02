@@ -293,6 +293,170 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   assert.equal(journalState.wakes["wake-test-paused"].status, "failed_before_send");
 });
 
+test("visible wakes steer the active turn with a persisted client id while hidden keeps legacy start", { timeout: 15000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-visibility-test-"));
+  const steerRequests = [];
+  const startRequests = [];
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", (socket) => socket.on("message", (data) => {
+    const message = JSON.parse(data.toString("utf8"));
+    if (message.method === "initialize") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
+    } else if (message.method === "thread/resume") {
+      const idle = message.params.threadId === "thread-hidden-idle";
+      const missingTurnId = message.params.threadId === "thread-busy-without-turn-id";
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: {
+          thread: {
+            id: message.params.threadId,
+            status: idle ? "idle" : "inProgress",
+            turns: idle || missingTurnId ? [] : [{ id: "active-turn-1", status: "inProgress" }],
+          },
+        },
+      }));
+    } else if (message.method === "turn/steer") {
+      steerRequests.push(message.params);
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { turn: { id: message.params.expectedTurnId, status: "inProgress" } },
+      }));
+    } else if (message.method === "turn/start") {
+      startRequests.push(message.params);
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { turn: { id: "legacy-hidden-turn", status: "inProgress" } },
+      }));
+    }
+  }));
+  const journalPath = path.join(temporaryRoot, "wake-journal.json");
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "visibility-test-token",
+    journal: createWakeJournal({ filePath: journalPath }),
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise((resolve) => upstream.close(resolve));
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+  await waitFor(() => proxy.status().readyClientCount === 1);
+
+  const wake = {
+    taskId: "task-visibility",
+    generation: 1,
+    threadId: "thread-visibility",
+    localRole: "development",
+    sourceMachine: "training",
+    targetMachine: "development",
+    trustedPeerQq: "1000000001",
+    pendingThroughSequence: 300,
+    pendingThroughTime: "2026-08-03T00:00:00.000Z",
+  };
+  const visible = await proxy.wakeThread({
+    ...wake,
+    wakeId: "wake-visible",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-visible",
+  });
+  assert.equal(visible.injectionMethod, "turn/steer");
+  assert.equal(visible.messageVisibility, "visible");
+  assert.match(visible.clientUserMessageId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(steerRequests.length, 1);
+  assert.equal(steerRequests[0].expectedTurnId, "active-turn-1");
+  assert.equal(steerRequests[0].clientUserMessageId, visible.clientUserMessageId);
+
+  const hidden = await proxy.wakeThread({
+    ...wake,
+    taskId: "task-hidden-idle",
+    threadId: "thread-hidden-idle",
+    wakeId: "wake-hidden",
+    pendingThroughSequence: 301,
+    pendingThroughTime: "2026-08-03T00:00:01.000Z",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-hidden",
+    messageVisibility: "hidden",
+  });
+  assert.equal(hidden.injectionMethod, "turn/start");
+  assert.equal(hidden.messageVisibility, "hidden");
+  assert.equal(hidden.clientUserMessageId, null);
+  assert.equal(startRequests.length, 1);
+  assert.equal(Object.hasOwn(startRequests[0], "clientUserMessageId"), false);
+
+  const busyWithoutTurnId = await proxy.wakeThread({
+    ...wake,
+    taskId: "task-busy-without-turn-id",
+    threadId: "thread-busy-without-turn-id",
+    wakeId: "wake-busy-without-turn-id",
+    pendingThroughSequence: 302,
+    pendingThroughTime: "2026-08-03T00:00:02.000Z",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-busy-without-turn-id",
+  });
+  assert.equal(busyWithoutTurnId.outcome, "busy");
+  assert.equal(busyWithoutTurnId.started, false);
+  assert.equal(startRequests.length, 1);
+  assert.equal(steerRequests.length, 1);
+
+  const hiddenBusy = await proxy.wakeThread({
+    ...wake,
+    taskId: "task-hidden-busy",
+    wakeId: "wake-hidden-busy",
+    pendingThroughSequence: 303,
+    pendingThroughTime: "2026-08-03T00:00:03.000Z",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-hidden-busy",
+    messageVisibility: "hidden",
+  });
+  assert.equal(hiddenBusy.outcome, "busy");
+  assert.equal(hiddenBusy.started, false);
+  assert.equal(startRequests.length, 1);
+  assert.equal(steerRequests.length, 1);
+
+  const state = JSON.parse(fs.readFileSync(journalPath, "utf8"));
+  assert.equal(state.wakes["wake-visible"].clientUserMessageId, visible.clientUserMessageId);
+  assert.equal(state.wakes["wake-hidden"].clientUserMessageId, null);
+  assert.equal(state.wakes["wake-busy-without-turn-id"].status, "failed_before_send");
+  assert.equal(state.wakes["wake-hidden-busy"].status, "failed_before_send");
+});
+
+test("failed-before-send wake may adopt a newly configured visibility mode", () => {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-proxy-visibility-retry-"));
+  const journalPath = path.join(temporaryRoot, "wake-journal.json");
+  try {
+    const journal = createWakeJournal({ filePath: journalPath });
+    const wake = {
+      wakeId: "wake-visibility-retry",
+      taskId: "task-visibility-retry",
+      generation: 1,
+      threadId: "thread-visibility-retry",
+      promptSha256: "a".repeat(64),
+      pendingThroughSequence: 400,
+      pendingThroughTime: "2026-08-03T00:00:04.000Z",
+    };
+    const hidden = journal.claimWake({ ...wake, messageVisibility: "hidden" });
+    assert.equal(hidden.wake.clientUserMessageId, null);
+    journal.writeWake(wake.wakeId, { status: "failed_before_send" }, ["prepared"]);
+    const visible = journal.claimWake({ ...wake, messageVisibility: "visible" });
+    assert.equal(visible.acquired, true);
+    assert.equal(visible.wake.messageVisibility, "visible");
+    assert.match(visible.wake.clientUserMessageId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  } finally {
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  }
+});
+
 test("accepted turn with journal commit failure becomes unknown and is never resent", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   let turnStartCount = 0;

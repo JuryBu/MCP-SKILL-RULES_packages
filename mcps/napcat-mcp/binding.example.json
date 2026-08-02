@@ -18,6 +18,7 @@
   ],
   "minimumHeartbeatMinutes": 5,
   "dedupeRetentionDays": 30,
+  "codexWakeMessageVisibility": "visible",
   "requireGroupIdentityCheckBeforeSend": true,
   "requireMessageVerification": true
 }

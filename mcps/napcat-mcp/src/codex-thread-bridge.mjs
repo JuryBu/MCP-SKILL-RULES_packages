@@ -55,6 +55,29 @@ function optionalString(value, fallback = "") {
   return typeof value === "string" && value.trim() ? value.trim() : fallback;
 }
 
+function readWakeMessageVisibility(bindingPath, fsImpl = fs) {
+  if (!bindingPath) return "visible";
+  let binding;
+  try {
+    binding = JSON.parse(fsImpl.readFileSync(bindingPath, "utf8").replace(/^\uFEFF/, ""));
+  } catch (cause) {
+    throw new CodexThreadBridgeError(
+      "BINDING_READ_FAILED",
+      `无法读取 NapCat binding：${bindingPath}`,
+      { cause },
+    );
+  }
+  const visibility = optionalString(binding.codexWakeMessageVisibility, "visible").toLowerCase();
+  if (!["visible", "hidden"].includes(visibility)) {
+    throw new CodexThreadBridgeError(
+      "BINDING_INVALID",
+      "codexWakeMessageVisibility 只支持 visible 或 hidden",
+      { details: { bindingPath, visibility } },
+    );
+  }
+  return visibility;
+}
+
 function normalizeProtocolStatus(value) {
   if (typeof value !== "string") return "";
   return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
@@ -782,6 +805,10 @@ class CodexThreadBridge {
 class CodexProxyThreadBridge {
   constructor(options = {}) {
     this.env = options.env ?? process.env;
+    this.fsImpl = options.fsImpl ?? fs;
+    this.bindingPath = optionalString(
+      options.bindingPath ?? this.env.NAPCAT_MCP_BINDING_PATH,
+    );
     this.fetchImpl = options.fetchImpl ?? fetch;
     this.controlUrl = optionalString(
       options.controlUrl ?? this.env.CODEX_APP_SERVER_PROXY_CONTROL_URL,
@@ -831,6 +858,7 @@ class CodexProxyThreadBridge {
     const wakeId = requiredString(input.wakeId, "wakeId", 256);
     const taskId = requiredString(input.taskId, "taskId", 128);
     const generation = positiveInteger(input.generation, 0, 1, Number.MAX_SAFE_INTEGER);
+    const messageVisibility = readWakeMessageVisibility(this.bindingPath, this.fsImpl);
     const subscription = {
       taskId,
       generation,
@@ -849,6 +877,7 @@ class CodexProxyThreadBridge {
         pendingThroughSequence: input.pendingThroughSequence,
         pendingThroughTime: input.pendingThroughTime,
         promptSha256: input.promptSha256,
+        messageVisibility,
       }, { mutating: true });
       return {
         threadId,
@@ -880,6 +909,7 @@ class CodexProxyThreadBridge {
       closed: this.closed,
       mode: "transparent_proxy",
       controlUrl: this.controlUrl,
+      bindingPath: this.bindingPath || null,
       lastStatus: this.lastStatus,
       lastError: this.lastError,
     };

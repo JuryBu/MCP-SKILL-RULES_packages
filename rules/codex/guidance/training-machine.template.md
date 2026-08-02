@@ -60,6 +60,8 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
 
+任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
+
 没有新消息时不按计时重复发送旧提醒；有新消息时，任务级冷却结束后只合并唤醒一次，并同时带回此前仍待处理的消息。短时间连续到达的新消息不得不断推迟这次提醒。模型可以通过 `napcat_task_update` 调整当前任务的 `wake_cooldown_ms`，但不能跳过可信身份、代次和 ACK 约束。
 
 监督器只在 broker、正确账号 OneBot、NapCat 进程、Codex 进程和 open task 都满足时运行任务路由。快速登录失效时进入人工二维码恢复，不把「进程存在」误当成账号在线。

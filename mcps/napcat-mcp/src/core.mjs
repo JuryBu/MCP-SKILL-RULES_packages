@@ -82,6 +82,18 @@ function normalizeBinding(raw) {
   const allowedEvents = Array.isArray(raw.allowedEvents) && raw.allowedEvents.length
     ? raw.allowedEvents.map((event) => String(event))
     : DEFAULT_ALLOWED_EVENTS;
+  const codexWakeMessageVisibility = boundedString(
+    raw.codexWakeMessageVisibility ?? "visible",
+    "codexWakeMessageVisibility",
+    16,
+    true,
+  ).toLowerCase();
+  if (!["visible", "hidden"].includes(codexWakeMessageVisibility)) {
+    throw new NapCatNotifierError(
+      "UNSUPPORTED_BINDING",
+      "codexWakeMessageVisibility 只支持 visible 或 hidden",
+    );
+  }
   const binding = {
     schemaVersion: Number(raw.schemaVersion ?? 1),
     bindingName: boundedString(raw.bindingName ?? "example-group-notify", "bindingName", 128, true),
@@ -95,6 +107,7 @@ function normalizeBinding(raw) {
     dedupeRetentionDays: positiveInteger(raw.dedupeRetentionDays, 30, 1, 3650),
     requireGroupIdentityCheckBeforeSend: true,
     requireMessageVerification: raw.requireMessageVerification !== false,
+    codexWakeMessageVisibility,
   };
   if (binding.schemaVersion !== 1) {
     throw new NapCatNotifierError("UNSUPPORTED_BINDING", `不支持 binding schemaVersion=${binding.schemaVersion}`);

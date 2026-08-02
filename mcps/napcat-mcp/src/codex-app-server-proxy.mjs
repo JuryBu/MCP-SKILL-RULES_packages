@@ -49,6 +49,74 @@ function responseTurn(response) {
   return null;
 }
 
+function normalizeWakeMessageVisibility(value) {
+  const visibility = typeof value === "string" && value.trim()
+    ? value.trim().toLowerCase()
+    : "visible";
+  if (!["visible", "hidden"].includes(visibility)) {
+    throw new CodexAppServerProxyError(
+      "INVALID_ARGUMENT",
+      "messageVisibility 只支持 visible 或 hidden",
+    );
+  }
+  return visibility;
+}
+
+function normalizeTurnStatus(value) {
+  return typeof value === "string" ? value.trim().toLowerCase().replace(/[\s_-]+/g, "") : "";
+}
+
+const ACTIVE_TURN_STATUSES = new Set([
+  "active",
+  "inprogress",
+  "pending",
+  "queued",
+  "running",
+  "starting",
+  "streaming",
+  "working",
+]);
+
+function resumeResultIndicatesBusy(value, depth = 0) {
+  if (depth > 12 || value === null || value === undefined) return false;
+  if (Array.isArray(value)) return value.some((item) => resumeResultIndicatesBusy(item, depth + 1));
+  if (!isObject(value)) return false;
+  const status = normalizeTurnStatus(value.status ?? value.state);
+  if (ACTIVE_TURN_STATUSES.has(status)) return true;
+  if (Array.isArray(value.turns) && value.turns.some((turn) => ACTIVE_TURN_STATUSES.has(normalizeTurnStatus(turn?.status ?? turn?.state)))) {
+    return true;
+  }
+  return Object.values(value).some((child) => resumeResultIndicatesBusy(child, depth + 1));
+}
+
+function activeTurnFromResumeResult(value, depth = 0) {
+  if (depth > 12 || value === null || value === undefined) return null;
+  if (Array.isArray(value)) {
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+      const active = activeTurnFromResumeResult(value[index], depth + 1);
+      if (active) return active;
+    }
+    return null;
+  }
+  if (!isObject(value)) return null;
+  if (Array.isArray(value.turns)) {
+    for (let index = value.turns.length - 1; index >= 0; index -= 1) {
+      const turn = value.turns[index];
+      const status = normalizeTurnStatus(turn?.status ?? turn?.state);
+      if (
+        isObject(turn)
+        && typeof (turn.id ?? turn.turnId) === "string"
+        && ACTIVE_TURN_STATUSES.has(status)
+      ) return turn;
+    }
+  }
+  for (const child of Object.values(value)) {
+    const active = activeTurnFromResumeResult(child, depth + 1);
+    if (active) return active;
+  }
+  return null;
+}
+
 function publicError(error) {
   return {
     code: error?.code ?? "UNEXPECTED_ERROR",
@@ -192,6 +260,7 @@ export function createWakeJournal(options = {}) {
     const wakeId = requiredString(input.wakeId, "wakeId", 256);
     const state = readJournal(filePath, fsImpl);
     const existing = state.wakes[wakeId] ?? null;
+    const messageVisibility = normalizeWakeMessageVisibility(input.messageVisibility);
     const identity = {
       wakeId,
       taskId: requiredString(input.taskId, "taskId", 128),
@@ -218,6 +287,13 @@ export function createWakeJournal(options = {}) {
     if (existing && !sameFields(existing, identity, identityFields)) {
       throw new CodexAppServerProxyError("WAKE_ID_CONFLICT", `wakeId 已被不同请求使用：${wakeId}`);
     }
+    if (
+      existing?.status !== "failed_before_send"
+      && existing?.messageVisibility
+      && existing.messageVisibility !== messageVisibility
+    ) {
+      throw new CodexAppServerProxyError("WAKE_ID_CONFLICT", `wakeId 已绑定不同的消息可见性：${wakeId}`);
+    }
     if (existing && existing.status !== "failed_before_send") {
       return { wake: existing, acquired: false };
     }
@@ -225,6 +301,10 @@ export function createWakeJournal(options = {}) {
     const next = {
       ...(existing ?? {}),
       ...identity,
+      messageVisibility,
+      clientUserMessageId: messageVisibility === "visible"
+        ? existing?.clientUserMessageId ?? crypto.randomUUID()
+        : null,
       status: "prepared",
       attempt: Number(existing?.attempt ?? 0) + 1,
       createdAt: existing?.createdAt ?? nowIso,
@@ -414,6 +494,7 @@ export class CodexAppServerProxy {
     const threadId = subscriptionInput.threadId;
     const prompt = requiredString(input.prompt, "prompt", 100000);
     const wakeId = requiredString(input.wakeId, "wakeId", 256);
+    const messageVisibility = normalizeWakeMessageVisibility(input.messageVisibility);
     const promptHash = promptSha256(prompt);
     if (input.promptSha256 && input.promptSha256 !== promptHash) {
       throw new CodexAppServerProxyError("PROMPT_HASH_MISMATCH", `promptSha256 与正文不一致：${wakeId}`);
@@ -425,6 +506,7 @@ export class CodexAppServerProxy {
       promptSha256: promptHash,
       pendingThroughSequence: input.pendingThroughSequence,
       pendingThroughTime: input.pendingThroughTime,
+      messageVisibility,
     });
     const existing = claim.wake;
     if (!claim.acquired && ["accepted", "completed", "recovered"].includes(existing.status)) {
@@ -436,6 +518,8 @@ export class CodexAppServerProxy {
         duplicateSuppressed: true,
         recovered: existing.status === "recovered",
         turn: existing.turnId ? { id: existing.turnId, status: existing.turnStatus ?? null } : null,
+        messageVisibility: existing.messageVisibility ?? "hidden",
+        clientUserMessageId: existing.clientUserMessageId ?? null,
       };
     }
 
@@ -495,16 +579,51 @@ export class CodexAppServerProxy {
           { details: maintenance },
         );
       }
+      const primary = subscription.readyClients[0];
+      const resumeBusy = subscription.results.some((result) => resumeResultIndicatesBusy(result));
+      const activeTurn = messageVisibility === "visible"
+        ? subscription.results.map((result) => activeTurnFromResumeResult(result)).find(Boolean) ?? null
+        : null;
+      if (resumeBusy && (messageVisibility === "hidden" || !activeTurn)) {
+        const busy = this.journal.writeWake(wakeId, {
+          status: "failed_before_send",
+          error: {
+            code: "THREAD_BUSY",
+            message: messageVisibility === "hidden"
+              ? "目标线程忙碌，hidden 模式等待当前轮次结束后重试"
+              : "目标线程忙碌，但 App Server 未返回可安全 steer 的 active turn id",
+          },
+        }, ["prepared"]);
+        return {
+          threadId,
+          wakeId,
+          outcome: "busy",
+          started: false,
+          duplicateSuppressed: false,
+          recovered: false,
+          messageVisibility,
+          clientUserMessageId: busy?.clientUserMessageId ?? existing.clientUserMessageId ?? null,
+          turn: null,
+        };
+      }
       this.journal.writeWake(wakeId, {
         status: "dispatching",
         writerEpoch: this.writerEpoch,
       }, ["prepared"]);
-      const primary = subscription.readyClients[0];
+      const method = activeTurn ? "turn/steer" : "turn/start";
+      const params = {
+        threadId,
+        input: [{ type: "text", text: prompt }],
+        ...(activeTurn ? { expectedTurnId: activeTurn.id ?? activeTurn.turnId } : {}),
+        ...(messageVisibility === "visible"
+          ? { clientUserMessageId: existing.clientUserMessageId }
+          : {}),
+      };
       mutationAttempted = true;
       const result = await this.#injectRequest(
         primary,
-        "turn/start",
-        { threadId, input: [{ type: "text", text: prompt }] },
+        method,
+        params,
         { mutating: true, threadId },
       );
       const turn = responseTurn(result);
@@ -517,6 +636,7 @@ export class CodexAppServerProxy {
           status: outcome,
           turnId: turn?.id ?? turn?.turnId ?? null,
           turnStatus: turn?.status ?? null,
+          injectionMethod: method,
         }, ["dispatching"]);
       } catch (cause) {
         throw new CodexAppServerProxyError(
@@ -532,6 +652,9 @@ export class CodexAppServerProxy {
         started: true,
         duplicateSuppressed: false,
         recovered: false,
+        messageVisibility,
+        clientUserMessageId: existing.clientUserMessageId ?? null,
+        injectionMethod: method,
         subscribedClientCount: subscription.readyClients.length,
         turn,
         raw: result,
