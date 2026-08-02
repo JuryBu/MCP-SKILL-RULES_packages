@@ -69,9 +69,11 @@ test("guarded update can explicitly preserve active wakes without acknowledging 
 
 test("backend-only hot reload proves proxy files unchanged and never stops the proxy", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
+  const compatibilityBlock = script.match(/function Assert-BackendOnlyCompatible[\s\S]*?\n}/)?.[0] ?? "";
   assert.match(script, /\[switch\]\$BackendOnlyHotReload/);
   assert.match(script, /function Assert-BackendOnlyCompatible/);
   assert.match(script, /proxy-critical file changed/);
+  assert.doesNotMatch(compatibilityBlock, /activate-codex-app-server-when-idle\.ps1/);
   assert.match(script, /if \(\$BackendOnlyHotReload\) \{/);
   assert.match(script, /reload-broker-backend\.ps1/);
   assert.match(script, /Existing transparent proxy did not remain healthy/);

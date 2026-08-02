@@ -175,8 +175,7 @@ function Assert-BackendOnlyCompatible {
     "src\codex-app-server-proxy-runner.mjs",
     "ops\start-codex-app-server-proxy.ps1",
     "ops\stop-codex-app-server-proxy.ps1",
-    "ops\get-codex-app-server-proxy-status.ps1",
-    "ops\activate-codex-app-server-when-idle.ps1"
+    "ops\get-codex-app-server-proxy-status.ps1"
   )) {
     $PreviousPath = Join-Path $PreviousRoot $RelativePath
     $NextPath = Join-Path $NextRoot $RelativePath
