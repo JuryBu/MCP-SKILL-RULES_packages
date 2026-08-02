@@ -235,6 +235,8 @@ Task routing state is written below the receiver's `.codex-toolkit/napcat-mcp/st
 
 Install or update the code with the guarded updater. It keeps source code separate from private state, validates a candidate before replacement, pauses automatic wake during the switch, preserves task fields, and reloads only the NapCat backend. Existing legacy installs can use the documented one-time mixed-root flag after making the generated backup; fresh installs should keep the default separate roots.
 
+Treat the updater result as the source of truth: `activated=true` and `pendingActivation=false` mean the release is running; copied files or a staged candidate do not. Record the exact `sourceCommit`, then verify the active pointer, task registry, router paths, proxy status, and supervisor status before reporting the upgrade complete.
+
 ```powershell
 ./mcps/napcat-mcp/ops/update-codex-napcat-bridge.ps1 -SourceCommit "<git-commit>" -MigrateAutostart
 ./mcps/napcat-mcp/ops/get-codex-app-server-proxy-status.ps1

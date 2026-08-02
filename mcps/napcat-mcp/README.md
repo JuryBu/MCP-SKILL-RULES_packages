@@ -101,7 +101,7 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ./mcps/napcat-mcp/ops/get-napcat-task-router-status.ps1
 ```
 
-更新器先备份代码、任务账本、维护状态和 broker 私有环境，再写入维护暂停，等待所有 `wakePending/activeWakeId` 清空，随后在候选目录执行 `npm ci`、语法检查和完整测试。候选通过后才替换公开代码，停止并恢复 router/supervisor/proxy，最后只重载 broker 的 NapCat backend；broker PID 和其他 MCP 前端 session 保持不变。更新前后会比较每个任务的对话绑定、角色、可信对端、generation、open/closed 状态、last seen/ACK、冷却、租约和 active wake，任何意外变化都会停止完成流程并留下告警。
+更新器先备份代码、任务账本、维护状态和 broker 私有环境，再写入维护暂停，等待所有 `wakePending/activeWakeId` 清空，随后在候选目录执行 `npm ci`、语法检查和完整测试。候选通过后才替换公开代码，停止并恢复 router/supervisor/proxy，最后只重载 broker 的 NapCat backend；broker PID 和其他 MCP 前端 session 保持不变。更新前后会比较每个任务的对话绑定、角色、可信对端、generation、open/closed 状态、last seen/ACK、冷却、租约和 active wake，任何意外变化都会停止完成流程并留下告警。更新输出中的 `sourceCommit`、`activated` 和 `pendingActivation` 是运行态依据：只有 `activated=true` 且 `pendingActivation=false` 才表示新版本已经运行，候选写入或文件复制完成不能冒充热重载完成。
 
 首次启用透明中转后需要彻底退出并正常打开 Codex 一次，让 Desktop 继承新的 `CODEX_APP_SERVER_WS_URL`。以后仍按原方式启动 Codex。更新失败时不要手工删除 task；运行 `rollback-codex-napcat-bridge.ps1` 恢复上一个代码备份，或者保留维护状态等待排查。若上一个代理也无法恢复，更新器会清除用户级代理 URL、写入 fallback 请求，并让下一次 Codex 启动走官方原生路径；回滚同样只重载 NapCat backend，不重启整个 broker。
 
