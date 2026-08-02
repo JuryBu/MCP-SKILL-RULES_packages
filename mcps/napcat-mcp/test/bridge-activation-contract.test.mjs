@@ -42,6 +42,11 @@ test("staged updates keep automatic wake paused until live activation succeeds",
   assert.match(script, /Write-JsonAtomic -Path \$LastKnownGoodPointerPath/);
 });
 
+test("task router startup accepts the intentional maintenance state", () => {
+  const script = read("ops/start-napcat-task-router.ps1");
+  assert.match(script, /state -notin @\("running", "maintenance"\)/);
+});
+
 test("guarded update can explicitly preserve active wakes without acknowledging them", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
   assert.match(script, /\[switch\]\$PreserveActiveWakes/);

@@ -7,16 +7,39 @@ param(
 
 $ErrorActionPreference = "Stop"
 $NormalizedDataRoot = [System.IO.Path]::GetFullPath($DataRoot)
+
+function Test-WatchdogProcess {
+  param($ProcessInfo)
+
+  if ($null -eq $ProcessInfo -or [int]$ProcessInfo.ProcessId -eq $PID) { return $false }
+  if ([string]$ProcessInfo.Name -notin @("powershell.exe", "pwsh.exe", "wscript.exe")) { return $false }
+  $CommandLine = [string]$ProcessInfo.CommandLine
+  if ($CommandLine.IndexOf("Run-NapCatSupervisorWatchdog.ps1", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
+  $DataRootMatch = [regex]::Match($CommandLine, '(?i)(?:^|\s)-DataRoot\s+(?:"([^"]+)"|(\S+))')
+  if (-not $DataRootMatch.Success) { return $false }
+  $CandidateDataRoot = if (-not [string]::IsNullOrWhiteSpace($DataRootMatch.Groups[1].Value)) {
+    $DataRootMatch.Groups[1].Value
+  } else {
+    $DataRootMatch.Groups[2].Value
+  }
+  try {
+    $NormalizedCandidateDataRoot = [System.IO.Path]::GetFullPath($CandidateDataRoot)
+  } catch {
+    return $false
+  }
+  return [string]::Equals(
+    $NormalizedCandidateDataRoot.TrimEnd('\'),
+    $NormalizedDataRoot.TrimEnd('\'),
+    [System.StringComparison]::OrdinalIgnoreCase
+  )
+}
+
 if (-not $SkipScheduledTask) {
   Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 }
 
 $Candidates = Get-CimInstance Win32_Process | Where-Object {
-  $CommandLine = [string]$_.CommandLine
-  $_.ProcessId -ne $PID -and
-  $_.Name -in @("powershell.exe", "pwsh.exe", "wscript.exe") -and
-  $CommandLine.IndexOf("Run-NapCatSupervisorWatchdog.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-  $CommandLine.IndexOf($NormalizedDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+  Test-WatchdogProcess -ProcessInfo $_
 } | Sort-Object { if ($_.Name -in @("powershell.exe", "pwsh.exe")) { 0 } else { 1 } }
 
 $StoppedPids = @()
@@ -28,11 +51,7 @@ foreach ($ProcessInfo in $Candidates) {
 $Deadline = [DateTime]::UtcNow.AddSeconds(5)
 do {
   $Remaining = Get-CimInstance Win32_Process | Where-Object {
-    $CommandLine = [string]$_.CommandLine
-    $_.ProcessId -ne $PID -and
-    $_.Name -in @("powershell.exe", "pwsh.exe", "wscript.exe") -and
-    $CommandLine.IndexOf("Run-NapCatSupervisorWatchdog.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
-    $CommandLine.IndexOf($NormalizedDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    Test-WatchdogProcess -ProcessInfo $_
   }
   if (@($Remaining).Count -eq 0) { break }
   Start-Sleep -Milliseconds 200

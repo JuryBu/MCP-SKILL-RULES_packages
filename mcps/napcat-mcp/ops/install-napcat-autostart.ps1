@@ -34,7 +34,9 @@ $BackupDirValue = $null
 
 $UserId = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $Action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument "//B //NoLogo `"$HiddenLauncher`" `"$WatchdogScript`" -DataRoot `"$DataRoot`" -BrokerRoot `"$BrokerRoot`""
-$Trigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+$LogonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $UserId
+$RecoveryTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) -RepetitionInterval (New-TimeSpan -Minutes 1)
+$Triggers = @($LogonTrigger, $RecoveryTrigger)
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit (New-TimeSpan -Hours 0) -MultipleInstances IgnoreNew -Hidden -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
 $Principal = New-ScheduledTaskPrincipal -UserId $UserId -LogonType Interactive -RunLevel Limited
 
@@ -51,7 +53,7 @@ if ($PSCmdlet.ShouldProcess($TaskName, "register hidden NapCat/Codex supervisor 
   if (Test-Path -LiteralPath $BackupDir) { $BackupDirValue = $BackupDir }
   try {
     & $StopWatchdogScript -DataRoot $DataRoot -TaskName $TaskName | Out-Null
-    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
+    Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Triggers -Settings $Settings -Principal $Principal -Description "Keep the Codex MCP broker and fixed-account NapCat task router available after user logon." -Force | Out-Null
     $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
     $InstallState = [ordered]@{
       schemaVersion = 1

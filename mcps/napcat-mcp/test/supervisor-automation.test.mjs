@@ -107,6 +107,32 @@ test("CLI 与 PowerShell 都传入 automation maintenance/alert 文件", () => {
   }
 });
 
+test("后台启动脚本在 PATH 缺少 node 时回退到受管服务清单", () => {
+  for (const scriptName of [
+    "start-codex-app-server-proxy.ps1",
+    "start-napcat-supervisor.ps1",
+    "start-napcat-task-router.ps1",
+    "start-napcat-heartbeat.ps1",
+  ]) {
+    const scriptPath = fileURLToPath(new URL(`../ops/${scriptName}`, import.meta.url));
+    const script = fs.readFileSync(scriptPath, "utf8");
+    assert.match(script, /CODEX_TOOLKIT_NODE_EXE/);
+    assert.match(script, /service-manifest\.json/);
+    assert.match(script, /Get-Command node -ErrorAction SilentlyContinue/);
+    assert.doesNotMatch(script, /Get-Command node -ErrorAction Stop/);
+  }
+});
+
+test("监督器计划任务同时使用登录触发与每分钟恢复触发", () => {
+  const scriptPath = fileURLToPath(new URL("../ops/install-napcat-autostart.ps1", import.meta.url));
+  const script = fs.readFileSync(scriptPath, "utf8");
+  assert.match(script, /New-ScheduledTaskTrigger -AtLogOn/);
+  assert.match(script, /New-ScheduledTaskTrigger -Once/);
+  assert.match(script, /-RepetitionInterval \(New-TimeSpan -Minutes 1\)/);
+  assert.match(script, /-MultipleInstances IgnoreNew/);
+  assert.match(script, /-Trigger \$Triggers/);
+});
+
 test("维护活跃时关闭 supervisor gate，不启动 task router，也不改 task registry", async () => {
   const fixture = createFixture();
   let routerStartCount = 0;

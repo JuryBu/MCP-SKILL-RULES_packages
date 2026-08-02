@@ -106,7 +106,29 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
 
 New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot "state") | Out-Null
 if (Test-Path -LiteralPath $StopFilePath) { Remove-Item -LiteralPath $StopFilePath -Force }
-$NodePath = (Get-Command node -ErrorAction Stop).Source
+function Resolve-NodeExecutable {
+  $ConfiguredNode = [string]$env:CODEX_TOOLKIT_NODE_EXE
+  if (-not [string]::IsNullOrWhiteSpace($ConfiguredNode) -and (Test-Path -LiteralPath $ConfiguredNode -PathType Leaf)) {
+    return [System.IO.Path]::GetFullPath($ConfiguredNode)
+  }
+  $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
+    return [string]$NodeCommand.Source
+  }
+  $ManifestPath = Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+  if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
+    try {
+      $ManagedNode = [string](Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).broker.nodeExe
+      if (-not [string]::IsNullOrWhiteSpace($ManagedNode) -and (Test-Path -LiteralPath $ManagedNode -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath($ManagedNode)
+      }
+    } catch {
+    }
+  }
+  throw "Managed Node executable is unavailable."
+}
+
+$NodePath = Resolve-NodeExecutable
 
 function Quote-Argument {
   param([string]$Value)
