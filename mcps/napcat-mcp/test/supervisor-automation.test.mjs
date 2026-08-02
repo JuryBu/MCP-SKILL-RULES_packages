@@ -211,6 +211,43 @@ test("NapCat 恢复后发送一次无 task_id 告警，重复 cycle 不重复发
   }
 });
 
+test("已发送事件被旧组件重写为 pending 时自动恢复 sent 状态", async () => {
+  const fixture = createFixture();
+  const incidentKey = "example-group-recovered-1003";
+  const sentAt = "2026-08-02T01:00:00.000Z";
+  const sends = [];
+  try {
+    writeJson(fixture.runtimeStatePath, {
+      alert: { sentIncidentKeys: { [incidentKey]: sentAt } },
+    });
+    writeJson(fixture.automationAlertPath, {
+      status: "pending",
+      pending: true,
+      incidentKey,
+      text: "ExampleGroup 旧告警不应重复发送",
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      notifier: {
+        async sendTextMessage(input) {
+          sends.push(input);
+          return { sent: true, messageId: "unexpected" };
+        },
+      },
+    }));
+    const runtime = readJson(fixture.runtimeStatePath);
+    const alertFile = readJson(fixture.automationAlertPath);
+    assert.equal(sends.length, 0);
+    assert.equal(runtime.actions.alert.reason, "incident_already_sent");
+    assert.equal(runtime.alert.status, "sent");
+    assert.equal(runtime.alert.pending, false);
+    assert.equal(alertFile.status, "sent");
+    assert.equal(alertFile.pending, false);
+    assert.equal(alertFile.sentAt, sentAt);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("告警发送失败保留 pending 并递增重试，下一次恢复后才标 sent", async () => {
   const fixture = createFixture();
   const sends = [];

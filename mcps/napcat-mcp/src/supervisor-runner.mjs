@@ -1336,6 +1336,25 @@ export async function runSupervisorService(options = {}) {
             incidentKey: alert.incidentKey,
           };
         } else if (alreadySent) {
+          const sentAt = sentIncidentKeys[alert.incidentKey];
+          writeAlertState(alert.raw, {
+            status: "sent",
+            pending: false,
+            sent: true,
+            incidentKey: alert.incidentKey,
+            attempts: alert.attempts,
+            retryCount: alert.attempts,
+            lastAttemptAt: alert.lastAttemptAt,
+            lastError: null,
+            sentAt,
+          });
+          alertSummary = {
+            ...alertSummary,
+            status: "sent",
+            pending: false,
+            sentAt,
+            lastError: null,
+          };
           actions.alert = {
             attempted: false,
             reason: "incident_already_sent",
