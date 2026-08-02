@@ -88,7 +88,7 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 
 公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。
 
-面向日常使用者的安装应优先采用「先准备、后重启」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，再由一次 Windows 重启统一清理旧代理与旧 App Server，登录后正常打开 Codex。运行中的无感热切换只保留给明确知道当前进程边界的维护场景，不能作为同步包默认行为。
+面向日常使用者的安装应优先采用「先准备、后退出 Codex 激活」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，隐藏激活器等待 Codex 与代理自然断开后，只清理受管代理和它启动的官方 App Server。用户正常退出 Codex、等待约 10 秒再打开即可，不需要重启 Windows；任何清理失败都必须保留旧任务和本地状态、暂停自动唤醒并报警，不能终止 Codex Desktop 或按进程名误杀其它实例。
 
 ```powershell
 # 在仓库根目录执行；首次迁移计划任务时加 -MigrateAutostart
