@@ -36,9 +36,12 @@ export function createTaskRouterController(options = {}) {
   const processKill = options.processKill ?? process.kill.bind(process);
   const nodePath = options.nodePath ?? process.execPath;
   const runnerPath = path.resolve(options.runnerPath ?? path.join(rootDir, "src", "task-router-runner.mjs"));
-  const stateDir = path.resolve(options.stateDir ?? path.join(rootDir, "state"));
+  const configuredRegistryPath = environment.NAPCAT_TASK_REGISTRY_PATH
+    ? path.resolve(environment.NAPCAT_TASK_REGISTRY_PATH)
+    : null;
+  const stateDir = path.resolve(options.stateDir ?? (configuredRegistryPath ? path.dirname(configuredRegistryPath) : path.join(rootDir, "state")));
   const paths = {
-    registry: path.resolve(environment.NAPCAT_TASK_REGISTRY_PATH ?? path.join(stateDir, "task-registry.json")),
+    registry: configuredRegistryPath ?? path.resolve(path.join(stateDir, "task-registry.json")),
     binding: path.resolve(environment.NAPCAT_MCP_BINDING_PATH ?? path.join(rootDir, "binding.json")),
     state: path.resolve(environment.NAPCAT_MCP_STATE_PATH ?? path.join(stateDir, "dedupe.json")),
     runtimeState: path.resolve(environment.NAPCAT_TASK_ROUTER_RUNTIME_PATH ?? path.join(stateDir, "task-router-runtime.json")),

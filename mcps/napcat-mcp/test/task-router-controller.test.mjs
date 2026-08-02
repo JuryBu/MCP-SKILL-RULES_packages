@@ -41,6 +41,22 @@ test("autostart launches one hidden detached runner with fixed paths", () => {
   ]);
 });
 
+test("a configured task registry anchors all default runtime state paths", () => {
+  const rootDir = fixture();
+  const dataStateDir = path.join(rootDir, "private-data", "state");
+  const registryPath = path.join(dataStateDir, "task-registry.json");
+  const controller = createTaskRouterController({
+    rootDir,
+    env: { NAPCAT_TASK_REGISTRY_PATH: registryPath },
+    processKill: () => { const error = new Error("missing"); error.code = "ESRCH"; throw error; },
+  });
+  const status = controller.status();
+  assert.equal(status.paths.registry, registryPath);
+  assert.equal(status.paths.runtimeState, path.join(dataStateDir, "task-router-runtime.json"));
+  assert.equal(status.paths.maintenance, path.join(dataStateDir, "task-router.maintenance.json"));
+  assert.equal(status.paths.alert, path.join(dataStateDir, "automation-alert.json"));
+});
+
 test("live runtime suppresses duplicate spawn", () => {
   const rootDir = fixture();
   const runtimePath = path.join(rootDir, "state", "task-router-runtime.json");

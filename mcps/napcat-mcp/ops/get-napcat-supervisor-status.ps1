@@ -39,12 +39,17 @@ $Watchdogs = @(Get-CimInstance Win32_Process | Where-Object {
   $CandidateCommandLine.IndexOf("Run-NapCatSupervisorWatchdog.ps1", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 -and
   $CandidateCommandLine.IndexOf($NormalizedDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
 } | Select-Object ProcessId, Name, CommandLine)
+$WatchdogInstances = @($Watchdogs | Where-Object { $_.Name -in @("powershell.exe", "pwsh.exe") })
+$WatchdogWrappers = @($Watchdogs | Where-Object { $_.Name -eq "wscript.exe" })
 
 [pscustomobject]@{
   alive = $SupervisorAlive
   runtimeState = $RuntimeState
   runtimeStatePath = $RuntimeStatePath
   scheduledTask = $ScheduledTaskPayload
-  watchdogCount = $Watchdogs.Count
+  watchdogCount = $WatchdogInstances.Count
+  watchdogInstanceCount = $WatchdogInstances.Count
+  watchdogProcessCount = $Watchdogs.Count
+  watchdogWrapperCount = $WatchdogWrappers.Count
   watchdogProcesses = $Watchdogs
 } | ConvertTo-Json -Depth 12

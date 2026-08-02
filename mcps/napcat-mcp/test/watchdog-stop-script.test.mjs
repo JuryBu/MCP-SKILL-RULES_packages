@@ -10,6 +10,15 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const stopScript = path.resolve(testRoot, "..", "ops", "stop-napcat-supervisor-watchdog.ps1");
+const statusScript = path.resolve(testRoot, "..", "ops", "get-napcat-supervisor-status.ps1");
+
+test("watchdog status separates logical instances from wrapper processes", () => {
+  const source = fs.readFileSync(statusScript, "utf8");
+  assert.match(source, /watchdogCount\s*=\s*\$WatchdogInstances\.Count/);
+  assert.match(source, /watchdogInstanceCount\s*=\s*\$WatchdogInstances\.Count/);
+  assert.match(source, /watchdogProcessCount\s*=\s*\$Watchdogs\.Count/);
+  assert.match(source, /watchdogWrapperCount\s*=\s*\$WatchdogWrappers\.Count/);
+});
 
 function isAlive(pid) {
   try {
