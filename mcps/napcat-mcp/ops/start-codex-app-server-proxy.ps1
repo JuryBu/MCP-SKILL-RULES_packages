@@ -153,6 +153,10 @@ do {
       $RuntimeState = $null
     }
     if ($null -ne $CandidateState) {
+      if ($null -eq $CandidateState.pid -or [int]$CandidateState.pid -ne [int]$Process.Id) {
+        $RuntimeState = $null
+        continue
+      }
       $RuntimeProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$CandidateState.pid)" -ErrorAction SilentlyContinue
       if (Test-ExpectedProxyRuntime -RuntimeState $CandidateState -ProcessInfo $RuntimeProcess) { $RuntimeState = $CandidateState; break }
       if ([string]$CandidateState.state -eq "degraded") {

@@ -11,6 +11,7 @@ import {
   acquireInstanceLock,
   parseArguments,
   runCodexAppServerProxyService,
+  terminateManagedAppServer,
 } from "../src/codex-app-server-proxy-runner.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -244,6 +245,35 @@ test("waits for a forced child termination to be confirmed before completing shu
   }
 });
 
+test("managed App Server shutdown tolerates delayed loopback-port release", async () => {
+  const child = createChildThatRequiresForceVerification();
+  let checks = 0;
+  await terminateManagedAppServer(child, 18453, {
+    terminateChild: async () => {
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+    },
+    verifyPortReleased: async () => {
+      checks += 1;
+      return checks >= 3;
+    },
+    portReleaseTimeoutMs: 100,
+    portReleasePollIntervalMs: 1,
+  });
+  assert.equal(checks, 3);
+});
+
+test("managed App Server shutdown does not probe an unrelated listener after its child is cleared", async () => {
+  let checks = 0;
+  await terminateManagedAppServer(null, 18453, {
+    verifyPortReleased: async () => {
+      checks += 1;
+      return false;
+    },
+  });
+  assert.equal(checks, 0);
+});
+
 test("a healthy managed App Server supersedes stale proxy alerts and fallback requests", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-recovery-artifacts-test-"));
   const paths = runtimePaths(root);
@@ -301,4 +331,12 @@ test("start script selects a backup loopback port when the default upstream port
   } finally {
     await new Promise((resolve, reject) => holder.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+test("start script ignores stale degraded runtime state from the previous proxy PID", () => {
+  const startScript = fs.readFileSync(path.resolve("ops/start-codex-app-server-proxy.ps1"), "utf8");
+  const staleGuardIndex = startScript.indexOf("[int]$CandidateState.pid -ne [int]$Process.Id");
+  const degradedCheckIndex = startScript.indexOf('[string]$CandidateState.state -eq "degraded"');
+  assert.ok(staleGuardIndex >= 0, "start script must fence runtime state by the newly spawned PID");
+  assert.ok(degradedCheckIndex > staleGuardIndex, "stale PID fencing must run before degraded-state handling");
 });

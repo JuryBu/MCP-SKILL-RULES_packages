@@ -341,9 +341,17 @@ function loopbackPortAvailable(port) {
   });
 }
 
-async function terminateManagedAppServer(child, port, options = {}) {
+export async function terminateManagedAppServer(child, port, options = {}) {
+  if (!child) return true;
   await (options.terminateChild ?? terminateChild)(child);
-  const released = await (options.verifyPortReleased ?? loopbackPortAvailable)(port);
+  const verifyPortReleased = options.verifyPortReleased ?? loopbackPortAvailable;
+  const deadline = Date.now() + (options.portReleaseTimeoutMs ?? 5000);
+  let released = false;
+  do {
+    released = await verifyPortReleased(port);
+    if (released || Date.now() >= deadline) break;
+    await wait(options.portReleasePollIntervalMs ?? 50);
+  } while (true);
   if (!released) {
     throw new CodexAppServerProxyError(
       "APP_SERVER_PORT_STILL_OCCUPIED",
