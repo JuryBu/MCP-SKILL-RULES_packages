@@ -41,3 +41,28 @@ test("staged updates keep automatic wake paused until live activation succeeds",
   assert.match(script, /if \(\$Activated\) \{/);
   assert.match(script, /Write-JsonAtomic -Path \$LastKnownGoodPointerPath/);
 });
+
+test("guarded update can explicitly preserve active wakes without acknowledging them", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  assert.match(script, /\[switch\]\$PreserveActiveWakes/);
+  assert.match(script, /stop-napcat-task-router\.ps1/);
+  assert.match(script, /messageLedger = \$_\.messageLedger/);
+  assert.match(script, /wakeBatches = \$_\.wakeBatches/);
+  assert.match(script, /Protected task routing, message ledger, or wake state changed/);
+  assert.match(script, /preservedActiveWakeCount = \$PreservedActiveWakeCount/);
+});
+
+test("backend-only hot reload proves proxy files unchanged and never stops the proxy", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  assert.match(script, /\[switch\]\$BackendOnlyHotReload/);
+  assert.match(script, /function Assert-BackendOnlyCompatible/);
+  assert.match(script, /proxy-critical file changed/);
+  assert.match(script, /if \(\$BackendOnlyHotReload\) \{/);
+  assert.match(script, /reload-broker-backend\.ps1/);
+  assert.match(script, /Existing transparent proxy did not remain healthy/);
+  assert.match(script, /\$RollbackStopScripts = @\("stop-napcat-task-router\.ps1", "stop-napcat-supervisor\.ps1"\)/);
+  assert.match(script, /if \(-not \$BackendOnlyHotReload\) \{ \$RollbackStopScripts \+= "stop-codex-app-server-proxy\.ps1" \}/);
+  assert.match(script, /foreach \(\$ScriptName in \$RollbackStopScripts\)/);
+  assert.match(script, /backendOnlyHotReload = \[bool\]\$BackendOnlyHotReload/);
+  assert.match(script, /restartCodexRequired = \(-not \$BackendOnlyHotReload\)/);
+});

@@ -233,6 +233,7 @@ function Test-PackageStructure {
         "mcps\\napcat-mcp\\test\\supervisor-runner.test.mjs",
         "mcps\\napcat-mcp\\test\\task-registry.test.mjs",
         "mcps\\napcat-mcp\\test\\task-router-controller.test.mjs",
+        "mcps\\napcat-mcp\\test\\task-router-ledger.test.mjs",
         "mcps\\napcat-mcp\\test\\task-router-runner.test.mjs",
         "mcps\\napcat-mcp\\test\\task-router.test.mjs"
     )) {
@@ -252,7 +253,10 @@ function Test-PackageStructure {
         if (-not $napcatSupervisorStart.Contains($requiredText)) { throw "NapCat supervisor start script is missing flat/portable layout compatibility: $requiredText" }
     }
     $napcatAutostartRemoval = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\remove-napcat-autostart.ps1") -Raw -Encoding UTF8
-    if (-not $napcatAutostart.Contains("Stop-ScheduledTask") -or -not $napcatAutostartRemoval.Contains("Stop-ScheduledTask")) {
+    $napcatWatchdogStop = Get-Content -LiteralPath (Join-Path $toolkitRoot "mcps\napcat-mcp\ops\stop-napcat-supervisor-watchdog.ps1") -Raw -Encoding UTF8
+    if (-not $napcatAutostart.Contains('& $StopWatchdogScript') -or
+        -not $napcatAutostartRemoval.Contains('& $StopWatchdogScript') -or
+        -not $napcatWatchdogStop.Contains("Stop-ScheduledTask")) {
         throw "NapCat autostart install/remove must stop an existing watchdog task before replacement or supervisor shutdown."
     }
 
@@ -275,8 +279,8 @@ function Test-PackageStructure {
     $utf8 = [System.Text.Encoding]::UTF8
     $timeboxHeading = $utf8.GetString([Convert]::FromBase64String("IyMjIOiuoeWIkuaXtumXtOebkg=="))
     $boundedFlexibility = $utf8.GetString([Convert]::FromBase64String("5pyJ6L6555WM55qE54G15rS75oCn"))
-    $noForcedCutoff = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LuF5Zug5Yiw5pe25bCx5by66KGM5Lit5pat"))
-    $noPassiveWaiting = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LiA55u0562J5Yiw5Y6f6aKE6K6h5pe26Ze06ICX5bC9"))
+    $noForcedCutoff = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95Y+q5Zug5Yiw5pe26KKr5by66KGM5omT5pat"))
+    $noPassiveWaiting = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LiA55u0562J5Yiw6aKE566X6ICX5bC9"))
     $noMechanicalAnnotationReply = $utf8.GetString([Convert]::FromBase64String("5LiN6KaB6buY6K6k5py65qKw6L6T5Ye6"))
     $profileIds = @("neutral", "catgirl", "development", "training")
     $buildScript = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"

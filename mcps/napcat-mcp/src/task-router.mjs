@@ -26,27 +26,37 @@ function eligibleMessage(task, message) {
   return messageSequence(message) !== null && messageTimestamp(message) !== null;
 }
 
-export function buildWakeId(task, pendingThroughSequence, pendingThroughTime) {
+export function buildWakeId(task, pendingMessages, pendingThroughTime = null) {
+  const normalizedMessages = Array.isArray(pendingMessages)
+    ? pendingMessages.map((message) => ({
+        messageSeq: Number(message.messageSeq ?? message.message_seq),
+        messageAt: String(message.messageAt ?? message.message_time ?? message.time),
+      }))
+    : [{ messageSeq: Number(pendingMessages), messageAt: String(pendingThroughTime) }];
   return crypto.createHash("sha256").update([
-    "wake:v1",
+    "wake:v2",
     task.taskId,
     String(task.generation),
     task.conversationId,
-    String(task.lastAckedSeq),
-    String(task.lastAckedAt ?? ""),
-    String(pendingThroughSequence),
-    String(pendingThroughTime),
+    ...normalizedMessages.flatMap((message) => [String(message.messageSeq), message.messageAt]),
   ].join("\0"), "utf8").digest("hex");
 }
 
-function buildWakePrompt(task, pendingThroughSequence, wakeId) {
+function buildWakePrompt(task, pendingMessages, newMessages, wakeId) {
+  const pendingSequences = pendingMessages.map((message) => message.messageSeq);
+  const newSequences = newMessages.map((message) => message.messageSeq);
+  const previouslyPendingSequences = pendingSequences.filter((sequence) => !newSequences.includes(sequence));
+  const pendingThroughSequence = pendingSequences.at(-1);
   return [
     "[NAPCAT_TASK_WAKE]",
     `task_id=${task.taskId}`,
     `generation=${task.generation}`,
+    `pending_message_seqs=${JSON.stringify(pendingSequences)}`,
+    `new_message_seqs=${JSON.stringify(newSequences)}`,
+    `previously_pending_message_seqs=${JSON.stringify(previouslyPendingSequences)}`,
     `pending_through_message_seq=${pendingThroughSequence}`,
     `wake_id=${wakeId}`,
-    "ExampleGroup 固定群有尚未确认的新消息。请调用 napcat_read_recent 按 task_id 读取并处理；完成后调用 napcat_task_ack，使用本提示中的 generation、pending_through_message_seq 和 wake_id 原值。message_seq 是不保证数字递增的消息标识，不能自行取最大值。",
+    "ExampleGroup 固定群有新增消息，并可能仍有此前未完成的消息。请调用 napcat_read_recent 按 task_id 读取并处理；完成一条或多条后调用 napcat_task_ack，原样回传 generation、wake_id，并用 processed_message_seqs 明确列出实际处理完成的消息。未列出的消息继续保留待处理；message_seq 是不保证数字递增的消息标识，不能自行取最大值或确认未处理消息。",
   ].join("\n");
 }
 
@@ -75,43 +85,54 @@ export function createTaskRouter(options = {}) {
       const eligible = history.messages
         .filter((message) => eligibleMessage(task, message))
         .sort((left, right) => messageTimestamp(left) - messageTimestamp(right));
-      const lastAckedAt = task.lastAckedAt === null ? null : Date.parse(task.lastAckedAt);
-      const acknowledgedIndex = task.lastAckedSeq > 0
-        ? eligible.findLastIndex((message) => messageSequence(message) === task.lastAckedSeq)
-        : -1;
-      const pending = acknowledgedIndex >= 0
-        ? eligible.slice(acknowledgedIndex + 1)
-        : eligible.filter((message) =>
-            lastAckedAt === null || messageTimestamp(message) >= lastAckedAt
-          );
-      if (!pending.length) {
+      if (!eligible.length) {
         return { taskId: task.taskId, outcome: "no_new_message", scannedCount: history.scannedCount };
       }
-      const pendingThroughMessage = pending.at(-1);
-      const pendingThroughSequence = messageSequence(pendingThroughMessage);
-      const seenTask = registry.markSeen({
+      let messagesToObserve = eligible;
+      if (!task.ledgerInitialized) {
+        const lastAckedAt = task.lastAckedAt === null ? null : Date.parse(task.lastAckedAt);
+        const acknowledgedIndex = task.lastAckedSeq > 0
+          ? eligible.findLastIndex((message) => messageSequence(message) === task.lastAckedSeq)
+          : -1;
+        messagesToObserve = acknowledgedIndex >= 0
+          ? eligible.slice(acknowledgedIndex + 1)
+          : eligible.filter((message) => lastAckedAt === null || messageTimestamp(message) >= lastAckedAt);
+      }
+      if (!messagesToObserve.length) {
+        return { taskId: task.taskId, outcome: "no_new_message", scannedCount: history.scannedCount };
+      }
+      const seenTask = registry.observeMessages({
         taskId: task.taskId,
         expectedGeneration: task.generation,
-        seq: pendingThroughSequence,
-        at: pendingThroughMessage.time,
+        messages: messagesToObserve.map((message) => ({
+          messageSeq: messageSequence(message),
+          messageAt: message.time,
+        })),
       });
-      const continuingWake = task.wakePending
-        && task.activeWakeId
-        && task.wakeMessageSeq !== null
-        && task.wakeMessageAt !== null;
-      const wakeBoundarySequence = continuingWake ? task.wakeMessageSeq : pendingThroughSequence;
-      const wakeBoundaryTime = continuingWake ? task.wakeMessageAt : pendingThroughMessage.time;
-      const wakeId = continuingWake
-        ? task.activeWakeId
-        : buildWakeId(seenTask, wakeBoundarySequence, wakeBoundaryTime);
-      const prompt = buildWakePrompt(seenTask, wakeBoundarySequence, wakeId);
+      const pendingMessages = seenTask.pendingMessages
+        .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
+      const newMessages = pendingMessages
+        .filter((message) => message.lastRemindedAt === null)
+        .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
+      if (!newMessages.length) {
+        return {
+          taskId: task.taskId,
+          outcome: pendingMessages.length ? "awaiting_ack" : "no_new_message",
+          pendingCount: pendingMessages.length,
+          scannedCount: history.scannedCount,
+        };
+      }
+      const pendingThroughMessage = pendingMessages.at(-1);
+      const wakeBoundarySequence = pendingThroughMessage.messageSeq;
+      const wakeBoundaryTime = pendingThroughMessage.messageAt;
+      const wakeId = buildWakeId(seenTask, pendingMessages);
+      const prompt = buildWakePrompt(seenTask, pendingMessages, newMessages, wakeId);
       const promptHash = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
       const lease = registry.acquireWakeLease({
         taskId: task.taskId,
         expectedGeneration: task.generation,
         leaseMs: wakeLeaseMs,
-        seq: wakeBoundarySequence,
-        at: wakeBoundaryTime,
+        messages: pendingMessages,
         wakeId,
         promptSha256: promptHash,
       });
@@ -119,7 +140,9 @@ export function createTaskRouter(options = {}) {
         return {
           taskId: task.taskId,
           outcome: lease.reason,
-          pendingCount: pending.length,
+          pendingCount: pendingMessages.length,
+          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
         };
@@ -134,7 +157,9 @@ export function createTaskRouter(options = {}) {
         return {
           taskId: task.taskId,
           outcome: "automation_paused",
-          pendingCount: pending.length,
+          pendingCount: pendingMessages.length,
+          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
         };
@@ -151,6 +176,8 @@ export function createTaskRouter(options = {}) {
           sourceMachine: seenTask.sourceMachine,
           targetMachine: seenTask.targetMachine,
           trustedPeerQq: seenTask.trustedPeerQq,
+          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           pendingThroughTime: wakeBoundaryTime,
           promptSha256: promptHash,
@@ -162,7 +189,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingThroughSequence: wakeBoundarySequence, wakeId };
+        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId };
       }
       if (wake.outcome === "accepted" || wake.outcome === "completed") {
         registry.confirmWakeSent({
@@ -174,7 +201,9 @@ export function createTaskRouter(options = {}) {
         return {
           taskId: task.taskId,
           outcome: wake.outcome,
-          pendingCount: pending.length,
+          pendingCount: pendingMessages.length,
+          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           turnId: wake.turn?.id ?? wake.turn?.turnId ?? null,
@@ -190,7 +219,9 @@ export function createTaskRouter(options = {}) {
         return {
           taskId: task.taskId,
           outcome: "wake_unknown",
-          pendingCount: pending.length,
+          pendingCount: pendingMessages.length,
+          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           error: wake.error,
@@ -205,7 +236,9 @@ export function createTaskRouter(options = {}) {
       return {
         taskId: task.taskId,
         outcome: wake.outcome === "busy" ? "thread_busy" : "thread_unavailable",
-        pendingCount: pending.length,
+        pendingCount: pendingMessages.length,
+        pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+        newMessageSeqs: newMessages.map((message) => message.messageSeq),
         pendingThroughSequence: wakeBoundarySequence,
         wakeId,
         threadStatus: wake.status,

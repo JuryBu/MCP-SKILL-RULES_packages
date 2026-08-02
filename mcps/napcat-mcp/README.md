@@ -63,7 +63,13 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
 
-成功提交唤醒后默认保留 5 分钟处理租约，并应用每任务默认 10 分钟成功唤醒冷却。每次唤醒都有确定的 `wake_id` 和固定消息边界；`napcat_task_ack` 必须同时回传该 `wake_id`、当前 generation 与实际处理到的 `pending_through_message_seq`。ACK、租约释放和游标推进在同一次账本写入中完成，后续新消息只进入下一批，不能改写已经送达的确认令牌。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务结束必须调用 `napcat_task_close`。
+唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；提交成功后应用每任务默认 10 分钟冷却。冷却期间到达的新消息进入持久消息账本，不会重置冷却截止时间；时间满足后只合并唤醒一次。没有新消息时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送。
+
+每次唤醒携带 `wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack` 回传当前 generation、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务结束必须调用 `napcat_task_close`。
+
+维护升级默认等待所有活跃唤醒自然完成；确需在任务暂停期间保留未 ACK 唤醒时，可显式给 `ops/update-codex-napcat-bridge.ps1` 传 `-PreserveActiveWakes`。脚本会先进入维护态并停止任务路由器，再校验任务绑定、generation、逐消息账本和唤醒批次完全不变，之后才允许切换代码；它不会替模型 ACK，也不会清除待处理消息。
+
+仅修改 NapCat MCP 后端与任务路由、透明中转相关文件哈希完全未变时，可同时传 `-BackendOnlyHotReload`。升级器会证明代理关键文件逐个相同，只重载 NapCat broker 子进程并重启监督器和任务路由器，不结束 Codex，也不中断当前透明代理连接；任一代理文件变化时会拒绝该模式，必须改走完整升级。
 
 ## Codex App Server 透明中转
 

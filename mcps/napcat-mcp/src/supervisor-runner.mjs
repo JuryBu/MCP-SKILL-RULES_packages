@@ -780,6 +780,11 @@ export function createSupervisorDependencies(options = {}) {
   const privateEnvironment = options.privateEnvironment
     ?? (privateEnvPath ? readPrivateEnvironment(privateEnvPath) : {});
   const rootDir = path.resolve(options.rootDir ?? path.dirname(bindingPath));
+  const codeRoot = path.resolve(
+    options.codeRoot
+      ?? privateEnvironment.NAPCAT_MCP_ROOT
+      ?? path.dirname(path.dirname(fileURLToPath(import.meta.url))),
+  );
   const statePath = path.resolve(options.statePath ?? path.join(rootDir, "state", "dedupe.json"));
   const automationMaintenancePath = path.resolve(
     options.automationMaintenancePath
@@ -825,6 +830,7 @@ export function createSupervisorDependencies(options = {}) {
   const routerController = options.routerController ?? (options.createTaskRouterController ?? createTaskRouterController)({
     ...(options.routerControllerOptions ?? {}),
     rootDir,
+    runnerPath: options.routerControllerOptions?.runnerPath ?? path.join(codeRoot, "src", "task-router-runner.mjs"),
     env: environment,
   });
   return {
@@ -836,6 +842,7 @@ export function createSupervisorDependencies(options = {}) {
     lockPath,
     privateEnvPath,
     privateEnvironment,
+    codeRoot,
     environment,
     rootDir,
     statePath,

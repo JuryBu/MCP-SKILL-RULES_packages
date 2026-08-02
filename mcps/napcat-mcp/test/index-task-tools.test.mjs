@@ -107,6 +107,10 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
     );
     const taskUpdateTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_update");
     assert.equal(Boolean(taskUpdateTool.inputSchema.properties.wake_cooldown_ms), true);
+    const taskAckTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_ack");
+    assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.type, "array");
+    assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.uniqueItems, true);
+    assert.deepEqual(taskAckTool.inputSchema.anyOf[0].required, ["processed_message_seqs", "wake_id"]);
 
     const registered = toolPayload(await fixture.request("tools/call", {
       name: "napcat_task_register",

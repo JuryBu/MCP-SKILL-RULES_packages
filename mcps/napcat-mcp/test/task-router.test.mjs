@@ -24,6 +24,9 @@ function task(overrides = {}) {
     activeWakeId: null,
     wakePromptSha256: null,
     lastWakeAt: null,
+    ledgerInitialized: true,
+    pendingMessages: [],
+    activeWakes: [],
     ...overrides,
   };
 }
@@ -47,11 +50,26 @@ function message(sequence, overrides = {}) {
 function fixture(options = {}) {
   let currentTask = task(options.task);
   const calls = [];
+  const acknowledgedSequences = new Set(options.acknowledgedSequences ?? []);
   const registry = {
     list: () => currentTask.status === "open" ? [{ ...currentTask }] : [],
-    markSeen: (input) => {
-      calls.push({ type: "markSeen", input });
-      currentTask = { ...currentTask, lastSeenSeq: input.seq, lastSeenAt: input.at };
+    observeMessages: (input) => {
+      calls.push({ type: "observeMessages", input });
+      const pendingMessages = [...currentTask.pendingMessages];
+      for (const observed of input.messages) {
+        if (acknowledgedSequences.has(observed.messageSeq)) continue;
+        if (!pendingMessages.some((message) => message.messageSeq === observed.messageSeq)) {
+          pendingMessages.push({ ...observed, lastRemindedAt: null });
+        }
+      }
+      const latest = input.messages.at(-1);
+      currentTask = {
+        ...currentTask,
+        ledgerInitialized: true,
+        pendingMessages,
+        lastSeenSeq: latest.messageSeq,
+        lastSeenAt: latest.messageAt,
+      };
       return { ...currentTask };
     },
     acquireWakeLease: (input) => {
@@ -63,21 +81,47 @@ function fixture(options = {}) {
         ...currentTask,
         wakePending: true,
         wakeSentAt: "2026-07-24T08:00:00.000Z",
-        wakeMessageSeq: input.seq,
-        wakeMessageAt: input.at,
+        wakeMessageSeq: input.messages.at(-1).messageSeq,
+        wakeMessageAt: input.messages.at(-1).messageAt,
         activeWakeId: input.wakeId,
         wakePromptSha256: input.promptSha256,
+        activeWakes: [{
+          wakeId: input.wakeId,
+          messageSeqs: input.messages.map((message) => message.messageSeq),
+          leaseStartedAt: "2026-07-24T08:00:00.000Z",
+          sentAt: null,
+          status: "leased",
+          legacy: false,
+        }],
       };
       return { ...currentTask, acquired: true, reason: "acquired" };
     },
     confirmWakeSent: (input) => {
       calls.push({ type: "confirmWakeSent", input });
-      currentTask = { ...currentTask, lastWakeAt: currentTask.wakeSentAt };
+      currentTask = {
+        ...currentTask,
+        lastWakeAt: currentTask.wakeSentAt,
+        pendingMessages: currentTask.pendingMessages.map((message) => ({
+          ...message,
+          lastRemindedAt: message.lastRemindedAt ?? currentTask.wakeSentAt,
+        })),
+        activeWakes: currentTask.activeWakes.map((wake) => ({
+          ...wake,
+          sentAt: currentTask.wakeSentAt,
+          status: "sent",
+        })),
+      };
       return { ...currentTask };
     },
     releaseWakeLease: (input) => {
       calls.push({ type: "releaseWakeLease", input });
-      currentTask = { ...currentTask, wakePending: false, wakeSentAt: null };
+      currentTask = {
+        ...currentTask,
+        wakePending: false,
+        wakeSentAt: null,
+        activeWakeId: null,
+        activeWakes: [],
+      };
       return { ...currentTask };
     },
   };
@@ -115,35 +159,33 @@ test("multiple eligible messages coalesce into one wake", async () => {
   assert.equal(leaseInput.taskId, "语音处理");
   assert.equal(leaseInput.expectedGeneration, 1);
   assert.equal(leaseInput.leaseMs, 300_000);
-  assert.equal(leaseInput.seq, 12);
-  assert.equal(leaseInput.at, message(12).time);
+  assert.deepEqual(leaseInput.messages.map((entry) => entry.messageSeq), [10, 11, 12]);
   assert.match(leaseInput.wakeId, /^[a-f0-9]{64}$/);
   assert.match(leaseInput.promptSha256, /^[a-f0-9]{64}$/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /task_id=语音处理/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /pending_through_message_seq=12/);
+  assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /new_message_seqs=\[10,11,12\]/);
+  assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /previously_pending_message_seqs=\[\]/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /wake_id=/);
   assert.equal(current.getTask().wakePending, true);
 });
 
-test("new messages stay queued behind an unresolved active wake", async () => {
+test("new messages trigger one guidance wake after cooldown while old messages remain pending", async () => {
   const originalTime = message(10).time;
   const current = fixture({
     task: {
-      wakePending: true,
-      wakeSentAt: "2026-07-24T08:00:00.000Z",
-      wakeMessageSeq: 10,
-      wakeMessageAt: originalTime,
-      activeWakeId: "wake-existing",
-      wakePromptSha256: "b".repeat(64),
+      lastWakeAt: "2026-07-24T07:49:00.000Z",
+      pendingMessages: [{ messageSeq: 10, messageAt: originalTime, lastRemindedAt: "2026-07-24T07:49:00.000Z" }],
     },
     messages: [message(10), message(11)],
   });
-  await createTaskRouter(current).scanOnce();
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "accepted");
   const leaseInput = current.calls.find((call) => call.type === "acquireWakeLease").input;
-  assert.equal(leaseInput.seq, 10);
-  assert.equal(leaseInput.at, originalTime);
-  assert.equal(leaseInput.wakeId, "wake-existing");
-  assert.equal(current.calls.find((call) => call.type === "markSeen").input.seq, 11);
+  assert.deepEqual(leaseInput.messages.map((entry) => entry.messageSeq), [10, 11]);
+  const prompt = current.calls.find((call) => call.type === "wake").input.prompt;
+  assert.match(prompt, /new_message_seqs=\[11\]/);
+  assert.match(prompt, /previously_pending_message_seqs=\[10\]/);
 });
 
 test("maintenance recheck after lease acquisition prevents the final wake write", async () => {
@@ -176,6 +218,7 @@ test("acknowledged messages and active leases suppress duplicate wake", async ()
       lastAckedAt: message(10).time,
     },
     messages: [message(10)],
+    acknowledgedSequences: [10],
   });
   assert.equal((await createTaskRouter(acknowledged).scanOnce()).results[0].outcome, "no_new_message");
   const leased = fixture({ leaseBlocked: true, messages: [message(11)] });
@@ -195,6 +238,7 @@ test("later messages wake even when their numeric message_seq is smaller", async
       lastAckedSeq: Number(earlier.messageSeq),
       lastSeenAt: earlier.time,
       lastAckedAt: earlier.time,
+      ledgerInitialized: false,
     },
     messages: [earlier, later],
   });
@@ -215,6 +259,7 @@ test("messages after the acknowledged token wake even when timestamps are equal"
       lastAckedSeq: 10,
       lastSeenAt: sharedTimestamp,
       lastAckedAt: sharedTimestamp,
+      ledgerInitialized: false,
     },
     messages: [
       message(9, { time: sharedTimestamp }),
@@ -235,6 +280,7 @@ test("same-second messages remain pending when the acknowledged token has left t
       lastAckedSeq: 10,
       lastSeenAt: sharedTimestamp,
       lastAckedAt: sharedTimestamp,
+      ledgerInitialized: false,
     },
     messages: [
       message(11, { time: sharedTimestamp }),
@@ -281,18 +327,27 @@ test("multiple open tasks share one fixed-group history read", async () => {
   ];
   let readCount = 0;
   const wakes = [];
+  const pendingByTask = new Map(tasks.map((item) => [item.taskId, []]));
   const registry = {
-    list: () => tasks.map((item) => ({ ...item })),
-    markSeen: ({ taskId, seq, at }) => ({
-      ...tasks.find((item) => item.taskId === taskId),
-      lastSeenSeq: seq,
-      lastSeenAt: at,
-    }),
-    acquireWakeLease: ({ taskId }) => ({
+    list: () => tasks.map((item) => ({ ...item, pendingMessages: pendingByTask.get(item.taskId) })),
+    observeMessages: ({ taskId, messages }) => {
+      const pending = pendingByTask.get(taskId);
+      for (const observed of messages) {
+        if (!pending.some((message) => message.messageSeq === observed.messageSeq)) {
+          pending.push({ ...observed, lastRemindedAt: null });
+        }
+      }
+      return {
+        ...tasks.find((item) => item.taskId === taskId),
+        pendingMessages: pending,
+      };
+    },
+    acquireWakeLease: ({ taskId, wakeId }) => ({
       ...tasks.find((item) => item.taskId === taskId),
       acquired: true,
       reason: "acquired",
       wakeSentAt: "2026-07-24T08:00:00.000Z",
+      activeWakeId: wakeId,
     }),
     confirmWakeSent: () => {},
     releaseWakeLease: () => {},

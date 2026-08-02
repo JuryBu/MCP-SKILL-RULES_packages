@@ -206,10 +206,21 @@ const taskAckInputSchema = {
   properties: {
     task_id: { type: "string", minLength: 1, maxLength: 128 },
     expected_generation: { type: "integer", minimum: 1 },
-    message_seq: { type: "integer", minimum: 0, maximum: 9007199254740991 },
-    wake_id: { type: "string", minLength: 1, maxLength: 256, description: "最近一次 [NAPCAT_TASK_WAKE] 提示中的 wake_id；新协议唤醒必须原样回传。" },
+    message_seq: { type: "integer", minimum: 0, maximum: 9007199254740991, description: "兼容升级前已发出的旧唤醒；新唤醒应使用 processed_message_seqs。" },
+    processed_message_seqs: {
+      type: "array",
+      minItems: 1,
+      uniqueItems: true,
+      items: { type: "integer", minimum: 0, maximum: 9007199254740991 },
+      description: "本次实际处理完成的一条或多条 QQ message_seq；只能选择 wake_id 覆盖的消息。",
+    },
+    wake_id: { type: "string", minLength: 1, maxLength: 256, description: "[NAPCAT_TASK_WAKE] 提示中的 wake_id；新协议唤醒必须原样回传。" },
   },
-  required: ["task_id", "expected_generation", "message_seq"],
+  required: ["task_id", "expected_generation"],
+  anyOf: [
+    { required: ["processed_message_seqs", "wake_id"] },
+    { required: ["message_seq"] },
+  ],
   additionalProperties: false,
 };
 
@@ -289,7 +300,7 @@ const tools = [
   },
   {
     name: "napcat_task_ack",
-    description: "目标对话处理完消息后原子确认并释放最近一次唤醒；使用提示中的 generation、pending_through_message_seq 与 wake_id 原值。message_seq 不保证数字递增，不能自行取最大值。",
+    description: "目标对话按消息精确确认处理结果。新唤醒使用提示中的 generation、wake_id，并在 processed_message_seqs 中列出实际处理完成的一条或多条消息；未列出的消息继续待处理。message_seq 不保证数字递增。",
     inputSchema: taskAckInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -446,6 +457,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         expectedGeneration: args.expected_generation,
         seq: args.message_seq,
         wakeId: args.wake_id,
+        processedMessageSeqs: args.processed_message_seqs,
       });
       return textResult({ ok: true, task });
     }

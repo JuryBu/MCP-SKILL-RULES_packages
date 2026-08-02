@@ -9,7 +9,9 @@ param(
   [ValidateRange(10, 600)][int]$QuiesceTimeoutSeconds = 120,
   [bool]$ActivateNow = $true,
   [switch]$MigrateAutostart,
-  [switch]$AllowLegacyMixedRoot
+  [switch]$AllowLegacyMixedRoot,
+  [switch]$PreserveActiveWakes,
+  [switch]$BackendOnlyHotReload
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,6 +112,9 @@ function Get-ProtectedTaskSnapshot {
       activeWakeId = $_.activeWakeId
       wakePromptSha256 = $_.wakePromptSha256
       lastWakeAt = $_.lastWakeAt
+      ledgerInitialized = $_.ledgerInitialized
+      messageLedger = $_.messageLedger
+      wakeBatches = $_.wakeBatches
       createdAt = $_.createdAt
       updatedAt = $_.updatedAt
     }
@@ -159,6 +164,33 @@ function Invoke-NpmChecked {
   }
 }
 
+function Assert-BackendOnlyCompatible {
+  param([string]$PreviousRoot, [string]$NextRoot)
+  if (-not (Test-Path -LiteralPath $PreviousRoot)) {
+    throw "Backend-only hot reload requires an existing installed code snapshot."
+  }
+  foreach ($RelativePath in @(
+    "src\codex-thread-bridge.mjs",
+    "src\codex-app-server-proxy.mjs",
+    "src\codex-app-server-proxy-runner.mjs",
+    "ops\start-codex-app-server-proxy.ps1",
+    "ops\stop-codex-app-server-proxy.ps1",
+    "ops\get-codex-app-server-proxy-status.ps1",
+    "ops\activate-codex-app-server-when-idle.ps1"
+  )) {
+    $PreviousPath = Join-Path $PreviousRoot $RelativePath
+    $NextPath = Join-Path $NextRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $PreviousPath) -or -not (Test-Path -LiteralPath $NextPath)) {
+      throw "Backend-only hot reload is unsafe because a proxy-critical file is missing: $RelativePath"
+    }
+    $PreviousHash = (Get-FileHash -LiteralPath $PreviousPath -Algorithm SHA256).Hash
+    $NextHash = (Get-FileHash -LiteralPath $NextPath -Algorithm SHA256).Hash
+    if ($PreviousHash -ne $NextHash) {
+      throw "Backend-only hot reload is unsafe because a proxy-critical file changed: $RelativePath"
+    }
+  }
+}
+
 function Copy-CodeTree {
   param([string]$From, [string]$To)
   New-Item -ItemType Directory -Force -Path $To | Out-Null
@@ -181,6 +213,9 @@ function Restore-CodeTree {
 if (-not (Test-Path -LiteralPath (Join-Path $SourceRoot "package.json"))) { throw "NapCat MCP source root is invalid: $SourceRoot" }
 if ($CodeRoot -eq $DataRoot -and -not $AllowLegacyMixedRoot) {
   throw "CodeRoot and DataRoot must be separate. Use -AllowLegacyMixedRoot only for a guarded one-time legacy migration."
+}
+if ($BackendOnlyHotReload -and -not $ActivateNow) {
+  throw "BackendOnlyHotReload requires ActivateNow=true because it performs the complete guarded backend activation in this invocation."
 }
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
@@ -209,15 +244,35 @@ try {
   $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
   Set-UpdateMaintenance -Active $true -Code "PACKAGE_UPDATE" -Message "NapCat bridge update is validating and switching code; automatic wake is paused."
 
-  $Deadline = [DateTime]::UtcNow.AddSeconds($QuiesceTimeoutSeconds)
-  do {
-    $Current = Get-ProtectedTaskSnapshot -Path $RegistryPath
-    $Busy = @($Current | Where-Object { $_.wakePending -or -not [string]::IsNullOrWhiteSpace([string]$_.activeWakeId) })
-    if ($Busy.Count -eq 0) { break }
-    Start-Sleep -Milliseconds 500
-  } while ([DateTime]::UtcNow -lt $Deadline)
-  if ($Busy.Count -gt 0) { throw "Open task wake processing did not become idle before the update timeout." }
-  $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
+  $Current = Get-ProtectedTaskSnapshot -Path $RegistryPath
+  $Busy = @($Current | Where-Object { $_.wakePending -or -not [string]::IsNullOrWhiteSpace([string]$_.activeWakeId) })
+  $PreservedActiveWakeCount = 0
+  if ($Busy.Count -gt 0 -and $PreserveActiveWakes) {
+    $RouterStopScript = Join-Path $CodeRoot "ops\stop-napcat-task-router.ps1"
+    if (-not (Test-Path -LiteralPath $RouterStopScript)) {
+      throw "Cannot preserve active wakes because the installed task-router stop script is missing: $RouterStopScript"
+    }
+    $RouterStopResult = & $RouterStopScript -DataRoot $DataRoot | ConvertFrom-Json
+    if ($RouterStopResult.stopped -ne $true) {
+      throw "Cannot preserve active wakes because the task router did not stop within the guarded timeout."
+    }
+    $AfterRouterStopSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
+    if ((Get-SnapshotJson $BeforeSnapshot) -ne (Get-SnapshotJson $AfterRouterStopSnapshot)) {
+      throw "Protected task routing, message ledger, or wake state changed while stopping the task router."
+    }
+    $BeforeSnapshot = $AfterRouterStopSnapshot
+    $PreservedActiveWakeCount = $Busy.Count
+  } else {
+    $Deadline = [DateTime]::UtcNow.AddSeconds($QuiesceTimeoutSeconds)
+    do {
+      $Current = Get-ProtectedTaskSnapshot -Path $RegistryPath
+      $Busy = @($Current | Where-Object { $_.wakePending -or -not [string]::IsNullOrWhiteSpace([string]$_.activeWakeId) })
+      if ($Busy.Count -eq 0) { break }
+      Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $Deadline)
+    if ($Busy.Count -gt 0) { throw "Open task wake processing did not become idle before the update timeout. Use -PreserveActiveWakes only when those durable wake records must survive the guarded switch unchanged." }
+    $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
+  }
 
   Copy-CodeTree -From $SourceRoot -To $CandidateRoot
   Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci")
@@ -231,6 +286,7 @@ try {
   }
 
   if (Test-Path -LiteralPath $CodeRoot) { Copy-CodeTree -From $CodeRoot -To $PreviousCodeRoot }
+  if ($BackendOnlyHotReload) { Assert-BackendOnlyCompatible -PreviousRoot $PreviousCodeRoot -NextRoot $ReleaseRoot }
   if ($PSCmdlet.ShouldProcess($CodeRoot, "install validated NapCat bridge candidate")) {
     Copy-CodeTree -From $ReleaseRoot -To $CodeRoot
     Invoke-NpmChecked -Root $CodeRoot -Arguments @("ci")
@@ -262,6 +318,28 @@ try {
   Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 
   if ($ActivateNow) {
+    if ($BackendOnlyHotReload) {
+      $StopWatchdogScript = Join-Path $CodeRoot "ops\stop-napcat-supervisor-watchdog.ps1"
+      if (-not (Test-Path -LiteralPath $StopWatchdogScript)) {
+        throw "Installed watchdog stop script is missing: $StopWatchdogScript"
+      }
+      & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
+      foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")) {
+        $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
+        if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "Installed stop script is missing: $ScriptPath" }
+        $StopResult = & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
+        if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process within the guarded timeout." }
+      }
+      if ($MigrateAutostart) {
+        & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -TaskName $SupervisorTaskName | Out-Null
+      }
+      & (Join-Path $CodeRoot "ops\reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null
+      $ProxyStatus = & (Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1") -DataRoot $DataRoot | ConvertFrom-Json
+      if ($ProxyStatus.ok -ne $true -or [string]$ProxyStatus.runtime.state -ne "running") {
+        throw "Existing transparent proxy did not remain healthy during the backend-only hot reload."
+      }
+      $Activated = $true
+    } else {
     $ExistingProxyRuntimePath = Join-Path $StateRoot "codex-app-server-proxy-runtime.json"
     $ExistingProxyStatusScript = Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1"
     if (Test-Path -LiteralPath $ExistingProxyRuntimePath) {
@@ -304,6 +382,7 @@ try {
     if ($ProxyStatus.ok -ne $true -or [string]$ProxyStatus.runtime.state -ne "running") { throw "Validated proxy did not become healthy after activation." }
     [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", [string]$ProxyStatus.runtime.downstreamUrl, "User")
     $Activated = $true
+    }
   }
 
   $AfterSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
@@ -337,8 +416,10 @@ try {
     releaseRoot = $ReleaseRoot
     activated = $Activated
     pendingActivation = (-not $Activated)
-    restartCodexRequired = $true
+    restartCodexRequired = (-not $BackendOnlyHotReload)
     protectedTaskCount = @($AfterSnapshot).Count
+    preservedActiveWakeCount = $PreservedActiveWakeCount
+    backendOnlyHotReload = [bool]$BackendOnlyHotReload
     previousUserAppServerWsUrl = $PreviousUserAppServerWsUrl
     activatedProxyUrl = $ActivatedProxyUrl
   }
@@ -347,7 +428,9 @@ try {
 } catch {
   $Failure = $_.Exception.Message
   try { [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $PreviousUserAppServerWsUrl, "User") } catch {}
-  foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
+  $RollbackStopScripts = @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")
+  if (-not $BackendOnlyHotReload) { $RollbackStopScripts += "stop-codex-app-server-proxy.ps1" }
+  foreach ($ScriptName in $RollbackStopScripts) {
     $ScriptPath = Join-Path $CandidateRoot "ops\$ScriptName"
     if (Test-Path -LiteralPath $ScriptPath) {
       try {

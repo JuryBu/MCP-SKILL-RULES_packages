@@ -70,6 +70,9 @@ test("register is idempotent and rejects silent conversation changes", () => {
       "activeWakeId",
       "wakePromptSha256",
       "lastWakeAt",
+      "ledgerInitialized",
+      "pendingMessages",
+      "activeWakes",
       "createdAt",
       "updatedAt",
     ]);
@@ -129,6 +132,41 @@ test("legacy sequence-only tasks migrate without inventing message timestamps", 
     assert.equal(migrated.lastAckedAt, null);
     assert.equal(migrated.wakeMessageSeq, null);
     assert.equal(migrated.wakeMessageAt, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy active wakes distinguish a delivered reminder from an unfinished lease", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    stored.schemaVersion = 1;
+    const legacy = stored.tasks["task-001"];
+    legacy.wakePending = true;
+    legacy.wakeSentAt = "2026-07-24T08:00:10.000Z";
+    legacy.wakeMessageSeq = 10;
+    legacy.wakeMessageAt = "2026-07-24T08:00:09.000Z";
+    legacy.activeWakeId = "legacy-wake";
+    legacy.wakePromptSha256 = "a".repeat(64);
+    legacy.lastWakeAt = "2026-07-24T07:50:00.000Z";
+    delete legacy.ledgerInitialized;
+    delete legacy.messageLedger;
+    delete legacy.wakeBatches;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+
+    const unfinished = fixture.createRegistry().get("task-001");
+    assert.equal(unfinished.ledgerInitialized, false);
+    assert.equal(unfinished.pendingMessages[0].lastRemindedAt, null);
+    assert.equal(unfinished.activeWakes[0].status, "leased");
+
+    const deliveredState = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    deliveredState.tasks["task-001"].lastWakeAt = deliveredState.tasks["task-001"].wakeSentAt;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(deliveredState, null, 2)}\n`, "utf8");
+    const delivered = fixture.createRegistry().get("task-001");
+    assert.equal(delivered.pendingMessages[0].lastRemindedAt, "2026-07-24T08:00:10.000Z");
+    assert.equal(delivered.activeWakes[0].status, "sent");
   } finally {
     fixture.cleanup();
   }
@@ -200,7 +238,13 @@ test("close is idempotent and list/get return complete public records", () => {
     assert.equal(closed.status, "closed");
     assert.equal(closed.wakePending, false);
     assert.equal(closed.wakeSentAt, null);
-    const closedLease = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    const closedLease = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "closed-wake",
+      promptSha256: "c".repeat(64),
+    });
     assert.equal(closedLease.acquired, false);
     assert.equal(closedLease.reason, "closed");
     assert.deepEqual(fixture.registry.close({ taskId: "task-001", expectedGeneration: 1 }), closed);
@@ -246,17 +290,24 @@ test("markSeen follows message time instead of numeric message_seq ordering", ()
     const acquired = fixture.registry.acquireWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 3,
-      at: "2026-07-24T08:00:09.000Z",
+      messages: [{ messageSeq: 3, messageAt: "2026-07-24T08:00:09.000Z" }],
+      wakeId: "wake-3",
+      promptSha256: "3".repeat(64),
     });
     assert.equal(acquired.wakeMessageSeq, 3);
-    const acknowledged = fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 3 });
+    const acknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [3],
+      wakeId: "wake-3",
+    });
     assert.equal(acknowledged.lastAckedSeq, 3);
     assert.equal(acknowledged.lastAckedAt, "2026-07-24T08:00:09.000Z");
     fixture.registry.releaseWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
       expectedWakeSentAt: acquired.wakeSentAt,
+      expectedWakeId: "wake-3",
     });
     fixture.registry.markSeen({
       taskId: "task-001",
@@ -267,15 +318,26 @@ test("markSeen follows message time instead of numeric message_seq ordering", ()
     fixture.registry.acquireWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 2,
-      at: "2026-07-24T08:00:10.000Z",
+      messages: [{ messageSeq: 2, messageAt: "2026-07-24T08:00:10.000Z" }],
+      wakeId: "wake-2",
+      promptSha256: "2".repeat(64),
     });
     assertRegistryError(
-      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 1, seq: 3 }),
-      "ACK_NOT_ACTIVE_WAKE",
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        processedMessageSeqs: [3],
+        wakeId: "wake-2",
+      }),
+      "ACK_MESSAGE_MISMATCH",
     );
     assertRegistryError(
-      () => fixture.registry.ack({ taskId: "task-001", expectedGeneration: 2, seq: 3 }),
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 2,
+        processedMessageSeqs: [2],
+        wakeId: "wake-2",
+      }),
       "GENERATION_MISMATCH",
     );
     assert.equal(fixture.registry.get("task-001").lastSeenSeq, 2);
@@ -288,34 +350,47 @@ test("wake lease acquisition, release, and timeout are persisted", () => {
   const fixture = createFixture({ wakeLeaseMs: 1000 });
   try {
     fixture.registry.register(taskInput());
-    const acquired = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 1, at: BASE_TIME });
+    const leaseInput = {
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "wake-1",
+      promptSha256: "1".repeat(64),
+    };
+    const acquired = fixture.registry.acquireWakeLease(leaseInput);
     assert.equal(acquired.acquired, true);
     assert.equal(acquired.reason, "acquired");
     assert.equal(acquired.wakePending, true);
     assert.equal(acquired.wakeSentAt, BASE_TIME);
-    assert.equal(acquired.wakeMessageSeq, null);
-    assert.equal(acquired.wakeMessageAt, null);
+    assert.equal(acquired.wakeMessageSeq, 1);
+    assert.equal(acquired.wakeMessageAt, BASE_TIME);
     assert.equal(acquired.leaseExpiresAt, "2026-07-24T08:00:01.000Z");
 
-    const blocked = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    const blocked = fixture.registry.acquireWakeLease(leaseInput);
     assert.equal(blocked.acquired, false);
     assert.equal(blocked.reason, "lease_active");
     assert.equal(blocked.wakeSentAt, BASE_TIME);
 
     fixture.advance(1000);
-    const reacquired = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    const reacquired = fixture.registry.acquireWakeLease(leaseInput);
     assert.equal(reacquired.acquired, true);
     assert.equal(reacquired.wakeSentAt, "2026-07-24T08:00:01.000Z");
     const released = fixture.registry.releaseWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
       expectedWakeSentAt: reacquired.wakeSentAt,
+      expectedWakeId: "wake-1",
     });
     assert.equal(released.wakePending, false);
     assert.equal(released.wakeSentAt, null);
     assert.equal(released.wakeMessageSeq, null);
     assert.equal(released.wakeMessageAt, null);
-    assert.deepEqual(fixture.registry.releaseWakeLease({ taskId: "task-001", expectedGeneration: 1 }), released);
+    assert.deepEqual(fixture.registry.releaseWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeId: "wake-1",
+    }), released);
   } finally {
     fixture.cleanup();
   }
@@ -325,24 +400,47 @@ test("a confirmed wake remains cooldown-limited after ACK releases its lease", (
   const fixture = createFixture({ wakeLeaseMs: 300_000, wakeCooldownMs: 60_000 });
   try {
     fixture.registry.register(taskInput());
-    const acquired = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 1, at: BASE_TIME });
+    const firstLeaseInput = {
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "wake-1",
+      promptSha256: "1".repeat(64),
+    };
+    const acquired = fixture.registry.acquireWakeLease(firstLeaseInput);
     const confirmed = fixture.registry.confirmWakeSent({
       taskId: "task-001",
       expectedGeneration: 1,
       expectedWakeSentAt: acquired.wakeSentAt,
+      expectedWakeId: "wake-1",
     });
     assert.equal(confirmed.lastWakeAt, BASE_TIME);
-    fixture.registry.releaseWakeLease({
+    fixture.registry.acknowledgeWake({
       taskId: "task-001",
       expectedGeneration: 1,
-      expectedWakeSentAt: acquired.wakeSentAt,
+      processedMessageSeqs: [1],
+      wakeId: "wake-1",
     });
-    const blocked = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    fixture.registry.markSeen({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      seq: 2,
+      at: "2026-07-24T08:00:01.000Z",
+    });
+    const secondLeaseInput = {
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 2, messageAt: "2026-07-24T08:00:01.000Z" }],
+      wakeId: "wake-2",
+      promptSha256: "2".repeat(64),
+    };
+    const blocked = fixture.registry.acquireWakeLease(secondLeaseInput);
     assert.equal(blocked.acquired, false);
     assert.equal(blocked.reason, "wake_cooldown");
     assert.equal(blocked.cooldownExpiresAt, "2026-07-24T08:01:00.000Z");
     fixture.advance(60_000);
-    const reacquired = fixture.registry.acquireWakeLease({ taskId: "task-001", expectedGeneration: 1 });
+    const reacquired = fixture.registry.acquireWakeLease(secondLeaseInput);
     assert.equal(reacquired.acquired, true);
     assert.equal(reacquired.wakeSentAt, "2026-07-24T08:01:00.000Z");
   } finally {
@@ -363,8 +461,9 @@ test("later scans do not invalidate the token already delivered by an active wak
     const acquired = fixture.registry.acquireWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 10,
-      at: "2026-07-24T08:00:10.000Z",
+      messages: [{ messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" }],
+      wakeId: "wake-10",
+      promptSha256: "a".repeat(64),
     });
     fixture.registry.markSeen({
       taskId: "task-001",
@@ -372,10 +471,11 @@ test("later scans do not invalidate the token already delivered by an active wak
       seq: 7,
       at: "2026-07-24T08:00:11.000Z",
     });
-    const acknowledged = fixture.registry.ack({
+    const acknowledged = fixture.registry.acknowledgeWake({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 10,
+      processedMessageSeqs: [10],
+      wakeId: "wake-10",
     });
     assert.equal(acknowledged.lastSeenSeq, 7);
     assert.equal(acknowledged.lastAckedSeq, 10);
@@ -384,6 +484,7 @@ test("later scans do not invalidate the token already delivered by an active wak
       taskId: "task-001",
       expectedGeneration: 1,
       expectedWakeSentAt: acquired.wakeSentAt,
+      expectedWakeId: "wake-10",
     });
     assert.equal(released.wakeMessageSeq, null);
     assert.equal(released.wakeMessageAt, null);
@@ -405,8 +506,7 @@ test("acknowledgeWake atomically confirms only the matching wake_id and releases
     const acquired = fixture.registry.acquireWakeLease({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 10,
-      at: "2026-07-24T08:00:10.000Z",
+      messages: [{ messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" }],
       wakeId: "wake-a",
       promptSha256: "a".repeat(64),
     });
@@ -415,21 +515,162 @@ test("acknowledgeWake atomically confirms only the matching wake_id and releases
       () => fixture.registry.acknowledgeWake({
         taskId: "task-001",
         expectedGeneration: 1,
-        seq: 10,
+        processedMessageSeqs: [10],
         wakeId: "wake-b",
       }),
-      "ACK_WAKE_ID_MISMATCH",
+      "ACK_NOT_ACTIVE_WAKE",
     );
     const acknowledged = fixture.registry.acknowledgeWake({
       taskId: "task-001",
       expectedGeneration: 1,
-      seq: 10,
+      processedMessageSeqs: [10],
       wakeId: "wake-a",
     });
     assert.equal(acknowledged.lastAckedSeq, 10);
     assert.equal(acknowledged.wakePending, false);
     assert.equal(acknowledged.activeWakeId, null);
     assert.equal(acknowledged.wakePromptSha256, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("message-level ACK accepts sparse subsets and keeps unprocessed messages pending", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const messages = [10, 11, 12].map((messageSeq) => ({
+      messageSeq,
+      messageAt: `2026-07-24T08:00:${messageSeq}.000Z`,
+    }));
+    fixture.registry.observeMessages({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages,
+    });
+    const acquired = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages,
+      wakeId: "wake-sparse",
+      promptSha256: "a".repeat(64),
+    });
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: acquired.wakeSentAt,
+      expectedWakeId: "wake-sparse",
+    });
+
+    const acknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10, 12],
+      wakeId: "wake-sparse",
+    });
+    assert.deepEqual(acknowledged.pendingMessages, [{
+      messageSeq: 11,
+      messageAt: "2026-07-24T08:00:11.000Z",
+      lastRemindedAt: BASE_TIME,
+    }]);
+    assert.deepEqual(acknowledged.activeWakes.map((wake) => wake.messageSeqs), [[11]]);
+    assert.equal(acknowledged.wakePending, true);
+    assert.deepEqual(fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10, 12],
+      wakeId: "wake-sparse",
+    }), acknowledged);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a late ACK for an older wake cannot clear messages added to a newer wake", () => {
+  const fixture = createFixture({ wakeCooldownMs: 30_000 });
+  try {
+    fixture.registry.register(taskInput());
+    const message10 = { messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" };
+    fixture.registry.observeMessages({ taskId: "task-001", expectedGeneration: 1, messages: [message10] });
+    const first = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [message10],
+      wakeId: "wake-old",
+      promptSha256: "a".repeat(64),
+    });
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: first.wakeSentAt,
+      expectedWakeId: "wake-old",
+    });
+
+    fixture.advance(30_000);
+    const message11 = { messageSeq: 11, messageAt: "2026-07-24T08:00:11.000Z" };
+    fixture.registry.observeMessages({ taskId: "task-001", expectedGeneration: 1, messages: [message11] });
+    const second = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [message10, message11],
+      wakeId: "wake-new",
+      promptSha256: "b".repeat(64),
+    });
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: second.wakeSentAt,
+      expectedWakeId: "wake-new",
+    });
+
+    const afterLateAck = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10],
+      wakeId: "wake-old",
+    });
+    assert.deepEqual(afterLateAck.pendingMessages.map((message) => message.messageSeq), [11]);
+    assert.deepEqual(afterLateAck.activeWakes.map((wake) => wake.messageSeqs), [[11]]);
+    assertRegistryError(
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        processedMessageSeqs: [11],
+        wakeId: "wake-old",
+      }),
+      "ACK_MESSAGE_MISMATCH",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("different wake batches cannot hold concurrent live injection leases", () => {
+  const fixture = createFixture({ wakeLeaseMs: 30_000 });
+  try {
+    fixture.registry.register(taskInput());
+    const messages = [
+      { messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" },
+      { messageSeq: 11, messageAt: "2026-07-24T08:00:11.000Z" },
+    ];
+    fixture.registry.observeMessages({ taskId: "task-001", expectedGeneration: 1, messages });
+    fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [messages[0]],
+      wakeId: "wake-a",
+      promptSha256: "a".repeat(64),
+    });
+    const blocked = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages,
+      wakeId: "wake-b",
+      promptSha256: "b".repeat(64),
+    });
+    assert.equal(blocked.acquired, false);
+    assert.equal(blocked.reason, "lease_active");
+    assert.equal(blocked.leaseExpiresAt, "2026-07-24T08:00:30.000Z");
   } finally {
     fixture.cleanup();
   }

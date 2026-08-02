@@ -58,9 +58,9 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 后台路由只接受固定群、已登记任务、正确目标机器和可信发送者同时匹配的消息。`message_seq` 不保证数字递增，同一扫描内多条消息按消息时间与群历史顺序合并，只唤醒绑定对话一次。
 
-收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件，处理到提示中的 `pending_through_message_seq` 后，使用该原值调用 `napcat_task_ack`。不得自行取数字最大值，也不得 ACK 未读取或未处理的消息。处理租约内后续到达的消息只进入下一批队列，不会改写当前唤醒的确认令牌。
+收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
 
-处理租约和任务级冷却期间不重入。模型可以通过 `napcat_task_update` 调整当前任务的 `wake_cooldown_ms`，但不能跳过可信身份、代次和 ACK 约束。
+没有新消息时不按计时重复发送旧提醒；有新消息时，任务级冷却结束后只合并唤醒一次，并同时带回此前仍待处理的消息。短时间连续到达的新消息不得不断推迟这次提醒。模型可以通过 `napcat_task_update` 调整当前任务的 `wake_cooldown_ms`，但不能跳过可信身份、代次和 ACK 约束。
 
 监督器只在 broker、正确账号 OneBot、NapCat 进程、Codex 进程和 open task 都满足时运行任务路由。快速登录失效时进入人工二维码恢复，不把「进程存在」误当成账号在线。
 

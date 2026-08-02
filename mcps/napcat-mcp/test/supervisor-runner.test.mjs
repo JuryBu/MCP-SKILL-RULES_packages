@@ -196,6 +196,34 @@ test("监督器与 task router 使用彼此独立的 runtime、stop 和 lock 文
   }
 });
 
+test("监督器从 NAPCAT_MCP_ROOT 启动 task router，但仍把状态保存在 DataRoot", () => {
+  const fixture = createFixture();
+  const codeRoot = path.join(fixture.root, "services", "napcat-bridge", "current");
+  let controllerOptions = null;
+  try {
+    const dependencies = createSupervisorDependencies({
+      ...fixture,
+      privateEnvironment: {
+        NAPCAT_MCP_ROOT: codeRoot,
+        NAPCAT_HTTP_URL: "http://127.0.0.1:3010",
+        NAPCAT_ACCESS_TOKEN: "test-token",
+      },
+      notifier: {},
+      registry: {},
+      createTaskRouterController(options) {
+        controllerOptions = options;
+        return {};
+      },
+    });
+    assert.equal(dependencies.codeRoot, path.resolve(codeRoot));
+    assert.equal(controllerOptions.rootDir, path.resolve(fixture.root));
+    assert.equal(controllerOptions.runnerPath, path.join(path.resolve(codeRoot), "src", "task-router-runner.mjs"));
+    assert.equal(controllerOptions.env.NAPCAT_TASK_REGISTRY_PATH, path.resolve(fixture.registryPath));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("满足 broker、NapCat 固定账号、Codex 和 open task 后才启动 task router", async () => {
   const fixture = createFixture();
   let startCount = 0;

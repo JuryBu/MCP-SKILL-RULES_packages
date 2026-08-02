@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const STATE_SCHEMA_VERSION = 1;
+const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_WAKE_LEASE_MS = 30_000;
 const DEFAULT_WAKE_COOLDOWN_MS = 600_000;
 const MINIMUM_WAKE_COOLDOWN_MS = 30_000;
@@ -31,6 +31,9 @@ const PUBLIC_FIELDS = [
   "activeWakeId",
   "wakePromptSha256",
   "lastWakeAt",
+  "ledgerInitialized",
+  "pendingMessages",
+  "activeWakes",
   "createdAt",
   "updatedAt",
 ];
@@ -142,11 +145,70 @@ function storedDate(value, name, statePath) {
 
 function clonePublicTask(task) {
   const result = {};
-  for (const field of PUBLIC_FIELDS) result[field] = task[field];
+  const pendingMessages = (task.messageLedger ?? [])
+    .filter((message) => message.status === "pending")
+    .map((message) => ({
+      messageSeq: message.messageSeq,
+      messageAt: message.messageAt,
+      lastRemindedAt: message.lastRemindedAt,
+    }));
+  const activeWakes = (task.wakeBatches ?? [])
+    .filter((wake) => wake.status !== "complete")
+    .map((wake) => ({
+      wakeId: wake.wakeId,
+      messageSeqs: wake.messageSeqs.filter((sequence) =>
+        pendingMessages.some((message) => message.messageSeq === sequence)
+      ),
+      leaseStartedAt: wake.leaseStartedAt,
+      sentAt: wake.sentAt,
+      status: wake.status,
+      legacy: Boolean(wake.legacy),
+    }))
+    .filter((wake) => wake.messageSeqs.length > 0);
+  for (const field of PUBLIC_FIELDS) {
+    if (field === "pendingMessages") result[field] = pendingMessages;
+    else if (field === "activeWakes") result[field] = activeWakes;
+    else result[field] = task[field];
+  }
   return result;
 }
 
-function normalizeStoredTask(task) {
+function messageRecord(sequence, at, status = "pending", lastRemindedAt = null) {
+  return {
+    messageSeq: sequence,
+    messageAt: at,
+    status,
+    lastRemindedAt,
+  };
+}
+
+function pendingSequenceSet(task) {
+  return new Set((task.messageLedger ?? [])
+    .filter((message) => message.status === "pending")
+    .map((message) => message.messageSeq));
+}
+
+function refreshLegacyWakeFields(task) {
+  const pendingSequences = pendingSequenceSet(task);
+  for (const wake of task.wakeBatches ?? []) {
+    const remaining = wake.messageSeqs.filter((sequence) => pendingSequences.has(sequence));
+    if (!remaining.length) wake.status = "complete";
+  }
+  const latestWake = (task.wakeBatches ?? [])
+    .filter((wake) => wake.status !== "complete")
+    .filter((wake) => wake.messageSeqs.some((sequence) => pendingSequences.has(sequence)))
+    .sort((left, right) => Date.parse(left.leaseStartedAt) - Date.parse(right.leaseStartedAt))
+    .at(-1) ?? null;
+  task.wakePending = latestWake !== null;
+  task.wakeSentAt = latestWake?.leaseStartedAt ?? null;
+  task.wakeMessageSeq = latestWake?.boundaryMessageSeq ?? null;
+  task.wakeMessageAt = latestWake?.boundaryMessageAt ?? null;
+  task.activeWakeId = latestWake?.wakeId ?? null;
+  task.wakePromptSha256 = latestWake?.promptSha256 ?? null;
+  return task;
+}
+
+function normalizeStoredTask(task, sourceSchemaVersion = STATE_SCHEMA_VERSION) {
   if (!isPlainObject(task)) return task;
   if (!hasOwn(task, "wakeCooldownMs")) task.wakeCooldownMs = DEFAULT_WAKE_COOLDOWN_MS;
   if (!hasOwn(task, "lastWakeAt")) task.lastWakeAt = task.wakeSentAt ?? null;
@@ -156,7 +218,52 @@ function normalizeStoredTask(task) {
   if (!hasOwn(task, "wakeMessageAt")) task.wakeMessageAt = null;
   if (!hasOwn(task, "activeWakeId")) task.activeWakeId = null;
   if (!hasOwn(task, "wakePromptSha256")) task.wakePromptSha256 = null;
-  return task;
+  if (!hasOwn(task, "ledgerInitialized")) task.ledgerInitialized = sourceSchemaVersion >= 2;
+  const legacyWakeSentAt = task.wakePending
+    && task.wakeSentAt !== null
+    && task.lastWakeAt === task.wakeSentAt
+    ? task.wakeSentAt
+    : null;
+  if (!Array.isArray(task.messageLedger)) {
+    task.messageLedger = [];
+    if (task.lastAckedSeq > 0 && task.lastAckedAt !== null) {
+      task.messageLedger.push(messageRecord(task.lastAckedSeq, task.lastAckedAt, "acked"));
+    }
+    if (task.wakeMessageSeq !== null && task.wakeMessageAt !== null) {
+      const existing = task.messageLedger.find((message) => message.messageSeq === task.wakeMessageSeq);
+      if (existing) {
+        existing.status = "pending";
+        existing.messageAt = task.wakeMessageAt;
+        existing.lastRemindedAt = legacyWakeSentAt;
+      } else {
+        task.messageLedger.push(messageRecord(
+          task.wakeMessageSeq,
+          task.wakeMessageAt,
+          "pending",
+          legacyWakeSentAt,
+        ));
+      }
+    }
+  }
+  if (!Array.isArray(task.wakeBatches)) {
+    task.wakeBatches = [];
+    if (task.wakePending && task.wakeMessageSeq !== null && task.wakeMessageAt !== null) {
+      task.wakeBatches.push({
+        wakeId: task.activeWakeId ?? `legacy-${task.generation}-${task.wakeMessageSeq}`,
+        messageSeqs: [task.wakeMessageSeq],
+        messageTimes: [task.wakeMessageAt],
+        boundaryMessageSeq: task.wakeMessageSeq,
+        boundaryMessageAt: task.wakeMessageAt,
+        leaseStartedAt: task.wakeSentAt,
+        sentAt: legacyWakeSentAt,
+        promptSha256: task.wakePromptSha256,
+        status: legacyWakeSentAt === null ? "leased" : "sent",
+        acknowledgedSeqs: [],
+        legacy: true,
+      });
+    }
+  }
+  return refreshLegacyWakeFields(task);
 }
 
 function emptyState() {
@@ -222,17 +329,64 @@ function validateStoredTask(task, taskId, statePath) {
   if (task.wakePending && task.wakeSentAt === null) {
     invalidState(statePath, `唤醒租约缺少时间（${taskId}）`);
   }
+  if (typeof task.ledgerInitialized !== "boolean") {
+    invalidState(statePath, `消息账本初始化状态无效（${taskId}）`);
+  }
+  if (!Array.isArray(task.messageLedger)) invalidState(statePath, `消息账本无效（${taskId}）`);
+  const seenSequences = new Set();
+  for (const message of task.messageLedger) {
+    if (!isPlainObject(message)) invalidState(statePath, `消息账本记录无效（${taskId}）`);
+    if (!Number.isSafeInteger(message.messageSeq) || message.messageSeq < 0) {
+      invalidState(statePath, `消息标识无效（${taskId}）`);
+    }
+    if (seenSequences.has(message.messageSeq)) invalidState(statePath, `消息标识重复（${taskId}.${message.messageSeq}）`);
+    seenSequences.add(message.messageSeq);
+    storedDate(message.messageAt, `${taskId}.messageLedger.messageAt`, statePath);
+    if (message.status !== "pending" && message.status !== "acked") {
+      invalidState(statePath, `消息处理状态无效（${taskId}.${message.messageSeq}）`);
+    }
+    if (message.lastRemindedAt !== null) {
+      storedDate(message.lastRemindedAt, `${taskId}.messageLedger.lastRemindedAt`, statePath);
+    }
+  }
+  if (!Array.isArray(task.wakeBatches)) invalidState(statePath, `唤醒批次账本无效（${taskId}）`);
+  const seenWakeIds = new Set();
+  for (const wake of task.wakeBatches) {
+    if (!isPlainObject(wake)) invalidState(statePath, `唤醒批次无效（${taskId}）`);
+    if (typeof wake.wakeId !== "string" || !wake.wakeId.trim() || seenWakeIds.has(wake.wakeId)) {
+      invalidState(statePath, `唤醒批次 ID 无效（${taskId}）`);
+    }
+    seenWakeIds.add(wake.wakeId);
+    if (!Array.isArray(wake.messageSeqs) || !wake.messageSeqs.length) {
+      invalidState(statePath, `唤醒批次消息无效（${taskId}.${wake.wakeId}）`);
+    }
+    if (wake.messageSeqs.some((sequence) => !Number.isSafeInteger(sequence) || sequence < 0)) {
+      invalidState(statePath, `唤醒批次消息标识无效（${taskId}.${wake.wakeId}）`);
+    }
+    if (!Array.isArray(wake.messageTimes) || wake.messageTimes.length !== wake.messageSeqs.length) {
+      invalidState(statePath, `唤醒批次消息时间无效（${taskId}.${wake.wakeId}）`);
+    }
+    for (const messageTime of wake.messageTimes) storedDate(messageTime, `${taskId}.wakeBatches.messageTime`, statePath);
+    if (wake.status !== "leased" && wake.status !== "sent" && wake.status !== "complete") {
+      invalidState(statePath, `唤醒批次状态无效（${taskId}.${wake.wakeId}）`);
+    }
+    storedDate(wake.leaseStartedAt, `${taskId}.wakeBatches.leaseStartedAt`, statePath);
+    if (wake.sentAt !== null) storedDate(wake.sentAt, `${taskId}.wakeBatches.sentAt`, statePath);
+    if (!Array.isArray(wake.acknowledgedSeqs)) invalidState(statePath, `唤醒批次 ACK 列表无效（${taskId}.${wake.wakeId}）`);
+  }
   storedDate(task.createdAt, `${taskId}.createdAt`, statePath);
   storedDate(task.updatedAt, `${taskId}.updatedAt`, statePath);
 }
 
 function validateState(value, statePath) {
-  if (!isPlainObject(value) || value.schemaVersion !== STATE_SCHEMA_VERSION || !isPlainObject(value.tasks)) {
+  if (!isPlainObject(value) || ![1, STATE_SCHEMA_VERSION].includes(value.schemaVersion) || !isPlainObject(value.tasks)) {
     invalidState(statePath, "账本结构无效");
   }
+  const sourceSchemaVersion = value.schemaVersion;
   for (const [taskId, task] of Object.entries(value.tasks)) {
-    validateStoredTask(normalizeStoredTask(task), taskId, statePath);
+    validateStoredTask(normalizeStoredTask(task, sourceSchemaVersion), taskId, statePath);
   }
+  value.schemaVersion = STATE_SCHEMA_VERSION;
   return value;
 }
 
@@ -371,6 +525,29 @@ function parseSequence(input, name, aliases) {
   invalidArgument(`${name} 不能为空`);
 }
 
+function parseSequenceList(value, name) {
+  if (!Array.isArray(value) || !value.length) invalidArgument(`${name} 必须是非空数组`);
+  const sequences = value.map((item) => nonNegativeInteger(item, name));
+  if (new Set(sequences).size !== sequences.length) invalidArgument(`${name} 不能包含重复消息标识`);
+  return sequences;
+}
+
+function parseObservedMessages(input) {
+  const source = input.messages ?? input.pendingMessages;
+  if (!Array.isArray(source) || !source.length) invalidArgument("messages 必须是非空数组");
+  return source.map((message) => {
+    if (!isPlainObject(message)) invalidArgument("messages 中的每项必须是对象");
+    return {
+      messageSeq: parseSequence(message, "messageSeq", ["messageSeq", "message_seq", "seq"]),
+      messageAt: toDate(message.messageAt ?? message.message_time ?? message.at, "messageAt").toISOString(),
+    };
+  }).sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
+}
+
+function findMessage(task, sequence) {
+  return task.messageLedger.find((message) => message.messageSeq === sequence) ?? null;
+}
+
 function parseExpectedGeneration(input) {
   if (!hasOwn(input, "expectedGeneration")) invalidArgument("expectedGeneration 不能为空");
   return positiveInteger(input.expectedGeneration, "expectedGeneration");
@@ -474,6 +651,9 @@ class TaskRegistry {
         activeWakeId: null,
         wakePromptSha256: null,
         lastWakeAt: null,
+        ledgerInitialized: true,
+        messageLedger: [],
+        wakeBatches: [],
         createdAt: now,
         updatedAt: now,
       };
@@ -518,6 +698,9 @@ class TaskRegistry {
       if (!changed) return { changed: false, value: clonePublicTask(task) };
       nextTask.updatedAt = resolveNow(this.now, input).toISOString();
       if (routingChanged) {
+        nextTask.ledgerInitialized = true;
+        nextTask.messageLedger = [];
+        nextTask.wakeBatches = [];
         nextTask.wakePending = false;
         nextTask.wakeSentAt = null;
         nextTask.wakeMessageSeq = null;
@@ -541,6 +724,7 @@ class TaskRegistry {
       const nextTask = {
         ...task,
         status: "closed",
+        wakeBatches: [],
         wakePending: false,
         wakeSentAt: null,
         wakeMessageSeq: null,
@@ -576,225 +760,242 @@ class TaskRegistry {
       .map(clonePublicTask);
   }
 
-  markSeen(input) {
+  observeMessages(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
-    const sequence = parseSequence(input, "seq", ["seq", "lastSeenSeq", "sequence"]);
-    const observedAt = toDate(input.at ?? input.messageTime ?? resolveNow(this.now, input), "at").toISOString();
+    const observedMessages = parseObservedMessages(input);
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       if (task.status === "closed") {
         throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
       }
-      const previousTimestamp = task.lastSeenAt === null ? null : Date.parse(task.lastSeenAt);
-      const observedTimestamp = Date.parse(observedAt);
-      if (
-        previousTimestamp !== null
-        && (
-          observedTimestamp < previousTimestamp
-          || (observedTimestamp === previousTimestamp && sequence === task.lastSeenSeq)
-        )
-      ) {
-        return { changed: false, value: clonePublicTask(task) };
+      let changed = false;
+      for (const observed of observedMessages) {
+        const existing = findMessage(task, observed.messageSeq);
+        if (existing) {
+          if (existing.messageAt !== observed.messageAt) {
+            throw new TaskRegistryError(
+              "MESSAGE_SEQ_CONFLICT",
+              `同一消息标识出现不同时间：${observed.messageSeq}`,
+              { taskId, messageSeq: observed.messageSeq, existingAt: existing.messageAt, observedAt: observed.messageAt },
+            );
+          }
+          continue;
+        }
+        task.messageLedger.push(messageRecord(observed.messageSeq, observed.messageAt));
+        changed = true;
       }
-      const nextTask = {
-        ...task,
-        lastSeenSeq: sequence,
-        lastSeenAt: observedAt,
-        updatedAt: resolveNow(this.now, input).toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
-      return { changed: true, value: clonePublicTask(nextTask) };
+      const latestObserved = observedMessages.at(-1);
+      if (task.lastSeenAt === null || Date.parse(latestObserved.messageAt) >= Date.parse(task.lastSeenAt)) {
+        if (task.lastSeenSeq !== latestObserved.messageSeq || task.lastSeenAt !== latestObserved.messageAt) changed = true;
+        task.lastSeenSeq = latestObserved.messageSeq;
+        task.lastSeenAt = latestObserved.messageAt;
+      }
+      if (!task.ledgerInitialized) {
+        task.ledgerInitialized = true;
+        changed = true;
+      }
+      if (!changed) return { changed: false, value: clonePublicTask(task) };
+      task.updatedAt = resolveNow(this.now, input).toISOString();
+      refreshLegacyWakeFields(task);
+      return { changed: true, value: clonePublicTask(task) };
+    });
+  }
+
+  markSeen(input) {
+    const sequence = parseSequence(input, "seq", ["seq", "lastSeenSeq", "sequence"]);
+    const observedAt = toDate(input.at ?? input.messageTime ?? resolveNow(this.now, input), "at").toISOString();
+    return this.observeMessages({
+      ...input,
+      messages: [{ messageSeq: sequence, messageAt: observedAt }],
     });
   }
 
   ack(input) {
-    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
-    const taskId = parseTaskId(input);
-    const sequence = parseSequence(input, "seq", ["seq", "lastAckedSeq", "sequence"]);
-    return this.#write((state) => {
-      const task = this.#requireTask(state, taskId);
-      requireGenerationMatch(task, input);
-      if (task.status === "closed") {
-        throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
-      }
-      if (
-        !task.wakePending
-        && task.wakeMessageSeq === null
-        && sequence === task.lastAckedSeq
-      ) {
-        return { changed: false, value: clonePublicTask(task) };
-      }
-      if (
-        !task.wakePending
-        || task.wakeMessageSeq === null
-        || task.wakeMessageAt === null
-        || sequence !== task.wakeMessageSeq
-      ) {
-        throw new TaskRegistryError(
-          "ACK_NOT_ACTIVE_WAKE",
-          `ACK 必须使用最近一次唤醒给出的 pending_through_message_seq：${taskId}`,
-          {
-            taskId,
-            wakeMessageSeq: task.wakeMessageSeq,
-            lastSeenSeq: task.lastSeenSeq,
-            requestedSeq: sequence,
-          },
-        );
-      }
-      const nextTask = {
-        ...task,
-        lastAckedSeq: sequence,
-        lastAckedAt: task.wakeMessageAt,
-        updatedAt: resolveNow(this.now, input).toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
-      return { changed: true, value: clonePublicTask(nextTask) };
-    });
+    return this.acknowledgeWake(input);
   }
 
   acknowledgeWake(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
-    const sequence = parseSequence(input, "seq", ["seq", "lastAckedSeq", "sequence"]);
-    const wakeId = optionalString(input.wakeId, "wakeId");
+    const explicitSequences = input.processedMessageSeqs ?? input.processed_message_seqs;
+    const processedSequences = explicitSequences !== undefined
+      ? parseSequenceList(explicitSequences, "processedMessageSeqs")
+      : [parseSequence(input, "seq", ["seq", "lastAckedSeq", "sequence"] )];
+    const requestedWakeId = optionalString(input.wakeId ?? input.wake_id, "wakeId");
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       if (task.status === "closed") {
         throw new TaskRegistryError("TASK_CLOSED", `任务已经关闭：${taskId}`, { taskId });
       }
-      if (
-        !task.wakePending
-        && task.wakeMessageSeq === null
-        && sequence === task.lastAckedSeq
-      ) {
-        return { changed: false, value: clonePublicTask(task) };
+      let wake = requestedWakeId === null
+        ? null
+        : task.wakeBatches.find((candidate) => candidate.wakeId === requestedWakeId) ?? null;
+      if (wake === null && requestedWakeId === null) {
+        const candidates = task.wakeBatches.filter((candidate) =>
+          candidate.legacy && processedSequences.every((sequence) => candidate.messageSeqs.includes(sequence))
+        );
+        if (candidates.length === 1) wake = candidates[0];
       }
-      if (
-        !task.wakePending
-        || task.wakeMessageSeq === null
-        || task.wakeMessageAt === null
-        || sequence !== task.wakeMessageSeq
-      ) {
+      if (wake === null) {
+        if (processedSequences.every((sequence) => findMessage(task, sequence)?.status === "acked")) {
+          return { changed: false, value: clonePublicTask(task) };
+        }
         throw new TaskRegistryError(
           "ACK_NOT_ACTIVE_WAKE",
-          `ACK 必须使用最近一次唤醒给出的 pending_through_message_seq：${taskId}`,
-          { taskId, wakeMessageSeq: task.wakeMessageSeq, requestedSeq: sequence },
+          `ACK 必须引用包含这些消息的有效 wake_id：${taskId}`,
+          { taskId, requestedWakeId, processedSequences },
         );
       }
-      if (task.activeWakeId !== null && wakeId !== task.activeWakeId) {
+      const invalidSequences = processedSequences.filter((sequence) => !wake.messageSeqs.includes(sequence));
+      if (invalidSequences.length) {
         throw new TaskRegistryError(
-          "ACK_WAKE_ID_MISMATCH",
-          `ACK 必须使用最近一次唤醒给出的 wake_id：${taskId}`,
-          { taskId, expectedWakeId: task.activeWakeId, requestedWakeId: wakeId },
+          "ACK_MESSAGE_MISMATCH",
+          `ACK 包含不属于该唤醒批次的消息：${taskId}`,
+          { taskId, wakeId: wake.wakeId, invalidSequences, wakeMessageSeqs: wake.messageSeqs },
         );
       }
-      const nextTask = {
-        ...task,
-        lastAckedSeq: sequence,
-        lastAckedAt: task.wakeMessageAt,
-        wakePending: false,
-        wakeSentAt: null,
-        wakeMessageSeq: null,
-        wakeMessageAt: null,
-        activeWakeId: null,
-        wakePromptSha256: null,
-        updatedAt: resolveNow(this.now, input).toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
-      return { changed: true, value: clonePublicTask(nextTask) };
+      let changed = false;
+      for (const sequence of processedSequences) {
+        const message = findMessage(task, sequence);
+        if (!message) {
+          throw new TaskRegistryError("ACK_MESSAGE_UNKNOWN", `ACK 消息不在任务账本中：${sequence}`, { taskId, sequence });
+        }
+        if (message.status !== "acked") {
+          message.status = "acked";
+          changed = true;
+        }
+      }
+      for (const candidate of task.wakeBatches) {
+        const acknowledged = new Set(candidate.acknowledgedSeqs);
+        for (const sequence of processedSequences) {
+          if (candidate.messageSeqs.includes(sequence)) acknowledged.add(sequence);
+        }
+        candidate.acknowledgedSeqs = [...acknowledged];
+        if (candidate.messageSeqs.every((sequence) => findMessage(task, sequence)?.status === "acked")) {
+          candidate.status = "complete";
+        }
+      }
+      const latestAcknowledged = task.messageLedger
+        .filter((message) => message.status === "acked")
+        .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt))
+        .at(-1) ?? null;
+      if (latestAcknowledged) {
+        task.lastAckedSeq = latestAcknowledged.messageSeq;
+        task.lastAckedAt = latestAcknowledged.messageAt;
+      }
+      refreshLegacyWakeFields(task);
+      if (!changed) return { changed: false, value: clonePublicTask(task) };
+      task.updatedAt = resolveNow(this.now, input).toISOString();
+      return { changed: true, value: clonePublicTask(task) };
     });
   }
 
   acquireWakeLease(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
-    const hasMessageSequence = ["seq", "messageSeq", "pendingThroughSequence"]
-      .some((field) => hasOwn(input, field));
-    const requestedMessageSequence = hasMessageSequence
-      ? parseSequence(input, "seq", ["seq", "messageSeq", "pendingThroughSequence"])
-      : null;
-    const requestedMessageAtValue = input.at ?? input.messageTime;
-    const requestedMessageAt = requestedMessageAtValue === undefined
-      ? null
-      : toDate(requestedMessageAtValue, "at").toISOString();
-    if ((requestedMessageSequence === null) !== (requestedMessageAt === null)) {
-      invalidArgument("唤醒消息的 seq 和 at 必须同时提供");
-    }
-    const requestedWakeId = optionalString(input.wakeId, "wakeId");
-    const requestedPromptSha256 = optionalString(input.promptSha256, "promptSha256");
-    if ((requestedWakeId === null) !== (requestedPromptSha256 === null)) {
-      invalidArgument("wakeId 和 promptSha256 必须同时提供");
-    }
-    const leaseMs = optionNumber(
-      input.leaseMs ?? input.wakeLeaseMs,
-      "leaseMs",
-      this.wakeLeaseMs,
-      1,
-    );
+    const requestedMessages = Array.isArray(input.messages)
+      ? parseObservedMessages({ messages: input.messages })
+      : [{
+          messageSeq: parseSequence(input, "seq", ["seq", "messageSeq", "pendingThroughSequence"]),
+          messageAt: toDate(input.at ?? input.messageTime, "at").toISOString(),
+        }];
+    const requestedWakeId = requiredString(input.wakeId, "wakeId");
+    const requestedPromptSha256 = requiredString(input.promptSha256, "promptSha256");
+    const leaseMs = optionNumber(input.leaseMs ?? input.wakeLeaseMs, "leaseMs", this.wakeLeaseMs, 1);
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       const now = resolveNow(this.now, input);
       if (task.status === "closed") {
+        return { changed: false, value: wakeLeaseResult(task, false, "closed", null) };
+      }
+      const expiredLeaseIds = new Set(task.wakeBatches
+        .filter((candidate) => candidate.status === "leased")
+        .filter((candidate) => now.getTime() >= Date.parse(candidate.leaseStartedAt) + leaseMs)
+        .map((candidate) => candidate.wakeId));
+      if (expiredLeaseIds.size) {
+        task.wakeBatches = task.wakeBatches.filter((candidate) => !expiredLeaseIds.has(candidate.wakeId));
+      }
+      const competingLease = task.wakeBatches.find((candidate) =>
+        candidate.status === "leased"
+        && candidate.wakeId !== requestedWakeId
+        && now.getTime() < Date.parse(candidate.leaseStartedAt) + leaseMs
+      );
+      if (competingLease) {
+        if (expiredLeaseIds.size) {
+          task.updatedAt = now.toISOString();
+          refreshLegacyWakeFields(task);
+        }
         return {
-          changed: false,
-          value: wakeLeaseResult(task, false, "closed", null),
+          changed: expiredLeaseIds.size > 0,
+          value: wakeLeaseResult(
+            task,
+            false,
+            "lease_active",
+            new Date(Date.parse(competingLease.leaseStartedAt) + leaseMs).toISOString(),
+          ),
         };
       }
-      const sentAtMs = task.wakeSentAt === null ? null : Date.parse(task.wakeSentAt);
-      const leaseExpiresAt = sentAtMs === null
-        ? null
-        : new Date(sentAtMs + leaseMs).toISOString();
-      if (task.wakePending && task.activeWakeId !== null) {
-        if (requestedWakeId !== task.activeWakeId || requestedPromptSha256 !== task.wakePromptSha256) {
-          return {
-            changed: false,
-            value: wakeLeaseResult(task, false, "wake_unresolved", leaseExpiresAt),
-          };
-        }
-        if (
-          requestedMessageSequence !== task.wakeMessageSeq
-          || requestedMessageAt !== task.wakeMessageAt
-        ) {
-          return {
-            changed: false,
-            value: wakeLeaseResult(task, false, "wake_boundary_conflict", leaseExpiresAt),
-          };
-        }
+      const resolved = requestedMessages.filter((message) => findMessage(task, message.messageSeq)?.status !== "pending");
+      if (resolved.length) {
+        return { changed: false, value: wakeLeaseResult(task, false, "messages_resolved", null) };
       }
-      if (task.wakePending && sentAtMs !== null && now.getTime() < sentAtMs + leaseMs) {
-        return {
-          changed: false,
-          value: wakeLeaseResult(task, false, "lease_active", leaseExpiresAt),
-        };
+      let batch = task.wakeBatches.find((candidate) => candidate.wakeId === requestedWakeId) ?? null;
+      if (batch) {
+        const sameMessages = batch.messageSeqs.length === requestedMessages.length
+          && batch.messageSeqs.every((sequence, index) => sequence === requestedMessages[index].messageSeq);
+        if (!sameMessages || batch.promptSha256 !== requestedPromptSha256) {
+          return { changed: false, value: wakeLeaseResult(task, false, "wake_boundary_conflict", null) };
+        }
+        if (batch.status === "sent") {
+          return { changed: false, value: wakeLeaseResult(task, false, "already_sent", null) };
+        }
+        if (batch.status === "complete") {
+          return { changed: false, value: wakeLeaseResult(task, false, "messages_resolved", null) };
+        }
+        const leaseStartedAtMs = Date.parse(batch.leaseStartedAt);
+        if (now.getTime() < leaseStartedAtMs + leaseMs) {
+          return {
+            changed: false,
+            value: wakeLeaseResult(task, false, "lease_active", new Date(leaseStartedAtMs + leaseMs).toISOString()),
+          };
+        }
       }
       const lastWakeAtMs = task.lastWakeAt === null ? null : Date.parse(task.lastWakeAt);
       const cooldownExpiresAt = lastWakeAtMs === null
         ? null
         : new Date(lastWakeAtMs + task.wakeCooldownMs).toISOString();
-      if (lastWakeAtMs !== null && now.getTime() < lastWakeAtMs + task.wakeCooldownMs) {
-        return {
-          changed: false,
-          value: wakeLeaseResult(task, false, "wake_cooldown", null, cooldownExpiresAt),
-        };
+      if (batch === null && lastWakeAtMs !== null && now.getTime() < lastWakeAtMs + task.wakeCooldownMs) {
+        return { changed: false, value: wakeLeaseResult(task, false, "wake_cooldown", null, cooldownExpiresAt) };
       }
-      const nextTask = {
-        ...task,
-        wakePending: true,
-        wakeSentAt: now.toISOString(),
-        wakeMessageSeq: requestedMessageSequence ?? (task.lastSeenAt === null ? null : task.lastSeenSeq),
-        wakeMessageAt: requestedMessageAt ?? task.lastSeenAt,
-        activeWakeId: requestedWakeId,
-        wakePromptSha256: requestedPromptSha256,
-        updatedAt: now.toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
+      const boundary = requestedMessages.at(-1);
+      if (batch === null) {
+        batch = {
+          wakeId: requestedWakeId,
+          messageSeqs: requestedMessages.map((message) => message.messageSeq),
+          messageTimes: requestedMessages.map((message) => message.messageAt),
+          boundaryMessageSeq: boundary.messageSeq,
+          boundaryMessageAt: boundary.messageAt,
+          leaseStartedAt: now.toISOString(),
+          sentAt: null,
+          promptSha256: requestedPromptSha256,
+          status: "leased",
+          acknowledgedSeqs: [],
+          legacy: false,
+        };
+        task.wakeBatches.push(batch);
+      } else {
+        batch.leaseStartedAt = now.toISOString();
+        batch.status = "leased";
+      }
+      refreshLegacyWakeFields(task);
+      task.updatedAt = now.toISOString();
       return {
         changed: true,
-        value: wakeLeaseResult(nextTask, true, "acquired", new Date(now.getTime() + leaseMs).toISOString()),
+        value: wakeLeaseResult(task, true, "acquired", new Date(now.getTime() + leaseMs).toISOString()),
       };
     });
   }
@@ -802,38 +1003,37 @@ class TaskRegistry {
   confirmWakeSent(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
-    const expectedWakeSentAt = requiredString(
-      input.expectedWakeSentAt ?? input.wakeSentAt,
-      "expectedWakeSentAt",
-    );
-    const expectedWakeId = optionalString(input.expectedWakeId ?? input.wakeId, "expectedWakeId");
+    const expectedWakeSentAt = requiredString(input.expectedWakeSentAt ?? input.wakeSentAt, "expectedWakeSentAt");
+    const expectedWakeId = requiredString(input.expectedWakeId ?? input.wakeId, "expectedWakeId");
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
-      if (!task.wakePending || task.wakeSentAt !== expectedWakeSentAt) {
+      const batch = task.wakeBatches.find((candidate) => candidate.wakeId === expectedWakeId) ?? null;
+      if (!batch || batch.leaseStartedAt !== expectedWakeSentAt) {
         throw new TaskRegistryError(
           "WAKE_LEASE_MISMATCH",
           `唤醒租约已变化：${taskId}`,
-          { taskId, expectedWakeSentAt, actualWakeSentAt: task.wakeSentAt },
+          { taskId, expectedWakeId, expectedWakeSentAt, actualWakeSentAt: batch?.leaseStartedAt ?? null },
         );
       }
-      if (expectedWakeId !== null && task.activeWakeId !== expectedWakeId) {
-        throw new TaskRegistryError(
-          "WAKE_LEASE_MISMATCH",
-          `唤醒租约 wakeId 已变化：${taskId}`,
-          { taskId, expectedWakeId, actualWakeId: task.activeWakeId },
-        );
-      }
-      if (task.lastWakeAt === task.wakeSentAt) {
+      if (batch.status === "sent" && batch.sentAt === expectedWakeSentAt) {
         return { changed: false, value: clonePublicTask(task) };
       }
-      const nextTask = {
-        ...task,
-        lastWakeAt: task.wakeSentAt,
-        updatedAt: resolveNow(this.now, input).toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
-      return { changed: true, value: clonePublicTask(nextTask) };
+      if (batch.status !== "leased") {
+        throw new TaskRegistryError("WAKE_LEASE_MISMATCH", `唤醒批次不再处于租约状态：${taskId}`, { taskId, expectedWakeId });
+      }
+      batch.status = "sent";
+      batch.sentAt = expectedWakeSentAt;
+      for (const sequence of batch.messageSeqs) {
+        const message = findMessage(task, sequence);
+        if (message?.status === "pending" && message.lastRemindedAt === null) {
+          message.lastRemindedAt = expectedWakeSentAt;
+        }
+      }
+      task.lastWakeAt = expectedWakeSentAt;
+      task.updatedAt = resolveNow(this.now, input).toISOString();
+      refreshLegacyWakeFields(task);
+      return { changed: true, value: clonePublicTask(task) };
     });
   }
 
@@ -841,44 +1041,25 @@ class TaskRegistry {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const taskId = parseTaskId(input);
     const expectedWakeSentAt = input.expectedWakeSentAt ?? input.wakeSentAt;
-    const expectedWakeId = input.expectedWakeId ?? input.wakeId;
+    const expectedWakeId = requiredString(input.expectedWakeId ?? input.wakeId, "expectedWakeId");
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
-      if (expectedWakeSentAt !== undefined && expectedWakeSentAt !== task.wakeSentAt) {
+      const batchIndex = task.wakeBatches.findIndex((candidate) => candidate.wakeId === expectedWakeId);
+      if (batchIndex < 0) return { changed: false, value: clonePublicTask(task) };
+      const batch = task.wakeBatches[batchIndex];
+      if (expectedWakeSentAt !== undefined && expectedWakeSentAt !== batch.leaseStartedAt) {
         throw new TaskRegistryError(
           "WAKE_LEASE_MISMATCH",
           `唤醒租约已变化：${taskId}`,
-          { taskId, expectedWakeSentAt, actualWakeSentAt: task.wakeSentAt },
+          { taskId, expectedWakeId, expectedWakeSentAt, actualWakeSentAt: batch.leaseStartedAt },
         );
       }
-      if (expectedWakeId !== undefined && expectedWakeId !== task.activeWakeId) {
-        throw new TaskRegistryError(
-          "WAKE_LEASE_MISMATCH",
-          `唤醒租约 wakeId 已变化：${taskId}`,
-          { taskId, expectedWakeId, actualWakeId: task.activeWakeId },
-        );
-      }
-      if (
-        !task.wakePending
-        && task.wakeSentAt === null
-        && task.wakeMessageSeq === null
-        && task.wakeMessageAt === null
-      ) {
-        return { changed: false, value: clonePublicTask(task) };
-      }
-      const nextTask = {
-        ...task,
-        wakePending: false,
-        wakeSentAt: null,
-        wakeMessageSeq: null,
-        wakeMessageAt: null,
-        activeWakeId: null,
-        wakePromptSha256: null,
-        updatedAt: resolveNow(this.now, input).toISOString(),
-      };
-      state.tasks[taskId] = nextTask;
-      return { changed: true, value: clonePublicTask(nextTask) };
+      if (batch.status !== "leased") return { changed: false, value: clonePublicTask(task) };
+      task.wakeBatches.splice(batchIndex, 1);
+      task.updatedAt = resolveNow(this.now, input).toISOString();
+      refreshLegacyWakeFields(task);
+      return { changed: true, value: clonePublicTask(task) };
     });
   }
 
