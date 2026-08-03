@@ -36,6 +36,16 @@ test("tool call budget keeps the broker default and caps caller extensions", () 
     timeoutSource: "caller_execution_timeout",
     deadlineAtMs: 316000,
   });
+  assert.deepEqual(resolveToolCallBudget({ timeout: 120000 }, defaults), {
+    timeoutMs: 135000,
+    timeoutSource: "caller_execution_timeout",
+    deadlineAtMs: 136000,
+  });
+  assert.deepEqual(resolveToolCallBudget({ timeout: 1000 }, defaults), {
+    timeoutMs: 120000,
+    timeoutSource: "caller_execution_timeout",
+    deadlineAtMs: 121000,
+  });
   assert.deepEqual(resolveToolCallBudget({ waitSeconds: 4000 }, defaults), {
     timeoutMs: 1800000,
     timeoutSource: "caller_wait_seconds",

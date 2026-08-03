@@ -37,7 +37,7 @@ Call timeout behavior:
 
 - Ordinary tool calls keep the `CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS` limit, which defaults to `120000` ms.
 - Calls whose arguments contain `waitSeconds > 0` receive `max(waitSeconds * 1000 + 15000, request timeout)`, capped by `CODEX_MCP_BROKER_WAIT_TIMEOUT_MS`.
-- Calls whose arguments contain `timeout > request timeout` receive `timeout + 15000` ms, capped by the same wait limit.
+- Calls whose arguments contain a positive `timeout` receive `max(timeout + 15000, request timeout)` ms, capped by the same wait limit. The extra 15 seconds prevents a command execution timeout from racing the broker communication deadline when both start from the same value.
 - Calls whose arguments contain `timeout=0` use the wait-timeout cap as their finite broker communication deadline instead of falling back to 120 seconds.
 - `CODEX_MCP_BROKER_WAIT_TIMEOUT_MS` defaults to `21600000` ms (6 hours). Invalid timeout variables fall back to defaults, and the cap is never lower than the ordinary request timeout.
 - Timeout selection is argument-based, so it works for any compatible tool without hard-coding tool names. The selected absolute deadline is forwarded in MCP `_meta["io.github.jurybu/broker"]`; older backends may ignore it safely.

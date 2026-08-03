@@ -22,8 +22,8 @@ export function resolveToolCallBudget(args, options) {
       waitTimeoutCapMs,
     );
     timeoutSource = "caller_wait_seconds";
-  } else if (typeof args.timeout === "number" && args.timeout > requestTimeoutMs) {
-    timeoutMs = Math.min(args.timeout + 15000, waitTimeoutCapMs);
+  } else if (typeof args.timeout === "number" && args.timeout > 0) {
+    timeoutMs = Math.min(Math.max(args.timeout + 15000, requestTimeoutMs), waitTimeoutCapMs);
     timeoutSource = "caller_execution_timeout";
   }
 
