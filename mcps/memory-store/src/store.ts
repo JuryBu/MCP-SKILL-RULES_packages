@@ -20,10 +20,8 @@ import { indexCache, type WorkspaceIndex, type MemoryIndexEntry } from "./cache.
 
 // ============= 路径常量 =============
 
-const TOOLKIT_DATA_ROOT = process.env.CODEX_TOOLKIT_DATA_ROOT
-    || path.join(os.homedir(), ".codex-toolkit");
 const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || path.join(TOOLKIT_DATA_ROOT, "memory-store");
+    || path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
 const WORKSPACES_DIR = path.join(DATA_ROOT, "workspaces");
 const GENERAL_DIR = path.join(DATA_ROOT, "general");
 const GLOBAL_INDEX_PATH = path.join(DATA_ROOT, "_global_index.json");
@@ -283,11 +281,16 @@ function renameWithRetry(tmpPath: string, filePath: string): void {
     }
 }
 
-export async function renameWithRetryAsync(tmpPath: string, filePath: string): Promise<void> {
+export async function renameWithRetryAsync(
+    tmpPath: string,
+    filePath: string,
+    beforeRename?: () => Promise<void> | void,
+): Promise<void> {
     const transient = new Set(["EPERM", "EACCES", "EBUSY"]);
     const maxAttempts = 5;
     for (let attempt = 1; ; attempt++) {
         try {
+            await beforeRename?.();
             await fs.promises.rename(tmpPath, filePath);
             return;
         } catch (error) {
@@ -307,10 +310,95 @@ function atomicWrite(filePath: string, content: string): void {
     renameWithRetry(tmpPath, filePath);
 }
 
-async function atomicWriteAsync(filePath: string, content: string): Promise<void> {
+export interface AtomicWriteAsyncOptions {
+    beforeCommit?: () => Promise<void> | void;
+    afterCommit?: () => Promise<void> | void;
+    rollbackOnAfterCommitFailure?: boolean;
+}
+
+async function syncFileAndParentAsync(filePath: string): Promise<void> {
+    const target = await fs.promises.open(filePath, process.platform === "win32" ? "r+" : "r");
+    try {
+        await target.sync();
+    } finally {
+        await target.close();
+    }
+    if (process.platform === "win32") return;
+    const parent = await fs.promises.open(path.dirname(filePath), "r");
+    try {
+        await parent.sync();
+    } finally {
+        await parent.close();
+    }
+}
+
+async function restoreAtomicWriteTargetAsync(filePath: string, previous: Buffer | null): Promise<void> {
+    if (previous === null) {
+        await fs.promises.rm(filePath, { force: true });
+        if (process.platform !== "win32") {
+            const parent = await fs.promises.open(path.dirname(filePath), "r");
+            try {
+                await parent.sync();
+            } finally {
+                await parent.close();
+            }
+        }
+        return;
+    }
+    const rollbackPath = uniqueTmpPath(filePath);
+    let handle: Awaited<ReturnType<typeof fs.promises.open>> | undefined;
+    try {
+        handle = await fs.promises.open(rollbackPath, "wx");
+        await handle.writeFile(previous);
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await renameWithRetryAsync(rollbackPath, filePath);
+        await syncFileAndParentAsync(filePath);
+    } catch (error) {
+        if (handle) await handle.close().catch(() => undefined);
+        await fs.promises.rm(rollbackPath, { force: true }).catch(() => undefined);
+        throw error;
+    }
+}
+
+async function atomicWriteAsync(filePath: string, content: string, options: AtomicWriteAsyncOptions = {}): Promise<void> {
     const tmpPath = uniqueTmpPath(filePath);
-    await fs.promises.writeFile(tmpPath, content, "utf-8");
-    await renameWithRetryAsync(tmpPath, filePath);
+    let previous: Buffer | null = null;
+    if (options.rollbackOnAfterCommitFailure) {
+        try {
+            previous = await fs.promises.readFile(filePath);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+        }
+    }
+    let handle: Awaited<ReturnType<typeof fs.promises.open>> | undefined;
+    let committed = false;
+    try {
+        handle = await fs.promises.open(tmpPath, "wx");
+        await handle.writeFile(content, "utf-8");
+        await handle.sync();
+        await handle.close();
+        handle = undefined;
+        await renameWithRetryAsync(tmpPath, filePath, options.beforeCommit);
+        committed = true;
+        await syncFileAndParentAsync(filePath);
+        try {
+            await options.afterCommit?.();
+        } catch (error) {
+            if (!options.rollbackOnAfterCommitFailure) throw error;
+            try {
+                await restoreAtomicWriteTargetAsync(filePath, previous);
+            } catch (rollbackError) {
+                throw new AggregateError([error, rollbackError], `atomic write post-commit verification and rollback both failed for ${filePath}`);
+            }
+            throw error;
+        }
+    } catch (error) {
+        if (handle) await handle.close().catch(() => undefined);
+        if (!committed) await fs.promises.rm(tmpPath, { force: true }).catch(() => undefined);
+        throw error;
+    }
 }
 
 /**
@@ -320,8 +408,8 @@ export function writeJsonAtomic(filePath: string, data: unknown): void {
     atomicWrite(filePath, JSON.stringify(data, null, 2));
 }
 
-export async function writeJsonAtomicAsync(filePath: string, data: unknown): Promise<void> {
-    await atomicWriteAsync(filePath, JSON.stringify(data, null, 2));
+export async function writeJsonAtomicAsync(filePath: string, data: unknown, options: AtomicWriteAsyncOptions = {}): Promise<void> {
+    await atomicWriteAsync(filePath, JSON.stringify(data, null, 2), options);
 }
 
 /**
@@ -331,8 +419,8 @@ export function writeTextAtomic(filePath: string, content: string): void {
     atomicWrite(filePath, content);
 }
 
-export async function writeTextAtomicAsync(filePath: string, content: string): Promise<void> {
-    await atomicWriteAsync(filePath, content);
+export async function writeTextAtomicAsync(filePath: string, content: string, options: AtomicWriteAsyncOptions = {}): Promise<void> {
+    await atomicWriteAsync(filePath, content, options);
 }
 
 // ============= 进程内索引锁 =============

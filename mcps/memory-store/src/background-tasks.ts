@@ -94,6 +94,7 @@ export interface BackgroundTaskContext {
 }
 
 export interface BackgroundTaskOptions {
+    taskId?: string;
     maxRunMs?: number;
     timeoutMessage?: string;
     resumePayload?: unknown;
@@ -1356,11 +1357,24 @@ export function startBackgroundTask(
     run: (context: BackgroundTaskContext) => Promise<string>,
     options: BackgroundTaskOptions = {},
 ): BackgroundTask {
+    const requestedTaskId = options.taskId === undefined ? undefined : options.taskId.trim();
+    if (requestedTaskId !== undefined && !isValidBackgroundTaskId(requestedTaskId)) {
+        throw new Error(`后台任务 taskId 格式非法: ${options.taskId}`);
+    }
+    if (requestedTaskId) {
+        const existingTask = getBackgroundTask(requestedTaskId);
+        if (existingTask) {
+            if (existingTask.kind !== kind) {
+                throw new Error(`后台任务 taskId=${requestedTaskId} 已属于 ${existingTask.kind}，不能复用于 ${kind}`);
+            }
+            return existingTask;
+        }
+    }
     const maxRunMs = options.maxRunMs ?? getBackgroundTaskMaxRunMs(kind);
     const startedAtMs = Date.now();
     const resume = prepareResumeMetadata(options);
     const task: BackgroundTask = {
-        id: makeTaskId(kind),
+        id: requestedTaskId || makeTaskId(kind),
         kind,
         status: "running",
         startedAt: new Date(startedAtMs).toISOString(),

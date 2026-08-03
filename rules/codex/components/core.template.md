@@ -264,6 +264,7 @@ MCP memory-store 是跨对话持久化知识的主要方式：
 - `record_manage(list/search, scope="workspace")` 默认严格只读指定 workspace，需要合并 general 时显式传 `includeGeneral=true`
 - 读取超长 Record 时，优先用结构化参数：`view="outline|state|outputs|lessons|risks|verification|phase"`、`phaseIds`、`sectionTypes`、`include/exclude`、`maxChars`、`withCitations`，而不是整篇读取
 - `record_manage(search)` 支持 `searchScope="record|phase|section|item"` 获取 block 级 provenance
+- Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record/Stage Guard 从排队、恢复到完成始终查询首次返回的同一公开 taskId，不因重试或后端恢复重复新建任务
 - `audit_ownership` 只读检测 duplicate/migratable/conflict/unknown；`repair_ownership` 默认 `dryRun=true`，首版只 copy/upsert 不删除来源副本
 - 用户要求写入记忆时，写入 memory-store 的记忆而不是系统自动维护的记忆条目
 
@@ -277,6 +278,8 @@ MCP memory-store 是跨对话持久化知识的主要方式：
 - 上下文被压缩后需要恢复细节
 
 流程：先 `list` 定位 `conversationId` → `search` 关键词 → `read` 精读 → 需要更多时 `depth="full"` 深度查看。
+
+`fetch` 负责建立或更新四宿主共用结构的持久规范化缓存，后续 search/read/full/diff 都从该缓存派生，不重复解析原始 JSONL/PB。`source="auto|local|ls|cache"` 可选择原始来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默省略。
 
 Codex 链路特性：`read(startRound, endRound)` 按轮次精读，`depth="full"` + `extraTypes` 展开 reasoning/工具结果/code diff，`link` 控制子代理引用展开方式（参数详见工具描述）。子代理关闭后仍可读取其内容。读取对话原文时遇到图片路径，有必要就主动查看对应图片内容，不要只报路径不看图。
 

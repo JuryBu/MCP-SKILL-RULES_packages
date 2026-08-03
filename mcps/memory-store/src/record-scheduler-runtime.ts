@@ -23,6 +23,12 @@ import {
     type TaskState,
 } from "./record-scheduler-contracts.js";
 import { DATA_ROOT, listWorkspaceHashes } from "./store.js";
+import {
+    pinConversationSourceCacheGeneration,
+    releaseConversationSourceCacheGenerationPinsForOwner,
+    type ConversationSourceCacheGenerationRef,
+} from "./conversation-source-cache.js";
+import { acquireConversationSourcePressure, withConversationSourcePressure } from "./conversation-source-pressure.js";
 import { listRecords } from "./record-store.js";
 import {
     admitRecordSchedulerTask,
@@ -74,14 +80,25 @@ import {
     buildLostObservation,
     buildSourceEnumerationEvidence,
     canonicalSourceIdentityKey,
+    isVerifiedConversationCacheEnumeration,
     type ExactFetchEvidence,
     type LostObservation,
     type SourceConversationIdentity,
     type SourceEnumerationEvidence,
     type SourceEvidenceHost,
 } from "./source-evidence-contracts.js";
-import { enumerateCodexSourceEvidence, fetchCodexSourceEvidence, listRecentCodexThreads } from "./codex-client.js";
-import { enumerateClaudeCodeSourceEvidence, fetchClaudeCodeSourceEvidence, listRecentClaudeCodeThreads } from "./claude-code-client.js";
+import {
+    enumerateCodexSourceEvidence,
+    fetchCodexSourceEvidence,
+    listRecentCodexThreads,
+    resolveCodexSourceEvidenceIdentity,
+} from "./codex-client.js";
+import {
+    enumerateClaudeCodeSourceEvidence,
+    fetchClaudeCodeSourceEvidence,
+    listRecentClaudeCodeThreads,
+    resolveClaudeCodeSourceEvidenceIdentity,
+} from "./claude-code-client.js";
 import { listRecentWindsurfThreads, scanWindsurfSourceEvidence } from "./windsurf-client.js";
 import {
     createAntigravityLsSourceEvidenceAdapter,
@@ -94,7 +111,9 @@ import {
 } from "./ls-client.js";
 import {
     createProductionSourceReader,
+    describeVerifiedConversationCacheSource,
     type ProductionSourceAuthorityVerification,
+    type ProductionSourceCacheReference,
     type ProductionSourceCanonicalDocument,
     type ProductionSourceReader,
     type ProductionSourceReadRequest,
@@ -144,6 +163,7 @@ const DEFAULT_RUNTIME_OWNER_LEASE_MS = 30_000;
 const MIN_RUNTIME_OWNER_HEARTBEAT_INTERVAL_MS = 50;
 const MAX_RUNTIME_OWNER_HEARTBEAT_INTERVAL_MS = 5_000;
 const EXECUTION_OWNER_HEARTBEAT_RETRY_LIMIT = 5;
+const RUNTIME_SOURCE_CACHE_REFERENCES_EXTENSION_KEY = "record-source-cache-references";
 
 export type RecordSchedulerRuntimeMode = typeof RECORD_SCHEDULER_RUNTIME_MODES[number];
 export type RecordSchedulerRuntimeTaskKind = "record-update" | "record-batch-update";
@@ -195,9 +215,16 @@ export interface RecordSchedulerRuntimeDiscoveryRecord {
     workspacePath: string | null;
     host?: SourceEvidenceHost;
     lastUpdatedAt: string;
+    lastUpdatedRound?: number;
     recordBodyHash: string;
     coveredRevision?: string;
     coveredRevisionSequence?: number | null;
+}
+
+export interface RecordSchedulerRuntimeSourceCacheReference extends ProductionSourceCacheReference {
+    host: SourceEvidenceHost;
+    conversationId: string;
+    workspaceHash: string;
 }
 
 export interface RecordSchedulerRuntimeDiscoveryRequest {
@@ -211,6 +238,7 @@ export interface RecordSchedulerRuntimeDiscoveryRequest {
     selectionLimit?: number;
     filters?: Record<string, unknown>;
     records?: RecordSchedulerRuntimeDiscoveryRecord[];
+    sourceCacheReferences?: RecordSchedulerRuntimeSourceCacheReference[];
     targets?: Array<{
         conversationId: string;
         host: SourceEvidenceHost;
@@ -229,6 +257,8 @@ export interface FrozenRuntimeSource {
     document: ProductionSourceCanonicalDocument;
     scanId: string;
     authority: ProductionSourceAuthorityVerification;
+    cacheGeneration?: ConversationSourceCacheGenerationRef;
+    cacheSourceSnapshot?: Record<string, unknown>;
 }
 
 export interface FrozenRuntimeSourceIssue {
@@ -696,6 +726,11 @@ interface ProductionDiscoverySeed {
     workspaceHash: string;
     workspacePath: string | null;
     sourceUpdatedAtMs: number | null;
+    listed?: boolean;
+    fallbackEligible?: boolean;
+    sourceAuthorityRoot?: string | null;
+    sourceIdentity?: SourceConversationIdentity["source"];
+    sourceRevisionHint?: string;
     record?: RecordSchedulerRuntimeDiscoveryRecord;
     discoveryError?: string;
 }
@@ -724,6 +759,8 @@ interface FrozenRuntimeSourceCapsule {
     request: ProductionSourceReadRequest;
     scanId: string;
     authority: ProductionSourceAuthorityVerification;
+    cacheGeneration?: ConversationSourceCacheGenerationRef;
+    cacheSourceSnapshot?: Record<string, unknown>;
 }
 
 interface DurableRefreshAttachment {
@@ -785,6 +822,7 @@ function productionDiscoveryKey(request: RecordSchedulerRuntimeDiscoveryRequest)
         selectionLimit: request.selectionLimit || null,
         filters: request.filters || {},
         records: request.records || [],
+        sourceCacheReferences: sourceCacheReferencesForDiscovery(request),
         targets: request.targets || [],
     })}`;
 }
@@ -809,6 +847,23 @@ function productionSeedKey(seed: Pick<ProductionDiscoverySeed, "host" | "convers
     return `${seed.host}\u0000${seed.workspaceHash}\u0000${seed.conversationId}`;
 }
 
+function sourceFileRevisionHint(filePath: string, fallback: Record<string, unknown>): string {
+    try {
+        const stat = fs.statSync(filePath);
+        return stableJsonHash({ path: path.resolve(filePath), bytes: stat.size, mtimeMs: stat.mtimeMs });
+    } catch {
+        return stableJsonHash(fallback);
+    }
+}
+
+function sourceFileUpdatedAtMs(filePath: string, fallback: number | null | undefined): number | null {
+    try {
+        return fs.statSync(filePath).mtimeMs;
+    } catch {
+        return fallback || null;
+    }
+}
+
 function matchesDiscoveryTime(seed: ProductionDiscoverySeed, filters: Record<string, unknown> | undefined): boolean {
     if (!seed.sourceUpdatedAtMs || !filters) return true;
     const after = typeof filters.after === "string" ? Date.parse(filters.after) : Number.NaN;
@@ -824,7 +879,7 @@ function sourceIdentityForSeed(seed: ProductionDiscoverySeed): SourceConversatio
             workspaceId: seed.workspaceHash,
             canonicalPath: seed.workspacePath,
         },
-        source: {
+        source: seed.sourceIdentity || {
             kind: "endpoint",
             authority: `${seed.host}-production`,
             authoritativeRoot: `${seed.host}-production`,
@@ -834,8 +889,103 @@ function sourceIdentityForSeed(seed: ProductionDiscoverySeed): SourceConversatio
     };
 }
 
+function normalizeCacheGeneration(value: unknown): ConversationSourceCacheGenerationRef | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const input = value as Partial<ConversationSourceCacheGenerationRef>;
+    if (!input.key || typeof input.key !== "object"
+        || typeof input.key.source !== "string" || input.key.source.length === 0
+        || typeof input.key.conversationId !== "string" || input.key.conversationId.length === 0
+        || typeof input.generation !== "string" || input.generation.length === 0
+        || (input.fingerprint !== null && (typeof input.fingerprint !== "object" || Array.isArray(input.fingerprint)))) {
+        return undefined;
+    }
+    return {
+        key: { source: input.key.source, conversationId: input.key.conversationId },
+        generation: input.generation,
+        fingerprint: input.fingerprint ? structuredClone(input.fingerprint) : null,
+    };
+}
+
+function normalizeCacheSourceSnapshot(value: unknown): Record<string, unknown> | undefined {
+    if (value === undefined || value === null) return undefined;
+    const normalized = normalizeResumePayload(value);
+    if (!normalized || typeof normalized !== "object" || Array.isArray(normalized)) return undefined;
+    return structuredClone(normalized) as Record<string, unknown>;
+}
+
+function normalizeRuntimeSourceCacheReference(value: unknown): RecordSchedulerRuntimeSourceCacheReference | undefined {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+    const input = value as Partial<RecordSchedulerRuntimeSourceCacheReference>;
+    if (!SOURCE_EVIDENCE_HOSTS.includes(input.host as SourceEvidenceHost)
+        || typeof input.conversationId !== "string" || input.conversationId.length === 0
+        || typeof input.workspaceHash !== "string" || input.workspaceHash.length === 0) {
+        return undefined;
+    }
+    const cacheGeneration = normalizeCacheGeneration(input.cacheGeneration);
+    const sourceSnapshot = normalizeCacheSourceSnapshot(input.sourceSnapshot);
+    const cacheReadStartRound = Number.isSafeInteger(input.cacheReadStartRound)
+        && input.cacheReadStartRound! >= 1
+        ? input.cacheReadStartRound
+        : undefined;
+    return {
+        host: input.host as SourceEvidenceHost,
+        conversationId: input.conversationId,
+        workspaceHash: input.workspaceHash,
+        ...(cacheGeneration ? { cacheGeneration } : {}),
+        ...(sourceSnapshot ? { sourceSnapshot } : {}),
+        ...(cacheReadStartRound !== undefined ? { cacheReadStartRound } : {}),
+    };
+}
+
+function sourceCacheReferencesForDiscovery(request: RecordSchedulerRuntimeDiscoveryRequest): RecordSchedulerRuntimeSourceCacheReference[] {
+    return (request.sourceCacheReferences || [])
+        .map(normalizeRuntimeSourceCacheReference)
+        .filter((reference): reference is RecordSchedulerRuntimeSourceCacheReference => reference !== undefined)
+        .sort((left, right) => [left.host, left.workspaceHash, left.conversationId].join("\u0000").localeCompare(
+            [right.host, right.workspaceHash, right.conversationId].join("\u0000"),
+        ));
+}
+
+function sourceCacheReferenceForCandidate(
+    discovery: DiscoveryCandidateSnapshot,
+    candidate: DiscoveryImmutable<DiscoveryCandidateSnapshot["candidates"][number]>,
+): ProductionSourceCacheReference {
+    const extensions = discovery.request.filters.extensions as Record<string, unknown>;
+    const rawReferences = extensions[RUNTIME_SOURCE_CACHE_REFERENCES_EXTENSION_KEY];
+    const identity = candidate.source.identity;
+    const reference = (Array.isArray(rawReferences) ? rawReferences : [])
+        .map(normalizeRuntimeSourceCacheReference)
+        .find((candidateReference): candidateReference is RecordSchedulerRuntimeSourceCacheReference => (
+            candidateReference !== undefined
+            && candidateReference.host === candidate.source.host
+            && candidateReference.conversationId === identity.conversationId
+            && candidateReference.workspaceHash === identity.workspace.workspaceId
+        ));
+    const existingRecord = discovery.recordIndex.entries.find(entry => (
+        entry.source.host === candidate.source.host
+        && entry.source.identity.conversationId === identity.conversationId
+        && entry.source.identity.workspace.workspaceId === identity.workspace.workspaceId
+    ));
+    const lastUpdatedRound = typeof existingRecord?.extensions.lastUpdatedRound === "number"
+        && Number.isSafeInteger(existingRecord.extensions.lastUpdatedRound)
+        && existingRecord.extensions.lastUpdatedRound >= 0
+        ? existingRecord.extensions.lastUpdatedRound
+        : undefined;
+    const cacheReadStartRound = reference?.cacheReadStartRound !== undefined
+        ? reference.cacheReadStartRound
+        : lastUpdatedRound === undefined
+            ? undefined
+            : lastUpdatedRound + 1;
+    return {
+        ...(reference?.cacheGeneration ? { cacheGeneration: reference.cacheGeneration } : {}),
+        ...(reference?.sourceSnapshot ? { sourceSnapshot: reference.sourceSnapshot } : {}),
+        ...(cacheReadStartRound === undefined ? {} : { cacheReadStartRound }),
+    };
+}
+
 function productionSourceRequestForCandidate(
     candidate: DiscoveryImmutable<DiscoveryCandidateSnapshot["candidates"][number]>,
+    cacheReference: ProductionSourceCacheReference = {},
 ): ProductionSourceReadRequest {
     const identity = candidate.source.identity;
     const workspacePath = identity.workspace.canonicalPath;
@@ -847,6 +997,7 @@ function productionSourceRequestForCandidate(
                 workspaceId: identity.workspace.workspaceId,
                 canonicalPath: workspacePath,
             },
+            ...cacheReference,
         };
     }
     if (candidate.source.host === "claude-code") {
@@ -855,6 +1006,7 @@ function productionSourceRequestForCandidate(
             conversationId: identity.conversationId,
             workspaceId: identity.workspace.workspaceId,
             workspacePath,
+            ...cacheReference,
         };
     }
     if (candidate.source.host === "windsurf") {
@@ -867,6 +1019,7 @@ function productionSourceRequestForCandidate(
             authoritativeRoot: identity.source.authoritativeRoot,
             sourceCanonicalPath: identity.source.canonicalPath,
             requestClass: "background",
+            ...cacheReference,
         };
     }
     return {
@@ -879,6 +1032,7 @@ function productionSourceRequestForCandidate(
             pbRoot: identity.source.authoritativeRoot,
             vscdbPath: identity.source.canonicalPath || identity.source.authoritativeRoot,
         },
+        ...cacheReference,
     };
 }
 
@@ -1170,6 +1324,11 @@ async function listProductionDiscoverySeeds(
         seeds.set(key, {
             ...(existing || seed),
             ...seed,
+            listed: seed.listed === true || existing?.listed === true,
+            fallbackEligible: seed.fallbackEligible === true || existing?.fallbackEligible === true,
+            sourceAuthorityRoot: seed.sourceAuthorityRoot ?? existing?.sourceAuthorityRoot,
+            sourceIdentity: seed.sourceIdentity || existing?.sourceIdentity,
+            sourceRevisionHint: seed.sourceRevisionHint || existing?.sourceRevisionHint,
             record: seed.record || existing?.record,
             sourceUpdatedAtMs: seed.sourceUpdatedAtMs ?? existing?.sourceUpdatedAtMs ?? null,
             discoveryError: seed.discoveryError || existing?.discoveryError,
@@ -1222,6 +1381,7 @@ async function listProductionDiscoverySeeds(
             workspaceHash: target.workspaceHash,
             workspacePath: target.workspacePath,
             sourceUpdatedAtMs: null,
+            fallbackEligible: true,
             record: (request.records || []).find(record => record.conversationId === target.conversationId
                 && (!record.host || record.host === target.host)),
         });
@@ -1233,7 +1393,24 @@ async function listProductionDiscoverySeeds(
             markHostDiscoverySuccess("codex", threads.length);
             for (const thread of threads) {
                 if (!matchesRequestedWorkspace(thread.cwd, request.workspacePath)) continue;
-                add({ host: "codex", conversationId: thread.id, title: thread.title, workspaceHash, workspacePath: thread.cwd || request.workspacePath || null, sourceUpdatedAtMs: thread.updatedAtMs || null });
+                add({
+                    host: "codex",
+                    conversationId: thread.id,
+                    title: thread.title,
+                    workspaceHash,
+                    workspacePath: thread.cwd || request.workspacePath || null,
+                    sourceUpdatedAtMs: sourceFileUpdatedAtMs(thread.rolloutPath, thread.updatedAtMs),
+                    listed: true,
+                    sourceAuthorityRoot: thread.rolloutPath,
+                    sourceIdentity: resolveCodexSourceEvidenceIdentity({
+                        conversationId: thread.id,
+                        workspace: {
+                            workspaceId: workspaceHash,
+                            canonicalPath: thread.cwd || request.workspacePath || null,
+                        },
+                    }).source,
+                    sourceRevisionHint: sourceFileRevisionHint(thread.rolloutPath, { id: thread.id, updatedAtMs: thread.updatedAtMs || null }),
+                });
             }
         } catch (error) {
             markHostDiscoveryError("codex", error);
@@ -1245,7 +1422,22 @@ async function listProductionDiscoverySeeds(
             markHostDiscoverySuccess("claude-code", threads.length);
             for (const thread of threads) {
                 if (!matchesRequestedWorkspace(thread.cwd, request.workspacePath)) continue;
-                add({ host: "claude-code", conversationId: thread.id, title: thread.title, workspaceHash, workspacePath: thread.cwd || request.workspacePath || null, sourceUpdatedAtMs: thread.updatedAtMs || null });
+                add({
+                    host: "claude-code",
+                    conversationId: thread.id,
+                    title: thread.title,
+                    workspaceHash,
+                    workspacePath: thread.cwd || request.workspacePath || null,
+                    sourceUpdatedAtMs: sourceFileUpdatedAtMs(thread.jsonlPath, thread.updatedAtMs),
+                    listed: true,
+                    sourceAuthorityRoot: thread.jsonlPath,
+                    sourceIdentity: resolveClaudeCodeSourceEvidenceIdentity({
+                        conversationId: thread.id,
+                        workspaceId: workspaceHash,
+                        workspacePath: thread.cwd || request.workspacePath || null,
+                    }, thread.jsonlPath).source,
+                    sourceRevisionHint: sourceFileRevisionHint(thread.jsonlPath, { id: thread.id, updatedAtMs: thread.updatedAtMs || null }),
+                });
             }
         } catch (error) {
             markHostDiscoveryError("claude-code", error);
@@ -1257,7 +1449,22 @@ async function listProductionDiscoverySeeds(
             markHostDiscoverySuccess("windsurf", threads.length);
             for (const thread of threads) {
                 if (!matchesRequestedWorkspace(thread.cwd, request.workspacePath)) continue;
-                add({ host: "windsurf", conversationId: thread.cascadeId || thread.id, title: thread.title, workspaceHash, workspacePath: thread.cwd || request.workspacePath || null, sourceUpdatedAtMs: Date.parse(thread.lastModifiedTime || thread.createdTime || "") || null });
+                add({
+                    host: "windsurf",
+                    conversationId: thread.cascadeId || thread.id,
+                    title: thread.title,
+                    workspaceHash,
+                    workspacePath: thread.cwd || request.workspacePath || null,
+                    sourceUpdatedAtMs: Date.parse(thread.lastModifiedTime || thread.createdTime || "") || null,
+                    listed: true,
+                    sourceAuthorityRoot: thread.workspaceUris?.[0] || thread.cwd || request.workspacePath || null,
+                    sourceRevisionHint: stableJsonHash({
+                        id: thread.cascadeId || thread.id,
+                        stepCount: thread.stepCount,
+                        lastModifiedTime: thread.lastModifiedTime || null,
+                        createdTime: thread.createdTime || null,
+                    }),
+                });
             }
         } catch (error) {
             markHostDiscoveryError("windsurf", error);
@@ -1272,7 +1479,21 @@ async function listProductionDiscoverySeeds(
             });
             markHostDiscoverySuccess("antigravity", conversations.length);
             for (const conversation of conversations) {
-                add({ host: "antigravity", conversationId: conversation.id, title: conversation.title || conversation.id, workspaceHash, workspacePath: request.workspacePath || null, sourceUpdatedAtMs: conversation.mtime.getTime() });
+                add({
+                    host: "antigravity",
+                    conversationId: conversation.id,
+                    title: conversation.title || conversation.id,
+                    workspaceHash,
+                    workspacePath: request.workspacePath || null,
+                    sourceUpdatedAtMs: conversation.mtime.getTime(),
+                    listed: true,
+                    sourceAuthorityRoot: request.workspacePath || null,
+                    sourceRevisionHint: stableJsonHash({
+                        id: conversation.id,
+                        mtimeMs: conversation.mtime.getTime(),
+                        sizeKB: conversation.sizeKB,
+                    }),
+                });
             }
         } catch (error) {
             markHostDiscoveryError("antigravity", error);
@@ -1315,6 +1536,116 @@ async function listProductionDiscoverySeeds(
     };
 }
 
+function metadataProductionEvidence(
+    seed: ProductionDiscoverySeed,
+    requestKey: string,
+    hostEnumeration: SchedulerCandidateSnapshot["enumerations"][number] | undefined,
+    scanOptions: Required<RecordSchedulerProductionSourceEvidenceAdapterOptions>,
+    cacheReference?: RecordSchedulerRuntimeSourceCacheReference,
+): ProductionEvidenceResult {
+    const observedAt = scanOptions.now().toISOString();
+    const sequence = discoverySequence(seed.sourceUpdatedAtMs);
+    const scanId = scanOptions.scanIdFactory({
+        requestKey,
+        host: seed.host,
+        conversationId: seed.conversationId,
+        startedAt: observedAt,
+    });
+    const metadataRevision = `metadata:${stableJsonHash({
+        host: seed.host,
+        conversationId: seed.conversationId,
+        workspaceHash: seed.workspaceHash,
+        sourceUpdatedAtMs: seed.sourceUpdatedAtMs,
+        sourceRevisionHint: seed.sourceRevisionHint || null,
+    })}`;
+    const legacyCoveredRevision = seed.record?.coveredRevision
+        && seed.record.coveredRevisionSequence === sequence
+        && !seed.record.coveredRevision.startsWith("metadata:")
+        ? seed.record.coveredRevision
+        : null;
+    const cacheDescriptor = cacheReference?.cacheGeneration
+        ? describeVerifiedConversationCacheSource({
+            host: seed.host,
+            conversationId: seed.conversationId,
+            workspace: { workspaceId: seed.workspaceHash, canonicalPath: seed.workspacePath },
+            cacheGeneration: cacheReference.cacheGeneration,
+            sourceSnapshot: cacheReference.sourceSnapshot,
+            roundCount: typeof cacheReference.sourceSnapshot?.roundCount === "number"
+                ? cacheReference.sourceSnapshot.roundCount
+                : undefined,
+        })
+        : null;
+    const revision = legacyCoveredRevision || cacheDescriptor?.sourceRevision.revision || metadataRevision;
+    const enumerationIssue = hostEnumeration?.error
+        ? [{
+            code: hostEnumeration.truncated ? "limit_reached" as const : "source_unavailable" as const,
+            message: hostEnumeration.error,
+        }]
+        : [];
+    const sourceKind = seed.host === "windsurf"
+        ? "hybrid" as const
+        : seed.host === "antigravity"
+            ? "database" as const
+            : "filesystem" as const;
+    const authoritativeRoot = seed.sourceAuthorityRoot || seed.workspacePath || `${seed.host}-metadata`;
+    const sourceIdentity = cacheDescriptor?.identity.source || seed.sourceIdentity || {
+        kind: sourceKind,
+        authority: `${seed.host}-metadata-listing`,
+        authoritativeRoot,
+        canonicalPath: seed.sourceAuthorityRoot || null,
+    };
+    const evidenceInput = {
+            adapterVersion: SOURCE_EVIDENCE_ADAPTER_VERSION,
+            host: seed.host,
+            identity: {
+                workspace: { workspaceId: seed.workspaceHash, canonicalPath: seed.workspacePath },
+                source: sourceIdentity,
+                conversationId: seed.conversationId,
+            },
+            sourceRevision: {
+                revision,
+                contentCursor: cacheDescriptor?.sourceRevision.contentCursor || null,
+                eventWatermark: cacheDescriptor?.sourceRevision.eventWatermark || revision,
+                sequence: cacheDescriptor?.sourceRevision.sequence ?? sequence,
+            },
+            pagination: {
+                cursor: null,
+                pages: 1,
+                limit: hostEnumeration?.truncated ? PRODUCTION_DISCOVERY_HARD_LIMIT : null,
+                truncated: hostEnumeration?.truncated !== false,
+            },
+            enumerationComplete: hostEnumeration?.complete === true,
+            cacheBypassed: cacheDescriptor === null,
+            exactFetchResult: "present" as const,
+            errors: [],
+            warnings: enumerationIssue,
+            observedAt: {
+                scanId,
+                sequence,
+                startedAt: observedAt,
+                completedAt: observedAt,
+            },
+    };
+    const enumeration = buildSourceEnumerationEvidence({
+            ...evidenceInput,
+            targetStatus: "present",
+    });
+    const exactFetch = cacheDescriptor
+        ? buildExactFetchEvidence({
+            ...evidenceInput,
+            observedAt: { ...evidenceInput.observedAt, sequence: sequence + 1 },
+        })
+        : undefined;
+    if (cacheDescriptor && !isVerifiedConversationCacheEnumeration(enumeration, exactFetch)) {
+        throw new Error("verified fetch cache discovery evidence failed its identity, revision, or scan binding invariant");
+    }
+    return {
+        seed,
+        enumeration,
+        ...(exactFetch ? { exactFetch } : {}),
+    };
+}
+
 async function collectProductionEvidence(
     seed: ProductionDiscoverySeed,
     requestKey: string,
@@ -1322,6 +1653,8 @@ async function collectProductionEvidence(
     apis: RecordSchedulerProductionSourceApis,
     scanOptions: Required<RecordSchedulerProductionSourceEvidenceAdapterOptions>,
     sourceReader?: ProductionSourceReader,
+    cacheReference?: RecordSchedulerRuntimeSourceCacheReference,
+    hostEnumeration?: SchedulerCandidateSnapshot["enumerations"][number],
 ): Promise<ProductionEvidenceResult> {
     const sequence = discoverySequence(seed.sourceUpdatedAtMs);
     const finalize = (result: ProductionEvidenceResult): ProductionEvidenceResult => {
@@ -1367,6 +1700,17 @@ async function collectProductionEvidence(
         };
     };
     try {
+        if (seed.listed) return metadataProductionEvidence(seed, requestKey, hostEnumeration, scanOptions, cacheReference);
+        if (!seed.fallbackEligible) {
+            return {
+                seed,
+                enumeration: buildUnresolvedEnumeration(
+                    seed,
+                    requestKey,
+                    `${seed.host} 的既有 Record 未出现在本次完整元数据列表中；仅显式 target 允许正文 fallback`,
+                ),
+            };
+        }
         if (sourceReader) {
             const readerRequest: ProductionSourceReadRequest = seed.host === "codex"
                 ? {
@@ -1400,7 +1744,14 @@ async function collectProductionEvidence(
                                 vscdbPath: seed.workspacePath || "antigravity-production-vscdb",
                             },
                         };
-            const result = await sourceReader.scan(readerRequest);
+            const result = await withConversationSourcePressure("background", () => sourceReader.scan({
+                ...readerRequest,
+                ...(cacheReference?.cacheGeneration ? { cacheGeneration: cacheReference.cacheGeneration } : {}),
+                ...(cacheReference?.sourceSnapshot ? { sourceSnapshot: cacheReference.sourceSnapshot } : {}),
+                ...(cacheReference?.cacheReadStartRound !== undefined
+                    ? { cacheReadStartRound: cacheReference.cacheReadStartRound }
+                    : {}),
+            } as ProductionSourceReadRequest));
             return finalize({
                 seed,
                 enumeration: result.enumeration,
@@ -1535,18 +1886,30 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
             const listing = await listProductionDiscoverySeeds(request, apis);
             const seeds = listing.seeds;
             const antigravityIds = seeds.filter(seed => seed.host === "antigravity").map(seed => seed.conversationId);
-            const evidence = await Promise.all(seeds.map(seed => collectProductionEvidence(
-                seed,
-                requestKey,
-                antigravityIds,
-                apis,
-                { now, scanIdFactory },
-                productionReader,
-            )));
+            const sourceCacheReferences = sourceCacheReferencesForDiscovery(request);
+            const enumerationsByHost = new Map(listing.enumerations.map(enumeration => [enumeration.chain, enumeration] as const));
+            const evidence: ProductionEvidenceResult[] = [];
+            for (const seed of seeds) {
+                evidence.push(await collectProductionEvidence(
+                    seed,
+                    requestKey,
+                    antigravityIds,
+                    apis,
+                    { now, scanIdFactory },
+                    productionReader,
+                    sourceCacheReferences.find(reference => (
+                        reference.host === seed.host
+                        && reference.conversationId === seed.conversationId
+                        && reference.workspaceHash === seed.workspaceHash
+                    )),
+                    enumerationsByHost.get(seed.host),
+                ));
+            }
             const indexRevision = `record-index:${stableJsonHash((request.records || []).map(record => ({
                 conversationId: record.conversationId,
                 workspaceHash: record.workspaceHash,
                 lastUpdatedAt: record.lastUpdatedAt,
+                lastUpdatedRound: record.lastUpdatedRound ?? null,
                 recordBodyHash: record.recordBodyHash,
                 coveredRevision: record.coveredRevision || null,
                 coveredRevisionSequence: record.coveredRevisionSequence ?? null,
@@ -1575,7 +1938,10 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
                         indexRevision,
                         coveredRevision: recordCoveredRevision(result),
                         recordBodyHash: result.seed.record.recordBodyHash,
-                        extensions: {},
+                        extensions: Number.isSafeInteger(result.seed.record.lastUpdatedRound)
+                            && (result.seed.record.lastUpdatedRound ?? -1) >= 0
+                            ? { lastUpdatedRound: result.seed.record.lastUpdatedRound }
+                            : {},
                     }));
                 }
                 if (result.enumeration.targetStatus === "absent" && result.exactFetch?.exactFetchResult === "not_found") {
@@ -1602,7 +1968,12 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
                         filters: {
                             hosts: request.hosts || [...SOURCE_EVIDENCE_HOSTS],
                             workspace: request.workspacePath || null,
-                            extensions: normalizeResumePayload(request.filters || {}) as RecordDiscoveryInput["request"]["filters"]["extensions"],
+                            extensions: {
+                                ...(normalizeResumePayload(request.filters || {}) as RecordDiscoveryInput["request"]["filters"]["extensions"]),
+                                ...(sourceCacheReferences.length > 0
+                                    ? { [RUNTIME_SOURCE_CACHE_REFERENCES_EXTENSION_KEY]: sourceCacheReferences }
+                                    : {}),
+                            },
                         },
                     },
                     sourceEnumerations: evidence.map(result => ({
@@ -1656,7 +2027,8 @@ function schedulerEnumerationsFromDiscovery(
             complete: envelopes.every(envelope => (
                 envelope.evidence.enumerationComplete
                 && envelope.evidence.errors.length === 0
-                && envelope.evidence.cacheBypassed
+                && (envelope.evidence.cacheBypassed
+                    || isVerifiedConversationCacheEnumeration(envelope.evidence, envelope.exactFetch))
             )),
             paginationExhausted: envelopes.every(envelope => !envelope.evidence.pagination.truncated),
             truncated: envelopes.some(envelope => envelope.evidence.pagination.truncated),
@@ -2464,7 +2836,11 @@ export class RecordSchedulerRuntime {
 
     async cancel(taskId: string): Promise<CancelRecordSchedulerTaskResult | null> {
         if (!this.status(taskId)) return null;
-        return this.control.cancel(taskId);
+        const cancelled = await this.control.cancel(taskId);
+        if (cancelled.status.taskState && isTerminalTaskState(cancelled.status.taskState)) {
+            await this.releasePinnedSourceCacheGenerations(taskId);
+        }
+        return cancelled;
     }
 
     async recover(taskId: string): Promise<RecoverRecordSchedulerOwnerResult | null> {
@@ -2483,14 +2859,11 @@ export class RecordSchedulerRuntime {
         if (!initialStatus) return null;
         const initialTaskState = authoritativeSchedulerTaskState(initialStatus);
         if (isTerminalTaskState(initialTaskState)) {
+            await this.releasePinnedSourceCacheGenerations(taskId);
             return { kind: "terminal", status: initialStatus };
         }
         if (initialTaskState === "CancelRequested" || initialTaskState === "Cancelling") {
-            const cancellation = await this.control.cancel(taskId);
-            if (cancellation.disposition === "repair_required") {
-                return { kind: "repair_required", status: cancellation.status, reason: cancellation.reason };
-            }
-            return { kind: "cancelled", cancellation, status: cancellation.status };
+            return this.cancelResumedExecution(taskId);
         }
         let executionStarted = false;
         let ownerLease: RecoveredRecordSchedulerOwner["ownerLease"] | undefined;
@@ -2505,20 +2878,7 @@ export class RecordSchedulerRuntime {
                 return { kind: "terminal", status: ownerStatus };
             }
             if (ownerTaskState === "CancelRequested" || ownerTaskState === "Cancelling") {
-                const cancellation = await this.control.cancel(taskId);
-                if (cancellation.disposition === "repair_required") {
-                    return {
-                        kind: "repair_required",
-                        status: cancellation.status,
-                        reason: cancellation.reason,
-                    };
-                }
-                return {
-                    kind: "cancelled",
-                    ownerLease,
-                    cancellation,
-                    status: cancellation.status,
-                };
+                return this.cancelResumedExecution(taskId, ownerLease);
             }
             if (!recoveryDescriptor) {
                 throw new RecordSchedulerRepairRequiredError(`execution recovery ${taskId} 缺少 matching admission descriptor`);
@@ -2541,20 +2901,7 @@ export class RecordSchedulerRuntime {
                 return { kind: "terminal", status };
             }
             if (taskState === "CancelRequested" || taskState === "Cancelling") {
-                const cancellation = await this.control.cancel(taskId);
-                if (cancellation.disposition === "repair_required") {
-                    return {
-                        kind: "repair_required",
-                        status: cancellation.status,
-                        reason: cancellation.reason,
-                    };
-                }
-                return {
-                    kind: "cancelled",
-                    ownerLease,
-                    cancellation,
-                    status: cancellation.status,
-                };
+                return this.cancelResumedExecution(taskId, ownerLease);
             }
             const loop = await this.executeFrozenTask({
                 taskId,
@@ -2594,6 +2941,23 @@ export class RecordSchedulerRuntime {
             await this.advanceTask(taskId, repairRequired ? "RepairRequired" : "FailedFinal", ownerLease);
             throw error;
         }
+    }
+
+    private async cancelResumedExecution(
+        taskId: string,
+        ownerLease?: RecoveredRecordSchedulerOwner["ownerLease"],
+    ): Promise<RecordSchedulerRuntimeResumeResult> {
+        const cancellation = await this.control.cancel(taskId);
+        await this.releasePinnedSourceCacheGenerations(taskId);
+        if (cancellation.disposition === "repair_required") {
+            return { kind: "repair_required", status: cancellation.status, reason: cancellation.reason };
+        }
+        return {
+            kind: "cancelled",
+            ...(ownerLease ? { ownerLease } : {}),
+            cancellation,
+            status: cancellation.status,
+        };
     }
 
     private async prepareExecutionRecovery(
@@ -2840,6 +3204,18 @@ export class RecordSchedulerRuntime {
             kind: "source",
             reference: snapshot.contentRef,
         });
+        const cacheGeneration = capsule.cacheGeneration === undefined
+            ? undefined
+            : normalizeCacheGeneration(capsule.cacheGeneration);
+        if (capsule.cacheGeneration !== undefined && !cacheGeneration) {
+            throw new Error(`source capsule ${snapshot.sourceSnapshotId} 的 cache generation 无效`);
+        }
+        const cacheSourceSnapshot = capsule.cacheSourceSnapshot === undefined
+            ? undefined
+            : normalizeCacheSourceSnapshot(capsule.cacheSourceSnapshot);
+        if (capsule.cacheSourceSnapshot !== undefined && !cacheSourceSnapshot) {
+            throw new Error(`source capsule ${snapshot.sourceSnapshotId} 的 cache source snapshot 无效`);
+        }
         return {
             snapshot: structuredClone(snapshot),
             discoverySnapshot: structuredClone(capsule.discoverySnapshot),
@@ -2847,6 +3223,8 @@ export class RecordSchedulerRuntime {
             document: parseFrozenSourceDocument(content, snapshot),
             scanId: capsule.scanId,
             authority: structuredClone(capsule.authority),
+            ...(cacheGeneration ? { cacheGeneration } : {}),
+            ...(cacheSourceSnapshot ? { cacheSourceSnapshot } : {}),
         };
     }
 
@@ -2990,6 +3368,12 @@ export class RecordSchedulerRuntime {
                 `Record source ${taskId} 冻结 spool 缺失或损坏：${error instanceof Error ? error.message : String(error)}`,
             );
         }
+    }
+
+    private async releasePinnedSourceCacheGenerations(taskId: string): Promise<void> {
+        const stored = await readRecordSchedulerLedgerStore(taskId, { expectPublished: true });
+        if (stored.kind !== "current" || !isTerminalTaskState(stored.ledger.task.state)) return;
+        await releaseConversationSourceCacheGenerationPinsForOwner(taskId);
     }
 
     private async persistFullSourceReadState(input: {
@@ -4025,28 +4409,34 @@ export class RecordSchedulerRuntime {
                 completed.add(selection.sourceKey);
                 continue;
             }
-            const sourceRequest = productionSourceRequestForCandidate(candidate);
-            let scan: Awaited<ReturnType<ProductionSourceReader["scan"]>>;
+            const sourceRequest = productionSourceRequestForCandidate(
+                candidate,
+                sourceCacheReferenceForCandidate(discovery, candidate),
+            );
+            const productionSourceReader = this.productionSourceReader;
+            const sourcePressurePermit = await acquireConversationSourcePressure("background");
             try {
-                scan = await this.productionSourceReader.scan(sourceRequest);
-            } catch (error) {
-                const reason = `production source full read failed: ${error instanceof Error ? error.message : String(error)}`;
-                await this.persistUnresolvedSourceState({ taskId, candidate, reason });
-                await this.persistSourceMaterializationOutcome({
-                    taskId,
-                    ownerLease,
-                    outcome: {
-                        sourceKey: selection.sourceKey,
-                        kind: "unresolved",
-                        observedAt: this.now().toISOString(),
-                        sourceRevision: candidate.sourceRevision?.revision,
-                        evidenceHash: candidate.evidenceHash,
-                        reason,
-                    },
-                });
-                completed.add(selection.sourceKey);
-                continue;
-            }
+                let scan: Awaited<ReturnType<ProductionSourceReader["scan"]>>;
+                try {
+                    scan = await sourcePressurePermit.run(() => productionSourceReader.scan(sourceRequest));
+                } catch (error) {
+                    const reason = `production source full read failed: ${error instanceof Error ? error.message : String(error)}`;
+                    await this.persistUnresolvedSourceState({ taskId, candidate, reason });
+                    await this.persistSourceMaterializationOutcome({
+                        taskId,
+                        ownerLease,
+                        outcome: {
+                            sourceKey: selection.sourceKey,
+                            kind: "unresolved",
+                            observedAt: this.now().toISOString(),
+                            sourceRevision: candidate.sourceRevision?.revision,
+                            evidenceHash: candidate.evidenceHash,
+                            reason,
+                        },
+                    });
+                    completed.add(selection.sourceKey);
+                    continue;
+                }
             if (scan.fullSourceRead.status !== "complete") {
                 const reason = scan.fullSourceRead.issues.map(issue => `${issue.code}:${issue.message}`).join("; ")
                     || "production source full read unresolved";
@@ -4115,6 +4505,16 @@ export class RecordSchedulerRuntime {
                 continue;
             }
             const fullRead = scan.fullSourceRead;
+            let cacheGeneration: ConversationSourceCacheGenerationRef | undefined;
+            if (scan.cacheGeneration) {
+                try {
+                    cacheGeneration = await pinConversationSourceCacheGeneration({ ...scan.cacheGeneration, ownerId: taskId });
+                } catch (error) {
+                    throw new RecordSchedulerRepairRequiredError(
+                        `Record source ${identity.conversationId} 无法固定缓存 generation：${error instanceof Error ? error.message : String(error)}`,
+                    );
+                }
+            }
             const contentWrite = await this.control.spool.writeImmutable({
                 taskId,
                 kind: "source",
@@ -4157,12 +4557,17 @@ export class RecordSchedulerRuntime {
                 completed.add(selection.sourceKey);
                 continue;
             }
+            const cacheSourceSnapshot = cacheGeneration
+                ? scan.cacheSourceSnapshot || sourceRequest.sourceSnapshot
+                : undefined;
             const capsule: FrozenRuntimeSourceCapsule = {
                 kind: "record-runtime-source-capsule",
                 discoverySnapshot: structuredClone(sourceResult.snapshot),
                 request: structuredClone(sourceRequest),
                 scanId: scan.scanId,
                 authority: structuredClone(fullRead.authority),
+                ...(cacheGeneration ? { cacheGeneration: structuredClone(cacheGeneration) } : {}),
+                ...(cacheSourceSnapshot ? { cacheSourceSnapshot: structuredClone(cacheSourceSnapshot) } : {}),
             };
             const capsuleWrite = await this.control.spool.writeImmutable({
                 taskId,
@@ -4198,7 +4603,10 @@ export class RecordSchedulerRuntime {
                     ...(conflict ? { reason: "same revision produced different source bytes" } : {}),
                 },
             });
-            completed.add(selection.sourceKey);
+                completed.add(selection.sourceKey);
+            } finally {
+                sourcePressurePermit.release();
+            }
         }
         return this.sealSourceMaterialization(taskId, ownerLease);
     }
@@ -4792,7 +5200,10 @@ export class RecordSchedulerRuntime {
         for (let attempt = 0; attempt < 5; attempt += 1) {
             const current = await readRecordSchedulerLedgerStore(taskId, { expectPublished: true });
             if (current.kind !== "current") return;
-            if (current.ledger.task.state === target || isTerminalTaskState(current.ledger.task.state)) return;
+            if (current.ledger.task.state === target || isTerminalTaskState(current.ledger.task.state)) {
+                if (isTerminalTaskState(current.ledger.task.state)) await this.releasePinnedSourceCacheGenerations(taskId);
+                return;
+            }
             const transitions = nextTaskState(current.ledger.task.state, target);
             if (transitions.length === 0) return;
             try {
@@ -4834,6 +5245,7 @@ export class RecordSchedulerRuntime {
                 } else {
                     await mutateRecordSchedulerLedger(taskId, current.ledger.revision, mutate);
                 }
+                if (isTerminalTaskState(target)) await this.releasePinnedSourceCacheGenerations(taskId);
                 return;
             } catch (error) {
                 if (!isSchedulerLedgerConflictError(error)) throw error;

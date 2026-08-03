@@ -282,6 +282,8 @@ export async function exportConversationBatch(
                 chainUsed: loaded.chainUsed,
                 rounds: loaded.rounds,
                 totalSteps: loaded.totalSteps,
+                cacheKey: loaded.cacheKey,
+                cacheGeneration: loaded.cacheGeneration,
                 expandedChildren: loaded.codexData?.expandedChildren || [],
                 childDiagnostics: loaded.codexData?.childDiagnostics || [],
                 partialWarning: formatWindsurfPartialWarning(loaded),

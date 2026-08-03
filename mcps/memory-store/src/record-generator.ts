@@ -2454,6 +2454,29 @@ async function generateRecordParallel(
  * 2. 默认串行仍逐批更新完整 Record
  * 3. 实验并行管线先生成 RecordPatch，再统一整合完整 Record
  */
+export function resolveRecordSourceReadStartRound(
+    existingRecord: string,
+    coveredRound: number,
+    totalRounds: number,
+    force = false,
+): number {
+    if (!Number.isSafeInteger(totalRounds) || totalRounds < 1) return 1;
+    if (!existingRecord.trim()) return 1;
+    const parsed = parseRecordDocument(existingRecord);
+    if (!parsed || parsed.phases.length === 0) return force ? 1 : Math.min(Math.max(coveredRound + 1, 1), totalRounds);
+    const preserveExistingForForce = force && !RECORD_FORCE_FULL_REBUILD;
+    if (force && !preserveExistingForForce) return 1;
+    let resumeFromRound = Math.min(Math.max(coveredRound, 0), totalRounds);
+    const shouldCompose = isLocalComposeEnabled() && (resumeFromRound < totalRounds || preserveExistingForForce);
+    if (shouldCompose) {
+        const boundary = selectLocalComposeBoundary(parsed, resumeFromRound, totalRounds);
+        if ((boundary.stablePhases.length > 0 || preserveExistingForForce) && boundary.stableEndRound < resumeFromRound) {
+            resumeFromRound = Math.max(0, boundary.stableEndRound);
+        }
+    }
+    return Math.min(resumeFromRound + 1, totalRounds);
+}
+
 export async function generateRecord(
     hash: string,
     conversationId: string,
@@ -2483,7 +2506,15 @@ export async function generateRecord(
         const forceRebuild = forceRequested && !preserveExistingForForce;
         let existingRecord = forceRebuild ? "" : storedRecord;
         let currentRecord = existingRecord;
-        const totalRounds = rounds.length;
+        const sourceRoundStart = options.sourceRoundStart ?? 1;
+        const totalRounds = options.sourceTotalRounds ?? rounds.length;
+        if (!Number.isSafeInteger(sourceRoundStart)
+            || sourceRoundStart < 1
+            || !Number.isSafeInteger(totalRounds)
+            || totalRounds < rounds.length
+            || (rounds.length > 0 && sourceRoundStart + rounds.length - 1 !== totalRounds)) {
+            return { success: false, error: `Record 增量来源轮次窗口非法: start=${sourceRoundStart}, materialized=${rounds.length}, total=${totalRounds}` };
+        }
         const indexBeforeRepair = (await readRecordsIndexAsync(hash)).records[conversationId];
         const indexedBeforeRepair = Math.min(Math.max(indexBeforeRepair?.lastUpdatedRound ?? 0, 0), totalRounds);
         const inferredBeforeRepair = storedRecord ? inferCoveredRoundFromRecord(storedRecord, totalRounds) : 0;
@@ -2513,7 +2544,14 @@ export async function generateRecord(
             resumeFromRound = Math.max(0, boundary.stableEndRound);
         }
     }
-    const roundsToProcess = rounds.slice(resumeFromRound);
+    const requiredSourceStartRound = resumeFromRound + 1;
+    if (requiredSourceStartRound < sourceRoundStart) {
+        return {
+            success: false,
+            error: `Record 增量来源缺少回滚轮次: requiredStart=${requiredSourceStartRound}, materializedStart=${sourceRoundStart}`,
+        };
+    }
+    const roundsToProcess = rounds.slice(Math.max(0, requiredSourceStartRound - sourceRoundStart));
     const repairedCoverageWarning = storedRecord && !forceRebuild && indexBeforeRepair && inferredBeforeRepair !== indexedBeforeRepair
         ? `Record 正文实际覆盖 ${inferredBeforeRepair}/${totalRounds} 轮，索引原为 ${indexedBeforeRepair}/${totalRounds} 轮，提交时会刷新索引`
         : undefined;

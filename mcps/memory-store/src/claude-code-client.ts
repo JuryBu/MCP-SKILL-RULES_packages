@@ -18,6 +18,7 @@ import {
     type RecordSourceSnapshot as SourceEvidenceRecordSnapshot,
     type SourceEnumerationEvidence,
     type SourceEvidenceClassification,
+    type SourceConversationIdentity,
     type SourceEvidenceIssue,
 } from "./source-evidence-contracts.js";
 
@@ -48,6 +49,8 @@ export interface ClaudeCodeConversationData {
     rounds: ConversationRound[];
     totalSteps: number;
     logicalChain?: ClaudeCodeLogicalChainInfo;
+    sourceCheckpoints?: ClaudeCodeSourceByteCheckpoint[];
+    sourceCheckpoint?: ClaudeCodeRoundTailCheckpoint;
 }
 
 export interface ClaudeCodeLogicalChainSegment {
@@ -130,6 +133,8 @@ export interface ClaudeCodeDeepLocateOptions {
 const CLAUDE_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CC_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
 const CLAUDE_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CC_JSONL_MAX_LINE_CHARS || 16 * 1024 * 1024);
 const CLAUDE_JSONL_YIELD_EVERY_LINES = Math.max(1, Number(process.env.MEMORY_STORE_CC_JSONL_YIELD_EVERY_LINES || 256) || 256);
+const CLAUDE_THREAD_LIST_HEAD_MAX_BYTES = Math.max(64 * 1024, Number(process.env.MEMORY_STORE_CC_THREAD_LIST_HEAD_MAX_BYTES || 128 * 1024) || 128 * 1024);
+const CLAUDE_THREAD_LIST_TAIL_MAX_BYTES = Math.max(64 * 1024, Number(process.env.MEMORY_STORE_CC_THREAD_LIST_TAIL_MAX_BYTES || 128 * 1024) || 128 * 1024);
 const CLAUDE_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CC_TEXT_FIELD_MAX_CHARS || 200_000);
 const CLAUDE_ATTACHMENT_MAX_BYTES = (() => {
     const configured = process.env.MEMORY_STORE_CC_ATTACHMENT_MAX_BYTES;
@@ -394,6 +399,9 @@ interface JsonlLineReadOptions {
     maxBytes?: number;
     tailOnly?: boolean;
     maxLineChars?: number;
+    startByte?: number;
+    endByte?: number;
+    startLineNo?: number;
 }
 
 type JsonlLineCallback = (line: string, lineNo: number, byteOffset: number) => boolean | void;
@@ -410,20 +418,25 @@ function readJsonlLines(
     const stat = safeStat(filePath);
     if (!stat?.isFile()) return { scannedBytes: 0, lines: 0 };
     const maxBytes = options.maxBytes && options.maxBytes > 0 ? Math.min(options.maxBytes, stat.size) : stat.size;
-    const startOffset = options.tailOnly && stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const defaultStartOffset = options.tailOnly && stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const startOffset = options.startByte ?? defaultStartOffset;
+    const endOffset = Math.min(options.endByte ?? stat.size, stat.size, startOffset + maxBytes);
+    if (!Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || startOffset < 0 || endOffset < startOffset || endOffset > stat.size) {
+        throw new Error("Claude Code JSONL byte range is invalid");
+    }
     const fd = fs.openSync(filePath, "r");
     const buffer = Buffer.alloc(Math.max(64 * 1024, CLAUDE_JSONL_READ_CHUNK_BYTES));
     const decoder = new StringDecoder("utf8");
     let position = startOffset;
     let pending = "";
-    let lineNo = 0;
+    let lineNo = options.startLineNo ?? 0;
     let lineOffset = startOffset;
     let scannedBytes = 0;
     let keepGoing = true;
 
     try {
-        while (keepGoing && scannedBytes < maxBytes) {
-            const toRead = Math.min(buffer.length, maxBytes - scannedBytes);
+        while (keepGoing && position < endOffset) {
+            const toRead = Math.min(buffer.length, endOffset - position);
             const bytesRead = fs.readSync(fd, buffer, 0, toRead, position);
             if (bytesRead <= 0) break;
             const chunk = decoder.write(buffer.subarray(0, bytesRead));
@@ -472,13 +485,18 @@ async function readJsonlLinesAsync(
     const stat = await safeStatAsync(filePath);
     if (!stat?.isFile()) return { scannedBytes: 0, lines: 0 };
     const maxBytes = options.maxBytes && options.maxBytes > 0 ? Math.min(options.maxBytes, stat.size) : stat.size;
-    const startOffset = options.tailOnly && stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const defaultStartOffset = options.tailOnly && stat.size > maxBytes ? stat.size - maxBytes : 0;
+    const startOffset = options.startByte ?? defaultStartOffset;
+    const endOffset = Math.min(options.endByte ?? stat.size, stat.size, startOffset + maxBytes);
+    if (!Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || startOffset < 0 || endOffset < startOffset || endOffset > stat.size) {
+        throw new Error("Claude Code JSONL byte range is invalid");
+    }
     const handle = await fs.promises.open(filePath, "r");
     const buffer = Buffer.alloc(Math.max(64 * 1024, CLAUDE_JSONL_READ_CHUNK_BYTES));
     const decoder = new StringDecoder("utf8");
     let position = startOffset;
     let pending = "";
-    let lineNo = 0;
+    let lineNo = options.startLineNo ?? 0;
     let lineOffset = startOffset;
     let scannedBytes = 0;
     let linesSinceYield = 0;
@@ -491,8 +509,8 @@ async function readJsonlLinesAsync(
     };
 
     try {
-        while (keepGoing && scannedBytes < maxBytes) {
-            const toRead = Math.min(buffer.length, maxBytes - scannedBytes);
+        while (keepGoing && position < endOffset) {
+            const toRead = Math.min(buffer.length, endOffset - position);
             const { bytesRead } = await handle.read(buffer, 0, toRead, position);
             if (bytesRead <= 0) break;
             const chunk = decoder.write(buffer.subarray(0, bytesRead));
@@ -580,41 +598,77 @@ function truncateTextParts(parts: string[], maxLen: number): { value: string; tr
     };
 }
 
-function stringifyCompact(value: any, maxLen = 500): string {
-    if (value === undefined || value === null) return "";
-    if (typeof value === "string") return truncate(value, maxLen);
-    if (Array.isArray(value)) {
-        return truncate(value.map(item => stringifyCompact(item, Math.ceil(maxLen / Math.max(value.length, 1)))).filter(Boolean).join("\n"), maxLen);
+function claudeBinaryReference(value: string, mimeType?: string): string {
+    return `[binary omitted${mimeType ? ` mime=${mimeType}` : ""} chars=${value.length} sha256=${createHash("sha256").update(value).digest("hex")}]`;
+}
+
+function looksLikeBase64(value: string): boolean {
+    return value.length >= 128 && /^[A-Za-z0-9+/=\s]+$/u.test(value);
+}
+
+function sanitizeClaudeCacheText(text: string): string {
+    return text.replace(/data:([^;,]+)?;base64,([A-Za-z0-9+/=]+)/giu, (dataUrl, mimeType) => claudeBinaryReference(dataUrl, mimeType));
+}
+
+function sanitizeClaudeCacheValue(value: any, key = "", seen = new WeakSet<object>()): any {
+    if (typeof value === "string") {
+        if ((key === "signature" || /(?:^|_)(?:data|base64|bytes|blob|binary)$/iu.test(key)) && looksLikeBase64(value)) {
+            return claudeBinaryReference(value);
+        }
+        return sanitizeClaudeCacheText(value);
     }
-    if (typeof value === "object") {
-        const copy: Record<string, unknown> = {};
-        for (const [key, entry] of Object.entries(value)) {
-            if (key === "signature") continue;
-            if (key === "data" && typeof entry === "string" && entry.length > 1000) {
-                copy[key] = `[base64/data omitted chars=${entry.length} sha256=${createHash("sha256").update(entry).digest("hex").slice(0, 12)}]`;
-            } else {
-                copy[key] = entry;
+    if (value === undefined || value === null || typeof value !== "object") return value;
+    if (Buffer.isBuffer(value)) return claudeBinaryReference(value.toString("base64"));
+    if (seen.has(value)) return "[circular reference omitted]";
+    seen.add(value);
+    if (Array.isArray(value)) {
+        const items = value.map((item) => sanitizeClaudeCacheValue(item, "", seen));
+        seen.delete(value);
+        return items;
+    }
+    const copy: Record<string, unknown> = {};
+    for (const [entryKey, entry] of Object.entries(value)) {
+        copy[entryKey] = sanitizeClaudeCacheValue(entry, entryKey, seen);
+    }
+    seen.delete(value);
+    return copy;
+}
+
+function serializeClaudeCacheValue(value: any): string {
+    if (value === undefined || value === null) return "";
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+            try {
+                return JSON.stringify(sanitizeClaudeCacheValue(JSON.parse(value)));
+            } catch {
+                return sanitizeClaudeCacheText(value);
             }
         }
-        try {
-            return truncate(JSON.stringify(copy), maxLen);
-        } catch {
-            return truncate(String(value), maxLen);
-        }
+        return sanitizeClaudeCacheText(value);
     }
-    return truncate(String(value), maxLen);
+    try {
+        return JSON.stringify(sanitizeClaudeCacheValue(value));
+    } catch {
+        return sanitizeClaudeCacheText(String(value));
+    }
+}
+
+function stringifyCompact(value: any, maxLen = 500): string {
+    if (value === undefined || value === null) return "";
+    return truncate(serializeClaudeCacheValue(value), maxLen);
 }
 
 function summarizeToolResult(event: any, content: any): string {
     const result = event?.toolUseResult;
     if (result !== undefined) {
-        if (typeof result === "string") return truncate(result, 500);
+        if (typeof result === "string") return truncate(sanitizeClaudeCacheText(result), 500);
         if (Array.isArray(result)) return truncate(result.map(item => stringifyCompact(item, 200)).join("\n"), 500);
         if (typeof result === "object" && result) {
             const preferred = [result.stdout, result.stderr, result.formatted_output, result.output, result.error]
                 .filter(item => typeof item === "string" && item.trim())
                 .join("\n");
-            if (preferred) return truncate(preferred, 500);
+            if (preferred) return truncate(sanitizeClaudeCacheText(preferred), 500);
             if (result.isImage) return "工具返回图片结果（内容未内联到文本）";
             return stringifyCompact(result, 500);
         }
@@ -657,12 +711,12 @@ function unknownContentBlockPlaceholder(type: unknown): string {
 function extractMessageContent(content: any, cwd?: string, options: ExtractMessageContentOptions = {}): { text: string; thinking: string; toolUses: any[]; toolResults: any[]; attachments: ConversationAttachment[]; truncated: boolean } {
     if (typeof content === "string") {
         return {
-            text: truncate(content, CLAUDE_TEXT_FIELD_MAX_CHARS),
+            text: sanitizeClaudeCacheText(content),
             thinking: "",
             toolUses: [],
             toolResults: [],
             attachments: [],
-            truncated: content.length > CLAUDE_TEXT_FIELD_MAX_CHARS,
+            truncated: false,
         };
     }
     const parts: string[] = [];
@@ -708,19 +762,15 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
                     source: "claude-code-data-url",
                     mimeType,
                     sizeBytes,
+                    sha256: `sha256:${createHash("sha256").update(source.data).digest("hex")}`,
                     stepIndex: options.stepIndex,
                 } as const;
-                if (sizeBytes > CLAUDE_ATTACHMENT_MAX_BYTES) {
-                    attachments.push({
-                        ...attachment,
-                        warning: `Claude Code base64 image estimated at ${sizeBytes} bytes exceeds configured ${CLAUDE_ATTACHMENT_MAX_BYTES}-byte limit; data URL was not materialized`,
-                    });
-                } else {
-                    attachments.push({
-                        ...attachment,
-                        dataUrl: `data:${mimeType};base64,${source.data}`,
-                    });
-                }
+                attachments.push({
+                    ...attachment,
+                    warning: sizeBytes > CLAUDE_ATTACHMENT_MAX_BYTES
+                        ? `Claude Code base64 image estimated at ${sizeBytes} bytes exceeds configured ${CLAUDE_ATTACHMENT_MAX_BYTES}-byte limit; data URL was not materialized`
+                        : "Claude Code attachment data URL omitted from cache; hash retained",
+                });
             } else if (typeof source.path === "string" || typeof item.path === "string") {
                 const rawPath = source.path || item.path;
                 const resolved = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd || process.cwd(), rawPath);
@@ -766,15 +816,13 @@ function extractMessageContent(content: any, cwd?: string, options: ExtractMessa
         }
     }
 
-    const text = truncateTextParts(parts, CLAUDE_TEXT_FIELD_MAX_CHARS);
-    const thinkingText = truncateTextParts(thinking, CLAUDE_TEXT_FIELD_MAX_CHARS);
     return {
-        text: text.value,
-        thinking: thinkingText.value,
+        text: parts.map(sanitizeClaudeCacheText).join("\n"),
+        thinking: thinking.map(sanitizeClaudeCacheText).join("\n"),
         toolUses,
         toolResults,
         attachments,
-        truncated: text.truncated || thinkingText.truncated,
+        truncated: false,
     };
 }
 
@@ -863,7 +911,11 @@ function compactSummaryPlaceholder(info: CompactionSummaryInfo): string {
     return `${CLAUDE_COMPACT_FOLDED_MARKER}: chars=${info.summaryChars}, sha256=${info.summarySha256.slice(0, 12)}, line=${info.eventLineNo ?? "?"}]`;
 }
 
-function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, ClaudeCodeDesktopIndexEntry>): ClaudeCodeThreadInfo | null {
+function readThreadMetadata(
+    jsonlPath: string,
+    desktopIndex?: Map<string, ClaudeCodeDesktopIndexEntry>,
+    options: { bounded?: boolean } = {},
+): ClaudeCodeThreadInfo | null {
     const id = path.basename(jsonlPath, ".jsonl");
     const stat = safeStat(jsonlPath);
     if (!stat?.isFile()) return null;
@@ -886,7 +938,7 @@ function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, Claude
     };
     pushTitleAlias(desktop?.title);
 
-    readJsonlLines(jsonlPath, (line) => {
+    const inspectMetadataLine = (line: string) => {
         const event = parseJsonLine(line);
         if (!event) return;
         if (!cwd && typeof event.cwd === "string") cwd = event.cwd;
@@ -911,7 +963,25 @@ function readThreadMetadata(jsonlPath: string, desktopIndex?: Map<string, Claude
                 pushTitleAlias(title);
             }
         }
-    }, { maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS });
+    };
+    if (options.bounded) {
+        const headBytes = Math.min(stat.size, CLAUDE_THREAD_LIST_HEAD_MAX_BYTES);
+        readJsonlLines(jsonlPath, inspectMetadataLine, {
+            maxBytes: headBytes,
+            maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS,
+        });
+        const tailBytes = Math.min(Math.max(0, stat.size - headBytes), CLAUDE_THREAD_LIST_TAIL_MAX_BYTES);
+        if (tailBytes > 0) {
+            readJsonlLines(jsonlPath, inspectMetadataLine, {
+                startByte: stat.size - tailBytes,
+                endByte: stat.size,
+                maxBytes: tailBytes,
+                maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS,
+            });
+        }
+    } else {
+        readJsonlLines(jsonlPath, inspectMetadataLine, { maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS });
+    }
 
     const displayTitle = customTitle || aiTitle || desktop?.title || title || lastPrompt || id;
     pushTitleAlias(displayTitle);
@@ -949,7 +1019,7 @@ export function listRecentClaudeCodeThreads(limit = 50): ClaudeCodeThreadInfo[] 
         .filter((item): item is { filePath: string; stat: fs.Stats } => Boolean(item.stat?.isFile()))
         .sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs)
         .slice(0, limit)
-        .map(item => readThreadMetadata(item.filePath, desktopIndex))
+        .map(item => readThreadMetadata(item.filePath, desktopIndex, { bounded: true }))
         .filter((item): item is ClaudeCodeThreadInfo => Boolean(item));
 }
 
@@ -1241,9 +1311,20 @@ export function discoverClaudeCodeLogicalChain(
     };
 }
 
-interface ClaudeCodeRoundBuildResult {
+export type ClaudeCodeSourceCheckpointKind = "round_start" | "thinking" | "tool_call" | "tool_result" | "compact_boundary";
+
+export interface ClaudeCodeSourceByteCheckpoint {
+    kind: ClaudeCodeSourceCheckpointKind;
+    roundIndex: number;
+    sourceByte: number;
+    sourceLineNo: number;
+    sourceStepIndex: number;
+}
+
+export interface ClaudeCodeRoundBuildResult {
     rounds: ConversationRound[];
     totalSteps: number;
+    sourceCheckpoints: ClaudeCodeSourceByteCheckpoint[];
 }
 
 interface ClaudeCodeRoundsBuilder {
@@ -1259,15 +1340,37 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
     let stepIndex = 0;
     let pendingThinking = "";
     let pendingCompactBoundary: PendingCompactBoundary | null = null;
+    let pendingCompactBoundaryStepIndex: number | null = null;
+    let currentRoundReplayByte: number | null = null;
+    let currentRoundReplayLineNo: number | null = null;
+    let currentRoundReplayStepIndex: number | null = null;
+    const sourceCheckpoints: ClaudeCodeSourceByteCheckpoint[] = [];
+
+    const recordSourceCheckpoint = (kind: Exclude<ClaudeCodeSourceCheckpointKind, "round_start">, round: ConversationRound, byteOffset: number, lineNo: number) => {
+        if (!Number.isSafeInteger(byteOffset)) return;
+        sourceCheckpoints.push({ kind, roundIndex: round.roundIndex, sourceByte: byteOffset, sourceLineNo: lineNo, sourceStepIndex: stepIndex });
+    };
 
     const pushCurrent = () => {
         if (!currentRound) return;
         currentRound.endStep = stepIndex;
+        if (currentRoundReplayByte !== null && currentRoundReplayLineNo !== null && currentRoundReplayStepIndex !== null) {
+            sourceCheckpoints.push({
+                kind: "round_start",
+                roundIndex: currentRound.roundIndex,
+                sourceByte: currentRoundReplayByte,
+                sourceLineNo: currentRoundReplayLineNo,
+                sourceStepIndex: currentRoundReplayStepIndex,
+            });
+        }
         rounds.push(currentRound);
         currentRound = null;
+        currentRoundReplayByte = null;
+        currentRoundReplayLineNo = null;
+        currentRoundReplayStepIndex = null;
     };
 
-    const ensureRound = (): ConversationRound => {
+    const ensureRound = (byteOffset: number, lineNo: number): ConversationRound => {
         if (!currentRound) {
             roundIndex += 1;
             currentRound = {
@@ -1284,23 +1387,30 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                 subagentSummaries: [],
                 fileViews: [],
             };
+            currentRoundReplayByte = byteOffset;
+            currentRoundReplayLineNo = lineNo;
+            currentRoundReplayStepIndex = stepIndex;
         }
         return currentRound;
     };
 
-    const applyToolResult = (event: any, toolResult: any) => {
+    const applyToolResult = (event: any, toolResult: any, byteOffset: number, lineNo: number) => {
         const toolUseId = toolResult?.tool_use_id || toolResult?.toolUseId || event?.toolUseResult?.tool_use_id;
         const summary = summarizeToolResult(event, toolResult?.content);
+        const resultFull = serializeClaudeCacheValue(event?.toolUseResult !== undefined ? event.toolUseResult : toolResult?.content);
         const slot = toolUseId ? toolCallMap.get(toolUseId) : null;
         if (slot) {
             slot.round.toolCalls[slot.index].resultSummary = summary;
+            slot.round.toolCalls[slot.index].resultFull = resultFull;
         } else {
-            const round = ensureRound();
+            const round = ensureRound(byteOffset, lineNo);
             round.toolCalls.push({
                 stepIndex,
                 name: "tool_result",
                 argsSummary: toolUseId ? `tool_use_id=${toolUseId}` : "",
                 resultSummary: summary,
+                argsFull: toolUseId ? `tool_use_id=${toolUseId}` : "",
+                resultFull,
             });
         }
     };
@@ -1318,7 +1428,8 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
 
         if (type === "user") {
             if (extracted.toolResults.length > 0 && !extracted.text) {
-                for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult);
+                for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult, byteOffset, lineNo);
+                if (currentRound) recordSourceCheckpoint("tool_result", currentRound, byteOffset, lineNo);
                 return;
             }
             pushCurrent();
@@ -1344,31 +1455,46 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
                 fileViews: [],
                 compactionSummaries: compactionInfo ? [compactionInfo] : undefined,
             };
+            currentRoundReplayByte = isCompactSummary && Number.isSafeInteger(pendingCompactBoundary?.byteOffset)
+                ? pendingCompactBoundary!.byteOffset!
+                : byteOffset;
+            currentRoundReplayLineNo = isCompactSummary && Number.isSafeInteger(pendingCompactBoundary?.lineNo)
+                ? pendingCompactBoundary!.lineNo!
+                : lineNo;
+            currentRoundReplayStepIndex = isCompactSummary && pendingCompactBoundaryStepIndex !== null
+                ? pendingCompactBoundaryStepIndex
+                : stepIndex;
             if (compactionInfo) pendingCompactBoundary = null;
-            for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult);
+            if (compactionInfo) pendingCompactBoundaryStepIndex = null;
+            for (const toolResult of extracted.toolResults) applyToolResult(event, toolResult, byteOffset, lineNo);
+            if (extracted.toolResults.length > 0) recordSourceCheckpoint("tool_result", currentRound, byteOffset, lineNo);
             return;
         }
 
         if (type === "assistant") {
-            const round = ensureRound();
+            const round = ensureRound(byteOffset, lineNo);
             if (extracted.thinking && !extracted.text && extracted.toolUses.length === 0) {
                 pendingThinking = [pendingThinking, extracted.thinking].filter(Boolean).join("\n\n");
+                recordSourceCheckpoint("thinking", round, byteOffset, lineNo);
                 return;
             }
 
-            const aiToolCalls = extracted.toolUses.map(toolUse => ({
-                name: toolUse.name || "tool_use",
-                args: stringifyCompact(toolUse.input || {}, 120),
-            }));
+            const aiToolCalls = extracted.toolUses.map(toolUse => {
+                const args = serializeClaudeCacheValue(toolUse.input || {});
+                return { name: toolUse.name || "tool_use", args: truncate(args, 120) };
+            });
             for (const toolUse of extracted.toolUses) {
+                const argsFull = serializeClaudeCacheValue(toolUse.input || {});
                 const index = round.toolCalls.push({
                     stepIndex,
                     name: toolUse.name || "tool_use",
-                    argsSummary: stringifyCompact(toolUse.input || {}, 120),
+                    argsSummary: truncate(argsFull, 120),
+                    argsFull,
                     resultSummary: "",
                 }) - 1;
                 if (toolUse.id) toolCallMap.set(toolUse.id, { round, index });
             }
+            if (extracted.toolUses.length > 0) recordSourceCheckpoint("tool_call", round, byteOffset, lineNo);
             const response = extracted.text || (aiToolCalls.length ? `（调用工具：${aiToolCalls.map(item => item.name).join(", ")}）` : "");
             if (response || pendingThinking || extracted.thinking) {
                 round.aiResponses.push({
@@ -1400,8 +1526,10 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
         if (type === "system") {
             if (isClaudeCodeCompactBoundary(event)) {
                 pendingCompactBoundary = compactBoundaryFromEvent(event, lineNo, byteOffset);
+                pendingCompactBoundaryStepIndex = stepIndex;
                 const round = currentRound;
                 if (!round) return;
+                recordSourceCheckpoint("compact_boundary", round, byteOffset, lineNo);
                 round.fileViews = round.fileViews || [];
                 round.fileViews.push({
                     stepIndex,
@@ -1430,21 +1558,260 @@ function createClaudeCodeRoundsBuilder(jsonlPath: string, cwd?: string): ClaudeC
         handleLine,
         finish: () => {
             pushCurrent();
-            return { rounds, totalSteps: stepIndex };
+            return { rounds, totalSteps: stepIndex, sourceCheckpoints };
         },
     };
 }
 
-function buildClaudeCodeRounds(jsonlPath: string, cwd?: string): ClaudeCodeRoundBuildResult {
+function buildClaudeCodeRounds(jsonlPath: string, cwd?: string, readOptions: JsonlLineReadOptions = {}): ClaudeCodeRoundBuildResult {
     const builder = createClaudeCodeRoundsBuilder(jsonlPath, cwd);
-    readJsonlLines(jsonlPath, builder.handleLine);
+    readJsonlLines(jsonlPath, builder.handleLine, readOptions);
     return builder.finish();
 }
 
-async function buildClaudeCodeRoundsAsync(jsonlPath: string, cwd?: string): Promise<ClaudeCodeRoundBuildResult> {
+async function buildClaudeCodeRoundsAsync(jsonlPath: string, cwd?: string, readOptions: JsonlLineReadOptions = {}): Promise<ClaudeCodeRoundBuildResult> {
     const builder = createClaudeCodeRoundsBuilder(jsonlPath, cwd);
-    await readJsonlLinesAsync(jsonlPath, builder.handleLine);
+    await readJsonlLinesAsync(jsonlPath, builder.handleLine, readOptions);
     return builder.finish();
+}
+
+const CLAUDE_CODE_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES = 8 * 1024;
+
+export interface ClaudeCodeRoundTailCheckpoint {
+    version: 1;
+    sourceSize: number;
+    sourceMtimeMs: number;
+    anchorStartByte: number;
+    anchorSha256: string;
+    replayStartByte: number;
+    replayStartLineNo: number;
+    replayStartStepIndex: number;
+    replaceFromRound: number;
+}
+
+export interface ClaudeCodeRoundTailReadOptions {
+    cwd?: string;
+    startByte?: number;
+    checkpoint?: ClaudeCodeRoundTailCheckpoint;
+    sourceChange?: "append" | "replace";
+}
+
+export interface ClaudeCodeRoundTailReadResult {
+    status: "ok" | "unchanged" | "rebuild_required";
+    reason?: "checkpoint_required" | "checkpoint_mismatch" | "source_truncated" | "source_replaced" | "source_changed_during_read" | "source_unavailable";
+    replaceFromRound: number;
+    startByte: number;
+    sourceSize: number;
+    roundIndexOffset: number;
+    rounds: ConversationRound[];
+    totalSteps: number;
+    sourceCheckpoints: ClaudeCodeSourceByteCheckpoint[];
+    checkpoint?: ClaudeCodeRoundTailCheckpoint;
+}
+
+async function claudeCodeCheckpointAnchor(filePath: string, sourceSize: number): Promise<{ anchorStartByte: number; anchorSha256: string }> {
+    const anchorStartByte = Math.max(0, sourceSize - CLAUDE_CODE_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES);
+    const length = sourceSize - anchorStartByte;
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+        const bytes = Buffer.allocUnsafe(length);
+        const { bytesRead } = await handle.read(bytes, 0, length, anchorStartByte);
+        if (bytesRead !== length) throw new Error("short Claude Code checkpoint anchor read");
+        return {
+            anchorStartByte,
+            anchorSha256: createHash("sha256").update(bytes).digest("hex"),
+        };
+    } finally {
+        await handle.close();
+    }
+}
+
+function rebaseClaudeCodeRoundTail(rounds: ConversationRound[], roundIndexOffset: number, stepIndexOffset: number): void {
+    const stepCollections = ["aiResponses", "toolCalls", "taskBoundaries", "codeActions", "fileViews", "userMessages", "semanticEvents", "attachments"];
+    for (const round of rounds) {
+        round.roundIndex += roundIndexOffset;
+        round.startStep += stepIndexOffset;
+        round.endStep += stepIndexOffset;
+        for (const collection of stepCollections) {
+            for (const item of (round as any)[collection] || []) {
+                if (typeof item?.stepIndex === "number") item.stepIndex += stepIndexOffset;
+            }
+        }
+    }
+}
+
+function claudeCodeTailRebuildRequired(
+    reason: NonNullable<ClaudeCodeRoundTailReadResult["reason"]>,
+    startByte: number,
+    sourceSize: number,
+): ClaudeCodeRoundTailReadResult {
+    return {
+        status: "rebuild_required",
+        reason,
+        replaceFromRound: 1,
+        startByte,
+        sourceSize,
+        roundIndexOffset: 0,
+        rounds: [],
+        totalSteps: 0,
+        sourceCheckpoints: [],
+    };
+}
+
+export async function readClaudeCodeRoundTail(
+    jsonlPath: string,
+    options: ClaudeCodeRoundTailReadOptions = {},
+): Promise<ClaudeCodeRoundTailReadResult> {
+    let before: fs.Stats;
+    try {
+        before = await fs.promises.stat(jsonlPath);
+    } catch {
+        return claudeCodeTailRebuildRequired("source_unavailable", options.startByte || 0, 0);
+    }
+    if (!before.isFile()) return claudeCodeTailRebuildRequired("source_unavailable", options.startByte || 0, before.size);
+
+    const checkpoint = options.checkpoint;
+    if (!checkpoint && (options.startByte || 0) > 0) {
+        return claudeCodeTailRebuildRequired("checkpoint_required", options.startByte!, before.size);
+    }
+    const startByte = checkpoint ? checkpoint.replayStartByte : (options.startByte || 0);
+    if (!Number.isSafeInteger(startByte) || startByte < 0 || startByte > before.size) {
+        return claudeCodeTailRebuildRequired(checkpoint ? "source_truncated" : "checkpoint_mismatch", startByte, before.size);
+    }
+    if (checkpoint) {
+        if (options.sourceChange === "replace") {
+            return claudeCodeTailRebuildRequired("source_replaced", startByte, before.size);
+        }
+        if (options.startByte !== undefined && options.startByte !== checkpoint.replayStartByte) {
+            return claudeCodeTailRebuildRequired("checkpoint_mismatch", startByte, before.size);
+        }
+        if (before.size < checkpoint.sourceSize) {
+            return claudeCodeTailRebuildRequired("source_truncated", startByte, before.size);
+        }
+        if (before.size === checkpoint.sourceSize && before.mtimeMs !== checkpoint.sourceMtimeMs) {
+            return claudeCodeTailRebuildRequired("source_replaced", startByte, before.size);
+        }
+        try {
+            const anchor = await claudeCodeCheckpointAnchor(jsonlPath, checkpoint.sourceSize);
+            if (anchor.anchorStartByte !== checkpoint.anchorStartByte || anchor.anchorSha256 !== checkpoint.anchorSha256) {
+                return claudeCodeTailRebuildRequired("source_replaced", startByte, before.size);
+            }
+        } catch {
+            return claudeCodeTailRebuildRequired("source_unavailable", startByte, before.size);
+        }
+        if (before.size === checkpoint.sourceSize && before.mtimeMs === checkpoint.sourceMtimeMs) {
+            return {
+                status: "unchanged",
+                replaceFromRound: checkpoint.replaceFromRound,
+                startByte,
+                sourceSize: before.size,
+                roundIndexOffset: checkpoint.replaceFromRound - 1,
+                rounds: [],
+                totalSteps: 0,
+                sourceCheckpoints: [],
+                checkpoint,
+            };
+        }
+    }
+
+    const built = await buildClaudeCodeRoundsAsync(jsonlPath, options.cwd, {
+        startByte,
+        endByte: before.size,
+        startLineNo: checkpoint ? checkpoint.replayStartLineNo - 1 : 0,
+    });
+    let after: fs.Stats;
+    try {
+        after = await fs.promises.stat(jsonlPath);
+    } catch {
+        return claudeCodeTailRebuildRequired("source_unavailable", startByte, before.size);
+    }
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+        return claudeCodeTailRebuildRequired("source_changed_during_read", startByte, after.size);
+    }
+
+    const replaceFromRound = checkpoint?.replaceFromRound || 1;
+    const roundIndexOffset = replaceFromRound - 1;
+    const stepIndexOffset = checkpoint ? checkpoint.replayStartStepIndex - 1 : 0;
+    rebaseClaudeCodeRoundTail(built.rounds, roundIndexOffset, stepIndexOffset);
+    const sourceCheckpoints = built.sourceCheckpoints.map(item => ({
+        ...item,
+        roundIndex: item.roundIndex + roundIndexOffset,
+        sourceStepIndex: item.sourceStepIndex + stepIndexOffset,
+    }));
+    const lastRoundCheckpoint = sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
+    const anchor = await claudeCodeCheckpointAnchor(jsonlPath, before.size);
+    return {
+        status: "ok",
+        replaceFromRound,
+        startByte,
+        sourceSize: before.size,
+        roundIndexOffset,
+        rounds: built.rounds,
+        totalSteps: built.totalSteps,
+        sourceCheckpoints,
+        checkpoint: {
+            version: 1,
+            sourceSize: before.size,
+            sourceMtimeMs: before.mtimeMs,
+            anchorStartByte: anchor.anchorStartByte,
+            anchorSha256: anchor.anchorSha256,
+            replayStartByte: lastRoundCheckpoint?.sourceByte ?? startByte,
+            replayStartLineNo: lastRoundCheckpoint?.sourceLineNo ?? (checkpoint?.replayStartLineNo || 1),
+            replayStartStepIndex: lastRoundCheckpoint?.sourceStepIndex ?? (stepIndexOffset + 1),
+            replaceFromRound: lastRoundCheckpoint?.roundIndex ?? replaceFromRound,
+        },
+    };
+}
+
+async function claudeCodeRoundTailCheckpointFromBuild(
+    jsonlPath: string,
+    built: ClaudeCodeRoundBuildResult,
+): Promise<ClaudeCodeRoundTailCheckpoint | undefined> {
+    const stat = await fs.promises.stat(jsonlPath);
+    if (!stat.isFile()) return undefined;
+    const lastRoundCheckpoint = built.sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
+    const anchor = await claudeCodeCheckpointAnchor(jsonlPath, stat.size);
+    return {
+        version: 1,
+        sourceSize: stat.size,
+        sourceMtimeMs: stat.mtimeMs,
+        anchorStartByte: anchor.anchorStartByte,
+        anchorSha256: anchor.anchorSha256,
+        replayStartByte: lastRoundCheckpoint?.sourceByte ?? 0,
+        replayStartLineNo: lastRoundCheckpoint?.sourceLineNo ?? 1,
+        replayStartStepIndex: lastRoundCheckpoint?.sourceStepIndex ?? 1,
+        replaceFromRound: lastRoundCheckpoint?.roundIndex ?? 1,
+    };
+}
+
+function claudeCodeRoundTailCheckpointFromBuildSync(
+    jsonlPath: string,
+    built: ClaudeCodeRoundBuildResult,
+): ClaudeCodeRoundTailCheckpoint | undefined {
+    const stat = fs.statSync(jsonlPath);
+    if (!stat.isFile()) return undefined;
+    const lastRoundCheckpoint = built.sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
+    const anchorStartByte = Math.max(0, stat.size - CLAUDE_CODE_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES);
+    const length = stat.size - anchorStartByte;
+    const fileDescriptor = fs.openSync(jsonlPath, "r");
+    try {
+        const bytes = Buffer.allocUnsafe(length);
+        const bytesRead = fs.readSync(fileDescriptor, bytes, 0, length, anchorStartByte);
+        if (bytesRead !== length) throw new Error("short Claude Code checkpoint anchor read");
+        return {
+            version: 1,
+            sourceSize: stat.size,
+            sourceMtimeMs: stat.mtimeMs,
+            anchorStartByte,
+            anchorSha256: createHash("sha256").update(bytes).digest("hex"),
+            replayStartByte: lastRoundCheckpoint?.sourceByte ?? 0,
+            replayStartLineNo: lastRoundCheckpoint?.sourceLineNo ?? 1,
+            replayStartStepIndex: lastRoundCheckpoint?.sourceStepIndex ?? 1,
+            replaceFromRound: lastRoundCheckpoint?.roundIndex ?? 1,
+        };
+    } finally {
+        fs.closeSync(fileDescriptor);
+    }
 }
 
 function cloneRoundWithLogicalOffsets(
@@ -1535,7 +1902,7 @@ function buildClaudeCodeLogicalConversation(
             roundOffset += 1;
         }
     }
-    return { rounds, totalSteps };
+    return { rounds, totalSteps, sourceCheckpoints: [] };
 }
 
 async function buildClaudeCodeLogicalConversationAsync(
@@ -1603,7 +1970,7 @@ async function buildClaudeCodeLogicalConversationAsync(
             roundOffset += 1;
         }
     }
-    return { rounds, totalSteps };
+    return { rounds, totalSteps, sourceCheckpoints: [] };
 }
 
 export function loadClaudeCodeConversation(
@@ -1619,11 +1986,16 @@ export function loadClaudeCodeConversation(
     const built = logicalChain?.merged
         ? buildClaudeCodeLogicalConversation(thread, logicalChain)
         : buildClaudeCodeRounds(thread.jsonlPath, thread.cwd);
+    const sourceCheckpoint = logicalChain?.merged
+        ? undefined
+        : claudeCodeRoundTailCheckpointFromBuildSync(thread.jsonlPath, built);
     return {
         thread,
         rounds: built.rounds,
         totalSteps: built.totalSteps,
         logicalChain: logicalChain || undefined,
+        sourceCheckpoints: logicalChain?.merged ? undefined : built.sourceCheckpoints,
+        sourceCheckpoint,
     };
 }
 
@@ -1640,11 +2012,16 @@ export async function loadClaudeCodeConversationAsync(
     const built = logicalChain?.merged
         ? await buildClaudeCodeLogicalConversationAsync(thread, logicalChain)
         : await buildClaudeCodeRoundsAsync(thread.jsonlPath, thread.cwd);
+    const sourceCheckpoint = logicalChain?.merged
+        ? undefined
+        : await claudeCodeRoundTailCheckpointFromBuild(thread.jsonlPath, built);
     return {
         thread,
         rounds: built.rounds,
         totalSteps: built.totalSteps,
         logicalChain: logicalChain || undefined,
+        sourceCheckpoints: logicalChain?.merged ? undefined : built.sourceCheckpoints,
+        sourceCheckpoint,
     };
 }
 
@@ -2168,6 +2545,15 @@ function claudeCodeSourceIdentity(
         },
         conversationId: options.conversationId.trim(),
     };
+}
+
+export function resolveClaudeCodeSourceEvidenceIdentity(
+    options: Pick<ClaudeCodeSourceEvidenceOptions, "conversationId" | "projectsRoot" | "workspaceId" | "workspacePath">,
+    jsonlPath?: string | null,
+): SourceConversationIdentity {
+    const projectsRoot = claudeCodeSourceEvidenceRoot(options);
+    const session = jsonlPath ? claudeCodeSessionFromPath(projectsRoot, jsonlPath) : null;
+    return claudeCodeSourceIdentity(options, session);
 }
 
 function claudeCodePaginationForIncompleteRead(

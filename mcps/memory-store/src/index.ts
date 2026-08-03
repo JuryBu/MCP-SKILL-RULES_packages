@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Memory Store Server v1.21.1
+ * MCP Memory Store Server v1.22.0
  *
  * AI 主动记忆管理系统，支持多工作区、冷热分层、置顶记忆、批量操作、对话原文阅读、
  * Auto Summary 双轨制、黄金片段提取、对话记录 Record。

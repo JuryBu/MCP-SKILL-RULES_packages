@@ -64,6 +64,7 @@ export interface GuardCheckHistoryItem {
     missingItems: string[];
     summary: string;
     checkedAt: string;
+    taskId?: string;
 }
 
 export interface GuardState {
@@ -243,6 +244,7 @@ export function addCheckResult(
     result: "pass" | "fail",
     summary: string,
     missingItems: string[] = [],
+    taskId?: string,
 ): GuardState | null {
     const state = typeof stateOrConversationId === "string"
         ? readGuardState(stateOrConversationId)
@@ -257,6 +259,7 @@ export function addCheckResult(
         missingItems,
         summary,
         checkedAt: new Date().toISOString(),
+        ...(taskId ? { taskId } : {}),
     });
     writeGuardState(current);
     return current;

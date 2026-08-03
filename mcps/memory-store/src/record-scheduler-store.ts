@@ -27,6 +27,7 @@ const RECORD_RECOVERY_DIR = path.join(DATA_ROOT, "record-recovery");
 const RECORD_SCHEDULER_ADMISSION_NAMESPACE_LOCK_ID = "record-scheduler-admission-namespace";
 const DEFAULT_LOCK_TIMEOUT_MS = 15_000;
 const DEFAULT_LOCK_STALE_MS = 30_000;
+const MIN_OPAQUE_LOCK_STALE_MS = 30_000;
 const MIN_OWNER_LEASE_MS = 1_000;
 const SCHEDULER_OWNER_PROCESS_QUERY_TIMEOUT_MS = 750;
 const SCHEDULER_OWNER_START_TIME_MATCH_TOLERANCE_MS = 2_000;
@@ -1076,10 +1077,12 @@ async function withSchedulerFileLock<Value>(
             .finally(() => { heartbeatInFlight = false; });
     }, heartbeatIntervalMs);
     try {
+        await lock.assertHeld();
         const result = await callback(lock);
         if (heartbeatFailure) {
             throw asStoreError(`scheduler ledger ${lockId} lock heartbeat 中断`, "LOCK_HEARTBEAT_FAILED", heartbeatFailure);
         }
+        await lock.assertHeld();
         return result;
     } finally {
         clearInterval(heartbeatTimer);
@@ -1329,14 +1332,24 @@ async function acquireSchedulerLedgerFileLock(
                 token,
                 ownerPid: process.pid,
             });
-            const handle = await fs.promises.open(lockPath, "wx");
-            const payload = JSON.stringify({ taskId, token, ownerPid: process.pid, acquiredAt: new Date().toISOString() });
+            const temporaryPath = `${lockPath}.candidate-${process.pid}-${token}`;
+            const handle = await fs.promises.open(temporaryPath, "wx");
+            const payload = JSON.stringify({
+                taskId,
+                token,
+                ownerPid: process.pid,
+                ownerStartedAtMs: CURRENT_SCHEDULER_OWNER_STARTED_AT_MS,
+                acquiredAt: new Date().toISOString(),
+            });
             try {
                 await writeSchedulerLedgerLockPayload(handle, payload, { taskId, lockPath, token, deadline });
+                await fs.promises.link(temporaryPath, lockPath);
+                await fs.promises.rm(temporaryPath, { force: true });
             } catch (error) {
                 await handle.close().catch(() => undefined);
-                await removeFailedSchedulerLedgerLock(lockPath, deadline);
-                throw asStoreError(`写入 scheduler ledger lock ${taskId} 失败`, "LOCK_WRITE_FAILED", error);
+                await fs.promises.rm(temporaryPath, { force: true }).catch(() => undefined);
+                if (isErrno(error, "EEXIST") || isTransientWindowsSchedulerLockRace(error)) throw error;
+                throw asStoreError(`原子发布 scheduler ledger lock ${taskId} 失败`, "LOCK_WRITE_FAILED", error);
             }
             return createFileLock(taskId, lockPath, token, handle);
         } catch (error) {
@@ -1451,6 +1464,7 @@ interface SchedulerLedgerLockMetadata {
     taskId: string;
     token: string;
     ownerPid: number;
+    ownerStartedAtMs?: number;
     acquiredAt: string;
 }
 
@@ -1461,11 +1475,20 @@ interface SchedulerLedgerLockSnapshot {
     size: number;
 }
 
+interface SchedulerLedgerOpaqueLockSnapshot {
+    raw: string;
+    mtimeMs: number;
+    size: number;
+}
+
 async function breakStaleLock(taskId: string, lockPath: string, staleMs: number): Promise<void> {
     const observed = await readSchedulerLedgerLockSnapshot(taskId, lockPath);
-    if (!observed) return;
-    const observedOwnerAlive = isProcessAlive(observed.metadata.ownerPid);
-    if (observedOwnerAlive && Date.now() - observed.mtimeMs < staleMs) return;
+    if (!observed) {
+        await breakOpaqueStaleLock(taskId, lockPath, staleMs);
+        return;
+    }
+    const observedOwnerState = await schedulerLedgerLockOwnerState(observed.metadata);
+    if (observedOwnerState !== "dead") return;
     await lockTestHook?.({
         phase: "stale-observed",
         taskId,
@@ -1475,7 +1498,7 @@ async function breakStaleLock(taskId: string, lockPath: string, staleMs: number)
     });
     const confirmed = await readSchedulerLedgerLockSnapshot(taskId, lockPath);
     if (!confirmed || !sameLockSnapshot(observed, confirmed)) return;
-    if (isProcessAlive(confirmed.metadata.ownerPid)) return;
+    if (await schedulerLedgerLockOwnerState(confirmed.metadata) !== "dead") return;
 
     const tokenHash = crypto.createHash("sha256").update(confirmed.metadata.token).digest("hex").slice(0, 20);
     const claimDirectory = `${lockPath}.stale-claim-${tokenHash}`;
@@ -1499,7 +1522,7 @@ async function breakStaleLock(taskId: string, lockPath: string, staleMs: number)
         const beforeRename = await readSchedulerLedgerLockSnapshot(taskId, lockPath);
         if (!beforeRename
             || !sameLockSnapshot(confirmed, beforeRename)
-            || isProcessAlive(beforeRename.metadata.ownerPid)) return;
+            || await schedulerLedgerLockOwnerState(beforeRename.metadata) !== "dead") return;
         try {
             await fs.promises.rename(lockPath, quarantinePath);
         } catch (error) {
@@ -1515,7 +1538,9 @@ async function breakStaleLock(taskId: string, lockPath: string, staleMs: number)
             ownerPid: confirmed.metadata.ownerPid,
         });
         const quarantined = await readSchedulerLedgerLockSnapshot(taskId, quarantinePath);
-        if (!quarantined || !sameLockSnapshot(beforeRename, quarantined) || isProcessAlive(quarantined.metadata.ownerPid)) {
+        if (!quarantined
+            || !sameLockSnapshot(beforeRename, quarantined)
+            || await schedulerLedgerLockOwnerState(quarantined.metadata) !== "dead") {
             await restoreQuarantinedLock(quarantinePath, lockPath);
             return;
         }
@@ -1526,6 +1551,58 @@ async function breakStaleLock(taskId: string, lockPath: string, staleMs: number)
         } catch (error) {
             if (!isErrno(error, "ENOENT") && !isErrno(error, "ENOTEMPTY")) {
                 throw asStoreError("清理 stale lock claim 目录失败", "LOCK_STALE_CLAIM_CLEANUP_FAILED", error);
+            }
+        }
+    }
+}
+
+async function breakOpaqueStaleLock(taskId: string, lockPath: string, staleMs: number): Promise<void> {
+    const opaqueStaleMs = Math.max(staleMs, MIN_OPAQUE_LOCK_STALE_MS);
+    const observed = await readSchedulerLedgerOpaqueLockSnapshot(lockPath);
+    if (!observed || Date.now() - observed.mtimeMs < opaqueStaleMs) return;
+    const confirmed = await readSchedulerLedgerOpaqueLockSnapshot(lockPath);
+    if (!confirmed
+        || !sameOpaqueLockSnapshot(observed, confirmed)
+        || Date.now() - confirmed.mtimeMs < opaqueStaleMs) return;
+
+    const tokenHash = crypto.createHash("sha256")
+        .update(`${taskId}\0${confirmed.raw}\0${confirmed.mtimeMs}\0${confirmed.size}`)
+        .digest("hex")
+        .slice(0, 20);
+    const claimDirectory = `${lockPath}.stale-opaque-claim-${tokenHash}`;
+    try {
+        await fs.promises.mkdir(claimDirectory);
+    } catch (error) {
+        if (isErrno(error, "EEXIST")) return;
+        if (isTransientWindowsSchedulerLockRace(error)) return;
+        throw asStoreError("创建 opaque stale lock 原子 claim 失败", "LOCK_STALE_CLAIM_FAILED", error);
+    }
+
+    const quarantinePath = path.join(claimDirectory, "quarantined.lock");
+    try {
+        const beforeRename = await readSchedulerLedgerOpaqueLockSnapshot(lockPath);
+        if (!beforeRename
+            || !sameOpaqueLockSnapshot(confirmed, beforeRename)
+            || Date.now() - beforeRename.mtimeMs < opaqueStaleMs) return;
+        try {
+            await fs.promises.rename(lockPath, quarantinePath);
+        } catch (error) {
+            if (isErrno(error, "ENOENT") || isErrno(error, "EEXIST")) return;
+            if (isTransientWindowsSchedulerLockRace(error)) return;
+            throw asStoreError("原子隔离 opaque stale scheduler ledger lock 失败", "LOCK_STALE_QUARANTINE_FAILED", error);
+        }
+        const quarantined = await readSchedulerLedgerOpaqueLockSnapshot(quarantinePath);
+        if (!quarantined || !sameOpaqueLockSnapshot(beforeRename, quarantined)) {
+            await restoreQuarantinedLock(quarantinePath, lockPath);
+            return;
+        }
+        await fs.promises.unlink(quarantinePath);
+    } finally {
+        try {
+            await fs.promises.rmdir(claimDirectory);
+        } catch (error) {
+            if (!isErrno(error, "ENOENT") && !isErrno(error, "ENOTEMPTY")) {
+                throw asStoreError("清理 opaque stale lock claim 目录失败", "LOCK_STALE_CLAIM_CLEANUP_FAILED", error);
             }
         }
     }
@@ -1554,6 +1631,7 @@ async function readSchedulerLedgerLockSnapshot(taskId: string, lockPath: string)
                 || !isNonEmptyString(value.taskId)
                 || !isNonEmptyString(value.token)
                 || !isPositiveInteger(value.ownerPid)
+                || (value.ownerStartedAtMs !== undefined && !isPositiveInteger(value.ownerStartedAtMs))
                 || !isTimestamp(value.acquiredAt)) {
                 throw new SchedulerLedgerStoreError(`scheduler ledger lock 元数据非法：${lockPath}`, "LOCK_METADATA_INVALID");
             }
@@ -1562,6 +1640,7 @@ async function readSchedulerLedgerLockSnapshot(taskId: string, lockPath: string)
                     taskId: value.taskId,
                     token: value.token,
                     ownerPid: value.ownerPid,
+                    ...(value.ownerStartedAtMs === undefined ? {} : { ownerStartedAtMs: value.ownerStartedAtMs }),
                     acquiredAt: value.acquiredAt,
                 },
                 raw,
@@ -1579,23 +1658,50 @@ async function readSchedulerLedgerLockSnapshot(taskId: string, lockPath: string)
     }
 }
 
+async function readSchedulerLedgerOpaqueLockSnapshot(lockPath: string): Promise<SchedulerLedgerOpaqueLockSnapshot | null> {
+    try {
+        const handle = await fs.promises.open(lockPath, "r");
+        try {
+            const raw = await handle.readFile("utf8");
+            const stat = await handle.stat();
+            return {
+                raw,
+                mtimeMs: stat.mtimeMs,
+                size: stat.size,
+            };
+        } finally {
+            await handle.close();
+        }
+    } catch (error) {
+        if (isErrno(error, "ENOENT")) return null;
+        if (isTransientWindowsSchedulerLockRace(error)) return null;
+        throw asStoreError("读取 opaque scheduler ledger lock 快照失败", "LOCK_STALE_READ_FAILED", error);
+    }
+}
+
 function sameLockSnapshot(left: SchedulerLedgerLockSnapshot, right: SchedulerLedgerLockSnapshot): boolean {
     return left.raw === right.raw
         && left.mtimeMs === right.mtimeMs
         && left.size === right.size
         && left.metadata.taskId === right.metadata.taskId
         && left.metadata.token === right.metadata.token
-        && left.metadata.ownerPid === right.metadata.ownerPid;
+        && left.metadata.ownerPid === right.metadata.ownerPid
+        && left.metadata.ownerStartedAtMs === right.metadata.ownerStartedAtMs;
 }
 
-function isProcessAlive(pid: number): boolean {
-    if (pid === process.pid) return true;
-    try {
-        process.kill(pid, 0);
-        return true;
-    } catch (error) {
-        return !isErrno(error, "ESRCH");
-    }
+function sameOpaqueLockSnapshot(left: SchedulerLedgerOpaqueLockSnapshot, right: SchedulerLedgerOpaqueLockSnapshot): boolean {
+    return left.raw === right.raw
+        && left.mtimeMs === right.mtimeMs
+        && left.size === right.size;
+}
+
+async function schedulerLedgerLockOwnerState(metadata: SchedulerLedgerLockMetadata): Promise<"alive" | "dead" | "unknown"> {
+    const state = await probeSchedulerOwnerProcess(metadata.ownerPid);
+    if (state.kind === "dead") return "dead";
+    if (state.kind === "unknown") return "unknown";
+    if (metadata.ownerStartedAtMs !== undefined
+        && !sameSchedulerOwnerProcessStartTime(state.startedAtMs, metadata.ownerStartedAtMs)) return "dead";
+    return "alive";
 }
 
 function isTransientWindowsSchedulerLockRace(error: unknown): boolean {

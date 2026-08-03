@@ -6,7 +6,7 @@
   · fuzzy：记不清名称拼个大概（拼写模糊、部分匹配），<2秒
   · smart：语义搜索，描述意图而非关键词（"处理超时的逻辑在哪"），45-110秒，grok low reasoning，默认后台
   · 批量查询用 queries 数组并行，maxResults 控制返回条数
-- record/conversation 先 search 定位，信息够就不 read 全轮
+- record/conversation 先 search 定位，信息够就不 read 全轮；需要大段原文时从 fetch 缓存按约 100K 字符的继续位置分段读取，不重复解析源文件
 - memory_query 批量用 depth=summary，重要单条再 full
 - ⚠️ MCP 60s硬超时：耗时操作一律 background=true + 短轮询(waitSeconds=30-45)，别同步死等
 - 脏活（扫目录/批量分析/长文摘要）拆子代理，不占主线

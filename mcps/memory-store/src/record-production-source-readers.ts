@@ -38,6 +38,7 @@ import {
     type ExactFetchEvidence,
     type FullSourceReadEvidence,
     type RecordSourceSnapshot,
+    type SourceConversationIdentity,
     type SourceEvidenceClassification,
     type SourceEnumerationEvidence,
     type SourceEvidenceHost,
@@ -50,6 +51,14 @@ import {
     type WindsurfLsTransport,
     type WindsurfSourceEvidenceScanOptions,
 } from "./windsurf-client.js";
+import {
+    getConversationSourceCacheGenerationKind,
+    readConversationSourceCacheRecordProjection,
+    type ConversationSourceCacheGenerationRef,
+} from "./conversation-source-cache.js";
+import { rebuildConversationCacheForRecord } from "./conversation-bridge.js";
+import type { ConversationRecordProjectionRound } from "./conversation-record-projection.js";
+import type { ConversationMessageRole, ConversationRound } from "./trajectory.js";
 
 export const PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION = "record-source-content/v1" as const;
 export const PRODUCTION_SOURCE_FORMATTER_VERSION_V1 = "canonical-json-nfc-lf/v1" as const;
@@ -120,16 +129,26 @@ export interface AntigravityProductionSourceReadRequest {
     maxContentBytes?: number;
 }
 
-export type ProductionSourceReadRequest =
+export interface ProductionSourceCacheReference {
+    cacheGeneration?: ConversationSourceCacheGenerationRef;
+    sourceSnapshot?: Record<string, unknown>;
+    cacheReadStartRound?: number;
+}
+
+export type ProductionSourceReadRequest = (
     | CodexProductionSourceReadRequest
     | ClaudeCodeProductionSourceReadRequest
     | WindsurfProductionSourceReadRequest
-    | AntigravityProductionSourceReadRequest;
+    | AntigravityProductionSourceReadRequest
+) & ProductionSourceCacheReference;
 
 export interface ProductionSourceCanonicalMessage {
     order: number;
     role: "user" | "assistant";
     content: string;
+    roundIndex?: number;
+    rawRole?: string;
+    semanticRole?: ConversationMessageRole;
     attachments?: ProductionSourceCanonicalAttachment[];
 }
 
@@ -212,6 +231,8 @@ export interface ProductionSourceReadResult {
     sourceSnapshot: RecordSourceSnapshot | null;
     classification: SourceEvidenceClassification;
     qualifiedAbsence: SourceEvidenceClassification["lostObservation"] | null;
+    cacheGeneration?: ConversationSourceCacheGenerationRef;
+    cacheSourceSnapshot?: Record<string, unknown>;
 }
 
 export interface ProductionSourceReader {
@@ -241,11 +262,17 @@ export interface ProductionSourceReaderOptions {
     antigravityReader?: AntigravityLsEvidenceReader;
     antigravityIo?: Partial<AntigravityProductionSourceIo>;
     maxContentBytes?: number;
+    rebuildLegacyCache?: (
+        request: ProductionSourceReadRequest,
+    ) => Promise<{ cacheGeneration: ConversationSourceCacheGenerationRef; sourceSnapshot?: Record<string, unknown> }>;
 }
 
 interface ProductionSourceMessage {
     role: "user" | "assistant";
     text: string;
+    roundIndex?: number;
+    rawRole?: string;
+    semanticRole?: ConversationMessageRole;
     attachments?: readonly ProductionSourceAttachmentInput[];
     mediaAttachments?: readonly string[];
 }
@@ -836,6 +863,9 @@ function canonicalProductionSourceMessages(messages: ProductionSourceMessage[]):
             order: canonical.length + 1,
             role: message.role,
             content,
+            ...(message.roundIndex !== undefined ? { roundIndex: message.roundIndex } : {}),
+            ...(message.rawRole !== undefined ? { rawRole: message.rawRole } : {}),
+            ...(message.semanticRole !== undefined ? { semanticRole: message.semanticRole } : {}),
             ...(attachments.length > 0 ? { attachments } : {}),
         });
     }
@@ -941,7 +971,7 @@ function buildProductionSourcePayload(
 }
 
 function messagesFromWindsurfRounds(
-    rounds: ReturnType<typeof windsurfStepsToConversationRounds>,
+    rounds: Iterable<ConversationRound>,
 ): ProductionSourceMessage[] {
     const messages: ProductionSourceMessage[] = [];
     for (const round of rounds) {
@@ -957,6 +987,246 @@ function messagesFromWindsurfRounds(
         }
     }
     return messages;
+}
+
+function messagesFromRecordProjection(rounds: readonly ConversationRecordProjectionRound[]): ProductionSourceMessage[] {
+    const messages: ProductionSourceMessage[] = [];
+    for (const [index, round] of rounds.entries()) {
+        if (!round || !Number.isInteger(round.roundIndex) || round.roundIndex < 1 || !Array.isArray(round.messages)) {
+            throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮结构无效`);
+        }
+        for (const [messageIndex, message] of round.messages.entries()) {
+            if (!message || (message.role !== "user" && message.role !== "assistant") || typeof message.text !== "string") {
+                throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮第 ${messageIndex + 1} 条消息结构无效`);
+            }
+            messages.push({
+                role: message.role,
+                text: message.text,
+                roundIndex: round.roundIndex,
+                ...(message.rawRole !== undefined ? { rawRole: message.rawRole } : {}),
+                ...(message.semanticRole !== undefined ? { semanticRole: message.semanticRole } : {}),
+                attachments: message.attachments,
+                mediaAttachments: message.mediaAttachments,
+            });
+        }
+    }
+    return messages;
+}
+
+function cacheWorkspace(request: ProductionSourceReadRequest): ProductionSourceReaderWorkspace {
+    if (request.host === "codex") return request.workspace;
+    return {
+        workspaceId: request.workspaceId || "general",
+        canonicalPath: request.workspacePath || null,
+    };
+}
+
+function cacheRevisionSequence(generation: ConversationSourceCacheGenerationRef): number {
+    const rawMtime = generation.fingerprint?.mtime;
+    const numericMtime = typeof rawMtime === "number"
+        ? rawMtime
+        : typeof rawMtime === "string"
+            ? Date.parse(rawMtime)
+            : Number.NaN;
+    if (Number.isFinite(numericMtime) && numericMtime >= 0) return Math.max(1, Math.floor(numericMtime));
+    return Number.parseInt(createHash("sha256").update(generation.generation).digest("hex").slice(0, 12), 16);
+}
+
+export function describeVerifiedConversationCacheSource(input: {
+    host: SourceEvidenceHost;
+    conversationId: string;
+    workspace: ProductionSourceReaderWorkspace;
+    cacheGeneration: ConversationSourceCacheGenerationRef;
+    sourceSnapshot?: Record<string, unknown>;
+    roundCount?: number;
+}): { identity: SourceConversationIdentity; sourceRevision: CanonicalSourceRevision } {
+    const authorityRevision = cacheAuthorityRevision(input.sourceSnapshot);
+    return {
+        identity: {
+            workspace: input.workspace,
+            source: {
+                kind: "filesystem",
+                authority: "memory-store-fetch-cache",
+                authoritativeRoot: `conversation-cache:${input.cacheGeneration.key.source}`,
+                canonicalPath: typeof input.cacheGeneration.fingerprint?.path === "string"
+                    ? input.cacheGeneration.fingerprint.path
+                    : input.workspace.canonicalPath,
+            },
+            conversationId: input.conversationId,
+        },
+        sourceRevision: {
+            revision: authorityRevision?.revision || `cache-generation:${input.cacheGeneration.generation}`,
+            contentCursor: authorityRevision?.contentCursor || `round:${Math.max(0, input.roundCount || 0)}`,
+            eventWatermark: `cache-fingerprint:${sourceHash(input.cacheGeneration.fingerprint)}`,
+            sequence: authorityRevision?.sequence ?? cacheRevisionSequence(input.cacheGeneration),
+        },
+    };
+}
+
+function cacheAuthorityRevision(sourceSnapshot: Record<string, unknown> | undefined): CanonicalSourceRevision | null {
+    const value = sourceSnapshot?.authorityRevision;
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const revision = value as Record<string, unknown>;
+    if (typeof revision.revision !== "string" || revision.revision.trim().length === 0) return null;
+    const sequence = revision.sequence === null
+        ? null
+        : Number.isSafeInteger(revision.sequence) && (revision.sequence as number) >= 0
+            ? revision.sequence as number
+            : null;
+    return {
+        revision: revision.revision,
+        contentCursor: typeof revision.contentCursor === "string" ? revision.contentCursor : null,
+        eventWatermark: typeof revision.eventWatermark === "string" ? revision.eventWatermark : null,
+        sequence,
+    };
+}
+
+function verifiedCacheScan(
+    request: ProductionSourceReadRequest,
+    scanId: string,
+    maxContentBytes: number,
+    now: () => Date,
+    contentHashesByAuthorityRevision: Map<string, string>,
+): ProductionSourceReadResult | null {
+    const reference = request.cacheGeneration;
+    if (!reference) return null;
+    if (request.sourceSnapshot?.cacheState === "stale") {
+        throw new Error(`stale fetch 缓存不可作为 Record 生产来源: ${reference.generation}`);
+    }
+    const cacheHost = reference.key.source.split(":", 1)[0];
+    if (reference.key.conversationId !== request.conversationId || cacheHost !== request.host) {
+        throw new Error(`fetch 缓存 generation 与 source request 不匹配: ${reference.key.source}/${reference.key.conversationId}`);
+    }
+    const requestedReadStartRound = Math.max(1, Math.min(
+        Number.isSafeInteger(request.cacheReadStartRound) ? request.cacheReadStartRound! : 1,
+        Number.MAX_SAFE_INTEGER,
+    ));
+    const projection = readConversationSourceCacheRecordProjection<ConversationRecordProjectionRound>({
+        key: reference.key,
+        generation: reference.generation,
+        expectedFingerprint: reference.fingerprint,
+        startRound: requestedReadStartRound,
+    });
+    if (!projection) {
+        throw new Error(`fetch 缓存 Record 投影不存在、损坏或未完整校验: ${reference.generation}`);
+    }
+    const cached = projection;
+    if (cached.generation !== reference.generation) {
+        throw new Error(`fetch 缓存 generation 不存在、损坏或未完整校验: ${reference.generation}`);
+    }
+    if (cached.roundCount === 0) throw new Error(`fetch 缓存 generation 没有可供 Record 使用的对话轮次: ${reference.generation}`);
+    const workspace = cacheWorkspace(request);
+    const startedAt = validNow(now).toISOString();
+    const { identity, sourceRevision } = describeVerifiedConversationCacheSource({
+        host: request.host,
+        conversationId: request.conversationId,
+        workspace,
+        cacheGeneration: reference,
+        sourceSnapshot: request.sourceSnapshot,
+        roundCount: cached.roundCount,
+    });
+    const pagination = { cursor: null, pages: 1, limit: null, truncated: false };
+    let materializedRoundCount = 0;
+    materializedRoundCount = projection.projections.length;
+    const messages = messagesFromRecordProjection(projection.projections);
+    const expectedMaterializedRoundCount = Math.max(0, cached.roundCount - requestedReadStartRound + 1);
+    if (materializedRoundCount !== expectedMaterializedRoundCount) {
+        throw new Error(`fetch 缓存 generation 增量轮次数量不一致: expected=${expectedMaterializedRoundCount}, actual=${materializedRoundCount}`);
+    }
+    const materializedSource = projection;
+    const observedAt = (sequence: number) => ({
+        scanId,
+        sequence,
+        startedAt,
+        completedAt: validNow(now).toISOString(),
+    });
+    const enumeration = buildSourceEnumerationEvidence({
+        adapterVersion: "source-evidence/v1",
+        host: request.host,
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete: true,
+        cacheBypassed: false,
+        exactFetchResult: "present",
+        errors: [],
+        warnings: [],
+        observedAt: observedAt(1),
+        targetStatus: "present",
+    });
+    const exactFetch = buildExactFetchEvidence({
+        adapterVersion: "source-evidence/v1",
+        host: request.host,
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete: true,
+        cacheBypassed: false,
+        exactFetchResult: "present",
+        errors: [],
+        warnings: [],
+        observedAt: observedAt(2),
+    });
+    const nativeEvidence = buildFullSourceReadEvidence({
+        adapterVersion: "source-evidence/v1",
+        host: request.host,
+        identity,
+        sourceRevision,
+        pagination,
+        enumerationComplete: true,
+        cacheBypassed: false,
+        exactFetchResult: "present",
+        errors: [],
+        warnings: [],
+        observedAt: observedAt(3),
+        content: {
+            mode: "full",
+            byteLength: materializedSource.bytes,
+            contentHash: `sha256:${materializedSource.sha256}`,
+            roundRange: { start: requestedReadStartRound, end: cached.roundCount },
+            truncated: false,
+            staleCache: false,
+        },
+    });
+    const fullSourceRead = buildProductionFullRead({
+        host: request.host,
+        conversationId: request.conversationId,
+        enumeration,
+        exactFetch,
+        nativeEvidence,
+        messages,
+        maxContentBytes,
+        allowVerifiedCache: true,
+    }, contentHashesByAuthorityRevision);
+    const normalized = normalizeClassification(enumeration, exactFetch, fullSourceRead);
+    return {
+        host: request.host,
+        scanId,
+        enumeration,
+        exactFetch,
+        fullSourceRead,
+        sourceSnapshot: fullSourceRead.sourceSnapshot,
+        cacheGeneration: {
+            key: { ...cached.key },
+            generation: cached.generation,
+            fingerprint: cached.fingerprint ? { ...cached.fingerprint } : null,
+        },
+        cacheSourceSnapshot: {
+            kind: "verified-conversation-fetch-cache",
+            generation: cached.generation,
+            source: cached.key.source,
+            roundCount: cached.roundCount,
+            ...(Number.isSafeInteger(request.sourceSnapshot?.totalSteps)
+                && Number(request.sourceSnapshot?.totalSteps) >= 0
+                ? { totalSteps: Number(request.sourceSnapshot?.totalSteps) }
+                : {}),
+            materializedSource: "recordProjection",
+            requestedReadStartRound,
+            materializedReadStartRound: projection.materializedStartRound,
+            materializedReadEndRound: projection.materializedEndRound,
+        },
+        ...normalized,
+    };
 }
 
 function directAntigravityMessages(value: unknown): ProductionSourceMessage[] {
@@ -1044,12 +1314,13 @@ function fullReadSafetyIssues(
     exactFetch: ExactFetchEvidence,
     fullSourceRead: FullSourceReadEvidence | null,
     authority: ProductionSourceAuthorityVerification,
+    allowVerifiedCache = false,
 ): SourceEvidenceIssue[] {
     const evidence = [enumeration, exactFetch, ...(fullSourceRead ? [fullSourceRead] : [])];
     const issues = evidence.flatMap(item => [...item.errors, ...item.warnings]);
     if (!authority.identityStable) issues.push(productionSourceIssue("revision_drift", "source identity changed between enumeration, exact fetch, and full read"));
     if (!authority.revisionStable) issues.push(productionSourceIssue("revision_drift", "source revision or scan identity changed during full read"));
-    if (!authority.cacheBypassed) issues.push(productionSourceIssue("cache_only", "full read did not bypass every host cache"));
+    if (!authority.cacheBypassed && !allowVerifiedCache) issues.push(productionSourceIssue("cache_only", "full read did not bypass every host cache"));
     if (exactFetch.exactFetchResult !== "present") issues.push(productionSourceIssue("exact_fetch_failed", "full read requires an exact present result"));
     if (!fullSourceRead) issues.push(productionSourceIssue("source_unavailable", "host did not return full source evidence"));
     for (const item of evidence) {
@@ -1157,16 +1428,19 @@ function buildProductionFullRead(
         messages: ProductionSourceMessage[] | null;
         messageIssues?: SourceEvidenceIssue[];
         maxContentBytes: number;
+        allowVerifiedCache?: boolean;
     },
     contentHashesByAuthorityRevision: Map<string, string>,
 ): ProductionSourceFullReadResult {
     const authority = authorityVerification(input.enumeration, input.exactFetch, input.nativeEvidence);
-    const issues = fullReadSafetyIssues(input.enumeration, input.exactFetch, input.nativeEvidence, authority);
+    const issues = fullReadSafetyIssues(input.enumeration, input.exactFetch, input.nativeEvidence, authority, input.allowVerifiedCache === true);
     issues.push(...(input.messageIssues || []));
     if (input.nativeEvidence && input.messages === null) {
         issues.push(productionSourceIssue("parse_error", "host full read did not expose meaningful user/assistant source messages"));
     }
-    if (input.messages !== null) issues.push(...unverifiedProductionSourceAttachmentIssues(input.messages));
+    if (input.messages !== null && input.allowVerifiedCache !== true) {
+        issues.push(...unverifiedProductionSourceAttachmentIssues(input.messages));
+    }
     const safetyIssues = uniqueProductionSourceIssues(issues);
     if (safetyIssues.length > 0 || !input.nativeEvidence || input.messages === null) {
         return unresolvedFullRead(input.nativeEvidence, authority, safetyIssues);
@@ -1290,6 +1564,46 @@ export function createProductionSourceReader(options: ProductionSourceReaderOpti
     const scan = async (request: ProductionSourceReadRequest): Promise<ProductionSourceReadResult> => {
         const scanId = nextScanId(request.host);
         const maxContentBytes = validMaxContentBytes(request.maxContentBytes, defaultMaxContentBytes);
+        let effectiveRequest = request;
+        if (request.cacheGeneration) {
+            const generationKind = getConversationSourceCacheGenerationKind(request.cacheGeneration);
+            if (generationKind === "missing") {
+                throw new Error(`fetch 缓存 generation 不存在、损坏或未完整校验: ${request.cacheGeneration.generation}`);
+            }
+            if (generationKind === "legacy") {
+                const rebuild = options.rebuildLegacyCache || (async (legacyRequest: ProductionSourceReadRequest) => {
+                    const rebuilt = await rebuildConversationCacheForRecord(
+                        legacyRequest.host,
+                        legacyRequest.conversationId,
+                        legacyRequest.cacheGeneration!,
+                    );
+                    return {
+                        cacheGeneration: {
+                            key: rebuilt.cacheKey!,
+                            generation: rebuilt.cacheGeneration!,
+                            fingerprint: rebuilt.cacheFingerprint || null,
+                        },
+                        sourceSnapshot: {
+                            ...(legacyRequest.sourceSnapshot || {}),
+                            cacheState: rebuilt.cacheState,
+                            totalSteps: rebuilt.totalSteps,
+                            ...(rebuilt.sourceRevision ? { authorityRevision: rebuilt.sourceRevision } : {}),
+                        },
+                    };
+                });
+                const migrated = await rebuild(request);
+                if (getConversationSourceCacheGenerationKind(migrated.cacheGeneration) !== "projection") {
+                    throw new Error(`legacy fetch 缓存重建后仍缺少 Record 投影: ${request.conversationId}`);
+                }
+                effectiveRequest = {
+                    ...request,
+                    cacheGeneration: migrated.cacheGeneration,
+                    sourceSnapshot: migrated.sourceSnapshot || request.sourceSnapshot,
+                } as ProductionSourceReadRequest;
+            }
+        }
+        const cached = verifiedCacheScan(effectiveRequest, scanId, maxContentBytes, now, contentHashesByAuthorityRevision);
+        if (cached) return cached;
         if (request.host === "codex") {
             const result = await collectCodexSourceEvidence({
                 conversationId: request.conversationId,

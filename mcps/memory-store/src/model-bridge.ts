@@ -100,15 +100,21 @@ async function cancelUnusedProviderLease(lease: ProviderTransportLease | undefin
     }
 }
 
-function getCodexCommand(): string {
-    const configuredCommand = process.env.MEMORY_STORE_CODEX_COMMAND;
+interface CodexCommandResolutionOptions {
+    configuredCommand?: string;
+    platform?: NodeJS.Platform;
+    localAppData?: string;
+}
+
+function resolveCodexCommand(options: CodexCommandResolutionOptions = {}): string {
+    const configuredCommand = options.configuredCommand ?? process.env.MEMORY_STORE_CODEX_COMMAND;
     if (configuredCommand) {
         const looksLikePath = path.isAbsolute(configuredCommand) || /[\\/]/u.test(configuredCommand);
         if (!looksLikePath || fs.existsSync(configuredCommand)) return configuredCommand;
     }
 
-    if (process.platform === "win32") {
-        const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local");
+    if ((options.platform ?? process.platform) === "win32") {
+        const localAppData = options.localAppData ?? process.env.LOCALAPPDATA ?? path.join(os.homedir(), "AppData", "Local");
         const binRoot = path.join(localAppData, "OpenAI", "Codex", "bin");
         try {
             const candidates = fs.readdirSync(binRoot, { withFileTypes: true })
@@ -124,6 +130,14 @@ function getCodexCommand(): string {
     }
 
     return "codex";
+}
+
+function getCodexCommand(): string {
+    return resolveCodexCommand();
+}
+
+export function resolveCodexCommandForTest(options: CodexCommandResolutionOptions = {}): string {
+    return resolveCodexCommand(options);
 }
 
 function getClaudeCodeCommand(): string {

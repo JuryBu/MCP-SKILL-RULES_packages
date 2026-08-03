@@ -16,6 +16,7 @@ import {
     type ExtraType,
 } from "./trajectory.js";
 import { materializeRoundAttachments, type ConversationAttachment } from "./conversation-attachments.js";
+import { iterateCachedConversationSourceCacheRounds, type ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { renderConversationPdf } from "./conversation-pdf.js";
 import type { BackgroundTaskContext } from "./background-tasks.js";
 import type { ResolvedConversationChain } from "./conversation-bridge.js";
@@ -30,6 +31,8 @@ export interface ConversationExportOptions {
     chainUsed: ResolvedConversationChain;
     rounds: ConversationRound[];
     totalSteps: number;
+    cacheKey?: ConversationSourceCacheKey;
+    cacheGeneration?: string;
     expandedChildren?: Array<{ thread: { id: string; title: string }; rounds: ConversationRound[] }>;
     childDiagnostics?: Array<{ threadId: string; nickname?: string; reason: string; detail: string }>;
     partialWarning?: string;
@@ -106,6 +109,22 @@ function safeSegment(input: string): string {
 function atomicWriteText(filePath: string, content: string): void {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
     writeTextAtomic(filePath, content);
+}
+
+function readCachedRounds(
+    options: Pick<ConversationExportOptions, "cacheKey" | "cacheGeneration">,
+    startRound?: number,
+    endRound?: number,
+) {
+    if (!options.cacheKey || !options.cacheGeneration) return null;
+    const cached = iterateCachedConversationSourceCacheRounds<ConversationRound>({
+        key: options.cacheKey,
+        generation: options.cacheGeneration,
+        startRound,
+        endRound,
+    });
+    if (!cached) throw new Error("export fetch 缓存轮次文件缺失或损坏");
+    return cached;
 }
 
 function throwIfExportAborted(
@@ -369,21 +388,32 @@ function copyAsset(
     return result;
 }
 
-function collectAndRewriteAssets(
-    rounds: ConversationRound[],
-    exportDir: string,
-    includeAssets: boolean,
-    shouldAbort?: () => boolean,
-): { rounds: ConversationRound[]; assets: ConversationExportAsset[]; warnings: string[] } {
-    const warnings: string[] = [];
-    const cloned = rounds.map(cloneRound);
-    if (!includeAssets) return { rounds: cloned, assets: [], warnings };
-    const budget = {
+interface AssetCopyBudget {
+    remainingCount: number;
+    remainingBytes: number;
+    maxBytes: number;
+    copiedByKey: Map<string, ConversationExportAsset>;
+}
+
+function createAssetCopyBudget(): AssetCopyBudget {
+    return {
         remainingCount: Math.max(0, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_ASSETS || DEFAULT_MAX_ASSETS)),
         remainingBytes: Math.max(1, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_TOTAL_ASSET_BYTES || DEFAULT_MAX_TOTAL_ASSET_BYTES)),
         maxBytes: Math.max(1, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_ASSET_BYTES || DEFAULT_MAX_ASSET_BYTES)),
         copiedByKey: new Map<string, ConversationExportAsset>(),
     };
+}
+
+function collectAndRewriteAssets(
+    rounds: ConversationRound[],
+    exportDir: string,
+    includeAssets: boolean,
+    shouldAbort?: () => boolean,
+    budget: AssetCopyBudget = createAssetCopyBudget(),
+): { rounds: ConversationRound[]; assets: ConversationExportAsset[]; warnings: string[] } {
+    const warnings: string[] = [];
+    const cloned = rounds.map(cloneRound);
+    if (!includeAssets) return { rounds: cloned, assets: [], warnings };
     const assets: ConversationExportAsset[] = [];
 
     for (const round of cloned) {
@@ -448,12 +478,32 @@ function formatAssetAppendix(assets: ConversationExportAsset[]): string {
     return lines.join("\n");
 }
 
-function buildMarkdown(options: ConversationExportOptions, rounds: ConversationRound[], assets: ConversationExportAsset[], warnings: string[], rangeLabel: string): string {
+function formatRoundForExport(
+    round: ConversationRound,
+    depth: Depth,
+    extraTypes: ExtraType[],
+    roleFilter: Set<ConversationMessageRole>,
+    compactionMode: CompactionMode,
+): string {
+    return roleFilter.size > 0
+        ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
+        : formatRound(round, depth, extraTypes, {
+            compactionMode,
+            attachmentMode: "markdown",
+        });
+}
+
+function buildMarkdownHeader(
+    options: ConversationExportOptions,
+    warnings: string[],
+    rangeLabel: string,
+    totalRounds: number = options.rounds.length,
+    streamed = false,
+): string {
     const lines: string[] = [];
     const depth = options.depth || "normal";
     const extraTypes = options.extraTypes || [];
     const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
-    const roleFilter = normalizeMessageRoles(options.messageRoles);
     lines.push("# Conversation Export");
     lines.push("");
     lines.push("## Export Metadata");
@@ -462,7 +512,7 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     lines.push(`- dataChain: ${options.chainUsed}`);
     lines.push(`- exportedAt: ${new Date().toISOString()}`);
     lines.push(`- scope: ${options.scope || "full"}`);
-    lines.push(`- rounds: ${rangeLabel} / total ${options.rounds.length}`);
+    lines.push(`- rounds: ${rangeLabel} / total ${totalRounds}`);
     lines.push(`- totalSteps: ${options.totalSteps}`);
     lines.push(`- depth: ${depth}`);
     lines.push(`- extraTypes: ${extraTypes.join(", ") || "(none)"}`);
@@ -478,32 +528,27 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     }
     lines.push("## Conversation");
     lines.push("");
-    lines.push(formatOverview(options.conversationId, options.rounds, options.totalSteps));
+    lines.push(streamed
+        ? `📂 对话: ${options.conversationId}\n📊 统计: ${totalRounds} 轮对话 | ${options.totalSteps} 步骤 | 按缓存逐轮流式导出`
+        : formatOverview(options.conversationId, options.rounds, options.totalSteps));
     lines.push(`🔗 数据链路: ${options.chainUsed}`);
     lines.push("");
-    for (const round of rounds) {
-        const formatted = roleFilter.size > 0
-            ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
-            : formatRound(round, depth, extraTypes, {
-                compactionMode,
-                attachmentMode: "markdown",
-            });
-        if (!formatted) continue;
-        lines.push(formatted);
-        lines.push("");
-    }
+    return lines.join("\n");
+}
+
+function buildMarkdownTail(options: ConversationExportOptions, assets: ConversationExportAsset[]): string {
+    const lines: string[] = [];
+    const depth = options.depth || "normal";
+    const extraTypes = options.extraTypes || [];
+    const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
+    const roleFilter = normalizeMessageRoles(options.messageRoles);
     if (options.expandedChildren?.length) {
         lines.push("# 子代理线程展开");
         lines.push("");
         for (const child of options.expandedChildren) {
             lines.push(`## 子线程 ${child.thread.id.slice(0, 8)}... ${child.thread.title ? `| ${child.thread.title}` : ""}`);
             for (const round of child.rounds) {
-                const formatted = roleFilter.size > 0
-                    ? formatRoundForMessageRoles(round, depth, extraTypes, roleFilter, compactionMode)
-                    : formatRound(round, depth, extraTypes, {
-                        compactionMode,
-                        attachmentMode: "markdown",
-                    });
+                const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode);
                 if (!formatted) continue;
                 lines.push(formatted);
                 lines.push("");
@@ -523,40 +568,196 @@ function buildMarkdown(options: ConversationExportOptions, rounds: ConversationR
     return lines.join("\n");
 }
 
+function buildMarkdown(
+    options: ConversationExportOptions,
+    rounds: ConversationRound[],
+    assets: ConversationExportAsset[],
+    warnings: string[],
+    rangeLabel: string,
+    totalRounds: number = options.rounds.length,
+): string {
+    const depth = options.depth || "normal";
+    const extraTypes = options.extraTypes || [];
+    const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
+    const roleFilter = normalizeMessageRoles(options.messageRoles);
+    const lines = [buildMarkdownHeader(options, warnings, rangeLabel, totalRounds)];
+    for (const round of rounds) {
+        const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode);
+        if (!formatted) continue;
+        lines.push(formatted, "");
+    }
+    lines.push(buildMarkdownTail(options, assets));
+    return lines.join("\n");
+}
+
+interface StreamedMarkdownResult {
+    markdownPath: string;
+    markdownChars: number;
+    roundsExported: number;
+    totalRounds: number;
+    startRound: number | null;
+    endRound: number | null;
+    assets: ConversationExportAsset[];
+}
+
+async function streamCachedFullMarkdown(
+    options: ConversationExportOptions,
+    cached: NonNullable<ReturnType<typeof readCachedRounds>>,
+    exportDir: string,
+    warnings: string[],
+): Promise<StreamedMarkdownResult> {
+    const markdownPath = path.join(exportDir, "conversation.md");
+    const temporaryPath = `${markdownPath}.${process.pid}.tmp`;
+    const maxChars = Math.max(10_000, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS || DEFAULT_MAX_EXPORT_CHARS));
+    const depth = options.depth || "normal";
+    const extraTypes = options.extraTypes || [];
+    const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
+    const roleFilter = normalizeMessageRoles(options.messageRoles);
+    const assetBudget = createAssetCopyBudget();
+    const assets: ConversationExportAsset[] = [];
+    const handle = await fs.promises.open(temporaryPath, "w");
+    let markdownChars = 0;
+    let roundsExported = 0;
+    let startRound: number | null = null;
+    let endRound: number | null = null;
+    let closed = false;
+    const write = async (content: string): Promise<void> => {
+        if (markdownChars + content.length > maxChars) {
+            throw new Error(`conversation export exceeds MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS=${maxChars} (${markdownChars + content.length} chars); narrow the export scope or raise the explicit limit`);
+        }
+        await handle.write(content);
+        markdownChars += content.length;
+    };
+    try {
+        await write(`${buildMarkdownHeader(options, warnings, `1-${cached.roundCount}`, cached.roundCount, true)}\n`);
+        for (const round of cached.rounds) {
+            throwIfExportAborted(options, `cache round ${round.roundIndex}`);
+            const materialized = await materializeRoundAttachments([round], options.conversationId, {
+                shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+            });
+            if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
+            const rewritten = collectAndRewriteAssets(
+                materialized.rounds,
+                exportDir,
+                options.includeAssets !== false,
+                () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+                assetBudget,
+            );
+            warnings.push(...rewritten.warnings);
+            assets.push(...rewritten.assets);
+            const exportedRound = rewritten.rounds[0];
+            if (exportedRound) {
+                const formatted = formatRoundForExport(exportedRound, depth, extraTypes, roleFilter, compactionMode);
+                if (formatted) await write(`${formatted}\n\n`);
+            }
+            roundsExported += 1;
+            startRound ??= round.roundIndex;
+            endRound = round.roundIndex;
+        }
+        if (warnings.length > 0) {
+            await write(`## Export Warnings\n\n${warnings.map(warning => `- ${warning}`).join("\n")}\n\n`);
+        }
+        await write(buildMarkdownTail(options, assets));
+        await handle.close();
+        closed = true;
+        fs.renameSync(temporaryPath, markdownPath);
+        return { markdownPath, markdownChars, roundsExported, totalRounds: cached.roundCount, startRound, endRound, assets };
+    } catch (error) {
+        if (!closed) await handle.close();
+        fs.rmSync(temporaryPath, { force: true });
+        throw error;
+    }
+}
+
 export async function exportConversation(options: ConversationExportOptions): Promise<ConversationExportResult> {
     const format = options.format || "markdown";
     const includeAssets = options.includeAssets !== false;
     const warnings: string[] = [];
     throwIfExportAborted(options, "export directory setup");
     const exportDir = resolveExportDirectory(options);
-    throwIfExportAborted(options, "round selection");
-    const selected = await selectRounds(options);
-    warnings.push(...selected.warnings);
+    const scope = options.scope || "full";
+    let markdownPath: string;
+    let markdownChars: number;
+    let assets: ConversationExportAsset[];
+    let totalRounds: number;
+    let roundsExported: number;
+    let exportedStartRound: number | null;
+    let exportedEndRound: number | null;
 
-    throwIfExportAborted(options, "attachment materialization");
-    const materialized = await materializeRoundAttachments(selected.rounds, options.conversationId, {
-        shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
-    });
-    if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
-    throwIfExportAborted(options, "asset rewrite");
-    const assetResult = collectAndRewriteAssets(
-        materialized.rounds,
-        exportDir,
-        includeAssets,
-        () => Boolean(options.isCancelled?.() || options.isSettled?.()),
-    );
-    warnings.push(...assetResult.warnings);
+    const cachedFull = scope === "full" ? readCachedRounds(options) : null;
+    if (cachedFull) {
+        throwIfExportAborted(options, "cached full export");
+        const streamed = await streamCachedFullMarkdown(options, cachedFull, exportDir, warnings);
+        markdownPath = streamed.markdownPath;
+        markdownChars = streamed.markdownChars;
+        assets = streamed.assets;
+        totalRounds = streamed.totalRounds;
+        roundsExported = streamed.roundsExported;
+        exportedStartRound = streamed.startRound;
+        exportedEndRound = streamed.endRound;
+    } else {
+        throwIfExportAborted(options, "round selection");
+        let selected: Awaited<ReturnType<typeof selectRounds>>;
+        let markdownOptions = options;
+        totalRounds = options.rounds.length;
+        if (scope === "rounds") {
+            const startRound = Math.max(1, options.startRound || 1);
+            const endRound = options.endRound || undefined;
+            if (endRound !== undefined && endRound < startRound) {
+                selected = { rounds: [], warnings: [`轮次范围 ${startRound}-${endRound} 为空`], rangeLabel: `${startRound}-${endRound}` };
+            } else {
+                const cachedRange = readCachedRounds(options, startRound, endRound);
+                if (cachedRange) {
+                    const effectiveEnd = Math.min(cachedRange.roundCount, endRound || cachedRange.roundCount);
+                    selected = startRound > effectiveEnd
+                        ? { rounds: [], warnings: [`轮次范围 ${startRound}-${effectiveEnd} 为空`], rangeLabel: `${startRound}-${effectiveEnd}` }
+                        : { rounds: Array.from(cachedRange.rounds), warnings: [], rangeLabel: `${startRound}-${effectiveEnd}` };
+                    totalRounds = cachedRange.roundCount;
+                } else {
+                    selected = await selectRounds(options);
+                }
+            }
+        } else if (scope === "search") {
+            const cachedSearch = readCachedRounds(options);
+            if (cachedSearch) {
+                markdownOptions = { ...options, rounds: Array.from(cachedSearch.rounds) };
+                totalRounds = cachedSearch.roundCount;
+            }
+            selected = await selectRounds(markdownOptions);
+        } else {
+            selected = await selectRounds(options);
+        }
+        warnings.push(...selected.warnings);
 
-    let markdown = buildMarkdown(options, assetResult.rounds, assetResult.assets, warnings, selected.rangeLabel);
-    const maxChars = Math.max(10_000, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS || DEFAULT_MAX_EXPORT_CHARS));
-    if (markdown.length > maxChars) {
-        markdown = `${markdown.slice(0, maxChars)}\n\n⚠️ 导出正文超过 MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS=${maxChars}，已截断。\n`;
-        warnings.push(`导出正文超过 ${maxChars} 字，Markdown 已截断`);
+        throwIfExportAborted(options, "attachment materialization");
+        const materialized = await materializeRoundAttachments(selected.rounds, options.conversationId, {
+            shouldAbort: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+        });
+        if (materialized.truncated > 0) warnings.push(`${materialized.truncated} 个内联图片超过 materialize 预算，未生成导出图片`);
+        throwIfExportAborted(options, "asset rewrite");
+        const assetResult = collectAndRewriteAssets(
+            materialized.rounds,
+            exportDir,
+            includeAssets,
+            () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+        );
+        warnings.push(...assetResult.warnings);
+
+        const markdown = buildMarkdown(markdownOptions, assetResult.rounds, assetResult.assets, warnings, selected.rangeLabel, totalRounds);
+        const maxChars = Math.max(10_000, Number(process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS || DEFAULT_MAX_EXPORT_CHARS));
+        if (markdown.length > maxChars) {
+            throw new Error(`conversation export exceeds MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS=${maxChars} (${markdown.length} chars); narrow the export scope or raise the explicit limit`);
+        }
+
+        markdownPath = path.join(exportDir, "conversation.md");
+        throwIfExportAborted(options, "markdown write");
+        atomicWriteText(markdownPath, markdown);
+        markdownChars = markdown.length;
+        assets = assetResult.assets;
+        roundsExported = selected.rounds.length;
+        exportedStartRound = selected.rounds[0]?.roundIndex || null;
+        exportedEndRound = selected.rounds[selected.rounds.length - 1]?.roundIndex || null;
     }
-
-    const markdownPath = path.join(exportDir, "conversation.md");
-    throwIfExportAborted(options, "markdown write");
-    atomicWriteText(markdownPath, markdown);
 
     let pdfPath: string | undefined;
     let htmlPath: string | undefined;
@@ -570,7 +771,7 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             markdownPath,
             pdfPath: targetPdfPath,
             embedAttachments: options.pdfEmbedAttachments || "auto",
-            attachmentFiles: assetResult.assets
+            attachmentFiles: assets
                 .filter(asset => asset.kind === "file" && asset.exportPath)
                 .map(asset => ({ path: asset.exportPath || "", name: asset.displayName, sizeBytes: asset.sizeBytes })),
         });
@@ -591,11 +792,11 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         extraTypes: options.extraTypes || [],
         messageRoles: options.messageRoles || [],
         compactionMode: options.compactionMode || ((options.depth || "normal") === "full" ? "full" : "folded"),
-        startRound: selected.rounds[0]?.roundIndex || null,
-        endRound: selected.rounds[selected.rounds.length - 1]?.roundIndex || null,
-        totalRounds: options.rounds.length,
+        startRound: exportedStartRound,
+        endRound: exportedEndRound,
+        totalRounds,
         totalSteps: options.totalSteps,
-        roundsExported: selected.rounds.length,
+        roundsExported,
         partial: Boolean(options.partialWarning) || warnings.length > 0,
         partialWarning: options.partialWarning || null,
         warnings,
@@ -604,11 +805,11 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             pdf: pdfPath || null,
             html: htmlPath || null,
         },
-        assets: assetResult.assets,
+        assets,
         stats: {
-            markdownChars: markdown.length,
-            assetsCopied: assetResult.assets.filter(asset => asset.exportPath).length,
-            assetsSkipped: assetResult.assets.filter(asset => asset.warning && !asset.exportPath).length,
+            markdownChars,
+            assetsCopied: assets.filter(asset => asset.exportPath).length,
+            assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
         },
     };
@@ -626,12 +827,12 @@ export async function exportConversation(options: ConversationExportOptions): Pr
         manifestPath,
         warnings,
         stats: {
-            roundsExported: selected.rounds.length,
-            totalRounds: options.rounds.length,
+            roundsExported,
+            totalRounds,
             totalSteps: options.totalSteps,
-            markdownChars: markdown.length,
-            assetsCopied: assetResult.assets.filter(asset => asset.exportPath).length,
-            assetsSkipped: assetResult.assets.filter(asset => asset.warning && !asset.exportPath).length,
+            markdownChars,
+            assetsCopied: assets.filter(asset => asset.exportPath).length,
+            assetsSkipped: assets.filter(asset => asset.warning && !asset.exportPath).length,
             embeddedPdfAttachments,
         },
     };

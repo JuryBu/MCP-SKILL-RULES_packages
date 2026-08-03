@@ -235,6 +235,8 @@ export interface GenerateRecordOptions {
     allowClaudeCodeFallback?: boolean;
     parallelMode?: RecordParallelMode;
     force?: boolean;
+    sourceRoundStart?: number;
+    sourceTotalRounds?: number;
     isCancelled?: () => boolean;
     isSettled?: () => boolean;
     onProgress?: (progress: {

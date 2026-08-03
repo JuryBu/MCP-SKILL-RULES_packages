@@ -3120,6 +3120,17 @@ export function windsurfStepsToConversationRounds(steps: unknown[]): Conversatio
             continue;
         }
 
+        if (type === "CORTEX_STEP_TYPE_MODEL_RESPONSE") {
+            const modelResponse = asRecord(step.modelResponse);
+            currentRound.aiResponses.push({
+                stepIndex: index,
+                response: toStringValue(modelResponse.response || modelResponse.text || step.response || step.text),
+                thinking: toStringValue(modelResponse.thinking || step.thinking),
+                toolCalls: [],
+            });
+            continue;
+        }
+
         attachWindsurfToolStep(currentRound, step, index);
     }
 

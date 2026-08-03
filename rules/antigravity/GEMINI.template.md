@@ -49,7 +49,7 @@ memory_query、record_manage(action="search")、conversation_read_original(actio
 Codex 轮询：sandbox_codex(action="check") 建议 30-60s 间隔
 大文件操作：超过 100 行的 Plan/Task 文件修改时用精确行号替换，100 行以内可全文重写
 记忆恢复：批量查询用 depth=summary 级别概览，重要单条可直接 depth=full
-conversation_read_original：优先 search 定位，read 时单次范围建议不超过 50KB，仍然不建议 fetch 全量（全量对话可能几百 KB 浪费上下文）
+conversation_read_original：`fetch` 负责建立或更新可复用的规范化缓存，后续 search/read/full/diff 都从同一份缓存派生，不重复解析原始源。单次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默丢内容；`maxBytes` 仍可显式收紧或放宽。
 
 关于上下文恢复的工具优先级
 跨对话上下文恢复优先使用 MCP memory-store，而非系统内置的 persistent_context 机制。
@@ -78,7 +78,7 @@ conversation_read_original：优先 search 定位，read 时单次范围建议�
 - 后台任务轮询不要把 `waitSeconds` 设到 60 秒以上；Codex MCP 客户端自身通常有约 60 秒请求上限，建议用 30-45 秒短轮询
 
 关于对话原文读取
-当前已部署 conversation_read_original 工具（v1.4+），可绕过 CHECKPOINT 上下文压缩机制，通过 Language Server 本地 API 读取对话的真实完整内容。
+当前已部署 conversation_read_original 工具（v1.22+），可绕过 CHECKPOINT 上下文压缩机制，并为 Codex、Claude Code、Windsurf、Antigravity 建立同结构的持久 fetch 缓存。`source="auto"` 以本地 JSONL/PB 为一等来源并按需比较 LS，`local` 只读本地源，`ls` 仅用于 Windsurf/Antigravity，`cache` 只读上一份完整可用的 fetch 缓存。
 v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）；Antigravity LS 环境下 fetch 后新增轮次≥3 自动后台触发 Record 更新。Codex wrapper 环境默认关闭隐式自动 Record，需要显式调用 record_manage(action="update", dataChain="codex", modelChain="codex", conversationId="...", background=true)。
 - 触发场景（应主动使用）：
   · CHECKPOINT 压缩后需要恢复丢失的上下文细节（最常见场景）
@@ -97,7 +97,7 @@ v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）
   3. 仅当需要更多细节时 → read(startRound=N, endRound=M, depth="normal") 精读 search 中未覆盖的轮次
   4. 仍需思考过程/工具结果 → read(..., depth="full", extraTypes=["thinking"]) 深度查看
   · 不需要手动 fetch，search/read 会自动触发拉取
-  · 默认不传 conversationId 即读取当前对话（被压缩的上下文恢复场景）
+  · fetch/search/read/export 必须显式传稳定 `conversationId`；共享 broker 后端不能安全推断调用方的“当前对话”
   · extraTypes（thinking/tool_results/code_diffs）体积大，仅在明确需要时拉取
   · 读取对话历史时如果遇到图片/附件路径（如临时目录下的 .png、.jpg 文件），要主动用 view_file 查看内容，不要只报路径给用户——图片往往是理解对话上下文的关键信息
 - 与 memory_query 的分工：
@@ -112,11 +112,12 @@ v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）
 关于对话记录 Record（v1.8+）
 Record 是对话粒度的结构化过程日志（Phase-based），由 Flash 自动生成，永久存储在 records/ 目录，抗 LS 过期。
 - 用 record_manage(action="update") 手动触发生成/更新当前或指定对话的 Record；需要跨组合时用 `dataChain` 指定对话来源、`modelChain` 指定生成模型；跨链路走 Codex 模型时建议加 `background=true`，再用 `record_manage(action="task_status", taskId="...", waitSeconds=45)` 查询；Codex 后台 Record 每批模型调用默认允许 5 分钟，可用 `MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT` 覆盖
+- Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record/Guard 从排队、恢复到完成始终查询首次返回的同一公开 taskId，不因重试或后端恢复重复新建任务
 - record_manage 支持 9 个 action: update/list/read/search/edit/delete/batch_update/batch_delete/task_status
 - 自动触发：Antigravity LS 环境下所有工具调用自动节流检查（60s 间隔），当前对话轮次增量≥3 后台异步更新 Record；Codex wrapper 环境默认只响应显式 record_manage update
 - Flash 重试：首次失败自动等 5s 重试 1 次，降低随机超时失败率
 - 批量更新：batch_update 后台 2 并发 worker 池，waitSeconds 等待查询进度
-- LS 对话数据不可用时 conversation_read_original 自动降级读取 Record
+- 原始源暂时不可用时可显式 `source="cache"` 读取上一份完整可用的 fetch 缓存；Record 是独立的结构化过程日志，只在没有原文缓存、且任务只需过程摘要时作为降级材料，不能冒充完整原文
 - 编辑 Record 时 append 模式会自动标记 [手动补充]，后续 Flash 更新会保留这些内容
 - Record 定位：介于原始对话（太重）和精炼记忆（太轻）之间的中等粒度日志，适合查阅历史操作决策过程
 - `record_manage`、`conversation_golden_extract`、`conversation_read_original` 这些工具在支持双向跨链路后，默认优先使用 `chain="auto"`；需要跨宿主取数或验证时再显式指定 `dataChain` / `modelChain`

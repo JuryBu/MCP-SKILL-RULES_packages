@@ -1,6 +1,7 @@
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { randomUUID } from "node:crypto";
 
 /**
  * MCP Memory Store 临时文件管理器
@@ -19,7 +20,7 @@ import fs from "fs";
 // 数据根目录（与 store.ts 共享，算法保持一致：优先读隔离 env，否则回退默认）
 // 测试隔离时设置 MEMORY_STORE_DATA_ROOT 后，失败/诊断路径的 saveTempFile 才不会污染真实库。
 const DATA_ROOT = process.env.MEMORY_STORE_DATA_ROOT
-    || path.join(process.env.CODEX_TOOLKIT_DATA_ROOT || path.join(os.homedir(), ".codex-toolkit"), "memory-store");
+    || path.join(os.homedir(), ".gemini", "antigravity", "memory-store");
 export const TEMP_DIR = path.join(DATA_ROOT, "temp");
 
 // 文件最大存活时间
@@ -44,7 +45,7 @@ function generateTempFilename(prefix: string, slug: string): string {
     const ts = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, "0")}${String(now.getDate()).padStart(2, "0")}-${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}${String(now.getSeconds()).padStart(2, "0")}`;
     // 清理 slug 中的特殊字符
     const safeSlug = slug.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]/g, "").slice(0, 30);
-    return `${prefix}_${ts}_${safeSlug}.md`;
+    return `${prefix}_${ts}_${safeSlug}_${process.pid}_${randomUUID().slice(0, 8)}.md`;
 }
 
 /**
@@ -60,11 +61,14 @@ export function saveTempFile(prefix: string, slug: string, content: string): str
 }
 
 export async function saveTempFileAsync(prefix: string, slug: string, content: string): Promise<string> {
-    await fs.promises.mkdir(TEMP_DIR, { recursive: true });
-    const filename = generateTempFilename(prefix, slug);
-    const filePath = path.join(TEMP_DIR, filename);
+    const filePath = await createTempFilePathAsync(prefix, slug);
     await fs.promises.writeFile(filePath, content, "utf-8");
     return filePath;
+}
+
+export async function createTempFilePathAsync(prefix: string, slug: string): Promise<string> {
+    await fs.promises.mkdir(TEMP_DIR, { recursive: true });
+    return path.join(TEMP_DIR, generateTempFilename(prefix, slug));
 }
 
 /**

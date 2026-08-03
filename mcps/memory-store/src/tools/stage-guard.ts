@@ -15,9 +15,12 @@ import {
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type DataChain } from "../chain.js";
 import { loadConversationData } from "../conversation-bridge.js";
 import {
+    cancelBackgroundTask,
     formatBackgroundTask,
+    getBackgroundTask,
     registerBackgroundTaskRecoveryHandler,
     startBackgroundTask,
+    stableJsonHash,
     waitForBackgroundTask,
 } from "../background-tasks.js";
 import type { BackgroundTaskContext } from "../background-tasks.js";
@@ -81,7 +84,7 @@ const StageGuardSchema = z.object({
         background: z.boolean().optional()
             .describe("check 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时保持同步；Guard 默认不自动后台化"),
     taskId: z.string().optional()
-        .describe("查询后台 Guard 检查任务的 taskId"),
+        .describe("check 时查询、cancel 时取消同一个后台 Guard 检查任务的 taskId"),
     waitSeconds: z.number().optional()
         .describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
 });
@@ -171,13 +174,32 @@ function summarizeLockResults(results: Array<{ file: string; result: GuardLockOp
     });
 }
 
+type GuardConversationLoader = typeof loadConversationData;
+let guardConversationLoader: GuardConversationLoader = loadConversationData;
+
+type GuardCheckRunner = typeof runGuardCheck;
+let guardCheckRunner: GuardCheckRunner = runGuardCheck;
+
+export function __testSetStageGuardConversationLoader(loader?: GuardConversationLoader): void {
+    guardConversationLoader = loader || loadConversationData;
+}
+
+export function __testSetStageGuardCheckRunner(runner?: GuardCheckRunner): void {
+    guardCheckRunner = runner || runGuardCheck;
+}
+
 async function resolveGuardConversationId(params: z.infer<typeof StageGuardSchema>) {
     const dataChain = resolveDataChain(params);
-    const loaded = await loadConversationData(dataChain, params.conversationId, { link: "summary" });
+    const loaded = await guardConversationLoader(dataChain, params.conversationId, {
+        link: "summary",
+        source: "cache",
+        includeRounds: false,
+    });
     return {
         conversationId: loaded?.conversationId || params.conversationId || "",
         dataChain: loaded?.chainUsed || dataChain,
-        roundsLength: loaded?.rounds.length || 0,
+        roundsLength: loaded?.roundCount ?? loaded?.rounds.length ?? 0,
+        cacheAvailable: Boolean(loaded),
     };
 }
 
@@ -201,9 +223,15 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
         return text(`❌ 文件不存在:\n${missing.map(f => `  - ${f}`).join("\n")}`);
     }
 
-    const resolved = await resolveGuardConversationId(params);
+    const hasExplicitStartBoundary = Boolean(params.conversationId?.trim() && Number.isFinite(params.startRound) && (params.startRound || 0) > 0);
+    const resolved = hasExplicitStartBoundary
+        ? { conversationId: params.conversationId!.trim(), dataChain: resolveDataChain(params), roundsLength: 0, cacheAvailable: false }
+        : await resolveGuardConversationId(params);
     if (!resolved.conversationId) {
         return text(`❌ 无法通过当前宿主链路确定要守卫的对话`);
+    }
+    if (!hasExplicitStartBoundary && params.startRound === undefined && !resolved.cacheAvailable) {
+        return text("❌ Stage Guard start 不读取对话正文；当前没有可用 fetch 缓存元数据，请先 fetch 或显式传 startRound。");
     }
     const conversationId = resolved.conversationId;
     const scopeSelectors = normalizeScopeSelectors(params.scopeSelectors);
@@ -380,18 +408,31 @@ function finalizeGuardPassReceipt(receipt: StageGuardPassReceipt, recovered: boo
         && currentState.stageId === receipt.stageId
         && currentState.childScopeId === normalizeChildScopeId(childScopeId)
         && (receipt.version === 1 || currentState.guardId === receipt.guardId));
-    if (!receiptMatchesCurrent || !currentState) {
+    if (currentState && !receiptMatchesCurrent) {
         throw new Error("Guard PASS receipt 已过期，拒绝清理较新的 Guard 状态");
     }
+    const receiptState: GuardState = currentState || {
+        active: false,
+        guardId: receipt.version === 2 ? receipt.guardId : `receipt:${receipt.conversationId}:${receipt.guardStartedAt}`,
+        conversationId: receipt.conversationId,
+        stageId: receipt.stageId,
+        childScopeId: normalizeChildScopeId(childScopeId),
+        scopeSelectors: receipt.version === 2 ? [...receipt.scopeSelectors] : [],
+        taskFiles: [...receipt.taskFiles],
+        planFiles: [],
+        startRound: 0,
+        startedAt: receipt.guardStartedAt,
+        checkHistory: [],
+    };
     const lockResults = receipt.taskFiles.map(file => ({
         file,
-        result: removeLockMark(file, currentState),
+        result: removeLockMark(file, receiptState),
     }));
     if (lockResults.some(item => !item.result.ok)) {
         throw new Error("Guard PASS receipt 未能完整移除本 Guard 锁，已保留 Guard 状态便于恢复");
     }
     const remainingLocks = lockResults.reduce((sum, item) => sum + Math.max(0, item.result.lockCount), 0);
-    if (!clearGuardState(currentState)) {
+    if (currentState && !clearGuardState(currentState)) {
         throw new Error("Guard PASS receipt 未能清理本 Guard 状态，已停止收口");
     }
     return [
@@ -429,6 +470,71 @@ function buildStageGuardCheckResumePayload(
         evidenceAssets: params.evidenceAssets ? params.evidenceAssets.map(asset => ({ ...asset })) : undefined,
         evidenceIndexMode: params.evidenceIndexMode,
     };
+}
+
+function normalizeOptionalText(value?: string): string | undefined {
+    const normalized = value?.trim();
+    return normalized || undefined;
+}
+
+function normalizeStringList(values?: string[]): string[] | undefined {
+    const normalized = [...new Set((values || []).map(value => value.trim()).filter(Boolean))].sort();
+    return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeEvidenceFiles(files?: string[]): string[] | undefined {
+    const normalized = [...new Set((files || [])
+        .map(file => normalizeOptionalText(file))
+        .filter((file): file is string => Boolean(file))
+        .map(file => path.resolve(file)))].sort();
+    return normalized.length > 0 ? normalized : undefined;
+}
+
+function normalizeEvidenceAssets(
+    assets?: z.infer<typeof StageGuardSchema>["evidenceAssets"],
+): Array<Record<string, unknown>> | undefined {
+    const byHash = new Map<string, Record<string, unknown>>();
+    for (const asset of assets || []) {
+        const normalized = {
+            path: path.resolve(asset.path.trim()),
+            label: normalizeOptionalText(asset.label),
+            type: normalizeOptionalText(asset.type),
+            role: normalizeOptionalText(asset.role),
+            range: normalizeOptionalText(asset.range),
+            maxChars: asset.maxChars,
+        };
+        const hash = stableJsonHash(normalized);
+        if (!byHash.has(hash)) byHash.set(hash, normalized);
+    }
+    return byHash.size > 0
+        ? [...byHash.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([, asset]) => asset)
+        : undefined;
+}
+
+function makeStageGuardCheckTaskId(
+    params: z.infer<typeof StageGuardSchema>,
+    state: GuardState,
+): string {
+    const effectiveModelChain = params.modelChain
+        ? resolveModelChain(params)
+        : (state.modelChain || resolveModelChain(params));
+    const normalizedInput = {
+        version: 1,
+        guardId: state.guardId,
+        conversationId: state.conversationId,
+        stageId: state.stageId,
+        childScopeId: state.childScopeId,
+        scopeSelectors: normalizeStringList(state.scopeSelectors),
+        dataChain: resolveDataChain(params),
+        modelChain: effectiveModelChain,
+        appealNote: normalizeOptionalText(params.appealNote),
+        evidence: normalizeOptionalText(params.evidence),
+        evidenceFiles: normalizeEvidenceFiles(params.evidenceFiles),
+        evidenceAssets: normalizeEvidenceAssets(params.evidenceAssets),
+        evidenceIndexMode: params.evidenceIndexMode || "auto",
+    };
+    const guardKey = stableJsonHash({ guardId: state.guardId }).slice(0, 24);
+    return `stage-guard-check-${guardKey}-${stableJsonHash(normalizedInput)}`;
 }
 
 function isStageGuardCheckResumePayload(value: unknown): value is StageGuardCheckResumePayload {
@@ -481,16 +587,23 @@ function receiptMatchesPayload(receipt: StageGuardPassReceipt, payload: StageGua
 }
 
 function findCommittedCheckFromSameRun(
+    taskId: string,
     taskStartedAt: string,
     state: GuardState,
 ): GuardCheckHistoryItem | null {
-    const taskStartedMs = new Date(taskStartedAt).getTime();
-    if (!Number.isFinite(taskStartedMs)) return null;
-    const latest = state.checkHistory[state.checkHistory.length - 1];
-    if (!latest) return null;
-    const checkedAtMs = new Date(latest.checkedAt).getTime();
-    if (!Number.isFinite(checkedAtMs) || checkedAtMs < taskStartedMs) return null;
-    return latest;
+    const exact = [...state.checkHistory].reverse().find(item => item.taskId === taskId);
+    if (exact) return exact;
+    const startedAtMs = Date.parse(taskStartedAt);
+    if (!Number.isFinite(startedAtMs)) return null;
+    const legacyCandidates = state.checkHistory.filter(item => (
+        !item.taskId
+        && Number.isFinite(Date.parse(item.checkedAt))
+        && Date.parse(item.checkedAt) >= startedAtMs
+    ));
+    if (legacyCandidates.length > 1) {
+        throw new Error("Guard 恢复发现多条缺少 taskId 的历史结果，无法安全判定同一次检查");
+    }
+    return legacyCandidates[0] || null;
 }
 
 function formatRecoveredCommittedGuardCheck(
@@ -538,7 +651,7 @@ registerBackgroundTaskRecoveryHandler("stage-guard-check", async (task) => {
     }
     const payload = task.resumePayload;
     return {
-        mode: "restart",
+        mode: "resume",
         run: async (taskContext) => {
             const passReceipt = readGuardPassReceipt(task.id);
             if (passReceipt) {
@@ -558,7 +671,7 @@ registerBackgroundTaskRecoveryHandler("stage-guard-check", async (task) => {
             if (!resumePayloadMatchesState(state, payload)) {
                 throw new Error("Guard 状态与恢复 payload 不匹配，无法安全恢复本次检查");
             }
-            const committed = findCommittedCheckFromSameRun(task.startedAt, state);
+            const committed = findCommittedCheckFromSameRun(task.id, task.startedAt, state);
             if (committed) {
                 return formatRecoveredCommittedGuardCheck(state, committed);
             }
@@ -578,7 +691,7 @@ async function handleCheck(
     backgroundModel = false,
     taskContext?: Pick<BackgroundTaskContext, "taskId" | "isCancelled" | "isSettled">,
     expectedGuard?: GuardState,
-) {
+): Promise<ReturnType<typeof text>> {
     if (params.taskId) {
         const task = await waitForBackgroundTask(params.taskId, params.waitSeconds || 0);
         return text(formatBackgroundTask(task));
@@ -598,7 +711,12 @@ async function handleCheck(
     // 仅显式 background=true 时才转后台。
     if (decision.useBackground) {
         const resumePayload = buildStageGuardCheckResumePayload(params, state);
-        const task = startBackgroundTask("stage-guard-check", async (backgroundTaskContext) => {
+        const taskId = makeStageGuardCheckTaskId(params, state);
+        const existingTask = getBackgroundTask(taskId);
+        if (existingTask && existingTask.kind !== "stage-guard-check") {
+            return text(`❌ Stage Guard 后台任务 taskId 冲突，已有任务类型为 ${existingTask.kind}`);
+        }
+        const task = existingTask || startBackgroundTask("stage-guard-check", async (backgroundTaskContext) => {
             const result = await handleCheck(
                 {
                     ...params,
@@ -616,10 +734,12 @@ async function handleCheck(
             );
             return responseText(result);
         }, {
+            taskId,
             resumePayload: resumePayload as unknown as ResumePayloadValue,
         });
         return text([
             "🚀 Stage Guard 检查已转入后台任务",
+            existingTask ? "♻️ 已复用相同 Guard 与规范化输入的已有后台任务" : "",
             decision.auto ? "（未显式指定 background，已自动转后台；如需同步请传 background=false）" : "",
             `🆔 taskId: ${task.id}`,
             `🧠 modelChain: ${resolveModelChain(params)}`,
@@ -633,7 +753,7 @@ async function handleCheck(
         ...(params.evidenceFiles || []).map(filePath => ({ path: filePath })),
         ...(params.evidenceAssets || []),
     ];
-    const result = await runGuardCheck(effectiveState, params.appealNote, params.evidence, {
+    const result = await guardCheckRunner(effectiveState, params.appealNote, params.evidence, {
         background: backgroundModel,
         evidenceAssets,
         evidenceIndexMode: params.evidenceIndexMode,
@@ -698,7 +818,8 @@ async function handleCheck(
         state,
         result.passed ? "pass" : "fail",
         result.summary,
-        result.missingItems
+        result.missingItems,
+        taskContext?.taskId,
     );
     if (!recordedState || !isCurrentGuard(state)) return staleGuardCheckText();
 
@@ -815,13 +936,43 @@ async function handleStatus(params: z.infer<typeof StageGuardSchema>) {
 }
 
 async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
-    const resolvedGuard = await resolveActiveGuard(params);
+    let taskPayload: StageGuardCheckResumePayload | undefined;
+    if (params.taskId) {
+        const task = getBackgroundTask(params.taskId);
+        if (!task) return text(`❌ 未找到后台 Guard 检查任务 taskId=${params.taskId}`);
+        if (task.kind !== "stage-guard-check") return text(`❌ taskId=${params.taskId} 不是 Stage Guard 检查任务`);
+        if (!isStageGuardCheckResumePayload(task.resumePayload)) return text(`❌ taskId=${params.taskId} 缺少可校验的 Stage Guard 恢复身份，拒绝取消`);
+        taskPayload = task.resumePayload;
+    }
+    const guardParams = taskPayload
+        ? {
+            ...params,
+            conversationId: taskPayload.conversationId,
+            stageId: taskPayload.stageId,
+            childScopeId: taskPayload.version === 2 ? taskPayload.childScopeId : "main",
+            scopeSelectors: taskPayload.version === 2 ? [...taskPayload.scopeSelectors] : undefined,
+        }
+        : params;
+    const resolvedGuard = await resolveActiveGuard(guardParams);
     if ("error" in resolvedGuard) {
         return text(resolvedGuard.error.includes("没有活跃的 Stage Guard 匹配当前选择器")
             ? "🛡 Stage Guard 未激活，无需取消。"
             : resolvedGuard.error);
     }
     const { state } = resolvedGuard;
+    if (taskPayload && !resumePayloadMatchesState(state, taskPayload)) {
+        return text("❌ taskId 的 Guard 身份与当前活跃 Guard 不匹配，拒绝取消以保护其它范围。");
+    }
+    let backgroundTaskMessage = "";
+    if (params.taskId) {
+        const task = getBackgroundTask(params.taskId);
+        if (!task) return text(`❌ 未找到后台 Guard 检查任务 taskId=${params.taskId}`);
+        const wasLive = task.status === "running" || task.status === "suspended";
+        const cancelled = cancelBackgroundTask(params.taskId, `Stage Guard ${state.guardId} 已取消`);
+        backgroundTaskMessage = wasLive
+            ? `🛑 同一后台检查任务已取消: ${cancelled?.id}`
+            : `ℹ️ 同一后台检查任务已是 ${cancelled?.status}，未重复结算: ${cancelled?.id}`;
+    }
 
     const lockResults = state.taskFiles.map(file => ({ file, result: removeLockMark(file, state) }));
     if (lockResults.some(item => !item.result.ok)) {
@@ -834,7 +985,8 @@ async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
     return text(
         `🛡 Stage Guard 已取消\n` +
         `🔓 本 Guard 锁已移除${remainingLocks > 0 ? `，相关文件仍有 ${remainingLocks} 个其它 Guard 锁` : ""}\n` +
-        summarizeLockResults(lockResults).join("\n")
+        summarizeLockResults(lockResults).join("\n") +
+        (backgroundTaskMessage ? `\n${backgroundTaskMessage}` : "")
     );
 }
 

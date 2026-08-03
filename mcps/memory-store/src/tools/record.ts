@@ -15,8 +15,9 @@ import {
 } from "../record-store.js";
 import { DATA_ROOT, GENERAL_DIR, WORKSPACES_DIR, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
 import {
-    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, validateRecordCandidateForWrite, type RecordParallelMode,
+    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, resolveRecordSourceReadStartRound, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
+import { readCachedConversationSourceCache } from "../conversation-source-cache.js";
 import { saveTempFile, saveTempFileAsync } from "../temp-store.js";
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
 import type { ConcurrencyGateRequestClass } from "../concurrency-gate.js";
@@ -31,6 +32,7 @@ import {
     recordSchedulerRequestKey,
     type RecordSchedulerRuntimeDiscoveryRecord,
     type RecordSchedulerRuntimeDiscoveryRequest,
+    type RecordSchedulerRuntimeSourceCacheReference,
     type RecordSchedulerRuntime,
     type RecordSchedulerRuntimeRecoveryDescriptor,
     type FrozenRuntimeSource,
@@ -52,6 +54,8 @@ import {
     createProductionSourceReader,
     PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION,
     isSupportedProductionSourceFormatterVersion,
+    type ProductionSourceCacheReference,
+    type ProductionSourceCanonicalDocument,
     type ProductionSourceReadRequest,
     type ProductionSourceReader,
 } from "../record-production-source-readers.js";
@@ -71,7 +75,7 @@ import {
     type ConversationLoadResult,
     type ResolvedConversationChain,
 } from "../conversation-bridge.js";
-import type { ConversationRound } from "../trajectory.js";
+import type { ConversationRound, ConversationUserMessage } from "../trajectory.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
 import {
@@ -173,6 +177,24 @@ class RecordBatchLedgerRepairRequiredError extends Error {
     }
 }
 
+const RecordSourceCacheReferenceSchema = z.object({
+    cacheGeneration: z.object({
+        key: z.object({
+            source: z.string().min(1),
+            conversationId: z.string().min(1),
+        }),
+        generation: z.string().min(1),
+        fingerprint: z.object({
+            path: z.string().optional(),
+            size: z.number().finite().optional(),
+            mtime: z.union([z.number().finite(), z.string()]).optional(),
+            revision: z.string().optional(),
+        }).nullable(),
+    }).optional(),
+    sourceSnapshot: z.object({}).passthrough().optional(),
+    cacheReadStartRound: z.number().int().min(1).optional(),
+});
+
 const RecordUpdateResumePayloadSchema = z.object({
     kind: z.literal("record-update"),
     conversationId: z.string().min(1),
@@ -183,6 +205,7 @@ const RecordUpdateResumePayloadSchema = z.object({
     parallelMode: z.enum(RECORD_RESUME_PARALLEL_MODES).optional(),
     force: z.boolean().optional(),
     logicalChain: z.enum(RECORD_RESUME_LOGICAL_CHAINS).optional(),
+    sourceCacheReference: RecordSourceCacheReferenceSchema.optional(),
 });
 
 const BatchCandidateSnapshotSchema = z.object({
@@ -1225,6 +1248,14 @@ function schedulerRecoveryDescriptor(
                 dataChain: payload.dataChain,
                 limit: 1,
                 targetConversationId: payload.conversationId,
+                ...(payload.sourceCacheReference ? {
+                    sourceCacheReferences: [{
+                        host: payload.dataChain,
+                        conversationId: payload.conversationId,
+                        workspaceHash: payload.workspaceHash,
+                        ...payload.sourceCacheReference,
+                    }],
+                } : {}),
             }),
         };
     }
@@ -1836,6 +1867,9 @@ export const __recordConcurrencyTest = {
     parseBatchResumePayload(payload: unknown): RecordBatchResumePayload | null {
         return tryParseRecordBatchResumePayload(payload);
     },
+    parseUpdateResumePayload(payload: unknown): RecordUpdateResumePayload | null {
+        return tryParseRecordUpdateResumePayload(payload);
+    },
     async prepareBatchPayload(payload: unknown): Promise<{ payload?: RecordBatchReadyResumePayload; result?: string }> {
         return prepareRecordBatchPayload(
             parseRecordBatchResumePayload(payload),
@@ -2161,6 +2195,7 @@ function buildRecordSchedulerDiscoveryRequest(input: {
     after?: string;
     before?: string;
     targetConversationId?: string;
+    sourceCacheReferences?: RecordSchedulerRuntimeSourceCacheReference[];
 }): RecordSchedulerRuntimeDiscoveryRequest {
     const records: RecordSchedulerRuntimeDiscoveryRecord[] = listRecordsForScope(
         input.hash,
@@ -2187,6 +2222,9 @@ function buildRecordSchedulerDiscoveryRequest(input: {
                 ? { host: record.chain as SourceEvidenceHost }
                 : {}),
             lastUpdatedAt: record.lastUpdatedAt,
+            ...(Number.isSafeInteger(record.lastUpdatedRound) && record.lastUpdatedRound >= 0
+                ? { lastUpdatedRound: record.lastUpdatedRound }
+                : {}),
             recordBodyHash: `sha256:${crypto.createHash("sha256").update(JSON.stringify(record), "utf8").digest("hex")}`,
             ...(coveredRevision ? { coveredRevision } : {}),
             ...(coveredRevision && Number.isSafeInteger(record.coveredRevisionSequence) && (record.coveredRevisionSequence ?? -1) >= 0
@@ -2219,10 +2257,12 @@ function buildRecordSchedulerDiscoveryRequest(input: {
             workspaceHash: record.workspaceHash,
             host: record.host || null,
             lastUpdatedAt: record.lastUpdatedAt,
+            lastUpdatedRound: record.lastUpdatedRound ?? null,
             recordBodyHash: record.recordBodyHash,
             coveredRevision: record.coveredRevision || null,
             coveredRevisionSequence: record.coveredRevisionSequence ?? null,
         })),
+        sourceCacheReferences: input.sourceCacheReferences || [],
     };
     return {
         kind: input.kind,
@@ -2235,6 +2275,7 @@ function buildRecordSchedulerDiscoveryRequest(input: {
         ...(selectionLimit !== undefined ? { selectionLimit } : {}),
         filters,
         records,
+        ...(input.sourceCacheReferences?.length ? { sourceCacheReferences: input.sourceCacheReferences } : {}),
         ...(input.targetConversationId ? {
             targets: hosts.map(host => ({
                 conversationId: input.targetConversationId!,
@@ -2374,6 +2415,15 @@ const FROZEN_CANONICAL_ATTACHMENT_WARNINGS = new Set([
     "attachment metadata warning redacted",
 ]);
 
+const FROZEN_CANONICAL_SEMANTIC_ROLES = new Set([
+    "user",
+    "system",
+    "model",
+    "assistant",
+    "tool",
+    "subagent",
+]);
+
 function frozenCanonicalAttachmentName(value: unknown): string {
     const extension = typeof value === "string" ? /\.([a-z0-9]{1,16})$/iu.exec(value.trim())?.[1]?.toLowerCase() : undefined;
     return extension ? `attachment.${extension}` : "attachment";
@@ -2441,6 +2491,19 @@ function frozenCanonicalAttachments(attachments: unknown, stepIndex: number): Fr
     });
 }
 
+function frozenCanonicalUserMessage(
+    message: ProductionSourceCanonicalDocument["messages"][number],
+    attachments: FrozenConversationAttachment[],
+): ConversationUserMessage {
+    return {
+        stepIndex: message.order,
+        text: message.content,
+        ...(message.rawRole !== undefined ? { rawRole: message.rawRole } : {}),
+        ...(message.semanticRole === "user" ? { semanticRole: "user" as const } : {}),
+        ...(attachments.length > 0 ? { attachments } : {}),
+    };
+}
+
 function assertFrozenCanonicalDocument(source: FrozenRuntimeSource): void {
     if (source.document.schemaVersion !== PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION) {
         throw new RecordSchedulerRepairRequiredError(
@@ -2461,6 +2524,10 @@ function assertFrozenCanonicalDocument(source: FrozenRuntimeSource): void {
             message.order !== index + 1
             || (message.role !== "user" && message.role !== "assistant")
             || typeof message.content !== "string"
+            || (message.roundIndex !== undefined && (!Number.isSafeInteger(message.roundIndex) || message.roundIndex < 1))
+            || (message.rawRole !== undefined && typeof message.rawRole !== "string")
+            || (message.semanticRole !== undefined && !FROZEN_CANONICAL_SEMANTIC_ROLES.has(message.semanticRole))
+            || (message.role === "user" && message.semanticRole !== undefined && message.semanticRole !== "user")
         ))) {
         throw new RecordSchedulerRepairRequiredError(
             `frozen source ${source.snapshot.sourceSnapshotId} 的 canonical document/version/content binding 无法验证`,
@@ -2468,36 +2535,55 @@ function assertFrozenCanonicalDocument(source: FrozenRuntimeSource): void {
     }
 }
 
-function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): ConversationLoadResult {
+export function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): ConversationLoadResult {
     assertFrozenCanonicalDocument(source);
+    const materializedReadStartRound = Number.isSafeInteger(source.cacheSourceSnapshot?.materializedReadStartRound)
+        && Number(source.cacheSourceSnapshot?.materializedReadStartRound) >= 1
+        ? Number(source.cacheSourceSnapshot?.materializedReadStartRound)
+        : 1;
     const rounds: ConversationRound[] = [];
     let current: ConversationRound | null = null;
     const publishCurrent = () => {
         if (!current) return;
-        current.roundIndex = rounds.length + 1;
+        const expectedRoundIndex = materializedReadStartRound + rounds.length;
+        if (current.roundIndex !== expectedRoundIndex) {
+            throw new RecordSchedulerRepairRequiredError(
+                `frozen source ${source.snapshot.sourceSnapshotId} 的增量轮次窗口不连续: expected=${expectedRoundIndex}, actual=${current.roundIndex}`,
+            );
+        }
         rounds.push(current);
         current = null;
     };
     for (const message of source.document.messages) {
         if (message.role === "user") {
+            const attachments = frozenCanonicalAttachments(message.attachments, message.order);
+            const userMessage = frozenCanonicalUserMessage(message, attachments);
+            if (current && message.roundIndex !== undefined && current.roundIndex === message.roundIndex) {
+                current.endStep = message.order;
+                current.userMessages = [...(current.userMessages || []), userMessage];
+                current.userMessage = current.userMessages.map(item => item.text).join("\n\n");
+                current.attachments!.push(...attachments);
+                continue;
+            }
             publishCurrent();
             current = {
-                roundIndex: rounds.length + 1,
+                roundIndex: message.roundIndex ?? materializedReadStartRound + rounds.length,
                 startStep: message.order,
                 endStep: message.order,
                 userMessage: message.content,
                 mediaAttachments: [],
-                attachments: frozenCanonicalAttachments(message.attachments, message.order),
+                attachments,
                 aiResponses: [],
                 toolCalls: [],
                 taskBoundaries: [],
                 codeActions: [],
                 subagentSummaries: [],
+                userMessages: [userMessage],
             };
             continue;
         }
         current ||= {
-            roundIndex: rounds.length + 1,
+            roundIndex: message.roundIndex ?? materializedReadStartRound + rounds.length,
             startStep: message.order,
             endStep: message.order,
             userMessage: "",
@@ -2509,6 +2595,11 @@ function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): Conversa
             codeActions: [],
             subagentSummaries: [],
         };
+        if (message.roundIndex !== undefined && current.roundIndex !== message.roundIndex) {
+            throw new RecordSchedulerRepairRequiredError(
+                `frozen source ${source.snapshot.sourceSnapshotId} 的消息轮次归属不连续: current=${current.roundIndex}, message=${message.roundIndex}`,
+            );
+        }
         current.endStep = message.order;
         current.attachments!.push(...frozenCanonicalAttachments(message.attachments, message.order));
         current.aiResponses.push({
@@ -2519,11 +2610,29 @@ function conversationLoadFromFrozenSource(source: FrozenRuntimeSource): Conversa
         });
     }
     publishCurrent();
+    const materializedReadEndRound = rounds.length > 0
+        ? materializedReadStartRound + rounds.length - 1
+        : materializedReadStartRound - 1;
+    const declaredRoundCount = Number.isSafeInteger(source.cacheSourceSnapshot?.roundCount)
+        && Number(source.cacheSourceSnapshot?.roundCount) >= 0
+        ? Number(source.cacheSourceSnapshot?.roundCount)
+        : materializedReadEndRound;
+    if (declaredRoundCount !== materializedReadEndRound) {
+        throw new RecordSchedulerRepairRequiredError(
+            `frozen source ${source.snapshot.sourceSnapshotId} 的增量轮次窗口不连续: start=${materializedReadStartRound}, materialized=${rounds.length}, total=${declaredRoundCount}`,
+        );
+    }
+    const declaredTotalSteps = Number.isSafeInteger(source.cacheSourceSnapshot?.totalSteps)
+        && Number(source.cacheSourceSnapshot?.totalSteps) >= source.document.messages.length
+        ? Number(source.cacheSourceSnapshot?.totalSteps)
+        : source.document.messages.length;
     return {
         chainUsed: source.snapshot.chain,
         conversationId: source.snapshot.conversationId,
         rounds,
-        totalSteps: source.document.messages.length,
+        roundStart: materializedReadStartRound,
+        roundCount: declaredRoundCount,
+        totalSteps: declaredTotalSteps,
     };
 }
 
@@ -2573,14 +2682,16 @@ async function handleUpdate(
 
         const rounds = loaded.rounds;
         const totalSteps = loaded.totalSteps;
+        const sourceRoundStart = loaded.roundStart ?? 1;
+        const sourceTotalRounds = loaded.roundCount ?? rounds.length;
         const afterLoadAbort = buildRecordTaskAbortResponse(startMs, options, "对话已加载，停止后续 Record 生成");
         if (afterLoadAbort) return afterLoadAbort;
         options.onProgress?.({
             stage: "解析完成",
             current: 0,
-            total: rounds.length,
+            total: sourceTotalRounds,
             unit: "轮",
-            detail: `${rounds.length} 轮 / ${totalSteps} 步，开始检查 Record 索引`,
+            detail: `已物化 ${rounds.length} 轮（第 ${sourceRoundStart}-${sourceTotalRounds} 轮）/ 共 ${sourceTotalRounds} 轮 / ${totalSteps} 步，开始检查 Record 索引`,
         });
 
         if (hash === "general" && !workspace) {
@@ -2606,7 +2717,7 @@ async function handleUpdate(
         }
         sourceSnapshot = {
             chain: loaded.chainUsed,
-            rounds: rounds.length,
+            rounds: sourceTotalRounds,
             totalSteps,
             rolloutPath: loaded.codexData?.thread.rolloutPath,
             rolloutMtimeMs: await statMtimeMsAsync(loaded.codexData?.thread.rolloutPath),
@@ -2655,6 +2766,8 @@ async function handleUpdate(
             background: options.background,
             parallelMode,
             force,
+            sourceRoundStart,
+            sourceTotalRounds,
             isCancelled: options.isCancelled,
             isSettled: options.isSettled,
             onProgress: options.onProgress,
@@ -2808,6 +2921,17 @@ async function recordCoverageWarningAsync(hash: string, conversationId: string, 
     return `⚠️ Record 正文疑似只覆盖 ${coveredRound}/${indexedRound} 轮；下次 update 会先修正索引并继续生成。`;
 }
 
+export function normalizeRecordSourceCacheReferenceForScheduler(
+    reference: ProductionSourceCacheReference | undefined,
+): ProductionSourceCacheReference | undefined {
+    if (!reference?.sourceSnapshot) return reference;
+    const sourceSnapshot = { ...reference.sourceSnapshot };
+    if (sourceSnapshot.cacheState === "hit" || sourceSnapshot.cacheState === "built") {
+        delete sourceSnapshot.cacheState;
+    }
+    return { ...reference, sourceSnapshot };
+}
+
 async function buildRecordUpdateResumePayload(
     workspaceHash: string,
     conversationId: string | undefined,
@@ -2817,6 +2941,7 @@ async function buildRecordUpdateResumePayload(
     parallelMode: RecordParallelMode | undefined,
     force: boolean | undefined,
     logicalChain: ConversationLogicalChainMode | undefined,
+    sourceCacheReference?: ProductionSourceCacheReference,
 ): Promise<RecordUpdateResumePayload | null> {
     const resolvedChain = await resolveConversationChain(dataChain);
     if (!resolvedChain) return null;
@@ -2828,6 +2953,72 @@ async function buildRecordUpdateResumePayload(
     } else if (workspaceHash === "general") {
         resolvedWorkspaceHash = (await detectOwnershipSource(resolvedConversationId, resolvedChain, "background")).expectedHash || workspaceHash;
     }
+    let resolvedSourceCacheReference = normalizeRecordSourceCacheReferenceForScheduler(sourceCacheReference);
+    if (!resolvedSourceCacheReference?.cacheGeneration) {
+        const cachedSource = await loadConversationData(resolvedChain, resolvedConversationId, {
+            link: "summary",
+            logicalChain: logicalChain || (resolvedChain === "claude-code" ? "auto" : "off"),
+            requestClass: "background",
+            source: "auto",
+            includeRounds: false,
+        });
+        if (!cachedSource?.cacheKey || !cachedSource.cacheGeneration) {
+            throw new Error(`无法为 ${resolvedChain}/${resolvedConversationId} 建立 Record 所需的 fetch 缓存`);
+        }
+        if (cachedSource.cacheState === "stale") {
+            throw new Error(`Record 拒绝使用过期 fetch 缓存: ${resolvedChain}/${resolvedConversationId}`);
+        }
+        if (cachedSource.windsurfData?.partial) {
+            throw new Error(`Record 拒绝使用不完整 fetch 缓存: ${resolvedChain}/${resolvedConversationId}`);
+        }
+        resolvedSourceCacheReference = {
+            cacheGeneration: {
+                key: cachedSource.cacheKey,
+                generation: cachedSource.cacheGeneration,
+                fingerprint: cachedSource.cacheFingerprint || null,
+            },
+            sourceSnapshot: {
+                kind: "conversation-fetch-cache",
+                sourceMode: cachedSource.sourceMode || "auto",
+                chainUsed: cachedSource.chainUsed,
+                roundCount: cachedSource.roundCount ?? cachedSource.rounds.length,
+                totalSteps: cachedSource.totalSteps,
+                ...(cachedSource.sourceRevision ? { authorityRevision: cachedSource.sourceRevision } : {}),
+            },
+        };
+    }
+    const generation = resolvedSourceCacheReference.cacheGeneration;
+    if (!generation) {
+        throw new Error(`Record 缺少可验证的 fetch 缓存 generation: ${resolvedChain}/${resolvedConversationId}`);
+    }
+    const cachedManifest = readCachedConversationSourceCache({
+        key: generation.key,
+        generation: generation.generation,
+        expectedFingerprint: generation.fingerprint,
+    });
+    if (!cachedManifest) {
+        throw new Error(`Record 所需的 fetch 缓存 generation 不存在或校验失败: ${generation.generation}`);
+    }
+    const existingRecord = await readRecordAsync(resolvedWorkspaceHash, resolvedConversationId) || "";
+    const existingEntry = (await readRecordsIndexAsync(resolvedWorkspaceHash)).records[resolvedConversationId];
+    const coveredRound = existingRecord
+        ? inferCoveredRoundFromRecord(existingRecord, cachedManifest.roundCount)
+        : Math.min(Math.max(existingEntry?.lastUpdatedRound || 0, 0), cachedManifest.roundCount);
+    const cacheReadStartRound = resolveRecordSourceReadStartRound(
+        existingRecord,
+        coveredRound,
+        cachedManifest.roundCount,
+        force === true,
+    );
+    resolvedSourceCacheReference = normalizeRecordSourceCacheReferenceForScheduler({
+        ...resolvedSourceCacheReference,
+        cacheReadStartRound,
+        sourceSnapshot: {
+            ...(resolvedSourceCacheReference.sourceSnapshot || {}),
+            roundCount: cachedManifest.roundCount,
+            cacheReadStartRound,
+        },
+    });
     return {
         kind: "record-update",
         conversationId: resolvedConversationId,
@@ -2838,6 +3029,7 @@ async function buildRecordUpdateResumePayload(
         ...(parallelMode ? { parallelMode } : {}),
         ...(force !== undefined ? { force } : {}),
         ...(logicalChain ? { logicalChain } : {}),
+        ...(resolvedSourceCacheReference ? { sourceCacheReference: resolvedSourceCacheReference } : {}),
     };
 }
 
@@ -2853,6 +3045,7 @@ async function handleRecordSchedulerUpdate(
     startMs: number,
     background: boolean,
     autoBackground: boolean,
+    sourceCacheReference?: ProductionSourceCacheReference,
 ) {
     await waitForRecordMutationReadiness();
     const resumePayload = await buildRecordUpdateResumePayload(
@@ -2864,6 +3057,7 @@ async function handleRecordSchedulerUpdate(
         parallelMode,
         force,
         logicalChain,
+        sourceCacheReference,
     );
     if (!resumePayload) {
         return rt(`❌ 无法为 dataChain=${dataChain} 冻结可恢复的 conversationId`, startMs);
@@ -2878,6 +3072,7 @@ async function handleRecordSchedulerUpdate(
         parallelMode: resumePayload.parallelMode || "off",
         force: resumePayload.force === true,
         logicalChain: resumePayload.logicalChain || "off",
+        sourceCacheReference: resumePayload.sourceCacheReference || null,
     };
     const runtime = getRecordSchedulerRuntime();
     const discoveryRequest = buildRecordSchedulerDiscoveryRequest({
@@ -2888,6 +3083,14 @@ async function handleRecordSchedulerUpdate(
         dataChain: resumePayload.dataChain,
         limit: 1,
         targetConversationId: resumePayload.conversationId,
+        ...(resumePayload.sourceCacheReference ? {
+            sourceCacheReferences: [{
+                host: resumePayload.dataChain,
+                conversationId: resumePayload.conversationId,
+                workspaceHash: resumePayload.workspaceHash,
+                ...resumePayload.sourceCacheReference,
+            }],
+        } : {}),
     });
     const admission = await runtime.admit({
         kind: "record-update",
@@ -2970,7 +3173,7 @@ async function handleRecordSchedulerUpdate(
     ].filter(Boolean).join("\n"), startMs);
 }
 
-export interface RecordAutoUpdateAdmissionInput {
+export interface RecordAutoUpdateAdmissionInput extends ProductionSourceCacheReference {
     workspaceHash: string;
     conversationId: string;
     workspace?: string;
@@ -2992,6 +3195,10 @@ export async function admitRecordAutoUpdate(input: RecordAutoUpdateAdmissionInpu
         Date.now(),
         true,
         true,
+        input.cacheGeneration || input.sourceSnapshot ? {
+            ...(input.cacheGeneration ? { cacheGeneration: input.cacheGeneration } : {}),
+            ...(input.sourceSnapshot ? { sourceSnapshot: input.sourceSnapshot } : {}),
+        } : undefined,
     );
     return responseText(response);
 }

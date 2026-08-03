@@ -28,6 +28,12 @@ export interface ConversationRound {
     subagentSummaries: SubagentSummary[]; // 子代理线程摘要（Codex 链路）
     fileViews?: FileViewInfo[]; // 文件/计划类视图记录（Codex 链路）
     compactionSummaries?: CompactionSummaryInfo[]; // Claude Code / 宿主压缩续聊摘要
+    /** 同一轮内的真实人类消息组；缺失时兼容读取旧 userMessage。 */
+    userMessages?: ConversationUserMessage[];
+    /** 合并前的旧轮次编号，供历史书签和旧调用定位。 */
+    legacyRoundIndices?: number[];
+    /** 保留原始来源角色后的统一语义事件。 */
+    semanticEvents?: ConversationSemanticEvent[];
 }
 
 export interface CompactionSummaryInfo {
@@ -56,6 +62,39 @@ export interface SubagentSummary {
     role?: string;
     prompt?: string;
     summary?: string;
+    attachments?: import("./conversation-attachments.js").ConversationAttachment[];
+    status?: string;
+    rawRole?: string;
+    semanticRole?: "subagent";
+}
+
+export interface ConversationAnnotation {
+    selectedText: string;
+    comment: string;
+}
+
+export interface ConversationUserMessage {
+    stepIndex?: number;
+    text: string;
+    rawRole?: string;
+    semanticRole?: "user";
+    mediaAttachments?: string[];
+    attachments?: import("./conversation-attachments.js").ConversationAttachment[];
+    annotations?: ConversationAnnotation[];
+}
+
+export interface ConversationSemanticEvent {
+    stepIndex?: number;
+    rawRole?: string;
+    semanticRole: ConversationMessageRole;
+    kind?: string;
+    text?: string;
+    name?: string;
+    argsFull?: string;
+    resultSummary?: string;
+    resultFull?: string;
+    subagent?: SubagentSummary;
+    attachments?: import("./conversation-attachments.js").ConversationAttachment[];
 }
 
 interface AiResponse {
@@ -70,6 +109,8 @@ interface ToolCallInfo {
     name: string;
     argsSummary: string;     // 参数摘要（截断到 60 字）
     resultSummary: string;   // 结果摘要（截断到 500 字）
+    argsFull?: string;
+    resultFull?: string;
 }
 
 interface TaskInfo {
@@ -105,7 +146,7 @@ interface CodeActionInfo {
 export type ExtraType = "thinking" | "tool_results" | "code_actions" | "code_diffs" | "file_views";
 export type Depth = "brief" | "normal" | "full";
 export type CompactionMode = "folded" | "full" | "omit";
-export type ConversationMessageRole = "user" | "system" | "model" | "assistant" | "tool";
+export type ConversationMessageRole = "user" | "system" | "model" | "assistant" | "tool" | "subagent";
 export type FormatRoundForMessageRolesOptions = {
     deadlineAt?: number;
     shouldAbort?: () => boolean;
@@ -125,19 +166,14 @@ export function parseRounds(steps: any[]): ConversationRound[] {
     const rounds: ConversationRound[] = [];
     let currentRound: ConversationRound | null = null;
     let roundIdx = 0;
+    let legacyRoundIdx = 0;
 
     for (let i = 0; i < steps.length; i++) {
         const step = steps[i];
         const type = step.type || "";
 
         if (type === "CORTEX_STEP_TYPE_USER_INPUT") {
-            // 开始新轮次
-            if (currentRound) {
-                currentRound.endStep = i - 1;
-                rounds.push(currentRound);
-            }
-            roundIdx++;
-
+            const legacyRoundIndex = ++legacyRoundIdx;
             const ui = step.userInput || {};
             const userMsg = ui.userResponse ||
                 (ui.items || [])
@@ -149,6 +185,30 @@ export function parseRounds(steps: any[]): ConversationRound[] {
             const mediaUris: string[] = (ui.media || [])
                 .filter((m: any) => m.uri && m.mimeType?.startsWith("image/"))
                 .map((m: any) => m.uri);
+            const userMessage: ConversationUserMessage = {
+                stepIndex: i,
+                text: userMsg,
+                rawRole: type,
+                semanticRole: "user",
+                mediaAttachments: mediaUris,
+            };
+
+            // 连续的人类消息没有模型侧活动时，属于同一个人类消息组。
+            if (currentRound && !hasModelSideActivity(currentRound)) {
+                currentRound.userMessages = [...(currentRound.userMessages || []), userMessage];
+                currentRound.legacyRoundIndices = [...(currentRound.legacyRoundIndices || []), legacyRoundIndex];
+                currentRound.userMessage = currentRound.userMessages.map((item) => item.text).filter(Boolean).join("\n\n");
+                currentRound.mediaAttachments.push(...mediaUris);
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "user", kind: "message", text: userMsg });
+                currentRound.endStep = i;
+                continue;
+            }
+
+            if (currentRound) {
+                currentRound.endStep = i - 1;
+                rounds.push(currentRound);
+            }
+            roundIdx++;
 
             currentRound = {
                 roundIndex: roundIdx,
@@ -161,6 +221,9 @@ export function parseRounds(steps: any[]): ConversationRound[] {
                 taskBoundaries: [],
                 codeActions: [],
                 subagentSummaries: [],
+                userMessages: [userMessage],
+                legacyRoundIndices: [legacyRoundIndex],
+                semanticEvents: [{ stepIndex: i, rawRole: type, semanticRole: "user", kind: "message", text: userMsg }],
             };
         } else if (currentRound) {
             // 其他步骤归入当前轮次
@@ -175,6 +238,12 @@ export function parseRounds(steps: any[]): ConversationRound[] {
                         args: truncate(tc.argumentsJson || "", 60),
                     })),
                 });
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "model", kind: "response", text: pr.response || "" });
+            } else if (type === "CORTEX_STEP_TYPE_MODEL_RESPONSE") {
+                const response = step.modelResponse?.response || step.modelResponse?.text || step.response || step.text || "";
+                const thinking = step.modelResponse?.thinking || step.thinking || "";
+                currentRound.aiResponses.push({ stepIndex: i, response, thinking, toolCalls: [] });
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "model", kind: "response", text: response });
             } else if (type === "CORTEX_STEP_TYPE_MCP_TOOL") {
                 const mt = step.mcpTool || {};
                 const tc = mt.toolCall || {};
@@ -188,6 +257,7 @@ export function parseRounds(steps: any[]): ConversationRound[] {
                 // 反重力 mcpTool 无 image block，图只在原始 resultString 的本地路径里（探针实测）。
                 const toolImages = extractAntigravityToolImages(mt, i);
                 if (toolImages.length) mergeRoundAttachments(currentRound, toolImages);
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "tool", kind: "tool", name: tc.name || "unknown", resultSummary: mt.resultString || "" });
             } else if (type === "CORTEX_STEP_TYPE_TASK_BOUNDARY") {
                 const tb = step.taskBoundary || {};
                 currentRound.taskBoundaries.push({
@@ -195,6 +265,7 @@ export function parseRounds(steps: any[]): ConversationRound[] {
                     taskName: tb.taskName || "",
                     taskStatus: tb.taskStatus || "",
                 });
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "tool", kind: "task_boundary", text: `${tb.taskName || ""} ${tb.taskStatus || ""}`.trim() });
             } else if (type === "CORTEX_STEP_TYPE_CODE_ACTION") {
                 const ca = step.codeAction || {};
                 const spec = ca.actionSpec || {};
@@ -215,6 +286,7 @@ export function parseRounds(steps: any[]): ConversationRound[] {
                         };
                     }),
                 });
+                currentRound.semanticEvents?.push({ stepIndex: i, rawRole: type, semanticRole: "tool", kind: "code_action", text: ca.description || "" });
             }
             // EPHEMERAL_MESSAGE, CHECKPOINT, VIEW_FILE, etc. — 不提取
         }
@@ -227,6 +299,70 @@ export function parseRounds(steps: any[]): ConversationRound[] {
     }
 
     return rounds;
+}
+
+function hasModelSideActivity(round: ConversationRound): boolean {
+    return round.aiResponses.length > 0
+        || round.toolCalls.length > 0
+        || round.taskBoundaries.length > 0
+        || round.codeActions.length > 0
+        || round.subagentSummaries.length > 0
+        || Boolean(round.semanticEvents?.some((event) => event.semanticRole === "model" || event.semanticRole === "assistant" || event.semanticRole === "tool" || event.semanticRole === "subagent"));
+}
+
+function getRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
+    if (round.userMessages?.length) return round.userMessages;
+    return [{
+        stepIndex: round.startStep,
+        text: round.userMessage,
+        mediaAttachments: round.mediaAttachments || [],
+        attachments: round.attachments,
+    }];
+}
+
+/**
+ * 合并由旧宿主解析器拆开的连续人类消息轮次，并保留旧序号映射。
+ * 宿主仍可继续传入旧 ConversationRound；调用方在接入点按需使用本函数即可。
+ */
+export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[]): ConversationRound[] {
+    const merged: ConversationRound[] = [];
+    for (const source of sourceRounds) {
+        const next: ConversationRound = {
+            ...source,
+            userMessages: getRoundUserMessages(source).map((message) => ({ ...message })),
+            legacyRoundIndices: [...(source.legacyRoundIndices?.length ? source.legacyRoundIndices : [source.roundIndex])],
+            semanticEvents: source.semanticEvents?.map((event) => ({ ...event })),
+            mediaAttachments: [...(source.mediaAttachments || [])],
+            attachments: source.attachments ? [...source.attachments] : undefined,
+            aiResponses: [...source.aiResponses],
+            toolCalls: [...source.toolCalls],
+            taskBoundaries: [...source.taskBoundaries],
+            codeActions: [...source.codeActions],
+            subagentSummaries: [...source.subagentSummaries],
+            fileViews: source.fileViews ? [...source.fileViews] : undefined,
+        };
+        const previous = merged[merged.length - 1];
+        if (previous && !hasModelSideActivity(previous)) {
+            const previousMessages = getRoundUserMessages(previous);
+            const nextMessages = getRoundUserMessages(next);
+            previous.userMessages = [...previousMessages, ...nextMessages];
+            previous.userMessage = previous.userMessages.map((message) => message.text).filter(Boolean).join("\n\n");
+            previous.mediaAttachments.push(...next.mediaAttachments);
+            previous.attachments = [...(previous.attachments || []), ...(next.attachments || [])];
+            previous.aiResponses.push(...next.aiResponses);
+            previous.toolCalls.push(...next.toolCalls);
+            previous.taskBoundaries.push(...next.taskBoundaries);
+            previous.codeActions.push(...next.codeActions);
+            previous.subagentSummaries.push(...next.subagentSummaries);
+            previous.fileViews = [...(previous.fileViews || []), ...(next.fileViews || [])];
+            previous.semanticEvents = [...(previous.semanticEvents || []), ...(next.semanticEvents || [])];
+            previous.legacyRoundIndices = [...(previous.legacyRoundIndices || []), ...(next.legacyRoundIndices || [])];
+            previous.endStep = Math.max(previous.endStep, next.endStep);
+            continue;
+        }
+        merged.push(next);
+    }
+    return merged.map((round, index) => ({ ...round, roundIndex: index + 1 }));
 }
 
 // ===== 格式化输出 =====
@@ -341,6 +477,161 @@ function renderToolCallLine(lines: string[], tc: ToolCallInfo, depth: Depth, ext
     lines.push(line);
 }
 
+type ParsedAnnotationMessage = {
+    text: string;
+    annotations: ConversationAnnotation[];
+    warnings: string[];
+};
+
+function readAnnotationText(value: Record<string, unknown>, keys: string[]): string {
+    for (const key of keys) {
+        const candidate = value[key];
+        if (typeof candidate === "string") return candidate;
+    }
+    return "";
+}
+
+function annotationsFromPayload(payload: unknown): ConversationAnnotation[] {
+    const records = Array.isArray(payload)
+        ? payload
+        : payload && typeof payload === "object"
+            ? Array.isArray((payload as Record<string, unknown>).annotations)
+                ? (payload as Record<string, unknown>).annotations as unknown[]
+                : Array.isArray((payload as Record<string, unknown>).items)
+                    ? (payload as Record<string, unknown>).items as unknown[]
+                    : [payload]
+            : [];
+    return records.flatMap((item) => {
+        if (!item || typeof item !== "object") return [];
+        const record = item as Record<string, unknown>;
+        const selectedText = readAnnotationText(record, ["selectedText", "selected_text", "selected", "quote", "text"]);
+        const comment = readAnnotationText(record, ["comment", "feedback", "note", "message"]);
+        return selectedText || comment ? [{ selectedText, comment }] : [];
+    });
+}
+
+/** 将 Codex response-annotations 转成可读结构；损坏数据保留原文并附警告。 */
+export function parseResponseAnnotations(input: string): ParsedAnnotationMessage {
+    const blockPattern = /<response-annotations>\s*([\s\S]*?)\s*<\/response-annotations>/giu;
+    const annotations: ConversationAnnotation[] = [];
+    const warnings: string[] = [];
+    let found = false;
+    const text = input.replace(blockPattern, (_block, json: string) => {
+        found = true;
+        try {
+            const parsed = annotationsFromPayload(JSON.parse(json));
+            if (parsed.length > 0) {
+                annotations.push(...parsed);
+                return "";
+            }
+        } catch {
+            // 保留下面的原文回退，避免坏数据被静默吞掉。
+        }
+        warnings.push("response-annotations 格式损坏，已保留原文");
+        return _block;
+    });
+    if (!found && input.includes("<response-annotations")) {
+        warnings.push("response-annotations 缺少完整结束标记，已保留原文");
+    }
+    return { text, annotations, warnings };
+}
+
+function renderHumanMessageContent(
+    lines: string[],
+    message: ConversationUserMessage,
+    depth: Depth,
+    truncateText: (input: string, depth: Depth) => string,
+): void {
+    const parsed = parseResponseAnnotations(message.text || "");
+    const annotations = [...parsed.annotations, ...(message.annotations || [])];
+    if (parsed.text) lines.push(truncateText(parsed.text, depth));
+    if (annotations.length > 0) {
+        lines.push("#### 📝 批注");
+        for (const annotation of annotations) {
+            lines.push(`- 被批注文本: ${truncateText(annotation.selectedText, depth)}`);
+            lines.push(`  用户评论: ${truncateText(annotation.comment, depth)}`);
+        }
+    }
+    for (const warning of parsed.warnings) {
+        lines.push(`⚠️ ${warning}`);
+    }
+}
+
+function getRoundAiResponses(round: ConversationRound): AiResponse[] {
+    if (round.aiResponses.length > 0) return round.aiResponses;
+    return (round.semanticEvents || [])
+        .filter((event) => event.semanticRole === "model" || event.semanticRole === "assistant")
+        .map((event) => ({ stepIndex: event.stepIndex ?? Number.NaN, response: event.text || "", thinking: "", toolCalls: [] }));
+}
+
+function getRoundToolCalls(round: ConversationRound): ToolCallInfo[] {
+    if (round.toolCalls.length > 0) return round.toolCalls;
+    return (round.semanticEvents || [])
+        .filter((event) => event.semanticRole === "tool")
+        .map((event) => ({
+            stepIndex: event.stepIndex ?? Number.NaN,
+            name: event.name || event.kind || "tool",
+            argsSummary: "",
+            resultSummary: event.resultSummary || event.text || "",
+            argsFull: event.argsFull,
+            resultFull: event.resultFull || event.resultSummary || event.text || "",
+        }));
+}
+
+function getRoundSubagentSummaries(round: ConversationRound): SubagentSummary[] {
+    const summaries = [...round.subagentSummaries];
+    for (const event of round.semanticEvents || []) {
+        if (event.semanticRole !== "subagent") continue;
+        const subagent = event.subagent || {
+            threadId: "",
+            nickname: event.name || "subagent",
+            status: event.text || event.resultSummary,
+            rawRole: event.rawRole,
+            semanticRole: "subagent" as const,
+        };
+        if (!summaries.some((item) => item.threadId === subagent.threadId && item.nickname === subagent.nickname)) {
+            summaries.push(subagent);
+        }
+    }
+    return summaries;
+}
+
+function formatSubagentLabel(subagent: SubagentSummary): string {
+    const nickname = subagent.nickname || "subagent";
+    const shortId = subagent.threadId ? `${subagent.threadId.slice(0, 8)}${subagent.threadId.length > 8 ? "…" : ""}` : "unknown";
+    return `Subagent-${nickname} (${shortId})`;
+}
+
+function renderCodeActionSection(
+    round: ConversationRound,
+    extraTypes: ExtraType[],
+    writeLine: (line: string) => boolean,
+): boolean {
+    if (round.codeActions.length === 0 || (!extraTypes.includes("code_actions") && !extraTypes.includes("code_diffs"))) return true;
+    if (!writeLine("#### ✏️ 代码编辑")) return false;
+    for (const action of round.codeActions) {
+        if (!writeLine(`- **${action.targetFile}**: ${action.description}`)) return false;
+        if (action.instruction && extraTypes.includes("code_actions") && !writeLine(`  指令: ${action.instruction}`)) return false;
+        if (!extraTypes.includes("code_diffs")) continue;
+        for (const diff of action.diffs) {
+            const lineRange = diff.startLine && diff.endLine ? ` (L${diff.startLine}-L${diff.endLine})` : "";
+            if (diff.unifiedDiff) {
+                if (!writeLine("```diff") || !writeLine(diff.unifiedDiff.replace(/\r/g, "")) || !writeLine("```")) return false;
+            } else if (diff.targetContent || diff.replacementContent) {
+                if (!writeLine("```diff") || !writeLine(`--- ${action.targetFile}${lineRange}`) || !writeLine(`+++ ${action.targetFile}${lineRange}`)) return false;
+                for (const line of diff.targetContent.split("\n")) {
+                    if (!writeLine(`-${line}`)) return false;
+                }
+                for (const line of diff.replacementContent.split("\n")) {
+                    if (!writeLine(`+${line}`)) return false;
+                }
+                if (!writeLine("```")) return false;
+            }
+        }
+    }
+    return writeLine("");
+}
+
 /**
  * 把 round.attachments 按 stepIndex 分桶（纯函数，便于单测）。
  * - userBucket：stepIndex≤startStep（用户输入图）或首个 AI 之前的兜底图 → 维持用户段。
@@ -396,21 +687,37 @@ export function formatRound(
 ): string {
     const lines: string[] = [];
     const stepsRange = `steps ${round.startStep}-${round.endStep}`;
+    const userMessages = getRoundUserMessages(round);
 
     lines.push(`## 轮次 ${round.roundIndex} (${stepsRange})`);
 
     // 用户消息
-    lines.push(`### 👤 用户 (step ${round.startStep})`);
     if (round.compactionSummaries?.length) {
+        lines.push(`### 👤 用户 (step ${round.startStep})`);
         lines.push(formatCompactionUserMessage(round, depth, options.compactionMode || (depth === "full" ? "full" : "folded")));
-    } else if (depth === "brief") {
-        lines.push(truncate(round.userMessage, 100));
     } else {
-        lines.push(round.userMessage);
+        for (const message of userMessages) {
+            lines.push(`### 👤 用户 (step ${message.stepIndex ?? round.startStep})`);
+            renderHumanMessageContent(lines, message, depth, (text, selectedDepth) => selectedDepth === "brief" ? truncate(text, 100) : text);
+            if (userMessages.length > 1) {
+                for (const attachment of message.attachments || []) {
+                    renderAttachmentLine(lines, attachment, round.roundIndex, options.attachmentMode);
+                }
+                for (const uri of message.mediaAttachments || []) {
+                    lines.push(options.attachmentMode === "markdown"
+                        ? `📎 图片: ![round-${round.roundIndex}-media](${formatMarkdownUrl(uri)})`
+                        : `📎 图片: ${uri}`);
+                }
+                lines.push("");
+            }
+        }
     }
     // 用户附件图片
-    if (round.mediaAttachments.length > 0) {
-        for (const [index, uri] of round.mediaAttachments.entries()) {
+    const singleMessageMedia = userMessages.length === 1
+        ? (round.mediaAttachments.length > 0 ? round.mediaAttachments : userMessages[0].mediaAttachments || [])
+        : [];
+    if (singleMessageMedia.length > 0) {
+        for (const [index, uri] of singleMessageMedia.entries()) {
             if (options.attachmentMode === "markdown") {
                 const label = `round-${round.roundIndex}-media-${index + 1}`;
                 lines.push(`📎 图片 ${label}: ![${escapeMarkdownLabel(label)}](${formatMarkdownUrl(uri)})`);
@@ -424,8 +731,11 @@ export function formatRound(
 
     if (!interleave) {
         // 非附件时间线分支：normal/full 的 AI 与工具仍按 stepIndex 交替渲染。
-        if (round.attachments?.length) {
-            for (const attachment of round.attachments) {
+        const singleMessageAttachments = userMessages.length === 1
+            ? (round.attachments || userMessages[0].attachments || [])
+            : round.attachments || [];
+        if (singleMessageAttachments.length) {
+            for (const attachment of singleMessageAttachments) {
                 const label = attachment.kind === "image" ? "图片" : "文件";
                 const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
                 const displayName = attachment.name || target.split(/[\\/]/u).pop() || `${label}-${round.roundIndex}`;
@@ -568,45 +878,10 @@ export function formatRound(
     }
 
     // 代码编辑
-    if (round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
-        lines.push("#### ✏️ 代码编辑");
-        for (const ca of round.codeActions) {
-            lines.push(`- **${ca.targetFile}**: ${ca.description}`);
-            if (ca.instruction && extraTypes.includes("code_actions")) {
-                lines.push(`  指令: ${ca.instruction}`);
-            }
-            if (ca.diffs.length > 0 && extraTypes.includes("code_diffs")) {
-                for (const diff of ca.diffs) {
-                    const lineRange = diff.startLine && diff.endLine
-                        ? ` (L${diff.startLine}-L${diff.endLine})`
-                        : "";
-                    if (diff.unifiedDiff) {
-                        lines.push(`\`\`\`diff`);
-                        lines.push(diff.unifiedDiff.replace(/\r/g, ""));
-                        lines.push("```");
-                    } else if (diff.targetContent || diff.replacementContent) {
-                        lines.push(`\`\`\`diff`);
-                        lines.push(`--- ${ca.targetFile}${lineRange}`);
-                        lines.push(`+++ ${ca.targetFile}${lineRange}`);
-                        // 输出移除的行（修改前）
-                        if (diff.targetContent) {
-                            for (const line of diff.targetContent.split("\n")) {
-                                lines.push(`-${line}`);
-                            }
-                        }
-                        // 输出新增的行（修改后）
-                        if (diff.replacementContent) {
-                            for (const line of diff.replacementContent.split("\n")) {
-                                lines.push(`+${line}`);
-                            }
-                        }
-                        lines.push("```");
-                    }
-                }
-            }
-        }
-        lines.push("");
-    }
+    renderCodeActionSection(round, extraTypes, (line) => {
+        lines.push(line);
+        return true;
+    });
 
     // Codex 文件/计划视图事件
     if (round.fileViews?.length && extraTypes.includes("file_views")) {
@@ -622,15 +897,16 @@ export function formatRound(
     }
 
     // 子代理摘要（主要用于 Codex 链路）
-    if (round.subagentSummaries.length > 0) {
+    const subagentSummaries = getRoundSubagentSummaries(round);
+    if (subagentSummaries.length > 0) {
         if (depth === "brief") {
-            const names = round.subagentSummaries.map((item) => item.nickname || "subagent");
+            const names = subagentSummaries.map((item) => formatSubagentLabel(item));
             lines.push(`🤝 子代理: ${names.join(", ")}`);
         } else {
             lines.push("#### 🤝 子代理线程");
-            for (const item of round.subagentSummaries) {
-                const label = item.threadId ? `${item.nickname} (${item.threadId.slice(0, 8)}...)` : item.nickname;
-                const detail = item.summary || item.prompt || "";
+            for (const item of subagentSummaries) {
+                const label = formatSubagentLabel(item);
+                const detail = item.status || item.summary || item.prompt || "";
                 lines.push(detail ? `- ${label}: ${truncate(detail, depth === "full" ? 300 : 120)}` : `- ${label}`);
             }
         }
@@ -670,7 +946,8 @@ function thinkingSummaryLabelForRoleView(thinking: string): string {
 
 function isSystemLikeRound(round: ConversationRound): boolean {
     if (round.compactionSummaries?.length) return true;
-    const text = (round.userMessage || "").trimStart();
+    if (round.semanticEvents?.some((event) => event.semanticRole === "system")) return true;
+    const text = getRoundUserMessages(round).map((message) => message.text).join("\n").trimStart();
     return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
         || text.startsWith("# AGENTS.md instructions")
         || text.startsWith("[Claude Code compact summary folded")
@@ -750,31 +1027,60 @@ export function formatRoundForMessageRoles(
     }
 
     const systemLike = isSystemLikeRound(round);
-    const includeUser = roles.has("user") && !systemLike;
-    const includeSystem = roles.has("system") && systemLike;
+    const userMessages = getRoundUserMessages(round);
+    const explicitSystemEvents = (round.semanticEvents || []).filter(event => event.semanticRole === "system" && event.text);
+    const legacySystemLike = systemLike && explicitSystemEvents.length === 0;
+    const aiResponses = getRoundAiResponses(round);
+    const toolCalls = getRoundToolCalls(round);
+    const subagentSummaries = getRoundSubagentSummaries(round);
+    const includeUser = roles.has("user") && !legacySystemLike;
+    const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0);
     const includeModel = roles.has("model") || roles.has("assistant");
     const includeTool = roles.has("tool");
-    const hasToolLike = round.toolCalls.length > 0
+    const includeSubagent = roles.has("subagent");
+    const hasToolLike = toolCalls.length > 0
         || round.taskBoundaries.length > 0
         || round.codeActions.length > 0
-        || (round.fileViews?.length || 0) > 0
-        || round.subagentSummaries.length > 0;
+        || (round.fileViews?.length || 0) > 0;
 
-    if (!includeUser && !includeSystem && !(includeModel && round.aiResponses.length > 0) && !(includeTool && hasToolLike)) {
+    if (!includeUser && !includeSystem && !(includeModel && aiResponses.length > 0) && !(includeTool && hasToolLike) && !(includeSubagent && subagentSummaries.length > 0)) {
         return finalizeResult("");
     }
 
     const lines: string[] = [];
     pushLine(lines, `## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`);
 
-    if (includeUser || includeSystem) {
-        if (!pushLine(lines, includeSystem
-            ? `### 🧩 系统/压缩内容 (step ${round.startStep})`
-            : `### 👤 用户 (step ${round.startStep})`)) {
-            appendBudgetWarning(lines);
-            return finalizeResult(lines.join("\n").trimEnd());
+    const renderUserMessages = (asSystem: boolean): void => {
+        for (const message of userMessages) {
+            const stepIndex = message.stepIndex ?? round.startStep;
+            if (!pushLine(lines, asSystem
+                ? `### 🧩 系统/压缩内容 (step ${stepIndex})`
+                : `### 👤 用户 (step ${stepIndex})`)) break;
+            const messageLines: string[] = [];
+            renderHumanMessageContent(messageLines, message, depth, truncateForRoleView);
+            for (const line of messageLines) {
+                if (!pushLine(lines, line)) break;
+            }
+            const attachments = message.attachments || (userMessages.length === 1 ? round.attachments || [] : []);
+            for (const attachment of attachments) {
+                const label = attachment.kind === "image" ? "图片" : "文件";
+                const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
+                if (!pushLine(lines, `📎 ${label}: ${target}`)) break;
+            }
+            const mediaAttachments = message.mediaAttachments || (userMessages.length === 1 ? round.mediaAttachments || [] : []);
+            for (const uri of mediaAttachments) {
+                if (!pushLine(lines, `📎 图片: ${uri}`)) break;
+            }
+            if (budgetState.exceeded || !pushLine(lines, "")) break;
         }
+    };
+
+    if (includeSystem) {
         if (round.compactionSummaries?.length) {
+            if (!pushLine(lines, `### 🧩 系统/压缩内容 (step ${round.startStep})`)) {
+                appendBudgetWarning(lines);
+                return finalizeResult(lines.join("\n").trimEnd());
+            }
             for (const item of round.compactionSummaries) {
                 const meta = `chars=${item.summaryChars}, sha256=${item.summarySha256.slice(0, 12)}`;
                 if (compactionMode === "full" || depth === "full") {
@@ -789,24 +1095,18 @@ export function formatRoundForMessageRoles(
                     if (!pushLine(lines, "说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。")) break;
                 }
             }
-        } else if (!pushLine(lines, truncateForRoleView(round.userMessage, depth))) {
-            appendBudgetWarning(lines);
-            return finalizeResult(lines.join("\n").trimEnd());
-        }
-        if (!budgetState.exceeded && includeUser && round.attachments?.length) {
-            for (const attachment of round.attachments) {
-                const label = attachment.kind === "image" ? "图片" : "文件";
-                const target = attachment.tempPath || attachment.originalPath || attachment.name || "JSONL 内联图片";
-                if (!pushLine(lines, `📎 ${label}: ${target}`)) break;
+            if (!budgetState.exceeded) pushLine(lines, "");
+        } else if (explicitSystemEvents.length > 0) {
+            for (const event of explicitSystemEvents) {
+                if (!pushLine(lines, `### 🧩 系统/压缩内容 (step ${event.stepIndex ?? round.startStep})`)) break;
+                if (!pushLine(lines, truncateForRoleView(event.text || "", depth))) break;
+                if (!pushLine(lines, "")) break;
             }
+        } else {
+            renderUserMessages(true);
         }
-        if (!budgetState.exceeded && includeUser && round.mediaAttachments.length > 0) {
-            for (const uri of round.mediaAttachments) {
-                if (!pushLine(lines, `📎 图片: ${uri}`)) break;
-            }
-        }
-        if (!budgetState.exceeded) pushLine(lines, "");
     }
+    if (includeUser) renderUserMessages(false);
 
     const mergeAiTool = includeModel && includeTool;
 
@@ -841,11 +1141,11 @@ export function formatRoundForMessageRoles(
         const SENTINEL = round.endStep + 1_000_000;
         const safeStep = (s: number) => (Number.isFinite(s) ? s : SENTINEL);
         if (includeModel) {
-            for (const ai of round.aiResponses) {
+            for (const ai of aiResponses) {
                 events.push({ step: safeStep(ai.stepIndex), seq: seq++, isTool: false, render: () => renderAiBlock(ai) });
             }
         }
-        for (const tc of round.toolCalls) {
+        for (const tc of toolCalls) {
             events.push({ step: safeStep(tc.stepIndex), seq: seq++, isTool: true, render: () => renderToolLine(tc) });
         }
         events.sort((a, b) => a.step - b.step || a.seq - b.seq);
@@ -868,12 +1168,12 @@ export function formatRoundForMessageRoles(
         }
         if (!budgetState.exceeded && prevToolStep !== null) pushLine(lines, "");
     } else if (!budgetState.exceeded && includeModel) {
-        for (const ai of round.aiResponses) {
+        for (const ai of aiResponses) {
             if (!renderAiBlock(ai)) break;
         }
-    } else if (!budgetState.exceeded && includeTool && round.toolCalls.length > 0) {
+    } else if (!budgetState.exceeded && includeTool && toolCalls.length > 0) {
         if (pushLine(lines, "#### 🔧 工具调用")) {
-            for (const tc of round.toolCalls) {
+            for (const tc of toolCalls) {
                 if (!renderToolLine(tc)) break;
             }
             if (!budgetState.exceeded) pushLine(lines, "");
@@ -888,12 +1188,7 @@ export function formatRoundForMessageRoles(
             }
         }
         if (!budgetState.exceeded && round.codeActions.length > 0 && (extraTypes.includes("code_actions") || extraTypes.includes("code_diffs"))) {
-            if (pushLine(lines, "#### ✏️ 代码编辑")) {
-                for (const ca of round.codeActions) {
-                    if (!pushLine(lines, `- **${ca.targetFile}**: ${ca.description}`)) break;
-                }
-                if (!budgetState.exceeded) pushLine(lines, "");
-            }
+            renderCodeActionSection(round, extraTypes, (line) => pushLine(lines, line));
         }
         if (!budgetState.exceeded && round.fileViews?.length && extraTypes.includes("file_views")) {
             if (pushLine(lines, "#### 📄 文件/计划视图")) {
@@ -903,13 +1198,17 @@ export function formatRoundForMessageRoles(
                 if (!budgetState.exceeded) pushLine(lines, "");
             }
         }
-        if (!budgetState.exceeded && round.subagentSummaries.length > 0) {
-            if (pushLine(lines, "#### 🤝 子代理线程")) {
-                for (const subagent of round.subagentSummaries) {
-                    if (!pushLine(lines, `- ${subagent.nickname || subagent.threadId} (${subagent.threadId})${subagent.role ? ` / ${subagent.role}` : ""}`)) break;
-                }
-                if (!budgetState.exceeded) pushLine(lines, "");
+    }
+
+    if (!budgetState.exceeded && includeSubagent && subagentSummaries.length > 0) {
+        if (pushLine(lines, "#### 🤝 子代理线程")) {
+            for (const subagent of subagentSummaries) {
+                const detail = subagent.status || subagent.summary || subagent.prompt || "";
+                if (!pushLine(lines, detail
+                    ? `- ${formatSubagentLabel(subagent)}: ${truncateForRoleView(detail, depth)}`
+                    : `- ${formatSubagentLabel(subagent)}`)) break;
             }
+            if (!budgetState.exceeded) pushLine(lines, "");
         }
     }
 
@@ -1093,9 +1392,22 @@ export function searchInRounds(
             });
         }
 
-        // 搜索 AI 回复
-        for (const ai of round.aiResponses) {
-            const aiLower = ai.response.toLowerCase();
+        const aiTexts = [
+            ...getRoundAiResponses(round).flatMap((ai) => [
+                ai.response,
+                ai.thinking,
+                ...ai.toolCalls.map((toolCall) => toolCall.args),
+            ]),
+            ...getRoundToolCalls(round).flatMap((toolCall) => [
+                toolCall.argsFull || toolCall.argsSummary,
+                toolCall.resultFull || toolCall.resultSummary,
+            ]),
+        ];
+        const seenAiTexts = new Set<string>();
+        for (const aiText of aiTexts) {
+            if (!aiText || seenAiTexts.has(aiText)) continue;
+            seenAiTexts.add(aiText);
+            const aiLower = aiText.toLowerCase();
             const aiHits = tokens.filter(t => aiLower.includes(t));
             if (aiHits.length > 0) {
                 const firstToken = aiHits[0];
@@ -1103,7 +1415,7 @@ export function searchInRounds(
                 candidates.push({
                     roundIndex: round.roundIndex,
                     matchType: "ai",
-                    matchText: extractContext(ai.response, idx, firstToken.length, 100),
+                    matchText: extractContext(aiText, idx, firstToken.length, 100),
                     contextStart: idx,
                     hitCount: aiHits.length,
                 });

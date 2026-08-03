@@ -1,6 +1,7 @@
 import crypto from "crypto";
 import fs from "fs";
 import path from "path";
+import { readFiniteIntegerEnv } from "./conversation-source-cache.js";
 import { TEMP_DIR } from "./temp-store.js";
 import type { ConversationRound } from "./trajectory.js";
 
@@ -49,6 +50,11 @@ const DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const DEFAULT_MATERIALIZE_LIMIT = 20;
 const DEFAULT_MATERIALIZE_CONCURRENCY = 4;
 const LARGE_BASE64_DECODE_YIELD_BYTES = 1024 * 1024;
+
+function readFinitePositiveInteger(value: unknown, fallback: number): number {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
 
 function yieldToEventLoop(): Promise<void> {
     return new Promise(resolve => setImmediate(resolve));
@@ -328,7 +334,7 @@ async function mapLimit<T, R>(
 ): Promise<R[]> {
     const results: R[] = new Array(items.length);
     let nextIndex = 0;
-    const runners = Array.from({ length: Math.max(1, concurrency) }, async () => {
+    const runners = Array.from({ length: Math.min(items.length, concurrency) }, async () => {
         while (nextIndex < items.length) {
             const index = nextIndex++;
             results[index] = await worker(items[index], index);
@@ -428,17 +434,32 @@ export async function materializeRoundAttachments(
         shouldAbort?: () => boolean;
     } = {},
 ): Promise<{ rounds: ConversationRound[]; truncated: number; budgetExceeded?: boolean }> {
-    const limit = Math.max(0, options.limit ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT || DEFAULT_MATERIALIZE_LIMIT));
-    const maxBytes = Math.max(1, options.maxBytes ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES || DEFAULT_MAX_ATTACHMENT_BYTES));
-    const maxTotalBytes = Math.max(1, options.maxTotalBytes ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES || DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES));
-    const concurrency = Math.max(1, options.concurrency ?? Number(process.env.MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY || DEFAULT_MATERIALIZE_CONCURRENCY));
+    const limit = options.limit === undefined
+        ? readFiniteIntegerEnv("MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT", DEFAULT_MATERIALIZE_LIMIT)
+        : readFinitePositiveInteger(options.limit, DEFAULT_MATERIALIZE_LIMIT);
+    const maxBytes = options.maxBytes === undefined
+        ? readFiniteIntegerEnv("MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES", DEFAULT_MAX_ATTACHMENT_BYTES)
+        : readFinitePositiveInteger(options.maxBytes, DEFAULT_MAX_ATTACHMENT_BYTES);
+    const maxTotalBytes = options.maxTotalBytes === undefined
+        ? readFiniteIntegerEnv("MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES", DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES)
+        : readFinitePositiveInteger(options.maxTotalBytes, DEFAULT_MAX_TOTAL_ATTACHMENT_BYTES);
+    const concurrency = options.concurrency === undefined
+        ? readFiniteIntegerEnv("MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY", DEFAULT_MATERIALIZE_CONCURRENCY)
+        : readFinitePositiveInteger(options.concurrency, DEFAULT_MATERIALIZE_CONCURRENCY);
     const cache = new Map<string, ConversationAttachment>();
     let remainingTotalBytes = maxTotalBytes;
     let budgetExceeded = false;
 
     let remaining = limit;
     let truncated = 0;
-    const cloned = rounds.map(round => ({ ...round, attachments: round.attachments ? [...round.attachments] : undefined }));
+    const cloned = rounds.map(round => ({
+        ...round,
+        attachments: round.attachments ? [...round.attachments] : undefined,
+        userMessages: round.userMessages?.map(message => ({
+            ...message,
+            attachments: message.attachments ? [...message.attachments] : undefined,
+        })),
+    }));
     const jobs: Array<{ round: ConversationRound; attachment: ConversationAttachment; index: number }> = [];
     const hasBudgetExpired = (): boolean => Number.isFinite(options.deadlineAt) && Date.now() >= Number(options.deadlineAt);
     const markBudgetExceeded = (): void => {
@@ -526,6 +547,20 @@ export async function materializeRoundAttachments(
     for (let i = 0; i < jobs.length; i++) {
         const job = jobs[i];
         if (job.round.attachments) job.round.attachments[job.index] = materialized[i];
+    }
+
+    for (const round of cloned) {
+        const materializedByDataUrl = new Map<string, ConversationAttachment>();
+        for (const attachment of round.attachments || []) {
+            if (attachment.dataUrl) materializedByDataUrl.set(attachment.dataUrl, attachment);
+        }
+        for (const message of round.userMessages || []) {
+            if (!message.attachments) continue;
+            message.attachments = message.attachments.map(attachment => {
+                const resolved = attachment.dataUrl ? materializedByDataUrl.get(attachment.dataUrl) : undefined;
+                return resolved ? { ...attachment, ...resolved } : attachment;
+            });
+        }
     }
 
     return { rounds: cloned, truncated, budgetExceeded: budgetExceeded || hasBudgetExpired() };

@@ -308,11 +308,15 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 
 跨链路读取时指定 `dataChain`：antigravity / codex / claude-code / windsurf
 
+`fetch` 会把宿主原始数据规范化为可复用缓存，后续 search/read/full/diff 从该缓存派生，不反复解析原始 JSONL/PB。`source="auto|local|ls|cache"` 可选择来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时使用响应给出的 `continuationCursor` / 下一段参数继续，不把截断误当成完整结果。
+
 读取对话历史时如果遇到图片/附件路径（如 `claude-code-attachments/` 下的 `.png`、`.jpg` 文件），要主动用 `Read` 工具查看内容，不要只报路径给用户。图片往往是理解对话上下文的关键信息。
 
 **从对话里「导出」图片/附件**：直接用 `conversation_read_original` 读自己当前对话——响应里就会带图片/附件的本地文件路径，复制路径即可拿到文件（不需要任何额外导出步骤；附件同理）。Plan/Task 场景的具体用法见「图片/附件处理（Plan/Task 全周期）」。
 
 ### Record（record_manage）
+
+Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record/Stage Guard 从排队、恢复到完成始终查询首次返回的同一公开 taskId，不因重试或后端恢复重复新建任务。
 
 对话的结构化过程日志，`record_manage(action="update")` 触发生成。
 跨链路走 Codex 模型时建议 `background=true`。

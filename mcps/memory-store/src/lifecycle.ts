@@ -37,19 +37,19 @@ const STDIN_LOG_FILE = path.join(os.tmpdir(), "mcp-memory-stdin-log.txt");
 export function touchActivity(options: { skipRecordAutoCheck?: boolean } = {}): void {
     lastMcpActivity = Date.now();
     if (options.skipRecordAutoCheck) return;
-    if (shouldSkipRecordAutoCheckForHost()) return;
+    if (!isRecordAutoUpdateEnabledForHost()) return;
     if (Date.now() - lastRecordCheckMs >= RECORD_CHECK_INTERVAL_MS) {
         lastRecordCheckMs = Date.now();
         triggerRecordAutoCheck().catch(() => { });
     }
 }
 
-function shouldSkipRecordAutoCheckForHost(): boolean {
-    if (process.env.MEMORY_STORE_AUTO_RECORD === "0") return true;
+export function isRecordAutoUpdateEnabledForHost(): boolean {
+    if (process.env.MEMORY_STORE_AUTO_RECORD === "0") return false;
     if (process.env.CODEX_MCP_WRAPPER === "1" && process.env.MEMORY_STORE_CODEX_AUTO_RECORD !== "1") {
-        return true;
+        return false;
     }
-    return false;
+    return true;
 }
 
 /**

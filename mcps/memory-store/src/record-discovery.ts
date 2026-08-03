@@ -7,6 +7,7 @@ import {
     canonicalSourceIdentityKey,
     canonicalizeSourceIdentity as canonicalizeContractSourceIdentity,
     canonicalizeSourceWorkspaceIdentity,
+    isVerifiedConversationCacheEnumeration,
     type ExactFetchEvidence,
     type FullSourceReadEvidence,
     type LostObservation,
@@ -510,10 +511,13 @@ function dedupeBy<Value>(values: readonly Value[], keyFor: (value: Value) => str
     return sortByCanonical([...unique.values()]);
 }
 
-function completeEnumeration(evidence: SourceEnumerationEvidence, targetStatus: "present" | "absent"): boolean {
+function completeEnumeration(envelope: SourceEnumerationEnvelope, targetStatus: "present" | "absent"): boolean {
+    const evidence = envelope.evidence;
+    const authorityAccepted = evidence.cacheBypassed
+        || (targetStatus === "present" && isVerifiedConversationCacheEnumeration(evidence, envelope.exactFetch));
     return evidence.targetStatus === targetStatus
         && evidence.enumerationComplete
-        && evidence.cacheBypassed
+        && authorityAccepted
         && evidence.errors.length === 0
         && evidence.pagination.cursor === null
         && evidence.pagination.limit === null
@@ -559,9 +563,6 @@ function classifyRevision(
         return { classification: "Unresolved", reason: reason("record-covered-revision-missing", refs), sourceRevision };
     }
     if (sourceRevision.revision === coveredRevision.revision) {
-        if (sourceRevision.sequence !== null && coveredRevision.sequence !== null && sourceRevision.sequence !== coveredRevision.sequence) {
-            return { classification: "Conflict", reason: reason("revision-sequence-conflict", refs), sourceRevision };
-        }
         return { classification: "Fresh", reason: reason("record-covered-current-source", refs), sourceRevision };
     }
     if (sourceRevision.sequence === null || coveredRevision.sequence === null) {
@@ -585,7 +586,7 @@ function boundLostReason(
     for (const observation of observations) {
         const enumeration = enumerationsByHash.get(observation.evidence.enumerationEvidenceHash);
         if (!enumeration) return reason("lost-observation-unbound", [observation.evidence.evidenceHash]);
-        if (!completeEnumeration(enumeration.evidence, "absent")) {
+        if (!completeEnumeration(enumeration, "absent")) {
             return reason("source-enumeration-incomplete", [enumeration.evidence.evidenceHash]);
         }
         if (sourceIdentityKey(sourceIdentityFromEvidence(enumeration.evidence)) !== sourceIdentityKey(sourceIdentityFromEvidence(observation.evidence))) {
@@ -665,10 +666,11 @@ function classifyCandidate(args: {
     }
 
     if (present.length > 0) {
-        if (present.some(envelope => !envelope.evidence.cacheBypassed)) {
+        if (present.some(envelope => !envelope.evidence.cacheBypassed
+            && !isVerifiedConversationCacheEnumeration(envelope.evidence, envelope.exactFetch))) {
             return { classification: "Unresolved", reason: reason("source-enumeration-cache-not-bypassed", sourceRefs), sourceRevision: null };
         }
-        if (present.some(envelope => !completeEnumeration(envelope.evidence, "present"))) {
+        if (present.some(envelope => !completeEnumeration(envelope, "present"))) {
             return { classification: "Unresolved", reason: reason("source-enumeration-incomplete", sourceRefs), sourceRevision: null };
         }
         if (new Set(present.map(enumerationSignature)).size !== 1) {
@@ -700,7 +702,7 @@ function classifyCandidate(args: {
     if (args.enumerations.some(envelope => !envelope.evidence.cacheBypassed)) {
         return { classification: "Unresolved", reason: reason("source-enumeration-cache-not-bypassed", sourceRefs), sourceRevision: null };
     }
-    if (args.enumerations.some(envelope => !completeEnumeration(envelope.evidence, "absent"))) {
+    if (args.enumerations.some(envelope => !completeEnumeration(envelope, "absent"))) {
         return { classification: "Unresolved", reason: reason("source-enumeration-incomplete", sourceRefs), sourceRevision: null };
     }
     const lost = boundLostReason(args.enumerations, args.observations);
@@ -986,13 +988,35 @@ export function createRecordSourceSnapshot(input: unknown): Immutable<RecordSour
         });
     }
     const sourceRead = parsed.data;
-    if (sourceRead.candidateId !== candidateIdForSource(sourceRead.source)
-        || sourceIdentityKey(sourceRead.source) !== sourceIdentityKey(sourceIdentityFromEvidence(sourceRead.fullSourceRead))) {
+    const expectedCandidateId = candidateIdForSource(sourceRead.source);
+    const candidateIdentity = sourceRead.source.identity;
+    const fullReadIdentity = sourceIdentityFromEvidence(sourceRead.fullSourceRead).identity;
+    const identityFieldPairs: Array<[string, unknown, unknown]> = [
+        ["workspace.workspaceId", candidateIdentity.workspace.workspaceId, fullReadIdentity.workspace.workspaceId],
+        ["workspace.canonicalPath", candidateIdentity.workspace.canonicalPath, fullReadIdentity.workspace.canonicalPath],
+        ["source.kind", candidateIdentity.source.kind, fullReadIdentity.source.kind],
+        ["source.authority", candidateIdentity.source.authority, fullReadIdentity.source.authority],
+        ["source.authoritativeRoot", candidateIdentity.source.authoritativeRoot, fullReadIdentity.source.authoritativeRoot],
+        ["source.canonicalPath", candidateIdentity.source.canonicalPath, fullReadIdentity.source.canonicalPath],
+        ["conversationId", candidateIdentity.conversationId, fullReadIdentity.conversationId],
+    ];
+    const mismatchedIdentityFields = identityFieldPairs
+        .filter(([, candidateValue, fullReadValue]) => canonicalSerialize(candidateValue) !== canonicalSerialize(fullReadValue))
+        .map(([field]) => field);
+    if (sourceRead.candidateId !== expectedCandidateId || mismatchedIdentityFields.length > 0) {
         return deepFreeze({
             status: "rejected",
             classification: "Unresolved",
             reason: "candidate-identity-mismatch",
-            issues: ["candidateId, source identity, and full source read identity must be canonical and equal"],
+            issues: [
+                ...(sourceRead.candidateId === expectedCandidateId ? [] : ["candidateId does not match the canonical source identity"]),
+                ...(mismatchedIdentityFields.length === 0
+                    ? []
+                    : [
+                        `source identity fields differ: ${mismatchedIdentityFields.join(", ")}`,
+                        `source identity authorities differ: candidate=${candidateIdentity.source.kind}:${candidateIdentity.source.authority}; full=${fullReadIdentity.source.kind}:${fullReadIdentity.source.authority}`,
+                    ]),
+            ],
         });
     }
     try {

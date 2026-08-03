@@ -320,6 +320,26 @@ export function canonicalSerialize(value: unknown): string {
     return canonicalSerializeValue(value);
 }
 
+export function isVerifiedConversationCacheEnumeration(
+    enumeration: SourceEnumerationEvidence,
+    exactFetch: ExactFetchEvidence | undefined,
+): boolean {
+    if (!exactFetch || enumeration.cacheBypassed || exactFetch.cacheBypassed) return false;
+    const usesVerifiedCacheIdentity = (value: SourceEnumerationEvidence | ExactFetchEvidence): boolean => (
+        value.identity.source.authority === "memory-store-fetch-cache"
+        && value.identity.source.authoritativeRoot.startsWith("conversation-cache:")
+        && value.sourceRevision.revision.trim().length > 0
+        && value.sourceRevision.eventWatermark?.startsWith("cache-fingerprint:") === true
+    );
+    return usesVerifiedCacheIdentity(enumeration)
+        && usesVerifiedCacheIdentity(exactFetch)
+        && canonicalSerialize(enumeration.identity) === canonicalSerialize(exactFetch.identity)
+        && canonicalSerialize(enumeration.sourceRevision) === canonicalSerialize(exactFetch.sourceRevision)
+        && enumeration.observedAt.scanId === exactFetch.observedAt.scanId
+        && exactFetch.exactFetchResult === "present"
+        && exactFetch.errors.length === 0;
+}
+
 export function canonicalizeSourceWorkspaceIdentity(input: SourceWorkspaceIdentity): SourceWorkspaceIdentity {
     return parseWorkspaceIdentity(input, "source workspace identity");
 }
@@ -622,7 +642,14 @@ function validateEligibleRecordSourceRead(value: unknown): FullSourceReadEvidenc
     if (read.exactFetchResult !== "present") throw new SourceEvidenceContractError("RecordSourceSnapshot 必须来自 exact present 的完整读取");
     if (read.errors.length > 0) throw new SourceEvidenceContractError("RecordSourceSnapshot 不能绑定有错误的读取");
     if (!read.enumerationComplete) throw new SourceEvidenceContractError("RecordSourceSnapshot 必须来自完整枚举");
-    if (!read.cacheBypassed) throw new SourceEvidenceContractError("RecordSourceSnapshot 必须绕过缓存");
+    const verifiedConversationCache = !read.cacheBypassed
+        && read.identity.source.authority === "memory-store-fetch-cache"
+        && read.identity.source.authoritativeRoot.startsWith("conversation-cache:")
+        && read.sourceRevision.revision.trim().length > 0
+        && read.sourceRevision.eventWatermark?.startsWith("cache-fingerprint:") === true;
+    if (!read.cacheBypassed && !verifiedConversationCache) {
+        throw new SourceEvidenceContractError("RecordSourceSnapshot 必须绕过缓存，或绑定已校验的不可变 fetch 缓存 generation");
+    }
     const paginationReason = paginationFailure(read.pagination);
     if (paginationReason) throw new SourceEvidenceContractError(`RecordSourceSnapshot 分页不完整: ${paginationReason}`);
     if (read.content.mode !== "full" || read.content.truncated || read.content.staleCache) {

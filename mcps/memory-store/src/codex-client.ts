@@ -53,6 +53,10 @@ export interface CodexSubagentSummary {
     role?: string;
     prompt?: string;
     summary?: string;
+    status?: string;
+    rawRole?: string;
+    semanticRole?: "subagent";
+    attachments?: ConversationAttachment[];
 }
 
 export interface CodexConversationData {
@@ -63,6 +67,8 @@ export interface CodexConversationData {
     childThreads: CodexSubagentSummary[];
     expandedChildren?: Array<{ thread: CodexThreadInfo; rounds: ConversationRound[] }>;
     childDiagnostics?: CodexChildThreadDiagnostic[];
+    sourceCheckpoints?: CodexSourceByteCheckpoint[];
+    sourceCheckpoint?: CodexRoundTailCheckpoint;
 }
 
 export interface CodexChildThreadDiagnostic {
@@ -134,7 +140,6 @@ const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, "sessions");
 const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_HOME, "archived_sessions");
 const CODEX_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CODEX_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
 const CODEX_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CODEX_JSONL_MAX_LINE_CHARS || 64 * 1024 * 1024);
-const CODEX_TEXT_FIELD_MAX_CHARS = Number(process.env.MEMORY_STORE_CODEX_TEXT_FIELD_MAX_CHARS || 200_000);
 const CODEX_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CODEX_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CODEX_AGENTS_HEADER_PREFIX = "# AGENTS.md instructions";
@@ -245,19 +250,40 @@ function parseCodexSessionIndexLine(line: string): [string, CodexSessionIndexEnt
 
 async function forEachCodexJsonlLineAsync(
     filePath: string,
-    onLine: (line: string) => void | Promise<void>,
+    onLine: (line: string, byteOffset: number) => void | Promise<void>,
     options: {
+        startByte?: number;
+        endByte?: number;
         maxLineChars?: number;
         onOversizedLine?: (chars: number, isTail: boolean) => void | Promise<void>;
+        isCancelled?: () => boolean;
     } = {},
 ): Promise<void> {
+    const throwIfCancelled = (): void => {
+        if (!options.isCancelled?.()) return;
+        const error = new Error("Codex conversation read cancelled");
+        error.name = "AbortError";
+        throw error;
+    };
+    throwIfCancelled();
+    const requiresFixedRange = options.startByte !== undefined || options.endByte !== undefined;
+    const stat = requiresFixedRange ? await fs.promises.stat(filePath) : null;
+    throwIfCancelled();
     const handle = await fs.promises.open(filePath, "r");
     const decoder = new StringDecoder("utf8");
     const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
     const maxLineChars = options.maxLineChars || CODEX_JSONL_MAX_LINE_CHARS;
+    const startByte = options.startByte ?? 0;
+    const endByte = options.endByte;
+    if (!Number.isSafeInteger(startByte) || startByte < 0 || (endByte !== undefined && (!Number.isSafeInteger(endByte) || endByte < startByte || endByte > (stat?.size ?? 0)))) {
+        throw new Error("Codex JSONL byte range is invalid");
+    }
     let pending = "";
+    let position = startByte;
+    let lineOffset = startByte;
     let skippingOversizedLine = false;
     let skippedChars = 0;
+    let skippedBytes = 0;
     let linesSinceYield = 0;
     let chunksSinceYield = 0;
 
@@ -275,36 +301,47 @@ async function forEachCodexJsonlLineAsync(
             await eventLoopYield();
         }
     };
-    const processLine = async (line: string) => {
+    const processLine = async (line: string, terminated: boolean) => {
+        throwIfCancelled();
         const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
-        if (trimmed.trim()) await onLine(trimmed);
+        const byteOffset = lineOffset;
+        lineOffset += Buffer.byteLength(line, "utf8") + (terminated ? 1 : 0);
+        if (trimmed.trim()) await onLine(trimmed, byteOffset);
+        throwIfCancelled();
         await yieldAfterLine();
     };
 
     try {
-        while (true) {
-            const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        while (endByte === undefined || position < endByte) {
+            throwIfCancelled();
+            const { bytesRead } = await handle.read(buffer, 0, endByte === undefined ? buffer.length : Math.min(buffer.length, endByte - position), position);
+            throwIfCancelled();
             if (bytesRead === 0) break;
+            position += bytesRead;
             let chunk = decoder.write(buffer.subarray(0, bytesRead));
 
             if (skippingOversizedLine) {
                 const newlineIndex = chunk.indexOf("\n");
                 if (newlineIndex < 0) {
                     skippedChars += chunk.length;
+                    skippedBytes += Buffer.byteLength(chunk, "utf8");
                     await yieldAfterChunk();
                     continue;
                 }
                 skippedChars += newlineIndex;
+                skippedBytes += Buffer.byteLength(chunk.slice(0, newlineIndex), "utf8");
                 await options.onOversizedLine?.(skippedChars, false);
                 chunk = chunk.slice(newlineIndex + 1);
+                lineOffset += skippedBytes + 1;
                 skippingOversizedLine = false;
                 skippedChars = 0;
+                skippedBytes = 0;
             }
 
             pending += chunk;
             let newlineIndex = pending.indexOf("\n");
             while (newlineIndex >= 0) {
-                await processLine(pending.slice(0, newlineIndex));
+                await processLine(pending.slice(0, newlineIndex), true);
                 pending = pending.slice(newlineIndex + 1);
                 newlineIndex = pending.indexOf("\n");
             }
@@ -312,6 +349,7 @@ async function forEachCodexJsonlLineAsync(
             if (pending.length > maxLineChars) {
                 skippingOversizedLine = true;
                 skippedChars = pending.length;
+                skippedBytes = Buffer.byteLength(pending, "utf8");
                 pending = "";
             }
             await yieldAfterChunk();
@@ -323,7 +361,7 @@ async function forEachCodexJsonlLineAsync(
             skippedChars += pending.length;
             await options.onOversizedLine?.(skippedChars, true);
         } else if (pending) {
-            await processLine(pending);
+            await processLine(pending, false);
         }
     } finally {
         await handle.close();
@@ -1004,6 +1042,141 @@ function isCodexAgentsUserMessageEvent(event: any): boolean {
     return Boolean(getCodexAgentsInstructionsBlock(extractRawCodexMessageText(payload)));
 }
 
+type CodexUserSemanticRole = "user" | "system" | "subagent";
+
+interface CodexUserSemanticSegment {
+    role: CodexUserSemanticRole;
+    kind: string;
+    text: string;
+    subagent?: CodexSubagentSummary;
+}
+
+const CODEX_SYSTEM_USER_ENVELOPES = [
+    ["<codex_delegation>", "</codex_delegation>", "delegation"],
+    ["<environment_context>", "</environment_context>", "environment_context"],
+    ["<developer_instructions>", "</developer_instructions>", "developer_instructions"],
+    ["<permissions instructions>", "</permissions instructions>", "permissions"],
+    ["<collaboration_mode>", "</collaboration_mode>", "collaboration_mode"],
+    ["<apps_instructions>", "</apps_instructions>", "apps_instructions"],
+    ["<plugins_instructions>", "</plugins_instructions>", "plugins_instructions"],
+    ["<skills_instructions>", "</skills_instructions>", "skills_instructions"],
+    ["<app-context>", "</app-context>", "app_context"],
+    ["<turn_aborted>", "</turn_aborted>", "turn_aborted"],
+] as const;
+
+function codexSubagentNotificationSummary(block: string): CodexSubagentSummary {
+    const open = "<subagent_notification>";
+    const close = "</subagent_notification>";
+    const jsonText = block.slice(open.length, block.length - close.length).trim();
+    try {
+        const parsed = JSON.parse(jsonText) as Record<string, any>;
+        const statusValue = parsed.status;
+        const statusKey = typeof statusValue === "string"
+            ? statusValue
+            : statusValue && typeof statusValue === "object"
+                ? ["completed", "errored", "failed", "cancelled", "shutdown", "running"]
+                    .find(key => statusValue[key] !== undefined) || "updated"
+                : "updated";
+        const summaryValue = typeof statusValue === "string"
+            ? statusValue
+            : statusValue && typeof statusValue === "object"
+                ? statusValue[statusKey]
+                : "";
+        return {
+            threadId: typeof parsed.agent_path === "string" ? parsed.agent_path : "",
+            nickname: typeof parsed.agent_nickname === "string" ? parsed.agent_nickname : "subagent",
+            role: typeof parsed.agent_role === "string" ? parsed.agent_role : undefined,
+            summary: typeof summaryValue === "string" ? summaryValue : stringifyCompact(summaryValue, 2_000),
+            status: statusKey,
+            rawRole: "response_item.message.user.subagent_notification",
+            semanticRole: "subagent",
+        };
+    } catch {
+        return {
+            threadId: "",
+            nickname: "subagent",
+            summary: block,
+            status: "unparsed",
+            rawRole: "response_item.message.user.subagent_notification",
+            semanticRole: "subagent",
+        };
+    }
+}
+
+function splitCodexUserSemanticSegments(text: string): CodexUserSemanticSegment[] {
+    const segments: CodexUserSemanticSegment[] = [];
+    let remaining = text.trim();
+    while (remaining) {
+        if (remaining.startsWith(CODEX_AGENTS_FOLDED_MARKER)) {
+            const lineEnd = remaining.indexOf("\n");
+            const end = lineEnd < 0 ? remaining.length : lineEnd;
+            segments.push({ role: "system", kind: "agents_instructions", text: remaining.slice(0, end).trim() });
+            remaining = remaining.slice(end).trimStart();
+            continue;
+        }
+        if (remaining.startsWith("<subagent_notification>")) {
+            const close = "</subagent_notification>";
+            const closeIndex = remaining.indexOf(close);
+            if (closeIndex >= 0) {
+                const end = closeIndex + close.length;
+                const block = remaining.slice(0, end);
+                segments.push({
+                    role: "subagent",
+                    kind: "subagent_notification",
+                    text: block,
+                    subagent: codexSubagentNotificationSummary(block),
+                });
+                remaining = remaining.slice(end).trimStart();
+                continue;
+            }
+        }
+        let matchedSystemEnvelope = false;
+        for (const [open, close, kind] of CODEX_SYSTEM_USER_ENVELOPES) {
+            if (!remaining.startsWith(open)) continue;
+            const closeIndex = remaining.indexOf(close, open.length);
+            if (closeIndex < 0) continue;
+            const end = closeIndex + close.length;
+            segments.push({ role: "system", kind, text: remaining.slice(0, end) });
+            remaining = remaining.slice(end).trimStart();
+            matchedSystemEnvelope = true;
+            break;
+        }
+        if (matchedSystemEnvelope) continue;
+        segments.push({ role: "user", kind: "message", text: remaining });
+        break;
+    }
+    return segments;
+}
+
+interface CodexMessageStableId {
+    namespace: "message" | "item" | "id" | "client";
+    value: string;
+}
+
+function codexStableIdValue(namespace: CodexMessageStableId["namespace"], ...candidates: unknown[]): CodexMessageStableId | null {
+    for (const candidate of candidates) {
+        if (typeof candidate === "string" && candidate.trim()) return { namespace, value: candidate };
+    }
+    return null;
+}
+
+function codexMessageStableId(event: unknown, payload: Record<string, unknown>): CodexMessageStableId | null {
+    const eventFields = event && typeof event === "object" && !Array.isArray(event)
+        ? event as Record<string, unknown>
+        : {};
+    return codexStableIdValue("message", payload.message_id, payload.messageId, eventFields.message_id, eventFields.messageId)
+        || codexStableIdValue("item", payload.item_id, payload.itemId, eventFields.item_id, eventFields.itemId)
+        || codexStableIdValue("id", payload.id, eventFields.id)
+        || codexStableIdValue("client", payload.client_id, payload.clientId, eventFields.client_id, eventFields.clientId);
+}
+
+function normalizeCodexMirrorText(text: string): string {
+    return normalizeProbeText(text.replace(
+        /<image\s+name=\[Image\s+#[^\]]+\]\s+path=(?:"[^"]*"|'[^']*')\s*><\/image>/giu,
+        " ",
+    ));
+}
+
 function extractRawCodexMessageText(payload: any): string {
     return extractText(Array.isArray(payload?.content) ? payload.content : []);
 }
@@ -1028,19 +1201,97 @@ function truncate(text: string, maxLen: number): string {
     return text.slice(0, maxLen) + "...";
 }
 
-function truncateCodexTextField(text: string, label: string): string {
-    if (!text || text.length <= CODEX_TEXT_FIELD_MAX_CHARS) return text;
-    return `${text.slice(0, CODEX_TEXT_FIELD_MAX_CHARS)}\n\n[... Codex ${label} 过长，读取层已截断 ${text.length - CODEX_TEXT_FIELD_MAX_CHARS} 字；可用更小轮次范围或原始文件定点查看 ...]`;
+function codexBinaryReference(value: string, mimeType?: string): string {
+    return `[binary omitted${mimeType ? ` mime=${mimeType}` : ""} chars=${value.length} sha256=${sha256Short(value)}]`;
+}
+
+function looksLikeBase64(value: string): boolean {
+    return value.length >= 128 && /^[A-Za-z0-9+/=\s]+$/u.test(value);
+}
+
+function sanitizeCodexCacheText(text: string): string {
+    return text.replace(/data:([^;,]+)?;base64,([A-Za-z0-9+/=]+)/giu, (dataUrl, mimeType) => codexBinaryReference(dataUrl, mimeType));
+}
+
+function sanitizeCodexCacheAttachments(attachments: any[]): any[] {
+    return attachments.map((attachment) => {
+        if (typeof attachment?.dataUrl !== "string") return attachment;
+        const dataUrl = attachment.dataUrl;
+        const base64 = dataUrl.slice(dataUrl.indexOf(",") + 1).replace(/\s+/gu, "");
+        const sizeBytes = Math.max(0, Math.floor((base64.length * 3) / 4) - (base64.endsWith("==") ? 2 : base64.endsWith("=") ? 1 : 0));
+        const { dataUrl: _dataUrl, ...safeAttachment } = attachment;
+        return {
+            ...safeAttachment,
+            sha256: safeAttachment.sha256 || `sha256:${createHash("sha256").update(dataUrl).digest("hex")}`,
+            sizeBytes: safeAttachment.sizeBytes ?? sizeBytes,
+            warning: [safeAttachment.warning, "Codex attachment data URL omitted from cache; hash retained"].filter(Boolean).join("; "),
+        };
+    });
+}
+
+function sanitizeCodexCacheValue(value: any, key = "", seen = new WeakSet<object>()): any {
+    if (typeof value === "string") {
+        if ((key === "signature" || /(?:^|_)(?:data|base64|bytes|blob|binary)$/iu.test(key)) && looksLikeBase64(value)) {
+            return codexBinaryReference(value);
+        }
+        return sanitizeCodexCacheText(value);
+    }
+    if (value === undefined || value === null || typeof value !== "object") return value;
+    if (Buffer.isBuffer(value)) return codexBinaryReference(value.toString("base64"));
+    if (seen.has(value)) return "[circular reference omitted]";
+    seen.add(value);
+    if (Array.isArray(value)) {
+        const items = value.map((item) => sanitizeCodexCacheValue(item, "", seen));
+        seen.delete(value);
+        return items;
+    }
+    const copy: Record<string, unknown> = {};
+    for (const [entryKey, entry] of Object.entries(value)) {
+        copy[entryKey] = sanitizeCodexCacheValue(entry, entryKey, seen);
+    }
+    seen.delete(value);
+    return copy;
+}
+
+function serializeCodexCacheValue(value: any): string {
+    if (value === undefined || value === null) return "";
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+            try {
+                return JSON.stringify(sanitizeCodexCacheValue(JSON.parse(value)));
+            } catch {
+                return sanitizeCodexCacheText(value);
+            }
+        }
+        return sanitizeCodexCacheText(value);
+    }
+    try {
+        return JSON.stringify(sanitizeCodexCacheValue(value));
+    } catch {
+        return sanitizeCodexCacheText(String(value));
+    }
 }
 
 function stringifyCompact(value: any, maxLen: number): string {
-    if (typeof value === "string") return truncate(value, maxLen);
     if (value === undefined || value === null) return "";
-    try {
-        return truncate(JSON.stringify(value), maxLen);
-    } catch {
-        return truncate(String(value), maxLen);
-    }
+    return truncate(serializeCodexCacheValue(value), maxLen);
+}
+
+function makeCodexToolCall(stepIndex: number, name: string, args: any): ConversationRound["toolCalls"][number] {
+    const argsFull = serializeCodexCacheValue(args);
+    return { stepIndex, name, argsSummary: truncate(argsFull, 120), argsFull, resultSummary: "" };
+}
+
+function setCodexToolCallResult(
+    toolCall: ConversationRound["toolCalls"][number],
+    result: any,
+    summary: any = result,
+    overwrite = false,
+): void {
+    const resultFull = serializeCodexCacheValue(result);
+    if (overwrite || !toolCall.resultSummary) toolCall.resultSummary = truncate(serializeCodexCacheValue(summary), 500);
+    if (overwrite || !toolCall.resultFull) toolCall.resultFull = resultFull;
 }
 
 function extractReasoningText(payload: any): string {
@@ -1100,7 +1351,7 @@ function summarizeMcpResult(result: any): string {
     const ok = result?.Ok ?? result?.ok ?? result;
     if (Array.isArray(ok?.content)) {
         return ok.content
-            .map((item: any) => item?.text || item?.type || "")
+            .map((item: any) => typeof item?.text === "string" ? sanitizeCodexCacheText(item.text) : item?.type || "")
             .filter(Boolean)
             .join("\n");
     }
@@ -1313,7 +1564,7 @@ export function matchCodexContextProbeInEvents(events: any[], probe: string): Co
         const payload = event?.payload || {};
 
         if (type === "response_item" && payload.type === "message") {
-            const text = truncateCodexTextField(extractCodexMessageText(payload, { events, eventIndex }), "message");
+            const text = sanitizeCodexCacheText(extractCodexMessageText(payload, { events, eventIndex }));
             if (payload.role === "user") {
                 roundIndex += 1;
                 activeRound = roundIndex;
@@ -1328,7 +1579,7 @@ export function matchCodexContextProbeInEvents(events: any[], probe: string): Co
         }
 
         if (type === "event_msg" && payload.type === "user_message") {
-            const text = truncateCodexTextField(extractEventMessageText(payload), "user_message");
+            const text = sanitizeCodexCacheText(extractEventMessageText(payload));
             const normalized = normalizeProbeText(text);
             if (normalized && normalized !== lastUserMessage) {
                 roundIndex += 1;
@@ -1341,7 +1592,7 @@ export function matchCodexContextProbeInEvents(events: any[], probe: string): Co
 
         if (type === "event_msg" && payload.type === "agent_message") {
             if (!activeRound) activeRound = Math.max(roundIndex, 1);
-            const text = truncateCodexTextField(extractEventMessageText(payload), "agent_message");
+            const text = sanitizeCodexCacheText(extractEventMessageText(payload));
             const normalized = normalizeProbeText(text);
             if (normalized && normalized !== lastAssistantMessage) {
                 lastAssistantMessage = normalized;
@@ -1351,12 +1602,12 @@ export function matchCodexContextProbeInEvents(events: any[], probe: string): Co
         }
 
         if (type === "response_item" && payload.type === "reasoning") {
-            addHit("reasoning", truncateCodexTextField(extractReasoningText(payload), "reasoning"));
+            addHit("reasoning", sanitizeCodexCacheText(extractReasoningText(payload)));
             continue;
         }
 
         if (type === "event_msg" && payload.type === "agent_reasoning") {
-            addHit("reasoning", truncateCodexTextField(extractReasoningText(payload), "agent_reasoning"));
+            addHit("reasoning", sanitizeCodexCacheText(extractReasoningText(payload)));
             continue;
         }
 
@@ -1422,12 +1673,11 @@ function makeCodexTextEntriesFromEvent(
     };
 
     if (type === "response_item" && payload.type === "message") {
-        const text = truncateCodexTextField(
+        const text = sanitizeCodexCacheText(
             options.foldAgents === false ? extractText(payload.content || []) : extractCodexMessageText(payload, {
                 events: options.events,
                 eventIndex: options.eventIndex,
             }),
-            "message",
         );
         if (payload.role === "user") {
             state.roundIndex += 1;
@@ -1443,7 +1693,7 @@ function makeCodexTextEntriesFromEvent(
     }
 
     if (type === "event_msg" && payload.type === "user_message") {
-        const text = truncateCodexTextField(extractEventMessageText(payload), "user_message");
+        const text = sanitizeCodexCacheText(extractEventMessageText(payload));
         const normalized = normalizeProbeText(text);
         if (normalized && normalized !== state.lastUserMessage) {
             state.roundIndex += 1;
@@ -1456,7 +1706,7 @@ function makeCodexTextEntriesFromEvent(
 
     if (type === "event_msg" && payload.type === "agent_message") {
         if (!state.activeRound) state.activeRound = Math.max(state.roundIndex, 1);
-        const text = truncateCodexTextField(extractEventMessageText(payload), "agent_message");
+        const text = sanitizeCodexCacheText(extractEventMessageText(payload));
         const normalized = normalizeProbeText(text);
         if (normalized && normalized !== state.lastAssistantMessage) {
             state.lastAssistantMessage = normalized;
@@ -1466,11 +1716,11 @@ function makeCodexTextEntriesFromEvent(
     }
 
     if (type === "response_item" && payload.type === "reasoning") {
-        add("reasoning", truncateCodexTextField(extractReasoningText(payload), "reasoning"));
+        add("reasoning", sanitizeCodexCacheText(extractReasoningText(payload)));
         return entries;
     }
     if (type === "event_msg" && payload.type === "agent_reasoning") {
-        add("reasoning", truncateCodexTextField(extractReasoningText(payload), "agent_reasoning"));
+        add("reasoning", sanitizeCodexCacheText(extractReasoningText(payload)));
         return entries;
     }
     if (type === "event_msg" && payload.type === "item_completed") {
@@ -1928,7 +2178,7 @@ export function getCodexRootThread(threadId: string): CodexThreadInfo | null {
     return current.id === threadId ? null : current;
 }
 
-export function buildCodexRoundsForTest(
+function buildCodexRoundsLegacy(
     events: any[],
     link: ConversationLinkMode,
     options: { cwd?: string } = {},
@@ -1975,11 +2225,11 @@ export function buildCodexRoundsForTest(
         const payload = event?.payload || {};
 
         if (type === "response_item" && payload.type === "message") {
-            const text = truncateCodexTextField(extractCodexMessageText(payload, { events, eventIndex }), "message");
+            const text = sanitizeCodexCacheText(extractCodexMessageText(payload, { events, eventIndex }));
             if (payload.role === "user") {
                 pushCurrent();
                 roundIndex += 1;
-                const attachments = extractCodexMessageAttachments(payload.content || [], text, { cwd: options.cwd, stepIndex: syntheticStep });
+            const attachments = sanitizeCodexCacheAttachments(extractCodexMessageAttachments(payload.content || [], text, { cwd: options.cwd, stepIndex: syntheticStep }));
                 currentRound = {
                     roundIndex,
                     startStep: syntheticStep,
@@ -2008,8 +2258,8 @@ export function buildCodexRoundsForTest(
         }
 
         if (type === "event_msg" && payload.type === "user_message") {
-            const text = truncateCodexTextField(extractEventMessageText(payload), "user_message");
-            const attachments = extractCodexEventUserAttachments(payload, { cwd: options.cwd, stepIndex: syntheticStep });
+            const text = sanitizeCodexCacheText(extractEventMessageText(payload));
+            const attachments = sanitizeCodexCacheAttachments(extractCodexEventUserAttachments(payload, { cwd: options.cwd, stepIndex: syntheticStep }));
             const normalized = normalizeProbeText(text);
             const currentNormalized = currentRound ? normalizeProbeText(currentRound.userMessage) : "";
             if (
@@ -2048,7 +2298,7 @@ export function buildCodexRoundsForTest(
         const round = ensureRound();
 
         if (type === "response_item" && payload.type === "reasoning") {
-            const text = truncateCodexTextField(extractReasoningText(payload), "reasoning");
+            const text = sanitizeCodexCacheText(extractReasoningText(payload));
             if (!appendThinking(round, text) && text.trim()) {
                 const clean = text.trim();
                 if (!pendingThinking.includes(clean)) {
@@ -2059,7 +2309,7 @@ export function buildCodexRoundsForTest(
         }
 
         if (type === "event_msg" && payload.type === "agent_reasoning") {
-            const text = truncateCodexTextField(extractReasoningText(payload), "agent_reasoning");
+            const text = sanitizeCodexCacheText(extractReasoningText(payload));
             if (!appendThinking(round, text) && text.trim()) {
                 const clean = text.trim();
                 if (!pendingThinking.includes(clean)) {
@@ -2070,12 +2320,11 @@ export function buildCodexRoundsForTest(
         }
 
         if (type === "response_item" && payload.type === "function_call") {
-            const index = round.toolCalls.push({
-                stepIndex: syntheticStep,
-                name: payload.name || "unknown",
-                argsSummary: truncate(payload.arguments || "", 120),
-                resultSummary: "",
-            }) - 1;
+            const index = round.toolCalls.push(makeCodexToolCall(
+                syntheticStep,
+                payload.name || "unknown",
+                payload.arguments || "",
+            )) - 1;
             if (payload.call_id) {
                 toolCallMap.set(payload.call_id, { round, index });
             }
@@ -2083,12 +2332,11 @@ export function buildCodexRoundsForTest(
         }
 
         if (type === "response_item" && payload.type === "custom_tool_call") {
-            const index = round.toolCalls.push({
-                stepIndex: syntheticStep,
-                name: payload.name || "custom_tool",
-                argsSummary: stringifyCompact(payload.input || payload.arguments || "", 120),
-                resultSummary: "",
-            }) - 1;
+            const index = round.toolCalls.push(makeCodexToolCall(
+                syntheticStep,
+                payload.name || "custom_tool",
+                payload.input || payload.arguments || "",
+            )) - 1;
             if (payload.call_id) {
                 toolCallMap.set(payload.call_id, { round, index });
             }
@@ -2097,23 +2345,13 @@ export function buildCodexRoundsForTest(
 
         if (type === "response_item" && payload.type === "function_call_output") {
             const slot = payload.call_id ? toolCallMap.get(payload.call_id) : null;
-            if (slot) {
-                const current = slot.round.toolCalls[slot.index].resultSummary;
-                if (!current) {
-                    slot.round.toolCalls[slot.index].resultSummary = truncate(payload.output || "", 500);
-                }
-            }
+            if (slot && !slot.round.toolCalls[slot.index].resultFull) setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.output || "");
             continue;
         }
 
         if (type === "response_item" && payload.type === "custom_tool_call_output") {
             const slot = payload.call_id ? toolCallMap.get(payload.call_id) : null;
-            if (slot) {
-                const current = slot.round.toolCalls[slot.index].resultSummary;
-                if (!current) {
-                    slot.round.toolCalls[slot.index].resultSummary = stringifyCompact(payload.output || "", 500);
-                }
-            }
+            if (slot && !slot.round.toolCalls[slot.index].resultFull) setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.output || "");
             continue;
         }
 
@@ -2121,14 +2359,11 @@ export function buildCodexRoundsForTest(
             const slot = payload.call_id ? toolCallMap.get(payload.call_id) : null;
             const result = payload.aggregated_output || payload.stdout || payload.stderr || payload.formatted_output || "";
             if (slot) {
-                slot.round.toolCalls[slot.index].resultSummary = truncate(result, 500);
+                setCodexToolCallResult(slot.round.toolCalls[slot.index], result, result, true);
             } else {
-                round.toolCalls.push({
-                    stepIndex: syntheticStep,
-                    name: "exec_command",
-                    argsSummary: truncate(summarizeCommand(payload.command), 120),
-                    resultSummary: truncate(result, 500),
-                });
+                const toolCall = makeCodexToolCall(syntheticStep, "exec_command", summarizeCommand(payload.command));
+                setCodexToolCallResult(toolCall, result);
+                round.toolCalls.push(toolCall);
             }
             continue;
         }
@@ -2142,14 +2377,11 @@ export function buildCodexRoundsForTest(
             const slot = payload.call_id ? toolCallMap.get(payload.call_id) : null;
             if (slot) {
                 slot.round.toolCalls[slot.index].name = slot.round.toolCalls[slot.index].name || name;
-                slot.round.toolCalls[slot.index].resultSummary = truncate(result, 500);
+                setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.result, result, true);
             } else {
-                round.toolCalls.push({
-                    stepIndex: syntheticStep,
-                    name,
-                    argsSummary: stringifyCompact(invocation.arguments || {}, 120),
-                    resultSummary: truncate(result, 500),
-                });
+                const toolCall = makeCodexToolCall(syntheticStep, name, invocation.arguments || {});
+                setCodexToolCallResult(toolCall, payload.result, result);
+                round.toolCalls.push(toolCall);
             }
             continue;
         }
@@ -2172,7 +2404,7 @@ export function buildCodexRoundsForTest(
             }
             const slot = payload.call_id ? toolCallMap.get(payload.call_id) : null;
             if (slot) {
-                slot.round.toolCalls[slot.index].resultSummary = truncate(payload.stdout || payload.stderr || payload.status || "", 500);
+                setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.stdout || payload.stderr || payload.status || "", undefined, true);
             }
             continue;
         }
@@ -2234,6 +2466,929 @@ export function buildCodexRoundsForTest(
     return {
         rounds,
         childThreads: [...childMap.values()],
+    };
+}
+
+export type CodexSourceCheckpointKind = "round_start" | "thinking" | "tool_call" | "tool_result" | "agents";
+
+export interface CodexSourceByteCheckpoint {
+    kind: CodexSourceCheckpointKind;
+    roundIndex: number;
+    sourceByte: number;
+}
+
+export interface CodexRoundBuildResult {
+    rounds: ConversationRound[];
+    childThreads: CodexSubagentSummary[];
+    totalSteps: number;
+    peakBufferedEvents: number;
+    sourceCheckpoints: CodexSourceByteCheckpoint[];
+    lastRound?: ConversationRound;
+}
+
+class CodexRoundBuilder {
+    private readonly rounds: ConversationRound[] = [];
+    private readonly childMap = new Map<string, CodexSubagentSummary>();
+    private readonly toolCallMap = new Map<string, { round: ConversationRound; index: number }>();
+    private currentRound: ConversationRound | null = null;
+    private currentRoundHasModelOutput = false;
+    private roundIndex = 0;
+    private syntheticStep = 0;
+    private pendingThinking = "";
+    private currentRoundStartByte: number | null = null;
+    private readonly sourceCheckpoints: CodexSourceByteCheckpoint[] = [];
+    private lastRound: ConversationRound | undefined;
+    private readonly pendingLeadingSemanticSegments: Array<{
+        segment: CodexUserSemanticSegment;
+        attachments: ConversationAttachment[];
+        rawRole: string;
+        stepIndex: number;
+        sourceByte?: number;
+    }> = [];
+    private messageMirrorCandidate: {
+        source: "response_item" | "event_msg";
+        semanticRole: "user" | "system" | "model" | "subagent";
+        normalizedText: string;
+        stableId: CodexMessageStableId | null;
+        hasAttachments: boolean;
+        stepIndex: number;
+    } | null = null;
+
+    constructor(
+        private readonly link: ConversationLinkMode,
+        private readonly options: {
+            cwd?: string;
+            onRound?: (round: ConversationRound) => void;
+            retainRounds?: boolean;
+        },
+    ) {}
+
+    private flushPendingLeadingSemanticSegments(): void {
+        const pending = this.pendingLeadingSemanticSegments.splice(0);
+        for (const item of pending) {
+            if (item.segment.role === "system") {
+                this.addSystemMessage(item.segment.text, item.rawRole, item.segment.kind, item.sourceByte, item.attachments, item.stepIndex);
+            } else if (item.segment.role === "subagent") {
+                this.addSubagentMessage(item.segment, item.attachments, item.rawRole, item.sourceByte, item.stepIndex);
+            }
+        }
+    }
+
+    private recordSourceCheckpoint(kind: Exclude<CodexSourceCheckpointKind, "round_start">, round: ConversationRound, sourceByte?: number): void {
+        if (!Number.isSafeInteger(sourceByte)) return;
+        this.sourceCheckpoints.push({ kind, roundIndex: round.roundIndex, sourceByte: sourceByte! });
+    }
+
+    private shouldSkipMessageMirror(
+        event: any,
+        payload: Record<string, unknown>,
+        source: "response_item" | "event_msg",
+        semanticRole: "user" | "system" | "model" | "subagent",
+        text: string,
+        hasAttachments = false,
+    ): boolean {
+        const normalizedText = normalizeCodexMirrorText(text);
+        const stableId = codexMessageStableId(event, payload);
+        const candidate = this.messageMirrorCandidate;
+        const stableIdsConflict = Boolean(
+            candidate?.stableId
+            && stableId
+            && candidate.stableId.namespace === stableId.namespace
+            && candidate.stableId.value !== stableId.value,
+        );
+        const sameStableId = Boolean(
+            candidate?.stableId
+            && stableId
+            && candidate.stableId.namespace === stableId.namespace
+            && candidate.stableId.value === stableId.value,
+        );
+        const samePayload = Boolean(
+            candidate
+            && candidate.normalizedText === normalizedText
+            && (normalizedText || (candidate.hasAttachments && hasAttachments)),
+        );
+        const stepDistance = candidate ? this.syntheticStep - candidate.stepIndex : Number.POSITIVE_INFINITY;
+        if (
+            candidate
+            && candidate.source !== source
+            && candidate.semanticRole === semanticRole
+            && !stableIdsConflict
+            && samePayload
+            && (stepDistance === 1 || (sameStableId && stepDistance <= 5))
+        ) {
+            this.messageMirrorCandidate = null;
+            return true;
+        }
+        this.messageMirrorCandidate = normalizedText || hasAttachments
+            ? { source, semanticRole, normalizedText, stableId, hasAttachments, stepIndex: this.syntheticStep }
+            : null;
+        return false;
+    }
+
+    private mergeMirroredAttachments(
+        attachments: ConversationAttachment[],
+        semanticRole: "user" | "system" | "model" | "subagent",
+    ): void {
+        if (!this.currentRound || attachments.length === 0) return;
+        mergeRoundAttachments(this.currentRound, attachments);
+        if (semanticRole === "user") {
+            const lastMessage = this.currentRound.userMessages?.at(-1);
+            if (lastMessage) lastMessage.attachments = mergeCodexEvidenceAttachments(lastMessage.attachments, attachments);
+            return;
+        }
+        const lastEvent = [...(this.currentRound.semanticEvents || [])].reverse().find(event => event.semanticRole === semanticRole);
+        if (!lastEvent) return;
+        lastEvent.attachments = mergeCodexEvidenceAttachments(lastEvent.attachments, attachments);
+        if (lastEvent.subagent) {
+            lastEvent.subagent.attachments = mergeCodexEvidenceAttachments(lastEvent.subagent.attachments, attachments);
+        }
+    }
+
+    private addSystemMessage(
+        text: string,
+        rawRole: string,
+        kind: string,
+        sourceByte?: number,
+        attachments: ConversationAttachment[] = [],
+        stepIndex = this.syntheticStep,
+    ): void {
+        if (!text.trim()) return;
+        if (!this.currentRound) {
+            this.pendingLeadingSemanticSegments.push({
+                segment: { role: "system", kind, text },
+                attachments,
+                rawRole,
+                stepIndex: this.syntheticStep,
+                sourceByte,
+            });
+            return;
+        }
+        const round = this.currentRound;
+        mergeRoundAttachments(round, attachments);
+        round.semanticEvents = [
+            ...(round.semanticEvents || []),
+            {
+                stepIndex,
+                rawRole,
+                semanticRole: "system",
+                kind,
+                text,
+                ...(attachments.length > 0 ? { attachments } : {}),
+            },
+        ];
+        if (kind === "agents_instructions") this.recordSourceCheckpoint("agents", round, sourceByte);
+        if (kind === "turn_aborted" && round.userMessages?.length) this.currentRoundHasModelOutput = true;
+    }
+
+    private addSubagentMessage(
+        segment: CodexUserSemanticSegment,
+        attachments: ConversationAttachment[],
+        rawRole: string,
+        sourceByte?: number,
+        stepIndex = this.syntheticStep,
+    ): void {
+        if (!this.currentRound) {
+            this.pendingLeadingSemanticSegments.push({ segment, attachments, rawRole, stepIndex: this.syntheticStep, sourceByte });
+            return;
+        }
+        const round = this.currentRound;
+        const parsed = segment.subagent || {
+            threadId: "",
+            nickname: "subagent",
+            summary: segment.text,
+            status: "updated",
+            rawRole,
+            semanticRole: "subagent" as const,
+        };
+        const compact: CodexSubagentSummary = {
+            ...parsed,
+            rawRole,
+            semanticRole: "subagent",
+            summary: this.link === "reference" ? undefined : truncate(parsed.summary || "", 300),
+            attachments: mergeCodexEvidenceAttachments(
+                this.childMap.get(parsed.threadId || "")?.attachments,
+                attachments,
+            ),
+        };
+        mergeRoundAttachments(round, attachments);
+        if (compact.threadId) this.childMap.set(compact.threadId, compact);
+        const existing = round.subagentSummaries.find(item => compact.threadId && item.threadId === compact.threadId);
+        if (existing) {
+            compact.attachments = mergeCodexEvidenceAttachments(existing.attachments, compact.attachments || []);
+            Object.assign(existing, compact);
+        }
+        else round.subagentSummaries.push(compact);
+        round.semanticEvents = [
+            ...(round.semanticEvents || []),
+            {
+                stepIndex,
+                rawRole,
+                semanticRole: "subagent",
+                kind: segment.kind,
+                text: segment.text,
+                name: compact.nickname,
+                subagent: compact,
+                attachments,
+            },
+        ];
+        this.currentRoundHasModelOutput = true;
+    }
+
+    private addAssistantMessage(text: string, rawRole: string, sourceByte?: number): void {
+        const round = this.currentRound;
+        if (!round) return;
+        if (text.trim()) {
+            round.aiResponses.push({
+                stepIndex: this.syntheticStep,
+                response: text,
+                thinking: this.pendingThinking,
+                toolCalls: [],
+            });
+            round.semanticEvents = [
+                ...(round.semanticEvents || []),
+                { stepIndex: this.syntheticStep, rawRole, semanticRole: "model", kind: "response" },
+            ];
+            this.pendingThinking = "";
+        }
+        this.currentRoundHasModelOutput = true;
+    }
+
+    private addUserSemanticSegments(
+        segments: CodexUserSemanticSegment[],
+        attachments: ConversationAttachment[],
+        rawRole: string,
+        sourceByte?: number,
+    ): void {
+        if (segments.length === 0 && attachments.length > 0) {
+            this.addUserMessage("", attachments, rawRole, sourceByte);
+            return;
+        }
+        let attachmentsAssigned = false;
+        for (const segment of segments) {
+            if (segment.role === "system") {
+                this.addSystemMessage(segment.text, rawRole, segment.kind, sourceByte, attachmentsAssigned ? [] : attachments);
+                attachmentsAssigned = true;
+            } else if (segment.role === "subagent") {
+                this.addSubagentMessage(segment, attachmentsAssigned ? [] : attachments, rawRole, sourceByte);
+                attachmentsAssigned = true;
+            } else {
+                this.addUserMessage(segment.text, attachmentsAssigned ? [] : attachments, rawRole, sourceByte);
+                attachmentsAssigned = true;
+            }
+        }
+        if (!attachmentsAssigned && attachments.length > 0) this.mergeMirroredAttachments(attachments, "system");
+    }
+
+    private pushCurrent(): void {
+        if (!this.currentRound) return;
+        const completedRound = this.currentRound;
+        completedRound.endStep = this.syntheticStep;
+        if (this.currentRoundStartByte !== null) {
+            this.sourceCheckpoints.push({
+                kind: "round_start",
+                roundIndex: completedRound.roundIndex,
+                sourceByte: this.currentRoundStartByte,
+            });
+        }
+        this.options.onRound?.(completedRound);
+        if (this.options.retainRounds !== false) this.rounds.push(completedRound);
+        this.lastRound = completedRound;
+        for (const [callId, slot] of this.toolCallMap) {
+            if (slot.round === completedRound && slot.round.toolCalls[slot.index]?.resultFull) {
+                this.toolCallMap.delete(callId);
+            }
+        }
+        this.currentRound = null;
+        this.currentRoundHasModelOutput = false;
+        this.currentRoundStartByte = null;
+    }
+
+    private addUserMessage(text: string, attachments: ConversationAttachment[], rawRole: string, sourceByte?: number): void {
+        const hasUserContent = Boolean(text) || attachments.length > 0;
+        if (!hasUserContent) return;
+        const userMessage = {
+            stepIndex: this.syntheticStep,
+            text,
+            rawRole,
+            semanticRole: "user" as const,
+            attachments,
+            mediaAttachments: [] as string[],
+        };
+        if (this.currentRound && !this.currentRoundHasModelOutput) {
+            mergeRoundAttachments(this.currentRound, attachments);
+            const existingMessages = this.currentRound.userMessages || (this.currentRound.userMessage === "(无显式用户消息)"
+                ? []
+                : [{ stepIndex: this.currentRound.startStep, text: this.currentRound.userMessage }]);
+            if (this.currentRound.userMessage === "(无显式用户消息)") {
+                this.currentRound.userMessage = text || "(仅附件)";
+                this.currentRound.userMessages = [userMessage];
+                this.currentRound.semanticEvents = [
+                    ...(this.currentRound.semanticEvents || []),
+                    { stepIndex: this.syntheticStep, rawRole, semanticRole: "user", kind: "message", text },
+                ];
+            } else {
+                this.currentRound.userMessages = [...existingMessages, userMessage];
+                this.currentRound.userMessage = this.currentRound.userMessages.map((message) => message.text).filter(Boolean).join("\n\n");
+                this.currentRound.semanticEvents = [
+                    ...(this.currentRound.semanticEvents || []),
+                    { stepIndex: this.syntheticStep, rawRole, semanticRole: "user", kind: "message", text },
+                ];
+            }
+            return;
+        }
+        this.pushCurrent();
+        this.roundIndex += 1;
+        this.currentRound = {
+            roundIndex: this.roundIndex,
+            startStep: this.syntheticStep,
+            endStep: this.syntheticStep,
+            userMessage: text || "(仅附件)",
+            mediaAttachments: [],
+            attachments,
+            aiResponses: [],
+            toolCalls: [],
+            taskBoundaries: [],
+            codeActions: [],
+            subagentSummaries: [],
+            fileViews: [],
+            userMessages: [userMessage],
+            semanticEvents: [],
+        };
+        this.flushPendingLeadingSemanticSegments();
+        this.currentRound.semanticEvents = [
+            ...(this.currentRound.semanticEvents || []),
+            { stepIndex: this.syntheticStep, rawRole, semanticRole: "user", kind: "message", text },
+        ];
+        this.currentRoundHasModelOutput = false;
+        this.currentRoundStartByte = Number.isSafeInteger(sourceByte) ? sourceByte! : null;
+    }
+
+    addEvent(event: any, options: { foldAgents?: boolean; sourceByte?: number; agentsInstructions?: boolean } = {}): void {
+        this.syntheticStep += 1;
+        const type = event?.type;
+        const payload = event?.payload || {};
+        const sourceByte = options.sourceByte;
+        if (type === "response_item" && payload.type === "message") {
+            const content = Array.isArray(payload.content) ? payload.content : [];
+            if (codexEvidenceToolOnlyContent(content)) return;
+            const rawText = extractRawCodexMessageText(payload);
+            if (payload.role === "user") {
+                const parsedAgents = options.agentsInstructions ? getCodexAgentsInstructionsBlock(rawText) : null;
+                const displayText = sanitizeCodexCacheText(options.foldAgents === false ? rawText : extractCodexMessageText(payload));
+                const segments = parsedAgents
+                    ? [
+                        { role: "system" as const, kind: "agents_instructions", text: foldCodexAgentsInstructionsText(parsedAgents.block) },
+                        ...splitCodexUserSemanticSegments(sanitizeCodexCacheText(parsedAgents.rest)),
+                    ]
+                    : splitCodexUserSemanticSegments(displayText);
+                const semanticRole = segments.some(segment => segment.role === "user")
+                    ? "user"
+                    : segments.some(segment => segment.role === "subagent")
+                        ? "subagent"
+                        : "system";
+                const attachments = sanitizeCodexCacheAttachments(extractCodexMessageAttachments(payload.content || [], rawText, {
+                    cwd: this.options.cwd,
+                    stepIndex: this.syntheticStep,
+                }));
+                if (this.shouldSkipMessageMirror(event, payload, "response_item", semanticRole, displayText, attachments.length > 0)) {
+                    this.mergeMirroredAttachments(attachments, semanticRole);
+                    return;
+                }
+                this.addUserSemanticSegments(segments, attachments, "response_item.message.user", sourceByte);
+            } else if (payload.role === "assistant") {
+                const text = sanitizeCodexCacheText(extractCodexMessageText(payload));
+                if (!this.shouldSkipMessageMirror(event, payload, "response_item", "model", text)) {
+                    this.addAssistantMessage(text, "response_item.message.assistant", sourceByte);
+                }
+            }
+            return;
+        }
+        if (type === "event_msg" && payload.type === "user_message") {
+            const text = sanitizeCodexCacheText(extractEventMessageText(payload));
+            const segments = splitCodexUserSemanticSegments(text);
+            const semanticRole = segments.some(segment => segment.role === "user")
+                ? "user"
+                : segments.some(segment => segment.role === "subagent")
+                    ? "subagent"
+                    : "system";
+            const attachments = sanitizeCodexCacheAttachments(extractCodexEventUserAttachments(payload, { cwd: this.options.cwd, stepIndex: this.syntheticStep }));
+            if (this.shouldSkipMessageMirror(event, payload, "event_msg", semanticRole, text, attachments.length > 0)) {
+                this.mergeMirroredAttachments(attachments, semanticRole);
+                return;
+            }
+            this.addUserSemanticSegments(segments, attachments, "event_msg.user_message", sourceByte);
+            return;
+        }
+        if (type === "event_msg" && payload.type === "agent_message") {
+            const text = sanitizeCodexCacheText(extractEventMessageText(payload));
+            if (!this.shouldSkipMessageMirror(event, payload, "event_msg", "model", text)) {
+                this.addAssistantMessage(text, "event_msg.agent_message", sourceByte);
+            }
+            return;
+        }
+        if (type === "event_msg" && payload.type === "turn_aborted") {
+            if (this.currentRound?.userMessages?.length) this.currentRoundHasModelOutput = true;
+            return;
+        }
+
+        const round = this.currentRound;
+        if (!round) return;
+        if (type === "response_item" && payload.type === "reasoning") {
+            this.appendThinking(round, sanitizeCodexCacheText(extractReasoningText(payload)));
+            this.recordSourceCheckpoint("thinking", round, sourceByte);
+            return;
+        }
+        if (type === "event_msg" && payload.type === "agent_reasoning") {
+            this.appendThinking(round, sanitizeCodexCacheText(extractReasoningText(payload)));
+            this.recordSourceCheckpoint("thinking", round, sourceByte);
+            return;
+        }
+        if (type === "response_item" && payload.type === "function_call") {
+            const index = round.toolCalls.push(makeCodexToolCall(
+                this.syntheticStep,
+                payload.name || "unknown",
+                payload.arguments || "",
+            )) - 1;
+            if (payload.call_id) this.toolCallMap.set(payload.call_id, { round, index });
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_call", round, sourceByte);
+            return;
+        }
+        if (type === "response_item" && payload.type === "custom_tool_call") {
+            const index = round.toolCalls.push(makeCodexToolCall(
+                this.syntheticStep,
+                payload.name || "custom_tool",
+                payload.input || payload.arguments || "",
+            )) - 1;
+            if (payload.call_id) this.toolCallMap.set(payload.call_id, { round, index });
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_call", round, sourceByte);
+            return;
+        }
+        if (type === "response_item" && payload.type === "function_call_output") {
+            const slot = payload.call_id ? this.toolCallMap.get(payload.call_id) : null;
+            if (slot && !slot.round.toolCalls[slot.index].resultFull) setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.output || "");
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_result", round, sourceByte);
+            return;
+        }
+        if (type === "response_item" && payload.type === "custom_tool_call_output") {
+            const slot = payload.call_id ? this.toolCallMap.get(payload.call_id) : null;
+            if (slot && !slot.round.toolCalls[slot.index].resultFull) setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.output || "");
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_result", round, sourceByte);
+            return;
+        }
+        if (type === "event_msg" && payload.type === "exec_command_end") {
+            const slot = payload.call_id ? this.toolCallMap.get(payload.call_id) : null;
+            const result = payload.aggregated_output || payload.stdout || payload.stderr || payload.formatted_output || "";
+            if (slot) {
+                setCodexToolCallResult(slot.round.toolCalls[slot.index], result, result, true);
+            } else {
+                const toolCall = makeCodexToolCall(this.syntheticStep, "exec_command", summarizeCommand(payload.command));
+                setCodexToolCallResult(toolCall, result);
+                round.toolCalls.push(toolCall);
+            }
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_result", round, sourceByte);
+            return;
+        }
+        if (type === "event_msg" && payload.type === "mcp_tool_call_end") {
+            const invocation = payload.invocation || {};
+            const name = invocation.tool ? [invocation.server || "mcp", invocation.tool].join("/") : "mcp_tool";
+            const result = summarizeMcpResult(payload.result);
+            const slot = payload.call_id ? this.toolCallMap.get(payload.call_id) : null;
+            if (slot) {
+                slot.round.toolCalls[slot.index].name = slot.round.toolCalls[slot.index].name || name;
+                setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.result, result, true);
+            } else {
+                const toolCall = makeCodexToolCall(this.syntheticStep, name, invocation.arguments || {});
+                setCodexToolCallResult(toolCall, payload.result, result);
+                round.toolCalls.push(toolCall);
+            }
+            this.currentRoundHasModelOutput = true;
+            this.recordSourceCheckpoint("tool_result", round, sourceByte);
+            return;
+        }
+        if (type === "event_msg" && payload.type === "patch_apply_end") {
+            for (const [file, change] of Object.entries(payload.changes || {})) {
+                const changeObj = change as any;
+                round.codeActions.push({
+                    stepIndex: this.syntheticStep,
+                    description: "Codex patch_apply_end: " + (changeObj?.type || "change"),
+                    targetFile: String(file),
+                    instruction: truncate(payload.stdout || payload.stderr || payload.status || "", 500),
+                    diffs: [{
+                        targetContent: "",
+                        replacementContent: "",
+                        unifiedDiff: unifiedDiffFromContent(String(file), changeObj),
+                    }],
+                });
+            }
+            const slot = payload.call_id ? this.toolCallMap.get(payload.call_id) : null;
+            if (slot) setCodexToolCallResult(slot.round.toolCalls[slot.index], payload.stdout || payload.stderr || payload.status || "", undefined, true);
+            this.currentRoundHasModelOutput = true;
+            return;
+        }
+        if (type === "event_msg" && payload.type === "item_completed") {
+            const item = payload.item || {};
+            const text = typeof item.text === "string" ? item.text : "";
+            round.fileViews = round.fileViews || [];
+            round.fileViews.push({
+                stepIndex: this.syntheticStep,
+                kind: item.type || "item",
+                id: item.id,
+                title: item.title || item.name,
+                textSummary: truncate(text || stringifyCompact(item, 500), 500),
+            });
+            this.currentRoundHasModelOutput = true;
+            return;
+        }
+        if (type === "event_msg" && payload.type === "collab_agent_spawn_end") {
+            const child = {
+                threadId: payload.new_thread_id || "",
+                nickname: payload.new_agent_nickname || "subagent",
+                role: payload.new_agent_role || "",
+                prompt: truncate(payload.prompt || "", 200),
+                summary: this.link === "reference" ? undefined : "运行中",
+            };
+            if (child.threadId) this.childMap.set(child.threadId, child);
+            round.subagentSummaries.push(child);
+            this.currentRoundHasModelOutput = true;
+            return;
+        }
+        if (type === "event_msg" && payload.type === "collab_waiting_end" && Array.isArray(payload.agent_statuses)) {
+            for (const item of payload.agent_statuses) {
+                const child: CodexSubagentSummary = this.childMap.get(item.thread_id) || {
+                    threadId: item.thread_id || "",
+                    nickname: item.agent_nickname || "subagent",
+                    role: item.agent_role || "",
+                };
+                if (this.link !== "reference") {
+                    child.summary = truncate(
+                        item.status?.completed ||
+                        item.status?.errored ||
+                        item.status?.failed ||
+                        item.status?.cancelled ||
+                        "已完成",
+                        300,
+                    );
+                }
+                this.childMap.set(child.threadId, child);
+                if (!round.subagentSummaries.find((existing) => existing.threadId === child.threadId)) {
+                    round.subagentSummaries.push(child);
+                }
+            }
+            this.currentRoundHasModelOutput = true;
+        }
+    }
+
+    private appendThinking(round: ConversationRound, text: string): void {
+        if (!appendThinking(round, text) && text.trim()) {
+            const clean = text.trim();
+            if (!this.pendingThinking.includes(clean)) {
+                this.pendingThinking = [this.pendingThinking, clean].filter(Boolean).join("\n\n");
+            }
+        }
+        this.currentRoundHasModelOutput = true;
+    }
+
+    finish(): { rounds: ConversationRound[]; childThreads: CodexSubagentSummary[]; sourceCheckpoints: CodexSourceByteCheckpoint[]; lastRound?: ConversationRound } {
+        this.pushCurrent();
+        return {
+            rounds: this.rounds,
+            childThreads: [...this.childMap.values()],
+            sourceCheckpoints: this.sourceCheckpoints,
+            lastRound: this.lastRound,
+        };
+    }
+}
+
+class CodexRoundEventCollector {
+    private readonly builder: CodexRoundBuilder;
+    private readonly bufferedEvents: Array<{ event: any; sourceByte?: number }> = [];
+    private totalSteps = 0;
+    private peakBufferedEvents = 0;
+
+    constructor(link: ConversationLinkMode, options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean }) {
+        this.builder = new CodexRoundBuilder(link, options);
+    }
+
+    addEvent(event: any, sourceByte?: number): void {
+        this.totalSteps += 1;
+        this.bufferedEvents.push({ event, sourceByte });
+        this.peakBufferedEvents = Math.max(this.peakBufferedEvents, this.bufferedEvents.length);
+        this.drain(false);
+    }
+
+    private agentsFoldDecision(): boolean | null {
+        const candidateText = extractRawCodexMessageText(this.bufferedEvents[0]?.event?.payload || {});
+        for (let index = 1; index < this.bufferedEvents.length && index <= 5; index += 1) {
+            const event = this.bufferedEvents[index].event;
+            const mirrorText = eventUserMessageText(event);
+            if (mirrorText) return normalizeProbeText(mirrorText) !== normalizeProbeText(candidateText);
+            const payload = event?.payload || {};
+            if (event?.type === "response_item" && payload.type === "message" && payload.role === "user") return true;
+        }
+        return this.bufferedEvents.length > 5 ? true : null;
+    }
+
+    private drain(forceFoldPendingAgents: boolean): void {
+        while (this.bufferedEvents.length > 0) {
+            const entry = this.bufferedEvents[0];
+            const event = entry.event;
+            if (!isCodexAgentsUserMessageEvent(event)) {
+                this.builder.addEvent(event, { sourceByte: entry.sourceByte });
+                this.bufferedEvents.shift();
+                continue;
+            }
+            const foldAgents = this.agentsFoldDecision();
+            if (foldAgents === null && !forceFoldPendingAgents) return;
+            this.builder.addEvent(event, {
+                ...(foldAgents === false ? { foldAgents: false } : {}),
+                sourceByte: entry.sourceByte,
+                agentsInstructions: foldAgents !== false,
+            });
+            this.bufferedEvents.shift();
+        }
+    }
+
+    finish(): CodexRoundBuildResult {
+        this.drain(true);
+        return { ...this.builder.finish(), totalSteps: this.totalSteps, peakBufferedEvents: this.peakBufferedEvents };
+    }
+}
+
+function buildCodexRoundsFromEvents(events: any[], link: ConversationLinkMode, options: { cwd?: string } = {}): CodexRoundBuildResult {
+    const collector = new CodexRoundEventCollector(link, options);
+    for (const event of events) collector.addEvent(event);
+    return collector.finish();
+}
+
+async function buildCodexRoundsFromRolloutAsync(
+    rolloutPath: string,
+    link: ConversationLinkMode,
+    options: {
+        cwd?: string;
+        startByte?: number;
+        endByte?: number;
+        onRound?: (round: ConversationRound) => void;
+        retainRounds?: boolean;
+        isCancelled?: () => boolean;
+    } = {},
+): Promise<CodexRoundBuildResult> {
+    const collector = new CodexRoundEventCollector(link, options);
+    try {
+        await forEachCodexJsonlLineAsync(rolloutPath, (line, sourceByte) => {
+            try {
+                collector.addEvent(sanitizeCodexEvent(JSON.parse(line)), sourceByte);
+            } catch {
+            }
+        }, {
+            startByte: options.startByte,
+            endByte: options.endByte,
+            onOversizedLine: (chars, isTail) => {
+                collector.addEvent(makeSkippedRolloutLineEvent(
+                    isTail ? "Codex rollout 尾部单行超过安全上限" : "Codex rollout 单行超过安全上限",
+                    chars,
+                ));
+            },
+            isCancelled: options.isCancelled,
+        });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") throw error;
+    }
+    return collector.finish();
+}
+
+export function buildCodexRoundsForTest(
+    events: any[],
+    link: ConversationLinkMode,
+    options: { cwd?: string } = {},
+): { rounds: ConversationRound[]; childThreads: CodexSubagentSummary[] } {
+    const built = buildCodexRoundsFromEvents(events, link, options);
+    return { rounds: built.rounds, childThreads: built.childThreads };
+}
+
+export async function buildCodexRoundsFromRolloutForTest(
+    rolloutPath: string,
+    link: ConversationLinkMode,
+    options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean; isCancelled?: () => boolean } = {},
+): Promise<CodexRoundBuildResult> {
+    return buildCodexRoundsFromRolloutAsync(rolloutPath, link, options);
+}
+
+const CODEX_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES = 8 * 1024;
+
+export interface CodexRoundTailCheckpoint {
+    version: 1;
+    sourceSize: number;
+    sourceMtimeMs: number;
+    anchorStartByte: number;
+    anchorSha256: string;
+    replayStartByte: number;
+    replayStartStep: number;
+    replaceFromRound: number;
+}
+
+export interface CodexRoundTailReadOptions {
+    cwd?: string;
+    startByte?: number;
+    checkpoint?: CodexRoundTailCheckpoint;
+    sourceChange?: "append" | "replace";
+}
+
+export interface CodexRoundTailReadResult {
+    status: "ok" | "unchanged" | "rebuild_required";
+    reason?: "checkpoint_required" | "checkpoint_mismatch" | "source_truncated" | "source_replaced" | "source_changed_during_read" | "source_unavailable";
+    replaceFromRound: number;
+    startByte: number;
+    sourceSize: number;
+    roundIndexOffset: number;
+    rounds: ConversationRound[];
+    childThreads: CodexSubagentSummary[];
+    totalSteps: number;
+    sourceCheckpoints: CodexSourceByteCheckpoint[];
+    checkpoint?: CodexRoundTailCheckpoint;
+}
+
+async function codexCheckpointAnchor(filePath: string, sourceSize: number): Promise<{ anchorStartByte: number; anchorSha256: string }> {
+    const anchorStartByte = Math.max(0, sourceSize - CODEX_INCREMENTAL_CHECKPOINT_ANCHOR_BYTES);
+    const length = sourceSize - anchorStartByte;
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+        const bytes = Buffer.allocUnsafe(length);
+        const { bytesRead } = await handle.read(bytes, 0, length, anchorStartByte);
+        if (bytesRead !== length) throw new Error("short Codex checkpoint anchor read");
+        return {
+            anchorStartByte,
+            anchorSha256: createHash("sha256").update(bytes).digest("hex"),
+        };
+    } finally {
+        await handle.close();
+    }
+}
+
+function rebaseCodexRoundTail(rounds: ConversationRound[], roundIndexOffset: number, stepIndexOffset: number): void {
+    const stepCollections = ["aiResponses", "toolCalls", "taskBoundaries", "codeActions", "fileViews", "userMessages", "semanticEvents", "attachments"];
+    for (const round of rounds) {
+        round.roundIndex += roundIndexOffset;
+        round.startStep += stepIndexOffset;
+        round.endStep += stepIndexOffset;
+        for (const collection of stepCollections) {
+            for (const item of (round as any)[collection] || []) {
+                if (typeof item?.stepIndex === "number") item.stepIndex += stepIndexOffset;
+            }
+        }
+    }
+}
+
+function codexTailRebuildRequired(
+    reason: NonNullable<CodexRoundTailReadResult["reason"]>,
+    startByte: number,
+    sourceSize: number,
+): CodexRoundTailReadResult {
+    return {
+        status: "rebuild_required",
+        reason,
+        replaceFromRound: 1,
+        startByte,
+        sourceSize,
+        roundIndexOffset: 0,
+        rounds: [],
+        childThreads: [],
+        totalSteps: 0,
+        sourceCheckpoints: [],
+    };
+}
+
+export async function readCodexRoundTail(
+    rolloutPath: string,
+    link: ConversationLinkMode,
+    options: CodexRoundTailReadOptions = {},
+): Promise<CodexRoundTailReadResult> {
+    let before: fs.Stats;
+    try {
+        before = await fs.promises.stat(rolloutPath);
+    } catch {
+        return codexTailRebuildRequired("source_unavailable", options.startByte || 0, 0);
+    }
+    if (!before.isFile()) return codexTailRebuildRequired("source_unavailable", options.startByte || 0, before.size);
+
+    const checkpoint = options.checkpoint;
+    if (!checkpoint && (options.startByte || 0) > 0) {
+        return codexTailRebuildRequired("checkpoint_required", options.startByte!, before.size);
+    }
+
+    const startByte = checkpoint ? checkpoint.replayStartByte : (options.startByte || 0);
+    if (!Number.isSafeInteger(startByte) || startByte < 0 || startByte > before.size) {
+        return codexTailRebuildRequired(checkpoint ? "source_truncated" : "checkpoint_mismatch", startByte, before.size);
+    }
+    if (checkpoint) {
+        if (options.sourceChange === "replace") {
+            return codexTailRebuildRequired("source_replaced", startByte, before.size);
+        }
+        if (options.startByte !== undefined && options.startByte !== checkpoint.replayStartByte) {
+            return codexTailRebuildRequired("checkpoint_mismatch", startByte, before.size);
+        }
+        if (before.size < checkpoint.sourceSize) {
+            return codexTailRebuildRequired("source_truncated", startByte, before.size);
+        }
+        if (before.size === checkpoint.sourceSize && before.mtimeMs !== checkpoint.sourceMtimeMs) {
+            return codexTailRebuildRequired("source_replaced", startByte, before.size);
+        }
+        try {
+            const anchor = await codexCheckpointAnchor(rolloutPath, checkpoint.sourceSize);
+            if (anchor.anchorStartByte !== checkpoint.anchorStartByte || anchor.anchorSha256 !== checkpoint.anchorSha256) {
+                return codexTailRebuildRequired("source_replaced", startByte, before.size);
+            }
+        } catch {
+            return codexTailRebuildRequired("source_unavailable", startByte, before.size);
+        }
+        if (before.size === checkpoint.sourceSize && before.mtimeMs === checkpoint.sourceMtimeMs) {
+            return {
+                status: "unchanged",
+                replaceFromRound: checkpoint.replaceFromRound,
+                startByte,
+                sourceSize: before.size,
+                roundIndexOffset: checkpoint.replaceFromRound - 1,
+                rounds: [],
+                childThreads: [],
+                totalSteps: 0,
+                sourceCheckpoints: [],
+                checkpoint,
+            };
+        }
+    }
+
+    const built = await buildCodexRoundsFromRolloutAsync(rolloutPath, link, {
+        cwd: options.cwd,
+        startByte,
+        endByte: before.size,
+    });
+    let after: fs.Stats;
+    try {
+        after = await fs.promises.stat(rolloutPath);
+    } catch {
+        return codexTailRebuildRequired("source_unavailable", startByte, before.size);
+    }
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+        return codexTailRebuildRequired("source_changed_during_read", startByte, after.size);
+    }
+
+    const replaceFromRound = checkpoint?.replaceFromRound || 1;
+    const roundIndexOffset = replaceFromRound - 1;
+    const stepIndexOffset = checkpoint ? checkpoint.replayStartStep - 1 : 0;
+    rebaseCodexRoundTail(built.rounds, roundIndexOffset, stepIndexOffset);
+    const sourceCheckpoints = built.sourceCheckpoints.map(item => ({ ...item, roundIndex: item.roundIndex + roundIndexOffset }));
+    const lastRoundCheckpoint = sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
+    const lastRound = lastRoundCheckpoint
+        ? built.rounds.find(round => round.roundIndex === lastRoundCheckpoint.roundIndex)
+        : undefined;
+    const anchor = await codexCheckpointAnchor(rolloutPath, before.size);
+    return {
+        status: "ok",
+        replaceFromRound,
+        startByte,
+        sourceSize: before.size,
+        roundIndexOffset,
+        rounds: built.rounds,
+        childThreads: built.childThreads,
+        totalSteps: built.totalSteps,
+        sourceCheckpoints,
+        checkpoint: {
+            version: 1,
+            sourceSize: before.size,
+            sourceMtimeMs: before.mtimeMs,
+            anchorStartByte: anchor.anchorStartByte,
+            anchorSha256: anchor.anchorSha256,
+            replayStartByte: lastRoundCheckpoint?.sourceByte ?? startByte,
+            replayStartStep: lastRound?.startStep ?? (stepIndexOffset + 1),
+            replaceFromRound: lastRoundCheckpoint?.roundIndex ?? replaceFromRound,
+        },
+    };
+}
+
+async function codexRoundTailCheckpointFromBuild(
+    rolloutPath: string,
+    built: CodexRoundBuildResult,
+): Promise<CodexRoundTailCheckpoint | undefined> {
+    const stat = await fs.promises.stat(rolloutPath);
+    if (!stat.isFile()) return undefined;
+    const lastRoundCheckpoint = built.sourceCheckpoints.filter(item => item.kind === "round_start").at(-1);
+    const lastRound = built.lastRound || (lastRoundCheckpoint
+        ? built.rounds.find(round => round.roundIndex === lastRoundCheckpoint.roundIndex)
+        : undefined);
+    const anchor = await codexCheckpointAnchor(rolloutPath, stat.size);
+    return {
+        version: 1,
+        sourceSize: stat.size,
+        sourceMtimeMs: stat.mtimeMs,
+        anchorStartByte: anchor.anchorStartByte,
+        anchorSha256: anchor.anchorSha256,
+        replayStartByte: lastRoundCheckpoint?.sourceByte ?? 0,
+        replayStartStep: lastRound?.startStep ?? 1,
+        replaceFromRound: lastRoundCheckpoint?.roundIndex ?? 1,
     };
 }
 
@@ -2311,12 +3466,12 @@ export async function loadCodexConversationAsync(
 ): Promise<CodexConversationData | null> {
     const thread = await getCodexThreadAsync(conversationId);
     if (!thread || !thread.rolloutPath) return null;
-    const [parentThread, events, edgeChildren] = await Promise.all([
+    const [parentThread, built, edgeChildren] = await Promise.all([
         getCodexParentThreadAsync(thread.id),
-        readRolloutEventsAsync(thread.rolloutPath),
+        buildCodexRoundsFromRolloutAsync(thread.rolloutPath, link, { cwd: thread.cwd }),
         readSpawnChildrenAsync(thread.id),
     ]);
-    const built = buildCodexRoundsForTest(events, link, { cwd: thread.cwd });
+    const sourceCheckpoint = await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built);
     for (const child of edgeChildren) {
         if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
             built.childThreads.push(child);
@@ -2366,11 +3521,99 @@ export async function loadCodexConversationAsync(
         thread,
         parentThread,
         rounds: built.rounds,
-        totalSteps: events.length,
+        totalSteps: built.totalSteps,
         childThreads: built.childThreads,
         expandedChildren,
         childDiagnostics,
+        sourceCheckpoints: built.sourceCheckpoints,
+        sourceCheckpoint,
     };
+}
+
+export async function loadCodexConversationToRoundSinkAsync(
+    conversationId: string,
+    onRound: (round: ConversationRound) => void,
+    link: Exclude<ConversationLinkMode, "expand_children"> = "summary",
+    control: {
+        isCancelled?: () => boolean;
+        expectedSource?: CodexSourceVersionExpectation;
+    } = {},
+): Promise<CodexConversationData | null> {
+    const throwIfCancelled = (): void => {
+        if (!control.isCancelled?.()) return;
+        const error = new Error("Codex conversation read cancelled");
+        error.name = "AbortError";
+        throw error;
+    };
+    throwIfCancelled();
+    const thread = await getCodexThreadAsync(conversationId);
+    if (!thread || !thread.rolloutPath) return null;
+    await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "before read");
+    const [parentThread, built, edgeChildren] = await Promise.all([
+        getCodexParentThreadAsync(thread.id),
+        buildCodexRoundsFromRolloutAsync(thread.rolloutPath, link, {
+            cwd: thread.cwd,
+            onRound,
+            retainRounds: false,
+            isCancelled: control.isCancelled,
+        }),
+        readSpawnChildrenAsync(thread.id),
+    ]);
+    throwIfCancelled();
+    await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "after read");
+    const sourceCheckpoint = await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built);
+    await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "after checkpoint");
+    for (const child of edgeChildren) {
+        if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
+            built.childThreads.push(child);
+        }
+    }
+    return {
+        thread,
+        parentThread,
+        rounds: [],
+        totalSteps: built.totalSteps,
+        childThreads: built.childThreads,
+        expandedChildren: [],
+        childDiagnostics: [],
+        sourceCheckpoints: built.sourceCheckpoints,
+        sourceCheckpoint,
+    };
+}
+
+export interface CodexSourceVersionExpectation {
+    sourcePath: string;
+    sourceSize: number;
+    sourceMtimeMs: number;
+}
+
+function canonicalCodexSourcePath(filePath: string): string {
+    const resolved = path.resolve(filePath);
+    return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+}
+
+export async function assertCodexSourceVersion(
+    rolloutPath: string,
+    expected: CodexSourceVersionExpectation | undefined,
+    stage: string,
+): Promise<void> {
+    if (!expected) return;
+    const actualPath = canonicalCodexSourcePath(rolloutPath);
+    const expectedPath = canonicalCodexSourcePath(expected.sourcePath);
+    let stat: fs.Stats;
+    try {
+        stat = await fs.promises.stat(rolloutPath);
+    } catch {
+        throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+    }
+    if (
+        actualPath !== expectedPath
+        || !stat.isFile()
+        || stat.size !== expected.sourceSize
+        || Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs)
+    ) {
+        throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+    }
 }
 
 export interface CodexSourceEvidencePaths {
@@ -2488,6 +3731,11 @@ interface CodexEvidenceMessages {
     roundEnd: number;
 }
 
+interface CodexProjectedEvidenceMessages extends CodexEvidenceMessages {
+    messageCount: number;
+    contentHash: string;
+}
+
 function codexEvidenceSha256(value: unknown): string {
     return `sha256:${createHash("sha256").update(canonicalSerialize(value), "utf8").digest("hex")}`;
 }
@@ -2521,6 +3769,23 @@ function resolveCodexEvidencePaths(options: CodexSourceEvidenceOptions): { state
         stateDbPath,
         rolloutRoots: [...new Set(rolloutRoots)],
         rootsExplicit,
+    };
+}
+
+export function resolveCodexSourceEvidenceIdentity(
+    options: Pick<CodexSourceEvidenceOptions, "conversationId" | "workspace" | "paths">,
+): SourceConversationIdentity {
+    const paths = resolveCodexEvidencePaths(options as CodexSourceEvidenceOptions);
+    const authoritativeRoot = paths.rolloutRoots[0] || path.dirname(paths.stateDbPath);
+    return {
+        workspace: options.workspace,
+        source: {
+            kind: "hybrid",
+            authority: "codex-local-state-db-rollout-jsonl",
+            authoritativeRoot,
+            canonicalPath: authoritativeRoot,
+        },
+        conversationId: options.conversationId,
     };
 }
 
@@ -2828,7 +4093,7 @@ function codexEvidenceAttachments(attachments: ConversationAttachment[]): Conver
     ) as ConversationAttachment);
 }
 
-function collectCodexEvidenceMessages(events: unknown[]): CodexEvidenceMessages {
+function collectCodexEvidenceMessagesLegacy(events: unknown[]): CodexEvidenceMessages {
     const messages: CodexSourceContentMessage[] = [];
     const sourceIndexesByMirrorId = new Map<string, number[]>();
     const mirrorIdOccurrences = new Map<string, number>();
@@ -2917,6 +4182,236 @@ function collectCodexEvidenceMessages(events: unknown[]): CodexEvidenceMessages 
     return { messages, roundEnd: Math.max(roundEnd, 1) };
 }
 
+class CodexEvidenceRoundProjector {
+    private readonly messages: CodexSourceContentMessage[] = [];
+    private readonly contentHash = createHash("sha256").update('{"messages":[', "utf8");
+    private readonly retainMessages: boolean;
+    private messageCount = 0;
+    private roundEnd = 0;
+
+    constructor(options: { retainMessages?: boolean } = {}) {
+        this.retainMessages = options.retainMessages !== false;
+    }
+
+    private addProjectedMessage(message: CodexSourceContentMessage): void {
+        if (this.messageCount > 0) this.contentHash.update(",", "utf8");
+        this.contentHash.update(canonicalSerialize(message), "utf8");
+        this.messageCount += 1;
+        if (this.retainMessages) this.messages.push(message);
+    }
+
+    addRound(round: ConversationRound): void {
+        const ordered: Array<{ stepIndex: number; sequence: number; message: CodexSourceContentMessage }> = [];
+        let sequence = 0;
+        const userMessages = round.userMessages?.length
+            ? round.userMessages
+            : round.userMessage && round.userMessage !== "(无显式用户消息)"
+                ? [{ stepIndex: round.startStep, text: round.userMessage, attachments: round.attachments }]
+                : [];
+        if (userMessages.length > 0) this.roundEnd += 1;
+        for (const message of userMessages) {
+            ordered.push({
+                stepIndex: message.stepIndex ?? round.startStep,
+                sequence: sequence += 1,
+                message: {
+                    role: "user",
+                    text: message.text.normalize("NFC"),
+                    ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+                },
+            });
+        }
+        for (const response of round.aiResponses) {
+            if (!response.response.trim()) continue;
+            ordered.push({
+                stepIndex: response.stepIndex,
+                sequence: sequence += 1,
+                message: { role: "assistant", text: response.response.normalize("NFC") },
+            });
+        }
+        for (const event of round.semanticEvents || []) {
+            if (event.semanticRole !== "subagent" || !event.text?.trim()) continue;
+            const parsed = codexSubagentNotificationSummary(event.text);
+            const shortId = parsed.threadId ? parsed.threadId.slice(0, 8) : "unknown";
+            const label = `Subagent-${parsed.nickname || "subagent"} (${shortId})`;
+            const detail = parsed.summary || event.text;
+            ordered.push({
+                stepIndex: event.stepIndex ?? round.endStep,
+                sequence: sequence += 1,
+                message: {
+                    role: "assistant",
+                    text: `${label}\n${detail}`.normalize("NFC"),
+                    ...(event.attachments?.length ? { attachments: event.attachments } : {}),
+                },
+            });
+        }
+        ordered.sort((left, right) => left.stepIndex - right.stepIndex || left.sequence - right.sequence);
+        for (const entry of ordered) this.addProjectedMessage(entry.message);
+    }
+
+    finish(): CodexProjectedEvidenceMessages {
+        const digest = this.contentHash.copy().update("]}", "utf8").digest("hex");
+        return {
+            messages: this.messages,
+            messageCount: this.messageCount,
+            contentHash: `sha256:${digest}`,
+            roundEnd: Math.max(this.roundEnd, 1),
+        };
+    }
+}
+
+export interface CodexSourceRevisionAccumulator {
+    addRound(round: ConversationRound): void;
+    finish(sequence?: number | null): SourceRevision;
+}
+
+export function createCodexSourceRevisionAccumulator(): CodexSourceRevisionAccumulator {
+    const projector = new CodexEvidenceRoundProjector({ retainMessages: false });
+    return {
+        addRound(round): void {
+            projector.addRound(round);
+        },
+        finish(sequence = null): SourceRevision {
+            const content = projector.finish();
+            const contentCursor = content.messageCount > 0 ? content.contentHash : null;
+            const revision = content.contentHash;
+            return {
+                revision,
+                contentCursor,
+                eventWatermark: contentCursor,
+                sequence: Number.isSafeInteger(sequence) && (sequence ?? -1) >= 0 ? sequence! : null,
+            };
+        },
+    };
+}
+
+export function codexSourceRevisionFromRounds(
+    rounds: Iterable<ConversationRound>,
+    sequence: number | null = null,
+): SourceRevision {
+    const accumulator = createCodexSourceRevisionAccumulator();
+    for (const round of rounds) accumulator.addRound(round);
+    return accumulator.finish(sequence);
+}
+
+class CodexEvidenceMessageCollector {
+    private readonly messages: CodexSourceContentMessage[] = [];
+    private readonly sourceIndexesByMirrorId = new Map<string, number[]>();
+    private readonly mirrorIdOccurrences = new Map<string, number>();
+    private readonly ambiguousMirrorIds = new Set<string>();
+    private roundEnd = 0;
+
+    private add(
+        role: "user" | "assistant",
+        rawText: string,
+        attachments: ConversationAttachment[],
+        source: "response_item" | "event_msg",
+        mirrorId: string | null,
+    ): void {
+        const text = rawText.normalize("NFC");
+        const sourceMirrorKey = mirrorId ? [source, role, mirrorId].join("\u0000") : null;
+        const mirrorIdentity = mirrorId ? [role, mirrorId].join("\u0000") : null;
+        if (sourceMirrorKey && mirrorIdentity) {
+            const occurrenceCount = (this.mirrorIdOccurrences.get(sourceMirrorKey) || 0) + 1;
+            this.mirrorIdOccurrences.set(sourceMirrorKey, occurrenceCount);
+            if (occurrenceCount > 1) this.ambiguousMirrorIds.add(mirrorIdentity);
+        }
+        const counterpartSource = source === "response_item" ? "event_msg" : "response_item";
+        const counterpartMirrorKey = mirrorId ? [counterpartSource, role, mirrorId].join("\u0000") : null;
+        const mirroredIndexes = counterpartMirrorKey === null ? [] : this.sourceIndexesByMirrorId.get(counterpartMirrorKey) || [];
+        if (mirrorIdentity && !this.ambiguousMirrorIds.has(mirrorIdentity) && mirroredIndexes.length === 1) {
+            const mirrored = this.messages[mirroredIndexes[0]];
+            if (mirrored && mirrored.text === text) {
+                const mergedAttachments = mergeCodexEvidenceAttachments(mirrored.attachments, attachments);
+                if (mergedAttachments) {
+                    mirrored.attachments = mergedAttachments;
+                } else {
+                    delete mirrored.attachments;
+                }
+                this.sourceIndexesByMirrorId.delete(counterpartMirrorKey!);
+                return;
+            }
+        }
+        if (role === "user") this.roundEnd += 1;
+        if (role === "assistant" && this.roundEnd === 0) this.roundEnd = 1;
+        this.messages.push({ role, text, ...(attachments.length > 0 ? { attachments } : {}) });
+        if (sourceMirrorKey) {
+            const indexes = this.sourceIndexesByMirrorId.get(sourceMirrorKey) || [];
+            indexes.push(this.messages.length - 1);
+            this.sourceIndexesByMirrorId.set(sourceMirrorKey, indexes);
+        }
+    }
+
+    addEvent(event: unknown): void {
+        const eventFields = event && typeof event === "object" && !Array.isArray(event)
+            ? event as Record<string, unknown>
+            : {};
+        const payloadFields = eventFields.payload && typeof eventFields.payload === "object" && !Array.isArray(eventFields.payload)
+            ? eventFields.payload as Record<string, unknown>
+            : {};
+        if (eventFields.type === "response_item" && payloadFields.type === "message") {
+            const role = payloadFields.role === "user" || payloadFields.role === "assistant" ? payloadFields.role : null;
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            const text = extractText(content);
+            if (role && !codexEvidenceToolOnlyContent(content)) {
+                this.add(
+                    role,
+                    text,
+                    codexEvidenceAttachments(extractCodexMessageAttachments(content, text)),
+                    "response_item",
+                    codexEvidenceMessageMirrorId(event, payloadFields),
+                );
+            }
+            return;
+        }
+        if (eventFields.type === "event_msg" && payloadFields.type === "user_message") {
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            if (!codexEvidenceToolOnlyContent(content)) {
+                this.add(
+                    "user",
+                    extractEventMessageText(payloadFields),
+                    codexEvidenceAttachments(extractCodexEventUserAttachments(payloadFields)),
+                    "event_msg",
+                    codexEvidenceMessageMirrorId(event, payloadFields),
+                );
+            }
+            return;
+        }
+        if (eventFields.type === "event_msg" && payloadFields.type === "agent_message") {
+            const content = Array.isArray(payloadFields.content) ? payloadFields.content : [];
+            if (!codexEvidenceToolOnlyContent(content)) {
+                this.add(
+                    "assistant",
+                    extractEventMessageText(payloadFields),
+                    [],
+                    "event_msg",
+                    codexEvidenceMessageMirrorId(event, payloadFields),
+                );
+            }
+        }
+    }
+
+    finish(): CodexEvidenceMessages {
+        return { messages: this.messages, roundEnd: Math.max(this.roundEnd, 1) };
+    }
+}
+
+function collectCodexEvidenceMessages(events: unknown[]): CodexEvidenceMessages {
+    const projector = new CodexEvidenceRoundProjector();
+    const collector = new CodexRoundEventCollector("reference", {
+        retainRounds: false,
+        onRound: round => projector.addRound(round),
+    });
+    for (const event of events) collector.addEvent(event);
+    collector.finish();
+    return projector.finish();
+}
+
+export function collectCodexEvidenceMessagesForTest(
+    events: unknown[],
+): { messages: CodexSourceContentMessage[]; roundEnd: number } {
+    return collectCodexEvidenceMessages(events);
+}
+
 function codexEvidenceRolloutId(filePath: string, sessionMeta: Record<string, unknown> | null): string | null {
     if (typeof sessionMeta?.id === "string" && sessionMeta.id.trim()) return sessionMeta.id;
     return path.basename(filePath).match(CODEX_ROLLOUT_ID_RE)?.[1] || null;
@@ -2924,7 +4419,13 @@ function codexEvidenceRolloutId(filePath: string, sessionMeta: Record<string, un
 
 async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvidenceRollout> {
     const errors: SourceEvidenceIssue[] = [];
-    const events: unknown[] = [];
+    const projector = new CodexEvidenceRoundProjector();
+    const collector = new CodexRoundEventCollector("reference", {
+        retainRounds: false,
+        onRound: round => projector.addRound(round),
+    });
+    let sessionMeta: Record<string, unknown> | null = null;
+    let sawSessionMeta = false;
     let byteLength = 0;
     let revisionSequence: number | null = null;
     let before: fs.Stats | null = null;
@@ -2955,7 +4456,18 @@ async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvide
             (line) => {
                 lineNumber += 1;
                 try {
-                    events.push(JSON.parse(line));
+                    const event = JSON.parse(line) as unknown;
+                    const eventFields = event && typeof event === "object" && !Array.isArray(event)
+                        ? event as Record<string, unknown>
+                        : {};
+                    if (!sawSessionMeta && eventFields.type === "session_meta") {
+                        sawSessionMeta = true;
+                        const payload = eventFields.payload;
+                        sessionMeta = payload && typeof payload === "object" && !Array.isArray(payload)
+                            ? payload as Record<string, unknown>
+                            : null;
+                    }
+                    collector.addEvent(sanitizeCodexEvent(event));
                 } catch {
                     errors.push(codexEvidenceIssue("parse_error", `Codex rollout 第 ${lineNumber} 个非空 JSONL 行无法解析`));
                 }
@@ -2977,18 +4489,9 @@ async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvide
     } catch (error) {
         errors.push(codexEvidenceIoIssue(error, "Codex rollout 文件"));
     }
-    const sessionMetaEvent = events.find((event) => {
-        if (!event || typeof event !== "object" || Array.isArray(event)) return false;
-        return (event as Record<string, unknown>).type === "session_meta";
-    });
-    const sessionMetaPayload = sessionMetaEvent && typeof sessionMetaEvent === "object" && !Array.isArray(sessionMetaEvent)
-        ? (sessionMetaEvent as Record<string, unknown>).payload
-        : null;
-    const sessionMeta = sessionMetaPayload && typeof sessionMetaPayload === "object" && !Array.isArray(sessionMetaPayload)
-        ? sessionMetaPayload as Record<string, unknown>
-        : null;
-    const content = collectCodexEvidenceMessages(events);
-    const contentHash = codexEvidenceSha256({ messages: content.messages });
+    collector.finish();
+    const content = projector.finish();
+    const contentHash = content.contentHash;
     return {
         rolloutPath,
         conversationId: codexEvidenceRolloutId(rolloutPath, sessionMeta),
@@ -3000,6 +4503,25 @@ async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvide
         roundEnd: content.roundEnd,
         messages: content.messages,
         errors: dedupeCodexEvidenceIssues(errors),
+    };
+}
+
+export async function readCodexEvidenceRolloutForTest(rolloutPath: string): Promise<{
+    conversationId: string | null;
+    sessionMeta: Record<string, unknown> | null;
+    contentHash: string;
+    roundEnd: number;
+    messages: CodexSourceContentMessage[];
+    errors: SourceEvidenceIssue[];
+}> {
+    const rollout = await readCodexEvidenceRollout(rolloutPath);
+    return {
+        conversationId: rollout.conversationId,
+        sessionMeta: rollout.sessionMeta,
+        contentHash: rollout.contentHash,
+        roundEnd: rollout.roundEnd,
+        messages: rollout.messages,
+        errors: rollout.errors,
     };
 }
 
@@ -3134,18 +4656,8 @@ function codexEvidenceRevision(
     return { revision: watermark, contentCursor: null, eventWatermark: watermark };
 }
 
-function codexEvidenceIdentity(options: CodexSourceEvidenceOptions, scan: CodexEvidenceScan): SourceConversationIdentity {
-    const authoritativeRoot = scan.rolloutRoots[0] || path.dirname(scan.stateDbPath);
-    return {
-        workspace: options.workspace,
-        source: {
-            kind: "hybrid",
-            authority: "codex-local-state-db-rollout-jsonl",
-            authoritativeRoot,
-            canonicalPath: authoritativeRoot,
-        },
-        conversationId: options.conversationId,
-    };
+function codexEvidenceIdentity(options: CodexSourceEvidenceOptions, _scan: CodexEvidenceScan): SourceConversationIdentity {
+    return resolveCodexSourceEvidenceIdentity(options);
 }
 
 async function collectCodexEvidenceContext(options: CodexSourceEvidenceOptions): Promise<CodexEvidenceContext> {
