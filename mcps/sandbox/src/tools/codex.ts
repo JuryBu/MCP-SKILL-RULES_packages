@@ -1,14 +1,20 @@
 import { spawn, spawnSync, ChildProcess } from "child_process";
-import { StringDecoder } from "string_decoder";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { killProcessTree, processOutput } from "../executor.js";
+import { killProcessTree } from "../executor.js";
 import { touchActivity, appendTiming, formatElapsed } from "../lifecycle.js";
 import pidusage from "pidusage";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
+import { acquireResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
+import {
+    createOutputDeliveryCollector,
+    type OutputDeliveryCollector,
+    type OutputDeliveryMode,
+    type OutputDeliveryResult,
+} from "../output-delivery.js";
 
 /**
  * sandbox_codex 工具 — Codex CLI 专用调用（v1.2 后台模式）
@@ -29,21 +35,40 @@ interface CodexTask {
     proc: ChildProcess;
     pid: number;
     startTime: number;
+    queueWaitMs: number;
     status: "running" | "done" | "failed" | "killed";
     exitCode: number | null;
     killed: boolean;
     killReason: string | null;
     peakMemoryMB: number;
-    stdoutBuf: string;
-    stderrBuf: string;
+    stdoutBytes: number;
+    stderrBytes: number;
+    stdoutLines: number;
+    stderrLines: number;
     outputFile?: string;
     outputFileBaselineSize: number; // 启动前文件大小（-1=不存在）
     maxOutput: number;
+    deliveryMode: OutputDeliveryMode;
+    outputCollector: OutputDeliveryCollector;
+    outputDelivery: OutputDeliveryResult | null;
+    resourceLease: ManagedResourceLease;
     lastCheckTime: number; // 上次 check 的时间戳（节流用）
-    // 完成时的 Promise resolve
     resolvers: Array<(result: string) => void>;
-    memoryMonitor: NodeJS.Timeout;
+    memoryMonitor: NodeJS.Timeout | null;
     timeoutTimer: NodeJS.Timeout | null;
+    terminationTimer: NodeJS.Timeout | null;
+    cleanupTimer: NodeJS.Timeout | null;
+    finalized: boolean;
+    finalizing: boolean;
+    terminate: (reason: string) => void;
+    finalize: () => void;
+}
+
+class CodexStartCancelledError extends Error {
+    constructor() {
+        super("Codex 调用已取消，任务未启动");
+        this.name = "CodexStartCancelledError";
+    }
 }
 
 // ── 模型列表缓存（启动时从 Codex CLI 缓存文件读取一次） ──
@@ -84,13 +109,8 @@ function generateTaskId(): string {
  */
 export function cleanupCodexTasks(): void {
     for (const [id, task] of taskPool) {
-        if (task.status === "running" && task.pid) {
-            try {
-                killProcessTree(task.pid);
-            } catch { /* ignore */ }
-        }
-        clearInterval(task.memoryMonitor);
-        if (task.timeoutTimer) clearTimeout(task.timeoutTimer);
+        task.terminate("shutdown");
+        task.finalize();
         taskPool.delete(id);
     }
 }
@@ -121,6 +141,25 @@ function parseCodexBinArgs(raw: string | undefined): string[] {
     return raw.split(/\s+/u).filter(Boolean);
 }
 
+function findBundledWindowsCodex(): string | undefined {
+    const candidates = [
+        path.join(os.homedir(), ".codex", "plugins", ".plugin-appserver", "codex.exe"),
+        path.join(os.homedir(), ".codex", ".sandbox-bin", "codex.exe"),
+        path.join(process.env.LOCALAPPDATA || "", "OpenAI", "Codex", "bin", "codex.exe"),
+    ];
+    const appBinRoot = path.join(process.env.LOCALAPPDATA || "", "OpenAI", "Codex", "bin");
+    try {
+        for (const entry of fs.readdirSync(appBinRoot, { withFileTypes: true })) {
+            if (entry.isDirectory()) candidates.push(path.join(appBinRoot, entry.name, "codex.exe"));
+        }
+    } catch {
+    }
+    return candidates
+        .filter(candidate => candidate && fs.existsSync(candidate))
+        .map(candidate => ({ candidate, modifiedAt: fs.statSync(candidate).mtimeMs }))
+        .sort((left, right) => right.modifiedAt - left.modifiedAt)[0]?.candidate;
+}
+
 function resolveCodexSpawnTarget(): { command: string; argsPrefix: string[] } {
     const override = process.env.SANDBOX_CODEX_BIN?.trim();
     if (override) {
@@ -129,6 +168,8 @@ function resolveCodexSpawnTarget(): { command: string; argsPrefix: string[] } {
     if (process.platform !== "win32") {
         return { command: "codex", argsPrefix: [] };
     }
+    const bundled = findBundledWindowsCodex();
+    if (bundled) return { command: bundled, argsPrefix: [] };
     const probe = spawnSync("where.exe", ["codex"], {
         windowsHide: true,
         encoding: "utf-8",
@@ -249,7 +290,10 @@ function buildResultText(task: CodexTask): string {
     if (success) {
         parts.push(`✅ Codex 执行成功 | ${elapsed} | 内存峰值 ${Math.round(task.peakMemoryMB)}MB`);
     } else if (task.killed) {
-        parts.push(`💀 Codex 被终止 (${task.killReason}) | ${elapsed}`);
+        const status = task.killReason === "timeout"
+            ? "execution_timeout（命令已启动后运行超时）"
+            : `被终止 (${task.killReason})`;
+        parts.push(`💀 Codex ${status} | ${elapsed}`);
     } else {
         parts.push(`❌ Codex 执行失败 (exit ${task.exitCode}) | ${elapsed}`);
     }
@@ -265,35 +309,42 @@ function buildResultText(task: CodexTask): string {
         }
     }
 
-    // stdout — 上下文保护：有报告文件时压缩显示
-    const shouldCompressStdout = reportInfo?.generated && task.stdoutBuf.length > 500;
+    const delivery = task.outputDelivery;
+    const channelText = (channel: "stdout" | "stderr"): string => {
+        if (!delivery) return "";
+        const inline = channel === "stdout" ? delivery.stdout : delivery.stderr;
+        if (inline !== undefined) return inline;
+        const preview = delivery.preview?.[channel];
+        if (!preview) return "";
+        if (!preview.head) return preview.tail;
+        if (!preview.tail || preview.tail === preview.head) return preview.head;
+        return `${preview.head}\n... (完整输出见 artifact) ...\n${preview.tail}`;
+    };
 
-    if (shouldCompressStdout) {
-        const lines = task.stdoutBuf.split("\n");
-        const preview = lines.slice(0, 5).join("\n");
-        parts.push("");
-        parts.push(`📤 stdout (已压缩，完整内容在报告文件中，共 ${task.stdoutBuf.length} 字符):`);
-        parts.push(preview);
-        if (lines.length > 5) {
-            parts.push(`... (省略 ${lines.length - 5} 行)`);
-        }
-    } else if (task.stdoutBuf.trim()) {
-        const stdoutResult = processOutput(task.stdoutBuf, "full", task.maxOutput, 20);
+    const stdout = channelText("stdout");
+    if (stdout.trim()) {
         parts.push("");
         parts.push("📤 stdout:");
-        parts.push(stdoutResult.text);
+        parts.push(stdout);
     }
 
-    // stderr — 成功任务如果报告已生成，跳过 stderr（节省上下文）
-    // 失败任务始终显示 stderr 用于调试
-    if (!success) {
-        const filteredStderr = filterStderr(task.stderrBuf);
-        if (filteredStderr.trim()) {
-            const stderrResult = processOutput(filteredStderr, "full", 2000, 20);
-            parts.push("");
-            parts.push("⚠️ stderr:");
-            parts.push(stderrResult.text);
-        }
+    const stderr = filterStderr(channelText("stderr"));
+    if (stderr.trim()) {
+        parts.push("");
+        parts.push("⚠️ stderr:");
+        parts.push(stderr);
+    }
+
+    if (delivery) {
+        parts.push("");
+        parts.push(`📦 输出交付: ${delivery.mode} | complete=${delivery.complete} | status=${delivery.status}`);
+        parts.push(`  artifactId: ${delivery.artifact.artifactId}`);
+        parts.push(`  manifest: ${delivery.artifact.manifestPath}`);
+        parts.push(`  stdout: ${delivery.stats.stdout.rawBytes} bytes / ${delivery.stats.stdout.lines} lines / sha256=${delivery.stats.stdout.sha256}`);
+        parts.push(`  stderr: ${delivery.stats.stderr.rawBytes} bytes / ${delivery.stats.stderr.lines} lines / sha256=${delivery.stats.stderr.sha256}`);
+        parts.push(`  estimatedTokens: ${delivery.stats.combined.estimatedTokens} | expiresAt: ${delivery.artifact.expiresAt}`);
+        if (delivery.reasons.length > 0) parts.push(`  reasons: ${delivery.reasons.join(", ")}`);
+        parts.push(`  readHint: ${delivery.readHint}`);
     }
 
     // 结构化数据摘要
@@ -317,34 +368,76 @@ function checkReport(outputFile: string, baselineSize: number, taskStartTime: nu
     return { generated: false, size: null };
 }
 
-async function waitForCodexCompletion(task: CodexTask, waitSeconds: number): Promise<void> {
-    const waitMs = Math.max(0, Math.min(waitSeconds, 300)) * 1000;
-    if (waitMs <= 0 || task.status !== "running") return;
+type CodexWaitOutcome = "completed" | "timeout" | "aborted";
 
-    await new Promise<void>((resolve) => {
+function removeTaskResolver(task: CodexTask, resolver: (result: string) => void): void {
+    const index = task.resolvers.indexOf(resolver);
+    if (index !== -1) task.resolvers.splice(index, 1);
+}
+
+async function waitForCodexCompletion(task: CodexTask, waitSeconds: number, signal?: AbortSignal): Promise<CodexWaitOutcome> {
+    const waitMs = Math.max(0, Math.min(waitSeconds, 300)) * 1000;
+    if (signal?.aborted) return "aborted";
+    if (task.status !== "running") return "completed";
+    if (waitMs <= 0) return "timeout";
+
+    return new Promise<CodexWaitOutcome>((resolve) => {
         let done = false;
-        let timer: NodeJS.Timeout;
-        let interval: NodeJS.Timeout;
-        const finish = () => {
+        const finish = (outcome: CodexWaitOutcome) => {
             if (done) return;
             done = true;
             clearTimeout(timer);
-            clearInterval(interval);
-            resolve();
+            removeTaskResolver(task, onTaskDone);
+            signal?.removeEventListener("abort", onAbort);
+            resolve(outcome);
+        };
+        const onTaskDone = () => finish("completed");
+        const onAbort = () => finish("aborted");
+
+        const timer = setTimeout(() => finish("timeout"), waitMs);
+        task.resolvers.push(onTaskDone);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
+        timer.unref?.();
+    });
+}
+
+async function waitForCodexResult(
+    task: CodexTask,
+    signal: AbortSignal | undefined,
+    terminateOnAbort: boolean,
+): Promise<{ aborted: boolean; resultText: string }> {
+    if (task.status !== "running") {
+        return { aborted: false, resultText: buildResultText(task) };
+    }
+
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (aborted: boolean, resultText: string) => {
+            if (done) return;
+            done = true;
+            removeTaskResolver(task, onTaskDone);
+            signal?.removeEventListener("abort", onAbort);
+            resolve({ aborted, resultText });
+        };
+        const onTaskDone = (resultText: string) => finish(false, resultText);
+        const onAbort = () => {
+            if (terminateOnAbort) {
+                task.terminate("cancelled");
+                return;
+            }
+            finish(true, `⏹️ 已取消等待任务 ${task.id}，后台任务继续运行`);
         };
 
-        timer = setTimeout(finish, waitMs);
-        interval = setInterval(() => {
-            if (task.status !== "running") finish();
-        }, 2000);
-        timer.unref?.();
-        interval.unref?.();
+        task.resolvers.push(onTaskDone);
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
     });
 }
 
 // ── 启动 Codex 进程 ──
 
-function startCodexProcess(params: {
+async function startCodexProcess(params: {
     prompt: string;
     outputFile?: string;
     cwd?: string;
@@ -359,11 +452,14 @@ function startCodexProcess(params: {
     disableFeatures?: string[];
     reviewMode?: { uncommitted?: boolean; base?: string; commit?: string; title?: string };
     ownerId?: string;
-}): CodexTask {
+    deliveryMode?: OutputDeliveryMode;
+    signal?: AbortSignal;
+    admissionBudgetMs?: number;
+    retryAttempt?: number;
+}): Promise<CodexTask> {
     const { prompt, outputFile, cwd, timeout, configOverrides, maxOutput, model,
         image, json: jsonMode, outputSchema, enableFeatures, disableFeatures, reviewMode } = params;
     const taskId = generateTaskId();
-    const startTime = Date.now();
 
     const codexTarget = resolveCodexSpawnTarget();
     const cmdArgs: string[] = [
@@ -442,20 +538,57 @@ function startCodexProcess(params: {
         } catch { /* ignore */ }
     }
 
-    // 启动进程
-    const proc = spawn(codexTarget.command, cmdArgs, {
-        cwd: cwd || process.cwd(),
-        env: { ...process.env },
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-        shell: false,
+    const resourceLease = await acquireResourceLease({
+        ownerId: params.ownerId,
+        reservationMB: Number(process.env.SANDBOX_CODEX_RESERVATION_MB || 512),
+        signal: params.signal,
+        admissionBudgetMs: params.admissionBudgetMs,
+        retryAttempt: params.retryAttempt,
     });
+    if (params.signal?.aborted) {
+        resourceLease.release();
+        throw new CodexStartCancelledError();
+    }
+    let outputCollector: OutputDeliveryCollector;
+    try {
+        outputCollector = await createOutputDeliveryCollector({
+            mode: params.deliveryMode || "auto",
+            responseByteLimit: maxOutput,
+        });
+    } catch (error) {
+        resourceLease.release();
+        throw error;
+    }
+    if (params.signal?.aborted) {
+        try {
+            await outputCollector.finalize({
+                status: "interrupted",
+                error: "cancelled_before_spawn",
+            });
+        } catch {
+        }
+        resourceLease.release();
+        throw new CodexStartCancelledError();
+    }
+    const startTime = Date.now();
+
+    let proc: ChildProcess;
+    try {
+        proc = spawn(codexTarget.command, cmdArgs, {
+            cwd: cwd || process.cwd(),
+            env: { ...process.env },
+            stdio: ["pipe", "pipe", "pipe"],
+            windowsHide: true,
+            shell: false,
+        });
+    } catch (error) {
+        await outputCollector.finalize({ status: "error", error: error instanceof Error ? error.message : String(error) });
+        resourceLease.release();
+        throw error;
+    }
 
     // 🔴 修复 Codex CLI 0.124.0 stdin 挂起：新版 exec 会等待 stdin EOF
     proc.stdin?.end();
-
-    const stdoutDecoder = new StringDecoder("utf-8");
-    const stderrDecoder = new StringDecoder("utf-8");
 
     const task: CodexTask = {
         id: taskId,
@@ -463,82 +596,133 @@ function startCodexProcess(params: {
         proc,
         pid: proc.pid || 0,
         startTime,
+        queueWaitMs: resourceLease.queueWaitMs,
         status: "running",
         exitCode: null,
         killed: false,
         killReason: null,
         peakMemoryMB: 0,
-        stdoutBuf: "",
-        stderrBuf: "",
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        stdoutLines: 0,
+        stderrLines: 0,
         outputFile,
         outputFileBaselineSize,
         maxOutput,
+        deliveryMode: params.deliveryMode || "auto",
+        outputCollector,
+        outputDelivery: null,
+        resourceLease,
         lastCheckTime: 0,
         resolvers: [],
-        memoryMonitor: null as unknown as NodeJS.Timeout, // 下方赋值
+        memoryMonitor: null,
         timeoutTimer: null,
+        terminationTimer: null,
+        cleanupTimer: null,
+        finalized: false,
+        finalizing: false,
+        terminate: () => undefined,
+        finalize: () => undefined,
     };
 
-    // 收集输出（带缓冲上限 512KB 防止内存爆炸）
-    const MAX_BUF = 512 * 1024; // 512KB
+    const countNewlines = (data: Buffer): number => {
+        let count = 0;
+        for (const byte of data) if (byte === 0x0a) count += 1;
+        return count;
+    };
     proc.stdout?.on("data", (data: Buffer) => {
-        if (task.stdoutBuf.length < MAX_BUF) {
-            task.stdoutBuf += stdoutDecoder.write(data);
-        }
+        task.stdoutBytes += data.length;
+        task.stdoutLines += countNewlines(data);
     });
 
     proc.stderr?.on("data", (data: Buffer) => {
-        if (task.stderrBuf.length < MAX_BUF) {
-            task.stderrBuf += stderrDecoder.write(data);
-        }
+        task.stderrBytes += data.length;
+        task.stderrLines += countNewlines(data);
     });
+    proc.stdout?.pipe(outputCollector.stdout);
+    proc.stderr?.pipe(outputCollector.stderr);
 
-    // 进程退出处理
-    const finalize = () => {
-        if (task.status !== "running") return;
+    task.finalize = () => {
+        if (task.finalized || task.finalizing) return;
+        task.finalizing = true;
 
-        task.exitCode = proc.exitCode;
-        const success = task.exitCode === 0 && (!outputFile || checkReport(outputFile, outputFileBaselineSize, startTime).generated);
-        task.status = task.killed ? "killed" : (success ? "done" : "failed");
+        void (async () => {
+            task.exitCode = proc.exitCode ?? task.exitCode;
+            if (task.memoryMonitor) clearInterval(task.memoryMonitor);
+            if (task.timeoutTimer) clearTimeout(task.timeoutTimer);
+            if (task.terminationTimer) clearTimeout(task.terminationTimer);
 
-        clearInterval(task.memoryMonitor);
-        if (task.timeoutTimer) clearTimeout(task.timeoutTimer);
+            try {
+                task.outputDelivery = await outputCollector.finalize({
+                    mode: task.deliveryMode,
+                    status: task.killed ? "interrupted" : task.exitCode === 0 ? "done" : "error",
+                    error: task.killed ? task.killReason || undefined : task.exitCode === 0 ? undefined : `exitCode=${task.exitCode}`,
+                });
+            } catch (error) {
+                task.killed = true;
+                task.killReason = `output_artifact_error: ${error instanceof Error ? error.message : String(error)}`;
+            } finally {
+                task.resourceLease.release();
+            }
 
-        // 通知所有等待者
-        const resultText = buildResultText(task);
-        for (const resolve of task.resolvers) {
-            resolve(resultText);
-        }
-        task.resolvers = [];
+            const success = task.exitCode === 0 && (!outputFile || checkReport(outputFile, outputFileBaselineSize, startTime).generated);
+            task.status = task.killed ? "killed" : (success ? "done" : "failed");
+            task.finalized = true;
+            task.finalizing = false;
 
-        // 清理已完成任务（保留 30 分钟后自动移除，unref 不阻止进程退出）
-        const cleanupTimer = setTimeout(() => {
-            taskPool.delete(taskId);
-        }, 30 * 60 * 1000);
-        cleanupTimer.unref();
+            const resultText = buildResultText(task);
+            const resolvers = task.resolvers.splice(0);
+            for (const resolveTask of resolvers) {
+                try {
+                    resolveTask(resultText);
+                } catch { /* ignore waiter failure */ }
+            }
+
+            if (!task.cleanupTimer) {
+                task.cleanupTimer = setTimeout(() => {
+                    taskPool.delete(taskId);
+                }, 30 * 60 * 1000);
+                task.cleanupTimer.unref?.();
+            }
+        })();
     };
 
-    proc.on("exit", () => {
-        setTimeout(finalize, 100);
-    });
+    task.terminate = (reason: string) => {
+        if (task.finalized || task.status !== "running") {
+            task.finalize();
+            return;
+        }
+
+        if (!task.killed) {
+            task.killed = true;
+            task.killReason = reason;
+        }
+
+        if (!task.terminationTimer) {
+            task.terminationTimer = setTimeout(task.finalize, 1500);
+            task.terminationTimer.unref?.();
+        }
+
+        try {
+            if (task.pid) killProcessTree(task.pid);
+        } catch (error) {
+            void outputCollector.write("stderr", `\n终止进程树失败: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    };
+
+    proc.on("close", task.finalize);
 
     proc.on("error", (err: Error) => {
-        task.stderrBuf += `\n进程错误: ${err.message}`;
-        task.killed = true;
-        task.killReason = "crash";
-        finalize();
+        if (!task.killed) {
+            task.killed = true;
+            task.killReason = "crash";
+        }
+        void outputCollector.write("stderr", `\n进程错误: ${err.message}`).finally(task.finalize);
     });
 
     // 超时管理
     if (timeout > 0) {
-        task.timeoutTimer = setTimeout(() => {
-            if (task.status === "running" && task.pid) {
-                task.killed = true;
-                task.killReason = "timeout";
-                killProcessTree(task.pid);
-                setTimeout(finalize, 300);
-            }
-        }, timeout);
+        task.timeoutTimer = setTimeout(() => task.terminate("timeout"), timeout);
         task.timeoutTimer.unref?.();
     }
 
@@ -551,6 +735,7 @@ function startCodexProcess(params: {
             if (memMB > task.peakMemoryMB) {
                 task.peakMemoryMB = memMB;
             }
+            task.resourceLease.updateObservedMemoryMB(memMB);
         } catch { /* pidusage 可能在进程退出后失败 */ }
     }, 2000);
     task.memoryMonitor.unref?.();
@@ -570,12 +755,17 @@ const CodexParamsShape = {
         .describe("指定 Codex 模型（-m 参数）。不传使用默认模型"),
     cwd: z.string().optional()
         .describe("工作目录"),
-    timeout: z.number().min(0).max(1800000).optional()
-        .describe("超时(ms)，默认0=无超时，最大1800000(30分钟)"),
+    timeout: z.number().min(0).optional()
+        .describe("超时(ms)，默认0=无超时"),
     configOverrides: z.string().optional()
         .describe("额外配置覆盖（-c 参数），如 model_reasoning_effort=high"),
-    maxOutput: z.number().min(100).max(50000).optional()
-        .describe("输出截断上限（字符），默认10000"),
+    maxOutput: z.number().min(100).optional()
+        .describe("兼容的内联响应预算，默认1MiB；超预算完整内容写入artifact"),
+    deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
+        .describe("交付模式，默认auto"),
+    admissionBudgetMs: z.number().min(0).optional()
+        .describe("资源不足时最多等待多久"),
+    retryAttempt: z.number().int().min(0).max(4).optional(),
     // 新增参数（v1.8）
     image: z.string().optional()
         .describe("图片文件路径（-i 参数），让 Codex 看截图做 UI Review 等"),
@@ -625,7 +815,7 @@ export function registerCodex(server: McpServer): void {
 - configOverrides: 覆盖配置项（-c 参数），如 model_reasoning_effort=xhigh
 - timeout: 超时(ms)，默认0=无超时
 - cwd: 工作目录
-- maxOutput: 输出截断上限，默认10000
+- maxOutput: MCP 内联响应展示预算，默认1MiB；完整 stdout/stderr 始终保存在 artifact
 
 后台模式（推荐用于长任务）：
 - background: true 启动后立刻返回 taskId，不阻塞
@@ -644,7 +834,7 @@ v1.8 新增参数：
 
 提示：指定 outputFile 时会自动在 prompt 末尾附加输出路径指令。${modelsDescription}`,
         CodexParamsShape,
-        async (params: Record<string, unknown>) => {
+        async (params: Record<string, unknown>, extra) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -681,14 +871,19 @@ v1.8 新增参数：
                 if (action === "check") {
                     const waitSeconds = (params.waitSeconds as number | undefined) || 0;
 
-                    // 主动等待：如果指定了 waitSeconds 且任务还在运行，先 sleep
-                    await waitForCodexCompletion(task, waitSeconds);
+                    const waitOutcome = await waitForCodexCompletion(task, waitSeconds, extra.signal);
+                    if (waitOutcome === "aborted") {
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: `⏹️ 已取消本次 check 等待，任务 ${taskId} 未被终止，当前状态 ${task.status}`,
+                            }],
+                        }, startTime);
+                    }
 
                     const elapsed = formatElapsed(Date.now() - task.startTime);
                     if (task.status === "running") {
                         task.lastCheckTime = Date.now();
-                        const stdoutLines = task.stdoutBuf.trim() ? task.stdoutBuf.split("\n").length : 0;
-                        const stderrLines = task.stderrBuf.trim() ? task.stderrBuf.split("\n").length : 0;
                         // 检查 outputFile 是否已开始写入
                         let outputInfo = "";
                         if (task.outputFile) {
@@ -702,7 +897,7 @@ v1.8 新增参数：
                         return appendTiming({
                             content: [{
                                 type: "text" as const,
-                                text: `🔄 任务 ${taskId} 运行中 | owner=${task.ownerId} | ${elapsed} | PID ${task.pid}\n📊 stdout ${stdoutLines} 行 | stderr ${stderrLines} 行 | 内存峰值 ${Math.round(task.peakMemoryMB)}MB${outputInfo}\n💡 建议 30-60s 后再次 check（stderr 静止不代表卡住，Codex 可能在思考）`,
+                                text: `🔄 任务 ${taskId} 运行中 | owner=${task.ownerId} | ${elapsed} | PID ${task.pid}\n📊 stdout ${task.stdoutBytes} bytes/${task.stdoutLines} 行 | stderr ${task.stderrBytes} bytes/${task.stderrLines} 行 | 内存峰值 ${Math.round(task.peakMemoryMB)}MB${outputInfo}\n💡 建议 30-60s 后再次 check（stderr 静止不代表卡住，Codex 可能在思考）`,
                             }],
                         }, startTime);
                     } else {
@@ -722,13 +917,10 @@ v1.8 新增参数：
                         }, startTime);
                     }
 
-                    // 等待完成
-                    const resultText = await new Promise<string>((resolve) => {
-                        task.resolvers.push(resolve);
-                    });
+                    const waitResult = await waitForCodexResult(task, extra.signal, false);
 
                     return appendTiming({
-                        content: [{ type: "text" as const, text: resultText }],
+                        content: [{ type: "text" as const, text: waitResult.resultText }],
                     }, startTime);
                 }
 
@@ -743,11 +935,7 @@ v1.8 新增参数：
                         }, startTime);
                     }
 
-                    task.killed = true;
-                    task.killReason = "user";
-                    if (task.pid) {
-                        killProcessTree(task.pid);
-                    }
+                    task.terminate("user");
 
                     return appendTiming({
                         content: [{
@@ -775,7 +963,10 @@ v1.8 新增参数：
             const cwd = params.cwd as string | undefined;
             const timeout = (params.timeout as number | undefined) ?? 0;
             const configOverrides = params.configOverrides as string | undefined;
-            const maxOutput = (params.maxOutput as number | undefined) ?? 10000;
+            const maxOutput = (params.maxOutput as number | undefined) ?? 1024 * 1024;
+            const deliveryMode = params.deliveryMode as OutputDeliveryMode | undefined;
+            const admissionBudgetMs = params.admissionBudgetMs as number | undefined;
+            const retryAttempt = params.retryAttempt as number | undefined;
             const background = (params.background as boolean | undefined) ?? false;
             const image = params.image as string | undefined;
             const jsonMode = params.json as boolean | undefined;
@@ -788,13 +979,44 @@ v1.8 新增参数：
             const commit = params.commit as string | undefined;
             const title = params.title as string | undefined;
 
-            const task = startCodexProcess({
-                prompt, outputFile, cwd, timeout, configOverrides, maxOutput, model,
-                image, json: jsonMode,
-                outputSchema, enableFeatures, disableFeatures,
-                reviewMode: review ? { uncommitted, base, commit, title } : undefined,
-                ownerId,
-            });
+            if (extra.signal.aborted) {
+                return appendTiming({
+                    content: [{ type: "text" as const, text: "⏹️ Codex 调用已取消，任务未启动" }],
+                }, startTime);
+            }
+
+            let task: CodexTask;
+            try {
+                task = await startCodexProcess({
+                    prompt, outputFile, cwd, timeout, configOverrides, maxOutput, model,
+                    image, json: jsonMode,
+                    outputSchema, enableFeatures, disableFeatures,
+                    reviewMode: review ? { uncommitted, base, commit, title } : undefined,
+                    ownerId,
+                    deliveryMode,
+                    signal: extra.signal,
+                    admissionBudgetMs,
+                    retryAttempt,
+                });
+            } catch (error) {
+                if (error instanceof CodexStartCancelledError) {
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: "⏹️ Codex 调用已取消，任务未启动" }],
+                    }, startTime);
+                }
+                const admissionError = serializeResourceAdmissionError(error);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Codex 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                    };
+                }
+                return {
+                    isError: true,
+                    content: [{ type: "text" as const, text: `❌ Codex 启动失败: ${error instanceof Error ? error.message : String(error)}` }],
+                };
+            }
 
             // ── 后台模式：立刻返回 taskId ──
             if (background) {
@@ -806,13 +1028,10 @@ v1.8 新增参数：
                 }, startTime);
             }
 
-            // ── 同步模式（向后兼容）：等待完成 ──
-            const resultText = await new Promise<string>((resolve) => {
-                task.resolvers.push(resolve);
-            });
+            const waitResult = await waitForCodexResult(task, extra.signal, true);
 
             return appendTiming({
-                content: [{ type: "text" as const, text: resultText }],
+                content: [{ type: "text" as const, text: waitResult.resultText }],
             }, startTime);
         }
     );

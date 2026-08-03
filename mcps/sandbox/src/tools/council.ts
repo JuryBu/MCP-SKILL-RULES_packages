@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { normalizeOwnerId } from "../owner.js";
+import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { runCouncil } from "../council/engine.js";
 import { formatPersistentCouncilTask, readCouncilResumeSource, startPersistentCouncilTask, waitForPersistentCouncilTask } from "../council/background.js";
 import type { CouncilProvider, CouncilRunParams } from "../council/types.js";
@@ -172,7 +173,7 @@ function toResumeRunParams(args: Record<string, unknown>, ownerId: string): { ru
 }
 
 export function registerCouncil(server: McpServer): void {
-    const handleCouncil = async (input: Record<string, unknown>) => {
+    const handleCouncil = async (input: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
             const args = input;
             const startTime = Date.now();
             touchActivity();
@@ -188,7 +189,8 @@ export function registerCouncil(server: McpServer): void {
             if (args.resume || args.resumeTaskId) {
                 try {
                     const { runParams, resumeSource } = toResumeRunParams(args, ownerId);
-                    const task = startPersistentCouncilTask(runParams, ownerId, COUNCIL_BACKGROUND_MAX_RUN_MS, resumeSource);
+                    runParams.signal = extra?.signal;
+                    const task = await startPersistentCouncilTask(runParams, ownerId, COUNCIL_BACKGROUND_MAX_RUN_MS, resumeSource);
                     return appendTiming({
                         content: [{
                             type: "text" as const,
@@ -205,6 +207,14 @@ export function registerCouncil(server: McpServer): void {
                         }],
                     }, startTime);
                 } catch (err) {
+                    const admissionError = serializeResourceAdmissionError(err);
+                    if (admissionError) {
+                        return {
+                            isError: true,
+                            structuredContent: { error: admissionError },
+                            content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council resume 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                        };
+                    }
                     return appendTiming({
                         content: [{ type: "text" as const, text: `❌ sandbox_council resume 失败: ${err instanceof Error ? err.message : String(err)}` }],
                     }, startTime);
@@ -217,27 +227,49 @@ export function registerCouncil(server: McpServer): void {
                         content: [{ type: "text" as const, text: "❌ 后台启动需要 participants、moderator、input 参数" }],
                     };
                 }
-                const runParams = toRunParams(args, ownerId);
-                const task = startPersistentCouncilTask(runParams, ownerId, COUNCIL_BACKGROUND_MAX_RUN_MS);
-                return appendTiming({
-                    content: [{
-                        type: "text" as const,
-                        text: [
-                            "🚀 sandbox_council 已转入后台任务",
-                            `🆔 taskId: ${task.id}`,
-                            `👤 ownerId: ${task.ownerId}`,
-                            `⏳ deadlineAt: ${task.deadlineAt}`,
-                            "",
-                            formatCouncilArtifactSummary(task.runId),
-                            `💡 后续用 sandbox_council(taskId="${task.id}", ownerId="${task.ownerId}", waitSeconds=45) 查询；ownerId 必须与启动时一致`,
-                        ].join("\n"),
-                    }],
-                }, startTime);
+                try {
+                    const runParams = toRunParams(args, ownerId);
+                    runParams.signal = extra?.signal;
+                    const task = await startPersistentCouncilTask(runParams, ownerId, COUNCIL_BACKGROUND_MAX_RUN_MS);
+                    return appendTiming({
+                        content: [{
+                            type: "text" as const,
+                            text: [
+                                "🚀 sandbox_council 已转入后台任务",
+                                `🆔 taskId: ${task.id}`,
+                                `👤 ownerId: ${task.ownerId}`,
+                                `⏳ deadlineAt: ${task.deadlineAt}`,
+                                "",
+                                formatCouncilArtifactSummary(task.runId),
+                                `💡 后续用 sandbox_council(taskId="${task.id}", ownerId="${task.ownerId}", waitSeconds=45) 查询；ownerId 必须与启动时一致`,
+                            ].join("\n"),
+                        }],
+                    }, startTime);
+                } catch (err) {
+                    const admissionError = serializeResourceAdmissionError(err);
+                    if (admissionError) {
+                        return {
+                            isError: true,
+                            structuredContent: { error: admissionError },
+                            content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                        };
+                    }
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: `❌ sandbox_council 后台启动失败: ${err instanceof Error ? err.message : String(err)}` }],
+                    }, startTime);
+                }
             }
 
             let synchronousRunId = "";
+            let resourceLease;
             try {
                 const baseParams = toRunParams(args, ownerId);
+                baseParams.signal = extra?.signal;
+                resourceLease = await acquireResourceLease({
+                    ownerId,
+                    reservationMB: Number(process.env.SANDBOX_COUNCIL_RESERVATION_MB || 512),
+                    signal: extra?.signal,
+                });
                 const artifactRun = createCouncilArtifactRun({ ownerId });
                 synchronousRunId = artifactRun.runId;
                 const result = await runCouncil({
@@ -249,9 +281,19 @@ export function registerCouncil(server: McpServer): void {
                     content: [{ type: "text" as const, text: formatCouncilResult(result) }],
                 }, startTime);
             } catch (err) {
+                const admissionError = serializeResourceAdmissionError(err);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                    };
+                }
                 return appendTiming({
                     content: [{ type: "text" as const, text: [`❌ sandbox_council 失败: ${err instanceof Error ? err.message : String(err)}`, synchronousRunId ? formatCouncilArtifactSummary(synchronousRunId) : ""].filter(Boolean).join("\n\n") }],
                 }, startTime);
+            } finally {
+                resourceLease?.release();
             }
         };
     const compatibleServer = server as unknown as {

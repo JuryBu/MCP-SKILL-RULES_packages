@@ -1,9 +1,15 @@
 import { spawn, execSync, ChildProcess } from "child_process";
-import { StringDecoder } from "string_decoder";
 import pidusage from "pidusage";
-import { saveTempScript, saveTempOutput, removeTempFile } from "./temp-store.js";
+import { saveTempScript, removeTempFile } from "./temp-store.js";
 import { resolveInterpreter, getCachedEnvInfo } from "./env-detector.js";
 import { formatElapsed } from "./lifecycle.js";
+import { acquireResourceLease } from "./resource-admission-runtime.js";
+import {
+    createOutputDeliveryCollector,
+    type OutputArtifactReference,
+    type OutputDeliveryMode,
+    type OutputDeliveryResult,
+} from "./output-delivery.js";
 
 /**
  * MCP Sandbox 子进程执行引擎
@@ -17,7 +23,7 @@ import { formatElapsed } from "./lifecycle.js";
  * - Windows 进程树杀（taskkill /T /F）
  */
 
-export type KillReason = "timeout" | "memory" | "vram" | "manual" | "crash";
+export type KillReason = "timeout" | "memory" | "vram" | "manual" | "cancelled" | "crash";
 export type OutputMode = "full" | "tail" | "head" | "silent";
 
 export interface ExecOptions {
@@ -34,6 +40,13 @@ export interface ExecOptions {
     maxLines?: number;
     gpu?: boolean;
     maxVRAM_MB?: number;
+    ownerId?: string;
+    signal?: AbortSignal;
+    admissionBudgetMs?: number;
+    retryAttempt?: number;
+    reservationMB?: number;
+    deliveryMode?: OutputDeliveryMode;
+    artifactTtlMs?: number;
 }
 
 export interface ExecResult {
@@ -48,6 +61,14 @@ export interface ExecResult {
     originalBytes: number;
     returnedBytes: number;
     tempFile: string | null;
+    queueWaitMs: number;
+    deliveryMode: OutputDeliveryResult["mode"] | null;
+    artifact: OutputArtifactReference | null;
+    outputReasons: string[];
+    outputStats: OutputDeliveryResult["stats"] | null;
+    outputStatus: OutputDeliveryResult["status"] | null;
+    outputComplete: boolean;
+    outputReadHint: string | null;
 }
 
 export interface NormalizedExecutionInput {
@@ -85,6 +106,23 @@ export function makeParamErrorResult(stderr: string): ExecResult {
         originalBytes: 0,
         returnedBytes: 0,
         tempFile: null,
+        queueWaitMs: 0,
+        deliveryMode: null,
+        artifact: null,
+        outputReasons: [],
+        outputStats: null,
+        outputStatus: null,
+        outputComplete: false,
+        outputReadHint: null,
+    };
+}
+
+function makeCancelledBeforeSpawnResult(queueWaitMs: number): ExecResult {
+    return {
+        ...makeParamErrorResult("执行已取消，进程未启动"),
+        killed: true,
+        killReason: "cancelled",
+        queueWaitMs,
     };
 }
 
@@ -92,10 +130,10 @@ export function makeParamErrorResult(stderr: string): ExecResult {
 const DEFAULTS = {
     language: "python",
     timeout: 30000,       // 30秒
-    maxTimeout: 300000,   // 5分钟
+    maxTimeout: Number(process.env.SANDBOX_EXEC_MAX_TIMEOUT_MS || 6 * 60 * 60 * 1000),
     maxMemoryMB: 256,
     maxMemoryLimit: 1024,
-    maxOutput: 8000,
+    maxOutput: 1024 * 1024,
     outputMode: "full" as OutputMode,
     tailLines: 20,
     maxVRAM_MB: 2048,
@@ -477,6 +515,13 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         tailLines = DEFAULTS.tailLines,
         maxLines,
         gpu,
+        ownerId,
+        signal,
+        admissionBudgetMs,
+        retryAttempt,
+        reservationMB,
+        deliveryMode = "auto",
+        artifactTtlMs,
     } = options;
 
     const normalizedInput = normalizeExecutionInput(code, command);
@@ -489,7 +534,6 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
     const effectiveTimeout = timeout === 0 ? 0 : Math.min(timeout, DEFAULTS.maxTimeout);
     const effectiveMemory = Math.min(maxMemoryMB, DEFAULTS.maxMemoryLimit);
 
-    const startTime = Date.now();
     let scriptPath: string | null = null;
     let killed = false;
     let killReason: KillReason | null = null;
@@ -567,6 +611,46 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         return makeParamErrorResult("错误：必须提供 code 或 command 之一");
     }
 
+    const lease = await acquireResourceLease({
+        ownerId,
+        reservationMB: reservationMB ?? (options.maxMemoryMB === undefined ? undefined : effectiveMemory),
+        admissionBudgetMs,
+        retryAttempt,
+        signal,
+    });
+    const cancelBeforeSpawn = (): ExecResult => {
+        lease.release();
+        if (scriptPath) removeTempFile(scriptPath);
+        return makeCancelledBeforeSpawnResult(lease.queueWaitMs);
+    };
+    if (signal?.aborted) return cancelBeforeSpawn();
+    const startTime = Date.now();
+    let collector;
+    try {
+        collector = await createOutputDeliveryCollector({
+            mode: deliveryMode,
+            combinedLineLimit: maxLines,
+            responseByteLimit: maxOutput,
+            previewHeadBytes: Math.max(4096, tailLines * 256),
+            previewTailBytes: Math.max(4096, tailLines * 256),
+            artifactTtlMs,
+        });
+    } catch (error) {
+        lease.release();
+        throw error;
+    }
+    if (signal?.aborted) {
+        try {
+            await collector.finalize({
+                mode: deliveryMode,
+                status: "interrupted",
+                error: "cancelled_before_spawn",
+            });
+        } catch {
+        }
+        return cancelBeforeSpawn();
+    }
+
     return new Promise<ExecResult>((resolve) => {
         // 构造环境变量 — 强制 IO 使用 UTF-8（不设 PYTHONUTF8 以兼容 Python 3.9 site-packages）
         const spawnEnv: Record<string, string | undefined> = {
@@ -577,26 +661,36 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             spawnEnv.CUDA_VISIBLE_DEVICES = "0";
         }
 
-        const proc: ChildProcess = spawn(execCmd, execArgs, {
-            cwd: effectiveCwd || process.cwd(),
-            env: spawnEnv,
-            stdio: ["pipe", "pipe", "pipe"],
-            windowsHide: true,
-        });
+        let proc: ChildProcess;
+        try {
+            proc = spawn(execCmd, execArgs, {
+                cwd: effectiveCwd || process.cwd(),
+                env: spawnEnv,
+                stdio: ["pipe", "pipe", "pipe"],
+                windowsHide: true,
+            });
+        } catch (error) {
+            lease.release();
+            resolve({
+                ...makeParamErrorResult(`进程启动失败: ${error instanceof Error ? error.message : String(error)}`),
+                elapsed: formatElapsed(Date.now() - startTime),
+                killed: true,
+                killReason: "crash",
+                queueWaitMs: lease.queueWaitMs,
+            });
+            return;
+        }
 
-        let stdoutBuf = "";
-        let stderrBuf = "";
         let resolved = false;
-        // StringDecoder 安全处理 UTF-8 多字节字符的流切分
-        const stdoutDecoder = new StringDecoder("utf-8");
-        const stderrDecoder = new StringDecoder("utf-8");
+        let finalizing = false;
 
-        const finalize = () => {
-            if (resolved) return;
-            resolved = true;
+        const finalize = async () => {
+            if (resolved || finalizing) return;
+            finalizing = true;
 
             if (timeoutTimer) clearTimeout(timeoutTimer);
             clearInterval(memoryMonitor);
+            signal?.removeEventListener("abort", onAbort);
 
             // 清理临时脚本文件
             if (scriptPath) {
@@ -605,59 +699,95 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
 
             const elapsed = formatElapsed(Date.now() - startTime);
 
-            // 处理输出
-            const stdoutResult = processOutput(stdoutBuf, outputMode, maxOutput, tailLines, maxLines);
-            const stderrResult = processOutput(stderrBuf, outputMode === "silent" ? "silent" : "full", maxOutput, tailLines);
-
-            // 大输出写临时文件
-            let tempFile: string | null = null;
-            if (stdoutResult.truncated || stderrResult.truncated) {
-                tempFile = saveTempOutput([
-                    "--- stdout ---",
-                    stdoutBuf,
-                    "--- stderr ---",
-                    stderrBuf,
-                ].join("\n"));
+            let delivery: OutputDeliveryResult;
+            try {
+                delivery = await collector.finalize({
+                    mode: deliveryMode,
+                    status: killed ? "interrupted" : proc.exitCode === 0 ? "done" : "error",
+                    error: killed ? killReason || undefined : proc.exitCode === 0 ? undefined : `exitCode=${proc.exitCode}`,
+                });
+            } catch (error) {
+                lease.release();
+                resolved = true;
+                resolve({
+                    ...makeParamErrorResult(`输出产物写入失败: ${error instanceof Error ? error.message : String(error)}`),
+                    elapsed,
+                    killed: true,
+                    killReason: "crash",
+                    queueWaitMs: lease.queueWaitMs,
+                });
+                return;
             }
 
+            const previewText = (channel: "stdout" | "stderr"): string => {
+                const preview = delivery.preview?.[channel];
+                if (!preview) return "";
+                if (!preview.head) return preview.tail;
+                if (!preview.tail || preview.tail === preview.head) return preview.head;
+                return `${preview.head}\n... (完整输出见 artifact) ...\n${preview.tail}`;
+            };
+            let stdoutText = delivery.stdout ?? previewText("stdout");
+            let stderrText = delivery.stderr ?? previewText("stderr");
+            let displayTruncated = false;
+            if (outputMode === "silent") {
+                stdoutText = "";
+                stderrText = "";
+            } else {
+                const processedStdout = processOutput(stdoutText, outputMode, maxOutput, tailLines, maxLines);
+                const processedStderr = processOutput(stderrText, "full", maxOutput, tailLines, maxLines);
+                stdoutText = processedStdout.text;
+                stderrText = processedStderr.text;
+                displayTruncated = processedStdout.truncated || processedStderr.truncated;
+            }
+
+            lease.release();
+            resolved = true;
+
             const result: ExecResult = {
-                stdout: stdoutResult.text,
-                stderr: stderrResult.text,
+                stdout: stdoutText,
+                stderr: stderrText,
                 exitCode: proc.exitCode,
                 elapsed,
                 killed,
                 killReason,
                 peakMemoryMB: Math.round(peakMemoryMB),
-                truncated: stdoutResult.truncated || stderrResult.truncated,
-                originalBytes: stdoutResult.originalBytes + stderrResult.originalBytes,
-                returnedBytes: Buffer.byteLength(stdoutResult.text + stderrResult.text, "utf-8"),
-                tempFile,
+                truncated: delivery.mode !== "inline" || displayTruncated,
+                originalBytes: delivery.stats.combined.rawBytes,
+                returnedBytes: Buffer.byteLength(stdoutText + stderrText, "utf-8"),
+                tempFile: delivery.artifact.manifestPath,
+                queueWaitMs: lease.queueWaitMs,
+                deliveryMode: delivery.mode,
+                artifact: delivery.artifact,
+                outputReasons: delivery.reasons,
+                outputStats: delivery.stats,
+                outputStatus: delivery.status,
+                outputComplete: delivery.complete,
+                outputReadHint: delivery.readHint,
             };
 
             resolve(result);
         };
 
-        // 收集输出（使用 StringDecoder 安全处理 UTF-8 多字节字符切分）
-        proc.stdout?.on("data", (data: Buffer) => {
-            stdoutBuf += stdoutDecoder.write(data);
-        });
+        proc.stdout?.pipe(collector.stdout);
+        proc.stderr?.pipe(collector.stderr);
 
-        proc.stderr?.on("data", (data: Buffer) => {
-            stderrBuf += stderrDecoder.write(data);
-        });
-
-        // 进程退出
-        proc.on("exit", () => {
-            // 给一点时间收集剩余的输出
-            setTimeout(finalize, 50);
-        });
+        proc.on("close", () => void finalize());
 
         proc.on("error", (err: Error) => {
-            stderrBuf += `\n进程错误: ${err.message}`;
             killed = true;
             killReason = "crash";
-            finalize();
+            void collector.write("stderr", `\n进程错误: ${err.message}`).finally(() => void finalize());
         });
+
+        const onAbort = () => {
+            if (resolved || !proc.pid) return;
+            killed = true;
+            killReason = "cancelled";
+            killProcessTree(proc.pid);
+            setTimeout(() => void finalize(), 200);
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) onAbort();
 
         // 硬超时（timeout=0 时不设超时，进程运行到自然结束）
         let timeoutTimer: NodeJS.Timeout | null = null;
@@ -668,7 +798,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                     killReason = "timeout";
                     killProcessTree(proc.pid);
                     // 给进程树杀留一点时间
-                    setTimeout(finalize, 200);
+                    setTimeout(() => void finalize(), 200);
                 }
             }, effectiveTimeout);
         }
@@ -682,13 +812,14 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 if (memMB > peakMemoryMB) {
                     peakMemoryMB = memMB;
                 }
+                lease.updateObservedMemoryMB(memMB);
 
                 // 超内存限制
                 if (memMB > effectiveMemory) {
                     killed = true;
                     killReason = "memory";
                     killProcessTree(proc.pid);
-                    setTimeout(finalize, 200);
+                    setTimeout(() => void finalize(), 200);
                 }
             } catch {
                 // pidusage 可能在进程退出后失败，忽略

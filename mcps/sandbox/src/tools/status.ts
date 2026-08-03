@@ -2,10 +2,12 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { getCachedEnvInfo, detectEnvironment } from "../env-detector.js";
-import { listSessions, closeSession, getActiveSessionCount } from "../session-manager.js";
+import { listSessions, closeSession, getActiveSessionCount, getSessionLimits } from "../session-manager.js";
 import { cleanOldTempFiles, getTempStats } from "../temp-store.js";
 import { runCouncilArtifactGc, type CouncilGcMode } from "../council/artifact-gc.js";
 import os from "os";
+import { getResourceAdmissionState } from "../resource-admission-runtime.js";
+import { cleanExpiredOutputArtifacts } from "../output-artifact-store.js";
 
 /**
  * sandbox_status 工具 — 系统状态
@@ -83,6 +85,7 @@ async function buildOverview() {
     const envInfo = getCachedEnvInfo();
     const sessions = await listSessions();
     const tempStats = getTempStats();
+    const admission = getResourceAdmissionState();
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
@@ -106,7 +109,14 @@ async function buildOverview() {
     }
 
     lines.push("");
-    lines.push(`活跃会话: ${sessions.length}/3`);
+    lines.push("全局资源调度:");
+    lines.push(`  预留: ${admission.activeReservedMB}/${admission.limits.admissionLimitMB} MB | 活跃租约: ${admission.activeLeases} | 等待: ${admission.queued}/${admission.limits.maxQueueSize}`);
+    lines.push(`  实测进程树: ${admission.observedMemoryMB.toFixed(1)}/${admission.limits.hardLimitMB} MB | 峰值预留: ${admission.peak.activeReservedMB} MB | 峰值等待: ${admission.peak.queued}`);
+    lines.push(`  系统可用: ${admission.systemAvailableMemoryMB === null ? "未知" : `${admission.systemAvailableMemoryMB.toFixed(0)} MB`} | 系统保留底线: ${admission.limits.systemHeadroomMB} MB`);
+    lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
+
+    lines.push("");
+    lines.push(`活跃会话: ${sessions.length}/${getSessionLimits().maxSessions}`);
     if (sessions.length > 0) {
         for (const s of sessions) {
             lines.push(`  ${s.id} | ${s.language} | ${s.memoryMB}MB | 运行 ${s.uptime} | 执行 ${s.execCount} 次`);
@@ -221,7 +231,9 @@ async function buildGc(gcScope?: "council", gcMode?: CouncilGcMode, quarantineId
         if (result.items.length > 100) lines.push(`  …其余 ${result.items.length - 100} 项未展开`);
         return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     }
+
     const cleaned = cleanOldTempFiles();
+    const outputArtifacts = await cleanExpiredOutputArtifacts();
     const sessions = await listSessions();
 
     // gc 只清理临时文件
@@ -230,6 +242,7 @@ async function buildGc(gcScope?: "council", gcMode?: CouncilGcMode, quarantineId
     const lines = [
         "🧹 清理完成",
         `  临时文件清理: ${cleaned} 个`,
+        `  过期输出 artifact 清理: ${outputArtifacts.removed} 个`,
         `  活跃会话: ${sessions.length} 个（由空闲超时自动管理）`,
     ];
 

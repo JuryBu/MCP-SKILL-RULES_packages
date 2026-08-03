@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.15.1
+ * MCP Sandbox Server v1.16.0
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -19,6 +19,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { isParentAlive, checkParentAliveWithTolerance, isAntigravityLS, logStdinEvent, touchActivity, getIdleTime, hasNewerSiblingInstance } from "./lifecycle.js";
 import { ensureDataDirs, cleanOldTempFiles } from "./temp-store.js";
+import { cleanExpiredOutputArtifacts } from "./output-artifact-store.js";
 import { detectEnvironment } from "./env-detector.js";
 import { closeAllSessions } from "./session-manager.js";
 import { cleanOldBgTasks, restoreBackgroundTasksOnStartup } from "./background-tasks.js";
@@ -42,7 +43,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.15.1",
+    version: "1.16.0",
 });
 
 // 注册所有 8 个工具
@@ -67,7 +68,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.15.1 使用指南
+                text: `# MCP Sandbox v1.16.0 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -121,9 +122,9 @@ sandbox_batch(tasks=[
 | language | python | python/node/powershell/cmd/bash(需GitBash) |
 | cwd | 当前目录 | 工作目录 |
 | env | - | conda:名称 / venv:路径 |
-| timeout | 30000 | 硬超时(ms)，最大300000(5分钟) |
+| timeout | 30000 | 命令执行超时(ms)，0 表示不主动限制 |
 | maxMemoryMB | 256 | 内存软限制(MB)，2s采样检测超限自动杀进程，实际峰值可能短暂超出 |
-| maxOutput | 8000 | 输出截断上限(字符) |
+| maxOutput | 自动 | MCP 内联展示预算；不填时约 100K 上下文或 2000 行，超预算返回完整 artifact |
 | outputMode | full | full/tail/head/silent |
 | tailLines | 20 | tail/head 取多少行 |
 | maxLines | - | 输出行数上限，超过时保留头尾折叠中间 |
@@ -207,10 +208,10 @@ sandbox_codex(action="kill",  taskId="codex-001")  — 终止任务
 | taskId | 无 | 后台任务 ID（action 时必须） |
 | **waitSeconds** | 无 | **check 前等待秒数（1-300），Codex 建议 90-120s** |
 | cwd | 当前目录 | 工作目录 |
-| timeout | 0(无超时) | 超时(ms)，最大1800000 |
+| timeout | 0(无超时) | Codex 子进程执行超时(ms)，不再限制为 30 分钟 |
 | model | 无 | 指定模型（-m 参数），不传使用默认 |
 | configOverrides | 无 | -c 配置覆盖 |
-| maxOutput | 10000 | 输出截断上限 |
+| maxOutput | 1MiB | MCP 内联展示预算；完整 stdout/stderr 始终保存在 artifact |
 | image | 无 | 图片文件路径（-i），让 Codex 看截图 |
 | json | false | JSONL 事件流输出（--json） |
 | outputSchema | 无 | JSON Schema 文件路径，约束输出格式 |
@@ -548,7 +549,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[sandbox] MCP Server v1.15.1 启动中... (ppid=${process.ppid})`);
+    console.error(`[sandbox] MCP Server v1.16.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -557,14 +558,28 @@ async function main(): Promise<void> {
     // 清理过期临时文件
     cleanOldTempFiles();
 
+    const reportOutputArtifactCleanup = (result: Awaited<ReturnType<typeof cleanExpiredOutputArtifacts>>) => {
+        if (result.removed > 0) console.error(`[sandbox] 已清理 ${result.removed} 个过期输出 artifact`);
+    };
+    void cleanExpiredOutputArtifacts(Date.now(), true).then(reportOutputArtifactCleanup).catch((error) => {
+        console.error(`[sandbox] 输出 artifact 清理失败: ${error}`);
+    });
+    const cleanOutputArtifacts = () => void cleanExpiredOutputArtifacts().then(reportOutputArtifactCleanup).catch((error) => {
+        console.error(`[sandbox] 输出 artifact 清理失败: ${error}`);
+    });
+    const outputArtifactGcTimer = setInterval(cleanOutputArtifacts, 30 * 60 * 1000);
+    outputArtifactGcTimer.unref?.();
+
     void Promise.resolve().then(() => {
-        const artifactGc = runCouncilArtifactGc({ mode: "apply", includeLegacy: false });
-        if (artifactGc.changed > 0) {
-            console.error(`[sandbox] 已清理 ${artifactGc.changed} 个过期 council artifact run`);
-        }
-        const cleaned = cleanOldCouncilTasks();
-        if (cleaned > 0) {
-            console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
+        if (/^(1|true|yes)$/iu.test(process.env.SANDBOX_COUNCIL_AUTO_GC || "")) {
+            const artifactGc = runCouncilArtifactGc({ mode: "apply", includeLegacy: false });
+            if (artifactGc.changed > 0) {
+                console.error(`[sandbox] 已清理 ${artifactGc.changed} 个过期 council artifact run`);
+            }
+            const cleaned = cleanOldCouncilTasks();
+            if (cleaned > 0) {
+                console.error(`[sandbox] 已清理 ${cleaned} 个过期council任务`);
+            }
         }
         scanCouncilTasksOnStartup((message) => console.error(message));
     }).catch((err) => {
@@ -594,7 +609,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[sandbox] MCP Server v1.15.1 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.16.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

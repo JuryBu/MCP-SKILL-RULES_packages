@@ -5,6 +5,13 @@ import { resolveInterpreter } from "./env-detector.js";
 import { killProcessTree } from "./executor.js";
 import { formatElapsed } from "./lifecycle.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "./owner.js";
+import { acquireResourceLease, type ManagedResourceLease } from "./resource-admission-runtime.js";
+import {
+    createOutputDeliveryCollector,
+    type OutputDeliveryCollector,
+    type OutputDeliveryMode,
+    type OutputDeliveryResult,
+} from "./output-delivery.js";
 
 /**
  * MCP Sandbox REPL 会话管理器
@@ -17,11 +24,39 @@ import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "./
  * - 空闲 5 分钟自动关闭
  */
 
-// 限制常量
-const MAX_SESSIONS = 3;
-const MAX_TOTAL_MEMORY_MB = 768;
-const IDLE_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟
+function readPositiveIntegerEnv(name: string, fallback: number, minimum: number = 1): number {
+    const parsed = Number(process.env[name]);
+    return Number.isFinite(parsed) && parsed >= minimum ? Math.floor(parsed) : fallback;
+}
+
+export interface SessionLimits {
+    maxSessions: number;
+    maxTotalMemoryMB: number;
+    defaultMemoryMB: number;
+    idleTimeoutMs: number;
+}
+
+const SESSION_LIMITS: Readonly<SessionLimits> = Object.freeze({
+    maxSessions: readPositiveIntegerEnv("SANDBOX_SESSION_MAX_COUNT", 5),
+    maxTotalMemoryMB: readPositiveIntegerEnv("SANDBOX_SESSION_MAX_TOTAL_MEMORY_MB", 1536, 16),
+    defaultMemoryMB: readPositiveIntegerEnv("SANDBOX_SESSION_DEFAULT_MEMORY_MB", 256, 16),
+    idleTimeoutMs: readPositiveIntegerEnv("SANDBOX_SESSION_IDLE_TIMEOUT_MS", 5 * 60 * 1000, 1000),
+});
+
+const IDLE_CHECK_INTERVAL_MS = Math.max(1000, Math.min(30000, Math.floor(SESSION_LIMITS.idleTimeoutMs / 2)));
 const MEMORY_CHECK_INTERVAL = 5000;     // 5 秒采样
+const SESSION_ROLLING_BUFFER_CHARS = 1024 * 1024;
+
+function appendRollingBuffer(current: string, chunk: string): string {
+    const combined = current + chunk;
+    return combined.length <= SESSION_ROLLING_BUFFER_CHARS
+        ? combined
+        : combined.slice(-SESSION_ROLLING_BUFFER_CHARS);
+}
+
+export function getSessionLimits(): SessionLimits {
+    return { ...SESSION_LIMITS };
+}
 
 export interface Session {
     id: string;
@@ -40,6 +75,9 @@ export interface Session {
     stdoutBuffer: string;
     stderrBuffer: string;
     execQueue: Promise<void>;
+    executing: boolean;
+    resourceLease: ManagedResourceLease;
+    activeOutputCollector: OutputDeliveryCollector | null;
 }
 
 export interface SessionExecResult {
@@ -48,6 +86,7 @@ export interface SessionExecResult {
     elapsed: string;
     killed: boolean;
     killReason: string | null;
+    outputDelivery: OutputDeliveryResult | null;
 }
 
 export interface SessionStatus {
@@ -62,6 +101,8 @@ export interface SessionStatus {
 
 // 会话存储
 const sessions = new Map<string, Session>();
+let pendingSessionCount = 0;
+let pendingSessionMemoryMB = 0;
 
 // 空闲检查定时器
 let idleChecker: ReturnType<typeof setInterval> | null = null;
@@ -123,87 +164,155 @@ function spawnREPL(language: string, cwd: string, envParam?: string): ChildProce
     return proc;
 }
 
+function waitForProcessSpawn(proc: ChildProcess): Promise<Error | null> {
+    return new Promise((resolve) => {
+        const onSpawn = () => {
+            proc.removeListener("error", onError);
+            resolve(null);
+        };
+        const onError = (error: Error) => {
+            proc.removeListener("spawn", onSpawn);
+            resolve(error);
+        };
+        proc.once("spawn", onSpawn);
+        proc.once("error", onError);
+    });
+}
+
 /**
  * 创建新会话
  */
-export function createSession(
+export async function createSession(
     language: string = "python",
     cwd: string = process.cwd(),
-    maxMemoryMB: number = 256,
+    maxMemoryMB: number = SESSION_LIMITS.defaultMemoryMB,
     envParam?: string,
     ownerId?: string,
-): { session: Session } | { error: string } {
+    signal?: AbortSignal,
+): Promise<{ session: Session } | { error: string }> {
     // 清理僵尸会话
     cleanDeadSessions();
 
-    // 检查会话数量限制
-    if (sessions.size >= MAX_SESSIONS) {
-        return { error: `已达最大会话数量限制 (${MAX_SESSIONS})。请先关闭不需要的会话。` };
+    if (sessions.size + pendingSessionCount >= SESSION_LIMITS.maxSessions) {
+        return { error: `已达最大会话数量限制 (${SESSION_LIMITS.maxSessions})。请先关闭不需要的会话。` };
     }
 
     // 检查总内存额度预留，避免新会话刚启动时 currentMemoryMB≈0 导致超卖。
-    const reservedMemory = getReservedSessionMemory();
-    if (reservedMemory + maxMemoryMB > MAX_TOTAL_MEMORY_MB) {
-        return { error: `总内存额度将超限：当前已预留 ${Math.round(reservedMemory)}MB + 新会话额度 ${maxMemoryMB}MB > 上限 ${MAX_TOTAL_MEMORY_MB}MB` };
+    const reservedMemory = getReservedSessionMemory() + pendingSessionMemoryMB;
+    if (reservedMemory + maxMemoryMB > SESSION_LIMITS.maxTotalMemoryMB) {
+        return { error: `总内存额度将超限：当前已预留 ${Math.round(reservedMemory)}MB + 新会话额度 ${maxMemoryMB}MB > 上限 ${SESSION_LIMITS.maxTotalMemoryMB}MB` };
     }
 
-    const id = newUuid();
-    const proc = spawnREPL(language, cwd, envParam);
+    pendingSessionCount += 1;
+    pendingSessionMemoryMB += maxMemoryMB;
+    let pendingReservationActive = true;
+    let resourceLease: ManagedResourceLease | null = null;
 
-    if (!proc.pid) {
-        return { error: "进程启动失败" };
+    try {
+        resourceLease = await acquireResourceLease({
+            ownerId,
+            reservationMB: maxMemoryMB,
+            signal,
+        });
+        if (signal?.aborted) {
+            resourceLease.release();
+            return { error: "资源等待已取消，Session 进程未启动" };
+        }
+        const id = newUuid();
+        let proc: ChildProcess;
+        try {
+            proc = spawnREPL(language, cwd, envParam);
+        } catch (error) {
+            resourceLease.release();
+            return { error: `进程启动失败: ${error instanceof Error ? error.message : String(error)}` };
+        }
+
+        const spawnError = await waitForProcessSpawn(proc);
+        if (spawnError || !proc.pid) {
+            resourceLease.release();
+            return { error: `进程启动失败${spawnError ? `: ${spawnError.message}` : ""}` };
+        }
+        if (signal?.aborted) {
+            proc.kill();
+            resourceLease.release();
+            return { error: "Session 启动期间调用已取消，进程已终止" };
+        }
+
+        const session: Session = {
+            id,
+            ownerId: normalizeOwnerId(ownerId),
+            language,
+            process: proc,
+            pid: proc.pid,
+            cwd,
+            maxMemoryMB,
+            createdAt: Date.now(),
+            lastActivity: Date.now(),
+            execCount: 0,
+            alive: true,
+            currentMemoryMB: 0,
+            stdoutBuffer: "",
+            stderrBuffer: "",
+            execQueue: Promise.resolve(),
+            executing: false,
+            resourceLease,
+            activeOutputCollector: null,
+        };
+
+        // StringDecoder 安全处理 UTF-8 多字节字符的流切分
+        const stdoutDecoder = new StringDecoder("utf-8");
+        const stderrDecoder = new StringDecoder("utf-8");
+
+        // 持续读取输出（防管道堵塞）
+        proc.stdout?.on("data", (data: Buffer) => {
+            session.stdoutBuffer = appendRollingBuffer(session.stdoutBuffer, stdoutDecoder.write(data));
+            const collector = session.activeOutputCollector;
+            if (collector && !collector.stdout.write(data)) {
+                proc.stdout?.pause();
+                collector.stdout.once("drain", () => proc.stdout?.resume());
+            }
+        });
+
+        proc.stderr?.on("data", (data: Buffer) => {
+            session.stderrBuffer = appendRollingBuffer(session.stderrBuffer, stderrDecoder.write(data));
+            const collector = session.activeOutputCollector;
+            if (collector && !collector.stderr.write(data)) {
+                proc.stderr?.pause();
+                collector.stderr.once("drain", () => proc.stderr?.resume());
+            }
+        });
+
+        // 进程退出检测
+        proc.on("exit", (code, signal) => {
+            session.alive = false;
+            session.resourceLease.release();
+            console.error(`[sandbox] 会话 ${id} 退出: code=${code} signal=${signal}`);
+        });
+
+        proc.on("error", (err) => {
+            session.alive = false;
+            session.resourceLease.release();
+            console.error(`[sandbox] 会话 ${id} 错误: ${err.message}`);
+        });
+
+        sessions.set(id, session);
+
+        // 启动空闲检查器（如果未启动）
+        startIdleChecker();
+
+        console.error(`[sandbox] 新会话 ${id}: ${language} @ ${cwd} (maxMem: ${maxMemoryMB}MB)`);
+
+        return { session };
+    } catch (error) {
+        resourceLease?.release();
+        throw error;
+    } finally {
+        if (pendingReservationActive) {
+            pendingReservationActive = false;
+            pendingSessionCount -= 1;
+            pendingSessionMemoryMB -= maxMemoryMB;
+        }
     }
-
-    const session: Session = {
-        id,
-        ownerId: normalizeOwnerId(ownerId),
-        language,
-        process: proc,
-        pid: proc.pid,
-        cwd,
-        maxMemoryMB,
-        createdAt: Date.now(),
-        lastActivity: Date.now(),
-        execCount: 0,
-        alive: true,
-        currentMemoryMB: 0,
-        stdoutBuffer: "",
-        stderrBuffer: "",
-        execQueue: Promise.resolve(),
-    };
-
-    // StringDecoder 安全处理 UTF-8 多字节字符的流切分
-    const stdoutDecoder = new StringDecoder("utf-8");
-    const stderrDecoder = new StringDecoder("utf-8");
-
-    // 持续读取输出（防管道堵塞）
-    proc.stdout?.on("data", (data: Buffer) => {
-        session.stdoutBuffer += stdoutDecoder.write(data);
-    });
-
-    proc.stderr?.on("data", (data: Buffer) => {
-        session.stderrBuffer += stderrDecoder.write(data);
-    });
-
-    // 进程退出检测
-    proc.on("exit", (code, signal) => {
-        session.alive = false;
-        console.error(`[sandbox] 会话 ${id} 退出: code=${code} signal=${signal}`);
-    });
-
-    proc.on("error", (err) => {
-        session.alive = false;
-        console.error(`[sandbox] 会话 ${id} 错误: ${err.message}`);
-    });
-
-    sessions.set(id, session);
-
-    // 启动空闲检查器（如果未启动）
-    startIdleChecker();
-
-    console.error(`[sandbox] 新会话 ${id}: ${language} @ ${cwd} (maxMem: ${maxMemoryMB}MB)`);
-
-    return { session };
 }
 
 /**
@@ -214,6 +323,10 @@ export async function execInSession(
     code: string,
     timeout: number = 15000,
     ownerId?: string,
+    signal?: AbortSignal,
+    deliveryMode: OutputDeliveryMode = "auto",
+    maxLines?: number,
+    maxOutput?: number,
 ): Promise<SessionExecResult> {
     const session = sessions.get(sessionId);
     const requestOwner = normalizeOwnerId(ownerId);
@@ -225,6 +338,7 @@ export async function execInSession(
             elapsed: "0ms",
             killed: false,
             killReason: null,
+            outputDelivery: null,
         };
     }
 
@@ -235,19 +349,65 @@ export async function execInSession(
             elapsed: "0ms",
             killed: false,
             killReason: "owner",
+            outputDelivery: null,
         };
     }
 
-    const run = () => execInSessionUnlocked(session, code, timeout);
+    const cancelledBeforeStart = (): SessionExecResult => ({
+        stdout: "",
+        stderr: `会话 ${sessionId} 的排队执行已取消，代码未运行`,
+        elapsed: "0ms",
+        killed: true,
+        killReason: "cancelled",
+        outputDelivery: null,
+    });
+
+    if (signal?.aborted) return cancelledBeforeStart();
+
+    let started = false;
+    const run = () => {
+        started = true;
+        if (signal?.aborted) return cancelledBeforeStart();
+        return execInSessionUnlocked(session, code, timeout, signal, deliveryMode, maxLines, maxOutput);
+    };
     const queued = session.execQueue.then(run, run);
     session.execQueue = queued.then(() => undefined, () => undefined);
-    return queued;
+
+    if (!signal) return queued;
+
+    return new Promise<SessionExecResult>((resolve) => {
+        let settled = false;
+        const finish = (result: SessionExecResult) => {
+            if (settled) return;
+            settled = true;
+            signal.removeEventListener("abort", onAbort);
+            resolve(result);
+        };
+        const onAbort = () => {
+            if (!started) finish(cancelledBeforeStart());
+        };
+
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        queued.then(finish, (error) => finish({
+            stdout: "",
+            stderr: `会话 ${sessionId} 执行异常: ${error instanceof Error ? error.message : String(error)}`,
+            elapsed: "0ms",
+            killed: true,
+            killReason: "crash",
+            outputDelivery: null,
+        }));
+    });
 }
 
 async function execInSessionUnlocked(
     session: Session,
     code: string,
     timeout: number,
+    signal?: AbortSignal,
+    deliveryMode: OutputDeliveryMode = "auto",
+    maxLines?: number,
+    maxOutput?: number,
 ): Promise<SessionExecResult> {
     const sessionId = session.id;
 
@@ -259,11 +419,20 @@ async function execInSessionUnlocked(
             elapsed: "0ms",
             killed: false,
             killReason: "crash",
+            outputDelivery: null,
         };
     }
 
+    const outputCollector = await createOutputDeliveryCollector({
+        mode: deliveryMode,
+        combinedLineLimit: maxLines,
+        responseByteLimit: maxOutput,
+    });
+    session.activeOutputCollector = outputCollector;
+
     session.lastActivity = Date.now();
     session.execCount++;
+    session.executing = true;
     const startTime = Date.now();
 
     const sentinel = generateSentinel();
@@ -279,16 +448,46 @@ async function execInSessionUnlocked(
         let resolved = false;
         let killed = false;
         let killReason: string | null = null;
+        let timeoutTimer: NodeJS.Timeout | null = null;
+        let memoryChecker: NodeJS.Timeout | null = null;
+        let sentinelChecker: NodeJS.Timeout | null = null;
 
-        const finalize = () => {
+        const finalize = async () => {
             if (resolved) return;
             resolved = true;
 
-            clearTimeout(timeoutTimer);
-            clearInterval(memoryChecker);
+            if (timeoutTimer) clearTimeout(timeoutTimer);
+            if (memoryChecker) clearInterval(memoryChecker);
+            if (sentinelChecker) clearInterval(sentinelChecker);
+            signal?.removeEventListener("abort", onAbort);
+            session.executing = false;
+            session.lastActivity = Date.now();
+            session.activeOutputCollector = null;
+
+            let outputDelivery: OutputDeliveryResult | null = null;
+            try {
+                outputDelivery = await outputCollector.finalize({
+                    mode: deliveryMode,
+                    status: killed ? "interrupted" : "done",
+                    error: killed ? killReason || undefined : undefined,
+                    readHint: "This is raw REPL stdout/stderr; internal sentinel and prompt text may appear near command boundaries.",
+                });
+            } catch (error) {
+                session.stderrBuffer = appendRollingBuffer(session.stderrBuffer, `\n输出artifact写入失败: ${error instanceof Error ? error.message : String(error)}`);
+            }
 
             // 从输出中去除 sentinel 标记及之后的内容
-            let stdout = session.stdoutBuffer;
+            const previewText = (channel: "stdout" | "stderr"): string => {
+                if (!outputDelivery) return channel === "stdout" ? session.stdoutBuffer : session.stderrBuffer;
+                const inline = channel === "stdout" ? outputDelivery.stdout : outputDelivery.stderr;
+                if (inline !== undefined) return inline;
+                const preview = outputDelivery.preview?.[channel];
+                if (!preview) return "";
+                if (!preview.head) return preview.tail;
+                if (!preview.tail || preview.tail === preview.head) return preview.head;
+                return `${preview.head}\n... (完整输出见 artifact) ...\n${preview.tail}`;
+            };
+            let stdout = previewText("stdout");
             const sentinelIdx = stdout.indexOf(sentinel);
             if (sentinelIdx !== -1) {
                 stdout = stdout.slice(0, sentinelIdx).trim();
@@ -298,7 +497,7 @@ async function execInSessionUnlocked(
             stdout = stdout.replace(/^>>>\s*/gm, "").replace(/^\.\.\.\s*/gm, "").trim();
 
             // 清理 stderr 中的 REPL 提示符
-            let stderr = session.stderrBuffer
+            let stderr = previewText("stderr")
                 .replace(/^>>>\s*/gm, "")
                 .replace(/^\.\.\.\s*/gm, "")
                 .replace(/^>\s*$/gm, "")
@@ -313,69 +512,70 @@ async function execInSessionUnlocked(
                 elapsed,
                 killed,
                 killReason,
+                outputDelivery,
             });
         };
 
+        const terminate = (reason: string) => {
+            if (resolved) return;
+            killed = true;
+            killReason = reason;
+            try {
+                killProcessTree(session.pid);
+            } finally {
+                session.alive = false;
+                session.resourceLease.release();
+                void finalize();
+            }
+        };
+
+        const onAbort = () => terminate("cancelled");
+
         // 监听 sentinel 出现
-        const sentinelChecker = setInterval(() => {
+        sentinelChecker = setInterval(() => {
             if (session.stdoutBuffer.includes(sentinel)) {
-                clearInterval(sentinelChecker);
+                if (sentinelChecker) clearInterval(sentinelChecker);
                 // 给一点时间收集剩余输出
-                setTimeout(finalize, 50);
+                setTimeout(() => void finalize(), 50);
             }
             // REPL 崩溃检测：进程已死但 sentinel 未出现
             if (!session.alive && !resolved) {
-                clearInterval(sentinelChecker);
+                if (sentinelChecker) clearInterval(sentinelChecker);
                 killed = true;
                 killReason = "crash";
-                finalize();
+                void finalize();
             }
         }, 30);
 
         // 超时：杀死进程防止后台资源泄漏
-        const timeoutTimer = setTimeout(() => {
-            if (!resolved) {
-                clearInterval(sentinelChecker);
-                killed = true;
-                killReason = "timeout";
-                // 必须杀死进程！否则用户代码继续后台运行
-                killProcessTree(session.pid);
-                session.alive = false;
-                finalize();
-            }
-        }, timeout);
+        timeoutTimer = setTimeout(() => terminate("timeout"), timeout);
 
         // 内存检查
-        const memoryChecker = setInterval(async () => {
+        memoryChecker = setInterval(async () => {
             if (resolved || !session.alive) return;
             try {
                 const stats = await pidusage(session.pid);
                 session.currentMemoryMB = stats.memory / (1024 * 1024);
+                session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
                 if (session.currentMemoryMB > session.maxMemoryMB) {
-                    clearInterval(sentinelChecker);
-                    killed = true;
-                    killReason = "memory";
-                    // 杀进程
-                    killProcessTree(session.pid);
-                    session.alive = false;
-                    finalize();
+                    terminate("memory");
                 }
             } catch { /* 忽略 */ }
         }, MEMORY_CHECK_INTERVAL);
 
+        signal?.addEventListener("abort", onAbort, { once: true });
+        if (signal?.aborted) {
+            onAbort();
+            return;
+        }
+
         // 发送代码到 REPL
         try {
-            session.process.stdin?.write(wrappedCode);
+            if (!session.process.stdin) throw new Error("REPL stdin 不可用");
+            session.process.stdin.write(wrappedCode);
         } catch (err) {
-            session.alive = false;
-            clearInterval(sentinelChecker);
-            resolve({
-                stdout: "",
-                stderr: `写入 REPL stdin 失败: ${err}`,
-                elapsed: formatElapsed(Date.now() - startTime),
-                killed: true,
-                killReason: "crash",
-            });
+            session.stderrBuffer += `\n写入 REPL stdin 失败: ${err instanceof Error ? err.message : String(err)}`;
+            terminate("crash");
         }
     });
 }
@@ -392,6 +592,7 @@ export async function getSessionStatus(sessionId: string): Promise<SessionStatus
         try {
             const stats = await pidusage(session.pid);
             session.currentMemoryMB = stats.memory / (1024 * 1024);
+            session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
         } catch {
             session.alive = false;
         }
@@ -420,6 +621,7 @@ export function closeSession(sessionId: string): boolean {
             killProcessTree(session.pid);
         } catch { /* 忽略 */ }
         session.alive = false;
+        session.resourceLease.release();
     }
 
     sessions.delete(sessionId);
@@ -463,6 +665,7 @@ function cleanDeadSessions(): void {
     for (const [id, session] of sessions) {
         if (!session.alive) {
             sessions.delete(id);
+            session.resourceLease.release();
             console.error(`[sandbox] 清理僵尸会话 ${id}`);
         }
     }
@@ -490,7 +693,7 @@ function startIdleChecker(): void {
     idleChecker = setInterval(() => {
         const now = Date.now();
         for (const [id, session] of sessions) {
-            if (session.alive && (now - session.lastActivity) > IDLE_TIMEOUT_MS) {
+            if (session.alive && !session.executing && (now - session.lastActivity) > SESSION_LIMITS.idleTimeoutMs) {
                 console.error(`[sandbox] 会话 ${id} 空闲超时 (${formatElapsed(now - session.lastActivity)})，自动关闭`);
                 closeSession(id);
             }
@@ -501,7 +704,7 @@ function startIdleChecker(): void {
             clearInterval(idleChecker!);
             idleChecker = null;
         }
-    }, 30000); // 每 30 秒检查
+    }, IDLE_CHECK_INTERVAL_MS);
 
     idleChecker.unref(); // 不阻塞 Node.js 退出
 }

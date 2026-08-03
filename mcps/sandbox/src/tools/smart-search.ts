@@ -16,6 +16,7 @@ import { scanDirectory, flattenSymbols, flattenFunctionBounds, type SymbolInfo, 
 import { callModelBridge, isCodexCliAvailable, type ModelChain, type ResolvedModelChain } from "../model-bridge.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
 import { normalizeOwnerId } from "../owner.js";
+import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { initParentLs, isLsReady } from "../ls-client.js";
 import {
     DEFAULT_PROGROK_FALLBACK_MODEL,
@@ -1935,7 +1936,7 @@ export function registerSmartSearch(server: McpServer): void {
             ownerId: z.string().optional()
                 .describe("任务归属 ID；未传按 global 兼容旧调用"),
         },
-        async (args) => {
+        async (args, extra?: { signal?: AbortSignal }) => {
             const globalStart = Date.now();
             const ownerId = normalizeOwnerId(args.ownerId);
 
@@ -1956,8 +1957,15 @@ export function registerSmartSearch(server: McpServer): void {
                 chain?: ModelChain;
                 background?: boolean;
                 signal?: AbortSignal;
+                ownerId?: string;
             }): Promise<string> {
-                switch (q.mode) {
+                const resourceLease = await acquireResourceLease({
+                    ownerId: q.ownerId,
+                    reservationMB: q.mode === "smart" ? Number(process.env.SANDBOX_SMART_RESERVATION_MB || 512) : 64,
+                    signal: q.signal,
+                });
+                try {
+                    switch (q.mode) {
                     case "exact": {
                         const data = await searchExact(q.query, q.searchPath, {
                             caseSensitive: q.caseSensitive,
@@ -1993,8 +2001,11 @@ export function registerSmartSearch(server: McpServer): void {
                         });
                         return `🧠 语义搜索 "${q.query}" (chain=${smartOutput.chainUsed})\n\n${smartOutput.text}`;
                     }
-                    default:
-                        return `❌ 未知模式: ${q.mode}`;
+                        default:
+                            return `❌ 未知模式: ${q.mode}`;
+                    }
+                } finally {
+                    resourceLease.release();
                 }
             }
 
@@ -2039,6 +2050,7 @@ export function registerSmartSearch(server: McpServer): void {
                         chain: args.chain as ModelChain | undefined,
                         background: true,
                         signal,
+                        ownerId,
                     });
                     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
                     return `${output}\n\n⏱ 耗时: ${elapsed}s`;
@@ -2095,7 +2107,8 @@ export function registerSmartSearch(server: McpServer): void {
                                 modelChain: (q.modelChain as ModelChain | undefined) ?? (args.modelChain as ModelChain | undefined),
                                 chain: (q.chain as ModelChain | undefined) ?? (args.chain as ModelChain | undefined),
                                 background: false,
-                                signal: undefined,
+                                signal: extra?.signal,
+                                ownerId,
                             };
                             const start = Date.now();
                             try {
@@ -2142,13 +2155,22 @@ export function registerSmartSearch(server: McpServer): void {
                     modelChain: args.modelChain as ModelChain | undefined,
                     chain: args.chain as ModelChain | undefined,
                     background: false,
-                    signal: undefined,
+                    signal: extra?.signal,
+                    ownerId,
                 });
 
                 const elapsed = Date.now() - globalStart;
                 output += `\n\n⏱ 耗时: ${(elapsed / 1000).toFixed(1)}s`;
                 return { content: [{ type: "text" as const, text: output }] };
             } catch (err: any) {
+                const admissionError = serializeResourceAdmissionError(err);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{ type: "text" as const, text: `❌ ${admissionError.type}: 搜索尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                    };
+                }
                 return { content: [{ type: "text" as const, text: `❌ 搜索失败: ${err.message}` }] };
             }
         }

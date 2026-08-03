@@ -7,9 +7,11 @@ import {
     getSessionStatus,
     canAccessSession,
     closeSessionForOwner,
+    getSessionLimits,
     listSessions,
 } from "../session-manager.js";
 import { normalizeOwnerId, ownerMismatchText } from "../owner.js";
+import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 
 /**
  * sandbox_session 工具 — 持久 REPL 会话
@@ -28,17 +30,22 @@ const SessionParamsSchema = z.object({
         .describe("工作目录（start时使用）"),
     env: z.string().optional()
         .describe("环境（start时使用）"),
-    timeout: z.number().min(1000).max(60000).optional()
+    timeout: z.number().int().min(1000).optional()
         .describe("单次执行超时(ms)，默认15000"),
-    maxMemoryMB: z.number().min(16).max(512).optional()
+    maxMemoryMB: z.number().int().min(16).optional()
         .describe("会话内存上限(MB)，默认256"),
-    maxLines: z.number().min(1).max(200).optional()
-        .describe("输出行数上限，超过时保留头尾、折叠中间"),
+    maxLines: z.number().min(1).optional()
+        .describe("兼容的内联行数预算，不再硬限制为200"),
+    maxOutput: z.number().min(100).optional()
+        .describe("兼容的内联响应预算，默认1MiB"),
+    deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
+        .describe("交付模式，默认auto"),
     ownerId: z.string().optional()
         .describe("会话归属 ID；未传按 global 兼容旧调用"),
 });
 
 export function registerSession(server: McpServer): void {
+    const limits = getSessionLimits();
     server.tool(
         "sandbox_session",
         `管理持久 REPL 会话。变量状态跨调用保持，适合交互式开发和调试。
@@ -50,9 +57,9 @@ action:
 - close: 关闭会话
 - list: 列出所有活跃会话
 
-限制：同一 MCP 进程内最多 3 个并发会话，空闲 5 分钟自动关闭。`,
+默认限制：同一 MCP 进程内最多 ${limits.maxSessions} 个并发会话、总预留 ${limits.maxTotalMemoryMB}MB、单会话默认 ${limits.defaultMemoryMB}MB、空闲 ${Math.round(limits.idleTimeoutMs / 60000)} 分钟自动关闭；均可通过 SANDBOX_SESSION_* 环境变量调整。`,
         SessionParamsSchema.shape,
-        async (params) => {
+        async (params, extra) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -63,13 +70,13 @@ action:
                 };
             }
 
-            const { action = "exec", sessionId, language, code, cwd, env, timeout, maxMemoryMB, maxLines, ownerId } = parsed.data;
+            const { action = "exec", sessionId, language, code, cwd, env, timeout, maxMemoryMB, maxLines, maxOutput, deliveryMode, ownerId } = parsed.data;
             const requestOwner = normalizeOwnerId(ownerId);
 
             try {
                 switch (action) {
                     case "start": {
-                        const result = createSession(language || "python", cwd, maxMemoryMB, env, requestOwner);
+                        const result = await createSession(language || "python", cwd, maxMemoryMB, env, requestOwner, extra.signal);
                         if ("error" in result) {
                             return {
                                 content: [{ type: "text" as const, text: `❌ ${result.error}` }],
@@ -96,7 +103,7 @@ action:
                             };
                         }
 
-                        const result = await execInSession(sessionId, code, timeout, requestOwner);
+                        const result = await execInSession(sessionId, code, timeout, requestOwner, extra.signal, deliveryMode, maxLines, maxOutput);
 
                         // maxLines 行数截断
                         let stdout = result.stdout;
@@ -114,8 +121,9 @@ action:
 
                         const parts: string[] = [];
 
+                        const errorType = result.killReason === "timeout" ? "execution_timeout" : undefined;
                         const statusIcon = result.killed ? "💀" : "✅";
-                        parts.push(`${statusIcon} ${result.killed ? `被杀 (${result.killReason})` : "执行完成"} | ${result.elapsed}`);
+                        parts.push(`${statusIcon} ${errorType ? `${errorType}（命令已启动后运行超时）` : result.killed ? `被杀 (${result.killReason})` : "执行完成"} | ${result.elapsed}`);
 
                         if (stdout) {
                             parts.push("");
@@ -127,8 +135,29 @@ action:
                             parts.push(`⚠️ ${result.stderr}`);
                         }
 
+                        if (result.outputDelivery) {
+                            const delivery = result.outputDelivery;
+                            parts.push("");
+                            parts.push(`📦 输出交付: ${delivery.mode} | complete=${delivery.complete} | status=${delivery.status}`);
+                            parts.push(`  artifactId: ${delivery.artifact.artifactId}`);
+                            parts.push(`  manifest: ${delivery.artifact.manifestPath}`);
+                            parts.push(`  stdout: ${delivery.stats.stdout.rawBytes} bytes / ${delivery.stats.stdout.lines} lines / sha256=${delivery.stats.stdout.sha256}`);
+                            parts.push(`  stderr: ${delivery.stats.stderr.rawBytes} bytes / ${delivery.stats.stderr.lines} lines / sha256=${delivery.stats.stderr.sha256}`);
+                            parts.push(`  estimatedTokens: ${delivery.stats.combined.estimatedTokens} | expiresAt: ${delivery.artifact.expiresAt}`);
+                            if (delivery.reasons.length > 0) parts.push(`  reasons: ${delivery.reasons.join(", ")}`);
+                            parts.push(`  readHint: ${delivery.readHint}`);
+                        }
+
                         const output = {
                             content: [{ type: "text" as const, text: parts.join("\n") }],
+                            structuredContent: {
+                                errorType,
+                                commandStarted: true,
+                                totalMs: Date.now() - startTime,
+                                killed: result.killed,
+                                killReason: result.killReason,
+                                artifact: result.outputDelivery?.artifact,
+                            },
                         };
                         return appendTiming(output, startTime);
                     }
@@ -146,6 +175,7 @@ action:
                                 content: [{ type: "text" as const, text: `❌ 会话 ${sessionId} 不存在` }],
                             };
                         }
+
                         if (!canAccessSession(sessionId, requestOwner)) {
                             return {
                                 content: [{ type: "text" as const, text: ownerMismatchText("会话", sessionId) }],
@@ -209,6 +239,14 @@ action:
                         };
                 }
             } catch (err) {
+                const admissionError = serializeResourceAdmissionError(err);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Session 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                    };
+                }
                 return {
                     content: [{ type: "text" as const, text: `❌ 异常: ${err instanceof Error ? err.message : String(err)}` }],
                 };

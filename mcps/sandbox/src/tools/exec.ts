@@ -2,6 +2,7 @@ import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { execute } from "../executor.js";
+import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 
 /**
  * sandbox_exec 工具 — 代码/命令执行
@@ -18,18 +19,26 @@ const ExecParamsShape = {
         .describe("语言：python(默认)/node/powershell/cmd/bash(需 Git Bash)"),
     cwd: z.string().optional().describe("工作目录"),
     env: z.string().optional().describe("环境：conda:名称 / venv:路径"),
-    timeout: z.number().min(1000).max(300000).optional()
-        .describe("硬超时(ms)，默认30000，最大300000(5分钟)"),
-    maxMemoryMB: z.number().min(16).max(1024).optional()
-        .describe("最大内存(MB)，默认256，最大1024"),
-    maxOutput: z.number().min(100).max(50000).optional()
-        .describe("输出截断上限(字符)，默认8000"),
+    timeout: z.number().min(0).optional()
+        .describe("执行超时(ms)，默认30000；0 表示 Sandbox 不主动超时"),
+    maxMemoryMB: z.number().min(16).max(1536).optional()
+        .describe("进程树内存上限(MB)，默认256；显式值也作为全局接纳预留"),
+    maxOutput: z.number().min(100).optional()
+        .describe("兼容参数：调用方希望的内联字符预算；最终仍受服务端响应保护线约束"),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional()
         .describe("输出模式：full(默认)/tail(最后N行)/head(前N行)/silent(只返回exitCode)"),
-    tailLines: z.number().min(1).max(200).optional()
+    deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
+        .describe("交付模式：auto 默认按100K估算token、2000行、1MiB响应线自动选择"),
+    tailLines: z.number().min(1).optional()
         .describe("tail/head模式取多少行，默认20"),
-    maxLines: z.number().min(1).max(200).optional()
-        .describe("输出行数上限，超过时保留头尾、折叠中间。和 maxOutput 并存取更严格的"),
+    maxLines: z.number().min(1).optional()
+        .describe("兼容参数：调用方希望的内联行数预算，不再硬限制为200"),
+    ownerId: z.string().min(1).max(200).optional()
+        .describe("稳定调用方标识，用于多对话公平调度"),
+    admissionBudgetMs: z.number().min(0).optional()
+        .describe("资源不足时最多等待多久；不填使用服务端8～10秒预算"),
+    retryAttempt: z.number().int().min(0).max(4).optional()
+        .describe("调用方重试级别，用于生成随机指数退避建议"),
     gpu: z.boolean().optional()
         .describe("允许使用GPU，默认false"),
     maxVRAM_MB: z.number().optional()
@@ -53,7 +62,7 @@ command 模式：执行系统命令，自动用 shell 包装
 - 输出智能截断（不爆上下文）
 - 失败原因清晰（killed + killReason）`,
         ExecParamsShape,
-        async (params: Record<string, unknown>) => {
+        async (params: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -80,10 +89,14 @@ command 模式：执行系统命令，自动用 shell 包装
             const maxMemoryMB = params.maxMemoryMB as number | undefined;
             const maxOutput = params.maxOutput as number | undefined;
             const outputMode = params.outputMode as "full" | "tail" | "head" | "silent" | undefined;
+            const deliveryMode = params.deliveryMode as "auto" | "inline" | "file" | "manifest" | undefined;
             const tailLines = params.tailLines as number | undefined;
             const maxLines = params.maxLines as number | undefined;
             const gpu = params.gpu as boolean | undefined;
             const maxVRAM_MB = params.maxVRAM_MB as number | undefined;
+            const ownerId = params.ownerId as string | undefined;
+            const admissionBudgetMs = params.admissionBudgetMs as number | undefined;
+            const retryAttempt = params.retryAttempt as number | undefined;
 
             try {
                 const result = await execute({
@@ -96,10 +109,15 @@ command 模式：执行系统命令，自动用 shell 包装
                     maxMemoryMB,
                     maxOutput,
                     outputMode,
+                    deliveryMode,
                     tailLines,
                     maxLines,
                     gpu,
                     maxVRAM_MB,
+                    ownerId,
+                    signal: extra?.signal,
+                    admissionBudgetMs,
+                    retryAttempt,
                 });
 
                 // 构建返回信息
@@ -107,10 +125,13 @@ command 模式：执行系统命令，自动用 shell 包装
 
                 // 状态行
                 const statusIcon = result.exitCode === 0 ? "✅" : result.killed ? "💀" : "❌";
-                const statusDesc = result.killed
+                const errorType = result.killReason === "timeout" ? "execution_timeout" : undefined;
+                const statusDesc = errorType
+                    ? `${errorType}（命令已启动后运行超时）`
+                    : result.killed
                     ? `被杀 (${result.killReason})`
                     : result.exitCode === 0 ? "成功" : `失败 (exit ${result.exitCode})`;
-                parts.push(`${statusIcon} ${statusDesc} | ${result.elapsed} | 内存峰值 ${result.peakMemoryMB}MB`);
+                parts.push(`${statusIcon} ${statusDesc} | 执行 ${result.elapsed} | 排队 ${result.queueWaitMs}ms | 内存峰值 ${result.peakMemoryMB}MB`);
 
                 // stdout
                 if (result.stdout) {
@@ -126,21 +147,46 @@ command 模式：执行系统命令，自动用 shell 包装
                     parts.push(result.stderr);
                 }
 
-                // 截断提示
-                if (result.truncated) {
+                if (result.artifact && result.outputStats) {
                     parts.push("");
-                    parts.push(`📎 输出被截断: ${result.returnedBytes} / ${result.originalBytes} bytes`);
-                    if (result.tempFile) {
-                        parts.push(`📁 完整输出: ${result.tempFile}`);
-                    }
+                    parts.push(`📦 输出交付: ${result.deliveryMode} | complete=${result.outputComplete} | status=${result.outputStatus}`);
+                    parts.push(`  artifactId: ${result.artifact.artifactId}`);
+                    parts.push(`  manifest: ${result.artifact.manifestPath}`);
+                    parts.push(`  stdout: ${result.outputStats.stdout.rawBytes} bytes / ${result.outputStats.stdout.lines} lines / sha256=${result.outputStats.stdout.sha256}`);
+                    parts.push(`  stderr: ${result.outputStats.stderr.rawBytes} bytes / ${result.outputStats.stderr.lines} lines / sha256=${result.outputStats.stderr.sha256}`);
+                    parts.push(`  estimatedTokens: ${result.outputStats.combined.estimatedTokens} | expiresAt: ${result.artifact.expiresAt}`);
+                    if (result.outputReasons.length > 0) parts.push(`  reasons: ${result.outputReasons.join(", ")}`);
+                    if (result.outputReadHint) parts.push(`  readHint: ${result.outputReadHint}`);
                 }
 
                 const output = {
                     content: [{ type: "text" as const, text: parts.join("\n") }],
+                    structuredContent: {
+                        errorType,
+                        commandStarted: true,
+                        queueWaitMs: result.queueWaitMs,
+                        runMs: Math.max(0, Date.now() - startTime - result.queueWaitMs),
+                        totalMs: Date.now() - startTime,
+                        exitCode: result.exitCode,
+                        killed: result.killed,
+                        killReason: result.killReason,
+                        artifact: result.artifact,
+                    },
                 };
 
                 return appendTiming(output, startTime);
             } catch (err) {
+                const admissionError = serializeResourceAdmissionError(err);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{
+                            type: "text" as const,
+                            text: `❌ ${admissionError.type}: 命令尚未启动；资源调度等待 ${admissionError.queueWaitMs}ms 后失败，建议 ${admissionError.retryAfterMs}ms 后随机重试`,
+                        }],
+                    };
+                }
                 return {
                     content: [{ type: "text" as const, text: `❌ 执行异常: ${err instanceof Error ? err.message : String(err)}` }],
                 };

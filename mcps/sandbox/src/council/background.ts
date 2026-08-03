@@ -6,6 +6,7 @@ import { fileURLToPath } from "url";
 import { TEMP_DIR } from "../temp-store.js";
 import { formatElapsed } from "../lifecycle.js";
 import { hasOwnerAccess, normalizeOwnerId, ownerMismatchText, newUuid } from "../owner.js";
+import { acquireResourceLease, adoptResourceLease, type ManagedResourceLease } from "../resource-admission-runtime.js";
 import { normalizeCouncilModelConfig, type CouncilCheckpoint, type CouncilRunParams, type CouncilTranscript } from "./types.js";
 import {
     councilArtifactPath,
@@ -52,7 +53,32 @@ export interface PersistentCouncilSpec {
         transcriptJsonPath: string;
     };
     params: Omit<CouncilRunParams, "onProgress" | "signal">;
+    reservationMB?: number;
 }
+
+const councilResourceLeases = new Map<string, ManagedResourceLease>();
+const COUNCIL_RESOURCE_LEASE_REAP_INTERVAL_MS = 30_000;
+
+function releaseCouncilResourceLease(taskId: string): void {
+    councilResourceLeases.get(taskId)?.release();
+    councilResourceLeases.delete(taskId);
+}
+
+function reconcileCouncilResourceLeases(): void {
+    for (const taskId of councilResourceLeases.keys()) {
+        const paths = getTaskPaths(taskId);
+        const done = readJson<PersistentCouncilDone>(paths.done);
+        const progress = readJson<PersistentCouncilProgress>(paths.progress);
+        const spec = readJson<PersistentCouncilSpec>(paths.spec);
+        const workerValidation = validateCouncilTaskWorker(progress, spec);
+        if (done || !progress || progress.status !== "running" || workerValidation !== "matching") {
+            releaseCouncilResourceLease(taskId);
+        }
+    }
+}
+
+const councilResourceLeaseReaper = setInterval(reconcileCouncilResourceLeases, COUNCIL_RESOURCE_LEASE_REAP_INTERVAL_MS);
+councilResourceLeaseReaper.unref?.();
 
 interface PersistentCouncilProgress {
     status: "running" | "done" | "error" | "interrupted";
@@ -226,6 +252,8 @@ export interface CouncilWorkerTerminationDependencies {
     terminateProcessTree?: (pid: number) => void;
 }
 
+export type CouncilWorkerIdentityValidationResult = "matching" | "not_running" | "identity_missing" | "identity_mismatch";
+
 function isPidAlive(pid?: number): boolean {
     if (!pid) return false;
     try {
@@ -287,14 +315,24 @@ export function readCouncilWorkerIdentity(pid?: number): CouncilWorkerIdentity |
     return startId ? { pid, startId } : undefined;
 }
 
+export function validateCouncilWorkerIdentity(
+    expected: CouncilWorkerIdentity | undefined,
+    dependencies: CouncilWorkerTerminationDependencies = {},
+): CouncilWorkerIdentityValidationResult {
+    if (!expected) return "identity_missing";
+    const observed = (dependencies.observeIdentity || readCouncilWorkerIdentity)(expected.pid);
+    if (!observed) return "not_running";
+    if (observed.pid !== expected.pid || observed.startId !== expected.startId) return "identity_mismatch";
+    return "matching";
+}
+
 export function terminateCouncilWorkerIfIdentityMatches(
     expected: CouncilWorkerIdentity | undefined,
     dependencies: CouncilWorkerTerminationDependencies = {},
 ): CouncilWorkerTerminationResult {
     if (!expected) return "identity_missing";
-    const observed = (dependencies.observeIdentity || readCouncilWorkerIdentity)(expected.pid);
-    if (!observed) return "not_running";
-    if (observed.pid !== expected.pid || observed.startId !== expected.startId) return "identity_mismatch";
+    const validation = validateCouncilWorkerIdentity(expected, dependencies);
+    if (validation !== "matching") return validation;
     (dependencies.terminateProcessTree || killProcessTree)(expected.pid);
     return "terminated";
 }
@@ -306,6 +344,23 @@ export function reclaimCouncilWorkerAfterDeadline(
 ): CouncilWorkerTerminationResult {
     if (status === "done" || status === "error") return "not_required";
     return terminateCouncilWorkerIfIdentityMatches(workerIdentity, dependencies);
+}
+
+function validateCouncilTaskWorker(
+    progress: Pick<PersistentCouncilProgress, "pid" | "workerIdentity"> | null | undefined,
+    spec: Pick<PersistentCouncilSpec, "workerIdentity"> | null | undefined,
+): CouncilWorkerIdentityValidationResult {
+    const workerIdentity = progress?.workerIdentity || spec?.workerIdentity;
+    if (progress?.pid && workerIdentity && progress.pid !== workerIdentity.pid) return "identity_mismatch";
+    return validateCouncilWorkerIdentity(workerIdentity);
+}
+
+function councilWorkerIdentityFailureText(validation: CouncilWorkerIdentityValidationResult): string {
+    if (validation === "not_running") return "后台 worker 已退出，但未写入完成标记";
+    if (validation === "identity_missing") {
+        return "后台 worker 缺少 workerIdentity，无法安全确认 PID 是否仍属于该任务；未继续报告为运行中，也未终止 PID";
+    }
+    return "后台 worker 的 workerIdentity 与当前进程不匹配，PID 可能已复用；未继续报告为运行中，也未终止 PID";
 }
 
 function sleep(ms: number): Promise<void> {
@@ -441,21 +496,28 @@ export function scanCouncilTasksOnStartup(logger: (message: string) => void = co
         if (!progress || fs.existsSync(paths.done)) continue;
 
         summary.discovered += 1;
-        if (progress.pid && isPidAlive(progress.pid)) {
+        const spec = readJson<PersistentCouncilSpec>(paths.spec);
+        const workerValidation = validateCouncilTaskWorker(progress, spec);
+        if (progress.status === "running" && workerValidation === "matching") {
+            if (!councilResourceLeases.has(taskId)) {
+                councilResourceLeases.set(taskId, adoptResourceLease(spec?.reservationMB || 512));
+            }
             summary.running += 1;
             logger(`[sandbox] 旧council任务 ${taskId} worker仍在运行 (pid=${progress.pid})`);
             continue;
         }
 
-        const spec = readJson<PersistentCouncilSpec>(paths.spec);
+        const error = progress.status === "running"
+            ? councilWorkerIdentityFailureText(workerValidation)
+            : `后台 worker 状态为 ${progress.status}，但未写入完成标记`;
         finalizeCouncilTask(taskId, spec?.ownerId || progress.ownerId, {
             status: "interrupted",
-            error: "worker已退出",
+            error,
             pid: progress.pid,
             startedAt: progress.startedAt,
         });
         summary.interrupted += 1;
-        logger(`[sandbox] 旧council任务 ${taskId} worker已退出，已标记中断`);
+        logger(`[sandbox] 旧council任务 ${taskId} ${error}，已标记中断`);
     }
 
     logger(`[sandbox] 发现 ${summary.discovered} 个旧council任务，${summary.running} 个worker仍在运行，${summary.interrupted} 个已标记中断`);
@@ -476,8 +538,14 @@ export function readCouncilResumeSource(taskId: string, requestOwnerId: string):
     }
     const progress = readJson<PersistentCouncilProgress>(paths.progress);
     const done = readJson<PersistentCouncilDone>(paths.done);
-    if (!done && progress?.status === "running" && isPidAlive(progress.pid)) {
-        throw new Error(`❌ council 任务 ${taskId} 的 worker 仍在运行，不能并发 resume；请等待任务结束或先中止旧任务`);
+    if (!done && progress?.status === "running") {
+        const workerValidation = validateCouncilTaskWorker(progress, spec);
+        if (workerValidation === "matching") {
+            throw new Error(`❌ council 任务 ${taskId} 的 worker 仍在运行，不能并发 resume；请等待任务结束或先中止旧任务`);
+        }
+        if (workerValidation === "identity_missing" || workerValidation === "identity_mismatch") {
+            throw new Error(`❌ council 任务 ${taskId} 的 ${councilWorkerIdentityFailureText(workerValidation)}；为避免与未验证 worker 并发，拒绝自动 resume`);
+        }
     }
     const transcriptPath = spec.transcriptPath || spec.params.transcriptPath;
     if (!transcriptPath) {
@@ -623,11 +691,12 @@ export function finalizeCouncilTask(taskId: string, ownerId: string, result: {
     writeJsonAtomic(paths.progress, progressPayload);
 }
 
-export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdInput?: string, maxRunMs = DEFAULT_BACKGROUND_MAX_RUN_MS, resumeSource?: CouncilResumeSource): { id: string; ownerId: string; deadlineAt: string; runId: string; artifactManifestPath: string } {
+export async function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdInput?: string, maxRunMs = DEFAULT_BACKGROUND_MAX_RUN_MS, resumeSource?: CouncilResumeSource): Promise<{ id: string; ownerId: string; deadlineAt: string; runId: string; artifactManifestPath: string }> {
     ensureTaskRoot();
     const taskId = `council-${newUuid()}`;
     runParams = normalizeCouncilRunParams(runParams);
     const ownerId = normalizeOwnerId(ownerIdInput || runParams.ownerId);
+    const reservationMB = Number(process.env.SANDBOX_COUNCIL_RESERVATION_MB || 512);
     const startedAt = nowIso();
     const deadlineAt = new Date(Date.now() + maxRunMs).toISOString();
     const paths = getTaskPaths(taskId);
@@ -683,8 +752,14 @@ export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdI
             artifactManifestPath: artifactRun.artifactManifestPath,
             checkpointPath,
         },
+        reservationMB,
     };
+    let resourceLease: ManagedResourceLease | undefined;
     try {
+        resourceLease = await acquireResourceLease({ ownerId, reservationMB, signal: runParams.signal });
+        if (runParams.signal?.aborted) {
+            throw new Error("Council 调用已取消，worker 未启动");
+        }
         if (resumeSource && resumeTranscriptJsonPath && resumeCheckpointPath) {
             writeJsonAtomic(resumeTranscriptJsonPath, normalizeCouncilTranscript(resumeSource.transcript));
             writeJsonAtomic(resumeCheckpointPath, resumeSource.checkpoint);
@@ -694,6 +769,9 @@ export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdI
             markCouncilTaskResumed(resumeSource.sourceTaskId, ownerId, taskId, artifactRun.runId);
         }
         writeCouncilTaskProgress(taskId, ownerId, "任务已启动，等待 worker 接管。", undefined, startedAt, deadlineAt);
+        if (runParams.signal?.aborted) {
+            throw new Error("Council 调用已取消，worker 未启动");
+        }
         const child = spawn(process.execPath, [WORKER_PATH, paths.spec], {
             cwd: SERVER_ROOT,
             detached: true,
@@ -701,11 +779,14 @@ export function startPersistentCouncilTask(runParams: CouncilRunParams, ownerIdI
             windowsHide: true,
         });
         child.unref();
+        councilResourceLeases.set(taskId, resourceLease);
+        child.on("close", () => releaseCouncilResourceLease(taskId));
         const workerIdentity = readCouncilWorkerIdentity(child.pid);
         if (workerIdentity) writeJsonAtomic(paths.spec, { ...spec, workerIdentity });
         writeCouncilTaskProgress(taskId, ownerId, "worker 已启动，准备执行 council。", child.pid, startedAt, deadlineAt, workerIdentity);
         scheduleCouncilWorkerForceKill(taskId, ownerId, deadlineAt);
     } catch (error) {
+        resourceLease?.release();
         const current = readCouncilArtifactManifest(artifactRun.runId);
         if (current.manifest.status === "running") finishCouncilArtifactRun(artifactRun.runId, "error");
         throw error;
@@ -726,6 +807,7 @@ function readTask(taskId: string, requestOwnerId: string): PersistentCouncilQuer
     }
     const done = readJson<PersistentCouncilDone>(paths.done);
     if (done) {
+        releaseCouncilResourceLease(taskId);
         const deadlineAtMs = spec.deadlineAt ? new Date(spec.deadlineAt).getTime() : Number.NaN;
         if (done.status === "interrupted" && Number.isFinite(deadlineAtMs) && Date.now() > deadlineAtMs + BACKGROUND_ABORT_GRACE_MS) {
             reclaimCouncilWorkerAfterDeadline(done.status, done.workerIdentity || spec.workerIdentity);
@@ -773,8 +855,10 @@ function readTask(taskId: string, requestOwnerId: string): PersistentCouncilQuer
                 progressText: progress.progressText,
             };
         }
-        if (progress.pid && !isPidAlive(progress.pid)) {
-            const error = "后台 worker 已退出，但未写入完成标记";
+        const workerValidation = validateCouncilTaskWorker(progress, spec);
+        if (workerValidation !== "matching") {
+            const error = councilWorkerIdentityFailureText(workerValidation);
+            releaseCouncilResourceLease(taskId);
             finalizeCouncilTask(taskId, progress.ownerId, {
                 status: "interrupted",
                 error,

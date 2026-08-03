@@ -8,6 +8,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, formatElapsed } from "../lifecycle.js";
 import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
+import { acquireResourceLease, adoptResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
 
 /**
  * MCP Sandbox Launch — 长任务脱离执行
@@ -16,7 +17,7 @@ import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "..
  * 进程完全脱离 MCP 生命周期，日志写磁盘，注册表持久化。
  *
  * 核心特性：
- * - spawn + unref()：进程独立于 MCP（Windows 不用 detached 避免断开 fd 继承）
+ * - bootstrap 先退出，再由 detached worker 托管命令，避免 backend 进程树回收误杀长任务
  * - stdout/stderr 重定向到磁盘日志文件
  * - 注册表存 JSON 文件，跨 MCP 重启持久化
  * - status 支持 waitSeconds（sleep + 早退）
@@ -30,6 +31,7 @@ const LAUNCH_DIR = process.env.SANDBOX_LAUNCH_DIR || path.join(DATA_ROOT, "launc
 const REGISTRY_FILE = path.join(LAUNCH_DIR, "registry.json");
 const TASK_REGISTRY_DIR = path.join(LAUNCH_DIR, "tasks");
 const WRAPPER_FILE = path.join(LAUNCH_DIR, "launch-wrapper.cjs");
+const BOOTSTRAP_FILE = path.join(LAUNCH_DIR, "launch-bootstrap.cjs");
 
 // ── 类型 ──
 
@@ -38,6 +40,7 @@ interface LaunchTask {
     pid: number;
     command: string;
     commandHash?: string;
+    processIdentity?: LaunchProcessIdentity;
     ownerId?: string;
     cwd: string;
     stdoutLog: string;
@@ -46,9 +49,19 @@ interface LaunchTask {
     exitMarkerPath?: string;
     createdAtMs?: number;
     finishedAtMs?: number;
+    missingPidSinceMs?: number;
     startTime: number;
     status: "running" | "done" | "failed";
     exitCode: number | null;
+    reservationMB?: number;
+    statusReason?: string;
+}
+
+const launchLeases = new Map<string, ManagedResourceLease>();
+
+function releaseLaunchLease(taskId: string): void {
+    launchLeases.get(taskId)?.release();
+    launchLeases.delete(taskId);
 }
 
 interface LaunchTombstone {
@@ -69,7 +82,24 @@ interface ExitMarker {
 interface ProcessInfo {
     commandLine?: string;
     createdAtMs?: number;
+    startId?: string;
 }
+
+export interface LaunchProcessIdentity {
+    pid: number;
+    startId: string;
+}
+
+export interface LaunchProcessIdentityDependencies {
+    observeIdentity?: (pid: number) => LaunchProcessIdentity | undefined;
+    observeProcessInfo?: (pid: number) => ProcessInfo | null;
+}
+
+export type LaunchProcessIdentityValidationResult = "matching" | "not_running" | "identity_missing" | "identity_mismatch";
+
+const LAUNCH_REAPER_INTERVAL_MS = 15_000;
+const LAUNCH_EXIT_MARKER_GRACE_MS = 2_000;
+let launchReaperStarted = false;
 
 // ── 注册表管理 ──
 
@@ -197,40 +227,9 @@ function validateLaunchCwd(cwd: string): string | null {
     }
 }
 
-function writeExitMarker(markerPath: string, data: ExitMarker): void {
-    const tmp = `${markerPath}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), "utf-8");
-    fs.renameSync(tmp, markerPath);
-}
-
-function markLaunchSpawnError(task: LaunchTask, err: Error): void {
-    const finishedAtMs = Date.now();
-    try {
-        if (task.exitMarkerPath) {
-            writeExitMarker(task.exitMarkerPath, {
-                done: true,
-                exitCode: null,
-                signal: null,
-                error: err.message,
-                startedAtMs: task.startTime,
-                finishedAtMs,
-            });
-        }
-    } catch { /* best effort */ }
-    try {
-        if (task.specPath) fs.unlinkSync(task.specPath);
-    } catch { /* best effort */ }
-    writeTask({
-        ...task,
-        status: "failed",
-        exitCode: null,
-        finishedAtMs,
-    });
-}
-
 function ensureWrapperFile(): void {
     ensureLaunchDir();
-    const wrapper = `const fs = require("fs");
+    const worker = `const fs = require("fs");
 const { spawn } = require("child_process");
 
 const specPath = process.argv[2];
@@ -302,8 +301,49 @@ try {
   }
 }
 `;
-    if (!fs.existsSync(WRAPPER_FILE) || fs.readFileSync(WRAPPER_FILE, "utf-8") !== wrapper) {
-        fs.writeFileSync(WRAPPER_FILE, wrapper, "utf-8");
+    const bootstrap = `const fs = require("fs");
+const { spawn } = require("child_process");
+
+const workerPath = process.argv[2];
+const specPath = process.argv[3];
+const handshakePath = process.argv[4];
+
+function writeHandshake(value) {
+  const tmp = handshakePath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
+  fs.renameSync(tmp, handshakePath);
+}
+
+try {
+  const child = spawn(process.execPath, [workerPath, specPath], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true,
+    env: { ...process.env },
+  });
+  child.once("error", (err) => {
+    try { writeHandshake({ error: err.message }); } catch {}
+    process.exit(124);
+  });
+  child.once("spawn", () => {
+    if (!child.pid) {
+      try { writeHandshake({ error: "worker PID missing" }); } catch {}
+      process.exit(123);
+    }
+    writeHandshake({ pid: child.pid });
+    child.unref();
+    process.exit(0);
+  });
+} catch (err) {
+  try { writeHandshake({ error: err && err.message ? err.message : String(err) }); } catch {}
+  process.exit(122);
+}
+`;
+    if (!fs.existsSync(WRAPPER_FILE) || fs.readFileSync(WRAPPER_FILE, "utf-8") !== worker) {
+        fs.writeFileSync(WRAPPER_FILE, worker, "utf-8");
+    }
+    if (!fs.existsSync(BOOTSTRAP_FILE) || fs.readFileSync(BOOTSTRAP_FILE, "utf-8") !== bootstrap) {
+        fs.writeFileSync(BOOTSTRAP_FILE, bootstrap, "utf-8");
     }
 }
 
@@ -332,7 +372,7 @@ function readExitMarker(task: LaunchTask): ExitMarker | null {
 function getProcessInfo(pid: number): ProcessInfo | null {
     try {
         if (process.platform === "win32") {
-            const script = `$p=Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($null -ne $p) { @{CreationDate=$p.CreationDate.ToUniversalTime().ToString('o'); CommandLine=$p.CommandLine} | ConvertTo-Json -Compress }`;
+            const script = `$p=Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($null -ne $p) { @{CreationDate=$p.CreationDate.ToUniversalTime().ToString('o'); StartId=$p.CreationDate.ToUniversalTime().Ticks.ToString(); CommandLine=$p.CommandLine} | ConvertTo-Json -Compress }`;
             const raw = execFileSync("powershell.exe", ["-NoProfile", "-Command", script], {
                 encoding: "utf-8",
                 windowsHide: true,
@@ -341,48 +381,129 @@ function getProcessInfo(pid: number): ProcessInfo | null {
             if (!raw) return null;
             const parsed = JSON.parse(raw);
             const createdAtMs = parsed.CreationDate ? new Date(parsed.CreationDate).getTime() : undefined;
-            return { commandLine: parsed.CommandLine, createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined };
+            return {
+                commandLine: typeof parsed.CommandLine === "string" ? parsed.CommandLine : undefined,
+                createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined,
+                startId: typeof parsed.StartId === "string" && parsed.StartId ? parsed.StartId : undefined,
+            };
         }
 
         const cmdlinePath = `/proc/${pid}/cmdline`;
-        if (fs.existsSync(cmdlinePath)) {
+        const statPath = `/proc/${pid}/stat`;
+        if (fs.existsSync(cmdlinePath) && fs.existsSync(statPath)) {
             const commandLine = fs.readFileSync(cmdlinePath, "utf-8").replace(/\0/g, " ").trim();
-            return { commandLine };
+            const stat = fs.readFileSync(statPath, "utf-8");
+            const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+            return { commandLine, startId: fields[19] || undefined };
         }
+
+        const startId = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+            encoding: "utf-8",
+            timeout: 3000,
+        }).trim();
+        if (!startId) return null;
+        const commandLine = execFileSync("ps", ["-o", "args=", "-p", String(pid)], {
+            encoding: "utf-8",
+            timeout: 3000,
+        }).trim();
+        const createdAtMs = new Date(startId).getTime();
+        return {
+            commandLine: commandLine || undefined,
+            createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined,
+            startId,
+        };
     } catch {
         return null;
     }
     return null;
 }
 
-function validatePidForTask(task: LaunchTask): { ok: boolean; reason?: string } {
-    if (!isPidAlive(task.pid)) {
-        return { ok: false, reason: "PID 已不存在" };
-    }
+export function readLaunchProcessIdentity(pid: number): LaunchProcessIdentity | undefined {
+    if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) return undefined;
+    const info = getProcessInfo(pid);
+    return info?.startId ? { pid, startId: info.startId } : undefined;
+}
 
-    const info = getProcessInfo(task.pid);
-    if (!info) {
-        return { ok: false, reason: "无法读取 PID 创建时间/命令行，拒绝终止以避免 PID 复用误杀" };
-    }
+async function waitForLaunchProcessIdentity(pid: number, timeoutMs = 3_000): Promise<LaunchProcessIdentity | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    do {
+        const identity = readLaunchProcessIdentity(pid);
+        if (identity) return identity;
+        if (!isPidAlive(pid)) return undefined;
+        await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    return readLaunchProcessIdentity(pid);
+}
 
-    const createdAtMs = task.createdAtMs ?? task.startTime;
-    if (info.createdAtMs && info.createdAtMs < createdAtMs - 60_000) {
-        return { ok: false, reason: `PID 创建时间早于任务创建时间 (${new Date(info.createdAtMs).toISOString()} < ${new Date(createdAtMs).toISOString()})` };
-    }
+async function waitForLaunchWorkerHandshake(
+    handshakePath: string,
+    timeoutMs = 3_000,
+): Promise<{ pid?: number; error?: string } | undefined> {
+    const deadline = Date.now() + timeoutMs;
+    do {
+        try {
+            if (fs.existsSync(handshakePath)) {
+                return JSON.parse(fs.readFileSync(handshakePath, "utf-8")) as { pid?: number; error?: string };
+            }
+        } catch {
+        }
+        await new Promise(resolve => setTimeout(resolve, 25));
+    } while (Date.now() < deadline);
+    return undefined;
+}
+
+export function validateLaunchProcessIdentity(
+    expected: LaunchProcessIdentity | undefined,
+    dependencies: LaunchProcessIdentityDependencies = {},
+): LaunchProcessIdentityValidationResult {
+    if (!expected) return "identity_missing";
+    const observed = (dependencies.observeIdentity || readLaunchProcessIdentity)(expected.pid);
+    if (!observed) return isPidAlive(expected.pid) ? "identity_missing" : "not_running";
+    if (observed.pid !== expected.pid || observed.startId !== expected.startId) return "identity_mismatch";
+    return "matching";
+}
+
+function migrateLegacyLaunchIdentity(
+    task: LaunchTask,
+    dependencies: LaunchProcessIdentityDependencies,
+): LaunchProcessIdentityValidationResult {
+    const info = (dependencies.observeProcessInfo || getProcessInfo)(task.pid);
+    if (!info) return isPidAlive(task.pid) ? "identity_missing" : "not_running";
+    if (!info.startId) return "identity_missing";
 
     const commandLine = info.commandLine || "";
     const hash = task.commandHash || commandHash(task.command, task.cwd);
-    if (commandLine && !commandLine.includes(hash) && task.exitMarkerPath && !commandLine.includes(path.basename(task.exitMarkerPath))) {
-        return { ok: false, reason: "PID 命令行特征不匹配当前任务" };
+    const markerName = task.exitMarkerPath ? path.basename(task.exitMarkerPath) : "";
+    if (!commandLine || (!commandLine.includes(hash) && (!markerName || !commandLine.includes(markerName)))) {
+        return "identity_missing";
     }
 
-    return { ok: true };
+    const createdAtMs = task.createdAtMs ?? task.startTime;
+    if (!info.createdAtMs || Math.abs(info.createdAtMs - createdAtMs) > 60_000) {
+        return "identity_mismatch";
+    }
+
+    task.processIdentity = { pid: task.pid, startId: info.startId };
+    return "matching";
+}
+
+function validatePidForTask(
+    task: LaunchTask,
+    dependencies: LaunchProcessIdentityDependencies = {},
+): { ok: boolean; reason?: string } {
+    const validation = task.processIdentity
+        ? validateLaunchProcessIdentity(task.processIdentity, dependencies)
+        : migrateLegacyLaunchIdentity(task, dependencies);
+    if (validation === "matching") return { ok: true };
+    if (validation === "not_running") return { ok: false, reason: "PID 已不存在" };
+    if (validation === "identity_mismatch") return { ok: false, reason: "PID 启动标识不匹配当前任务" };
+    return { ok: false, reason: "无法读取或安全迁移 PID 启动标识，拒绝继续以避免 PID 复用误杀" };
 }
 
 /**
  * 刷新任务状态（检查 PID 是否还在）
  */
-function refreshTaskStatus(task: LaunchTask): void {
+function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentityDependencies = {}): void {
     if (task.status !== "running") return;
 
     const marker = readExitMarker(task);
@@ -390,17 +511,68 @@ function refreshTaskStatus(task: LaunchTask): void {
         task.exitCode = typeof marker.exitCode === "number" ? marker.exitCode : null;
         task.finishedAtMs = marker.finishedAtMs;
         task.status = task.exitCode === 0 ? "done" : "failed";
+        task.statusReason = undefined;
+        task.missingPidSinceMs = undefined;
+        releaseLaunchLease(task.id);
         return;
     }
 
-    if (!isPidAlive(task.pid)) {
-        task.status = task.exitMarkerPath ? "failed" : "done";
-        task.exitCode = task.exitMarkerPath ? null : 0;
+    const validation = validatePidForTask(task, dependencies);
+    if (!validation.ok) {
+        const pidMissing = validation.reason === "PID 已不存在";
+        if (pidMissing && task.exitMarkerPath) {
+            const now = Date.now();
+            task.missingPidSinceMs ??= now;
+            task.statusReason = "PID 已退出，等待完成标记落盘";
+            if (now - task.missingPidSinceMs < LAUNCH_EXIT_MARKER_GRACE_MS) return;
+        }
+        task.status = pidMissing && !task.exitMarkerPath ? "done" : "failed";
+        task.exitCode = task.status === "done" ? 0 : null;
+        task.finishedAtMs = Date.now();
+        task.statusReason = pidMissing
+            ? undefined
+            : `无法确认任务 PID 身份: ${validation.reason || "未知原因"}`;
+        releaseLaunchLease(task.id);
     }
+}
+
+export function reapLaunchTasksOnce(
+    dependencies: LaunchProcessIdentityDependencies = {},
+    adoptMissingLeases = true,
+): { running: number; terminal: number; adopted: number } {
+    const tasks = readAllTasks();
+    let adopted = 0;
+    for (const task of tasks) {
+        refreshTaskStatus(task, dependencies);
+        if (task.status === "running" && adoptMissingLeases && !launchLeases.has(task.id)) {
+            launchLeases.set(task.id, adoptResourceLease(task.reservationMB || 256));
+            adopted += 1;
+        }
+        writeTask(task);
+    }
+    return {
+        running: tasks.filter(task => task.status === "running").length,
+        terminal: tasks.filter(task => task.status !== "running").length,
+        adopted,
+    };
+}
+
+function ensureLaunchReaper(): void {
+    if (launchReaperStarted) return;
+    launchReaperStarted = true;
+    const timer = setInterval(() => {
+        try {
+            reapLaunchTasksOnce();
+        } catch (err) {
+            console.warn(`[launch] resource reaper failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }, LAUNCH_REAPER_INTERVAL_MS);
+    timer.unref?.();
 }
 
 async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise<void> {
     const waitMs = Math.max(0, Math.min(waitSeconds, 300)) * 1000;
+    refreshTaskStatus(task);
     if (waitMs <= 0 || task.status !== "running") return;
 
     await new Promise<void>((resolve) => {
@@ -456,7 +628,7 @@ function getFileSize(filePath: string): number {
 
 export function getLaunchTaskCount(): { running: number; total: number } {
     const tasks = readAllTasks();
-    tasks.forEach(refreshTaskStatus);
+    tasks.forEach(task => refreshTaskStatus(task));
     return {
         running: tasks.filter(t => t.status === "running").length,
         total: tasks.length,
@@ -482,9 +654,13 @@ const LaunchParamsShape = {
         .describe("status 前等待秒数（1-300），任务完成时提前返回"),
     ownerId: z.string().optional()
         .describe("任务归属 ID；未传按 global 兼容旧调用"),
+    maxMemoryMB: z.number().int().min(16).max(1536).optional()
+        .describe("长期任务的全局内存预留，默认256MB"),
 };
 
 export function registerLaunch(server: McpServer): void {
+    reapLaunchTasksOnce();
+    ensureLaunchReaper();
     server.tool(
         "sandbox_launch",
         `长任务脱离执行。进程完全独立于 MCP，可跑数小时~数天。
@@ -502,7 +678,7 @@ export function registerLaunch(server: McpServer): void {
 - 注册表持久化，新对话可用 list 找回任务
 - waitSeconds 主动等待后返回，避免频繁轮询`,
         LaunchParamsShape,
-        async (params: Record<string, unknown>) => {
+        async (params: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -518,7 +694,7 @@ export function registerLaunch(server: McpServer): void {
             // ── list ──
             if (action === "list") {
                 const tasks = readAllTasks();
-                tasks.forEach(refreshTaskStatus);
+                tasks.forEach(task => refreshTaskStatus(task));
                 tasks.forEach(writeTask);
                 const visibleTasks = tasks.filter(t => hasOwnerAccess(t.ownerId, ownerId));
 
@@ -542,7 +718,7 @@ export function registerLaunch(server: McpServer): void {
             // ── clean ──
             if (action === "clean") {
                 const tasks = readAllTasks();
-                tasks.forEach(refreshTaskStatus);
+                tasks.forEach(task => refreshTaskStatus(task));
                 const taskId = params.taskId as string | undefined;
 
                 const toClean = taskId
@@ -595,6 +771,8 @@ export function registerLaunch(server: McpServer): void {
 
                 // ── kill ──
                 if (action === "kill") {
+                    refreshTaskStatus(task);
+                    writeTask(task);
                     if (task.status !== "running") {
                         return appendTiming({
                             content: [{ type: "text" as const, text: `⚠️ 任务 ${taskId} 已结束 (${task.status})\n` }],
@@ -603,6 +781,12 @@ export function registerLaunch(server: McpServer): void {
 
                     const validation = validatePidForTask(task);
                     if (!validation.ok) {
+                        task.status = "failed";
+                        task.exitCode = null;
+                        task.finishedAtMs = Date.now();
+                        task.statusReason = `无法确认任务 PID 身份: ${validation.reason || "未知原因"}`;
+                        releaseLaunchLease(task.id);
+                        writeTask(task);
                         return appendTiming({
                             content: [{ type: "text" as const, text: `❌ 终止前校验失败: ${validation.reason}\n` }],
                         });
@@ -613,6 +797,7 @@ export function registerLaunch(server: McpServer): void {
                         task.status = "failed";
                         task.exitCode = -1;
                         task.finishedAtMs = Date.now();
+                        releaseLaunchLease(task.id);
                         writeTask(task);
                         return appendTiming({
                             content: [{ type: "text" as const, text: `🛑 已终止任务 ${taskId} (PID ${task.pid})\n` }],
@@ -652,7 +837,7 @@ export function registerLaunch(server: McpServer): void {
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `${icon} ${taskId} ${task.status === "done" ? "已完成" : "已失败"} | ${elapsed} | exitCode=${task.exitCode}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n`,
+                            text: `${icon} ${taskId} ${task.status === "done" ? "已完成" : "已失败"} | ${elapsed} | exitCode=${task.exitCode}${task.statusReason ? `\n⚠️ 状态说明: ${task.statusReason}` : ""}\n📄 stdout ${stdoutSize} bytes | stderr ${stderrSize} bytes\n📋 最近 ${tailLines} 行:\n${logTail}\n`,
                         }],
                     });
                 }
@@ -689,7 +874,7 @@ export function registerLaunch(server: McpServer): void {
             const stderrLog = path.join(logDir, `${taskId}.stderr.log`);
             const exitMarkerPath = path.join(logDir, `${taskId}.done.json`);
             const specPath = path.join(logDir, `${taskId}.spec.json`);
-            const createdAtMs = Date.now();
+            const handshakePath = path.join(logDir, `${taskId}.worker.json`);
             const hash = commandHash(command, cwd);
             fs.writeFileSync(specPath, JSON.stringify({
                 command,
@@ -700,19 +885,59 @@ export function registerLaunch(server: McpServer): void {
                 env: { PYTHONUNBUFFERED: "1" },
             }, null, 2), "utf-8");
 
+            const reservationMB = (params.maxMemoryMB as number | undefined) || 256;
+            let resourceLease: ManagedResourceLease | null = null;
+            let workerPid: number | null = null;
             try {
-                const proc = spawn(process.execPath, [WRAPPER_FILE, specPath, hash], {
+                const acquiredLease = await acquireResourceLease({
+                    ownerId,
+                    reservationMB,
+                    signal: extra?.signal,
+                });
+                resourceLease = acquiredLease;
+                if (extra?.signal?.aborted) {
+                    acquiredLease.release();
+                    try { fs.unlinkSync(specPath); } catch { }
+                    return appendTiming({
+                        content: [{ type: "text" as const, text: "⏹️ launch 调用已取消，任务未启动\n" }],
+                    });
+                }
+                const createdAtMs = Date.now();
+                const bootstrap = spawn(process.execPath, [BOOTSTRAP_FILE, WRAPPER_FILE, specPath, handshakePath], {
                     cwd,
                     stdio: "ignore",
                     windowsHide: true,
                     env: { ...process.env, PYTHONUNBUFFERED: "1" },
                 });
+                bootstrap.unref();
+
+                const handshake = await waitForLaunchWorkerHandshake(handshakePath);
+                workerPid = Number(handshake?.pid);
+                if (!Number.isInteger(workerPid) || workerPid <= 0) {
+                    throw new Error(`launch bootstrap 未返回 worker PID${handshake?.error ? `: ${handshake.error}` : ""}`);
+                }
+                const bootstrapExited = bootstrap.exitCode !== null || await Promise.race([
+                    new Promise<boolean>(resolve => bootstrap.once("close", () => resolve(true))),
+                    new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
+                ]);
+                if (!bootstrapExited) {
+                    killProcessTree(workerPid);
+                    if (bootstrap.pid) killProcessTree(bootstrap.pid);
+                    throw new Error("launch bootstrap 未在 1 秒内退出，已停止 worker 以避免 backend 重拉误伤");
+                }
+                const processIdentity = await waitForLaunchProcessIdentity(workerPid);
+                if (!processIdentity) {
+                    killProcessTree(workerPid);
+                    throw new Error("无法读取新任务的 PID 启动标识，已停止任务以避免后续 PID 复用误杀");
+                }
+                try { fs.unlinkSync(handshakePath); } catch { }
 
                 const task: LaunchTask = {
                     id: taskId,
-                    pid: proc.pid || 0,
+                    pid: workerPid,
                     command,
                     commandHash: hash,
+                    processIdentity,
                     ownerId,
                     cwd,
                     stdoutLog,
@@ -723,14 +948,10 @@ export function registerLaunch(server: McpServer): void {
                     startTime: createdAtMs,
                     status: "running",
                     exitCode: null,
+                    reservationMB,
                 };
 
-                proc.on("error", (err: Error) => {
-                    console.error(`[launch] spawn error for task ${taskId}: ${err.message}`);
-                    markLaunchSpawnError(task, err);
-                });
-
-                proc.unref();
+                launchLeases.set(taskId, acquiredLease);
 
                 writeTask(task);
 
@@ -741,7 +962,18 @@ export function registerLaunch(server: McpServer): void {
                     }],
                 });
             } catch (err) {
+                resourceLease?.release();
+                if (workerPid) killProcessTree(workerPid);
                 try { fs.unlinkSync(specPath); } catch { /* */ }
+                try { fs.unlinkSync(handshakePath); } catch { /* */ }
+                const admissionError = serializeResourceAdmissionError(err);
+                if (admissionError) {
+                    return {
+                        isError: true,
+                        structuredContent: { error: admissionError },
+                        content: [{ type: "text" as const, text: `❌ ${admissionError.type}: launch 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
+                    };
+                }
                 return appendTiming({
                     content: [{ type: "text" as const, text: `❌ 启动失败: ${err}\n` }],
                 });
