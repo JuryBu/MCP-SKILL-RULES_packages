@@ -72,6 +72,11 @@ test("backend-only hot reload proves proxy files unchanged and never stops the p
   const compatibilityBlock = script.match(/function Assert-BackendOnlyCompatible[\s\S]*?\n}/)?.[0] ?? "";
   assert.match(script, /\[switch\]\$BackendOnlyHotReload/);
   assert.match(script, /function Assert-BackendOnlyCompatible/);
+  assert.match(script, /function Get-NormalizedTextHash/);
+  assert.match(script, /\.Replace\("`r`n", "`n"\)\.Replace\("`r", "`n"\)/);
+  assert.match(compatibilityBlock, /Get-NormalizedTextHash -Path \$PreviousPath/);
+  assert.match(compatibilityBlock, /Get-NormalizedTextHash -Path \$NextPath/);
+  assert.doesNotMatch(compatibilityBlock, /Get-FileHash/);
   assert.match(script, /proxy-critical file changed/);
   assert.doesNotMatch(compatibilityBlock, /src\\codex-thread-bridge\.mjs/);
   assert.match(compatibilityBlock, /src\\codex-app-server-proxy\.mjs/);

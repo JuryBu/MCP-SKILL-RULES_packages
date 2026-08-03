@@ -164,6 +164,20 @@ function Invoke-NpmChecked {
   }
 }
 
+function Get-NormalizedTextHash {
+  param([string]$Path)
+  $Text = [System.IO.File]::ReadAllText($Path)
+  $Normalized = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+  $Encoding = New-Object System.Text.UTF8Encoding($false)
+  $Bytes = $Encoding.GetBytes($Normalized)
+  $Sha256 = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return -join ($Sha256.ComputeHash($Bytes) | ForEach-Object { $_.ToString("x2") })
+  } finally {
+    $Sha256.Dispose()
+  }
+}
+
 function Assert-BackendOnlyCompatible {
   param([string]$PreviousRoot, [string]$NextRoot)
   if (-not (Test-Path -LiteralPath $PreviousRoot)) {
@@ -181,8 +195,8 @@ function Assert-BackendOnlyCompatible {
     if (-not (Test-Path -LiteralPath $PreviousPath) -or -not (Test-Path -LiteralPath $NextPath)) {
       throw "Backend-only hot reload is unsafe because a proxy-critical file is missing: $RelativePath"
     }
-    $PreviousHash = (Get-FileHash -LiteralPath $PreviousPath -Algorithm SHA256).Hash
-    $NextHash = (Get-FileHash -LiteralPath $NextPath -Algorithm SHA256).Hash
+    $PreviousHash = Get-NormalizedTextHash -Path $PreviousPath
+    $NextHash = Get-NormalizedTextHash -Path $NextPath
     if ($PreviousHash -ne $NextHash) {
       throw "Backend-only hot reload is unsafe because a proxy-critical file changed: $RelativePath"
     }
