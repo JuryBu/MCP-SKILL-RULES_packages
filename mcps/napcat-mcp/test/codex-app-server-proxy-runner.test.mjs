@@ -93,6 +93,8 @@ test("parseArguments requires all durable state paths", () => {
   assert.equal(parsed.downstreamPort, 18432);
   assert.equal(parsed.controlPort, 18431);
   assert.equal(parsed.upstreamPort, 18433);
+  assert.equal(parsed.requestTimeoutMs, 30000);
+  assert.equal(parsed.resumeRequestTimeoutMs, 120000);
 });
 
 test("missing compatible Codex binary pauses automation and requests native fallback", async () => {

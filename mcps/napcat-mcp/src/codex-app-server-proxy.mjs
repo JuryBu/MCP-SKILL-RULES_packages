@@ -5,6 +5,7 @@ import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
 
 function isObject(value) {
@@ -347,6 +348,12 @@ export class CodexAppServerProxy {
     this.upstreamUrl = requiredString(options.upstreamUrl ?? "ws://127.0.0.1:18433", "upstreamUrl", 2048);
     this.controlToken = requiredString(options.controlToken, "controlToken", 4096);
     this.requestTimeoutMs = boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000);
+    this.resumeRequestTimeoutMs = boundedInteger(
+      options.resumeRequestTimeoutMs,
+      DEFAULT_RESUME_REQUEST_TIMEOUT_MS,
+      this.requestTimeoutMs,
+      300000,
+    );
     this.maxBodyBytes = boundedInteger(options.maxBodyBytes, DEFAULT_MAX_BODY_BYTES, 1024, 16 * 1024 * 1024);
     this.reconnectInitialMs = boundedInteger(options.reconnectInitialMs, 250, 50, 60000);
     this.reconnectMaxMs = boundedInteger(options.reconnectMaxMs, 5000, this.reconnectInitialMs, 300000);
@@ -459,7 +466,7 @@ export class CodexAppServerProxy {
         client,
         "thread/resume",
         { threadId: normalizedThreadId },
-        { threadId: normalizedThreadId },
+        { threadId: normalizedThreadId, timeoutMs: this.resumeRequestTimeoutMs },
       )),
     );
     return { threadId: normalizedThreadId, readyClients, results };
@@ -895,6 +902,7 @@ export class CodexAppServerProxy {
     }
     const id = this.nextInjectedRequestId;
     this.nextInjectedRequestId -= 1;
+    const timeoutMs = boundedInteger(options.timeoutMs, this.requestTimeoutMs, 250, 300000);
     return new Promise((resolve, reject) => {
       const pending = {
         id,
@@ -909,10 +917,10 @@ export class CodexAppServerProxy {
         if (!client.injected.delete(id)) return;
         reject(new CodexAppServerProxyError(
           "APP_SERVER_TIMEOUT",
-          `App Server 在 ${this.requestTimeoutMs}ms 内未响应：${method}`,
+          `App Server 在 ${timeoutMs}ms 内未响应：${method}`,
           { outcomeUnknown: pending.mutating && pending.written, details: { method, id } },
         ));
-      }, this.requestTimeoutMs);
+      }, timeoutMs);
       client.injected.set(id, pending);
       try {
         client.upstream.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));

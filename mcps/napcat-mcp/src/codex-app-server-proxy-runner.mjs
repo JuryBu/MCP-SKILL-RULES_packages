@@ -17,6 +17,7 @@ const DEFAULT_UPSTREAM_PORT = 18433;
 const DEFAULT_PROBE_PORT = 18434;
 const DEFAULT_START_TIMEOUT_MS = 15000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
+const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
 
 const CLI_OPTIONS = new Set([
@@ -35,6 +36,7 @@ const CLI_OPTIONS = new Set([
   "probe-port",
   "start-timeout-ms",
   "request-timeout-ms",
+  "resume-timeout-ms",
   "codex-exe",
 ]);
 
@@ -519,6 +521,13 @@ export function parseArguments(argv) {
     probePort: boundedInteger(values["probe-port"], "probe-port", DEFAULT_PROBE_PORT, 1, 65535),
     startTimeoutMs: boundedInteger(values["start-timeout-ms"], "start-timeout-ms", DEFAULT_START_TIMEOUT_MS, 1000, 300000),
     requestTimeoutMs: boundedInteger(values["request-timeout-ms"], "request-timeout-ms", DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000),
+    resumeRequestTimeoutMs: boundedInteger(
+      values["resume-timeout-ms"],
+      "resume-timeout-ms",
+      DEFAULT_RESUME_REQUEST_TIMEOUT_MS,
+      250,
+      300000,
+    ),
     executablePath: values["codex-exe"] ? path.resolve(values["codex-exe"]) : null,
   };
 }
@@ -705,6 +714,7 @@ export async function runCodexAppServerProxyService(options = {}) {
       upstreamUrl: status.upstreamUrl,
       controlToken,
       requestTimeoutMs: options.requestTimeoutMs,
+      resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
       journal,
       maintenanceFilePath: options.maintenanceFilePath,
       onEvent: (event) => {

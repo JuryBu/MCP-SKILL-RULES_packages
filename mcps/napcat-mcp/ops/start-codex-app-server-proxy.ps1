@@ -4,7 +4,8 @@ param(
   [ValidateRange(1, 65535)][int]$DownstreamPort = 18432,
   [ValidateRange(1, 65535)][int]$ControlPort = 18431,
   [ValidateRange(1, 65535)][int]$UpstreamPort = 18433,
-  [ValidateRange(1, 65535)][int]$ProbePort = 18434
+  [ValidateRange(1, 65535)][int]$ProbePort = 18434,
+  [ValidateRange(250, 300000)][int]$ResumeTimeoutMs = 120000
 )
 
 $ErrorActionPreference = "Stop"
@@ -136,7 +137,8 @@ $Arguments = @(
   "--downstream-port", ([string]$DownstreamPort),
   "--control-port", ([string]$ControlPort),
   "--upstream-port", ([string]$UpstreamPort),
-  "--probe-port", ([string]$ProbePort)
+  "--probe-port", ([string]$ProbePort),
+  "--resume-timeout-ms", ([string]$ResumeTimeoutMs)
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru

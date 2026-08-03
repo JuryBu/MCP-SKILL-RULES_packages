@@ -457,6 +457,71 @@ test("failed-before-send wake may adopt a newly configured visibility mode", () 
   }
 });
 
+test("slow thread resume uses its dedicated timeout without widening mutations", { timeout: 5000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-proxy-slow-resume-"));
+  let turnStartCount = 0;
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", (socket) => socket.on("message", (data) => {
+    const message = JSON.parse(data.toString("utf8"));
+    if (message.method === "initialize") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
+    } else if (message.method === "thread/resume") {
+      setTimeout(() => socket.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { thread: { id: message.params.threadId, status: "idle", turns: [] } },
+      })), 120);
+    } else if (message.method === "turn/start") {
+      turnStartCount += 1;
+      socket.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: message.id,
+        result: { turn: { id: "slow-resume-turn", status: "inProgress" } },
+      }));
+    }
+  }));
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "slow-resume-token",
+    requestTimeoutMs: 40,
+    resumeRequestTimeoutMs: 300,
+    journal: createWakeJournal({ filePath: path.join(temporaryRoot, "wake-journal.json") }),
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise((resolve) => upstream.close(resolve));
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+  await waitFor(() => proxy.status().readyClientCount === 1);
+  const result = await proxy.wakeThread({
+    taskId: "task-slow-resume",
+    generation: 1,
+    threadId: "thread-slow-resume",
+    localRole: "development",
+    sourceMachine: "training",
+    targetMachine: "development",
+    trustedPeerQq: "1000000001",
+    wakeId: "wake-slow-resume",
+    pendingThroughSequence: 1,
+    pendingThroughTime: "2026-08-03T00:00:00.000Z",
+    prompt: "[NAPCAT_TASK_WAKE] slow resume",
+  });
+  assert.equal(result.outcome, "accepted");
+  assert.equal(turnStartCount, 1);
+});
+
 test("accepted turn with journal commit failure becomes unknown and is never resent", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   let turnStartCount = 0;
