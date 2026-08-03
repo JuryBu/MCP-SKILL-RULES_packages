@@ -264,7 +264,10 @@ export async function exportConversationBatch(
     const items = await runWithConcurrency(selected, concurrency, async (candidate) => {
         const childDir = childDirForCandidate(batchDir, candidate);
         try {
-            const loaded = await activeDeps.loadConversationData(candidate.dataChain, candidate.id, { link: options.link });
+            const loaded = await activeDeps.loadConversationData(candidate.dataChain, candidate.id, {
+                link: options.link,
+                includeRounds: options.scope === "search",
+            });
             if (!loaded) {
                 return {
                     conversationId: candidate.id,

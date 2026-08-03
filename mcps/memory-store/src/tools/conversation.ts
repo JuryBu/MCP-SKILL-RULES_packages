@@ -2693,9 +2693,8 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     sourceFailureMode: sourceFailureMode as SourceFailureMode,
                     logicalChain: logicalChain as ConversationLogicalChainMode | undefined,
                     source,
-                    includeRounds: action !== "fetch"
-                        && action !== "read"
-                        && !(action === "search" && (mode === "auto" || mode === "exact")),
+                    includeRounds: action === "export"
+                        && (exportScope === "search" || (!exportScope && Boolean(query))),
                 });
                 if (!loaded) {
                     return appendTiming({
