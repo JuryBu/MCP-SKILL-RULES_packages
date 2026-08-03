@@ -83,7 +83,7 @@ Rules 保留少汇报腔、解释技术概念、Plan / Task / Stage Guard、子�
 | Claude Code | `rules/claude-code/CLAUDE.template.md` |
 | Windsurf | `rules/windsurf/global_rules.template.md` 与五个 `system_rules` 分片 |
 
-Codex 四种配置都复用 `components/core.template.md`，所以工程流程、工具说明和证据要求不会因角色风格变化而丢失。开发机与训练机配置可能超过常见的 32K 项目说明读取上限，`Apply-CodexConfig.ps1` 与 Rules 安装器都会幂等保证 `project_doc_max_bytes >= 65536`，并保留已有更高值。`system-prompt.template.md` 是四种配置共用的可选模板，用于在宿主支持时强调 AGENTS 用户规则；它不会自动覆盖系统文件。开发机与训练机的真实账号、群号、路径和信任边界必须写入仓库外的私有覆盖文件，公开示例不能直接当真实配置安装。
+Codex 四种配置都复用 `components/core.template.md`，所以工程流程、工具说明和证据要求不会因角色风格变化而丢失。开发机与训练机配置可能超过常见的 32K 项目说明读取上限，`Apply-CodexConfig.ps1` 与 Rules 安装器都会幂等保证 `project_doc_max_bytes >= 65536`，并保留已有更高值。`system-prompt.template.md` 是四种配置共用的可选模板，集中放置时间与质量、先查证再实现、提问边界和写作组织等通用原则；`Install-CodexRulesProfile.ps1 -InstallSystemPrompt -InstallRecommendedDesktopFeatures` 可在备份后维护提示词指针和当前 Desktop 功能配置，不会整份覆盖 `config.toml`。开发机与训练机的真实账号、群号、路径和信任边界必须写入仓库外的私有覆盖文件，公开示例不能直接当真实配置安装。
 
 Rules 已删除生日、学业、账号链接、登录态、本机路径、真实服务额度和私人项目上下文。接收方应根据自己的环境再修改。
 

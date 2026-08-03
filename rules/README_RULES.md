@@ -18,7 +18,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 
 The templates preserve natural Chinese communication, anti-report-writing guidance, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, background-task rules, and Council artifact safety (`dryRun` before approved cleanup). The Codex catgirl voice is optional rather than embedded in the shared engineering core. General model-selection guidance may remain as a receiver-editable workflow preference; sender-specific identity, account data, local paths, credentials, active sessions, private entitlements, pricing claims, and quota promises are removed.
 
-Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. A real local override remains receiver-private and is ignored by package creation.
+Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. Add `-InstallSystemPrompt -InstallRecommendedDesktopFeatures` only when the receiver wants the shared system prompt and the currently tested Desktop feature tables merged into its existing config. A real local override remains receiver-private and is ignored by package creation.
 
 The Codex `system-prompt.template.md` is an optional receiver-installed model-instructions file shared by all four profiles. It reinforces following AGENTS user rules when the host supports this setting and never overwrites a host configuration automatically.
 

@@ -275,6 +275,48 @@ function Test-PackageStructure {
     if ($insertedRootLimit.IndexOf("project_doc_max_bytes") -gt $insertedRootLimit.IndexOf("[features]")) {
         throw "Codex config helper inserted project_doc_max_bytes inside a TOML table."
     }
+    $featureInput = @(
+        'model_instructions_file = "D:/private/prompt.md"',
+        "",
+        "[features]",
+        "test_feature = true",
+        "default_mode_request_user_input = false",
+        "",
+        "[features.current_time_reminder]",
+        "reminder_interval_seconds = 900",
+        "",
+        "[mcp_servers.private]",
+        'url = "http://127.0.0.1:19999/mcp"'
+    ) -join "`r`n"
+    $recommendedFeatures = Set-CodexRecommendedDesktopFeatures -Content $featureInput
+    $recommendedFeatures = Set-CodexRecommendedDesktopFeatures -Content $recommendedFeatures
+    foreach ($requiredFeature in @(
+        "default_mode_request_user_input = true",
+        "concurrent_reasoning_summaries = true",
+        "prevent_idle_sleep = true",
+        "reminder_interval_seconds = 120",
+        'clock_source = "system"',
+        'delivery_mode = "after_user_or_tool_output"',
+        "sleep_tool = false"
+    )) {
+        if (-not $recommendedFeatures.Contains($requiredFeature)) {
+            throw "Codex Desktop feature helper did not apply: $requiredFeature"
+        }
+    }
+    if (-not $recommendedFeatures.Contains("test_feature = true") -or
+        -not $recommendedFeatures.Contains("[mcp_servers.private]")) {
+        throw "Codex Desktop feature helper overwrote unrelated private configuration."
+    }
+    foreach ($tableName in @("features", "features.current_time_reminder")) {
+        if ([regex]::Matches($recommendedFeatures, "(?m)^\[" + [regex]::Escape($tableName) + "\]\s*$").Count -ne 1) {
+            throw "Codex Desktop feature helper duplicated [$tableName]."
+        }
+    }
+    $modelPointer = Set-CodexModelInstructionsFile -Content $recommendedFeatures
+    if ([regex]::Matches($modelPointer, "(?m)^model_instructions_file\s*=").Count -ne 1 -or
+        -not $modelPointer.Contains('model_instructions_file = "~/.codex/prompts/system-prompt.md"')) {
+        throw "Codex system prompt helper did not maintain one canonical model_instructions_file setting."
+    }
 
     $utf8 = [System.Text.Encoding]::UTF8
     $timeboxHeading = $utf8.GetString([Convert]::FromBase64String("IyMjIOiuoeWIkuaXtumXtOebkg=="))
@@ -361,7 +403,7 @@ function Test-PackageStructure {
     $installScript = Join-Path $toolkitRoot "install\Install-CodexRulesProfile.ps1"
     $profileInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-install-test-" + [guid]::NewGuid().ToString("N"))
     try {
-        & $installScript -Profile "development" -CodexHome $profileInstallRoot | Out-Null
+        & $installScript -Profile "development" -CodexHome $profileInstallRoot -InstallSystemPrompt -InstallRecommendedDesktopFeatures | Out-Null
         $installedConfigPath = Join-Path $profileInstallRoot "config.toml"
         $installedConfig = Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8
         $installedLimit = [regex]::Match($installedConfig, "(?m)^project_doc_max_bytes\s*=\s*(\d+)\s*$")
@@ -371,6 +413,12 @@ function Test-PackageStructure {
         $developmentGuidance = Join-Path $profileInstallRoot "guidance\development-machine.md"
         if (-not (Test-Path -LiteralPath $developmentGuidance)) {
             throw "Development profile install did not create role guidance."
+        }
+        if (-not (Test-Path -LiteralPath (Join-Path $profileInstallRoot "prompts\system-prompt.md")) -or
+            -not $installedConfig.Contains('model_instructions_file = "~/.codex/prompts/system-prompt.md"') -or
+            -not $installedConfig.Contains("[features.current_time_reminder]") -or
+            -not $installedConfig.Contains("reminder_interval_seconds = 120")) {
+            throw "Rules profile install did not apply the requested system prompt or Desktop feature configuration."
         }
 
         Set-Content -LiteralPath $installedConfigPath -Encoding UTF8 -Value @(

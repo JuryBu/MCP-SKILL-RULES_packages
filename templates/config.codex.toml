@@ -1,8 +1,23 @@
 ﻿# Add or merge these blocks into %USERPROFILE%/.codex/config.toml
 # Apply-CodexConfig.ps1 separately ensures the top-level project_doc_max_bytes is at least 65536.
-# Optional top-level setting:
-# If you run install/Install-SystemPromptTemplate.ps1, you may add:
+# Optional top-level setting. Install-CodexRulesProfile.ps1 -InstallSystemPrompt
+# installs the template and maintains this pointer idempotently:
 # model_instructions_file = "~/.codex/prompts/system-prompt.md"
+
+# Optional current Codex Desktop features. Prefer applying them through
+# Install-CodexRulesProfile.ps1 -InstallRecommendedDesktopFeatures so existing
+# private config is backed up and merged instead of overwritten.
+# [features]
+# default_mode_request_user_input = true
+# concurrent_reasoning_summaries = true
+# prevent_idle_sleep = true
+#
+# [features.current_time_reminder]
+# enabled = true
+# reminder_interval_seconds = 120
+# clock_source = "system"
+# delivery_mode = "after_user_or_tool_output"
+# sleep_tool = false
 
 [mcp_servers.memory-store]
 url = "http://127.0.0.1:14588/memory-store/mcp"

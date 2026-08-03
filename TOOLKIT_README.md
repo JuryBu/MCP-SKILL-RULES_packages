@@ -23,6 +23,8 @@
 
 `Apply-CodexConfig.ps1` 与 `Install-CodexRulesProfile.ps1` 都会保证 Codex 的 `project_doc_max_bytes` 至少为 `65536`，避免较长的开发机或训练机 Rules 在 32K 附近被截断。
 
+需要同步安装公共 system prompt 和当前 Codex Desktop 的时间提醒、结构化提问等交互配置时，使用 `Install-CodexRulesProfile.ps1 -InstallSystemPrompt -InstallRecommendedDesktopFeatures`。脚本先备份再精确合并，不覆盖其它私有 `config.toml` 内容；仍依赖旧版独立 Codex CLI 的接收方应暂不启用该 Desktop 功能开关。
+
 然后按自己的使用方式安装 Codex Rules，例如保留原有自然猫娘表达：
 
 ```powershell

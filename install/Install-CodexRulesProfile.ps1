@@ -3,7 +3,8 @@ param(
     [string]$Profile = "catgirl",
     [string]$LocalOverridePath,
     [string]$CodexHome = (Join-Path $env:USERPROFILE ".codex"),
-    [switch]$InstallSystemPrompt
+    [switch]$InstallSystemPrompt,
+    [switch]$InstallRecommendedDesktopFeatures
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,6 +40,12 @@ try {
         ""
     }
     $nextConfig = Set-CodexProjectDocMaxBytes -Content $currentConfig -MinimumBytes $requiredProjectDocBytes
+    if ($InstallSystemPrompt) {
+        $nextConfig = Set-CodexModelInstructionsFile -Content $nextConfig
+    }
+    if ($InstallRecommendedDesktopFeatures) {
+        $nextConfig = Set-CodexRecommendedDesktopFeatures -Content $nextConfig
+    }
     $configNeedsUpdate = $nextConfig -ne $currentConfig
     $copies = @(
         [pscustomobject]@{
@@ -112,7 +119,10 @@ try {
         Write-Output "Backup: $backupRoot"
     }
     if ($InstallSystemPrompt) {
-        Write-Output 'Ensure config.toml contains: model_instructions_file = "~/.codex/prompts/system-prompt.md"'
+        Write-Output 'Installed system prompt and configured model_instructions_file = "~/.codex/prompts/system-prompt.md".'
+    }
+    if ($InstallRecommendedDesktopFeatures) {
+        Write-Output "Enabled the recommended Codex Desktop time reminder, structured input, reasoning summary, and idle-sleep settings."
     }
 } finally {
     if (Test-Path -LiteralPath $tempRoot) {

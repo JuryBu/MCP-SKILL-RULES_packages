@@ -103,19 +103,34 @@ Machine-specific accounts, trusted peers, group IDs, absolute paths, and credent
 
 Do not pass `local-overrides.example.md` itself: the scripts reject it to prevent placeholder values from being mistaken for a working binding.
 
-Optional common system-prompt emphasis:
+Optional common system-prompt emphasis and the currently tested Codex Desktop interaction features:
 
 ```powershell
-./install/Install-CodexRulesProfile.ps1 -Profile catgirl -InstallSystemPrompt
+./install/Install-CodexRulesProfile.ps1 `
+  -Profile catgirl `
+  -InstallSystemPrompt `
+  -InstallRecommendedDesktopFeatures
 ```
 
-Then configure:
+The installer backs up `config.toml`, maintains this pointer exactly once, and merges the feature tables without replacing unrelated private configuration:
 
 ```toml
 model_instructions_file = "~/.codex/prompts/system-prompt.md"
+
+[features]
+default_mode_request_user_input = true
+concurrent_reasoning_summaries = true
+prevent_idle_sleep = true
+
+[features.current_time_reminder]
+enabled = true
+reminder_interval_seconds = 120
+clock_source = "system"
+delivery_mode = "after_user_or_tool_output"
+sleep_tool = false
 ```
 
-The system prompt only points Codex back to AGENTS-style instructions; it is shared by all four profiles and does not contain credentials or private data. `Install-SystemPromptTemplate.ps1` remains available for receivers who want to install only that template.
+The system prompt is shared by all four profiles and contains only universal execution principles. The feature block targets current Codex Desktop behavior: it provides periodic time context after user or tool output and enables the structured question UI while retaining free-form answers. Older standalone Codex CLI builds may reject the structured `current_time_reminder` table; Desktop-first installations may use it, while CLI-dependent receivers should omit `-InstallRecommendedDesktopFeatures` until their CLI supports the same schema. `Install-SystemPromptTemplate.ps1` remains available for receivers who want only the template.
 
 ## 6. Configure Antigravity
 
