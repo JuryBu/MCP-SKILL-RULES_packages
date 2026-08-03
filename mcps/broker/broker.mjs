@@ -5,7 +5,16 @@ import os from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
-import { shouldTrackBackendWork } from "./request-lifecycle.mjs";
+import {
+  attachBrokerRequestMeta,
+  createBackendRequestOptions,
+  createBrokerBackendTimeoutResult,
+  createBrokerRequestTimeoutError,
+  isRequestTimeoutError,
+  remainingBudgetMs,
+  resolveToolCallBudget,
+  shouldTrackBackendWork,
+} from "./request-lifecycle.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,10 +103,10 @@ const configuredRequestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_T
 const requestTimeoutMs = Number.isFinite(configuredRequestTimeoutMs) && configuredRequestTimeoutMs > 0
   ? Math.floor(configuredRequestTimeoutMs)
   : 120000;
-const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 1800000);
+const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 21600000);
 const waitTimeoutCapMs = Number.isFinite(configuredWaitTimeoutCapMs) && configuredWaitTimeoutCapMs > 0
   ? Math.max(requestTimeoutMs, Math.floor(configuredWaitTimeoutCapMs))
-  : Math.max(requestTimeoutMs, 1800000);
+  : Math.max(requestTimeoutMs, 21600000);
 const sessionIdleMs = Number(process.env.CODEX_MCP_BROKER_SESSION_IDLE_MS || 6 * 60 * 60 * 1000);
 
 const exaMcpRemoteUrl = process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL || "";
@@ -413,7 +422,12 @@ function ensureDefaultContentType(res) {
 function withTimeout(promise, timeoutMs, label) {
   let timer;
   const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    timer = setTimeout(() => {
+      reject(createBrokerRequestTimeoutError(
+        `${label} timed out after ${timeoutMs}ms`,
+        { timeout: timeoutMs },
+      ));
+    }, timeoutMs);
   });
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
@@ -641,14 +655,31 @@ class BackendManager {
   }
 
   async request(request, resultSchema, options = {}) {
-    const client = await this.ensureConnected(options);
-    this.lastActivityAt = new Date().toISOString();
     const timeoutMs = Number(options.timeoutMs || requestTimeoutMs);
+    const deadlineAtMs = Number.isFinite(options.deadlineAtMs)
+      ? options.deadlineAtMs
+      : Date.now() + timeoutMs;
+    const connectBudgetMs = remainingBudgetMs(deadlineAtMs);
+    if (connectBudgetMs <= 0) {
+      throw createBrokerRequestTimeoutError(
+        `${this.name} request deadline expired before backend connection`,
+        { timeout: timeoutMs },
+      );
+    }
+    const client = await this.ensureConnected({ connectTimeoutMs: connectBudgetMs });
+    this.lastActivityAt = new Date().toISOString();
+    const requestBudgetMs = remainingBudgetMs(deadlineAtMs);
+    if (requestBudgetMs <= 0) {
+      throw createBrokerRequestTimeoutError(
+        `${this.name} request deadline expired after backend connection`,
+        { timeout: timeoutMs },
+      );
+    }
     try {
-      return await withTimeout(
-        client.request(request, resultSchema, { timeout: timeoutMs }),
-        timeoutMs,
-        `${this.name} ${request.method}`,
+      return await client.request(
+        request,
+        resultSchema,
+        createBackendRequestOptions(requestBudgetMs, options.signal),
       );
     } catch (error) {
       this.lastError = error.message;
@@ -796,7 +827,7 @@ class EndpointBroker {
         throw error;
       }
     });
-    server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const validationError = validateToolCall(this.name, request.params);
       if (validationError) {
         log("tool call blocked", {
@@ -807,23 +838,45 @@ class EndpointBroker {
         return toolError(validationError);
       }
       const args = request.params?.arguments || {};
-      let callTimeoutMs = requestTimeoutMs;
-      if (typeof args.waitSeconds === "number" && args.waitSeconds > 0) {
-        callTimeoutMs = Math.min(
-          Math.max(args.waitSeconds * 1000 + 15000, requestTimeoutMs),
-          waitTimeoutCapMs,
+      const budget = resolveToolCallBudget(args, { requestTimeoutMs, waitTimeoutCapMs });
+      try {
+        return await this.backend.request(
+          {
+            method: request.method,
+            params: attachBrokerRequestMeta(request.params, budget),
+          },
+          CallToolResultSchema,
+          {
+            closeOnError: false,
+            timeoutMs: budget.timeoutMs,
+            deadlineAtMs: budget.deadlineAtMs,
+            signal: extra.signal,
+          },
         );
-      } else if (typeof args.timeout === "number" && args.timeout > requestTimeoutMs) {
-        callTimeoutMs = Math.min(args.timeout + 15000, waitTimeoutCapMs);
+      } catch (error) {
+        if (extra.signal.aborted) {
+          log("frontend caller cancelled tool call", {
+            endpoint: this.name,
+            tool: request.params?.name,
+            requestId: extra.requestId,
+          });
+          throw error;
+        }
+        if (isRequestTimeoutError(error)) {
+          return createBrokerBackendTimeoutResult({
+            endpoint: this.name,
+            toolName: request.params?.name,
+            budget,
+            backendStatus: ((status) => ({
+              generation: status.generation,
+              connected: status.connected,
+              pid: status.pid,
+              lastActivityAt: status.lastActivityAt,
+            }))(this.backend.status()),
+          });
+        }
+        throw error;
       }
-      return this.backend.request(
-        {
-          method: request.method,
-          params: request.params,
-        },
-        CallToolResultSchema,
-        { closeOnError: false, timeoutMs: callTimeoutMs },
-      );
     });
     forwardOptionalList(ListResourcesRequestSchema, ListResourcesResultSchema, { resources: [] });
     forward(ReadResourceRequestSchema, ReadResourceResultSchema);
