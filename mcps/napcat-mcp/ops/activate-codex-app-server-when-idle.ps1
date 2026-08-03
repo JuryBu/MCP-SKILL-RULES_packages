@@ -92,9 +92,9 @@ try {
     $StopResult = & (Join-Path $OpsRoot $ScriptName) -DataRoot $DataRoot | ConvertFrom-Json
     if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process cleanly." }
   }
-  $ProxyStopResult = & (Join-Path $OpsRoot "stop-codex-app-server-proxy.ps1") -DataRoot $DataRoot -AllowVerifiedForceStop | ConvertFrom-Json
+  $ProxyStopResult = & (Join-Path $OpsRoot "stop-codex-app-server-proxy.ps1") -DataRoot $DataRoot -ChildTimeoutSeconds 120 -AllowVerifiedForceStop | ConvertFrom-Json
   if ($ProxyStopResult.stopped -ne $true -or $ProxyStopResult.clean -ne $true) {
-    throw "The managed proxy or App Server did not stop cleanly."
+    throw "The managed proxy or App Server did not stop cleanly (proxyStopped=$($ProxyStopResult.stopped), childStopped=$($ProxyStopResult.childStopped), staleListener=$($ProxyStopResult.staleListener), orphanedListener=$($ProxyStopResult.orphanedListener), appServerPid=$($ProxyStopResult.appServerPid))."
   }
   if (-not [string]::IsNullOrWhiteSpace($BrokerRoot)) {
     & (Join-Path $OpsRoot "reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null

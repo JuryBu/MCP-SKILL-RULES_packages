@@ -78,11 +78,11 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 原生蓝点和侧边栏未读状态只会出现在 Codex Desktop 自己持有的 App Server 连接上。直接启动另一份 App Server 虽然能把文字写进对话存储，却不能通知当前 Desktop 刷新。可选透明中转使用下面的连接方式，把 Desktop 的原始流量双向转发给官方 App Server，同时允许 NapCat 在同一条已初始化连接上先恢复已登记任务，再提交一条带 `wake_id` 的唤醒消息：
 
 ```text
-Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官方 App Server
+Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官方 App Server（默认；冲突时自动换空闲端口）
 NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ```
 
-`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时必须同时确认子进程和监听端口都已消失，确认前不得写入 `stopped` 或清空 PID。默认上游端口若被无法识别的历史监听占用，代理会选择空闲回环端口并在运行状态中记录实际地址，避免影响 Codex 启动；后续受管实例仍执行精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。
+`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。
 
 更新脚本不会终止 Codex Desktop。便携包会启动隐藏激活器，等待当前 Codex 与代理连接自然断开后，再干净重启受管代理并热重载 NapCat backend；用户只需正常退出 Codex、等待约 10 秒后重新打开，不需要重启 Windows。
 

@@ -34,6 +34,19 @@ test("idle activation fails closed and replaces every managed component", () => 
   assert.match(script, /Start-ScheduledTask -TaskName \$SupervisorTaskName/);
 });
 
+test("idle activation tolerates a stale listener only after its real process is gone", () => {
+  const stopScript = read("ops/stop-codex-app-server-proxy.ps1");
+  const activationScript = read("ops/activate-codex-app-server-when-idle.ps1");
+  assert.match(stopScript, /\[ValidateRange\(5, 300\)\]\[int\]\$ChildTimeoutSeconds = 120/);
+  assert.match(stopScript, /\$ChildListenerOwnerAlive/);
+  assert.match(stopScript, /\$StaleListener = \$null -ne \$ChildListenerRemaining -and -not \$ChildListenerOwnerAlive/);
+  assert.match(stopScript, /\$ChildStopped = \$null -eq \$ChildRemaining -and \(-not \$ChildListenerOwnerAlive\)/);
+  assert.match(stopScript, /staleListener = \$StaleListener/);
+  assert.match(stopScript, /orphanedListener = \(\$null -ne \$ChildListenerRemaining -and \$ChildListenerOwnerAlive\)/);
+  assert.match(activationScript, /-ChildTimeoutSeconds 120 -AllowVerifiedForceStop/);
+  assert.match(activationScript, /staleListener=\$\(\$ProxyStopResult\.staleListener\)/);
+});
+
 test("staged updates keep automatic wake paused until live activation succeeds", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
   assert.match(script, /pendingActivation = \(-not \$Activated\)/);

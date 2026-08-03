@@ -2,6 +2,7 @@
 param(
   [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [ValidateRange(1, 120)][int]$TimeoutSeconds = 20,
+  [ValidateRange(5, 300)][int]$ChildTimeoutSeconds = 120,
   [switch]$AllowVerifiedForceStop
 )
 
@@ -60,6 +61,11 @@ $ProxyStopped = $null -eq $RemainingProcess
 
 $ChildIdentityVerified = $false
 $ChildForced = $false
+$ChildForceExitCode = $null
+$ChildWaitStartedAt = [DateTime]::UtcNow
+$ChildListenerRemaining = $null
+$ChildListenerOwnerAlive = $false
+$StaleListener = $false
 $ExpectedUpstreamPort = $null
 if ($ExpectedUpstreamUrl -match ':(\d+)$') { $ExpectedUpstreamPort = [int]$Matches[1] }
 if ($null -eq $AppServerPid -and $null -ne $ExpectedUpstreamPort) {
@@ -80,23 +86,29 @@ if ($null -ne $AppServerPid) {
     $ChildCommandLine.IndexOf("app-server", [System.StringComparison]::OrdinalIgnoreCase) -ge 0
   if ($ChildIdentityVerified -and $AllowVerifiedForceStop) {
     & taskkill.exe /PID $AppServerPid /T /F 2>$null | Out-Null
+    $ChildForceExitCode = $LASTEXITCODE
     $ChildForced = $true
   }
-  $ChildDeadline = [DateTime]::UtcNow.AddSeconds(5)
+  $ChildDeadline = [DateTime]::UtcNow.AddSeconds($ChildTimeoutSeconds)
   do {
     $ChildRemaining = Get-Process -Id $AppServerPid -ErrorAction SilentlyContinue
-    if ($null -eq $ChildRemaining) { break }
-    Start-Sleep -Milliseconds 100
+    $ChildListenerRemaining = if ($null -ne $ExpectedUpstreamPort) {
+      Get-NetTCPConnection -State Listen -LocalPort $ExpectedUpstreamPort -ErrorAction SilentlyContinue |
+        Where-Object { [int]$_.OwningProcess -eq $AppServerPid } |
+        Select-Object -First 1
+    } else { $null }
+    $ChildListenerOwnerAlive = if ($null -ne $ChildListenerRemaining) {
+      $null -ne (Get-Process -Id ([int]$ChildListenerRemaining.OwningProcess) -ErrorAction SilentlyContinue)
+    } else { $false }
+    $StaleListener = $null -ne $ChildListenerRemaining -and -not $ChildListenerOwnerAlive
+    if ($null -eq $ChildRemaining -and (-not $ChildListenerOwnerAlive)) { break }
+    Start-Sleep -Milliseconds 250
   } while ([DateTime]::UtcNow -lt $ChildDeadline)
-  $ChildListenerRemaining = if ($null -ne $ExpectedUpstreamPort) {
-    Get-NetTCPConnection -State Listen -LocalPort $ExpectedUpstreamPort -ErrorAction SilentlyContinue |
-      Where-Object { [int]$_.OwningProcess -eq $AppServerPid } |
-      Select-Object -First 1
-  } else { $null }
-  $ChildStopped = $null -eq $ChildRemaining -and $null -eq $ChildListenerRemaining
+  $ChildStopped = $null -eq $ChildRemaining -and (-not $ChildListenerOwnerAlive)
 } else {
   $ChildStopped = $true
 }
+$ChildWaitSeconds = [Math]::Round(([DateTime]::UtcNow - $ChildWaitStartedAt).TotalSeconds, 3)
 [pscustomobject]@{
   stopped = $ProxyStopped
   clean = ($ProxyStopped -and $ChildStopped)
@@ -108,5 +120,8 @@ if ($null -ne $AppServerPid) {
   childStopped = $ChildStopped
   childIdentityVerified = $ChildIdentityVerified
   childForced = $ChildForced
-  orphanedListener = (-not $ChildStopped)
+  childForceExitCode = $ChildForceExitCode
+  childWaitSeconds = $ChildWaitSeconds
+  staleListener = $StaleListener
+  orphanedListener = ($null -ne $ChildListenerRemaining -and $ChildListenerOwnerAlive)
 } | ConvertTo-Json -Depth 6
