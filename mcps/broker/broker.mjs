@@ -103,10 +103,10 @@ const configuredRequestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_T
 const requestTimeoutMs = Number.isFinite(configuredRequestTimeoutMs) && configuredRequestTimeoutMs > 0
   ? Math.floor(configuredRequestTimeoutMs)
   : 120000;
-const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 21600000);
+const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 1800000);
 const waitTimeoutCapMs = Number.isFinite(configuredWaitTimeoutCapMs) && configuredWaitTimeoutCapMs > 0
   ? Math.max(requestTimeoutMs, Math.floor(configuredWaitTimeoutCapMs))
-  : Math.max(requestTimeoutMs, 21600000);
+  : Math.max(requestTimeoutMs, 1800000);
 const sessionIdleMs = Number(process.env.CODEX_MCP_BROKER_SESSION_IDLE_MS || 6 * 60 * 60 * 1000);
 
 const exaMcpRemoteUrl = process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL || "";

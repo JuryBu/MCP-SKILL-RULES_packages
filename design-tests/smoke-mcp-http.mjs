@@ -1,10 +1,27 @@
-const endpoints = ["memory-store", "web-fetcher", "sandbox"];
+let endpoints = ["memory-store", "web-fetcher", "sandbox"];
 if (process.env.CODEX_TOOLKIT_SMOKE_OPTIONAL === "1") {
   endpoints.push("playwright", "sequential-thinking");
   if (process.env.EXA_MCP_REMOTE_URL || process.env.CODEX_TOOLKIT_EXA_MCP_REMOTE_URL) endpoints.push("exa");
   if (process.env.CODEX_TOOLKIT_SMOKE_SUBAGENT === "1") endpoints.push("subagent");
 }
 if (process.env.CODEX_TOOLKIT_SMOKE_NAPCAT === "1") endpoints.push("napcat");
+
+const requestedEndpoints = String(process.env.CODEX_TOOLKIT_SMOKE_ENDPOINTS || "")
+  .split(/[\s,]+/u)
+  .map((endpoint) => endpoint.trim().toLowerCase())
+  .filter(Boolean);
+if (requestedEndpoints.length > 0) {
+  const enabledEndpoints = new Set(endpoints);
+  const unavailableEndpoints = requestedEndpoints.filter((endpoint) => !enabledEndpoints.has(endpoint));
+  if (unavailableEndpoints.length > 0) {
+    throw new Error(
+      `CODEX_TOOLKIT_SMOKE_ENDPOINTS requested endpoints that are not enabled: ${unavailableEndpoints.join(", ")}. ` +
+      `Enabled endpoints: ${endpoints.join(", ")}`,
+    );
+  }
+  const requestedSet = new Set(requestedEndpoints);
+  endpoints = endpoints.filter((endpoint) => requestedSet.has(endpoint));
+}
 
 const base = process.env.CODEX_TOOLKIT_MCP_BASE_URL || "http://127.0.0.1:14588";
 

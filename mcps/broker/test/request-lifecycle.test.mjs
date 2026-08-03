@@ -29,31 +29,37 @@ test("tool call budget keeps the broker default and caps caller extensions", () 
   assert.deepEqual(resolveToolCallBudget({}, defaults), {
     timeoutMs: 120000,
     timeoutSource: "broker_default",
+    deadlineOwner: "broker",
     deadlineAtMs: 121000,
   });
   assert.deepEqual(resolveToolCallBudget({ timeout: 300000 }, defaults), {
     timeoutMs: 315000,
     timeoutSource: "caller_execution_timeout",
+    deadlineOwner: "caller",
     deadlineAtMs: 316000,
   });
   assert.deepEqual(resolveToolCallBudget({ timeout: 120000 }, defaults), {
     timeoutMs: 135000,
     timeoutSource: "caller_execution_timeout",
+    deadlineOwner: "caller",
     deadlineAtMs: 136000,
   });
   assert.deepEqual(resolveToolCallBudget({ timeout: 1000 }, defaults), {
     timeoutMs: 120000,
     timeoutSource: "caller_execution_timeout",
+    deadlineOwner: "broker",
     deadlineAtMs: 121000,
   });
   assert.deepEqual(resolveToolCallBudget({ waitSeconds: 4000 }, defaults), {
     timeoutMs: 1800000,
     timeoutSource: "caller_wait_seconds",
+    deadlineOwner: "broker",
     deadlineAtMs: 1801000,
   });
   assert.deepEqual(resolveToolCallBudget({ timeout: 0 }, defaults), {
     timeoutMs: 1800000,
     timeoutSource: "caller_no_execution_timeout",
+    deadlineOwner: "broker",
     deadlineAtMs: 1801000,
   });
 });
@@ -61,13 +67,14 @@ test("tool call budget keeps the broker default and caps caller extensions", () 
 test("broker metadata preserves caller metadata and exposes one absolute deadline", () => {
   const params = attachBrokerRequestMeta(
     { name: "sandbox_exec", arguments: { command: "echo ok" }, _meta: { traceId: "abc" } },
-    { timeoutMs: 120000, timeoutSource: "broker_default", deadlineAtMs: 121000 },
+    { timeoutMs: 120000, timeoutSource: "broker_default", deadlineOwner: "broker", deadlineAtMs: 121000 },
   );
   assert.equal(params._meta.traceId, "abc");
   assert.deepEqual(params._meta[BROKER_REQUEST_META_KEY], {
     schemaVersion: 1,
     timeoutMs: 120000,
     timeoutSource: "broker_default",
+    deadlineOwner: "broker",
     deadlineAtMs: 121000,
   });
 });
@@ -95,7 +102,7 @@ test("only MCP request timeout errors become broker backend timeout results", ()
   const result = createBrokerBackendTimeoutResult({
     endpoint: "sandbox",
     toolName: "sandbox_exec",
-    budget: { timeoutMs: 120000, deadlineAtMs: 121000 },
+    budget: { timeoutMs: 120000, timeoutSource: "broker_default", deadlineOwner: "broker", deadlineAtMs: 121000 },
     backendStatus: { generation: 2, pid: 1234 },
   });
   assert.equal(result.isError, true);
@@ -103,4 +110,14 @@ test("only MCP request timeout errors become broker backend timeout results", ()
   assert.equal(result.structuredContent.retryable, false);
   assert.equal(result.structuredContent.mayHaveStarted, true);
   assert.match(result.content[0].text, /^broker_backend_timeout:/);
+
+  const callerResult = createBrokerBackendTimeoutResult({
+    endpoint: "sandbox",
+    toolName: "sandbox_exec",
+    budget: { timeoutMs: 315000, timeoutSource: "caller_execution_timeout", deadlineOwner: "caller", deadlineAtMs: 316000 },
+    backendStatus: { generation: 2, pid: 1234 },
+  });
+  assert.equal(callerResult.structuredContent.errorType, "caller_deadline_exceeded");
+  assert.equal(callerResult.structuredContent.totalMs, 315000);
+  assert.match(callerResult.content[0].text, /^caller_deadline_exceeded:/);
 });
