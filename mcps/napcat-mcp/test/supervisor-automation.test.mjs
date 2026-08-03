@@ -168,6 +168,45 @@ test("维护活跃时关闭 supervisor gate，不启动 task router，也不改 
   }
 });
 
+test("只有 automationBridge 维护时启动 router 让它核对代理日志并自愈", async () => {
+  const fixture = createFixture();
+  let routerStartCount = 0;
+  try {
+    writeJson(fixture.automationMaintenancePath, {
+      schemaVersion: 1,
+      reasons: {
+        automationBridge: {
+          code: "PROXY_TIMEOUT",
+          outcomeUnknown: true,
+          wakeId: "wake-reconcile-1",
+        },
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      getOpenTaskCount: async () => 1,
+      routerController: {
+        status() {
+          return { alive: false, state: "stopped" };
+        },
+        ensureStarted() {
+          routerStartCount += 1;
+          return { started: true, pid: 9002 };
+        },
+      },
+    }));
+    const runtime = readJson(fixture.runtimeStatePath);
+    assert.equal(routerStartCount, 1);
+    assert.equal(runtime.maintenance.active, true);
+    assert.deepEqual(runtime.maintenance.reasons, ["automationBridge"]);
+    assert.equal(runtime.actions.maintenance.routerCanReconcile, true);
+    assert.equal(runtime.checks.gate, true);
+    assert.equal(runtime.actions.taskRouter.succeeded, true);
+    assert.equal(fs.readFileSync(fixture.registryPath, "utf8"), "registry-unchanged\n");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("NapCat 离线时 pending 固定群告警不发送，仍保留 pending", async () => {
   const fixture = createFixture();
   const sends = [];

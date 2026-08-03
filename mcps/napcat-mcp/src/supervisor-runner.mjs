@@ -1267,6 +1267,14 @@ export async function runSupervisorService(options = {}) {
         reason: maintenance.reason,
         reasons: maintenance.reasons,
       };
+      const routerCanReconcileMaintenance = Boolean(
+        maintenance.active
+        && maintenance.known
+        && maintenance.reasons.length === 1
+        && maintenance.reasons[0] === "automationBridge"
+      );
+      const maintenanceBlocksRouter = maintenance.active && !routerCanReconcileMaintenance;
+      actions.maintenance.routerCanReconcile = routerCanReconcileMaintenance;
       if (
         !broker.healthy
         && brokerProcess.known
@@ -1475,7 +1483,7 @@ export async function runSupervisorService(options = {}) {
         && codexProcess.present
         && tasksKnown
         && openTaskCount > 0
-        && !maintenance.active,
+        && !maintenanceBlocksRouter,
       );
       let finalRouter = router;
       if (gate && router.known && !router.alive) {
@@ -1503,7 +1511,7 @@ export async function runSupervisorService(options = {}) {
       } else if (!gate) {
         actions.taskRouter = {
           attempted: false,
-          reason: maintenance.active ? "maintenance_active" : "gate_closed",
+          reason: maintenanceBlocksRouter ? "maintenance_active" : "gate_closed",
         };
       } else {
         actions.taskRouter = { attempted: false, reason: "already_running" };
