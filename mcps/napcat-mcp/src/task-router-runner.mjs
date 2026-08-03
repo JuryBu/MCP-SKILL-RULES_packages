@@ -204,6 +204,74 @@ function pauseAutomation(options, failure, fsImpl, now) {
   return reasons.automationBridge;
 }
 
+const DELIVERED_WAKE_STATUSES = new Set(["accepted", "completed", "recovered"]);
+const FATAL_AUTOMATION_CODES = new Set([
+  "UNAUTHORIZED",
+  "PROXY_TOKEN_MISSING",
+  "PROXY_TOKEN_READ_FAILED",
+  "WAKE_ID_CONFLICT",
+  "WAKE_STATE_CONFLICT",
+  "WAKE_JOURNAL_REQUIRED",
+  "WAKE_JOURNAL_INVALID",
+  "WAKE_JOURNAL_COMMIT_FAILED",
+]);
+
+function shouldPauseAutomation(result) {
+  if (!result) return false;
+  if (result.outcome === "wake_unknown" && result.error?.outcomeUnknown) return true;
+  return result.outcome === "wake_failed" && FATAL_AUTOMATION_CODES.has(result.error?.code);
+}
+
+function clearAutomationMaintenance(options, maintenance, fsImpl, now) {
+  const reasons = { ...(maintenance.reasons ?? {}) };
+  delete reasons.automationBridge;
+  if (Object.keys(reasons).length > 0) {
+    atomicWriteJson(options.maintenanceFilePath, { schemaVersion: 1, reasons }, fsImpl);
+  } else if (fsImpl.existsSync(options.maintenanceFilePath)) {
+    fsImpl.unlinkSync(options.maintenanceFilePath);
+  }
+  if (options.alertFilePath && fsImpl.existsSync(options.alertFilePath)) {
+    const alert = readExistingJson(options.alertFilePath, fsImpl);
+    if (alert.source === "task-router") {
+      atomicWriteJson(options.alertFilePath, {
+        ...alert,
+        pending: false,
+        resolvedAt: nowIso(now),
+        resolution: "journal_reconciled",
+      }, fsImpl);
+    }
+  }
+}
+
+export function reconcileAutomationMaintenance(options, components, maintenance, fsImpl = fs, now = () => new Date()) {
+  const reason = maintenance?.reasons?.automationBridge;
+  if (!reason?.wakeId || !reason?.taskId || !options.maintenanceFilePath) return { resolved: false };
+  const journalPath = options.wakeJournalPath
+    ?? path.join(path.dirname(options.registryPath), "codex-app-server-wake-journal.json");
+  const journal = readExistingJson(journalPath, fsImpl);
+  const wake = journal.wakes?.[reason.wakeId] ?? null;
+  const task = components.registry?.get?.(reason.taskId) ?? null;
+  const activeWake = task?.activeWakes?.find((candidate) => candidate.wakeId === reason.wakeId) ?? null;
+  if (!task || task.status === "closed" || !activeWake) {
+    clearAutomationMaintenance(options, maintenance, fsImpl, now);
+    return { resolved: true, outcome: "task_resolved", wake };
+  }
+  if (wake?.status === "failed_before_send") {
+    components.registry.reconcileFailedWake({
+      taskId: reason.taskId,
+      expectedGeneration: task.generation,
+      wakeId: reason.wakeId,
+    });
+    clearAutomationMaintenance(options, maintenance, fsImpl, now);
+    return { resolved: true, outcome: "failed_before_send", wake };
+  }
+  if (DELIVERED_WAKE_STATUSES.has(wake?.status)) {
+    clearAutomationMaintenance(options, maintenance, fsImpl, now);
+    return { resolved: true, outcome: wake.status, wake };
+  }
+  return { resolved: false, wake };
+}
+
 export function writeRuntimeState(runtimeStatePath, patch = {}, options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const current = readExistingJson(runtimeStatePath, fsImpl);
@@ -597,9 +665,23 @@ export async function runTaskRouterService(options = {}) {
     }
 
     while (!detectStop()) {
-      const maintenance = options.maintenanceFilePath
+      let maintenance = options.maintenanceFilePath
         ? readExistingJson(options.maintenanceFilePath, fsImpl)
         : {};
+      const reconciliation = reconcileAutomationMaintenance(options, components, maintenance, fsImpl, now);
+      if (reconciliation.resolved) {
+        appendLog(logPath, {
+          at: nowIso(now),
+          type: "maintenance_reconciled",
+          pid,
+          taskId: maintenance.reasons?.automationBridge?.taskId ?? null,
+          wakeId: maintenance.reasons?.automationBridge?.wakeId ?? null,
+          outcome: reconciliation.outcome,
+        }, fsImpl);
+        maintenance = options.maintenanceFilePath
+          ? readExistingJson(options.maintenanceFilePath, fsImpl)
+          : {};
+      }
       const maintenanceReasons = maintenance.reasons && typeof maintenance.reasons === "object"
         ? maintenance.reasons
         : {};
@@ -647,7 +729,7 @@ export async function runTaskRouterService(options = {}) {
         const taskScanError = scanResultError(scanResult);
         if (taskScanError) throw taskScanError;
         const automationFailure = Array.isArray(scanResult?.results)
-          ? scanResult.results.find((result) => ["wake_failed", "wake_unknown", "thread_unavailable"].includes(result?.outcome))
+          ? scanResult.results.find((result) => shouldPauseAutomation(result))
           : null;
         const automationPause = automationFailure
           ? pauseAutomation(options, automationFailure, fsImpl, now)

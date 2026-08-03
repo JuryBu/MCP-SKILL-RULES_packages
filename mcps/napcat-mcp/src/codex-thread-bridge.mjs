@@ -5,6 +5,8 @@ import { spawn } from "node:child_process";
 const DEFAULT_REQUEST_TIMEOUT_MS = 12000;
 const DEFAULT_START_TIMEOUT_MS = 12000;
 const DEFAULT_CLOSE_TIMEOUT_MS = 1500;
+const DEFAULT_PROXY_RECONCILE_TIMEOUT_MS = 45000;
+const DEFAULT_PROXY_RECONCILE_POLL_MS = 250;
 const MAX_STDERR_CHARACTERS = 12000;
 
 const BUSY_PROTOCOL_STATUSES = new Set([
@@ -320,6 +322,18 @@ class CodexThreadBridge {
     this.env = options.env ?? process.env;
     this.spawnImpl = options.spawnImpl ?? spawn;
     this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000);
+    this.reconcileTimeoutMs = positiveInteger(
+      options.reconcileTimeoutMs ?? this.env.CODEX_APP_SERVER_PROXY_RECONCILE_TIMEOUT_MS,
+      DEFAULT_PROXY_RECONCILE_TIMEOUT_MS,
+      1000,
+      300000,
+    );
+    this.reconcilePollMs = positiveInteger(
+      options.reconcilePollMs ?? this.env.CODEX_APP_SERVER_PROXY_RECONCILE_POLL_MS,
+      DEFAULT_PROXY_RECONCILE_POLL_MS,
+      25,
+      10000,
+    );
     this.startTimeoutMs = positiveInteger(options.startTimeoutMs, this.requestTimeoutMs, 250, 300000);
     this.closeTimeoutMs = positiveInteger(options.closeTimeoutMs, DEFAULT_CLOSE_TIMEOUT_MS, 50, 30000);
     this.clientInfo = {
@@ -831,6 +845,18 @@ class CodexProxyThreadBridge {
       throw new CodexThreadBridgeError("PROXY_TOKEN_MISSING", "Codex 代理控制口令未配置");
     }
     this.requestTimeoutMs = positiveInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000);
+    this.reconcileTimeoutMs = positiveInteger(
+      options.reconcileTimeoutMs ?? this.env.CODEX_APP_SERVER_PROXY_RECONCILE_TIMEOUT_MS,
+      DEFAULT_PROXY_RECONCILE_TIMEOUT_MS,
+      250,
+      300000,
+    );
+    this.reconcilePollMs = positiveInteger(
+      options.reconcilePollMs ?? this.env.CODEX_APP_SERVER_PROXY_RECONCILE_POLL_MS,
+      DEFAULT_PROXY_RECONCILE_POLL_MS,
+      10,
+      5000,
+    );
     this.closed = false;
     this.lastStatus = null;
     this.lastError = null;
@@ -892,6 +918,8 @@ class CodexProxyThreadBridge {
       };
     } catch (error) {
       if (error?.outcomeUnknown) {
+        const reconciled = await this.#reconcileWake(wakeId);
+        if (reconciled !== null) return reconciled;
         return {
           threadId,
           status: "unknown",
@@ -923,16 +951,23 @@ class CodexProxyThreadBridge {
   async #request(route, body, options = {}) {
     if (this.closed) throw new CodexThreadBridgeError("BRIDGE_CLOSED", "Codex 线程桥已关闭");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.requestTimeoutMs);
+    const requestTimeoutMs = positiveInteger(
+      options.requestTimeoutMs,
+      this.requestTimeoutMs,
+      250,
+      300000,
+    );
+    const method = options.method ?? "POST";
+    const timeout = setTimeout(() => controller.abort(), requestTimeoutMs);
     let response;
     try {
       response = await this.fetchImpl(`${this.controlUrl}${route}`, {
-        method: "POST",
+        method,
         headers: {
           authorization: `Bearer ${this.controlToken}`,
           "content-type": "application/json; charset=utf-8",
         },
-        body: JSON.stringify(body),
+        ...(method === "GET" ? {} : { body: JSON.stringify(body) }),
         signal: controller.signal,
       });
       const payload = await response.json().catch(() => ({}));
@@ -956,7 +991,7 @@ class CodexProxyThreadBridge {
         : new CodexThreadBridgeError(
           cause?.name === "AbortError" ? "PROXY_TIMEOUT" : "PROXY_UNREACHABLE",
           cause?.name === "AbortError"
-            ? `Codex 代理在 ${this.requestTimeoutMs}ms 内未响应`
+            ? `Codex 代理在 ${requestTimeoutMs}ms 内未响应`
             : `无法连接 Codex 代理：${cause?.message ?? String(cause)}`,
           { cause, outcomeUnknown: Boolean(options.mutating), details: { route } },
         );
@@ -965,6 +1000,60 @@ class CodexProxyThreadBridge {
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  async #reconcileWake(wakeId) {
+    const deadline = Date.now() + this.reconcileTimeoutMs;
+    while (Date.now() < deadline) {
+      let wake = null;
+      try {
+        const remainingMs = Math.max(250, deadline - Date.now());
+        const payload = await this.#request(
+          `/v1/wakes/${encodeURIComponent(wakeId)}`,
+          null,
+          { method: "GET", requestTimeoutMs: Math.min(this.requestTimeoutMs, remainingMs) },
+        );
+        wake = payload?.wake ?? null;
+      } catch {
+      }
+      if (wake) {
+        if (["accepted", "completed", "recovered"].includes(wake.status)) {
+          const outcome = wake.status === "completed" ? "completed" : "accepted";
+          return {
+            threadId: wake.threadId,
+            status: outcome === "completed" ? "idle" : "busy",
+            outcome,
+            started: true,
+            duplicateSuppressed: true,
+            recovered: true,
+            turn: wake.turnId ? { id: wake.turnId, status: wake.turnStatus ?? null } : null,
+            raw: { wake },
+          };
+        }
+        if (wake.status === "failed_before_send") {
+          throw new CodexThreadBridgeError(
+            wake.error?.code ?? "PROXY_WAKE_FAILED_BEFORE_SEND",
+            wake.error?.message ?? `Codex 唤醒在发送前失败：${wakeId}`,
+            { outcomeUnknown: false, details: { wake } },
+          );
+        }
+        if (wake.status === "unknown") {
+          return {
+            threadId: wake.threadId,
+            status: "unknown",
+            outcome: "unknown",
+            started: null,
+            error: wake.error ?? {
+              code: "PROXY_WAKE_OUTCOME_UNKNOWN",
+              message: `Codex 唤醒结果未知：${wakeId}`,
+              outcomeUnknown: true,
+            },
+          };
+        }
+      }
+      await new Promise((resolve) => setTimeout(resolve, this.reconcilePollMs));
+    }
+    return null;
   }
 }
 

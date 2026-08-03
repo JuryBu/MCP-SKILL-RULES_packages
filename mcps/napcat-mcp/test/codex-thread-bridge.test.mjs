@@ -341,4 +341,130 @@ if (fakeArgumentIndex >= 0) {
     }
   });
 
+  test("transparent proxy bridge reconciles a timed out wake that failed before send", async () => {
+    const calls = [];
+    let wakeStatus = "dispatching";
+    const bridge = createCodexThreadBridge({
+      mode: "transparent_proxy",
+      controlUrl: "http://127.0.0.1:18431",
+      controlToken: "proxy-test-token",
+      requestTimeoutMs: 250,
+      reconcileTimeoutMs: 1000,
+      reconcilePollMs: 10,
+      fetchImpl: async (url, options) => {
+        const route = new URL(url).pathname;
+        calls.push({ route, method: options.method });
+        if (route === "/v1/subscriptions") {
+          return new Response(JSON.stringify({ ok: true, created: true }), { status: 200 });
+        }
+        if (route === "/v1/wakes" && options.method === "POST") {
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener("abort", () => {
+              wakeStatus = "failed_before_send";
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            }, { once: true });
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          wake: {
+            wakeId: "wake-timeout-failed",
+            threadId: "thread-timeout-failed",
+            status: wakeStatus,
+            error: wakeStatus === "failed_before_send"
+              ? { code: "APP_SERVER_TIMEOUT", message: "thread/resume 未完成", outcomeUnknown: false }
+              : null,
+          },
+        }), { status: 200 });
+      },
+    });
+    try {
+      await assert.rejects(
+        () => bridge.wake({
+          taskId: "task-timeout-failed",
+          generation: 1,
+          threadId: "thread-timeout-failed",
+          localRole: "development",
+          sourceMachine: "training",
+          targetMachine: "development",
+          trustedPeerQq: "1000000001",
+          wakeId: "wake-timeout-failed",
+          pendingThroughSequence: 10,
+          promptSha256: "e".repeat(64),
+          prompt: "timeout wake prompt",
+        }),
+        (error) => error instanceof CodexThreadBridgeError
+          && error.code === "APP_SERVER_TIMEOUT"
+          && error.outcomeUnknown === false,
+      );
+      assert.equal(calls.filter((call) => call.route === "/v1/wakes" && call.method === "POST").length, 1);
+      assert.ok(calls.some((call) => call.route === "/v1/wakes/wake-timeout-failed" && call.method === "GET"));
+    } finally {
+      await bridge.close();
+    }
+  });
+
+  test("transparent proxy bridge recovers a timed out wake already accepted by the proxy", async () => {
+    const calls = [];
+    let wakeStatus = "dispatching";
+    const bridge = createCodexThreadBridge({
+      mode: "transparent_proxy",
+      controlUrl: "http://127.0.0.1:18431",
+      controlToken: "proxy-test-token",
+      requestTimeoutMs: 250,
+      reconcileTimeoutMs: 1000,
+      reconcilePollMs: 10,
+      fetchImpl: async (url, options) => {
+        const route = new URL(url).pathname;
+        calls.push({ route, method: options.method });
+        if (route === "/v1/subscriptions") {
+          return new Response(JSON.stringify({ ok: true, created: true }), { status: 200 });
+        }
+        if (route === "/v1/wakes" && options.method === "POST") {
+          return new Promise((resolve, reject) => {
+            options.signal.addEventListener("abort", () => {
+              wakeStatus = "accepted";
+              const error = new Error("aborted");
+              error.name = "AbortError";
+              reject(error);
+            }, { once: true });
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          wake: {
+            wakeId: "wake-timeout-accepted",
+            threadId: "thread-timeout-accepted",
+            status: wakeStatus,
+            turnId: wakeStatus === "accepted" ? "turn-accepted" : null,
+          },
+        }), { status: 200 });
+      },
+    });
+    try {
+      const result = await bridge.wake({
+        taskId: "task-timeout-accepted",
+        generation: 1,
+        threadId: "thread-timeout-accepted",
+        localRole: "development",
+        sourceMachine: "training",
+        targetMachine: "development",
+        trustedPeerQq: "1000000001",
+        wakeId: "wake-timeout-accepted",
+        pendingThroughSequence: 11,
+        promptSha256: "f".repeat(64),
+        prompt: "accepted wake prompt",
+      });
+      assert.equal(result.outcome, "accepted");
+      assert.equal(result.recovered, true);
+      assert.equal(result.duplicateSuppressed, true);
+      assert.equal(result.turn.id, "turn-accepted");
+      assert.equal(calls.filter((call) => call.route === "/v1/wakes" && call.method === "POST").length, 1);
+    } finally {
+      await bridge.close();
+    }
+  });
+
 }

@@ -1063,6 +1063,48 @@ class TaskRegistry {
     });
   }
 
+  reconcileFailedWake(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const taskId = parseTaskId(input);
+    const wakeId = requiredString(input.wakeId, "wakeId");
+    return this.#write((state) => {
+      const task = this.#requireTask(state, taskId);
+      requireGenerationMatch(task, input);
+      const batchIndex = task.wakeBatches.findIndex((candidate) => candidate.wakeId === wakeId);
+      if (batchIndex < 0) return { changed: false, value: clonePublicTask(task) };
+      const batch = task.wakeBatches[batchIndex];
+      if (batch.status === "complete") return { changed: false, value: clonePublicTask(task) };
+      if (!["leased", "sent"].includes(batch.status)) {
+        throw new TaskRegistryError(
+          "WAKE_RECONCILE_CONFLICT",
+          `无法把当前唤醒状态恢复为待重试：${taskId}`,
+          { taskId, wakeId, status: batch.status },
+        );
+      }
+      task.wakeBatches.splice(batchIndex, 1);
+      for (const sequence of batch.messageSeqs) {
+        const message = findMessage(task, sequence);
+        if (!message || message.status !== "pending") continue;
+        const latestReminder = task.wakeBatches
+          .filter((candidate) => candidate.status === "sent" && candidate.messageSeqs.includes(sequence))
+          .map((candidate) => candidate.sentAt)
+          .filter(Boolean)
+          .sort((left, right) => Date.parse(left) - Date.parse(right))
+          .at(-1) ?? null;
+        message.lastRemindedAt = latestReminder;
+      }
+      task.lastWakeAt = task.wakeBatches
+        .filter((candidate) => candidate.status === "sent")
+        .map((candidate) => candidate.sentAt)
+        .filter(Boolean)
+        .sort((left, right) => Date.parse(left) - Date.parse(right))
+        .at(-1) ?? null;
+      task.updatedAt = resolveNow(this.now, input).toISOString();
+      refreshLegacyWakeFields(task);
+      return { changed: true, value: clonePublicTask(task) };
+    });
+  }
+
   #requireTask(state, taskId) {
     const task = state.tasks[taskId];
     if (!task) {

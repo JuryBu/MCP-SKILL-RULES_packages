@@ -170,7 +170,6 @@ function Assert-BackendOnlyCompatible {
     throw "Backend-only hot reload requires an existing installed code snapshot."
   }
   foreach ($RelativePath in @(
-    "src\codex-thread-bridge.mjs",
     "src\codex-app-server-proxy.mjs",
     "src\codex-app-server-proxy-runner.mjs",
     "ops\start-codex-app-server-proxy.ps1",

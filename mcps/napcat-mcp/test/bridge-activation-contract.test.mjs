@@ -73,6 +73,8 @@ test("backend-only hot reload proves proxy files unchanged and never stops the p
   assert.match(script, /\[switch\]\$BackendOnlyHotReload/);
   assert.match(script, /function Assert-BackendOnlyCompatible/);
   assert.match(script, /proxy-critical file changed/);
+  assert.doesNotMatch(compatibilityBlock, /src\\codex-thread-bridge\.mjs/);
+  assert.match(compatibilityBlock, /src\\codex-app-server-proxy\.mjs/);
   assert.doesNotMatch(compatibilityBlock, /activate-codex-app-server-when-idle\.ps1/);
   assert.match(script, /if \(\$BackendOnlyHotReload\) \{/);
   assert.match(script, /reload-broker-backend\.ps1/);

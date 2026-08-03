@@ -448,6 +448,51 @@ test("a confirmed wake remains cooldown-limited after ACK releases its lease", (
   }
 });
 
+test("failed-before-send reconciliation restores a confirmed batch without changing task progress", () => {
+  const fixture = createFixture({ wakeLeaseMs: 300_000, wakeCooldownMs: 60_000 });
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 7, at: BASE_TIME });
+    const leaseInput = {
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 7, messageAt: BASE_TIME }],
+      wakeId: "wake-failed-before-send",
+      promptSha256: "7".repeat(64),
+    };
+    const acquired = fixture.registry.acquireWakeLease(leaseInput);
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: acquired.wakeSentAt,
+      expectedWakeId: leaseInput.wakeId,
+    });
+
+    const restored = fixture.registry.reconcileFailedWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      wakeId: leaseInput.wakeId,
+    });
+    assert.equal(restored.generation, 1);
+    assert.equal(restored.status, "open");
+    assert.equal(restored.lastSeenSeq, 7);
+    assert.equal(restored.lastAckedSeq, 0);
+    assert.equal(restored.lastWakeAt, null);
+    assert.deepEqual(restored.activeWakes, []);
+    assert.deepEqual(restored.pendingMessages.map((message) => ({
+      messageSeq: message.messageSeq,
+      lastRemindedAt: message.lastRemindedAt,
+    })), [{ messageSeq: 7, lastRemindedAt: null }]);
+
+    const retried = fixture.registry.acquireWakeLease(leaseInput);
+    assert.equal(retried.acquired, true);
+    assert.equal(retried.reason, "acquired");
+    assert.equal(retried.activeWakeId, leaseInput.wakeId);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("later scans do not invalidate the token already delivered by an active wake", () => {
   const fixture = createFixture({ wakeLeaseMs: 300_000 });
   try {

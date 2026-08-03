@@ -9,6 +9,7 @@ import {
   createTaskRouterDependencies,
   parseArguments,
   readPrivateEnvironment,
+  reconcileAutomationMaintenance,
   runTaskRouterService,
   writeRuntimeState,
 } from "../src/task-router-runner.mjs";
@@ -288,6 +289,116 @@ test("扫描异常按指数退避并在上限后继续存活", async () => {
     assert.equal(state.lastError.code, "TEMPORARY_SCAN_FAILURE");
     assert.equal(state.nextScanAt, null);
     assert.equal(state.state, "stopped");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("known-before-send wake failure stays retryable instead of entering maintenance", async () => {
+  const fixture = createFixture();
+  let scanCount = 0;
+  try {
+    const result = await runTaskRouterService(serviceOptions(fixture, {
+      maintenanceFilePath: path.join(fixture.root, "state", "maintenance.json"),
+      router: {
+        async scanOnce() {
+          scanCount += 1;
+          return {
+            scannedAt: "2026-07-24T08:00:01.000Z",
+            openTaskCount: 1,
+            wakeCount: 0,
+            results: [{
+              taskId: "task-001",
+              wakeId: "wake-known-failure",
+              outcome: "wake_failed",
+              error: { code: "APP_SERVER_TIMEOUT", message: "发送前失败", outcomeUnknown: false },
+            }],
+          };
+        },
+      },
+      wait: async () => fs.writeFileSync(fixture.stopFilePath, "stop\n", "utf8"),
+    }));
+    assert.equal(scanCount, 1);
+    assert.equal(result.stopReason, "stop_file");
+    assert.equal(fs.existsSync(path.join(fixture.root, "state", "maintenance.json")), false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("true unknown wake result still enters maintenance", async () => {
+  const fixture = createFixture();
+  const maintenanceFilePath = path.join(fixture.root, "state", "maintenance.json");
+  try {
+    await runTaskRouterService(serviceOptions(fixture, {
+      maintenanceFilePath,
+      router: {
+        async scanOnce() {
+          return {
+            scannedAt: "2026-07-24T08:00:01.000Z",
+            openTaskCount: 1,
+            wakeCount: 0,
+            results: [{
+              taskId: "task-001",
+              wakeId: "wake-unknown",
+              outcome: "wake_unknown",
+              error: { code: "PROXY_WAKE_OUTCOME_UNKNOWN", message: "结果未知", outcomeUnknown: true },
+            }],
+          };
+        },
+      },
+      wait: async () => fs.writeFileSync(fixture.stopFilePath, "stop\n", "utf8"),
+    }));
+    const maintenance = JSON.parse(fs.readFileSync(maintenanceFilePath, "utf8"));
+    assert.equal(maintenance.reasons.automationBridge.wakeId, "wake-unknown");
+    assert.equal(maintenance.reasons.automationBridge.outcomeUnknown, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("maintenance reconciliation restores failed-before-send wake and clears only automation pause", () => {
+  const fixture = createFixture();
+  const maintenanceFilePath = path.join(fixture.root, "state", "maintenance.json");
+  const alertFilePath = path.join(fixture.root, "state", "alert.json");
+  const wakeJournalPath = path.join(fixture.root, "state", "codex-app-server-wake-journal.json");
+  const maintenance = {
+    schemaVersion: 1,
+    reasons: {
+      automationBridge: { taskId: "task-001", wakeId: "wake-failed", code: "PROXY_TIMEOUT" },
+    },
+  };
+  const reconciled = [];
+  fs.mkdirSync(path.dirname(maintenanceFilePath), { recursive: true });
+  fs.writeFileSync(maintenanceFilePath, JSON.stringify(maintenance), "utf8");
+  fs.writeFileSync(alertFilePath, JSON.stringify({ pending: true, source: "task-router" }), "utf8");
+  fs.writeFileSync(wakeJournalPath, JSON.stringify({
+    wakes: { "wake-failed": { status: "failed_before_send", error: { code: "APP_SERVER_TIMEOUT" } } },
+  }), "utf8");
+  try {
+    const result = reconcileAutomationMaintenance({
+      registryPath: fixture.registryPath,
+      maintenanceFilePath,
+      alertFilePath,
+      wakeJournalPath,
+    }, {
+      registry: {
+        get: () => ({
+          taskId: "task-001",
+          generation: 1,
+          status: "open",
+          activeWakes: [{ wakeId: "wake-failed" }],
+        }),
+        reconcileFailedWake: (input) => reconciled.push(input),
+      },
+    }, maintenance);
+    assert.equal(result.resolved, true);
+    assert.equal(result.outcome, "failed_before_send");
+    assert.deepEqual(reconciled, [{ taskId: "task-001", expectedGeneration: 1, wakeId: "wake-failed" }]);
+    assert.equal(fs.existsSync(maintenanceFilePath), false);
+    const alert = JSON.parse(fs.readFileSync(alertFilePath, "utf8"));
+    assert.equal(alert.pending, false);
+    assert.equal(alert.resolution, "journal_reconciled");
   } finally {
     fixture.cleanup();
   }
