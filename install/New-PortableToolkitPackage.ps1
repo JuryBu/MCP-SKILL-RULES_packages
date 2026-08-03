@@ -27,7 +27,7 @@ $excludeDirectories = @(
     "archived_sessions", "workspaces", "profiles", "browser-profile", "web-fetcher-profiles", "user-data-dir",
     "cookies", "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp",
     "tmp", "temp", "logs", ".cache", "__pycache__", "playwright-report", "test-results",
-    "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
+    "output-artifacts", "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
     "council-large-inputs", "council-model-calls", "agy-runtime", "state", "napcat-runtime"
 )
 $excludeNames = @(

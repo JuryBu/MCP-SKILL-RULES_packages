@@ -211,6 +211,9 @@ plans/
 - 代码/文件搜索优先用 CC 原生 `Grep`/`Glob`（快、集成权限 UI），语义搜索才用 sandbox `smart_search`
 - ⚠️ **MCP 60s 超时**：当前大部分 MCP 操作有约 60s 硬超时，单次同步调用别指望跑长任务，到点直接超时失败。耗时操作一律 `background=true` 启动 + 短轮询（`waitSeconds=30~45`）取结果
 - 执行命令/脚本优先走 sandbox（`sandbox_exec` 硬超时+内存隔离、`sandbox_session` 持久 REPL、`sandbox_launch` 长任务脱离），替代 CC 原生 run command 跑命令/计算/验证。✅ 实测 sandbox 能直接访问本地真实目录与文件（`os.listdir`、读写本地路径都通，还能 python-docx/pptx 提取 office 文本），所以本地文件操作也能交给它；仅当需要 CC 权限 UI 留痕、或依赖 CC 专属上下文时才用原生 Bash/PowerShell
+- Sandbox 自身预留额度和系统可用内存都足够时会立即并行，只有接近任一内存底线时才等待；`admission_timeout` 表示命令尚未启动，按返回的 `retryAfterMs` 随机退避后再重试，不要立即并发重发
+- 分清四类超时：`admission_timeout` 是资源等待超时，`execution_timeout` 是命令已经启动后运行超时，`caller_deadline_exceeded` 是排队与执行合计超过调用方总期限，`broker_backend_timeout` 是 broker 与 Sandbox backend 通信超时。后三类可能已经开始执行，先检查状态再重试
+- 大输出在安全预算内直接完整返回，超预算时返回预览与 artifact 的路径、SHA256、字节数、行数和过期时间；读取 artifact 才是完整结果。该机制不改变 CC 自己约 60 秒的外层 MCP 限制，长任务仍按上一条使用后台模式和 30～45 秒短轮询
 - ⚠️ **后台参数别张冠李戴**：开后台的方式因工具而异，别把一个工具的习惯惯性套到别的——`Agent`/`Bash` 用 `run_in_background`；**`Workflow` 天生就在后台跑，不接受 `run_in_background`，硬传会被打回、得重发**；多数 MCP（sandbox/council 等）用 `background=true`。调用前先认准当前工具收哪个、还是压根不收
 
 ## 高风险操作边界
@@ -350,6 +353,7 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 - **代码执行**：`sandbox_exec`（硬超时+内存限制）、`sandbox_session`（持久REPL）、`sandbox_batch`（并行）、`sandbox_launch`（长任务脱离执行）
 - **模型协作**：`sandbox_codex`（调用 Codex CLI）、`sandbox_council`（多模型审议）
 - **智能搜索**：`smart_search`（exact/fuzzy/smart 三模式）
+- **完整输出**：返回中出现 artifact 元数据时，按路径读取完整 stdout/stderr 并核对 SHA256；预览只用于判断内容，不代表原始输出被截断丢失
 
 ### Council 使用要点
 

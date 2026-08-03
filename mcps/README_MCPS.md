@@ -12,7 +12,7 @@ Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 
 `chain="windsurf"` is a compatibility shortcut for data only. `chain="grok"` is a compatibility shortcut for model execution only.
 
-### sandbox 1.15.1
+### sandbox 1.16.0
 
 Short execution, parallel batch, persistent session, long-running launch, Codex task execution, smart search, and multi-model Council. Grok Council uses a receiver-managed ProGrok OpenAI-compatible endpoint and supports image input when the selected model supports vision.
 
@@ -34,7 +34,7 @@ Streamable HTTP bridge exposing memory-store, web-fetcher, sandbox, Playwright, 
 
 Optional Windsurf Cascade-only async subagent controller. It is not a shared four-host MCP and must not be presented as a Codex, Antigravity, or Claude Code native subagent service.
 
-### napcat-mcp 0.1.0
+### napcat-mcp 0.2.0
 
 Optional fixed-QQ-group collaboration MCP for status checks, structured task messages, verified file indexes, task ledger registration, trusted-peer routing, Codex conversation wakeups, heartbeat management, a process supervisor, and per-user autostart. It is source-only and disabled by default; the receiver must supply NapCat OneBot, a private token, QQ login state, and a private `binding.json`.
 

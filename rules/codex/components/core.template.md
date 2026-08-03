@@ -189,6 +189,17 @@ Codex 侧 MCP 通过 HTTP broker（`127.0.0.1:14588`）暴露。broker 后端进
 
 ### 超时与后台任务
 
+Sandbox backend 会把资源等待、命令运行和外层调用期限分开报告，不能把所有失败都理解成「命令跑超时」：
+
+- `admission_timeout`：命令尚未启动，因全局内存压力等待接纳超时；参考返回的 `queueWaitMs`、`memoryPressure` 与随机 `retryAfterMs`，到点后再重试，不要立即并发重发
+- `execution_timeout`：命令已经启动，但超过该命令自己的运行时限；进程可能已经产生部分副作用，确认状态后再决定是否重试
+- `caller_deadline_exceeded`：排队与执行合计超过调用方总期限；结合 `mayHaveStarted` 判断命令是否可能已经开始
+- `broker_backend_timeout`：broker 与 Sandbox backend 的连接或响应超时；是否已经执行可能未知，应先查询持久任务或外部状态
+
+Sandbox 在自身预留额度和系统可用内存都充足时立即并行，只有接近任一内存底线时才等待；`admission_timeout` 表示等待结束前始终没有启动。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。
+
+以上是 Sandbox 内部状态，不替代 Codex 宿主自己的 MCP 外层期限与短轮询策略：
+
 共享 Codex HTTP broker 的普通 tool call 默认超时 120 秒。参数含 `waitSeconds>0` 时按 `waitSeconds*1000+15000` 计算；`timeout` 大于普通上限时按 `timeout+15000` 计算；默认上限 30 分钟。
 
 长任务优先 `background=true` + `waitSeconds=30-45` 短轮询，不要用单次超长同步调用占住宿主。后台任务轮询不要把 `waitSeconds` 设到 60 秒以上。

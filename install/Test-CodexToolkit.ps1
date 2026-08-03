@@ -103,7 +103,7 @@ function Test-ExcludedDirectories {
         "ms-playwright", "__pycache__", ".cache", "logs", "tmp", "temp", "profiles", "browser-profile",
         "web-fetcher-profiles", "user-data-dir", "playwright-report", "test-results", "cookies",
         "localstorage", "indexeddb", "archive", "handoff", ".codex-toolkit", ".playwright-mcp",
-        "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
+        "output-artifacts", "council-artifacts", "council-tasks", "council-quarantine", "council-indexes",
         "council-large-inputs", "council-model-calls", "agy-runtime", "state", "napcat-runtime"
     )
     if ($StrictPackage) {

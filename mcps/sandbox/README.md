@@ -1,4 +1,4 @@
-# MCP Sandbox v1.15.1
+# MCP Sandbox v1.16.0
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -8,7 +8,7 @@
 
 | 工具 | 功能 |
 |------|------|
-| `sandbox_exec` | 执行代码片段或系统命令，支持硬超时、内存限制、GPU、输出截断、重复输出折叠 |
+| `sandbox_exec` | 执行代码片段或系统命令，支持硬超时、内存限制、GPU、自适应输出、重复输出折叠 |
 | `sandbox_session` | 持久 REPL 会话，变量状态跨调用保持 |
 | `sandbox_batch` | 一次调用并行执行多个任务 |
 | `sandbox_status` | 查看系统状态、可用环境、GPU/CUDA 信息 |
@@ -22,13 +22,50 @@
 - ✅ 直接传代码字符串，不用写临时文件
 - ✅ 硬超时 + 自动杀进程，不会卡死
 - ✅ 内存限制，防止吃光系统内存
-- ✅ 输出截断/模式控制，不爆上下文
+- ✅ 小输出完整内联，大输出自动写入 artifact，不丢原始 stdout/stderr
 - ✅ 连续重复输出自动折叠（`[× N 重复]`）
 - ✅ maxLines 行数限制（保留头尾，折叠中间）
 - ✅ 持久 REPL 会话，有状态交互
 - ✅ 并行执行多任务
 - ✅ GPU/CUDA 支持
-- ✅ 清晰的失败原因（timeout/memory/vram/crash）
+- ✅ 清晰区分资源等待、命令运行、调用方总期限与 broker 通信超时
+
+## 全局资源接纳与超时分类
+
+Sandbox backend 在同一进程内统一管理会创建本机子进程的工具。内存足够时任务立即并行，不设置普通任务数量硬上限；接近全局内存预算时才暂停启动新任务，已经运行的任务继续执行。默认最低记账 64MB、正常接纳线 1536MB、硬线 2048MB、系统可用内存保留底线 1024MB、等待队列最多 256 项；系统底线会把尚未实际消耗的预留额度一并计算，避免其它应用已占满内存时继续接入大命令。`sandbox_batch` 的每个真实子任务分别记账，不能用单次 batch 绕过总内存预算；所有值均可通过 `templates/env.example.ps1` 中的 `SANDBOX_ADMISSION_*` 环境变量覆盖。
+
+等待队列按提交顺序并结合 `ownerId` 轮转，避免单个调用方长期占满资源。接纳等待默认最多约 10 秒；仍无资源时命令不会启动，并返回随机 `retryAfterMs`，供调用方错开下一次重试。四类超时含义不同：
+
+| 错误类型 | 是否已启动 | 处理方式 |
+|---|---|---|
+| `admission_timeout` | 否 | 资源等待超时；读取 `queueWaitMs`、`memoryPressure`、`retryAfterMs` 后再重试 |
+| `execution_timeout` | 是 | 命令超过自身运行时限；确认已产生的状态或副作用后再决定是否重试 |
+| `caller_deadline_exceeded` | 可能 | 排队与执行合计超过调用方总期限；结合 `mayHaveStarted` 判断 |
+| `broker_backend_timeout` | 未知 | broker 与 backend 连接或响应超时；先检查持久任务或外部状态 |
+
+这些状态属于 Sandbox/backend 链路，不会替代 Codex、Antigravity、Claude Code 或 Windsurf 各自的外层 MCP 期限。宿主可能先结束一次同步调用，因此长任务仍应使用工具自己的后台模式或 `sandbox_launch`，并按宿主规则短轮询。
+
+`sandbox_session` 默认最多 5 个会话、合计配置额度 1536MB、单会话默认 256MB、空闲 5 分钟关闭；这些 Session 默认值可通过 `templates/env.example.ps1` 中列出的环境变量覆盖。
+
+## 自适应输出与 artifact
+
+默认 `deliveryMode=auto`。结果同时满足以下条件时直接完整返回：轻量估算不超过 100000 tokens、总行数不超过 2000、MCP 单次响应 UTF-8 大小不超过 1MiB。`estimatedTokens` 是跨模型近似值，不是具体模型 tokenizer 的精确计数。
+
+超过任一条件时，响应保留有界头尾预览，并把完整 stdout、stderr 与 manifest 写入 `SANDBOX_DATA_ROOT/output-artifacts`。artifact 默认保留 6 小时，返回稳定 ID、绝对路径、SHA256、原始字节数、行数、创建/过期时间与完整性标记；调用方应读取 artifact 获取全文，并可用 SHA256 核对内容。
+
+`maxLines`、`tailLines`、`maxOutput` 继续表示调用方希望的展示预算，不再作为 200 行或 50000 字符的 schema 强制上限。`outputMode=full|head|tail|silent` 保持原语义；显式 `deliveryMode=inline` 可提高内联预算，但仍受可配置的 1MiB 服务端应急保护线约束。`sandbox_launch` 已将完整日志写入磁盘，它的状态查询仍默认只取少量尾行，不因本机制改成一次返回整份长期日志。
+
+## 安全重拉 Sandbox backend
+
+`ops/reload-broker-backend.ps1` 只访问 loopback broker 控制接口，endpoint 固定为 `sandbox`。脚本不复用 NapCat 的 legacy child recycle、不直接查找或终止任何进程；它在重拉前后核对 broker PID 不变，并重新执行 MCP `initialize` 与真实短 `sandbox_exec` 调用，确认新的 Sandbox backend 已经实际启动。
+
+使用前在接收方私有环境配置 `CODEX_MCP_BROKER_CONTROL_TOKEN`，或放入 broker 的私有环境文件；不要把 token 写进仓库。示例：
+
+```powershell
+& .\ops\reload-broker-backend.ps1
+```
+
+控制调用会等待正在处理的 Sandbox 请求结束，超时则失败，不会降级为直接杀进程。重拉会保留 broker PID 与其他 backend，但 Sandbox 进程内的 REPL Session 和未持久化状态会丢失，因此执行前先确认没有需要保留的会话。
 
 ## 进程生命周期（v1.9）
 
@@ -95,7 +132,9 @@ smart_search(taskId="...", waitSeconds=30)
 
 - `sandbox_session`、`sandbox_codex`、`sandbox_launch`、`smart_search(background=true)`、`sandbox_council(background=true)` 都支持 `ownerId`；未传时按 `global` 兼容旧调用。后台任务启动时传了 `ownerId`，后续 `taskId` 查询也必须带同一个 `ownerId`。
 - `sandbox_session` 同一 REPL 会话的并发 exec 会串行排队，避免 stdout/stderr buffer 混写。
-- `sandbox_launch` 注册表会记录 `createdAtMs`、`commandHash`、`ownerId`、`exitMarkerPath`，状态优先读取 done marker；kill 前校验 PID 创建时间和命令特征，避免 PID 复用误杀。
+- Windows 上的 `sandbox_codex` 会优先选择修改时间最新的 Codex Desktop bundled 可执行文件，避免被过旧的全局 npm CLI 阻塞；显式 `SANDBOX_CODEX_COMMAND` 仍拥有最高优先级。
+- `sandbox_launch` 用短生命周期 bootstrap 启动 detached worker，并通过 PID handshake 与原子 done marker 持久化真实工作进程；因此只重拉 Sandbox backend 时，长期任务与日志仍可恢复。
+- `sandbox_launch` 注册表会记录 `createdAtMs`、`commandHash`、`ownerId`、`exitMarkerPath`，状态优先读取 done marker；kill 前校验 PID 创建时间和命令特征，避免 PID 复用误杀。PID 刚消失而 marker 尚未落盘时会短暂等待，身份冲突仍立即失败。
 - `sandbox_launch` 是显式长期任务，不会因为后台超时自动杀；需要用 `status/list/kill/clean` 管理。
 
 ## Windsurf / WSF MCP 客户端兼容
@@ -214,6 +253,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 - v1.14.0 实现 Plan_13 P0/P1/P2：broker 关机 best-effort 落状态；council 历史清理、启动扫描和 checkpoint resume；普通 background tasks 写入 `sandbox-data/bg-tasks`，后端重启后可查询 done/error/interrupted。新增 `npm run test:council-maintenance` / `test:council-resume` / `test:bg-tasks-persist` / `test:bg-tasks-cleanup`。
 - v1.15.0：本地 CLI 主名称迁移为 `antigravityCli`（`agy`），`geminiCli` 与旧 `SANDBOX_COUNCIL_GEMINI_*` 环境变量暂时兼容。复杂文件索引优先 `agy`，PPTX 始终走 `agy → 本地解析` 的隔离路径，其他结构化文件须显式开启才可由 Codex 兜底
 - v1.15.1：Council 引入 manifest 制品追踪、终态制品回收与 quarantine/restore；补强 Abort、后台 resume、跨 worker 租约、子进程代理隔离和 terminal failure 处理。运行时根支持优先从 `SANDBOX_DATA_ROOT/temp` 解析，broker 部署不会默认把 Council 运行数据写回源码目录；自动 council GC 默认关闭，需显式设置 `SANDBOX_COUNCIL_AUTO_GC=1`
+- v1.16.0：实现 Issue #13/#14。Sandbox backend 按64/1536/2048MB默认额度统一接纳本机任务，同时保留默认1024MB系统可用内存底线；压力时按owner公平等待并返回结构化退避，Session默认5个且可配置。exec、batch、Session与Codex改为流式保存完整stdout/stderr，小输出在100K估算token、2000行与1MiB响应线内直接返回，超预算返回6小时artifact、SHA256和头尾预览；移除200行、50000字符与Codex 30分钟schema硬上限。长期 launch 改用 detached bootstrap/worker 与原子 marker，Windows Codex 调用自动选择最新 bundled CLI，并新增只重拉Sandbox endpoint的安全脚本。
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例
 - v1.12.2 补充 `sandbox_council` 后台查询防呆：启动返回会直接给出带 `ownerId` 的查询示例；README、Resource guide 和 schema 明确查询必须复用同一个 `ownerId`，避免误判任务丢失后重复启动

@@ -13,6 +13,13 @@
 - 多模型交叉验证、红蓝对抗审题用 sandbox_council
 - 复杂推理/数学证明/多方案对比用 sequential-thinking MCP
 
+## MCP sandbox
+
+- Sandbox 自身预留额度和系统可用内存都足够时立即并行；只有接近任一内存底线时才等待。`admission_timeout` 表示命令尚未启动，按返回的 `queueWaitMs`、`memoryPressure` 和随机 `retryAfterMs` 退避后再重试，不要立即并发重发
+- `execution_timeout` 表示命令已经启动后运行超时；`caller_deadline_exceeded` 表示排队与执行合计超过调用方总期限；`broker_backend_timeout` 表示 broker 与 Sandbox backend 通信超时。这三类可能已经开始执行，重试前先检查状态和副作用
+- 大输出在安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；读取 artifact 才是完整结果
+- 这些是 Sandbox 内部状态，不覆盖 Windsurf 自己的外层 MCP 期限。耗时任务使用对应工具的后台模式或 sandbox_launch，状态查询沿用本模板的 30～45 秒短轮询
+
 ## MCP 跨链路访问
 
 共享 MCP 支持跨宿主：chain=auto|antigravity|codex|claude-code|windsurf，支持 dataChain/modelChain 拆分。

@@ -203,7 +203,7 @@ Use `modelChain="grok"` to force this route. `dataChain` never uses Grok because
 
 ## 10. Sandbox Council Artifacts
 
-Council 1.15.1 stores managed transcripts, indexes, large-input chunks, checkpoints, and quarantine data below `SANDBOX_DATA_ROOT`. The portable build does not run artifact GC automatically. Inspect candidates first:
+Sandbox 1.16.0 stores Council artifacts plus adaptive stdout/stderr output artifacts below `SANDBOX_DATA_ROOT`. Inspect candidates before destructive cleanup:
 
 ```text
 sandbox_status(action="gc", gcScope="council", gcMode="dryRun")

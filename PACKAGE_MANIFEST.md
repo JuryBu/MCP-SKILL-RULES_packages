@@ -4,8 +4,8 @@
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.15.1, broker 0.1.0 |
-| Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.1.0 |
+| MCP | memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0 |
+| Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 17 license-reviewed portable user skills plus manifest |
 | Setup | PowerShell build, broker, config, validation, and packaging scripts |
@@ -18,13 +18,13 @@
 - Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
 - NapCat autostart now uses an internal windowless launcher plus a long-running supervisor watchdog, so interactive logon does not expose PowerShell consoles and unexpected supervisor exits are retried without replacing receiver-private state.
 - Added public-safe Bug/compatibility and Feature Request Issue forms for cross-machine MCP maintenance.
-- Common MCP versions remain memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.15.1, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Common MCP versions are memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
 - NapCat public source is refreshed to the current task-ledger, router, supervisor, and Codex wake-bridge snapshot while keeping runtime state, real bindings, login data, and credentials excluded.
 
 ## 2026-07-24 Baseline
 
 - memory-store upgraded from 1.19.3 to 1.21.1 with production Record scheduling, source evidence, startup barriers, commit protocols, provider admission/control, AGY routing, unknown-chain migration, background-task suspension and expanded multi-host recovery behavior.
-- sandbox remains 1.15.1 while synchronizing the current Grok bridge, Council background handling, smart-search routing, executor/session fixes and portable data-root behavior.
+- sandbox 1.16.0 adds backend-wide memory admission, configurable five-Session defaults, adaptive 100K-token/2000-line/1MiB output delivery, six-hour output artifacts, and scoped Sandbox backend reload support.
 - the portable Sandbox Council root now follows `SANDBOX_DATA_ROOT`, keeping transcripts, indexes, task checkpoints, quarantine groups, and other runtime data outside the source tree.
 - refreshed lockfiles build successfully on Node.js 18+. On 2026-07-24, `npm audit --omit=dev` reported no critical issues but did report transitive advisories: memory-store 9, web-fetcher 11, sandbox 8, and mcp-subagent 5; broker reported 0. The package does not run `npm audit fix --force` because breaking dependency rewrites must be evaluated upstream rather than silently applied during packaging.
 - web-fetcher remains 7.0.0 and synchronizes the latest constants, interaction and pipeline behavior.

@@ -11,6 +11,37 @@ $env:MEMORY_STORE_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\memory-store"
 $env:SANDBOX_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\sandbox-data"
 $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-profiles"
 
+# Optional Sandbox-wide resource admission. Defaults allow twenty 64MB light tasks without a fixed process-count ceiling.
+# $env:SANDBOX_ADMISSION_MIN_RESERVATION_MB = "64"
+# $env:SANDBOX_ADMISSION_LIMIT_MB = "1536"
+# $env:SANDBOX_ADMISSION_HARD_LIMIT_MB = "2048"
+# $env:SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB = "1024"
+# $env:SANDBOX_ADMISSION_MAX_QUEUE = "256"
+# $env:SANDBOX_ADMISSION_WAIT_MIN_MS = "8000"
+# $env:SANDBOX_ADMISSION_WAIT_MAX_MS = "10000"
+# $env:SANDBOX_ADMISSION_AGING_MS = "1000"
+# $env:SANDBOX_ADMISSION_RETRY_SLOT_MS = "500"
+# $env:SANDBOX_ADMISSION_MAX_RETRY_EXPONENT = "4"
+# $env:SANDBOX_EXEC_MAX_TIMEOUT_MS = "21600000"
+
+# Optional reservations for tools whose child-process lifetime is managed as one unit.
+# $env:SANDBOX_CODEX_RESERVATION_MB = "512"
+# $env:SANDBOX_COUNCIL_RESERVATION_MB = "512"
+# $env:SANDBOX_SMART_RESERVATION_MB = "512"
+
+# Optional Sandbox session limits.
+# $env:SANDBOX_SESSION_MAX_COUNT = "5"
+# $env:SANDBOX_SESSION_MAX_TOTAL_MEMORY_MB = "1536"
+# $env:SANDBOX_SESSION_DEFAULT_MEMORY_MB = "256"
+# $env:SANDBOX_SESSION_IDLE_TIMEOUT_MS = "300000"
+
+# Optional adaptive output artifact retention. Defaults to six hours.
+# $env:SANDBOX_OUTPUT_ARTIFACT_TTL_MS = "21600000"
+# $env:SANDBOX_OUTPUT_HARD_RESPONSE_BYTES = "1048576"
+
+# Limit design-tests/smoke-mcp-http.mjs to an already enabled comma-separated subset, for example sandbox only.
+# $env:CODEX_TOOLKIT_SMOKE_ENDPOINTS = "sandbox"
+
 # Optional Council retention controls. Managed artifacts default to 14 days; values below 7 are clamped to 7.
 # Always preview receiver data with gcMode=dryRun before apply, restore, or purge.
 # $env:SANDBOX_COUNCIL_ARTIFACT_TTL_DAYS = "14"
