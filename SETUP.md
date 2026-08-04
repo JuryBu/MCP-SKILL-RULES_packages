@@ -201,15 +201,17 @@ $env:SANDBOX_PROGROK_MODEL = "<receiver-supported-model>"
 
 Use `modelChain="grok"` to force this route. `dataChain` never uses Grok because Grok does not own conversation data.
 
-## 10. Sandbox Council Artifacts
+## 10. Sandbox Artifacts
 
-Sandbox 1.16.0 stores Council artifacts plus adaptive stdout/stderr output artifacts below `SANDBOX_DATA_ROOT`. Inspect candidates before destructive cleanup:
+Sandbox 1.16.1 stores Council artifacts plus only oversized, explicitly file-oriented, or interrupted-recovery stdout/stderr artifacts below `SANDBOX_DATA_ROOT`. After upgrading from 1.16.0, first confirm small output no longer creates an artifact, inspect retained counts, then clean only expired output artifacts:
 
 ```text
 sandbox_status(action="gc", gcScope="council", gcMode="dryRun")
+sandbox_status(action="overview")
+sandbox_status(action="gc")
 ```
 
-`apply` may move expired managed artifacts into quarantine, `restore` moves a selected quarantine group back, and `purge` permanently removes an eligible quarantine group. These modes modify persistent receiver data, so explain the scope and recovery path and obtain explicit approval before using them. A receiver may opt into startup cleanup with `SANDBOX_COUNCIL_AUTO_GC=1` only after accepting that behavior.
+The unscoped `gc` call removes only expired temporary/output artifacts and reports how many output artifacts were removed, retained, or invalid; do not manually delete a recent artifact that another task may still need. Council `apply` may move expired managed artifacts into quarantine, `restore` moves a selected quarantine group back, and `purge` permanently removes an eligible quarantine group. These Council modes modify persistent receiver data, so explain the scope and recovery path and obtain explicit approval before using them. A receiver may opt into startup cleanup with `SANDBOX_COUNCIL_AUTO_GC=1` only after accepting that behavior.
 
 For Antigravity CLI / Gemini-family Council participants, use `provider="antigravityCli"`; `geminiCli` is a temporary compatibility alias. The `agy` command, login state, proxy, and model capacity are receiver-managed and are not included in this package.
 

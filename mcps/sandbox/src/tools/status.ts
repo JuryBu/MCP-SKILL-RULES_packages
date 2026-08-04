@@ -7,7 +7,7 @@ import { cleanOldTempFiles, getTempStats } from "../temp-store.js";
 import { runCouncilArtifactGc, type CouncilGcMode } from "../council/artifact-gc.js";
 import os from "os";
 import { getResourceAdmissionState } from "../resource-admission-runtime.js";
-import { cleanExpiredOutputArtifacts } from "../output-artifact-store.js";
+import { cleanExpiredOutputArtifacts, getOutputArtifactStats } from "../output-artifact-store.js";
 
 /**
  * sandbox_status 工具 — 系统状态
@@ -17,7 +17,7 @@ const StatusParamsSchema = z.object({
     action: z.enum(["overview", "envs", "gpu", "gc"]).optional()
         .describe("操作：overview(默认)/envs/gpu/gc"),
     gcScope: z.enum(["council"]).optional()
-        .describe("gc 范围：不传保持临时文件清理兼容；council 清理托管 council artifact 与受控 legacy 产物"),
+        .describe("gc 范围：不传清理过期临时文件与输出 artifact；council 清理托管 council artifact 与受控 legacy 产物"),
     gcMode: z.enum(["dryRun", "apply", "restore", "purge"]).optional()
         .describe("council gc 模式：dryRun(默认)/apply/restore/purge"),
     quarantineId: z.string().min(1).max(160).optional()
@@ -28,10 +28,10 @@ export function registerStatus(server: McpServer): void {
     const description = `查看沙箱系统状态。包括可用环境列表、CUDA 信息、资源占用、活跃会话列表。
 
 action:
-- overview (默认): 系统资源 + 活跃会话 + 临时文件
+- overview (默认): 系统资源 + 活跃会话 + 临时文件 + 输出 artifact 统计
 - envs: 可用语言环境列表（Python/Node/conda/bash）
 - gpu: GPU/CUDA/DirectML 详细信息
-- gc: 不传 gcScope 时清理过期临时文件；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务启动会自动先 apply 托管 council artifact（includeLegacy=false），再按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;
+- gc: 不传 gcScope 时清理过期临时文件与输出 artifact，并报告保留/无效数量；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务启动会自动先 apply 托管 council artifact（includeLegacy=false），再按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;
     const handleStatus = async (params: Record<string, unknown>) => {
             const startTime = Date.now();
             touchActivity();
@@ -83,7 +83,7 @@ action:
 
 async function buildOverview() {
     const envInfo = getCachedEnvInfo();
-    const sessions = await listSessions();
+    const [sessions, outputArtifacts] = await Promise.all([listSessions(), getOutputArtifactStats()]);
     const tempStats = getTempStats();
     const admission = getResourceAdmissionState();
 
@@ -125,6 +125,7 @@ async function buildOverview() {
 
     lines.push("");
     lines.push(`临时文件: ${tempStats.count} 个 | ${formatBytes(tempStats.totalBytes)}`);
+    lines.push(`输出 artifact: ${outputArtifacts.runs} 个（完整 ${outputArtifacts.complete} / 未完成 ${outputArtifacts.incomplete} / 无效 ${outputArtifacts.invalid}）| payload ${formatBytes(outputArtifacts.payloadBytes)}`);
 
     return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
@@ -236,13 +237,10 @@ async function buildGc(gcScope?: "council", gcMode?: CouncilGcMode, quarantineId
     const outputArtifacts = await cleanExpiredOutputArtifacts();
     const sessions = await listSessions();
 
-    // gc 只清理临时文件
-    // 空闲会话由 idle checker 自动处理
-
     const lines = [
         "🧹 清理完成",
         `  临时文件清理: ${cleaned} 个`,
-        `  过期输出 artifact 清理: ${outputArtifacts.removed} 个`,
+        `  过期输出 artifact: 清理 ${outputArtifacts.removed} 个 | 保留 ${outputArtifacts.retained} 个 | 无效 ${outputArtifacts.invalid} 个`,
         `  活跃会话: ${sessions.length} 个（由空闲超时自动管理）`,
     ];
 

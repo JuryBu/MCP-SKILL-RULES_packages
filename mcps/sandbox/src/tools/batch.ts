@@ -138,7 +138,7 @@ export function registerBatch(server: McpServer): void {
                     if (r.errorType) parts.push(`调度错误: ${r.errorType}${r.retryAfterMs ? ` | 建议 ${r.retryAfterMs}ms 后重试` : ""}`);
                     if (r.stdout) parts.push(r.stdout);
                     if (r.stderr) parts.push(`⚠️ ${r.stderr}`);
-                    if (r.truncated && r.tempFile) parts.push(`📁 完整输出: ${r.tempFile}`);
+                    if (r.truncated && r.tempFile && !r.artifact) parts.push(`📁 完整输出: ${r.tempFile}`);
                     if (r.artifact && r.outputStats) {
                         parts.push(`📦 ${r.deliveryMode} artifact=${r.artifact.artifactId} expires=${r.artifact.expiresAt}`);
                         parts.push(`   stdout sha256=${r.outputStats.stdout.sha256} | stderr sha256=${r.outputStats.stderr.sha256}`);

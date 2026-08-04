@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.16.0
+ * MCP Sandbox Server v1.16.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -43,7 +43,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.16.0",
+    version: "1.16.1",
 });
 
 // 注册所有 8 个工具
@@ -68,7 +68,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.16.0 使用指南
+                text: `# MCP Sandbox v1.16.1 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -138,19 +138,19 @@ sandbox_batch(tasks=[
 | status | 查看会话内存/运行时间 |
 | close | 关闭会话 |
 | list | 列出所有活跃会话 |
-限制: 最多3并发，空闲5分钟自动关闭，单会话最大512MB；支持 ownerId，未传按 global 兼容，同一 session 的并发 exec 会串行排队
+默认最多 5 个会话、单会话 256MB、合计预留 1536MB、空闲 5 分钟自动关闭，均可通过 SANDBOX_SESSION_* 环境变量调整；支持 ownerId，未传按 global 兼容，同一 session 的并发 exec 会串行排队
 
 ### sandbox_batch — 并行执行
-- tasks: 最多5个，每个含独立的 code/command/timeout/maxMemoryMB
+- tasks: 最多20个，每个含独立的 code/command/timeout/maxMemoryMB
 - parallel: true(默认)/false
 - maxParallel: 默认3
 每个任务独立计时、独立超时、独立内存限制，某任务失败不影响其他
 
 ### sandbox_status — 系统状态
-- overview: CPU/RAM/VRAM + 活跃会话 + 临时文件
+- overview: CPU/RAM/VRAM + 资源调度 + 活跃会话 + 临时文件 + 输出 artifact 数量与 payload
 - envs: Python/Node/conda/bash/CUDA 环境列表
 - gpu: GPU/CUDA/DirectML 详情
-- gc: 清理临时文件
+- gc: 清理过期临时文件与过期输出 artifact，并报告清理、保留和无效数量
 
 ## 返回值关键字段
 | 字段 | 含义 |
@@ -161,7 +161,7 @@ sandbox_batch(tasks=[
 | killReason | timeout/memory/vram/crash |
 | peakMemoryMB | 内存峰值（短进程<200ms可能为0） |
 | truncated | 输出是否被截断 |
-| tempFile | 截断时完整输出的临时文件路径 |
+| tempFile | 保留 artifact 时的 manifest 路径；普通 inline 为 null |
 
 ## 使用技巧
 1. **sandbox 可替代 run_command**：sandbox_exec(command=...) 可执行所有非交互式命令，自动继承 PowerShell 环境，且有超时保护、内存限制、输出截断。解决了 Antigravity 中 run_command 的输出检测不到问题
@@ -211,7 +211,7 @@ sandbox_codex(action="kill",  taskId="codex-001")  — 终止任务
 | timeout | 0(无超时) | Codex 子进程执行超时(ms)，不再限制为 30 分钟 |
 | model | 无 | 指定模型（-m 参数），不传使用默认 |
 | configOverrides | 无 | -c 配置覆盖 |
-| maxOutput | 1MiB | MCP 内联展示预算；完整 stdout/stderr 始终保存在 artifact |
+| maxOutput | 1MiB | MCP 内联展示预算；普通小输出直接返回且不保留 artifact，超预算或中断恢复才保留完整 artifact |
 | image | 无 | 图片文件路径（-i），让 Codex 看截图 |
 | json | false | JSONL 事件流输出（--json） |
 | outputSchema | 无 | JSON Schema 文件路径，约束输出格式 |
@@ -458,6 +458,8 @@ Antigravity 常用别名:
 - v1.14.0 Plan_13 P0/P1/P2：broker 关机 best-effort 落状态；council 历史清理、启动扫描和 checkpoint resume；普通 background tasks 写入 sandbox-data/bg-tasks，后端重启后可查询 done/error/interrupted。新增 npm run test:council-maintenance / test:council-resume / test:bg-tasks-persist / test:bg-tasks-cleanup。
 - v1.14.0 Plan_13 D-11：sandbox_council 新增 provider=grok，复用 progrok API，支持 vision image_url、同源并发限制、显式同 provider fallback 和 fake server 回归测试。
 - v1.15.0 Plan_14：本地 CLI 主名称迁移为 antigravityCli（agy），geminiCli 和旧 SANDBOX_COUNCIL_GEMINI_* 环境变量保留一个版本周期兼容；新增 agy 模型链和专项回归脚本。PPTX 改为 agy → Python 的硬隔离路径，永不进入 Codex；其他结构化文件需显式 SANDBOX_COUNCIL_STRUCTURED_CODEX_FALLBACK=1 才允许 Codex 最后兜底。only-text 默认转述器升级为 codex/gpt-5.6-luna，reasoning=high、speed=fast。
+- v1.16.0 实现 backend 全局内存接纳、可配置 Session、四类超时、自适应输出、6 小时 artifact 与 Sandbox endpoint scoped reload。
+- v1.16.1 修复普通 inline 输出也持久化并展示 artifact 的回归；成功内联后删除执行期 spool，仅超预算、显式文件模式和中断恢复保留 artifact。status overview/gc 增加输出 artifact 统计。
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，默认走 sandbox direct 安全路径，手动跟随重定向并逐跳拒绝 localhost / 私有地址；显式 backend=exa/webFetcher 暂停，待补等价逐跳私网校验证明后再恢复
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -549,7 +551,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[sandbox] MCP Server v1.16.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[sandbox] MCP Server v1.16.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -609,7 +611,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[sandbox] MCP Server v1.16.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.16.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

@@ -135,17 +135,18 @@ action:
                             parts.push(`⚠️ ${result.stderr}`);
                         }
 
-                        if (result.outputDelivery) {
-                            const delivery = result.outputDelivery;
+                        const delivery = result.outputDelivery;
+                        const artifact = delivery?.artifact;
+                        if (delivery && artifact) {
                             parts.push("");
                             parts.push(`📦 输出交付: ${delivery.mode} | complete=${delivery.complete} | status=${delivery.status}`);
-                            parts.push(`  artifactId: ${delivery.artifact.artifactId}`);
-                            parts.push(`  manifest: ${delivery.artifact.manifestPath}`);
+                            parts.push(`  artifactId: ${artifact.artifactId}`);
+                            parts.push(`  manifest: ${artifact.manifestPath}`);
                             parts.push(`  stdout: ${delivery.stats.stdout.rawBytes} bytes / ${delivery.stats.stdout.lines} lines / sha256=${delivery.stats.stdout.sha256}`);
                             parts.push(`  stderr: ${delivery.stats.stderr.rawBytes} bytes / ${delivery.stats.stderr.lines} lines / sha256=${delivery.stats.stderr.sha256}`);
-                            parts.push(`  estimatedTokens: ${delivery.stats.combined.estimatedTokens} | expiresAt: ${delivery.artifact.expiresAt}`);
+                            parts.push(`  estimatedTokens: ${delivery.stats.combined.estimatedTokens} | expiresAt: ${artifact.expiresAt}`);
                             if (delivery.reasons.length > 0) parts.push(`  reasons: ${delivery.reasons.join(", ")}`);
-                            parts.push(`  readHint: ${delivery.readHint}`);
+                            if (delivery.readHint) parts.push(`  readHint: ${delivery.readHint}`);
                         }
 
                         const output = {
@@ -156,7 +157,7 @@ action:
                                 totalMs: Date.now() - startTime,
                                 killed: result.killed,
                                 killReason: result.killReason,
-                                artifact: result.outputDelivery?.artifact,
+                                artifact: result.outputDelivery?.artifact ?? null,
                             },
                         };
                         return appendTiming(output, startTime);

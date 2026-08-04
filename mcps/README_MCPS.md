@@ -12,9 +12,11 @@ Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 
 `chain="windsurf"` is a compatibility shortcut for data only. `chain="grok"` is a compatibility shortcut for model execution only.
 
-### sandbox 1.16.0
+### sandbox 1.16.1
 
 Short execution, parallel batch, persistent session, long-running launch, Codex task execution, smart search, and multi-model Council. Grok Council uses a receiver-managed ProGrok OpenAI-compatible endpoint and supports image input when the selected model supports vision.
+
+Ordinary bounded stdout/stderr is returned directly without a persistent output artifact. Oversized, explicitly file-oriented, or interrupted recovery output retains a six-hour artifact; `sandbox_status overview/gc` reports retained artifact counts for receiver-side verification and expiry cleanup.
 
 Council runs now use manifest-governed artifact directories for transcripts, indexes, and large inputs. `sandbox_status(action="gc", gcScope="council")` defaults to a dry run and supports guarded apply, restore, and purge flows. Active, referenced, preserved, or malformed runs are retained and reported instead of being deleted blindly. Runtime paths follow `SANDBOX_DATA_ROOT`; the portable package never treats its source directory as persistent data storage.
 

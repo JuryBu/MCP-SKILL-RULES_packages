@@ -15,7 +15,7 @@ const {
 const {
     cleanExpiredOutputArtifacts,
     createOutputArtifactRun,
-    DEFAULT_OUTPUT_ARTIFACT_TTL_MS,
+    getOutputArtifactStats,
     OUTPUT_ARTIFACT_ROOT,
 } = await import("../mcps/sandbox/dist/output-artifact-store.js");
 
@@ -32,7 +32,13 @@ function assertAtomicManifest(result) {
     assert.equal(entries.some((entry) => entry.endsWith(".tmp")), false);
 }
 
+function artifactIds() {
+    if (!fs.existsSync(OUTPUT_ARTIFACT_ROOT)) return [];
+    return fs.readdirSync(OUTPUT_ARTIFACT_ROOT).sort();
+}
+
 test("auto returns split UTF-8 and CRLF inline with exact metrics", async () => {
+    const before = artifactIds();
     const collector = await createOutputDeliveryCollector();
     const stdout = Buffer.from("甲\r\n乙🙂\n", "utf8");
     const emojiStart = stdout.indexOf(Buffer.from("🙂", "utf8"));
@@ -52,16 +58,9 @@ test("auto returns split UTF-8 and CRLF inline with exact metrics", async () => 
     assert.equal(result.stats.stdout.sha256, sha256(stdout));
     assert.equal(result.complete, true);
     assert.equal(result.status, "done");
-    assert.equal(result.artifact.root, path.join(dataRoot, "output-artifacts"));
-    assert.equal(result.artifact.root, OUTPUT_ARTIFACT_ROOT);
-
-    const manifest = readManifest(result);
-    assert.equal(manifest.complete, true);
-    assert.equal(manifest.status, "done");
-    assert.equal(manifest.files.stdout.rawBytes, stdout.length);
-    assert.equal(Date.parse(manifest.expiresAt) - Date.parse(manifest.completedAt), DEFAULT_OUTPUT_ARTIFACT_TTL_MS);
-    assert.equal(fs.readFileSync(manifest.files.stdout.path).compare(stdout), 0);
-    assertAtomicManifest(result);
+    assert.equal(result.artifact, undefined);
+    assert.equal(result.readHint, undefined);
+    assert.deepEqual(artifactIds(), before);
 });
 
 test("auto falls back after 2000 combined lines while inline can override it", async () => {
@@ -73,11 +72,27 @@ test("auto falls back after 2000 combined lines while inline can override it", a
     assert.equal(automaticResult.stats.combined.lines, 2001);
     assert.ok(automaticResult.reasons.includes("combined_line_limit_exceeded"));
 
+    const beforeForced = artifactIds();
     const forced = await createOutputDeliveryCollector({ mode: "inline" });
     await forced.write("stdout", content);
     const forcedResult = await forced.finalize();
     assert.equal(forcedResult.mode, "inline");
     assert.equal(forcedResult.stdout, content);
+    assert.equal(forcedResult.artifact, undefined);
+    assert.deepEqual(artifactIds(), beforeForced);
+});
+
+test("interrupted auto output retains a recovery artifact", async () => {
+    const before = await getOutputArtifactStats();
+    const collector = await createOutputDeliveryCollector();
+    await collector.write("stdout", "partial output");
+    const result = await collector.finalize({ status: "interrupted", error: "timeout" });
+    assert.equal(result.mode, "file");
+    assert.ok(result.reasons.includes("interrupted_output_preserved"));
+    assert.equal(fs.readFileSync(result.artifact.stdoutPath, "utf8"), "partial output");
+    const after = await getOutputArtifactStats();
+    assert.equal(after.runs, before.runs + 1);
+    assert.ok(after.payloadBytes >= before.payloadBytes + Buffer.byteLength("partial output"));
 });
 
 test("the 1 MiB serialized response guard overrides explicit inline", async () => {

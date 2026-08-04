@@ -52,7 +52,7 @@ function createExecHandler() {
     return handler;
 }
 
-test("process output preserves Unicode, emoji, and CRLF in its artifact", async () => {
+test("small process output preserves Unicode, emoji, and CRLF inline without an artifact", async () => {
     const stdout = "第一行\\r\\n🙂 第二行\\r\\n末行\\n";
     const stderr = "警告🙂\\r\\n";
     const result = await execute({
@@ -71,9 +71,16 @@ test("process output preserves Unicode, emoji, and CRLF in its artifact", async 
     assert.equal(result.deliveryMode, "inline");
     assert.equal(result.stdout, stdout);
     assert.equal(result.stderr, stderr);
-    assert.deepEqual(readArtifact(result, "stdout"), Buffer.from(stdout, "utf8"));
-    assert.deepEqual(readArtifact(result, "stderr"), Buffer.from(stderr, "utf8"));
-    assert.equal(result.artifact.root, path.join(dataRoot, "output-artifacts"));
+    assert.equal(result.artifact, null);
+    assert.equal(result.tempFile, null);
+});
+
+test("sandbox_exec omits artifact metadata for a small inline result", async () => {
+    const handler = createExecHandler();
+    const response = await handler(nodeCode(`process.stdout.write("direct-output");`), {});
+    assert.match(response.content[0].text, /direct-output/u);
+    assert.doesNotMatch(response.content[0].text, /输出交付|artifactId|manifest:/u);
+    assert.equal(response.structuredContent.artifact, null);
 });
 
 test("2001 process-output lines are delivered through a complete artifact", async () => {
@@ -205,6 +212,7 @@ test("batch maxTotalMemoryMB locally serializes three 64 MB reservations", async
     assert.ok(starts[1] - starts[0] >= 120, `first gap was ${starts[1] - starts[0]}ms`);
     assert.ok(starts[2] - starts[1] >= 120, `second gap was ${starts[2] - starts[1]}ms`);
     assert.match(response.content[0].text, /3 个任务/u);
+    assert.doesNotMatch(response.content[0].text, /artifact=/u);
 });
 
 let passed = 0;

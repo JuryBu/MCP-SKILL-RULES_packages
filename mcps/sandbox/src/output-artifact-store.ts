@@ -54,6 +54,14 @@ export interface OutputArtifactCleanupResult {
     invalid: number;
 }
 
+export interface OutputArtifactStats {
+    runs: number;
+    complete: number;
+    incomplete: number;
+    invalid: number;
+    payloadBytes: number;
+}
+
 function safeArtifactId(value: string): string {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)) {
         throw new Error("artifactId must be a safe 1-128 character file name");
@@ -197,6 +205,17 @@ export class OutputArtifactRun {
         return this.finalizePromise;
     }
 
+    async discard(): Promise<void> {
+        if (!this.finalizePromise) throw new Error("output artifact must be finalized before discard");
+        await this.finalizePromise;
+        await fs.promises.rm(this.directory, {
+            recursive: true,
+            force: true,
+            maxRetries: 3,
+            retryDelay: 50,
+        });
+    }
+
     private async finalizeInternal(options: FinalizeOutputArtifactOptions): Promise<OutputArtifactManifest> {
         const writeResults = await Promise.allSettled([this.pendingWrites.stdout, this.pendingWrites.stderr]);
         const closeResults = await Promise.allSettled([
@@ -272,6 +291,34 @@ export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeInco
             } else {
                 result.retained += 1;
             }
+        } catch {
+            result.invalid += 1;
+        }
+    }
+    return result;
+}
+
+export async function getOutputArtifactStats(): Promise<OutputArtifactStats> {
+    const result: OutputArtifactStats = { runs: 0, complete: 0, incomplete: 0, invalid: 0, payloadBytes: 0 };
+    let entries: fs.Dirent[];
+    try {
+        entries = await fs.promises.readdir(OUTPUT_ARTIFACT_ROOT, { withFileTypes: true });
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return result;
+        throw error;
+    }
+    for (const entry of entries) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        result.runs += 1;
+        try {
+            const manifestPath = path.join(OUTPUT_ARTIFACT_ROOT, entry.name, "manifest.json");
+            const manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf8")) as Partial<OutputArtifactManifest>;
+            if (manifest.complete === true) result.complete += 1;
+            else result.incomplete += 1;
+            const stdoutBytes = Number(manifest.files?.stdout?.rawBytes);
+            const stderrBytes = Number(manifest.files?.stderr?.rawBytes);
+            if (Number.isFinite(stdoutBytes) && stdoutBytes > 0) result.payloadBytes += stdoutBytes;
+            if (Number.isFinite(stderrBytes) && stderrBytes > 0) result.payloadBytes += stderrBytes;
         } catch {
             result.invalid += 1;
         }

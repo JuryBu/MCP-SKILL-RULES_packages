@@ -76,8 +76,8 @@ export interface OutputDeliveryResult {
     stderr?: string;
     preview?: OutputPreview;
     stats: OutputDeliveryStats;
-    artifact: OutputArtifactReference;
-    readHint: string;
+    artifact?: OutputArtifactReference;
+    readHint?: string;
     reasons: string[];
     error: string | null;
 }
@@ -395,19 +395,26 @@ export class OutputDeliveryCollector {
             status: manifest.status,
             complete: manifest.complete,
             stats,
-            artifact,
-            readHint: manifest.readHint,
             reasons,
             error: manifest.error,
         };
-        if (requestedMode === "manifest") return { ...base, mode: "manifest" };
+        const artifactResult = {
+            ...base,
+            artifact,
+            readHint: manifest.readHint,
+        };
+        if (requestedMode === "manifest") return { ...artifactResult, mode: "manifest" };
 
         const autoWithinTokenLimit = stats.combined.estimatedTokens <= this.options.estimatedTokenLimit;
         const autoWithinLineLimit = stats.combined.lines <= this.options.combinedLineLimit;
         if (requestedMode === "auto" && !autoWithinTokenLimit) reasons.push("estimated_token_limit_exceeded");
         if (requestedMode === "auto" && !autoWithinLineLimit) reasons.push("combined_line_limit_exceeded");
-        const shouldTryInline = requestedMode === "inline"
-            || (requestedMode === "auto" && autoWithinTokenLimit && autoWithinLineLimit);
+        const interrupted = manifest.status === "interrupted";
+        const shouldTryInline = !interrupted && (requestedMode === "inline"
+            || (requestedMode === "auto" && autoWithinTokenLimit && autoWithinLineLimit));
+        if (interrupted && (requestedMode === "auto" || requestedMode === "inline")) {
+            reasons.push("interrupted_output_preserved");
+        }
 
         if (shouldTryInline) {
             const contentBudget = this.options.responseByteLimit - this.options.metadataReserveBytes;
@@ -416,14 +423,21 @@ export class OutputDeliveryCollector {
                 const stderr = (await fs.promises.readFile(this.artifactRun.stderrPath)).toString("utf8");
                 if (serializedBytes({ stdout, stderr }) <= contentBudget) {
                     const inlineResult: OutputDeliveryResult = { ...base, mode: "inline", stdout, stderr };
-                    if (serializedBytes(inlineResult) <= this.options.responseByteLimit) return inlineResult;
+                    if (serializedBytes(inlineResult) <= this.options.responseByteLimit) {
+                        try {
+                            await this.artifactRun.discard();
+                            return inlineResult;
+                        } catch {
+                            reasons.push("inline_spool_cleanup_failed");
+                        }
+                    }
                 }
             }
-            reasons.push("response_byte_limit_exceeded");
+            if (!reasons.includes("inline_spool_cleanup_failed")) reasons.push("response_byte_limit_exceeded");
         }
 
         const fileResult: OutputDeliveryResult = {
-            ...base,
+            ...artifactResult,
             mode: "file",
             preview: {
                 stdout: previewFor(stdoutSummary),
@@ -432,7 +446,7 @@ export class OutputDeliveryCollector {
         };
         if (serializedBytes(fileResult) <= this.options.responseByteLimit) return fileResult;
         reasons.push("file_preview_response_limit_exceeded");
-        return { ...base, mode: "manifest" };
+        return { ...artifactResult, mode: "manifest" };
     }
 }
 

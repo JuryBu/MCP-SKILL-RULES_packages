@@ -754,15 +754,15 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 truncated: delivery.mode !== "inline" || displayTruncated,
                 originalBytes: delivery.stats.combined.rawBytes,
                 returnedBytes: Buffer.byteLength(stdoutText + stderrText, "utf-8"),
-                tempFile: delivery.artifact.manifestPath,
+                tempFile: delivery.artifact?.manifestPath ?? null,
                 queueWaitMs: lease.queueWaitMs,
                 deliveryMode: delivery.mode,
-                artifact: delivery.artifact,
+                artifact: delivery.artifact ?? null,
                 outputReasons: delivery.reasons,
                 outputStats: delivery.stats,
                 outputStatus: delivery.status,
                 outputComplete: delivery.complete,
-                outputReadHint: delivery.readHint,
+                outputReadHint: delivery.readHint ?? null,
             };
 
             resolve(result);

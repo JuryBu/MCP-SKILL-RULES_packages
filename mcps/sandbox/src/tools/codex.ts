@@ -335,7 +335,7 @@ function buildResultText(task: CodexTask): string {
         parts.push(stderr);
     }
 
-    if (delivery) {
+    if (delivery?.artifact) {
         parts.push("");
         parts.push(`📦 输出交付: ${delivery.mode} | complete=${delivery.complete} | status=${delivery.status}`);
         parts.push(`  artifactId: ${delivery.artifact.artifactId}`);
@@ -344,7 +344,7 @@ function buildResultText(task: CodexTask): string {
         parts.push(`  stderr: ${delivery.stats.stderr.rawBytes} bytes / ${delivery.stats.stderr.lines} lines / sha256=${delivery.stats.stderr.sha256}`);
         parts.push(`  estimatedTokens: ${delivery.stats.combined.estimatedTokens} | expiresAt: ${delivery.artifact.expiresAt}`);
         if (delivery.reasons.length > 0) parts.push(`  reasons: ${delivery.reasons.join(", ")}`);
-        parts.push(`  readHint: ${delivery.readHint}`);
+        if (delivery.readHint) parts.push(`  readHint: ${delivery.readHint}`);
     }
 
     // 结构化数据摘要
@@ -815,7 +815,7 @@ export function registerCodex(server: McpServer): void {
 - configOverrides: 覆盖配置项（-c 参数），如 model_reasoning_effort=xhigh
 - timeout: 超时(ms)，默认0=无超时
 - cwd: 工作目录
-- maxOutput: MCP 内联响应展示预算，默认1MiB；完整 stdout/stderr 始终保存在 artifact
+- maxOutput: MCP 内联响应展示预算，默认1MiB；普通小输出直接返回，超预算或中断恢复时保留完整 artifact
 
 后台模式（推荐用于长任务）：
 - background: true 启动后立刻返回 taskId，不阻塞
