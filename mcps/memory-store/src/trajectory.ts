@@ -516,12 +516,14 @@ export function parseResponseAnnotations(input: string): ParsedAnnotationMessage
     const annotations: ConversationAnnotation[] = [];
     const warnings: string[] = [];
     let found = false;
-    const text = input.replace(blockPattern, (_block, json: string) => {
+    let parsedBlock = false;
+    let text = input.replace(blockPattern, (_block, json: string) => {
         found = true;
         try {
             const parsed = annotationsFromPayload(JSON.parse(json));
             if (parsed.length > 0) {
                 annotations.push(...parsed);
+                parsedBlock = true;
                 return "";
             }
         } catch {
@@ -532,6 +534,17 @@ export function parseResponseAnnotations(input: string): ParsedAnnotationMessage
     });
     if (!found && input.includes("<response-annotations")) {
         warnings.push("response-annotations 缺少完整结束标记，已保留原文");
+    }
+    if (parsedBlock) {
+        const blockStart = input.search(/<response-annotations>/iu);
+        const prefix = blockStart >= 0 ? input.slice(0, blockStart) : "";
+        const normalizedPrefix = prefix.trim();
+        const isCodexInjectedPreamble = normalizedPrefix.startsWith("# Response annotations:")
+            && normalizedPrefix.includes("Each item contains text selected from an earlier Codex response")
+            && normalizedPrefix.includes("Treat items as Annotation 1");
+        if (isCodexInjectedPreamble && text.startsWith(prefix)) {
+            text = text.slice(prefix.length).trimStart();
+        }
     }
     return { text, annotations, warnings };
 }
@@ -549,7 +562,10 @@ function renderHumanMessageContent(
         lines.push("#### 📝 批注");
         for (const annotation of annotations) {
             lines.push(`- 被批注文本: ${truncateText(annotation.selectedText, depth)}`);
-            lines.push(`  用户评论: ${truncateText(annotation.comment, depth)}`);
+            const comment = annotation.comment.trim()
+                ? truncateText(annotation.comment, depth)
+                : "（未填写）";
+            lines.push(`  用户评论: ${comment}`);
         }
     }
     for (const warning of parsed.warnings) {
