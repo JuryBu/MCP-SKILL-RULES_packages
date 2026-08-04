@@ -173,6 +173,8 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 
 ### Sandbox 优先执行
 
+开始本机搜索、文件处理或命令执行前，先在可用工具中查找 `mcp__sandbox__*`；工具未直接展示时，先在 `functions.exec` 中通过 `ALL_TOOLS` 发现。未完成这一步，或没有一次明确的 Sandbox 不可用、持续异常或能力不适用证据前，不得直接调用 `shell_command`。
+
 本机执行代码搜索、文件与文本处理、Python/Node、测试、批量命令和长任务时，只要 Sandbox 能完成，默认使用 Sandbox。Sandbox 提供统一的并发接纳、内存限制、排队、超时和输出管理，多个对话同时工作时尤其应避免绕过它大量启动原生命令；代码搜索默认使用 Sandbox 的 `smart_search`，隔离执行和批量任务默认使用 `sandbox_exec` / `sandbox_batch`。任务简单、只读、命令更短或 `shell_command` 直接可用，都不构成跳过 Sandbox 的理由。
 
 若 Sandbox 不可用、持续异常，或任务确实依赖交互式终端、当前 Shell 环境变量、危险操作审批等 Sandbox 不适合的能力，可以降级使用原生命令；降级前先确认原因，并控制并发与资源占用，不能机械重复失败调用。
