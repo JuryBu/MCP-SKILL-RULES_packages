@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { DATA_ROOT, writeJsonAtomic, writeJsonAtomicAsync } from "./store.js";
 
-export const CONVERSATION_SOURCE_CACHE_FORMAT = "conversation-source-cache/v1" as const;
+export const CONVERSATION_SOURCE_CACHE_FORMAT = "conversation-source-cache/v2" as const;
 
 export interface ConversationSourceCacheKey {
     source: string;

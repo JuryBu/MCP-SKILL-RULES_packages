@@ -1460,7 +1460,8 @@ export function searchInRounds(
             ]),
         ];
         const seenAiTexts = new Set<string>();
-        for (const aiText of aiTexts) {
+        for (const rawAiText of aiTexts) {
+            const aiText = toSearchableText(rawAiText);
             if (!aiText || seenAiTexts.has(aiText)) continue;
             seenAiTexts.add(aiText);
             const aiLower = aiText.toLowerCase();
@@ -1483,6 +1484,17 @@ export function searchInRounds(
     candidates.sort((a, b) => b.hitCount - a.hitCount || a.roundIndex - b.roundIndex);
 
     return candidates.slice(0, limit);
+}
+
+function toSearchableText(value: unknown): string {
+    if (typeof value === "string") return value;
+    if (value === undefined || value === null) return "";
+    try {
+        const serialized = JSON.stringify(value);
+        return typeof serialized === "string" ? serialized : String(value);
+    } catch {
+        return String(value);
+    }
 }
 
 // ===== 工具函数 =====

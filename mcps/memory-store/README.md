@@ -1,4 +1,4 @@
-# MCP Memory Store v1.22.3
+# MCP Memory Store v1.22.4
 
 AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
@@ -24,6 +24,7 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **四宿主统一 Fetch 缓存与来源控制** (v1.22+)：Codex、Claude Code、Windsurf、Antigravity 统一发布可校验、不可变的 fetch cache generation；Codex/Claude Code 对大 JSONL 流式增量读取，Windsurf/Antigravity 即使 IDE 与 Language Server 均未启动，也能直接解密 active/implicit 本地 PB。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。
 - **大结果可续读与对话语义** (v1.22+)：`read/search` 对约 100K 的结果返回继续位置，不再沿用古老的静默截断；连续人类消息归为同一人类轮，annotations 保留被批注文本与用户评论，子代理明确标注与主线程的角色关系。
 - **离线目录与压缩回溯 Recall** (v1.22.3+)：Windsurf/Antigravity 即使 IDE 与 Language Server 都关闭，也能从 active/implicit PB 元数据列出本地对话；四宿主 fetch cache generation 保存压缩边界元数据。`conversation_read_original(action="recall", recallMode="auto|manual|full")` 会先增量更新 fetch 缓存，再只从同一已提交 generation 恢复人类可见上下文；排除 thinking、工具结果、diff、Rules 注入和压缩摘要。`auto/manual` 继续遵守约 100K 分段交付，`full` 只返回带 SHA256 的临时文件。
+- **旧 fetch 缓存自动迁移** (v1.22.4+)：缓存格式升级为 `conversation-source-cache/v2`，首次访问旧 generation 时自动按原始来源重建；搜索同时安全处理历史对象/数组字段，不再要求调用方先手动 fetch 才能避开 `.toLowerCase()` 类型错误。
 - **Record/Guard 缓存稳定性** (v1.22+)：Record 只使用已校验的不可变 fetch cache generation，不再回读可能达到 2GB 的原始对话文件；为保证 Phase 回滚正确性，会物化完整规范化缓存而非仅保存尾部。Stage Guard 的 `start` 以常数时间 O(1) 建立状态，遵守模型预算并保持稳定 `taskId`，让重试与恢复指向同一任务。
 - **公开文档边界**：公开说明只覆盖可公开协议与行为；固定应用 key 属于本地 PB 格式兼容常量，不作为用户秘密。用户自定义覆盖值、真实样本以及执行 Plan/Task 不会进入 README、CHANGELOG 或 npm 发布包。
 - **Record 自动触发可靠性** (v1.10+)：MCP 退出时等待 pending Record 生成，阈值 5→3 轮

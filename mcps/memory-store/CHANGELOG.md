@@ -2,6 +2,13 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.4] - 2026-08-04
+
+### Fixed
+
+- fetch 缓存格式升级为 `conversation-source-cache/v2`，旧 generation 不再被新版读取器误认为兼容缓存，而是在首次访问时通过现有单航班 fetch 链路规范化重建。
+- `searchInRounds` 会把历史 AI 回复、thinking、工具参数与结果中的对象/数组安全序列化为可搜索文本，修复 `aiText.toLowerCase is not a function`；Codex、Windsurf、Antigravity、Claude Code 共用修复。
+
 ## [1.22.3] - 2026-08-04
 
 ### Added
