@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from "child_process";
+import { execFile, spawn, ChildProcess } from "child_process";
 import { StringDecoder } from "string_decoder";
 import pidusage from "pidusage";
 import { resolveInterpreter } from "./env-detector.js";
@@ -42,6 +42,35 @@ const SESSION_LIMITS: Readonly<SessionLimits> = Object.freeze({
     defaultMemoryMB: readPositiveIntegerEnv("SANDBOX_SESSION_DEFAULT_MEMORY_MB", 256, 16),
     idleTimeoutMs: readPositiveIntegerEnv("SANDBOX_SESSION_IDLE_TIMEOUT_MS", 5 * 60 * 1000, 1000),
 });
+
+async function readProcessMemoryMB(pid: number): Promise<number> {
+    try {
+        const stats = await pidusage(pid);
+        return stats.memory / (1024 * 1024);
+    } catch (error) {
+        if (process.platform !== "win32") throw error;
+        return await new Promise<number>((resolve, reject) => {
+            const command = `[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; (Get-Process -Id ${pid} -ErrorAction Stop).WorkingSet64`;
+            execFile(
+                "powershell.exe",
+                ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                { encoding: "utf8", timeout: 3000, windowsHide: true },
+                (fallbackError, stdout) => {
+                    if (fallbackError) {
+                        reject(fallbackError);
+                        return;
+                    }
+                    const workingSetBytes = Number(String(stdout).trim());
+                    if (!Number.isFinite(workingSetBytes) || workingSetBytes < 0) {
+                        reject(new Error(`Invalid WorkingSet64 for PID ${pid}`));
+                        return;
+                    }
+                    resolve(workingSetBytes / (1024 * 1024));
+                },
+            );
+        });
+    }
+}
 
 const IDLE_CHECK_INTERVAL_MS = Math.max(1000, Math.min(30000, Math.floor(SESSION_LIMITS.idleTimeoutMs / 2)));
 const MEMORY_CHECK_INTERVAL = 5000;     // 5 秒采样
@@ -554,8 +583,7 @@ async function execInSessionUnlocked(
         memoryChecker = setInterval(async () => {
             if (resolved || !session.alive) return;
             try {
-                const stats = await pidusage(session.pid);
-                session.currentMemoryMB = stats.memory / (1024 * 1024);
+                session.currentMemoryMB = await readProcessMemoryMB(session.pid);
                 session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
                 if (session.currentMemoryMB > session.maxMemoryMB) {
                     terminate("memory");
@@ -590,11 +618,12 @@ export async function getSessionStatus(sessionId: string): Promise<SessionStatus
     // 更新内存信息
     if (session.alive) {
         try {
-            const stats = await pidusage(session.pid);
-            session.currentMemoryMB = stats.memory / (1024 * 1024);
+            session.currentMemoryMB = await readProcessMemoryMB(session.pid);
             session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
         } catch {
-            session.alive = false;
+            if (session.process.exitCode !== null || session.process.signalCode !== null) {
+                session.alive = false;
+            }
         }
     }
 
