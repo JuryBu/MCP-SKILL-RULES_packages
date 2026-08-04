@@ -171,6 +171,12 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 
 并行主要减少工具往返、模型接管轮次和等待时间，并不会自动减少工具返回内容；应同时限制查询范围和输出量，不能为追求并行重复调用、扩大输出或制造竞态。
 
+### Sandbox 优先执行
+
+本机执行代码搜索、文件与文本处理、Python/Node、测试、批量命令和长任务时，优先使用 Sandbox。Sandbox 提供统一的并发接纳、内存限制、排队、超时和输出管理，多个对话同时工作时尤其应避免绕过它大量启动原生命令；代码搜索优先使用 Sandbox 的 `smart_search`，隔离执行和批量任务优先使用 `sandbox_exec` / `sandbox_batch`。
+
+若 Sandbox 不可用、持续异常，或任务确实依赖交互式终端、当前 Shell 环境变量、危险操作审批等 Sandbox 不适合的能力，可以降级使用原生命令；降级前先确认原因，并控制并发与资源占用，不能机械重复失败调用。
+
 ### MCP broker
 
 Codex 侧 MCP 通过 HTTP broker（`127.0.0.1:14588`）暴露。broker 后端进程是共享的，不具备每对话独立的「当前对话」状态。
@@ -235,9 +241,6 @@ Codex 侧以下操作优先用后台模式：
 ### 其他工具
 
 - 复杂推理、多方案比较、长链分析：优先 `sequential-thinking`。Codex 不输出思考过程，需要深度思考时尽量用 `sequential-thinking` 进行推理，不要在回复里直接「想」
-- ⚠️ **sandbox 必须代替 PowerShell**：Python/Node 代码执行、文件操作、文本处理**必须**用 `sandbox_exec`/`sandbox_batch`，**禁止**用 PowerShell `Ran command` 跑 Python 脚本。PowerShell 的中文路径编码（`????`）、GBK 输出乱码、正则转义双重问题会反复浪费大量时间调试。只有以下场景才用原生 shell：需要用户审批的危险操作（`run_command`）、需要交互式输入、需要访问当前 shell 环境变量
-- 隔离执行、持久会话、并行执行或长任务托管：优先 `sandbox`
-- 代码搜索：优先用 sandbox 的 `smart_search`（exact/fuzzy/smart 三模式，exact 模式底层就是 rg 但有更好的输出处理），不要自己在 sandbox 里手动跑 rg 或 grep
 - 产出文件（Word/PPT/HTML/PDF 等）必须用 web-fetcher 截图做视觉检查，不能只看代码觉得对就交付
 - docx/pptx/xlsx/pdf 任务先读对应 skill 的 SKILL.md 再动手
 - PPT/PPTX 验收不得只依赖生成脚本或 PDF 转换；应优先用 web-fetcher 直接打开 .pptx 做每页截图，并按需用 `web_inspect` 检查结构、重叠、溢出、可读性
