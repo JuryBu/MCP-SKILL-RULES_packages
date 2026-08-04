@@ -2,6 +2,13 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.2] - 2026-08-04
+
+### Fixed
+
+- Windsurf 与 Antigravity 本地 PB 在未配置显式覆盖密钥时使用稳定的应用密钥，关闭 IDE 与 Language Server 后仍可独立完成解密、fetch 与后续缓存读取。
+- `source="local"`、`source="ls"` 与 `source="auto"` 发布到同一个宿主级 fetch 缓存入口，`source="cache"` 始终读取最近一次成功 fetch 的 generation，不再命中按来源分裂的旧缓存。
+
 ## [1.22.1] - 2026-08-04
 
 ### Fixed

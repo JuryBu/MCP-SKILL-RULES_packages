@@ -125,12 +125,14 @@ interface ProtoMessage {
 }
 
 const DEFAULT_KEY_ENV = "MEMORY_STORE_LOCAL_PB_KEY";
+const DEFAULT_APPLICATION_KEY = "safeCodeiumworldKeYsecretBalloon";
 const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
 
 /**
  * Reads a nonce-prefixed AES-256-GCM payload. The layout is exactly
- * nonce[12] + ciphertext + tag[16]; keys are never discovered or embedded.
+ * nonce[12] + ciphertext + tag[16]. The application key works offline;
+ * an explicit key or environment override remains available for compatibility.
  */
 export function decryptLocalPb(encrypted: Uint8Array, options: LocalPbReaderOptions): Uint8Array {
     if (encrypted.byteLength < 28) {
@@ -220,7 +222,8 @@ export function readLocalPbCandidates(candidates: LocalPbCandidate[], options: L
 }
 
 function resolveKey(options: LocalPbReaderOptions): Buffer {
-    const supplied = options.key ?? (options.env ?? process.env)[options.keyEnv ?? DEFAULT_KEY_ENV];
+    const environmentKey = (options.env ?? process.env)[options.keyEnv ?? DEFAULT_KEY_ENV];
+    const supplied = options.key ?? environmentKey ?? (options.keyEnv ? undefined : DEFAULT_APPLICATION_KEY);
     if (supplied === undefined || supplied === "") {
         throw new LocalPbReaderError("MISSING_KEY", `Local PB key is required through options.key or ${options.keyEnv ?? DEFAULT_KEY_ENV}`);
     }

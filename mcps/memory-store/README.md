@@ -1,4 +1,4 @@
-# MCP Memory Store v1.22.1
+# MCP Memory Store v1.22.2
 
 AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
@@ -21,10 +21,10 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **进程生命周期容错** (v1.7+)：ppid 连续 3 次失败容错 + stdin 断裂诊断增强 + 非 LS 环境 1h 空闲超时兜底
 - **对话记录 Record** (v1.8+ / 持久调度 v1.20+)：模型自动生成对话过程日志，抗 LS 过期，超长 prompt 分批处理；更新会冻结来源快照并物化为 Task → Record → Unit → Attempt，持久 scheduler 负责公平排队、取消、崩溃恢复和多步提交，同一逻辑 revision 由 Record work registry 去重
 - **Stage Guard 任务完整性验证** (v1.9+ / 多实例 v1.19.2+)：四层防御网（RULES + 工具提醒 + 🔒标记 + 用户审计），审核模型比对 Plan/Task vs 执行记录。GuardKey 由 conversationId + stageId + childScopeId 组成，每次 start 生成不可变 guardId；同一 Task 可并存多个 Guard，pass/cancel/force 只处理目标实例。子任务用 scopeSelectors 定义局部审核范围，status(listAll=true) 不读取对话即可列出全部活跃 Guard。
-- **四宿主统一 Fetch 缓存与来源控制** (v1.22+)：Codex、Claude Code、Windsurf、Antigravity 统一发布可校验、不可变的 fetch cache generation；Codex/Claude Code 对大 JSONL 流式增量读取，Windsurf/Antigravity 以本地 PB 为一等来源。`source=auto|local|ls|cache` 可明确来源，`cache` 只读取已发布的完整缓存。
+- **四宿主统一 Fetch 缓存与来源控制** (v1.22+)：Codex、Claude Code、Windsurf、Antigravity 统一发布可校验、不可变的 fetch cache generation；Codex/Claude Code 对大 JSONL 流式增量读取，Windsurf/Antigravity 即使 IDE 与 Language Server 均未启动，也能直接解密 active/implicit 本地 PB。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。
 - **大结果可续读与对话语义** (v1.22+)：`read/search` 对约 100K 的结果返回继续位置，不再沿用古老的静默截断；连续人类消息归为同一人类轮，annotations 保留被批注文本与用户评论，子代理明确标注与主线程的角色关系。
 - **Record/Guard 缓存稳定性** (v1.22+)：Record 只使用已校验的不可变 fetch cache generation，不再回读可能达到 2GB 的原始对话文件；为保证 Phase 回滚正确性，会物化完整规范化缓存而非仅保存尾部。Stage Guard 的 `start` 以常数时间 O(1) 建立状态，遵守模型预算并保持稳定 `taskId`，让重试与恢复指向同一任务。
-- **公开文档边界**：公开说明只覆盖可公开协议与行为，私有 PB key、真实样本以及执行 Plan/Task 不会进入 README、CHANGELOG 或 npm 发布包。
+- **公开文档边界**：公开说明只覆盖可公开协议与行为；固定应用 key 属于本地 PB 格式兼容常量，不作为用户秘密。用户自定义覆盖值、真实样本以及执行 Plan/Task 不会进入 README、CHANGELOG 或 npm 发布包。
 - **Record 自动触发可靠性** (v1.10+)：MCP 退出时等待 pending Record 生成，阈值 5→3 轮
 - **Record Reader 读侧治理** (v1.12+)：Record markdown 仍是唯一事实源；新增 reader index、结构化 `read`、block 级 `search`、带来源 `guide`，支持只读 outline/state/outputs/phase 等局部内容，避免 70KB-100KB Record 每次整篇塞进上下文。
 - **Record Reader 归属治理** (v1.12+)：`scope="workspace"` 严格只读指定工作区，`includeGeneral=true` 才显式兼容旧的 workspace + general 读法；新增 `audit_ownership` / `repair_ownership(dryRun=true)`，按 Antigravity `workspaceUri`、Codex `cwd`、子线程 parent/root 派生关系和同 ID 副本检测归属，不根据标题或正文语义猜测。

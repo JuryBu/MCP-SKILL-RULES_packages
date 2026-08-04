@@ -670,13 +670,7 @@ function conversationSourceCacheKey(
         : resolved === "claude-code"
             ? `:logical=${options.logicalChain || "off"}`
             : "";
-    const origin = (resolved === "antigravity" || resolved === "windsurf")
-        && options.source !== undefined
-        && options.source !== "auto"
-        && options.source !== "cache"
-        ? `:origin=${options.source}`
-        : "";
-    return { source: `${resolved}${variant}${origin}`, conversationId };
+    return { source: `${resolved}${variant}`, conversationId };
 }
 
 function fileFingerprint(filePath: string | undefined): ConversationSourceFingerprint | null {
