@@ -10,6 +10,8 @@ export interface CodexFetchWorkerPayload {
     sourcePath: string;
     sourceSize: number;
     sourceMtimeMs: number;
+    anchorStartByte: number;
+    anchorSha256: string;
     artifactBucket: number;
     modelChain: Chain;
 }
@@ -109,6 +111,11 @@ export function isCodexFetchWorkerPayload(value: unknown): value is CodexFetchWo
         && payload.sourcePath.length > 0
         && Number.isFinite(payload.sourceSize)
         && Number.isFinite(payload.sourceMtimeMs)
+        && typeof payload.anchorStartByte === "number"
+        && Number.isSafeInteger(payload.anchorStartByte)
+        && payload.anchorStartByte >= 0
+        && typeof payload.anchorSha256 === "string"
+        && /^[a-f0-9]{64}$/u.test(payload.anchorSha256)
         && Number.isInteger(payload.artifactBucket)
         && ["auto", "antigravity", "codex", "claude-code", "grok", "agy"].includes(payload.modelChain || "");
 }

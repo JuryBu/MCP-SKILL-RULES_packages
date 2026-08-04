@@ -313,7 +313,13 @@ async function loadFromResolvedChain(
     const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass);
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
         key,
-        fingerprint: freshness.fingerprint,
+        fingerprint: options.expectedCodexSource
+            ? {
+                path: options.expectedCodexSource.sourcePath,
+                size: options.expectedCodexSource.sourceSize,
+                mtime: options.expectedCodexSource.sourceMtimeMs,
+            }
+            : freshness.fingerprint,
         refresh: options.forceRawCacheRebuild === true
             || (options.refresh === true && (resolved === "antigravity" || resolved === "windsurf")),
         assertPublishable: resolved === "codex" && options.expectedCodexSource
@@ -474,6 +480,8 @@ async function tryBuildIncrementalConversation(
         const tail = await readCodexRoundTail(rolloutPath, options.link || "summary", {
             checkpoint,
             cwd: oldData.thread.cwd,
+            endByte: options.expectedCodexSource?.sourceSize,
+            sourceMtimeMs: options.expectedCodexSource?.sourceMtimeMs,
         });
         if (tail.status === "unchanged") {
             const spool = createConversationSourceCacheRoundSpool<ConversationRound>({

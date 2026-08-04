@@ -2,6 +2,14 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.1] - 2026-08-04
+
+### Fixed
+
+- `conversation_read_original(search)` 将 response annotations 的被批注文本与用户评论分别建立命中项，返回单条 Annotation、命中字段和有限片段，不再因一个批注命中展开整个父轮。
+- 补齐 malformed annotations 原文回退、`messageRoles=["subagent"]` 文档、四端 Rules 安装语义与 Plan_39 收尾状态。
+- 巨型活动 Codex 对话后台 fetch 固定读取启动时的字节快照；源文件仅向尾部追加时允许发布该完整快照，截断、替换或旧前缀锚点变化时仍拒绝发布并保留上一代缓存。
+
 ## [1.22.0] - 2026-08-03
 
 ### Changed

@@ -1,4 +1,4 @@
-# MCP Memory Store v1.22.0
+# MCP Memory Store v1.22.1
 
 AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
@@ -54,7 +54,7 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **Conversation 工作区过滤范围与长标题展示治理** (v1.15.8+)：`conversation_read_original(list/export)` 新增 `workspaceScope="any|primary"`。默认 `any` 保持旧行为，会匹配主工作区和关联工作区；`primary` 只匹配对话主工作区，适合排除 WSF 跨项目引用导致的误命中。列表展示中的超长 App 标题会被折叠为短标题并标记 `[titleTruncated]`，搜索、读取和导出的原始数据不受影响。
 - **Codex 子代理线程标注** (v1.15.9+)：Codex 子代理线程在 `conversation_read_original(list)` 中显示为 `子代理对话(role)：...`，候选 detail 会标出 `parentConversationId`；直接 `fetch/read/search` 子代理线程时会在头部提示源头对话 ID 与源头标题。Claude Code 与 Windsurf 子代理不作为独立对话强行标注。
 - **Claude Code 加密思考占位** (v1.15.10+)：Claude Code JSONL 中 `thinking=""` 但存在 `signature` 的加密思考块，在 `read(depth="full", extraTypes=["thinking"])` 中会显示 `🔒 加密思考块 step N：thinking 为空，signature 存在，明文不可读`；完整 signature 不输出，也不会进入 contextProbe、deep_locate、Record、Guard 或 Golden Extract 的正文材料。
-- **Conversation 主子线程定位与角色过滤** (v1.15.11+)：`conversation_read_original(list/export)` 支持 `threadMode="main|children|all"`、`parentConversationId`、`parentQuery`。默认 `main` 只返回主线程；若标题命中 Codex 子代理线程，会回指父线程并标注 `matchedChildConversationId`。`read` 支持 `messageRoles=["user","system","model","assistant","tool"]`，可只读用户消息、系统/压缩摘要、模型回复或工具证据。
+- **Conversation 主子线程定位与角色过滤** (v1.15.11+)：`conversation_read_original(list/export)` 支持 `threadMode="main|children|all"`、`parentConversationId`、`parentQuery`。默认 `main` 只返回主线程；若标题命中 Codex 子代理线程，会回指父线程并标注 `matchedChildConversationId`。`read` 支持 `messageRoles=["user","system","model","assistant","tool","subagent"]`；`user` 只读真实用户消息与结构化批注，`subagent` 单独读取子代理事件，不把它们混入人类轮。
 - **Codex 标题全量轻量定位与 Record 写入门禁** (v1.15.11+)：Codex 标题/ID/工作区/来源查询使用 `session_index.jsonl` 等轻量元数据，不再被最近 300 条正文候选限制；`record_manage(update/batch_update/bulk_update)` 与自动后台 Record 写入前会统一拒绝 `0 Phase`、覆盖轮次不足、异常缩水或 Phase 范围重叠的候选，候选保存到 `memory-store/temp`，旧正式 Record 保持不变。
 - **Record 手动补充保护误判修正** (v1.15.12+)：Local Compose 仍严格保留旧 `[手动补充]` 内容；质量检查比较前会忽略历史重复列表编号，避免 `9. 3.` 与 `1.` 这种编号变化被误判为内容丢失。
 - **Conversation list 多词查询修正** (v1.15.13+)：`conversation_read_original(list/export)` 在标题、ID、工作区、主/子线程等轻量元数据定位中，会把空格分开的 `query` 词按“或”匹配；完整 ID、短 ID 前缀和完整标题仍优先排序。若要搜正文片段，仍使用 `search` 或 `deep_locate`，避免同步 `list` 扫超长原文。
@@ -227,7 +227,7 @@ Codex / Claude Code / Windsurf 侧通过共享后端、本地 JSONL 或只读 LS
 
 主/子线程查询可用 `threadMode` 控制：默认 `main` 只返回主线程；`children` 需要 `parentConversationId`，或用 `parentQuery` 唯一定位父线程后列出子线程；`all` 显式混合返回主线程与子线程。Codex 会使用结构化 `thread_spawn_edges`，不会按标题语义猜测父子关系。
 
-按消息角色读取可用 `conversation_read_original(action="read", messageRoles=[...])`：`user` 只读用户消息，`model`/`assistant` 只读模型回复，`tool` 只读工具调用、文件视图和代码动作，`system` 只读压缩摘要、规则注入占位和系统类轮次。未传 `messageRoles` 时保持旧的完整轮次格式。
+按消息角色读取可用 `conversation_read_original(action="read", messageRoles=[...])`：`user` 只读真实用户消息与结构化批注，`model`/`assistant` 只读模型回复，`tool` 只读工具调用、文件视图和代码动作，`system` 只读压缩摘要、规则注入占位和系统类轮次，`subagent` 只读带昵称、对话 ID 和原始来源角色的子代理事件。未传 `messageRoles` 时保持完整轮次格式；搜索命中批注时返回单条 Annotation 和命中字段，不展开整个父轮。
 
 常用参数：
 

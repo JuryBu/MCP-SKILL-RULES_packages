@@ -505,7 +505,7 @@ function annotationsFromPayload(payload: unknown): ConversationAnnotation[] {
         if (!item || typeof item !== "object") return [];
         const record = item as Record<string, unknown>;
         const selectedText = readAnnotationText(record, ["selectedText", "selected_text", "selected", "quote", "text"]);
-        const comment = readAnnotationText(record, ["comment", "feedback", "note", "message"]);
+        const comment = readAnnotationText(record, ["comment", "annotation", "feedback", "note", "message"]);
         return selectedText || comment ? [{ selectedText, comment }] : [];
     });
 }
@@ -1351,10 +1351,14 @@ export function saveConversationToTemp(
 
 interface SearchResult {
     roundIndex: number;
-    matchType: "user" | "ai";
+    matchType: "user" | "ai" | "annotation";
     matchText: string;        // 匹配的文本片段
     contextStart: number;     // 上下文起始位置（字符）
     hitCount: number;         // 命中的 token 数量（用于排序）
+    annotationIndex?: number;
+    annotationField?: "selectedText" | "comment";
+    annotationSelectedText?: string;
+    annotationComment?: string;
 }
 
 /**
@@ -1375,7 +1379,42 @@ export function searchInRounds(
     const candidates: SearchResult[] = [];
 
     for (const round of rounds) {
-        const userLower = round.userMessage.toLowerCase();
+        const userTexts: string[] = [];
+        const seenAnnotations = new Set<string>();
+        let annotationIndex = 0;
+        for (const message of getRoundUserMessages(round)) {
+            const parsed = parseResponseAnnotations(message.text || "");
+            if (parsed.text.trim()) userTexts.push(parsed.text);
+            for (const annotation of [...parsed.annotations, ...(message.annotations || [])]) {
+                const annotationKey = `${annotation.selectedText}\u0000${annotation.comment}`;
+                if (seenAnnotations.has(annotationKey)) continue;
+                seenAnnotations.add(annotationKey);
+                annotationIndex += 1;
+                for (const [field, value] of [
+                    ["selectedText", annotation.selectedText],
+                    ["comment", annotation.comment],
+                ] as const) {
+                    const valueLower = value.toLowerCase();
+                    const annotationHits = tokens.filter(token => valueLower.includes(token));
+                    if (annotationHits.length === 0) continue;
+                    const firstToken = annotationHits[0];
+                    const idx = valueLower.indexOf(firstToken);
+                    candidates.push({
+                        roundIndex: round.roundIndex,
+                        matchType: "annotation",
+                        matchText: extractContext(value, idx, firstToken.length, 100),
+                        contextStart: idx,
+                        hitCount: annotationHits.length,
+                        annotationIndex,
+                        annotationField: field,
+                        annotationSelectedText: annotation.selectedText,
+                        annotationComment: annotation.comment,
+                    });
+                }
+            }
+        }
+        const userText = userTexts.join("\n");
+        const userLower = userText.toLowerCase();
 
         // 搜索用户消息
         const userHits = tokens.filter(t => userLower.includes(t));
@@ -1386,7 +1425,7 @@ export function searchInRounds(
             candidates.push({
                 roundIndex: round.roundIndex,
                 matchType: "user",
-                matchText: extractContext(round.userMessage, idx, firstToken.length, 100),
+                matchText: extractContext(userText, idx, firstToken.length, 100),
                 contextStart: idx,
                 hitCount: userHits.length,
             });

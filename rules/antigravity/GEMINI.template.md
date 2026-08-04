@@ -50,6 +50,7 @@ Codex 轮询：sandbox_codex(action="check") 建议 30-60s 间隔
 大文件操作：超过 100 行的 Plan/Task 文件修改时用精确行号替换，100 行以内可全文重写
 记忆恢复：批量查询用 depth=summary 级别概览，重要单条可直接 depth=full
 conversation_read_original：`fetch` 负责建立或更新可复用的规范化缓存，后续 search/read/full/diff 都从同一份缓存派生，不重复解析原始源。单次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默丢内容；`maxBytes` 仍可显式收紧或放宽。
+批注与子代理语义：`messageRoles=["user"]` 只含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取子代理事件；批注搜索返回命中的单条 Annotation、命中字段和有限片段，不展开整个父轮。
 
 关于上下文恢复的工具优先级
 跨对话上下文恢复优先使用 MCP memory-store，而非系统内置的 persistent_context 机制。

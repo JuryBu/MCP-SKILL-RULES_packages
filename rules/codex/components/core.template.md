@@ -281,6 +281,8 @@ MCP memory-store 是跨对话持久化知识的主要方式：
 
 `fetch` 负责建立或更新四宿主共用结构的持久规范化缓存，后续 search/read/full/diff 都从该缓存派生，不重复解析原始 JSONL/PB。`source="auto|local|ls|cache"` 可选择原始来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默省略。
 
+`messageRoles=["user"]` 只包含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取带昵称、对话 ID 和来源角色的子代理事件；批注搜索返回命中的单条 Annotation、命中字段和有限片段，不展开整个父轮。
+
 Codex 链路特性：`read(startRound, endRound)` 按轮次精读，`depth="full"` + `extraTypes` 展开 reasoning/工具结果/code diff，`link` 控制子代理引用展开方式（参数详见工具描述）。子代理关闭后仍可读取其内容。读取对话原文时遇到图片路径，有必要就主动查看对应图片内容，不要只报路径不看图。
 
 ## web-fetcher

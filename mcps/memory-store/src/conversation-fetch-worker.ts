@@ -1,6 +1,6 @@
 import process from "node:process";
-import fs from "node:fs";
 import { loadConversationData } from "./conversation-bridge.js";
+import { assertCodexSourceVersion } from "./codex-client.js";
 import { writeFetchedConversationArtifact } from "./conversation-fetch-artifact.js";
 import {
     createCodexFetchWorkerLinkDiagnostics,
@@ -24,19 +24,7 @@ function send(message: CodexFetchWorkerMessage): Promise<void> {
 
 async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWorkerResult> {
     const assertSourceCurrent = async (stage: string): Promise<void> => {
-        let stat: fs.Stats;
-        try {
-            stat = await fs.promises.stat(payload.sourcePath);
-        } catch {
-            throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
-        }
-        if (
-            !stat.isFile()
-            || stat.size !== payload.sourceSize
-            || Math.trunc(stat.mtimeMs) !== Math.trunc(payload.sourceMtimeMs)
-        ) {
-            throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
-        }
+        await assertCodexSourceVersion(payload.sourcePath, payload, stage);
     };
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
     await assertSourceCurrent("before cache build");
@@ -55,6 +43,8 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
             sourcePath: payload.sourcePath,
             sourceSize: payload.sourceSize,
             sourceMtimeMs: payload.sourceMtimeMs,
+            anchorStartByte: payload.anchorStartByte,
+            anchorSha256: payload.anchorSha256,
         },
     });
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");

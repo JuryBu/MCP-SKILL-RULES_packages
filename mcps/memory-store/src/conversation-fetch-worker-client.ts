@@ -2,7 +2,7 @@ import { fork } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getCodexThread } from "./codex-client.js";
+import { assertCodexSourceVersionSync, captureCodexSourceVersion, getCodexThread } from "./codex-client.js";
 import { stableJsonHash, type BackgroundTaskContext } from "./background-tasks.js";
 import type { Chain } from "./chain.js";
 import type { CodexFetchWorkerMessage, CodexFetchWorkerPayload, CodexFetchWorkerResult } from "./conversation-fetch-worker-types.js";
@@ -20,6 +20,8 @@ export interface CodexFetchWorkEstimate {
     sourcePath: string;
     sourceSize: number;
     sourceMtimeMs: number;
+    anchorStartByte: number;
+    anchorSha256: string;
     thresholdBytes: number;
     shouldBackground: boolean;
 }
@@ -28,15 +30,12 @@ export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEs
     const thread = getCodexThread(conversationId);
     if (!thread?.rolloutPath) return null;
     try {
-        const stat = fs.statSync(thread.rolloutPath);
-        if (!stat.isFile()) return null;
+        const sourceVersion = captureCodexSourceVersion(thread.rolloutPath);
         const thresholdBytes = readThreshold();
         return {
-            sourcePath: path.resolve(thread.rolloutPath),
-            sourceSize: stat.size,
-            sourceMtimeMs: Math.trunc(stat.mtimeMs),
+            ...sourceVersion,
             thresholdBytes,
-            shouldBackground: stat.size >= thresholdBytes,
+            shouldBackground: sourceVersion.sourceSize >= thresholdBytes,
         };
     } catch {
         return null;
@@ -59,6 +58,8 @@ export function createCodexFetchWorkerPayload(input: {
         sourcePath: input.estimate.sourcePath,
         sourceSize: input.estimate.sourceSize,
         sourceMtimeMs: input.estimate.sourceMtimeMs,
+        anchorStartByte: input.estimate.anchorStartByte,
+        anchorSha256: input.estimate.anchorSha256,
         artifactBucket: Math.floor((input.now ?? Date.now()) / CODEX_FETCH_ARTIFACT_BUCKET_MS),
         modelChain: input.modelChain,
     };
@@ -91,14 +92,7 @@ export function runCodexFetchWorker(
             : "conversation fetch worker stopped before start after task settlement"));
     }
     try {
-        const stat = fs.statSync(payload.sourcePath);
-        if (
-            !stat.isFile()
-            || stat.size !== payload.sourceSize
-            || Math.trunc(stat.mtimeMs) !== Math.trunc(payload.sourceMtimeMs)
-        ) {
-            throw new Error("Codex source changed before worker start; start a fresh fetch");
-        }
+        assertCodexSourceVersionSync(payload.sourcePath, payload, "before worker start");
     } catch (error) {
         return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }

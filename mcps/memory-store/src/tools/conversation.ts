@@ -1641,6 +1641,26 @@ function formatConversationSearchDelivery(text: string, roundIndices: number[]):
     return `${text.slice(0, headEnd)}${omittedNote}${text.slice(tailStart)}`;
 }
 
+function truncateAnnotationSearchField(text: string, maxCodePoints: number): string {
+    const codePoints = Array.from(text);
+    return codePoints.length <= maxCodePoints
+        ? text
+        : `${codePoints.slice(0, maxCodePoints).join("")}…`;
+}
+
+function formatAnnotationSearchMatch(match: ReturnType<typeof searchInRounds>[number]): string {
+    const field = match.annotationField === "comment" ? "用户评论" : "被批注文本";
+    const selectedText = truncateAnnotationSearchField(match.annotationSelectedText || "", 1_200);
+    const comment = truncateAnnotationSearchField(match.annotationComment || "", 1_200);
+    return [
+        `## 轮次 ${match.roundIndex} · Annotation ${match.annotationIndex || 1}`,
+        `- 命中字段: ${field}`,
+        `- 命中片段: ${match.matchText}`,
+        `- 被批注文本: ${selectedText}`,
+        `- 用户评论: ${comment}`,
+    ].join("\n");
+}
+
 function formatBytes(bytes: number): string {
     if (!Number.isFinite(bytes) || bytes < 0) return "0B";
     if (bytes < 1024) return `${bytes}B`;
@@ -2884,10 +2904,17 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     const output: string[] = [];
                     output.push(`🔍 搜索 "${query}" — 命中 ${matches.length} 处\n`);
 
+                    const annotationMatches = matches.filter(match => match.matchType === "annotation");
+                    const roundMatches = matches.filter(match => match.matchType !== "annotation");
+                    for (const match of annotationMatches) {
+                        output.push(formatAnnotationSearchMatch(match));
+                        output.push("");
+                    }
+
                     // 收集需要展示的轮次（去重 + 上下文）
                     const roundsToShow = new Set<number>();
                     const totalRoundCount = loaded.roundCount ?? rounds.length;
-                    for (const m of matches) {
+                    for (const m of roundMatches) {
                         const ctx = contextRounds ?? 1;
                         for (let r = Math.max(1, m.roundIndex - ctx); r <= Math.min(totalRoundCount, m.roundIndex + ctx); r++) {
                             roundsToShow.add(r);
@@ -2913,7 +2940,8 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     });
                     if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
 
-                    let text = formatConversationSearchDelivery(output.join("\n"), sortedRounds);
+                    const matchedRoundIndices = matches.map(match => match.roundIndex);
+                    let text = formatConversationSearchDelivery(output.join("\n"), matchedRoundIndices);
                     text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
 
                     return appendTiming({
