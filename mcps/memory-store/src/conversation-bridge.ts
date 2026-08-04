@@ -34,6 +34,11 @@ import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable, listLiveAntigravityConversationIds } from "./ls-client.js";
 import { setCurrentContext } from "./conversation-router.js";
 import { mergeConsecutiveHumanRounds, parseRounds, type ConversationRound } from "./trajectory.js";
+import {
+    buildConversationCompactionMetadata,
+    projectConversationRoundForRecallMetadata,
+    type ConversationCompactionMetadata,
+} from "./conversation-recall.js";
 import { projectConversationRoundForRecord } from "./conversation-record-projection.js";
 import {
     readCachedConversationSourceCacheRounds,
@@ -83,11 +88,13 @@ export interface ConversationLoadResult {
     cacheKey?: ConversationSourceCacheKey;
     cacheGeneration?: string;
     cacheState?: "hit" | "built" | "stale";
+    cacheCreatedAt?: string;
     cacheBuildFailure?: ConversationSourceCacheBuildFailure;
     cacheFingerprint?: ConversationSourceFingerprint | null;
     sourceMode?: ConversationRawSource;
     sourceDiagnostics?: string[];
     sourceRevision?: SourceRevision;
+    compactionMetadata?: ConversationCompactionMetadata;
 }
 
 type ConversationCacheAuthority = Extract<ConversationRawSource, "local" | "ls">;
@@ -97,8 +104,11 @@ interface CachedConversationLoadResult extends ConversationLoadResult {
 }
 
 function compactConversationCacheSnapshot(loaded: CachedConversationLoadResult): CachedConversationLoadResult {
+    const compactionMetadata = loaded.compactionMetadata
+        || buildConversationCompactionMetadata(loaded.chainUsed, loaded.rounds);
     return {
         ...loaded,
+        compactionMetadata,
         rounds: [],
         ...(loaded.codexData ? { codexData: { ...loaded.codexData, rounds: [] } } : {}),
         ...(loaded.claudeCodeData ? { claudeCodeData: { ...loaded.claudeCodeData, rounds: [] } } : {}),
@@ -132,6 +142,7 @@ interface ConversationLoadOptions {
     forceRawCacheRebuild?: boolean;
     isCancelled?: () => boolean;
     expectedCodexSource?: CodexSourceVersionExpectation;
+    requireCompactionMetadata?: boolean;
 }
 
 function throwIfConversationLoadCancelled(options: Pick<ConversationLoadOptions, "isCancelled">): void {
@@ -310,6 +321,11 @@ async function loadFromResolvedChain(
 
     const previous = readCachedConversationSourceCache<CachedConversationLoadResult>({ key });
     const buildPrevious = options.forceRawCacheRebuild ? undefined : previous;
+    const requiresMetadataRefresh = Boolean(
+        options.requireCompactionMetadata
+        && previous
+        && previous.snapshot.compactionMetadata?.version !== 1,
+    );
     const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass);
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
         key,
@@ -321,6 +337,7 @@ async function loadFromResolvedChain(
             }
             : freshness.fingerprint,
         refresh: options.forceRawCacheRebuild === true
+            || requiresMetadataRefresh
             || (options.refresh === true && (resolved === "antigravity" || resolved === "windsurf")),
         assertPublishable: resolved === "codex" && options.expectedCodexSource
             ? () => assertCodexSourceVersion(options.expectedCodexSource!.sourcePath, options.expectedCodexSource, "before cache publication")
@@ -335,6 +352,7 @@ async function loadFromResolvedChain(
                 });
                 let aiResponseCount = 0;
                 let toolCallCount = 0;
+                const recallMetadataRounds: ConversationRound[] = [];
                 const revisionAccumulator = createCodexSourceRevisionAccumulator();
                 try {
                     const streamedLink = options.link === "reference" ? "reference" : "summary";
@@ -343,6 +361,7 @@ async function loadFromResolvedChain(
                         (round) => {
                             throwIfConversationLoadCancelled(options);
                             spool.append(round);
+                            recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
                             revisionAccumulator.addRound(round);
                             aiResponseCount += round.aiResponses.length;
                             toolCallCount += round.toolCalls.length;
@@ -369,6 +388,7 @@ async function loadFromResolvedChain(
                                 : null,
                         ),
                         codexData: { ...codexData, rounds: [] },
+                        compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
                         sourceDiagnostics: [`Codex JSONL 已流式规范化为 fetch 缓存，共 ${preparedRounds.roundCount} 轮/${codexData.totalSteps} 步`],
                     };
                     return { snapshot, preparedRounds };
@@ -401,7 +421,7 @@ async function loadFromResolvedChain(
         getRoundNumber: (round, index) => round.roundIndex || index + 1,
         projectRecordRound: projectConversationRoundForRecord,
     });
-    return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, source, options, cached.roundCount, cached.buildFailure);
+    return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, source, options, cached.roundCount, cached.buildFailure, cached.createdAt);
 }
 
 export async function rebuildConversationCacheForRecord(
@@ -427,6 +447,8 @@ export async function rebuildConversationCacheForRecord(
             "cache",
             { includeRounds: false },
             cached.roundCount,
+            undefined,
+            cached.createdAt,
         );
         if (reused) return reused;
     }
@@ -491,6 +513,7 @@ async function tryBuildIncrementalConversation(
             });
             let aiResponseCount = 0;
             let toolCallCount = 0;
+            const recallMetadataRounds: ConversationRound[] = [];
             const revisionAccumulator = createCodexSourceRevisionAccumulator();
             try {
                 const cachedRounds = iterateCachedConversationSourceCacheRounds<ConversationRound>({
@@ -500,6 +523,7 @@ async function tryBuildIncrementalConversation(
                 if (!cachedRounds) throw new Error("Codex 增量更新无法读取上一代 fetch 缓存");
                 for (const round of cachedRounds.rounds) {
                     spool.append(round);
+                    recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
                     revisionAccumulator.addRound(round);
                     aiResponseCount += round.aiResponses.length;
                     toolCallCount += round.toolCalls.length;
@@ -517,6 +541,7 @@ async function tryBuildIncrementalConversation(
                 toolCallCount,
                 sourceRevision: revisionAccumulator.finish(Math.floor(checkpoint.sourceMtimeMs)),
                 codexData: { ...oldData, rounds: [] },
+                compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
             };
             return { snapshot, preparedRounds };
         }
@@ -528,9 +553,11 @@ async function tryBuildIncrementalConversation(
         });
         let aiResponseCount = 0;
         let toolCallCount = 0;
+        const recallMetadataRounds: ConversationRound[] = [];
         const revisionAccumulator = createCodexSourceRevisionAccumulator();
         const appendRound = (round: ConversationRound): void => {
             spool.append(round);
+            recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
             revisionAccumulator.addRound(round);
             aiResponseCount += round.aiResponses.length;
             toolCallCount += round.toolCalls.length;
@@ -576,6 +603,7 @@ async function tryBuildIncrementalConversation(
                 sourceCheckpoints: tail.sourceCheckpoints,
                 sourceCheckpoint: tail.checkpoint,
             },
+            compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
             sourceDiagnostics: [...(previous.snapshot.sourceDiagnostics || []), `Codex JSONL 仅重放第 ${tail.replaceFromRound} 轮起的追加尾部`],
         };
         return { snapshot, preparedRounds };
@@ -599,10 +627,12 @@ async function tryBuildIncrementalConversation(
         });
         let aiResponseCount = 0;
         let toolCallCount = 0;
+        const recallMetadataRounds: ConversationRound[] = [];
         try {
             for (const source of sources) {
                 for (const round of source) {
                     spool.append(round);
+                    recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
                     aiResponseCount += round.aiResponses.length;
                     toolCallCount += round.toolCalls.length;
                 }
@@ -628,6 +658,7 @@ async function tryBuildIncrementalConversation(
                     sourceCheckpoint: nextCheckpoint,
                 },
                 sourceDiagnostics: [...(previous.snapshot.sourceDiagnostics || []), diagnostic],
+                compactionMetadata: buildConversationCompactionMetadata("claude-code", recallMetadataRounds),
             }),
             preparedRounds,
         };
@@ -815,6 +846,7 @@ function hydrateConversationCache(
     options: Pick<ConversationLoadOptions, "includeRounds" | "roundRange"> = {},
     cachedRoundCount?: number,
     cacheBuildFailure?: ConversationSourceCacheBuildFailure,
+    cacheCreatedAt?: string,
 ): ConversationLoadResult | null {
     const roundResult = options.includeRounds === false
         ? null
@@ -835,6 +867,7 @@ function hydrateConversationCache(
         roundStart: options.roundRange?.startRound || 1,
         cacheKey: { ...key },
         cacheGeneration: generation,
+        cacheCreatedAt,
         cacheState,
         cacheBuildFailure,
         cacheFingerprint: fingerprint,
@@ -853,7 +886,7 @@ function loadConversationCacheOnly(
 ): ConversationLoadResult | null {
     const cached = readConversationSourceCacheOnly<ConversationLoadResult>({ key });
     if (!cached) return null;
-    return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, sourceMode, options, cached.roundCount, cached.buildFailure);
+    return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, sourceMode, options, cached.roundCount, cached.buildFailure, cached.createdAt);
 }
 
 function localPbToConversationResult(

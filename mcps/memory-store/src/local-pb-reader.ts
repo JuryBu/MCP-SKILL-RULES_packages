@@ -84,6 +84,7 @@ export interface LocalPbDiagnostic {
 export interface LocalPbStep {
     index: number;
     timestamp?: LocalPbTimestamp;
+    contextTokens?: number;
     user?: string;
     planner?: LocalPbPlannerResponse;
     system?: string;
@@ -360,7 +361,9 @@ function findTrajectory(root: ProtoMessage, kind: LocalPbCandidateKind): ProtoMe
 
 function parseStep(message: ProtoMessage, index: number): LocalPbStep {
     const plannerMessage = firstNestedField(message, 20);
+    const metadataMessage = firstNestedField(message, 5);
     const timestamp = extractTimestamp(message);
+    const contextTokens = metadataMessage ? firstVarintField(metadataMessage, 25) : undefined;
     const toolVariants = extractUnknownVariants(message);
     const diagnostics = [
         ...detectMarkerDiagnostics(message),
@@ -374,6 +377,7 @@ function parseStep(message: ProtoMessage, index: number): LocalPbStep {
     return {
         index,
         ...(timestamp ? { timestamp } : {}),
+        ...(contextTokens !== undefined ? { contextTokens } : {}),
         ...(firstTextFromNestedField(message, 19) ? { user: firstTextFromNestedField(message, 19) } : {}),
         ...(plannerMessage ? { planner: {
             ...(firstTextField(plannerMessage, 1) ? { response: firstTextField(plannerMessage, 1) } : {}),
@@ -384,6 +388,11 @@ function parseStep(message: ProtoMessage, index: number): LocalPbStep {
         toolVariants,
         diagnostics,
     };
+}
+
+function firstVarintField(message: ProtoMessage, fieldNumber: number): number | undefined {
+    const field = message.fields.find(candidate => candidate.fieldNumber === fieldNumber && candidate.wireType === 0 && candidate.value !== undefined);
+    return field?.value === undefined ? undefined : asSafeNumber(field.value, `field ${fieldNumber}`);
 }
 
 function firstNestedField(message: ProtoMessage, fieldNumber: number): ProtoMessage | undefined {
@@ -480,7 +489,7 @@ function extractTimestamp(message: ProtoMessage): LocalPbTimestamp | undefined {
 }
 
 function extractUnknownVariants(message: ProtoMessage): LocalPbToolVariant[] {
-    const reserved = new Set([19, 20, 114]);
+    const reserved = new Set([5, 19, 20, 114]);
     const variants: LocalPbToolVariant[] = [];
     for (const field of message.fields) {
         if (reserved.has(field.fieldNumber) || field.wireType !== 2 || !field.bytes) continue;

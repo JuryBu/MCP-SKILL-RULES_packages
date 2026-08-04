@@ -95,6 +95,7 @@ export function fingerprintLocalPbCandidates(candidates: LocalPbDiscoveredCandid
 function canonicalLocalPbStep(step: LocalPbStep): string {
     return JSON.stringify({
         timestamp: step.timestamp,
+        contextTokens: step.contextTokens,
         user: step.user,
         planner: step.planner,
         system: step.system,
@@ -167,6 +168,15 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
             round.endStep = stepIndex;
         }
         const round = ensureCurrent(stepIndex);
+        if (step.contextTokens !== undefined) {
+            round.semanticEvents?.push({
+                stepIndex,
+                rawRole: "local_pb.field_25",
+                semanticRole: "system",
+                kind: "context_tokens",
+                contextTokens: step.contextTokens,
+            });
+        }
         if (step.system) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_114", semanticRole: "system", kind: "system", text: step.system });
         if (step.timestamp?.iso) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.timestamp", semanticRole: "system", kind: "timestamp", text: step.timestamp.iso });
         if (step.planner) {

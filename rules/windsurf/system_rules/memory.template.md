@@ -11,6 +11,7 @@ MCP memory-store 是跨对话持久化知识的主要方式，是你和下一个
 - 操作顺序：先search定位→read精读→需要时depth="full"深度查看
 - `fetch` 建立或更新规范化缓存，后续 search/read/full/diff 从同一缓存派生；fetch/search/read/export 都要显式传稳定 conversationId
 - `source="auto"` 以本地 PB 为一等来源并按需比较 LS，`local` 只读 PB，`ls` 只读 Language Server，`cache` 只读上一份完整可用缓存
+- `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含用户/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 - 单次返回默认约 100K 字符，超出时使用响应给出的 continuationCursor / 下一段参数继续，不能把截断当成完整结果
 - `messageRoles=["user"]` 只含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取子代理事件；批注搜索返回命中的单条 Annotation 与命中字段
 - 遇到图片/附件路径要主动查看内容，不要只报路径

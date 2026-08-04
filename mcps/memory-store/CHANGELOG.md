@@ -2,6 +2,18 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.3] - 2026-08-04
+
+### Added
+
+- Windsurf 与 Antigravity 的 `conversation_read_original(list, source="local")` 直接扫描 active/implicit PB 元数据；IDE 与 Language Server 均关闭时仍可列出本地对话，精确 ID fetch 继续使用离线 PB 解码链路。
+- fetch cache generation 新增四宿主压缩元数据：Windsurf 使用 PB `f5.f25` token 下降，Codex 使用第二次及后续折叠 Rules 注入，Claude Code 使用 `isCompactSummary`；Antigravity 无可靠信号时明确使用最近约 150K tokens（约 450K context characters）保底。
+- 新增 `conversation_read_original(action="recall", recallMode="auto|manual|full")`。Recall 先增量刷新并提交最新可取得的 fetch generation，再只从同一 generation 输出上下文；自动模式恢复到压缩前规模约 60%，手动模式按人类轮次，全量模式写入带 SHA256 的临时文件。
+
+### Safety
+
+- Recall 只包含用户消息、引导消息、annotations、模型可见回复与附件引用；不会输出 thinking、工具调用/结果、代码 diff、文件查看、Rules 注入、压缩摘要或内部诊断。超过约 100K 的普通结果继续通过 continuation 与临时 artifact 安全交付。
+
 ## [1.22.2] - 2026-08-04
 
 ### Fixed

@@ -93,6 +93,7 @@ export interface ConversationSemanticEvent {
     argsFull?: string;
     resultSummary?: string;
     resultFull?: string;
+    contextTokens?: number;
     subagent?: SubagentSummary;
     attachments?: import("./conversation-attachments.js").ConversationAttachment[];
 }

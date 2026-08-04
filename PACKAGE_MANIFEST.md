@@ -1,10 +1,10 @@
-# Package Manifest（2026-07-27）
+# Package Manifest（2026-08-04）
 
 ## Included
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0 |
+| MCP | memory-store 1.22.3, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 17 license-reviewed portable user skills plus manifest |
@@ -12,13 +12,14 @@
 | Templates | Four host configs and receiver-private environment example |
 | Tests | HTTP smoke helper, local pages, memory workspace, expected results |
 
-## 2026-07-27 Changes
+## 2026-08-04 Changes
 
 - Codex Rules now separate a shared engineering core from optional catgirl, development-machine, and training-machine overlays. Four profile manifests build `neutral`, `catgirl`, `development`, and `training` configurations without duplicating the engineering workflow.
 - Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
 - NapCat autostart now uses an internal windowless launcher plus a long-running supervisor watchdog, so interactive logon does not expose PowerShell consoles and unexpected supervisor exits are retried without replacing receiver-private state.
 - Added public-safe Bug/compatibility and Feature Request Issue forms for cross-machine MCP maintenance.
-- Common MCP versions are memory-store 1.21.1, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Common MCP versions are memory-store 1.22.3, web-fetcher 7.0.0, sandbox 1.16.0, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Memory Store 1.22.3 adds four-host persistent fetch generations, offline Windsurf/Antigravity PB listing, compression metadata, context-only auto/manual/full Recall, continuation delivery, and large-source safeguards without packaging conversations or Plan/Task files.
 - NapCat public source is refreshed to the current task-ledger, router, supervisor, and Codex wake-bridge snapshot while keeping runtime state, real bindings, login data, and credentials excluded.
 
 ## 2026-07-24 Baseline

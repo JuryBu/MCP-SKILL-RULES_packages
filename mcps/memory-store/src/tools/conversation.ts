@@ -88,6 +88,14 @@ import {
     type CodexFetchWorkerResult,
 } from "../conversation-fetch-worker-types.js";
 import { withConversationSourcePressure } from "../conversation-source-pressure.js";
+import { listLocalPbConversationCandidates } from "../conversation-local-list.js";
+import {
+    formatConversationRecallRound,
+    selectConversationRecallRange,
+    writeConversationRecallArtifact,
+    type ConversationRecallArtifact,
+    type ConversationRecallMode,
+} from "../conversation-recall.js";
 
 const CONVERSATION_READ_TEXT_BUILD_MAX_CHARS = readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_READ_TEXT_BUILD_MAX_CHARS", 64 * 1024 * 1024);
 const CONVERSATION_READ_WINDOW_MAX_CHARS = Math.max(100_000, readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_READ_WINDOW_MAX_CHARS", 8 * 1024 * 1024));
@@ -95,7 +103,12 @@ const DEFAULT_CONVERSATION_READ_DELIVERY_MAX_CHARS = 100_000;
 const CONVERSATION_READ_DELIVERY_MAX_CHARS = readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_READ_DELIVERY_MAX_CHARS", DEFAULT_CONVERSATION_READ_DELIVERY_MAX_CHARS);
 const CONVERSATION_READ_TAIL_PREVIEW_CHARS = readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_READ_TAIL_PREVIEW_CHARS", 2_000);
 const CONVERSATION_LIST_TITLE_MAX_CHARS = Math.max(readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_LIST_TITLE_MAX_CHARS", 120), 20);
-const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "export"]);
+const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "recall", "export"]);
+
+function candidateLimitForLocalList(limit?: number): number {
+    const requested = Math.min(Math.max(limit || 20, 1), 100);
+    return Math.max(requested * 3, 300);
+}
 
 export interface ConversationReadSourcePosition {
     charPosition: number;
@@ -1500,6 +1513,80 @@ function loadConversationRoundWindow(
     };
 }
 
+export function iterateConversationRecallRounds(
+    loaded: LoadedConversationData,
+    startRound: number,
+    endRound: number,
+): Iterable<ConversationRound> {
+    if (loaded.cacheKey && loaded.cacheGeneration) {
+        const cached = iterateCachedConversationSourceCacheRounds<ConversationRound>({
+            key: loaded.cacheKey,
+            generation: loaded.cacheGeneration,
+            startRound,
+            endRound,
+        });
+        if (!cached) {
+            throw new Error(`Recall cache generation ${loaded.cacheGeneration} is missing or corrupt; refusing to return incomplete context`);
+        }
+        return cached.rounds;
+    }
+    if (loaded.rounds.length === 0) {
+        throw new Error("Recall has neither a committed cache generation nor loaded rounds; refusing to return empty context");
+    }
+    return loaded.rounds.filter(round => round.roundIndex >= startRound && round.roundIndex <= endRound);
+}
+
+function formatRecallArtifactNote(artifact: ConversationRecallArtifact): string {
+    return [
+        "📦 完整 context-only Recall 临时文件",
+        `路径: ${artifact.path}`,
+        `SHA256: ${artifact.sha256}`,
+        `大小: ${artifact.bytes} bytes | 人类轮次: ${artifact.startRound}-${artifact.endRound} | 实际有内容 ${artifact.rounds} 轮`,
+        `过期时间: ${artifact.expiresAt}`,
+    ].join("\n");
+}
+
+function buildConversationRecallText(
+    loaded: LoadedConversationData,
+    selection: NonNullable<ReturnType<typeof selectConversationRecallRange>>,
+    artifact?: ConversationRecallArtifact,
+): { text: string; sourcePositions: ConversationReadSourcePosition[] } {
+    const latest = loaded.cacheState !== "stale";
+    const lines = [
+        "🧠 Conversation Recall（context-only）",
+        `📂 对话: ${loaded.conversationId}`,
+        `🔗 数据链路: ${loaded.chainUsed}`,
+        `📌 cacheGeneration: ${loaded.cacheGeneration || "(unknown)"}`,
+        `🕒 缓存截至: ${loaded.cacheCreatedAt || "(unknown)"} | isLatest=${latest}`,
+        `📖 回溯轮次: ${selection.startRound}-${selection.endRound}`,
+        `🎯 选择原因: ${selection.reason}`,
+        ...(loaded.cacheBuildFailure ? [`⚠️ 刷新失败: ${loaded.cacheBuildFailure.name}: ${loaded.cacheBuildFailure.message}`] : []),
+        ...(artifact ? ["", formatRecallArtifactNote(artifact)] : []),
+        "",
+    ];
+    const sourcePositions: ConversationReadSourcePosition[] = [{
+        charPosition: 0,
+        roundIndex: selection.startRound,
+        stepIndex: 0,
+    }];
+    let builtChars = lines.reduce((sum, item) => sum + item.length + 1, 0);
+    for (const round of iterateConversationRecallRounds(loaded, selection.startRound, selection.endRound)) {
+        const formatted = formatConversationRecallRound(round);
+        if (!formatted) continue;
+        sourcePositions.push({
+            charPosition: Math.max(0, builtChars - 1),
+            roundIndex: round.roundIndex,
+            stepIndex: round.startStep,
+        });
+        lines.push(formatted, "");
+        builtChars += formatted.length + 2;
+        if (builtChars > CONVERSATION_READ_TEXT_BUILD_MAX_CHARS) {
+            throw new Error(`recall context-only output exceeds ${CONVERSATION_READ_TEXT_BUILD_MAX_CHARS} characters; use recallMode=full`);
+        }
+    }
+    return { text: lines.join("\n"), sourcePositions };
+}
+
 function loadConversationRoundsByIndex(loaded: LoadedConversationData, roundIndices: readonly number[]): ConversationRound[] {
     if (roundIndices.length === 0) return [];
     const wanted = new Set(roundIndices);
@@ -1804,11 +1891,12 @@ registerBackgroundTaskRecoveryHandler("conversation-batch-export", async (task) 
 /**
  * conversation_read_original — 读取对话原文
  *
- * 五类操作：
+ * 六类操作：
  *   list   — 按标题/路径/ID/Record/contextProbe 列出候选对话
  *   fetch  — 拉取对话数据到缓存并返回概览
  *   search — 在对话中关键词搜索
  *   read   — 读取指定轮次范围的对话内容
+ *   recall — 从最新 fetch 缓存恢复压缩前的 context-only 上下文
  *   export — 将可读对话原文持久化导出为 Markdown / PDF
  *   deep_locate — 后台流式深搜 Codex / Claude Code JSONL，用正文片段定位 conversationId
  */
@@ -1821,12 +1909,13 @@ export function registerConversation(server: McpServer): void {
   fetch — 拉取对话数据到缓存，返回概览统计
   search — 在对话中关键词搜索，返回匹配的上下文
   read — 读取指定轮次范围的对话内容
+  recall — 自动、按轮次或全量恢复 context-only 上下文
   export — 将可读对话原文持久化导出为 Markdown / PDF
   deep_locate — Codex/Claude Code 后台深搜正文片段以定位 conversationId
-fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
+fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
-            action: z.enum(["list", "fetch", "search", "read", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
-                .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
+            action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
+                .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / recall=恢复压缩上下文 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
             conversationId: z.string().optional()
                 .describe("对话 UUID；fetch/search/read/export 建议总是显式传入，避免共享后端串到其它当前对话"),
             conversationIds: z.array(z.string()).optional()
@@ -1858,9 +1947,11 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
             maxHits: z.number().optional()
                 .describe("[deep_locate] 最大命中数"),
             startRound: z.number().optional()
-                .describe("[read] 起始轮次（1-indexed）"),
+                .describe("[read/recall manual] 起始轮次（1-indexed）"),
             endRound: z.number().optional()
-                .describe("[read] 结束轮次"),
+                .describe("[read/recall manual] 结束轮次"),
+            recallMode: z.enum(["auto", "manual", "full"]).optional()
+                .describe("[recall] auto=按宿主压缩信号恢复 / manual=按 startRound/endRound / full=全部 context-only 内容写临时文件"),
             continuationCursor: z.string().optional()
                 .describe("[read] 上一段返回的续读光标；来源或参数变化时会拒绝，避免重复或串读"),
             exportFormat: z.enum(["markdown", "pdf", "both"]).optional()
@@ -1932,6 +2023,7 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                     limit = 8,
                     startRound,
                     endRound,
+                    recallMode = "auto",
                     continuationCursor,
                     exportFormat,
                     exportScope,
@@ -2082,6 +2174,27 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 }
 
                 if (action === "list") {
+                    if (source === "local" && (chains.dataChain === "auto" || chains.dataChain === "antigravity" || chains.dataChain === "windsurf")) {
+                        const hosts = chains.dataChain === "auto"
+                            ? (["antigravity", "windsurf"] as const)
+                            : ([chains.dataChain] as Array<"antigravity" | "windsurf">);
+                        const localCandidates = hosts.flatMap(host => listLocalPbConversationCandidates(host, { limit: candidateLimitForLocalList(limit), query })
+                            .map(candidate => ({ host, ...candidate })));
+                        localCandidates.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
+                        const selected = localCandidates.slice(0, Math.min(Math.max(limit || 20, 1), 100));
+                        const lines = [
+                            "🔎 本地 PB 对话目录（仅元数据，未解密正文）",
+                            `候选对话: ${selected.length}${query ? ` | 关键词: ${query}` : ""}`,
+                            "说明: active/cascade 与 implicit 同 ID 已合并；implicit 仅表示本机仍存在的隐藏/归档候选。",
+                            "",
+                            ...selected.map((item, index) => [
+                                `${index + 1}. [${item.host}] ${item.id}`,
+                                `   ID: ${item.id}`,
+                                `   位置: ${item.kinds.join("+")} | 更新时间: ${item.updatedAt} | ${formatBytes(item.bytes)}${item.files > 1 ? ` | ${item.files} 个候选文件` : ""}`,
+                            ].join("\n")),
+                        ];
+                        return appendTiming({ content: [{ type: "text" as const, text: lines.join("\n") }] }, startTime);
+                    }
                     if (dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
                         const result = await listConversationCandidates({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
@@ -2706,15 +2819,18 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 }
 
                 const loaded = await loadConversationData(chains.dataChain, conversationId, {
-                    refresh: action === "fetch",
+                    refresh: action === "fetch" || action === "recall",
                     link,
                     dataChains: dataChains as DataChain[] | undefined,
                     idResolutionMode: idResolutionMode as IdResolutionMode,
                     sourceFailureMode: sourceFailureMode as SourceFailureMode,
                     logicalChain: logicalChain as ConversationLogicalChainMode | undefined,
                     source,
-                    includeRounds: action === "export"
-                        && (exportScope === "search" || (!exportScope && Boolean(query))),
+                    includeRounds: action === "recall"
+                        ? false
+                        : action === "export"
+                            && (exportScope === "search" || (!exportScope && Boolean(query))),
+                    requireCompactionMetadata: action === "recall",
                 });
                 if (!loaded) {
                     return appendTiming({
@@ -2728,6 +2844,110 @@ fetch/search/read/export 必须传 conversationId（共享 broker 后端拦截�
                 const windsurfSourceDiagnostics = formatWindsurfSourceDiagnostics(loaded);
                 const expandedChildren = loaded.codexData?.expandedChildren || [];
                 const childDiagnostics = loaded.codexData?.childDiagnostics || [];
+
+                if (action === "recall") {
+                    if (!loaded.cacheKey || !loaded.cacheGeneration || !loaded.compactionMetadata) {
+                        return appendTiming({
+                            content: [{ type: "text" as const, text: "❌ Recall 需要已完整发布且带压缩元数据的 fetch cache generation" }],
+                        }, startTime);
+                    }
+                    if (sourceFailureMode === "fail" && loaded.cacheState === "stale") {
+                        const failure = loaded.cacheBuildFailure;
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: `❌ Recall 刷新失败，sourceFailureMode=fail 禁止使用旧缓存${failure ? `：${failure.name}: ${failure.message}` : ""}`,
+                            }],
+                        }, startTime);
+                    }
+                    const selection = selectConversationRecallRange(
+                        loaded.compactionMetadata,
+                        recallMode as ConversationRecallMode,
+                        startRound,
+                        endRound,
+                    );
+                    if (!selection) {
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: [
+                                    "ℹ️ 当前 fetch cache generation 未检测到可回溯的压缩事件",
+                                    `📂 对话: ${cascadeId}`,
+                                    `🔗 数据链路: ${loaded.chainUsed}`,
+                                    `📌 cacheGeneration: ${loaded.cacheGeneration}`,
+                                    `🕒 缓存截至: ${loaded.cacheCreatedAt || "(unknown)"} | isLatest=${loaded.cacheState !== "stale"}`,
+                                ].join("\n"),
+                            }],
+                        }, startTime);
+                    }
+                    if (selection.selectedContextChars <= 0) {
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: [
+                                    "ℹ️ 检测到压缩边界，但压缩后当前可见上下文已经达到压缩前规模的约 60%，无需额外注入",
+                                    `📂 对话: ${cascadeId}`,
+                                    `📌 cacheGeneration: ${loaded.cacheGeneration}`,
+                                    `🎯 ${selection.reason}`,
+                                ].join("\n"),
+                            }],
+                        }, startTime);
+                    }
+                    const artifactForSelection = async (): Promise<ConversationRecallArtifact> => writeConversationRecallArtifact({
+                        conversationId: cascadeId,
+                        dataChain: loaded.chainUsed,
+                        cacheGeneration: loaded.cacheGeneration!,
+                        selection,
+                        rounds: iterateConversationRecallRounds(loaded, selection.startRound, selection.endRound),
+                    });
+                    if (recallMode === "full") {
+                        const artifact = await artifactForSelection();
+                        return appendTiming({
+                            content: [{
+                                type: "text" as const,
+                                text: [
+                                    "🧠 Conversation Recall（full / context-only）",
+                                    `📂 对话: ${cascadeId}`,
+                                    `🔗 数据链路: ${loaded.chainUsed}`,
+                                    `📌 cacheGeneration: ${loaded.cacheGeneration}`,
+                                    `🕒 缓存截至: ${loaded.cacheCreatedAt || "(unknown)"} | isLatest=${loaded.cacheState !== "stale"}`,
+                                    ...(loaded.cacheBuildFailure ? [`⚠️ 刷新失败: ${loaded.cacheBuildFailure.name}: ${loaded.cacheBuildFailure.message}`] : []),
+                                    "",
+                                    formatRecallArtifactNote(artifact),
+                                ].join("\n"),
+                            }],
+                        }, startTime);
+                    }
+
+                    let built = buildConversationRecallText(loaded, selection);
+                    const exceedsDefault = maxBytes === undefined
+                        ? built.text.length > CONVERSATION_READ_DELIVERY_MAX_CHARS
+                        : Buffer.byteLength(built.text, "utf8") + 1_024 > maxBytes;
+                    if (exceedsDefault) {
+                        const artifact = await artifactForSelection();
+                        built = buildConversationRecallText(loaded, selection, artifact);
+                    }
+                    const nextParams = {
+                        action: "recall",
+                        conversationId: cascadeId,
+                        dataChain: loaded.chainUsed,
+                        recallMode,
+                        source,
+                        sourceFailureMode,
+                        ...(recallMode === "manual" ? { startRound: selection.startRound, endRound: selection.endRound } : {}),
+                        ...(maxBytes !== undefined ? { maxBytes } : {}),
+                        link,
+                    };
+                    const { text } = formatPaginatedConversationReadText({
+                        conversationId: cascadeId,
+                        text: built.text,
+                        sourcePositions: built.sourcePositions,
+                        continuationCursor,
+                        maxBytes,
+                        nextParams,
+                    });
+                    return appendTiming({ content: [{ type: "text" as const, text }] }, startTime);
+                }
 
                 if (action === "export") {
                     const partialWarning = formatWindsurfPartialWarning(loaded);
