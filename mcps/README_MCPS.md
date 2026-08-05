@@ -12,7 +12,7 @@ Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 
 `chain="windsurf"` is a compatibility shortcut for data only. `chain="grok"` is a compatibility shortcut for model execution only.
 
-### sandbox 1.16.2
+### sandbox 1.16.3
 
 Short execution, parallel batch, persistent session, long-running launch, Codex task execution, smart search, and multi-model Council. Grok Council uses a receiver-managed ProGrok OpenAI-compatible endpoint and supports image input when the selected model supports vision.
 

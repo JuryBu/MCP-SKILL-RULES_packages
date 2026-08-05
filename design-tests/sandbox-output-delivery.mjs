@@ -256,15 +256,43 @@ test("JSON-heavy text keeps one structured copy when mirroring would break the r
     assert.match(result.content[0].text, /structuredContent\.text/u);
 });
 
-test("startup cleanup may remove expired incomplete artifacts", async () => {
+test("cleanup protects active artifacts and removes expired orphaned artifacts", async () => {
     const run = await createOutputArtifactRun({ ttlMs: 1 });
     const manifest = JSON.parse(fs.readFileSync(run.manifestPath, "utf8"));
     const now = Date.parse(manifest.expiresAt) + 1;
     const retained = await cleanExpiredOutputArtifacts(now);
     assert.ok(retained.retained >= 1);
     assert.equal(fs.existsSync(run.directory), true);
-    const removed = await cleanExpiredOutputArtifacts(now, true);
+
+    const orphanId = crypto.randomUUID();
+    const orphanDirectory = path.join(OUTPUT_ARTIFACT_ROOT, orphanId);
+    fs.mkdirSync(orphanDirectory, { recursive: true });
+    fs.writeFileSync(path.join(orphanDirectory, "manifest.json"), JSON.stringify({
+        version: 1,
+        artifactId: orphanId,
+        status: "running",
+        complete: false,
+        createdAt: manifest.createdAt,
+        completedAt: null,
+        expiresAt: manifest.expiresAt,
+        files: {},
+        readHint: "",
+        error: null,
+    }));
+    const removed = await cleanExpiredOutputArtifacts(now);
     assert.equal(removed.removed, 1);
+    assert.equal(fs.existsSync(orphanDirectory), false);
+    assert.equal(fs.existsSync(run.directory), true);
+
+    await run.finalize({
+        stats: {
+            stdout: { rawBytes: 0, lines: 0, sha256: sha256(Buffer.alloc(0)), estimatedTokens: 0 },
+            stderr: { rawBytes: 0, lines: 0, sha256: sha256(Buffer.alloc(0)), estimatedTokens: 0 },
+        },
+    });
+    const finalizedManifest = JSON.parse(fs.readFileSync(run.manifestPath, "utf8"));
+    const finalizedCleanup = await cleanExpiredOutputArtifacts(Date.parse(finalizedManifest.expiresAt) + 1);
+    assert.equal(finalizedCleanup.removed, 1);
     assert.equal(fs.existsSync(run.directory), false);
 });
 

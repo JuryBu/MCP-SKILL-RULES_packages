@@ -1,4 +1,4 @@
-# MCP Sandbox v1.16.2
+# MCP Sandbox v1.16.3
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -255,7 +255,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 - v1.15.1：Council 引入 manifest 制品追踪、终态制品回收与 quarantine/restore；补强 Abort、后台 resume、跨 worker 租约、子进程代理隔离和 terminal failure 处理。运行时根支持优先从 `SANDBOX_DATA_ROOT/temp` 解析，broker 部署不会默认把 Council 运行数据写回源码目录；自动 council GC 默认关闭，需显式设置 `SANDBOX_COUNCIL_AUTO_GC=1`
 - v1.16.0：实现 Issue #13/#14。Sandbox backend 按64/1536/2048MB默认额度统一接纳本机任务，同时保留默认1024MB系统可用内存底线；压力时按owner公平等待并返回结构化退避，Session默认5个且可配置。exec、batch、Session与Codex改为流式保存完整stdout/stderr，小输出在100K估算token、2000行与1MiB响应线内直接返回，超预算返回6小时artifact、SHA256和头尾预览；移除200行、50000字符与Codex 30分钟schema硬上限。长期 launch 改用 detached bootstrap/worker 与原子 marker，Windows Codex 调用自动选择最新 bundled CLI，并新增只重拉Sandbox endpoint的安全脚本。
 - v1.16.1：修复 1.16.0 把所有小输出也持久化并展示为 artifact 的回归。普通 inline 结果完成后立即删除执行期 spool，exec、batch、Session 与 Codex 不再追加 artifact 元数据；超预算、显式文件模式和中断恢复仍保留完整 artifact。`sandbox_status overview/gc` 增加 artifact 数量、payload、保留与无效统计，便于接收方检查和清理。
-- v1.16.2：修复 `maxOutput` 被 16KiB 元数据预留提前扣减、强制 inline 配合 `maxLines` 可能丢失完整输出、Codex 只展示 `structuredContent` 时看不到 stdout/stderr，以及 batch 合并响应可突破总预算的问题。字符、行数、序列化字节和批量总响应现分别控制，异常/超时/artifact 结构化返回会携带模型可见文本。
+- v1.16.3：包含 v1.16.2 的输出预算、完整 artifact、模型可见性与 batch 总响应修复，并为运行中的 artifact 建立进程内保护，使定时 GC 可以安全清理热重载遗留的过期未完成目录，不会误删仍在写入的长任务输出。
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例
 - v1.12.2 补充 `sandbox_council` 后台查询防呆：启动返回会直接给出带 `ownerId` 的查询示例；README、Resource guide 和 schema 明确查询必须复用同一个 `ownerId`，避免误判任务丢失后重复启动

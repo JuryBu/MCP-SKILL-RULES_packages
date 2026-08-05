@@ -203,7 +203,7 @@ Use `modelChain="grok"` to force this route. `dataChain` never uses Grok because
 
 ## 10. Sandbox Artifacts
 
-Sandbox 1.16.2 stores Council artifacts plus only oversized, explicitly file-oriented, or interrupted-recovery stdout/stderr artifacts below `SANDBOX_DATA_ROOT`. After upgrading, confirm that a roughly 6.8K-character result with `maxOutput=20000` remains inline, inspect retained counts, then clean only expired output artifacts:
+Sandbox 1.16.3 stores Council artifacts plus only oversized, explicitly file-oriented, or interrupted-recovery stdout/stderr artifacts below `SANDBOX_DATA_ROOT`. It also protects currently active output artifacts while allowing periodic GC to remove expired incomplete directories left by a backend reload. After upgrading, confirm that a roughly 6.8K-character result with `maxOutput=20000` remains inline, inspect retained counts, then clean only expired output artifacts:
 
 ```text
 sandbox_status(action="gc", gcScope="council", gcMode="dryRun")

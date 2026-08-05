@@ -6,6 +6,7 @@ import { DATA_ROOT } from "./temp-store.js";
 
 export const DEFAULT_OUTPUT_ARTIFACT_TTL_MS = 6 * 60 * 60 * 1000;
 export const OUTPUT_ARTIFACT_ROOT = path.join(DATA_ROOT, "output-artifacts");
+const activeOutputArtifactIds = new Set<string>();
 
 export type OutputArtifactChannel = "stdout" | "stderr";
 export type OutputArtifactStatus = "running" | "done" | "error" | "interrupted";
@@ -201,7 +202,11 @@ export class OutputArtifactRun {
     }
 
     finalize(options: FinalizeOutputArtifactOptions): Promise<OutputArtifactManifest> {
-        if (!this.finalizePromise) this.finalizePromise = this.finalizeInternal(options);
+        if (!this.finalizePromise) {
+            this.finalizePromise = this.finalizeInternal(options).finally(() => {
+                activeOutputArtifactIds.delete(this.artifactId);
+            });
+        }
         return this.finalizePromise;
     }
 
@@ -260,16 +265,18 @@ export async function createOutputArtifactRun(options: CreateOutputArtifactOptio
         positiveInteger(options.writeHighWaterMarkBytes, 64 * 1024),
         options.readHint || "",
     );
+    activeOutputArtifactIds.add(artifactId);
     try {
         await run.initialize();
         return run;
     } catch (error) {
+        activeOutputArtifactIds.delete(artifactId);
         await fs.promises.rm(directory, { recursive: true, force: true }).catch(() => undefined);
         throw error;
     }
 }
 
-export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeIncomplete = false): Promise<OutputArtifactCleanupResult> {
+export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeIncomplete = true): Promise<OutputArtifactCleanupResult> {
     const result: OutputArtifactCleanupResult = { removed: 0, retained: 0, invalid: 0 };
     let entries: fs.Dirent[];
     try {
@@ -285,7 +292,10 @@ export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeInco
         try {
             const manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf8")) as Partial<OutputArtifactManifest>;
             const expiresAt = typeof manifest.expiresAt === "string" ? Date.parse(manifest.expiresAt) : Number.NaN;
-            if ((manifest.complete === true || removeIncomplete) && Number.isFinite(expiresAt) && expiresAt <= nowMs) {
+            const removableIncomplete = removeIncomplete
+                && manifest.complete !== true
+                && !activeOutputArtifactIds.has(entry.name);
+            if ((manifest.complete === true || removableIncomplete) && Number.isFinite(expiresAt) && expiresAt <= nowMs) {
                 await fs.promises.rm(directory, { recursive: true, force: true });
                 result.removed += 1;
             } else {
