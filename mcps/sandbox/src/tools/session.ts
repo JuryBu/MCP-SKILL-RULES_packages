@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { touchActivity, appendTiming } from "../lifecycle.js";
+import { touchActivity, appendTiming, ensureModelVisibleToolResult } from "../lifecycle.js";
 import {
     createSession,
     execInSession,
@@ -37,7 +37,7 @@ const SessionParamsSchema = z.object({
     maxLines: z.number().min(1).optional()
         .describe("兼容的内联行数预算，不再硬限制为200"),
     maxOutput: z.number().min(100).optional()
-        .describe("兼容的内联响应预算，默认1MiB"),
+        .describe("调用方希望的内联字符预算，默认1MiB"),
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
         .describe("交付模式，默认auto"),
     ownerId: z.string().optional()
@@ -151,14 +151,14 @@ action:
 
                         const output = {
                             content: [{ type: "text" as const, text: parts.join("\n") }],
-                            structuredContent: {
+                            ...((result.killed || result.outputDelivery?.artifact) ? { structuredContent: {
                                 errorType,
                                 commandStarted: true,
                                 totalMs: Date.now() - startTime,
                                 killed: result.killed,
                                 killReason: result.killReason,
                                 artifact: result.outputDelivery?.artifact ?? null,
-                            },
+                            } } : {}),
                         };
                         return appendTiming(output, startTime);
                     }
@@ -242,11 +242,11 @@ action:
             } catch (err) {
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Session 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                    };
+                    });
                 }
                 return {
                     content: [{ type: "text" as const, text: `❌ 异常: ${err instanceof Error ? err.message : String(err)}` }],

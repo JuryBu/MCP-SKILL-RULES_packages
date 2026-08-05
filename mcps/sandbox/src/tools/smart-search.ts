@@ -18,6 +18,7 @@ import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from
 import { normalizeOwnerId } from "../owner.js";
 import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { initParentLs, isLsReady } from "../ls-client.js";
+import { ensureModelVisibleToolResult } from "../lifecycle.js";
 import {
     DEFAULT_PROGROK_FALLBACK_MODEL,
     DEFAULT_PROGROK_REASONING_EFFORT,
@@ -2165,11 +2166,11 @@ export function registerSmartSearch(server: McpServer): void {
             } catch (err: any) {
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: 搜索尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                    };
+                    });
                 }
                 return { content: [{ type: "text" as const, text: `❌ 搜索失败: ${err.message}` }] };
             }

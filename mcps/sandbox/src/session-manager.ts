@@ -455,7 +455,8 @@ async function execInSessionUnlocked(
     const outputCollector = await createOutputDeliveryCollector({
         mode: deliveryMode,
         combinedLineLimit: maxLines,
-        responseByteLimit: maxOutput,
+        inlineCharacterLimit: maxOutput,
+        inlineLineLimit: maxLines,
     });
     session.activeOutputCollector = outputCollector;
 

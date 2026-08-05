@@ -5,7 +5,7 @@ import os from "os";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { killProcessTree } from "../executor.js";
-import { touchActivity, appendTiming, formatElapsed } from "../lifecycle.js";
+import { touchActivity, appendTiming, ensureModelVisibleToolResult, formatElapsed } from "../lifecycle.js";
 import pidusage from "pidusage";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { acquireResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
@@ -22,7 +22,7 @@ import {
  * 核心设计变更（v1.2）：
  * - 新增后台模式（background=true）：启动后立刻返回 taskId
  * - 支持 action: check/wait/kill 管理后台任务
- * - stderr 智能过滤（去除 mcp: 调试行，上限 2000 字符）
+ * - stderr 智能过滤（去除 mcp: 调试行），最终大小由 output delivery 预算处理
  * - 上下文保护（有 outputFile 且报告已生成时压缩 stdout）
  * - 维护 Map<string, CodexTask> 任务池，进程自动清理
  */
@@ -553,7 +553,7 @@ async function startCodexProcess(params: {
     try {
         outputCollector = await createOutputDeliveryCollector({
             mode: params.deliveryMode || "auto",
-            responseByteLimit: maxOutput,
+            inlineCharacterLimit: maxOutput,
         });
     } catch (error) {
         resourceLease.release();
@@ -760,7 +760,7 @@ const CodexParamsShape = {
     configOverrides: z.string().optional()
         .describe("额外配置覆盖（-c 参数），如 model_reasoning_effort=high"),
     maxOutput: z.number().min(100).optional()
-        .describe("兼容的内联响应预算，默认1MiB；超预算完整内容写入artifact"),
+        .describe("调用方希望的内联字符预算，默认1MiB；超预算完整内容写入artifact"),
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
         .describe("交付模式，默认auto"),
     admissionBudgetMs: z.number().min(0).optional()
@@ -815,7 +815,7 @@ export function registerCodex(server: McpServer): void {
 - configOverrides: 覆盖配置项（-c 参数），如 model_reasoning_effort=xhigh
 - timeout: 超时(ms)，默认0=无超时
 - cwd: 工作目录
-- maxOutput: MCP 内联响应展示预算，默认1MiB；普通小输出直接返回，超预算或中断恢复时保留完整 artifact
+- maxOutput: MCP 内联字符展示预算，默认1MiB；普通小输出直接返回，超预算或中断恢复时保留完整 artifact
 
 后台模式（推荐用于长任务）：
 - background: true 启动后立刻返回 taskId，不阻塞
@@ -1006,11 +1006,11 @@ v1.8 新增参数：
                 }
                 const admissionError = serializeResourceAdmissionError(error);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Codex 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                    };
+                    });
                 }
                 return {
                     isError: true,

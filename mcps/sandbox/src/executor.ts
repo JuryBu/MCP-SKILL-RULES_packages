@@ -6,6 +6,8 @@ import { formatElapsed } from "./lifecycle.js";
 import { acquireResourceLease } from "./resource-admission-runtime.js";
 import {
     createOutputDeliveryCollector,
+    countTextCharacters,
+    sliceTextCharacters,
     type OutputArtifactReference,
     type OutputDeliveryMode,
     type OutputDeliveryResult,
@@ -35,6 +37,7 @@ export interface ExecOptions {
     timeout?: number;
     maxMemoryMB?: number;
     maxOutput?: number;
+    responseByteLimit?: number;
     outputMode?: OutputMode;
     tailLines?: number;
     maxLines?: number;
@@ -490,8 +493,8 @@ export function processOutput(
     }
 
     // 第四步：maxOutput 字符截断
-    if (text.length > maxOutput) {
-        text = text.slice(0, maxOutput) + `\n... (截断，总计 ${originalBytes} bytes)`;
+    if (countTextCharacters(text) > maxOutput) {
+        text = sliceTextCharacters(text, maxOutput) + `\n... (截断，总计 ${originalBytes} bytes)`;
         truncated = true;
     }
 
@@ -511,6 +514,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         timeout = DEFAULTS.timeout,
         maxMemoryMB = DEFAULTS.maxMemoryMB,
         maxOutput = DEFAULTS.maxOutput,
+        responseByteLimit,
         outputMode = DEFAULTS.outputMode,
         tailLines = DEFAULTS.tailLines,
         maxLines,
@@ -630,7 +634,9 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         collector = await createOutputDeliveryCollector({
             mode: deliveryMode,
             combinedLineLimit: maxLines,
-            responseByteLimit: maxOutput,
+            inlineCharacterLimit: maxOutput,
+            inlineLineLimit: maxLines,
+            responseByteLimit,
             previewHeadBytes: Math.max(4096, tailLines * 256),
             previewTailBytes: Math.max(4096, tailLines * 256),
             artifactTtlMs,
@@ -670,13 +676,16 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 windowsHide: true,
             });
         } catch (error) {
-            lease.release();
-            resolve({
-                ...makeParamErrorResult(`进程启动失败: ${error instanceof Error ? error.message : String(error)}`),
-                elapsed: formatElapsed(Date.now() - startTime),
-                killed: true,
-                killReason: "crash",
-                queueWaitMs: lease.queueWaitMs,
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            void collector.finalize({ status: "error", error: `spawn_failed: ${errorMessage}` }).catch(() => undefined).then(() => {
+                lease.release();
+                resolve({
+                    ...makeParamErrorResult(`进程启动失败: ${errorMessage}`),
+                    elapsed: formatElapsed(Date.now() - startTime),
+                    killed: true,
+                    killReason: "crash",
+                    queueWaitMs: lease.queueWaitMs,
+                });
             });
             return;
         }

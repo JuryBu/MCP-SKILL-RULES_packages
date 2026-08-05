@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { execute, ExecResult, normalizeExecutionInput } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import { DEFAULT_METADATA_RESERVE_BYTES, HARD_RESPONSE_BYTE_LIMIT } from "../output-delivery.js";
 
 /**
  * sandbox_batch 工具 — 并行执行多任务
@@ -46,6 +47,7 @@ type BatchTask = z.infer<typeof TaskItemSchema>;
 
 interface EffectiveBatchTask extends BatchTask {
     reservationMB: number;
+    responseByteLimit: number;
     ownerId?: string;
     admissionBudgetMs?: number;
     retryAttempt?: number;
@@ -102,8 +104,14 @@ export function registerBatch(server: McpServer): void {
                 // 计算每个任务的有效内存限制（受 maxTotalMemoryMB 约束）
                 const maxTotalMemoryMB = parsed.data.maxTotalMemoryMB || 768;
                 const perTaskMemDefault = Math.floor(maxTotalMemoryMB / tasks.length);
+                const perTaskInlineBudget = Math.max(
+                    100,
+                    Math.floor((HARD_RESPONSE_BYTE_LIMIT - DEFAULT_METADATA_RESERVE_BYTES - 64 * 1024) / tasks.length),
+                );
                 const effectiveTasks: EffectiveBatchTask[] = tasks.map(t => ({
                     ...t,
+                    maxOutput: Math.min(t.maxOutput ?? perTaskInlineBudget, perTaskInlineBudget),
+                    responseByteLimit: perTaskInlineBudget,
                     maxMemoryMB: t.maxMemoryMB ? Math.min(t.maxMemoryMB, maxTotalMemoryMB) : Math.min(Math.max(perTaskMemDefault, 64), 256),
                     reservationMB: t.maxMemoryMB ? Math.min(t.maxMemoryMB, maxTotalMemoryMB) : 64,
                     ownerId: parsed.data.ownerId,
@@ -148,7 +156,7 @@ export function registerBatch(server: McpServer): void {
 
                 const output = {
                     content: [{ type: "text" as const, text: parts.join("\n").trim() }],
-                    structuredContent: {
+                    ...((!allSuccess || results.some((result) => Boolean(result.artifact || result.errorType))) ? { structuredContent: {
                         tasks: results.map((result) => ({
                             index: result.index,
                             errorType: result.errorType,
@@ -161,7 +169,7 @@ export function registerBatch(server: McpServer): void {
                             retryAfterMs: result.retryAfterMs,
                             artifact: result.artifact,
                         })),
-                    },
+                    } } : {}),
                 };
                 return appendTiming(output, startTime);
             } catch (err) {
@@ -285,6 +293,7 @@ async function executeTask(
             timeout: task.timeout,
             maxMemoryMB: task.maxMemoryMB,
             maxOutput: task.maxOutput,
+            responseByteLimit: task.responseByteLimit,
             outputMode: task.outputMode,
             deliveryMode: task.deliveryMode,
             tailLines: task.tailLines,

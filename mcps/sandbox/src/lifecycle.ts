@@ -183,6 +183,41 @@ export function logStdinEvent(event: string): void {
 /**
  * 在 MCP 工具返回结果的最后一个 text content 追加耗时信息
  */
+const STRUCTURED_TEXT_MIRROR_BYTE_LIMIT = 480 * 1024;
+const configuredHardResponseByteLimit = Number(process.env.SANDBOX_OUTPUT_HARD_RESPONSE_BYTES);
+const MODEL_VISIBLE_HARD_RESPONSE_BYTE_LIMIT = Number.isFinite(configuredHardResponseByteLimit) && configuredHardResponseByteLimit >= 64 * 1024
+    ? Math.floor(configuredHardResponseByteLimit)
+    : 1024 * 1024;
+const MODEL_VISIBLE_METADATA_RESERVE_BYTES = 16 * 1024;
+const STRUCTURED_TEXT_TRANSFER_NOTICE = "完整工具文本已放入 structuredContent.text，以避免大响应重复编码。";
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export function ensureModelVisibleToolResult(result: any): any {
+    if (!result?.structuredContent || typeof result.structuredContent !== "object") return result;
+    const textContent = [...(result.content || [])]
+        .reverse()
+        .find((item) => item?.type === "text" && typeof item.text === "string" && item.text.length > 0);
+    if (!textContent) return result;
+    const serializedTextBytes = Buffer.byteLength(JSON.stringify(textContent.text), "utf8");
+    const serializedMetadataBytes = Buffer.byteLength(JSON.stringify(result.structuredContent), "utf8");
+    const mirroredResponseBytes = serializedTextBytes * 2 + serializedMetadataBytes + MODEL_VISIBLE_METADATA_RESERVE_BYTES;
+    if (serializedTextBytes <= STRUCTURED_TEXT_MIRROR_BYTE_LIMIT
+        && mirroredResponseBytes <= MODEL_VISIBLE_HARD_RESPONSE_BYTE_LIMIT) {
+        result.structuredContent = { ...result.structuredContent, text: textContent.text };
+    } else if (serializedTextBytes + serializedMetadataBytes + MODEL_VISIBLE_METADATA_RESERVE_BYTES
+        <= MODEL_VISIBLE_HARD_RESPONSE_BYTE_LIMIT) {
+        result.structuredContent = { ...result.structuredContent, text: textContent.text };
+        textContent.text = STRUCTURED_TEXT_TRANSFER_NOTICE;
+    } else {
+        result.structuredContent = {
+            ...result.structuredContent,
+            textPreview: `${textContent.text.slice(0, 4096)}\n... (工具文本超过响应保护线) ...\n${textContent.text.slice(-4096)}`,
+            textTruncated: true,
+        };
+    }
+    return result;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function appendTiming(result: any, startTime: number): any {
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -193,7 +228,7 @@ export function appendTiming(result: any, startTime: number): any {
             break;
         }
     }
-    return result;
+    return ensureModelVisibleToolResult(result);
 }
 
 /**

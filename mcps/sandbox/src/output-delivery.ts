@@ -27,6 +27,8 @@ export interface OutputDeliveryOptions {
     mode?: OutputDeliveryMode;
     estimatedTokenLimit?: number;
     combinedLineLimit?: number;
+    inlineCharacterLimit?: number;
+    inlineLineLimit?: number;
     responseByteLimit?: number;
     metadataReserveBytes?: number;
     previewHeadBytes?: number;
@@ -258,13 +260,35 @@ function serializedBytes(value: unknown): number {
     return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
+export function countTextCharacters(value: string): number {
+    let count = 0;
+    for (const character of value) {
+        void character;
+        count += 1;
+    }
+    return count;
+}
+
+export function sliceTextCharacters(value: string, limit: number): string {
+    if (limit <= 0) return "";
+    let count = 0;
+    let endIndex = 0;
+    for (const character of value) {
+        if (count >= limit) break;
+        endIndex += character.length;
+        count += 1;
+    }
+    return value.slice(0, endIndex);
+}
+
 export class OutputDeliveryCollector {
     readonly stdout: Writable;
     readonly stderr: Writable;
 
     private readonly artifactRun: OutputArtifactRun;
     private readonly options: Required<Pick<OutputDeliveryOptions,
-        "mode" | "estimatedTokenLimit" | "combinedLineLimit" | "responseByteLimit" |
+        "mode" | "estimatedTokenLimit" | "combinedLineLimit" | "inlineCharacterLimit" |
+        "inlineLineLimit" | "responseByteLimit" |
         "metadataReserveBytes" | "previewHeadBytes" | "previewTailBytes" | "inputHighWaterMarkBytes">>;
     private readonly accumulators: Record<OutputArtifactChannel, ChannelAccumulator>;
     private readonly inputErrors: Record<OutputArtifactChannel, Error | null> = { stdout: null, stderr: null };
@@ -284,6 +308,8 @@ export class OutputDeliveryCollector {
             mode: options.mode || "auto",
             estimatedTokenLimit: positiveInteger(options.estimatedTokenLimit, DEFAULT_INLINE_ESTIMATED_TOKEN_LIMIT),
             combinedLineLimit: positiveInteger(options.combinedLineLimit, DEFAULT_INLINE_COMBINED_LINE_LIMIT),
+            inlineCharacterLimit: positiveInteger(options.inlineCharacterLimit, Number.MAX_SAFE_INTEGER),
+            inlineLineLimit: positiveInteger(options.inlineLineLimit, Number.MAX_SAFE_INTEGER),
             responseByteLimit,
             metadataReserveBytes,
             previewHeadBytes: positiveInteger(options.previewHeadBytes, 4096),
@@ -407,10 +433,12 @@ export class OutputDeliveryCollector {
 
         const autoWithinTokenLimit = stats.combined.estimatedTokens <= this.options.estimatedTokenLimit;
         const autoWithinLineLimit = stats.combined.lines <= this.options.combinedLineLimit;
+        const withinCallerLineLimit = stats.combined.lines <= this.options.inlineLineLimit;
         if (requestedMode === "auto" && !autoWithinTokenLimit) reasons.push("estimated_token_limit_exceeded");
         if (requestedMode === "auto" && !autoWithinLineLimit) reasons.push("combined_line_limit_exceeded");
+        if (!withinCallerLineLimit) reasons.push("caller_inline_line_limit_exceeded");
         const interrupted = manifest.status === "interrupted";
-        const shouldTryInline = !interrupted && (requestedMode === "inline"
+        const shouldTryInline = !interrupted && withinCallerLineLimit && (requestedMode === "inline"
             || (requestedMode === "auto" && autoWithinTokenLimit && autoWithinLineLimit));
         if (interrupted && (requestedMode === "auto" || requestedMode === "inline")) {
             reasons.push("interrupted_output_preserved");
@@ -421,7 +449,10 @@ export class OutputDeliveryCollector {
             if (stats.combined.rawBytes <= contentBudget) {
                 const stdout = (await fs.promises.readFile(this.artifactRun.stdoutPath)).toString("utf8");
                 const stderr = (await fs.promises.readFile(this.artifactRun.stderrPath)).toString("utf8");
-                if (serializedBytes({ stdout, stderr }) <= contentBudget) {
+                const combinedCharacters = countTextCharacters(stdout) + countTextCharacters(stderr);
+                const withinCallerCharacterLimit = combinedCharacters <= this.options.inlineCharacterLimit;
+                if (!withinCallerCharacterLimit) reasons.push("caller_inline_character_limit_exceeded");
+                if (withinCallerCharacterLimit && serializedBytes({ stdout, stderr }) <= contentBudget) {
                     const inlineResult: OutputDeliveryResult = { ...base, mode: "inline", stdout, stderr };
                     if (serializedBytes(inlineResult) <= this.options.responseByteLimit) {
                         try {
@@ -433,7 +464,10 @@ export class OutputDeliveryCollector {
                     }
                 }
             }
-            if (!reasons.includes("inline_spool_cleanup_failed")) reasons.push("response_byte_limit_exceeded");
+            if (!reasons.includes("inline_spool_cleanup_failed")
+                && !reasons.includes("caller_inline_character_limit_exceeded")) {
+                reasons.push("response_byte_limit_exceeded");
+            }
         }
 
         const fileResult: OutputDeliveryResult = {

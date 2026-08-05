@@ -8,6 +8,7 @@ process.env.SANDBOX_DATA_ROOT = dataRoot;
 process.env.SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB = "0";
 
 const { execute } = await import("../mcps/sandbox/dist/executor.js");
+const { HARD_RESPONSE_BYTE_LIMIT } = await import("../mcps/sandbox/dist/output-delivery.js");
 const { registerBatch } = await import("../mcps/sandbox/dist/tools/batch.js");
 const { registerExec } = await import("../mcps/sandbox/dist/tools/exec.js");
 
@@ -80,7 +81,17 @@ test("sandbox_exec omits artifact metadata for a small inline result", async () 
     const response = await handler(nodeCode(`process.stdout.write("direct-output");`), {});
     assert.match(response.content[0].text, /direct-output/u);
     assert.doesNotMatch(response.content[0].text, /输出交付|artifactId|manifest:/u);
-    assert.equal(response.structuredContent.artifact, null);
+    assert.equal(response.structuredContent, undefined);
+});
+
+test("a 6.8K result stays inline with maxOutput 20K", async () => {
+    const result = await execute({
+        ...nodeCode(`process.stdout.write("x".repeat(6784));`),
+        maxOutput: 20_000,
+    });
+    assert.equal(result.deliveryMode, "inline");
+    assert.equal(result.stdout.length, 6_784);
+    assert.equal(result.artifact, null);
 });
 
 test("2001 process-output lines are delivered through a complete artifact", async () => {
@@ -167,6 +178,8 @@ test("sandbox_exec classifies a started command timeout separately", async () =>
     assert.equal(response.structuredContent.commandStarted, true);
     assert.equal(response.structuredContent.killReason, "timeout");
     assert.ok(response.structuredContent.totalMs >= 200);
+    assert.match(response.structuredContent.text, /execution_timeout/u);
+    assert.match(response.structuredContent.text, /started/u);
     assert.match(response.content[0].text, /execution_timeout/u);
 });
 
@@ -213,6 +226,40 @@ test("batch maxTotalMemoryMB locally serializes three 64 MB reservations", async
     assert.ok(starts[2] - starts[1] >= 120, `second gap was ${starts[2] - starts[1]}ms`);
     assert.match(response.content[0].text, /3 个任务/u);
     assert.doesNotMatch(response.content[0].text, /artifact=/u);
+    assert.equal(response.structuredContent, undefined);
+});
+
+test("batch shares one response budget across otherwise-inline tasks", async () => {
+    const handler = createBatchHandler();
+    const response = await handler({
+        tasks: Array.from({ length: 4 }, () => nodeCode(`process.stdout.write("x".repeat(300000));`)),
+        maxParallel: 4,
+    }, {});
+    assert.match(response.content[0].text, /artifact=/u);
+    assert.ok(Buffer.byteLength(response.content[0].text, "utf8") < 512 * 1024);
+    assert.ok(response.structuredContent.tasks.every((task) => task.artifact));
+    assert.match(response.structuredContent.text, /artifact=/u);
+});
+
+test("batch final response stays under the hard line for multibyte output", async () => {
+    const handler = createBatchHandler();
+    const response = await handler({
+        tasks: Array.from({ length: 10 }, () => nodeCode(`process.stdout.write("甲".repeat(30000));`)),
+        maxParallel: 10,
+    }, {});
+    assert.ok(Buffer.byteLength(JSON.stringify(response), "utf8") <= HARD_RESPONSE_BYTE_LIMIT);
+    assert.match(response.content[0].text, /artifact=/u);
+    assert.ok(response.structuredContent.tasks.every((task) => task.artifact));
+});
+
+test("batch final response stays under the hard line for JSON-heavy output", async () => {
+    const handler = createBatchHandler();
+    const response = await handler({
+        tasks: Array.from({ length: 10 }, () => nodeCode(`process.stdout.write("\\0".repeat(15000));`)),
+        maxParallel: 10,
+    }, {});
+    assert.ok(Buffer.byteLength(JSON.stringify(response), "utf8") <= HARD_RESPONSE_BYTE_LIMIT);
+    assert.match(response.content[0].text, /artifact=/u);
 });
 
 let passed = 0;

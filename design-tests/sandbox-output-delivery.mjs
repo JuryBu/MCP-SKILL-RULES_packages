@@ -13,6 +13,10 @@ const {
     HARD_RESPONSE_BYTE_LIMIT,
 } = await import("../mcps/sandbox/dist/output-delivery.js");
 const {
+    appendTiming,
+    ensureModelVisibleToolResult,
+} = await import("../mcps/sandbox/dist/lifecycle.js");
+const {
     cleanExpiredOutputArtifacts,
     createOutputArtifactRun,
     getOutputArtifactStats,
@@ -80,6 +84,69 @@ test("auto falls back after 2000 combined lines while inline can override it", a
     assert.equal(forcedResult.stdout, content);
     assert.equal(forcedResult.artifact, undefined);
     assert.deepEqual(artifactIds(), beforeForced);
+});
+
+test("a 20K caller character budget does not lose the metadata reserve", async () => {
+    const content = "x".repeat(6_784);
+    const collector = await createOutputDeliveryCollector({ inlineCharacterLimit: 20_000 });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "inline");
+    assert.equal(result.stdout, content);
+    assert.equal(result.artifact, undefined);
+});
+
+test("caller character budgets count text characters separately from UTF-8 bytes", async () => {
+    const content = "甲".repeat(6_000);
+    assert.equal(Buffer.byteLength(content, "utf8"), 18_000);
+    const collector = await createOutputDeliveryCollector({ inlineCharacterLimit: 7_000 });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "inline");
+    assert.equal(result.stdout, content);
+});
+
+test("emoji count as one caller-visible character", async () => {
+    const content = "🙂".repeat(4_000);
+    assert.equal(content.length, 8_000);
+    const collector = await createOutputDeliveryCollector({ inlineCharacterLimit: 4_000 });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "inline");
+    assert.equal(result.stdout, content);
+});
+
+test("an explicit maxLines value can raise the auto line budget", async () => {
+    const content = "line\n".repeat(3_000);
+    const collector = await createOutputDeliveryCollector({
+        combinedLineLimit: 5_000,
+        inlineLineLimit: 5_000,
+    });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "inline");
+    assert.equal(result.stdout, content);
+});
+
+test("caller character overflow retains the full artifact", async () => {
+    const content = "x".repeat(20_001);
+    const collector = await createOutputDeliveryCollector({ inlineCharacterLimit: 20_000 });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "file");
+    assert.ok(result.reasons.includes("caller_inline_character_limit_exceeded"));
+    assert.equal(result.reasons.includes("response_byte_limit_exceeded"), false);
+    assert.equal(fs.readFileSync(result.artifact.stdoutPath, "utf8"), content);
+});
+
+test("caller line overflow overrides forced inline and retains the full artifact", async () => {
+    const content = "line\n".repeat(25);
+    const collector = await createOutputDeliveryCollector({ mode: "inline", inlineLineLimit: 5 });
+    await collector.write("stdout", content);
+    const result = await collector.finalize();
+    assert.equal(result.mode, "file");
+    assert.ok(result.reasons.includes("caller_inline_line_limit_exceeded"));
+    assert.equal(fs.readFileSync(result.artifact.stdoutPath, "utf8"), content);
 });
 
 test("interrupted auto output retains a recovery artifact", async () => {
@@ -156,6 +223,37 @@ test("a small caller response budget falls back to manifest metadata", async () 
     assert.equal(result.stdout, undefined);
     assert.ok(result.reasons.includes("response_byte_limit_exceeded"));
     assert.ok(result.reasons.includes("file_preview_response_limit_exceeded"));
+});
+
+test("structured metadata mirrors bounded text for Codex model visibility", () => {
+    const result = appendTiming({
+        content: [{ type: "text", text: "visible stdout" }],
+        structuredContent: { exitCode: 1 },
+    }, Date.now());
+    assert.match(result.structuredContent.text, /visible stdout/u);
+    assert.match(result.structuredContent.text, /耗时/u);
+});
+
+test("large text moves into structured output without duplication or metadata loss", () => {
+    const content = "x".repeat(500 * 1024);
+    const result = ensureModelVisibleToolResult({
+        content: [{ type: "text", text: content }],
+        structuredContent: { exitCode: 1 },
+    });
+    assert.equal(result.structuredContent.exitCode, 1);
+    assert.equal(result.structuredContent.text, content);
+    assert.match(result.content[0].text, /structuredContent\.text/u);
+});
+
+test("JSON-heavy text keeps one structured copy when mirroring would break the response guard", () => {
+    const content = "\0".repeat(100_000);
+    const result = ensureModelVisibleToolResult({
+        content: [{ type: "text", text: content }],
+        structuredContent: { exitCode: 1 },
+    });
+    assert.equal(result.structuredContent.exitCode, 1);
+    assert.equal(result.structuredContent.text, content);
+    assert.match(result.content[0].text, /structuredContent\.text/u);
 });
 
 test("startup cleanup may remove expired incomplete artifacts", async () => {

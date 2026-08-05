@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { touchActivity, appendTiming } from "../lifecycle.js";
+import { touchActivity, appendTiming, ensureModelVisibleToolResult } from "../lifecycle.js";
 import { normalizeOwnerId } from "../owner.js";
 import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { runCouncil } from "../council/engine.js";
@@ -209,11 +209,11 @@ export function registerCouncil(server: McpServer): void {
                 } catch (err) {
                     const admissionError = serializeResourceAdmissionError(err);
                     if (admissionError) {
-                        return {
+                        return ensureModelVisibleToolResult({
                             isError: true,
                             structuredContent: { error: admissionError },
                             content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council resume 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                        };
+                        });
                     }
                     return appendTiming({
                         content: [{ type: "text" as const, text: `❌ sandbox_council resume 失败: ${err instanceof Error ? err.message : String(err)}` }],
@@ -248,11 +248,11 @@ export function registerCouncil(server: McpServer): void {
                 } catch (err) {
                     const admissionError = serializeResourceAdmissionError(err);
                     if (admissionError) {
-                        return {
+                        return ensureModelVisibleToolResult({
                             isError: true,
                             structuredContent: { error: admissionError },
                             content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                        };
+                        });
                     }
                     return appendTiming({
                         content: [{ type: "text" as const, text: `❌ sandbox_council 后台启动失败: ${err instanceof Error ? err.message : String(err)}` }],
@@ -283,11 +283,11 @@ export function registerCouncil(server: McpServer): void {
             } catch (err) {
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: Council 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                    };
+                    });
                 }
                 return appendTiming({
                     content: [{ type: "text" as const, text: [`❌ sandbox_council 失败: ${err instanceof Error ? err.message : String(err)}`, synchronousRunId ? formatCouncilArtifactSummary(synchronousRunId) : ""].filter(Boolean).join("\n\n") }],

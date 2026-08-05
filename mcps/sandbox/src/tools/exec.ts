@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { touchActivity, appendTiming } from "../lifecycle.js";
+import { touchActivity, appendTiming, ensureModelVisibleToolResult } from "../lifecycle.js";
 import { execute } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 
@@ -161,7 +161,7 @@ command 模式：执行系统命令，自动用 shell 包装
 
                 const output = {
                     content: [{ type: "text" as const, text: parts.join("\n") }],
-                    structuredContent: {
+                    ...((result.exitCode !== 0 || result.killed || result.artifact) ? { structuredContent: {
                         errorType,
                         commandStarted: true,
                         queueWaitMs: result.queueWaitMs,
@@ -171,21 +171,21 @@ command 模式：执行系统命令，自动用 shell 包装
                         killed: result.killed,
                         killReason: result.killReason,
                         artifact: result.artifact,
-                    },
+                    } } : {}),
                 };
 
                 return appendTiming(output, startTime);
             } catch (err) {
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{
                             type: "text" as const,
                             text: `❌ ${admissionError.type}: 命令尚未启动；资源调度等待 ${admissionError.queueWaitMs}ms 后失败，建议 ${admissionError.retryAfterMs}ms 后随机重试`,
                         }],
-                    };
+                    });
                 }
                 return {
                     content: [{ type: "text" as const, text: `❌ 执行异常: ${err instanceof Error ? err.message : String(err)}` }],

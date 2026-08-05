@@ -5,7 +5,7 @@ import os from "os";
 import { createHash } from "crypto";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { touchActivity, formatElapsed } from "../lifecycle.js";
+import { touchActivity, ensureModelVisibleToolResult, formatElapsed } from "../lifecycle.js";
 import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { acquireResourceLease, adoptResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
@@ -968,11 +968,11 @@ export function registerLaunch(server: McpServer): void {
                 try { fs.unlinkSync(handshakePath); } catch { /* */ }
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
-                    return {
+                    return ensureModelVisibleToolResult({
                         isError: true,
                         structuredContent: { error: admissionError },
                         content: [{ type: "text" as const, text: `❌ ${admissionError.type}: launch 尚未启动；等待 ${admissionError.queueWaitMs}ms 后仍无资源，建议 ${admissionError.retryAfterMs}ms 后重试` }],
-                    };
+                    });
                 }
                 return appendTiming({
                     content: [{ type: "text" as const, text: `❌ 启动失败: ${err}\n` }],

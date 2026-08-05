@@ -205,7 +205,7 @@ Sandbox backend 会把资源等待、命令运行和外层调用期限分开报�
 - `caller_deadline_exceeded`：排队与执行合计超过调用方总期限；结合 `mayHaveStarted` 判断命令是否可能已经开始
 - `broker_backend_timeout`：broker 与 Sandbox backend 的连接或响应超时；是否已经执行可能未知，应先查询持久任务或外部状态
 
-Sandbox 在自身预留额度和系统可用内存都充足时立即并行，只有接近任一内存底线时才等待；`admission_timeout` 表示等待结束前始终没有启动。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。
+Sandbox 在自身预留额度和系统可用内存都充足时立即并行，只有接近任一内存底线时才等待；`admission_timeout` 表示等待结束前始终没有启动。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。`maxOutput` 是正文字符预算，不能把响应元数据预留从中提前扣掉；`maxLines` 超预算时也必须保留完整 artifact，批量任务共享单次响应总预算。
 
 以上是 Sandbox 内部状态，不替代 Codex 宿主自己的 MCP 外层期限与短轮询策略：
 
