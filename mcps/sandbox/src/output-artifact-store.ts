@@ -256,17 +256,17 @@ export class OutputArtifactRun {
 export async function createOutputArtifactRun(options: CreateOutputArtifactOptions = {}): Promise<OutputArtifactRun> {
     const artifactId = safeArtifactId(options.artifactId || crypto.randomUUID());
     const directory = path.join(OUTPUT_ARTIFACT_ROOT, artifactId);
-    await fs.promises.mkdir(OUTPUT_ARTIFACT_ROOT, { recursive: true });
-    await fs.promises.mkdir(directory, { recursive: false });
-    const run = new OutputArtifactRun(
-        artifactId,
-        directory,
-        positiveInteger(options.ttlMs, configuredTtlMs()),
-        positiveInteger(options.writeHighWaterMarkBytes, 64 * 1024),
-        options.readHint || "",
-    );
     activeOutputArtifactIds.add(artifactId);
     try {
+        await fs.promises.mkdir(OUTPUT_ARTIFACT_ROOT, { recursive: true });
+        await fs.promises.mkdir(directory, { recursive: false });
+        const run = new OutputArtifactRun(
+            artifactId,
+            directory,
+            positiveInteger(options.ttlMs, configuredTtlMs()),
+            positiveInteger(options.writeHighWaterMarkBytes, 64 * 1024),
+            options.readHint || "",
+        );
         await run.initialize();
         return run;
     } catch (error) {
@@ -288,6 +288,10 @@ export async function cleanExpiredOutputArtifacts(nowMs = Date.now(), removeInco
     for (const entry of entries) {
         if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
         const directory = path.join(OUTPUT_ARTIFACT_ROOT, entry.name);
+        if (activeOutputArtifactIds.has(entry.name)) {
+            result.retained += 1;
+            continue;
+        }
         const manifestPath = path.join(directory, "manifest.json");
         try {
             const manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf8")) as Partial<OutputArtifactManifest>;
@@ -320,6 +324,10 @@ export async function getOutputArtifactStats(): Promise<OutputArtifactStats> {
     for (const entry of entries) {
         if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
         result.runs += 1;
+        if (activeOutputArtifactIds.has(entry.name)) {
+            result.incomplete += 1;
+            continue;
+        }
         try {
             const manifestPath = path.join(OUTPUT_ARTIFACT_ROOT, entry.name, "manifest.json");
             const manifest = JSON.parse(await fs.promises.readFile(manifestPath, "utf8")) as Partial<OutputArtifactManifest>;

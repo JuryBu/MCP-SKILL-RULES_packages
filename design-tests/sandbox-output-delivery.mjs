@@ -263,6 +263,9 @@ test("cleanup protects active artifacts and removes expired orphaned artifacts",
     const retained = await cleanExpiredOutputArtifacts(now);
     assert.ok(retained.retained >= 1);
     assert.equal(fs.existsSync(run.directory), true);
+    const activeStats = await getOutputArtifactStats();
+    assert.equal(activeStats.invalid, 0);
+    assert.ok(activeStats.incomplete >= 1);
 
     const orphanId = crypto.randomUUID();
     const orphanDirectory = path.join(OUTPUT_ARTIFACT_ROOT, orphanId);

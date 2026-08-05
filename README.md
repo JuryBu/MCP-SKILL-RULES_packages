@@ -19,7 +19,7 @@
 | 组件 | 版本 | 主要用途 |
 | --- | ---: | --- |
 | `memory-store` | 1.22.4 | 记忆、四宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
-| `sandbox` | 1.16.3 | 隔离执行、全局内存调度、按需 artifact、自适应输出、持久会话、Codex 任务与多模型 Council |
+| `sandbox` | 1.16.4 | 隔离执行、全局内存调度、按需 artifact、自适应输出、持久会话、Codex 任务与多模型 Council |
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
@@ -174,7 +174,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | Component | Version | Purpose |
 | --- | ---: | --- |
 | `memory-store` | 1.22.4 | Memory, four-host Conversation/Recall, Record, Golden Extract, Stage Guard, scheduling recovery, and host routing |
-| `sandbox` | 1.16.3 | Isolated execution, global memory admission, on-demand artifacts, adaptive output, sessions, Codex tasks, and multi-model Council |
+| `sandbox` | 1.16.4 | Isolated execution, global memory admission, on-demand artifacts, adaptive output, sessions, Codex tasks, and multi-model Council |
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
