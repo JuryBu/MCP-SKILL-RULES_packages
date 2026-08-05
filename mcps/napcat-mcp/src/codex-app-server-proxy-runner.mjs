@@ -19,6 +19,7 @@ const DEFAULT_START_TIMEOUT_MS = 15000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
+const DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS = 250;
 
 const CLI_OPTIONS = new Set([
   "runtime-state",
@@ -282,6 +283,38 @@ function codexCandidates(options = {}) {
     .map((candidate) => ({ candidate, modifiedAt: fsImpl.statSync(candidate).mtimeMs }))
     .sort((left, right) => right.modifiedAt - left.modifiedAt || right.candidate.localeCompare(left.candidate))
     .map((entry) => entry.candidate);
+}
+
+function executableRevision(executablePath, fsImpl = fs) {
+  if (!executablePath) return null;
+  try {
+    const stat = fsImpl.statSync(executablePath);
+    return { executablePath: path.resolve(executablePath), modifiedAt: stat.mtimeMs, size: stat.size };
+  } catch {
+    return null;
+  }
+}
+
+export async function findExecutableRefresh(currentRevision, options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const candidate = codexCandidates({
+    fsImpl,
+    executablePath: options.executablePath,
+    localAppData: options.localAppData,
+  })[0];
+  const nextRevision = executableRevision(candidate, fsImpl);
+  if (!nextRevision) return null;
+  const changed = !currentRevision
+    || nextRevision.executablePath !== currentRevision.executablePath
+    || nextRevision.modifiedAt !== currentRevision.modifiedAt
+    || nextRevision.size !== currentRevision.size;
+  if (!changed || Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
+  await (options.probeExecutable ?? probeExecutable)(nextRevision.executablePath, options.probePort, {
+    ...options,
+    timeoutMs: options.startTimeoutMs,
+  });
+  if (Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
+  return nextRevision;
 }
 
 function wait(milliseconds) {
@@ -565,6 +598,7 @@ export async function runCodexAppServerProxyService(options = {}) {
   const controlToken = ensureControlToken(options.tokenFilePath, fsImpl);
   const previous = readJsonObject(options.runtimeStatePath, fsImpl);
   let currentExecutable = null;
+  let currentExecutableRevision = null;
   let appServer = null;
   let proxy = null;
   let stopRequested = false;
@@ -679,6 +713,7 @@ export async function runCodexAppServerProxyService(options = {}) {
           timeoutMs: options.startTimeoutMs,
         });
         currentExecutable = candidate;
+        currentExecutableRevision = executableRevision(candidate, fsImpl);
         break;
       } catch (error) {
         lastProbeError = error;
@@ -760,14 +795,57 @@ export async function runCodexAppServerProxyService(options = {}) {
           resolveProxyFailureArtifacts(options, status, fsImpl, now);
         }
         log("app_server_started", { executablePath: currentExecutable, appServerPid: appServer.pid ?? null });
-        const exit = await Promise.race([
-          waitForExit(appServer),
-          (async () => {
-            while (!stopRequested && !fsImpl.existsSync(options.stopFilePath)) await wait(250);
-            return { code: null, signal: "stop_requested" };
-          })(),
-        ]);
+        const appServerExit = waitForExit(appServer);
+        let exit;
+        while (true) {
+          let cycleActive = true;
+          const lifecycleWatch = (async () => {
+            let nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
+            while (cycleActive) {
+              await wait(250);
+              if (!cycleActive) return { code: null, signal: "watch_stopped" };
+              if (stopRequested || fsImpl.existsSync(options.stopFilePath)) {
+                return { code: null, signal: "stop_requested" };
+              }
+              if (Date.now() < nextRefreshAt) continue;
+              nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
+              const revision = await findExecutableRefresh(currentExecutableRevision, {
+                ...options,
+                fsImpl,
+                proxyStatus: () => proxy.status(),
+              }).catch((error) => {
+                log("candidate_refresh_probe_failed", { error: publicError(error) });
+                return null;
+              });
+              if (!cycleActive) return { code: null, signal: "watch_stopped" };
+              if (revision) return { code: null, signal: "executable_refresh", revision };
+            }
+            return { code: null, signal: "watch_stopped" };
+          })();
+          exit = await Promise.race([appServerExit, lifecycleWatch]);
+          cycleActive = false;
+          if (exit.signal !== "executable_refresh" || Number(proxy.status()?.clientCount ?? 0) === 0) break;
+          log("app_server_executable_refresh_deferred", {
+            nextExecutable: exit.revision,
+            clientCount: Number(proxy.status()?.clientCount ?? 0),
+          });
+        }
         if (stopRequested || fsImpl.existsSync(options.stopFilePath)) break;
+        if (exit.signal === "executable_refresh") {
+          const previousExecutable = currentExecutableRevision;
+          currentExecutableRevision = exit.revision;
+          currentExecutable = exit.revision.executablePath;
+          pauseForUpstream("APP_SERVER_REFRESHING", "检测到 Codex 更新，正在安全切换受管 App Server");
+          persist({
+            state: "refreshing",
+            automationEnabled: false,
+            executablePath: currentExecutable,
+            lastKnownGoodExecutablePath: currentExecutable,
+            lastError: null,
+          });
+          log("app_server_executable_refresh", { previousExecutable, nextExecutable: exit.revision });
+          continue;
+        }
         restartFailureCount += 1;
         pauseForUpstream("APP_SERVER_EXITED", "Codex App Server 意外退出，自动唤醒已暂停并等待透明中转恢复");
         persist({

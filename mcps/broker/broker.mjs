@@ -10,6 +10,7 @@ import {
   createBackendRequestOptions,
   createBrokerBackendTimeoutResult,
   createBrokerRequestTimeoutError,
+  isFatalBackendTransportError,
   isRequestTimeoutError,
   remainingBudgetMs,
   resolveToolCallBudget,
@@ -602,12 +603,21 @@ class BackendManager {
       }
     });
 
+    let connectionGeneration = null;
     transport.onclose = () => {
-      const closedPid = this.lastPid;
-      this.lastError = null;
-      this.client = null;
-      this.transport = null;
-      log("backend closed", { endpoint: this.name, generation: this.generation, pid: closedPid });
+      const closedPid = transport.pid ?? null;
+      const isCurrentTransport = this.transport === transport;
+      if (isCurrentTransport) {
+        this.lastError = null;
+        this.client = null;
+        this.transport = null;
+      }
+      log("backend closed", {
+        endpoint: this.name,
+        generation: connectionGeneration,
+        pid: closedPid,
+        stale: !isCurrentTransport,
+      });
     };
     transport.onerror = (error) => {
       this.lastError = error.message;
@@ -640,6 +650,7 @@ class BackendManager {
     this.client = client;
     this.transport = transport;
     this.generation += 1;
+    connectionGeneration = this.generation;
     this.lastStartedAt = new Date().toISOString();
     this.lastActivityAt = this.lastStartedAt;
     this.lastPid = transport.pid;
@@ -683,8 +694,14 @@ class BackendManager {
       );
     } catch (error) {
       this.lastError = error.message;
-      log("backend request failed", { endpoint: this.name, method: request.method, error: error.message });
-      if (options.closeOnError !== false) {
+      const fatalTransportError = isFatalBackendTransportError(error);
+      log("backend request failed", {
+        endpoint: this.name,
+        method: request.method,
+        error: error.message,
+        fatalTransportError,
+      });
+      if (fatalTransportError || options.closeOnError !== false) {
         await this.close();
       }
       throw error;
@@ -740,6 +757,22 @@ class EndpointBroker {
       lastReloadAt: this.lastReloadAt,
       backend: this.backend.status(),
     };
+  }
+
+  async probeBackend(options = {}) {
+    const request = () => this.backend.request(
+      { method: "tools/list", params: {} },
+      ListToolsResultSchema,
+      { closeOnError: true, timeoutMs: options.timeoutMs },
+    );
+    try {
+      const result = await request();
+      return { healthy: true, toolCount: result.tools.length, recovered: false, backend: this.backend.status() };
+    } catch (error) {
+      if (!isFatalBackendTransportError(error)) throw error;
+      const result = await request();
+      return { healthy: true, toolCount: result.tools.length, recovered: true, backend: this.backend.status() };
+    }
   }
 
   createServer() {
@@ -1077,9 +1110,40 @@ const server = http.createServer(async (req, res) => {
       sendJson(res, 200, { ok: true, brokerPid: process.pid, ...result });
       return;
     }
-    if (req.url === "/health") {
+    const requestUrl = new URL(req.url || "/", `http://${host}:${port}`);
+    if (requestUrl.pathname === "/health") {
       writeState(brokers);
-      sendJson(res, 200, { ok: true, pid: process.pid, endpoints: Object.keys(endpoints) });
+      const endpointName = requestUrl.searchParams.get("endpoint");
+      const deep = requestUrl.searchParams.get("deep") === "1";
+      if (!deep) {
+        sendJson(res, 200, { ok: true, healthy: true, pid: process.pid, endpoints: Object.keys(endpoints) });
+        return;
+      }
+      const remoteAddress = String(req.socket.remoteAddress || "");
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(remoteAddress)) {
+        sendJson(res, 403, { ok: false, healthy: false, error: "Deep health is loopback-only" });
+        return;
+      }
+      const broker = endpointName ? brokers[endpointName] : null;
+      if (!broker) {
+        sendJson(res, 400, { ok: false, healthy: false, error: "Deep health requires a known endpoint" });
+        return;
+      }
+      try {
+        const probe = await broker.probeBackend({ timeoutMs: Math.min(requestTimeoutMs, 15000) });
+        writeState(brokers);
+        sendJson(res, 200, { ok: true, healthy: true, pid: process.pid, endpoint: endpointName, ...probe });
+      } catch (error) {
+        writeState(brokers);
+        sendJson(res, 200, {
+          ok: false,
+          healthy: false,
+          pid: process.pid,
+          endpoint: endpointName,
+          error: error.message,
+          backend: broker.backend.status(),
+        });
+      }
       return;
     }
 

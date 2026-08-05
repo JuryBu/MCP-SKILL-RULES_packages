@@ -144,8 +144,8 @@ function Test-PackageStructure {
     foreach ($name in @("memory-store", "web-fetcher", "sandbox")) {
         $packageJson = Get-Content -LiteralPath (Join-Path $mcpRoot "$name\package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
         if (-not $packageJson.scripts.'test:portable') { throw "Missing portable build test script: $name" }
-        $scriptText = $packageJson.scripts | ConvertTo-Json -Compress
-        if ($scriptText -match 'tests[/\\]') { throw "Public package exposes an internal test path that is not bundled: $name" }
+        $portableScriptText = [string]$packageJson.scripts.'test:portable'
+        if ($portableScriptText -match 'tests[/\\]') { throw "Portable build test exposes an internal test path that is not bundled: $name" }
     }
     $napcatPackage = Get-Content -LiteralPath (Join-Path $mcpRoot "napcat-mcp\package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $napcatPackage.scripts.check -or -not $napcatPackage.scripts.test) {
@@ -193,6 +193,7 @@ function Test-PackageStructure {
         "mcps\napcat-mcp\ops\start-napcat-heartbeat.ps1",
         "mcps\napcat-mcp\test\core.test.mjs",
         "skills\skills_manifest.md",
+        "install\Update-CodexMcpBroker.ps1",
         "templates\config.codex.toml",
         "templates\env.example.ps1"
     )) {

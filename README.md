@@ -73,6 +73,8 @@
 
 broker 会为普通请求使用 120 秒默认超时，并根据工具参数中的 `waitSeconds` / `timeout` 放宽长任务等待，上限默认 30 分钟。状态文件在退出、`SIGBREAK` 和 `beforeExit` 时尽力落盘。
 
+broker 子后端断管后会丢弃失效 transport，但不会自动重放结果未知的当前工具调用；下一次调用或仅允许本机回环访问的 `GET /health?endpoint=<name>&deep=1` 只读探针会建立新子后端。已有本机安装可用 `install\Update-CodexMcpBroker.ps1` 先备份、受控重启并验证 NapCat/Sandbox 等深层健康，同时用 `-ProtectedStatePaths` 保护任务账本等持久状态。
+
 ### Rules：四宿主的人类化工作规则
 
 Rules 保留少汇报腔、解释技术概念、Plan / Task / Stage Guard、子代理证据、Office 视觉验收和隐私边界等工作习惯，主要目标是让 AI 说人话并减少模板化伪人感。猫娘表达已从 Codex 核心工程规则中拆成可选组件：不喜欢角色风格时可安装中性版，喜欢原有表达时可安装普通猫娘版，双机协作环境则选择开发机或训练机版。

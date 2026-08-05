@@ -82,7 +82,7 @@ Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官�
 NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ```
 
-`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。
+`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。代理运行期间还会比较当前最新 `codex.exe` 的路径、修改时间和文件大小；只有 Desktop 已断开、代理客户端数为 0，并且新候选通过独立探针时，才结束旧受管 App Server 并切换到新版本，避免 Codex 更新后长期沿用旧 App Server，也避免在线会话被强制中断。
 
 更新脚本不会终止 Codex Desktop。便携包会启动隐藏激活器，等待当前 Codex 与代理连接自然断开后，再干净重启受管代理并热重载 NapCat backend；用户只需正常退出 Codex、等待约 10 秒后重新打开，不需要重启 Windows。
 
@@ -122,6 +122,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 整机关机、Windows 卡死、runner 被终止、QQ 或 NapCat 离线后，心跳都会停止。缺失心跳因此能作为失联线索，但本机死亡时无法主动发送“我死了”；真正的超时报警仍应由群外接收端判断。
 
 `ops/` 中还提供任务路由器与 `CodexNapCatSupervisor` 的启动、停止、状态和登录后自动启动脚本。监督器是当前 Windows 用户下的隐藏普通进程，不是系统服务；它同时核对 broker 健康与进程、NapCat OneBot 与进程、Codex 进程和 open task，条件齐全才保持任务路由运行。NapCat 完全未运行时才尝试无二维码快速登录，已有进程但 OneBot 离线时不会启动第二份。无二维码快登超时或账号不符时，登录脚本会结束本次启动的隐藏进程树，避免留下一个拿不到二维码、又阻止后续恢复的僵尸 NapCat。
+
+监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
 有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本会使用 binding 中的 `expectedSelfId` 先尝试该账号的快速登录；授权有效则不显示二维码，授权失效且 NapCat 生成新二维码时才弹出小窗口并阻塞到登录成功或明确失败。监督器始终传 `-NoQr`，不会在无人值守桌面弹出二维码。
 

@@ -64,6 +64,28 @@ $env:CODEX_MCP_BROKER_REQUEST_TIMEOUT_MS = "120000"
 $env:CODEX_MCP_BROKER_WAIT_TIMEOUT_MS = "1800000"
 ```
 
+### 4.1 Update A Running Broker Without Replacing State
+
+Use the guarded updater when public broker source changes but local task registries, bindings, or other persistent state must survive:
+
+```powershell
+$DataRoot = if ($env:CODEX_TOOLKIT_DATA_ROOT) {
+  $env:CODEX_TOOLKIT_DATA_ROOT
+} else {
+  "$env:USERPROFILE\.codex-toolkit"
+}
+
+./install/Update-CodexMcpBroker.ps1 `
+  -SourceBrokerRoot ".\mcps\broker" `
+  -BrokerRoot "$env:USERPROFILE\.codex\mcp-http-broker" `
+  -DeepHealthEndpoints @("napcat", "sandbox") `
+  -ProtectedStatePaths @(
+    (Join-Path $DataRoot "napcat-mcp\state\task-registry.json")
+  )
+```
+
+The updater backs up the installed broker code, hashes protected state before and after the restart, then checks shallow broker health and selected read-only deep probes. A failed update restores the previous code and starts it again. It never replays the tool call that exposed a broken transport, and it does not read, send, or acknowledge task messages.
+
 ## 5. Configure Codex
 
 ```powershell

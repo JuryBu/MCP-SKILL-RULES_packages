@@ -85,6 +85,42 @@ export function isRequestTimeoutError(error) {
   return hasSdkTimeoutData && hasSdkTimeoutMessage;
 }
 
+function errorChain(error) {
+  const values = [];
+  const seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    values.push(current);
+    current = current.cause;
+  }
+  return values;
+}
+
+export function isFatalBackendTransportError(error) {
+  const transportCodes = new Set([
+    "EPIPE",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "ERR_STREAM_DESTROYED",
+    "ERR_IPC_CHANNEL_CLOSED",
+  ]);
+  const transportPatterns = [
+    /transport send error/i,
+    /transport (?:is )?closed/i,
+    /connection (?:is )?closed/i,
+    /transport.*not connected/i,
+    /not connected.*transport/i,
+    /socket hang up/i,
+    /broken pipe/i,
+  ];
+  return errorChain(error).some((value) => {
+    if (transportCodes.has(String(value.code ?? "").toUpperCase())) return true;
+    const message = String(value.message ?? value);
+    return transportPatterns.some((pattern) => pattern.test(message));
+  });
+}
+
 export function createBrokerBackendTimeoutResult({ endpoint, toolName, budget, backendStatus }) {
   const callerDeadline = budget.deadlineOwner === "caller";
   const details = {

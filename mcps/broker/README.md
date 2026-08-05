@@ -42,6 +42,8 @@ Call timeout behavior:
 - `CODEX_MCP_BROKER_WAIT_TIMEOUT_MS` defaults to `1800000` ms (30 minutes). Invalid timeout variables fall back to defaults, and the cap is never lower than the ordinary request timeout.
 - Timeout selection is argument-based, so it works for any compatible tool without hard-coding tool names. The selected absolute deadline is forwarded in MCP `_meta["io.github.jurybu/broker"]`; older backends may ignore it safely.
 - Frontend tool-call cancellation is propagated to the backend through the MCP SDK request signal. A broker-layer MCP request timeout returns `broker_backend_timeout`, which is distinct from a command's own execution timeout and does not recommend blind retries because the command may already have started. Endpoint `tools/list` calls keep their own short timeout.
+- Fatal child-transport failures such as `Transport send error`, broken pipes, closed transports, and reset sockets invalidate that backend immediately even for forwarded tool calls. The failed tool call is never replayed automatically because a mutating operation may already have taken effect; the next call reconnects to a fresh child.
+- `GET /health` remains a shallow process check. The loopback-only `GET /health?endpoint=<name>&deep=1` performs a read-only `tools/list` round trip, reconnects once after a fatal stale transport, and reports `healthy`, backend PID, generation, and tool count without invoking any business tool.
 
 Exa stateless bridge:
 
@@ -75,6 +77,7 @@ Commands:
 - From each sibling MCP source package, install its declared dependencies before starting the broker. In particular, the Exa bridge loads `../memory-store/node_modules/@modelcontextprotocol/sdk`; run `npm install` in `../memory-store` first, then start this package with `npm start`. Direct startup stores logs and broker state under `%USERPROFILE%\.codex-toolkit\broker` unless `CODEX_TOOLKIT_DATA_ROOT`, `CODEX_MCP_BROKER_LOG`, or `CODEX_MCP_BROKER_STATE` overrides it.
 - Syntax validation for both entry points: `npm run check`
 - The `npm run health` alias intentionally runs that static validation. This package does not ship the private PowerShell health scripts.
+- A receiver with an existing `%USERPROFILE%\.codex\mcp-http-broker` installation can run `install\Update-CodexMcpBroker.ps1`. It validates the changed broker lifecycle tests, backs up the installed code, restarts only the broker process tree, checks selected deep-health endpoints, and compares caller-supplied protected state hashes. Failure restores the previous code and starts it again.
 
 Shutdown behavior:
 

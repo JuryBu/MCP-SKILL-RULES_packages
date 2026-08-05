@@ -7,6 +7,7 @@ import {
   createBackendRequestOptions,
   createBrokerBackendTimeoutResult,
   createBrokerRequestTimeoutError,
+  isFatalBackendTransportError,
   isRequestTimeoutError,
   remainingBudgetMs,
   resolveToolCallBudget,
@@ -120,4 +121,14 @@ test("only MCP request timeout errors become broker backend timeout results", ()
   assert.equal(callerResult.structuredContent.errorType, "caller_deadline_exceeded");
   assert.equal(callerResult.structuredContent.totalMs, 315000);
   assert.match(callerResult.content[0].text, /^caller_deadline_exceeded:/);
+});
+
+test("fatal backend transport errors are separated from ordinary tool failures", () => {
+  assert.equal(isFatalBackendTransportError(new Error("Transport send error: HTTP request failed")), true);
+  const nested = new Error("outer failure", { cause: Object.assign(new Error("write failed"), { code: "EPIPE" }) });
+  assert.equal(isFatalBackendTransportError(nested), true);
+  assert.equal(isFatalBackendTransportError(new Error("transport is not connected")), true);
+  assert.equal(isFatalBackendTransportError(new Error("service is not connected to the configured account")), false);
+  assert.equal(isFatalBackendTransportError(new Error("HTTP request failed")), false);
+  assert.equal(isFatalBackendTransportError({ code: -32001, message: "Request timed out" }), false);
 });

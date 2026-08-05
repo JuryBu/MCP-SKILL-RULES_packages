@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
 import {
   acquireInstanceLock,
+  findExecutableRefresh,
   parseArguments,
   runCodexAppServerProxyService,
   terminateManagedAppServer,
@@ -274,6 +275,45 @@ test("managed App Server shutdown does not probe an unrelated listener after its
     },
   });
   assert.equal(checks, 0);
+});
+
+test("Codex executable refresh is accepted only while the Desktop proxy has no clients", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-refresh-test-"));
+  const executablePath = path.join(root, "codex.exe");
+  try {
+    fs.writeFileSync(executablePath, "new-binary", "utf8");
+    const currentRevision = { executablePath, modifiedAt: 1, size: 1 };
+    let probes = 0;
+    const active = await findExecutableRefresh(currentRevision, {
+      executablePath,
+      probePort: 18454,
+      proxyStatus: () => ({ clientCount: 1 }),
+      probeExecutable: async () => { probes += 1; },
+    });
+    assert.equal(active, null);
+    assert.equal(probes, 0);
+
+    const idle = await findExecutableRefresh(currentRevision, {
+      executablePath,
+      probePort: 18454,
+      proxyStatus: () => ({ clientCount: 0 }),
+      probeExecutable: async () => { probes += 1; },
+    });
+    assert.equal(idle.executablePath, path.resolve(executablePath));
+    assert.equal(probes, 1);
+
+    const clientCounts = [0, 1];
+    const connectedDuringProbe = await findExecutableRefresh(currentRevision, {
+      executablePath,
+      probePort: 18454,
+      proxyStatus: () => ({ clientCount: clientCounts.shift() ?? 1 }),
+      probeExecutable: async () => { probes += 1; },
+    });
+    assert.equal(connectedDuringProbe, null);
+    assert.equal(probes, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("a healthy managed App Server supersedes stale proxy alerts and fallback requests", async () => {

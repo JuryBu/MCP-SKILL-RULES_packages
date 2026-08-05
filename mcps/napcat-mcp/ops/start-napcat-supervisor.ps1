@@ -145,7 +145,7 @@ $Arguments = @(
   "--stop-file", $StopFilePath,
   "--lock", $LockPath,
   "--interval-ms", ([string]$IntervalMilliseconds),
-  "--broker-health-url", "http://127.0.0.1:14588/health",
+  "--broker-health-url", "http://127.0.0.1:14588/health?endpoint=napcat&deep=1",
   "--broker-start-script", $BrokerStartScript,
   "--login-script", $LoginScript,
   "--napcat-root", $NapCatRoot,
