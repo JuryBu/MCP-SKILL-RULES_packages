@@ -62,6 +62,7 @@ function baseOptions(fixture, overrides = {}) {
     once: true,
     checkBrokerHealth: async () => ({ known: true, healthy: true, reachable: true }),
     checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true }),
+    checkNapCatRuntime: async () => ({ known: true, ready: true, requiredFiles: [], missingFiles: [] }),
     checkNapCatProcesses: async () => ({ known: true, present: true, processes: [{ pid: 7003, name: "NapCat.exe" }] }),
     checkCodexProcesses: async () => ({ known: true, present: true, processes: [{ pid: 7001, name: "Codex.exe" }] }),
     checkBrokerProcesses: async () => ({ known: true, present: true, processes: [{ pid: 7002, name: "node.exe" }] }),
@@ -379,6 +380,42 @@ test("NapCat 离线且无进程时调用无二维码登录，并在冷却内抑�
     assert.equal(attempts[0].timeoutMs, 30_000);
     assert.equal(waitCount, 3);
     assert.equal(readRuntime(fixture).login.lastResult, "started");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat 核心文件缺失时不把运行损坏误判为快速登录授权过期", async () => {
+  const fixture = createFixture();
+  let loginCount = 0;
+  try {
+    await runSupervisorService(baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ known: true, reachable: false, online: false, accountMatches: false }),
+      checkNapCatRuntime: async () => ({
+        known: true,
+        ready: false,
+        napcatRoot: fixture.napcatRoot,
+        requiredFiles: [path.join(fixture.napcatRoot, "launcher-user.bat"), path.join(fixture.napcatRoot, "napcat.mjs")],
+        missingFiles: [path.join(fixture.napcatRoot, "napcat.mjs")],
+        error: {
+          code: "NAPCAT_RUNTIME_INCOMPLETE",
+          message: "NapCat 运行文件缺失",
+          outcomeUnknown: false,
+        },
+      }),
+      checkNapCatProcesses: async () => ({ known: true, present: false }),
+      getOpenTaskCount: async () => 0,
+      quickLogin() {
+        loginCount += 1;
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(loginCount, 0);
+    assert.equal(runtime.actions.quickLogin.reason, "runtime_incomplete");
+    assert.equal(runtime.actions.quickLogin.error.code, "NAPCAT_RUNTIME_INCOMPLETE");
+    assert.equal(runtime.checks.napcatRuntime.ready, false);
+    assert.deepEqual(runtime.checks.napcatRuntime.missingFiles, [path.join(fixture.napcatRoot, "napcat.mjs")]);
+    assert.equal(runtime.checks.gate, false);
   } finally {
     fixture.cleanup();
   }

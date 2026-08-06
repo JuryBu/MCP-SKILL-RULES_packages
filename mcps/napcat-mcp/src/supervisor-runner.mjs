@@ -724,6 +724,56 @@ export function normalizeNapCatStatus(value) {
   };
 }
 
+export function checkNapCatRuntime(options = {}) {
+  const fsImpl = options.fsImpl ?? fs;
+  const napcatRoot = resolveOptionalPath(options.napcatRoot);
+  if (!napcatRoot) {
+    return {
+      known: false,
+      ready: false,
+      napcatRoot: null,
+      requiredFiles: [],
+      missingFiles: [],
+      error: {
+        code: "NAPCAT_ROOT_UNKNOWN",
+        message: "NapCatRoot 未配置，无法判断运行文件是否完整",
+        outcomeUnknown: false,
+      },
+    };
+  }
+  const requiredFiles = [
+    path.join(napcatRoot, "launcher-user.bat"),
+    path.join(napcatRoot, "napcat.mjs"),
+  ];
+  const missingFiles = requiredFiles.filter((filePath) => !fileExists(filePath, fsImpl));
+  return {
+    known: true,
+    ready: missingFiles.length === 0,
+    napcatRoot,
+    requiredFiles,
+    missingFiles,
+    error: missingFiles.length > 0
+      ? {
+        code: "NAPCAT_RUNTIME_INCOMPLETE",
+        message: `NapCat 运行文件缺失：${missingFiles.join(", ")}。可能被安全软件隔离或安装损坏，这不表示快速登录授权已过期。`,
+        outcomeUnknown: false,
+      }
+      : null,
+  };
+}
+
+export function normalizeNapCatRuntime(value) {
+  const ready = normalizeBoolean(value?.ready);
+  return {
+    known: value?.known !== false && ready !== null,
+    ready: ready === true,
+    napcatRoot: value?.napcatRoot ?? null,
+    requiredFiles: Array.isArray(value?.requiredFiles) ? value.requiredFiles : [],
+    missingFiles: Array.isArray(value?.missingFiles) ? value.missingFiles : [],
+    error: value?.error ?? null,
+  };
+}
+
 export function normalizeProcessCheck(value) {
   if (Array.isArray(value)) {
     return processCheckResult(value);
@@ -912,7 +962,7 @@ function processSnapshotOptions(dependencies, options, snapshot) {
 
 function summarizeCheck(check) {
   const summary = { known: Boolean(check?.known) };
-  for (const field of ["healthy", "reachable", "online", "accountMatches", "ready", "present", "count", "alive", "state", "pid", "error"]) {
+  for (const field of ["healthy", "reachable", "online", "accountMatches", "ready", "present", "count", "alive", "state", "pid", "napcatRoot", "requiredFiles", "missingFiles", "error"]) {
     if (check?.[field] !== undefined) summary[field] = check[field];
   }
   return summary;
@@ -1117,6 +1167,9 @@ export async function runSupervisorService(options = {}) {
   const checkNapCat = options.checkNapCatStatus
     ?? options.napcatStatusCheck
     ?? (async () => dependencies.notifier.status({ include_group: false }));
+  const checkRuntime = options.checkNapCatRuntime
+    ?? options.napcatRuntimeCheck
+    ?? ((input) => checkNapCatRuntime(input));
   const checkTasks = options.getOpenTaskCount
     ?? options.openTaskCountCheck
     ?? (() => dependencies.registry.list({ status: "open" }).length);
@@ -1206,6 +1259,13 @@ export async function runSupervisorService(options = {}) {
         { known: false, reachable: false, online: false, accountMatches: false },
       ));
       if (napcat.error) errors.push({ source: "napcat", error: napcat.error });
+
+      const napcatRuntime = normalizeNapCatRuntime(await capture(
+        checkRuntime,
+        { napcatRoot: options.napcatRoot ?? dependencies.napcatRoot, fsImpl },
+        { known: false, ready: false, requiredFiles: [], missingFiles: [] },
+      ));
+      if (napcatRuntime.error) errors.push({ source: "napcat_runtime", error: napcatRuntime.error });
 
       const napcatProcess = normalizeProcessCheck(await capture(
         checkNapCatProcess,
@@ -1306,6 +1366,8 @@ export async function runSupervisorService(options = {}) {
 
       const quickLoginEligible = Boolean(
         !napcat.online
+        && napcatRuntime.known
+        && napcatRuntime.ready
         && napcatProcess.known
         && !napcatProcess.present
       );
@@ -1334,6 +1396,15 @@ export async function runSupervisorService(options = {}) {
           errors.push({ source: "quick_login", error: value });
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
         }
+      } else if (!napcatRuntime.known) {
+        actions.quickLogin = { attempted: false, reason: "runtime_unknown", noQr: true };
+      } else if (!napcatRuntime.ready) {
+        actions.quickLogin = {
+          attempted: false,
+          reason: "runtime_incomplete",
+          noQr: true,
+          error: napcatRuntime.error,
+        };
       } else if (quickLoginEligible && typeof runLogin !== "function") {
         actions.quickLogin = { attempted: false, reason: "script_missing", noQr: true };
       } else if (!napcat.online && napcatProcess.present) {
@@ -1477,6 +1548,8 @@ export async function runSupervisorService(options = {}) {
         && brokerProcess.present
         && napcat.known
         && napcat.ready
+        && napcatRuntime.known
+        && napcatRuntime.ready
         && napcatProcess.known
         && napcatProcess.present
         && codexProcess.known
@@ -1520,6 +1593,7 @@ export async function runSupervisorService(options = {}) {
       const checkSummary = {
         broker: summarizeCheck(broker),
         napcat: summarizeCheck(napcat),
+        napcatRuntime: summarizeCheck(napcatRuntime),
         napcatProcess: summarizeCheck(napcatProcess),
         codexProcess: summarizeCheck(codexProcess),
         brokerProcess: summarizeCheck(brokerProcess),

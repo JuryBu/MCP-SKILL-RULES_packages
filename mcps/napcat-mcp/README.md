@@ -82,7 +82,7 @@ Codex Desktop -> ws://127.0.0.1:18432 透明中转 -> ws://127.0.0.1:18433 官�
 NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ```
 
-`18432` 是 Codex Desktop 始终使用的固定入口；官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。代理运行期间还会比较当前最新 `codex.exe` 的路径、修改时间和文件大小；只有 Desktop 已断开、代理客户端数为 0，并且新候选通过独立探针时，才结束旧受管 App Server 并切换到新版本，避免 Codex 更新后长期沿用旧 App Server，也避免在线会话被强制中断。
+`18432` 是 Codex Desktop 始终使用的固定入口；透明中转先监听该端口，再探测或启动官方 App Server。Desktop 提前连接时，初始化请求会留在内存队列中并在上游就绪后继续发送，避免开机竞态表现成 `ECONNREFUSED` 或 WebSocket 1005。官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。代理运行期间还会比较当前最新 `codex.exe` 的路径、修改时间和文件大小；只有 Desktop 已断开、代理客户端数为 0，并且新候选通过独立探针时，才结束旧受管 App Server 并切换到新版本，避免 Codex 更新后长期沿用旧 App Server，也避免在线会话被强制中断。
 
 更新脚本不会终止 Codex Desktop。便携包会启动隐藏激活器，等待当前 Codex 与代理连接自然断开后，再干净重启受管代理并热重载 NapCat backend；用户只需正常退出 Codex、等待约 10 秒后重新打开，不需要重启 Windows。
 
@@ -95,6 +95,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 ## 安全更新与回滚
 
 公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。
+
+监督器和登录脚本在尝试快速登录前会同时检查 `launcher-user.bat` 与 `napcat.mjs`。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
 
 面向日常使用者的安装应优先采用「先准备、后退出 Codex 激活」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，隐藏激活器等待 Codex 与代理自然断开后，只清理受管代理和它启动的官方 App Server。用户正常退出 Codex、等待约 10 秒再打开即可，不需要重启 Windows；任何清理失败都必须保留旧任务和本地状态、暂停自动唤醒并报警，不能终止 Codex Desktop 或按进程名误杀其它实例。
 

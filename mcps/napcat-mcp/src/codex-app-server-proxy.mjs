@@ -850,10 +850,6 @@ export class CodexAppServerProxy {
     }
     client.injected.clear();
     if (error) this.#recordError(reason, error);
-    if (!client.initialized) {
-      this.#closeClient(client, "upstream_closed_before_initialize", error);
-      return;
-    }
     this.#scheduleReconnect(client, reason);
   }
 

@@ -696,6 +696,40 @@ export async function runCodexAppServerProxyService(options = {}) {
   try {
     signalCleanup = installSignals();
     persist();
+    const journal = options.journal ?? createWakeJournal({ filePath: options.journalPath, fsImpl, now });
+    const pauseForUpstream = (code, message) => ownsLock() && updateMaintenance(
+      options.maintenanceFilePath,
+      "codexAppServerProxyUpstream",
+      { at: now().toISOString(), code, message },
+      fsImpl,
+    );
+    const resumeAfterUpstream = () => ownsLock() && updateMaintenance(
+      options.maintenanceFilePath,
+      "codexAppServerProxyUpstream",
+      null,
+      fsImpl,
+    );
+    proxy = (options.createProxy ?? createCodexAppServerProxy)({
+      downstreamPort: options.downstreamPort,
+      controlPort: options.controlPort,
+      upstreamUrl: status.upstreamUrl,
+      controlToken,
+      requestTimeoutMs: options.requestTimeoutMs,
+      resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
+      journal,
+      maintenanceFilePath: options.maintenanceFilePath,
+      onEvent: (event) => {
+        if (event.type === "upstream_reconnect_scheduled") {
+          pauseForUpstream("APP_SERVER_RECONNECTING", "Codex App Server 上游暂时不可用，自动唤醒已暂停并等待恢复");
+        } else if (event.type === "upstream_connected") {
+          resumeAfterUpstream();
+        }
+        if (event.type === "proxy_error") persist({ proxy: proxy?.status() ?? null, lastError: event.error });
+        log(event.type, event);
+      },
+    });
+    await proxy.start();
+    persist({ proxy: proxy.status() });
     const candidates = codexCandidates({
       fsImpl,
       executablePath: options.executablePath,
@@ -730,39 +764,6 @@ export async function runCodexAppServerProxyService(options = {}) {
       fallbackRequired: false,
       lastError: null,
     });
-    const journal = options.journal ?? createWakeJournal({ filePath: options.journalPath, fsImpl, now });
-    const pauseForUpstream = (code, message) => ownsLock() && updateMaintenance(
-      options.maintenanceFilePath,
-      "codexAppServerProxyUpstream",
-      { at: now().toISOString(), code, message },
-      fsImpl,
-    );
-    const resumeAfterUpstream = () => ownsLock() && updateMaintenance(
-      options.maintenanceFilePath,
-      "codexAppServerProxyUpstream",
-      null,
-      fsImpl,
-    );
-    proxy = (options.createProxy ?? createCodexAppServerProxy)({
-      downstreamPort: options.downstreamPort,
-      controlPort: options.controlPort,
-      upstreamUrl: status.upstreamUrl,
-      controlToken,
-      requestTimeoutMs: options.requestTimeoutMs,
-      resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
-      journal,
-      maintenanceFilePath: options.maintenanceFilePath,
-      onEvent: (event) => {
-        if (event.type === "upstream_reconnect_scheduled") {
-          pauseForUpstream("APP_SERVER_RECONNECTING", "Codex App Server 上游暂时不可用，自动唤醒已暂停并等待恢复");
-        } else if (event.type === "upstream_connected") {
-          resumeAfterUpstream();
-        }
-        if (event.type === "proxy_error") persist({ proxy: proxy?.status() ?? null, lastError: event.error });
-        log(event.type, event);
-      },
-    });
-
     while (!stopRequested && !fsImpl.existsSync(options.stopFilePath)) {
       const launched = (options.spawnAppServer ?? spawnAppServer)(currentExecutable, options.upstreamPort, options);
       appServer = launched.child;
@@ -775,7 +776,6 @@ export async function runCodexAppServerProxyService(options = {}) {
           ...options,
           timeoutMs: options.startTimeoutMs,
         });
-        if (!proxy.startedAt) await proxy.start();
         resumeAfterUpstream();
         restartFailureCount = 0;
         persist({

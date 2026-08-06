@@ -45,11 +45,15 @@ if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
   }
 }
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
+$CoreModule = Join-Path $NapCatRoot "napcat.mjs"
 $QrCodePath = Join-Path $NapCatRoot "cache\qrcode.png"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
 $BindingPath = Join-Path $DataRoot "binding.json"
 $LogDirectory = Join-Path $NapCatRoot "logs"
 if (-not (Test-Path -LiteralPath $Launcher)) { throw "找不到 NapCat launcher：$Launcher" }
+if (-not (Test-Path -LiteralPath $CoreModule -PathType Leaf)) {
+  throw "[NAPCAT_RUNTIME_INCOMPLETE] NapCat 核心模块缺失：$CoreModule。可能被安全软件隔离或安装损坏，这不表示快速登录授权已过期。"
+}
 if (-not (Test-Path -LiteralPath $PrivateEnvPath)) { throw "找不到 broker 私密环境：$PrivateEnvPath" }
 if (-not (Test-Path -LiteralPath $BindingPath)) { throw "找不到 NapCat binding：$BindingPath" }
 

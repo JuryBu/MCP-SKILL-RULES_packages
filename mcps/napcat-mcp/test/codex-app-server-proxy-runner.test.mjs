@@ -277,6 +277,42 @@ test("managed App Server shutdown does not probe an unrelated listener after its
   assert.equal(checks, 0);
 });
 
+test("proxy listener starts before Codex binary probing and managed App Server launch", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-boot-order-test-"));
+  const paths = runtimePaths(root);
+  const events = [];
+  const child = createChildThatRequiresForceVerification((processHandle) => {
+    processHandle.exitCode = 137;
+    processHandle.emit("exit", 137, "SIGKILL");
+  });
+  try {
+    await runCodexAppServerProxyService({
+      ...createStoppingServiceOptions(paths, child),
+      createProxy: () => ({
+        startedAt: null,
+        async start() {
+          events.push("proxy_start");
+          this.startedAt = new Date().toISOString();
+        },
+        async close() {},
+        status() { return { state: "running" }; },
+      }),
+      probeExecutable: async () => { events.push("probe_executable"); },
+      spawnAppServer: () => {
+        events.push("spawn_app_server");
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        events.push("upstream_ready");
+        fs.writeFileSync(paths.stopFilePath, "stop\n", "utf8");
+      },
+    });
+    assert.deepEqual(events, ["proxy_start", "probe_executable", "spawn_app_server", "upstream_ready"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codex executable refresh is accepted only while the Desktop proxy has no clients", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-refresh-test-"));
   const executablePath = path.join(root, "codex.exe");

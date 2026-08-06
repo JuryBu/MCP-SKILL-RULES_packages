@@ -139,6 +139,55 @@ test("transparent proxy keeps Desktop connected while App Server restarts", { ti
   assert.equal(hiddenInitializeCount, 1);
 });
 
+test("transparent proxy accepts Desktop before App Server starts and replays queued initialization", { timeout: 15000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "boot-race-test-token",
+    reconnectInitialMs: 50,
+    reconnectMaxMs: 100,
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  const responses = [];
+  desktop.on("message", (data) => responses.push(JSON.parse(data.toString("utf8"))));
+  let upstream = null;
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    if (upstream) {
+      for (const socket of upstream.clients) socket.terminate();
+      await new Promise((resolve) => upstream.close(resolve));
+    }
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 31, method: "initialize", params: { clientInfo: { name: "desktop" } } }));
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(desktop.readyState, WebSocket.OPEN);
+
+  upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.method === "initialize") {
+        socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { serverInfo: { name: "fake" } } }));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once("listening", resolve);
+    upstream.once("error", reject);
+  });
+  await waitFor(() => responses.some((message) => message.id === 31));
+  assert.equal(desktop.readyState, WebSocket.OPEN);
+  assert.equal(proxy.status().readyClientCount, 1);
+});
+
 test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_id", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-test-"));
