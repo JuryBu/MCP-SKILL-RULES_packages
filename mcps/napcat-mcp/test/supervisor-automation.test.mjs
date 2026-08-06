@@ -67,6 +67,7 @@ function baseOptions(fixture, overrides = {}) {
     once: true,
     checkBrokerHealth: async () => ({ known: true, healthy: true, reachable: true }),
     checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true, ready: true }),
+    checkNapCatRuntime: async () => ({ known: true, ready: true }),
     checkNapCatProcesses: async () => ({ known: true, present: true }),
     checkCodexProcesses: async () => ({ known: true, present: true }),
     checkBrokerProcesses: async () => ({ known: true, present: true }),

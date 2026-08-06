@@ -55,6 +55,14 @@ test("staged updates keep automatic wake paused until live activation succeeds",
   assert.match(script, /Write-JsonAtomic -Path \$LastKnownGoodPointerPath/);
 });
 
+test("failed validation resumes the previous router while preserving an alert", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  const catchBlock = script.match(/} catch \{[\s\S]*?\n} finally \{/)?.[0] ?? "";
+  assert.match(catchBlock, /Set-UpdateMaintenance -Active \$false/);
+  assert.match(catchBlock, /PACKAGE_UPDATE_FAILED/);
+  assert.match(catchBlock, /start-napcat-task-router\.ps1/);
+});
+
 test("successful idle activation resolves the persisted pending-update metadata", () => {
   const script = read("ops/activate-codex-app-server-when-idle.ps1");
   assert.match(script, /napcat-bridge-last-update\.json/);

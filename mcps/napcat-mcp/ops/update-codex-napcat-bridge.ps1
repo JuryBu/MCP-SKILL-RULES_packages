@@ -465,7 +465,7 @@ try {
   if ($PrivateEnvBackupPath -and (Test-Path -LiteralPath $PrivateEnvBackupPath)) {
     try { Copy-Item -LiteralPath $PrivateEnvBackupPath -Destination $PrivateEnvPath -Force } catch {}
   }
-  Set-UpdateMaintenance -Active $true -Code "PACKAGE_UPDATE_FAILED" -Message $Failure
+  Set-UpdateMaintenance -Active $false
   Write-JsonAtomic -Path $AlertPath -Value ([ordered]@{
     schemaVersion = 1; pending = $true; incidentKey = "package-update-$Stamp"; createdAt = (Get-Date).ToString("o"); code = "PACKAGE_UPDATE_FAILED"; message = $Failure
   })
@@ -498,6 +498,10 @@ try {
   $PreviousSupervisorStartScript = Join-Path $CodeRoot "ops\start-napcat-supervisor.ps1"
   if (Test-Path -LiteralPath $PreviousSupervisorStartScript) {
     try { & $PreviousSupervisorStartScript -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null } catch {}
+  }
+  $PreviousRouterStartScript = Join-Path $CodeRoot "ops\start-napcat-task-router.ps1"
+  if (Test-Path -LiteralPath $PreviousRouterStartScript) {
+    try { & $PreviousRouterStartScript -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null } catch {}
   }
   try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue } catch {}
   throw
