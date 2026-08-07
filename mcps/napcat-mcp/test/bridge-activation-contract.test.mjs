@@ -58,9 +58,33 @@ test("staged updates keep automatic wake paused until live activation succeeds",
 test("failed validation resumes the previous router while preserving an alert", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
   const catchBlock = script.match(/} catch \{[\s\S]*?\n} finally \{/)?.[0] ?? "";
+  const validationIndex = script.indexOf('Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test")');
+  const installIndex = script.indexOf("$CodeInstallStarted = $true");
+  assert.ok(validationIndex >= 0 && installIndex > validationIndex, "candidate validation must finish before live installation starts");
+  assert.match(script, /\$CodeInstallStarted = \$false/);
+  assert.match(script, /\$BrokerBackendReloaded = \$false/);
+  assert.match(script, /\$ProxyLifecycleTouched = \$false/);
   assert.match(catchBlock, /Set-UpdateMaintenance -Active \$false/);
   assert.match(catchBlock, /PACKAGE_UPDATE_FAILED/);
   assert.match(catchBlock, /start-napcat-task-router\.ps1/);
+  assert.match(catchBlock, /\$RollbackStopScripts = @\(\)/);
+  assert.match(catchBlock, /if \(\$CodeInstallStarted -or \$BrokerBackendReloaded\)/);
+  assert.match(catchBlock, /if \(\$ProxyLifecycleTouched\) \{ \$RollbackStopScripts \+= "stop-codex-app-server-proxy\.ps1" \}/);
+  assert.match(catchBlock, /if \(\$BrokerBackendReloaded\)/);
+  assert.match(catchBlock, /\$PreviousProxyRecovered = \(-not \$ProxyLifecycleTouched\)/);
+});
+
+test("candidate validation resolves the broker MCP SDK before entering maintenance", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  const resolveIndex = script.indexOf("$ValidationMcpSdkRoot = Resolve-McpSdkRoot");
+  const maintenanceIndex = script.indexOf("Set-UpdateMaintenance -Active $true");
+  assert.match(script, /function Resolve-McpSdkRoot/);
+  assert.match(script, /MEMORY_STORE_MCP_ROOT/);
+  assert.match(script, /CODEX_TOOLKIT_MCP_ROOT/);
+  assert.ok(resolveIndex >= 0 && maintenanceIndex > resolveIndex, "SDK resolution must finish before maintenance starts");
+  for (const command of ['@("ci")', '@("run", "check")', '@("test")']) {
+    assert.ok(script.includes(`-Arguments ${command} -McpSdkRoot $ValidationMcpSdkRoot`));
+  }
 });
 
 test("successful idle activation resolves the persisted pending-update metadata", () => {
@@ -105,8 +129,8 @@ test("backend-only hot reload proves proxy files unchanged and never stops the p
   assert.match(script, /if \(\$BackendOnlyHotReload\) \{/);
   assert.match(script, /reload-broker-backend\.ps1/);
   assert.match(script, /Existing transparent proxy did not remain healthy/);
-  assert.match(script, /\$RollbackStopScripts = @\("stop-napcat-task-router\.ps1", "stop-napcat-supervisor\.ps1"\)/);
-  assert.match(script, /if \(-not \$BackendOnlyHotReload\) \{ \$RollbackStopScripts \+= "stop-codex-app-server-proxy\.ps1" \}/);
+  assert.match(script, /if \(\$CodeInstallStarted -or \$BrokerBackendReloaded\)/);
+  assert.match(script, /if \(\$ProxyLifecycleTouched\) \{ \$RollbackStopScripts \+= "stop-codex-app-server-proxy\.ps1" \}/);
   assert.match(script, /foreach \(\$ScriptName in \$RollbackStopScripts\)/);
   assert.match(script, /backendOnlyHotReload = \[bool\]\$BackendOnlyHotReload/);
   assert.match(script, /restartCodexRequired = \(-not \$BackendOnlyHotReload\)/);

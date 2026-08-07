@@ -79,6 +79,24 @@ function Read-JsonOrNull {
   return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
 }
 
+function Resolve-McpSdkRoot {
+  $PrivateEnv = Read-JsonOrNull -Path $PrivateEnvPath
+  $Candidates = @(
+    [string]$env:MCP_SDK_ROOT,
+    [string]$PrivateEnv.MCP_SDK_ROOT,
+    $(if (-not [string]::IsNullOrWhiteSpace([string]$PrivateEnv.MEMORY_STORE_MCP_ROOT)) { Join-Path ([string]$PrivateEnv.MEMORY_STORE_MCP_ROOT) "node_modules\@modelcontextprotocol\sdk\dist\esm" }),
+    $(if (-not [string]::IsNullOrWhiteSpace([string]$PrivateEnv.CODEX_TOOLKIT_MCP_ROOT)) { Join-Path ([string]$PrivateEnv.CODEX_TOOLKIT_MCP_ROOT) "memory-store\node_modules\@modelcontextprotocol\sdk\dist\esm" })
+  )
+  foreach ($Candidate in $Candidates) {
+    if ([string]::IsNullOrWhiteSpace([string]$Candidate)) { continue }
+    $Resolved = [System.IO.Path]::GetFullPath([string]$Candidate)
+    if ((Test-Path -LiteralPath (Join-Path $Resolved "server\index.js")) -and (Test-Path -LiteralPath (Join-Path $Resolved "types.js"))) {
+      return $Resolved
+    }
+  }
+  return $null
+}
+
 function Get-ProtectedTaskSnapshot {
   param([string]$Path)
   $Registry = Read-JsonOrNull -Path $Path
@@ -154,12 +172,15 @@ function Resolve-StaleUpdateAlert {
 }
 
 function Invoke-NpmChecked {
-  param([string]$Root, [string[]]$Arguments)
+  param([string]$Root, [string[]]$Arguments, [string]$McpSdkRoot = $null)
   Push-Location $Root
+  $PreviousMcpSdkRoot = $env:MCP_SDK_ROOT
   try {
+    if (-not [string]::IsNullOrWhiteSpace($McpSdkRoot)) { $env:MCP_SDK_ROOT = $McpSdkRoot }
     & npm @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
   } finally {
+    $env:MCP_SDK_ROOT = $PreviousMcpSdkRoot
     Pop-Location
   }
 }
@@ -229,6 +250,10 @@ if ($CodeRoot -eq $DataRoot -and -not $AllowLegacyMixedRoot) {
 if ($BackendOnlyHotReload -and -not $ActivateNow) {
   throw "BackendOnlyHotReload requires ActivateNow=true because it performs the complete guarded backend activation in this invocation."
 }
+$ValidationMcpSdkRoot = Resolve-McpSdkRoot
+if ([string]::IsNullOrWhiteSpace($ValidationMcpSdkRoot)) {
+  throw "Cannot validate the NapCat MCP candidate because the broker MCP SDK path is unavailable. Check MCP_SDK_ROOT or MEMORY_STORE_MCP_ROOT before entering maintenance."
+}
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $ReleasesRoot | Out-Null
@@ -237,6 +262,9 @@ $LockStream = $null
 $PrivateEnvBackupPath = $null
 $BeforeSnapshot = $null
 $Activated = $false
+$CodeInstallStarted = $false
+$BrokerBackendReloaded = $false
+$ProxyLifecycleTouched = $false
 $PreviousPointer = Read-JsonOrNull -Path $ActivePointerPath
 $PreviousUserAppServerWsUrl = [Environment]::GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", "User")
 
@@ -287,9 +315,9 @@ try {
   }
 
   Copy-CodeTree -From $SourceRoot -To $CandidateRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci")
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check")
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test")
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check") -McpSdkRoot $ValidationMcpSdkRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test") -McpSdkRoot $ValidationMcpSdkRoot
   if (-not (Test-Path -LiteralPath $ReleaseRoot)) {
     Copy-CodeTree -From $CandidateRoot -To $ReleaseRoot
     Write-JsonAtomic -Path (Join-Path $ReleaseRoot "release-manifest.json") -Value ([ordered]@{
@@ -300,8 +328,9 @@ try {
   if (Test-Path -LiteralPath $CodeRoot) { Copy-CodeTree -From $CodeRoot -To $PreviousCodeRoot }
   if ($BackendOnlyHotReload) { Assert-BackendOnlyCompatible -PreviousRoot $PreviousCodeRoot -NextRoot $ReleaseRoot }
   if ($PSCmdlet.ShouldProcess($CodeRoot, "install validated NapCat bridge candidate")) {
+    $CodeInstallStarted = $true
     Copy-CodeTree -From $ReleaseRoot -To $CodeRoot
-    Invoke-NpmChecked -Root $CodeRoot -Arguments @("ci")
+    Invoke-NpmChecked -Root $CodeRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot
   }
   if ($null -ne $PreviousPointer) { Write-JsonAtomic -Path $PreviousPointerPath -Value $PreviousPointer }
   Write-JsonAtomic -Path $ActivePointerPath -Value ([ordered]@{
@@ -345,6 +374,7 @@ try {
       if ($MigrateAutostart) {
         & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -TaskName $SupervisorTaskName | Out-Null
       }
+      $BrokerBackendReloaded = $true
       & (Join-Path $CodeRoot "ops\reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null
       $ProxyStatus = & (Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1") -DataRoot $DataRoot | ConvertFrom-Json
       if ($ProxyStatus.ok -ne $true -or [string]$ProxyStatus.runtime.state -ne "running") {
@@ -375,6 +405,7 @@ try {
       $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
       if (Test-Path -LiteralPath $ScriptPath) {
         $StopResult = if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
+          $ProxyLifecycleTouched = $true
           & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | ConvertFrom-Json
         } else {
           & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
@@ -388,7 +419,9 @@ try {
     if ($MigrateAutostart) {
       & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -TaskName $SupervisorTaskName | Out-Null
     }
+    $BrokerBackendReloaded = $true
     & (Join-Path $CodeRoot "ops\reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null
+    $ProxyLifecycleTouched = $true
     & (Join-Path $CodeRoot "ops\start-codex-app-server-proxy.ps1") -DataRoot $DataRoot | Out-Null
     $ProxyStatus = & (Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1") -DataRoot $DataRoot | ConvertFrom-Json
     if ($ProxyStatus.ok -ne $true -or [string]$ProxyStatus.runtime.state -ne "running") { throw "Validated proxy did not become healthy after activation." }
@@ -440,8 +473,11 @@ try {
 } catch {
   $Failure = $_.Exception.Message
   try { [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $PreviousUserAppServerWsUrl, "User") } catch {}
-  $RollbackStopScripts = @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")
-  if (-not $BackendOnlyHotReload) { $RollbackStopScripts += "stop-codex-app-server-proxy.ps1" }
+  $RollbackStopScripts = @()
+  if ($CodeInstallStarted -or $BrokerBackendReloaded) {
+    $RollbackStopScripts += @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")
+  }
+  if ($ProxyLifecycleTouched) { $RollbackStopScripts += "stop-codex-app-server-proxy.ps1" }
   foreach ($ScriptName in $RollbackStopScripts) {
     $ScriptPath = Join-Path $CandidateRoot "ops\$ScriptName"
     if (Test-Path -LiteralPath $ScriptPath) {
@@ -454,28 +490,32 @@ try {
       } catch {}
     }
   }
-  if ((Test-Path -LiteralPath $PreviousCodeRoot) -and (Test-Path -LiteralPath $CodeRoot)) {
-    try { Restore-CodeTree -From $PreviousCodeRoot -To $CodeRoot } catch {}
-  }
-  if ($null -ne $PreviousPointer) {
-    try { Write-JsonAtomic -Path $ActivePointerPath -Value $PreviousPointer } catch {}
-  } else {
-    try { Remove-Item -LiteralPath $ActivePointerPath -Force -ErrorAction SilentlyContinue } catch {}
-  }
-  if ($PrivateEnvBackupPath -and (Test-Path -LiteralPath $PrivateEnvBackupPath)) {
-    try { Copy-Item -LiteralPath $PrivateEnvBackupPath -Destination $PrivateEnvPath -Force } catch {}
+  if ($CodeInstallStarted) {
+    if ((Test-Path -LiteralPath $PreviousCodeRoot) -and (Test-Path -LiteralPath $CodeRoot)) {
+      try { Restore-CodeTree -From $PreviousCodeRoot -To $CodeRoot } catch {}
+    }
+    if ($null -ne $PreviousPointer) {
+      try { Write-JsonAtomic -Path $ActivePointerPath -Value $PreviousPointer } catch {}
+    } else {
+      try { Remove-Item -LiteralPath $ActivePointerPath -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    if ($PrivateEnvBackupPath -and (Test-Path -LiteralPath $PrivateEnvBackupPath)) {
+      try { Copy-Item -LiteralPath $PrivateEnvBackupPath -Destination $PrivateEnvPath -Force } catch {}
+    }
   }
   Set-UpdateMaintenance -Active $false
   Write-JsonAtomic -Path $AlertPath -Value ([ordered]@{
     schemaVersion = 1; pending = $true; incidentKey = "package-update-$Stamp"; createdAt = (Get-Date).ToString("o"); code = "PACKAGE_UPDATE_FAILED"; message = $Failure
   })
-  $RecoveryReloadScript = Join-Path $CandidateRoot "ops\reload-broker-backend.ps1"
-  if (Test-Path -LiteralPath $RecoveryReloadScript) {
-    try { & $RecoveryReloadScript -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null } catch {}
+  if ($BrokerBackendReloaded) {
+    $RecoveryReloadScript = Join-Path $CandidateRoot "ops\reload-broker-backend.ps1"
+    if (Test-Path -LiteralPath $RecoveryReloadScript) {
+      try { & $RecoveryReloadScript -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null } catch {}
+    }
   }
   $PreviousProxyStartScript = Join-Path $CodeRoot "ops\start-codex-app-server-proxy.ps1"
-  $PreviousProxyRecovered = $false
-  if ((-not [string]::IsNullOrWhiteSpace($PreviousUserAppServerWsUrl)) -and (Test-Path -LiteralPath $PreviousProxyStartScript)) {
+  $PreviousProxyRecovered = (-not $ProxyLifecycleTouched)
+  if ($ProxyLifecycleTouched -and (-not [string]::IsNullOrWhiteSpace($PreviousUserAppServerWsUrl)) -and (Test-Path -LiteralPath $PreviousProxyStartScript)) {
     try {
       & $PreviousProxyStartScript -DataRoot $DataRoot | Out-Null
       $PreviousProxyStatusScript = Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1"
@@ -487,7 +527,7 @@ try {
       $PreviousProxyRecovered = $false
     }
   }
-  if ((-not [string]::IsNullOrWhiteSpace($PreviousUserAppServerWsUrl)) -and -not $PreviousProxyRecovered) {
+  if ($ProxyLifecycleTouched -and (-not [string]::IsNullOrWhiteSpace($PreviousUserAppServerWsUrl)) -and -not $PreviousProxyRecovered) {
     try { [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $null, "User") } catch {}
     try {
       Write-JsonAtomic -Path (Join-Path $StateRoot "codex-app-server-proxy-fallback.json") -Value ([ordered]@{
