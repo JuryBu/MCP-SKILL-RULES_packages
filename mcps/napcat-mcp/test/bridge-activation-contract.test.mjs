@@ -122,6 +122,19 @@ test("portable package entrypoint leaves live services untouched before guarded 
   assert.match(script, /The live broker was not modified by this entrypoint/);
 });
 
+test("portable upgrade staging keeps its package entrypoint and uses built-in SHA256", () => {
+  const updater = read("ops/update-codex-napcat-bridge.ps1");
+  const entrypoint = read("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1");
+  const copyBlock = updater.match(/function Copy-CodeTree[\s\S]*?\n}/)?.[0] ?? "";
+  const restoreBlock = updater.match(/function Restore-CodeTree[\s\S]*?\n}/)?.[0] ?? "";
+  assert.match(copyBlock, /"package"/);
+  assert.match(restoreBlock, /"package"/);
+  assert.match(updater, /function Get-FileSha256/);
+  assert.match(entrypoint, /function Get-FileSha256/);
+  assert.doesNotMatch(updater, /Get-FileHash/);
+  assert.doesNotMatch(entrypoint, /Get-FileHash/);
+});
+
 test("candidate npm validation finishes before maintenance or router quiescence", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
   const validationIndex = script.indexOf('Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test")');
@@ -206,7 +219,10 @@ test("guarded updater really derives the validation SDK from the configured brok
       name: "napcat-sdk-fixture",
       version: "1.0.0",
       private: true,
-      scripts: { check: "node --check src/index.mjs", test: "node -e \"process.exit(7)\"" },
+      scripts: {
+        check: "node --check src/index.mjs",
+        test: "node -e \"require('node:fs').accessSync('package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1');process.exit(7)\"",
+      },
     }),
   );
   write(
@@ -220,9 +236,19 @@ test("guarded updater really derives the validation SDK from the configured brok
     }),
   );
   write(path.join(sourceRoot, "src", "index.mjs"), "export {};\n");
+  write(path.join(sourceRoot, "package", "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"), "Write-Output 'portable fixture'\n");
   fs.copyFileSync(path.resolve("ops/update-codex-napcat-bridge.ps1"), path.join(sourceRoot, "update.ps1"));
+  const launcherPath = path.join(sourceRoot, "invoke-without-get-file-hash.ps1");
+  write(
+    launcherPath,
+    [
+      "function global:Get-FileHash { throw 'Get-FileHash is unavailable in this compatibility test' }",
+      "& $env:TARGET_UPDATE_SCRIPT @args",
+      "",
+    ].join("\n"),
+  );
   const result = runPowerShell(
-    path.join(sourceRoot, "update.ps1"),
+    launcherPath,
     [
       "-SourceRoot", sourceRoot,
       "-CodeRoot", codeRoot,
@@ -236,11 +262,13 @@ test("guarded updater really derives the validation SDK from the configured brok
       MEMORY_STORE_MCP_ROOT: "",
       CODEX_TOOLKIT_MCP_ROOT: "",
       CODEX_TOOLKIT_BROKER_ROOT: "",
+      TARGET_UPDATE_SCRIPT: path.join(sourceRoot, "update.ps1"),
     },
   );
   const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
   assert.notEqual(result.status, 0, combinedOutput);
   assert.match(combinedOutput, /npm test failed with exit code 7/);
+  assert.doesNotMatch(combinedOutput, /Get-FileHash is unavailable/);
   assert.doesNotMatch(combinedOutput, /SDK path is unavailable/);
   assert.equal(fs.readFileSync(path.join(codeRoot, "sentinel.txt"), "utf8"), "previous installation\n");
   assert.equal(fs.existsSync(path.join(dataRoot, "state", "task-router.maintenance.json")), false);

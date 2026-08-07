@@ -23,7 +23,17 @@ $BackupRoot = Join-Path $BrokerRoot "backups\broker-update-$Stamp"
 function Get-FileHashOrNull {
     param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    $Stream = [System.IO.File]::OpenRead($Path)
+    try {
+        $Hasher = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "")
+        } finally {
+            $Hasher.Dispose()
+        }
+    } finally {
+        $Stream.Dispose()
+    }
 }
 
 function Wait-BrokerHealth {

@@ -31,7 +31,7 @@ function Restore-StagedUpdate {
   $UpdateBackupRoot = [string]$Result.backupRoot
   $PreviousCodeRoot = Join-Path $UpdateBackupRoot "previous-code"
   if (Test-Path -LiteralPath $PreviousCodeRoot) {
-    foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
+    foreach ($Name in @("src", "ops", "test", "package", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
       $Source = Join-Path $PreviousCodeRoot $Name
       if (Test-Path -LiteralPath $Source) { Copy-Item -LiteralPath $Source -Destination $CodeRoot -Recurse -Force }
     }
@@ -58,8 +58,18 @@ function Restore-StagedUpdate {
 
 function Get-FileSha256 {
   param([string]$Path)
-  if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+  $Stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+    } finally {
+      $Hasher.Dispose()
+    }
+  } finally {
+    $Stream.Dispose()
+  }
 }
 
 function Assert-BrokerSnapshotCurrent {

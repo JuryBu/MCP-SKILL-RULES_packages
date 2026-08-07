@@ -39,10 +39,27 @@ $PreviousCodeRoot = Join-Path $BackupRoot "previous-code"
 $PreviousUserEnvironmentPath = Join-Path $BackupRoot "codex-app-server-user-env.json"
 $UpdateStatePath = Join-Path $StateRoot "napcat-bridge-last-update.json"
 $LockPath = Join-Path $StateRoot "napcat-bridge-update.lock"
+
+function Get-FileSha256 {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+  $Stream = [System.IO.File]::OpenRead($Path)
+  try {
+    $Hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+      return ([System.BitConverter]::ToString($Hasher.ComputeHash($Stream))).Replace("-", "").ToLowerInvariant()
+    } finally {
+      $Hasher.Dispose()
+    }
+  } finally {
+    $Stream.Dispose()
+  }
+}
+
 $PackageMetadata = Get-Content -LiteralPath (Join-Path $SourceRoot "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
-$PackageLockHash = (Get-FileHash -LiteralPath (Join-Path $SourceRoot "package-lock.json") -Algorithm SHA256).Hash.ToLowerInvariant().Substring(0, 12)
+$PackageLockHash = (Get-FileSha256 -Path (Join-Path $SourceRoot "package-lock.json")).Substring(0, 12)
 $SourceTreeFiles = @()
-foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-lock.json")) {
+foreach ($Name in @("src", "ops", "test", "package", "README.md", "package.json", "package-lock.json")) {
   $SourcePath = Join-Path $SourceRoot $Name
   if (Test-Path -LiteralPath $SourcePath -PathType Container) {
     $SourceTreeFiles += Get-ChildItem -LiteralPath $SourcePath -File -Recurse
@@ -52,7 +69,7 @@ foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-
 }
 $SourceTreeDescriptor = @($SourceTreeFiles | Sort-Object FullName | ForEach-Object {
   $RelativePath = $_.FullName.Substring($SourceRoot.Length).TrimStart('\').Replace('\', '/')
-  "$RelativePath`:$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
+  "$RelativePath`:$(Get-FileSha256 -Path $_.FullName)"
 }) -join "`n"
 $SourceTreeHasher = [System.Security.Cryptography.SHA256]::Create()
 try {
@@ -240,7 +257,7 @@ function Assert-BackendOnlyCompatible {
 function Copy-CodeTree {
   param([string]$From, [string]$To)
   New-Item -ItemType Directory -Force -Path $To | Out-Null
-  foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
+  foreach ($Name in @("src", "ops", "test", "package", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
     $Source = Join-Path $From $Name
     if (Test-Path -LiteralPath $Source) { Copy-Item -LiteralPath $Source -Destination $To -Recurse -Force }
   }
@@ -248,7 +265,7 @@ function Copy-CodeTree {
 
 function Restore-CodeTree {
   param([string]$From, [string]$To)
-  foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
+  foreach ($Name in @("src", "ops", "test", "package", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
     $Target = Join-Path $To $Name
     if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Recurse -Force }
   }

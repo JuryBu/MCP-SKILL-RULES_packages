@@ -161,7 +161,7 @@ try {
   $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
 
   if ($PSCmdlet.ShouldProcess($CodeRoot, "restore the previous validated NapCat bridge code")) {
-    foreach ($Name in @("src", "ops", "test", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
+    foreach ($Name in @("src", "ops", "test", "package", "README.md", "package.json", "package-lock.json", "release-manifest.json")) {
       $Target = Join-Path $CodeRoot $Name
       if (Test-Path -LiteralPath $Target) { Remove-Item -LiteralPath $Target -Recurse -Force }
       $Source = Join-Path $RestoreRoot $Name
