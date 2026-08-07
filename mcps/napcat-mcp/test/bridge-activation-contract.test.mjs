@@ -1,10 +1,30 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
 function read(relativePath) {
   return fs.readFileSync(path.resolve(relativePath), "utf8");
+}
+
+function write(filePath, contents) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  fs.writeFileSync(filePath, contents, "utf8");
+}
+
+function runPowerShell(scriptPath, args, env = {}) {
+  return spawnSync(
+    "powershell.exe",
+    ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath, ...args],
+    {
+      cwd: path.dirname(scriptPath),
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+      timeout: 120_000,
+    },
+  );
 }
 
 test("update, activation, and rollback share one lifecycle lock", () => {
@@ -81,10 +101,149 @@ test("candidate validation resolves the broker MCP SDK before entering maintenan
   assert.match(script, /function Resolve-McpSdkRoot/);
   assert.match(script, /MEMORY_STORE_MCP_ROOT/);
   assert.match(script, /CODEX_TOOLKIT_MCP_ROOT/);
+  assert.match(script, /CODEX_TOOLKIT_BROKER_ROOT/);
+  assert.match(script, /Split-Path -Parent \(\[System\.IO\.Path\]::GetFullPath\(\[string\]\$_\)\)/);
+  assert.match(script, /memory-store\\node_modules\\@modelcontextprotocol\\sdk\\dist\\esm/);
   assert.ok(resolveIndex >= 0 && maintenanceIndex > resolveIndex, "SDK resolution must finish before maintenance starts");
   for (const command of ['@("ci")', '@("run", "check")', '@("test")']) {
     assert.ok(script.includes(`-Arguments ${command} -McpSdkRoot $ValidationMcpSdkRoot`));
   }
+});
+
+test("portable package entrypoint leaves live services untouched before guarded validation succeeds", () => {
+  const script = read("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1");
+  const updaterIndex = script.lastIndexOf("$UpdateResult = & $Updater @UpdateArguments");
+  const brokerProofIndex = script.indexOf("\n  Assert-BrokerSnapshotCurrent\n");
+  assert.ok(brokerProofIndex >= 0 && updaterIndex > brokerProofIndex, "the installed broker snapshot must be proven before invoking the guarded updater");
+  assert.match(script, /Run Update-CodexMcpBroker\.ps1 before the NapCat App Server upgrade/);
+  assert.doesNotMatch(script, /stop-napcat-supervisor-watchdog\.ps1/);
+  assert.doesNotMatch(script, /Copy-Item -LiteralPath \$BrokerSource -Destination \$BrokerTarget/);
+  assert.doesNotMatch(script, /Start-ScheduledTask -TaskName \$SupervisorTaskName/);
+  assert.match(script, /The live broker was not modified by this entrypoint/);
+});
+
+test("candidate npm validation finishes before maintenance or router quiescence", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  const validationIndex = script.indexOf('Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test")');
+  const maintenanceIndex = script.indexOf("Set-UpdateMaintenance -Active $true");
+  const routerStopIndex = script.indexOf("$RouterStopResult = & $RouterStopScript");
+  assert.ok(validationIndex >= 0, "candidate test invocation must exist");
+  assert.ok(maintenanceIndex > validationIndex, "candidate tests must finish before maintenance starts");
+  assert.ok(routerStopIndex > validationIndex, "candidate tests must finish before the task router can stop");
+});
+
+test("portable package entrypoint really leaves the watchdog and broker untouched when candidate validation fails", { skip: process.platform !== "win32" }, (t) => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-package-entrypoint-"));
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const packageRoot = path.join(fixtureRoot, "package");
+  const brokerRoot = path.join(fixtureRoot, "installed-broker");
+  const codeRoot = path.join(fixtureRoot, "installed-code");
+  const dataRoot = path.join(fixtureRoot, "private-data");
+  const codexHome = path.join(fixtureRoot, "codex-home");
+  const stopMarker = path.join(fixtureRoot, "watchdog-stopped.txt");
+  fs.mkdirSync(packageRoot, { recursive: true });
+  fs.mkdirSync(codeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(codexHome, { recursive: true });
+  fs.copyFileSync(
+    path.resolve("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
+    path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
+  );
+  write(path.join(packageRoot, "verify-package.ps1"), "Write-Output 'fixture package verified'\n");
+  write(path.join(packageRoot, "manifest.json"), JSON.stringify({ source_commits: { napcat_mcp: "fixture" } }));
+  for (const brokerFile of ["broker.mjs", "request-lifecycle.mjs"]) {
+    const contents = `export const fixture = ${JSON.stringify(brokerFile)};\n`;
+    write(path.join(packageRoot, "broker", brokerFile), contents);
+    write(path.join(brokerRoot, brokerFile), contents);
+  }
+  write(
+    path.join(packageRoot, "napcat-mcp", "ops", "update-codex-napcat-bridge.ps1"),
+    [
+      "param([string]$SourceRoot,[string]$CodeRoot,[string]$DataRoot,[string]$BrokerRoot,[string]$SourceCommit,[bool]$MigrateAutostart,[bool]$ActivateNow,[switch]$PreserveActiveWakes,[switch]$BackendOnlyHotReload,[switch]$ValidateOnly)",
+      "throw 'candidate validation failed'",
+      "",
+    ].join("\n"),
+  );
+  write(
+    path.join(packageRoot, "napcat-mcp", "ops", "stop-napcat-supervisor-watchdog.ps1"),
+    `Set-Content -LiteralPath ${JSON.stringify(stopMarker)} -Value 'stopped' -Encoding UTF8\n`,
+  );
+  const brokerBefore = Object.fromEntries(
+    ["broker.mjs", "request-lifecycle.mjs"].map((name) => [name, fs.readFileSync(path.join(brokerRoot, name), "utf8")]),
+  );
+  const result = runPowerShell(
+    path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
+    ["-CodexHome", codexHome, "-BrokerRoot", brokerRoot, "-CodeRoot", codeRoot, "-DataRoot", dataRoot],
+    { USERPROFILE: fixtureRoot },
+  );
+  const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0, combinedOutput);
+  assert.match(combinedOutput, /candidate validation failed/);
+  assert.match(combinedOutput, /live broker was not modified/i);
+  assert.equal(fs.existsSync(stopMarker), false, "candidate failure must not stop the watchdog");
+  for (const [name, contents] of Object.entries(brokerBefore)) {
+    assert.equal(fs.readFileSync(path.join(brokerRoot, name), "utf8"), contents, `${name} must remain byte-identical`);
+  }
+  assert.equal(fs.existsSync(path.join(dataRoot, "state", "task-router.maintenance.json")), false);
+});
+
+test("guarded updater really derives the validation SDK from the configured broker root", { skip: process.platform !== "win32" }, (t) => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-broker-sdk-"));
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const sourceRoot = path.join(fixtureRoot, "source");
+  const brokerRoot = path.join(fixtureRoot, "broker");
+  const codeRoot = path.join(fixtureRoot, "service", "current");
+  const dataRoot = path.join(fixtureRoot, "private-data");
+  const sdkRoot = path.join(fixtureRoot, "memory-store", "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
+  fs.mkdirSync(codeRoot, { recursive: true });
+  write(path.join(codeRoot, "sentinel.txt"), "previous installation\n");
+  write(path.join(sdkRoot, "server", "index.js"), "export {};\n");
+  write(path.join(sdkRoot, "types.js"), "export {};\n");
+  write(path.join(brokerRoot, "broker-private.env.json"), JSON.stringify({ CODEX_TOOLKIT_BROKER_ROOT: brokerRoot }));
+  write(
+    path.join(sourceRoot, "package.json"),
+    JSON.stringify({
+      name: "napcat-sdk-fixture",
+      version: "1.0.0",
+      private: true,
+      scripts: { check: "node --check src/index.mjs", test: "node -e \"process.exit(7)\"" },
+    }),
+  );
+  write(
+    path.join(sourceRoot, "package-lock.json"),
+    JSON.stringify({
+      name: "napcat-sdk-fixture",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": { name: "napcat-sdk-fixture", version: "1.0.0" } },
+    }),
+  );
+  write(path.join(sourceRoot, "src", "index.mjs"), "export {};\n");
+  fs.copyFileSync(path.resolve("ops/update-codex-napcat-bridge.ps1"), path.join(sourceRoot, "update.ps1"));
+  const result = runPowerShell(
+    path.join(sourceRoot, "update.ps1"),
+    [
+      "-SourceRoot", sourceRoot,
+      "-CodeRoot", codeRoot,
+      "-DataRoot", dataRoot,
+      "-BrokerRoot", brokerRoot,
+      "-SourceCommit", "fixture",
+    ],
+    {
+      USERPROFILE: fixtureRoot,
+      MCP_SDK_ROOT: "",
+      MEMORY_STORE_MCP_ROOT: "",
+      CODEX_TOOLKIT_MCP_ROOT: "",
+      CODEX_TOOLKIT_BROKER_ROOT: "",
+    },
+  );
+  const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0, combinedOutput);
+  assert.match(combinedOutput, /npm test failed with exit code 7/);
+  assert.doesNotMatch(combinedOutput, /SDK path is unavailable/);
+  assert.equal(fs.readFileSync(path.join(codeRoot, "sentinel.txt"), "utf8"), "previous installation\n");
+  assert.equal(fs.existsSync(path.join(dataRoot, "state", "task-router.maintenance.json")), false);
 });
 
 test("successful idle activation resolves the persisted pending-update metadata", () => {

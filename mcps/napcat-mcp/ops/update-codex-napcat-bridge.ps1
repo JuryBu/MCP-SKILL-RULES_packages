@@ -11,7 +11,8 @@ param(
   [switch]$MigrateAutostart,
   [switch]$AllowLegacyMixedRoot,
   [switch]$PreserveActiveWakes,
-  [switch]$BackendOnlyHotReload
+  [switch]$BackendOnlyHotReload,
+  [switch]$ValidateOnly
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,12 +82,24 @@ function Read-JsonOrNull {
 
 function Resolve-McpSdkRoot {
   $PrivateEnv = Read-JsonOrNull -Path $PrivateEnvPath
+  $BrokerRoots = @(
+    [string]$env:CODEX_TOOLKIT_BROKER_ROOT,
+    [string]$PrivateEnv.CODEX_TOOLKIT_BROKER_ROOT,
+    [string]$BrokerRoot
+  ) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique
+  $ToolkitRoots = @($BrokerRoots | ForEach-Object {
+    Split-Path -Parent ([System.IO.Path]::GetFullPath([string]$_))
+  } | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Unique)
+  $BrokerSdkCandidates = @($ToolkitRoots | ForEach-Object {
+    Join-Path ([string]$_) "memory-store\node_modules\@modelcontextprotocol\sdk\dist\esm"
+    Join-Path ([string]$_) "services\memory-store\node_modules\@modelcontextprotocol\sdk\dist\esm"
+  })
   $Candidates = @(
     [string]$env:MCP_SDK_ROOT,
     [string]$PrivateEnv.MCP_SDK_ROOT,
     $(if (-not [string]::IsNullOrWhiteSpace([string]$PrivateEnv.MEMORY_STORE_MCP_ROOT)) { Join-Path ([string]$PrivateEnv.MEMORY_STORE_MCP_ROOT) "node_modules\@modelcontextprotocol\sdk\dist\esm" }),
     $(if (-not [string]::IsNullOrWhiteSpace([string]$PrivateEnv.CODEX_TOOLKIT_MCP_ROOT)) { Join-Path ([string]$PrivateEnv.CODEX_TOOLKIT_MCP_ROOT) "memory-store\node_modules\@modelcontextprotocol\sdk\dist\esm" })
-  )
+  ) + $BrokerSdkCandidates
   foreach ($Candidate in $Candidates) {
     if ([string]::IsNullOrWhiteSpace([string]$Candidate)) { continue }
     $Resolved = [System.IO.Path]::GetFullPath([string]$Candidate)
@@ -252,10 +265,32 @@ if ($BackendOnlyHotReload -and -not $ActivateNow) {
 }
 $ValidationMcpSdkRoot = Resolve-McpSdkRoot
 if ([string]::IsNullOrWhiteSpace($ValidationMcpSdkRoot)) {
-  throw "Cannot validate the NapCat MCP candidate because the broker MCP SDK path is unavailable. Check MCP_SDK_ROOT or MEMORY_STORE_MCP_ROOT before entering maintenance."
+  throw "Cannot validate the NapCat MCP candidate because the broker MCP SDK path is unavailable. Check MCP_SDK_ROOT, MEMORY_STORE_MCP_ROOT, or CODEX_TOOLKIT_BROKER_ROOT before entering maintenance."
+}
+New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
+try {
+  Copy-CodeTree -From $SourceRoot -To $CandidateRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check") -McpSdkRoot $ValidationMcpSdkRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test") -McpSdkRoot $ValidationMcpSdkRoot
+} catch {
+  try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+  throw
+}
+if ($ValidateOnly) {
+  [pscustomobject]@{
+    schemaVersion = 1
+    candidateValidated = $true
+    sourceCommit = $SourceCommit
+    sourceRoot = $SourceRoot
+    sourceTreeSha256 = $SourceTreeHash
+    validationMcpSdkRoot = $ValidationMcpSdkRoot
+    validatedAt = (Get-Date).ToString("o")
+  } | ConvertTo-Json -Depth 8
+  try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+  return
 }
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
-New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $ReleasesRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $PointersRoot | Out-Null
 $LockStream = $null
@@ -265,6 +300,9 @@ $Activated = $false
 $CodeInstallStarted = $false
 $BrokerBackendReloaded = $false
 $ProxyLifecycleTouched = $false
+$RouterStopped = $false
+$SupervisorStopped = $false
+$WatchdogStopped = $false
 $PreviousPointer = Read-JsonOrNull -Path $ActivePointerPath
 $PreviousUserAppServerWsUrl = [Environment]::GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", "User")
 
@@ -296,6 +334,7 @@ try {
     if ($RouterStopResult.stopped -ne $true) {
       throw "Cannot preserve active wakes because the task router did not stop within the guarded timeout."
     }
+    $RouterStopped = $true
     $AfterRouterStopSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
     if ((Get-SnapshotJson $BeforeSnapshot) -ne (Get-SnapshotJson $AfterRouterStopSnapshot)) {
       throw "Protected task routing, message ledger, or wake state changed while stopping the task router."
@@ -314,10 +353,6 @@ try {
     $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
   }
 
-  Copy-CodeTree -From $SourceRoot -To $CandidateRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check") -McpSdkRoot $ValidationMcpSdkRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test") -McpSdkRoot $ValidationMcpSdkRoot
   if (-not (Test-Path -LiteralPath $ReleaseRoot)) {
     Copy-CodeTree -From $CandidateRoot -To $ReleaseRoot
     Write-JsonAtomic -Path (Join-Path $ReleaseRoot "release-manifest.json") -Value ([ordered]@{
@@ -365,11 +400,14 @@ try {
         throw "Installed watchdog stop script is missing: $StopWatchdogScript"
       }
       & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
+      $WatchdogStopped = $true
       foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")) {
         $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
         if (-not (Test-Path -LiteralPath $ScriptPath)) { throw "Installed stop script is missing: $ScriptPath" }
         $StopResult = & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
         if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process within the guarded timeout." }
+        if ($ScriptName -eq "stop-napcat-task-router.ps1") { $RouterStopped = $true }
+        if ($ScriptName -eq "stop-napcat-supervisor.ps1") { $SupervisorStopped = $true }
       }
       if ($MigrateAutostart) {
         & (Join-Path $CodeRoot "ops\install-napcat-autostart.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot -TaskName $SupervisorTaskName | Out-Null
@@ -401,6 +439,7 @@ try {
       throw "Installed watchdog stop script is missing: $StopWatchdogScript"
     }
     & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
+    $WatchdogStopped = $true
     foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
       $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
       if (Test-Path -LiteralPath $ScriptPath) {
@@ -411,6 +450,8 @@ try {
           & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
         }
         if ($StopResult.stopped -ne $true) { throw "$ScriptName did not stop its managed process within the guarded timeout." }
+        if ($ScriptName -eq "stop-napcat-task-router.ps1") { $RouterStopped = $true }
+        if ($ScriptName -eq "stop-napcat-supervisor.ps1") { $SupervisorStopped = $true }
         if ($ScriptName -eq "stop-codex-app-server-proxy.ps1" -and $StopResult.clean -ne $true) {
           throw "$ScriptName left a managed App Server process or listener behind."
         }
@@ -487,6 +528,8 @@ try {
         } else {
           & $ScriptPath -DataRoot $DataRoot | Out-Null
         }
+        if ($ScriptName -eq "stop-napcat-task-router.ps1") { $RouterStopped = $true }
+        if ($ScriptName -eq "stop-napcat-supervisor.ps1") { $SupervisorStopped = $true }
       } catch {}
     }
   }
@@ -536,14 +579,16 @@ try {
     } catch {}
   }
   $PreviousSupervisorStartScript = Join-Path $CodeRoot "ops\start-napcat-supervisor.ps1"
-  if (Test-Path -LiteralPath $PreviousSupervisorStartScript) {
+  if ($SupervisorStopped -and (Test-Path -LiteralPath $PreviousSupervisorStartScript)) {
     try { & $PreviousSupervisorStartScript -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null } catch {}
   }
   $PreviousRouterStartScript = Join-Path $CodeRoot "ops\start-napcat-task-router.ps1"
-  if (Test-Path -LiteralPath $PreviousRouterStartScript) {
+  if ($RouterStopped -and (Test-Path -LiteralPath $PreviousRouterStartScript)) {
     try { & $PreviousRouterStartScript -DataRoot $DataRoot -BrokerRoot $BrokerRoot | Out-Null } catch {}
   }
-  try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue } catch {}
+  if ($WatchdogStopped) {
+    try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue } catch {}
+  }
   throw
 } finally {
   if ($null -ne $LockStream) { $LockStream.Dispose() }
