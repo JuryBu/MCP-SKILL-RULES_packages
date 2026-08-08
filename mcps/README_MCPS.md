@@ -2,7 +2,7 @@
 
 ## Components
 
-### memory-store 1.22.4
+### memory-store 1.22.5
 
 Shared memory, four-host Conversation reading/export/Recall, offline PB listing, compaction metadata, Record management, Golden Extract, Stage Guard, ownership repair, trajectories, smart search, background recovery, stable task status, source evidence, provider control and production Record scheduling.
 

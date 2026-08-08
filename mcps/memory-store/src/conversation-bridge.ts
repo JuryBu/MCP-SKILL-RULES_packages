@@ -103,11 +103,29 @@ interface CachedConversationLoadResult extends ConversationLoadResult {
     cacheAuthority?: ConversationCacheAuthority;
 }
 
+function countConversationOverview(rounds: ConversationRound[]): { aiResponseCount: number; toolCallCount: number } {
+    let aiResponseCount = 0;
+    let toolCallCount = 0;
+    for (const round of rounds) {
+        aiResponseCount += round.aiResponses.length > 0
+            ? round.aiResponses.length
+            : (round.semanticEvents || []).filter(event => event.semanticRole === "model" || event.semanticRole === "assistant").length;
+        toolCallCount += round.toolCalls.length > 0
+            ? round.toolCalls.length
+            : (round.semanticEvents || []).filter(event => event.semanticRole === "tool").length;
+    }
+    return { aiResponseCount, toolCallCount };
+}
+
 function compactConversationCacheSnapshot(loaded: CachedConversationLoadResult): CachedConversationLoadResult {
     const compactionMetadata = loaded.compactionMetadata
         || buildConversationCompactionMetadata(loaded.chainUsed, loaded.rounds);
+    const overview = countConversationOverview(loaded.rounds);
     return {
         ...loaded,
+        roundCount: loaded.roundCount ?? loaded.rounds.length,
+        aiResponseCount: loaded.aiResponseCount ?? overview.aiResponseCount,
+        toolCallCount: loaded.toolCallCount ?? overview.toolCallCount,
         compactionMetadata,
         rounds: [],
         ...(loaded.codexData ? { codexData: { ...loaded.codexData, rounds: [] } } : {}),
@@ -322,9 +340,12 @@ async function loadFromResolvedChain(
     const previous = readCachedConversationSourceCache<CachedConversationLoadResult>({ key });
     const buildPrevious = options.forceRawCacheRebuild ? undefined : previous;
     const requiresMetadataRefresh = Boolean(
-        options.requireCompactionMetadata
-        && previous
-        && previous.snapshot.compactionMetadata?.version !== 1,
+        previous
+        && (
+            (options.requireCompactionMetadata && previous.snapshot.compactionMetadata?.version !== 1)
+            || previous.snapshot.aiResponseCount === undefined
+            || previous.snapshot.toolCallCount === undefined
+        ),
     );
     const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass);
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
