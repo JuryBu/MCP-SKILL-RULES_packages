@@ -121,6 +121,15 @@ export function isFatalBackendTransportError(error) {
   });
 }
 
+export function shouldResetBackendAfterToolsListFailure({ failureCount, threshold, activeToolCalls }) {
+  const normalizedThreshold = Math.max(0, Math.floor(Number(threshold) || 0));
+  const normalizedFailures = Math.max(0, Math.floor(Number(failureCount) || 0));
+  const normalizedActiveToolCalls = Math.max(0, Math.floor(Number(activeToolCalls) || 0));
+  return normalizedThreshold > 0
+    && normalizedFailures >= normalizedThreshold
+    && normalizedActiveToolCalls === 0;
+}
+
 export function createBrokerBackendTimeoutResult({ endpoint, toolName, budget, backendStatus }) {
   const callerDeadline = budget.deadlineOwner === "caller";
   const details = {

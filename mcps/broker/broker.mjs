@@ -14,6 +14,7 @@ import {
   isRequestTimeoutError,
   remainingBudgetMs,
   resolveToolCallBudget,
+  shouldResetBackendAfterToolsListFailure,
   shouldTrackBackendWork,
 } from "./request-lifecycle.mjs";
 
@@ -224,6 +225,7 @@ const endpoints = {
     command: "node",
     args: [path.join(sandboxRoot, "dist", "index.js")],
     cwd: sandboxRoot,
+    resetBackendAfterToolsListFailures: 2,
     env: {
       CODEX_MCP_WRAPPER: "1",
       CODEX_MCP_TOOL_NAME: "sandbox",
@@ -732,6 +734,8 @@ class EndpointBroker {
       ? { tools: config.toolsListFallback }
       : null;
     this.cachedToolsListAt = this.cachedToolsList ? "static-fallback" : null;
+    this.consecutiveToolsListFailures = 0;
+    this.activeToolCalls = 0;
     this.inFlight = 0;
     this.reloading = false;
     this.reloadCount = 0;
@@ -751,6 +755,8 @@ class EndpointBroker {
       oldestSessionAt: sessions.map((session) => session.createdAt).sort()[0] ?? null,
       newestSessionSeenAt: sessions.map((session) => session.lastSeenAt).sort().at(-1) ?? null,
       toolsListCacheAt: this.cachedToolsListAt,
+      consecutiveToolsListFailures: this.consecutiveToolsListFailures,
+      activeToolCalls: this.activeToolCalls,
       inFlight: this.inFlight,
       reloading: this.reloading,
       reloadCount: this.reloadCount,
@@ -847,8 +853,23 @@ class EndpointBroker {
           this.cachedToolsList = result;
           this.cachedToolsListAt = new Date().toISOString();
         }
+        this.consecutiveToolsListFailures = 0;
         return result;
       } catch (error) {
+        this.consecutiveToolsListFailures += 1;
+        const shouldReset = shouldResetBackendAfterToolsListFailure({
+          failureCount: this.consecutiveToolsListFailures,
+          threshold: this.config.resetBackendAfterToolsListFailures,
+          activeToolCalls: this.activeToolCalls,
+        });
+        if (shouldReset && this.backend.status().connected) {
+          log("tools/list recovery threshold reached", {
+            endpoint: this.name,
+            consecutiveFailures: this.consecutiveToolsListFailures,
+            activeToolCalls: this.activeToolCalls,
+          });
+          await this.backend.close();
+        }
         if (this.cachedToolsList) {
           log("tools/list fallback used", {
             endpoint: this.name,
@@ -872,6 +893,7 @@ class EndpointBroker {
       }
       const args = request.params?.arguments || {};
       const budget = resolveToolCallBudget(args, { requestTimeoutMs, waitTimeoutCapMs });
+      this.activeToolCalls += 1;
       try {
         return await this.backend.request(
           {
@@ -909,6 +931,8 @@ class EndpointBroker {
           });
         }
         throw error;
+      } finally {
+        this.activeToolCalls = Math.max(0, this.activeToolCalls - 1);
       }
     });
     forwardOptionalList(ListResourcesRequestSchema, ListResourcesResultSchema, { resources: [] });

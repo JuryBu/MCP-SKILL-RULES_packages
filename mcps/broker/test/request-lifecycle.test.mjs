@@ -11,6 +11,7 @@ import {
   isRequestTimeoutError,
   remainingBudgetMs,
   resolveToolCallBudget,
+  shouldResetBackendAfterToolsListFailure,
   shouldTrackBackendWork,
 } from "../request-lifecycle.mjs";
 
@@ -131,4 +132,11 @@ test("fatal backend transport errors are separated from ordinary tool failures",
   assert.equal(isFatalBackendTransportError(new Error("service is not connected to the configured account")), false);
   assert.equal(isFatalBackendTransportError(new Error("HTTP request failed")), false);
   assert.equal(isFatalBackendTransportError({ code: -32001, message: "Request timed out" }), false);
+});
+
+test("tools/list recovery waits for repeated failures and an idle endpoint", () => {
+  assert.equal(shouldResetBackendAfterToolsListFailure({ failureCount: 1, threshold: 2, activeToolCalls: 0 }), false);
+  assert.equal(shouldResetBackendAfterToolsListFailure({ failureCount: 2, threshold: 2, activeToolCalls: 1 }), false);
+  assert.equal(shouldResetBackendAfterToolsListFailure({ failureCount: 2, threshold: 2, activeToolCalls: 0 }), true);
+  assert.equal(shouldResetBackendAfterToolsListFailure({ failureCount: 3, threshold: 0, activeToolCalls: 0 }), false);
 });

@@ -44,6 +44,7 @@ Call timeout behavior:
 - Frontend tool-call cancellation is propagated to the backend through the MCP SDK request signal. A broker-layer MCP request timeout returns `broker_backend_timeout`, which is distinct from a command's own execution timeout and does not recommend blind retries because the command may already have started. Endpoint `tools/list` calls keep their own short timeout.
 - Fatal child-transport failures such as `Transport send error`, broken pipes, closed transports, and reset sockets invalidate that backend immediately even for forwarded tool calls. The failed tool call is never replayed automatically because a mutating operation may already have taken effect; the next call reconnects to a fresh child.
 - `GET /health` remains a shallow process check. The loopback-only `GET /health?endpoint=<name>&deep=1` performs a read-only `tools/list` round trip, reconnects once after a fatal stale transport, and reports `healthy`, backend PID, generation, and tool count without invoking any business tool.
+- Sandbox keeps ordinary tool-call timeouts non-destructive. If the endpoint has no active tool call and two consecutive `tools/list` probes time out, the broker closes only that unresponsive Sandbox backend so the next request can start a fresh generation.
 
 Exa stateless bridge:
 

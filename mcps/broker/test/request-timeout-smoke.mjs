@@ -66,7 +66,12 @@ const [{ Server }, { StdioServerTransport }, types] = await Promise.all([
   import(pathToFileURL(sdkRoot + "/types.js").href),
 ]);
 const server = new Server({ name: "fake-sandbox", version: "1.0.0" }, { capabilities: { tools: {} } });
-server.setRequestHandler(types.ListToolsRequestSchema, async () => ({ tools: [{ name: "delay", description: "delay", inputSchema: { type: "object" } }] }));
+let listCount = 0;
+server.setRequestHandler(types.ListToolsRequestSchema, async () => {
+  listCount += 1;
+  if (listCount > 1) await new Promise(() => undefined);
+  return { tools: [{ name: "delay", description: "delay", inputSchema: { type: "object" } }] };
+});
 server.setRequestHandler(types.CallToolRequestSchema, async (request, extra) => {
   await new Promise((resolve, reject) => {
     const timer = setTimeout(resolve, 5000);
@@ -136,7 +141,13 @@ try {
   assert.equal(marker.aborted, true);
   assert.equal(marker.meta?.["io.github.jurybu/broker"]?.timeoutMs, 2000);
   assert.equal(typeof marker.meta?.["io.github.jurybu/broker"]?.deadlineAtMs, "number");
-  console.log("Broker timeout smoke propagated cancellation and returned a classified timeout.");
+
+  await assert.rejects(() => client.listTools(), /timed out/i);
+  await assert.rejects(() => client.listTools(), /timed out/i);
+  await new Promise((resolve) => setTimeout(resolve, 250));
+  const recoveredTools = await client.listTools();
+  assert.deepEqual(recoveredTools.tools.map((tool) => tool.name), ["delay"]);
+  console.log("Broker timeout smoke preserved tool timeout semantics and recovered an unresponsive idle backend.");
 } finally {
   await client?.close().catch(() => undefined);
   if (child.exitCode === null) {
