@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "ownerAccountKey": "receiver-owned-private-key",
+  "routes": [
+    {
+      "routeId": "local-generated-uuid",
+      "profile": "human_group",
+      "exactTitle": "ExampleGroup",
+      "expectedChatType": "group",
+      "expectedMemberCount": 3,
+      "conversationId": "receiver-owned-codex-thread",
+      "generation": 1,
+      "state": "enrolling"
+    }
+  ]
+}
