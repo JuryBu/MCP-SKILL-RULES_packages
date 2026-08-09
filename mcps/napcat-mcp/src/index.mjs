@@ -410,7 +410,7 @@ const tools = [
   },
   {
     name: "napcat_owner_alert",
-    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短自然的主人通知。默认在末尾自动追加简短回复提示，也可用 reply_hint 自定义自然措辞。私聊直接回复时会投递到同一目标最近一条开放通知；引用回复可精确指定较早通知。单独图片、文件、转发或表情先持久缓冲，等后续明确文字时合并唤醒。群聊仍需引用并 @ 本机 QQ。内部 route_key 不展示给主人。",
+    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短自然的主人通知。默认在末尾自动追加简短回复提示，也可用 reply_hint 自定义自然措辞。主人在私聊中必须引用该通知；群聊中必须引用该通知并 @ 本机 QQ，系统才会把回复精确送回对应 Codex 对话。单独图片、文件、转发或表情先持久缓冲，等后续明确文字时合并唤醒。内部 route_key 不展示给主人。",
     inputSchema: ownerAlertInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
