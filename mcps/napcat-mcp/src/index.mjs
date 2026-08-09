@@ -296,6 +296,7 @@ const ownerAlertInputSchema = {
   properties: {
     route_key: { type: "string", minLength: 1, maxLength: 256 },
     summary: { type: "string", minLength: 1, maxLength: 800 },
+    reply_hint: { type: "string", minLength: 1, maxLength: 80 },
     level: { type: "string", enum: ["INFO", "MILESTONE", "ACTION", "WARNING", "FAILED", "COMPLETED"] },
     dedupe_key: { type: "string", minLength: 1, maxLength: 200 },
   },
@@ -397,7 +398,7 @@ const tools = [
   },
   {
     name: "napcat_owner_route_register",
-    description: "把内部 route_key 登记到当前 Codex conversationId 和 binding 中预先配置的主人通知目标；route_key 用于本地回复路由，不展示给主人，也不允许调用方直接传 QQ 或群号。",
+    description: "把内部 route_key 登记到当前 Codex conversationId 和 binding 中预先配置的主人通知目标；首次登记或关闭后重开时自动以目标当前最近消息建立历史基线，避免旧私聊回放。route_key 用于本地回复路由，不展示给主人，也不允许调用方直接传 QQ 或群号。",
     inputSchema: ownerRouteInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -409,7 +410,7 @@ const tools = [
   },
   {
     name: "napcat_owner_alert",
-    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短自然的主人通知。私聊引用该通知即可回复；群聊需引用该通知并 @ 本机 QQ。内部 route_key 不展示给主人。",
+    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短自然的主人通知。默认在末尾自动追加简短回复提示，也可用 reply_hint 自定义自然措辞。私聊直接回复时会投递到同一目标最近一条开放通知；引用回复可精确指定较早通知。单独图片、文件、转发或表情先持久缓冲，等后续明确文字时合并唤醒。群聊仍需引用并 @ 本机 QQ。内部 route_key 不展示给主人。",
     inputSchema: ownerAlertInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
@@ -598,7 +599,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({ ok: true, ...result, router: taskRouterController.ensureStarted() });
     }
     if (name === "napcat_owner_route_register") {
-      const route = controlPlane.registerOwnerRoute(args);
+      const route = await controlPlane.registerOwnerRoute(args);
       return textResult({ ok: true, route, router: taskRouterController.ensureStarted() });
     }
     if (name === "napcat_owner_route_close") {

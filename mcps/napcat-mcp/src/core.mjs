@@ -317,28 +317,93 @@ function summarizeFileAttachment(data = {}) {
   };
 }
 
-function oneBotFileAttachments(message) {
+const DEFERRED_ATTACHMENT_TYPES = new Set([
+  "file",
+  "image",
+  "record",
+  "video",
+  "forward",
+  "node",
+  "face",
+  "mface",
+  "json",
+  "xml",
+]);
+
+const DEFERRED_ATTACHMENT_FIELDS = [
+  "id",
+  "file",
+  "file_id",
+  "file_uuid",
+  "file_name",
+  "name",
+  "url",
+  "summary",
+  "sub_type",
+  "size",
+  "key",
+  "resid",
+];
+
+function summarizeDeferredAttachment(type, data = {}) {
+  if (type === "file") return summarizeFileAttachment(data);
+  const attachment = { type };
+  for (const field of DEFERRED_ATTACHMENT_FIELDS) {
+    const value = data?.[field];
+    if (value === undefined || value === null || value === "") continue;
+    attachment[field] = typeof value === "string" ? decodeCqValue(value).slice(0, 1000) : value;
+  }
+  return attachment;
+}
+
+function oneBotDeferredAttachments(message) {
   const attachments = [];
   if (Array.isArray(message?.message)) {
     for (const segment of message.message) {
-      if (segment?.type === "file") attachments.push(summarizeFileAttachment(segment.data));
+      if (DEFERRED_ATTACHMENT_TYPES.has(segment?.type)) {
+        attachments.push(summarizeDeferredAttachment(segment.type, segment.data));
+      }
     }
   }
   const rawMessage = typeof message?.raw_message === "string" ? message.raw_message : "";
-  for (const match of rawMessage.matchAll(/\[CQ:file,([^\]]+)\]/g)) {
+  for (const match of rawMessage.matchAll(/\[CQ:([^,\]]+),([^\]]+)\]/g)) {
+    const type = match[1];
+    if (!DEFERRED_ATTACHMENT_TYPES.has(type)) continue;
     const attributes = {};
-    for (const part of match[1].split(",")) {
+    for (const part of match[2].split(",")) {
       const separator = part.indexOf("=");
       if (separator > 0) attributes[part.slice(0, separator)] = part.slice(separator + 1);
     }
-    attachments.push(summarizeFileAttachment(attributes));
+    attachments.push(summarizeDeferredAttachment(type, attributes));
   }
   const unique = new Map();
   for (const attachment of attachments) {
-    const key = `${attachment.fileId}\n${attachment.fileName}\n${attachment.fileBytes ?? ""}`;
+    const key = JSON.stringify(attachment);
     if (!unique.has(key)) unique.set(key, attachment);
   }
   return [...unique.values()];
+}
+
+function oneBotContentSummary(message) {
+  const contentTypes = [];
+  let explicitText = "";
+  if (Array.isArray(message?.message)) {
+    for (const segment of message.message) {
+      if (typeof segment === "string") explicitText += segment;
+      else if (segment?.type === "text") explicitText += String(segment?.data?.text ?? "");
+      else if (segment?.type && segment.type !== "reply" && segment.type !== "at") contentTypes.push(String(segment.type));
+    }
+  } else {
+    const raw = String(message?.raw_message ?? message?.message ?? "");
+    explicitText = raw.replace(/\[CQ:[^\]]+\]/g, "");
+    for (const match of raw.matchAll(/\[CQ:([^,\]]+)/g)) {
+      if (match[1] !== "reply" && match[1] !== "at") contentTypes.push(match[1]);
+    }
+  }
+  return {
+    hasExplicitText: Boolean(explicitText.trim()),
+    contentTypes: [...new Set(contentTypes)],
+  };
 }
 
 function structuredTaskMetadata(text) {
@@ -447,6 +512,7 @@ function summarizeGroupMessage(message, expectedSelfId) {
   const text = oneBotReadableText(message);
   const taskMetadata = structuredTaskMetadata(text);
   const controlSegments = oneBotControlSegments(message);
+  const contentSummary = oneBotContentSummary(message);
   return {
     messageId: String(message?.message_id ?? ""),
     messageSeq: String(message?.message_seq ?? message?.message_id ?? ""),
@@ -470,7 +536,9 @@ function summarizeGroupMessage(message, expectedSelfId) {
     routeKey: taskMetadata.routeKey,
     mentionedUserIds: controlSegments.mentionedUserIds,
     replyMessageId: controlSegments.replyMessageId,
-    attachments: oneBotFileAttachments(message),
+    attachments: oneBotDeferredAttachments(message),
+    hasExplicitText: contentSummary.hasExplicitText,
+    contentTypes: contentSummary.contentTypes,
   };
 }
 

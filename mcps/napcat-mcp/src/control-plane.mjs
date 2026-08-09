@@ -55,15 +55,43 @@ function connectionPrompt(message) {
   ].join("\n");
 }
 
-function ownerReplyPrompt(route, message) {
+function ownerReplyPrompt(route, message, bufferedMessages = []) {
+  const buffered = bufferedMessages.length > 0
+    ? [
+        "主人此前连续发送了以下附件或媒体，当时按规则只缓冲、没有单独触发回复：",
+        ...bufferedMessages.map((item) => [
+          `message_seq=${item.messageSeq}`,
+          `类型=${item.contentTypes.join(",") || "media"}`,
+          ...(item.attachments.length > 0 ? [`附件=${JSON.stringify(item.attachments)}`] : []),
+          ...(item.text ? [`内容=${item.text}`] : []),
+        ].join("；")),
+        "主人现在补充了明确文字，请结合这些缓冲内容一起处理：",
+      ]
+    : ["主人通过 QQ 通知通道回复了这条 Codex 对话，请把下面内容作为用户补充信息处理："];
   return [
     "[NAPCAT_OWNER_REPLY]",
     `route_key=${route.routeKey}`,
     ...(route.taskId ? [`task_id=${route.taskId}`] : []),
     `message_seq=${message.messageSeq}`,
-    "主人通过 QQ 通知通道回复了这条 Codex 对话，请把下面内容作为用户补充信息处理：",
+    ...buffered,
     String(message.text ?? "").trim(),
   ].join("\n");
+}
+
+function standaloneDeferredOwnerMessage(message) {
+  return message?.hasExplicitText === false && Array.isArray(message?.contentTypes) && message.contentTypes.length > 0;
+}
+
+function chronologicalMessages(messages) {
+  return messages
+    .map((message, index) => ({ message, index, timestamp: Date.parse(message?.time ?? "") }))
+    .sort((left, right) => {
+      if (Number.isFinite(left.timestamp) && Number.isFinite(right.timestamp) && left.timestamp !== right.timestamp) {
+        return left.timestamp - right.timestamp;
+      }
+      return left.index - right.index;
+    })
+    .map((entry) => entry.message);
 }
 
 export function createControlPlane(options = {}) {
@@ -378,13 +406,31 @@ export function createControlPlane(options = {}) {
     };
   }
 
-  function registerOwnerRoute(input) {
-    return state.openOwnerRoute({
-      routeKey: requiredText(input.route_key, "route_key", 256),
+  async function registerOwnerRoute(input) {
+    const routeKey = requiredText(input.route_key, "route_key", 256);
+    const targetKey = requiredText(input.target_key || config().defaultTargetKey, "target_key", 64);
+    const existing = state.getOwnerRoute(routeKey);
+    let baselineMessageKeys = null;
+    if (!existing || existing.status !== "open" || existing.baselineInitialized === false) {
+      const history = await notifier.readConfiguredTargetMessages({ target_key: targetKey, count: 50, reverse_order: true });
+      baselineMessageKeys = history.messages
+        .filter((message) => !message.isSelf)
+        .map((message) => messageKey(`owner:${targetKey}`, message));
+    }
+    const route = state.openOwnerRoute({
+      routeKey,
       conversationId: requiredText(input.conversation_id, "conversation_id", 256),
       taskId: optionalText(input.task_id, 128) || null,
-      targetKey: requiredText(input.target_key || config().defaultTargetKey, "target_key", 64),
+      targetKey,
+      ...(baselineMessageKeys === null ? {} : { baselineMessageKeys }),
     });
+    return {
+      ...route,
+      baselineMessageCount: route.baselineMessageKeys.length,
+      bufferedMessageCount: route.bufferedOwnerMessages.length,
+      baselineMessageKeys: undefined,
+      bufferedOwnerMessages: undefined,
+    };
   }
 
   function closeOwnerRoute(input) {
@@ -399,13 +445,20 @@ export function createControlPlane(options = {}) {
     const target = configuration.targets[route.targetKey];
     if (!target) throw new Error(`binding 未定义通知目标：${route.targetKey}`);
     const summary = requiredText(input.summary, "summary", 800);
+    const defaultReplyHint = target.type === "group"
+      ? "回复此条并 @ 当前机器账号即可"
+      : "回复此条即可";
+    const replyHint = optionalText(input.reply_hint, 80) || defaultReplyHint;
+    const message = summary.includes(replyHint)
+      ? summary
+      : `${summary}\n\n${replyHint}`;
     const level = optionalText(input.level, 24) || "INFO";
     const sent = await notifier.sendConfiguredMessage({
       target_key: route.targetKey,
       event: "owner_alert",
       task_id: route.taskId || "owner-alert",
       dedupe_key: requiredText(input.dedupe_key, "dedupe_key", 200),
-      message: summary,
+      message,
     });
     const messageId = sent.messageId ?? sent.existing?.messageId ?? null;
     if (messageId === null || messageId === undefined || String(messageId).trim() === "") {
@@ -420,7 +473,8 @@ export function createControlPlane(options = {}) {
       ...sent,
       level,
       replyRoute,
-      replyMode: target.type === "group" ? "quote_and_mention" : "quote",
+      replyMode: target.type === "group" ? "quote_and_mention" : "latest_private_anchor",
+      replyHint,
     };
   }
 
@@ -437,19 +491,28 @@ export function createControlPlane(options = {}) {
     for (const [targetKey, routes] of routesByTarget) {
       let history;
       try {
-        history = await notifier.readConfiguredTargetMessages({ target_key: targetKey, count: 50 });
+        history = await notifier.readConfiguredTargetMessages({ target_key: targetKey, count: 50, reverse_order: true });
       } catch (error) {
         results.push({ outcome: "owner_channel_read_failed", targetKey, error: publicError(error) });
         continue;
       }
-      for (const message of history.messages) {
+      for (const message of chronologicalMessages(history.messages)) {
         if (message.isSelf) continue;
         const quotedAlert = message.replyMessageId
           ? state.getOwnerAlertMessage(String(message.replyMessageId))
           : null;
+        const latestPrivateAlert = history.target.type === "private"
+          && !quotedAlert
+          && !message.routeKey
+          ? state.getLatestOwnerAlertMessageForTarget(targetKey, routes.map((route) => route.routeKey))
+          : { message: null, ambiguous: false };
+        if (latestPrivateAlert.ambiguous) {
+          results.push({ outcome: "owner_private_route_ambiguous", targetKey, messageSeq: Number(message.messageSeq) });
+          continue;
+        }
         const resolvedRouteKey = quotedAlert?.targetKey === targetKey
           ? quotedAlert.routeKey
-          : message.routeKey;
+          : message.routeKey || latestPrivateAlert.message?.routeKey;
         if (!resolvedRouteKey) continue;
         const route = routes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
@@ -458,9 +521,25 @@ export function createControlPlane(options = {}) {
         const sequence = Number(message.messageSeq);
         if (!Number.isSafeInteger(sequence)) continue;
         const key = messageKey(`owner:${targetKey}`, message);
+        if (state.isOwnerRouteBaselineMessage(route.routeKey, key)) continue;
         if (state.hasSeenControlMessage(key)) continue;
-        const prompt = ownerReplyPrompt(route, message);
-        const wakeId = stableId("owner-reply", [route.routeKey, key]);
+        if (standaloneDeferredOwnerMessage(message)) {
+          state.bufferOwnerRouteMessage({
+            routeKey: route.routeKey,
+            messageKey: key,
+            messageSeq: sequence,
+            time: message.time,
+            text: message.text,
+            contentTypes: message.contentTypes,
+            attachments: message.attachments,
+          });
+          results.push({ outcome: "owner_reply_buffered", routeKey: route.routeKey, messageSeq: sequence });
+          continue;
+        }
+        const bufferedMessages = state.listOwnerRouteBufferedMessages(route.routeKey);
+        const prompt = ownerReplyPrompt(route, message, bufferedMessages);
+        const pendingSequences = [...new Set([...bufferedMessages.map((item) => item.messageSeq), sequence])];
+        const wakeId = stableId("owner-reply", [route.routeKey, ...bufferedMessages.map((item) => item.messageKey), key]);
         try {
           const wake = await bridge.wake({
             threadId: route.conversationId,
@@ -472,8 +551,8 @@ export function createControlPlane(options = {}) {
             sourceMachine: "owner",
             targetMachine: configuration.localMachine,
             trustedPeerQq: String(message.senderId),
-            pendingMessageSeqs: [sequence],
-            newMessageSeqs: [sequence],
+            pendingMessageSeqs: pendingSequences,
+            newMessageSeqs: pendingSequences,
             pendingThroughSequence: sequence,
             pendingThroughTime: message.time,
             promptSha256: crypto.createHash("sha256").update(prompt, "utf8").digest("hex"),
@@ -482,8 +561,7 @@ export function createControlPlane(options = {}) {
             results.push({ outcome: wake?.outcome === "busy" ? "owner_thread_busy" : "owner_thread_unavailable", routeKey: route.routeKey, messageSeq: sequence });
             continue;
           }
-          state.recordOwnerRouteInbound({ routeKey: route.routeKey, messageSeq: sequence });
-          state.markControlMessageSeen(key);
+          state.completeOwnerReplyDelivery({ routeKey: route.routeKey, messageKey: key, messageSeq: sequence });
           results.push({ outcome: "owner_reply_delivered", routeKey: route.routeKey, messageSeq: sequence });
         } catch (error) {
           results.push({ outcome: "owner_reply_failed", routeKey: route.routeKey, messageSeq: sequence, error: publicError(error) });

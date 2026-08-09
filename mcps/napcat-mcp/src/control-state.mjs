@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const STATE_SCHEMA_VERSION = 3;
+const STATE_SCHEMA_VERSION = 5;
 const DEFAULT_MAX_SEEN = 2048;
 const DEFAULT_LOCK_WAIT_MS = 2000;
 
@@ -124,8 +124,42 @@ function migrateState(value) {
   if (migrated.schemaVersion === 2) {
     migrated = {
       ...migrated,
-      schemaVersion: STATE_SCHEMA_VERSION,
+      schemaVersion: 3,
       ownerAlertMessages: {},
+    };
+  }
+  if (migrated.schemaVersion === 3) {
+    migrated = {
+      ...migrated,
+      schemaVersion: 4,
+      ownerRoutes: Object.fromEntries(Object.entries(migrated.ownerRoutes ?? {}).map(([routeKey, route]) => [
+        routeKey,
+        {
+          ...route,
+          baselineMessageKeys: [],
+          baselineInitialized: false,
+          bufferedOwnerMessages: [],
+        },
+      ])),
+    };
+  }
+  if (migrated.schemaVersion === 4) {
+    migrated = {
+      ...migrated,
+      schemaVersion: STATE_SCHEMA_VERSION,
+      ownerRoutes: Object.fromEntries(Object.entries(migrated.ownerRoutes ?? {}).map(([routeKey, route]) => [
+        routeKey,
+        {
+          ...route,
+          baselineMessageKeys: Array.isArray(route.baselineMessageKeys) ? route.baselineMessageKeys : [],
+          baselineInitialized: typeof route.baselineInitialized === "boolean"
+            ? route.baselineInitialized
+            : false,
+          bufferedOwnerMessages: Array.isArray(route.bufferedOwnerMessages)
+            ? route.bufferedOwnerMessages
+            : [],
+        },
+      ])),
     };
   }
   return migrated;
@@ -253,6 +287,31 @@ function validateStoredOwnerRoute(route, routeKey, statePath) {
   }
   if (!Number.isSafeInteger(route.lastInboundMessageSeq) || route.lastInboundMessageSeq < 0) {
     invalidState(statePath, `所有者路由消息标识无效（${routeKey}）`);
+  }
+  if (!Array.isArray(route.baselineMessageKeys) || route.baselineMessageKeys.length > 50) {
+    invalidState(statePath, `所有者路由历史基线无效（${routeKey}）`);
+  }
+  for (const key of route.baselineMessageKeys) {
+    validateStoredString(key, statePath, `ownerRoutes.${routeKey}.baselineMessageKeys`);
+  }
+  if (typeof route.baselineInitialized !== "boolean") {
+    invalidState(statePath, `所有者路由历史基线状态无效（${routeKey}）`);
+  }
+  if (!Array.isArray(route.bufferedOwnerMessages) || route.bufferedOwnerMessages.length > 50) {
+    invalidState(statePath, `所有者路由缓冲消息无效（${routeKey}）`);
+  }
+  for (const [index, message] of route.bufferedOwnerMessages.entries()) {
+    if (!isPlainObject(message)) invalidState(statePath, `所有者路由缓冲消息结构无效（${routeKey}:${index}）`);
+    validateStoredString(message.messageKey, statePath, `ownerRoutes.${routeKey}.bufferedOwnerMessages.${index}.messageKey`);
+    if (!Number.isSafeInteger(message.messageSeq) || message.messageSeq < 0) {
+      invalidState(statePath, `所有者路由缓冲消息标识无效（${routeKey}:${index}）`);
+    }
+    if (message.time !== null) validateStoredDate(message.time, statePath, `ownerRoutes.${routeKey}.bufferedOwnerMessages.${index}.time`);
+    if (typeof message.text !== "string") invalidState(statePath, `所有者路由缓冲文本无效（${routeKey}:${index}）`);
+    if (!Array.isArray(message.contentTypes) || message.contentTypes.some((type) => typeof type !== "string" || !type.trim())) {
+      invalidState(statePath, `所有者路由缓冲内容类型无效（${routeKey}:${index}）`);
+    }
+    if (!Array.isArray(message.attachments)) invalidState(statePath, `所有者路由缓冲附件无效（${routeKey}:${index}）`);
   }
 }
 
@@ -725,6 +784,12 @@ export class ControlState {
       const requestedSequence = hasOwn(input, "lastInboundMessageSeq")
         ? nonNegativeInteger(input.lastInboundMessageSeq, "lastInboundMessageSeq")
         : null;
+      if (hasOwn(input, "baselineMessageKeys") && !Array.isArray(input.baselineMessageKeys)) {
+        invalidArgument("baselineMessageKeys 必须是数组");
+      }
+      const requestedBaseline = hasOwn(input, "baselineMessageKeys")
+        ? [...new Set(input.baselineMessageKeys.map((key) => requiredString(key, "baselineMessageKeys", 512)))].slice(-50)
+        : null;
       const route = {
         routeKey,
         conversationId: immutableValue(input, "conversationId", existing, {
@@ -748,10 +813,21 @@ export class ControlState {
           : requestedOpenedAt ?? resolveNow(this.now, input),
         closedAt: null,
         lastInboundMessageSeq: requestedSequence ?? existing?.lastInboundMessageSeq ?? 0,
+        baselineMessageKeys: existing?.status === "open" && existing.baselineInitialized
+          ? existing.baselineMessageKeys
+          : requestedBaseline ?? [],
+        baselineInitialized: existing?.status === "open" && existing.baselineInitialized
+          ? true
+          : requestedBaseline !== null,
+        bufferedOwnerMessages: existing?.status === "open"
+          ? existing.bufferedOwnerMessages
+          : [],
       };
       const changed = !existing
         || existing.status !== "open"
-        || route.lastInboundMessageSeq !== existing.lastInboundMessageSeq;
+        || route.lastInboundMessageSeq !== existing.lastInboundMessageSeq
+        || route.baselineInitialized !== existing.baselineInitialized
+        || JSON.stringify(route.baselineMessageKeys) !== JSON.stringify(existing.baselineMessageKeys);
       if (!changed) return { changed: false, value: clone(existing) };
       state.ownerRoutes[routeKey] = route;
       return { changed: true, value: clone(route) };
@@ -806,6 +882,84 @@ export class ControlState {
   getOwnerAlertMessage(messageId) {
     const normalizedId = requiredString(messageId, "messageId", 256);
     return clone(readState(this.statePath, this.maxSeen).state.ownerAlertMessages[normalizedId] ?? null);
+  }
+
+  isOwnerRouteBaselineMessage(routeKey, messageKey) {
+    const normalizedRouteKey = requiredString(routeKey, "routeKey", 256);
+    const normalizedMessageKey = requiredString(messageKey, "messageKey", 512);
+    const route = readState(this.statePath, this.maxSeen).state.ownerRoutes[normalizedRouteKey];
+    return Boolean(route?.baselineMessageKeys.includes(normalizedMessageKey));
+  }
+
+  listOwnerRouteBufferedMessages(routeKey) {
+    const normalizedRouteKey = requiredString(routeKey, "routeKey", 256);
+    const route = readState(this.statePath, this.maxSeen).state.ownerRoutes[normalizedRouteKey];
+    return clone(route?.bufferedOwnerMessages ?? []);
+  }
+
+  bufferOwnerRouteMessage(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    const messageKey = requiredString(input.messageKey, "messageKey", 512);
+    const messageSeq = nonNegativeInteger(input.messageSeq, "messageSeq");
+    return this.#write((state) => {
+      const route = state.ownerRoutes[routeKey];
+      if (!route) throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
+      if (route.status !== "open") throw new ControlStateError("OWNER_ROUTE_CLOSED", `所有者路由已关闭：${routeKey}`, { routeKey });
+      const existing = route.bufferedOwnerMessages.find((message) => message.messageKey === messageKey);
+      if (existing) return { changed: false, value: clone(existing) };
+      const message = {
+        messageKey,
+        messageSeq,
+        time: input.time ? toISOString(input.time, "time") : null,
+        text: String(input.text ?? "").slice(0, 2000),
+        contentTypes: [...new Set((input.contentTypes ?? []).map((type) => requiredString(type, "contentTypes", 64)))],
+        attachments: clone(Array.isArray(input.attachments) ? input.attachments : []),
+      };
+      route.bufferedOwnerMessages.push(message);
+      if (route.bufferedOwnerMessages.length > 50) route.bufferedOwnerMessages.splice(0, route.bufferedOwnerMessages.length - 50);
+      if (!state.seenControlMessages.includes(messageKey)) state.seenControlMessages.push(messageKey);
+      if (state.seenControlMessages.length > this.maxSeen) {
+        state.seenControlMessages.splice(0, state.seenControlMessages.length - this.maxSeen);
+      }
+      return { changed: true, value: clone(message) };
+    });
+  }
+
+  completeOwnerReplyDelivery(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    const messageKey = requiredString(input.messageKey, "messageKey", 512);
+    const messageSeq = nonNegativeInteger(input.messageSeq, "messageSeq");
+    return this.#write((state) => {
+      const route = state.ownerRoutes[routeKey];
+      if (!route) throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
+      if (route.status !== "open") throw new ControlStateError("OWNER_ROUTE_CLOSED", `所有者路由已关闭：${routeKey}`, { routeKey });
+      route.lastInboundMessageSeq = messageSeq;
+      route.bufferedOwnerMessages = [];
+      if (!state.seenControlMessages.includes(messageKey)) state.seenControlMessages.push(messageKey);
+      if (state.seenControlMessages.length > this.maxSeen) {
+        state.seenControlMessages.splice(0, state.seenControlMessages.length - this.maxSeen);
+      }
+      return { changed: true, value: clone(route) };
+    });
+  }
+
+  getLatestOwnerAlertMessageForTarget(targetKey, routeKeys = null) {
+    const normalizedTargetKey = requiredString(targetKey, "targetKey", 256);
+    const allowedRouteKeys = routeKeys === null
+      ? null
+      : new Set(routeKeys.map((routeKey) => requiredString(routeKey, "routeKey", 256)));
+    const messages = Object.values(readState(this.statePath, this.maxSeen).state.ownerAlertMessages)
+      .filter((message) => message.targetKey === normalizedTargetKey
+        && (allowedRouteKeys === null || allowedRouteKeys.has(message.routeKey)))
+      .sort((left, right) => Date.parse(right.sentAt) - Date.parse(left.sentAt));
+    if (messages.length === 0) return { message: null, ambiguous: false };
+    const latest = messages[0];
+    const ambiguous = messages.some((message, index) => index > 0
+      && message.sentAt === latest.sentAt
+      && message.routeKey !== latest.routeKey);
+    return { message: ambiguous ? null : clone(latest), ambiguous };
   }
 
   recordOwnerAlertMessage(input) {

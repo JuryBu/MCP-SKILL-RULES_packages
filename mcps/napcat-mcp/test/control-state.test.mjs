@@ -69,7 +69,7 @@ function assertControlStateError(callback, code) {
   assert.throws(callback, (error) => error instanceof ControlStateError && error.code === code);
 }
 
-test("first write creates schemaVersion 3 state through a clean atomic rename", () => {
+test("first write creates schemaVersion 5 state through a clean atomic rename", () => {
   const fixture = createFixture();
   try {
     assert.equal(fs.existsSync(fixture.statePath), false);
@@ -86,7 +86,7 @@ test("first write creates schemaVersion 3 state through a clean atomic rename", 
     });
 
     const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
-    assert.equal(stored.schemaVersion, 3);
+    assert.equal(stored.schemaVersion, 5);
     assert.equal(stored.businessReceiptBootstrapAt, null);
     assert.deepEqual(stored.deliveries["delivery-001"], delivery);
     assert.deepEqual(stored.connectionRequests, {});
@@ -125,7 +125,7 @@ test("legacy schema migrates and persists the business receipt bootstrap", () =>
       fixture.controlState.hasSeenControlMessage("business-receipt:machine_received:delivery-legacy"),
       true,
     );
-    assert.equal(fixture.controlState.snapshot().schemaVersion, 3);
+    assert.equal(fixture.controlState.snapshot().schemaVersion, 5);
   } finally {
     fixture.cleanup();
   }
@@ -283,7 +283,7 @@ test("schemaVersion 2 migrates owner alert message mappings without changing exi
     }, null, 2)}\n`, "utf8");
 
     const snapshot = fixture.controlState.snapshot();
-    assert.equal(snapshot.schemaVersion, 3);
+    assert.equal(snapshot.schemaVersion, 5);
     assert.equal(snapshot.businessReceiptBootstrapAt, BASE_TIME);
     assert.deepEqual(snapshot.ownerAlertMessages, {});
     assert.equal(snapshot.deliveries["delivery-001"].deliveryId, "delivery-001");
@@ -311,6 +311,10 @@ test("owner alert message mappings are idempotent and cannot be remapped", () =>
       targetKey: "training:task-001",
     }), first);
     assert.deepEqual(fixture.controlState.getOwnerAlertMessage("501"), first);
+    assert.deepEqual(
+      fixture.controlState.getLatestOwnerAlertMessageForTarget("training:task-001", ["development:conversation-owner"]),
+      { message: first, ambiguous: false },
+    );
     fixture.controlState.openOwnerRoute(ownerRouteInput({
       routeKey: "another-route",
       conversationId: "another-conversation",
@@ -322,6 +326,36 @@ test("owner alert message mappings are idempotent and cannot be remapped", () =>
         targetKey: "training:task-001",
       }),
       "OWNER_ALERT_MESSAGE_CONFLICT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("latest owner alert resolution rejects tied routes instead of guessing", () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlState.openOwnerRoute(ownerRouteInput());
+    fixture.controlState.openOwnerRoute(ownerRouteInput({
+      routeKey: "another-route",
+      conversationId: "another-conversation",
+    }));
+    fixture.controlState.recordOwnerAlertMessage({
+      messageId: "501",
+      routeKey: "development:conversation-owner",
+      targetKey: "training:task-001",
+    });
+    fixture.controlState.recordOwnerAlertMessage({
+      messageId: "502",
+      routeKey: "another-route",
+      targetKey: "training:task-001",
+    });
+    assert.deepEqual(
+      fixture.controlState.getLatestOwnerAlertMessageForTarget("training:task-001", [
+        "development:conversation-owner",
+        "another-route",
+      ]),
+      { message: null, ambiguous: true },
     );
   } finally {
     fixture.cleanup();
@@ -376,7 +410,9 @@ test("seen control messages deduplicate and stay within maxSeen", () => {
 test("owner routes open, track the latest processed identity without numeric ordering, close, and reopen cleanly", () => {
   const fixture = createFixture();
   try {
-    const opened = fixture.controlState.openOwnerRoute(ownerRouteInput());
+    const opened = fixture.controlState.openOwnerRoute(ownerRouteInput({
+      baselineMessageKeys: ["owner:training:task-001:old-message"],
+    }));
     assert.deepEqual(opened, {
       routeKey: "development:conversation-owner",
       conversationId: "conversation-owner",
@@ -386,6 +422,9 @@ test("owner routes open, track the latest processed identity without numeric ord
       openedAt: BASE_TIME,
       closedAt: null,
       lastInboundMessageSeq: 0,
+      baselineMessageKeys: ["owner:training:task-001:old-message"],
+      baselineInitialized: true,
+      bufferedOwnerMessages: [],
     });
     const openedBytes = fs.readFileSync(fixture.statePath, "utf8");
     assert.deepEqual(fixture.controlState.openOwnerRoute(ownerRouteInput()), opened);
@@ -408,6 +447,19 @@ test("owner routes open, track the latest processed identity without numeric ord
     );
     assert.equal(fs.readFileSync(fixture.statePath, "utf8"), inboundBytes);
 
+    fixture.controlState.bufferOwnerRouteMessage({
+      routeKey: opened.routeKey,
+      messageKey: "owner:training:task-001:media-message",
+      messageSeq: 11,
+      time: BASE_TIME,
+      text: "[CQ:image,file=image-001]",
+      contentTypes: ["image"],
+      attachments: [{ type: "image", file: "image-001" }],
+    });
+    const reloadedBuffered = fixture.createState().getOwnerRoute(opened.routeKey);
+    assert.equal(reloadedBuffered.bufferedOwnerMessages.length, 1);
+    assert.equal(reloadedBuffered.bufferedOwnerMessages[0].messageSeq, 11);
+
     fixture.advance(1000);
     const closed = fixture.controlState.closeOwnerRoute({ routeKey: opened.routeKey });
     assert.equal(closed.status, "closed");
@@ -421,11 +473,58 @@ test("owner routes open, track the latest processed identity without numeric ord
     );
 
     fixture.advance(1000);
-    const reopened = fixture.controlState.openOwnerRoute({ routeKey: opened.routeKey });
+    const reopened = fixture.controlState.openOwnerRoute({
+      routeKey: opened.routeKey,
+      baselineMessageKeys: ["owner:training:task-001:new-baseline"],
+    });
     assert.equal(reopened.status, "open");
     assert.equal(reopened.openedAt, "2026-08-09T00:00:02.000Z");
     assert.equal(reopened.closedAt, null);
     assert.equal(reopened.lastInboundMessageSeq, 10);
+    assert.deepEqual(reopened.baselineMessageKeys, ["owner:training:task-001:new-baseline"]);
+    assert.equal(reopened.baselineInitialized, true);
+    assert.deepEqual(reopened.bufferedOwnerMessages, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("schemaVersion 3 open owner route requires one baseline refresh before scanning", () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlState.openOwnerRoute(ownerRouteInput());
+    const legacyState = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    legacyState.schemaVersion = 3;
+    delete legacyState.ownerRoutes["development:conversation-owner"].baselineMessageKeys;
+    delete legacyState.ownerRoutes["development:conversation-owner"].bufferedOwnerMessages;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+
+    const migrated = fixture.createState().getOwnerRoute("development:conversation-owner");
+    assert.equal(migrated.baselineInitialized, false);
+    const refreshed = fixture.createState().openOwnerRoute({
+      routeKey: "development:conversation-owner",
+      baselineMessageKeys: ["owner:training:task-001:legacy-history"],
+    });
+    assert.equal(refreshed.baselineInitialized, true);
+    assert.deepEqual(refreshed.baselineMessageKeys, ["owner:training:task-001:legacy-history"]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("schemaVersion 4 partial owner route preserves data and requires one baseline refresh", () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlState.openOwnerRoute(ownerRouteInput());
+    const partialState = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    partialState.schemaVersion = 4;
+    delete partialState.ownerRoutes["development:conversation-owner"].baselineInitialized;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(partialState, null, 2)}\n`, "utf8");
+
+    const migrated = fixture.createState().getOwnerRoute("development:conversation-owner");
+    assert.equal(migrated.baselineInitialized, false);
+    assert.deepEqual(migrated.baselineMessageKeys, []);
+    assert.deepEqual(migrated.bufferedOwnerMessages, []);
   } finally {
     fixture.cleanup();
   }
