@@ -12,6 +12,7 @@ Endpoints:
 - `http://127.0.0.1:14588/exa/mcp` (optional remote URL)
 - `http://127.0.0.1:14588/subagent/mcp` (Windsurf-only backend)
 - `http://127.0.0.1:14588/napcat/mcp` (optional; disabled by default)
+- `http://127.0.0.1:14588/wechat-docs/mcp` (optional; disabled by default)
 
 The daemon keeps Codex config stable with `url` transports while it manages backend stdio MCP child processes internally.
 
@@ -66,6 +67,13 @@ NapCat QQ group bridge:
 - A NapCat reload refreshes only allowlisted code/data paths from this broker's private environment file before closing the child. Request bodies cannot inject commands, paths, environment variables, or arbitrary endpoint names.
 - The receiver must install NapCat separately, provide a loopback `NAPCAT_HTTP_URL`, keep `NAPCAT_ACCESS_TOKEN` private, and place a receiver-owned fixed-group binding below `%USERPROFILE%\.codex-toolkit\napcat-mcp` or set `NAPCAT_MCP_BINDING_PATH` explicitly.
 - The broker never bundles QQ login state, a real binding, heartbeat state, QR codes, or NapCat binaries. See `../napcat-mcp/README.md`.
+
+WeChat and Tencent Docs bridge:
+
+- `/wechat-docs/mcp` is added only when `CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP=1`; the source package remains inert otherwise.
+- The backend runs from a versioned Python environment selected by `WECHAT_DOCS_MCP_PYTHON` and `WECHAT_DOCS_MCP_ROOT`. Private route bindings, database paths, the Tencent Docs token file, and the event ledger remain outside the public source tree.
+- `WECHAT_DOCS_MCP_AUTO_POLL=1` keeps database polling inside the shared stdio backend. `WECHAT_DOCS_MCP_WAKE_ENABLED=1` additionally uses the loopback Codex proxy files named by `CODEX_WAKE_PROXY_RUNTIME_FILE` and `CODEX_WAKE_PROXY_TOKEN_FILE`; wake prompts contain route metadata only, never WeChat message text.
+- The bridge reuses the proxy's durable `wake_id` journal but does not edit NapCat tasks, QQ bindings, or OneBot runtime state.
 
 Local secrets:
 

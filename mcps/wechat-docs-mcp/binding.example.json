@@ -3,12 +3,12 @@
   "ownerAccountKey": "receiver-owned-private-key",
   "routes": [
     {
-      "routeId": "local-generated-uuid",
+      "route_id": "local-generated-uuid",
       "profile": "human_group",
-      "exactTitle": "ExampleGroup",
-      "expectedChatType": "group",
-      "expectedMemberCount": 3,
-      "conversationId": "receiver-owned-codex-thread",
+      "exact_title": "ExampleGroup",
+      "chat_type": "group",
+      "username": "sanitized-room-id",
+      "conversation_id": "receiver-owned-codex-thread",
       "generation": 1,
       "state": "enrolling"
     }

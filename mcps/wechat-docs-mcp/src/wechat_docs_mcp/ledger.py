@@ -245,6 +245,60 @@ class EventLedger:
             connection.close()
         return dict(row) if row else None
 
+    def list_wakes_for_notification(self, limit: int = 100) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 500:
+            raise LedgerError("INVALID_LIMIT", "limit 必须在 1 到 500 之间")
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT
+                  wakes.*,
+                  routes.conversation_id,
+                  routes.profile,
+                  (
+                    SELECT COUNT(*)
+                    FROM events
+                    WHERE events.route_id=wakes.route_id AND events.acked_at IS NULL
+                  ) AS pending_count
+                FROM wakes
+                JOIN routes ON routes.route_id=wakes.route_id
+                WHERE wakes.state IN ('prepared','unknown')
+                  AND routes.state='active'
+                  AND EXISTS(
+                    SELECT 1
+                    FROM events
+                    WHERE events.route_id=wakes.route_id AND events.acked_at IS NULL
+                  )
+                ORDER BY wakes.created_at,wakes.wake_id
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        finally:
+            connection.close()
+        return [dict(row) for row in rows]
+
+    def mark_wake_state(
+        self,
+        wake_id: str,
+        expected_states: Sequence[str],
+        next_state: str,
+    ) -> dict[str, Any]:
+        allowed_states = {"prepared", "submitted", "unknown", "closed", "failed"}
+        expected = set(expected_states)
+        if not expected or not expected.issubset(allowed_states) or next_state not in allowed_states:
+            raise LedgerError("INVALID_WAKE_STATE", "wake state 参数无效")
+        with self._transaction() as connection:
+            wake = connection.execute("SELECT * FROM wakes WHERE wake_id=?", (wake_id,)).fetchone()
+            if wake is None:
+                raise LedgerError("WAKE_NOT_FOUND", f"wake 不存在：{wake_id}")
+            if wake["state"] not in expected:
+                raise LedgerError("WAKE_STATE_CONFLICT", "wake state 已变化")
+            connection.execute("UPDATE wakes SET state=? WHERE wake_id=?", (next_state, wake_id))
+            updated = connection.execute("SELECT * FROM wakes WHERE wake_id=?", (wake_id,)).fetchone()
+        return dict(updated)
+
     def list_pending(self, route_id: str, limit: int = 100) -> list[dict[str, Any]]:
         if not 1 <= limit <= 500:
             raise LedgerError("INVALID_LIMIT", "limit 必须在 1 到 500 之间")

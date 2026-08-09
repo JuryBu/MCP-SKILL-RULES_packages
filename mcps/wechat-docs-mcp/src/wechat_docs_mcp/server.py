@@ -13,6 +13,7 @@ from .db_observer import RouteBinding
 from .db_watcher import DbWatcher
 from .ledger import EventLedger, LedgerError
 from .tencent_docs import TencentDocsMcpClient, classify_tool
+from .wake_notifier import CodexWakeNotifier
 
 
 DATA_ROOT = Path(os.environ.get("WECHAT_DOCS_MCP_DATA_ROOT", Path.home() / ".codex-toolkit" / "wechat-docs-mcp"))
@@ -27,6 +28,11 @@ ENCRYPTED_DB_DIR: Path | None = Path(_ENCRYPTED_DB_DIR_RAW) if _ENCRYPTED_DB_DIR
 DECRYPTED_DIR = DATA_ROOT / "private-state" / "decrypted"
 KEYS_FILE = DATA_ROOT / "private-state" / "keys" / "all_keys.json"
 BINDING_FILE = DATA_ROOT / "config" / "binding.json"
+WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
+_WAKE_RUNTIME_RAW = os.environ.get("CODEX_WAKE_PROXY_RUNTIME_FILE", "")
+_WAKE_TOKEN_RAW = os.environ.get("CODEX_WAKE_PROXY_TOKEN_FILE", "")
+WAKE_RUNTIME_FILE = Path(_WAKE_RUNTIME_RAW) if _WAKE_RUNTIME_RAW else None
+WAKE_TOKEN_FILE = Path(_WAKE_TOKEN_RAW) if _WAKE_TOKEN_RAW else None
 
 mcp = MCPServer(
     "wechat_docs_mcp",
@@ -48,6 +54,9 @@ def docs_client() -> TencentDocsMcpClient:
 
 _poll_control_lock = threading.RLock()
 _watcher: DbWatcher | None = None
+_wake_notifier: CodexWakeNotifier | None = None
+_wake_last_error: str | None = None
+_wake_last_attempt_time: str | None = None
 
 
 def _load_bindings() -> list[RouteBinding]:
@@ -86,17 +95,61 @@ def watcher() -> DbWatcher | None:
         return _watcher
 
 
+def wake_notifier() -> CodexWakeNotifier | None:
+    global _wake_notifier
+    with _poll_control_lock:
+        if _wake_notifier is not None:
+            return _wake_notifier
+        if not WAKE_ENABLED or WAKE_RUNTIME_FILE is None or WAKE_TOKEN_FILE is None:
+            return None
+        _wake_notifier = CodexWakeNotifier(
+            ledger(),
+            WAKE_RUNTIME_FILE,
+            WAKE_TOKEN_FILE,
+            os.environ.get("WECHAT_DOCS_MCP_SOURCE_MACHINE", "local"),
+            os.environ.get("WECHAT_DOCS_MCP_TARGET_MACHINE", "local"),
+            retry_interval_seconds=float(os.environ.get("WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS", "30")),
+        )
+        return _wake_notifier
+
+
+def _submit_pending_wakes() -> dict[str, Any]:
+    global _wake_last_error, _wake_last_attempt_time
+    notifier = wake_notifier()
+    if notifier is None:
+        return {"enabled": False, "candidate_count": 0, "submitted_count": 0}
+    _wake_last_attempt_time = utc_now_iso()
+    try:
+        result = notifier.submit_pending()
+        with _poll_control_lock:
+            _wake_last_error = None if not result["errors"] else result["errors"][0]["code"]
+        return {"enabled": True, **result}
+    except Exception as error:
+        with _poll_control_lock:
+            _wake_last_error = type(error).__name__
+        return {
+            "enabled": True,
+            "candidate_count": 0,
+            "submitted_count": 0,
+            "errors": [{"code": type(error).__name__}],
+        }
+
+
 @mcp.tool()
 def wechat_status() -> dict[str, Any]:
     """Return private bridge readiness without exposing account names, routes, messages, or tokens."""
     token_ready = TOKEN_FILE.is_file() and TOKEN_FILE.stat().st_size > 0
     bindings = _load_bindings()
     w = watcher()
+    notifier = wake_notifier()
+    notifier_status = notifier.readiness() if notifier is not None else {"ready": False, "error_code": None}
     with _poll_control_lock:
         background_polling = _poll_thread is not None and _poll_thread.is_alive()
         poll_last_error = _poll_last_error
         poll_last_error_time = _poll_last_error_time
         poll_consecutive_failures = _poll_consecutive_failures
+        wake_last_error = _wake_last_error
+        wake_last_attempt_time = _wake_last_attempt_time
     return {
         "data_root_ready": DATA_ROOT.is_dir(),
         "ledger_ready": (DATA_ROOT / "state" / "events.sqlite3").exists(),
@@ -109,6 +162,10 @@ def wechat_status() -> dict[str, Any]:
         "poll_last_error": poll_last_error,
         "poll_last_error_time": poll_last_error_time,
         "poll_consecutive_failures": poll_consecutive_failures,
+        "wake_notifier_enabled": WAKE_ENABLED,
+        "wake_notifier_ready": notifier_status["ready"],
+        "wake_notifier_error": wake_last_error or notifier_status["error_code"],
+        "wake_last_attempt_time": wake_last_attempt_time,
         "wxautox4_runtime": "not_verified",
         "napcat_runtime_modified": False,
     }
@@ -164,6 +221,7 @@ def wechat_poll(force_refresh: bool = False) -> dict[str, Any]:
             "new_observations": [],
         }
     result = w.watch_once(force_refresh=force_refresh)
+    wake_notifications = _submit_pending_wakes()
     return {
         "changed_files": result.changed_files,
         "decrypted_files": result.decrypted_files,
@@ -180,6 +238,7 @@ def wechat_poll(force_refresh: bool = False) -> dict[str, Any]:
         ],
         "elapsed_seconds": result.elapsed_seconds,
         "error": result.error,
+        "wake_notifications": wake_notifications,
     }
 
 
@@ -294,6 +353,7 @@ def _poll_loop(stop_event: threading.Event, interval: float) -> None:
                         else:
                             _poll_consecutive_failures = 0
                             _poll_last_error = None
+                _submit_pending_wakes()
             except Exception as e:
                 with _poll_control_lock:
                     _poll_last_error = str(e)
@@ -394,10 +454,18 @@ def wechat_poll_stop(timeout: float = 70.0) -> dict[str, Any]:
 
 
 def main() -> None:
+    auto_poll = os.environ.get("WECHAT_DOCS_MCP_AUTO_POLL", "0") == "1"
+    if auto_poll:
+        result = wechat_poll_start(float(os.environ.get("WECHAT_DOCS_MCP_POLL_INTERVAL", "5")))
+        if result["status"] == "error":
+            raise RuntimeError(result["error"])
     try:
         mcp.run(transport="stdio")
     except LedgerError as error:
         raise RuntimeError(f"{error.code}: {error}") from error
+    finally:
+        if auto_poll:
+            wechat_poll_stop()
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ Verified for the 2026-07-27 refresh. These are license-reviewed portable user-si
 | `theme-factory` | 13 | Applies reusable visual themes to documents and web artifacts. |
 | `webapp-testing` | 6 | Tests local web applications with Playwright. |
 | `web-artifacts-builder` | 5 | Builds multi-component HTML artifacts with modern frontend tools. |
+| `wechat-docs-collaboration` | 1 | Handles governed WeChat/Tencent Docs wakes, exact ACK, approval, files, and cross-channel loop prevention. |
 
 ## Excluded By Design
 

@@ -520,7 +520,8 @@ function Test-PackageStructure {
     $allowedSkills = @(
         "algorithmic-art", "brand-guidelines", "canvas-design", "frontend-design", "hatch-pet", "imagegen",
         "internal-comms", "jupyter-notebook", "mcp-builder", "pdf", "playwright", "screenshot",
-        "skill-creator", "slack-gif-creator", "theme-factory", "webapp-testing", "web-artifacts-builder"
+        "skill-creator", "slack-gif-creator", "theme-factory", "webapp-testing", "web-artifacts-builder",
+        "wechat-docs-collaboration"
     )
     $skillDirs = @(Get-ChildItem -LiteralPath (Join-Path $toolkitRoot "skills") -Directory -Force)
     $actualSkills = @($skillDirs | ForEach-Object { $_.Name } | Sort-Object)
@@ -550,6 +551,7 @@ function Test-PackageStructure {
         if (-not $codexConfig.Contains($requiredBlock)) { throw "Codex config template missing block: $requiredBlock" }
     }
     if (-not $codexConfig.Contains("[mcp_servers.napcat]")) { throw "Codex config template missing optional NapCat block." }
+    if (-not $codexConfig.Contains("[mcp_servers.wechat-docs]")) { throw "Codex config template missing optional WeChat Docs block." }
 }
 
 Test-PrivatePatterns

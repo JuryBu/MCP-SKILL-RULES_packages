@@ -24,6 +24,7 @@
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
 | `napcat-mcp` | 0.3.7 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、自然私聊回复路由、热升级历史基线、群文件传输、监督器与安全更新 |
+| `wechat-docs-mcp` | 0.1.0 | 可选本地微信只读监听、合并唤醒、精确 ACK、腾讯文档治理层与当前用户监督器 |
 
 ## 重点能力
 
@@ -92,7 +93,7 @@ Rules 已删除生日、学业、账号链接、登录态、本机路径、真�
 
 ### Skills：完整的可迁移技能包
 
-`skills/` 当前包含 17 个经过 allow-list 与许可证筛选的用户侧技能，本轮新增 `hatch-pet`。`install/Test-CodexToolkit.ps1 -PackageClean` 会逐个检查技能目录、`SKILL.md` 和 manifest，避免压缩包漏掉 Skills。
+`skills/` 当前包含 18 个经过 allow-list 与许可证筛选的用户侧技能，包含 `hatch-pet` 与 `wechat-docs-collaboration`。`install/Test-CodexToolkit.ps1 -PackageClean` 会逐个检查技能目录、`SKILL.md` 和 manifest，避免压缩包漏掉 Skills。
 
 没有打包 Codex `.system` 技能、插件缓存、运行产物，以及本机许可证不允许再分发的 Office skills。详情见 `skills/skills_manifest.md`。
 
@@ -181,6 +182,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
 | `napcat-mcp` | 0.3.7 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, natural private-reply routing, hot-upgrade history baselines, file transfer, supervisor, and guarded updates |
+| `wechat-docs-mcp` | 0.1.0 | Optional governed local WeChat observation, merged wakes, exact ACK, Tencent Docs tools, and a per-user supervisor |
 
 ## Highlights
 

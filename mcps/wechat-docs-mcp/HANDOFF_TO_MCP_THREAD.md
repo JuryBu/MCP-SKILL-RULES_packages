@@ -19,20 +19,24 @@
 | 迁移脚本 SQLite backup() | ✅ | 代码审查确认 |
 | 后台停止竞态（独立 Event） | ✅ | 代码审查确认 |
 | zstandard 依赖声明 | ✅ | `pyproject.toml` 确认 |
+| 可见 wake 正文隔离与重试去重 | ✅ | `test_wake_notifier.py` |
+| broker 深度健康 Supervisor | ✅ | `test_supervisor.py` |
 
 ### 1.2 测试结果
 
 ```
-41 passed in 22.96s, zero warnings
+50 passed, zero warnings
 ```
 
 | 文件 | 数量 |
 |---|---|
 | test_db_observer.py | 10 |
 | test_db_watcher.py | 15 |
-| test_ledger.py | 12 |
+| test_ledger.py | 13 |
 | test_server_polling.py | 4 |
-| **合计** | **41** |
+| test_wake_notifier.py | 5 |
+| test_supervisor.py | 3 |
+| **合计** | **50** |
 
 ### 1.3 文档完成
 
@@ -42,7 +46,7 @@
 | `docs/WECHAT_DATABASE.md` | 密钥提取、18 个 DB、Msg_MD5、zstd、消息类型 |
 | `docs/EVENT_PROTOCOL.md` | route/baseline/event/wake/dedupe/ACK 语义 |
 | `docs/OPERATIONS.md` | 环境配置、安装、启停、备份、健康状态 |
-| `docs/TESTING_AND_TROUBLESHOOTING.md` | 41 项测试、验收步骤、常见错误、诊断顺序 |
+| `docs/TESTING_AND_TROUBLESHOOTING.md` | 50 项测试、验收步骤、常见错误、诊断顺序 |
 | `docs/DECISIONS_AND_HISTORY.md` | raw-key 失败、UIA 取代、Config.Cipher 扫描 |
 
 ## 2. MCP 开发对话待完成
@@ -51,28 +55,28 @@
 
 ### 2.1 环境配置
 
-- [ ] 目标 Python 3.12 环境安装 `zstandard`：`pip install zstandard`
-- [ ] 配置 `WECHAT_ENCRYPTED_DB_DIR` 环境变量
-- [ ] 确保密钥提取工具 `wcdb_key_tool_windows.py` 已安装到 `private-state/tools/`
-- [ ] 用新备份方法生成一份当前账本快照
+- [x] 版本化 Python 3.12.13 环境已安装锁定依赖
+- [x] 私有运行配置已登记 `WECHAT_ENCRYPTED_DB_DIR`
+- [x] 密钥提取工具已验证存在于 `private-state/tools/`
+- [x] 已用 SQLite `backup()` 生成当前账本快照并通过完整性检查
 
 ### 2.2 版本化安装
 
-- [ ] `pip install -e .` 安装到目标环境
-- [ ] 验证 `wechat-docs-mcp` 命令可启动
-- [ ] 验证 `wechat_status` 返回正确状态
+- [x] 已安装到独立 release/env，不使用可变 editable 安装
+- [x] `wechat-docs-mcp` 入口存在，Python 3.12.13
+- [x] `wechat_status` 已在真实私有配置下返回 watcher ready、2 条 route
 
 ### 2.3 后台 Supervisor
 
-- [ ] 配置 MCP 服务自动启动（不依赖手动 `wechat_poll_start`）
-- [ ] 确保服务崩溃后自动重启
+- [x] 已实现 broker 后端自动轮询与深度健康 Supervisor
+- [ ] 安装当前用户登录自启动并做崩溃恢复实测
 - [ ] 配置日志轮转
 
 ### 2.4 Broker 唤醒注入
 
-- [ ] 实现从本地 wake 到 Codex 对话的自动注入
-- [ ] 当前后台线程只写账本，**不会自动唤醒 Codex 对话**
-- [ ] 需要 broker 监听 wake 创建，然后向 Codex 发送通知
+- [x] 已实现本地 wake → Codex 透明代理控制口，复用持久 `wake_id` 去重
+- [x] 提醒仅含 route/generation/wake_id，不含微信消息正文
+- [ ] 安装 broker 端点并用真实新微信消息验证可见注入
 
 ### 2.5 真实微信验收
 
@@ -85,8 +89,8 @@
 
 ### 2.6 Git 跟踪
 
-- [ ] 整个 MCP 目录进入 Git 跟踪
-- [ ] 确认公开源码不含真实账号、Token、聊天内容
+- [x] 整个 MCP 目录已进入 Git 跟踪并形成首个可审计提交
+- [x] 首个提交前已确认公开源码不含真实账号、Token、聊天内容
 
 ### 2.7 旧文档标记（已完成）
 

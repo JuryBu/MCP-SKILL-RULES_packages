@@ -58,6 +58,9 @@ const sandboxRoot = process.env.SANDBOX_MCP_ROOT || path.join(toolkitMcpRoot, "s
 const subagentRoot = process.env.SUBAGENT_MCP_ROOT || path.join(toolkitMcpRoot, "mcp-subagent");
 const napcatRoot = process.env.NAPCAT_MCP_ROOT || path.join(toolkitMcpRoot, "napcat-mcp");
 const napcatEnabled = process.env.CODEX_TOOLKIT_ENABLE_NAPCAT_MCP === "1";
+const wechatDocsRoot = process.env.WECHAT_DOCS_MCP_ROOT || path.join(toolkitMcpRoot, "wechat-docs-mcp");
+const wechatDocsPython = process.env.WECHAT_DOCS_MCP_PYTHON || "python";
+const wechatDocsEnabled = process.env.CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP === "1";
 const brokerControlToken = process.env.CODEX_MCP_BROKER_CONTROL_TOKEN || process.env.NAPCAT_MCP_TOKEN || "";
 const sdkRoot = path.join(
   memoryStoreRoot,
@@ -254,6 +257,34 @@ const endpoints = {
       },
     },
   } : {}),
+  ...(wechatDocsEnabled ? {
+    "wechat-docs": {
+      path: "/wechat-docs/mcp",
+      command: wechatDocsPython,
+      args: ["-m", "wechat_docs_mcp.server"],
+      cwd: wechatDocsRoot,
+      resources: false,
+      env: {
+        CODEX_MCP_WRAPPER: "1",
+        CODEX_MCP_TOOL_NAME: "wechat-docs",
+        PYTHONUTF8: "1",
+        WECHAT_DOCS_MCP_DATA_ROOT: process.env.WECHAT_DOCS_MCP_DATA_ROOT || path.join(toolkitDataRoot, "wechat-docs-mcp"),
+        WECHAT_ENCRYPTED_DB_DIR: process.env.WECHAT_ENCRYPTED_DB_DIR || "",
+        ...(process.env.WECHAT_KEY_TOOL ? { WECHAT_KEY_TOOL: process.env.WECHAT_KEY_TOOL } : {}),
+        ...(process.env.TENCENT_DOCS_MCP_TOKEN_FILE ? {
+          TENCENT_DOCS_MCP_TOKEN_FILE: process.env.TENCENT_DOCS_MCP_TOKEN_FILE,
+        } : {}),
+        WECHAT_DOCS_MCP_AUTO_POLL: process.env.WECHAT_DOCS_MCP_AUTO_POLL || "1",
+        WECHAT_DOCS_MCP_POLL_INTERVAL: process.env.WECHAT_DOCS_MCP_POLL_INTERVAL || "5",
+        WECHAT_DOCS_MCP_WAKE_ENABLED: process.env.WECHAT_DOCS_MCP_WAKE_ENABLED || "0",
+        WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS: process.env.WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS || "30",
+        WECHAT_DOCS_MCP_SOURCE_MACHINE: process.env.WECHAT_DOCS_MCP_SOURCE_MACHINE || "local",
+        WECHAT_DOCS_MCP_TARGET_MACHINE: process.env.WECHAT_DOCS_MCP_TARGET_MACHINE || "local",
+        CODEX_WAKE_PROXY_RUNTIME_FILE: process.env.CODEX_WAKE_PROXY_RUNTIME_FILE || "",
+        CODEX_WAKE_PROXY_TOKEN_FILE: process.env.CODEX_WAKE_PROXY_TOKEN_FILE || "",
+      },
+    },
+  } : {}),
   subagent: {
     path: "/subagent/mcp",
     command: "node",
@@ -270,8 +301,34 @@ const endpoints = {
 };
 
 function refreshEndpointConfigFromPrivateEnv(name, config) {
-  if (name !== "napcat") return { refreshed: false };
   const privateEnv = readPrivateEnvSnapshot() || {};
+  if (name === "wechat-docs") {
+    const refreshedRoot = privateEnv.WECHAT_DOCS_MCP_ROOT || config.cwd;
+    const refreshedPython = privateEnv.WECHAT_DOCS_MCP_PYTHON || config.command;
+    const refreshedDataRoot = privateEnv.WECHAT_DOCS_MCP_DATA_ROOT || config.env.WECHAT_DOCS_MCP_DATA_ROOT;
+    config.cwd = refreshedRoot;
+    config.command = refreshedPython;
+    config.args = ["-m", "wechat_docs_mcp.server"];
+    config.env = {
+      ...config.env,
+      WECHAT_DOCS_MCP_DATA_ROOT: refreshedDataRoot,
+      WECHAT_ENCRYPTED_DB_DIR: privateEnv.WECHAT_ENCRYPTED_DB_DIR || config.env.WECHAT_ENCRYPTED_DB_DIR,
+      ...(privateEnv.WECHAT_KEY_TOOL ? { WECHAT_KEY_TOOL: privateEnv.WECHAT_KEY_TOOL } : {}),
+      ...(privateEnv.TENCENT_DOCS_MCP_TOKEN_FILE ? {
+        TENCENT_DOCS_MCP_TOKEN_FILE: privateEnv.TENCENT_DOCS_MCP_TOKEN_FILE,
+      } : {}),
+      WECHAT_DOCS_MCP_AUTO_POLL: privateEnv.WECHAT_DOCS_MCP_AUTO_POLL || config.env.WECHAT_DOCS_MCP_AUTO_POLL,
+      WECHAT_DOCS_MCP_POLL_INTERVAL: privateEnv.WECHAT_DOCS_MCP_POLL_INTERVAL || config.env.WECHAT_DOCS_MCP_POLL_INTERVAL,
+      WECHAT_DOCS_MCP_WAKE_ENABLED: privateEnv.WECHAT_DOCS_MCP_WAKE_ENABLED || config.env.WECHAT_DOCS_MCP_WAKE_ENABLED,
+      WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS: privateEnv.WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS || config.env.WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS,
+      WECHAT_DOCS_MCP_SOURCE_MACHINE: privateEnv.WECHAT_DOCS_MCP_SOURCE_MACHINE || config.env.WECHAT_DOCS_MCP_SOURCE_MACHINE,
+      WECHAT_DOCS_MCP_TARGET_MACHINE: privateEnv.WECHAT_DOCS_MCP_TARGET_MACHINE || config.env.WECHAT_DOCS_MCP_TARGET_MACHINE,
+      CODEX_WAKE_PROXY_RUNTIME_FILE: privateEnv.CODEX_WAKE_PROXY_RUNTIME_FILE || config.env.CODEX_WAKE_PROXY_RUNTIME_FILE,
+      CODEX_WAKE_PROXY_TOKEN_FILE: privateEnv.CODEX_WAKE_PROXY_TOKEN_FILE || config.env.CODEX_WAKE_PROXY_TOKEN_FILE,
+    };
+    return { refreshed: true, cwd: refreshedRoot, dataRoot: refreshedDataRoot };
+  }
+  if (name !== "napcat") return { refreshed: false };
   const refreshedRoot = privateEnv.NAPCAT_MCP_ROOT || config.cwd;
   const refreshedDataRoot = privateEnv.CODEX_TOOLKIT_NAPCAT_DATA_ROOT || config.env.CODEX_TOOLKIT_NAPCAT_DATA_ROOT;
   config.cwd = refreshedRoot;

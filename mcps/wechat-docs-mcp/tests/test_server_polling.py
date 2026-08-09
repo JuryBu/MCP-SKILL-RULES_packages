@@ -17,6 +17,8 @@ class ServerPollingTests(unittest.TestCase):
             server._poll_last_error = None
             server._poll_last_error_time = None
             server._poll_consecutive_failures = 0
+            server._wake_last_error = None
+            server._wake_last_attempt_time = None
 
     def tearDown(self) -> None:
         with server._poll_control_lock:
@@ -156,13 +158,16 @@ class ServerPollingTests(unittest.TestCase):
                 return self.results.pop(0)
 
         stop_event = TwoCycleStop()
-        with patch.object(server, "watcher", return_value=FakeWatcher()):
+        with patch.object(server, "watcher", return_value=FakeWatcher()), patch.object(
+            server, "_submit_pending_wakes", return_value={"submitted_count": 0}
+        ) as submit_wakes:
             server._poll_loop(stop_event, 1.25)
 
         self.assertEqual(stop_event.wait_intervals, [1.25, 1.25])
         self.assertIsNone(server._poll_last_error)
         self.assertIsNotNone(server._poll_last_error_time)
         self.assertEqual(server._poll_consecutive_failures, 0)
+        self.assertEqual(2, submit_wakes.call_count)
 
 
 if __name__ == "__main__":

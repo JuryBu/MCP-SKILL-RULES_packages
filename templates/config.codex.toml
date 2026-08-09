@@ -49,4 +49,10 @@ enabled = true
 # url = "http://127.0.0.1:14588/napcat/mcp"
 # enabled = true
 
+# Optional governed WeChat and Tencent Docs bridge. Enable the broker module and
+# configure receiver-owned private routes, database paths, and token files first.
+# [mcp_servers.wechat-docs]
+# url = "http://127.0.0.1:14588/wechat-docs/mcp"
+# enabled = true
+
 

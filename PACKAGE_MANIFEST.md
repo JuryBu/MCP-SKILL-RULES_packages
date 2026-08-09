@@ -7,7 +7,7 @@
 | MCP | memory-store 1.22.5, web-fetcher 7.0.0, sandbox 1.16.4, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
-| Skills | 17 license-reviewed portable user skills plus manifest |
+| Skills | 18 license-reviewed portable user skills plus manifest |
 | Setup | PowerShell build, broker, config, validation, and packaging scripts |
 | Templates | Four host configs and receiver-private environment example |
 | Tests | HTTP smoke helper, local pages, memory workspace, expected results |
@@ -33,7 +33,7 @@
 - Windsurf-only subagent remains 1.1.0 and synchronizes current process guarding, LS client, registry and config utilities without carrying Cascade data.
 - NapCat MCP 0.1.0 adds fixed-group status, target discovery, recent-message reads, file download/upload, training events, structured task messages and heartbeat scripts. The package contains no NapCat runtime or QQ state.
 - Codex, Antigravity, Claude Code and Windsurf Rules were refreshed from current sources with personal information removed; Codex system-prompt and Windsurf five-fragment system rules are included.
-- Skills expand from 16 to 17 with the Apache-2.0 `hatch-pet` workflow; redistribution-restricted Office skills remain excluded.
+- Skills include the Apache-2.0 `hatch-pet` workflow and the MIT `wechat-docs-collaboration` governance workflow; redistribution-restricted Office skills remain excluded.
 - Package validation now verifies Skills, Rules, config templates, forbidden runtime files, credential-shaped text, and absolute user paths.
 - Added `install/New-PortableToolkitPackage.ps1` to create a verified directory, zip, and SHA256 without omitting Skills.
 

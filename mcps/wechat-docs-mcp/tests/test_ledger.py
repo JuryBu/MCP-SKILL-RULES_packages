@@ -33,6 +33,17 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(first["wake"]["wake_id"], second["wake"]["wake_id"])
         self.assertFalse(duplicate["inserted"])
 
+    def test_wake_notification_state_is_compare_and_swap(self) -> None:
+        event = self.ledger.ingest_event("route-test", "fp-wake", "text", {"text": "private"})
+        pending = self.ledger.list_wakes_for_notification()
+        self.assertEqual([event["wake"]["wake_id"]], [wake["wake_id"] for wake in pending])
+        self.assertEqual("conversation-test", pending[0]["conversation_id"])
+        submitted = self.ledger.mark_wake_state(event["wake"]["wake_id"], ["prepared"], "submitted")
+        self.assertEqual("submitted", submitted["state"])
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.mark_wake_state(event["wake"]["wake_id"], ["prepared"], "unknown")
+        self.assertEqual("WAKE_STATE_CONFLICT", raised.exception.code)
+
     def test_partial_ack_keeps_later_event_pending(self) -> None:
         first = self.ledger.ingest_event("route-test", "fp-1", "text", {"text": "one"})
         second = self.ledger.ingest_event("route-test", "fp-2", "text", {"text": "two"})

@@ -20,6 +20,10 @@
 | `WECHAT_ENCRYPTED_DB_DIR` | (无) | 微信加密数据库目录，**必须设置** |
 | `WECHAT_KEY_TOOL` | `<data_root>/private-state/tools/wcdb_key_tool_windows.py` | 密钥提取工具路径 |
 | `TENCENT_DOCS_MCP_TOKEN_FILE` | `<data_root>/secrets/tencent-docs-mcp.token` | 腾讯文档 Token 文件 |
+| `WECHAT_DOCS_MCP_AUTO_POLL` | `0` | MCP 进程启动时自动开启后台轮询 |
+| `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
+| `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
+| `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
 
 ### 2.2 目录结构
 
@@ -50,13 +54,17 @@
       "route_id": "route-friend-xxx",
       "exact_title": "张三",
       "chat_type": "friend",
-      "username": "wxid_abc123"
+      "username": "wxid_abc123",
+      "conversation_id": "receiver-owned-codex-thread",
+      "generation": 1
     },
     {
       "route_id": "route-group-xxx",
       "exact_title": "工作群",
       "chat_type": "group",
-      "username": "12345678@chatroom"
+      "username": "12345678@chatroom",
+      "conversation_id": "receiver-owned-codex-thread",
+      "generation": 1
     }
   ]
 }
@@ -79,7 +87,7 @@ python -m pip install -e .
 python -m pytest tests/ -v
 ```
 
-应看到 41 项全部通过、零警告。
+应看到 50 项全部通过、零警告。
 
 ### 3.3 配置环境变量
 
@@ -123,6 +131,22 @@ wechat-docs-mcp
 
 通过 stdio 与 MCP 客户端通信。
 
+### 4.5 Broker 与 Supervisor
+
+公开 broker 仅在 `CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP=1` 时增加 `/wechat-docs/mcp`。建议从版本化 release 的 `env` 启动后端，并让 Supervisor 定期调用深度健康检查：
+
+```powershell
+& <current>\ops\manage-wechat-docs-supervisor.ps1 -Action Start
+& <current>\ops\manage-wechat-docs-supervisor.ps1 -Action Status
+& <current>\ops\manage-wechat-docs-supervisor.ps1 -Action Stop
+```
+
+安装当前用户登录自启动前应先完成候选 release、broker 端点和回滚验证：
+
+```powershell
+& <current>\ops\manage-wechat-docs-supervisor.ps1 -Action InstallAutostart
+```
+
 ## 5. 健康状态
 
 ```python
@@ -144,6 +168,10 @@ wechat_status()
 | `poll_last_error` | 后台轮询最后一次错误信息 |
 | `poll_last_error_time` | 错误发生时间 |
 | `poll_consecutive_failures` | 连续失败次数 |
+| `wake_notifier_enabled` | 是否启用 Codex wake 提交 |
+| `wake_notifier_ready` | 代理 runtime、token 与回环地址是否就绪 |
+| `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
+| `wake_last_attempt_time` | 最近一次提交尝试时间 |
 
 ### 5.1 健康判断
 
