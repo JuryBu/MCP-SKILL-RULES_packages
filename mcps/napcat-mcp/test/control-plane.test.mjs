@@ -924,7 +924,7 @@ test("new owner route baselines existing history and delivers only later replies
   }
 });
 
-test("migrated open owner route establishes a baseline before scanning legacy history", async () => {
+test("migrated open owner route establishes a baseline on its first background scan", async () => {
   const seed = createFixture();
   let legacyState;
   try {
@@ -952,14 +952,12 @@ test("migrated open owner route establishes a baseline before scanning legacy hi
   };
   const fixture = createFixture({ existingState: legacyState, targetHistory: { "owner-private": [oldReply] } });
   try {
-    const route = await fixture.controlPlane.registerOwnerRoute({
-      route_key: "private-route",
-      conversation_id: "conversation-private",
-      target_key: "owner-private",
-    });
-    assert.equal(route.baselineMessageCount, 1);
     assert.deepEqual((await fixture.controlPlane.scanOwnerReplies()).results, []);
     assert.equal(fixture.wakeCalls.length, 0);
+    const persisted = JSON.parse(fs.readFileSync(path.join(fixture.root, "state", "control-state.json"), "utf8"));
+    assert.equal(persisted.schemaVersion, 5);
+    assert.equal(persisted.ownerRoutes["private-route"].baselineInitialized, true);
+    assert.equal(persisted.ownerRoutes["private-route"].baselineMessageKeys.length, 1);
   } finally {
     fixture.cleanup();
   }

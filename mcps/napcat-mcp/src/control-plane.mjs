@@ -496,6 +496,19 @@ export function createControlPlane(options = {}) {
         results.push({ outcome: "owner_channel_read_failed", targetKey, error: publicError(error) });
         continue;
       }
+      const baselineMessageKeys = history.messages
+        .filter((message) => !message.isSelf)
+        .map((message) => messageKey(`owner:${targetKey}`, message));
+      const readyRoutes = routes.map((route) => {
+        if (route.baselineInitialized !== false) return route;
+        return state.openOwnerRoute({
+          routeKey: route.routeKey,
+          conversationId: route.conversationId,
+          taskId: route.taskId,
+          targetKey: route.targetKey,
+          baselineMessageKeys,
+        });
+      });
       for (const message of chronologicalMessages(history.messages)) {
         if (message.isSelf) continue;
         const quotedAlert = message.replyMessageId
@@ -504,7 +517,7 @@ export function createControlPlane(options = {}) {
         const latestPrivateAlert = history.target.type === "private"
           && !quotedAlert
           && !message.routeKey
-          ? state.getLatestOwnerAlertMessageForTarget(targetKey, routes.map((route) => route.routeKey))
+          ? state.getLatestOwnerAlertMessageForTarget(targetKey, readyRoutes.map((route) => route.routeKey))
           : { message: null, ambiguous: false };
         if (latestPrivateAlert.ambiguous) {
           results.push({ outcome: "owner_private_route_ambiguous", targetKey, messageSeq: Number(message.messageSeq) });
@@ -514,7 +527,7 @@ export function createControlPlane(options = {}) {
           ? quotedAlert.routeKey
           : message.routeKey || latestPrivateAlert.message?.routeKey;
         if (!resolvedRouteKey) continue;
-        const route = routes.find((candidate) => candidate.routeKey === resolvedRouteKey);
+        const route = readyRoutes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
         if (history.target.type === "private" && String(message.senderId) !== String(history.target.id)) continue;
         if (history.target.type === "group" && !message.mentionedUserIds.includes(configuration.expectedSelfId)) continue;
