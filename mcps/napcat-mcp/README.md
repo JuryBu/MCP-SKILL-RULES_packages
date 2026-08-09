@@ -13,7 +13,7 @@
 | 任务账本 | `napcat_task_register`、`napcat_task_update`、`napcat_task_status`、`napcat_task_list` | 维护任务、Codex 对话、角色、可信对端、代次和唤醒冷却 |
 | 任务完成 | `napcat_task_ack`、`napcat_task_close` | 处理完明确消息序号后确认，任务结束后关闭路由 |
 | 送达与重连 | `napcat_delivery_status`、`napcat_connection_request` | 查询对端机器/对话送达状态，或向已知对端对话提出重新建链请求 |
-| 主人通知 | `napcat_owner_route_register`、`napcat_owner_alert`、`napcat_owner_route_close` | 把简短提醒发到预配置私聊/群聊，并把带路由标记的回复送回指定 Codex 对话 |
+| 主人通知 | `napcat_owner_route_register`、`napcat_owner_alert`、`napcat_owner_route_close` | 把简短人话提醒发到预配置私聊/群聊，并把引用回复送回指定 Codex 对话 |
 | 预览与训练事件 | `napcat_preview_*`、`napcat_send_training_event` | 在发送前预览正文，或发送受去重保护的训练状态 |
 
 ## 本机配置
@@ -84,7 +84,7 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 意外关闭任务时，可以调用 `napcat_connection_request`。首次请求只在这条控制消息中交换 `source_conversation_id` 与 `target_conversation_id`，接收端校验可信机器后把回拨地址持久保存；以后反向重连可传 `reply_to_request_id`，或用稳定的 `previous_task_id` 自动恢复对端地址。普通任务消息、文件索引和 heartbeat 不携带双方 conversationId，不会持续挤占 QQ 单条消息空间。工具只负责唤醒和提出请求，不会替对端创建、更新或绑定任务；对端仍需自行核对身份并调用 `napcat_task_register`，两边完成握手后才能恢复正式消息或关闭旧连接。
 
-主人通知先用 `napcat_owner_route_register` 把 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短提醒。私聊回复必须来自 binding 指定账号并保留「路由」标记；群聊回复还必须 @ 本机 NapCat 账号并保留 `route_key`。扫描器只把匹配的回复送回绑定对话，普通私聊、普通群消息和其它路由不会触发。真实 QQ、群号和目标映射只存在于 schema v2 binding，公开示例只放占位值。
+主人通知先用 `napcat_owner_route_register` 把内部 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短、自然、方便主人直接阅读的提醒。发送成功后，控制面只在本机保存「QQ 消息 ID → route_key → conversationId」映射，不把路由字段写进给主人看的正文。私聊由 binding 指定账号引用该通知回复；群聊需引用该通知并 @ 本机 NapCat 账号。扫描器只把匹配回复送回绑定对话，普通私聊、普通群消息和其它任务不会触发。滚动升级期间仍兼容旧的可见 `route_key` 回复，但新通知不再生成这种格式。真实 QQ、群号和目标映射只存在于私有 binding，公开示例只放占位值。
 
 维护升级默认等待所有活跃唤醒自然完成；确需在任务暂停期间保留未 ACK 唤醒时，可显式给 `ops/update-codex-napcat-bridge.ps1` 传 `-PreserveActiveWakes`。脚本会先进入维护态并停止任务路由器，再校验任务绑定、generation、逐消息账本和唤醒批次完全不变，之后才允许切换代码；它不会替模型 ACK，也不会清除待处理消息。
 

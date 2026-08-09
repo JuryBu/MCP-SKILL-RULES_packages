@@ -69,7 +69,7 @@ function assertControlStateError(callback, code) {
   assert.throws(callback, (error) => error instanceof ControlStateError && error.code === code);
 }
 
-test("first write creates schemaVersion 2 state through a clean atomic rename", () => {
+test("first write creates schemaVersion 3 state through a clean atomic rename", () => {
   const fixture = createFixture();
   try {
     assert.equal(fs.existsSync(fixture.statePath), false);
@@ -86,11 +86,12 @@ test("first write creates schemaVersion 2 state through a clean atomic rename", 
     });
 
     const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
-    assert.equal(stored.schemaVersion, 2);
+    assert.equal(stored.schemaVersion, 3);
     assert.equal(stored.businessReceiptBootstrapAt, null);
     assert.deepEqual(stored.deliveries["delivery-001"], delivery);
     assert.deepEqual(stored.connectionRequests, {});
     assert.deepEqual(stored.ownerRoutes, {});
+    assert.deepEqual(stored.ownerAlertMessages, {});
     assert.deepEqual(stored.seenControlMessages, []);
     assert.deepEqual(
       fs.readdirSync(path.dirname(fixture.statePath)).filter((name) => name.endsWith(".tmp")),
@@ -124,7 +125,7 @@ test("legacy schema migrates and persists the business receipt bootstrap", () =>
       fixture.controlState.hasSeenControlMessage("business-receipt:machine_received:delivery-legacy"),
       true,
     );
-    assert.equal(fixture.controlState.snapshot().schemaVersion, 2);
+    assert.equal(fixture.controlState.snapshot().schemaVersion, 3);
   } finally {
     fixture.cleanup();
   }
@@ -238,14 +239,90 @@ test("a fresh instance reloads all persisted control records", () => {
     const delivery = fixture.controlState.updateDelivery(deliveryInput());
     const request = fixture.controlState.updateConnectionRequest(connectionRequestInput());
     const route = fixture.controlState.openOwnerRoute(ownerRouteInput());
+    const alert = fixture.controlState.recordOwnerAlertMessage({
+      messageId: "501",
+      routeKey: route.routeKey,
+      targetKey: route.targetKey,
+    });
     fixture.controlState.markControlMessageSeen("training:message:101");
 
     const reloaded = fixture.createState();
     assert.deepEqual(reloaded.getDelivery(delivery.deliveryId), delivery);
     assert.deepEqual(reloaded.getConnectionRequest(request.requestId), request);
     assert.deepEqual(reloaded.getOwnerRoute(route.routeKey), route);
+    assert.deepEqual(reloaded.getOwnerAlertMessage(alert.messageId), alert);
     assert.equal(reloaded.hasSeenControlMessage("training:message:101"), true);
     assert.deepEqual(reloaded.snapshot(), JSON.parse(fs.readFileSync(fixture.statePath, "utf8")));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("schemaVersion 2 migrates owner alert message mappings without changing existing records", () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.dirname(fixture.statePath), { recursive: true });
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify({
+      schemaVersion: 2,
+      businessReceiptBootstrapAt: BASE_TIME,
+      deliveries: {
+        "delivery-001": {
+          deliveryId: "delivery-001",
+          taskId: "task-001",
+          sourceMachine: "development",
+          targetMachine: "training",
+          messageSeq: 101,
+          machineReceivedAt: BASE_TIME,
+          conversationReceivedAt: null,
+          status: "machine_received",
+        },
+      },
+      connectionRequests: {},
+      ownerRoutes: {},
+      seenControlMessages: ["business-receipt:machine_received:delivery-001"],
+    }, null, 2)}\n`, "utf8");
+
+    const snapshot = fixture.controlState.snapshot();
+    assert.equal(snapshot.schemaVersion, 3);
+    assert.equal(snapshot.businessReceiptBootstrapAt, BASE_TIME);
+    assert.deepEqual(snapshot.ownerAlertMessages, {});
+    assert.equal(snapshot.deliveries["delivery-001"].deliveryId, "delivery-001");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner alert message mappings are idempotent and cannot be remapped", () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlState.openOwnerRoute(ownerRouteInput());
+    const first = fixture.controlState.recordOwnerAlertMessage({
+      messageId: "501",
+      routeKey: "development:conversation-owner",
+      targetKey: "training:task-001",
+    });
+    assert.equal(first.messageId, "501");
+    assert.equal(first.sentAt, BASE_TIME);
+
+    fixture.advance(1000);
+    assert.deepEqual(fixture.controlState.recordOwnerAlertMessage({
+      messageId: "501",
+      routeKey: "development:conversation-owner",
+      targetKey: "training:task-001",
+    }), first);
+    assert.deepEqual(fixture.controlState.getOwnerAlertMessage("501"), first);
+    fixture.controlState.openOwnerRoute(ownerRouteInput({
+      routeKey: "another-route",
+      conversationId: "another-conversation",
+    }));
+    assertControlStateError(
+      () => fixture.controlState.recordOwnerAlertMessage({
+        messageId: "501",
+        routeKey: "another-route",
+        targetKey: "training:task-001",
+      }),
+      "OWNER_ALERT_MESSAGE_CONFLICT",
+    );
   } finally {
     fixture.cleanup();
   }

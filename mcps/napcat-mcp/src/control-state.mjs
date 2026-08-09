@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const STATE_SCHEMA_VERSION = 2;
+const STATE_SCHEMA_VERSION = 3;
 const DEFAULT_MAX_SEEN = 2048;
 const DEFAULT_LOCK_WAIT_MS = 2000;
 
@@ -106,17 +106,29 @@ function emptyState() {
     deliveries: {},
     connectionRequests: {},
     ownerRoutes: {},
+    ownerAlertMessages: {},
     seenControlMessages: [],
   };
 }
 
 function migrateState(value) {
-  if (!isPlainObject(value) || value.schemaVersion !== 1) return value;
-  return {
-    ...value,
-    schemaVersion: STATE_SCHEMA_VERSION,
-    businessReceiptBootstrapAt: null,
-  };
+  if (!isPlainObject(value)) return value;
+  let migrated = value;
+  if (migrated.schemaVersion === 1) {
+    migrated = {
+      ...migrated,
+      schemaVersion: 2,
+      businessReceiptBootstrapAt: null,
+    };
+  }
+  if (migrated.schemaVersion === 2) {
+    migrated = {
+      ...migrated,
+      schemaVersion: STATE_SCHEMA_VERSION,
+      ownerAlertMessages: {},
+    };
+  }
+  return migrated;
 }
 
 function invalidState(statePath, message, details = null, cause = undefined) {
@@ -244,6 +256,15 @@ function validateStoredOwnerRoute(route, routeKey, statePath) {
   }
 }
 
+function validateStoredOwnerAlertMessage(message, messageId, statePath) {
+  if (!isPlainObject(message)) invalidState(statePath, `主人通知消息记录无效（${messageId}）`);
+  if (message.messageId !== messageId) invalidState(statePath, `主人通知消息键与 messageId 不一致（${messageId}）`);
+  for (const field of ["messageId", "routeKey", "targetKey"]) {
+    validateStoredString(message[field], statePath, `ownerAlertMessages.${messageId}.${field}`);
+  }
+  validateStoredDate(message.sentAt, statePath, `ownerAlertMessages.${messageId}.sentAt`);
+}
+
 function validateState(value, statePath) {
   value = migrateState(value);
   if (!isPlainObject(value)
@@ -254,6 +275,7 @@ function validateState(value, statePath) {
     || !isPlainObject(value.deliveries)
     || !isPlainObject(value.connectionRequests)
     || !isPlainObject(value.ownerRoutes)
+    || !isPlainObject(value.ownerAlertMessages)
     || !Array.isArray(value.seenControlMessages)) {
     invalidState(statePath, "控制账本结构无效");
   }
@@ -265,6 +287,9 @@ function validateState(value, statePath) {
   }
   for (const [routeKey, route] of Object.entries(value.ownerRoutes)) {
     validateStoredOwnerRoute(route, routeKey, statePath);
+  }
+  for (const [messageId, message] of Object.entries(value.ownerAlertMessages)) {
+    validateStoredOwnerAlertMessage(message, messageId, statePath);
   }
   const seen = new Set();
   for (const messageKey of value.seenControlMessages) {
@@ -292,7 +317,13 @@ function readState(statePath, maxSeen) {
   const state = validateState(value, statePath);
   const trimCount = Math.max(0, state.seenControlMessages.length - maxSeen);
   if (trimCount > 0) state.seenControlMessages.splice(0, trimCount);
-  return { state, trimmed: trimCount > 0 };
+  const ownerAlertEntries = Object.values(state.ownerAlertMessages)
+    .sort((left, right) => Date.parse(left.sentAt) - Date.parse(right.sentAt));
+  const ownerAlertTrimCount = Math.max(0, ownerAlertEntries.length - maxSeen);
+  for (const entry of ownerAlertEntries.slice(0, ownerAlertTrimCount)) {
+    delete state.ownerAlertMessages[entry.messageId];
+  }
+  return { state, trimmed: trimCount > 0 || ownerAlertTrimCount > 0 };
 }
 
 function atomicWriteState(statePath, state) {
@@ -769,6 +800,53 @@ export class ControlState {
       if (messageSeq === route.lastInboundMessageSeq) return { changed: false, value: clone(route) };
       route.lastInboundMessageSeq = messageSeq;
       return { changed: true, value: clone(route) };
+    });
+  }
+
+  getOwnerAlertMessage(messageId) {
+    const normalizedId = requiredString(messageId, "messageId", 256);
+    return clone(readState(this.statePath, this.maxSeen).state.ownerAlertMessages[normalizedId] ?? null);
+  }
+
+  recordOwnerAlertMessage(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const messageId = requiredString(input.messageId, "messageId", 256);
+    const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    const targetKey = requiredString(input.targetKey, "targetKey", 256);
+    return this.#write((state) => {
+      const route = state.ownerRoutes[routeKey];
+      if (!route) {
+        throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
+      }
+      if (route.status !== "open") {
+        throw new ControlStateError("OWNER_ROUTE_CLOSED", `所有者路由已关闭：${routeKey}`, { routeKey });
+      }
+      if (route.targetKey !== targetKey) {
+        throw new ControlStateError(
+          "OWNER_ALERT_TARGET_CONFLICT",
+          `通知目标与路由不一致：${routeKey}`,
+          { routeKey, existing: route.targetKey, requested: targetKey },
+        );
+      }
+      const existing = state.ownerAlertMessages[messageId] ?? null;
+      if (existing) {
+        if (existing.routeKey !== routeKey || existing.targetKey !== targetKey) {
+          throw new ControlStateError(
+            "OWNER_ALERT_MESSAGE_CONFLICT",
+            `messageId 已绑定到其它主人通知：${messageId}`,
+            { messageId, existing, requested: { routeKey, targetKey } },
+          );
+        }
+        return { changed: false, value: clone(existing) };
+      }
+      const message = {
+        messageId,
+        routeKey,
+        targetKey,
+        sentAt: resolveNow(this.now, input),
+      };
+      state.ownerAlertMessages[messageId] = message;
+      return { changed: true, value: clone(message) };
     });
   }
 

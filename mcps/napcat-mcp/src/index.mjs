@@ -397,7 +397,7 @@ const tools = [
   },
   {
     name: "napcat_owner_route_register",
-    description: "把一个稳定 route_key 登记到当前 Codex conversationId 和 binding 中预先配置的主人通知目标；不允许调用方直接传 QQ 或群号。",
+    description: "把内部 route_key 登记到当前 Codex conversationId 和 binding 中预先配置的主人通知目标；route_key 用于本地回复路由，不展示给主人，也不允许调用方直接传 QQ 或群号。",
     inputSchema: ownerRouteInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -409,7 +409,7 @@ const tools = [
   },
   {
     name: "napcat_owner_alert",
-    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短可读的 Codex 通知。主人回复时保留 route_key；群聊回复还需 @ 本机 QQ。",
+    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短自然的主人通知。私聊引用该通知即可回复；群聊需引用该通知并 @ 本机 QQ。内部 route_key 不展示给主人。",
     inputSchema: ownerAlertInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },

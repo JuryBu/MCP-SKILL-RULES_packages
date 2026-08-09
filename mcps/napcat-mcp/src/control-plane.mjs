@@ -400,30 +400,28 @@ export function createControlPlane(options = {}) {
     if (!target) throw new Error(`binding 未定义通知目标：${route.targetKey}`);
     const summary = requiredText(input.summary, "summary", 800);
     const level = optionalText(input.level, 24) || "INFO";
-    const text = target.type === "private"
-      ? [
-          `[Codex提醒][${level}] ${summary}`,
-          `机器：${configuration.localMachine}`,
-          `路由：${routeKey}`,
-          ...(route.taskId ? [`任务：${route.taskId}`] : []),
-          "回复时请保留「路由」这一行。",
-        ].join("\n")
-      : [
-          "[Codex][OWNER_ALERT]",
-          `level：${level}`,
-          `machine：${configuration.localMachine}`,
-          `route_key：${routeKey}`,
-          ...(route.taskId ? [`task_id：${route.taskId}`] : []),
-          `summary：${summary}`,
-          "回复时请 @ 本机 QQ 并保留 route_key。",
-        ].join("\n");
-    return notifier.sendConfiguredMessage({
+    const sent = await notifier.sendConfiguredMessage({
       target_key: route.targetKey,
       event: "owner_alert",
       task_id: route.taskId || "owner-alert",
       dedupe_key: requiredText(input.dedupe_key, "dedupe_key", 200),
-      message: text,
+      message: summary,
     });
+    const messageId = sent.messageId ?? sent.existing?.messageId ?? null;
+    if (messageId === null || messageId === undefined || String(messageId).trim() === "") {
+      throw new Error("主人通知已提交发送，但没有取得 QQ messageId，无法建立引用回复路由");
+    }
+    const replyRoute = state.recordOwnerAlertMessage({
+      messageId: String(messageId),
+      routeKey,
+      targetKey: route.targetKey,
+    });
+    return {
+      ...sent,
+      level,
+      replyRoute,
+      replyMode: target.type === "group" ? "quote_and_mention" : "quote",
+    };
   }
 
   async function scanOwnerReplies() {
@@ -445,8 +443,15 @@ export function createControlPlane(options = {}) {
         continue;
       }
       for (const message of history.messages) {
-        if (message.isSelf || !message.routeKey) continue;
-        const route = routes.find((candidate) => candidate.routeKey === message.routeKey);
+        if (message.isSelf) continue;
+        const quotedAlert = message.replyMessageId
+          ? state.getOwnerAlertMessage(String(message.replyMessageId))
+          : null;
+        const resolvedRouteKey = quotedAlert?.targetKey === targetKey
+          ? quotedAlert.routeKey
+          : message.routeKey;
+        if (!resolvedRouteKey) continue;
+        const route = routes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
         if (history.target.type === "private" && String(message.senderId) !== String(history.target.id)) continue;
         if (history.target.type === "group" && !message.mentionedUserIds.includes(configuration.expectedSelfId)) continue;

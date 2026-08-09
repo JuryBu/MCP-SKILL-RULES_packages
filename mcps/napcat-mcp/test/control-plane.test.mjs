@@ -643,7 +643,7 @@ test("owner private and group replies require their configured sender or mention
       "owner-private": [
         {
           isSelf: false,
-          routeKey: "private-route",
+          replyMessageId: "500",
           senderId: "9999999999",
           messageSeq: 10,
           time: BASE_TIME,
@@ -652,7 +652,7 @@ test("owner private and group replies require their configured sender or mention
         },
         {
           isSelf: false,
-          routeKey: "private-route",
+          replyMessageId: "500",
           senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
           messageSeq: 11,
           time: BASE_TIME,
@@ -663,7 +663,7 @@ test("owner private and group replies require their configured sender or mention
       "owner-group": [
         {
           isSelf: false,
-          routeKey: "group-route",
+          replyMessageId: "501",
           senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
           messageSeq: 20,
           time: BASE_TIME,
@@ -672,7 +672,7 @@ test("owner private and group replies require their configured sender or mention
         },
         {
           isSelf: false,
-          routeKey: "group-route",
+          replyMessageId: "501",
           senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
           messageSeq: 21,
           time: BASE_TIME,
@@ -695,6 +695,28 @@ test("owner private and group replies require their configured sender or mention
       task_id: "stable-task-group",
       target_key: "owner-group",
     });
+    const privateAlert = await fixture.controlPlane.sendOwnerAlert({
+      route_key: "private-route",
+      summary: "开发机处理完成，请引用回复。",
+      dedupe_key: "owner-private-alert",
+    });
+    const groupAlert = await fixture.controlPlane.sendOwnerAlert({
+      route_key: "group-route",
+      summary: "训练机需要主人确认，请引用并 @ 当前机器账号回复。",
+      dedupe_key: "owner-group-alert",
+    });
+    assert.equal(privateAlert.messageId, 500);
+    assert.equal(groupAlert.messageId, 501);
+    assert.equal(privateAlert.replyMode, "quote");
+    assert.equal(groupAlert.replyMode, "quote_and_mention");
+    assert.deepEqual(
+      fixture.configuredSends.map((send) => send.message),
+      [
+        "开发机处理完成，请引用回复。",
+        "训练机需要主人确认，请引用并 @ 当前机器账号回复。",
+      ],
+    );
+    assert.equal(fixture.configuredSends.some((send) => /route_key|\[OWNER_ALERT\]/.test(send.message)), false);
 
     const first = await fixture.controlPlane.scanOwnerReplies();
     assert.deepEqual(

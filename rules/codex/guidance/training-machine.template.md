@@ -62,7 +62,7 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（开发机扫描到）与 `conversation_received`（开发机 Codex 对话收到引导）。它们是自动传输回执，不代表业务完成；只有对话处理正文后提交的 `napcat_task_ack` 才能清除 pending 消息。
 
-旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的开发机 `target_conversation_id`，开发机校验可信机器后持久保存回拨地址；之后任一端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替开发机登记任务；双方必须各自核对并登记建议任务、互发握手，确认新路由后才恢复正式协作。需要给主人发 QQ 提醒时，先登记当前对话的 owner route，再向 binding 预配置的私聊或通知群发送简短消息；主人回复只有在私聊身份匹配，或群聊同时 @ 本机账号并保留 route key 时才进入当前对话。
+旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的开发机 `target_conversation_id`，开发机校验可信机器后持久保存回拨地址；之后任一端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替开发机登记任务；双方必须各自核对并登记建议任务、互发握手，确认新路由后才恢复正式协作。需要主人知晓、判断或协助时，先登记当前对话的 owner route，再向 binding 预配置的私聊或通知群发送简短人话；不要把训练日志、字段块或内部 `route_key` 倾倒给主人。主人在私聊引用该通知回复，或在群聊引用并 @ 本机账号，系统才把回复送回当前对话。
 
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
 
