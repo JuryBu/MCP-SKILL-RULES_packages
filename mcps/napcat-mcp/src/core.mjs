@@ -349,6 +349,7 @@ function structuredTaskMetadata(text) {
     deliveryId: "",
     messageType: "business",
     requestId: "",
+    sourceConversationId: "",
     targetConversationId: "",
     receiptStage: "",
     deliveryMessageSeq: "",
@@ -357,9 +358,10 @@ function structuredTaskMetadata(text) {
     routeKey: "",
   };
   const normalizedText = normalizeComparableText(text);
-  if (normalizedText.includes("[Codex][CONNECTION_REQUEST]")) metadata.messageType = "connection_request";
-  else if (normalizedText.includes("[Codex][DELIVERY_RECEIPT]")) metadata.messageType = "delivery_receipt";
-  else if (normalizedText.includes("[Codex][OWNER_REPLY]")) metadata.messageType = "owner_reply";
+  const firstLine = normalizedText.split("\n").find((line) => line.trim())?.trim() ?? "";
+  if (firstLine === "[Codex][CONNECTION_REQUEST]") metadata.messageType = "connection_request";
+  else if (firstLine === "[Codex][DELIVERY_RECEIPT]") metadata.messageType = "delivery_receipt";
+  else if (firstLine === "[Codex][OWNER_REPLY]") metadata.messageType = "owner_reply";
   for (const line of normalizedText.split("\n")) {
     const taskMatch = line.match(/^(?:任务|task_id)\s*[：:]\s*(.+)$/i);
     if (taskMatch) metadata.taskId = taskMatch[1].trim().slice(0, 128);
@@ -371,6 +373,8 @@ function structuredTaskMetadata(text) {
     if (deliveryMatch) metadata.deliveryId = deliveryMatch[1].trim().slice(0, 128);
     const requestMatch = line.match(/^request_id\s*[：:]\s*(.+)$/i);
     if (requestMatch) metadata.requestId = requestMatch[1].trim().slice(0, 128);
+    const sourceConversationMatch = line.match(/^source_conversation_id\s*[：:]\s*(.+)$/i);
+    if (sourceConversationMatch) metadata.sourceConversationId = sourceConversationMatch[1].trim().slice(0, 256);
     const conversationMatch = line.match(/^target_conversation_id\s*[：:]\s*(.+)$/i);
     if (conversationMatch) metadata.targetConversationId = conversationMatch[1].trim().slice(0, 256);
     const receiptMatch = line.match(/^receipt_stage\s*[：:]\s*(.+)$/i);
@@ -457,6 +461,7 @@ function summarizeGroupMessage(message, expectedSelfId) {
     deliveryId: taskMetadata.deliveryId,
     messageType: taskMetadata.messageType,
     requestId: taskMetadata.requestId,
+    sourceConversationId: taskMetadata.sourceConversationId,
     targetConversationId: taskMetadata.targetConversationId,
     receiptStage: taskMetadata.receiptStage,
     deliveryMessageSeq: taskMetadata.deliveryMessageSeq,

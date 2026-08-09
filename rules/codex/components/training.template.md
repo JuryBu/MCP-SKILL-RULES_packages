@@ -15,6 +15,7 @@
 - 模型可以按任务阶段调整自己的 `wake_cooldown_ms`，但不能绕开登记、可信发送者与 ACK 约束
 - 逻辑任务迁移时，先登记新 `task_id`，双方完成握手并验证新 task 可收发，再关闭旧 task；不得先关旧 task 导致失联
 - `napcat_task_close` 会终止路由，关闭后该 task 的远端消息不会再唤醒对话；关闭前必须确认无未处理消息、无 active wake，并明确 `final_close` 或 `successor_task_id`
+- 建链请求只在首次控制消息中交换双方 `conversation_id` 并由接收端持久保存；反向重连优先按 `reply_to_request_id` 或稳定的 `previous_task_id` 恢复回拨地址，普通任务消息、文件索引和 heartbeat 不重复携带对话 ID
 - 换对话时更新绑定并增加 `generation`，任务结束后仅在满足上述关闭条件时关闭登记
 
 ### Git 提交来源标记

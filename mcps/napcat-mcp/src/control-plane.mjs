@@ -48,6 +48,7 @@ function connectionPrompt(message) {
     `previous_task_id=${message.previousTaskId || ""}`,
     `source_machine=${message.sourceMachine}`,
     `target_machine=${message.targetMachine}`,
+    ...(message.sourceConversationId ? [`source_conversation_id=${message.sourceConversationId}`] : []),
     "可信对端请求重新建立双机任务连接。此消息只负责唤醒与提出请求，不代表本机已经登记、绑定或接受 task；请先核对任务身份和来源，再自行决定是否调用 napcat_task_register，并在双方握手完成后才关闭旧 task。",
   ].join("\n");
 }
@@ -145,10 +146,29 @@ export function createControlPlane(options = {}) {
     if (!message.requestId || !message.targetConversationId || !message.proposedTaskId) return null;
     const key = messageKey("connection-request", message);
     if (state.hasSeenControlMessage(key)) return { outcome: "duplicate_connection_request", requestId: message.requestId };
+    const existing = state.getConnectionRequest(message.requestId);
+    if (existing) {
+      state.updateConnectionRequest({
+        requestId: message.requestId,
+        ...(message.sourceConversationId ? { sourceConversationId: message.sourceConversationId } : {}),
+        targetConversationId: message.targetConversationId,
+        proposedTaskId: message.proposedTaskId,
+        ...(message.previousTaskId ? { previousTaskId: message.previousTaskId } : {}),
+        sourceMachine: message.sourceMachine,
+        targetMachine: message.targetMachine,
+        status: existing.status,
+      });
+      await sendReceipt(message, "machine_received");
+      if (existing.status === "wake_accepted") await sendReceipt(message, "conversation_received");
+      state.markControlMessageSeen(key);
+      return { outcome: "duplicate_connection_request", requestId: message.requestId };
+    }
     state.updateConnectionRequest({
       requestId: message.requestId,
+      ...(message.sourceConversationId ? { sourceConversationId: message.sourceConversationId } : {}),
       targetConversationId: message.targetConversationId,
       proposedTaskId: message.proposedTaskId,
+      ...(message.previousTaskId ? { previousTaskId: message.previousTaskId } : {}),
       sourceMachine: message.sourceMachine,
       targetMachine: message.targetMachine,
       status: "received",
@@ -219,12 +239,39 @@ export function createControlPlane(options = {}) {
     const configuration = config();
     if (!configuration.enabled || !configuration.machineIngressEnabled) throw new Error("控制通道未启用");
     const proposedTaskId = requiredText(input.proposed_task_id, "proposed_task_id", 128);
-    const targetConversationId = requiredText(input.target_conversation_id, "target_conversation_id", 256);
+    const sourceConversationId = requiredText(input.source_conversation_id, "source_conversation_id", 256);
     const previousTaskId = optionalText(input.previous_task_id, 128);
+    const replyToRequestId = optionalText(input.reply_to_request_id, 128);
     const reason = optionalText(input.reason, 600);
-    const requestId = optionalText(input.request_id, 128)
-      || stableId("request", [configuration.localMachine, input.target_machine, targetConversationId, proposedTaskId]);
     const targetMachine = requiredText(input.target_machine, "target_machine", 64);
+    let matchedRequest = null;
+    if (replyToRequestId) {
+      matchedRequest = state.getConnectionRequest(replyToRequestId);
+      if (!matchedRequest) throw new Error(`找不到可回拨的连接请求：${replyToRequestId}`);
+    } else if (previousTaskId) {
+      matchedRequest = state.listConnectionRequests()
+        .filter((request) => request.proposedTaskId === previousTaskId
+          && request.sourceMachine === targetMachine
+          && request.targetMachine === configuration.localMachine
+          && request.sourceConversationId)
+        .sort((left, right) => Date.parse(right.receivedAt) - Date.parse(left.receivedAt))[0] ?? null;
+    }
+    if (matchedRequest && (matchedRequest.sourceMachine !== targetMachine
+      || matchedRequest.targetMachine !== configuration.localMachine)) {
+      throw new Error(`连接请求机器方向不匹配：${matchedRequest.requestId}`);
+    }
+    const explicitTargetConversationId = optionalText(input.target_conversation_id, 256);
+    const rememberedTargetConversationId = matchedRequest?.sourceConversationId || "";
+    if (explicitTargetConversationId && rememberedTargetConversationId
+      && explicitTargetConversationId !== rememberedTargetConversationId) {
+      throw new Error(`target_conversation_id 与已持久化回拨地址冲突：${matchedRequest.requestId}`);
+    }
+    const targetConversationId = explicitTargetConversationId || rememberedTargetConversationId;
+    if (!targetConversationId) {
+      throw new Error("缺少 target_conversation_id，且本机没有可由 reply_to_request_id 或 previous_task_id 恢复的回拨地址");
+    }
+    const requestId = optionalText(input.request_id, 128)
+      || stableId("request", [configuration.localMachine, targetMachine, sourceConversationId, targetConversationId, proposedTaskId]);
     const message = [
       "[Codex][CONNECTION_REQUEST]",
       `request_id：${requestId}`,
@@ -233,6 +280,7 @@ export function createControlPlane(options = {}) {
       ...(previousTaskId ? [`previous_task_id：${previousTaskId}`] : []),
       `source_machine：${configuration.localMachine}`,
       `target_machine：${targetMachine}`,
+      `source_conversation_id：${sourceConversationId}`,
       `target_conversation_id：${targetConversationId}`,
       ...(reason ? [`reason：${reason}`] : []),
       "说明：这是建立连接请求，不会替接收方自动登记或绑定 task。",
@@ -252,7 +300,14 @@ export function createControlPlane(options = {}) {
       targetMachine,
       messageSeq: sequence,
     });
-    return { requestId, deliveryId: requestId, sent };
+    return {
+      requestId,
+      deliveryId: requestId,
+      sourceConversationId,
+      targetConversationId,
+      resolvedFromRequestId: matchedRequest?.requestId ?? null,
+      sent,
+    };
   }
 
   function registerOwnerRoute(input) {

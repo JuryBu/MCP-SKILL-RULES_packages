@@ -44,8 +44,10 @@ function deliveryInput(overrides = {}) {
 function connectionRequestInput(overrides = {}) {
   return {
     requestId: "request-001",
+    sourceConversationId: "019f-source-conversation",
     targetConversationId: "019f-test-conversation",
     proposedTaskId: "task-proposed-001",
+    previousTaskId: "task-previous-001",
     sourceMachine: "training",
     targetMachine: "development",
     status: "received",
@@ -166,6 +168,7 @@ test("connection requests persist reception and wake acceptance monotonically", 
     assert.equal(received.receivedAt, BASE_TIME);
     assert.equal(received.wakeAcceptedAt, null);
     assert.equal(received.status, "received");
+    assert.equal(received.sourceConversationId, "019f-source-conversation");
 
     fixture.advance(5000);
     const accepted = fixture.controlState.updateConnectionRequest({
@@ -213,6 +216,23 @@ test("a fresh instance reloads all persisted control records", () => {
     assert.deepEqual(reloaded.getOwnerRoute(route.routeKey), route);
     assert.equal(reloaded.hasSeenControlMessage("training:message:101"), true);
     assert.deepEqual(reloaded.snapshot(), JSON.parse(fs.readFileSync(fixture.statePath, "utf8")));
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy connection requests without callback fields remain readable", () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlState.updateConnectionRequest(connectionRequestInput());
+    const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    delete stored.connectionRequests["request-001"].sourceConversationId;
+    delete stored.connectionRequests["request-001"].previousTaskId;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(stored, null, 2)}\n`, "utf8");
+
+    const legacy = fixture.createState().getConnectionRequest("request-001");
+    assert.equal(legacy.targetConversationId, "019f-test-conversation");
+    assert.equal(Object.hasOwn(legacy, "sourceConversationId"), false);
   } finally {
     fixture.cleanup();
   }

@@ -233,6 +233,7 @@ test("connection request wakes only its requested conversation and never registe
       requestId: "request-001",
       proposedTaskId: "stable-successor-task",
       previousTaskId: "stable-predecessor-task",
+      sourceConversationId: "019f-source-conversation",
       targetConversationId: "019f-target-conversation",
       sourceMachine: "training",
       targetMachine: "development",
@@ -249,6 +250,7 @@ test("connection request wakes only its requested conversation and never registe
     assert.equal(fixture.wakeCalls.length, 1);
     assert.equal(fixture.wakeCalls[0].threadId, "019f-target-conversation");
     assert.equal(fixture.wakeCalls[0].taskId, "stable-successor-task");
+    assert.match(fixture.wakeCalls[0].prompt, /source_conversation_id=019f-source-conversation/);
     assert.match(fixture.wakeCalls[0].prompt, /不代表本机已经登记、绑定或接受 task/);
     assert.deepEqual(
       fixture.groupSends.map((entry) => entry.dedupe_key),
@@ -267,6 +269,113 @@ test("connection request wakes only its requested conversation and never registe
     }]);
     assert.equal(fixture.wakeCalls.length, 1);
     assert.equal(fixture.groupSends.length, 2);
+
+    const replayedWithNewSequence = {
+      ...request,
+      messageId: "602",
+      messageSeq: "602",
+      deliveryMessageSeq: "602",
+    };
+    const third = await fixture.controlPlane.scanGroupHistory([replayedWithNewSequence]);
+    assert.deepEqual(third.results, [{
+      outcome: "duplicate_connection_request",
+      requestId: "request-001",
+    }]);
+    assert.equal(fixture.wakeCalls.length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("connection requests exchange callback ids once and reverse requests reuse the persisted address", async () => {
+  const fixture = createFixture();
+  try {
+    fixture.state.updateConnectionRequest({
+      requestId: "request-original",
+      sourceConversationId: "019f-training-source",
+      targetConversationId: "019f-development-target",
+      proposedTaskId: "stable-old-task",
+      previousTaskId: null,
+      sourceMachine: "training",
+      targetMachine: "development",
+      status: "wake_accepted",
+    });
+
+    const sent = await fixture.controlPlane.sendConnectionRequest({
+      proposed_task_id: "stable-new-task",
+      previous_task_id: "stable-old-task",
+      source_conversation_id: "019f-development-source",
+      target_machine: "training",
+      reason: "recover",
+    });
+
+    assert.equal(sent.targetConversationId, "019f-training-source");
+    assert.equal(sent.resolvedFromRequestId, "request-original");
+    assert.match(fixture.groupSends[0].message, /source_conversation_id：019f-development-source/);
+    assert.match(fixture.groupSends[0].message, /target_conversation_id：019f-training-source/);
+    assert.equal((fixture.groupSends[0].message.match(/source_conversation_id/g) ?? []).length, 1);
+    assert.equal((fixture.groupSends[0].message.match(/target_conversation_id/g) ?? []).length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("connection requests can resolve the callback by the exact prior request id", async () => {
+  const fixture = createFixture();
+  try {
+    fixture.state.updateConnectionRequest({
+      requestId: "request-exact",
+      sourceConversationId: "019f-training-source",
+      targetConversationId: "019f-development-target",
+      proposedTaskId: "stable-old-task",
+      previousTaskId: null,
+      sourceMachine: "training",
+      targetMachine: "development",
+      status: "wake_accepted",
+    });
+
+    const sent = await fixture.controlPlane.sendConnectionRequest({
+      proposed_task_id: "stable-new-task",
+      reply_to_request_id: "request-exact",
+      source_conversation_id: "019f-development-source",
+      target_machine: "training",
+      reason: "recover-by-request-id",
+    });
+
+    assert.equal(sent.targetConversationId, "019f-training-source");
+    assert.equal(sent.resolvedFromRequestId, "request-exact");
+    assert.match(fixture.groupSends[0].message, /source_conversation_id：019f-development-source/);
+    assert.match(fixture.groupSends[0].message, /target_conversation_id：019f-training-source/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("connection request rejects an explicit target that conflicts with the persisted callback", async () => {
+  const fixture = createFixture();
+  try {
+    fixture.state.updateConnectionRequest({
+      requestId: "request-original",
+      sourceConversationId: "019f-training-source",
+      targetConversationId: "019f-development-target",
+      proposedTaskId: "stable-old-task",
+      previousTaskId: null,
+      sourceMachine: "training",
+      targetMachine: "development",
+      status: "received",
+    });
+
+    await assert.rejects(
+      () => fixture.controlPlane.sendConnectionRequest({
+        proposed_task_id: "stable-new-task",
+        previous_task_id: "stable-old-task",
+        source_conversation_id: "019f-development-source",
+        target_conversation_id: "019f-wrong-target",
+        target_machine: "training",
+      }),
+      /与已持久化回拨地址冲突/,
+    );
+    assert.equal(fixture.groupSends.length, 0);
   } finally {
     fixture.cleanup();
   }
@@ -445,6 +554,7 @@ test("connection delivery and wake identifiers are stable and duplicate scans ar
   try {
     const input = {
       proposed_task_id: "stable-task",
+      source_conversation_id: "019f-local-conversation",
       target_conversation_id: "019f-peer-conversation",
       target_machine: "training",
       reason: "reconnect after an accidental close",

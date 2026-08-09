@@ -181,6 +181,16 @@ function validateStoredConnectionRequest(request, requestId, statePath) {
   ]) {
     validateStoredString(request[field], statePath, `connectionRequests.${requestId}.${field}`);
   }
+  if (request.sourceConversationId !== undefined) {
+    validateStoredOptionalString(
+      request.sourceConversationId,
+      statePath,
+      `connectionRequests.${requestId}.sourceConversationId`,
+    );
+  }
+  if (request.previousTaskId !== undefined) {
+    validateStoredOptionalString(request.previousTaskId, statePath, `connectionRequests.${requestId}.previousTaskId`);
+  }
   if (!CONNECTION_REQUEST_STATUS_RANK.has(request.status)) {
     invalidState(statePath, `连接请求状态无效（${requestId}）`);
   }
@@ -565,12 +575,24 @@ export class ControlState {
       assertChronological(receivedAt, wakeAcceptedAt, "receivedAt", "wakeAcceptedAt");
       const request = {
         requestId,
+        sourceConversationId: immutableValue(input, "sourceConversationId", existing, {
+          optional: true,
+          maximum: 256,
+          conflictCode: "CONNECTION_REQUEST_CONFLICT",
+          recordId: requestId,
+        }),
         targetConversationId: immutableValue(input, "targetConversationId", existing, {
           maximum: 256,
           conflictCode: "CONNECTION_REQUEST_CONFLICT",
           recordId: requestId,
         }),
         proposedTaskId: immutableValue(input, "proposedTaskId", existing, {
+          conflictCode: "CONNECTION_REQUEST_CONFLICT",
+          recordId: requestId,
+        }),
+        previousTaskId: immutableValue(input, "previousTaskId", existing, {
+          optional: true,
+          maximum: 128,
           conflictCode: "CONNECTION_REQUEST_CONFLICT",
           recordId: requestId,
         }),

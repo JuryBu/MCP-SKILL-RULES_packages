@@ -264,11 +264,18 @@ const connectionRequestInputSchema = {
     request_id: { type: "string", minLength: 1, maxLength: 128 },
     proposed_task_id: { type: "string", minLength: 1, maxLength: 128 },
     previous_task_id: { type: "string", minLength: 1, maxLength: 128 },
+    reply_to_request_id: { type: "string", minLength: 1, maxLength: 128 },
     target_machine: { type: "string", minLength: 1, maxLength: 64 },
+    source_conversation_id: { type: "string", minLength: 1, maxLength: 256 },
     target_conversation_id: { type: "string", minLength: 1, maxLength: 256 },
     reason: { type: "string", minLength: 1, maxLength: 600 },
   },
-  required: ["proposed_task_id", "target_machine", "target_conversation_id"],
+  required: ["proposed_task_id", "target_machine", "source_conversation_id"],
+  anyOf: [
+    { required: ["target_conversation_id"] },
+    { required: ["reply_to_request_id"] },
+    { required: ["previous_task_id"] },
+  ],
   additionalProperties: false,
 };
 
@@ -384,7 +391,7 @@ const tools = [
   },
   {
     name: "napcat_connection_request",
-    description: "在旧 task 意外关闭或失联时，向可信对端的指定 conversationId 发送建立连接请求。只唤醒并请求确认，不替对端登记、绑定或接受 task。",
+    description: "在旧 task 意外关闭或失联时发送建立连接请求。首次请求携带双方 conversationId 并由接收端本地持久保存；反向重连可用 reply_to_request_id 或 previous_task_id 恢复对端地址，不把 conversationId 重复塞进后续业务消息。只唤醒并请求确认，不替对端登记、绑定或接受 task。",
     inputSchema: connectionRequestInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
