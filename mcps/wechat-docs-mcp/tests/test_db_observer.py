@@ -79,7 +79,7 @@ def _make_decrypted_tree(base: Path) -> Path:
         );
         INSERT INTO [{group_table}] VALUES
             (1, 2001, 10000, 1700000010000, 2, 1700000010, 4, '<msgsource/>', 'UserA joined the group', '', NULL, 0, 0),
-            (2, 2002, 1, 1700000011000, 1, 1700000011, 4, '<msgsource/>', 'group test message', '', NULL, 0, 0);
+            (2, 2002, 1, 1700000011000, 1, 1700000011, 4, '<msgsource/>', 'wxid_test_friend:\ngroup test message', '', NULL, 0, 0);
     """)
     conn.commit()
     conn.close()
@@ -178,6 +178,23 @@ class DbObserverTests(unittest.TestCase):
         # local_id=1 is from sender_id=1 = wxid_test_friend = TestFriend
         msg1 = next(o for o in friend_msgs if o.payload["local_id"] == 1)
         self.assertEqual("TestFriend", msg1.payload["sender_display"])
+
+    def test_group_sender_prefix_is_removed_from_visible_text(self) -> None:
+        observations = list(self.observer.poll_new_messages({}))
+        group_message = next(
+            observation
+            for observation in observations
+            if observation.route_id == "route-group" and observation.payload["local_id"] == 2
+        )
+        self.assertEqual("wxid_test_friend", group_message.payload["sender_username"])
+        self.assertEqual("group test message", group_message.payload["visible_text"])
+
+    def test_group_sender_prefix_requires_exact_sender(self) -> None:
+        content = "wxid_other:\nkeep this text"
+        self.assertEqual(
+            content,
+            self.observer._strip_group_sender_prefix(content, "wxid_test_friend"),
+        )
 
     def test_dedup_fingerprint_is_unique_per_message(self) -> None:
         observations = list(self.observer.poll_new_messages({}))

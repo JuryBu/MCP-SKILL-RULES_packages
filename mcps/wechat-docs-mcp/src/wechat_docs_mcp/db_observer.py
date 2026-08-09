@@ -115,6 +115,11 @@ class DbObserver:
     def _sender_name(self, sender_id: int) -> str:
         return self._sender_cache.get(sender_id, f"id={sender_id}")
 
+    @staticmethod
+    def _strip_group_sender_prefix(content: str, sender_username: str) -> str:
+        prefix = f"{sender_username}:\n"
+        return content[len(prefix):] if sender_username and content.startswith(prefix) else content
+
     def _contact_display_name(self, username: str) -> str:
         """Look up nick_name from contact.db for a username."""
         if username in self._contact_cache:
@@ -347,10 +352,12 @@ class DbObserver:
                     content = self._decompress_field(
                         r["message_content"], r["WCDB_CT_message_content"]
                     )
+                    sender_username = self._sender_name(r["real_sender_id"])
+                    if binding.chat_type == "group":
+                        content = self._strip_group_sender_prefix(content, sender_username)
                     msg_type = self._classify_message(r["local_type"], content)
                     visible_text = self._extract_text(content, msg_type)
                     attachment_info = self._extract_attachment_info(content, msg_type)
-                    sender_username = self._sender_name(r["real_sender_id"])
                     sender_display = self._contact_display_name(sender_username)
 
                     # Build fingerprint for dedup
