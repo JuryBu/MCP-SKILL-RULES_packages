@@ -18,6 +18,7 @@ function expectedPeerMachine(task) {
 
 function eligibleMessage(task, message) {
   if (!message || message.isSelf) return false;
+  if (String(message.messageType ?? "business") !== "business") return false;
   if (String(message.taskId ?? "") !== task.taskId) return false;
   if (String(message.senderId ?? "") !== task.trustedPeerQq) return false;
   if (task.localRole && message.targetMachine !== task.localRole) return false;
@@ -72,6 +73,7 @@ export function createTaskRouter(options = {}) {
   const registry = options.registry;
   const notifier = options.notifier;
   const bridge = options.bridge;
+  const controlPlane = options.controlPlane ?? null;
   if (!registry || !notifier || !bridge) throw new Error("task router 需要 registry、notifier 和 bridge");
   const historyCount = Math.max(1, Math.min(50, Number(options.historyCount ?? 50)));
   const wakeLeaseMs = Math.max(1000, Number(options.wakeLeaseMs ?? 300000));
@@ -109,6 +111,9 @@ export function createTaskRouter(options = {}) {
           messageAt: message.time,
         })),
       });
+      const machineReceipts = controlPlane
+        ? await controlPlane.acknowledgeBusinessMessages(messagesToObserve, "machine_received")
+        : [];
       const pendingMessages = seenTask.pendingMessages
         .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
       const newMessages = pendingMessages
@@ -120,6 +125,7 @@ export function createTaskRouter(options = {}) {
           outcome: pendingMessages.length ? "awaiting_ack" : "no_new_message",
           pendingCount: pendingMessages.length,
           scannedCount: history.scannedCount,
+          machineReceipts,
         };
       }
       const pendingThroughMessage = pendingMessages.at(-1);
@@ -198,6 +204,13 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
+        const pendingSequenceSet = new Set(pendingMessages.map((message) => message.messageSeq));
+        const conversationReceipts = controlPlane
+          ? await controlPlane.acknowledgeBusinessMessages(
+              eligible.filter((message) => pendingSequenceSet.has(messageSequence(message))),
+              "conversation_received",
+            )
+          : [];
         return {
           taskId: task.taskId,
           outcome: wake.outcome,
@@ -207,6 +220,8 @@ export function createTaskRouter(options = {}) {
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           turnId: wake.turn?.id ?? wake.turn?.turnId ?? null,
+          machineReceipts,
+          conversationReceipts,
         };
       }
       if (wake.outcome === "unknown" && wake.error?.outcomeUnknown) {
@@ -250,8 +265,9 @@ export function createTaskRouter(options = {}) {
 
   async function scanOnce() {
     const tasks = registry.list({ status: "open" });
-    if (!tasks.length) {
-      return { scannedAt: new Date().toISOString(), openTaskCount: 0, wakeCount: 0, results: [] };
+    const keepAlive = Boolean(controlPlane?.keepAlive());
+    if (!tasks.length && !keepAlive) {
+      return { scannedAt: new Date().toISOString(), openTaskCount: 0, keepAlive: false, wakeCount: 0, results: [] };
     }
     let history;
     try {
@@ -261,17 +277,24 @@ export function createTaskRouter(options = {}) {
       return {
         scannedAt: new Date().toISOString(),
         openTaskCount: tasks.length,
+        keepAlive,
         wakeCount: 0,
-        results: tasks.map((task) => ({ taskId: task.taskId, outcome: "scan_error", error: failure })),
+        results: tasks.length
+          ? tasks.map((task) => ({ taskId: task.taskId, outcome: "scan_error", error: failure }))
+          : [{ taskId: "control-plane", outcome: "scan_error", error: failure }],
       };
     }
+    const controlGroup = controlPlane ? await controlPlane.scanGroupHistory(history.messages) : null;
+    const ownerReplies = controlPlane ? await controlPlane.scanOwnerReplies() : null;
     const results = [];
     for (const task of tasks) results.push(await scanTask(task, history));
     return {
       scannedAt: new Date().toISOString(),
       openTaskCount: tasks.length,
+      keepAlive,
       wakeCount: results.filter((result) => result.outcome === "accepted" || result.outcome === "completed").length,
       results,
+      controlPlane: { group: controlGroup, ownerReplies },
     };
   }
 

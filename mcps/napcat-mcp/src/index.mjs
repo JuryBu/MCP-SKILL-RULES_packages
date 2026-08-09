@@ -4,6 +4,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { createNapCatNotifier, NapCatNotifierError } from "./core.mjs";
 import { createTaskRegistry, TaskRegistryError } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
+import { createControlState, ControlStateError } from "./control-state.mjs";
+import { createControlPlane } from "./control-plane.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -96,11 +98,16 @@ const textInputSchema = {
   properties: {
     text: { type: "string", minLength: 1, maxLength: 1000, description: "写入固定格式消息中的正文。" },
     dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "唯一去重键；同一次重试必须复用。" },
+    delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成。" },
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时发送可按任务精确读取的结构化消息。" },
     source_machine: { type: "string", minLength: 1, maxLength: 64, description: "可选来源机器标签，例如 development 或 training。" },
     target_machine: { type: "string", minLength: 1, maxLength: 64, description: "可选目标机器标签，例如 training 或 development。" },
   },
   required: ["text", "dedupe_key"],
+  allOf: [{
+    if: { required: ["task_id"] },
+    then: { required: ["source_machine", "target_machine"] },
+  }],
   additionalProperties: false,
 };
 
@@ -110,6 +117,7 @@ const fileInputSchema = {
     file_path: { type: "string", minLength: 1, maxLength: 4096, description: "本机待上传文件的绝对路径。" },
     name: { type: "string", minLength: 1, maxLength: 255, description: "可选群文件显示名，不能包含目录。" },
     dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "唯一去重键；同一次重试必须复用。" },
+    delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成，用于跟踪文件索引送达状态。" },
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时 source_machine 和 target_machine 也必须提供，上传后会发送可路由的文件索引。" },
     source_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务文件来源机器；task_id 存在时必填。" },
     target_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务文件目标机器；task_id 存在时必填。" },
@@ -183,6 +191,24 @@ const taskIdentityInputSchema = {
   additionalProperties: false,
 };
 
+const taskCloseInputSchema = {
+  type: "object",
+  properties: {
+    task_id: { type: "string", minLength: 1, maxLength: 128 },
+    expected_generation: { type: "integer", minimum: 1 },
+    confirm_pending_empty: { type: "boolean", description: "调用方已核对本机没有未处理消息和 active wake。" },
+    confirm_peer_ready: { type: "boolean", description: "最终结束时确认可信对端知情；迁移时确认 successor task 已完成双边握手。" },
+    final_close: { type: "boolean", description: "任务确实永久结束时设为 true；不能与 successor_task_id 同时使用。" },
+    successor_task_id: { type: "string", minLength: 1, maxLength: 128, description: "迁移时填写已登记且已握手的新 task_id；旧 task 只在新路由就绪后关闭。" },
+  },
+  required: ["task_id", "expected_generation", "confirm_pending_empty", "confirm_peer_ready"],
+  oneOf: [
+    { required: ["final_close"], properties: { final_close: { const: true } } },
+    { required: ["successor_task_id"] },
+  ],
+  additionalProperties: false,
+};
+
 const taskListInputSchema = {
   type: "object",
   properties: {
@@ -221,6 +247,52 @@ const taskAckInputSchema = {
     { required: ["processed_message_seqs", "wake_id"] },
     { required: ["message_seq"] },
   ],
+  additionalProperties: false,
+};
+
+const deliveryStatusInputSchema = {
+  type: "object",
+  properties: {
+    delivery_id: { type: "string", minLength: 1, maxLength: 128 },
+  },
+  additionalProperties: false,
+};
+
+const connectionRequestInputSchema = {
+  type: "object",
+  properties: {
+    request_id: { type: "string", minLength: 1, maxLength: 128 },
+    proposed_task_id: { type: "string", minLength: 1, maxLength: 128 },
+    previous_task_id: { type: "string", minLength: 1, maxLength: 128 },
+    target_machine: { type: "string", minLength: 1, maxLength: 64 },
+    target_conversation_id: { type: "string", minLength: 1, maxLength: 256 },
+    reason: { type: "string", minLength: 1, maxLength: 600 },
+  },
+  required: ["proposed_task_id", "target_machine", "target_conversation_id"],
+  additionalProperties: false,
+};
+
+const ownerRouteInputSchema = {
+  type: "object",
+  properties: {
+    route_key: { type: "string", minLength: 1, maxLength: 256 },
+    conversation_id: { type: "string", minLength: 1, maxLength: 256 },
+    task_id: { type: "string", minLength: 1, maxLength: 128 },
+    target_key: { type: "string", minLength: 1, maxLength: 64 },
+  },
+  required: ["route_key", "conversation_id"],
+  additionalProperties: false,
+};
+
+const ownerAlertInputSchema = {
+  type: "object",
+  properties: {
+    route_key: { type: "string", minLength: 1, maxLength: 256 },
+    summary: { type: "string", minLength: 1, maxLength: 800 },
+    level: { type: "string", enum: ["INFO", "MILESTONE", "ACTION", "WARNING", "FAILED", "COMPLETED"] },
+    dedupe_key: { type: "string", minLength: 1, maxLength: 200 },
+  },
+  required: ["route_key", "summary", "dedupe_key"],
   additionalProperties: false,
 };
 
@@ -270,14 +342,14 @@ const tools = [
   },
   {
     name: "napcat_task_update",
-    description: "用 expected_generation 原子更新任务路由或单条任务的唤醒间隔；路由实际变化时 generation 加一，仅改 wake_cooldown_ms 时不换代。",
+    description: "用 expected_generation 原子更新任务路由或单条任务的唤醒间隔；路由实际变化时 generation 加一，但存在待处理消息或活动唤醒时会拒绝换绑，避免清空账本；仅改 wake_cooldown_ms 时不换代。",
     inputSchema: taskUpdateInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "napcat_task_close",
-    description: "关闭本机任务路由并停止后续扫描唤醒；必须提供当前 generation。",
-    inputSchema: taskIdentityInputSchema,
+    description: "谨慎关闭本机任务路由。关闭会停止该 task 的后续唤醒；必须确认账本为空、可信对端已就绪，并明确永久结束或已完成握手的 successor task。",
+    inputSchema: taskCloseInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
   },
   {
@@ -303,6 +375,36 @@ const tools = [
     description: "目标对话按消息精确确认处理结果。新唤醒使用提示中的 generation、wake_id，并在 processed_message_seqs 中列出实际处理完成的一条或多条消息；未列出的消息继续待处理。message_seq 不保证数字递增。",
     inputSchema: taskAckInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_delivery_status",
+    description: "查看结构化消息的自动运输回执。pending 表示仅本机已发送；machine_received 表示对端机器已扫描到；conversation_received 表示对端指定 Codex 对话已接受唤醒。它不等于业务处理完成 ACK。",
+    inputSchema: deliveryStatusInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_connection_request",
+    description: "在旧 task 意外关闭或失联时，向可信对端的指定 conversationId 发送建立连接请求。只唤醒并请求确认，不替对端登记、绑定或接受 task。",
+    inputSchema: connectionRequestInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_owner_route_register",
+    description: "把一个稳定 route_key 登记到当前 Codex conversationId 和 binding 中预先配置的主人通知目标；不允许调用方直接传 QQ 或群号。",
+    inputSchema: ownerRouteInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_route_close",
+    description: "关闭主人通知 route_key，之后不再把 QQ 回复注入该 Codex 对话。",
+    inputSchema: { type: "object", properties: { route_key: { type: "string", minLength: 1, maxLength: 256 } }, required: ["route_key"], additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_alert",
+    description: "通过 binding 中预先配置的私聊或群聊目标，发送简短可读的 Codex 通知。主人回复时保留 route_key；群聊回复还需 @ 本机 QQ。",
+    inputSchema: ownerAlertInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
     name: "napcat_preview_training_event",
@@ -350,7 +452,7 @@ function textResult(value, isError = false) {
 }
 
 function errorResult(error) {
-  const knownError = error instanceof NapCatNotifierError || error instanceof TaskRegistryError;
+  const knownError = error instanceof NapCatNotifierError || error instanceof TaskRegistryError || error instanceof ControlStateError;
   const safe = {
     ok: false,
     code: knownError ? error.code : "UNEXPECTED_ERROR",
@@ -363,14 +465,25 @@ function errorResult(error) {
 }
 
 const notifier = createNapCatNotifier({ cwd: path.resolve(__dirname, "..") });
+const taskRegistryStatePath = process.env.NAPCAT_TASK_REGISTRY_PATH
+  || path.resolve(__dirname, "..", "state", "task-registry.json");
 const taskRegistry = createTaskRegistry({
-  statePath: process.env.NAPCAT_TASK_REGISTRY_PATH || path.resolve(__dirname, "..", "state", "task-registry.json"),
+  statePath: taskRegistryStatePath,
     wakeLeaseMs: Number(process.env.NAPCAT_TASK_WAKE_LEASE_MS || 300000),
     wakeCooldownMs: Number(process.env.NAPCAT_TASK_WAKE_COOLDOWN_MS || 600000),
 });
 const taskRouterController = createTaskRouterController({ rootDir: path.resolve(__dirname, "..") });
+const controlState = createControlState({
+  statePath: process.env.NAPCAT_CONTROL_STATE_PATH
+    || path.join(path.dirname(taskRegistryStatePath), "control-state.json"),
+});
+const controlPlane = createControlPlane({
+  notifier,
+  state: controlState,
+  bridge: { wake: async () => { throw new Error("入站唤醒只由 task router 执行"); } },
+});
 const server = new Server(
-  { name: "codex-napcat-training-notifier", version: "0.1.0" },
+  { name: "codex-napcat-training-notifier", version: "0.3.0" },
   {
     capabilities: {
       tools: { listChanged: false },
@@ -437,6 +550,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({ ok: true, task: taskRegistry.close({
         taskId: args.task_id,
         expectedGeneration: args.expected_generation,
+        confirmPendingEmpty: args.confirm_pending_empty,
+        confirmPeerReady: args.confirm_peer_ready,
+        ...(args.final_close === true ? { finalClose: true } : {}),
+        ...(args.successor_task_id ? { successorTaskId: args.successor_task_id } : {}),
       }) });
     }
     if (name === "napcat_task_list") {
@@ -461,6 +578,28 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       return textResult({ ok: true, task });
     }
+    if (name === "napcat_delivery_status") {
+      return textResult({
+        ok: true,
+        ...(args.delivery_id
+          ? { delivery: controlPlane.getDeliveryStatus(args.delivery_id) }
+          : { deliveries: controlPlane.listDeliveryStatuses() }),
+      });
+    }
+    if (name === "napcat_connection_request") {
+      const result = await controlPlane.sendConnectionRequest(args);
+      return textResult({ ok: true, ...result, router: taskRouterController.ensureStarted() });
+    }
+    if (name === "napcat_owner_route_register") {
+      const route = controlPlane.registerOwnerRoute(args);
+      return textResult({ ok: true, route, router: taskRouterController.ensureStarted() });
+    }
+    if (name === "napcat_owner_route_close") {
+      return textResult({ ok: true, route: controlPlane.closeOwnerRoute(args) });
+    }
+    if (name === "napcat_owner_alert") {
+      return textResult({ ok: true, ...(await controlPlane.sendOwnerAlert(args)) });
+    }
     if (name === "napcat_preview_training_event") {
       return textResult({ ok: true, ...notifier.previewTrainingEvent(args) });
     }
@@ -471,13 +610,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({ ok: true, ...notifier.previewTextMessage(args) });
     }
     if (name === "napcat_send_text") {
-      return textResult({ ok: true, ...(await notifier.sendTextMessage(args)) });
+      const result = await notifier.sendTextMessage(args);
+      if (args.task_id && args.source_machine && args.target_machine) {
+        const messageSeq = Number(result.messageId ?? result.existing?.messageId);
+        if (Number.isSafeInteger(messageSeq) && messageSeq >= 0) {
+          controlPlane.trackOutgoingDelivery({
+            deliveryId: result.deliveryId,
+            taskId: args.task_id,
+            sourceMachine: args.source_machine,
+            targetMachine: args.target_machine,
+            messageSeq,
+          });
+        }
+      }
+      return textResult({ ok: true, ...result });
     }
     if (name === "napcat_preview_file") {
       return textResult({ ok: true, ...(await notifier.previewFile(args)) });
     }
     if (name === "napcat_send_file") {
-      return textResult({ ok: true, ...(await notifier.sendFile(args)) });
+      const result = await notifier.sendFile(args);
+      const taskIndex = result.taskIndex;
+      if (args.task_id && args.source_machine && args.target_machine && taskIndex?.deliveryId) {
+        const messageSeq = Number(taskIndex.messageId);
+        if (Number.isSafeInteger(messageSeq) && messageSeq >= 0) {
+          controlPlane.trackOutgoingDelivery({
+            deliveryId: taskIndex.deliveryId,
+            taskId: args.task_id,
+            sourceMachine: args.source_machine,
+            targetMachine: args.target_machine,
+            messageSeq,
+          });
+        }
+      }
+      return textResult({ ok: true, ...result });
     }
     throw new NapCatNotifierError("UNKNOWN_TOOL", `未知工具：${name}`);
   } catch (error) {

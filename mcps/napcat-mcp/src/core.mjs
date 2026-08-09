@@ -72,6 +72,59 @@ function positiveInteger(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, Math.trunc(parsed)));
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeControlPlane(rawControlPlane) {
+  if (rawControlPlane === undefined || rawControlPlane === null) {
+    return {
+      enabled: false,
+      machineIngressEnabled: false,
+      localMachine: "",
+      trustedPeerQq: "",
+      defaultTargetKey: "",
+      targets: {},
+    };
+  }
+  if (!isPlainObject(rawControlPlane)) {
+    throw new NapCatNotifierError("UNSUPPORTED_BINDING", "controlPlane 必须是对象");
+  }
+  const targets = {};
+  const rawTargets = isPlainObject(rawControlPlane.targets) ? rawControlPlane.targets : {};
+  for (const [key, rawTarget] of Object.entries(rawTargets)) {
+    const targetKey = boundedString(key, "controlPlane target key", 64, true);
+    if (!isPlainObject(rawTarget)) {
+      throw new NapCatNotifierError("UNSUPPORTED_BINDING", `controlPlane.targets.${targetKey} 必须是对象`);
+    }
+    const type = boundedString(rawTarget.type, `controlPlane.targets.${targetKey}.type`, 16, true).toLowerCase();
+    if (!["private", "group"].includes(type)) {
+      throw new NapCatNotifierError("UNSUPPORTED_BINDING", `controlPlane.targets.${targetKey}.type 只支持 private 或 group`);
+    }
+    targets[targetKey] = {
+      type,
+      id: boundedString(rawTarget.id, `controlPlane.targets.${targetKey}.id`, 64, true),
+      name: boundedString(rawTarget.name, `controlPlane.targets.${targetKey}.name`, 128),
+      mentionUserId: boundedString(rawTarget.mentionUserId, `controlPlane.targets.${targetKey}.mentionUserId`, 64),
+      expectedMemberCount: type === "group"
+        ? positiveInteger(rawTarget.expectedMemberCount, 0, 0, 1000000)
+        : null,
+    };
+  }
+  const defaultTargetKey = boundedString(rawControlPlane.defaultTargetKey, "controlPlane.defaultTargetKey", 64);
+  if (defaultTargetKey && !targets[defaultTargetKey]) {
+    throw new NapCatNotifierError("UNSUPPORTED_BINDING", `controlPlane.defaultTargetKey 未定义：${defaultTargetKey}`);
+  }
+  return {
+    enabled: rawControlPlane.enabled === true,
+    machineIngressEnabled: rawControlPlane.machineIngressEnabled === true,
+    localMachine: boundedString(rawControlPlane.localMachine, "controlPlane.localMachine", 64),
+    trustedPeerQq: boundedString(rawControlPlane.trustedPeerQq, "controlPlane.trustedPeerQq", 64),
+    defaultTargetKey,
+    targets,
+  };
+}
+
 function normalizeBinding(raw) {
   if (raw.requireGroupIdentityCheckBeforeSend === false) {
     throw new NapCatNotifierError(
@@ -108,9 +161,13 @@ function normalizeBinding(raw) {
     requireGroupIdentityCheckBeforeSend: true,
     requireMessageVerification: raw.requireMessageVerification !== false,
     codexWakeMessageVisibility,
+    controlPlane: normalizeControlPlane(raw.controlPlane),
   };
-  if (binding.schemaVersion !== 1) {
+  if (![1, 2].includes(binding.schemaVersion)) {
     throw new NapCatNotifierError("UNSUPPORTED_BINDING", `不支持 binding schemaVersion=${binding.schemaVersion}`);
+  }
+  if (binding.schemaVersion === 1 && binding.controlPlane.enabled) {
+    throw new NapCatNotifierError("UNSUPPORTED_BINDING", "启用 controlPlane 时 binding schemaVersion 必须为 2");
   }
   return binding;
 }
@@ -289,16 +346,65 @@ function structuredTaskMetadata(text) {
     taskId: "",
     sourceMachine: "",
     targetMachine: "",
+    deliveryId: "",
+    messageType: "business",
+    requestId: "",
+    targetConversationId: "",
+    receiptStage: "",
+    deliveryMessageSeq: "",
+    proposedTaskId: "",
+    previousTaskId: "",
+    routeKey: "",
   };
-  for (const line of normalizeComparableText(text).split("\n")) {
+  const normalizedText = normalizeComparableText(text);
+  if (normalizedText.includes("[Codex][CONNECTION_REQUEST]")) metadata.messageType = "connection_request";
+  else if (normalizedText.includes("[Codex][DELIVERY_RECEIPT]")) metadata.messageType = "delivery_receipt";
+  else if (normalizedText.includes("[Codex][OWNER_REPLY]")) metadata.messageType = "owner_reply";
+  for (const line of normalizedText.split("\n")) {
     const taskMatch = line.match(/^(?:任务|task_id)\s*[：:]\s*(.+)$/i);
     if (taskMatch) metadata.taskId = taskMatch[1].trim().slice(0, 128);
     const sourceMatch = line.match(/^(?:来源机器|source_machine)\s*[：:]\s*(.+)$/i);
     if (sourceMatch) metadata.sourceMachine = sourceMatch[1].trim().slice(0, 64);
     const targetMatch = line.match(/^(?:目标机器|target_machine)\s*[：:]\s*(.+)$/i);
     if (targetMatch) metadata.targetMachine = targetMatch[1].trim().slice(0, 64);
+    const deliveryMatch = line.match(/^delivery_id\s*[：:]\s*(.+)$/i);
+    if (deliveryMatch) metadata.deliveryId = deliveryMatch[1].trim().slice(0, 128);
+    const requestMatch = line.match(/^request_id\s*[：:]\s*(.+)$/i);
+    if (requestMatch) metadata.requestId = requestMatch[1].trim().slice(0, 128);
+    const conversationMatch = line.match(/^target_conversation_id\s*[：:]\s*(.+)$/i);
+    if (conversationMatch) metadata.targetConversationId = conversationMatch[1].trim().slice(0, 256);
+    const receiptMatch = line.match(/^receipt_stage\s*[：:]\s*(.+)$/i);
+    if (receiptMatch) metadata.receiptStage = receiptMatch[1].trim().slice(0, 64);
+    const deliverySequenceMatch = line.match(/^delivery_message_seq\s*[：:]\s*(.+)$/i);
+    if (deliverySequenceMatch) metadata.deliveryMessageSeq = deliverySequenceMatch[1].trim().slice(0, 64);
+    const proposedTaskMatch = line.match(/^proposed_task_id\s*[：:]\s*(.+)$/i);
+    if (proposedTaskMatch) metadata.proposedTaskId = proposedTaskMatch[1].trim().slice(0, 128);
+    const previousTaskMatch = line.match(/^previous_task_id\s*[：:]\s*(.+)$/i);
+    if (previousTaskMatch) metadata.previousTaskId = previousTaskMatch[1].trim().slice(0, 128);
+    const routeMatch = line.match(/^(?:route_key|路由)\s*[：:]\s*(.+)$/i);
+    if (routeMatch) metadata.routeKey = routeMatch[1].trim().slice(0, 256);
   }
   return metadata;
+}
+
+function oneBotControlSegments(message) {
+  const mentionedUserIds = [];
+  let replyMessageId = "";
+  if (Array.isArray(message?.message)) {
+    for (const segment of message.message) {
+      if (segment?.type === "at") {
+        const userId = String(segment?.data?.qq ?? segment?.data?.user_id ?? "");
+        if (userId) mentionedUserIds.push(userId);
+      }
+      if (segment?.type === "reply" && !replyMessageId) {
+        replyMessageId = String(segment?.data?.id ?? segment?.data?.message_id ?? "");
+      }
+    }
+  }
+  return {
+    mentionedUserIds: [...new Set(mentionedUserIds)],
+    replyMessageId,
+  };
 }
 
 function taskFileIndexMetadata(text) {
@@ -336,6 +442,7 @@ function summarizeGroupMessage(message, expectedSelfId) {
   const timestamp = Number(message?.time ?? 0);
   const text = oneBotReadableText(message);
   const taskMetadata = structuredTaskMetadata(text);
+  const controlSegments = oneBotControlSegments(message);
   return {
     messageId: String(message?.message_id ?? ""),
     messageSeq: String(message?.message_seq ?? message?.message_id ?? ""),
@@ -347,8 +454,23 @@ function summarizeGroupMessage(message, expectedSelfId) {
     taskId: taskMetadata.taskId,
     sourceMachine: taskMetadata.sourceMachine,
     targetMachine: taskMetadata.targetMachine,
+    deliveryId: taskMetadata.deliveryId,
+    messageType: taskMetadata.messageType,
+    requestId: taskMetadata.requestId,
+    targetConversationId: taskMetadata.targetConversationId,
+    receiptStage: taskMetadata.receiptStage,
+    deliveryMessageSeq: taskMetadata.deliveryMessageSeq,
+    proposedTaskId: taskMetadata.proposedTaskId,
+    previousTaskId: taskMetadata.previousTaskId,
+    routeKey: taskMetadata.routeKey,
+    mentionedUserIds: controlSegments.mentionedUserIds,
+    replyMessageId: controlSegments.replyMessageId,
     attachments: oneBotFileAttachments(message),
   };
+}
+
+function stableDeliveryId(kind, dedupeKey) {
+  return createHash("sha256").update(`delivery:${kind}\0${dedupeKey}`, "utf8").digest("hex");
 }
 
 function publicError(error) {
@@ -405,11 +527,13 @@ function buildTrainingMessage(normalizedInput, nowDate) {
 
 function normalizeTextInput(input) {
   const taskId = boundedString(input.task_id, "task_id", 128);
+  const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
   return {
     event: "message",
     taskId: taskId || "fixed-group-text",
     runId: "",
-    dedupeKey: boundedString(input.dedupe_key, "dedupe_key", 200, true),
+    dedupeKey,
+    deliveryId: boundedString(input.delivery_id, "delivery_id", 128) || stableDeliveryId("text", dedupeKey),
     text: boundedString(input.text, "text", 1000, true),
     sourceMachine: boundedString(input.source_machine, "source_machine", 64),
     targetMachine: boundedString(input.target_machine, "target_machine", 64),
@@ -421,6 +545,7 @@ function buildTextMessage(normalizedInput, nowDate) {
     const lines = ["[Codex][TASK_MESSAGE]", `任务：${normalizedInput.taskId}`];
     if (normalizedInput.sourceMachine) lines.push(`来源机器：${normalizedInput.sourceMachine}`);
     if (normalizedInput.targetMachine) lines.push(`目标机器：${normalizedInput.targetMachine}`);
+    lines.push(`delivery_id：${normalizedInput.deliveryId}`);
     lines.push(`正文：${normalizedInput.text}`, `时间：${nowDate.toISOString()}`);
     return lines.join("\n");
   }
@@ -437,6 +562,7 @@ function buildTaskFileIndexMessage(normalizedInput, file, nowDate) {
     `任务：${normalizedInput.taskId}`,
     `来源机器：${normalizedInput.sourceMachine || "未指定"}`,
     `目标机器：${normalizedInput.targetMachine || "未指定"}`,
+    `delivery_id：${normalizedInput.deliveryId}`,
     `file_id：${file.fileId}`,
   ];
   if (file.messageSeq) lines.push(`file_message_seq：${file.messageSeq}`);
@@ -484,12 +610,14 @@ function normalizeFileInput(input, maximumFileBytes) {
   const taskId = boundedString(input.task_id, "task_id", 128);
   const sourceMachine = boundedString(input.source_machine, "source_machine", 64, Boolean(taskId));
   const targetMachine = boundedString(input.target_machine, "target_machine", 64, Boolean(taskId));
+  const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
   return {
     event: "file",
     taskId: taskId || "fixed-group-file",
     hasTaskId: Boolean(taskId),
     runId: "",
-    dedupeKey: boundedString(input.dedupe_key, "dedupe_key", 200, true),
+    dedupeKey,
+    deliveryId: boundedString(input.delivery_id, "delivery_id", 128) || stableDeliveryId("file-index", dedupeKey),
     filePath,
     fileName: requestedName,
     fileBytes: fileStat.size,
@@ -623,7 +751,7 @@ export function createNapCatNotifier(options = {}) {
     }
     if (envelope?.status !== "ok" || Number(envelope?.retcode ?? 0) !== 0) {
       throw new NapCatNotifierError("ONEBOT_ACTION_FAILED", `OneBot ${action} 执行失败`, {
-        outcomeUnknown: action === "send_group_msg" || action === "upload_group_file",
+        outcomeUnknown: action === "send_group_msg" || action === "send_private_msg" || action === "upload_group_file",
         details: { retcode: envelope?.retcode ?? null, wording: envelope?.wording ?? "" },
       });
     }
@@ -679,6 +807,121 @@ export function createNapCatNotifier(options = {}) {
       ? verifyGroup(binding, await callOneBot("get_group_info", { group_id: binding.groupId, no_cache: true }))
       : { actualGroupId: binding.groupId, actualGroupName: binding.groupName, actualMemberCount: null };
     return { runtimeStatus, login, group };
+  }
+
+  function requireControlPlane(binding) {
+    if (!binding.controlPlane.enabled) {
+      throw new NapCatNotifierError("CONTROL_PLANE_DISABLED", "binding 尚未启用 controlPlane");
+    }
+    return binding.controlPlane;
+  }
+
+  async function checkConfiguredTarget(binding, targetKey) {
+    const controlPlane = requireControlPlane(binding);
+    const resolvedKey = boundedString(
+      targetKey || controlPlane.defaultTargetKey,
+      "target_key",
+      64,
+      true,
+    );
+    const target = controlPlane.targets[resolvedKey];
+    if (!target) {
+      throw new NapCatNotifierError("CONTROL_TARGET_NOT_FOUND", `binding 未定义控制目标：${resolvedKey}`);
+    }
+    const runtimeStatus = await callOneBot("get_status");
+    if (runtimeStatus?.online === false || runtimeStatus?.good === false) {
+      throw new NapCatNotifierError("NAPCAT_NOT_READY", "NapCat 当前不在线或状态异常");
+    }
+    const login = verifyLogin(binding, await callOneBot("get_login_info"));
+    if (target.type === "private") {
+      const friends = await callOneBot("get_friend_list", { no_cache: true });
+      const friend = (Array.isArray(friends) ? friends : [])
+        .find((item) => String(item?.user_id ?? "") === target.id);
+      if (!friend) {
+        throw new NapCatNotifierError("PRIVATE_TARGET_NOT_FRIEND", `私聊目标不在当前账号好友列表：${resolvedKey}`);
+      }
+      return {
+        runtimeStatus,
+        login,
+        target: {
+          targetKey: resolvedKey,
+          type: "private",
+          id: target.id,
+          name: target.name || String(friend.remark ?? friend.nickname ?? ""),
+        },
+      };
+    }
+    const groupInfo = await callOneBot("get_group_info", { group_id: target.id, no_cache: true });
+    const actualName = String(groupInfo?.group_name ?? "");
+    const actualMemberCount = Number(groupInfo?.member_count ?? 0);
+    if (target.name && actualName !== target.name) {
+      throw new NapCatNotifierError("CONTROL_GROUP_NAME_MISMATCH", `控制群名称与 binding 不一致：${resolvedKey}`);
+    }
+    if (target.expectedMemberCount && actualMemberCount !== target.expectedMemberCount) {
+      throw new NapCatNotifierError("CONTROL_GROUP_MEMBER_COUNT_MISMATCH", `控制群成员数与 binding 不一致：${resolvedKey}`);
+    }
+    return {
+      runtimeStatus,
+      login,
+      target: {
+        targetKey: resolvedKey,
+        type: "group",
+        id: target.id,
+        name: actualName,
+        memberCount: actualMemberCount,
+        mentionUserId: target.mentionUserId || "",
+      },
+    };
+  }
+
+  function getControlPlaneConfig() {
+    const binding = loadBinding();
+    const controlPlane = binding.controlPlane;
+    return {
+      enabled: controlPlane.enabled,
+      machineIngressEnabled: controlPlane.machineIngressEnabled,
+      localMachine: controlPlane.localMachine,
+      trustedPeerQq: controlPlane.trustedPeerQq,
+      expectedSelfId: binding.expectedSelfId,
+      defaultTargetKey: controlPlane.defaultTargetKey,
+      targets: Object.fromEntries(Object.entries(controlPlane.targets).map(([key, target]) => [
+        key,
+        {
+          type: target.type,
+          name: target.name,
+          expectedMemberCount: target.expectedMemberCount,
+          mentionConfigured: Boolean(target.mentionUserId),
+        },
+      ])),
+    };
+  }
+
+  async function readConfiguredTargetMessages(input = {}) {
+    const binding = loadBinding();
+    const targetCheck = await checkConfiguredTarget(binding, input.target_key);
+    const count = positiveInteger(input.count, 20, 1, 50);
+    const action = targetCheck.target.type === "private"
+      ? "get_friend_msg_history"
+      : "get_group_msg_history";
+    const history = await callOneBot(action, {
+      ...(targetCheck.target.type === "private"
+        ? { user_id: targetCheck.target.id }
+        : { group_id: targetCheck.target.id }),
+      count,
+      reverse_order: input.reverse_order === true,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    });
+    const messages = (Array.isArray(history?.messages) ? history.messages : [])
+      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+    return {
+      target: targetCheck.target,
+      identity: targetCheck.login,
+      requestedCount: count,
+      returnedCount: messages.length,
+      messages,
+    };
   }
 
   async function status(optionsInput = {}) {
@@ -836,6 +1079,7 @@ export function createNapCatNotifier(options = {}) {
         expectedMemberCount: binding.expectedMemberCount,
       },
       dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId,
       message: buildTextMessage(normalizedInput, now()),
     };
   }
@@ -851,6 +1095,7 @@ export function createNapCatNotifier(options = {}) {
         expectedMemberCount: binding.expectedMemberCount,
       },
       dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId,
       filePath: normalizedInput.filePath,
       fileName: normalizedInput.fileName,
       fileBytes: normalizedInput.fileBytes,
@@ -1084,6 +1329,7 @@ export function createNapCatNotifier(options = {}) {
         taskId: normalizedInput.taskId,
         runId: "",
         dedupeKey,
+        deliveryId: normalizedInput.deliveryId,
         message: buildTaskFileIndexMessage(normalizedInput, file, now()),
       });
       const existing = result.existing ?? {};
@@ -1095,6 +1341,7 @@ export function createNapCatNotifier(options = {}) {
         reason: result.reason ?? null,
         messageId: result.messageId ?? String(existing.messageId ?? ""),
         dedupeKey,
+        deliveryId: normalizedInput.deliveryId,
         verificationError: result.verificationError ?? existing.verificationError ?? null,
         error: null,
       };
@@ -1107,6 +1354,7 @@ export function createNapCatNotifier(options = {}) {
         reason: null,
         messageId: "",
         dedupeKey,
+        deliveryId: normalizedInput.deliveryId,
         verificationError: null,
         error: publicError(error),
       };
@@ -1142,6 +1390,7 @@ export function createNapCatNotifier(options = {}) {
           fileBytes: file.fileBytes,
           sha256: file.sha256,
           dedupeKey: normalizedInput.dedupeKey,
+          deliveryId: normalizedInput.deliveryId,
           taskIndex: await sendTaskFileIndex(binding, normalizedInput, file),
         };
       }
@@ -1382,6 +1631,7 @@ export function createNapCatNotifier(options = {}) {
         target: targetCheck.group,
         identity: targetCheck.login,
         dedupeKey: normalizedInput.dedupeKey,
+        deliveryId: normalizedInput.deliveryId,
         ...(taskIndex ? { taskIndex } : {}),
       };
     } finally {
@@ -1390,7 +1640,7 @@ export function createNapCatNotifier(options = {}) {
     }
   }
 
-  async function sendFixedMessage(binding, normalizedInput) {
+  async function sendFixedMessage(binding, normalizedInput, configuredTargetKey = "") {
     const currentTime = now();
     const preview = {
       bindingName: binding.bindingName,
@@ -1398,6 +1648,7 @@ export function createNapCatNotifier(options = {}) {
       taskId: normalizedInput.taskId,
       runId: normalizedInput.runId,
       dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId || "",
       message: normalizedInput.message,
     };
     const state = loadState(statePath);
@@ -1436,7 +1687,21 @@ export function createNapCatNotifier(options = {}) {
     inFlight.add(normalizedInput.dedupeKey);
     let releaseDedupeLock = null;
     try {
-      const targetCheck = await checkTarget(binding);
+      const targetCheck = configuredTargetKey
+        ? await checkConfiguredTarget(binding, configuredTargetKey)
+        : {
+            ...(await checkTarget(binding)),
+            target: null,
+          };
+      const resolvedTarget = configuredTargetKey
+        ? targetCheck.target
+        : {
+            targetKey: "fixed-group",
+            type: "group",
+            id: binding.groupId,
+            name: targetCheck.group.actualGroupName,
+            memberCount: targetCheck.group.actualMemberCount,
+          };
       const lockResult = acquireDedupeLock(statePath, normalizedInput.dedupeKey, currentTime);
       releaseDedupeLock = lockResult.release;
       if (!releaseDedupeLock && lockResult.existingLock?.stale) {
@@ -1467,6 +1732,7 @@ export function createNapCatNotifier(options = {}) {
         event: normalizedInput.event,
         taskId: normalizedInput.taskId,
         runId: normalizedInput.runId,
+        deliveryId: normalizedInput.deliveryId || "",
         createdAt: claimedExisting?.createdAt || currentTime.toISOString(),
         updatedAt: currentTime.toISOString(),
         attempts: previousAttempts + 1,
@@ -1475,10 +1741,15 @@ export function createNapCatNotifier(options = {}) {
 
       let sendData;
       try {
-        sendData = await callOneBot("send_group_msg", {
-          group_id: binding.groupId,
-          message: preview.message,
-        });
+        sendData = resolvedTarget.type === "private"
+          ? await callOneBot("send_private_msg", {
+              user_id: resolvedTarget.id,
+              message: preview.message,
+            })
+          : await callOneBot("send_group_msg", {
+              group_id: resolvedTarget.id,
+              message: preview.message,
+            });
       } catch (error) {
         const failedState = loadState(statePath);
         const entry = failedState.entries[normalizedInput.dedupeKey] || {};
@@ -1532,8 +1803,11 @@ export function createNapCatNotifier(options = {}) {
           if (verifiedMessageId !== messageId) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_ID_MISMATCH", "get_msg 返回的 message_id 不一致");
           }
-          if (verifiedGroupId !== binding.groupId) {
-            throw new NapCatNotifierError("MESSAGE_VERIFY_GROUP_MISMATCH", "get_msg 返回的群号不是已绑定 ExampleGroup 群");
+          if (resolvedTarget.type === "group" && verifiedGroupId !== resolvedTarget.id) {
+            throw new NapCatNotifierError("MESSAGE_VERIFY_GROUP_MISMATCH", "get_msg 返回的群号不是已配置目标群");
+          }
+          if (resolvedTarget.type === "private" && verifiedGroupId) {
+            throw new NapCatNotifierError("MESSAGE_VERIFY_TYPE_MISMATCH", "get_msg 返回的消息不是私聊消息");
           }
           if (!verifiedText || verifiedText !== expectedText) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_TEXT_MISMATCH", "get_msg 返回的通知正文与发送内容不一致");
@@ -1562,12 +1836,13 @@ export function createNapCatNotifier(options = {}) {
         verified,
         messageId,
         verificationError,
-        target: targetCheck.group,
+        target: configuredTargetKey ? resolvedTarget : targetCheck.group,
         identity: targetCheck.login,
         event: normalizedInput.event,
         taskId: normalizedInput.taskId,
         runId: normalizedInput.runId,
         dedupeKey: normalizedInput.dedupeKey,
+        deliveryId: normalizedInput.deliveryId || "",
       };
     } finally {
       if (releaseDedupeLock) releaseDedupeLock();
@@ -1593,19 +1868,57 @@ export function createNapCatNotifier(options = {}) {
     });
   }
 
+  async function sendControlGroupMessage(input) {
+    const binding = loadBinding();
+    requireControlPlane(binding);
+    const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
+    return sendFixedMessage(binding, {
+      event: boundedString(input.event || "control", "event", 64, true),
+      taskId: boundedString(input.task_id || "control-plane", "task_id", 128, true),
+      runId: "",
+      dedupeKey,
+      deliveryId: "",
+      message: boundedString(input.message, "message", 4000, true),
+    });
+  }
+
+  async function sendConfiguredMessage(input) {
+    const binding = loadBinding();
+    const controlPlane = requireControlPlane(binding);
+    const targetKey = boundedString(
+      input.target_key || controlPlane.defaultTargetKey,
+      "target_key",
+      64,
+      true,
+    );
+    const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
+    return sendFixedMessage(binding, {
+      event: boundedString(input.event || "owner_alert", "event", 64, true),
+      taskId: boundedString(input.task_id || "control-plane", "task_id", 128, true),
+      runId: "",
+      dedupeKey,
+      deliveryId: "",
+      message: boundedString(input.message, "message", 4000, true),
+    }, targetKey);
+  }
+
   return {
     bindingPath,
     statePath,
     baseUrl,
     status,
     discoverTarget,
+    getControlPlaneConfig,
     readRecentMessages,
+    readConfiguredTargetMessages,
     previewTrainingEvent,
     previewTextMessage,
     previewFile,
     downloadFile,
     sendTrainingEvent,
     sendTextMessage,
+    sendControlGroupMessage,
+    sendConfiguredMessage,
     sendFile,
   };
 }

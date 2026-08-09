@@ -39,6 +39,10 @@ $PreviousCodeRoot = Join-Path $BackupRoot "previous-code"
 $PreviousUserEnvironmentPath = Join-Path $BackupRoot "codex-app-server-user-env.json"
 $UpdateStatePath = Join-Path $StateRoot "napcat-bridge-last-update.json"
 $LockPath = Join-Path $StateRoot "napcat-bridge-update.lock"
+$ControlStatePath = Join-Path $StateRoot "control-state.json"
+$LegacyControlStatePath = Join-Path $CodeRoot "state\control-state.json"
+$ControlStateBackupPath = Join-Path $BackupRoot "control-state.json"
+$LegacyControlStateBackupPath = Join-Path $BackupRoot "legacy-code-control-state.json"
 
 function Get-FileSha256 {
   param([string]$Path)
@@ -95,6 +99,35 @@ function Read-JsonOrNull {
   param([string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
   return Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json
+}
+
+function Get-ControlStateMigrationPlan {
+  param([string]$DataPath, [string]$LegacyPath)
+  $DataExists = Test-Path -LiteralPath $DataPath -PathType Leaf
+  $LegacyExists = Test-Path -LiteralPath $LegacyPath -PathType Leaf
+  if ($DataExists) { $null = Read-JsonOrNull -Path $DataPath }
+  if ($LegacyExists) { $null = Read-JsonOrNull -Path $LegacyPath }
+  $DataHash = if ($DataExists) { Get-FileSha256 -Path $DataPath } else { $null }
+  $LegacyHash = if ($LegacyExists) { Get-FileSha256 -Path $LegacyPath } else { $null }
+  if ($DataExists -and $LegacyExists -and $DataHash -ne $LegacyHash) {
+    throw "Control state exists in both DataRoot and legacy CodeRoot with different content. Preserve both files and reconcile them before activation."
+  }
+  $Action = if ($DataExists) {
+    "preserve_data_root"
+  } elseif ($LegacyExists) {
+    "migrate_legacy_code_root"
+  } else {
+    "initialize_data_root"
+  }
+  return [pscustomobject]@{
+    action = $Action
+    dataPath = $DataPath
+    legacyPath = $LegacyPath
+    dataExisted = $DataExists
+    legacyExisted = $LegacyExists
+    dataSha256 = $DataHash
+    legacySha256 = $LegacyHash
+  }
 }
 
 function Resolve-McpSdkRoot {
@@ -294,6 +327,12 @@ try {
   try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
   throw
 }
+try {
+  $ControlStateMigrationPlan = Get-ControlStateMigrationPlan -DataPath $ControlStatePath -LegacyPath $LegacyControlStatePath
+} catch {
+  try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+  throw
+}
 if ($ValidateOnly) {
   [pscustomobject]@{
     schemaVersion = 1
@@ -302,6 +341,8 @@ if ($ValidateOnly) {
     sourceRoot = $SourceRoot
     sourceTreeSha256 = $SourceTreeHash
     validationMcpSdkRoot = $ValidationMcpSdkRoot
+    controlStatePath = $ControlStatePath
+    controlStateMigrationAction = [string]$ControlStateMigrationPlan.action
     validatedAt = (Get-Date).ToString("o")
   } | ConvertTo-Json -Depth 8
   try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
@@ -320,6 +361,7 @@ $ProxyLifecycleTouched = $false
 $RouterStopped = $false
 $SupervisorStopped = $false
 $WatchdogStopped = $false
+$ControlStateMigrated = $false
 $PreviousPointer = Read-JsonOrNull -Path $ActivePointerPath
 $PreviousUserAppServerWsUrl = [Environment]::GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", "User")
 
@@ -335,6 +377,17 @@ try {
   if (Test-Path -LiteralPath $PrivateEnvPath) {
     $PrivateEnvBackupPath = Join-Path $BackupRoot "broker-private.env.json"
     Copy-Item -LiteralPath $PrivateEnvPath -Destination $PrivateEnvBackupPath -Force
+  }
+  if (Test-Path -LiteralPath $ControlStatePath -PathType Leaf) {
+    Copy-Item -LiteralPath $ControlStatePath -Destination $ControlStateBackupPath -Force
+  }
+  if (Test-Path -LiteralPath $LegacyControlStatePath -PathType Leaf) {
+    Copy-Item -LiteralPath $LegacyControlStatePath -Destination $LegacyControlStateBackupPath -Force
+  }
+  if ([string]$ControlStateMigrationPlan.action -eq "migrate_legacy_code_root") {
+    New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
+    Copy-Item -LiteralPath $LegacyControlStatePath -Destination $ControlStatePath -Force
+    $ControlStateMigrated = $true
   }
   $BeforeSnapshot = Get-ProtectedTaskSnapshot -Path $RegistryPath
   Set-UpdateMaintenance -Active $true -Code "PACKAGE_UPDATE" -Message "NapCat bridge update is validating and switching code; automatic wake is paused."
@@ -396,6 +449,7 @@ try {
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_MCP_BINDING_PATH -NotePropertyValue (Join-Path $DataRoot "binding.json") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_MCP_STATE_PATH -NotePropertyValue (Join-Path $StateRoot "dedupe.json") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_REGISTRY_PATH -NotePropertyValue $RegistryPath -Force
+  $PrivateEnv | Add-Member -NotePropertyName NAPCAT_CONTROL_STATE_PATH -NotePropertyValue $ControlStatePath -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_RUNTIME_PATH -NotePropertyValue (Join-Path $StateRoot "task-router-runtime.json") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_LOG_PATH -NotePropertyValue (Join-Path $StateRoot "task-router.jsonl") -Force
   $PrivateEnv | Add-Member -NotePropertyName NAPCAT_TASK_ROUTER_STOP_PATH -NotePropertyValue (Join-Path $StateRoot "task-router.stop") -Force
@@ -522,6 +576,8 @@ try {
     restartCodexRequired = (-not $BackendOnlyHotReload)
     protectedTaskCount = @($AfterSnapshot).Count
     preservedActiveWakeCount = $PreservedActiveWakeCount
+    controlStatePath = $ControlStatePath
+    controlStateMigrationAction = [string]$ControlStateMigrationPlan.action
     backendOnlyHotReload = [bool]$BackendOnlyHotReload
     previousUserAppServerWsUrl = $PreviousUserAppServerWsUrl
     activatedProxyUrl = $ActivatedProxyUrl
@@ -562,6 +618,11 @@ try {
     if ($PrivateEnvBackupPath -and (Test-Path -LiteralPath $PrivateEnvBackupPath)) {
       try { Copy-Item -LiteralPath $PrivateEnvBackupPath -Destination $PrivateEnvPath -Force } catch {}
     }
+  }
+  if (Test-Path -LiteralPath $ControlStateBackupPath -PathType Leaf) {
+    try { Copy-Item -LiteralPath $ControlStateBackupPath -Destination $ControlStatePath -Force } catch {}
+  } elseif ($ControlStateMigrated) {
+    try { Remove-Item -LiteralPath $ControlStatePath -Force -ErrorAction SilentlyContinue } catch {}
   }
   Set-UpdateMaintenance -Active $false
   Write-JsonAtomic -Path $AlertPath -Value ([ordered]@{

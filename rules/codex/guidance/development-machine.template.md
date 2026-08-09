@@ -20,7 +20,7 @@
 
 ## 主包准备
 
-主包必须包含稳定 `task_id`、项目身份、目标机器、文件清单、SHA256、必做项、禁做项、允许调整项、暂停条件、完成条件和回包要求。
+主包必须包含稳定 `task_id`、项目身份、目标机器、文件清单、SHA256、必做项、禁做项、允许调整项、暂停条件、完成条件和回包要求。`task_id` 表示长期协作身份，重复运行的日期、时间和批次放进 `run_id` 或 generation，不因一次重跑就更换任务 ID。
 
 开发机在发送前从新的空目录复验主包，确保没有混入登录态、对话数据库、浏览器 profile、运行日志、旧任务产物和无关大文件。
 
@@ -28,7 +28,7 @@
 
 发送端和接收端都必须调用 `napcat_task_register`，使用相同 `task_id` 并显式填写各自稳定 `conversation_id`、`local_role`、来源/目标机器和可信对端。
 
-任务换对话时使用受控更新并增加 `generation`，旧对话不能继续读取或 ACK 新代次消息。任务完成后调用 `napcat_task_close`。
+任务换对话时使用受控更新并增加 `generation`，旧对话不能继续读取或 ACK 新代次消息。需要更换整个 `task_id` 时，两端先登记方向兼容的后继任务并完成握手与消息验证，再以 `successor_task_id` 关闭旧任务；最终结束则必须确认本地 pending/active wake 为空、对端已完成最终交接并显式声明 `final_close=true`。不得先关闭旧任务再尝试联系对端。
 
 ## 消息与文件
 
@@ -37,6 +37,10 @@
 文件索引记录原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、字节数、SHA256 和可下载标识；不得把只对发送端 NapCat 当前进程有效的根文件临时 `file_id` 当作跨机索引。接收端下载后必须重新计算大小与哈希，不以「接口返回成功」代替文件验证。兼容旧索引时，只能按固定群中同一发送者、文件名、字节数和五分钟内相邻附件受约束地恢复真实 `fileUuid`。
 
 `message_seq` 是不保证数字递增的消息标识。收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务消息；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
+
+结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（对端机器扫描到）与 `conversation_received`（对端 Codex 对话收到引导）。这两项是系统自动生成的传输回执，不代表业务已处理；只有绑定对话完成正文处理后提交的 `napcat_task_ack` 才能清除对应 pending 消息。
+
+如果旧任务意外关闭但仍知道对端 `conversation_id`，调用 `napcat_connection_request` 向指定对话提出重新建链请求。该请求只唤醒，不替对方登记任务；双方仍须各自核对并登记建议任务、互发握手，确认新路由后才能继续正式协作。需要在 QQ 私聊或通知群提醒主人时，先登记本对话的 owner route，再向 binding 预配置的目标发送简短通知；主人回复只有在私聊身份匹配，或群聊同时 @ 本机账号并保留 route key 时才进入当前对话。
 
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
 

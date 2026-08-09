@@ -1,5 +1,5 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "bindingName": "example-group-notify",
   "expectedSelfId": "1000000001",
   "expectedNickname": "ExampleBot",
@@ -20,5 +20,26 @@
   "dedupeRetentionDays": 30,
   "codexWakeMessageVisibility": "visible",
   "requireGroupIdentityCheckBeforeSend": true,
-  "requireMessageVerification": true
+  "requireMessageVerification": true,
+  "controlPlane": {
+    "enabled": false,
+    "machineIngressEnabled": false,
+    "localMachine": "development",
+    "trustedPeerQq": "1000000002",
+    "defaultTargetKey": "owner-private",
+    "targets": {
+      "owner-private": {
+        "type": "private",
+        "id": "1000000003",
+        "name": "Owner"
+      },
+      "owner-group": {
+        "type": "group",
+        "id": "2000000002",
+        "name": "OwnerOps",
+        "mentionUserId": "1000000001",
+        "expectedMemberCount": 4
+      }
+    }
+  }
 }

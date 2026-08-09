@@ -1,0 +1,470 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import { createControlPlane } from "../src/control-plane.mjs";
+import { createControlState } from "../src/control-state.mjs";
+
+const BASE_TIME = "2026-08-09T00:00:00.000Z";
+const PLACEHOLDER_OWNER_PRIVATE_ID = "1999000001";
+const PLACEHOLDER_OWNER_GROUP_ID = "2999000001";
+
+function configuration(overrides = {}) {
+  return {
+    enabled: true,
+    machineIngressEnabled: true,
+    localMachine: "development",
+    trustedPeerQq: "2000000002",
+    expectedSelfId: "1000000001",
+    defaultTargetKey: "owner-private",
+    targets: {
+      "owner-private": {
+        type: "private",
+        id: PLACEHOLDER_OWNER_PRIVATE_ID,
+        name: "owner",
+      },
+      "owner-group": {
+        type: "group",
+        id: PLACEHOLDER_OWNER_GROUP_ID,
+        name: "owner-group",
+      },
+    },
+    ...overrides,
+  };
+}
+
+function createFixture(options = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-control-plane-test-"));
+  const statePath = path.join(root, "state", "control-state.json");
+  const groupSends = [];
+  const configuredSends = [];
+  const wakeCalls = [];
+  const targetHistory = new Map(Object.entries(options.targetHistory ?? {}));
+  const sentByDedupeKey = new Map();
+  const currentConfiguration = configuration(options.configuration);
+  let nextMessageId = options.nextMessageId ?? 500;
+  const notifier = {
+    getControlPlaneConfig: () => currentConfiguration,
+    sendControlGroupMessage: async (input) => {
+      groupSends.push(structuredClone(input));
+      if (!sentByDedupeKey.has(input.dedupe_key)) {
+        sentByDedupeKey.set(input.dedupe_key, nextMessageId);
+        nextMessageId += 1;
+      }
+      return {
+        sent: !groupSends.slice(0, -1).some((entry) => entry.dedupe_key === input.dedupe_key),
+        verified: true,
+        messageId: sentByDedupeKey.get(input.dedupe_key),
+      };
+    },
+    sendConfiguredMessage: async (input) => {
+      configuredSends.push(structuredClone(input));
+      return { sent: true, verified: true, messageId: nextMessageId++ };
+    },
+    readConfiguredTargetMessages: async ({ target_key: targetKey }) => {
+      const target = currentConfiguration.targets[targetKey];
+      if (!target) throw new Error(`missing target: ${targetKey}`);
+      return {
+        target: { ...target },
+        messages: structuredClone(targetHistory.get(targetKey) ?? []),
+      };
+    },
+  };
+  const bridge = {
+    wake: async (input) => {
+      wakeCalls.push(structuredClone(input));
+      return options.wakeResult ?? {
+        outcome: "accepted",
+        status: "busy",
+        started: true,
+        turn: { id: `turn-${wakeCalls.length}` },
+      };
+    },
+  };
+  const state = createControlState({
+    statePath,
+    now: options.now ?? (() => new Date(BASE_TIME)),
+  });
+  const controlPlane = createControlPlane({
+    notifier,
+    bridge,
+    state,
+    now: options.now ?? (() => new Date(BASE_TIME)),
+    registry: options.registry,
+  });
+  return {
+    root,
+    state,
+    controlPlane,
+    groupSends,
+    configuredSends,
+    wakeCalls,
+    targetHistory,
+    cleanup() {
+      fs.rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+function businessMessage(overrides = {}) {
+  return {
+    messageId: "77",
+    messageSeq: "77",
+    deliveryMessageSeq: "77",
+    senderId: "1000000001",
+    isSelf: false,
+    messageType: "business",
+    deliveryId: "delivery-001",
+    taskId: "stable-task",
+    sourceMachine: "development",
+    targetMachine: "training",
+    time: BASE_TIME,
+    text: "business payload",
+    ...overrides,
+  };
+}
+
+function receiptMessage(stage, overrides = {}) {
+  return {
+    messageId: stage === "machine_received" ? "501" : "502",
+    messageSeq: stage === "machine_received" ? "501" : "502",
+    deliveryMessageSeq: "77",
+    senderId: "2000000002",
+    isSelf: false,
+    messageType: "delivery_receipt",
+    deliveryId: "delivery-001",
+    taskId: "stable-task",
+    sourceMachine: "training",
+    targetMachine: "development",
+    receiptStage: stage,
+    time: stage === "machine_received"
+      ? "2026-08-09T00:00:01.000Z"
+      : "2026-08-09T00:00:02.000Z",
+    text: `[Codex][DELIVERY_RECEIPT] ${stage}`,
+    ...overrides,
+  };
+}
+
+test("business delivery advances through machine and conversation receipts without receipt recursion", async () => {
+  const sender = createFixture();
+  const receiver = createFixture({
+    configuration: {
+      localMachine: "training",
+      trustedPeerQq: "1000000001",
+      expectedSelfId: "2000000002",
+    },
+  });
+  try {
+    sender.controlPlane.trackOutgoingDelivery({
+      deliveryId: "delivery-001",
+      taskId: "stable-task",
+      sourceMachine: "development",
+      targetMachine: "training",
+      messageSeq: 77,
+    });
+
+    const business = businessMessage();
+    assert.deepEqual(
+      await receiver.controlPlane.acknowledgeBusinessMessages([business], "machine_received"),
+      [{ deliveryId: "delivery-001", stage: "machine_received", sent: true }],
+    );
+    assert.deepEqual(
+      await receiver.controlPlane.acknowledgeBusinessMessages([business], "conversation_received"),
+      [{ deliveryId: "delivery-001", stage: "conversation_received", sent: true }],
+    );
+    assert.deepEqual(
+      receiver.groupSends.map((entry) => entry.dedupe_key),
+      [
+        "delivery-receipt:machine_received:delivery-001",
+        "delivery-receipt:conversation_received:delivery-001",
+      ],
+    );
+
+    const receipts = [receiptMessage("machine_received"), receiptMessage("conversation_received")];
+    const scan = await sender.controlPlane.scanGroupHistory(receipts);
+    assert.deepEqual(
+      scan.results.map((result) => result.outcome),
+      ["machine_received", "conversation_received"],
+    );
+    assert.deepEqual(sender.controlPlane.getDeliveryStatus("delivery-001"), {
+      deliveryId: "delivery-001",
+      taskId: "stable-task",
+      sourceMachine: "development",
+      targetMachine: "training",
+      messageSeq: 77,
+      machineReceivedAt: "2026-08-09T00:00:01.000Z",
+      conversationReceivedAt: "2026-08-09T00:00:02.000Z",
+      status: "conversation_received",
+    });
+
+    const sendCount = receiver.groupSends.length;
+    assert.deepEqual(
+      await receiver.controlPlane.acknowledgeBusinessMessages(receipts, "machine_received"),
+      [],
+    );
+    assert.equal(receiver.groupSends.length, sendCount);
+    assert.equal(sender.groupSends.length, 0);
+  } finally {
+    sender.cleanup();
+    receiver.cleanup();
+  }
+});
+
+test("connection request wakes only its requested conversation and never registers a task", async () => {
+  let registryRegisterCount = 0;
+  const fixture = createFixture({
+    registry: {
+      register() {
+        registryRegisterCount += 1;
+        throw new Error("control plane must not register tasks");
+      },
+    },
+  });
+  try {
+    const request = {
+      messageId: "601",
+      messageSeq: "601",
+      deliveryMessageSeq: "601",
+      senderId: "2000000002",
+      isSelf: false,
+      messageType: "connection_request",
+      deliveryId: "request-001",
+      requestId: "request-001",
+      proposedTaskId: "stable-successor-task",
+      previousTaskId: "stable-predecessor-task",
+      targetConversationId: "019f-target-conversation",
+      sourceMachine: "training",
+      targetMachine: "development",
+      time: BASE_TIME,
+      text: "connection request",
+    };
+
+    const first = await fixture.controlPlane.scanGroupHistory([request]);
+    assert.deepEqual(first.results, [{
+      outcome: "connection_request_delivered",
+      requestId: "request-001",
+    }]);
+    assert.equal(registryRegisterCount, 0);
+    assert.equal(fixture.wakeCalls.length, 1);
+    assert.equal(fixture.wakeCalls[0].threadId, "019f-target-conversation");
+    assert.equal(fixture.wakeCalls[0].taskId, "stable-successor-task");
+    assert.match(fixture.wakeCalls[0].prompt, /不代表本机已经登记、绑定或接受 task/);
+    assert.deepEqual(
+      fixture.groupSends.map((entry) => entry.dedupe_key),
+      [
+        "delivery-receipt:machine_received:request-001",
+        "delivery-receipt:conversation_received:request-001",
+      ],
+    );
+    assert.equal(fixture.state.snapshot().connectionRequests["request-001"].status, "wake_accepted");
+    assert.deepEqual(fixture.state.snapshot().deliveries, {});
+
+    const second = await fixture.controlPlane.scanGroupHistory([request]);
+    assert.deepEqual(second.results, [{
+      outcome: "duplicate_connection_request",
+      requestId: "request-001",
+    }]);
+    assert.equal(fixture.wakeCalls.length, 1);
+    assert.equal(fixture.groupSends.length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner private and group replies require their configured sender or mention before routing", async () => {
+  const fixture = createFixture({
+    targetHistory: {
+      "owner-private": [
+        {
+          isSelf: false,
+          routeKey: "private-route",
+          senderId: "9999999999",
+          messageSeq: 10,
+          time: BASE_TIME,
+          text: "wrong private sender",
+          mentionedUserIds: [],
+        },
+        {
+          isSelf: false,
+          routeKey: "private-route",
+          senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+          messageSeq: 11,
+          time: BASE_TIME,
+          text: "valid private reply",
+          mentionedUserIds: [],
+        },
+      ],
+      "owner-group": [
+        {
+          isSelf: false,
+          routeKey: "group-route",
+          senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+          messageSeq: 20,
+          time: BASE_TIME,
+          text: "missing mention",
+          mentionedUserIds: [],
+        },
+        {
+          isSelf: false,
+          routeKey: "group-route",
+          senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+          messageSeq: 21,
+          time: BASE_TIME,
+          text: "valid group reply",
+          mentionedUserIds: ["1000000001"],
+        },
+      ],
+    },
+  });
+  try {
+    fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-private",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+    fixture.controlPlane.registerOwnerRoute({
+      route_key: "group-route",
+      conversation_id: "conversation-group",
+      task_id: "stable-task-group",
+      target_key: "owner-group",
+    });
+
+    const first = await fixture.controlPlane.scanOwnerReplies();
+    assert.deepEqual(
+      first.results.map((result) => ({
+        outcome: result.outcome,
+        routeKey: result.routeKey,
+        messageSeq: result.messageSeq,
+      })),
+      [
+        { outcome: "owner_reply_delivered", routeKey: "private-route", messageSeq: 11 },
+        { outcome: "owner_reply_delivered", routeKey: "group-route", messageSeq: 21 },
+      ],
+    );
+    assert.deepEqual(
+      fixture.wakeCalls.map((call) => [call.threadId, call.pendingThroughSequence]),
+      [
+        ["conversation-private", 11],
+        ["conversation-group", 21],
+      ],
+    );
+    assert.match(fixture.wakeCalls[0].prompt, /valid private reply/);
+    assert.match(fixture.wakeCalls[1].prompt, /valid group reply/);
+    assert.equal(fixture.state.getOwnerRoute("private-route").lastInboundMessageSeq, 11);
+    assert.equal(fixture.state.getOwnerRoute("group-route").lastInboundMessageSeq, 21);
+
+    await fixture.controlPlane.scanOwnerReplies();
+    assert.equal(fixture.wakeCalls.length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner replies with out-of-order message_seq are delivered exactly once each", async () => {
+  const firstReply = {
+    isSelf: false,
+    routeKey: "private-route",
+    senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+    messageSeq: 21,
+    time: BASE_TIME,
+    text: "first valid reply",
+    mentionedUserIds: [],
+  };
+  const secondReply = {
+    isSelf: false,
+    routeKey: "private-route",
+    senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+    messageSeq: 20,
+    time: "2026-08-09T00:00:01.000Z",
+    text: "second valid reply with lower sequence",
+    mentionedUserIds: [],
+  };
+  const fixture = createFixture({
+    targetHistory: {
+      "owner-private": [firstReply],
+    },
+  });
+  try {
+    fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-private",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+
+    const first = await fixture.controlPlane.scanOwnerReplies();
+    assert.deepEqual(
+      first.results.map((result) => [result.outcome, result.messageSeq]),
+      [["owner_reply_delivered", 21]],
+    );
+
+    fixture.targetHistory.set("owner-private", [firstReply, secondReply]);
+    const second = await fixture.controlPlane.scanOwnerReplies();
+    assert.deepEqual(
+      second.results.map((result) => [result.outcome, result.messageSeq]),
+      [["owner_reply_delivered", 20]],
+    );
+    assert.deepEqual(
+      fixture.wakeCalls.map((call) => [call.pendingThroughSequence, call.prompt.includes("valid reply")]),
+      [
+        [21, true],
+        [20, true],
+      ],
+    );
+
+    const third = await fixture.controlPlane.scanOwnerReplies();
+    assert.deepEqual(third.results, []);
+    assert.equal(fixture.wakeCalls.length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("open owner route keeps the control plane alive without machine ingress or business tasks", () => {
+  const fixture = createFixture({
+    configuration: { machineIngressEnabled: false },
+  });
+  try {
+    assert.equal(fixture.controlPlane.keepAlive(), false);
+    fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-private",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+    assert.equal(fixture.controlPlane.keepAlive(), true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("connection delivery and wake identifiers are stable and duplicate scans are idempotent", async () => {
+  const fixture = createFixture();
+  try {
+    const input = {
+      proposed_task_id: "stable-task",
+      target_conversation_id: "019f-peer-conversation",
+      target_machine: "training",
+      reason: "reconnect after an accidental close",
+    };
+    const first = await fixture.controlPlane.sendConnectionRequest(input);
+    const second = await fixture.controlPlane.sendConnectionRequest(input);
+    assert.equal(first.requestId, second.requestId);
+    assert.equal(first.deliveryId, first.requestId);
+    assert.equal(second.deliveryId, first.requestId);
+    assert.match(first.requestId, /^request-[a-f0-9]{32}$/);
+    assert.equal(fixture.groupSends[0].dedupe_key, fixture.groupSends[1].dedupe_key);
+    assert.equal(fixture.controlPlane.listDeliveryStatuses().length, 1);
+    assert.equal(fixture.controlPlane.getDeliveryStatus(first.deliveryId).status, "pending");
+
+    const changed = await fixture.controlPlane.sendConnectionRequest({
+      ...input,
+      target_conversation_id: "019f-another-conversation",
+    });
+    assert.notEqual(changed.requestId, first.requestId);
+  } finally {
+    fixture.cleanup();
+  }
+});

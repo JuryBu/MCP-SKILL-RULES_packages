@@ -18,7 +18,7 @@
 
 ## 收包身份门
 
-进入 `ACTIVE_TRAINING` 前逐项核对包哈希、`task_id`、项目、工作区、目标机器、硬件、任务清单和 `ready_to_run=true`。任何一项不匹配都留在只读状态，不创建训练环境、不写正式目录、不启动进程。
+进入 `ACTIVE_TRAINING` 前逐项核对包哈希、`task_id`、项目、工作区、目标机器、硬件、任务清单和 `ready_to_run=true`。`task_id` 表示长期协作身份，重复运行日期、时间和批次放在 `run_id` 或 generation，不因一次重跑就自行更换任务 ID。任何身份项不匹配都留在只读状态，不创建训练环境、不写正式目录、不启动进程。
 
 ## 主包权限与自主判断
 
@@ -54,11 +54,15 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 固定群迁移必须与对端约定带时区的绝对切换时间。切换前短暂停止结构化发送并处理或留证旧群待确认消息，备份私有 binding 后原子更新群身份；保留 open task、代次、游标和冷却状态，验证新群与路由正常后再恢复，失败立即回滚。
 
-进入任务对话后调用 `napcat_task_register`，显式登记 `task_id`、稳定 `conversation_id`、`local_role=training`、来源/目标机器和可信对端。
+进入任务对话后调用 `napcat_task_register`，显式登记 `task_id`、稳定 `conversation_id`、`local_role=training`、来源/目标机器和可信对端。需要更换整个任务时，两端先登记方向兼容的后继任务并完成握手与消息验证，再以 `successor_task_id` 关闭旧任务；最终结束则确认 pending/active wake 为空、开发机已完成最终交接并显式声明 `final_close=true`。关闭后的任务不会继续接收提醒，不能先关旧任务再等开发机联系。
 
 后台路由只接受固定群、已登记任务、正确目标机器和可信发送者同时匹配的消息。`message_seq` 不保证数字递增，同一扫描内多条消息按消息时间与群历史顺序合并，只唤醒绑定对话一次。
 
 收到 `[NAPCAT_TASK_WAKE]` 后，当前对话调用 `napcat_read_recent`，按需下载文件；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
+
+结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（开发机扫描到）与 `conversation_received`（开发机 Codex 对话收到引导）。它们是自动传输回执，不代表业务完成；只有对话处理正文后提交的 `napcat_task_ack` 才能清除 pending 消息。
+
+如果旧任务意外关闭但仍知道开发机 `conversation_id`，调用 `napcat_connection_request` 向指定对话提出重新建链请求。该请求只唤醒，不替开发机登记任务；双方必须各自核对并登记建议任务、互发握手，确认新路由后才恢复正式协作。需要给主人发 QQ 提醒时，先登记当前对话的 owner route，再向 binding 预配置的私聊或通知群发送简短消息；主人回复只有在私聊身份匹配，或群聊同时 @ 本机账号并保留 route key 时才进入当前对话。
 
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
 

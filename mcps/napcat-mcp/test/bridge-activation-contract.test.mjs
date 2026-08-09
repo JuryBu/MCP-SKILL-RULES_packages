@@ -110,10 +110,116 @@ test("candidate validation resolves the broker MCP SDK before entering maintenan
   }
 });
 
+test("guarded updater shares control state through the private DataRoot", () => {
+  const script = read("ops/update-codex-napcat-bridge.ps1");
+  assert.match(script, /\$ControlStatePath = Join-Path \$StateRoot "control-state\.json"/);
+  assert.match(script, /function Get-ControlStateMigrationPlan/);
+  assert.match(script, /migrate_legacy_code_root/);
+  assert.match(script, /different content\. Preserve both files and reconcile them before activation/);
+  assert.match(script, /NAPCAT_CONTROL_STATE_PATH/);
+  assert.match(script, /\$ControlStateBackupPath/);
+  assert.match(script, /\$LegacyControlStateBackupPath/);
+  assert.match(script, /elseif \(\$ControlStateMigrated\)/);
+
+  const indexSource = read("src/index.mjs");
+  assert.match(indexSource, /path\.join\(path\.dirname\(taskRegistryStatePath\), "control-state\.json"\)/);
+
+  const routerSource = read("src/task-router-runner.mjs");
+  assert.match(routerSource, /env\.NAPCAT_CONTROL_STATE_PATH/);
+  assert.match(routerSource, /path\.join\(path\.dirname\(registryPath\), "control-state\.json"\)/);
+});
+
+test("legacy control-state migration rolls back when update fails before code installation", { skip: process.platform !== "win32" }, (t) => {
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-control-state-rollback-"));
+  t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
+  const sourceRoot = path.join(fixtureRoot, "source");
+  const brokerRoot = path.join(fixtureRoot, "broker");
+  const codeRoot = path.join(fixtureRoot, "service", "current");
+  const dataRoot = path.join(fixtureRoot, "private-data");
+  const sdkRoot = path.join(fixtureRoot, "memory-store", "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
+  const legacyControlStatePath = path.join(codeRoot, "state", "control-state.json");
+  const dataControlStatePath = path.join(dataRoot, "state", "control-state.json");
+  const registryPath = path.join(dataRoot, "state", "task-registry.json");
+  const legacyControlState = JSON.stringify({ schemaVersion: 1, deliveries: { legacy: { stage: "machine_received" } } });
+  const registry = {
+    schemaVersion: 1,
+    tasks: {
+      fixture: {
+        taskId: "fixture",
+        conversationId: "fixture-conversation",
+        localRole: "development",
+        sourceMachine: "training",
+        targetMachine: "development",
+        trustedPeerQq: "10000",
+        generation: 1,
+        status: "open",
+        wakePending: true,
+        activeWakeId: "fixture-wake",
+        messageLedger: {},
+        wakeBatches: {},
+      },
+    },
+  };
+  write(path.join(sdkRoot, "server", "index.js"), "export {};\n");
+  write(path.join(sdkRoot, "types.js"), "export {};\n");
+  write(path.join(brokerRoot, "broker-private.env.json"), JSON.stringify({ CODEX_TOOLKIT_BROKER_ROOT: brokerRoot }));
+  write(legacyControlStatePath, legacyControlState);
+  write(registryPath, JSON.stringify(registry));
+  write(
+    path.join(sourceRoot, "package.json"),
+    JSON.stringify({
+      name: "napcat-control-state-rollback-fixture",
+      version: "1.0.0",
+      private: true,
+      scripts: {
+        check: "node -e \"process.exit(0)\"",
+        test: "node -e \"process.exit(0)\"",
+      },
+    }),
+  );
+  write(
+    path.join(sourceRoot, "package-lock.json"),
+    JSON.stringify({
+      name: "napcat-control-state-rollback-fixture",
+      version: "1.0.0",
+      lockfileVersion: 3,
+      requires: true,
+      packages: { "": { name: "napcat-control-state-rollback-fixture", version: "1.0.0" } },
+    }),
+  );
+  write(path.join(sourceRoot, "src", "index.mjs"), "export {};\n");
+  write(path.join(sourceRoot, "package", "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"), "Write-Output 'portable fixture'\n");
+  fs.copyFileSync(path.resolve("ops/update-codex-napcat-bridge.ps1"), path.join(sourceRoot, "update.ps1"));
+  const result = runPowerShell(
+    path.join(sourceRoot, "update.ps1"),
+    [
+      "-SourceRoot", sourceRoot,
+      "-CodeRoot", codeRoot,
+      "-DataRoot", dataRoot,
+      "-BrokerRoot", brokerRoot,
+      "-SourceCommit", "fixture",
+      "-PreserveActiveWakes",
+    ],
+    {
+      USERPROFILE: fixtureRoot,
+      MCP_SDK_ROOT: sdkRoot,
+      MEMORY_STORE_MCP_ROOT: "",
+      CODEX_TOOLKIT_MCP_ROOT: "",
+      CODEX_TOOLKIT_BROKER_ROOT: "",
+    },
+  );
+  const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0, combinedOutput);
+  assert.match(combinedOutput, /task-router stop script is missing/);
+  assert.equal(fs.existsSync(dataControlStatePath), false, "failed migration must not leave a new DataRoot control-state");
+  assert.equal(fs.readFileSync(legacyControlStatePath, "utf8"), legacyControlState);
+  assert.deepEqual(JSON.parse(fs.readFileSync(registryPath, "utf8")), registry);
+});
+
 test("portable package entrypoint leaves live services untouched before guarded validation succeeds", () => {
   const script = read("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1");
   const updaterIndex = script.lastIndexOf("$UpdateResult = & $Updater @UpdateArguments");
-  const brokerProofIndex = script.indexOf("\n  Assert-BrokerSnapshotCurrent\n");
+  const brokerProofIndex = script.search(/\r?\n\s*Assert-BrokerSnapshotCurrent\r?\n/);
   assert.ok(brokerProofIndex >= 0 && updaterIndex > brokerProofIndex, "the installed broker snapshot must be proven before invoking the guarded updater");
   assert.match(script, /Run Update-CodexMcpBroker\.ps1 before the NapCat App Server upgrade/);
   assert.doesNotMatch(script, /stop-napcat-supervisor-watchdog\.ps1/);

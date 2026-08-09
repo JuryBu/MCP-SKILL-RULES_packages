@@ -204,6 +204,46 @@ test("update uses expectedGeneration for an atomic rebind", () => {
   }
 });
 
+test("route update rejects pending active wakes without changing the ledger", () => {
+  const fixture = createFixture();
+  try {
+    const first = fixture.registry.register(taskInput());
+    const pendingMessage = { messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" };
+    fixture.registry.observeMessages({
+      taskId: first.taskId,
+      expectedGeneration: first.generation,
+      messages: [pendingMessage],
+    });
+    fixture.registry.acquireWakeLease({
+      taskId: first.taskId,
+      expectedGeneration: first.generation,
+      messages: [pendingMessage],
+      wakeId: "wake-pending-route-update",
+      promptSha256: "a".repeat(64),
+    });
+    const beforePublic = fixture.registry.get(first.taskId);
+    const beforeRaw = fs.readFileSync(fixture.statePath, "utf8");
+
+    let thrown = null;
+    try {
+      fixture.registry.update({
+        taskId: first.taskId,
+        expectedGeneration: first.generation,
+        conversationId: "conversation-002",
+      });
+    } catch (error) {
+      thrown = error;
+    }
+
+    assert.deepEqual(fixture.registry.get(first.taskId), beforePublic);
+    assert.equal(fs.readFileSync(fixture.statePath, "utf8"), beforeRaw);
+    assert.ok(thrown instanceof TaskRegistryError);
+    assert.equal(thrown.code, "TASK_ROUTE_UPDATE_BLOCKED");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("task wake cooldown can be updated without changing the routing generation", () => {
   const fixture = createFixture();
   try {
@@ -229,29 +269,174 @@ test("task wake cooldown can be updated without changing the routing generation"
   }
 });
 
-test("close is idempotent and list/get return complete public records", () => {
+test("close requires explicit confirmations and a final disposition", () => {
   const fixture = createFixture();
   try {
     fixture.registry.register(taskInput());
-    fixture.registry.register(taskInput({ taskId: "task-002", conversationId: "conversation-002" }));
-    const closed = fixture.registry.close({ taskId: "task-001", expectedGeneration: 1 });
-    assert.equal(closed.status, "closed");
-    assert.equal(closed.wakePending, false);
-    assert.equal(closed.wakeSentAt, null);
-    const closedLease = fixture.registry.acquireWakeLease({
+    assert.throws(() => fixture.registry.close({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      finalClose: true,
+    }), (error) => (
+      error instanceof TaskRegistryError
+      && error.code === "CLOSE_CONFIRMATION_REQUIRED"
+      && error.details.missingConfirmations.includes("confirmPendingEmpty")
+      && error.details.missingConfirmations.includes("confirmPeerReady")
+    ));
+    assertRegistryError(
+      () => fixture.registry.close({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        confirmPendingEmpty: true,
+        confirmPeerReady: true,
+      }),
+      "CLOSE_DISPOSITION_REQUIRED",
+    );
+    assertRegistryError(
+      () => fixture.registry.close({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        confirmPendingEmpty: true,
+        confirmPeerReady: true,
+        finalClose: true,
+        successorTaskId: "task-002",
+      }),
+      "CLOSE_DISPOSITION_CONFLICT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close rejects pending messages and active wake state without clearing its ledger", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.observeMessages({
       taskId: "task-001",
       expectedGeneration: 1,
       messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
-      wakeId: "closed-wake",
-      promptSha256: "c".repeat(64),
     });
-    assert.equal(closedLease.acquired, false);
-    assert.equal(closedLease.reason, "closed");
+    const lease = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "wake-1",
+      promptSha256: "1".repeat(64),
+    });
+    assert.throws(() => fixture.registry.close({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      confirmPendingEmpty: true,
+      confirmPeerReady: true,
+      finalClose: true,
+    }), (error) => (
+      error instanceof TaskRegistryError
+      && error.code === "TASK_CLOSE_BLOCKED"
+      && error.details.pendingMessages.length === 1
+      && error.details.activeWakes[0].wakeId === "wake-1"
+      && error.details.activeWakeId === "wake-1"
+      && error.details.wakePending === true
+    ));
+    assert.equal(fixture.registry.get("task-001").status, "open");
+    assert.equal(fixture.registry.get("task-001").activeWakeId, "wake-1");
+    assert.equal(lease.wakePending, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close rejects missing and incompatible successor tasks", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const closeWith = (successorTaskId) => fixture.registry.close({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      confirmPendingEmpty: true,
+      confirmPeerReady: true,
+      successorTaskId,
+    });
+    assertRegistryError(() => closeWith("missing-task"), "SUCCESSOR_TASK_NOT_FOUND");
+    fixture.registry.register(taskInput({
+      taskId: "task-002",
+      conversationId: "conversation-002",
+      targetMachine: "development",
+    }));
+    assertRegistryError(() => closeWith("task-002"), "SUCCESSOR_ROUTE_INCOMPATIBLE");
+    assert.equal(fixture.registry.get("task-001").status, "open");
+    assert.equal(fixture.registry.get("task-002").status, "open");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("close succeeds for final and successor dispositions while preserving normal ledgers", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.observeMessages({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+    });
+    const lease = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "wake-1",
+      promptSha256: "1".repeat(64),
+    });
+    fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [1],
+      wakeId: "wake-1",
+    });
+    const closed = fixture.registry.close({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      confirmPendingEmpty: true,
+      confirmPeerReady: true,
+      finalClose: true,
+    });
+    assert.equal(closed.status, "closed");
+    const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(stored.tasks["task-001"].messageLedger[0].status, "acked");
+    assert.equal(stored.tasks["task-001"].wakeBatches[0].wakeId, lease.activeWakeId);
+
+    fixture.registry.register(taskInput({ taskId: "task-002", conversationId: "conversation-002" }));
+    fixture.registry.register(taskInput({ taskId: "task-003", conversationId: "conversation-003" }));
+    const successorClosed = fixture.registry.close({
+      taskId: "task-002",
+      expectedGeneration: 1,
+      confirmPendingEmpty: true,
+      confirmPeerReady: true,
+      successorTaskId: "task-003",
+    });
+    assert.equal(successorClosed.status, "closed");
+    assert.equal(fixture.registry.get("task-003").status, "open");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repeated close remains idempotent after generation matching", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const closed = fixture.registry.close({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      confirmPendingEmpty: true,
+      confirmPeerReady: true,
+      finalClose: true,
+    });
+    assertRegistryError(
+      () => fixture.registry.close({ taskId: "task-001", expectedGeneration: 2 }),
+      "GENERATION_MISMATCH",
+    );
     assert.deepEqual(fixture.registry.close({ taskId: "task-001", expectedGeneration: 1 }), closed);
-    assert.equal(fixture.registry.get("missing-task"), null);
-    assert.deepEqual(fixture.registry.list({ status: "closed" }).map((task) => task.taskId), ["task-001"]);
-    assert.deepEqual(fixture.registry.list({ status: "open" }).map((task) => task.taskId), ["task-002"]);
-    assert.deepEqual(fixture.registry.list().map((task) => task.taskId), ["task-001", "task-002"]);
   } finally {
     fixture.cleanup();
   }

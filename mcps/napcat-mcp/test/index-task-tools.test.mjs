@@ -165,8 +165,15 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
 
     const closed = toolPayload(await fixture.request("tools/call", {
       name: "napcat_task_close",
-      arguments: { task_id: "语音处理", expected_generation: 2 },
+      arguments: {
+        task_id: "语音处理",
+        expected_generation: 2,
+        confirm_pending_empty: true,
+        confirm_peer_ready: true,
+        final_close: true,
+      },
     }));
+    assert.equal(closed.ok, true, JSON.stringify(closed));
     assert.equal(closed.task.status, "closed");
 
     const listed = toolPayload(await fixture.request("tools/call", {

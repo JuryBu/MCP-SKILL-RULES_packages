@@ -565,6 +565,138 @@ function requireGenerationMatch(task, input) {
   return expectedGeneration;
 }
 
+function requireCloseConfirmations(input) {
+  const missingConfirmations = [
+    "confirmPendingEmpty",
+    "confirmPeerReady",
+  ].filter((field) => input[field] !== true);
+  if (missingConfirmations.length) {
+    throw new TaskRegistryError(
+      "CLOSE_CONFIRMATION_REQUIRED",
+      "关闭任务前必须明确确认账本为空且可信对端已就绪",
+      { missingConfirmations },
+    );
+  }
+}
+
+function closeBlockers(task) {
+  const pendingMessages = (task.messageLedger ?? [])
+    .filter((message) => message.status === "pending")
+    .map((message) => ({
+      messageSeq: message.messageSeq,
+      messageAt: message.messageAt,
+      lastRemindedAt: message.lastRemindedAt,
+    }));
+  const activeWakes = (task.wakeBatches ?? [])
+    .filter((wake) => wake.status !== "complete")
+    .map((wake) => ({
+      wakeId: wake.wakeId,
+      messageSeqs: [...wake.messageSeqs],
+      leaseStartedAt: wake.leaseStartedAt,
+      sentAt: wake.sentAt,
+      status: wake.status,
+    }));
+  return {
+    pendingMessages,
+    activeWakes,
+    activeWakeId: task.activeWakeId,
+    wakePending: task.wakePending,
+  };
+}
+
+function requireEmptyCloseLedger(task) {
+  const blockers = closeBlockers(task);
+  if (
+    blockers.pendingMessages.length
+    || blockers.activeWakes.length
+    || blockers.activeWakeId !== null
+    || blockers.wakePending
+  ) {
+    throw new TaskRegistryError(
+      "TASK_CLOSE_BLOCKED",
+      `任务仍有待处理消息或唤醒，不能关闭：${task.taskId}`,
+      { taskId: task.taskId, ...blockers },
+    );
+  }
+}
+
+function requireEmptyRouteUpdateLedger(task) {
+  const blockers = closeBlockers(task);
+  if (
+    blockers.pendingMessages.length
+    || blockers.activeWakes.length
+    || blockers.activeWakeId !== null
+    || blockers.wakePending
+  ) {
+    throw new TaskRegistryError(
+      "TASK_ROUTE_UPDATE_BLOCKED",
+      `任务仍有待处理消息或唤醒，不能变更路由：${task.taskId}`,
+      { taskId: task.taskId, ...blockers },
+    );
+  }
+}
+
+function requireCloseDisposition(state, task, input) {
+  if (hasOwn(input, "finalClose") && typeof input.finalClose !== "boolean") {
+    invalidArgument("finalClose 必须是布尔值");
+  }
+  const successorTaskId = hasOwn(input, "successorTaskId")
+    ? requiredString(input.successorTaskId, "successorTaskId")
+    : null;
+  if (input.finalClose === true && successorTaskId !== null) {
+    throw new TaskRegistryError(
+      "CLOSE_DISPOSITION_CONFLICT",
+      "finalClose 与 successorTaskId 不能同时指定",
+      { taskId: task.taskId, finalClose: true, successorTaskId },
+    );
+  }
+  if (input.finalClose !== true && successorTaskId === null) {
+    throw new TaskRegistryError(
+      "CLOSE_DISPOSITION_REQUIRED",
+      "关闭任务必须指定 finalClose=true 或 successorTaskId",
+      { taskId: task.taskId },
+    );
+  }
+  if (successorTaskId === null) return;
+  if (successorTaskId === task.taskId) {
+    throw new TaskRegistryError(
+      "SUCCESSOR_TASK_SAME_AS_CURRENT",
+      "successorTaskId 必须不同于当前任务",
+      { taskId: task.taskId, successorTaskId },
+    );
+  }
+  const successor = state.tasks[successorTaskId];
+  if (!successor) {
+    throw new TaskRegistryError(
+      "SUCCESSOR_TASK_NOT_FOUND",
+      `未找到 successorTaskId：${successorTaskId}`,
+      { taskId: task.taskId, successorTaskId },
+    );
+  }
+  if (successor.status !== "open") {
+    throw new TaskRegistryError(
+      "SUCCESSOR_TASK_NOT_OPEN",
+      `successorTaskId 未处于 open 状态：${successorTaskId}`,
+      { taskId: task.taskId, successorTaskId, successorStatus: successor.status },
+    );
+  }
+  const incompatibleFields = ["localRole", "sourceMachine", "targetMachine", "trustedPeerQq"]
+    .filter((field) => successor[field] !== task[field]);
+  if (incompatibleFields.length) {
+    throw new TaskRegistryError(
+      "SUCCESSOR_ROUTE_INCOMPATIBLE",
+      "successorTaskId 的路由方向或可信对端与当前任务不兼容",
+      {
+        taskId: task.taskId,
+        successorTaskId,
+        incompatibleFields,
+        current: Object.fromEntries(incompatibleFields.map((field) => [field, task[field]])),
+        successor: Object.fromEntries(incompatibleFields.map((field) => [field, successor[field]])),
+      },
+    );
+  }
+}
+
 function resolveNow(provider, input) {
   const value = hasOwn(input, "now") ? input.now : provider();
   return toDate(value, "now");
@@ -689,6 +821,7 @@ class TaskRegistry {
       }
       const routingChanged = ROUTING_FIELDS.some((field) => nextTask[field] !== task[field]);
       if (routingChanged) {
+        requireEmptyRouteUpdateLedger(task);
         if (nextTask.generation >= Number.MAX_SAFE_INTEGER) {
           throw new TaskRegistryError("GENERATION_OVERFLOW", `任务代次已达到上限：${taskId}`, { taskId });
         }
@@ -716,21 +849,17 @@ class TaskRegistry {
 
   close(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
-      const taskId = parseTaskId(input);
-      return this.#write((state) => {
-        const task = this.#requireTask(state, taskId);
+    const taskId = parseTaskId(input);
+    return this.#write((state) => {
+      const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       if (task.status === "closed") return { changed: false, value: clonePublicTask(task) };
+      requireCloseConfirmations(input);
+      requireEmptyCloseLedger(task);
+      requireCloseDisposition(state, task, input);
       const nextTask = {
         ...task,
         status: "closed",
-        wakeBatches: [],
-        wakePending: false,
-        wakeSentAt: null,
-        wakeMessageSeq: null,
-        wakeMessageAt: null,
-        activeWakeId: null,
-        wakePromptSha256: null,
         updatedAt: resolveNow(this.now, input).toISOString(),
       };
       state.tasks[taskId] = nextTask;

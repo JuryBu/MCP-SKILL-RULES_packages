@@ -1555,7 +1555,17 @@ export async function runSupervisorService(options = {}) {
         && codexProcess.known
         && codexProcess.present
         && tasksKnown
-        && openTaskCount > 0
+        && (
+          openTaskCount > 0
+          || (() => {
+            try {
+              const control = dependencies.notifier.getControlPlaneConfig();
+              return control.enabled === true && control.machineIngressEnabled === true;
+            } catch {
+              return false;
+            }
+          })()
+        )
         && !maintenanceBlocksRouter,
       );
       let finalRouter = router;

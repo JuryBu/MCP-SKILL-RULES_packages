@@ -1,6 +1,6 @@
 # NapCat QQ 群协作 MCP（可选）
 
-这是一个固定账号、固定群聊的窄功能协作服务。AI 可以通过 NapCat OneBot HTTP API 向 QQ 群发送运行状态和文本、读取最近消息、上传或下载群文件，也可以把经过身份校验的结构化任务消息路由回已经登记的 Codex 对话。调用方不能临时指定任意群号或联系人。
+这是一个固定账号、固定任务群与私有通知目标的窄功能协作服务。AI 可以通过 NapCat OneBot HTTP API 向任务群发送运行状态和文本、读取最近消息、上传或下载群文件，也可以把经过身份校验的结构化任务消息路由回已经登记的 Codex 对话。主人私聊或通知群只能由本机私有 binding 预先命名，调用方不能临时指定任意群号或联系人。
 
 本目录只包含 MCP 源码、示例绑定、测试和运维脚本，不包含 NapCat 本体、QQ 登录态、二维码、真实账号、真实群号、访问令牌或运行状态。接收方必须自行安装 NapCat 并在本机完成登录；broker 默认不启用本模块，只有设置 `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP=1` 后才暴露 `/napcat/mcp`。
 
@@ -12,6 +12,8 @@
 | 消息与文件 | `napcat_read_recent`、`napcat_download_file`、`napcat_send_text`、`napcat_send_file` | 按固定群读取、下载、发送与上传；任务文件会附带结构化索引 |
 | 任务账本 | `napcat_task_register`、`napcat_task_update`、`napcat_task_status`、`napcat_task_list` | 维护任务、Codex 对话、角色、可信对端、代次和唤醒冷却 |
 | 任务完成 | `napcat_task_ack`、`napcat_task_close` | 处理完明确消息序号后确认，任务结束后关闭路由 |
+| 送达与重连 | `napcat_delivery_status`、`napcat_connection_request` | 查询对端机器/对话送达状态，或向已知对端对话提出重新建链请求 |
+| 主人通知 | `napcat_owner_route_register`、`napcat_owner_alert`、`napcat_owner_route_close` | 把简短提醒发到预配置私聊/群聊，并把带路由标记的回复送回指定 Codex 对话 |
 | 预览与训练事件 | `napcat_preview_*`、`napcat_send_training_event` | 在发送前预览正文，或发送受去重保护的训练状态 |
 
 ## 本机配置
@@ -25,6 +27,7 @@
 | `NAPCAT_HTTP_URL` | `http://127.0.0.1:3010` | 仅回环地址的 OneBot HTTP 服务 |
 | `NAPCAT_ACCESS_TOKEN` | 不写进同步包 | OneBot Bearer token |
 | `NAPCAT_TASK_REGISTRY_PATH` | data root `state/task-registry.json` | 任务、对话、代次、游标、租约与冷却账本 |
+| `NAPCAT_CONTROL_STATE_PATH` | data root `state/control-state.json` | 送达回执、重连请求、主人回复路由与控制消息去重状态 |
 | `NAPCAT_TASK_ROUTER_INTERVAL_MS` | `30000` | 固定群任务扫描间隔 |
 | `NAPCAT_MCP_BINDING_PATH` | `%USERPROFILE%\.codex-toolkit\napcat-mcp\binding.json` | 固定账号和群绑定 |
 | `NAPCAT_MCP_STATE_PATH` | `%USERPROFILE%\.codex-toolkit\napcat-mcp\state\dedupe.json` | 通知去重状态 |
@@ -63,11 +66,21 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 `napcat_send_file` 提供 `task_id`、来源机器和目标机器时，会在文件上传并完成群文件核验后追加 `[Codex][TASK_FILE_INDEX]`，记录文件名、字节数、SHA256 和文件标识。索引发送失败时不会重新上传已核验文件，重试只补索引。
 
-参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
+参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。`task_id` 应表示长期任务身份，不把每次运行日期当成默认组成；重复实验日期、时间和批次放在 `run_id` 或当前 generation 中。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
 
 唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；提交成功后应用每任务默认 10 分钟冷却。冷却期间到达的新消息进入持久消息账本，不会重置冷却截止时间；时间满足后只合并唤醒一次。没有新消息时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送。
 
-每次唤醒携带 `wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack` 回传当前 generation、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务结束必须调用 `napcat_task_close`。
+每次唤醒携带 `wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack` 回传当前 generation、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
+
+`napcat_task_close` 不再接受无条件关闭：调用方必须确认本地没有 pending/active wake、对端已经完成最终交接，并明确这是最终关闭，或给出已经登记、方向兼容且双方握手成功的 `successor_task_id`。任务迁移固定采用「两端先登记后继任务并互发握手 → 验证新路由 → 再关闭旧任务」的顺序；关闭后的任务不会继续扫描或唤醒，不能把先关旧任务当成建新连接的捷径。
+
+## 送达回执、重连请求与主人通知
+
+结构化任务文本和文件索引都会得到稳定 `delivery_id`。接收端路由器识别到可信消息后自动发送 `machine_received`，成功把消息提交给绑定 Codex 对话后再发送 `conversation_received`；发送端用 `napcat_delivery_status` 查询这两个传输状态。它们只回答「对端机器看到了」「对端对话收到引导」，不会确认模型已经理解或完成业务，因此绝不能代替上面的显式 `napcat_task_ack`。
+
+意外关闭任务但仍知道对端 `conversation_id` 时，可以调用 `napcat_connection_request`。它向固定任务群发送带 `request_id`、建议 `task_id` 和目标对话的请求，对端只校验可信机器并唤醒该对话；工具不会替对端创建、更新或绑定任务。对端仍需自行核对身份并调用 `napcat_task_register`，两边完成握手后才能恢复正式消息或关闭旧连接。
+
+主人通知先用 `napcat_owner_route_register` 把 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短提醒。私聊回复必须来自 binding 指定账号并保留「路由」标记；群聊回复还必须 @ 本机 NapCat 账号并保留 `route_key`。扫描器只把匹配的回复送回绑定对话，普通私聊、普通群消息和其它路由不会触发。真实 QQ、群号和目标映射只存在于 schema v2 binding，公开示例只放占位值。
 
 维护升级默认等待所有活跃唤醒自然完成；确需在任务暂停期间保留未 ACK 唤醒时，可显式给 `ops/update-codex-napcat-bridge.ps1` 传 `-PreserveActiveWakes`。脚本会先进入维护态并停止任务路由器，再校验任务绑定、generation、逐消息账本和唤醒批次完全不变，之后才允许切换代码；它不会替模型 ACK，也不会清除待处理消息。
 
@@ -94,7 +107,7 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 
 ## 安全更新与回滚
 
-公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。
+公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、控制状态、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。`control-state.json` 固定与任务账本共享 data root；升级器会备份并迁移旧代码目录中的同名状态，若两处同时存在且内容不同则拒绝切换，保留两份文件等待人工核对。
 
 监督器和登录脚本在尝试快速登录前会同时检查 `launcher-user.bat` 与 `napcat.mjs`。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
 

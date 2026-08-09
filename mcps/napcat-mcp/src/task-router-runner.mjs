@@ -6,6 +6,8 @@ import { createNapCatNotifier } from "./core.mjs";
 import { createCodexThreadBridge } from "./codex-thread-bridge.mjs";
 import { createTaskRegistry } from "./task-registry.mjs";
 import { createTaskRouter } from "./task-router.mjs";
+import { createControlState } from "./control-state.mjs";
+import { createControlPlane } from "./control-plane.mjs";
 
 export const DEFAULT_SCAN_INTERVAL_MS = 30_000;
 export const DEFAULT_MAX_BACKOFF_MS = 300_000;
@@ -491,6 +493,8 @@ export function createTaskRouterDependencies(options = {}) {
   const notifierFactory = options.createNotifier ?? createNapCatNotifier;
   const bridgeFactory = options.createBridge ?? createCodexThreadBridge;
   const routerFactory = options.createRouter ?? createTaskRouter;
+  const controlStateFactory = options.createControlState ?? createControlState;
+  const controlPlaneFactory = options.createControlPlane ?? createControlPlane;
   const bridgeOptions = resolveAutomaticProxyBridgeOptions(
     registryPath,
     options.bridgeOptions,
@@ -506,11 +510,24 @@ export function createTaskRouterDependencies(options = {}) {
     cwd,
     env,
   });
+  const controlState = options.controlState ?? controlStateFactory({
+    statePath: options.controlStatePath
+      ?? env.NAPCAT_CONTROL_STATE_PATH
+      ?? path.join(path.dirname(registryPath), "control-state.json"),
+    ...(options.controlStateOptions ?? {}),
+  });
+  const controlPlane = options.controlPlane ?? controlPlaneFactory({
+    ...(options.controlPlaneOptions ?? {}),
+    notifier,
+    bridge,
+    state: controlState,
+  });
   const router = options.router ?? routerFactory({
     ...(options.routerOptions ?? {}),
     registry,
     notifier,
     bridge,
+    controlPlane,
     isMaintenanceActive: () => {
       if (!options.maintenanceFilePath) return false;
       const maintenance = readExistingJson(options.maintenanceFilePath, options.fsImpl ?? fs);
@@ -523,7 +540,7 @@ export function createTaskRouterDependencies(options = {}) {
   if (!router || typeof router.scanOnce !== "function") {
     throw new Error("task router 必须提供 scanOnce() 方法");
   }
-  return { router, registry, notifier, bridge };
+  return { router, registry, notifier, bridge, controlState, controlPlane };
 }
 
 function parseOpenTaskCount(scanResult) {
@@ -534,6 +551,10 @@ function parseOpenTaskCount(scanResult) {
     throw error;
   }
   return count;
+}
+
+function parseKeepAlive(scanResult) {
+  return scanResult?.keepAlive === true;
 }
 
 function scanResultError(scanResult) {
@@ -723,6 +744,7 @@ export async function runTaskRouterService(options = {}) {
         persist({ state: "running", inFlightScan: true, maintenance: null });
         const scanResult = await components.router.scanOnce();
         const openTaskCount = parseOpenTaskCount(scanResult);
+        const keepAlive = parseKeepAlive(scanResult);
         const scanAt = typeof scanResult?.scannedAt === "string" && scanResult.scannedAt
           ? scanResult.scannedAt
           : nowIso(now);
@@ -738,8 +760,9 @@ export async function runTaskRouterService(options = {}) {
         status = {
           ...status,
           lastScanAt: scanAt,
-          nextScanAt: openTaskCount > 0 ? nextTimeIso(now, scanIntervalMs) : null,
+          nextScanAt: openTaskCount > 0 || keepAlive ? nextTimeIso(now, scanIntervalMs) : null,
           openTaskCount,
+          keepAlive,
           lastError: null,
           state: automationPause ? "maintenance" : "running",
           inFlightScan: false,
@@ -751,9 +774,10 @@ export async function runTaskRouterService(options = {}) {
           type: "scan",
           pid,
           openTaskCount,
+          keepAlive,
           wakeCount: Number(scanResult?.wakeCount ?? 0),
         }, fsImpl);
-        if (openTaskCount === 0) {
+        if (openTaskCount === 0 && !keepAlive) {
           stopReason = "no_open_tasks";
           break;
         }
