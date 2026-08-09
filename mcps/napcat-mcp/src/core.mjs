@@ -980,6 +980,20 @@ export function createNapCatNotifier(options = {}) {
           groupName: binding.groupName,
           expectedMemberCount: binding.expectedMemberCount,
         },
+        controlPlane: {
+          enabled: binding.controlPlane.enabled,
+          machineIngressEnabled: binding.controlPlane.machineIngressEnabled,
+          machineIngressReady: Boolean(
+            binding.controlPlane.enabled
+            && binding.controlPlane.machineIngressEnabled
+            && binding.controlPlane.localMachine
+            && binding.controlPlane.trustedPeerQq
+          ),
+          localMachine: binding.controlPlane.localMachine,
+          trustedPeerConfigured: Boolean(binding.controlPlane.trustedPeerQq),
+          targetCount: Object.keys(binding.controlPlane.targets).length,
+          defaultTargetKey: binding.controlPlane.defaultTargetKey,
+        },
         runtimeStatus,
         identity,
         identityError,
@@ -997,6 +1011,20 @@ export function createNapCatNotifier(options = {}) {
           expectedSelfId: binding.expectedSelfId,
           groupId: binding.groupId,
           groupName: binding.groupName,
+        },
+        controlPlane: {
+          enabled: binding.controlPlane.enabled,
+          machineIngressEnabled: binding.controlPlane.machineIngressEnabled,
+          machineIngressReady: Boolean(
+            binding.controlPlane.enabled
+            && binding.controlPlane.machineIngressEnabled
+            && binding.controlPlane.localMachine
+            && binding.controlPlane.trustedPeerQq
+          ),
+          localMachine: binding.controlPlane.localMachine,
+          trustedPeerConfigured: Boolean(binding.controlPlane.trustedPeerQq),
+          targetCount: Object.keys(binding.controlPlane.targets).length,
+          defaultTargetKey: binding.controlPlane.defaultTargetKey,
         },
         error: publicError(error),
       };

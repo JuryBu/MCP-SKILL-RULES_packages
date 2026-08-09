@@ -23,7 +23,7 @@
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
-| `napcat-mcp` | 0.2.0 | 可选 QQ 群通知、任务账本、可信路由、Codex 原生未读唤醒、群文件传输、监督器与安全更新 |
+| `napcat-mcp` | 0.3.4 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、群文件传输、监督器与安全更新 |
 
 ## 重点能力
 
@@ -180,7 +180,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
-| `napcat-mcp` | 0.2.0 | Optional QQ group messaging, task ledger, trusted routing, native Codex unread wakeups, file transfer, supervisor, and guarded updates |
+| `napcat-mcp` | 0.3.4 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, file transfer, supervisor, and guarded updates |
 
 ## Highlights
 

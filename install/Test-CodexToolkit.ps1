@@ -213,6 +213,7 @@ function Test-PackageStructure {
         "mcps\\napcat-mcp\\ops\\get-napcat-supervisor-status.ps1",
         "mcps\\napcat-mcp\\ops\\get-codex-app-server-proxy-status.ps1",
         "mcps\\napcat-mcp\\ops\\get-napcat-task-router-status.ps1",
+        "mcps\\napcat-mcp\\ops\\enable-napcat-machine-ingress.ps1",
         "mcps\\napcat-mcp\\ops\\install-napcat-autostart.ps1",
         "mcps\\napcat-mcp\\ops\\remove-napcat-autostart.ps1",
         "mcps\\napcat-mcp\\ops\\reload-broker-backend.ps1",

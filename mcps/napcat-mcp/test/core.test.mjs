@@ -346,6 +346,15 @@ test("status verifies OneBot identity and fixed group", async () => {
     assert.equal(result.identity.actualSelfId, "1000000001");
     assert.equal(result.group.actualGroupName, "ExampleGroup");
     assert.equal(result.group.actualMemberCount, 4);
+    assert.deepEqual(result.controlPlane, {
+      enabled: false,
+      machineIngressEnabled: false,
+      machineIngressReady: false,
+      localMachine: "",
+      trustedPeerConfigured: false,
+      targetCount: 0,
+      defaultTargetKey: "",
+    });
     assert.ok(fixture.calls.every((call) => call.authorization === "Bearer test-token"));
   } finally {
     await fixture.close();
