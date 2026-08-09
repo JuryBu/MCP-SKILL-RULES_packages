@@ -18,7 +18,7 @@
 
 | 组件 | 版本 | 主要用途 |
 | --- | ---: | --- |
-| `memory-store` | 1.22.5 | 记忆、四宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
+| `memory-store` | 1.22.6 | 记忆、四宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
 | `sandbox` | 1.16.4 | 隔离执行、全局内存调度、按需 artifact、自适应输出、持久会话、Codex 任务与多模型 Council |
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
@@ -31,7 +31,7 @@
 ### memory-store：Conversation 与 Record 系列
 
 - `conversation_read_original` 可列出、定位、搜索、分轮读取和导出 Codex、Antigravity、Claude Code、Windsurf 对话。
-- Memory Store 1.22.5 可在 Windsurf/Antigravity 离线时列出本地 PB，通过 auto/manual/full Recall 恢复 context-only 上下文，自动迁移旧 fetch 缓存，并让范围读取保留整段本地 PB 的 AI 回复与工具调用统计。
+- Memory Store 1.22.6 可在 Windsurf/Antigravity 离线时列出本地 PB，通过 auto/manual/full Recall 恢复 context-only 上下文，自动迁移旧版或重复轮号的 fetch 缓存，并让范围读取保留整段本地 PB 的 AI 回复与工具调用统计。
 - 跨宿主 Conversation 需要接收方自行授权访问对应宿主的本地对话目录；工具包不会携带发送方数据，也不会把读取权限扩展到未配置的机器或账户。
 - `conversation_golden_extract` 从长对话中提取可复用的高价值片段。
 - `record_manage` 维护结构化工作记录，支持读取视图、阶段更新、所有权审计与后台生成。
@@ -176,7 +176,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 
 | Component | Version | Purpose |
 | --- | ---: | --- |
-| `memory-store` | 1.22.5 | Memory, four-host Conversation/Recall, Record, Golden Extract, Stage Guard, scheduling recovery, and host routing |
+| `memory-store` | 1.22.6 | Memory, four-host Conversation/Recall, Record, Golden Extract, Stage Guard, scheduling recovery, and host routing |
 | `sandbox` | 1.16.4 | Isolated execution, global memory admission, on-demand artifacts, adaptive output, sessions, Codex tasks, and multi-model Council |
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
@@ -187,7 +187,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 ## Highlights
 
 - Conversation tools can locate, search, read by round, and export conversations from all four hosts.
-- Memory Store 1.22.5 can list local Windsurf/Antigravity PB files offline, restore context-only history through auto/manual/full Recall, migrate old fetch caches, and preserve full local PB response/tool totals during range reads.
+- Memory Store 1.22.6 can list local Windsurf/Antigravity PB files offline, restore context-only history through auto/manual/full Recall, migrate old or duplicate-round fetch caches, and preserve full local PB response/tool totals during range reads.
 - Cross-host conversation access requires receiver-granted access to each host's local conversation directory; no sender data or remote account access is bundled.
 - Record, Golden Extract, Stage Guard, ownership checks, background recovery, and stable task IDs support long engineering workflows.
 - Memory Store 1.21.1 adds production scheduling, source-evidence tracking, startup barriers, commit protocols, provider admission/control, and unknown-chain migration for recoverable multi-host Record work.

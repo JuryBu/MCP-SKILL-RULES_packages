@@ -325,7 +325,7 @@ function getRoundUserMessages(round: ConversationRound): ConversationUserMessage
  * 合并由旧宿主解析器拆开的连续人类消息轮次，并保留旧序号映射。
  * 宿主仍可继续传入旧 ConversationRound；调用方在接入点按需使用本函数即可。
  */
-export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[]): ConversationRound[] {
+export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], startRound = 1): ConversationRound[] {
     const merged: ConversationRound[] = [];
     for (const source of sourceRounds) {
         const next: ConversationRound = {
@@ -363,7 +363,7 @@ export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[]): 
         }
         merged.push(next);
     }
-    return merged.map((round, index) => ({ ...round, roundIndex: index + 1 }));
+    return merged.map((round, index) => ({ ...round, roundIndex: startRound + index }));
 }
 
 // ===== 格式化输出 =====

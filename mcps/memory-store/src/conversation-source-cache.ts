@@ -174,6 +174,16 @@ interface RoundOffsetIndex {
     entries: RoundOffset[];
 }
 
+function hasUniquePositiveRoundNumbers(index: RoundOffsetIndex, expectedCount: number): boolean {
+    if (index.version !== 1 || !Array.isArray(index.entries) || index.entries.length !== expectedCount) return false;
+    const roundNumbers = new Set<number>();
+    for (const entry of index.entries) {
+        if (!Number.isInteger(entry.round) || entry.round < 1 || roundNumbers.has(entry.round)) return false;
+        roundNumbers.add(entry.round);
+    }
+    return true;
+}
+
 interface ConversationSourceCacheManifest {
     format: typeof CONVERSATION_SOURCE_CACHE_FORMAT;
     key: ConversationSourceCacheKey;
@@ -407,10 +417,14 @@ function readCachedInternal<TSnapshot>(
     if (!manifest) return null;
     if (options.expectedFingerprint !== undefined && !fingerprintsMatch(manifest.fingerprint, options.expectedFingerprint)) return null;
 
-    const snapshotBytes = readVerifiedFile(entryDirectory(options.key), manifest.files.snapshot);
-    if (!snapshotBytes) return null;
+    const directory = entryDirectory(options.key);
+    const snapshotBytes = readVerifiedFile(directory, manifest.files.snapshot);
+    const indexBytes = readVerifiedFile(directory, manifest.files.roundIndex);
+    if (!snapshotBytes || !indexBytes || !verifyFileDescriptorSize(directory, manifest.files.rounds)) return null;
 
     try {
+        const index = JSON.parse(indexBytes.toString("utf8")) as RoundOffsetIndex;
+        if (!hasUniquePositiveRoundNumbers(index, manifest.roundCount)) throw new Error("invalid round offset index");
         return {
             ...cacheState(manifest),
             snapshot: JSON.parse(snapshotBytes.toString("utf8")) as TSnapshot,
@@ -502,6 +516,7 @@ export function createConversationSourceCacheRoundSpool<TRound>(options: {
     const recordProjectionHash = recordProjectionFileDescriptor === undefined ? undefined : createHash("sha256");
     const entries: RoundOffset[] = [];
     const recordProjectionEntries: RoundOffset[] = [];
+    const roundNumbers = new Set<number>();
     let byteOffset = 0;
     let recordProjectionByteOffset = 0;
     let roundCount = 0;
@@ -534,6 +549,10 @@ export function createConversationSourceCacheRoundSpool<TRound>(options: {
             if (!Number.isInteger(roundNumber) || roundNumber < 1) {
                 throw new Error(`round number at index ${roundCount} must be a positive integer`);
             }
+            if (roundNumbers.has(roundNumber)) {
+                throw new Error(`round number ${roundNumber} is duplicated at index ${roundCount}`);
+            }
+            roundNumbers.add(roundNumber);
             const line = Buffer.from(`${serializeJson(round, `round at index ${roundCount}`)}\n`, "utf8");
             let written = 0;
             while (written < line.length) {
@@ -831,7 +850,7 @@ export function iterateCachedConversationSourceCacheRounds<TRound = unknown>(
     let index: RoundOffsetIndex;
     try {
         index = JSON.parse(indexBytes.toString("utf8")) as RoundOffsetIndex;
-        if (index.version !== 1 || !Array.isArray(index.entries)) throw new Error("invalid round offset index");
+        if (!hasUniquePositiveRoundNumbers(index, manifest.roundCount)) throw new Error("invalid round offset index");
     } catch {
         diagnostics.corruptions += 1;
         return null;
@@ -920,7 +939,7 @@ export function readConversationSourceCacheRecordProjection<TProjection = unknow
             const indexBytes = readVerifiedFile(directory, manifest.files.recordProjectionIndex);
             if (!indexBytes) return null;
             const index = JSON.parse(indexBytes.toString("utf8")) as RoundOffsetIndex;
-            if (index.version !== 1 || !Array.isArray(index.entries) || index.entries.length !== manifest.roundCount) {
+            if (!hasUniquePositiveRoundNumbers(index, manifest.roundCount)) {
                 throw new Error("Record projection offset index is invalid");
             }
             const selected = index.entries.filter(entry => entry.round >= startRound && entry.round <= endRound);

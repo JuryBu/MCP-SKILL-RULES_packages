@@ -1,4 +1,4 @@
-# MCP Memory Store v1.22.5
+# MCP Memory Store v1.22.6
 
 AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 

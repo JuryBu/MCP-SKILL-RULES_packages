@@ -594,7 +594,7 @@ async function tryBuildIncrementalConversation(
                 if (!prefix) throw new Error("Codex 增量更新无法读取上一代 fetch 缓存前缀");
                 for (const round of prefix.rounds) appendRound(round);
             }
-            for (const round of mergeConsecutiveHumanRounds(tail.rounds)) appendRound(round);
+            for (const round of mergeConsecutiveHumanRounds(tail.rounds, tail.replaceFromRound)) appendRound(round);
         } catch (error) {
             spool.abort();
             throw error;
@@ -702,7 +702,7 @@ async function tryBuildIncrementalConversation(
         })
         : null;
     if (tail.replaceFromRound > 1 && !prefix) return null;
-    const normalizedTail = mergeConsecutiveHumanRounds(tail.rounds);
+    const normalizedTail = mergeConsecutiveHumanRounds(tail.rounds, tail.replaceFromRound);
     const totalSteps = normalizedTail.at(-1)?.endStep || previous.snapshot.totalSteps;
     return buildClaudePrepared(
         [...(prefix ? [prefix.rounds] : []), normalizedTail],
