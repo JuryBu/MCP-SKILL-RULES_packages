@@ -50,6 +50,7 @@ function Start-Supervisor {
   if (-not (Test-Path -LiteralPath $Pythonw)) { throw "Versioned Python runtime not found: $Pythonw" }
   New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
   if (Test-Path -LiteralPath $StopPath) { Remove-Item -LiteralPath $StopPath -Force }
+  $launchStartedAt = [DateTimeOffset]::UtcNow
   $arguments = @(
     "-m", "wechat_docs_mcp.supervisor",
     "--data-root", ('"' + $DataRoot + '"'),
@@ -62,8 +63,18 @@ function Start-Supervisor {
   do {
     Start-Sleep -Milliseconds 250
     $runtime = Read-Runtime
-    if ($null -ne $runtime -and [int]$runtime.pid -eq $process.Id) {
-      return [ordered]@{ status = "started"; pid = $process.Id; healthy = $runtime.healthy -eq $true; errorCode = $runtime.errorCode }
+    if ($null -ne $runtime -and [int]$runtime.pid -gt 0) {
+      $runtimeProcess = Get-Process -Id ([int]$runtime.pid) -ErrorAction SilentlyContinue
+      $runtimeStartedAt = if ($runtime.startedAt) { [DateTimeOffset]::Parse([string]$runtime.startedAt) } else { [DateTimeOffset]::MinValue }
+      if ($null -ne $runtimeProcess -and $runtimeStartedAt -ge $launchStartedAt.AddSeconds(-2) -and $runtime.stopped -ne $true) {
+        return [ordered]@{
+          status = "started"
+          pid = $runtimeProcess.Id
+          launcherPid = $process.Id
+          healthy = $runtime.healthy -eq $true
+          errorCode = $runtime.errorCode
+        }
+      }
     }
   } while ([DateTimeOffset]::UtcNow -lt $deadline -and -not $process.HasExited)
   throw "Supervisor did not publish a matching runtime state within 15 seconds"
