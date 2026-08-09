@@ -470,6 +470,26 @@ function oneBotControlSegments(message) {
       }
     }
   }
+  const rawMessage = typeof message?.raw_message === "string"
+    ? message.raw_message
+    : typeof message?.message === "string"
+      ? message.message
+      : "";
+  for (const match of rawMessage.matchAll(/\[CQ:(at|reply)(?:,([^\]]*))?\]/g)) {
+    const attributes = {};
+    for (const part of String(match[2] ?? "").split(",")) {
+      const separator = part.indexOf("=");
+      if (separator <= 0) continue;
+      attributes[part.slice(0, separator)] = decodeCqValue(part.slice(separator + 1));
+    }
+    if (match[1] === "at") {
+      const userId = String(attributes.qq ?? attributes.user_id ?? "");
+      if (userId) mentionedUserIds.push(userId);
+    }
+    if (match[1] === "reply" && !replyMessageId) {
+      replyMessageId = String(attributes.id ?? attributes.message_id ?? "");
+    }
+  }
   return {
     mentionedUserIds: [...new Set(mentionedUserIds)],
     replyMessageId,

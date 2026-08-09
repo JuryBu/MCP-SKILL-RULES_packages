@@ -473,7 +473,7 @@ export function createControlPlane(options = {}) {
       ...sent,
       level,
       replyRoute,
-      replyMode: target.type === "group" ? "quote_and_mention" : "latest_private_anchor",
+      replyMode: target.type === "group" ? "quote_and_mention" : "quote_only",
       replyHint,
     };
   }
@@ -514,18 +514,9 @@ export function createControlPlane(options = {}) {
         const quotedAlert = message.replyMessageId
           ? state.getOwnerAlertMessage(String(message.replyMessageId))
           : null;
-        const latestPrivateAlert = history.target.type === "private"
-          && !quotedAlert
-          && !message.routeKey
-          ? state.getLatestOwnerAlertMessageForTarget(targetKey, readyRoutes.map((route) => route.routeKey))
-          : { message: null, ambiguous: false };
-        if (latestPrivateAlert.ambiguous) {
-          results.push({ outcome: "owner_private_route_ambiguous", targetKey, messageSeq: Number(message.messageSeq) });
-          continue;
-        }
         const resolvedRouteKey = quotedAlert?.targetKey === targetKey
           ? quotedAlert.routeKey
-          : message.routeKey || latestPrivateAlert.message?.routeKey;
+          : null;
         if (!resolvedRouteKey) continue;
         const route = readyRoutes.find((candidate) => candidate.routeKey === resolvedRouteKey);
         if (!route) continue;
@@ -558,7 +549,7 @@ export function createControlPlane(options = {}) {
             threadId: route.conversationId,
             prompt,
             wakeId,
-            taskId: route.taskId || "owner-reply",
+            taskId: route.taskId || `owner-reply:${route.routeKey}`,
             generation: 1,
             localRole: configuration.localMachine,
             sourceMachine: "owner",

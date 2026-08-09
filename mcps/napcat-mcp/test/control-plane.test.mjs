@@ -705,7 +705,7 @@ test("owner private and group replies require their configured sender or mention
     });
     assert.equal(privateAlert.messageId, 500);
     assert.equal(groupAlert.messageId, 501);
-    assert.equal(privateAlert.replyMode, "latest_private_anchor");
+    assert.equal(privateAlert.replyMode, "quote_only");
     assert.equal(groupAlert.replyMode, "quote_and_mention");
     assert.deepEqual(
       fixture.configuredSends.map((send) => send.message),
@@ -749,7 +749,7 @@ test("owner private and group replies require their configured sender or mention
   }
 });
 
-test("an unquoted private reply follows the latest alert for the same target", async () => {
+test("an unquoted private reply is ignored instead of guessing the latest route", async () => {
   let now = new Date(BASE_TIME);
   const fixture = createFixture({
     now: () => new Date(now),
@@ -788,16 +788,68 @@ test("an unquoted private reply follows the latest alert for the same target", a
     }]);
 
     const scan = await fixture.controlPlane.scanOwnerReplies();
-    assert.deepEqual(scan.results, [{
-      outcome: "owner_reply_delivered",
-      routeKey: "latest-route",
-      messageSeq: 1852008078,
-    }]);
-    assert.equal(fixture.wakeCalls.length, 1);
-    assert.equal(fixture.wakeCalls[0].threadId, "conversation-latest");
-    assert.match(fixture.wakeCalls[0].prompt, /受到/);
+    assert.deepEqual(scan.results, []);
+    assert.equal(fixture.wakeCalls.length, 0);
     assert.equal(fixture.state.getOwnerRoute("older-route").lastInboundMessageSeq, 0);
-    assert.equal(fixture.state.getOwnerRoute("latest-route").lastInboundMessageSeq, 1852008078);
+    assert.equal(fixture.state.getOwnerRoute("latest-route").lastInboundMessageSeq, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner routes without business task ids use distinct bridge subscriptions", async () => {
+  const fixture = createFixture();
+  try {
+    await fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-private",
+      target_key: "owner-private",
+    });
+    await fixture.controlPlane.registerOwnerRoute({
+      route_key: "group-route",
+      conversation_id: "conversation-group",
+      target_key: "owner-group",
+    });
+    await fixture.controlPlane.sendOwnerAlert({
+      route_key: "private-route",
+      summary: "private alert",
+      dedupe_key: "private-alert-distinct-subscription",
+    });
+    await fixture.controlPlane.sendOwnerAlert({
+      route_key: "group-route",
+      summary: "group alert",
+      dedupe_key: "group-alert-distinct-subscription",
+    });
+    fixture.targetHistory.set("owner-private", [{
+      isSelf: false,
+      replyMessageId: "500",
+      senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+      messageSeq: 31,
+      time: BASE_TIME,
+      text: "private reply",
+      mentionedUserIds: [],
+    }]);
+    fixture.targetHistory.set("owner-group", [{
+      isSelf: false,
+      replyMessageId: "501",
+      senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+      messageSeq: 32,
+      time: BASE_TIME,
+      text: "group reply",
+      mentionedUserIds: ["1000000001"],
+    }]);
+
+    const scan = await fixture.controlPlane.scanOwnerReplies();
+
+    assert.deepEqual(scan.results.map((result) => result.outcome), [
+      "owner_reply_delivered",
+      "owner_reply_delivered",
+    ]);
+    assert.deepEqual(fixture.wakeCalls.map((call) => call.taskId), [
+      "owner-reply:private-route",
+      "owner-reply:group-route",
+    ]);
+    assert.notEqual(fixture.wakeCalls[0].taskId, fixture.wakeCalls[1].taskId);
   } finally {
     fixture.cleanup();
   }
@@ -806,7 +858,7 @@ test("an unquoted private reply follows the latest alert for the same target", a
 test("owner replies with out-of-order message_seq are delivered exactly once each", async () => {
   const firstReply = {
     isSelf: false,
-    routeKey: "private-route",
+    replyMessageId: "500",
     senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
     messageSeq: 21,
     time: BASE_TIME,
@@ -815,7 +867,7 @@ test("owner replies with out-of-order message_seq are delivered exactly once eac
   };
   const secondReply = {
     isSelf: false,
-    routeKey: "private-route",
+    replyMessageId: "500",
     senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
     messageSeq: 20,
     time: "2026-08-09T00:00:01.000Z",
@@ -829,6 +881,11 @@ test("owner replies with out-of-order message_seq are delivered exactly once eac
       conversation_id: "conversation-private",
       task_id: "stable-task-private",
       target_key: "owner-private",
+    });
+    await fixture.controlPlane.sendOwnerAlert({
+      route_key: "private-route",
+      summary: "回复顺序测试",
+      dedupe_key: "owner-order-alert",
     });
 
     fixture.targetHistory.set("owner-private", [firstReply]);
@@ -906,6 +963,7 @@ test("new owner route baselines existing history and delivers only later replies
 
     fixture.targetHistory.set("owner-private", [oldReply, {
       ...oldReply,
+      replyMessageId: "500",
       messageSeq: 102,
       time: "2026-08-09T00:00:01.000Z",
       text: "new reply",
@@ -966,8 +1024,8 @@ test("migrated open owner route establishes a baseline on its first background s
 test("standalone owner media stays buffered until explicit text arrives", async () => {
   const media = {
     isSelf: false,
-    replyMessageId: "",
-    routeKey: "private-route",
+    replyMessageId: "500",
+    routeKey: "",
     senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
     messageSeq: 201,
     time: BASE_TIME,
@@ -983,6 +1041,11 @@ test("standalone owner media stays buffered until explicit text arrives", async 
       route_key: "private-route",
       conversation_id: "conversation-private",
       target_key: "owner-private",
+    });
+    await fixture.controlPlane.sendOwnerAlert({
+      route_key: "private-route",
+      summary: "请结合后续媒体回复",
+      dedupe_key: "owner-media-alert",
     });
     fixture.targetHistory.set("owner-private", [media]);
     assert.deepEqual((await fixture.controlPlane.scanOwnerReplies()).results, [{
