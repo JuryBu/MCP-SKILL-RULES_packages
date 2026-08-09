@@ -128,6 +128,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 
 更新器先从当前进程或 broker 私有配置解析真实 `MCP_SDK_ROOT`；训练机只有 `CODEX_TOOLKIT_BROKER_ROOT` 时，也会按 broker 的真实目录布局，从其父目录下的同级 `memory-store/node_modules` 推导 SDK。路径缺失时直接拒绝升级；路径有效后，先在独立候选目录执行 `npm ci`、语法检查和完整测试，三项全部通过才创建维护标记、等待或保护 `wakePending/activeWakeId`、备份任务账本与私有环境并进入安装。候选检查失败时只删除隔离候选，不写维护状态、不停止 task router、watchdog、透明代理或 App Server，不修改或重载 broker，也不中断当前 Codex。候选通过后才替换公开代码，停止并恢复实际需要切换的 router/supervisor/proxy，最后只重载 broker 的 NapCat backend。broker PID 和其他 MCP 前端 session 保持不变。更新前后会比较每个任务的对话绑定、角色、可信对端、generation、open/closed 状态、last seen/ACK、冷却、租约和 active wake，任何意外变化都会停止完成流程并留下告警。更新输出中的 `sourceCommit`、`activated` 和 `pendingActivation` 是运行态依据：只有 `activated=true` 且 `pendingActivation=false` 才表示新版本已经运行，候选写入或文件复制完成不能冒充热重载完成。
 
+监督器恢复 broker 时优先读取受管 `service-manifest.json` 中的 `broker.startScript`，并要求 `broker.brokerScript` 的父目录与本次传入的 `BrokerRoot` 完全一致；这样 NapCat `CodeRoot` 与便携 broker release 分离安装时不会再从错误目录猜启动器。清单缺字段、路径不存在或归属不一致都会在启动前安全拒绝，不会误拉起另一套 broker。
+
 便携同步包的顶层入口源码位于 `package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1`。它不负责在线修改 broker：`-ValidateOnly` 可在 broker 更新前先做无运行态副作用的 NapCat 候选预检；正式安装时再逐文件证明目标机 broker 已由 `Update-CodexMcpBroker.ps1` 更新到与包内相同的快照，然后调用受保护更新器。证明失败或候选验证失败时，它不会停止 watchdog、透明代理或 App Server，不复制 broker 文件，也不重启计划任务；这条入口必须随公开源码和同步包一起测试，不能只验证内部 updater。
 
 便携包升级顺序固定为：先运行 `APPLY-NAPCAT-APPSERVER-UPGRADE.ps1 -ValidateOnly`，确认候选源码、依赖与测试全部通过；再运行 `Update-CodexMcpBroker.ps1` 更新共享 broker；最后运行不带 `-ValidateOnly` 的 NapCat 升级入口完成受保护切换。不得把 broker 更新或任何停服动作放在候选验证之前。

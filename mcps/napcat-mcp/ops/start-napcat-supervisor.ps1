@@ -44,16 +44,53 @@ $StopFilePath = Join-Path $DataRoot "state\supervisor.stop"
 $LockPath = Join-Path $DataRoot "state\supervisor.lock"
 $AutomationMaintenancePath = Join-Path $DataRoot "state\task-router.maintenance.json"
 $AutomationAlertPath = Join-Path $DataRoot "state\automation-alert.json"
-$PortableBrokerStartScript = Join-Path $ToolkitRoot "install\Start-CodexMcpBroker.ps1"
-$FlatBrokerStartScript = Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1"
-$BrokerStartScript = if (Test-Path -LiteralPath $PortableBrokerStartScript) {
-  $PortableBrokerStartScript
-} else {
-  $FlatBrokerStartScript
-}
 $LoginScript = Join-Path $NapCatMcpRoot "ops\start-napcat-login.ps1"
 $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT = $DataRoot
 $env:CODEX_TOOLKIT_BROKER_ROOT = $BrokerRoot
+
+function Get-ServiceManifestPath {
+  $ConfiguredManifestPath = [string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST
+  if (-not [string]::IsNullOrWhiteSpace($ConfiguredManifestPath)) {
+    return [System.IO.Path]::GetFullPath($ConfiguredManifestPath)
+  }
+  return Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+}
+
+function Resolve-BrokerStartScript {
+  $ResolvedBrokerRoot = [System.IO.Path]::GetFullPath($BrokerRoot).TrimEnd('\')
+  $ServiceManifestPath = Get-ServiceManifestPath
+  if (Test-Path -LiteralPath $ServiceManifestPath -PathType Leaf) {
+    try {
+      $ServiceManifest = Get-Content -LiteralPath $ServiceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $ManagedBrokerStartScript = [string]$ServiceManifest.broker.startScript
+      $ManagedBrokerScript = [string]$ServiceManifest.broker.brokerScript
+      if (-not [string]::IsNullOrWhiteSpace($ManagedBrokerStartScript) -or -not [string]::IsNullOrWhiteSpace($ManagedBrokerScript)) {
+        if ([string]::IsNullOrWhiteSpace($ManagedBrokerStartScript) -or [string]::IsNullOrWhiteSpace($ManagedBrokerScript)) {
+          throw "Managed broker service manifest must record both broker.startScript and broker.brokerScript: $ServiceManifestPath"
+        }
+        $ResolvedBrokerScript = [System.IO.Path]::GetFullPath($ManagedBrokerScript)
+        $ManagedBrokerRoot = [System.IO.Path]::GetFullPath((Split-Path -Parent $ResolvedBrokerScript)).TrimEnd('\')
+        if (-not $ManagedBrokerRoot.Equals($ResolvedBrokerRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+          throw "Managed broker service manifest points to a different BrokerRoot. expected=$ResolvedBrokerRoot actual=$ManagedBrokerRoot manifest=$ServiceManifestPath"
+        }
+        $ResolvedStartScript = [System.IO.Path]::GetFullPath($ManagedBrokerStartScript)
+        if (-not (Test-Path -LiteralPath $ResolvedStartScript -PathType Leaf)) {
+          throw "Managed broker start script is missing: $ResolvedStartScript"
+        }
+        return $ResolvedStartScript
+      }
+    } catch {
+      throw "Cannot resolve the managed broker start script from $ServiceManifestPath. $($_.Exception.Message)"
+    }
+  }
+
+  $PortableBrokerStartScript = Join-Path $ToolkitRoot "install\Start-CodexMcpBroker.ps1"
+  $FlatBrokerStartScript = Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1"
+  if (Test-Path -LiteralPath $PortableBrokerStartScript -PathType Leaf) { return $PortableBrokerStartScript }
+  return $FlatBrokerStartScript
+}
+
+$BrokerStartScript = Resolve-BrokerStartScript
 
 $IntervalMilliseconds = if ($IntervalSeconds -gt 0) { $IntervalSeconds * 1000 } else { 60000 }
 if ($IntervalSeconds -eq 0 -and (Test-Path -LiteralPath $PrivateEnvPath)) {
@@ -115,7 +152,7 @@ function Resolve-NodeExecutable {
   if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
     return [string]$NodeCommand.Source
   }
-  $ManifestPath = Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+  $ManifestPath = Get-ServiceManifestPath
   if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
     try {
       $ManagedNode = [string](Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).broker.nodeExe

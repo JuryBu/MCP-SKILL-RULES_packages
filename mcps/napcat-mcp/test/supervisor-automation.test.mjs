@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -122,6 +123,136 @@ test("后台启动脚本在 PATH 缺少 node 时回退到受管服务清单", ()
     assert.match(script, /Get-Command node -ErrorAction SilentlyContinue/);
     assert.doesNotMatch(script, /Get-Command node -ErrorAction Stop/);
   }
+});
+
+test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-supervisor-manifest-test-"));
+  const codeRoot = path.join(root, "code-root");
+  const napcatMcpRoot = path.join(codeRoot, "napcat-mcp");
+  const opsRoot = path.join(napcatMcpRoot, "ops");
+  const brokerReleaseRoot = path.join(root, "portable-broker-release");
+  const brokerRoot = path.join(brokerReleaseRoot, "broker");
+  const brokerScriptPath = path.join(brokerRoot, "broker.mjs");
+  const manifestStartScriptPath = path.join(brokerReleaseRoot, "install", "Start-CodexMcpBroker.ps1");
+  const decoyStartScriptPath = path.join(brokerRoot, "Start-CodexMcpBroker.ps1");
+  const serviceManifestPath = path.join(root, ".codex-toolkit", "services", "infrastructure", "service-manifest.json");
+  const startScriptPath = path.join(opsRoot, "start-napcat-supervisor.ps1");
+  const runnerPath = path.join(napcatMcpRoot, "src", "supervisor-runner.mjs");
+  const startedPids = new Set();
+
+  t.after(() => {
+    for (const pid of startedPids) {
+      try {
+        process.kill(pid);
+      } catch {
+      }
+    }
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  fs.mkdirSync(opsRoot, { recursive: true });
+  fs.copyFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), startScriptPath);
+  fs.writeFileSync(path.join(opsRoot, "start-napcat-login.ps1"), "param()\n", "utf8");
+  fs.mkdirSync(path.dirname(runnerPath), { recursive: true });
+  fs.writeFileSync(
+    runnerPath,
+    [
+      'import fs from "node:fs";',
+      'import path from "node:path";',
+      "const args = process.argv.slice(2);",
+      "const valueOf = (name) => args[args.indexOf(name) + 1];",
+      'const token = "manifest-regression-token";',
+      'const runtimeStatePath = valueOf("--runtime-state");',
+      'const lockPath = valueOf("--lock");',
+      "fs.mkdirSync(path.dirname(runtimeStatePath), { recursive: true });",
+      "fs.writeFileSync(process.env.NAPCAT_SUPERVISOR_CAPTURE_PATH, JSON.stringify({ brokerStartScript: valueOf(\"--broker-start-script\") }), \"utf8\");",
+      "fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, token }), \"utf8\");",
+      "fs.writeFileSync(runtimeStatePath, JSON.stringify({ state: \"running\", pid: process.pid, instanceToken: token }), \"utf8\");",
+      "setInterval(() => {}, 1000);",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(brokerRoot, "broker-private.env.json"), "{}\n", "utf8");
+  fs.writeFileSync(brokerScriptPath, "export {};\n", "utf8");
+  fs.mkdirSync(path.dirname(manifestStartScriptPath), { recursive: true });
+  fs.writeFileSync(manifestStartScriptPath, "Write-Output 'manifest launcher'\n", "utf8");
+  fs.writeFileSync(decoyStartScriptPath, "Write-Output 'wrong flat launcher'\n", "utf8");
+
+  const serviceManifest = {
+    broker: {
+      nodeExe: process.execPath,
+      startScript: manifestStartScriptPath,
+      brokerScript: brokerScriptPath,
+    },
+  };
+  writeJson(serviceManifestPath, serviceManifest);
+  assert.equal(path.dirname(path.resolve(serviceManifest.broker.brokerScript)), path.resolve(brokerRoot));
+
+  const inheritedEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => ![
+    "path",
+    "userprofile",
+    "codex_toolkit_node_exe",
+    "codex_toolkit_broker_root",
+    "codex_toolkit_napcat_data_root",
+    "napcat_supervisor_capture_path",
+  ].includes(key.toLowerCase())));
+  const systemRoot = process.env.SystemRoot ?? "C:\\Windows";
+
+  function runStart(runName) {
+    const dataRoot = path.join(root, runName, "data");
+    const capturePath = path.join(root, runName, "captured.json");
+    const runtimeStatePath = path.join(dataRoot, "state", "supervisor-runtime.json");
+    writeJson(path.join(dataRoot, "binding.json"), {});
+    const result = spawnSync(
+      "powershell.exe",
+      [
+        "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+        "-File", startScriptPath,
+        "-DataRoot", dataRoot,
+        "-BrokerRoot", brokerRoot,
+        "-NapCatRoot", path.join(root, "napcat-runtime"),
+      ],
+      {
+        cwd: opsRoot,
+        encoding: "utf8",
+        env: {
+          ...inheritedEnv,
+          Path: `${systemRoot}\\System32;${systemRoot}\\System32\\WindowsPowerShell\\v1.0`,
+          USERPROFILE: root,
+          CODEX_TOOLKIT_NODE_EXE: "",
+          CODEX_TOOLKIT_BROKER_ROOT: "",
+          CODEX_TOOLKIT_NAPCAT_DATA_ROOT: "",
+          NAPCAT_SUPERVISOR_CAPTURE_PATH: capturePath,
+        },
+        timeout: 30_000,
+        windowsHide: true,
+      },
+    );
+    if (fs.existsSync(runtimeStatePath)) {
+      startedPids.add(readJson(runtimeStatePath).pid);
+    }
+    return { result, capturePath };
+  }
+
+  const validRun = runStart("valid-manifest");
+  const validOutput = `${validRun.result.stdout ?? ""}\n${validRun.result.stderr ?? ""}`;
+  assert.equal(validRun.result.status, 0, validOutput);
+  assert.equal(
+    path.resolve(readJson(validRun.capturePath).brokerStartScript),
+    path.resolve(manifestStartScriptPath),
+    "supervisor must pass service-manifest broker.startScript instead of BrokerRoot\\Start-CodexMcpBroker.ps1",
+  );
+
+  serviceManifest.broker.brokerScript = path.join(root, "other-broker", "broker.mjs");
+  fs.mkdirSync(path.dirname(serviceManifest.broker.brokerScript), { recursive: true });
+  fs.writeFileSync(serviceManifest.broker.brokerScript, "export {};\n", "utf8");
+  writeJson(serviceManifestPath, serviceManifest);
+  const mismatchedRun = runStart("mismatched-broker-root");
+  const mismatchedOutput = `${mismatchedRun.result.stdout ?? ""}\n${mismatchedRun.result.stderr ?? ""}`;
+  assert.notEqual(mismatchedRun.result.status, 0, mismatchedOutput);
+  assert.equal(fs.existsSync(mismatchedRun.capturePath), false, "brokerScript outside BrokerRoot must fail before supervisor launch");
 });
 
 test("监督器计划任务同时使用登录触发与每分钟恢复触发", () => {
