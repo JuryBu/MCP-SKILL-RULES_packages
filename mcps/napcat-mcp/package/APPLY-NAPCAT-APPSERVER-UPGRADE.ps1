@@ -72,6 +72,20 @@ function Get-FileSha256 {
   }
 }
 
+function Get-CanonicalTextSha256 {
+  param([string]$Path)
+  if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+  $Text = [System.IO.File]::ReadAllText($Path)
+  $CanonicalText = $Text.TrimStart([char]0xFEFF).Replace("`r`n", "`n").Replace("`r", "`n")
+  $Bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($CanonicalText)
+  $Hasher = [System.Security.Cryptography.SHA256]::Create()
+  try {
+    return ([System.BitConverter]::ToString($Hasher.ComputeHash($Bytes))).Replace("-", "").ToLowerInvariant()
+  } finally {
+    $Hasher.Dispose()
+  }
+}
+
 function Assert-BrokerSnapshotCurrent {
   foreach ($BrokerFile in $BrokerFiles) {
     $BrokerSource = Join-Path $BrokerSourceRoot $BrokerFile
@@ -79,7 +93,9 @@ function Assert-BrokerSnapshotCurrent {
     if (-not (Test-Path -LiteralPath $BrokerTarget)) {
       throw "Installed broker file is missing: $BrokerTarget. Run Update-CodexMcpBroker.ps1 before the NapCat App Server upgrade."
     }
-    if ((Get-FileSha256 -Path $BrokerSource) -ne (Get-FileSha256 -Path $BrokerTarget)) {
+    $RawHashMatches = (Get-FileSha256 -Path $BrokerSource) -eq (Get-FileSha256 -Path $BrokerTarget)
+    $CanonicalHashMatches = (Get-CanonicalTextSha256 -Path $BrokerSource) -eq (Get-CanonicalTextSha256 -Path $BrokerTarget)
+    if (-not $RawHashMatches -and -not $CanonicalHashMatches) {
       throw "Installed broker file does not match this package: $BrokerFile. Run Update-CodexMcpBroker.ps1 first; this script will not modify a live broker before candidate validation."
     }
   }

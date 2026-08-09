@@ -222,6 +222,8 @@ test("portable package entrypoint leaves live services untouched before guarded 
   const brokerProofIndex = script.search(/\r?\n\s*Assert-BrokerSnapshotCurrent\r?\n/);
   assert.ok(brokerProofIndex >= 0 && updaterIndex > brokerProofIndex, "the installed broker snapshot must be proven before invoking the guarded updater");
   assert.match(script, /Run Update-CodexMcpBroker\.ps1 before the NapCat App Server upgrade/);
+  assert.match(script, /function Get-CanonicalTextSha256/);
+  assert.match(script, /-not \$RawHashMatches -and -not \$CanonicalHashMatches/);
   assert.doesNotMatch(script, /stop-napcat-supervisor-watchdog\.ps1/);
   assert.doesNotMatch(script, /Copy-Item -LiteralPath \$BrokerSource -Destination \$BrokerTarget/);
   assert.doesNotMatch(script, /Start-ScheduledTask -TaskName \$SupervisorTaskName/);
