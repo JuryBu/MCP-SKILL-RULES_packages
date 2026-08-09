@@ -87,7 +87,7 @@ python -m pip install -e .
 python -m pytest tests/ -v
 ```
 
-应看到 50 项全部通过、零警告。
+应看到 57 项全部通过、零警告。
 
 ### 3.3 配置环境变量
 
@@ -214,21 +214,58 @@ src.close()
 
 ## 7. 升级回滚
 
-### 7.1 升级流程
+### 7.1 离线演练
 
-1. 停止后台轮询：`wechat_poll_stop()`
-2. 备份账本：运行 `migrate_baselines` 或手动 `backup()`
-3. 更新代码：`git pull` 或覆盖源码
-4. 安装依赖：`pip install -e .`
-5. 运行测试：`pytest tests/ -v`
-6. 启动服务
+正式切换前必须使用独立目录运行 `Drill`。它复用生产切换和回滚函数，但健康检查使用本地 fixture，不访问或修改正式 service、data、broker：
 
-### 7.2 回滚
+```powershell
+& .\ops\manage-wechat-docs-release.ps1 `
+  -Action Drill `
+  -DrillRoot <disposable_absolute_path> `
+  -CandidateManifestPath <candidate_release>\service-manifest.json `
+  -ProbePython <python.exe> `
+  -TimeoutSeconds 5
+```
 
-1. 停止服务
-2. 恢复备份的 `events.sqlite3`
-3. 恢复旧代码
-4. 启动服务
+`READY_FOR_ACTIVATION` 只有在以下项目全部成立时返回：
+
+- 候选 Python 能从最终 release 路径导入项目，工具数与预期一致；
+- `validation` 缺失、为 `null`、`activeBackend` 为 `null` 三种旧 manifest 均能升级；
+- Junction 切到候选后，`activeBackend`、backend generation 和 Supervisor 状态一致；
+- 账本事件、pending、wake 和 active wake 计数不变；
+- 受保护 endpoint 的 broker PID、backend PID 和 generation 均未改变；
+- 每个成功案例主动回滚并再次通过健康检查；
+- 强制健康失败会自动回滚，active 与 last-known-good 恢复旧 release。
+
+演练目录不会自动删除，其中 `drill-summary.json`、`activation-verification.json` 和 `rollback-verification.json` 是验收证据。
+
+### 7.2 正式激活
+
+`Activate` 默认硬拒绝，必须同时提供预期旧 release、候选 release、私有 route 和显式确认开关：
+
+```powershell
+& .\ops\manage-wechat-docs-release.ps1 `
+  -Action Activate `
+  -ServiceRoot <service_root> `
+  -DataRoot <data_root> `
+  -BrokerRoot <broker_root> `
+  -CandidateReleaseId <candidate_release_id> `
+  -ExpectedCurrentReleaseId <current_release_id> `
+  -RouteId <private_route_id> `
+  -ConfirmProductionActivation
+```
+
+脚本只做 endpoint-scoped reload，不重启整个 broker。候选健康、账本快照、受保护 endpoint 和 Supervisor 全部通过后，才更新 active/candidate/last-known-good 与 manifest；每个 JSON 文件使用临时文件原子替换，跨文件一致性由失败回滚保障。缺少 `-ConfirmProductionActivation` 时，在创建目录或 Junction 前即终止。
+
+### 7.3 自动回滚
+
+切换后的任何异常都会执行同一回滚函数：恢复旧 Junction、pointer、私有运行配置、broker 私有环境和候选 manifest，随后 scoped reload 旧后端并再次核对健康与账本。只有 `rollback-verification.json` 中 `verified=true` 才会报告“失败后已验证回滚”。
+
+账本检查由 `ops/release_probe.py` 完成。PowerShell 只传文件路径和 route 参数，不再使用内嵌 `python -c`，避免 Windows 多层引号和换行转义改变代码。
+
+### 7.4 手动恢复
+
+如果自动回滚本身无法完成，应保留 `current.failed-*`、`current.before-*` 和 `backups/release-switch-*`，停止继续切换。先把 `current.before-*` 恢复为 `current`，再恢复同一 backup 目录内的 pointer 与私有配置，最后只重载 `wechat-docs` backend。不要删除或替换 `events.sqlite3` 来掩盖 release 状态错误。
 
 ## 8. 常见配置问题
 

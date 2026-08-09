@@ -16,7 +16,7 @@
 | [docs/WECHAT_DATABASE.md](docs/WECHAT_DATABASE.md) | 微信 4.1+ 密钥提取、18 个数据库、Msg_MD5 表名、zstd 解压、消息类型分类 |
 | [docs/EVENT_PROTOCOL.md](docs/EVENT_PROTOCOL.md) | route/baseline/event/wake/dedupe/ACK 的准确语义和完整闭环示例 |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Python 环境、配置项、安装、启动停止、备份恢复、升级回滚、健康状态 |
-| [docs/TESTING_AND_TROUBLESHOOTING.md](docs/TESTING_AND_TROUBLESHOOTING.md) | 50 项测试说明、真实微信验收步骤、常见错误、诊断顺序 |
+| [docs/TESTING_AND_TROUBLESHOOTING.md](docs/TESTING_AND_TROUBLESHOOTING.md) | 57 项测试说明、真实微信验收步骤、release 演练、常见错误、诊断顺序 |
 | [docs/DECISIONS_AND_HISTORY.md](docs/DECISIONS_AND_HISTORY.md) | raw-key 扫描失败、UIA 路线被取代、Config.Cipher 扫描成功、架构决策记录 |
 | [HANDOFF_TO_MCP_THREAD.md](HANDOFF_TO_MCP_THREAD.md) | Windsurf 施工交接给 MCP 开发对话的待办和验收标准 |
 

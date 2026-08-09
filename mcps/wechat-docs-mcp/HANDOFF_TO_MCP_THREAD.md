@@ -21,22 +21,24 @@
 | zstandard 依赖声明 | ✅ | `pyproject.toml` 确认 |
 | 可见 wake 正文隔离与重试去重 | ✅ | `test_wake_notifier.py` |
 | broker 深度健康 Supervisor | ✅ | `test_supervisor.py` |
+| release manifest/Junction 回滚演练 | ✅ | `test_release_management.py` |
 
 ### 1.2 测试结果
 
 ```
-50 passed, zero warnings
+57 passed, zero warnings
 ```
 
 | 文件 | 数量 |
 |---|---|
-| test_db_observer.py | 10 |
+| test_db_observer.py | 12 |
 | test_db_watcher.py | 15 |
 | test_ledger.py | 13 |
 | test_server_polling.py | 4 |
 | test_wake_notifier.py | 5 |
 | test_supervisor.py | 3 |
-| **合计** | **50** |
+| test_release_management.py | 5 |
+| **合计** | **57** |
 
 ### 1.3 文档完成
 
@@ -46,7 +48,7 @@
 | `docs/WECHAT_DATABASE.md` | 密钥提取、18 个 DB、Msg_MD5、zstd、消息类型 |
 | `docs/EVENT_PROTOCOL.md` | route/baseline/event/wake/dedupe/ACK 语义 |
 | `docs/OPERATIONS.md` | 环境配置、安装、启停、备份、健康状态 |
-| `docs/TESTING_AND_TROUBLESHOOTING.md` | 50 项测试、验收步骤、常见错误、诊断顺序 |
+| `docs/TESTING_AND_TROUBLESHOOTING.md` | 57 项测试、release 演练、验收步骤、常见错误、诊断顺序 |
 | `docs/DECISIONS_AND_HISTORY.md` | raw-key 失败、UIA 取代、Config.Cipher 扫描 |
 
 ## 2. MCP 开发对话待完成
