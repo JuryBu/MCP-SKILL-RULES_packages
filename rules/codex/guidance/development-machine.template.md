@@ -40,7 +40,9 @@
 
 结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（对端机器扫描到）与 `conversation_received`（对端 Codex 对话收到引导）。这两项是系统自动生成的传输回执，不代表业务已处理；只有绑定对话完成正文处理后提交的 `napcat_task_ack` 才能清除对应 pending 消息。
 
-旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的对端 `target_conversation_id`，接收端校验可信机器后持久保存回拨地址；之后对端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替对方登记任务；双方仍须各自核对并登记建议任务、互发握手，确认新路由后才能继续正式协作。需要主人知晓、判断或协助时，先登记本对话的 owner route，再向 binding 预配置的私聊或通知群发送简短人话；不要把日志、字段块或内部 `route_key` 倾倒给主人。主人在私聊引用该通知回复，或在群聊引用并 @ 本机账号，系统才把回复送回当前对话。
+旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的对端 `target_conversation_id`，接收端校验可信机器后持久保存回拨地址；之后对端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替对方登记任务；双方仍须各自核对并登记建议任务、互发握手，确认新路由后才能继续正式协作。
+
+需要主人采取操作、作出决定，或发生长任务完成/失败、安全暂停、人工登录、双机通信中断等值得离开 Codex 后及时知晓的事件时，先登记本对话的 owner route，再向 binding 预配置的私聊或通知群发送简短人话；普通心跳、例行进度、内部诊断和可自动恢复的短暂异常不发送。通知只说明发生了什么、是否需要主人行动，不倾倒日志、字段块或内部 `route_key`。主人在私聊引用该通知回复，或在群聊引用并 @ 本机账号，系统才把回复精确送回当前对话。
 
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
 

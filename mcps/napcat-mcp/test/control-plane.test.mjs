@@ -695,7 +695,6 @@ test("owner private and group replies require their configured sender or mention
     const privateAlert = await fixture.controlPlane.sendOwnerAlert({
       route_key: "private-route",
       summary: "开发机处理完成。",
-      reply_hint: "回我这条就好",
       dedupe_key: "owner-private-alert",
     });
     const groupAlert = await fixture.controlPlane.sendOwnerAlert({
@@ -710,8 +709,8 @@ test("owner private and group replies require their configured sender or mention
     assert.deepEqual(
       fixture.configuredSends.map((send) => send.message),
       [
-        "开发机处理完成。\n\n回我这条就好",
-        "训练机需要主人确认，请引用并 @ 当前机器账号回复。\n\n回复此条并 @ 当前机器账号即可",
+        "开发机处理完成。\n\n引用此条回复即可",
+        "训练机需要主人确认，请引用并 @ 当前机器账号回复。\n\n引用此条并 @ 当前机器账号回复即可",
       ],
     );
     assert.equal(fixture.configuredSends.some((send) => /route_key|\[OWNER_ALERT\]/.test(send.message)), false);

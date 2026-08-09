@@ -446,8 +446,8 @@ export function createControlPlane(options = {}) {
     if (!target) throw new Error(`binding 未定义通知目标：${route.targetKey}`);
     const summary = requiredText(input.summary, "summary", 800);
     const defaultReplyHint = target.type === "group"
-      ? "回复此条并 @ 当前机器账号即可"
-      : "回复此条即可";
+      ? "引用此条并 @ 当前机器账号回复即可"
+      : "引用此条回复即可";
     const replyHint = optionalText(input.reply_hint, 80) || defaultReplyHint;
     const message = summary.includes(replyHint)
       ? summary

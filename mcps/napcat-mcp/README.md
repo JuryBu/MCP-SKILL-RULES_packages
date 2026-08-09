@@ -84,7 +84,7 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 意外关闭任务时，可以调用 `napcat_connection_request`。首次请求只在这条控制消息中交换 `source_conversation_id` 与 `target_conversation_id`，接收端校验可信机器后把回拨地址持久保存；以后反向重连可传 `reply_to_request_id`，或用稳定的 `previous_task_id` 自动恢复对端地址。普通任务消息、文件索引和 heartbeat 不携带双方 conversationId，不会持续挤占 QQ 单条消息空间。工具只负责唤醒和提出请求，不会替对端创建、更新或绑定任务；对端仍需自行核对身份并调用 `napcat_task_register`，两边完成握手后才能恢复正式消息或关闭旧连接。
 
-主人通知先用 `napcat_owner_route_register` 把内部 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短、自然、方便主人直接阅读的提醒。首次登记或关闭后重开路由时，控制面会把目标当前已有的最近消息保存为基线，旧私聊历史不会被重新注入；路由开放期间已经确认或缓冲的消息身份也会持久保存，backend 重启不会回放。发送成功后，控制面只在本机保存「QQ 消息 ID → route_key → conversationId」映射，不把路由字段写进给主人看的正文；末尾默认仅追加一行「回复此条即可」，调用方也可用 `reply_hint` 换成更符合语境的短提示。
+主人通知先用 `napcat_owner_route_register` 把内部 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短、自然、方便主人直接阅读的提醒。首次登记或关闭后重开路由时，控制面会把目标当前已有的最近消息保存为基线，旧私聊历史不会被重新注入；路由开放期间已经确认或缓冲的消息身份也会持久保存，backend 重启不会回放。发送成功后，控制面只在本机保存「QQ 消息 ID → route_key → conversationId」映射，不把路由字段写进给主人看的正文；私聊末尾默认追加「引用此条回复即可」，群聊默认追加「引用此条并 @ 当前机器账号回复即可」，调用方也可用 `reply_hint` 换成更符合语境的短提示。
 
 私聊必须引用对应通知，群聊必须引用对应通知并 @ 本机 NapCat 账号；系统只按被引用通知的 QQ 消息 ID 精确恢复 `route_key` 与 `conversationId`，不根据语义、发送时间或“最近开放路由”猜测目标，也不会广播给其它对话。主人单独发送图片、文件、转发、表情等无明确文字指令的消息时，扫描器只把附件元数据写入该路由的持久缓冲，不立即唤醒 Codex；后续出现明确文字时再把缓冲附件和文字合并成一次可见唤醒，提交失败则保留缓冲等待重试。扫描器只把匹配回复送回绑定对话，普通私聊、普通群消息和其它任务不会触发。滚动升级期间仍兼容旧的可见 `route_key` 回复，但新通知不再生成这种格式。真实 QQ、群号和目标映射只存在于私有 binding，公开示例只放占位值。
 
