@@ -48,15 +48,27 @@ function createFixture(options = {}) {
     getControlPlaneConfig: () => currentConfiguration,
     sendControlGroupMessage: async (input) => {
       groupSends.push(structuredClone(input));
+      if (typeof options.sendControlGroupMessage === "function") {
+        return options.sendControlGroupMessage(input, { groupSends, sentByDedupeKey });
+      }
       if (!sentByDedupeKey.has(input.dedupe_key)) {
         sentByDedupeKey.set(input.dedupe_key, nextMessageId);
         nextMessageId += 1;
       }
-      return {
-        sent: !groupSends.slice(0, -1).some((entry) => entry.dedupe_key === input.dedupe_key),
-        verified: true,
-        messageId: sentByDedupeKey.get(input.dedupe_key),
-      };
+      const duplicateSuppressed = groupSends.slice(0, -1)
+        .some((entry) => entry.dedupe_key === input.dedupe_key);
+      return duplicateSuppressed
+        ? {
+            sent: false,
+            duplicateSuppressed: true,
+            reason: "already_sent",
+            existing: { messageId: sentByDedupeKey.get(input.dedupe_key) },
+          }
+        : {
+            sent: true,
+            verified: true,
+            messageId: sentByDedupeKey.get(input.dedupe_key),
+          };
     },
     sendConfiguredMessage: async (input) => {
       configuredSends.push(structuredClone(input));
@@ -86,12 +98,17 @@ function createFixture(options = {}) {
     statePath,
     now: options.now ?? (() => new Date(BASE_TIME)),
   });
+  if (options.existingState) {
+    fs.mkdirSync(path.dirname(statePath), { recursive: true });
+    fs.writeFileSync(statePath, `${JSON.stringify(options.existingState, null, 2)}\n`, "utf8");
+  }
   const controlPlane = createControlPlane({
     notifier,
     bridge,
     state,
     now: options.now ?? (() => new Date(BASE_TIME)),
     registry: options.registry,
+    connectionRequestBootstrapLookbackMs: options.connectionRequestBootstrapLookbackMs,
   });
   return {
     root,
@@ -100,6 +117,7 @@ function createFixture(options = {}) {
     groupSends,
     configuredSends,
     wakeCalls,
+    configuration: currentConfiguration,
     targetHistory,
     cleanup() {
       fs.rmSync(root, { recursive: true, force: true });
@@ -165,6 +183,7 @@ test("business delivery advances through machine and conversation receipts witho
     });
 
     const business = businessMessage();
+    await receiver.controlPlane.scanGroupHistory([]);
     assert.deepEqual(
       await receiver.controlPlane.acknowledgeBusinessMessages([business], "machine_received"),
       [{ deliveryId: "delivery-001", stage: "machine_received", sent: true }],
@@ -208,6 +227,243 @@ test("business delivery advances through machine and conversation receipts witho
   } finally {
     sender.cleanup();
     receiver.cleanup();
+  }
+});
+
+test("first control-plane enable baselines historical business messages without emitting receipts", async () => {
+  const fixture = createFixture({
+    now: () => new Date("2026-08-09T00:10:00.000Z"),
+    configuration: {
+      localMachine: "training",
+      trustedPeerQq: "1000000001",
+      expectedSelfId: "2000000002",
+    },
+  });
+  try {
+    const historical = businessMessage({
+      deliveryId: "delivery-before-enable",
+      messageId: "71",
+      messageSeq: "71",
+      deliveryMessageSeq: "71",
+      time: "2026-08-09T00:00:00.000Z",
+    });
+    const bootstrap = await fixture.controlPlane.scanGroupHistory([historical]);
+    assert.equal(bootstrap.bootstrap.initialized, true);
+    assert.equal(bootstrap.bootstrap.baselinedReceiptCount, 2);
+    assert.deepEqual(await fixture.controlPlane.acknowledgeBusinessMessages([historical], "machine_received"), []);
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([historical], "conversation_received"),
+      [],
+    );
+    assert.equal(fixture.groupSends.length, 0);
+    assert.equal(fixture.state.snapshot().businessReceiptBootstrapAt, "2026-08-09T00:10:00.000Z");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("disabled control plane does not establish a bootstrap before real enable", async () => {
+  const fixture = createFixture({
+    now: () => new Date("2026-08-09T00:10:00.000Z"),
+    configuration: {
+      enabled: false,
+      localMachine: "training",
+      trustedPeerQq: "1000000001",
+      expectedSelfId: "2000000002",
+    },
+  });
+  try {
+    const historical = businessMessage({ deliveryId: "delivery-while-disabled" });
+    assert.equal((await fixture.controlPlane.scanGroupHistory([historical])).enabled, false);
+    assert.equal(fixture.state.getBusinessReceiptBootstrapAt(), null);
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([historical], "machine_received"),
+      [],
+    );
+    fixture.configuration.enabled = true;
+    const enabled = await fixture.controlPlane.scanGroupHistory([historical]);
+    assert.equal(enabled.bootstrap.initialized, true);
+    assert.equal(enabled.bootstrap.baselinedReceiptCount, 2);
+    assert.equal(fixture.groupSends.length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("same-second business message after bootstrap is receipted without wall-clock filtering", async () => {
+  let currentTime = new Date("2026-08-09T00:10:00.700Z");
+  const fixture = createFixture({ now: () => currentTime });
+  try {
+    await fixture.controlPlane.scanGroupHistory([]);
+    currentTime = new Date("2026-08-09T00:10:01.000Z");
+    const sameSecond = businessMessage({
+      deliveryId: "delivery-same-second",
+      messageId: "73",
+      messageSeq: "73",
+      deliveryMessageSeq: "73",
+      time: "2026-08-09T00:10:00.000Z",
+    });
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([sameSecond], "machine_received"),
+      [{ deliveryId: "delivery-same-second", stage: "machine_received", sent: true }],
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("persisted bootstrap resumes receipts for messages received while the machine was offline", async () => {
+  const fixture = createFixture({
+    now: () => new Date("2026-08-09T01:00:00.000Z"),
+    existingState: {
+      schemaVersion: 2,
+      businessReceiptBootstrapAt: "2026-08-09T00:10:00.000Z",
+      deliveries: {},
+      connectionRequests: {},
+      ownerRoutes: {},
+      seenControlMessages: [],
+    },
+  });
+  try {
+    const offlineArrival = businessMessage({
+      deliveryId: "delivery-during-offline",
+      messageId: "72",
+      messageSeq: "72",
+      deliveryMessageSeq: "72",
+      time: "2026-08-09T00:30:00.000Z",
+    });
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([offlineArrival], "machine_received"),
+      [{ deliveryId: "delivery-during-offline", stage: "machine_received", sent: true }],
+    );
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([offlineArrival], "machine_received"),
+      [],
+    );
+    assert.equal(fixture.groupSends.length, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("unknown receipt send outcome is persisted and never retried automatically", async () => {
+  let attempts = 0;
+  const fixture = createFixture({
+    sendControlGroupMessage: async () => {
+      attempts += 1;
+      const error = new Error("socket closed after send");
+      error.outcomeUnknown = true;
+      throw error;
+    },
+  });
+  try {
+    await fixture.controlPlane.scanGroupHistory([]);
+    const inbound = businessMessage({ deliveryId: "delivery-outcome-unknown" });
+    const first = await fixture.controlPlane.acknowledgeBusinessMessages([inbound], "machine_received");
+    assert.equal(first[0].sent, false);
+    assert.equal(first[0].error.outcomeUnknown, true);
+    assert.deepEqual(
+      await fixture.controlPlane.acknowledgeBusinessMessages([inbound], "machine_received"),
+      [],
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("first enable accepts only recent connection requests inside the bootstrap lookback", async () => {
+  const fixture = createFixture({
+    now: () => new Date("2026-08-09T00:20:00.000Z"),
+    connectionRequestBootstrapLookbackMs: 10 * 60 * 1000,
+  });
+  try {
+    const base = {
+      senderId: "2000000002",
+      isSelf: false,
+      messageType: "connection_request",
+      proposedTaskId: "stable-successor-task",
+      sourceConversationId: "019f-source-conversation",
+      targetConversationId: "019f-target-conversation",
+      sourceMachine: "training",
+      targetMachine: "development",
+      text: "connection request",
+    };
+    const stale = {
+      ...base,
+      messageId: "610",
+      messageSeq: "610",
+      deliveryMessageSeq: "610",
+      deliveryId: "request-stale",
+      requestId: "request-stale",
+      time: "2026-08-09T00:00:00.000Z",
+    };
+    const recent = {
+      ...base,
+      messageId: "611",
+      messageSeq: "611",
+      deliveryMessageSeq: "611",
+      deliveryId: "request-recent",
+      requestId: "request-recent",
+      time: "2026-08-09T00:15:00.000Z",
+    };
+    const scan = await fixture.controlPlane.scanGroupHistory([stale, recent]);
+    assert.deepEqual(scan.results.map((entry) => entry.outcome), [
+      "stale_connection_request_baselined",
+      "connection_request_delivered",
+    ]);
+    assert.equal(fixture.wakeCalls.length, 1);
+    assert.equal(fixture.wakeCalls[0].taskId, "stable-successor-task");
+    assert.deepEqual(fixture.groupSends.map((entry) => entry.dedupe_key), [
+      "delivery-receipt:machine_received:request-recent",
+      "delivery-receipt:conversation_received:request-recent",
+    ]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("first enable rejects connection requests with unverifiable time but later restarts accept offline requests", async () => {
+  const fixture = createFixture({ now: () => new Date("2026-08-09T00:20:00.000Z") });
+  try {
+    const base = {
+      senderId: "2000000002",
+      isSelf: false,
+      messageType: "connection_request",
+      proposedTaskId: "stable-successor-task",
+      sourceConversationId: "019f-source-conversation",
+      targetConversationId: "019f-target-conversation",
+      sourceMachine: "training",
+      targetMachine: "development",
+      text: "connection request",
+    };
+    const invalidTime = {
+      ...base,
+      messageId: "612",
+      messageSeq: "612",
+      deliveryMessageSeq: "612",
+      deliveryId: "request-invalid-time",
+      requestId: "request-invalid-time",
+      time: null,
+    };
+    const first = await fixture.controlPlane.scanGroupHistory([invalidTime]);
+    assert.deepEqual(first.results.map((entry) => entry.outcome), ["connection_request_time_unverifiable"]);
+    assert.equal(fixture.wakeCalls.length, 0);
+
+    const offlineRequest = {
+      ...base,
+      messageId: "613",
+      messageSeq: "613",
+      deliveryMessageSeq: "613",
+      deliveryId: "request-after-bootstrap",
+      requestId: "request-after-bootstrap",
+      time: "2026-08-08T23:00:00.000Z",
+    };
+    const later = await fixture.controlPlane.scanGroupHistory([offlineRequest]);
+    assert.deepEqual(later.results.map((entry) => entry.outcome), ["connection_request_delivered"]);
+    assert.equal(fixture.wakeCalls.length, 1);
+  } finally {
+    fixture.cleanup();
   }
 });
 

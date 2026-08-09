@@ -254,6 +254,8 @@ Codex 侧以下操作优先用后台模式：
 
 `codex_app__*` 是 Codex 原生任务管理接口，不走 MCP broker，速度更快。**获取当前对话 ID 的首选方法**：`codex_app__list_threads` 筛选 `status=active` + 比对当前工作目录。`codex_app__read_thread` 读取任务历史，比 MCP 的 `conversation_read_original` 更快，适合压缩后回溯。其余：`read_thread_terminal`（终端输出）、`load_workspace_dependencies`（打包库）、`create_thread`/`fork_thread`/`send_message_to_thread`/`handoff_thread`（任务管理）、`automation_update`（定时任务）。没有 `get_current_thread()`，需 `list_threads` + 筛选定位。
 
+原生任务工具只操作当前 Codex App Server 能列出的本机任务或显式已连接宿主；知道另一台电脑的 `conversationId` 不代表当前 App Server 能访问它。目标任务未出现在 `list_threads` 中，或发送返回 `No Codex thread found` 时，不要反复重试，也不要另建中转任务冒充跨机连接；已登记的开发机/训练机协作改用对应 `task_id` 的 NapCat 双机通道，本机可见任务才继续使用原生线程工具。
+
 通过 `send_message_to_thread` 或 `handoff_thread` 派发需要后续回报的工作时，发送方必须记录目标任务、预期里程碑和下一检查时间。当前轮次仍保持运行时优先用 `wait_threads` 等待；当前轮次将结束或回报窗口较长时，创建一次性 `automation_update` 作为失联检查。收到回报，或任务完成、取消后立即撤销检查；到点先只读确认状态再决定是否提醒，不能周期性骚扰，也不能只依赖接收方主动回报。
 
 ## memory-store

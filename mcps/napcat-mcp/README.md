@@ -78,6 +78,8 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 结构化任务文本和文件索引都会得到稳定 `delivery_id`。接收端路由器识别到可信消息后自动发送 `machine_received`，成功把消息提交给绑定 Codex 对话后再发送 `conversation_received`；发送端用 `napcat_delivery_status` 查询这两个传输状态。它们只回答「对端机器看到了」「对端对话收到引导」，不会确认模型已经理解或完成业务，因此绝不能代替上面的显式 `napcat_task_ack`。
 
+控制面第一次在启用状态下成功读取群历史时，会把当前可信业务消息快照的两阶段回执键写入基线，并持久化 `businessReceiptBootstrapAt`；这些历史消息不补发 `machine_received` 或 `conversation_received`，避免把群历史刷成一屏回执。业务基线不依赖 QQ 时间戳或两台电脑的时钟，写入后也不会随进程或电脑重启改变，因此机器离线期间后来到达的消息仍会在恢复扫描后正常补回执。首次启用时只有最近 15 分钟内且时间可核验的建链请求允许进入处理窗口，更旧或时间无效的请求只记为历史基线；已经确认或发送结果未知的控制回执按稳定键去重，不会因扫描器重启自动重发。
+
 意外关闭任务时，可以调用 `napcat_connection_request`。首次请求只在这条控制消息中交换 `source_conversation_id` 与 `target_conversation_id`，接收端校验可信机器后把回拨地址持久保存；以后反向重连可传 `reply_to_request_id`，或用稳定的 `previous_task_id` 自动恢复对端地址。普通任务消息、文件索引和 heartbeat 不携带双方 conversationId，不会持续挤占 QQ 单条消息空间。工具只负责唤醒和提出请求，不会替对端创建、更新或绑定任务；对端仍需自行核对身份并调用 `napcat_task_register`，两边完成握手后才能恢复正式消息或关闭旧连接。
 
 主人通知先用 `napcat_owner_route_register` 把 `route_key` 绑定到本机 Codex 对话与私有 `target_key`，再用 `napcat_owner_alert` 发送简短提醒。私聊回复必须来自 binding 指定账号并保留「路由」标记；群聊回复还必须 @ 本机 NapCat 账号并保留 `route_key`。扫描器只把匹配的回复送回绑定对话，普通私聊、普通群消息和其它路由不会触发。真实 QQ、群号和目标映射只存在于 schema v2 binding，公开示例只放占位值。

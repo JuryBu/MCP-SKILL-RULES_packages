@@ -69,7 +69,7 @@ function assertControlStateError(callback, code) {
   assert.throws(callback, (error) => error instanceof ControlStateError && error.code === code);
 }
 
-test("first write creates schemaVersion 1 state through a clean atomic rename", () => {
+test("first write creates schemaVersion 2 state through a clean atomic rename", () => {
   const fixture = createFixture();
   try {
     assert.equal(fs.existsSync(fixture.statePath), false);
@@ -86,7 +86,8 @@ test("first write creates schemaVersion 1 state through a clean atomic rename", 
     });
 
     const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
-    assert.equal(stored.schemaVersion, 1);
+    assert.equal(stored.schemaVersion, 2);
+    assert.equal(stored.businessReceiptBootstrapAt, null);
     assert.deepEqual(stored.deliveries["delivery-001"], delivery);
     assert.deepEqual(stored.connectionRequests, {});
     assert.deepEqual(stored.ownerRoutes, {});
@@ -95,6 +96,35 @@ test("first write creates schemaVersion 1 state through a clean atomic rename", 
       fs.readdirSync(path.dirname(fixture.statePath)).filter((name) => name.endsWith(".tmp")),
       [],
     );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("legacy schema migrates and persists the business receipt bootstrap", () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.dirname(fixture.statePath), { recursive: true });
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify({
+      schemaVersion: 1,
+      deliveries: {},
+      connectionRequests: {},
+      ownerRoutes: {},
+      seenControlMessages: [],
+    }, null, 2)}\n`, "utf8");
+    assert.deepEqual(fixture.controlState.initializeBusinessReceiptBaseline({
+      receiptKeys: ["business-receipt:machine_received:delivery-legacy"],
+    }), {
+      initialized: true,
+      bootstrapAt: BASE_TIME,
+      baselinedReceiptCount: 1,
+    });
+    assert.equal(fixture.controlState.getBusinessReceiptBootstrapAt(), BASE_TIME);
+    assert.equal(
+      fixture.controlState.hasSeenControlMessage("business-receipt:machine_received:delivery-legacy"),
+      true,
+    );
+    assert.equal(fixture.controlState.snapshot().schemaVersion, 2);
   } finally {
     fixture.cleanup();
   }

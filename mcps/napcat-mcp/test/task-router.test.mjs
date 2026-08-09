@@ -145,6 +145,7 @@ function fixture(options = {}) {
     calls,
     getTask: () => currentTask,
     isMaintenanceActive: async () => Boolean(options.maintenanceActive),
+    ...(options.controlPlane ? { controlPlane: options.controlPlane } : {}),
   };
 }
 
@@ -168,6 +169,32 @@ test("multiple eligible messages coalesce into one wake", async () => {
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /previously_pending_message_seqs=\[\]/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /wake_id=/);
   assert.equal(current.getTask().wakePending, true);
+});
+
+test("task router emits machine and conversation receipts around one accepted wake", async () => {
+  const receiptCalls = [];
+  const controlPlane = {
+    keepAlive: () => false,
+    scanGroupHistory: async () => ({ enabled: true, results: [] }),
+    scanOwnerReplies: async () => ({ enabled: true, results: [] }),
+    acknowledgeBusinessMessages: async (messages, stage) => {
+      receiptCalls.push({ stage, deliveryIds: messages.map((entry) => entry.deliveryId) });
+      return messages.map((entry) => ({ deliveryId: entry.deliveryId, stage, sent: true }));
+    },
+  };
+  const current = fixture({
+    controlPlane,
+    messages: [
+      message(10, { messageType: "business", deliveryId: "delivery-10" }),
+      message(11, { messageType: "business", deliveryId: "delivery-11" }),
+    ],
+  });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "accepted");
+  assert.deepEqual(receiptCalls, [
+    { stage: "machine_received", deliveryIds: ["delivery-10", "delivery-11"] },
+    { stage: "conversation_received", deliveryIds: ["delivery-10", "delivery-11"] },
+  ]);
 });
 
 test("new messages trigger one guidance wake after cooldown while old messages remain pending", async () => {

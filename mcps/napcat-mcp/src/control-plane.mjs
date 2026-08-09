@@ -1,5 +1,7 @@
 import crypto from "node:crypto";
 
+const DEFAULT_CONNECTION_REQUEST_BOOTSTRAP_LOOKBACK_MS = 15 * 60 * 1000;
+
 function requiredText(value, name, maximum = 512) {
   const normalized = String(value ?? "").trim();
   if (!normalized) throw new Error(`${name} 不能为空`);
@@ -69,8 +71,11 @@ export function createControlPlane(options = {}) {
   const bridge = options.bridge;
   const state = options.state;
   const now = options.now ?? (() => new Date());
+  const connectionRequestBootstrapLookbackMs = Math.max(
+    0,
+    Number(options.connectionRequestBootstrapLookbackMs ?? DEFAULT_CONNECTION_REQUEST_BOOTSTRAP_LOOKBACK_MS),
+  );
   if (!notifier || !bridge || !state) throw new Error("control plane 需要 notifier、bridge 和 state");
-
   function config() {
     return notifier.getControlPlaneConfig();
   }
@@ -87,6 +92,15 @@ export function createControlPlane(options = {}) {
     return !message?.isSelf
       && String(message?.senderId ?? "") === configuration.trustedPeerQq
       && String(message?.targetMachine ?? "") === configuration.localMachine;
+  }
+
+  function deliveryReceiptKey(message, stage) {
+    return `business-receipt:${stage}:${requiredText(message.deliveryId, "deliveryId", 128)}`;
+  }
+
+  function messageTime(message) {
+    const timestamp = Date.parse(message?.time ?? "");
+    return Number.isFinite(timestamp) ? timestamp : null;
   }
 
   async function sendReceipt(message, stage) {
@@ -110,6 +124,25 @@ export function createControlPlane(options = {}) {
       dedupe_key: `delivery-receipt:${stage}:${message.deliveryId}`,
       message: receipt,
     });
+  }
+
+  async function sendReceiptOnce(message, stage) {
+    if (!message?.deliveryId) return { skipped: true, reason: "missing_delivery_id" };
+    const receiptKey = deliveryReceiptKey(message, stage);
+    if (state.hasSeenControlMessage(receiptKey)) {
+      return { skipped: true, reason: "receipt_already_recorded" };
+    }
+    try {
+      const receipt = await sendReceipt(message, stage);
+      if (!receipt) return { skipped: true, reason: "receipt_not_applicable" };
+      if (receipt.sent === true || receipt.duplicateSuppressed === true) {
+        state.markControlMessageSeen(receiptKey);
+      }
+      return { skipped: false, receipt };
+    } catch (error) {
+      if (error?.outcomeUnknown) state.markControlMessageSeen(receiptKey);
+      throw error;
+    }
   }
 
   function trackOutgoingDelivery(input) {
@@ -141,11 +174,24 @@ export function createControlPlane(options = {}) {
     return { outcome: message.receiptStage, deliveryId: message.deliveryId };
   }
 
-  async function scanConnectionRequest(message, configuration) {
+  async function scanConnectionRequest(message, configuration, bootstrap = null) {
     if (message.messageType !== "connection_request" || !validatePeerMessage(message, configuration)) return null;
     if (!message.requestId || !message.targetConversationId || !message.proposedTaskId) return null;
     const key = messageKey("connection-request", message);
     if (state.hasSeenControlMessage(key)) return { outcome: "duplicate_connection_request", requestId: message.requestId };
+    if (bootstrap?.initialized) {
+      const requestTime = messageTime(message);
+      const bootstrapTime = Date.parse(bootstrap.bootstrapAt);
+      if (requestTime === null) {
+        state.markControlMessageSeen(key);
+        return { outcome: "connection_request_time_unverifiable", requestId: message.requestId };
+      }
+      if (Number.isFinite(bootstrapTime)
+        && requestTime < bootstrapTime - connectionRequestBootstrapLookbackMs) {
+        state.markControlMessageSeen(key);
+        return { outcome: "stale_connection_request_baselined", requestId: message.requestId };
+      }
+    }
     const existing = state.getConnectionRequest(message.requestId);
     if (existing) {
       state.updateConnectionRequest({
@@ -158,8 +204,8 @@ export function createControlPlane(options = {}) {
         targetMachine: message.targetMachine,
         status: existing.status,
       });
-      await sendReceipt(message, "machine_received");
-      if (existing.status === "wake_accepted") await sendReceipt(message, "conversation_received");
+      await sendReceiptOnce(message, "machine_received");
+      if (existing.status === "wake_accepted") await sendReceiptOnce(message, "conversation_received");
       state.markControlMessageSeen(key);
       return { outcome: "duplicate_connection_request", requestId: message.requestId };
     }
@@ -174,7 +220,7 @@ export function createControlPlane(options = {}) {
       status: "received",
       receivedAt: message.time,
     });
-    await sendReceipt(message, "machine_received");
+    await sendReceiptOnce(message, "machine_received");
     const wakeId = stableId("connection", [message.requestId, message.targetConversationId]);
     const wake = await bridge.wake({
       threadId: message.targetConversationId,
@@ -196,7 +242,7 @@ export function createControlPlane(options = {}) {
       return { outcome: wake?.outcome === "busy" ? "connection_thread_busy" : "connection_thread_unavailable", requestId: message.requestId };
     }
     state.updateConnectionRequest({ requestId: message.requestId, status: "wake_accepted" });
-    await sendReceipt(message, "conversation_received");
+    await sendReceiptOnce(message, "conversation_received");
     state.markControlMessageSeen(key);
     return { outcome: "connection_request_delivered", requestId: message.requestId };
   }
@@ -204,6 +250,18 @@ export function createControlPlane(options = {}) {
   async function scanGroupHistory(messages = []) {
     const configuration = config();
     if (!configuration.enabled || !configuration.machineIngressEnabled) return { enabled: false, results: [] };
+    const baselineReceiptKeys = messages
+      .filter((message) => message?.messageType === "business"
+        && message?.deliveryId
+        && validatePeerMessage(message, configuration))
+      .flatMap((message) => [
+        deliveryReceiptKey(message, "machine_received"),
+        deliveryReceiptKey(message, "conversation_received"),
+      ]);
+    const bootstrap = state.initializeBusinessReceiptBaseline({
+      now: now(),
+      receiptKeys: baselineReceiptKeys,
+    });
     const results = [];
     for (const message of messages) {
       try {
@@ -212,22 +270,32 @@ export function createControlPlane(options = {}) {
           results.push(receipt);
           continue;
         }
-        const request = await scanConnectionRequest(message, configuration);
+        const request = await scanConnectionRequest(message, configuration, bootstrap);
         if (request) results.push(request);
       } catch (error) {
         results.push({ outcome: "control_scan_error", messageSeq: message?.messageSeq ?? null, error: publicError(error) });
       }
     }
-    return { enabled: true, results };
+    return { enabled: true, bootstrap, results };
   }
 
   async function acknowledgeBusinessMessages(messages, stage) {
+    const configuration = config();
+    if (!configuration.enabled || !configuration.machineIngressEnabled) return [];
+    if (state.getBusinessReceiptBootstrapAt() === null) return [];
     const results = [];
     for (const message of messages) {
       if (!message?.deliveryId || message.messageType !== "business") continue;
       try {
-        const receipt = await sendReceipt(message, stage);
-        if (receipt) results.push({ deliveryId: message.deliveryId, stage, sent: true });
+        const outcome = await sendReceiptOnce(message, stage);
+        if (outcome.skipped) continue;
+        const result = {
+          deliveryId: message.deliveryId,
+          stage,
+          sent: outcome.receipt.sent === true,
+        };
+        if (outcome.receipt.duplicateSuppressed === true) result.duplicateSuppressed = true;
+        results.push(result);
       } catch (error) {
         results.push({ deliveryId: message.deliveryId, stage, sent: false, error: publicError(error) });
       }

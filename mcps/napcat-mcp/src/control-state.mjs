@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const STATE_SCHEMA_VERSION = 1;
+const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_MAX_SEEN = 2048;
 const DEFAULT_LOCK_WAIT_MS = 2000;
 
@@ -102,10 +102,20 @@ function clone(value) {
 function emptyState() {
   return {
     schemaVersion: STATE_SCHEMA_VERSION,
+    businessReceiptBootstrapAt: null,
     deliveries: {},
     connectionRequests: {},
     ownerRoutes: {},
     seenControlMessages: [],
+  };
+}
+
+function migrateState(value) {
+  if (!isPlainObject(value) || value.schemaVersion !== 1) return value;
+  return {
+    ...value,
+    schemaVersion: STATE_SCHEMA_VERSION,
+    businessReceiptBootstrapAt: null,
   };
 }
 
@@ -235,8 +245,12 @@ function validateStoredOwnerRoute(route, routeKey, statePath) {
 }
 
 function validateState(value, statePath) {
+  value = migrateState(value);
   if (!isPlainObject(value)
     || value.schemaVersion !== STATE_SCHEMA_VERSION
+    || !(value.businessReceiptBootstrapAt === null
+      || (typeof value.businessReceiptBootstrapAt === "string"
+        && Number.isFinite(Date.parse(value.businessReceiptBootstrapAt))))
     || !isPlainObject(value.deliveries)
     || !isPlainObject(value.connectionRequests)
     || !isPlainObject(value.ownerRoutes)
@@ -446,6 +460,47 @@ export class ControlState {
 
   snapshot() {
     return clone(readState(this.statePath, this.maxSeen).state);
+  }
+
+  getBusinessReceiptBootstrapAt() {
+    return readState(this.statePath, this.maxSeen).state.businessReceiptBootstrapAt;
+  }
+
+  initializeBusinessReceiptBaseline(input = {}) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const receiptKeys = Array.isArray(input.receiptKeys)
+      ? input.receiptKeys.map((value) => requiredString(value, "receiptKeys[]", 512))
+      : [];
+    return this.#write((state) => {
+      if (state.businessReceiptBootstrapAt !== null) {
+        return {
+          changed: false,
+          value: {
+            initialized: false,
+            bootstrapAt: state.businessReceiptBootstrapAt,
+            baselinedReceiptCount: 0,
+          },
+        };
+      }
+      state.businessReceiptBootstrapAt = resolveNow(this.now, input);
+      let baselinedReceiptCount = 0;
+      for (const receiptKey of receiptKeys) {
+        if (state.seenControlMessages.includes(receiptKey)) continue;
+        state.seenControlMessages.push(receiptKey);
+        baselinedReceiptCount += 1;
+      }
+      if (state.seenControlMessages.length > this.maxSeen) {
+        state.seenControlMessages.splice(0, state.seenControlMessages.length - this.maxSeen);
+      }
+      return {
+        changed: true,
+        value: {
+          initialized: true,
+          bootstrapAt: state.businessReceiptBootstrapAt,
+          baselinedReceiptCount,
+        },
+      };
+    });
   }
 
   getDelivery(deliveryId) {
