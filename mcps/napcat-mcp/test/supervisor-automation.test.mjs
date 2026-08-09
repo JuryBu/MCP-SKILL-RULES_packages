@@ -240,8 +240,8 @@ test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 
   const validOutput = `${validRun.result.stdout ?? ""}\n${validRun.result.stderr ?? ""}`;
   assert.equal(validRun.result.status, 0, validOutput);
   assert.equal(
-    path.resolve(readJson(validRun.capturePath).brokerStartScript),
-    path.resolve(manifestStartScriptPath),
+    fs.realpathSync.native(readJson(validRun.capturePath).brokerStartScript).toLowerCase(),
+    fs.realpathSync.native(manifestStartScriptPath).toLowerCase(),
     "supervisor must pass service-manifest broker.startScript instead of BrokerRoot\\Start-CodexMcpBroker.ps1",
   );
 
