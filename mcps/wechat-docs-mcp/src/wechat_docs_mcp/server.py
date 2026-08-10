@@ -618,7 +618,7 @@ async def tdocs_monitor_create(
     policy_ref: str,
     monitor_id: str = "",
 ) -> dict[str, Any]:
-    """Enroll one private allowlisted Tencent Docs resource after a successful read-only baseline."""
+    """Enroll a private resource, or safely re-baseline its paused monitor after a policy change."""
     return await document_monitor_service().create_monitor(
         resource_kind,
         resource_key,

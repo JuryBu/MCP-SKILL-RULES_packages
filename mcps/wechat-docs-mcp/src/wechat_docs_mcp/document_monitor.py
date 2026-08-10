@@ -123,6 +123,104 @@ class DocumentMonitorStore:
             return result
         return _safe_monitor(result)
 
+    def assert_monitor_reconfigurable(self, monitor_id: str, resource_key: str) -> None:
+        connection = self.ledger._connect()
+        try:
+            self._assert_monitor_reconfigurable(connection, monitor_id, resource_key)
+        finally:
+            connection.close()
+
+    def reconfigure_monitor(
+        self,
+        monitor_id: str,
+        resource_kind: str,
+        resource_key: str,
+        poll_tool: str,
+        poll_arguments: dict[str, Any],
+        baseline_fingerprint: str,
+        baseline_summary: dict[str, Any],
+        *,
+        policy_ref: str,
+        observed_at: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        if not resource_kind.strip() or not resource_key.strip():
+            raise LedgerError("DOCUMENT_RESOURCE_REQUIRED", "resource_kind 和 resource_key 不能为空")
+        if not poll_tool.strip() or not isinstance(poll_arguments, dict):
+            raise LedgerError("DOCUMENT_POLL_CONTRACT_REQUIRED", "poll_tool 和 poll_arguments 必须有效")
+        if not policy_ref.strip():
+            raise LedgerError("DOCUMENT_POLICY_REF_REQUIRED", "登记私有文档监视必须提供 policy_ref")
+        if not baseline_fingerprint.strip():
+            raise LedgerError("DOCUMENT_BASELINE_REQUIRED", "重新配置必须保存成功读取的 baseline")
+        observed = _time(observed_at).isoformat()
+        with self.ledger._transaction() as connection:
+            self._assert_monitor_reconfigurable(connection, monitor_id, resource_key)
+            connection.execute(
+                """
+                UPDATE tdocs_monitors
+                SET resource_kind=?,poll_tool=?,poll_arguments_json=?,state='active',
+                    baseline_fingerprint=?,baseline_summary_json=?,baseline_observed_at=?,
+                    last_success_at=?,last_error_code=NULL,consecutive_failures=0,
+                    policy_ref=?,updated_at=?
+                WHERE monitor_id=?
+                """,
+                (
+                    resource_kind.strip().casefold(),
+                    poll_tool,
+                    canonical_json(poll_arguments),
+                    baseline_fingerprint,
+                    canonical_json(baseline_summary),
+                    observed,
+                    observed,
+                    policy_ref,
+                    observed,
+                    monitor_id,
+                ),
+            )
+        return self.get_monitor(monitor_id)
+
+    def _assert_monitor_reconfigurable(
+        self,
+        connection: Any,
+        monitor_id: str,
+        resource_key: str,
+    ) -> None:
+        row = connection.execute(
+            "SELECT state,resource_key_sha256 FROM tdocs_monitors WHERE monitor_id=?",
+            (monitor_id,),
+        ).fetchone()
+        if row is None:
+            raise LedgerError("DOCUMENT_MONITOR_NOT_FOUND", f"monitor 不存在：{monitor_id}")
+        if row["resource_key_sha256"] != payload_sha256(resource_key.strip()):
+            raise LedgerError("DOCUMENT_MONITOR_RESOURCE_MISMATCH", "不能把 monitor 改绑到另一份文档")
+        if row["state"] != "paused":
+            raise LedgerError(
+                "DOCUMENT_MONITOR_RECONFIGURE_REQUIRES_PAUSED",
+                "重新配置前必须先暂停 monitor",
+            )
+        pending = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM tdocs_batch_deliveries d
+            JOIN tdocs_monitor_subscriptions s ON s.subscription_id=d.subscription_id
+            WHERE s.monitor_id=? AND d.state='PENDING'
+            """,
+            (monitor_id,),
+        ).fetchone()[0]
+        wakes = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM tdocs_subscription_wakes w
+            JOIN tdocs_monitor_subscriptions s ON s.subscription_id=w.subscription_id
+            WHERE s.monitor_id=? AND w.state IN ('prepared','submitted','unknown')
+            """,
+            (monitor_id,),
+        ).fetchone()[0]
+        if pending or wakes:
+            raise LedgerError(
+                "DOCUMENT_MONITOR_RECONFIGURE_PENDING",
+                "重新配置前必须先清空 pending delivery 和 active wake",
+            )
+
     def list_monitors(self, state: str = "") -> list[dict[str, Any]]:
         connection = self.ledger._connect()
         try:
@@ -698,7 +796,26 @@ class TencentDocsMonitorService:
             poll_arguments,
             policy_ref,
         )
+        reconfigure = False
+        if monitor_id:
+            try:
+                self.store.assert_monitor_reconfigurable(monitor_id, resource_key)
+                reconfigure = True
+            except LedgerError as error:
+                if error.code != "DOCUMENT_MONITOR_NOT_FOUND":
+                    raise
         fingerprint, summary = await self._snapshot(poll_tool, poll_arguments)
+        if reconfigure:
+            return self.store.reconfigure_monitor(
+                monitor_id,
+                resource_kind,
+                resource_key,
+                poll_tool,
+                poll_arguments,
+                fingerprint,
+                summary,
+                policy_ref=policy_ref,
+            )
         return self.store.register_monitor(
             resource_kind,
             resource_key,

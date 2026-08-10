@@ -27,6 +27,16 @@ TOOL = {
     },
 }
 
+CONTENT_TOOL = {
+    "name": "get_content",
+    "description": "read document content",
+    "inputSchema": {
+        "type": "object",
+        "properties": {"file_id": {"type": "string"}},
+        "required": ["file_id"],
+    },
+}
+
 
 def policy_binding(
     *,
@@ -34,6 +44,7 @@ def policy_binding(
     listen: bool = True,
     resource_key: str = "private-file-id",
     policy_ref: str = "private-monitor-policy",
+    poll_tool: str = "manage.query_file_info",
     poll_arguments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
@@ -44,7 +55,7 @@ def policy_binding(
                     "policy_ref": policy_ref,
                     "resource_kind": "doc",
                     "resource_key": resource_key,
-                    "poll_tool": "manage.query_file_info",
+                    "poll_tool": poll_tool,
                     "poll_arguments": (
                         {"file_id": resource_key} if poll_arguments is None else poll_arguments
                     ),
@@ -143,6 +154,112 @@ def test_create_monitor_establishes_current_baseline_without_replay(tmp_path: Pa
     assert subscription["baseline_batch_seq"] == 0
     assert store.list_pending("subscription-one") == []
     assert store.get_active_wake("subscription-one") is None
+
+
+def test_create_monitor_reconfigures_paused_monitor_without_replay(tmp_path: Path) -> None:
+    _, store = make_store(tmp_path)
+    original_client = FakeDocsClient([tool_result({"modified_at": 1})])
+    original_service = monitor_service(store, original_client)
+    original = asyncio.run(
+        original_service.create_monitor(
+            "doc",
+            "private-file-id",
+            "manage.query_file_info",
+            {"file_id": "private-file-id"},
+            "private-monitor-policy",
+            monitor_id="monitor-one",
+        )
+    )
+    store.register_subscription(
+        "monitor-one", "conversation-one", 1, subscription_id="subscription-one"
+    )
+    store.set_subscription_state("subscription-one", 1, "paused")
+    store.set_monitor_state("monitor-one", "paused")
+
+    content_client = FakeDocsClient(
+        [tool_result({"text": "current document"})],
+        catalog=[CONTENT_TOOL],
+    )
+    content_service = monitor_service(
+        store,
+        content_client,
+        policy_binding(poll_tool="get_content"),
+    )
+    reconfigured = asyncio.run(
+        content_service.create_monitor(
+            "doc",
+            "private-file-id",
+            "get_content",
+            {"file_id": "private-file-id"},
+            "private-monitor-policy",
+            monitor_id="monitor-one",
+        )
+    )
+
+    assert reconfigured["poll_tool"] == "get_content"
+    assert reconfigured["state"] == "active"
+    assert reconfigured["baseline_fingerprint"] != original["baseline_fingerprint"]
+    assert store.list_pending("subscription-one") == []
+    assert store.get_active_wake("subscription-one") is None
+
+
+def test_active_monitor_cannot_be_reconfigured(tmp_path: Path) -> None:
+    _, store = make_store(tmp_path)
+    register_monitor(store, datetime(2026, 8, 10, tzinfo=timezone.utc))
+    content_client = FakeDocsClient([], catalog=[CONTENT_TOOL])
+    service = monitor_service(
+        store,
+        content_client,
+        policy_binding(poll_tool="get_content"),
+    )
+
+    with pytest.raises(LedgerError) as raised:
+        asyncio.run(
+            service.create_monitor(
+                "doc",
+                "private-file-id",
+                "get_content",
+                {"file_id": "private-file-id"},
+                "private-monitor-policy",
+                monitor_id="monitor-one",
+            )
+        )
+
+    assert raised.value.code == "DOCUMENT_MONITOR_RECONFIGURE_REQUIRES_PAUSED"
+    assert content_client.calls == []
+
+
+def test_monitor_with_pending_delivery_cannot_be_reconfigured(tmp_path: Path) -> None:
+    _, store = make_store(tmp_path)
+    start = datetime(2026, 8, 10, tzinfo=timezone.utc)
+    register_monitor(store, start)
+    store.register_subscription(
+        "monitor-one", "conversation-one", 1, subscription_id="subscription-one"
+    )
+    store.record_poll_success("monitor-one", "change-b", {"object_count": 1}, start)
+    store.promote_ready(start + timedelta(minutes=5))
+    store.set_monitor_state("monitor-one", "paused")
+    content_client = FakeDocsClient([], catalog=[CONTENT_TOOL])
+    service = monitor_service(
+        store,
+        content_client,
+        policy_binding(poll_tool="get_content"),
+    )
+
+    with pytest.raises(LedgerError) as raised:
+        asyncio.run(
+            service.create_monitor(
+                "doc",
+                "private-file-id",
+                "get_content",
+                {"file_id": "private-file-id"},
+                "private-monitor-policy",
+                monitor_id="monitor-one",
+            )
+        )
+
+    assert raised.value.code == "DOCUMENT_MONITOR_RECONFIGURE_PENDING"
+    assert content_client.calls == []
 
 
 def test_quiet_and_max_windows_merge_many_changes_into_one_wake(tmp_path: Path) -> None:

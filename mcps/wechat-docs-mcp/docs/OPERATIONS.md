@@ -119,6 +119,8 @@ tdocs_monitor_poll_stop(timeout=35)
 
 首次调用 `tdocs_monitor_create` 会先把资源、官方工具、参数和 `policy_ref` 与私有 `binding.json/tencentDocs.monitors` 做精确比对，再动态核对官方工具目录和必填字段，最后执行一次只读 baseline。每次后续轮询也会重新核对 allowlist，策略暂停、删除或不一致时不访问官方 MCP，baseline 不推进。正式资源 ID、轮询参数、conversation 与策略引用只保存在私有 binding/SQLite；公开模板仅提供 synthetic 占位值。
 
+同一资源需要切换只读轮询工具时，先暂停 monitor，并确保它的所有 delivery 已 ACK、active wake 已清空；随后用相同 `monitor_id` 再次调用 `tdocs_monitor_create`。服务只允许同一资源原地重新建立 baseline，不允许改绑另一资源，也不会回放切换前历史。
+
 ### 4.4 MCP 服务启动
 
 ```powershell
