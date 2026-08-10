@@ -193,12 +193,20 @@ function Test-PackageStructure {
         "mcps\napcat-mcp\ops\start-napcat-heartbeat.ps1",
         "mcps\napcat-mcp\test\core.test.mjs",
         "skills\skills_manifest.md",
+        "install\Start-CodexMcpBroker.ps1",
+        "install\Stop-CodexMcpBroker.ps1",
+        "install\Test-CodexMcpBrokerLifecycle.ps1",
         "install\Update-CodexMcpBroker.ps1",
         "templates\config.codex.toml",
         "templates\env.example.ps1"
     )) {
         $full = Join-Path $toolkitRoot $path
         if (-not (Test-Path -LiteralPath $full)) { throw "Missing required portable file: $full" }
+    }
+
+    $brokerUpdater = Get-Content -LiteralPath (Join-Path $toolkitRoot "install\Update-CodexMcpBroker.ps1") -Encoding UTF8 -Raw
+    foreach ($requiredText in @("SourceStartScript", "SourceStopScript", "lifecycleBootstrapped", "installedStartExisted", "installedStopExisted")) {
+        if (-not $brokerUpdater.Contains($requiredText)) { throw "Broker updater is missing portable lifecycle bootstrap behavior: $requiredText" }
     }
 
     foreach ($path in @(

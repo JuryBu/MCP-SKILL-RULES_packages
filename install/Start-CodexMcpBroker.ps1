@@ -1,10 +1,24 @@
 ﻿$ErrorActionPreference = "Stop"
 
-$toolkitRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$brokerDir = Join-Path $toolkitRoot "mcps\broker"
+$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
+$flatBrokerPath = Join-Path $scriptDirectory "broker.mjs"
+$isFlatInstallation = Test-Path -LiteralPath $flatBrokerPath -PathType Leaf
+$toolkitRoot = Split-Path -Parent $scriptDirectory
+$brokerDir = if ($isFlatInstallation) { $scriptDirectory } else { Join-Path $toolkitRoot "mcps\broker" }
 $brokerScript = [System.IO.Path]::GetFullPath((Join-Path $brokerDir "broker.mjs"))
+$privateEnvPath = Join-Path $brokerDir "broker-private.env.json"
+
+if ($isFlatInstallation -and (Test-Path -LiteralPath $privateEnvPath -PathType Leaf)) {
+    $privateEnv = Get-Content -LiteralPath $privateEnvPath -Encoding UTF8 -Raw | ConvertFrom-Json
+    foreach ($property in $privateEnv.PSObject.Properties) {
+        if ($property.Name -and $null -ne $property.Value -and [string]$property.Value -ne "") {
+            Set-Item -LiteralPath "Env:$($property.Name)" -Value ([string]$property.Value)
+        }
+    }
+}
+
 $dataRoot = if ($env:CODEX_TOOLKIT_DATA_ROOT) { $env:CODEX_TOOLKIT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit" }
-$brokerDataDir = Join-Path $dataRoot "mcp-http-broker"
+$brokerDataDir = if ($isFlatInstallation) { $brokerDir } else { Join-Path $dataRoot "mcp-http-broker" }
 $stdoutPath = Join-Path $brokerDataDir "broker-stdout.log"
 $stderrPath = Join-Path $brokerDataDir "broker-stderr.log"
 $pidPath = Join-Path $brokerDataDir "broker.pid"
@@ -52,14 +66,18 @@ if ($existingBroker) {
 }
 
 $previousEnv = @{}
-$envVars = @{
-    CODEX_TOOLKIT_MCP_ROOT = (Join-Path $toolkitRoot "mcps")
-    CODEX_TOOLKIT_DATA_ROOT = $dataRoot
-    CODEX_MCP_BROKER_LOG = (Join-Path $brokerDataDir "broker.log")
-    CODEX_MCP_BROKER_STATE = $statePath
-    MEMORY_STORE_DATA_ROOT = (Join-Path $dataRoot "memory-store")
-    SANDBOX_DATA_ROOT = (Join-Path $dataRoot "sandbox-data")
-    WEB_FETCHER_PROFILE_BASE_DIR = (Join-Path $dataRoot "web-fetcher-profiles")
+$envVars = if ($isFlatInstallation) {
+    @{}
+} else {
+    @{
+        CODEX_TOOLKIT_MCP_ROOT = (Join-Path $toolkitRoot "mcps")
+        CODEX_TOOLKIT_DATA_ROOT = $dataRoot
+        CODEX_MCP_BROKER_LOG = (Join-Path $brokerDataDir "broker.log")
+        CODEX_MCP_BROKER_STATE = $statePath
+        MEMORY_STORE_DATA_ROOT = (Join-Path $dataRoot "memory-store")
+        SANDBOX_DATA_ROOT = (Join-Path $dataRoot "sandbox-data")
+        WEB_FETCHER_PROFILE_BASE_DIR = (Join-Path $dataRoot "web-fetcher-profiles")
+    }
 }
 foreach ($entry in $envVars.GetEnumerator()) {
     $previousEnv[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, "Process")
