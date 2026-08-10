@@ -11,7 +11,7 @@ param(
   [string]$CandidateManifestPath,
   [string]$DrillRoot,
   [string]$Endpoint = "wechat-docs",
-  [int]$ExpectedCurrentToolCount = 49,
+  [int]$ExpectedCurrentToolCount = 50,
   [int]$ExpectedToolCount = 50,
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,

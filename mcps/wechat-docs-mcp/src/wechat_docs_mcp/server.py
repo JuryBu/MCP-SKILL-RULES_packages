@@ -93,7 +93,11 @@ IMAGE_VIEWER_TITLES = tuple(
     if title.strip()
 )
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
-OUTBOUND_ENABLED = os.environ.get("WECHAT_DOCS_MCP_OUTBOUND_ENABLED", "0") == "1"
+OUTBOUND_ENABLED = resolve_private_runtime_flag(
+    DATA_ROOT,
+    "outboundWeChatEnabled",
+    "WECHAT_DOCS_MCP_OUTBOUND_ENABLED",
+)
 ATTACHMENT_OUTBOUND_ENABLED = resolve_private_runtime_flag(
     DATA_ROOT,
     "attachmentOutboundWeChatEnabled",

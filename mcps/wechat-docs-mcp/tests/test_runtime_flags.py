@@ -36,14 +36,16 @@ class PrivateRuntimeFlagTests(unittest.TestCase):
             self.write_runtime(root, True)
             environment = os.environ.copy()
             environment["WECHAT_DOCS_MCP_DATA_ROOT"] = str(root)
+            environment.pop("WECHAT_DOCS_MCP_OUTBOUND_ENABLED", None)
             environment.pop("WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED", None)
             result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
                     (
-                        "from wechat_docs_mcp.server import ATTACHMENT_OUTBOUND_ENABLED; "
-                        "print(ATTACHMENT_OUTBOUND_ENABLED)"
+                        "from wechat_docs_mcp.server import "
+                        "ATTACHMENT_OUTBOUND_ENABLED, OUTBOUND_ENABLED; "
+                        "print(OUTBOUND_ENABLED, ATTACHMENT_OUTBOUND_ENABLED)"
                     ),
                 ],
                 env=environment,
@@ -54,7 +56,7 @@ class PrivateRuntimeFlagTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("True", result.stdout.strip())
+            self.assertEqual("True True", result.stdout.strip())
 
     def test_missing_malformed_and_non_boolean_values_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -76,7 +78,12 @@ class PrivateRuntimeFlagTests(unittest.TestCase):
         runtime_path = root / "config" / "service-runtime.json"
         runtime_path.parent.mkdir(parents=True)
         runtime_path.write_text(
-            json.dumps({"attachmentOutboundWeChatEnabled": value}),
+            json.dumps(
+                {
+                    "outboundWeChatEnabled": value,
+                    "attachmentOutboundWeChatEnabled": value,
+                }
+            ),
             encoding="utf-8",
         )
 
