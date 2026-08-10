@@ -1,0 +1,446 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import sqlite3
+import struct
+from pathlib import Path
+
+import httpx
+import pytest
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad
+
+from wechat_docs_mcp.ledger import EventLedger, LedgerError
+from wechat_docs_mcp.wechat_attachment_source import WechatAttachmentSourceResolver
+
+
+OWNER_KEY = "synthetic-owner"
+USERNAME = "synthetic-room@chatroom"
+FILE_BYTES = b"synthetic attachment"
+STICKER_BYTES = b"synthetic sticker"
+
+
+def _message_table(username: str) -> str:
+    digest = hashlib.md5(username.encode("utf-8")).hexdigest()
+    return f"Msg_{digest}"
+
+
+def _binding() -> dict[str, object]:
+    return {
+        "schemaVersion": 1,
+        "ownerAccountKey": OWNER_KEY,
+        "routes": [
+            {
+                "route_id": "route-a",
+                "exact_title": "Synthetic Room",
+                "chat_type": "group",
+                "username": USERNAME,
+                "state": "active",
+            }
+        ],
+    }
+
+
+def _write_message_database(
+    root: Path,
+    content: str,
+    *,
+    local_id: int,
+    server_id: int,
+    local_type: int = 49,
+) -> None:
+    database = root / "message" / "message_0.db"
+    database.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            f"""
+            CREATE TABLE [{_message_table(USERNAME)}](
+              local_id INTEGER,
+              server_id INTEGER,
+              local_type INTEGER,
+              create_time INTEGER,
+              message_content TEXT,
+              WCDB_CT_message_content INTEGER
+            )
+            """
+        )
+        connection.execute(
+            f"INSERT INTO [{_message_table(USERNAME)}] VALUES(?,?,?,?,?,?)",
+            (local_id, server_id, local_type, 1_723_680_000, content, 0),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_hardlink_database(root: Path, *, file_name: str, size: int, content_md5: str) -> None:
+    database = root / "hardlink" / "hardlink.db"
+    database.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute(
+            "CREATE TABLE file_hardlink_info_v4(md5 TEXT,file_name TEXT,file_size INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO file_hardlink_info_v4 VALUES(?,?,?)",
+            (content_md5, file_name, size),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_emoticon_database(root: Path, *, content_md5: str, url: str) -> None:
+    database = root / "emoticon" / "emoticon.db"
+    database.parent.mkdir(parents=True)
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("CREATE TABLE kNonStoreEmoticonTable(md5 TEXT,cdn_url TEXT)")
+        connection.execute("INSERT INTO kNonStoreEmoticonTable VALUES(?,?)", (content_md5, url))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _write_image_databases(
+    root: Path,
+    *,
+    local_id: int,
+    server_id: int,
+    file_id: str,
+    content_md5: str,
+    size: int,
+) -> None:
+    resource = root / "message" / "message_resource.db"
+    resource.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(resource)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE ChatName2Id(user_name TEXT);
+            CREATE TABLE MessageResourceInfo(
+              chat_id INTEGER,message_local_id INTEGER,message_svr_id INTEGER,
+              message_local_type INTEGER,packed_info BLOB
+            );
+            """
+        )
+        connection.execute("INSERT INTO ChatName2Id(rowid,user_name) VALUES(1,?)", (USERNAME,))
+        packed_info = b"\x12\x22\x0a\x20" + file_id.encode("ascii")
+        connection.execute(
+            "INSERT INTO MessageResourceInfo VALUES(?,?,?,?,?)",
+            (1, local_id, server_id, 3, packed_info),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    hardlink = root / "hardlink" / "hardlink.db"
+    hardlink.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(hardlink)
+    try:
+        connection.execute(
+            "CREATE TABLE image_hardlink_info_v4(md5 TEXT,file_name TEXT,file_size INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO image_hardlink_info_v4 VALUES(?,?,?)",
+            (content_md5, f"{file_id}_h.dat", size),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _encrypt_v2_image(payload: bytes, aes_key: bytes, xor_key: int) -> bytes:
+    aes_size = min(1024, len(payload))
+    encrypted = AES.new(aes_key, AES.MODE_ECB).encrypt(pad(payload[:aes_size], 16))
+    tail = bytes(value ^ xor_key for value in payload[aes_size:])
+    return b"\x07\x08V2\x08\x07" + struct.pack("<LLB", aes_size, len(tail), 1) + encrypted + tail
+
+
+def _resolver(tmp_path: Path) -> tuple[WechatAttachmentSourceResolver, EventLedger, Path, Path]:
+    decrypted = tmp_path / "decrypted"
+    account = tmp_path / "account"
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    ledger.register_route(
+        "route-a",
+        profile="test",
+        identity={"chat_name": "Synthetic Room", "chat_type": "group", "username": USERNAME},
+        state="active",
+    )
+    return WechatAttachmentSourceResolver(ledger, _binding(), decrypted, account), ledger, decrypted, account
+
+
+def _attachment(*, kind: str, local_id: int, server_id: int, size: int, content_md5: str) -> dict[str, object]:
+    return {
+        "route_id": "route-a",
+        "kind": kind,
+        "local_id": local_id,
+        "server_id": str(server_id),
+        "byte_count": size,
+        "content_md5": content_md5,
+        "source_fingerprint": f"{USERNAME}:{local_id}:{server_id}",
+    }
+
+
+def test_file_materialization_requires_exact_message_index_and_entity(tmp_path: Path) -> None:
+    resolver, _, decrypted, account = _resolver(tmp_path)
+    file_name = "sample.pdf"
+    content_md5 = hashlib.md5(FILE_BYTES).hexdigest()
+    content = (
+        "<msg><appmsg><title>sample.pdf</title><md5>"
+        f"{content_md5}</md5><appattach><totallen>{len(FILE_BYTES)}</totallen>"
+        "</appattach></appmsg></msg>"
+    )
+    _write_message_database(decrypted, content, local_id=7, server_id=99)
+    _write_hardlink_database(
+        decrypted,
+        file_name=file_name,
+        size=len(FILE_BYTES),
+        content_md5=content_md5,
+    )
+    source = account / "msg" / "file" / "2024-08" / file_name
+    source.parent.mkdir(parents=True)
+    source.write_bytes(FILE_BYTES)
+
+    destination = tmp_path / "materialized.pdf"
+    source_kind = resolver.materialize(
+        _attachment(
+            kind="file",
+            local_id=7,
+            server_id=99,
+            size=len(FILE_BYTES),
+            content_md5=content_md5,
+        ),
+        destination,
+    )
+
+    assert source_kind == "wechat_local_file"
+    assert destination.read_bytes() == FILE_BYTES
+
+
+def test_v1_route_fingerprint_mismatch_is_rejected_before_database_read(tmp_path: Path) -> None:
+    resolver, _, _, _ = _resolver(tmp_path)
+    attachment = _attachment(
+        kind="file",
+        local_id=7,
+        server_id=99,
+        size=len(FILE_BYTES),
+        content_md5=hashlib.md5(FILE_BYTES).hexdigest(),
+    )
+    attachment["source_fingerprint"] = "other-room@chatroom:7:99"
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(attachment, tmp_path / "materialized.pdf")
+    assert raised.value.code == "ATTACHMENT_ROUTE_UNVERIFIED"
+
+
+def test_sticker_download_rejects_redirect_and_accepts_integrity_checked_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver, _, decrypted, _ = _resolver(tmp_path)
+    content_md5 = hashlib.md5(STICKER_BYTES).hexdigest()
+    content = (
+        "<msg><emoji md5=\""
+        f"{content_md5}\" len=\"{len(STICKER_BYTES)}\" width=\"1\" height=\"1\"/>"
+        "</msg>"
+    )
+    _write_message_database(decrypted, content, local_id=8, server_id=100)
+    _write_emoticon_database(
+        decrypted,
+        content_md5=content_md5,
+        url="https://vweixinf.tc.qq.com/synthetic",
+    )
+    attachment = _attachment(
+        kind="sticker",
+        local_id=8,
+        server_id=100,
+        size=len(STICKER_BYTES),
+        content_md5=content_md5,
+    )
+    real_client = httpx.Client
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **_: real_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(302, headers={"Location": "https://example.invalid"})
+            ),
+            follow_redirects=False,
+        ),
+    )
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(attachment, tmp_path / "redirect.partial")
+    assert raised.value.code == "ATTACHMENT_CDN_HTTP"
+
+    monkeypatch.setattr(
+        httpx,
+        "Client",
+        lambda **_: real_client(
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, content=STICKER_BYTES)),
+            follow_redirects=False,
+        ),
+    )
+    destination = tmp_path / "sticker.partial"
+    assert resolver.materialize(attachment, destination) == "wechat_sticker_cdn"
+    assert destination.read_bytes() == STICKER_BYTES
+
+
+def test_sticker_rejects_unapproved_cdn_host(tmp_path: Path) -> None:
+    resolver, _, decrypted, _ = _resolver(tmp_path)
+    content_md5 = hashlib.md5(STICKER_BYTES).hexdigest()
+    content = (
+        "<msg><emoji md5=\""
+        f"{content_md5}\" len=\"{len(STICKER_BYTES)}\" width=\"1\" height=\"1\"/>"
+        "</msg>"
+    )
+    _write_message_database(decrypted, content, local_id=9, server_id=101)
+    _write_emoticon_database(
+        decrypted,
+        content_md5=content_md5,
+        url="https://example.invalid/synthetic",
+    )
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(
+            _attachment(
+                kind="sticker",
+                local_id=9,
+                server_id=101,
+                size=len(STICKER_BYTES),
+                content_md5=content_md5,
+            ),
+            tmp_path / "sticker.partial",
+        )
+    assert raised.value.code == "ATTACHMENT_CDN_NOT_ALLOWED"
+
+
+def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integrity(
+    tmp_path: Path,
+) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 10
+    server_id = 102
+    file_id = "a" * 32
+    aes_key = b"syntheticAESkey1"
+    xor_key = 0xD4
+    payload = b"\xff\xd8\xff\xe0" + (b"synthetic-image" * 140) + b"\xff\xd9"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    content = (
+        "<msg><img originsourcemd5=\""
+        f"{content_md5}\" md5=\"{content_md5}\" hdlength=\"{len(payload)}\"/></msg>"
+    )
+    _write_message_database(
+        decrypted,
+        content,
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    source = (
+        account
+        / "msg"
+        / "attach"
+        / hashlib.md5(USERNAME.encode("utf-8")).hexdigest()
+        / "2024-08"
+        / "Img"
+        / f"{file_id}_h.dat"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_encrypt_v2_image(payload, aes_key, xor_key))
+    key_file = tmp_path / "private-image-key.json"
+    key_file.write_text(
+        json.dumps({"version": 1, "aes_key": aes_key.decode("ascii"), "xor_key": xor_key}),
+        encoding="utf-8",
+    )
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        key_file,
+    )
+    destination = tmp_path / "image.partial"
+
+    source_kind = resolver.materialize(
+        _attachment(
+            kind="image",
+            local_id=local_id,
+            server_id=server_id,
+            size=len(payload),
+            content_md5=content_md5,
+        ),
+        destination,
+    )
+
+    assert source_kind == "wechat_v2_image_dat"
+    assert destination.read_bytes() == payload
+
+
+def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    payload = b"\xff\xd8\xff" + b"x" * 1200 + b"\xff\xd9"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    file_id = "b" * 32
+    _write_message_database(
+        decrypted,
+        f'<msg><img aeskey="0123456789abcdef0123456789abcdef" md5="{content_md5}" '
+        f'originsourcemd5="{content_md5}" hdlength="{len(payload)}"/></msg>',
+        local_id=11,
+        server_id=103,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=11,
+        server_id=103,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    source = (
+        account
+        / "msg"
+        / "attach"
+        / hashlib.md5(USERNAME.encode("utf-8")).hexdigest()
+        / "2024-08"
+        / "Img"
+        / f"{file_id}_h.dat"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_encrypt_v2_image(payload, b"correctAESkey123", 0x88))
+    wrong_key_file = tmp_path / "wrong-key.json"
+    wrong_key_file.write_text(
+        json.dumps({"version": 1, "aes_key": "0123456789abcdef", "xor_key": 0x88}),
+        encoding="utf-8",
+    )
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        wrong_key_file,
+    )
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(
+            _attachment(
+                kind="image",
+                local_id=11,
+                server_id=103,
+                size=len(payload),
+                content_md5=content_md5,
+            ),
+            tmp_path / "wrong.partial",
+        )
+    assert raised.value.code == "ATTACHMENT_IMAGE_DECRYPT"

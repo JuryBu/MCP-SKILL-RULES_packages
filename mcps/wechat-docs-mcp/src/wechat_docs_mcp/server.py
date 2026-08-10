@@ -5,12 +5,15 @@ import json
 import os
 import threading
 import uuid
+from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.types import CallToolResult
 
+from .attachment_reader import VisualAttachmentReader
 from .attachments import AttachmentRegistry
 from .db_observer import RouteBinding
 from .db_watcher import DbWatcher
@@ -19,9 +22,15 @@ from .document_monitor import DocumentMonitorStore, TencentDocsMonitorService
 from .document_policy import PrivateBindingDocumentMonitorVerifier
 from .ledger import EventLedger, LedgerError
 from .outbound import SafeTextOutbound
+from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
 from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
+from .wechat_attachment_source import WechatAttachmentSourceResolver
+from .wechat_attachment_outbound import SafeAttachmentOutbound
+from .wechat_outbound_verifier import WechatAttachmentDatabaseVerifier
+from .win32_attachment_ui import Win32WechatAttachmentBackend
+from .visible_view_capture import VisibleViewCapture, Win32VisibleViewerBackend
 
 
 DATA_ROOT = Path(os.environ.get("WECHAT_DOCS_MCP_DATA_ROOT", Path.home() / ".codex-toolkit" / "wechat-docs-mcp"))
@@ -33,6 +42,7 @@ TOKEN_FILE = Path(
 )
 _ENCRYPTED_DB_DIR_RAW = os.environ.get("WECHAT_ENCRYPTED_DB_DIR", "")
 ENCRYPTED_DB_DIR: Path | None = Path(_ENCRYPTED_DB_DIR_RAW) if _ENCRYPTED_DB_DIR_RAW else None
+WECHAT_ACCOUNT_ROOT: Path | None = ENCRYPTED_DB_DIR.parent if ENCRYPTED_DB_DIR is not None else None
 DECRYPTED_DIR = DATA_ROOT / "private-state" / "decrypted"
 KEYS_FILE = DATA_ROOT / "private-state" / "keys" / "all_keys.json"
 BINDING_FILE = DATA_ROOT / "config" / "binding.json"
@@ -42,8 +52,31 @@ ATTACHMENT_INTAKE_ROOT = Path(
 ATTACHMENT_UPLOAD_ROOT = Path(
     os.environ.get("WECHAT_DOCS_MCP_UPLOAD_ROOT", DATA_ROOT / "upload")
 )
+ATTACHMENT_DERIVED_ROOT = Path(
+    os.environ.get("WECHAT_DOCS_MCP_DERIVED_ROOT", DATA_ROOT / "derived")
+)
+SOFFICE_PATH = Path(
+    os.environ.get(
+        "WECHAT_DOCS_MCP_SOFFICE_PATH",
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+    )
+)
+IMAGE_KEY_FILE = Path(
+    os.environ.get(
+        "WECHAT_DOCS_MCP_IMAGE_KEY_FILE",
+        DATA_ROOT / "secrets" / "wechat-image-v2.json",
+    )
+)
+IMAGE_VIEWER_TITLES = tuple(
+    title.strip()
+    for title in os.environ.get("WECHAT_DOCS_MCP_IMAGE_VIEWER_TITLES", "图片和视频").split(";")
+    if title.strip()
+)
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
 OUTBOUND_ENABLED = os.environ.get("WECHAT_DOCS_MCP_OUTBOUND_ENABLED", "0") == "1"
+ATTACHMENT_OUTBOUND_ENABLED = (
+    os.environ.get("WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED", "0") == "1"
+)
 _WAKE_RUNTIME_RAW = os.environ.get("CODEX_WAKE_PROXY_RUNTIME_FILE", "")
 _WAKE_TOKEN_RAW = os.environ.get("CODEX_WAKE_PROXY_TOKEN_FILE", "")
 WAKE_RUNTIME_FILE = Path(_WAKE_RUNTIME_RAW) if _WAKE_RUNTIME_RAW else None
@@ -69,6 +102,55 @@ def docs_client() -> TencentDocsMcpClient:
 
 def attachment_registry() -> AttachmentRegistry:
     return AttachmentRegistry(ledger(), ATTACHMENT_INTAKE_ROOT, ATTACHMENT_UPLOAD_ROOT)
+
+
+def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSourceResolver:
+    if WECHAT_ACCOUNT_ROOT is None or not WECHAT_ACCOUNT_ROOT.exists():
+        raise LedgerError("WECHAT_ACCOUNT_ROOT_NOT_READY", "微信账号数据根目录未配置")
+    return WechatAttachmentSourceResolver(
+        event_ledger,
+        _load_binding_document(),
+        DECRYPTED_DIR,
+        WECHAT_ACCOUNT_ROOT,
+        IMAGE_KEY_FILE,
+    )
+
+
+def attachment_reader(event_ledger: EventLedger) -> VisualAttachmentReader:
+    return VisualAttachmentReader(
+        AttachmentRegistry(event_ledger, ATTACHMENT_INTAKE_ROOT, ATTACHMENT_UPLOAD_ROOT),
+        attachment_source_resolver(event_ledger),
+        ATTACHMENT_DERIVED_ROOT,
+        LocalOfficeConverter(ATTACHMENT_DERIVED_ROOT, SOFFICE_PATH),
+    )
+
+
+def visible_view_capture(event_ledger: EventLedger) -> VisibleViewCapture:
+    return VisibleViewCapture(
+        AttachmentRegistry(event_ledger, ATTACHMENT_INTAKE_ROOT, ATTACHMENT_UPLOAD_ROOT),
+        ATTACHMENT_DERIVED_ROOT,
+        Win32VisibleViewerBackend(viewer_titles=IMAGE_VIEWER_TITLES),
+    )
+
+
+def _refresh_decrypted_for_outbound() -> None:
+    active_watcher = watcher()
+    if active_watcher is None:
+        raise LedgerError("WECHAT_WATCHER_NOT_READY", "微信数据库 watcher 未就绪")
+    result = active_watcher.watch_once(force_refresh=True)
+    if result.error:
+        raise LedgerError("WECHAT_DATABASE_REFRESH_FAILED", result.error)
+
+
+def attachment_outbound_sender(event_ledger: EventLedger) -> SafeAttachmentOutbound:
+    route_verifier = PrivateBindingRouteVerifier(_load_binding_document())
+    return SafeAttachmentOutbound(
+        event_ledger,
+        route_verifier,
+        Win32WechatAttachmentBackend(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
+        WechatAttachmentDatabaseVerifier(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
+        ATTACHMENT_UPLOAD_ROOT,
+    )
 
 
 def document_change_coalescer() -> DocumentChangeCoalescer:
@@ -529,12 +611,14 @@ def outbound_verify_observed(draft_id: str, observed_event_id: str) -> dict[str,
 def wechat_outbound_capabilities() -> dict[str, Any]:
     """Describe the current outbound implementation without touching the WeChat UI."""
     return {
-        "production_enabled": False,
+        "production_enabled": OUTBOUND_ENABLED or ATTACHMENT_OUTBOUND_ENABLED,
         "configured_enabled": OUTBOUND_ENABLED,
+        "attachment_configured_enabled": ATTACHMENT_OUTBOUND_ENABLED,
         "visible_ui_backend_implemented": False,
         "text_skeleton_available": True,
+        "attachment_visible_ui_backend_implemented": True,
         "experimental_hidden_wm_char": SafeTextOutbound.capabilities.experimental_hidden_wm_char,
-        "database_direction_verifier_implemented": False,
+        "database_direction_verifier_implemented": True,
     }
 
 
@@ -556,27 +640,172 @@ def wechat_attachment_download_record(transfer_id: str, local_path: str) -> dict
 
 
 @mcp.tool()
+def wechat_attachment_download(
+    subscription_id: str,
+    event_id: str,
+    attachment_ref: str,
+    dedupe_key: str,
+    destination_dir: str = "",
+) -> dict[str, Any]:
+    """Materialize one precisely delivered attachment without overwriting existing files."""
+    event_ledger = ledger()
+    return AttachmentRegistry(
+        event_ledger,
+        ATTACHMENT_INTAKE_ROOT,
+        ATTACHMENT_UPLOAD_ROOT,
+    ).download(
+        subscription_id,
+        event_id,
+        attachment_ref,
+        destination_dir,
+        dedupe_key,
+        attachment_source_resolver(event_ledger),
+    )
+
+
+@mcp.tool()
+def wechat_read_attachments(
+    subscription_id: str,
+    attachment_refs: list[str],
+    pages: dict[str, list[int]] | None = None,
+    page_ranges: dict[str, list[str]] | None = None,
+    continuation_cursor: str = "",
+    mode: str = "auto",
+    max_images: int = 8,
+    max_pixels: int = 24_000_000,
+    max_bytes: int = 8 * 1024 * 1024,
+) -> CallToolResult:
+    """Read authorized images and document pages with hard count, pixel, and response budgets."""
+    event_ledger = ledger()
+    return attachment_reader(event_ledger).read(
+        subscription_id,
+        attachment_refs,
+        pages=pages,
+        page_ranges=page_ranges,
+        continuation_cursor=continuation_cursor,
+        mode=mode,
+        max_images=max_images,
+        max_pixels=max_pixels,
+        max_bytes=max_bytes,
+    )
+
+
+@mcp.tool()
+def wechat_read_image(
+    subscription_id: str,
+    attachment_ref: str,
+    mode: str = "auto",
+) -> CallToolResult:
+    """Thin single-image wrapper over wechat_read_attachments; arbitrary local paths are rejected."""
+    event_ledger = ledger()
+    return attachment_reader(event_ledger).read(
+        subscription_id,
+        [attachment_ref],
+        mode=mode,
+        max_images=1,
+    )
+
+
+@mcp.tool()
+def wechat_capture_visible_image_preview(
+    subscription_id: str,
+    event_id: str,
+    attachment_ref: str,
+    human_assisted_confirmation_ref: str,
+) -> CallToolResult:
+    """Capture one owner-opened WeChat image viewer without focusing it; returns a non-original preview."""
+    event_ledger = ledger()
+    return visible_view_capture(event_ledger).capture(
+        subscription_id,
+        event_id,
+        attachment_ref,
+        human_assisted_confirmation_ref,
+    )
+
+
+@mcp.tool()
 def wechat_attachment_upload_prepare(
     subscription_id: str,
     route_id: str,
     local_path: str,
     dedupe_key: str,
     capability: str = "file",
+    ttl_seconds: int = 600,
 ) -> dict[str, Any]:
-    """Hash an allowed local file for a later approved upload; this tool does not send it."""
+    """Prepare an immutable attachment draft and transfer manifest without touching WeChat UI."""
     if capability not in {"file", "image"}:
         raise ValueError("capability must be file or image")
+    if not 30 <= ttl_seconds <= 3600:
+        raise ValueError("ttl_seconds must be between 30 and 3600")
     event_ledger = ledger()
     PrivateBindingRouteVerifier(_load_binding_document()).verify(
         route_id,
         event_ledger.get_route(route_id),
         capability,
     )
+    expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     return AttachmentRegistry(
         event_ledger,
         ATTACHMENT_INTAKE_ROOT,
         ATTACHMENT_UPLOAD_ROOT,
-    ).prepare_upload(subscription_id, route_id, local_path, dedupe_key)
+    ).prepare_upload_draft(
+        subscription_id,
+        route_id,
+        local_path,
+        dedupe_key,
+        capability,
+        expires_at,
+    )
+
+
+@mcp.tool()
+def wechat_attachment_upload_execute(
+    draft_id: str,
+    payload: dict[str, Any],
+    dedupe_key: str,
+    lease_seconds: int = 90,
+) -> dict[str, Any]:
+    """Execute one approved attachment draft; UNKNOWN is never retried automatically."""
+    if not ATTACHMENT_OUTBOUND_ENABLED:
+        raise LedgerError("ATTACHMENT_OUTBOUND_DISABLED", "附件 outbound 未在本机私有运行配置中启用")
+    if not 30 <= lease_seconds <= 180:
+        raise ValueError("lease_seconds must be between 30 and 180")
+    event_ledger = ledger()
+    result = attachment_outbound_sender(event_ledger).execute(
+        draft_id=draft_id,
+        payload=payload,
+        dedupe_key=dedupe_key,
+        lease_expires_at=(
+            datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+        ).isoformat(),
+    )
+    return asdict(result)
+
+
+@mcp.tool()
+def wechat_attachment_upload_verify(draft_id: str) -> dict[str, Any]:
+    """Verify a prior SEND_ATTEMPTED or UNKNOWN attachment without sending it again."""
+    event_ledger = ledger()
+    draft = event_ledger.get_draft(draft_id)
+    if draft["state"] not in {"SEND_ATTEMPTED", "UNKNOWN"}:
+        raise LedgerError("DRAFT_STATE_INVALID", f"draft 当前状态为 {draft['state']}")
+    result = draft.get("result") or {}
+    baseline = result.get("baseline_local_id")
+    if not isinstance(baseline, int):
+        raise LedgerError("ATTACHMENT_BASELINE_MISSING", "draft 缺少发送前数据库 baseline")
+    kind = str(draft["kind"])
+    capability = "image" if kind == "wechat_image" else "file"
+    route = PrivateBindingRouteVerifier(_load_binding_document()).verify(
+        draft["route_id"],
+        event_ledger.get_route(draft["route_id"]),
+        capability,
+    )
+    observation = WechatAttachmentDatabaseVerifier(
+        DECRYPTED_DIR,
+        _refresh_decrypted_for_outbound,
+    ).verify(route, kind, draft["payload"], baseline)
+    observation["baseline_local_id"] = baseline
+    return event_ledger.verify_attachment_draft(draft_id, observation)
 
 
 @mcp.tool()

@@ -197,7 +197,7 @@ Codex 侧 MCP 通过 HTTP broker（`127.0.0.1:14588`）暴露。broker 后端进
 
 腾讯文档资源使用独立的 private allowlist、monitor 与 M:N subscription，不复用微信 route。首次成功只读轮询只建立当前 baseline，不回放旧历史；网络错误、官方 `isError` 或不完整分页不得推进 baseline。收到 `[TDOCS_MONITOR_WAKE]` 后，按 `subscription_id` 列出合并批次摘要，处理后用同一 generation、wake 和明确 `batch_id` 精确 ACK；一个文档订阅 ACK 不影响其它订阅。可见提醒不得包含文档正文。
 
-监听授权与发送授权彼此独立。微信文字/文件发送、腾讯文档写入和其它变更操作必须显式指定唯一 route，使用未变化、未过期的草稿，并携带非空 `owner_authorization_refs` 与 `dedupe_key`；route enrollment、旧批准或 Agent 自己的消息不能替代主人对当前动作的授权。发送状态只使用 `PREPARED/APPROVED/EXECUTING/SEND_ATTEMPTED/VERIFIED/FAILED/UNKNOWN`，`UNKNOWN` 不自动重试，UI 动作不能冒充数据库验证。下载文件记录来源、大小和 SHA-256，不自动执行或解压。腾讯文档变化按 5 分钟安静窗口、15 分钟最长批次合并。跨 QQ/微信机器任务保留 transport、trace、delivery、hop 与 dedupe 字段，默认拒绝未知 route 并防止循环。
+监听授权与发送授权彼此独立。微信文字/文件发送、腾讯文档写入和其它变更操作必须显式指定唯一 route，使用未变化、未过期的草稿，并携带非空 `owner_authorization_refs` 与 `dedupe_key`；route enrollment、旧批准或 Agent 自己的消息不能替代主人对当前动作的授权。发送状态只使用 `PREPARED/APPROVED/EXECUTING/SEND_ATTEMPTED/VERIFIED/FAILED/UNKNOWN`，`UNKNOWN` 不自动重试，UI 动作不能冒充数据库验证。附件收到时只入账元数据和不可伪造的 `attachment_ref`；按需下载后记录来源、大小、SHA-256、MIME 和可得尺寸，不自动 OCR、解析、执行或解压，表情与普通图片不得混同。需要把图片、PDF 或 Office 页送入视觉上下文时，使用 subscription-scoped 的附件读取工具；遵守图片数、像素与返回字节预算，并沿稳定 continuation cursor 续读，不能传任意本机路径或静默漏页。若只能由用户手动打开客户端图片查看器再抓取当前视窗，必须显式标注 `human_assisted`、`viewport_preview`、非原件和无法机器绑定消息身份，不得用预览哈希冒充原件哈希；窗口不唯一、焦点变化或质量不足时拒绝。附件上传只有在唯一 post-baseline 出站数据库记录匹配 route、MD5 和大小时才能称为 `VERIFIED`。腾讯文档变化按 5 分钟安静窗口、15 分钟最长批次合并。跨 QQ/微信机器任务保留 transport、trace、delivery、hop 与 dedupe 字段，默认拒绝未知 route 并防止循环。
 
 微信 bridge 健康只证明对应层：`wechat_status` 的 watcher ready 不等于 broker 已暴露、Codex 已收到可见提醒、锁屏仍稳定或断线消息可补回。真实账号、群名、微信号、token、数据库路径和 conversation binding 只能存在本机私有覆盖，公开 Rules、Skill、日志样例和测试夹具不得包含。
 

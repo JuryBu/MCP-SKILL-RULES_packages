@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
+import secrets
 import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_SUBSCRIPTION_NAMESPACE = uuid.UUID("0f2926e1-71c8-4b22-92f7-4ef81461bdf8")
 REQUIRED_V2_TABLES = {
     "schema_meta",
@@ -27,6 +29,7 @@ REQUIRED_V3_TABLES = REQUIRED_V2_TABLES | {
     "tdocs_batch_deliveries",
     "tdocs_subscription_wakes",
 }
+REQUIRED_V4_TABLES = REQUIRED_V3_TABLES | {"attachments", "outbound_attachment_verifications"}
 
 
 def utc_now() -> str:
@@ -75,7 +78,7 @@ def _is_current_schema(path: Path) -> bool:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if not REQUIRED_V3_TABLES.issubset(tables):
+        if not REQUIRED_V4_TABLES.issubset(tables):
             return False
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
@@ -428,6 +431,102 @@ def _create_v3_tables(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_v4_tables(connection: sqlite3.Connection) -> None:
+    _execute_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS attachments(
+          attachment_ref TEXT PRIMARY KEY,
+          event_id TEXT NOT NULL UNIQUE REFERENCES events(event_id),
+          route_id TEXT NOT NULL REFERENCES routes(route_id),
+          kind TEXT NOT NULL CHECK(kind IN ('file','image','sticker')),
+          local_id INTEGER,
+          server_id TEXT,
+          file_name TEXT,
+          byte_count INTEGER,
+          content_md5 TEXT,
+          mime_hint TEXT,
+          width INTEGER,
+          height INTEGER,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS attachments_route_event
+          ON attachments(route_id,event_id);
+        CREATE TABLE IF NOT EXISTS outbound_attachment_verifications(
+          draft_id TEXT PRIMARY KEY REFERENCES outbound_drafts(draft_id),
+          route_id TEXT NOT NULL REFERENCES routes(route_id),
+          local_id INTEGER NOT NULL,
+          server_id TEXT NOT NULL,
+          verified_at TEXT NOT NULL,
+          UNIQUE(route_id,local_id,server_id)
+        );
+        """,
+    )
+    for definition in (
+        "subscription_id TEXT",
+        "attachment_ref TEXT",
+        "mime_type TEXT",
+        "width INTEGER",
+        "height INTEGER",
+        "source_kind TEXT",
+        "result_json TEXT",
+        "draft_id TEXT REFERENCES outbound_drafts(draft_id)",
+        "content_md5 TEXT",
+    ):
+        _add_column(connection, "attachment_transfers", definition)
+
+
+def _backfill_attachment_refs(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT event_id,route_id,event_type,payload_json,observed_at
+        FROM events
+        WHERE event_type IN ('file','image','sticker')
+        ORDER BY event_seq
+        """
+    ).fetchall()
+    for row in rows:
+        existing = connection.execute(
+            "SELECT attachment_ref FROM attachments WHERE event_id=?",
+            (row[0],),
+        ).fetchone()
+        if existing is not None:
+            attachment_ref = existing[0]
+        else:
+            payload = json.loads(row[3])
+            attachment_ref = f"att_{secrets.token_urlsafe(24)}"
+            connection.execute(
+                """
+                INSERT INTO attachments(
+                  attachment_ref,event_id,route_id,kind,local_id,server_id,file_name,
+                  byte_count,content_md5,mime_hint,width,height,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    attachment_ref,
+                    row[0],
+                    row[1],
+                    row[2],
+                    payload.get("local_id"),
+                    str(payload["server_id"]) if payload.get("server_id") is not None else None,
+                    payload.get("attachment_name"),
+                    payload.get("attachment_size"),
+                    payload.get("attachment_md5"),
+                    payload.get("attachment_mime"),
+                    payload.get("attachment_width"),
+                    payload.get("attachment_height"),
+                    row[4],
+                ),
+            )
+        payload = json.loads(row[3])
+        if payload.get("attachment_ref") != attachment_ref:
+            payload["attachment_ref"] = attachment_ref
+            connection.execute(
+                "UPDATE events SET payload_json=? WHERE event_id=?",
+                (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), row[0]),
+            )
+
+
 def legacy_subscription_id(route_id: str, conversation_id: str, generation: int) -> str:
     return str(
         uuid.uuid5(
@@ -579,7 +678,9 @@ def ensure_schema(path: str | Path) -> dict[str, str | int | bool | None]:
             _create_v1_tables(connection)
             _create_v2_tables(connection)
             _create_v3_tables(connection)
+            _create_v4_tables(connection)
             _migrate_v1_rows(connection)
+            _backfill_attachment_refs(connection)
             connection.execute(
                 "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

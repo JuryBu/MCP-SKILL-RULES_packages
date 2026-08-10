@@ -22,6 +22,7 @@ Security boundaries:
 from __future__ import annotations
 
 import hashlib
+import mimetypes
 import os
 import re
 import sqlite3
@@ -248,11 +249,70 @@ class DbObserver:
 
     @staticmethod
     def _extract_attachment_info(content: str, msg_type: str) -> dict[str, Any]:
-        """Extract attachment metadata (name, size) from app messages."""
-        if msg_type not in ("file", "link", "mini_program", "app", "unknown_app"):
+        """Extract non-secret attachment metadata without materializing bytes."""
+        if msg_type not in ("file", "image", "sticker", "link", "mini_program", "app", "unknown_app"):
             return {}
+
+        def positive_int(value: str | None) -> int | None:
+            try:
+                parsed = int(value or 0)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
         try:
             root = ET.fromstring(content)
+            if msg_type == "sticker":
+                emoji = root.find(".//emoji")
+                if emoji is None:
+                    return {}
+                content_md5 = (emoji.get("md5") or "").strip().lower()
+                info: dict[str, Any] = {}
+                if re.fullmatch(r"[0-9a-f]{32}", content_md5):
+                    info["attachment_md5"] = content_md5
+                    info["attachment_name"] = f"sticker-{content_md5}"
+                for source, target in (
+                    ("len", "attachment_size"),
+                    ("width", "attachment_width"),
+                    ("height", "attachment_height"),
+                ):
+                    parsed = positive_int(emoji.get(source))
+                    if parsed is not None:
+                        info[target] = parsed
+                info["attachment_mime"] = "image/*"
+                return info
+
+            if msg_type == "image":
+                image = root.find(".//img")
+                if image is None:
+                    return {}
+                info = {}
+                content_md5 = (
+                    image.get("originsourcemd5")
+                    or image.get("md5")
+                    or image.get("origmd5")
+                    or ""
+                ).strip().lower()
+                if re.fullmatch(r"[0-9a-f]{32}", content_md5):
+                    info["attachment_md5"] = content_md5
+                    info["attachment_name"] = f"image-{content_md5}"
+                for source in ("hdlength", "length", "hevc_mid_size", "midlength", "thumblength"):
+                    parsed = positive_int(image.get(source))
+                    if parsed is not None:
+                        info["attachment_size"] = parsed
+                        break
+                for source, target in (
+                    ("cdnhdwidth", "attachment_width"),
+                    ("cdnhdheight", "attachment_height"),
+                    ("width", "attachment_width"),
+                    ("height", "attachment_height"),
+                ):
+                    parsed = positive_int(image.get(source))
+                    if parsed is not None and target not in info:
+                        info[target] = parsed
+                info["attachment_mime"] = "image/*"
+                return info
+
             appmsg = root.find(".//appmsg")
             if appmsg is None:
                 return {}
@@ -271,8 +331,14 @@ class DbObserver:
                             info["attachment_size_display"] = f"{size / 1024 / 1024:.1f}MB"
                         else:
                             info["attachment_size_display"] = f"{size / 1024:.0f}KB"
+                fileext = (attach.findtext("fileext") or "").strip().lower()
+                if fileext:
+                    info["attachment_mime"] = mimetypes.guess_type(f"file.{fileext}")[0] or "application/octet-stream"
+            content_md5 = (appmsg.findtext("md5") or "").strip().lower()
+            if re.fullmatch(r"[0-9a-f]{32}", content_md5):
+                info["attachment_md5"] = content_md5
             return info
-        except ET.ParseError:
+        except (ET.ParseError, ValueError):
             return {}
 
     # ------------------------------------------------------------------

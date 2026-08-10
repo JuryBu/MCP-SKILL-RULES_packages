@@ -156,8 +156,9 @@ def test_server_attachment_and_document_change_interfaces_are_non_sending(
         str(upload),
         "dedupe-upload-v2",
     )
-    assert transfer["state"] == "VERIFIED"
-    assert transfer["sha256"]
+    assert transfer["transfer"]["state"] == "PREPARED"
+    assert transfer["draft"]["state"] == "PREPARED"
+    assert transfer["transfer"]["sha256"]
 
     start = datetime(2026, 8, 10, 0, 0, tzinfo=timezone.utc)
     batch = server.tdocs_change_observe(
@@ -259,4 +260,9 @@ def test_document_monitor_tools_are_registered() -> None:
         "tdocs_monitor_poll_start",
         "tdocs_monitor_poll_stop",
     }.issubset(names)
-    assert len(names) == 43
+    assert {
+        "wechat_read_attachments",
+        "wechat_read_image",
+        "wechat_capture_visible_image_preview",
+    }.issubset(names)
+    assert len(names) == 49

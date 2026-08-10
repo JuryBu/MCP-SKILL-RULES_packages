@@ -141,9 +141,17 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 
 ## 7. 附件
 
-下载是按需流程：先以 `(subscription_id,event_id,file_name,dedupe_key)` 创建 transfer，确认该事件确实投递给订阅且类型为 file/image/sticker；适配器把文件放入 intake root 后，再登记实际字节数和 SHA-256。大小或名称与元数据不一致时失败。
+附件事件先只入账元数据，并在事务中生成随机 `attachment_ref`。下载必须精确提供 `(subscription_id,event_id,attachment_ref,dedupe_key)`；适配器只能在对应 route 的精确消息身份中解析实体，保存到 intake root 时不覆盖同名文件，并登记实际字节、SHA-256、MIME 和可得尺寸。大小、MD5、文件索引、CDN 主机或 route 身份不一致时失败。表情与普通图片是不同来源类型，不能互相冒充。
 
-上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。它只生成哈希清单，不执行发送；后续实际上传仍需不可变 outbound 草稿和授权链。
+可视读取必须先完成同一下载与完整性合同。`wechat_read_attachments` 可接收多个已授权 `attachment_ref`：图片/表情各产生一个 `ImageContent`，PDF 按页产生多个 `ImageContent`，DOCX/PPTX 先生成可审计的派生 PDF。每个返回块记录来源 ref、页码、原件/返回 MIME、尺寸、字节和 SHA-256，以及是否缩放或转码。总图片数、总像素和总返回字节均有硬上限；超限必须返回已返回与剩余 ref/page 以及稳定 continuation cursor，续读不得重复或跳页。任意本机路径、伪造 ref、重复 ref、损坏或加密 PDF 都应拒绝。
+
+`wechat_capture_visible_image_preview` 是显式人工辅助降级，不是附件下载。调用仍需 subscription、event 与 `attachment_ref` 精确一致，并要求非空人工确认引用；实现只能后台抓取唯一、可见、未最小化的微信图片查看器，不能激活窗口或发送输入。返回必须标明视窗预览不是原件、预览哈希不能替代原件哈希、客户端无法把查看器像素机器绑定到 event/local/server 标识且视窗可能不完整。窗口不唯一、焦点变化、空白捕获或质量不足时保守拒绝。
+
+Office 转换只接受无宏、无外部关系的 DOCX/PPTX，使用隔离 LibreOffice profile，不修改原件；派生 PDF 与页面缓存按 `attachment_ref + source_sha + converter_version` 隔离并可过期清理。字体替换和版式诊断无法完整证明时必须明确标记 unknown，不能伪称无警告。XLSX 只保留原件供 spreadsheet 工具读取。
+
+上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。prepare 原子绑定 transfer 清单与不可变 outbound 草稿；approve 机械验证主人授权引用、TTL、草稿哈希和 dedupe；execute 再核对精确 route 与本机附件 outbound 开关。Windows 执行器必须先完整备份剪贴板和窗口状态，搜索目标显示名后用 `SessionDraft` 证明附件草稿属于精确 username，检测到用户切换焦点或移动鼠标立即停止。
+
+UI 按键完成只算 `SEND_ATTEMPTED`。只有发送前 baseline 之后出现唯一的目标 route 数据库出站记录，并且文件 MD5、大小与草稿一致，才进入 `VERIFIED`。数据库刷新失败、等待超时或出现多个匹配记录一律为 `UNKNOWN`，不得自动重试；`wechat_attachment_upload_verify` 只能对原尝试补做确认，不能再次发送。
 
 文件永不自动执行或解压。
 

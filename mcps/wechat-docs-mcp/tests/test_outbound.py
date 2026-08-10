@@ -52,6 +52,13 @@ def binding() -> dict[str, Any]:
     }
 
 
+def legacy_binding() -> dict[str, Any]:
+    value = binding()
+    value["schemaVersion"] = 1
+    value["routes"][0].pop("state")
+    return value
+
+
 @dataclass
 class FakeLedgerStorage:
     state: str = OutboundState.APPROVED.value
@@ -186,6 +193,14 @@ def execute(sender_instance: SafeTextOutbound, dedupe_key: str = "dedupe-synthet
 
 
 class SafeTextOutboundTests(unittest.TestCase):
+    def test_legacy_private_binding_keeps_exact_outbound_verification(self) -> None:
+        verified = PrivateBindingRouteVerifier(legacy_binding()).verify(
+            "route-synthetic",
+            route_record(),
+            "text",
+        )
+        self.assertEqual(USERNAME, verified.username)
+
     def test_wake_exception_restores_snapshot(self) -> None:
         ledger = FakeLedger()
         backend = FakeBackend()

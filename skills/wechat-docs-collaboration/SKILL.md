@@ -43,9 +43,13 @@ Document monitoring uses a private allowlist and a successful current-state base
 
 ## Handle files and cross-channel tasks
 
-Prepare downloads only for an event delivered to the current subscription. Materialize files inside the configured intake root, then record source `event_id`, name, bytes, and SHA-256. Do not execute or unzip them automatically.
+Prepare downloads only for an event delivered to the current subscription, using its unforgeable `attachment_ref`. Materialize inside the configured intake root without overwriting, then record source `event_id`, bytes, SHA-256, MIME, and available dimensions. A sticker is not an ordinary image source. Do not OCR, parse, execute, or unzip automatically.
 
-Upload preparation only hashes files inside the configured upload root; it does not send. Actual upload uses the same exact route, subscription capability, immutable draft, owner authorization, and dedupe controls as text.
+Use `wechat_read_attachments` only after that governed materialization. It accepts subscription-scoped refs, returns images or PDF/converted Office pages as MCP image blocks, and reports original plus returned hashes and dimensions. Respect image-count, total-pixel, and response-byte budgets; follow the stable continuation cursor until the requested refs/pages are complete, and never substitute an arbitrary local path. XLSX remains download-only for a spreadsheet tool.
+
+If the encrypted client cache cannot yield an event-bound ordinary image, `wechat_capture_visible_image_preview` is an explicit human-assisted fallback only after a person opens the target viewer. It must not focus the viewer or send input. Treat the result as an incomplete viewport preview, never as the original: its hash is a preview hash, the client cannot machine-bind the pixels to event/local/server identifiers, and non-unique windows, focus changes, or poor capture quality require refusal.
+
+Upload preparation only hashes files inside the configured upload root and creates an immutable draft; it does not touch WeChat UI. Actual upload uses the exact route, subscription capability, private policy, owner authorization, TTL, and dedupe controls. UI execution is only `SEND_ATTEMPTED`; claim `VERIFIED` only after a unique post-baseline outbound database row matches the attachment MD5 and size. Database timeout or ambiguity is `UNKNOWN`, and verification may be retried without resending.
 
 For QQ to WeChat or WeChat to QQ machine tasks, preserve `task_id`, `generation`, `source_machine`, `target_machine`, `delivery_id`, `trace_id`, `origin_transport`, `hop_count`, and dedupe. Reject repeated deliveries and stop when hop count exceeds the private limit.
 
@@ -53,4 +57,4 @@ For QQ to WeChat or WeChat to QQ machine tasks, preserve `task_id`, `generation`
 
 `wechat_status()` separates configured paths, watcher readiness, subscription count, polling, wake notifier, and the outbound flag. A healthy watcher does not prove broker exposure, visible Codex injection, lock-screen stability, backfill, a real UI send backend, database direction verification, or recipient read status.
 
-If `wechat_outbound_capabilities()` reports no visible UI backend or no database direction verifier, prepare and approve drafts if authorized, but do not claim a WeChat send can execute or become verified.
+Read the text and attachment capability fields separately. If the requested transport lacks a visible backend, route proof, or database verifier, preparation may continue when authorized, but execution or `VERIFIED` must not be claimed.

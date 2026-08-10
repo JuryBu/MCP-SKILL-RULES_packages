@@ -73,10 +73,11 @@ class PrivateBindingRouteVerifier:
         ledger_route: Mapping[str, Any],
         capability: str = "text",
     ) -> RouteVerification:
-        if self._binding.get("schemaVersion") != 2:
+        schema_version = self._binding.get("schemaVersion")
+        if schema_version not in {1, 2}:
             return RouteVerification(
                 RouteVerificationStatus.UNVERIFIED,
-                reason="private binding 不是受支持的 schemaVersion 2",
+                reason="private binding schemaVersion 不受支持",
             )
 
         routes = self._binding.get("routes")
@@ -100,7 +101,9 @@ class PrivateBindingRouteVerifier:
             )
 
         candidate = candidates[0]
-        if candidate.get("state") != "active":
+        if candidate.get("state") != "active" and not (
+            schema_version == 1 and not str(candidate.get("state") or "").strip()
+        ):
             return RouteVerification(
                 RouteVerificationStatus.UNVERIFIED,
                 reason="private binding route 未处于 active",
@@ -218,3 +221,31 @@ class PrivateBindingRouteVerifier:
                 verification.reason or "route 未通过精确身份验证",
             )
         return verification.route
+
+    def verify_identity(
+        self,
+        route_id: str,
+        ledger_route: Mapping[str, Any],
+    ) -> VerifiedRoute:
+        routes = self._binding.get("routes")
+        if not isinstance(routes, Sequence) or isinstance(routes, (str, bytes, bytearray)):
+            raise RouteVerificationError(
+                RouteVerificationStatus.UNVERIFIED,
+                "private binding 缺少 routes 数组",
+            )
+        identity_capability = "__identity_only__"
+        binding = dict(self._binding)
+        binding["routes"] = [
+            {
+                **dict(candidate),
+                "outbound": {"enabled": True, identity_capability: True},
+            }
+            if isinstance(candidate, Mapping) and candidate.get("route_id") == route_id
+            else candidate
+            for candidate in routes
+        ]
+        return PrivateBindingRouteVerifier(binding).verify(
+            route_id,
+            ledger_route,
+            identity_capability,
+        )

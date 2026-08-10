@@ -53,7 +53,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
     database = tmp_path / "events.sqlite3"
     _create_v1_database(database)
     ledger = EventLedger(database)
-    assert ledger.schema_info()["schema_version"] == 3
+    assert ledger.schema_info()["schema_version"] == 4
     assert ledger.migration["migrated"] is True
     backup = Path(ledger.migration["backup_path"])
     assert backup.is_file()
@@ -88,12 +88,12 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
         ).fetchone()[0]
     finally:
         connection.close()
-    reopened = EventLedger(database)
-    assert reopened.migration == {
-        "schema_version": 3,
-        "backup_path": None,
-        "migrated": False,
-    }
+        reopened = EventLedger(database)
+        assert reopened.migration == {
+            "schema_version": 4,
+            "backup_path": None,
+            "migrated": False,
+        }
     connection = sqlite3.connect(database)
     try:
         assert connection.execute(
@@ -173,7 +173,7 @@ def test_v2_to_v3_preserves_existing_rows_and_creates_v2_backup(tmp_path: Path) 
     migrated = EventLedger(database)
     backup = Path(migrated.migration["backup_path"])
 
-    assert migrated.schema_info()["schema_version"] == 3
+    assert migrated.schema_info()["schema_version"] == 4
     assert migrated.get_route("route-preserved")["route_id"] == "route-preserved"
     assert ".v2-backup." in backup.name
     assert backup.is_file()

@@ -98,9 +98,9 @@ class PrivateBindingRouteVerifierTests(unittest.TestCase):
         result = PrivateBindingRouteVerifier(malformed).inspect("route-synthetic", ledger_route())
         self.assertEqual(RouteVerificationStatus.UNVERIFIED, result.status)
 
-    def test_non_v2_binding_is_rejected(self) -> None:
+    def test_unknown_binding_schema_is_rejected(self) -> None:
         old_binding = binding()
-        old_binding["schemaVersion"] = 1
+        old_binding["schemaVersion"] = 99
         with self.assertRaises(RouteVerificationError) as raised:
             PrivateBindingRouteVerifier(old_binding).verify("route-synthetic", ledger_route())
         self.assertEqual("UNVERIFIED", raised.exception.code)

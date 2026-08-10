@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import secrets
 import sqlite3
 import unicodedata
 import uuid
@@ -541,6 +542,12 @@ class EventLedger:
     ) -> dict[str, Any]:
         event_id = str(uuid.uuid4())
         observed_at = utc_now()
+        persisted_payload = dict(payload)
+        persisted_payload.pop("attachment_ref", None)
+        attachment_ref = None
+        if event_type in {"file", "image", "sticker"}:
+            attachment_ref = f"att_{secrets.token_urlsafe(24)}"
+            persisted_payload["attachment_ref"] = attachment_ref
         with self._transaction() as connection:
             route = connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
             if route is None or route["state"] != "active":
@@ -569,11 +576,37 @@ class EventLedger:
                     occurred_at,
                     observed_at,
                     event_type,
-                    canonical_json(payload),
+                    canonical_json(persisted_payload),
                     sensitivity,
                     event_seq,
                 ),
             )
+            if attachment_ref is not None:
+                connection.execute(
+                    """
+                    INSERT INTO attachments(
+                      attachment_ref,event_id,route_id,kind,local_id,server_id,file_name,
+                      byte_count,content_md5,mime_hint,width,height,created_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        attachment_ref,
+                        event_id,
+                        route_id,
+                        event_type,
+                        persisted_payload.get("local_id"),
+                        str(persisted_payload["server_id"])
+                        if persisted_payload.get("server_id") is not None
+                        else None,
+                        persisted_payload.get("attachment_name"),
+                        persisted_payload.get("attachment_size"),
+                        persisted_payload.get("attachment_md5"),
+                        persisted_payload.get("attachment_mime"),
+                        persisted_payload.get("attachment_width"),
+                        persisted_payload.get("attachment_height"),
+                        observed_at,
+                    ),
+                )
             subscriptions = connection.execute(
                 """
                 SELECT * FROM subscriptions
@@ -846,6 +879,89 @@ class EventLedger:
             )
         return {"draft_id": draft_id, "content_sha256": content_hash, "state": "PREPARED"}
 
+    def prepare_attachment_upload_draft(
+        self,
+        subscription_id: str,
+        route_id: str,
+        kind: str,
+        payload: dict[str, Any],
+        expires_at: str,
+        transfer: dict[str, Any],
+        dedupe_key: str,
+    ) -> dict[str, Any]:
+        if kind not in {"wechat_file", "wechat_image"}:
+            raise LedgerError("ATTACHMENT_CAPABILITY_INVALID", "附件草稿类型无效")
+        if not dedupe_key.strip():
+            raise LedgerError("DEDUPE_KEY_REQUIRED", "dedupe_key 不能为空")
+        draft_id = str(uuid.uuid4())
+        now = utc_now()
+        content_hash = payload_sha256(payload)
+        try:
+            with self._transaction() as connection:
+                route = connection.execute(
+                    "SELECT state FROM routes WHERE route_id=?", (route_id,)
+                ).fetchone()
+                if route is None or route["state"] != "active":
+                    raise LedgerError("ROUTE_NOT_ACTIVE", "route 未处于 active")
+                subscription = connection.execute(
+                    "SELECT route_id,state,send_capability,policy_ref FROM subscriptions WHERE subscription_id=?",
+                    (subscription_id,),
+                ).fetchone()
+                if subscription is None or subscription["route_id"] != route_id:
+                    raise LedgerError("SUBSCRIPTION_ROUTE_MISMATCH", "subscription 不属于目标 route")
+                if subscription["state"] != "active" or not subscription["send_capability"]:
+                    raise LedgerError("SUBSCRIPTION_SEND_DISABLED", "subscription 未启用发送能力")
+                if not (subscription["policy_ref"] or "").strip():
+                    raise LedgerError("SUBSCRIPTION_POLICY_MISSING", "subscription 缺少本机发送策略引用")
+                connection.execute(
+                    """
+                    INSERT INTO outbound_drafts(
+                      draft_id,subscription_id,route_id,kind,payload_json,content_sha256,expires_at,
+                      state,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,'PREPARED',?,?)
+                    """,
+                    (
+                        draft_id,
+                        subscription_id,
+                        route_id,
+                        kind,
+                        canonical_json(payload),
+                        content_hash,
+                        expires_at,
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO attachment_transfers(
+                      transfer_id,direction,route_id,file_name,byte_count,sha256,local_path,
+                      state,dedupe_key,created_at,updated_at,subscription_id,mime_type,width,height,
+                      content_md5,draft_id
+                    ) VALUES(?,'upload',?,?,?,?,?,'PREPARED',?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        transfer["transfer_id"],
+                        route_id,
+                        transfer["file_name"],
+                        transfer["byte_count"],
+                        transfer["sha256"],
+                        transfer["local_path"],
+                        dedupe_key,
+                        now,
+                        now,
+                        subscription_id,
+                        transfer["mime_type"],
+                        transfer["width"],
+                        transfer["height"],
+                        transfer["content_md5"],
+                        draft_id,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise LedgerError("DEDUPE_KEY_CONFLICT", "dedupe_key 已被使用") from error
+        return {"draft_id": draft_id, "content_sha256": content_hash, "state": "PREPARED"}
+
     def approve_draft(
         self,
         draft_id: str,
@@ -1096,6 +1212,113 @@ class EventLedger:
                 "UPDATE outbound_drafts SET state='VERIFIED',result_json=?,error_code=NULL,updated_at=? WHERE draft_id=?",
                 (canonical_json(result), utc_now(), draft_id),
             )
+        return self.get_draft(draft_id)
+
+    def verify_attachment_draft(
+        self,
+        draft_id: str,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        required = {
+            "route_id",
+            "local_id",
+            "server_id",
+            "observed_at",
+            "source_kind",
+            "baseline_local_id",
+        }
+        if not required.issubset(observation):
+            raise LedgerError("OUTBOUND_ATTACHMENT_PROOF_INVALID", "附件发送证明字段不完整")
+        with self._transaction() as connection:
+            draft = connection.execute(
+                "SELECT * FROM outbound_drafts WHERE draft_id=?", (draft_id,)
+            ).fetchone()
+            if draft is None:
+                raise LedgerError("DRAFT_NOT_FOUND", "draft 不存在")
+            if draft["state"] not in {"SEND_ATTEMPTED", "UNKNOWN"}:
+                raise LedgerError("DRAFT_STATE_INVALID", f"draft 当前状态为 {draft['state']}")
+            if draft["kind"] not in {"wechat_file", "wechat_image"}:
+                raise LedgerError("OUTBOUND_VERIFICATION_UNSUPPORTED", "draft 不是附件发送")
+            if observation["route_id"] != draft["route_id"]:
+                raise LedgerError("OUTBOUND_OBSERVATION_MISMATCH", "附件证明与草稿 route 不匹配")
+            if observation["source_kind"] != "wechat_message_database":
+                raise LedgerError("OUTBOUND_ATTACHMENT_SOURCE_UNTRUSTED", "附件证明来源不可信")
+            local_id = int(observation["local_id"])
+            baseline_local_id = int(observation["baseline_local_id"])
+            server_id = str(observation["server_id"])
+            if local_id <= baseline_local_id or baseline_local_id < 0 or not server_id:
+                raise LedgerError("OUTBOUND_ATTACHMENT_PROOF_INVALID", "附件消息身份无效")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO outbound_attachment_verifications(
+                      draft_id,route_id,local_id,server_id,verified_at
+                    ) VALUES(?,?,?,?,?)
+                    """,
+                    (draft_id, draft["route_id"], local_id, server_id, utc_now()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise LedgerError(
+                    "OUTBOUND_OBSERVATION_ALREADY_USED",
+                    "同一数据库附件记录不能验证多个草稿",
+                ) from error
+            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
+            result["attachment_observation"] = {
+                "local_id": local_id,
+                "server_id": server_id,
+                "observed_at": observation["observed_at"],
+                "source_kind": observation["source_kind"],
+            }
+            connection.execute(
+                """
+                UPDATE outbound_drafts
+                SET state='VERIFIED',result_json=?,error_code=NULL,updated_at=?
+                WHERE draft_id=?
+                """,
+                (canonical_json(result), utc_now(), draft_id),
+            )
+            payload = json.loads(draft["payload_json"])
+            transfer_id = payload.get("transfer_id")
+            if isinstance(transfer_id, str) and transfer_id:
+                connection.execute(
+                    """
+                    UPDATE attachment_transfers
+                    SET state='VERIFIED',result_json=?,updated_at=?
+                    WHERE transfer_id=? AND draft_id=? AND direction='upload'
+                    """,
+                    (canonical_json(result["attachment_observation"]), utc_now(), transfer_id, draft_id),
+                )
+        return self.get_draft(draft_id)
+
+    def mark_draft_unknown(
+        self,
+        draft_id: str,
+        expected_states: Sequence[str],
+        error_code: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        allowed = {"SEND_ATTEMPTED", "UNKNOWN"}
+        expected = tuple(dict.fromkeys(expected_states))
+        if not expected or not set(expected).issubset(allowed):
+            raise LedgerError("DRAFT_STATE_INVALID", "UNKNOWN 转换来源状态无效")
+        placeholders = ",".join("?" for _ in expected)
+        with self._transaction() as connection:
+            changed = connection.execute(
+                f"""
+                UPDATE outbound_drafts
+                SET state='UNKNOWN',error_code=?,result_json=COALESCE(?,result_json),updated_at=?
+                WHERE draft_id=? AND state IN ({placeholders})
+                """,
+                (
+                    error_code,
+                    canonical_json(result) if result is not None else None,
+                    utc_now(),
+                    draft_id,
+                    *expected,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LedgerError("DRAFT_STATE_CONFLICT", "draft 不处于可标记 UNKNOWN 的状态")
         return self.get_draft(draft_id)
 
     def mark_draft_state(self, draft_id: str, expected: str, next_state: str) -> dict[str, Any]:
