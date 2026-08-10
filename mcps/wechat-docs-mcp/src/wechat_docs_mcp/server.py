@@ -80,6 +80,10 @@ IMAGE_KEY_ROOT = Path(
         DATA_ROOT / "secrets" / "wechat-image-v2",
     )
 )
+ACTIVE_OWNER_ACCOUNT_KEY_SHA256 = os.environ.get(
+    "WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256",
+    "",
+).strip().casefold()
 FFMPEG_PATH = Path(
     os.environ.get("WECHAT_DOCS_MCP_FFMPEG_PATH", shutil.which("ffmpeg") or "ffmpeg.exe")
 )
@@ -132,6 +136,7 @@ def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSou
         WECHAT_ACCOUNT_ROOT,
         IMAGE_KEY_FILE,
         IMAGE_KEY_ROOT,
+        active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
     )
 
 

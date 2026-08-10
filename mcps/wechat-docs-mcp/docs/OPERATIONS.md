@@ -28,6 +28,7 @@
 | `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件可见发送开关；只在私有 route/policy 与真实 capability probe 通过后启用 |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
 | `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |
+| `WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256` | 空 | 私有 enrollment 已核验的当前账号身份哈希；缺失或与 route 不符时禁止进程扫描并返回 `WAITING_FOR_KEY` |
 | `WECHAT_DOCS_MCP_FFMPEG_PATH` | `PATH` 中的 ffmpeg | wxgf/HEVC 图片的无窗口本地解码器 |
 | `WECHAT_DOCS_MCP_UPLOAD_ROOT` | `<data_root>/upload` | 附件草稿只允许读取此目录内文件，执行前重新校验 SHA-256 |
 | `WECHAT_DOCS_MCP_DERIVED_ROOT` | `<data_root>/derived` | PDF 页面及 DOCX/PPTX 派生 PDF 的私有缓存目录 |

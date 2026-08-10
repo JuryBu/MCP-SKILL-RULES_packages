@@ -23,6 +23,7 @@ from .image_key_manager import (
     ImageKeyManager,
     ImageKeyMaterial,
     ImageKeyScanner,
+    OWNER_SCOPE_PATTERN,
     WindowsWeixinImageKeyScanner,
 )
 from .ledger import EventLedger, LedgerError
@@ -53,6 +54,7 @@ class WechatAttachmentSourceResolver:
         image_key_file: str | Path | None = None,
         image_key_root: str | Path | None = None,
         image_key_scanner: ImageKeyScanner | None = None,
+        active_owner_account_key_sha256: str | None = None,
     ) -> None:
         self.ledger = ledger
         self.binding = binding
@@ -73,6 +75,13 @@ class WechatAttachmentSourceResolver:
             legacy_key_file=self.image_key_file,
             scanner=image_key_scanner or WindowsWeixinImageKeyScanner(),
         )
+        active_owner_scope = (active_owner_account_key_sha256 or "").strip().casefold()
+        if active_owner_scope and not OWNER_SCOPE_PATTERN.fullmatch(active_owner_scope):
+            raise LedgerError(
+                "ATTACHMENT_IMAGE_ACTIVE_ACCOUNT_INVALID",
+                "当前微信账号作用域不是有效的 SHA-256",
+            )
+        self.active_owner_account_key_sha256 = active_owner_scope
 
     @staticmethod
     def _message_xml(content: str) -> ET.Element:
@@ -411,6 +420,17 @@ class WechatAttachmentSourceResolver:
         age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
         return 0 <= age <= IMAGE_KEY_EVENT_SCAN_WINDOW_SECONDS
 
+    def _account_scan_allowed(
+        self,
+        owner_account_key_sha256: str,
+        observed_at: object,
+    ) -> bool:
+        return (
+            bool(self.active_owner_account_key_sha256)
+            and self.active_owner_account_key_sha256 == owner_account_key_sha256
+            and self._scan_allowed(observed_at)
+        )
+
     def _materialize_image(
         self,
         attachment: Mapping[str, Any],
@@ -456,7 +476,10 @@ class WechatAttachmentSourceResolver:
                 scan_candidates,
             ),
             validated_content_md5=content_md5,
-            allow_scan=self._scan_allowed(attachment.get("observed_at")),
+            allow_scan=self._account_scan_allowed(
+                owner_account_key_sha256,
+                attachment.get("observed_at"),
+            ),
             scan_timeout_seconds=IMAGE_KEY_SCAN_TIMEOUT_SECONDS,
         )
         decrypted = self._decrypt_v2_image(data, material.aes_key, material.xor_key)

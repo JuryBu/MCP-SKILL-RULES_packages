@@ -5,6 +5,7 @@
 ## 当前能力
 
 - route 表示一个由 `ownerAccountKey + username + chat_type` 精确识别的微信会话；显示标题不参与身份判定。
+- 新账号只在私有 enrollment 明确给出当前 owner identity 哈希后才允许短时扫描图片密钥；账号不明或与 route 不符时保持 `WAITING_FOR_KEY`，不会覆盖其他账号缓存。
 - route 与 Codex conversation 是 M:N。每个 subscription 只属于一个 `(route_id, conversation_id, generation)`，事件按 route 只入账一次，再向所有 active subscription 独立投递。
 - 每个 subscription 有独立 pending、wake、ACK、暂停、关闭和能力策略；一个订阅 ACK 不影响其它订阅。
 - 微信发送与腾讯文档写入都使用不可变草稿、非空 `owner_authorization_refs`、TTL 和 `dedupe_key`。批准只消费一次，`UNKNOWN` 不自动重试。

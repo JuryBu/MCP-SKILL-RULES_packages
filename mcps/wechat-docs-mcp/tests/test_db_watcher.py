@@ -185,7 +185,9 @@ class DbWatcherTests(unittest.TestCase):
             self.assertIsNone(result.error)
 
     def test_watch_result_elapsed_is_positive(self) -> None:
-        result = self.watcher.watch_once()
+        with patch.object(self.watcher, "refresh_keys", return_value=True), \
+             patch.object(self.watcher, "decrypt_changed", return_value=[]):
+            result = self.watcher.watch_once()
         self.assertGreaterEqual(result.elapsed_seconds, 0.0)
 
     def test_failed_key_extraction_preserves_snapshot_for_retry(self) -> None:

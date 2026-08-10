@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -451,3 +452,15 @@ def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Pat
             tmp_path / "wrong.partial",
         )
     assert raised.value.code == "ATTACHMENT_IMAGE_KEY_WAITING"
+
+
+def test_image_process_scan_requires_matching_active_owner_scope(tmp_path: Path) -> None:
+    resolver, _, _, _ = _resolver(tmp_path)
+    owner_scope = hashlib.sha256(OWNER_KEY.encode()).hexdigest()
+    observed_at = datetime.now(timezone.utc).isoformat()
+
+    assert not resolver._account_scan_allowed(owner_scope, observed_at)
+    resolver.active_owner_account_key_sha256 = "0" * 64
+    assert not resolver._account_scan_allowed(owner_scope, observed_at)
+    resolver.active_owner_account_key_sha256 = owner_scope
+    assert resolver._account_scan_allowed(owner_scope, observed_at)
