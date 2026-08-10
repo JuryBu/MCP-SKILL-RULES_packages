@@ -24,6 +24,7 @@ from .ledger import EventLedger, LedgerError
 from .outbound import SafeTextOutbound
 from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
+from .runtime_flags import resolve_private_runtime_flag
 from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
 from .wechat_attachment_source import WechatAttachmentSourceResolver
@@ -74,8 +75,10 @@ IMAGE_VIEWER_TITLES = tuple(
 )
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
 OUTBOUND_ENABLED = os.environ.get("WECHAT_DOCS_MCP_OUTBOUND_ENABLED", "0") == "1"
-ATTACHMENT_OUTBOUND_ENABLED = (
-    os.environ.get("WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED", "0") == "1"
+ATTACHMENT_OUTBOUND_ENABLED = resolve_private_runtime_flag(
+    DATA_ROOT,
+    "attachmentOutboundWeChatEnabled",
+    "WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED",
 )
 _WAKE_RUNTIME_RAW = os.environ.get("CODEX_WAKE_PROXY_RUNTIME_FILE", "")
 _WAKE_TOKEN_RAW = os.environ.get("CODEX_WAKE_PROXY_TOKEN_FILE", "")

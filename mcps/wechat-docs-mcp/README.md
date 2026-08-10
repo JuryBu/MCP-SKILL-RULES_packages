@@ -26,7 +26,7 @@
 | 附件 | `wechat_attachment_*`、`wechat_read_attachments`、`wechat_read_image`、`wechat_capture_visible_image_preview` | 精确下载、图片/PDF/Office 可视读取、人工辅助视窗预览、上传草稿、受控执行与数据库确认 |
 | 腾讯文档 | `tdocs_*`、`tdocs_monitor_*` | 高频读、官方完整能力入口、allowlist 监视、M:N 批次投递与精确 ACK |
 
-当前源码包含安全文字发送状态机，但普通文字仍没有正式 UI backend。附件另有默认关闭的 Windows 可见执行器：搜索标题必须在本地联系人库唯一，粘贴后必须由 `SessionDraft` 证明草稿属于精确微信 username，发送后还要由消息数据库中唯一的新出站记录匹配文件 MD5、大小和 route。`WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` 与普通文字总开关独立，默认都是 `0`。
+当前源码包含安全文字发送状态机，但普通文字仍没有正式 UI backend。附件另有默认关闭的 Windows 可见执行器：搜索标题必须在本地联系人库唯一，粘贴后必须由 `SessionDraft` 证明草稿属于精确微信 username，发送后还要由消息数据库中唯一的新出站记录匹配文件 MD5、大小和 route。附件开关与普通文字总开关独立；`WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` 明确设置时优先，否则只读取私有数据根目录下 `config/service-runtime.json` 的布尔字段 `attachmentOutboundWeChatEnabled`，缺失、损坏或非布尔值都会保持关闭。
 
 `wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终完整保留并记录 SHA-256；XLSX 只下载原件，不自动分页。
 
