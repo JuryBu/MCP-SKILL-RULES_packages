@@ -96,6 +96,7 @@ const child = spawn(process.execPath, [path.join(brokerRoot, "broker.mjs")], {
     WECHAT_DOCS_MCP_PYTHON: process.execPath,
     CODEX_MCP_BROKER_CONTROL_TOKEN: controlToken,
     MEMORY_STORE_MCP_ROOT: memoryStoreRoot,
+    PATH: "",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });

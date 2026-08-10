@@ -61,6 +61,7 @@ const napcatEnabled = process.env.CODEX_TOOLKIT_ENABLE_NAPCAT_MCP === "1";
 const wechatDocsRoot = process.env.WECHAT_DOCS_MCP_ROOT || path.join(toolkitMcpRoot, "wechat-docs-mcp");
 const wechatDocsPython = process.env.WECHAT_DOCS_MCP_PYTHON || "python";
 const wechatDocsEnabled = process.env.CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP === "1";
+const nodeCommand = process.execPath;
 const brokerControlToken = process.env.CODEX_MCP_BROKER_CONTROL_TOKEN || process.env.NAPCAT_MCP_TOKEN || "";
 const sdkRoot = path.join(
   memoryStoreRoot,
@@ -186,7 +187,7 @@ const endpoints = {
   },
   exa: {
     path: "/exa/mcp",
-    command: "node",
+    command: nodeCommand,
     args: [path.join(__dirname, "exa-stateless-stdio.mjs")],
     cwd: __dirname,
     resources: false,
@@ -203,7 +204,7 @@ const endpoints = {
   },
   "memory-store": {
     path: "/memory-store/mcp",
-    command: "node",
+    command: nodeCommand,
     args: [path.join(memoryStoreRoot, "dist", "index.js")],
     cwd: memoryStoreRoot,
     env: {
@@ -214,7 +215,7 @@ const endpoints = {
   },
   "web-fetcher": {
     path: "/web-fetcher/mcp",
-    command: "node",
+    command: nodeCommand,
     args: [path.join(webFetcherRoot, "dist", "index.js")],
     cwd: webFetcherRoot,
     env: {
@@ -225,7 +226,7 @@ const endpoints = {
   },
   sandbox: {
     path: "/sandbox/mcp",
-    command: "node",
+    command: nodeCommand,
     args: [path.join(sandboxRoot, "dist", "index.js")],
     cwd: sandboxRoot,
     resetBackendAfterToolsListFailures: 2,
@@ -238,7 +239,7 @@ const endpoints = {
   ...(napcatEnabled ? {
     napcat: {
       path: "/napcat/mcp",
-      command: "node",
+      command: nodeCommand,
       args: [path.join(napcatRoot, "src", "index.mjs")],
       cwd: napcatRoot,
       env: {
@@ -287,7 +288,7 @@ const endpoints = {
   } : {}),
   subagent: {
     path: "/subagent/mcp",
-    command: "node",
+    command: nodeCommand,
     args: [path.join(subagentRoot, "src", "index.js")],
     cwd: subagentRoot,
     env: {
@@ -692,7 +693,13 @@ class BackendManager {
     } catch (error) {
       this.lastError = error.message;
       const failedPid = transport.pid ?? null;
-      log("backend connect failed", { endpoint: this.name, error: error.message, pid: failedPid });
+      const backendStderr = stderrChunks.join("").trim().slice(-8000);
+      log("backend connect failed", {
+        endpoint: this.name,
+        error: error.message,
+        pid: failedPid,
+        ...(backendStderr ? { backendStderr } : {}),
+      });
       void (async () => {
         await client.close().catch((closeError) => {
           log("backend close after connect failure failed", {

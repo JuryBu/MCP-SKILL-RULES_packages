@@ -213,7 +213,7 @@ function Copy-CandidateRuntimeLogs {
         Join-Path $env:USERPROFILE ".codex-toolkit"
     }
     $RuntimeRoot = if ($ManagedStartScript) { Join-Path $DataRoot "mcp-http-broker" } else { $BrokerRoot }
-    foreach ($Name in @("broker-stdout.log", "broker-stderr.log")) {
+    foreach ($Name in @("broker-stdout.log", "broker-stderr.log", "broker.log", "broker-state.json")) {
         $SourcePath = Join-Path $RuntimeRoot $Name
         if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
             Copy-Item -LiteralPath $SourcePath -Destination (Join-Path $BackupRoot "candidate-$Name") -Force

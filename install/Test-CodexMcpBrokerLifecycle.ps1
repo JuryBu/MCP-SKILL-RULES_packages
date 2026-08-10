@@ -324,6 +324,8 @@ server.listen(port, "127.0.0.1", () => {
         $managedLifecycleHash = Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")
         $managedStartHash = Get-Sha256 $managedStartScript
         $managedStopHash = Get-Sha256 $managedStopScript
+        $managedRuntimeRoot = Join-Path $testRoot "managed-data\mcp-http-broker"
+        Set-Content -LiteralPath (Join-Path $managedRuntimeRoot "broker.log") -Encoding UTF8 -Value '{"message":"candidate diagnostic evidence"}'
         $managedRollbackFailed = $false
         try {
             & $updaterPath -SourceBrokerRoot $unhealthySource -BrokerPort 19491 -DeepHealthEndpoints @() -StartupTimeoutSeconds 1 | Out-Null
@@ -334,7 +336,7 @@ server.listen(port, "127.0.0.1", () => {
         $managedBackupRoot = Get-ChildItem -LiteralPath (Join-Path $managedRoot "backups") -Directory |
             Sort-Object LastWriteTimeUtc |
             Select-Object -Last 1
-        foreach ($evidenceName in @("candidate-start-output.txt", "candidate-process.json", "candidate-broker-stdout.log", "candidate-broker-stderr.log")) {
+        foreach ($evidenceName in @("candidate-start-output.txt", "candidate-process.json", "candidate-broker-stdout.log", "candidate-broker-stderr.log", "candidate-broker.log")) {
             if (-not (Test-Path -LiteralPath (Join-Path $managedBackupRoot.FullName $evidenceName) -PathType Leaf)) {
                 throw "Managed rollback did not preserve startup evidence: $evidenceName"
             }
