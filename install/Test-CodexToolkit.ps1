@@ -207,7 +207,7 @@ function Test-PackageStructure {
     }
 
     $brokerUpdater = Get-Content -LiteralPath (Join-Path $toolkitRoot "install\Update-CodexMcpBroker.ps1") -Encoding UTF8 -Raw
-    foreach ($requiredText in @("SourceStartScript", "SourceStopScript", "lifecycleBootstrapped", "installedStartExisted", "installedStopExisted")) {
+    foreach ($requiredText in @("SourceStartScript", "SourceStopScript", "ServiceManifestPath", "Assert-BrokerHealthIdentity", "RejectedProcessId", "lifecycleBootstrapped", "installedStartExisted", "installedStopExisted")) {
         if (-not $brokerUpdater.Contains($requiredText)) { throw "Broker updater is missing portable lifecycle bootstrap behavior: $requiredText" }
     }
     & (Join-Path $toolkitRoot "install\Test-CodexMcpBrokerLifecycle.ps1") | Out-Host

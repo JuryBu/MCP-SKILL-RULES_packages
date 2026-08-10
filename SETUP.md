@@ -84,7 +84,7 @@ $DataRoot = if ($env:CODEX_TOOLKIT_DATA_ROOT) {
   )
 ```
 
-`Update-CodexMcpBroker.ps1` 与同目录的 `Start-CodexMcpBroker.ps1`、`Stop-CodexMcpBroker.ps1` 必须一起分发。更新器会把双布局兼容的启停脚本安装到扁平 broker 目录，因此目标机即使旧安装缺少 Stop 脚本也能受控升级；`-WhatIf` 只做预检，不创建备份或修改目标目录。
+`Update-CodexMcpBroker.ps1` 与同目录的 `Start-CodexMcpBroker.ps1`、`Stop-CodexMcpBroker.ps1` 必须一起分发。未显式传入 `-BrokerRoot` 时，更新器会优先读取 `CODEX_TOOLKIT_SERVICE_MANIFEST` 或 `%USERPROFILE%\.codex-toolkit\services\infrastructure\service-manifest.json`，把清单中的 broker、Start 和 Stop 路径分别作为受管 release 的权威目标；没有受管清单时才回退到 `%USERPROFILE%\.codex\mcp-http-broker` 平铺目录。正式写入前，健康端口返回的 PID 必须确实运行目标 broker；更新后 PID 必须变化且命令行仍指向同一目标。`-WhatIf` 只做静态预检，不访问健康端口、不创建备份或修改目标目录。
 
 The updater backs up the installed broker code, hashes protected state before and after the restart, then checks shallow broker health and selected read-only deep probes. A failed update restores the previous code and starts it again. It never replays the tool call that exposed a broken transport, and it does not read, send, or acknowledge task messages.
 

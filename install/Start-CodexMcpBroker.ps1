@@ -7,6 +7,14 @@ $toolkitRoot = Split-Path -Parent $scriptDirectory
 $brokerDir = if ($isFlatInstallation) { $scriptDirectory } else { Join-Path $toolkitRoot "mcps\broker" }
 $brokerScript = [System.IO.Path]::GetFullPath((Join-Path $brokerDir "broker.mjs"))
 $privateEnvPath = Join-Path $brokerDir "broker-private.env.json"
+$nodeExe = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_NODE_EXE)) {
+    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_NODE_EXE)
+} else {
+    "node"
+}
+if ([System.IO.Path]::IsPathRooted($nodeExe) -and -not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
+    throw "Configured Node executable is missing: $nodeExe"
+}
 
 if ($isFlatInstallation -and (Test-Path -LiteralPath $privateEnvPath -PathType Leaf)) {
     $privateEnv = Get-Content -LiteralPath $privateEnvPath -Encoding UTF8 -Raw | ConvertFrom-Json
@@ -101,7 +109,7 @@ foreach ($entry in $envVars.GetEnumerator()) {
     [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, "Process")
 }
 try {
-    $process = Start-Process -FilePath "node" `
+    $process = Start-Process -FilePath $nodeExe `
         -ArgumentList @($brokerScript) `
         -WorkingDirectory $brokerDir `
         -RedirectStandardOutput $stdoutPath `
