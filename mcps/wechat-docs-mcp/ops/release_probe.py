@@ -19,10 +19,57 @@ def connect_read_only(path: Path) -> sqlite3.Connection:
 def ledger_state(path: Path, route_id: str) -> dict[str, int]:
     connection = connect_read_only(path)
     try:
+        tables = {
+            row["name"]
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        if {"subscriptions", "event_deliveries", "subscription_wakes"}.issubset(tables):
+            schema_version = 2
+            if "schema_meta" in tables:
+                row = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()
+                if row is not None:
+                    schema_version = int(row["value"])
+            return {
+                "schema_version": schema_version,
+                "events": connection.execute(
+                    "SELECT COUNT(*) FROM events WHERE route_id=?", (route_id,)
+                ).fetchone()[0],
+                "subscriptions": connection.execute(
+                    "SELECT COUNT(*) FROM subscriptions WHERE route_id=?", (route_id,)
+                ).fetchone()[0],
+                "pending": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM event_deliveries
+                    JOIN subscriptions USING(subscription_id)
+                    WHERE subscriptions.route_id=? AND event_deliveries.state='PENDING'
+                    """,
+                    (route_id,),
+                ).fetchone()[0],
+                "wakes": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM subscription_wakes
+                    JOIN subscriptions USING(subscription_id)
+                    WHERE subscriptions.route_id=?
+                    """,
+                    (route_id,),
+                ).fetchone()[0],
+                "active_wakes": connection.execute(
+                    """
+                    SELECT COUNT(*) FROM subscription_wakes
+                    JOIN subscriptions USING(subscription_id)
+                    WHERE subscriptions.route_id=? AND subscription_wakes.state IN (?,?,?)
+                    """,
+                    (route_id, *ACTIVE_WAKE_STATES),
+                ).fetchone()[0],
+            }
         return {
+            "schema_version": 1,
             "events": connection.execute(
                 "SELECT COUNT(*) FROM events WHERE route_id=?", (route_id,)
             ).fetchone()[0],
+            "subscriptions": 0,
             "pending": connection.execute(
                 "SELECT COUNT(*) FROM events WHERE route_id=? AND acked_at IS NULL",
                 (route_id,),

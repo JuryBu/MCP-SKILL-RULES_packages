@@ -22,6 +22,9 @@
 | `TENCENT_DOCS_MCP_TOKEN_FILE` | `<data_root>/secrets/tencent-docs-mcp.token` | 腾讯文档 Token 文件 |
 | `WECHAT_DOCS_MCP_AUTO_POLL` | `0` | MCP 进程启动时自动开启后台轮询 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
+| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 微信真实发送总开关；当前无正式 UI backend，保持关闭 |
+| `WECHAT_DOCS_MCP_INTAKE_ROOT` | `<data_root>/intake` | 按需下载附件的允许根目录 |
+| `WECHAT_DOCS_MCP_UPLOAD_ROOT` | `<data_root>/upload` | 上传清单只允许读取此目录内文件 |
 | `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
 | `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
 
@@ -41,36 +44,17 @@
 │       └── wcdb_key_tool_windows.py  # 密钥提取工具
 ├── state/
 │   └── events.sqlite3        # 权威事件账本
+├── intake/                   # 按需下载文件，不自动执行或解压
+├── upload/                   # 待批准上传文件的允许根目录
 └── secrets/
     └── tencent-docs-mcp.token
 ```
 
 ### 2.3 binding.json 格式
 
-```json
-{
-  "routes": [
-    {
-      "route_id": "route-friend-xxx",
-      "exact_title": "张三",
-      "chat_type": "friend",
-      "username": "wxid_abc123",
-      "conversation_id": "receiver-owned-codex-thread",
-      "generation": 1
-    },
-    {
-      "route_id": "route-group-xxx",
-      "exact_title": "工作群",
-      "chat_type": "group",
-      "username": "12345678@chatroom",
-      "conversation_id": "receiver-owned-codex-thread",
-      "generation": 1
-    }
-  ]
-}
-```
+使用 `binding.example.json` 的 schema v2 模板。route 只保存精确微信会话身份和本机 outbound capability；conversation 放在独立 `subscriptions` 数组中。一个 route 可出现于多个 subscription，一个 conversation 也可订阅多个 route。
 
-参考 `binding.example.json` 获取模板。
+公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 全关闭。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 时必须同时提供非空 `policy_ref`，真实授权消息引用另存于私有授权链，不得提交。
 
 ## 3. 安装
 
@@ -87,7 +71,7 @@ python -m pip install -e .
 python -m pytest tests/ -v
 ```
 
-应看到 57 项全部通过、零警告。
+应看到全部测试通过、零警告；准确数量以当前提交的 pytest 输出为准。
 
 ### 3.3 配置环境变量
 
@@ -163,6 +147,7 @@ wechat_status()
 | `decrypted_db_ready` | 解密目录存在 |
 | `encrypted_db_configured` | 加密 DB 目录已配置且存在 |
 | `route_count` | 绑定的路由数量 |
+| `subscription_count` | 当前账本中的 subscription 数量 |
 | `watcher_ready` | DbWatcher 实例已创建 |
 | `background_polling` | 后台轮询线程是否活跃 |
 | `poll_last_error` | 后台轮询最后一次错误信息 |
@@ -172,6 +157,7 @@ wechat_status()
 | `wake_notifier_ready` | 代理 runtime、token 与回环地址是否就绪 |
 | `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
 | `wake_last_attempt_time` | 最近一次提交尝试时间 |
+| `outbound_enabled` | 微信真实发送总开关；不代表 UI backend 已实现 |
 
 ### 5.1 健康判断
 
@@ -183,7 +169,7 @@ wechat_status()
 
 ### 6.1 迁移脚本备份
 
-`migrate_baselines.py` 使用 SQLite 原生 `backup()` API 创建时间戳备份：
+schema v2 自动迁移和 `migrate_baselines.py` 都使用 SQLite 原生 `backup()` API 创建时间戳备份：
 
 ```powershell
 python -m wechat_docs_mcp.migrate_baselines
@@ -232,7 +218,7 @@ src.close()
 - 候选 Python 能从最终 release 路径导入项目，工具数与预期一致；
 - `validation` 缺失、为 `null`、`activeBackend` 为 `null` 三种旧 manifest 均能升级；
 - Junction 切到候选后，`activeBackend`、backend generation 和 Supervisor 状态一致；
-- 账本事件、pending、wake 和 active wake 计数不变；
+- 账本 schema version、事件、subscription、pending delivery、wake 和 active wake 计数不变；
 - 受保护 endpoint 的 broker PID、backend PID 和 generation 均未改变；
 - 每个成功案例主动回滚并再次通过健康检查；
 - 强制健康失败会自动回滚，active 与 last-known-good 恢复旧 release。
@@ -260,6 +246,8 @@ src.close()
 ### 7.3 自动回滚
 
 切换后的任何异常都会执行同一回滚函数：恢复旧 Junction、pointer、私有运行配置、broker 私有环境和候选 manifest，随后 scoped reload 旧后端并再次核对健康与账本。只有 `rollback-verification.json` 中 `verified=true` 才会报告“失败后已验证回滚”。
+
+schema v2 首次启动会先备份再迁移旧账本。若迁移后已经产生多 subscription 的独立新 delivery，旧 V1 代码无法表达这些差异；此时不能只切回旧 release 并宣称数据语义已回滚。应保留现场，使用迁移前 SQLite backup 恢复到独立副本核验，再决定恢复窗口。
 
 账本检查由 `ops/release_probe.py` 完成。PowerShell 只传文件路径和 route 参数，不再使用内嵌 `python -c`，避免 Windows 多层引号和换行转义改变代码。
 

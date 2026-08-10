@@ -11,7 +11,7 @@ param(
   [string]$CandidateManifestPath,
   [string]$DrillRoot,
   [string]$Endpoint = "wechat-docs",
-  [int]$ExpectedToolCount = 15,
+  [int]$ExpectedToolCount = 29,
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,
   [string]$BrokerBaseUrl = "http://127.0.0.1:14588",

@@ -40,9 +40,9 @@ Optional Windsurf Cascade-only async subagent controller. It is not a shared fou
 
 Optional fixed-QQ-group collaboration MCP for status checks, structured task messages, verified file indexes, task ledger registration, trusted-peer routing, Codex conversation wakeups, heartbeat management, a process supervisor, and per-user autostart. It is source-only and disabled by default; the receiver must supply NapCat OneBot, a private token, QQ login state, and a private `binding.json`.
 
-### wechat-docs-mcp 0.1.0
+### wechat-docs-mcp 0.2.0
 
-Optional governed local bridge for allowlisted WeChat routes and Tencent Docs. SQLite is the event source of truth; merged wakes use exact event ACK and the existing Codex proxy journal without editing NapCat tasks. The receiver must supply private route bindings, database paths, token files, and a compatible logged-in desktop WeChat environment.
+Optional governed local bridge for allowlisted WeChat routes and Tencent Docs. SQLite is the event source of truth; route-to-conversation links are M:N subscriptions with independent delivery, wake, and exact ACK. The package also provides approval-gated outbound scaffolding, attachment manifests, document-change coalescing, and the existing Codex proxy journal without editing NapCat tasks. The receiver must supply private route bindings, policy references, database paths, token files, and a compatible logged-in desktop WeChat environment. Real WeChat UI sending remains disabled until a verified backend is installed privately.
 
 ## Portable Data
 

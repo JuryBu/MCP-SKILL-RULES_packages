@@ -319,12 +319,13 @@ class DbWatcherTests(unittest.TestCase):
         import threading
         call_log: list[str] = []
         original_impl = self.watcher._watch_once_impl
+        expected_result = original_impl(False)
 
         def tracking_impl(force_refresh: bool) -> WatchResult:
             call_log.append("enter")
             time.sleep(0.1)
             call_log.append("exit")
-            return original_impl(force_refresh)
+            return expected_result
 
         self.watcher._watch_once_impl = tracking_impl
 
@@ -339,6 +340,7 @@ class DbWatcherTests(unittest.TestCase):
             t.join(timeout=5)
 
         # Calls should be serialized: enter, exit, enter, exit (not interleaved)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
         self.assertEqual(["enter", "exit", "enter", "exit"], call_log)
 
     def test_get_active_wake_returns_wake_id(self) -> None:

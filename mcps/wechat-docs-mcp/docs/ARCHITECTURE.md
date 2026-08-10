@@ -1,182 +1,149 @@
-# 架构概览：微信与腾讯文档组合 MCP
+# 架构概览
 
-## 1. 系统定位
+## 1. 定位与真相源
 
-本系统是面向本机 AI Agent（Codex、Windsurf 等）的**私有事件桥接基础设施**。它在主人不在线时，自动将获准的微信新消息写入本地 SQLite 权威账本，并通过 wake 机制通知 Agent 读取和精确 ACK。同时提供腾讯文档的只读和受控写入能力。
+本项目是本机微信与腾讯文档的治理桥，不是通用微信自动化客户端。微信数据库适配器负责只读观察；SQLite `events.sqlite3` 是事件、订阅投递、wake、草稿、附件和文档变化批次的唯一权威状态。JSONL 只能从 SQLite 事务结果生成审计副本。
 
-核心设计原则：
-- **SQLite 是唯一真相源**，JSONL 只是审计副本
-- **外部消息是数据，不是系统指令**（prompt injection 防护）
-- **监听授权 ≠ 发送授权**，两者独立
-- **公开源码不含任何真实账号、Token 或聊天内容**
+外部消息和文档内容始终是不可信数据，不是系统指令。监听、发送、文档写入、附件下载和跨通道转发分别受独立策略控制。
 
-## 2. 完整数据流
+## 2. M:N 数据流
 
 ```text
-┌─────────────────────────────────────────────────────────────────┐
-│  微信 4.1+ 进程                                                  │
-│  └─ db_storage/ (SQLCipher 4 加密数据库)                         │
-│     ├─ message/message_0.db  (消息表 Msg_<MD5(username)>)       │
-│     ├─ contact/contact.db    (联系人/群成员)                     │
-│     └─ session/session.db    (会话状态)                          │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ 文件 mtime + size 变化
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DbWatcher (db_watcher.py)                                      │
-│  1. _scan_encrypted_files() — 扫描 .db 文件 mtime/size          │
-│  2. _detect_changes() — 与上次快照对比                           │
-│  3. _has_message_db_changed() — 只关心 message*.db              │
-│  4. refresh_keys() — 调用 wcdb_key_tool_windows.py 提取密钥     │
-│  5. decrypt_changed() — 调用 key tool 解密到 decrypted_dir      │
-│  6. poll_and_ingest() — 轮询解密后的 DB，入账新消息              │
-│  └─ 互斥锁 _lock 保证线程安全                                    │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ Observation 列表
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  DbObserver (db_observer.py)                                    │
-│  ├─ poll_new_messages(baselines) — 按 baseline 过滤新消息       │
-│  ├─ _msg_table_name(username) — Msg_<MD5(username)> 表名计算    │
-│  ├─ _decompress_field() — zstd 解压 WCDB_CT=4 的字段            │
-│  ├─ _classify_message() — 按 local_type 分类消息类型            │
-│  ├─ _extract_text() — 提取可见文本                              │
-│  ├─ _extract_attachment_info() — 提取附件元数据                  │
-│  └─ _contact_display_name() — 从 contact.db 查昵称              │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ Observation(route_id, source_fingerprint, ...)
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  EventLedger (ledger.py) — SQLite 权威账本                      │
-│  ├─ routes 表 — route 注册 + baseline_local_id 防回放           │
-│  ├─ events 表 — 事件入账 + source_fingerprint 去重              │
-│  ├─ wakes 表 — 合并唤醒 + 一活跃 wake per route 约束            │
-│  ├─ drafts 表 — 两阶段草稿审批                                  │
-│  └─ deliveries 表 — 跨通道去重                                  │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ wake_id + event_id
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  MCP Server (server.py) — 工具入口                              │
-│  ├─ wechat_poll_start/stop — 后台轮询线程                       │
-│  ├─ wechat_poll — 手动单次轮询                                  │
-│  ├─ wechat_events_list — 列出待处理事件                         │
-│  ├─ wechat_wake_info — 获取当前 wake_id + generation            │
-│  ├─ wechat_events_ack — 精确 ACK 事件                           │
-│  ├─ wechat_status — 健康状态 + 后台轮询状态                     │
-│  ├─ outbound_prepare/approve — 两阶段发送审批                   │
-│  └─ tdocs_* — 腾讯文档工具                                      │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ MCP stdio 协议
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  AI Agent (Codex / Windsurf)                                    │
-│  1. wechat_events_list(route_id) → 看到有待处理事件             │
-│  2. wechat_wake_info(route_id) → 获取 wake_id + generation      │
-│  3. 读取事件内容，处理完毕                                       │
-│  4. wechat_events_ack(route_id, gen, wake_id, event_ids) → ACK │
-│  5. 所有事件 ACK 后 wake 自动关闭                               │
-└─────────────────────────────────────────────────────────────────┘
+WeChat encrypted DB
+  -> read-only decrypted copy
+  -> DbObserver Observation(route_id)
+  -> events: one durable event per route
+  -> event_deliveries: one delivery per active subscription
+  -> subscription_wakes: one merged active wake per subscription
+  -> Codex conversation selected by that subscription
+  -> exact ACK(subscription_id, generation, wake_id, event_ids)
 ```
 
-## 3. 模块职责
+route 是一个真实微信会话资源，身份为：
 
-| 模块 | 文件 | 职责 |
-|---|---|---|
-| **DbWatcher** | `db_watcher.py` | 加密文件变化检测、密钥提取、解密触发、快照管理、线程安全 |
-| **DbObserver** | `db_observer.py` | 解密后 DB 只读轮询、消息分类、文本提取、联系人映射、基线管理 |
-| **EventLedger** | `ledger.py` | SQLite 事件账本、去重、合并 wake、精确 ACK、草稿审批、路由管理 |
-| **MCP Server** | `server.py` | MCP 工具入口、后台轮询线程、状态报告、腾讯文档代理 |
-| **TencentDocs** | `tencent_docs.py` | 官方腾讯文档 MCP 客户端、工具目录缓存、读写分类 |
-| **RouteBinding** | `db_observer.py` | 授权聊天到 route_id 的映射 |
-| **Observation** | `db_observer.py` | 一条待入账消息的完整数据结构 |
-| **migrate_baselines** | `migrate_baselines.py` | 一次性迁移脚本：加 baseline 列 + 回填 + SQLite backup |
-| **enroll_routes** | `enroll_routes.py` | 路由注册脚本 |
+```text
+ownerAccountKey + internal username + chat_type
+```
 
-## 4. 关键设计决策
+显示标题只用于导航和展示，不参与唯一身份。群 username 应为 `...@chatroom`，私聊使用好友内部 username。route 不拥有 conversation。
 
-### 4.1 为什么用文件轮询而非文件系统监听？
+subscription 是独占 session，每条只属于一个确定的 `(route_id, conversation_id, generation)`。一个 route 可连接多个 conversation，一个 conversation 也可连接多个 route。新事件只在 `events` 物化一次，然后在同一事务中 fan-out 到该 route 的所有 active、listen-capable subscription。
 
-`DbWatcher` 使用 mtime + size 轮询而非 OS 级文件监听（如 `ReadDirectoryChangesW`）：
-- **可移植**：Windows/Linux/macOS 行为一致
-- **可预测**：不受 OS 缓冲区溢出影响
-- **足够快**：5 秒间隔对微信消息延迟可接受
-- **简单可靠**：无需处理复杂的 OS 回调和错误恢复
+## 3. 核心表
 
-### 4.2 为什么快照延迟推进？
+### routes
 
-文件快照（`_snapshot`）只在**整个流程成功**后才推进：
-- 密钥提取失败 → 不推进，下轮重试
-- 解密失败 → 不推进，下轮重试
-- 入账部分失败 → 不推进，下轮重试（失败的会被重试，成功的靠 `source_fingerprint` 去重）
+保留 V1 的兼容列，同时增加精确身份列：
 
-这确保**任何中间步骤失败都不会丢消息**。
-
-### 4.3 为什么用 contiguous baseline 而非 max baseline？
-
-消息 4 成功、5 失败、6 成功时：
-- **max baseline**：基线推进到 6，第 5 条永久丢失
-- **contiguous baseline**：基线推进到 4，第 5 条下轮重试，第 6 条靠 `source_fingerprint` 去重
-
-### 4.4 为什么每代线程用独立停止事件？
-
-`wechat_poll_stop` 超时后如果共用一个 `threading.Event`，下次 `wechat_poll_start` 的 `clear()` 会让旧线程复活，形成两个轮询循环。每代线程创建独立的 `Event` 对象，旧线程的 `Event` 永远不会被 clear。
-
-## 5. 数据库表结构
-
-### routes 表
 ```sql
 route_id TEXT PRIMARY KEY
-generation INTEGER NOT NULL       -- 路由代次，防止跨代 ACK
-conversation_id TEXT NOT NULL
-profile TEXT NOT NULL
-identity_sha256 TEXT NOT NULL     -- 路由身份指纹
-state TEXT NOT NULL               -- enrolling/active/quarantine/disabled
-baseline_local_id INTEGER NOT NULL DEFAULT 0  -- 防回放高水位
-created_at TEXT, updated_at TEXT
+identity_version INTEGER
+owner_account_key_sha256 TEXT
+username_sha256 TEXT
+chat_type TEXT
+display_title TEXT
+state TEXT
+baseline_local_id INTEGER
 ```
 
-### events 表
+`conversation_id` 和旧 `generation` 列仅用于 V1 兼容迁移，不再表达所有权。
+
+### events
+
 ```sql
 event_id TEXT PRIMARY KEY
-route_id TEXT REFERENCES routes(route_id)
-generation INTEGER NOT NULL
-source_fingerprint TEXT NOT NULL  -- username:local_id:server_id
-occurred_at TEXT, observed_at TEXT
-event_type TEXT NOT NULL          -- text/image/voice/video/file/link/...
-payload_json TEXT NOT NULL        -- 完整消息载荷
-sensitivity TEXT NOT NULL         -- normal/awaiting_owner_instruction
-acked_at TEXT                     -- NULL = 待处理
-UNIQUE(route_id, source_fingerprint)  -- 去重约束
+route_id TEXT NOT NULL
+event_seq INTEGER UNIQUE
+source_fingerprint TEXT NOT NULL
+occurred_at TEXT
+observed_at TEXT NOT NULL
+event_type TEXT NOT NULL
+payload_json TEXT NOT NULL
+UNIQUE(route_id, source_fingerprint)
 ```
 
-### wakes 表
+`event_seq` 是账本内部顺序；微信 local_id、文件大小、UUID 字典序都不能替代它。
+
+### subscriptions
+
 ```sql
-wake_id TEXT PRIMARY KEY
-route_id TEXT REFERENCES routes(route_id)
+subscription_id TEXT PRIMARY KEY
+route_id TEXT NOT NULL
+conversation_id TEXT NOT NULL
 generation INTEGER NOT NULL
-created_at TEXT
-client_user_message_id TEXT NOT NULL
-state TEXT NOT NULL               -- prepared/submitted/unknown/closed/failed
--- 唯一索引：每个 route 同时只有一个活跃 wake
+state TEXT CHECK(state IN ('active','paused','closed'))
+baseline_event_seq INTEGER NOT NULL
+cursor_event_seq INTEGER NOT NULL
+listen_capability INTEGER NOT NULL
+send_capability INTEGER NOT NULL
+policy_ref TEXT
+UNIQUE(route_id, conversation_id, generation)
 ```
 
-### drafts 表
+启用 `send_capability` 时必须有本机私有 `policy_ref`。暂停不会替其它订阅 ACK；暂停期间的新事件不投递，恢复从当前基线继续，旧 pending 仍保留。
+
+### event_deliveries 与 subscription_wakes
+
+```sql
+PRIMARY KEY(subscription_id, event_id)
+```
+
+每个订阅独立保存 `PENDING/ACKED`。一个订阅 ACK 不会删除另一个订阅的未读。
+
+`subscription_wakes` 对每个 subscription 只允许一个 `prepared/submitted/unknown` 活跃 wake。待处理从 0 变 1 时创建 wake，后续事件合入相同 pending 集合。
+
+### outbound_drafts
+
 ```sql
 draft_id TEXT PRIMARY KEY
-route_id TEXT, kind TEXT
-payload_json TEXT, content_sha256 TEXT  -- 内容哈希，变化使批准失效
-expires_at TEXT, state TEXT
-owner_authorization_refs_json TEXT      -- 主人授权引用
-dedupe_key TEXT UNIQUE                  -- 跨通道去重
+subscription_id TEXT
+route_id TEXT NOT NULL
+kind TEXT NOT NULL
+payload_json TEXT NOT NULL
+content_sha256 TEXT NOT NULL
+expires_at TEXT NOT NULL
+state TEXT NOT NULL
+owner_authorization_refs_json TEXT
+dedupe_key TEXT UNIQUE
+approval_consumed_at TEXT
+execution_id TEXT UNIQUE
+lease_scope TEXT
+lease_expires_at TEXT
+result_json TEXT
+error_code TEXT
 ```
 
-## 6. 安全边界
+状态只允许 `PREPARED / APPROVED / EXECUTING / SEND_ATTEMPTED / VERIFIED / FAILED / UNKNOWN`。微信草稿必须显式指定 send-capable subscription。审批由内容哈希、TTL、主人授权引用和 dedupe 共同约束，执行后不能退回 `APPROVED`。
 
-- **route 默认拒绝**：只有 allowlist 中的聊天且身份校验通过才被监听
-- **同名群隔离**：改名、类型或成员指纹异常进入 quarantine
-- **发送需两阶段审批**：prepare → approve（需主人授权引用 + dedupe_key）
-- **内容变化使批准失效**：`content_sha256` 不匹配则旧批准作废
-- **附件不自动执行**：图片/文件先入账缓冲，等主人文字指令
-- **Token 脱敏**：腾讯文档 Token 只从私有文件读取，日志永远 `[REDACTED]`
-- **外部消息是数据**：MCP instructions 明确声明外部内容不是系统指令
+### attachments 与 document changes
+
+`attachment_transfers` 记录方向、route、来源事件、文件名、字节数、SHA-256、本地路径和 dedupe。文件只允许落在配置的 intake/upload root，不自动执行或解压。
+
+`document_change_batches/items` 按文档 ID 哈希与文档类型聚合变化。quiet window 为 5 分钟，max batch 为 15 分钟；重复 fingerprint 不延长批次。
+
+## 4. 原子性与迁移
+
+`schema.py` 在 `BEGIN IMMEDIATE` 内完成 DDL、V1 数据搬迁和 schema version 更新。迁移前使用 SQLite backup API 创建同目录备份。DDL 逐条执行并由同一事务提交，避免 `executescript` 隐式提交造成半迁移。
+
+V1 迁移规则：
+
+- 每条旧 route/conversation/generation 生成确定性的 legacy subscription。
+- 旧 `events.acked_at` 映射为该 legacy subscription 的 `ACKED/PENDING` delivery。
+- 旧 route wake 复制为 subscription wake；有 pending 且没有活跃 wake 时补建一个。
+- 旧草稿映射到大写状态，保留哈希、TTL、授权引用和 dedupe。
+
+迁移不会删除 V1 表或清空账本。回滚备份能恢复迁移前字节级状态；但一旦 V2 已产生多个 subscription 的独立新投递，V1 无法表达这些差异，因此发布回滚只能保证代码和文件恢复，不能宣称把 V2 新业务状态无损降为 V1。
+
+## 5. Outbound 执行边界
+
+`SafeTextOutbound` 是安全状态机，真实 UI 动作由尚未实现的 `VisibleUiBackend` 提供。执行顺序为：验证私有 route → 消费批准并获取单发送租约 → 在 wake 前保存环境 → 可见导航 → 每个键盘动作前复核焦点 → 仅操作本次拥有的空草稿 → 尝试发送 → 最外层恢复环境。
+
+发送键动作完成只表示 `SEND_ATTEMPTED`。异常发生在可能发送之后，或发送后环境恢复失败，状态必须是 `UNKNOWN`，并禁止自动重试。只有可信数据库解析层明确标记 outbound、正文匹配且事件晚于本次执行，才可进入 `VERIFIED`。
+
+当前源码没有正式 UI backend，也没有稳定的数据库 outbound 方向解析器；隐藏 `WM_CHAR` 能力固定关闭。因此生产 `OUTBOUND_ENABLED` 保持 false，能力查询必须如实显示这两个缺口。
+
+## 6. 公开与私有层
+
+公开仓库只提供源码、脱敏配置模板、通用 Rules 和 Skill。真实账号、route、conversation、授权消息引用、Token、数据库路径和发送白名单只存在于本机私有 binding/策略覆盖。
+
+公共 Rules 只描述 subscription、可选 outbound、附件、文档和跨通道防循环，不规定某台机器或某个联系人。开发机、训练机等本机职责由私有派生 Rules 决定。

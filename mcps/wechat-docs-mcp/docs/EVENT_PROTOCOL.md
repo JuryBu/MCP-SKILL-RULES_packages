@@ -1,266 +1,158 @@
-# 事件协议参考
+# 事件与发送协议
 
-## 1. 核心概念
+## 1. Route、subscription 与 event
 
-| 概念 | 说明 |
-|---|---|
-| **Route** | 一个获准监听的微信会话（私聊或群聊），有唯一 `route_id` 和 `generation` |
-| **Baseline** | 每个 route 的高水位标记（`baseline_local_id`），防止旧历史回放 |
-| **Event** | 一条入账的微信消息，有唯一 `event_id` 和 `source_fingerprint` |
-| **Wake** | 合并唤醒，多条消息只产生一次 wake，Agent 读取后精确 ACK |
-| **Draft** | 两阶段发送草稿，prepare → approve → send |
-| **ACK** | 确认事件已处理，只 ACK 真正处理完的 `event_id` |
+route 是精确识别的一条微信会话资源，conversation 不写死在 route。subscription 是一个独占 session：
 
-## 2. Route 生命周期
+```text
+subscription_id -> (route_id, conversation_id, generation)
+```
 
-### 2.1 注册
+route 与 conversation 都可连接多个 subscription。事件按 route 只入账一次，每个 active、listen-capable subscription 获得自己的 delivery。
+
+新 subscription 默认以当前 `MAX(event_seq)` 为 baseline，不回放旧历史。数据库以 `PRIMARY KEY(subscription_id,event_id)` 防止同一订阅重复投递，但其它订阅收到同一 event 是有意 fan-out。
+
+## 2. 建链
 
 ```python
 ledger.register_route(
-    route_id="route-xxx",
-    conversation_id="conv-xxx",
-    generation=1,
-    profile="test",
-    identity={"chat_name": "TestUser", "chat_type": "friend", "username": "wxid_xxx"},
+    route_id="route-synthetic",
+    profile="human_group",
+    identity={"chat_name": "Synthetic Group"},
     state="active",
-    baseline_local_id=0,
+    owner_account_key="synthetic-owner-key",
+    username="synthetic-room@chatroom",
+    chat_type="group",
+    display_title="Synthetic Group",
+)
+
+ledger.register_subscription(
+    "route-synthetic",
+    "conversation-synthetic",
+    1,
+    subscription_id="subscription-synthetic",
+    listen_capability=True,
+    send_capability=False,
+    policy_ref="private-listen-policy",
 )
 ```
 
-- `generation` 从 1 开始，每次重开 route 递增，防止跨代 ACK
-- `identity` 的 SHA-256 存入 `identity_sha256`，用于检测身份变化
-- `state` 可以是 `enrolling`、`active`、`quarantine`、`disabled`
-- 只有 `active` 状态的 route 才能入账事件
+精确身份是规范化后的 `ownerAccountKey + username + chat_type`。显示标题只作展示和 UI 导航。同名候选不能自动选择；来源目标不唯一时进入 quarantine 或拒绝。
 
-### 2.2 身份校验
+启用发送能力必须提供本机私有 `policy_ref`，并且 private binding 的对应 route/capability 也必须显式开启。监听授权不等于发送授权。
 
-路由身份包含：
-- `chat_name` — 精确标题（微信中显示的名称）
-- `chat_type` — `friend` 或 `group`
-- `username` — wxid 或 chatroom ID
-- `group_member_count` — 群成员数（仅群聊）
-
-身份变化（改名、成员数变化）会触发 quarantine，不自动迁移。
-
-### 2.3 Baseline 防回放
-
-`baseline_local_id` 是该 route 消息表中的 `MAX(local_id)`。新消息入账后基线推进到 contiguous max（连续成功的最大值），确保：
-- 旧历史不回放
-- 中间失败的消息会被重试
-- 成功的消息靠 `source_fingerprint` 去重
-
-`update_baseline()` 有回归检查：新值必须 >= 当前值。
-
-## 3. Event 入账
-
-### 3.1 入账流程
+## 3. 入账与 fan-out
 
 ```python
 result = ledger.ingest_event(
-    route_id="route-xxx",
-    source_fingerprint="wxid_xxx:42:100200",
+    route_id="route-synthetic",
+    source_fingerprint="synthetic-room@chatroom:42:100200",
     event_type="text",
-    payload={"kind": "text", "visible_text": "你好", "sender_display": "张三", ...},
-    occurred_at="2026-08-09T11:00:00+00:00",
-    sensitivity="normal",
+    payload={
+        "kind": "text",
+        "visible_text": "synthetic message",
+        "sender_display": "Synthetic Sender",
+    },
 )
 ```
 
-返回值：
-```python
-# 新事件
-{"inserted": True, "event_id": "uuid-xxx", "wake": {"wake_id": "uuid-yyy", "state": "prepared", ...}}
+返回 `event_id`、`event_seq`、`delivery_count` 和本次涉及的 wakes。事件插入、所有 delivery 和 0→1 wake 创建在同一 SQLite 事务中。
 
-# 重复事件（source_fingerprint 已存在）
-{"inserted": False, "event_id": "existing-uuid", "wake": None}
-```
+`source_fingerprint` 只用于同一 route 内的来源去重。处理顺序必须使用 `event_seq`，不能按微信索引、数字大小、文件大小或 UUID 字典序推断。
 
-### 3.2 去重机制
+## 4. 每 subscription 合并 wake
 
-`events` 表有 `UNIQUE(route_id, source_fingerprint)` 约束。`source_fingerprint` 格式是 `<username>:<local_id>:<server_id>`，保证：
-- 同一消息不会重复入账
-- `watch_once` 重试时已入账的消息被安全跳过
-- 不同 route 的相同消息各自独立入账
+每个 subscription 最多有一个活跃 wake，活跃状态是 `prepared / submitted / unknown`。只有该订阅 pending 从 0 变 1 时创建 wake；后续事件合入同一 pending 集合，不逐消息注入 Codex。
 
-### 3.3 Payload 结构
+wake 提醒必须包含 `subscription_id`、`route_id`、`generation` 和 `wake_id`，不能包含微信正文。Codex conversation 由 subscription 决定。
 
-```json
-{
-  "kind": "text",
-  "sender_display": "张三",
-  "sender_username": "wxid_abc123",
-  "message_time_display": "2026-08-09T11:00:00+00:00",
-  "visible_text": "你好",
-  "local_id": 42,
-  "server_id": 100200,
-  "source_window_identity": "张三",
-  "attachment_name": "report.pdf",
-  "attachment_size": 1048576,
-  "attachment_size_display": "1.0MB"
-}
-```
+暂停 subscription 会关闭其活跃 wake，但不会 ACK 已有 pending。暂停期间的新 route event 不投递给该 subscription；其它 active subscription 不受影响。closed subscription 不能重新开启。
 
-附件字段只在 file/link/mini_program 类型消息中出现。
-
-## 4. Wake 合并唤醒
-
-### 4.1 创建规则
-
-当一条新事件入账时：
-1. 查询该 route 当前是否有活跃 wake（`state IN ('prepared','submitted','unknown')`）
-2. 查询该 route 入账前的待处理事件数
-3. 如果**入账前待处理数为 0 且没有活跃 wake**，创建新 wake
-4. 否则不创建新 wake（合并到现有 wake）
-
-这意味着：短时间内收到多条消息只产生一次唤醒。
-
-### 4.2 唯一约束
-
-```sql
-CREATE UNIQUE INDEX wakes_one_active_per_route
-  ON wakes(route_id) WHERE state IN ('prepared','submitted','unknown');
-```
-
-数据库层面保证每个 route 同时只有一个活跃 wake。
-
-### 4.3 Wake 状态流转
-
-```
-prepared → submitted → closed    (正常流程)
-prepared → unknown → closed      (异常恢复)
-prepared → failed                (处理失败)
-```
-
-- `prepared` — 刚创建，等待 Agent 读取
-- `submitted` — Agent 已开始处理（可选状态）
-- `unknown` — 状态不确定（恢复用）
-- `closed` — 所有事件已 ACK，wake 关闭
-- `failed` — 处理失败
-
-### 4.4 查询活跃 wake
+## 5. 读取与精确 ACK
 
 ```python
-wake = ledger.get_active_wake("route-xxx")
-# {"wake_id": "uuid-yyy", "route_id": "route-xxx", "generation": 1, "state": "prepared", ...}
-```
+events = wechat_events_list(subscription_id="subscription-synthetic")
+wake = wechat_wake_info(subscription_id="subscription-synthetic")
 
-MCP 工具 `wechat_wake_info(route_id)` 返回 `wake_id` 和 `generation`，供 `wechat_events_ack` 使用。
-
-## 5. ACK 精确确认
-
-### 5.1 ACK 操作
-
-```python
-result = ledger.ack(
-    route_id="route-xxx",
-    generation=1,
-    wake_id="uuid-yyy",
-    event_ids=["event-uuid-1", "event-uuid-2"],
+wechat_events_ack(
+    subscription_id="subscription-synthetic",
+    generation=wake["generation"],
+    wake_id=wake["wake_id"],
+    event_ids=[events[0]["event_id"]],
 )
 ```
 
-### 5.2 ACK 规则
+ACK 规则：
 
-- 只 ACK 真正处理完的 `event_id`，未列出的事件继续待处理
-- `wake_id` 必须是当前活跃的 wake
-- `generation` 必须与 wake 的 generation 一致（防跨代 ACK）
-- 所有 `event_id` 必须属于该 route 和 generation
-- 所有事件 ACK 后 wake 自动关闭（`state='closed'`）
+- 只列真正处理完的 event_id；未列 delivery 继续 PENDING。
+- event 必须确实投递给当前 subscription。
+- generation 必须同时匹配 subscription 与 wake。
+- 一个 subscription 的 ACK 不会改变其它 subscription 的 delivery。
+- pending 归零后仅关闭当前 subscription 的 wake。
 
-### 5.3 ACK 返回值
+`route_id` 参数只用于 V1 单订阅兼容。若 route 有多个 active subscription，兼容调用会返回 `AMBIGUOUS_SUBSCRIPTION`，调用者必须改用 `subscription_id`。
+
+## 6. Outbound 草稿与状态
+
+```text
+PREPARED -> APPROVED -> EXECUTING -> SEND_ATTEMPTED -> VERIFIED
+                               \-> FAILED
+                               \-> UNKNOWN
+```
+
+微信草稿必须显式指定唯一 route 和 send-capable subscription：
 
 ```python
-{
-  "processed_event_ids": ["event-uuid-1", "event-uuid-2"],
-  "pending_count": 0,      # 剩余待处理数
-  "wake_active": False      # wake 是否仍活跃
-}
+draft = outbound_prepare(
+    route_id="route-synthetic",
+    subscription_id="subscription-synthetic",
+    kind="wechat_text",
+    payload={"text": "SYNTHETIC_MARKER"},
+)
+
+outbound_approve(
+    draft_id=draft["draft_id"],
+    payload={"text": "SYNTHETIC_MARKER"},
+    owner_authorization_refs=[{
+        "conversation_id": "owner-conversation",
+        "turn_id": "owner-turn",
+        "message_item_id": "owner-item",
+        "role": "user",
+        "authorized_at": "2026-01-01T00:00:00+00:00"
+    }],
+    dedupe_key="synthetic-dedupe",
+)
 ```
 
-### 5.4 部分 ACK
+代码只机械校验授权引用字段、角色、时间、草稿哈希、TTL 与 dedupe，不判断主人消息是否在语义上授权当前动作。Agent/Rules 负责语义判断。
 
-如果一次只 ACK 部分事件：
-```python
-result = ledger.ack("route-xxx", 1, "wake-uuid", ["event-1"])
-# {"processed_event_ids": ["event-1"], "pending_count": 2, "wake_active": True}
-```
+批准在 `APPROVED -> EXECUTING` 时一次消费。单个 `wechat-visible-ui` lease 同时只允许一条发送。进程重载后发现过期 `EXECUTING` 会改为 `UNKNOWN`，不能恢复为 `APPROVED` 或自动重试。
 
-剩余事件继续待处理，wake 保持活跃。
+UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足以下全部条件才可 `VERIFIED`：
 
-## 6. 发送授权（两阶段草稿）
+- route 相同；
+- event 和 draft 都是文字类型；
+- 可信解析器明确给出 `direction=outbound`；
+- `visible_text` 与批准草稿正文完全一致；
+- event 晚于本次批准消费时间；
+- 该 event 尚未被其它草稿消费，同一观察事件只能验证一次。
 
-### 6.1 流程
+当前数据库观察器尚未稳定提供 outbound 方向，因此真实 UI backend 接入前会停在 `SEND_ATTEMPTED/UNKNOWN`，不得伪称成功。
 
-```
-1. outbound_prepare(route_id, kind, payload, ttl_seconds)
-   → 生成不可变草稿，返回 draft_id + content_sha256
+## 7. 附件
 
-2. outbound_approve(draft_id, payload, owner_authorization_refs, dedupe_key)
-   → 验证 payload 哈希一致 + 主人授权引用有效
-   → 返回 approved 状态
+下载是按需流程：先以 `(subscription_id,event_id,file_name,dedupe_key)` 创建 transfer，确认该事件确实投递给订阅且类型为 file/image/sticker；适配器把文件放入 intake root 后，再登记实际字节数和 SHA-256。大小或名称与元数据不一致时失败。
 
-3. 执行发送（通过 wxautox4 或其他适配器）
-   → mark_draft_state(draft_id, "approved", "client_sent")
-```
+上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。它只生成哈希清单，不执行发送；后续实际上传仍需不可变 outbound 草稿和授权链。
 
-### 6.2 安全约束
+文件永不自动执行或解压。
 
-- **payload 变化使批准失效**：`content_sha256` 不匹配则 `DRAFT_CHANGED` 错误
-- **主人授权引用必填**：`owner_authorization_refs` 不能为空
-- **授权引用校验**：每条引用必须有 `conversation_id`、`turn_id`、`message_item_id`、`role`（必须是 `user`）、`authorized_at`（必须早于调用时间）
-- **dedupe_key 唯一**：防止同一发送重复执行
-- **TTL 过期**：草稿超过 `expires_at` 后不能批准
+## 8. 腾讯文档
 
-### 6.3 Draft 状态
+高频只读工具可以直接调用。官方完整能力通过工具发现与通用调用入口保留；修改、删除、移动、权限等写操作仍需草稿、授权与 dedupe。
 
-```
-prepared → approved → client_sent → chat_observed
-                    → failed
-```
+文档/表单观察器以文档 ID 哈希分组。变化后等待 5 分钟安静窗口；持续变化最多合并 15 分钟。相同 fingerprint 不重复计数，也不延长窗口。批次从 `OPEN -> READY -> EMITTED`，一个 batch 只生成一次汇总提醒。
 
-- `prepared` — 刚创建
-- `approved` — 已批准
-- `client_sent` — 已发送到微信
-- `chat_observed` — 在聊天中观察到发送结果
-- `failed` — 发送失败
+## 9. 跨通道
 
-## 7. 附件处理
-
-### 7.1 缓冲策略
-
-图片、文件、表情等附件类消息先入账，`sensitivity` 标记为 `awaiting_owner_instruction`，不触发立即回复。
-
-### 7.2 附件元数据
-
-```json
-{
-  "attachment_name": "report.pdf",
-  "attachment_size": 1048576,
-  "attachment_size_display": "1.0MB"
-}
-```
-
-### 7.3 安全要求
-
-- 附件**不自动执行或解压**
-- 下载后记录来源 `event_id`、字节数和 SHA-256
-- 等待主人后续文字指令后，把附件与指令合并交付
-
-## 8. 完整 ACK 闭环示例
-
-```python
-# 1. 后台轮询自动入账新消息
-# 2. Agent 发现有待处理事件
-events = wechat_events_list("route-xxx", limit=50)
-# [{"event_id": "evt-1", "event_type": "text", "payload": {...}, ...}, ...]
-
-# 3. 获取 wake 信息
-wake = wechat_wake_info("route-xxx")
-# {"wake_id": "wake-uuid", "generation": 1, "state": "prepared"}
-
-# 4. 处理事件，逐项 ACK
-wechat_events_ack("route-xxx", 1, "wake-uuid", ["evt-1", "evt-2"])
-# {"processed_event_ids": ["evt-1", "evt-2"], "pending_count": 0, "wake_active": False}
-
-# 5. wake 自动关闭，闭环完成
-```
+跨 QQ/微信机器任务保留 `task_id`、`generation`、`source_machine`、`target_machine`、`delivery_id`、`trace_id`、`origin_transport`、`hop_count` 和 dedupe。重复 delivery 或超出 hop 限制必须拒绝，防止 QQ 与微信之间形成回环。

@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from wechat_docs_mcp.ledger import EventLedger
+
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RELEASE_SCRIPT = PACKAGE_ROOT / "ops" / "manage-wechat-docs-release.ps1"
@@ -53,7 +55,14 @@ class ReleaseProbeTests(unittest.TestCase):
             )
             self.assertEqual(0, created.returncode, created.stderr)
             self.assertEqual(
-                {"active_wakes": 0, "events": 1, "pending": 0, "wakes": 1},
+                {
+                    "active_wakes": 0,
+                    "events": 1,
+                    "pending": 0,
+                    "schema_version": 1,
+                    "subscriptions": 0,
+                    "wakes": 1,
+                },
                 json.loads(created.stdout),
             )
 
@@ -71,6 +80,46 @@ class ReleaseProbeTests(unittest.TestCase):
             self.assertEqual(0, snapshot.returncode, snapshot.stderr)
             self.assertEqual(json.loads(created.stdout), json.loads(snapshot.stdout))
 
+    def test_v2_snapshot_counts_subscription_deliveries(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "events.sqlite3"
+            ledger = EventLedger(path)
+            ledger.register_route("route-v2", profile="test", state="active")
+            ledger.register_subscription(
+                "route-v2", "conversation-a", 1, subscription_id="subscription-a"
+            )
+            ledger.register_subscription(
+                "route-v2", "conversation-b", 1, subscription_id="subscription-b"
+            )
+            event = ledger.ingest_event("route-v2", "fingerprint-v2", "text", {"text": "safe"})
+            wake = ledger.get_active_wake("subscription-a")
+            self.assertIsNotNone(wake)
+            ledger.ack("subscription-a", 1, wake["wake_id"], [event["event_id"]])
+
+            snapshot = run_process(
+                [
+                    sys.executable,
+                    str(PROBE_SCRIPT),
+                    "ledger-state",
+                    "--ledger",
+                    str(path),
+                    "--route-id",
+                    "route-v2",
+                ]
+            )
+            self.assertEqual(0, snapshot.returncode, snapshot.stderr)
+            self.assertEqual(
+                {
+                    "active_wakes": 1,
+                    "events": 1,
+                    "pending": 1,
+                    "schema_version": 2,
+                    "subscriptions": 2,
+                    "wakes": 2,
+                },
+                json.loads(snapshot.stdout),
+            )
+
     def test_package_probe_resolves_inside_expected_root(self) -> None:
         result = run_process(
             [
@@ -84,7 +133,7 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         package = json.loads(result.stdout)
         self.assertTrue(package["inside_release"])
-        self.assertEqual(15, package["tool_count"])
+        self.assertEqual(29, package["tool_count"])
 
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell and Junctions required")

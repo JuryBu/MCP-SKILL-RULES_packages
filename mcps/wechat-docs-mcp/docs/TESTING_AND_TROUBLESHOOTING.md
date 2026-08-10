@@ -2,13 +2,16 @@
 
 ## 1. 测试概览
 
-当前共 **57 项测试**，分布在 7 个文件中：
+测试覆盖入站观察、M:N 投递、原子迁移、发送状态机、附件、文档合并、Supervisor 和发布回滚。测试数量随实现增长，验收以当前提交的完整 pytest 输出为准，不在文档里维护容易失真的固定总数。
 
 | 文件 | 测试数 | 覆盖范围 |
 |---|---|---|
 | `test_db_observer.py` | 12 | 消息轮询、基线、去重指纹、消息分类、发送者解析、群正文规范化 |
 | `test_db_watcher.py` | 15 | 文件变化检测、快照管理、入账重试、并发锁、wake 查询 |
-| `test_ledger.py` | 13 | 事件去重、合并 wake、部分 ACK、草稿审批、wake 状态比较交换、路由隔离 |
+| `test_ledger.py` / `test_mn_subscriptions.py` | 动态 | fan-out、独立 ACK、订阅能力、草稿租约、UNKNOWN 恢复 |
+| `test_schema_migration.py` | 动态 | V1 自动备份、事务迁移、delivery/wake 映射和备份恢复 |
+| `test_outbound.py` / `test_route_verifier.py` | 动态 | UI 外层恢复、焦点保护、精确身份、逐 capability 私有策略 |
+| `test_attachments.py` / `test_document_changes.py` | 动态 | intake/upload 边界、哈希去重、5/15 分钟合并窗口 |
 | `test_server_polling.py` | 4 | 后台启动互斥、停止/启动交错、停止超时、轮询失败恢复 |
 | `test_wake_notifier.py` | 5 | 正文隔离、代理重试去重、busy/unknown 结果、回环地址限制 |
 | `test_supervisor.py` | 3 | broker 深度健康、错误脱敏、回环地址限制 |
@@ -94,13 +97,13 @@ mock_ledger.update_baseline.assert_called_once_with("route-test", 4)  # 不是 6
 2. wechat_poll_start(interval=5)  → 启动后台轮询
 3. 从另一手机向授权会话发送一条测试消息
 4. 等待 5-10 秒
-5. wechat_events_list(route_id)   → 应看到新事件
-6. wechat_wake_info(route_id)     → 应返回 wake_id
-7. wechat_events_ack(route_id, gen, wake_id, [event_id])  → ACK
-8. wechat_events_list(route_id)   → 待处理数应为 0
+5. wechat_events_list(subscription_id)   → 应看到新事件
+6. wechat_wake_info(subscription_id)     → 应返回 wake_id
+7. wechat_events_ack(gen, wake_id, [event_id], subscription_id)  → ACK
+8. wechat_events_list(subscription_id)   → 当前订阅待处理数应为 0
 9. wechat_poll_stop()             → 停止后台轮询
 10. wechat_poll_start(interval=5) → 重启
-11. wechat_events_list(route_id)  → 旧消息不重放
+11. wechat_events_list(subscription_id)  → 旧消息不重放
 ```
 
 ### 3.3 验收通过标准
@@ -110,6 +113,8 @@ mock_ledger.update_baseline.assert_called_once_with("route-test", 4)  # 不是 6
 - [ ] 连续 3 条消息只产生 1 次 wake
 - [ ] 逐条 ACK 后 wake 关闭
 - [ ] 重启服务后旧消息不重放
+- [ ] 同一 route 的第二个 active subscription 独立收到 delivery
+- [ ] 第一个 subscription ACK 后第二个仍保持 pending
 - [ ] 后台轮询状态在 `wechat_status` 中可见
 
 ## 4. 常见错误
@@ -146,7 +151,7 @@ mock_ledger.update_baseline.assert_called_once_with("route-test", 4)  # 不是 6
 ### 4.5 "STALE_WAKE" / "STALE_GENERATION"
 
 **原因**：ACK 时提供的 `wake_id` 或 `generation` 不匹配
-**排查**：先调用 `wechat_wake_info(route_id)` 获取当前值
+**排查**：先调用 `wechat_wake_info(subscription_id)` 获取当前值。route 同时有多个 active subscription 时，不能使用 route 兼容参数。
 
 ### 4.6 后台线程无法停止
 
@@ -180,7 +185,7 @@ mock_ledger.update_baseline.assert_called_once_with("route-test", 4)  # 不是 6
 
 5. **检查账本** — 确认事件已入账
    ```python
-   ledger.list_pending("route-xxx")
+   ledger.list_pending("subscription-xxx")
    ```
 
 ## 6. 测试数据构造

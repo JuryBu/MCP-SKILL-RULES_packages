@@ -1,16 +1,68 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "ownerAccountKey": "receiver-owned-private-key",
   "routes": [
     {
-      "route_id": "local-generated-uuid",
+      "route_id": "route-synthetic-group",
       "profile": "human_group",
-      "exact_title": "ExampleGroup",
+      "exact_title": "Synthetic Group",
+      "display_title": "Synthetic Group",
       "chat_type": "group",
-      "username": "sanitized-room-id",
-      "conversation_id": "receiver-owned-codex-thread",
+      "username": "synthetic-room@chatroom",
+      "state": "enrolling",
+      "outbound": {
+        "enabled": false,
+        "text": false,
+        "file": false,
+        "image": false
+      }
+    },
+    {
+      "route_id": "route-synthetic-direct",
+      "profile": "human_direct",
+      "exact_title": "Synthetic Contact",
+      "display_title": "Synthetic Contact",
+      "chat_type": "friend",
+      "username": "synthetic-contact-id",
+      "state": "enrolling",
+      "outbound": {
+        "enabled": false,
+        "text": false,
+        "file": false,
+        "image": false
+      }
+    }
+  ],
+  "subscriptions": [
+    {
+      "subscription_id": "subscription-synthetic-a",
+      "route_id": "route-synthetic-group",
+      "conversation_id": "receiver-owned-codex-thread-a",
       "generation": 1,
-      "state": "enrolling"
+      "state": "paused",
+      "listen_capability": true,
+      "send_capability": false,
+      "policy_ref": "receiver-owned-private-listen-policy"
+    },
+    {
+      "subscription_id": "subscription-synthetic-b",
+      "route_id": "route-synthetic-group",
+      "conversation_id": "receiver-owned-codex-thread-b",
+      "generation": 1,
+      "state": "paused",
+      "listen_capability": true,
+      "send_capability": false,
+      "policy_ref": "receiver-owned-private-listen-policy"
+    },
+    {
+      "subscription_id": "subscription-synthetic-c",
+      "route_id": "route-synthetic-direct",
+      "conversation_id": "receiver-owned-codex-thread-a",
+      "generation": 1,
+      "state": "paused",
+      "listen_capability": true,
+      "send_capability": false,
+      "policy_ref": "receiver-owned-private-listen-policy"
     }
   ]
 }

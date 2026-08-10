@@ -1,5 +1,7 @@
 # 交接给 MCP 开发对话
 
+> 历史归档：本文记录 V1 入站接管时点，固定测试数和单 route wake 语义不再代表当前实现。当前合同以 `README.md`、`docs/ARCHITECTURE.md` 与 `docs/EVENT_PROTOCOL.md` 的 schema v2 M:N subscription 设计为准。
+
 ## 1. 已验证状态（Windsurf 施工 + MCP 接管修复）
 
 ### 1.1 代码修复全部完成

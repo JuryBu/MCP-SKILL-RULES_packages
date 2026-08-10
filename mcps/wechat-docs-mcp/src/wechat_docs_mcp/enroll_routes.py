@@ -1,27 +1,13 @@
-"""Register authorised routes and establish message baselines.
-
-This script reads route bindings from the private config file
-(``config/binding.json`` under the data root) and registers them in the
-event ledger.  No real account identifiers, conversation IDs, or other
-sensitive data appear in this source file.
-
-Run with:
-    python -m wechat_docs_mcp.enroll_routes
-"""
 from __future__ import annotations
 
 import json
 import os
-import sys
 from pathlib import Path
+from typing import Any
 
-# Set up paths for direct execution
-SRC_DIR = Path(__file__).resolve().parent.parent / "src"
-if str(SRC_DIR) not in sys.path:
-    sys.path.insert(0, str(SRC_DIR))
+from .db_observer import DbObserver, RouteBinding
+from .ledger import EventLedger, LedgerError
 
-from wechat_docs_mcp.db_observer import DbObserver, RouteBinding
-from wechat_docs_mcp.ledger import EventLedger
 
 DATA_ROOT = Path(
     os.environ.get(
@@ -31,103 +17,126 @@ DATA_ROOT = Path(
 )
 DECRYPTED_DIR = DATA_ROOT / "private-state" / "decrypted"
 LEDGER_PATH = DATA_ROOT / "state" / "events.sqlite3"
-
 BINDING_FILE = DATA_ROOT / "config" / "binding.json"
 
 
-def load_bindings(path: Path) -> list[RouteBinding]:
-    """Load route bindings from the private config file.
-
-    Expected format (``binding.json``)::
-
-        {
-          "routes": [
-            {
-              "route_id": "wechat-example-friend",
-              "exact_title": "<display name>",
-              "chat_type": "friend",
-              "username": "<wxid>",
-              "conversation_id": "<conversation id>"
-            }
-          ]
-        }
-    """
+def load_binding_config(path: Path) -> dict[str, Any]:
     if not path.exists():
-        raise FileNotFoundError(
-            f"Binding file not found: {path}. "
-            "Create it with route_id, exact_title, chat_type, username, "
-            "and conversation_id for each authorised chat."
-        )
-    with open(path, encoding="utf-8") as f:
-        data = json.load(f)
-    routes = data.get("routes", [])
+        raise FileNotFoundError(f"Binding file not found: {path}")
+    with path.open(encoding="utf-8") as stream:
+        data = json.load(stream)
+    owner_account_key = str(data.get("ownerAccountKey") or "").strip()
+    if not owner_account_key:
+        raise ValueError("ownerAccountKey is required")
+    routes = data.get("routes") or []
     if not routes:
-        raise ValueError(f"No routes found in {path}")
+        raise ValueError("At least one route is required")
+    data["ownerAccountKey"] = owner_account_key
+    return data
+
+
+def load_bindings(path: Path) -> list[RouteBinding]:
+    data = load_binding_config(path)
+    owner_account_key = data["ownerAccountKey"]
     return [
         RouteBinding(
-            route_id=r["route_id"],
-            exact_title=r["exact_title"],
-            chat_type=r["chat_type"],
-            username=r["username"],
-            conversation_id=r.get("conversation_id", ""),
+            route_id=route["route_id"],
+            exact_title=route["exact_title"],
+            chat_type=route["chat_type"],
+            username=route["username"],
+            owner_account_key=owner_account_key,
         )
-        for r in routes
+        for route in data["routes"]
     ]
 
 
+def _subscriptions(data: dict[str, Any]) -> list[dict[str, Any]]:
+    subscriptions = list(data.get("subscriptions") or [])
+    if subscriptions:
+        return subscriptions
+    for route in data["routes"]:
+        conversation_id = str(route.get("conversation_id") or "").strip()
+        if conversation_id:
+            subscriptions.append(
+                {
+                    "route_id": route["route_id"],
+                    "conversation_id": conversation_id,
+                    "generation": int(route.get("generation", 1)),
+                    "state": "active" if route.get("state", "active") == "active" else "paused",
+                    "listen_capability": True,
+                    "send_capability": False,
+                    "policy_ref": "legacy-binding-v1",
+                }
+            )
+    return subscriptions
+
+
 def main() -> int:
-    print(f"[*] Decrypted dir: {DECRYPTED_DIR}")
-    print(f"[*] Ledger path: {LEDGER_PATH}")
-
     if not DECRYPTED_DIR.exists():
-        print("[ERROR] Decrypted directory not found. Run key extraction first.")
+        print("ERROR: decrypted database directory is unavailable")
         return 1
-
+    data = load_binding_config(BINDING_FILE)
     bindings = load_bindings(BINDING_FILE)
-    print(f"[*] Loaded {len(bindings)} route binding(s)")
-
     observer = DbObserver(DECRYPTED_DIR, bindings)
-    ledger = EventLedger(LEDGER_PATH)
-
-    # Step 1: Establish baselines (high-water mark per route)
-    print("\n[1] Establishing message baselines...")
+    event_ledger = EventLedger(LEDGER_PATH)
     baselines = observer.establish_baseline()
-    for rid, max_id in baselines.items():
-        print(f"    {rid}: max_local_id = {max_id}")
 
-    # Step 2: Register routes in the ledger
-    print("\n[2] Registering routes in event ledger...")
     for binding in bindings:
         identity = observer.get_route_identity(binding)
-        baseline = baselines.get(binding.route_id, 0)
         try:
-            route = ledger.register_route(
+            event_ledger.get_route(binding.route_id)
+        except LedgerError as error:
+            if error.code != "ROUTE_NOT_FOUND":
+                raise
+            event_ledger.register_route(
                 route_id=binding.route_id,
-                conversation_id=binding.conversation_id,
-                generation=1,
-                profile="human_direct_test" if binding.chat_type == "friend" else "human_group_test",
+                profile="human_direct" if binding.chat_type == "friend" else "human_group",
                 identity=identity,
                 state="active",
-                baseline_local_id=baseline,
+                baseline_local_id=baselines.get(binding.route_id, 0),
+                owner_account_key=binding.owner_account_key,
+                username=binding.username,
+                chat_type=binding.chat_type,
+                display_title=binding.exact_title,
             )
-            print(f"    OK: {binding.route_id} -> active (identity_sha256={route['identity_sha256'][:12]}...)")
-        except Exception as e:
-            if "UNIQUE constraint" in str(e):
-                print(f"    SKIP: {binding.route_id} already registered")
-            else:
+        else:
+            event_ledger.verify_or_upgrade_route_identity(
+                binding.route_id,
+                identity,
+                binding.owner_account_key,
+                binding.username,
+                binding.chat_type,
+                binding.exact_title,
+            )
+            event_ledger.update_baseline(binding.route_id, baselines.get(binding.route_id, 0))
+
+    for subscription in _subscriptions(data):
+        try:
+            event_ledger.register_subscription(
+                subscription["route_id"],
+                subscription["conversation_id"],
+                int(subscription.get("generation", 1)),
+                subscription_id=subscription.get("subscription_id") or None,
+                state=subscription.get("state", "active"),
+                listen_capability=bool(subscription.get("listen_capability", True)),
+                send_capability=bool(subscription.get("send_capability", False)),
+                policy_ref=subscription.get("policy_ref"),
+            )
+        except LedgerError as error:
+            if error.code != "SUBSCRIPTION_CONFLICT":
                 raise
 
-    # Step 3: Verify no messages are yielded when baseline is applied
-    print("\n[3] Verifying baseline prevents replay...")
-    new_obs = list(observer.poll_new_messages(baselines))
-    if not new_obs:
-        print("    OK: 0 new messages with baseline applied (no replay)")
-    else:
-        print(f"    WARN: {len(new_obs)} messages above baseline:")
-        for o in new_obs:
-            print(f"      {o.route_id} local_id={o.payload['local_id']}")
-
-    print("\nDone. Routes are active and baselines are stored in the ledger.")
+    print(
+        json.dumps(
+            {
+                "schema_version": event_ledger.schema_info()["schema_version"],
+                "route_count": len(bindings),
+                "subscription_count": len(event_ledger.list_subscriptions()),
+                "history_replayed": False,
+            },
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 

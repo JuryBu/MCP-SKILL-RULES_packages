@@ -47,12 +47,12 @@ SQLITE_HDR = b"SQLite format 3\x00"
 
 @dataclass(frozen=True)
 class RouteBinding:
-    """A single authorised chat mapped to a route_id."""
+    """One precise authorised chat resource mapped to a route_id."""
     route_id: str
     exact_title: str
     chat_type: str  # "friend" or "group"
     username: str   # wxid_xxx or xxx@chatroom
-    conversation_id: str = ""
+    owner_account_key: str = ""
 
 
 @dataclass(frozen=True)
@@ -404,6 +404,7 @@ class DbObserver:
             "chat_name": binding.exact_title,
             "chat_type": binding.chat_type,
             "username": binding.username,
+            "owner_account_key": binding.owner_account_key,
         }
         # For groups, try to get member count
         if binding.chat_type == "group":
