@@ -161,21 +161,88 @@ function Stop-TargetBrokerProcesses {
     }
 }
 
+function Test-TcpPortAccepting {
+    param([int]$Port)
+    $Listeners = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    return [bool]@($Listeners | Where-Object { $_.Port -eq $Port }).Count
+}
+
+function Wait-BrokerPortReleased {
+    param(
+        [int]$Port,
+        [int]$TimeoutSeconds = 5
+    )
+    $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $ConsecutiveRefusals = 0
+    do {
+        if (Test-TcpPortAccepting -Port $Port) {
+            $ConsecutiveRefusals = 0
+        } else {
+            $ConsecutiveRefusals++
+            if ($ConsecutiveRefusals -ge 3) { return }
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $Deadline)
+    throw "Broker port did not become continuously free within $TimeoutSeconds seconds: 127.0.0.1:$Port"
+}
+
+function Save-CandidateStartupEvidence {
+    param(
+        [string[]]$StartOutput,
+        [int]$CandidateProcessId = 0
+    )
+    if ($StartOutput) {
+        $StartOutput | Set-Content -LiteralPath (Join-Path $BackupRoot "candidate-start-output.txt") -Encoding UTF8
+    }
+    if ($CandidateProcessId) {
+        $Identity = Get-BrokerProcessIdentity -ProcessId $CandidateProcessId
+        [pscustomobject]@{
+            pid = $CandidateProcessId
+            observedAt = [DateTimeOffset]::Now.ToString("o")
+            alive = [bool](Get-Process -Id $CandidateProcessId -ErrorAction SilentlyContinue)
+            entryScript = if ($Identity) { $Identity.entryScript } else { $null }
+            commandLine = if ($Identity) { $Identity.commandLine } else { $null }
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $BackupRoot "candidate-process.json") -Encoding UTF8
+    }
+}
+
+function Copy-CandidateRuntimeLogs {
+    $DataRoot = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_DATA_ROOT)) {
+        [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_DATA_ROOT)
+    } else {
+        Join-Path $env:USERPROFILE ".codex-toolkit"
+    }
+    $RuntimeRoot = if ($ManagedStartScript) { Join-Path $DataRoot "mcp-http-broker" } else { $BrokerRoot }
+    foreach ($Name in @("broker-stdout.log", "broker-stderr.log")) {
+        $SourcePath = Join-Path $RuntimeRoot $Name
+        if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
+            Copy-Item -LiteralPath $SourcePath -Destination (Join-Path $BackupRoot "candidate-$Name") -Force
+        }
+    }
+}
+
 function Wait-BrokerHealth {
     param(
         [int]$TimeoutSeconds,
         [string]$ExpectedBrokerPath,
-        [int]$RejectedProcessId = 0
+        [int]$RejectedProcessId = 0,
+        [int]$ExpectedProcessId = 0
     )
     $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $LastObservation = $null
     do {
+        if ($ExpectedProcessId -and -not (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue)) {
+            throw "Candidate broker process exited before becoming healthy: PID $ExpectedProcessId"
+        }
         try {
             $Health = Invoke-RestMethod -Method Get -Uri $HealthUrl -TimeoutSec 3
             if ($Health.ok -eq $true) {
                 $Identity = Assert-BrokerHealthIdentity -Health $Health -ExpectedBrokerPath $ExpectedBrokerPath -Stage "Started"
                 if ($RejectedProcessId -and $Identity.pid -eq $RejectedProcessId) {
                     throw "Started broker reused the pre-update PID $RejectedProcessId."
+                }
+                if ($ExpectedProcessId -and $Identity.pid -ne $ExpectedProcessId) {
+                    throw "Healthy broker PID did not match the candidate process. expected=$ExpectedProcessId actual=$($Identity.pid)"
                 }
                 return $Health
             }
@@ -263,6 +330,7 @@ try {
     if (Get-Process -Id $BeforeIdentity.pid -ErrorAction SilentlyContinue) {
         throw "Pre-update broker PID did not exit: $($BeforeIdentity.pid)"
     }
+    Wait-BrokerPortReleased -Port $BrokerPort -TimeoutSeconds 5
     Copy-Item -LiteralPath $SourceStopScript -Destination $StopScript -Force
     Copy-Item -LiteralPath $SourceStartScript -Destination $StartScript -Force
     Copy-Item -LiteralPath $SourceBrokerPath -Destination $InstalledBrokerPath -Force
@@ -274,13 +342,24 @@ try {
         throw "Installed request lifecycle hash does not match the validated source."
     }
     $PreviousManagedNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
+    $CandidateStartOutput = @()
+    $CandidateProcessId = 0
     try {
         if ($ManagedNodeExe) { [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $ManagedNodeExe, "Process") }
-        & $StartScript | Out-Host
+        $CandidateStartOutput = @(& $StartScript 2>&1 | ForEach-Object { [string]$_ })
+        $CandidateStartOutput | ForEach-Object { Write-Host $_ }
     } finally {
         [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $PreviousManagedNodeExe, "Process")
     }
-    $AfterHealth = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds -ExpectedBrokerPath $InstalledBrokerPath -RejectedProcessId $BeforeIdentity.pid
+    foreach ($Line in $CandidateStartOutput) {
+        if ($Line -match 'Codex MCP broker (?:started|already running): PID (\d+)') {
+            $CandidateProcessId = [int]$Matches[1]
+            break
+        }
+    }
+    if (-not $CandidateProcessId) { throw "Broker start script did not report a candidate PID." }
+    Save-CandidateStartupEvidence -StartOutput $CandidateStartOutput -CandidateProcessId $CandidateProcessId
+    $AfterHealth = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds -ExpectedBrokerPath $InstalledBrokerPath -RejectedProcessId $BeforeIdentity.pid -ExpectedProcessId $CandidateProcessId
     $DeepHealth = @()
     foreach ($Endpoint in $DeepHealthEndpoints) {
         $ProbeUrl = "$HealthUrl`?endpoint=$([uri]::EscapeDataString($Endpoint))&deep=1"
@@ -312,6 +391,10 @@ try {
     $Failure = $_.Exception.Message
     if (-not $Activated) {
         $RollbackErrors = [System.Collections.Generic.List[string]]::new()
+        $StartupEvidenceWarning = $null
+        if ($CandidateProcessId -or $CandidateStartOutput.Count -gt 0) {
+            try { Copy-CandidateRuntimeLogs } catch { $StartupEvidenceWarning = $_.Exception.Message }
+        }
         try {
             Stop-TargetBrokerProcesses -ExpectedBrokerPath $InstalledBrokerPath
         } catch { $RollbackErrors.Add("stop: $($_.Exception.Message)") }
@@ -354,8 +437,10 @@ try {
             } catch { $RollbackErrors.Add("protected state check: $Path $($_.Exception.Message)") }
         }
         if ($RollbackErrors.Count -gt 0) {
-            throw "Broker update failed and rollback was incomplete. Update error: $Failure Rollback errors: $($RollbackErrors -join ' | ') Backup: $BackupRoot"
+            $EvidenceSuffix = if ($StartupEvidenceWarning) { " Startup evidence warning: $StartupEvidenceWarning" } else { "" }
+            throw "Broker update failed and rollback was incomplete. Update error: $Failure Rollback errors: $($RollbackErrors -join ' | ') Backup: $BackupRoot$EvidenceSuffix"
         }
     }
-    throw "Broker update failed; previous code was restored and verified healthy: $Failure"
+    $EvidenceSuffix = if ($StartupEvidenceWarning) { " Startup evidence warning: $StartupEvidenceWarning" } else { "" }
+    throw "Broker update failed; previous code was restored and verified healthy: $Failure Backup: $BackupRoot$EvidenceSuffix"
 }

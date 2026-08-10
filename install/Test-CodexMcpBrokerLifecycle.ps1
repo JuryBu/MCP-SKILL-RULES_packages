@@ -172,6 +172,48 @@ try {
     Stop-FlatBroker -Root $whatIfRoot
     Write-MockSource -Root $healthySource -Mode healthy
 
+    $updaterTokens = $null
+    $updaterErrors = $null
+    $updaterAst = [System.Management.Automation.Language.Parser]::ParseFile($updaterPath, [ref]$updaterTokens, [ref]$updaterErrors)
+    if ($updaterErrors.Count -gt 0) { throw "Cannot parse updater for port-release regression coverage." }
+    foreach ($functionName in @("Test-TcpPortAccepting", "Wait-BrokerPortReleased")) {
+        $functionAst = $updaterAst.Find({
+            param($node)
+            $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName
+        }, $true)
+        if (-not $functionAst) { throw "Updater is missing $functionName." }
+        Invoke-Expression $functionAst.Extent.Text
+    }
+    $portHolderScript = Join-Path $testRoot "temporary-port-holder.mjs"
+    $portHolderReady = Join-Path $testRoot "temporary-port-holder.ready"
+    Set-Content -LiteralPath $portHolderScript -Encoding UTF8 -Value @'
+import fs from "node:fs";
+import net from "node:net";
+const port = Number(process.argv[2]);
+const ready = process.argv[3];
+const sockets = new Set();
+const server = net.createServer((socket) => {
+  sockets.add(socket);
+  socket.on("close", () => sockets.delete(socket));
+});
+server.listen(port, "127.0.0.1", () => {
+  fs.writeFileSync(ready, "ready");
+  setTimeout(() => {
+    for (const socket of sockets) socket.destroy();
+    server.close(() => process.exit(0));
+  }, 500);
+});
+'@
+    $portHolder = Start-Process -FilePath $nodeExePath -ArgumentList @($portHolderScript, "19479", $portHolderReady) -PassThru -WindowStyle Hidden
+    $processIds.Add($portHolder.Id)
+    $readyDeadline = [DateTime]::UtcNow.AddSeconds(2)
+    while (-not (Test-Path -LiteralPath $portHolderReady) -and [DateTime]::UtcNow -lt $readyDeadline) { Start-Sleep -Milliseconds 25 }
+    if (-not (Test-Path -LiteralPath $portHolderReady)) { throw "Temporary port holder did not start." }
+    $portWait = [System.Diagnostics.Stopwatch]::StartNew()
+    Wait-BrokerPortReleased -Port 19479 -TimeoutSeconds 2
+    $portWait.Stop()
+    if ($portWait.ElapsedMilliseconds -lt 250) { throw "Port release guard did not wait for a lingering listener." }
+
     $incompleteManifestPath = Join-Path $testRoot "incomplete-service-manifest.json"
     [ordered]@{ broker = [ordered]@{ brokerScript = (Join-Path $whatIfRoot "broker.mjs"); startScript = ""; stopScript = "" } } |
         ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $incompleteManifestPath -Encoding UTF8
@@ -272,6 +314,14 @@ try {
             $managedRollbackFailed = $_.Exception.Message.Contains("previous code was restored")
         }
         if (-not $managedRollbackFailed) { throw "Managed release rollback case unexpectedly succeeded or did not verify restoration." }
+        $managedBackupRoot = Get-ChildItem -LiteralPath (Join-Path $managedRoot "backups") -Directory |
+            Sort-Object LastWriteTimeUtc |
+            Select-Object -Last 1
+        foreach ($evidenceName in @("candidate-start-output.txt", "candidate-process.json", "candidate-broker-stdout.log", "candidate-broker-stderr.log")) {
+            if (-not (Test-Path -LiteralPath (Join-Path $managedBackupRoot.FullName $evidenceName) -PathType Leaf)) {
+                throw "Managed rollback did not preserve startup evidence: $evidenceName"
+            }
+        }
         Wait-Health -Port 19491
         if ((Get-Sha256 (Join-Path $managedRoot "broker.mjs")) -ne $managedBrokerHash) { throw "Managed rollback did not restore broker.mjs." }
         if ((Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")) -ne $managedLifecycleHash) { throw "Managed rollback did not restore request-lifecycle.mjs." }
