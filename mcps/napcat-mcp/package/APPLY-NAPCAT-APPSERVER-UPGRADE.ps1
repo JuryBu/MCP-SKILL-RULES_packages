@@ -177,6 +177,7 @@ try {
     CodeRoot = $CodeRoot
     DataRoot = $DataRoot
     BrokerRoot = $BrokerRoot
+    NodeExecutable = $Node
     SourceCommit = $SourceCommit
     MigrateAutostart = [bool]$BackendOnlyHotReload
     ActivateNow = [bool]$BackendOnlyHotReload

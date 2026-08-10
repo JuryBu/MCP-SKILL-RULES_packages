@@ -4,6 +4,7 @@ param(
   [string]$CodeRoot = $(if ($env:NAPCAT_MCP_ROOT) { $env:NAPCAT_MCP_ROOT } else { Join-Path $env:USERPROFILE ".codex\services\napcat-bridge\current" }),
   [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
   [string]$BrokerRoot = $(if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Join-Path $env:USERPROFILE ".codex\mcp-http-broker" }),
+  [string]$NodeExecutable = "",
   [string]$SourceCommit = "unknown",
   [string]$SupervisorTaskName = "CodexNapCatSupervisor",
   [ValidateRange(10, 600)][int]$QuiesceTimeoutSeconds = 120,
@@ -234,16 +235,75 @@ function Resolve-StaleUpdateAlert {
   Write-JsonAtomic -Path $AlertPath -Value $Alert
 }
 
+function Resolve-NodeExecutable {
+  param([string]$PreferredNode)
+  foreach ($Candidate in @($PreferredNode, [string]$env:CODEX_TOOLKIT_NODE_EXE)) {
+    if (-not [string]::IsNullOrWhiteSpace($Candidate) -and (Test-Path -LiteralPath $Candidate -PathType Leaf)) {
+      return [System.IO.Path]::GetFullPath($Candidate)
+    }
+  }
+  $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
+    return [string]$NodeCommand.Source
+  }
+  $ManifestPath = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)) {
+    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
+  } else {
+    Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+  }
+  if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
+    try {
+      $ManagedNode = [string](Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).broker.nodeExe
+      if (-not [string]::IsNullOrWhiteSpace($ManagedNode) -and (Test-Path -LiteralPath $ManagedNode -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath($ManagedNode)
+      }
+    } catch {
+    }
+  }
+  throw "Managed Node executable is unavailable for npm validation."
+}
+
+function Resolve-NpmInvocation {
+  param([string]$PreferredNode)
+  $ResolvedNode = Resolve-NodeExecutable -PreferredNode $PreferredNode
+  $NodeDirectory = Split-Path -Parent $ResolvedNode
+  $NpmCommandPath = Join-Path $NodeDirectory "npm.cmd"
+  if (Test-Path -LiteralPath $NpmCommandPath -PathType Leaf) {
+    return [pscustomobject]@{ FilePath = $NpmCommandPath; PrefixArguments = @(); NodeDirectory = $NodeDirectory }
+  }
+  foreach ($NpmCliPath in @(
+    (Join-Path $NodeDirectory "node_modules\npm\bin\npm-cli.js"),
+    (Join-Path (Split-Path -Parent $NodeDirectory) "node_modules\npm\bin\npm-cli.js")
+  )) {
+    if (Test-Path -LiteralPath $NpmCliPath -PathType Leaf) {
+      return [pscustomobject]@{ FilePath = $ResolvedNode; PrefixArguments = @($NpmCliPath); NodeDirectory = $NodeDirectory }
+    }
+  }
+  foreach ($CommandName in @("npm.cmd", "npm")) {
+    $NpmCommand = Get-Command $CommandName -ErrorAction SilentlyContinue
+    if ($null -ne $NpmCommand -and -not [string]::IsNullOrWhiteSpace([string]$NpmCommand.Source)) {
+      return [pscustomobject]@{ FilePath = [string]$NpmCommand.Source; PrefixArguments = @(); NodeDirectory = $NodeDirectory }
+    }
+  }
+  throw "npm is unavailable beside the managed Node executable and on PATH."
+}
+
+$NpmInvocation = Resolve-NpmInvocation -PreferredNode $NodeExecutable
+
 function Invoke-NpmChecked {
   param([string]$Root, [string[]]$Arguments, [string]$McpSdkRoot = $null)
   Push-Location $Root
   $PreviousMcpSdkRoot = $env:MCP_SDK_ROOT
+  $PreviousPath = $env:PATH
   try {
     if (-not [string]::IsNullOrWhiteSpace($McpSdkRoot)) { $env:MCP_SDK_ROOT = $McpSdkRoot }
-    & npm @Arguments | Out-Host
+    $env:PATH = "$($NpmInvocation.NodeDirectory);$PreviousPath"
+    $InvocationArguments = @($NpmInvocation.PrefixArguments) + @($Arguments)
+    & $NpmInvocation.FilePath @InvocationArguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
   } finally {
     $env:MCP_SDK_ROOT = $PreviousMcpSdkRoot
+    $env:PATH = $PreviousPath
     Pop-Location
   }
 }

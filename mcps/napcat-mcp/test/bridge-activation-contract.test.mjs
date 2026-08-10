@@ -233,6 +233,7 @@ test("portable package entrypoint leaves live services untouched before guarded 
   assert.match(script, /CODEX_TOOLKIT_SERVICE_MANIFEST/);
   assert.match(script, /service-manifest\.json/);
   assert.doesNotMatch(script, /Get-Command node -ErrorAction Stop/);
+  assert.match(script, /NodeExecutable = \$Node/);
 });
 
 test("portable upgrade staging keeps its package entrypoint and uses built-in SHA256", () => {
@@ -260,6 +261,9 @@ test("candidate npm validation finishes before maintenance or router quiescence"
   assert.ok(validationIndex >= 0, "candidate test invocation must exist");
   assert.ok(maintenanceIndex > validationIndex, "candidate tests must finish before maintenance starts");
   assert.ok(routerStopIndex > validationIndex, "candidate tests must finish before the task router can stop");
+  assert.match(script, /function Resolve-NpmInvocation/);
+  assert.doesNotMatch(script, /& npm\b/);
+  assert.doesNotMatch(read("ops/rollback-codex-napcat-bridge.ps1"), /& npm\b/);
 });
 
 test("portable package entrypoint really leaves the watchdog and broker untouched when candidate validation fails", { skip: process.platform !== "win32" }, (t) => {
@@ -293,7 +297,7 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   write(
     path.join(packageRoot, "napcat-mcp", "ops", "update-codex-napcat-bridge.ps1"),
     [
-      "param([string]$SourceRoot,[string]$CodeRoot,[string]$DataRoot,[string]$BrokerRoot,[string]$SourceCommit,[bool]$MigrateAutostart,[bool]$ActivateNow,[switch]$PreserveActiveWakes,[switch]$BackendOnlyHotReload,[switch]$ValidateOnly)",
+      "param([string]$SourceRoot,[string]$CodeRoot,[string]$DataRoot,[string]$BrokerRoot,[string]$NodeExecutable,[string]$SourceCommit,[bool]$MigrateAutostart,[bool]$ActivateNow,[switch]$PreserveActiveWakes,[switch]$BackendOnlyHotReload,[switch]$ValidateOnly)",
       "throw 'candidate validation failed'",
       "",
     ].join("\n"),
@@ -328,7 +332,7 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   assert.equal(fs.existsSync(path.join(dataRoot, "state", "task-router.maintenance.json")), false);
 });
 
-test("guarded updater really derives the validation SDK from the configured broker root", { skip: process.platform !== "win32" }, (t) => {
+test("guarded updater derives the validation SDK and managed npm without PATH node", { skip: process.platform !== "win32" }, (t) => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-broker-sdk-"));
   t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
   const sourceRoot = path.join(fixtureRoot, "source");
@@ -390,6 +394,11 @@ test("guarded updater really derives the validation SDK from the configured brok
       MEMORY_STORE_MCP_ROOT: "",
       CODEX_TOOLKIT_MCP_ROOT: "",
       CODEX_TOOLKIT_BROKER_ROOT: "",
+      CODEX_TOOLKIT_NODE_EXE: process.execPath,
+      PATH: [
+        path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0"),
+        path.join(process.env.SystemRoot ?? "C:\\Windows", "System32"),
+      ].join(path.delimiter),
       TARGET_UPDATE_SCRIPT: path.join(sourceRoot, "update.ps1"),
     },
   );
