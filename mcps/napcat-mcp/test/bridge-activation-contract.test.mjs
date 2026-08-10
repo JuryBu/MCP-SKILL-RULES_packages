@@ -228,6 +228,11 @@ test("portable package entrypoint leaves live services untouched before guarded 
   assert.doesNotMatch(script, /Copy-Item -LiteralPath \$BrokerSource -Destination \$BrokerTarget/);
   assert.doesNotMatch(script, /Start-ScheduledTask -TaskName \$SupervisorTaskName/);
   assert.match(script, /The live broker was not modified by this entrypoint/);
+  assert.match(script, /function Resolve-NodeExecutable/);
+  assert.match(script, /CODEX_TOOLKIT_NODE_EXE/);
+  assert.match(script, /CODEX_TOOLKIT_SERVICE_MANIFEST/);
+  assert.match(script, /service-manifest\.json/);
+  assert.doesNotMatch(script, /Get-Command node -ErrorAction Stop/);
 });
 
 test("portable upgrade staging keeps its package entrypoint and uses built-in SHA256", () => {
@@ -270,6 +275,10 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   fs.mkdirSync(codeRoot, { recursive: true });
   fs.mkdirSync(dataRoot, { recursive: true });
   fs.mkdirSync(codexHome, { recursive: true });
+  write(
+    path.join(fixtureRoot, ".codex-toolkit", "services", "infrastructure", "service-manifest.json"),
+    JSON.stringify({ broker: { nodeExe: process.execPath } }),
+  );
   fs.copyFileSync(
     path.resolve("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
     path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
@@ -299,7 +308,14 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   const result = runPowerShell(
     path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
     ["-CodexHome", codexHome, "-BrokerRoot", brokerRoot, "-CodeRoot", codeRoot, "-DataRoot", dataRoot],
-    { USERPROFILE: fixtureRoot },
+    {
+      USERPROFILE: fixtureRoot,
+      CODEX_TOOLKIT_NODE_EXE: "",
+      PATH: [
+        path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0"),
+        path.join(process.env.SystemRoot ?? "C:\\Windows", "System32"),
+      ].join(path.delimiter),
+    },
   );
   const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
   assert.notEqual(result.status, 0, combinedOutput);

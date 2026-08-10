@@ -140,7 +140,33 @@ if (-not $DataRootWasExplicit) {
 $DataRoot = [System.IO.Path]::GetFullPath($DataRoot)
 if ($CodeRoot -eq $DataRoot) { throw "CodeRoot and DataRoot must be different" }
 
-$Node = (Get-Command node -ErrorAction Stop).Source
+function Resolve-NodeExecutable {
+  $ConfiguredNode = [string]$env:CODEX_TOOLKIT_NODE_EXE
+  if (-not [string]::IsNullOrWhiteSpace($ConfiguredNode) -and (Test-Path -LiteralPath $ConfiguredNode -PathType Leaf)) {
+    return [System.IO.Path]::GetFullPath($ConfiguredNode)
+  }
+  $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
+  if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
+    return [string]$NodeCommand.Source
+  }
+  $ManifestPath = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)) {
+    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
+  } else {
+    Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+  }
+  if (Test-Path -LiteralPath $ManifestPath -PathType Leaf) {
+    try {
+      $ManagedNode = [string](Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).broker.nodeExe
+      if (-not [string]::IsNullOrWhiteSpace($ManagedNode) -and (Test-Path -LiteralPath $ManagedNode -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath($ManagedNode)
+      }
+    } catch {
+    }
+  }
+  throw "Managed Node executable is unavailable. Configure CODEX_TOOLKIT_NODE_EXE or broker.nodeExe in the service manifest."
+}
+
+$Node = Resolve-NodeExecutable
 foreach ($BrokerFile in $BrokerFiles) {
   & $Node --check (Join-Path $BrokerSourceRoot $BrokerFile)
   if ($LASTEXITCODE -ne 0) { throw "Package broker source syntax check failed: $BrokerFile" }
