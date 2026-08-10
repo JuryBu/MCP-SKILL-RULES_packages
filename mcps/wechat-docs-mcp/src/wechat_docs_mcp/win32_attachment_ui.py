@@ -127,6 +127,10 @@ class Win32WechatAttachmentBackend:
         self.kernel32.GlobalLock.restype = ctypes.c_void_p
         self.kernel32.GlobalSize.argtypes = [wintypes.HGLOBAL]
         self.kernel32.GlobalSize.restype = ctypes.c_size_t
+        self.kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalUnlock.restype = wintypes.BOOL
+        self.kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        self.kernel32.GlobalFree.restype = wintypes.HGLOBAL
         self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         self.user32.SendInput.restype = wintypes.UINT
         self.user32.GetClipboardSequenceNumber.restype = wintypes.DWORD

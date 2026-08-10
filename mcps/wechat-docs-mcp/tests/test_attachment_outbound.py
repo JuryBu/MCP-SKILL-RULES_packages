@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ctypes
 import struct
+from ctypes import wintypes
 from pathlib import Path
 from typing import Any
 
@@ -368,3 +369,25 @@ def test_win32_input_layout_and_dropfiles_payload_are_native_safe(tmp_path: Path
     offset, x, y, non_client, wide = struct.unpack("<IiiII", payload[:20])
     assert (offset, x, y, non_client, wide) == (20, 0, 0, 0, 1)
     assert payload[20:].decode("utf-16-le").rstrip("\0") == str(source)
+
+
+def test_win32_clipboard_handle_functions_use_pointer_sized_types() -> None:
+    class NativeFunction:
+        argtypes: list[object] | None = None
+        restype: object | None = None
+
+    class NativeLibrary:
+        def __getattr__(self, name: str) -> NativeFunction:
+            function = NativeFunction()
+            setattr(self, name, function)
+            return function
+
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = NativeLibrary()
+    backend.kernel32 = NativeLibrary()
+    backend._configure_apis()
+
+    assert backend.kernel32.GlobalUnlock.argtypes == [wintypes.HGLOBAL]
+    assert backend.kernel32.GlobalUnlock.restype is wintypes.BOOL
+    assert backend.kernel32.GlobalFree.argtypes == [wintypes.HGLOBAL]
+    assert backend.kernel32.GlobalFree.restype is wintypes.HGLOBAL
