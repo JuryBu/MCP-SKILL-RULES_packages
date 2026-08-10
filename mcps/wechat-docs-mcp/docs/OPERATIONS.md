@@ -213,7 +213,15 @@ src.close()
 
 **不要用 `shutil.copy2`** 复制 WAL 模式的 SQLite 文件，可能丢失 -wal 文件中的事务。
 
-### 6.3 恢复
+### 6.3 旧 route 精确身份恢复
+
+早期 V1 route 只保存了旧身份 JSON 的 SHA-256，没有保存原始 JSON。原始输入已经丢失时，禁止猜测字段组合或直接覆盖指纹。`EventLedger.recover_legacy_route_identity_from_events` 是依赖外部核验的低层维护原语，不是自证身份的恢复工具。
+
+代码会强制检查：route 仍为 active、`identity_version=1`，旧指纹与账本当前值精确相等；route 至少已有一个事件，且每个 `source_fingerprint` 都以同一个内部 username 加冒号开头；group/friend 与 `@chatroom` 格式双向一致；调用方提供非空核验证据引用、核验证据 SHA-256 和 SQLite 备份 SHA-256。身份更新、事务内返回快照和脱敏审计记录一起提交，失败全部回滚。
+
+正式包装器仍必须先用 SQLite `backup()` 生成可校验备份，再由私有 binding、当前微信账户和联系人数据库独立确认 owner、username、chat type，并把脱敏核验报告落到私有验证目录。事件前缀只能证明账本内 username 一致，不能证明 owner 或 chat type。此方法不会自动 quarantine，也不会修改事件、delivery、wake 或 ACK，不是 Agent 可调用的 MCP 工具。
+
+### 6.4 恢复
 
 ```powershell
 # 停止服务

@@ -4,13 +4,45 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
-from wechat_docs_mcp.ledger import EventLedger, LedgerError
+from wechat_docs_mcp.ledger import EventLedger, LedgerError, route_identity_sha256
 from wechat_docs_mcp.routes import evaluate_route_enrollment
 from wechat_docs_mcp.tencent_docs import TencentDocsMcpClient, classify_tool
 
 
 class LedgerTests(unittest.TestCase):
+    RECOVERY_EVIDENCE_REF = "private-test-evidence"
+    RECOVERY_EVIDENCE_SHA256 = "1" * 64
+    RECOVERY_BACKUP_SHA256 = "2" * 64
+
+    @staticmethod
+    def event_delivery_state(ledger: EventLedger) -> dict[str, int]:
+        connection = ledger._connect()
+        try:
+            return {
+                "events": int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0]),
+                "events_acked": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM events WHERE acked_at IS NOT NULL"
+                    ).fetchone()[0]
+                ),
+                "deliveries": int(
+                    connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0]
+                ),
+                "deliveries_acked": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM event_deliveries WHERE acked_at IS NOT NULL"
+                    ).fetchone()[0]
+                ),
+                "legacy_wakes": int(connection.execute("SELECT COUNT(*) FROM wakes").fetchone()[0]),
+                "subscription_wakes": int(
+                    connection.execute("SELECT COUNT(*) FROM subscription_wakes").fetchone()[0]
+                ),
+            }
+        finally:
+            connection.close()
+
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory()
         self.ledger = EventLedger(Path(self.temp_dir.name) / "events.sqlite3")
@@ -338,6 +370,315 @@ class LedgerTests(unittest.TestCase):
             ledger3.update_baseline("route-bl2", 12)
         self.assertEqual("BASELINE_REGRESSION", raised.exception.code)
         self.temp_dir3.cleanup()
+
+    def test_recover_legacy_route_identity_from_matching_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route(
+                "legacy-route",
+                identity={"chat_name": "legacy-title", "chat_type": "group"},
+                state="active",
+            )
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+            ledger.ingest_event("legacy-route", "room@chatroom:2", "text", {"text": "two"})
+            message_state_before = self.event_delivery_state(ledger)
+
+            with mock.patch.object(ledger, "get_route", side_effect=AssertionError("unexpected read")):
+                recovered = ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    "current-title",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual(2, recovered["identity_version"])
+            self.assertEqual("active", recovered["state"])
+            self.assertEqual("group", recovered["chat_type"])
+            self.assertEqual("current-title", recovered["display_title"])
+            self.assertEqual(
+                route_identity_sha256("owner-key", "room@chatroom", "group"),
+                recovered["identity_sha256"],
+            )
+            connection = ledger._connect()
+            try:
+                audit = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='legacy_route_recovery:legacy-route'"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertIsNotNone(audit)
+            self.assertIn(self.RECOVERY_EVIDENCE_SHA256, audit["value"])
+            self.assertIn(self.RECOVERY_BACKUP_SHA256, audit["value"])
+            self.assertEqual(message_state_before, self.event_delivery_state(ledger))
+
+    def test_recover_legacy_route_identity_requires_audit_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref="",
+                    verification_evidence_sha256="invalid",
+                    backup_sha256="invalid",
+                )
+
+            self.assertEqual("LEGACY_ROUTE_AUDIT_EVIDENCE_REQUIRED", raised.exception.code)
+            self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
+
+    def test_recover_legacy_route_identity_rolls_back_on_audit_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+            with ledger._transaction() as connection:
+                connection.execute(
+                    "INSERT INTO schema_meta(key,value) VALUES(?,?)",
+                    ("legacy_route_recovery:legacy-route", "existing"),
+                )
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_AUDIT_CONFLICT", raised.exception.code)
+            self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
+            self.assertEqual(legacy_hash, ledger.get_route("legacy-route")["identity_sha256"])
+
+    def test_recover_legacy_route_identity_rejects_already_precise_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route(
+                "precise-route",
+                owner_account_key="owner-key",
+                username="room@chatroom",
+                chat_type="group",
+                state="active",
+            )
+            precise_hash = ledger.get_route("precise-route")["identity_sha256"]
+            ledger.ingest_event("precise-route", "room@chatroom:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "precise-route",
+                    precise_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_RECOVERY_NOT_APPLICABLE", raised.exception.code)
+
+    def test_recover_legacy_route_identity_rejects_changed_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    "a" * 64,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_HASH_MISMATCH", raised.exception.code)
+            self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
+            self.assertEqual("active", ledger.get_route("legacy-route")["state"])
+
+    def test_recover_legacy_route_identity_requires_existing_events(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_EVIDENCE_MISSING", raised.exception.code)
+
+    def test_recover_legacy_route_identity_requires_active_route(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+            with ledger._transaction() as connection:
+                connection.execute(
+                    "UPDATE routes SET state='quarantine' WHERE route_id='legacy-route'"
+                )
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_RECOVERY_REQUIRES_ACTIVE", raised.exception.code)
+            self.assertEqual("quarantine", ledger.get_route("legacy-route")["state"])
+
+    def test_recover_legacy_group_requires_chatroom_username(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "not-a-room:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "not-a-room",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("ROUTE_IDENTITY_INCOMPLETE", raised.exception.code)
+
+    def test_recover_legacy_friend_rejects_chatroom_username(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "friend",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("ROUTE_IDENTITY_INCOMPLETE", raised.exception.code)
+
+    def test_recover_legacy_route_rejects_colon_in_username(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "friend:name:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "friend:name",
+                    "friend",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("ROUTE_IDENTITY_INCOMPLETE", raised.exception.code)
+
+    def test_recover_legacy_route_identity_rejects_mixed_event_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+            ledger.ingest_event("legacy-route", "other@chatroom:2", "text", {"text": "two"})
+            message_state_before = self.event_delivery_state(ledger)
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("LEGACY_ROUTE_EVIDENCE_MISMATCH", raised.exception.code)
+            self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
+            self.assertEqual("active", ledger.get_route("legacy-route")["state"])
+            self.assertEqual(message_state_before, self.event_delivery_state(ledger))
+
+    def test_recover_legacy_route_identity_rejects_precise_identity_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = EventLedger(Path(temp_dir) / "events.sqlite3")
+            ledger.register_route(
+                "precise-route",
+                owner_account_key="owner-key",
+                username="room@chatroom",
+                chat_type="group",
+                state="active",
+            )
+            ledger.register_route("legacy-route", identity={"chat_name": "x"}, state="active")
+            legacy_hash = ledger.get_route("legacy-route")["identity_sha256"]
+            ledger.ingest_event("legacy-route", "room@chatroom:1", "text", {"text": "one"})
+
+            with self.assertRaises(LedgerError) as raised:
+                ledger.recover_legacy_route_identity_from_events(
+                    "legacy-route",
+                    legacy_hash,
+                    "owner-key",
+                    "room@chatroom",
+                    "group",
+                    verification_evidence_ref=self.RECOVERY_EVIDENCE_REF,
+                    verification_evidence_sha256=self.RECOVERY_EVIDENCE_SHA256,
+                    backup_sha256=self.RECOVERY_BACKUP_SHA256,
+                )
+
+            self.assertEqual("ROUTE_IDENTITY_CONFLICT", raised.exception.code)
+            self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
 
 
 class RouteTests(unittest.TestCase):

@@ -44,6 +44,11 @@ def payload_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _is_sha256_hex(value: str) -> bool:
+    normalized = value.strip().casefold()
+    return len(normalized) == 64 and all(character in "0123456789abcdef" for character in normalized)
+
+
 def route_identity_sha256(owner_account_key: str, username: str, chat_type: str) -> str:
     owner_account_key, username, chat_type = normalize_route_identity(
         owner_account_key, username, chat_type
@@ -280,6 +285,109 @@ class EventLedger:
             except sqlite3.IntegrityError as error:
                 raise LedgerError("ROUTE_IDENTITY_CONFLICT", "该精确微信会话已绑定到另一 route") from error
         return self.get_route(route_id)
+
+    def recover_legacy_route_identity_from_events(
+        self,
+        route_id: str,
+        expected_legacy_identity_sha256: str,
+        owner_account_key: str,
+        username: str,
+        chat_type: str,
+        display_title: str = "",
+        *,
+        verification_evidence_ref: str,
+        verification_evidence_sha256: str,
+        backup_sha256: str,
+    ) -> dict[str, Any]:
+        owner_account_key, username, chat_type = normalize_route_identity(
+            owner_account_key, username, chat_type
+        )
+        expected_legacy_identity_sha256 = expected_legacy_identity_sha256.strip().casefold()
+        if not _is_sha256_hex(expected_legacy_identity_sha256):
+            raise LedgerError("LEGACY_ROUTE_HASH_REQUIRED", "必须提供当前账本中的旧 route 身份指纹")
+        if (
+            not verification_evidence_ref.strip()
+            or not _is_sha256_hex(verification_evidence_sha256)
+            or not _is_sha256_hex(backup_sha256)
+        ):
+            raise LedgerError("LEGACY_ROUTE_AUDIT_EVIDENCE_REQUIRED", "身份核验与账本备份证据不完整")
+        if not owner_account_key or not username or chat_type not in {"friend", "group"}:
+            raise LedgerError("ROUTE_IDENTITY_INCOMPLETE", "精确 route 身份字段不完整")
+        is_group_username = username.endswith("@chatroom")
+        if ":" in username or is_group_username != (chat_type == "group"):
+            raise LedgerError("ROUTE_IDENTITY_INCOMPLETE", "route 类型与内部 username 格式不一致")
+
+        precise_hash = route_identity_sha256(owner_account_key, username, chat_type)
+        with self._transaction() as connection:
+            route = connection.execute("SELECT * FROM routes WHERE route_id=?", (route_id,)).fetchone()
+            if route is None:
+                raise LedgerError("ROUTE_NOT_FOUND", f"route 不存在：{route_id}")
+            if route["identity_version"] != 1:
+                raise LedgerError("LEGACY_ROUTE_RECOVERY_NOT_APPLICABLE", "route 已具有精确身份")
+            if route["state"] != "active":
+                raise LedgerError("LEGACY_ROUTE_RECOVERY_REQUIRES_ACTIVE", "只允许恢复 active 的旧 route")
+            if route["identity_sha256"] != expected_legacy_identity_sha256:
+                raise LedgerError("LEGACY_ROUTE_HASH_MISMATCH", "旧 route 身份指纹已变化，拒绝恢复")
+
+            expected_prefix = f"{username}:"
+            fingerprint_count = 0
+            for row in connection.execute(
+                "SELECT source_fingerprint FROM events WHERE route_id=? ORDER BY event_seq,event_id",
+                (route_id,),
+            ):
+                fingerprint_count += 1
+                if not str(row["source_fingerprint"]).startswith(expected_prefix):
+                    raise LedgerError(
+                        "LEGACY_ROUTE_EVIDENCE_MISMATCH", "既有事件不支持该精确 route 身份"
+                    )
+            if fingerprint_count == 0:
+                raise LedgerError("LEGACY_ROUTE_EVIDENCE_MISSING", "route 没有可用于恢复的既有事件")
+
+            recovered_at = utc_now()
+            try:
+                connection.execute(
+                    """
+                    UPDATE routes
+                    SET identity_sha256=?,identity_version=2,owner_account_key_sha256=?,
+                        username_sha256=?,chat_type=?,display_title=?,updated_at=?
+                    WHERE route_id=?
+                    """,
+                    (
+                        precise_hash,
+                        hashlib.sha256(owner_account_key.encode("utf-8")).hexdigest(),
+                        hashlib.sha256(username.encode("utf-8")).hexdigest(),
+                        chat_type,
+                        display_title or None,
+                        recovered_at,
+                        route_id,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise LedgerError("ROUTE_IDENTITY_CONFLICT", "该精确微信会话已绑定到另一 route") from error
+            recovered_route = connection.execute(
+                "SELECT * FROM routes WHERE route_id=?", (route_id,)
+            ).fetchone()
+            if recovered_route is None:
+                raise LedgerError("ROUTE_NOT_FOUND", f"route 不存在：{route_id}")
+            audit_record = {
+                "backup_sha256": backup_sha256.strip().casefold(),
+                "event_count": fingerprint_count,
+                "legacy_identity_sha256": expected_legacy_identity_sha256,
+                "precise_identity_sha256": precise_hash,
+                "recorded_at": recovered_at,
+                "verification_evidence_ref": verification_evidence_ref.strip(),
+                "verification_evidence_sha256": verification_evidence_sha256.strip().casefold(),
+            }
+            try:
+                connection.execute(
+                    "INSERT INTO schema_meta(key,value) VALUES(?,?)",
+                    (f"legacy_route_recovery:{route_id}", canonical_json(audit_record)),
+                )
+            except sqlite3.IntegrityError as error:
+                raise LedgerError(
+                    "LEGACY_ROUTE_AUDIT_CONFLICT", "旧 route 恢复审计记录已存在"
+                ) from error
+        return dict(recovered_route)
 
     def get_baseline(self, route_id: str) -> int:
         return int(self.get_route(route_id)["baseline_local_id"])
