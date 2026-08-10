@@ -264,6 +264,108 @@ def create_fixture(path: Path, route_id: str) -> dict[str, int]:
     return ledger_state(path, route_id)
 
 
+def create_release_v1_fixture(path: Path, route_id: str) -> dict[str, int]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        raise FileExistsError(f"fixture ledger already exists: {path}")
+    connection = sqlite3.connect(path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE routes(
+              route_id TEXT PRIMARY KEY,generation INTEGER NOT NULL,conversation_id TEXT NOT NULL,
+              profile TEXT NOT NULL,identity_sha256 TEXT NOT NULL,state TEXT NOT NULL,
+              created_at TEXT NOT NULL,updated_at TEXT NOT NULL,baseline_local_id INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE events(
+              event_id TEXT PRIMARY KEY,route_id TEXT NOT NULL,generation INTEGER NOT NULL,
+              source_fingerprint TEXT NOT NULL,occurred_at TEXT,observed_at TEXT NOT NULL,
+              event_type TEXT NOT NULL,payload_json TEXT NOT NULL,sensitivity TEXT NOT NULL,
+              acked_at TEXT,UNIQUE(route_id,source_fingerprint)
+            );
+            CREATE TABLE wakes(
+              wake_id TEXT PRIMARY KEY,route_id TEXT NOT NULL,generation INTEGER NOT NULL,
+              created_at TEXT NOT NULL,client_user_message_id TEXT NOT NULL,state TEXT NOT NULL
+            );
+            CREATE TABLE drafts(
+              draft_id TEXT PRIMARY KEY,route_id TEXT NOT NULL,kind TEXT NOT NULL,payload_json TEXT NOT NULL,
+              content_sha256 TEXT NOT NULL,expires_at TEXT NOT NULL,state TEXT NOT NULL,
+              owner_authorization_refs_json TEXT,dedupe_key TEXT UNIQUE,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+            );
+            CREATE TABLE deliveries(
+              delivery_id TEXT PRIMARY KEY,origin_transport TEXT NOT NULL,dedupe_key TEXT NOT NULL,
+              trace_id TEXT NOT NULL,hop_count INTEGER NOT NULL,state TEXT NOT NULL,created_at TEXT NOT NULL,
+              UNIQUE(origin_transport,dedupe_key)
+            );
+            """
+        )
+        now = "2026-08-09T00:00:00+00:00"
+        connection.execute(
+            "INSERT INTO routes VALUES(?,?,?,?,?,?,?,?,?)",
+            (route_id, 1, "conversation-fixture", "fixture", "identity-fixture", "active", now, now, 0),
+        )
+        connection.execute(
+            "INSERT INTO events VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "event-fixture",
+                route_id,
+                1,
+                "fingerprint-fixture",
+                None,
+                now,
+                "text",
+                "{}",
+                "normal",
+                None,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO wakes VALUES(?,?,?,?,?,?)",
+            ("wake-fixture", route_id, 1, now, "client-fixture", "prepared"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return ledger_state(path, route_id)
+
+
+def create_v2_fixture(path: Path, route_id: str) -> dict[str, int]:
+    from wechat_docs_mcp.ledger import EventLedger
+
+    ledger = EventLedger(path)
+    ledger.register_route(route_id, profile="fixture", state="active")
+    ledger.register_subscription(
+        route_id,
+        "conversation-fixture",
+        1,
+        subscription_id="subscription-fixture",
+    )
+    ledger.ingest_event(route_id, "fingerprint-fixture", "text", {"text": "synthetic"})
+    connection = sqlite3.connect(path)
+    try:
+        for table in (
+            "tdocs_subscription_wakes",
+            "tdocs_batch_deliveries",
+            "tdocs_monitor_changes",
+            "tdocs_monitor_batches",
+            "tdocs_monitor_subscriptions",
+            "tdocs_monitors",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("UPDATE schema_meta SET value='2' WHERE key='schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+    return ledger_state(path, route_id)
+
+
+def migrate_ledger(path: Path, route_id: str) -> dict[str, int]:
+    from wechat_docs_mcp.ledger import EventLedger
+
+    EventLedger(path)
+    return ledger_state(path, route_id)
+
+
 def package_info(expected_root: Path) -> dict[str, object]:
     import wechat_docs_mcp
     from wechat_docs_mcp.server import mcp
@@ -290,6 +392,18 @@ def main() -> int:
     fixture_parser.add_argument("--ledger", type=Path, required=True)
     fixture_parser.add_argument("--route-id", required=True)
 
+    release_v1_fixture_parser = subparsers.add_parser("create-release-v1-fixture")
+    release_v1_fixture_parser.add_argument("--ledger", type=Path, required=True)
+    release_v1_fixture_parser.add_argument("--route-id", required=True)
+
+    v2_fixture_parser = subparsers.add_parser("create-v2-fixture")
+    v2_fixture_parser.add_argument("--ledger", type=Path, required=True)
+    v2_fixture_parser.add_argument("--route-id", required=True)
+
+    migrate_parser = subparsers.add_parser("migrate-ledger")
+    migrate_parser.add_argument("--ledger", type=Path, required=True)
+    migrate_parser.add_argument("--route-id", required=True)
+
     package_parser = subparsers.add_parser("package-info")
     package_parser.add_argument("--expected-root", type=Path, required=True)
 
@@ -313,6 +427,12 @@ def main() -> int:
         result = ledger_state(args.ledger, args.route_id)
     elif args.action == "create-fixture":
         result = create_fixture(args.ledger, args.route_id)
+    elif args.action == "create-release-v1-fixture":
+        result = create_release_v1_fixture(args.ledger, args.route_id)
+    elif args.action == "create-v2-fixture":
+        result = create_v2_fixture(args.ledger, args.route_id)
+    elif args.action == "migrate-ledger":
+        result = migrate_ledger(args.ledger, args.route_id)
     elif args.action == "package-info":
         result = package_info(args.expected_root)
     elif args.action == "backup-ledger":

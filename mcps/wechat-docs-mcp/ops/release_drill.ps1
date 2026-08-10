@@ -42,7 +42,8 @@ function New-DrillLayout {
     toolHistory = @()
   })
   $LedgerPath = Join-Path $Data "state\events.sqlite3"
-  & $ProbePython $ProbeScript create-fixture --ledger $LedgerPath --route-id "route-fixture" | Out-Null
+  $FixtureAction = $(if ($Shape -eq "v2-schema") { "create-v2-fixture" } else { "create-release-v1-fixture" })
+  & $ProbePython $ProbeScript $FixtureAction --ledger $LedgerPath --route-id "route-fixture" | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "Fixture ledger creation failed" }
   return [pscustomobject]@{ service = $Service; data = $Data; broker = $Broker; oldReleaseId = $OldReleaseId; candidateReleaseId = $CandidateId; fixtureStatePath = $FixtureStatePath }
 }
@@ -63,7 +64,7 @@ function Invoke-Drill {
   if (Test-Path -LiteralPath $Root) { throw "DrillRoot already exists: $Root" }
   New-Item -ItemType Directory -Path $Root | Out-Null
   $Results = @()
-  foreach ($Shape in @("missing-validation", "null-validation", "null-active-backend")) {
+  foreach ($Shape in @("missing-validation", "null-validation", "null-active-backend", "v2-schema")) {
     $CaseRoot = Join-Path $Root $Shape
     $Layout = New-DrillLayout -CaseRoot $CaseRoot -Shape $Shape -SourceManifestPath $CandidateManifestPath
     $Context = Invoke-ReleaseSwitch -Mode Fixture -SwitchServiceRoot $Layout.service -SwitchDataRoot $Layout.data -SwitchBrokerRoot $Layout.broker -SwitchCandidateReleaseId $Layout.candidateReleaseId -SwitchExpectedCurrentReleaseId $Layout.oldReleaseId -SwitchRouteId "route-fixture" -SwitchProbePython $ProbePython -FixtureStatePath $Layout.fixtureStatePath

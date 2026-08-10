@@ -113,7 +113,19 @@ function Compare-JsonValue {
 function Test-LedgerTransition {
   param($Before, $After)
   if (Compare-JsonValue $Before $After) { return $true }
-  if ([int]$Before.schema_version -ne 1 -or [int]$After.schema_version -ne 2) { return $false }
+  $BeforeVersion = [int]$Before.schema_version
+  $AfterVersion = [int]$After.schema_version
+  if ($BeforeVersion -eq 2 -and $AfterVersion -eq 3) {
+    foreach ($Name in @(
+      "routes", "events_total", "subscriptions_total", "pending_total", "pending_subscriptions_total",
+      "wakes_total", "active_wakes_total", "events", "subscriptions", "pending",
+      "pending_subscriptions", "wakes", "active_wakes"
+    )) {
+      if ([int]$Before.$Name -ne [int]$After.$Name) { return $false }
+    }
+    return $true
+  }
+  if ($BeforeVersion -ne 1 -or $AfterVersion -notin @(2, 3)) { return $false }
   foreach ($Name in @("routes", "events_total", "pending_total", "pending_subscriptions_total", "events", "pending", "pending_subscriptions")) {
     if ([int]$Before.$Name -ne [int]$After.$Name) { return $false }
   }
@@ -615,6 +627,12 @@ function Invoke-ReleaseSwitch {
     Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 
     Invoke-BackendReload -Mode $Mode -Name $Endpoint -PrivateEnvPath $PrivateEnvPath -FixtureStatePath $FixtureStatePath -TargetToolCount $ExpectedToolCount -FailFixtureHealth:$FailFixtureHealth | Out-Null
+    if ($Mode -eq "Fixture") {
+      $MigrationRaw = & $SwitchProbePython $ProbeScript migrate-ledger --ledger $LedgerPath --route-id $SwitchRouteId
+      if ($LASTEXITCODE -ne 0) { throw "Fixture candidate ledger migration failed" }
+      $Migration = ($MigrationRaw -join "`n") | ConvertFrom-Json
+      if ([int]$Migration.schema_version -ne 3) { throw "Fixture candidate did not migrate the ledger to schema 3" }
+    }
     $Health = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration ($Context.beforeBackendGeneration + 1)
     $Supervisor = Wait-Supervisor -Mode $Mode -SupervisorPath $SupervisorPath -FixtureStatePath $FixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)
     $ProtectedHealth = Wait-EndpointHealth -Mode $Mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration $Context.beforeProtectedBackendGeneration
@@ -622,7 +640,7 @@ function Invoke-ReleaseSwitch {
       throw "Protected endpoint changed during the WeChat release switch"
     }
     $AfterLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
-    if (-not (Test-LedgerTransition $BeforeLedger $AfterLedger)) { throw "Ledger transition is not a valid unchanged or V1-to-V2 migration" }
+    if (-not (Test-LedgerTransition $BeforeLedger $AfterLedger)) { throw "Ledger transition is not unchanged or a supported schema migration" }
     $PhaseAStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
     Assert-PollStatus -Status $PhaseAStatus -ExpectedRunning $false
     if ($FailBeforePollStart) { throw "Forced failure after Phase A before polling resumes" }

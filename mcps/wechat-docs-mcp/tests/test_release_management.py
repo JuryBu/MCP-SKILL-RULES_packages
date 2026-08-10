@@ -283,13 +283,14 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         summary = json.loads(result.stdout)
         self.assertEqual("READY_FOR_ACTIVATION", summary["status"])
         self.assertFalse(summary["productionTouched"])
-        self.assertEqual(3, len(summary["successfulCases"]))
+        self.assertEqual(4, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["activationToolCount"] == 43 for case in summary["successfulCases"]))
         self.assertTrue(all(case["activated"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["phaseAWatcherFrozen"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["ledgerBackupPresent"] for case in summary["successfulCases"]))
+        self.assertIn("v2-schema", {case["case"] for case in summary["successfulCases"]})
         self.assertTrue(summary["forcedFailure"]["caught"])
         self.assertTrue(summary["forcedFailure"]["rollbackVerified"])
         self.assertEqual("release-old", summary["forcedFailure"]["currentReleaseId"])
@@ -311,7 +312,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertEqual(43, null_validation["validation"]["activeBackend"]["toolCount"])
         self.assertEqual(43, null_active_backend["validation"]["activeBackend"]["toolCount"])
 
-        for case_name in ("missing-validation", "null-validation", "null-active-backend"):
+        for case_name in ("missing-validation", "null-validation", "null-active-backend", "v2-schema"):
             case_root = drill_root / case_name
             active = json.loads((case_root / "service" / "pointers" / "active.json").read_text(encoding="utf-8"))
             last_known_good = json.loads(
@@ -320,6 +321,17 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             self.assertEqual("release-candidate", active["releaseId"])
             self.assertEqual("release-candidate", last_known_good["releaseId"])
             self.assertFalse(list((case_root / "service").glob("current.next-*")))
+            connection = sqlite3.connect(case_root / "data" / "state" / "events.sqlite3")
+            try:
+                self.assertEqual(
+                    "3",
+                    connection.execute(
+                        "SELECT value FROM schema_meta WHERE key='schema_version'"
+                    ).fetchone()[0],
+                )
+                self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
+            finally:
+                connection.close()
 
         for case_name in ("forced-health-failure", "forced-precommit-failure"):
             case_root = drill_root / case_name
