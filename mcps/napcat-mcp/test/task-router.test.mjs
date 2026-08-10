@@ -126,10 +126,10 @@ function fixture(options = {}) {
     },
   };
   const notifier = {
-    readRecentMessages: async () => ({
+    readRecentMessages: options.readRecentMessages ?? (async () => ({
       scannedCount: (options.messages ?? [message(10)]).length,
       messages: options.messages ?? [message(10)],
-    }),
+    })),
   };
   const bridge = {
     wake: async (input) => {
@@ -169,6 +169,39 @@ test("multiple eligible messages coalesce into one wake", async () => {
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /previously_pending_message_seqs=\[\]/);
   assert.match(current.calls.find((call) => call.type === "wake").input.prompt, /wake_id=/);
   assert.equal(current.getTask().wakePending, true);
+});
+
+test("router paginates beyond the latest fifty without comparing cross-account sequences", async () => {
+  const allMessages = Array.from({ length: 120 }, (_, index) => message(index + 1, {
+    taskId: index === 9 ? "语音处理" : "other-task",
+  }));
+  const readArgs = [];
+  const current = fixture({
+    task: { createdAt: "2026-07-24T07:59:00.000Z" },
+    readRecentMessages: async (input) => {
+      readArgs.push(structuredClone(input));
+      if (input.message_seq === undefined) {
+        return { scannedCount: 50, messages: allMessages.slice(70) };
+      }
+      if (Number(input.message_seq) === 71) {
+        return { scannedCount: 50, messages: allMessages.slice(20, 70) };
+      }
+      if (Number(input.message_seq) === 21) {
+        return { scannedCount: 20, messages: allMessages.slice(0, 20) };
+      }
+      return { scannedCount: 0, messages: [] };
+    },
+  });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.history.pagesScanned, 4);
+  assert.equal(result.wakeCount, 1);
+  assert.deepEqual(readArgs, [
+    { count: 50 },
+    { count: 50, message_seq: 71 },
+    { count: 50, message_seq: 21 },
+    { count: 50, message_seq: 1 },
+  ]);
+  assert.deepEqual(current.calls.find((call) => call.type === "acquireWakeLease").input.messages.map((item) => item.messageSeq), [10]);
 });
 
 test("task router emits machine and conversation receipts around one accepted wake", async () => {

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
-const STATE_SCHEMA_VERSION = 5;
+const STATE_SCHEMA_VERSION = 6;
 const DEFAULT_MAX_SEEN = 2048;
 const DEFAULT_LOCK_WAIT_MS = 2000;
 
@@ -146,7 +146,7 @@ function migrateState(value) {
   if (migrated.schemaVersion === 4) {
     migrated = {
       ...migrated,
-      schemaVersion: STATE_SCHEMA_VERSION,
+      schemaVersion: 5,
       ownerRoutes: Object.fromEntries(Object.entries(migrated.ownerRoutes ?? {}).map(([routeKey, route]) => [
         routeKey,
         {
@@ -158,6 +158,23 @@ function migrateState(value) {
           bufferedOwnerMessages: Array.isArray(route.bufferedOwnerMessages)
             ? route.bufferedOwnerMessages
             : [],
+        },
+      ])),
+    };
+  }
+  if (migrated.schemaVersion === 5) {
+    migrated = {
+      ...migrated,
+      schemaVersion: STATE_SCHEMA_VERSION,
+      deliveries: Object.fromEntries(Object.entries(migrated.deliveries ?? {}).map(([deliveryId, delivery]) => [
+        deliveryId,
+        {
+          ...delivery,
+          sentAt: delivery.sentAt ?? null,
+          machineIncidentAlertedAt: delivery.machineIncidentAlertedAt ?? null,
+          machineIncidentResolvedAt: delivery.machineIncidentResolvedAt ?? null,
+          conversationIncidentAlertedAt: delivery.conversationIncidentAlertedAt ?? null,
+          conversationIncidentResolvedAt: delivery.conversationIncidentResolvedAt ?? null,
         },
       ])),
     };
@@ -212,6 +229,15 @@ function validateStoredDelivery(delivery, deliveryId, statePath) {
     `deliveries.${deliveryId}.conversationReceivedAt`,
     true,
   );
+  for (const field of [
+    "sentAt",
+    "machineIncidentAlertedAt",
+    "machineIncidentResolvedAt",
+    "conversationIncidentAlertedAt",
+    "conversationIncidentResolvedAt",
+  ]) {
+    validateStoredDate(delivery[field], statePath, `deliveries.${deliveryId}.${field}`, true);
+  }
   const rank = DELIVERY_STATUS_RANK.get(delivery.status);
   if ((rank === 0 && (delivery.machineReceivedAt !== null || delivery.conversationReceivedAt !== null))
     || (rank === 1 && (delivery.machineReceivedAt === null || delivery.conversationReceivedAt !== null))
@@ -222,6 +248,18 @@ function validateStoredDelivery(delivery, deliveryId, statePath) {
     && delivery.conversationReceivedAt !== null
     && Date.parse(delivery.conversationReceivedAt) < Date.parse(delivery.machineReceivedAt)) {
     invalidState(statePath, `投递时间顺序无效（${deliveryId}）`);
+  }
+  for (const [alertedField, resolvedField] of [
+    ["machineIncidentAlertedAt", "machineIncidentResolvedAt"],
+    ["conversationIncidentAlertedAt", "conversationIncidentResolvedAt"],
+  ]) {
+    if (delivery[resolvedField] !== null && delivery[alertedField] === null) {
+      invalidState(statePath, `投递事故恢复时间缺少对应告警（${deliveryId}）`);
+    }
+    if (delivery[alertedField] !== null && delivery[resolvedField] !== null
+      && Date.parse(delivery[resolvedField]) < Date.parse(delivery[alertedField])) {
+      invalidState(statePath, `投递事故恢复时间早于告警时间（${deliveryId}）`);
+    }
   }
 }
 
@@ -618,9 +656,9 @@ export class ControlState {
         );
       }
       const now = resolveNow(this.now, input);
-      const machineReceivedAt = requestedRank >= 1
-        ? mergeDate(existing?.machineReceivedAt ?? null, input, "machineReceivedAt", "DELIVERY_CONFLICT", deliveryId) ?? now
-        : requestedDate(input, "machineReceivedAt");
+      const sentAt = existing
+        ? mergeDate(existing.sentAt ?? null, input, "sentAt", "DELIVERY_CONFLICT", deliveryId)
+        : requestedDate(input, "sentAt") ?? now;
       const conversationReceivedAt = requestedRank >= 2
         ? mergeDate(
           existing?.conversationReceivedAt ?? null,
@@ -630,6 +668,10 @@ export class ControlState {
           deliveryId,
         ) ?? now
         : requestedDate(input, "conversationReceivedAt");
+      const machineReceivedAt = requestedRank >= 1
+        ? mergeDate(existing?.machineReceivedAt ?? null, input, "machineReceivedAt", "DELIVERY_CONFLICT", deliveryId)
+          ?? (requestedRank >= 2 ? conversationReceivedAt : now)
+        : requestedDate(input, "machineReceivedAt");
       if (requestedRank === 0 && (machineReceivedAt !== null || conversationReceivedAt !== null)) {
         invalidArgument("pending 阶段不能带接收时间");
       }
@@ -663,11 +705,70 @@ export class ControlState {
           "DELIVERY_CONFLICT",
           deliveryId,
         ),
+        sentAt,
         machineReceivedAt,
         conversationReceivedAt,
+        machineIncidentAlertedAt: mergeDate(
+          existing?.machineIncidentAlertedAt ?? null,
+          input,
+          "machineIncidentAlertedAt",
+          "DELIVERY_CONFLICT",
+          deliveryId,
+        ),
+        machineIncidentResolvedAt: mergeDate(
+          existing?.machineIncidentResolvedAt ?? null,
+          input,
+          "machineIncidentResolvedAt",
+          "DELIVERY_CONFLICT",
+          deliveryId,
+        ),
+        conversationIncidentAlertedAt: mergeDate(
+          existing?.conversationIncidentAlertedAt ?? null,
+          input,
+          "conversationIncidentAlertedAt",
+          "DELIVERY_CONFLICT",
+          deliveryId,
+        ),
+        conversationIncidentResolvedAt: mergeDate(
+          existing?.conversationIncidentResolvedAt ?? null,
+          input,
+          "conversationIncidentResolvedAt",
+          "DELIVERY_CONFLICT",
+          deliveryId,
+        ),
         status: requestedStatus,
       };
-      if (existing && requestedRank === currentRank) return { changed: false, value: clone(existing) };
+      if (existing && JSON.stringify(existing) === JSON.stringify(delivery)) {
+        return { changed: false, value: clone(existing) };
+      }
+      state.deliveries[deliveryId] = delivery;
+      return { changed: true, value: clone(delivery) };
+    });
+  }
+
+  updateDeliveryIncident(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const deliveryId = requiredString(input.deliveryId, "deliveryId", 128);
+    const layer = enumValue(input.layer, "layer", ["machine_received", "conversation_received"]);
+    const phase = enumValue(input.phase, "phase", ["alerted", "resolved"]);
+    const field = layer === "machine_received"
+      ? (phase === "alerted" ? "machineIncidentAlertedAt" : "machineIncidentResolvedAt")
+      : (phase === "alerted" ? "conversationIncidentAlertedAt" : "conversationIncidentResolvedAt");
+    const alertedField = layer === "machine_received"
+      ? "machineIncidentAlertedAt"
+      : "conversationIncidentAlertedAt";
+    return this.#write((state) => {
+      const existing = state.deliveries[deliveryId];
+      if (!existing) invalidArgument(`找不到投递记录：${deliveryId}`);
+      if (existing[field] !== null) return { changed: false, value: clone(existing) };
+      if (phase === "resolved" && existing[alertedField] === null) {
+        invalidArgument(`不能在未发送事故告警前记录恢复：${deliveryId}`);
+      }
+      const timestamp = resolveNow(this.now, input);
+      if (phase === "resolved") {
+        assertChronological(existing[alertedField], timestamp, alertedField, field);
+      }
+      const delivery = { ...existing, [field]: timestamp };
       state.deliveries[deliveryId] = delivery;
       return { changed: true, value: clone(delivery) };
     });

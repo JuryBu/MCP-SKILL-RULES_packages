@@ -31,6 +31,10 @@
 | `NAPCAT_TASK_REGISTRY_PATH` | data root `state/task-registry.json` | 任务、对话、代次、游标、租约与冷却账本 |
 | `NAPCAT_CONTROL_STATE_PATH` | data root `state/control-state.json` | 送达回执、重连请求、主人回复路由与控制消息去重状态 |
 | `NAPCAT_TASK_ROUTER_INTERVAL_MS` | `30000` | 固定群任务扫描间隔 |
+| `NAPCAT_ROUTER_HISTORY_MAX_PAGES` | `40` | 路由恢复时向前分页补扫的最大页数 |
+| `NAPCAT_CONTROL_HISTORY_LOOKBACK_MS` | `900000` | 控制消息首次启用时允许进入处理窗口的时间范围 |
+| `NAPCAT_DELIVERY_MACHINE_ALERT_MS` | `120000` | 关键送达缺少 `machine_received` 时触发严重告警的等待时间 |
+| `NAPCAT_DELIVERY_CONVERSATION_ALERT_MS` | `300000` | 关键送达缺少 `conversation_received` 时触发严重告警的等待时间 |
 | `NAPCAT_MCP_BINDING_PATH` | `%USERPROFILE%\.codex-toolkit\napcat-mcp\binding.json` | 固定账号和群绑定 |
 | `NAPCAT_MCP_STATE_PATH` | `%USERPROFILE%\.codex-toolkit\napcat-mcp\state\dedupe.json` | 通知去重状态 |
 | `NAPCAT_FILE_UPLOAD_TIMEOUT_MS` | `600000` | 群文件上传最长等待 10 分钟 |
@@ -79,6 +83,10 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 ## 送达回执、重连请求与主人通知
 
 结构化任务文本和文件索引都会得到稳定 `delivery_id`。接收端路由器识别到可信消息后自动发送 `machine_received`，成功把消息提交给绑定 Codex 对话后再发送 `conversation_received`；发送端用 `napcat_delivery_status` 查询这两个传输状态。它们只回答「对端机器看到了」「对端对话收到引导」，不会确认模型已经理解或完成业务，因此绝不能代替上面的显式 `napcat_task_ack`。
+
+跨机器送达对账只使用 `delivery_id`、`task_id`、generation、发送时间和内容哈希；不同 QQ 账号看到的 `message_seq` 只在各自本机历史分页中使用，不能跨账号比较或查询。路由器会从最新页向前补扫到开放任务或控制窗口边界，即使消息已经掉出最近 50 条，也不会因短暂停机或维护窗口永久漏掉。
+
+关键结构化送达在短窗口内仍缺少 `machine_received` 或 `conversation_received` 时，会通过私有 binding 中固定的主人通知群发送一次去重后的严重故障告警；告警包含 task、delivery、缺失层级、影响、是否已执行和当前处置。对应层恢复后只发送一次解除告警。告警属于控制面通知，不携带或 ACK 业务正文，也不依赖跨账号 `message_seq` 关联。
 
 控制面第一次在启用状态下成功读取群历史时，会把当前可信业务消息快照的两阶段回执键写入基线，并持久化 `businessReceiptBootstrapAt`；这些历史消息不补发 `machine_received` 或 `conversation_received`，避免把群历史刷成一屏回执。业务基线不依赖 QQ 时间戳或两台电脑的时钟，写入后也不会随进程或电脑重启改变，因此机器离线期间后来到达的消息仍会在恢复扫描后正常补回执。首次启用时只有最近 15 分钟内且时间可核验的建链请求允许进入处理窗口，更旧或时间无效的请求只记为历史基线；已经确认或发送结果未知的控制回执按稳定键去重，不会因扫描器重启自动重发。
 

@@ -10,6 +10,14 @@ function messageTimestamp(message) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+function historyMessageKey(message) {
+  return [
+    String(message?.senderId ?? ""),
+    String(messageSequence(message) ?? ""),
+    String(message?.time ?? ""),
+  ].join("\0");
+}
+
 function expectedPeerMachine(task) {
   if (task.localRole && task.localRole === task.sourceMachine) return task.targetMachine;
   if (task.localRole && task.localRole === task.targetMachine) return task.sourceMachine;
@@ -76,10 +84,84 @@ export function createTaskRouter(options = {}) {
   const controlPlane = options.controlPlane ?? null;
   if (!registry || !notifier || !bridge) throw new Error("task router 需要 registry、notifier 和 bridge");
   const historyCount = Math.max(1, Math.min(50, Number(options.historyCount ?? 50)));
+  const historyMaxPages = Math.max(1, Math.min(200, Number(options.historyMaxPages ?? 40)));
+  const controlHistoryLookbackMs = Math.max(0, Number(options.controlHistoryLookbackMs ?? 15 * 60 * 1000));
   const wakeLeaseMs = Math.max(1000, Number(options.wakeLeaseMs ?? 300000));
   const isMaintenanceActive = typeof options.isMaintenanceActive === "function"
     ? options.isMaintenanceActive
     : () => false;
+
+  function historyBoundary(tasks) {
+    const candidates = [Date.now() - controlHistoryLookbackMs];
+    for (const task of tasks) {
+      for (const value of [task.lastSeenAt, task.lastAckedAt, task.createdAt]) {
+        const timestamp = Date.parse(value ?? "");
+        if (Number.isFinite(timestamp)) {
+          candidates.push(timestamp);
+          break;
+        }
+      }
+    }
+    return Math.min(...candidates);
+  }
+
+  async function readHistoryForScan(tasks) {
+    const boundary = historyBoundary(tasks);
+    const first = await notifier.readRecentMessages({ count: historyCount });
+    const messagesByKey = new Map();
+    for (const message of first.messages ?? []) messagesByKey.set(historyMessageKey(message), message);
+    let pagesScanned = 1;
+    let stopReason = "boundary_reached";
+    let historyComplete = false;
+    while (messagesByKey.size > 0) {
+      const chronological = [...messagesByKey.values()]
+        .filter((message) => messageTimestamp(message) !== null)
+        .sort((left, right) => messageTimestamp(left) - messageTimestamp(right));
+      const oldest = chronological[0];
+      if (!oldest || messageTimestamp(oldest) <= boundary) {
+        historyComplete = true;
+        stopReason = "boundary_reached";
+        break;
+      }
+      if (pagesScanned >= historyMaxPages) {
+        stopReason = "page_limit_reached";
+        break;
+      }
+      const anchor = messageSequence(oldest);
+      if (anchor === null) {
+        stopReason = "missing_receiver_local_anchor";
+        break;
+      }
+      const page = await notifier.readRecentMessages({ count: historyCount, message_seq: anchor });
+      pagesScanned += 1;
+      let added = 0;
+      for (const message of page.messages ?? []) {
+        const key = historyMessageKey(message);
+        if (messagesByKey.has(key)) continue;
+        messagesByKey.set(key, message);
+        added += 1;
+      }
+      if (added === 0) {
+        historyComplete = true;
+        stopReason = "history_exhausted";
+        break;
+      }
+    }
+    if (messagesByKey.size === 0) {
+      historyComplete = true;
+      stopReason = "history_empty";
+    }
+    const messages = [...messagesByKey.values()]
+      .sort((left, right) => (messageTimestamp(left) ?? 0) - (messageTimestamp(right) ?? 0));
+    return {
+      messages,
+      scannedCount: messages.length,
+      pagesScanned,
+      historyComplete,
+      stopReason,
+      boundaryAt: new Date(boundary).toISOString(),
+    };
+  }
 
   async function scanTask(task, sharedHistory = null) {
     try {
@@ -271,7 +353,7 @@ export function createTaskRouter(options = {}) {
     }
     let history;
     try {
-      history = await notifier.readRecentMessages({ count: historyCount });
+      history = await readHistoryForScan(tasks);
     } catch (error) {
       const failure = publicError(error);
       return {
@@ -285,6 +367,9 @@ export function createTaskRouter(options = {}) {
       };
     }
     const controlGroup = controlPlane ? await controlPlane.scanGroupHistory(history.messages) : null;
+    const deliveryReconciliation = controlPlane?.reconcileOutgoingDeliveries
+      ? await controlPlane.reconcileOutgoingDeliveries()
+      : null;
     const ownerReplies = controlPlane ? await controlPlane.scanOwnerReplies() : null;
     const results = [];
     for (const task of tasks) results.push(await scanTask(task, history));
@@ -294,7 +379,13 @@ export function createTaskRouter(options = {}) {
       keepAlive,
       wakeCount: results.filter((result) => result.outcome === "accepted" || result.outcome === "completed").length,
       results,
-      controlPlane: { group: controlGroup, ownerReplies },
+      history: {
+        pagesScanned: history.pagesScanned,
+        historyComplete: history.historyComplete,
+        stopReason: history.stopReason,
+        boundaryAt: history.boundaryAt,
+      },
+      controlPlane: { group: controlGroup, deliveries: deliveryReconciliation, ownerReplies },
     };
   }
 

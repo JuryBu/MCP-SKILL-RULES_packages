@@ -6,6 +6,7 @@ import { createTaskRegistry, TaskRegistryError } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { createControlState, ControlStateError } from "./control-state.mjs";
 import { createControlPlane } from "./control-plane.mjs";
+import { resolveTrackedDelivery } from "./delivery-result.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -620,14 +621,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     if (name === "napcat_send_text") {
       const result = await notifier.sendTextMessage(args);
       if (args.task_id && args.source_machine && args.target_machine) {
-        const messageSeq = Number(result.messageId ?? result.existing?.messageId);
-        if (Number.isSafeInteger(messageSeq) && messageSeq >= 0) {
+        const tracked = resolveTrackedDelivery(result);
+        if (tracked) {
           controlPlane.trackOutgoingDelivery({
-            deliveryId: result.deliveryId,
+            deliveryId: tracked.deliveryId,
             taskId: args.task_id,
             sourceMachine: args.source_machine,
             targetMachine: args.target_machine,
-            messageSeq,
+            messageSeq: tracked.messageSeq,
           });
         }
       }

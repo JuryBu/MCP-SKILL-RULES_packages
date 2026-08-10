@@ -69,7 +69,7 @@ function assertControlStateError(callback, code) {
   assert.throws(callback, (error) => error instanceof ControlStateError && error.code === code);
 }
 
-test("first write creates schemaVersion 5 state through a clean atomic rename", () => {
+test("first write creates schemaVersion 6 state through a clean atomic rename", () => {
   const fixture = createFixture();
   try {
     assert.equal(fs.existsSync(fixture.statePath), false);
@@ -80,13 +80,18 @@ test("first write creates schemaVersion 5 state through a clean atomic rename", 
       sourceMachine: "development",
       targetMachine: "training",
       messageSeq: 101,
+      sentAt: BASE_TIME,
       machineReceivedAt: BASE_TIME,
       conversationReceivedAt: null,
+      machineIncidentAlertedAt: null,
+      machineIncidentResolvedAt: null,
+      conversationIncidentAlertedAt: null,
+      conversationIncidentResolvedAt: null,
       status: "machine_received",
     });
 
     const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
-    assert.equal(stored.schemaVersion, 5);
+    assert.equal(stored.schemaVersion, 6);
     assert.equal(stored.businessReceiptBootstrapAt, null);
     assert.deepEqual(stored.deliveries["delivery-001"], delivery);
     assert.deepEqual(stored.connectionRequests, {});
@@ -125,7 +130,7 @@ test("legacy schema migrates and persists the business receipt bootstrap", () =>
       fixture.controlState.hasSeenControlMessage("business-receipt:machine_received:delivery-legacy"),
       true,
     );
-    assert.equal(fixture.controlState.snapshot().schemaVersion, 5);
+    assert.equal(fixture.controlState.snapshot().schemaVersion, 6);
   } finally {
     fixture.cleanup();
   }
@@ -283,7 +288,7 @@ test("schemaVersion 2 migrates owner alert message mappings without changing exi
     }, null, 2)}\n`, "utf8");
 
     const snapshot = fixture.controlState.snapshot();
-    assert.equal(snapshot.schemaVersion, 5);
+    assert.equal(snapshot.schemaVersion, 6);
     assert.equal(snapshot.businessReceiptBootstrapAt, BASE_TIME);
     assert.deepEqual(snapshot.ownerAlertMessages, {});
     assert.equal(snapshot.deliveries["delivery-001"].deliveryId, "delivery-001");

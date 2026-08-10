@@ -109,6 +109,8 @@ function createFixture(options = {}) {
     now: options.now ?? (() => new Date(BASE_TIME)),
     registry: options.registry,
     connectionRequestBootstrapLookbackMs: options.connectionRequestBootstrapLookbackMs,
+    machineReceiptAlertMs: options.machineReceiptAlertMs,
+    conversationReceiptAlertMs: options.conversationReceiptAlertMs,
   });
   return {
     root,
@@ -212,8 +214,13 @@ test("business delivery advances through machine and conversation receipts witho
       sourceMachine: "development",
       targetMachine: "training",
       messageSeq: 77,
+      sentAt: "2026-08-09T00:00:00.000Z",
       machineReceivedAt: "2026-08-09T00:00:01.000Z",
       conversationReceivedAt: "2026-08-09T00:00:02.000Z",
+      machineIncidentAlertedAt: null,
+      machineIncidentResolvedAt: null,
+      conversationIncidentAlertedAt: null,
+      conversationIncidentResolvedAt: null,
       status: "conversation_received",
     });
 
@@ -227,6 +234,81 @@ test("business delivery advances through machine and conversation receipts witho
   } finally {
     sender.cleanup();
     receiver.cleanup();
+  }
+});
+
+test("receipt identity is delivery based even when receiver-local message sequences collide", async () => {
+  const fixture = createFixture();
+  try {
+    for (const deliveryId of ["delivery-a", "delivery-b"]) {
+      fixture.controlPlane.trackOutgoingDelivery({
+        deliveryId,
+        taskId: "stable-task",
+        sourceMachine: "development",
+        targetMachine: "training",
+        messageSeq: 77,
+      });
+    }
+    const scan = await fixture.controlPlane.scanGroupHistory([
+      receiptMessage("machine_received", { deliveryId: "delivery-a", messageId: "900", messageSeq: "900" }),
+      receiptMessage("machine_received", { deliveryId: "delivery-b", messageId: "900", messageSeq: "900" }),
+    ]);
+    assert.deepEqual(scan.results.map((result) => result.deliveryId), ["delivery-a", "delivery-b"]);
+    assert.equal(fixture.controlPlane.getDeliveryStatus("delivery-a").status, "machine_received");
+    assert.equal(fixture.controlPlane.getDeliveryStatus("delivery-b").status, "machine_received");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("missing delivery receipts raise one severe alert per layer and one recovery alert", async () => {
+  let currentTime = new Date("2026-08-09T00:00:00.000Z");
+  const fixture = createFixture({
+    now: () => currentTime,
+    machineReceiptAlertMs: 60_000,
+    conversationReceiptAlertMs: 60_000,
+  });
+  try {
+    fixture.controlPlane.trackOutgoingDelivery({
+      deliveryId: "delivery-alert",
+      taskId: "stable-task",
+      sourceMachine: "development",
+      targetMachine: "training",
+      messageSeq: 77,
+    });
+    currentTime = new Date("2026-08-09T00:01:01.000Z");
+    await fixture.controlPlane.reconcileOutgoingDeliveries();
+    await fixture.controlPlane.reconcileOutgoingDeliveries();
+    assert.deepEqual(fixture.groupSends.map((entry) => entry.dedupe_key), [
+      "delivery-missing:machine_received:delivery-alert",
+    ]);
+
+    await fixture.controlPlane.scanGroupHistory([
+      receiptMessage("machine_received", { deliveryId: "delivery-alert", time: "2026-08-09T00:01:02.000Z" }),
+    ]);
+    currentTime = new Date("2026-08-09T00:02:03.000Z");
+    await fixture.controlPlane.reconcileOutgoingDeliveries();
+    assert.deepEqual(fixture.groupSends.map((entry) => entry.dedupe_key), [
+      "delivery-missing:machine_received:delivery-alert",
+      "delivery-recovered:machine_received:delivery-alert",
+      "delivery-missing:conversation_received:delivery-alert",
+    ]);
+
+    await fixture.controlPlane.scanGroupHistory([
+      receiptMessage("conversation_received", { deliveryId: "delivery-alert", time: "2026-08-09T00:02:04.000Z" }),
+    ]);
+    currentTime = new Date("2026-08-09T00:02:05.000Z");
+    await fixture.controlPlane.reconcileOutgoingDeliveries();
+    assert.deepEqual(fixture.groupSends.map((entry) => entry.dedupe_key), [
+      "delivery-missing:machine_received:delivery-alert",
+      "delivery-recovered:machine_received:delivery-alert",
+      "delivery-missing:conversation_received:delivery-alert",
+      "delivery-recovered:conversation_received:delivery-alert",
+    ]);
+    assert.match(fixture.groupSends[0].message, /task：stable-task/);
+    assert.match(fixture.groupSends[0].message, /是否执行：未知/);
+  } finally {
+    fixture.cleanup();
   }
 });
 
@@ -1012,7 +1094,7 @@ test("migrated open owner route establishes a baseline on its first background s
     assert.deepEqual((await fixture.controlPlane.scanOwnerReplies()).results, []);
     assert.equal(fixture.wakeCalls.length, 0);
     const persisted = JSON.parse(fs.readFileSync(path.join(fixture.root, "state", "control-state.json"), "utf8"));
-    assert.equal(persisted.schemaVersion, 5);
+    assert.equal(persisted.schemaVersion, 6);
     assert.equal(persisted.ownerRoutes["private-route"].baselineInitialized, true);
     assert.equal(persisted.ownerRoutes["private-route"].baselineMessageKeys.length, 1);
   } finally {

@@ -36,6 +36,15 @@ function normalizePositiveInteger(value, name, fallback = undefined) {
   return parsed;
 }
 
+function normalizeNonNegativeInteger(value, name, fallback = undefined) {
+  const candidate = value === undefined || value === null || value === "" ? fallback : value;
+  const parsed = Number(candidate);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} 必须是非负整数`);
+  }
+  return parsed;
+}
+
 function resolveRequiredPath(value, name) {
   if (value === undefined || value === null || String(value).trim() === "") {
     throw new Error(`${name} 不能为空`);
@@ -518,12 +527,32 @@ export function createTaskRouterDependencies(options = {}) {
   });
   const controlPlane = options.controlPlane ?? controlPlaneFactory({
     ...(options.controlPlaneOptions ?? {}),
+    machineReceiptAlertMs: normalizeNonNegativeInteger(
+      options.controlPlaneOptions?.machineReceiptAlertMs ?? env.NAPCAT_DELIVERY_MACHINE_ALERT_MS,
+      "NAPCAT_DELIVERY_MACHINE_ALERT_MS",
+      2 * 60 * 1000,
+    ),
+    conversationReceiptAlertMs: normalizeNonNegativeInteger(
+      options.controlPlaneOptions?.conversationReceiptAlertMs ?? env.NAPCAT_DELIVERY_CONVERSATION_ALERT_MS,
+      "NAPCAT_DELIVERY_CONVERSATION_ALERT_MS",
+      5 * 60 * 1000,
+    ),
     notifier,
     bridge,
     state: controlState,
   });
   const router = options.router ?? routerFactory({
     ...(options.routerOptions ?? {}),
+    historyMaxPages: normalizePositiveInteger(
+      options.routerOptions?.historyMaxPages ?? env.NAPCAT_ROUTER_HISTORY_MAX_PAGES,
+      "NAPCAT_ROUTER_HISTORY_MAX_PAGES",
+      40,
+    ),
+    controlHistoryLookbackMs: normalizeNonNegativeInteger(
+      options.routerOptions?.controlHistoryLookbackMs ?? env.NAPCAT_CONTROL_HISTORY_LOOKBACK_MS,
+      "NAPCAT_CONTROL_HISTORY_LOOKBACK_MS",
+      15 * 60 * 1000,
+    ),
     registry,
     notifier,
     bridge,

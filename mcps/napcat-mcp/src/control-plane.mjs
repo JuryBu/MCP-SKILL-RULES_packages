@@ -1,6 +1,13 @@
 import crypto from "node:crypto";
 
 const DEFAULT_CONNECTION_REQUEST_BOOTSTRAP_LOOKBACK_MS = 15 * 60 * 1000;
+const DEFAULT_MACHINE_RECEIPT_ALERT_MS = 2 * 60 * 1000;
+const DEFAULT_CONVERSATION_RECEIPT_ALERT_MS = 5 * 60 * 1000;
+const DELIVERY_STAGE_RANK = new Map([
+  ["pending", 0],
+  ["machine_received", 1],
+  ["conversation_received", 2],
+]);
 
 function requiredText(value, name, maximum = 512) {
   const normalized = String(value ?? "").trim();
@@ -94,6 +101,11 @@ function chronologicalMessages(messages) {
     .map((entry) => entry.message);
 }
 
+function normalizedDuration(value, fallback) {
+  const number = Number(value ?? fallback);
+  return Number.isFinite(number) && number >= 0 ? number : fallback;
+}
+
 export function createControlPlane(options = {}) {
   const notifier = options.notifier;
   const bridge = options.bridge;
@@ -102,6 +114,14 @@ export function createControlPlane(options = {}) {
   const connectionRequestBootstrapLookbackMs = Math.max(
     0,
     Number(options.connectionRequestBootstrapLookbackMs ?? DEFAULT_CONNECTION_REQUEST_BOOTSTRAP_LOOKBACK_MS),
+  );
+  const machineReceiptAlertMs = normalizedDuration(
+    options.machineReceiptAlertMs,
+    DEFAULT_MACHINE_RECEIPT_ALERT_MS,
+  );
+  const conversationReceiptAlertMs = normalizedDuration(
+    options.conversationReceiptAlertMs,
+    DEFAULT_CONVERSATION_RECEIPT_ALERT_MS,
   );
   if (!notifier || !bridge || !state) throw new Error("control plane 需要 notifier、bridge 和 state");
   function config() {
@@ -174,12 +194,16 @@ export function createControlPlane(options = {}) {
   }
 
   function trackOutgoingDelivery(input) {
+    const deliveryId = requiredText(input.deliveryId, "deliveryId", 128);
+    const existing = state.getDelivery(deliveryId);
+    if (existing) return existing;
     return state.updateDelivery({
-      deliveryId: requiredText(input.deliveryId, "deliveryId", 128),
+      deliveryId,
       taskId: requiredText(input.taskId, "taskId", 128),
       sourceMachine: requiredText(input.sourceMachine, "sourceMachine", 64),
       targetMachine: requiredText(input.targetMachine, "targetMachine", 64),
       messageSeq: Number(input.messageSeq),
+      sentAt: now(),
       status: "pending",
     });
   }
@@ -187,10 +211,16 @@ export function createControlPlane(options = {}) {
   async function scanReceipt(message, configuration) {
     if (message.messageType !== "delivery_receipt" || !validatePeerMessage(message, configuration)) return null;
     if (!message.deliveryId || !["machine_received", "conversation_received"].includes(message.receiptStage)) return null;
-    const key = messageKey("receipt", message);
+    const key = deliveryReceiptKey(message, message.receiptStage);
     if (state.hasSeenControlMessage(key)) return { outcome: "duplicate_receipt", deliveryId: message.deliveryId };
     const existing = state.getDelivery(message.deliveryId);
     if (!existing) return { outcome: "unknown_delivery_receipt", deliveryId: message.deliveryId };
+    const currentRank = DELIVERY_STAGE_RANK.get(existing.status);
+    const incomingRank = DELIVERY_STAGE_RANK.get(message.receiptStage);
+    if (currentRank >= incomingRank) {
+      state.markControlMessageSeen(key);
+      return { outcome: "receipt_already_advanced", deliveryId: message.deliveryId, status: existing.status };
+    }
     state.updateDelivery({
       deliveryId: message.deliveryId,
       status: message.receiptStage,
@@ -205,7 +235,7 @@ export function createControlPlane(options = {}) {
   async function scanConnectionRequest(message, configuration, bootstrap = null) {
     if (message.messageType !== "connection_request" || !validatePeerMessage(message, configuration)) return null;
     if (!message.requestId || !message.targetConversationId || !message.proposedTaskId) return null;
-    const key = messageKey("connection-request", message);
+    const key = `connection-request:${requiredText(message.requestId, "requestId", 128)}`;
     if (state.hasSeenControlMessage(key)) return { outcome: "duplicate_connection_request", requestId: message.requestId };
     if (bootstrap?.initialized) {
       const requestTime = messageTime(message);
@@ -305,6 +335,96 @@ export function createControlPlane(options = {}) {
       }
     }
     return { enabled: true, bootstrap, results };
+  }
+
+  function deliveryAlertMessage(delivery, layer, recovered) {
+    const missingLayer = layer === "machine_received" ? "machine_received（对端机器确认）" : "conversation_received（目标对话确认）";
+    const impact = layer === "machine_received"
+      ? "对端可能没有收到这条关键结构化消息，不能假设业务已经开始执行"
+      : "对端机器已确认收到，但目标 Codex 对话尚未确认接收，不能假设业务已经执行";
+    const execution = recovered
+      ? "接收层已恢复；业务是否执行仍以任务消息与后续回报为准"
+      : "未知；本告警不会自动重发、执行或 ACK 业务消息";
+    const action = recovered
+      ? "系统已解除本层告警并继续按 delivery_id 对账"
+      : "系统继续按 delivery_id 对账，请检查对端路由或对话；不要按跨账号 message_seq 猜测状态";
+    return [
+      "[Codex][MESSAGE]",
+      recovered ? "【跨机投递告警已恢复】" : "【跨机投递严重告警】",
+      `task：${delivery.taskId}`,
+      `delivery：${delivery.deliveryId}`,
+      `缺失层级：${missingLayer}`,
+      `影响：${impact}`,
+      `是否执行：${execution}`,
+      `处置：${action}`,
+      `时间：${new Date(now()).toISOString()}`,
+    ].join("\n");
+  }
+
+  async function sendDeliveryAlert(delivery, layer, recovered) {
+    const suffix = recovered ? "recovered" : "missing";
+    const sent = await notifier.sendControlGroupMessage({
+      event: recovered ? "delivery_recovery" : "delivery_incident",
+      task_id: "control-plane",
+      dedupe_key: `delivery-${suffix}:${layer}:${delivery.deliveryId}`,
+      message: deliveryAlertMessage(delivery, layer, recovered),
+    });
+    if (sent.sent === true || sent.duplicateSuppressed === true) {
+      return state.updateDeliveryIncident({
+        deliveryId: delivery.deliveryId,
+        layer,
+        phase: recovered ? "resolved" : "alerted",
+        now: now(),
+      });
+    }
+    return null;
+  }
+
+  async function reconcileOutgoingDeliveries() {
+    const currentTime = new Date(now()).getTime();
+    const results = [];
+    for (const delivery of state.listDeliveries()) {
+      if (!delivery.sentAt) continue;
+      const sentAt = Date.parse(delivery.sentAt);
+      const machineMissing = delivery.machineReceivedAt === null;
+      if (machineMissing && delivery.machineIncidentAlertedAt === null
+        && currentTime - sentAt >= machineReceiptAlertMs) {
+        try {
+          await sendDeliveryAlert(delivery, "machine_received", false);
+          results.push({ deliveryId: delivery.deliveryId, outcome: "machine_incident_alerted" });
+        } catch (error) {
+          results.push({ deliveryId: delivery.deliveryId, outcome: "machine_incident_alert_failed", error: publicError(error) });
+        }
+      } else if (!machineMissing && delivery.machineIncidentAlertedAt !== null
+        && delivery.machineIncidentResolvedAt === null) {
+        try {
+          await sendDeliveryAlert(delivery, "machine_received", true);
+          results.push({ deliveryId: delivery.deliveryId, outcome: "machine_incident_resolved" });
+        } catch (error) {
+          results.push({ deliveryId: delivery.deliveryId, outcome: "machine_incident_recovery_failed", error: publicError(error) });
+        }
+      }
+      const conversationBase = Date.parse(delivery.machineReceivedAt ?? delivery.sentAt);
+      const conversationMissing = delivery.conversationReceivedAt === null;
+      if (!machineMissing && conversationMissing && delivery.conversationIncidentAlertedAt === null
+        && currentTime - conversationBase >= conversationReceiptAlertMs) {
+        try {
+          await sendDeliveryAlert(delivery, "conversation_received", false);
+          results.push({ deliveryId: delivery.deliveryId, outcome: "conversation_incident_alerted" });
+        } catch (error) {
+          results.push({ deliveryId: delivery.deliveryId, outcome: "conversation_incident_alert_failed", error: publicError(error) });
+        }
+      } else if (!conversationMissing && delivery.conversationIncidentAlertedAt !== null
+        && delivery.conversationIncidentResolvedAt === null) {
+        try {
+          await sendDeliveryAlert(delivery, "conversation_received", true);
+          results.push({ deliveryId: delivery.deliveryId, outcome: "conversation_incident_resolved" });
+        } catch (error) {
+          results.push({ deliveryId: delivery.deliveryId, outcome: "conversation_incident_recovery_failed", error: publicError(error) });
+        }
+      }
+    }
+    return { checkedAt: new Date(currentTime).toISOString(), results };
   }
 
   async function acknowledgeBusinessMessages(messages, stage) {
@@ -581,6 +701,7 @@ export function createControlPlane(options = {}) {
     trackOutgoingDelivery,
     getDeliveryStatus: (deliveryId) => state.getDelivery(deliveryId),
     listDeliveryStatuses: () => state.listDeliveries(),
+    reconcileOutgoingDeliveries,
     sendConnectionRequest,
     registerOwnerRoute,
     closeOwnerRoute,
