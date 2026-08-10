@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from ops.release_probe import parse_arguments
 from wechat_docs_mcp.ledger import EventLedger
 
 
@@ -40,6 +41,13 @@ def run_process(
 
 
 class ReleaseProbeTests(unittest.TestCase):
+    def test_base64_arguments_preserve_json_property_names(self) -> None:
+        encoded = "eyJ0aW1lb3V0Ijo2NS4wLCJmb3JjZV9yZWZyZXNoIjp0cnVlfQ=="
+        self.assertEqual(
+            {"timeout": 65.0, "force_refresh": True},
+            parse_arguments("{}", encoded),
+        )
+
     def test_fixture_and_read_only_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             ledger = Path(temporary_directory) / "含 # 与 % 字符" / "events.sqlite3"

@@ -173,7 +173,8 @@ function Invoke-McpTool {
   if ($Mode -eq "Http") {
     $EffectiveTimeout = $(if ($CallTimeoutSeconds -gt 0) { $CallTimeoutSeconds } else { $TimeoutSeconds })
     $ArgumentsJson = $Arguments | ConvertTo-Json -Depth 20 -Compress
-    $Raw = & $PythonPath $ProbeScript mcp-call --url "$BrokerBaseUrl/$Endpoint/mcp" --name $ToolName --arguments-json $ArgumentsJson --timeout $EffectiveTimeout
+    $ArgumentsBase64 = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($ArgumentsJson))
+    $Raw = & $PythonPath $ProbeScript mcp-call --url "$BrokerBaseUrl/$Endpoint/mcp" --name $ToolName --arguments-base64 $ArgumentsBase64 --timeout $EffectiveTimeout
     if ($LASTEXITCODE -ne 0) { throw "MCP tool call failed: $ToolName (exit $LASTEXITCODE)" }
     $Envelope = ($Raw -join "`n") | ConvertFrom-Json
     if ($Envelope.is_error -eq $true) { throw "MCP tool returned an error: $ToolName" }

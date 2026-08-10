@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import sqlite3
@@ -219,6 +220,16 @@ async def call_mcp_tool(url: str, name: str, arguments: dict[str, Any], timeout:
     }
 
 
+def parse_arguments(argument_json: str, argument_base64: str) -> dict[str, Any]:
+    raw = argument_json
+    if argument_base64:
+        raw = base64.b64decode(argument_base64, validate=True).decode("utf-8")
+    arguments = json.loads(raw)
+    if not isinstance(arguments, dict):
+        raise TypeError("MCP tool arguments must be a JSON object")
+    return arguments
+
+
 def create_fixture(path: Path, route_id: str) -> dict[str, int]:
     if path.exists():
         raise FileExistsError(f"fixture ledger already exists: {path}")
@@ -294,6 +305,7 @@ def main() -> int:
     call_parser.add_argument("--url", required=True)
     call_parser.add_argument("--name", required=True)
     call_parser.add_argument("--arguments-json", default="{}")
+    call_parser.add_argument("--arguments-base64", default="")
     call_parser.add_argument("--timeout", type=float, default=30.0)
 
     args = parser.parse_args()
@@ -308,9 +320,7 @@ def main() -> int:
     elif args.action == "restore-ledger":
         result = restore_ledger(args.source, args.destination)
     else:
-        arguments = json.loads(args.arguments_json)
-        if not isinstance(arguments, dict):
-            raise TypeError("MCP tool arguments must be a JSON object")
+        arguments = parse_arguments(args.arguments_json, args.arguments_base64)
         result = asyncio.run(call_mcp_tool(args.url, args.name, arguments, args.timeout))
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
