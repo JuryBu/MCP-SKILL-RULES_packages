@@ -11,10 +11,33 @@ param(
 
 $ErrorActionPreference = "Stop"
 $PackageRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
-if ([string]::IsNullOrWhiteSpace($BrokerRoot)) { $BrokerRoot = Join-Path $CodexHome "mcp-http-broker" }
+
+function Resolve-BrokerRoot {
+  param([string]$ConfiguredBrokerRoot, [string]$ConfiguredCodexHome)
+  if (-not [string]::IsNullOrWhiteSpace($ConfiguredBrokerRoot)) {
+    return [System.IO.Path]::GetFullPath($ConfiguredBrokerRoot)
+  }
+  $ServiceManifestPath = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)) {
+    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
+  } else {
+    Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+  }
+  if (Test-Path -LiteralPath $ServiceManifestPath -PathType Leaf) {
+    try {
+      $ManifestBrokerScript = [string](Get-Content -LiteralPath $ServiceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json).broker.brokerScript
+      if (-not [string]::IsNullOrWhiteSpace($ManifestBrokerScript) -and (Test-Path -LiteralPath $ManifestBrokerScript -PathType Leaf)) {
+        return [System.IO.Path]::GetFullPath((Split-Path -Parent $ManifestBrokerScript))
+      }
+    } catch {
+      throw "Managed broker service manifest could not be read: $ServiceManifestPath"
+    }
+  }
+  return Join-Path $ConfiguredCodexHome "mcp-http-broker"
+}
+
+$BrokerRoot = Resolve-BrokerRoot -ConfiguredBrokerRoot $BrokerRoot -ConfiguredCodexHome $CodexHome
 if ([string]::IsNullOrWhiteSpace($CodeRoot)) { $CodeRoot = Join-Path $CodexHome "services\napcat-bridge\current" }
 
-$BrokerRoot = [System.IO.Path]::GetFullPath($BrokerRoot)
 $CodeRoot = [System.IO.Path]::GetFullPath($CodeRoot)
 $NapCatSource = Join-Path $PackageRoot "napcat-mcp"
 $BrokerSourceRoot = Join-Path $PackageRoot "broker"

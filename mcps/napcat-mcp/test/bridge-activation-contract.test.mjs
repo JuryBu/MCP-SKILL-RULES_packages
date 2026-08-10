@@ -234,6 +234,8 @@ test("portable package entrypoint leaves live services untouched before guarded 
   assert.match(script, /service-manifest\.json/);
   assert.doesNotMatch(script, /Get-Command node -ErrorAction Stop/);
   assert.match(script, /NodeExecutable = \$Node/);
+  assert.match(script, /function Resolve-BrokerRoot/);
+  assert.match(script, /broker\.brokerScript/);
 });
 
 test("portable upgrade staging keeps its package entrypoint and uses built-in SHA256", () => {
@@ -266,7 +268,7 @@ test("candidate npm validation finishes before maintenance or router quiescence"
   assert.doesNotMatch(read("ops/rollback-codex-napcat-bridge.ps1"), /& npm\b/);
 });
 
-test("portable package entrypoint really leaves the watchdog and broker untouched when candidate validation fails", { skip: process.platform !== "win32" }, (t) => {
+test("portable package entrypoint resolves the managed broker root and leaves it untouched when validation fails", { skip: process.platform !== "win32" }, (t) => {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-package-entrypoint-"));
   t.after(() => fs.rmSync(fixtureRoot, { recursive: true, force: true }));
   const packageRoot = path.join(fixtureRoot, "package");
@@ -281,7 +283,7 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   fs.mkdirSync(codexHome, { recursive: true });
   write(
     path.join(fixtureRoot, ".codex-toolkit", "services", "infrastructure", "service-manifest.json"),
-    JSON.stringify({ broker: { nodeExe: process.execPath } }),
+    JSON.stringify({ broker: { nodeExe: process.execPath, brokerScript: path.join(brokerRoot, "broker.mjs") } }),
   );
   fs.copyFileSync(
     path.resolve("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
@@ -311,7 +313,7 @@ test("portable package entrypoint really leaves the watchdog and broker untouche
   );
   const result = runPowerShell(
     path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
-    ["-CodexHome", codexHome, "-BrokerRoot", brokerRoot, "-CodeRoot", codeRoot, "-DataRoot", dataRoot],
+    ["-CodexHome", codexHome, "-CodeRoot", codeRoot, "-DataRoot", dataRoot],
     {
       USERPROFILE: fixtureRoot,
       CODEX_TOOLKIT_NODE_EXE: "",
