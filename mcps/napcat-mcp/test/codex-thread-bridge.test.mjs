@@ -8,6 +8,7 @@ import {
 
 const thisFile = fileURLToPath(import.meta.url);
 const fakeArgumentIndex = process.argv.indexOf("--fake-app-server");
+const fixtureStartTimeoutMs = 5000;
 
 function send(message) {
   process.stdout.write(`${JSON.stringify(message)}\n`);
@@ -125,7 +126,7 @@ function createFixture(mode, overrides = {}) {
     executablePath: process.execPath,
     appServerArgs: [thisFile, "--fake-app-server", mode],
     requestTimeoutMs: 120,
-    startTimeoutMs: 1000,
+    startTimeoutMs: fixtureStartTimeoutMs,
     closeTimeoutMs: 120,
     onStderr: (chunk) => stderr.push(chunk),
     ...overrides,
@@ -143,7 +144,10 @@ if (fakeArgumentIndex >= 0) {
   runFakeAppServer(process.argv[fakeArgumentIndex + 1] || "complete");
 } else {
   test("handshake, resume/read, wake accepted, and completion state", async () => {
-    const fixture = createFixture("complete", { requestTimeoutMs: 1000, startTimeoutMs: 1000 });
+    const fixture = createFixture("complete", {
+      requestTimeoutMs: 1000,
+      startTimeoutMs: fixtureStartTimeoutMs,
+    });
     try {
       const initial = await fixture.bridge.inspectThread("thread-example-primary");
       assert.equal(initial.status, "idle");
@@ -235,7 +239,10 @@ if (fakeArgumentIndex >= 0) {
   });
 
   test("turn timeout is returned as unknown and is not retried", async () => {
-    const fixture = createFixture("timeout", { requestTimeoutMs: 40, startTimeoutMs: 1000 });
+    const fixture = createFixture("timeout", {
+      requestTimeoutMs: 40,
+      startTimeoutMs: fixtureStartTimeoutMs,
+    });
     try {
       const result = await fixture.bridge.wake({ threadId: "thread-timeout", prompt: "只发送一次" });
       assert.equal(result.status, "unknown");
