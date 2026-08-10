@@ -73,6 +73,7 @@ def classify_tool(tool: dict[str, Any]) -> str:
     if annotations.get("readOnlyHint") is True:
         return "read_only"
     name = str(tool.get("name", "")).casefold()
-    if name.startswith(READ_ONLY_PREFIXES):
+    action = name.rsplit(".", 1)[-1]
+    if name.startswith(READ_ONLY_PREFIXES) or action.startswith(READ_ONLY_PREFIXES):
         return "read_only"
     return "approval_required"

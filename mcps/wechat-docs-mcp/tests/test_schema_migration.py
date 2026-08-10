@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
+
+from wechat_docs_mcp import schema
 from wechat_docs_mcp.ledger import EventLedger
 
 
@@ -49,7 +53,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
     database = tmp_path / "events.sqlite3"
     _create_v1_database(database)
     ledger = EventLedger(database)
-    assert ledger.schema_info()["schema_version"] == 2
+    assert ledger.schema_info()["schema_version"] == 3
     assert ledger.migration["migrated"] is True
     backup = Path(ledger.migration["backup_path"])
     assert backup.is_file()
@@ -86,7 +90,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
         connection.close()
     reopened = EventLedger(database)
     assert reopened.migration == {
-        "schema_version": 2,
+        "schema_version": 3,
         "backup_path": None,
         "migrated": False,
     }
@@ -142,3 +146,81 @@ def test_incomplete_v2_adds_single_use_verification_table_with_backup(tmp_path: 
         assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         connection.close()
+
+
+def test_v2_to_v3_preserves_existing_rows_and_creates_v2_backup(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    ledger = EventLedger(database)
+    ledger.register_route("route-preserved", identity={"chat_name": "synthetic"}, state="active")
+    connection = sqlite3.connect(database)
+    try:
+        for table in (
+            "tdocs_subscription_wakes",
+            "tdocs_batch_deliveries",
+            "tdocs_monitor_changes",
+            "tdocs_monitor_batches",
+            "tdocs_monitor_subscriptions",
+            "tdocs_monitors",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute(
+            "UPDATE schema_meta SET value='2' WHERE key='schema_version'"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    migrated = EventLedger(database)
+    backup = Path(migrated.migration["backup_path"])
+
+    assert migrated.schema_info()["schema_version"] == 3
+    assert migrated.get_route("route-preserved")["route_id"] == "route-preserved"
+    assert ".v2-backup." in backup.name
+    assert backup.is_file()
+
+
+def test_v2_to_v3_failure_rolls_back_partial_schema_and_keeps_backup(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    ledger = EventLedger(database)
+    ledger.register_route("route-preserved", identity={"chat_name": "synthetic"}, state="active")
+    connection = sqlite3.connect(database)
+    try:
+        for table in (
+            "tdocs_subscription_wakes",
+            "tdocs_batch_deliveries",
+            "tdocs_monitor_changes",
+            "tdocs_monitor_batches",
+            "tdocs_monitor_subscriptions",
+            "tdocs_monitors",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.execute("UPDATE schema_meta SET value='2' WHERE key='schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    original_create = schema._create_v3_tables
+
+    def fail_after_create(connection: sqlite3.Connection) -> None:
+        original_create(connection)
+        raise RuntimeError("synthetic migration failure")
+
+    with patch.object(schema, "_create_v3_tables", side_effect=fail_after_create):
+        with pytest.raises(RuntimeError, match="synthetic migration failure"):
+            schema.ensure_schema(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "tdocs_monitors" not in tables
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "2"
+        assert connection.execute("SELECT COUNT(*) FROM routes").fetchone()[0] == 1
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+    backups = list(tmp_path.glob("events.v2-backup.*.sqlite3"))
+    assert len(backups) == 1

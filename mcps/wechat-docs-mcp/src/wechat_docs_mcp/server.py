@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import threading
@@ -14,11 +15,13 @@ from .attachments import AttachmentRegistry
 from .db_observer import RouteBinding
 from .db_watcher import DbWatcher
 from .document_changes import DocumentChangeCoalescer
+from .document_monitor import DocumentMonitorStore, TencentDocsMonitorService
+from .document_policy import PrivateBindingDocumentMonitorVerifier
 from .ledger import EventLedger, LedgerError
 from .outbound import SafeTextOutbound
 from .route_verifier import PrivateBindingRouteVerifier
 from .tencent_docs import TencentDocsMcpClient, classify_tool
-from .wake_notifier import CodexWakeNotifier
+from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
 
 
 DATA_ROOT = Path(os.environ.get("WECHAT_DOCS_MCP_DATA_ROOT", Path.home() / ".codex-toolkit" / "wechat-docs-mcp"))
@@ -72,11 +75,27 @@ def document_change_coalescer() -> DocumentChangeCoalescer:
     return DocumentChangeCoalescer(ledger())
 
 
+def document_monitor_store() -> DocumentMonitorStore:
+    return DocumentMonitorStore(ledger())
+
+
+def document_monitor_service() -> TencentDocsMonitorService:
+    return TencentDocsMonitorService(
+        document_monitor_store(),
+        docs_client(),
+        PrivateBindingDocumentMonitorVerifier(_load_binding_document()),
+    )
+
+
 _poll_control_lock = threading.RLock()
+_tdocs_poll_control_lock = threading.RLock()
 _watcher: DbWatcher | None = None
 _wake_notifier: CodexWakeNotifier | None = None
+_tdocs_wake_notifier: TencentDocsWakeNotifier | None = None
 _wake_last_error: str | None = None
 _wake_last_attempt_time: str | None = None
+_tdocs_wake_last_error: str | None = None
+_tdocs_wake_last_attempt_time: str | None = None
 
 
 def _load_binding_document() -> dict[str, Any]:
@@ -148,6 +167,24 @@ def wake_notifier() -> CodexWakeNotifier | None:
         return _wake_notifier
 
 
+def tdocs_wake_notifier() -> TencentDocsWakeNotifier | None:
+    global _tdocs_wake_notifier
+    with _tdocs_poll_control_lock:
+        if _tdocs_wake_notifier is not None:
+            return _tdocs_wake_notifier
+        if not WAKE_ENABLED or WAKE_RUNTIME_FILE is None or WAKE_TOKEN_FILE is None:
+            return None
+        _tdocs_wake_notifier = TencentDocsWakeNotifier(
+            document_monitor_store(),
+            WAKE_RUNTIME_FILE,
+            WAKE_TOKEN_FILE,
+            os.environ.get("WECHAT_DOCS_MCP_SOURCE_MACHINE", "local"),
+            os.environ.get("WECHAT_DOCS_MCP_TARGET_MACHINE", "local"),
+            retry_interval_seconds=float(os.environ.get("WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS", "30")),
+        )
+        return _tdocs_wake_notifier
+
+
 def _submit_pending_wakes() -> dict[str, Any]:
     global _wake_last_error, _wake_last_attempt_time
     notifier = wake_notifier()
@@ -170,6 +207,28 @@ def _submit_pending_wakes() -> dict[str, Any]:
         }
 
 
+def _submit_pending_tdocs_wakes() -> dict[str, Any]:
+    global _tdocs_wake_last_error, _tdocs_wake_last_attempt_time
+    notifier = tdocs_wake_notifier()
+    if notifier is None:
+        return {"enabled": False, "candidate_count": 0, "submitted_count": 0}
+    _tdocs_wake_last_attempt_time = utc_now_iso()
+    try:
+        result = notifier.submit_pending()
+        with _tdocs_poll_control_lock:
+            _tdocs_wake_last_error = None if not result["errors"] else result["errors"][0]["code"]
+        return {"enabled": True, **result}
+    except Exception as error:
+        with _tdocs_poll_control_lock:
+            _tdocs_wake_last_error = type(error).__name__
+        return {
+            "enabled": True,
+            "candidate_count": 0,
+            "submitted_count": 0,
+            "errors": [{"code": type(error).__name__}],
+        }
+
+
 @mcp.tool()
 def wechat_status() -> dict[str, Any]:
     """Return private bridge readiness without exposing account names, routes, messages, or tokens."""
@@ -178,7 +237,14 @@ def wechat_status() -> dict[str, Any]:
     event_ledger = ledger()
     w = watcher()
     notifier = wake_notifier()
+    docs_notifier = tdocs_wake_notifier()
     notifier_status = notifier.readiness() if notifier is not None else {"ready": False, "error_code": None}
+    docs_notifier_status = (
+        docs_notifier.readiness()
+        if docs_notifier is not None
+        else {"ready": False, "error_code": None}
+    )
+    docs_health = document_monitor_store().health()
     with _poll_control_lock:
         background_polling = _poll_thread is not None and _poll_thread.is_alive()
         poll_last_error = _poll_last_error
@@ -186,6 +252,13 @@ def wechat_status() -> dict[str, Any]:
         poll_consecutive_failures = _poll_consecutive_failures
         wake_last_error = _wake_last_error
         wake_last_attempt_time = _wake_last_attempt_time
+    with _tdocs_poll_control_lock:
+        tdocs_background_polling = _tdocs_poll_thread is not None and _tdocs_poll_thread.is_alive()
+        tdocs_poll_last_error = _tdocs_poll_last_error
+        tdocs_poll_last_error_time = _tdocs_poll_last_error_time
+        tdocs_poll_consecutive_failures = _tdocs_poll_consecutive_failures
+        tdocs_wake_last_error = _tdocs_wake_last_error
+        tdocs_wake_last_attempt_time = _tdocs_wake_last_attempt_time
     return {
         "data_root_ready": DATA_ROOT.is_dir(),
         "ledger_ready": (DATA_ROOT / "state" / "events.sqlite3").exists(),
@@ -203,6 +276,16 @@ def wechat_status() -> dict[str, Any]:
         "wake_notifier_ready": notifier_status["ready"],
         "wake_notifier_error": wake_last_error or notifier_status["error_code"],
         "wake_last_attempt_time": wake_last_attempt_time,
+        "tdocs_monitoring": {
+            **docs_health,
+            "background_polling": tdocs_background_polling,
+            "poll_last_error": tdocs_poll_last_error,
+            "poll_last_error_time": tdocs_poll_last_error_time,
+            "poll_consecutive_failures": tdocs_poll_consecutive_failures,
+            "wake_notifier_ready": docs_notifier_status["ready"],
+            "wake_notifier_error": tdocs_wake_last_error or docs_notifier_status["error_code"],
+            "wake_last_attempt_time": tdocs_wake_last_attempt_time,
+        },
         "outbound_enabled": OUTBOUND_ENABLED,
         "wxautox4_runtime": "not_verified",
         "napcat_runtime_modified": False,
@@ -527,6 +610,167 @@ def tdocs_change_batch_mark_emitted(batch_id: str) -> dict[str, Any]:
 
 
 @mcp.tool()
+async def tdocs_monitor_create(
+    resource_kind: str,
+    resource_key: str,
+    poll_tool: str,
+    poll_arguments: dict[str, Any],
+    policy_ref: str,
+    monitor_id: str = "",
+) -> dict[str, Any]:
+    """Enroll one private allowlisted Tencent Docs resource after a successful read-only baseline."""
+    return await document_monitor_service().create_monitor(
+        resource_kind,
+        resource_key,
+        poll_tool,
+        poll_arguments,
+        policy_ref,
+        monitor_id=monitor_id or None,
+    )
+
+
+@mcp.tool()
+def tdocs_monitors_list(state: str = "") -> list[dict[str, Any]]:
+    """List monitor metadata without returning resource IDs, titles, poll arguments, or content."""
+    return document_monitor_store().list_monitors(state)
+
+
+@mcp.tool()
+def tdocs_monitor_set_state(monitor_id: str, state: str) -> dict[str, Any]:
+    """Activate, pause, or close one document monitor without changing the remote document."""
+    return document_monitor_store().set_monitor_state(monitor_id, state)
+
+
+@mcp.tool()
+def tdocs_monitor_subscription_create(
+    monitor_id: str,
+    conversation_id: str,
+    generation: int,
+    subscription_id: str = "",
+    listen_capability: bool = True,
+    policy_ref: str = "",
+) -> dict[str, Any]:
+    """Create one monitor/conversation/generation session at the current batch baseline."""
+    return document_monitor_store().register_subscription(
+        monitor_id,
+        conversation_id,
+        generation,
+        subscription_id=subscription_id or None,
+        listen_capability=listen_capability,
+        policy_ref=policy_ref or None,
+    )
+
+
+@mcp.tool()
+def tdocs_monitor_subscriptions_list(
+    monitor_id: str = "",
+    conversation_id: str = "",
+    state: str = "",
+) -> list[dict[str, Any]]:
+    """List document-monitor subscriptions without returning document content or resource IDs."""
+    return document_monitor_store().list_subscriptions(
+        monitor_id=monitor_id,
+        conversation_id=conversation_id,
+        state=state,
+    )
+
+
+@mcp.tool()
+def tdocs_monitor_subscription_set_state(
+    subscription_id: str,
+    generation: int,
+    state: str,
+) -> dict[str, Any]:
+    """Independently activate, pause, or close one document-monitor subscription."""
+    return document_monitor_store().set_subscription_state(subscription_id, generation, state)
+
+
+@mcp.tool()
+async def tdocs_monitor_poll(monitor_id: str = "") -> dict[str, Any]:
+    """Run one read-only official MCP poll; failures and incomplete reads do not advance baseline."""
+    service = document_monitor_service()
+    result = await service.poll_one(monitor_id) if monitor_id else await service.poll_all()
+    return {**result, "wake_submit": _submit_pending_tdocs_wakes()}
+
+
+@mcp.tool()
+def tdocs_monitor_pending_batches(
+    subscription_id: str,
+    limit: int = 50,
+) -> list[dict[str, Any]]:
+    """List merged pending batch summaries for one subscription; document bodies are not included."""
+    return document_monitor_store().list_pending(subscription_id, limit)
+
+
+@mcp.tool()
+def tdocs_monitor_wake_info(subscription_id: str) -> dict[str, Any]:
+    """Return the active merged wake needed for precise document batch ACK."""
+    wake = document_monitor_store().get_active_wake(subscription_id)
+    if wake is None:
+        return {
+            "subscription_id": subscription_id,
+            "wake_id": None,
+            "generation": None,
+            "state": None,
+        }
+    return {
+        "subscription_id": subscription_id,
+        "wake_id": wake["wake_id"],
+        "generation": wake["generation"],
+        "state": wake["state"],
+        "created_at": wake["created_at"],
+    }
+
+
+@mcp.tool()
+def tdocs_monitor_batches_ack(
+    subscription_id: str,
+    generation: int,
+    wake_id: str,
+    batch_ids: list[str],
+) -> dict[str, Any]:
+    """ACK only named batch deliveries for one subscription; other subscriptions remain pending."""
+    return document_monitor_store().ack(subscription_id, generation, wake_id, batch_ids)
+
+
+@mcp.tool()
+def tdocs_monitor_health() -> dict[str, Any]:
+    """Return monitor, subscription, pending, wake, and failure counts without private identifiers."""
+    return document_monitor_store().health()
+
+
+@mcp.tool()
+async def tdocs_monitor_capabilities() -> dict[str, Any]:
+    """Dynamically report the official tools relevant to read-only change detection."""
+    catalog = await docs_client().tool_catalog()
+    relevant = [
+        tool["name"]
+        for tool in catalog
+        if tool.get("name")
+        in {
+            "manage.query_file_info",
+            "get_content",
+            "smartsheet.list_tables",
+            "smartsheet.list_views",
+            "smartsheet.list_records",
+        }
+    ]
+    policy_summary = PrivateBindingDocumentMonitorVerifier(_load_binding_document()).summary()
+    return {
+        "official_tool_count": len(catalog),
+        "read_only_monitor_tools": sorted(relevant),
+        "collection_specific_tool_discovered": any(
+            "collect" in str(tool.get("name", "")).casefold()
+            or "收集" in str(tool.get("description", ""))
+            for tool in catalog
+        ),
+        "quiet_window_seconds": 300,
+        "max_batch_seconds": 900,
+        **policy_summary,
+    }
+
+
+@mcp.tool()
 async def tdocs_list_spaces() -> dict[str, Any]:
     """List spaces visible to the private official Tencent Docs MCP token."""
     return await docs_client().call_tool("query_space_list", {})
@@ -627,6 +871,101 @@ async def tdocs_official_call(
             )
             event_ledger.mark_draft_state(draft_id, "SEND_ATTEMPTED", "VERIFIED")
     return response
+
+
+_tdocs_poll_thread: threading.Thread | None = None
+_tdocs_poll_stop: threading.Event | None = None
+_tdocs_poll_interval = 60.0
+_tdocs_poll_last_error: str | None = None
+_tdocs_poll_last_error_time: str | None = None
+_tdocs_poll_consecutive_failures = 0
+
+
+def _tdocs_poll_loop(stop_event: threading.Event, interval: float) -> None:
+    global _tdocs_poll_thread, _tdocs_poll_stop
+    global _tdocs_poll_last_error, _tdocs_poll_last_error_time, _tdocs_poll_consecutive_failures
+    try:
+        while not stop_event.is_set():
+            try:
+                result = asyncio.run(document_monitor_service().poll_all())
+                _submit_pending_tdocs_wakes()
+                with _tdocs_poll_control_lock:
+                    if result["failed"]:
+                        _tdocs_poll_last_error = "DOCUMENT_MONITOR_POLL_FAILED"
+                        _tdocs_poll_last_error_time = utc_now_iso()
+                        _tdocs_poll_consecutive_failures += 1
+                    else:
+                        _tdocs_poll_last_error = None
+                        _tdocs_poll_consecutive_failures = 0
+            except Exception as error:
+                with _tdocs_poll_control_lock:
+                    _tdocs_poll_last_error = type(error).__name__
+                    _tdocs_poll_last_error_time = utc_now_iso()
+                    _tdocs_poll_consecutive_failures += 1
+            stop_event.wait(interval)
+    finally:
+        with _tdocs_poll_control_lock:
+            if _tdocs_poll_thread is threading.current_thread():
+                _tdocs_poll_thread = None
+                if _tdocs_poll_stop is stop_event:
+                    _tdocs_poll_stop = None
+
+
+@mcp.tool()
+def tdocs_monitor_poll_start(interval: float = 60.0) -> dict[str, Any]:
+    """Start the optional background read-only Tencent Docs monitor loop."""
+    global _tdocs_poll_thread, _tdocs_poll_stop, _tdocs_poll_interval
+    with _tdocs_poll_control_lock:
+        if _tdocs_poll_thread is not None and _tdocs_poll_thread.is_alive():
+            return {"status": "already_running", "interval": _tdocs_poll_interval}
+        if not TOKEN_FILE.is_file() or TOKEN_FILE.stat().st_size == 0:
+            return {"status": "error", "error": "TENCENT_DOCS_TOKEN_NOT_READY"}
+        stop_event = threading.Event()
+        poll_interval = max(15.0, interval)
+        poll_thread = threading.Thread(
+            target=_tdocs_poll_loop,
+            args=(stop_event, poll_interval),
+            daemon=True,
+            name="wechat-docs-tdocs-poll",
+        )
+        _tdocs_poll_stop = stop_event
+        _tdocs_poll_interval = poll_interval
+        _tdocs_poll_thread = poll_thread
+        try:
+            poll_thread.start()
+        except Exception:
+            if _tdocs_poll_thread is poll_thread:
+                _tdocs_poll_thread = None
+            if _tdocs_poll_stop is stop_event:
+                _tdocs_poll_stop = None
+            raise
+        return {"status": "started", "interval": _tdocs_poll_interval}
+
+
+@mcp.tool()
+def tdocs_monitor_poll_stop(timeout: float = 35.0) -> dict[str, Any]:
+    """Stop the document monitor loop without stopping WeChat polling or the MCP process."""
+    global _tdocs_poll_thread, _tdocs_poll_stop
+    with _tdocs_poll_control_lock:
+        poll_thread = _tdocs_poll_thread
+        stop_event = _tdocs_poll_stop
+        if poll_thread is None or not poll_thread.is_alive():
+            if _tdocs_poll_thread is poll_thread:
+                _tdocs_poll_thread = None
+            if _tdocs_poll_stop is stop_event:
+                _tdocs_poll_stop = None
+            return {"status": "not_running"}
+        if stop_event is not None:
+            stop_event.set()
+    poll_thread.join(timeout=max(0.0, timeout))
+    with _tdocs_poll_control_lock:
+        if poll_thread.is_alive():
+            return {"status": "stopping", "alive": True}
+        if _tdocs_poll_thread is poll_thread:
+            _tdocs_poll_thread = None
+        if _tdocs_poll_stop is stop_event:
+            _tdocs_poll_stop = None
+        return {"status": "stopped"}
 
 
 _poll_thread: threading.Thread | None = None
@@ -761,15 +1100,26 @@ def wechat_poll_stop(timeout: float = 70.0) -> dict[str, Any]:
 def main() -> None:
     ledger().recover_expired_executions()
     auto_poll = os.environ.get("WECHAT_DOCS_MCP_AUTO_POLL", "0") == "1"
+    auto_tdocs_poll = os.environ.get("WECHAT_DOCS_MCP_TDOCS_AUTO_POLL", "0") == "1"
     if auto_poll:
         result = wechat_poll_start(float(os.environ.get("WECHAT_DOCS_MCP_POLL_INTERVAL", "5")))
         if result["status"] == "error":
+            raise RuntimeError(result["error"])
+    if auto_tdocs_poll:
+        result = tdocs_monitor_poll_start(
+            float(os.environ.get("WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL", "60"))
+        )
+        if result["status"] == "error":
+            if auto_poll:
+                wechat_poll_stop()
             raise RuntimeError(result["error"])
     try:
         mcp.run(transport="stdio")
     except LedgerError as error:
         raise RuntimeError(f"{error.code}: {error}") from error
     finally:
+        if auto_tdocs_poll:
+            tdocs_monitor_poll_stop()
         if auto_poll:
             wechat_poll_stop()
 

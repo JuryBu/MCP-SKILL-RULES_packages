@@ -21,6 +21,8 @@
 | `WECHAT_KEY_TOOL` | `<data_root>/private-state/tools/wcdb_key_tool_windows.py` | 密钥提取工具路径 |
 | `TENCENT_DOCS_MCP_TOKEN_FILE` | `<data_root>/secrets/tencent-docs-mcp.token` | 腾讯文档 Token 文件 |
 | `WECHAT_DOCS_MCP_AUTO_POLL` | `0` | MCP 进程启动时自动开启后台轮询 |
+| `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
+| `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
 | `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 微信真实发送总开关；当前无正式 UI backend，保持关闭 |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `<data_root>/intake` | 按需下载附件的允许根目录 |
@@ -52,9 +54,9 @@
 
 ### 2.3 binding.json 格式
 
-使用 `binding.example.json` 的 schema v2 模板。route 只保存精确微信会话身份和本机 outbound capability；conversation 放在独立 `subscriptions` 数组中。一个 route 可出现于多个 subscription，一个 conversation 也可订阅多个 route。
+使用 `binding.example.json` 的 schema v2 模板。route 只保存精确微信会话身份和本机 outbound capability；conversation 放在独立 `subscriptions` 数组中。一个 route 可出现于多个 subscription，一个 conversation 也可订阅多个 route。`tencentDocs.monitors` 是独立的文档监视 allowlist，不复用微信 route 身份表。
 
-公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 全关闭。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 时必须同时提供非空 `policy_ref`，真实授权消息引用另存于私有授权链，不得提交。
+公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 全关闭，示例文档策略也为 `paused/listen=false`。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 时必须同时提供非空 `policy_ref`，真实授权消息引用另存于私有授权链，不得提交。
 
 ## 3. 安装
 
@@ -107,6 +109,16 @@ wechat_poll_stop(timeout=70.0)
 - **不能**再次 `wechat_poll_start`（会返回 `already_running`）
 - 再次调用 `wechat_poll_stop` 重试等待
 
+腾讯文档监视使用独立控制线程，不会启动、停止或重置微信 watcher：
+
+```python
+tdocs_monitor_poll()                  # 手动轮询全部 active monitor
+tdocs_monitor_poll_start(interval=60)
+tdocs_monitor_poll_stop(timeout=35)
+```
+
+首次调用 `tdocs_monitor_create` 会先把资源、官方工具、参数和 `policy_ref` 与私有 `binding.json/tencentDocs.monitors` 做精确比对，再动态核对官方工具目录和必填字段，最后执行一次只读 baseline。每次后续轮询也会重新核对 allowlist，策略暂停、删除或不一致时不访问官方 MCP，baseline 不推进。正式资源 ID、轮询参数、conversation 与策略引用只保存在私有 binding/SQLite；公开模板仅提供 synthetic 占位值。
+
 ### 4.4 MCP 服务启动
 
 ```powershell
@@ -157,6 +169,7 @@ wechat_status()
 | `wake_notifier_ready` | 代理 runtime、token 与回环地址是否就绪 |
 | `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
 | `wake_last_attempt_time` | 最近一次提交尝试时间 |
+| `tdocs_monitoring` | 文档 monitor/subscription/pending/wake 计数、后台线程、失败次数和文档 wake 状态；不含资源 ID 或正文 |
 | `outbound_enabled` | 微信真实发送总开关；不代表 UI backend 已实现 |
 
 ### 5.1 健康判断
@@ -169,7 +182,7 @@ wechat_status()
 
 ### 6.1 迁移脚本备份
 
-schema v2 自动迁移和 `migrate_baselines.py` 都使用 SQLite 原生 `backup()` API 创建时间戳备份：
+schema 自动迁移和 `migrate_baselines.py` 都使用 SQLite 原生 `backup()` API 创建时间戳备份；备份名记录来源 schema 版本：
 
 ```powershell
 python -m wechat_docs_mcp.migrate_baselines

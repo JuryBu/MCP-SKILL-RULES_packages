@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_SUBSCRIPTION_NAMESPACE = uuid.UUID("0f2926e1-71c8-4b22-92f7-4ef81461bdf8")
 REQUIRED_V2_TABLES = {
     "schema_meta",
@@ -18,6 +18,14 @@ REQUIRED_V2_TABLES = {
     "attachment_transfers",
     "document_change_batches",
     "document_change_items",
+}
+REQUIRED_V3_TABLES = REQUIRED_V2_TABLES | {
+    "tdocs_monitors",
+    "tdocs_monitor_subscriptions",
+    "tdocs_monitor_batches",
+    "tdocs_monitor_changes",
+    "tdocs_batch_deliveries",
+    "tdocs_subscription_wakes",
 }
 
 
@@ -67,7 +75,7 @@ def _is_current_schema(path: Path) -> bool:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if not REQUIRED_V2_TABLES.issubset(tables):
+        if not REQUIRED_V3_TABLES.issubset(tables):
             return False
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
@@ -79,6 +87,24 @@ def _is_current_schema(path: Path) -> bool:
         connection.close()
 
 
+def _detected_schema_version(path: Path) -> int:
+    if not path.exists() or path.stat().st_size == 0:
+        return 0
+    connection = sqlite3.connect(path)
+    try:
+        if _table_exists(connection, "schema_meta"):
+            row = connection.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()
+            if row is not None:
+                return int(row[0])
+        return 1 if _table_exists(connection, "routes") else 0
+    except (sqlite3.DatabaseError, TypeError, ValueError):
+        return 0
+    finally:
+        connection.close()
+
+
 def _backup_legacy_database(path: Path) -> Path | None:
     if not path.exists() or path.stat().st_size == 0:
         return None
@@ -86,11 +112,16 @@ def _backup_legacy_database(path: Path) -> Path | None:
     try:
         if not _table_exists(source, "routes"):
             return None
+        previous_version = _detected_schema_version(path)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup = path.with_name(f"{path.stem}.v1-backup.{timestamp}{path.suffix}")
+        backup = path.with_name(
+            f"{path.stem}.v{previous_version}-backup.{timestamp}{path.suffix}"
+        )
         suffix = 1
         while backup.exists():
-            backup = path.with_name(f"{path.stem}.v1-backup.{timestamp}.{suffix}{path.suffix}")
+            backup = path.with_name(
+                f"{path.stem}.v{previous_version}-backup.{timestamp}.{suffix}{path.suffix}"
+            )
             suffix += 1
         target = sqlite3.connect(backup)
         try:
@@ -308,6 +339,95 @@ def _create_v2_tables(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_v3_tables(connection: sqlite3.Connection) -> None:
+    _execute_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS tdocs_monitors(
+          monitor_id TEXT PRIMARY KEY,
+          provider TEXT NOT NULL,
+          resource_kind TEXT NOT NULL,
+          resource_key_sha256 TEXT NOT NULL,
+          poll_tool TEXT NOT NULL,
+          poll_arguments_json TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('active','paused','closed')),
+          baseline_fingerprint TEXT,
+          baseline_summary_json TEXT,
+          baseline_observed_at TEXT,
+          last_success_at TEXT,
+          last_error_code TEXT,
+          consecutive_failures INTEGER NOT NULL DEFAULT 0,
+          policy_ref TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(provider,resource_kind,resource_key_sha256)
+        );
+        CREATE INDEX IF NOT EXISTS tdocs_monitors_state_idx
+          ON tdocs_monitors(state);
+        CREATE TABLE IF NOT EXISTS tdocs_monitor_subscriptions(
+          subscription_id TEXT PRIMARY KEY,
+          monitor_id TEXT NOT NULL REFERENCES tdocs_monitors(monitor_id),
+          conversation_id TEXT NOT NULL,
+          generation INTEGER NOT NULL CHECK(generation >= 1),
+          state TEXT NOT NULL CHECK(state IN ('active','paused','closed')),
+          baseline_batch_seq INTEGER NOT NULL DEFAULT 0,
+          cursor_batch_seq INTEGER NOT NULL DEFAULT 0,
+          listen_capability INTEGER NOT NULL DEFAULT 1 CHECK(listen_capability IN (0,1)),
+          policy_ref TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          UNIQUE(monitor_id,conversation_id,generation)
+        );
+        CREATE INDEX IF NOT EXISTS tdocs_monitor_subscriptions_state_idx
+          ON tdocs_monitor_subscriptions(monitor_id,state);
+        CREATE TABLE IF NOT EXISTS tdocs_monitor_batches(
+          batch_id TEXT PRIMARY KEY,
+          batch_seq INTEGER NOT NULL UNIQUE,
+          monitor_id TEXT NOT NULL REFERENCES tdocs_monitors(monitor_id),
+          state TEXT NOT NULL CHECK(state IN ('OPEN','READY')),
+          first_observed_at TEXT NOT NULL,
+          last_observed_at TEXT NOT NULL,
+          emit_after TEXT NOT NULL,
+          change_count INTEGER NOT NULL DEFAULT 0,
+          summary_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS tdocs_monitor_one_open_batch
+          ON tdocs_monitor_batches(monitor_id) WHERE state='OPEN';
+        CREATE TABLE IF NOT EXISTS tdocs_monitor_changes(
+          monitor_id TEXT NOT NULL REFERENCES tdocs_monitors(monitor_id),
+          change_fingerprint TEXT NOT NULL,
+          batch_id TEXT NOT NULL REFERENCES tdocs_monitor_batches(batch_id),
+          observed_at TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          PRIMARY KEY(monitor_id,change_fingerprint)
+        );
+        CREATE TABLE IF NOT EXISTS tdocs_batch_deliveries(
+          subscription_id TEXT NOT NULL REFERENCES tdocs_monitor_subscriptions(subscription_id),
+          batch_id TEXT NOT NULL REFERENCES tdocs_monitor_batches(batch_id),
+          state TEXT NOT NULL CHECK(state IN ('PENDING','ACKED')),
+          delivered_at TEXT NOT NULL,
+          acked_at TEXT,
+          PRIMARY KEY(subscription_id,batch_id)
+        );
+        CREATE INDEX IF NOT EXISTS tdocs_batch_deliveries_pending_idx
+          ON tdocs_batch_deliveries(subscription_id,delivered_at) WHERE state='PENDING';
+        CREATE TABLE IF NOT EXISTS tdocs_subscription_wakes(
+          wake_id TEXT PRIMARY KEY,
+          subscription_id TEXT NOT NULL REFERENCES tdocs_monitor_subscriptions(subscription_id),
+          generation INTEGER NOT NULL,
+          created_at TEXT NOT NULL,
+          client_user_message_id TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('prepared','submitted','unknown','closed','failed'))
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS tdocs_subscription_wakes_one_active
+          ON tdocs_subscription_wakes(subscription_id)
+          WHERE state IN ('prepared','submitted','unknown');
+        """,
+    )
+
+
 def legacy_subscription_id(route_id: str, conversation_id: str, generation: int) -> str:
     return str(
         uuid.uuid5(
@@ -458,6 +578,7 @@ def ensure_schema(path: str | Path) -> dict[str, str | int | bool | None]:
         try:
             _create_v1_tables(connection)
             _create_v2_tables(connection)
+            _create_v3_tables(connection)
             _migrate_v1_rows(connection)
             connection.execute(
                 "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "

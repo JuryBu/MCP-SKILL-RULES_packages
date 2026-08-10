@@ -9,7 +9,8 @@
 - 每个 subscription 有独立 pending、wake、ACK、暂停、关闭和能力策略；一个订阅 ACK 不影响其它订阅。
 - 微信发送与腾讯文档写入都使用不可变草稿、非空 `owner_authorization_refs`、TTL 和 `dedupe_key`。批准只消费一次，`UNKNOWN` 不自动重试。
 - 附件按需准备和登记，记录来源事件、文件名、字节数与 SHA-256，不自动执行或解压。
-- 腾讯文档变化按同一文档或收集表合并：quiet window 为 5 分钟，max batch 为 15 分钟。
+- 腾讯文档资源使用独立 monitor 与 M:N subscription，不复用微信 route 身份。首次登记只保存成功只读轮询得到的当前 baseline；变化按 quiet window 5 分钟、max batch 15 分钟合并，同 fingerprint 全局去重。
+- 官方 MCP 的网络错误、JSON-RPC error、tool-level `isError=true` 或分页未完整结果都不会推进文档 baseline。可见 wake 只含 monitor/subscription/generation/wake 和批次数，不含文档正文。
 
 ## 微信监听路线
 
@@ -23,7 +24,7 @@
 | 订阅与事件 | `wechat_subscriptions_*`、`wechat_events_*`、`wechat_wake_info` | M:N 建链、独立读取与精确 ACK |
 | Outbound 治理 | `outbound_prepare/approve/status/recover/verify`、`wechat_outbound_capabilities` | 草稿审批、状态恢复和严格数据库确认 |
 | 附件 | `wechat_attachment_*` | 下载准备、落盘哈希、上传清单；不直接发送 |
-| 腾讯文档 | `tdocs_*` | 高频读、官方完整能力入口、变更合并批次 |
+| 腾讯文档 | `tdocs_*`、`tdocs_monitor_*` | 高频读、官方完整能力入口、allowlist 监视、M:N 批次投递与精确 ACK |
 
 当前源码包含安全文字发送状态机和 `VisibleUiBackend` 协议，但没有正式微信 UI backend。`wechat_outbound_capabilities()` 会明确返回 `visible_ui_backend_implemented=false`；默认 `WECHAT_DOCS_MCP_OUTBOUND_ENABLED=0`。因此公开候选不会触碰微信输入框，也不能把 `SEND_ATTEMPTED` 说成 `VERIFIED`。
 

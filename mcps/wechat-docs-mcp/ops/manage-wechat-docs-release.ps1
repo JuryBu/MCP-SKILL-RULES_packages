@@ -12,7 +12,7 @@ param(
   [string]$DrillRoot,
   [string]$Endpoint = "wechat-docs",
   [int]$ExpectedCurrentToolCount = 15,
-  [int]$ExpectedToolCount = 29,
+  [int]$ExpectedToolCount = 43,
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,
   [string]$BrokerBaseUrl = "http://127.0.0.1:14588",

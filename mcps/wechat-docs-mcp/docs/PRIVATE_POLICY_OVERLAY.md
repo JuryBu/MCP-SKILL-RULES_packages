@@ -17,7 +17,7 @@ receiver private layer
   secrets/*
 ```
 
-`binding.json` 保存精确 route、M:N subscriptions 和逐 route outbound capability。`owner-authorizations.json` 保存主人原始消息引用、适用 route/capability、有效期和撤销状态。`local-rules.md` 只描述该机器的联系人优先级、人工协助通道和不可扩张边界。
+`binding.json` 保存精确 route、M:N subscriptions、逐 route outbound capability，以及独立的 `tencentDocs.monitors` 私有 allowlist。每条文档策略精确绑定资源、官方只读工具、参数和 `policy_ref`；默认 `paused/listen=false`，启用后创建与每次轮询都会重新核验。`owner-authorizations.json` 保存主人原始消息引用、适用 route/capability、有效期和撤销状态。`local-rules.md` 只描述该机器的联系人优先级、人工协助通道和不可扩张边界。
 
 ## 私有发送策略
 

@@ -151,7 +151,11 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 
 高频只读工具可以直接调用。官方完整能力通过工具发现与通用调用入口保留；修改、删除、移动、权限等写操作仍需草稿、授权与 dedupe。
 
-文档/表单观察器以文档 ID 哈希分组。变化后等待 5 分钟安静窗口；持续变化最多合并 15 分钟。相同 fingerprint 不重复计数，也不延长窗口。批次从 `OPEN -> READY -> EMITTED`，一个 batch 只生成一次汇总提醒。
+文档/表单观察器只允许登记本机私有 allowlist 中的资源；单独提供一个非空 `policy_ref` 不算通过。创建和每次轮询都必须精确匹配资源、官方工具、参数及 active/listen 状态。首次成功只读轮询建立当前 baseline，不产生历史 batch；策略撤销、网络失败、`isError=true` 或不完整分页不得推进 baseline。每次成功结果只保存 fingerprint 与不含正文的结构摘要。
+
+变化后等待 5 分钟安静窗口；持续变化最多合并 15 分钟。相同 `(monitor_id, change_fingerprint)` 跨批次和重启去重，几十个单元格或多位填写者在同一窗口内只形成一个 READY batch。
+
+文档 monitor 与 conversation 是 M:N。每个 document subscription 有独立 delivery、wake 和 ACK。`[TDOCS_MONITOR_WAKE]` 只包含 `monitor_id/subscription_id/generation/wake_id/pending_batch_count`；Agent 再调用 `tdocs_monitor_pending_batches` 读取摘要，并用同一 wake 精确 ACK 已完成的 `batch_id`。一个订阅 ACK 不得确认其它订阅。
 
 ## 9. 跨通道
 

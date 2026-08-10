@@ -115,15 +115,19 @@ error_code TEXT
 
 状态只允许 `PREPARED / APPROVED / EXECUTING / SEND_ATTEMPTED / VERIFIED / FAILED / UNKNOWN`。微信草稿必须显式指定 send-capable subscription。审批由内容哈希、TTL、主人授权引用和 dedupe 共同约束，执行后不能退回 `APPROVED`。
 
-### attachments 与 document changes
+### attachments 与 document monitors
 
 `attachment_transfers` 记录方向、route、来源事件、文件名、字节数、SHA-256、本地路径和 dedupe。文件只允许落在配置的 intake/upload root，不自动执行或解压。
 
-`document_change_batches/items` 按文档 ID 哈希与文档类型聚合变化。quiet window 为 5 分钟，max batch 为 15 分钟；重复 fingerprint 不延长批次。
+本机私有 `binding.json/tencentDocs.monitors` 是文档 allowlist，必须精确绑定 `policy_ref + resource_kind + resource_key + poll_tool + poll_arguments`，并同时设为 `active/listen=true`。`tdocs_monitors` 只是通过 allowlist 后的运行账本：保存资源 ID 哈希、私有调用参数、当前 baseline fingerprint 和失败状态。创建和每次轮询都会重新校验私有 allowlist；撤销策略后不会继续读取，也不会推进 baseline。真实资源 ID、标题与调用参数不会出现在 monitor 列表或 wake 中。
+
+文档资源与 Codex conversation 通过 `tdocs_monitor_subscriptions` 建立 M:N 连接。`tdocs_monitor_batches/changes` 实现 5 分钟 quiet window 与 15 分钟 max batch；`UNIQUE(monitor_id, change_fingerprint)` 保证同一变化跨批次和重启不重复。批次 READY 后才向每个 active subscription 建立独立 `tdocs_batch_deliveries` 与 `tdocs_subscription_wakes`，一个订阅 ACK 不影响其它订阅。
+
+首次登记必须先完成一次成功只读调用，只保存当前 fingerprint 作为 baseline，不生成旧历史 batch。网络异常、JSON-RPC error、tool-level `isError=true`、缺失结果或分页未完整标记都只增加失败计数，不推进 baseline。
 
 ## 4. 原子性与迁移
 
-`schema.py` 在 `BEGIN IMMEDIATE` 内完成 DDL、V1 数据搬迁和 schema version 更新。迁移前使用 SQLite backup API 创建同目录备份。DDL 逐条执行并由同一事务提交，避免 `executescript` 隐式提交造成半迁移。
+`schema.py` 在 `BEGIN IMMEDIATE` 内完成 DDL、旧数据搬迁和 schema version 更新。迁移前使用 SQLite backup API 创建带来源版本号的同目录备份。DDL 逐条执行并由同一事务提交，避免 `executescript` 隐式提交造成半迁移。
 
 V1 迁移规则：
 

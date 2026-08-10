@@ -239,3 +239,24 @@ def test_outbound_prepare_maps_image_capability_and_rejects_unknown_kind(
             {"value": "x"},
             subscription_id="subscription-synthetic",
         )
+
+
+def test_document_monitor_tools_are_registered() -> None:
+    names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+    assert {
+        "tdocs_monitor_create",
+        "tdocs_monitors_list",
+        "tdocs_monitor_set_state",
+        "tdocs_monitor_subscription_create",
+        "tdocs_monitor_subscriptions_list",
+        "tdocs_monitor_subscription_set_state",
+        "tdocs_monitor_poll",
+        "tdocs_monitor_pending_batches",
+        "tdocs_monitor_wake_info",
+        "tdocs_monitor_batches_ack",
+        "tdocs_monitor_health",
+        "tdocs_monitor_capabilities",
+        "tdocs_monitor_poll_start",
+        "tdocs_monitor_poll_stop",
+    }.issubset(names)
+    assert len(names) == 43

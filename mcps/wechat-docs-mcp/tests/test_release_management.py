@@ -139,7 +139,7 @@ class ReleaseProbeTests(unittest.TestCase):
                     "pending_subscriptions_total": 1,
                     "pending_total": 1,
                     "routes": 1,
-                    "schema_version": 2,
+                    "schema_version": 3,
                     "subscriptions": 2,
                     "subscriptions_total": 2,
                     "wakes": 2,
@@ -216,7 +216,7 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         package = json.loads(result.stdout)
         self.assertTrue(package["inside_release"])
-        self.assertEqual(29, package["tool_count"])
+        self.assertEqual(43, package["tool_count"])
 
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell and Junctions required")
@@ -285,7 +285,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertFalse(summary["productionTouched"])
         self.assertEqual(3, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
-        self.assertTrue(all(case["activationToolCount"] == 29 for case in summary["successfulCases"]))
+        self.assertTrue(all(case["activationToolCount"] == 43 for case in summary["successfulCases"]))
         self.assertTrue(all(case["activated"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["phaseAWatcherFrozen"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
@@ -307,9 +307,9 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         null_active_backend = json.loads(
             (drill_root / "null-active-backend" / "service" / "releases" / "release-candidate" / "service-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(29, missing_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(29, null_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(29, null_active_backend["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(43, missing_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(43, null_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(43, null_active_backend["validation"]["activeBackend"]["toolCount"])
 
         for case_name in ("missing-validation", "null-validation", "null-active-backend"):
             case_root = drill_root / case_name

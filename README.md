@@ -24,7 +24,7 @@
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
 | `napcat-mcp` | 0.3.7 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、自然私聊回复路由、热升级历史基线、群文件传输、监督器与安全更新 |
-| `wechat-docs-mcp` | 0.2.0 | 可选本地微信 M:N 订阅、独立投递/ACK、安全 outbound 骨架、腾讯文档治理与当前用户监督器 |
+| `wechat-docs-mcp` | 0.3.0 | 可选本地微信与腾讯文档双 M:N 订阅、独立投递/ACK、文档只读合并提醒、安全 outbound 骨架与当前用户监督器 |
 
 ## 重点能力
 
@@ -182,7 +182,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
 | `napcat-mcp` | 0.3.7 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, natural private-reply routing, hot-upgrade history baselines, file transfer, supervisor, and guarded updates |
-| `wechat-docs-mcp` | 0.2.0 | Optional governed local WeChat M:N subscriptions, independent delivery/ACK, safe outbound scaffolding, Tencent Docs tools, and a per-user supervisor |
+| `wechat-docs-mcp` | 0.3.0 | Optional governed local WeChat and Tencent Docs M:N subscriptions, independent delivery/ACK, read-only coalesced document wakes, safe outbound scaffolding, and a per-user supervisor |
 
 ## Highlights
 

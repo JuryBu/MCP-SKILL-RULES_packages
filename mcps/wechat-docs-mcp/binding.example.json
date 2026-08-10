@@ -64,5 +64,20 @@
       "send_capability": false,
       "policy_ref": "receiver-owned-private-listen-policy"
     }
-  ]
+  ],
+  "tencentDocs": {
+    "monitors": [
+      {
+        "policy_ref": "receiver-owned-private-document-policy",
+        "resource_kind": "doc",
+        "resource_key": "synthetic-document-id",
+        "poll_tool": "manage.query_file_info",
+        "poll_arguments": {
+          "file_id": "synthetic-document-id"
+        },
+        "state": "paused",
+        "listen": false
+      }
+    ]
+  }
 }
