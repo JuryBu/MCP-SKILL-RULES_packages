@@ -318,8 +318,7 @@ class DbWatcherTests(unittest.TestCase):
         """Two concurrent watch_once calls should be serialized by the lock."""
         import threading
         call_log: list[str] = []
-        original_impl = self.watcher._watch_once_impl
-        expected_result = original_impl(False)
+        expected_result = WatchResult()
 
         def tracking_impl(force_refresh: bool) -> WatchResult:
             call_log.append("enter")

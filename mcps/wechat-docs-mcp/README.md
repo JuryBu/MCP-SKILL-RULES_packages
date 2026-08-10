@@ -28,9 +28,9 @@
 
 当前源码包含安全文字发送状态机，但普通文字仍没有正式 UI backend。附件另有默认关闭的 Windows 可见执行器：搜索标题必须在本地联系人库唯一，粘贴后必须由 `SessionDraft` 证明草稿属于精确微信 username，发送后还要由消息数据库中唯一的新出站记录匹配文件 MD5、大小和 route。执行器只在当前剪贴板由可无损复制的简单全局内存格式组成时继续；图片、位图、复杂 OLE 或未知格式会在唤醒微信前拒绝，不能为发送而破坏用户剪贴板。附件开关与普通文字总开关独立；`WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` 明确设置时优先，否则只读取私有数据根目录下 `config/service-runtime.json` 的布尔字段 `attachmentOutboundWeChatEnabled`，缺失、损坏或非布尔值都会保持关闭。
 
-`wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终完整保留并记录 SHA-256；XLSX 只下载原件，不自动分页。
+`wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。微信 V2 普通图片按 owner account identity 分区使用本机私有 key；旧无归属 key 只有通过精确 DAT 的大小、MD5 和格式验证后才会迁入该账号。解密后的 wxgf 原件完整保留，HEVC 只在私有派生目录中用无窗口 ffmpeg 转成可视 PNG。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终记录 SHA-256；XLSX 只下载原件，不自动分页。
 
-若普通图片的本地实体仍加密且无法按事件唯一执行客户端“另存为”，`wechat_capture_visible_image_preview` 只能在用户已手动打开目标图片查看器后显式调用。它不激活窗口，只抓取唯一微信查看器的当前视窗，并标记为 `human_assisted`、`viewport_preview`、`original_available=false`、`machine_verified_content_identity=false`。预览哈希不是原件哈希，视窗也可能没有覆盖完整图片；找不到唯一窗口、前台焦点变化或缺少人工确认引用时必须拒绝。
+当当前账号没有通过目标 DAT 验证的 key 时，普通图片读取返回 `ATTACHMENT_IMAGE_KEY_WAITING`。适配器只允许在一条新图片事件到达后的短窗口执行有截止时间的只读 Weixin 进程扫描；平时不常驻高频盲扫，也不通过点击、窗口消息或可见预览触发 key。`wechat_capture_visible_image_preview` 仍是单独的人工辅助降级：只有用户已手动打开目标查看器并提供确认引用时才可调用，不能替代原件下载，也不能把预览哈希冒充原件哈希。
 
 ## 状态合同
 

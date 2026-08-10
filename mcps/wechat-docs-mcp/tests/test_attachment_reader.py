@@ -8,6 +8,7 @@ import os
 import random
 import re
 import subprocess
+import time
 import zipfile
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from wechat_docs_mcp.attachment_reader import VisualAttachmentReader
 from wechat_docs_mcp.attachments import AttachmentRegistry
 from wechat_docs_mcp.ledger import EventLedger, LedgerError
 from wechat_docs_mcp.office_converter import LocalOfficeConverter
+from wechat_docs_mcp.wxgf_decoder import WxgfDecoder
 
 
 def image_bytes(size: tuple[int, int] = (80, 60), format_name: str = "PNG") -> bytes:
@@ -434,3 +436,91 @@ def test_continuation_rejects_changed_request(
             max_images=1,
         )
     assert mismatch.value.code == "ATTACHMENT_CONTINUATION_MISMATCH"
+
+
+def test_wxgf_is_preserved_as_original_and_converted_once_for_visual_read(
+    tmp_path: Path,
+) -> None:
+    ledger = EventLedger(tmp_path / "events.sqlite3")
+    ledger.register_route(
+        "route-a",
+        profile="test",
+        identity={"chat_name": "sanitized", "chat_type": "group", "username": "room"},
+        state="active",
+    )
+    ledger.register_subscription(
+        "route-a",
+        "conversation-a",
+        1,
+        subscription_id="subscription-a",
+        policy_ref="test-policy",
+    )
+    registry = AttachmentRegistry(ledger, tmp_path / "intake", tmp_path / "upload")
+    registry.intake_root.mkdir()
+    registry.upload_root.mkdir()
+    payload = b"wxgf-header" + b"\x00\x00\x00\x01" + b"synthetic-hevc"
+    materializer = MappingMaterializer({})
+    _, attachment_ref = add_attachment(
+        ledger,
+        materializer,
+        "wxgf-image",
+        "image",
+        "sample.dat",
+        payload,
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append({"command": command, **kwargs})
+        Image.new("RGB", (320, 240), (12, 34, 56)).save(command[-1], format="PNG")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    ffmpeg = tmp_path / "ffmpeg.exe"
+    ffmpeg.write_bytes(b"fixture")
+    decoder = WxgfDecoder(tmp_path / "derived", ffmpeg, runner=fake_run)
+    reader = VisualAttachmentReader(
+        registry,
+        materializer,
+        tmp_path / "derived",
+        wxgf_decoder=decoder,
+    )
+
+    first = reader.read("subscription-a", [attachment_ref])
+    second = reader.read("subscription-a", [attachment_ref])
+
+    original = first.structured_content["originals"][0]
+    returned = first.structured_content["returned"][0]
+    assert Path(original["local_path"]).read_bytes() == payload
+    assert original["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert original["storage_format"] == "wxgf"
+    assert returned["source_kind"] == "wxgf_hevc_image"
+    assert returned["returned_mime_type"] == "image/png"
+    assert first.content[1].data == second.content[1].data
+    assert len(calls) == 1
+    if os.name == "nt":
+        assert int(calls[0]["creationflags"]) & subprocess.CREATE_NO_WINDOW
+
+
+def test_materialized_attachment_ttl_is_24_hours_not_derived_cache_ttl(
+    reader_fixture: tuple[VisualAttachmentReader, EventLedger, str, MappingMaterializer],
+) -> None:
+    reader, ledger, subscription_id, materializer = reader_fixture
+    _, image_ref = add_attachment(
+        ledger,
+        materializer,
+        "ttl-image",
+        "image",
+        "sample.png",
+        image_bytes(),
+    )
+    reader.read(subscription_id, [image_ref])
+    transfer = reader.registry._verified_download(subscription_id, image_ref)
+    assert transfer is not None
+    materialized = Path(str(transfer["local_path"]))
+    two_days_ago = time.time() - 2 * 24 * 60 * 60
+    os.utime(materialized, (two_days_ago, two_days_ago))
+
+    result = reader.cleanup_expired()
+
+    assert result["materialized_files"] == 1
+    assert not materialized.exists()

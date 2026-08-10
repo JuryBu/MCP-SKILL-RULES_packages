@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import tempfile
 import threading
 import uuid
 from dataclasses import asdict
@@ -32,6 +34,7 @@ from .wechat_attachment_outbound import SafeAttachmentOutbound
 from .wechat_outbound_verifier import WechatAttachmentDatabaseVerifier
 from .win32_attachment_ui import Win32WechatAttachmentBackend
 from .visible_view_capture import VisibleViewCapture, Win32VisibleViewerBackend
+from .wxgf_decoder import WxgfDecoder
 
 
 DATA_ROOT = Path(os.environ.get("WECHAT_DOCS_MCP_DATA_ROOT", Path.home() / ".codex-toolkit" / "wechat-docs-mcp"))
@@ -48,7 +51,10 @@ DECRYPTED_DIR = DATA_ROOT / "private-state" / "decrypted"
 KEYS_FILE = DATA_ROOT / "private-state" / "keys" / "all_keys.json"
 BINDING_FILE = DATA_ROOT / "config" / "binding.json"
 ATTACHMENT_INTAKE_ROOT = Path(
-    os.environ.get("WECHAT_DOCS_MCP_INTAKE_ROOT", DATA_ROOT / "intake")
+    os.environ.get(
+        "WECHAT_DOCS_MCP_INTAKE_ROOT",
+        Path(tempfile.gettempdir()) / "wechat-docs-mcp" / "intake",
+    )
 )
 ATTACHMENT_UPLOAD_ROOT = Path(
     os.environ.get("WECHAT_DOCS_MCP_UPLOAD_ROOT", DATA_ROOT / "upload")
@@ -67,6 +73,15 @@ IMAGE_KEY_FILE = Path(
         "WECHAT_DOCS_MCP_IMAGE_KEY_FILE",
         DATA_ROOT / "secrets" / "wechat-image-v2.json",
     )
+)
+IMAGE_KEY_ROOT = Path(
+    os.environ.get(
+        "WECHAT_DOCS_MCP_IMAGE_KEY_ROOT",
+        DATA_ROOT / "secrets" / "wechat-image-v2",
+    )
+)
+FFMPEG_PATH = Path(
+    os.environ.get("WECHAT_DOCS_MCP_FFMPEG_PATH", shutil.which("ffmpeg") or "ffmpeg.exe")
 )
 IMAGE_VIEWER_TITLES = tuple(
     title.strip()
@@ -116,6 +131,7 @@ def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSou
         DECRYPTED_DIR,
         WECHAT_ACCOUNT_ROOT,
         IMAGE_KEY_FILE,
+        IMAGE_KEY_ROOT,
     )
 
 
@@ -125,6 +141,7 @@ def attachment_reader(event_ledger: EventLedger) -> VisualAttachmentReader:
         attachment_source_resolver(event_ledger),
         ATTACHMENT_DERIVED_ROOT,
         LocalOfficeConverter(ATTACHMENT_DERIVED_ROOT, SOFFICE_PATH),
+        WxgfDecoder(ATTACHMENT_DERIVED_ROOT, FFMPEG_PATH),
     )
 
 

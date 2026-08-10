@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 import sqlite3
 import struct
 import uuid
@@ -14,6 +15,9 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from .ledger import EventLedger, LedgerError, utc_now
+
+
+ATTACHMENT_MATERIALIZATION_TTL_SECONDS = 24 * 60 * 60
 
 
 def _safe_file_name(value: str) -> str:
@@ -119,6 +123,7 @@ class AttachmentRegistry:
             rows = connection.execute(
                 """
                 SELECT attachments.*,events.event_type,events.payload_json,events.source_fingerprint,
+                       events.observed_at,
                        event_deliveries.state AS delivery_state
                 FROM event_deliveries
                 JOIN events USING(event_id)
@@ -153,7 +158,8 @@ class AttachmentRegistry:
             rows = connection.execute(
                 """
                 SELECT attachments.*,events.event_type,events.payload_json,
-                       events.source_fingerprint,event_deliveries.state AS delivery_state
+                       events.source_fingerprint,events.observed_at,
+                       event_deliveries.state AS delivery_state
                 FROM event_deliveries
                 JOIN events USING(event_id)
                 JOIN attachments ON attachments.event_id=events.event_id
@@ -199,6 +205,28 @@ class AttachmentRegistry:
                 continue
             return transfer
         return None
+
+    def cleanup_expired(
+        self,
+        max_age_seconds: int = ATTACHMENT_MATERIALIZATION_TTL_SECONDS,
+    ) -> dict[str, int]:
+        threshold = time.time() - max_age_seconds
+        read_root = self.intake_root / "read"
+        removed_files = 0
+        removed_partials = 0
+        if read_root.is_dir():
+            for path in sorted(read_root.rglob("*"), reverse=True):
+                if path.is_file() and path.stat().st_mtime < threshold:
+                    is_partial = path.name.startswith(".") and path.name.endswith(".partial")
+                    path.unlink()
+                    removed_partials += int(is_partial)
+                    removed_files += int(not is_partial)
+                elif path.is_dir():
+                    try:
+                        path.rmdir()
+                    except OSError:
+                        pass
+        return {"materialized_files": removed_files, "partial_files": removed_partials}
 
     def _next_read_dedupe_key(self, subscription_id: str, attachment_ref: str) -> str:
         base = f"read-attachment:v1:{subscription_id}:{attachment_ref}"

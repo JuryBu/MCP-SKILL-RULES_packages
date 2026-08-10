@@ -168,6 +168,10 @@ def _resolver(tmp_path: Path) -> tuple[WechatAttachmentSourceResolver, EventLedg
         profile="test",
         identity={"chat_name": "Synthetic Room", "chat_type": "group", "username": USERNAME},
         state="active",
+        owner_account_key=OWNER_KEY,
+        username=USERNAME,
+        chat_type="group",
+        display_title="Synthetic Room",
     )
     return WechatAttachmentSourceResolver(ledger, _binding(), decrypted, account), ledger, decrypted, account
 
@@ -369,6 +373,7 @@ def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integri
         decrypted,
         account,
         key_file,
+        tmp_path / "scoped-image-keys",
     )
     destination = tmp_path / "image.partial"
 
@@ -385,6 +390,7 @@ def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integri
 
     assert source_kind == "wechat_v2_image_dat"
     assert destination.read_bytes() == payload
+    assert (tmp_path / "scoped-image-keys" / f"{hashlib.sha256(OWNER_KEY.encode()).hexdigest()}.json").is_file()
 
 
 def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Path) -> None:
@@ -430,6 +436,7 @@ def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Pat
         decrypted,
         account,
         wrong_key_file,
+        tmp_path / "scoped-image-keys",
     )
 
     with pytest.raises(LedgerError) as raised:
@@ -443,4 +450,4 @@ def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Pat
             ),
             tmp_path / "wrong.partial",
         )
-    assert raised.value.code == "ATTACHMENT_IMAGE_DECRYPT"
+    assert raised.value.code == "ATTACHMENT_IMAGE_KEY_WAITING"

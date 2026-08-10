@@ -15,9 +15,14 @@ import pypdfium2 as pdfium
 from mcp.types import CallToolResult, ImageContent, TextContent
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from .attachments import AttachmentMaterializer, AttachmentRegistry
+from .attachments import (
+    ATTACHMENT_MATERIALIZATION_TTL_SECONDS,
+    AttachmentMaterializer,
+    AttachmentRegistry,
+)
 from .ledger import LedgerError
 from .office_converter import DERIVED_CACHE_TTL_SECONDS, LocalOfficeConverter
+from .wxgf_decoder import WXGF_MAGIC, WxgfDecoder
 
 
 MAX_RETURN_IMAGES = 8
@@ -63,6 +68,14 @@ def _sha256_bytes(data: bytes) -> str:
 
 def _wire_size(data: bytes) -> int:
     return 4 * ((len(data) + 2) // 3)
+
+
+def _starts_with(path: Path, magic: bytes) -> bool:
+    try:
+        with path.open("rb") as stream:
+            return stream.read(len(magic)) == magic
+    except OSError:
+        return False
 
 
 def _cursor_encode(fingerprint: str, offset: int) -> str:
@@ -114,11 +127,13 @@ class VisualAttachmentReader:
         materializer: AttachmentMaterializer,
         derived_root: str | Path,
         office_converter: LocalOfficeConverter | None = None,
+        wxgf_decoder: WxgfDecoder | None = None,
     ) -> None:
         self.registry = registry
         self.materializer = materializer
         self.derived_root = Path(derived_root).resolve()
         self.office_converter = office_converter
+        self.wxgf_decoder = wxgf_decoder
 
     @staticmethod
     def _budget(images: int, pixels: int, bytes_: int) -> ReadBudget:
@@ -224,7 +239,33 @@ class VisualAttachmentReader:
                 "local_path": str(source_path),
             }
             originals.append(original)
-            if mime_type.startswith("image/"):
+            if attachment["kind"] == "image" and _starts_with(source_path, WXGF_MAGIC):
+                if self.wxgf_decoder is None:
+                    raise LedgerError("ATTACHMENT_WXGF_DECODER_MISSING", "wxgf 解码器未配置")
+                conversion = self.wxgf_decoder.convert(attachment_ref, source_path, source_sha256)
+                originals[-1]["storage_format"] = "wxgf"
+                originals[-1]["conversion"] = {
+                    key: value for key, value in conversion.items() if key != "derived_path"
+                }
+                requested_pages = self._selected_pages(attachment_ref, 1, pages, page_ranges)
+                if requested_pages != [1]:
+                    raise LedgerError("ATTACHMENT_PAGE_OUT_OF_RANGE", "普通图片只有第 1 页")
+                units.append(
+                    VisualUnit(
+                        attachment_ref=attachment_ref,
+                        source_path=Path(str(conversion["derived_path"])),
+                        source_sha256=str(conversion["derived_sha256"]),
+                        source_mime_type=str(conversion["derived_mime_type"]),
+                        page_number=None,
+                        page_count=1,
+                        source_kind="wxgf_hevc_image",
+                        conversion={
+                            **conversion,
+                            "original_attachment_sha256": source_sha256,
+                        },
+                    )
+                )
+            elif mime_type.startswith("image/"):
                 requested_pages = self._selected_pages(attachment_ref, 1, pages, page_ranges)
                 if requested_pages != [1]:
                     raise LedgerError("ATTACHMENT_PAGE_OUT_OF_RANGE", "普通图片只有第 1 页")
@@ -460,7 +501,11 @@ class VisualAttachmentReader:
             }
         return data, returned_mime, metadata
 
-    def cleanup_expired(self, max_age_seconds: int = DERIVED_CACHE_TTL_SECONDS) -> dict[str, int]:
+    def cleanup_expired(
+        self,
+        max_age_seconds: int = DERIVED_CACHE_TTL_SECONDS,
+        materialized_max_age_seconds: int = ATTACHMENT_MATERIALIZATION_TTL_SECONDS,
+    ) -> dict[str, int]:
         threshold = time.time() - max_age_seconds
         page_root = self.derived_root / "pages"
         removed_pages = 0
@@ -474,7 +519,18 @@ class VisualAttachmentReader:
             if self.office_converter is not None
             else 0
         )
-        return {"page_cache_files": removed_pages, "office_cache_entries": removed_office}
+        removed_wxgf = (
+            self.wxgf_decoder.cleanup_expired(max_age_seconds)
+            if self.wxgf_decoder is not None
+            else 0
+        )
+        removed_intake = self.registry.cleanup_expired(materialized_max_age_seconds)
+        return {
+            "page_cache_files": removed_pages,
+            "office_cache_entries": removed_office,
+            "wxgf_cache_entries": removed_wxgf,
+            **removed_intake,
+        }
 
     def read(
         self,
@@ -491,6 +547,7 @@ class VisualAttachmentReader:
     ) -> CallToolResult:
         if mode not in {"auto", "original"}:
             raise LedgerError("ATTACHMENT_READ_MODE_INVALID", "mode 必须为 auto 或 original")
+        self.cleanup_expired()
         budget = self._budget(max_images, max_pixels, max_bytes)
         page_map = pages or {}
         range_map = page_ranges or {}

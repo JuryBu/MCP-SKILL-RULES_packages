@@ -141,9 +141,9 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 
 ## 7. 附件
 
-附件事件先只入账元数据，并在事务中生成随机 `attachment_ref`。下载必须精确提供 `(subscription_id,event_id,attachment_ref,dedupe_key)`；适配器只能在对应 route 的精确消息身份中解析实体，保存到 intake root 时不覆盖同名文件，并登记实际字节、SHA-256、MIME 和可得尺寸。大小、MD5、文件索引、CDN 主机或 route 身份不一致时失败。表情与普通图片是不同来源类型，不能互相冒充。
+附件事件先只入账元数据，并在事务中生成随机 `attachment_ref`。下载必须精确提供 `(subscription_id,event_id,attachment_ref,dedupe_key)`；适配器只能在对应 route 的精确消息身份中解析实体，默认物化到系统临时 intake 且不覆盖同名文件，并登记实际字节、SHA-256、MIME 和可得尺寸。大小、MD5、文件索引、CDN 主机或 route 身份不一致时失败。表情与普通图片是不同来源类型，不能互相冒充；普通图片 key 按 owner account identity 分区，旧无归属 key 必须先通过当前目标验证。
 
-可视读取必须先完成同一下载与完整性合同。`wechat_read_attachments` 可接收多个已授权 `attachment_ref`：图片/表情各产生一个 `ImageContent`，PDF 按页产生多个 `ImageContent`，DOCX/PPTX 先生成可审计的派生 PDF。每个返回块记录来源 ref、页码、原件/返回 MIME、尺寸、字节和 SHA-256，以及是否缩放或转码。总图片数、总像素和总返回字节均有硬上限；超限必须返回已返回与剩余 ref/page 以及稳定 continuation cursor，续读不得重复或跳页。任意本机路径、伪造 ref、重复 ref、损坏或加密 PDF 都应拒绝。
+可视读取必须先完成同一下载与完整性合同。`wechat_read_attachments` 可接收多个已授权 `attachment_ref`：图片/表情各产生一个 `ImageContent`，PDF 按页产生多个 `ImageContent`，DOCX/PPTX 先生成可审计的派生 PDF；wxgf 原件先保留并登记，再从 HEVC 生成带独立哈希的派生 PNG。每个返回块记录来源 ref、页码、原件/返回 MIME、尺寸、字节和 SHA-256，以及是否缩放或转码。总图片数、总像素和总返回字节均有硬上限；超限必须返回已返回与剩余 ref/page 以及稳定 continuation cursor，续读不得重复或跳页。任意本机路径、伪造 ref、重复 ref、损坏或加密 PDF 都应拒绝。
 
 `wechat_capture_visible_image_preview` 是显式人工辅助降级，不是附件下载。调用仍需 subscription、event 与 `attachment_ref` 精确一致，并要求非空人工确认引用；实现只能后台抓取唯一、可见、未最小化的微信图片查看器，不能激活窗口或发送输入。返回必须标明视窗预览不是原件、预览哈希不能替代原件哈希、客户端无法把查看器像素机器绑定到 event/local/server 标识且视窗可能不完整。窗口不唯一、焦点变化、空白捕获或质量不足时保守拒绝。
 

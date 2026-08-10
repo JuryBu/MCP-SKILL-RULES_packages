@@ -26,12 +26,14 @@
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
 | `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 普通微信文字 outbound 开关；无正式文字 UI backend 时保持关闭 |
 | `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件可见发送开关；只在私有 route/policy 与真实 capability probe 通过后启用 |
-| `WECHAT_DOCS_MCP_INTAKE_ROOT` | `<data_root>/intake` | 按需下载附件的允许根目录 |
+| `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
+| `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |
+| `WECHAT_DOCS_MCP_FFMPEG_PATH` | `PATH` 中的 ffmpeg | wxgf/HEVC 图片的无窗口本地解码器 |
 | `WECHAT_DOCS_MCP_UPLOAD_ROOT` | `<data_root>/upload` | 附件草稿只允许读取此目录内文件，执行前重新校验 SHA-256 |
 | `WECHAT_DOCS_MCP_DERIVED_ROOT` | `<data_root>/derived` | PDF 页面及 DOCX/PPTX 派生 PDF 的私有缓存目录 |
 | `WECHAT_DOCS_MCP_SOFFICE_PATH` | `C:\Program Files\LibreOffice\program\soffice.exe` | DOCX/PPTX 的本地隔离转换器；Windows 仅使用 GUI 启动器并强制无控制台窗口，缺失时不降级执行宏或联网转换 |
 | `WECHAT_DOCS_MCP_IMAGE_VIEWER_TITLES` | `图片和视频` | 分号分隔的微信图片查看器标题，仅供显式人工辅助视窗预览；不用于消息身份推断 |
-| `WECHAT_DOCS_MCP_IMAGE_KEY_FILE` | `<data_root>/secrets/wechat-image-v2.json` | 可选的微信 V2 本地图片密钥；只在私有层保存，缺失时普通图片下载明确失败 |
+| `WECHAT_DOCS_MCP_IMAGE_KEY_FILE` | `<data_root>/secrets/wechat-image-v2.json` | 旧版无账号归属 key 的兼容候选；只有通过当前精确 DAT 验证后才迁入分账号目录 |
 | `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
 | `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
 

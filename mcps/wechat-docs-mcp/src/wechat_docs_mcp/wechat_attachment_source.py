@@ -8,7 +8,7 @@ import sqlite3
 import struct
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -19,12 +19,20 @@ from Crypto.Util.Padding import unpad
 
 from .attachments import _safe_file_name
 from .db_observer import DbObserver
+from .image_key_manager import (
+    ImageKeyManager,
+    ImageKeyMaterial,
+    ImageKeyScanner,
+    WindowsWeixinImageKeyScanner,
+)
 from .ledger import EventLedger, LedgerError
-from .route_verifier import PrivateBindingRouteVerifier
+from .route_verifier import PrivateBindingRouteVerifier, RouteVerificationError
 
 
 ATTACHMENT_CDN_HOSTS = {"vweixinf.tc.qq.com"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
+IMAGE_KEY_EVENT_SCAN_WINDOW_SECONDS = 120
+IMAGE_KEY_SCAN_TIMEOUT_SECONDS = 15
 
 
 def _md5(path: Path) -> str:
@@ -43,12 +51,28 @@ class WechatAttachmentSourceResolver:
         decrypted_dir: str | Path,
         account_root: str | Path,
         image_key_file: str | Path | None = None,
+        image_key_root: str | Path | None = None,
+        image_key_scanner: ImageKeyScanner | None = None,
     ) -> None:
         self.ledger = ledger
         self.binding = binding
         self.decrypted_dir = Path(decrypted_dir)
         self.account_root = Path(account_root)
         self.image_key_file = Path(image_key_file) if image_key_file else None
+        key_root = (
+            Path(image_key_root)
+            if image_key_root is not None
+            else (
+                self.image_key_file.parent / "wechat-image-v2"
+                if self.image_key_file
+                else Path.home() / ".wechat-image-v2"
+            )
+        )
+        self.image_key_manager = ImageKeyManager(
+            key_root,
+            legacy_key_file=self.image_key_file,
+            scanner=image_key_scanner or WindowsWeixinImageKeyScanner(),
+        )
 
     @staticmethod
     def _message_xml(content: str) -> ET.Element:
@@ -60,36 +84,24 @@ class WechatAttachmentSourceResolver:
         except ET.ParseError as error:
             raise LedgerError("ATTACHMENT_MESSAGE_XML", "附件消息 XML 无法解析") from error
 
-    def _verified_username(self, attachment: Mapping[str, Any]) -> str:
+    def _verified_identity(self, attachment: Mapping[str, Any]) -> tuple[str, str]:
         route = self.ledger.get_route(str(attachment["route_id"]))
-        if self.binding.get("schemaVersion") == 2:
-            return PrivateBindingRouteVerifier(self.binding).verify_identity(
+        try:
+            verified = PrivateBindingRouteVerifier(self.binding).verify_identity(
                 route["route_id"],
                 route,
-            ).username
-        if self.binding.get("schemaVersion") != 1:
-            raise LedgerError("ATTACHMENT_BINDING_SCHEMA", "private binding schema 不受支持")
-        routes = self.binding.get("routes")
-        if not isinstance(routes, Sequence) or isinstance(routes, (str, bytes, bytearray)):
-            raise LedgerError("ATTACHMENT_ROUTE_NOT_FOUND", "private binding 缺少 routes")
-        candidates = [
-            candidate
-            for candidate in routes
-            if isinstance(candidate, Mapping) and candidate.get("route_id") == route["route_id"]
-        ]
-        if len(candidates) != 1:
-            raise LedgerError("ATTACHMENT_ROUTE_AMBIGUOUS", "private binding 无法唯一确认 route")
-        candidate = candidates[0]
-        username = candidate.get("username")
-        chat_type = candidate.get("chat_type")
-        if not isinstance(username, str) or not username:
-            raise LedgerError("ATTACHMENT_ROUTE_UNVERIFIED", "private binding 缺少微信内部 username")
-        if chat_type not in {"friend", "group"} or ((chat_type == "group") != username.endswith("@chatroom")):
-            raise LedgerError("ATTACHMENT_ROUTE_UNVERIFIED", "private binding 的 username/chat_type 不一致")
-        expected_fingerprint = f"{username}:{attachment.get('local_id')}:{attachment.get('server_id')}"
+            )
+        except RouteVerificationError as error:
+            raise LedgerError("ATTACHMENT_ROUTE_UNVERIFIED", str(error)) from error
+        expected_fingerprint = (
+            f"{verified.username}:{attachment.get('local_id')}:{attachment.get('server_id')}"
+        )
         if attachment.get("source_fingerprint") != expected_fingerprint:
             raise LedgerError("ATTACHMENT_ROUTE_UNVERIFIED", "事件消息身份与 private binding 不一致")
-        return username
+        return verified.username, verified.owner_account_key_sha256
+
+    def _verified_username(self, attachment: Mapping[str, Any]) -> str:
+        return self._verified_identity(attachment)[0]
 
     def _message_content(self, attachment: Mapping[str, Any]) -> tuple[ET.Element, int]:
         username = self._verified_username(attachment)
@@ -231,7 +243,7 @@ class WechatAttachmentSourceResolver:
             return match.group().decode("ascii")
         raise LedgerError("ATTACHMENT_IMAGE_INDEX", "图片资源索引不含合法文件标识")
 
-    def _image_index(self, attachment: Mapping[str, Any], username: str) -> tuple[str, str, int]:
+    def _image_index(self, attachment: Mapping[str, Any], username: str) -> list[tuple[str, str, int]]:
         path = self.decrypted_dir / "message" / "message_resource.db"
         connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
         connection.row_factory = sqlite3.Row
@@ -284,25 +296,13 @@ class WechatAttachmentSourceResolver:
             connection.close()
         if not indexed:
             raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引不存在")
-        preferred = indexed[0]
-        if sum(row["file_name"] == preferred["file_name"] for row in indexed) != 1:
+        rows = [
+            (str(row["file_name"]), str(row["md5"]).lower(), int(row["file_size"]))
+            for row in indexed
+        ]
+        if len({row[0] for row in rows}) != len(rows):
             raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引存在歧义")
-        return str(preferred["file_name"]), str(preferred["md5"]).lower(), int(preferred["file_size"])
-
-    def _load_image_key(self) -> tuple[bytes, int]:
-        if self.image_key_file is None or not self.image_key_file.is_file():
-            raise LedgerError("ATTACHMENT_IMAGE_KEY_NOT_READY", "微信 V2 图片密钥尚未在本机私有层就绪")
-        try:
-            payload = json.loads(self.image_key_file.read_text(encoding="utf-8"))
-            key_text = payload["aes_key"]
-            xor_key = int(payload["xor_key"])
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-            raise LedgerError("ATTACHMENT_IMAGE_KEY_INVALID", "微信 V2 图片密钥文件格式无效") from error
-        if not isinstance(key_text, str) or not re.fullmatch(r"[A-Za-z0-9]{16}", key_text):
-            raise LedgerError("ATTACHMENT_IMAGE_KEY_INVALID", "微信 V2 图片 AES 密钥格式无效")
-        if not 0 <= xor_key <= 255:
-            raise LedgerError("ATTACHMENT_IMAGE_KEY_INVALID", "微信 V2 图片 XOR 密钥格式无效")
-        return key_text.encode("ascii"), xor_key
+        return rows
 
     @staticmethod
     def _decrypt_v2_image(data: bytes, aes_key: bytes, xor_key: int) -> bytes:
@@ -341,18 +341,9 @@ class WechatAttachmentSourceResolver:
             raise LedgerError("ATTACHMENT_IMAGE_DECRYPT", "微信 V2 PNG 尾部校验失败")
         return result
 
-    def _materialize_image(
-        self,
-        attachment: Mapping[str, Any],
-        root: ET.Element,
-        create_time: int,
-        destination: Path,
-    ) -> None:
-        username = self._verified_username(attachment)
-        file_name, content_md5, expected_size = self._image_index(attachment, username)
-        self._validate_expected(attachment, size=expected_size, content_md5=content_md5)
+    def _image_source(self, username: str, create_time: int, file_name: str) -> Path:
         month = datetime.fromtimestamp(create_time).strftime("%Y-%m")
-        source = (
+        return (
             self.account_root
             / "msg"
             / "attach"
@@ -361,6 +352,77 @@ class WechatAttachmentSourceResolver:
             / "Img"
             / file_name
         )
+
+    def _validated_material(
+        self,
+        material: ImageKeyMaterial,
+        data: bytes,
+        expected_size: int,
+        content_md5: str,
+    ) -> bool:
+        try:
+            decrypted = self._decrypt_v2_image(data, material.aes_key, material.xor_key)
+        except LedgerError:
+            return False
+        return len(decrypted) == expected_size and hashlib.md5(decrypted).hexdigest() == content_md5
+
+    def _resolve_scanned_aes(
+        self,
+        aes_key: bytes,
+        owner_account_key_sha256: str,
+        candidates: list[tuple[Path, int, str]],
+    ) -> ImageKeyMaterial | None:
+        for source, expected_size, content_md5 in candidates:
+            try:
+                data = source.read_bytes()
+            except OSError:
+                continue
+            if len(data) < 31 or data[:6] != b"\x07\x08V2\x08\x07":
+                continue
+            try:
+                first_block = AES.new(aes_key, AES.MODE_ECB).decrypt(data[15:31])
+            except (ValueError, KeyError):
+                continue
+            if not first_block.startswith(
+                (b"\xff\xd8\xff", b"\x89PNG\r\n\x1a\n", b"GIF87a", b"GIF89a", b"RIFF", b"wxgf")
+            ):
+                continue
+            for xor_key in range(256):
+                material = ImageKeyMaterial(
+                    aes_key=aes_key,
+                    xor_key=xor_key,
+                    source="process_memory",
+                    owner_account_key_sha256=owner_account_key_sha256,
+                )
+                if self._validated_material(material, data, expected_size, content_md5):
+                    return material
+        return None
+
+    @staticmethod
+    def _scan_allowed(observed_at: object) -> bool:
+        if not isinstance(observed_at, str) or not observed_at:
+            return False
+        try:
+            observed = datetime.fromisoformat(observed_at)
+        except ValueError:
+            return False
+        if observed.tzinfo is None:
+            return False
+        age = (datetime.now(timezone.utc) - observed.astimezone(timezone.utc)).total_seconds()
+        return 0 <= age <= IMAGE_KEY_EVENT_SCAN_WINDOW_SECONDS
+
+    def _materialize_image(
+        self,
+        attachment: Mapping[str, Any],
+        root: ET.Element,
+        create_time: int,
+        destination: Path,
+    ) -> None:
+        username, owner_account_key_sha256 = self._verified_identity(attachment)
+        indexed = self._image_index(attachment, username)
+        file_name, content_md5, expected_size = indexed[0]
+        self._validate_expected(attachment, size=expected_size, content_md5=content_md5)
+        source = self._image_source(username, create_time, file_name)
         if not source.is_file():
             raise LedgerError("ATTACHMENT_IMAGE_ENTITY", "微信图片实体不存在")
         image = root.find(".//img")
@@ -369,11 +431,35 @@ class WechatAttachmentSourceResolver:
         ).strip().lower()
         if file_name.endswith("_h.dat") and message_md5 and message_md5 != content_md5:
             raise LedgerError("ATTACHMENT_IMAGE_INDEX", "图片消息与高清硬链接 MD5 不一致")
-        aes_key, xor_key = self._load_image_key()
         data = source.read_bytes()
         if len(data) > MAX_ATTACHMENT_BYTES + 64:
             raise LedgerError("ATTACHMENT_TOO_LARGE", "微信图片实体超过允许上限")
-        decrypted = self._decrypt_v2_image(data, aes_key, xor_key)
+        scan_candidates = [
+            (candidate_source, size, candidate_md5)
+            for candidate_name, candidate_md5, size in sorted(
+                indexed,
+                key=lambda row: (0 if row[0].endswith("_t.dat") else 1, row[2]),
+            )
+            if (candidate_source := self._image_source(username, create_time, candidate_name)).is_file()
+        ]
+        material = self.image_key_manager.resolve(
+            owner_account_key_sha256,
+            validate=lambda candidate: self._validated_material(
+                candidate,
+                data,
+                expected_size,
+                content_md5,
+            ),
+            resolve_scanned_aes=lambda aes_key: self._resolve_scanned_aes(
+                aes_key,
+                owner_account_key_sha256,
+                scan_candidates,
+            ),
+            validated_content_md5=content_md5,
+            allow_scan=self._scan_allowed(attachment.get("observed_at")),
+            scan_timeout_seconds=IMAGE_KEY_SCAN_TIMEOUT_SECONDS,
+        )
+        decrypted = self._decrypt_v2_image(data, material.aes_key, material.xor_key)
         if len(decrypted) != expected_size or hashlib.md5(decrypted).hexdigest() != content_md5:
             raise LedgerError("ATTACHMENT_IMAGE_INTEGRITY", "微信图片未通过硬链接大小或 MD5 校验")
         with destination.open("xb") as stream:
