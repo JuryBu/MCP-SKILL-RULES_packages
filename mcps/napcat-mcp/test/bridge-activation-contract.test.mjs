@@ -233,14 +233,18 @@ test("portable package entrypoint leaves live services untouched before guarded 
 test("portable upgrade staging keeps its package entrypoint and uses built-in SHA256", () => {
   const updater = read("ops/update-codex-napcat-bridge.ps1");
   const entrypoint = read("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1");
+  const verifier = read("package/verify-package.ps1");
   const copyBlock = updater.match(/function Copy-CodeTree[\s\S]*?\n}/)?.[0] ?? "";
   const restoreBlock = updater.match(/function Restore-CodeTree[\s\S]*?\n}/)?.[0] ?? "";
   assert.match(copyBlock, /"package"/);
   assert.match(restoreBlock, /"package"/);
   assert.match(updater, /function Get-FileSha256/);
   assert.match(entrypoint, /function Get-FileSha256/);
+  assert.match(verifier, /function Get-PortableFileSha256/);
+  assert.match(verifier, /System\.Security\.Cryptography\.SHA256/);
   assert.doesNotMatch(updater, /Get-FileHash/);
   assert.doesNotMatch(entrypoint, /Get-FileHash/);
+  assert.doesNotMatch(verifier, /Get-FileHash/);
 });
 
 test("candidate npm validation finishes before maintenance or router quiescence", () => {
