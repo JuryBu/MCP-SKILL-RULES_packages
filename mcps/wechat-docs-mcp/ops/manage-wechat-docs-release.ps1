@@ -688,7 +688,7 @@ function Invoke-ReleaseSwitch {
     protectedBackendGeneration = [int]$Context.phaseAProtectedHealth.backend.generation
     ledger = $Context.phaseALedger
     ledgerBackupPath = $LedgerBackupPath
-    schemaMigrated = ([int]$BeforeLedger.schema_version -eq 1 -and [int]$Context.phaseALedger.schema_version -eq 2)
+    schemaMigrated = ([int]$BeforeLedger.schema_version -ne [int]$Context.phaseALedger.schema_version)
     phaseAWatcherFrozen = ([bool]$Context.phaseAStatus.background_polling -eq $false)
     pollStart = $Context.pollStart
     postCommitStatusVerified = $PostCommitStatusVerified

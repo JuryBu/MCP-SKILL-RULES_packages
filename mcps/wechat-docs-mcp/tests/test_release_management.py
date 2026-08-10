@@ -291,6 +291,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["ledgerBackupPresent"] for case in summary["successfulCases"]))
         self.assertIn("v2-schema", {case["case"] for case in summary["successfulCases"]})
+        self.assertTrue(all(case["schemaMigrated"] for case in summary["successfulCases"]))
         self.assertTrue(summary["forcedFailure"]["caught"])
         self.assertTrue(summary["forcedFailure"]["rollbackVerified"])
         self.assertEqual("release-old", summary["forcedFailure"]["currentReleaseId"])

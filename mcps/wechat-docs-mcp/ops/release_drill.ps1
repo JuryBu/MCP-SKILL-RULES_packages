@@ -79,6 +79,7 @@ function Invoke-Drill {
       phaseAWatcherFrozen = [bool]$Context.activationResult.phaseAWatcherFrozen
       postCommitStatusVerified = [bool]$Context.activationResult.postCommitStatusVerified
       ledgerBackupPresent = (Test-Path -LiteralPath $Context.activationResult.ledgerBackupPath -PathType Leaf)
+      schemaMigrated = [bool]$Context.activationResult.schemaMigrated
       toolHistory = $FixtureState.toolHistory
     }
   }

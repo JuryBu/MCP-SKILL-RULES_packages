@@ -4,7 +4,10 @@ import base64
 import hashlib
 import io
 import json
+import os
 import random
+import re
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -361,14 +364,59 @@ def test_converter_version_uses_files_without_launching_process(
     program.mkdir()
     executable = program / "soffice.exe"
     executable.write_bytes(b"offline-converter-fixture")
+    (program / "soffice.com").write_bytes(b"console-launcher-must-not-be-selected")
     (program / "version.ini").write_text("[Version]\nbuildid=fixture-build\n", encoding="utf-8")
     monkeypatch.setattr(
         "wechat_docs_mcp.office_converter.subprocess.run",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not launch")),
     )
-    version = LocalOfficeConverter(tmp_path / "derived", executable)._converter_version()
+    converter = LocalOfficeConverter(tmp_path / "derived", executable)
+    version = converter._converter_version()
+    assert converter._launcher_path() == executable
     assert "buildid=fixture-build" in version
     assert hashlib.sha256(executable.read_bytes()).hexdigest() in version
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows console-window regression")
+def test_windows_office_invocation_uses_gui_launcher_and_hidden_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    program = tmp_path / "program"
+    program.mkdir()
+    executable = program / "soffice.exe"
+    executable.write_bytes(b"gui-launcher")
+    (program / "soffice.com").write_bytes(b"console-launcher")
+    captured: dict[str, object] = {}
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["command"] = command
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("wechat_docs_mcp.office_converter.subprocess.run", fake_run)
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    converter = LocalOfficeConverter(tmp_path / "derived", executable)
+    converter._invoke(tmp_path / "source.docx", output_dir, tmp_path / "profile")
+
+    assert captured["command"][0] == str(executable)
+    assert int(captured["creationflags"]) & subprocess.CREATE_NO_WINDOW
+    startupinfo = captured["startupinfo"]
+    assert startupinfo.dwFlags & subprocess.STARTF_USESHOWWINDOW
+    assert startupinfo.wShowWindow == subprocess.SW_HIDE
+
+
+def test_runtime_sources_never_probe_soffice_version() -> None:
+    package_root = Path(__file__).resolve().parents[1]
+    forbidden = re.compile(r"soffice(?:\.exe|\.com)?.{0,160}--version|--version.{0,160}soffice", re.I | re.S)
+    checked: list[Path] = []
+    for root_name in ("src", "ops"):
+        for source in (package_root / root_name).rglob("*"):
+            if source.suffix.lower() not in {".py", ".ps1", ".psm1", ".cmd", ".bat"}:
+                continue
+            checked.append(source)
+            assert forbidden.search(source.read_text(encoding="utf-8")) is None, source
+    assert checked
 
 
 def test_continuation_rejects_changed_request(

@@ -53,11 +53,27 @@ class LocalOfficeConverter:
         self.timeout_seconds = timeout_seconds
 
     def _launcher_path(self) -> Path:
-        if os.name == "nt" and self.soffice_path.suffix.lower() == ".exe":
-            console_launcher = self.soffice_path.with_suffix(".com")
-            if console_launcher.is_file():
-                return console_launcher
+        if os.name == "nt" and self.soffice_path.suffix.lower() == ".com":
+            gui_launcher = self.soffice_path.with_suffix(".exe")
+            if gui_launcher.is_file():
+                return gui_launcher
+            raise LedgerError(
+                "ATTACHMENT_OFFICE_GUI_LAUNCHER_REQUIRED",
+                "Windows 上必须使用不会创建控制台窗口的 soffice.exe",
+            )
         return self.soffice_path
+
+    @staticmethod
+    def _hidden_subprocess_options() -> dict[str, Any]:
+        if os.name != "nt":
+            return {}
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        return {
+            "creationflags": subprocess.CREATE_NO_WINDOW,
+            "startupinfo": startupinfo,
+        }
 
     @staticmethod
     def _validate_openxml(source: Path) -> str:
@@ -178,7 +194,7 @@ class LocalOfficeConverter:
                 errors="replace",
                 timeout=self.timeout_seconds,
                 check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                **self._hidden_subprocess_options(),
             )
         except subprocess.TimeoutExpired as error:
             raise LedgerError("ATTACHMENT_OFFICE_CONVERSION_TIMEOUT", "Office 转 PDF 超时") from error
