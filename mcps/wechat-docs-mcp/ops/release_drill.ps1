@@ -35,7 +35,7 @@ function New-DrillLayout {
   Write-JsonAtomic -Path $FixtureStatePath -Value ([pscustomobject]@{
     brokerPid = 4242
     endpoints = [pscustomobject]@{
-      "wechat-docs" = [pscustomobject]@{ healthy = $true; toolCount = 29; pid = 5100; generation = 3 }
+      "wechat-docs" = [pscustomobject]@{ healthy = $true; toolCount = $ExpectedCurrentToolCount; pid = 5100; generation = 3 }
       napcat = [pscustomobject]@{ healthy = $true; toolCount = 22; pid = 5200; generation = 2 }
     }
     supervisor = [pscustomobject]@{ pid = 7001; healthy = $true; consecutiveFailures = 0; backendPid = 5100; backendGeneration = 3 }
@@ -71,6 +71,7 @@ function Invoke-Drill {
     $Results += [pscustomobject]@{
       case = $Shape
       activationGeneration = [int]$ActivatedManifest.validation.activeBackend.generation
+      activationToolCount = [int]$ActivatedManifest.validation.activeBackend.toolCount
       activeBackendPresent = ($null -ne $ActivatedManifest.validation.activeBackend)
       rollbackVerified = [bool]$Rollback.verified
       ledger = $Rollback.ledger

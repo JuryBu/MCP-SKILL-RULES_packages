@@ -202,6 +202,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertFalse(summary["productionTouched"])
         self.assertEqual(3, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
+        self.assertTrue(all(case["activationToolCount"] == 29 for case in summary["successfulCases"]))
         self.assertTrue(all(case["rollbackVerified"] for case in summary["successfulCases"]))
         self.assertTrue(summary["forcedFailure"]["caught"])
         self.assertTrue(summary["forcedFailure"]["rollbackVerified"])

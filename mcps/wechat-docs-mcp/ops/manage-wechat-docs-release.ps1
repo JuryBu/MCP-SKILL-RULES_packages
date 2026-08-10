@@ -11,6 +11,7 @@ param(
   [string]$CandidateManifestPath,
   [string]$DrillRoot,
   [string]$Endpoint = "wechat-docs",
+  [int]$ExpectedCurrentToolCount = 15,
   [int]$ExpectedToolCount = 29,
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,
@@ -159,6 +160,7 @@ function Invoke-BackendReload {
     [string]$Name,
     [string]$PrivateEnvPath,
     [string]$FixtureStatePath,
+    [int]$TargetToolCount,
     [switch]$FailFixtureHealth
   )
   $Before = Get-EndpointHealth -Mode $Mode -Name $Name -FixtureStatePath $FixtureStatePath
@@ -176,6 +178,7 @@ function Invoke-BackendReload {
   $BeforeBackend = [pscustomobject]@{ pid = [int]$Entry.pid; generation = [int]$Entry.generation }
   Set-JsonProperty -Object $Entry -Name "pid" -Value ([int]$Entry.pid + 1)
   Set-JsonProperty -Object $Entry -Name "generation" -Value ([int]$Entry.generation + 1)
+  Set-JsonProperty -Object $Entry -Name "toolCount" -Value $TargetToolCount
   Set-JsonProperty -Object $Entry -Name "healthy" -Value (-not $FailFixtureHealth)
   $Supervisor = Ensure-JsonObject -Parent $State -Name "supervisor"
   Set-JsonProperty -Object $Supervisor -Name "pid" -Value 7001
@@ -284,8 +287,8 @@ function Restore-ReleaseSwitch {
   if (-not (Test-Path -LiteralPath $Context.previousLinkPath)) { throw "Previous Junction is missing during rollback" }
   [System.IO.Directory]::Move($Context.previousLinkPath, $Context.currentPath)
   Restore-ActivationFiles -BackupRoot $Context.backupRoot -PointersRoot $Context.pointersRoot -RuntimePath $Context.runtimePath -PrivateEnvPath $Context.privateEnvPath -ManifestPath $Context.manifestPath
-  Invoke-BackendReload -Mode $Context.mode -Name $Endpoint -PrivateEnvPath $Context.privateEnvPath -FixtureStatePath $Context.fixtureStatePath | Out-Null
-  $Health = Wait-EndpointHealth -Mode $Context.mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $Context.fixtureStatePath
+  Invoke-BackendReload -Mode $Context.mode -Name $Endpoint -PrivateEnvPath $Context.privateEnvPath -FixtureStatePath $Context.fixtureStatePath -TargetToolCount $Context.expectedCurrentToolCount | Out-Null
+  $Health = Wait-EndpointHealth -Mode $Context.mode -Name $Endpoint -ToolCount $Context.expectedCurrentToolCount -FixtureStatePath $Context.fixtureStatePath
   $Supervisor = Wait-Supervisor -Mode $Context.mode -SupervisorPath $Context.supervisorPath -FixtureStatePath $Context.fixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)
   $ProtectedHealth = Wait-EndpointHealth -Mode $Context.mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $Context.fixtureStatePath
   $Ledger = Get-LedgerState -PythonPath $Context.probePython -LedgerPath $Context.ledgerPath -BoundRouteId $Context.routeId
@@ -376,7 +379,7 @@ function Invoke-ReleaseSwitch {
     if ($PackageInfo.inside_release -ne $true -or [int]$PackageInfo.tool_count -ne $ExpectedToolCount) { throw "Candidate package does not resolve from the final release path" }
   }
   $BeforeLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
-  $BeforeHealth = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $FixtureStatePath
+  $BeforeHealth = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedCurrentToolCount -FixtureStatePath $FixtureStatePath
   $BeforeProtectedHealth = Wait-EndpointHealth -Mode $Mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $FixtureStatePath
   Copy-ActivationBackup -BackupRoot $BackupRoot -PointersRoot $PointersRoot -RuntimePath $RuntimePath -PrivateEnvPath $PrivateEnvPath -ManifestPath $ManifestPath -CurrentTarget $PreviousTarget
 
@@ -405,6 +408,7 @@ function Invoke-ReleaseSwitch {
     beforeLedger = $BeforeLedger
     beforeBrokerPid = [int]$BeforeHealth.pid
     beforeBackendGeneration = [int]$BeforeHealth.backend.generation
+    expectedCurrentToolCount = [int]$ExpectedCurrentToolCount
     beforeProtectedBackendPid = [int]$BeforeProtectedHealth.backend.pid
     beforeProtectedBackendGeneration = [int]$BeforeProtectedHealth.backend.generation
   }
@@ -431,7 +435,7 @@ function Invoke-ReleaseSwitch {
     Set-JsonProperty -Object $PrivateEnv -Name "WECHAT_DOCS_MCP_PYTHON" -Value (Join-Path $CurrentPath "env\Scripts\python.exe")
     Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 
-    Invoke-BackendReload -Mode $Mode -Name $Endpoint -PrivateEnvPath $PrivateEnvPath -FixtureStatePath $FixtureStatePath -FailFixtureHealth:$FailFixtureHealth | Out-Null
+    Invoke-BackendReload -Mode $Mode -Name $Endpoint -PrivateEnvPath $PrivateEnvPath -FixtureStatePath $FixtureStatePath -TargetToolCount $ExpectedToolCount -FailFixtureHealth:$FailFixtureHealth | Out-Null
     $Health = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration ($Context.beforeBackendGeneration + 1)
     $Supervisor = Wait-Supervisor -Mode $Mode -SupervisorPath $SupervisorPath -FixtureStatePath $FixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)
     $ProtectedHealth = Wait-EndpointHealth -Mode $Mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration $Context.beforeProtectedBackendGeneration
