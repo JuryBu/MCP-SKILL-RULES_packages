@@ -606,7 +606,7 @@ wheels = [
 
 [[package]]
 name = "wechat-docs-mcp"
-version = "0.4.4"
+version = "0.4.5"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -614,6 +614,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pycryptodome" },
     { name = "pypdfium2" },
+    { name = "pywin32", marker = "sys_platform == 'win32'" },
     { name = "zstandard" },
 ]
 
@@ -624,6 +625,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=11,<13" },
     { name = "pycryptodome", specifier = ">=3.23,<4" },
     { name = "pypdfium2", specifier = ">=4.30,<5" },
+    { name = "pywin32", marker = "sys_platform == 'win32'", specifier = ">=311,<313" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
 

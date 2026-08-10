@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import pythoncom
+
 from .outbound import FocusState, UiBackendError
 from .route_verifier import VerifiedRoute
 
@@ -80,11 +82,11 @@ class ClipboardFormat:
     data: bytes
 
 
-@dataclass(frozen=True)
+@dataclass
 class Win32EnvironmentSnapshot:
     foreground_window: int
     mouse_position: tuple[int, int]
-    clipboard_formats: tuple[ClipboardFormat, ...]
+    clipboard_data_object: object | None
     clipboard_sequence_number: int
     wechat_window: int | None
     wechat_visible: bool
@@ -108,6 +110,7 @@ class Win32WechatAttachmentBackend:
         self._expected_mouse_position: tuple[int, int] | None = None
         self._owned_clipboard_sequence: int | None = None
         self._user_interaction_detected = False
+        self._clipboard_com_initialized = False
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
@@ -142,37 +145,38 @@ class Win32WechatAttachmentBackend:
             time.sleep(0.05)
         raise UiBackendError("CLIPBOARD_BUSY", "剪贴板被其它程序占用")
 
-    def _snapshot_clipboard(self) -> tuple[ClipboardFormat, ...]:
-        formats: list[ClipboardFormat] = []
-        self._open_clipboard()
+    def _snapshot_clipboard(self) -> object:
         try:
-            format_id = 0
-            while True:
-                format_id = int(self.user32.EnumClipboardFormats(format_id))
-                if not format_id:
-                    break
-                handle = self.user32.GetClipboardData(format_id)
-                if not handle:
-                    raise UiBackendError(
-                        "CLIPBOARD_FORMAT_UNSUPPORTED",
-                        "剪贴板包含无法完整读取的延迟格式",
-                    )
-                size = int(self.kernel32.GlobalSize(handle))
-                if size <= 0:
-                    raise UiBackendError(
-                        "CLIPBOARD_FORMAT_UNSUPPORTED",
-                        "剪贴板包含非内存型格式，无法安全恢复",
-                    )
-                pointer = self.kernel32.GlobalLock(handle)
-                if not pointer:
-                    raise UiBackendError("CLIPBOARD_SNAPSHOT_FAILED", "剪贴板格式无法锁定")
-                try:
-                    formats.append(ClipboardFormat(format_id, ctypes.string_at(pointer, size)))
-                finally:
-                    self.kernel32.GlobalUnlock(handle)
-        finally:
-            self.user32.CloseClipboard()
-        return tuple(formats)
+            pythoncom.CoInitialize()
+            self._clipboard_com_initialized = True
+            data_object = pythoncom.OleGetClipboard()
+            if data_object is None:
+                raise RuntimeError("OLE clipboard returned no data object")
+            return data_object
+        except Exception as error:
+            if self._clipboard_com_initialized:
+                pythoncom.CoUninitialize()
+                self._clipboard_com_initialized = False
+            raise UiBackendError(
+                "CLIPBOARD_SNAPSHOT_FAILED",
+                "无法通过 OLE 安全保存当前剪贴板对象",
+            ) from error
+
+    def _restore_clipboard(self, data_object: object) -> None:
+        try:
+            pythoncom.OleSetClipboard(data_object)
+            pythoncom.OleFlushClipboard()
+        except Exception as error:
+            raise UiBackendError(
+                "CLIPBOARD_RESTORE_FAILED",
+                "无法通过 OLE 恢复原剪贴板对象",
+            ) from error
+
+    def _release_clipboard_snapshot(self, data_object: object | None) -> None:
+        del data_object
+        if getattr(self, "_clipboard_com_initialized", False):
+            pythoncom.CoUninitialize()
+            self._clipboard_com_initialized = False
 
     def _replace_clipboard(self, formats: tuple[ClipboardFormat, ...]) -> None:
         self._open_clipboard()
@@ -260,15 +264,20 @@ class Win32WechatAttachmentBackend:
         if not self.user32.GetCursorPos(ctypes.byref(point)):
             raise UiBackendError("CURSOR_SNAPSHOT_FAILED", "无法读取鼠标位置")
         wechat_window = self._find_window(required=False)
-        snapshot = Win32EnvironmentSnapshot(
-            foreground_window=int(self.user32.GetForegroundWindow()),
-            mouse_position=(int(point.x), int(point.y)),
-            clipboard_formats=self._snapshot_clipboard(),
-            clipboard_sequence_number=int(self.user32.GetClipboardSequenceNumber()),
-            wechat_window=wechat_window,
-            wechat_visible=bool(wechat_window and self.user32.IsWindowVisible(wechat_window)),
-            wechat_iconic=bool(wechat_window and self.user32.IsIconic(wechat_window)),
-        )
+        clipboard_data_object = self._snapshot_clipboard()
+        try:
+            snapshot = Win32EnvironmentSnapshot(
+                foreground_window=int(self.user32.GetForegroundWindow()),
+                mouse_position=(int(point.x), int(point.y)),
+                clipboard_data_object=clipboard_data_object,
+                clipboard_sequence_number=int(self.user32.GetClipboardSequenceNumber()),
+                wechat_window=wechat_window,
+                wechat_visible=bool(wechat_window and self.user32.IsWindowVisible(wechat_window)),
+                wechat_iconic=bool(wechat_window and self.user32.IsIconic(wechat_window)),
+            )
+        except Exception:
+            self._release_clipboard_snapshot(clipboard_data_object)
+            raise
         self._snapshot = snapshot
         self._expected_mouse_position = snapshot.mouse_position
         self._user_interaction_detected = False
@@ -530,15 +539,25 @@ class Win32WechatAttachmentBackend:
         if not isinstance(snapshot, Win32EnvironmentSnapshot):
             raise UiBackendError("ENV_SNAPSHOT_INVALID", "环境快照类型无效")
         errors: list[Exception] = []
-        clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
-        if self._owned_clipboard_sequence is not None:
-            if clipboard_sequence == self._owned_clipboard_sequence:
-                try:
-                    self._replace_clipboard(snapshot.clipboard_formats)
-                except Exception as error:
-                    errors.append(error)
-            else:
-                self._user_interaction_detected = True
+        clipboard_data_object = snapshot.clipboard_data_object
+        try:
+            clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
+            if self._owned_clipboard_sequence is not None:
+                if clipboard_sequence == self._owned_clipboard_sequence:
+                    try:
+                        if clipboard_data_object is None:
+                            raise UiBackendError(
+                                "CLIPBOARD_SNAPSHOT_INVALID",
+                                "原剪贴板 OLE 对象已失效",
+                            )
+                        self._restore_clipboard(clipboard_data_object)
+                    except Exception as error:
+                        errors.append(error)
+                else:
+                    self._user_interaction_detected = True
+        finally:
+            snapshot.clipboard_data_object = None
+            self._release_clipboard_snapshot(clipboard_data_object)
         if self._user_interaction_detected:
             self._snapshot = None
             self._expected_mouse_position = None

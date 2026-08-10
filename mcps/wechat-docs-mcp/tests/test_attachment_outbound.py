@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from wechat_docs_mcp import win32_attachment_ui
 from wechat_docs_mcp.attachments import AttachmentRegistry
 from wechat_docs_mcp.ledger import EventLedger, LedgerError
 from wechat_docs_mcp.outbound import FocusState, OutboundRefused, OutboundState, UiBackendError
@@ -355,7 +356,7 @@ def test_clipboard_sequence_change_preserves_user_clipboard() -> None:
     backend._expected_mouse_position = (1, 1)
     restored: list[object] = []
     backend._replace_clipboard = restored.append
-    snapshot = Win32EnvironmentSnapshot(1, (1, 1), tuple(), 50, None, False, False)
+    snapshot = Win32EnvironmentSnapshot(1, (1, 1), object(), 50, None, False, False)
     with pytest.raises(UiBackendError) as raised:
         backend.restore_environment(snapshot)
     assert raised.value.code == "ENV_RESTORE_SKIPPED_USER_INTERACTION"
@@ -391,3 +392,66 @@ def test_win32_clipboard_handle_functions_use_pointer_sized_types() -> None:
     assert backend.kernel32.GlobalUnlock.restype is wintypes.BOOL
     assert backend.kernel32.GlobalFree.argtypes == [wintypes.HGLOBAL]
     assert backend.kernel32.GlobalFree.restype is wintypes.HGLOBAL
+
+
+def test_clipboard_snapshot_and_restore_use_ole_data_object(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[object] = []
+    data_object = object()
+
+    class PythonCom:
+        @staticmethod
+        def CoInitialize() -> None:
+            calls.append("initialize")
+
+        @staticmethod
+        def OleGetClipboard() -> object:
+            calls.append("get")
+            return data_object
+
+        @staticmethod
+        def OleSetClipboard(value: object) -> None:
+            calls.append(("set", value))
+
+        @staticmethod
+        def OleFlushClipboard() -> None:
+            calls.append("flush")
+
+        @staticmethod
+        def CoUninitialize() -> None:
+            calls.append("uninitialize")
+
+    class User32:
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 100
+
+        @staticmethod
+        def SetCursorPos(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return False
+
+    monkeypatch.setattr(win32_attachment_ui, "pythoncom", PythonCom())
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._clipboard_com_initialized = False
+    backend._owned_clipboard_sequence = 100
+    backend._user_interaction_detected = False
+    backend._snapshot = None
+    backend._expected_mouse_position = None
+    backend._find_window = lambda *, required: None
+
+    captured = backend._snapshot_clipboard()
+    snapshot = Win32EnvironmentSnapshot(0, (1, 1), captured, 50, None, False, False)
+    backend.restore_environment(snapshot)
+
+    assert calls == [
+        "initialize",
+        "get",
+        ("set", data_object),
+        "flush",
+        "uninitialize",
+    ]
+    assert snapshot.clipboard_data_object is None
