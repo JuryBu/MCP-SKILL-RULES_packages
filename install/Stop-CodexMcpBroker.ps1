@@ -35,6 +35,22 @@ function Find-BrokerProcesses {
         Where-Object { Test-BrokerCommandLine -CommandLine ([string]$_.CommandLine) }
 }
 
+function Wait-BrokerProcessExit {
+    param(
+        [int]$TargetProcessId,
+        [int]$TimeoutMilliseconds = 5000
+    )
+    $deadline = [DateTime]::UtcNow.AddMilliseconds($TimeoutMilliseconds)
+    do {
+        if (-not (Get-Process -Id $TargetProcessId -ErrorAction SilentlyContinue)) {
+            return
+        }
+        Start-Sleep -Milliseconds 50
+    } while ([DateTime]::UtcNow -lt $deadline)
+
+    throw "Timed out waiting for Codex MCP broker process to exit: PID $TargetProcessId"
+}
+
 function Get-BrokerProcessFromPid {
     param([string]$PidValue)
     if (-not $PidValue) { return $null }
@@ -56,6 +72,7 @@ if (-not (Test-Path -LiteralPath $pidPath)) {
     }
     foreach ($brokerProcess in $brokerProcesses) {
         & taskkill.exe /PID $brokerProcess.ProcessId /T /F | Out-Null
+        Wait-BrokerProcessExit -TargetProcessId $brokerProcess.ProcessId
         Write-Output "Stopped Codex MCP broker process tree by command line match: PID $($brokerProcess.ProcessId)"
     }
     exit 0
@@ -65,6 +82,7 @@ $pidValue = Get-Content -LiteralPath $pidPath -Encoding UTF8 | Select-Object -Fi
 $brokerProcess = Get-BrokerProcessFromPid -PidValue $pidValue
 if ($brokerProcess) {
     & taskkill.exe /PID $pidValue /T /F | Out-Null
+    Wait-BrokerProcessExit -TargetProcessId ([int]$pidValue)
     Write-Output "Stopped Codex MCP broker process tree: PID $pidValue"
 } else {
     $process = if ($pidValue) { Get-Process -Id ([int]$pidValue) -ErrorAction SilentlyContinue } else { $null }
@@ -75,6 +93,7 @@ if ($brokerProcess) {
     }
     foreach ($liveBrokerProcess in @(Find-BrokerProcesses)) {
         & taskkill.exe /PID $liveBrokerProcess.ProcessId /T /F | Out-Null
+        Wait-BrokerProcessExit -TargetProcessId $liveBrokerProcess.ProcessId
         Write-Output "Stopped Codex MCP broker process tree by command line match: PID $($liveBrokerProcess.ProcessId)"
     }
 }
