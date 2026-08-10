@@ -286,6 +286,19 @@ class SafeTextOutboundTests(unittest.TestCase):
         self.assertTrue(result.cleanup_performed)
         self.assertEqual(["write", "clear"], backend.keyboard_actions)
 
+    def test_cleanup_failure_preserves_primary_error(self) -> None:
+        ledger = FakeLedger()
+        backend = FakeBackend()
+        backend.failures["write"] = UiBackendError("WRITE_FAILED", "synthetic")
+        backend.failures["clear"] = UiBackendError("CLEAR_FAILED", "synthetic")
+
+        result = execute(sender(ledger, backend))
+
+        self.assertEqual(OutboundState.FAILED, result.state)
+        self.assertEqual("WRITE_FAILED", result.error_code)
+        self.assertEqual("OWNED_DRAFT_CLEANUP_FAILED", result.cleanup_error_code)
+        self.assertFalse(result.cleanup_performed)
+
     def test_lost_focus_skips_owned_draft_cleanup(self) -> None:
         ledger = FakeLedger()
         backend = FakeBackend()

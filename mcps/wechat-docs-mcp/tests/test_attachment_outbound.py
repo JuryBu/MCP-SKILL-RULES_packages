@@ -5,6 +5,7 @@ import ctypes
 import struct
 from ctypes import wintypes
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -598,6 +599,8 @@ def test_text_draft_requires_database_proof_before_send(monkeypatch: pytest.Monk
 
     assert handle["proof_sha256"]
     assert handle["text_sha256"] == hashlib.sha256(b"SYNTHETIC_TEXT").hexdigest()
+    assert handle["text"] == "SYNTHETIC_TEXT"
+    assert handle["delete_press_count"] == len("SYNTHETIC_TEXT")
     assert backend._text_draft_handle is handle
     assert calls == [("focus", 9001), ("write", 9001, "SYNTHETIC_TEXT"), "refresh"]
 
@@ -636,3 +639,54 @@ def test_text_send_uses_bounded_window_enter(monkeypatch: pytest.MonkeyPatch) ->
     backend.send_owned_draft(9001, handle)
 
     assert calls == [9001]
+
+
+def test_text_focus_proof_tolerates_database_metadata_changes() -> None:
+    backend = object.__new__(Win32WechatTextBackend)
+    text = "SYNTHETIC_TEXT"
+    handle: dict[str, Any] = {
+        "username": USERNAME,
+        "proof_sha256": "old-row-hash",
+        "text": text,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "delete_press_count": len(text),
+    }
+    backend._text_draft_handle = handle
+    backend._guard = lambda window: int(window)
+    backend._refresh = lambda: None
+    backend._draft_rows = lambda username: [(1, b"changed-prefix" + text.encode("utf-8"))]
+
+    assert backend.focus_state(9001, SimpleNamespace(username=USERNAME)) is FocusState.VERIFIED
+
+
+def test_text_cleanup_uses_exact_bounded_backspaces(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    text = "SYNTHETIC_TEXT"
+    handle: dict[str, Any] = {
+        "username": USERNAME,
+        "proof_sha256": "proof",
+        "text": text,
+        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "delete_press_count": len(text),
+    }
+    backend._text_draft_handle = handle
+    calls: list[object] = []
+    rows = [[(1, text.encode("utf-8"))], [(1, b"")]]
+    backend._guard = lambda window: int(window)
+    backend._focus_input = lambda window: calls.append(("focus", window))
+    backend._window_end = lambda window: calls.append(("end", window))
+    backend._window_backspaces = lambda window, count: calls.append(("backspace", window, count))
+    backend._refresh = lambda: calls.append("refresh")
+    backend._draft_rows = lambda username: rows.pop(0) if len(rows) > 1 else rows[0]
+
+    backend.clear_owned_draft(9001, handle)
+
+    assert calls == [
+        "refresh",
+        ("focus", 9001),
+        ("end", 9001),
+        ("backspace", 9001, len(text)),
+        "refresh",
+    ]
+    assert backend._text_draft_handle is None

@@ -41,6 +41,7 @@ class OutboundExecutionResult:
     send_action_invoked: bool
     cleanup_performed: bool
     restore_succeeded: bool
+    cleanup_error_code: str | None = None
 
 
 class OutboundRefused(RuntimeError):
@@ -205,6 +206,7 @@ class SafeTextOutbound:
         send_action_invoked = False
         send_may_have_occurred = False
         cleanup_performed = False
+        cleanup_error_code: str | None = None
         restore_succeeded = True
         draft_handle: object | None = None
         window: object | None = None
@@ -254,7 +256,9 @@ class SafeTextOutbound:
                             self._backend.clear_owned_draft(window, draft_handle)
                             cleanup_performed = True
                     except Exception:
-                        error_code = "OWNED_DRAFT_CLEANUP_FAILED"
+                        cleanup_error_code = "OWNED_DRAFT_CLEANUP_FAILED"
+                        if error_code is None:
+                            error_code = cleanup_error_code
                         state = OutboundState.FAILED
                 try:
                     self._backend.restore_environment(snapshot)
@@ -268,6 +272,7 @@ class SafeTextOutbound:
             "execution_id": active_execution_id,
             "send_action_invoked": send_action_invoked,
             "cleanup_performed": cleanup_performed,
+            "cleanup_error_code": cleanup_error_code,
             "restore_succeeded": restore_succeeded,
             "baseline_local_id": baseline_local_id,
         }
@@ -308,4 +313,5 @@ class SafeTextOutbound:
             send_action_invoked=send_action_invoked,
             cleanup_performed=cleanup_performed,
             restore_succeeded=restore_succeeded,
+            cleanup_error_code=cleanup_error_code,
         )

@@ -30,6 +30,7 @@ SW_SHOWNORMAL = 1
 SW_MINIMIZE = 6
 SW_RESTORE = 9
 VK_CONTROL = 0x11
+VK_END = 0x23
 VK_DELETE = 0x2E
 VK_DOWN = 0x28
 VK_F = 0x46
@@ -648,6 +649,19 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
         self._send_window_message(window, WM_KEYDOWN, VK_RETURN, lparam_down)
         self._send_window_message(window, WM_KEYUP, VK_RETURN, lparam_down | 0xC0000000)
 
+    def _window_end(self, window: int) -> None:
+        scan = int(self.user32.MapVirtualKeyW(VK_END, 0))
+        lparam_down = (scan << 16) | 1
+        self._send_window_message(window, WM_KEYDOWN, VK_END, lparam_down)
+        self._send_window_message(window, WM_KEYUP, VK_END, lparam_down | 0xC0000000)
+
+    def _window_backspaces(self, window: int, delete_press_count: int) -> None:
+        if not 0 < delete_press_count <= VISIBLE_TEXT_CODE_UNIT_LIMIT:
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿长度证明无效")
+        for _ in range(delete_press_count):
+            self._send_window_message(window, WM_CHAR, 0x08, 1)
+            time.sleep(0.05)
+
     def snapshot_environment(self) -> Win32EnvironmentSnapshot:
         point = wintypes.POINT()
         if not self.user32.GetCursorPos(ctypes.byref(point)):
@@ -695,6 +709,8 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
             raise UiBackendError("TEXT_DRAFT_CONTENT_UNVERIFIED", "微信草稿表未包含批准正文")
         draft_handle["proof_sha256"] = hashlib.sha256(data).hexdigest()
         draft_handle["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        draft_handle["text"] = text
+        draft_handle["delete_press_count"] = len(text)
         self._text_draft_handle = draft_handle
 
     def focus_state(self, window: object, route: VerifiedRoute) -> FocusState:
@@ -713,12 +729,18 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
             proof = handle.get("proof_sha256")
             if not isinstance(proof, str) or not proof:
                 return FocusState.UNKNOWN
+            text = handle.get("text")
+            text_sha256 = handle.get("text_sha256")
+            if not isinstance(text, str) or not text:
+                return FocusState.UNKNOWN
+            if hashlib.sha256(text.encode("utf-8")).hexdigest() != text_sha256:
+                return FocusState.UNKNOWN
             self._refresh()
             rows = self._draft_rows(route.username)
             if len(rows) != 1:
                 return FocusState.UNKNOWN
             data = self._draft_bytes(rows[0][1])
-            return FocusState.VERIFIED if hashlib.sha256(data).hexdigest() == proof else FocusState.MISMATCH
+            return FocusState.VERIFIED if self._contains_text(data, text) else FocusState.MISMATCH
         except Exception:
             return FocusState.UNKNOWN
 
@@ -740,11 +762,22 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
         active_window = self._guard(window)
         if draft_handle is not getattr(self, "_text_draft_handle", None):
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿句柄无效")
-        self._hotkey(active_window, VK_CONTROL, 0x41)
-        self._press(active_window, VK_DELETE)
-        time.sleep(0.5)
-        self._refresh()
+        text = draft_handle.get("text")
+        delete_press_count = draft_handle.get("delete_press_count")
+        if not isinstance(text, str) or not text or not isinstance(delete_press_count, int):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿内容证明无效")
         username = draft_handle.get("username")
-        if any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
-            raise UiBackendError("TEXT_DRAFT_CLEANUP_FAILED", "文字草稿未被清理")
-        self._text_draft_handle = None
+        self._refresh()
+        rows = self._draft_rows(username)
+        if len(rows) != 1 or not self._contains_text(self._draft_bytes(rows[0][1]), text):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "当前草稿不再匹配本次自有正文")
+        self._focus_input(active_window)
+        self._window_end(active_window)
+        self._window_backspaces(active_window, delete_press_count)
+        for _ in range(4):
+            time.sleep(0.5)
+            self._refresh()
+            if not any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
+                self._text_draft_handle = None
+                return
+        raise UiBackendError("TEXT_DRAFT_CLEANUP_FAILED", "文字草稿未被清理")
