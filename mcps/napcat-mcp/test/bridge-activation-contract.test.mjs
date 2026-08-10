@@ -316,6 +316,8 @@ test("portable package entrypoint resolves the managed broker root and leaves it
     ["-CodexHome", codexHome, "-CodeRoot", codeRoot, "-DataRoot", dataRoot],
     {
       USERPROFILE: fixtureRoot,
+      CODEX_TOOLKIT_BROKER_ROOT: "",
+      CODEX_TOOLKIT_SERVICE_MANIFEST: "",
       CODEX_TOOLKIT_NODE_EXE: "",
       PATH: [
         path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0"),

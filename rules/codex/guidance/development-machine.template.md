@@ -38,7 +38,9 @@
 
 `message_seq` 是不保证数字递增的消息标识。收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务消息；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
 
-结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（对端机器扫描到）与 `conversation_received`（对端 Codex 对话收到引导）。这两项是系统自动生成的传输回执，不代表业务已处理；只有绑定对话完成正文处理后提交的 `napcat_task_ack` 才能清除对应 pending 消息。
+结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（对端机器扫描到）与 `conversation_received`（可信消息已按任务绑定持久化进目标对话的任务账本）。任务级 wake cooldown 只控制下一次 UI 提醒，不延迟持久化回执。这两项都不代表业务已处理；只有绑定对话完成正文处理后提交的 `napcat_task_ack` 才能清除对应 pending 消息。
+
+收到跨机投递严重告警后，开发机维护对话尽快通过维护 task 回带原 `delivery_id` 的接警消息，并核对发送侧 delivery、接收侧任务绑定/持久账本、router 与 wake 租约。不得自动重发业务消息、替生产对话 ACK、关闭 task 或按跨账号 `message_seq` 猜测状态。消息已持久化但处于合法 wake cooldown 时属于「已投递、待提醒」，不得按失联处置，也不应只为消警降低生产 task 的 cooldown；真实故障修复后等待系统恢复通知，再回报最终结果。
 
 旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的对端 `target_conversation_id`，接收端校验可信机器后持久保存回拨地址；之后对端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替对方登记任务；双方仍须各自核对并登记建议任务、互发握手，确认新路由后才能继续正式协作。
 
@@ -47,6 +49,8 @@
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；`visible` 会为消息附带稳定标识，忙碌轮次中模型可先收到，但 Desktop 气泡可能等当前阻塞工具返回后才渲染，`hidden` 保留无独立气泡的旧行为。
 
 没有新消息时不按计时重复发送旧提醒；有新消息时，冷却结束后只合并唤醒一次，并同时带回此前仍待处理的消息。短时间连续到达的新消息不得不断推迟这次提醒，也不得拆成多次唤醒。
+
+公共 MCP、Rules 或 broker 修复默认在隔离工作树完成实现、测试、打包和对端影子验证，不把生产对话或正式 task 当测试夹具。生产切换只占最后的受控热更新窗口：先确认无 in-flight scan 和不可保护的 active wake，备份私有状态，短暂停止必要后端，健康检查失败立即回滚；不得把候选修复、长测或跨机等待串进生产停机时间。
 
 ## 问题回收
 

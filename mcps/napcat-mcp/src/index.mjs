@@ -387,7 +387,7 @@ const tools = [
   },
   {
     name: "napcat_delivery_status",
-    description: "查看结构化消息的自动运输回执。pending 表示仅本机已发送；machine_received 表示对端机器已扫描到；conversation_received 表示对端指定 Codex 对话已接受唤醒。它不等于业务处理完成 ACK。",
+    description: "查看结构化消息的自动运输回执。pending 表示仅本机已发送；machine_received 表示对端机器已扫描到；conversation_received 表示可信任务消息已按绑定持久化进目标对话任务账本。任务 wake cooldown 只延迟 UI 提醒；这些状态都不等于业务处理完成 ACK。",
     inputSchema: deliveryStatusInputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },

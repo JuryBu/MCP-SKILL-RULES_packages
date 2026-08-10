@@ -196,6 +196,9 @@ export function createTaskRouter(options = {}) {
       const machineReceipts = controlPlane
         ? await controlPlane.acknowledgeBusinessMessages(messagesToObserve, "machine_received")
         : [];
+      const conversationReceipts = controlPlane
+        ? await controlPlane.acknowledgeBusinessMessages(messagesToObserve, "conversation_received")
+        : [];
       const pendingMessages = seenTask.pendingMessages
         .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
       const newMessages = pendingMessages
@@ -208,6 +211,7 @@ export function createTaskRouter(options = {}) {
           pendingCount: pendingMessages.length,
           scannedCount: history.scannedCount,
           machineReceipts,
+          conversationReceipts,
         };
       }
       const pendingThroughMessage = pendingMessages.at(-1);
@@ -233,6 +237,8 @@ export function createTaskRouter(options = {}) {
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
+          machineReceipts,
+          conversationReceipts,
         };
       }
       if (await isMaintenanceActive()) {
@@ -250,6 +256,8 @@ export function createTaskRouter(options = {}) {
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
+          machineReceipts,
+          conversationReceipts,
         };
       }
       let wake;
@@ -277,7 +285,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId };
+        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId, machineReceipts, conversationReceipts };
       }
       if (wake.outcome === "accepted" || wake.outcome === "completed") {
         registry.confirmWakeSent({
@@ -286,13 +294,6 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        const pendingSequenceSet = new Set(pendingMessages.map((message) => message.messageSeq));
-        const conversationReceipts = controlPlane
-          ? await controlPlane.acknowledgeBusinessMessages(
-              eligible.filter((message) => pendingSequenceSet.has(messageSequence(message))),
-              "conversation_received",
-            )
-          : [];
         return {
           taskId: task.taskId,
           outcome: wake.outcome,
@@ -322,6 +323,8 @@ export function createTaskRouter(options = {}) {
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           error: wake.error,
+          machineReceipts,
+          conversationReceipts,
         };
       }
       registry.releaseWakeLease({
@@ -339,6 +342,8 @@ export function createTaskRouter(options = {}) {
         pendingThroughSequence: wakeBoundarySequence,
         wakeId,
         threadStatus: wake.status,
+        machineReceipts,
+        conversationReceipts,
       };
     } catch (error) {
       return { taskId: task.taskId, outcome: "scan_error", error: publicError(error) };

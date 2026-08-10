@@ -17,6 +17,7 @@ function message(messageSeq, offsetMs) {
     taskId: "router-ledger-e2e",
     sourceMachine: "development",
     targetMachine: "training",
+    deliveryId: `delivery-${messageSeq}`,
     time: new Date(BASE_TIME_MS + offsetMs).toISOString(),
     text: `message-${messageSeq}`,
     attachments: [],
@@ -28,6 +29,8 @@ function createFixture() {
   let currentTimeMs = BASE_TIME_MS;
   let history = [message(10, 0)];
   const wakes = [];
+  const receipts = [];
+  const receiptKeys = new Set();
   const registry = createTaskRegistry({
     statePath: path.join(root, "state", "task-registry.json"),
     now: () => new Date(currentTimeMs),
@@ -57,11 +60,38 @@ function createFixture() {
         return { outcome: "accepted", status: "busy", started: true, turn: { id: `turn-${wakes.length}` } };
       },
     },
+    controlPlane: {
+      async keepAlive() {
+        return { enabled: true };
+      },
+      async scanGroupHistory() {
+        return { enabled: true, results: [] };
+      },
+      async reconcileOutgoingDeliveries() {
+        return { results: [] };
+      },
+      async scanOwnerReplies() {
+        return { enabled: true, results: [] };
+      },
+      async acknowledgeBusinessMessages(messages, stage) {
+        const sent = [];
+        for (const entry of messages) {
+          const key = `${stage}:${entry.deliveryId}`;
+          if (receiptKeys.has(key)) continue;
+          receiptKeys.add(key);
+          const receipt = { deliveryId: entry.deliveryId, stage, sent: true };
+          receipts.push(receipt);
+          sent.push(receipt);
+        }
+        return sent;
+      },
+    },
   });
   return {
     registry,
     router,
     wakes,
+    receipts,
     advance(milliseconds) {
       currentTimeMs += milliseconds;
     },
@@ -90,7 +120,14 @@ test("new traffic triggers coalesced guidance while old unACKed messages never r
 
     fixture.advance(5_000);
     fixture.addMessage(11, 5_000);
-    assert.equal((await fixture.router.scanOnce()).results[0].outcome, "wake_cooldown");
+    const cooldown = await fixture.router.scanOnce();
+    assert.equal(cooldown.results[0].outcome, "wake_cooldown");
+    assert.deepEqual(fixture.receipts.filter((entry) => entry.deliveryId === "delivery-11"), [
+      { deliveryId: "delivery-11", stage: "machine_received", sent: true },
+      { deliveryId: "delivery-11", stage: "conversation_received", sent: true },
+    ]);
+    assert.deepEqual(fixture.registry.get("router-ledger-e2e").pendingMessages.map((entry) => entry.messageSeq), [10, 11]);
+    assert.equal(fixture.wakes.length, 1);
     fixture.advance(5_000);
     fixture.addMessage(12, 10_000);
     assert.equal((await fixture.router.scanOnce()).results[0].outcome, "wake_cooldown");

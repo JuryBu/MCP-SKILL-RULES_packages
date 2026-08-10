@@ -338,16 +338,16 @@ export function createControlPlane(options = {}) {
   }
 
   function deliveryAlertMessage(delivery, layer, recovered) {
-    const missingLayer = layer === "machine_received" ? "machine_received（对端机器确认）" : "conversation_received（目标对话确认）";
+    const missingLayer = layer === "machine_received" ? "machine_received（对端机器确认）" : "conversation_received（目标任务账本确认）";
     const impact = layer === "machine_received"
       ? "对端可能没有收到这条关键结构化消息，不能假设业务已经开始执行"
-      : "对端机器已确认收到，但目标 Codex 对话尚未确认接收，不能假设业务已经执行";
+      : "对端机器已确认收到，但消息尚未确认持久化进目标对话任务账本，不能假设业务已经执行";
     const execution = recovered
       ? "接收层已恢复；业务是否执行仍以任务消息与后续回报为准"
       : "未知；本告警不会自动重发、执行或 ACK 业务消息";
     const action = recovered
       ? "系统已解除本层告警并继续按 delivery_id 对账"
-      : "系统继续按 delivery_id 对账，请检查对端路由或对话；不要按跨账号 message_seq 猜测状态";
+      : "系统继续按 delivery_id 对账，请检查对端路由、任务绑定和持久账本；不要按跨账号 message_seq 猜测状态";
     return [
       "[Codex][MESSAGE]",
       recovered ? "【跨机投递告警已恢复】" : "【跨机投递严重告警】",

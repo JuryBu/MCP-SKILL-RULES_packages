@@ -204,7 +204,7 @@ test("router paginates beyond the latest fifty without comparing cross-account s
   assert.deepEqual(current.calls.find((call) => call.type === "acquireWakeLease").input.messages.map((item) => item.messageSeq), [10]);
 });
 
-test("task router emits machine and conversation receipts around one accepted wake", async () => {
+test("task router emits machine and conversation receipts after durable ledger acceptance", async () => {
   const receiptCalls = [];
   const controlPlane = {
     keepAlive: () => false,
@@ -227,6 +227,36 @@ test("task router emits machine and conversation receipts around one accepted wa
   assert.deepEqual(receiptCalls, [
     { stage: "machine_received", deliveryIds: ["delivery-10", "delivery-11"] },
     { stage: "conversation_received", deliveryIds: ["delivery-10", "delivery-11"] },
+  ]);
+});
+
+test("durable ledger acceptance emits conversation receipts during legal wake cooldown", async () => {
+  const receiptCalls = [];
+  const controlPlane = {
+    keepAlive: () => false,
+    scanGroupHistory: async () => ({ enabled: true, results: [] }),
+    scanOwnerReplies: async () => ({ enabled: true, results: [] }),
+    acknowledgeBusinessMessages: async (messages, stage) => {
+      receiptCalls.push({ stage, deliveryIds: messages.map((entry) => entry.deliveryId) });
+      return messages.map((entry) => ({ deliveryId: entry.deliveryId, stage, sent: true }));
+    },
+  };
+  const current = fixture({
+    controlPlane,
+    leaseBlocked: true,
+    leaseReason: "wake_cooldown",
+    messages: [message(12, { messageType: "business", deliveryId: "delivery-cooldown-12" })],
+  });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "wake_cooldown");
+  assert.equal(current.calls.some((call) => call.type === "wake"), false);
+  assert.equal(current.getTask().pendingMessages.some((entry) => entry.messageSeq === 12), true);
+  assert.deepEqual(receiptCalls, [
+    { stage: "machine_received", deliveryIds: ["delivery-cooldown-12"] },
+    { stage: "conversation_received", deliveryIds: ["delivery-cooldown-12"] },
+  ]);
+  assert.deepEqual(result.results[0].conversationReceipts, [
+    { deliveryId: "delivery-cooldown-12", stage: "conversation_received", sent: true },
   ]);
 });
 
