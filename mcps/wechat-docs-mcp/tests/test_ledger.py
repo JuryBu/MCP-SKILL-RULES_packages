@@ -337,6 +337,42 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual("OUTBOUND_OBSERVATION_ALREADY_USED", raised.exception.code)
         self.assertEqual("SEND_ATTEMPTED", self.ledger.get_draft(second["draft_id"])["state"])
 
+    def test_direct_text_database_proof_is_audited_without_delivery(self) -> None:
+        draft, payload = self.approved_wechat_draft("exact-marker", "dedupe-direct-text")
+        execution_id = "execution-direct-text"
+        self.ledger.acquire_draft_execution(
+            draft["draft_id"],
+            payload,
+            "dedupe-direct-text",
+            execution_id,
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        )
+        self.ledger.finish_draft_execution(
+            draft["draft_id"], execution_id, "SEND_ATTEMPTED", {"ui_attempted": True}
+        )
+
+        verified = self.ledger.verify_text_draft(
+            draft["draft_id"],
+            {
+                "route_id": "route-test",
+                "local_id": 42,
+                "server_id": "server-42",
+                "occurred_at": datetime.now(timezone.utc).isoformat(),
+                "source_kind": "wechat_message_database",
+                "source_fingerprint": "route-user:42:server-42",
+                "visible_text": "exact-marker",
+                "baseline_local_id": 41,
+            },
+        )
+
+        self.assertEqual("VERIFIED", verified["state"])
+        self.assertTrue(verified["result"]["ui_attempted"])
+        self.assertEqual([], self.ledger.list_pending("subscription-test"))
+        state = self.event_delivery_state(self.ledger)
+        self.assertEqual(1, state["events"])
+        self.assertEqual(1, state["events_acked"])
+        self.assertEqual(0, state["deliveries"])
+
     def test_register_route_stores_baseline(self) -> None:
         self.temp_dir2 = tempfile.TemporaryDirectory()
         ledger2 = EventLedger(Path(self.temp_dir2.name) / "ev.sqlite3")

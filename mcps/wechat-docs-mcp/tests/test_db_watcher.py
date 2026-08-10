@@ -43,13 +43,13 @@ def _make_decrypted_tree(base: Path) -> Path:
         CREATE TABLE Msg_{h} (
             local_id INTEGER, server_id INTEGER, local_type INTEGER,
             sort_seq INTEGER, real_sender_id INTEGER, create_time INTEGER,
-            status INTEGER, source TEXT, message_content TEXT,
+            status INTEGER, origin_source INTEGER, source TEXT, message_content TEXT,
             compress_content TEXT, packed_info_data BLOB,
             WCDB_CT_message_content INTEGER DEFAULT 0,
             WCDB_CT_source INTEGER DEFAULT 0
         );
         INSERT INTO Msg_{h} VALUES
-            (1, 100, 1, 1700000001000, 1, 1700000001, 4, '<msgsource/>', 'hello', '', NULL, 0, 0);
+            (1, 100, 1, 1700000001000, 1, 1700000001, 4, 2, '<msgsource/>', 'hello', '', NULL, 0, 0);
     """)
     conn.commit()
     conn.close()
@@ -65,14 +65,29 @@ def _make_decrypted_tree(base: Path) -> Path:
     return base
 
 
-def _insert_msg(db_path: Path, username: str, local_id: int, content: str = "msg") -> None:
+def _insert_msg(
+    db_path: Path,
+    username: str,
+    local_id: int,
+    content: str = "msg",
+    status: int = 4,
+    origin_source: int = 2,
+) -> None:
     """Insert a message row into the test decrypted DB."""
     import hashlib
     h = hashlib.md5(username.encode("utf-8")).hexdigest()
     conn = sqlite3.connect(str(db_path))
     conn.execute(
-        f"INSERT INTO Msg_{h} VALUES (?, ?, 1, ?, 1, ?, 4, '<msgsource/>', ?, '', NULL, 0, 0)",
-        (local_id, 200 + local_id, 1700000001000 + local_id, 1700000001 + local_id, content),
+        f"INSERT INTO Msg_{h} VALUES (?, ?, 1, ?, 1, ?, ?, ?, '<msgsource/>', ?, '', NULL, 0, 0)",
+        (
+            local_id,
+            200 + local_id,
+            1700000001000 + local_id,
+            1700000001 + local_id,
+            status,
+            origin_source,
+            content,
+        ),
     )
     conn.commit()
     conn.close()
@@ -119,6 +134,40 @@ class DbWatcherTests(unittest.TestCase):
             self.assertIsNone(result.error)
             # The existing message (local_id=1) should be found
             self.assertEqual(1, len(result.new_observations))
+
+    def test_outbound_observation_is_persisted_without_delivery(self) -> None:
+        with patch.object(self.watcher, "refresh_keys", return_value=True), patch.object(
+            self.watcher, "decrypt_changed", return_value=["message/message_0.db"]
+        ):
+            self.watcher.watch_once()
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            deliveries_before = connection.execute(
+                "SELECT COUNT(*) FROM event_deliveries"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        _insert_msg(
+            self.decrypted_dir / "message" / "message_0.db",
+            "wxid_test",
+            2,
+            "outbound marker",
+            status=2,
+            origin_source=1,
+        )
+
+        observations, complete = self.watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("outbound", observations[0].payload["direction"])
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            self.assertEqual(
+                deliveries_before,
+                connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0],
+            )
+        finally:
+            connection.close()
 
     def test_file_change_triggers_poll(self) -> None:
         """After initial scan, changing a file should trigger the cycle."""

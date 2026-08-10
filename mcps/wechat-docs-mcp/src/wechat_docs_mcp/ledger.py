@@ -647,6 +647,7 @@ class EventLedger:
         payload: dict[str, Any],
         occurred_at: str | None = None,
         sensitivity: str = "normal",
+        deliver_to_subscriptions: bool = True,
     ) -> dict[str, Any]:
         event_id = str(uuid.uuid4())
         observed_at = utc_now()
@@ -715,14 +716,18 @@ class EventLedger:
                         observed_at,
                     ),
                 )
-            subscriptions = connection.execute(
-                """
-                SELECT * FROM subscriptions
-                WHERE route_id=? AND state='active' AND listen_capability=1
-                ORDER BY created_at,subscription_id
-                """,
-                (route_id,),
-            ).fetchall()
+            subscriptions = (
+                connection.execute(
+                    """
+                    SELECT * FROM subscriptions
+                    WHERE route_id=? AND state='active' AND listen_capability=1
+                    ORDER BY created_at,subscription_id
+                    """,
+                    (route_id,),
+                ).fetchall()
+                if deliver_to_subscriptions
+                else []
+            )
             wakes: list[dict[str, Any]] = []
             for subscription in subscriptions:
                 pending_before = connection.execute(
@@ -1217,6 +1222,124 @@ class EventLedger:
                 )
         except sqlite3.IntegrityError as error:
             raise LedgerError("SEND_LEASE_BUSY", "已有微信发送正在执行") from error
+        return self.get_draft(draft_id)
+
+    def verify_text_draft(
+        self,
+        draft_id: str,
+        observation: dict[str, Any],
+    ) -> dict[str, Any]:
+        required = {
+            "route_id",
+            "local_id",
+            "server_id",
+            "occurred_at",
+            "source_kind",
+            "source_fingerprint",
+            "visible_text",
+            "baseline_local_id",
+        }
+        if not required.issubset(observation):
+            raise LedgerError("OUTBOUND_TEXT_PROOF_INVALID", "文字发送证明字段不完整")
+        with self._transaction() as connection:
+            draft = connection.execute(
+                "SELECT * FROM outbound_drafts WHERE draft_id=?", (draft_id,)
+            ).fetchone()
+            if draft is None:
+                raise LedgerError("DRAFT_NOT_FOUND", "draft 不存在")
+            if draft["state"] not in {"SEND_ATTEMPTED", "UNKNOWN"}:
+                raise LedgerError("DRAFT_STATE_INVALID", f"draft 当前状态为 {draft['state']}")
+            if draft["kind"] != "wechat_text":
+                raise LedgerError("OUTBOUND_VERIFICATION_UNSUPPORTED", "draft 不是文字发送")
+            if observation["route_id"] != draft["route_id"]:
+                raise LedgerError("OUTBOUND_OBSERVATION_MISMATCH", "文字证明与草稿 route 不匹配")
+            if observation["source_kind"] != "wechat_message_database":
+                raise LedgerError("OUTBOUND_TEXT_SOURCE_UNTRUSTED", "文字证明来源不可信")
+            payload = json.loads(draft["payload_json"])
+            if observation["visible_text"] != payload.get("text"):
+                raise LedgerError("OUTBOUND_CONTENT_MISMATCH", "数据库正文与批准草稿不一致")
+            local_id = int(observation["local_id"])
+            baseline_local_id = int(observation["baseline_local_id"])
+            server_id = str(observation["server_id"])
+            if local_id <= baseline_local_id or baseline_local_id < 0 or not server_id:
+                raise LedgerError("OUTBOUND_TEXT_PROOF_INVALID", "文字消息身份无效")
+
+            event = connection.execute(
+                "SELECT event_id,payload_json FROM events WHERE route_id=? AND source_fingerprint=?",
+                (draft["route_id"], observation["source_fingerprint"]),
+            ).fetchone()
+            if event is None:
+                route = connection.execute(
+                    "SELECT generation FROM routes WHERE route_id=?", (draft["route_id"],)
+                ).fetchone()
+                event_id = str(uuid.uuid4())
+                observed_at = utc_now()
+                event_seq = connection.execute(
+                    "SELECT COALESCE(MAX(event_seq),0)+1 FROM events"
+                ).fetchone()[0]
+                event_payload = {
+                    "kind": "text",
+                    "direction": "outbound",
+                    "visible_text": observation["visible_text"],
+                    "local_id": local_id,
+                    "server_id": server_id,
+                }
+                connection.execute(
+                    """
+                    INSERT INTO events(
+                      event_id,route_id,generation,source_fingerprint,occurred_at,observed_at,
+                      event_type,payload_json,sensitivity,acked_at,event_seq
+                    ) VALUES(?,?,?,?,?,?, 'text',?,'normal',?,?)
+                    """,
+                    (
+                        event_id,
+                        draft["route_id"],
+                        route["generation"],
+                        observation["source_fingerprint"],
+                        observation["occurred_at"],
+                        observed_at,
+                        canonical_json(event_payload),
+                        observed_at,
+                        event_seq,
+                    ),
+                )
+            else:
+                event_id = event["event_id"]
+                event_payload = json.loads(event["payload_json"])
+                if (
+                    event_payload.get("direction") != "outbound"
+                    or event_payload.get("visible_text") != observation["visible_text"]
+                ):
+                    raise LedgerError(
+                        "OUTBOUND_OBSERVATION_MISMATCH",
+                        "已有事件不能证明当前文字草稿",
+                    )
+            try:
+                connection.execute(
+                    "INSERT INTO outbound_verifications(observed_event_id,draft_id,verified_at) VALUES(?,?,?)",
+                    (event_id, draft_id, utc_now()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise LedgerError(
+                    "OUTBOUND_OBSERVATION_ALREADY_USED",
+                    "同一数据库文字记录不能验证多个草稿",
+                ) from error
+            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
+            result["text_observation"] = {
+                "event_id": event_id,
+                "local_id": local_id,
+                "server_id": server_id,
+                "occurred_at": observation["occurred_at"],
+                "source_kind": observation["source_kind"],
+            }
+            connection.execute(
+                """
+                UPDATE outbound_drafts
+                SET state='VERIFIED',result_json=?,error_code=NULL,updated_at=?
+                WHERE draft_id=?
+                """,
+                (canonical_json(result), utc_now(), draft_id),
+            )
         return self.get_draft(draft_id)
 
     def finish_draft_execution(

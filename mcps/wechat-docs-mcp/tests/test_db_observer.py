@@ -156,6 +156,26 @@ class DbObserverTests(unittest.TestCase):
         self.assertEqual(3, friend_obs[0].payload["local_id"])
         self.assertEqual(2, group_obs[0].payload["local_id"])
 
+    def test_status_two_without_origin_column_is_not_trusted_outbound(self) -> None:
+        table = self.observer._msg_table_name("wxid_test_friend")
+        connection = sqlite3.connect(self.decrypted_dir / "message" / "message_0.db")
+        try:
+            connection.execute(
+                f"""
+                INSERT INTO [{table}] VALUES(
+                  4,1004,1,1700000004000,2,1700000004,2,
+                  '<msgsource/>','outbound marker','',NULL,0,0
+                )
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        observation = list(self.observer.poll_new_messages({"route-friend": 3}))[0]
+
+        self.assertEqual("unknown", observation.payload["direction"])
+
     def test_text_message_classification_and_content(self) -> None:
         observations = list(self.observer.poll_new_messages({}))
         text_msgs = [

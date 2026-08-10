@@ -172,7 +172,7 @@ def test_server_attachment_and_document_change_interfaces_are_non_sending(
         (start + timedelta(minutes=5)).isoformat()
     )[0]["batch_id"] == batch["batch_id"]
     assert server.tdocs_change_batch_mark_emitted(batch["batch_id"])["state"] == "EMITTED"
-    assert server.wechat_outbound_capabilities()["visible_ui_backend_implemented"] is False
+    assert server.wechat_outbound_capabilities()["visible_ui_backend_implemented"] is True
 
 
 def test_official_tool_level_error_does_not_verify_draft(
@@ -264,5 +264,6 @@ def test_document_monitor_tools_are_registered() -> None:
         "wechat_read_attachments",
         "wechat_read_image",
         "wechat_capture_visible_image_preview",
+        "wechat_text_send_execute",
     }.issubset(names)
-    assert len(names) == 49
+    assert len(names) == 50

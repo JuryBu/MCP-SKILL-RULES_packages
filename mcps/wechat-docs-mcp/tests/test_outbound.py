@@ -64,6 +64,7 @@ class FakeLedgerStorage:
     state: str = OutboundState.APPROVED.value
     used_dedupe_keys: set[str] = field(default_factory=set)
     finishes: list[dict[str, Any]] = field(default_factory=list)
+    verifications: list[dict[str, Any]] = field(default_factory=list)
 
 
 class FakeLedgerError(RuntimeError):
@@ -122,6 +123,22 @@ class FakeLedger:
         self.storage.finishes.append(finished)
         return finished
 
+    def verify_text_draft(self, draft_id: str, observation: dict[str, Any]) -> dict[str, Any]:
+        self.storage.state = OutboundState.VERIFIED.value
+        self.storage.verifications.append(observation)
+        return {"draft_id": draft_id, "state": OutboundState.VERIFIED.value, "error_code": None}
+
+    def mark_draft_unknown(
+        self,
+        draft_id: str,
+        expected_states: list[str],
+        error_code: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        assert self.storage.state in expected_states
+        self.storage.state = OutboundState.UNKNOWN.value
+        return {"draft_id": draft_id, "state": OutboundState.UNKNOWN.value, "error_code": error_code}
+
 
 class FakeBackend:
     def __init__(self) -> None:
@@ -178,8 +195,40 @@ class FakeBackend:
         self._step("restore")
 
 
-def sender(ledger: FakeLedger, backend: FakeBackend) -> SafeTextOutbound:
-    return SafeTextOutbound(ledger, PrivateBindingRouteVerifier(binding()), backend)
+class FakeDatabaseVerifier:
+    def __init__(self, *, failure: Exception | None = None) -> None:
+        self.failure = failure
+        self.baselines: list[object] = []
+        self.verifications: list[tuple[object, str, int]] = []
+
+    def baseline(self, route: object) -> int:
+        self.baselines.append(route)
+        return 41
+
+    def verify(self, route: object, text: str, baseline_local_id: int) -> dict[str, Any]:
+        self.verifications.append((route, text, baseline_local_id))
+        if self.failure is not None:
+            raise self.failure
+        return {
+            "local_id": 42,
+            "server_id": 4200,
+            "status": 2,
+            "origin_source": 1,
+            "text": text,
+        }
+
+
+def sender(
+    ledger: FakeLedger,
+    backend: FakeBackend,
+    database_verifier: FakeDatabaseVerifier | None = None,
+) -> SafeTextOutbound:
+    return SafeTextOutbound(
+        ledger,
+        PrivateBindingRouteVerifier(binding()),
+        backend,
+        database_verifier,
+    )
 
 
 def execute(sender_instance: SafeTextOutbound, dedupe_key: str = "dedupe-synthetic"):
@@ -253,6 +302,30 @@ class SafeTextOutboundTests(unittest.TestCase):
         self.assertEqual(OutboundState.SEND_ATTEMPTED, result.state)
         self.assertNotEqual(OutboundState.VERIFIED, result.state)
         self.assertEqual(OutboundState.SEND_ATTEMPTED.value, ledger.storage.finishes[-1]["state"])
+
+    def test_unique_database_confirmation_promotes_send_to_verified(self) -> None:
+        ledger = FakeLedger()
+        backend = FakeBackend()
+        verifier = FakeDatabaseVerifier()
+
+        result = execute(sender(ledger, backend, verifier))
+
+        self.assertEqual(OutboundState.VERIFIED, result.state)
+        self.assertEqual([41], [item[2] for item in verifier.verifications])
+        self.assertEqual(41, ledger.storage.verifications[0]["baseline_local_id"])
+        self.assertTrue(result.send_action_invoked)
+        self.assertTrue(result.restore_succeeded)
+
+    def test_database_confirmation_failure_is_unknown_and_not_retryable(self) -> None:
+        ledger = FakeLedger()
+        backend = FakeBackend()
+        failure = UiBackendError("TEXT_DATABASE_AMBIGUOUS", "synthetic")
+
+        result = execute(sender(ledger, backend, FakeDatabaseVerifier(failure=failure)))
+
+        self.assertEqual(OutboundState.UNKNOWN, result.state)
+        self.assertEqual("TEXT_DATABASE_AMBIGUOUS", result.error_code)
+        self.assertEqual(OutboundState.UNKNOWN.value, ledger.storage.state)
 
     def test_send_exception_becomes_unknown_without_cleanup(self) -> None:
         ledger = FakeLedger()

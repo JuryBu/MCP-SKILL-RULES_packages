@@ -79,6 +79,31 @@ class OutboundLedger(Protocol):
         error_code: str | None = None,
     ) -> Mapping[str, Any]: ...
 
+    def verify_text_draft(
+        self,
+        draft_id: str,
+        observation: dict[str, Any],
+    ) -> Mapping[str, Any]: ...
+
+    def mark_draft_unknown(
+        self,
+        draft_id: str,
+        expected_states: list[str],
+        error_code: str,
+        result: dict[str, Any] | None = None,
+    ) -> Mapping[str, Any]: ...
+
+
+class TextDatabaseVerifier(Protocol):
+    def baseline(self, route: VerifiedRoute) -> int: ...
+
+    def verify(
+        self,
+        route: VerifiedRoute,
+        text: str,
+        baseline_local_id: int,
+    ) -> dict[str, Any]: ...
+
 
 class VisibleUiBackend(Protocol):
     def snapshot_environment(self) -> object: ...
@@ -112,10 +137,12 @@ class SafeTextOutbound:
         ledger: OutboundLedger,
         route_verifier: RouteVerifier,
         backend: VisibleUiBackend,
+        database_verifier: TextDatabaseVerifier | None = None,
     ) -> None:
         self._ledger = ledger
         self._route_verifier = route_verifier
         self._backend = backend
+        self._database_verifier = database_verifier
 
     @staticmethod
     def _validate_payload(payload: Mapping[str, Any]) -> str:
@@ -181,11 +208,14 @@ class SafeTextOutbound:
         restore_succeeded = True
         draft_handle: object | None = None
         window: object | None = None
+        baseline_local_id: int | None = None
 
         try:
+            if self._database_verifier is not None:
+                baseline_local_id = self._database_verifier.baseline(verified_route)
             snapshot = self._backend.snapshot_environment()
-        except Exception:
-            error_code = "ENV_SNAPSHOT_FAILED"
+        except Exception as error:
+            error_code = getattr(error, "code", "ENV_SNAPSHOT_FAILED")
         else:
             try:
                 self._backend.wake()
@@ -239,6 +269,7 @@ class SafeTextOutbound:
             "send_action_invoked": send_action_invoked,
             "cleanup_performed": cleanup_performed,
             "restore_succeeded": restore_succeeded,
+            "baseline_local_id": baseline_local_id,
         }
         self._ledger.finish_draft_execution(
             draft_id,
@@ -247,6 +278,27 @@ class SafeTextOutbound:
             result=audit_result,
             error_code=error_code,
         )
+
+        if send_may_have_occurred and baseline_local_id is not None and self._database_verifier:
+            try:
+                observation = self._database_verifier.verify(
+                    verified_route,
+                    text,
+                    baseline_local_id,
+                )
+                observation["baseline_local_id"] = baseline_local_id
+                verified = self._ledger.verify_text_draft(draft_id, observation)
+                state = OutboundState(str(verified["state"]))
+                error_code = verified.get("error_code")
+            except Exception as error:
+                error_code = getattr(error, "code", "TEXT_DATABASE_CONFIRMATION_FAILED")
+                self._ledger.mark_draft_unknown(
+                    draft_id,
+                    [OutboundState.SEND_ATTEMPTED.value, OutboundState.UNKNOWN.value],
+                    error_code,
+                    audit_result,
+                )
+                state = OutboundState.UNKNOWN
         return OutboundExecutionResult(
             draft_id=draft_id,
             execution_id=active_execution_id,

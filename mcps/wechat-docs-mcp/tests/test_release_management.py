@@ -216,7 +216,7 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         package = json.loads(result.stdout)
         self.assertTrue(package["inside_release"])
-        self.assertEqual(49, package["tool_count"])
+        self.assertEqual(50, package["tool_count"])
 
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell and Junctions required")
@@ -285,7 +285,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertFalse(summary["productionTouched"])
         self.assertEqual(4, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
-        self.assertTrue(all(case["activationToolCount"] == 49 for case in summary["successfulCases"]))
+        self.assertTrue(all(case["activationToolCount"] == 50 for case in summary["successfulCases"]))
         self.assertTrue(all(case["activated"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["phaseAWatcherFrozen"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
@@ -309,9 +309,9 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         null_active_backend = json.loads(
             (drill_root / "null-active-backend" / "service" / "releases" / "release-candidate" / "service-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(49, missing_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(49, null_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(49, null_active_backend["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(50, missing_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(50, null_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(50, null_active_backend["validation"]["activeBackend"]["toolCount"])
 
         for case_name in ("missing-validation", "null-validation", "null-active-backend", "v2-schema"):
             case_root = drill_root / case_name

@@ -24,7 +24,7 @@
 | `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
-| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 普通微信文字 outbound 开关；无正式文字 UI backend 时保持关闭 |
+| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | Windows 可见文字发送开关；仅在私有 route/policy、授权链与真实数据库确认均通过后启用 |
 | `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件可见发送开关；只在私有 route/policy 与真实 capability probe 通过后启用 |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
 | `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |

@@ -236,6 +236,7 @@ class DbWatcher:
                     payload=obs.payload,
                     occurred_at=obs.occurred_at,
                     sensitivity=obs.sensitivity,
+                    deliver_to_subscriptions=obs.payload.get("direction") != "outbound",
                 )
                 success_ids.setdefault(rid, set()).add(local_id)
             except Exception:

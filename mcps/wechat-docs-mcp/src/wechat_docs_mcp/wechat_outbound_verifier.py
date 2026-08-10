@@ -187,6 +187,130 @@ class WechatAttachmentDatabaseVerifier:
             time.sleep(self.poll_interval_seconds)
 
 
+class WechatTextDatabaseVerifier:
+    def __init__(
+        self,
+        decrypted_dir: str | Path,
+        refresh_decrypted: Callable[[], None],
+        *,
+        timeout_seconds: float = 20.0,
+        poll_interval_seconds: float = 1.0,
+    ) -> None:
+        self.decrypted_dir = Path(decrypted_dir)
+        self.refresh_decrypted = refresh_decrypted
+        self.timeout_seconds = timeout_seconds
+        self.poll_interval_seconds = poll_interval_seconds
+
+    def _database(self) -> Path:
+        return self.decrypted_dir / "message" / "message_0.db"
+
+    def baseline(self, route: VerifiedRoute) -> int:
+        try:
+            self.refresh_decrypted()
+        except Exception as error:
+            raise AttachmentDatabaseVerificationError(
+                "TEXT_DATABASE_REFRESH_FAILED",
+                "无法在文字发送前刷新微信数据库 baseline",
+            ) from error
+        connection = sqlite3.connect(f"{self._database().resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                f"SELECT COALESCE(MAX(local_id),0) FROM [{DbObserver._msg_table_name(route.username)}]"
+            ).fetchone()
+        finally:
+            connection.close()
+        return int(row[0])
+
+    def _matching_rows(
+        self,
+        route: VerifiedRoute,
+        text: str,
+        baseline_local_id: int,
+    ) -> list[dict[str, Any]]:
+        connection = sqlite3.connect(f"{self._database().resolve().as_uri()}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                f"""
+                SELECT local_id,server_id,create_time,real_sender_id,
+                       message_content,WCDB_CT_message_content
+                FROM [{DbObserver._msg_table_name(route.username)}]
+                WHERE local_id>? AND status=2 AND origin_source=1
+                ORDER BY local_id
+                """,
+                (baseline_local_id,),
+            ).fetchall()
+            sender_names: dict[int, str] = {}
+            if route.chat_type == "group":
+                for sender_id in {int(row["real_sender_id"]) for row in rows}:
+                    sender = connection.execute(
+                        "SELECT user_name FROM Name2Id WHERE rowid=?",
+                        (sender_id,),
+                    ).fetchone()
+                    if sender is not None and sender[0]:
+                        sender_names[sender_id] = str(sender[0])
+        finally:
+            connection.close()
+        matches: list[dict[str, Any]] = []
+        for row in rows:
+            content = DbObserver._decompress_field(
+                row["message_content"], row["WCDB_CT_message_content"]
+            )
+            if route.chat_type == "group":
+                content = DbObserver._strip_group_sender_prefix(
+                    content,
+                    sender_names.get(int(row["real_sender_id"]), ""),
+                )
+            if content != text or not row["server_id"]:
+                continue
+            local_id = int(row["local_id"])
+            server_id = str(row["server_id"])
+            matches.append(
+                {
+                    "route_id": route.route_id,
+                    "local_id": local_id,
+                    "server_id": server_id,
+                    "occurred_at": datetime.fromtimestamp(
+                        int(row["create_time"]), timezone.utc
+                    ).isoformat(),
+                    "source_kind": "wechat_message_database",
+                    "source_fingerprint": f"{route.username}:{local_id}:{server_id}",
+                    "visible_text": content,
+                }
+            )
+        return matches
+
+    def verify(
+        self,
+        route: VerifiedRoute,
+        text: str,
+        baseline_local_id: int,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                self.refresh_decrypted()
+            except Exception as error:
+                raise AttachmentDatabaseVerificationError(
+                    "TEXT_DATABASE_REFRESH_FAILED",
+                    "无法刷新微信数据库确认文字发送结果",
+                ) from error
+            matches = self._matching_rows(route, text, baseline_local_id)
+            if len(matches) == 1:
+                return matches[0]
+            if len(matches) > 1:
+                raise AttachmentDatabaseVerificationError(
+                    "TEXT_DATABASE_CONFIRMATION_AMBIGUOUS",
+                    "出现多条相同文字出站记录，无法唯一确认",
+                )
+            if time.monotonic() >= deadline:
+                raise AttachmentDatabaseVerificationError(
+                    "TEXT_DATABASE_CONFIRMATION_TIMEOUT",
+                    "等待微信数据库确认文字发送超时",
+                )
+            time.sleep(self.poll_interval_seconds)
+
+
 def content_md5(path: str | Path) -> str:
     digest = hashlib.md5()
     with Path(path).open("rb") as stream:

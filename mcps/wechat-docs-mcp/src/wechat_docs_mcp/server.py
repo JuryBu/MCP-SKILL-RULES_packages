@@ -31,8 +31,8 @@ from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
 from .wechat_attachment_source import WechatAttachmentSourceResolver
 from .wechat_attachment_outbound import SafeAttachmentOutbound
-from .wechat_outbound_verifier import WechatAttachmentDatabaseVerifier
-from .win32_attachment_ui import Win32WechatAttachmentBackend
+from .wechat_outbound_verifier import WechatAttachmentDatabaseVerifier, WechatTextDatabaseVerifier
+from .win32_attachment_ui import Win32WechatAttachmentBackend, Win32WechatTextBackend
 from .visible_view_capture import VisibleViewCapture, Win32VisibleViewerBackend
 from .wxgf_decoder import WxgfDecoder
 
@@ -175,6 +175,15 @@ def attachment_outbound_sender(event_ledger: EventLedger) -> SafeAttachmentOutbo
         Win32WechatAttachmentBackend(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
         WechatAttachmentDatabaseVerifier(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
         ATTACHMENT_UPLOAD_ROOT,
+    )
+
+
+def text_outbound_sender(event_ledger: EventLedger) -> SafeTextOutbound:
+    return SafeTextOutbound(
+        event_ledger,
+        PrivateBindingRouteVerifier(_load_binding_document()),
+        Win32WechatTextBackend(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
+        WechatTextDatabaseVerifier(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
     )
 
 
@@ -639,12 +648,34 @@ def wechat_outbound_capabilities() -> dict[str, Any]:
         "production_enabled": OUTBOUND_ENABLED or ATTACHMENT_OUTBOUND_ENABLED,
         "configured_enabled": OUTBOUND_ENABLED,
         "attachment_configured_enabled": ATTACHMENT_OUTBOUND_ENABLED,
-        "visible_ui_backend_implemented": False,
+        "visible_ui_backend_implemented": True,
         "text_skeleton_available": True,
+        "text_visible_ui_backend_implemented": True,
         "attachment_visible_ui_backend_implemented": True,
         "experimental_hidden_wm_char": SafeTextOutbound.capabilities.experimental_hidden_wm_char,
         "database_direction_verifier_implemented": True,
     }
+
+
+@mcp.tool()
+def wechat_text_send_execute(
+    draft_id: str,
+    payload: dict[str, Any],
+    dedupe_key: str,
+    lease_seconds: int = 90,
+) -> dict[str, Any]:
+    """Execute one approved text draft; only a unique database row can become VERIFIED."""
+    if not OUTBOUND_ENABLED:
+        raise LedgerError("OUTBOUND_DISABLED", "文字 outbound 未在本机私有运行配置中启用")
+    if not 30 <= lease_seconds <= 180:
+        raise ValueError("lease_seconds must be between 30 and 180")
+    result = text_outbound_sender(ledger()).execute_text(
+        draft_id=draft_id,
+        payload=payload,
+        dedupe_key=dedupe_key,
+        lease_expires_at=(datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat(),
+    )
+    return asdict(result)
 
 
 @mcp.tool()

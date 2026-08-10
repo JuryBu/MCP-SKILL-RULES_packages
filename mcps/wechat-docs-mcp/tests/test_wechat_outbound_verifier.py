@@ -10,6 +10,7 @@ from wechat_docs_mcp.route_verifier import VerifiedRoute
 from wechat_docs_mcp.wechat_outbound_verifier import (
     AttachmentDatabaseVerificationError,
     WechatAttachmentDatabaseVerifier,
+    WechatTextDatabaseVerifier,
 )
 
 
@@ -38,11 +39,15 @@ def _database(root: Path, rows: list[tuple[object, ...]]) -> None:
             f"""
             CREATE TABLE [{table}](
               local_id INTEGER,server_id INTEGER,create_time INTEGER,status INTEGER,
-              origin_source INTEGER,message_content TEXT,WCDB_CT_message_content INTEGER
+              origin_source INTEGER,message_content TEXT,WCDB_CT_message_content INTEGER,
+              real_sender_id INTEGER
             )
             """
         )
-        connection.executemany(f"INSERT INTO [{table}] VALUES(?,?,?,?,?,?,?)", rows)
+        connection.execute("CREATE TABLE Name2Id(user_name TEXT)")
+        connection.execute("INSERT INTO Name2Id(rowid,user_name) VALUES(1,'synthetic-sender')")
+        normalized_rows = [(*row, 1) if len(row) == 7 else row for row in rows]
+        connection.executemany(f"INSERT INTO [{table}] VALUES(?,?,?,?,?,?,?,?)", normalized_rows)
         connection.commit()
     finally:
         connection.close()
@@ -215,8 +220,8 @@ def test_baseline_refreshes_before_reading_max_local_id(tmp_path: Path) -> None:
         connection = sqlite3.connect(database)
         try:
             connection.execute(
-                f"INSERT INTO [{table}] VALUES(?,?,?,?,?,?,?)",
-                (9, 90, 1_800_000_020, 2, 1, "<msg/>", 0),
+                f"INSERT INTO [{table}] VALUES(?,?,?,?,?,?,?,?)",
+                (9, 90, 1_800_000_020, 2, 1, "<msg/>", 0, 1),
             )
             connection.commit()
         finally:
@@ -254,3 +259,66 @@ def test_baseline_refresh_failure_is_not_reported_as_current(tmp_path: Path) -> 
     with pytest.raises(AttachmentDatabaseVerificationError) as raised:
         verifier.baseline(_route())
     assert raised.value.code == "ATTACHMENT_DATABASE_REFRESH_FAILED"
+
+
+def test_text_verification_requires_unique_exact_outbound_row(tmp_path: Path) -> None:
+    _database(
+        tmp_path,
+        [
+            (20, 100, 1_800_000_000, 3, 2, "marker", 0),
+            (21, 101, 1_800_000_001, 2, 1, "other", 0),
+            (22, 102, 1_800_000_002, 2, 1, "marker", 0),
+        ],
+    )
+    verifier = WechatTextDatabaseVerifier(
+        tmp_path,
+        lambda: None,
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    proof = verifier.verify(_route(), "marker", 20)
+
+    assert proof["local_id"] == 22
+    assert proof["server_id"] == "102"
+    assert proof["visible_text"] == "marker"
+    assert proof["source_fingerprint"].endswith(":22:102")
+
+
+def test_text_verification_rejects_duplicate_outbound_rows(tmp_path: Path) -> None:
+    _database(
+        tmp_path,
+        [
+            (22, 102, 1_800_000_002, 2, 1, "marker", 0),
+            (23, 103, 1_800_000_003, 2, 1, "marker", 0),
+        ],
+    )
+    verifier = WechatTextDatabaseVerifier(
+        tmp_path,
+        lambda: None,
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    with pytest.raises(AttachmentDatabaseVerificationError) as raised:
+        verifier.verify(_route(), "marker", 20)
+
+    assert raised.value.code == "TEXT_DATABASE_CONFIRMATION_AMBIGUOUS"
+
+
+def test_text_verification_strips_exact_group_sender_prefix(tmp_path: Path) -> None:
+    _database(
+        tmp_path,
+        [(22, 102, 1_800_000_002, 2, 1, "synthetic-sender:\nmarker", 0)],
+    )
+    verifier = WechatTextDatabaseVerifier(
+        tmp_path,
+        lambda: None,
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    proof = verifier.verify(_route(), "marker", 20)
+
+    assert proof["visible_text"] == "marker"
+    assert proof["local_id"] == 22

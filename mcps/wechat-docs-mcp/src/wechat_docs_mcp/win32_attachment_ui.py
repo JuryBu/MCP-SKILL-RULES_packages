@@ -38,6 +38,12 @@ VK_UP = 0x26
 VK_V = 0x56
 MOUSEEVENTF_LEFTDOWN = 0x0002
 MOUSEEVENTF_LEFTUP = 0x0004
+SMTO_ABORTIFHUNG = 0x0002
+WM_CHAR = 0x0102
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WINDOW_MESSAGE_TIMEOUT_MS = 1000
+VISIBLE_TEXT_CODE_UNIT_LIMIT = 512
 SAFE_CLIPBOARD_FORMATS = frozenset(
     {CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_HDROP, CF_LOCALE}
 )
@@ -130,6 +136,18 @@ class Win32WechatAttachmentBackend:
         self.user32.SetClipboardData.restype = wintypes.HANDLE
         self.user32.EnumClipboardFormats.argtypes = [wintypes.UINT]
         self.user32.EnumClipboardFormats.restype = wintypes.UINT
+        self.user32.SendMessageTimeoutW.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+            wintypes.UINT,
+            wintypes.UINT,
+            ctypes.POINTER(ctypes.c_size_t),
+        ]
+        self.user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+        self.user32.MapVirtualKeyW.argtypes = [wintypes.UINT, wintypes.UINT]
+        self.user32.MapVirtualKeyW.restype = wintypes.UINT
         self.kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
         self.kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
         self.kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
@@ -594,3 +612,139 @@ class Win32WechatAttachmentBackend:
         self._owned_clipboard_sequence = None
         if errors:
             raise UiBackendError("ENV_RESTORE_FAILED", "无法完整恢复剪贴板、窗口或焦点")
+
+
+class Win32WechatTextBackend(Win32WechatAttachmentBackend):
+    def _send_window_message(self, window: int, message: int, wparam: int, lparam: int) -> None:
+        self._guard(window)
+        result = ctypes.c_size_t()
+        delivered = self.user32.SendMessageTimeoutW(
+            window,
+            message,
+            wparam,
+            lparam,
+            SMTO_ABORTIFHUNG,
+            WINDOW_MESSAGE_TIMEOUT_MS,
+            ctypes.byref(result),
+        )
+        if not delivered:
+            raise UiBackendError("WECHAT_WINDOW_MESSAGE_TIMEOUT", "微信窗口消息没有在时限内完成")
+
+    def _window_unicode_text(self, window: int, text: str) -> None:
+        encoded = text.encode("utf-16-le")
+        code_units = [
+            int.from_bytes(encoded[index : index + 2], "little")
+            for index in range(0, len(encoded), 2)
+        ]
+        if len(code_units) > VISIBLE_TEXT_CODE_UNIT_LIMIT:
+            raise UiBackendError("TEXT_CAPABILITY_LIMIT", "当前可见文字后端不接受超过 512 个 UTF-16 单元的正文")
+        for unit in code_units:
+            self._send_window_message(window, WM_CHAR, unit, 1)
+            time.sleep(0.2)
+
+    def _window_enter(self, window: int) -> None:
+        scan = int(self.user32.MapVirtualKeyW(VK_RETURN, 0))
+        lparam_down = (scan << 16) | 1
+        self._send_window_message(window, WM_KEYDOWN, VK_RETURN, lparam_down)
+        self._send_window_message(window, WM_KEYUP, VK_RETURN, lparam_down | 0xC0000000)
+
+    def snapshot_environment(self) -> Win32EnvironmentSnapshot:
+        point = wintypes.POINT()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise UiBackendError("CURSOR_SNAPSHOT_FAILED", "无法读取鼠标位置")
+        wechat_window = self._find_window(required=False)
+        snapshot = Win32EnvironmentSnapshot(
+            foreground_window=int(self.user32.GetForegroundWindow()),
+            mouse_position=(int(point.x), int(point.y)),
+            clipboard_formats=(),
+            clipboard_sequence_number=int(self.user32.GetClipboardSequenceNumber()),
+            wechat_window=wechat_window,
+            wechat_visible=bool(wechat_window and self.user32.IsWindowVisible(wechat_window)),
+            wechat_iconic=bool(wechat_window and self.user32.IsIconic(wechat_window)),
+        )
+        self._snapshot = snapshot
+        self._expected_mouse_position = snapshot.mouse_position
+        self._owned_clipboard_sequence = None
+        self._user_interaction_detected = False
+        return snapshot
+
+    @staticmethod
+    def _contains_text(data: bytes, text: str) -> bool:
+        return any(
+            encoded in data
+            for encoded in (
+                text.encode("utf-8"),
+                text.encode("utf-16-le"),
+                text.encode("utf-16-be"),
+            )
+        )
+
+    def write_owned_draft(self, window: object, draft_handle: object, text: str) -> None:
+        active_window = self._guard(window)
+        if not isinstance(draft_handle, dict) or not isinstance(draft_handle.get("username"), str):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿句柄无效")
+        self._focus_input(active_window)
+        self._window_unicode_text(active_window, text)
+        time.sleep(1)
+        self._refresh()
+        rows = self._draft_rows(draft_handle["username"])
+        if len(rows) != 1:
+            raise UiBackendError("TEXT_DRAFT_ROUTE_UNVERIFIED", "微信草稿表未唯一指向目标 route")
+        data = self._draft_bytes(rows[0][1])
+        if not data or not self._contains_text(data, text):
+            raise UiBackendError("TEXT_DRAFT_CONTENT_UNVERIFIED", "微信草稿表未包含批准正文")
+        draft_handle["proof_sha256"] = hashlib.sha256(data).hexdigest()
+        draft_handle["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        self._text_draft_handle = draft_handle
+
+    def focus_state(self, window: object, route: VerifiedRoute) -> FocusState:
+        try:
+            self._guard(window)
+            handle = getattr(self, "_text_draft_handle", None)
+            if handle is None:
+                rows = self._draft_rows(route.username)
+                return (
+                    FocusState.VERIFIED
+                    if not rows or all(row[1] in (None, b"", "") for row in rows)
+                    else FocusState.MISMATCH
+                )
+            if not isinstance(handle, dict) or handle.get("username") != route.username:
+                return FocusState.UNKNOWN
+            proof = handle.get("proof_sha256")
+            if not isinstance(proof, str) or not proof:
+                return FocusState.UNKNOWN
+            self._refresh()
+            rows = self._draft_rows(route.username)
+            if len(rows) != 1:
+                return FocusState.UNKNOWN
+            data = self._draft_bytes(rows[0][1])
+            return FocusState.VERIFIED if hashlib.sha256(data).hexdigest() == proof else FocusState.MISMATCH
+        except Exception:
+            return FocusState.UNKNOWN
+
+    def send_owned_draft(self, window: object, draft_handle: object) -> None:
+        active_window = self._guard(window)
+        if draft_handle is not getattr(self, "_text_draft_handle", None):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿未获得 route 证明")
+        try:
+            self._window_enter(active_window)
+        except Exception as error:
+            raise UiBackendError(
+                "TEXT_SEND_OUTCOME_UNKNOWN",
+                "发送按键执行结果未知",
+                send_may_have_occurred=True,
+            ) from error
+        time.sleep(1)
+
+    def clear_owned_draft(self, window: object, draft_handle: object) -> None:
+        active_window = self._guard(window)
+        if draft_handle is not getattr(self, "_text_draft_handle", None):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿句柄无效")
+        self._hotkey(active_window, VK_CONTROL, 0x41)
+        self._press(active_window, VK_DELETE)
+        time.sleep(0.5)
+        self._refresh()
+        username = draft_handle.get("username")
+        if any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
+            raise UiBackendError("TEXT_DRAFT_CLEANUP_FAILED", "文字草稿未被清理")
+        self._text_draft_handle = None

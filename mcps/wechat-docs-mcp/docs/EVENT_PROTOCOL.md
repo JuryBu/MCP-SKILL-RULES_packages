@@ -137,7 +137,7 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 - event 晚于本次批准消费时间；
 - 该 event 尚未被其它草稿消费，同一观察事件只能验证一次。
 
-当前数据库观察器尚未稳定提供 outbound 方向，因此真实 UI backend 接入前会停在 `SEND_ATTEMPTED/UNKNOWN`，不得伪称成功。
+当前 Windows 适配器只把 `status=2 AND origin_source=1` 的消息数据库行作为可信文字出站候选，并要求发送前 baseline 之后恰好出现一条 route 与完整正文都匹配的新记录。普通观察器会保存出站事件用于审计，但不会为它建立 subscription delivery 或 wake；字段缺失、刷新失败、零条或多条匹配都不能进入 `VERIFIED`。
 
 ## 7. 附件
 

@@ -398,10 +398,20 @@ class DbObserver:
                 tname = self._msg_table_name(binding.username)
                 baseline = baselines.get(binding.route_id, 0)
                 try:
+                    columns = {
+                        column[1]
+                        for column in conn.execute(f"PRAGMA table_info([{tname}])").fetchall()
+                    }
+                    origin_source = (
+                        "origin_source"
+                        if "origin_source" in columns
+                        else "NULL AS origin_source"
+                    )
                     rows = conn.execute(
                         f"""
                         SELECT local_id, server_id, local_type, sort_seq,
                                real_sender_id, create_time, status,
+                               {origin_source},
                                source, message_content,
                                WCDB_CT_message_content, WCDB_CT_source
                         FROM [{tname}]
@@ -441,6 +451,15 @@ class DbObserver:
 
                     payload: dict[str, Any] = {
                         "kind": msg_type,
+                        "direction": (
+                            "outbound"
+                            if r["status"] == 2 and r["origin_source"] == 1
+                            else (
+                                "inbound"
+                                if r["status"] in {3, 4} or r["origin_source"] == 2
+                                else "unknown"
+                            )
+                        ),
                         "sender_display": sender_display,
                         "sender_username": sender_username,
                         "message_time_display": datetime.fromtimestamp(

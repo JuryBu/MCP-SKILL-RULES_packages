@@ -22,6 +22,7 @@ from wechat_docs_mcp.win32_attachment_ui import (
     ClipboardFormat,
     Win32EnvironmentSnapshot,
     Win32WechatAttachmentBackend,
+    Win32WechatTextBackend,
 )
 
 
@@ -541,3 +542,97 @@ def test_locate_window_rejects_unverified_foreground(monkeypatch: pytest.MonkeyP
     with pytest.raises(UiBackendError) as raised:
         backend.locate_window()
     assert raised.value.code == "WECHAT_FOCUS_FAILED"
+
+
+def test_text_snapshot_never_reads_or_copies_clipboard() -> None:
+    class User32:
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 12
+            point._obj.y = 34
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 77
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 88
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return False
+
+        @staticmethod
+        def IsIconic(_: object) -> bool:
+            return False
+
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    backend._find_window = lambda *, required: None
+    backend._snapshot_clipboard = lambda: pytest.fail("text sender must not read clipboard payloads")
+
+    snapshot = backend.snapshot_environment()
+
+    assert snapshot.foreground_window == 77
+    assert snapshot.mouse_position == (12, 34)
+    assert snapshot.clipboard_formats == ()
+    assert snapshot.clipboard_sequence_number == 88
+    assert backend._owned_clipboard_sequence is None
+
+
+def test_text_draft_requires_database_proof_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    backend._text_draft_handle = None
+    calls: list[object] = []
+    backend._guard = lambda window: int(window)
+    backend._focus_input = lambda window: calls.append(("focus", window))
+    backend._window_unicode_text = lambda window, text: calls.append(("write", window, text))
+    backend._refresh = lambda: calls.append("refresh")
+    backend._draft_rows = lambda username: [(1, "SYNTHETIC_TEXT".encode("utf-16-le"))]
+    handle: dict[str, Any] = {"username": USERNAME, "proof_sha256": None}
+
+    backend.write_owned_draft(9001, handle, "SYNTHETIC_TEXT")
+
+    assert handle["proof_sha256"]
+    assert handle["text_sha256"] == hashlib.sha256(b"SYNTHETIC_TEXT").hexdigest()
+    assert backend._text_draft_handle is handle
+    assert calls == [("focus", 9001), ("write", 9001, "SYNTHETIC_TEXT"), "refresh"]
+
+
+def test_text_window_message_writer_is_visible_guarded_and_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    calls: list[tuple[int, int, int, int]] = []
+    backend = object.__new__(Win32WechatTextBackend)
+    backend._guard = lambda window: int(window)
+    backend._send_window_message = lambda window, message, wparam, lparam: calls.append(
+        (window, message, wparam, lparam)
+    )
+
+    backend._window_unicode_text(9001, "A猫")
+
+    assert calls == [
+        (9001, win32_attachment_ui.WM_CHAR, ord("A"), 1),
+        (9001, win32_attachment_ui.WM_CHAR, ord("猫"), 1),
+    ]
+    with pytest.raises(UiBackendError) as raised:
+        backend._window_unicode_text(9001, "x" * (win32_attachment_ui.VISIBLE_TEXT_CODE_UNIT_LIMIT + 1))
+    assert raised.value.code == "TEXT_CAPABILITY_LIMIT"
+
+
+def test_text_send_uses_bounded_window_enter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    handle: dict[str, Any] = {"username": USERNAME, "proof_sha256": "proof"}
+    backend._text_draft_handle = handle
+    backend._guard = lambda window: int(window)
+    calls: list[int] = []
+    backend._window_enter = calls.append
+
+    backend.send_owned_draft(9001, handle)
+
+    assert calls == [9001]
