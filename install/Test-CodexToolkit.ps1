@@ -208,6 +208,8 @@ function Test-PackageStructure {
     foreach ($requiredText in @("SourceStartScript", "SourceStopScript", "lifecycleBootstrapped", "installedStartExisted", "installedStopExisted")) {
         if (-not $brokerUpdater.Contains($requiredText)) { throw "Broker updater is missing portable lifecycle bootstrap behavior: $requiredText" }
     }
+    & (Join-Path $toolkitRoot "install\Test-CodexMcpBrokerLifecycle.ps1") | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Broker lifecycle regression test failed." }
 
     foreach ($path in @(
         "mcps\\napcat-mcp\\src\\codex-thread-bridge.mjs",

@@ -4,7 +4,8 @@ param(
     [string]$BrokerRoot = (Join-Path $env:USERPROFILE ".codex\mcp-http-broker"),
     [string[]]$DeepHealthEndpoints = @("napcat", "sandbox"),
     [string[]]$ProtectedStatePaths = @(),
-    [ValidateRange(5, 120)][int]$StartupTimeoutSeconds = 30
+    [ValidateRange(1, 120)][int]$StartupTimeoutSeconds = 30,
+    [ValidateRange(1024, 65535)][int]$BrokerPort = 14588
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,7 +29,7 @@ $InstalledBrokerPath = Join-Path $BrokerRoot "broker.mjs"
 $InstalledLifecyclePath = Join-Path $BrokerRoot "request-lifecycle.mjs"
 $StopScript = Join-Path $BrokerRoot "Stop-CodexMcpBroker.ps1"
 $StartScript = Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1"
-$HealthUrl = "http://127.0.0.1:14588/health"
+$HealthUrl = "http://127.0.0.1:$BrokerPort/health"
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
 $BackupRoot = Join-Path $BrokerRoot "backups\broker-update-$Stamp"
 
@@ -87,8 +88,6 @@ try {
 $ProtectedBefore = [ordered]@{}
 foreach ($Path in $ProtectedStatePaths) { $ProtectedBefore[$Path] = Get-FileHashOrNull -Path $Path }
 
-$BeforeHealth = $null
-try { $BeforeHealth = Invoke-RestMethod -Method Get -Uri $HealthUrl -TimeoutSec 3 } catch {}
 $ShouldActivate = $PSCmdlet.ShouldProcess($BrokerRoot, "install validated broker code and lifecycle scripts, then restart broker")
 if (-not $ShouldActivate) {
     [pscustomobject]@{
@@ -101,6 +100,9 @@ if (-not $ShouldActivate) {
     } | ConvertTo-Json -Depth 10
     return
 }
+
+$BeforeHealth = $null
+try { $BeforeHealth = Invoke-RestMethod -Method Get -Uri $HealthUrl -TimeoutSec 3 } catch {}
 
 New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 Copy-Item -LiteralPath $InstalledBrokerPath -Destination (Join-Path $BackupRoot "broker.mjs") -Force
@@ -151,35 +153,44 @@ try {
 } catch {
     $Failure = $_.Exception.Message
     if (-not $Activated) {
-        $RollbackFailure = $null
+        $RollbackErrors = [System.Collections.Generic.List[string]]::new()
         try {
             if (Test-Path -LiteralPath $StopScript -PathType Leaf) { & $StopScript | Out-Null }
+        } catch { $RollbackErrors.Add("stop: $($_.Exception.Message)") }
+        try {
             Copy-Item -LiteralPath (Join-Path $BackupRoot "broker.mjs") -Destination $InstalledBrokerPath -Force
             Copy-Item -LiteralPath (Join-Path $BackupRoot "request-lifecycle.mjs") -Destination $InstalledLifecyclePath -Force
+        } catch { $RollbackErrors.Add("code restore: $($_.Exception.Message)") }
+        try {
             if ($InstalledStartExisted) {
                 Copy-Item -LiteralPath (Join-Path $BackupRoot "Start-CodexMcpBroker.ps1") -Destination $StartScript -Force
             }
-            & $StartScript | Out-Null
-            $null = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds
             if ($InstalledStopExisted) {
                 Copy-Item -LiteralPath (Join-Path $BackupRoot "Stop-CodexMcpBroker.ps1") -Destination $StopScript -Force
+            }
+        } catch { $RollbackErrors.Add("lifecycle content restore: $($_.Exception.Message)") }
+        try {
+            if (Test-Path -LiteralPath $StartScript -PathType Leaf) {
+                & $StartScript | Out-Null
+                $null = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds
             } else {
-                Remove-Item -LiteralPath $StopScript -Force -ErrorAction SilentlyContinue
+                $RollbackErrors.Add("restart: no start script is available")
             }
-            if (-not $InstalledStartExisted) {
-                Remove-Item -LiteralPath $StartScript -Force -ErrorAction SilentlyContinue
-            }
-            foreach ($Path in $ProtectedStatePaths) {
+        } catch { $RollbackErrors.Add("restart: $($_.Exception.Message)") }
+        try {
+            if (-not $InstalledStopExisted) { Remove-Item -LiteralPath $StopScript -Force -ErrorAction Stop }
+            if (-not $InstalledStartExisted) { Remove-Item -LiteralPath $StartScript -Force -ErrorAction Stop }
+        } catch { $RollbackErrors.Add("lifecycle existence restore: $($_.Exception.Message)") }
+        foreach ($Path in $ProtectedStatePaths) {
+            try {
                 $RollbackHash = Get-FileHashOrNull -Path $Path
                 if ($ProtectedBefore[$Path] -ne $RollbackHash) {
-                    throw "Protected state changed during update and rollback: $Path"
+                    $RollbackErrors.Add("protected state changed: $Path")
                 }
-            }
-        } catch {
-            $RollbackFailure = $_.Exception.Message
+            } catch { $RollbackErrors.Add("protected state check: $Path $($_.Exception.Message)") }
         }
-        if ($RollbackFailure) {
-            throw "Broker update failed and rollback did not restore a healthy broker. Update error: $Failure Rollback error: $RollbackFailure Backup: $BackupRoot"
+        if ($RollbackErrors.Count -gt 0) {
+            throw "Broker update failed and rollback was incomplete. Update error: $Failure Rollback errors: $($RollbackErrors -join ' | ') Backup: $BackupRoot"
         }
     }
     throw "Broker update failed; previous code was restored and verified healthy: $Failure"

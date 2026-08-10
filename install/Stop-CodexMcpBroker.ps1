@@ -12,9 +12,27 @@ $brokerScript = if ($isFlatInstallation) {
 $dataRoot = if ($env:CODEX_TOOLKIT_DATA_ROOT) { $env:CODEX_TOOLKIT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit" }
 $pidPath = if ($isFlatInstallation) { Join-Path $scriptDirectory "broker.pid" } else { Join-Path $dataRoot "mcp-http-broker\broker.pid" }
 
+function Get-NodeEntryScript {
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return $null }
+    $tokens = @([regex]::Matches($CommandLine, '(?:"((?:\\.|[^"])*)"|(\S+))') | ForEach-Object {
+        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    })
+    if ($tokens.Count -lt 2) { return $null }
+    $candidate = $tokens[1]
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) { return $null }
+    return [System.IO.Path]::GetFullPath($candidate)
+}
+
+function Test-BrokerCommandLine {
+    param([string]$CommandLine)
+    $entryScript = Get-NodeEntryScript -CommandLine $CommandLine
+    return $entryScript -and $entryScript.Equals($brokerScript, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Find-BrokerProcesses {
     Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-        Where-Object { ([string]$_.CommandLine).IndexOf($brokerScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 }
+        Where-Object { Test-BrokerCommandLine -CommandLine ([string]$_.CommandLine) }
 }
 
 function Get-BrokerProcessFromPid {
@@ -24,8 +42,7 @@ function Get-BrokerProcessFromPid {
     if (-not $process) { return $null }
     if ($process.ProcessName -ne "node") { return $null }
     $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
-    $commandLine = [string]$cim.CommandLine
-    if ($commandLine.IndexOf($brokerScript, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+    if (-not (Test-BrokerCommandLine -CommandLine ([string]$cim.CommandLine))) {
         return $null
     }
     return $process

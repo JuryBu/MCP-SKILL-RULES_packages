@@ -26,6 +26,24 @@ $statePath = Join-Path $brokerDataDir "broker-state.json"
 
 New-Item -ItemType Directory -Force -Path $brokerDataDir | Out-Null
 
+function Get-NodeEntryScript {
+    param([string]$CommandLine)
+    if (-not $CommandLine) { return $null }
+    $tokens = @([regex]::Matches($CommandLine, '(?:"((?:\\.|[^"])*)"|(\S+))') | ForEach-Object {
+        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    })
+    if ($tokens.Count -lt 2) { return $null }
+    $candidate = $tokens[1]
+    if (-not [System.IO.Path]::IsPathRooted($candidate)) { return $null }
+    return [System.IO.Path]::GetFullPath($candidate)
+}
+
+function Test-BrokerCommandLine {
+    param([string]$CommandLine)
+    $entryScript = Get-NodeEntryScript -CommandLine $CommandLine
+    return $entryScript -and $entryScript.Equals($brokerScript, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
 function Get-BrokerProcessFromPid {
     param([string]$PidValue)
     if (-not $PidValue) { return $null }
@@ -33,8 +51,7 @@ function Get-BrokerProcessFromPid {
     if (-not $process) { return $null }
     if ($process.ProcessName -ne "node") { return $null }
     $cim = Get-CimInstance Win32_Process -Filter "ProcessId = $($process.Id)" -ErrorAction SilentlyContinue
-    $commandLine = [string]$cim.CommandLine
-    if ($commandLine.IndexOf($brokerScript, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+    if (-not (Test-BrokerCommandLine -CommandLine ([string]$cim.CommandLine))) {
         return $null
     }
     return $process
@@ -42,7 +59,7 @@ function Get-BrokerProcessFromPid {
 
 function Find-BrokerProcess {
     Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
-        Where-Object { ([string]$_.CommandLine).IndexOf($brokerScript, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 } |
+        Where-Object { Test-BrokerCommandLine -CommandLine ([string]$_.CommandLine) } |
         Select-Object -First 1
 }
 
