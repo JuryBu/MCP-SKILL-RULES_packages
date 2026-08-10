@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -57,11 +58,21 @@ class ReleaseProbeTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "active_wakes": 0,
+                    "active_wakes_total": 0,
                     "events": 1,
+                    "events_total": 1,
+                    "expected_legacy_subscriptions": 0,
                     "pending": 0,
+                    "pending_subscriptions": 0,
+                    "pending_subscriptions_total": 0,
+                    "pending_total": 0,
+                    "route_subscription_expected": 0,
+                    "routes": 0,
                     "schema_version": 1,
                     "subscriptions": 0,
+                    "subscriptions_total": 0,
                     "wakes": 1,
+                    "wakes_total": 1,
                 },
                 json.loads(created.stdout),
             )
@@ -111,14 +122,78 @@ class ReleaseProbeTests(unittest.TestCase):
             self.assertEqual(
                 {
                     "active_wakes": 1,
+                    "active_wakes_total": 1,
                     "events": 1,
+                    "events_total": 1,
+                    "expected_legacy_subscriptions": 0,
                     "pending": 1,
+                    "pending_subscriptions": 1,
+                    "pending_subscriptions_total": 1,
+                    "pending_total": 1,
+                    "routes": 1,
                     "schema_version": 2,
                     "subscriptions": 2,
+                    "subscriptions_total": 2,
                     "wakes": 2,
+                    "wakes_total": 2,
                 },
                 json.loads(snapshot.stdout),
             )
+
+    def test_online_backup_is_complete_and_refuses_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source = root / "source.sqlite3"
+            backup = root / "backup" / "events.sqlite3"
+            ledger = EventLedger(source)
+            ledger.register_route("route-backup", profile="test", state="active")
+            result = run_process(
+                [
+                    sys.executable,
+                    str(PROBE_SCRIPT),
+                    "backup-ledger",
+                    "--source",
+                    str(source),
+                    "--destination",
+                    str(backup),
+                ]
+            )
+            self.assertEqual(0, result.returncode, result.stderr)
+            self.assertEqual("ok", json.loads(result.stdout)["integrity"])
+            copied = EventLedger(backup)
+            self.assertEqual("route-backup", copied.get_route("route-backup")["route_id"])
+            duplicate = run_process(
+                [
+                    sys.executable,
+                    str(PROBE_SCRIPT),
+                    "backup-ledger",
+                    "--source",
+                    str(source),
+                    "--destination",
+                    str(backup),
+                ]
+            )
+            self.assertNotEqual(0, duplicate.returncode)
+            ledger.register_route("route-after-backup", profile="test", state="active")
+            restored = run_process(
+                [
+                    sys.executable,
+                    str(PROBE_SCRIPT),
+                    "restore-ledger",
+                    "--source",
+                    str(backup),
+                    "--destination",
+                    str(source),
+                ]
+            )
+            self.assertEqual(0, restored.returncode, restored.stderr)
+            self.assertEqual("ok", json.loads(restored.stdout)["integrity"])
+            connection = sqlite3.connect(source)
+            try:
+                route_ids = {row[0] for row in connection.execute("SELECT route_id FROM routes")}
+            finally:
+                connection.close()
+            self.assertEqual({"route-backup"}, route_ids)
 
     def test_package_probe_resolves_inside_expected_root(self) -> None:
         result = run_process(
@@ -166,7 +241,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
 
-    def test_drill_upgrades_old_manifests_and_verifies_rollbacks(self) -> None:
+    def test_drill_uses_two_phase_polling_and_verifies_precommit_rollbacks(self) -> None:
         drill_root = self.root / "drill"
         result = run_process(
             [
@@ -203,10 +278,17 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertEqual(3, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["activationToolCount"] == 29 for case in summary["successfulCases"]))
-        self.assertTrue(all(case["rollbackVerified"] for case in summary["successfulCases"]))
+        self.assertTrue(all(case["activated"] for case in summary["successfulCases"]))
+        self.assertTrue(all(case["phaseAWatcherFrozen"] for case in summary["successfulCases"]))
+        self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
+        self.assertTrue(all(case["ledgerBackupPresent"] for case in summary["successfulCases"]))
         self.assertTrue(summary["forcedFailure"]["caught"])
         self.assertTrue(summary["forcedFailure"]["rollbackVerified"])
         self.assertEqual("release-old", summary["forcedFailure"]["currentReleaseId"])
+        self.assertTrue(summary["forcedPreCommitFailure"]["caught"])
+        self.assertTrue(summary["forcedPreCommitFailure"]["rollbackVerified"])
+        self.assertTrue(summary["forcedPreCommitFailure"]["ledgerRestoredExactly"])
+        self.assertEqual("release-old", summary["forcedPreCommitFailure"]["currentReleaseId"])
 
         missing_validation = json.loads(
             (drill_root / "missing-validation" / "service" / "releases" / "release-candidate" / "service-manifest.json").read_text(encoding="utf-8")
@@ -217,16 +299,21 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         null_active_backend = json.loads(
             (drill_root / "null-active-backend" / "service" / "releases" / "release-candidate" / "service-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertNotIn("validation", missing_validation)
-        self.assertIsNone(null_validation["validation"])
-        self.assertIsNone(null_active_backend["validation"]["activeBackend"])
+        self.assertEqual(29, missing_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(29, null_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(29, null_active_backend["validation"]["activeBackend"]["toolCount"])
 
-        for case_name in (
-            "missing-validation",
-            "null-validation",
-            "null-active-backend",
-            "forced-health-failure",
-        ):
+        for case_name in ("missing-validation", "null-validation", "null-active-backend"):
+            case_root = drill_root / case_name
+            active = json.loads((case_root / "service" / "pointers" / "active.json").read_text(encoding="utf-8"))
+            last_known_good = json.loads(
+                (case_root / "service" / "pointers" / "last-known-good.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual("release-candidate", active["releaseId"])
+            self.assertEqual("release-candidate", last_known_good["releaseId"])
+            self.assertFalse(list((case_root / "service").glob("current.next-*")))
+
+        for case_name in ("forced-health-failure", "forced-precommit-failure"):
             case_root = drill_root / case_name
             active = json.loads((case_root / "service" / "pointers" / "active.json").read_text(encoding="utf-8"))
             last_known_good = json.loads(
@@ -240,6 +327,8 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             rollback = json.loads(rollback_files[0].read_text(encoding="utf-8"))
             self.assertTrue(rollback["verified"])
             self.assertTrue(rollback["protectedBackendStable"])
+            self.assertTrue(rollback["ledgerRestoredExactly"])
+            self.assertTrue(Path(rollback["ledgerBackupPath"]).is_file())
 
     def test_drill_rejects_missing_candidate_python(self) -> None:
         drill_root = self.root / "missing-python-drill"

@@ -29,16 +29,17 @@ function New-DrillLayout {
   Write-JsonAtomic -Path (Join-Path $Service "pointers\candidate.json") -Value (New-ReleasePointer -ReleaseId $CandidateId -ReleasePath $Candidate -SourceCommit "candidate-commit" -Activated $false -Reason "fixture")
   Write-JsonAtomic -Path (Join-Path $Service "pointers\last-known-good.json") -Value (New-ReleasePointer -ReleaseId $OldReleaseId -ReleasePath $OldRelease -SourceCommit "old-commit" -Activated $true -Reason "fixture")
   Write-JsonAtomic -Path (Join-Path $Data "config\service-runtime.json") -Value ([pscustomobject]@{ schemaVersion = 1; releaseId = $OldReleaseId })
-  Write-JsonAtomic -Path (Join-Path $Broker "broker-private.env.json") -Value ([pscustomobject]@{ CODEX_MCP_BROKER_CONTROL_TOKEN = "fixture-token"; WECHAT_DOCS_MCP_ROOT = (Join-Path $Service "current"); WECHAT_DOCS_MCP_PYTHON = "fixture-python" })
+  Write-JsonAtomic -Path (Join-Path $Broker "broker-private.env.json") -Value ([pscustomobject]@{ CODEX_MCP_BROKER_CONTROL_TOKEN = "fixture-token"; WECHAT_DOCS_MCP_ROOT = (Join-Path $Service "current"); WECHAT_DOCS_MCP_PYTHON = "fixture-python"; WECHAT_DOCS_MCP_AUTO_POLL = "1"; WECHAT_DOCS_MCP_POLL_INTERVAL = "5" })
   Write-JsonAtomic -Path (Join-Path $Data "state\supervisor-runtime.json") -Value ([pscustomobject]@{ pid = 7001; healthy = $true; consecutiveFailures = 0; backendPid = 5100; backendGeneration = 3 })
   $FixtureStatePath = Join-Path $CaseRoot "fixture-health.json"
   Write-JsonAtomic -Path $FixtureStatePath -Value ([pscustomobject]@{
     brokerPid = 4242
     endpoints = [pscustomobject]@{
-      "wechat-docs" = [pscustomobject]@{ healthy = $true; toolCount = $ExpectedCurrentToolCount; pid = 5100; generation = 3 }
+      "wechat-docs" = [pscustomobject]@{ healthy = $true; toolCount = $ExpectedCurrentToolCount; pid = 5100; generation = 3; autoPoll = $true; pollCycles = 0 }
       napcat = [pscustomobject]@{ healthy = $true; toolCount = 22; pid = 5200; generation = 2 }
     }
     supervisor = [pscustomobject]@{ pid = 7001; healthy = $true; consecutiveFailures = 0; backendPid = 5100; backendGeneration = 3 }
+    toolHistory = @()
   })
   $LedgerPath = Join-Path $Data "state\events.sqlite3"
   & $ProbePython $ProbeScript create-fixture --ledger $LedgerPath --route-id "route-fixture" | Out-Null
@@ -67,14 +68,17 @@ function Invoke-Drill {
     $Layout = New-DrillLayout -CaseRoot $CaseRoot -Shape $Shape -SourceManifestPath $CandidateManifestPath
     $Context = Invoke-ReleaseSwitch -Mode Fixture -SwitchServiceRoot $Layout.service -SwitchDataRoot $Layout.data -SwitchBrokerRoot $Layout.broker -SwitchCandidateReleaseId $Layout.candidateReleaseId -SwitchExpectedCurrentReleaseId $Layout.oldReleaseId -SwitchRouteId "route-fixture" -SwitchProbePython $ProbePython -FixtureStatePath $Layout.fixtureStatePath
     $ActivatedManifest = Read-Json (Join-Path $Layout.service "current\service-manifest.json")
-    $Rollback = Restore-ReleaseSwitch -Context $Context
+    $FixtureState = Read-Json $Layout.fixtureStatePath
     $Results += [pscustomobject]@{
       case = $Shape
       activationGeneration = [int]$ActivatedManifest.validation.activeBackend.generation
       activationToolCount = [int]$ActivatedManifest.validation.activeBackend.toolCount
       activeBackendPresent = ($null -ne $ActivatedManifest.validation.activeBackend)
-      rollbackVerified = [bool]$Rollback.verified
-      ledger = $Rollback.ledger
+      activated = ($Context.activationResult.status -eq "activated")
+      phaseAWatcherFrozen = [bool]$Context.activationResult.phaseAWatcherFrozen
+      postCommitStatusVerified = [bool]$Context.activationResult.postCommitStatusVerified
+      ledgerBackupPresent = (Test-Path -LiteralPath $Context.activationResult.ledgerBackupPath -PathType Leaf)
+      toolHistory = $FixtureState.toolHistory
     }
   }
   $FailureRoot = Join-Path $Root "forced-health-failure"
@@ -83,18 +87,31 @@ function Invoke-Drill {
   try {
     Invoke-ReleaseSwitch -Mode Fixture -SwitchServiceRoot $FailureLayout.service -SwitchDataRoot $FailureLayout.data -SwitchBrokerRoot $FailureLayout.broker -SwitchCandidateReleaseId $FailureLayout.candidateReleaseId -SwitchExpectedCurrentReleaseId $FailureLayout.oldReleaseId -SwitchRouteId "route-fixture" -SwitchProbePython $ProbePython -FixtureStatePath $FailureLayout.fixtureStatePath -FailFixtureHealth | Out-Null
   } catch {
-    $FailureCaught = $_.Exception.Message -like "Activation failed after verified rollback:*"
+    $FailureCaught = $_.Exception.Message -like "Activation failed before polling resumed and completed a verified rollback:*"
   }
   $FailureRollback = Read-Json (Get-ChildItem -LiteralPath (Join-Path $FailureLayout.data "backups") -Directory | Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "rollback-verification.json" })
   $FailureCurrent = Get-JunctionTarget (Join-Path $FailureLayout.service "current")
   $FailureVerified = $FailureCaught -and $FailureRollback.verified -eq $true -and (Split-Path -Leaf $FailureCurrent) -eq $FailureLayout.oldReleaseId
+
+  $PreCommitRoot = Join-Path $Root "forced-precommit-failure"
+  $PreCommitLayout = New-DrillLayout -CaseRoot $PreCommitRoot -Shape "missing-validation" -SourceManifestPath $CandidateManifestPath
+  $PreCommitCaught = $false
+  try {
+    Invoke-ReleaseSwitch -Mode Fixture -SwitchServiceRoot $PreCommitLayout.service -SwitchDataRoot $PreCommitLayout.data -SwitchBrokerRoot $PreCommitLayout.broker -SwitchCandidateReleaseId $PreCommitLayout.candidateReleaseId -SwitchExpectedCurrentReleaseId $PreCommitLayout.oldReleaseId -SwitchRouteId "route-fixture" -SwitchProbePython $ProbePython -FixtureStatePath $PreCommitLayout.fixtureStatePath -FailBeforePollStart | Out-Null
+  } catch {
+    $PreCommitCaught = $_.Exception.Message -like "Activation failed before polling resumed and completed a verified rollback:*"
+  }
+  $PreCommitRollback = Read-Json (Get-ChildItem -LiteralPath (Join-Path $PreCommitLayout.data "backups") -Directory | Sort-Object Name -Descending | Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName "rollback-verification.json" })
+  $PreCommitCurrent = Get-JunctionTarget (Join-Path $PreCommitLayout.service "current")
+  $PreCommitVerified = $PreCommitCaught -and $PreCommitRollback.verified -eq $true -and $PreCommitRollback.ledgerRestoredExactly -eq $true -and (Split-Path -Leaf $PreCommitCurrent) -eq $PreCommitLayout.oldReleaseId
   $CandidatePackageReady = $CandidatePackage.checked -eq $true -and $CandidatePackage.insideRelease -eq $true -and $CandidatePackage.toolCount -eq $ExpectedToolCount
   $Summary = [pscustomobject]@{
-    status = $(if ($FailureVerified -and $CandidatePackageReady -and @($Results | Where-Object { -not $_.rollbackVerified }).Count -eq 0) { "READY_FOR_ACTIVATION" } else { "DRILL_FAILED" })
+    status = $(if ($FailureVerified -and $PreCommitVerified -and $CandidatePackageReady -and @($Results | Where-Object { -not $_.activated -or -not $_.phaseAWatcherFrozen -or -not $_.postCommitStatusVerified -or -not $_.ledgerBackupPresent }).Count -eq 0) { "READY_FOR_ACTIVATION" } else { "DRILL_FAILED" })
     drillRoot = $Root
     candidatePackage = $CandidatePackage
     successfulCases = $Results
     forcedFailure = [pscustomobject]@{ caught = $FailureCaught; rollbackVerified = [bool]$FailureRollback.verified; currentReleaseId = Split-Path -Leaf $FailureCurrent }
+    forcedPreCommitFailure = [pscustomobject]@{ caught = $PreCommitCaught; rollbackVerified = [bool]$PreCommitRollback.verified; ledgerRestoredExactly = [bool]$PreCommitRollback.ledgerRestoredExactly; currentReleaseId = Split-Path -Leaf $PreCommitCurrent }
     productionTouched = $false
   }
   Write-JsonAtomic -Path (Join-Path $Root "drill-summary.json") -Value $Summary

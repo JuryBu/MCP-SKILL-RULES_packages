@@ -19,7 +19,8 @@ param(
   [ValidateRange(5, 180)]
   [int]$TimeoutSeconds = 60,
   [string]$ProbePython,
-  [switch]$ConfirmProductionActivation
+  [switch]$ConfirmProductionActivation,
+  [switch]$FailBeforePollStart
 )
 
 $ErrorActionPreference = "Stop"
@@ -109,6 +110,130 @@ function Compare-JsonValue {
   return (($Left | ConvertTo-Json -Depth 30 -Compress) -eq ($Right | ConvertTo-Json -Depth 30 -Compress))
 }
 
+function Test-LedgerTransition {
+  param($Before, $After)
+  if (Compare-JsonValue $Before $After) { return $true }
+  if ([int]$Before.schema_version -ne 1 -or [int]$After.schema_version -ne 2) { return $false }
+  foreach ($Name in @("routes", "events_total", "pending_total", "pending_subscriptions_total", "events", "pending", "pending_subscriptions")) {
+    if ([int]$Before.$Name -ne [int]$After.$Name) { return $false }
+  }
+  $SubscriptionsValid = (
+    [int]$After.subscriptions_total -eq [int]$Before.expected_legacy_subscriptions -and
+    [int]$After.subscriptions -eq [int]$Before.route_subscription_expected
+  )
+  $WakeTotalsValid = (
+    [int]$After.wakes_total -ge [int]$Before.wakes_total -and
+    [int]$After.wakes_total -le ([int]$Before.wakes_total + [int]$After.pending_subscriptions_total) -and
+    [int]$After.wakes -ge [int]$Before.wakes -and
+    [int]$After.wakes -le ([int]$Before.wakes + [int]$After.pending_subscriptions)
+  )
+  $ActiveWakesValid = (
+    [int]$After.active_wakes_total -eq [int]$After.pending_subscriptions_total -and
+    [int]$After.active_wakes -eq [int]$After.pending_subscriptions
+  )
+  return ($SubscriptionsValid -and $WakeTotalsValid -and $ActiveWakesValid)
+}
+
+function Backup-Ledger {
+  param([string]$PythonPath, [string]$LedgerPath, [string]$Destination)
+  $Raw = & $PythonPath $ProbeScript backup-ledger --source $LedgerPath --destination $Destination
+  if ($LASTEXITCODE -ne 0) { throw "Ledger backup failed with exit code $LASTEXITCODE" }
+  $Result = ($Raw -join "`n") | ConvertFrom-Json
+  if ($Result.integrity -ne "ok" -or -not (Test-Path -LiteralPath $Destination -PathType Leaf)) {
+    throw "Ledger backup verification failed"
+  }
+  return $Result
+}
+
+function Restore-Ledger {
+  param([string]$PythonPath, [string]$BackupPath, [string]$LedgerPath)
+  $Raw = & $PythonPath $ProbeScript restore-ledger --source $BackupPath --destination $LedgerPath
+  if ($LASTEXITCODE -ne 0) { throw "Ledger restore failed with exit code $LASTEXITCODE" }
+  $Result = ($Raw -join "`n") | ConvertFrom-Json
+  if ($Result.integrity -ne "ok") { throw "Ledger restore verification failed" }
+  return $Result
+}
+
+function Set-AutoPoll {
+  param([string]$PrivateEnvPath, [bool]$Enabled)
+  $PrivateEnv = Read-Json $PrivateEnvPath
+  Set-JsonProperty -Object $PrivateEnv -Name "WECHAT_DOCS_MCP_AUTO_POLL" -Value $(if ($Enabled) { "1" } else { "0" })
+  Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
+}
+
+function Invoke-McpTool {
+  param(
+    [ValidateSet("Http", "Fixture")][string]$Mode,
+    [string]$PythonPath,
+    [string]$FixtureStatePath,
+    [string]$ToolName,
+    $Arguments = [pscustomobject]@{},
+    [int]$CallTimeoutSeconds = 0
+  )
+  if ($Mode -eq "Http") {
+    $EffectiveTimeout = $(if ($CallTimeoutSeconds -gt 0) { $CallTimeoutSeconds } else { $TimeoutSeconds })
+    $ArgumentsJson = $Arguments | ConvertTo-Json -Depth 20 -Compress
+    $Raw = & $PythonPath $ProbeScript mcp-call --url "$BrokerBaseUrl/$Endpoint/mcp" --name $ToolName --arguments-json $ArgumentsJson --timeout $EffectiveTimeout
+    if ($LASTEXITCODE -ne 0) { throw "MCP tool call failed: $ToolName (exit $LASTEXITCODE)" }
+    $Envelope = ($Raw -join "`n") | ConvertFrom-Json
+    if ($Envelope.is_error -eq $true) { throw "MCP tool returned an error: $ToolName" }
+    return $Envelope.structured_content
+  }
+
+  $State = Get-FixtureState $FixtureStatePath
+  $Entry = $State.endpoints.PSObject.Properties[$Endpoint].Value
+  $History = @($State.toolHistory)
+  if ($ToolName -eq "wechat_poll_stop") {
+    $WasRunning = [bool]$Entry.autoPoll
+    Set-JsonProperty -Object $Entry -Name "autoPoll" -Value $false
+    $Result = [pscustomobject]@{ status = $(if ($WasRunning) { "stopped" } else { "not_running" }) }
+  } elseif ($ToolName -eq "wechat_poll_start") {
+    Set-JsonProperty -Object $Entry -Name "autoPoll" -Value $true
+    $Result = [pscustomobject]@{ status = "started"; interval = 5.0 }
+  } elseif ($ToolName -eq "wechat_poll") {
+    Set-JsonProperty -Object $Entry -Name "pollCycles" -Value ([int]$Entry.pollCycles + 1)
+    $Result = [pscustomobject]@{ status = "ok"; forced = [bool]$Arguments.force_refresh }
+  } elseif ($ToolName -eq "wechat_status") {
+    $Result = [pscustomobject]@{
+      watcher_ready = $true
+      background_polling = [bool]$Entry.autoPoll
+      poll_consecutive_failures = 0
+      route_count = 1
+    }
+  } else {
+    throw "Unsupported fixture MCP tool: $ToolName"
+  }
+  Set-JsonProperty -Object $State -Name "toolHistory" -Value @($History + [pscustomobject]@{ tool = $ToolName; result = $Result })
+  Write-JsonAtomic -Path $FixtureStatePath -Value $State
+  return $Result
+}
+
+function Assert-PollStatus {
+  param($Status, [bool]$ExpectedRunning)
+  if ($Status.watcher_ready -ne $true -or [bool]$Status.background_polling -ne $ExpectedRunning -or [int]$Status.poll_consecutive_failures -ne 0) {
+    throw "Watcher state does not match the release phase"
+  }
+}
+
+function Wait-PollStatus {
+  param(
+    [ValidateSet("Http", "Fixture")][string]$Mode,
+    [string]$PythonPath,
+    [string]$FixtureStatePath,
+    [bool]$ExpectedRunning
+  )
+  $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds + 15)
+  do {
+    $Status = Invoke-McpTool -Mode $Mode -PythonPath $PythonPath -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
+    if ([bool]$Status.background_polling -eq $ExpectedRunning) {
+      Assert-PollStatus -Status $Status -ExpectedRunning $ExpectedRunning
+      return $Status
+    }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTimeOffset]::UtcNow -lt $Deadline)
+  throw "Watcher did not reach the expected polling state"
+}
+
 function Get-FileSha256 {
   param([string]$Path)
   return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -175,11 +300,14 @@ function Invoke-BackendReload {
   }
   $State = Get-FixtureState $FixtureStatePath
   $Entry = $State.endpoints.PSObject.Properties[$Name].Value
+  $PrivateEnv = Read-Json $PrivateEnvPath
+  $AutoPoll = ([string]$PrivateEnv.WECHAT_DOCS_MCP_AUTO_POLL -eq "1")
   $BeforeBackend = [pscustomobject]@{ pid = [int]$Entry.pid; generation = [int]$Entry.generation }
   Set-JsonProperty -Object $Entry -Name "pid" -Value ([int]$Entry.pid + 1)
   Set-JsonProperty -Object $Entry -Name "generation" -Value ([int]$Entry.generation + 1)
   Set-JsonProperty -Object $Entry -Name "toolCount" -Value $TargetToolCount
   Set-JsonProperty -Object $Entry -Name "healthy" -Value (-not $FailFixtureHealth)
+  Set-JsonProperty -Object $Entry -Name "autoPoll" -Value $AutoPoll
   $Supervisor = Ensure-JsonObject -Parent $State -Name "supervisor"
   Set-JsonProperty -Object $Supervisor -Name "pid" -Value 7001
   Set-JsonProperty -Object $Supervisor -Name "healthy" -Value (-not $FailFixtureHealth)
@@ -281,13 +409,30 @@ function Restore-ActivationFiles {
 
 function Restore-ReleaseSwitch {
   param($Context, [switch]$Automatic)
-  if (Test-Path -LiteralPath $Context.currentPath) {
-    [System.IO.Directory]::Move($Context.currentPath, $Context.failedLinkPath)
+  $StopResult = Invoke-McpTool -Mode $Context.mode -PythonPath $Context.probePython -FixtureStatePath $Context.fixtureStatePath -ToolName "wechat_poll_stop" -Arguments ([pscustomobject]@{ timeout = [double]($TimeoutSeconds + 5) }) -CallTimeoutSeconds ($TimeoutSeconds + 20)
+  if ($StopResult.status -notin @("stopped", "not_running", "stopping")) { throw "Candidate polling could not be frozen for rollback" }
+  Wait-PollStatus -Mode $Context.mode -PythonPath $Context.probePython -FixtureStatePath $Context.fixtureStatePath -ExpectedRunning $false | Out-Null
+  if (Test-Path -LiteralPath $Context.previousLinkPath) {
+    if (Test-Path -LiteralPath $Context.currentPath) {
+      [System.IO.Directory]::Move($Context.currentPath, $Context.failedLinkPath)
+    }
+    [System.IO.Directory]::Move($Context.previousLinkPath, $Context.currentPath)
+  } elseif ((Get-JunctionTarget $Context.currentPath) -ne $Context.previousTarget) {
+    throw "Previous Junction is missing during rollback"
   }
-  if (-not (Test-Path -LiteralPath $Context.previousLinkPath)) { throw "Previous Junction is missing during rollback" }
-  [System.IO.Directory]::Move($Context.previousLinkPath, $Context.currentPath)
   Restore-ActivationFiles -BackupRoot $Context.backupRoot -PointersRoot $Context.pointersRoot -RuntimePath $Context.runtimePath -PrivateEnvPath $Context.privateEnvPath -ManifestPath $Context.manifestPath
+  Set-AutoPoll -PrivateEnvPath $Context.privateEnvPath -Enabled $false
+  $LedgerRestore = Restore-Ledger -PythonPath $Context.probePython -BackupPath $Context.ledgerBackupPath -LedgerPath $Context.ledgerPath
   Invoke-BackendReload -Mode $Context.mode -Name $Endpoint -PrivateEnvPath $Context.privateEnvPath -FixtureStatePath $Context.fixtureStatePath -TargetToolCount $Context.expectedCurrentToolCount | Out-Null
+  $IdleHealth = Wait-EndpointHealth -Mode $Context.mode -Name $Endpoint -ToolCount $Context.expectedCurrentToolCount -FixtureStatePath $Context.fixtureStatePath
+  $IdleSupervisor = Wait-Supervisor -Mode $Context.mode -SupervisorPath $Context.supervisorPath -FixtureStatePath $Context.fixtureStatePath -BackendPid ([int]$IdleHealth.backend.pid) -BackendGeneration ([int]$IdleHealth.backend.generation)
+  $RestoredLedger = Get-LedgerState -PythonPath $Context.probePython -LedgerPath $Context.ledgerPath -BoundRouteId $Context.routeId
+  $LedgerRestoredExactly = Compare-JsonValue $Context.beforeLedger $RestoredLedger
+  Copy-Item -LiteralPath (Join-Path $Context.backupRoot "broker-private.env.json") -Destination $Context.privateEnvPath -Force
+  $ResumeResult = Invoke-McpTool -Mode $Context.mode -PythonPath $Context.probePython -FixtureStatePath $Context.fixtureStatePath -ToolName "wechat_poll_start" -Arguments ([pscustomobject]@{ interval = $Context.pollInterval })
+  if ($ResumeResult.status -notin @("started", "already_running")) { throw "Previous backend polling did not resume after rollback" }
+  $ResumeStatus = Invoke-McpTool -Mode $Context.mode -PythonPath $Context.probePython -FixtureStatePath $Context.fixtureStatePath -ToolName "wechat_status"
+  Assert-PollStatus -Status $ResumeStatus -ExpectedRunning $true
   $Health = Wait-EndpointHealth -Mode $Context.mode -Name $Endpoint -ToolCount $Context.expectedCurrentToolCount -FixtureStatePath $Context.fixtureStatePath
   $Supervisor = Wait-Supervisor -Mode $Context.mode -SupervisorPath $Context.supervisorPath -FixtureStatePath $Context.fixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)
   $ProtectedHealth = Wait-EndpointHealth -Mode $Context.mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $Context.fixtureStatePath
@@ -310,7 +455,7 @@ function Restore-ReleaseSwitch {
     [int]$ProtectedHealth.backend.generation -eq $Context.beforeProtectedBackendGeneration
   )
   $Result = [pscustomobject]@{
-    verified = ((Get-JunctionTarget $Context.currentPath) -eq $Context.previousTarget -and $ActiveRelease -eq $Context.expectedCurrentReleaseId -and $CandidateRelease -eq $Context.beforeCandidateReleaseId -and $LastKnownGood -eq $Context.expectedCurrentReleaseId -and (Compare-JsonValue $Ledger $Context.beforeLedger) -and $ProtectedBackendStable -and $FilesRestoredExactly)
+    verified = ((Get-JunctionTarget $Context.currentPath) -eq $Context.previousTarget -and $ActiveRelease -eq $Context.expectedCurrentReleaseId -and $CandidateRelease -eq $Context.beforeCandidateReleaseId -and $LastKnownGood -eq $Context.expectedCurrentReleaseId -and $LedgerRestoredExactly -and $ProtectedBackendStable -and $FilesRestoredExactly -and (Test-Path -LiteralPath $Context.ledgerBackupPath -PathType Leaf))
     automatic = [bool]$Automatic
     currentTarget = Get-JunctionTarget $Context.currentPath
     activeReleaseId = $ActiveRelease
@@ -319,6 +464,10 @@ function Restore-ReleaseSwitch {
     filesRestoredExactly = $FilesRestoredExactly
     protectedBackendStable = $ProtectedBackendStable
     ledger = $Ledger
+    restoredLedger = $RestoredLedger
+    ledgerRestoredExactly = $LedgerRestoredExactly
+    ledgerRestore = $LedgerRestore
+    ledgerBackupPath = $Context.ledgerBackupPath
     backendGeneration = [int]$Health.backend.generation
     supervisorGeneration = [int]$Supervisor.backendGeneration
     protectedBackendGeneration = [int]$ProtectedHealth.backend.generation
@@ -339,7 +488,8 @@ function Invoke-ReleaseSwitch {
     [string]$SwitchRouteId,
     [string]$SwitchProbePython,
     [string]$FixtureStatePath,
-    [switch]$FailFixtureHealth
+    [switch]$FailFixtureHealth,
+    [switch]$FailBeforePollStart
   )
   $Service = Get-FullPath $SwitchServiceRoot
   $Data = Get-FullPath $SwitchDataRoot
@@ -378,10 +528,34 @@ function Invoke-ReleaseSwitch {
     $PackageInfo = Get-CandidatePackageInfo -PythonPath $SwitchProbePython -ReleasePath $CandidatePath
     if ($PackageInfo.inside_release -ne $true -or [int]$PackageInfo.tool_count -ne $ExpectedToolCount) { throw "Candidate package does not resolve from the final release path" }
   }
-  $BeforeLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
+  $OriginalPrivateEnv = Read-Json $PrivateEnvPath
+  if ([string]$OriginalPrivateEnv.WECHAT_DOCS_MCP_AUTO_POLL -ne "1") { throw "Activation requires the existing watcher to be configured for automatic polling" }
+  $PollInterval = 5.0
+  if ($null -ne $OriginalPrivateEnv.PSObject.Properties["WECHAT_DOCS_MCP_POLL_INTERVAL"]) {
+    $PollInterval = [double]$OriginalPrivateEnv.WECHAT_DOCS_MCP_POLL_INTERVAL
+  }
   $BeforeHealth = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedCurrentToolCount -FixtureStatePath $FixtureStatePath
   $BeforeProtectedHealth = Wait-EndpointHealth -Mode $Mode -Name $ProtectedEndpoint -ToolCount $ExpectedProtectedToolCount -FixtureStatePath $FixtureStatePath
+  $BeforeStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
+  Assert-PollStatus -Status $BeforeStatus -ExpectedRunning $true
   Copy-ActivationBackup -BackupRoot $BackupRoot -PointersRoot $PointersRoot -RuntimePath $RuntimePath -PrivateEnvPath $PrivateEnvPath -ManifestPath $ManifestPath -CurrentTarget $PreviousTarget
+  $PollStopped = $false
+  try {
+    $StopResult = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_poll_stop" -Arguments ([pscustomobject]@{ timeout = [double]($TimeoutSeconds + 5) }) -CallTimeoutSeconds ($TimeoutSeconds + 20)
+    if ($StopResult.status -notin @("stopped", "not_running", "stopping")) { throw "Existing polling did not stop before the ledger backup" }
+    $PollStopped = $true
+    $StoppedStatus = Wait-PollStatus -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ExpectedRunning $false
+    $BeforeLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
+    $LedgerBackupPath = Join-Path $BackupRoot "events.sqlite3"
+    $LedgerBackup = Backup-Ledger -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -Destination $LedgerBackupPath
+  } catch {
+    if ($PollStopped) {
+      Wait-PollStatus -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ExpectedRunning $false | Out-Null
+      $ResumeResult = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_poll_start" -Arguments ([pscustomobject]@{ interval = $PollInterval })
+      if ($ResumeResult.status -notin @("started", "already_running")) { throw "Preflight failed and the existing watcher could not be resumed" }
+    }
+    throw
+  }
 
   $Context = [pscustomobject]@{
     mode = $Mode
@@ -406,6 +580,10 @@ function Invoke-ReleaseSwitch {
     previousLinkPath = $PreviousLinkPath
     failedLinkPath = $FailedLinkPath
     beforeLedger = $BeforeLedger
+    ledgerBackupPath = $LedgerBackupPath
+    ledgerBackup = $LedgerBackup
+    pollInterval = $PollInterval
+    beforeStatus = $BeforeStatus
     beforeBrokerPid = [int]$BeforeHealth.pid
     beforeBackendGeneration = [int]$BeforeHealth.backend.generation
     expectedCurrentToolCount = [int]$ExpectedCurrentToolCount
@@ -413,13 +591,12 @@ function Invoke-ReleaseSwitch {
     beforeProtectedBackendGeneration = [int]$BeforeProtectedHealth.backend.generation
   }
 
-  $Switched = $false
   try {
+    Set-AutoPoll -PrivateEnvPath $PrivateEnvPath -Enabled $false
     New-Item -ItemType Junction -Path $NextLinkPath -Target $CandidatePath | Out-Null
     [System.IO.Directory]::Move($CurrentPath, $PreviousLinkPath)
     try {
       [System.IO.Directory]::Move($NextLinkPath, $CurrentPath)
-      $Switched = $true
     } catch {
       [System.IO.Directory]::Move($PreviousLinkPath, $CurrentPath)
       throw
@@ -433,6 +610,7 @@ function Invoke-ReleaseSwitch {
     $PrivateEnv = Read-Json $PrivateEnvPath
     Set-JsonProperty -Object $PrivateEnv -Name "WECHAT_DOCS_MCP_ROOT" -Value $CurrentPath
     Set-JsonProperty -Object $PrivateEnv -Name "WECHAT_DOCS_MCP_PYTHON" -Value (Join-Path $CurrentPath "env\Scripts\python.exe")
+    Set-JsonProperty -Object $PrivateEnv -Name "WECHAT_DOCS_MCP_AUTO_POLL" -Value "0"
     Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 
     Invoke-BackendReload -Mode $Mode -Name $Endpoint -PrivateEnvPath $PrivateEnvPath -FixtureStatePath $FixtureStatePath -TargetToolCount $ExpectedToolCount -FailFixtureHealth:$FailFixtureHealth | Out-Null
@@ -443,7 +621,10 @@ function Invoke-ReleaseSwitch {
       throw "Protected endpoint changed during the WeChat release switch"
     }
     $AfterLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
-    if (-not (Compare-JsonValue $BeforeLedger $AfterLedger)) { throw "Ledger state changed during the release switch" }
+    if (-not (Test-LedgerTransition $BeforeLedger $AfterLedger)) { throw "Ledger transition is not a valid unchanged or V1-to-V2 migration" }
+    $PhaseAStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
+    Assert-PollStatus -Status $PhaseAStatus -ExpectedRunning $false
+    if ($FailBeforePollStart) { throw "Forced failure after Phase A before polling resumes" }
 
     $UpdatedManifest = Update-ServiceManifest -Path (Join-Path $CurrentPath "service-manifest.json") -ReleaseId $SwitchCandidateReleaseId -SourceCommit $SourceCommit -Health $Health -Supervisor $Supervisor
     $Pointer = New-ReleasePointer -ReleaseId $SwitchCandidateReleaseId -ReleasePath $CandidatePath -SourceCommit $SourceCommit -Activated $true -Reason "Scoped reload, ledger persistence and supervisor health verified"
@@ -451,31 +632,55 @@ function Invoke-ReleaseSwitch {
     foreach ($Name in @("active.json", "candidate.json", "last-known-good.json")) {
       if ((Get-ReleaseIdFromPointer (Join-Path $PointersRoot $Name)) -ne $SwitchCandidateReleaseId) { throw "Pointer verification failed: $Name" }
     }
-
-    $Result = [pscustomobject]@{
-      status = "activated"
-      releaseId = $SwitchCandidateReleaseId
-      sourceCommit = $SourceCommit
-      backupRoot = $BackupRoot
-      previousLinkPath = $PreviousLinkPath
-      backendPid = [int]$Health.backend.pid
-      backendGeneration = [int]$Health.backend.generation
-      protectedBackendGeneration = [int]$ProtectedHealth.backend.generation
-      ledger = $AfterLedger
-      manifestActiveBackend = $UpdatedManifest.validation.activeBackend
-      packageInfo = $PackageInfo
-    }
-    Set-JsonProperty -Object $Context -Name "activationResult" -Value $Result
-    Write-JsonAtomic -Path (Join-Path $BackupRoot "activation-verification.json") -Value $Result
-    return $Context
+    Set-AutoPoll -PrivateEnvPath $PrivateEnvPath -Enabled $true
+    $StartResult = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_poll_start" -Arguments ([pscustomobject]@{ interval = $PollInterval })
+    if ($StartResult.status -notin @("started", "already_running")) { throw "Candidate polling did not start at the Phase B commit point" }
+    Set-JsonProperty -Object $Context -Name "phaseAHealth" -Value $Health
+    Set-JsonProperty -Object $Context -Name "phaseASupervisor" -Value $Supervisor
+    Set-JsonProperty -Object $Context -Name "phaseAProtectedHealth" -Value $ProtectedHealth
+    Set-JsonProperty -Object $Context -Name "phaseALedger" -Value $AfterLedger
+    Set-JsonProperty -Object $Context -Name "phaseAStatus" -Value $PhaseAStatus
+    Set-JsonProperty -Object $Context -Name "pollStart" -Value $StartResult
+    Set-JsonProperty -Object $Context -Name "updatedManifest" -Value $UpdatedManifest
   } catch {
     $Failure = $_.Exception.Message
-    if ($Switched) {
-      $Rollback = Restore-ReleaseSwitch -Context $Context -Automatic
-      throw "Activation failed after verified rollback: $Failure; rollbackGeneration=$($Rollback.backendGeneration)"
-    }
-    throw
+    $Rollback = Restore-ReleaseSwitch -Context $Context -Automatic
+    throw "Activation failed before polling resumed and completed a verified rollback: $Failure; rollbackGeneration=$($Rollback.backendGeneration)"
   }
+
+  $PostCommitStatus = $null
+  $PostCommitStatusVerified = $false
+  $PostCommitStatusError = $null
+  try {
+    $PostCommitStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
+    Assert-PollStatus -Status $PostCommitStatus -ExpectedRunning $true
+    $PostCommitStatusVerified = $true
+  } catch {
+    $PostCommitStatusError = $_.Exception.Message
+  }
+  $Result = [pscustomobject]@{
+    status = $(if ($PostCommitStatusVerified) { "activated" } else { "activated_poll_status_unverified" })
+    releaseId = $SwitchCandidateReleaseId
+    sourceCommit = $SourceCommit
+    backupRoot = $BackupRoot
+    previousLinkPath = $PreviousLinkPath
+    backendPid = [int]$Context.phaseAHealth.backend.pid
+    backendGeneration = [int]$Context.phaseAHealth.backend.generation
+    protectedBackendGeneration = [int]$Context.phaseAProtectedHealth.backend.generation
+    ledger = $Context.phaseALedger
+    ledgerBackupPath = $LedgerBackupPath
+    schemaMigrated = ([int]$BeforeLedger.schema_version -eq 1 -and [int]$Context.phaseALedger.schema_version -eq 2)
+    phaseAWatcherFrozen = ([bool]$Context.phaseAStatus.background_polling -eq $false)
+    pollStart = $Context.pollStart
+    postCommitStatusVerified = $PostCommitStatusVerified
+    postCommitStatus = $PostCommitStatus
+    postCommitStatusError = $PostCommitStatusError
+    manifestActiveBackend = $Context.updatedManifest.validation.activeBackend
+    packageInfo = $PackageInfo
+  }
+  Set-JsonProperty -Object $Context -Name "activationResult" -Value $Result
+  Write-JsonAtomic -Path (Join-Path $BackupRoot "activation-verification.json") -Value $Result
+  return $Context
 }
 
 if ($Action -eq "Drill") {
@@ -488,5 +693,5 @@ foreach ($Required in @($CandidateReleaseId, $ExpectedCurrentReleaseId, $RouteId
   if ([string]::IsNullOrWhiteSpace($Required)) { throw "Activate requires CandidateReleaseId, ExpectedCurrentReleaseId and RouteId" }
 }
 if ([string]::IsNullOrWhiteSpace($ProbePython)) { $ProbePython = Join-Path $ServiceRoot "releases\$CandidateReleaseId\env\Scripts\python.exe" }
-$Context = Invoke-ReleaseSwitch -Mode Http -SwitchServiceRoot $ServiceRoot -SwitchDataRoot $DataRoot -SwitchBrokerRoot $BrokerRoot -SwitchCandidateReleaseId $CandidateReleaseId -SwitchExpectedCurrentReleaseId $ExpectedCurrentReleaseId -SwitchRouteId $RouteId -SwitchProbePython $ProbePython -FixtureStatePath ""
+$Context = Invoke-ReleaseSwitch -Mode Http -SwitchServiceRoot $ServiceRoot -SwitchDataRoot $DataRoot -SwitchBrokerRoot $BrokerRoot -SwitchCandidateReleaseId $CandidateReleaseId -SwitchExpectedCurrentReleaseId $ExpectedCurrentReleaseId -SwitchRouteId $RouteId -SwitchProbePython $ProbePython -FixtureStatePath "" -FailBeforePollStart:$FailBeforePollStart
 $Context.activationResult | ConvertTo-Json -Depth 20
