@@ -43,7 +43,7 @@ function Get-StaticTargetSnapshot {
 }
 
 function Write-MockSource {
-    param([string]$Root, [ValidateSet("healthy", "unhealthy")][string]$Mode)
+    param([string]$Root, [ValidateSet("healthy", "unhealthy", "transient-deep")][string]$Mode)
     New-Item -ItemType Directory -Force -Path $Root, (Join-Path $Root "test") | Out-Null
     $broker = @'
 import fs from "node:fs";
@@ -51,13 +51,21 @@ import http from "node:http";
 const mode = "__MODE__";
 const port = Number(process.env.CODEX_MCP_BROKER_PORT);
 const probe = process.env.BROKER_PROBE_FILE;
+let deepAttempts = 0;
 if (mode === "unhealthy") {
   setInterval(() => {}, 1000);
 } else {
   const server = http.createServer((request, response) => {
-    if (probe) fs.appendFileSync(probe, "health\n");
+    const url = new URL(request.url, "http://127.0.0.1");
+    const deep = url.searchParams.get("deep") === "1";
+    if (probe) fs.appendFileSync(probe, deep ? "deep\n" : "health\n");
+    if (mode === "transient-deep" && deep && ++deepAttempts < 3) {
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ ok: false, healthy: false, pid: process.pid, error: "MCP error -32000: Connection closed" }));
+      return;
+    }
     response.writeHead(200, { "content-type": "application/json" });
-    response.end(JSON.stringify({ ok: true, pid: process.pid }));
+    response.end(JSON.stringify({ ok: true, healthy: deep, pid: process.pid, endpoint: deep ? url.searchParams.get("endpoint") : undefined, toolCount: deep ? 22 : undefined }));
   });
   server.listen(port, "127.0.0.1");
 }
@@ -131,9 +139,11 @@ try {
     New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
     $healthySource = Join-Path $testRoot "source-healthy"
     $unhealthySource = Join-Path $testRoot "source-unhealthy"
+    $transientDeepSource = Join-Path $testRoot "source-transient-deep"
     $oldSource = Join-Path $testRoot "source-old"
     Write-MockSource -Root $healthySource -Mode healthy
     Write-MockSource -Root $unhealthySource -Mode unhealthy
+    Write-MockSource -Root $transientDeepSource -Mode transient-deep
     Write-MockSource -Root $oldSource -Mode healthy
 
     $flatRoot = Join-Path $testRoot "process-match"
@@ -266,6 +276,13 @@ server.listen(port, "127.0.0.1", () => {
     }
     Stop-FlatBroker -Root $successRoot
 
+    $deepRetryRoot = Join-Path $testRoot "deep-retry"
+    Initialize-Target -Root $deepRetryRoot -OldSource $oldSource -Port 19493 -StartExists $true -StopExists $true
+    & $updaterPath -SourceBrokerRoot $transientDeepSource -BrokerRoot $deepRetryRoot -BrokerPort 19493 -DeepHealthEndpoints @("napcat") -StartupTimeoutSeconds 3 | Out-Null
+    $deepAttemptCount = @((Get-Content -LiteralPath (Join-Path $deepRetryRoot "probe.log") -Encoding UTF8) | Where-Object { $_ -eq "deep" }).Count
+    if ($deepAttemptCount -lt 3) { throw "Updater did not retry transient deep health failures." }
+    Stop-FlatBroker -Root $deepRetryRoot
+
     $managedReleaseRoot = Join-Path $testRoot "managed-release"
     $managedRoot = Join-Path $managedReleaseRoot "mcps\broker"
     $managedInstallRoot = Join-Path $managedReleaseRoot "install"
@@ -353,7 +370,7 @@ server.listen(port, "127.0.0.1", () => {
     Wait-Health -Port 19492
     Stop-FlatBroker -Root $actualRoot
 
-    Write-Output "Codex MCP broker lifecycle portability, WhatIf, flat and managed rollback, managed release, identity guard, and success tests passed."
+    Write-Output "Codex MCP broker lifecycle portability, WhatIf, deep-health retry, flat and managed rollback, managed release, identity guard, and success tests passed."
 } finally {
     foreach ($processId in $processIds) {
         if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {

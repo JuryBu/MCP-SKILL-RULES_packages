@@ -252,6 +252,36 @@ function Wait-BrokerHealth {
     throw "Broker did not become healthy within $TimeoutSeconds seconds. Last observation: $LastObservation"
 }
 
+function Wait-BrokerDeepHealth {
+    param(
+        [string]$Endpoint,
+        [DateTime]$Deadline,
+        [string]$ExpectedBrokerPath,
+        [int]$ExpectedProcessId
+    )
+    $LastObservation = $null
+    do {
+        if (-not (Get-Process -Id $ExpectedProcessId -ErrorAction SilentlyContinue)) {
+            throw "Candidate broker process exited before deep health became ready: PID $ExpectedProcessId endpoint=$Endpoint"
+        }
+        try {
+            $CurrentHealth = Invoke-RestMethod -Method Get -Uri $HealthUrl -TimeoutSec 3
+            $Identity = Assert-BrokerHealthIdentity -Health $CurrentHealth -ExpectedBrokerPath $ExpectedBrokerPath -Stage "Deep health"
+            if ($Identity.pid -ne $ExpectedProcessId) {
+                throw "Deep health broker PID did not match the candidate process. expected=$ExpectedProcessId actual=$($Identity.pid)"
+            }
+            $ProbeUrl = "$HealthUrl`?endpoint=$([uri]::EscapeDataString($Endpoint))&deep=1"
+            $Probe = Invoke-RestMethod -Method Get -Uri $ProbeUrl -TimeoutSec 20
+            if ($Probe.ok -eq $true -and $Probe.healthy -eq $true) { return $Probe }
+            $LastObservation = if ($Probe.error) { [string]$Probe.error } else { $Probe | ConvertTo-Json -Compress -Depth 5 }
+        } catch {
+            $LastObservation = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    } while ([DateTime]::UtcNow -lt $Deadline)
+    throw "Deep health did not become ready for endpoint '$Endpoint' before the startup deadline. Last observation: $LastObservation"
+}
+
 foreach ($Path in @($SourceBrokerPath, $SourceLifecyclePath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required file is missing: $Path" }
 }
@@ -361,13 +391,9 @@ try {
     Save-CandidateStartupEvidence -StartOutput $CandidateStartOutput -CandidateProcessId $CandidateProcessId
     $AfterHealth = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds -ExpectedBrokerPath $InstalledBrokerPath -RejectedProcessId $BeforeIdentity.pid -ExpectedProcessId $CandidateProcessId
     $DeepHealth = @()
+    $DeepHealthDeadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
     foreach ($Endpoint in $DeepHealthEndpoints) {
-        $ProbeUrl = "$HealthUrl`?endpoint=$([uri]::EscapeDataString($Endpoint))&deep=1"
-        $Probe = Invoke-RestMethod -Method Get -Uri $ProbeUrl -TimeoutSec 20
-        if ($Probe.ok -ne $true -or $Probe.healthy -ne $true) {
-            throw "Deep health failed for endpoint '$Endpoint': $($Probe.error)"
-        }
-        $DeepHealth += $Probe
+        $DeepHealth += Wait-BrokerDeepHealth -Endpoint $Endpoint -Deadline $DeepHealthDeadline -ExpectedBrokerPath $InstalledBrokerPath -ExpectedProcessId $CandidateProcessId
     }
     foreach ($Path in $ProtectedStatePaths) {
         $AfterHash = Get-FileHashOrNull -Path $Path
