@@ -486,11 +486,12 @@ class AttachmentRegistry:
             if not partial.is_file():
                 raise LedgerError("ATTACHMENT_NOT_MATERIALIZED", "底层适配器没有产生附件实体")
             actual_size = partial.stat().st_size
+            is_preview = source_kind == "wechat_v2_image_preview"
             expected_size = attachment.get("byte_count")
-            if expected_size is not None and int(expected_size) != actual_size:
+            if not is_preview and expected_size is not None and int(expected_size) != actual_size:
                 raise LedgerError("ATTACHMENT_SIZE_MISMATCH", "附件字节数与消息元数据不一致")
             expected_md5 = str(attachment.get("content_md5") or "").lower()
-            if expected_md5 and _digest(partial, "md5") != expected_md5:
+            if not is_preview and expected_md5 and _digest(partial, "md5") != expected_md5:
                 raise LedgerError("ATTACHMENT_MD5_MISMATCH", "附件 MD5 与消息元数据不一致")
             inspected = inspect_file(partial)
             name = str(attachment.get("file_name") or prepared["file_name"])
@@ -533,6 +534,7 @@ class AttachmentRegistry:
         size = materialized.stat().st_size
         digest = _sha256(materialized)
         inspected = inspect_file(materialized)
+        is_preview = source_kind == "wechat_v2_image_preview"
         failure: LedgerError | None = None
         with self.ledger._transaction() as connection:
             transfer = connection.execute(
@@ -543,7 +545,7 @@ class AttachmentRegistry:
             if transfer["direction"] != "download" or transfer["state"] != "PREPARED":
                 raise LedgerError("ATTACHMENT_TRANSFER_STATE", "attachment transfer 状态不允许落盘确认")
             expected_md5 = str(transfer["content_md5"] or "").strip().lower()
-            if not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
+            if not is_preview and not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
                 connection.execute(
                     """
                     UPDATE attachment_transfers SET state='FAILED',result_json=?,updated_at=?
@@ -559,7 +561,7 @@ class AttachmentRegistry:
                     "ATTACHMENT_INTEGRITY_METADATA_REQUIRED",
                     "附件缺少可验证的 MD5，不能标记为原件",
                 )
-            elif transfer["byte_count"] is not None and transfer["byte_count"] != size:
+            elif not is_preview and transfer["byte_count"] is not None and transfer["byte_count"] != size:
                 connection.execute(
                     """
                     UPDATE attachment_transfers SET state='FAILED',result_json=?,updated_at=?
@@ -572,7 +574,7 @@ class AttachmentRegistry:
                     "下载文件字节数与消息元数据不一致",
                 )
             else:
-                if _digest(materialized, "md5") != expected_md5:
+                if not is_preview and _digest(materialized, "md5") != expected_md5:
                     connection.execute(
                         """
                         UPDATE attachment_transfers SET state='FAILED',result_json=?,updated_at=?
@@ -594,6 +596,8 @@ class AttachmentRegistry:
                         "mime_type": inspected["mime_type"],
                         "width": inspected["width"],
                         "height": inspected["height"],
+                        "quality": "preview" if is_preview else "original",
+                        "matches_event_original": not is_preview,
                     }
                     connection.execute(
                         """

@@ -262,6 +262,38 @@ def test_event_gets_unforgeable_attachment_ref_and_downloads_without_overwrite(
     assert (destination / "sample.png").read_bytes() == b"existing"
 
 
+def test_verified_wechat_image_preview_records_quality_without_claiming_original(
+    registry: tuple[AttachmentRegistry, EventLedger, str],
+) -> None:
+    attachment_registry, ledger, subscription_id = registry
+    event = ledger.ingest_event(
+        "route-a",
+        "image-preview",
+        "image",
+        {
+            "attachment_name": "preview",
+            "attachment_size": len(PNG_1X1) + 100,
+            "attachment_md5": hashlib.md5(b"unavailable-original").hexdigest(),
+        },
+    )
+    attachment_ref = ledger.list_pending(subscription_id)[-1]["payload"]["attachment_ref"]
+    downloaded = attachment_registry.download(
+        subscription_id,
+        event["event_id"],
+        attachment_ref,
+        str(attachment_registry.intake_root / "preview"),
+        "download-preview",
+        BytesMaterializer(PNG_1X1, "wechat_v2_image_preview"),
+    )
+
+    result = __import__("json").loads(downloaded["result_json"])
+    assert downloaded["state"] == "VERIFIED"
+    assert downloaded["source_kind"] == "wechat_v2_image_preview"
+    assert downloaded["byte_count"] == len(PNG_1X1)
+    assert result["quality"] == "preview"
+    assert result["matches_event_original"] is False
+
+
 def test_download_rejects_forged_attachment_ref_before_materialization(
     registry: tuple[AttachmentRegistry, EventLedger, str]
 ) -> None:

@@ -437,14 +437,29 @@ class WechatAttachmentSourceResolver:
         root: ET.Element,
         create_time: int,
         destination: Path,
-    ) -> None:
+    ) -> str:
         username, owner_account_key_sha256 = self._verified_identity(attachment)
         indexed = self._image_index(attachment, username)
-        file_name, content_md5, expected_size = indexed[0]
-        self._validate_expected(attachment, size=expected_size, content_md5=content_md5)
-        source = self._image_source(username, create_time, file_name)
-        if not source.is_file():
+        expected_event_size = attachment.get("byte_count")
+        expected_event_md5 = str(attachment.get("content_md5") or "").casefold()
+        available = [
+            (file_name, content_md5, expected_size)
+            for file_name, content_md5, expected_size in indexed
+            if self._image_source(username, create_time, file_name).is_file()
+        ]
+        if not available:
             raise LedgerError("ATTACHMENT_IMAGE_ENTITY", "微信图片实体不存在")
+        exact = [
+            row
+            for row in available
+            if expected_event_size is not None
+            and int(expected_event_size) == row[2]
+            and expected_event_md5
+            and expected_event_md5 == row[1]
+        ]
+        file_name, content_md5, expected_size = (exact or available)[0]
+        source_kind = "wechat_v2_image_dat" if exact else "wechat_v2_image_preview"
+        source = self._image_source(username, create_time, file_name)
         image = root.find(".//img")
         message_md5 = "" if image is None else (
             image.get("originsourcemd5") or image.get("md5") or ""
@@ -489,6 +504,7 @@ class WechatAttachmentSourceResolver:
             stream.write(decrypted)
             stream.flush()
             os.fsync(stream.fileno())
+        return source_kind
 
     def materialize(self, attachment: Mapping[str, Any], destination: Path) -> str:
         if destination.exists():
@@ -507,6 +523,5 @@ class WechatAttachmentSourceResolver:
             self._download_sticker(attachment, root, destination)
             return "wechat_sticker_cdn"
         if kind == "image":
-            self._materialize_image(attachment, root, create_time, destination)
-            return "wechat_v2_image_dat"
+            return self._materialize_image(attachment, root, create_time, destination)
         raise LedgerError("ATTACHMENT_KIND_UNSUPPORTED", f"不支持的附件类型：{kind}")

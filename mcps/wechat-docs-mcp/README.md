@@ -33,6 +33,8 @@
 
 当当前账号没有通过目标 DAT 验证的 key 时，普通图片读取返回 `ATTACHMENT_IMAGE_KEY_WAITING`。适配器只允许在一条新图片事件到达后的短窗口执行有截止时间的只读 Weixin 进程扫描；平时不常驻高频盲扫，也不通过点击、窗口消息或可见预览触发 key。`wechat_capture_visible_image_preview` 仍是单独的人工辅助降级：只有用户已手动打开目标查看器并提供确认引用时才可调用，不能替代原件下载，也不能把预览哈希冒充原件哈希。
 
+若微信后台只落盘了与该消息精确 hardlink 绑定的本地预览，而事件声明的原件仍不可用，读取工具可以返回该预览，但响应必须标记 `quality=preview`、`matches_event_original=false`，同时保留事件声明的原件大小与 MD5；预览自身仍须通过 hardlink 大小与 MD5 校验，不能被描述为原件。
+
 ## 状态合同
 
 Outbound 只使用以下状态：

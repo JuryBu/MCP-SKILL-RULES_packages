@@ -237,6 +237,14 @@ class VisualAttachmentReader:
                 "width": transfer.get("width"),
                 "height": transfer.get("height"),
                 "local_path": str(source_path),
+                "quality": (
+                    "preview"
+                    if transfer.get("source_kind") == "wechat_v2_image_preview"
+                    else "original"
+                ),
+                "matches_event_original": transfer.get("source_kind") != "wechat_v2_image_preview",
+                "event_original_byte_count": attachment.get("byte_count"),
+                "event_original_md5": attachment.get("content_md5"),
             }
             originals.append(original)
             if attachment["kind"] == "image" and _starts_with(source_path, WXGF_MAGIC):

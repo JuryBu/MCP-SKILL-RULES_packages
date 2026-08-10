@@ -113,6 +113,7 @@ def _write_image_databases(
     file_id: str,
     content_md5: str,
     size: int,
+    variant: str = "_h",
 ) -> None:
     resource = root / "message" / "message_resource.db"
     resource.parent.mkdir(parents=True, exist_ok=True)
@@ -146,7 +147,7 @@ def _write_image_databases(
         )
         connection.execute(
             "INSERT INTO image_hardlink_info_v4 VALUES(?,?,?)",
-            (content_md5, f"{file_id}_h.dat", size),
+            (content_md5, f"{file_id}{variant}.dat", size),
         )
         connection.commit()
     finally:
@@ -392,6 +393,74 @@ def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integri
     assert source_kind == "wechat_v2_image_dat"
     assert destination.read_bytes() == payload
     assert (tmp_path / "scoped-image-keys" / f"{hashlib.sha256(OWNER_KEY.encode()).hexdigest()}.json").is_file()
+
+
+def test_v2_image_returns_exact_hardlink_preview_without_claiming_original(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 12
+    server_id = 104
+    file_id = "c" * 32
+    aes_key = b"syntheticAESkey1"
+    xor_key = 0xD4
+    preview = b"\xff\xd8\xff\xe0" + (b"preview-image" * 100) + b"\xff\xd9"
+    preview_md5 = hashlib.md5(preview).hexdigest()
+    original_md5 = hashlib.md5(b"unavailable-original").hexdigest()
+    original_size = len(preview) + 5000
+    _write_message_database(
+        decrypted,
+        f'<msg><img originsourcemd5="{original_md5}" hdlength="{original_size}"/></msg>',
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=preview_md5,
+        size=len(preview),
+        variant="",
+    )
+    source = (
+        account
+        / "msg"
+        / "attach"
+        / hashlib.md5(USERNAME.encode("utf-8")).hexdigest()
+        / "2024-08"
+        / "Img"
+        / f"{file_id}.dat"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_encrypt_v2_image(preview, aes_key, xor_key))
+    key_file = tmp_path / "private-image-key.json"
+    key_file.write_text(
+        json.dumps({"version": 1, "aes_key": aes_key.decode("ascii"), "xor_key": xor_key}),
+        encoding="utf-8",
+    )
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        key_file,
+        tmp_path / "scoped-image-keys",
+    )
+    destination = tmp_path / "preview.partial"
+
+    source_kind = resolver.materialize(
+        _attachment(
+            kind="image",
+            local_id=local_id,
+            server_id=server_id,
+            size=original_size,
+            content_md5=original_md5,
+        ),
+        destination,
+    )
+
+    assert source_kind == "wechat_v2_image_preview"
+    assert destination.read_bytes() == preview
 
 
 def test_v2_image_does_not_accept_message_xml_cdn_key_as_local_key(tmp_path: Path) -> None:
