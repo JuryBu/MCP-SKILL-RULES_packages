@@ -149,7 +149,7 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 
 Office 转换只接受无宏、无外部关系的 DOCX/PPTX，使用隔离 LibreOffice profile，不修改原件；派生 PDF 与页面缓存按 `attachment_ref + source_sha + converter_version` 隔离并可过期清理。字体替换和版式诊断无法完整证明时必须明确标记 unknown，不能伪称无警告。XLSX 只保留原件供 spreadsheet 工具读取。
 
-上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。prepare 原子绑定 transfer 清单与不可变 outbound 草稿；approve 机械验证主人授权引用、TTL、草稿哈希和 dedupe；execute 再核对精确 route 与本机附件 outbound 开关。Windows 执行器必须先完整备份剪贴板和窗口状态，搜索目标显示名后用 `SessionDraft` 证明附件草稿属于精确 username，检测到用户切换焦点或移动鼠标立即停止。
+上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。prepare 原子绑定 transfer 清单与不可变 outbound 草稿；approve 机械验证主人授权引用、TTL、草稿哈希和 dedupe；execute 再核对精确 route 与本机附件 outbound 开关。Windows 执行器必须先枚举剪贴板格式；只有能逐字节无损复制和恢复的简单全局内存格式才允许继续，图片、位图、复杂 OLE 或未知格式必须在唤醒微信前拒绝。执行器随后保存窗口状态，搜索目标显示名后用 `SessionDraft` 证明附件草稿属于精确 username，检测到用户切换焦点或移动鼠标立即停止。
 
 UI 按键完成只算 `SEND_ATTEMPTED`。只有发送前 baseline 之后出现唯一的目标 route 数据库出站记录，并且文件 MD5、大小与草稿一致，才进入 `VERIFIED`。数据库刷新失败、等待超时或出现多个匹配记录一律为 `UNKNOWN`，不得自动重试；`wechat_attachment_upload_verify` 只能对原尝试补做确认，不能再次发送。
 

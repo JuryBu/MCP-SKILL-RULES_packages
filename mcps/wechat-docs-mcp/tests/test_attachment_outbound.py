@@ -17,7 +17,9 @@ from wechat_docs_mcp.route_verifier import PrivateBindingRouteVerifier
 from wechat_docs_mcp.wechat_attachment_outbound import SafeAttachmentOutbound
 from wechat_docs_mcp.wechat_outbound_verifier import AttachmentDatabaseVerificationError
 from wechat_docs_mcp.win32_attachment_ui import (
+    CF_HDROP,
     INPUT,
+    ClipboardFormat,
     Win32EnvironmentSnapshot,
     Win32WechatAttachmentBackend,
 )
@@ -356,7 +358,15 @@ def test_clipboard_sequence_change_preserves_user_clipboard() -> None:
     backend._expected_mouse_position = (1, 1)
     restored: list[object] = []
     backend._replace_clipboard = restored.append
-    snapshot = Win32EnvironmentSnapshot(1, (1, 1), object(), 50, None, False, False)
+    snapshot = Win32EnvironmentSnapshot(
+        1,
+        (1, 1),
+        (ClipboardFormat(CF_HDROP, b"test"),),
+        50,
+        None,
+        False,
+        False,
+    )
     with pytest.raises(UiBackendError) as raised:
         backend.restore_environment(snapshot)
     assert raised.value.code == "ENV_RESTORE_SKIPPED_USER_INTERACTION"
@@ -394,67 +404,95 @@ def test_win32_clipboard_handle_functions_use_pointer_sized_types() -> None:
     assert backend.kernel32.GlobalFree.restype is wintypes.HGLOBAL
 
 
-def test_clipboard_snapshot_and_restore_use_ole_data_object(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_clipboard_snapshot_rejects_unsafe_format_before_reading_data() -> None:
     calls: list[object] = []
-    data_object = object()
 
-    class PythonCom:
+    class User32:
+        def OpenClipboard(self, *_: object) -> bool:
+            return True
+        def EnumClipboardFormats(self, previous: int) -> int:
+            return 2 if previous == 0 else 0
+        def GetClipboardData(self, format_id: int) -> int:
+            calls.append(("get", format_id))
+            return 1
+        def CloseClipboard(self) -> bool:
+            calls.append("close")
+            return True
+
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+
+    with pytest.raises(UiBackendError) as raised:
+        backend._snapshot_clipboard()
+
+    assert raised.value.code == "CLIPBOARD_FORMAT_UNSUPPORTED"
+    assert calls == ["close"]
+
+
+def test_clipboard_snapshot_copies_safe_global_memory_format() -> None:
+    raw = ctypes.create_string_buffer("hello\0".encode("utf-16-le"))
+    calls: list[object] = []
+
+    class User32:
+        def OpenClipboard(self, *_: object) -> bool:
+            return True
+        def EnumClipboardFormats(self, previous: int) -> int:
+            return 13 if previous == 0 else 0
+        def GetClipboardData(self, format_id: int) -> int:
+            calls.append(("get", format_id))
+            return 42
+        def CloseClipboard(self) -> bool:
+            calls.append("close")
+            return True
+
+    class Kernel32:
         @staticmethod
-        def CoInitialize() -> None:
-            calls.append("initialize")
-
+        def GlobalSize(_: object) -> int:
+            return len(raw)
         @staticmethod
-        def OleGetClipboard() -> object:
-            calls.append("get")
-            return data_object
-
+        def GlobalLock(_: object) -> int:
+            return ctypes.addressof(raw)
         @staticmethod
-        def OleSetClipboard(value: object) -> None:
-            calls.append(("set", value))
+        def GlobalUnlock(_: object) -> bool:
+            return True
 
-        @staticmethod
-        def OleFlushClipboard() -> None:
-            calls.append("flush")
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend.kernel32 = Kernel32()
 
-        @staticmethod
-        def CoUninitialize() -> None:
-            calls.append("uninitialize")
+    captured = backend._snapshot_clipboard()
 
+    assert captured == (ClipboardFormat(13, bytes(raw)),)
+    assert calls == [("get", 13), "close"]
+
+
+def test_clipboard_restore_replays_snapshot_when_sequence_is_owned() -> None:
     class User32:
         @staticmethod
         def GetClipboardSequenceNumber() -> int:
             return 100
-
         @staticmethod
         def SetCursorPos(*_: object) -> bool:
             return True
-
         @staticmethod
         def IsWindow(_: object) -> bool:
             return False
 
-    monkeypatch.setattr(win32_attachment_ui, "pythoncom", PythonCom())
+    clipboard_formats = (ClipboardFormat(CF_HDROP, b"test"),)
+    restored: list[tuple[ClipboardFormat, ...]] = []
     backend = object.__new__(Win32WechatAttachmentBackend)
     backend.user32 = User32()
-    backend._clipboard_com_initialized = False
     backend._owned_clipboard_sequence = 100
     backend._user_interaction_detected = False
-    backend._snapshot = None
-    backend._expected_mouse_position = None
+    backend._snapshot = object()
+    backend._expected_mouse_position = (1, 1)
+    backend._replace_clipboard = restored.append
     backend._find_window = lambda *, required: None
+    snapshot = Win32EnvironmentSnapshot(0, (1, 1), clipboard_formats, 50, None, False, False)
 
-    captured = backend._snapshot_clipboard()
-    snapshot = Win32EnvironmentSnapshot(0, (1, 1), captured, 50, None, False, False)
     backend.restore_environment(snapshot)
 
-    assert calls == [
-        "initialize",
-        "get",
-        ("set", data_object),
-        "flush",
-        "uninitialize",
-    ]
-    assert snapshot.clipboard_data_object is None
+    assert restored == [clipboard_formats]
 
 
 def test_locate_window_accepts_verified_foreground_when_win32_return_is_false(

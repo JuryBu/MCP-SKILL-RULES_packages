@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wechat-docs-mcp"
-version = "0.4.6"
+version = "0.4.7"
 description = "Local governed WeChat and Tencent Docs event bridge for Codex"
 requires-python = ">=3.12,<3.14"
 dependencies = [
@@ -13,7 +13,6 @@ dependencies = [
   "pillow>=11,<13",
   "pycryptodome>=3.23,<4",
   "pypdfium2>=4.30,<5",
-  "pywin32>=311,<313; sys_platform == 'win32'",
   "zstandard>=0.22,<1",
 ]
 
