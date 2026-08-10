@@ -196,7 +196,9 @@ function Test-PackageStructure {
         "install\Start-CodexMcpBroker.ps1",
         "install\Stop-CodexMcpBroker.ps1",
         "install\Test-CodexMcpBrokerLifecycle.ps1",
+        "install\Test-NapCatLegacyRollbackCompatibility.ps1",
         "install\Update-CodexMcpBroker.ps1",
+        "install\rollback-napcat-mcp.ps1",
         "templates\config.codex.toml",
         "templates\env.example.ps1"
     )) {
@@ -210,6 +212,8 @@ function Test-PackageStructure {
     }
     & (Join-Path $toolkitRoot "install\Test-CodexMcpBrokerLifecycle.ps1") | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "Broker lifecycle regression test failed." }
+    & (Join-Path $toolkitRoot "install\Test-NapCatLegacyRollbackCompatibility.ps1") | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "Legacy NapCat rollback compatibility test failed." }
 
     foreach ($path in @(
         "mcps\\napcat-mcp\\src\\codex-thread-bridge.mjs",
