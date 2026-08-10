@@ -455,3 +455,51 @@ def test_clipboard_snapshot_and_restore_use_ole_data_object(monkeypatch: pytest.
         "uninitialize",
     ]
     assert snapshot.clipboard_data_object is None
+
+
+def test_locate_window_accepts_verified_foreground_when_win32_return_is_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class User32:
+        @staticmethod
+        def ShowWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(*_: object) -> bool:
+            return False
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 9001
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._find_window = lambda *, required: 9001
+
+    assert backend.locate_window() == 9001
+
+
+def test_locate_window_rejects_unverified_foreground(monkeypatch: pytest.MonkeyPatch) -> None:
+    class User32:
+        @staticmethod
+        def ShowWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 42
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._find_window = lambda *, required: 9001
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.locate_window()
+    assert raised.value.code == "WECHAT_FOCUS_FAILED"

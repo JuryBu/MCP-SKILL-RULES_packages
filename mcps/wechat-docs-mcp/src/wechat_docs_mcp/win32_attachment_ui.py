@@ -291,9 +291,10 @@ class Win32WechatAttachmentBackend:
         window = self._find_window(required=True)
         assert window is not None
         self.user32.ShowWindow(window, SW_RESTORE)
-        if not self.user32.SetForegroundWindow(window):
-            raise UiBackendError("WECHAT_FOCUS_FAILED", "无法把微信窗口置于前台")
+        self.user32.SetForegroundWindow(window)
         time.sleep(1)
+        if int(self.user32.GetForegroundWindow()) != window:
+            raise UiBackendError("WECHAT_FOCUS_FAILED", "无法把微信窗口置于前台")
         return window
 
     def _guard(self, window: object) -> int:
