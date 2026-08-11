@@ -641,7 +641,7 @@ def outbound_recover_expired_executions() -> dict[str, Any]:
 
 @mcp.tool()
 def outbound_verify_observed(draft_id: str, observed_event_id: str) -> dict[str, Any]:
-    """Verify a send only from a trusted outbound database event matching the immutable draft."""
+    """Compatibility entrypoint; WeChat sends refuse legacy event-only verification."""
     return ledger().verify_draft(draft_id, observed_event_id)
 
 
@@ -657,7 +657,20 @@ def wechat_outbound_capabilities() -> dict[str, Any]:
         "text_visible_ui_backend_implemented": True,
         "attachment_visible_ui_backend_implemented": True,
         "experimental_hidden_wm_char": SafeTextOutbound.capabilities.experimental_hidden_wm_char,
+        "hidden_after_verified_navigation": (
+            SafeTextOutbound.capabilities.hidden_after_verified_navigation
+        ),
         "database_direction_verifier_implemented": True,
+        "attachment_input_mode": "file_picker",
+        "attachment_preferred_input_mode": "cf_hdrop_strict_no_window",
+        "attachment_cf_hdrop_candidate": True,
+        "attachment_cf_hdrop_enabled": False,
+        "attachment_cf_hdrop_blocker": "exact_hidden_route_identity_and_live_receiver_proof_required",
+        "file_picker_fallback_available": True,
+        "file_picker_fallback_disturbance": "low",
+        "attachment_remote_confirmation_required": True,
+        "complex_clipboard_restore_verified": False,
+        "no_disturbance_metrics_implemented": True,
     }
 
 
@@ -843,8 +856,11 @@ def wechat_attachment_upload_execute(
 
 
 @mcp.tool()
-def wechat_attachment_upload_verify(draft_id: str) -> dict[str, Any]:
-    """Verify a prior SEND_ATTEMPTED or UNKNOWN attachment without sending it again."""
+def wechat_attachment_upload_verify(
+    draft_id: str,
+    remote_confirmation: dict[str, Any],
+) -> dict[str, Any]:
+    """Verify a prior attachment only with local DB proof plus receiver-side confirmation."""
     event_ledger = ledger()
     draft = event_ledger.get_draft(draft_id)
     if draft["state"] not in {"SEND_ATTEMPTED", "UNKNOWN"}:
@@ -865,6 +881,7 @@ def wechat_attachment_upload_verify(draft_id: str) -> dict[str, Any]:
         _refresh_decrypted_for_outbound,
     ).verify(route, kind, draft["payload"], baseline)
     observation["baseline_local_id"] = baseline
+    observation["remote_confirmation"] = remote_confirmation
     return event_ledger.verify_attachment_draft(draft_id, observation)
 
 

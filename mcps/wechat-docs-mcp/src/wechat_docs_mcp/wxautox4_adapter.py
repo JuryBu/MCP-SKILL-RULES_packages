@@ -56,6 +56,7 @@ class WxAutoAdapter:
                 errors="replace",
                 timeout=timeout_seconds,
                 check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         if completed.returncode != 0:
             raise WxAutoError(

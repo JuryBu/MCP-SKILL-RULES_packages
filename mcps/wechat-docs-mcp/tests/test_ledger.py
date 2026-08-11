@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -83,6 +84,20 @@ class LedgerTests(unittest.TestCase):
         }
         self.ledger.approve_draft(draft["draft_id"], payload, [reference], dedupe_key)
         return draft, payload
+
+    @staticmethod
+    def successful_text_audit(baseline_local_id: int = 41) -> dict:
+        return {
+            "send_action_invoked": True,
+            "restore_succeeded": True,
+            "baseline_local_id": baseline_local_id,
+            "environment_observation": {
+                "restore_skipped_user_interaction": False,
+                "foreground_restored": True,
+                "mouse_restored": True,
+                "clipboard_semantics_restored": True,
+            },
+        }
 
     def test_ingest_merges_wake_and_deduplicates(self) -> None:
         first = self.ledger.ingest_event("route-test", "fp-1", "text", {"text": "one"})
@@ -247,6 +262,16 @@ class LedgerTests(unittest.TestCase):
         self.ledger.acquire_draft_execution(
             first["draft_id"], first_payload, "dedupe-first", "execution-first", lease_expires
         )
+        with self.assertRaises(LedgerError) as invalid_scope:
+            self.ledger.acquire_draft_execution(
+                second["draft_id"],
+                second_payload,
+                "dedupe-second",
+                "execution-second-invalid-scope",
+                lease_expires,
+                lease_scope="wechat-visible-attachment-ui",
+            )
+        self.assertEqual("SEND_LEASE_SCOPE_INVALID", invalid_scope.exception.code)
         with self.assertRaises(LedgerError) as raised:
             self.ledger.acquire_draft_execution(
                 second["draft_id"],
@@ -256,6 +281,118 @@ class LedgerTests(unittest.TestCase):
                 lease_expires,
             )
         self.assertEqual("SEND_LEASE_BUSY", raised.exception.code)
+
+    def test_legacy_persisted_wechat_lease_scope_still_blocks_new_execution(self) -> None:
+        first, first_payload = self.approved_wechat_draft("first", "dedupe-first")
+        second, second_payload = self.approved_wechat_draft("second", "dedupe-second")
+        lease_expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        self.ledger.acquire_draft_execution(
+            first["draft_id"], first_payload, "dedupe-first", "execution-first", lease_expires
+        )
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            connection.execute(
+                "UPDATE outbound_drafts SET lease_scope=? WHERE draft_id=?",
+                ("wechat-visible-attachment-ui", first["draft_id"]),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.acquire_draft_execution(
+                second["draft_id"],
+                second_payload,
+                "dedupe-second",
+                "execution-second",
+                lease_expires,
+            )
+
+        self.assertEqual("SEND_LEASE_BUSY", raised.exception.code)
+        self.assertEqual("APPROVED", self.ledger.get_draft(second["draft_id"])["state"])
+
+    def test_expired_legacy_wechat_lease_is_recovered_atomically_before_acquire(self) -> None:
+        first, first_payload = self.approved_wechat_draft("first", "dedupe-first")
+        second, second_payload = self.approved_wechat_draft("second", "dedupe-second")
+        future_lease = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        self.ledger.acquire_draft_execution(
+            first["draft_id"], first_payload, "dedupe-first", "execution-first", future_lease
+        )
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            connection.execute(
+                "UPDATE outbound_drafts SET lease_scope=?,lease_expires_at=? WHERE draft_id=?",
+                (
+                    "wechat-visible-attachment-ui",
+                    (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat(),
+                    first["draft_id"],
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        acquired = self.ledger.acquire_draft_execution(
+            second["draft_id"],
+            second_payload,
+            "dedupe-second",
+            "execution-second",
+            future_lease,
+        )
+
+        self.assertEqual("UNKNOWN", self.ledger.get_draft(first["draft_id"])["state"])
+        self.assertEqual("EXECUTION_LEASE_EXPIRED", self.ledger.get_draft(first["draft_id"])["error_code"])
+        self.assertEqual("EXECUTING", acquired["state"])
+
+    def test_non_wechat_execution_requires_explicit_non_wechat_scope(self) -> None:
+        payload = {
+            "provider": "tencent_docs_official_mcp",
+            "tool": "synthetic_mutation",
+            "arguments": {"value": "safe"},
+        }
+        draft = self.ledger.prepare_draft(
+            "route-test",
+            "tdocs_official_call",
+            payload,
+            (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+        )
+        self.ledger.approve_draft(
+            draft["draft_id"],
+            payload,
+            [
+                {
+                    "conversation_id": "conversation-owner",
+                    "turn_id": "turn-owner",
+                    "message_item_id": "item-owner",
+                    "role": "user",
+                    "authorized_at": (
+                        datetime.now(timezone.utc) - timedelta(minutes=1)
+                    ).isoformat(),
+                }
+            ],
+            "dedupe-docs",
+        )
+        lease_expires = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.acquire_draft_execution(
+                draft["draft_id"],
+                payload,
+                "dedupe-docs",
+                "execution-docs-invalid",
+                lease_expires,
+            )
+        self.assertEqual("SEND_LEASE_SCOPE_REQUIRED", raised.exception.code)
+
+        acquired = self.ledger.acquire_draft_execution(
+            draft["draft_id"],
+            payload,
+            "dedupe-docs",
+            "execution-docs",
+            lease_expires,
+            lease_scope="tencent-docs-official-mcp",
+        )
+        self.assertEqual("EXECUTING", acquired["state"])
 
     def test_wechat_execution_rechecks_subscription_capability(self) -> None:
         draft, payload = self.approved_wechat_draft("revoked", "dedupe-revoked")
@@ -276,7 +413,7 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual("SUBSCRIPTION_SEND_DISABLED", raised.exception.code)
         self.assertEqual("APPROVED", self.ledger.get_draft(draft["draft_id"])["state"])
 
-    def test_database_verification_requires_outbound_exact_match(self) -> None:
+    def test_legacy_event_verification_is_disabled_for_wechat(self) -> None:
         draft, payload = self.approved_wechat_draft("unique-marker", "dedupe-verify")
         execution_id = "execution-verify"
         self.ledger.acquire_draft_execution(
@@ -287,30 +424,23 @@ class LedgerTests(unittest.TestCase):
             (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
         )
         self.ledger.finish_draft_execution(
-            draft["draft_id"], execution_id, "SEND_ATTEMPTED", {"ui_attempted": True}
+            draft["draft_id"],
+            execution_id,
+            "SEND_ATTEMPTED",
+            self.successful_text_audit(),
         )
-        inbound = self.ledger.ingest_event(
-            "route-test",
-            "fp-inbound-confirmation",
-            "text",
-            {"visible_text": "unique-marker", "direction": "inbound"},
-        )
-        with self.assertRaises(LedgerError) as raised:
-            self.ledger.verify_draft(draft["draft_id"], inbound["event_id"])
-        self.assertEqual("OUTBOUND_DIRECTION_UNVERIFIED", raised.exception.code)
-
         outbound = self.ledger.ingest_event(
             "route-test",
-            "fp-outbound-confirmation",
+            "fp-legacy-confirmation",
             "text",
             {"visible_text": "unique-marker", "direction": "outbound"},
         )
-        verified = self.ledger.verify_draft(draft["draft_id"], outbound["event_id"])
-        self.assertEqual("VERIFIED", verified["state"])
-        self.assertTrue(verified["result"]["ui_attempted"])
-        self.assertEqual(outbound["event_id"], verified["result"]["observed_event_id"])
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.verify_draft(draft["draft_id"], outbound["event_id"])
+        self.assertEqual("OUTBOUND_LEGACY_OBSERVATION_DISABLED", raised.exception.code)
+        self.assertEqual("SEND_ATTEMPTED", self.ledger.get_draft(draft["draft_id"])["state"])
 
-    def test_database_verification_consumes_observation_once(self) -> None:
+    def test_direct_database_verification_consumes_observation_once(self) -> None:
         first, first_payload = self.approved_wechat_draft("same-marker", "dedupe-verify-first")
         second, second_payload = self.approved_wechat_draft("same-marker", "dedupe-verify-second")
         for draft, payload, execution_id, dedupe_key in (
@@ -324,16 +454,25 @@ class LedgerTests(unittest.TestCase):
                 execution_id,
                 (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
             )
-            self.ledger.finish_draft_execution(draft["draft_id"], execution_id, "SEND_ATTEMPTED")
-        outbound = self.ledger.ingest_event(
-            "route-test",
-            "fp-single-use-confirmation",
-            "text",
-            {"visible_text": "same-marker", "direction": "outbound"},
-        )
-        self.ledger.verify_draft(first["draft_id"], outbound["event_id"])
+            self.ledger.finish_draft_execution(
+                draft["draft_id"],
+                execution_id,
+                "SEND_ATTEMPTED",
+                self.successful_text_audit(),
+            )
+        observation = {
+            "route_id": "route-test",
+            "local_id": 42,
+            "server_id": "server-42",
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+            "source_kind": "wechat_message_database",
+            "source_fingerprint": "route-user:42:server-42",
+            "visible_text": "same-marker",
+            "baseline_local_id": 41,
+        }
+        self.ledger.verify_text_draft(first["draft_id"], observation)
         with self.assertRaises(LedgerError) as raised:
-            self.ledger.verify_draft(second["draft_id"], outbound["event_id"])
+            self.ledger.verify_text_draft(second["draft_id"], observation)
         self.assertEqual("OUTBOUND_OBSERVATION_ALREADY_USED", raised.exception.code)
         self.assertEqual("SEND_ATTEMPTED", self.ledger.get_draft(second["draft_id"])["state"])
 
@@ -348,7 +487,10 @@ class LedgerTests(unittest.TestCase):
             (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
         )
         self.ledger.finish_draft_execution(
-            draft["draft_id"], execution_id, "SEND_ATTEMPTED", {"ui_attempted": True}
+            draft["draft_id"],
+            execution_id,
+            "SEND_ATTEMPTED",
+            self.successful_text_audit(),
         )
 
         verified = self.ledger.verify_text_draft(
@@ -366,12 +508,51 @@ class LedgerTests(unittest.TestCase):
         )
 
         self.assertEqual("VERIFIED", verified["state"])
-        self.assertTrue(verified["result"]["ui_attempted"])
+        self.assertTrue(verified["result"]["restore_succeeded"])
         self.assertEqual([], self.ledger.list_pending("subscription-test"))
         state = self.event_delivery_state(self.ledger)
         self.assertEqual(1, state["events"])
         self.assertEqual(1, state["events_acked"])
         self.assertEqual(0, state["deliveries"])
+
+    def test_direct_text_database_proof_requires_environment_restore(self) -> None:
+        draft, payload = self.approved_wechat_draft("restore-marker", "dedupe-restore-proof")
+        execution_id = "execution-restore-proof"
+        self.ledger.acquire_draft_execution(
+            draft["draft_id"],
+            payload,
+            "dedupe-restore-proof",
+            execution_id,
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        )
+        audit = self.successful_text_audit()
+        audit["restore_succeeded"] = False
+        audit["environment_observation"]["foreground_restored"] = False
+        self.ledger.finish_draft_execution(
+            draft["draft_id"],
+            execution_id,
+            "UNKNOWN",
+            audit,
+            "RESTORE_FAILED_AFTER_SEND",
+        )
+
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.verify_text_draft(
+                draft["draft_id"],
+                {
+                    "route_id": "route-test",
+                    "local_id": 42,
+                    "server_id": "server-42",
+                    "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    "source_kind": "wechat_message_database",
+                    "source_fingerprint": "route-user:42:server-42",
+                    "visible_text": "restore-marker",
+                    "baseline_local_id": 41,
+                },
+            )
+
+        self.assertEqual("OUTBOUND_TEXT_ENVIRONMENT_UNVERIFIED", raised.exception.code)
+        self.assertEqual("UNKNOWN", self.ledger.get_draft(draft["draft_id"])["state"])
 
     def test_register_route_stores_baseline(self) -> None:
         self.temp_dir2 = tempfile.TemporaryDirectory()

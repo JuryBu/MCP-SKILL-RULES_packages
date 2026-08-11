@@ -98,6 +98,8 @@ class AttachmentUiBackend(Protocol):
 
     def restore_environment(self, snapshot: object) -> None: ...
 
+    def environment_observation(self) -> dict[str, Any]: ...
+
 
 class AttachmentDatabaseVerifier(Protocol):
     def baseline(self, route: VerifiedRoute) -> int: ...
@@ -202,7 +204,7 @@ class SafeAttachmentOutbound:
             dedupe_key,
             active_execution_id,
             lease_expires_at,
-            lease_scope="wechat-visible-attachment-ui",
+            lease_scope="wechat-visible-ui",
         )
 
         state = OutboundState.FAILED
@@ -210,11 +212,14 @@ class SafeAttachmentOutbound:
         send_action_invoked = False
         send_may_have_occurred = False
         cleanup_performed = False
+        cleanup_error_code: str | None = None
         restore_succeeded = True
+        restore_error_code: str | None = None
         draft_handle: object | None = None
         window: object | None = None
         snapshot: object | None = None
         baseline_local_id: int | None = None
+        local_observation: dict[str, Any] | None = None
 
         try:
             baseline_local_id = self._database_verifier.baseline(route)
@@ -245,6 +250,22 @@ class SafeAttachmentOutbound:
                 else:
                     send_may_have_occurred = True
                 state = OutboundState.SEND_ATTEMPTED
+                if baseline_local_id is not None:
+                    try:
+                        local_observation = self._database_verifier.verify(
+                            route,
+                            kind,
+                            payload,
+                            baseline_local_id,
+                        )
+                        local_observation["baseline_local_id"] = baseline_local_id
+                    except Exception as error:
+                        error_code = getattr(
+                            error,
+                            "code",
+                            "ATTACHMENT_DATABASE_CONFIRMATION_FAILED",
+                        )
+                        state = OutboundState.UNKNOWN
             except UiBackendError as error:
                 error_code = error.code
                 if send_may_have_occurred or error.send_may_have_occurred:
@@ -262,26 +283,35 @@ class SafeAttachmentOutbound:
                             self._backend.clear_owned_attachment(window, draft_handle)
                             cleanup_performed = True
                     except Exception:
-                        error_code = "ATTACHMENT_OWNED_DRAFT_CLEANUP_FAILED"
+                        cleanup_error_code = "ATTACHMENT_OWNED_DRAFT_CLEANUP_FAILED"
+                        if error_code is None:
+                            error_code = cleanup_error_code
                         state = OutboundState.FAILED
                 if snapshot is not None:
                     try:
                         self._backend.restore_environment(snapshot)
                     except Exception:
                         restore_succeeded = False
-                        error_code = (
+                        restore_error_code = (
                             "RESTORE_FAILED_AFTER_SEND" if send_may_have_occurred else "RESTORE_FAILED"
                         )
+                        if error_code is None:
+                            error_code = restore_error_code
                         state = OutboundState.UNKNOWN if send_may_have_occurred else OutboundState.FAILED
 
+        observation_getter = getattr(self._backend, "environment_observation", None)
+        environment_observation = observation_getter() if callable(observation_getter) else {}
         audit_result = {
             "route_id": route_id,
             "execution_id": active_execution_id,
             "transfer_id": payload.get("transfer_id"),
             "send_action_invoked": send_action_invoked,
             "cleanup_performed": cleanup_performed,
+            "cleanup_error_code": cleanup_error_code,
             "restore_succeeded": restore_succeeded,
+            "restore_error_code": restore_error_code,
             "baseline_local_id": baseline_local_id,
+            "environment_observation": environment_observation,
         }
         self._ledger.finish_draft_execution(
             draft_id,
@@ -291,27 +321,22 @@ class SafeAttachmentOutbound:
             error_code=error_code,
         )
 
-        if send_may_have_occurred and baseline_local_id is not None:
-            try:
-                observation = self._database_verifier.verify(
-                    route,
-                    kind,
-                    payload,
-                    baseline_local_id,
-                )
-                observation["baseline_local_id"] = baseline_local_id
-                verified = self._ledger.verify_attachment_draft(draft_id, observation)
-                state = OutboundState(str(verified["state"]))
-                error_code = verified.get("error_code")
-            except Exception as error:
-                error_code = getattr(error, "code", "ATTACHMENT_DATABASE_CONFIRMATION_FAILED")
-                self._ledger.mark_draft_unknown(
-                    draft_id,
-                    [OutboundState.SEND_ATTEMPTED.value, OutboundState.UNKNOWN.value],
-                    error_code,
-                    audit_result,
-                )
-                state = OutboundState.UNKNOWN
+        if local_observation is not None:
+            audit_result["local_attachment_observation"] = local_observation
+        if (
+            local_observation is not None
+            and restore_succeeded
+            and state is OutboundState.SEND_ATTEMPTED
+        ):
+            error_code = "ATTACHMENT_REMOTE_CONFIRMATION_REQUIRED"
+            state = OutboundState.UNKNOWN
+        if send_may_have_occurred and state is OutboundState.UNKNOWN:
+            self._ledger.mark_draft_unknown(
+                draft_id,
+                [OutboundState.SEND_ATTEMPTED.value, OutboundState.UNKNOWN.value],
+                error_code or "ATTACHMENT_DATABASE_CONFIRMATION_FAILED",
+                audit_result,
+            )
 
         return OutboundExecutionResult(
             draft_id=draft_id,
@@ -322,4 +347,6 @@ class SafeAttachmentOutbound:
             send_action_invoked=send_action_invoked,
             cleanup_performed=cleanup_performed,
             restore_succeeded=restore_succeeded,
+            cleanup_error_code=cleanup_error_code,
+            restore_error_code=restore_error_code,
         )

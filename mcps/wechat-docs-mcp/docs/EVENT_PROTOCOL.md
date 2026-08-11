@@ -126,18 +126,17 @@ outbound_approve(
 
 代码只机械校验授权引用字段、角色、时间、草稿哈希、TTL 与 dedupe，不判断主人消息是否在语义上授权当前动作。Agent/Rules 负责语义判断。
 
-批准在 `APPROVED -> EXECUTING` 时一次消费。单个 `wechat-visible-ui` lease 同时只允许一条发送。进程重载后发现过期 `EXECUTING` 会改为 `UNKNOWN`，不能恢复为 `APPROVED` 或自动重试。
+批准在 `APPROVED -> EXECUTING` 时一次消费。所有文字、图片和文件发送都必须使用同一个 `wechat-visible-ui` lease；账本拒绝微信 kind 自定义其它 scope，因此同时只允许一条微信 UI 发送。进程启动和下一次微信租约获取都会在同一写事务内把过期 `EXECUTING` 改为 `UNKNOWN`，不能恢复为 `APPROVED` 或自动重试。非微信变更操作必须显式使用自己的独立 lease scope，不能占用微信 UI 租约。
 
-UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足以下全部条件才可 `VERIFIED`：
+UI 键动作成功只表示 `SEND_ATTEMPTED`。文字只有专用数据库验证器满足以下全部条件才可 `VERIFIED`：
 
-- route 相同；
-- event 和 draft 都是文字类型；
-- 可信解析器明确给出 `direction=outbound`；
-- `visible_text` 与批准草稿正文完全一致；
-- event 晚于本次批准消费时间；
-- 该 event 尚未被其它草稿消费，同一观察事件只能验证一次。
+- route、完整正文和消息数据库身份相同；
+- 发送前 baseline 之后恰好出现一条 `status=2 AND origin_source=1` 的新行；
+- `local_id`、`server_id` 和 source fingerprint 唯一，且未被其它草稿消费；
+- 执行审计中的 baseline 与证明一致；
+- 发送动作确实发生，环境恢复成功，且未因用户交互跳过焦点、鼠标或剪贴板恢复。
 
-当前 Windows 适配器只把 `status=2 AND origin_source=1` 的消息数据库行作为可信文字出站候选，并要求发送前 baseline 之后恰好出现一条 route 与完整正文都匹配的新记录。普通观察器会保存出站事件用于审计，但不会为它建立 subscription delivery 或 wake；字段缺失、刷新失败、零条或多条匹配都不能进入 `VERIFIED`。
+当前 Windows 适配器只把 `status=2 AND origin_source=1` 的消息数据库行作为可信文字出站候选，并要求发送前 baseline 之后恰好出现一条 route 与完整正文都匹配的新记录。普通观察器会保存出站事件用于审计，但不会为它建立 subscription delivery 或 wake；兼容工具 `outbound_verify_observed` 对微信草稿固定拒绝，不能用晚入账事件绕过 baseline 或恢复证明。字段缺失、刷新失败、零条或多条匹配都不能进入 `VERIFIED`。
 
 ## 7. 附件
 
@@ -149,9 +148,9 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。只有可信数据库事件满足
 
 Office 转换只接受无宏、无外部关系的 DOCX/PPTX，使用隔离 LibreOffice profile，不修改原件；派生 PDF 与页面缓存按 `attachment_ref + source_sha + converter_version` 隔离并可过期清理。字体替换和版式诊断无法完整证明时必须明确标记 unknown，不能伪称无警告。XLSX 只保留原件供 spreadsheet 工具读取。
 
-上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。prepare 原子绑定 transfer 清单与不可变 outbound 草稿；approve 机械验证主人授权引用、TTL、草稿哈希和 dedupe；execute 再核对精确 route 与本机附件 outbound 开关。Windows 执行器必须先枚举剪贴板格式；只有能逐字节无损复制和恢复的简单全局内存格式才允许继续，图片、位图、复杂 OLE 或未知格式必须在唤醒微信前拒绝。执行器随后保存窗口状态，搜索目标显示名后用 `SessionDraft` 证明附件草稿属于精确 username，检测到用户切换焦点或移动鼠标立即停止。
+上传准备只接受 upload root 内的普通文件，并要求 subscription 属于目标 route、处于 active 且有发送能力。prepare 原子绑定 transfer 清单与不可变 outbound 草稿；approve 机械验证主人授权引用、TTL、草稿哈希和 dedupe；execute 再核对精确 route 与本机附件 outbound 开关。严格无窗口首选候选使用带 20 字节 `<IIIII` 头的标准 `CF_HDROP`，但当前仍禁用；只有隐藏状态下精确 route 身份、整个执行期可见窗口数为零、剪贴板语义恢复和接收端可下载都获证明后才能启用。当前低打扰回退通过微信打开的标准 `#32770` 文件选择器，以控件身份填写已校验的文件路径并确认；缺失文件、错误对话框、窗口身份或焦点变化均保守停止，且不会替换剪贴板。复杂 OLE、多 TYMED、延迟渲染和 helper 退出后的接收方行为尚未获证明，因此不得把合成格式测试当作任意剪贴板恢复能力。文件选择后仍须用 `SessionDraft` 证明附件草稿属于精确 username，检测到用户切换焦点、移动鼠标或改动剪贴板立即停止恢复并记录原因。
 
-UI 按键完成只算 `SEND_ATTEMPTED`。只有发送前 baseline 之后出现唯一的目标 route 数据库出站记录，并且文件 MD5、大小与草稿一致，才进入 `VERIFIED`。数据库刷新失败、等待超时或出现多个匹配记录一律为 `UNKNOWN`，不得自动重试；`wechat_attachment_upload_verify` 只能对原尝试补做确认，不能再次发送。
+UI 按键完成只算 `SEND_ATTEMPTED`。发送前 baseline 之后出现唯一的目标 route 数据库文件记录，并且 MD5、大小与草稿一致，只构成本机发送尝试证据；草稿保持 `UNKNOWN`，直到 `wechat_attachment_upload_verify` 同时取得时间不早于该本机记录、附件身份字段完全一致、带用户来源引用的接收端可见且可下载或已下载确认，并且执行审计证明前台焦点、鼠标和剪贴板语义均恢复，才进入 `VERIFIED`。数据库刷新失败、等待超时、多条匹配、用户交互导致恢复跳过、接收端证据缺失或不可信均保持 `UNKNOWN`，不得自动重试；补做确认只能验证原尝试，不能再次发送。
 
 文件永不自动执行或解压。
 

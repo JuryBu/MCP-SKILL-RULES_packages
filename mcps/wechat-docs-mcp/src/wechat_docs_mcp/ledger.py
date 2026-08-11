@@ -1166,7 +1166,7 @@ class EventLedger:
         execution_id: str,
         lease_expires_at: str,
         *,
-        lease_scope: str = "wechat-visible-ui",
+        lease_scope: str | None = None,
     ) -> dict[str, Any]:
         call_time = _parse_datetime(utc_now())
         lease_expiration = _parse_datetime(lease_expires_at)
@@ -1181,6 +1181,21 @@ class EventLedger:
                     raise LedgerError("DRAFT_NOT_FOUND", "draft 不存在")
                 if draft["state"] != "APPROVED":
                     raise LedgerError("DRAFT_NOT_EXECUTABLE", f"draft 当前状态为 {draft['state']}")
+                draft_kind = str(draft["kind"])
+                if draft_kind.startswith("wechat_"):
+                    effective_lease_scope = lease_scope or "wechat-visible-ui"
+                    if effective_lease_scope != "wechat-visible-ui":
+                        raise LedgerError(
+                            "SEND_LEASE_SCOPE_INVALID",
+                            "所有微信 UI 发送必须共享 wechat-visible-ui 租约",
+                        )
+                else:
+                    effective_lease_scope = str(lease_scope or "").strip()
+                    if not effective_lease_scope or effective_lease_scope == "wechat-visible-ui":
+                        raise LedgerError(
+                            "SEND_LEASE_SCOPE_REQUIRED",
+                            "非微信执行必须显式使用独立租约 scope",
+                        )
                 if draft["dedupe_key"] != dedupe_key:
                     raise LedgerError("DEDUPE_KEY_MISMATCH", "dedupe_key 与批准记录不一致")
                 if payload_sha256(payload) != draft["content_sha256"]:
@@ -1194,7 +1209,7 @@ class EventLedger:
                 ).fetchone()
                 if route is None or route["state"] != "active":
                     raise LedgerError("ROUTE_NOT_ACTIVE", "草稿目标 route 已停用或进入隔离")
-                if str(draft["kind"]).startswith("wechat_"):
+                if draft_kind.startswith("wechat_"):
                     subscription = connection.execute(
                         "SELECT * FROM subscriptions WHERE subscription_id=?",
                         (draft["subscription_id"],),
@@ -1211,6 +1226,39 @@ class EventLedger:
                         raise LedgerError(
                             "SUBSCRIPTION_POLICY_MISSING", "执行前 subscription 缺少本机发送策略引用"
                         )
+                    execution_rows = connection.execute(
+                        """
+                        SELECT draft_id,lease_expires_at FROM outbound_drafts
+                        WHERE state='EXECUTING' AND kind LIKE 'wechat_%'
+                          AND lease_expires_at IS NOT NULL
+                        """
+                    ).fetchall()
+                    expired_draft_ids = [
+                        row["draft_id"]
+                        for row in execution_rows
+                        if _parse_datetime(row["lease_expires_at"]).astimezone(timezone.utc)
+                        <= call_time.astimezone(timezone.utc)
+                    ]
+                    if expired_draft_ids:
+                        placeholders = ",".join("?" for _ in expired_draft_ids)
+                        connection.execute(
+                            f"""
+                            UPDATE outbound_drafts
+                            SET state='UNKNOWN',lease_scope=NULL,lease_expires_at=NULL,
+                                error_code='EXECUTION_LEASE_EXPIRED',updated_at=?
+                            WHERE draft_id IN ({placeholders}) AND state='EXECUTING'
+                            """,
+                            (call_time.astimezone(timezone.utc).isoformat(), *expired_draft_ids),
+                        )
+                    active_wechat_execution = connection.execute(
+                        """
+                        SELECT draft_id FROM outbound_drafts
+                        WHERE state='EXECUTING' AND kind LIKE 'wechat_%'
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if active_wechat_execution is not None:
+                        raise LedgerError("SEND_LEASE_BUSY", "已有微信发送正在执行")
                 connection.execute(
                     """
                     UPDATE outbound_drafts
@@ -1218,7 +1266,14 @@ class EventLedger:
                         lease_scope=?,lease_expires_at=?,updated_at=?
                     WHERE draft_id=? AND state='APPROVED'
                     """,
-                    (utc_now(), execution_id, lease_scope, lease_expires_at, utc_now(), draft_id),
+                    (
+                        utc_now(),
+                        execution_id,
+                        effective_lease_scope,
+                        lease_expires_at,
+                        utc_now(),
+                        draft_id,
+                    ),
                 )
         except sqlite3.IntegrityError as error:
             raise LedgerError("SEND_LEASE_BUSY", "已有微信发送正在执行") from error
@@ -1255,6 +1310,21 @@ class EventLedger:
                 raise LedgerError("OUTBOUND_OBSERVATION_MISMATCH", "文字证明与草稿 route 不匹配")
             if observation["source_kind"] != "wechat_message_database":
                 raise LedgerError("OUTBOUND_TEXT_SOURCE_UNTRUSTED", "文字证明来源不可信")
+            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
+            environment = result.get("environment_observation")
+            if (
+                result.get("send_action_invoked") is not True
+                or result.get("restore_succeeded") is not True
+                or not isinstance(environment, dict)
+                or environment.get("restore_skipped_user_interaction") is not False
+                or environment.get("foreground_restored") is not True
+                or environment.get("mouse_restored") is not True
+                or environment.get("clipboard_semantics_restored") is not True
+            ):
+                raise LedgerError(
+                    "OUTBOUND_TEXT_ENVIRONMENT_UNVERIFIED",
+                    "文字发送环境没有完整恢复证明",
+                )
             payload = json.loads(draft["payload_json"])
             if observation["visible_text"] != payload.get("text"):
                 raise LedgerError("OUTBOUND_CONTENT_MISMATCH", "数据库正文与批准草稿不一致")
@@ -1263,6 +1333,16 @@ class EventLedger:
             server_id = str(observation["server_id"])
             if local_id <= baseline_local_id or baseline_local_id < 0 or not server_id:
                 raise LedgerError("OUTBOUND_TEXT_PROOF_INVALID", "文字消息身份无效")
+            audited_baseline = result.get("baseline_local_id")
+            if (
+                not isinstance(audited_baseline, int)
+                or isinstance(audited_baseline, bool)
+                or audited_baseline != baseline_local_id
+            ):
+                raise LedgerError(
+                    "OUTBOUND_TEXT_BASELINE_MISMATCH",
+                    "文字证明 baseline 与发送审计不一致",
+                )
 
             event = connection.execute(
                 "SELECT event_id,payload_json FROM events WHERE route_id=? AND source_fingerprint=?",
@@ -1324,7 +1404,6 @@ class EventLedger:
                     "OUTBOUND_OBSERVATION_ALREADY_USED",
                     "同一数据库文字记录不能验证多个草稿",
                 ) from error
-            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
             result["text_observation"] = {
                 "event_id": event_id,
                 "local_id": local_id,
@@ -1401,49 +1480,16 @@ class EventLedger:
         return draft_ids
 
     def verify_draft(self, draft_id: str, observed_event_id: str) -> dict[str, Any]:
-        with self._transaction() as connection:
-            event = connection.execute(
-                "SELECT route_id,event_type,payload_json,observed_at FROM events WHERE event_id=?",
-                (observed_event_id,),
-            ).fetchone()
-            draft = connection.execute(
-                "SELECT * FROM outbound_drafts WHERE draft_id=?", (draft_id,)
-            ).fetchone()
-            if draft is None:
-                raise LedgerError("DRAFT_NOT_FOUND", "draft 不存在")
-            if event is None or event["route_id"] != draft["route_id"]:
-                raise LedgerError("OUTBOUND_OBSERVATION_MISMATCH", "观察事件与草稿 route 不匹配")
-            if draft["state"] not in {"SEND_ATTEMPTED", "UNKNOWN"}:
-                raise LedgerError("DRAFT_STATE_INVALID", f"draft 当前状态为 {draft['state']}")
-            if draft["kind"] != "wechat_text" or event["event_type"] != "text":
-                raise LedgerError("OUTBOUND_VERIFICATION_UNSUPPORTED", "当前只支持文字草稿的数据库确认")
-            event_payload = json.loads(event["payload_json"])
-            draft_payload = json.loads(draft["payload_json"])
-            if event_payload.get("direction") != "outbound":
-                raise LedgerError("OUTBOUND_DIRECTION_UNVERIFIED", "事件未被可信解析层确认为 outbound")
-            if event_payload.get("visible_text") != draft_payload.get("text"):
-                raise LedgerError("OUTBOUND_CONTENT_MISMATCH", "数据库事件正文与批准草稿不一致")
-            if not draft["approval_consumed_at"] or _parse_datetime(event["observed_at"]) < _parse_datetime(
-                draft["approval_consumed_at"]
-            ):
-                raise LedgerError("OUTBOUND_EVENT_TOO_OLD", "数据库事件早于本次发送执行")
-            try:
-                connection.execute(
-                    "INSERT INTO outbound_verifications(observed_event_id,draft_id,verified_at) VALUES(?,?,?)",
-                    (observed_event_id, draft_id, utc_now()),
-                )
-            except sqlite3.IntegrityError as error:
-                raise LedgerError(
-                    "OUTBOUND_OBSERVATION_ALREADY_USED",
-                    "同一数据库出站事件不能验证多个草稿",
-                ) from error
-            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
-            result["observed_event_id"] = observed_event_id
-            connection.execute(
-                "UPDATE outbound_drafts SET state='VERIFIED',result_json=?,error_code=NULL,updated_at=? WHERE draft_id=?",
-                (canonical_json(result), utc_now(), draft_id),
+        draft = self.get_draft(draft_id)
+        if str(draft["kind"]).startswith("wechat_"):
+            raise LedgerError(
+                "OUTBOUND_LEGACY_OBSERVATION_DISABLED",
+                "微信发送只能使用带 baseline、数据库身份和环境恢复证明的专用验证器",
             )
-        return self.get_draft(draft_id)
+        raise LedgerError(
+            "OUTBOUND_VERIFICATION_UNSUPPORTED",
+            f"draft 类型 {draft['kind']} 不支持事件观察验证",
+        )
 
     def verify_attachment_draft(
         self,
@@ -1457,6 +1503,7 @@ class EventLedger:
             "observed_at",
             "source_kind",
             "baseline_local_id",
+            "remote_confirmation",
         }
         if not required.issubset(observation):
             raise LedgerError("OUTBOUND_ATTACHMENT_PROOF_INVALID", "附件发送证明字段不完整")
@@ -1474,6 +1521,66 @@ class EventLedger:
                 raise LedgerError("OUTBOUND_OBSERVATION_MISMATCH", "附件证明与草稿 route 不匹配")
             if observation["source_kind"] != "wechat_message_database":
                 raise LedgerError("OUTBOUND_ATTACHMENT_SOURCE_UNTRUSTED", "附件证明来源不可信")
+            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
+            environment = result.get("environment_observation")
+            if (
+                result.get("restore_succeeded") is not True
+                or not isinstance(environment, dict)
+                or environment.get("restore_skipped_user_interaction") is not False
+                or environment.get("foreground_restored") is not True
+                or environment.get("mouse_restored") is not True
+                or environment.get("clipboard_semantics_restored") is not True
+            ):
+                raise LedgerError(
+                    "OUTBOUND_ATTACHMENT_ENVIRONMENT_UNVERIFIED",
+                    "附件执行环境没有完整恢复证明",
+                )
+            remote_confirmation = observation["remote_confirmation"]
+            if not isinstance(remote_confirmation, dict):
+                raise LedgerError("OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID", "接收端确认格式无效")
+            if remote_confirmation.get("status") not in {
+                "receiver_visible_and_downloadable",
+                "receiver_downloaded",
+            }:
+                raise LedgerError("OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID", "接收端确认状态无效")
+            payload = json.loads(draft["payload_json"])
+            remote_identity = {
+                "draft_id": draft_id,
+                "route_id": draft["route_id"],
+                "file_name": payload.get("file_name"),
+                "byte_count": payload.get("byte_count"),
+                "sha256": payload.get("sha256"),
+                "content_md5": payload.get("content_md5"),
+            }
+            if any(remote_confirmation.get(key) != value for key, value in remote_identity.items()):
+                raise LedgerError(
+                    "OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID",
+                    "接收端确认与附件草稿身份不一致",
+                )
+            confirmation_ref = remote_confirmation.get("owner_confirmation_ref")
+            confirmation_required = {
+                "conversation_id",
+                "turn_id",
+                "message_item_id",
+                "role",
+                "authorized_at",
+            }
+            if (
+                not isinstance(confirmation_ref, dict)
+                or not confirmation_required.issubset(confirmation_ref)
+                or confirmation_ref.get("role") != "user"
+                or any(
+                    not isinstance(confirmation_ref.get(key), str)
+                    or not confirmation_ref.get(key)
+                    for key in confirmation_required
+                )
+            ):
+                raise LedgerError("OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID", "接收端确认缺少主人消息引用")
+            confirmation_time = _parse_datetime(confirmation_ref["authorized_at"])
+            if confirmation_time < _parse_datetime(observation["observed_at"]):
+                raise LedgerError("OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID", "接收端确认早于发送端数据库记录")
+            if confirmation_time >= _parse_datetime(utc_now()):
+                raise LedgerError("OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID", "接收端确认时间不得晚于当前调用")
             local_id = int(observation["local_id"])
             baseline_local_id = int(observation["baseline_local_id"])
             server_id = str(observation["server_id"])
@@ -1493,13 +1600,13 @@ class EventLedger:
                     "OUTBOUND_OBSERVATION_ALREADY_USED",
                     "同一数据库附件记录不能验证多个草稿",
                 ) from error
-            result = json.loads(draft["result_json"]) if draft["result_json"] else {}
             result["attachment_observation"] = {
                 "local_id": local_id,
                 "server_id": server_id,
                 "observed_at": observation["observed_at"],
                 "source_kind": observation["source_kind"],
             }
+            result["remote_confirmation"] = remote_confirmation
             connection.execute(
                 """
                 UPDATE outbound_drafts
@@ -1508,7 +1615,6 @@ class EventLedger:
                 """,
                 (canonical_json(result), utc_now(), draft_id),
             )
-            payload = json.loads(draft["payload_json"])
             transfer_id = payload.get("transfer_id")
             if isinstance(transfer_id, str) and transfer_id:
                 connection.execute(

@@ -194,6 +194,15 @@ class FakeBackend:
     def restore_environment(self, snapshot: object) -> None:
         self._step("restore")
 
+    @staticmethod
+    def environment_observation() -> dict[str, Any]:
+        return {
+            "restore_skipped_user_interaction": False,
+            "foreground_restored": True,
+            "mouse_restored": True,
+            "clipboard_semantics_restored": True,
+        }
+
 
 class FakeDatabaseVerifier:
     def __init__(self, *, failure: Exception | None = None) -> None:
@@ -328,6 +337,34 @@ class SafeTextOutboundTests(unittest.TestCase):
         self.assertEqual(41, ledger.storage.verifications[0]["baseline_local_id"])
         self.assertTrue(result.send_action_invoked)
         self.assertTrue(result.restore_succeeded)
+        self.assertTrue(
+            ledger.storage.finishes[-1]["result"]["environment_observation"][
+                "foreground_restored"
+            ]
+        )
+
+    def test_database_confirmation_occurs_before_environment_restore(self) -> None:
+        timeline: list[str] = []
+
+        class OrderedBackend(FakeBackend):
+            def restore_environment(self, snapshot: object) -> None:
+                timeline.append("restore")
+                super().restore_environment(snapshot)
+
+        class OrderedVerifier(FakeDatabaseVerifier):
+            def verify(
+                self,
+                route: object,
+                text: str,
+                baseline_local_id: int,
+            ) -> dict[str, Any]:
+                timeline.append("verify")
+                return super().verify(route, text, baseline_local_id)
+
+        result = execute(sender(FakeLedger(), OrderedBackend(), OrderedVerifier()))
+
+        self.assertEqual(OutboundState.VERIFIED, result.state)
+        self.assertEqual(["verify", "restore"], timeline)
 
     def test_database_confirmation_failure_is_unknown_and_not_retryable(self) -> None:
         ledger = FakeLedger()
@@ -369,6 +406,23 @@ class SafeTextOutboundTests(unittest.TestCase):
         result = execute(sender(ledger, backend))
         self.assertEqual(OutboundState.UNKNOWN, result.state)
         self.assertEqual("RESTORE_FAILED_AFTER_SEND", result.error_code)
+        self.assertEqual("RESTORE_FAILED_AFTER_SEND", result.restore_error_code)
+
+    def test_restore_failure_preserves_primary_error_and_records_secondary_error(self) -> None:
+        ledger = FakeLedger()
+        backend = FakeBackend()
+        backend.failures["locate"] = UiBackendError("WECHAT_FOCUS_FAILED", "synthetic")
+        backend.failures["restore"] = RuntimeError("synthetic restore failure")
+
+        result = execute(sender(ledger, backend))
+
+        self.assertEqual(OutboundState.FAILED, result.state)
+        self.assertEqual("WECHAT_FOCUS_FAILED", result.error_code)
+        self.assertEqual("RESTORE_FAILED", result.restore_error_code)
+        self.assertEqual(
+            "RESTORE_FAILED",
+            ledger.storage.finishes[-1]["result"]["restore_error_code"],
+        )
 
     def test_reload_dedupe_refuses_second_execution_before_ui(self) -> None:
         storage = FakeLedgerStorage()
@@ -384,6 +438,7 @@ class SafeTextOutboundTests(unittest.TestCase):
 
     def test_hidden_wm_char_capability_is_disabled(self) -> None:
         self.assertFalse(SafeTextOutbound.capabilities.experimental_hidden_wm_char)
+        self.assertTrue(SafeTextOutbound.capabilities.hidden_after_verified_navigation)
 
 
 if __name__ == "__main__":

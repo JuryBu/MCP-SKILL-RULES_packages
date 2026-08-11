@@ -22,6 +22,7 @@ CF_LOCALE = 16
 CF_OEMTEXT = 7
 CF_TEXT = 1
 CF_UNICODETEXT = 13
+BM_CLICK = 0x00F5
 GMEM_MOVEABLE = 0x0002
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
@@ -43,8 +44,14 @@ SMTO_ABORTIFHUNG = 0x0002
 WM_CHAR = 0x0102
 WM_KEYDOWN = 0x0100
 WM_KEYUP = 0x0101
+WM_SETTEXT = 0x000C
 WINDOW_MESSAGE_TIMEOUT_MS = 1000
 VISIBLE_TEXT_CODE_UNIT_LIMIT = 512
+DEFAULT_DRAFT_TIMEOUT_SECONDS = 60.0
+DEFAULT_CLEANUP_TIMEOUT_SECONDS = 30.0
+DEFAULT_DATABASE_POLL_SECONDS = 2.0
+FILE_DIALOG_TIMEOUT_SECONDS = 10.0
+MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 SAFE_CLIPBOARD_FORMATS = frozenset(
     {CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_HDROP, CF_LOCALE}
 )
@@ -88,6 +95,10 @@ class INPUT(ctypes.Structure):
     _fields_ = [("type", wintypes.DWORD), ("u", INPUT_UNION)]
 
 
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
 @dataclass(frozen=True)
 class ClipboardFormat:
     format_id: int
@@ -103,6 +114,7 @@ class Win32EnvironmentSnapshot:
     wechat_window: int | None
     wechat_visible: bool
     wechat_iconic: bool
+    last_input_tick: int = 0
 
 
 class Win32WechatAttachmentBackend:
@@ -112,16 +124,37 @@ class Win32WechatAttachmentBackend:
         refresh_decrypted: Callable[[], None],
         *,
         settle_seconds: float = 0.35,
+        attachment_input_mode: str = "file_picker",
+        draft_timeout_seconds: float = DEFAULT_DRAFT_TIMEOUT_SECONDS,
+        cleanup_timeout_seconds: float = DEFAULT_CLEANUP_TIMEOUT_SECONDS,
+        database_poll_seconds: float = DEFAULT_DATABASE_POLL_SECONDS,
+        hide_text_after_navigation: bool = True,
     ) -> None:
         self.decrypted_dir = Path(decrypted_dir)
         self.refresh_decrypted = refresh_decrypted
         self.settle_seconds = settle_seconds
+        if attachment_input_mode not in {"file_picker", "cf_hdrop"}:
+            raise ValueError("attachment_input_mode must be file_picker or cf_hdrop")
+        self.attachment_input_mode = attachment_input_mode
+        self.draft_timeout_seconds = draft_timeout_seconds
+        self.cleanup_timeout_seconds = cleanup_timeout_seconds
+        self.database_poll_seconds = database_poll_seconds
+        self.hide_text_after_navigation = hide_text_after_navigation
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
         self._snapshot: Win32EnvironmentSnapshot | None = None
         self._expected_mouse_position: tuple[int, int] | None = None
         self._owned_clipboard_sequence: int | None = None
         self._user_interaction_detected = False
+        self._hidden_text_phase = False
+        self._hidden_foreground_window: int | None = None
+        self._hidden_last_input_tick: int | None = None
+        self._hidden_clipboard_sequence: int | None = None
+        self._displayed_wechat_window: int | None = None
+        self._owned_wechat_window: int | None = None
+        self._visible_started_at: float | None = None
+        self._visible_duration_seconds = 0.0
+        self._environment_observation: dict[str, Any] = {}
         try:
             ctypes.windll.shcore.SetProcessDpiAwareness(2)
         except Exception:
@@ -162,6 +195,8 @@ class Win32WechatAttachmentBackend:
         self.user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         self.user32.SendInput.restype = wintypes.UINT
         self.user32.GetClipboardSequenceNumber.restype = wintypes.DWORD
+        self.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(LASTINPUTINFO)]
+        self.user32.GetLastInputInfo.restype = wintypes.BOOL
 
     def _open_clipboard(self) -> None:
         for _ in range(20):
@@ -242,11 +277,191 @@ class Win32WechatAttachmentBackend:
     @staticmethod
     def _dropfiles(path: Path) -> bytes:
         encoded = (str(path) + "\0\0").encode("utf-16-le")
-        return struct.pack("<IiiII", 20, 0, 0, 0, 1) + encoded
+        return struct.pack("<IIIII", 20, 0, 0, 0, 1) + encoded
 
     def _set_file_clipboard(self, path: Path) -> None:
+        if not path.is_file():
+            raise UiBackendError("ATTACHMENT_SOURCE_MISSING", "附件来源文件不存在")
+        if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+            raise UiBackendError("ATTACHMENT_SOURCE_TOO_LARGE", "附件超过当前单文件大小限制")
         self._replace_clipboard((ClipboardFormat(CF_HDROP, self._dropfiles(path)),))
         self._owned_clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
+
+    def _guard_snapshot_clipboard_unchanged(self) -> None:
+        snapshot = getattr(self, "_snapshot", None)
+        if not isinstance(snapshot, Win32EnvironmentSnapshot):
+            raise UiBackendError("ENV_SNAPSHOT_MISSING", "附件剪贴板操作缺少环境快照")
+        if int(self.user32.GetClipboardSequenceNumber()) != snapshot.clipboard_sequence_number:
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "附件写入前剪贴板已发生变化")
+
+    def _window_class(self, window: int) -> str:
+        buffer = ctypes.create_unicode_buffer(256)
+        self.user32.GetClassNameW(window, buffer, len(buffer))
+        return buffer.value
+
+    def _window_title(self, window: int) -> str:
+        length = int(self.user32.GetWindowTextLengthW(window))
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        self.user32.GetWindowTextW(window, buffer, len(buffer))
+        return buffer.value
+
+    def _window_pid(self, window: int) -> int:
+        pid = wintypes.DWORD()
+        self.user32.GetWindowThreadProcessId(window, ctypes.byref(pid))
+        return int(pid.value)
+
+    def _descendants(self, window: int) -> list[int]:
+        found: list[int] = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(child: int, _: int) -> bool:
+            found.append(int(child))
+            return True
+
+        self.user32.EnumChildWindows(window, callback, 0)
+        return found
+
+    def _file_dialogs(self, window: int) -> list[int]:
+        target_pid = self._window_pid(window)
+        found: set[int] = set()
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(candidate: int, _: int) -> bool:
+            handle = int(candidate)
+            if (
+                self._window_class(handle) == "#32770"
+                and self.user32.IsWindowVisible(handle)
+                and self._window_pid(handle) == target_pid
+            ):
+                found.add(handle)
+            return True
+
+        self.user32.EnumWindows(callback, 0)
+        self.user32.EnumChildWindows(window, callback, 0)
+        return sorted(found)
+
+    def _dialog_control(
+        self,
+        dialog: int,
+        class_name: str,
+        title_fragment: str = "",
+    ) -> int | None:
+        matches = [
+            child
+            for child in self._descendants(dialog)
+            if self._window_class(child) == class_name
+            and self.user32.IsWindowVisible(child)
+            and (not title_fragment or title_fragment in self._window_title(child))
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _click_control(self, control: int) -> None:
+        rectangle = wintypes.RECT()
+        if not self.user32.GetWindowRect(control, ctypes.byref(rectangle)):
+            raise UiBackendError("FILE_PICKER_CONTROL_INVALID", "无法读取文件选择器控件位置")
+        point = ((rectangle.left + rectangle.right) // 2, (rectangle.top + rectangle.bottom) // 2)
+        if not self.user32.SetCursorPos(*point):
+            raise UiBackendError("FILE_PICKER_CONTROL_INVALID", "无法定位文件选择器控件")
+        self._expected_mouse_position = point
+        result = ctypes.c_size_t()
+        delivered = self.user32.SendMessageTimeoutW(
+            control,
+            BM_CLICK,
+            0,
+            0,
+            SMTO_ABORTIFHUNG,
+            WINDOW_MESSAGE_TIMEOUT_MS,
+            ctypes.byref(result),
+        )
+        if not delivered:
+            raise UiBackendError("FILE_PICKER_CONTROL_TIMEOUT", "文件选择器控件未响应")
+
+    def _set_dialog_path(self, edit: int, path: Path) -> None:
+        buffer = ctypes.create_unicode_buffer(str(path))
+        result = ctypes.c_size_t()
+        delivered = self.user32.SendMessageTimeoutW(
+            edit,
+            WM_SETTEXT,
+            0,
+            ctypes.cast(buffer, ctypes.c_void_p).value,
+            SMTO_ABORTIFHUNG,
+            WINDOW_MESSAGE_TIMEOUT_MS,
+            ctypes.byref(result),
+        )
+        if not delivered or self._window_title(edit) != str(path):
+            raise UiBackendError("FILE_PICKER_PATH_REJECTED", "文件选择器未接受目标路径")
+
+    def _picker_controls(self, dialog: int) -> tuple[int, int, int] | None:
+        edit = self._dialog_control(dialog, "Edit")
+        open_button = self._dialog_control(dialog, "Button", "打开")
+        cancel_button = self._dialog_control(dialog, "Button", "取消")
+        if edit is None or open_button is None or cancel_button is None:
+            return None
+        return edit, open_button, cancel_button
+
+    def _select_file_with_dialog(self, window: int, path: Path) -> None:
+        if not path.is_file():
+            raise UiBackendError("ATTACHMENT_SOURCE_MISSING", "附件来源文件不存在")
+        if path.stat().st_size > MAX_ATTACHMENT_BYTES:
+            raise UiBackendError("ATTACHMENT_SOURCE_TOO_LARGE", "附件超过当前单文件大小限制")
+        self._guard(window)
+        rectangle = wintypes.RECT()
+        if not self.user32.GetWindowRect(window, ctypes.byref(rectangle)):
+            raise UiBackendError("WECHAT_WINDOW_RECT_FAILED", "无法读取微信窗口位置")
+        width = rectangle.right - rectangle.left
+        height = rectangle.bottom - rectangle.top
+        point = (rectangle.left + int(width * 0.385), rectangle.top + int(height * 0.955))
+        if not self.user32.SetCursorPos(*point):
+            raise UiBackendError("FILE_PICKER_OPEN_FAILED", "无法定位微信文件按钮")
+        self._expected_mouse_position = point
+        self.user32.mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        self.user32.mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        deadline = time.monotonic() + FILE_DIALOG_TIMEOUT_SECONDS
+        picker: int | None = None
+        controls: tuple[int, int, int] | None = None
+        while time.monotonic() < deadline:
+            candidates = [
+                (dialog, self._picker_controls(dialog))
+                for dialog in self._file_dialogs(window)
+            ]
+            candidates = [(dialog, value) for dialog, value in candidates if value is not None]
+            if len(candidates) == 1:
+                picker, controls = candidates[0]
+                break
+            if len(candidates) > 1:
+                raise UiBackendError("FILE_PICKER_AMBIGUOUS", "出现多个文件选择器，拒绝猜测")
+            time.sleep(0.2)
+        if picker is None or controls is None:
+            raise UiBackendError("FILE_PICKER_NOT_FOUND", "微信文件选择器未出现")
+
+        edit, open_button, cancel_button = controls
+        self.user32.SetForegroundWindow(picker)
+        self._set_dialog_path(edit, path)
+        self._click_control(open_button)
+
+        deadline = time.monotonic() + FILE_DIALOG_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            dialogs = self._file_dialogs(window)
+            if picker not in dialogs or not self.user32.IsWindow(picker):
+                self.user32.SetForegroundWindow(window)
+                return
+            for dialog in dialogs:
+                if dialog == picker:
+                    continue
+                ok_button = self._dialog_control(dialog, "Button", "确定")
+                if ok_button is not None:
+                    self._click_control(ok_button)
+                    if self.user32.IsWindow(cancel_button):
+                        self._click_control(cancel_button)
+                    raise UiBackendError("FILE_PICKER_REJECTED", "文件选择器拒绝了目标文件")
+            time.sleep(0.2)
+        if self.user32.IsWindow(cancel_button):
+            self._click_control(cancel_button)
+        raise UiBackendError("FILE_PICKER_TIMEOUT", "文件选择器没有在时限内完成")
 
     @staticmethod
     def _wechat_pids() -> set[int]:
@@ -268,6 +483,83 @@ class Win32WechatAttachmentBackend:
                 except ValueError:
                     continue
         return pids
+
+    def _visible_wechat_window_count(self) -> int:
+        if not hasattr(self.user32, "EnumWindows"):
+            return 0
+        pids = self._wechat_pids()
+        count = 0
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def callback(window: int, _: int) -> bool:
+            nonlocal count
+            if (
+                self._window_pid(int(window)) in pids
+                and self.user32.IsWindowVisible(window)
+                and not self.user32.IsIconic(window)
+            ):
+                count += 1
+            return True
+
+        self.user32.EnumWindows(callback, 0)
+        return count
+
+    @staticmethod
+    def _clipboard_digest(formats: tuple[ClipboardFormat, ...]) -> str:
+        digest = hashlib.sha256()
+        for item in formats:
+            digest.update(struct.pack("<I", item.format_id))
+            digest.update(struct.pack("<Q", len(item.data)))
+            digest.update(item.data)
+        return digest.hexdigest()
+
+    def _start_visible_interval(self) -> None:
+        if getattr(self, "_visible_started_at", None) is None:
+            self._visible_started_at = time.monotonic()
+
+    def _stop_visible_interval(self) -> None:
+        visible_started_at = getattr(self, "_visible_started_at", None)
+        if visible_started_at is not None:
+            self._visible_duration_seconds = getattr(self, "_visible_duration_seconds", 0.0)
+            self._visible_duration_seconds += time.monotonic() - visible_started_at
+            self._visible_started_at = None
+
+    def environment_observation(self) -> dict[str, Any]:
+        duration = getattr(self, "_visible_duration_seconds", 0.0)
+        visible_started_at = getattr(self, "_visible_started_at", None)
+        if visible_started_at is not None:
+            duration += time.monotonic() - visible_started_at
+        result = dict(getattr(self, "_environment_observation", {}))
+        result["wechat_visible_duration_ms"] = round(duration * 1000)
+        return result
+
+    def _last_input_tick(self) -> int:
+        info = LASTINPUTINFO(cbSize=ctypes.sizeof(LASTINPUTINFO))
+        if not self.user32.GetLastInputInfo(ctypes.byref(info)):
+            raise UiBackendError("LAST_INPUT_SNAPSHOT_FAILED", "无法读取 Windows 最近输入时间")
+        return int(info.dwTime)
+
+    def _guard_pre_ui_takeover(self, window: int | None) -> None:
+        snapshot = getattr(self, "_snapshot", None)
+        if not isinstance(snapshot, Win32EnvironmentSnapshot):
+            raise UiBackendError("ENV_SNAPSHOT_MISSING", "微信 UI 操作缺少环境快照")
+        point = wintypes.POINT()
+        if not self.user32.GetCursorPos(ctypes.byref(point)):
+            raise UiBackendError("CURSOR_SNAPSHOT_FAILED", "无法复核鼠标位置")
+        allowed_foregrounds = {snapshot.foreground_window}
+        if window is not None:
+            allowed_foregrounds.add(window)
+        unchanged = (
+            self._last_input_tick() == snapshot.last_input_tick
+            and (int(point.x), int(point.y)) == snapshot.mouse_position
+            and int(self.user32.GetClipboardSequenceNumber())
+            == snapshot.clipboard_sequence_number
+            and int(self.user32.GetForegroundWindow()) in allowed_foregrounds
+        )
+        if not unchanged:
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "环境快照后检测到用户操作，停止接管微信")
 
     def _find_window(self, *, required: bool) -> int | None:
         pids = self._wechat_pids()
@@ -298,37 +590,116 @@ class Win32WechatAttachmentBackend:
         return None
 
     def snapshot_environment(self) -> Win32EnvironmentSnapshot:
+        last_input_tick = self._last_input_tick()
         point = wintypes.POINT()
         if not self.user32.GetCursorPos(ctypes.byref(point)):
             raise UiBackendError("CURSOR_SNAPSHOT_FAILED", "无法读取鼠标位置")
+        foreground_window = int(self.user32.GetForegroundWindow())
+        mouse_position = (int(point.x), int(point.y))
+        clipboard_sequence_number = int(self.user32.GetClipboardSequenceNumber())
         wechat_window = self._find_window(required=False)
-        clipboard_formats = self._snapshot_clipboard()
+        clipboard_formats = (
+            self._snapshot_clipboard()
+            if getattr(self, "attachment_input_mode", "file_picker") == "cf_hdrop"
+            else ()
+        )
+        final_point = wintypes.POINT()
+        stable = (
+            self._last_input_tick() == last_input_tick
+            and self.user32.GetCursorPos(ctypes.byref(final_point))
+            and (int(final_point.x), int(final_point.y)) == mouse_position
+            and int(self.user32.GetForegroundWindow()) == foreground_window
+            and int(self.user32.GetClipboardSequenceNumber()) == clipboard_sequence_number
+        )
+        if not stable:
+            self._user_interaction_detected = True
+            raise UiBackendError("ENV_SNAPSHOT_UNSTABLE", "环境快照期间检测到用户操作")
         snapshot = Win32EnvironmentSnapshot(
-            foreground_window=int(self.user32.GetForegroundWindow()),
-            mouse_position=(int(point.x), int(point.y)),
+            foreground_window=foreground_window,
+            mouse_position=mouse_position,
             clipboard_formats=clipboard_formats,
-            clipboard_sequence_number=int(self.user32.GetClipboardSequenceNumber()),
+            clipboard_sequence_number=clipboard_sequence_number,
             wechat_window=wechat_window,
             wechat_visible=bool(wechat_window and self.user32.IsWindowVisible(wechat_window)),
             wechat_iconic=bool(wechat_window and self.user32.IsIconic(wechat_window)),
+            last_input_tick=last_input_tick,
         )
         self._snapshot = snapshot
         self._expected_mouse_position = snapshot.mouse_position
+        self._owned_clipboard_sequence = None
         self._user_interaction_detected = False
+        self._hidden_text_phase = False
+        self._hidden_foreground_window = None
+        self._hidden_last_input_tick = None
+        self._hidden_clipboard_sequence = None
+        self._displayed_wechat_window = None
+        self._owned_wechat_window = None
+        self._visible_started_at = None
+        self._visible_duration_seconds = 0.0
+        self._environment_observation = {
+            "ui_mode": (
+                "file_picker_low_disturbance"
+                if getattr(self, "attachment_input_mode", "file_picker") == "file_picker"
+                else "cf_hdrop_candidate"
+            ),
+            "foreground_unchanged_before_restore": None,
+            "foreground_restored": None,
+            "mouse_unchanged_before_restore": None,
+            "mouse_restored": None,
+            "clipboard_sequence_before": snapshot.clipboard_sequence_number,
+            "clipboard_sequence_after": None,
+            "clipboard_semantics_restored": None,
+            "restore_skipped_user_interaction": False,
+            "visible_window_count_before": self._visible_wechat_window_count(),
+            "visible_window_count_after": None,
+            "cf_hdrop_candidate": True,
+            "cf_hdrop_enabled": False,
+            "file_picker_fallback_used": (
+                getattr(self, "attachment_input_mode", "file_picker") == "file_picker"
+            ),
+        }
+        if snapshot.clipboard_formats:
+            self._environment_observation["clipboard_semantics_before_sha256"] = (
+                self._clipboard_digest(snapshot.clipboard_formats)
+            )
         return snapshot
 
     def wake(self) -> None:
+        snapshot = getattr(self, "_snapshot", None)
+        if not isinstance(snapshot, Win32EnvironmentSnapshot):
+            raise UiBackendError("ENV_SNAPSHOT_MISSING", "微信唤醒缺少环境快照")
+        self._guard_pre_ui_takeover(snapshot.wechat_window)
         os.startfile("weixin://")
-        time.sleep(4)
+        deadline = time.monotonic() + 4.0
+        tracked_window = snapshot.wechat_window
+        while time.monotonic() < deadline:
+            if tracked_window is None or not self.user32.IsWindow(tracked_window):
+                tracked_window = self._find_window(required=False)
+            if (
+                tracked_window is not None
+                and self.user32.IsWindowVisible(tracked_window)
+                and not self.user32.IsIconic(tracked_window)
+            ):
+                self._displayed_wechat_window = tracked_window
+                self._start_visible_interval()
+            elif self._displayed_wechat_window == tracked_window:
+                self._stop_visible_interval()
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(0.25, remaining))
 
     def locate_window(self) -> int:
         window = self._find_window(required=True)
         assert window is not None
+        self._guard_pre_ui_takeover(window)
+        self._displayed_wechat_window = window
+        self._start_visible_interval()
         self.user32.ShowWindow(window, SW_RESTORE)
         self.user32.SetForegroundWindow(window)
         time.sleep(1)
         if int(self.user32.GetForegroundWindow()) != window:
             raise UiBackendError("WECHAT_FOCUS_FAILED", "无法把微信窗口置于前台")
+        self._owned_wechat_window = window
         return window
 
     def _guard(self, window: object) -> int:
@@ -343,6 +714,13 @@ class Win32WechatAttachmentBackend:
             if (int(point.x), int(point.y)) != self._expected_mouse_position:
                 self._user_interaction_detected = True
                 raise UiBackendError("USER_INTERACTION_DETECTED", "鼠标位置已变化，停止自动操作")
+        owned_clipboard_sequence = getattr(self, "_owned_clipboard_sequence", None)
+        if (
+            owned_clipboard_sequence is not None
+            and int(self.user32.GetClipboardSequenceNumber()) != owned_clipboard_sequence
+        ):
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "附件粘贴前剪贴板已被用户改变")
         return window
 
     def window_focus_state(self, window: object) -> FocusState:
@@ -505,16 +883,37 @@ class Win32WechatAttachmentBackend:
         if not isinstance(draft_handle, dict) or draft_handle.get("username") != route.username:
             raise UiBackendError("ATTACHMENT_DRAFT_HANDLE_INVALID", "附件草稿句柄无效")
         self._focus_input(active_window)
-        self._set_file_clipboard(path)
-        self._hotkey(active_window, VK_CONTROL, VK_V)
-        time.sleep(2)
-        self._refresh()
-        rows = self._draft_rows(route.username)
-        if len(rows) != 1:
-            raise UiBackendError("ATTACHMENT_DRAFT_ROUTE_UNVERIFIED", "微信草稿表未唯一指向目标 route")
-        data = self._draft_bytes(rows[0][1])
-        if not data or not self._contains_file_name(data, path.name):
-            raise UiBackendError("ATTACHMENT_DRAFT_CONTENT_UNVERIFIED", "微信草稿表未包含目标附件名称")
+        if getattr(self, "attachment_input_mode", "file_picker") == "file_picker":
+            self._select_file_with_dialog(active_window, path)
+        else:
+            self._guard_snapshot_clipboard_unchanged()
+            self._set_file_clipboard(path)
+            self._hotkey(active_window, VK_CONTROL, VK_V)
+        deadline = time.monotonic() + getattr(
+            self, "draft_timeout_seconds", DEFAULT_DRAFT_TIMEOUT_SECONDS
+        )
+        rows: list[tuple[Any, Any]] = []
+        data = b""
+        while time.monotonic() < deadline:
+            self._refresh()
+            rows = self._draft_rows(route.username)
+            if len(rows) > 1:
+                raise UiBackendError(
+                    "ATTACHMENT_DRAFT_ROUTE_AMBIGUOUS",
+                    "微信草稿表出现多条目标 route 记录",
+                )
+            if len(rows) == 1:
+                data = self._draft_bytes(rows[0][1])
+                if data and self._contains_file_name(data, path.name):
+                    break
+            time.sleep(getattr(self, "database_poll_seconds", DEFAULT_DATABASE_POLL_SECONDS))
+        else:
+            code = (
+                "ATTACHMENT_DRAFT_ROUTE_UNVERIFIED"
+                if len(rows) != 1
+                else "ATTACHMENT_DRAFT_CONTENT_UNVERIFIED"
+            )
+            raise UiBackendError(code, "微信草稿未在时限内获得精确 route 与附件证明")
         draft_handle["proof_sha256"] = hashlib.sha256(data).hexdigest()
         draft_handle["file_name"] = path.name
 
@@ -562,18 +961,46 @@ class Win32WechatAttachmentBackend:
         active_window = self._guard(window)
         self._hotkey(active_window, VK_CONTROL, 0x41)
         self._press(active_window, VK_DELETE)
-        time.sleep(0.5)
-        self._refresh()
         username = draft_handle.get("username") if isinstance(draft_handle, dict) else None
         if not isinstance(username, str):
             raise UiBackendError("ATTACHMENT_DRAFT_HANDLE_INVALID", "附件草稿句柄无效")
-        if any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
-            raise UiBackendError("ATTACHMENT_DRAFT_CLEANUP_FAILED", "附件草稿未被清理")
+        deadline = time.monotonic() + getattr(
+            self, "cleanup_timeout_seconds", DEFAULT_CLEANUP_TIMEOUT_SECONDS
+        )
+        while time.monotonic() < deadline:
+            self._refresh()
+            if not any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
+                return
+            time.sleep(getattr(self, "database_poll_seconds", DEFAULT_DATABASE_POLL_SECONDS))
+        raise UiBackendError("ATTACHMENT_DRAFT_CLEANUP_FAILED", "附件草稿未在时限内被清理")
 
     def restore_environment(self, snapshot: object) -> None:
         if not isinstance(snapshot, Win32EnvironmentSnapshot):
             raise UiBackendError("ENV_SNAPSHOT_INVALID", "环境快照类型无效")
         errors: list[Exception] = []
+        if not hasattr(self, "_environment_observation"):
+            self._environment_observation = {}
+        point = wintypes.POINT()
+        mouse_read = bool(self.user32.GetCursorPos(ctypes.byref(point)))
+        current_mouse = (int(point.x), int(point.y)) if mouse_read else None
+        current_foreground = int(self.user32.GetForegroundWindow())
+        hidden_text_phase = getattr(self, "_hidden_text_phase", False)
+        owned_window = getattr(self, "_owned_wechat_window", None)
+        displayed_window = getattr(self, "_displayed_wechat_window", None)
+        if hidden_text_phase:
+            expected_foregrounds = {getattr(self, "_hidden_foreground_window", None)}
+        elif owned_window is not None:
+            expected_foregrounds = {owned_window}
+        elif displayed_window is not None:
+            expected_foregrounds = {snapshot.foreground_window, displayed_window}
+        else:
+            expected_foregrounds = {snapshot.foreground_window}
+        foreground_unchanged = current_foreground in expected_foregrounds
+        mouse_unchanged = current_mouse == getattr(self, "_expected_mouse_position", None)
+        self._environment_observation["foreground_unchanged_before_restore"] = foreground_unchanged
+        self._environment_observation["mouse_unchanged_before_restore"] = mouse_unchanged
+        if not foreground_unchanged or not mouse_unchanged:
+            self._user_interaction_detected = True
         clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
         if self._owned_clipboard_sequence is not None:
             if clipboard_sequence == self._owned_clipboard_sequence:
@@ -583,10 +1010,43 @@ class Win32WechatAttachmentBackend:
                     errors.append(error)
             else:
                 self._user_interaction_detected = True
+        elif clipboard_sequence != snapshot.clipboard_sequence_number:
+            self._user_interaction_detected = True
         if self._user_interaction_detected:
+            self._stop_visible_interval()
+            self._environment_observation["restore_skipped_user_interaction"] = True
+            self._environment_observation["clipboard_sequence_after"] = clipboard_sequence
+            displayed_window = getattr(self, "_displayed_wechat_window", None)
+            displayed_window_unwound = False
+            if (
+                displayed_window is not None
+                and displayed_window != current_foreground
+                and self.user32.IsWindow(displayed_window)
+            ):
+                try:
+                    if snapshot.wechat_window is None or not snapshot.wechat_visible:
+                        self.user32.ShowWindow(displayed_window, SW_HIDE)
+                        displayed_window_unwound = True
+                    elif snapshot.wechat_iconic:
+                        self.user32.ShowWindow(displayed_window, SW_MINIMIZE)
+                        displayed_window_unwound = True
+                except Exception:
+                    displayed_window_unwound = False
+            self._environment_observation["wechat_window_unwound_after_user_interaction"] = (
+                displayed_window_unwound
+            )
+            self._environment_observation["visible_window_count_after"] = (
+                self._visible_wechat_window_count()
+            )
             self._snapshot = None
             self._expected_mouse_position = None
             self._owned_clipboard_sequence = None
+            self._displayed_wechat_window = None
+            self._owned_wechat_window = None
+            self._hidden_text_phase = False
+            self._hidden_foreground_window = None
+            self._hidden_last_input_tick = None
+            self._hidden_clipboard_sequence = None
             raise UiBackendError(
                 "ENV_RESTORE_SKIPPED_USER_INTERACTION",
                 "检测到用户操作；未覆盖用户的新剪贴板，也未改变当前窗口和鼠标",
@@ -611,13 +1071,111 @@ class Win32WechatAttachmentBackend:
         self._snapshot = None
         self._expected_mouse_position = None
         self._owned_clipboard_sequence = None
+        self._displayed_wechat_window = None
+        self._owned_wechat_window = None
+        self._hidden_text_phase = False
+        self._hidden_foreground_window = None
+        self._hidden_last_input_tick = None
+        self._hidden_clipboard_sequence = None
+        self._stop_visible_interval()
+        final_point = wintypes.POINT()
+        final_mouse_read = bool(self.user32.GetCursorPos(ctypes.byref(final_point)))
+        self._environment_observation["foreground_restored"] = (
+            int(self.user32.GetForegroundWindow()) == snapshot.foreground_window
+        )
+        self._environment_observation["mouse_restored"] = (
+            final_mouse_read
+            and (int(final_point.x), int(final_point.y)) == snapshot.mouse_position
+        )
+        final_clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
+        self._environment_observation["clipboard_sequence_after"] = final_clipboard_sequence
+        if snapshot.clipboard_formats:
+            try:
+                restored_formats = self._snapshot_clipboard()
+                self._environment_observation["clipboard_semantics_restored"] = (
+                    self._clipboard_digest(restored_formats)
+                    == self._clipboard_digest(snapshot.clipboard_formats)
+                )
+            except Exception:
+                self._environment_observation["clipboard_semantics_restored"] = False
+        else:
+            self._environment_observation["clipboard_semantics_restored"] = (
+                final_clipboard_sequence == snapshot.clipboard_sequence_number
+            )
+        self._environment_observation["visible_window_count_after"] = (
+            self._visible_wechat_window_count()
+        )
         if errors:
             raise UiBackendError("ENV_RESTORE_FAILED", "无法完整恢复剪贴板、窗口或焦点")
 
 
 class Win32WechatTextBackend(Win32WechatAttachmentBackend):
-    def _send_window_message(self, window: int, message: int, wparam: int, lparam: int) -> None:
+    def _guard_text_phase(self, window: object) -> int:
+        if not getattr(self, "_hidden_text_phase", False):
+            return self._guard(window)
+        if not isinstance(window, int) or not self.user32.IsWindow(window):
+            raise UiBackendError("WECHAT_WINDOW_LOST", "微信窗口已失效")
+        if self.user32.IsWindowVisible(window):
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "微信窗口在隐藏发送阶段意外显示")
+        if int(self.user32.GetForegroundWindow()) != self._hidden_foreground_window:
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "隐藏发送阶段前台窗口已变化")
+        if self._expected_mouse_position is not None:
+            point = wintypes.POINT()
+            self.user32.GetCursorPos(ctypes.byref(point))
+            if (int(point.x), int(point.y)) != self._expected_mouse_position:
+                self._user_interaction_detected = True
+                raise UiBackendError("USER_INTERACTION_DETECTED", "隐藏发送阶段鼠标位置已变化")
+        if self._last_input_tick() != getattr(self, "_hidden_last_input_tick", None):
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "隐藏发送阶段检测到新的键盘或鼠标输入")
+        if int(self.user32.GetClipboardSequenceNumber()) != getattr(
+            self, "_hidden_clipboard_sequence", None
+        ):
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "隐藏发送阶段剪贴板已变化")
+        return window
+
+    def _enter_hidden_text_phase(self, window: int) -> None:
         self._guard(window)
+        hidden_last_input_tick = self._last_input_tick()
+        hidden_clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
+        self.user32.ShowWindow(window, SW_HIDE)
+        time.sleep(0.25)
+        if self.user32.IsWindowVisible(window):
+            raise UiBackendError("WECHAT_HIDE_FAILED", "无法进入隐藏文字发送阶段")
+        self._stop_visible_interval()
+        self._hidden_text_phase = True
+        self._hidden_foreground_window = int(self.user32.GetForegroundWindow())
+        self._hidden_last_input_tick = hidden_last_input_tick
+        self._hidden_clipboard_sequence = hidden_clipboard_sequence
+        if (
+            self._last_input_tick() != hidden_last_input_tick
+            or int(self.user32.GetClipboardSequenceNumber()) != hidden_clipboard_sequence
+        ):
+            self._user_interaction_detected = True
+            raise UiBackendError("USER_INTERACTION_DETECTED", "隐藏窗口期间检测到用户输入或剪贴板变化")
+
+    def _restore_visible_text_control(self, window: int) -> None:
+        if not getattr(self, "_hidden_text_phase", False):
+            return
+        self._guard_text_phase(window)
+        self._displayed_wechat_window = window
+        self._start_visible_interval()
+        self.user32.ShowWindow(window, SW_RESTORE)
+        self.user32.SetForegroundWindow(window)
+        time.sleep(0.5)
+        if int(self.user32.GetForegroundWindow()) != window:
+            raise UiBackendError("WECHAT_FOCUS_FAILED", "无法恢复微信窗口用于安全清理")
+        self._owned_wechat_window = window
+        self._hidden_text_phase = False
+        self._hidden_foreground_window = None
+        self._hidden_last_input_tick = None
+        self._hidden_clipboard_sequence = None
+
+    def _send_window_message(self, window: int, message: int, wparam: int, lparam: int) -> None:
+        self._guard_text_phase(window)
         result = ctypes.c_size_t()
         delivered = self.user32.SendMessageTimeoutW(
             window,
@@ -663,23 +1221,9 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
             time.sleep(0.05)
 
     def snapshot_environment(self) -> Win32EnvironmentSnapshot:
-        point = wintypes.POINT()
-        if not self.user32.GetCursorPos(ctypes.byref(point)):
-            raise UiBackendError("CURSOR_SNAPSHOT_FAILED", "无法读取鼠标位置")
-        wechat_window = self._find_window(required=False)
-        snapshot = Win32EnvironmentSnapshot(
-            foreground_window=int(self.user32.GetForegroundWindow()),
-            mouse_position=(int(point.x), int(point.y)),
-            clipboard_formats=(),
-            clipboard_sequence_number=int(self.user32.GetClipboardSequenceNumber()),
-            wechat_window=wechat_window,
-            wechat_visible=bool(wechat_window and self.user32.IsWindowVisible(wechat_window)),
-            wechat_iconic=bool(wechat_window and self.user32.IsIconic(wechat_window)),
-        )
-        self._snapshot = snapshot
-        self._expected_mouse_position = snapshot.mouse_position
-        self._owned_clipboard_sequence = None
-        self._user_interaction_detected = False
+        snapshot = super().snapshot_environment()
+        self._environment_observation["ui_mode"] = "visible_navigation_then_hidden_text"
+        self._environment_observation["file_picker_fallback_used"] = False
         return snapshot
 
     @staticmethod
@@ -698,24 +1242,35 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
         if not isinstance(draft_handle, dict) or not isinstance(draft_handle.get("username"), str):
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿句柄无效")
         self._focus_input(active_window)
-        self._window_unicode_text(active_window, text)
-        time.sleep(1)
-        self._refresh()
-        rows = self._draft_rows(draft_handle["username"])
-        if len(rows) != 1:
-            raise UiBackendError("TEXT_DRAFT_ROUTE_UNVERIFIED", "微信草稿表未唯一指向目标 route")
-        data = self._draft_bytes(rows[0][1])
-        if not data or not self._contains_text(data, text):
-            raise UiBackendError("TEXT_DRAFT_CONTENT_UNVERIFIED", "微信草稿表未包含批准正文")
-        draft_handle["proof_sha256"] = hashlib.sha256(data).hexdigest()
-        draft_handle["text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if getattr(self, "hide_text_after_navigation", False):
+            self._enter_hidden_text_phase(active_window)
+        draft_handle["approved_text_sha256"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
         draft_handle["text"] = text
-        draft_handle["delete_press_count"] = len(text)
         self._text_draft_handle = draft_handle
+        self._window_unicode_text(active_window, text)
+        deadline = time.monotonic() + getattr(
+            self, "draft_timeout_seconds", DEFAULT_DRAFT_TIMEOUT_SECONDS
+        )
+        rows: list[tuple[Any, Any]] = []
+        data = b""
+        while time.monotonic() < deadline:
+            self._refresh()
+            rows = self._draft_rows(draft_handle["username"])
+            if len(rows) > 1:
+                raise UiBackendError("TEXT_DRAFT_ROUTE_AMBIGUOUS", "微信草稿表出现多条目标 route 记录")
+            if len(rows) == 1:
+                data = self._draft_bytes(rows[0][1])
+                if data and self._contains_text(data, text):
+                    break
+            time.sleep(getattr(self, "database_poll_seconds", DEFAULT_DATABASE_POLL_SECONDS))
+        else:
+            code = "TEXT_DRAFT_ROUTE_UNVERIFIED" if len(rows) != 1 else "TEXT_DRAFT_CONTENT_UNVERIFIED"
+            raise UiBackendError(code, "微信草稿未在时限内获得精确 route 与批准正文证明")
+        draft_handle["proof_sha256"] = hashlib.sha256(data).hexdigest()
 
     def focus_state(self, window: object, route: VerifiedRoute) -> FocusState:
         try:
-            self._guard(window)
+            self._guard_text_phase(window)
             handle = getattr(self, "_text_draft_handle", None)
             if handle is None:
                 rows = self._draft_rows(route.username)
@@ -727,10 +1282,10 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
             if not isinstance(handle, dict) or handle.get("username") != route.username:
                 return FocusState.UNKNOWN
             proof = handle.get("proof_sha256")
-            if not isinstance(proof, str) or not proof:
+            if proof is not None and (not isinstance(proof, str) or not proof):
                 return FocusState.UNKNOWN
             text = handle.get("text")
-            text_sha256 = handle.get("text_sha256")
+            text_sha256 = handle.get("approved_text_sha256")
             if not isinstance(text, str) or not text:
                 return FocusState.UNKNOWN
             if hashlib.sha256(text.encode("utf-8")).hexdigest() != text_sha256:
@@ -745,9 +1300,11 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
             return FocusState.UNKNOWN
 
     def send_owned_draft(self, window: object, draft_handle: object) -> None:
-        active_window = self._guard(window)
+        active_window = self._guard_text_phase(window)
         if draft_handle is not getattr(self, "_text_draft_handle", None):
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿未获得 route 证明")
+        if not isinstance(draft_handle, dict) or not draft_handle.get("proof_sha256"):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿未获得数据库 route 证明")
         try:
             self._window_enter(active_window)
         except Exception as error:
@@ -759,12 +1316,15 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
         time.sleep(1)
 
     def clear_owned_draft(self, window: object, draft_handle: object) -> None:
+        if not isinstance(window, int):
+            raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿窗口无效")
+        self._guard_text_phase(window)
+        self._restore_visible_text_control(window)
         active_window = self._guard(window)
         if draft_handle is not getattr(self, "_text_draft_handle", None):
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿句柄无效")
         text = draft_handle.get("text")
-        delete_press_count = draft_handle.get("delete_press_count")
-        if not isinstance(text, str) or not text or not isinstance(delete_press_count, int):
+        if not isinstance(text, str) or not text:
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "文字草稿内容证明无效")
         username = draft_handle.get("username")
         self._refresh()
@@ -772,12 +1332,15 @@ class Win32WechatTextBackend(Win32WechatAttachmentBackend):
         if len(rows) != 1 or not self._contains_text(self._draft_bytes(rows[0][1]), text):
             raise UiBackendError("TEXT_DRAFT_HANDLE_INVALID", "当前草稿不再匹配本次自有正文")
         self._focus_input(active_window)
-        self._window_end(active_window)
-        self._window_backspaces(active_window, delete_press_count)
-        for _ in range(4):
-            time.sleep(0.5)
+        self._hotkey(active_window, VK_CONTROL, 0x41)
+        self._press(active_window, VK_DELETE)
+        deadline = time.monotonic() + getattr(
+            self, "cleanup_timeout_seconds", DEFAULT_CLEANUP_TIMEOUT_SECONDS
+        )
+        while time.monotonic() < deadline:
             self._refresh()
             if not any(row[1] not in (None, b"", "") for row in self._draft_rows(username)):
                 self._text_draft_handle = None
                 return
-        raise UiBackendError("TEXT_DRAFT_CLEANUP_FAILED", "文字草稿未被清理")
+            time.sleep(getattr(self, "database_poll_seconds", DEFAULT_DATABASE_POLL_SECONDS))
+        raise UiBackendError("TEXT_DRAFT_CLEANUP_FAILED", "文字草稿未在时限内被清理")

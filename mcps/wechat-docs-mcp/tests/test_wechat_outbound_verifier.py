@@ -322,3 +322,54 @@ def test_text_verification_strips_exact_group_sender_prefix(tmp_path: Path) -> N
 
     assert proof["visible_text"] == "marker"
     assert proof["local_id"] == 22
+
+
+def test_text_verifier_uses_bounded_thirty_second_default_window(tmp_path: Path) -> None:
+    verifier = WechatTextDatabaseVerifier(tmp_path, lambda: None)
+    assert verifier.timeout_seconds == 30.0
+    assert verifier.poll_interval_seconds == 2.0
+
+
+def test_attachment_verifier_uses_longer_upload_observation_window(tmp_path: Path) -> None:
+    verifier = WechatAttachmentDatabaseVerifier(tmp_path, lambda: None)
+    assert verifier.timeout_seconds == 45.0
+    assert verifier.poll_interval_seconds == 2.0
+
+
+def test_text_refresh_failure_is_propagated(tmp_path: Path) -> None:
+    _database(tmp_path, [])
+
+    def fail_refresh() -> None:
+        raise RuntimeError("synthetic")
+
+    verifier = WechatTextDatabaseVerifier(tmp_path, fail_refresh, timeout_seconds=0)
+    with pytest.raises(AttachmentDatabaseVerificationError) as raised:
+        verifier.verify(_route(), "marker", 0)
+    assert raised.value.code == "TEXT_DATABASE_REFRESH_FAILED"
+
+
+def test_text_baseline_rejects_missing_route_table(tmp_path: Path) -> None:
+    database = tmp_path / "message" / "message_0.db"
+    database.parent.mkdir(parents=True)
+    sqlite3.connect(database).close()
+    verifier = WechatTextDatabaseVerifier(tmp_path, lambda: None, timeout_seconds=0)
+
+    with pytest.raises(AttachmentDatabaseVerificationError) as raised:
+        verifier.baseline(_route())
+
+    assert raised.value.code == "TEXT_OUTBOUND_MESSAGE_TABLE"
+
+
+def test_text_verification_rejects_exact_content_without_outbound_origin(tmp_path: Path) -> None:
+    _database(tmp_path, [(22, 102, 1_800_000_002, 2, 2, "marker", 0)])
+    verifier = WechatTextDatabaseVerifier(
+        tmp_path,
+        lambda: None,
+        timeout_seconds=0,
+        poll_interval_seconds=0,
+    )
+
+    with pytest.raises(AttachmentDatabaseVerificationError) as raised:
+        verifier.verify(_route(), "marker", 20)
+
+    assert raised.value.code == "TEXT_DATABASE_CONFIRMATION_TIMEOUT"

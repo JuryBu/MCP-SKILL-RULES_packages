@@ -81,6 +81,11 @@ class DbWatcher:
         self._observer = DbObserver(self.decrypted_dir, self.bindings)
         self._initial_scan_done = False
         self._lock = threading.Lock()
+        self._last_tool_error: str | None = None
+
+    @staticmethod
+    def _tool_failure(operation: str, detail: str) -> str:
+        return f"{operation} failed: {detail}"
 
     def _scan_encrypted_files(self) -> dict[str, FileSnapshot]:
         """Build a snapshot of all .db files in the encrypted directory."""
@@ -149,16 +154,33 @@ class DbWatcher:
                 Path.home() / ".codex-toolkit" / "wechat-docs-mcp" / "private-state" / "tools" / "wcdb_key_tool_windows.py",
             )
         )
-        if not tool_path.exists():
+        self._last_tool_error = None
+        if not tool_path.is_file():
+            self._last_tool_error = self._tool_failure("key extraction", "tool unavailable")
             return False
-        result = subprocess.run(
-            [sys.executable, str(tool_path), "extract",
-             "--db-dir", str(self.db_dir),
-             "--output", str(self.keys_file)],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=30,
-        )
-        return result.returncode == 0
+        try:
+            result = subprocess.run(
+                [sys.executable, str(tool_path), "extract",
+                 "--db-dir", str(self.db_dir),
+                 "--output", str(self.keys_file)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            self._last_tool_error = self._tool_failure("key extraction", "timeout")
+            return False
+        except OSError as error:
+            self._last_tool_error = self._tool_failure(
+                "key extraction", f"process error {type(error).__name__}"
+            )
+            return False
+        if result.returncode != 0:
+            self._last_tool_error = self._tool_failure(
+                "key extraction", f"exit code {result.returncode}"
+            )
+            return False
+        return True
 
     def decrypt_changed(self, changed_files: list[str]) -> list[str]:
         """Re-decrypt the database files that changed.
@@ -177,15 +199,32 @@ class DbWatcher:
                 Path.home() / ".codex-toolkit" / "wechat-docs-mcp" / "private-state" / "tools" / "wcdb_key_tool_windows.py",
             )
         )
-        result = subprocess.run(
-            [sys.executable, str(tool_path), "decrypt",
-             "--db-dir", str(self.db_dir),
-             "--keys", str(self.keys_file),
-             "--output", str(self.decrypted_dir)],
-            capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=60,
-        )
+        self._last_tool_error = None
+        if not tool_path.is_file():
+            self._last_tool_error = self._tool_failure("decryption", "tool unavailable")
+            return []
+        try:
+            result = subprocess.run(
+                [sys.executable, str(tool_path), "decrypt",
+                 "--db-dir", str(self.db_dir),
+                 "--keys", str(self.keys_file),
+                 "--output", str(self.decrypted_dir)],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=60,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired:
+            self._last_tool_error = self._tool_failure("decryption", "timeout")
+            return []
+        except OSError as error:
+            self._last_tool_error = self._tool_failure(
+                "decryption", f"process error {type(error).__name__}"
+            )
+            return []
         if result.returncode != 0:
+            self._last_tool_error = self._tool_failure(
+                "decryption", f"exit code {result.returncode}"
+            )
             return []
         return changed_files
 
@@ -316,14 +355,14 @@ class DbWatcher:
             result.changed_files = changed
 
         if not self.refresh_keys():
-            result.error = "Key extraction failed"
+            result.error = self._last_tool_error or "Key extraction failed"
             # Do NOT advance snapshot — next cycle will retry
             result.elapsed_seconds = time.time() - t0
             return result
 
         result.decrypted_files = self.decrypt_changed(changed)
         if not result.decrypted_files:
-            result.error = "Decryption failed"
+            result.error = self._last_tool_error or "Decryption failed"
             # Do NOT advance snapshot — next cycle will retry
             result.elapsed_seconds = time.time() - t0
             return result

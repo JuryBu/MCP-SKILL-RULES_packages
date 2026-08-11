@@ -29,6 +29,7 @@ class FocusState(StrEnum):
 class OutboundCapabilities:
     visible_ui: bool = True
     experimental_hidden_wm_char: bool = False
+    hidden_after_verified_navigation: bool = True
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class OutboundExecutionResult:
     cleanup_performed: bool
     restore_succeeded: bool
     cleanup_error_code: str | None = None
+    restore_error_code: str | None = None
 
 
 class OutboundRefused(RuntimeError):
@@ -129,6 +131,8 @@ class VisibleUiBackend(Protocol):
 
     def restore_environment(self, snapshot: object) -> None: ...
 
+    def environment_observation(self) -> dict[str, Any]: ...
+
 
 class SafeTextOutbound:
     capabilities = OutboundCapabilities()
@@ -208,9 +212,11 @@ class SafeTextOutbound:
         cleanup_performed = False
         cleanup_error_code: str | None = None
         restore_succeeded = True
+        restore_error_code: str | None = None
         draft_handle: object | None = None
         window: object | None = None
         baseline_local_id: int | None = None
+        database_observation: dict[str, Any] | None = None
 
         try:
             if self._database_verifier is not None:
@@ -241,6 +247,17 @@ class SafeTextOutbound:
                 else:
                     send_may_have_occurred = True
                 state = OutboundState.SEND_ATTEMPTED
+                if baseline_local_id is not None and self._database_verifier is not None:
+                    try:
+                        database_observation = self._database_verifier.verify(
+                            verified_route,
+                            text,
+                            baseline_local_id,
+                        )
+                        database_observation["baseline_local_id"] = baseline_local_id
+                    except Exception as error:
+                        error_code = getattr(error, "code", "TEXT_DATABASE_CONFIRMATION_FAILED")
+                        state = OutboundState.UNKNOWN
             except UiBackendError as error:
                 error_code = error.code
                 if send_may_have_occurred or error.send_may_have_occurred:
@@ -264,9 +281,15 @@ class SafeTextOutbound:
                     self._backend.restore_environment(snapshot)
                 except Exception:
                     restore_succeeded = False
-                    error_code = "RESTORE_FAILED_AFTER_SEND" if send_may_have_occurred else "RESTORE_FAILED"
+                    restore_error_code = (
+                        "RESTORE_FAILED_AFTER_SEND" if send_may_have_occurred else "RESTORE_FAILED"
+                    )
+                    if error_code is None:
+                        error_code = restore_error_code
                     state = OutboundState.UNKNOWN if send_may_have_occurred else OutboundState.FAILED
 
+        observation_getter = getattr(self._backend, "environment_observation", None)
+        environment_observation = observation_getter() if callable(observation_getter) else {}
         audit_result = {
             "route_id": route_id,
             "execution_id": active_execution_id,
@@ -274,7 +297,9 @@ class SafeTextOutbound:
             "cleanup_performed": cleanup_performed,
             "cleanup_error_code": cleanup_error_code,
             "restore_succeeded": restore_succeeded,
+            "restore_error_code": restore_error_code,
             "baseline_local_id": baseline_local_id,
+            "environment_observation": environment_observation,
         }
         self._ledger.finish_draft_execution(
             draft_id,
@@ -284,15 +309,9 @@ class SafeTextOutbound:
             error_code=error_code,
         )
 
-        if send_may_have_occurred and baseline_local_id is not None and self._database_verifier:
+        if database_observation is not None and restore_succeeded and state is OutboundState.SEND_ATTEMPTED:
             try:
-                observation = self._database_verifier.verify(
-                    verified_route,
-                    text,
-                    baseline_local_id,
-                )
-                observation["baseline_local_id"] = baseline_local_id
-                verified = self._ledger.verify_text_draft(draft_id, observation)
+                verified = self._ledger.verify_text_draft(draft_id, database_observation)
                 state = OutboundState(str(verified["state"]))
                 error_code = verified.get("error_code")
             except Exception as error:
@@ -304,6 +323,13 @@ class SafeTextOutbound:
                     audit_result,
                 )
                 state = OutboundState.UNKNOWN
+        elif send_may_have_occurred and state is OutboundState.UNKNOWN:
+            self._ledger.mark_draft_unknown(
+                draft_id,
+                [OutboundState.SEND_ATTEMPTED.value, OutboundState.UNKNOWN.value],
+                error_code or "TEXT_DATABASE_CONFIRMATION_FAILED",
+                audit_result,
+            )
         return OutboundExecutionResult(
             draft_id=draft_id,
             execution_id=active_execution_id,
@@ -314,4 +340,5 @@ class SafeTextOutbound:
             cleanup_performed=cleanup_performed,
             restore_succeeded=restore_succeeded,
             cleanup_error_code=cleanup_error_code,
+            restore_error_code=restore_error_code,
         )

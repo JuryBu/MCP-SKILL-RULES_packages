@@ -24,8 +24,8 @@
 | `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
-| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | Windows 可见文字发送开关；仅在私有 route/policy、授权链与真实数据库确认均通过后启用 |
-| `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件可见发送开关；只在私有 route/policy 与真实 capability probe 通过后启用 |
+| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | Windows 文字发送开关；仅在私有 route/policy、授权链、可见导航与真实数据库确认均通过后启用 |
+| `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件发送开关；只在私有 route/policy、低打扰文件选择器实测、环境恢复和接收端确认流程均通过后启用；严格无窗口 `CF_HDROP` 候选另行保持禁用 |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
 | `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |
 | `WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256` | 空 | 私有 enrollment 已核验的当前账号身份哈希；缺失或与 route 不符时禁止进程扫描并返回 `WAITING_FOR_KEY` |
@@ -37,6 +37,8 @@
 | `WECHAT_DOCS_MCP_IMAGE_KEY_FILE` | `<data_root>/secrets/wechat-image-v2.json` | 旧版无账号归属 key 的兼容候选；只有通过当前精确 DAT 验证后才迁入分账号目录 |
 | `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
 | `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
+
+`wechat_outbound_capabilities` 会分别报告严格无窗口附件候选、当前是否启用、低打扰文件选择器回退、复杂剪贴板恢复和接收端确认要求。执行审计中的 `wechat_visible_duration_ms`、前后可见窗口数、前台焦点、鼠标和剪贴板字段用于衡量干扰程度；没有全程采样证据时，不能仅凭前后窗口数都为零宣称严格无窗口。
 
 ### 2.2 目录结构
 
@@ -183,7 +185,7 @@ wechat_status()
 | `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
 | `wake_last_attempt_time` | 最近一次提交尝试时间 |
 | `tdocs_monitoring` | 文档 monitor/subscription/pending/wake 计数、后台线程、失败次数和文档 wake 状态；不含资源 ID 或正文 |
-| `outbound_enabled` | 微信真实发送总开关；不代表 UI backend 已实现 |
+| `outbound_enabled` | 微信真实发送总开关；不代表 route、草稿、数据库或接收端确认已通过 |
 
 ### 5.1 健康判断
 
@@ -305,7 +307,7 @@ schema v2 首次启动会先备份再迁移旧账本。若迁移后已经产生�
 
 ### 8.3 密钥提取工具不存在
 
-`refresh_keys()` 返回 `False`，`watch_once` 报 `"Key extraction failed"`。
+`refresh_keys()` 返回 `False`，`watch_once` 报不含工具输出或凭据的具体类别，例如 `key extraction failed: tool unavailable`、`timeout` 或非零退出码。
 
 解决：确认 `WECHAT_KEY_TOOL` 路径正确，工具文件存在。
 

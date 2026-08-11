@@ -107,6 +107,15 @@ class FakeBackend:
     def restore_environment(self, snapshot: object) -> None:
         self._step("restore")
 
+    @staticmethod
+    def environment_observation() -> dict[str, Any]:
+        return {
+            "restore_skipped_user_interaction": False,
+            "foreground_restored": True,
+            "mouse_restored": True,
+            "clipboard_semantics_restored": True,
+        }
+
 
 class FakeDatabaseVerifier:
     def __init__(self) -> None:
@@ -131,7 +140,7 @@ class FakeDatabaseVerifier:
             "route_id": "route-a",
             "local_id": baseline_local_id + 1,
             "server_id": "1001",
-            "observed_at": "2099-01-01T00:00:01+00:00",
+            "observed_at": "2026-01-01T00:00:01+00:00",
             "source_kind": "wechat_message_database",
         }
 
@@ -190,6 +199,30 @@ def _prepared(tmp_path: Path) -> tuple[EventLedger, dict[str, Any], dict[str, An
     return ledger, prepared, payload
 
 
+def _remote_confirmation(
+    prepared: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    authorized_at: str = "2026-01-01T00:00:02+00:00",
+) -> dict[str, Any]:
+    return {
+        "status": "receiver_downloaded",
+        "draft_id": prepared["draft"]["draft_id"],
+        "route_id": "route-a",
+        "file_name": payload["file_name"],
+        "byte_count": payload["byte_count"],
+        "sha256": payload["sha256"],
+        "content_md5": payload["content_md5"],
+        "owner_confirmation_ref": {
+            "conversation_id": "conversation-owner",
+            "turn_id": "turn-confirmation",
+            "message_item_id": "item-confirmation",
+            "role": "user",
+            "authorized_at": authorized_at,
+        },
+    }
+
+
 def _sender(
     ledger: EventLedger,
     backend: FakeBackend,
@@ -205,7 +238,7 @@ def _sender(
     )
 
 
-def test_attachment_send_is_verified_only_after_database_proof(tmp_path: Path) -> None:
+def test_attachment_send_requires_remote_confirmation_after_database_proof(tmp_path: Path) -> None:
     ledger, prepared, payload = _prepared(tmp_path)
     backend = FakeBackend()
     verifier = FakeDatabaseVerifier()
@@ -218,15 +251,276 @@ def test_attachment_send_is_verified_only_after_database_proof(tmp_path: Path) -
         execution_id="execution-a",
     )
 
-    assert result.state is OutboundState.VERIFIED
+    assert result.state is OutboundState.UNKNOWN
+    assert result.error_code == "ATTACHMENT_REMOTE_CONFIRMATION_REQUIRED"
     assert backend.calls[-1] == "restore"
     assert verifier.calls == ["baseline", "verify"]
     draft = ledger.get_draft(prepared["draft"]["draft_id"])
-    assert draft["state"] == "VERIFIED"
+    assert draft["state"] == "UNKNOWN"
+    assert draft["result"]["local_attachment_observation"]["local_id"] == 21
+    assert draft["result"]["environment_observation"]["foreground_restored"] is True
     transfer = AttachmentRegistry(ledger, tmp_path / "intake", tmp_path / "upload").get(
         prepared["transfer"]["transfer_id"]
     )
-    assert transfer["state"] == "VERIFIED"
+    assert transfer["state"] != "VERIFIED"
+
+
+def test_attachment_database_confirmation_precedes_environment_restore(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    timeline: list[str] = []
+
+    class OrderedBackend(FakeBackend):
+        def restore_environment(self, snapshot: object) -> None:
+            timeline.append("restore")
+            super().restore_environment(snapshot)
+
+    class OrderedVerifier(FakeDatabaseVerifier):
+        def verify(
+            self,
+            route: object,
+            kind: str,
+            payload: dict[str, Any],
+            baseline_local_id: int,
+        ) -> dict[str, Any]:
+            timeline.append("verify")
+            return super().verify(route, kind, payload, baseline_local_id)
+
+    _sender(ledger, OrderedBackend(), OrderedVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+
+    assert timeline == ["verify", "restore"]
+
+
+def test_attachment_restore_failure_preserves_primary_error(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    backend = FakeBackend()
+    backend.failures["locate"] = UiBackendError("WECHAT_FOCUS_FAILED", "synthetic")
+    backend.failures["restore"] = RuntimeError("synthetic restore failure")
+
+    result = _sender(ledger, backend, FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+
+    assert result.state is OutboundState.FAILED
+    assert result.error_code == "WECHAT_FOCUS_FAILED"
+    assert result.restore_error_code == "RESTORE_FAILED"
+    draft = ledger.get_draft(prepared["draft"]["draft_id"])
+    assert draft["result"]["restore_error_code"] == "RESTORE_FAILED"
+
+
+def test_attachment_cleanup_failure_preserves_primary_error(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    backend = FakeBackend()
+    backend.failures["write"] = UiBackendError("ATTACHMENT_WRITE_FAILED", "synthetic")
+    backend.failures["clear"] = UiBackendError("ATTACHMENT_CLEAR_FAILED", "synthetic")
+
+    result = _sender(ledger, backend, FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+
+    assert result.state is OutboundState.FAILED
+    assert result.error_code == "ATTACHMENT_WRITE_FAILED"
+    assert result.cleanup_error_code == "ATTACHMENT_OWNED_DRAFT_CLEANUP_FAILED"
+    draft = ledger.get_draft(prepared["draft"]["draft_id"])
+    assert draft["result"]["cleanup_error_code"] == "ATTACHMENT_OWNED_DRAFT_CLEANUP_FAILED"
+
+
+def test_attachment_uses_global_wechat_ui_lease_scope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    scopes: list[str | None] = []
+    original_acquire = ledger.acquire_draft_execution
+
+    def capture_scope(*args: object, **kwargs: object) -> dict[str, Any]:
+        scopes.append(kwargs.get("lease_scope"))
+        return original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(ledger, "acquire_draft_execution", capture_scope)
+    _sender(ledger, FakeBackend(), FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+
+    assert scopes == ["wechat-visible-ui"]
+
+
+def test_attachment_remote_confirmation_promotes_existing_unknown_without_resend(
+    tmp_path: Path,
+) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    result = _sender(ledger, FakeBackend(), FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+    assert result.state is OutboundState.UNKNOWN
+    draft = ledger.get_draft(prepared["draft"]["draft_id"])
+    observation = dict(draft["result"]["local_attachment_observation"])
+    observation["remote_confirmation"] = {
+        "status": "receiver_downloaded",
+        "draft_id": prepared["draft"]["draft_id"],
+        "route_id": "route-a",
+        "file_name": payload["file_name"],
+        "byte_count": payload["byte_count"],
+        "sha256": payload["sha256"],
+        "content_md5": payload["content_md5"],
+        "owner_confirmation_ref": {
+            "conversation_id": "conversation-owner",
+            "turn_id": "turn-confirmation",
+            "message_item_id": "item-confirmation",
+            "role": "user",
+            "authorized_at": "2026-01-01T00:00:02+00:00",
+        },
+    }
+
+    verified = ledger.verify_attachment_draft(prepared["draft"]["draft_id"], observation)
+
+    assert verified["state"] == "VERIFIED"
+    assert verified["result"]["remote_confirmation"]["status"] == "receiver_downloaded"
+
+
+def test_attachment_remote_confirmation_rejects_non_user_evidence(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    _sender(ledger, FakeBackend(), FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+    observation = dict(
+        ledger.get_draft(prepared["draft"]["draft_id"])["result"][
+            "local_attachment_observation"
+        ]
+    )
+    observation["remote_confirmation"] = {
+        "status": "receiver_visible_and_downloadable",
+        "draft_id": prepared["draft"]["draft_id"],
+        "route_id": "route-a",
+        "file_name": payload["file_name"],
+        "byte_count": payload["byte_count"],
+        "sha256": payload["sha256"],
+        "content_md5": payload["content_md5"],
+        "owner_confirmation_ref": {
+            "conversation_id": "conversation-agent",
+            "turn_id": "turn-agent",
+            "message_item_id": "item-agent",
+            "role": "assistant",
+            "authorized_at": "2026-01-01T00:00:02+00:00",
+        },
+    }
+
+    with pytest.raises(LedgerError) as raised:
+        ledger.verify_attachment_draft(prepared["draft"]["draft_id"], observation)
+
+    assert raised.value.code == "OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID"
+
+
+def test_attachment_remote_confirmation_rejects_changed_attachment_identity(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    _sender(ledger, FakeBackend(), FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+    observation = dict(
+        ledger.get_draft(prepared["draft"]["draft_id"])["result"][
+            "local_attachment_observation"
+        ]
+    )
+    observation["remote_confirmation"] = _remote_confirmation(prepared, payload)
+    observation["remote_confirmation"]["sha256"] = "f" * 64
+
+    with pytest.raises(LedgerError) as raised:
+        ledger.verify_attachment_draft(prepared["draft"]["draft_id"], observation)
+
+    assert raised.value.code == "OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID"
+
+
+def test_attachment_remote_confirmation_rejects_future_reference(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    _sender(ledger, FakeBackend(), FakeDatabaseVerifier(), tmp_path / "upload").execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+    observation = dict(
+        ledger.get_draft(prepared["draft"]["draft_id"])["result"][
+            "local_attachment_observation"
+        ]
+    )
+    observation["remote_confirmation"] = _remote_confirmation(
+        prepared,
+        payload,
+        authorized_at="2999-01-01T00:00:00+00:00",
+    )
+
+    with pytest.raises(LedgerError) as raised:
+        ledger.verify_attachment_draft(prepared["draft"]["draft_id"], observation)
+
+    assert raised.value.code == "OUTBOUND_ATTACHMENT_REMOTE_PROOF_INVALID"
+
+
+def test_attachment_remote_confirmation_requires_environment_restoration(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+
+    class IncompleteEnvironmentBackend(FakeBackend):
+        @staticmethod
+        def environment_observation() -> dict[str, Any]:
+            return {
+                "restore_skipped_user_interaction": False,
+                "foreground_restored": False,
+                "mouse_restored": True,
+                "clipboard_semantics_restored": True,
+            }
+
+    _sender(
+        ledger,
+        IncompleteEnvironmentBackend(),
+        FakeDatabaseVerifier(),
+        tmp_path / "upload",
+    ).execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+    observation = dict(
+        ledger.get_draft(prepared["draft"]["draft_id"])["result"][
+            "local_attachment_observation"
+        ]
+    )
+    observation["remote_confirmation"] = _remote_confirmation(prepared, payload)
+
+    with pytest.raises(LedgerError) as raised:
+        ledger.verify_attachment_draft(prepared["draft"]["draft_id"], observation)
+
+    assert raised.value.code == "OUTBOUND_ATTACHMENT_ENVIRONMENT_UNVERIFIED"
 
 
 def test_database_timeout_becomes_unknown_and_is_not_retried(tmp_path: Path) -> None:
@@ -352,6 +646,16 @@ def test_clipboard_sequence_change_preserves_user_clipboard() -> None:
         def GetClipboardSequenceNumber() -> int:
             return 200
 
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 1
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 1
+
     backend = object.__new__(Win32WechatAttachmentBackend)
     backend.user32 = User32()
     backend._owned_clipboard_sequence = 100
@@ -360,6 +664,7 @@ def test_clipboard_sequence_change_preserves_user_clipboard() -> None:
     backend._expected_mouse_position = (1, 1)
     restored: list[object] = []
     backend._replace_clipboard = restored.append
+    backend._visible_wechat_window_count = lambda: 0
     snapshot = Win32EnvironmentSnapshot(
         1,
         (1, 1),
@@ -373,6 +678,293 @@ def test_clipboard_sequence_change_preserves_user_clipboard() -> None:
         backend.restore_environment(snapshot)
     assert raised.value.code == "ENV_RESTORE_SKIPPED_USER_INTERACTION"
     assert restored == []
+
+
+def test_environment_restore_does_not_override_later_user_focus_or_mouse() -> None:
+    setters: list[tuple[object, ...]] = []
+
+    class User32:
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 8
+            point._obj.y = 9
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 777
+
+        @staticmethod
+        def SetCursorPos(*args: object) -> bool:
+            setters.append(("mouse", *args))
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(*args: object) -> bool:
+            setters.append(("foreground", *args))
+            return True
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._snapshot = object()
+    backend._expected_mouse_position = (1, 1)
+    backend._owned_wechat_window = 9001
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.5
+    backend._hidden_text_phase = False
+    backend._environment_observation = {"restore_skipped_user_interaction": False}
+    backend._visible_wechat_window_count = lambda: 1
+    snapshot = Win32EnvironmentSnapshot(1, (1, 1), (), 50, None, False, False)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.restore_environment(snapshot)
+
+    assert raised.value.code == "ENV_RESTORE_SKIPPED_USER_INTERACTION"
+    assert setters == []
+    observation = backend.environment_observation()
+    assert observation["restore_skipped_user_interaction"] is True
+    assert observation["foreground_unchanged_before_restore"] is False
+    assert observation["mouse_unchanged_before_restore"] is False
+
+
+def test_locate_window_counts_visibility_from_first_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 100.0}
+
+    class User32:
+        @staticmethod
+        def ShowWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 9001
+
+    monkeypatch.setattr(win32_attachment_ui.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        win32_attachment_ui.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._find_window = lambda *, required: 9001
+    backend._guard_pre_ui_takeover = lambda _: None
+    backend._displayed_wechat_window = None
+    backend._owned_wechat_window = None
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {}
+
+    assert backend.locate_window() == 9001
+    assert backend.environment_observation()["wechat_visible_duration_ms"] == 1000
+
+
+def test_wake_counts_visibility_that_begins_before_locate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 100.0}
+
+    class User32:
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return clock["now"] >= 101.0
+
+        @staticmethod
+        def IsIconic(_: object) -> bool:
+            return False
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 10
+
+    monkeypatch.setattr(win32_attachment_ui.os, "startfile", lambda _: None)
+    monkeypatch.setattr(win32_attachment_ui.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        win32_attachment_ui.time,
+        "sleep",
+        lambda seconds: clock.__setitem__("now", clock["now"] + seconds),
+    )
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, 9001, False, False, 7)
+    backend._last_input_tick = lambda: 7
+    backend._user_interaction_detected = False
+    backend._displayed_wechat_window = None
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {}
+
+    backend.wake()
+
+    assert backend._displayed_wechat_window == 9001
+    assert backend.environment_observation()["wechat_visible_duration_ms"] == 3000
+
+
+def test_locate_window_refuses_input_that_arrived_during_wake() -> None:
+    calls: list[tuple[str, object]] = []
+
+    class User32:
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 9001
+
+        @staticmethod
+        def ShowWindow(window: object, state: object) -> bool:
+            calls.append(("show", (window, state)))
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(window: object) -> bool:
+            calls.append(("focus", window))
+            return True
+
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, 9001, False, False, 10)
+    backend._find_window = lambda *, required: 9001
+    backend._last_input_tick = lambda: 11
+    backend._user_interaction_detected = False
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.locate_window()
+
+    assert raised.value.code == "USER_INTERACTION_DETECTED"
+    assert calls == []
+
+
+def test_focus_failure_restores_displayed_but_unowned_wechat_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[tuple[str, object]] = []
+
+    class User32:
+        foreground = 10
+
+        @classmethod
+        def ShowWindow(cls, window: object, state: object) -> bool:
+            actions.append(("show", (window, state)))
+            return True
+
+        @classmethod
+        def SetForegroundWindow(cls, window: object) -> bool:
+            actions.append(("focus", window))
+            return False
+
+        @classmethod
+        def GetForegroundWindow(cls) -> int:
+            return cls.foreground
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def SetCursorPos(x: object, y: object) -> bool:
+            actions.append(("mouse", (x, y)))
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False, 7)
+    backend._find_window = lambda *, required: 9001
+    backend._guard_pre_ui_takeover = lambda _: None
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._hidden_text_phase = False
+    backend._hidden_foreground_window = None
+    backend._displayed_wechat_window = None
+    backend._owned_wechat_window = None
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {"restore_skipped_user_interaction": False}
+    backend._visible_wechat_window_count = lambda: 0
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.locate_window()
+    assert raised.value.code == "WECHAT_FOCUS_FAILED"
+
+    backend.restore_environment(backend._snapshot)
+
+    assert ("show", (9001, win32_attachment_ui.SW_HIDE)) in actions
+    assert backend.environment_observation()["restore_skipped_user_interaction"] is False
+
+
+def test_visible_window_count_excludes_minimized_wechat() -> None:
+    class User32:
+        iconic = True
+
+        @staticmethod
+        def EnumWindows(callback: object, _: object) -> None:
+            callback(9001, 0)
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return True
+
+        @classmethod
+        def IsIconic(cls, _: object) -> bool:
+            return cls.iconic
+
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._wechat_pids = lambda: {42}
+    backend._window_pid = lambda _: 42
+
+    assert backend._visible_wechat_window_count() == 0
+    User32.iconic = False
+    assert backend._visible_wechat_window_count() == 1
 
 
 def test_win32_input_layout_and_dropfiles_payload_are_native_safe(tmp_path: Path) -> None:
@@ -473,6 +1065,17 @@ def test_clipboard_restore_replays_snapshot_when_sequence_is_owned() -> None:
         @staticmethod
         def GetClipboardSequenceNumber() -> int:
             return 100
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 1
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 0
+
         @staticmethod
         def SetCursorPos(*_: object) -> bool:
             return True
@@ -489,7 +1092,9 @@ def test_clipboard_restore_replays_snapshot_when_sequence_is_owned() -> None:
     backend._snapshot = object()
     backend._expected_mouse_position = (1, 1)
     backend._replace_clipboard = restored.append
+    backend._snapshot_clipboard = lambda: clipboard_formats
     backend._find_window = lambda *, required: None
+    backend._visible_wechat_window_count = lambda: 0
     snapshot = Win32EnvironmentSnapshot(0, (1, 1), clipboard_formats, 50, None, False, False)
 
     backend.restore_environment(snapshot)
@@ -517,6 +1122,7 @@ def test_locate_window_accepts_verified_foreground_when_win32_return_is_false(
     backend = object.__new__(Win32WechatAttachmentBackend)
     backend.user32 = User32()
     backend._find_window = lambda *, required: 9001
+    backend._guard_pre_ui_takeover = lambda _: None
 
     assert backend.locate_window() == 9001
 
@@ -539,6 +1145,7 @@ def test_locate_window_rejects_unverified_foreground(monkeypatch: pytest.MonkeyP
     backend = object.__new__(Win32WechatAttachmentBackend)
     backend.user32 = User32()
     backend._find_window = lambda *, required: 9001
+    backend._guard_pre_ui_takeover = lambda _: None
 
     with pytest.raises(UiBackendError) as raised:
         backend.locate_window()
@@ -572,6 +1179,8 @@ def test_text_snapshot_never_reads_or_copies_clipboard() -> None:
     backend = object.__new__(Win32WechatTextBackend)
     backend.user32 = User32()
     backend._find_window = lambda *, required: None
+    backend._visible_wechat_window_count = lambda: 0
+    backend._last_input_tick = lambda: 99
     backend._snapshot_clipboard = lambda: pytest.fail("text sender must not read clipboard payloads")
 
     snapshot = backend.snapshot_environment()
@@ -580,7 +1189,39 @@ def test_text_snapshot_never_reads_or_copies_clipboard() -> None:
     assert snapshot.mouse_position == (12, 34)
     assert snapshot.clipboard_formats == ()
     assert snapshot.clipboard_sequence_number == 88
+    assert snapshot.last_input_tick == 99
     assert backend._owned_clipboard_sequence is None
+
+
+def test_snapshot_rejects_input_that_arrives_during_capture() -> None:
+    class User32:
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 12
+            point._obj.y = 34
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 77
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 88
+
+    ticks = iter([10, 11])
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    backend._snapshot = None
+    backend._user_interaction_detected = False
+    backend._find_window = lambda *, required: None
+    backend._last_input_tick = lambda: next(ticks)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.snapshot_environment()
+
+    assert raised.value.code == "ENV_SNAPSHOT_UNSTABLE"
+    assert backend._snapshot is None
 
 
 def test_text_draft_requires_database_proof_before_send(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -598,9 +1239,8 @@ def test_text_draft_requires_database_proof_before_send(monkeypatch: pytest.Monk
     backend.write_owned_draft(9001, handle, "SYNTHETIC_TEXT")
 
     assert handle["proof_sha256"]
-    assert handle["text_sha256"] == hashlib.sha256(b"SYNTHETIC_TEXT").hexdigest()
+    assert handle["approved_text_sha256"] == hashlib.sha256(b"SYNTHETIC_TEXT").hexdigest()
     assert handle["text"] == "SYNTHETIC_TEXT"
-    assert handle["delete_press_count"] == len("SYNTHETIC_TEXT")
     assert backend._text_draft_handle is handle
     assert calls == [("focus", 9001), ("write", 9001, "SYNTHETIC_TEXT"), "refresh"]
 
@@ -632,6 +1272,7 @@ def test_text_send_uses_bounded_window_enter(monkeypatch: pytest.MonkeyPatch) ->
     backend = object.__new__(Win32WechatTextBackend)
     handle: dict[str, Any] = {"username": USERNAME, "proof_sha256": "proof"}
     backend._text_draft_handle = handle
+    backend._hidden_text_phase = False
     backend._guard = lambda window: int(window)
     calls: list[int] = []
     backend._window_enter = calls.append
@@ -648,10 +1289,10 @@ def test_text_focus_proof_tolerates_database_metadata_changes() -> None:
         "username": USERNAME,
         "proof_sha256": "old-row-hash",
         "text": text,
-        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "delete_press_count": len(text),
+        "approved_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
     backend._text_draft_handle = handle
+    backend._hidden_text_phase = False
     backend._guard = lambda window: int(window)
     backend._refresh = lambda: None
     backend._draft_rows = lambda username: [(1, b"changed-prefix" + text.encode("utf-8"))]
@@ -659,7 +1300,7 @@ def test_text_focus_proof_tolerates_database_metadata_changes() -> None:
     assert backend.focus_state(9001, SimpleNamespace(username=USERNAME)) is FocusState.VERIFIED
 
 
-def test_text_cleanup_uses_exact_bounded_backspaces(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_text_cleanup_uses_select_all_delete_and_database_poll(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
     backend = object.__new__(Win32WechatTextBackend)
     text = "SYNTHETIC_TEXT"
@@ -667,16 +1308,16 @@ def test_text_cleanup_uses_exact_bounded_backspaces(monkeypatch: pytest.MonkeyPa
         "username": USERNAME,
         "proof_sha256": "proof",
         "text": text,
-        "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-        "delete_press_count": len(text),
+        "approved_text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
     }
     backend._text_draft_handle = handle
+    backend._hidden_text_phase = False
     calls: list[object] = []
     rows = [[(1, text.encode("utf-8"))], [(1, b"")]]
     backend._guard = lambda window: int(window)
     backend._focus_input = lambda window: calls.append(("focus", window))
-    backend._window_end = lambda window: calls.append(("end", window))
-    backend._window_backspaces = lambda window, count: calls.append(("backspace", window, count))
+    backend._hotkey = lambda window, modifier, key: calls.append(("hotkey", window, modifier, key))
+    backend._press = lambda window, key: calls.append(("press", window, key))
     backend._refresh = lambda: calls.append("refresh")
     backend._draft_rows = lambda username: rows.pop(0) if len(rows) > 1 else rows[0]
 
@@ -685,8 +1326,518 @@ def test_text_cleanup_uses_exact_bounded_backspaces(monkeypatch: pytest.MonkeyPa
     assert calls == [
         "refresh",
         ("focus", 9001),
-        ("end", 9001),
-        ("backspace", 9001, len(text)),
+        ("hotkey", 9001, win32_attachment_ui.VK_CONTROL, 0x41),
+        ("press", 9001, win32_attachment_ui.VK_DELETE),
         "refresh",
     ]
     assert backend._text_draft_handle is None
+
+
+def test_text_draft_polls_until_exact_route_row_appears(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    backend._text_draft_handle = None
+    backend.hide_text_after_navigation = False
+    backend.draft_timeout_seconds = 1
+    backend.database_poll_seconds = 0
+    backend._guard = lambda window: int(window)
+    backend._focus_input = lambda window: None
+    backend._window_unicode_text = lambda window, text: None
+    refreshes: list[str] = []
+    backend._refresh = lambda: refreshes.append("refresh")
+    rows = [[], [], [(1, b"SYNTHETIC_TEXT")]]
+    backend._draft_rows = lambda username: rows.pop(0)
+    handle: dict[str, Any] = {"username": USERNAME, "proof_sha256": None}
+
+    backend.write_owned_draft(9001, handle, "SYNTHETIC_TEXT")
+
+    assert len(refreshes) == 3
+    assert handle["proof_sha256"]
+
+
+def test_hidden_text_phase_detects_foreground_change() -> None:
+    class User32:
+        foreground = 77
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return False
+
+        @classmethod
+        def GetForegroundWindow(cls) -> int:
+            return cls.foreground
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 10
+            point._obj.y = 20
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    backend._hidden_text_phase = True
+    backend._hidden_foreground_window = 77
+    backend._hidden_last_input_tick = 10
+    backend._hidden_clipboard_sequence = 50
+    backend._last_input_tick = lambda: 10
+    backend._expected_mouse_position = (10, 20)
+    backend._user_interaction_detected = False
+
+    assert backend._guard_text_phase(9001) == 9001
+    User32.foreground = 88
+    with pytest.raises(UiBackendError) as raised:
+        backend._guard_text_phase(9001)
+    assert raised.value.code == "USER_INTERACTION_DETECTED"
+
+
+def test_hidden_text_phase_detects_keyboard_or_clipboard_change() -> None:
+    state = {"last_input": 10, "clipboard": 50}
+
+    class User32:
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return False
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 77
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 10
+            point._obj.y = 20
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return state["clipboard"]
+
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    backend._hidden_text_phase = True
+    backend._hidden_foreground_window = 77
+    backend._hidden_last_input_tick = 10
+    backend._hidden_clipboard_sequence = 50
+    backend._last_input_tick = lambda: state["last_input"]
+    backend._expected_mouse_position = (10, 20)
+    backend._user_interaction_detected = False
+
+    state["last_input"] = 11
+    with pytest.raises(UiBackendError) as input_error:
+        backend._guard_text_phase(9001)
+    assert input_error.value.code == "USER_INTERACTION_DETECTED"
+
+    backend._user_interaction_detected = False
+    state["last_input"] = 10
+    state["clipboard"] = 51
+    with pytest.raises(UiBackendError) as clipboard_error:
+        backend._guard_text_phase(9001)
+    assert clipboard_error.value.code == "USER_INTERACTION_DETECTED"
+
+
+def test_hidden_text_phase_rejects_input_during_hide(monkeypatch: pytest.MonkeyPatch) -> None:
+    state = {"last_input": 10, "clipboard": 50}
+
+    class User32:
+        @staticmethod
+        def ShowWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return False
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 77
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return state["clipboard"]
+
+    def advance_user_input(_: float) -> None:
+        state["last_input"] = 11
+        state["clipboard"] = 51
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", advance_user_input)
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    backend._guard = lambda window: int(window)
+    backend._last_input_tick = lambda: state["last_input"]
+    backend._user_interaction_detected = False
+    backend._hidden_text_phase = False
+    backend._hidden_foreground_window = None
+    backend._hidden_last_input_tick = None
+    backend._hidden_clipboard_sequence = None
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+
+    with pytest.raises(UiBackendError) as raised:
+        backend._enter_hidden_text_phase(9001)
+
+    assert raised.value.code == "USER_INTERACTION_DETECTED"
+    assert backend._hidden_last_input_tick == 10
+    assert backend._hidden_clipboard_sequence == 50
+
+
+def test_hidden_cleanup_focus_failure_is_rehidden_by_environment_restore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[tuple[str, object]] = []
+
+    class User32:
+        visible = False
+
+        @classmethod
+        def ShowWindow(cls, window: object, state: object) -> bool:
+            actions.append(("show", (window, state)))
+            cls.visible = state not in {win32_attachment_ui.SW_HIDE, win32_attachment_ui.SW_MINIMIZE}
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(window: object) -> bool:
+            actions.append(("focus", window))
+            return False
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 10
+
+        @classmethod
+        def IsWindowVisible(cls, _: object) -> bool:
+            return cls.visible
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def SetCursorPos(x: object, y: object) -> bool:
+            actions.append(("mouse", (x, y)))
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False, 7)
+    backend._snapshot = snapshot
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._hidden_text_phase = True
+    backend._hidden_foreground_window = 10
+    backend._hidden_last_input_tick = 7
+    backend._hidden_clipboard_sequence = 50
+    backend._last_input_tick = lambda: 7
+    backend._displayed_wechat_window = None
+    backend._owned_wechat_window = 9001
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {"restore_skipped_user_interaction": False}
+    backend._find_window = lambda *, required: 9001
+    backend._visible_wechat_window_count = lambda: int(User32.visible)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend._restore_visible_text_control(9001)
+    assert raised.value.code == "WECHAT_FOCUS_FAILED"
+    assert backend._hidden_text_phase is True
+    assert User32.visible is True
+
+    backend.restore_environment(snapshot)
+
+    assert User32.visible is False
+    assert ("show", (9001, win32_attachment_ui.SW_HIDE)) in actions
+    assert backend.environment_observation()["restore_skipped_user_interaction"] is False
+
+
+def test_hidden_cleanup_focus_failure_rehides_owned_window_after_user_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actions: list[tuple[str, object]] = []
+    state = {"foreground": 10, "visible": False}
+
+    class User32:
+        @staticmethod
+        def ShowWindow(window: object, show_state: object) -> bool:
+            actions.append(("show", (window, show_state)))
+            state["visible"] = show_state not in {
+                win32_attachment_ui.SW_HIDE,
+                win32_attachment_ui.SW_MINIMIZE,
+            }
+            return True
+
+        @staticmethod
+        def SetForegroundWindow(window: object) -> bool:
+            actions.append(("focus", window))
+            return False
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return state["foreground"]
+
+        @staticmethod
+        def IsWindowVisible(_: object) -> bool:
+            return state["visible"]
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 50
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = User32()
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False, 7)
+    backend._snapshot = snapshot
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._hidden_text_phase = True
+    backend._hidden_foreground_window = 10
+    backend._hidden_last_input_tick = 7
+    backend._hidden_clipboard_sequence = 50
+    backend._last_input_tick = lambda: 7
+    backend._displayed_wechat_window = None
+    backend._owned_wechat_window = 9001
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {"restore_skipped_user_interaction": False}
+    backend._find_window = lambda *, required: 9001
+    backend._visible_wechat_window_count = lambda: int(state["visible"])
+
+    with pytest.raises(UiBackendError) as focus_error:
+        backend._restore_visible_text_control(9001)
+    assert focus_error.value.code == "WECHAT_FOCUS_FAILED"
+    state["foreground"] = 88
+
+    with pytest.raises(UiBackendError) as restore_error:
+        backend.restore_environment(snapshot)
+
+    assert restore_error.value.code == "ENV_RESTORE_SKIPPED_USER_INTERACTION"
+    assert state["visible"] is False
+    assert ("show", (9001, win32_attachment_ui.SW_HIDE)) in actions
+    assert backend.environment_observation()["wechat_window_unwound_after_user_interaction"] is True
+
+
+def test_cf_hdrop_rechecks_owned_clipboard_before_paste(tmp_path: Path) -> None:
+    class User32:
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 9001
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 101
+
+    source = tmp_path / "sample.txt"
+    source.write_text("safe", encoding="utf-8")
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend.attachment_input_mode = "cf_hdrop"
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._snapshot = Win32EnvironmentSnapshot(9001, (1, 2), (), 101, 9001, True, False, 10)
+    backend._focus_input = lambda window: None
+    backend._set_file_clipboard = lambda path: setattr(backend, "_owned_clipboard_sequence", 100)
+    backend._send_inputs = lambda inputs: pytest.fail("changed clipboard must block paste")
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.write_owned_attachment(
+            9001,
+            {"username": USERNAME},
+            SimpleNamespace(username=USERNAME),
+            source,
+        )
+
+    assert raised.value.code == "USER_INTERACTION_DETECTED"
+
+
+def test_cf_hdrop_refuses_to_replace_clipboard_changed_since_snapshot(tmp_path: Path) -> None:
+    class User32:
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+        @staticmethod
+        def GetForegroundWindow() -> int:
+            return 9001
+
+        @staticmethod
+        def GetCursorPos(point: object) -> bool:
+            point._obj.x = 1
+            point._obj.y = 2
+            return True
+
+        @staticmethod
+        def GetClipboardSequenceNumber() -> int:
+            return 60
+
+    source = tmp_path / "sample.txt"
+    source.write_text("safe", encoding="utf-8")
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend.attachment_input_mode = "cf_hdrop"
+    backend._snapshot = Win32EnvironmentSnapshot(9001, (1, 2), (), 50, 9001, True, False, 10)
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._focus_input = lambda window: None
+    backend._set_file_clipboard = lambda path: pytest.fail("changed clipboard must not be replaced")
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.write_owned_attachment(
+            9001,
+            {"username": USERNAME},
+            SimpleNamespace(username=USERNAME),
+            source,
+        )
+
+    assert raised.value.code == "USER_INTERACTION_DETECTED"
+
+
+def test_file_picker_path_does_not_replace_clipboard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+
+    class User32:
+        @staticmethod
+        def GetWindowRect(_: object, rectangle: object) -> bool:
+            rectangle._obj.left = 0
+            rectangle._obj.top = 0
+            rectangle._obj.right = 1000
+            rectangle._obj.bottom = 1000
+            return True
+
+        @staticmethod
+        def SetCursorPos(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def mouse_event(*_: object) -> None:
+            return None
+
+        @staticmethod
+        def SetForegroundWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+    source = tmp_path / "sample.txt"
+    source.write_text("safe", encoding="utf-8")
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._guard = lambda window: int(window)
+    backend._expected_mouse_position = None
+    dialog_results = [[100], []]
+    backend._file_dialogs = lambda window: dialog_results.pop(0)
+    backend._picker_controls = lambda dialog: (101, 102, 103)
+    actions: list[object] = []
+    backend._set_dialog_path = lambda edit, path: actions.append(("path", edit, path))
+    backend._click_control = lambda control: actions.append(("click", control))
+    backend._set_file_clipboard = lambda path: pytest.fail("file picker must not replace clipboard")
+
+    backend._select_file_with_dialog(9001, source)
+
+    assert actions == [("path", 101, source), ("click", 102)]
+
+
+def test_file_picker_error_dialog_is_closed_before_refusal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+
+    class User32:
+        @staticmethod
+        def GetWindowRect(_: object, rectangle: object) -> bool:
+            rectangle._obj.left = 0
+            rectangle._obj.top = 0
+            rectangle._obj.right = 1000
+            rectangle._obj.bottom = 1000
+            return True
+
+        @staticmethod
+        def SetCursorPos(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def mouse_event(*_: object) -> None:
+            return None
+
+        @staticmethod
+        def SetForegroundWindow(*_: object) -> bool:
+            return True
+
+        @staticmethod
+        def IsWindow(_: object) -> bool:
+            return True
+
+    source = tmp_path / "sample.txt"
+    source.write_text("safe", encoding="utf-8")
+    backend = object.__new__(Win32WechatAttachmentBackend)
+    backend.user32 = User32()
+    backend._guard = lambda window: int(window)
+    backend._expected_mouse_position = None
+    dialog_results = [[100], [100, 200]]
+    backend._file_dialogs = lambda window: dialog_results.pop(0)
+    backend._picker_controls = lambda dialog: (101, 102, 103) if dialog == 100 else None
+    backend._set_dialog_path = lambda edit, path: None
+    backend._dialog_control = (
+        lambda dialog, class_name, title="": 201
+        if dialog == 200 and class_name == "Button" and title == "确定"
+        else None
+    )
+    clicked: list[int] = []
+    backend._click_control = clicked.append
+
+    with pytest.raises(UiBackendError) as raised:
+        backend._select_file_with_dialog(9001, source)
+
+    assert raised.value.code == "FILE_PICKER_REJECTED"
+    assert clicked == [102, 201, 103]

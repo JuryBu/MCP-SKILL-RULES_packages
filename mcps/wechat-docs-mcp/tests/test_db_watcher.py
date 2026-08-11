@@ -411,6 +411,27 @@ class DbWatcherTests(unittest.TestCase):
         wake = self.ledger.get_active_wake("route-test")
         self.assertIsNone(wake)
 
+    def test_key_tool_timeout_records_actionable_error(self) -> None:
+        tool = Path(self.temp_dir.name) / "wcdb_key_tool_windows.py"
+        tool.write_text("pass\n", encoding="utf-8")
+        with patch.dict(os.environ, {"WECHAT_KEY_TOOL": str(tool)}), patch(
+            "subprocess.run",
+            side_effect=__import__("subprocess").TimeoutExpired(["python"], 30),
+        ):
+            self.assertFalse(self.watcher.refresh_keys())
+        self.assertEqual("key extraction failed: timeout", self.watcher._last_tool_error)
+
+    def test_decrypt_nonzero_exit_records_return_code_without_output(self) -> None:
+        tool = Path(self.temp_dir.name) / "wcdb_key_tool_windows.py"
+        tool.write_text("pass\n", encoding="utf-8")
+        completed = MagicMock(returncode=7, stdout="private", stderr="private")
+        with patch.dict(os.environ, {"WECHAT_KEY_TOOL": str(tool)}), patch(
+            "subprocess.run",
+            return_value=completed,
+        ):
+            self.assertEqual([], self.watcher.decrypt_changed(["message/message_0.db"]))
+        self.assertEqual("decryption failed: exit code 7", self.watcher._last_tool_error)
+
 
 if __name__ == "__main__":
     unittest.main()

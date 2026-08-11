@@ -26,8 +26,8 @@ class WechatAttachmentDatabaseVerifier:
         decrypted_dir: str | Path,
         refresh_decrypted: Callable[[], None],
         *,
-        timeout_seconds: float = 20.0,
-        poll_interval_seconds: float = 1.0,
+        timeout_seconds: float = 45.0,
+        poll_interval_seconds: float = 2.0,
     ) -> None:
         self.decrypted_dir = Path(decrypted_dir)
         self.refresh_decrypted = refresh_decrypted
@@ -193,8 +193,8 @@ class WechatTextDatabaseVerifier:
         decrypted_dir: str | Path,
         refresh_decrypted: Callable[[], None],
         *,
-        timeout_seconds: float = 20.0,
-        poll_interval_seconds: float = 1.0,
+        timeout_seconds: float = 30.0,
+        poll_interval_seconds: float = 2.0,
     ) -> None:
         self.decrypted_dir = Path(decrypted_dir)
         self.refresh_decrypted = refresh_decrypted
@@ -217,6 +217,11 @@ class WechatTextDatabaseVerifier:
             row = connection.execute(
                 f"SELECT COALESCE(MAX(local_id),0) FROM [{DbObserver._msg_table_name(route.username)}]"
             ).fetchone()
+        except sqlite3.OperationalError as error:
+            raise AttachmentDatabaseVerificationError(
+                "TEXT_OUTBOUND_MESSAGE_TABLE",
+                "目标 route 的文字消息表不可用",
+            ) from error
         finally:
             connection.close()
         return int(row[0])

@@ -172,7 +172,18 @@ def test_server_attachment_and_document_change_interfaces_are_non_sending(
         (start + timedelta(minutes=5)).isoformat()
     )[0]["batch_id"] == batch["batch_id"]
     assert server.tdocs_change_batch_mark_emitted(batch["batch_id"])["state"] == "EMITTED"
-    assert server.wechat_outbound_capabilities()["visible_ui_backend_implemented"] is True
+    capabilities = server.wechat_outbound_capabilities()
+    assert capabilities["visible_ui_backend_implemented"] is True
+    assert capabilities["hidden_after_verified_navigation"] is True
+    assert capabilities["attachment_input_mode"] == "file_picker"
+    assert capabilities["attachment_preferred_input_mode"] == "cf_hdrop_strict_no_window"
+    assert capabilities["attachment_cf_hdrop_candidate"] is True
+    assert capabilities["attachment_cf_hdrop_enabled"] is False
+    assert capabilities["file_picker_fallback_available"] is True
+    assert capabilities["file_picker_fallback_disturbance"] == "low"
+    assert capabilities["attachment_remote_confirmation_required"] is True
+    assert capabilities["complex_clipboard_restore_verified"] is False
+    assert capabilities["no_disturbance_metrics_implemented"] is True
 
 
 def test_official_tool_level_error_does_not_verify_draft(
@@ -243,7 +254,8 @@ def test_outbound_prepare_maps_image_capability_and_rejects_unknown_kind(
 
 
 def test_document_monitor_tools_are_registered() -> None:
-    names = {tool.name for tool in asyncio.run(server.mcp.list_tools())}
+    tools = asyncio.run(server.mcp.list_tools())
+    names = {tool.name for tool in tools}
     assert {
         "tdocs_monitor_create",
         "tdocs_monitors_list",
@@ -267,3 +279,5 @@ def test_document_monitor_tools_are_registered() -> None:
         "wechat_text_send_execute",
     }.issubset(names)
     assert len(names) == 50
+    attachment_verify = next(tool for tool in tools if tool.name == "wechat_attachment_upload_verify")
+    assert set(attachment_verify.input_schema["required"]) == {"draft_id", "remote_confirmation"}

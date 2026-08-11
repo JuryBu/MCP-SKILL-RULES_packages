@@ -27,7 +27,9 @@
 | 附件 | `wechat_attachment_*`、`wechat_read_attachments`、`wechat_read_image`、`wechat_capture_visible_image_preview` | 精确下载、图片/PDF/Office 可视读取、人工辅助视窗预览、上传草稿、受控执行与数据库确认 |
 | 腾讯文档 | `tdocs_*`、`tdocs_monitor_*` | 高频读、官方完整能力入口、allowlist 监视、M:N 批次投递与精确 ACK |
 
-当前源码包含默认关闭的 Windows 可见文字发送后端。它不读取或替换剪贴板；搜索标题必须先在本地联系人库唯一，窗口持续可见且保持前台时才用有超时的同步窗口字符消息写入，输入后必须由 `SessionDraft` 证明草稿属于精确微信 username，按下发送键后还要由消息数据库中唯一的新出站行匹配完整正文和 route 才能成为 `VERIFIED`。隐藏 `WM_CHAR` 发送仍未启用，当前后端也拒绝超过 512 个 UTF-16 单元的长文本。附件执行器仍是独立能力：粘贴后同样要求 `SessionDraft` 证明，发送后匹配文件 MD5、大小和 route；只有当前剪贴板由可逐字节复制的简单全局内存格式组成时才继续，图片、位图、复杂 OLE 或未知格式会在唤醒微信前拒绝。附件开关与文字总开关独立；两个开关缺失、损坏或非布尔时均保持关闭。
+当前源码包含默认关闭的 Windows 文字与附件发送后端。文字发送不读取或替换剪贴板：目标标题必须先在本地联系人库唯一，执行器以可见窗口完成导航并由 `SessionDraft` 证明空草稿属于精确微信 username，之后才允许隐藏该窗口，通过有超时的同步窗口字符消息写入和发送；草稿写入、清理以及发送后的消息数据库确认都有明确截止时间。完全不做可见导航的隐藏发送仍未启用，正文也不能超过 512 个 UTF-16 单元。附件的产品首选候选是使用标准 20 字节 `CF_HDROP` 的严格无窗口路径，但当前仍为 `candidate=true/enabled=false`：尚未同时证明隐藏状态下的精确 route 身份、整个执行期可见窗口数为零、复杂剪贴板语义恢复和接收端真实可下载。当前执行器仅提供标准 `#32770` 文件选择器这一低打扰回退，以控件身份填写一个已校验的普通文件路径且不替换剪贴板；复杂 OLE、多 TYMED、延迟渲染和 helper 退出后的剪贴板恢复均未获证明，因此不会启用隐藏附件路径。附件开关与文字总开关独立；任一开关缺失、损坏或非布尔时均保持关闭。
+
+每次 UI 执行都记录微信可见时长、执行前后可见窗口数、前台焦点、鼠标和剪贴板语义恢复结果；检测到用户在执行期间移动鼠标、切换焦点或更改剪贴板时，恢复会保守停止，避免覆盖用户的新状态。这些前后观测与累计可见时长用于审计，但在没有独立全程采样器时不能单独证明严格无窗口。
 
 `wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。微信 V2 普通图片按 owner account identity 分区使用本机私有 key；旧无归属 key 只有通过精确 DAT 的大小、MD5 和格式验证后才会迁入该账号。解密后的 wxgf 原件完整保留，HEVC 只在私有派生目录中用无窗口 ffmpeg 转成可视 PNG。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终记录 SHA-256；XLSX 只下载原件，不自动分页。
 
@@ -41,7 +43,7 @@ Outbound 只使用以下状态：
 
 `PREPARED → APPROVED → EXECUTING → SEND_ATTEMPTED → VERIFIED`
 
-失败分支是 `FAILED` 或 `UNKNOWN`。文字只有可信数据库解析层明确标记为 outbound 且正文匹配不可变草稿时才能进入 `VERIFIED`；附件则要求发送前 baseline 之后出现唯一的目标 route 出站记录，并匹配附件 MD5 与字节数。UI 只完成到 `SEND_ATTEMPTED`，数据库超时、歧义、窗口恢复失败或结果不明都会进入 `UNKNOWN`，绝不自动重发。
+失败分支是 `FAILED` 或 `UNKNOWN`。文字只有可信数据库解析层明确标记为 outbound、`origin_source=1`，且正文匹配不可变草稿时才能进入 `VERIFIED`。附件的本机数据库只能证明发送尝试后出现了唯一的目标 route 文件记录，并匹配 MD5 与字节数；它仍须取得带用户来源引用的接收端可见且可下载或已下载确认，才能进入 `VERIFIED`。UI 只完成到 `SEND_ATTEMPTED`，数据库超时、歧义、窗口恢复失败、缺少接收端确认或结果不明都会进入 `UNKNOWN`，绝不自动重发。
 
 ## 私有层与安装层
 
