@@ -6,7 +6,56 @@ $startScriptPath = Join-Path $installRoot "Start-CodexMcpBroker.ps1"
 $stopScriptPath = Join-Path $installRoot "Stop-CodexMcpBroker.ps1"
 $testRoot = Join-Path $env:TEMP ("codex-broker-lifecycle-test-" + [guid]::NewGuid())
 $processIds = [System.Collections.Generic.List[int]]::new()
-$nodeExePath = (Get-Command node -ErrorAction Stop).Source
+
+function Resolve-NodeExecutable {
+    $configuredNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
+    if (-not [string]::IsNullOrWhiteSpace([string]$configuredNodeExe)) {
+        $configuredNodeExe = [System.IO.Path]::GetFullPath([string]$configuredNodeExe)
+        if (-not (Test-Path -LiteralPath $configuredNodeExe -PathType Leaf)) {
+            throw "Configured Node executable is missing: $configuredNodeExe"
+        }
+        return [pscustomobject]@{ path = $configuredNodeExe; source = "CODEX_TOOLKIT_NODE_EXE" }
+    }
+
+    $explicitServiceManifest = -not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
+    $serviceManifestPath = if ($explicitServiceManifest) {
+        [string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST
+    } else {
+        Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+    }
+    $serviceManifestPath = [System.IO.Path]::GetFullPath($serviceManifestPath)
+    if (Test-Path -LiteralPath $serviceManifestPath -PathType Leaf) {
+        try {
+            $serviceManifest = Get-Content -LiteralPath $serviceManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $manifestNodeExe = [string]$serviceManifest.broker.nodeExe
+            if ([string]::IsNullOrWhiteSpace($manifestNodeExe)) {
+                throw "Managed broker service manifest does not record broker.nodeExe."
+            }
+            $manifestNodeExe = [System.IO.Path]::GetFullPath($manifestNodeExe)
+            if (-not (Test-Path -LiteralPath $manifestNodeExe -PathType Leaf)) {
+                throw "Managed broker Node executable is missing: $manifestNodeExe"
+            }
+            return [pscustomobject]@{ path = $manifestNodeExe; source = "managed-service-manifest" }
+        } catch {
+            throw "Cannot resolve Node executable from $serviceManifestPath. $($_.Exception.Message)"
+        }
+    }
+    if ($explicitServiceManifest) {
+        throw "Managed broker service manifest is missing: $serviceManifestPath"
+    }
+
+    $pathNodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($pathNodeCommand -and -not [string]::IsNullOrWhiteSpace([string]$pathNodeCommand.Source)) {
+        return [pscustomobject]@{ path = [System.IO.Path]::GetFullPath([string]$pathNodeCommand.Source); source = "PATH" }
+    }
+    throw "Node executable was not found in CODEX_TOOLKIT_NODE_EXE, the managed broker service manifest, or PATH."
+}
+
+$previousNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
+$nodeResolution = Resolve-NodeExecutable
+$nodeExePath = [string]$nodeResolution.path
+[Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $nodeExePath, "Process")
+Write-Output "Codex MCP broker lifecycle Node source: $($nodeResolution.source)"
 
 function Get-Sha256 {
     param([string]$Path)
@@ -246,8 +295,8 @@ try {
     Set-Content -LiteralPath (Join-Path $flatRoot "broker.mjs") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
     Set-Content -LiteralPath (Join-Path $flatRoot "broker.mjs.backup") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
     Set-Content -LiteralPath (Join-Path $flatRoot "decoy.mjs") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
-    $decoyScript = Start-Process -FilePath "node" -ArgumentList @((Join-Path $flatRoot "broker.mjs.backup")) -PassThru -WindowStyle Hidden
-    $decoyArgument = Start-Process -FilePath "node" -ArgumentList @((Join-Path $flatRoot "decoy.mjs"), (Join-Path $flatRoot "broker.mjs")) -PassThru -WindowStyle Hidden
+    $decoyScript = Start-Process -FilePath $nodeExePath -ArgumentList @((Join-Path $flatRoot "broker.mjs.backup")) -PassThru -WindowStyle Hidden
+    $decoyArgument = Start-Process -FilePath $nodeExePath -ArgumentList @((Join-Path $flatRoot "decoy.mjs"), (Join-Path $flatRoot "broker.mjs")) -PassThru -WindowStyle Hidden
     $processIds.Add($decoyScript.Id)
     $processIds.Add($decoyArgument.Id)
     $realPid = Start-FlatBroker -Root $flatRoot
@@ -557,4 +606,5 @@ server.listen(port, "127.0.0.1", () => {
         }
     }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+    [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $previousNodeExe, "Process")
 }

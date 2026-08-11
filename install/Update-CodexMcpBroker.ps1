@@ -503,7 +503,17 @@ foreach ($ScriptPath in @($SourceStopScript, $SourceStartScript)) {
 
 Push-Location $SourceBrokerRoot
 try {
-    $ValidationNodeExe = if ($ManagedNodeExe) { $ManagedNodeExe } else { "node" }
+    $ConfiguredNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
+    $ValidationNodeExe = if ($ManagedNodeExe) {
+        $ManagedNodeExe
+    } elseif (-not [string]::IsNullOrWhiteSpace([string]$ConfiguredNodeExe)) {
+        [System.IO.Path]::GetFullPath([string]$ConfiguredNodeExe)
+    } else {
+        "node"
+    }
+    if ([System.IO.Path]::IsPathRooted($ValidationNodeExe) -and -not (Test-Path -LiteralPath $ValidationNodeExe -PathType Leaf)) {
+        throw "Configured Node executable is missing: $ValidationNodeExe"
+    }
     & $ValidationNodeExe --check $SourceBrokerPath
     if ($LASTEXITCODE -ne 0) { throw "Source broker syntax validation failed." }
     & $ValidationNodeExe --check $SourceEndpointConfigPath
