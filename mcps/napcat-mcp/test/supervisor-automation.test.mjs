@@ -7,6 +7,46 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { parseArguments, runSupervisorService } from "../src/supervisor-runner.mjs";
 
+const syncWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
+
+function waitSync(milliseconds) {
+  Atomics.wait(syncWaitBuffer, 0, 0, milliseconds);
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function waitForJsonFile(filePath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  do {
+    if (fs.existsSync(filePath)) {
+      try {
+        return readJson(filePath);
+      } catch {
+      }
+    }
+    waitSync(25);
+  } while (Date.now() < deadline);
+  return null;
+}
+
+function terminateProcessTreeAndWait(pid, timeoutMs = 5_000) {
+  if (!isProcessAlive(pid)) return;
+  spawnSync("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  const deadline = Date.now() + timeoutMs;
+  while (isProcessAlive(pid) && Date.now() < deadline) waitSync(25);
+  if (isProcessAlive(pid)) throw new Error(`Timed out waiting for test process tree to exit: PID ${pid}`);
+}
+
 function createFixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-supervisor-automation-test-"));
   const fixture = {
@@ -142,12 +182,10 @@ test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 
 
   t.after(() => {
     for (const pid of startedPids) {
-      try {
-        process.kill(pid);
-      } catch {
-      }
+      terminateProcessTreeAndWait(pid);
     }
     fs.rmSync(root, { recursive: true, force: true });
+    assert.equal(fs.existsSync(root), false, "manifest regression TEMP root must be removed");
   });
 
   fs.mkdirSync(opsRoot, { recursive: true });
@@ -230,8 +268,10 @@ test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 
         windowsHide: true,
       },
     );
-    if (fs.existsSync(runtimeStatePath)) {
-      startedPids.add(readJson(runtimeStatePath).pid);
+    if (result.status === 0) {
+      const runtimeState = waitForJsonFile(runtimeStatePath, 3_000);
+      assert.ok(runtimeState?.pid, `successful supervisor start did not publish a PID: ${runtimeStatePath}`);
+      startedPids.add(runtimeState.pid);
     }
     return { result, capturePath };
   }
