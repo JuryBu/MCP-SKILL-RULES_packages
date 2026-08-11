@@ -25,8 +25,8 @@
 | `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
-| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | Windows 文字发送开关；仅在私有 route/policy、授权链、可见导航与真实数据库确认均通过后启用 |
-| `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | Windows 附件发送开关；只在私有 route/policy、低打扰文件选择器实测、环境恢复和接收端确认流程均通过后启用；严格无窗口 `CF_HDROP` 候选另行保持禁用 |
+| `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时文字发送 gate，避免 broker 环境残留覆盖私有关闭状态 |
+| `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时附件发送 gate |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
 | `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |
 | `WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256` | 空 | 私有 enrollment 已核验的当前账号身份哈希；缺失或与 route 不符时禁止进程扫描并返回 `WAITING_FOR_KEY` |
@@ -38,6 +38,8 @@
 | `WECHAT_DOCS_MCP_IMAGE_KEY_FILE` | `<data_root>/secrets/wechat-image-v2.json` | 旧版无账号归属 key 的兼容候选；只有通过当前精确 DAT 验证后才迁入分账号目录 |
 | `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
 | `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
+
+0.6.1 起，微信真实发送只读取 `<data_root>/config/service-runtime.json` 中的 `outboundWeChatEnabled` 与 `attachmentOutboundWeChatEnabled`。MCP 在状态查询、能力查询和每次执行发送前都会重新读取该私有文件；文件缺失、损坏、字段缺失或字段不是布尔值时一律关闭。`wechat_outbound_capabilities.active_execution_count` 报告仍持有发送租约的微信执行；关闭脚本必须先关闭动态 gate，再等待该计数归零后才能报告完成。route policy、草稿批准、授权引用、dedupe 与数据库确认仍是独立硬门，动态 gate 不会自动执行或重试既有草稿。
 
 `wechat_outbound_capabilities` 会分别报告严格无窗口附件候选、当前是否启用、低打扰文件选择器回退、复杂剪贴板恢复和接收端确认要求。执行审计中的 `wechat_visible_duration_ms`、前后可见窗口数、前台焦点、鼠标和剪贴板字段用于衡量干扰程度；没有全程采样证据时，不能仅凭前后窗口数都为零宣称严格无窗口。
 
@@ -186,7 +188,10 @@ wechat_status()
 | `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
 | `wake_last_attempt_time` | 最近一次提交尝试时间 |
 | `tdocs_monitoring` | 文档 monitor/subscription/pending/wake 计数、后台线程、失败次数和文档 wake 状态；不含资源 ID 或正文 |
-| `outbound_enabled` | 微信真实发送总开关；不代表 route、草稿、数据库或接收端确认已通过 |
+| `outbound_enabled` | 文字或附件动态 gate 任一开启时为 true；不代表 route、草稿、数据库或接收端确认已通过 |
+| `outbound_text_enabled` | 私有运行文件中的动态文字发送 gate |
+| `attachment_outbound_enabled` | 私有运行文件中的动态附件发送 gate |
+| `runtime_gate_mode` | 动态 gate 的 fail-closed 读取模式 |
 
 ### 5.1 健康判断
 

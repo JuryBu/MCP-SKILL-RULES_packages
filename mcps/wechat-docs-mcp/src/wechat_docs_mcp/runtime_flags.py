@@ -35,3 +35,15 @@ def resolve_private_runtime_flag(
         return False
     value = document.get(config_key)
     return value if isinstance(value, bool) else False
+
+
+def resolve_private_runtime_gate(data_root: Path, config_key: str) -> bool:
+    runtime_path = data_root / "config" / "service-runtime.json"
+    try:
+        document = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(document, dict):
+        return False
+    value = document.get(config_key)
+    return value if isinstance(value, bool) else False

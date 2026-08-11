@@ -26,7 +26,7 @@ from .ledger import EventLedger, LedgerError
 from .outbound import SafeTextOutbound
 from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
-from .runtime_flags import resolve_private_runtime_flag
+from .runtime_flags import resolve_private_runtime_gate
 from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
 from .wechat_attachment_source import WechatAttachmentSourceResolver
@@ -93,16 +93,14 @@ IMAGE_VIEWER_TITLES = tuple(
     if title.strip()
 )
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
-OUTBOUND_ENABLED = resolve_private_runtime_flag(
-    DATA_ROOT,
-    "outboundWeChatEnabled",
-    "WECHAT_DOCS_MCP_OUTBOUND_ENABLED",
-)
-ATTACHMENT_OUTBOUND_ENABLED = resolve_private_runtime_flag(
-    DATA_ROOT,
-    "attachmentOutboundWeChatEnabled",
-    "WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED",
-)
+
+
+def outbound_runtime_enabled() -> bool:
+    return resolve_private_runtime_gate(DATA_ROOT, "outboundWeChatEnabled")
+
+
+def attachment_outbound_runtime_enabled() -> bool:
+    return resolve_private_runtime_gate(DATA_ROOT, "attachmentOutboundWeChatEnabled")
 _WAKE_RUNTIME_RAW = os.environ.get("CODEX_WAKE_PROXY_RUNTIME_FILE", "")
 _WAKE_TOKEN_RAW = os.environ.get("CODEX_WAKE_PROXY_TOKEN_FILE", "")
 WAKE_RUNTIME_FILE = Path(_WAKE_RUNTIME_RAW) if _WAKE_RUNTIME_RAW else None
@@ -179,6 +177,7 @@ def attachment_outbound_sender(event_ledger: EventLedger) -> SafeAttachmentOutbo
         Win32WechatAttachmentBackend(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
         WechatAttachmentDatabaseVerifier(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
         ATTACHMENT_UPLOAD_ROOT,
+        attachment_outbound_runtime_enabled,
     )
 
 
@@ -188,6 +187,7 @@ def text_outbound_sender(event_ledger: EventLedger) -> SafeTextOutbound:
         PrivateBindingRouteVerifier(_load_binding_document()),
         Win32WechatTextBackend(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
         WechatTextDatabaseVerifier(DECRYPTED_DIR, _refresh_decrypted_for_outbound),
+        outbound_runtime_enabled,
     )
 
 
@@ -353,6 +353,8 @@ def _submit_pending_tdocs_wakes() -> dict[str, Any]:
 def wechat_status() -> dict[str, Any]:
     """Return private bridge readiness without exposing account names, routes, messages, or tokens."""
     token_ready = TOKEN_FILE.is_file() and TOKEN_FILE.stat().st_size > 0
+    text_outbound_enabled = outbound_runtime_enabled()
+    attachment_outbound_enabled = attachment_outbound_runtime_enabled()
     bindings = _load_bindings()
     event_ledger = ledger()
     w = watcher()
@@ -406,7 +408,10 @@ def wechat_status() -> dict[str, Any]:
             "wake_notifier_error": tdocs_wake_last_error or docs_notifier_status["error_code"],
             "wake_last_attempt_time": tdocs_wake_last_attempt_time,
         },
-        "outbound_enabled": OUTBOUND_ENABLED,
+        "outbound_enabled": text_outbound_enabled or attachment_outbound_enabled,
+        "outbound_text_enabled": text_outbound_enabled,
+        "attachment_outbound_enabled": attachment_outbound_enabled,
+        "runtime_gate_mode": "private_file_dynamic_fail_closed",
         "wxautox4_runtime": "not_verified",
         "napcat_runtime_modified": False,
     }
@@ -648,10 +653,15 @@ def outbound_verify_observed(draft_id: str, observed_event_id: str) -> dict[str,
 @mcp.tool()
 def wechat_outbound_capabilities() -> dict[str, Any]:
     """Describe the current outbound implementation without touching the WeChat UI."""
+    text_enabled = outbound_runtime_enabled()
+    attachment_enabled = attachment_outbound_runtime_enabled()
+    active_execution_count = ledger().count_active_wechat_executions()
     return {
-        "production_enabled": OUTBOUND_ENABLED or ATTACHMENT_OUTBOUND_ENABLED,
-        "configured_enabled": OUTBOUND_ENABLED,
-        "attachment_configured_enabled": ATTACHMENT_OUTBOUND_ENABLED,
+        "production_enabled": text_enabled or attachment_enabled,
+        "configured_enabled": text_enabled,
+        "attachment_configured_enabled": attachment_enabled,
+        "active_execution_count": active_execution_count,
+        "runtime_gate_mode": "private_file_dynamic_fail_closed",
         "visible_ui_backend_implemented": True,
         "text_skeleton_available": True,
         "text_visible_ui_backend_implemented": True,
@@ -682,7 +692,7 @@ def wechat_text_send_execute(
     lease_seconds: int = 90,
 ) -> dict[str, Any]:
     """Execute one approved text draft; only a unique database row can become VERIFIED."""
-    if not OUTBOUND_ENABLED:
+    if not outbound_runtime_enabled():
         raise LedgerError("OUTBOUND_DISABLED", "文字 outbound 未在本机私有运行配置中启用")
     if not 30 <= lease_seconds <= 180:
         raise ValueError("lease_seconds must be between 30 and 180")
@@ -839,7 +849,7 @@ def wechat_attachment_upload_execute(
     lease_seconds: int = 90,
 ) -> dict[str, Any]:
     """Execute one approved attachment draft; UNKNOWN is never retried automatically."""
-    if not ATTACHMENT_OUTBOUND_ENABLED:
+    if not attachment_outbound_runtime_enabled():
         raise LedgerError("ATTACHMENT_OUTBOUND_DISABLED", "附件 outbound 未在本机私有运行配置中启用")
     if not 30 <= lease_seconds <= 180:
         raise ValueError("lease_seconds must be between 30 and 180")

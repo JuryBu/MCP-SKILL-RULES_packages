@@ -4,7 +4,7 @@ import hashlib
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .outbound import (
     FocusState,
@@ -121,12 +121,21 @@ class SafeAttachmentOutbound:
         backend: AttachmentUiBackend,
         database_verifier: AttachmentDatabaseVerifier,
         upload_root: str | Path,
+        execution_gate: Callable[[], bool] | None = None,
     ) -> None:
         self._ledger = ledger
         self._route_verifier = route_verifier
         self._backend = backend
         self._database_verifier = database_verifier
         self._upload_root = Path(upload_root).resolve()
+        self._execution_gate = execution_gate
+
+    def _require_execution_gate(self) -> None:
+        if self._execution_gate is not None and not self._execution_gate():
+            raise OutboundRefused(
+                "ATTACHMENT_OUTBOUND_DISABLED",
+                "附件 outbound 动态 gate 已关闭",
+            )
 
     @staticmethod
     def _sha256(path: Path) -> str:
@@ -222,6 +231,7 @@ class SafeAttachmentOutbound:
         local_observation: dict[str, Any] | None = None
 
         try:
+            self._require_execution_gate()
             baseline_local_id = self._database_verifier.baseline(route)
             snapshot = self._backend.snapshot_environment()
         except Exception as error:
@@ -238,6 +248,7 @@ class SafeAttachmentOutbound:
                 self._backend.write_owned_attachment(window, draft_handle, route, source)
                 if not self._focus_is_verified(self._backend.focus_state(window, draft_handle, route)):
                     raise UiBackendError("ATTACHMENT_DRAFT_ROUTE_UNVERIFIED", "附件草稿无法证明属于目标 route")
+                self._require_execution_gate()
                 send_action_invoked = True
                 try:
                     self._backend.send_owned_attachment(window, draft_handle)

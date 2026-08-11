@@ -4,7 +4,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .route_verifier import RouteVerifier, VerifiedRoute
 
@@ -143,11 +143,17 @@ class SafeTextOutbound:
         route_verifier: RouteVerifier,
         backend: VisibleUiBackend,
         database_verifier: TextDatabaseVerifier | None = None,
+        execution_gate: Callable[[], bool] | None = None,
     ) -> None:
         self._ledger = ledger
         self._route_verifier = route_verifier
         self._backend = backend
         self._database_verifier = database_verifier
+        self._execution_gate = execution_gate
+
+    def _require_execution_gate(self) -> None:
+        if self._execution_gate is not None and not self._execution_gate():
+            raise OutboundRefused("OUTBOUND_DISABLED", "文字 outbound 动态 gate 已关闭")
 
     @staticmethod
     def _validate_payload(payload: Mapping[str, Any]) -> str:
@@ -219,6 +225,7 @@ class SafeTextOutbound:
         database_observation: dict[str, Any] | None = None
 
         try:
+            self._require_execution_gate()
             if self._database_verifier is not None:
                 baseline_local_id = self._database_verifier.baseline(verified_route)
             snapshot = self._backend.snapshot_environment()
@@ -235,6 +242,7 @@ class SafeTextOutbound:
                 self._require_verified_focus(window, verified_route)
                 self._backend.write_owned_draft(window, draft_handle, text)
                 self._require_verified_focus(window, verified_route)
+                self._require_execution_gate()
                 send_action_invoked = True
                 try:
                     self._backend.send_owned_draft(window, draft_handle)
@@ -258,6 +266,8 @@ class SafeTextOutbound:
                     except Exception as error:
                         error_code = getattr(error, "code", "TEXT_DATABASE_CONFIRMATION_FAILED")
                         state = OutboundState.UNKNOWN
+            except OutboundRefused as error:
+                error_code = error.code
             except UiBackendError as error:
                 error_code = error.code
                 if send_may_have_occurred or error.send_may_have_occurred:

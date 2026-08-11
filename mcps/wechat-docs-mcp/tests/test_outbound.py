@@ -231,12 +231,14 @@ def sender(
     ledger: FakeLedger,
     backend: FakeBackend,
     database_verifier: FakeDatabaseVerifier | None = None,
+    execution_gate=None,
 ) -> SafeTextOutbound:
     return SafeTextOutbound(
         ledger,
         PrivateBindingRouteVerifier(binding()),
         backend,
         database_verifier,
+        execution_gate,
     )
 
 
@@ -324,6 +326,28 @@ class SafeTextOutboundTests(unittest.TestCase):
         self.assertEqual(OutboundState.SEND_ATTEMPTED, result.state)
         self.assertNotEqual(OutboundState.VERIFIED, result.state)
         self.assertEqual(OutboundState.SEND_ATTEMPTED.value, ledger.storage.finishes[-1]["state"])
+
+    def test_runtime_gate_closing_before_send_cleans_draft_without_sending(self) -> None:
+        ledger = FakeLedger()
+        backend = FakeBackend()
+        gate_states = iter([True, False])
+
+        result = execute(
+            sender(
+                ledger,
+                backend,
+                FakeDatabaseVerifier(),
+                lambda: next(gate_states),
+            )
+        )
+
+        self.assertEqual(OutboundState.FAILED, result.state)
+        self.assertEqual("OUTBOUND_DISABLED", result.error_code)
+        self.assertFalse(result.send_action_invoked)
+        self.assertIn("write", backend.keyboard_actions)
+        self.assertIn("clear", backend.keyboard_actions)
+        self.assertNotIn("send", backend.keyboard_actions)
+        self.assertTrue(result.restore_succeeded)
 
     def test_unique_database_confirmation_promotes_send_to_verified(self) -> None:
         ledger = FakeLedger()

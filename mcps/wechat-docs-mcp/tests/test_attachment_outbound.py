@@ -228,6 +228,7 @@ def _sender(
     backend: FakeBackend,
     verifier: FakeDatabaseVerifier,
     upload_root: Path,
+    execution_gate=None,
 ):
     return SafeAttachmentOutbound(
         ledger,
@@ -235,6 +236,7 @@ def _sender(
         backend,
         verifier,
         upload_root,
+        execution_gate,
     )
 
 
@@ -263,6 +265,34 @@ def test_attachment_send_requires_remote_confirmation_after_database_proof(tmp_p
         prepared["transfer"]["transfer_id"]
     )
     assert transfer["state"] != "VERIFIED"
+
+
+def test_attachment_runtime_gate_closing_before_send_cleans_draft(tmp_path: Path) -> None:
+    ledger, prepared, payload = _prepared(tmp_path)
+    backend = FakeBackend()
+    gate_states = iter([True, False])
+
+    result = _sender(
+        ledger,
+        backend,
+        FakeDatabaseVerifier(),
+        tmp_path / "upload",
+        lambda: next(gate_states),
+    ).execute(
+        draft_id=prepared["draft"]["draft_id"],
+        payload=payload,
+        dedupe_key="dedupe-upload",
+        lease_expires_at="2099-01-01T00:00:00+00:00",
+        execution_id="execution-a",
+    )
+
+    assert result.state is OutboundState.FAILED
+    assert result.error_code == "ATTACHMENT_OUTBOUND_DISABLED"
+    assert result.send_action_invoked is False
+    assert "write" in backend.calls
+    assert "clear" in backend.calls
+    assert "send" not in backend.calls
+    assert result.restore_succeeded is True
 
 
 def test_attachment_database_confirmation_precedes_environment_restore(tmp_path: Path) -> None:

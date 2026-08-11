@@ -311,6 +311,27 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual("SEND_LEASE_BUSY", raised.exception.code)
         self.assertEqual("APPROVED", self.ledger.get_draft(second["draft_id"])["state"])
 
+    def test_active_wechat_execution_count_tracks_drain(self) -> None:
+        draft, payload = self.approved_wechat_draft("active", "dedupe-active")
+        self.assertEqual(0, self.ledger.count_active_wechat_executions())
+
+        self.ledger.acquire_draft_execution(
+            draft["draft_id"],
+            payload,
+            "dedupe-active",
+            "execution-active",
+            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(),
+        )
+        self.assertEqual(1, self.ledger.count_active_wechat_executions())
+
+        self.ledger.finish_draft_execution(
+            draft["draft_id"],
+            "execution-active",
+            "FAILED",
+            error_code="SYNTHETIC_FAILURE",
+        )
+        self.assertEqual(0, self.ledger.count_active_wechat_executions())
+
     def test_expired_legacy_wechat_lease_is_recovered_atomically_before_acquire(self) -> None:
         first, first_payload = self.approved_wechat_draft("first", "dedupe-first")
         second, second_payload = self.approved_wechat_draft("second", "dedupe-second")

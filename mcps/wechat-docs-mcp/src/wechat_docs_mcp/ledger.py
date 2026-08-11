@@ -1451,6 +1451,19 @@ class EventLedger:
                 raise LedgerError("DRAFT_STATE_CONFLICT", "draft 执行租约不存在或已结束")
         return self.get_draft(draft_id)
 
+    def count_active_wechat_executions(self) -> int:
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) FROM outbound_drafts
+                WHERE state='EXECUTING' AND kind LIKE 'wechat_%'
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        return int(row[0])
+
     def recover_expired_executions(self, called_at: str | None = None) -> list[str]:
         now = _parse_datetime(called_at or utc_now()).astimezone(timezone.utc)
         now_iso = now.isoformat()

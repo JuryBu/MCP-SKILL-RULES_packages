@@ -173,6 +173,10 @@ def test_server_attachment_and_document_change_interfaces_are_non_sending(
     )[0]["batch_id"] == batch["batch_id"]
     assert server.tdocs_change_batch_mark_emitted(batch["batch_id"])["state"] == "EMITTED"
     capabilities = server.wechat_outbound_capabilities()
+    assert capabilities["runtime_gate_mode"] == "private_file_dynamic_fail_closed"
+    assert capabilities["configured_enabled"] is False
+    assert capabilities["attachment_configured_enabled"] is False
+    assert capabilities["active_execution_count"] == 0
     assert capabilities["visible_ui_backend_implemented"] is True
     assert capabilities["hidden_after_verified_navigation"] is True
     assert capabilities["attachment_input_mode"] == "file_picker"
@@ -184,6 +188,21 @@ def test_server_attachment_and_document_change_interfaces_are_non_sending(
     assert capabilities["attachment_remote_confirmation_required"] is True
     assert capabilities["complex_clipboard_restore_verified"] is False
     assert capabilities["no_disturbance_metrics_implemented"] is True
+
+
+def test_wechat_status_reports_attachment_only_gate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    configure_private_layer(monkeypatch, tmp_path)
+    monkeypatch.setattr(server, "outbound_runtime_enabled", lambda: False)
+    monkeypatch.setattr(server, "attachment_outbound_runtime_enabled", lambda: True)
+
+    status = server.wechat_status()
+
+    assert status["outbound_enabled"] is True
+    assert status["outbound_text_enabled"] is False
+    assert status["attachment_outbound_enabled"] is True
+    assert status["runtime_gate_mode"] == "private_file_dynamic_fail_closed"
 
 
 def test_official_tool_level_error_does_not_verify_draft(

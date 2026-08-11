@@ -7,8 +7,12 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from wechat_docs_mcp.runtime_flags import resolve_private_runtime_flag
+from wechat_docs_mcp.runtime_flags import (
+    resolve_private_runtime_flag,
+    resolve_private_runtime_gate,
+)
 
 
 class PrivateRuntimeFlagTests(unittest.TestCase):
@@ -30,22 +34,27 @@ class PrivateRuntimeFlagTests(unittest.TestCase):
             self.write_runtime(root, True)
             self.assertTrue(self.resolve(root, {}))
 
-    def test_server_import_consumes_private_runtime_file(self) -> None:
+    def test_server_reads_private_runtime_gate_without_reimport(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
-            self.write_runtime(root, True)
+            self.write_runtime(root, False)
             environment = os.environ.copy()
             environment["WECHAT_DOCS_MCP_DATA_ROOT"] = str(root)
-            environment.pop("WECHAT_DOCS_MCP_OUTBOUND_ENABLED", None)
-            environment.pop("WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED", None)
             result = subprocess.run(
                 [
                     sys.executable,
                     "-c",
                     (
+                        "import json; "
+                        "from pathlib import Path; "
                         "from wechat_docs_mcp.server import "
-                        "ATTACHMENT_OUTBOUND_ENABLED, OUTBOUND_ENABLED; "
-                        "print(OUTBOUND_ENABLED, ATTACHMENT_OUTBOUND_ENABLED)"
+                        "attachment_outbound_runtime_enabled, outbound_runtime_enabled; "
+                        "root=Path(r'" + str(root) + "'); "
+                        "path=root/'config'/'service-runtime.json'; "
+                        "print(outbound_runtime_enabled(), attachment_outbound_runtime_enabled()); "
+                        "path.write_text(json.dumps({'outboundWeChatEnabled': True, "
+                        "'attachmentOutboundWeChatEnabled': False}), encoding='utf-8'); "
+                        "print(outbound_runtime_enabled(), attachment_outbound_runtime_enabled())"
                     ),
                 ],
                 env=environment,
@@ -56,7 +65,39 @@ class PrivateRuntimeFlagTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(0, result.returncode, result.stderr)
-            self.assertEqual("True True", result.stdout.strip())
+            self.assertEqual(["False False", "True False"], result.stdout.splitlines())
+
+    def test_dynamic_gate_ignores_stale_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.write_runtime(root, True)
+            with mock.patch.dict(
+                os.environ,
+                {"WECHAT_DOCS_MCP_OUTBOUND_ENABLED": "0"},
+            ):
+                self.assertTrue(
+                    resolve_private_runtime_gate(root, "outboundWeChatEnabled")
+                )
+
+    def test_dynamic_gate_missing_malformed_and_non_boolean_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self.assertFalse(
+                resolve_private_runtime_gate(root, "outboundWeChatEnabled")
+            )
+            runtime_path = root / "config" / "service-runtime.json"
+            runtime_path.parent.mkdir(parents=True)
+            runtime_path.write_text("{invalid", encoding="utf-8")
+            self.assertFalse(
+                resolve_private_runtime_gate(root, "outboundWeChatEnabled")
+            )
+            runtime_path.write_text(
+                json.dumps({"outboundWeChatEnabled": "true"}),
+                encoding="utf-8",
+            )
+            self.assertFalse(
+                resolve_private_runtime_gate(root, "outboundWeChatEnabled")
+            )
 
     def test_missing_malformed_and_non_boolean_values_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
