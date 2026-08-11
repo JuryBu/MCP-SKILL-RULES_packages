@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { canonicalMachineRole } from "./machine-role.mjs";
+import { createStaleSentWakeRearmPlan } from "./stale-sent-wake-rearm.mjs";
 
 const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_WAKE_LEASE_MS = 30_000;
@@ -1031,6 +1032,88 @@ class TaskRegistry {
       refreshLegacyWakeFields(task);
       if (!changed) return { changed: false, value: clonePublicTask(task) };
       task.updatedAt = resolveNow(this.now, input).toISOString();
+      return { changed: true, value: clonePublicTask(task) };
+    });
+  }
+
+  rearmStaleSentWakes(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const taskId = parseTaskId(input);
+    const newWakeId = requiredString(input.newWakeId, "newWakeId");
+    const promptSha256 = requiredString(input.promptSha256, "promptSha256");
+    return this.#write((state) => {
+      const task = this.#requireTask(state, taskId);
+      requireGenerationMatch(task, input);
+      const now = resolveNow(this.now, input).toISOString();
+      const plan = createStaleSentWakeRearmPlan({
+        state,
+        taskId,
+        expectedGeneration: input.expectedGeneration,
+        expectedConversationId: requiredString(input.expectedConversationId, "expectedConversationId"),
+        expectedPendingSeqs: parseSequenceList(input.expectedPendingSeqs, "expectedPendingSeqs"),
+        expectedActiveWakeIds: input.expectedActiveWakeIds.map((wakeId) => requiredString(wakeId, "expectedActiveWakeIds")),
+        expectedLatestWakeId: requiredString(input.expectedLatestWakeId, "expectedLatestWakeId"),
+        preparedAt: input.preparedAt ?? now,
+      });
+      if (task.wakeBatches.some((wake) => wake.wakeId === newWakeId)) {
+        throw new TaskRegistryError("WAKE_ID_CONFLICT", `新的 wake_id 已存在：${newWakeId}`, { taskId, newWakeId });
+      }
+      plan.apply(state, now);
+      const nextTask = state.tasks[taskId];
+      const boundary = plan.before.pending.at(-1);
+      nextTask.wakeBatches.push({
+        wakeId: newWakeId,
+        messageSeqs: plan.expectedPendingSeqs,
+        messageTimes: plan.before.pending.map((message) => message.messageAt),
+        boundaryMessageSeq: boundary.messageSeq,
+        boundaryMessageAt: boundary.messageAt,
+        leaseStartedAt: now,
+        sentAt: null,
+        promptSha256,
+        status: "leased",
+        acknowledgedSeqs: [],
+        legacy: false,
+      });
+      refreshLegacyWakeFields(nextTask);
+      return {
+        changed: true,
+        value: {
+          task: clonePublicTask(nextTask),
+          archivedWakes: plan.archivedWakes,
+          rollback: plan.rollback,
+          wakeId: newWakeId,
+          wakeSentAt: now,
+        },
+      };
+    });
+  }
+
+  rollbackStaleSentWakeRearm(input) {
+    if (!isPlainObject(input) || !isPlainObject(input.rollback)) invalidArgument("rollback 必须是对象");
+    const taskId = parseTaskId(input);
+    const newWakeId = requiredString(input.newWakeId, "newWakeId");
+    const expectedPendingSeqs = parseSequenceList(input.expectedPendingSeqs, "expectedPendingSeqs");
+    return this.#write((state) => {
+      const task = this.#requireTask(state, taskId);
+      requireGenerationMatch(task, input);
+      const currentPending = task.messageLedger.filter((message) => message.status === "pending").map((message) => message.messageSeq);
+      if (currentPending.length !== expectedPendingSeqs.length || currentPending.some((sequence, index) => sequence !== expectedPendingSeqs[index])) {
+        throw new TaskRegistryError("REARM_ROLLBACK_BLOCKED", "pending 消息已变化，不能回滚重唤醒", { currentPending, expectedPendingSeqs });
+      }
+      const currentActive = task.wakeBatches.filter((wake) => wake.status !== "complete");
+      if (currentActive.length !== 1 || currentActive[0].wakeId !== newWakeId || currentActive[0].status !== "leased") {
+        throw new TaskRegistryError("REARM_ROLLBACK_BLOCKED", "新 wake 已不再是唯一未发送租约，不能回滚", {
+          activeWakes: currentActive.map((wake) => ({ wakeId: wake.wakeId, status: wake.status })),
+        });
+      }
+      const reminderMap = new Map(input.rollback.reminders.map((item) => [item.messageSeq, item.lastRemindedAt]));
+      task.wakeBatches = input.rollback.wakeBatches;
+      for (const message of task.messageLedger) {
+        if (reminderMap.has(message.messageSeq)) message.lastRemindedAt = reminderMap.get(message.messageSeq);
+      }
+      for (const field of ["wakePending", "wakeSentAt", "wakeMessageSeq", "wakeMessageAt", "activeWakeId", "wakePromptSha256", "lastWakeAt", "updatedAt"]) {
+        task[field] = input.rollback[field];
+      }
       return { changed: true, value: clonePublicTask(task) };
     });
   }

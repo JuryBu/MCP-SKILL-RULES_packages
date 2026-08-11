@@ -78,6 +78,8 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 每次唤醒携带 `wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack` 回传当前 generation、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
 
+生产对话已经长期空闲、但旧版留下多批 `sent` 唤醒且待处理消息仍不能判定完成时，只能使用 `ops/rearm-stale-sent-wake.mjs` 做受控重新提醒。先用 `--prepare` 固定 registry/dedupe/router log 哈希、任务绑定、精确 pending 与 wake 身份，再在确认对话空闲和业务进程为 0 后用 `--execute`；脚本会备份三文件、归档旧 wake、保持消息与 ACK 状态不变，并向同一对话注入恰好一个随机新 `wake_id`。任一身份或文件漂移都会拒绝执行，注入失败则恢复备份；禁止用它代 ACK、清 pending、换 generation 或启动新业务。
+
 `napcat_task_close` 不再接受无条件关闭：调用方必须确认本地没有 pending/active wake、对端已经完成最终交接，并明确这是最终关闭，或给出已经登记、方向兼容且双方握手成功的 `successor_task_id`。任务迁移固定采用「两端先登记后继任务并互发握手 → 验证新路由 → 再关闭旧任务」的顺序；关闭后的任务不会继续扫描或唤醒，不能把先关旧任务当成建新连接的捷径。
 
 ## 送达回执、重连请求与主人通知

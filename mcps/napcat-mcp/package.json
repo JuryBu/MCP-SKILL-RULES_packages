@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "check": "node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs && node --check src/task-registry.mjs && node --check src/control-state.mjs && node --check src/machine-role.mjs && node --check src/control-plane.mjs && node --check src/task-router.mjs && node --check src/task-router-controller.mjs && node --check src/task-router-runner.mjs && node --check src/codex-thread-bridge.mjs && node --check src/codex-app-server-proxy.mjs && node --check src/codex-app-server-proxy-runner.mjs && node --check src/supervisor-runner.mjs",
+    "check": "node --check src/core.mjs && node --check src/index.mjs && node --check src/heartbeat.mjs && node --check src/heartbeat-runner.mjs && node --check src/task-registry.mjs && node --check src/control-state.mjs && node --check src/machine-role.mjs && node --check src/control-plane.mjs && node --check src/task-router.mjs && node --check src/task-router-controller.mjs && node --check src/task-router-runner.mjs && node --check src/codex-thread-bridge.mjs && node --check src/codex-app-server-proxy.mjs && node --check src/codex-app-server-proxy-runner.mjs && node --check src/supervisor-runner.mjs && node --check src/stale-sent-wake-rearm.mjs && node --check ops/rearm-stale-sent-wake.mjs",
     "test": "node --test --test-concurrency=2 test/*.test.mjs"
   },
   "dependencies": {
