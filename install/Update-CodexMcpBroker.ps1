@@ -113,6 +113,8 @@ function Get-TaskRouterRuntimeSnapshot {
     $ProcessId = 0
     $SchemaVersion = 0
     $ScanIntervalMs = 0
+    $OpenTaskCount = 0
+    $UpdatedAt = [DateTimeOffset]::MinValue
     if (-not [int]::TryParse([string]$Runtime.pid, [ref]$ProcessId) -or $ProcessId -le 0) {
         throw "Task router runtime state has an invalid PID: $FullPath"
     }
@@ -121,6 +123,15 @@ function Get-TaskRouterRuntimeSnapshot {
     }
     if (-not [int]::TryParse([string]$Runtime.scanIntervalMs, [ref]$ScanIntervalMs) -or $ScanIntervalMs -le 0) {
         throw "Task router runtime state has an invalid scanIntervalMs: $FullPath"
+    }
+    if (-not [int]::TryParse([string]$Runtime.openTaskCount, [ref]$OpenTaskCount) -or $OpenTaskCount -lt 0) {
+        throw "Task router runtime state has an invalid openTaskCount: $FullPath"
+    }
+    if (-not [DateTimeOffset]::TryParse([string]$Runtime.updatedAt, [ref]$UpdatedAt)) {
+        throw "Task router runtime state has an invalid updatedAt: $FullPath"
+    }
+    if ($Runtime.keepAlive -isnot [bool]) {
+        throw "Task router runtime state has an invalid keepAlive flag: $FullPath"
     }
     foreach ($RequiredField in @("startedAt", "stopFilePath", "lockPath", "instanceToken")) {
         if ([string]::IsNullOrWhiteSpace([string]$Runtime.$RequiredField)) {
@@ -140,7 +151,6 @@ function Get-TaskRouterRuntimeSnapshot {
             lockPath = [System.IO.Path]::GetFullPath([string]$Runtime.lockPath)
             scanIntervalMs = $ScanIntervalMs
             instanceToken = [string]$Runtime.instanceToken
-            keepAlive = $Runtime.keepAlive
         }
         health = [pscustomobject][ordered]@{
             state = [string]$Runtime.state
@@ -152,15 +162,35 @@ function Get-TaskRouterRuntimeSnapshot {
             lastScanAt = $Runtime.lastScanAt
             nextScanAt = $Runtime.nextScanAt
             updatedAt = $Runtime.updatedAt
-            openTaskCount = $Runtime.openTaskCount
+            openTaskCount = $OpenTaskCount
+            keepAlive = [bool]$Runtime.keepAlive
         }
     }
-    if ($Snapshot.identity.keepAlive -ne $true) { throw "Task router keepAlive is not true: $FullPath" }
     if ($Snapshot.health.state -ne "running") { throw "Task router is not running: $FullPath state=$($Snapshot.health.state)" }
     if (-not [string]::IsNullOrWhiteSpace([string]$Snapshot.health.lastError)) { throw "Task router reports an error: $FullPath error=$($Snapshot.health.lastError)" }
     if ($Snapshot.health.inFlightScan -ne $false) { throw "Task router has an in-flight scan: $FullPath" }
     if ($null -ne $Snapshot.health.maintenance) { throw "Task router is in maintenance: $FullPath" }
-    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { throw "Task router PID is not running: $FullPath pid=$ProcessId" }
+    $ProcessInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue
+    if (-not $ProcessInfo -or [string]$ProcessInfo.Name -ne "node.exe") {
+        throw "Task router PID is not a running Node process: $FullPath pid=$ProcessId"
+    }
+    $CommandLine = [string]$ProcessInfo.CommandLine
+    foreach ($ExpectedFragment in @("task-router-runner.mjs", $FullPath, $Snapshot.identity.lockPath)) {
+        if ($CommandLine.IndexOf($ExpectedFragment, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+            throw "Task router command line does not match its runtime identity: $FullPath missing=$ExpectedFragment pid=$ProcessId"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Snapshot.identity.lockPath -PathType Leaf)) {
+        throw "Task router lock file is missing: $($Snapshot.identity.lockPath)"
+    }
+    try {
+        $LockState = Get-Content -LiteralPath $Snapshot.identity.lockPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "Cannot parse task router lock state: $($Snapshot.identity.lockPath). $($_.Exception.Message)"
+    }
+    if ([int]$LockState.pid -ne $ProcessId -or [string]$LockState.token -cne $Snapshot.identity.instanceToken) {
+        throw "Task router lock identity does not match runtime state: $FullPath"
+    }
     return $Snapshot
 }
 
@@ -169,7 +199,7 @@ function Assert-TaskRouterRuntimeUnchanged {
         [object]$Before,
         [object]$After
     )
-    foreach ($Field in @("schemaVersion", "pid", "startedAt", "scanIntervalMs", "instanceToken", "keepAlive")) {
+    foreach ($Field in @("schemaVersion", "pid", "startedAt", "scanIntervalMs", "instanceToken")) {
         if ($Before.identity.$Field -cne $After.identity.$Field) {
             throw "Task router runtime identity changed: $($Before.path) field=$Field before=$($Before.identity.$Field) after=$($After.identity.$Field)"
         }

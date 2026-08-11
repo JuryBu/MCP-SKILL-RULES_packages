@@ -53,18 +53,15 @@ const mode = "__MODE__";
 const port = Number(process.env.CODEX_MCP_BROKER_PORT);
 const probe = process.env.BROKER_PROBE_FILE;
 const routerRuntimePath = process.env.BROKER_TEST_ROUTER_RUNTIME;
-const routerRuntimeBaseline = process.env.BROKER_TEST_ROUTER_RUNTIME_BASELINE;
 let deepAttempts = 0;
 if (routerRuntimePath && fs.existsSync(routerRuntimePath)) {
-  if (mode === "healthy" && routerRuntimeBaseline && fs.existsSync(routerRuntimeBaseline)) {
-    fs.copyFileSync(routerRuntimeBaseline, routerRuntimePath);
-  }
   const runtime = JSON.parse(fs.readFileSync(routerRuntimePath, "utf8").replace(/^\uFEFF/, ""));
   if (mode === "router-volatile") {
     runtime.lastScanAt = "2026-08-12T00:00:01.000Z";
     runtime.nextScanAt = "2026-08-12T00:00:31.000Z";
     runtime.updatedAt = "2026-08-12T00:00:01.000Z";
     runtime.openTaskCount = Number(runtime.openTaskCount || 0) + 1;
+    runtime.keepAlive = false;
     fs.writeFileSync(routerRuntimePath, JSON.stringify(runtime, null, 2));
   } else if (mode === "router-identity-failure") {
     runtime.instanceToken = "unexpected-router-instance";
@@ -99,12 +96,14 @@ if (mode === "unhealthy") {
 function Write-TaskRouterRuntimeState {
     param(
         [string]$Path,
+        [int]$ProcessId,
+        [string]$LockPath,
         [string]$InstanceToken = "router-instance-stable"
     )
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Path) | Out-Null
     [ordered]@{
         schemaVersion = 1
-        pid = $PID
+        pid = $ProcessId
         startedAt = "2026-08-12T00:00:00.000Z"
         lastScanAt = "2026-08-12T00:00:00.000Z"
         nextScanAt = "2026-08-12T00:00:30.000Z"
@@ -112,7 +111,7 @@ function Write-TaskRouterRuntimeState {
         lastError = $null
         state = "running"
         stopFilePath = (Join-Path $testRoot "router.stop")
-        lockPath = (Join-Path $testRoot "router.lock")
+        lockPath = $LockPath
         scanIntervalMs = 30000
         stoppedAt = $null
         stopReason = $null
@@ -122,6 +121,29 @@ function Write-TaskRouterRuntimeState {
         updatedAt = "2026-08-12T00:00:00.000Z"
         keepAlive = $true
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $Path -Encoding UTF8
+}
+
+function Start-MockTaskRouter {
+    param(
+        [string]$RuntimePath,
+        [string]$LockPath,
+        [string]$InstanceToken = "router-instance-stable"
+    )
+    $runnerRoot = Join-Path $testRoot "mock-task-router"
+    $runnerPath = Join-Path $runnerRoot "task-router-runner.mjs"
+    New-Item -ItemType Directory -Force -Path $runnerRoot | Out-Null
+    if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
+        Set-Content -LiteralPath $runnerPath -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
+    }
+    $process = Start-Process -FilePath $nodeExePath -ArgumentList @($runnerPath, "--runtime-state", $RuntimePath, "--lock", $LockPath) -PassThru -WindowStyle Hidden
+    $processIds.Add($process.Id)
+    [ordered]@{
+        pid = $process.Id
+        token = $InstanceToken
+        startedAt = "2026-08-12T00:00:00.000Z"
+    } | ConvertTo-Json | Set-Content -LiteralPath $LockPath -Encoding UTF8
+    Write-TaskRouterRuntimeState -Path $RuntimePath -ProcessId $process.Id -LockPath $LockPath -InstanceToken $InstanceToken
+    return $process.Id
 }
 
 function Start-FlatBroker {
@@ -339,8 +361,18 @@ server.listen(port, "127.0.0.1", () => {
     Initialize-Target -Root $routerStateRoot -OldSource $oldSource -Port 19494 -StartExists $true -StopExists $true
     $stableLedgerPath = Join-Path $routerStateRoot "task-registry.json"
     $routerRuntimePath = Join-Path $routerStateRoot "task-router-runtime.json"
+    $routerLockPath = Join-Path $routerStateRoot "task-router.lock"
     Set-Content -LiteralPath $stableLedgerPath -Encoding UTF8 -Value '{"stable":true}'
-    Write-TaskRouterRuntimeState -Path $routerRuntimePath
+    [ordered]@{ pid = $PID; token = "wrong-process"; startedAt = "2026-08-12T00:00:00.000Z" } | ConvertTo-Json | Set-Content -LiteralPath $routerLockPath -Encoding UTF8
+    Write-TaskRouterRuntimeState -Path $routerRuntimePath -ProcessId $PID -LockPath $routerLockPath -InstanceToken "wrong-process"
+    $wrongProcessFailed = $false
+    try {
+        & $updaterPath -SourceBrokerRoot $routerVolatileSource -BrokerRoot $routerStateRoot -BrokerPort 19494 -DeepHealthEndpoints @() -TaskRouterRuntimeStatePaths @($routerRuntimePath) -WhatIf | Out-Null
+    } catch {
+        $wrongProcessFailed = $_.Exception.Message.Contains("not a running Node process")
+    }
+    if (-not $wrongProcessFailed) { throw "Updater accepted a non-router process from runtime state." }
+    $null = Start-MockTaskRouter -RuntimePath $routerRuntimePath -LockPath $routerLockPath
     $misclassifiedFailed = $false
     try {
         & $updaterPath -SourceBrokerRoot $routerVolatileSource -BrokerRoot $routerStateRoot -BrokerPort 19494 -DeepHealthEndpoints @() -ProtectedStatePaths @($routerRuntimePath) -WhatIf | Out-Null
@@ -348,6 +380,18 @@ server.listen(port, "127.0.0.1", () => {
         $misclassifiedFailed = $_.Exception.Message.Contains("cannot use byte-for-byte ProtectedStatePaths")
     }
     if (-not $misclassifiedFailed) { throw "Updater did not reject volatile task router state from byte protection." }
+    $unhealthyRuntime = Get-Content -LiteralPath $routerRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $unhealthyRuntime.inFlightScan = $true
+    $unhealthyRuntime | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $routerRuntimePath -Encoding UTF8
+    $inFlightFailed = $false
+    try {
+        & $updaterPath -SourceBrokerRoot $routerVolatileSource -BrokerRoot $routerStateRoot -BrokerPort 19494 -DeepHealthEndpoints @() -TaskRouterRuntimeStatePaths @($routerRuntimePath) -WhatIf | Out-Null
+    } catch {
+        $inFlightFailed = $_.Exception.Message.Contains("in-flight scan")
+    }
+    if (-not $inFlightFailed) { throw "Updater accepted an in-flight task router scan." }
+    $unhealthyRuntime.inFlightScan = $false
+    $unhealthyRuntime | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $routerRuntimePath -Encoding UTF8
     $stableLedgerHash = Get-Sha256 $stableLedgerPath
     $runtimeBefore = Get-Content -LiteralPath $routerRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $previousRouterRuntime = [Environment]::GetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME", "Process")
@@ -359,37 +403,33 @@ server.listen(port, "127.0.0.1", () => {
     }
     $runtimeAfter = Get-Content -LiteralPath $routerRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($runtimeAfter.instanceToken -ne $runtimeBefore.instanceToken -or $runtimeAfter.pid -ne $runtimeBefore.pid) { throw "Volatile router update changed stable identity fields." }
-    if ($runtimeAfter.updatedAt -eq $runtimeBefore.updatedAt -or $runtimeAfter.openTaskCount -eq $runtimeBefore.openTaskCount) { throw "Volatile router fixture did not exercise semantic protection." }
+    if ($runtimeAfter.updatedAt -eq $runtimeBefore.updatedAt -or $runtimeAfter.openTaskCount -eq $runtimeBefore.openTaskCount -or $runtimeAfter.keepAlive -ne $false) { throw "Volatile router fixture did not exercise semantic protection." }
     if ((Get-Sha256 $stableLedgerPath) -ne $stableLedgerHash) { throw "Byte-protected stable ledger changed during router semantic test." }
     Stop-FlatBroker -Root $routerStateRoot
 
     $routerFailureRoot = Join-Path $testRoot "router-identity-rollback"
     Initialize-Target -Root $routerFailureRoot -OldSource $oldSource -Port 19495 -StartExists $true -StopExists $true
     $routerFailureRuntimePath = Join-Path $routerFailureRoot "task-router-runtime.json"
-    $routerFailureBaselinePath = Join-Path $routerFailureRoot "task-router-runtime.baseline.json"
-    Write-TaskRouterRuntimeState -Path $routerFailureRuntimePath
-    Copy-Item -LiteralPath $routerFailureRuntimePath -Destination $routerFailureBaselinePath -Force
+    $routerFailureLockPath = Join-Path $routerFailureRoot "task-router.lock"
+    $null = Start-MockTaskRouter -RuntimePath $routerFailureRuntimePath -LockPath $routerFailureLockPath
     $routerFailureBrokerHash = Get-Sha256 (Join-Path $routerFailureRoot "broker.mjs")
     $previousRouterRuntime = [Environment]::GetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME", "Process")
-    $previousRouterBaseline = [Environment]::GetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME_BASELINE", "Process")
     $routerIdentityFailed = $false
     try {
         [Environment]::SetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME", $routerFailureRuntimePath, "Process")
-        [Environment]::SetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME_BASELINE", $routerFailureBaselinePath, "Process")
         try {
             & $updaterPath -SourceBrokerRoot $routerIdentityFailureSource -BrokerRoot $routerFailureRoot -BrokerPort 19495 -DeepHealthEndpoints @() -TaskRouterRuntimeStatePaths @($routerFailureRuntimePath) -StartupTimeoutSeconds 2 | Out-Null
         } catch {
-            $routerIdentityFailed = $_.Exception.Message.Contains("previous code was restored") -and $_.Exception.Message.Contains("runtime identity changed")
+            $routerIdentityFailed = $_.Exception.Message.Contains("rollback was incomplete") -and $_.Exception.Message.Contains("lock identity does not match")
         }
     } finally {
         [Environment]::SetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME", $previousRouterRuntime, "Process")
-        [Environment]::SetEnvironmentVariable("BROKER_TEST_ROUTER_RUNTIME_BASELINE", $previousRouterBaseline, "Process")
     }
-    if (-not $routerIdentityFailed) { throw "Router identity failure did not fail closed with a verified broker rollback." }
+    if (-not $routerIdentityFailed) { throw "Router identity failure did not expose the incomplete runtime rollback boundary." }
     Wait-Health -Port 19495
     if ((Get-Sha256 (Join-Path $routerFailureRoot "broker.mjs")) -ne $routerFailureBrokerHash) { throw "Router identity failure did not restore broker.mjs." }
     $routerFailureAfter = Get-Content -LiteralPath $routerFailureRuntimePath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($routerFailureAfter.instanceToken -ne "router-instance-stable") { throw "Router identity rollback fixture did not restore the runtime baseline." }
+    if ($routerFailureAfter.instanceToken -ne "unexpected-router-instance") { throw "Router identity failure unexpectedly rewrote volatile runtime state." }
     Stop-FlatBroker -Root $routerFailureRoot
 
     $deepRetryRoot = Join-Path $testRoot "deep-retry"

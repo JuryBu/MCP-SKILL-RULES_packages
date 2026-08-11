@@ -74,7 +74,7 @@
 
 broker 会为普通请求使用 120 秒默认超时，并根据工具参数中的 `waitSeconds` / `timeout` 放宽长任务等待，上限默认 30 分钟。状态文件在退出、`SIGBREAK` 和 `beforeExit` 时尽力落盘。
 
-broker 子后端断管后会丢弃失效 transport，但不会自动重放结果未知的当前工具调用；下一次调用或仅允许本机回环访问的 `GET /health?endpoint=<name>&deep=1` 只读探针会建立新子后端。已有本机安装可用 `install\Update-CodexMcpBroker.ps1` 先备份、受控重启并验证 NapCat/Sandbox 等深层健康，同时用 `-ProtectedStatePaths` 逐字节保护稳定任务账本，用 `-TaskRouterRuntimeStatePaths` 对会周期更新的 `task-router-runtime.json` 做路由进程身份与健康字段核对。运行态文件误放进逐字节清单会在修改前拒绝，正常扫描时间变化不会再触发误回滚。未显式传入 `-BrokerRoot` 时，更新器优先读取 `CODEX_TOOLKIT_SERVICE_MANIFEST` 或 `%USERPROFILE%\.codex-toolkit\services\infrastructure\service-manifest.json`，分别使用 `broker.brokerScript`、`broker.startScript` 和 `broker.stopScript` 指向的受管 release 文件；写入前会证明健康 PID 的 Node 入口就是目标 broker，更新后还要求 PID 已变化且入口路径仍一致。平铺安装继续使用目标目录内的 Start/Stop 脚本；失败时恢复原 broker 代码及原有生命周期文件状态。
+broker 子后端断管后会丢弃失效 transport，但不会自动重放结果未知的当前工具调用；下一次调用或仅允许本机回环访问的 `GET /health?endpoint=<name>&deep=1` 只读探针会建立新子后端。已有本机安装可用 `install\Update-CodexMcpBroker.ps1` 先备份、受控重启并验证 NapCat/Sandbox 等深层健康，同时用 `-ProtectedStatePaths` 逐字节保护稳定任务账本，用 `-TaskRouterRuntimeStatePaths` 对会周期更新的 `task-router-runtime.json` 做路由进程、锁、实例身份与健康字段核对。运行态文件误放进逐字节清单会在修改前拒绝，正常扫描时间、任务数和 `keepAlive` 变化不会再触发误回滚。未显式传入 `-BrokerRoot` 时，更新器优先读取 `CODEX_TOOLKIT_SERVICE_MANIFEST` 或 `%USERPROFILE%\.codex-toolkit\services\infrastructure\service-manifest.json`，分别使用 `broker.brokerScript`、`broker.startScript` 和 `broker.stopScript` 指向的受管 release 文件；写入前会证明健康 PID 的 Node 入口就是目标 broker，更新后还要求 PID 已变化且入口路径仍一致。平铺安装继续使用目标目录内的 Start/Stop 脚本；失败时恢复原 broker 代码及原有生命周期文件状态。
 
 ### Rules：四宿主的人类化工作规则
 
