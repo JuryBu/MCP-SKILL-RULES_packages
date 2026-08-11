@@ -164,6 +164,16 @@ function proxyBridgeOptions(options) {
   };
 }
 
+export async function injectWakeAfterMaintenanceRelease({ releaseMaintenance, restoreMaintenance, injectWake }) {
+  releaseMaintenance();
+  try {
+    return await injectWake();
+  } catch (error) {
+    restoreMaintenance();
+    throw error;
+  }
+}
+
 async function executePlan(options, storedPlan) {
   const paths = { registry: options.registry, dedupe: options.dedupe, log: options.log };
   verifyFileSnapshot(storedPlan, paths);
@@ -174,6 +184,7 @@ async function executePlan(options, storedPlan) {
   let registry;
   let rearmResult;
   let wakeAccepted = false;
+  let wakeOutcomeUncertain = false;
   try {
     updateMaintenance(options.maintenanceFile, maintenance);
     verifyFileSnapshot(storedPlan, paths);
@@ -198,22 +209,30 @@ async function executePlan(options, storedPlan) {
     });
     writeJson(path.join(backupPath, "archived-wakes.json"), rearmResult.archivedWakes);
     bridge = createCodexThreadBridge(proxyBridgeOptions(options));
-    const wake = await bridge.wake({
-      threadId: storedPlan.expectedConversationId,
-      prompt,
-      wakeId,
-      taskId: storedPlan.taskId,
-      generation: storedPlan.expectedGeneration,
-      localRole: plan.before.localRole,
-      sourceMachine: plan.before.sourceMachine,
-      targetMachine: plan.before.targetMachine,
-      trustedPeerQq: plan.before.trustedPeerQq,
-      pendingMessageSeqs: storedPlan.expectedPendingSeqs,
-      newMessageSeqs: storedPlan.expectedPendingSeqs,
-      pendingThroughSequence: storedPlan.expectedPendingSeqs.at(-1),
-      pendingThroughTime: messages.at(-1).messageAt,
-      promptSha256,
+    const wake = await injectWakeAfterMaintenanceRelease({
+      releaseMaintenance: () => updateMaintenance(options.maintenanceFile, null),
+      restoreMaintenance: () => updateMaintenance(options.maintenanceFile, maintenance),
+      injectWake: () => bridge.wake({
+        threadId: storedPlan.expectedConversationId,
+        prompt,
+        wakeId,
+        taskId: storedPlan.taskId,
+        generation: storedPlan.expectedGeneration,
+        localRole: plan.before.localRole,
+        sourceMachine: plan.before.sourceMachine,
+        targetMachine: plan.before.targetMachine,
+        trustedPeerQq: plan.before.trustedPeerQq,
+        pendingMessageSeqs: storedPlan.expectedPendingSeqs,
+        newMessageSeqs: storedPlan.expectedPendingSeqs,
+        pendingThroughSequence: storedPlan.expectedPendingSeqs.at(-1),
+        pendingThroughTime: messages.at(-1).messageAt,
+        promptSha256,
+      }),
     });
+    if (wake.outcome === "unknown") {
+      wakeOutcomeUncertain = true;
+      throw Object.assign(new Error("新 wake 接纳结果未知，保留现场且禁止重试"), { outcomeUnknown: true, wake });
+    }
     if (!["accepted", "completed"].includes(wake.outcome)) throw new Error(`新 wake 未被接纳：${wake.outcome}`);
     wakeAccepted = true;
     registry.confirmWakeSent({
@@ -228,7 +247,7 @@ async function executePlan(options, storedPlan) {
   } catch (error) {
     try {
       updateMaintenance(options.maintenanceFile, maintenance);
-      if (rearmResult && !wakeAccepted) {
+      if (rearmResult && !wakeAccepted && !wakeOutcomeUncertain) {
         registry.rollbackStaleSentWakeRearm({
           taskId: storedPlan.taskId,
           expectedGeneration: storedPlan.expectedGeneration,
@@ -242,6 +261,8 @@ async function executePlan(options, storedPlan) {
         restoreBackup({ dedupe: paths.dedupe, log: paths.log }, backupPath);
       } else if (!rearmResult) {
         restoreBackup(paths, backupPath);
+      } else if (wakeOutcomeUncertain) {
+        throw new Error("新 wake 接纳结果未知，禁止回滚或重试");
       } else {
         throw new Error("新 wake 已被接纳，禁止回滚造成重复注入");
       }

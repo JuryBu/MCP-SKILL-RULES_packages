@@ -3,7 +3,11 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { createBackup, restoreBackup } from "../ops/rearm-stale-sent-wake.mjs";
+import {
+  createBackup,
+  injectWakeAfterMaintenanceRelease,
+  restoreBackup,
+} from "../ops/rearm-stale-sent-wake.mjs";
 import { createTaskRegistry } from "../src/task-registry.mjs";
 import {
   buildRearmWakePrompt,
@@ -263,4 +267,29 @@ test("three-file backup restores exact original bytes", () => {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("controlled injection releases maintenance and restores it on failure", async () => {
+  let maintenanceActive = true;
+  const accepted = await injectWakeAfterMaintenanceRelease({
+    releaseMaintenance: () => { maintenanceActive = false; },
+    restoreMaintenance: () => { maintenanceActive = true; },
+    injectWake: async () => {
+      assert.equal(maintenanceActive, false);
+      return { outcome: "accepted" };
+    },
+  });
+  assert.equal(accepted.outcome, "accepted");
+  assert.equal(maintenanceActive, false);
+
+  maintenanceActive = true;
+  await assert.rejects(() => injectWakeAfterMaintenanceRelease({
+    releaseMaintenance: () => { maintenanceActive = false; },
+    restoreMaintenance: () => { maintenanceActive = true; },
+    injectWake: async () => {
+      assert.equal(maintenanceActive, false);
+      throw new Error("injection failed");
+    },
+  }), /injection failed/);
+  assert.equal(maintenanceActive, true);
 });
