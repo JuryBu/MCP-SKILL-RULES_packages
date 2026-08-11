@@ -5,6 +5,7 @@ param(
     [string]$ServiceManifestPath,
     [string[]]$DeepHealthEndpoints = @("napcat", "sandbox"),
     [string[]]$ProtectedStatePaths = @(),
+    [string[]]$TaskRouterRuntimeStatePaths = @(),
     [ValidateRange(1, 120)][int]$StartupTimeoutSeconds = 30,
     [ValidateRange(1024, 65535)][int]$BrokerPort = 14588
 )
@@ -89,6 +90,94 @@ function Get-FileHashOrNull {
         }
     } finally {
         $Stream.Dispose()
+    }
+}
+
+function Get-NormalizedFilePath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "State path cannot be empty." }
+    return [System.IO.Path]::GetFullPath($Path)
+}
+
+function Get-TaskRouterRuntimeSnapshot {
+    param([string]$Path)
+    $FullPath = Get-NormalizedFilePath -Path $Path
+    if (-not (Test-Path -LiteralPath $FullPath -PathType Leaf)) {
+        throw "Task router runtime state is missing: $FullPath"
+    }
+    try {
+        $Runtime = Get-Content -LiteralPath $FullPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    } catch {
+        throw "Cannot parse task router runtime state: $FullPath. $($_.Exception.Message)"
+    }
+    $ProcessId = 0
+    $SchemaVersion = 0
+    $ScanIntervalMs = 0
+    if (-not [int]::TryParse([string]$Runtime.pid, [ref]$ProcessId) -or $ProcessId -le 0) {
+        throw "Task router runtime state has an invalid PID: $FullPath"
+    }
+    if (-not [int]::TryParse([string]$Runtime.schemaVersion, [ref]$SchemaVersion) -or $SchemaVersion -le 0) {
+        throw "Task router runtime state has an invalid schemaVersion: $FullPath"
+    }
+    if (-not [int]::TryParse([string]$Runtime.scanIntervalMs, [ref]$ScanIntervalMs) -or $ScanIntervalMs -le 0) {
+        throw "Task router runtime state has an invalid scanIntervalMs: $FullPath"
+    }
+    foreach ($RequiredField in @("startedAt", "stopFilePath", "lockPath", "instanceToken")) {
+        if ([string]::IsNullOrWhiteSpace([string]$Runtime.$RequiredField)) {
+            throw "Task router runtime state is missing identity field '$RequiredField': $FullPath"
+        }
+    }
+    if (-not [System.IO.Path]::IsPathRooted([string]$Runtime.stopFilePath) -or -not [System.IO.Path]::IsPathRooted([string]$Runtime.lockPath)) {
+        throw "Task router runtime state must use absolute stop and lock paths: $FullPath"
+    }
+    $Snapshot = [pscustomobject]@{
+        path = $FullPath
+        identity = [pscustomobject][ordered]@{
+            schemaVersion = $SchemaVersion
+            pid = $ProcessId
+            startedAt = [string]$Runtime.startedAt
+            stopFilePath = [System.IO.Path]::GetFullPath([string]$Runtime.stopFilePath)
+            lockPath = [System.IO.Path]::GetFullPath([string]$Runtime.lockPath)
+            scanIntervalMs = $ScanIntervalMs
+            instanceToken = [string]$Runtime.instanceToken
+            keepAlive = $Runtime.keepAlive
+        }
+        health = [pscustomobject][ordered]@{
+            state = [string]$Runtime.state
+            lastError = $Runtime.lastError
+            inFlightScan = $Runtime.inFlightScan
+            maintenance = $Runtime.maintenance
+        }
+        volatile = [pscustomobject][ordered]@{
+            lastScanAt = $Runtime.lastScanAt
+            nextScanAt = $Runtime.nextScanAt
+            updatedAt = $Runtime.updatedAt
+            openTaskCount = $Runtime.openTaskCount
+        }
+    }
+    if ($Snapshot.identity.keepAlive -ne $true) { throw "Task router keepAlive is not true: $FullPath" }
+    if ($Snapshot.health.state -ne "running") { throw "Task router is not running: $FullPath state=$($Snapshot.health.state)" }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Snapshot.health.lastError)) { throw "Task router reports an error: $FullPath error=$($Snapshot.health.lastError)" }
+    if ($Snapshot.health.inFlightScan -ne $false) { throw "Task router has an in-flight scan: $FullPath" }
+    if ($null -ne $Snapshot.health.maintenance) { throw "Task router is in maintenance: $FullPath" }
+    if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { throw "Task router PID is not running: $FullPath pid=$ProcessId" }
+    return $Snapshot
+}
+
+function Assert-TaskRouterRuntimeUnchanged {
+    param(
+        [object]$Before,
+        [object]$After
+    )
+    foreach ($Field in @("schemaVersion", "pid", "startedAt", "scanIntervalMs", "instanceToken", "keepAlive")) {
+        if ($Before.identity.$Field -cne $After.identity.$Field) {
+            throw "Task router runtime identity changed: $($Before.path) field=$Field before=$($Before.identity.$Field) after=$($After.identity.$Field)"
+        }
+    }
+    foreach ($Field in @("stopFilePath", "lockPath")) {
+        if (-not ([string]$Before.identity.$Field).Equals([string]$After.identity.$Field, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Task router runtime identity changed: $($Before.path) field=$Field before=$($Before.identity.$Field) after=$($After.identity.$Field)"
+        }
     }
 }
 
@@ -284,6 +373,22 @@ function Wait-BrokerDeepHealth {
     throw "Deep health did not become ready for endpoint '$Endpoint' before the startup deadline. Last observation: $LastObservation"
 }
 
+$ProtectedStatePaths = @($ProtectedStatePaths | ForEach-Object { Get-NormalizedFilePath -Path $_ })
+$TaskRouterRuntimeStatePaths = @($TaskRouterRuntimeStatePaths | ForEach-Object { Get-NormalizedFilePath -Path $_ })
+foreach ($Path in $ProtectedStatePaths) {
+    if ([System.IO.Path]::GetFileName($Path).Equals("task-router-runtime.json", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "task-router-runtime.json is volatile and cannot use byte-for-byte ProtectedStatePaths. Pass it via TaskRouterRuntimeStatePaths."
+    }
+}
+foreach ($Path in $TaskRouterRuntimeStatePaths) {
+    if (-not [System.IO.Path]::GetFileName($Path).Equals("task-router-runtime.json", [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "TaskRouterRuntimeStatePaths only accepts task-router-runtime.json files: $Path"
+    }
+    if (@($ProtectedStatePaths | Where-Object { $_.Equals($Path, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+        throw "A state path cannot use both byte and task-router semantic protection: $Path"
+    }
+}
+
 foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required file is missing: $Path" }
 }
@@ -319,6 +424,8 @@ try {
 
 $ProtectedBefore = [ordered]@{}
 foreach ($Path in $ProtectedStatePaths) { $ProtectedBefore[$Path] = Get-FileHashOrNull -Path $Path }
+$TaskRouterBefore = [ordered]@{}
+foreach ($Path in $TaskRouterRuntimeStatePaths) { $TaskRouterBefore[$Path] = Get-TaskRouterRuntimeSnapshot -Path $Path }
 
 $ShouldActivate = $PSCmdlet.ShouldProcess($BrokerRoot, "install validated broker code and lifecycle scripts, then restart broker")
 if (-not $ShouldActivate) {
@@ -332,6 +439,7 @@ if (-not $ShouldActivate) {
         lifecycleBootstrap = $true
         endpointConfigBootstrap = -not (Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf)
         protectedState = $ProtectedBefore
+        taskRouterRuntimeState = @($TaskRouterBefore.Values)
     } | ConvertTo-Json -Depth 10
     return
 }
@@ -413,6 +521,11 @@ try {
             throw "Protected state changed during broker update: $Path"
         }
     }
+    $TaskRouterAfter = [ordered]@{}
+    foreach ($Path in $TaskRouterRuntimeStatePaths) {
+        $TaskRouterAfter[$Path] = Get-TaskRouterRuntimeSnapshot -Path $Path
+        Assert-TaskRouterRuntimeUnchanged -Before $TaskRouterBefore[$Path] -After $TaskRouterAfter[$Path]
+    }
     $Activated = $true
     [pscustomobject]@{
         ok = $true
@@ -425,6 +538,9 @@ try {
         endpointConfigBootstrapped = -not $InstalledEndpointConfigExisted
         endpoints = @($DeepHealth | ForEach-Object { [pscustomobject]@{ endpoint = $_.endpoint; toolCount = $_.toolCount; recovered = $_.recovered } })
         protectedState = $ProtectedBefore
+        taskRouterRuntimeState = @($TaskRouterRuntimeStatePaths | ForEach-Object {
+            [pscustomobject]@{ path = $_; before = $TaskRouterBefore[$_]; after = $TaskRouterAfter[$_] }
+        })
     } | ConvertTo-Json -Depth 10
 } catch {
     $Failure = $_.Exception.Message
@@ -479,6 +595,12 @@ try {
                     $RollbackErrors.Add("protected state changed: $Path")
                 }
             } catch { $RollbackErrors.Add("protected state check: $Path $($_.Exception.Message)") }
+        }
+        foreach ($Path in $TaskRouterRuntimeStatePaths) {
+            try {
+                $RollbackRuntime = Get-TaskRouterRuntimeSnapshot -Path $Path
+                Assert-TaskRouterRuntimeUnchanged -Before $TaskRouterBefore[$Path] -After $RollbackRuntime
+            } catch { $RollbackErrors.Add("task router runtime check: $Path $($_.Exception.Message)") }
         }
         if ($RollbackErrors.Count -gt 0) {
             $EvidenceSuffix = if ($StartupEvidenceWarning) { " Startup evidence warning: $StartupEvidenceWarning" } else { "" }
