@@ -620,6 +620,49 @@ test("task text preview writes exact task and machine routing markers", async ()
   }
 });
 
+test("task sends reject aliases and unknown roles before touching OneBot", async () => {
+  const fixture = await createFixture();
+  try {
+    await assert.rejects(
+      () => fixture.notifier.sendTextMessage({
+        text: "错误角色不会发出",
+        task_id: "role-preflight",
+        source_machine: "training",
+        target_machine: "developer",
+        dedupe_key: "role-preflight:text-alias",
+      }),
+      (error) => error.code === "MACHINE_ROLE_ALIAS_NOT_CANONICAL"
+        && /标准值 development/.test(error.message)
+        && /再发送/.test(error.message),
+    );
+    await assert.rejects(
+      () => fixture.notifier.sendTextMessage({
+        text: "未知角色不会发出",
+        task_id: "role-preflight",
+        source_machine: "trainer",
+        target_machine: "development",
+        dedupe_key: "role-preflight:text-unknown",
+      }),
+      (error) => error.code === "INVALID_MACHINE_ROLE" && /development 或 training/.test(error.message),
+    );
+    const filePath = path.join(fixture.temporaryRoot, "role-preflight.zip");
+    fs.writeFileSync(filePath, "role-preflight", "utf8");
+    await assert.rejects(
+      () => fixture.notifier.sendFile({
+        file_path: filePath,
+        task_id: "role-preflight",
+        source_machine: "developer",
+        target_machine: "training",
+        dedupe_key: "role-preflight:file-alias",
+      }),
+      (error) => error.code === "MACHINE_ROLE_ALIAS_NOT_CANONICAL" && /标准值 development/.test(error.message),
+    );
+    assert.equal(fixture.calls.length, 0);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("text send validates, verifies and deduplicates in the bound group", async () => {
   const fixture = await createFixture();
   try {

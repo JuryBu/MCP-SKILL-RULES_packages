@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { canonicalMachineRole } from "./machine-role.mjs";
 
 const STATE_SCHEMA_VERSION = 2;
 const DEFAULT_WAKE_LEASE_MS = 30_000;
@@ -90,6 +91,15 @@ function optionalString(value, name, maximum = 512) {
     invalidArgument(`${name} 不能超过 ${maximum} 个字符`);
   }
   return normalized;
+}
+
+function standardMachineRole(value, name) {
+  const role = optionalString(value, name, 64);
+  if (role === null) return null;
+  const canonical = canonicalMachineRole(role);
+  if (!canonical) invalidArgument(`${name} 只允许标准值 development 或 training；收到 ${role}`);
+  if (canonical !== role) invalidArgument(`${name} 不接受兼容别名 ${role}；请改用标准值 ${canonical}`);
+  return canonical;
 }
 
 function nonNegativeInteger(value, name) {
@@ -742,9 +752,9 @@ class TaskRegistry {
     const conversationId = requiredString(input.conversationId, "conversationId");
     const requestedRoute = {
       conversationId,
-      localRole: optionalString(input.localRole, "localRole"),
-      sourceMachine: optionalString(input.sourceMachine, "sourceMachine"),
-      targetMachine: optionalString(input.targetMachine, "targetMachine"),
+      localRole: standardMachineRole(input.localRole, "localRole"),
+      sourceMachine: standardMachineRole(input.sourceMachine, "sourceMachine"),
+      targetMachine: standardMachineRole(input.targetMachine, "targetMachine"),
       trustedPeerQq: optionalString(input.trustedPeerQq, "trustedPeerQq"),
     };
     return this.#write((state) => {
@@ -814,7 +824,10 @@ class TaskRegistry {
         : task.conversationId;
       const nextTask = { ...task, conversationId: nextConversationId };
       for (const field of ROUTING_FIELDS.slice(1)) {
-        if (hasOwn(input, field)) nextTask[field] = optionalString(input[field], field);
+        if (!hasOwn(input, field)) continue;
+        nextTask[field] = ["localRole", "sourceMachine", "targetMachine"].includes(field)
+          ? standardMachineRole(input[field], field)
+          : optionalString(input[field], field);
       }
       if (hasCooldownUpdate) {
         nextTask.wakeCooldownMs = wakeCooldownNumber(input.wakeCooldownMs, task.wakeCooldownMs);

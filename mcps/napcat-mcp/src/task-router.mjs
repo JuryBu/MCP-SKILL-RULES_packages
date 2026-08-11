@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { machineRolesEqual } from "./machine-role.mjs";
 
 function messageSequence(message) {
   const sequence = Number(message?.messageSeq ?? message?.messageId ?? -1);
@@ -19,8 +20,8 @@ function historyMessageKey(message) {
 }
 
 function expectedPeerMachine(task) {
-  if (task.localRole && task.localRole === task.sourceMachine) return task.targetMachine;
-  if (task.localRole && task.localRole === task.targetMachine) return task.sourceMachine;
+  if (task.localRole && machineRolesEqual(task.localRole, task.sourceMachine)) return task.targetMachine;
+  if (task.localRole && machineRolesEqual(task.localRole, task.targetMachine)) return task.sourceMachine;
   return "";
 }
 
@@ -29,9 +30,9 @@ function eligibleMessage(task, message) {
   if (String(message.messageType ?? "business") !== "business") return false;
   if (String(message.taskId ?? "") !== task.taskId) return false;
   if (String(message.senderId ?? "") !== task.trustedPeerQq) return false;
-  if (task.localRole && message.targetMachine !== task.localRole) return false;
+  if (task.localRole && !machineRolesEqual(message.targetMachine, task.localRole)) return false;
   const peerMachine = expectedPeerMachine(task);
-  if (peerMachine && message.sourceMachine !== peerMachine) return false;
+  if (peerMachine && !machineRolesEqual(message.sourceMachine, peerMachine)) return false;
   return messageSequence(message) !== null && messageTimestamp(message) !== null;
 }
 

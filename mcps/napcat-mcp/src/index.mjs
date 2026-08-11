@@ -94,6 +94,11 @@ const readInputSchema = {
   additionalProperties: false,
 };
 
+const canonicalMachineRoleSchema = {
+  type: "string",
+  enum: ["development", "training"],
+};
+
 const textInputSchema = {
   type: "object",
   properties: {
@@ -101,8 +106,8 @@ const textInputSchema = {
     dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "唯一去重键；同一次重试必须复用。" },
     delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成。" },
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时发送可按任务精确读取的结构化消息。" },
-    source_machine: { type: "string", minLength: 1, maxLength: 64, description: "可选来源机器标签，例如 development 或 training。" },
-    target_machine: { type: "string", minLength: 1, maxLength: 64, description: "可选目标机器标签，例如 training 或 development。" },
+    source_machine: { ...canonicalMachineRoleSchema, description: "可选来源机器标准角色。" },
+    target_machine: { ...canonicalMachineRoleSchema, description: "可选目标机器标准角色。" },
   },
   required: ["text", "dedupe_key"],
   allOf: [{
@@ -120,8 +125,8 @@ const fileInputSchema = {
     dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "唯一去重键；同一次重试必须复用。" },
     delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成，用于跟踪文件索引送达状态。" },
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时 source_machine 和 target_machine 也必须提供，上传后会发送可路由的文件索引。" },
-    source_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务文件来源机器；task_id 存在时必填。" },
-    target_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务文件目标机器；task_id 存在时必填。" },
+    source_machine: { ...canonicalMachineRoleSchema, description: "任务文件来源机器标准角色；task_id 存在时必填。" },
+    target_machine: { ...canonicalMachineRoleSchema, description: "任务文件目标机器标准角色；task_id 存在时必填。" },
   },
   required: ["file_path", "dedupe_key"],
   additionalProperties: false,
@@ -145,9 +150,9 @@ const taskRegisterInputSchema = {
   properties: {
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "双方约定的稳定任务 ID。" },
     conversation_id: { type: "string", minLength: 1, maxLength: 256, description: "本机需要被唤醒的 Codex conversationId。" },
-    local_role: { type: "string", minLength: 1, maxLength: 64, description: "本机角色，例如 development 或 training。" },
-    source_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务消息来源机器标签。" },
-    target_machine: { type: "string", minLength: 1, maxLength: 64, description: "任务消息目标机器标签。" },
+    local_role: { ...canonicalMachineRoleSchema, description: "本机标准角色。" },
+    source_machine: { ...canonicalMachineRoleSchema, description: "任务消息来源机器标准角色。" },
+    target_machine: { ...canonicalMachineRoleSchema, description: "任务消息目标机器标准角色。" },
     trusted_peer_qq: { type: "string", pattern: "^[0-9]{5,20}$", description: "该任务允许触发唤醒的对端 QQ 号。" },
     wake_cooldown_ms: {
       type: "integer",
@@ -167,9 +172,9 @@ const taskUpdateInputSchema = {
     task_id: { type: "string", minLength: 1, maxLength: 128 },
     expected_generation: { type: "integer", minimum: 1, description: "当前路由代次；不匹配时拒绝更新。" },
     conversation_id: { type: "string", minLength: 1, maxLength: 256 },
-    local_role: { type: "string", minLength: 1, maxLength: 64 },
-    source_machine: { type: "string", minLength: 1, maxLength: 64 },
-    target_machine: { type: "string", minLength: 1, maxLength: 64 },
+    local_role: canonicalMachineRoleSchema,
+    source_machine: canonicalMachineRoleSchema,
+    target_machine: canonicalMachineRoleSchema,
     trusted_peer_qq: { type: "string", pattern: "^[0-9]{5,20}$" },
     wake_cooldown_ms: {
       type: "integer",
@@ -266,7 +271,7 @@ const connectionRequestInputSchema = {
     proposed_task_id: { type: "string", minLength: 1, maxLength: 128 },
     previous_task_id: { type: "string", minLength: 1, maxLength: 128 },
     reply_to_request_id: { type: "string", minLength: 1, maxLength: 128 },
-    target_machine: { type: "string", minLength: 1, maxLength: 64 },
+    target_machine: canonicalMachineRoleSchema,
     source_conversation_id: { type: "string", minLength: 1, maxLength: 256 },
     target_conversation_id: { type: "string", minLength: 1, maxLength: 256 },
     reason: { type: "string", minLength: 1, maxLength: 600 },

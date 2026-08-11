@@ -1,4 +1,10 @@
 import crypto from "node:crypto";
+import {
+  canonicalMachineRole,
+  machineRoleAlias,
+  machineRolesEqual,
+  oppositeMachineRole,
+} from "./machine-role.mjs";
 
 const DEFAULT_CONNECTION_REQUEST_BOOTSTRAP_LOOKBACK_MS = 15 * 60 * 1000;
 const DEFAULT_MACHINE_RECEIPT_ALERT_MS = 2 * 60 * 1000;
@@ -21,6 +27,22 @@ function optionalText(value, maximum = 512) {
   if (!normalized) return "";
   if (normalized.length > maximum) throw new Error(`文本不能超过 ${maximum} 个字符`);
   return normalized;
+}
+
+function outboundMachineRole(value, name) {
+  const role = requiredText(value, name, 64);
+  const canonical = canonicalMachineRole(role);
+  if (!canonical) {
+    const error = new Error(`${name} 只允许标准值 development 或 training；收到 ${role}`);
+    error.code = "INVALID_MACHINE_ROLE";
+    throw error;
+  }
+  if (canonical !== role) {
+    const error = new Error(`${name} 使用了兼容别名 ${role}；请改为标准值 ${canonical} 后再发送`);
+    error.code = "MACHINE_ROLE_ALIAS_NOT_CANONICAL";
+    throw error;
+  }
+  return canonical;
 }
 
 function safeSequence(message) {
@@ -137,9 +159,12 @@ export function createControlPlane(options = {}) {
   }
 
   function validatePeerMessage(message, configuration) {
+    const expectedPeerMachine = oppositeMachineRole(configuration.localMachine);
     return !message?.isSelf
       && String(message?.senderId ?? "") === configuration.trustedPeerQq
-      && String(message?.targetMachine ?? "") === configuration.localMachine;
+      && machineRolesEqual(message?.targetMachine, configuration.localMachine)
+      && expectedPeerMachine !== null
+      && machineRolesEqual(message?.sourceMachine, expectedPeerMachine);
   }
 
   function deliveryReceiptKey(message, stage) {
@@ -156,14 +181,24 @@ export function createControlPlane(options = {}) {
     const originalSequence = safeSequence(message);
     if (originalSequence === null) return null;
     const configuration = config();
+    const sourceMachine = canonicalMachineRole(configuration.localMachine);
+    const targetMachine = canonicalMachineRole(message.sourceMachine);
+    if (!sourceMachine || !targetMachine) throw new Error("无法为未知机器角色生成回执");
+    const aliases = stage === "machine_received"
+      ? [
+          ["source_machine", machineRoleAlias(message.sourceMachine)],
+          ["target_machine", machineRoleAlias(message.targetMachine)],
+        ].filter((entry) => entry[1] !== null)
+      : [];
     const receipt = [
       "[Codex][DELIVERY_RECEIPT]",
       `delivery_id：${message.deliveryId}`,
       `task_id：${message.taskId || message.proposedTaskId || "control-plane"}`,
-      `source_machine：${configuration.localMachine}`,
-      `target_machine：${message.sourceMachine}`,
+      `source_machine：${sourceMachine}`,
+      `target_machine：${targetMachine}`,
       `receipt_stage：${stage}`,
       `delivery_message_seq：${originalSequence}`,
+      ...aliases.map(([field, alias]) => `兼容提醒：${field}=${alias.alias} 已按标准 ${alias.canonical} 接纳；本 delivery 已接纳，请勿重发；后续发送必须改用标准值 ${alias.canonical}。`),
       `时间：${new Date(now()).toISOString()}`,
     ].join("\n");
     return notifier.sendControlGroupMessage({
@@ -235,6 +270,11 @@ export function createControlPlane(options = {}) {
   async function scanConnectionRequest(message, configuration, bootstrap = null) {
     if (message.messageType !== "connection_request" || !validatePeerMessage(message, configuration)) return null;
     if (!message.requestId || !message.targetConversationId || !message.proposedTaskId) return null;
+    const canonicalMessage = {
+      ...message,
+      sourceMachine: canonicalMachineRole(message.sourceMachine),
+      targetMachine: canonicalMachineRole(message.targetMachine),
+    };
     const key = `connection-request:${requiredText(message.requestId, "requestId", 128)}`;
     if (state.hasSeenControlMessage(key)) return { outcome: "duplicate_connection_request", requestId: message.requestId };
     if (bootstrap?.initialized) {
@@ -258,8 +298,8 @@ export function createControlPlane(options = {}) {
         targetConversationId: message.targetConversationId,
         proposedTaskId: message.proposedTaskId,
         ...(message.previousTaskId ? { previousTaskId: message.previousTaskId } : {}),
-        sourceMachine: message.sourceMachine,
-        targetMachine: message.targetMachine,
+        sourceMachine: canonicalMessage.sourceMachine,
+        targetMachine: canonicalMessage.targetMachine,
         status: existing.status,
       });
       await sendReceiptOnce(message, "machine_received");
@@ -273,8 +313,8 @@ export function createControlPlane(options = {}) {
       targetConversationId: message.targetConversationId,
       proposedTaskId: message.proposedTaskId,
       ...(message.previousTaskId ? { previousTaskId: message.previousTaskId } : {}),
-      sourceMachine: message.sourceMachine,
-      targetMachine: message.targetMachine,
+      sourceMachine: canonicalMessage.sourceMachine,
+      targetMachine: canonicalMessage.targetMachine,
       status: "received",
       receivedAt: message.time,
     });
@@ -282,19 +322,19 @@ export function createControlPlane(options = {}) {
     const wakeId = stableId("connection", [message.requestId, message.targetConversationId]);
     const wake = await bridge.wake({
       threadId: message.targetConversationId,
-      prompt: connectionPrompt(message),
+      prompt: connectionPrompt(canonicalMessage),
       wakeId,
       taskId: message.proposedTaskId,
       generation: 1,
       localRole: configuration.localMachine,
-      sourceMachine: message.sourceMachine,
-      targetMachine: message.targetMachine,
+      sourceMachine: canonicalMessage.sourceMachine,
+      targetMachine: canonicalMessage.targetMachine,
       trustedPeerQq: configuration.trustedPeerQq,
       pendingMessageSeqs: [Number(message.messageSeq)],
       newMessageSeqs: [Number(message.messageSeq)],
       pendingThroughSequence: Number(message.messageSeq),
       pendingThroughTime: message.time,
-      promptSha256: crypto.createHash("sha256").update(connectionPrompt(message), "utf8").digest("hex"),
+      promptSha256: crypto.createHash("sha256").update(connectionPrompt(canonicalMessage), "utf8").digest("hex"),
     });
     if (!acceptedWake(wake)) {
       return { outcome: wake?.outcome === "busy" ? "connection_thread_busy" : "connection_thread_unavailable", requestId: message.requestId };
@@ -459,7 +499,12 @@ export function createControlPlane(options = {}) {
     const previousTaskId = optionalText(input.previous_task_id, 128);
     const replyToRequestId = optionalText(input.reply_to_request_id, 128);
     const reason = optionalText(input.reason, 600);
-    const targetMachine = requiredText(input.target_machine, "target_machine", 64);
+    const targetMachine = outboundMachineRole(input.target_machine, "target_machine");
+    if (targetMachine !== oppositeMachineRole(configuration.localMachine)) {
+      const error = new Error(`target_machine 必须是本机 ${configuration.localMachine} 的可信对端角色`);
+      error.code = "INVALID_MACHINE_DIRECTION";
+      throw error;
+    }
     let matchedRequest = null;
     if (replyToRequestId) {
       matchedRequest = state.getConnectionRequest(replyToRequestId);
@@ -467,13 +512,13 @@ export function createControlPlane(options = {}) {
     } else if (previousTaskId) {
       matchedRequest = state.listConnectionRequests()
         .filter((request) => request.proposedTaskId === previousTaskId
-          && request.sourceMachine === targetMachine
-          && request.targetMachine === configuration.localMachine
+          && machineRolesEqual(request.sourceMachine, targetMachine)
+          && machineRolesEqual(request.targetMachine, configuration.localMachine)
           && request.sourceConversationId)
         .sort((left, right) => Date.parse(right.receivedAt) - Date.parse(left.receivedAt))[0] ?? null;
     }
-    if (matchedRequest && (matchedRequest.sourceMachine !== targetMachine
-      || matchedRequest.targetMachine !== configuration.localMachine)) {
+    if (matchedRequest && (!machineRolesEqual(matchedRequest.sourceMachine, targetMachine)
+      || !machineRolesEqual(matchedRequest.targetMachine, configuration.localMachine))) {
       throw new Error(`连接请求机器方向不匹配：${matchedRequest.requestId}`);
     }
     const explicitTargetConversationId = optionalText(input.target_conversation_id, 256);

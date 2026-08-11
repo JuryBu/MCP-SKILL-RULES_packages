@@ -113,6 +113,31 @@ test("register is idempotent and rejects silent conversation changes", () => {
   }
 });
 
+test("new task routes require canonical machine role fields", () => {
+  const fixture = createFixture();
+  try {
+    for (const overrides of [
+      { localRole: "developer" },
+      { sourceMachine: "developer" },
+      { targetMachine: "trainer" },
+    ]) {
+      assertRegistryError(() => fixture.registry.register(taskInput(overrides)), "INVALID_ARGUMENT");
+    }
+    const registered = fixture.registry.register(taskInput());
+    assertRegistryError(
+      () => fixture.registry.update({
+        taskId: registered.taskId,
+        expectedGeneration: registered.generation,
+        targetMachine: "developer",
+      }),
+      "INVALID_ARGUMENT",
+    );
+    assert.equal(fixture.registry.get(registered.taskId).targetMachine, "training");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("legacy sequence-only tasks migrate without inventing message timestamps", () => {
   const fixture = createFixture();
   try {

@@ -3,6 +3,7 @@ import path from "node:path";
 import { createHash } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { canonicalMachineRole } from "./machine-role.mjs";
 
 const DEFAULT_ALLOWED_EVENTS = [
   "started",
@@ -62,6 +63,25 @@ function boundedString(value, name, maximum, required = false) {
     throw new NapCatNotifierError("INVALID_ARGUMENT", `${name} 不能超过 ${maximum} 个字符`);
   }
   return normalized;
+}
+
+function outboundMachineRole(value, name, required = false) {
+  const role = boundedString(value, name, 64, required);
+  if (!role) return "";
+  const canonical = canonicalMachineRole(role);
+  if (!canonical) {
+    throw new NapCatNotifierError(
+      "INVALID_MACHINE_ROLE",
+      `${name} 只允许标准值 development 或 training；收到 ${role}`,
+    );
+  }
+  if (canonical !== role) {
+    throw new NapCatNotifierError(
+      "MACHINE_ROLE_ALIAS_NOT_CANONICAL",
+      `${name} 使用了兼容别名 ${role}；请改为标准值 ${canonical} 后再发送`,
+    );
+  }
+  return canonical;
 }
 
 function positiveInteger(value, fallback, minimum, maximum) {
@@ -628,8 +648,8 @@ function normalizeTextInput(input) {
     dedupeKey,
     deliveryId: boundedString(input.delivery_id, "delivery_id", 128) || stableDeliveryId("text", dedupeKey),
     text: boundedString(input.text, "text", 1000, true),
-    sourceMachine: boundedString(input.source_machine, "source_machine", 64),
-    targetMachine: boundedString(input.target_machine, "target_machine", 64),
+    sourceMachine: outboundMachineRole(input.source_machine, "source_machine", Boolean(taskId)),
+    targetMachine: outboundMachineRole(input.target_machine, "target_machine", Boolean(taskId)),
   };
 }
 
@@ -701,8 +721,8 @@ function normalizeFileInput(input, maximumFileBytes) {
     throw new NapCatNotifierError("INVALID_FILE_NAME", "name 只能是文件名，不能包含目录");
   }
   const taskId = boundedString(input.task_id, "task_id", 128);
-  const sourceMachine = boundedString(input.source_machine, "source_machine", 64, Boolean(taskId));
-  const targetMachine = boundedString(input.target_machine, "target_machine", 64, Boolean(taskId));
+  const sourceMachine = outboundMachineRole(input.source_machine, "source_machine", Boolean(taskId));
+  const targetMachine = outboundMachineRole(input.target_machine, "target_machine", Boolean(taskId));
   const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
   return {
     event: "file",

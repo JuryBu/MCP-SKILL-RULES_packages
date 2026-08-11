@@ -237,6 +237,60 @@ test("business delivery advances through machine and conversation receipts witho
   }
 });
 
+test("controlled alias is accepted with a canonical no-resend reminder", async () => {
+  const receiver = createFixture({
+    configuration: {
+      localMachine: "training",
+      trustedPeerQq: "1000000001",
+      expectedSelfId: "2000000002",
+    },
+  });
+  try {
+    await receiver.controlPlane.scanGroupHistory([]);
+    const business = businessMessage({ sourceMachine: "developer" });
+    assert.deepEqual(
+      await receiver.controlPlane.acknowledgeBusinessMessages([business], "machine_received"),
+      [{ deliveryId: "delivery-001", stage: "machine_received", sent: true }],
+    );
+    assert.match(receiver.groupSends[0].message, /target_machine：development/);
+    assert.match(receiver.groupSends[0].message, /source_machine=developer 已按标准 development 接纳/);
+    assert.match(receiver.groupSends[0].message, /本 delivery 已接纳，请勿重发/);
+  } finally {
+    receiver.cleanup();
+  }
+});
+
+test("receipt ingress accepts the controlled target alias but rejects unknown roles", async () => {
+  const fixture = createFixture();
+  try {
+    fixture.controlPlane.trackOutgoingDelivery({
+      deliveryId: "delivery-alias-receipt",
+      taskId: "stable-task",
+      sourceMachine: "development",
+      targetMachine: "training",
+      messageSeq: 77,
+    });
+    const accepted = await fixture.controlPlane.scanGroupHistory([
+      receiptMessage("machine_received", {
+        deliveryId: "delivery-alias-receipt",
+        targetMachine: "developer",
+      }),
+    ]);
+    assert.deepEqual(accepted.results.map((entry) => entry.outcome), ["machine_received"]);
+
+    const rejected = await fixture.controlPlane.scanGroupHistory([
+      receiptMessage("conversation_received", {
+        deliveryId: "delivery-alias-receipt",
+        sourceMachine: "trainer",
+      }),
+    ]);
+    assert.deepEqual(rejected.results, []);
+    assert.equal(fixture.controlPlane.getDeliveryStatus("delivery-alias-receipt").status, "machine_received");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("receipt identity is delivery based even when receiver-local message sequences collide", async () => {
   const fixture = createFixture();
   try {

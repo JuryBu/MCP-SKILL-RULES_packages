@@ -260,6 +260,29 @@ test("durable ledger acceptance emits conversation receipts during legal wake co
   ]);
 });
 
+test("controlled developer alias reaches the durable task ledger in both directions", async () => {
+  const training = fixture({
+    messages: [message(14, { sourceMachine: "developer", targetMachine: "training" })],
+  });
+  const trainingResult = await createTaskRouter(training).scanOnce();
+  assert.equal(trainingResult.results[0].outcome, "accepted");
+  assert.deepEqual(
+    training.calls.find((call) => call.type === "observeMessages").input.messages.map((entry) => entry.messageSeq),
+    [14],
+  );
+
+  const development = fixture({
+    task: { localRole: "development", sourceMachine: "training", targetMachine: "development" },
+    messages: [message(15, { sourceMachine: "training", targetMachine: "developer" })],
+  });
+  const developmentResult = await createTaskRouter(development).scanOnce();
+  assert.equal(developmentResult.results[0].outcome, "accepted");
+  assert.deepEqual(
+    development.calls.find((call) => call.type === "observeMessages").input.messages.map((entry) => entry.messageSeq),
+    [15],
+  );
+});
+
 test("new messages trigger one guidance wake after cooldown while old messages remain pending", async () => {
   const originalTime = message(10).time;
   const current = fixture({
@@ -293,6 +316,8 @@ test("self, untrusted, wrong-task, and wrong-machine messages never wake", async
     message(11, { senderId: "999" }),
     message(12, { taskId: "数字图像处理" }),
     message(13, { targetMachine: "development" }),
+    message(14, { sourceMachine: "trainer" }),
+    message(15, { targetMachine: "training-preview" }),
   ] });
   const result = await createTaskRouter(current).scanOnce();
   assert.equal(result.results[0].outcome, "no_new_message");
