@@ -55,6 +55,21 @@ function readHealth(port) {
   });
 }
 
+function readDeepHealth(port, endpoint) {
+  return new Promise((resolve, reject) => {
+    const request = http.get(
+      `http://127.0.0.1:${port}/health?endpoint=${encodeURIComponent(endpoint)}&deep=1`,
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => chunks.push(chunk));
+        response.on("end", () => resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}")));
+      },
+    );
+    request.setTimeout(20000, () => request.destroy(new Error("deep health request timed out")));
+    request.once("error", reject);
+  });
+}
+
 fs.mkdirSync(path.join(fakeSandboxRoot, "dist"), { recursive: true });
 fs.writeFileSync(path.join(fakeSandboxRoot, "dist", "index.js"), `
 import fs from "node:fs";
@@ -69,7 +84,7 @@ const server = new Server({ name: "fake-sandbox", version: "1.0.0" }, { capabili
 let listCount = 0;
 server.setRequestHandler(types.ListToolsRequestSchema, async () => {
   listCount += 1;
-  if (listCount > 1) await new Promise(() => undefined);
+  if (listCount > 2) await new Promise(() => undefined);
   return { tools: [{ name: "delay", description: "delay", inputSchema: { type: "object" } }] };
 });
 server.setRequestHandler(types.CallToolRequestSchema, async (request, extra) => {
@@ -124,6 +139,9 @@ try {
     }
   }
   assert.equal(ready, true, `broker health did not become ready: ${stderr}`);
+  const startupHealth = await readDeepHealth(port, "sandbox");
+  assert.equal(startupHealth.healthy, true, `sandbox backend did not prewarm: ${JSON.stringify(startupHealth)}`);
+  assert.equal(startupHealth.probeTimeoutMs, 15000);
 
   client = new Client({ name: "broker-timeout-smoke", version: "1.0.0" });
   await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/sandbox/mcp`)));

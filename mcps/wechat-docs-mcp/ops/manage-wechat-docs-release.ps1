@@ -18,6 +18,8 @@ param(
   [string]$BrokerBaseUrl = "http://127.0.0.1:14588",
   [ValidateRange(5, 180)]
   [int]$TimeoutSeconds = 60,
+  [ValidateRange(5, 600)]
+  [int]$StartupProbeTimeoutSeconds = 15,
   [string]$ProbePython,
   [switch]$ConfirmProductionActivation,
   [switch]$FailBeforePollStart
@@ -173,6 +175,14 @@ function Set-AutoPoll {
   Write-JsonAtomic -Path $PrivateEnvPath -Value $PrivateEnv
 }
 
+function Get-EndpointStartupTimeoutKey {
+  param([string]$Name)
+  $Suffix = $Name.Trim().ToUpperInvariant() -replace '[^A-Z0-9]+', '_'
+  $Suffix = $Suffix.Trim('_')
+  if ([string]::IsNullOrWhiteSpace($Suffix)) { throw "Endpoint name is required for startup timeout configuration" }
+  return "CODEX_MCP_BROKER_$($Suffix)_STARTUP_TIMEOUT_MS"
+}
+
 function Invoke-McpTool {
   param(
     [ValidateSet("Http", "Fixture")][string]$Mode,
@@ -260,7 +270,7 @@ function Get-FixtureState {
 function Get-EndpointHealth {
   param([ValidateSet("Http", "Fixture")][string]$Mode, [string]$Name, [string]$FixtureStatePath)
   if ($Mode -eq "Http") {
-    return Invoke-RestMethod -Method Get -Uri "$BrokerBaseUrl/health?endpoint=$Name&deep=1" -TimeoutSec 20
+    return Invoke-RestMethod -Method Get -Uri "$BrokerBaseUrl/health?endpoint=$Name&deep=1" -TimeoutSec ($StartupProbeTimeoutSeconds + 5)
   }
   $State = Get-FixtureState $FixtureStatePath
   $Entry = $State.endpoints.PSObject.Properties[$Name].Value
@@ -281,7 +291,8 @@ function Wait-EndpointHealth {
     [string]$FixtureStatePath,
     [int]$MinimumGeneration = 0
   )
-  $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+  $DeadlineSeconds = $(if ($Mode -eq "Http") { [Math]::Max($TimeoutSeconds, $StartupProbeTimeoutSeconds + 5) } else { $TimeoutSeconds })
+  $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($DeadlineSeconds)
   do {
     try { $Health = Get-EndpointHealth -Mode $Mode -Name $Name -FixtureStatePath $FixtureStatePath } catch { $Health = $null }
     if ($null -ne $Health -and $Health.healthy -eq $true -and [int]$Health.toolCount -eq $ToolCount -and [int]$Health.backend.generation -ge $MinimumGeneration) {
@@ -351,7 +362,8 @@ function Wait-Supervisor {
     [int]$BackendPid,
     [int]$BackendGeneration
   )
-  $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($TimeoutSeconds)
+  $DeadlineSeconds = $(if ($Mode -eq "Http") { [Math]::Max($TimeoutSeconds, $StartupProbeTimeoutSeconds + 45) } else { $TimeoutSeconds })
+  $Deadline = [DateTimeOffset]::UtcNow.AddSeconds($DeadlineSeconds)
   do {
     $State = Get-SupervisorState -Mode $Mode -SupervisorPath $SupervisorPath -FixtureStatePath $FixtureStatePath
     if ($State.healthy -eq $true -and [int]$State.consecutiveFailures -eq 0 -and [int]$State.backendPid -eq $BackendPid -and [int]$State.backendGeneration -eq $BackendGeneration) {
@@ -552,6 +564,12 @@ function Invoke-ReleaseSwitch {
   $BeforeStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
   Assert-PollStatus -Status $BeforeStatus -ExpectedRunning $true
   Copy-ActivationBackup -BackupRoot $BackupRoot -PointersRoot $PointersRoot -RuntimePath $RuntimePath -PrivateEnvPath $PrivateEnvPath -ManifestPath $ManifestPath -CurrentTarget $PreviousTarget
+  $StartupTimeoutKey = Get-EndpointStartupTimeoutKey -Name $Endpoint
+  foreach ($Path in @($PrivateEnvPath, (Join-Path $BackupRoot "broker-private.env.json"))) {
+    $PrivateEnv = Read-Json $Path
+    Set-JsonProperty -Object $PrivateEnv -Name $StartupTimeoutKey -Value ([string]($StartupProbeTimeoutSeconds * 1000))
+    Write-JsonAtomic -Path $Path -Value $PrivateEnv
+  }
   $PollStopped = $false
   try {
     $StopResult = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_poll_stop" -Arguments ([pscustomobject]@{ timeout = [double]($TimeoutSeconds + 5) }) -CallTimeoutSeconds ($TimeoutSeconds + 20)

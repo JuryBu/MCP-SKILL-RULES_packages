@@ -24,6 +24,7 @@ if (-not $SourceBrokerRoot) {
 }
 $SourceBrokerRoot = [System.IO.Path]::GetFullPath($SourceBrokerRoot)
 $SourceBrokerPath = Join-Path $SourceBrokerRoot "broker.mjs"
+$SourceEndpointConfigPath = Join-Path $SourceBrokerRoot "endpoint-config.mjs"
 $SourceLifecyclePath = Join-Path $SourceBrokerRoot "request-lifecycle.mjs"
 $SourceStopScript = Join-Path $InstallerRoot "Stop-CodexMcpBroker.ps1"
 $SourceStartScript = Join-Path $InstallerRoot "Start-CodexMcpBroker.ps1"
@@ -67,6 +68,7 @@ if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
 }
 $BrokerRoot = [System.IO.Path]::GetFullPath($BrokerRoot)
 $InstalledBrokerPath = if ($ManagedBrokerPath) { $ManagedBrokerPath } else { Join-Path $BrokerRoot "broker.mjs" }
+$InstalledEndpointConfigPath = Join-Path $BrokerRoot "endpoint-config.mjs"
 $InstalledLifecyclePath = Join-Path $BrokerRoot "request-lifecycle.mjs"
 $StopScript = if ($ManagedStopScript) { $ManagedStopScript } else { Join-Path $BrokerRoot "Stop-CodexMcpBroker.ps1" }
 $StartScript = if ($ManagedStartScript) { $ManagedStartScript } else { Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1" }
@@ -282,7 +284,7 @@ function Wait-BrokerDeepHealth {
     throw "Deep health did not become ready for endpoint '$Endpoint' before the startup deadline. Last observation: $LastObservation"
 }
 
-foreach ($Path in @($SourceBrokerPath, $SourceLifecyclePath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
+foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required file is missing: $Path" }
 }
 if ($ManagedStartScript -and -not (Test-Path -LiteralPath $ManagedStartScript -PathType Leaf)) {
@@ -307,6 +309,8 @@ try {
     $ValidationNodeExe = if ($ManagedNodeExe) { $ManagedNodeExe } else { "node" }
     & $ValidationNodeExe --check $SourceBrokerPath
     if ($LASTEXITCODE -ne 0) { throw "Source broker syntax validation failed." }
+    & $ValidationNodeExe --check $SourceEndpointConfigPath
+    if ($LASTEXITCODE -ne 0) { throw "Source endpoint configuration syntax validation failed." }
     & $ValidationNodeExe --check $SourceLifecyclePath
     if ($LASTEXITCODE -ne 0) { throw "Source request lifecycle syntax validation failed." }
 } finally {
@@ -326,6 +330,7 @@ if (-not $ShouldActivate) {
         brokerPath = $InstalledBrokerPath
         serviceManifestPath = if ($ManagedStartScript) { $ConfiguredServiceManifestPath } else { $null }
         lifecycleBootstrap = $true
+        endpointConfigBootstrap = -not (Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf)
         protectedState = $ProtectedBefore
     } | ConvertTo-Json -Depth 10
     return
@@ -345,6 +350,8 @@ try {
 New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 Copy-Item -LiteralPath $InstalledBrokerPath -Destination (Join-Path $BackupRoot "broker.mjs") -Force
 Copy-Item -LiteralPath $InstalledLifecyclePath -Destination (Join-Path $BackupRoot "request-lifecycle.mjs") -Force
+$InstalledEndpointConfigExisted = Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf
+if ($InstalledEndpointConfigExisted) { Copy-Item -LiteralPath $InstalledEndpointConfigPath -Destination (Join-Path $BackupRoot "endpoint-config.mjs") -Force }
 $InstalledStartExisted = Test-Path -LiteralPath $StartScript -PathType Leaf
 $InstalledStopExisted = Test-Path -LiteralPath $StopScript -PathType Leaf
 if ($InstalledStartExisted) { Copy-Item -LiteralPath $StartScript -Destination (Join-Path $BackupRoot "Start-CodexMcpBroker.ps1") -Force }
@@ -352,6 +359,7 @@ if ($InstalledStopExisted) { Copy-Item -LiteralPath $StopScript -Destination (Jo
 [pscustomobject]@{
     installedStartExisted = $InstalledStartExisted
     installedStopExisted = $InstalledStopExisted
+    installedEndpointConfigExisted = $InstalledEndpointConfigExisted
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BackupRoot "lifecycle-state.json") -Encoding UTF8
 
 $Activated = $false
@@ -364,12 +372,16 @@ try {
     Copy-Item -LiteralPath $SourceStopScript -Destination $StopScript -Force
     Copy-Item -LiteralPath $SourceStartScript -Destination $StartScript -Force
     Copy-Item -LiteralPath $SourceBrokerPath -Destination $InstalledBrokerPath -Force
+    Copy-Item -LiteralPath $SourceEndpointConfigPath -Destination $InstalledEndpointConfigPath -Force
     Copy-Item -LiteralPath $SourceLifecyclePath -Destination $InstalledLifecyclePath -Force
     if ((Get-FileHashOrNull -Path $InstalledBrokerPath) -ne (Get-FileHashOrNull -Path $SourceBrokerPath)) {
         throw "Installed broker hash does not match the validated source."
     }
     if ((Get-FileHashOrNull -Path $InstalledLifecyclePath) -ne (Get-FileHashOrNull -Path $SourceLifecyclePath)) {
         throw "Installed request lifecycle hash does not match the validated source."
+    }
+    if ((Get-FileHashOrNull -Path $InstalledEndpointConfigPath) -ne (Get-FileHashOrNull -Path $SourceEndpointConfigPath)) {
+        throw "Installed endpoint configuration hash does not match the validated source."
     }
     $PreviousManagedNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
     $CandidateStartOutput = @()
@@ -410,6 +422,7 @@ try {
         brokerPath = $InstalledBrokerPath
         serviceManifestPath = if ($ManagedStartScript) { $ConfiguredServiceManifestPath } else { $null }
         lifecycleBootstrapped = (-not $InstalledStartExisted -or -not $InstalledStopExisted)
+        endpointConfigBootstrapped = -not $InstalledEndpointConfigExisted
         endpoints = @($DeepHealth | ForEach-Object { [pscustomobject]@{ endpoint = $_.endpoint; toolCount = $_.toolCount; recovered = $_.recovered } })
         protectedState = $ProtectedBefore
     } | ConvertTo-Json -Depth 10
@@ -427,6 +440,11 @@ try {
         try {
             Copy-Item -LiteralPath (Join-Path $BackupRoot "broker.mjs") -Destination $InstalledBrokerPath -Force
             Copy-Item -LiteralPath (Join-Path $BackupRoot "request-lifecycle.mjs") -Destination $InstalledLifecyclePath -Force
+            if ($InstalledEndpointConfigExisted) {
+                Copy-Item -LiteralPath (Join-Path $BackupRoot "endpoint-config.mjs") -Destination $InstalledEndpointConfigPath -Force
+            } else {
+                Remove-Item -LiteralPath $InstalledEndpointConfigPath -Force -ErrorAction SilentlyContinue
+            }
         } catch { $RollbackErrors.Add("code restore: $($_.Exception.Message)") }
         try {
             if ($InstalledStartExisted) {

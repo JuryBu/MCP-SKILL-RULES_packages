@@ -275,6 +275,8 @@ class ReleaseManagerDrillTests(unittest.TestCase):
                 str(self.root / "protected-broker"),
                 "-TimeoutSeconds",
                 "5",
+                "-StartupProbeTimeoutSeconds",
+                "25",
             ],
             timeout=90,
             extra_environment=self.package_environment,
@@ -321,6 +323,8 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             )
             self.assertEqual("release-candidate", active["releaseId"])
             self.assertEqual("release-candidate", last_known_good["releaseId"])
+            private_env = json.loads((case_root / "broker" / "broker-private.env.json").read_text(encoding="utf-8"))
+            self.assertEqual("25000", private_env["CODEX_MCP_BROKER_WECHAT_DOCS_STARTUP_TIMEOUT_MS"])
             self.assertFalse(list((case_root / "service").glob("current.next-*")))
             connection = sqlite3.connect(case_root / "data" / "state" / "events.sqlite3")
             try:
@@ -342,6 +346,8 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             )
             self.assertEqual("release-old", active["releaseId"])
             self.assertEqual("release-old", last_known_good["releaseId"])
+            private_env = json.loads((case_root / "broker" / "broker-private.env.json").read_text(encoding="utf-8"))
+            self.assertEqual("25000", private_env["CODEX_MCP_BROKER_WECHAT_DOCS_STARTUP_TIMEOUT_MS"])
             self.assertFalse(list((case_root / "service").glob("current.next-*")))
             rollback_files = list((case_root / "data" / "backups").glob("*/rollback-verification.json"))
             self.assertEqual(1, len(rollback_files))

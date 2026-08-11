@@ -31,6 +31,7 @@ function Get-StaticTargetSnapshot {
     $snapshot = [ordered]@{}
     foreach ($name in @(
         "broker.mjs",
+        "endpoint-config.mjs",
         "request-lifecycle.mjs",
         "broker-private.env.json",
         "Start-CodexMcpBroker.ps1",
@@ -72,6 +73,7 @@ if (mode === "unhealthy") {
 '@
     $fixtureMarker = [System.IO.Path]::GetFileName($Root)
     Set-Content -LiteralPath (Join-Path $Root "broker.mjs") -Encoding UTF8 -Value ($broker.Replace("__MODE__", $Mode) + "`n// fixture: $fixtureMarker")
+    Set-Content -LiteralPath (Join-Path $Root "endpoint-config.mjs") -Encoding UTF8 -Value "export const endpointConfig = '$fixtureMarker';"
     Set-Content -LiteralPath (Join-Path $Root "request-lifecycle.mjs") -Encoding UTF8 -Value "export const lifecycle = true;"
     Set-Content -LiteralPath (Join-Path $Root "test\request-lifecycle.test.mjs") -Encoding UTF8 -Value 'import test from "node:test"; import assert from "node:assert/strict"; test("fixture", () => assert.equal(1, 1));'
 }
@@ -124,6 +126,9 @@ function Initialize-Target {
     )
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     Copy-Item -LiteralPath (Join-Path $OldSource "broker.mjs") -Destination (Join-Path $Root "broker.mjs") -Force
+    if (Test-Path -LiteralPath (Join-Path $OldSource "endpoint-config.mjs") -PathType Leaf) {
+        Copy-Item -LiteralPath (Join-Path $OldSource "endpoint-config.mjs") -Destination (Join-Path $Root "endpoint-config.mjs") -Force
+    }
     Copy-Item -LiteralPath (Join-Path $OldSource "request-lifecycle.mjs") -Destination (Join-Path $Root "request-lifecycle.mjs") -Force
     [ordered]@{
         CODEX_MCP_BROKER_PORT = [string]$Port
@@ -145,6 +150,7 @@ try {
     Write-MockSource -Root $unhealthySource -Mode unhealthy
     Write-MockSource -Root $transientDeepSource -Mode transient-deep
     Write-MockSource -Root $oldSource -Mode healthy
+    Remove-Item -LiteralPath (Join-Path $oldSource "endpoint-config.mjs") -Force
 
     $flatRoot = Join-Path $testRoot "process-match"
     New-Item -ItemType Directory -Force -Path $flatRoot | Out-Null
@@ -247,6 +253,7 @@ server.listen(port, "127.0.0.1", () => {
         $port = 19480 + $caseIndex
         Initialize-Target -Root $root -OldSource $oldSource -Port $port -StartExists $state.start -StopExists $state.stop
         $oldBrokerHash = Get-Sha256 (Join-Path $root "broker.mjs")
+        $oldEndpointConfigHash = Get-Sha256 (Join-Path $root "endpoint-config.mjs")
         $oldLifecycleHash = Get-Sha256 (Join-Path $root "request-lifecycle.mjs")
         $oldStartHash = Get-Sha256 (Join-Path $root "Start-CodexMcpBroker.ps1")
         $oldStopHash = Get-Sha256 (Join-Path $root "Stop-CodexMcpBroker.ps1")
@@ -257,6 +264,7 @@ server.listen(port, "127.0.0.1", () => {
         if (-not $failed) { throw "Rollback case $caseIndex unexpectedly succeeded." }
         Wait-Health -Port $port
         if ((Get-Sha256 (Join-Path $root "broker.mjs")) -ne $oldBrokerHash) { throw "Rollback case $caseIndex did not restore broker.mjs." }
+        if ((Get-Sha256 (Join-Path $root "endpoint-config.mjs")) -ne $oldEndpointConfigHash) { throw "Rollback case $caseIndex did not restore endpoint-config.mjs state." }
         if ((Get-Sha256 (Join-Path $root "request-lifecycle.mjs")) -ne $oldLifecycleHash) { throw "Rollback case $caseIndex did not restore request-lifecycle.mjs." }
         if ((Get-Sha256 (Join-Path $root "Start-CodexMcpBroker.ps1")) -ne $oldStartHash) { throw "Rollback case $caseIndex did not restore Start script state." }
         if ((Get-Sha256 (Join-Path $root "Stop-CodexMcpBroker.ps1")) -ne $oldStopHash) { throw "Rollback case $caseIndex did not restore Stop script state." }
@@ -271,6 +279,7 @@ server.listen(port, "127.0.0.1", () => {
     $successPidAfter = [int](Get-Content -LiteralPath (Join-Path $successRoot "broker.pid") -Encoding UTF8 | Select-Object -First 1)
     if ($successPidAfter -eq $successPidBefore) { throw "Successful update did not replace the broker PID." }
     if ((Get-Sha256 (Join-Path $successRoot "broker.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "broker.mjs"))) { throw "Successful update did not install candidate broker.mjs." }
+    if ((Get-Sha256 (Join-Path $successRoot "endpoint-config.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "endpoint-config.mjs"))) { throw "Successful update did not install candidate endpoint-config.mjs." }
     foreach ($name in @("Start-CodexMcpBroker.ps1", "Stop-CodexMcpBroker.ps1")) {
         if (-not (Test-Path -LiteralPath (Join-Path $successRoot $name) -PathType Leaf)) { throw "Successful update did not retain $name." }
     }
@@ -320,7 +329,9 @@ server.listen(port, "127.0.0.1", () => {
         if ((Get-Sha256 $managedStartScript) -ne (Get-Sha256 $startScriptPath)) { throw "Managed update did not install the source Start script at the manifest path." }
         if ((Get-Sha256 $managedStopScript) -ne (Get-Sha256 $stopScriptPath)) { throw "Managed update did not install the source Stop script at the manifest path." }
         if ((Get-Sha256 (Join-Path $managedRoot "broker.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "broker.mjs"))) { throw "Managed update did not install the candidate broker at the manifest path." }
+        if ((Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "endpoint-config.mjs"))) { throw "Managed update did not install endpoint-config.mjs at the manifest path." }
         $managedBrokerHash = Get-Sha256 (Join-Path $managedRoot "broker.mjs")
+        $managedEndpointConfigHash = Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")
         $managedLifecycleHash = Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")
         $managedStartHash = Get-Sha256 $managedStartScript
         $managedStopHash = Get-Sha256 $managedStopScript
@@ -343,6 +354,7 @@ server.listen(port, "127.0.0.1", () => {
         }
         Wait-Health -Port 19491
         if ((Get-Sha256 (Join-Path $managedRoot "broker.mjs")) -ne $managedBrokerHash) { throw "Managed rollback did not restore broker.mjs." }
+        if ((Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")) -ne $managedEndpointConfigHash) { throw "Managed rollback did not restore endpoint-config.mjs." }
         if ((Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")) -ne $managedLifecycleHash) { throw "Managed rollback did not restore request-lifecycle.mjs." }
         if ((Get-Sha256 $managedStartScript) -ne $managedStartHash) { throw "Managed rollback did not restore the Start script." }
         if ((Get-Sha256 $managedStopScript) -ne $managedStopHash) { throw "Managed rollback did not restore the Stop script." }
@@ -359,6 +371,9 @@ server.listen(port, "127.0.0.1", () => {
     Initialize-Target -Root $actualRoot -OldSource $oldSource -Port 19492 -StartExists $true -StopExists $true
     New-Item -ItemType Directory -Force -Path $wrongRoot | Out-Null
     Copy-Item -LiteralPath (Join-Path $oldSource "broker.mjs") -Destination (Join-Path $wrongRoot "broker.mjs") -Force
+    if (Test-Path -LiteralPath (Join-Path $oldSource "endpoint-config.mjs") -PathType Leaf) {
+        Copy-Item -LiteralPath (Join-Path $oldSource "endpoint-config.mjs") -Destination (Join-Path $wrongRoot "endpoint-config.mjs") -Force
+    }
     Copy-Item -LiteralPath (Join-Path $oldSource "request-lifecycle.mjs") -Destination (Join-Path $wrongRoot "request-lifecycle.mjs") -Force
     $wrongSnapshotBefore = Get-StaticTargetSnapshot -Root $wrongRoot
     $wrongTargetFailed = $false

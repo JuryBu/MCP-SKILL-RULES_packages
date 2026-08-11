@@ -21,6 +21,7 @@
 | `WECHAT_KEY_TOOL` | `<data_root>/private-state/tools/wcdb_key_tool_windows.py` | 密钥提取工具路径 |
 | `TENCENT_DOCS_MCP_TOKEN_FILE` | `<data_root>/secrets/tencent-docs-mcp.token` | 腾讯文档 Token 文件 |
 | `WECHAT_DOCS_MCP_AUTO_POLL` | `0` | MCP 进程启动时自动开启后台轮询 |
+| `CODEX_MCP_BROKER_WECHAT_DOCS_STARTUP_TIMEOUT_MS` | `15000` | broker 深层健康检查等待微信 backend 冷启动的上限；仅在实测依赖导入较慢时提高 |
 | `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |

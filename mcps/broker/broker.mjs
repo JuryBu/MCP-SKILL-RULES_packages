@@ -6,6 +6,11 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import {
+  DEFAULT_BACKEND_STARTUP_TIMEOUT_MS,
+  normalizeBackendStartupTimeoutMs,
+  resolveEndpointStartupTimeoutMs,
+} from "./endpoint-config.mjs";
+import {
   attachBrokerRequestMeta,
   createBackendRequestOptions,
   createBrokerBackendTimeoutResult,
@@ -109,6 +114,7 @@ const configuredRequestTimeoutMs = Number(process.env.CODEX_MCP_BROKER_REQUEST_T
 const requestTimeoutMs = Number.isFinite(configuredRequestTimeoutMs) && configuredRequestTimeoutMs > 0
   ? Math.floor(configuredRequestTimeoutMs)
   : 120000;
+const defaultBackendStartupTimeoutMs = DEFAULT_BACKEND_STARTUP_TIMEOUT_MS;
 const configuredWaitTimeoutCapMs = Number(process.env.CODEX_MCP_BROKER_WAIT_TIMEOUT_MS || 1800000);
 const waitTimeoutCapMs = Number.isFinite(configuredWaitTimeoutCapMs) && configuredWaitTimeoutCapMs > 0
   ? Math.max(requestTimeoutMs, Math.floor(configuredWaitTimeoutCapMs))
@@ -301,8 +307,21 @@ const endpoints = {
   },
 };
 
+for (const [name, config] of Object.entries(endpoints)) {
+  config.startupProbeTimeoutMs = resolveEndpointStartupTimeoutMs(name, {
+    env: process.env,
+    defaultTimeoutMs: defaultBackendStartupTimeoutMs,
+  });
+}
+
 function refreshEndpointConfigFromPrivateEnv(name, config) {
   const privateEnv = readPrivateEnvSnapshot() || {};
+  const previousStartupProbeTimeoutMs = config.startupProbeTimeoutMs;
+  config.startupProbeTimeoutMs = resolveEndpointStartupTimeoutMs(name, {
+    env: process.env,
+    privateEnv,
+    defaultTimeoutMs: defaultBackendStartupTimeoutMs,
+  });
   if (name === "wechat-docs") {
     const refreshedRoot = privateEnv.WECHAT_DOCS_MCP_ROOT || config.cwd;
     const refreshedPython = privateEnv.WECHAT_DOCS_MCP_PYTHON || config.command;
@@ -327,9 +346,19 @@ function refreshEndpointConfigFromPrivateEnv(name, config) {
       CODEX_WAKE_PROXY_RUNTIME_FILE: privateEnv.CODEX_WAKE_PROXY_RUNTIME_FILE || config.env.CODEX_WAKE_PROXY_RUNTIME_FILE,
       CODEX_WAKE_PROXY_TOKEN_FILE: privateEnv.CODEX_WAKE_PROXY_TOKEN_FILE || config.env.CODEX_WAKE_PROXY_TOKEN_FILE,
     };
-    return { refreshed: true, cwd: refreshedRoot, dataRoot: refreshedDataRoot };
+    return {
+      refreshed: true,
+      cwd: refreshedRoot,
+      dataRoot: refreshedDataRoot,
+      startupProbeTimeoutMs: config.startupProbeTimeoutMs,
+    };
   }
-  if (name !== "napcat") return { refreshed: false };
+  if (name !== "napcat") {
+    return {
+      refreshed: previousStartupProbeTimeoutMs !== config.startupProbeTimeoutMs,
+      startupProbeTimeoutMs: config.startupProbeTimeoutMs,
+    };
+  }
   const refreshedRoot = privateEnv.NAPCAT_MCP_ROOT || config.cwd;
   const refreshedDataRoot = privateEnv.CODEX_TOOLKIT_NAPCAT_DATA_ROOT || config.env.CODEX_TOOLKIT_NAPCAT_DATA_ROOT;
   config.cwd = refreshedRoot;
@@ -346,7 +375,12 @@ function refreshEndpointConfigFromPrivateEnv(name, config) {
     CODEX_TOOLKIT_NAPCAT_DATA_ROOT: refreshedDataRoot,
     CODEX_TOOLKIT_BROKER_ROOT: privateEnv.CODEX_TOOLKIT_BROKER_ROOT || config.env.CODEX_TOOLKIT_BROKER_ROOT,
   };
-  return { refreshed: true, cwd: refreshedRoot, dataRoot: refreshedDataRoot };
+  return {
+    refreshed: true,
+    cwd: refreshedRoot,
+    dataRoot: refreshedDataRoot,
+    startupProbeTimeoutMs: config.startupProbeTimeoutMs,
+  };
 }
 
 function log(message, details = undefined) {
@@ -818,6 +852,7 @@ class EndpointBroker {
       sessionIdleMs,
       oldestSessionAt: sessions.map((session) => session.createdAt).sort()[0] ?? null,
       newestSessionSeenAt: sessions.map((session) => session.lastSeenAt).sort().at(-1) ?? null,
+      startupProbeTimeoutMs: this.config.startupProbeTimeoutMs,
       toolsListCacheAt: this.cachedToolsListAt,
       consecutiveToolsListFailures: this.consecutiveToolsListFailures,
       activeToolCalls: this.activeToolCalls,
@@ -830,18 +865,42 @@ class EndpointBroker {
   }
 
   async probeBackend(options = {}) {
-    const request = () => this.backend.request(
+    const connectedProbeTimeoutMs = normalizeBackendStartupTimeoutMs(
+      options.timeoutMs,
+      DEFAULT_BACKEND_STARTUP_TIMEOUT_MS,
+    );
+    const startupProbeTimeoutMs = normalizeBackendStartupTimeoutMs(
+      options.startupTimeoutMs,
+      this.config.startupProbeTimeoutMs,
+    );
+    let timeoutMs = this.backend.status().connected ? connectedProbeTimeoutMs : startupProbeTimeoutMs;
+    const request = (requestTimeoutMs) => this.backend.request(
       { method: "tools/list", params: {} },
       ListToolsResultSchema,
-      { closeOnError: true, timeoutMs: options.timeoutMs },
+      { closeOnError: true, timeoutMs: requestTimeoutMs },
     );
     try {
-      const result = await request();
-      return { healthy: true, toolCount: result.tools.length, recovered: false, backend: this.backend.status() };
+      const result = await request(timeoutMs);
+      return {
+        healthy: true,
+        toolCount: result.tools.length,
+        recovered: false,
+        probeTimeoutMs: timeoutMs,
+        startupProbeTimeoutMs,
+        backend: this.backend.status(),
+      };
     } catch (error) {
       if (!isFatalBackendTransportError(error)) throw error;
-      const result = await request();
-      return { healthy: true, toolCount: result.tools.length, recovered: true, backend: this.backend.status() };
+      timeoutMs = startupProbeTimeoutMs;
+      const result = await request(timeoutMs);
+      return {
+        healthy: true,
+        toolCount: result.tools.length,
+        recovered: true,
+        probeTimeoutMs: timeoutMs,
+        startupProbeTimeoutMs,
+        backend: this.backend.status(),
+      };
     }
   }
 
@@ -1218,7 +1277,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       try {
-        const probe = await broker.probeBackend({ timeoutMs: Math.min(requestTimeoutMs, 15000) });
+        const probe = await broker.probeBackend();
         writeState(brokers);
         sendJson(res, 200, { ok: true, healthy: true, pid: process.pid, endpoint: endpointName, ...probe });
       } catch (error) {
@@ -1229,6 +1288,7 @@ const server = http.createServer(async (req, res) => {
           pid: process.pid,
           endpoint: endpointName,
           error: error.message,
+          startupProbeTimeoutMs: broker.config.startupProbeTimeoutMs,
           backend: broker.backend.status(),
         });
       }

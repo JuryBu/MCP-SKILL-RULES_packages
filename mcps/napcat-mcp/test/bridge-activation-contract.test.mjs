@@ -291,7 +291,7 @@ test("portable package entrypoint resolves the managed broker root and leaves it
   );
   write(path.join(packageRoot, "verify-package.ps1"), "Write-Output 'fixture package verified'\n");
   write(path.join(packageRoot, "manifest.json"), JSON.stringify({ source_commits: { napcat_mcp: "fixture" } }));
-  for (const brokerFile of ["broker.mjs", "request-lifecycle.mjs"]) {
+  for (const brokerFile of ["broker.mjs", "endpoint-config.mjs", "request-lifecycle.mjs"]) {
     const contents = `export const fixture = ${JSON.stringify(brokerFile)};\n`;
     write(path.join(packageRoot, "broker", brokerFile), contents);
     write(path.join(brokerRoot, brokerFile), contents);
@@ -309,7 +309,7 @@ test("portable package entrypoint resolves the managed broker root and leaves it
     `Set-Content -LiteralPath ${JSON.stringify(stopMarker)} -Value 'stopped' -Encoding UTF8\n`,
   );
   const brokerBefore = Object.fromEntries(
-    ["broker.mjs", "request-lifecycle.mjs"].map((name) => [name, fs.readFileSync(path.join(brokerRoot, name), "utf8")]),
+    ["broker.mjs", "endpoint-config.mjs", "request-lifecycle.mjs"].map((name) => [name, fs.readFileSync(path.join(brokerRoot, name), "utf8")]),
   );
   const result = runPowerShell(
     path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
