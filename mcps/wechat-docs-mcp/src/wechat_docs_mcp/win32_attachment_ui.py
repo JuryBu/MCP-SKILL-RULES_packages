@@ -51,6 +51,9 @@ DEFAULT_DRAFT_TIMEOUT_SECONDS = 60.0
 DEFAULT_CLEANUP_TIMEOUT_SECONDS = 30.0
 DEFAULT_DATABASE_POLL_SECONDS = 2.0
 FILE_DIALOG_TIMEOUT_SECONDS = 10.0
+FOREGROUND_RESTORE_POLL_ATTEMPTS = 20
+FOREGROUND_RESTORE_POLL_SECONDS = 0.05
+FOREGROUND_RESTORE_STABLE_SAMPLES = 2
 MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
 SAFE_CLIPBOARD_FORMATS = frozenset(
     {CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_HDROP, CF_LOCALE}
@@ -997,9 +1000,25 @@ class Win32WechatAttachmentBackend:
             expected_foregrounds = {snapshot.foreground_window}
         foreground_unchanged = current_foreground in expected_foregrounds
         mouse_unchanged = current_mouse == getattr(self, "_expected_mouse_position", None)
+        expected_last_input_tick = (
+            getattr(self, "_hidden_last_input_tick", None) if hidden_text_phase else None
+        )
+        last_input_tick_before_restore = (
+            self._last_input_tick() if expected_last_input_tick is not None else None
+        )
+        last_input_unchanged = (
+            expected_last_input_tick is None
+            or last_input_tick_before_restore == expected_last_input_tick
+        )
         self._environment_observation["foreground_unchanged_before_restore"] = foreground_unchanged
         self._environment_observation["mouse_unchanged_before_restore"] = mouse_unchanged
-        if not foreground_unchanged or not mouse_unchanged:
+        self._environment_observation["last_input_tick_before_restore"] = (
+            last_input_tick_before_restore
+        )
+        self._environment_observation["last_input_unchanged_before_restore"] = (
+            last_input_unchanged
+        )
+        if not foreground_unchanged or not mouse_unchanged or not last_input_unchanged:
             self._user_interaction_detected = True
         clipboard_sequence = int(self.user32.GetClipboardSequenceNumber())
         if self._owned_clipboard_sequence is not None:
@@ -1064,10 +1083,70 @@ class Win32WechatAttachmentBackend:
                 errors.append(error)
         try:
             self.user32.SetCursorPos(*snapshot.mouse_position)
-            if snapshot.foreground_window and self.user32.IsWindow(snapshot.foreground_window):
-                self.user32.SetForegroundWindow(snapshot.foreground_window)
         except Exception as error:
             errors.append(error)
+        foreground_restore_request_result: bool | None = None
+        try:
+            if (
+                int(self.user32.GetForegroundWindow()) != snapshot.foreground_window
+                and snapshot.foreground_window
+                and self.user32.IsWindow(snapshot.foreground_window)
+            ):
+                foreground_restore_request_result = bool(
+                    self.user32.SetForegroundWindow(snapshot.foreground_window)
+                )
+        except Exception as error:
+            errors.append(error)
+        stable_foreground_samples = 0
+        for _ in range(FOREGROUND_RESTORE_POLL_ATTEMPTS):
+            if int(self.user32.GetForegroundWindow()) == snapshot.foreground_window:
+                stable_foreground_samples += 1
+                if stable_foreground_samples >= FOREGROUND_RESTORE_STABLE_SAMPLES:
+                    break
+            else:
+                stable_foreground_samples = 0
+            time.sleep(FOREGROUND_RESTORE_POLL_SECONDS)
+        final_foreground = int(self.user32.GetForegroundWindow())
+        foreground_restored = (
+            stable_foreground_samples >= FOREGROUND_RESTORE_STABLE_SAMPLES
+            and final_foreground == snapshot.foreground_window
+        )
+        last_input_tick_after_restore = (
+            self._last_input_tick() if expected_last_input_tick is not None else None
+        )
+        last_input_unchanged_after_restore = (
+            expected_last_input_tick is None
+            or last_input_tick_after_restore == expected_last_input_tick
+        )
+        self._environment_observation["foreground_restore_request_result"] = (
+            foreground_restore_request_result
+        )
+        self._environment_observation["foreground_restore_stable_samples"] = (
+            stable_foreground_samples
+        )
+        self._environment_observation["last_input_tick_after_restore"] = (
+            last_input_tick_after_restore
+        )
+        self._environment_observation["last_input_unchanged_after_restore"] = (
+            last_input_unchanged_after_restore
+        )
+        if not last_input_unchanged_after_restore:
+            self._user_interaction_detected = True
+            self._environment_observation["restore_skipped_user_interaction"] = True
+            foreground_restored = False
+            errors.append(
+                UiBackendError(
+                    "ENV_RESTORE_SKIPPED_USER_INTERACTION",
+                    "恢复前台窗口期间检测到新的用户输入",
+                )
+            )
+        if not foreground_restored:
+            errors.append(
+                UiBackendError(
+                    "ENV_FOREGROUND_RESTORE_FAILED",
+                    "无法在时限内恢复原前台窗口",
+                )
+            )
         self._snapshot = None
         self._expected_mouse_position = None
         self._owned_clipboard_sequence = None
@@ -1080,9 +1159,7 @@ class Win32WechatAttachmentBackend:
         self._stop_visible_interval()
         final_point = wintypes.POINT()
         final_mouse_read = bool(self.user32.GetCursorPos(ctypes.byref(final_point)))
-        self._environment_observation["foreground_restored"] = (
-            int(self.user32.GetForegroundWindow()) == snapshot.foreground_window
-        )
+        self._environment_observation["foreground_restored"] = foreground_restored
         self._environment_observation["mouse_restored"] = (
             final_mouse_read
             and (int(final_point.x), int(final_point.y)) == snapshot.mouse_position

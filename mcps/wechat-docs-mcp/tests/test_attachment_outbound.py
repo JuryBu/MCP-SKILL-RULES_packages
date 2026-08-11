@@ -1132,6 +1132,180 @@ def test_clipboard_restore_replays_snapshot_when_sequence_is_owned() -> None:
     assert restored == [clipboard_formats]
 
 
+class RestoreUser32:
+    def __init__(
+        self,
+        initial_foreground: int,
+        *,
+        after_set_foregrounds: list[int] | None = None,
+        set_result: bool = True,
+    ) -> None:
+        self.foreground = initial_foreground
+        self.after_set_foregrounds = list(after_set_foregrounds or [])
+        self.set_result = set_result
+        self.set_calls = 0
+
+    @staticmethod
+    def GetClipboardSequenceNumber() -> int:
+        return 50
+
+    @staticmethod
+    def GetCursorPos(point: object) -> bool:
+        point._obj.x = 1
+        point._obj.y = 2
+        return True
+
+    def GetForegroundWindow(self) -> int:
+        if self.set_calls and self.after_set_foregrounds:
+            self.foreground = self.after_set_foregrounds.pop(0)
+        return self.foreground
+
+    @staticmethod
+    def SetCursorPos(*_: object) -> bool:
+        return True
+
+    def SetForegroundWindow(self, _: object) -> bool:
+        self.set_calls += 1
+        return self.set_result
+
+    @staticmethod
+    def IsWindow(_: object) -> bool:
+        return True
+
+
+def _restore_test_backend(user32: RestoreUser32) -> Win32WechatTextBackend:
+    backend = object.__new__(Win32WechatTextBackend)
+    backend.user32 = user32
+    backend._snapshot = object()
+    backend._expected_mouse_position = (1, 2)
+    backend._owned_clipboard_sequence = None
+    backend._user_interaction_detected = False
+    backend._hidden_text_phase = True
+    backend._hidden_foreground_window = 0
+    backend._hidden_last_input_tick = None
+    backend._hidden_clipboard_sequence = 50
+    backend._displayed_wechat_window = None
+    backend._owned_wechat_window = None
+    backend._visible_started_at = None
+    backend._visible_duration_seconds = 0.0
+    backend._environment_observation = {"restore_skipped_user_interaction": False}
+    backend._find_window = lambda *, required: None
+    backend._visible_wechat_window_count = lambda: 0
+    return backend
+
+
+def test_environment_restore_waits_for_delayed_foreground_transition(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    user32 = RestoreUser32(
+        0,
+        after_set_foregrounds=[0, 0, 10, 10, 10],
+        set_result=False,
+    )
+    backend = _restore_test_backend(user32)
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False)
+
+    backend.restore_environment(snapshot)
+
+    assert user32.set_calls == 1
+    assert backend.environment_observation()["foreground_restored"] is True
+
+
+def test_environment_restore_fails_closed_when_foreground_never_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = _restore_test_backend(RestoreUser32(0, set_result=False))
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.restore_environment(snapshot)
+
+    assert raised.value.code == "ENV_RESTORE_FAILED"
+    assert backend.environment_observation()["foreground_restored"] is False
+
+
+def test_environment_restore_requires_stable_foreground_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    alternating = [10, 88] * (
+        win32_attachment_ui.FOREGROUND_RESTORE_POLL_ATTEMPTS // 2
+    )
+    user32 = RestoreUser32(0, after_set_foregrounds=[*alternating, 10])
+    backend = _restore_test_backend(user32)
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.restore_environment(snapshot)
+
+    assert raised.value.code == "ENV_RESTORE_FAILED"
+    assert user32.set_calls == 1
+    assert backend.environment_observation()["foreground_restored"] is False
+
+
+def test_environment_restore_rechecks_foreground_after_stable_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    user32 = RestoreUser32(0, after_set_foregrounds=[10, 10, 88])
+    backend = _restore_test_backend(user32)
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.restore_environment(snapshot)
+
+    assert raised.value.code == "ENV_RESTORE_FAILED"
+    assert user32.set_calls == 1
+    assert backend.environment_observation()["foreground_restored"] is False
+
+
+def test_environment_restore_rejects_keyboard_input_during_wait(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = {"input_reads": 0}
+
+    def last_input_tick() -> int:
+        state["input_reads"] += 1
+        return 7 if state["input_reads"] == 1 else 8
+
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    backend = _restore_test_backend(
+        RestoreUser32(0, after_set_foregrounds=[10, 10, 10])
+    )
+    backend._hidden_last_input_tick = 7
+    backend._last_input_tick = last_input_tick
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False, 7)
+
+    with pytest.raises(UiBackendError) as raised:
+        backend.restore_environment(snapshot)
+
+    observation = backend.environment_observation()
+    assert raised.value.code == "ENV_RESTORE_FAILED"
+    assert observation["restore_skipped_user_interaction"] is True
+    assert observation["last_input_unchanged_before_restore"] is True
+    assert observation["last_input_unchanged_after_restore"] is False
+    assert observation["foreground_restored"] is False
+
+
+def test_environment_restore_does_not_request_focus_when_already_restored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(win32_attachment_ui.time, "sleep", lambda _: None)
+    user32 = RestoreUser32(10)
+    backend = _restore_test_backend(user32)
+    backend._hidden_foreground_window = 10
+    snapshot = Win32EnvironmentSnapshot(10, (1, 2), (), 50, None, False, False)
+
+    backend.restore_environment(snapshot)
+
+    observation = backend.environment_observation()
+    assert user32.set_calls == 0
+    assert observation["foreground_restore_request_result"] is None
+    assert observation["foreground_restored"] is True
+
+
 def test_locate_window_accepts_verified_foreground_when_win32_return_is_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
