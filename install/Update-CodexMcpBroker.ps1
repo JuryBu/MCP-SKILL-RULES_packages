@@ -99,6 +99,54 @@ function Get-NormalizedFilePath {
     return [System.IO.Path]::GetFullPath($Path)
 }
 
+function Get-CanonicalExistingPath {
+    param([string]$Path)
+    $FullPath = Get-NormalizedFilePath -Path $Path
+    $Item = Get-Item -LiteralPath $FullPath -Force -ErrorAction Stop
+    return [System.IO.Path]::GetFullPath([string]$Item.FullName)
+}
+
+function Get-CommandLineTokens {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return @() }
+    return @([regex]::Matches($CommandLine, '(?:^|\s)(?:"((?:\\.|[^"])*)"|(\S+))') | ForEach-Object {
+        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
+    })
+}
+
+function Get-UniqueCommandLineOptionValue {
+    param(
+        [string[]]$Tokens,
+        [string]$OptionName
+    )
+    $Values = [System.Collections.Generic.List[string]]::new()
+    for ($Index = 0; $Index -lt $Tokens.Count; $Index++) {
+        if ($Tokens[$Index].Equals($OptionName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            if ($Index + 1 -ge $Tokens.Count) { throw "Task router command line option has no value: $OptionName" }
+            $Values.Add($Tokens[$Index + 1])
+        } elseif ($Tokens[$Index].StartsWith("$OptionName=", [System.StringComparison]::OrdinalIgnoreCase)) {
+            $Values.Add($Tokens[$Index].Substring($OptionName.Length + 1))
+        }
+    }
+    if ($Values.Count -ne 1 -or [string]::IsNullOrWhiteSpace($Values[0])) {
+        throw "Task router command line must contain exactly one $OptionName option."
+    }
+    return $Values[0]
+}
+
+function Assert-EquivalentExistingPath {
+    param(
+        [string]$ActualPath,
+        [string]$ExpectedPath,
+        [string]$Description
+    )
+    $ActualCanonical = Get-CanonicalExistingPath -Path $ActualPath
+    $ExpectedCanonical = Get-CanonicalExistingPath -Path $ExpectedPath
+    if (-not $ActualCanonical.Equals($ExpectedCanonical, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "$Description path does not match. expected=$ExpectedCanonical actual=$ActualCanonical"
+    }
+}
+
 function Get-TaskRouterRuntimeSnapshot {
     param([string]$Path)
     $FullPath = Get-NormalizedFilePath -Path $Path
@@ -175,10 +223,27 @@ function Get-TaskRouterRuntimeSnapshot {
         throw "Task router PID is not a running Node process: $FullPath pid=$ProcessId"
     }
     $CommandLine = [string]$ProcessInfo.CommandLine
-    foreach ($ExpectedFragment in @("task-router-runner.mjs", $FullPath, $Snapshot.identity.lockPath)) {
-        if ($CommandLine.IndexOf($ExpectedFragment, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
-            throw "Task router command line does not match its runtime identity: $FullPath missing=$ExpectedFragment pid=$ProcessId"
+    $CommandTokens = @(Get-CommandLineTokens -CommandLine $CommandLine)
+    $RunnerPaths = @($CommandTokens | ForEach-Object {
+        if ([System.IO.Path]::IsPathRooted($_)) {
+            try {
+                $CanonicalPath = Get-CanonicalExistingPath -Path $_
+                if ([System.IO.Path]::GetFileName($CanonicalPath).Equals("task-router-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase)) {
+                    $CanonicalPath
+                }
+            } catch {}
         }
+    })
+    if ($RunnerPaths.Count -ne 1) {
+        throw "Task router command line does not identify exactly one task-router-runner.mjs: $FullPath pid=$ProcessId actual=$CommandLine"
+    }
+    $RuntimeArgument = Get-UniqueCommandLineOptionValue -Tokens $CommandTokens -OptionName "--runtime-state"
+    $LockArgument = Get-UniqueCommandLineOptionValue -Tokens $CommandTokens -OptionName "--lock"
+    try {
+        Assert-EquivalentExistingPath -ActualPath $RuntimeArgument -ExpectedPath $FullPath -Description "Task router runtime-state"
+        Assert-EquivalentExistingPath -ActualPath $LockArgument -ExpectedPath $Snapshot.identity.lockPath -Description "Task router lock"
+    } catch {
+        throw "Task router command line does not match its runtime identity: $FullPath pid=$ProcessId actual=$CommandLine. $($_.Exception.Message)"
     }
     if (-not (Test-Path -LiteralPath $Snapshot.identity.lockPath -PathType Leaf)) {
         throw "Task router lock file is missing: $($Snapshot.identity.lockPath)"
@@ -213,10 +278,7 @@ function Assert-TaskRouterRuntimeUnchanged {
 
 function Get-NodeEntryScript {
     param([string]$CommandLine)
-    if (-not $CommandLine) { return $null }
-    $Tokens = @([regex]::Matches($CommandLine, '(?:"((?:\\.|[^"])*)"|(\S+))') | ForEach-Object {
-        if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value }
-    })
+    $Tokens = @(Get-CommandLineTokens -CommandLine $CommandLine)
     if ($Tokens.Count -lt 2) { return $null }
     $Candidate = $Tokens[1]
     if (-not [System.IO.Path]::IsPathRooted($Candidate)) { return $null }

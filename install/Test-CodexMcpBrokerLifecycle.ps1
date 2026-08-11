@@ -26,6 +26,14 @@ function Get-Sha256 {
 
 function Get-FileHash { throw "Get-FileHash is unavailable in this compatibility test." }
 
+function Get-ShortPathIfAvailable {
+    param([string]$Path)
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $shortPath = @(& cmd.exe /d /c "for %I in (`"$fullPath`") do @echo %~sI" 2>$null) | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace([string]$shortPath)) { return $fullPath }
+    return [string]$shortPath
+}
+
 function Get-StaticTargetSnapshot {
     param([string]$Root)
     $snapshot = [ordered]@{}
@@ -135,7 +143,14 @@ function Start-MockTaskRouter {
     if (-not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
         Set-Content -LiteralPath $runnerPath -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
     }
-    $process = Start-Process -FilePath $nodeExePath -ArgumentList @($runnerPath, "--runtime-state", $RuntimePath, "--lock", $LockPath) -PassThru -WindowStyle Hidden
+    Set-Content -LiteralPath $RuntimePath -Encoding UTF8 -Value "{}"
+    Set-Content -LiteralPath $LockPath -Encoding UTF8 -Value "{}"
+    $runnerArgument = Get-ShortPathIfAvailable -Path $runnerPath
+    $runtimeArgument = Get-ShortPathIfAvailable -Path $RuntimePath
+    $lockArgument = Get-ShortPathIfAvailable -Path $LockPath
+    $arguments = @($runnerArgument, "--runtime-state", $runtimeArgument, "--lock", $lockArgument)
+    $argumentLine = ($arguments | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' }) -join " "
+    $process = Start-Process -FilePath $nodeExePath -ArgumentList $argumentLine -PassThru -WindowStyle Hidden
     $processIds.Add($process.Id)
     [ordered]@{
         pid = $process.Id
