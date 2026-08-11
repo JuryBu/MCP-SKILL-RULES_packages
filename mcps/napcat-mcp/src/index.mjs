@@ -6,7 +6,7 @@ import { createTaskRegistry, TaskRegistryError } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { createControlState, ControlStateError } from "./control-state.mjs";
 import { createControlPlane } from "./control-plane.mjs";
-import { resolveTrackedDelivery } from "./delivery-result.mjs";
+import { withOutgoingDeliveryTracking } from "./delivery-result.mjs";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -624,18 +624,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return textResult({ ok: true, ...notifier.previewTextMessage(args) });
     }
     if (name === "napcat_send_text") {
-      const result = await notifier.sendTextMessage(args);
+      let result = await notifier.sendTextMessage(args);
       if (args.task_id && args.source_machine && args.target_machine) {
-        const tracked = resolveTrackedDelivery(result);
-        if (tracked) {
-          controlPlane.trackOutgoingDelivery({
-            deliveryId: tracked.deliveryId,
-            taskId: args.task_id,
-            sourceMachine: args.source_machine,
-            targetMachine: args.target_machine,
-            messageSeq: tracked.messageSeq,
-          });
-        }
+        result = withOutgoingDeliveryTracking(
+          result,
+          args,
+          (delivery) => controlPlane.trackOutgoingDelivery(delivery),
+        );
       }
       return textResult({ ok: true, ...result });
     }
@@ -644,18 +639,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_send_file") {
       const result = await notifier.sendFile(args);
-      const taskIndex = result.taskIndex;
-      if (args.task_id && args.source_machine && args.target_machine && taskIndex?.deliveryId) {
-        const messageSeq = Number(taskIndex.messageId);
-        if (Number.isSafeInteger(messageSeq) && messageSeq >= 0) {
-          controlPlane.trackOutgoingDelivery({
-            deliveryId: taskIndex.deliveryId,
-            taskId: args.task_id,
-            sourceMachine: args.source_machine,
-            targetMachine: args.target_machine,
-            messageSeq,
-          });
-        }
+      if (args.task_id && args.source_machine && args.target_machine && result.taskIndex) {
+        result.taskIndex = withOutgoingDeliveryTracking(
+          result.taskIndex,
+          args,
+          (delivery) => controlPlane.trackOutgoingDelivery(delivery),
+        );
       }
       return textResult({ ok: true, ...result });
     }

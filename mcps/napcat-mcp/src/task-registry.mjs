@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { renameReplaceSync } from "./atomic-file.mjs";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { createStaleSentWakeRearmPlan } from "./stale-sent-wake-rearm.mjs";
 
@@ -513,7 +514,7 @@ function atomicWriteState(statePath, state) {
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
-    fs.renameSync(temporaryPath, statePath);
+    renameReplaceSync(temporaryPath, statePath);
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     try {

@@ -315,11 +315,12 @@ async function createFixture(options = {}) {
       return fetch(url, requestOptions);
     }
     : fetch;
-  const createNotifier = () => createNapCatNotifier({
+  const createNotifier = (notifierOptions = {}) => createNapCatNotifier({
       cwd: temporaryRoot,
       env,
       fetchImpl,
       now: () => new Date("2026-07-24T05:30:00.000Z"),
+      ...notifierOptions,
     });
   const notifier = createNotifier();
 
@@ -677,6 +678,40 @@ test("text send validates, verifies and deduplicates in the bound group", async 
     const second = await fixture.notifier.sendTextMessage(input);
     assert.equal(second.sent, false);
     assert.equal(second.duplicateSuppressed, true);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("text send keeps its verified result when post-send state persistence fails", async () => {
+  const fixture = await createFixture();
+  try {
+    let writes = 0;
+    const notifier = fixture.createNotifier({
+      writeState: (statePath, state) => {
+        writes += 1;
+        if (writes > 1) {
+          const error = new Error("simulated state rename failure");
+          error.code = "EPERM";
+          throw error;
+        }
+        fs.mkdirSync(path.dirname(statePath), { recursive: true });
+        fs.writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+      },
+    });
+    const input = { text: "状态写盘失败契约", dedupe_key: "manual:test:state-write-failure" };
+    const result = await notifier.sendTextMessage(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.statePersisted, false);
+    assert.equal(result.statePersistenceError.code, "EPERM");
+    assert.equal(result.retryRecommended, false);
+
+    const duplicate = await fixture.createNotifier().sendTextMessage(input);
+    assert.equal(duplicate.sent, false);
+    assert.equal(duplicate.duplicateSuppressed, true);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
     assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
   } finally {
     await fixture.close();

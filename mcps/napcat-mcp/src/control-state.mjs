@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { renameReplaceSync } from "./atomic-file.mjs";
 
 const STATE_SCHEMA_VERSION = 6;
 const DEFAULT_MAX_SEEN = 2048;
@@ -436,7 +437,7 @@ function atomicWriteState(statePath, state) {
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
-    fs.renameSync(temporaryPath, statePath);
+    renameReplaceSync(temporaryPath, statePath);
   } catch (error) {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     try {

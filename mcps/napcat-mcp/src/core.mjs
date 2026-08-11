@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { canonicalMachineRole } from "./machine-role.mjs";
+import { renameReplaceSync } from "./atomic-file.mjs";
 
 const DEFAULT_ALLOWED_EVENTS = [
   "started",
@@ -51,7 +52,7 @@ function atomicWriteJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.tmp-${process.pid}-${Date.now()}`;
   fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  fs.renameSync(temporaryPath, filePath);
+  renameReplaceSync(temporaryPath, filePath);
 }
 
 function boundedString(value, name, maximum, required = false) {
@@ -782,6 +783,7 @@ export function createNapCatNotifier(options = {}) {
   const cwd = options.cwd ?? process.cwd();
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
   const now = options.now ?? (() => new Date());
+  const writeState = options.writeState ?? atomicWriteJson;
   const bindingPath = resolveConfiguredPath(
     env.NAPCAT_MCP_BINDING_PATH,
     "binding.json",
@@ -805,6 +807,26 @@ export function createNapCatNotifier(options = {}) {
 
   if (typeof fetchImpl !== "function") {
     throw new NapCatNotifierError("FETCH_UNAVAILABLE", "当前 Node 运行时没有 fetch 支持");
+  }
+
+  function writeStateAfterSideEffect(state) {
+    try {
+      writeState(statePath, state);
+      return null;
+    } catch (error) {
+      return {
+        ...publicError(error),
+        code: error?.code || "STATE_WRITE_FAILED",
+      };
+    }
+  }
+
+  function persistenceResult(error) {
+    return {
+      statePersisted: error === null,
+      statePersistenceError: error,
+      ...(error ? { retryRecommended: false } : {}),
+    };
   }
 
   function loadBinding() {
@@ -1608,7 +1630,7 @@ export function createNapCatNotifier(options = {}) {
         sourceMachine: normalizedInput.sourceMachine,
         targetMachine: normalizedInput.targetMachine,
       };
-      atomicWriteJson(statePath, claimedState);
+      writeState(statePath, claimedState);
 
       let uploadData;
       try {
@@ -1626,7 +1648,14 @@ export function createNapCatNotifier(options = {}) {
           updatedAt: now().toISOString(),
           error: publicError(error),
         };
-        atomicWriteJson(statePath, failedState);
+        try {
+          writeState(statePath, failedState);
+        } catch (stateError) {
+          error.details = {
+            ...(error.details ?? {}),
+            statePersistenceError: publicError(stateError),
+          };
+        }
         throw error;
       }
 
@@ -1644,7 +1673,10 @@ export function createNapCatNotifier(options = {}) {
           updatedAt: now().toISOString(),
           error: publicError(missingFileId),
         };
-        atomicWriteJson(statePath, unknownState);
+        const statePersistenceError = writeStateAfterSideEffect(unknownState);
+        if (statePersistenceError) {
+          missingFileId.details = { statePersistenceError };
+        }
         throw missingFileId;
       }
 
@@ -1655,7 +1687,7 @@ export function createNapCatNotifier(options = {}) {
         fileId,
         updatedAt: now().toISOString(),
       };
-      atomicWriteJson(statePath, sentState);
+      let statePersistenceError = writeStateAfterSideEffect(sentState);
 
       let verified = false;
       let verificationError = null;
@@ -1723,6 +1755,7 @@ export function createNapCatNotifier(options = {}) {
         ...finalState.entries[normalizedInput.dedupeKey],
         status: verified ? "sent_verified" : "sent_unverified",
         verified,
+        fileId,
         verificationError,
         verifiedFileId: String(verifiedFile?.file_id ?? ""),
         fileMessageId: String(fileMessage?.messageId ?? ""),
@@ -1731,7 +1764,7 @@ export function createNapCatNotifier(options = {}) {
         fileMessageLookupError,
         updatedAt: now().toISOString(),
       };
-      atomicWriteJson(statePath, finalState);
+      statePersistenceError = writeStateAfterSideEffect(finalState);
 
       const taskIndex = normalizedInput.hasTaskId
         ? (verified
@@ -1773,6 +1806,7 @@ export function createNapCatNotifier(options = {}) {
         identity: targetCheck.login,
         dedupeKey: normalizedInput.dedupeKey,
         deliveryId: normalizedInput.deliveryId,
+        ...persistenceResult(statePersistenceError),
         ...(taskIndex ? { taskIndex } : {}),
       };
     } finally {
@@ -1878,7 +1912,7 @@ export function createNapCatNotifier(options = {}) {
         updatedAt: currentTime.toISOString(),
         attempts: previousAttempts + 1,
       };
-      atomicWriteJson(statePath, claimedState);
+      writeState(statePath, claimedState);
 
       let sendData;
       try {
@@ -1900,7 +1934,14 @@ export function createNapCatNotifier(options = {}) {
           updatedAt: now().toISOString(),
           error: publicError(error),
         };
-        atomicWriteJson(statePath, failedState);
+        try {
+          writeState(statePath, failedState);
+        } catch (stateError) {
+          error.details = {
+            ...(error.details ?? {}),
+            statePersistenceError: publicError(stateError),
+          };
+        }
         throw error;
       }
 
@@ -1918,7 +1959,10 @@ export function createNapCatNotifier(options = {}) {
           updatedAt: now().toISOString(),
           error: publicError(missingMessageId),
         };
-        atomicWriteJson(statePath, unknownState);
+        const statePersistenceError = writeStateAfterSideEffect(unknownState);
+        if (statePersistenceError) {
+          missingMessageId.details = { statePersistenceError };
+        }
         throw missingMessageId;
       }
 
@@ -1929,7 +1973,7 @@ export function createNapCatNotifier(options = {}) {
         messageId,
         updatedAt: now().toISOString(),
       };
-      atomicWriteJson(statePath, sentState);
+      let statePersistenceError = writeStateAfterSideEffect(sentState);
 
       let verified = !binding.requireMessageVerification;
       let verificationError = null;
@@ -1967,10 +2011,11 @@ export function createNapCatNotifier(options = {}) {
         ...finalState.entries[normalizedInput.dedupeKey],
         status: verified ? "sent_verified" : "sent_unverified",
         verified,
+        messageId,
         verificationError,
         updatedAt: now().toISOString(),
       };
-      atomicWriteJson(statePath, finalState);
+      statePersistenceError = writeStateAfterSideEffect(finalState);
 
       return {
         sent: true,
@@ -1984,6 +2029,7 @@ export function createNapCatNotifier(options = {}) {
         runId: normalizedInput.runId,
         dedupeKey: normalizedInput.dedupeKey,
         deliveryId: normalizedInput.deliveryId || "",
+        ...persistenceResult(statePersistenceError),
       };
     } finally {
       if (releaseDedupeLock) releaseDedupeLock();
