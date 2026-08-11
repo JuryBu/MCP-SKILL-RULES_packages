@@ -6,7 +6,9 @@ license: MIT
 
 # WeChat and Tencent Docs Collaboration
 
-Use the local `wechat-docs` MCP as a governed event bridge, not as a general WeChat automation client. Real account names, route titles, database paths, tokens, authorization messages, and Codex conversation bindings belong only in the receiver's private configuration.
+Use the local `wechat-docs` MCP as a governed WeChat ecosystem collaboration bridge. When deployed alongside NapCat, it may occupy a parallel ecosystem role for WeChat messages, attachments, governed outbound, and Tencent Docs integration; this is a role analogy rather than a promise of identical protocol or capability coverage. Real account names, route titles, database paths, tokens, authorization messages, and Codex conversation bindings belong only in the receiver's private configuration.
+
+This public skill does not choose QQ, WeChat, or another transport as the receiver's default owner-contact channel. Put that preference in the receiver-private Rules overlay and continue to enforce the authorization and capability checks below.
 
 ## Handle a wake
 
