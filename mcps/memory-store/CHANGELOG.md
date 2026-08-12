@@ -2,6 +2,18 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.8] - 2026-08-13
+
+### Fixed
+
+- Codex `<heartbeat>` 定时注入现在保存为短结构化自动事件，不再回填长 `instructions`、创建空用户标题或增加人类轮次；旧 fetch 缓存会在读取时合并历史自动事件轮，新 fetch 在解析 JSONL 时直接使用正确语义。
+- NapCat task wake、建链请求、微信 wake、腾讯文档 wake 与子代理通知不会进入 `messageRoles=["user"]`；`[NAPCAT_OWNER_REPLY]` 仅移除自动运输外壳，主人真实正文、缓冲附件引用继续作为用户消息。
+- `<codex_delegation>` 与 `<realtime_delegation>` 按真实跨线程任务正文保留为用户消息，避免把协作输入误归类为系统注入。
+
+### Verification
+
+- 使用超大真实 Codex 对话脱敏重放：heartbeat 被折叠进短系统事件，用户视图无 heartbeat，完整人类消息聚类未发现其它自动注入残留。
+
 ## [1.22.7] - 2026-08-12
 
 ### Added

@@ -59,7 +59,8 @@ import {
 import { rebuildConversationCacheForRecord } from "./conversation-bridge.js";
 import type { ConversationRecordProjectionRound } from "./conversation-record-projection.js";
 import { getRoundUserMessages, type ConversationMessageRole, type ConversationRound } from "./trajectory.js";
-import { parseConversationAutomationEvent } from "./conversation-automation-event.js";
+import { projectConversationAutomationInput } from "./conversation-automation-event.js";
+import { projectConversationSubagentInput } from "./conversation-subagent-event.js";
 
 export const PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION = "record-source-content/v1" as const;
 export const PRODUCTION_SOURCE_FORMATTER_VERSION_V1 = "canonical-json-nfc-lf/v1" as const;
@@ -1002,13 +1003,21 @@ function messagesFromRecordProjection(rounds: readonly ConversationRecordProject
             if (!message || (message.role !== "user" && message.role !== "assistant") || typeof message.text !== "string") {
                 throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮第 ${messageIndex + 1} 条消息结构无效`);
             }
-            if (message.role === "user" && parseConversationAutomationEvent(message.text)) continue;
+            let projectedMessage = message;
+            if (projectedMessage.role === "user") {
+                const projection = projectConversationAutomationInput(projectedMessage.text);
+                if (projection && !projection.userText) continue;
+                if (projection?.userText) projectedMessage = { ...projectedMessage, text: projection.userText };
+                const subagentProjection = projectConversationSubagentInput(projectedMessage.text);
+                if (subagentProjection && !subagentProjection.userText) continue;
+                if (subagentProjection?.userText) projectedMessage = { ...projectedMessage, text: subagentProjection.userText };
+            }
             messages.push({
-                role: message.role,
-                text: message.text,
+                role: projectedMessage.role,
+                text: projectedMessage.text,
                 roundIndex: round.roundIndex,
-                ...(message.rawRole !== undefined ? { rawRole: message.rawRole } : {}),
-                ...(message.semanticRole !== undefined ? { semanticRole: message.semanticRole } : {}),
+                ...(projectedMessage.rawRole !== undefined ? { rawRole: projectedMessage.rawRole } : {}),
+                ...(projectedMessage.semanticRole !== undefined ? { semanticRole: projectedMessage.semanticRole } : {}),
                 attachments: message.attachments,
                 mediaAttachments: message.mediaAttachments,
             });

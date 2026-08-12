@@ -6,10 +6,14 @@ import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
 import { extractAntigravityToolImages, mergeRoundAttachments } from "./conversation-attachments.js";
 import {
     conversationAutomationEventKey,
-    parseConversationAutomationEvent,
+    projectConversationAutomationInput,
     renderConversationAutomationEvent,
     type ConversationAutomationEvent,
 } from "./conversation-automation-event.js";
+import {
+    projectConversationSubagentInput,
+    type ConversationSubagentNotification,
+} from "./conversation-subagent-event.js";
 
 /**
  * Trajectory 数据解析与提取
@@ -318,8 +322,37 @@ function hasModelSideActivity(round: ConversationRound): boolean {
         || Boolean(round.semanticEvents?.some((event) => event.semanticRole === "model" || event.semanticRole === "assistant" || event.semanticRole === "tool" || event.semanticRole === "subagent"));
 }
 
+function mergeRoundData(target: ConversationRound, source: ConversationRound, prepend = false): void {
+    const combine = <T>(left: T[], right: T[]): T[] => prepend ? [...right, ...left] : [...left, ...right];
+    target.userMessages = combine(getRoundUserMessages(target), getRoundUserMessages(source));
+    target.userMessage = target.userMessages.map(message => message.text).filter(Boolean).join("\n\n");
+    target.mediaAttachments = combine(target.mediaAttachments || [], source.mediaAttachments || []);
+    target.attachments = combine(target.attachments || [], source.attachments || []);
+    target.aiResponses = combine(target.aiResponses, source.aiResponses);
+    target.toolCalls = combine(target.toolCalls, source.toolCalls);
+    target.taskBoundaries = combine(target.taskBoundaries, source.taskBoundaries);
+    target.codeActions = combine(target.codeActions, source.codeActions);
+    target.subagentSummaries = combine(target.subagentSummaries, source.subagentSummaries);
+    target.fileViews = combine(target.fileViews || [], source.fileViews || []);
+    target.semanticEvents = combine(target.semanticEvents || [], source.semanticEvents || []);
+    target.legacyRoundIndices = combine(target.legacyRoundIndices || [], source.legacyRoundIndices || []);
+    target.startStep = Math.min(target.startStep, source.startStep);
+    target.endStep = Math.max(target.endStep, source.endStep);
+}
+
 function rawRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
-    if (round.userMessages?.length) return round.userMessages;
+    if (round.userMessages) {
+        if (round.userMessages.length > 0) return round.userMessages;
+        if ((round.attachments?.length || 0) > 0 || (round.mediaAttachments?.length || 0) > 0) {
+            return [{
+                stepIndex: round.startStep,
+                text: "",
+                mediaAttachments: round.mediaAttachments || [],
+                attachments: round.attachments,
+            }];
+        }
+        return [];
+    }
     return [{
         stepIndex: round.startStep,
         text: round.userMessage,
@@ -329,7 +362,16 @@ function rawRoundUserMessages(round: ConversationRound): ConversationUserMessage
 }
 
 export function getRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
-    return rawRoundUserMessages(round).filter(message => message.annotations?.length || !parseConversationAutomationEvent(message.text || ""));
+    return rawRoundUserMessages(round).flatMap(message => {
+        if (message.annotations?.length) return [{ ...message }];
+        const automationProjection = projectConversationAutomationInput(message.text || "");
+        let text = automationProjection ? automationProjection.userText || "" : message.text || "";
+        const hasAttachments = (message.attachments?.length || 0) > 0 || (message.mediaAttachments?.length || 0) > 0;
+        if (!text) return hasAttachments && !automationProjection ? [{ ...message }] : [];
+        const subagentProjection = projectConversationSubagentInput(text);
+        if (subagentProjection) text = subagentProjection.userText || "";
+        return text ? [{ ...message, text }] : hasAttachments && !subagentProjection ? [{ ...message, text }] : [];
+    });
 }
 
 export function getRoundAutomationEvents(round: ConversationRound): Array<{
@@ -344,29 +386,31 @@ export function getRoundAutomationEvents(round: ConversationRound): Array<{
     }>();
     const annotationProtectedSteps = new Set(
         rawRoundUserMessages(round)
-            .filter(message => message.annotations?.length && parseConversationAutomationEvent(message.text || ""))
+            .filter(message => message.annotations?.length && projectConversationAutomationInput(message.text || ""))
             .map(message => message.stepIndex),
     );
     for (const semanticEvent of round.semanticEvents || []) {
         if (annotationProtectedSteps.has(semanticEvent.stepIndex)) continue;
         const automation = semanticEvent.automation
             || (semanticEvent.semanticRole === "user" || semanticEvent.semanticRole === "system"
-                ? parseConversationAutomationEvent(semanticEvent.text || "")
+                ? projectConversationAutomationInput(semanticEvent.text || "")?.event
                 : null);
         if (!automation) continue;
+        const projection = projectConversationAutomationInput(semanticEvent.text || "");
         events.set(conversationAutomationEventKey(automation), {
             stepIndex: semanticEvent.stepIndex,
             event: automation,
-            attachments: semanticEvent.attachments,
+            attachments: projection?.userText ? undefined : semanticEvent.attachments,
         });
     }
     for (const message of rawRoundUserMessages(round)) {
-        const automation = parseConversationAutomationEvent(message.text || "");
+        const projection = projectConversationAutomationInput(message.text || "");
+        const automation = projection?.event;
         if (!automation || message.annotations?.length) continue;
         events.set(conversationAutomationEventKey(automation), {
             stepIndex: message.stepIndex,
             event: automation,
-            attachments: message.attachments,
+            attachments: projection.userText ? undefined : message.attachments,
         });
     }
     return [...events.values()];
@@ -376,14 +420,24 @@ export function normalizeConversationAutomationRound(round: ConversationRound): 
     const userMessages = getRoundUserMessages(round).map(message => ({ ...message }));
     const automationEvents = getRoundAutomationEvents(round);
     const automationKeys = new Set(automationEvents.map(item => conversationAutomationEventKey(item.event)));
-    const semanticEvents = (round.semanticEvents || [])
-        .filter(event => {
-            const parsed = (event.semanticRole === "user" || event.semanticRole === "system")
-                ? parseConversationAutomationEvent(event.text || "")
-                : null;
-            return !parsed || !automationKeys.has(conversationAutomationEventKey(parsed));
-        })
-        .map(event => ({ ...event }));
+    const semanticEvents = (round.semanticEvents || []).flatMap(event => {
+        const projection = (event.semanticRole === "user" || event.semanticRole === "system")
+            ? projectConversationAutomationInput(event.text || "")
+            : null;
+        let projectedEvent = { ...event };
+        if (projection && automationKeys.has(conversationAutomationEventKey(projection.event))) {
+            if (!projection.userText) return [];
+            projectedEvent = { ...projectedEvent, semanticRole: "user" as const, text: projection.userText };
+        }
+        if (projectedEvent.semanticRole === "user" || projectedEvent.semanticRole === "system") {
+            const subagentProjection = projectConversationSubagentInput(projectedEvent.text || "");
+            if (subagentProjection) {
+                if (!subagentProjection.userText) return [];
+                projectedEvent = { ...projectedEvent, semanticRole: "user" as const, text: subagentProjection.userText };
+            }
+        }
+        return [projectedEvent];
+    });
     for (const item of automationEvents) {
         semanticEvents.push({
             stepIndex: item.stepIndex,
@@ -400,6 +454,7 @@ export function normalizeConversationAutomationRound(round: ConversationRound): 
         userMessages,
         userMessage: userMessages.map(message => message.text).filter(Boolean).join("\n\n"),
         semanticEvents,
+        subagentSummaries: getRoundSubagentSummaries(round),
     };
 }
 
@@ -409,6 +464,7 @@ export function normalizeConversationAutomationRound(round: ConversationRound): 
  */
 export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], startRound = 1): ConversationRound[] {
     const merged: ConversationRound[] = [];
+    let leadingNonHuman: ConversationRound | null = null;
     for (const rawSource of sourceRounds) {
         const source = normalizeConversationAutomationRound(rawSource);
         const next: ConversationRound = {
@@ -425,23 +481,21 @@ export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], s
             subagentSummaries: [...source.subagentSummaries],
             fileViews: source.fileViews ? [...source.fileViews] : undefined,
         };
+        const nextMessages = getRoundUserMessages(next);
+        if (nextMessages.length === 0) {
+            const previous = merged[merged.length - 1];
+            if (previous) mergeRoundData(previous, next);
+            else if (leadingNonHuman) mergeRoundData(leadingNonHuman, next);
+            else leadingNonHuman = next;
+            continue;
+        }
+        if (leadingNonHuman) {
+            mergeRoundData(next, leadingNonHuman, true);
+            leadingNonHuman = null;
+        }
         const previous = merged[merged.length - 1];
         if (previous && !hasModelSideActivity(previous)) {
-            const previousMessages = getRoundUserMessages(previous);
-            const nextMessages = getRoundUserMessages(next);
-            previous.userMessages = [...previousMessages, ...nextMessages];
-            previous.userMessage = previous.userMessages.map((message) => message.text).filter(Boolean).join("\n\n");
-            previous.mediaAttachments.push(...next.mediaAttachments);
-            previous.attachments = [...(previous.attachments || []), ...(next.attachments || [])];
-            previous.aiResponses.push(...next.aiResponses);
-            previous.toolCalls.push(...next.toolCalls);
-            previous.taskBoundaries.push(...next.taskBoundaries);
-            previous.codeActions.push(...next.codeActions);
-            previous.subagentSummaries.push(...next.subagentSummaries);
-            previous.fileViews = [...(previous.fileViews || []), ...(next.fileViews || [])];
-            previous.semanticEvents = [...(previous.semanticEvents || []), ...(next.semanticEvents || [])];
-            previous.legacyRoundIndices = [...(previous.legacyRoundIndices || []), ...(next.legacyRoundIndices || [])];
-            previous.endStep = Math.max(previous.endStep, next.endStep);
+            mergeRoundData(previous, next);
             continue;
         }
         merged.push(next);
@@ -678,8 +732,15 @@ function getRoundToolCalls(round: ConversationRound): ToolCallInfo[] {
         }));
 }
 
-function getRoundSubagentSummaries(round: ConversationRound): SubagentSummary[] {
+export function getRoundSubagentSummaries(round: ConversationRound): SubagentSummary[] {
     const summaries = [...round.subagentSummaries];
+    const add = (subagent: SubagentSummary): void => {
+        const existing = summaries.some((item) => item.threadId === subagent.threadId
+            && item.nickname === subagent.nickname
+            && item.status === subagent.status
+            && item.summary === subagent.summary);
+        if (!existing) summaries.push(subagent);
+    };
     for (const event of round.semanticEvents || []) {
         if (event.semanticRole !== "subagent") continue;
         const subagent = event.subagent || {
@@ -689,8 +750,15 @@ function getRoundSubagentSummaries(round: ConversationRound): SubagentSummary[] 
             rawRole: event.rawRole,
             semanticRole: "subagent" as const,
         };
-        if (!summaries.some((item) => item.threadId === subagent.threadId && item.nickname === subagent.nickname)) {
-            summaries.push(subagent);
+        add(subagent);
+    }
+    for (const message of rawRoundUserMessages(round)) {
+        if (message.annotations?.length) continue;
+        const automationProjection = projectConversationAutomationInput(message.text || "");
+        const text = automationProjection ? automationProjection.userText || "" : message.text || "";
+        const projection = text ? projectConversationSubagentInput(text) : null;
+        for (const notification of projection?.notifications || []) {
+            add(notification as ConversationSubagentNotification);
         }
     }
     return summaries;
@@ -1140,7 +1208,7 @@ export function formatRoundForMessageRoles(
     const aiResponses = getRoundAiResponses(round);
     const toolCalls = getRoundToolCalls(round);
     const subagentSummaries = getRoundSubagentSummaries(round);
-    const includeUser = roles.has("user") && !legacySystemLike;
+    const includeUser = roles.has("user") && !legacySystemLike && userMessages.length > 0;
     const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0 || automationEvents.length > 0);
     const includeModel = roles.has("model") || roles.has("assistant");
     const includeTool = roles.has("tool");

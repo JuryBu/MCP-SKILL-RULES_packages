@@ -5,7 +5,7 @@ import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
 import { promisify } from "util";
-import type { ConversationRound } from "./trajectory.js";
+import { getRoundSubagentSummaries, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
     buildExactFetchEvidence,
@@ -27,6 +27,14 @@ import {
     mergeRoundAttachments,
     type ConversationAttachment,
 } from "./conversation-attachments.js";
+import {
+    projectConversationAutomationInput,
+    renderConversationAutomationEvent,
+    type ConversationAutomationEvent,
+} from "./conversation-automation-event.js";
+import {
+    projectConversationSubagentInput,
+} from "./conversation-subagent-event.js";
 
 export interface CodexThreadInfo {
     id: string;
@@ -1049,10 +1057,10 @@ interface CodexUserSemanticSegment {
     kind: string;
     text: string;
     subagent?: CodexSubagentSummary;
+    automation?: ConversationAutomationEvent;
 }
 
 const CODEX_SYSTEM_USER_ENVELOPES = [
-    ["<codex_delegation>", "</codex_delegation>", "delegation"],
     ["<environment_context>", "</environment_context>", "environment_context"],
     ["<developer_instructions>", "</developer_instructions>", "developer_instructions"],
     ["<permissions instructions>", "</permissions instructions>", "permissions"],
@@ -1064,49 +1072,24 @@ const CODEX_SYSTEM_USER_ENVELOPES = [
     ["<turn_aborted>", "</turn_aborted>", "turn_aborted"],
 ] as const;
 
-function codexSubagentNotificationSummary(block: string): CodexSubagentSummary {
-    const open = "<subagent_notification>";
-    const close = "</subagent_notification>";
-    const jsonText = block.slice(open.length, block.length - close.length).trim();
-    try {
-        const parsed = JSON.parse(jsonText) as Record<string, any>;
-        const statusValue = parsed.status;
-        const statusKey = typeof statusValue === "string"
-            ? statusValue
-            : statusValue && typeof statusValue === "object"
-                ? ["completed", "errored", "failed", "cancelled", "shutdown", "running"]
-                    .find(key => statusValue[key] !== undefined) || "updated"
-                : "updated";
-        const summaryValue = typeof statusValue === "string"
-            ? statusValue
-            : statusValue && typeof statusValue === "object"
-                ? statusValue[statusKey]
-                : "";
-        return {
-            threadId: typeof parsed.agent_path === "string" ? parsed.agent_path : "",
-            nickname: typeof parsed.agent_nickname === "string" ? parsed.agent_nickname : "subagent",
-            role: typeof parsed.agent_role === "string" ? parsed.agent_role : undefined,
-            summary: typeof summaryValue === "string" ? summaryValue : stringifyCompact(summaryValue, 2_000),
-            status: statusKey,
-            rawRole: "response_item.message.user.subagent_notification",
-            semanticRole: "subagent",
-        };
-    } catch {
-        return {
-            threadId: "",
-            nickname: "subagent",
-            summary: block,
-            status: "unparsed",
-            rawRole: "response_item.message.user.subagent_notification",
-            semanticRole: "subagent",
-        };
-    }
-}
-
 function splitCodexUserSemanticSegments(text: string): CodexUserSemanticSegment[] {
     const segments: CodexUserSemanticSegment[] = [];
     let remaining = text.trim();
     while (remaining) {
+        const automationProjection = projectConversationAutomationInput(remaining);
+        if (automationProjection) {
+            const automation = automationProjection.event;
+            segments.push({
+                role: "system",
+                kind: "automation_event",
+                text: renderConversationAutomationEvent(automation),
+                automation,
+            });
+            if (automationProjection.userText) {
+                segments.push({ role: "user", kind: "message", text: automationProjection.userText });
+            }
+            break;
+        }
         if (remaining.startsWith(CODEX_AGENTS_FOLDED_MARKER)) {
             const lineEnd = remaining.indexOf("\n");
             const end = lineEnd < 0 ? remaining.length : lineEnd;
@@ -1114,21 +1097,18 @@ function splitCodexUserSemanticSegments(text: string): CodexUserSemanticSegment[
             remaining = remaining.slice(end).trimStart();
             continue;
         }
-        if (remaining.startsWith("<subagent_notification>")) {
-            const close = "</subagent_notification>";
-            const closeIndex = remaining.indexOf(close);
-            if (closeIndex >= 0) {
-                const end = closeIndex + close.length;
-                const block = remaining.slice(0, end);
+        const subagentProjection = projectConversationSubagentInput(remaining);
+        if (subagentProjection) {
+            for (const notification of subagentProjection.notifications) {
                 segments.push({
                     role: "subagent",
                     kind: "subagent_notification",
-                    text: block,
-                    subagent: codexSubagentNotificationSummary(block),
+                    text: notification.summary || "",
+                    subagent: notification,
                 });
-                remaining = remaining.slice(end).trimStart();
-                continue;
             }
+            remaining = subagentProjection.userText || "";
+            continue;
         }
         let matchedSystemEnvelope = false;
         for (const [open, close, kind] of CODEX_SYSTEM_USER_ENVELOPES) {
@@ -2527,7 +2507,15 @@ class CodexRoundBuilder {
         const pending = this.pendingLeadingSemanticSegments.splice(0);
         for (const item of pending) {
             if (item.segment.role === "system") {
-                this.addSystemMessage(item.segment.text, item.rawRole, item.segment.kind, item.sourceByte, item.attachments, item.stepIndex);
+                this.addSystemMessage(
+                    item.segment.text,
+                    item.rawRole,
+                    item.segment.kind,
+                    item.sourceByte,
+                    item.attachments,
+                    item.stepIndex,
+                    item.segment.automation,
+                );
             } else if (item.segment.role === "subagent") {
                 this.addSubagentMessage(item.segment, item.attachments, item.rawRole, item.sourceByte, item.stepIndex);
             }
@@ -2611,11 +2599,12 @@ class CodexRoundBuilder {
         sourceByte?: number,
         attachments: ConversationAttachment[] = [],
         stepIndex = this.syntheticStep,
+        automation?: ConversationAutomationEvent,
     ): void {
         if (!text.trim()) return;
         if (!this.currentRound) {
             this.pendingLeadingSemanticSegments.push({
-                segment: { role: "system", kind, text },
+                segment: { role: "system", kind, text, automation },
                 attachments,
                 rawRole,
                 stepIndex: this.syntheticStep,
@@ -2633,6 +2622,7 @@ class CodexRoundBuilder {
                 semanticRole: "system",
                 kind,
                 text,
+                ...(automation ? { automation } : {}),
                 ...(attachments.length > 0 ? { attachments } : {}),
             },
         ];
@@ -2724,17 +2714,25 @@ class CodexRoundBuilder {
             return;
         }
         let attachmentsAssigned = false;
-        for (const segment of segments) {
+        const attachmentSegmentIndex = Math.max(0, segments.findIndex(segment => segment.role === "user"));
+        for (const [segmentIndex, segment] of segments.entries()) {
+            const segmentAttachments = segmentIndex === attachmentSegmentIndex ? attachments : [];
             if (segment.role === "system") {
-                this.addSystemMessage(segment.text, rawRole, segment.kind, sourceByte, attachmentsAssigned ? [] : attachments);
-                attachmentsAssigned = true;
+                this.addSystemMessage(
+                    segment.text,
+                    rawRole,
+                    segment.kind,
+                    sourceByte,
+                    segmentAttachments,
+                    this.syntheticStep,
+                    segment.automation,
+                );
             } else if (segment.role === "subagent") {
-                this.addSubagentMessage(segment, attachmentsAssigned ? [] : attachments, rawRole, sourceByte);
-                attachmentsAssigned = true;
+                this.addSubagentMessage(segment, segmentAttachments, rawRole, sourceByte);
             } else {
-                this.addUserMessage(segment.text, attachmentsAssigned ? [] : attachments, rawRole, sourceByte);
-                attachmentsAssigned = true;
+                this.addUserMessage(segment.text, segmentAttachments, rawRole, sourceByte);
             }
+            if (segmentAttachments.length > 0) attachmentsAssigned = true;
         }
         if (!attachmentsAssigned && attachments.length > 0) this.mergeMirroredAttachments(attachments, "system");
     }
@@ -4270,11 +4268,7 @@ class CodexEvidenceRoundProjector {
     addRound(round: ConversationRound): void {
         const ordered: Array<{ stepIndex: number; sequence: number; message: CodexSourceContentMessage }> = [];
         let sequence = 0;
-        const userMessages = round.userMessages?.length
-            ? round.userMessages
-            : round.userMessage && round.userMessage !== "(无显式用户消息)"
-                ? [{ stepIndex: round.startStep, text: round.userMessage, attachments: round.attachments }]
-                : [];
+        const userMessages = getRoundUserMessages(round);
         if (userMessages.length > 0) this.roundEnd += 1;
         for (const message of userMessages) {
             ordered.push({
@@ -4295,19 +4289,17 @@ class CodexEvidenceRoundProjector {
                 message: { role: "assistant", text: response.response.normalize("NFC") },
             });
         }
-        for (const event of round.semanticEvents || []) {
-            if (event.semanticRole !== "subagent" || !event.text?.trim()) continue;
-            const parsed = codexSubagentNotificationSummary(event.text);
+        for (const parsed of getRoundSubagentSummaries(round)) {
             const shortId = parsed.threadId ? parsed.threadId.slice(0, 8) : "unknown";
             const label = `Subagent-${parsed.nickname || "subagent"} (${shortId})`;
-            const detail = parsed.summary || event.text;
+            const detail = parsed.summary || parsed.status || "子代理状态已更新";
             ordered.push({
-                stepIndex: event.stepIndex ?? round.endStep,
+                stepIndex: round.endStep,
                 sequence: sequence += 1,
                 message: {
                     role: "assistant",
                     text: `${label}\n${detail}`.normalize("NFC"),
-                    ...(event.attachments?.length ? { attachments: event.attachments } : {}),
+                    ...(parsed.attachments?.length ? { attachments: parsed.attachments } : {}),
                 },
             });
         }
