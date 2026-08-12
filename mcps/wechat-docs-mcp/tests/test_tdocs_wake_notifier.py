@@ -57,11 +57,28 @@ def test_document_wake_routes_by_subscription_without_document_body(tmp_path: Pa
         "development",
         client=httpx.Client(transport=httpx.MockTransport(handler)),
         retry_interval_seconds=1,
+        message_visibility="hidden",
     )
+    candidate = store.list_wakes_for_notification(1)[0]
+    visible_notifier = TencentDocsWakeNotifier(
+        store,
+        runtime,
+        token,
+        "development",
+        "development",
+        client=httpx.Client(transport=httpx.MockTransport(handler)),
+        retry_interval_seconds=1,
+    )
+    visible_request = visible_notifier._request_body(candidate)
+    hidden_request = notifier._request_body(candidate)
+    assert visible_request.pop("messageVisibility") == "visible"
+    assert hidden_request.pop("messageVisibility") == "hidden"
+    assert visible_request == hidden_request
     result = notifier.submit_pending()
 
     assert result["submitted_count"] == 1
     assert requests[0]["threadId"] == "conversation-one"
+    assert requests[0]["messageVisibility"] == "hidden"
     assert "monitor_id=monitor-one" in str(requests[0]["prompt"])
     assert "subscription_id=subscription-one" in str(requests[0]["prompt"])
     assert "DO_NOT_INCLUDE_DOCUMENT_BODY" not in str(requests[0]["prompt"])

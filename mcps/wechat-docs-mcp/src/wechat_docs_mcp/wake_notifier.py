@@ -19,6 +19,16 @@ class WakeNotifierError(RuntimeError):
         self.code = code
 
 
+def normalize_wake_message_visibility(value: object) -> str:
+    visibility = str(value if value is not None else "visible").strip().lower()
+    if visibility not in {"visible", "hidden"}:
+        raise WakeNotifierError(
+            "WAKE_MESSAGE_VISIBILITY_INVALID",
+            "wake message visibility must be visible or hidden",
+        )
+    return visibility
+
+
 class CodexWakeNotifier:
     def __init__(
         self,
@@ -30,6 +40,7 @@ class CodexWakeNotifier:
         *,
         client: httpx.Client | None = None,
         retry_interval_seconds: float = 30.0,
+        message_visibility: str = "visible",
     ) -> None:
         self.ledger = ledger
         self.runtime_file = Path(runtime_file)
@@ -38,6 +49,7 @@ class CodexWakeNotifier:
         self.target_machine = target_machine
         self.client = client or httpx.Client(timeout=10.0)
         self.retry_interval_seconds = max(1.0, retry_interval_seconds)
+        self.message_visibility = normalize_wake_message_visibility(message_visibility)
         self._last_attempt: dict[str, float] = {}
 
     def readiness(self) -> dict[str, Any]:
@@ -149,7 +161,7 @@ class CodexWakeNotifier:
             "promptSha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "pendingThroughSequence": 0,
             "pendingThroughTime": wake["created_at"],
-            "messageVisibility": "visible",
+            "messageVisibility": self.message_visibility,
         }
 
     def _control_url(self) -> str:
@@ -205,6 +217,7 @@ class TencentDocsWakeNotifier(CodexWakeNotifier):
         *,
         client: httpx.Client | None = None,
         retry_interval_seconds: float = 30.0,
+        message_visibility: str = "visible",
     ) -> None:
         super().__init__(
             monitor_store.ledger,
@@ -214,6 +227,7 @@ class TencentDocsWakeNotifier(CodexWakeNotifier):
             target_machine,
             client=client,
             retry_interval_seconds=retry_interval_seconds,
+            message_visibility=message_visibility,
         )
         self.monitor_store = monitor_store
 
@@ -253,5 +267,5 @@ class TencentDocsWakeNotifier(CodexWakeNotifier):
             "promptSha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
             "pendingThroughSequence": 0,
             "pendingThroughTime": wake["created_at"],
-            "messageVisibility": "visible",
+            "messageVisibility": self.message_visibility,
         }

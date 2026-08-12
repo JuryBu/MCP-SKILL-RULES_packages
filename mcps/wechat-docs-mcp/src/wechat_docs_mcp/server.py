@@ -28,7 +28,11 @@ from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
 from .runtime_flags import resolve_private_runtime_gate
 from .tencent_docs import TencentDocsMcpClient, classify_tool
-from .wake_notifier import CodexWakeNotifier, TencentDocsWakeNotifier
+from .wake_notifier import (
+    CodexWakeNotifier,
+    TencentDocsWakeNotifier,
+    normalize_wake_message_visibility,
+)
 from .wechat_attachment_source import WechatAttachmentSourceResolver
 from .wechat_attachment_outbound import SafeAttachmentOutbound
 from .wechat_outbound_verifier import WechatAttachmentDatabaseVerifier, WechatTextDatabaseVerifier
@@ -93,6 +97,9 @@ IMAGE_VIEWER_TITLES = tuple(
     if title.strip()
 )
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
+WAKE_MESSAGE_VISIBILITY = normalize_wake_message_visibility(
+    os.environ.get("WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY", "visible")
+)
 
 
 def outbound_runtime_enabled() -> bool:
@@ -283,6 +290,7 @@ def wake_notifier() -> CodexWakeNotifier | None:
             os.environ.get("WECHAT_DOCS_MCP_SOURCE_MACHINE", "local"),
             os.environ.get("WECHAT_DOCS_MCP_TARGET_MACHINE", "local"),
             retry_interval_seconds=float(os.environ.get("WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS", "30")),
+            message_visibility=WAKE_MESSAGE_VISIBILITY,
         )
         return _wake_notifier
 
@@ -301,6 +309,7 @@ def tdocs_wake_notifier() -> TencentDocsWakeNotifier | None:
             os.environ.get("WECHAT_DOCS_MCP_SOURCE_MACHINE", "local"),
             os.environ.get("WECHAT_DOCS_MCP_TARGET_MACHINE", "local"),
             retry_interval_seconds=float(os.environ.get("WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS", "30")),
+            message_visibility=WAKE_MESSAGE_VISIBILITY,
         )
         return _tdocs_wake_notifier
 
@@ -395,6 +404,7 @@ def wechat_status() -> dict[str, Any]:
         "poll_last_error_time": poll_last_error_time,
         "poll_consecutive_failures": poll_consecutive_failures,
         "wake_notifier_enabled": WAKE_ENABLED,
+        "wake_message_visibility": WAKE_MESSAGE_VISIBILITY,
         "wake_notifier_ready": notifier_status["ready"],
         "wake_notifier_error": wake_last_error or notifier_status["error_code"],
         "wake_last_attempt_time": wake_last_attempt_time,

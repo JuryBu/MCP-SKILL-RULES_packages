@@ -25,6 +25,7 @@
 | `WECHAT_DOCS_MCP_TDOCS_AUTO_POLL` | `0` | 启动时开启腾讯文档只读监视；候选验证前保持关闭 |
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
+| `WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY` | `visible` | `visible` 显示 Codex 用户消息气泡，`hidden` 仅隐藏气泡；两者保持相同注入、重试、wake 与 ACK 语义，非法值拒绝启动 |
 | `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时文字发送 gate，避免 broker 环境残留覆盖私有关闭状态 |
 | `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时附件发送 gate |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
@@ -38,6 +39,8 @@
 | `WECHAT_DOCS_MCP_IMAGE_KEY_FILE` | `<data_root>/secrets/wechat-image-v2.json` | 旧版无账号归属 key 的兼容候选；只有通过当前精确 DAT 验证后才迁入分账号目录 |
 | `CODEX_WAKE_PROXY_RUNTIME_FILE` | (无) | 透明代理运行状态文件 |
 | `CODEX_WAKE_PROXY_TOKEN_FILE` | (无) | 透明代理控制 token 文件 |
+
+`WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY=hidden` 依赖共享 Codex App Server 代理 0.3.12 或更新版本提供“可见性与投递语义解耦”的合同。切换前必须先确认该代理版本已生效；旧代理在目标对话忙碌时可能把 `hidden` 当作拒绝投递，而不是与 `visible` 一样转入当前 turn。
 
 0.6.1 起，微信真实发送只读取 `<data_root>/config/service-runtime.json` 中的 `outboundWeChatEnabled` 与 `attachmentOutboundWeChatEnabled`。MCP 在状态查询、能力查询和每次执行发送前都会重新读取该私有文件；文件缺失、损坏、字段缺失或字段不是布尔值时一律关闭。`wechat_outbound_capabilities.active_execution_count` 报告仍持有发送租约的微信执行；关闭脚本必须先关闭动态 gate，再等待该计数归零后才能报告完成。route policy、草稿批准、授权引用、dedupe 与数据库确认仍是独立硬门，动态 gate 不会自动执行或重试既有草稿。
 
@@ -184,6 +187,7 @@ wechat_status()
 | `poll_last_error_time` | 错误发生时间 |
 | `poll_consecutive_failures` | 连续失败次数 |
 | `wake_notifier_enabled` | 是否启用 Codex wake 提交 |
+| `wake_message_visibility` | 当前 wake 气泡可见性，`visible` 或 `hidden`；该值在 backend 启动时读取 |
 | `wake_notifier_ready` | 代理 runtime、token 与回环地址是否就绪 |
 | `wake_notifier_error` | 最近一次 wake 提交错误码，不含消息正文或 token |
 | `wake_last_attempt_time` | 最近一次提交尝试时间 |
