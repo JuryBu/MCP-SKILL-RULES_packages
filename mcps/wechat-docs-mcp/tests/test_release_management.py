@@ -410,6 +410,60 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertFalse((self.root / "data").exists())
         self.assertFalse((self.root / "broker").exists())
 
+    def test_timeout_contract_accepts_300_and_rejects_above_900(self) -> None:
+        accepted = run_process(
+            [
+                str(POWERSHELL),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(RELEASE_SCRIPT),
+                "-Action",
+                "Activate",
+                "-TimeoutSeconds",
+                "300",
+                "-StartupProbeTimeoutSeconds",
+                "300",
+            ]
+        )
+        self.assertNotEqual(0, accepted.returncode)
+        self.assertIn("ConfirmProductionActivation", accepted.stderr)
+        self.assertNotIn("TimeoutSeconds", accepted.stderr.split("ConfirmProductionActivation")[0])
+
+        rejected = run_process(
+            [
+                str(POWERSHELL),
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(RELEASE_SCRIPT),
+                "-Action",
+                "Activate",
+                "-TimeoutSeconds",
+                "901",
+            ]
+        )
+        self.assertNotEqual(0, rejected.returncode)
+        self.assertIn("TimeoutSeconds", rejected.stderr)
+        self.assertNotIn("ConfirmProductionActivation", rejected.stderr)
+
+    def test_http_wait_budgets_cover_backend_startup_timeout(self) -> None:
+        script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            '-TimeoutSec ($StartupProbeTimeoutSeconds + 5)',
+            script,
+        )
+        self.assertIn(
+            '[Math]::Max($TimeoutSeconds, $StartupProbeTimeoutSeconds + 5)',
+            script,
+        )
+        self.assertIn(
+            '[Math]::Max($TimeoutSeconds, $StartupProbeTimeoutSeconds + 45)',
+            script,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

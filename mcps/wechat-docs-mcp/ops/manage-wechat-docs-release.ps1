@@ -16,7 +16,7 @@ param(
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,
   [string]$BrokerBaseUrl = "http://127.0.0.1:14588",
-  [ValidateRange(5, 180)]
+  [ValidateRange(5, 900)]
   [int]$TimeoutSeconds = 60,
   [ValidateRange(5, 600)]
   [int]$StartupProbeTimeoutSeconds = 15,
