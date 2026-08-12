@@ -4,9 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  appendOnlyFileSnapshot,
   createBackup,
   injectWakeAfterMaintenanceRelease,
   restoreBackup,
+  verifyAppendOnlyFileSnapshot,
 } from "../ops/rearm-stale-sent-wake.mjs";
 import { createTaskRegistry } from "../src/task-registry.mjs";
 import {
@@ -264,6 +266,74 @@ test("three-file backup restores exact original bytes", () => {
     for (const name of Object.keys(paths)) fs.writeFileSync(paths[name], `${name}-changed\n`, "utf8");
     restoreBackup(paths, backupPath);
     for (const name of Object.keys(paths)) assert.deepEqual(fs.readFileSync(paths[name]), original[name]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("append-only log accepts a legitimate tail while preserving its prepared prefix", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-rearm-log-append-"));
+  try {
+    const logPath = path.join(root, "task-router.jsonl");
+    fs.writeFileSync(logPath, "prepared\n", "utf8");
+    const snapshot = appendOnlyFileSnapshot(logPath);
+    fs.appendFileSync(logPath, "later-scan\n", "utf8");
+    const verified = verifyAppendOnlyFileSnapshot(snapshot, logPath);
+    assert.equal(verified.appendedBytes, Buffer.byteLength("later-scan\n"));
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("append-only log rejects prepared-prefix tampering and truncation", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-rearm-log-drift-"));
+  try {
+    const logPath = path.join(root, "task-router.jsonl");
+    fs.writeFileSync(logPath, "prepared\n", "utf8");
+    const snapshot = appendOnlyFileSnapshot(logPath);
+    fs.writeFileSync(logPath, "tampered\nlater\n", "utf8");
+    assert.throws(() => verifyAppendOnlyFileSnapshot(snapshot, logPath), /既有前缀已变化/);
+    fs.writeFileSync(logPath, "short\n", "utf8");
+    assert.throws(() => verifyAppendOnlyFileSnapshot(snapshot, logPath), /已截断/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("append-only log rejects replacement even when bytes match", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-rearm-log-identity-"));
+  try {
+    const logPath = path.join(root, "task-router.jsonl");
+    const displacedPath = path.join(root, "task-router.old.jsonl");
+    fs.writeFileSync(logPath, "prepared\n", "utf8");
+    const snapshot = appendOnlyFileSnapshot(logPath);
+    fs.renameSync(logPath, displacedPath);
+    fs.writeFileSync(logPath, "prepared\n", "utf8");
+    assert.throws(() => verifyAppendOnlyFileSnapshot(snapshot, logPath), /身份已变化/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stable rollback does not erase append-only log records written after backup", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-rearm-log-rollback-"));
+  try {
+    const paths = {
+      registry: path.join(root, "task-registry.json"),
+      dedupe: path.join(root, "dedupe.json"),
+      log: path.join(root, "task-router.jsonl"),
+    };
+    fs.writeFileSync(paths.registry, "registry-original\n", "utf8");
+    fs.writeFileSync(paths.dedupe, "dedupe-original\n", "utf8");
+    fs.writeFileSync(paths.log, "log-original\n", "utf8");
+    const backupRoot = path.join(root, "backups");
+    fs.mkdirSync(backupRoot);
+    const backupPath = createBackup({ schemaVersion: 1 }, paths, backupRoot);
+    fs.writeFileSync(paths.dedupe, "dedupe-changed\n", "utf8");
+    fs.appendFileSync(paths.log, "legitimate-tail\n", "utf8");
+    restoreBackup({ dedupe: paths.dedupe }, backupPath);
+    assert.equal(fs.readFileSync(paths.dedupe, "utf8"), "dedupe-original\n");
+    assert.equal(fs.readFileSync(paths.log, "utf8"), "log-original\nlegitimate-tail\n");
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

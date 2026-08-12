@@ -68,6 +68,52 @@ function fileSnapshot(paths) {
   }));
 }
 
+function fileIdentity(filePath) {
+  const stat = fs.statSync(filePath);
+  return {
+    realPath: fs.realpathSync.native(filePath),
+    device: String(stat.dev),
+    inode: String(stat.ino),
+    birthtimeMs: stat.birthtimeMs,
+  };
+}
+
+export function appendOnlyFileSnapshot(filePath) {
+  const buffer = readBuffer(filePath);
+  return {
+    path: filePath,
+    bytes: buffer.length,
+    prefixSha256: sha256(buffer),
+    identity: fileIdentity(filePath),
+  };
+}
+
+export function verifyAppendOnlyFileSnapshot(snapshot, filePath) {
+  const identity = fileIdentity(filePath);
+  if (identity.realPath !== snapshot.identity.realPath
+    || identity.device !== snapshot.identity.device
+    || identity.inode !== snapshot.identity.inode
+    || identity.birthtimeMs !== snapshot.identity.birthtimeMs) {
+    throw new Error("log 文件身份已变化，拒绝执行");
+  }
+  const descriptor = fs.openSync(filePath, "r");
+  try {
+    const stat = fs.fstatSync(descriptor);
+    if (stat.size < snapshot.bytes) throw new Error("log 文件已截断，拒绝执行");
+    const prefix = Buffer.alloc(snapshot.bytes);
+    let offset = 0;
+    while (offset < prefix.length) {
+      const read = fs.readSync(descriptor, prefix, offset, prefix.length - offset, offset);
+      if (read === 0) throw new Error("log 文件读取不完整，拒绝执行");
+      offset += read;
+    }
+    if (sha256(prefix) !== snapshot.prefixSha256) throw new Error("log 文件既有前缀已变化，拒绝执行");
+    return { path: filePath, bytes: stat.size, appendedBytes: stat.size - snapshot.bytes, identity };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
 function updateMaintenance(filePath, value) {
   const current = fs.existsSync(filePath) ? readJson(filePath) : { schemaVersion: 1, reasons: {} };
   const reasons = current.reasons && typeof current.reasons === "object" ? { ...current.reasons } : {};
@@ -107,7 +153,10 @@ function createPlan(options) {
     expectedActiveWakeIds: plan.expectedActiveWakeIds,
     expectedLatestWakeId: plan.expectedLatestWakeId,
     before: plan.before,
-    files: fileSnapshot({ registry: options.registry, dedupe: options.dedupe, log: options.log }),
+    files: {
+      ...fileSnapshot({ registry: options.registry, dedupe: options.dedupe }),
+      log: appendOnlyFileSnapshot(options.log),
+    },
     routerPid: runtime.pid,
     routerStartedAt: runtime.startedAt,
   };
@@ -127,12 +176,14 @@ function rehydratePlan(state, storedPlan) {
 }
 
 function verifyFileSnapshot(storedPlan, paths) {
-  const current = fileSnapshot(paths);
-  for (const name of Object.keys(paths)) {
+  const stablePaths = { registry: paths.registry, dedupe: paths.dedupe };
+  const current = fileSnapshot(stablePaths);
+  for (const name of Object.keys(stablePaths)) {
     if (current[name].sha256 !== storedPlan.files[name].sha256 || current[name].bytes !== storedPlan.files[name].bytes) {
       throw new Error(`${name} 文件已变化，拒绝执行`);
     }
   }
+  return { ...current, log: verifyAppendOnlyFileSnapshot(storedPlan.files.log, paths.log) };
 }
 
 export function createBackup(storedPlan, paths, backupRoot) {
@@ -247,24 +298,24 @@ async function executePlan(options, storedPlan) {
   } catch (error) {
     try {
       updateMaintenance(options.maintenanceFile, maintenance);
-      if (rearmResult && !wakeAccepted && !wakeOutcomeUncertain) {
-        registry.rollbackStaleSentWakeRearm({
-          taskId: storedPlan.taskId,
-          expectedGeneration: storedPlan.expectedGeneration,
-          expectedPendingSeqs: storedPlan.expectedPendingSeqs,
-          newWakeId: rearmResult.wakeId,
-          rollback: rearmResult.rollback,
-        });
-        const restoredRegistry = readBuffer(options.registry);
-        const originalRegistry = readBuffer(path.join(backupPath, "registry.backup"));
-        if (!restoredRegistry.equals(originalRegistry)) throw new Error("registry 回滚后未恢复原始字节");
-        restoreBackup({ dedupe: paths.dedupe, log: paths.log }, backupPath);
-      } else if (!rearmResult) {
-        restoreBackup(paths, backupPath);
-      } else if (wakeOutcomeUncertain) {
-        throw new Error("新 wake 接纳结果未知，禁止回滚或重试");
-      } else {
-        throw new Error("新 wake 已被接纳，禁止回滚造成重复注入");
+      if (rearmResult) {
+        if (!wakeAccepted && !wakeOutcomeUncertain) {
+          registry.rollbackStaleSentWakeRearm({
+            taskId: storedPlan.taskId,
+            expectedGeneration: storedPlan.expectedGeneration,
+            expectedPendingSeqs: storedPlan.expectedPendingSeqs,
+            newWakeId: rearmResult.wakeId,
+            rollback: rearmResult.rollback,
+          });
+          const restoredRegistry = readBuffer(options.registry);
+          const originalRegistry = readBuffer(path.join(backupPath, "registry.backup"));
+          if (!restoredRegistry.equals(originalRegistry)) throw new Error("registry 回滚后未恢复原始字节");
+          restoreBackup({ dedupe: paths.dedupe }, backupPath);
+        } else if (wakeOutcomeUncertain) {
+          throw new Error("新 wake 接纳结果未知，禁止回滚或重试");
+        } else {
+          throw new Error("新 wake 已被接纳，禁止回滚造成重复注入");
+        }
       }
       updateMaintenance(options.maintenanceFile, null);
     } catch (rollbackError) {
