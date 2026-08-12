@@ -9,6 +9,7 @@ import { touchActivity, ensureModelVisibleToolResult, formatElapsed } from "../l
 import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { acquireResourceLease, adoptResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
+import { getWindowsJobRunnerPath, hasWindowsJobRunner, readWindowsJobMetadata } from "../windows-job-runner.js";
 
 /**
  * MCP Sandbox Launch — 长任务脱离执行
@@ -54,6 +55,10 @@ interface LaunchTask {
     status: "running" | "done" | "failed";
     exitCode: number | null;
     reservationMB?: number;
+    maxMemoryMB?: number;
+    memoryMetadataPath?: string;
+    peakMemoryMB?: number;
+    memoryLimitHit?: boolean;
     statusReason?: string;
 }
 
@@ -77,6 +82,8 @@ interface ExitMarker {
     error?: string;
     startedAtMs?: number;
     finishedAtMs?: number;
+    peakMemoryBytes?: number;
+    memoryLimitHit?: boolean;
 }
 
 interface ProcessInfo {
@@ -233,7 +240,8 @@ function ensureWrapperFile(): void {
 const { spawn } = require("child_process");
 
 const specPath = process.argv[2];
-if (!specPath) {
+const handshakePath = process.argv[3];
+if (!specPath || !handshakePath) {
   process.exit(125);
 }
 
@@ -243,6 +251,12 @@ function writeMarker(markerPath, data) {
   fs.renameSync(tmp, markerPath);
 }
 
+function writeHandshake(value) {
+  const tmp = handshakePath + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(value), "utf8");
+  fs.renameSync(tmp, handshakePath);
+}
+
 const spec = JSON.parse(fs.readFileSync(specPath, "utf8"));
 const startedAtMs = Date.now();
 let stdoutFd;
@@ -250,7 +264,18 @@ let stderrFd;
 try {
   stdoutFd = fs.openSync(spec.stdoutLog, "a");
   stderrFd = fs.openSync(spec.stderrLog, "a");
-  const child = spawn(spec.command, [], {
+  const useJobRunner = process.platform === "win32" && spec.windowsJobRunner;
+  const child = useJobRunner ? spawn(spec.windowsJobRunner, [
+    "--memory-mb", String(spec.maxMemoryMB),
+    "--metadata", spec.memoryMetadataPath,
+    "--cwd", spec.cwd,
+    "--shell-base64", Buffer.from(spec.command, "utf8").toString("base64"),
+  ], {
+    cwd: spec.cwd,
+    stdio: ["ignore", stdoutFd, stderrFd],
+    windowsHide: true,
+    env: { ...process.env, ...(spec.env || {}) },
+  }) : spawn(spec.command, [], {
     cwd: spec.cwd,
     shell: true,
     stdio: ["ignore", stdoutFd, stderrFd],
@@ -259,6 +284,7 @@ try {
   });
 
   child.on("error", (err) => {
+    try { writeHandshake({ error: err.message }); } catch {}
     writeMarker(spec.exitMarkerPath, {
       done: true,
       exitCode: null,
@@ -270,13 +296,25 @@ try {
     process.exit(124);
   });
 
+  child.on("spawn", () => {
+    if (!child.pid) {
+      try { writeHandshake({ error: "command PID missing" }); } catch {}
+      return;
+    }
+    writeHandshake({ pid: child.pid });
+  });
+
   child.on("close", (code, signal) => {
+    let memory = null;
+    try { memory = spec.memoryMetadataPath ? JSON.parse(fs.readFileSync(spec.memoryMetadataPath, "utf8")) : null; } catch {}
     writeMarker(spec.exitMarkerPath, {
       done: true,
       exitCode: code,
       signal,
       startedAtMs,
       finishedAtMs: Date.now(),
+      peakMemoryBytes: memory && memory.peakMemoryBytes,
+      memoryLimitHit: Boolean(memory && memory.memoryLimitHit),
     });
     process.exit(typeof code === "number" ? code : 1);
   });
@@ -315,7 +353,7 @@ function writeHandshake(value) {
 }
 
 try {
-  const child = spawn(process.execPath, [workerPath, specPath], {
+  const child = spawn(process.execPath, [workerPath, specPath, handshakePath], {
     detached: true,
     stdio: "ignore",
     windowsHide: true,
@@ -326,11 +364,6 @@ try {
     process.exit(124);
   });
   child.once("spawn", () => {
-    if (!child.pid) {
-      try { writeHandshake({ error: "worker PID missing" }); } catch {}
-      process.exit(123);
-    }
-    writeHandshake({ pid: child.pid });
     child.unref();
     process.exit(0);
   });
@@ -511,7 +544,11 @@ function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentity
         task.exitCode = typeof marker.exitCode === "number" ? marker.exitCode : null;
         task.finishedAtMs = marker.finishedAtMs;
         task.status = task.exitCode === 0 ? "done" : "failed";
-        task.statusReason = undefined;
+        task.peakMemoryMB = Number.isFinite(marker.peakMemoryBytes)
+            ? Math.round(Number(marker.peakMemoryBytes) / 1024 / 1024)
+            : undefined;
+        task.memoryLimitHit = marker.memoryLimitHit === true;
+        task.statusReason = task.memoryLimitHit ? "memory_limit" : undefined;
         task.missingPidSinceMs = undefined;
         releaseLaunchLease(task.id);
         return;
@@ -653,9 +690,11 @@ const LaunchParamsShape = {
     waitSeconds: z.number().min(1).max(300).optional()
         .describe("status 前等待秒数（1-300），任务完成时提前返回"),
     ownerId: z.string().optional()
-        .describe("任务归属 ID；未传按 global 兼容旧调用"),
+        .describe("任务归属 ID；未传时优先使用当前 MCP session 身份"),
     maxMemoryMB: z.number().int().min(16).max(1536).optional()
-        .describe("长期任务的全局内存预留，默认256MB"),
+        .describe("长期任务进程树提交内存硬上限，默认256MB"),
+    memoryRequestMB: z.number().int().min(16).max(1536).optional()
+        .describe("长期任务调度预期内存，必须不大于 maxMemoryMB"),
 };
 
 export function registerLaunch(server: McpServer): void {
@@ -678,12 +717,12 @@ export function registerLaunch(server: McpServer): void {
 - 注册表持久化，新对话可用 list 找回任务
 - waitSeconds 主动等待后返回，避免频繁轮询`,
         LaunchParamsShape,
-        async (params: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
+        async (params: Record<string, unknown>, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const startTime = Date.now();
             touchActivity();
 
             const action = params.action as string | undefined;
-            const ownerId = normalizeOwnerId(params.ownerId);
+            const ownerId = normalizeOwnerId(params.ownerId ?? extra?.sessionId);
 
             const appendTiming = (result: { content: Array<{ type: "text"; text: string }> }) => {
                 const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -731,6 +770,7 @@ export function registerLaunch(server: McpServer): void {
                     try { fs.unlinkSync(t.stderrLog); } catch { /* */ }
                     try { if (t.exitMarkerPath) fs.unlinkSync(t.exitMarkerPath); } catch { /* */ }
                     try { if (t.specPath) fs.unlinkSync(t.specPath); } catch { /* */ }
+                    try { if (t.memoryMetadataPath) fs.unlinkSync(t.memoryMetadataPath); } catch { /* */ }
                     deleteTask(t.id);
                     cleaned++;
                 }
@@ -875,17 +915,28 @@ export function registerLaunch(server: McpServer): void {
             const exitMarkerPath = path.join(logDir, `${taskId}.done.json`);
             const specPath = path.join(logDir, `${taskId}.spec.json`);
             const handshakePath = path.join(logDir, `${taskId}.worker.json`);
+            const memoryMetadataPath = path.join(logDir, `${taskId}.memory.json`);
             const hash = commandHash(command, cwd);
+            const maxMemoryMB = (params.maxMemoryMB as number | undefined) || 256;
+            const reservationMB = (params.memoryRequestMB as number | undefined)
+                ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
+            if (reservationMB > maxMemoryMB) {
+                return appendTiming({
+                    content: [{ type: "text" as const, text: "❌ memoryRequestMB 不能大于 maxMemoryMB\n" }],
+                });
+            }
             fs.writeFileSync(specPath, JSON.stringify({
                 command,
                 cwd,
                 stdoutLog,
                 stderrLog,
                 exitMarkerPath,
+                memoryMetadataPath,
+                windowsJobRunner: hasWindowsJobRunner() ? getWindowsJobRunnerPath() : null,
+                maxMemoryMB,
                 env: { PYTHONUNBUFFERED: "1" },
             }, null, 2), "utf-8");
 
-            const reservationMB = (params.maxMemoryMB as number | undefined) || 256;
             let resourceLease: ManagedResourceLease | null = null;
             let workerPid: number | null = null;
             try {
@@ -898,6 +949,7 @@ export function registerLaunch(server: McpServer): void {
                 if (extra?.signal?.aborted) {
                     acquiredLease.release();
                     try { fs.unlinkSync(specPath); } catch { }
+                    try { fs.unlinkSync(memoryMetadataPath); } catch { }
                     return appendTiming({
                         content: [{ type: "text" as const, text: "⏹️ launch 调用已取消，任务未启动\n" }],
                     });
@@ -927,7 +979,11 @@ export function registerLaunch(server: McpServer): void {
                 }
                 const processIdentity = await waitForLaunchProcessIdentity(workerPid);
                 if (!processIdentity) {
+                    const memory = readWindowsJobMetadata(memoryMetadataPath);
                     killProcessTree(workerPid);
+                    if (memory?.memoryLimitHit) {
+                        throw new Error(`任务启动阶段触发 ${maxMemoryMB}MB 进程树内存硬上限`);
+                    }
                     throw new Error("无法读取新任务的 PID 启动标识，已停止任务以避免后续 PID 复用误杀");
                 }
                 try { fs.unlinkSync(handshakePath); } catch { }
@@ -949,6 +1005,8 @@ export function registerLaunch(server: McpServer): void {
                     status: "running",
                     exitCode: null,
                     reservationMB,
+                    maxMemoryMB,
+                    memoryMetadataPath,
                 };
 
                 launchLeases.set(taskId, acquiredLease);
@@ -958,7 +1016,7 @@ export function registerLaunch(server: McpServer): void {
                 return appendTiming({
                     content: [{
                         type: "text" as const,
-                        text: `🚀 长任务已启动\n📋 taskId: ${taskId}\n👤 ownerId: ${ownerId}\n📂 PID: ${task.pid}\n📁 cwd: ${cwd}\n📄 stdout: ${stdoutLog}\n📄 stderr: ${stderrLog}\n📄 exitMarker: ${exitMarkerPath}\n\n💡 用法:\n  sandbox_launch(action="status", taskId="${taskId}", tailLines=5, waitSeconds=60)\n  sandbox_launch(action="kill", taskId="${taskId}")\n`,
+                        text: `🚀 长任务已启动\n📋 taskId: ${taskId}\n👤 ownerId: ${ownerId}\n📂 PID: ${task.pid}\n📁 cwd: ${cwd}\n调度请求: ${reservationMB}MB\n内存硬上限: ${maxMemoryMB}MB\n📄 stdout: ${stdoutLog}\n📄 stderr: ${stderrLog}\n📄 exitMarker: ${exitMarkerPath}\n\n💡 用法:\n  sandbox_launch(action="status", taskId="${taskId}", tailLines=5, waitSeconds=60)\n  sandbox_launch(action="kill", taskId="${taskId}")\n`,
                     }],
                 });
             } catch (err) {
@@ -966,6 +1024,7 @@ export function registerLaunch(server: McpServer): void {
                 if (workerPid) killProcessTree(workerPid);
                 try { fs.unlinkSync(specPath); } catch { /* */ }
                 try { fs.unlinkSync(handshakePath); } catch { /* */ }
+                try { fs.unlinkSync(memoryMetadataPath); } catch { /* */ }
                 const admissionError = serializeResourceAdmissionError(err);
                 if (admissionError) {
                     return ensureModelVisibleToolResult({

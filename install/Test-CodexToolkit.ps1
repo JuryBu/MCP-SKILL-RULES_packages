@@ -17,7 +17,7 @@ function Get-PrivatePatterns {
 }
 
 function Get-TextFiles {
-    $extensions = @(".md", ".txt", ".json", ".jsonc", ".toml", ".yaml", ".yml", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".ps1", ".cmd", ".bat", ".html", ".css", ".env")
+    $extensions = @(".md", ".txt", ".json", ".jsonc", ".toml", ".yaml", ".yml", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".cs", ".ps1", ".cmd", ".bat", ".html", ".css", ".env")
     $extensionlessTextNames = @("LICENSE", "NOTICE", "COPYING", ".env")
     return Get-ChildItem -LiteralPath $toolkitRoot -Recurse -File -Force -ErrorAction SilentlyContinue |
         Where-Object {

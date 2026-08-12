@@ -6,6 +6,7 @@ import {
     type ResourceLease,
 } from "./resource-admission.js";
 import os from "node:os";
+import { hasWindowsJobRunner, startWindowsSystemMemoryMonitor } from "./windows-job-runner.js";
 
 export interface ManagedResourceLease extends ResourceLease {
     readonly queueWaitMs: number;
@@ -26,22 +27,62 @@ export const resourceAdmission = new ResourceAdmissionController({
     minReservationMB: readEnvNumber("SANDBOX_ADMISSION_MIN_RESERVATION_MB", 64),
     admissionLimitMB: readEnvNumber("SANDBOX_ADMISSION_LIMIT_MB", 1536),
     hardLimitMB: readEnvNumber("SANDBOX_ADMISSION_HARD_LIMIT_MB", 2048),
-    systemHeadroomMB: readEnvNumber("SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB", 1024),
+    systemHeadroomMB: readEnvNumber("SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB", 512),
+    commitHeadroomMB: readEnvNumber("SANDBOX_ADMISSION_COMMIT_HEADROOM_MB", 4096),
+    yellowPhysicalMemoryMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_PHYSICAL_MB", 1536),
+    yellowMaxReservationMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_MAX_REQUEST_MB", 192),
+    maxAgedReservationMB: readEnvNumber("SANDBOX_ADMISSION_MAX_AGED_RESERVATION_MB", 256),
     maxQueueSize: readEnvNumber("SANDBOX_ADMISSION_MAX_QUEUE", 256),
     admissionBudgetMinMs: readEnvNumber("SANDBOX_ADMISSION_WAIT_MIN_MS", 8000),
     admissionBudgetMaxMs: readEnvNumber("SANDBOX_ADMISSION_WAIT_MAX_MS", 10000),
     agingThresholdMs: readEnvNumber("SANDBOX_ADMISSION_AGING_MS", 1000),
     retrySlotMs: readEnvNumber("SANDBOX_ADMISSION_RETRY_SLOT_MS", 500),
     maxRetryExponent: readEnvNumber("SANDBOX_ADMISSION_MAX_RETRY_EXPONENT", 4),
+    progressIntervalMs: readEnvNumber("SANDBOX_ADMISSION_PROGRESS_INTERVAL_MS", 2000),
 });
 
 function refreshSystemAvailableMemory(): void {
     resourceAdmission.updateSystemAvailableMemoryMB(os.freemem() / 1024 / 1024);
 }
 
-refreshSystemAvailableMemory();
-const systemMemoryPoll = setInterval(refreshSystemAvailableMemory, 500);
-systemMemoryPoll.unref?.();
+let systemMemoryPoll: NodeJS.Timeout | null = null;
+let memoryMonitorRetry: NodeJS.Timeout | null = null;
+
+function ensureFallbackMemoryPoll(): void {
+    refreshSystemAvailableMemory();
+    if (systemMemoryPoll) return;
+    systemMemoryPoll = setInterval(refreshSystemAvailableMemory, 500);
+    systemMemoryPoll.unref?.();
+}
+
+function stopFallbackMemoryPoll(): void {
+    if (!systemMemoryPoll) return;
+    clearInterval(systemMemoryPoll);
+    systemMemoryPoll = null;
+}
+
+function startNativeMemoryMonitor(): boolean {
+    const monitor = startWindowsSystemMemoryMonitor((sample) => {
+        resourceAdmission.updateSystemPressure({
+            systemAvailableMemoryMB: sample.physicalAvailableMB,
+            commitAvailableMemoryMB: sample.commitAvailableMB,
+            highMemorySignaled: sample.highMemory,
+            lowMemorySignaled: sample.lowMemory,
+        });
+        stopFallbackMemoryPoll();
+    }, () => {
+        ensureFallbackMemoryPoll();
+        if (memoryMonitorRetry) return;
+        memoryMonitorRetry = setTimeout(() => {
+            memoryMonitorRetry = null;
+            startNativeMemoryMonitor();
+        }, 2000);
+        memoryMonitorRetry.unref?.();
+    });
+    return monitor !== null;
+}
+
+if (!hasWindowsJobRunner() || !startNativeMemoryMonitor()) ensureFallbackMemoryPoll();
 
 const observedMemoryByLease = new Map<ManagedResourceLease, number>();
 
@@ -108,6 +149,9 @@ export function serializeResourceAdmissionError(error: unknown): {
         hardLimitMB: number;
         systemAvailableMemoryMB: number | null;
         systemHeadroomMB: number;
+        commitAvailableMemoryMB: number | null;
+        commitHeadroomMB: number;
+        pressureLevel: string;
         queued: number;
     };
 } | null {
@@ -126,6 +170,9 @@ export function serializeResourceAdmissionError(error: unknown): {
             hardLimitMB: state.limits.hardLimitMB,
             systemAvailableMemoryMB: state.systemAvailableMemoryMB,
             systemHeadroomMB: state.limits.systemHeadroomMB,
+            commitAvailableMemoryMB: state.commitAvailableMemoryMB,
+            commitHeadroomMB: state.limits.commitHeadroomMB,
+            pressureLevel: state.pressureLevel,
             queued: state.queued,
         },
     };

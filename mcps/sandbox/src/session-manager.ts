@@ -12,6 +12,11 @@ import {
     type OutputDeliveryMode,
     type OutputDeliveryResult,
 } from "./output-delivery.js";
+import {
+    createWindowsJobLaunch,
+    readWindowsJobMetadata,
+    removeWindowsJobMetadata,
+} from "./windows-job-runner.js";
 
 /**
  * MCP Sandbox REPL 会话管理器
@@ -73,7 +78,7 @@ async function readProcessMemoryMB(pid: number): Promise<number> {
 }
 
 const IDLE_CHECK_INTERVAL_MS = Math.max(1000, Math.min(30000, Math.floor(SESSION_LIMITS.idleTimeoutMs / 2)));
-const MEMORY_CHECK_INTERVAL = 5000;     // 5 秒采样
+const MEMORY_CHECK_INTERVAL = 100;
 const SESSION_ROLLING_BUFFER_CHARS = 1024 * 1024;
 
 function appendRollingBuffer(current: string, chunk: string): string {
@@ -95,6 +100,8 @@ export interface Session {
     pid: number;
     cwd: string;
     maxMemoryMB: number;
+    reservationMB: number;
+    memoryMetadataPath: string | null;
     createdAt: number;
     lastActivity: number;
     execCount: number;
@@ -163,7 +170,10 @@ function wrapWithSentinel(code: string, sentinel: string, language: string): str
 /**
  * 启动 REPL 进程
  */
-function spawnREPL(language: string, cwd: string, envParam?: string): ChildProcess {
+function spawnREPL(language: string, cwd: string, maxMemoryMB: number, envParam?: string): {
+    process: ChildProcess;
+    memoryMetadataPath: string | null;
+} {
     const customInterpreter = resolveInterpreter(envParam, language);
 
     let cmd: string;
@@ -180,7 +190,8 @@ function spawnREPL(language: string, cwd: string, envParam?: string): ChildProce
         args = [];
     }
 
-    const proc = spawn(cmd, args, {
+    const windowsJobLaunch = createWindowsJobLaunch(cmd, args, cwd, maxMemoryMB);
+    const proc = spawn(windowsJobLaunch?.command ?? cmd, windowsJobLaunch?.args ?? args, {
         cwd,
         env: {
             ...process.env,
@@ -190,7 +201,7 @@ function spawnREPL(language: string, cwd: string, envParam?: string): ChildProce
         windowsHide: true,
     });
 
-    return proc;
+    return { process: proc, memoryMetadataPath: windowsJobLaunch?.metadataPath ?? null };
 }
 
 function waitForProcessSpawn(proc: ChildProcess): Promise<Error | null> {
@@ -208,6 +219,17 @@ function waitForProcessSpawn(proc: ChildProcess): Promise<Error | null> {
     });
 }
 
+async function waitForWindowsJobReady(proc: ChildProcess, metadataPath: string | null): Promise<boolean> {
+    if (!metadataPath) return true;
+    const deadline = Date.now() + 1500;
+    while (Date.now() < deadline) {
+        if (readWindowsJobMetadata(metadataPath)) return true;
+        if (proc.exitCode !== null || proc.signalCode !== null) return false;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+}
+
 /**
  * 创建新会话
  */
@@ -218,6 +240,7 @@ export async function createSession(
     envParam?: string,
     ownerId?: string,
     signal?: AbortSignal,
+    memoryRequestMB?: number,
 ): Promise<{ session: Session } | { error: string }> {
     // 清理僵尸会话
     cleanDeadSessions();
@@ -226,21 +249,32 @@ export async function createSession(
         return { error: `已达最大会话数量限制 (${SESSION_LIMITS.maxSessions})。请先关闭不需要的会话。` };
     }
 
-    // 检查总内存额度预留，避免新会话刚启动时 currentMemoryMB≈0 导致超卖。
+    const effectiveMemoryRequestMB = memoryRequestMB
+        ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
+    if (!Number.isFinite(maxMemoryMB) || maxMemoryMB < 16 || maxMemoryMB > 1536) {
+        return { error: "会话 maxMemoryMB 必须在 16～1536 之间" };
+    }
+    if (!Number.isFinite(effectiveMemoryRequestMB)
+        || effectiveMemoryRequestMB < 16
+        || effectiveMemoryRequestMB > maxMemoryMB) {
+        return { error: "会话 memoryRequestMB 必须在 16 与 maxMemoryMB 之间" };
+    }
+
+    // 会话用预期量参与调度，Job Object 继续按 maxMemoryMB 执行硬限制。
     const reservedMemory = getReservedSessionMemory() + pendingSessionMemoryMB;
-    if (reservedMemory + maxMemoryMB > SESSION_LIMITS.maxTotalMemoryMB) {
-        return { error: `总内存额度将超限：当前已预留 ${Math.round(reservedMemory)}MB + 新会话额度 ${maxMemoryMB}MB > 上限 ${SESSION_LIMITS.maxTotalMemoryMB}MB` };
+    if (reservedMemory + effectiveMemoryRequestMB > SESSION_LIMITS.maxTotalMemoryMB) {
+        return { error: `总内存请求量将超限：当前 ${Math.round(reservedMemory)}MB + 新会话 ${effectiveMemoryRequestMB}MB > 上限 ${SESSION_LIMITS.maxTotalMemoryMB}MB` };
     }
 
     pendingSessionCount += 1;
-    pendingSessionMemoryMB += maxMemoryMB;
+    pendingSessionMemoryMB += effectiveMemoryRequestMB;
     let pendingReservationActive = true;
     let resourceLease: ManagedResourceLease | null = null;
 
     try {
         resourceLease = await acquireResourceLease({
             ownerId,
-            reservationMB: maxMemoryMB,
+            reservationMB: effectiveMemoryRequestMB,
             signal,
         });
         if (signal?.aborted) {
@@ -250,19 +284,27 @@ export async function createSession(
         const id = newUuid();
         let proc: ChildProcess;
         try {
-            proc = spawnREPL(language, cwd, envParam);
+            const spawned = spawnREPL(language, cwd, maxMemoryMB, envParam);
+            proc = spawned.process;
+            var memoryMetadataPath = spawned.memoryMetadataPath;
         } catch (error) {
             resourceLease.release();
             return { error: `进程启动失败: ${error instanceof Error ? error.message : String(error)}` };
         }
 
         const spawnError = await waitForProcessSpawn(proc);
-        if (spawnError || !proc.pid) {
+        const windowsJobReady = !spawnError && proc.pid
+            ? await waitForWindowsJobReady(proc, memoryMetadataPath)
+            : false;
+        if (spawnError || !proc.pid || !windowsJobReady) {
+            removeWindowsJobMetadata(memoryMetadataPath);
+            if (proc.pid) killProcessTree(proc.pid);
             resourceLease.release();
-            return { error: `进程启动失败${spawnError ? `: ${spawnError.message}` : ""}` };
+            return { error: `进程启动失败${spawnError ? `: ${spawnError.message}` : memoryMetadataPath ? ": Windows Job Object 未确认子进程启动" : ""}` };
         }
         if (signal?.aborted) {
             proc.kill();
+            removeWindowsJobMetadata(memoryMetadataPath);
             resourceLease.release();
             return { error: "Session 启动期间调用已取消，进程已终止" };
         }
@@ -275,6 +317,8 @@ export async function createSession(
             pid: proc.pid,
             cwd,
             maxMemoryMB,
+            reservationMB: effectiveMemoryRequestMB,
+            memoryMetadataPath,
             createdAt: Date.now(),
             lastActivity: Date.now(),
             execCount: 0,
@@ -315,12 +359,14 @@ export async function createSession(
         proc.on("exit", (code, signal) => {
             session.alive = false;
             session.resourceLease.release();
+            removeWindowsJobMetadata(session.memoryMetadataPath);
             console.error(`[sandbox] 会话 ${id} 退出: code=${code} signal=${signal}`);
         });
 
         proc.on("error", (err) => {
             session.alive = false;
             session.resourceLease.release();
+            removeWindowsJobMetadata(session.memoryMetadataPath);
             console.error(`[sandbox] 会话 ${id} 错误: ${err.message}`);
         });
 
@@ -339,7 +385,7 @@ export async function createSession(
         if (pendingReservationActive) {
             pendingReservationActive = false;
             pendingSessionCount -= 1;
-            pendingSessionMemoryMB -= maxMemoryMB;
+            pendingSessionMemoryMB -= effectiveMemoryRequestMB;
         }
     }
 }
@@ -584,9 +630,17 @@ async function execInSessionUnlocked(
         memoryChecker = setInterval(async () => {
             if (resolved || !session.alive) return;
             try {
-                session.currentMemoryMB = await readProcessMemoryMB(session.pid);
+                const metadata = session.memoryMetadataPath
+                    ? readWindowsJobMetadata(session.memoryMetadataPath)
+                    : null;
+                if (session.memoryMetadataPath) {
+                    if (!metadata) return;
+                    session.currentMemoryMB = metadata.peakMemoryBytes / 1024 / 1024;
+                } else {
+                    session.currentMemoryMB = await readProcessMemoryMB(session.pid);
+                }
                 session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
-                if (session.currentMemoryMB > session.maxMemoryMB) {
+                if (metadata?.memoryLimitHit || session.currentMemoryMB > session.maxMemoryMB) {
                     terminate("memory");
                 }
             } catch { /* 忽略 */ }
@@ -619,7 +673,14 @@ export async function getSessionStatus(sessionId: string): Promise<SessionStatus
     // 更新内存信息
     if (session.alive) {
         try {
-            session.currentMemoryMB = await readProcessMemoryMB(session.pid);
+            const metadata = session.memoryMetadataPath
+                ? readWindowsJobMetadata(session.memoryMetadataPath)
+                : null;
+            if (session.memoryMetadataPath) {
+                if (metadata) session.currentMemoryMB = metadata.peakMemoryBytes / 1024 / 1024;
+            } else {
+                session.currentMemoryMB = await readProcessMemoryMB(session.pid);
+            }
             session.resourceLease.updateObservedMemoryMB(session.currentMemoryMB);
         } catch {
             if (session.process.exitCode !== null || session.process.signalCode !== null) {
@@ -655,6 +716,7 @@ export function closeSession(sessionId: string): boolean {
     }
 
     sessions.delete(sessionId);
+    removeWindowsJobMetadata(session.memoryMetadataPath);
     console.error(`[sandbox] 会话 ${sessionId} 已关闭`);
     return true;
 }
@@ -696,6 +758,7 @@ function cleanDeadSessions(): void {
         if (!session.alive) {
             sessions.delete(id);
             session.resourceLease.release();
+            removeWindowsJobMetadata(session.memoryMetadataPath);
             console.error(`[sandbox] 清理僵尸会话 ${id}`);
         }
     }
@@ -708,7 +771,7 @@ function getReservedSessionMemory(): number {
     let total = 0;
     for (const [, session] of sessions) {
         if (session.alive) {
-            total += session.maxMemoryMB;
+            total += session.reservationMB;
         }
     }
     return total;

@@ -2,13 +2,18 @@ export const RESOURCE_ADMISSION_DEFAULTS = Object.freeze({
     minReservationMB: 64,
     admissionLimitMB: 1536,
     hardLimitMB: 2048,
-    systemHeadroomMB: 1024,
+    systemHeadroomMB: 512,
+    commitHeadroomMB: 4096,
+    yellowPhysicalMemoryMB: 1536,
+    yellowMaxReservationMB: 192,
+    maxAgedReservationMB: 256,
     maxQueueSize: 256,
     admissionBudgetMinMs: 8000,
     admissionBudgetMaxMs: 10000,
     agingThresholdMs: 1000,
     retrySlotMs: 500,
     maxRetryExponent: 4,
+    progressIntervalMs: 2000,
 });
 
 export type ResourceAdmissionErrorCode =
@@ -58,12 +63,17 @@ export interface ResourceAdmissionOptions {
     admissionLimitMB?: number;
     hardLimitMB?: number;
     systemHeadroomMB?: number;
+    commitHeadroomMB?: number;
+    yellowPhysicalMemoryMB?: number;
+    yellowMaxReservationMB?: number;
+    maxAgedReservationMB?: number;
     maxQueueSize?: number;
     admissionBudgetMinMs?: number;
     admissionBudgetMaxMs?: number;
     agingThresholdMs?: number;
     retrySlotMs?: number;
     maxRetryExponent?: number;
+    progressIntervalMs?: number;
     now?: () => number;
     random?: () => number;
 }
@@ -75,6 +85,20 @@ export interface ResourceAdmissionRequest {
     retryAttempt?: number;
     signal?: AbortSignal;
     control?: boolean;
+    onWaitProgress?: (progress: ResourceWaitProgress) => void;
+}
+
+export type ResourcePressureLevel = "green" | "yellow" | "red";
+
+export interface ResourceWaitProgress {
+    queueWaitMs: number;
+    queuePosition: number;
+    queued: number;
+    pressureLevel: ResourcePressureLevel;
+    activeReservedMB: number;
+    observedMemoryMB: number;
+    systemAvailableMemoryMB: number | null;
+    commitAvailableMemoryMB: number | null;
 }
 
 export interface ResourceLease {
@@ -90,6 +114,9 @@ export interface ResourceAdmissionState {
         admissionLimitMB: number;
         hardLimitMB: number;
         systemHeadroomMB: number;
+        commitHeadroomMB: number;
+        yellowPhysicalMemoryMB: number;
+        yellowMaxReservationMB: number;
         maxQueueSize: number;
     };
     activeReservedMB: number;
@@ -97,6 +124,10 @@ export interface ResourceAdmissionState {
     queued: number;
     observedMemoryMB: number;
     systemAvailableMemoryMB: number | null;
+    commitAvailableMemoryMB: number | null;
+    highMemorySignaled: boolean | null;
+    lowMemorySignaled: boolean | null;
+    pressureLevel: ResourcePressureLevel;
     hardLimitExceeded: boolean;
     peak: {
         activeReservedMB: number;
@@ -126,6 +157,8 @@ interface PendingRequest {
     signal?: AbortSignal;
     abortHandler?: () => void;
     timer?: ReturnType<typeof setTimeout>;
+    progressTimer?: ReturnType<typeof setTimeout>;
+    onWaitProgress?: (progress: ResourceWaitProgress) => void;
     resolve: (lease: ResourceLease) => void;
     reject: (error: ResourceAdmissionError) => void;
     settled: boolean;
@@ -148,6 +181,9 @@ export class ResourceAdmissionController {
     readonly admissionLimitMB: number;
     readonly hardLimitMB: number;
     readonly systemHeadroomMB: number;
+    readonly commitHeadroomMB: number;
+    readonly yellowPhysicalMemoryMB: number;
+    readonly yellowMaxReservationMB: number;
     readonly maxQueueSize: number;
 
     private readonly admissionBudgetMinMs: number;
@@ -155,6 +191,8 @@ export class ResourceAdmissionController {
     private readonly agingThresholdMs: number;
     private readonly retrySlotMs: number;
     private readonly maxRetryExponent: number;
+    private readonly maxAgedReservationMB: number;
+    private readonly progressIntervalMs: number;
     private readonly now: () => number;
     private readonly random: () => number;
     private readonly queue: PendingRequest[] = [];
@@ -174,6 +212,9 @@ export class ResourceAdmissionController {
     private activeLeases = 0;
     private observedMemoryMB = 0;
     private systemAvailableMemoryMB = Number.POSITIVE_INFINITY;
+    private commitAvailableMemoryMB = Number.POSITIVE_INFINITY;
+    private highMemorySignaled: boolean | null = null;
+    private lowMemorySignaled: boolean | null = null;
     private peakActiveReservedMB = 0;
     private peakQueued = 0;
     private peakObservedMemoryMB = 0;
@@ -201,6 +242,26 @@ export class ResourceAdmissionController {
             options.systemHeadroomMB,
             RESOURCE_ADMISSION_DEFAULTS.systemHeadroomMB,
             "systemHeadroomMB",
+        );
+        this.commitHeadroomMB = nonNegativeNumber(
+            options.commitHeadroomMB,
+            RESOURCE_ADMISSION_DEFAULTS.commitHeadroomMB,
+            "commitHeadroomMB",
+        );
+        this.yellowPhysicalMemoryMB = nonNegativeNumber(
+            options.yellowPhysicalMemoryMB,
+            RESOURCE_ADMISSION_DEFAULTS.yellowPhysicalMemoryMB,
+            "yellowPhysicalMemoryMB",
+        );
+        this.yellowMaxReservationMB = positiveNumber(
+            options.yellowMaxReservationMB,
+            RESOURCE_ADMISSION_DEFAULTS.yellowMaxReservationMB,
+            "yellowMaxReservationMB",
+        );
+        this.maxAgedReservationMB = nonNegativeNumber(
+            options.maxAgedReservationMB,
+            RESOURCE_ADMISSION_DEFAULTS.maxAgedReservationMB,
+            "maxAgedReservationMB",
         );
         this.maxQueueSize = positiveInteger(
             options.maxQueueSize,
@@ -231,6 +292,11 @@ export class ResourceAdmissionController {
             options.maxRetryExponent,
             RESOURCE_ADMISSION_DEFAULTS.maxRetryExponent,
             "maxRetryExponent",
+        );
+        this.progressIntervalMs = positiveNumber(
+            options.progressIntervalMs,
+            RESOURCE_ADMISSION_DEFAULTS.progressIntervalMs,
+            "progressIntervalMs",
         );
         this.now = options.now ?? Date.now;
         this.random = options.random ?? Math.random;
@@ -274,7 +340,10 @@ export class ResourceAdmissionController {
 
         const admissionBudgetMs = request.admissionBudgetMs === undefined
             ? this.randomInteger(this.admissionBudgetMinMs, this.admissionBudgetMaxMs)
-            : nonNegativeNumber(request.admissionBudgetMs, 0, "admissionBudgetMs");
+            : Math.min(
+                nonNegativeNumber(request.admissionBudgetMs, 0, "admissionBudgetMs"),
+                this.admissionBudgetMaxMs,
+            );
 
         return new Promise<ResourceLease>((resolve, reject) => {
             const pending: PendingRequest = {
@@ -284,6 +353,7 @@ export class ResourceAdmissionController {
                 enqueuedAt: this.now(),
                 retryAttempt: request.retryAttempt,
                 signal: request.signal,
+                onWaitProgress: request.onWaitProgress,
                 resolve,
                 reject,
                 settled: false,
@@ -300,6 +370,7 @@ export class ResourceAdmissionController {
             this.waitCounters.queuedTotal += 1;
             this.peakQueued = Math.max(this.peakQueued, this.queue.length);
             request.signal?.addEventListener("abort", pending.abortHandler, { once: true });
+            this.scheduleWaitProgress(pending);
 
             if (request.signal?.aborted) {
                 this.rejectPending(pending, "admission_aborted");
@@ -345,6 +416,33 @@ export class ResourceAdmissionController {
         return this.getState();
     }
 
+    updateSystemPressure(sample: {
+        systemAvailableMemoryMB: number;
+        commitAvailableMemoryMB: number;
+        highMemorySignaled: boolean;
+        lowMemorySignaled: boolean;
+    }): ResourceAdmissionState {
+        if (!Number.isFinite(sample.systemAvailableMemoryMB) || sample.systemAvailableMemoryMB < 0
+            || !Number.isFinite(sample.commitAvailableMemoryMB) || sample.commitAvailableMemoryMB < 0) {
+            throw new RangeError("system pressure memory values must be finite non-negative numbers");
+        }
+        const previousPhysical = this.systemAvailableMemoryMB;
+        const previousCommit = this.commitAvailableMemoryMB;
+        const previousHighMemory = this.highMemorySignaled;
+        const previousLowMemory = this.lowMemorySignaled;
+        this.systemAvailableMemoryMB = sample.systemAvailableMemoryMB;
+        this.commitAvailableMemoryMB = sample.commitAvailableMemoryMB;
+        this.highMemorySignaled = sample.highMemorySignaled;
+        this.lowMemorySignaled = sample.lowMemorySignaled;
+        if (sample.systemAvailableMemoryMB > previousPhysical
+            || sample.commitAvailableMemoryMB > previousCommit
+            || (previousLowMemory === true && !sample.lowMemorySignaled)
+            || (previousHighMemory === false && sample.highMemorySignaled)) {
+            this.drainQueue();
+        }
+        return this.getState();
+    }
+
     getState(): ResourceAdmissionState {
         const completedTotal = this.waitCounters.completedTotal;
         return {
@@ -353,6 +451,9 @@ export class ResourceAdmissionController {
                 admissionLimitMB: this.admissionLimitMB,
                 hardLimitMB: this.hardLimitMB,
                 systemHeadroomMB: this.systemHeadroomMB,
+                commitHeadroomMB: this.commitHeadroomMB,
+                yellowPhysicalMemoryMB: this.yellowPhysicalMemoryMB,
+                yellowMaxReservationMB: this.yellowMaxReservationMB,
                 maxQueueSize: this.maxQueueSize,
             },
             activeReservedMB: this.activeReservedMB,
@@ -362,6 +463,12 @@ export class ResourceAdmissionController {
             systemAvailableMemoryMB: Number.isFinite(this.systemAvailableMemoryMB)
                 ? this.systemAvailableMemoryMB
                 : null,
+            commitAvailableMemoryMB: Number.isFinite(this.commitAvailableMemoryMB)
+                ? this.commitAvailableMemoryMB
+                : null,
+            highMemorySignaled: this.highMemorySignaled,
+            lowMemorySignaled: this.lowMemorySignaled,
+            pressureLevel: this.getPressureLevel(),
             hardLimitExceeded: this.observedMemoryMB >= this.hardLimitMB,
             peak: {
                 activeReservedMB: this.peakActiveReservedMB,
@@ -399,14 +506,32 @@ export class ResourceAdmissionController {
         return reservedMB;
     }
 
-    private canGrant(reservedMB: number): boolean {
+    private getPressureLevel(): ResourcePressureLevel {
+        if (this.lowMemorySignaled === true
+            || this.systemAvailableMemoryMB < this.systemHeadroomMB
+            || this.commitAvailableMemoryMB < this.commitHeadroomMB) return "red";
+        if (this.highMemorySignaled === false
+            || this.systemAvailableMemoryMB < this.yellowPhysicalMemoryMB) return "yellow";
+        return "green";
+    }
+
+    private canGrant(reservedMB: number, protectedReservationMB = 0): boolean {
         const reservedButNotObservedMB = Math.max(0, this.activeReservedMB - this.observedMemoryMB);
         const preservesSystemHeadroom = this.systemAvailableMemoryMB
             - reservedButNotObservedMB
-            - reservedMB >= this.systemHeadroomMB;
-        return this.observedMemoryMB < this.hardLimitMB
-            && this.activeReservedMB + reservedMB <= this.admissionLimitMB
-            && preservesSystemHeadroom;
+            - reservedMB
+            - protectedReservationMB >= this.systemHeadroomMB;
+        const preservesCommitHeadroom = this.commitAvailableMemoryMB
+            - reservedButNotObservedMB
+            - reservedMB
+            - protectedReservationMB >= this.commitHeadroomMB;
+        const pressureLevel = this.getPressureLevel();
+        return pressureLevel !== "red"
+            && !(pressureLevel === "yellow" && reservedMB > this.yellowMaxReservationMB)
+            && this.observedMemoryMB < this.hardLimitMB
+            && this.activeReservedMB + reservedMB + protectedReservationMB <= this.admissionLimitMB
+            && preservesSystemHeadroom
+            && preservesCommitHeadroom;
     }
 
     private grantImmediate(reservedMB: number): ResourceLease {
@@ -473,18 +598,17 @@ export class ResourceAdmissionController {
 
         const oldest = liveQueue[0];
         const oldestWaitMs = Math.max(0, this.now() - oldest.enqueuedAt);
-        if (oldestWaitMs >= this.agingThresholdMs) {
-            return this.canGrant(oldest.reservedMB) ? oldest : undefined;
-        }
+        if (oldestWaitMs >= this.agingThresholdMs && this.canGrant(oldest.reservedMB)) return oldest;
+        const protectedReservationMB = this.computeAgedReservation(oldest, oldestWaitMs);
 
-        const ownerHeads = new Map<string, PendingRequest>();
+        const ownerQueues = new Map<string, PendingRequest[]>();
         for (const pending of liveQueue) {
-            if (!ownerHeads.has(pending.ownerId)) {
-                ownerHeads.set(pending.ownerId, pending);
-            }
+            const ownerQueue = ownerQueues.get(pending.ownerId) ?? [];
+            ownerQueue.push(pending);
+            ownerQueues.set(pending.ownerId, ownerQueue);
         }
 
-        const owners = [...ownerHeads.keys()];
+        const owners = [...ownerQueues.keys()];
         const lastOwnerIndex = this.lastGrantedOwnerId === null
             ? -1
             : owners.indexOf(this.lastGrantedOwnerId);
@@ -494,13 +618,59 @@ export class ResourceAdmissionController {
 
         for (let offset = 0; offset < owners.length; offset += 1) {
             const ownerId = owners[(startIndex + offset) % owners.length];
-            const pending = ownerHeads.get(ownerId);
-            if (pending && this.canGrant(pending.reservedMB)) {
-                return pending;
+            const ownerQueue = ownerQueues.get(ownerId) ?? [];
+            for (const pending of ownerQueue) {
+                if (this.canGrant(
+                    pending.reservedMB,
+                    pending === oldest ? 0 : protectedReservationMB,
+                )) {
+                    return pending;
+                }
             }
         }
 
         return undefined;
+    }
+
+    private computeAgedReservation(oldest: PendingRequest, oldestWaitMs: number): number {
+        if (oldestWaitMs < this.agingThresholdMs || this.agingThresholdMs <= 0) return 0;
+        if (this.activeReservedMB + oldest.reservedMB <= this.admissionLimitMB) return 0;
+        const agingSteps = Math.max(1, Math.floor(oldestWaitMs / this.agingThresholdMs));
+        return Math.min(
+            oldest.reservedMB,
+            this.maxAgedReservationMB,
+            Math.max(0, agingSteps - 2) * this.minReservationMB,
+        );
+    }
+
+    private scheduleWaitProgress(pending: PendingRequest): void {
+        if (!pending.onWaitProgress) return;
+        const emit = () => {
+            if (pending.settled) return;
+            const liveQueue = this.queue.filter((item) => !item.settled);
+            const queuePosition = liveQueue.indexOf(pending) + 1;
+            try {
+                pending.onWaitProgress?.({
+                    queueWaitMs: Math.max(0, this.now() - pending.enqueuedAt),
+                    queuePosition: Math.max(1, queuePosition),
+                    queued: liveQueue.length,
+                    pressureLevel: this.getPressureLevel(),
+                    activeReservedMB: this.activeReservedMB,
+                    observedMemoryMB: this.observedMemoryMB,
+                    systemAvailableMemoryMB: Number.isFinite(this.systemAvailableMemoryMB)
+                        ? this.systemAvailableMemoryMB
+                        : null,
+                    commitAvailableMemoryMB: Number.isFinite(this.commitAvailableMemoryMB)
+                        ? this.commitAvailableMemoryMB
+                        : null,
+                });
+            } catch {
+            }
+            pending.progressTimer = setTimeout(emit, this.progressIntervalMs);
+            pending.progressTimer.unref?.();
+        };
+        pending.progressTimer = setTimeout(emit, this.agingThresholdMs);
+        pending.progressTimer.unref?.();
     }
 
     private grantPending(pending: PendingRequest): void {
@@ -542,6 +712,7 @@ export class ResourceAdmissionController {
         const queueIndex = this.queue.findIndex((candidate) => candidate.id === pending.id);
         if (queueIndex >= 0) this.queue.splice(queueIndex, 1);
         if (pending.timer) clearTimeout(pending.timer);
+        if (pending.progressTimer) clearTimeout(pending.progressTimer);
         if (pending.signal && pending.abortHandler) {
             pending.signal.removeEventListener("abort", pending.abortHandler);
         }

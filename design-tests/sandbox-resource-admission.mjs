@@ -19,7 +19,10 @@ test("20 small commands start immediately without a process-count ceiling", asyn
         minReservationMB: 64,
         admissionLimitMB: 1536,
         hardLimitMB: 2048,
-        systemHeadroomMB: 1024,
+        systemHeadroomMB: 512,
+        commitHeadroomMB: 4096,
+        yellowPhysicalMemoryMB: 1536,
+        yellowMaxReservationMB: 192,
         maxQueueSize: 256,
     });
     assert.equal(state.activeLeases, 20);
@@ -78,7 +81,7 @@ test("queued owners rotate instead of letting one owner drain first", async () =
     for (const lease of leases) lease.release();
 });
 
-test("an aged request reserves headroom instead of starving behind smaller work", async () => {
+test("an aged request permits bounded backfill before reserving capacity", async () => {
     const admission = new ResourceAdmissionController({
         admissionLimitMB: 256,
         hardLimitMB: 512,
@@ -101,13 +104,15 @@ test("an aged request reserves headroom instead of starving behind smaller work"
     await delay(30);
     secondHolder.release();
     await delay(10);
-    assert.deepEqual(grantOrder, []);
+    assert.deepEqual(grantOrder, ["small"]);
+    const smallLease = await small;
+    smallLease.release();
 
     firstHolder.release();
-    const leases = await Promise.all([aged, small]);
-    assert.deepEqual(grantOrder, ["aged", "small"]);
+    const agedLease = await aged;
+    assert.deepEqual(grantOrder, ["small", "aged"]);
 
-    for (const lease of leases) lease.release();
+    agedLease.release();
 });
 
 test("aborting a queued request removes it and it never starts later", async () => {
@@ -240,6 +245,98 @@ test("system headroom blocks heavy work without starving a small command", async
     const heavyLease = await heavy;
     assert.equal(heavyStarted, true);
     heavyLease.release();
+});
+
+test("a blocked request cannot freeze a fitting request from the same anonymous owner", async () => {
+    const admission = new ResourceAdmissionController({
+        admissionLimitMB: 256,
+        hardLimitMB: 512,
+        systemHeadroomMB: 0,
+        commitHeadroomMB: 0,
+        admissionBudgetMinMs: 500,
+        admissionBudgetMaxMs: 500,
+        agingThresholdMs: 100,
+    });
+    const holder = await admission.acquire({ reservationMB: 192 });
+    const blocked = admission.acquire({ reservationMB: 128 });
+    const fitting = admission.acquire({ reservationMB: 64 });
+
+    const fittingLease = await fitting;
+    assert.equal(fittingLease.reservedMB, 64);
+    assert.equal(admission.getState().queued, 1);
+
+    fittingLease.release();
+    holder.release();
+    const blockedLease = await blocked;
+    blockedLease.release();
+});
+
+test("commit headroom and Windows notifications drive pressure levels", async () => {
+    const admission = new ResourceAdmissionController();
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 1200,
+        commitAvailableMemoryMB: 8000,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "yellow");
+    const small = await admission.acquire({ ownerId: "small", reservationMB: 64 });
+    let heavyStarted = false;
+    const heavy = admission.acquire({
+        ownerId: "heavy",
+        reservationMB: 512,
+        admissionBudgetMs: 200,
+    }).then((lease) => {
+        heavyStarted = true;
+        return lease;
+    });
+    await delay(10);
+    assert.equal(heavyStarted, false);
+    small.release();
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 9000,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "green");
+    const heavyLease = await heavy;
+    heavyLease.release();
+
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 3000,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "red");
+});
+
+test("queued callers receive bounded progress without exposing payloads", async () => {
+    const admission = new ResourceAdmissionController({
+        admissionLimitMB: 128,
+        hardLimitMB: 256,
+        agingThresholdMs: 10,
+        progressIntervalMs: 10,
+    });
+    const holder = await admission.acquire({ ownerId: "holder", reservationMB: 128 });
+    const progress = [];
+    const pending = admission.acquire({
+        ownerId: "waiting",
+        reservationMB: 64,
+        admissionBudgetMs: 100,
+        onWaitProgress: (event) => progress.push(event),
+    });
+    await delay(25);
+    assert.ok(progress.length >= 1);
+    assert.equal(progress[0].queuePosition, 1);
+    assert.equal(progress[0].pressureLevel, "green");
+    holder.release();
+    const lease = await pending;
+    lease.release();
+    const countAfterGrant = progress.length;
+    await delay(20);
+    assert.equal(progress.length, countAfterGrant);
 });
 
 test("state reports aggregate pressure without retaining request payloads", async () => {

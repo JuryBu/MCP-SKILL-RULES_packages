@@ -15,6 +15,11 @@ import {
     type OutputDeliveryMode,
     type OutputDeliveryResult,
 } from "../output-delivery.js";
+import {
+    createWindowsJobLaunch,
+    readWindowsJobMetadata,
+    removeWindowsJobMetadata,
+} from "../windows-job-runner.js";
 
 /**
  * sandbox_codex 工具 — Codex CLI 专用调用（v1.2 后台模式）
@@ -40,7 +45,9 @@ interface CodexTask {
     exitCode: number | null;
     killed: boolean;
     killReason: string | null;
-    peakMemoryMB: number;
+    peakMemoryMB: number | null;
+    memoryMetadataPath: string | null;
+    maxMemoryMB: number;
     stdoutBytes: number;
     stderrBytes: number;
     stdoutLines: number;
@@ -288,7 +295,8 @@ function buildResultText(task: CodexTask): string {
     // 状态行
     const success = task.exitCode === 0 && (!task.outputFile || (reportInfo?.generated ?? false));
     if (success) {
-        parts.push(`✅ Codex 执行成功 | ${elapsed} | 内存峰值 ${Math.round(task.peakMemoryMB)}MB`);
+        const peakMemory = task.peakMemoryMB === null ? "未取得可信样本" : `${Math.round(task.peakMemoryMB)}MB`;
+        parts.push(`✅ Codex 执行成功 | ${elapsed} | 内存峰值 ${peakMemory}`);
     } else if (task.killed) {
         const status = task.killReason === "timeout"
             ? "execution_timeout（命令已启动后运行超时）"
@@ -540,7 +548,7 @@ async function startCodexProcess(params: {
 
     const resourceLease = await acquireResourceLease({
         ownerId: params.ownerId,
-        reservationMB: Number(process.env.SANDBOX_CODEX_RESERVATION_MB || 512),
+        reservationMB: Number(process.env.SANDBOX_CODEX_MEMORY_REQUEST_MB || process.env.SANDBOX_CODEX_RESERVATION_MB || 384),
         signal: params.signal,
         admissionBudgetMs: params.admissionBudgetMs,
         retryAttempt: params.retryAttempt,
@@ -571,17 +579,21 @@ async function startCodexProcess(params: {
         throw new CodexStartCancelledError();
     }
     const startTime = Date.now();
+    const maxMemoryMB = Number(process.env.SANDBOX_CODEX_MAX_MEMORY_MB || 1536);
+    const targetCwd = cwd || process.cwd();
+    const windowsJobLaunch = createWindowsJobLaunch(codexTarget.command, cmdArgs, targetCwd, maxMemoryMB);
 
     let proc: ChildProcess;
     try {
-        proc = spawn(codexTarget.command, cmdArgs, {
-            cwd: cwd || process.cwd(),
+        proc = spawn(windowsJobLaunch?.command ?? codexTarget.command, windowsJobLaunch?.args ?? cmdArgs, {
+            cwd: targetCwd,
             env: { ...process.env },
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
             shell: false,
         });
     } catch (error) {
+        removeWindowsJobMetadata(windowsJobLaunch?.metadataPath ?? null);
         await outputCollector.finalize({ status: "error", error: error instanceof Error ? error.message : String(error) });
         resourceLease.release();
         throw error;
@@ -601,7 +613,9 @@ async function startCodexProcess(params: {
         exitCode: null,
         killed: false,
         killReason: null,
-        peakMemoryMB: 0,
+        peakMemoryMB: null,
+        memoryMetadataPath: windowsJobLaunch?.metadataPath ?? null,
+        maxMemoryMB,
         stdoutBytes: 0,
         stderrBytes: 0,
         stdoutLines: 0,
@@ -647,6 +661,16 @@ async function startCodexProcess(params: {
         task.finalizing = true;
 
         void (async () => {
+            const finalMemory = task.memoryMetadataPath
+                ? readWindowsJobMetadata(task.memoryMetadataPath)
+                : null;
+            if (finalMemory) {
+                task.peakMemoryMB = finalMemory.peakMemoryBytes / 1024 / 1024;
+                if (finalMemory.memoryLimitHit) {
+                    task.killed = true;
+                    task.killReason = "memory";
+                }
+            }
             task.exitCode = proc.exitCode ?? task.exitCode;
             if (task.memoryMonitor) clearInterval(task.memoryMonitor);
             if (task.timeoutTimer) clearTimeout(task.timeoutTimer);
@@ -662,6 +686,7 @@ async function startCodexProcess(params: {
                 task.killed = true;
                 task.killReason = `output_artifact_error: ${error instanceof Error ? error.message : String(error)}`;
             } finally {
+                removeWindowsJobMetadata(task.memoryMetadataPath);
                 task.resourceLease.release();
             }
 
@@ -726,18 +751,24 @@ async function startCodexProcess(params: {
         task.timeoutTimer.unref?.();
     }
 
-    // 内存监控（2秒采样）
+    // Windows Job Object 执行硬限制；这里读取峰值用于实时状态。非 Windows 保留轮询降级。
     task.memoryMonitor = setInterval(async () => {
         if (task.status !== "running" || !task.pid) return;
         try {
-            const stats = await pidusage(task.pid);
-            const memMB = stats.memory / (1024 * 1024);
-            if (memMB > task.peakMemoryMB) {
+            const metadata = task.memoryMetadataPath
+                ? readWindowsJobMetadata(task.memoryMetadataPath)
+                : null;
+            if (task.memoryMetadataPath && !metadata) return;
+            const memMB = metadata
+                ? metadata.peakMemoryBytes / 1024 / 1024
+                : (await pidusage(task.pid)).memory / (1024 * 1024);
+            if (task.peakMemoryMB === null || memMB > task.peakMemoryMB) {
                 task.peakMemoryMB = memMB;
             }
             task.resourceLease.updateObservedMemoryMB(memMB);
+            if (metadata?.memoryLimitHit) task.terminate("memory");
         } catch { /* pidusage 可能在进程退出后失败 */ }
-    }, 2000);
+    }, 100);
     task.memoryMonitor.unref?.();
 
     taskPool.set(taskId, task);
@@ -798,7 +829,7 @@ const CodexParamsShape = {
     waitSeconds: z.number().min(1).max(300).optional()
         .describe("check 前等待秒数（1-300），避免频繁轮询。Codex 任务建议 90-120s"),
     ownerId: z.string().optional()
-        .describe("任务归属 ID；未传按 global 兼容旧调用"),
+        .describe("任务归属 ID；未传时优先使用当前 MCP session 身份"),
 };
 
 export function registerCodex(server: McpServer): void {
@@ -834,13 +865,13 @@ v1.8 新增参数：
 
 提示：指定 outputFile 时会自动在 prompt 末尾附加输出路径指令。${modelsDescription}`,
         CodexParamsShape,
-        async (params: Record<string, unknown>, extra) => {
+        async (params: Record<string, unknown>, extra: { signal?: AbortSignal; sessionId?: string }) => {
             const startTime = Date.now();
             touchActivity();
 
             const action = params.action as string | undefined;
             const taskId = params.taskId as string | undefined;
-            const ownerId = normalizeOwnerId(params.ownerId);
+            const ownerId = normalizeOwnerId(params.ownerId ?? extra.sessionId);
 
             // ── action 模式：管理已有任务 ──
             if (action) {
@@ -897,7 +928,7 @@ v1.8 新增参数：
                         return appendTiming({
                             content: [{
                                 type: "text" as const,
-                                text: `🔄 任务 ${taskId} 运行中 | owner=${task.ownerId} | ${elapsed} | PID ${task.pid}\n📊 stdout ${task.stdoutBytes} bytes/${task.stdoutLines} 行 | stderr ${task.stderrBytes} bytes/${task.stderrLines} 行 | 内存峰值 ${Math.round(task.peakMemoryMB)}MB${outputInfo}\n💡 建议 30-60s 后再次 check（stderr 静止不代表卡住，Codex 可能在思考）`,
+                                text: `🔄 任务 ${taskId} 运行中 | owner=${task.ownerId} | ${elapsed} | PID ${task.pid}\n📊 stdout ${task.stdoutBytes} bytes/${task.stdoutLines} 行 | stderr ${task.stderrBytes} bytes/${task.stderrLines} 行 | 内存峰值 ${task.peakMemoryMB === null ? "未取得可信样本" : `${Math.round(task.peakMemoryMB)}MB`}${outputInfo}\n💡 建议 30-60s 后再次 check（stderr 静止不代表卡住，Codex 可能在思考）`,
                             }],
                         }, startTime);
                     } else {
@@ -979,7 +1010,7 @@ v1.8 新增参数：
             const commit = params.commit as string | undefined;
             const title = params.title as string | undefined;
 
-            if (extra.signal.aborted) {
+            if (extra.signal?.aborted) {
                 return appendTiming({
                     content: [{ type: "text" as const, text: "⏹️ Codex 调用已取消，任务未启动" }],
                 }, startTime);

@@ -134,7 +134,7 @@ function testConcurrentSessionAdmission() {
 
     const memoryLimited = probeConcurrentSessionAdmission({
         maxSessions: 8,
-        maxTotalMemoryMB: 1024,
+        maxTotalMemoryMB: 256,
         maxMemoryMB: 256,
         requestCount: 6,
     });
@@ -142,7 +142,7 @@ function testConcurrentSessionAdmission() {
     assert.equal(memoryLimited.active, 4);
     assert.equal(memoryLimited.errors.length, 2);
     for (const error of memoryLimited.errors) {
-        assert.match(error, /总内存额度将超限/u);
+        assert.match(error, /总内存请求量将超限/u);
     }
     console.log("PASS concurrent session admission: count=5/6, memory=4/6");
 }
@@ -257,17 +257,19 @@ async function testSessionLifecycle(McpServer) {
     registerSession(server);
     const tool = server._registeredTools.sandbox_session;
     assert.ok(tool);
-    assert.equal(tool.inputSchema.safeParse({ action: "exec", timeout: 120000, maxMemoryMB: 2048 }).success, true);
+    assert.equal(tool.inputSchema.safeParse({ action: "exec", timeout: 120000, maxMemoryMB: 1536 }).success, true);
+    assert.equal(tool.inputSchema.safeParse({ action: "exec", maxMemoryMB: 2048 }).success, false);
 
     const ownerId = "session-lifecycle-test";
     const started = await tool.handler({ action: "start", language: "node", ownerId }, extra());
     const startedText = resultText(started);
     const sessionId = parseSessionId(startedText);
-    assert.match(startedText, /内存上限: 320MB/u);
+    assert.match(startedText, /调度请求: 80MB/u);
+    assert.match(startedText, /内存硬上限: 320MB/u);
 
-    const overTotal = await sessionManager.createSession("node", process.cwd(), 800, undefined, ownerId);
+    const overTotal = await sessionManager.createSession("node", process.cwd(), 1024, undefined, ownerId, undefined, 1024);
     assert.ok("error" in overTotal);
-    assert.match(overTotal.error, /总内存额度将超限/u);
+    assert.match(overTotal.error, /总内存请求量将超限/u);
     const secondSession = await sessionManager.createSession("node", process.cwd(), undefined, undefined, ownerId);
     const thirdSession = await sessionManager.createSession("node", process.cwd(), undefined, undefined, ownerId);
     assert.ok("session" in secondSession);

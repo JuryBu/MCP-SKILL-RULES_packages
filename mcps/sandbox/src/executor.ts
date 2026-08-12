@@ -5,6 +5,12 @@ import { resolveInterpreter, getCachedEnvInfo } from "./env-detector.js";
 import { formatElapsed } from "./lifecycle.js";
 import { acquireResourceLease } from "./resource-admission-runtime.js";
 import {
+    createWindowsJobLaunch,
+    readWindowsJobMetadata,
+    removeWindowsJobMetadata,
+} from "./windows-job-runner.js";
+import type { ResourceWaitProgress } from "./resource-admission.js";
+import {
     createOutputDeliveryCollector,
     countTextCharacters,
     sliceTextCharacters,
@@ -36,6 +42,7 @@ export interface ExecOptions {
     env?: string;
     timeout?: number;
     maxMemoryMB?: number;
+    memoryRequestMB?: number;
     maxOutput?: number;
     responseByteLimit?: number;
     outputMode?: OutputMode;
@@ -48,6 +55,7 @@ export interface ExecOptions {
     admissionBudgetMs?: number;
     retryAttempt?: number;
     reservationMB?: number;
+    onQueueProgress?: (progress: ResourceWaitProgress) => void;
     deliveryMode?: OutputDeliveryMode;
     artifactTtlMs?: number;
 }
@@ -59,7 +67,7 @@ export interface ExecResult {
     elapsed: string;
     killed: boolean;
     killReason: KillReason | null;
-    peakMemoryMB: number;
+    peakMemoryMB: number | null;
     truncated: boolean;
     originalBytes: number;
     returnedBytes: number;
@@ -104,7 +112,7 @@ export function makeParamErrorResult(stderr: string): ExecResult {
         elapsed: "0ms",
         killed: false,
         killReason: null,
-        peakMemoryMB: 0,
+        peakMemoryMB: null,
         truncated: false,
         originalBytes: 0,
         returnedBytes: 0,
@@ -135,12 +143,12 @@ const DEFAULTS = {
     timeout: 30000,       // 30秒
     maxTimeout: Number(process.env.SANDBOX_EXEC_MAX_TIMEOUT_MS || 6 * 60 * 60 * 1000),
     maxMemoryMB: 256,
-    maxMemoryLimit: 1024,
+    maxMemoryLimit: 1536,
     maxOutput: 1024 * 1024,
     outputMode: "full" as OutputMode,
     tailLines: 20,
     maxVRAM_MB: 2048,
-    memoryCheckInterval: 2000,  // 2秒采样
+    memoryCheckInterval: 100,
 };
 
 /**
@@ -513,6 +521,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         env: envParam,
         timeout = DEFAULTS.timeout,
         maxMemoryMB = DEFAULTS.maxMemoryMB,
+        memoryRequestMB,
         maxOutput = DEFAULTS.maxOutput,
         responseByteLimit,
         outputMode = DEFAULTS.outputMode,
@@ -524,6 +533,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         admissionBudgetMs,
         retryAttempt,
         reservationMB,
+        onQueueProgress,
         deliveryMode = "auto",
         artifactTtlMs,
     } = options;
@@ -536,12 +546,23 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
     const normalizedCommand = normalizedInput.command;
 
     const effectiveTimeout = timeout === 0 ? 0 : Math.min(timeout, DEFAULTS.maxTimeout);
-    const effectiveMemory = Math.min(maxMemoryMB, DEFAULTS.maxMemoryLimit);
+    if (!Number.isFinite(maxMemoryMB) || maxMemoryMB < 16 || maxMemoryMB > DEFAULTS.maxMemoryLimit) {
+        return makeParamErrorResult(`错误：maxMemoryMB 必须在 16～${DEFAULTS.maxMemoryLimit} 之间`);
+    }
+    if (memoryRequestMB !== undefined
+        && (!Number.isFinite(memoryRequestMB) || memoryRequestMB < 16 || memoryRequestMB > maxMemoryMB)) {
+        return makeParamErrorResult("错误：memoryRequestMB 必须在 16 与 maxMemoryMB 之间");
+    }
+    const effectiveMemory = maxMemoryMB;
+    const inferredMemoryRequestMB = Math.min(
+        effectiveMemory,
+        Math.max(64, Math.ceil(effectiveMemory / 4)),
+    );
 
     let scriptPath: string | null = null;
     let killed = false;
     let killReason: KillReason | null = null;
-    let peakMemoryMB = 0;
+    let peakMemoryMB: number | null = null;
 
     // 确定执行方式
     let execCmd: string;
@@ -617,10 +638,11 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
 
     const lease = await acquireResourceLease({
         ownerId,
-        reservationMB: reservationMB ?? (options.maxMemoryMB === undefined ? undefined : effectiveMemory),
+        reservationMB: memoryRequestMB ?? reservationMB ?? inferredMemoryRequestMB,
         admissionBudgetMs,
         retryAttempt,
         signal,
+        onWaitProgress: onQueueProgress,
     });
     const cancelBeforeSpawn = (): ExecResult => {
         lease.release();
@@ -667,15 +689,21 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             spawnEnv.CUDA_VISIBLE_DEVICES = "0";
         }
 
+        const targetCwd = effectiveCwd || process.cwd();
+        const windowsJobLaunch = createWindowsJobLaunch(execCmd, execArgs, targetCwd, effectiveMemory);
         let proc: ChildProcess;
         try {
-            proc = spawn(execCmd, execArgs, {
-                cwd: effectiveCwd || process.cwd(),
+            proc = spawn(
+                windowsJobLaunch?.command ?? execCmd,
+                windowsJobLaunch?.args ?? execArgs,
+                {
+                cwd: targetCwd,
                 env: spawnEnv,
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
             });
         } catch (error) {
+            removeWindowsJobMetadata(windowsJobLaunch?.metadataPath ?? null);
             const errorMessage = error instanceof Error ? error.message : String(error);
             void collector.finalize({ status: "error", error: `spawn_failed: ${errorMessage}` }).catch(() => undefined).then(() => {
                 lease.release();
@@ -692,13 +720,29 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
 
         let resolved = false;
         let finalizing = false;
+        let memoryMonitor: NodeJS.Timeout | null = null;
+
+        const applyWindowsJobMetadata = (): boolean => {
+            if (!windowsJobLaunch) return false;
+            const metadata = readWindowsJobMetadata(windowsJobLaunch.metadataPath);
+            if (!metadata) return false;
+            const memoryMB = metadata.peakMemoryBytes / 1024 / 1024;
+            peakMemoryMB = peakMemoryMB === null ? memoryMB : Math.max(peakMemoryMB, memoryMB);
+            lease.updateObservedMemoryMB(memoryMB);
+            if (metadata.memoryLimitHit) {
+                killed = true;
+                killReason = "memory";
+            }
+            return true;
+        };
 
         const finalize = async () => {
             if (resolved || finalizing) return;
             finalizing = true;
 
             if (timeoutTimer) clearTimeout(timeoutTimer);
-            clearInterval(memoryMonitor);
+            if (memoryMonitor) clearInterval(memoryMonitor);
+            applyWindowsJobMetadata();
             signal?.removeEventListener("abort", onAbort);
 
             // 清理临时脚本文件
@@ -712,8 +756,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             try {
                 delivery = await collector.finalize({
                     mode: deliveryMode,
-                    status: killed ? "interrupted" : proc.exitCode === 0 ? "done" : "error",
-                    error: killed ? killReason || undefined : proc.exitCode === 0 ? undefined : `exitCode=${proc.exitCode}`,
+                status: killed ? "interrupted" : proc.exitCode === 0 ? "done" : "error",
+                error: killed ? killReason || undefined : proc.exitCode === 0 ? undefined : `exitCode=${proc.exitCode}`,
                 });
             } catch (error) {
                 lease.release();
@@ -759,7 +803,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 elapsed,
                 killed,
                 killReason,
-                peakMemoryMB: Math.round(peakMemoryMB),
+                peakMemoryMB: peakMemoryMB === null ? null : Math.round(peakMemoryMB),
                 truncated: delivery.mode !== "inline" || displayTruncated,
                 originalBytes: delivery.stats.combined.rawBytes,
                 returnedBytes: Buffer.byteLength(stdoutText + stderrText, "utf-8"),
@@ -774,6 +818,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 outputReadHint: delivery.readHint ?? null,
             };
 
+            removeWindowsJobMetadata(windowsJobLaunch?.metadataPath ?? null);
             resolve(result);
         };
 
@@ -812,13 +857,18 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             }, effectiveTimeout);
         }
 
-        // 内存监控（2秒采样）
-        const memoryMonitor = setInterval(async () => {
+        // Windows Job Object 从进程恢复前即执行硬限制；轮询只负责实时状态。
+        // 非 Windows 或辅助程序缺失时保留快速采样降级，未知峰值返回 null 而不是伪造 0MB。
+        const sampleMemory = async () => {
             if (resolved || !proc.pid) return;
 
             try {
+                if (windowsJobLaunch) {
+                    applyWindowsJobMetadata();
+                    return;
+                }
                 const memMB = await getProcessTreeMemoryMB(proc.pid);
-                if (memMB > peakMemoryMB) {
+                if (peakMemoryMB === null || memMB > peakMemoryMB) {
                     peakMemoryMB = memMB;
                 }
                 lease.updateObservedMemoryMB(memMB);
@@ -833,6 +883,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             } catch {
                 // pidusage 可能在进程退出后失败，忽略
             }
-        }, DEFAULTS.memoryCheckInterval);
+        };
+        void sampleMemory();
+        memoryMonitor = setInterval(() => void sampleMemory(), DEFAULTS.memoryCheckInterval);
     });
 }

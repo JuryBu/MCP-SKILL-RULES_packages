@@ -76,6 +76,35 @@ test("small process output preserves Unicode, emoji, and CRLF inline without an 
     assert.equal(result.tempFile, null);
 });
 
+test("Windows Job Object reports a real peak for a sub-two-second command", async () => {
+    if (process.platform !== "win32") return;
+    const result = await execute({
+        ...nodeCode(`setTimeout(() => process.stdout.write("short-memory-ok"), 200);`),
+        memoryRequestMB: 64,
+        maxMemoryMB: 256,
+    });
+
+    assert.equal(result.exitCode, 0);
+    assert.equal(result.killed, false);
+    assert.equal(typeof result.peakMemoryMB, "number");
+    assert.ok(result.peakMemoryMB > 0, `expected a measured peak, received ${result.peakMemoryMB}`);
+});
+
+test("Windows Job Object enforces the hard limit before a short command escapes sampling", async () => {
+    if (process.platform !== "win32") return;
+    const result = await execute({
+        ...nodeCode(`setTimeout(() => process.stdout.write("should-not-complete"), 200);`),
+        memoryRequestMB: 16,
+        maxMemoryMB: 16,
+    });
+
+    assert.equal(result.exitCode, 137);
+    assert.equal(result.killed, true);
+    assert.equal(result.killReason, "memory");
+    assert.equal(typeof result.peakMemoryMB, "number");
+    assert.ok(result.peakMemoryMB >= 16, `expected a limit-sized peak, received ${result.peakMemoryMB}`);
+});
+
 test("sandbox_exec omits artifact metadata for a small inline result", async () => {
     const handler = createExecHandler();
     const response = await handler(nodeCode(`process.stdout.write("direct-output");`), {});

@@ -20,6 +20,7 @@ const TaskItemSchema = z.object({
     env: z.string().optional(),
     timeout: z.number().min(0).optional(),
     maxMemoryMB: z.number().min(16).max(1536).optional(),
+    memoryRequestMB: z.number().min(16).max(1536).optional(),
     maxOutput: z.number().min(100).optional(),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional(),
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional(),
@@ -35,11 +36,11 @@ const BatchParamsSchema = z.object({
     maxParallel: z.number().min(1).max(20).optional()
         .describe("最大并行数，默认3"),
     maxTotalMemoryMB: z.number().min(64).max(1536).optional()
-        .describe("全部任务总内存上限(MB)，默认768"),
+        .describe("batch 内同时运行任务的调度请求量上限(MB)，默认768；每项 maxMemoryMB 仍是独立进程树硬上限"),
     ownerId: z.string().min(1).max(200).optional()
         .describe("稳定调用方标识，用于全局公平调度"),
-    admissionBudgetMs: z.number().min(0).optional()
-        .describe("资源不足时单个任务最多等待多久"),
+    admissionBudgetMs: z.number().min(0).max(10000).optional()
+        .describe("资源不足时单个任务最多等待多久，服务端最多10秒"),
     retryAttempt: z.number().int().min(0).max(4).optional(),
 });
 
@@ -62,7 +63,7 @@ interface BatchTaskResult {
     elapsed: string;
     killed: boolean;
     killReason: string | null;
-    peakMemoryMB: number;
+    peakMemoryMB: number | null;
     truncated: boolean;
     tempFile: string | null;
     queueWaitMs: number;
@@ -81,7 +82,7 @@ export function registerBatch(server: McpServer): void {
 每个任务独立计时、独立超时、独立内存限制，结果互不影响。
 最多 20 个任务，默认并行（maxParallel=3）；全局内存调度仍会限制真正同时启动的任务。`,
         BatchParamsSchema.shape,
-        async (params, extra?: { signal?: AbortSignal }) => {
+        async (params, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -108,17 +109,28 @@ export function registerBatch(server: McpServer): void {
                     100,
                     Math.floor((HARD_RESPONSE_BYTE_LIMIT - DEFAULT_METADATA_RESERVE_BYTES - 64 * 1024) / tasks.length),
                 );
-                const effectiveTasks: EffectiveBatchTask[] = tasks.map(t => ({
-                    ...t,
-                    maxOutput: Math.min(t.maxOutput ?? perTaskInlineBudget, perTaskInlineBudget),
-                    responseByteLimit: perTaskInlineBudget,
-                    maxMemoryMB: t.maxMemoryMB ? Math.min(t.maxMemoryMB, maxTotalMemoryMB) : Math.min(Math.max(perTaskMemDefault, 64), 256),
-                    reservationMB: t.maxMemoryMB ? Math.min(t.maxMemoryMB, maxTotalMemoryMB) : 64,
-                    ownerId: parsed.data.ownerId,
-                    admissionBudgetMs: parsed.data.admissionBudgetMs,
-                    retryAttempt: parsed.data.retryAttempt,
-                    signal: extra?.signal,
-                }));
+                const effectiveTasks: EffectiveBatchTask[] = tasks.map(t => {
+                    const maxMemoryMB = t.maxMemoryMB
+                        ? Math.min(t.maxMemoryMB, 1536)
+                        : Math.min(Math.max(perTaskMemDefault, 64), 256);
+                    const memoryRequestMB = t.memoryRequestMB
+                        ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
+                    if (memoryRequestMB > maxMemoryMB) {
+                        throw new Error("memoryRequestMB 不能大于同一任务的 maxMemoryMB");
+                    }
+                    return {
+                        ...t,
+                        maxOutput: Math.min(t.maxOutput ?? perTaskInlineBudget, perTaskInlineBudget),
+                        responseByteLimit: perTaskInlineBudget,
+                        maxMemoryMB,
+                        memoryRequestMB,
+                        reservationMB: memoryRequestMB,
+                        ownerId: parsed.data.ownerId ?? extra?.sessionId,
+                        admissionBudgetMs: parsed.data.admissionBudgetMs,
+                        retryAttempt: parsed.data.retryAttempt,
+                        signal: extra?.signal,
+                    };
+                });
 
                 if (parallel) {
                     // 并行执行（受 maxParallel 限制）
@@ -142,7 +154,8 @@ export function registerBatch(server: McpServer): void {
                     const status = r.errorType === "execution_timeout"
                         ? "execution_timeout（命令已启动后运行超时）"
                         : r.killed ? `被杀(${r.killReason})` : r.exitCode === 0 ? "成功" : `失败(exit ${r.exitCode})`;
-                    parts.push(`--- 任务 #${r.index} ${icon} ${status} | 执行 ${r.elapsed} | 排队 ${r.queueWaitMs}ms | ${r.peakMemoryMB}MB ---`);
+                    const peakMemory = r.peakMemoryMB === null ? "未取得可信内存样本" : `${r.peakMemoryMB}MB`;
+                    parts.push(`--- 任务 #${r.index} ${icon} ${status} | 执行 ${r.elapsed} | 排队 ${r.queueWaitMs}ms | ${peakMemory} ---`);
                     if (r.errorType) parts.push(`调度错误: ${r.errorType}${r.retryAfterMs ? ` | 建议 ${r.retryAfterMs}ms 后重试` : ""}`);
                     if (r.stdout) parts.push(r.stdout);
                     if (r.stderr) parts.push(`⚠️ ${r.stderr}`);
@@ -225,7 +238,7 @@ async function executeParallel(
                         elapsed: "0ms",
                         killed: false,
                         killReason: null,
-                        peakMemoryMB: 0,
+                        peakMemoryMB: null,
                         truncated: false,
                         tempFile: null,
                         queueWaitMs: 0,
@@ -275,7 +288,7 @@ async function executeTask(
             elapsed: "0ms",
             killed: false,
             killReason: null,
-            peakMemoryMB: 0,
+            peakMemoryMB: null,
             truncated: false,
             tempFile: null,
             queueWaitMs: 0,
@@ -292,6 +305,7 @@ async function executeTask(
             env: task.env,
             timeout: task.timeout,
             maxMemoryMB: task.maxMemoryMB,
+            memoryRequestMB: task.memoryRequestMB,
             maxOutput: task.maxOutput,
             responseByteLimit: task.responseByteLimit,
             outputMode: task.outputMode,
@@ -315,7 +329,7 @@ async function executeTask(
             elapsed: "0ms",
             killed: false,
             killReason: null,
-            peakMemoryMB: 0,
+            peakMemoryMB: null,
             truncated: false,
             tempFile: null,
             queueWaitMs: admissionError.queueWaitMs,

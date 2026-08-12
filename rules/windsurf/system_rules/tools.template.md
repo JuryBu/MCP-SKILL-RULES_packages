@@ -15,7 +15,8 @@
 
 ## MCP sandbox
 
-- Sandbox 自身预留额度和系统可用内存都足够时立即并行；只有接近任一内存底线时才等待。`admission_timeout` 表示命令尚未启动，按返回的 `queueWaitMs`、`memoryPressure` 和随机 `retryAfterMs` 退避后再重试，不要立即并发重发
+- Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树硬上限；短命令可在 Windows 提交余量安全时继续并行，队首大任务放不下也不会堵住后续小任务。`admission_timeout` 表示命令尚未启动，按随机 `retryAfterMs` 最多重试一次；再次失败就拆小、降低请求量、改后台或明确反馈排队超时，不能把同一重命令绕到原生命令
+- 排队超过约 1 秒后 Sandbox 会尝试定期发送等待位置和内存压力，但 Windsurf 界面未必展示 MCP progress；以最终结构化结果为准，不因没有中途提示就并发重发
 - `execution_timeout` 表示命令已经启动后运行超时；`caller_deadline_exceeded` 表示排队与执行合计超过调用方总期限；`broker_backend_timeout` 表示 broker 与 Sandbox backend 通信超时。这三类可能已经开始执行，重试前先检查状态和副作用
 - 大输出在安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；读取 artifact 才是完整结果。`maxOutput` 按正文字符计算，元数据预留另计；`maxLines` 超预算仍保留全文 artifact，批量任务共享单次响应总预算
 - 这些是 Sandbox 内部状态，不覆盖 Windsurf 自己的外层 MCP 期限。耗时任务使用对应工具的后台模式或 sandbox_launch，状态查询沿用本模板的 30～45 秒短轮询

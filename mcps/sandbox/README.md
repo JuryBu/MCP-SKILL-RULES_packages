@@ -1,4 +1,4 @@
-# MCP Sandbox v1.16.4
+# MCP Sandbox v1.17.0
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -32,9 +32,11 @@
 
 ## 全局资源接纳与超时分类
 
-Sandbox backend 在同一进程内统一管理会创建本机子进程的工具。内存足够时任务立即并行，不设置普通任务数量硬上限；接近全局内存预算时才暂停启动新任务，已经运行的任务继续执行。默认最低记账 64MB、正常接纳线 1536MB、硬线 2048MB、系统可用内存保留底线 1024MB、等待队列最多 256 项；系统底线会把尚未实际消耗的预留额度一并计算，避免其它应用已占满内存时继续接入大命令。`sandbox_batch` 的每个真实子任务分别记账，不能用单次 batch 绕过总内存预算；所有值均可通过 `templates/env.example.ps1` 中的 `SANDBOX_ADMISSION_*` 环境变量覆盖。
+Sandbox backend 在同一进程内统一管理会创建本机子进程的工具。`memoryRequestMB` 表示任务预计需要多少调度额度，`maxMemoryMB` 表示整棵进程树绝不能越过的硬上限；未显式给请求量时，默认按硬上限的四分之一估算且不少于 64MB。这样二十个约 60MB 的短命令可以直接并行，而声明 1GB 硬上限的构建不会在尚未使用内存前先独占 1GB 调度额度。`sandbox_batch` 的每个真实子任务分别记账，不能用单次 batch 绕过总内存预算。
 
-等待队列按提交顺序并结合 `ownerId` 轮转，避免单个调用方长期占满资源。接纳等待默认最多约 10 秒；仍无资源时命令不会启动，并返回随机 `retryAfterMs`，供调用方错开下一次重试。四类超时含义不同：
+Windows 运行时同时读取物理可用内存、系统提交余量（物理内存加页面文件可承诺的总空间）和高低内存通知。默认保留 512MB 物理内存与 4096MB 提交余量；物理内存低于 1536MB 时进入黄区，只继续接纳请求量不超过 192MB 的小任务，进入 Windows 低内存状态或跌破任一红线时暂停新任务。正常接纳线仍为 1536MB、硬线为 2048MB、等待队列最多 256 项，所有值都可通过根目录 `templates/env.example.ps1` 中的 `SANDBOX_ADMISSION_*` 环境变量覆盖。
+
+等待队列按调用方轮转，但不会再让一个暂时放不下的大任务堵住后面的所有小任务；老请求等待后会逐步保留最多 256MB 额度，避免反过来被持续小任务饿死。接纳等待最多 10 秒，超过 1 秒后每约 2 秒尝试发送一次排队位置和内存压力进度；当前宿主不展示 MCP progress 时，最终结构化结果仍会准确给出等待时长。仍无资源时命令不会启动，并返回随机 `retryAfterMs`，供调用方错开下一次重试。四类超时含义不同：
 
 | 错误类型 | 是否已启动 | 处理方式 |
 |---|---|---|
@@ -130,10 +132,10 @@ smart_search(taskId="...", waitSeconds=30)
 
 ## 生命周期与 owner 边界
 
-- `sandbox_session`、`sandbox_codex`、`sandbox_launch`、`smart_search(background=true)`、`sandbox_council(background=true)` 都支持 `ownerId`；未传时按 `global` 兼容旧调用。后台任务启动时传了 `ownerId`，后续 `taskId` 查询也必须带同一个 `ownerId`。
+- `sandbox_session`、`sandbox_codex`、`sandbox_launch`、`smart_search(background=true)`、`sandbox_council(background=true)` 都支持 `ownerId`；SDK 提供 MCP session 身份时会优先用作默认 owner，拿不到时兼容回退到 `global`。即使多个匿名请求同属 `global`，不可接纳的大请求也不能冻结后续放得下的小请求；需要跨对话严格公平和持久任务隔离时仍应显式传稳定 `ownerId`。后台任务启动时传了 `ownerId`，后续 `taskId` 查询也必须带同一个 `ownerId`。
 - `sandbox_session` 同一 REPL 会话的并发 exec 会串行排队，避免 stdout/stderr buffer 混写。
 - Windows 上的 `sandbox_codex` 会优先选择修改时间最新的 Codex Desktop bundled 可执行文件，避免被过旧的全局 npm CLI 阻塞；显式 `SANDBOX_CODEX_COMMAND` 仍拥有最高优先级。
-- `sandbox_launch` 用短生命周期 bootstrap 启动 detached worker，并通过 PID handshake 与原子 done marker 持久化真实工作进程；因此只重拉 Sandbox backend 时，长期任务与日志仍可恢复。
+- `sandbox_launch` 用短生命周期 bootstrap 启动 detached worker，并由 Windows Job Runner 在真实受控命令启动后回写 PID handshake；原子 done marker 持久化退出状态、内存峰值和是否触发硬上限，因此只重拉 Sandbox backend 时，长期任务与日志仍可恢复。
 - `sandbox_launch` 注册表会记录 `createdAtMs`、`commandHash`、`ownerId`、`exitMarkerPath`，状态优先读取 done marker；kill 前校验 PID 创建时间和命令特征，避免 PID 复用误杀。PID 刚消失而 marker 尚未落盘时会短暂等待，身份冲突仍立即失败。
 - `sandbox_launch` 是显式长期任务，不会因为后台超时自动杀；需要用 `status/list/kill/clean` 管理。
 
@@ -256,6 +258,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 - v1.16.0：实现 Issue #13/#14。Sandbox backend 按64/1536/2048MB默认额度统一接纳本机任务，同时保留默认1024MB系统可用内存底线；压力时按owner公平等待并返回结构化退避，Session默认5个且可配置。exec、batch、Session与Codex改为流式保存完整stdout/stderr，小输出在100K估算token、2000行与1MiB响应线内直接返回，超预算返回6小时artifact、SHA256和头尾预览；移除200行、50000字符与Codex 30分钟schema硬上限。长期 launch 改用 detached bootstrap/worker 与原子 marker，Windows Codex 调用自动选择最新 bundled CLI，并新增只重拉Sandbox endpoint的安全脚本。
 - v1.16.1：修复 1.16.0 把所有小输出也持久化并展示为 artifact 的回归。普通 inline 结果完成后立即删除执行期 spool，exec、batch、Session 与 Codex 不再追加 artifact 元数据；超预算、显式文件模式和中断恢复仍保留完整 artifact。`sandbox_status overview/gc` 增加 artifact 数量、payload、保留与无效统计，便于接收方检查和清理。
 - v1.16.4：包含 v1.16.3 的输出预算、模型可见性、batch 总响应与孤儿 artifact 清理修复，并消除目录创建到 manifest 初始化之间的统计/GC 竞态；运行中 artifact 统一显示为未完成并受保护，不再短暂误报无效。
+- v1.17.0：调度请求与进程树硬上限分离，Windows 使用 Job Object 对短命令和多层子进程实施内核级内存限制并返回可信峰值；接纳器同时参考物理内存、系统提交余量与 Windows 压力通知，在黄区继续放行小任务，跳过暂时不可接纳的队首大任务并为老请求渐进保留额度。接纳等待封顶 10 秒并定期上报进度；SDK 提供 MCP session 身份时会用作默认 owner，匿名同 owner 仍允许小任务绕过暂时放不下的大请求。新增 `npm run test:short-burst`，实测 20 路匿名短 PowerShell 可直接并行且均有真实峰值。
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例
 - v1.12.2 补充 `sandbox_council` 后台查询防呆：启动返回会直接给出带 `ownerId` 的查询示例；README、Resource guide 和 schema 明确查询必须复用同一个 `ownerId`，避免误判任务丢失后重复启动

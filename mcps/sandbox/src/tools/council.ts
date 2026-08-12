@@ -74,7 +74,7 @@ const CouncilParamsShape = {
     resume: z.boolean().optional().describe("恢复模式：true 时从 resumeTaskId 指向的旧后台任务继续，创建新的后台 taskId"),
     resumeTaskId: z.string().optional().describe("要恢复的旧 sandbox_council 后台任务 ID；会读取旧 spec/checkpoint/transcript，不需要重新传 participants/moderator/input"),
     waitSeconds: z.number().min(1).max(300).optional().describe("查询后台任务前等待秒数"),
-    ownerId: z.string().optional().describe("ownerId 任务归属 ID；后台启动和 taskId 查询必须保持一致；未传按 global 兼容旧调用"),
+    ownerId: z.string().optional().describe("ownerId 任务归属 ID；后台启动和 taskId 查询必须保持一致；未传时优先使用当前 MCP session 身份"),
 };
 const CouncilParamsSchema = z.object(CouncilParamsShape).strict();
 
@@ -173,11 +173,11 @@ function toResumeRunParams(args: Record<string, unknown>, ownerId: string): { ru
 }
 
 export function registerCouncil(server: McpServer): void {
-    const handleCouncil = async (input: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
+    const handleCouncil = async (input: Record<string, unknown>, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const args = input;
             const startTime = Date.now();
             touchActivity();
-            const ownerId = normalizeOwnerId(args.ownerId);
+            const ownerId = normalizeOwnerId(args.ownerId ?? extra?.sessionId);
 
             if (args.taskId) {
                 const task = await waitForPersistentCouncilTask(args.taskId as string, args.waitSeconds as number || 0, ownerId);

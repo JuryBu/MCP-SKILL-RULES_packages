@@ -182,7 +182,7 @@ Exa MCP 通过 broker 暴露为 `http://127.0.0.1:14588/exa/mcp`，常用工具�
 
 本机执行代码搜索、文件与文本处理、Python/Node、测试、批量命令和长任务时，只要 Sandbox 能完成，默认使用 Sandbox。Sandbox 提供统一的并发接纳、内存限制、排队、超时和输出管理，多个对话同时工作时尤其应避免绕过它大量启动原生命令；代码搜索默认使用 Sandbox 的 `smart_search`，隔离执行和批量任务默认使用 `sandbox_exec` / `sandbox_batch`。任务简单、只读、命令更短或 `shell_command` 直接可用，都不构成跳过 Sandbox 的理由。
 
-若 Sandbox 不可用、持续异常，或任务确实依赖交互式终端、当前 Shell 环境变量、危险操作审批等 Sandbox 不适合的能力，可以降级使用原生命令；降级前先确认原因，并控制并发与资源占用，不能机械重复失败调用。
+若 Sandbox 的 transport/backend 明确不可达或任务确实依赖交互式终端、当前 Shell 环境变量、危险操作审批等 Sandbox 不适合的能力，可以降级使用原生命令；降级前先确认原因，并控制并发与资源占用，不能机械重复失败调用。`admission_timeout` 说明调度器仍正常且命令尚未启动，不能当成 Sandbox 不可用后把同一重命令原样交给系统执行；按 `retryAfterMs` 重试一次仍失败时，应降低 `memoryRequestMB`、拆小任务、改后台或把明确的排队超时反馈给用户。
 
 ### MCP broker
 
@@ -217,12 +217,12 @@ Codex 侧 MCP 通过 HTTP broker（`127.0.0.1:14588`）暴露。broker 后端进
 
 Sandbox backend 会把资源等待、命令运行和外层调用期限分开报告，不能把所有失败都理解成「命令跑超时」：
 
-- `admission_timeout`：命令尚未启动，因全局内存压力等待接纳超时；参考返回的 `queueWaitMs`、`memoryPressure` 与随机 `retryAfterMs`，到点后再重试，不要立即并发重发
+- `admission_timeout`：命令尚未启动，因全局内存压力等待接纳超时；参考返回的 `queueWaitMs`、`memoryPressure` 与随机 `retryAfterMs`，到点后最多重试一次，不要立即并发重发或绕过 Sandbox
 - `execution_timeout`：命令已经启动，但超过该命令自己的运行时限；进程可能已经产生部分副作用，确认状态后再决定是否重试
 - `caller_deadline_exceeded`：排队与执行合计超过调用方总期限；结合 `mayHaveStarted` 判断命令是否可能已经开始
 - `broker_backend_timeout`：broker 与 Sandbox backend 的连接或响应超时；是否已经执行可能未知，应先查询持久任务或外部状态
 
-Sandbox 在自身预留额度和系统可用内存都充足时立即并行，只有接近任一内存底线时才等待；`admission_timeout` 表示等待结束前始终没有启动。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。`maxOutput` 是正文字符预算，不能把响应元数据预留从中提前扣掉；`maxLines` 超预算时也必须保留完整 artifact，批量任务共享单次响应总预算。
+Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树的硬上限；请求量较小的短命令可在物理内存偏低但 Windows 提交余量安全时继续并行，重任务则会暂停。队首大任务暂时放不下时，后续可接纳的小任务仍可前进，老请求会逐步获得保留额度。等待超过约 1 秒后 Sandbox 会尝试定期发送排队进度，但宿主界面可能不展示；最终结果中的结构化等待状态始终是准确信息。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。`maxOutput` 是正文字符预算，不能把响应元数据预留从中提前扣掉；`maxLines` 超预算时也必须保留完整 artifact，批量任务共享单次响应总预算。
 
 以上是 Sandbox 内部状态，不替代 Codex 宿主自己的 MCP 外层期限与短轮询策略：
 

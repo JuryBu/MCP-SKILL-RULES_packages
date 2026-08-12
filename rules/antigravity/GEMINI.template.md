@@ -222,7 +222,8 @@ Codex 与你共享 memory-store MCP 和 web-fetcher MCP，能查询项目记忆�
 它是 run_command 的安全增强替代，解决了 PowerShell 卡死、输出丢失、编码错误等系统性问题。
 - 所有代码执行和系统命令都应优先使用 sandbox，不要使用 run_command
   sandbox_exec 提供硬超时自动杀进程、内存限制、输出截断、编码安全等保护
-- Sandbox 自身预留额度和系统可用内存都足够时会立即并行；只有接近任一内存底线时才等待。若返回 `admission_timeout`，命令尚未启动，应参考 `queueWaitMs`、`memoryPressure` 和随机 `retryAfterMs` 后再重试，不要立刻并发重发
+- Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树的硬上限；短命令可在 Windows 提交余量安全时继续并行，队首大任务放不下也不会堵住后续小任务。若返回 `admission_timeout`，命令尚未启动，应按随机 `retryAfterMs` 最多重试一次；再次失败就拆小任务、降低请求量、改后台或明确反馈排队超时，不能把同一重命令绕到 `run_command`
+- 排队超过约 1 秒后 Sandbox 会尝试定期发送等待位置和内存压力，但 Antigravity 界面未必显示 MCP progress；以最终结构化结果为准，不因没有中途提示就并发重发
 - Sandbox 的四类超时不能混为一谈：`admission_timeout` 是资源等待超时且未启动，`execution_timeout` 是已经启动后运行超时，`caller_deadline_exceeded` 是排队与执行合计超过调用方总期限，`broker_backend_timeout` 是 broker 与 backend 通信超时；后三类重试前先判断是否可能已有副作用
 - 大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间。需要完整结果时读取 artifact，不要把预览当全文；`maxOutput` 按正文字符计算，元数据预留另计，`maxLines` 超预算仍须保留全文 artifact，批量任务共享单次响应总预算
 - 上述分类属于 Sandbox backend，不能覆盖 Antigravity 自己的外层工具期限；长任务仍使用对应工具的后台模式或 `sandbox_launch`，并沿用本模板已有的 30～60 秒短轮询节奏

@@ -22,7 +22,9 @@ const ExecParamsShape = {
     timeout: z.number().min(0).optional()
         .describe("执行超时(ms)，默认30000；0 表示 Sandbox 不主动超时"),
     maxMemoryMB: z.number().min(16).max(1536).optional()
-        .describe("进程树内存上限(MB)，默认256；显式值也作为全局接纳预留"),
+        .describe("进程树提交内存硬上限(MB)，默认256；Windows 从进程恢复运行前开始强制执行"),
+    memoryRequestMB: z.number().min(16).max(1536).optional()
+        .describe("调度预期内存(MB)，必须不大于 maxMemoryMB；不填时按硬上限的约25%推导，最少64MB"),
     maxOutput: z.number().min(100).optional()
         .describe("兼容参数：调用方希望的内联字符预算；最终仍受服务端响应保护线约束"),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional()
@@ -35,8 +37,8 @@ const ExecParamsShape = {
         .describe("兼容参数：调用方希望的内联行数预算，不再硬限制为200"),
     ownerId: z.string().min(1).max(200).optional()
         .describe("稳定调用方标识，用于多对话公平调度"),
-    admissionBudgetMs: z.number().min(0).optional()
-        .describe("资源不足时最多等待多久；不填使用服务端8～10秒预算"),
+    admissionBudgetMs: z.number().min(0).max(10000).optional()
+        .describe("资源不足时最多等待多久；不填使用服务端8～10秒预算，服务端最多10秒"),
     retryAttempt: z.number().int().min(0).max(4).optional()
         .describe("调用方重试级别，用于生成随机指数退避建议"),
     gpu: z.boolean().optional()
@@ -62,7 +64,7 @@ command 模式：执行系统命令，自动用 shell 包装
 - 输出智能截断（不爆上下文）
 - 失败原因清晰（killed + killReason）`,
         ExecParamsShape,
-        async (params: Record<string, unknown>, extra?: { signal?: AbortSignal }) => {
+        async (params, extra) => {
             const startTime = Date.now();
             touchActivity();
 
@@ -87,6 +89,7 @@ command 模式：执行系统命令，自动用 shell 包装
             const env = params.env as string | undefined;
             const timeout = params.timeout as number | undefined;
             const maxMemoryMB = params.maxMemoryMB as number | undefined;
+            const memoryRequestMB = params.memoryRequestMB as number | undefined;
             const maxOutput = params.maxOutput as number | undefined;
             const outputMode = params.outputMode as "full" | "tail" | "head" | "silent" | undefined;
             const deliveryMode = params.deliveryMode as "auto" | "inline" | "file" | "manifest" | undefined;
@@ -97,6 +100,25 @@ command 模式：执行系统命令，自动用 shell 包装
             const ownerId = params.ownerId as string | undefined;
             const admissionBudgetMs = params.admissionBudgetMs as number | undefined;
             const retryAttempt = params.retryAttempt as number | undefined;
+            const progressToken = extra?._meta?.progressToken;
+            const onQueueProgress = progressToken === undefined || !extra?.sendNotification
+                ? undefined
+                : (progress: {
+                    queueWaitMs: number;
+                    queuePosition: number;
+                    queued: number;
+                    pressureLevel: string;
+                }) => {
+                    void extra.sendNotification?.({
+                        method: "notifications/progress",
+                        params: {
+                            progressToken,
+                            progress: progress.queueWaitMs,
+                            total: 10000,
+                            message: `命令尚未启动：排队 ${progress.queuePosition}/${progress.queued}，已等待 ${progress.queueWaitMs}ms，资源压力 ${progress.pressureLevel}`,
+                        },
+                    }).catch(() => undefined);
+                };
 
             try {
                 const result = await execute({
@@ -107,6 +129,7 @@ command 模式：执行系统命令，自动用 shell 包装
                     env,
                     timeout,
                     maxMemoryMB,
+                    memoryRequestMB,
                     maxOutput,
                     outputMode,
                     deliveryMode,
@@ -114,10 +137,11 @@ command 模式：执行系统命令，自动用 shell 包装
                     maxLines,
                     gpu,
                     maxVRAM_MB,
-                    ownerId,
+                    ownerId: ownerId ?? extra?.sessionId,
                     signal: extra?.signal,
                     admissionBudgetMs,
                     retryAttempt,
+                    onQueueProgress,
                 });
 
                 // 构建返回信息
@@ -131,7 +155,8 @@ command 模式：执行系统命令，自动用 shell 包装
                     : result.killed
                     ? `被杀 (${result.killReason})`
                     : result.exitCode === 0 ? "成功" : `失败 (exit ${result.exitCode})`;
-                parts.push(`${statusIcon} ${statusDesc} | 执行 ${result.elapsed} | 排队 ${result.queueWaitMs}ms | 内存峰值 ${result.peakMemoryMB}MB`);
+                const peakMemory = result.peakMemoryMB === null ? "未取得可信样本" : `${result.peakMemoryMB}MB`;
+                parts.push(`${statusIcon} ${statusDesc} | 执行 ${result.elapsed} | 排队 ${result.queueWaitMs}ms | 内存峰值 ${peakMemory}`);
 
                 // stdout
                 if (result.stdout) {

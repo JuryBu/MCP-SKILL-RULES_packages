@@ -1935,11 +1935,11 @@ export function registerSmartSearch(server: McpServer): void {
             waitSeconds: z.number().optional()
                 .describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
             ownerId: z.string().optional()
-                .describe("任务归属 ID；未传按 global 兼容旧调用"),
+                .describe("任务归属 ID；未传时优先使用当前 MCP session 身份"),
         },
-        async (args, extra?: { signal?: AbortSignal }) => {
+        async (args, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const globalStart = Date.now();
-            const ownerId = normalizeOwnerId(args.ownerId);
+            const ownerId = normalizeOwnerId(args.ownerId ?? extra?.sessionId);
 
             // ── 单查询执行函数 ──
             async function executeSingleQuery(q: {

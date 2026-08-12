@@ -32,8 +32,10 @@ const SessionParamsSchema = z.object({
         .describe("环境（start时使用）"),
     timeout: z.number().int().min(1000).optional()
         .describe("单次执行超时(ms)，默认15000"),
-    maxMemoryMB: z.number().int().min(16).optional()
+    maxMemoryMB: z.number().int().min(16).max(1536).optional()
         .describe("会话内存上限(MB)，默认256"),
+    memoryRequestMB: z.number().int().min(16).max(1536).optional()
+        .describe("会话调度预期内存(MB)，必须不大于 maxMemoryMB"),
     maxLines: z.number().min(1).optional()
         .describe("兼容的内联行数预算，不再硬限制为200"),
     maxOutput: z.number().min(100).optional()
@@ -41,7 +43,7 @@ const SessionParamsSchema = z.object({
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
         .describe("交付模式，默认auto"),
     ownerId: z.string().optional()
-        .describe("会话归属 ID；未传按 global 兼容旧调用"),
+        .describe("会话归属 ID；未传时优先使用当前 MCP session 身份"),
 });
 
 export function registerSession(server: McpServer): void {
@@ -57,7 +59,7 @@ action:
 - close: 关闭会话
 - list: 列出所有活跃会话
 
-默认限制：同一 MCP 进程内最多 ${limits.maxSessions} 个并发会话、总预留 ${limits.maxTotalMemoryMB}MB、单会话默认 ${limits.defaultMemoryMB}MB、空闲 ${Math.round(limits.idleTimeoutMs / 60000)} 分钟自动关闭；均可通过 SANDBOX_SESSION_* 环境变量调整。`,
+默认限制：同一 MCP 进程内最多 ${limits.maxSessions} 个并发会话、调度请求量合计 ${limits.maxTotalMemoryMB}MB、单会话默认硬上限 ${limits.defaultMemoryMB}MB、空闲 ${Math.round(limits.idleTimeoutMs / 60000)} 分钟自动关闭；均可通过 SANDBOX_SESSION_* 环境变量调整。`,
         SessionParamsSchema.shape,
         async (params, extra) => {
             const startTime = Date.now();
@@ -70,13 +72,13 @@ action:
                 };
             }
 
-            const { action = "exec", sessionId, language, code, cwd, env, timeout, maxMemoryMB, maxLines, maxOutput, deliveryMode, ownerId } = parsed.data;
-            const requestOwner = normalizeOwnerId(ownerId);
+            const { action = "exec", sessionId, language, code, cwd, env, timeout, maxMemoryMB, memoryRequestMB, maxLines, maxOutput, deliveryMode, ownerId } = parsed.data;
+            const requestOwner = normalizeOwnerId(ownerId ?? extra.sessionId);
 
             try {
                 switch (action) {
                     case "start": {
-                        const result = await createSession(language || "python", cwd, maxMemoryMB, env, requestOwner, extra.signal);
+                        const result = await createSession(language || "python", cwd, maxMemoryMB, env, requestOwner, extra.signal, memoryRequestMB);
                         if ("error" in result) {
                             return {
                                 content: [{ type: "text" as const, text: `❌ ${result.error}` }],
@@ -85,7 +87,7 @@ action:
                         const output = {
                             content: [{
                                 type: "text" as const,
-                                text: `✅ 会话已创建\nID: ${result.session.id}\nownerId: ${result.session.ownerId}\n语言: ${result.session.language}\n工作目录: ${result.session.cwd}\n内存上限: ${result.session.maxMemoryMB}MB`,
+                                text: `✅ 会话已创建\nID: ${result.session.id}\nownerId: ${result.session.ownerId}\n语言: ${result.session.language}\n工作目录: ${result.session.cwd}\n调度请求: ${result.session.reservationMB}MB\n内存硬上限: ${result.session.maxMemoryMB}MB`,
                             }],
                         };
                         return appendTiming(output, startTime);

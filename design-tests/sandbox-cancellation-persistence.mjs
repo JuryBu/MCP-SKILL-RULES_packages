@@ -265,7 +265,13 @@ test("launch waits for a real process identity before persisting the task", asyn
 
     const ownerId = "launch-real-identity-test";
     const command = `${JSON.stringify(process.execPath)} -e "setTimeout(() => console.log('launch-identity-ok'), 1500)"`;
-    const started = await handler({ command, cwd: dataRoot, ownerId, maxMemoryMB: 64 }, {});
+    const started = await handler({
+        command,
+        cwd: dataRoot,
+        ownerId,
+        memoryRequestMB: 64,
+        maxMemoryMB: 256,
+    }, {});
     const startText = started.content[0].text;
     assert.match(startText, /任务已启动/u);
     const taskId = startText.match(/ID:\s*([a-z0-9-]+)/iu)?.[1];
@@ -275,6 +281,29 @@ test("launch waits for a real process identity before persisting the task", asyn
     const completed = await handler({ action: "status", taskId, ownerId, tailLines: 20 }, {});
     assert.match(completed.content[0].text, /已完成/u);
     assert.match(completed.content[0].text, /launch-identity-ok/u);
+});
+
+test("launch reports an immediate Windows Job Object limit as memory pressure", async () => {
+    if (process.platform !== "win32") return;
+    let handler;
+    registerLaunch({
+        tool(name, description, schema, registeredHandler) {
+            assert.equal(name, "sandbox_launch");
+            assert.equal(typeof description, "string");
+            assert.ok(schema);
+            handler = registeredHandler;
+        },
+    });
+
+    const command = `${JSON.stringify(process.execPath)} -e "setTimeout(() => {}, 1500)"`;
+    const response = await handler({
+        command,
+        cwd: dataRoot,
+        ownerId: "launch-immediate-memory-limit",
+        memoryRequestMB: 16,
+        maxMemoryMB: 16,
+    }, {});
+    assert.match(response.content[0].text, /启动阶段触发 16MB 进程树内存硬上限/u);
 });
 
 test("launch waits for an atomic exit marker before declaring a missing PID failed", async () => {
