@@ -1,4 +1,4 @@
-import type { ConversationMessageRole, ConversationRound, ConversationUserMessage } from "./trajectory.js";
+import { getRoundUserMessages, type ConversationMessageRole, type ConversationRound, type ConversationUserMessage } from "./trajectory.js";
 
 export interface ConversationRecordProjectionMessage {
     role: "user" | "assistant";
@@ -18,13 +18,7 @@ export function projectConversationRoundForRecord(
     round: ConversationRound,
     index: number,
 ): ConversationRecordProjectionRound {
-    const userMessages: ConversationUserMessage[] = round.userMessages?.length
-        ? round.userMessages
-        : [{
-            text: round.userMessage,
-            attachments: round.attachments,
-            mediaAttachments: round.mediaAttachments,
-        }];
+    const userMessages: ConversationUserMessage[] = getRoundUserMessages(round);
     const messages: ConversationRecordProjectionMessage[] = userMessages.map(message => {
         const projection: ConversationRecordProjectionMessage = {
             role: "user",

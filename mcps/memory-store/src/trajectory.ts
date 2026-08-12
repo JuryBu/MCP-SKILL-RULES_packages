@@ -4,6 +4,12 @@ import fs from "fs";
 import path from "path";
 import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
 import { extractAntigravityToolImages, mergeRoundAttachments } from "./conversation-attachments.js";
+import {
+    conversationAutomationEventKey,
+    parseConversationAutomationEvent,
+    renderConversationAutomationEvent,
+    type ConversationAutomationEvent,
+} from "./conversation-automation-event.js";
 
 /**
  * Trajectory 数据解析与提取
@@ -95,6 +101,7 @@ export interface ConversationSemanticEvent {
     resultFull?: string;
     contextTokens?: number;
     subagent?: SubagentSummary;
+    automation?: ConversationAutomationEvent;
     attachments?: import("./conversation-attachments.js").ConversationAttachment[];
 }
 
@@ -311,7 +318,7 @@ function hasModelSideActivity(round: ConversationRound): boolean {
         || Boolean(round.semanticEvents?.some((event) => event.semanticRole === "model" || event.semanticRole === "assistant" || event.semanticRole === "tool" || event.semanticRole === "subagent"));
 }
 
-function getRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
+function rawRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
     if (round.userMessages?.length) return round.userMessages;
     return [{
         stepIndex: round.startStep,
@@ -321,13 +328,89 @@ function getRoundUserMessages(round: ConversationRound): ConversationUserMessage
     }];
 }
 
+export function getRoundUserMessages(round: ConversationRound): ConversationUserMessage[] {
+    return rawRoundUserMessages(round).filter(message => message.annotations?.length || !parseConversationAutomationEvent(message.text || ""));
+}
+
+export function getRoundAutomationEvents(round: ConversationRound): Array<{
+    stepIndex?: number;
+    event: ConversationAutomationEvent;
+    attachments?: ConversationUserMessage["attachments"];
+}> {
+    const events = new Map<string, {
+        stepIndex?: number;
+        event: ConversationAutomationEvent;
+        attachments?: ConversationUserMessage["attachments"];
+    }>();
+    const annotationProtectedSteps = new Set(
+        rawRoundUserMessages(round)
+            .filter(message => message.annotations?.length && parseConversationAutomationEvent(message.text || ""))
+            .map(message => message.stepIndex),
+    );
+    for (const semanticEvent of round.semanticEvents || []) {
+        if (annotationProtectedSteps.has(semanticEvent.stepIndex)) continue;
+        const automation = semanticEvent.automation
+            || (semanticEvent.semanticRole === "user" || semanticEvent.semanticRole === "system"
+                ? parseConversationAutomationEvent(semanticEvent.text || "")
+                : null);
+        if (!automation) continue;
+        events.set(conversationAutomationEventKey(automation), {
+            stepIndex: semanticEvent.stepIndex,
+            event: automation,
+            attachments: semanticEvent.attachments,
+        });
+    }
+    for (const message of rawRoundUserMessages(round)) {
+        const automation = parseConversationAutomationEvent(message.text || "");
+        if (!automation || message.annotations?.length) continue;
+        events.set(conversationAutomationEventKey(automation), {
+            stepIndex: message.stepIndex,
+            event: automation,
+            attachments: message.attachments,
+        });
+    }
+    return [...events.values()];
+}
+
+export function normalizeConversationAutomationRound(round: ConversationRound): ConversationRound {
+    const userMessages = getRoundUserMessages(round).map(message => ({ ...message }));
+    const automationEvents = getRoundAutomationEvents(round);
+    const automationKeys = new Set(automationEvents.map(item => conversationAutomationEventKey(item.event)));
+    const semanticEvents = (round.semanticEvents || [])
+        .filter(event => {
+            const parsed = (event.semanticRole === "user" || event.semanticRole === "system")
+                ? parseConversationAutomationEvent(event.text || "")
+                : null;
+            return !parsed || !automationKeys.has(conversationAutomationEventKey(parsed));
+        })
+        .map(event => ({ ...event }));
+    for (const item of automationEvents) {
+        semanticEvents.push({
+            stepIndex: item.stepIndex,
+            rawRole: "automatic_channel_event",
+            semanticRole: "system",
+            kind: "automation_event",
+            text: renderConversationAutomationEvent(item.event),
+            automation: item.event,
+            attachments: item.attachments,
+        });
+    }
+    return {
+        ...round,
+        userMessages,
+        userMessage: userMessages.map(message => message.text).filter(Boolean).join("\n\n"),
+        semanticEvents,
+    };
+}
+
 /**
  * 合并由旧宿主解析器拆开的连续人类消息轮次，并保留旧序号映射。
  * 宿主仍可继续传入旧 ConversationRound；调用方在接入点按需使用本函数即可。
  */
 export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], startRound = 1): ConversationRound[] {
     const merged: ConversationRound[] = [];
-    for (const source of sourceRounds) {
+    for (const rawSource of sourceRounds) {
+        const source = normalizeConversationAutomationRound(rawSource);
         const next: ConversationRound = {
             ...source,
             userMessages: getRoundUserMessages(source).map((message) => ({ ...message })),
@@ -708,6 +791,12 @@ export function formatRound(
 
     lines.push(`## 轮次 ${round.roundIndex} (${stepsRange})`);
 
+    for (const automation of getRoundAutomationEvents(round)) {
+        lines.push(`### 🔔 自动通道事件 (step ${automation.stepIndex ?? round.startStep})`);
+        lines.push(renderConversationAutomationEvent(automation.event));
+        lines.push("");
+    }
+
     // 用户消息
     if (round.compactionSummaries?.length) {
         lines.push(`### 👤 用户 (step ${round.startStep})`);
@@ -963,7 +1052,7 @@ function thinkingSummaryLabelForRoleView(thinking: string): string {
 
 function isSystemLikeRound(round: ConversationRound): boolean {
     if (round.compactionSummaries?.length) return true;
-    if (round.semanticEvents?.some((event) => event.semanticRole === "system")) return true;
+    if (round.semanticEvents?.some((event) => event.semanticRole === "system" && event.kind !== "automation_event" && !event.automation)) return true;
     const text = getRoundUserMessages(round).map((message) => message.text).join("\n").trimStart();
     return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
         || text.startsWith("# AGENTS.md instructions")
@@ -1045,13 +1134,14 @@ export function formatRoundForMessageRoles(
 
     const systemLike = isSystemLikeRound(round);
     const userMessages = getRoundUserMessages(round);
-    const explicitSystemEvents = (round.semanticEvents || []).filter(event => event.semanticRole === "system" && event.text);
+    const automationEvents = getRoundAutomationEvents(round);
+    const explicitSystemEvents = (round.semanticEvents || []).filter(event => event.semanticRole === "system" && event.text && event.kind !== "automation_event");
     const legacySystemLike = systemLike && explicitSystemEvents.length === 0;
     const aiResponses = getRoundAiResponses(round);
     const toolCalls = getRoundToolCalls(round);
     const subagentSummaries = getRoundSubagentSummaries(round);
     const includeUser = roles.has("user") && !legacySystemLike;
-    const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0);
+    const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0 || automationEvents.length > 0);
     const includeModel = roles.has("model") || roles.has("assistant");
     const includeTool = roles.has("tool");
     const includeSubagent = roles.has("subagent");
@@ -1093,6 +1183,11 @@ export function formatRoundForMessageRoles(
     };
 
     if (includeSystem) {
+        for (const automation of automationEvents) {
+            if (!pushLine(lines, `### 🔔 自动通道事件 (step ${automation.stepIndex ?? round.startStep})`)) break;
+            if (!pushLine(lines, renderConversationAutomationEvent(automation.event))) break;
+            if (!pushLine(lines, "")) break;
+        }
         if (round.compactionSummaries?.length) {
             if (!pushLine(lines, `### 🧩 系统/压缩内容 (step ${round.startStep})`)) {
                 appendBudgetWarning(lines);
@@ -1119,7 +1214,7 @@ export function formatRoundForMessageRoles(
                 if (!pushLine(lines, truncateForRoleView(event.text || "", depth))) break;
                 if (!pushLine(lines, "")) break;
             }
-        } else {
+        } else if (legacySystemLike) {
             renderUserMessages(true);
         }
     }
@@ -1368,7 +1463,7 @@ export function saveConversationToTemp(
 
 interface SearchResult {
     roundIndex: number;
-    matchType: "user" | "ai" | "annotation";
+    matchType: "user" | "ai" | "annotation" | "automation";
     matchText: string;        // 匹配的文本片段
     contextStart: number;     // 上下文起始位置（字符）
     hitCount: number;         // 命中的 token 数量（用于排序）
@@ -1445,6 +1540,23 @@ export function searchInRounds(
                 matchText: extractContext(userText, idx, firstToken.length, 100),
                 contextStart: idx,
                 hitCount: userHits.length,
+            });
+        }
+
+        const automationText = getRoundAutomationEvents(round)
+            .map(item => renderConversationAutomationEvent(item.event))
+            .join("\n");
+        const automationLower = automationText.toLowerCase();
+        const automationHits = tokens.filter(token => automationLower.includes(token));
+        if (automationHits.length > 0) {
+            const firstToken = automationHits[0];
+            const idx = automationLower.indexOf(firstToken);
+            candidates.push({
+                roundIndex: round.roundIndex,
+                matchType: "automation",
+                matchText: extractContext(automationText, idx, firstToken.length, 100),
+                contextStart: idx,
+                hitCount: automationHits.length,
             });
         }
 

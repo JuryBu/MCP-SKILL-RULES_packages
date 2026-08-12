@@ -1,4 +1,4 @@
-# MCP Memory Store v1.22.6
+# MCP Memory Store v1.22.7
 
 AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
@@ -23,6 +23,7 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **Stage Guard 任务完整性验证** (v1.9+ / 多实例 v1.19.2+)：四层防御网（RULES + 工具提醒 + 🔒标记 + 用户审计），审核模型比对 Plan/Task vs 执行记录。GuardKey 由 conversationId + stageId + childScopeId 组成，每次 start 生成不可变 guardId；同一 Task 可并存多个 Guard，pass/cancel/force 只处理目标实例。子任务用 scopeSelectors 定义局部审核范围，status(listAll=true) 不读取对话即可列出全部活跃 Guard。
 - **四宿主统一 Fetch 缓存与来源控制** (v1.22+)：Codex、Claude Code、Windsurf、Antigravity 统一发布可校验、不可变的 fetch cache generation；Codex/Claude Code 对大 JSONL 流式增量读取，Windsurf/Antigravity 即使 IDE 与 Language Server 均未启动，也能直接解密 active/implicit 本地 PB。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。
 - **大结果可续读与对话语义** (v1.22+)：`read/search` 对约 100K 的结果返回继续位置，不再沿用古老的静默截断；连续人类消息归为同一人类轮，annotations 保留被批注文本与用户评论，子代理明确标注与主线程的角色关系。
+- **自动通道事件精简** (v1.22.7+)：QQ、微信及后续自动渠道的 wake/alert/notification/event 在 fetch cache 中统一保存为短结构化事件；`read/search/recall/export` 只呈现任务或订阅身份、待处理数量/序号摘要和 ACK 状态，不再把 `wake_id`、工具说明或长通知模板冒充用户原话，同时保留主人真实发言、批注、附件引用和对端任务正文。
 - **离线目录与压缩回溯 Recall** (v1.22.3+)：Windsurf/Antigravity 即使 IDE 与 Language Server 都关闭，也能从 active/implicit PB 元数据列出本地对话；四宿主 fetch cache generation 保存压缩边界元数据。`conversation_read_original(action="recall", recallMode="auto|manual|full")` 会先增量更新 fetch 缓存，再只从同一已提交 generation 恢复人类可见上下文；排除 thinking、工具结果、diff、Rules 注入和压缩摘要。`auto/manual` 继续遵守约 100K 分段交付，`full` 只返回带 SHA256 的临时文件。
 - **旧 fetch 缓存自动迁移** (v1.22.4+)：缓存格式升级为 `conversation-source-cache/v2`，首次访问旧 generation 时自动按原始来源重建；搜索同时安全处理历史对象/数组字段，不再要求调用方先手动 fetch 才能避开 `.toLowerCase()` 类型错误。
 - **本地 PB 全量统计** (v1.22.5+)：Windsurf/Antigravity 的 fetch 缓存保存整段对话的 AI 回复与工具调用总数；范围读取继续显示全量统计，旧缓存缺少统计字段时首次访问自动重建。

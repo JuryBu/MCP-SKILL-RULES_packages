@@ -2,6 +2,17 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.22.7] - 2026-08-12
+
+### Added
+
+- fetch/cache 规范化新增通用自动通道事件模型，按 `channel/type/summary` 表示 QQ、微信及后续渠道的 wake/alert/notification/event；输出仅保留必要的任务或订阅身份、待处理数量/序号摘要和处理/ACK 状态。
+
+### Fixed
+
+- `read/search/recall/export` 不再把 `wake_id`、工具调用说明和整段自动通知模板回填为用户原话；已有 v2 缓存读取时动态兼容，后续增量发布会写入规范化事件。
+- 主人真实发言、带批注的引用、附件引用和 `<codex_delegation>` 对端任务正文继续保留；Record 投影不会把自动提醒计入用户消息。
+
 ## [1.22.6] - 2026-08-10
 
 ### Fixed

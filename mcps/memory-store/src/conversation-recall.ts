@@ -1,7 +1,13 @@
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { createTempFilePathAsync } from "./temp-store.js";
-import type { ConversationRound, ConversationUserMessage } from "./trajectory.js";
+import {
+    getRoundAutomationEvents,
+    getRoundUserMessages,
+    type ConversationRound,
+    type ConversationUserMessage,
+} from "./trajectory.js";
+import { renderConversationAutomationEvent } from "./conversation-automation-event.js";
 
 export const CONVERSATION_RECALL_METADATA_VERSION = 1 as const;
 export const ANTIGRAVITY_RECALL_FALLBACK_TOKENS = 150_000;
@@ -57,13 +63,7 @@ export interface ConversationRecallArtifact {
 }
 
 function getUserMessages(round: ConversationRound): ConversationUserMessage[] {
-    if (round.userMessages?.length) return round.userMessages;
-    return [{
-        stepIndex: round.startStep,
-        text: round.userMessage || "",
-        mediaAttachments: round.mediaAttachments,
-        attachments: round.attachments,
-    }];
+    return getRoundUserMessages(round);
 }
 
 function stripCodexRulesInjection(text: string): string {
@@ -106,6 +106,10 @@ function renderRecallUserMessage(lines: string[], message: ConversationUserMessa
 
 export function formatConversationRecallRound(round: ConversationRound): string {
     const lines = [`## 轮次 ${round.roundIndex} (steps ${round.startStep}-${round.endStep})`];
+    for (const automation of getRoundAutomationEvents(round)) {
+        lines.push(`### 🔔 自动通道事件 (step ${automation.stepIndex ?? round.startStep})`);
+        lines.push(renderConversationAutomationEvent(automation.event), "");
+    }
     if (!round.compactionSummaries?.length) {
         for (const message of getUserMessages(round)) renderRecallUserMessage(lines, message, round.startStep);
     }

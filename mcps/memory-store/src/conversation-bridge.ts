@@ -33,7 +33,7 @@ import { withConversationSourcePressure } from "./conversation-source-pressure.j
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable, listLiveAntigravityConversationIds } from "./ls-client.js";
 import { setCurrentContext } from "./conversation-router.js";
-import { mergeConsecutiveHumanRounds, parseRounds, type ConversationRound } from "./trajectory.js";
+import { mergeConsecutiveHumanRounds, normalizeConversationAutomationRound, parseRounds, type ConversationRound } from "./trajectory.js";
 import {
     buildConversationCompactionMetadata,
     projectConversationRoundForRecallMetadata,
@@ -542,7 +542,8 @@ async function tryBuildIncrementalConversation(
                     generation: previous.generation,
                 });
                 if (!cachedRounds) throw new Error("Codex 增量更新无法读取上一代 fetch 缓存");
-                for (const round of cachedRounds.rounds) {
+                for (const cachedRound of cachedRounds.rounds) {
+                    const round = normalizeConversationAutomationRound(cachedRound);
                     spool.append(round);
                     recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
                     revisionAccumulator.addRound(round);
@@ -576,7 +577,8 @@ async function tryBuildIncrementalConversation(
         let toolCallCount = 0;
         const recallMetadataRounds: ConversationRound[] = [];
         const revisionAccumulator = createCodexSourceRevisionAccumulator();
-        const appendRound = (round: ConversationRound): void => {
+        const appendRound = (sourceRound: ConversationRound): void => {
+            const round = normalizeConversationAutomationRound(sourceRound);
             spool.append(round);
             recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
             revisionAccumulator.addRound(round);
@@ -651,7 +653,8 @@ async function tryBuildIncrementalConversation(
         const recallMetadataRounds: ConversationRound[] = [];
         try {
             for (const source of sources) {
-                for (const round of source) {
+                for (const sourceRound of source) {
+                    const round = normalizeConversationAutomationRound(sourceRound);
                     spool.append(round);
                     recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
                     aiResponseCount += round.aiResponses.length;

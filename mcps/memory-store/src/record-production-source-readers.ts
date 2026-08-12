@@ -58,7 +58,8 @@ import {
 } from "./conversation-source-cache.js";
 import { rebuildConversationCacheForRecord } from "./conversation-bridge.js";
 import type { ConversationRecordProjectionRound } from "./conversation-record-projection.js";
-import type { ConversationMessageRole, ConversationRound } from "./trajectory.js";
+import { getRoundUserMessages, type ConversationMessageRole, type ConversationRound } from "./trajectory.js";
+import { parseConversationAutomationEvent } from "./conversation-automation-event.js";
 
 export const PRODUCTION_SOURCE_CONTENT_SCHEMA_VERSION = "record-source-content/v1" as const;
 export const PRODUCTION_SOURCE_FORMATTER_VERSION_V1 = "canonical-json-nfc-lf/v1" as const;
@@ -975,12 +976,14 @@ function messagesFromWindsurfRounds(
 ): ProductionSourceMessage[] {
     const messages: ProductionSourceMessage[] = [];
     for (const round of rounds) {
-        messages.push({
-            role: "user",
-            text: round.userMessage,
-            attachments: round.attachments,
-            mediaAttachments: round.mediaAttachments,
-        });
+        for (const message of getRoundUserMessages(round)) {
+            messages.push({
+                role: "user",
+                text: message.text,
+                attachments: message.attachments,
+                mediaAttachments: message.mediaAttachments,
+            });
+        }
         for (const response of round.aiResponses) {
             if (!response.response && response.toolCalls.length > 0) continue;
             messages.push({ role: "assistant", text: response.response });
@@ -999,6 +1002,7 @@ function messagesFromRecordProjection(rounds: readonly ConversationRecordProject
             if (!message || (message.role !== "user" && message.role !== "assistant") || typeof message.text !== "string") {
                 throw new Error(`fetch 缓存 Record 投影第 ${index + 1} 轮第 ${messageIndex + 1} 条消息结构无效`);
             }
+            if (message.role === "user" && parseConversationAutomationEvent(message.text)) continue;
             messages.push({
                 role: message.role,
                 text: message.text,
