@@ -880,6 +880,58 @@ test("structured reply contracts persist with pending messages and reject confli
   }
 });
 
+test("legacy messages can adopt a structured reply contract exactly once", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const legacy = {
+      messageSeq: 22,
+      messageAt: "2026-07-24T08:00:22.000Z",
+    };
+    fixture.registry.observeMessages({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [legacy],
+    });
+    const upgraded = fixture.registry.observeMessages({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{
+        ...legacy,
+        replyRequired: true,
+        expectedReply: "TASK_22_COMPLETED",
+        replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+        nextCheckAt: "2026-07-24T08:30:00.000Z",
+      }],
+    });
+    assert.deepEqual(upgraded.pendingMessages, [{
+      messageSeq: 22,
+      messageAt: legacy.messageAt,
+      lastRemindedAt: null,
+      replyRequired: true,
+      expectedReply: "TASK_22_COMPLETED",
+      replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+      nextCheckAt: "2026-07-24T08:30:00.000Z",
+    }]);
+    assertRegistryError(
+      () => fixture.registry.observeMessages({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        messages: [{
+          ...legacy,
+          replyRequired: true,
+          expectedReply: "DIFFERENT_REPLY",
+          replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+          nextCheckAt: "2026-07-24T08:30:00.000Z",
+        }],
+      }),
+      "MESSAGE_SEQ_CONFLICT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("a late ACK for an older wake cannot clear messages added to a newer wake", () => {
   const fixture = createFixture({ wakeCooldownMs: 30_000 });
   try {

@@ -981,6 +981,18 @@ class TaskRegistry {
       for (const observed of observedMessages) {
         const existing = findMessage(task, observed.messageSeq);
         if (existing) {
+          const legacyReplyContract = existing.replyRequired !== true
+            && existing.expectedReply == null
+            && existing.replyDeadlineAt == null
+            && existing.nextCheckAt == null;
+          if (existing.messageAt === observed.messageAt && legacyReplyContract && observed.replyRequired) {
+            existing.replyRequired = true;
+            existing.expectedReply = observed.expectedReply;
+            existing.replyDeadlineAt = observed.replyDeadlineAt;
+            existing.nextCheckAt = observed.nextCheckAt;
+            changed = true;
+            continue;
+          }
           if (
             existing.messageAt !== observed.messageAt
             || existing.replyRequired !== observed.replyRequired
