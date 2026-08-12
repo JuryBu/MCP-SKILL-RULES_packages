@@ -38,6 +38,20 @@ function runPowerShell(args, env = {}, timeout = 30_000) {
   );
 }
 
+function pathIdentity(value) {
+  const tail = [];
+  let existing = path.resolve(value);
+  while (!fs.existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) break;
+    tail.unshift(path.basename(existing));
+    existing = parent;
+  }
+  const canonicalBase = fs.existsSync(existing) ? fs.realpathSync.native(existing) : existing;
+  const canonical = path.join(canonicalBase, ...tail);
+  return process.platform === "win32" ? canonical.toLowerCase() : canonical;
+}
+
 function resolveDataRoot({ helperPath, explicit = "", processRoot = "", brokerRoot, userProfile }) {
   const command = [
     `. '${helperPath.replaceAll("'", "''")}'`,
@@ -62,22 +76,22 @@ test("DataRoot resolver follows one precedence chain without creating a split-br
 
     let result = resolveDataRoot({ helperPath, explicit: explicitRoot, processRoot, brokerRoot, userProfile });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(path.resolve(result.stdout.trim()), path.resolve(explicitRoot));
+    assert.equal(pathIdentity(result.stdout.trim()), pathIdentity(explicitRoot));
 
     result = resolveDataRoot({ helperPath, processRoot, brokerRoot, userProfile });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(path.resolve(result.stdout.trim()), path.resolve(processRoot));
+    assert.equal(pathIdentity(result.stdout.trim()), pathIdentity(processRoot));
 
     writeJson(path.join(brokerRoot, "broker-private.env.json"), { CODEX_TOOLKIT_NAPCAT_DATA_ROOT: privateRoot });
     result = resolveDataRoot({ helperPath, brokerRoot, userProfile });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(path.resolve(result.stdout.trim()), path.resolve(privateRoot));
+    assert.equal(pathIdentity(result.stdout.trim()), pathIdentity(privateRoot));
 
     fs.rmSync(path.join(brokerRoot, "broker-private.env.json"));
     writeJson(path.join(legacyRoot, "state", "task-registry.json"), { schemaVersion: 1, tasks: {} });
     result = resolveDataRoot({ helperPath, brokerRoot, userProfile });
     assert.equal(result.status, 0, result.stderr);
-    assert.equal(path.resolve(result.stdout.trim()), path.resolve(legacyRoot));
+    assert.equal(pathIdentity(result.stdout.trim()), pathIdentity(legacyRoot));
     assert.equal(fs.existsSync(canonicalRoot), false, "manual discovery must not create the canonical root");
 
     writeJson(path.join(canonicalRoot, "state", "task-registry.json"), { schemaVersion: 1, tasks: {} });
