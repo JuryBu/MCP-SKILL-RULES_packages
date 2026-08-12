@@ -1,9 +1,12 @@
 ﻿[CmdletBinding()]
 param(
-  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+  [string]$DataRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+$ResolverBrokerRoot = if (Get-Variable -Name BrokerRoot -ErrorAction SilentlyContinue) { [string]$BrokerRoot } else { "" }
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $ResolverBrokerRoot
 $RuntimeStatePath = Join-Path $DataRoot "state\codex-app-server-proxy-runtime.json"
 $TokenFilePath = Join-Path $DataRoot "state\codex-app-server-proxy-token.txt"
 if (-not (Test-Path -LiteralPath $RuntimeStatePath)) {

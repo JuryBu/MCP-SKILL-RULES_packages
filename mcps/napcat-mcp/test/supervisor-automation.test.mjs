@@ -190,6 +190,7 @@ test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 
 
   fs.mkdirSync(opsRoot, { recursive: true });
   fs.copyFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), startScriptPath);
+  fs.copyFileSync(fileURLToPath(new URL("../ops/resolve-napcat-data-root.ps1", import.meta.url)), path.join(opsRoot, "resolve-napcat-data-root.ps1"));
   fs.writeFileSync(path.join(opsRoot, "start-napcat-login.ps1"), "param()\n", "utf8");
   fs.mkdirSync(path.dirname(runnerPath), { recursive: true });
   fs.writeFileSync(

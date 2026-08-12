@@ -1246,3 +1246,112 @@ test("connection delivery and wake identifiers are stable and duplicate scans ar
     fixture.cleanup();
   }
 });
+
+test("closed owner route migrates conversation only through an explicit identity-checked contract", async () => {
+  const fixture = createFixture();
+  try {
+    const opened = await fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-old",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+    fixture.state.recordOwnerRouteInbound({
+      routeKey: "private-route",
+      messageSeq: 77,
+      messageKey: "owner:private:77",
+    });
+    fixture.controlPlane.closeOwnerRoute({ route_key: "private-route" });
+    const before = fixture.state.getOwnerRoute("private-route");
+    assert.equal(before.status, "closed");
+    assert.throws(
+      () => fixture.state.openOwnerRoute({
+        routeKey: "private-route",
+        conversationId: "conversation-new",
+        taskId: "stable-task-private",
+        targetKey: "owner-private",
+      }),
+      (error) => error.code === "OWNER_ROUTE_CONFLICT",
+    );
+
+    const migrated = fixture.controlPlane.migrateOwnerRoute({
+      route_key: "private-route",
+      expected_conversation_id: "conversation-old",
+      expected_task_id: "stable-task-private",
+      expected_target_key: "owner-private",
+      conversation_id: "conversation-new",
+    });
+    assert.equal(migrated.conversationId, "conversation-new");
+    assert.equal(migrated.taskId, "stable-task-private");
+    assert.equal(migrated.targetKey, "owner-private");
+    assert.equal(migrated.status, "open");
+    assert.equal(migrated.closedAt, null);
+    assert.equal(migrated.lastInboundMessageSeq, 77);
+    assert.equal(migrated.baselineInitialized, opened.baselineInitialized);
+    assert.deepEqual(migrated.baselineMessageKeys, before.baselineMessageKeys);
+    assert.deepEqual(migrated.bufferedOwnerMessages, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner route migration rejects stale identity, open state, and buffered messages without drift", async () => {
+  const fixture = createFixture();
+  let identityFixture = null;
+  try {
+    await fixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-old",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+    const migrate = (overrides = {}) => fixture.controlPlane.migrateOwnerRoute({
+      route_key: "private-route",
+      expected_conversation_id: "conversation-old",
+      expected_task_id: "stable-task-private",
+      expected_target_key: "owner-private",
+      conversation_id: "conversation-new",
+      ...overrides,
+    });
+    const openSnapshot = fixture.state.getOwnerRoute("private-route");
+    assert.throws(migrate, (error) => error.code === "OWNER_ROUTE_NOT_CLOSED");
+    assert.deepEqual(fixture.state.getOwnerRoute("private-route"), openSnapshot);
+
+    fixture.state.bufferOwnerRouteMessage({
+      routeKey: "private-route",
+      messageKey: "owner:private:buffered",
+      messageSeq: 88,
+      time: BASE_TIME,
+      text: "buffered",
+      attachments: [],
+    });
+    fixture.controlPlane.closeOwnerRoute({ route_key: "private-route" });
+    const bufferedSnapshot = fixture.state.getOwnerRoute("private-route");
+    assert.throws(migrate, (error) => error.code === "OWNER_ROUTE_BUFFER_NOT_EMPTY");
+    assert.deepEqual(fixture.state.getOwnerRoute("private-route"), bufferedSnapshot);
+
+    identityFixture = createFixture();
+    await identityFixture.controlPlane.registerOwnerRoute({
+      route_key: "private-route",
+      conversation_id: "conversation-old",
+      task_id: "stable-task-private",
+      target_key: "owner-private",
+    });
+    identityFixture.controlPlane.closeOwnerRoute({ route_key: "private-route" });
+    const identitySnapshot = identityFixture.state.getOwnerRoute("private-route");
+    assert.throws(
+      () => identityFixture.controlPlane.migrateOwnerRoute({
+        route_key: "private-route",
+        expected_conversation_id: "wrong-conversation",
+        expected_task_id: "stable-task-private",
+        expected_target_key: "owner-private",
+        conversation_id: "conversation-new",
+      }),
+      (error) => error.code === "OWNER_ROUTE_EXPECTATION_MISMATCH",
+    );
+    assert.deepEqual(identityFixture.state.getOwnerRoute("private-route"), identitySnapshot);
+  } finally {
+    identityFixture?.cleanup();
+    fixture.cleanup();
+  }
+});

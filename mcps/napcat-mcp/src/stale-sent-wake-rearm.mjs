@@ -24,9 +24,14 @@ function pendingMessages(task) {
   return task.messageLedger.filter((message) => message.status === "pending");
 }
 
+function effectiveWakeMessageSeqs(wake) {
+  const superseded = new Set(wake.supersededMessageSeqs ?? []);
+  return wake.messageSeqs.filter((sequence) => !superseded.has(sequence));
+}
+
 function activeWakes(task, pendingSet) {
   return task.wakeBatches.filter((wake) =>
-    wake.status !== "complete" && wake.messageSeqs.some((sequence) => pendingSet.has(sequence))
+    wake.status !== "complete" && effectiveWakeMessageSeqs(wake).some((sequence) => pendingSet.has(sequence))
   );
 }
 
@@ -79,7 +84,7 @@ export function createStaleSentWakeRearmPlan(input) {
   const wakeIds = wakes.map((wake) => wake.wakeId);
   if (input.expectedActiveWakeIds) exactArray(wakeIds, input.expectedActiveWakeIds, "active wake_id");
   const latest = [...wakes].sort((left, right) => Date.parse(left.leaseStartedAt) - Date.parse(right.leaseStartedAt)).at(-1);
-  const latestCoverage = latest.messageSeqs.filter((sequence) => pendingSet.has(sequence));
+  const latestCoverage = effectiveWakeMessageSeqs(latest).filter((sequence) => pendingSet.has(sequence));
   exactArray(latestCoverage, pendingSeqs, "latest wake coverage");
   if (input.expectedLatestWakeId && latest.wakeId !== input.expectedLatestWakeId) {
     fail("LATEST_WAKE_MISMATCH", "最新 wake_id 与计划不一致", { actual: latest.wakeId, expected: input.expectedLatestWakeId });
@@ -157,6 +162,6 @@ export function verifyRearmedTask(task, plan, newWakeId) {
   if (wake.wakeId !== newWakeId || wake.status !== "sent") {
     fail("REARM_WAKE_MISMATCH", "新的 wake 身份或状态不正确", { wake, newWakeId });
   }
-  exactArray(wake.messageSeqs, plan.expectedPendingSeqs, "new wake coverage");
+  exactArray(effectiveWakeMessageSeqs(wake), plan.expectedPendingSeqs, "new wake coverage");
   return { pendingCount: pending.length, activeWakeCount: 1, wakeId: newWakeId };
 }

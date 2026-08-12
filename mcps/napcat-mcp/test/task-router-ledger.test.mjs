@@ -49,6 +49,7 @@ function createFixture() {
   const router = createTaskRouter({
     registry,
     wakeLeaseMs: 30_000,
+    now: () => new Date(currentTimeMs),
     notifier: {
       async readRecentMessages() {
         return { scannedCount: history.length, messages: history };
@@ -104,7 +105,7 @@ function createFixture() {
   };
 }
 
-test("new traffic triggers coalesced guidance while old unACKed messages never repeat on a timer alone", async () => {
+test("new traffic coalesces while old unACKed messages wait until the twelve-hour reminder interval", async () => {
   const fixture = createFixture();
   try {
     const first = await fixture.router.scanOnce();
@@ -135,9 +136,9 @@ test("new traffic triggers coalesced guidance while old unACKed messages never r
     const second = await fixture.router.scanOnce();
     assert.equal(second.results[0].outcome, "accepted");
     assert.equal(fixture.wakes.length, 2);
-    assert.match(fixture.wakes[1].prompt, /pending_message_seqs=\[10,11,12\]/);
+    assert.match(fixture.wakes[1].prompt, /pending_message_seqs=\[11,12\]/);
     assert.match(fixture.wakes[1].prompt, /new_message_seqs=\[11,12\]/);
-    assert.match(fixture.wakes[1].prompt, /previously_pending_message_seqs=\[10\]/);
+    assert.match(fixture.wakes[1].prompt, /previously_pending_message_seqs=\[\]/);
 
     fixture.registry.acknowledgeWake({
       taskId: "router-ledger-e2e",
@@ -163,14 +164,20 @@ test("new traffic triggers coalesced guidance while old unACKed messages never r
     const third = await fixture.router.scanOnce();
     assert.equal(third.results[0].outcome, "accepted");
     assert.equal(fixture.wakes.length, 3);
-    assert.match(fixture.wakes[2].prompt, /pending_message_seqs=\[12,13,14\]/);
+    assert.match(fixture.wakes[2].prompt, /pending_message_seqs=\[13,14\]/);
     assert.match(fixture.wakes[2].prompt, /new_message_seqs=\[13,14\]/);
-    assert.match(fixture.wakes[2].prompt, /previously_pending_message_seqs=\[12\]/);
+    assert.match(fixture.wakes[2].prompt, /previously_pending_message_seqs=\[\]/);
 
     fixture.registry.acknowledgeWake({
       taskId: "router-ledger-e2e",
       expectedGeneration: 1,
-      processedMessageSeqs: [12, 13, 14],
+      processedMessageSeqs: [12],
+      wakeId: fixture.wakes[1].wakeId,
+    });
+    fixture.registry.acknowledgeWake({
+      taskId: "router-ledger-e2e",
+      expectedGeneration: 1,
+      processedMessageSeqs: [13, 14],
       wakeId: fixture.wakes[2].wakeId,
     });
     assert.deepEqual(fixture.registry.get("router-ledger-e2e").pendingMessages, []);

@@ -442,6 +442,10 @@ function structuredTaskMetadata(text) {
     proposedTaskId: "",
     previousTaskId: "",
     routeKey: "",
+    replyRequired: false,
+    expectedReply: "",
+    replyDeadlineAt: "",
+    nextCheckAt: "",
   };
   const normalizedText = normalizeComparableText(text);
   const firstLine = normalizedText.split("\n").find((line) => line.trim())?.trim() ?? "";
@@ -473,6 +477,14 @@ function structuredTaskMetadata(text) {
     if (previousTaskMatch) metadata.previousTaskId = previousTaskMatch[1].trim().slice(0, 128);
     const routeMatch = line.match(/^(?:route_key|路由)\s*[：:]\s*(.+)$/i);
     if (routeMatch) metadata.routeKey = routeMatch[1].trim().slice(0, 256);
+    const replyRequiredMatch = line.match(/^reply_required\s*[：:]\s*(true|false)$/i);
+    if (replyRequiredMatch) metadata.replyRequired = replyRequiredMatch[1].toLowerCase() === "true";
+    const expectedReplyMatch = line.match(/^expected_reply\s*[：:]\s*(.+)$/i);
+    if (expectedReplyMatch) metadata.expectedReply = expectedReplyMatch[1].trim().slice(0, 240);
+    const replyDeadlineMatch = line.match(/^reply_deadline_at\s*[：:]\s*(.+)$/i);
+    if (replyDeadlineMatch) metadata.replyDeadlineAt = replyDeadlineMatch[1].trim().slice(0, 64);
+    const nextCheckMatch = line.match(/^next_check_at\s*[：:]\s*(.+)$/i);
+    if (nextCheckMatch) metadata.nextCheckAt = nextCheckMatch[1].trim().slice(0, 64);
   }
   return metadata;
 }
@@ -575,6 +587,10 @@ function summarizeGroupMessage(message, expectedSelfId) {
     proposedTaskId: taskMetadata.proposedTaskId,
     previousTaskId: taskMetadata.previousTaskId,
     routeKey: taskMetadata.routeKey,
+    replyRequired: taskMetadata.replyRequired,
+    expectedReply: taskMetadata.expectedReply,
+    replyDeadlineAt: taskMetadata.replyDeadlineAt,
+    nextCheckAt: taskMetadata.nextCheckAt,
     mentionedUserIds: controlSegments.mentionedUserIds,
     replyMessageId: controlSegments.replyMessageId,
     attachments: oneBotDeferredAttachments(message),
@@ -642,6 +658,28 @@ function buildTrainingMessage(normalizedInput, nowDate) {
 function normalizeTextInput(input) {
   const taskId = boundedString(input.task_id, "task_id", 128);
   const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
+  if (input.reply_required !== undefined && typeof input.reply_required !== "boolean") {
+    throw new NapCatNotifierError("INVALID_ARGUMENT", "reply_required 必须是布尔值");
+  }
+  const replyRequired = input.reply_required === true;
+  const expectedReply = boundedString(input.expected_reply, "expected_reply", 240);
+  const replyDeadlineAt = boundedString(input.reply_deadline_at, "reply_deadline_at", 64);
+  const nextCheckAt = boundedString(input.next_check_at, "next_check_at", 64);
+  const hasReplyContract = input.reply_required !== undefined || expectedReply || replyDeadlineAt || nextCheckAt;
+  if (hasReplyContract && !taskId) {
+    throw new NapCatNotifierError("INVALID_ARGUMENT", "回复合同只允许用于带 task_id 的结构化任务消息");
+  }
+  if (replyRequired && !expectedReply) {
+    throw new NapCatNotifierError("INVALID_ARGUMENT", "reply_required=true 时 expected_reply 不能为空");
+  }
+  if (!replyRequired && (expectedReply || replyDeadlineAt || nextCheckAt)) {
+    throw new NapCatNotifierError("INVALID_ARGUMENT", "expected_reply、reply_deadline_at、next_check_at 需要 reply_required=true");
+  }
+  for (const [name, value] of [["reply_deadline_at", replyDeadlineAt], ["next_check_at", nextCheckAt]]) {
+    if (value && !Number.isFinite(Date.parse(value))) {
+      throw new NapCatNotifierError("INVALID_ARGUMENT", `${name} 必须是有效 ISO 时间`);
+    }
+  }
   return {
     event: "message",
     taskId: taskId || "fixed-group-text",
@@ -651,6 +689,10 @@ function normalizeTextInput(input) {
     text: boundedString(input.text, "text", 1000, true),
     sourceMachine: outboundMachineRole(input.source_machine, "source_machine", Boolean(taskId)),
     targetMachine: outboundMachineRole(input.target_machine, "target_machine", Boolean(taskId)),
+    replyRequired,
+    expectedReply,
+    replyDeadlineAt: replyDeadlineAt ? new Date(replyDeadlineAt).toISOString() : "",
+    nextCheckAt: nextCheckAt ? new Date(nextCheckAt).toISOString() : "",
   };
 }
 
@@ -660,6 +702,11 @@ function buildTextMessage(normalizedInput, nowDate) {
     if (normalizedInput.sourceMachine) lines.push(`来源机器：${normalizedInput.sourceMachine}`);
     if (normalizedInput.targetMachine) lines.push(`目标机器：${normalizedInput.targetMachine}`);
     lines.push(`delivery_id：${normalizedInput.deliveryId}`);
+    if (normalizedInput.replyRequired) {
+      lines.push("reply_required：true", `expected_reply：${normalizedInput.expectedReply}`);
+      if (normalizedInput.replyDeadlineAt) lines.push(`reply_deadline_at：${normalizedInput.replyDeadlineAt}`);
+      if (normalizedInput.nextCheckAt) lines.push(`next_check_at：${normalizedInput.nextCheckAt}`);
+    }
     lines.push(`正文：${normalizedInput.text}`, `时间：${nowDate.toISOString()}`);
     return lines.join("\n");
   }

@@ -41,14 +41,15 @@ export function buildWakeId(task, pendingMessages, pendingThroughTime = null) {
     ? pendingMessages.map((message) => ({
         messageSeq: Number(message.messageSeq ?? message.message_seq),
         messageAt: String(message.messageAt ?? message.message_time ?? message.time),
+        lastRemindedAt: message.lastRemindedAt ?? null,
       }))
     : [{ messageSeq: Number(pendingMessages), messageAt: String(pendingThroughTime) }];
   return crypto.createHash("sha256").update([
-    "wake:v2",
+    "wake:v3",
     task.taskId,
     String(task.generation),
     task.conversationId,
-    ...normalizedMessages.flatMap((message) => [String(message.messageSeq), message.messageAt]),
+    ...normalizedMessages.flatMap((message) => [String(message.messageSeq), message.messageAt, String(message.lastRemindedAt ?? "")]),
   ].join("\0"), "utf8").digest("hex");
 }
 
@@ -57,7 +58,15 @@ function buildWakePrompt(task, pendingMessages, newMessages, wakeId) {
   const newSequences = newMessages.map((message) => message.messageSeq);
   const previouslyPendingSequences = pendingSequences.filter((sequence) => !newSequences.includes(sequence));
   const pendingThroughSequence = pendingSequences.at(-1);
-  return [
+  const replyContracts = pendingMessages
+    .filter((message) => message.replyRequired)
+    .map((message) => ({
+      message_seq: message.messageSeq,
+      expected_reply: message.expectedReply,
+      reply_deadline_at: message.replyDeadlineAt,
+      next_check_at: message.nextCheckAt,
+    }));
+  const lines = [
     "[NAPCAT_TASK_WAKE]",
     `task_id=${task.taskId}`,
     `generation=${task.generation}`,
@@ -66,8 +75,13 @@ function buildWakePrompt(task, pendingMessages, newMessages, wakeId) {
     `previously_pending_message_seqs=${JSON.stringify(previouslyPendingSequences)}`,
     `pending_through_message_seq=${pendingThroughSequence}`,
     `wake_id=${wakeId}`,
-    "ExampleGroup 固定群有新增消息，并可能仍有此前未完成的消息。请调用 napcat_read_recent 按 task_id 读取并处理；完成一条或多条后调用 napcat_task_ack，原样回传 generation、wake_id，并用 processed_message_seqs 明确列出实际处理完成的消息。未列出的消息继续保留待处理；message_seq 是不保证数字递增的消息标识，不能自行取最大值或确认未处理消息。",
-  ].join("\n");
+  ];
+  if (replyContracts.length) lines.push(`reply_contracts=${JSON.stringify(replyContracts)}`);
+  if (previouslyPendingSequences.length) {
+    lines.push("这是运输成功但业务仍未完成或未精确 ACK 的 12 小时复核提醒，只核对上述 message_seq；先向可信对端报告异常，持续异常才通过主人通知通道求助。");
+  }
+  lines.push("ExampleGroup 固定群有结构化 task 消息。machine_received / conversation_received 只证明运输或持久化，不等于业务回复。请调用 napcat_read_recent 按 task_id 读取并处理；若预计超过 60 秒，可先发送 IN_PROGRESS 并给出 next_check_at，但最终固定回复仍须发送。完成一条或多条后调用 napcat_task_ack，参数 expected_generation 原样使用本提示 generation，wake_id 原样回传，processed_message_seqs 只列实际完成项；未列消息继续待处理。message_seq 不保证数字递增，不能自行取最大值或确认未处理消息。");
+  return lines.join("\n");
 }
 
 function publicError(error) {
@@ -88,12 +102,14 @@ export function createTaskRouter(options = {}) {
   const historyMaxPages = Math.max(1, Math.min(200, Number(options.historyMaxPages ?? 40)));
   const controlHistoryLookbackMs = Math.max(0, Number(options.controlHistoryLookbackMs ?? 15 * 60 * 1000));
   const wakeLeaseMs = Math.max(1000, Number(options.wakeLeaseMs ?? 300000));
+  const businessReminderIntervalMs = Math.max(60_000, Number(options.businessReminderIntervalMs ?? 12 * 60 * 60 * 1000));
+  const now = typeof options.now === "function" ? options.now : () => new Date();
   const isMaintenanceActive = typeof options.isMaintenanceActive === "function"
     ? options.isMaintenanceActive
     : () => false;
 
   function historyBoundary(tasks) {
-    const candidates = [Date.now() - controlHistoryLookbackMs];
+    const candidates = [now().getTime() - controlHistoryLookbackMs];
     for (const task of tasks) {
       for (const value of [task.lastSeenAt, task.lastAckedAt, task.createdAt]) {
         const timestamp = Date.parse(value ?? "");
@@ -192,6 +208,10 @@ export function createTaskRouter(options = {}) {
         messages: messagesToObserve.map((message) => ({
           messageSeq: messageSequence(message),
           messageAt: message.time,
+          replyRequired: message.replyRequired === true,
+          expectedReply: message.expectedReply || null,
+          replyDeadlineAt: message.replyDeadlineAt || null,
+          nextCheckAt: message.nextCheckAt || null,
         })),
       });
       const machineReceipts = controlPlane
@@ -205,7 +225,15 @@ export function createTaskRouter(options = {}) {
       const newMessages = pendingMessages
         .filter((message) => message.lastRemindedAt === null)
         .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
-      if (!newMessages.length) {
+      const currentTime = now().getTime();
+      const reminderMessages = pendingMessages
+        .filter((message) => message.lastRemindedAt !== null)
+        .filter((message) => currentTime - Date.parse(message.lastRemindedAt) >= businessReminderIntervalMs)
+        .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
+      const wakeMessages = [...newMessages, ...reminderMessages]
+        .filter((message, index, source) => source.findIndex((candidate) => candidate.messageSeq === message.messageSeq) === index)
+        .sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
+      if (!wakeMessages.length) {
         return {
           taskId: task.taskId,
           outcome: pendingMessages.length ? "awaiting_ack" : "no_new_message",
@@ -215,17 +243,17 @@ export function createTaskRouter(options = {}) {
           conversationReceipts,
         };
       }
-      const pendingThroughMessage = pendingMessages.at(-1);
+      const pendingThroughMessage = wakeMessages.at(-1);
       const wakeBoundarySequence = pendingThroughMessage.messageSeq;
       const wakeBoundaryTime = pendingThroughMessage.messageAt;
-      const wakeId = buildWakeId(seenTask, pendingMessages);
-      const prompt = buildWakePrompt(seenTask, pendingMessages, newMessages, wakeId);
+      const wakeId = buildWakeId(seenTask, wakeMessages);
+      const prompt = buildWakePrompt(seenTask, wakeMessages, newMessages, wakeId);
       const promptHash = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
       const lease = registry.acquireWakeLease({
         taskId: task.taskId,
         expectedGeneration: task.generation,
         leaseMs: wakeLeaseMs,
-        messages: pendingMessages,
+        messages: wakeMessages,
         wakeId,
         promptSha256: promptHash,
       });
@@ -234,8 +262,9 @@ export function createTaskRouter(options = {}) {
           taskId: task.taskId,
           outcome: lease.reason,
           pendingCount: pendingMessages.length,
-          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq),
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
+          reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           machineReceipts,
@@ -253,8 +282,9 @@ export function createTaskRouter(options = {}) {
           taskId: task.taskId,
           outcome: "automation_paused",
           pendingCount: pendingMessages.length,
-          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq),
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
+          reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           machineReceipts,
@@ -273,8 +303,9 @@ export function createTaskRouter(options = {}) {
           sourceMachine: seenTask.sourceMachine,
           targetMachine: seenTask.targetMachine,
           trustedPeerQq: seenTask.trustedPeerQq,
-          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq),
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
+          reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           pendingThroughTime: wakeBoundaryTime,
           promptSha256: promptHash,
@@ -286,7 +317,7 @@ export function createTaskRouter(options = {}) {
           expectedWakeSentAt: lease.wakeSentAt,
           expectedWakeId: wakeId,
         });
-        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId, machineReceipts, conversationReceipts };
+        return { taskId: task.taskId, outcome: "wake_failed", error: publicError(error), pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq), newMessageSeqs: newMessages.map((message) => message.messageSeq), reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq), pendingThroughSequence: wakeBoundarySequence, wakeId, machineReceipts, conversationReceipts };
       }
       if (wake.outcome === "accepted" || wake.outcome === "completed") {
         registry.confirmWakeSent({
@@ -299,8 +330,9 @@ export function createTaskRouter(options = {}) {
           taskId: task.taskId,
           outcome: wake.outcome,
           pendingCount: pendingMessages.length,
-          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq),
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
+          reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           turnId: wake.turn?.id ?? wake.turn?.turnId ?? null,
@@ -319,8 +351,9 @@ export function createTaskRouter(options = {}) {
           taskId: task.taskId,
           outcome: "wake_unknown",
           pendingCount: pendingMessages.length,
-          pendingMessageSeqs: pendingMessages.map((message) => message.messageSeq),
+          pendingMessageSeqs: wakeMessages.map((message) => message.messageSeq),
           newMessageSeqs: newMessages.map((message) => message.messageSeq),
+          reminderMessageSeqs: reminderMessages.map((message) => message.messageSeq),
           pendingThroughSequence: wakeBoundarySequence,
           wakeId,
           error: wake.error,

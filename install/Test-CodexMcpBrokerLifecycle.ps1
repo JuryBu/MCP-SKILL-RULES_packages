@@ -52,9 +52,11 @@ function Resolve-NodeExecutable {
 }
 
 $previousNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
+$previousStartupTimeout = [Environment]::GetEnvironmentVariable("CODEX_MCP_BROKER_STARTUP_TIMEOUT_SECONDS", "Process")
 $nodeResolution = Resolve-NodeExecutable
 $nodeExePath = [string]$nodeResolution.path
 [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $nodeExePath, "Process")
+[Environment]::SetEnvironmentVariable("CODEX_MCP_BROKER_STARTUP_TIMEOUT_SECONDS", "2", "Process")
 Write-Output "Codex MCP broker lifecycle Node source: $($nodeResolution.source)"
 
 function Get-Sha256 {
@@ -289,10 +291,10 @@ try {
     Remove-Item -LiteralPath (Join-Path $oldSource "endpoint-config.mjs") -Force
 
     $flatRoot = Join-Path $testRoot "process-match"
-    New-Item -ItemType Directory -Force -Path $flatRoot | Out-Null
+    Write-MockSource -Root $flatRoot -Mode healthy
     Copy-Item -LiteralPath $startScriptPath -Destination (Join-Path $flatRoot "Start-CodexMcpBroker.ps1") -Force
     Copy-Item -LiteralPath $stopScriptPath -Destination (Join-Path $flatRoot "Stop-CodexMcpBroker.ps1") -Force
-    Set-Content -LiteralPath (Join-Path $flatRoot "broker.mjs") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
+    [ordered]@{ CODEX_MCP_BROKER_PORT = "19478" } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $flatRoot "broker-private.env.json") -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $flatRoot "broker.mjs.backup") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
     Set-Content -LiteralPath (Join-Path $flatRoot "decoy.mjs") -Encoding UTF8 -Value "setInterval(() => {}, 1000);"
     $decoyScript = Start-Process -FilePath $nodeExePath -ArgumentList @((Join-Path $flatRoot "broker.mjs.backup")) -PassThru -WindowStyle Hidden
@@ -607,4 +609,5 @@ server.listen(port, "127.0.0.1", () => {
     }
     Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
     [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $previousNodeExe, "Process")
+    [Environment]::SetEnvironmentVariable("CODEX_MCP_BROKER_STARTUP_TIMEOUT_SECONDS", $previousStartupTimeout, "Process")
 }

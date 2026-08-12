@@ -596,21 +596,36 @@ try {
     $PreviousManagedNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
     $CandidateStartOutput = @()
     $CandidateProcessId = 0
+    $CandidateStartFailure = $null
     try {
         if ($ManagedNodeExe) { [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $ManagedNodeExe, "Process") }
-        $CandidateStartOutput = @(& $StartScript 2>&1 | ForEach-Object { [string]$_ })
-        $CandidateStartOutput | ForEach-Object { Write-Host $_ }
+        try {
+            $CandidateStartOutput = @(& $StartScript 2>&1 | ForEach-Object { [string]$_ })
+        } catch {
+            $CandidateStartFailure = $_
+            $CandidateStartOutput += [string]$_
+        }
     } finally {
         [Environment]::SetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", $PreviousManagedNodeExe, "Process")
     }
+    $CandidateStartOutput | ForEach-Object { Write-Host $_ }
     foreach ($Line in $CandidateStartOutput) {
         if ($Line -match 'Codex MCP broker (?:started|already running): PID (\d+)') {
             $CandidateProcessId = [int]$Matches[1]
             break
         }
     }
-    if (-not $CandidateProcessId) { throw "Broker start script did not report a candidate PID." }
+    if (-not $CandidateProcessId) {
+        $ExpectedCandidatePath = [System.IO.Path]::GetFullPath($InstalledBrokerPath)
+        $CandidateProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" | Where-Object {
+            $EntryScript = Get-NodeEntryScript -CommandLine ([string]$_.CommandLine)
+            $EntryScript -and $EntryScript.Equals($ExpectedCandidatePath, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($CandidateProcesses.Count -eq 1) { $CandidateProcessId = [int]$CandidateProcesses[0].ProcessId }
+    }
     Save-CandidateStartupEvidence -StartOutput $CandidateStartOutput -CandidateProcessId $CandidateProcessId
+    if ($CandidateStartFailure) { throw $CandidateStartFailure }
+    if (-not $CandidateProcessId) { throw "Broker start script did not report a candidate PID." }
     $AfterHealth = Wait-BrokerHealth -TimeoutSeconds $StartupTimeoutSeconds -ExpectedBrokerPath $InstalledBrokerPath -RejectedProcessId $BeforeIdentity.pid -ExpectedProcessId $CandidateProcessId
     $DeepHealth = @()
     $DeepHealthDeadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)

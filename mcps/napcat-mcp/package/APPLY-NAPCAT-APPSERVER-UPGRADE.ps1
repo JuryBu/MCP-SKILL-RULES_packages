@@ -5,7 +5,7 @@ param(
   [string]$CodeRoot = "",
   [string]$DataRoot = "",
   [switch]$PreserveActiveWakes,
-  [switch]$BackendOnlyHotReload,
+  [switch]$BackendOnlyHotReload = $true,
   [switch]$ValidateOnly
 )
 
@@ -137,40 +137,14 @@ $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | Convert
 $SourceCommit = [string]$Manifest.source_commits.napcat_mcp
 if ([string]::IsNullOrWhiteSpace($SourceCommit)) { throw "manifest.json does not record the NapCat source commit" }
 
-$LegacyDataRoot = Join-Path $BrokerRoot "napcat-mcp"
-$CanonicalDataRoot = Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"
-$DataRootWasExplicit = -not [string]::IsNullOrWhiteSpace($DataRoot)
-if (-not $DataRootWasExplicit) {
-  $ConfiguredDataRoot = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NAPCAT_DATA_ROOT", "User")
-  $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
-  if ([string]::IsNullOrWhiteSpace($ConfiguredDataRoot) -and (Test-Path -LiteralPath $PrivateEnvPath)) {
-    try { $ConfiguredDataRoot = [string](Get-Content -LiteralPath $PrivateEnvPath -Raw -Encoding UTF8 | ConvertFrom-Json).CODEX_TOOLKIT_NAPCAT_DATA_ROOT } catch {}
-  }
-  $RegistryRoots = @(@($LegacyDataRoot, $CanonicalDataRoot) | Where-Object { Test-Path -LiteralPath (Join-Path $_ "state\task-registry.json") } | Select-Object -Unique)
-  if ($RegistryRoots.Count -gt 1) { throw "Multiple NapCat task registries were found. Pass -DataRoot explicitly so no task state can be selected by guesswork." }
-  if (-not [string]::IsNullOrWhiteSpace($ConfiguredDataRoot)) {
-    $ConfiguredDataRoot = [System.IO.Path]::GetFullPath($ConfiguredDataRoot)
-    if ($RegistryRoots.Count -eq 1 -and [System.IO.Path]::GetFullPath($RegistryRoots[0]) -ne $ConfiguredDataRoot) {
-      throw "Configured NapCat DataRoot does not match the existing task registry. Pass -DataRoot explicitly after checking the private state."
-    }
-    $DataRoot = $ConfiguredDataRoot
-  } elseif ($RegistryRoots.Count -eq 1) {
-    $DataRoot = $RegistryRoots[0]
-  } else {
-    $DataRoot = $CanonicalDataRoot
-  }
-}
-$DataRoot = [System.IO.Path]::GetFullPath($DataRoot)
+. (Join-Path $NapCatSource "ops\resolve-napcat-data-root.ps1")
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $BrokerRoot
 if ($CodeRoot -eq $DataRoot) { throw "CodeRoot and DataRoot must be different" }
 
 function Resolve-NodeExecutable {
   $ConfiguredNode = [string]$env:CODEX_TOOLKIT_NODE_EXE
   if (-not [string]::IsNullOrWhiteSpace($ConfiguredNode) -and (Test-Path -LiteralPath $ConfiguredNode -PathType Leaf)) {
     return [System.IO.Path]::GetFullPath($ConfiguredNode)
-  }
-  $NodeCommand = Get-Command node -ErrorAction SilentlyContinue
-  if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
-    return [string]$NodeCommand.Source
   }
   $ManifestPath = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)) {
     [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
@@ -185,6 +159,14 @@ function Resolve-NodeExecutable {
       }
     } catch {
     }
+  }
+  $PackagedNode = Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE ".codex-toolkit\runtime") -Filter node.exe -File -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+  if (-not [string]::IsNullOrWhiteSpace([string]$PackagedNode)) { return [System.IO.Path]::GetFullPath($PackagedNode) }
+  $NodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($null -ne $NodeCommand -and (Test-Path -LiteralPath $NodeCommand.Source -PathType Leaf)) {
+    return [string]$NodeCommand.Source
   }
   throw "Managed Node executable is unavailable. Configure CODEX_TOOLKIT_NODE_EXE or broker.nodeExe in the service manifest."
 }

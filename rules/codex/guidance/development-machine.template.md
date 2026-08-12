@@ -36,9 +36,11 @@
 
 文件索引记录原始 `file_id/fileUuid`、可用的 `file_message_seq` / `busid`、文件名、字节数、SHA256 和可下载标识；不得把只对发送端 NapCat 当前进程有效的根文件临时 `file_id` 当作跨机索引。接收端下载后必须重新计算大小与哈希，不以「接口返回成功」代替文件验证。兼容旧索引时，只能按固定群中同一发送者、文件名、字节数和五分钟内相邻附件受约束地恢复真实 `fileUuid`。
 
-`message_seq` 是不保证数字递增的消息标识。收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务消息；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
+`message_seq` 是不保证数字递增的消息标识。收到 `[NAPCAT_TASK_WAKE]` 后，绑定对话调用 `napcat_read_recent` 获取当前任务消息；提示中的 `new_message_seqs` 是本次新增，`previously_pending_message_seqs` 是此前仍未完成的待办。实际处理完一条或多条后，用同一 `wake_id` 调用 `napcat_task_ack`，明确传 `expected_generation=唤醒提示中的 generation`，并在 `processed_message_seqs` 中只列出已完成的消息。旧唤醒的迟到 ACK 只确认所列消息，不能顺带清除后来消息。
 
 结构化文本和文件索引发送后，用 `napcat_delivery_status` 区分 `machine_received`（对端机器扫描到）与 `conversation_received`（可信消息已按任务绑定持久化进目标对话的任务账本）。任务级 wake cooldown 只控制下一次 UI 提醒，不延迟持久化回执。这两项都不代表业务已处理；只有绑定对话完成正文处理后提交的 `napcat_task_ack` 才能清除对应 pending 消息。
+
+发送方确实需要对方回信时，任务正文或索引必须显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。`machine_received` 与 `conversation_received` 只证明运输成功，不能被当作业务回答；接收方预计超过 60 秒才能完成时，先回一条 `IN_PROGRESS`，说明已开始、当前阻断和下一检查时间。发送方等待其它对话 20～30 分钟时设置一次性 `automation_update` 叫回检查，收到回信后立即撤销。
 
 收到跨机投递严重告警后，开发机维护对话尽快通过维护 task 回带原 `delivery_id` 的接警消息，并核对发送侧 delivery、接收侧任务绑定/持久账本、router 与 wake 租约。不得自动重发业务消息、替生产对话 ACK、关闭 task 或按跨账号 `message_seq` 猜测状态。消息已持久化但处于合法 wake cooldown 时属于「已投递、待提醒」，不得按失联处置，也不应只为消警降低生产 task 的 cooldown；真实故障修复后等待系统恢复通知，再回报最终结果。
 
@@ -48,9 +50,13 @@
 
 任务唤醒的 UI 可见性由私有 binding 的 `codexWakeMessageVisibility=visible|hidden` 控制，默认 `visible`。该字段只决定是否附带稳定的客户端消息标识并保存独立气泡，不改变注入方式、送达时机或模型收到的内容：两种模式在忙碌轮次都用 `turn/steer`，空闲时都用 `turn/start`。路由器每次唤醒前重读该字段，修改后从下一次唤醒起生效，无需重启；可见气泡可能等当前阻塞工具返回后才渲染，`hidden` 则不保存独立气泡。
 
-没有新消息时不按计时重复发送旧提醒；有新消息时，冷却结束后只合并唤醒一次，并同时带回此前仍待处理的消息。短时间连续到达的新消息不得不断推迟这次提醒，也不得拆成多次唤醒。
+普通消息没有新内容时不按计时重复发送旧提醒；有新消息时，冷却结束后只合并唤醒一次，并同时带回此前仍待处理的消息。只有明确登记的双机结构化 task 在未完成消息首次持续 12 小时且没有业务 ACK 时，才发送一条简短去重提醒，此后每满 12 小时至多再发一条，要求对方核对精确待办、ACK 已完成项并报告异常；普通群聊、主人聊天和只读群消息不进入这套流程。
 
 公共 MCP、Rules 或 broker 修复默认在隔离工作树完成实现、测试、打包和对端影子验证，不把生产对话或正式 task 当测试夹具。生产切换只占最后的受控热更新窗口：先确认无 in-flight scan 和不可保护的 active wake，备份私有状态，短暂停止必要后端，健康检查失败立即回滚；不得把候选修复、长测或跨机等待串进生产停机时间。
+
+无感升级的目标是把生产切换压缩为约 1～2 分钟后端热更新，离线研发、完整测试、干净包、回滚演练和双端影子都在窗口前完成。生产没有使用该信道，或调用方可在短暂不可用后自然重试时，通常无需让生产主线停工或反复批窗口；只有不可保护的在途状态、真实业务强依赖或必须完整重启时，才携带实时门槛和回滚入口协调一次短窗口。
+
+若未来版本确实需要退出 Codex 或整机重启，安装完成不能等同于最终激活。重启前后都要核对激活器已经写完 `activated/pendingActivation/restartCodexRequired`，撤销或超时会恢复 router 而不是留下 `task-router.stop`，Windows 登录后共享 broker 使用包内 Node 绝对路径启动，随后验证 router 连续扫描、全部 open task 和私有账本未漂移。
 
 ## 问题回收
 

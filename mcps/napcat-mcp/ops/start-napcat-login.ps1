@@ -9,6 +9,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CodexHome)) { $CodexHome = Join-Path $env:USERPROFILE ".codex" }
 if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
@@ -23,18 +24,7 @@ if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
     }
   }
 }
-if ([string]::IsNullOrWhiteSpace($DataRoot)) {
-  if (-not [string]::IsNullOrWhiteSpace($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT)) {
-    $DataRoot = $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT
-  } else {
-    $LegacyDataRoot = Join-Path $BrokerRoot "napcat-mcp"
-    $DataRoot = if (Test-Path -LiteralPath (Join-Path $LegacyDataRoot "binding.json")) {
-      $LegacyDataRoot
-    } else {
-      Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"
-    }
-  }
-}
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $BrokerRoot
 if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
   $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
   if (Test-Path -LiteralPath $RuntimeStateFile) {

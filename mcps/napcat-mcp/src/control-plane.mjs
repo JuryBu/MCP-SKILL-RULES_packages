@@ -602,6 +602,19 @@ export function createControlPlane(options = {}) {
     return state.closeOwnerRoute({ routeKey: requiredText(input.route_key, "route_key", 256) });
   }
 
+  function migrateOwnerRoute(input) {
+    if (!Object.prototype.hasOwnProperty.call(input, "expected_task_id")) {
+      throw new Error("expected_task_id 必须显式提供，旧值为空时传 null");
+    }
+    return state.migrateOwnerRoute({
+      routeKey: requiredText(input.route_key, "route_key", 256),
+      expectedConversationId: requiredText(input.expected_conversation_id, "expected_conversation_id", 256),
+      expectedTaskId: optionalText(input.expected_task_id, 128) || null,
+      expectedTargetKey: requiredText(input.expected_target_key, "expected_target_key", 256),
+      conversationId: requiredText(input.conversation_id, "conversation_id", 256),
+    });
+  }
+
   async function sendOwnerAlert(input) {
     const routeKey = requiredText(input.route_key, "route_key", 256);
     const route = state.getOwnerRoute(routeKey);
@@ -750,6 +763,7 @@ export function createControlPlane(options = {}) {
     sendConnectionRequest,
     registerOwnerRoute,
     closeOwnerRoute,
+    migrateOwnerRoute,
     sendOwnerAlert,
     scanGroupHistory,
     scanOwnerReplies,

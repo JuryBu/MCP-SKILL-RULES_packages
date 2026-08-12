@@ -963,6 +963,55 @@ export class ControlState {
     });
   }
 
+  migrateOwnerRoute(input) {
+    if (!isPlainObject(input)) invalidArgument("input 必须是对象");
+    const routeKey = requiredString(input.routeKey, "routeKey", 256);
+    const expectedConversationId = requiredString(input.expectedConversationId, "expectedConversationId", 256);
+    if (!hasOwn(input, "expectedTaskId")) invalidArgument("expectedTaskId 必须显式提供，旧值为空时传 null");
+    const expectedTaskId = optionalString(input.expectedTaskId, "expectedTaskId", 128);
+    const expectedTargetKey = requiredString(input.expectedTargetKey, "expectedTargetKey", 256);
+    const conversationId = requiredString(input.conversationId, "conversationId", 256);
+    if (conversationId === expectedConversationId) {
+      invalidArgument("conversationId 必须与 expectedConversationId 不同");
+    }
+    return this.#write((state) => {
+      const existing = state.ownerRoutes[routeKey];
+      if (!existing) {
+        throw new ControlStateError("OWNER_ROUTE_NOT_FOUND", `所有者路由不存在：${routeKey}`, { routeKey });
+      }
+      if (existing.status !== "closed") {
+        throw new ControlStateError("OWNER_ROUTE_NOT_CLOSED", `所有者路由尚未关闭：${routeKey}`, { routeKey, status: existing.status });
+      }
+      const mismatches = [];
+      for (const [field, expected, actual] of [
+        ["conversationId", expectedConversationId, existing.conversationId],
+        ["taskId", expectedTaskId, existing.taskId],
+        ["targetKey", expectedTargetKey, existing.targetKey],
+      ]) {
+        if (expected !== actual) mismatches.push({ field, expected, actual });
+      }
+      if (mismatches.length) {
+        throw new ControlStateError(
+          "OWNER_ROUTE_EXPECTATION_MISMATCH",
+          `所有者路由旧身份与显式预期不一致：${routeKey}`,
+          { routeKey, mismatches },
+        );
+      }
+      if (existing.bufferedOwnerMessages.length !== 0) {
+        throw new ControlStateError(
+          "OWNER_ROUTE_BUFFER_NOT_EMPTY",
+          `所有者路由仍有缓冲消息，禁止迁移：${routeKey}`,
+          { routeKey, bufferedMessageCount: existing.bufferedOwnerMessages.length },
+        );
+      }
+      existing.conversationId = conversationId;
+      existing.status = "open";
+      existing.openedAt = resolveNow(this.now, input);
+      existing.closedAt = null;
+      return { changed: true, value: clone(existing) };
+    });
+  }
+
   recordOwnerRouteInbound(input) {
     if (!isPlainObject(input)) invalidArgument("input 必须是对象");
     const routeKey = requiredString(input.routeKey, "routeKey", 256);

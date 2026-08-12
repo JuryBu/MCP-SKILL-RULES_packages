@@ -2,7 +2,7 @@
 param(
   [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
   [string]$CodeRoot = $(if ($env:NAPCAT_MCP_ROOT) { $env:NAPCAT_MCP_ROOT } else { Join-Path $env:USERPROFILE ".codex\services\napcat-bridge\current" }),
-  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = "",
   [string]$BrokerRoot = $(if ($env:CODEX_TOOLKIT_BROKER_ROOT) { $env:CODEX_TOOLKIT_BROKER_ROOT } else { Join-Path $env:USERPROFILE ".codex\mcp-http-broker" }),
   [string]$NodeExecutable = "",
   [string]$SourceCommit = "unknown",
@@ -17,6 +17,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+$ResolverBrokerRoot = if (Get-Variable -Name BrokerRoot -ErrorAction SilentlyContinue) { [string]$BrokerRoot } else { "" }
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $ResolverBrokerRoot
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $SourceRoot = [System.IO.Path]::GetFullPath($SourceRoot).TrimEnd('\')
 $CodeRoot = [System.IO.Path]::GetFullPath($CodeRoot).TrimEnd('\')

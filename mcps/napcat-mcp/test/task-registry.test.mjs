@@ -841,6 +841,45 @@ test("message-level ACK accepts sparse subsets and keeps unprocessed messages pe
   }
 });
 
+test("structured reply contracts persist with pending messages and reject conflicting replay", () => {
+  const fixture = createFixture();
+  try {
+    fixture.registry.register(taskInput());
+    const observed = {
+      messageSeq: 21,
+      messageAt: "2026-07-24T08:00:21.000Z",
+      replyRequired: true,
+      expectedReply: "TASK_21_COMPLETED",
+      replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+      nextCheckAt: "2026-07-24T08:30:00.000Z",
+    };
+    const task = fixture.registry.observeMessages({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [observed],
+    });
+    assert.deepEqual(task.pendingMessages, [{
+      messageSeq: 21,
+      messageAt: observed.messageAt,
+      lastRemindedAt: null,
+      replyRequired: true,
+      expectedReply: "TASK_21_COMPLETED",
+      replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+      nextCheckAt: "2026-07-24T08:30:00.000Z",
+    }]);
+    assertRegistryError(
+      () => fixture.registry.observeMessages({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        messages: [{ ...observed, expectedReply: "DIFFERENT_REPLY" }],
+      }),
+      "MESSAGE_SEQ_CONFLICT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("a late ACK for an older wake cannot clear messages added to a newer wake", () => {
   const fixture = createFixture({ wakeCooldownMs: 30_000 });
   try {
@@ -878,23 +917,169 @@ test("a late ACK for an older wake cannot clear messages added to a newer wake",
       expectedWakeId: "wake-new",
     });
 
-    const afterLateAck = fixture.registry.acknowledgeWake({
-      taskId: "task-001",
-      expectedGeneration: 1,
-      processedMessageSeqs: [10],
-      wakeId: "wake-old",
-    });
-    assert.deepEqual(afterLateAck.pendingMessages.map((message) => message.messageSeq), [11]);
-    assert.deepEqual(afterLateAck.activeWakes.map((wake) => wake.messageSeqs), [[11]]);
     assertRegistryError(
       () => fixture.registry.acknowledgeWake({
         taskId: "task-001",
         expectedGeneration: 1,
-        processedMessageSeqs: [11],
+        processedMessageSeqs: [10],
         wakeId: "wake-old",
+      }),
+      "ACK_NOT_ACTIVE_WAKE",
+    );
+    const afterLatestAck = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10],
+      wakeId: "wake-new",
+    });
+    assert.deepEqual(afterLatestAck.pendingMessages.map((message) => message.messageSeq), [11]);
+    assert.deepEqual(afterLatestAck.activeWakes.map((wake) => wake.messageSeqs), [[11]]);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("repeated reminder wakes keep pending messages and only the latest coverage active", () => {
+  const fixture = createFixture({ wakeCooldownMs: 30_000 });
+  try {
+    fixture.registry.register(taskInput({ wakeCooldownMs: 30_000 }));
+    const message = { messageSeq: 10, messageAt: "2026-07-24T08:00:10.000Z" };
+    fixture.registry.observeMessages({ taskId: "task-001", expectedGeneration: 1, messages: [message] });
+
+    const sendWake = (wakeId, promptCharacter) => {
+      const acquired = fixture.registry.acquireWakeLease({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        messages: [message],
+        wakeId,
+        promptSha256: promptCharacter.repeat(64),
+      });
+      return fixture.registry.confirmWakeSent({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        expectedWakeSentAt: acquired.wakeSentAt,
+        expectedWakeId: wakeId,
+      });
+    };
+
+    sendWake("wake-reminder-1", "a");
+    fixture.advance(43_200_000);
+    sendWake("wake-reminder-2", "b");
+    fixture.advance(43_200_000);
+    const latest = sendWake("wake-reminder-3", "c");
+
+    assert.deepEqual(latest.pendingMessages.map((pending) => pending.messageSeq), [10]);
+    assert.deepEqual(latest.activeWakes.map((wake) => ({
+      wakeId: wake.wakeId,
+      messageSeqs: wake.messageSeqs,
+      status: wake.status,
+    })), [{ wakeId: "wake-reminder-3", messageSeqs: [10], status: "sent" }]);
+
+    const stored = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.deepEqual(stored.tasks["task-001"].wakeBatches.map((wake) => ({
+      wakeId: wake.wakeId,
+      status: wake.status,
+      supersededMessageSeqs: wake.supersededMessageSeqs,
+    })), [
+      { wakeId: "wake-reminder-1", status: "complete", supersededMessageSeqs: [10] },
+      { wakeId: "wake-reminder-2", status: "complete", supersededMessageSeqs: [10] },
+      { wakeId: "wake-reminder-3", status: "sent", supersededMessageSeqs: [] },
+    ]);
+    assertRegistryError(
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        processedMessageSeqs: [10],
+        wakeId: "wake-reminder-1",
+      }),
+      "ACK_NOT_ACTIVE_WAKE",
+    );
+
+    const acknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10],
+      wakeId: "wake-reminder-3",
+    });
+    assert.deepEqual(acknowledged.pendingMessages, []);
+    assert.deepEqual(acknowledged.activeWakes, []);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("a reminder supersedes only overlapping sent coverage and preserves disjoint wake work", () => {
+  const fixture = createFixture({ wakeCooldownMs: 30_000 });
+  try {
+    fixture.registry.register(taskInput({ wakeCooldownMs: 30_000 }));
+    const messages = [10, 11].map((messageSeq) => ({
+      messageSeq,
+      messageAt: `2026-07-24T08:00:${messageSeq}.000Z`,
+    }));
+    fixture.registry.observeMessages({ taskId: "task-001", expectedGeneration: 1, messages });
+    const first = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages,
+      wakeId: "wake-overlap-old",
+      promptSha256: "a".repeat(64),
+    });
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: first.wakeSentAt,
+      expectedWakeId: "wake-overlap-old",
+    });
+
+    fixture.advance(43_200_000);
+    const second = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [messages[0]],
+      wakeId: "wake-overlap-new",
+      promptSha256: "b".repeat(64),
+    });
+    const reminded = fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: second.wakeSentAt,
+      expectedWakeId: "wake-overlap-new",
+    });
+
+    assert.deepEqual(reminded.pendingMessages.map((pending) => pending.messageSeq), [10, 11]);
+    assert.deepEqual(reminded.activeWakes.map((wake) => ({ wakeId: wake.wakeId, messageSeqs: wake.messageSeqs })), [
+      { wakeId: "wake-overlap-old", messageSeqs: [11] },
+      { wakeId: "wake-overlap-new", messageSeqs: [10] },
+    ]);
+    assertRegistryError(
+      () => fixture.registry.acknowledgeWake({
+        taskId: "task-001",
+        expectedGeneration: 1,
+        processedMessageSeqs: [10],
+        wakeId: "wake-overlap-old",
       }),
       "ACK_MESSAGE_MISMATCH",
     );
+
+    const oldAcknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [11],
+      wakeId: "wake-overlap-old",
+    });
+    assert.deepEqual(oldAcknowledged.pendingMessages.map((pending) => pending.messageSeq), [10]);
+    assert.deepEqual(oldAcknowledged.activeWakes.map((wake) => ({ wakeId: wake.wakeId, messageSeqs: wake.messageSeqs })), [
+      { wakeId: "wake-overlap-new", messageSeqs: [10] },
+    ]);
+
+    const latestAcknowledged = fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [10],
+      wakeId: "wake-overlap-new",
+    });
+    assert.deepEqual(latestAcknowledged.pendingMessages, []);
+    assert.deepEqual(latestAcknowledged.activeWakes, []);
   } finally {
     fixture.cleanup();
   }

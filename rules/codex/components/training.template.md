@@ -9,11 +9,12 @@
 - 进入任务对话后显式登记 `task_id`、当前 `conversation_id`、`local_role=training`、来源/目标机器和可信对端
 - `task_id` 默认使用稳定且与任务目的有关的名称，日期、批次和重复运行写入 `run_id` 或 `generation`；既有含日期的 task 不因命名习惯变化而更换
 - 真实账号、群、机器映射和凭据只从本机私有覆盖或环境读取
-- 收到唤醒提示后自行读取当前任务消息，按需下载文件；处理完一条或多条后，用 `processed_message_seqs` 精确 ACK，未列出的继续待处理
+- 收到唤醒提示后自行读取当前任务消息，按需下载文件；处理完一条或多条后，按 `expected_generation=唤醒提示中的 generation`、原 `wake_id` 和 `processed_message_seqs` 精确 ACK，未列出的继续待处理
 - `machine_received` 只表示对端扫描到消息，`conversation_received` 表示可信消息已按绑定持久化进目标对话任务账本；wake cooldown 只延迟 UI 提醒，两种回执都不能代替业务 ACK
+- 需要回信的结构化任务必须明确识别 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`；双回执不是业务回答，预计处理超过 60 秒时先回 `IN_PROGRESS` 和新的检查时间；等待其它对话 20～30 分钟时设置一次性 `automation_update`，收到结果后撤销
 - 收到跨机投递严重告警后，维护对话立即按原 `delivery_id` 回复接警并核对两端 delivery、任务账本、router 与 wake 租约；不自动重发、不替生产对话 ACK、不关闭 task，也不为消警擅自降低生产 cooldown
 - 群聊文件下载优先遵守主人、任务 manifest、调用参数或本机/当前任务既有的稳定目录约定；都没有指定时，才默认放入当前任务根目录的 `intake/<generation-or-round>/`，不得为了套用默认值移动已经下载好的文件
-- 同一扫描内多条新消息合并处理；有新消息时冷却结束后带旧待办提醒一次，没有新消息时不定时重发旧提醒
+- 同一扫描内多条新消息合并处理；普通消息没有新内容时不定时重发。仅对明确登记的双机结构化 task，未完成消息首次持续 12 小时仍无业务 ACK 时发送一条简短去重提醒，此后每满 12 小时至多再发一条，要求核对待办、精确 ACK 已完成项并报告异常；普通群聊、主人聊天和只读群消息不受影响
 - 模型可以按任务阶段调整自己的 `wake_cooldown_ms`，但不能绕开登记、可信发送者与 ACK 约束
 - 逻辑任务迁移时，先登记新 `task_id`，双方完成握手并验证新 task 可收发，再关闭旧 task；不得先关旧 task 导致失联
 - `napcat_task_close` 会终止路由，关闭后该 task 的远端消息不会再唤醒对话；关闭前必须确认无未处理消息、无 active wake，并明确 `final_close` 或 `successor_task_id`
@@ -35,6 +36,7 @@
 - 维护前和 push 前都执行 `git fetch --prune origin`；远端较新时先快进或 rebase，再基于最新源码继续
 - 无冲突的公开更新和本机派生文件重建可直接完成，并始终保留账号、群、token、登录态、任务账本、data-root 与训练现场
 - 公共修复在隔离工作树完成实现、测试、打包与影子验证；生产切换只执行已验证版本的短热更新和健康检查，不把候选修复、长测或跨机等待串进生产停机时间
+- 无感升级默认只在生产侧执行约 1～2 分钟后端热切，不因离线研发反复占用生产窗口；确需完整重启时再核对激活器收尾、router stop/维护标记清理、连续扫描和包内 Node 驱动的 broker 开机恢复
 - 遇到未提交修改、合并冲突、私有配置可能被覆盖、活跃训练依赖当前服务、必须重启 broker/NapCat/QQ 或回滚路径不明时，停止自动覆盖并请示主人
 - push 或 pull 后刷新本机受影响的 profile/MCP；开发机同步包由开发机维护，训练机只回报实际 commit 和 `package_refresh_required=true`，宣称「最新」前核对来源 commit 与实际内容
 

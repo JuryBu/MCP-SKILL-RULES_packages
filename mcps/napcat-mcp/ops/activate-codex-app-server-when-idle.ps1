@@ -1,19 +1,24 @@
 [CmdletBinding()]
 param(
-  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }),
+  [string]$DataRoot = "",
   [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
   [string]$SupervisorTaskName = "CodexNapCatSupervisor",
-  [ValidateRange(10, 900)][int]$TimeoutSeconds = 600,
-  [ValidateRange(500, 10000)][int]$IdleConfirmMilliseconds = 1500
+  [ValidateRange(1, 900)][int]$TimeoutSeconds = 600,
+  [ValidateRange(500, 10000)][int]$IdleConfirmMilliseconds = 1500,
+  [switch]$CancelPendingActivation
 )
 
 $ErrorActionPreference = "Stop"
 $OpsRoot = $PSScriptRoot
+. (Join-Path $OpsRoot "resolve-napcat-data-root.ps1")
+$BrokerRoot = Resolve-NapCatBrokerRoot -ExplicitBrokerRoot $BrokerRoot
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $BrokerRoot
 $StateRoot = Join-Path $DataRoot "state"
 $ActivationStatePath = Join-Path $StateRoot "codex-app-server-pending-activation.json"
 $ActivationLockPath = Join-Path $StateRoot "napcat-bridge-update.lock"
 $AlertPath = Join-Path $StateRoot "automation-alert.json"
 $MaintenancePath = Join-Path $StateRoot "task-router.maintenance.json"
+$StopFilePath = Join-Path $StateRoot "task-router.stop"
 $UpdateStatePath = Join-Path $StateRoot "napcat-bridge-last-update.json"
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
@@ -51,6 +56,27 @@ function Set-ActivationMaintenance {
   }
 }
 
+function Restore-AutomationAfterDeferredActivation {
+  Remove-Item -LiteralPath $StopFilePath -Force -ErrorAction SilentlyContinue
+  Set-ActivationMaintenance -Active $false
+
+  $ProxyStart = & (Join-Path $OpsRoot "start-codex-app-server-proxy.ps1") -DataRoot $DataRoot | ConvertFrom-Json
+  $SupervisorStart = & (Join-Path $OpsRoot "start-napcat-supervisor.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot | ConvertFrom-Json
+  $RouterStart = & (Join-Path $OpsRoot "start-napcat-task-router.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot | ConvertFrom-Json
+  if ([int]$SupervisorStart.pid -le 0 -or [int]$RouterStart.pid -le 0) {
+    throw "Deferred activation cleanup did not restore the supervisor and task router."
+  }
+  try { Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction Stop } catch {
+    if ($null -ne (Get-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction SilentlyContinue)) { throw }
+  }
+
+  return [pscustomobject]@{
+    proxy = $ProxyStart
+    supervisor = $SupervisorStart
+    router = $RouterStart
+  }
+}
+
 $ActivationLockStream = $null
 try {
   $ActivationLockStream = [System.IO.File]::Open($ActivationLockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
@@ -59,6 +85,23 @@ try {
 }
 
 try {
+  if ($CancelPendingActivation) {
+    $Restored = Restore-AutomationAfterDeferredActivation
+    Write-State -State "cancelled" -Message "Pending activation was cancelled; staged files remain retryable and automation was restored."
+    [pscustomobject]@{ ok = $true; cancelled = $true; retryable = $true; supervisorPid = $Restored.supervisor.pid; taskRouterPid = $Restored.router.pid } | ConvertTo-Json -Depth 8
+    exit 0
+  }
+
+  if (Test-Path -LiteralPath $UpdateStatePath -PathType Leaf) {
+    $ExistingUpdateState = Get-Content -LiteralPath $UpdateStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($ExistingUpdateState.activated -eq $true -and $ExistingUpdateState.pendingActivation -ne $true) {
+      $Restored = Restore-AutomationAfterDeferredActivation
+      Write-State -State "ready" -Message "Activation was already complete; lifecycle finalization was applied idempotently."
+      [pscustomobject]@{ ok = $true; alreadyActivated = $true; supervisorPid = $Restored.supervisor.pid; taskRouterPid = $Restored.router.pid } | ConvertTo-Json -Depth 8
+      exit 0
+    }
+  }
+
   $StopWatchdogScript = Join-Path $OpsRoot "stop-napcat-supervisor-watchdog.ps1"
   if (-not (Test-Path -LiteralPath $StopWatchdogScript)) { throw "Supervisor watchdog stop script is missing: $StopWatchdogScript" }
   & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
@@ -84,7 +127,10 @@ try {
     Start-Sleep -Milliseconds 250
   } while ([DateTime]::UtcNow -lt $Deadline)
   if ($null -eq $IdleSince -or ([DateTime]::UtcNow - $IdleSince).TotalMilliseconds -lt $IdleConfirmMilliseconds) {
-    throw "Codex Desktop did not disconnect before the activation timeout."
+    $Restored = Restore-AutomationAfterDeferredActivation
+    Write-State -State "retryable_timeout" -Message "Codex Desktop did not disconnect before the activation timeout; staging remains retryable and automation was restored."
+    [pscustomobject]@{ ok = $false; retryable = $true; timedOut = $true; supervisorPid = $Restored.supervisor.pid; taskRouterPid = $Restored.router.pid } | ConvertTo-Json -Depth 8
+    exit 2
   }
 
   Write-State -State "activating" -Message "Codex Desktop is idle; activating the staged NapCat bridge."
@@ -104,8 +150,9 @@ try {
   if ($FinalStatus.ok -ne $true -or $FinalStatus.runtime.state -ne "running" -or $FinalStatus.runtime.automationEnabled -ne $true) {
     throw "The staged proxy did not become healthy after activation."
   }
-  $SupervisorStart = & (Join-Path $OpsRoot "start-napcat-supervisor.ps1") -DataRoot $DataRoot -BrokerRoot $BrokerRoot | ConvertFrom-Json
-  $RouterStart = & (Join-Path $OpsRoot "start-napcat-task-router.ps1") -DataRoot $DataRoot | ConvertFrom-Json
+  $Restored = Restore-AutomationAfterDeferredActivation
+  $SupervisorStart = $Restored.supervisor
+  $RouterStart = $Restored.router
   $SupervisorStatus = & (Join-Path $OpsRoot "get-napcat-supervisor-status.ps1") -DataRoot $DataRoot -TaskName $SupervisorTaskName | ConvertFrom-Json
   if ($SupervisorStatus.alive -ne $true -or [int]$RouterStart.pid -le 0) {
     throw "The staged supervisor or task router did not become healthy after activation."
@@ -139,7 +186,9 @@ try {
   })
 } catch {
   $Message = $_.Exception.Message
-  Set-ActivationMaintenance -Active $true -Code "PENDING_ACTIVATION_FAILED" -Message $Message
+  $RestoreError = $null
+  try { Restore-AutomationAfterDeferredActivation | Out-Null } catch { $RestoreError = $_.Exception.Message }
+  Set-ActivationMaintenance -Active $false
   Write-State -State "failed" -Message $Message
   $Alert = [ordered]@{
     schemaVersion = 1
@@ -151,19 +200,10 @@ try {
     code = "PENDING_ACTIVATION_FAILED"
     message = $Message
     text = "[Codex automatic wake upgrade failed]`n$Message`nCodex Desktop was not terminated; inspect the local activation state."
+    automationRestoreError = $RestoreError
   }
   [System.IO.File]::WriteAllText($AlertPath, (($Alert | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
   exit 1
 } finally {
   if ($null -ne $ActivationLockStream) { $ActivationLockStream.Dispose() }
-  try {
-    Start-ScheduledTask -TaskName $SupervisorTaskName -ErrorAction Stop
-  } catch {
-    $RestartMessage = $_.Exception.Message
-    $ExistingAlert = if (Test-Path -LiteralPath $AlertPath) { try { Get-Content -LiteralPath $AlertPath -Raw -Encoding UTF8 | ConvertFrom-Json } catch { [pscustomobject]@{} } } else { [pscustomobject]@{} }
-    $ExistingAlert | Add-Member -NotePropertyName pending -NotePropertyValue $true -Force
-    $ExistingAlert | Add-Member -NotePropertyName status -NotePropertyValue "pending" -Force
-    $ExistingAlert | Add-Member -NotePropertyName watchdogRestartError -NotePropertyValue $RestartMessage -Force
-    [System.IO.File]::WriteAllText($AlertPath, (($ExistingAlert | ConvertTo-Json -Depth 10) + "`n"), $Utf8NoBom)
-  }
 }

@@ -1,10 +1,13 @@
 ﻿[CmdletBinding()]
 param(
   [ValidateRange(1, 120)][int]$WaitSeconds = 20,
-  [string]$DataRoot = $(if ($env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT) { $env:CODEX_TOOLKIT_NAPCAT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" })
+  [string]$DataRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+$ResolverBrokerRoot = if (Get-Variable -Name BrokerRoot -ErrorAction SilentlyContinue) { [string]$BrokerRoot } else { "" }
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $ResolverBrokerRoot
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $StateDirectory = Join-Path $DataRoot "state"
 $RuntimeStatePath = Join-Path $StateDirectory "supervisor-runtime.json"

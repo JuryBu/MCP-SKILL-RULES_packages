@@ -108,11 +108,26 @@ const textInputSchema = {
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时发送可按任务精确读取的结构化消息。" },
     source_machine: { ...canonicalMachineRoleSchema, description: "可选来源机器标准角色。" },
     target_machine: { ...canonicalMachineRoleSchema, description: "可选目标机器标准角色。" },
+    reply_required: { type: "boolean", description: "结构化任务是否要求业务回复；运输回执 machine_received/conversation_received 不算业务回复。" },
+    expected_reply: { type: "string", minLength: 1, maxLength: 240, description: "reply_required=true 时最终必须返回的固定业务回复。预计超过 60 秒可先回 IN_PROGRESS，但不能替代该最终回复。" },
+    reply_deadline_at: { type: "string", format: "date-time", description: "可选最终业务回复截止时间。" },
+    next_check_at: { type: "string", format: "date-time", description: "可选下一次状态检查时间；用于超过 60 秒的处理中状态。" },
   },
   required: ["text", "dedupe_key"],
   allOf: [{
     if: { required: ["task_id"] },
     then: { required: ["source_machine", "target_machine"] },
+  }, {
+    if: { anyOf: [
+      { required: ["reply_required"] },
+      { required: ["expected_reply"] },
+      { required: ["reply_deadline_at"] },
+      { required: ["next_check_at"] },
+    ] },
+    then: { required: ["task_id"] },
+  }, {
+    if: { properties: { reply_required: { const: true } }, required: ["reply_required"] },
+    then: { required: ["expected_reply"] },
   }],
   additionalProperties: false,
 };
@@ -191,7 +206,7 @@ const taskIdentityInputSchema = {
   type: "object",
   properties: {
     task_id: { type: "string", minLength: 1, maxLength: 128 },
-    expected_generation: { type: "integer", minimum: 1 },
+    expected_generation: { type: "integer", minimum: 1, description: "参数名必须是 expected_generation，值原样使用当前 [NAPCAT_TASK_WAKE] 唤醒提示中的 generation。" },
   },
   required: ["task_id", "expected_generation"],
   additionalProperties: false,
@@ -237,14 +252,14 @@ const taskAckInputSchema = {
   type: "object",
   properties: {
     task_id: { type: "string", minLength: 1, maxLength: 128 },
-    expected_generation: { type: "integer", minimum: 1 },
+    expected_generation: { type: "integer", minimum: 1, description: "参数名必须是 expected_generation，值原样使用当前 [NAPCAT_TASK_WAKE] 唤醒提示中的 generation。" },
     message_seq: { type: "integer", minimum: 0, maximum: 9007199254740991, description: "兼容升级前已发出的旧唤醒；新唤醒应使用 processed_message_seqs。" },
     processed_message_seqs: {
       type: "array",
       minItems: 1,
       uniqueItems: true,
       items: { type: "integer", minimum: 0, maximum: 9007199254740991 },
-      description: "本次实际处理完成的一条或多条 QQ message_seq；只能选择 wake_id 覆盖的消息。",
+      description: "只列本次实际处理完成的一条或多条 QQ message_seq；未完成项不得列入，只能选择 wake_id 覆盖的消息。",
     },
     wake_id: { type: "string", minLength: 1, maxLength: 256, description: "[NAPCAT_TASK_WAKE] 提示中的 wake_id；新协议唤醒必须原样回传。" },
   },
@@ -294,6 +309,25 @@ const ownerRouteInputSchema = {
     target_key: { type: "string", minLength: 1, maxLength: 64 },
   },
   required: ["route_key", "conversation_id"],
+  additionalProperties: false,
+};
+
+const ownerRouteMigrateInputSchema = {
+  type: "object",
+  properties: {
+    route_key: { type: "string", minLength: 1, maxLength: 256 },
+    expected_conversation_id: { type: "string", minLength: 1, maxLength: 256, description: "迁移前已关闭 route 的精确 conversation_id。" },
+    expected_task_id: {
+      anyOf: [
+        { type: "string", minLength: 1, maxLength: 128 },
+        { type: "null" },
+      ],
+      description: "迁移前已关闭 route 的精确 task_id；旧值为空时必须显式传 null。",
+    },
+    expected_target_key: { type: "string", minLength: 1, maxLength: 256, description: "迁移前已关闭 route 的精确 target_key。" },
+    conversation_id: { type: "string", minLength: 1, maxLength: 256, description: "迁移后的新 conversation_id，必须与旧值不同。" },
+  },
+  required: ["route_key", "expected_conversation_id", "expected_task_id", "expected_target_key", "conversation_id"],
   additionalProperties: false,
 };
 
@@ -386,7 +420,7 @@ const tools = [
   },
   {
     name: "napcat_task_ack",
-    description: "目标对话按消息精确确认处理结果。新唤醒使用提示中的 generation、wake_id，并在 processed_message_seqs 中列出实际处理完成的一条或多条消息；未列出的消息继续待处理。message_seq 不保证数字递增。",
+    description: "目标对话按消息精确确认处理结果。参数 expected_generation 必须原样使用唤醒提示中的 generation，wake_id 也必须原样回传；processed_message_seqs 只列实际处理完成项，未列消息继续待处理。message_seq 不保证数字递增。",
     inputSchema: taskAckInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   },
@@ -413,6 +447,12 @@ const tools = [
     description: "关闭主人通知 route_key，之后不再把 QQ 回复注入该 Codex 对话。",
     inputSchema: { type: "object", properties: { route_key: { type: "string", minLength: 1, maxLength: 256 } }, required: ["route_key"], additionalProperties: false },
     annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_owner_route_migrate",
+    description: "显式迁移同一 route_key 的目标 Codex 对话。仅允许 existing route 已关闭且 bufferedOwnerMessages（缓冲消息）为空时执行，必须精确提供旧 conversation/target/task 身份；保留入站游标与历史基线，清除 closedAt 后重新打开。普通 napcat_owner_route_register 仍保持不可变字段，不能静默迁移。",
+    inputSchema: ownerRouteMigrateInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
   },
   {
     name: "napcat_owner_alert",
@@ -497,7 +537,7 @@ const controlPlane = createControlPlane({
   bridge: { wake: async () => { throw new Error("入站唤醒只由 task router 执行"); } },
 });
 const server = new Server(
-  { name: "codex-napcat-training-notifier", version: "0.3.0" },
+  { name: "codex-napcat-training-notifier", version: "0.3.13" },
   {
     capabilities: {
       tools: { listChanged: false },
@@ -610,6 +650,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_owner_route_close") {
       return textResult({ ok: true, route: controlPlane.closeOwnerRoute(args) });
+    }
+    if (name === "napcat_owner_route_migrate") {
+      return textResult({ ok: true, route: controlPlane.migrateOwnerRoute(args), router: taskRouterController.ensureStarted() });
     }
     if (name === "napcat_owner_alert") {
       return textResult({ ok: true, ...(await controlPlane.sendOwnerAlert(args)) });

@@ -74,9 +74,11 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。`task_id` 应表示长期任务身份，不把每次运行日期当成默认组成；重复实验日期、时间和批次放在 `run_id` 或当前 generation 中。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
 
-唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；提交成功后应用每任务默认 10 分钟冷却。冷却期间到达的新消息进入持久消息账本，不会重置冷却截止时间；时间满足后只合并唤醒一次。没有新消息时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送。
+唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；提交成功后应用每任务默认 10 分钟冷却。冷却期间到达的新消息进入持久消息账本，不会重置冷却截止时间；时间满足后只合并唤醒一次。普通消息没有新内容时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送；只有明确登记的双机结构化 task 在 pending 首次持续 12 小时且没有业务 ACK 时，才允许发送一条简短去重提醒，此后每满 12 小时至多再发一条，普通群聊、主人聊天和只读群消息不参与。
 
-每次唤醒携带 `wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack` 回传当前 generation、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
+每次唤醒携带 `generation`、`wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack`，明确传 `expected_generation=唤醒提示中的 generation`、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中只列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
+
+需要对端业务回信的结构化任务在正文或索引中显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。`machine_received` 与 `conversation_received` 只证明运输链路，不是业务回信；预计处理超过 60 秒时接收方先回 `IN_PROGRESS` 和新的检查时间。发送方等待其它对话 20～30 分钟时设置一次性 `automation_update` 叫回检查，收到回信后撤销，避免两端互等。
 
 生产对话已经长期空闲、但旧版留下多批 `sent` 唤醒且待处理消息仍不能判定完成时，只能使用 `ops/rearm-stale-sent-wake.mjs` 做受控重新提醒。先用 `--prepare` 固定 registry/dedupe/router log 哈希、任务绑定、精确 pending 与 wake 身份，再在确认对话空闲和业务进程为 0 后用 `--execute`；脚本会备份三文件、归档旧 wake、保持消息与 ACK 状态不变，并向同一对话注入恰好一个随机新 `wake_id`。任一身份或文件漂移都会拒绝执行，注入失败则恢复备份；禁止用它代 ACK、清 pending、换 generation 或启动新业务。
 
@@ -104,6 +106,8 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 仅修改 NapCat MCP 后端与任务路由、透明中转相关文件哈希完全未变时，可同时传 `-BackendOnlyHotReload`。升级器会证明代理关键文件逐个相同，只重载 NapCat broker 子进程并重启监督器和任务路由器，不结束 Codex，也不中断当前透明代理连接；任一代理文件变化时会拒绝该模式，必须改走完整升级。
 
+维护发布按无感升级设计：实现、测试、干净包、回滚演练和双端影子验证全部在隔离环境完成，生产侧只执行已验证候选的约 1～2 分钟后端热切与健康检查，通常不需要生产停工，也不应反复找业务主线开放窗口。只有实时业务确实依赖该信道、存在不可保护状态或必须完整切换代理时，才携带候选身份、回滚入口和实时门槛协调一次短窗口。
+
 ## Codex App Server 透明中转
 
 原生蓝点和侧边栏未读状态只会出现在 Codex Desktop 自己持有的 App Server 连接上。直接启动另一份 App Server 虽然能把文字写进对话存储，却不能通知当前 Desktop 刷新。可选透明中转使用下面的连接方式，把 Desktop 的原始流量双向转发给官方 App Server，同时允许 NapCat 在同一条已初始化连接上先恢复已登记任务，再提交一条带 `wake_id` 的唤醒消息：
@@ -116,6 +120,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 `18432` 是 Codex Desktop 始终使用的固定入口；透明中转先监听该端口，再探测或启动官方 App Server。Desktop 提前连接时，初始化请求会留在内存队列中并在上游就绪后继续发送，避免开机竞态表现成 `ECONNREFUSED` 或 WebSocket 1005。官方 App Server 的上游端口只在本机回环地址中使用。受管 App Server 停止时最长等待 120 秒，并同时确认子进程和仍由真实进程承载的监听都已消失；Windows 端口表若只残留一个查不到进程实体的旧 PID，则记录为 `staleListener`，允许新代理改用空闲回环端口，不能因此把升级永久卡在维护态。默认上游端口被真实历史进程占用时同样选择空闲端口并记录实际地址；所有可结束实例仍须通过精确 PID、命令行、路径和端口校验，禁止按进程名结束 Codex。代理运行期间还会比较当前最新 `codex.exe` 的路径、修改时间和文件大小；只有 Desktop 已断开、代理客户端数为 0，并且新候选通过独立探针时，才结束旧受管 App Server 并切换到新版本，避免 Codex 更新后长期沿用旧 App Server，也避免在线会话被强制中断。
 
 更新脚本不会终止 Codex Desktop。便携包会启动隐藏激活器，等待当前 Codex 与代理连接自然断开后，再干净重启受管代理并热重载 NapCat backend；用户只需正常退出 Codex、等待约 10 秒后重新打开，不需要重启 Windows。
+
+未来版本若确需退出 Codex 或重启 Windows，验收必须覆盖最后收尾而不只看代码复制：激活器应完成 `activated=true`、`pendingActivation=false`、`restartCodexRequired=false`；超时、撤销或失败应恢复 router 并清除本次维护留下的 `task-router.stop`/maintenance；Windows 登录后共享 broker 必须使用包内 Node 绝对路径自动启动，再核对 router 连续扫描、open task 与私有账本无漂移。任一项未满足都不能报升级完成。
 
 控制端口只监听回环地址并要求随机 Bearer token。task router 会从任务账本所在的 `state` 目录自动发现 `codex-app-server-proxy-runtime.json` 与 `codex-app-server-proxy-token.txt`；发现任一代理产物后必须走透明中转，配置残缺或代理不可达时暂停自动唤醒并报错，禁止静默退回独立 App Server。任务订阅同时绑定 `task_id`、generation、conversation ID、本机角色、来源/目标机器和可信 QQ，订阅接口只登记绑定并确认 Desktop 在线，真正唤醒时才执行一次 `thread/resume`。同一个 `wake_id` 在任何并发、超时或重启情况下最多提交一次。可见模式的 `clientUserMessageId` 在请求发送前写入唤醒日志，同一次逻辑唤醒重试只复用原值，不把 UUID 当作去重边界。若 App Server 在正常会话中退出，透明中转保留 Desktop WebSocket，暂停自动唤醒，按退避重启官方进程，并在恢复后使用缓存的初始化参数重建上游连接。已经写出但没有得到确定结果的 `turn/start` 或 `turn/steer` 记为 `unknown`，不会自动补发。proxy、supervisor 和 task router 的单实例恢复同时核对 PID、runner 路径、runtime/lock 路径、随机实例 token 与状态新鲜度，不能只因某个 PID 仍存在就认定旧实例健康。
 

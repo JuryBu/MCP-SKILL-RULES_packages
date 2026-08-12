@@ -1,11 +1,13 @@
 ﻿[CmdletBinding()]
 param(
-  [string]$DataRoot = (Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp"),
+  [string]$DataRoot = "",
   [ValidateRange(2, 60)][int]$WaitSeconds = 15,
   [switch]$ForceAfterTimeout
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $RunnerPath = Join-Path $NapCatMcpRoot "src\heartbeat-runner.mjs"
 $RuntimeStatePath = Join-Path $DataRoot "state\heartbeat-runtime.json"

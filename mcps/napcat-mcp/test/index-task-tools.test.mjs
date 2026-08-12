@@ -5,6 +5,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { spawn } from "node:child_process";
 import test from "node:test";
+import { createNapCatNotifier } from "../src/core.mjs";
 
 function startMcp() {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-task-mcp-"));
@@ -76,6 +77,39 @@ function toolPayload(response) {
   return JSON.parse(text);
 }
 
+function createPreviewNotifier() {
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-task-preview-"));
+  const bindingPath = path.join(temporaryRoot, "binding.json");
+  fs.writeFileSync(bindingPath, `${JSON.stringify({
+    schemaVersion: 1,
+    bindingName: "task-preview",
+    expectedSelfId: "1000000002",
+    expectedNickname: "测试账号",
+    groupId: "123456789",
+    groupName: "ExampleGroup",
+    expectedMemberCount: 4,
+    allowedEvents: ["test"],
+    minimumHeartbeatMinutes: 5,
+    dedupeRetentionDays: 30,
+    requireGroupIdentityCheckBeforeSend: true,
+    requireMessageVerification: true,
+  }, null, 2)}\n`, "utf8");
+  return {
+    temporaryRoot,
+    notifier: createNapCatNotifier({
+      env: {
+        NAPCAT_MCP_BINDING_PATH: bindingPath,
+        NAPCAT_MCP_STATE_PATH: path.join(temporaryRoot, "dedupe.json"),
+        NAPCAT_ALLOW_EMPTY_TOKEN: "1",
+      },
+      fetchImpl: async () => {
+        throw new Error("preview must stay offline");
+      },
+      now: () => new Date("2026-08-12T10:00:00.000Z"),
+    }),
+  };
+}
+
 test("MCP task tools register, rebind, reject stale generation, and close", async () => {
   const fixture = startMcp();
   try {
@@ -85,6 +119,7 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       clientInfo: { name: "task-tool-test", version: "1.0.0" },
     });
     assert.equal(initialize.error, undefined);
+    assert.equal(initialize.result.serverInfo.version, "0.3.13");
     fixture.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
     const listedTools = await fixture.request("tools/list", {});
@@ -97,6 +132,7 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       "napcat_task_status",
       "napcat_task_router_status",
       "napcat_task_ack",
+      "napcat_owner_route_migrate",
     ]) {
       assert.equal(names.includes(name), true, `缺少工具：${name}`);
     }
@@ -105,12 +141,33 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       ["task_id", "source_machine", "target_machine"].filter((field) => !sendFileTool.inputSchema.properties[field]),
       [],
     );
+    const sendTextTool = listedTools.result.tools.find((tool) => tool.name === "napcat_send_text");
+    assert.deepEqual(
+      ["reply_required", "expected_reply", "reply_deadline_at", "next_check_at"]
+        .filter((field) => !sendTextTool.inputSchema.properties[field]),
+      [],
+    );
     const taskUpdateTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_update");
     assert.equal(Boolean(taskUpdateTool.inputSchema.properties.wake_cooldown_ms), true);
     const taskAckTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_ack");
     assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.type, "array");
     assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.uniqueItems, true);
+    assert.match(taskAckTool.inputSchema.properties.expected_generation.description, /expected_generation/);
+    assert.match(taskAckTool.inputSchema.properties.expected_generation.description, /唤醒提示.*generation/);
+    assert.match(taskAckTool.inputSchema.properties.processed_message_seqs.description, /实际处理完成/);
+    assert.match(taskAckTool.description, /expected_generation/);
     assert.deepEqual(taskAckTool.inputSchema.anyOf[0].required, ["processed_message_seqs", "wake_id"]);
+    const ownerRouteMigrateTool = listedTools.result.tools.find((tool) => tool.name === "napcat_owner_route_migrate");
+    assert.deepEqual(ownerRouteMigrateTool.inputSchema.required, [
+      "route_key",
+      "expected_conversation_id",
+      "expected_task_id",
+      "expected_target_key",
+      "conversation_id",
+    ]);
+    assert.match(ownerRouteMigrateTool.description, /已关闭/);
+    assert.match(ownerRouteMigrateTool.description, /缓冲.*为空/);
+    assert.match(ownerRouteMigrateTool.description, /普通.*register.*不可变/);
 
     const registered = toolPayload(await fixture.request("tools/call", {
       name: "napcat_task_register",
@@ -183,5 +240,37 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
     assert.deepEqual(listed.tasks.map((task) => task.taskId), ["语音处理"]);
   } finally {
     await fixture.close();
+  }
+});
+
+test("task text reply contract is explicit and taskless messages cannot opt in", () => {
+  const fixture = createPreviewNotifier();
+  try {
+    const preview = fixture.notifier.previewTextMessage({
+      text: "开始执行",
+      task_id: "protocol-e2e",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "protocol-e2e:start",
+      reply_required: true,
+      expected_reply: "PROTOCOL_E2E_COMPLETED",
+      reply_deadline_at: "2026-08-12T12:00:00.000Z",
+      next_check_at: "2026-08-12T10:30:00.000Z",
+    });
+    assert.match(preview.message, /reply_required：true/);
+    assert.match(preview.message, /expected_reply：PROTOCOL_E2E_COMPLETED/);
+    assert.match(preview.message, /reply_deadline_at：2026-08-12T12:00:00.000Z/);
+    assert.match(preview.message, /next_check_at：2026-08-12T10:30:00.000Z/);
+    assert.throws(
+      () => fixture.notifier.previewTextMessage({
+        text: "普通群聊",
+        dedupe_key: "plain-message",
+        reply_required: true,
+        expected_reply: "SHOULD_NOT_APPLY",
+      }),
+      (error) => error.code === "INVALID_ARGUMENT",
+    );
+  } finally {
+    fs.rmSync(fixture.temporaryRoot, { recursive: true, force: true });
   }
 });

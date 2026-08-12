@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { renameReplaceSync } from "./atomic-file.mjs";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { createStaleSentWakeRearmPlan } from "./stale-sent-wake-rearm.mjs";
@@ -95,6 +95,11 @@ function optionalString(value, name, maximum = 512) {
   return normalized;
 }
 
+function optionalDate(value, name) {
+  if (value === undefined || value === null || value === "") return null;
+  return toDate(value, name).toISOString();
+}
+
 function standardMachineRole(value, name) {
   const role = optionalString(value, name, 64);
   if (role === null) return null;
@@ -163,12 +168,18 @@ function clonePublicTask(task) {
       messageSeq: message.messageSeq,
       messageAt: message.messageAt,
       lastRemindedAt: message.lastRemindedAt,
+      ...(message.replyRequired ? {
+        replyRequired: true,
+        expectedReply: message.expectedReply,
+        replyDeadlineAt: message.replyDeadlineAt,
+        nextCheckAt: message.nextCheckAt,
+      } : {}),
     }));
   const activeWakes = (task.wakeBatches ?? [])
     .filter((wake) => wake.status !== "complete")
     .map((wake) => ({
       wakeId: wake.wakeId,
-      messageSeqs: wake.messageSeqs.filter((sequence) =>
+      messageSeqs: effectiveWakeMessageSeqs(wake).filter((sequence) =>
         pendingMessages.some((message) => message.messageSeq === sequence)
       ),
       leaseStartedAt: wake.leaseStartedAt,
@@ -185,12 +196,16 @@ function clonePublicTask(task) {
   return result;
 }
 
-function messageRecord(sequence, at, status = "pending", lastRemindedAt = null) {
+function messageRecord(sequence, at, status = "pending", lastRemindedAt = null, replyContract = {}) {
   return {
     messageSeq: sequence,
     messageAt: at,
     status,
     lastRemindedAt,
+    replyRequired: replyContract.replyRequired === true,
+    expectedReply: replyContract.expectedReply ?? null,
+    replyDeadlineAt: replyContract.replyDeadlineAt ?? null,
+    nextCheckAt: replyContract.nextCheckAt ?? null,
   };
 }
 
@@ -200,15 +215,20 @@ function pendingSequenceSet(task) {
     .map((message) => message.messageSeq));
 }
 
+function effectiveWakeMessageSeqs(wake) {
+  const superseded = new Set(wake.supersededMessageSeqs ?? []);
+  return wake.messageSeqs.filter((sequence) => !superseded.has(sequence));
+}
+
 function refreshLegacyWakeFields(task) {
   const pendingSequences = pendingSequenceSet(task);
   for (const wake of task.wakeBatches ?? []) {
-    const remaining = wake.messageSeqs.filter((sequence) => pendingSequences.has(sequence));
+    const remaining = effectiveWakeMessageSeqs(wake).filter((sequence) => pendingSequences.has(sequence));
     if (!remaining.length) wake.status = "complete";
   }
   const latestWake = (task.wakeBatches ?? [])
     .filter((wake) => wake.status !== "complete")
-    .filter((wake) => wake.messageSeqs.some((sequence) => pendingSequences.has(sequence)))
+    .filter((wake) => effectiveWakeMessageSeqs(wake).some((sequence) => pendingSequences.has(sequence)))
     .sort((left, right) => Date.parse(left.leaseStartedAt) - Date.parse(right.leaseStartedAt))
     .at(-1) ?? null;
   task.wakePending = latestWake !== null;
@@ -257,6 +277,12 @@ function normalizeStoredTask(task, sourceSchemaVersion = STATE_SCHEMA_VERSION) {
       }
     }
   }
+  for (const message of task.messageLedger) {
+    if (!hasOwn(message, "replyRequired")) message.replyRequired = false;
+    if (!hasOwn(message, "expectedReply")) message.expectedReply = null;
+    if (!hasOwn(message, "replyDeadlineAt")) message.replyDeadlineAt = null;
+    if (!hasOwn(message, "nextCheckAt")) message.nextCheckAt = null;
+  }
   if (!Array.isArray(task.wakeBatches)) {
     task.wakeBatches = [];
     if (task.wakePending && task.wakeMessageSeq !== null && task.wakeMessageAt !== null) {
@@ -271,9 +297,13 @@ function normalizeStoredTask(task, sourceSchemaVersion = STATE_SCHEMA_VERSION) {
         promptSha256: task.wakePromptSha256,
         status: legacyWakeSentAt === null ? "leased" : "sent",
         acknowledgedSeqs: [],
+        supersededMessageSeqs: [],
         legacy: true,
       });
     }
+  }
+  for (const wake of task.wakeBatches) {
+    if (!Array.isArray(wake.supersededMessageSeqs)) wake.supersededMessageSeqs = [];
   }
   return refreshLegacyWakeFields(task);
 }
@@ -360,6 +390,16 @@ function validateStoredTask(task, taskId, statePath) {
     if (message.lastRemindedAt !== null) {
       storedDate(message.lastRemindedAt, `${taskId}.messageLedger.lastRemindedAt`, statePath);
     }
+    if (typeof message.replyRequired !== "boolean") invalidState(statePath, `消息回复要求无效（${taskId}.${message.messageSeq}）`);
+    if (message.replyRequired) {
+      if (typeof message.expectedReply !== "string" || !message.expectedReply.trim()) {
+        invalidState(statePath, `消息固定回复无效（${taskId}.${message.messageSeq}）`);
+      }
+    } else if (message.expectedReply !== null || message.replyDeadlineAt !== null || message.nextCheckAt !== null) {
+      invalidState(statePath, `无回复任务携带回复合同（${taskId}.${message.messageSeq}）`);
+    }
+    if (message.replyDeadlineAt !== null) storedDate(message.replyDeadlineAt, `${taskId}.messageLedger.replyDeadlineAt`, statePath);
+    if (message.nextCheckAt !== null) storedDate(message.nextCheckAt, `${taskId}.messageLedger.nextCheckAt`, statePath);
   }
   if (!Array.isArray(task.wakeBatches)) invalidState(statePath, `唤醒批次账本无效（${taskId}）`);
   const seenWakeIds = new Set();
@@ -385,6 +425,10 @@ function validateStoredTask(task, taskId, statePath) {
     storedDate(wake.leaseStartedAt, `${taskId}.wakeBatches.leaseStartedAt`, statePath);
     if (wake.sentAt !== null) storedDate(wake.sentAt, `${taskId}.wakeBatches.sentAt`, statePath);
     if (!Array.isArray(wake.acknowledgedSeqs)) invalidState(statePath, `唤醒批次 ACK 列表无效（${taskId}.${wake.wakeId}）`);
+    if (!Array.isArray(wake.supersededMessageSeqs)
+      || wake.supersededMessageSeqs.some((sequence) => !wake.messageSeqs.includes(sequence))) {
+      invalidState(statePath, `唤醒批次覆盖归档无效（${taskId}.${wake.wakeId}）`);
+    }
   }
   storedDate(task.createdAt, `${taskId}.createdAt`, statePath);
   storedDate(task.updatedAt, `${taskId}.updatedAt`, statePath);
@@ -501,7 +545,7 @@ function acquireFileLock(lockPath, timeoutMs, retryMs, staleLockMs) {
   }
 }
 
-function atomicWriteState(statePath, state) {
+function atomicWriteBytes(statePath, bytes) {
   fs.mkdirSync(path.dirname(statePath), { recursive: true });
   const temporaryPath = path.join(
     path.dirname(statePath),
@@ -510,7 +554,7 @@ function atomicWriteState(statePath, state) {
   let descriptor;
   try {
     descriptor = fs.openSync(temporaryPath, "wx", 0o600);
-    fs.writeFileSync(descriptor, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+    fs.writeFileSync(descriptor, bytes);
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
@@ -523,6 +567,10 @@ function atomicWriteState(statePath, state) {
     }
     throw new TaskRegistryError("STATE_WRITE_FAILED", `无法原子写入账本：${statePath}`, { statePath }, { cause: error });
   }
+}
+
+function atomicWriteState(statePath, state) {
+  atomicWriteBytes(statePath, Buffer.from(`${JSON.stringify(state, null, 2)}\n`, "utf8"));
 }
 
 function parseTaskId(input) {
@@ -549,9 +597,24 @@ function parseObservedMessages(input) {
   if (!Array.isArray(source) || !source.length) invalidArgument("messages 必须是非空数组");
   return source.map((message) => {
     if (!isPlainObject(message)) invalidArgument("messages 中的每项必须是对象");
+    if (message.replyRequired !== undefined && typeof message.replyRequired !== "boolean") {
+      invalidArgument("replyRequired 必须是布尔值");
+    }
+    const replyRequired = message.replyRequired === true;
+    const expectedReply = optionalString(message.expectedReply, "expectedReply", 240);
+    const replyDeadlineAt = optionalDate(message.replyDeadlineAt, "replyDeadlineAt");
+    const nextCheckAt = optionalDate(message.nextCheckAt, "nextCheckAt");
+    if (replyRequired && expectedReply === null) invalidArgument("replyRequired=true 时 expectedReply 不能为空");
+    if (!replyRequired && (expectedReply !== null || replyDeadlineAt !== null || nextCheckAt !== null)) {
+      invalidArgument("无回复任务不能携带 expectedReply、replyDeadlineAt 或 nextCheckAt");
+    }
     return {
       messageSeq: parseSequence(message, "messageSeq", ["messageSeq", "message_seq", "seq"]),
       messageAt: toDate(message.messageAt ?? message.message_time ?? message.at, "messageAt").toISOString(),
+      replyRequired,
+      expectedReply,
+      replyDeadlineAt,
+      nextCheckAt,
     };
   }).sort((left, right) => Date.parse(left.messageAt) - Date.parse(right.messageAt));
 }
@@ -918,16 +981,22 @@ class TaskRegistry {
       for (const observed of observedMessages) {
         const existing = findMessage(task, observed.messageSeq);
         if (existing) {
-          if (existing.messageAt !== observed.messageAt) {
+          if (
+            existing.messageAt !== observed.messageAt
+            || existing.replyRequired !== observed.replyRequired
+            || existing.expectedReply !== observed.expectedReply
+            || existing.replyDeadlineAt !== observed.replyDeadlineAt
+            || existing.nextCheckAt !== observed.nextCheckAt
+          ) {
             throw new TaskRegistryError(
               "MESSAGE_SEQ_CONFLICT",
-              `同一消息标识出现不同时间：${observed.messageSeq}`,
+              `同一消息标识出现不同时间或回复合同：${observed.messageSeq}`,
               { taskId, messageSeq: observed.messageSeq, existingAt: existing.messageAt, observedAt: observed.messageAt },
             );
           }
           continue;
         }
-        task.messageLedger.push(messageRecord(observed.messageSeq, observed.messageAt));
+        task.messageLedger.push(messageRecord(observed.messageSeq, observed.messageAt, "pending", null, observed));
         changed = true;
       }
       const latestObserved = observedMessages.at(-1);
@@ -976,10 +1045,12 @@ class TaskRegistry {
       }
       let wake = requestedWakeId === null
         ? null
-        : task.wakeBatches.find((candidate) => candidate.wakeId === requestedWakeId) ?? null;
+        : task.wakeBatches.find((candidate) => candidate.wakeId === requestedWakeId && candidate.status !== "complete") ?? null;
       if (wake === null && requestedWakeId === null) {
         const candidates = task.wakeBatches.filter((candidate) =>
-          candidate.legacy && processedSequences.every((sequence) => candidate.messageSeqs.includes(sequence))
+          candidate.status !== "complete"
+          && candidate.legacy
+          && processedSequences.every((sequence) => effectiveWakeMessageSeqs(candidate).includes(sequence))
         );
         if (candidates.length === 1) wake = candidates[0];
       }
@@ -993,12 +1064,13 @@ class TaskRegistry {
           { taskId, requestedWakeId, processedSequences },
         );
       }
-      const invalidSequences = processedSequences.filter((sequence) => !wake.messageSeqs.includes(sequence));
+      const wakeMessageSeqs = effectiveWakeMessageSeqs(wake);
+      const invalidSequences = processedSequences.filter((sequence) => !wakeMessageSeqs.includes(sequence));
       if (invalidSequences.length) {
         throw new TaskRegistryError(
           "ACK_MESSAGE_MISMATCH",
           `ACK 包含不属于该唤醒批次的消息：${taskId}`,
-          { taskId, wakeId: wake.wakeId, invalidSequences, wakeMessageSeqs: wake.messageSeqs },
+          { taskId, wakeId: wake.wakeId, invalidSequences, wakeMessageSeqs },
         );
       }
       let changed = false;
@@ -1014,11 +1086,12 @@ class TaskRegistry {
       }
       for (const candidate of task.wakeBatches) {
         const acknowledged = new Set(candidate.acknowledgedSeqs);
+        const candidateMessageSeqs = effectiveWakeMessageSeqs(candidate);
         for (const sequence of processedSequences) {
-          if (candidate.messageSeqs.includes(sequence)) acknowledged.add(sequence);
+          if (candidateMessageSeqs.includes(sequence)) acknowledged.add(sequence);
         }
         candidate.acknowledgedSeqs = [...acknowledged];
-        if (candidate.messageSeqs.every((sequence) => findMessage(task, sequence)?.status === "acked")) {
+        if (candidateMessageSeqs.every((sequence) => findMessage(task, sequence)?.status === "acked")) {
           candidate.status = "complete";
         }
       }
@@ -1042,7 +1115,7 @@ class TaskRegistry {
     const taskId = parseTaskId(input);
     const newWakeId = requiredString(input.newWakeId, "newWakeId");
     const promptSha256 = requiredString(input.promptSha256, "promptSha256");
-    return this.#write((state) => {
+    return this.#write((state, context) => {
       const task = this.#requireTask(state, taskId);
       requireGenerationMatch(task, input);
       const now = resolveNow(this.now, input).toISOString();
@@ -1056,6 +1129,8 @@ class TaskRegistry {
         expectedLatestWakeId: requiredString(input.expectedLatestWakeId, "expectedLatestWakeId"),
         preparedAt: input.preparedAt ?? now,
       });
+      plan.rollback.originalStateBytes = Buffer.from(context.originalStateBytes);
+      plan.rollback.originalStateSha256 = createHash("sha256").update(context.originalStateBytes).digest("hex");
       if (task.wakeBatches.some((wake) => wake.wakeId === newWakeId)) {
         throw new TaskRegistryError("WAKE_ID_CONFLICT", `新的 wake_id 已存在：${newWakeId}`, { taskId, newWakeId });
       }
@@ -1073,6 +1148,7 @@ class TaskRegistry {
         promptSha256,
         status: "leased",
         acknowledgedSeqs: [],
+        supersededMessageSeqs: [],
         legacy: false,
       });
       refreshLegacyWakeFields(nextTask);
@@ -1115,7 +1191,24 @@ class TaskRegistry {
       for (const field of ["wakePending", "wakeSentAt", "wakeMessageSeq", "wakeMessageAt", "activeWakeId", "wakePromptSha256", "lastWakeAt", "updatedAt"]) {
         task[field] = input.rollback[field];
       }
-      return { changed: true, value: clonePublicTask(task) };
+      const originalStateBytes = input.rollback.originalStateBytes;
+      const originalStateSha256 = input.rollback.originalStateSha256;
+      if (!Buffer.isBuffer(originalStateBytes)
+        || createHash("sha256").update(originalStateBytes).digest("hex") !== originalStateSha256) {
+        throw new TaskRegistryError("REARM_ROLLBACK_BLOCKED", "原始账本备份身份无效，不能回滚重唤醒");
+      }
+      const originalState = validateState(JSON.parse(originalStateBytes.toString("utf8").replace(/^\uFEFF/, "")), this.statePath);
+      const originalTask = originalState.tasks[taskId];
+      const originalPending = originalTask?.messageLedger
+        ?.filter((message) => message.status === "pending")
+        .map((message) => message.messageSeq) ?? [];
+      if (!originalTask
+        || originalTask.generation !== input.expectedGeneration
+        || originalPending.length !== expectedPendingSeqs.length
+        || originalPending.some((sequence, index) => sequence !== expectedPendingSeqs[index])) {
+        throw new TaskRegistryError("REARM_ROLLBACK_BLOCKED", "原始账本备份与回滚身份不一致，不能恢复");
+      }
+      return { changed: true, rawStateBytes: originalStateBytes, value: clonePublicTask(originalTask) };
     });
   }
 
@@ -1210,6 +1303,7 @@ class TaskRegistry {
           promptSha256: requestedPromptSha256,
           status: "leased",
           acknowledgedSeqs: [],
+          supersededMessageSeqs: [],
           legacy: false,
         };
         task.wakeBatches.push(batch);
@@ -1250,9 +1344,25 @@ class TaskRegistry {
       }
       batch.status = "sent";
       batch.sentAt = expectedWakeSentAt;
+      const coveredPendingSequences = new Set(batch.messageSeqs.filter((sequence) =>
+        findMessage(task, sequence)?.status === "pending"
+      ));
+      for (const candidate of task.wakeBatches) {
+        if (candidate.wakeId === batch.wakeId || candidate.status !== "sent") continue;
+        const overlappingSequences = effectiveWakeMessageSeqs(candidate)
+          .filter((sequence) => coveredPendingSequences.has(sequence));
+        if (!overlappingSequences.length) continue;
+        candidate.supersededMessageSeqs = [...new Set([
+          ...candidate.supersededMessageSeqs,
+          ...overlappingSequences,
+        ])];
+        if (!effectiveWakeMessageSeqs(candidate).some((sequence) => findMessage(task, sequence)?.status === "pending")) {
+          candidate.status = "complete";
+        }
+      }
       for (const sequence of batch.messageSeqs) {
         const message = findMessage(task, sequence);
-        if (message?.status === "pending" && message.lastRemindedAt === null) {
+        if (message?.status === "pending") {
           message.lastRemindedAt = expectedWakeSentAt;
         }
       }
@@ -1342,12 +1452,27 @@ class TaskRegistry {
   #write(mutator) {
     const release = acquireFileLock(this.lockPath, this.lockTimeoutMs, this.lockRetryMs, this.staleLockMs);
     try {
+      let originalStateBytes = null;
+      try {
+        originalStateBytes = fs.readFileSync(this.statePath);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
       const state = readState(this.statePath);
-      const result = mutator(state);
+      const result = mutator(state, { originalStateBytes });
       if (!result || typeof result.changed !== "boolean") {
         throw new TaskRegistryError("INTERNAL_ERROR", "账本变更没有返回有效结果");
       }
-      if (result.changed) atomicWriteState(this.statePath, state);
+      if (result.changed) {
+        if (result.rawStateBytes !== undefined) {
+          if (!Buffer.isBuffer(result.rawStateBytes)) {
+            throw new TaskRegistryError("INTERNAL_ERROR", "账本原字节恢复结果无效");
+          }
+          atomicWriteBytes(this.statePath, result.rawStateBytes);
+        } else {
+          atomicWriteState(this.statePath, state);
+        }
+      }
       return result.value;
     } finally {
       release();

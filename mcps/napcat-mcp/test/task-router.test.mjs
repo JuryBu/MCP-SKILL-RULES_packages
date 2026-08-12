@@ -49,6 +49,8 @@ function message(sequence, overrides = {}) {
 
 function fixture(options = {}) {
   let currentTask = task(options.task);
+  let currentTime = Date.parse(options.now ?? "2026-07-24T08:00:00.000Z");
+  let currentMessages = options.messages ?? [message(10)];
   const calls = [];
   const acknowledgedSequences = new Set(options.acknowledgedSequences ?? []);
   const registry = {
@@ -80,7 +82,7 @@ function fixture(options = {}) {
       currentTask = {
         ...currentTask,
         wakePending: true,
-        wakeSentAt: "2026-07-24T08:00:00.000Z",
+        wakeSentAt: new Date(currentTime).toISOString(),
         wakeMessageSeq: input.messages.at(-1).messageSeq,
         wakeMessageAt: input.messages.at(-1).messageAt,
         activeWakeId: input.wakeId,
@@ -88,7 +90,7 @@ function fixture(options = {}) {
         activeWakes: [{
           wakeId: input.wakeId,
           messageSeqs: input.messages.map((message) => message.messageSeq),
-          leaseStartedAt: "2026-07-24T08:00:00.000Z",
+          leaseStartedAt: new Date(currentTime).toISOString(),
           sentAt: null,
           status: "leased",
           legacy: false,
@@ -101,10 +103,9 @@ function fixture(options = {}) {
       currentTask = {
         ...currentTask,
         lastWakeAt: currentTask.wakeSentAt,
-        pendingMessages: currentTask.pendingMessages.map((message) => ({
-          ...message,
-          lastRemindedAt: message.lastRemindedAt ?? currentTask.wakeSentAt,
-        })),
+        pendingMessages: currentTask.pendingMessages.map((message) => currentTask.activeWakes[0]?.messageSeqs.includes(message.messageSeq)
+          ? { ...message, lastRemindedAt: currentTask.wakeSentAt }
+          : message),
         activeWakes: currentTask.activeWakes.map((wake) => ({
           ...wake,
           sentAt: currentTask.wakeSentAt,
@@ -127,8 +128,8 @@ function fixture(options = {}) {
   };
   const notifier = {
     readRecentMessages: options.readRecentMessages ?? (async () => ({
-      scannedCount: (options.messages ?? [message(10)]).length,
-      messages: options.messages ?? [message(10)],
+      scannedCount: currentMessages.length,
+      messages: currentMessages,
     })),
   };
   const bridge = {
@@ -144,6 +145,13 @@ function fixture(options = {}) {
     bridge,
     calls,
     getTask: () => currentTask,
+    now: () => new Date(currentTime),
+    advance: (milliseconds) => {
+      currentTime += milliseconds;
+    },
+    setMessages: (messages) => {
+      currentMessages = messages;
+    },
     isMaintenanceActive: async () => Boolean(options.maintenanceActive),
     ...(options.controlPlane ? { controlPlane: options.controlPlane } : {}),
   };
@@ -228,6 +236,65 @@ test("task router emits machine and conversation receipts after durable ledger a
     { stage: "machine_received", deliveryIds: ["delivery-10", "delivery-11"] },
     { stage: "conversation_received", deliveryIds: ["delivery-10", "delivery-11"] },
   ]);
+  assert.equal(current.getTask().pendingMessages.length, 2);
+});
+
+test("reply-required task wakes preserve the fixed final reply contract", async () => {
+  const current = fixture({
+    messages: [message(30, {
+      replyRequired: true,
+      expectedReply: "TASK_30_COMPLETED",
+      replyDeadlineAt: "2026-07-24T12:00:00.000Z",
+      nextCheckAt: "2026-07-24T08:30:00.000Z",
+    })],
+  });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "accepted");
+  const observed = current.calls.find((call) => call.type === "observeMessages").input.messages[0];
+  assert.equal(observed.replyRequired, true);
+  assert.equal(observed.expectedReply, "TASK_30_COMPLETED");
+  const prompt = current.calls.find((call) => call.type === "wake").input.prompt;
+  assert.match(prompt, /TASK_30_COMPLETED/);
+  assert.match(prompt, /IN_PROGRESS/);
+  assert.match(prompt, /最终固定回复仍须发送/);
+});
+
+test("pending task messages receive at most one exact reminder every twelve hours", async () => {
+  const current = fixture({ messages: [message(40)] });
+  const router = createTaskRouter(current);
+  assert.equal((await router.scanOnce()).results[0].outcome, "accepted");
+  current.advance(12 * 60 * 60 * 1000 - 1);
+  assert.equal((await router.scanOnce()).results[0].outcome, "awaiting_ack");
+  current.advance(1);
+  const reminder = await router.scanOnce();
+  assert.equal(reminder.results[0].outcome, "accepted");
+  const wakeCalls = current.calls.filter((call) => call.type === "wake");
+  assert.equal(wakeCalls.length, 2);
+  assert.match(wakeCalls[1].input.prompt, /previously_pending_message_seqs=\[40\]/);
+  assert.match(wakeCalls[1].input.prompt, /12 小时复核提醒/);
+  assert.match(wakeCalls[1].input.prompt, /精确 ACK/);
+  current.advance(60_000);
+  assert.equal((await router.scanOnce()).results[0].outcome, "awaiting_ack");
+});
+
+test("a fresh task message does not re-remind older pending messages before twelve hours", async () => {
+  const current = fixture({ messages: [message(50)] });
+  const router = createTaskRouter(current);
+  await router.scanOnce();
+  current.advance(60 * 60 * 1000);
+  current.setMessages([message(50), message(51)]);
+  const result = await router.scanOnce();
+  assert.equal(result.results[0].outcome, "accepted");
+  const leaseCalls = current.calls.filter((call) => call.type === "acquireWakeLease");
+  assert.deepEqual(leaseCalls.at(-1).input.messages.map((entry) => entry.messageSeq), [51]);
+});
+
+test("taskless ordinary group messages never enter the task reminder flow", async () => {
+  const current = fixture({ messages: [message(60, { taskId: "", sourceMachine: "", targetMachine: "" })] });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "no_new_message");
+  assert.equal(current.calls.some((call) => call.type === "observeMessages"), false);
+  assert.equal(current.calls.some((call) => call.type === "wake"), false);
 });
 
 test("durable ledger acceptance emits conversation receipts during legal wake cooldown", async () => {
@@ -283,7 +350,7 @@ test("controlled developer alias reaches the durable task ledger in both directi
   );
 });
 
-test("new messages trigger one guidance wake after cooldown while old messages remain pending", async () => {
+test("new messages wake without re-reminding old messages before the twelve-hour interval", async () => {
   const originalTime = message(10).time;
   const current = fixture({
     task: {
@@ -295,10 +362,10 @@ test("new messages trigger one guidance wake after cooldown while old messages r
   const result = await createTaskRouter(current).scanOnce();
   assert.equal(result.results[0].outcome, "accepted");
   const leaseInput = current.calls.find((call) => call.type === "acquireWakeLease").input;
-  assert.deepEqual(leaseInput.messages.map((entry) => entry.messageSeq), [10, 11]);
+  assert.deepEqual(leaseInput.messages.map((entry) => entry.messageSeq), [11]);
   const prompt = current.calls.find((call) => call.type === "wake").input.prompt;
   assert.match(prompt, /new_message_seqs=\[11\]/);
-  assert.match(prompt, /previously_pending_message_seqs=\[10\]/);
+  assert.match(prompt, /previously_pending_message_seqs=\[\]/);
 });
 
 test("maintenance recheck after lease acquisition prevents the final wake write", async () => {

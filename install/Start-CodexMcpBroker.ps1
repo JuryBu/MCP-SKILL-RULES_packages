@@ -7,14 +7,6 @@ $toolkitRoot = Split-Path -Parent $scriptDirectory
 $brokerDir = if ($isFlatInstallation) { $scriptDirectory } else { Join-Path $toolkitRoot "mcps\broker" }
 $brokerScript = [System.IO.Path]::GetFullPath((Join-Path $brokerDir "broker.mjs"))
 $privateEnvPath = Join-Path $brokerDir "broker-private.env.json"
-$nodeExe = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_NODE_EXE)) {
-    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_NODE_EXE)
-} else {
-    "node"
-}
-if ([System.IO.Path]::IsPathRooted($nodeExe) -and -not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
-    throw "Configured Node executable is missing: $nodeExe"
-}
 
 if ($isFlatInstallation -and (Test-Path -LiteralPath $privateEnvPath -PathType Leaf)) {
     $privateEnv = Get-Content -LiteralPath $privateEnvPath -Encoding UTF8 -Raw | ConvertFrom-Json
@@ -25,12 +17,48 @@ if ($isFlatInstallation -and (Test-Path -LiteralPath $privateEnvPath -PathType L
     }
 }
 
+$serviceManifestPath = if (-not [string]::IsNullOrWhiteSpace([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)) {
+    [System.IO.Path]::GetFullPath([string]$env:CODEX_TOOLKIT_SERVICE_MANIFEST)
+} else {
+    Join-Path $env:USERPROFILE ".codex-toolkit\services\infrastructure\service-manifest.json"
+}
+$manifestNodeExe = ""
+if (Test-Path -LiteralPath $serviceManifestPath -PathType Leaf) {
+    try {
+        $serviceManifest = Get-Content -LiteralPath $serviceManifestPath -Encoding UTF8 -Raw | ConvertFrom-Json
+        $manifestNodeExe = [string]$serviceManifest.broker.nodeExe
+    } catch {
+        throw "Unable to read the broker service manifest: $serviceManifestPath"
+    }
+}
+$packagedNodeExe = Get-ChildItem -LiteralPath (Join-Path $env:USERPROFILE ".codex-toolkit\runtime") -Filter node.exe -File -Recurse -ErrorAction SilentlyContinue |
+    Sort-Object FullName -Descending |
+    Select-Object -First 1 -ExpandProperty FullName
+$nodeExe = @(
+    [string]$env:CODEX_TOOLKIT_NODE_EXE,
+    $manifestNodeExe,
+    [string]$packagedNodeExe
+) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1
+if ([string]::IsNullOrWhiteSpace($nodeExe)) {
+    $nodeCommand = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -ne $nodeCommand) { $nodeExe = [string]$nodeCommand.Source }
+}
+if ([string]::IsNullOrWhiteSpace($nodeExe)) {
+    throw "No managed Node executable is available for the MCP broker."
+}
+$nodeExe = [System.IO.Path]::GetFullPath($nodeExe)
+if (-not (Test-Path -LiteralPath $nodeExe -PathType Leaf)) {
+    throw "Configured Node executable is missing: $nodeExe"
+}
+
 $dataRoot = if ($env:CODEX_TOOLKIT_DATA_ROOT) { $env:CODEX_TOOLKIT_DATA_ROOT } else { Join-Path $env:USERPROFILE ".codex-toolkit" }
 $brokerDataDir = if ($isFlatInstallation) { $brokerDir } else { Join-Path $dataRoot "mcp-http-broker" }
 $stdoutPath = Join-Path $brokerDataDir "broker-stdout.log"
 $stderrPath = Join-Path $brokerDataDir "broker-stderr.log"
 $pidPath = Join-Path $brokerDataDir "broker.pid"
 $statePath = Join-Path $brokerDataDir "broker-state.json"
+$brokerPort = if ($env:CODEX_MCP_BROKER_PORT) { [int]$env:CODEX_MCP_BROKER_PORT } else { 14588 }
+$startupTimeoutSeconds = if ($env:CODEX_MCP_BROKER_STARTUP_TIMEOUT_SECONDS) { [int]$env:CODEX_MCP_BROKER_STARTUP_TIMEOUT_SECONDS } else { 30 }
 
 New-Item -ItemType Directory -Force -Path $brokerDataDir | Out-Null
 
@@ -71,10 +99,35 @@ function Find-BrokerProcess {
         Select-Object -First 1
 }
 
+function Wait-BrokerEndpoint {
+    param([int]$ProcessId)
+    $healthUrl = "http://127.0.0.1:$brokerPort/health"
+    $deadline = [DateTime]::UtcNow.AddSeconds($startupTimeoutSeconds)
+    $lastObservation = "no response"
+    do {
+        if (-not (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) {
+            throw "Managed broker exited before its health endpoint became ready: PID $ProcessId"
+        }
+        try {
+            $health = Invoke-RestMethod -Method Get -Uri $healthUrl -TimeoutSec 3
+            if ($health.ok -eq $true -and [int]$health.pid -eq $ProcessId) {
+                Write-Output "Codex MCP broker endpoint verified: $healthUrl"
+                return
+            }
+            $lastObservation = $health | ConvertTo-Json -Compress -Depth 4
+        } catch {
+            $lastObservation = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "Managed broker endpoint did not become healthy within $startupTimeoutSeconds seconds: $lastObservation"
+}
+
 if (Test-Path -LiteralPath $pidPath) {
     $existingPid = Get-Content -LiteralPath $pidPath -Encoding UTF8 | Select-Object -First 1
     $brokerProcess = Get-BrokerProcessFromPid -PidValue $existingPid
     if ($brokerProcess) {
+        Wait-BrokerEndpoint -ProcessId ([int]$existingPid)
         Write-Output "Codex MCP broker already running: PID $existingPid"
         Write-Output "Data root: $dataRoot"
         exit 0
@@ -85,6 +138,7 @@ if (Test-Path -LiteralPath $pidPath) {
 $existingBroker = Find-BrokerProcess
 if ($existingBroker) {
     Set-Content -LiteralPath $pidPath -Value $existingBroker.ProcessId -Encoding UTF8
+    Wait-BrokerEndpoint -ProcessId ([int]$existingBroker.ProcessId)
     Write-Output "Codex MCP broker already running: PID $($existingBroker.ProcessId)"
     Write-Output "Data root: $dataRoot"
     exit 0
@@ -123,5 +177,6 @@ try {
 }
 
 Set-Content -LiteralPath $pidPath -Value $process.Id -Encoding UTF8
+Wait-BrokerEndpoint -ProcessId $process.Id
 Write-Output "Codex MCP broker started: PID $($process.Id)"
 Write-Output "Data root: $dataRoot"

@@ -190,6 +190,7 @@ test("legacy control-state migration rolls back when update fails before code in
   write(path.join(sourceRoot, "src", "index.mjs"), "export {};\n");
   write(path.join(sourceRoot, "package", "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"), "Write-Output 'portable fixture'\n");
   fs.copyFileSync(path.resolve("ops/update-codex-napcat-bridge.ps1"), path.join(sourceRoot, "update.ps1"));
+  fs.copyFileSync(path.resolve("ops/resolve-napcat-data-root.ps1"), path.join(sourceRoot, "resolve-napcat-data-root.ps1"));
   const result = runPowerShell(
     path.join(sourceRoot, "update.ps1"),
     [
@@ -289,6 +290,11 @@ test("portable package entrypoint resolves the managed broker root and leaves it
     path.resolve("package/APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
     path.join(packageRoot, "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"),
   );
+  fs.mkdirSync(path.join(packageRoot, "napcat-mcp", "ops"), { recursive: true });
+  fs.copyFileSync(
+    path.resolve("ops/resolve-napcat-data-root.ps1"),
+    path.join(packageRoot, "napcat-mcp", "ops", "resolve-napcat-data-root.ps1"),
+  );
   write(path.join(packageRoot, "verify-package.ps1"), "Write-Output 'fixture package verified'\n");
   write(path.join(packageRoot, "manifest.json"), JSON.stringify({ source_commits: { napcat_mcp: "fixture" } }));
   for (const brokerFile of ["broker.mjs", "endpoint-config.mjs", "request-lifecycle.mjs"]) {
@@ -374,6 +380,7 @@ test("guarded updater derives the validation SDK and managed npm without PATH no
   write(path.join(sourceRoot, "src", "index.mjs"), "export {};\n");
   write(path.join(sourceRoot, "package", "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"), "Write-Output 'portable fixture'\n");
   fs.copyFileSync(path.resolve("ops/update-codex-napcat-bridge.ps1"), path.join(sourceRoot, "update.ps1"));
+  fs.copyFileSync(path.resolve("ops/resolve-napcat-data-root.ps1"), path.join(sourceRoot, "resolve-napcat-data-root.ps1"));
   const launcherPath = path.join(sourceRoot, "invoke-without-get-file-hash.ps1");
   write(
     launcherPath,
