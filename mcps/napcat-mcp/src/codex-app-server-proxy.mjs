@@ -588,17 +588,15 @@ export class CodexAppServerProxy {
       }
       const primary = subscription.readyClients[0];
       const resumeBusy = subscription.results.some((result) => resumeResultIndicatesBusy(result));
-      const activeTurn = messageVisibility === "visible"
-        ? subscription.results.map((result) => activeTurnFromResumeResult(result)).find(Boolean) ?? null
-        : null;
-      if (resumeBusy && (messageVisibility === "hidden" || !activeTurn)) {
+      const activeTurn = subscription.results
+        .map((result) => activeTurnFromResumeResult(result))
+        .find(Boolean) ?? null;
+      if (resumeBusy && !activeTurn) {
         const busy = this.journal.writeWake(wakeId, {
           status: "failed_before_send",
           error: {
             code: "THREAD_BUSY",
-            message: messageVisibility === "hidden"
-              ? "目标线程忙碌，hidden 模式等待当前轮次结束后重试"
-              : "目标线程忙碌，但 App Server 未返回可安全 steer 的 active turn id",
+            message: "目标线程忙碌，但 App Server 未返回可安全 steer 的 active turn id",
           },
         }, ["prepared"]);
         return {

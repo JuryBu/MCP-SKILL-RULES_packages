@@ -342,7 +342,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   assert.equal(journalState.wakes["wake-test-paused"].status, "failed_before_send");
 });
 
-test("visible wakes steer the active turn with a persisted client id while hidden keeps legacy start", { timeout: 15000 }, async (context) => {
+test("wake visibility only controls client ids while busy and idle injection semantics stay identical", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-visibility-test-"));
   const steerRequests = [];
@@ -353,7 +353,7 @@ test("visible wakes steer the active turn with a persisted client id while hidde
     if (message.method === "initialize") {
       socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
     } else if (message.method === "thread/resume") {
-      const idle = message.params.threadId === "thread-hidden-idle";
+      const idle = ["thread-visible-idle", "thread-hidden-idle"].includes(message.params.threadId);
       const missingTurnId = message.params.threadId === "thread-busy-without-turn-id";
       socket.send(JSON.stringify({
         jsonrpc: "2.0",
@@ -429,55 +429,76 @@ test("visible wakes steer the active turn with a persisted client id while hidde
   assert.equal(steerRequests[0].expectedTurnId, "active-turn-1");
   assert.equal(steerRequests[0].clientUserMessageId, visible.clientUserMessageId);
 
-  const hidden = await proxy.wakeThread({
+  const visibleIdle = await proxy.wakeThread({
+    ...wake,
+    taskId: "task-visible-idle",
+    threadId: "thread-visible-idle",
+    wakeId: "wake-visible-idle",
+    pendingThroughSequence: 301,
+    pendingThroughTime: "2026-08-03T00:00:01.000Z",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-visible-idle",
+  });
+  assert.equal(visibleIdle.injectionMethod, "turn/start");
+  assert.equal(visibleIdle.messageVisibility, "visible");
+  assert.match(visibleIdle.clientUserMessageId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+  assert.equal(startRequests.length, 1);
+  assert.equal(startRequests[0].clientUserMessageId, visibleIdle.clientUserMessageId);
+
+  const hiddenIdle = await proxy.wakeThread({
     ...wake,
     taskId: "task-hidden-idle",
     threadId: "thread-hidden-idle",
-    wakeId: "wake-hidden",
-    pendingThroughSequence: 301,
-    pendingThroughTime: "2026-08-03T00:00:01.000Z",
-    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-hidden",
+    wakeId: "wake-hidden-idle",
+    pendingThroughSequence: 302,
+    pendingThroughTime: "2026-08-03T00:00:02.000Z",
+    prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-hidden-idle",
     messageVisibility: "hidden",
   });
-  assert.equal(hidden.injectionMethod, "turn/start");
-  assert.equal(hidden.messageVisibility, "hidden");
-  assert.equal(hidden.clientUserMessageId, null);
-  assert.equal(startRequests.length, 1);
-  assert.equal(Object.hasOwn(startRequests[0], "clientUserMessageId"), false);
+  assert.equal(hiddenIdle.injectionMethod, "turn/start");
+  assert.equal(hiddenIdle.messageVisibility, "hidden");
+  assert.equal(hiddenIdle.clientUserMessageId, null);
+  assert.equal(startRequests.length, 2);
+  assert.equal(Object.hasOwn(startRequests[1], "clientUserMessageId"), false);
 
   const busyWithoutTurnId = await proxy.wakeThread({
     ...wake,
     taskId: "task-busy-without-turn-id",
     threadId: "thread-busy-without-turn-id",
     wakeId: "wake-busy-without-turn-id",
-    pendingThroughSequence: 302,
-    pendingThroughTime: "2026-08-03T00:00:02.000Z",
+    pendingThroughSequence: 303,
+    pendingThroughTime: "2026-08-03T00:00:03.000Z",
     prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-busy-without-turn-id",
   });
   assert.equal(busyWithoutTurnId.outcome, "busy");
   assert.equal(busyWithoutTurnId.started, false);
-  assert.equal(startRequests.length, 1);
+  assert.equal(startRequests.length, 2);
   assert.equal(steerRequests.length, 1);
 
   const hiddenBusy = await proxy.wakeThread({
     ...wake,
     taskId: "task-hidden-busy",
     wakeId: "wake-hidden-busy",
-    pendingThroughSequence: 303,
-    pendingThroughTime: "2026-08-03T00:00:03.000Z",
+    pendingThroughSequence: 304,
+    pendingThroughTime: "2026-08-03T00:00:04.000Z",
     prompt: "[NAPCAT_TASK_WAKE]\nwake_id=wake-hidden-busy",
     messageVisibility: "hidden",
   });
-  assert.equal(hiddenBusy.outcome, "busy");
-  assert.equal(hiddenBusy.started, false);
-  assert.equal(startRequests.length, 1);
-  assert.equal(steerRequests.length, 1);
+  assert.equal(hiddenBusy.injectionMethod, "turn/steer");
+  assert.equal(hiddenBusy.messageVisibility, "hidden");
+  assert.equal(hiddenBusy.clientUserMessageId, null);
+  assert.equal(hiddenBusy.started, true);
+  assert.equal(startRequests.length, 2);
+  assert.equal(steerRequests.length, 2);
+  assert.equal(steerRequests[1].expectedTurnId, "active-turn-1");
+  assert.equal(Object.hasOwn(steerRequests[1], "clientUserMessageId"), false);
 
   const state = JSON.parse(fs.readFileSync(journalPath, "utf8"));
   assert.equal(state.wakes["wake-visible"].clientUserMessageId, visible.clientUserMessageId);
-  assert.equal(state.wakes["wake-hidden"].clientUserMessageId, null);
+  assert.equal(state.wakes["wake-visible-idle"].clientUserMessageId, visibleIdle.clientUserMessageId);
+  assert.equal(state.wakes["wake-hidden-idle"].clientUserMessageId, null);
   assert.equal(state.wakes["wake-busy-without-turn-id"].status, "failed_before_send");
-  assert.equal(state.wakes["wake-hidden-busy"].status, "failed_before_send");
+  assert.equal(state.wakes["wake-hidden-busy"].status, "accepted");
+  assert.equal(state.wakes["wake-hidden-busy"].clientUserMessageId, null);
 });
 
 test("failed-before-send wake may adopt a newly configured visibility mode", () => {

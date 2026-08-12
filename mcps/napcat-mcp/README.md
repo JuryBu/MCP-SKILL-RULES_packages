@@ -22,7 +22,7 @@
 
 双机任务需要在双方私有 binding 中填写不同的 `controlPlane.localMachine`、可信对端 `trustedPeerQq`，并把 `enabled` 与 `machineIngressEnabled` 同时设为 `true`。这两个开关控制固定任务群的消息扫描、`machine_received` / `conversation_received` 送达回执和回执索引吸收；`targets` 与 `defaultTargetKey` 只服务主人私聊或通知群，不是双机回执前置条件。可先运行 `ops/enable-napcat-machine-ingress.ps1` 做备份、校验和原子启用，再选择性重载 NapCat backend 与 task router。`napcat_status.controlPlane.machineIngressReady=true` 才表示双机回执链路已真正就绪。
 
-`codexWakeMessageVisibility` 控制自动唤醒是否作为 Codex Desktop 可见消息保存。省略或设为 `visible` 时，代理为每次逻辑唤醒生成并持久化一个 UUID 格式的 `clientUserMessageId`；对话忙碌时使用 `turn/steer` 插入当前轮次，空闲时使用 `turn/start`。设为 `hidden` 时保留旧行为，不携带客户端消息 ID。task router 每次唤醒前都会重新读取 binding，因此修改后从下一次唤醒立即生效，不需要重启 broker、NapCat 或任务路由器。Codex Desktop 在前台命令持续运行时可能延后绘制气泡，命令结束后才显示，但模型会在同一轮上下文中收到消息。
+`codexWakeMessageVisibility` 只控制自动唤醒是否作为 Codex Desktop 可见消息保存，不改变注入方式、送达时机或模型收到的内容。无论设为 `visible` 还是 `hidden`，对话忙碌时都使用 `turn/steer` 插入当前轮次，空闲时都使用 `turn/start`；省略或设为 `visible` 时，代理还会为每次逻辑唤醒生成并持久化一个 UUID 格式的 `clientUserMessageId`，设为 `hidden` 时则不携带客户端消息 ID，因此不保存独立的用户消息气泡。task router 每次唤醒前都会重新读取 binding，因此修改字段后从下一次唤醒立即生效，不需要重启 broker、NapCat 或任务路由器。Codex Desktop 在前台命令持续运行时可能延后绘制可见模式的气泡，命令结束后才显示，但模型会在同一轮上下文中收到消息。
 
 | 环境变量 | 示例 | 说明 |
 |---|---|---|
