@@ -447,7 +447,7 @@ test("guarded update can explicitly preserve active wakes without acknowledging 
   assert.match(script, /preservedActiveWakeCount = \$PreservedActiveWakeCount/);
 });
 
-test("backend-only hot reload proves proxy files unchanged and never stops the proxy", () => {
+test("backend-only hot reload protects loaded proxy code but allows next-start lifecycle scripts", () => {
   const script = read("ops/update-codex-napcat-bridge.ps1");
   const compatibilityBlock = script.match(/function Assert-BackendOnlyCompatible[\s\S]*?\n}/)?.[0] ?? "";
   assert.match(script, /\[switch\]\$BackendOnlyHotReload/);
@@ -460,6 +460,10 @@ test("backend-only hot reload proves proxy files unchanged and never stops the p
   assert.match(script, /proxy-critical file changed/);
   assert.doesNotMatch(compatibilityBlock, /src\\codex-thread-bridge\.mjs/);
   assert.match(compatibilityBlock, /src\\codex-app-server-proxy\.mjs/);
+  assert.match(compatibilityBlock, /src\\codex-app-server-proxy-runner\.mjs/);
+  assert.doesNotMatch(compatibilityBlock, /ops\\start-codex-app-server-proxy\.ps1/);
+  assert.doesNotMatch(compatibilityBlock, /ops\\stop-codex-app-server-proxy\.ps1/);
+  assert.doesNotMatch(compatibilityBlock, /ops\\get-codex-app-server-proxy-status\.ps1/);
   assert.doesNotMatch(compatibilityBlock, /activate-codex-app-server-when-idle\.ps1/);
   assert.match(script, /if \(\$BackendOnlyHotReload\) \{/);
   assert.match(script, /reload-broker-backend\.ps1/);

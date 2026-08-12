@@ -332,10 +332,7 @@ function Assert-BackendOnlyCompatible {
   }
   foreach ($RelativePath in @(
     "src\codex-app-server-proxy.mjs",
-    "src\codex-app-server-proxy-runner.mjs",
-    "ops\start-codex-app-server-proxy.ps1",
-    "ops\stop-codex-app-server-proxy.ps1",
-    "ops\get-codex-app-server-proxy-status.ps1"
+    "src\codex-app-server-proxy-runner.mjs"
   )) {
     $PreviousPath = Join-Path $PreviousRoot $RelativePath
     $NextPath = Join-Path $NextRoot $RelativePath
