@@ -256,7 +256,7 @@ test("managed broker start uses manifest Node when PATH has no node", () => {
     if (brokerPid) {
       spawnSync("taskkill.exe", ["/PID", String(brokerPid), "/T", "/F"], { encoding: "utf8" });
     }
-    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
