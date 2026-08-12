@@ -26,7 +26,7 @@ from .ledger import EventLedger, LedgerError
 from .outbound import SafeTextOutbound
 from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
-from .runtime_flags import resolve_private_runtime_gate
+from .runtime_flags import resolve_private_runtime_environment_value, resolve_private_runtime_gate
 from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import (
     CodexWakeNotifier,
@@ -98,7 +98,11 @@ IMAGE_VIEWER_TITLES = tuple(
 )
 WAKE_ENABLED = os.environ.get("WECHAT_DOCS_MCP_WAKE_ENABLED", "0") == "1"
 WAKE_MESSAGE_VISIBILITY = normalize_wake_message_visibility(
-    os.environ.get("WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY", "visible")
+    resolve_private_runtime_environment_value(
+        DATA_ROOT,
+        "WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY",
+        "visible",
+    )
 )
 
 

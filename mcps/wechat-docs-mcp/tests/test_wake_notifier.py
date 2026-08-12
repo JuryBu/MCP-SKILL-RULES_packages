@@ -100,6 +100,7 @@ class WakeNotifierTests(unittest.TestCase):
 
     def test_server_startup_rejects_invalid_message_visibility(self) -> None:
         environment = os.environ.copy()
+        environment["WECHAT_DOCS_MCP_DATA_ROOT"] = str(self.root / "invalid-runtime")
         environment["WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY"] = "transparent"
 
         result = subprocess.run(
@@ -114,6 +115,58 @@ class WakeNotifierTests(unittest.TestCase):
 
         self.assertNotEqual(0, result.returncode)
         self.assertIn("wake message visibility must be visible or hidden", result.stderr)
+
+    def test_server_startup_prefers_private_runtime_visibility_and_defaults_visible(self) -> None:
+        hidden_root = self.root / "hidden-runtime"
+        (hidden_root / "config").mkdir(parents=True)
+        (hidden_root / "config" / "service-runtime.json").write_text(
+            json.dumps(
+                {
+                    "environment": {
+                        "WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY": "hidden",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        hidden_environment = os.environ.copy()
+        hidden_environment["WECHAT_DOCS_MCP_DATA_ROOT"] = str(hidden_root)
+        hidden_environment["WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY"] = "visible"
+        hidden = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from wechat_docs_mcp.server import WAKE_MESSAGE_VISIBILITY; print(WAKE_MESSAGE_VISIBILITY)",
+            ],
+            env=hidden_environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, hidden.returncode, hidden.stderr)
+        self.assertEqual("hidden", hidden.stdout.strip())
+
+        default_root = self.root / "default-runtime"
+        default_environment = os.environ.copy()
+        default_environment["WECHAT_DOCS_MCP_DATA_ROOT"] = str(default_root)
+        default_environment.pop("WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY", None)
+        visible = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from wechat_docs_mcp.server import WAKE_MESSAGE_VISIBILITY; print(WAKE_MESSAGE_VISIBILITY)",
+            ],
+            env=default_environment,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(0, visible.returncode, visible.stderr)
+        self.assertEqual("visible", visible.stdout.strip())
 
     def test_transport_uncertainty_reuses_same_wake_id(self) -> None:
         event = self.ledger.ingest_event("route-test", "fp-retry", "text", {"visible_text": "private"})

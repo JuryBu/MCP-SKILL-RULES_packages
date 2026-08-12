@@ -47,3 +47,23 @@ def resolve_private_runtime_gate(data_root: Path, config_key: str) -> bool:
         return False
     value = document.get(config_key)
     return value if isinstance(value, bool) else False
+
+
+def resolve_private_runtime_environment_value(
+    data_root: Path,
+    environment_key: str,
+    default: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> object:
+    values = os.environ if environ is None else environ
+    runtime_path = data_root / "config" / "service-runtime.json"
+    try:
+        document = json.loads(runtime_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return values.get(environment_key, default)
+    if isinstance(document, dict):
+        runtime_environment = document.get("environment")
+        if isinstance(runtime_environment, dict) and environment_key in runtime_environment:
+            return runtime_environment[environment_key]
+    return values.get(environment_key, default)
