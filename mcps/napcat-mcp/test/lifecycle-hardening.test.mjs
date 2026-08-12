@@ -38,6 +38,16 @@ function runPowerShell(args, env = {}, timeout = 30_000) {
   );
 }
 
+function removeSpawnFixture(root) {
+  try {
+    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch (error) {
+    const transientWindowsLock = process.platform === "win32" && ["EACCES", "EBUSY", "EPERM"].includes(error?.code);
+    if (!transientWindowsLock) throw error;
+    process.emitWarning(`Deferred locked test fixture cleanup: ${root}`, { code: "NAPCAT_TEST_TEMP_LOCKED" });
+  }
+}
+
 function pathIdentity(value) {
   const tail = [];
   let existing = path.resolve(value);
@@ -256,7 +266,7 @@ test("managed broker start uses manifest Node when PATH has no node", () => {
     if (brokerPid) {
       spawnSync("taskkill.exe", ["/PID", String(brokerPid), "/T", "/F"], { encoding: "utf8" });
     }
-    fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    removeSpawnFixture(root);
   }
 });
 
