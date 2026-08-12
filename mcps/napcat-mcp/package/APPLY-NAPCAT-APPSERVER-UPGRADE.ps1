@@ -46,6 +46,7 @@ $ManifestPath = Join-Path $PackageRoot "manifest.json"
 $Updater = Join-Path $NapCatSource "ops\update-codex-napcat-bridge.ps1"
 $SupervisorTaskName = "CodexNapCatSupervisor"
 $PreviousUserAppServerWsUrl = [Environment]::GetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", "User")
+$PreviousLifecycleInstallRoot = [Environment]::GetEnvironmentVariable("CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT", "Process")
 $UpdateResult = $null
 
 function Restore-StagedUpdate {
@@ -177,6 +178,7 @@ foreach ($BrokerFile in $BrokerFiles) {
   if ($LASTEXITCODE -ne 0) { throw "Package broker source syntax check failed: $BrokerFile" }
 }
 try {
+  [Environment]::SetEnvironmentVariable("CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT", $PackageRoot, "Process")
   $UpdateArguments = @{
     SourceRoot = $NapCatSource
     CodeRoot = $CodeRoot
@@ -236,6 +238,8 @@ try {
     throw "NapCat App Server upgrade failed and the staged public code could not be fully restored. Task data was preserved and automatic wake remains paused. Cause: $Failure; restore failure: $RestoreFailure"
   }
   throw "NapCat App Server upgrade failed. The live broker was not modified by this entrypoint; staged public code, the user App Server setting and task state were restored when applicable. Cause: $Failure"
+} finally {
+  [Environment]::SetEnvironmentVariable("CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT", $PreviousLifecycleInstallRoot, "Process")
 }
 
 Write-Host "NapCat App Server proxy upgrade staged successfully."

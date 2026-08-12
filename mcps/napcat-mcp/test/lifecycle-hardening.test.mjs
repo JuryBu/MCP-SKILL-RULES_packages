@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 const testRoot = path.dirname(fileURLToPath(import.meta.url));
 const napcatRoot = path.resolve(testRoot, "..");
 const repositoryRoot = path.resolve(napcatRoot, "..", "..");
+const lifecycleInstallRoot = process.env.CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT
+  ? path.resolve(process.env.CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT)
+  : path.join(repositoryRoot, "install");
 const powershell = path.join(
   process.env.SystemRoot ?? "C:\\Windows",
   "System32",
@@ -203,7 +206,7 @@ test("managed broker start uses manifest Node when PATH has no node", () => {
     const manifestPath = path.join(root, "service-manifest.json");
     const brokerPort = 20000 + Math.floor(Math.random() * 20000);
     fs.mkdirSync(brokerRoot, { recursive: true });
-    fs.copyFileSync(path.join(repositoryRoot, "install", "Start-CodexMcpBroker.ps1"), path.join(brokerRoot, "Start-CodexMcpBroker.ps1"));
+    fs.copyFileSync(path.join(lifecycleInstallRoot, "Start-CodexMcpBroker.ps1"), path.join(brokerRoot, "Start-CodexMcpBroker.ps1"));
     fs.writeFileSync(
       path.join(brokerRoot, "broker.mjs"),
       `import fs from "node:fs"; import http from "node:http"; fs.writeFileSync(${JSON.stringify(markerPath)}, JSON.stringify({ pid: process.pid })); http.createServer((request, response) => { response.setHeader("content-type", "application/json"); response.end(JSON.stringify({ ok: true, pid: process.pid })); }).listen(Number(process.env.CODEX_MCP_BROKER_PORT), "127.0.0.1");\n`,
