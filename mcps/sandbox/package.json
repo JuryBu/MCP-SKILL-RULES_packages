@@ -1,6 +1,6 @@
 {
   "name": "sandbox-mcp-server",
-  "version": "1.17.0",
+  "version": "1.17.1",
   "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
   "type": "module",
   "main": "dist/index.js",
@@ -10,6 +10,7 @@
     "build": "tsc && node scripts/build-windows-job-runner.mjs",
     "clean": "rimraf dist",
     "test:portable": "npm run build",
+    "test:resource-admission": "node ../../design-tests/sandbox-resource-admission.mjs",
     "test:output-delivery": "node ../../design-tests/sandbox-output-delivery.mjs",
     "test:exec-batch": "node ../../design-tests/sandbox-exec-batch-integration.mjs",
     "test:short-burst": "node ../../design-tests/sandbox-short-command-burst.mjs",

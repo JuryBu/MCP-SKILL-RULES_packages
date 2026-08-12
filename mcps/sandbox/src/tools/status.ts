@@ -113,7 +113,7 @@ async function buildOverview() {
     lines.push(`  预留: ${admission.activeReservedMB}/${admission.limits.admissionLimitMB} MB | 活跃租约: ${admission.activeLeases} | 等待: ${admission.queued}/${admission.limits.maxQueueSize}`);
     lines.push(`  实测进程树: ${admission.observedMemoryMB.toFixed(1)}/${admission.limits.hardLimitMB} MB | 峰值预留: ${admission.peak.activeReservedMB} MB | 峰值等待: ${admission.peak.queued}`);
     lines.push(`  压力等级: ${admission.pressureLevel} | 物理可用: ${admission.systemAvailableMemoryMB === null ? "未知" : `${admission.systemAvailableMemoryMB.toFixed(0)} MB`} | 临界底线: ${admission.limits.systemHeadroomMB} MB | 黄色线: ${admission.limits.yellowPhysicalMemoryMB} MB`);
-    lines.push(`  提交余量: ${admission.commitAvailableMemoryMB === null ? "未知" : `${admission.commitAvailableMemoryMB.toFixed(0)} MB`} | 保留底线: ${admission.limits.commitHeadroomMB} MB | Windows 高/低内存信号: ${admission.highMemorySignaled ?? "未知"}/${admission.lowMemorySignaled ?? "未知"}`);
+    lines.push(`  提交余量: ${admission.commitAvailableMemoryMB === null ? "未知" : `${admission.commitAvailableMemoryMB.toFixed(0)} MB`} | 重任务目标: ${admission.limits.commitHeadroomMB} MB | 紧急底线: ${admission.limits.commitCriticalFloorMB} MB | Windows 高/低内存信号: ${admission.highMemorySignaled ?? "未知"}/${admission.lowMemorySignaled ?? "未知"}`);
     lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
 
     lines.push("");

@@ -1,4 +1,4 @@
-# MCP Sandbox v1.17.0
+# MCP Sandbox v1.17.1
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -34,7 +34,7 @@
 
 Sandbox backend 在同一进程内统一管理会创建本机子进程的工具。`memoryRequestMB` 表示任务预计需要多少调度额度，`maxMemoryMB` 表示整棵进程树绝不能越过的硬上限；未显式给请求量时，默认按硬上限的四分之一估算且不少于 64MB。这样二十个约 60MB 的短命令可以直接并行，而声明 1GB 硬上限的构建不会在尚未使用内存前先独占 1GB 调度额度。`sandbox_batch` 的每个真实子任务分别记账，不能用单次 batch 绕过总内存预算。
 
-Windows 运行时同时读取物理可用内存、系统提交余量（物理内存加页面文件可承诺的总空间）和高低内存通知。默认保留 512MB 物理内存与 4096MB 提交余量；物理内存低于 1536MB 时进入黄区，只继续接纳请求量不超过 192MB 的小任务，进入 Windows 低内存状态或跌破任一红线时暂停新任务。正常接纳线仍为 1536MB、硬线为 2048MB、等待队列最多 256 项，所有值都可通过根目录 `templates/env.example.ps1` 中的 `SANDBOX_ADMISSION_*` 环境变量覆盖。
+Windows 运行时同时读取物理可用内存、系统提交余量（物理内存加页面文件可承诺的总空间）和高低内存通知。默认保留 512MB 物理内存；4096MB 提交余量是重任务希望守住的目标线，不是禁止所有任务的绝对红线，1536MB 才是紧急底线。提交余量处于两条线之间、物理内存低于 1536MB 或 Windows 撤销高内存信号时进入黄区，只接纳请求量不超过 192MB、且扣除活动预留与老请求保护额度后仍守住对应底线的小任务；Windows 低内存信号、物理内存低于 512MB 或提交余量低于 1536MB 时暂停全部新任务。正常接纳线仍为 1536MB、硬线为 2048MB、等待队列最多 256 项，所有值都可通过根目录 `templates/env.example.ps1` 中的 `SANDBOX_ADMISSION_*` 环境变量覆盖。
 
 等待队列按调用方轮转，但不会再让一个暂时放不下的大任务堵住后面的所有小任务；老请求等待后会逐步保留最多 256MB 额度，避免反过来被持续小任务饿死。接纳等待最多 10 秒，超过 1 秒后每约 2 秒尝试发送一次排队位置和内存压力进度；当前宿主不展示 MCP progress 时，最终结构化结果仍会准确给出等待时长。仍无资源时命令不会启动，并返回随机 `retryAfterMs`，供调用方错开下一次重试。四类超时含义不同：
 
@@ -259,6 +259,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 - v1.16.1：修复 1.16.0 把所有小输出也持久化并展示为 artifact 的回归。普通 inline 结果完成后立即删除执行期 spool，exec、batch、Session 与 Codex 不再追加 artifact 元数据；超预算、显式文件模式和中断恢复仍保留完整 artifact。`sandbox_status overview/gc` 增加 artifact 数量、payload、保留与无效统计，便于接收方检查和清理。
 - v1.16.4：包含 v1.16.3 的输出预算、模型可见性、batch 总响应与孤儿 artifact 清理修复，并消除目录创建到 manifest 初始化之间的统计/GC 竞态；运行中 artifact 统一显示为未完成并受保护，不再短暂误报无效。
 - v1.17.0：调度请求与进程树硬上限分离，Windows 使用 Job Object 对短命令和多层子进程实施内核级内存限制并返回可信峰值；接纳器同时参考物理内存、系统提交余量与 Windows 压力通知，在黄区继续放行小任务，跳过暂时不可接纳的队首大任务并为老请求渐进保留额度。接纳等待封顶 10 秒并定期上报进度；SDK 提供 MCP session 身份时会用作默认 owner，匿名同 owner 仍允许小任务绕过暂时放不下的大请求。新增 `npm run test:short-burst`，实测 20 路匿名短 PowerShell 可直接并行且均有真实峰值。
+- v1.17.1：修复 4096MB 提交余量目标被误作全局红线的问题。新增默认 1536MB 紧急底线；中间黄区继续放行不超过 192MB、且接纳后仍守住紧急底线的小请求，重任务仍需守住 4096MB 目标线。状态与结构化错误同时展示目标线和紧急底线，新增 `npm run test:resource-admission` 锁定训练机低提交余量场景。
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例
 - v1.12.2 补充 `sandbox_council` 后台查询防呆：启动返回会直接给出带 `ownerId` 的查询示例；README、Resource guide 和 schema 明确查询必须复用同一个 `ownerId`，避免误判任务丢失后重复启动

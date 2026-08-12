@@ -4,6 +4,7 @@ export const RESOURCE_ADMISSION_DEFAULTS = Object.freeze({
     hardLimitMB: 2048,
     systemHeadroomMB: 512,
     commitHeadroomMB: 4096,
+    commitCriticalFloorMB: 1536,
     yellowPhysicalMemoryMB: 1536,
     yellowMaxReservationMB: 192,
     maxAgedReservationMB: 256,
@@ -64,6 +65,7 @@ export interface ResourceAdmissionOptions {
     hardLimitMB?: number;
     systemHeadroomMB?: number;
     commitHeadroomMB?: number;
+    commitCriticalFloorMB?: number;
     yellowPhysicalMemoryMB?: number;
     yellowMaxReservationMB?: number;
     maxAgedReservationMB?: number;
@@ -115,6 +117,7 @@ export interface ResourceAdmissionState {
         hardLimitMB: number;
         systemHeadroomMB: number;
         commitHeadroomMB: number;
+        commitCriticalFloorMB: number;
         yellowPhysicalMemoryMB: number;
         yellowMaxReservationMB: number;
         maxQueueSize: number;
@@ -182,6 +185,7 @@ export class ResourceAdmissionController {
     readonly hardLimitMB: number;
     readonly systemHeadroomMB: number;
     readonly commitHeadroomMB: number;
+    readonly commitCriticalFloorMB: number;
     readonly yellowPhysicalMemoryMB: number;
     readonly yellowMaxReservationMB: number;
     readonly maxQueueSize: number;
@@ -248,6 +252,11 @@ export class ResourceAdmissionController {
             RESOURCE_ADMISSION_DEFAULTS.commitHeadroomMB,
             "commitHeadroomMB",
         );
+        this.commitCriticalFloorMB = nonNegativeNumber(
+            options.commitCriticalFloorMB,
+            RESOURCE_ADMISSION_DEFAULTS.commitCriticalFloorMB,
+            "commitCriticalFloorMB",
+        );
         this.yellowPhysicalMemoryMB = nonNegativeNumber(
             options.yellowPhysicalMemoryMB,
             RESOURCE_ADMISSION_DEFAULTS.yellowPhysicalMemoryMB,
@@ -306,6 +315,9 @@ export class ResourceAdmissionController {
         }
         if (this.admissionLimitMB > this.hardLimitMB) {
             throw new RangeError("admissionLimitMB cannot exceed hardLimitMB");
+        }
+        if (this.commitCriticalFloorMB > this.commitHeadroomMB) {
+            throw new RangeError("commitCriticalFloorMB cannot exceed commitHeadroomMB");
         }
         if (this.admissionBudgetMinMs > this.admissionBudgetMaxMs) {
             throw new RangeError("admissionBudgetMinMs cannot exceed admissionBudgetMaxMs");
@@ -452,6 +464,7 @@ export class ResourceAdmissionController {
                 hardLimitMB: this.hardLimitMB,
                 systemHeadroomMB: this.systemHeadroomMB,
                 commitHeadroomMB: this.commitHeadroomMB,
+                commitCriticalFloorMB: this.commitCriticalFloorMB,
                 yellowPhysicalMemoryMB: this.yellowPhysicalMemoryMB,
                 yellowMaxReservationMB: this.yellowMaxReservationMB,
                 maxQueueSize: this.maxQueueSize,
@@ -509,25 +522,33 @@ export class ResourceAdmissionController {
     private getPressureLevel(): ResourcePressureLevel {
         if (this.lowMemorySignaled === true
             || this.systemAvailableMemoryMB < this.systemHeadroomMB
-            || this.commitAvailableMemoryMB < this.commitHeadroomMB) return "red";
+            || this.commitAvailableMemoryMB < this.commitCriticalFloorMB) return "red";
         if (this.highMemorySignaled === false
-            || this.systemAvailableMemoryMB < this.yellowPhysicalMemoryMB) return "yellow";
+            || this.systemAvailableMemoryMB < this.yellowPhysicalMemoryMB
+            || this.commitAvailableMemoryMB < this.commitHeadroomMB) return "yellow";
         return "green";
     }
 
     private canGrant(reservedMB: number, protectedReservationMB = 0): boolean {
         const reservedButNotObservedMB = Math.max(0, this.activeReservedMB - this.observedMemoryMB);
+        const isSmallRequest = reservedMB <= this.yellowMaxReservationMB;
+        const requiredPhysicalHeadroomMB = isSmallRequest
+            ? this.systemHeadroomMB
+            : this.yellowPhysicalMemoryMB;
+        const requiredCommitHeadroomMB = isSmallRequest
+            ? this.commitCriticalFloorMB
+            : this.commitHeadroomMB;
         const preservesSystemHeadroom = this.systemAvailableMemoryMB
             - reservedButNotObservedMB
             - reservedMB
-            - protectedReservationMB >= this.systemHeadroomMB;
+            - protectedReservationMB >= requiredPhysicalHeadroomMB;
         const preservesCommitHeadroom = this.commitAvailableMemoryMB
             - reservedButNotObservedMB
             - reservedMB
-            - protectedReservationMB >= this.commitHeadroomMB;
+            - protectedReservationMB >= requiredCommitHeadroomMB;
         const pressureLevel = this.getPressureLevel();
         return pressureLevel !== "red"
-            && !(pressureLevel === "yellow" && reservedMB > this.yellowMaxReservationMB)
+            && !(pressureLevel === "yellow" && !isSmallRequest)
             && this.observedMemoryMB < this.hardLimitMB
             && this.activeReservedMB + reservedMB + protectedReservationMB <= this.admissionLimitMB
             && preservesSystemHeadroom

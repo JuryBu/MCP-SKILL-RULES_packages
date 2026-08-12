@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.17.0
+ * MCP Sandbox Server v1.17.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -43,7 +43,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.17.0",
+    version: "1.17.1",
 });
 
 // 注册所有 8 个工具
@@ -68,7 +68,7 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-                text: `# MCP Sandbox v1.17.0 使用指南
+                text: `# MCP Sandbox v1.17.1 使用指南
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -462,6 +462,7 @@ Antigravity 常用别名:
 - v1.16.1 修复普通 inline 输出也持久化并展示 artifact 的回归；成功内联后删除执行期 spool，仅超预算、显式文件模式和中断恢复保留 artifact。status overview/gc 增加输出 artifact 统计。
 - v1.16.4 在 v1.16.3 的活跃 artifact 保护基础上，消除目录创建到 manifest 初始化之间的状态/GC 竞态，运行中 artifact 统一显示为未完成并受保护，不再短暂误报无效。
 - v1.17.0 将调度请求与进程树硬上限拆开，Windows 使用 Job Object 对短命令和多层子进程实施内核级限制并返回可信峰值；调度同时参考物理内存、系统提交余量与 Windows 高低内存信号，允许黄区小任务继续并行，跳过暂时放不下的队首大任务，并对老请求逐步保留额度。接纳等待最长 10 秒且定期上报进度；SDK 提供 MCP session 身份时用作默认 owner，匿名同 owner 也能绕过暂时不可接纳的队首请求。
+- v1.17.1 将 4096MB 提交余量改为重任务目标线，新增默认 1536MB 紧急底线；两者之间进入黄区，仅在扣除活动预留、待观测预留和老请求保护额度后仍守住紧急底线时放行不超过 192MB 的小请求，低内存信号或跌破紧急底线仍暂停全部新任务。
 - webFetchText: http/https 页面 text/html/links/tables 非视觉抽取，默认走 sandbox direct 安全路径，手动跟随重定向并逐跳拒绝 localhost / 私有地址；显式 backend=exa/webFetcher 暂停，待补等价逐跳私网校验证明后再恢复
 - simpleScript: v1.10 仅受限 Node/Python 子进程片段，Python 走 AST/白名单导入与最小环境；默认 language=node，不是通用命令执行器
 - v1.11 稳定性：provider 层有限流和有限 retry。antigravity 默认同源并发 2，codex 默认同源并发 2，customOpenAICompatible 默认同 baseUrl/source 并发 2；支持 params.maxConcurrency、params.source/sourceKey、params.retries、params.retryBackoffMs
@@ -553,7 +554,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-    console.error(`[sandbox] MCP Server v1.17.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[sandbox] MCP Server v1.17.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -613,7 +614,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[sandbox] MCP Server v1.17.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[sandbox] MCP Server v1.17.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

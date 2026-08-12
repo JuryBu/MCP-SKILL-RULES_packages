@@ -21,6 +21,7 @@ test("20 small commands start immediately without a process-count ceiling", asyn
         hardLimitMB: 2048,
         systemHeadroomMB: 512,
         commitHeadroomMB: 4096,
+        commitCriticalFloorMB: 1536,
         yellowPhysicalMemoryMB: 1536,
         yellowMaxReservationMB: 192,
         maxQueueSize: 256,
@@ -253,6 +254,7 @@ test("a blocked request cannot freeze a fitting request from the same anonymous 
         hardLimitMB: 512,
         systemHeadroomMB: 0,
         commitHeadroomMB: 0,
+        commitCriticalFloorMB: 0,
         admissionBudgetMinMs: 500,
         admissionBudgetMaxMs: 500,
         agingThresholdMs: 100,
@@ -271,7 +273,7 @@ test("a blocked request cannot freeze a fitting request from the same anonymous 
     blockedLease.release();
 });
 
-test("commit headroom and Windows notifications drive pressure levels", async () => {
+test("commit target headroom creates a yellow zone where small work can continue", async () => {
     const admission = new ResourceAdmissionController();
     admission.updateSystemPressure({
         systemAvailableMemoryMB: 1200,
@@ -295,6 +297,16 @@ test("commit headroom and Windows notifications drive pressure levels", async ()
     small.release();
     admission.updateSystemPressure({
         systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 3000,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "yellow");
+    const commitZoneSmall = await admission.acquire({ ownerId: "commit-zone-small", reservationMB: 64 });
+    commitZoneSmall.release();
+
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
         commitAvailableMemoryMB: 9000,
         highMemorySignaled: true,
         lowMemorySignaled: false,
@@ -302,14 +314,107 @@ test("commit headroom and Windows notifications drive pressure levels", async ()
     assert.equal(admission.getState().pressureLevel, "green");
     const heavyLease = await heavy;
     heavyLease.release();
+});
+
+test("critical commit floor blocks grants that would consume the emergency reserve", async () => {
+    const admission = new ResourceAdmissionController({
+        admissionBudgetMinMs: 200,
+        admissionBudgetMaxMs: 200,
+    });
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 1599,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "yellow");
+
+    let smallStarted = false;
+    const small = admission.acquire({ ownerId: "small", reservationMB: 64 }).then((lease) => {
+        smallStarted = true;
+        return lease;
+    });
+    await delay(10);
+    assert.equal(smallStarted, false);
 
     admission.updateSystemPressure({
         systemAvailableMemoryMB: 2400,
-        commitAvailableMemoryMB: 3000,
+        commitAvailableMemoryMB: 1600,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    const smallLease = await small;
+    smallLease.release();
+
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 1500,
         highMemorySignaled: true,
         lowMemorySignaled: false,
     });
     assert.equal(admission.getState().pressureLevel, "red");
+
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 9000,
+        highMemorySignaled: true,
+        lowMemorySignaled: true,
+    });
+    assert.equal(admission.getState().pressureLevel, "red");
+});
+
+test("a small request uses emergency floors consistently across yellow causes", async () => {
+    const admission = new ResourceAdmissionController();
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 1200,
+        commitAvailableMemoryMB: 4100,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "yellow");
+    const smallLease = await admission.acquire({ ownerId: "small", reservationMB: 64 });
+    smallLease.release();
+});
+
+test("critical commit floor cannot exceed the normal commit target", () => {
+    assert.throws(
+        () => new ResourceAdmissionController({
+            commitHeadroomMB: 1024,
+            commitCriticalFloorMB: 1536,
+        }),
+        /commitCriticalFloorMB cannot exceed commitHeadroomMB/,
+    );
+});
+
+test("a heavy request cannot consume the normal commit target from a green state", async () => {
+    const admission = new ResourceAdmissionController({
+        admissionBudgetMinMs: 200,
+        admissionBudgetMaxMs: 200,
+    });
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 4300,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    assert.equal(admission.getState().pressureLevel, "green");
+
+    let heavyStarted = false;
+    const heavy = admission.acquire({ ownerId: "heavy", reservationMB: 512 }).then((lease) => {
+        heavyStarted = true;
+        return lease;
+    });
+    await delay(10);
+    assert.equal(heavyStarted, false);
+
+    admission.updateSystemPressure({
+        systemAvailableMemoryMB: 2400,
+        commitAvailableMemoryMB: 4608,
+        highMemorySignaled: true,
+        lowMemorySignaled: false,
+    });
+    const heavyLease = await heavy;
+    heavyLease.release();
 });
 
 test("queued callers receive bounded progress without exposing payloads", async () => {

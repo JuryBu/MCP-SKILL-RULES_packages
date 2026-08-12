@@ -29,6 +29,7 @@ export const resourceAdmission = new ResourceAdmissionController({
     hardLimitMB: readEnvNumber("SANDBOX_ADMISSION_HARD_LIMIT_MB", 2048),
     systemHeadroomMB: readEnvNumber("SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB", 512),
     commitHeadroomMB: readEnvNumber("SANDBOX_ADMISSION_COMMIT_HEADROOM_MB", 4096),
+    commitCriticalFloorMB: readEnvNumber("SANDBOX_ADMISSION_COMMIT_CRITICAL_FLOOR_MB", 1536),
     yellowPhysicalMemoryMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_PHYSICAL_MB", 1536),
     yellowMaxReservationMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_MAX_REQUEST_MB", 192),
     maxAgedReservationMB: readEnvNumber("SANDBOX_ADMISSION_MAX_AGED_RESERVATION_MB", 256),
@@ -151,6 +152,7 @@ export function serializeResourceAdmissionError(error: unknown): {
         systemHeadroomMB: number;
         commitAvailableMemoryMB: number | null;
         commitHeadroomMB: number;
+        commitCriticalFloorMB: number;
         pressureLevel: string;
         queued: number;
     };
@@ -172,6 +174,7 @@ export function serializeResourceAdmissionError(error: unknown): {
             systemHeadroomMB: state.limits.systemHeadroomMB,
             commitAvailableMemoryMB: state.commitAvailableMemoryMB,
             commitHeadroomMB: state.limits.commitHeadroomMB,
+            commitCriticalFloorMB: state.limits.commitCriticalFloorMB,
             pressureLevel: state.pressureLevel,
             queued: state.queued,
         },
