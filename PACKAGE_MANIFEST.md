@@ -4,7 +4,7 @@
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.22.9, web-fetcher 7.0.0, sandbox 1.17.0, broker 0.1.0 |
+| MCP | memory-store 1.22.10, web-fetcher 7.0.0, sandbox 1.17.0, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 18 license-reviewed portable user skills plus manifest |
@@ -18,8 +18,8 @@
 - Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
 - NapCat autostart now uses an internal windowless launcher plus a long-running supervisor watchdog, so interactive logon does not expose PowerShell consoles and unexpected supervisor exits are retried without replacing receiver-private state.
 - Added public-safe Bug/compatibility and Feature Request Issue forms for cross-machine MCP maintenance.
-- Common MCP versions are memory-store 1.22.9, web-fetcher 7.0.0, sandbox 1.17.0, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
-- Memory Store 1.22.9 retains four-host persistent fetch generations, offline PB listing and context-only Recall, rebuilds pre-v3 caches so global human-round numbering matches the new semantics, preserves full local PB response/tool totals for range reads, and keeps Codex heartbeat, automatic channel wakes and subagent notifications out of human rounds while preserving owner replies, attachments and delegation bodies.
+- Common MCP versions are memory-store 1.22.10, web-fetcher 7.0.0, sandbox 1.17.0, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Memory Store 1.22.10 retains four-host persistent fetch generations, offline PB listing and context-only Recall, rebuilds pre-v3 caches so global human-round numbering matches the new semantics, preserves full local PB response/tool totals for range reads, keeps Codex heartbeat, automatic channel wakes and subagent notifications out of human rounds while preserving owner replies, attachments and delegation bodies, and reports actual selected-round statistics for cached range exports.
 - NapCat public source is refreshed to the current task-ledger, router, supervisor, and Codex wake-bridge snapshot while keeping runtime state, real bindings, login data, and credentials excluded.
 
 ## 2026-07-24 Baseline

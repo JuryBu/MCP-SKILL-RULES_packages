@@ -580,7 +580,7 @@ function buildMarkdown(
     const extraTypes = options.extraTypes || [];
     const compactionMode = options.compactionMode || (depth === "full" ? "full" : "folded");
     const roleFilter = normalizeMessageRoles(options.messageRoles);
-    const lines = [buildMarkdownHeader(options, warnings, rangeLabel, totalRounds)];
+    const lines = [buildMarkdownHeader({ ...options, rounds }, warnings, rangeLabel, totalRounds)];
     for (const round of rounds) {
         const formatted = formatRoundForExport(round, depth, extraTypes, roleFilter, compactionMode);
         if (!formatted) continue;
