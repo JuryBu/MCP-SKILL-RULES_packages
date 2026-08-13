@@ -156,7 +156,7 @@ async function triggerRecordAutoCheck(): Promise<void> {
         }
 
         pendingRecordKeys.add(pendingKey);
-        const recordModelChain = (loaded.chainUsed === "claude-code" || loaded.chainUsed === "windsurf") ? "auto" : loaded.chainUsed;
+        const recordModelChain = (loaded.chainUsed === "claude-code" || loaded.chainUsed === "windsurf" || loaded.chainUsed === "dsh") ? "auto" : loaded.chainUsed;
         const p = (async () => {
             if (!await shouldAutoUpdateRecordAsync(recordHash, cascadeId, rounds.length)) return;
             const { admitRecordAutoUpdate } = await import("./tools/record.js");

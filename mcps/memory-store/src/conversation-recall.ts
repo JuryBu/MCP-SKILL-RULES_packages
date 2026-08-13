@@ -16,7 +16,7 @@ const APPROX_CHARS_PER_TOKEN = 4;
 const TEMP_ARTIFACT_TTL_MS = 60 * 60 * 1000;
 
 export type ConversationRecallMode = "auto" | "manual" | "full";
-export type ConversationRecallHost = "antigravity" | "codex" | "claude-code" | "windsurf";
+export type ConversationRecallHost = "antigravity" | "codex" | "claude-code" | "windsurf" | "dsh";
 
 export interface ConversationCompactionEvent {
     kind: "windsurf_token_drop" | "codex_agents_reinjection" | "claude_code_compact_summary";

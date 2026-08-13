@@ -28,6 +28,17 @@ import {
     isWindsurfStoreAvailable,
     type WindsurfConversationReadResult,
 } from "./windsurf-client.js";
+import {
+    listDshSessionSnapshots,
+    readDshSession,
+    resolveDshSessionsRoot,
+    type DshSessionHeader,
+    type DshSessionProvenance,
+} from "./dsh-session-reader.js";
+import {
+    normalizeDshSessionReadResult,
+    type DshConversionDiagnostic,
+} from "./dsh-client.js";
 import type { ConcurrencyGateRequestClass } from "./concurrency-gate.js";
 import { withConversationSourcePressure } from "./conversation-source-pressure.js";
 import { isAntigravityLS } from "./lifecycle.js";
@@ -84,6 +95,12 @@ export interface ConversationLoadResult {
     codexData?: CodexConversationData;
     claudeCodeData?: ClaudeCodeConversationData;
     windsurfData?: WindsurfConversationReadResult;
+    dshData?: {
+        header: DshSessionHeader;
+        provenance: DshSessionProvenance;
+        diagnostics: DshConversionDiagnostic[];
+        rounds: ConversationRound[];
+    };
     trajectory?: any;
     cacheKey?: ConversationSourceCacheKey;
     cacheGeneration?: string;
@@ -131,6 +148,7 @@ function compactConversationCacheSnapshot(loaded: CachedConversationLoadResult):
         ...(loaded.codexData ? { codexData: { ...loaded.codexData, rounds: [] } } : {}),
         ...(loaded.claudeCodeData ? { claudeCodeData: { ...loaded.claudeCodeData, rounds: [] } } : {}),
         ...(loaded.windsurfData ? { windsurfData: { ...loaded.windsurfData, rounds: [], steps: [] } } : {}),
+        ...(loaded.dshData ? { dshData: { ...loaded.dshData, rounds: [] } } : {}),
         ...(loaded.trajectory ? { trajectory: { ...loaded.trajectory, steps: [] } } : {}),
     };
 }
@@ -184,6 +202,9 @@ export async function resolveConversationChain(chain: DataChain = "auto"): Promi
     if (chain === "windsurf") {
         return (await isWindsurfStoreAvailable()) ? "windsurf" : null;
     }
+    if (chain === "dsh") {
+        return fs.existsSync(resolveDshSessionsRoot()) ? "dsh" : null;
+    }
 
     const preferLs = await isAntigravityLS();
     if (preferLs) {
@@ -217,6 +238,7 @@ export async function resolveConversationId(
         if (requestedId) return await resolveWindsurfThreadId(requestedId, { requestClass }) || requestedId;
         return null;
     }
+    if (chain === "dsh") return requestedId || null;
     if (requestedId) return await resolveCodexThreadIdAsync(requestedId) || requestedId;
     return resolveCurrentCodexThreadIdAsync(cwd);
 }
@@ -231,7 +253,7 @@ export async function loadConversationData(
     if (chain === "auto") {
         if (conversationId && source === "cache") {
             const cached = (await Promise.all(
-                (["codex", "antigravity", "claude-code", "windsurf"] as ResolvedConversationChain[])
+                (["codex", "antigravity", "claude-code", "windsurf", "dsh"] as ResolvedConversationChain[])
                     .map(candidate => loadFromResolvedChain(candidate, conversationId, options).catch(() => null)),
             )).filter((item): item is ConversationLoadResult => Boolean(item));
             if (cached.length > 1) {
@@ -256,7 +278,7 @@ export async function loadConversationData(
             }
             if (source === "auto" || source === "local") {
                 const localFallbacks = (await Promise.all(
-                    (["antigravity", "windsurf"] as ResolvedConversationChain[])
+                    (["antigravity", "windsurf", "dsh"] as ResolvedConversationChain[])
                         .map(candidate => loadFromResolvedChain(candidate, conversationId, { ...options, source: "local" }).catch(() => null)),
                 )).filter((item): item is ConversationLoadResult => Boolean(item));
                 if (localFallbacks.length > 1) {
@@ -273,6 +295,7 @@ export async function loadConversationData(
             : ["codex", "antigravity", "claude-code"];
         if (conversationId) {
             candidates.push("windsurf");
+            candidates.push("dsh");
         }
 
         for (const candidate of candidates) {
@@ -282,7 +305,9 @@ export async function loadConversationData(
                     ? isCodexSessionStoreAvailable()
                     : candidate === "claude-code"
                         ? isClaudeCodeStoreAvailable()
-                        : await isWindsurfStoreAvailable();
+                        : candidate === "windsurf"
+                            ? await isWindsurfStoreAvailable()
+                            : fs.existsSync(resolveDshSessionsRoot());
             if (!isAvailable) continue;
 
             let loaded: ConversationLoadResult | null = null;
@@ -321,7 +346,7 @@ async function loadFromResolvedChain(
     }
 
     const source = options.source || "auto";
-    if (source === "ls" && (resolved === "codex" || resolved === "claude-code")) {
+    if (source === "ls" && (resolved === "codex" || resolved === "claude-code" || resolved === "dsh")) {
         throw new Error(`source=ls 不支持 ${resolved}；该宿主的权威原始源是本地 JSONL`);
     }
     const effectiveId = (source === "cache" || source === "local") && conversationId
@@ -834,6 +859,20 @@ async function prepareConversationCacheFreshness(
     requestClass?: ConcurrencyGateRequestClass,
 ): Promise<ConversationCacheFreshness> {
     if (resolved !== "antigravity" && resolved !== "windsurf") {
+        if (resolved === "dsh") {
+            const snapshot = (await listDshSessionSnapshots()).find(item => item.id === conversationId);
+            return {
+                fingerprint: snapshot
+                    ? {
+                        path: snapshot.provenance.sourcePath,
+                        size: snapshot.provenance.sourceSizeBytes,
+                        mtime: snapshot.provenance.sourceMtimeMs,
+                        revision: snapshot.fingerprint,
+                    }
+                    : null,
+                buildSource: "local",
+            };
+        }
         return { fingerprint: localConversationSourceFingerprint(resolved, conversationId, source), buildSource: source };
     }
     if (source === "ls") {
@@ -900,6 +939,7 @@ function hydrateConversationCache(
     if (loaded.codexData) loaded.codexData = { ...loaded.codexData, rounds };
     if (loaded.claudeCodeData) loaded.claudeCodeData = { ...loaded.claudeCodeData, rounds };
     if (loaded.windsurfData) loaded.windsurfData = { ...loaded.windsurfData, rounds };
+    if (loaded.dshData) loaded.dshData = { ...loaded.dshData, rounds };
     return loaded;
 }
 
@@ -1055,6 +1095,42 @@ async function loadRawConversationData(
             rounds: mergeConsecutiveHumanRounds(claudeCodeData.rounds),
             totalSteps: claudeCodeData.totalSteps,
             claudeCodeData: { ...claudeCodeData, rounds: mergeConsecutiveHumanRounds(claudeCodeData.rounds) },
+        };
+    }
+
+    if (resolved === "dsh") {
+        if (source === "ls") throw new Error("source=ls 不支持 dsh；DSH 的权威原始源是本地 session-persistence-jsonl");
+        const read = await readDshSession(effectiveId);
+        const converted = normalizeDshSessionReadResult(read);
+        const rounds = converted.rounds;
+        const lastEvent = read.events.at(-1);
+        const lastSequence = typeof lastEvent?.seq === "number" ? lastEvent.seq : null;
+        return {
+            chainUsed: "dsh",
+            conversationId: effectiveId,
+            rounds,
+            totalSteps: rounds.at(-1)?.endStep || read.events.length,
+            cacheAuthority: "local",
+            dshData: {
+                header: read.header,
+                provenance: read.provenance,
+                diagnostics: converted.diagnostics,
+                rounds,
+            },
+            sourceRevision: {
+                revision: read.fingerprint,
+                contentCursor: lastSequence === null ? null : String(lastSequence),
+                eventWatermark: String(read.provenance.sourceMtimeMs),
+                sequence: lastSequence,
+            },
+            sourceDiagnostics: [
+                `DSH 本地 ${read.provenance.format}: ${rounds.length} 轮/${read.events.length} 事件`,
+                `DSH format v${read.header.version}，source=${read.provenance.sourcePath}`,
+                ...(read.provenance.ignoredTrailingTextRecord || read.provenance.ignoredTrailingZstdFrame
+                    ? ["DSH 活动日志存在尚未提交完成的尾部，本次缓存只包含最后一个完整记录"]
+                    : []),
+                ...converted.diagnostics.slice(0, 20).map(item => `DSH ${item.code}@${item.eventIndex}/${item.eventType}: ${item.detail}`),
+            ],
         };
     }
 

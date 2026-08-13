@@ -18,6 +18,7 @@ import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, resolveRecordSourceReadStartRound, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
 import { readCachedConversationSourceCache } from "../conversation-source-cache.js";
+import { listDshSessionSnapshots } from "../dsh-session-reader.js";
 import { saveTempFile, saveTempFileAsync } from "../temp-store.js";
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type ChainInput, type DataChainInput, type DataChain, type ConversationLogicalChainMode } from "../chain.js";
 import type { ConcurrencyGateRequestClass } from "../concurrency-gate.js";
@@ -67,7 +68,7 @@ import {
     type UnknownChainMigrationReaders,
     type UnknownChainMigrationResult,
 } from "../record-unknown-chain-migration.js";
-import { SOURCE_EVIDENCE_HOSTS, type SourceEvidenceHost } from "../source-evidence-contracts.js";
+import { DEFAULT_SOURCE_EVIDENCE_HOSTS, SOURCE_EVIDENCE_HOSTS, type SourceEvidenceHost } from "../source-evidence-contracts.js";
 import {
     loadConversationData,
     resolveConversationChain,
@@ -159,7 +160,7 @@ export interface RecordSourceSnapshot {
 }
 
 const RECORD_RESUME_MODEL_CHAINS = ["auto", "antigravity", "codex", "grok", "agy", "claude-code"] as const;
-const RECORD_RESUME_DATA_CHAINS = ["antigravity", "codex", "claude-code", "windsurf"] as const;
+const RECORD_RESUME_DATA_CHAINS = ["antigravity", "codex", "claude-code", "windsurf", "dsh"] as const;
 const RECORD_RESUME_PARALLEL_MODES = ["off", "auto", "force"] as const;
 const RECORD_RESUME_LOGICAL_CHAINS = ["off", "explain", "auto", "strict"] as const;
 const RECORD_RECOVERABLE_TASK_KINDS = new Set(["record-update", "record-batch-update"]);
@@ -485,7 +486,7 @@ function recordUnknownChainMigrationAntigravitySource(): { endpoint: string; pbR
 
 function recordUnknownChainMigrationSourceRequest(
     entry: HistoricalRecordIndexEntry,
-    host: SourceEvidenceHost,
+    host: typeof DEFAULT_SOURCE_EVIDENCE_HOSTS[number],
 ): ProductionSourceReadRequest {
     if (host === "codex") {
         return {
@@ -521,7 +522,7 @@ function recordUnknownChainMigrationSourceRequest(
 }
 
 function createRecordUnknownChainMigrationReaders(sourceReader: ProductionSourceReader): UnknownChainMigrationReaders {
-    const readerForHost = (host: SourceEvidenceHost): NonNullable<UnknownChainMigrationReaders[SourceEvidenceHost]> => ({
+    const readerForHost = (host: typeof DEFAULT_SOURCE_EVIDENCE_HOSTS[number]): NonNullable<UnknownChainMigrationReaders[typeof DEFAULT_SOURCE_EVIDENCE_HOSTS[number]]> => ({
         host,
         scan: async ({ entry, signal }) => {
             if (signal?.aborted) throw Object.assign(new Error("unknown-chain migration scan cancelled"), { name: "AbortError" });
@@ -1864,6 +1865,13 @@ export const __recordConcurrencyTest = {
     setBatchCandidateCollector(collector: BatchCandidateCollector | null): void {
         batchCandidateCollectorOverride = collector;
     },
+    collectBatchCandidates(
+        chain: ResolvedConversationChain,
+        args: BatchCandidateCollectionArgs,
+        hash: string,
+    ): Promise<BatchCandidateCollectionResult> {
+        return collectBatchConversationCandidates(chain, args, hash);
+    },
     parseBatchResumePayload(payload: unknown): RecordBatchResumePayload | null {
         return tryParseRecordBatchResumePayload(payload);
     },
@@ -2179,7 +2187,7 @@ export function listRecordsForScope(hash: string, scope: RecordManageScope | und
 function recordDiscoveryHosts(dataChain: string | undefined): SourceEvidenceHost[] {
     return dataChain && dataChain !== "auto" && SOURCE_EVIDENCE_HOSTS.includes(dataChain as SourceEvidenceHost)
         ? [dataChain as SourceEvidenceHost]
-        : [...SOURCE_EVIDENCE_HOSTS];
+        : [...DEFAULT_SOURCE_EVIDENCE_HOSTS];
 }
 
 function buildRecordSchedulerDiscoveryRequest(input: {
@@ -4954,6 +4962,35 @@ async function collectBatchConversationCandidates(
             return {
                 candidates: [],
                 emptyReason: "📦 无符合条件的对话",
+                diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
+            };
+        }
+    } else if (resolvedChain === "dsh") {
+        const afterMs = args.after ? new Date(args.after).getTime() : null;
+        const beforeMs = args.before ? new Date(args.before).getTime() : null;
+        const snapshots = await listDshSessionSnapshots();
+        sourceEnumerationLimited = snapshots.length >= sourceEnumerationLimit;
+        rawCandidates = snapshots
+            .filter(snapshot => {
+                const updatedMs = snapshot.provenance.sourceMtimeMs;
+                const workspace = typeof snapshot.header.cwd === "string" ? snapshot.header.cwd : "";
+                if (afterMs !== null && updatedMs < afterMs) return false;
+                if (beforeMs !== null && updatedMs > beforeMs) return false;
+                return workspaceMatchesFilter(workspace, args.workspace);
+            })
+            .sort((left, right) => right.provenance.sourceMtimeMs - left.provenance.sourceMtimeMs)
+            .slice(0, sourceEnumerationLimit)
+            .map(snapshot => ({
+                id: snapshot.id,
+                workspace: typeof snapshot.header.cwd === "string" ? snapshot.header.cwd : "",
+                chain: "dsh",
+                lastModifiedMs: snapshot.provenance.sourceMtimeMs,
+                stepCount: snapshot.eventCount,
+            }));
+        if (rawCandidates.length === 0) {
+            return {
+                candidates: [],
+                emptyReason: "📦 无符合条件的 DSH 对话",
                 diagnostics: emptyRecordBatchCandidateDiagnostics({ sourceEnumerationLimited }),
             };
         }

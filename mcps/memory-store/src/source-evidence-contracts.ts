@@ -3,7 +3,8 @@ import { createHash } from "node:crypto";
 export const SOURCE_EVIDENCE_SCHEMA_VERSION = "source-evidence/v1" as const;
 export const SOURCE_EVIDENCE_ADAPTER_VERSION = "source-evidence/v1" as const;
 
-export const SOURCE_EVIDENCE_HOSTS = ["codex", "claude-code", "windsurf", "antigravity"] as const;
+export const SOURCE_EVIDENCE_HOSTS = ["codex", "claude-code", "windsurf", "antigravity", "dsh"] as const;
+export const DEFAULT_SOURCE_EVIDENCE_HOSTS = ["codex", "claude-code", "windsurf", "antigravity"] as const;
 export type SourceEvidenceHost = typeof SOURCE_EVIDENCE_HOSTS[number];
 
 export const EXACT_FETCH_RESULTS = ["present", "not_found", "unresolved"] as const;

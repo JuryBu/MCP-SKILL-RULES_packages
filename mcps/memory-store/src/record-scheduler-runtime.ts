@@ -74,6 +74,7 @@ import {
 import { createRecordSchedulerCoordinator, type RecordSchedulerCoordinator, type RecordSchedulerProviderPermitRequest } from "./record-scheduler-coordinator.js";
 import { createRecordUnitPlan, type RecordUnitPlan, type RecordUnitPlanningInput } from "./record-unit-engine.js";
 import {
+    DEFAULT_SOURCE_EVIDENCE_HOSTS,
     SOURCE_EVIDENCE_ADAPTER_VERSION,
     SOURCE_EVIDENCE_HOSTS,
     buildExactFetchEvidence,
@@ -817,7 +818,7 @@ function productionDiscoveryKey(request: RecordSchedulerRuntimeDiscoveryRequest)
         selector: request.selector,
         workspaceHash: request.workspaceHash || "general",
         workspacePath: request.workspacePath || null,
-        hosts: request.hosts || SOURCE_EVIDENCE_HOSTS,
+        hosts: request.hosts || DEFAULT_SOURCE_EVIDENCE_HOSTS,
         limit: request.limit || 50,
         selectionLimit: request.selectionLimit || null,
         filters: request.filters || {},
@@ -1019,6 +1020,15 @@ function productionSourceRequestForCandidate(
             authoritativeRoot: identity.source.authoritativeRoot,
             sourceCanonicalPath: identity.source.canonicalPath,
             requestClass: "background",
+            ...cacheReference,
+        };
+    }
+    if (candidate.source.host === "dsh") {
+        return {
+            host: "dsh",
+            conversationId: identity.conversationId,
+            workspaceId: identity.workspace.workspaceId,
+            workspacePath,
             ...cacheReference,
         };
     }
@@ -1311,7 +1321,7 @@ async function listProductionDiscoverySeeds(
     request: RecordSchedulerRuntimeDiscoveryRequest,
     apis: RecordSchedulerProductionSourceApis,
 ): Promise<ProductionDiscoveryListing> {
-    const hosts = request.hosts && request.hosts.length > 0 ? [...new Set(request.hosts)] : [...SOURCE_EVIDENCE_HOSTS];
+    const hosts = request.hosts && request.hosts.length > 0 ? [...new Set(request.hosts)] : [...DEFAULT_SOURCE_EVIDENCE_HOSTS];
     const limit = Math.max(1, Math.min(200, Math.floor(request.limit || 50)));
     const scanLimit = PRODUCTION_DISCOVERY_HARD_LIMIT;
     const workspaceHash = request.workspaceHash || "general";
@@ -1733,6 +1743,13 @@ async function collectProductionEvidence(
                             workspacePath: seed.workspacePath,
                             requestClass: "background",
                         }
+                        : seed.host === "dsh"
+                            ? {
+                                host: "dsh",
+                                conversationId: seed.conversationId,
+                                workspaceId: seed.workspaceHash,
+                                workspacePath: seed.workspacePath,
+                            }
                         : {
                             host: "antigravity",
                             conversationId: seed.conversationId,
@@ -1966,7 +1983,7 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
                         })}`,
                         discoveredAtSequence: sequence,
                         filters: {
-                            hosts: request.hosts || [...SOURCE_EVIDENCE_HOSTS],
+                            hosts: request.hosts || [...DEFAULT_SOURCE_EVIDENCE_HOSTS],
                             workspace: request.workspacePath || null,
                             extensions: {
                                 ...(normalizeResumePayload(request.filters || {}) as RecordDiscoveryInput["request"]["filters"]["extensions"]),

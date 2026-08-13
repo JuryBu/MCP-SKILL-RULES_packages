@@ -310,7 +310,7 @@ MCP memory-store 是跨对话持久化知识的主要方式：
 
 流程：先 `list` 定位 `conversationId` → `search` 关键词 → `read` 精读 → 需要更多时 `depth="full"` 深度查看。
 
-`fetch` 负责建立或更新四宿主共用结构的持久规范化缓存，后续 search/read/full/diff 都从该缓存派生，不重复解析原始 JSONL/PB。`source="auto|local|ls|cache"` 可选择原始来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默省略。
+`fetch` 负责建立或更新 Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 五宿主共用结构的持久规范化缓存，后续 search/read/full/diff 都从该缓存派生，不重复解析原始 JSONL/PB/DSH session 日志。DSH 使用只读 `dataChain="dsh"` 或别名 `deepseek-harness`，不支持 `modelChain=dsh`；`source="auto|local|ls|cache"` 可选择原始来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默省略。
 
 `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含用户/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 

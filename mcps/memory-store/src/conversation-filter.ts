@@ -20,6 +20,11 @@ import {
     resolveWindsurfThreadId,
     type WindsurfConversationSummary,
 } from "./windsurf-client.js";
+import {
+    listDshSessionSnapshots,
+    readDshSession,
+    type DshSessionSnapshot,
+} from "./dsh-session-reader.js";
 import { canonicalWorkspacePath } from "./store.js";
 
 export type ConversationSource = Exclude<DataChain, "auto">;
@@ -110,9 +115,13 @@ export interface ConversationSourceAdapters {
         list(limit: number): Promise<WindsurfConversationSummary[]> | WindsurfConversationSummary[];
         resolve(id: string): Promise<string | null> | string | null;
     };
+    dsh?: {
+        list(limit: number): Promise<DshSessionSnapshot[]> | DshSessionSnapshot[];
+        get(id: string): Promise<DshSessionSnapshot | null> | DshSessionSnapshot | null;
+    };
 }
 
-const DEFAULT_SOURCE_ORDER: ConversationSource[] = ["codex", "antigravity", "claude-code", "windsurf"];
+const DEFAULT_SOURCE_ORDER: ConversationSource[] = ["codex", "antigravity", "claude-code", "windsurf", "dsh"];
 
 const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     codex: {
@@ -129,6 +138,16 @@ const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
     windsurf: {
         list: limit => listRecentWindsurfThreads(limit),
         resolve: id => resolveWindsurfThreadId(id),
+    },
+    dsh: {
+        list: async limit => (await listDshSessionSnapshots()).slice(0, limit),
+        get: async id => {
+            try {
+                return (await readDshSession(id)).snapshot;
+            } catch {
+                return null;
+            }
+        },
     },
 };
 
@@ -243,6 +262,39 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): UnifiedConve
         parentConversationId,
         isChildThread,
         searchAliases: item.titleAliases,
+    };
+}
+
+function candidateFromDshSession(item: DshSessionSnapshot): UnifiedConversationCandidate {
+    const header = item.header as Record<string, unknown>;
+    const parentConversationId = typeof header.parentSession === "string" ? header.parentSession : null;
+    const isChildThread = parentConversationId !== null || header.origin === "subagent";
+    const workspace = typeof header.cwd === "string" ? header.cwd : "";
+    const title = typeof header.title === "string"
+        ? header.title
+        : typeof header.agentPreset === "string"
+            ? header.agentPreset
+            : item.id;
+    return {
+        id: item.id,
+        dataChain: "dsh",
+        title,
+        workspace,
+        workspaces: workspace ? [workspace] : undefined,
+        updatedAt: isoFromMs(item.provenance.sourceMtimeMs),
+        detail: [
+            "dsh format v0",
+            item.provenance.format,
+            `${item.eventCount} events`,
+            `${item.provenance.sourceSizeBytes} bytes`,
+            isChildThread ? "childThread" : "",
+        ].filter(Boolean).join(" / "),
+        searchAliases: typeof header.agentPreset === "string" ? [header.agentPreset] : undefined,
+        agentRole: header.origin === "subagent" ? "subagent" : null,
+        agentNickname: typeof header.agentPreset === "string" ? header.agentPreset : null,
+        parentConversationId,
+        rootConversationId: parentConversationId,
+        isChildThread,
     };
 }
 
@@ -393,6 +445,9 @@ async function listSourceCandidates(
     if (source === "windsurf") {
         return (await adapters.windsurf.list(limit)).map(candidateFromWindsurfThread);
     }
+    if (source === "dsh") {
+        return (await (adapters.dsh || DEFAULT_ADAPTERS.dsh)!.list(limit)).map(candidateFromDshSession);
+    }
     const rows = await adapters.antigravity.list(limit);
     const candidates = rows.map(item => ({
         id: item.id,
@@ -539,7 +594,7 @@ export async function listConversationCandidates(options: ListConversationCandid
                 if (queryPriority !== 0) return queryPriority;
                 return (Date.parse(b.updatedAt || "") || 0) - (Date.parse(a.updatedAt || "") || 0);
             });
-        if (source === "codex" || source === "claude-code" || source === "windsurf") {
+        if (source === "codex" || source === "claude-code" || source === "windsurf" || source === "dsh") {
             const result = applyThreadMode(raw, filtered, normalizedQuery, queryTerms, options);
             filtered = result.filtered;
             warnings.push(...result.warnings);
@@ -583,6 +638,17 @@ async function resolveIdInSource(
     if (source === "windsurf") {
         const resolved = await adapters.windsurf.resolve(conversationId);
         return resolved ? { dataChain: "windsurf", conversationId: resolved } : null;
+    }
+    if (source === "dsh") {
+        const snapshot = await (adapters.dsh || DEFAULT_ADAPTERS.dsh)!.get(conversationId);
+        return snapshot
+            ? {
+                dataChain: "dsh",
+                conversationId: snapshot.id,
+                title: typeof snapshot.header.title === "string" ? snapshot.header.title : snapshot.id,
+                workspace: typeof snapshot.header.cwd === "string" ? snapshot.header.cwd : "",
+            }
+            : null;
     }
     const query = conversationId.trim().toLowerCase();
     const rows = await adapters.antigravity.list(1000);

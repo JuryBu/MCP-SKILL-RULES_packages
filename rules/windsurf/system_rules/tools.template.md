@@ -23,8 +23,8 @@
 
 ## MCP 跨链路访问
 
-共享 MCP 支持跨宿主：chain=auto|antigravity|codex|claude-code|windsurf，支持 dataChain/modelChain 拆分。
-dataChain=windsurf 读 WSF 对话；modelChain 不支持 windsurf。速度：antigravity(~18s)>codex(~30s)。后台轮询 30-45s。
+共享 MCP 支持跨宿主：chain=auto|antigravity|codex|claude-code|windsurf|dsh，支持 dataChain/modelChain 拆分。
+dataChain=windsurf 读 WSF 对话，dataChain=dsh 只读 DeepSeek Harness session；modelChain 不支持 windsurf 或 dsh。速度：antigravity(~18s)>codex(~30s)。后台轮询 30-45s。
 
 ## MCP web-fetcher
 

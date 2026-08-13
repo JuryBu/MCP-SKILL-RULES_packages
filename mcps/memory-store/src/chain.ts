@@ -1,8 +1,8 @@
 export const CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "grok", "agy"] as const;
 export const CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "grok", "agy"] as const;
-export const DATA_CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "windsurf"] as const;
-export const DATA_CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf"] as const;
-export const CHAIN_COMPAT_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf", "grok", "agy"] as const;
+export const DATA_CHAIN_VALUES = ["auto", "antigravity", "codex", "claude-code", "windsurf", "dsh"] as const;
+export const DATA_CHAIN_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf", "dsh", "deepseek-harness"] as const;
+export const CHAIN_COMPAT_INPUT_VALUES = ["auto", "antigravity", "codex", "claude-code", "cc", "windsurf", "wsf", "dsh", "deepseek-harness", "grok", "agy"] as const;
 
 export type Chain = typeof CHAIN_VALUES[number];
 export type ChainInput = typeof CHAIN_INPUT_VALUES[number];
@@ -34,6 +34,11 @@ export function isWindsurfAlias(input: unknown): boolean {
     return value === "windsurf" || value === "wsf";
 }
 
+export function isDshAlias(input: unknown): boolean {
+    const value = String(input || "").trim().toLowerCase();
+    return value === "dsh" || value === "deepseek-harness";
+}
+
 export function isGrokAlias(input: unknown): boolean {
     const value = String(input || "").trim().toLowerCase();
     return value === "grok";
@@ -48,14 +53,17 @@ export function assertValidModelChainInput(input: unknown, parameterName = "mode
     if (isWindsurfAlias(input)) {
         throw new Error(`${parameterName} 不支持 windsurf/wsf：Windsurf 只提供对话数据链路。请使用 dataChain="windsurf"，并把 modelChain 设为 auto|antigravity|codex|claude-code|cc|grok|agy`);
     }
+    if (isDshAlias(input)) {
+        throw new Error(`${parameterName} 不支持 dsh/deepseek-harness：DSH（DeepSeek Harness）只提供对话数据链路。请使用 dataChain="dsh"，并把 modelChain 设为 auto|antigravity|codex|claude-code|cc|grok|agy`);
+    }
 }
 
 export function assertValidDataChainInput(input: unknown, parameterName = "dataChain"): void {
     if (isGrokAlias(input)) {
-        throw new Error(`${parameterName} 不支持 grok：Grok 只提供模型链路。请使用 modelChain="grok"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf`);
+        throw new Error(`${parameterName} 不支持 grok：Grok 只提供模型链路。请使用 modelChain="grok"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness`);
     }
     if (isAgyAlias(input)) {
-        throw new Error(`${parameterName} 不支持 agy：agy CLI 只提供模型链路。请使用 modelChain="agy"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf`);
+        throw new Error(`${parameterName} 不支持 agy：agy CLI 只提供模型链路。请使用 modelChain="agy"，并把 dataChain 设为 auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness`);
     }
 }
 
@@ -72,6 +80,7 @@ export function normalizeDataChain(input: DataChainInput | ChainInput | string |
     const value = String(input).trim().toLowerCase();
     if (value === "cc") return "claude-code";
     if (value === "wsf") return "windsurf";
+    if (value === "deepseek-harness") return "dsh";
     if ((DATA_CHAIN_VALUES as readonly string[]).includes(value)) return value as DataChain;
     return fallback;
 }
@@ -81,7 +90,7 @@ export function normalizeDataChain(input: DataChainInput | ChainInput | string |
  * - chain defaults to auto.
  * - dataChain defaults to chain.
  * - modelChain defaults to chain.
- * - chain="windsurf"/"wsf" only affects dataChain; modelChain falls back to auto.
+ * - chain="windsurf"/"wsf"/"dsh"/"deepseek-harness" only affects dataChain; modelChain falls back to auto.
  * - chain="grok"/"agy" only affects modelChain; dataChain falls back to auto.
  */
 export function resolveChainSplit(input: ChainSplitInput = {}): ChainSplit {

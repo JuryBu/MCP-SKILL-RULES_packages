@@ -1020,6 +1020,7 @@ async function getConversationExecutionRecord(
             const loaded = await loadConversationData(dataChain || "auto", conversationId, {
                 link: "summary",
                 includeRounds: false,
+                ...(dataChain === "dsh" ? { source: "cache" as const } : {}),
             });
             if (loaded) {
                 const cachedRounds = loaded.cacheKey && loaded.cacheGeneration
@@ -1322,7 +1323,7 @@ export function resolveGuardSelfReferenceResult(result: GuardCheckResult): Guard
 
 function resolveGuardModelChain(state: GuardState): Chain {
     if (state.modelChain) return state.modelChain;
-    if (state.chain === "windsurf") return "auto";
+    if (state.chain === "windsurf" || state.chain === "dsh") return "auto";
     return state.chain || "auto";
 }
 

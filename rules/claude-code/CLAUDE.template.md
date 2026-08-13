@@ -242,6 +242,7 @@ plans/
 - `codex`：强制走 Codex 链路
 - `claude-code` / `cc`：强制走 Claude Code 链路
 - `windsurf` / `wsf`：强制走 Windsurf 链路（仅 dataChain，modelChain 不支持）
+- `dsh` / `deepseek-harness`：只读 DeepSeek Harness 对话链路（仅 dataChain，modelChain 不支持）
 
 支持 `dataChain`（数据来源）/ `modelChain`（模型调用）拆分的工具，未填时继承 `chain`。
 速度参考：antigravity(~18s) > codex(~30s)。后台任务轮询 30-45s。
@@ -307,9 +308,9 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 3. 需要更多 → `read(startRound=N, endRound=M, depth="normal")`
 4. 需要思考过程 → `depth="full", extraTypes=["thinking"]`
 
-跨链路读取时指定 `dataChain`：antigravity / codex / claude-code / windsurf
+跨链路读取时指定 `dataChain`：antigravity / codex / claude-code / windsurf / dsh
 
-`fetch` 会把宿主原始数据规范化为可复用缓存，后续 search/read/full/diff 从该缓存派生，不反复解析原始 JSONL/PB。`source="auto|local|ls|cache"` 可选择来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时使用响应给出的 `continuationCursor` / 下一段参数继续，不把截断误当成完整结果。
+`fetch` 会把宿主原始数据规范化为可复用缓存，后续 search/read/full/diff 从该缓存派生，不反复解析原始 JSONL/PB/DSH session 日志。`source="auto|local|ls|cache"` 可选择来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时使用响应给出的 `continuationCursor` / 下一段参数继续，不把截断误当成完整结果。
 `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含用户/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 `messageRoles=["user"]` 只含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取带昵称和对话 ID 的子代理事件；批注搜索返回命中的单条 Annotation 与命中字段，不展开整个父轮。
 

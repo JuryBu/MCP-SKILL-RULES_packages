@@ -2,6 +2,14 @@
 
 本文件记录面向 npm 发布的主要变更。
 
+## [1.23.0] - 2026-08-14
+
+### Added
+
+- 新增只读 `dataChain="dsh"` 与别名 `deepseek-harness`，读取 DeepSeek Harness v0 `session-persistence-jsonl` 的普通 JSONL 或拼接 Zstandard 帧；未知格式、重复会话 ID 与越界路径均拒绝读取，活动日志只提交最后一个完整记录。
+- DSH 原生 session id 作为稳定 `conversationId`，fetch 发布到既有可校验缓存 generation，后续 read/search/recall/export 与 Record 投影只消费已发布缓存；DSH 不提供 `modelChain`，也不写回或改名原始日志。
+- 仅 `message.role=user` 且 `message.source.kind=user` 计入真人轮，synthetic/plugin/tool/subagent/automation 保留来源语义但不冒充主人消息；保留模型可见回复、工具调用、附件引用与 provenance。
+
 ## [1.22.10] - 2026-08-13
 
 ### Fixed

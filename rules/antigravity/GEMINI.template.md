@@ -80,7 +80,7 @@ conversation_read_original：`fetch` 负责建立或更新可复用的规范化�
 - 后台任务轮询不要把 `waitSeconds` 设到 60 秒以上；Codex MCP 客户端自身通常有约 60 秒请求上限，建议用 30-45 秒短轮询
 
 关于对话原文读取
-当前已部署 conversation_read_original 工具（v1.22+），可绕过 CHECKPOINT 上下文压缩机制，并为 Codex、Claude Code、Windsurf、Antigravity 建立同结构的持久 fetch 缓存。`source="auto"` 以本地 JSONL/PB 为一等来源并按需比较 LS，`local` 只读本地源，`ls` 仅用于 Windsurf/Antigravity，`cache` 只读上一份完整可用的 fetch 缓存。
+当前已部署 conversation_read_original 工具（v1.23+），可绕过 CHECKPOINT 上下文压缩机制，并为 Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 建立同结构的持久 fetch 缓存。DSH 只作为只读 `dataChain="dsh"`，不提供模型链；`source="auto"` 以本地 JSONL/PB/DSH session 日志为一等来源并按需比较 LS，`local` 只读本地源，`ls` 仅用于 Windsurf/Antigravity，`cache` 只读上一份完整可用的 fetch 缓存。
 v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）；Antigravity LS 环境下 fetch 后新增轮次≥3 自动后台触发 Record 更新。Codex wrapper 环境默认关闭隐式自动 Record，需要显式调用 record_manage(action="update", dataChain="codex", modelChain="codex", conversationId="...", background=true)。
 - 触发场景（应主动使用）：
   · CHECKPOINT 压缩后需要恢复丢失的上下文细节（最常见场景）

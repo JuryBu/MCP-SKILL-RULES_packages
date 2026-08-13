@@ -131,6 +131,14 @@ export interface AntigravityProductionSourceReadRequest {
     maxContentBytes?: number;
 }
 
+export interface DshProductionSourceReadRequest {
+    host: "dsh";
+    conversationId: string;
+    workspaceId?: string;
+    workspacePath?: string | null;
+    maxContentBytes?: number;
+}
+
 export interface ProductionSourceCacheReference {
     cacheGeneration?: ConversationSourceCacheGenerationRef;
     sourceSnapshot?: Record<string, unknown>;
@@ -142,6 +150,7 @@ export type ProductionSourceReadRequest = (
     | ClaudeCodeProductionSourceReadRequest
     | WindsurfProductionSourceReadRequest
     | AntigravityProductionSourceReadRequest
+    | DshProductionSourceReadRequest
 ) & ProductionSourceCacheReference;
 
 export interface ProductionSourceCanonicalMessage {
@@ -1584,6 +1593,9 @@ export function createProductionSourceReader(options: ProductionSourceReaderOpti
                 throw new Error(`fetch 缓存 generation 不存在、损坏或未完整校验: ${request.cacheGeneration.generation}`);
             }
             if (generationKind === "legacy") {
+                if (request.host === "dsh") {
+                    throw new Error(`DSH Record 只接受带投影的已发布 fetch 缓存 generation: ${request.cacheGeneration.generation}`);
+                }
                 const rebuild = options.rebuildLegacyCache || (async (legacyRequest: ProductionSourceReadRequest) => {
                     const rebuilt = await rebuildConversationCacheForRecord(
                         legacyRequest.host,
@@ -1617,6 +1629,9 @@ export function createProductionSourceReader(options: ProductionSourceReaderOpti
         }
         const cached = verifiedCacheScan(effectiveRequest, scanId, maxContentBytes, now, contentHashesByAuthorityRevision);
         if (cached) return cached;
+        if (request.host === "dsh") {
+            throw new Error(`DSH Record 只从已验证 fetch 缓存读取，当前 generation 缺失或不可用: ${request.conversationId}`);
+        }
         if (request.host === "codex") {
             const result = await collectCodexSourceEvidence({
                 conversationId: request.conversationId,

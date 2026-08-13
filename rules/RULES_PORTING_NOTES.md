@@ -6,7 +6,7 @@
 - Work-mode distinction: chat vs. task execution.
 - Subagent / council usage boundaries and evidence requirements.
 - MCP usage rules for `memory-store`, `web-fetcher`, `sandbox`, optional `exa`, Windsurf subagent, and optional NapCat QQ group collaboration.
-- Four-source chain model: `antigravity`, `codex`, `claude-code` / `cc`, and `windsurf` / `wsf`.
+- Five-source chain model: `antigravity`, `codex`, `claude-code` / `cc`, `windsurf` / `wsf`, and read-only `dsh` / `deepseek-harness`; DSH is not a model provider.
 - `dataChain` and `modelChain` split-routing guidance.
 - Exa-first search discipline, with fallback only after explicit unavailability or no-result evidence.
 - PPT/PDF/DOCX/XLSX skill and visual QA expectations where applicable.

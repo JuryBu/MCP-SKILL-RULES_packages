@@ -803,11 +803,12 @@ export async function callModelResponse(
         };
     }
     const rawChain = String(chain || "auto").trim().toLowerCase();
-    if (rawChain === "windsurf" || rawChain === "wsf") {
+    if (rawChain === "windsurf" || rawChain === "wsf" || rawChain === "dsh" || rawChain === "deepseek-harness") {
         return {
             text: null,
             chainUsed: null,
-            error: "Windsurf 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code|grok|agy",
+            error: (rawChain === "dsh" || rawChain === "deepseek-harness" ? "DSH" : "Windsurf")
+                + " 只支持 dataChain，不支持 modelChain；请改用 modelChain=auto|antigravity|codex|claude-code|grok|agy",
         };
     }
     const resolvedChain = normalizeChain(chain as string);

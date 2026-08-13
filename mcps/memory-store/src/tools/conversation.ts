@@ -22,7 +22,7 @@ import {
     type ConversationLoadResult,
     type ResolvedConversationChain,
 } from "../conversation-bridge.js";
-import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, resolveChainSplit } from "../chain.js";
+import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, DEFAULT_LINK_MODE, isDshAlias, resolveChainSplit } from "../chain.js";
 import { formatToolError } from "../error-format.js";
 import { dataChainInputSchema, dataChainValueSchema, modelChainInputSchema } from "./schema-utils.js";
 import { listConversationsByMtime } from "../ls-client.js";
@@ -88,6 +88,36 @@ import {
     type CodexFetchWorkerResult,
 } from "../conversation-fetch-worker-types.js";
 import { withConversationSourcePressure } from "../conversation-source-pressure.js";
+
+const CONVERSATION_DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness";
+const CONVERSATION_MODEL_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|grok|agy";
+
+function conversationDataChainValueSchema(parameterName = "dataChain", description?: string) {
+    const schemaDescription = description
+        ? `${description}；支持 ${CONVERSATION_DATA_CHAIN_ALLOWED}`
+        : `${parameterName} 对话数据链路；支持 ${CONVERSATION_DATA_CHAIN_ALLOWED}`;
+    return dataChainValueSchema(parameterName).describe(schemaDescription);
+}
+
+function conversationDataChainInputSchema(parameterName = "dataChain", description?: string) {
+    return conversationDataChainValueSchema(parameterName, description).optional();
+}
+
+function conversationModelChainInputSchema(parameterName = "modelChain", description?: string) {
+    const schemaDescription = description
+        ? `${description}；支持 ${CONVERSATION_MODEL_CHAIN_ALLOWED}`
+        : `${parameterName} 模型链路；支持 ${CONVERSATION_MODEL_CHAIN_ALLOWED}`;
+    return z.preprocess((input, context) => {
+        if (isDshAlias(input)) {
+            context.addIssue({
+                code: z.ZodIssueCode.custom,
+                message: `${parameterName} 不支持 dsh/deepseek-harness：DSH（DeepSeek Harness）只提供对话数据链路。请使用 dataChain="dsh"，并把 ${parameterName} 设为 ${CONVERSATION_MODEL_CHAIN_ALLOWED}`,
+            });
+            return z.NEVER;
+        }
+        return input;
+    }, modelChainInputSchema(parameterName)).describe(schemaDescription);
+}
 import { listLocalPbConversationCandidates } from "../conversation-local-list.js";
 import {
     formatConversationRecallRound,
@@ -475,7 +505,7 @@ function formatMissingConversationIdMessage(action: string, dataChain: DataChain
     return [
         `❌ conversation_read_original(${action}) 需要显式 conversationId`,
         `当前 dataChain=${dataChain}，共享后端不能安全推断“当前对话”，否则可能读到别的宿主或别的窗口里的对话。`,
-        `做法：先用 conversation_read_original(action="list", dataChain="${dataChain === "auto" ? "codex|antigravity|claude-code|windsurf" : dataChain}", query="标题或关键词") 定位 ID，再把 conversationId 传给 ${action}。`,
+        `做法：先用 conversation_read_original(action="list", dataChain="${dataChain === "auto" ? "codex|antigravity|claude-code|windsurf|dsh" : dataChain}", query="标题或关键词") 定位 ID，再把 conversationId 传给 ${action}。`,
         `注意：共享 broker 后端会拦截所有无 conversationId 的调用（含 antigravity）——跨 session 共享后端无法安全推断「当前对话」（与多窗口路由同源），「读当前窗口」兼容路径在 broker 下不可用，务必先 list 定位 ID 再显式传入。`,
     ].join("\n");
 }
@@ -1971,12 +2001,12 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool", "subagent"])).optional()
                 .describe("[read/export] 按消息角色选择性读取或导出。user=真实人类输入，system=规则/压缩/系统注入，model/assistant=模型回复，tool=工具/代码/任务事件，subagent=挂在父轮的子代理摘要"),
             chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
-                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\" 只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
-            dataChain: dataChainInputSchema("dataChain", "读取对话数据的宿主链路；未填用 chain。agy 与 Grok 只支持 modelChain"),
+                .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\"/\"dsh\"（含别名）只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
+            dataChain: conversationDataChainInputSchema("dataChain", "读取对话数据的宿主链路；未填用 chain。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
             source: z.enum(["auto", "local", "ls", "cache"]).default("auto")
                 .describe("fetch/read/search/export 原文来源：auto=本地一等来源并按需比较 LS；local=只读 JSONL/PB；ls=仅 Windsurf/Antigravity；cache=只读已发布 fetch 缓存"),
-            dataChains: z.array(dataChainValueSchema("dataChains")).optional()
-                .describe("[list/export] 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\"]。未传时保持旧单 dataChain 行为"),
+            dataChains: z.array(conversationDataChainValueSchema("dataChains")).optional()
+                .describe("[list/export] 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\",\"dsh\"]。未传时保持旧单 dataChain 行为"),
             workspaces: z.array(z.string()).optional()
                 .describe("[list/export] 批量模式：按工作区路径过滤，可传一个或多个目录"),
             workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
@@ -1999,8 +2029,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[list/export] threadMode=children 时指定父线程 conversationId"),
             parentQuery: z.string().optional()
                 .describe("[list/export] threadMode=children 时用标题/ID/工作区唯一定位父线程；不唯一会返回诊断"),
-            parentDataChain: dataChainInputSchema("parentDataChain", "预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤。agy 与 Grok 只支持 modelChain"),
-            modelChain: modelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain；agy=本地 agy CLI（三模型内部 fallback），Grok=本机 progrok proxy。Windsurf 只支持 dataChain"),
+            parentDataChain: conversationDataChainInputSchema("parentDataChain", "预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
+            modelChain: conversationModelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain；agy=本地 agy CLI（三模型内部 fallback），Grok=本机 progrok proxy。Windsurf 与 DSH 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
                 .describe("Codex 链路下对子代理线程的呈现方式"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
@@ -2195,7 +2225,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         ];
                         return appendTiming({ content: [{ type: "text" as const, text: lines.join("\n") }] }, startTime);
                     }
-                    if (dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
+                    if (chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
                         const result = await listConversationCandidates({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
                             query,

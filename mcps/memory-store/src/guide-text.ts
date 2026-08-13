@@ -98,7 +98,7 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - Antigravity LS 链路下，conversationId 不填可默认当前对话；Codex / Claude Code / Windsurf 通过共享后端、本地 JSONL 或只读 LS 接口定位，必须显式传稳定 conversationId
 - extraTypes: 额外拉取 thinking/tool_results/code_actions/code_diffs/file_views
 - "chain=\"auto|antigravity|codex|claude-code|cc|grok|agy|windsurf|wsf\"" 为兼容旧参数；cc 会归一为 claude-code，wsf 会归一为 windsurf；chain="windsurf" 只作为 dataChain 兼容写法，modelChain 回落 auto；chain="grok"/"agy" 只作为 modelChain 兼容写法，dataChain 回落 auto
-- "dataChain=\"auto|antigravity|codex|claude-code|cc|windsurf|wsf\"" 控制原文来源；list/fetch/read/exact/fuzzy 主要使用 dataChain
+- "dataChain=\"auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness\"" 控制原文来源；list/fetch/read/exact/fuzzy 主要使用 dataChain
 - "modelChain=\"auto|antigravity|codex|claude-code|cc|grok|agy\"" 控制 smart 搜索的模型调用链路；显式 claude-code 只走 Claude Code CLI，显式 grok 只走本机 progrok proxy，显式 agy 只走本地 agy CLI 的三模型内部 fallback
 - modelChain 不支持 windsurf/wsf，dataChain 不支持 grok 或 agy；Windsurf 只提供对话数据，Grok 与 agy 都只提供模型调用链路
 - memory_query、memory_batch(query)、memory_write、memory_update、memory_stats(action="enhance") 也支持 modelChain；旧 chain 继续作为模型链路兼容别名
@@ -123,6 +123,7 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - Claude Code 对话与模型链路兼容(v1.14.0): 新增 dataChain/modelChain="claude-code" 与别名 "cc"；conversation_read_original 可读取 .claude/projects 下 JSONL，支持 list/fetch/read/search/deep_locate/contextProbe；Record/Golden Extract/Stage Guard 基于统一轮次工作，附件只懒解析元信息；Claude Code CLI 仅在显式 modelChain 或允许 fallback 时使用，并带 timeout/kill/输出预算。
 - Claude Code compact summary 折叠(v1.14.1): Claude Code compact_boundary + isCompactSummary 续聊摘要会作为压缩元信息处理；conversation_read_original(read) 默认按读取轮次懒导出临时 Markdown，depth="full" 或 compactionMode="full" 可展开但保留 marker，Record/Guard/Golden Extract/contextProbe/deep_locate 默认不把它当真实用户正文。
 - Windsurf 四数据链路兼容(v1.15.0): 新增 dataChain="windsurf" 与别名 "wsf"；conversation_read_original 通过 Windsurf Language Server 只读 Cascade 对话，支持 list/fetch/read/search；Record/Golden Extract/Stage Guard 可读取 WSF 对话并复用现有模型链路；不调用 WSF 模型代理、发送消息接口或 ACP summary-agent。
+- DeepSeek Harness 五数据链路兼容(v1.23.0): 新增只读 dataChain="dsh" 与别名 "deepseek-harness"；读取 DSH v0 session-persistence-jsonl 的 JSONL/Zstandard 会话并发布统一 fetch 缓存。仅 source.kind=user 的 user message 计入真人轮；DSH 不提供 modelChain，也不写回原始会话。
 - Windsurf 超大 step 降级(v1.15.1): 若 WSF LS 返回单个 step 超过 4MB 限制，conversation_read_original 会插入占位轮次并继续读取后续 steps；partial 结果会明确警告，且不会自动或显式写入正式 Record。
 - Windsurf 工具证据归一化(v1.15.2): WSF run command、MCP tool、find、view file、code action、list directory、command status 等 step 会进入 toolCalls/fileViews/codeActions；conversation_read_original(depth="full") 和 Stage Guard 可看到真实执行证据，避免因 WSF 工具步骤不可见误判虚标。
 - Windsurf fetch/read 缓存与诊断(v1.19.0): fetch 强刷并写 last-good，read/search 优先复用 TTL+LRU；默认 5 秒 fresh window 内不访问 LS，过窗 summary 校验 stepCount。partial、LS 异常或 stepCount>0 但 0 轮时不覆盖 last-good；无旧缓存则 read 明示 LS 读取不完整。read 独享格式化/附件预算，search/export/子线程展开保持旧行为。
@@ -201,8 +202,8 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - unknown 链迁移: record_manage(migrate_unknown_chain, scope, apply=false) 默认只读扫描 Codex、Claude Code、Windsurf、Antigravity 的权威 enumeration/exact-fetch/full-read 证据。仅一个宿主完整匹配且其余宿主可证明不存在时才提出 Patch；apply=true 才按 index revision/hash CAS 写入 chain。任一证据不完整或多宿主命中均保持 Unresolved/Conflict，不改索引，也不作为 batch_update 前置步骤
 - official home 止血: C:\\ 与 \\\\?\\C:\\ 等路径别名会归一；repair/update 会把旧 alias/general 副本 copy/upsert 到 official workspace，并用 ownership sidecar 标记 superseded，默认 list/search 不展示已取代副本
 - 降级: LS 不可用时自动从 Record 读取
-- 四数据链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退；chain="windsurf" 只代表 dataChain，modelChain 回落 auto；chain="grok"/"agy" 只代表 modelChain，dataChain 回落 auto
-- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 生成 Record；可读取 Codex/Claude Code/Windsurf 对话并用 Grok/progrok、agy CLI、Antigravity LS、Codex 或 Claude Code 模型生成。agy 不能填入 dataChain
+- 五数据链路约定: "chain=\"auto\"" 时优先当前宿主；dataChain/modelChain 未填时沿用 chain；显式指定链路时不静默回退；chain="windsurf" 或 "dsh" 只代表 dataChain，modelChain 回落 auto；chain="grok"/"agy" 只代表 modelChain，dataChain 回落 auto
+- 支持 dataChain/modelChain 拆分：dataChain 读取对话，modelChain 生成 Record；可读取 Codex/Claude Code/Windsurf/DSH 对话并用 Grok/progrok、agy CLI、Antigravity LS、Codex 或 Claude Code 模型生成。agy 不能填入 dataChain，DSH 不能填入 modelChain
 - Codex 链路下，Record 读取的对话原文来自本地线程索引与事件流，子代理内容默认以摘要或引用纳入；Claude Code 链路来自 .claude/projects JSONL
 - Codex/Claude Code 侧 update 必须显式传 conversationId；未传 background 时默认创建持久 scheduler Task 并返回 taskId，单更新与 batch 分别进入至少 8 槽的专用 materialization lane；lane 只编排任务，不拥有模型 permit。后续用 action="task_status" + taskId + waitSeconds=30-45 轮询
 - Grok Record 使用 grok-4.3，默认 prompt 上限 200000、输出上限 8192 tokens、超时 120000ms，可用 MEMORY_STORE_GROK_RECORD_MAX_PROMPT_CHARS / MEMORY_STORE_GROK_RECORD_MAX_TOKENS / MEMORY_STORE_GROK_RECORD_TIMEOUT 覆盖；agy Record 默认 prompt 上限 24000、总超时 5 分钟，可用 MEMORY_STORE_AGY_RECORD_MAX_PROMPT_CHARS / MEMORY_STORE_AGY_RECORD_TIMEOUT 覆盖，三模型内部 fallback 共用同一预算；Codex/Claude Code 本地模型桥 Record 会按较小 prompt 批次生成，Codex 后台单批默认允许 8 分钟，可用 MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT 覆盖；Claude Code 可用 MEMORY_STORE_CC_RECORD_BACKGROUND_TIMEOUT_MS 覆盖

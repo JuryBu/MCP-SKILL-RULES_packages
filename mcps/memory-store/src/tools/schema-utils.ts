@@ -2,7 +2,7 @@ import { z } from "zod";
 import { CHAIN_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES } from "../chain.js";
 
 const MODEL_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|grok|agy";
-const DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf";
+const DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness";
 
 function modelChainError(parameterName: string, received: unknown): string {
     const value = String(received || "").trim().toLowerCase();

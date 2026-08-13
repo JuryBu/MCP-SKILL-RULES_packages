@@ -1,6 +1,6 @@
-# MCP Memory Store v1.22.9
+# MCP Memory Store v1.23.0
 
-AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
+AI 主动记忆管理系统 + 五数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
 ## 功能
 
@@ -21,11 +21,11 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **进程生命周期容错** (v1.7+)：ppid 连续 3 次失败容错 + stdin 断裂诊断增强 + 非 LS 环境 1h 空闲超时兜底
 - **对话记录 Record** (v1.8+ / 持久调度 v1.20+)：模型自动生成对话过程日志，抗 LS 过期，超长 prompt 分批处理；更新会冻结来源快照并物化为 Task → Record → Unit → Attempt，持久 scheduler 负责公平排队、取消、崩溃恢复和多步提交，同一逻辑 revision 由 Record work registry 去重
 - **Stage Guard 任务完整性验证** (v1.9+ / 多实例 v1.19.2+)：四层防御网（RULES + 工具提醒 + 🔒标记 + 用户审计），审核模型比对 Plan/Task vs 执行记录。GuardKey 由 conversationId + stageId + childScopeId 组成，每次 start 生成不可变 guardId；同一 Task 可并存多个 Guard，pass/cancel/force 只处理目标实例。子任务用 scopeSelectors 定义局部审核范围，status(listAll=true) 不读取对话即可列出全部活跃 Guard。
-- **四宿主统一 Fetch 缓存与来源控制** (v1.22+)：Codex、Claude Code、Windsurf、Antigravity 统一发布可校验、不可变的 fetch cache generation；Codex/Claude Code 对大 JSONL 流式增量读取，Windsurf/Antigravity 即使 IDE 与 Language Server 均未启动，也能直接解密 active/implicit 本地 PB。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。
+- **五宿主统一 Fetch 缓存与来源控制** (v1.23+)：Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 统一发布可校验、不可变的 fetch cache generation；DSH 只读 v0 session-persistence-jsonl 的 JSONL/Zstandard 会话，其他宿主继续沿用 JSONL、PB 或 LS 来源。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。DSH 的 `.jsonl.zstd` 读取需要 Node 运行时提供 `zstdDecompressSync`（当前生产 Node 24 已满足）；旧 Node 仍可使用其它宿主链路，但 DSH 压缩会话会明确拒绝而不会误读。
 - **大结果可续读与对话语义** (v1.22+)：`read/search` 对约 100K 的结果返回继续位置，不再沿用古老的静默截断；连续人类消息归为同一人类轮，annotations 保留被批注文本与用户评论，子代理明确标注与主线程的角色关系。
 - **自动通道事件精简** (v1.22.7+)：QQ、微信及后续自动渠道的 wake/alert/notification/event 在 fetch cache 中统一保存为短结构化事件；`read/search/recall/export` 只呈现任务或订阅身份、待处理数量/序号摘要和 ACK 状态，不再把 `wake_id`、工具说明或长通知模板冒充用户原话，同时保留主人真实发言、批注、附件引用和对端任务正文。
 - **自动事件不占人类轮** (v1.22.8+)：Codex `<heartbeat>`、NapCat task/建链提醒、微信和腾讯文档 wake、子代理完成通知不再创建人类轮；`<codex_delegation>` / `<realtime_delegation>` 仍是跨线程真实任务正文，`[NAPCAT_OWNER_REPLY]` 只剥离运输外壳并保留主人正文与附件引用。
-- **离线目录与压缩回溯 Recall** (v1.22.3+)：Windsurf/Antigravity 即使 IDE 与 Language Server 都关闭，也能从 active/implicit PB 元数据列出本地对话；四宿主 fetch cache generation 保存压缩边界元数据。`conversation_read_original(action="recall", recallMode="auto|manual|full")` 会先增量更新 fetch 缓存，再只从同一已提交 generation 恢复人类可见上下文；排除 thinking、工具结果、diff、Rules 注入和压缩摘要。`auto/manual` 继续遵守约 100K 分段交付，`full` 只返回带 SHA256 的临时文件。
+- **离线目录与压缩回溯 Recall** (v1.22.3+)：Windsurf/Antigravity 即使 IDE 与 Language Server 都关闭，也能从 active/implicit PB 元数据列出本地对话；五宿主 fetch cache generation 保存压缩边界元数据。`conversation_read_original(action="recall", recallMode="auto|manual|full")` 会先增量更新 fetch 缓存，再只从同一已提交 generation 恢复人类可见上下文；排除 thinking、工具结果、diff、Rules 注入和压缩摘要。`auto/manual` 继续遵守约 100K 分段交付，`full` 只返回带 SHA256 的临时文件。
 - **旧 fetch 缓存自动迁移** (v1.22.9+)：缓存格式升级为 `conversation-source-cache/v3`，首次访问旧 generation 时按原始来源单航班重建，确保自动事件移出人类轮后全局轮号与统计同步重排；搜索继续安全处理历史对象/数组字段。
 - **本地 PB 全量统计** (v1.22.5+)：Windsurf/Antigravity 的 fetch 缓存保存整段对话的 AI 回复与工具调用总数；范围读取继续显示全量统计，旧缓存缺少统计字段时首次访问自动重建。
 - **Record/Guard 缓存稳定性** (v1.22+)：Record 只使用已校验的不可变 fetch cache generation，不再回读可能达到 2GB 的原始对话文件；为保证 Phase 回滚正确性，会物化完整规范化缓存而非仅保存尾部。Stage Guard 的 `start` 以常数时间 O(1) 建立状态，遵守模型预算并保持稳定 `taskId`，让重试与恢复指向同一任务。
@@ -86,22 +86,23 @@ AI 主动记忆管理系统 + 四数据链路对话原文阅读器 + 附件懒�
 - **Codex 原文附件懒解析** (v1.12.2+)：Codex 图片可从 JSONL 内联 `data:image/...`、`local_images` 和 `Files mentioned` 文本块恢复为可读附件；`fetch` 只统计附件，`read/search/export` 命中轮次时才按需并行生成或复制图片，带哈希缓存、数量上限和大小上限。
 - **Stage Guard 自指收口识别** (v1.12.3+)：当 Guard 明确承认实质产物、测试或用户裁定证据已充分，唯一缺口只是“本次 Guard 结果 / PASS 记录 / 完成标记”等后置记录时，自动按通过收口并保留 warning；混有真实代码、测试、文件缺口时仍保持失败。
 
-## 四数据链路与模型链路说明
+## 五数据链路与模型链路说明
 
 - `chain="auto"`：优先使用当前宿主链路；当前宿主不可用时，才尝试其它链路
 - `chain="antigravity"`：强制走 Antigravity Language Server 链路；目标宿主不在线时直接报错
 - `chain="codex"`：强制走 Codex 本地线程/模型桥链路；目标宿主不在线时直接报错
 - `chain="claude-code"` / `chain="cc"`：强制走 Claude Code 本地 JSONL / CLI 链路；`cc` 会在内部归一为 `claude-code`
 - `chain="windsurf"` / `chain="wsf"`：只在读取对话数据的工具里作为 `dataChain="windsurf"` 兼容写法；模型链路不会走 WSF，会回落 `auto`
+- `chain="dsh"` / `chain="deepseek-harness"`：只作为 `dataChain="dsh"` 兼容写法；模型链路回落 `auto`，显式 `modelChain="dsh"` 会报错
 - `chain="grok"`：只作为 `modelChain="grok"` 兼容写法；`dataChain` 保持 `auto`，显式 `dataChain="grok"` 不支持
 - `chain="agy"`：只作为 `modelChain="agy"` 兼容写法；`dataChain` 保持 `auto`，显式 `dataChain="agy"` 会明确报错
 - `dataChain` / `modelChain`：把“读取数据”和“调用模型”拆到不同链路；未填时分别继承 `chain`
-- 兼容规则：`chain` 未填默认为 `auto`，`dataChain` 未填用 `chain`，`modelChain` 未填用 `chain`；如果 `chain` 是 `windsurf/wsf`，`modelChain` 会按 `auto` 处理；如果 `chain` 是 `grok` 或 `agy`，`dataChain` 会按 `auto` 处理
+- 兼容规则：`chain` 未填默认为 `auto`，`dataChain` 未填用 `chain`，`modelChain` 未填用 `chain`；如果 `chain` 是 `windsurf/wsf` 或 `dsh/deepseek-harness`，`modelChain` 会按 `auto` 处理；如果 `chain` 是 `grok` 或 `agy`，`dataChain` 会按 `auto` 处理
 - `conversation_read_original` 的 `list/fetch/read/exact/fuzzy` 主要使用 `dataChain`；`list/search` 的 `smart` 模式用 `dataChain` 读取候选摘要、`modelChain` 调模型
 - `conversation_golden_extract` 用 `dataChain` 读取对话、`modelChain` 调模型提取黄金片段
 - 模型调用的 `auto` 优先探测 Grok/progrok，只有 `MEMORY_STORE_AGY_AUTO_ENABLED=1` 时才接着探测 agy CLI，然后 fallback 到 Antigravity LS、Codex 模型桥，必要时才按调用点允许使用 Claude Code CLI
 - 显式指定 `chain="antigravity"`、`chain="codex"`、`chain="claude-code"`、`chain="grok"` 或 `chain="agy"` 时，不做跨宿主静默回退；显式 `modelChain="agy"` 只走 agy 内部三模型 fallback
-- `modelChain` 只支持 `auto|antigravity|codex|claude-code|cc|grok|agy`；传入 `windsurf/wsf` 会明确报错，`dataChain="agy"` 也会明确报错
+- `modelChain` 只支持 `auto|antigravity|codex|claude-code|cc|grok|agy`；传入 `windsurf/wsf|dsh|deepseek-harness` 会明确报错，`dataChain="agy"` 也会明确报错
 - Grok/progrok 不会由 memory-store 自动启动，只会探测 `MEMORY_STORE_GROK_PROXY_URL`；真实 smoke 前需确保 proxy 已在本机运行
 - Codex 模型桥默认值：`gpt-5.5` + `model_reasoning_effort=medium` + `model_speed_tier=fast`
 - Claude Code CLI 默认值：`MEMORY_STORE_CC_MODEL=sonnet`、`MEMORY_STORE_CC_EFFORT=medium`；普通 `modelChain="auto"` 不默认消耗 CC 额度，CC 相关非 Record 模型任务才允许按 `Antigravity > Codex > Claude Code CLI` fallback。
