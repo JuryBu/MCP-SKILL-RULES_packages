@@ -30,7 +30,7 @@ function runFakeAppServer(mode) {
   });
   const handleMessage = (message) => {
     if (!message || typeof message !== "object") return;
-    if (message.method) log(message.method);
+    if (message.method) log(`${message.method}:${JSON.stringify(message.params ?? {})}`);
     if (message.method === "initialized") return;
     if (message.method === "initialize") {
       send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "test" } });
@@ -167,6 +167,7 @@ if (fakeArgumentIndex >= 0) {
       assert.match(fixture.stderr.join(""), /fake:initialize/);
       assert.match(fixture.stderr.join(""), /fake:initialized/);
       assert.match(fixture.stderr.join(""), /fake:thread\/resume/);
+      assert.match(fixture.stderr.join(""), /fake:thread\/resume:\{\"threadId\":\"thread-example-primary\",\"excludeTurns\":true\}/);
       assert.match(fixture.stderr.join(""), /fake:turn\/start/);
     } finally {
       await fixture.close();

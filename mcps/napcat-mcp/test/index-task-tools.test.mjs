@@ -119,7 +119,7 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       clientInfo: { name: "task-tool-test", version: "1.0.0" },
     });
     assert.equal(initialize.error, undefined);
-    assert.equal(initialize.result.serverInfo.version, "0.3.13");
+    assert.equal(initialize.result.serverInfo.version, "0.3.14");
     fixture.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
     const listedTools = await fixture.request("tools/list", {});

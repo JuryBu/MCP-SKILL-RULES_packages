@@ -65,17 +65,15 @@ test("wake journal replaces a subscription only when generation increases", () =
   }
 });
 
-test("transparent proxy keeps Desktop connected while App Server restarts", { timeout: 15000 }, async (context) => {
+test("established upstream loss closes Desktop so Codex performs an authoritative resync", { timeout: 15000 }, async (context) => {
   const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
   let upstream = null;
-  let hiddenInitializeCount = 0;
   const startUpstream = async () => {
     const server = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
     server.on("connection", (socket) => {
       socket.on("message", (data) => {
         const message = JSON.parse(data.toString("utf8"));
         if (message.method === "initialize") {
-          if (Number(message.id) < 0) hiddenInitializeCount += 1;
           socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { serverInfo: { name: "fake" } } }));
         } else if (Object.hasOwn(message, "id")) {
           socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { echoed: message.method } }));
@@ -128,15 +126,64 @@ test("transparent proxy keeps Desktop connected while App Server restarts", { ti
   await waitFor(() => proxy.status().readyClientCount === 1);
 
   await stopUpstream();
-  await waitFor(() => proxy.status().readyClientCount === 0);
-  assert.equal(desktop.readyState, WebSocket.OPEN);
+  await waitFor(() => desktop.readyState === WebSocket.CLOSED);
+  assert.equal(proxy.status().clientCount, 0);
   await startUpstream();
+  const resumedDesktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  context.after(() => resumedDesktop.terminate());
+  const resumedResponses = [];
+  resumedDesktop.on("message", (data) => resumedResponses.push(JSON.parse(data.toString("utf8"))));
+  await new Promise((resolve, reject) => {
+    resumedDesktop.once("open", resolve);
+    resumedDesktop.once("error", reject);
+  });
+  resumedDesktop.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "initialize", params: {} }));
+  await waitFor(() => resumedResponses.some((message) => message.id === 2));
+  resumedDesktop.send(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "desktop/after-restart", params: {} }));
+  await waitFor(() => resumedResponses.some((message) => message.id === 3));
+  assert.equal(resumedResponses.find((message) => message.id === 3).result.echoed, "desktop/after-restart");
+  assert.equal(resumedDesktop.readyState, WebSocket.OPEN);
+});
+
+test("downstream heartbeat terminates a half-open Desktop connection", { timeout: 8000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", (socket) => {
+    socket.on("message", (data) => {
+      const message = JSON.parse(data.toString("utf8"));
+      if (message.method === "initialize") {
+        socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { serverInfo: { name: "fake" } } }));
+      }
+    });
+  });
+  await new Promise((resolve, reject) => {
+    upstream.once("listening", resolve);
+    upstream.once("error", reject);
+  });
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "heartbeat-test-token",
+    heartbeatIntervalMs: 1000,
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`, { autoPong: false });
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise((resolve) => upstream.close(resolve));
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 9, method: "initialize", params: {} }));
   await waitFor(() => proxy.status().readyClientCount === 1);
-  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "desktop/after-restart", params: {} }));
-  await waitFor(() => responses.some((message) => message.id === 2));
-  assert.equal(responses.find((message) => message.id === 2).result.echoed, "desktop/after-restart");
-  assert.equal(desktop.readyState, WebSocket.OPEN);
-  assert.equal(hiddenInitializeCount, 1);
+  await waitFor(() => desktop.readyState === WebSocket.CLOSED, 5000);
+  assert.equal(proxy.status().clientCount, 0);
+  assert.equal(proxy.status().lastError.code, "DOWNSTREAM_HEARTBEAT_TIMEOUT");
 });
 
 test("transparent proxy accepts Desktop before App Server starts and replays queued initialization", { timeout: 15000 }, async (context) => {
@@ -194,6 +241,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   const token = "test-token-that-is-long-enough";
   let turnStartCount = 0;
   let threadResumeCount = 0;
+  const threadResumeParams = [];
   const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
   upstream.on("connection", (socket) => {
     socket.on("message", (data) => {
@@ -202,6 +250,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
         socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { serverInfo: { name: "fake" } } }));
       } else if (message.method === "thread/resume") {
         threadResumeCount += 1;
+        threadResumeParams.push(message.params);
         socket.send(JSON.stringify({
           jsonrpc: "2.0",
           id: message.id,
@@ -285,6 +334,7 @@ test("transparent proxy forwards Desktop traffic and suppresses duplicate wake_i
   assert.equal(first.turn.id, "turn-1");
   assert.equal(turnStartCount, 1);
   assert.equal(threadResumeCount, 1);
+  assert.deepEqual(threadResumeParams, [{ threadId: "thread-test", excludeTurns: true }]);
 
   const concurrentBody = {
     ...wakeBody,
@@ -671,6 +721,136 @@ test("accepted turn with journal commit failure becomes unknown and is never res
   assert.equal(retry.outcome, "unknown");
   assert.equal(retry.duplicateSuppressed, true);
   assert.equal(turnStartCount, 1);
+});
+
+test("large upstream text frames are forwarded without JSON materialization", { timeout: 15000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const largeValue = "x".repeat(512 * 1024);
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort, maxPayload: 2 * 1024 * 1024 });
+  upstream.on("connection", (socket) => socket.on("message", (data) => {
+    const message = JSON.parse(data.toString("utf8"));
+    if (message.method === "initialize") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
+    } else if (message.method === "large/result") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { value: largeValue } }));
+    }
+  }));
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "large-frame-token",
+    maxJsonParseBytes: 1024,
+    maxWebSocketPayloadBytes: 2 * 1024 * 1024,
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`, { maxPayload: 2 * 1024 * 1024 });
+  const responses = [];
+  desktop.on("message", (data) => responses.push(JSON.parse(data.toString("utf8"))));
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise((resolve) => upstream.close(resolve));
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+  await waitFor(() => responses.some((message) => message.id === 1));
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "large/result", params: {} }));
+  await waitFor(() => responses.some((message) => message.id === 2));
+  assert.equal(responses.find((message) => message.id === 2).result.value.length, largeValue.length);
+  assert.equal(proxy.status().limits.maxJsonParseBytes, 1024);
+});
+
+test("startup queue is bounded by bytes as well as message count", { timeout: 15000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "queue-byte-limit-token",
+    maxQueuedMessages: 10,
+    maxQueuedBytes: 1024,
+    reconnectInitialMs: 1000,
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", method: "queued/a", params: { value: "a".repeat(700) } }));
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", method: "queued/b", params: { value: "b".repeat(700) } }));
+  await waitFor(() => desktop.readyState === WebSocket.CLOSED);
+  assert.equal(proxy.status().clientCount, 0);
+  assert.equal(proxy.status().lastError.code, "DOWNSTREAM_QUEUE_OVERFLOW");
+});
+
+test("disconnect after a mutating wake write becomes unknown and is never replayed", { timeout: 15000 }, async (context) => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-proxy-mutation-disconnect-"));
+  let turnStartCount = 0;
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", (socket) => socket.on("message", (data) => {
+    const message = JSON.parse(data.toString("utf8"));
+    if (message.method === "initialize") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
+    } else if (message.method === "thread/resume") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { thread: { id: message.params.threadId, status: "idle" } } }));
+    } else if (message.method === "turn/start") {
+      turnStartCount += 1;
+      socket.terminate();
+    }
+  }));
+  const journalPath = path.join(temporaryRoot, "wake-journal.json");
+  const proxy = createCodexAppServerProxy({
+    downstreamPort,
+    controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "mutation-disconnect-token",
+    journal: createWakeJournal({ filePath: journalPath }),
+  });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise((resolve) => upstream.close(resolve));
+    fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  });
+  await new Promise((resolve, reject) => {
+    desktop.once("open", resolve);
+    desktop.once("error", reject);
+  });
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
+  await waitFor(() => proxy.status().readyClientCount === 1);
+  const wake = {
+    taskId: "task-mutation-disconnect",
+    generation: 1,
+    threadId: "thread-mutation-disconnect",
+    localRole: "development",
+    sourceMachine: "training",
+    targetMachine: "development",
+    trustedPeerQq: "1000000001",
+    wakeId: "wake-mutation-disconnect",
+    pendingThroughSequence: 1,
+    pendingThroughTime: "2026-08-13T00:00:00.000Z",
+    prompt: "[NAPCAT_TASK_WAKE] mutation disconnect",
+  };
+  await assert.rejects(() => proxy.wakeThread(wake), (error) => error?.outcomeUnknown === true);
+  const retry = await proxy.wakeThread(wake);
+  assert.equal(retry.outcome, "unknown");
+  assert.equal(retry.duplicateSuppressed, true);
+  assert.equal(turnStartCount, 1);
+  assert.equal(JSON.parse(fs.readFileSync(journalPath, "utf8")).wakes[wake.wakeId].status, "unknown");
 });
 
 test("corrupted wake journal fails closed instead of forgetting prior turns", () => {

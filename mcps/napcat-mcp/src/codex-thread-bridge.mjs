@@ -346,7 +346,7 @@ class CodexThreadBridge {
       : ["app-server", "--stdio"];
     this.makeResumeParams = typeof options.makeResumeParams === "function"
       ? options.makeResumeParams
-      : (threadId) => ({ threadId });
+      : (threadId) => ({ threadId, excludeTurns: true });
     this.makeTurnStartParams = typeof options.makeTurnStartParams === "function"
       ? options.makeTurnStartParams
       : ({ threadId, prompt }) => ({

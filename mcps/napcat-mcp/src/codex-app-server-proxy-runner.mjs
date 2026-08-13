@@ -5,6 +5,7 @@ import path from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
+import { renameReplaceSync } from "./atomic-file.mjs";
 import {
   CodexAppServerProxyError,
   createCodexAppServerProxy,
@@ -20,6 +21,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
 const DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS = 250;
+const DEFAULT_LIVENESS_INTERVAL_MS = 15000;
 
 const CLI_OPTIONS = new Set([
   "runtime-state",
@@ -68,11 +70,15 @@ function publicError(error, fallbackCode = "UNEXPECTED_ERROR") {
   };
 }
 
-function atomicWriteJson(filePath, value, fsImpl = fs) {
+export function atomicWriteJson(filePath, value, fsImpl = fs) {
   fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
   const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
-  fsImpl.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  fsImpl.renameSync(temporaryPath, filePath);
+  try {
+    fsImpl.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    renameReplaceSync(temporaryPath, filePath, { renameSync: fsImpl.renameSync.bind(fsImpl) });
+  } finally {
+    fsImpl.rmSync(temporaryPath, { force: true });
+  }
 }
 
 function readJsonObject(filePath, fsImpl = fs) {
@@ -625,11 +631,13 @@ export async function runCodexAppServerProxyService(options = {}) {
     restartFailureCount: 0,
     lastError: null,
     stopReason: null,
+    livenessAt: startedAt,
   };
   const ownsLock = () => lock.isOwner();
   const persist = (patch = {}) => {
     if (!ownsLock()) throw new CodexAppServerProxyError("INSTANCE_LOCK_LOST", "Codex App Server proxy instance no longer owns the lifecycle lock");
-    status = { ...status, ...patch, updatedAt: now().toISOString() };
+    const persistedAt = now().toISOString();
+    status = { ...status, ...patch, livenessAt: persistedAt, updatedAt: persistedAt };
     atomicWriteJson(options.runtimeStatePath, status, fsImpl);
     return status;
   };
@@ -724,7 +732,12 @@ export async function runCodexAppServerProxyService(options = {}) {
         } else if (event.type === "upstream_connected") {
           resumeAfterUpstream();
         }
-        if (event.type === "proxy_error") persist({ proxy: proxy?.status() ?? null, lastError: event.error });
+        if (["proxy_error", "upstream_session_lost", "upstream_connected"].includes(event.type)) {
+          persist({
+            proxy: proxy?.status() ?? null,
+            ...(event.type === "proxy_error" ? { lastError: event.error } : {}),
+          });
+        }
         log(event.type, event);
       },
     });
@@ -801,11 +814,16 @@ export async function runCodexAppServerProxyService(options = {}) {
           let cycleActive = true;
           const lifecycleWatch = (async () => {
             let nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
+            let nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
             while (cycleActive) {
               await wait(250);
               if (!cycleActive) return { code: null, signal: "watch_stopped" };
               if (stopRequested || fsImpl.existsSync(options.stopFilePath)) {
                 return { code: null, signal: "stop_requested" };
+              }
+              if (Date.now() >= nextLivenessAt) {
+                nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
+                persist({ proxy: proxy.status() });
               }
               if (Date.now() < nextRefreshAt) continue;
               nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);

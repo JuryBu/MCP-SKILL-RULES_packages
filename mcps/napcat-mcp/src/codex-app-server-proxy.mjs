@@ -7,6 +7,11 @@ import { WebSocket, WebSocketServer } from "ws";
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024;
+const DEFAULT_MAX_WEBSOCKET_PAYLOAD_BYTES = 512 * 1024 * 1024;
+const DEFAULT_MAX_JSON_PARSE_BYTES = 4 * 1024 * 1024;
+const DEFAULT_MAX_QUEUED_BYTES = 16 * 1024 * 1024;
+const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
+const DEFAULT_HEARTBEAT_INTERVAL_MS = 15000;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -27,20 +32,20 @@ function boundedInteger(value, fallback, minimum, maximum) {
   return Math.min(maximum, Math.max(minimum, Math.trunc(parsed)));
 }
 
-function parseJsonMessage(data) {
+function messageByteLength(data) {
+  if (Buffer.isBuffer(data)) return data.length;
+  if (ArrayBuffer.isView(data)) return data.byteLength;
+  if (data instanceof ArrayBuffer) return data.byteLength;
+  return Buffer.byteLength(String(data));
+}
+
+function parseJsonMessage(data, maximumBytes = DEFAULT_MAX_JSON_PARSE_BYTES) {
+  if (messageByteLength(data) > maximumBytes) return null;
   try {
     return JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
   } catch {
     return null;
   }
-}
-
-function recursiveContainsString(value, expected, depth = 0) {
-  if (depth > 16 || value === null || value === undefined) return false;
-  if (typeof value === "string") return value.includes(expected);
-  if (Array.isArray(value)) return value.some((item) => recursiveContainsString(item, expected, depth + 1));
-  if (!isObject(value)) return false;
-  return Object.values(value).some((item) => recursiveContainsString(item, expected, depth + 1));
 }
 
 function responseTurn(response) {
@@ -358,6 +363,36 @@ export class CodexAppServerProxy {
     this.reconnectInitialMs = boundedInteger(options.reconnectInitialMs, 250, 50, 60000);
     this.reconnectMaxMs = boundedInteger(options.reconnectMaxMs, 5000, this.reconnectInitialMs, 300000);
     this.maxQueuedMessages = boundedInteger(options.maxQueuedMessages, 1000, 1, 10000);
+    this.maxQueuedBytes = boundedInteger(
+      options.maxQueuedBytes,
+      DEFAULT_MAX_QUEUED_BYTES,
+      1024,
+      DEFAULT_MAX_WEBSOCKET_PAYLOAD_BYTES,
+    );
+    this.maxBufferedBytes = boundedInteger(
+      options.maxBufferedBytes,
+      DEFAULT_MAX_BUFFERED_BYTES,
+      1024,
+      DEFAULT_MAX_WEBSOCKET_PAYLOAD_BYTES,
+    );
+    this.maxWebSocketPayloadBytes = boundedInteger(
+      options.maxWebSocketPayloadBytes,
+      DEFAULT_MAX_WEBSOCKET_PAYLOAD_BYTES,
+      1024 * 1024,
+      1024 * 1024 * 1024 - 1,
+    );
+    this.maxJsonParseBytes = boundedInteger(
+      options.maxJsonParseBytes,
+      DEFAULT_MAX_JSON_PARSE_BYTES,
+      1024,
+      this.maxWebSocketPayloadBytes,
+    );
+    this.heartbeatIntervalMs = boundedInteger(
+      options.heartbeatIntervalMs,
+      DEFAULT_HEARTBEAT_INTERVAL_MS,
+      1000,
+      300000,
+    );
     this.WebSocketImpl = options.WebSocketImpl ?? WebSocket;
     this.WebSocketServerImpl = options.WebSocketServerImpl ?? WebSocketServer;
     this.journal = options.journal ?? null;
@@ -370,9 +405,11 @@ export class CodexAppServerProxy {
     this.nextInjectedRequestId = -1_000_000_000;
     this.websocketServer = null;
     this.controlServer = null;
+    this.heartbeatTimer = null;
     this.startedAt = null;
     this.closed = false;
     this.lastError = null;
+    this.lastIncident = null;
   }
 
   async start() {
@@ -382,6 +419,7 @@ export class CodexAppServerProxy {
       this.websocketServer = new this.WebSocketServerImpl({
         host: this.downstreamHost,
         port: this.downstreamPort,
+        maxPayload: this.maxWebSocketPayloadBytes,
       });
       this.websocketServer.on("connection", (socket) => this.#acceptDownstream(socket));
       this.websocketServer.on("error", (error) => this.#recordError("downstream_server", error));
@@ -404,6 +442,8 @@ export class CodexAppServerProxy {
       this.controlServer.on("error", (error) => this.#recordError("control_server", error));
       await this.#listenHttp(this.controlServer, this.controlPort, this.controlHost);
       this.startedAt = new Date().toISOString();
+      this.heartbeatTimer = setInterval(() => this.#checkHeartbeats(), this.heartbeatIntervalMs);
+      this.heartbeatTimer.unref?.();
       this.onEvent({ type: "proxy_started", status: this.status() });
       return this.status();
     } catch (error) {
@@ -425,6 +465,9 @@ export class CodexAppServerProxy {
       upstreamReady: client.upstreamReady,
       pendingInjectionCount: client.injected.size,
       queuedMessageCount: client.queued.length,
+      queuedBytes: client.queuedBytes,
+      downstreamBufferedBytes: client.downstream.bufferedAmount ?? 0,
+      upstreamBufferedBytes: client.upstream?.bufferedAmount ?? 0,
       reconnectAttempt: client.reconnectAttempt,
       nextReconnectAt: client.nextReconnectAt,
       connectedAt: client.connectedAt,
@@ -449,6 +492,15 @@ export class CodexAppServerProxy {
       maintenance: this.#maintenanceStatus(),
       journal: this.journal?.status?.() ?? null,
       lastError: this.lastError,
+      lastIncident: this.lastIncident,
+      limits: {
+        maxWebSocketPayloadBytes: this.maxWebSocketPayloadBytes,
+        maxJsonParseBytes: this.maxJsonParseBytes,
+        maxQueuedMessages: this.maxQueuedMessages,
+        maxQueuedBytes: this.maxQueuedBytes,
+        maxBufferedBytes: this.maxBufferedBytes,
+        heartbeatIntervalMs: this.heartbeatIntervalMs,
+      },
     };
   }
 
@@ -461,15 +513,14 @@ export class CodexAppServerProxy {
         "没有已初始化且上下游均在线的 Codex Desktop 连接",
       );
     }
-    const results = await Promise.all(
-      readyClients.map((client) => this.#injectRequest(
-        client,
-        "thread/resume",
-        { threadId: normalizedThreadId },
-        { threadId: normalizedThreadId, timeoutMs: this.resumeRequestTimeoutMs },
-      )),
+    const primary = readyClients[0];
+    const result = await this.#injectRequest(
+      primary,
+      "thread/resume",
+      { threadId: normalizedThreadId, excludeTurns: true },
+      { threadId: normalizedThreadId, timeoutMs: this.resumeRequestTimeoutMs },
     );
-    return { threadId: normalizedThreadId, readyClients, results };
+    return { threadId: normalizedThreadId, readyClients: [primary], results: [result] };
   }
 
   async subscribeTask(input) {
@@ -549,22 +600,6 @@ export class CodexAppServerProxy {
     let subscription;
     try {
       subscription = await this.subscribeThread(threadId);
-      const priorTurnVisible = subscription.results.some((result) => recursiveContainsString(result, wakeId));
-      if (priorTurnVisible) {
-        const recovered = this.journal.writeWake(wakeId, {
-          status: "recovered",
-          recoveredFromThread: true,
-        }, ["prepared"]);
-        return {
-          threadId,
-          wakeId,
-          outcome: "accepted",
-          started: false,
-          duplicateSuppressed: true,
-          recovered: true,
-          turn: recovered?.turnId ? { id: recovered.turnId, status: recovered.turnStatus ?? null } : null,
-        };
-      }
     } catch (error) {
       try {
         this.journal.writeWake(wakeId, {
@@ -680,6 +715,8 @@ export class CodexAppServerProxy {
   async close() {
     if (this.closed) return { closed: true };
     this.closed = true;
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
     for (const client of [...this.clients]) this.#closeClient(client, "proxy_closed");
     await Promise.all([
       this.#closeServer(this.websocketServer),
@@ -730,44 +767,47 @@ export class CodexAppServerProxy {
       upstream: null,
       initialized: false,
       initializationRequestId: null,
-      initializeParams: null,
-      initializedNotification: null,
       upstreamReady: false,
       hasConnectedBefore: false,
       queued: [],
+      queuedBytes: 0,
       injected: new Map(),
       connectedAt: new Date().toISOString(),
       closed: false,
       reconnectTimer: null,
       reconnectAttempt: 0,
       nextReconnectAt: null,
+      downstreamAlive: true,
+      upstreamAlive: false,
     };
     this.clients.add(client);
     downstream.on("message", (data, isBinary) => {
-      const message = parseJsonMessage(data);
+      client.downstreamAlive = true;
+      const message = parseJsonMessage(data, this.maxJsonParseBytes);
       if (message?.method === "initialize") {
         client.initializationRequestId = message.id ?? null;
-        client.initializeParams = message.params ?? {};
       } else if (message?.method === "initialized") {
         client.initialized = true;
-        client.initializedNotification = { data: isBinary ? data : data.toString("utf8"), isBinary };
       }
-      const payload = isBinary ? data : data.toString("utf8");
+      const payload = data;
+      const payloadBytes = messageByteLength(payload);
       if (client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
-        client.upstream.send(payload, { binary: isBinary });
+        this.#sendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream");
         return;
       }
-      if (client.queued.length >= this.maxQueuedMessages) {
+      if (client.queued.length >= this.maxQueuedMessages || client.queuedBytes + payloadBytes > this.maxQueuedBytes) {
         this.#closeClient(client, "downstream_queue_overflow", new CodexAppServerProxyError(
           "DOWNSTREAM_QUEUE_OVERFLOW",
-          `App Server 离线期间累计消息超过 ${this.maxQueuedMessages} 条，已关闭当前连接以避免无界占用`,
+          `App Server 启动期间累计消息超过安全上限，已关闭当前连接以避免无界占用`,
         ));
         return;
       }
-      client.queued.push({ data: payload, isBinary });
+      client.queued.push({ data: payload, isBinary, bytes: payloadBytes });
+      client.queuedBytes += payloadBytes;
     });
     downstream.on("close", () => this.#closeClient(client, "downstream_closed"));
     downstream.on("error", (error) => this.#closeClient(client, "downstream_error", error));
+    downstream.on("pong", () => { client.downstreamAlive = true; });
     this.#connectUpstream(client);
   }
 
@@ -783,28 +823,23 @@ export class CodexAppServerProxy {
       client.reconnectTimer = null;
     }
     client.nextReconnectAt = null;
-    const upstream = new this.WebSocketImpl(this.upstreamUrl);
+    const upstream = new this.WebSocketImpl(this.upstreamUrl, { maxPayload: this.maxWebSocketPayloadBytes });
     client.upstream = upstream;
     upstream.on("open", () => {
       if (client.closed || client.upstream !== upstream) return;
       client.reconnectAttempt = 0;
       client.nextReconnectAt = null;
-      if (!client.hasConnectedBefore) {
-        client.hasConnectedBefore = true;
-        client.upstreamReady = true;
-        this.#flushQueuedMessages(client, upstream);
-        this.onEvent({ type: "upstream_connected", connectedAt: client.connectedAt, restored: false });
-        return;
-      }
-      this.#restoreUpstream(client, upstream).catch((error) => {
-        if (client.closed || client.upstream !== upstream) return;
-        this.#recordError("upstream_restore_failed", error);
-        upstream.close();
-      });
+      client.upstreamAlive = true;
+      client.hasConnectedBefore = true;
+      client.upstreamReady = true;
+      this.lastError = null;
+      this.#flushQueuedMessages(client, upstream);
+      this.onEvent({ type: "upstream_connected", connectedAt: client.connectedAt, restored: false });
     });
     upstream.on("message", (data, isBinary) => {
       if (client.closed || client.upstream !== upstream) return;
-      const message = parseJsonMessage(data);
+      client.upstreamAlive = true;
+      const message = parseJsonMessage(data, this.maxJsonParseBytes);
       if (
         message
         && client.initializationRequestId !== null
@@ -827,11 +862,43 @@ export class CodexAppServerProxy {
         return;
       }
       if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
-        client.downstream.send(isBinary ? data : data.toString("utf8"), { binary: isBinary });
+        this.#sendOrClose(client, client.downstream, data, isBinary, "upstream_to_downstream");
       }
     });
     upstream.on("close", () => this.#handleUpstreamDisconnect(client, upstream, "upstream_closed"));
     upstream.on("error", (error) => this.#handleUpstreamDisconnect(client, upstream, "upstream_error", error));
+    upstream.on("pong", () => { client.upstreamAlive = true; });
+  }
+
+  #checkHeartbeats() {
+    for (const client of [...this.clients]) {
+      if (client.closed) continue;
+      if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
+        if (!client.downstreamAlive) {
+          client.downstream.terminate?.();
+          this.#closeClient(client, "downstream_heartbeat_timeout", new CodexAppServerProxyError(
+            "DOWNSTREAM_HEARTBEAT_TIMEOUT",
+            "Codex Desktop WebSocket 心跳超时",
+          ), 1012);
+          continue;
+        }
+        client.downstreamAlive = false;
+        client.downstream.ping?.();
+      }
+      if (client.upstream?.readyState === this.WebSocketImpl.OPEN) {
+        if (!client.upstreamAlive) {
+          const upstream = client.upstream;
+          upstream.terminate?.();
+          this.#handleUpstreamDisconnect(client, upstream, "upstream_heartbeat_timeout", new CodexAppServerProxyError(
+            "UPSTREAM_HEARTBEAT_TIMEOUT",
+            "Codex App Server WebSocket 心跳超时",
+          ));
+          continue;
+        }
+        client.upstreamAlive = false;
+        client.upstream.ping?.();
+      }
+    }
   }
 
   #handleUpstreamDisconnect(client, upstream, reason, error = null) {
@@ -847,26 +914,43 @@ export class CodexAppServerProxy {
       ));
     }
     client.injected.clear();
+    if (client.hasConnectedBefore) {
+      this.lastIncident = {
+        at: new Date().toISOString(),
+        code: "UPSTREAM_SESSION_LOST",
+        reason,
+        error: error ? publicError(error) : null,
+      };
+      this.onEvent({ type: "upstream_session_lost", incident: this.lastIncident });
+      this.#closeClient(client, "upstream_session_lost", error, 1012);
+      return;
+    }
     if (error) this.#recordError(reason, error);
     this.#scheduleReconnect(client, reason);
   }
 
-  async #restoreUpstream(client, upstream) {
-    if (client.initializeParams !== null) {
-      await this.#injectRequest(client, "initialize", client.initializeParams);
-    }
-    if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) return;
-    if (client.initializedNotification) {
-      upstream.send(client.initializedNotification.data, { binary: client.initializedNotification.isBinary });
-    }
-    client.upstreamReady = true;
-    this.#flushQueuedMessages(client, upstream);
-    this.onEvent({ type: "upstream_connected", connectedAt: client.connectedAt, restored: true });
-  }
-
   #flushQueuedMessages(client, upstream) {
     if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) return;
-    for (const queued of client.queued.splice(0)) upstream.send(queued.data, { binary: queued.isBinary });
+    for (const queued of client.queued.splice(0)) {
+      client.queuedBytes -= queued.bytes;
+      if (!this.#sendOrClose(client, upstream, queued.data, queued.isBinary, "queued_to_upstream")) break;
+    }
+    if (!client.queued.length) client.queuedBytes = 0;
+  }
+
+  #sendOrClose(client, socket, data, isBinary, source) {
+    if (socket.readyState !== this.WebSocketImpl.OPEN) return false;
+    if ((socket.bufferedAmount ?? 0) > this.maxBufferedBytes) {
+      this.#closeClient(client, `${source}_backpressure`, new CodexAppServerProxyError(
+        "WEBSOCKET_BACKPRESSURE",
+        `WebSocket 待发送数据超过 ${this.maxBufferedBytes} 字节，已关闭连接以触发权威重连`,
+      ), 1013);
+      return false;
+    }
+    socket.send(data, { binary: isBinary }, (error) => {
+      if (error) this.#closeClient(client, `${source}_write_failed`, error, 1011);
+    });
+    return true;
   }
 
   #scheduleReconnect(client, reason) {
@@ -931,7 +1015,7 @@ export class CodexAppServerProxy {
     });
   }
 
-  #closeClient(client, reason, error = null) {
+  #closeClient(client, reason, error = null, closeCode = 1000) {
     if (client.closed) return;
     client.closed = true;
     this.clients.delete(client);
@@ -946,7 +1030,9 @@ export class CodexAppServerProxy {
       ));
     }
     client.injected.clear();
-    if (client.downstream.readyState < this.WebSocketImpl.CLOSING) client.downstream.close();
+    if (client.downstream.readyState < this.WebSocketImpl.CLOSING) {
+      client.downstream.close(closeCode, String(reason).slice(0, 120));
+    }
     if (client.upstream?.readyState < this.WebSocketImpl.CLOSING) client.upstream.close();
     if (error) this.#recordError(reason, error);
     this.onEvent({ type: "client_closed", reason, connectedAt: client.connectedAt });

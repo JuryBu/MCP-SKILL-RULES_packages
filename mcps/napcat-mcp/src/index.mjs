@@ -537,7 +537,7 @@ const controlPlane = createControlPlane({
   bridge: { wake: async () => { throw new Error("入站唤醒只由 task router 执行"); } },
 });
 const server = new Server(
-  { name: "codex-napcat-training-notifier", version: "0.3.13" },
+  { name: "codex-napcat-training-notifier", version: "0.3.14" },
   {
     capabilities: {
       tools: { listChanged: false },

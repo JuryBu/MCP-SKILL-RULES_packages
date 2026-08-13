@@ -9,6 +9,7 @@ import { EventEmitter } from "node:events";
 import { promisify } from "node:util";
 import {
   acquireInstanceLock,
+  atomicWriteJson,
   findExecutableRefresh,
   parseArguments,
   runCodexAppServerProxyService,
@@ -136,6 +137,25 @@ test("proxy lock rejects a live PID whose instance token is stale", () => {
     assert.equal(lock.acquired, true);
     assert.notEqual(lock.metadata.token, "stale-token");
     lock.release();
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("atomic runtime writes remove temporary files after rename failure", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-atomic-cleanup-test-"));
+  const runtimePath = path.join(root, "runtime.json");
+  const fsImpl = {
+    ...fs,
+    renameSync() {
+      const error = new Error("simulated rename failure");
+      error.code = "EIO";
+      throw error;
+    },
+  };
+  try {
+    assert.throws(() => atomicWriteJson(runtimePath, { state: "running" }, fsImpl), /simulated rename failure/);
+    assert.equal(fs.readdirSync(root).some((name) => name.endsWith(".tmp")), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
