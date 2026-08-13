@@ -3035,11 +3035,14 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             ? " (Codex 本地会话)"
                             : loaded.chainUsed === "claude-code"
                                 ? " (Claude Code 本地会话)"
-                                : " (Windsurf Cascade)";
+                                : loaded.chainUsed === "dsh"
+                                    ? " (DeepSeek Harness 本地会话)"
+                                    : " (Windsurf Cascade)";
 
                     const workspace = loaded.codexData?.thread.cwd
                         || loaded.claudeCodeData?.thread.cwd
-                        || loaded.windsurfData?.thread.cwd;
+                        || loaded.windsurfData?.thread.cwd
+                        || (typeof loaded.dshData?.header.cwd === "string" ? loaded.dshData.header.cwd : undefined);
                     const recordNote = await scheduleFetchRecordAutoUpdate({
                         conversationId: cascadeId,
                         chainUsed: loaded.chainUsed,
