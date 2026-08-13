@@ -267,7 +267,11 @@ Codex 侧以下操作优先用后台模式：
 
 ### Codex 进程工具
 
-`codex_app__*` 是 Codex 原生任务管理接口，不走 MCP broker，速度更快。**获取当前对话 ID 的首选方法**：`codex_app__list_threads` 筛选 `status=active` + 比对当前工作目录。`codex_app__read_thread` 读取任务历史，比 MCP 的 `conversation_read_original` 更快，适合压缩后回溯。其余：`read_thread_terminal`（终端输出）、`load_workspace_dependencies`（打包库）、`create_thread`/`fork_thread`/`send_message_to_thread`/`handoff_thread`（任务管理）、`automation_update`（定时任务）。没有 `get_current_thread()`，需 `list_threads` + 筛选定位。
+`codex_app__*` 是 Codex 原生任务管理接口，不走 MCP broker，速度更快。**获取当前对话 ID 的首选方法**：`codex_app__list_threads` 筛选 `status=active` + 比对当前工作目录。普通短对话可用 `codex_app__read_thread` 快速读取；没有 `get_current_thread()`，需 `list_threads` + 筛选定位。
+
+历史读取命中以下任一信号时视为长对话：已知源文件达到约 100 MiB、包含数万项工具或步骤，或已有长期高频工具调用历史。长对话绝对优先使用带稳定 `conversationId` 的 `conversation_read_original`，按 `fetch/list → search/read` 分页获取；不能依赖原生工具的 `turnLimit`、`includeOutputs=false` 或输出截断参数控制前置内存占用。
+
+事前不知道体量时可以先做一次有界原生读取；若首次出现 app-server unavailable、超时、stream disconnected、客户端断开重连或异常内存增长，立即停止原生读取重试并改用 `conversation_read_original`，保留真实失败边界，不能把 UI 仍可用或任务列表可见当成定点读取成功。此分流只改变历史读取优先级，不改变 `list_threads`、`wait_threads`、`read_thread_terminal`、`load_workspace_dependencies`、`create_thread`/`fork_thread`/`send_message_to_thread`/`handoff_thread` 和 `automation_update` 等其它原生任务管理用途。
 
 原生任务工具只操作当前 Codex App Server 能列出的本机任务或显式已连接宿主；知道另一台电脑的 `conversationId` 不代表当前 App Server 能访问它。目标任务未出现在 `list_threads` 中，或发送返回 `No Codex thread found` 时，不要反复重试，也不要另建中转任务冒充跨机连接；已登记的开发机/训练机协作改用对应 `task_id` 的 NapCat 双机通道，本机可见任务才继续使用原生线程工具。
 
