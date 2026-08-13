@@ -12,7 +12,7 @@
 - 收到唤醒提示后自行读取当前任务消息，按需下载文件；处理完一条或多条后，按 `expected_generation=唤醒提示中的 generation`、原 `wake_id` 和 `processed_message_seqs` 精确 ACK，未列出的继续待处理
 - `machine_received` 只表示对端扫描到消息，`conversation_received` 表示可信消息已按绑定持久化进目标对话任务账本；wake cooldown 只延迟 UI 提醒，两种回执都不能代替业务 ACK
 - 需要回信的结构化任务必须明确识别 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`；双回执不是业务回答，预计处理超过 60 秒时先回 `IN_PROGRESS` 和新的检查时间；等待其它对话 20～30 分钟时设置一次性 `automation_update`，收到结果后撤销
-- 收到跨机投递严重告警后，维护对话立即按原 `delivery_id` 回复接警并核对两端 delivery、任务账本、router 与 wake 租约；不自动重发、不替生产对话 ACK、不关闭 task，也不为消警擅自降低生产 cooldown
+- 发送后没有 `machine_received` 时，先核对调用使用的精确 `task_id`、来源/目标方向、对端是否登记同一 task 及其目标 conversation；再检查两端 delivery、router、binding、任务账本和 wake 租约。只有这些身份都正确，才按投递事故处理；不自动重发、不替生产对话 ACK、不关闭 task，也不为消警擅自降低生产 cooldown。事故持续阻塞当前工作时，通过该维护任务已登记的 owner route 向主人发一条去重 QQ 通知
 - 群聊文件下载优先遵守主人、任务 manifest、调用参数或本机/当前任务既有的稳定目录约定；都没有指定时，才默认放入当前任务根目录的 `intake/<generation-or-round>/`，不得为了套用默认值移动已经下载好的文件
 - 同一扫描内多条新消息合并处理；普通消息没有新内容时不定时重发。仅对明确登记的双机结构化 task，未完成消息首次持续 12 小时仍无业务 ACK 时发送一条简短去重提醒，此后每满 12 小时至多再发一条，要求核对待办、精确 ACK 已完成项并报告异常；普通群聊、主人聊天和只读群消息不受影响
 - 模型可以按任务阶段调整自己的 `wake_cooldown_ms`，但不能绕开登记、可信发送者与 ACK 约束

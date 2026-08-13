@@ -14,7 +14,7 @@
 - `message_seq` 不保证数字递增；实际处理完一条或多条后，用提示中的 `wake_id` 调用 ACK，明确传 `expected_generation=唤醒提示中的 generation`，并在 `processed_message_seqs` 中只列出已完成消息
 - `machine_received` 只表示对端扫描到消息，`conversation_received` 表示可信消息已按绑定持久化进目标对话任务账本；wake cooldown 只延迟 UI 提醒，两种回执都不能代替业务 ACK
 - 需要对方回信的结构化任务必须显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`；双回执不等于业务回信，预计处理超过 60 秒时接收方先回一条 `IN_PROGRESS` 和新的检查时间；等待其它对话 20～30 分钟时设置一次性 `automation_update`，收到结果后撤销
-- 收到跨机投递严重告警后，维护对话立即按原 `delivery_id` 回复接警并核对两端 delivery、任务账本、router 与 wake 租约；不自动重发、不替生产对话 ACK、不关闭 task，也不为消警擅自降低生产 cooldown
+- 发送后没有 `machine_received` 时，先核对调用使用的精确 `task_id`、来源/目标方向、对端是否登记同一 task 及其目标 conversation；再检查两端 delivery、router、binding、任务账本和 wake 租约。只有这些身份都正确，才按投递事故处理；不自动重发、不替生产对话 ACK、不关闭 task，也不为消警擅自降低生产 cooldown。事故持续阻塞当前工作时，通过该维护任务已登记的 owner route 向主人发一条去重 QQ 通知
 - 新消息触发下一次合并提醒并带回旧待办；普通消息没有新内容时不定时重发。仅对明确登记的双机结构化 task，未完成消息首次持续 12 小时仍无业务 ACK 时发送一条简短去重提醒，此后每满 12 小时至多再发一条，要求核对待办、精确 ACK 已完成项并报告异常；该机制不得影响普通群聊、主人聊天或只读群消息
 - 逻辑任务迁移时，先登记新 `task_id`，双方完成握手并验证新 task 可收发，再关闭旧 task；不得先关旧 task 导致失联
 - `napcat_task_close` 会终止路由，关闭后该 task 的远端消息不会再唤醒对话；关闭前必须确认无未处理消息、无 active wake，并明确 `final_close` 或 `successor_task_id`

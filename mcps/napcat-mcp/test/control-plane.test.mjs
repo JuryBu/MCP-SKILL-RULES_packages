@@ -361,6 +361,9 @@ test("missing delivery receipts raise one severe alert per layer and one recover
     ]);
     assert.match(fixture.groupSends[0].message, /task：stable-task/);
     assert.match(fixture.groupSends[0].message, /是否执行：未知/);
+    assert.match(fixture.groupSends[0].message, /先核对 task_id、来源\/目标方向、对端任务登记与目标 conversation/);
+    assert.match(fixture.groupSends[0].message, /全部正确后才按投递事故处理/);
+    assert.match(fixture.groupSends[0].message, /已登记 owner route 向主人发一条去重 QQ 通知/);
   } finally {
     fixture.cleanup();
   }

@@ -387,7 +387,7 @@ export function createControlPlane(options = {}) {
       : "未知；本告警不会自动重发、执行或 ACK 业务消息";
     const action = recovered
       ? "系统已解除本层告警并继续按 delivery_id 对账"
-      : "系统继续按 delivery_id 对账，请检查对端路由、任务绑定和持久账本；不要按跨账号 message_seq 猜测状态";
+      : "先核对 task_id、来源/目标方向、对端任务登记与目标 conversation，再检查两端 router、binding、持久账本和 wake 租约；全部正确后才按投递事故处理。不要按跨账号 message_seq 猜测状态，不自动重发或代 ACK；若事故持续阻塞当前工作，维护对话应通过已登记 owner route 向主人发一条去重 QQ 通知";
     return [
       "[Codex][MESSAGE]",
       recovered ? "【跨机投递告警已恢复】" : "【跨机投递严重告警】",

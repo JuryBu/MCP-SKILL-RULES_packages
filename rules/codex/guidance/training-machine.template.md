@@ -64,7 +64,7 @@ Windows 睡眠、更新重启、断电和卡死按正常故障设计。定期保
 
 收到明确要求回信的结构化任务时，核对 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。运输双回执不能替代业务回答；预计超过 60 秒才能完成时先回 `IN_PROGRESS`，说明已开始、当前阻断与下一检查时间。需要等待开发机 20～30 分钟时设置一次性 `automation_update` 叫回检查，收到结果后撤销，不能让双方都以为对方会主动叫回。
 
-收到跨机投递严重告警后，训练机维护对话尽快通过维护 task 回带原 `delivery_id` 的接警消息，并核对发送侧 delivery、接收侧任务绑定/持久账本、router 与 wake 租约。不得自动重发业务消息、替生产对话 ACK、关闭 task 或按跨账号 `message_seq` 猜测状态。消息已持久化但处于合法 wake cooldown 时属于「已投递、待提醒」，不得按失联处置，也不应只为消警降低生产 task 的 cooldown；真实故障修复后等待系统恢复通知，再回报最终结果。
+发送后没有 `machine_received` 时，不得停在原 task 机械等待。先核对调用使用的精确 `task_id`、来源/目标机器方向、对端是否登记同一 task、目标 conversation 是否仍是当前维护核心；再检查发送侧 delivery、两端 router、binding、任务账本和 wake 租约。只有这些身份与运行状态都正确，才按投递事故处理并通过维护 task 回带原 `delivery_id` 的接警消息。不得自动重发业务消息、替生产对话 ACK、关闭 task 或按跨账号 `message_seq` 猜测状态。消息已持久化但处于合法 wake cooldown 时属于「已投递、待提醒」，不得按失联处置，也不应只为消警降低生产 task 的 cooldown；事故持续阻塞当前工作时，通过该维护任务已登记的 owner route 向主人发一条去重 QQ 通知。真实故障修复后等待系统恢复通知，再回报最终结果。
 
 旧任务意外关闭时调用 `napcat_connection_request` 提出重新建链。首次请求显式传本机 `source_conversation_id` 和已知的开发机 `target_conversation_id`，开发机校验可信机器后持久保存回拨地址；之后任一端可用 `reply_to_request_id`，或用稳定 `previous_task_id` 自动恢复该地址，不需要主人再次远程提供。双方对话 ID 只出现在建链控制消息中，普通任务消息、文件索引和 heartbeat 不重复携带。该请求只唤醒，不替开发机登记任务；双方必须各自核对并登记建议任务、互发握手，确认新路由后才恢复正式协作。
 
