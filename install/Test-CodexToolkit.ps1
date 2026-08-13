@@ -187,6 +187,7 @@ function Test-PackageStructure {
         "rules\windsurf\system_rules\collaboration.template.md",
         "rules\windsurf\system_rules\efficiency.template.md",
         "rules\windsurf\system_rules\rendering.template.md",
+        "mcps\napcat-mcp\INSTALL-CODEX.md",
         "mcps\napcat-mcp\binding.example.json",
         "mcps\napcat-mcp\heartbeat.example.json",
         "mcps\napcat-mcp\ops\start-napcat-login.ps1",
@@ -476,6 +477,10 @@ function Test-PackageStructure {
 
     $applyConfigScript = Join-Path $toolkitRoot "install\\Apply-CodexConfig.ps1"
     $configApplyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-config-apply-test-" + [guid]::NewGuid().ToString("N"))
+    $originalUserProfile = $env:USERPROFILE
+    $originalBrokerPort = $env:CODEX_MCP_BROKER_PORT
+    $originalExaRemoteUrl = $env:EXA_MCP_REMOTE_URL
+    $originalToolkitExaRemoteUrl = $env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL
     try {
         $fakeUserProfile = Join-Path $configApplyRoot "user"
         $fakeCodexHome = Join-Path $fakeUserProfile ".codex"
@@ -487,11 +492,13 @@ function Test-PackageStructure {
             "[features]",
             "test_feature = true"
         )
-        $originalUserProfile = $env:USERPROFILE
+        $env:CODEX_MCP_BROKER_PORT = "14588"
+        Remove-Item Env:EXA_MCP_REMOTE_URL -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL -ErrorAction SilentlyContinue
         try {
             $env:USERPROFILE = $fakeUserProfile
-            & $applyConfigScript | Out-Null
-            & $applyConfigScript | Out-Null
+            & $applyConfigScript -IncludeNapCat | Out-Null
+            & $applyConfigScript -IncludeNapCat | Out-Null
         } finally {
             $env:USERPROFILE = $originalUserProfile
         }
@@ -508,13 +515,21 @@ function Test-PackageStructure {
         if ($appliedConfig.IndexOf("project_doc_max_bytes") -gt $appliedConfig.IndexOf("[features]")) {
             throw "Apply-CodexConfig placed project_doc_max_bytes inside a TOML table."
         }
+        if ([regex]::Matches($appliedConfig, "(?m)^\[mcp_servers\.napcat\]\s*$").Count -ne 1) {
+            throw "Apply-CodexConfig -IncludeNapCat did not enable exactly one NapCat table."
+        }
+        if (-not $appliedConfig.Contains("url = `"http://127.0.0.1:14588/napcat/mcp`"")) {
+            throw "Apply-CodexConfig -IncludeNapCat wrote the wrong NapCat endpoint."
+        }
+        if ($appliedConfig -match "(?m)^\[mcp_servers\.wechat-docs\]\s*$") {
+            throw "Apply-CodexConfig -IncludeNapCat unexpectedly enabled WeChat Docs."
+        }
         Set-Content -LiteralPath $configApplyPath -Encoding UTF8 -Value @(
             "project_doc_max_bytes = 131_072",
             "",
             "[features]",
             "test_feature = true"
         )
-        $originalUserProfile = $env:USERPROFILE
         try {
             $env:USERPROFILE = $fakeUserProfile
             & $applyConfigScript | Out-Null
@@ -525,7 +540,38 @@ function Test-PackageStructure {
         if (-not $preservedAppliedConfig.Contains("project_doc_max_bytes = 131_072")) {
             throw "Apply-CodexConfig did not preserve an existing higher TOML-formatted project document limit."
         }
+
+        $env:EXA_MCP_REMOTE_URL = "https://example.invalid/mcp"
+        try {
+            $env:USERPROFILE = $fakeUserProfile
+            & $applyConfigScript | Out-Null
+        } finally {
+            $env:USERPROFILE = $originalUserProfile
+        }
+        $exaAppliedConfig = Get-Content -LiteralPath $configApplyPath -Raw -Encoding UTF8
+        if ([regex]::Matches($exaAppliedConfig, "(?m)^\[mcp_servers\.exa\]\s*$").Count -ne 1) {
+            throw "Apply-CodexConfig did not enable exactly one Exa table."
+        }
+        if ($exaAppliedConfig -match "(?m)^\[mcp_servers\.(napcat|wechat-docs)\]\s*$") {
+            throw "Enabling Exa unexpectedly enabled another optional MCP table."
+        }
     } finally {
+        $env:USERPROFILE = $originalUserProfile
+        if ($null -eq $originalBrokerPort) {
+            Remove-Item Env:CODEX_MCP_BROKER_PORT -ErrorAction SilentlyContinue
+        } else {
+            $env:CODEX_MCP_BROKER_PORT = $originalBrokerPort
+        }
+        if ($null -eq $originalExaRemoteUrl) {
+            Remove-Item Env:EXA_MCP_REMOTE_URL -ErrorAction SilentlyContinue
+        } else {
+            $env:EXA_MCP_REMOTE_URL = $originalExaRemoteUrl
+        }
+        if ($null -eq $originalToolkitExaRemoteUrl) {
+            Remove-Item Env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL -ErrorAction SilentlyContinue
+        } else {
+            $env:CODEX_TOOLKIT_EXA_MCP_REMOTE_URL = $originalToolkitExaRemoteUrl
+        }
         if (Test-Path -LiteralPath $configApplyRoot) {
             Remove-Item -LiteralPath $configApplyRoot -Recurse -Force
         }

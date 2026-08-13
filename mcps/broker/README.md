@@ -81,6 +81,7 @@ Local secrets:
 - The broker and Exa bridge may optionally load `broker-private.env.json` from this directory when it exists. Environment variables supplied by the shell always win.
 - This file is for local credentials and endpoints only. It is ignored by Git and must never be committed. Do not copy a private file from another installation.
 - Generate a unique `CODEX_MCP_BROKER_CONTROL_TOKEN` per receiver. The token is never returned by health, state, logs, or the reload response.
+- For the NapCat source-tree installation, create this private file with the receiver's OneBot endpoint, access token, unique control token, and binding path before the first broker start. `update-codex-napcat-bridge.ps1` then merges the managed NapCat code/data paths into the same file. Pass that source broker directory through `-BrokerRoot`; otherwise the endpoint and updater may read different private files. See `../napcat-mcp/INSTALL-CODEX.md`.
 
 Commands:
 

@@ -4,12 +4,12 @@
 
 ## 你会得到什么
 
-- 三个通用 MCP：memory-store 1.22.5、web-fetcher 7.0.0、sandbox 1.17.1。
+- 三个通用 MCP：memory-store 1.22.10、web-fetcher 7.0.0、sandbox 1.17.1。
 - 一个 portable HTTP broker 0.1.0，用于 Codex 和其他支持 HTTP MCP 的宿主。
 - 一个 Windsurf-only subagent 1.1.0，只在你明确安装并登录 Windsurf 后使用。
-- 一个可选 NapCat MCP 0.2.0，用于 QQ 群通知、跨设备任务账本、可信路由、Codex 对话唤醒和群文件传输；需要你自己的 NapCat、QQ 登录与群绑定。
+- 一个可选 NapCat MCP 0.3.14，用于 QQ 群通知、跨设备任务账本、可信路由、Codex 对话唤醒和群文件传输；需要你自己的 NapCat、QQ 登录与群绑定。
 - Codex、Antigravity、Claude Code、Windsurf 四宿主脱敏 Rules；Codex 额外提供中性、普通猫娘、开发机猫娘、训练机猫娘四种组合。
-- 17 个许可证允许迁移的 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
+- 18 个许可证允许迁移的 Skills、安装脚本、配置模板和 smoke test（基础功能验证测试）。
 
 ## 最短安装路径
 
@@ -50,6 +50,8 @@
 - 不会安装缺失的授权受限 Office skills。
 
 完整配置见 `SETUP.md`，组件细节见 `mcps/README_MCPS.md`，Rules 部署见 `rules/README_RULES.md`。
+
+需要启用 NapCat 与 Codex Desktop 原生未读提醒时，不要只复制一个 MCP URL；按 `mcps/napcat-mcp/INSTALL-CODEX.md` 完成 Broker 私有环境、NapCat 安装根、App Server 透明代理和重启验收。
 
 ---
 

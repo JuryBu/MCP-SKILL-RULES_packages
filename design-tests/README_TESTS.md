@@ -15,7 +15,7 @@
 - 六个 MCP 源码包存在且 package.json 可读，包括默认关闭的 NapCat 可选模块。
 - Codex、Antigravity、Claude Code、Windsurf Rules 结构完整。
 - Windsurf 的 global rule 和五个 system rule 分片齐全。
-- 17 个 Skills 均有 `SKILL.md` 且出现在 manifest。
+- 18 个 Skills 均有 `SKILL.md` 且出现在 manifest。
 - 四宿主 JSON 配置模板与两个 NapCat 示例 JSON 均能解析。
 - 不含绝对用户路径、credential-shaped 文本、数据库、日志、profile、session、构建产物。
 

@@ -2,6 +2,8 @@
 
 这是一个固定账号、固定任务群与私有通知目标的窄功能协作服务。AI 可以通过 NapCat OneBot HTTP API 向任务群发送运行状态和文本、读取最近消息、上传或下载群文件，也可以把经过身份校验的结构化任务消息路由回已经登记的 Codex 对话。主人私聊或通知群只能由本机私有 binding 预先命名，调用方不能临时指定任意群号或联系人。
 
+第一次在 Codex Desktop 接入时，请先按 `INSTALL-CODEX.md` 完成 Broker、私有绑定、透明 App Server 代理和重启后验收；本文件继续说明协议、安全边界和维护细节。
+
 本目录只包含 MCP 源码、示例绑定、测试和运维脚本，不包含 NapCat 本体、QQ 登录态、二维码、真实账号、真实群号、访问令牌或运行状态。接收方必须自行安装 NapCat 并在本机完成登录；broker 默认不启用本模块，只有设置 `CODEX_TOOLKIT_ENABLE_NAPCAT_MCP=1` 后才暴露 `/napcat/mcp`。
 
 ## 工具
@@ -139,8 +141,11 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 
 ```powershell
 # 在仓库根目录执行；首次迁移计划任务时加 -MigrateAutostart
+$brokerRoot = (Resolve-Path ".\mcps\broker").Path
 ./mcps/napcat-mcp/ops/update-codex-napcat-bridge.ps1 `
-  -SourceCommit "<git-commit>" -MigrateAutostart
+  -BrokerRoot $brokerRoot `
+  -SourceCommit "<git-commit>" `
+  -MigrateAutostart
 
 # 检查代理、监督器和任务路由
 ./mcps/napcat-mcp/ops/get-codex-app-server-proxy-status.ps1

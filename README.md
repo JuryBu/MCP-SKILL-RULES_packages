@@ -23,8 +23,8 @@
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
 | `mcp-subagent` | 1.1.0 | Windsurf Cascade 专属异步子代理控制器，可选安装 |
-| `napcat-mcp` | 0.3.9 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、自然私聊回复路由、热升级历史基线、群文件传输、监督器与安全更新 |
-| `wechat-docs-mcp` | 0.3.0 | 可选本地微信与腾讯文档双 M:N 订阅、独立投递/ACK、文档只读合并提醒、安全 outbound 骨架与当前用户监督器 |
+| `napcat-mcp` | 0.3.14 | 可选 QQ 群通知、任务账本、双机送达回执、可信路由、Codex 原生未读唤醒、自然私聊回复路由、热升级历史基线、群文件传输、监督器与安全更新 |
+| `wechat-docs-mcp` | 0.6.3 | 可选本地微信与腾讯文档双 M:N 订阅、独立投递/ACK、文档只读合并提醒、安全 outbound 骨架与当前用户监督器 |
 
 ## 重点能力
 
@@ -120,13 +120,13 @@ Codex Rules 还可选择 `neutral`、`development` 或 `training`。需要部署
 
 它不会自动修改 Windsurf 或其他宿主配置。请按 `mcps/mcp-subagent/README.md` 单独部署。
 
-检查可选 NapCat 模块源码：
+构建并检查可选 NapCat 模块源码：
 
 ```powershell
 ./install/Install-CodexToolkit.ps1 -IncludeNapCat
 ```
 
-NapCat 本体、QQ 登录态和真实群绑定不会被安装或打包；配置步骤见 `mcps/napcat-mcp/README.md`。
+NapCat 本体、QQ 登录态和真实群绑定不会被安装或打包。首次接入请直接按 `mcps/napcat-mcp/INSTALL-CODEX.md` 从 Broker、私有绑定、App Server 代理到最终验收顺序执行；协议和运维细节见 `mcps/napcat-mcp/README.md`。
 
 完整步骤见 `SETUP.md`，接收方快速说明见 `TOOLKIT_README.md`。
 
@@ -181,8 +181,8 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
 | `mcp-subagent` | 1.1.0 | Optional Windsurf Cascade-only asynchronous sub-agent controller |
-| `napcat-mcp` | 0.3.9 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, natural private-reply routing, hot-upgrade history baselines, file transfer, supervisor, and guarded updates |
-| `wechat-docs-mcp` | 0.3.0 | Optional governed local WeChat and Tencent Docs M:N subscriptions, independent delivery/ACK, read-only coalesced document wakes, safe outbound scaffolding, and a per-user supervisor |
+| `napcat-mcp` | 0.3.14 | Optional QQ group messaging, task ledger, cross-machine delivery receipts, trusted routing, native Codex unread wakeups, natural private-reply routing, hot-upgrade history baselines, file transfer, supervisor, and guarded updates |
+| `wechat-docs-mcp` | 0.6.3 | Optional governed local WeChat and Tencent Docs M:N subscriptions, independent delivery/ACK, read-only coalesced document wakes, safe outbound scaffolding, and a per-user supervisor |
 
 ## Highlights
 

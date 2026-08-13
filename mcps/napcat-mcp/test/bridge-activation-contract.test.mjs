@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
+const lifecycleInstallRoot = process.env.CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT || path.resolve("..", "..", "install");
+
 function read(relativePath) {
   return fs.readFileSync(path.resolve(relativePath), "utf8");
 }
@@ -104,9 +106,11 @@ test("candidate validation resolves the broker MCP SDK before entering maintenan
   assert.match(script, /CODEX_TOOLKIT_BROKER_ROOT/);
   assert.match(script, /Split-Path -Parent \(\[System\.IO\.Path\]::GetFullPath\(\[string\]\$_\)\)/);
   assert.match(script, /memory-store\\node_modules\\@modelcontextprotocol\\sdk\\dist\\esm/);
+  assert.match(script, /\$ValidationLifecycleInstallRoot = \[string\]\$env:CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT/);
+  assert.match(script, /Cannot validate the NapCat MCP candidate because the broker lifecycle install root is unavailable/);
   assert.ok(resolveIndex >= 0 && maintenanceIndex > resolveIndex, "SDK resolution must finish before maintenance starts");
   for (const command of ['@("ci")', '@("run", "check")', '@("test")']) {
-    assert.ok(script.includes(`-Arguments ${command} -McpSdkRoot $ValidationMcpSdkRoot`));
+    assert.ok(script.includes(`-Arguments ${command} -McpSdkRoot $ValidationMcpSdkRoot -LifecycleInstallRoot $ValidationLifecycleInstallRoot`));
   }
 });
 
@@ -207,6 +211,7 @@ test("legacy control-state migration rolls back when update fails before code in
       MEMORY_STORE_MCP_ROOT: "",
       CODEX_TOOLKIT_MCP_ROOT: "",
       CODEX_TOOLKIT_BROKER_ROOT: "",
+      CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT: lifecycleInstallRoot,
     },
   );
   const combinedOutput = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
@@ -405,6 +410,7 @@ test("guarded updater derives the validation SDK and managed npm without PATH no
       MEMORY_STORE_MCP_ROOT: "",
       CODEX_TOOLKIT_MCP_ROOT: "",
       CODEX_TOOLKIT_BROKER_ROOT: "",
+      CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT: lifecycleInstallRoot,
       CODEX_TOOLKIT_NODE_EXE: process.execPath,
       PATH: [
         path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0"),

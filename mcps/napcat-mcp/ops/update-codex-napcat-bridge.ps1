@@ -294,18 +294,28 @@ function Resolve-NpmInvocation {
 $NpmInvocation = Resolve-NpmInvocation -PreferredNode $NodeExecutable
 
 function Invoke-NpmChecked {
-  param([string]$Root, [string[]]$Arguments, [string]$McpSdkRoot = $null)
+  param(
+    [string]$Root,
+    [string[]]$Arguments,
+    [string]$McpSdkRoot = $null,
+    [string]$LifecycleInstallRoot = $null
+  )
   Push-Location $Root
   $PreviousMcpSdkRoot = $env:MCP_SDK_ROOT
+  $PreviousLifecycleInstallRoot = $env:CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT
   $PreviousPath = $env:PATH
   try {
     if (-not [string]::IsNullOrWhiteSpace($McpSdkRoot)) { $env:MCP_SDK_ROOT = $McpSdkRoot }
+    if (-not [string]::IsNullOrWhiteSpace($LifecycleInstallRoot)) {
+      $env:CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT = $LifecycleInstallRoot
+    }
     $env:PATH = "$($NpmInvocation.NodeDirectory);$PreviousPath"
     $InvocationArguments = @($NpmInvocation.PrefixArguments) + @($Arguments)
     & $NpmInvocation.FilePath @InvocationArguments | Out-Host
     if ($LASTEXITCODE -ne 0) { throw "npm $($Arguments -join ' ') failed with exit code $LASTEXITCODE" }
   } finally {
     $env:MCP_SDK_ROOT = $PreviousMcpSdkRoot
+    $env:CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT = $PreviousLifecycleInstallRoot
     $env:PATH = $PreviousPath
     Pop-Location
   }
@@ -377,12 +387,23 @@ $ValidationMcpSdkRoot = Resolve-McpSdkRoot
 if ([string]::IsNullOrWhiteSpace($ValidationMcpSdkRoot)) {
   throw "Cannot validate the NapCat MCP candidate because the broker MCP SDK path is unavailable. Check MCP_SDK_ROOT, MEMORY_STORE_MCP_ROOT, or CODEX_TOOLKIT_BROKER_ROOT before entering maintenance."
 }
+$ValidationLifecycleInstallRoot = [string]$env:CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT
+if ([string]::IsNullOrWhiteSpace($ValidationLifecycleInstallRoot)) {
+  $SourceRepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceRoot)
+  $SourceLifecycleInstallRoot = Join-Path $SourceRepositoryRoot "install"
+  if (Test-Path -LiteralPath (Join-Path $SourceLifecycleInstallRoot "Start-CodexMcpBroker.ps1") -PathType Leaf) {
+    $ValidationLifecycleInstallRoot = $SourceLifecycleInstallRoot
+  }
+}
+if ([string]::IsNullOrWhiteSpace($ValidationLifecycleInstallRoot) -or -not (Test-Path -LiteralPath (Join-Path $ValidationLifecycleInstallRoot "Start-CodexMcpBroker.ps1") -PathType Leaf)) {
+  throw "Cannot validate the NapCat MCP candidate because the broker lifecycle install root is unavailable. Set CODEX_NAPCAT_LIFECYCLE_INSTALL_ROOT or run from the complete public repository/package."
+}
 New-Item -ItemType Directory -Force -Path $BackupRoot | Out-Null
 try {
   Copy-CodeTree -From $SourceRoot -To $CandidateRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check") -McpSdkRoot $ValidationMcpSdkRoot
-  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test") -McpSdkRoot $ValidationMcpSdkRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("ci") -McpSdkRoot $ValidationMcpSdkRoot -LifecycleInstallRoot $ValidationLifecycleInstallRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("run", "check") -McpSdkRoot $ValidationMcpSdkRoot -LifecycleInstallRoot $ValidationLifecycleInstallRoot
+  Invoke-NpmChecked -Root $CandidateRoot -Arguments @("test") -McpSdkRoot $ValidationMcpSdkRoot -LifecycleInstallRoot $ValidationLifecycleInstallRoot
 } catch {
   try { Remove-Item -LiteralPath $BackupRoot -Recurse -Force -ErrorAction SilentlyContinue } catch {}
   throw

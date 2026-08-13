@@ -44,13 +44,15 @@ enabled = true
 # enabled = true
 
 # Optional QQ group collaboration endpoint. Enable the broker module and configure
-# a receiver-owned NapCat installation before uncommenting this block.
+# a receiver-owned NapCat installation first. Prefer
+# install/Apply-CodexConfig.ps1 -IncludeNapCat over editing this template.
 # [mcp_servers.napcat]
 # url = "http://127.0.0.1:14588/napcat/mcp"
 # enabled = true
 
 # Optional governed WeChat and Tencent Docs bridge. Enable the broker module and
 # configure receiver-owned private routes, database paths, and token files first.
+# Prefer install/Apply-CodexConfig.ps1 -IncludeWechatDocs over editing this template.
 # [mcp_servers.wechat-docs]
 # url = "http://127.0.0.1:14588/wechat-docs/mcp"
 # enabled = true
