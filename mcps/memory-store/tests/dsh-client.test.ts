@@ -15,7 +15,7 @@ const message = (role: string, source: Record<string, unknown>, content: unknown
 });
 
 const humanAndSynthetic = normalizeDshSessionEvents([
-    { type: "user/message", data: { message: message("user", { kind: "user" }, [{ type: "text", text: "真人问题" }]) } },
+    { type: "user/message", data: message("user", { kind: "user" }, [{ type: "text", text: "真人问题" }]) },
     { type: "user/message", data: { message: message("user", { kind: "plugin", plugin: "scheduler" }, [{ type: "text", text: "plugin context" }]) } },
     { type: "user/message", data: { message: message("user", { kind: "synthetic" }, [{ type: "text", text: "synthetic context" }]) } },
     { type: "user/message", data: { message: message("user", { kind: "subagent" }, [{ type: "text", text: "subagent context" }]) } },
@@ -28,6 +28,18 @@ assert.deepEqual(humanAndSynthetic[0].userMessages?.map(item => item.text), ["�
 assert.equal(humanAndSynthetic[0].userMessages?.some(item => item.text.includes("plugin context")), false);
 assert.equal(humanAndSynthetic[0].semanticEvents?.some(item => item.kind === "plugin_message" && item.semanticRole === "system"), true);
 assert.equal(humanAndSynthetic[0].semanticEvents?.filter(item => item.semanticRole === "system" && item.kind.endsWith("_message")).length, 4);
+
+const inboxMessage = { ...message("user", { kind: "user" }, [{ type: "text", text: "inbox 真人消息" }]), id: "human-1" };
+const inboxAndCanonical = normalizeDshSessionEvents([
+    { type: "agent/inbox/spliced", data: { target: "next-turn", inserted: [inboxMessage] } },
+    { type: "user/message", data: inboxMessage },
+] as any).rounds[0];
+assert.deepEqual(inboxAndCanonical.userMessages?.map(item => item.text), ["inbox 真人消息"]);
+
+const inboxOnly = normalizeDshSessionEvents([
+    { type: "agent/inbox/spliced", data: { target: "next-turn", inserted: [{ ...message("user", { kind: "user" }, [{ type: "text", text: "尚未落 canonical" }]), id: "pending-1" }] } },
+] as any).rounds[0];
+assert.deepEqual(inboxOnly.userMessages?.map(item => item.text), ["尚未落 canonical"]);
 
 const assistantAndTool = normalizeDshSessionEvents([
     { type: "turn/start", data: { turn: 1 } },

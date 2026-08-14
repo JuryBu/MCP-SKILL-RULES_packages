@@ -175,7 +175,10 @@ function hasModelSideActivity(round: ConversationRound): boolean {
 }
 
 function getMessage(data: UnknownRecord): UnknownRecord | null {
-    return asRecord(data.message);
+    const nested = asRecord(data.message);
+    if (nested) return nested;
+    if (typeof data.role === "string" && ("content" in data || "source" in data)) return data;
+    return null;
 }
 
 function getMessageContent(message: UnknownRecord | null): unknown {
@@ -233,6 +236,18 @@ export function normalizeDshSessionEvents(
     const toolCallSlots = new Map<string, { round: ConversationRound; index: number }>();
     const pendingToolResults = new Map<string, PendingToolResult>();
     let currentRound: ConversationRound | null = null;
+    const canonicalHumanMessageIds = new Set<string>();
+
+    for (const rawEvent of events) {
+        const event = asRecord(rawEvent);
+        if (asString(event?.type) !== "user/message") continue;
+        const data = asRecord(event?.data);
+        if (!data) continue;
+        const message = getMessage(data);
+        if (message?.role !== "user" || getSourceKind(message) !== "user") continue;
+        const id = asString(message.id);
+        if (id) canonicalHumanMessageIds.add(id);
+    }
 
     const ensureRound = (stepIndex: number): ConversationRound => {
         if (!currentRound) currentRound = newRound(rawRounds.length + 1, stepIndex);
@@ -305,6 +320,30 @@ export function normalizeDshSessionEvents(
         const created: ChunkState = { thinking: [], toolCalls: new Map(), emitted: false };
         chunks.set(key, created);
         return created;
+    };
+
+    const appendMessage = (stepIndex: number, eventType: string, message: UnknownRecord): void => {
+        const projection = projectContent(getMessageContent(message), stepIndex, eventType, diagnostics);
+        const isHuman = message.role === "user" && getSourceKind(message) === "user";
+        if (isHuman) {
+            const userText = [projection.visibleText, ...projection.references].filter(Boolean).join("\n");
+            if (currentRound && currentRound.userMessages?.length && hasModelSideActivity(currentRound)) {
+                rawRounds.push(currentRound);
+                currentRound = newRound(rawRounds.length + 1, stepIndex);
+            }
+            const round = ensureRound(stepIndex);
+            const userMessage: ConversationUserMessage = { stepIndex, text: userText, rawRole: eventType, semanticRole: "user", mediaAttachments: projection.references };
+            round.userMessages?.push(userMessage);
+            round.userMessage = (round.userMessages || []).map(item => item.text).filter(Boolean).join("\n\n");
+            round.mediaAttachments.push(...projection.references);
+            round.legacyRoundIndices?.push(round.legacyRoundIndices.length + 1);
+            appendSemanticEvent(stepIndex, { stepIndex, rawRole: eventType, semanticRole: "user", kind: "message", text: userText });
+            return;
+        }
+        const sourceKind = getSourceKind(message) || "unknown";
+        const rawText = projection.fullText || safeJson(message);
+        const automation = projectConversationAutomationInput(rawText);
+        appendSemanticEvent(stepIndex, { stepIndex, rawRole: `${eventType}:${sourceKind}`, semanticRole: "system", kind: automation ? "automation_event" : `${sourceKind}_message`, text: automation ? renderConversationAutomationEvent(automation.event) : rawText, ...(automation ? { automation: automation.event } : {}) });
     };
 
     const appendHeader = (): void => {
@@ -444,48 +483,23 @@ export function normalizeDshSessionEvents(
             });
             continue;
         }
+        if (eventType === "agent/inbox/spliced") {
+            const inserted = Array.isArray(data.inserted) ? data.inserted : [];
+            for (const candidate of inserted) {
+                const message = asRecord(candidate);
+                if (!message) continue;
+                const messageId = asString(message.id);
+                const isHuman = message.role === "user" && getSourceKind(message) === "user";
+                if (isHuman && messageId && canonicalHumanMessageIds.has(messageId)) continue;
+                appendMessage(eventIndex, `${eventType}:${asString(data.target) || "unknown"}`, message);
+            }
+            if (inserted.length === 0) appendSemanticEvent(eventIndex, { stepIndex: eventIndex, rawRole: eventType, semanticRole: "system", kind: "inbox_splice", text: `DSH inbox splice | target=${asString(data.target) || "unknown"} | inserted=0 | removed=${String(data.removedCount ?? 0)}` });
+            continue;
+        }
         if (eventType === "user/message") {
             const message = getMessage(data);
-            const projection = projectContent(getMessageContent(message), eventIndex, eventType, diagnostics);
-            const isHuman = message?.role === "user" && getSourceKind(message) === "user";
-            if (isHuman) {
-                const userText = [projection.visibleText, ...projection.references].filter(Boolean).join("\n");
-                if (currentRound && currentRound.userMessages?.length && hasModelSideActivity(currentRound)) {
-                    rawRounds.push(currentRound);
-                    currentRound = newRound(rawRounds.length + 1, eventIndex);
-                }
-                const round = ensureRound(eventIndex);
-                const userMessage: ConversationUserMessage = {
-                    stepIndex: eventIndex,
-                    text: userText,
-                    rawRole: eventType,
-                    semanticRole: "user",
-                    mediaAttachments: projection.references,
-                };
-                round.userMessages?.push(userMessage);
-                round.userMessage = (round.userMessages || []).map(item => item.text).filter(Boolean).join("\n\n");
-                round.mediaAttachments.push(...projection.references);
-                round.legacyRoundIndices?.push(round.legacyRoundIndices.length + 1);
-                appendSemanticEvent(eventIndex, {
-                    stepIndex: eventIndex,
-                    rawRole: eventType,
-                    semanticRole: "user",
-                    kind: "message",
-                    text: userText,
-                });
-                continue;
-            }
-            const sourceKind = getSourceKind(message) || "unknown";
-            const rawText = projection.fullText || safeJson(message);
-            const automation = projectConversationAutomationInput(rawText);
-            appendSemanticEvent(eventIndex, {
-                stepIndex: eventIndex,
-                rawRole: `${eventType}:${sourceKind}`,
-                semanticRole: "system",
-                kind: automation ? "automation_event" : `${sourceKind}_message`,
-                text: automation ? renderConversationAutomationEvent(automation.event) : rawText,
-                ...(automation ? { automation: automation.event } : {}),
-            });
+            if (message) appendMessage(eventIndex, eventType, message);
+            else diagnostics.push({ eventIndex, eventType, code: "malformed_event", detail: safeJson(data) });
             continue;
         }
         appendSemanticEvent(eventIndex, {

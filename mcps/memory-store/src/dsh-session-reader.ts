@@ -67,6 +67,7 @@ export interface DshSessionProvenance {
 
 export interface DshSessionSnapshot {
     id: string;
+    titleBestEffort?: string;
     header: DshSessionHeader;
     fingerprint: string;
     provenance: DshSessionProvenance;
@@ -109,6 +110,7 @@ type ReaderInput = DshReaderOptions | string | undefined;
 type ReadInput = DshSessionSnapshot | DshSessionReadOptions | string;
 
 const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
+const DSH_READER_REVISION = "2";
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
 
 export class DshSessionReaderError extends Error {
@@ -266,7 +268,10 @@ async function readCandidate(candidate: DshSessionCandidate, options: DshReaderO
         ? decodeZstdSource(source.bytes)
         : { text: decodeUtf8(source.bytes, "raw DSH JSONL"), ignoredTrailingZstdFrame: false };
     const parsed = parseDshJsonl(decoded.text);
-    const fingerprint = createHash("sha256").update(source.bytes).digest("hex");
+    const fingerprint = createHash("sha256")
+        .update(`dsh-reader:${DSH_READER_REVISION}\0`)
+        .update(source.bytes)
+        .digest("hex");
     const provenance: DshSessionProvenance = {
         source: "dsh",
         sessionsRoot: candidate.sessionsRoot,
@@ -281,12 +286,23 @@ async function readCandidate(candidate: DshSessionCandidate, options: DshReaderO
     };
     const snapshot: DshSessionSnapshot = {
         id: parsed.header.id,
+        titleBestEffort: latestSessionTitle(parsed.events),
         header: parsed.header,
         fingerprint,
         provenance,
         eventCount: parsed.events.length,
     };
     return { header: parsed.header, events: parsed.events, snapshot, fingerprint, provenance };
+}
+
+function latestSessionTitle(events: readonly DshSessionEvent[]): string | undefined {
+    for (let index = events.length - 1; index >= 0; index--) {
+        const event = events[index];
+        if (event.type !== "session/title" || Array.isArray(event.data) || !event.data) continue;
+        const title = event.data.title;
+        if (typeof title === "string" && title.trim()) return title.trim();
+    }
+    return undefined;
 }
 
 async function readStableSource(sourcePath: string, maxAttempts: number): Promise<StableSource> {

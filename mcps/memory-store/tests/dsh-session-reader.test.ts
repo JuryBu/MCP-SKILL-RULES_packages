@@ -56,11 +56,12 @@ async function run(): Promise<void> {
         assert.equal(resolveDshSessionsRoot({ env: {}, homeDir: "home" }), path.resolve("home", ".dsh", "sessions"));
 
         const rawPath = await sessionPath(root, "raw-project", "raw-directory");
-        await writeFile(rawPath, `${line(header("raw-id"))}${line(textEvent(0))}${line(reasoningEvent(1))}${line(toolEvent(2))}`, "utf8");
+        await writeFile(rawPath, `${line(header("raw-id"))}${line(textEvent(0))}${line({ type: "session/title", seq: 1, time: 1001, data: { title: "最新真实标题" } })}${line(reasoningEvent(2))}${line(toolEvent(3))}`, "utf8");
         const raw = await readDshSession("raw-id", { sessionsRoot: root });
-        assert.equal(raw.events.length, 3);
+        assert.equal(raw.events.length, 4);
         assert.deepEqual(raw.events[0], textEvent(0));
-        assert.deepEqual(raw.events[2], toolEvent(2));
+        assert.deepEqual(raw.events[3], toolEvent(3));
+        assert.equal(raw.snapshot.titleBestEffort, "最新真实标题");
         assert.equal(raw.provenance.format, "jsonl");
 
         const zstdPath = await sessionPath(root, "zstd-project", "zstd-directory", "session.jsonl.zstd");

@@ -270,11 +270,12 @@ function candidateFromDshSession(item: DshSessionSnapshot): UnifiedConversationC
     const parentConversationId = typeof header.parentSession === "string" ? header.parentSession : null;
     const isChildThread = parentConversationId !== null || header.origin === "subagent";
     const workspace = typeof header.cwd === "string" ? header.cwd : "";
-    const title = typeof header.title === "string"
+    const title = item.titleBestEffort
+        || (typeof header.title === "string"
         ? header.title
         : typeof header.agentPreset === "string"
             ? header.agentPreset
-            : item.id;
+            : item.id);
     return {
         id: item.id,
         dataChain: "dsh",
