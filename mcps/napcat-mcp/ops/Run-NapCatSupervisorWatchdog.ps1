@@ -12,6 +12,7 @@ $DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $Reso
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $StartScript = Join-Path $PSScriptRoot "start-napcat-supervisor.ps1"
 $ProxyStartScript = Join-Path $PSScriptRoot "start-codex-app-server-proxy.ps1"
+$ModelProxyStartScript = Join-Path $PSScriptRoot "start-codex-model-stream-proxy.ps1"
 $ProxyFallbackPath = Join-Path $DataRoot "state\codex-app-server-proxy-fallback.json"
 $WatchdogStatePath = Join-Path $DataRoot "supervisor-watchdog.json"
 $WatchdogLogPath = Join-Path $DataRoot "supervisor-watchdog.jsonl"
@@ -77,6 +78,9 @@ try {
   if (-not (Test-Path -LiteralPath $ProxyStartScript)) {
     throw "Codex App Server proxy start script is missing: $ProxyStartScript"
   }
+  if (-not (Test-Path -LiteralPath $ModelProxyStartScript)) {
+    throw "Codex model stream proxy start script is missing: $ModelProxyStartScript"
+  }
   if (-not (Test-Path -LiteralPath $NapCatMcpRoot)) {
     throw "NapCat MCP root is missing: $NapCatMcpRoot"
   }
@@ -84,6 +88,7 @@ try {
   New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
   while ($true) {
     try {
+      & $ModelProxyStartScript -DataRoot $DataRoot | Out-Null
       & $ProxyStartScript -DataRoot $DataRoot | Out-Null
       Apply-ProxyFallbackRequest
       $StartArguments = @{ DataRoot = $DataRoot }

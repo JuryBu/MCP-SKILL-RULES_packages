@@ -5,11 +5,12 @@
 ```text
 Codex Desktop
   ├─ HTTP MCP -> 127.0.0.1:14588/napcat/mcp -> 共享 Broker -> NapCat MCP backend -> OneBot
-  └─ WebSocket -> App Server 透明代理 -> 官方 Codex App Server
-                                      └─ task router 注入原生未读提醒
+  ├─ WebSocket -> App Server 透明代理 -> 官方 Codex App Server
+  │                                   └─ task router 注入原生未读提醒
+  └─ HTTP Responses -> 模型流量看门人 -> OpenAI
 ```
 
-Broker 负责让 Codex 稳定连接多个 MCP；NapCat MCP 负责固定群、任务账本和精确 ACK；App Server 透明代理只负责把已登记任务的提醒实时放进目标 Codex 对话。只配置 MCP URL 可以调用 QQ 工具，但不会自动得到原生侧边栏未读提醒。
+Broker 负责让 Codex 稳定连接多个 MCP；NapCat MCP 负责固定群、任务账本和精确 ACK；App Server 透明代理只负责把已登记任务的提醒实时放进目标 Codex 对话；模型流量看门人只负责普通模型请求长期无有效输出时的单请求透明重试。只配置 MCP URL 可以调用 QQ 工具，但不会自动得到原生侧边栏未读提醒，也不会启用模型请求看门人。
 
 ## 1. 安装边界
 
@@ -110,46 +111,72 @@ enabled = true
 
 如果配置文件已经手工定义同名表，脚本会在写入前拒绝，要求先人工合并，避免生成重复 TOML 表。
 
-## 7. 正常退出并重新打开 Codex
+## 7. 启用模型流量看门人
+
+先启动并验证本机回环代理，再预览和应用 `config.toml` 的自定义模型 provider：
+
+```powershell
+./mcps/napcat-mcp/ops/start-codex-model-stream-proxy.ps1 -DataRoot $napcatDataRoot
+./mcps/napcat-mcp/ops/get-codex-model-stream-proxy-status.ps1 -DataRoot $napcatDataRoot
+./mcps/napcat-mcp/ops/switch-codex-model-stream-proxy.ps1 -Action Preview
+./mcps/napcat-mcp/ops/switch-codex-model-stream-proxy.ps1 -Action Apply
+```
+
+`Apply` 只有在代理健康时才会继续，写入前会保存 `config.toml` 的精确字节备份，再用同目录临时文件原子替换。它把普通 Responses 请求送到 `127.0.0.1:18435`，仍由 Codex 自己附加和维护 ChatGPT 登录凭据；代理不保存或记录 Authorization。压缩、预热、记忆、未知请求以及带云端托管工具的请求都直接透传。
+
+若要退出此功能，执行下面的命令恢复原字节配置，然后重新打开 Codex：
+
+```powershell
+./mcps/napcat-mcp/ops/switch-codex-model-stream-proxy.ps1 -Action Rollback
+./mcps/napcat-mcp/ops/stop-codex-model-stream-proxy.ps1 -DataRoot $napcatDataRoot
+```
+
+## 8. 正常退出并重新打开 Codex
 
 首次启用透明代理后，完整退出 Codex Desktop，等待约 10 秒，再按原方式打开 Codex。通常不需要重启 Windows。这样新进程才能同时读取：
 
 - `config.toml` 中的 NapCat MCP endpoint
+- `config.toml` 中的本机模型流量看门 provider
 - 用户级 `CODEX_APP_SERVER_WS_URL` 透明代理地址
 
 如果 updater 输出 `restartCodexRequired=true`，就必须完成这一步；重新打开后该字段应归零。
 
-## 8. 验证运行链路
+## 9. 验证运行链路
 
 ```powershell
 ./install/Status-CodexMcpBroker.ps1
 ./mcps/napcat-mcp/ops/get-codex-app-server-proxy-status.ps1 -DataRoot $napcatDataRoot
+./mcps/napcat-mcp/ops/get-codex-model-stream-proxy-status.ps1 -DataRoot $napcatDataRoot
 ./mcps/napcat-mcp/ops/get-napcat-supervisor-status.ps1 -DataRoot $napcatDataRoot
 ./mcps/napcat-mcp/ops/get-napcat-task-router-status.ps1 -DataRoot $napcatDataRoot
 Invoke-RestMethod "http://127.0.0.1:14588/health?endpoint=napcat&deep=1"
 ```
 
-验收时至少确认：Broker 与 NapCat backend 深层健康、NapCat 工具列表可见、代理和监督器在运行、router 扫描时间持续推进、没有 `task-router.stop` 或维护残留。尚未登记 open task 时 router 可以保持待命，但不能把“没有 task”误报成 endpoint 故障。
+验收时至少确认：Broker 与 NapCat backend 深层健康、NapCat 工具列表可见、两类代理和监督器在运行、模型代理 `/health` 正常、router 扫描时间持续推进、没有 `task-router.stop` 或维护残留。尚未登记 open task 时 router 可以保持待命，但不能把“没有 task”误报成 endpoint 故障。
 
 然后使用独立测试对话和测试 `task_id` 做一次双向真实验证：目标对话未打开时出现原生未读标记，消息只出现一次，实际处理后用提示中的 generation、`wake_id` 和精确 `processed_message_seqs` ACK。不要拿生产 task 做首次试验。
 
-## 9. 后续更新怎么选
+## 10. 后续更新怎么选
 
 | 变化范围 | 推荐方式 | 是否退出 Codex |
 | --- | --- | --- |
 | 仅 NapCat backend、账本、router 或 supervisor | `-BackendOnlyHotReload -PreserveActiveWakes` | 通常不需要 |
 | App Server 代理源码或代理启停脚本变化 | 完整受保护更新 | 需要正常退出并重新打开 |
+| 模型流量看门人的已加载 core/runner 变化，但 provider 配置不变 | 完整受保护更新 | 通常不需要；只独立重启该代理 |
+| 模型 provider 配置变化 | `switch-codex-model-stream-proxy.ps1` | 需要重新打开 Codex |
 | 共享 Broker 本体变化 | 先验证候选，再用 `Update-CodexMcpBroker.ps1` | 通常不需要退出 Codex，但会短暂重启 Broker |
 | 只改 `config.toml` 的 endpoint 开关 | `Apply-CodexConfig.ps1` | 需要重新打开 Codex |
 
 实现、完整测试、打包和影子验证应在隔离环境完成；生产切换只执行已验证候选、备份、短热切和健康检查。更新失败时不要删 task 或清账，使用 updater 输出的 `backupRoot` 与 `rollback-codex-napcat-bridge.ps1` 恢复。
 
-## 10. 常见误区
+## 11. 常见误区
 
 - `machine_received` / `conversation_received` 只证明运输或持久化，不等于业务已经处理或 ACK。
 - Broker 端口能连接不等于子 backend 健康，验收要使用 `deep=1`。
 - `CodeRoot` 是可替换代码，`DataRoot` 是私有账本；绝不能用 GitHub 文件覆盖整个 DataRoot。
 - 原生未读提醒依赖透明代理；只看到群消息或数据库入账不等于 App Server 注入成功。
+- 模型流量看门人不监控 MCP、Sandbox 或本地工具执行；它只观察 OpenAI Responses 流是否产生有效内容。
+- 一旦普通回答已经产生正文、推理增量或工具调用参数，看门人不会重放整轮请求，避免重复文本或重复工具。
 - 不要把真实 binding、token、登录态、二维码、群文件、日志或 state 文件上传到 GitHub。
 
 协议、任务 M:N 绑定、owner route、精确 ACK、升级保护域和故障降级细节继续查阅 `README.md`；Broker timeout、endpoint reload 与私有环境规则查阅 `../broker/README.md`。

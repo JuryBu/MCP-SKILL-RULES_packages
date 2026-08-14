@@ -270,7 +270,7 @@ test("managed broker start uses manifest Node when PATH has no node", () => {
   }
 });
 
-test("portable 0.3.14 entrypoint defaults to backend-only hot reload", () => {
+test("portable package entrypoint defaults to backend-only hot reload", () => {
   const script = fs.readFileSync(path.join(napcatRoot, "package", "APPLY-NAPCAT-APPSERVER-UPGRADE.ps1"), "utf8");
   assert.match(script, /\[switch\]\$BackendOnlyHotReload\s*=\s*\$true/);
   assert.match(script, /ActivateNow\s*=\s*\[bool\]\$BackendOnlyHotReload/);

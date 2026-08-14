@@ -106,7 +106,7 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 维护升级默认等待所有活跃唤醒自然完成；确需在任务暂停期间保留未 ACK 唤醒时，可显式给 `ops/update-codex-napcat-bridge.ps1` 传 `-PreserveActiveWakes`。脚本会先进入维护态并停止任务路由器，再校验任务绑定、generation、逐消息账本和唤醒批次完全不变，之后才允许切换代码；它不会替模型 ACK，也不会清除待处理消息。
 
-仅修改 NapCat MCP 后端与任务路由、透明中转相关文件哈希完全未变时，可同时传 `-BackendOnlyHotReload`。升级器会证明代理关键文件逐个相同，只重载 NapCat broker 子进程并重启监督器和任务路由器，不结束 Codex，也不中断当前透明代理连接；任一代理文件变化时会拒绝该模式，必须改走完整升级。
+仅修改 NapCat MCP 后端与任务路由、App Server 透明中转和模型流量看门人相关文件哈希完全未变时，可同时传 `-BackendOnlyHotReload`。升级器会证明两类代理关键文件逐个相同，只重载 NapCat broker 子进程并重启监督器和任务路由器，不结束 Codex，也不中断当前代理连接；任一代理文件变化时会拒绝该模式，必须改走完整升级。
 
 维护发布按无感升级设计：实现、测试、干净包、回滚演练和双端影子验证全部在隔离环境完成，生产侧只执行已验证候选的约 1～2 分钟后端热切与健康检查，通常不需要生产停工，也不应反复找业务主线开放窗口。只有实时业务确实依赖该信道、存在不可保护状态或必须完整切换代理时，才携带候选身份、回滚入口和实时门槛协调一次短窗口。
 
@@ -130,6 +130,22 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 协议探针、唤醒日志、控制 token、运行状态和 fallback 请求都保存在私有 data root。唤醒日志损坏、协议不兼容、代理连续恢复失败或维护状态不可读时，系统采取两层降级：当前自动唤醒立即暂停；监督器在固定群发送一条去重告警并保留本地 incident 状态。看门狗随后清除用户级 `CODEX_APP_SERVER_WS_URL`，让下一次普通 Codex 启动回到官方原生路径。这个设计保证代理故障不会持续阻止 Codex 打开，但无法承诺未来任意 Codex 版本永不改变内部协议；不兼容时必须以「暂停自动化、保留任务、恢复原生启动」结束，不能猜协议继续写入。
 
 升级验收必须使用两端各自独立登记的测试 task 和测试对话，不能拿正式 open task 试错。两台机器同步同一公开提交并正常重启 Codex 后，由两端维护对话互发唯一测试消息；主人需要在目标测试对话尚未打开时亲眼确认侧边栏未读标记，随后确认消息实时可见、只出现一次、测试对话能正常处理并 ACK。两端都通过后才能恢复正式自动路由；只有后端日志、对话存储写入或重启后才看见消息，均不算通过。测试 task 完成后应关闭，正式 task 的 generation、游标、租约和绑定保持不变。
+
+## Codex 模型流量看门人
+
+App Server 透明中转负责 Desktop 与本机 App Server 的连接和未读提醒；模型流量看门人解决的是另一层问题：普通回答请求已经发往 OpenAI，但长时间没有任何正文、推理增量或工具调用参数返回，界面只能一直转圈。它作为只监听回环地址的 HTTP 中转插在 Codex 与 OpenAI 之间，不修改或重编 `codex.exe`：
+
+```text
+Codex -> http://127.0.0.1:18435/backend-api/codex -> OpenAI
+```
+
+看门人只处理 `x-codex-turn-metadata.request_kind=turn` 的普通回答。一次请求约 60 秒没有任何有效增量时，它只取消这一条上游连接，确认旧连接结束后使用同一请求重试一次；第一条请求的状态帧和迟到输出不会转给 Codex。每条请求有独立状态，一个对话超时不会重启代理或中断其它对话。两次都没有有效输出时，它在总时间边界内返回明确失败并释放当前输入框，不把五轮重连累积成十几分钟的无解释等待。
+
+只要已经收到正文、推理内容、工具调用参数或完成/失败事件，就禁止整轮重放，避免重复文字或重复执行工具。压缩、预热、记忆请求和无法可靠识别的请求直接透传；带云端托管工具或未知工具类型的请求也不做透明重试。代理不监控本地 MCP、Sandbox 或工具执行时间，本地工具完成后的下一次模型请求会得到一个新的独立看门周期。
+
+Codex 仍负责 ChatGPT 登录和 OAuth 生命周期。看门人只在内存中转发 Codex 已附带的请求头，不记录请求头、请求体或 Authorization；运行日志只保存请求身份的哈希、阶段、耗时和计数。进程由现有监督器启动，运行状态写入私有 data root。代理故障时不会自动重启共享 broker、NapCat 或其它 MCP。
+
+启用前先运行 `ops/start-codex-model-stream-proxy.ps1` 并检查 `/health`，再用 `ops/switch-codex-model-stream-proxy.ps1 -Action Preview` 查看将要修改的 `config.toml`；`-Action Apply` 会保存原文件的精确字节备份并原子切换自定义模型提供方，完成后需要正常退出并重新打开 Codex 一次。`-Action Rollback` 会恢复原字节配置；回退后再次打开 Codex 即回到官方直连，不需要替换 `codex.exe`。官方 Codex 更新通常不会覆盖这个独立服务和配置，但每次 Codex 升级后仍应先验证自定义 provider、Responses 路径和 ChatGPT 登录转发合同没有变化。
 
 ## 安全更新与回滚
 
@@ -161,7 +177,7 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 
 便携包升级顺序固定为：先运行 `APPLY-NAPCAT-APPSERVER-UPGRADE.ps1 -ValidateOnly`，确认候选源码、依赖与测试全部通过；再运行 `Update-CodexMcpBroker.ps1` 更新共享 broker；最后运行不带 `-ValidateOnly` 的 NapCat 升级入口完成受保护切换。不得把 broker 更新或任何停服动作放在候选验证之前。
 
-只修改任务路由、账本、监督器、MCP backend 或 `codex-thread-bridge.mjs` 时可以使用 `-BackendOnlyHotReload`：该模式会停止并恢复 task router 与 supervisor、定向重载 NapCat backend，但保持透明代理、受管 App Server、Codex Desktop 连接和其他 MCP session 不变。只有 `codex-app-server-proxy*.mjs` 或代理启停脚本变化时才必须等 Codex 正常退出后执行完整代理切换。维护文件中只有 `automationBridge` 原因时，监督器允许启动 task router 核对代理唤醒日志并自愈；包升级、回滚、认证或协议异常仍会继续拦截自动路由。
+只修改任务路由、账本、监督器、MCP backend 或 `codex-thread-bridge.mjs` 时可以使用 `-BackendOnlyHotReload`：该模式会停止并恢复 task router 与 supervisor、定向重载 NapCat backend，但保持 App Server 透明中转、模型流量看门人、受管 App Server、Codex Desktop 连接和其他 MCP session 不变。已经加载的 `codex-app-server-proxy*.mjs` 或 `codex-model-stream-proxy*.mjs` 变化时必须改走完整受保护更新；仅启停/状态脚本变化时可以随普通后端更新写入，待下一次独立生命周期操作生效。只有 App Server 连接配置或模型 provider 配置发生变化时才需要正常退出并重新打开 Codex。维护文件中只有 `automationBridge` 原因时，监督器允许启动 task router 核对代理唤醒日志并自愈；包升级、回滚、认证或协议异常仍会继续拦截自动路由。
 
 首次启用透明中转后需要彻底退出并正常打开 Codex 一次，让 Desktop 继承新的 `CODEX_APP_SERVER_WS_URL`。以后仍按原方式启动 Codex。更新失败时不要手工删除 task；运行 `rollback-codex-napcat-bridge.ps1` 恢复上一个代码备份，或者保留维护状态等待排查。若上一个代理也无法恢复，更新器会清除用户级代理 URL、写入 fallback 请求，并让下一次 Codex 启动走官方原生路径；回滚同样只重载 NapCat backend，不重启整个 broker。
 

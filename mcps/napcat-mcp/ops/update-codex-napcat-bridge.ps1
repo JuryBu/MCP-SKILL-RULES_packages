@@ -342,7 +342,9 @@ function Assert-BackendOnlyCompatible {
   }
   foreach ($RelativePath in @(
     "src\codex-app-server-proxy.mjs",
-    "src\codex-app-server-proxy-runner.mjs"
+    "src\codex-app-server-proxy-runner.mjs",
+    "src\codex-model-stream-proxy.mjs",
+    "src\codex-model-stream-proxy-runner.mjs"
   )) {
     $PreviousPath = Join-Path $PreviousRoot $RelativePath
     $NextPath = Join-Path $NextRoot $RelativePath
@@ -439,6 +441,7 @@ $Activated = $false
 $CodeInstallStarted = $false
 $BrokerBackendReloaded = $false
 $ProxyLifecycleTouched = $false
+$ModelProxyLifecycleTouched = $false
 $RouterStopped = $false
 $SupervisorStopped = $false
 $WatchdogStopped = $false
@@ -592,12 +595,15 @@ try {
     }
     & $StopWatchdogScript -DataRoot $DataRoot -TaskName $SupervisorTaskName | Out-Null
     $WatchdogStopped = $true
-    foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1")) {
+    foreach ($ScriptName in @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1", "stop-codex-app-server-proxy.ps1", "stop-codex-model-stream-proxy.ps1")) {
       $ScriptPath = Join-Path $CodeRoot "ops\$ScriptName"
       if (Test-Path -LiteralPath $ScriptPath) {
         $StopResult = if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
           $ProxyLifecycleTouched = $true
           & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | ConvertFrom-Json
+        } elseif ($ScriptName -eq "stop-codex-model-stream-proxy.ps1") {
+          $ModelProxyLifecycleTouched = $true
+          & $ScriptPath -DataRoot $DataRoot -Force | ConvertFrom-Json
         } else {
           & $ScriptPath -DataRoot $DataRoot | ConvertFrom-Json
         }
@@ -614,6 +620,10 @@ try {
     }
     $BrokerBackendReloaded = $true
     & (Join-Path $CodeRoot "ops\reload-broker-backend.ps1") -Endpoint napcat -BrokerRoot $BrokerRoot -AllowLegacyChildRecycle | Out-Null
+    $ModelProxyLifecycleTouched = $true
+    & (Join-Path $CodeRoot "ops\start-codex-model-stream-proxy.ps1") -DataRoot $DataRoot | Out-Null
+    $ModelProxyStatus = & (Join-Path $CodeRoot "ops\get-codex-model-stream-proxy-status.ps1") -DataRoot $DataRoot | ConvertFrom-Json
+    if ($ModelProxyStatus.healthy -ne $true -or $ModelProxyStatus.running -ne $true) { throw "Validated model stream proxy did not become healthy after activation." }
     $ProxyLifecycleTouched = $true
     & (Join-Path $CodeRoot "ops\start-codex-app-server-proxy.ps1") -DataRoot $DataRoot | Out-Null
     $ProxyStatus = & (Join-Path $CodeRoot "ops\get-codex-app-server-proxy-status.ps1") -DataRoot $DataRoot | ConvertFrom-Json
@@ -673,12 +683,15 @@ try {
     $RollbackStopScripts += @("stop-napcat-task-router.ps1", "stop-napcat-supervisor.ps1")
   }
   if ($ProxyLifecycleTouched) { $RollbackStopScripts += "stop-codex-app-server-proxy.ps1" }
+  if ($ModelProxyLifecycleTouched) { $RollbackStopScripts += "stop-codex-model-stream-proxy.ps1" }
   foreach ($ScriptName in $RollbackStopScripts) {
     $ScriptPath = Join-Path $CandidateRoot "ops\$ScriptName"
     if (Test-Path -LiteralPath $ScriptPath) {
       try {
         if ($ScriptName -eq "stop-codex-app-server-proxy.ps1") {
           & $ScriptPath -DataRoot $DataRoot -AllowVerifiedForceStop | Out-Null
+        } elseif ($ScriptName -eq "stop-codex-model-stream-proxy.ps1") {
+          & $ScriptPath -DataRoot $DataRoot -Force | Out-Null
         } else {
           & $ScriptPath -DataRoot $DataRoot | Out-Null
         }
@@ -736,6 +749,12 @@ try {
         schemaVersion = 1; pending = $true; requestedAt = (Get-Date).ToString("o"); code = "PACKAGE_UPDATE_PROXY_RECOVERY_FAILED"; message = $Failure
       })
     } catch {}
+  }
+  if ($ModelProxyLifecycleTouched) {
+    $PreviousModelProxyStartScript = Join-Path $CodeRoot "ops\start-codex-model-stream-proxy.ps1"
+    if (Test-Path -LiteralPath $PreviousModelProxyStartScript) {
+      try { & $PreviousModelProxyStartScript -DataRoot $DataRoot | Out-Null } catch {}
+    }
   }
   $PreviousSupervisorStartScript = Join-Path $CodeRoot "ops\start-napcat-supervisor.ps1"
   if ($SupervisorStopped -and (Test-Path -LiteralPath $PreviousSupervisorStartScript)) {
