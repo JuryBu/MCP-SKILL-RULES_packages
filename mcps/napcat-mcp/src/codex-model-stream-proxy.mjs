@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import http from "node:http";
 import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
+import zlib from "node:zlib";
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -56,10 +57,31 @@ export function classifyCodexModelRequest(request) {
   };
 }
 
-function isReplayableRequestBody(body) {
+function decodeRequestBody(body, contentEncoding, maxOutputLength) {
+  const encodings = String(contentEncoding ?? "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value && value !== "identity");
+  let decoded = body;
+  try {
+    for (const encoding of encodings.reverse()) {
+      if (encoding === "gzip") decoded = zlib.gunzipSync(decoded, { maxOutputLength });
+      else if (encoding === "deflate") decoded = zlib.inflateSync(decoded, { maxOutputLength });
+      else if (encoding === "br") decoded = zlib.brotliDecompressSync(decoded, { maxOutputLength });
+      else return null;
+    }
+  } catch {
+    return null;
+  }
+  return decoded.length <= maxOutputLength ? decoded : null;
+}
+
+function isReplayableRequestBody(body, contentEncoding, maxOutputLength) {
+  const decoded = decodeRequestBody(body, contentEncoding, maxOutputLength);
+  if (decoded === null) return false;
   let payload;
   try {
-    payload = JSON.parse(body.toString("utf8"));
+    payload = JSON.parse(decoded.toString("utf8"));
   } catch {
     return false;
   }
@@ -428,9 +450,15 @@ export function createCodexModelStreamProxy(options = {}) {
 
     try {
       const body = await collectRequestBody(request, maxBufferedRequestBytes);
-      if (!isReplayableRequestBody(body)) {
+      if (!isReplayableRequestBody(body, request.headers["content-encoding"], maxBufferedRequestBytes)) {
         counters.passthrough += 1;
-        emit({ type: "buffered_passthrough", reason: "non_json_body" });
+        emit({
+          type: "buffered_passthrough",
+          reason: "non_json_body",
+          contentEncoding: String(request.headers["content-encoding"] ?? "identity").slice(0, 64),
+          contentType: String(request.headers["content-type"] ?? "unknown").slice(0, 128),
+          bodyBytes: body.length,
+        });
         const client = requestClient(targetUrl);
         const upstream = client.request(targetUrl, {
           method: request.method,

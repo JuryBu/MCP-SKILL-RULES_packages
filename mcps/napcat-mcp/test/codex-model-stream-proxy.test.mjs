@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import test from "node:test";
 import { once } from "node:events";
+import zlib from "node:zlib";
 import {
   classifyCodexModelRequest,
   createCodexModelStreamProxy,
@@ -23,7 +24,8 @@ async function listen(server) {
 }
 
 async function request(port, body, options = {}) {
-  const payload = Buffer.from(JSON.stringify(body));
+  const json = Buffer.from(JSON.stringify(body));
+  const payload = options.contentEncoding === "gzip" ? zlib.gzipSync(json) : json;
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: "127.0.0.1",
@@ -33,6 +35,7 @@ async function request(port, body, options = {}) {
       headers: {
         "content-type": "application/json",
         "content-length": String(payload.length),
+        ...(options.contentEncoding ? { "content-encoding": options.contentEncoding } : {}),
         "x-codex-turn-metadata": metadataHeader(options.requestKind ?? "turn", options.threadId),
         authorization: "Bearer secret-test-token",
       },
@@ -201,7 +204,7 @@ test("compaction bypasses replay while ordinary turns with hosted tool declarati
   const compact = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
   assert.equal(compact.statusCode, 200);
   assert.equal(attempts, 1);
-  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] });
+  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "gzip" });
   assert.equal(hosted.statusCode, 200);
   assert.match(hosted.body, /recovered/u);
   assert.equal(attempts, 3);
