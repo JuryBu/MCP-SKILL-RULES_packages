@@ -8,7 +8,6 @@ const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
 const ABORT_CONFIRM_TIMEOUT_MS = 2_000;
 const DEFAULT_UPSTREAM_ORIGIN = "https://chatgpt.com";
 const MAX_METADATA_HEADER_BYTES = 64 * 1024;
-const SAFE_REPLAY_TOOL_TYPES = new Set(["function", "custom", "local_shell"]);
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
   "keep-alive",
@@ -57,19 +56,14 @@ export function classifyCodexModelRequest(request) {
   };
 }
 
-function hasReplaySafeTools(body) {
+function isReplayableStreamingBody(body) {
   let payload;
   try {
     payload = JSON.parse(body.toString("utf8"));
   } catch {
     return false;
   }
-  if (payload?.stream !== true) return false;
-  if (!Array.isArray(payload?.tools)) return true;
-  return payload.tools.every((tool) => {
-    const type = typeof tool?.type === "string" ? tool.type : null;
-    return type !== null && SAFE_REPLAY_TOOL_TYPES.has(type);
-  });
+  return payload?.stream === true;
 }
 
 function eventPayloadHasContent(event) {
@@ -434,9 +428,9 @@ export function createCodexModelStreamProxy(options = {}) {
 
     try {
       const body = await collectRequestBody(request, maxBufferedRequestBytes);
-      if (!hasReplaySafeTools(body)) {
+      if (!isReplayableStreamingBody(body)) {
         counters.passthrough += 1;
-        emit({ type: "buffered_passthrough", reason: "hosted_or_unknown_tools" });
+        emit({ type: "buffered_passthrough", reason: "non_stream_body" });
         const client = requestClient(targetUrl);
         const upstream = client.request(targetUrl, {
           method: request.method,

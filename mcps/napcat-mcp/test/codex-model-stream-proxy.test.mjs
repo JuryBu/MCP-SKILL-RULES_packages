@@ -175,12 +175,23 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   assert.match(slowResult.body, /slow/u);
 });
 
-test("compaction and hosted-tool requests bypass replay", async (t) => {
+test("compaction bypasses replay while ordinary turns with hosted tool declarations remain guarded", async (t) => {
   let attempts = 0;
+  let turnAttempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
     res.writeHead(200, { "content-type": "text/event-stream" });
-    res.end(sse({ type: "response.in_progress" }));
+    const metadata = JSON.parse(req.headers["x-codex-turn-metadata"]);
+    if (metadata.request_kind === "compaction") {
+      res.end(sse({ type: "response.in_progress" }));
+      return;
+    }
+    turnAttempts += 1;
+    if (turnAttempts === 1) {
+      res.write(sse({ type: "response.in_progress" }));
+      return;
+    }
+    res.end(sse({ type: "response.output_text.delta", delta: "recovered" }) + sse({ type: "response.completed" }));
   });
   const upstreamPort = await listen(upstream);
   const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 40 });
@@ -192,7 +203,9 @@ test("compaction and hosted-tool requests bypass replay", async (t) => {
   assert.equal(attempts, 1);
   const hosted = await request(proxy.status().port, { stream: true, tools: [{ type: "web_search" }] });
   assert.equal(hosted.statusCode, 200);
-  assert.equal(attempts, 2);
+  assert.match(hosted.body, /recovered/u);
+  assert.equal(attempts, 3);
+  assert.equal(turnAttempts, 2);
 });
 
 test("two stalled attempts end within the bounded deadline", async (t) => {
