@@ -68,6 +68,7 @@ function decodeRequestBody(body, contentEncoding, maxOutputLength) {
       if (encoding === "gzip") decoded = zlib.gunzipSync(decoded, { maxOutputLength });
       else if (encoding === "deflate") decoded = zlib.inflateSync(decoded, { maxOutputLength });
       else if (encoding === "br") decoded = zlib.brotliDecompressSync(decoded, { maxOutputLength });
+      else if (encoding === "zstd") decoded = zlib.zstdDecompressSync(decoded, { maxOutputLength });
       else return null;
     }
   } catch {

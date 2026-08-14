@@ -25,7 +25,11 @@ async function listen(server) {
 
 async function request(port, body, options = {}) {
   const json = Buffer.from(JSON.stringify(body));
-  const payload = options.contentEncoding === "gzip" ? zlib.gzipSync(json) : json;
+  const payload = options.contentEncoding === "gzip"
+    ? zlib.gzipSync(json)
+    : options.contentEncoding === "zstd"
+      ? zlib.zstdCompressSync(json)
+      : json;
   return new Promise((resolve, reject) => {
     const req = http.request({
       host: "127.0.0.1",
@@ -204,7 +208,7 @@ test("compaction bypasses replay while ordinary turns with hosted tool declarati
   const compact = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
   assert.equal(compact.statusCode, 200);
   assert.equal(attempts, 1);
-  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "gzip" });
+  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd" });
   assert.equal(hosted.statusCode, 200);
   assert.match(hosted.body, /recovered/u);
   assert.equal(attempts, 3);
