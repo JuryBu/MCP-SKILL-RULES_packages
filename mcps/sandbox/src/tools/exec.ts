@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming, ensureModelVisibleToolResult } from "../lifecycle.js";
 import { execute } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import { PROCESS_TREE_MAX_MEMORY_MB } from "../memory-limits.js";
 
 /**
  * sandbox_exec 工具 — 代码/命令执行
@@ -21,9 +22,9 @@ const ExecParamsShape = {
     env: z.string().optional().describe("环境：conda:名称 / venv:路径"),
     timeout: z.number().min(0).optional()
         .describe("执行超时(ms)，默认30000；0 表示 Sandbox 不主动超时"),
-    maxMemoryMB: z.number().min(16).max(1536).optional()
-        .describe("进程树提交内存硬上限(MB)，默认256；Windows 从进程恢复运行前开始强制执行"),
-    memoryRequestMB: z.number().min(16).max(1536).optional()
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe(`进程树提交内存硬上限(MB)，默认256、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}；Windows 从进程恢复运行前开始强制执行`),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe("调度预期内存(MB)，必须不大于 maxMemoryMB；不填时按硬上限的约25%推导，最少64MB"),
     maxOutput: z.number().min(100).optional()
         .describe("兼容参数：调用方希望的内联字符预算；最终仍受服务端响应保护线约束"),
@@ -149,9 +150,11 @@ command 模式：执行系统命令，自动用 shell 包装
 
                 // 状态行
                 const statusIcon = result.exitCode === 0 ? "✅" : result.killed ? "💀" : "❌";
-                const errorType = result.killReason === "timeout" ? "execution_timeout" : undefined;
+                const errorType = result.errorType || (result.killReason === "timeout" ? "execution_timeout" : undefined);
                 const statusDesc = errorType
-                    ? `${errorType}（命令已启动后运行超时）`
+                    ? result.commandStarted
+                        ? `${errorType}（命令已启动）`
+                        : `${errorType}（命令未启动）`
                     : result.killed
                     ? `被杀 (${result.killReason})`
                     : result.exitCode === 0 ? "成功" : `失败 (exit ${result.exitCode})`;
@@ -188,9 +191,10 @@ command 模式：执行系统命令，自动用 shell 包装
                     content: [{ type: "text" as const, text: parts.join("\n") }],
                     ...((result.exitCode !== 0 || result.killed || result.artifact) ? { structuredContent: {
                         errorType,
-                        commandStarted: true,
+                        commandStarted: result.commandStarted,
+                        mayHaveStarted: result.mayHaveStarted,
                         queueWaitMs: result.queueWaitMs,
-                        runMs: Math.max(0, Date.now() - startTime - result.queueWaitMs),
+                        runMs: result.runMs,
                         totalMs: Date.now() - startTime,
                         exitCode: result.exitCode,
                         killed: result.killed,

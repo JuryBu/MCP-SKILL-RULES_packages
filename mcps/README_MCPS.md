@@ -12,11 +12,13 @@ Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 
 `chain="windsurf"` is a compatibility shortcut for data only. `chain="grok"` is a compatibility shortcut for model execution only.
 
-### sandbox 1.17.1
+### sandbox 1.17.2
 
 Short execution, parallel batch, persistent session, long-running launch, Codex task execution, smart search, and multi-model Council. Grok Council uses a receiver-managed ProGrok OpenAI-compatible endpoint and supports image input when the selected model supports vision.
 
 Expected scheduling memory is separate from the process-tree hard limit. Windows builds a local Job Object runner from public C# source, measures short and descendant processes, and combines physical memory, commit headroom, and pressure notifications so fitting light work can bypass a temporarily blocked heavy queue head without starving aged requests. The default 4096MB commit headroom is a heavy-work target; a separate 1536MB emergency floor lets bounded light work continue in the yellow zone without spending the final safety reserve.
+
+The per-process-tree parameter ceiling defaults to 4096MB and is server-configurable without changing global admission or emergency reserves. Exact search streams ripgrep JSON and terminates at the global result cap; symbol indexing yields between bounded batches. Missing Windows helpers fail closed, startup errors distinguish the helper, working directory, and payload, and structured results report whether the command actually started.
 
 Ordinary bounded stdout/stderr is returned directly without a persistent output artifact. Caller character and line budgets are independent from the hard serialized-response guard, batch tasks share one aggregate response budget, and error metadata keeps model-visible text on hosts that prefer structured results. Oversized, explicitly file-oriented, or interrupted recovery output retains a six-hour artifact; `sandbox_status overview/gc` reports retained artifact counts for receiver-side verification and expiry cleanup.
 

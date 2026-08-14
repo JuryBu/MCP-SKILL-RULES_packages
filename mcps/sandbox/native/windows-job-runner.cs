@@ -290,6 +290,7 @@ internal static class WindowsJobRunner
             CloseHandle(process.hThread);
             process.hThread = IntPtr.Zero;
 
+            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null);
             DateTime nextMetadataWrite = DateTime.UtcNow;
             while (true)
             {
@@ -298,7 +299,7 @@ internal static class WindowsJobRunner
                 peakBytes = Math.Max(peakBytes, QueryPeakJobMemory(job));
                 if (DateTime.UtcNow >= nextMetadataWrite)
                 {
-                    WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null);
+                    WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, true, null, null);
                     nextMetadataWrite = DateTime.UtcNow.AddMilliseconds(100);
                 }
                 if (memoryLimitHit)
@@ -313,8 +314,15 @@ internal static class WindowsJobRunner
             peakBytes = Math.Max(peakBytes, QueryPeakJobMemory(job));
             uint childExitCode;
             if (!GetExitCodeProcess(process.hProcess, out childExitCode)) ThrowLastWin32("GetExitCodeProcess");
-            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, childExitCode);
+            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, childExitCode, true, null, null);
             return memoryLimitHit ? 137 : unchecked((int)childExitCode);
+        }
+        catch (Exception error)
+        {
+            string errorType = !Directory.Exists(currentDirectory) ? "working_directory_missing" : "payload_start_failed";
+            Win32Exception win32 = error as Win32Exception;
+            WriteMetadata(metadataPath, peakBytes, memoryLimitHit, null, false, errorType, win32 != null ? (int?)win32.NativeErrorCode : null);
+            throw;
         }
         finally
         {
@@ -414,13 +422,16 @@ internal static class WindowsJobRunner
         }
     }
 
-    private static void WriteMetadata(string path, ulong peakBytes, bool memoryLimitHit, uint? childExitCode)
+    private static void WriteMetadata(string path, ulong peakBytes, bool memoryLimitHit, uint? childExitCode, bool commandStarted, string startErrorType, int? startErrorCode)
     {
         string directory = Path.GetDirectoryName(path);
         if (!string.IsNullOrEmpty(directory)) Directory.CreateDirectory(directory);
         string json = "{\"peakMemoryBytes\":" + peakBytes.ToString(CultureInfo.InvariantCulture) +
             ",\"memoryLimitHit\":" + (memoryLimitHit ? "true" : "false") +
-            ",\"childExitCode\":" + (childExitCode.HasValue ? childExitCode.Value.ToString(CultureInfo.InvariantCulture) : "null") + "}";
+            ",\"childExitCode\":" + (childExitCode.HasValue ? childExitCode.Value.ToString(CultureInfo.InvariantCulture) : "null") +
+            ",\"commandStarted\":" + (commandStarted ? "true" : "false") +
+            ",\"startErrorType\":" + (startErrorType == null ? "null" : "\"" + startErrorType + "\"") +
+            ",\"startErrorCode\":" + (startErrorCode.HasValue ? startErrorCode.Value.ToString(CultureInfo.InvariantCulture) : "null") + "}";
         File.WriteAllText(path, json, new UTF8Encoding(false));
     }
 

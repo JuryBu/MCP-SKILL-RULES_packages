@@ -9,12 +9,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { spawn, spawnSync } from "child_process";
+import { StringDecoder } from "string_decoder";
 import path from "path";
 import fs from "fs";
 import Fuse from "fuse.js";
 import { scanDirectory, flattenSymbols, flattenFunctionBounds, type SymbolInfo, type FunctionBound, type FileIndex } from "../symbol-index.js";
 import { callModelBridge, isCodexCliAvailable, type ModelChain, type ResolvedModelChain } from "../model-bridge.js";
-import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
+import { cancelBackgroundTask, startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
 import { normalizeOwnerId } from "../owner.js";
 import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { initParentLs, isLsReady } from "../ls-client.js";
@@ -221,8 +222,6 @@ async function searchWithRipgrep(
 
     if (!opts.caseSensitive) args.push("-i");
     if (!opts.isRegex) args.push("--fixed-strings");
-    if (opts.context) args.push("-C", String(opts.context));
-    if (opts.maxResults) args.push("--max-count", String(opts.maxResults));
 
     // 排除
     const excludes = opts.excludes || [
@@ -241,60 +240,98 @@ async function searchWithRipgrep(
     args.push("--", query, searchPath);
 
     return new Promise((resolve) => {
-        const child = spawn(rgBin, args, { timeout: 30000 });
-        let stdout = "";
+        const child = spawn(rgBin, args, { timeout: 30000, windowsHide: true, shell: false });
+        const decoder = new StringDecoder("utf8");
+        const results: ExactResult[] = [];
+        const fileSet = new Set<string>();
+        const maxResults = Math.max(1, Math.floor(opts.maxResults || 50));
+        const maxJsonLineChars = 1024 * 1024;
+        const maxStderrChars = 8192;
+        let stdoutRemainder = "";
         let stderr = "";
+        let settled = false;
+        let capped = false;
+
+        const resultCount = () => opts.matchPerLine === false ? fileSet.size : results.length;
+        const finish = (engine: string) => {
+            if (settled) return;
+            settled = true;
+            opts.signal?.removeEventListener("abort", onAbort);
+            resolve({
+                results,
+                fileOnly: [...fileSet].slice(0, maxResults),
+                engine,
+            });
+        };
+
+        const stopAtLimit = () => {
+            capped = true;
+            try { child.kill(); } catch { /* ignore */ }
+            finish("ripgrep (global cap)");
+        };
+
+        const parseLine = (line: string) => {
+            if (!line || settled) return;
+            if (line.length > maxJsonLineChars) {
+                try { child.kill(); } catch { /* ignore */ }
+                results.push({ file: "(error)", line: 0, content: "ripgrep JSON line exceeded the 1MiB safety limit" });
+                finish("ripgrep (line too large)");
+                return;
+            }
+            try {
+                const obj = JSON.parse(line);
+                if (obj.type !== "match") return;
+                const data = obj.data;
+                const file = data.path?.text || "";
+                if (!file) return;
+                fileSet.add(file);
+                if (opts.matchPerLine !== false) {
+                    results.push({
+                        file,
+                        line: data.line_number,
+                        content: data.lines?.text?.trimEnd() || "",
+                    });
+                }
+                if (resultCount() >= maxResults) stopAtLimit();
+            } catch { /* skip malformed event */ }
+        };
 
         const onAbort = () => {
             try { child.kill(); } catch { /* ignore */ }
-            resolve({ results: [], fileOnly: [], engine: "ripgrep (cancelled)" });
+            finish("ripgrep (cancelled)");
         };
         opts.signal?.addEventListener("abort", onAbort, { once: true });
 
-        child.stdout.on("data", (d: Buffer) => { stdout += d.toString("utf-8"); });
-        child.stderr.on("data", (d: Buffer) => { stderr += d.toString("utf-8"); });
+        child.stdout.on("data", (chunk: Buffer) => {
+            if (settled) return;
+            stdoutRemainder += decoder.write(chunk);
+            let newlineIndex;
+            while (!settled && (newlineIndex = stdoutRemainder.indexOf("\n")) >= 0) {
+                const line = stdoutRemainder.slice(0, newlineIndex);
+                stdoutRemainder = stdoutRemainder.slice(newlineIndex + 1);
+                parseLine(line);
+            }
+            if (stdoutRemainder.length > maxJsonLineChars) parseLine(stdoutRemainder);
+        });
+        child.stderr.on("data", (chunk: Buffer) => {
+            if (stderr.length < maxStderrChars) stderr += chunk.toString("utf-8").slice(0, maxStderrChars - stderr.length);
+        });
         child.on("close", (code) => {
-            opts.signal?.removeEventListener("abort", onAbort);
+            if (settled || capped) return;
+            stdoutRemainder += decoder.end();
+            if (stdoutRemainder) parseLine(stdoutRemainder);
+            if (settled) return;
             // 非法正则等错误：rg 返回非 0/1 exit code
             if (code && code > 1 && stderr) {
-                resolve({
-                    results: [{ file: "(error)", line: 0, content: `ripgrep error: ${stderr.substring(0, 200)}` }],
-                    fileOnly: [],
-                    engine: `ripgrep (exit ${code})`,
-                });
+                results.push({ file: "(error)", line: 0, content: `ripgrep error: ${stderr.substring(0, 200)}` });
+                finish(`ripgrep (exit ${code})`);
                 return;
             }
-            const results: ExactResult[] = [];
-            const fileSet = new Set<string>();
-
-            for (const line of stdout.split("\n").filter(Boolean)) {
-                try {
-                    const obj = JSON.parse(line);
-                    if (obj.type === "match") {
-                        const d = obj.data;
-                        const file = d.path?.text || "";
-                        fileSet.add(file);
-                        if (opts.matchPerLine !== false) {
-                            results.push({
-                                file,
-                                line: d.line_number,
-                                content: d.lines?.text?.trimEnd() || "",
-                            });
-                        }
-                    }
-                } catch { /* skip malformed */ }
-            }
-
-            resolve({
-                results: results.slice(0, opts.maxResults || 50),
-                fileOnly: [...fileSet],
-                engine: "ripgrep",
-            });
+            finish("ripgrep");
         });
 
         child.on("error", () => {
-            opts.signal?.removeEventListener("abort", onAbort);
-            resolve({ results: [], fileOnly: [], engine: "ripgrep (error)" });
+            finish("ripgrep (error)");
         });
     });
 }
@@ -311,11 +348,16 @@ async function searchWithNodeFallback(
         ? new RegExp(query, opts.caseSensitive ? "g" : "gi")
         : null;
 
-    function searchDir(dir: string): void {
+    async function searchDir(root: string): Promise<void> {
+        const pending = [root];
+        let visitedEntries = 0;
+        const maxFileBytes = Math.max(64 * 1024, Number(process.env.SANDBOX_EXACT_FALLBACK_MAX_FILE_BYTES || 2 * 1024 * 1024));
+        const reachedLimit = () => opts.matchPerLine === false ? fileSet.size >= maxResults : results.length >= maxResults;
+        while (pending.length > 0 && !reachedLimit()) {
         assertNotAborted(opts.signal);
-        if (results.length >= maxResults) return;
+        const dir = pending.pop()!;
         let entries;
-        try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+        try { entries = await fs.promises.readdir(dir, { withFileTypes: true }); } catch { continue; }
 
         const excludes = opts.excludes || [
             "node_modules", "dist", ".git", "__pycache__",
@@ -325,12 +367,12 @@ async function searchWithNodeFallback(
         const includes = opts.includes as string[] | undefined;
         for (const entry of entries) {
             assertNotAborted(opts.signal);
-            if (results.length >= maxResults) break;
+            if (reachedLimit()) break;
             if (excludes.includes(entry.name)) continue;
 
             const fullPath = path.join(dir, entry.name);
             if (entry.isDirectory()) {
-                searchDir(fullPath);
+                pending.push(fullPath);
             } else if (entry.isFile()) {
                 // includes 过滤
                 if (includes && includes.length > 0) {
@@ -342,9 +384,11 @@ async function searchWithNodeFallback(
                     if (!matched) continue;
                 }
                 try {
-                    const content = fs.readFileSync(fullPath, "utf-8");
+                    const stat = await fs.promises.stat(fullPath);
+                    if (stat.size > maxFileBytes) continue;
+                    const content = await fs.promises.readFile(fullPath, "utf-8");
                     const lines = content.split("\n");
-                    for (let i = 0; i < lines.length && results.length < maxResults; i++) {
+                    for (let i = 0; i < lines.length && !reachedLimit(); i++) {
                         const match = regex
                             ? regex.test(lines[i])
                             : opts.caseSensitive
@@ -360,10 +404,13 @@ async function searchWithNodeFallback(
                     }
                 } catch { /* skip binary files */ }
             }
+            visitedEntries += 1;
+            if (visitedEntries % 100 === 0) await new Promise((resolve) => setImmediate(resolve));
+        }
         }
     }
 
-    searchDir(searchPath);
+    await searchDir(searchPath);
     return { results, fileOnly: [...fileSet], engine: "node-fallback (降级模式)" };
 }
 
@@ -378,6 +425,7 @@ async function searchFuzzy(
     const index = await scanDirectory(searchPath, {
         includes: opts.includes,
         excludes: opts.excludes,
+        signal: opts.signal,
     });
     assertNotAborted(opts.signal);
 
@@ -1182,6 +1230,7 @@ export async function buildUnitsFromFiles(
     const index = await scanDirectory(basePath, {
         includes: opts.includes,
         excludes: opts.excludes,
+        signal: opts.signal,
     });
     const bounds = flattenFunctionBounds(index);
     const units: SearchUnit[] = [];
@@ -1916,7 +1965,7 @@ export function registerSmartSearch(server: McpServer): void {
             caseSensitive: z.boolean().optional().describe("exact: 大小写敏感（默认 false）"),
             isRegex: z.boolean().optional().describe("exact: 正则模式（默认 false）"),
             matchPerLine: z.boolean().optional().describe("exact: true=行级结果, false=文件级（默认 true）"),
-            context: z.number().optional().describe("exact: 上下文行数（默认 2）"),
+                context: z.number().optional().describe("exact: 保留参数；流式全局上限模式不预读上下文"),
             files: z.array(z.object({
                 path: z.string(),
                 range: z.string().optional(),
@@ -1932,6 +1981,8 @@ export function registerSmartSearch(server: McpServer): void {
                 .describe("smart 模式默认后台；设为 false 可强制前台，true 会先返回 taskId，后续用 taskId 查询"),
             taskId: z.string().optional()
                 .describe("查询后台 smart_search 任务的 taskId"),
+            cancel: z.boolean().optional()
+                .describe("与 taskId 同用，取消仍在运行的后台搜索并传播到底层进程"),
             waitSeconds: z.number().optional()
                 .describe("查询后台任务时等待秒数(1-300)，任务完成时提前返回"),
             ownerId: z.string().optional()
@@ -1972,7 +2023,7 @@ export function registerSmartSearch(server: McpServer): void {
                             caseSensitive: q.caseSensitive,
                             isRegex: q.isRegex,
                             matchPerLine: q.matchPerLine,
-                            context: q.context ?? 2,
+                            context: q.context ?? 0,
                             includes: q.includes,
                             excludes: q.excludes,
                             maxResults: q.maxResults ?? 50,
@@ -2011,7 +2062,9 @@ export function registerSmartSearch(server: McpServer): void {
             }
 
             if (args.taskId) {
-                const task = await waitForBackgroundTask(args.taskId, args.waitSeconds || 0, ownerId);
+                const task = args.cancel
+                    ? cancelBackgroundTask(args.taskId, ownerId)
+                    : await waitForBackgroundTask(args.taskId, args.waitSeconds || 0, ownerId);
                 const elapsed = Date.now() - globalStart;
                 return {
                     content: [{

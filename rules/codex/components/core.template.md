@@ -224,6 +224,8 @@ Sandbox backend 会把资源等待、命令运行和外层调用期限分开报�
 
 Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树的硬上限；请求量较小的短命令可在物理内存偏低但 Windows 提交余量安全时继续并行，重任务则会暂停。默认 4096MB 提交余量是重任务目标线，不是所有任务的绝对红线；目标线与 1536MB 紧急底线之间只放行不超过 192MB、且接纳后仍守住紧急底线的小请求，跌破紧急底线或收到 Windows 低内存信号才暂停全部新任务。队首大任务暂时放不下时，后续可接纳的小任务仍可前进，老请求会逐步获得保留额度。等待超过约 1 秒后 Sandbox 会尝试定期发送排队进度，但宿主界面可能不展示；最终结果中的结构化等待状态始终是准确信息。大输出默认自适应交付：安全预算内直接完整返回，超预算时返回头尾预览和 artifact 的路径、SHA256、字节数、行数及过期时间；需要完整内容时读取 artifact，不要把预览误当完整结果。`maxOutput` 是正文字符预算，不能把响应元数据预留从中提前扣掉；`maxLines` 超预算时也必须保留完整 artifact，批量任务共享单次响应总预算。
 
+`maxMemoryMB` 的允许上限由服务端配置并在 `sandbox_status` 的「工具内存配置」中展示，不能把参数越界误解成整机内存压力。`working_directory_missing`、`windows_job_runner_missing` 等启动前错误必须保持 `commandStarted=false`，不得绕过 Sandbox 改用原生命令；`mayHaveStarted=true` 时先检查副作用再决定是否重试。大目录 exact 搜索会流式到全局 `maxResults` 后停止；fuzzy/smart 仍优先后台运行，需要取消时用同一 `taskId` 加 `cancel=true`，不要靠并发重发制造更多压力。
+
 以上是 Sandbox 内部状态，不替代 Codex 宿主自己的 MCP 外层期限与短轮询策略：
 
 共享 Codex HTTP broker 的普通 tool call 默认超时 120 秒。参数含 `waitSeconds>0` 时按 `waitSeconds*1000+15000` 计算；`timeout` 大于普通上限时按 `timeout+15000` 计算；默认上限 30 分钟。

@@ -4,7 +4,7 @@
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.23.0, web-fetcher 7.0.0, sandbox 1.17.1, broker 0.1.0 |
+| MCP | memory-store 1.23.0, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 18 license-reviewed portable user skills plus manifest |
@@ -18,14 +18,14 @@
 - Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
 - NapCat autostart now uses an internal windowless launcher plus a long-running supervisor watchdog, so interactive logon does not expose PowerShell consoles and unexpected supervisor exits are retried without replacing receiver-private state.
 - Added public-safe Bug/compatibility and Feature Request Issue forms for cross-machine MCP maintenance.
-- Common MCP versions are memory-store 1.23.0, web-fetcher 7.0.0, sandbox 1.17.1, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Common MCP versions are memory-store 1.23.0, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
 - Memory Store 1.23.0 adds read-only DeepSeek Harness v0 JSONL/Zstandard sessions as a fifth data source, publishes them through the existing verified fetch-generation cache, keeps synthetic/tool/subagent/automation events out of human turns, and never exposes DSH as a model provider.
 - NapCat public source is refreshed to the current task-ledger, router, supervisor, and Codex wake-bridge snapshot while keeping runtime state, real bindings, login data, and credentials excluded.
 
 ## 2026-07-24 Baseline
 
 - memory-store upgraded from 1.19.3 to 1.21.1 with production Record scheduling, source evidence, startup barriers, commit protocols, provider admission/control, AGY routing, unknown-chain migration, background-task suspension and expanded multi-host recovery behavior.
-- sandbox 1.17.1 separates expected scheduling memory from the per-process-tree hard limit. Windows builds a local Job Object runner from public C# source, applies the limit before the command resumes, measures sub-two-second and descendant processes, and keeps the generated EXE outside the portable source package. Admission uses physical memory, Windows commit headroom and pressure notifications; 4096MB is the heavy-work target while a separate 1536MB emergency floor permits bounded light work in the yellow zone without spending the final safety reserve. A blocked heavy queue head no longer freezes fitting small work, while aged requests receive bounded reserved capacity. Adaptive 100K-token/2000-line/1MiB delivery and six-hour overflow artifacts remain unchanged.
+- sandbox 1.17.2 keeps scheduling requests separate from process-tree hard limits and raises only the configurable parameter ceiling to 4096MB by default; global admission and the 1536MB emergency floor remain unchanged. Exact search streams ripgrep JSON and stops at the global result cap, symbol indexing yields between bounded batches, and background cancellation reaches local scans and model calls. Windows startup now fails closed when the Job Object helper is unavailable and distinguishes helper, cwd, and payload failures while reporting whether the command actually started; cancellation and timeouts wait for process-tree cleanup before releasing admission capacity, and `runMs` excludes queue waiting exactly once. Adaptive 100K-token/2000-line/1MiB delivery and six-hour overflow artifacts remain unchanged.
 - the portable Sandbox Council root now follows `SANDBOX_DATA_ROOT`, keeping transcripts, indexes, task checkpoints, quarantine groups, and other runtime data outside the source tree.
 - refreshed lockfiles build successfully on Node.js 18+. On 2026-07-24, `npm audit --omit=dev` reported no critical issues but did report transitive advisories: memory-store 9, web-fetcher 11, sandbox 8, and mcp-subagent 5; broker reported 0. The package does not run `npm audit fix --force` because breaking dependency rewrites must be evaluated upstream rather than silently applied during packaging.
 - web-fetcher remains 7.0.0 and synchronizes the latest constants, interaction and pipeline behavior.

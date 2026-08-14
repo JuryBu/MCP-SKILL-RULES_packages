@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,9 @@ export interface WindowsJobMetadata {
     peakMemoryBytes: number;
     memoryLimitHit: boolean;
     childExitCode: number | null;
+    commandStarted: boolean;
+    startErrorType: string | null;
+    startErrorCode: number | null;
 }
 
 export interface WindowsSystemMemorySample {
@@ -22,10 +25,27 @@ export interface WindowsJobLaunch {
     command: string;
     args: string[];
     metadataPath: string;
+    spawnCwd: string;
+}
+
+export type WindowsStartErrorType =
+    | "working_directory_missing"
+    | "working_directory_invalid"
+    | "windows_job_runner_missing"
+    | "windows_job_runner_spawn_failed"
+    | "payload_start_failed";
+
+export class WindowsJobLaunchError extends Error {
+    constructor(public readonly errorType: WindowsStartErrorType, message: string) {
+        super(`${errorType}: ${message}`);
+        this.name = "WindowsJobLaunchError";
+    }
 }
 
 export function getWindowsJobRunnerPath(): string {
-    return path.join(path.dirname(fileURLToPath(import.meta.url)), "native", "windows-job-runner.exe");
+    return process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH
+        ? path.resolve(process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH)
+        : path.join(path.dirname(fileURLToPath(import.meta.url)), "native", "windows-job-runner.exe");
 }
 
 export function hasWindowsJobRunner(): boolean {
@@ -38,10 +58,21 @@ export function createWindowsJobLaunch(
     cwd: string,
     maxMemoryMB: number,
 ): WindowsJobLaunch | null {
-    if (!hasWindowsJobRunner()) return null;
+    if (process.platform !== "win32") return null;
+    const runnerPath = getWindowsJobRunnerPath();
+    if (!existsSync(runnerPath)) {
+        throw new WindowsJobLaunchError("windows_job_runner_missing", `Windows Job Object helper 不存在: ${runnerPath}`);
+    }
+    let cwdStat;
+    try { cwdStat = statSync(cwd); } catch {
+        throw new WindowsJobLaunchError("working_directory_missing", `工作目录不存在或不可访问: ${cwd}`);
+    }
+    if (!cwdStat.isDirectory()) {
+        throw new WindowsJobLaunchError("working_directory_invalid", `工作目录不是目录: ${cwd}`);
+    }
     const metadataPath = path.join(tmpdir(), `sandbox-job-${process.pid}-${randomUUID()}.json`);
     return {
-        command: getWindowsJobRunnerPath(),
+        command: runnerPath,
         args: [
             "--memory-mb", String(Math.ceil(maxMemoryMB)),
             "--metadata", metadataPath,
@@ -50,7 +81,18 @@ export function createWindowsJobLaunch(
             ...args,
         ],
         metadataPath,
+        spawnCwd: path.dirname(runnerPath),
     };
+}
+
+export function classifyWindowsRunnerSpawnFailure(cwd: string): WindowsStartErrorType {
+    if (!existsSync(getWindowsJobRunnerPath())) return "windows_job_runner_missing";
+    try {
+        if (!statSync(cwd).isDirectory()) return "working_directory_invalid";
+    } catch {
+        return "working_directory_missing";
+    }
+    return "windows_job_runner_spawn_failed";
 }
 
 export function readWindowsJobMetadata(metadataPath: string): WindowsJobMetadata | null {
@@ -61,6 +103,9 @@ export function readWindowsJobMetadata(metadataPath: string): WindowsJobMetadata
             peakMemoryBytes: Math.max(0, Number(parsed.peakMemoryBytes)),
             memoryLimitHit: parsed.memoryLimitHit,
             childExitCode: Number.isFinite(parsed.childExitCode) ? Number(parsed.childExitCode) : null,
+            commandStarted: typeof parsed.commandStarted === "boolean" ? parsed.commandStarted : true,
+            startErrorType: typeof parsed.startErrorType === "string" ? parsed.startErrorType : null,
+            startErrorCode: Number.isFinite(parsed.startErrorCode) ? Number(parsed.startErrorCode) : null,
         };
     } catch {
         return null;

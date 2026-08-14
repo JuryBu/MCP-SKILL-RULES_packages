@@ -12,6 +12,7 @@ import {
 } from "../session-manager.js";
 import { normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import { PROCESS_TREE_MAX_MEMORY_MB } from "../memory-limits.js";
 
 /**
  * sandbox_session 工具 — 持久 REPL 会话
@@ -32,9 +33,9 @@ const SessionParamsSchema = z.object({
         .describe("环境（start时使用）"),
     timeout: z.number().int().min(1000).optional()
         .describe("单次执行超时(ms)，默认15000"),
-    maxMemoryMB: z.number().int().min(16).max(1536).optional()
-        .describe("会话内存上限(MB)，默认256"),
-    memoryRequestMB: z.number().int().min(16).max(1536).optional()
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe(`会话内存上限(MB)，默认256、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}`),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe("会话调度预期内存(MB)，必须不大于 maxMemoryMB"),
     maxLines: z.number().min(1).optional()
         .describe("兼容的内联行数预算，不再硬限制为200"),
@@ -201,7 +202,7 @@ action:
                             };
                         }
 
-                        const closeResult = closeSessionForOwner(sessionId, requestOwner);
+                        const closeResult = await closeSessionForOwner(sessionId, requestOwner);
                         if (closeResult.error) {
                             return {
                                 content: [{ type: "text" as const, text: closeResult.error }],

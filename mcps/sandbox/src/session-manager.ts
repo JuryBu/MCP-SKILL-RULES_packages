@@ -17,6 +17,12 @@ import {
     readWindowsJobMetadata,
     removeWindowsJobMetadata,
 } from "./windows-job-runner.js";
+import {
+    inferMemoryRequestMB,
+    PROCESS_TREE_MAX_MEMORY_MB,
+    readConfiguredMemoryMB,
+    validateProcessTreeMemory,
+} from "./memory-limits.js";
 
 /**
  * MCP Sandbox REPL 会话管理器
@@ -44,7 +50,12 @@ export interface SessionLimits {
 const SESSION_LIMITS: Readonly<SessionLimits> = Object.freeze({
     maxSessions: readPositiveIntegerEnv("SANDBOX_SESSION_MAX_COUNT", 5),
     maxTotalMemoryMB: readPositiveIntegerEnv("SANDBOX_SESSION_MAX_TOTAL_MEMORY_MB", 1536, 16),
-    defaultMemoryMB: readPositiveIntegerEnv("SANDBOX_SESSION_DEFAULT_MEMORY_MB", 256, 16),
+    defaultMemoryMB: readConfiguredMemoryMB(
+        "SANDBOX_SESSION_DEFAULT_MEMORY_MB",
+        256,
+        16,
+        PROCESS_TREE_MAX_MEMORY_MB,
+    ),
     idleTimeoutMs: readPositiveIntegerEnv("SANDBOX_SESSION_IDLE_TIMEOUT_MS", 5 * 60 * 1000, 1000),
 });
 
@@ -192,7 +203,7 @@ function spawnREPL(language: string, cwd: string, maxMemoryMB: number, envParam?
 
     const windowsJobLaunch = createWindowsJobLaunch(cmd, args, cwd, maxMemoryMB);
     const proc = spawn(windowsJobLaunch?.command ?? cmd, windowsJobLaunch?.args ?? args, {
-        cwd,
+        cwd: windowsJobLaunch?.spawnCwd ?? cwd,
         env: {
             ...process.env,
             PYTHONIOENCODING: "utf-8",
@@ -219,15 +230,19 @@ function waitForProcessSpawn(proc: ChildProcess): Promise<Error | null> {
     });
 }
 
-async function waitForWindowsJobReady(proc: ChildProcess, metadataPath: string | null): Promise<boolean> {
-    if (!metadataPath) return true;
+async function waitForWindowsJobReady(
+    proc: ChildProcess,
+    metadataPath: string | null,
+): Promise<{ ready: boolean; errorType: string | null }> {
+    if (!metadataPath) return { ready: true, errorType: null };
     const deadline = Date.now() + 1500;
     while (Date.now() < deadline) {
-        if (readWindowsJobMetadata(metadataPath)) return true;
-        if (proc.exitCode !== null || proc.signalCode !== null) return false;
+        const metadata = readWindowsJobMetadata(metadataPath);
+        if (metadata) return { ready: metadata.commandStarted, errorType: metadata.startErrorType };
+        if (proc.exitCode !== null || proc.signalCode !== null) return { ready: false, errorType: "payload_start_failed" };
         await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    return false;
+    return { ready: false, errorType: "windows_job_runner_not_ready" };
 }
 
 /**
@@ -249,16 +264,9 @@ export async function createSession(
         return { error: `已达最大会话数量限制 (${SESSION_LIMITS.maxSessions})。请先关闭不需要的会话。` };
     }
 
-    const effectiveMemoryRequestMB = memoryRequestMB
-        ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
-    if (!Number.isFinite(maxMemoryMB) || maxMemoryMB < 16 || maxMemoryMB > 1536) {
-        return { error: "会话 maxMemoryMB 必须在 16～1536 之间" };
-    }
-    if (!Number.isFinite(effectiveMemoryRequestMB)
-        || effectiveMemoryRequestMB < 16
-        || effectiveMemoryRequestMB > maxMemoryMB) {
-        return { error: "会话 memoryRequestMB 必须在 16 与 maxMemoryMB 之间" };
-    }
+    const effectiveMemoryRequestMB = memoryRequestMB ?? inferMemoryRequestMB(maxMemoryMB);
+    const memoryValidationError = validateProcessTreeMemory(maxMemoryMB, effectiveMemoryRequestMB, "会话");
+    if (memoryValidationError) return { error: memoryValidationError };
 
     // 会话用预期量参与调度，Job Object 继续按 maxMemoryMB 执行硬限制。
     const reservedMemory = getReservedSessionMemory() + pendingSessionMemoryMB;
@@ -295,15 +303,18 @@ export async function createSession(
         const spawnError = await waitForProcessSpawn(proc);
         const windowsJobReady = !spawnError && proc.pid
             ? await waitForWindowsJobReady(proc, memoryMetadataPath)
-            : false;
-        if (spawnError || !proc.pid || !windowsJobReady) {
+            : { ready: false, errorType: null };
+        if (spawnError || !proc.pid || !windowsJobReady.ready) {
             removeWindowsJobMetadata(memoryMetadataPath);
-            if (proc.pid) killProcessTree(proc.pid);
+            if (proc.pid) await killProcessTree(proc.pid);
             resourceLease.release();
-            return { error: `进程启动失败${spawnError ? `: ${spawnError.message}` : memoryMetadataPath ? ": Windows Job Object 未确认子进程启动" : ""}` };
+            const detail = spawnError?.message
+                || windowsJobReady.errorType
+                || (memoryMetadataPath ? "Windows Job Object 未确认子进程启动" : "未知启动错误");
+            return { error: `进程启动失败: ${detail}` };
         }
         if (signal?.aborted) {
-            proc.kill();
+            if (proc.pid) await killProcessTree(proc.pid);
             removeWindowsJobMetadata(memoryMetadataPath);
             resourceLease.release();
             return { error: "Session 启动期间调用已取消，进程已终止" };
@@ -592,17 +603,17 @@ async function execInSessionUnlocked(
             });
         };
 
+        let terminationPromise: Promise<void> | null = null;
         const terminate = (reason: string) => {
-            if (resolved) return;
+            if (resolved || terminationPromise) return;
             killed = true;
             killReason = reason;
-            try {
-                killProcessTree(session.pid);
-            } finally {
+            terminationPromise = killProcessTree(session.pid);
+            void terminationPromise.finally(() => {
                 session.alive = false;
                 session.resourceLease.release();
                 void finalize();
-            }
+            });
         };
 
         const onAbort = () => terminate("cancelled");
@@ -703,13 +714,13 @@ export async function getSessionStatus(sessionId: string): Promise<SessionStatus
 /**
  * 关闭会话
  */
-export function closeSession(sessionId: string): boolean {
+export async function closeSession(sessionId: string): Promise<boolean> {
     const session = sessions.get(sessionId);
     if (!session) return false;
 
     if (session.alive) {
         try {
-            killProcessTree(session.pid);
+            await killProcessTree(session.pid);
         } catch { /* 忽略 */ }
         session.alive = false;
         session.resourceLease.release();
@@ -727,11 +738,11 @@ export function canAccessSession(sessionId: string, ownerId?: string): boolean |
     return hasOwnerAccess(session.ownerId, normalizeOwnerId(ownerId));
 }
 
-export function closeSessionForOwner(sessionId: string, ownerId?: string): { closed: boolean; error?: string } {
+export async function closeSessionForOwner(sessionId: string, ownerId?: string): Promise<{ closed: boolean; error?: string }> {
     const access = canAccessSession(sessionId, ownerId);
     if (access === null) return { closed: false };
     if (!access) return { closed: false, error: ownerMismatchText("会话", sessionId) };
-    return { closed: closeSession(sessionId) };
+    return { closed: await closeSession(sessionId) };
 }
 
 /**
@@ -788,7 +799,7 @@ function startIdleChecker(): void {
         for (const [id, session] of sessions) {
             if (session.alive && !session.executing && (now - session.lastActivity) > SESSION_LIMITS.idleTimeoutMs) {
                 console.error(`[sandbox] 会话 ${id} 空闲超时 (${formatElapsed(now - session.lastActivity)})，自动关闭`);
-                closeSession(id);
+                void closeSession(id);
             }
         }
 
@@ -807,7 +818,7 @@ function startIdleChecker(): void {
  */
 export function closeAllSessions(): void {
     for (const [id] of sessions) {
-        closeSession(id);
+        void closeSession(id);
     }
     if (idleChecker) {
         clearInterval(idleChecker);

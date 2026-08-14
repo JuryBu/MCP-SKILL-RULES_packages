@@ -4,6 +4,7 @@ import { touchActivity, appendTiming } from "../lifecycle.js";
 import { execute, ExecResult, normalizeExecutionInput } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
 import { DEFAULT_METADATA_RESERVE_BYTES, HARD_RESPONSE_BYTE_LIMIT } from "../output-delivery.js";
+import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB } from "../memory-limits.js";
 
 /**
  * sandbox_batch 工具 — 并行执行多任务
@@ -19,8 +20,8 @@ const TaskItemSchema = z.object({
     cwd: z.string().optional(),
     env: z.string().optional(),
     timeout: z.number().min(0).optional(),
-    maxMemoryMB: z.number().min(16).max(1536).optional(),
-    memoryRequestMB: z.number().min(16).max(1536).optional(),
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional(),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional(),
     maxOutput: z.number().min(100).optional(),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional(),
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional(),
@@ -35,7 +36,7 @@ const BatchParamsSchema = z.object({
         .describe("true=并行(默认) false=顺序"),
     maxParallel: z.number().min(1).max(20).optional()
         .describe("最大并行数，默认3"),
-    maxTotalMemoryMB: z.number().min(64).max(1536).optional()
+    maxTotalMemoryMB: z.number().int().min(64).optional()
         .describe("batch 内同时运行任务的调度请求量上限(MB)，默认768；每项 maxMemoryMB 仍是独立进程树硬上限"),
     ownerId: z.string().min(1).max(200).optional()
         .describe("稳定调用方标识，用于全局公平调度"),
@@ -68,6 +69,9 @@ interface BatchTaskResult {
     tempFile: string | null;
     queueWaitMs: number;
     errorType?: string;
+    commandStarted?: boolean;
+    mayHaveStarted?: boolean;
+    runMs?: number;
     retryAfterMs?: number;
     deliveryMode?: ExecResult["deliveryMode"];
     artifact?: ExecResult["artifact"];
@@ -111,12 +115,14 @@ export function registerBatch(server: McpServer): void {
                 );
                 const effectiveTasks: EffectiveBatchTask[] = tasks.map(t => {
                     const maxMemoryMB = t.maxMemoryMB
-                        ? Math.min(t.maxMemoryMB, 1536)
-                        : Math.min(Math.max(perTaskMemDefault, 64), 256);
+                        ?? Math.min(Math.max(perTaskMemDefault, 64), 256);
                     const memoryRequestMB = t.memoryRequestMB
-                        ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
+                        ?? inferMemoryRequestMB(maxMemoryMB);
                     if (memoryRequestMB > maxMemoryMB) {
                         throw new Error("memoryRequestMB 不能大于同一任务的 maxMemoryMB");
+                    }
+                    if (memoryRequestMB > maxTotalMemoryMB) {
+                        throw new Error(`任务 memoryRequestMB ${memoryRequestMB}MB 超过 batch maxTotalMemoryMB ${maxTotalMemoryMB}MB`);
                     }
                     return {
                         ...t,
@@ -173,9 +179,11 @@ export function registerBatch(server: McpServer): void {
                         tasks: results.map((result) => ({
                             index: result.index,
                             errorType: result.errorType,
-                            commandStarted: !result.errorType?.startsWith("admission_")
-                                && !result.errorType?.startsWith("reservation_exceeds_"),
+                            commandStarted: result.commandStarted ?? (!result.errorType?.startsWith("admission_")
+                                && !result.errorType?.startsWith("reservation_exceeds_")),
+                            mayHaveStarted: result.mayHaveStarted ?? false,
                             queueWaitMs: result.queueWaitMs,
+                            runMs: result.runMs ?? 0,
                             exitCode: result.exitCode,
                             killed: result.killed,
                             killReason: result.killReason,
@@ -350,7 +358,10 @@ async function executeTask(
         truncated: result.truncated,
         tempFile: result.tempFile,
         queueWaitMs: result.queueWaitMs,
-        errorType: result.killReason === "timeout" ? "execution_timeout" : undefined,
+        errorType: result.errorType || (result.killReason === "timeout" ? "execution_timeout" : undefined),
+        commandStarted: result.commandStarted,
+        mayHaveStarted: result.mayHaveStarted,
+        runMs: result.runMs,
         deliveryMode: result.deliveryMode,
         artifact: result.artifact,
         outputStats: result.outputStats,

@@ -2,8 +2,11 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-exec-batch-integration-"));
+const sandboxRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "mcps", "sandbox");
 process.env.SANDBOX_DATA_ROOT = dataRoot;
 process.env.SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB = "0";
 
@@ -289,6 +292,98 @@ test("batch final response stays under the hard line for JSON-heavy output", asy
     }, {});
     assert.ok(Buffer.byteLength(JSON.stringify(response), "utf8") <= HARD_RESPONSE_BYTE_LIMIT);
     assert.match(response.content[0].text, /artifact=/u);
+});
+
+test("runMs measures execution after admission waiting without subtracting the queue twice", async () => {
+    const probe = spawnSync(process.execPath, [
+        "--input-type=module",
+        "--eval",
+        `process.env.SANDBOX_DATA_ROOT=${JSON.stringify(path.join(dataRoot, "run-ms-probe"))};
+         process.env.SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB="0";
+         process.env.SANDBOX_ADMISSION_LIMIT_MB="64";
+         const { acquireResourceLease } = await import("./dist/resource-admission-runtime.js");
+         const { execute } = await import("./dist/executor.js");
+         const held = await acquireResourceLease({ ownerId: "holder", reservationMB: 64 });
+         setTimeout(() => held.release(), 300);
+         const result = await execute({
+             code: "setTimeout(() => console.log('done'), 200)",
+             language: "node",
+             maxMemoryMB: 256,
+             memoryRequestMB: 64,
+             admissionBudgetMs: 2000,
+             timeout: 5000,
+         });
+         process.stdout.write(JSON.stringify({ queueWaitMs: result.queueWaitMs, runMs: result.runMs, commandStarted: result.commandStarted }));
+         process.exit(0);`,
+    ], {
+        cwd: sandboxRoot,
+        encoding: "utf8",
+        timeout: 15000,
+        env: { ...process.env },
+    });
+    assert.equal(probe.status, 0, JSON.stringify({
+        error: probe.error?.message,
+        signal: probe.signal,
+        stdout: probe.stdout,
+        stderr: probe.stderr,
+    }));
+    const metrics = JSON.parse(probe.stdout.trim().split(/\r?\n/u).at(-1));
+    assert.equal(metrics.commandStarted, true);
+    assert.ok(metrics.queueWaitMs >= 200, `queue wait was only ${metrics.queueWaitMs}ms`);
+    assert.ok(metrics.runMs >= 150, `runMs lost execution time and was only ${metrics.runMs}ms`);
+});
+
+test("missing working directory is classified before a command starts", async () => {
+    const missingCwd = path.join(dataRoot, "missing-cwd");
+    const result = await execute({
+        command: "echo should-not-run",
+        language: "cmd",
+        cwd: missingCwd,
+        maxMemoryMB: 256,
+    });
+    assert.equal(result.commandStarted, false);
+    assert.equal(result.mayHaveStarted, false);
+    assert.equal(result.errorType, "working_directory_missing");
+    assert.equal(result.runMs, 0);
+    assert.equal(result.exitCode, 1);
+});
+
+test("missing Windows Job runner fails closed and the next command remains usable", async () => {
+    if (process.platform !== "win32") return;
+    const originalRunner = process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH;
+    const markerPath = path.join(dataRoot, "runner-missing-marker.txt");
+    process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH = path.join(dataRoot, "missing-runner.exe");
+    try {
+        const failed = await execute({
+            ...nodeCode(`require("node:fs").writeFileSync(${JSON.stringify(markerPath)}, "unsafe");`),
+            maxMemoryMB: 256,
+        });
+        assert.equal(failed.commandStarted, false);
+        assert.equal(failed.mayHaveStarted, false);
+        assert.equal(failed.errorType, "windows_job_runner_missing");
+        assert.equal(failed.runMs, 0);
+        assert.equal(fs.existsSync(markerPath), false);
+    } finally {
+        if (originalRunner === undefined) delete process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH;
+        else process.env.SANDBOX_WINDOWS_JOB_RUNNER_PATH = originalRunner;
+    }
+
+    const recovered = await execute({ ...nodeCode(`console.log("followup-ok")`), maxMemoryMB: 256 });
+    assert.equal(recovered.exitCode, 0);
+    assert.equal(recovered.commandStarted, true);
+    assert.equal(recovered.mayHaveStarted, true);
+    assert.match(recovered.stdout, /followup-ok/u);
+});
+
+test("batch preserves startup classification for a missing cwd", async () => {
+    const handler = createBatchHandler();
+    const response = await handler({
+        tasks: [{ command: "echo should-not-run", language: "cmd", cwd: path.join(dataRoot, "batch-missing-cwd") }],
+    }, {});
+    assert.equal(response.structuredContent.tasks[0].errorType, "working_directory_missing");
+    assert.equal(response.structuredContent.tasks[0].commandStarted, false);
+    assert.equal(response.structuredContent.tasks[0].mayHaveStarted, false);
+    assert.equal(response.structuredContent.tasks[0].runMs, 0);
 });
 
 let passed = 0;

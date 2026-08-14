@@ -653,7 +653,7 @@ export async function callModelBridge(
     const chainUsed = await resolveModelChain(chain);
 
     if (chainUsed === "antigravity") {
-        const text = await callGetModelResponse(LS_AUTO_MODEL, prompt, timeoutMs);
+        const text = await callGetModelResponse(LS_AUTO_MODEL, prompt, timeoutMs, signal);
         if (!text) {
             throw new Error("Antigravity 链路模型调用失败");
         }
@@ -664,6 +664,7 @@ export async function callModelBridge(
         const result = await callClaudeCodeText(prompt, {
             ...claudeCodeOptionsFromParams(params),
             timeoutMs: typeof params?.timeoutMs === "number" ? params.timeoutMs : timeoutMs,
+            signal,
         });
         return { chainUsed, text: result.text };
     }

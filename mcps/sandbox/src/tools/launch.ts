@@ -10,6 +10,7 @@ import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
 import { acquireResourceLease, adoptResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
 import { getWindowsJobRunnerPath, hasWindowsJobRunner, readWindowsJobMetadata } from "../windows-job-runner.js";
+import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB, validateProcessTreeMemory } from "../memory-limits.js";
 
 /**
  * MCP Sandbox Launch — 长任务脱离执行
@@ -237,6 +238,7 @@ function validateLaunchCwd(cwd: string): string | null {
 function ensureWrapperFile(): void {
     ensureLaunchDir();
     const worker = `const fs = require("fs");
+const path = require("path");
 const { spawn } = require("child_process");
 
 const specPath = process.argv[2];
@@ -264,6 +266,9 @@ let stderrFd;
 try {
   stdoutFd = fs.openSync(spec.stdoutLog, "a");
   stderrFd = fs.openSync(spec.stderrLog, "a");
+  if (process.platform === "win32" && !spec.windowsJobRunner) {
+    throw new Error("windows_job_runner_missing: Windows Job Object helper is required");
+  }
   const useJobRunner = process.platform === "win32" && spec.windowsJobRunner;
   const child = useJobRunner ? spawn(spec.windowsJobRunner, [
     "--memory-mb", String(spec.maxMemoryMB),
@@ -271,7 +276,7 @@ try {
     "--cwd", spec.cwd,
     "--shell-base64", Buffer.from(spec.command, "utf8").toString("base64"),
   ], {
-    cwd: spec.cwd,
+    cwd: path.dirname(spec.windowsJobRunner),
     stdio: ["ignore", stdoutFd, stderrFd],
     windowsHide: true,
     env: { ...process.env, ...(spec.env || {}) },
@@ -691,9 +696,9 @@ const LaunchParamsShape = {
         .describe("status 前等待秒数（1-300），任务完成时提前返回"),
     ownerId: z.string().optional()
         .describe("任务归属 ID；未传时优先使用当前 MCP session 身份"),
-    maxMemoryMB: z.number().int().min(16).max(1536).optional()
-        .describe("长期任务进程树提交内存硬上限，默认256MB"),
-    memoryRequestMB: z.number().int().min(16).max(1536).optional()
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe(`长期任务进程树提交内存硬上限，默认256MB、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}MB`),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe("长期任务调度预期内存，必须不大于 maxMemoryMB"),
 };
 
@@ -833,7 +838,7 @@ export function registerLaunch(server: McpServer): void {
                     }
 
                     try {
-                        killProcessTree(task.pid);
+                        await killProcessTree(task.pid);
                         task.status = "failed";
                         task.exitCode = -1;
                         task.finishedAtMs = Date.now();
@@ -898,6 +903,11 @@ export function registerLaunch(server: McpServer): void {
                     content: [{ type: "text" as const, text: `❌ ${cwdError}\n` }],
                 });
             }
+            if (process.platform === "win32" && !hasWindowsJobRunner()) {
+                return appendTiming({
+                    content: [{ type: "text" as const, text: "❌ windows_job_runner_missing: Windows Job Object helper 不存在，任务未启动\n" }],
+                });
+            }
 
             ensureLaunchDir();
             ensureWrapperFile();
@@ -917,12 +927,13 @@ export function registerLaunch(server: McpServer): void {
             const handshakePath = path.join(logDir, `${taskId}.worker.json`);
             const memoryMetadataPath = path.join(logDir, `${taskId}.memory.json`);
             const hash = commandHash(command, cwd);
-            const maxMemoryMB = (params.maxMemoryMB as number | undefined) || 256;
+            const maxMemoryMB = (params.maxMemoryMB as number | undefined) ?? 256;
             const reservationMB = (params.memoryRequestMB as number | undefined)
-                ?? Math.min(maxMemoryMB, Math.max(64, Math.ceil(maxMemoryMB / 4)));
-            if (reservationMB > maxMemoryMB) {
+                ?? inferMemoryRequestMB(maxMemoryMB);
+            const memoryValidationError = validateProcessTreeMemory(maxMemoryMB, reservationMB);
+            if (memoryValidationError) {
                 return appendTiming({
-                    content: [{ type: "text" as const, text: "❌ memoryRequestMB 不能大于 maxMemoryMB\n" }],
+                    content: [{ type: "text" as const, text: `❌ ${memoryValidationError}\n` }],
                 });
             }
             fs.writeFileSync(specPath, JSON.stringify({
@@ -932,7 +943,7 @@ export function registerLaunch(server: McpServer): void {
                 stderrLog,
                 exitMarkerPath,
                 memoryMetadataPath,
-                windowsJobRunner: hasWindowsJobRunner() ? getWindowsJobRunnerPath() : null,
+                windowsJobRunner: process.platform === "win32" ? getWindowsJobRunnerPath() : null,
                 maxMemoryMB,
                 env: { PYTHONUNBUFFERED: "1" },
             }, null, 2), "utf-8");
@@ -973,14 +984,16 @@ export function registerLaunch(server: McpServer): void {
                     new Promise<boolean>(resolve => setTimeout(() => resolve(false), 1_000)),
                 ]);
                 if (!bootstrapExited) {
-                    killProcessTree(workerPid);
-                    if (bootstrap.pid) killProcessTree(bootstrap.pid);
+                    await Promise.all([
+                        killProcessTree(workerPid),
+                        bootstrap.pid ? killProcessTree(bootstrap.pid) : Promise.resolve(),
+                    ]);
                     throw new Error("launch bootstrap 未在 1 秒内退出，已停止 worker 以避免 backend 重拉误伤");
                 }
                 const processIdentity = await waitForLaunchProcessIdentity(workerPid);
                 if (!processIdentity) {
                     const memory = readWindowsJobMetadata(memoryMetadataPath);
-                    killProcessTree(workerPid);
+                    await killProcessTree(workerPid);
                     if (memory?.memoryLimitHit) {
                         throw new Error(`任务启动阶段触发 ${maxMemoryMB}MB 进程树内存硬上限`);
                     }
@@ -1020,8 +1033,8 @@ export function registerLaunch(server: McpServer): void {
                     }],
                 });
             } catch (err) {
+                if (workerPid) await killProcessTree(workerPid);
                 resourceLease?.release();
-                if (workerPid) killProcessTree(workerPid);
                 try { fs.unlinkSync(specPath); } catch { /* */ }
                 try { fs.unlinkSync(handshakePath); } catch { /* */ }
                 try { fs.unlinkSync(memoryMetadataPath); } catch { /* */ }

@@ -212,6 +212,7 @@ plans/
 - ⚠️ **MCP 60s 超时**：当前大部分 MCP 操作有约 60s 硬超时，单次同步调用别指望跑长任务，到点直接超时失败。耗时操作一律 `background=true` 启动 + 短轮询（`waitSeconds=30~45`）取结果
 - 执行命令/脚本优先走 sandbox（`sandbox_exec` 硬超时+内存隔离、`sandbox_session` 持久 REPL、`sandbox_launch` 长任务脱离），替代 CC 原生 run command 跑命令/计算/验证。✅ 实测 sandbox 能直接访问本地真实目录与文件（`os.listdir`、读写本地路径都通，还能 python-docx/pptx 提取 office 文本），所以本地文件操作也能交给它；仅当需要 CC 权限 UI 留痕、或依赖 CC 专属上下文时才用原生 Bash/PowerShell
 - Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树硬上限；短命令可在 Windows 提交余量安全时继续并行，队首大任务放不下也不会堵住后续小任务。默认 4096MB 提交余量是重任务目标线，不是所有任务的绝对红线；目标线与 1536MB 紧急底线之间只放行不超过 192MB、且接纳后仍守住紧急底线的小请求。`admission_timeout` 表示命令尚未启动，按 `retryAfterMs` 最多重试一次；再次失败就拆小、降低请求量、改后台或明确反馈排队超时，不能把同一重命令绕到原生 Bash/PowerShell
+- `maxMemoryMB` 的允许上限由服务端配置并在 `sandbox_status` 的「工具内存配置」中展示；参数越界或 `working_directory_missing`、`windows_job_runner_missing` 等启动前错误不等于 Sandbox 不可用，`commandStarted=false` 时修正参数或路径，禁止改用原生命令绕过保护。大目录 exact 搜索在全局 `maxResults` 到达后停止；fuzzy/smart 优先后台，取消时用同一 `taskId` 加 `cancel=true`
 - 排队超过约 1 秒后 Sandbox 会尝试定期发送等待位置和内存压力，但 Claude Code 界面未必展示 MCP progress；以最终结构化结果为准，不因没有中途提示就并发重发
 - 分清四类超时：`admission_timeout` 是资源等待超时，`execution_timeout` 是命令已经启动后运行超时，`caller_deadline_exceeded` 是排队与执行合计超过调用方总期限，`broker_backend_timeout` 是 broker 与 Sandbox backend 通信超时。后三类可能已经开始执行，先检查状态再重试
 - 大输出在安全预算内直接完整返回，超预算时返回预览与 artifact 的路径、SHA256、字节数、行数和过期时间；读取 artifact 才是完整结果。`maxOutput` 按正文字符计算，元数据预留另计；`maxLines` 超预算仍保留全文 artifact，批量任务共享单次响应总预算。该机制不改变 CC 自己约 60 秒的外层 MCP 限制，长任务仍按上一条使用后台模式和 30～45 秒短轮询

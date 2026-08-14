@@ -71,6 +71,15 @@ const WASM_FILES: Record<string, string> = {
 let parserReady = false;
 const loadedLanguages = new Map<string, Language>(); // searchPath → fileMap
 const indexCache = new Map<string, Map<string, FileIndex>>(); // searchPath → fileMap
+const DEFAULT_MAX_FILE_BYTES = Math.max(64 * 1024, Number(process.env.SANDBOX_SYMBOL_INDEX_MAX_FILE_BYTES || 2 * 1024 * 1024));
+
+function throwIfAborted(signal?: AbortSignal): void {
+    if (signal?.aborted) throw new Error("symbol index cancelled");
+}
+
+function yieldToEventLoop(): Promise<void> {
+    return new Promise((resolve) => setImmediate(resolve));
+}
 
 // ===== 初始化 =====
 
@@ -272,22 +281,25 @@ function extractHeader(content: string, lines = 10): string {
 
 // ===== 单文件索引 =====
 
-async function indexFile(filePath: string): Promise<FileIndex | null> {
+async function indexFile(filePath: string, opts: ScanOptions): Promise<FileIndex | null> {
+    throwIfAborted(opts.signal);
     const ext = path.extname(filePath).toLowerCase();
     const lang = LANG_MAP[ext];
     if (!lang) return null;
 
     let stat;
-    try { stat = fs.statSync(filePath); } catch { return null; }
+    try { stat = await fs.promises.stat(filePath); } catch { return null; }
+    if (stat.size > (opts.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES)) return null;
 
     const language = await loadLanguage(lang);
     if (!language) {
         // 不支持的语言：用正则兜底
-        return indexFileWithRegex(filePath, stat);
+        return indexFileWithRegex(filePath, stat, opts.signal);
     }
 
     let content;
-    try { content = fs.readFileSync(filePath, "utf-8"); } catch { return null; }
+    try { content = await fs.promises.readFile(filePath, "utf-8"); } catch { return null; }
+    throwIfAborted(opts.signal);
 
     const { Parser } = await getTreeSitter();
     const parser = new Parser();
@@ -315,9 +327,10 @@ const GENERIC_PATTERNS = [
     { re: /(?:export\s+)?(?:class|struct|enum|interface|trait|type)\s+(\w+)/g, type: "class" },
 ];
 
-function indexFileWithRegex(filePath: string, stat: fs.Stats): FileIndex | null {
+async function indexFileWithRegex(filePath: string, stat: fs.Stats, signal?: AbortSignal): Promise<FileIndex | null> {
+    throwIfAborted(signal);
     let content;
-    try { content = fs.readFileSync(filePath, "utf-8"); } catch { return null; }
+    try { content = await fs.promises.readFile(filePath, "utf-8"); } catch { return null; }
 
     const symbols: SymbolInfo[] = [];
     for (const { re, type } of GENERIC_PATTERNS) {
@@ -343,6 +356,8 @@ function indexFileWithRegex(filePath: string, stat: fs.Stats): FileIndex | null 
 interface ScanOptions {
     includes?: string[];
     excludes?: string[];
+    signal?: AbortSignal;
+    maxFileBytes?: number;
 }
 
 const DEFAULT_EXCLUDES = [
@@ -371,23 +386,29 @@ function matchesInclude(filePath: string, includes?: string[]): boolean {
     });
 }
 
-function collectFiles(dir: string, opts: ScanOptions, result: string[]): void {
+async function collectFiles(dir: string, opts: ScanOptions, result: string[]): Promise<void> {
     const excludes = opts.excludes || DEFAULT_EXCLUDES;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    const pending = [dir];
+    let visitedEntries = 0;
+    while (pending.length > 0) {
+        throwIfAborted(opts.signal);
+        const current = pending.pop()!;
+        let entries;
+        try { entries = await fs.promises.readdir(current, { withFileTypes: true }); } catch { continue; }
 
-    for (const entry of entries) {
-        if (shouldExclude(entry.name, excludes)) continue;
+        for (const entry of entries) {
+            throwIfAborted(opts.signal);
+            if (shouldExclude(entry.name, excludes)) continue;
 
-        const fullPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-            collectFiles(fullPath, opts, result);
-        } else if (entry.isFile() && matchesInclude(fullPath, opts.includes)) {
-            // 只收集有语言映射的文件，或者 includes 里明确指定的
-            const ext = path.extname(entry.name).toLowerCase();
-            if (LANG_MAP[ext] || matchesInclude(fullPath, opts.includes)) {
-                result.push(fullPath);
+            const fullPath = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+                pending.push(fullPath);
+            } else if (entry.isFile() && matchesInclude(fullPath, opts.includes)) {
+                const ext = path.extname(entry.name).toLowerCase();
+                if (LANG_MAP[ext] || matchesInclude(fullPath, opts.includes)) result.push(fullPath);
             }
+            visitedEntries += 1;
+            if (visitedEntries % 200 === 0) await yieldToEventLoop();
         }
     }
 }
@@ -410,10 +431,10 @@ export async function scanDirectory(
 
     // 收集文件
     const files: string[] = [];
-    collectFiles(searchPath, opts, files);
+    await collectFiles(searchPath, opts, files);
 
     // 并行索引（增量更新）
-    const BATCH_SIZE = 20;
+    const BATCH_SIZE = 8;
     const newCache = new Map<string, FileIndex>();
 
     for (let i = 0; i < files.length; i += BATCH_SIZE) {
@@ -423,7 +444,7 @@ export async function scanDirectory(
             const cached = cache.get(filePath);
             if (cached) {
                 try {
-                    const stat = fs.statSync(filePath);
+                    const stat = await fs.promises.stat(filePath);
                     if (stat.mtimeMs === cached.mtime) {
                         return { path: filePath, index: cached };
                     }
@@ -431,13 +452,14 @@ export async function scanDirectory(
             }
 
             // 需要重新索引
-            const index = await indexFile(filePath);
+            const index = await indexFile(filePath, opts);
             return index ? { path: filePath, index } : null;
         }));
 
         for (const result of results) {
             if (result) newCache.set(result.path, result.index);
         }
+        await yieldToEventLoop();
     }
 
     // 更新缓存

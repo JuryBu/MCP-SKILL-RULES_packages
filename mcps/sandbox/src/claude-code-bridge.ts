@@ -22,6 +22,7 @@ export interface ClaudeCodeOptions {
     noSessionPersistence?: boolean;
     cwd?: string;
     command?: string;
+    signal?: AbortSignal;
 }
 
 export interface ClaudeCodeResult {
@@ -262,6 +263,7 @@ export function claudeCodeOptionsFromParams(params: Record<string, unknown> | un
 }
 
 export async function callClaudeCodeText(prompt: string, options: ClaudeCodeOptions = {}): Promise<ClaudeCodeResult> {
+    options.signal?.throwIfAborted();
     const command = findClaudeCommand(options.command);
     if (!isClaudeCodeCliAvailable(command)) {
         throw new Error("Claude Code 链路不可用：未发现 claude CLI");
@@ -312,6 +314,7 @@ export async function callClaudeCodeText(prompt: string, options: ClaudeCodeOpti
         const stderrFd = fs.openSync(stderrPath, "a");
         let settled = false;
         let timedOut = false;
+        let aborted = false;
         const child = spawn(getPowerShellCommand(), [
             "-NoProfile",
             "-NonInteractive",
@@ -330,16 +333,26 @@ export async function callClaudeCodeText(prompt: string, options: ClaudeCodeOpti
             killProcessTree(child.pid);
             child.kill();
         }, timeoutMs);
+        const onAbort = () => {
+            aborted = true;
+            killProcessTree(child.pid);
+            child.kill();
+        };
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) onAbort();
         const finish = (fn: () => void) => {
             if (settled) return;
             settled = true;
             clearTimeout(timer);
+            options.signal?.removeEventListener("abort", onAbort);
             fs.closeSync(stdoutFd);
             fs.closeSync(stderrFd);
             fn();
         };
         child.on("error", (err) => finish(() => reject(err)));
-        child.on("close", (exitCode) => finish(() => resolve({ exitCode, timedOut })));
+        child.on("close", (exitCode) => finish(() => aborted
+            ? reject(options.signal?.reason instanceof Error ? options.signal.reason : new Error("Claude Code 调用已取消"))
+            : resolve({ exitCode, timedOut })));
     });
 
     const stdout = readClip(stdoutPath, Math.max(MAX_STDIO_CHARS, 20000));

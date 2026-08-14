@@ -171,7 +171,8 @@ function httpPost(
     urlPath: string,
     body: string,
     headers: Record<string, string>,
-    timeoutMs = 15000
+    timeoutMs = 15000,
+    signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
     return new Promise((resolve, reject) => {
         const req = http.request(
@@ -186,6 +187,7 @@ function httpPost(
                     ...headers,
                 },
                 timeout: timeoutMs,
+                signal,
             },
             (res) => {
                 const chunks: Buffer[] = [];
@@ -214,7 +216,8 @@ async function rpcCall(
     port: number,
     method: string,
     payload: Record<string, unknown> = {},
-    timeoutMs = 15000
+    timeoutMs = 15000,
+    signal?: AbortSignal,
 ): Promise<RpcResult> {
     const rpcPath = `/exa.language_server_pb.LanguageServerService/${method}`;
     const body = JSON.stringify(payload);
@@ -223,7 +226,7 @@ async function rpcCall(
         "Connect-Protocol-Version": "1",
     };
 
-    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs);
+    const resp = await httpPost("127.0.0.1", port, rpcPath, body, headers, timeoutMs, signal);
 
     let data: any;
     try {
@@ -238,12 +241,15 @@ async function rpcCall(
 /**
  * 找到 LS 的有效 HTTP 端口（通过 Heartbeat 验证）
  */
-async function findHttpPort(lsInfo: LsProcessInfo): Promise<number | null> {
+async function findHttpPort(lsInfo: LsProcessInfo, signal?: AbortSignal): Promise<number | null> {
     for (const port of lsInfo.ports) {
+        signal?.throwIfAborted();
         try {
-            const result = await rpcCall(lsInfo, port, "Heartbeat", {}, 5000);
+            const result = await rpcCall(lsInfo, port, "Heartbeat", {}, 5000, signal);
             if (result.status === 200) return port;
-        } catch { /* try next */ }
+        } catch {
+            signal?.throwIfAborted();
+        }
     }
     return null;
 }
@@ -453,12 +459,14 @@ async function callGetModelResponseOn(
     port: number,
     model: string,
     prompt: string,
-    timeout: number
+    timeout: number,
+    signal?: AbortSignal,
 ): Promise<string | null> {
     const errors: string[] = [];
     for (const candidate of getLsModelCandidates(model)) {
+        signal?.throwIfAborted();
         try {
-            const result = await rpcCall(info, port, "GetModelResponse", { model: candidate, prompt }, timeout);
+            const result = await rpcCall(info, port, "GetModelResponse", { model: candidate, prompt }, timeout, signal);
             if (result.status < 200 || result.status >= 300) {
                 errors.push(`${candidate}: LS GetModelResponse HTTP ${result.status}`);
                 continue;
@@ -472,6 +480,7 @@ async function callGetModelResponseOn(
             }
             errors.push(`${candidate}: Antigravity LS 模型返回为空`);
         } catch (err) {
+            signal?.throwIfAborted();
             errors.push(`${candidate}: ${errorMessage(err)}`);
         }
     }
@@ -481,17 +490,19 @@ async function callGetModelResponseOn(
 async function callGetModelResponseWithDiscovery(
     model: string,
     prompt: string,
-    timeout: number
+    timeout: number,
+    signal?: AbortSignal,
 ): Promise<string | null> {
     const tried = new Set<number>();
     const errors: string[] = [];
     if (parentLs) {
         const currentParent = parentLs;
         try {
-            const text = await callGetModelResponseOn(currentParent.info, currentParent.port, model, prompt, timeout);
+            const text = await callGetModelResponseOn(currentParent.info, currentParent.port, model, prompt, timeout, signal);
             if (text) return text;
             tried.add(currentParent.info.pid);
         } catch (err) {
+            signal?.throwIfAborted();
             tried.add(currentParent.info.pid);
             const message = `PID=${currentParent.info.pid} port=${currentParent.port}: ${errorMessage(err)}`;
             errors.push(message);
@@ -507,19 +518,21 @@ async function callGetModelResponseWithDiscovery(
     const candidates = discoverAllLsCandidates()
         .filter((info) => !tried.has(info.pid));
     for (const info of candidates) {
-        const port = await findHttpPort(info);
+        signal?.throwIfAborted();
+        const port = await findHttpPort(info, signal);
         if (!port) {
             tried.add(info.pid);
             continue;
         }
         try {
-            const text = await callGetModelResponseOn(info, port, model, prompt, timeout);
+            const text = await callGetModelResponseOn(info, port, model, prompt, timeout, signal);
             if (text) {
                 parentLs = { info, port };
                 parentLsInitPromise = null;
                 return text;
             }
         } catch (err) {
+            signal?.throwIfAborted();
             tried.add(info.pid);
             const message = `PID=${info.pid} port=${port}: ${errorMessage(err)}`;
             errors.push(message);
@@ -528,6 +541,7 @@ async function callGetModelResponseWithDiscovery(
     }
 
     const best = await discoverBestLs();
+    signal?.throwIfAborted();
     if (!best || tried.has(best.info.pid)) {
         if (errors.length > 0) {
             throw new Error(`Antigravity LS 候选全部失败: ${errors.join(" | ")}`);
@@ -536,8 +550,9 @@ async function callGetModelResponseWithDiscovery(
     }
     parentLs = best;
     try {
-        return await callGetModelResponseOn(best.info, best.port, model, prompt, timeout);
+        return await callGetModelResponseOn(best.info, best.port, model, prompt, timeout, signal);
     } catch (err) {
+        signal?.throwIfAborted();
         const message = `PID=${best.info.pid} port=${best.port}: ${errorMessage(err)}`;
         console.error(`[ls-client] LS model call failed: ${message}`);
         throw new Error(`Antigravity LS 候选全部失败: ${[...errors, message].join(" | ")}`);
@@ -547,17 +562,19 @@ async function callGetModelResponseWithDiscovery(
 export async function callGetModelResponseDetailed(
     model: string,
     prompt: string,
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: AbortSignal,
 ): Promise<LsModelResult> {
     const timeout = timeoutMs || DEFAULT_TIMEOUT;
     try {
         const text = await withWallClockTimeout(
-            callGetModelResponseWithDiscovery(model, prompt, timeout),
+            callGetModelResponseWithDiscovery(model, prompt, timeout, signal),
             timeout,
         );
         if (text) return { text };
         return { text: null, error: "Antigravity LS 模型返回为空", timedOut: false };
     } catch (err) {
+        signal?.throwIfAborted();
         const timedOut = isTimeoutError(err);
         const message = err === LS_WALL_CLOCK_TIMEOUT
             ? `Antigravity LS 模型调用超时（${timeout}ms）`
@@ -569,8 +586,9 @@ export async function callGetModelResponseDetailed(
 export async function callGetModelResponse(
     model: string,
     prompt: string,
-    timeoutMs?: number
+    timeoutMs?: number,
+    signal?: AbortSignal,
 ): Promise<string | null> {
-    const result = await callGetModelResponseDetailed(model, prompt, timeoutMs);
+    const result = await callGetModelResponseDetailed(model, prompt, timeoutMs, signal);
     return result.text;
 }

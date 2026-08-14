@@ -258,7 +258,8 @@ async function testSessionLifecycle(McpServer) {
     const tool = server._registeredTools.sandbox_session;
     assert.ok(tool);
     assert.equal(tool.inputSchema.safeParse({ action: "exec", timeout: 120000, maxMemoryMB: 1536 }).success, true);
-    assert.equal(tool.inputSchema.safeParse({ action: "exec", maxMemoryMB: 2048 }).success, false);
+    assert.equal(tool.inputSchema.safeParse({ action: "exec", maxMemoryMB: 2048 }).success, true);
+    assert.equal(tool.inputSchema.safeParse({ action: "exec", maxMemoryMB: 4097 }).success, false);
 
     const ownerId = "session-lifecycle-test";
     const started = await tool.handler({ action: "start", language: "node", ownerId }, extra());

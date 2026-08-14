@@ -22,6 +22,7 @@ export interface BackgroundTask {
 }
 
 const tasks = new Map<string, BackgroundTask>();
+const controllers = new Map<string, AbortController>();
 const TASK_TTL_MS = Number(process.env.SANDBOX_BACKGROUND_TASK_TTL || 30 * 60 * 1000);
 const BG_TASKS_DIR = process.env.SANDBOX_BG_TASKS_DIR
     ? path.resolve(process.env.SANDBOX_BG_TASKS_DIR)
@@ -33,6 +34,38 @@ export interface StartBackgroundTaskOptions {
 }
 
 export type BackgroundTaskProgress = (progress: string) => void;
+
+export function getBackgroundTaskStats(): { running: number; total: number; byKind: Record<string, number> } {
+    cleanupTasks();
+    const byKind: Record<string, number> = {};
+    let running = 0;
+    for (const task of tasks.values()) {
+        if (task.status !== "running") continue;
+        running += 1;
+        byKind[task.kind] = (byKind[task.kind] || 0) + 1;
+    }
+    return { running, total: tasks.size, byKind };
+}
+
+export function cancelBackgroundTask(
+    taskId: string,
+    ownerId?: string,
+): BackgroundTask | null | { forbidden: true; text: string } {
+    const requestOwner = normalizeOwnerId(ownerId);
+    const task = tasks.get(taskId) || readTaskFile(taskId);
+    if (!task) return null;
+    if (!hasOwnerAccess(task.ownerId, requestOwner)) {
+        return { forbidden: true, text: ownerMismatchText("后台任务", taskId) };
+    }
+    if (task.status !== "running") return task;
+    const controller = controllers.get(taskId);
+    if (!controller) return markInterrupted(task, "后台任务控制器不存在，无法继续执行");
+    task.progress = "取消已请求，正在终止底层任务";
+    task.updatedAt = nowIso();
+    writeTask(task);
+    controller.abort(new Error("调用方取消后台任务"));
+    return task;
+}
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -172,12 +205,14 @@ export function startBackgroundTask(
     writeTask(task);
 
     const abortController = new AbortController();
+    controllers.set(task.id, abortController);
     let settled = false;
     let timeoutTimer: NodeJS.Timeout | null = null;
 
     const settle = (patch: Partial<BackgroundTask>) => {
         if (settled) return;
         settled = true;
+        controllers.delete(task.id);
         if (timeoutTimer) clearTimeout(timeoutTimer);
         Object.assign(task, patch);
         task.finishedAt = nowIso();

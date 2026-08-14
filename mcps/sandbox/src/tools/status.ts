@@ -6,8 +6,18 @@ import { listSessions, closeSession, getActiveSessionCount, getSessionLimits } f
 import { cleanOldTempFiles, getTempStats } from "../temp-store.js";
 import { runCouncilArtifactGc, type CouncilGcMode } from "../council/artifact-gc.js";
 import os from "os";
+import { monitorEventLoopDelay } from "perf_hooks";
 import { getResourceAdmissionState } from "../resource-admission-runtime.js";
 import { cleanExpiredOutputArtifacts, getOutputArtifactStats } from "../output-artifact-store.js";
+import {
+    CODEX_DEFAULT_MAX_MEMORY_MB,
+    CODEX_DEFAULT_MEMORY_REQUEST_MB,
+    PROCESS_TREE_MAX_MEMORY_MB,
+} from "../memory-limits.js";
+import { getBackgroundTaskStats } from "../background-tasks.js";
+
+const eventLoopDelay = monitorEventLoopDelay({ resolution: 20 });
+eventLoopDelay.enable();
 
 /**
  * sandbox_status 工具 — 系统状态
@@ -86,6 +96,7 @@ async function buildOverview() {
     const [sessions, outputArtifacts] = await Promise.all([listSessions(), getOutputArtifactStats()]);
     const tempStats = getTempStats();
     const admission = getResourceAdmissionState();
+    const backgroundTasks = getBackgroundTaskStats();
 
     const totalMem = os.totalmem();
     const freeMem = os.freemem();
@@ -116,8 +127,23 @@ async function buildOverview() {
     lines.push(`  提交余量: ${admission.commitAvailableMemoryMB === null ? "未知" : `${admission.commitAvailableMemoryMB.toFixed(0)} MB`} | 重任务目标: ${admission.limits.commitHeadroomMB} MB | 紧急底线: ${admission.limits.commitCriticalFloorMB} MB | Windows 高/低内存信号: ${admission.highMemorySignaled ?? "未知"}/${admission.lowMemorySignaled ?? "未知"}`);
     lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
 
+    const loopMeanMs = Number.isFinite(eventLoopDelay.mean) ? eventLoopDelay.mean / 1e6 : 0;
+    const loopMaxMs = Number.isFinite(eventLoopDelay.max) ? eventLoopDelay.max / 1e6 : 0;
+    lines.push(`  事件循环延迟: 平均 ${loopMeanMs.toFixed(1)}ms | 峰值 ${loopMaxMs.toFixed(1)}ms | 后台任务: ${backgroundTasks.running}/${backgroundTasks.total}`);
+    if (backgroundTasks.running > 0) {
+        lines.push(`  后台任务类型: ${Object.entries(backgroundTasks.byKind).map(([kind, count]) => `${kind}=${count}`).join(", ")}`);
+    }
+    eventLoopDelay.reset();
+
+    const sessionLimits = getSessionLimits();
     lines.push("");
-    lines.push(`活跃会话: ${sessions.length}/${getSessionLimits().maxSessions}`);
+    lines.push("工具内存配置:");
+    lines.push(`  单进程树允许上限: ${PROCESS_TREE_MAX_MEMORY_MB} MB | 普通工具默认: 256 MB`);
+    lines.push(`  Codex 默认: 请求 ${CODEX_DEFAULT_MEMORY_REQUEST_MB} MB / 硬上限 ${CODEX_DEFAULT_MAX_MEMORY_MB} MB`);
+    lines.push(`  Session 默认: ${sessionLimits.defaultMemoryMB} MB | 合计请求额度: ${sessionLimits.maxTotalMemoryMB} MB`);
+
+    lines.push("");
+    lines.push(`活跃会话: ${sessions.length}/${sessionLimits.maxSessions}`);
     if (sessions.length > 0) {
         for (const s of sessions) {
             lines.push(`  ${s.id} | ${s.language} | ${s.memoryMB}MB | 运行 ${s.uptime} | 执行 ${s.execCount} 次`);

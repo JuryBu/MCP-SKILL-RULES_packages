@@ -20,6 +20,12 @@ import {
     readWindowsJobMetadata,
     removeWindowsJobMetadata,
 } from "../windows-job-runner.js";
+import {
+    CODEX_DEFAULT_MAX_MEMORY_MB,
+    CODEX_DEFAULT_MEMORY_REQUEST_MB,
+    PROCESS_TREE_MAX_MEMORY_MB,
+    validateProcessTreeMemory,
+} from "../memory-limits.js";
 
 /**
  * sandbox_codex 工具 — Codex CLI 专用调用（v1.2 后台模式）
@@ -64,6 +70,7 @@ interface CodexTask {
     memoryMonitor: NodeJS.Timeout | null;
     timeoutTimer: NodeJS.Timeout | null;
     terminationTimer: NodeJS.Timeout | null;
+    terminationPromise: Promise<void> | null;
     cleanupTimer: NodeJS.Timeout | null;
     finalized: boolean;
     finalizing: boolean;
@@ -464,6 +471,8 @@ async function startCodexProcess(params: {
     signal?: AbortSignal;
     admissionBudgetMs?: number;
     retryAttempt?: number;
+    maxMemoryMB?: number;
+    memoryRequestMB?: number;
 }): Promise<CodexTask> {
     const { prompt, outputFile, cwd, timeout, configOverrides, maxOutput, model,
         image, json: jsonMode, outputSchema, enableFeatures, disableFeatures, reviewMode } = params;
@@ -546,9 +555,14 @@ async function startCodexProcess(params: {
         } catch { /* ignore */ }
     }
 
+    const maxMemoryMB = params.maxMemoryMB ?? CODEX_DEFAULT_MAX_MEMORY_MB;
+    const memoryRequestMB = params.memoryRequestMB ?? CODEX_DEFAULT_MEMORY_REQUEST_MB;
+    const memoryValidationError = validateProcessTreeMemory(maxMemoryMB, memoryRequestMB, "Codex");
+    if (memoryValidationError) throw new Error(memoryValidationError);
+
     const resourceLease = await acquireResourceLease({
         ownerId: params.ownerId,
-        reservationMB: Number(process.env.SANDBOX_CODEX_MEMORY_REQUEST_MB || process.env.SANDBOX_CODEX_RESERVATION_MB || 384),
+        reservationMB: memoryRequestMB,
         signal: params.signal,
         admissionBudgetMs: params.admissionBudgetMs,
         retryAttempt: params.retryAttempt,
@@ -579,14 +593,13 @@ async function startCodexProcess(params: {
         throw new CodexStartCancelledError();
     }
     const startTime = Date.now();
-    const maxMemoryMB = Number(process.env.SANDBOX_CODEX_MAX_MEMORY_MB || 1536);
     const targetCwd = cwd || process.cwd();
-    const windowsJobLaunch = createWindowsJobLaunch(codexTarget.command, cmdArgs, targetCwd, maxMemoryMB);
-
+    let windowsJobLaunch: ReturnType<typeof createWindowsJobLaunch> = null;
     let proc: ChildProcess;
     try {
+        windowsJobLaunch = createWindowsJobLaunch(codexTarget.command, cmdArgs, targetCwd, maxMemoryMB);
         proc = spawn(windowsJobLaunch?.command ?? codexTarget.command, windowsJobLaunch?.args ?? cmdArgs, {
-            cwd: targetCwd,
+            cwd: windowsJobLaunch?.spawnCwd ?? targetCwd,
             env: { ...process.env },
             stdio: ["pipe", "pipe", "pipe"],
             windowsHide: true,
@@ -632,6 +645,7 @@ async function startCodexProcess(params: {
         memoryMonitor: null,
         timeoutTimer: null,
         terminationTimer: null,
+        terminationPromise: null,
         cleanupTimer: null,
         finalized: false,
         finalizing: false,
@@ -661,6 +675,7 @@ async function startCodexProcess(params: {
         task.finalizing = true;
 
         void (async () => {
+            if (task.terminationPromise) await task.terminationPromise;
             const finalMemory = task.memoryMetadataPath
                 ? readWindowsJobMetadata(task.memoryMetadataPath)
                 : null;
@@ -723,16 +738,8 @@ async function startCodexProcess(params: {
             task.killReason = reason;
         }
 
-        if (!task.terminationTimer) {
-            task.terminationTimer = setTimeout(task.finalize, 1500);
-            task.terminationTimer.unref?.();
-        }
-
-        try {
-            if (task.pid) killProcessTree(task.pid);
-        } catch (error) {
-            void outputCollector.write("stderr", `\n终止进程树失败: ${error instanceof Error ? error.message : String(error)}`);
-        }
+        if (task.pid) task.terminationPromise ??= killProcessTree(task.pid);
+        task.finalize();
     };
 
     proc.on("close", task.finalize);
@@ -797,6 +804,10 @@ const CodexParamsShape = {
     admissionBudgetMs: z.number().min(0).optional()
         .describe("资源不足时最多等待多久"),
     retryAttempt: z.number().int().min(0).max(4).optional(),
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe(`Codex 进程树提交内存硬上限，默认${CODEX_DEFAULT_MAX_MEMORY_MB}MB、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}MB`),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe(`Codex 调度预期内存，默认${CODEX_DEFAULT_MEMORY_REQUEST_MB}MB，必须不大于 maxMemoryMB`),
     // 新增参数（v1.8）
     image: z.string().optional()
         .describe("图片文件路径（-i 参数），让 Codex 看截图做 UI Review 等"),
@@ -998,6 +1009,8 @@ v1.8 新增参数：
             const deliveryMode = params.deliveryMode as OutputDeliveryMode | undefined;
             const admissionBudgetMs = params.admissionBudgetMs as number | undefined;
             const retryAttempt = params.retryAttempt as number | undefined;
+            const maxMemoryMB = params.maxMemoryMB as number | undefined;
+            const memoryRequestMB = params.memoryRequestMB as number | undefined;
             const background = (params.background as boolean | undefined) ?? false;
             const image = params.image as string | undefined;
             const jsonMode = params.json as boolean | undefined;
@@ -1028,6 +1041,8 @@ v1.8 新增参数：
                     signal: extra.signal,
                     admissionBudgetMs,
                     retryAttempt,
+                    maxMemoryMB,
+                    memoryRequestMB,
                 });
             } catch (error) {
                 if (error instanceof CodexStartCancelledError) {

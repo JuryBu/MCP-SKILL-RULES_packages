@@ -5,9 +5,11 @@ import { resolveInterpreter, getCachedEnvInfo } from "./env-detector.js";
 import { formatElapsed } from "./lifecycle.js";
 import { acquireResourceLease } from "./resource-admission-runtime.js";
 import {
+    classifyWindowsRunnerSpawnFailure,
     createWindowsJobLaunch,
     readWindowsJobMetadata,
     removeWindowsJobMetadata,
+    WindowsJobLaunchError,
 } from "./windows-job-runner.js";
 import type { ResourceWaitProgress } from "./resource-admission.js";
 import {
@@ -18,6 +20,11 @@ import {
     type OutputDeliveryMode,
     type OutputDeliveryResult,
 } from "./output-delivery.js";
+import {
+    inferMemoryRequestMB,
+    PROCESS_TREE_MAX_MEMORY_MB,
+    validateProcessTreeMemory,
+} from "./memory-limits.js";
 
 /**
  * MCP Sandbox 子进程执行引擎
@@ -80,6 +87,10 @@ export interface ExecResult {
     outputStatus: OutputDeliveryResult["status"] | null;
     outputComplete: boolean;
     outputReadHint: string | null;
+    commandStarted: boolean;
+    mayHaveStarted: boolean;
+    errorType: string | null;
+    runMs: number;
 }
 
 export interface NormalizedExecutionInput {
@@ -125,6 +136,10 @@ export function makeParamErrorResult(stderr: string): ExecResult {
         outputStatus: null,
         outputComplete: false,
         outputReadHint: null,
+        commandStarted: false,
+        mayHaveStarted: false,
+        errorType: "parameter_validation",
+        runMs: 0,
     };
 }
 
@@ -133,6 +148,7 @@ function makeCancelledBeforeSpawnResult(queueWaitMs: number): ExecResult {
         ...makeParamErrorResult("执行已取消，进程未启动"),
         killed: true,
         killReason: "cancelled",
+        errorType: "cancelled_before_start",
         queueWaitMs,
     };
 }
@@ -143,7 +159,7 @@ const DEFAULTS = {
     timeout: 30000,       // 30秒
     maxTimeout: Number(process.env.SANDBOX_EXEC_MAX_TIMEOUT_MS || 6 * 60 * 60 * 1000),
     maxMemoryMB: 256,
-    maxMemoryLimit: 1536,
+    maxMemoryLimit: PROCESS_TREE_MAX_MEMORY_MB,
     maxOutput: 1024 * 1024,
     outputMode: "full" as OutputMode,
     tailLines: 20,
@@ -154,21 +170,53 @@ const DEFAULTS = {
 /**
  * Windows 下杀进程树（taskkill /T /F），Linux 下用 kill
  */
-export function killProcessTree(pid: number): void {
+export async function killProcessTree(pid: number): Promise<void> {
+    if (process.platform === "win32") {
+        await new Promise<void>((resolve) => {
+            let settled = false;
+            const fallback = () => {
+                try { process.kill(pid, "SIGKILL"); } catch { /* already exited */ }
+            };
+            const finish = () => {
+                if (settled) return;
+                settled = true;
+                resolve();
+            };
+            try {
+                const killer = spawn("taskkill.exe", ["/T", "/F", "/PID", String(pid)], {
+                    stdio: "ignore",
+                    windowsHide: true,
+                    shell: false,
+                });
+                const timeout = setTimeout(() => {
+                    try { killer.kill(); } catch { /* ignore */ }
+                    fallback();
+                    finish();
+                }, 5000);
+                killer.once("close", () => {
+                    clearTimeout(timeout);
+                    finish();
+                });
+                killer.once("error", () => {
+                    clearTimeout(timeout);
+                    fallback();
+                    finish();
+                });
+            } catch {
+                fallback();
+                finish();
+            }
+        });
+        return;
+    }
     try {
-        if (process.platform === "win32") {
-            execSync(`taskkill /T /F /PID ${pid}`, {
-                stdio: "pipe",
-                windowsHide: true,
-            });
-        } else {
+        try {
             process.kill(-pid, "SIGKILL");
+        } catch {
+            process.kill(pid, "SIGKILL");
         }
     } catch {
-        // 进程可能已退出
-        try {
-            process.kill(pid, "SIGKILL");
-        } catch { /* 已退出 */ }
+        // process tree already exited
     }
 }
 
@@ -546,18 +594,10 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
     const normalizedCommand = normalizedInput.command;
 
     const effectiveTimeout = timeout === 0 ? 0 : Math.min(timeout, DEFAULTS.maxTimeout);
-    if (!Number.isFinite(maxMemoryMB) || maxMemoryMB < 16 || maxMemoryMB > DEFAULTS.maxMemoryLimit) {
-        return makeParamErrorResult(`错误：maxMemoryMB 必须在 16～${DEFAULTS.maxMemoryLimit} 之间`);
-    }
-    if (memoryRequestMB !== undefined
-        && (!Number.isFinite(memoryRequestMB) || memoryRequestMB < 16 || memoryRequestMB > maxMemoryMB)) {
-        return makeParamErrorResult("错误：memoryRequestMB 必须在 16 与 maxMemoryMB 之间");
-    }
+    const memoryValidationError = validateProcessTreeMemory(maxMemoryMB, memoryRequestMB);
+    if (memoryValidationError) return makeParamErrorResult(`错误：${memoryValidationError}`);
     const effectiveMemory = maxMemoryMB;
-    const inferredMemoryRequestMB = Math.min(
-        effectiveMemory,
-        Math.max(64, Math.ceil(effectiveMemory / 4)),
-    );
+    const inferredMemoryRequestMB = inferMemoryRequestMB(effectiveMemory);
 
     let scriptPath: string | null = null;
     let killed = false;
@@ -690,14 +730,29 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         }
 
         const targetCwd = effectiveCwd || process.cwd();
-        const windowsJobLaunch = createWindowsJobLaunch(execCmd, execArgs, targetCwd, effectiveMemory);
+        let windowsJobLaunch;
+        try {
+            windowsJobLaunch = createWindowsJobLaunch(execCmd, execArgs, targetCwd, effectiveMemory);
+        } catch (error) {
+            const errorType = error instanceof WindowsJobLaunchError ? error.errorType : "spawn_failed";
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            void collector.finalize({ status: "error", error: `${errorType}: ${errorMessage}` }).catch(() => undefined).then(() => {
+                lease.release();
+                resolve({
+                    ...makeParamErrorResult(`进程启动失败: ${errorMessage}`),
+                    errorType,
+                    queueWaitMs: lease.queueWaitMs,
+                });
+            });
+            return;
+        }
         let proc: ChildProcess;
         try {
             proc = spawn(
                 windowsJobLaunch?.command ?? execCmd,
                 windowsJobLaunch?.args ?? execArgs,
                 {
-                cwd: targetCwd,
+                cwd: windowsJobLaunch?.spawnCwd ?? targetCwd,
                 env: spawnEnv,
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
@@ -705,13 +760,14 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         } catch (error) {
             removeWindowsJobMetadata(windowsJobLaunch?.metadataPath ?? null);
             const errorMessage = error instanceof Error ? error.message : String(error);
+            const errorType = process.platform === "win32"
+                ? classifyWindowsRunnerSpawnFailure(targetCwd)
+                : "spawn_failed";
             void collector.finalize({ status: "error", error: `spawn_failed: ${errorMessage}` }).catch(() => undefined).then(() => {
                 lease.release();
                 resolve({
                     ...makeParamErrorResult(`进程启动失败: ${errorMessage}`),
-                    elapsed: formatElapsed(Date.now() - startTime),
-                    killed: true,
-                    killReason: "crash",
+                    errorType,
                     queueWaitMs: lease.queueWaitMs,
                 });
             });
@@ -721,6 +777,10 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         let resolved = false;
         let finalizing = false;
         let memoryMonitor: NodeJS.Timeout | null = null;
+        let commandStarted = false;
+        let mayHaveStarted = false;
+        let startErrorType: string | null = null;
+        let terminationPromise: Promise<void> | null = null;
 
         const applyWindowsJobMetadata = (): boolean => {
             if (!windowsJobLaunch) return false;
@@ -733,12 +793,17 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 killed = true;
                 killReason = "memory";
             }
+            commandStarted = metadata.commandStarted;
+            mayHaveStarted = metadata.commandStarted;
+            if (metadata.startErrorType) startErrorType = metadata.startErrorType;
             return true;
         };
 
         const finalize = async () => {
             if (resolved || finalizing) return;
             finalizing = true;
+
+            if (terminationPromise) await terminationPromise;
 
             if (timeoutTimer) clearTimeout(timeoutTimer);
             if (memoryMonitor) clearInterval(memoryMonitor);
@@ -756,8 +821,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             try {
                 delivery = await collector.finalize({
                     mode: deliveryMode,
-                status: killed ? "interrupted" : proc.exitCode === 0 ? "done" : "error",
-                error: killed ? killReason || undefined : proc.exitCode === 0 ? undefined : `exitCode=${proc.exitCode}`,
+                status: killed ? "interrupted" : commandStarted && proc.exitCode === 0 ? "done" : "error",
+                error: startErrorType || (killed ? killReason || undefined : proc.exitCode === 0 ? undefined : `exitCode=${proc.exitCode}`),
                 });
             } catch (error) {
                 lease.release();
@@ -799,7 +864,7 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             const result: ExecResult = {
                 stdout: stdoutText,
                 stderr: stderrText,
-                exitCode: proc.exitCode,
+                exitCode: commandStarted ? proc.exitCode : null,
                 elapsed,
                 killed,
                 killReason,
@@ -816,6 +881,10 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 outputStatus: delivery.status,
                 outputComplete: delivery.complete,
                 outputReadHint: delivery.readHint ?? null,
+                commandStarted,
+                mayHaveStarted,
+                errorType: startErrorType || (killed ? (killReason === "timeout" ? "execution_timeout" : killReason) : null),
+                runMs: commandStarted ? Math.max(0, Date.now() - startTime) : 0,
             };
 
             removeWindowsJobMetadata(windowsJobLaunch?.metadataPath ?? null);
@@ -825,11 +894,23 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
         proc.stdout?.pipe(collector.stdout);
         proc.stderr?.pipe(collector.stderr);
 
+        proc.once("spawn", () => {
+            if (!windowsJobLaunch) {
+                commandStarted = true;
+                mayHaveStarted = true;
+            }
+        });
+
         proc.on("close", () => void finalize());
 
         proc.on("error", (err: Error) => {
-            killed = true;
-            killReason = "crash";
+            startErrorType = process.platform === "win32"
+                ? classifyWindowsRunnerSpawnFailure(targetCwd)
+                : "spawn_failed";
+            if (commandStarted) {
+                killed = true;
+                killReason = "crash";
+            }
             void collector.write("stderr", `\n进程错误: ${err.message}`).finally(() => void finalize());
         });
 
@@ -837,8 +918,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
             if (resolved || !proc.pid) return;
             killed = true;
             killReason = "cancelled";
-            killProcessTree(proc.pid);
-            setTimeout(() => void finalize(), 200);
+            terminationPromise ??= killProcessTree(proc.pid);
+            void finalize();
         };
         signal?.addEventListener("abort", onAbort, { once: true });
         if (signal?.aborted) onAbort();
@@ -850,9 +931,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 if (!resolved && proc.pid) {
                     killed = true;
                     killReason = "timeout";
-                    killProcessTree(proc.pid);
-                    // 给进程树杀留一点时间
-                    setTimeout(() => void finalize(), 200);
+                    terminationPromise ??= killProcessTree(proc.pid);
+                    void finalize();
                 }
             }, effectiveTimeout);
         }
@@ -877,8 +957,8 @@ export async function execute(options: ExecOptions): Promise<ExecResult> {
                 if (memMB > effectiveMemory) {
                     killed = true;
                     killReason = "memory";
-                    killProcessTree(proc.pid);
-                    setTimeout(() => void finalize(), 200);
+                    terminationPromise ??= killProcessTree(proc.pid);
+                    void finalize();
                 }
             } catch {
                 // pidusage 可能在进程退出后失败，忽略
