@@ -56,14 +56,14 @@ export function classifyCodexModelRequest(request) {
   };
 }
 
-function isReplayableStreamingBody(body) {
+function isReplayableRequestBody(body) {
   let payload;
   try {
     payload = JSON.parse(body.toString("utf8"));
   } catch {
     return false;
   }
-  return payload?.stream === true;
+  return payload !== null && typeof payload === "object" && !Array.isArray(payload);
 }
 
 function eventPayloadHasContent(event) {
@@ -428,9 +428,9 @@ export function createCodexModelStreamProxy(options = {}) {
 
     try {
       const body = await collectRequestBody(request, maxBufferedRequestBytes);
-      if (!isReplayableStreamingBody(body)) {
+      if (!isReplayableRequestBody(body)) {
         counters.passthrough += 1;
-        emit({ type: "buffered_passthrough", reason: "non_stream_body" });
+        emit({ type: "buffered_passthrough", reason: "non_json_body" });
         const client = requestClient(targetUrl);
         const upstream = client.request(targetUrl, {
           method: request.method,

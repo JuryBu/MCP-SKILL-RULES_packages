@@ -201,7 +201,7 @@ test("compaction bypasses replay while ordinary turns with hosted tool declarati
   const compact = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
   assert.equal(compact.statusCode, 200);
   assert.equal(attempts, 1);
-  const hosted = await request(proxy.status().port, { stream: true, tools: [{ type: "web_search" }] });
+  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] });
   assert.equal(hosted.statusCode, 200);
   assert.match(hosted.body, /recovered/u);
   assert.equal(attempts, 3);
