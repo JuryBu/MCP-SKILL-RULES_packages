@@ -340,12 +340,15 @@ function Assert-BackendOnlyCompatible {
   if (-not (Test-Path -LiteralPath $PreviousRoot)) {
     throw "Backend-only hot reload requires an existing installed code snapshot."
   }
-  foreach ($RelativePath in @(
+  $LoadedProxyPaths = @(
     "src\codex-app-server-proxy.mjs",
-    "src\codex-app-server-proxy-runner.mjs",
+    "src\codex-app-server-proxy-runner.mjs"
+  )
+  $NextStartProxyPaths = @(
     "src\codex-model-stream-proxy.mjs",
     "src\codex-model-stream-proxy-runner.mjs"
-  )) {
+  )
+  foreach ($RelativePath in $LoadedProxyPaths) {
     $PreviousPath = Join-Path $PreviousRoot $RelativePath
     $NextPath = Join-Path $NextRoot $RelativePath
     if (-not (Test-Path -LiteralPath $PreviousPath) -or -not (Test-Path -LiteralPath $NextPath)) {
@@ -355,6 +358,19 @@ function Assert-BackendOnlyCompatible {
     $NextHash = Get-NormalizedTextHash -Path $NextPath
     if ($PreviousHash -ne $NextHash) {
       throw "Backend-only hot reload is unsafe because a proxy-critical file changed: $RelativePath"
+    }
+  }
+  foreach ($RelativePath in $NextStartProxyPaths) {
+    $PreviousPath = Join-Path $PreviousRoot $RelativePath
+    $NextPath = Join-Path $NextRoot $RelativePath
+    if (-not (Test-Path -LiteralPath $NextPath)) {
+      throw "Backend-only hot reload is unsafe because a next-start proxy file is missing: $RelativePath"
+    }
+    if (-not (Test-Path -LiteralPath $PreviousPath)) { continue }
+    $PreviousHash = Get-NormalizedTextHash -Path $PreviousPath
+    $NextHash = Get-NormalizedTextHash -Path $NextPath
+    if ($PreviousHash -ne $NextHash) {
+      throw "Backend-only hot reload is unsafe because a next-start proxy file changed: $RelativePath"
     }
   }
 }

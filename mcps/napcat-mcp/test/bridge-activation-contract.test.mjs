@@ -467,6 +467,11 @@ test("backend-only hot reload protects loaded proxy code but allows next-start l
   assert.doesNotMatch(compatibilityBlock, /src\\codex-thread-bridge\.mjs/);
   assert.match(compatibilityBlock, /src\\codex-app-server-proxy\.mjs/);
   assert.match(compatibilityBlock, /src\\codex-app-server-proxy-runner\.mjs/);
+  assert.match(compatibilityBlock, /\$LoadedProxyPaths/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths/);
+  assert.match(compatibilityBlock, /next-start proxy file is missing/);
+  assert.match(compatibilityBlock, /if \(-not \(Test-Path -LiteralPath \$PreviousPath\)\) \{ continue \}/);
+  assert.match(compatibilityBlock, /next-start proxy file changed/);
   assert.doesNotMatch(compatibilityBlock, /ops\\start-codex-app-server-proxy\.ps1/);
   assert.doesNotMatch(compatibilityBlock, /ops\\stop-codex-app-server-proxy\.ps1/);
   assert.doesNotMatch(compatibilityBlock, /ops\\get-codex-app-server-proxy-status\.ps1/);
