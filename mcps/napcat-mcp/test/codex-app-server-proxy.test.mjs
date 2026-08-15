@@ -456,13 +456,6 @@ test("wake visibility only controls client ids while busy and idle injection sem
   desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }));
   await waitFor(() => proxy.status().readyClientCount === 1);
 
-  const busyInspection = await proxy.subscribeThread("thread-visibility");
-  assert.equal(busyInspection.status, "busy");
-  assert.equal(busyInspection.busy, true);
-  const idleInspection = await proxy.subscribeThread("thread-visible-idle");
-  assert.equal(idleInspection.status, "idle");
-  assert.equal(idleInspection.busy, false);
-
   const wake = {
     taskId: "task-visibility",
     generation: 1,

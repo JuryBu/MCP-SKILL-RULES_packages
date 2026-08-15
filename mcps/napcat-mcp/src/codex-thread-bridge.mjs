@@ -865,17 +865,7 @@ class CodexProxyThreadBridge {
   async inspectThread(threadId) {
     const normalizedThreadId = requiredString(threadId, "threadId", 256);
     const response = await this.#request("/subscribe", { threadId: normalizedThreadId });
-    const status = response.status === "idle" || response.status === "busy"
-      ? response.status
-      : "unknown";
-    return {
-      threadId: normalizedThreadId,
-      status,
-      busy: status === "busy" ? true : status === "idle" ? false : null,
-      found: response.found ?? true,
-      source: "proxy/thread/resume",
-      raw: response,
-    };
+    return interpretThreadResponse(normalizedThreadId, response, "proxy/thread/resume");
   }
 
   async wake(input) {

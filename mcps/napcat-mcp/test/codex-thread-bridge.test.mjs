@@ -349,6 +349,32 @@ if (fakeArgumentIndex >= 0) {
     }
   });
 
+  test("transparent proxy bridge interprets existing resume payloads without proxy changes", async () => {
+    const responses = [
+      { threadId: "thread-proxy", results: [{ thread: { id: "thread-proxy", turns: [{ status: "in_progress" }] } }] },
+      { threadId: "thread-proxy", results: [{ thread: { id: "thread-proxy", turns: [{ status: "completed" }] } }] },
+    ];
+    const bridge = createCodexThreadBridge({
+      mode: "transparent_proxy",
+      controlUrl: "http://127.0.0.1:18431",
+      controlToken: "proxy-test-token",
+      fetchImpl: async () => new Response(JSON.stringify(responses.shift()), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    });
+    try {
+      const busy = await bridge.inspectThread("thread-proxy");
+      assert.equal(busy.status, "busy");
+      assert.equal(busy.busy, true);
+      const idle = await bridge.inspectThread("thread-proxy");
+      assert.equal(idle.status, "idle");
+      assert.equal(idle.busy, false);
+    } finally {
+      await bridge.close();
+    }
+  });
+
   test("transparent proxy bridge reconciles a timed out wake that failed before send", async () => {
     const calls = [];
     let wakeStatus = "dispatching";

@@ -520,15 +520,7 @@ export class CodexAppServerProxy {
       { threadId: normalizedThreadId, excludeTurns: true },
       { threadId: normalizedThreadId, timeoutMs: this.resumeRequestTimeoutMs },
     );
-    const busy = resumeResultIndicatesBusy(result);
-    return {
-      threadId: normalizedThreadId,
-      status: busy ? "busy" : "idle",
-      busy,
-      found: true,
-      readyClients: [primary],
-      results: [result],
-    };
+    return { threadId: normalizedThreadId, readyClients: [primary], results: [result] };
   }
 
   async subscribeTask(input) {
