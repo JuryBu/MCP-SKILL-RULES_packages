@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { open, lstat, readdir, realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import * as zlib from "node:zlib";
+import { Decompress as ZstdDecompress } from "fzstd";
+import xxhash from "xxhash-wasm";
 
 export interface DshReaderOptions {
     sessionsRoot?: string;
@@ -10,6 +11,8 @@ export interface DshReaderOptions {
     env?: NodeJS.ProcessEnv;
     homeDir?: string;
     maxStabilityAttempts?: number;
+    maxDecompressedBytes?: number;
+    maxDecompressedFrameBytes?: number;
 }
 
 export interface DshSessionHeader {
@@ -106,12 +109,20 @@ interface DecodedSource {
     ignoredTrailingZstdFrame: boolean;
 }
 
+interface ZstdFrameInfo {
+    end: number;
+    checksum?: number;
+}
+
 type ReaderInput = DshReaderOptions | string | undefined;
 type ReadInput = DshSessionSnapshot | DshSessionReadOptions | string;
 
 const ZSTD_MAGIC = [0x28, 0xb5, 0x2f, 0xfd];
-const DSH_READER_REVISION = "2";
+const DSH_READER_REVISION = "3";
+const DSH_DEFAULT_MAX_DECOMPRESSED_BYTES = 256 * 1024 * 1024;
+const DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES = 16 * 1024 * 1024;
 const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+const xxhashApi = xxhash();
 
 export class DshSessionReaderError extends Error {
     constructor(message: string) {
@@ -265,7 +276,11 @@ function isWithin(root: string, candidate: string): boolean {
 async function readCandidate(candidate: DshSessionCandidate, options: DshReaderOptions): Promise<DshSessionReadResult> {
     const source = await readStableSource(candidate.sourcePath, options.maxStabilityAttempts ?? 3);
     const decoded = candidate.format === "jsonl.zstd"
-        ? decodeZstdSource(source.bytes)
+        ? await decodeZstdSource(
+            source.bytes,
+            options.maxDecompressedBytes ?? DSH_DEFAULT_MAX_DECOMPRESSED_BYTES,
+            options.maxDecompressedFrameBytes ?? DSH_DEFAULT_MAX_DECOMPRESSED_FRAME_BYTES,
+        )
         : { text: decodeUtf8(source.bytes, "raw DSH JSONL"), ignoredTrailingZstdFrame: false };
     const parsed = parseDshJsonl(decoded.text);
     const fingerprint = createHash("sha256")
@@ -336,34 +351,58 @@ function sameRevision(left: { dev: number; ino: number; size: number; mtimeMs: n
     return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.mtimeMs === right.mtimeMs;
 }
 
-function decodeZstdSource(source: Buffer): DecodedSource {
-    const frames: Buffer[] = [];
+async function decodeZstdSource(
+    source: Buffer,
+    maxDecompressedBytes: number,
+    maxDecompressedFrameBytes: number,
+): Promise<DecodedSource> {
+    const limit = requirePositiveInteger(maxDecompressedBytes, "maxDecompressedBytes");
+    const frameLimit = requirePositiveInteger(maxDecompressedFrameBytes, "maxDecompressedFrameBytes");
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    const textParts: string[] = [];
+    let decompressedBytes = 0;
+    let completeFrames = 0;
     let offset = 0;
     let ignoredTrailingZstdFrame = false;
     while (offset < source.length) {
-        let end: number;
+        let frameInfo: ZstdFrameInfo;
         try {
-            end = zstdFrameEnd(source, offset);
+            frameInfo = zstdFrameInfo(source, offset);
         } catch (error) {
-            if (error instanceof IncompleteZstdFrameError && frames.length > 0) {
+            if (error instanceof IncompleteZstdFrameError && completeFrames > 0) {
                 ignoredTrailingZstdFrame = true;
                 break;
             }
             throw error;
         }
-        const frame = source.subarray(offset, end);
+        const frame = source.subarray(offset, frameInfo.end);
         try {
-            frames.push(decompressZstdFrame(frame));
+            decompressedBytes += await decompressZstdFrame(
+                frame,
+                decoder,
+                textParts,
+                limit - decompressedBytes,
+                frameLimit,
+                frameInfo.checksum,
+            );
         } catch (error) {
+            if (error instanceof DshSessionReaderError) throw error;
             throw new DshSessionReaderError(`invalid complete zstd frame: ${errorMessage(error)}`);
         }
-        offset = end;
+        completeFrames += 1;
+        offset = frameInfo.end;
     }
-    if (!frames.length) throw new DshSessionReaderError("DSH zstd source has no complete frame");
-    return { text: decodeUtf8(Buffer.concat(frames), "DSH zstd JSONL"), ignoredTrailingZstdFrame };
+    if (!completeFrames) throw new DshSessionReaderError("DSH zstd source has no complete frame");
+    try {
+        const finalText = decoder.decode();
+        if (finalText) textParts.push(finalText);
+    } catch (error) {
+        throw new DshSessionReaderError(`invalid UTF-8 in DSH zstd JSONL: ${errorMessage(error)}`);
+    }
+    return { text: textParts.join(""), ignoredTrailingZstdFrame };
 }
 
-function zstdFrameEnd(source: Buffer, start: number): number {
+function zstdFrameInfo(source: Buffer, start: number): ZstdFrameInfo {
     requireBytes(source, start, 4);
     for (let index = 0; index < ZSTD_MAGIC.length; index++) {
         if (source[start + index] !== ZSTD_MAGIC[index]) throw new DshSessionReaderError("invalid zstd frame magic");
@@ -397,21 +436,51 @@ function zstdFrameEnd(source: Buffer, start: number): number {
         offset += payloadSize;
         if (lastBlock) break;
     }
+    let checksum: number | undefined;
     if ((descriptor & 0x04) !== 0) {
         requireBytes(source, offset, 4);
+        checksum = source.readUInt32LE(offset);
         offset += 4;
     }
-    return offset;
+    return { end: offset, checksum };
 }
 
 function requireBytes(source: Buffer, offset: number, length: number): void {
     if (offset + length > source.length) throw new IncompleteZstdFrameError();
 }
 
-function decompressZstdFrame(frame: Buffer): Buffer {
-    const zstd = zlib as unknown as { zstdDecompressSync?: (input: Uint8Array) => Uint8Array };
-    if (typeof zstd.zstdDecompressSync !== "function") throw new DshSessionReaderError("this Node runtime does not provide zstdDecompressSync");
-    return Buffer.from(zstd.zstdDecompressSync(frame));
+async function decompressZstdFrame(
+    frame: Buffer,
+    decoder: typeof utf8Decoder,
+    textParts: string[],
+    remainingBytes: number,
+    maxFrameBytes: number,
+    expectedChecksum?: number,
+): Promise<number> {
+    if (remainingBytes <= 0) {
+        throw new DshSessionReaderError("DSH zstd decompressed output exceeds maxDecompressedBytes");
+    }
+    const outputLimit = Math.min(remainingBytes, maxFrameBytes);
+    let frameBytes = 0;
+    const checksum = expectedChecksum === undefined ? undefined : (await xxhashApi).create64();
+    const decompressor = new ZstdDecompress(chunk => {
+        frameBytes += chunk.length;
+        if (frameBytes > outputLimit) {
+            const limitName = remainingBytes <= maxFrameBytes ? "maxDecompressedBytes" : "maxDecompressedFrameBytes";
+            throw new DshSessionReaderError(`DSH zstd decompressed output exceeds ${limitName}`);
+        }
+        checksum?.update(chunk);
+        const text = decoder.decode(chunk, { stream: true });
+        if (text) textParts.push(text);
+    });
+    decompressor.push(frame, true);
+    if (checksum) {
+        const actualChecksum = Number(checksum.digest() & 0xffff_ffffn) >>> 0;
+        if (actualChecksum !== expectedChecksum) {
+            throw new DshSessionReaderError("invalid complete zstd frame checksum");
+        }
+    }
+    return frameBytes;
 }
 
 function decodeUtf8(source: Buffer, label: string): string {

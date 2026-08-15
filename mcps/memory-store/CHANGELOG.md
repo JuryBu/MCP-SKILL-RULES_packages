@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.23.1] - 2026-08-16
+
+- 修复 DSH 数百/数千个无 Frame Content Size 的拼接 Zstd 小帧在 Node v24 同步逐帧解压时产生异常内部分配的问题；改用受输出上限约束的逐帧纯 JavaScript 解码和 WASM xxHash 校验，保留 live trailing frame、packed rows 与 fail-closed 语义，并提升 reader revision 使旧缓存自动失效。
+
 本文件记录面向 npm 发布的主要变更。
 
 ## [1.23.0] - 2026-08-14

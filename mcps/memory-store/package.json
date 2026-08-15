@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.23.0",
+  "version": "1.23.1",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、五数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -191,8 +191,10 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.6.1",
     "fuse.js": "^7.0.0",
+    "fzstd": "^0.1.1",
     "katex": "^0.17.0",
     "markdown-it": "^14.2.0",
+    "xxhash-wasm": "^1.1.0",
     "zod": "^3.23.8"
   },
   "devDependencies": {

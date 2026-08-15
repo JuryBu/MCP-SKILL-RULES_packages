@@ -10,7 +10,10 @@ import {
     resolveDshSessionsRoot,
 } from "../src/dsh-session-reader.ts";
 
-const zstd = zlib as unknown as { zstdCompressSync?: (input: Uint8Array) => Uint8Array };
+const zstd = zlib as unknown as {
+    constants: typeof zlib.constants;
+    zstdCompressSync?: (input: Uint8Array, options?: { params?: Record<number, number> }) => Uint8Array;
+};
 
 function line(value: unknown): string {
     return `${JSON.stringify(value)}\n`;
@@ -47,6 +50,16 @@ function compress(value: string): Buffer {
     return Buffer.from(zstd.zstdCompressSync!(Buffer.from(value)));
 }
 
+function compressWithoutContentSize(value: string, checksum = false): Buffer {
+    assert.equal(typeof zstd.zstdCompressSync, "function", "Node v24 must expose zstdCompressSync");
+    return Buffer.from(zstd.zstdCompressSync!(Buffer.from(value), {
+        params: {
+            [zlib.constants.ZSTD_c_contentSizeFlag]: 0,
+            [zlib.constants.ZSTD_c_checksumFlag]: checksum ? 1 : 0,
+        },
+    }));
+}
+
 async function run(): Promise<void> {
     const root = await mkdtemp(path.join(tmpdir(), "dsh-session-reader-"));
     try {
@@ -70,6 +83,31 @@ async function run(): Promise<void> {
         assert.equal(multiFrame.events.length, 3);
         assert.equal((multiFrame.events[0].data as { chunk: { text: string } }).chunk.text, "first");
         assert.equal(multiFrame.provenance.format, "jsonl.zstd");
+
+        const manyFramesPath = await sessionPath(root, "many-frames-project", "many-frames-directory", "session.jsonl.zstd");
+        const manyFrames = [compressWithoutContentSize(line(header("many-frames-id")))];
+        for (let seq = 0; seq < 2_000; seq++) {
+            manyFrames.push(compressWithoutContentSize(line(textEvent(seq, `frame-${seq}`))));
+        }
+        await writeFile(manyFramesPath, Buffer.concat(manyFrames));
+        const manyFrameResult = await readDshSession("many-frames-id", { sessionsRoot: root });
+        assert.equal(manyFrameResult.events.length, 2_000);
+        assert.equal((manyFrameResult.events.at(-1)?.data as { chunk: { text: string } }).chunk.text, "frame-1999");
+
+        const oversizedPath = await sessionPath(root, "oversized-project", "oversized-directory", "session.jsonl.zstd");
+        await writeFile(oversizedPath, Buffer.concat([
+            compressWithoutContentSize(line(header("oversized-id"))),
+            compressWithoutContentSize(line(textEvent(0, "output-over-limit"))),
+        ]));
+        await expectReject(
+            () => readDshSession("oversized-id", { sessionsRoot: root, maxDecompressedBytes: 32 }),
+            /decompressed output exceeds maxDecompressedBytes/,
+        );
+        await expectReject(
+            () => readDshSession("oversized-id", { sessionsRoot: root, maxDecompressedFrameBytes: 32 }),
+            /decompressed output exceeds maxDecompressedFrameBytes/,
+        );
+        await rm(path.join(root, "oversized-project"), { recursive: true, force: true });
 
         const packedPath = await sessionPath(root, "packed-project", "packed-directory");
         const packedRows = [
@@ -104,11 +142,18 @@ async function run(): Promise<void> {
         assert.equal(partialRaw.provenance.ignoredTrailingTextRecord, true);
 
         const partialZstdPath = await sessionPath(root, "partial-zstd-project", "partial-zstd-directory", "session.jsonl.zstd");
-        const partialFrame = compress(line(textEvent(0, "ignored")));
-        await writeFile(partialZstdPath, Buffer.concat([compress(line(header("partial-zstd-id"))), partialFrame.subarray(0, partialFrame.length - 2)]));
+        const partialFrame = compressWithoutContentSize(line(textEvent(0, "ignored")));
+        await writeFile(partialZstdPath, Buffer.concat([compressWithoutContentSize(line(header("partial-zstd-id"))), partialFrame.subarray(0, partialFrame.length - 2)]));
         const partialZstd = await readDshSession("partial-zstd-id", { sessionsRoot: root });
         assert.equal(partialZstd.events.length, 0);
         assert.equal(partialZstd.provenance.ignoredTrailingZstdFrame, true);
+
+        const corruptPath = await sessionPath(root, "corrupt-zstd-project", "corrupt-zstd-directory", "session.jsonl.zstd");
+        const corruptFrame = compressWithoutContentSize(line(textEvent(0, "must-fail")), true);
+        corruptFrame[corruptFrame.length - 1] ^= 0xff;
+        await writeFile(corruptPath, Buffer.concat([compressWithoutContentSize(line(header("corrupt-zstd-id"))), corruptFrame]));
+        await expectReject(() => readDshSession("corrupt-zstd-id", { sessionsRoot: root }), /invalid complete zstd frame/);
+        await rm(path.join(root, "corrupt-zstd-project"), { recursive: true, force: true });
 
         const futurePath = await sessionPath(root, "future-project", "future-directory");
         await writeFile(futurePath, line(header("future-id", 1)), "utf8");

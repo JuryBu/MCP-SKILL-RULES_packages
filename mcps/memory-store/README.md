@@ -1,4 +1,4 @@
-# MCP Memory Store v1.23.0
+# MCP Memory Store v1.23.1
 
 AI 主动记忆管理系统 + 五数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 
@@ -21,7 +21,7 @@ AI 主动记忆管理系统 + 五数据链路对话原文阅读器 + 附件懒�
 - **进程生命周期容错** (v1.7+)：ppid 连续 3 次失败容错 + stdin 断裂诊断增强 + 非 LS 环境 1h 空闲超时兜底
 - **对话记录 Record** (v1.8+ / 持久调度 v1.20+)：模型自动生成对话过程日志，抗 LS 过期，超长 prompt 分批处理；更新会冻结来源快照并物化为 Task → Record → Unit → Attempt，持久 scheduler 负责公平排队、取消、崩溃恢复和多步提交，同一逻辑 revision 由 Record work registry 去重
 - **Stage Guard 任务完整性验证** (v1.9+ / 多实例 v1.19.2+)：四层防御网（RULES + 工具提醒 + 🔒标记 + 用户审计），审核模型比对 Plan/Task vs 执行记录。GuardKey 由 conversationId + stageId + childScopeId 组成，每次 start 生成不可变 guardId；同一 Task 可并存多个 Guard，pass/cancel/force 只处理目标实例。子任务用 scopeSelectors 定义局部审核范围，status(listAll=true) 不读取对话即可列出全部活跃 Guard。
-- **五宿主统一 Fetch 缓存与来源控制** (v1.23+)：Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 统一发布可校验、不可变的 fetch cache generation；DSH 只读 v0 session-persistence-jsonl 的 JSONL/Zstandard 会话，其他宿主继续沿用 JSONL、PB 或 LS 来源。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。DSH 的 `.jsonl.zstd` 读取需要 Node 运行时提供 `zstdDecompressSync`（当前生产 Node 24 已满足）；旧 Node 仍可使用其它宿主链路，但 DSH 压缩会话会明确拒绝而不会误读。
+- **五宿主统一 Fetch 缓存与来源控制** (v1.23+)：Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 统一发布可校验、不可变的 fetch cache generation；DSH 只读 v0 session-persistence-jsonl 的 JSONL/Zstandard 会话，其他宿主继续沿用 JSONL、PB 或 LS 来源。`source=auto|local|ls` 的成功 fetch 都发布到同一个宿主级最新缓存入口，`source=cache` 只读取最近一次成功发布的完整 generation。DSH 的 `.jsonl.zstd` 使用随包安装的纯 JavaScript 解码器逐帧消费，并用 WASM xxHash 校验带 checksum 的完整 frame；数百或数千个拼接小帧不会触发 Node 原生 Zstd 的异常大额分配，活动日志尾部未写完的 frame 留待下次 fetch。
 - **大结果可续读与对话语义** (v1.22+)：`read/search` 对约 100K 的结果返回继续位置，不再沿用古老的静默截断；连续人类消息归为同一人类轮，annotations 保留被批注文本与用户评论，子代理明确标注与主线程的角色关系。
 - **自动通道事件精简** (v1.22.7+)：QQ、微信及后续自动渠道的 wake/alert/notification/event 在 fetch cache 中统一保存为短结构化事件；`read/search/recall/export` 只呈现任务或订阅身份、待处理数量/序号摘要和 ACK 状态，不再把 `wake_id`、工具说明或长通知模板冒充用户原话，同时保留主人真实发言、批注、附件引用和对端任务正文。
 - **自动事件不占人类轮** (v1.22.8+)：Codex `<heartbeat>`、NapCat task/建链提醒、微信和腾讯文档 wake、子代理完成通知不再创建人类轮；`<codex_delegation>` / `<realtime_delegation>` 仍是跨线程真实任务正文，`[NAPCAT_OWNER_REPLY]` 只剥离运输外壳并保留主人正文与附件引用。
