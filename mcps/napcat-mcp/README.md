@@ -76,9 +76,9 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 参与任务的发送端和接收端都要调用 `napcat_task_register`，登记相同 `task_id`、本机稳定 `conversation_id`、本机角色、来源/目标机器和可信对端 QQ。`task_id` 应表示长期任务身份，不把每次运行日期当成默认组成；重复实验日期、时间和批次放在 `run_id` 或当前 generation 中。任务路由器每 30 秒读取一次固定群，同一次扫描中的多条合格消息合并成一次唤醒；只有登记任务、可信发送者、正确来源/目标和未确认消息同时满足时才会唤醒对应 Codex 对话。
 
-唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；提交成功后应用每任务默认 10 分钟冷却。冷却期间到达的新消息进入持久消息账本，不会重置冷却截止时间；时间满足后只合并唤醒一次。普通消息没有新内容时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送；只有明确登记的双机结构化 task 在 pending 首次持续 12 小时且没有业务 ACK 时，才允许发送一条简短去重提醒，此后每满 12 小时至多再发一条，普通群聊、主人聊天和只读群消息不参与。
+唤醒提交使用默认 5 分钟的注入租约，防止多个路由进程同时向同一对话写入；存在活动唤醒时，每任务冷却默认 60 秒、最大 120 秒。没有活动唤醒的新 pending 会立即提交，不受历史 `lastWakeAt` 阻塞；已有活动唤醒时，新消息继续写入持久账本并在冷却后合并提醒，精确 ACK 释放旧唤醒后可立即处理下一批。普通消息没有新内容时，已经提醒过但尚未 ACK 的旧消息不会因为计时被反复发送；只有明确登记的双机结构化 task 在 pending 首次持续 12 小时且没有业务 ACK 时，才允许发送一条简短去重提醒，此后每满 12 小时至多再发一条，普通群聊、主人聊天和只读群消息不参与。
 
-每次唤醒携带 `generation`、`wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack`，明确传 `expected_generation=唤醒提示中的 generation`、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中只列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30 秒至 24 小时。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
+每次唤醒携带 `generation`、`wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack`，明确传 `expected_generation=唤醒提示中的 generation`、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中只列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30～120 秒。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
 
 需要对端业务回信的结构化任务在正文或索引中显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。`machine_received` 与 `conversation_received` 只证明运输链路，不是业务回信；预计处理超过 60 秒时接收方先回 `IN_PROGRESS` 和新的检查时间。发送方等待其它对话 20～30 分钟时设置一次性 `automation_update` 叫回检查，收到回信后撤销，避免两端互等。
 

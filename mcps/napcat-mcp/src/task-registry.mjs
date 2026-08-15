@@ -5,11 +5,11 @@ import { renameReplaceSync } from "./atomic-file.mjs";
 import { canonicalMachineRole } from "./machine-role.mjs";
 import { createStaleSentWakeRearmPlan } from "./stale-sent-wake-rearm.mjs";
 
-const STATE_SCHEMA_VERSION = 2;
+const STATE_SCHEMA_VERSION = 3;
 const DEFAULT_WAKE_LEASE_MS = 30_000;
-const DEFAULT_WAKE_COOLDOWN_MS = 600_000;
+const DEFAULT_WAKE_COOLDOWN_MS = 60_000;
 const MINIMUM_WAKE_COOLDOWN_MS = 30_000;
-const MAXIMUM_WAKE_COOLDOWN_MS = 86_400_000;
+const MAXIMUM_WAKE_COOLDOWN_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 5_000;
 const DEFAULT_LOCK_RETRY_MS = 5;
 const DEFAULT_STALE_LOCK_MS = 120_000;
@@ -243,6 +243,9 @@ function refreshLegacyWakeFields(task) {
 function normalizeStoredTask(task, sourceSchemaVersion = STATE_SCHEMA_VERSION) {
   if (!isPlainObject(task)) return task;
   if (!hasOwn(task, "wakeCooldownMs")) task.wakeCooldownMs = DEFAULT_WAKE_COOLDOWN_MS;
+  if (sourceSchemaVersion < 3 && task.wakeCooldownMs > MAXIMUM_WAKE_COOLDOWN_MS) {
+    task.wakeCooldownMs = MAXIMUM_WAKE_COOLDOWN_MS;
+  }
   if (!hasOwn(task, "lastWakeAt")) task.lastWakeAt = task.wakeSentAt ?? null;
   if (!hasOwn(task, "lastSeenAt")) task.lastSeenAt = null;
   if (!hasOwn(task, "lastAckedAt")) task.lastAckedAt = null;
@@ -435,7 +438,7 @@ function validateStoredTask(task, taskId, statePath) {
 }
 
 function validateState(value, statePath) {
-  if (!isPlainObject(value) || ![1, STATE_SCHEMA_VERSION].includes(value.schemaVersion) || !isPlainObject(value.tasks)) {
+  if (!isPlainObject(value) || ![1, 2, STATE_SCHEMA_VERSION].includes(value.schemaVersion) || !isPlainObject(value.tasks)) {
     invalidState(statePath, "账本结构无效");
   }
   const sourceSchemaVersion = value.schemaVersion;
@@ -1235,6 +1238,7 @@ class TaskRegistry {
         }];
     const requestedWakeId = requiredString(input.wakeId, "wakeId");
     const requestedPromptSha256 = requiredString(input.promptSha256, "promptSha256");
+    const threadIdleVerified = input.threadIdleVerified === true;
     const leaseMs = optionNumber(input.leaseMs ?? input.wakeLeaseMs, "leaseMs", this.wakeLeaseMs, 1);
     return this.#write((state) => {
       const task = this.#requireTask(state, taskId);
@@ -1299,7 +1303,17 @@ class TaskRegistry {
       const cooldownExpiresAt = lastWakeAtMs === null
         ? null
         : new Date(lastWakeAtMs + task.wakeCooldownMs).toISOString();
-      if (batch === null && lastWakeAtMs !== null && now.getTime() < lastWakeAtMs + task.wakeCooldownMs) {
+      const hasActiveSentWake = task.wakeBatches.some((candidate) =>
+        candidate.status === "sent"
+        && effectiveWakeMessageSeqs(candidate).some((sequence) => findMessage(task, sequence)?.status === "pending")
+      );
+      if (
+        batch === null
+        && hasActiveSentWake
+        && !threadIdleVerified
+        && lastWakeAtMs !== null
+        && now.getTime() < lastWakeAtMs + task.wakeCooldownMs
+      ) {
         return { changed: false, value: wakeLeaseResult(task, false, "wake_cooldown", null, cooldownExpiresAt) };
       }
       const boundary = requestedMessages.at(-1);

@@ -16,7 +16,7 @@ function task(overrides = {}) {
     lastAckedSeq: 0,
     lastSeenAt: null,
     lastAckedAt: null,
-    wakeCooldownMs: 600_000,
+    wakeCooldownMs: 60_000,
     wakePending: false,
     wakeSentAt: null,
     wakeMessageSeq: null,
@@ -76,7 +76,7 @@ function fixture(options = {}) {
     },
     acquireWakeLease: (input) => {
       calls.push({ type: "acquireWakeLease", input });
-      if (options.leaseBlocked) {
+      if (options.leaseBlocked && !(options.leaseReason === "wake_cooldown" && input.threadIdleVerified)) {
         return { ...currentTask, acquired: false, reason: options.leaseReason ?? "lease_active" };
       }
       currentTask = {
@@ -133,6 +133,10 @@ function fixture(options = {}) {
     })),
   };
   const bridge = {
+    inspectThread: async (threadId) => {
+      calls.push({ type: "inspectThread", threadId });
+      return options.threadState ?? { threadId, status: "busy", busy: true, found: true };
+    },
     wake: async (input) => {
       calls.push({ type: "wake", input });
       if (options.wakeError) throw options.wakeError;
@@ -409,6 +413,39 @@ test("acknowledged messages and active leases suppress duplicate wake", async ()
   const cooldown = fixture({ leaseBlocked: true, leaseReason: "wake_cooldown", messages: [message(12)] });
   assert.equal((await createTaskRouter(cooldown).scanOnce()).results[0].outcome, "wake_cooldown");
   assert.equal(cooldown.calls.some((call) => call.type === "wake"), false);
+});
+
+test("an idle thread bypasses active-wake cooldown for a newly pending message", async () => {
+  const oldMessage = message(10, { time: "2026-07-24T08:00:00.000Z" });
+  const newMessage = message(11, { time: "2026-07-24T08:00:10.000Z" });
+  const current = fixture({
+    now: "2026-07-24T08:00:30.000Z",
+    task: {
+      lastWakeAt: "2026-07-24T08:00:00.000Z",
+      pendingMessages: [{
+        messageSeq: oldMessage.messageSeq,
+        messageAt: oldMessage.time,
+        lastRemindedAt: "2026-07-24T08:00:00.000Z",
+      }],
+      activeWakes: [{
+        wakeId: "old-wake",
+        messageSeqs: [oldMessage.messageSeq],
+        leaseStartedAt: "2026-07-24T08:00:00.000Z",
+        sentAt: "2026-07-24T08:00:00.000Z",
+        status: "sent",
+        legacy: false,
+      }],
+    },
+    messages: [oldMessage, newMessage],
+    leaseBlocked: true,
+    leaseReason: "wake_cooldown",
+    threadState: { status: "idle", busy: false, found: true },
+  });
+  const result = await createTaskRouter(current).scanOnce();
+  assert.equal(result.results[0].outcome, "accepted");
+  assert.equal(current.calls.filter((call) => call.type === "inspectThread").length, 1);
+  assert.equal(current.calls.find((call) => call.type === "acquireWakeLease").input.threadIdleVerified, true);
+  assert.equal(current.calls.filter((call) => call.type === "wake").length, 1);
 });
 
 test("later messages wake even when their numeric message_seq is smaller", async () => {

@@ -119,7 +119,7 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       clientInfo: { name: "task-tool-test", version: "1.0.0" },
     });
     assert.equal(initialize.error, undefined);
-    assert.equal(initialize.result.serverInfo.version, "0.3.16");
+    assert.equal(initialize.result.serverInfo.version, "0.3.17");
     fixture.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" })}\n`);
 
     const listedTools = await fixture.request("tools/list", {});
@@ -149,6 +149,7 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
     );
     const taskUpdateTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_update");
     assert.equal(Boolean(taskUpdateTool.inputSchema.properties.wake_cooldown_ms), true);
+    assert.equal(taskUpdateTool.inputSchema.properties.wake_cooldown_ms.maximum, 120_000);
     const taskAckTool = listedTools.result.tools.find((tool) => tool.name === "napcat_task_ack");
     assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.type, "array");
     assert.equal(taskAckTool.inputSchema.properties.processed_message_seqs.uniqueItems, true);
@@ -178,12 +179,12 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
         source_machine: "development",
         target_machine: "training",
         trusted_peer_qq: "1000000001",
-        wake_cooldown_ms: 1_800_000,
+        wake_cooldown_ms: 120_000,
       },
     }));
     assert.equal(registered.ok, true);
     assert.equal(registered.task.generation, 1);
-    assert.equal(registered.task.wakeCooldownMs, 1_800_000);
+    assert.equal(registered.task.wakeCooldownMs, 120_000);
     assert.equal(registered.router.reason, "autostart_disabled");
 
     const status = toolPayload(await fixture.request("tools/call", {

@@ -172,9 +172,9 @@ const taskRegisterInputSchema = {
     wake_cooldown_ms: {
       type: "integer",
       minimum: 30000,
-      maximum: 86400000,
-      default: 600000,
-      description: "该任务两次成功自动唤醒之间的最短间隔，默认 600000（10 分钟）。",
+      maximum: 120000,
+      default: 60000,
+      description: "存在活动唤醒时，两次成功自动唤醒之间的最短间隔；默认 60000（60 秒），最大 120000（120 秒）。没有活动唤醒时，新待办会立即触发。",
     },
   },
   required: ["task_id", "conversation_id", "local_role", "source_machine", "target_machine", "trusted_peer_qq"],
@@ -194,8 +194,8 @@ const taskUpdateInputSchema = {
     wake_cooldown_ms: {
       type: "integer",
       minimum: 30000,
-      maximum: 86400000,
-      description: "仅调整当前任务的自动唤醒间隔；单独修改时不增加 generation。",
+      maximum: 120000,
+      description: "仅调整当前任务在已有活动唤醒时的自动唤醒间隔；范围 30000～120000，单独修改时不增加 generation。",
     },
   },
   required: ["task_id", "expected_generation"],
@@ -524,7 +524,7 @@ const taskRegistryStatePath = process.env.NAPCAT_TASK_REGISTRY_PATH
 const taskRegistry = createTaskRegistry({
   statePath: taskRegistryStatePath,
     wakeLeaseMs: Number(process.env.NAPCAT_TASK_WAKE_LEASE_MS || 300000),
-    wakeCooldownMs: Number(process.env.NAPCAT_TASK_WAKE_COOLDOWN_MS || 600000),
+    wakeCooldownMs: Math.min(Number(process.env.NAPCAT_TASK_WAKE_COOLDOWN_MS || 60000), 120000),
 });
 const taskRouterController = createTaskRouterController({ rootDir: path.resolve(__dirname, "..") });
 const controlState = createControlState({
@@ -537,7 +537,7 @@ const controlPlane = createControlPlane({
   bridge: { wake: async () => { throw new Error("入站唤醒只由 task router 执行"); } },
 });
 const server = new Server(
-  { name: "codex-napcat-training-notifier", version: "0.3.16" },
+  { name: "codex-napcat-training-notifier", version: "0.3.17" },
   {
     capabilities: {
       tools: { listChanged: false },

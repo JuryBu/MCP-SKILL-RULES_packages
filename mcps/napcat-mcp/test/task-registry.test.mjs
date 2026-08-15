@@ -82,7 +82,7 @@ test("register is idempotent and rejects silent conversation changes", () => {
     assert.equal(first.lastAckedSeq, 0);
     assert.equal(first.lastSeenAt, null);
     assert.equal(first.lastAckedAt, null);
-    assert.equal(first.wakeCooldownMs, 600_000);
+    assert.equal(first.wakeCooldownMs, 60_000);
     assert.equal(first.wakePending, false);
     assert.equal(first.wakeSentAt, null);
     assert.equal(first.wakeMessageSeq, null);
@@ -272,8 +272,8 @@ test("route update rejects pending active wakes without changing the ledger", ()
 test("task wake cooldown can be updated without changing the routing generation", () => {
   const fixture = createFixture();
   try {
-    const first = fixture.registry.register(taskInput({ wakeCooldownMs: 1_800_000 }));
-    assert.equal(first.wakeCooldownMs, 1_800_000);
+    const first = fixture.registry.register(taskInput({ wakeCooldownMs: 120_000 }));
+    assert.equal(first.wakeCooldownMs, 120_000);
     fixture.advance(1000);
     const updated = fixture.registry.update({
       taskId: first.taskId,
@@ -289,6 +289,45 @@ test("task wake cooldown can be updated without changing the routing generation"
       expectedGeneration: first.generation,
       wakeCooldownMs: 60_000,
     }), updated);
+    assertRegistryError(
+      () => fixture.registry.update({
+        taskId: first.taskId,
+        expectedGeneration: first.generation,
+        wakeCooldownMs: 120_001,
+      }),
+      "INVALID_ARGUMENT",
+    );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("schema 2 task cooldowns above the new limit migrate without changing task progress", () => {
+  const fixture = createFixture();
+  try {
+    const first = fixture.registry.register(taskInput({ wakeCooldownMs: 120_000 }));
+    const legacyState = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    legacyState.schemaVersion = 2;
+    legacyState.tasks[first.taskId].wakeCooldownMs = 600_000;
+    fs.writeFileSync(fixture.statePath, `${JSON.stringify(legacyState, null, 2)}\n`, "utf8");
+
+    const migratedRegistry = fixture.createRegistry();
+    const migrated = migratedRegistry.get(first.taskId);
+    assert.equal(migrated.wakeCooldownMs, 120_000);
+    assert.equal(migrated.generation, first.generation);
+    assert.deepEqual(migrated.pendingMessages, []);
+    assert.deepEqual(migrated.activeWakes, []);
+
+    migratedRegistry.markSeen({
+      taskId: first.taskId,
+      expectedGeneration: first.generation,
+      seq: 1,
+      at: BASE_TIME,
+    });
+    const persisted = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(persisted.schemaVersion, 3);
+    assert.equal(persisted.tasks[first.taskId].wakeCooldownMs, 120_000);
+    assert.equal(persisted.tasks[first.taskId].generation, first.generation);
   } finally {
     fixture.cleanup();
   }
@@ -606,7 +645,7 @@ test("wake lease acquisition, release, and timeout are persisted", () => {
   }
 });
 
-test("a confirmed wake remains cooldown-limited after ACK releases its lease", () => {
+test("cooldown applies while a sent wake is active but a new pending message wakes immediately after ACK", () => {
   const fixture = createFixture({ wakeLeaseMs: 300_000, wakeCooldownMs: 60_000 });
   try {
     fixture.registry.register(taskInput());
@@ -626,12 +665,6 @@ test("a confirmed wake remains cooldown-limited after ACK releases its lease", (
       expectedWakeId: "wake-1",
     });
     assert.equal(confirmed.lastWakeAt, BASE_TIME);
-    fixture.registry.acknowledgeWake({
-      taskId: "task-001",
-      expectedGeneration: 1,
-      processedMessageSeqs: [1],
-      wakeId: "wake-1",
-    });
     fixture.registry.markSeen({
       taskId: "task-001",
       expectedGeneration: 1,
@@ -649,10 +682,49 @@ test("a confirmed wake remains cooldown-limited after ACK releases its lease", (
     assert.equal(blocked.acquired, false);
     assert.equal(blocked.reason, "wake_cooldown");
     assert.equal(blocked.cooldownExpiresAt, "2026-07-24T08:01:00.000Z");
-    fixture.advance(60_000);
+    fixture.registry.acknowledgeWake({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      processedMessageSeqs: [1],
+      wakeId: "wake-1",
+    });
     const reacquired = fixture.registry.acquireWakeLease(secondLeaseInput);
     assert.equal(reacquired.acquired, true);
-    assert.equal(reacquired.wakeSentAt, "2026-07-24T08:01:00.000Z");
+    assert.equal(reacquired.wakeSentAt, "2026-07-24T08:00:00.000Z");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("verified idle thread bypasses cooldown even while an older sent wake awaits ACK", () => {
+  const fixture = createFixture({ wakeLeaseMs: 300_000, wakeCooldownMs: 60_000 });
+  try {
+    fixture.registry.register(taskInput());
+    fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 1, at: BASE_TIME });
+    const firstLease = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 1, messageAt: BASE_TIME }],
+      wakeId: "wake-1",
+      promptSha256: "hash-1",
+    });
+    fixture.registry.confirmWakeSent({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      expectedWakeSentAt: firstLease.wakeSentAt,
+      expectedWakeId: "wake-1",
+    });
+    fixture.registry.markSeen({ taskId: "task-001", expectedGeneration: 1, seq: 2, at: BASE_TIME });
+    const bypassed = fixture.registry.acquireWakeLease({
+      taskId: "task-001",
+      expectedGeneration: 1,
+      messages: [{ messageSeq: 2, messageAt: BASE_TIME }],
+      wakeId: "wake-2",
+      promptSha256: "hash-2",
+      threadIdleVerified: true,
+    });
+    assert.equal(bypassed.acquired, true);
+    assert.equal(bypassed.wakeSentAt, BASE_TIME);
   } finally {
     fixture.cleanup();
   }

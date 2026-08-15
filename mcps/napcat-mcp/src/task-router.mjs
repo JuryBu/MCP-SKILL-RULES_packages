@@ -249,6 +249,22 @@ export function createTaskRouter(options = {}) {
       const wakeId = buildWakeId(seenTask, wakeMessages);
       const prompt = buildWakePrompt(seenTask, wakeMessages, newMessages, wakeId);
       const promptHash = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
+      const currentTimeMs = now().getTime();
+      const lastWakeAtMs = seenTask.lastWakeAt === null ? null : Date.parse(seenTask.lastWakeAt);
+      const hasActiveSentWake = Array.isArray(seenTask.activeWakes)
+        && seenTask.activeWakes.some((wake) => wake.status === "sent");
+      const cooldownActive = hasActiveSentWake
+        && lastWakeAtMs !== null
+        && currentTimeMs < lastWakeAtMs + seenTask.wakeCooldownMs;
+      let threadIdleVerified = false;
+      if (cooldownActive && typeof bridge.inspectThread === "function") {
+        try {
+          const threadState = await bridge.inspectThread(seenTask.conversationId);
+          threadIdleVerified = threadState?.status === "idle";
+        } catch {
+          threadIdleVerified = false;
+        }
+      }
       const lease = registry.acquireWakeLease({
         taskId: task.taskId,
         expectedGeneration: task.generation,
@@ -256,6 +272,7 @@ export function createTaskRouter(options = {}) {
         messages: wakeMessages,
         wakeId,
         promptSha256: promptHash,
+        threadIdleVerified,
       });
       if (!lease.acquired) {
         return {
