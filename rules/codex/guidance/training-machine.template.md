@@ -96,6 +96,14 @@ Heartbeat 只表示长跑存活，不等于任务 ACK，也不负责恢复 Codex
 
 回包禁止夹带 QQ 登录态、NapCat token、broker 私密环境、浏览器 profile、缓存、临时文件、旧任务对话和无关大文件。
 
+## 原生任务工具卡滞分流
+
+已知目标对话 ID 时，优先直接使用有界的 `wait_threads` 或 `read_thread`，不要先全量 `list_threads`。已知源文件约 100 MiB 以上、包含数万项工具/步骤或长期高频调用的对话，历史读取绝对优先使用带稳定 `conversationId` 的 `conversation_read_original` 分页接口。
+
+事前不知道体量时只允许做一次有界原生读取。`list_threads`、`read_thread` 或 `wait_threads` 约 40 秒仍零返回，或首次出现 app-server unavailable、stream disconnected、客户端重连、异常内存增长时，终止这一次调用并立即换上述分页接口，不机械重试。该现象可能只是当前工具调用的等待器失效；其他对话、App Server、broker 或 MCP 仍健康时，不得据此宣告全局服务故障或自行重启。
+
+`send_message_to_thread` 超时或调用被终止后，把投递结果记为 `UNKNOWN`。先用目标对话原文或其它已登记通道核对消息是否落盘；没有明确证据前既不能声称发送成功，也不能盲目重发。需要跨机协调时改用已登记的 NapCat task，不另建中转对话冒充连接。
+
 ## 退出
 
 训练完成、任务拒绝或回包传回后停止当前 heartbeat，调用 `napcat_task_close`，写明最终状态并退出训练模式。

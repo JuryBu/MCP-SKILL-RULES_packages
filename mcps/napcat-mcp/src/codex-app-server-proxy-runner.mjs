@@ -6,6 +6,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import {
   CodexAppServerProxyError,
   createCodexAppServerProxy,
@@ -90,16 +91,19 @@ function readJsonObject(filePath, fsImpl = fs) {
   }
 }
 
-function appendJsonLine(filePath, value, fsImpl = fs) {
-  if (!filePath) return;
-  fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
-  fsImpl.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
-}
-
 function processAlive(pid) {
   if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return false;
   try {
     process.kill(Number(pid), 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function bestEffortAppend(writer, value) {
+  try {
+    writer.append(value);
     return true;
   } catch {
     return false;
@@ -574,6 +578,16 @@ export function parseArguments(argv) {
 export async function runCodexAppServerProxyService(options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const now = options.now ?? (() => new Date());
+  const operationalLog = createBoundedJsonlWriter({
+    filePath: options.logPath,
+    fsImpl,
+    now,
+  });
+  const anomalyLog = createBoundedJsonlWriter({
+    filePath: options.anomalyLogPath ?? path.join(path.dirname(options.logPath), "codex-app-server-turn-anomalies.jsonl"),
+    fsImpl,
+    now,
+  });
   const pid = Number(options.pid ?? process.pid);
   const startedAt = now().toISOString();
   const lock = acquireInstanceLock(options.lockPath, {
@@ -641,12 +655,12 @@ export async function runCodexAppServerProxyService(options = {}) {
     atomicWriteJson(options.runtimeStatePath, status, fsImpl);
     return status;
   };
-  const log = (type, details = {}) => appendJsonLine(options.logPath, {
+  const log = (type, details = {}) => bestEffortAppend(operationalLog, {
     at: now().toISOString(),
     type,
     pid,
     ...details,
-  }, fsImpl);
+  });
   const requestStop = (reason) => {
     stopRequested = true;
     if (!stopReason) stopReason = reason;
@@ -724,6 +738,8 @@ export async function runCodexAppServerProxyService(options = {}) {
       controlToken,
       requestTimeoutMs: options.requestTimeoutMs,
       resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
+      turnFirstOutputTimeoutMs: options.turnFirstOutputTimeoutMs
+        ?? Number(process.env.CODEX_APP_SERVER_PROXY_FIRST_OUTPUT_TIMEOUT_MS ?? 60000),
       journal,
       maintenanceFilePath: options.maintenanceFilePath,
       onEvent: (event) => {
@@ -736,6 +752,13 @@ export async function runCodexAppServerProxyService(options = {}) {
           persist({
             proxy: proxy?.status() ?? null,
             ...(event.type === "proxy_error" ? { lastError: event.error } : {}),
+          });
+        }
+        if (String(event.type ?? "").startsWith("app_server_turn_")) {
+          bestEffortAppend(anomalyLog, {
+            at: now().toISOString(),
+            layer: "app_server_proxy",
+            ...event,
           });
         }
         log(event.type, event);

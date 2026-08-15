@@ -131,6 +131,8 @@ NapCat task router -> http://127.0.0.1:18431/v1/subscriptions + /v1/wakes
 
 升级验收必须使用两端各自独立登记的测试 task 和测试对话，不能拿正式 open task 试错。两台机器同步同一公开提交并正常重启 Codex 后，由两端维护对话互发唯一测试消息；主人需要在目标测试对话尚未打开时亲眼确认侧边栏未读标记，随后确认消息实时可见、只出现一次、测试对话能正常处理并 ACK。两端都通过后才能恢复正式自动路由；只有后端日志、对话存储写入或重启后才看见消息，均不算通过。测试 task 完成后应关闭，正式 task 的 generation、游标、租约和绑定保持不变。
 
+透明中转还会只读监督普通 `turn/start` 到首个真实回合内容事件的耗时。`turn/started`、侧栏摘要和连接状态不算模型已经开始输出；只有 item 生命周期、正文/推理增量、工具事件、计划或 diff 更新才算有效进展。超过 60 秒仍没有这类事件时只记录异常，不中断、不重发、不修改官方回合状态；若随后恢复或无输出结束，会再记录对应结局。异常文件按外层 App Server 与内层模型流量两层分别保存到私有 state root，每个 JSONL 最多 4 MiB、最多 8 份、保留 7 天；只含散列身份、阶段、时间和错误类别，不保存提示词、回复、OAuth 请求头、工具参数或文件正文。
+
 ## Codex 模型流量看门人
 
 App Server 透明中转负责 Desktop 与本机 App Server 的连接和未读提醒；模型流量看门人解决的是另一层问题：普通回答请求已经发往 OpenAI，但长时间没有任何正文、推理增量或工具调用参数返回，界面只能一直转圈。它作为只监听回环地址的 HTTP 中转插在 Codex 与 OpenAI 之间，不修改或重编 `codex.exe`：
@@ -144,6 +146,8 @@ Codex -> http://127.0.0.1:18435/backend-api/codex -> OpenAI
 只要已经收到正文、推理内容、工具调用参数或完成/失败事件，就禁止整轮重放，避免重复文字或重复执行工具。压缩、预热、记忆请求和无法可靠识别的请求直接透传；带云端托管工具或未知工具类型的请求也不做透明重试。代理不监控本地 MCP、Sandbox 或工具执行时间，本地工具完成后的下一次模型请求会得到一个新的独立看门周期。
 
 Codex 仍负责 ChatGPT 登录和 OAuth 生命周期。看门人只在内存中转发 Codex 已附带的请求头，不记录请求头、请求体或 Authorization；运行日志只保存请求身份的哈希、阶段、耗时和计数。进程由现有监督器启动，运行状态写入私有 data root。代理故障时不会自动重启共享 broker、NapCat 或其它 MCP。
+
+两层异常日志使用相同的 thread/turn 散列时才能标为精确关联；只有其中一项或完全缺失时分别标为 `ambiguous` 或 `none`，禁止凭相近时间强行认定同一请求。原生 `codex_app__list_threads/read_thread/send_message_to_thread` 如果在 Codex 自己的工具调用桥里尚未送达 App Server，不会出现在这两层日志中；这类故障按 Rules 的一次有界调用和分页降级处理。
 
 启用前先运行 `ops/start-codex-model-stream-proxy.ps1` 并检查 `/health`，再用 `ops/switch-codex-model-stream-proxy.ps1 -Action Preview` 查看将要修改的 `config.toml`；`-Action Apply` 会保存原文件的精确字节备份并原子切换自定义模型提供方，完成后需要正常退出并重新打开 Codex 一次。`-Action Rollback` 会恢复原字节配置；回退后再次打开 Codex 即回到官方直连，不需要替换 `codex.exe`。官方 Codex 更新通常不会覆盖这个独立服务和配置，但每次 Codex 升级后仍应先验证自定义 provider、Responses 路径和 ChatGPT 登录转发合同没有变化。
 

@@ -58,6 +58,14 @@
 
 若未来版本确实需要退出 Codex 或整机重启，安装完成不能等同于最终激活。重启前后都要核对激活器已经写完 `activated/pendingActivation/restartCodexRequired`，撤销或超时会恢复 router 而不是留下 `task-router.stop`，Windows 登录后共享 broker 使用包内 Node 绝对路径启动，随后验证 router 连续扫描、全部 open task 和私有账本未漂移。
 
+## 原生任务工具卡滞分流
+
+已知目标对话 ID 时，优先直接使用有界的 `wait_threads` 或 `read_thread`，不要先全量 `list_threads`。已知源文件约 100 MiB 以上、包含数万项工具/步骤或长期高频调用的对话，历史读取绝对优先使用带稳定 `conversationId` 的 `conversation_read_original` 分页接口。
+
+事前不知道体量时只允许做一次有界原生读取。`list_threads`、`read_thread` 或 `wait_threads` 约 40 秒仍零返回，或首次出现 app-server unavailable、stream disconnected、客户端重连、异常内存增长时，终止这一次调用并立即换上述分页接口，不机械重试。该现象可能只是当前工具调用的等待器失效；其他对话、App Server、broker 或 MCP 仍健康时，不得据此宣告全局服务故障或自行重启。
+
+`send_message_to_thread` 超时或调用被终止后，把投递结果记为 `UNKNOWN`。先用目标对话原文或其它已登记通道核对消息是否落盘；没有明确证据前既不能声称发送成功，也不能盲目重发。需要跨机协调时改用已登记的 NapCat task，不另建中转对话冒充连接。
+
 ## 问题回收
 
 训练机报告问题时，开发机先区分任务包错误、环境差异、运行故障和 MCP 工具缺陷。能够继续科学任务时，不让工具缺陷无故阻塞训练；需要修复时由一个维护源统一修改并重新发版，禁止两台机器各补一套不兼容代码。

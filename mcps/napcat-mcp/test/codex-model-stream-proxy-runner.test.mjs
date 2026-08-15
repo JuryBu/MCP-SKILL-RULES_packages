@@ -134,7 +134,8 @@ test("runtime heartbeat write failure never aborts an active model stream and la
   assert.equal(readEvents(logPath).some((event) => event.type === "runner_uncaught_exception"), false);
 
   fs.rmSync(runtimePath, { recursive: true, force: true });
-  fs.renameSync(runtimeBackupPath, runtimePath);
+  fs.copyFileSync(runtimeBackupPath, runtimePath);
+  fs.rmSync(runtimeBackupPath, { force: true });
   await waitFor(() => readEvents(logPath).some((event) => event.type === "runtime_state_write_recovered"), 3_000);
   const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8"));
   assert.equal(runtime.status, "running");

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
+import { createTurnLifecycleObserver } from "./turn-observability.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
@@ -12,6 +13,7 @@ const DEFAULT_MAX_JSON_PARSE_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_QUEUED_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_BYTES = 16 * 1024 * 1024;
 const DEFAULT_HEARTBEAT_INTERVAL_MS = 15000;
+const DEFAULT_FIRST_OUTPUT_TIMEOUT_MS = 60000;
 
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -393,6 +395,13 @@ export class CodexAppServerProxy {
       1000,
       300000,
     );
+    this.turnFirstOutputTimeoutMs = boundedInteger(
+      options.turnFirstOutputTimeoutMs,
+      DEFAULT_FIRST_OUTPUT_TIMEOUT_MS,
+      1000,
+      300000,
+    );
+    this.createTurnObserver = options.createTurnObserver ?? createTurnLifecycleObserver;
     this.WebSocketImpl = options.WebSocketImpl ?? WebSocket;
     this.WebSocketServerImpl = options.WebSocketServerImpl ?? WebSocketServer;
     this.journal = options.journal ?? null;
@@ -471,6 +480,7 @@ export class CodexAppServerProxy {
       reconnectAttempt: client.reconnectAttempt,
       nextReconnectAt: client.nextReconnectAt,
       connectedAt: client.connectedAt,
+      turnObservation: client.turnObserver.status(),
     }));
     return {
       ok: true,
@@ -500,6 +510,7 @@ export class CodexAppServerProxy {
         maxQueuedBytes: this.maxQueuedBytes,
         maxBufferedBytes: this.maxBufferedBytes,
         heartbeatIntervalMs: this.heartbeatIntervalMs,
+        turnFirstOutputTimeoutMs: this.turnFirstOutputTimeoutMs,
       },
     };
   }
@@ -779,11 +790,16 @@ export class CodexAppServerProxy {
       nextReconnectAt: null,
       downstreamAlive: true,
       upstreamAlive: false,
+      turnObserver: this.createTurnObserver({
+        timeoutMs: this.turnFirstOutputTimeoutMs,
+        onAnomaly: (event) => this.onEvent(event),
+      }),
     };
     this.clients.add(client);
     downstream.on("message", (data, isBinary) => {
       client.downstreamAlive = true;
       const message = parseJsonMessage(data, this.maxJsonParseBytes);
+      client.turnObserver.observeDownstream(message);
       if (message?.method === "initialize") {
         client.initializationRequestId = message.id ?? null;
       } else if (message?.method === "initialized") {
@@ -792,7 +808,9 @@ export class CodexAppServerProxy {
       const payload = data;
       const payloadBytes = messageByteLength(payload);
       if (client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
-        this.#sendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream");
+        if (this.#sendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream")) {
+          client.turnObserver.markForwarded(message);
+        }
         return;
       }
       if (client.queued.length >= this.maxQueuedMessages || client.queuedBytes + payloadBytes > this.maxQueuedBytes) {
@@ -840,6 +858,7 @@ export class CodexAppServerProxy {
       if (client.closed || client.upstream !== upstream) return;
       client.upstreamAlive = true;
       const message = parseJsonMessage(data, this.maxJsonParseBytes);
+      client.turnObserver.observeUpstream(message);
       if (
         message
         && client.initializationRequestId !== null
@@ -934,6 +953,7 @@ export class CodexAppServerProxy {
     for (const queued of client.queued.splice(0)) {
       client.queuedBytes -= queued.bytes;
       if (!this.#sendOrClose(client, upstream, queued.data, queued.isBinary, "queued_to_upstream")) break;
+      client.turnObserver.markForwarded(parseJsonMessage(queued.data, this.maxJsonParseBytes));
     }
     if (!client.queued.length) client.queuedBytes = 0;
   }
@@ -1021,6 +1041,7 @@ export class CodexAppServerProxy {
     this.clients.delete(client);
     if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
     client.reconnectTimer = null;
+    client.turnObserver.close(reason);
     for (const pending of client.injected.values()) {
       clearTimeout(pending.timeout);
       pending.reject(new CodexAppServerProxyError(

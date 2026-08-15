@@ -3,6 +3,7 @@ import http from "node:http";
 import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
 import zlib from "node:zlib";
+import { correlationQuality, hashIdentity } from "./observability-utils.mjs";
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
@@ -175,12 +176,6 @@ function writeHeadOnce(response, statusCode, statusMessage, headers) {
   if (response.headersSent || response.destroyed) return false;
   response.writeHead(statusCode, statusMessage, sanitizeResponseHeaders(headers));
   return true;
-}
-
-function hashIdentity(value) {
-  return typeof value === "string" && value.length > 0
-    ? crypto.createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16)
-    : null;
 }
 
 function requestClient(url) {
@@ -419,12 +414,15 @@ export function createCodexModelStreamProxy(options = {}) {
     const requestId = crypto.randomUUID();
     const requestState = { cancelled: false, currentAbort: null };
     active.set(requestId, requestState);
+    const threadHash = hashIdentity(identity.threadId);
+    const turnHash = hashIdentity(identity.turnId);
     const emit = (event) => onEvent({
       at: new Date().toISOString(),
       requestId,
       requestKind: identity.requestKind,
-      threadHash: hashIdentity(identity.threadId),
-      turnHash: hashIdentity(identity.turnId),
+      threadHash,
+      turnHash,
+      correlation: correlationQuality(threadHash, turnHash),
       ...event,
     });
     const finish = () => active.delete(requestId);

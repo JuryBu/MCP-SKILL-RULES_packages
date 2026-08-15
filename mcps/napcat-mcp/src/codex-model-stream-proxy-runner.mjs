@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import process from "node:process";
 import crypto from "node:crypto";
 import { createCodexModelStreamProxy } from "./codex-model-stream-proxy.mjs";
@@ -32,9 +33,25 @@ const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
 const lockPath = path.join(stateRoot, "codex-model-stream-proxy.lock.json");
 fs.mkdirSync(stateRoot, { recursive: true });
 
+const operationalLog = createBoundedJsonlWriter({ filePath: logPath });
+const anomalyLog = createBoundedJsonlWriter({
+  filePath: path.join(stateRoot, "codex-model-stream-anomalies.jsonl"),
+});
+const ANOMALY_EVENT_TYPES = new Set([
+  "attempt_no_progress_timeout",
+  "attempt_abort_unconfirmed",
+  "attempt_ended_without_progress",
+  "guarded_request_failed",
+  "guarded_request_error",
+  "passthrough_error",
+]);
+
 function appendRunnerEvent(event) {
   try {
-    fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, "utf8");
+    operationalLog.append({ at: new Date().toISOString(), ...event });
+    if (ANOMALY_EVENT_TYPES.has(event.type)) {
+      anomalyLog.append({ at: new Date().toISOString(), layer: "model_stream_proxy", ...event });
+    }
     return true;
   } catch (error) {
     try {
