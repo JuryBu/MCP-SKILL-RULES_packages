@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import crypto from "node:crypto";
 import { createCodexModelStreamProxy } from "./codex-model-stream-proxy.mjs";
+import { renameReplaceSync } from "./atomic-file.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
   const value = Number(process.env[name] ?? fallback);
@@ -14,8 +15,13 @@ function integerEnvironment(name, fallback, minimum, maximum) {
 
 function writeJsonAtomic(filePath, value) {
   const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-  fs.renameSync(temporaryPath, filePath);
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    renameReplaceSync(temporaryPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(temporaryPath); } catch {}
+    throw error;
+  }
 }
 
 const stateRoot = path.resolve(process.env.CODEX_MODEL_STREAM_PROXY_STATE_ROOT
@@ -26,6 +32,18 @@ const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
 const lockPath = path.join(stateRoot, "codex-model-stream-proxy.lock.json");
 fs.mkdirSync(stateRoot, { recursive: true });
 
+function appendRunnerEvent(event) {
+  try {
+    fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, "utf8");
+    return true;
+  } catch (error) {
+    try {
+      process.stderr.write(`model stream proxy log write failed: ${error.code ?? "LOG_WRITE_FAILED"}: ${error.message}\n`);
+    } catch {}
+    return false;
+  }
+}
+
 const startedAt = new Date().toISOString();
 const instanceToken = crypto.randomUUID();
 const lockHandle = fs.openSync(lockPath, "wx");
@@ -35,6 +53,8 @@ fs.closeSync(lockHandle);
 let stopping = false;
 let heartbeat = null;
 let stopWatcher = null;
+let consecutiveRuntimeWriteFailures = 0;
+const heartbeatIntervalMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_HEARTBEAT_INTERVAL_MS", 5_000, 100, 60_000);
 const proxy = createCodexModelStreamProxy({
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
   port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, 1, 65535),
@@ -42,7 +62,7 @@ const proxy = createCodexModelStreamProxy({
   firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 60_000, 1_000, 300_000),
   maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 64 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
   onEvent(event) {
-    fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), ...event })}\n`, "utf8");
+    appendRunnerEvent(event);
   },
 });
 
@@ -57,10 +77,37 @@ function runtimeState(status = "running", error = null) {
     endpoint: `http://${proxy.status().host}:${proxy.status().port}`,
     upstreamOrigin: proxy.status().upstreamOrigin,
     firstProgressTimeoutMs: proxy.status().firstProgressTimeoutMs,
+    heartbeatIntervalMs,
     activeRequests: proxy.status().activeRequests,
     counters: proxy.status().counters,
     error,
   };
+}
+
+function writeRuntimeState(status = "running", error = null, phase = "heartbeat", fatal = false) {
+  try {
+    writeJsonAtomic(runtimePath, runtimeState(status, error));
+    if (consecutiveRuntimeWriteFailures > 0) {
+      appendRunnerEvent({
+        type: "runtime_state_write_recovered",
+        phase,
+        previousConsecutiveFailures: consecutiveRuntimeWriteFailures,
+      });
+    }
+    consecutiveRuntimeWriteFailures = 0;
+    return true;
+  } catch (writeError) {
+    consecutiveRuntimeWriteFailures += 1;
+    appendRunnerEvent({
+      type: "runtime_state_write_failed",
+      phase,
+      consecutiveFailures: consecutiveRuntimeWriteFailures,
+      code: writeError.code ?? "RUNTIME_STATE_WRITE_FAILED",
+      message: writeError.message,
+    });
+    if (fatal) throw writeError;
+    return false;
+  }
 }
 
 async function shutdown(reason, exitCode = 0) {
@@ -70,42 +117,42 @@ async function shutdown(reason, exitCode = 0) {
   clearInterval(stopWatcher);
   try {
     await proxy.stop();
-    writeJsonAtomic(runtimePath, runtimeState("stopped", null));
+    writeRuntimeState("stopped", null, "shutdown");
   } catch (error) {
-    writeJsonAtomic(runtimePath, runtimeState("failed", { code: error.code ?? "STOP_FAILED", message: error.message }));
+    writeRuntimeState("failed", { code: error.code ?? "STOP_FAILED", message: error.message }, "shutdown_failed");
     exitCode = 1;
   }
   try {
     const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
     if (lock.pid === process.pid && lock.instanceToken === instanceToken) fs.unlinkSync(lockPath);
   } catch {}
-  fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), type: "runner_stopped", reason, exitCode })}\n`, "utf8");
+  appendRunnerEvent({ type: "runner_stopped", reason, exitCode });
   process.exitCode = exitCode;
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
 process.once("SIGTERM", () => void shutdown("SIGTERM"));
 process.once("uncaughtException", (error) => {
-  fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), type: "runner_uncaught_exception", code: error.code ?? "UNCAUGHT", message: error.message })}\n`, "utf8");
+  appendRunnerEvent({ type: "runner_uncaught_exception", code: error.code ?? "UNCAUGHT", message: error.message });
   void shutdown("uncaughtException", 1);
 });
 process.once("unhandledRejection", (error) => {
   const normalized = error instanceof Error ? error : new Error(String(error));
-  fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), type: "runner_unhandled_rejection", code: normalized.code ?? "UNHANDLED", message: normalized.message })}\n`, "utf8");
+  appendRunnerEvent({ type: "runner_unhandled_rejection", code: normalized.code ?? "UNHANDLED", message: normalized.message });
   void shutdown("unhandledRejection", 1);
 });
 
 try {
   await proxy.start();
-  writeJsonAtomic(runtimePath, runtimeState());
-  fs.appendFileSync(logPath, `${JSON.stringify({ at: new Date().toISOString(), type: "runner_started", pid: process.pid, endpoint: runtimeState().endpoint })}\n`, "utf8");
-  heartbeat = setInterval(() => writeJsonAtomic(runtimePath, runtimeState()), 5_000);
+  writeRuntimeState("running", null, "startup", true);
+  appendRunnerEvent({ type: "runner_started", pid: process.pid, endpoint: runtimeState().endpoint });
+  heartbeat = setInterval(() => writeRuntimeState("running", null, "heartbeat"), heartbeatIntervalMs);
   heartbeat.unref?.();
   stopWatcher = setInterval(() => {
     if (fs.existsSync(stopPath)) void shutdown("stop_file");
   }, 500);
 } catch (error) {
-  writeJsonAtomic(runtimePath, runtimeState("failed", { code: error.code ?? "START_FAILED", message: error.message }));
+  writeRuntimeState("failed", { code: error.code ?? "START_FAILED", message: error.message }, "startup_failed");
   try { fs.unlinkSync(lockPath); } catch {}
   throw error;
 }
