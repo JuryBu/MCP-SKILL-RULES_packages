@@ -151,7 +151,7 @@ Codex 仍负责 ChatGPT 登录和 OAuth 生命周期。看门人只在内存中�
 
 公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、控制状态、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。`control-state.json` 固定与任务账本共享 data root；升级器会备份并迁移旧代码目录中的同名状态，若两处同时存在且内容不同则拒绝切换，保留两份文件等待人工核对。
 
-监督器和登录脚本在尝试快速登录前会同时检查 `launcher-user.bat` 与 `napcat.mjs`。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
+监督器和登录脚本在尝试快速登录前会检查当前启动模式所需文件。旧注册表模式要求 `launcher-user.bat` 与 `napcat.mjs`；固定 QQ 模式要求指定的 `QQ.exe`、`napcat.mjs`、`NapCatWinBootMain.exe` 与 `NapCatWinBootHook.dll`，不再依赖系统 QQ 注册表或旧 launcher。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
 
 面向日常使用者的安装应优先采用「先准备、后退出 Codex 激活」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，隐藏激活器等待 Codex 与代理自然断开后，只清理受管代理和它启动的官方 App Server。用户正常退出 Codex、等待约 10 秒再打开即可，不需要重启 Windows；任何清理失败都必须保留旧任务和本地状态、暂停自动唤醒并报警，不能终止 Codex Desktop 或按进程名误杀其它实例。
 
@@ -192,6 +192,8 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
 有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本会使用 binding 中的 `expectedSelfId` 先尝试该账号的快速登录；授权有效则不显示二维码，授权失效且 NapCat 生成新二维码时才弹出小窗口并阻塞到登录成功或明确失败。监督器始终传 `-NoQr`，不会在无人值守桌面弹出二维码。
+
+需要让机器人 QQ 不受日常桌面 QQ 自动升级影响时，把一个经过官方签名验证、且被当前 NapCat PacketBackend 精确支持的 QQ 版本放在独立目录，并在私有 `napcat-runtime.json` 中同时记录 `napCatRoot` 与绝对 `qqExePath`。`ops/set-napcat-runtime.ps1 -ValidateOnly` 会先核对 QQ 签名、四段版本号、`napcat.mjs` 中的精确 `版本-x64` 映射、必需的 BootMain/Hook 文件和可选 SHA256，全程不写运行态；去掉 `-ValidateOnly` 后才会原字节备份旧 runtime、原子写入新路径并复核，失败自动恢复。输出中的 `backupPath` 可交给同一脚本的 `-Rollback -BackupPath <path>` 精确回退。独立路径启用后，登录脚本会直接使用该 QQ，不再读取系统 QQ 注册表；未配置 `qqExePath` 的旧安装仍保持原行为。
 
 `install-napcat-autostart.ps1 -StartNow` 只注册固定名称的当前用户登录计划任务，替换前会导出同名旧任务并记录回滚状态。`remove-napcat-autostart.ps1` 只移除该固定任务，并在存在备份时恢复前任任务。所有运行状态默认写入接收方的 `.codex-toolkit/napcat-mcp` 数据目录，不写回源码目录。
 

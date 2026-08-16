@@ -3,7 +3,8 @@ param(
   [ValidateRange(0, 3600)][int]$IntervalSeconds = 0,
   [string]$DataRoot = "",
   [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
-  [string]$NapCatRoot = ""
+  [string]$NapCatRoot = "",
+  [string]$QqExePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -27,14 +28,19 @@ if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
     $FlatBrokerRoot
   }
 }
+$RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
+$RuntimeConfiguration = $null
+if (Test-Path -LiteralPath $RuntimeStateFile) {
+  try { $RuntimeConfiguration = Get-Content -LiteralPath $RuntimeStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $RuntimeConfiguration = $null }
+}
 if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
-  $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
-  if (Test-Path -LiteralPath $RuntimeStateFile) {
-    try { $NapCatRoot = [string](Get-Content -LiteralPath $RuntimeStateFile -Raw -Encoding UTF8 | ConvertFrom-Json).napCatRoot } catch { $NapCatRoot = "" }
-  }
+  if ($null -ne $RuntimeConfiguration) { $NapCatRoot = [string]$RuntimeConfiguration.napCatRoot }
   if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
     $NapCatRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"
   }
+}
+if ([string]::IsNullOrWhiteSpace($QqExePath) -and $null -ne $RuntimeConfiguration) {
+  $QqExePath = [string]$RuntimeConfiguration.qqExePath
 }
 $ToolkitRoot = Split-Path -Parent $NapCatParent
 $RunnerPath = Join-Path $NapCatMcpRoot "src\supervisor-runner.mjs"
@@ -192,6 +198,9 @@ $Arguments = @(
   "--maintenance-file", $AutomationMaintenancePath,
   "--alert-file", $AutomationAlertPath
 )
+if (-not [string]::IsNullOrWhiteSpace($QqExePath)) {
+  $Arguments += @("--qq-exe-path", $QqExePath)
+}
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
 
