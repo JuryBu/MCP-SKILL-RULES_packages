@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.23.3] - 2026-08-16
+
+- 修复 Record scheduler 在只读取尾部增量窗口时，把 `rounds.length` 当作全会话总轮数传给写入校验，导致已覆盖 15/15 轮的合法候选被误拒为“只覆盖到第 6 轮”的问题；写入校验、生成参数和 metadata 现在统一使用 frozen source snapshot 的 `sourceTotalRounds`。
+- 修复 provider 已返回 `ResultReady` 后候选质量失败被生产泵误判为“执行回调提前返回”并转入 `RepairRequired` 的兜底状态；候选失败会结算为业务失败并透传原始原因，不再污染 scheduler ledger。
+
 ## [1.23.2] - 2026-08-16
 
 - 修复 Record scheduler 在 DSH 增量 Record 更新中把尾部完整读取的 source snapshot 误判为不完整的问题；`Preparing + frozen + selected=1/materialized=0` 的合法中间态现在可继续 materialize 到 `Succeeded`，不再触发 `invalid_current_ledger`。

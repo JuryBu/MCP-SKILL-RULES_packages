@@ -151,9 +151,15 @@ export interface RecordSchedulerLocalFinalizeInput {
 
 export type RecordSchedulerProductionSessionFinalizeInput = Omit<RecordSchedulerLocalFinalizeInput, "registration" | "modelUnitIds">;
 
+export interface RecordSchedulerProductionSessionFailureInput {
+    reason: string;
+    failedRecords?: number;
+}
+
 export interface RecordSchedulerProductionSession {
     schedulerModelCall: RecordSchedulerModelCallHook;
     finalizeLocalRecord(input: RecordSchedulerProductionSessionFinalizeInput): Promise<RecordSchedulerFinalizedCommitResult>;
+    failRecordGeneration(input: RecordSchedulerProductionSessionFailureInput): Promise<void>;
 }
 
 export interface RecordSchedulerProductionPersistedHandoff {
@@ -300,6 +306,7 @@ export class RecordSchedulerProductionPump {
                 registration,
                 modelUnitIds: [],
             }),
+            failRecordGeneration: async input => await this.failRecordGeneration(registration, input),
         };
     }
 
@@ -1038,6 +1045,43 @@ export class RecordSchedulerProductionPump {
                     throw new RecordSchedulerExecutionDriverError("REPAIR_REQUIRED", `local-finalize 依赖的 model Unit ${unitId} 状态异常: ${unit.state}`);
                 }
             }
+            refreshUnitCounters(ledger);
+        });
+    }
+
+    private async failRecordGeneration(
+        registration: RecordSchedulerProductionRegistration,
+        input: RecordSchedulerProductionSessionFailureInput,
+    ): Promise<void> {
+        this.assertRegistration(registration);
+        const ownerLease = await this.getOrRecoverTaskOwner(registration);
+        const failedRecords = Math.max(1, Math.floor(input.failedRecords ?? 1));
+        const now = new Date(this.nowMs()).toISOString();
+        await this.mutateOwnerLedger(registration.taskId, ownerLease, ledger => {
+            const affectedUnitIds = new Set<string>();
+            for (const unit of ledger.units) {
+                if (unit.sourceSnapshotId !== registration.sourceSnapshotId || unit.layer !== "provider-attempt") continue;
+                if (unit.state === "ResultReady" || unit.state === "Committing" || unit.state === "UnknownOutcome") {
+                    assertUnitTransition(unit.state, "Discarded");
+                    unit.state = "Discarded";
+                    unit.failureClass = "Quality";
+                    affectedUnitIds.add(unit.unitId);
+                }
+            }
+            for (const attempt of ledger.attempts) {
+                if (!affectedUnitIds.has(attempt.unitId)) continue;
+                if (attempt.state === "KnownSuccess" || attempt.state === "UnknownOutcome" || attempt.state === "DispatchIntentPersisted" || attempt.state === "Created") {
+                    assertAttemptTransition(attempt.state, "Discarded");
+                    attempt.state = "Discarded";
+                    attempt.outcome = "discarded";
+                    attempt.errorClass = "Quality";
+                    attempt.providerEvidence = input.reason.slice(0, 512) || "record generation failed before local-finalize";
+                }
+                attempt.activeTaskIds = attempt.activeTaskIds.filter(taskId => taskId !== registration.taskId);
+            }
+            const remainingFailureSlots = Math.max(0, ledger.task.recordItems.total - ledger.task.recordItems.succeeded - ledger.task.recordItems.failed - ledger.task.recordItems.unresolved);
+            ledger.task.recordItems.failed += Math.min(failedRecords, remainingFailureSlots);
+            ledger.task.updatedAt = now;
             refreshUnitCounters(ledger);
         });
     }

@@ -2366,6 +2366,22 @@ async function finalizeSchedulerLocalRecord(
     throw new Error("local-finalize retry loop 未返回结果");
 }
 
+async function failSchedulerRecordGeneration(
+    session: RecordSchedulerProductionSession,
+    reason: string,
+): Promise<void> {
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+        try {
+            await session.failRecordGeneration({ reason, failedRecords: 1 });
+            return;
+        } catch (error) {
+            const code = (error as { code?: unknown })?.code;
+            if ((code !== "REVISION_CONFLICT" && code !== "SCHEDULER_LEDGER_CONFLICT") || attempt === 3) throw error;
+            await new Promise(resolve => setTimeout(resolve, 10 * (attempt + 1)));
+        }
+    }
+}
+
 function completeRecordMetadata(input: {
     conversationId: string;
     content: string;
@@ -2667,6 +2683,8 @@ async function handleUpdate(
     let effectiveHash = hash;
     let effectiveWs = workspace || "general";
     let sourceSnapshot: RecordSourceSnapshot | null = null;
+    let sourceRoundStart = 1;
+    let sourceTotalRounds = 0;
     try {
         loaded = options.frozenSource
             ? conversationLoadFromFrozenSource(options.frozenSource)
@@ -2690,8 +2708,8 @@ async function handleUpdate(
 
         const rounds = loaded.rounds;
         const totalSteps = loaded.totalSteps;
-        const sourceRoundStart = loaded.roundStart ?? 1;
-        const sourceTotalRounds = loaded.roundCount ?? rounds.length;
+        sourceRoundStart = loaded.roundStart ?? 1;
+        sourceTotalRounds = loaded.roundCount ?? rounds.length;
         const afterLoadAbort = buildRecordTaskAbortResponse(startMs, options, "对话已加载，停止后续 Record 生成");
         if (afterLoadAbort) return afterLoadAbort;
         options.onProgress?.({
@@ -2811,23 +2829,29 @@ async function handleUpdate(
                 startMs,
             );
         }
-        if (!result.success) return rt(`❌ Record 生成失败: ${result.error}`, startMs);
+        if (!result.success) {
+            if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, result.error || "Record 生成失败");
+            return rt(`❌ Record 生成失败: ${result.error}`, startMs);
+        }
 
         const beforeWriteAbort = buildRecordTaskAbortResponse(startMs, options, "写回正式 Record 前检查到任务已终止");
         if (beforeWriteAbort) return beforeWriteAbort;
         const oldRecordForGate = await readRecordAsync(effectiveHash, cascadeId) || "";
-        const gate = validateRecordCandidateForWrite(result.content!, cascadeId, rounds.length, result.coveredRounds || rounds.length, {
+        const gate = validateRecordCandidateForWrite(result.content!, cascadeId, sourceTotalRounds, result.coveredRounds || sourceTotalRounds, {
             oldRecord: oldRecordForGate,
         });
-        if (!gate.ok) return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
+        if (!gate.ok) {
+            if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, gate.error);
+            return rt(`❌ Record 生成失败: ${gate.error}`, startMs);
+        }
         const phases = countPhasesInRecord(result.content!);
         const existingIndexEntry = (await readRecordsIndexAsync(effectiveHash)).records[cascadeId];
         const recordMeta = completeRecordMetadata({
             conversationId: cascadeId,
             content: result.content!,
-            rounds: rounds.length,
+            rounds: sourceTotalRounds,
             totalSteps,
-            coveredRounds: result.coveredRounds || rounds.length,
+            coveredRounds: result.coveredRounds || sourceTotalRounds,
             phases,
             timeSpan: existingIndexEntry?.timeSpan,
             tags: result.tags ?? existingIndexEntry?.tags,
@@ -5328,6 +5352,8 @@ async function runRecordBatchUpdateFromPayload(
                     }
 
                     const rounds = loaded.rounds;
+                    const sourceRoundStart = loaded.roundStart ?? 1;
+                    const sourceTotalRounds = loaded.roundCount ?? rounds.length;
                     const parseMs = Date.now() - startedAt - fetchMs;
                     if (rounds.length < 3) {
                         ledger = schedulerManaged
@@ -5364,6 +5390,8 @@ async function runRecordBatchUpdateFromPayload(
                         background: true,
                         trafficClass: "record-batch",
                         force: recordBatchGenerateForce(candidate),
+                        sourceRoundStart,
+                        sourceTotalRounds,
                         isCancelled,
                         isSettled,
                         ...(schedulerSession ? {
@@ -5380,6 +5408,7 @@ async function runRecordBatchUpdateFromPayload(
                         break;
                     }
                     if (!result.success || !result.content) {
+                        if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, result.error || "Record 生成失败");
                         ledger = schedulerManaged
                             ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, result.error || "unknown")
                             : await updateRecordBatchLedger(payload, "failed", candidate, result.error || "unknown");
@@ -5389,10 +5418,11 @@ async function runRecordBatchUpdateFromPayload(
 
                     const content = result.content;
                     const oldRecord = await readRecordAsync(actualHash, candidate.id) || "";
-                    const gate = validateRecordCandidateForWrite(content, candidate.id, rounds.length, result.coveredRounds || rounds.length, {
+                    const gate = validateRecordCandidateForWrite(content, candidate.id, sourceTotalRounds, result.coveredRounds || sourceTotalRounds, {
                         oldRecord,
                     });
                     if (!gate.ok) {
+                        if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, gate.error);
                         ledger = schedulerManaged
                             ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, gate.error)
                             : await updateRecordBatchLedger(payload, "failed", candidate, gate.error);
@@ -5415,9 +5445,9 @@ async function runRecordBatchUpdateFromPayload(
                         const metadata = completeRecordMetadata({
                             conversationId: candidate.id,
                             content,
-                            rounds: rounds.length,
+                            rounds: sourceTotalRounds,
                             totalSteps,
-                            coveredRounds: result.coveredRounds || rounds.length,
+                            coveredRounds: result.coveredRounds || sourceTotalRounds,
                             phases,
                             tags: result.tags ?? existingIndexEntry?.tags ?? [],
                             chain: loaded.chainUsed || payload.dataChain || existingIndexEntry?.chain,
