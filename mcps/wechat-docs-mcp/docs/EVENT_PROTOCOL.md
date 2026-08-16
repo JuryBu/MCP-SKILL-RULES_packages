@@ -39,6 +39,8 @@ ledger.register_subscription(
 
 精确身份是规范化后的 `ownerAccountKey + username + chat_type`。显示标题只作展示和 UI 导航。同名候选不能自动选择；来源目标不唯一时进入 quarantine 或拒绝。
 
+消息方向不是只看微信数据库的 `status/origin_source`。private binding 应按 owner account scope 保存已验证的 `ownerSenderUsername`：作者精确命中 owner 时优先判为 `outbound`；否则只有可信数据库入站组合才判为 `inbound`。`unknown` 事件仍入账和推进连续基线，但不建立 delivery，也不生成 wake。
+
 启用发送能力必须提供本机私有 `policy_ref`，并且 private binding 的对应 route/capability 也必须显式开启。监听授权不等于发送授权。
 
 ## 3. 入账与 fan-out
@@ -57,6 +59,8 @@ result = ledger.ingest_event(
 ```
 
 返回 `event_id`、`event_seq`、`delivery_count` 和本次涉及的 wakes。事件插入、所有 delivery 和 0→1 wake 创建在同一 SQLite 事务中。
+
+只有 `payload.direction == "inbound"` 才向 active、listen-capable subscription fan-out。self-sent/outbound 与 unknown 都不会投递；同一 inbound event 仍会向该 route 的每个 active subscription 各建一张独立 delivery。
 
 `source_fingerprint` 只用于同一 route 内的来源去重。处理顺序必须使用 `event_seq`，不能按微信索引、数字大小、文件大小或 UUID 字典序推断。
 

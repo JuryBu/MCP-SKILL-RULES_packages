@@ -9,6 +9,7 @@
       "display_title": "Synthetic Group",
       "chat_type": "group",
       "username": "synthetic-room@chatroom",
+      "ownerSenderUsername": "synthetic-owner-wxid",
       "state": "enrolling",
       "outbound": {
         "enabled": false,
@@ -24,6 +25,7 @@
       "display_title": "Synthetic Contact",
       "chat_type": "friend",
       "username": "synthetic-contact-id",
+      "ownerSenderUsername": "synthetic-owner-wxid",
       "state": "enrolling",
       "outbound": {
         "enabled": false,

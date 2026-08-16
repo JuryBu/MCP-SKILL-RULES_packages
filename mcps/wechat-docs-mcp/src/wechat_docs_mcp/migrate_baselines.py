@@ -20,7 +20,11 @@ SRC_DIR = Path(__file__).resolve().parent.parent / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from wechat_docs_mcp.db_observer import DbObserver, RouteBinding
+from wechat_docs_mcp.db_observer import (
+    DbObserver,
+    RouteBinding,
+    resolve_owner_sender_username,
+)
 from wechat_docs_mcp.ledger import EventLedger
 
 DATA_ROOT = Path(
@@ -82,12 +86,20 @@ def main() -> int:
         print(f"    FATAL: cannot load binding.json: {e}")
         return 1
     routes = data.get("routes", [])
+    owner_account_key = str(data.get("ownerAccountKey") or "")
+    owner_sender_username = str(data.get("ownerSenderUsername") or "")
     bindings = [
         RouteBinding(
             route_id=r["route_id"],
             exact_title=r["exact_title"],
             chat_type=r["chat_type"],
             username=r["username"],
+            owner_account_key=str(r.get("ownerAccountKey") or owner_account_key),
+            owner_sender_username=resolve_owner_sender_username(
+                r,
+                default_owner_account_key=owner_account_key,
+                default_owner_sender_username=owner_sender_username,
+            ),
         )
         for r in routes
     ]

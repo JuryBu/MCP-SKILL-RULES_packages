@@ -54,6 +54,25 @@ class RouteBinding:
     chat_type: str  # "friend" or "group"
     username: str   # wxid_xxx or xxx@chatroom
     owner_account_key: str = ""
+    owner_sender_username: str = ""
+
+
+def resolve_owner_sender_username(
+    route: dict[str, Any],
+    *,
+    default_owner_account_key: str,
+    default_owner_sender_username: str,
+) -> str:
+    route_sender = str(route.get("ownerSenderUsername") or "").strip()
+    if route_sender:
+        return route_sender
+    route_owner_account_key = str(
+        route.get("ownerAccountKey") or default_owner_account_key
+    ).strip()
+    normalized_default_key = default_owner_account_key.strip()
+    if route_owner_account_key and route_owner_account_key == normalized_default_key:
+        return default_owner_sender_username.strip()
+    return ""
 
 
 @dataclass(frozen=True)
@@ -105,16 +124,39 @@ class DbObserver:
         path = self._msg_db_path()
         if not path.exists():
             return
+        sender_cache: dict[int, str] = {}
         conn = sqlite3.connect(path)
         try:
             rows = conn.execute("SELECT rowid, user_name FROM Name2Id").fetchall()
             for rowid, user_name in rows:
-                self._sender_cache[rowid] = user_name or "<system>"
+                sender_cache[rowid] = user_name or "<system>"
+        except sqlite3.OperationalError:
+            return
         finally:
             conn.close()
+        self._sender_cache = sender_cache
 
     def _sender_name(self, sender_id: int) -> str:
         return self._sender_cache.get(sender_id, f"id={sender_id}")
+
+    @staticmethod
+    def _message_direction(
+        sender_username: str,
+        owner_sender_username: str,
+        status: int | None,
+        origin_source: int | None,
+    ) -> tuple[str, str]:
+        sender = sender_username.strip()
+        owner_sender = owner_sender_username.strip()
+        if owner_sender and sender == owner_sender:
+            return "outbound", "verified_owner_sender"
+        if owner_sender and (not sender or sender.startswith("id=")):
+            return "unknown", "owner_sender_unresolved"
+        if status == 2 and origin_source == 1:
+            return "outbound", "database_outbound"
+        if status in {3, 4} or origin_source == 2:
+            return "inbound", "database_inbound"
+        return "unknown", "untrusted_database_direction"
 
     @staticmethod
     def _strip_group_sender_prefix(content: str, sender_username: str) -> str:
@@ -388,6 +430,7 @@ class DbObserver:
         Observation
             One per new message, in chronological order within each route.
         """
+        self._load_sender_cache()
         path = self._msg_db_path()
         if not path.exists():
             return
@@ -435,6 +478,12 @@ class DbObserver:
                     visible_text = self._extract_text(content, msg_type)
                     attachment_info = self._extract_attachment_info(content, msg_type)
                     sender_display = self._contact_display_name(sender_username)
+                    direction, direction_basis = self._message_direction(
+                        sender_username,
+                        binding.owner_sender_username,
+                        r["status"],
+                        r["origin_source"],
+                    )
 
                     # Build fingerprint for dedup
                     fp = f"{binding.username}:{r['local_id']}:{r['server_id']}"
@@ -451,15 +500,10 @@ class DbObserver:
 
                     payload: dict[str, Any] = {
                         "kind": msg_type,
-                        "direction": (
-                            "outbound"
-                            if r["status"] == 2 and r["origin_source"] == 1
-                            else (
-                                "inbound"
-                                if r["status"] in {3, 4} or r["origin_source"] == 2
-                                else "unknown"
-                            )
-                        ),
+                        "direction": direction,
+                        "direction_basis": direction_basis,
+                        "database_status": r["status"],
+                        "database_origin_source": r["origin_source"],
                         "sender_display": sender_display,
                         "sender_username": sender_username,
                         "message_time_display": datetime.fromtimestamp(

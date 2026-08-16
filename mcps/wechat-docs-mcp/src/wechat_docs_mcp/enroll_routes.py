@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .db_observer import DbObserver, RouteBinding
+from .db_observer import DbObserver, RouteBinding, resolve_owner_sender_username
 from .ledger import EventLedger, LedgerError
 
 
@@ -38,13 +38,19 @@ def load_binding_config(path: Path) -> dict[str, Any]:
 def load_bindings(path: Path) -> list[RouteBinding]:
     data = load_binding_config(path)
     owner_account_key = data["ownerAccountKey"]
+    owner_sender_username = str(data.get("ownerSenderUsername") or "")
     return [
         RouteBinding(
             route_id=route["route_id"],
             exact_title=route["exact_title"],
             chat_type=route["chat_type"],
             username=route["username"],
-            owner_account_key=owner_account_key,
+            owner_account_key=str(route.get("ownerAccountKey") or owner_account_key),
+            owner_sender_username=resolve_owner_sender_username(
+                route,
+                default_owner_account_key=owner_account_key,
+                default_owner_sender_username=owner_sender_username,
+            ),
         )
         for route in data["routes"]
     ]

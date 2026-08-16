@@ -17,7 +17,7 @@ from mcp.types import CallToolResult
 
 from .attachment_reader import VisualAttachmentReader
 from .attachments import AttachmentRegistry
-from .db_observer import RouteBinding
+from .db_observer import RouteBinding, resolve_owner_sender_username
 from .db_watcher import DbWatcher
 from .document_changes import DocumentChangeCoalescer
 from .document_monitor import DocumentMonitorStore, TencentDocsMonitorService
@@ -150,6 +150,7 @@ def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSou
         IMAGE_KEY_FILE,
         IMAGE_KEY_ROOT,
         active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
+        refresh_decrypted=_refresh_decrypted_for_attachment,
     )
 
 
@@ -176,6 +177,15 @@ def _refresh_decrypted_for_outbound() -> None:
     if active_watcher is None:
         raise LedgerError("WECHAT_WATCHER_NOT_READY", "微信数据库 watcher 未就绪")
     result = active_watcher.watch_once(force_refresh=True)
+    if result.error:
+        raise LedgerError("WECHAT_DATABASE_REFRESH_FAILED", result.error)
+
+
+def _refresh_decrypted_for_attachment() -> None:
+    active_watcher = watcher()
+    if active_watcher is None:
+        raise LedgerError("WECHAT_WATCHER_NOT_READY", "微信数据库 watcher 未就绪")
+    result = active_watcher.watch_once(force_refresh=False)
     if result.error:
         raise LedgerError("WECHAT_DATABASE_REFRESH_FAILED", result.error)
 
@@ -242,6 +252,7 @@ def _load_binding_document() -> dict[str, Any]:
 def _load_bindings() -> list[RouteBinding]:
     data = _load_binding_document()
     owner_account_key = str(data.get("ownerAccountKey") or "")
+    owner_sender_username = str(data.get("ownerSenderUsername") or "")
     schema_version = int(data.get("schemaVersion") or 1)
     return [
         RouteBinding(
@@ -250,6 +261,11 @@ def _load_bindings() -> list[RouteBinding]:
             chat_type=r["chat_type"],
             username=r["username"],
             owner_account_key=str(r.get("ownerAccountKey") or owner_account_key),
+            owner_sender_username=resolve_owner_sender_username(
+                r,
+                default_owner_account_key=owner_account_key,
+                default_owner_sender_username=owner_sender_username,
+            ),
         )
         for r in data.get("routes", [])
         if isinstance(r, dict)

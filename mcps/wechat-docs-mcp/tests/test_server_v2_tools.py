@@ -126,6 +126,7 @@ def test_legacy_binding_without_route_state_remains_listenable(
             {
                 "schemaVersion": 1,
                 "ownerAccountKey": OWNER_KEY,
+                "ownerSenderUsername": "synthetic-owner-sender",
                 "routes": [
                     {
                         "route_id": "route-legacy",
@@ -142,6 +143,46 @@ def test_legacy_binding_without_route_state_remains_listenable(
     bindings = server._load_bindings()
     assert len(bindings) == 1
     assert bindings[0].route_id == "route-legacy"
+    assert bindings[0].owner_sender_username == "synthetic-owner-sender"
+
+
+def test_route_owner_override_does_not_inherit_another_accounts_sender(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    binding_file = tmp_path / "binding.json"
+    binding_file.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "ownerAccountKey": OWNER_KEY,
+                "ownerSenderUsername": "synthetic-root-owner",
+                "routes": [
+                    {
+                        "route_id": "route-other-owner",
+                        "exact_title": "Synthetic Other Owner",
+                        "chat_type": "friend",
+                        "username": "synthetic-contact-id",
+                        "ownerAccountKey": "b" * 64,
+                    },
+                    {
+                        "route_id": "route-explicit-owner",
+                        "exact_title": "Synthetic Explicit Owner",
+                        "chat_type": "friend",
+                        "username": "synthetic-contact-id-2",
+                        "ownerAccountKey": "c" * 64,
+                        "ownerSenderUsername": "synthetic-route-owner",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(server, "BINDING_FILE", binding_file)
+
+    bindings = server._load_bindings()
+
+    assert bindings[0].owner_sender_username == ""
+    assert bindings[1].owner_sender_username == "synthetic-route-owner"
 
 
 def test_server_attachment_and_document_change_interfaces_are_non_sending(

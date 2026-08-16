@@ -72,17 +72,19 @@ def _insert_msg(
     content: str = "msg",
     status: int = 4,
     origin_source: int = 2,
+    real_sender_id: int = 1,
 ) -> None:
     """Insert a message row into the test decrypted DB."""
     import hashlib
     h = hashlib.md5(username.encode("utf-8")).hexdigest()
     conn = sqlite3.connect(str(db_path))
     conn.execute(
-        f"INSERT INTO Msg_{h} VALUES (?, ?, 1, ?, 1, ?, ?, ?, '<msgsource/>', ?, '', NULL, 0, 0)",
+        f"INSERT INTO Msg_{h} VALUES (?, ?, 1, ?, ?, ?, ?, ?, '<msgsource/>', ?, '', NULL, 0, 0)",
         (
             local_id,
             200 + local_id,
             1700000001000 + local_id,
+            real_sender_id,
             1700000001 + local_id,
             status,
             origin_source,
@@ -110,6 +112,7 @@ class DbWatcherTests(unittest.TestCase):
                 exact_title="TestUser",
                 chat_type="friend",
                 username="wxid_test",
+                owner_sender_username="self",
             ),
         ]
         self.ledger = EventLedger(base / "events.sqlite3")
@@ -154,17 +157,197 @@ class DbWatcherTests(unittest.TestCase):
             "outbound marker",
             status=2,
             origin_source=1,
+            real_sender_id=2,
         )
 
         observations, complete = self.watcher.poll_and_ingest()
 
         self.assertTrue(complete)
         self.assertEqual("outbound", observations[0].payload["direction"])
+        self.assertEqual(
+            "verified_owner_sender",
+            observations[0].payload["direction_basis"],
+        )
         connection = sqlite3.connect(self.ledger.path)
         try:
             self.assertEqual(
                 deliveries_before,
                 connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_synced_owner_message_is_outbound_without_delivery(self) -> None:
+        self.watcher.poll_and_ingest()
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            deliveries_before = connection.execute(
+                "SELECT COUNT(*) FROM event_deliveries"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        _insert_msg(
+            self.decrypted_dir / "message" / "message_0.db",
+            "wxid_test",
+            2,
+            "synced owner marker",
+            status=3,
+            origin_source=2,
+            real_sender_id=2,
+        )
+
+        observations, complete = self.watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("outbound", observations[0].payload["direction"])
+        self.assertEqual(
+            "verified_owner_sender",
+            observations[0].payload["direction_basis"],
+        )
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            self.assertEqual(
+                deliveries_before,
+                connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_sender_cache_refreshes_after_new_name2id_mapping(self) -> None:
+        self.watcher.poll_and_ingest()
+        message_db = self.decrypted_dir / "message" / "message_0.db"
+        connection = sqlite3.connect(message_db)
+        try:
+            connection.execute("DELETE FROM Name2Id WHERE user_name='self'")
+            connection.commit()
+        finally:
+            connection.close()
+        watcher = DbWatcher(
+            self.encrypted_dir,
+            self.decrypted_dir,
+            self.keys_file,
+            self.bindings,
+            self.ledger,
+        )
+        connection = sqlite3.connect(message_db)
+        try:
+            cursor = connection.execute(
+                "INSERT INTO Name2Id(user_name,is_session) VALUES ('self',0)"
+            )
+            sender_id = int(cursor.lastrowid)
+            connection.commit()
+        finally:
+            connection.close()
+        _insert_msg(
+            message_db,
+            "wxid_test",
+            2,
+            "late owner mapping",
+            status=3,
+            origin_source=2,
+            real_sender_id=sender_id,
+        )
+
+        observations, complete = watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("outbound", observations[0].payload["direction"])
+        self.assertEqual(
+            "verified_owner_sender", observations[0].payload["direction_basis"]
+        )
+
+    def test_unresolved_sender_is_quarantined_when_owner_identity_is_configured(self) -> None:
+        self.watcher.poll_and_ingest()
+        _insert_msg(
+            self.decrypted_dir / "message" / "message_0.db",
+            "wxid_test",
+            2,
+            "unresolved sender",
+            status=3,
+            origin_source=2,
+            real_sender_id=999,
+        )
+
+        observations, complete = self.watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("unknown", observations[0].payload["direction"])
+        self.assertEqual(
+            "owner_sender_unresolved", observations[0].payload["direction_basis"]
+        )
+
+    def test_unknown_direction_is_persisted_without_delivery(self) -> None:
+        self.watcher.poll_and_ingest()
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            deliveries_before = connection.execute(
+                "SELECT COUNT(*) FROM event_deliveries"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+        _insert_msg(
+            self.decrypted_dir / "message" / "message_0.db",
+            "wxid_test",
+            2,
+            "unknown marker",
+            status=1,
+            origin_source=1,
+            real_sender_id=1,
+        )
+
+        observations, complete = self.watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("unknown", observations[0].payload["direction"])
+        self.assertEqual(
+            "untrusted_database_direction",
+            observations[0].payload["direction_basis"],
+        )
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            self.assertEqual(
+                deliveries_before,
+                connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0],
+            )
+        finally:
+            connection.close()
+
+    def test_inbound_message_fans_out_to_each_active_subscription(self) -> None:
+        self.watcher.poll_and_ingest()
+        self.ledger.register_subscription(
+            "route-test",
+            "conv-second",
+            1,
+            subscription_id="subscription-second",
+            listen_capability=True,
+            send_capability=False,
+        )
+        _insert_msg(
+            self.decrypted_dir / "message" / "message_0.db",
+            "wxid_test",
+            2,
+            "other sender marker",
+            status=3,
+            origin_source=2,
+            real_sender_id=1,
+        )
+
+        observations, complete = self.watcher.poll_and_ingest()
+
+        self.assertTrue(complete)
+        self.assertEqual("inbound", observations[0].payload["direction"])
+        connection = sqlite3.connect(self.ledger.path)
+        try:
+            event_id = connection.execute(
+                "SELECT event_id FROM events WHERE source_fingerprint=?",
+                ("wxid_test:2:202",),
+            ).fetchone()[0]
+            self.assertEqual(
+                2,
+                connection.execute(
+                    "SELECT COUNT(*) FROM event_deliveries WHERE event_id=? AND state='PENDING'",
+                    (event_id,),
+                ).fetchone()[0],
             )
         finally:
             connection.close()
@@ -209,6 +392,57 @@ class DbWatcherTests(unittest.TestCase):
         result = self.watcher.watch_once()
         self.assertIsNone(result.error)
         self.assertEqual(0, len(result.decrypted_files))
+
+    def test_hardlink_index_change_triggers_decryption(self) -> None:
+        with patch.object(self.watcher, "refresh_keys", return_value=True), patch.object(
+            self.watcher, "decrypt_changed", return_value=["message/message_0.db"]
+        ):
+            self.watcher.watch_once()
+
+        hardlink = self.encrypted_dir / "hardlink" / "hardlink.db"
+        hardlink.parent.mkdir(parents=True)
+        time.sleep(0.1)
+        hardlink.write_bytes(b"\x00" * 4096)
+
+        with patch.object(self.watcher, "refresh_keys", return_value=True), patch.object(
+            self.watcher,
+            "decrypt_changed",
+            return_value=["hardlink/hardlink.db"],
+        ) as decrypt_changed:
+            result = self.watcher.watch_once()
+
+        self.assertIsNone(result.error)
+        decrypt_changed.assert_called_once()
+        self.assertIn(
+            "hardlink/hardlink.db",
+            [path.replace("\\", "/") for path in result.changed_files],
+        )
+
+    def test_hardlink_wal_change_triggers_decryption(self) -> None:
+        hardlink = self.encrypted_dir / "hardlink" / "hardlink.db"
+        hardlink.parent.mkdir(parents=True)
+        hardlink.write_bytes(b"\x00" * 4096)
+        with patch.object(self.watcher, "refresh_keys", return_value=True), patch.object(
+            self.watcher, "decrypt_changed", return_value=["message/message_0.db"]
+        ):
+            self.watcher.watch_once()
+
+        wal = hardlink.with_name("hardlink.db-wal")
+        wal.write_bytes(b"\x01" * 4096)
+
+        with patch.object(self.watcher, "refresh_keys", return_value=True), patch.object(
+            self.watcher,
+            "decrypt_changed",
+            return_value=["hardlink/hardlink.db-wal"],
+        ) as decrypt_changed:
+            result = self.watcher.watch_once()
+
+        self.assertIsNone(result.error)
+        decrypt_changed.assert_called_once()
+        self.assertIn(
+            "hardlink/hardlink.db-wal",
+            [path.replace("\\", "/") for path in result.changed_files],
+        )
 
     def test_poll_and_ingest_advances_baseline(self) -> None:
         """Polling should ingest events and advance the baseline."""

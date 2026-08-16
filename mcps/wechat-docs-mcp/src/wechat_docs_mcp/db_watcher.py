@@ -92,7 +92,7 @@ class DbWatcher:
         snapshot: dict[str, FileSnapshot] = {}
         for root, _dirs, files in os.walk(self.db_dir):
             for name in files:
-                if not name.endswith(".db") or name.endswith("-wal") or name.endswith("-shm"):
+                if not (name.endswith(".db") or name.endswith(".db-wal")):
                     continue
                 path = os.path.join(root, name)
                 rel = os.path.relpath(path, self.db_dir)
@@ -130,10 +130,14 @@ class DbWatcher:
         self._snapshot = current
 
     def _has_message_db_changed(self, changed_files: list[str]) -> bool:
-        """Check if any message-related database file has changed."""
+        """Check if message or attachment-index databases changed."""
         for f in changed_files:
             lower = f.replace("\\", "/").lower()
-            if "message" in lower and lower.endswith(".db"):
+            if "message" in lower and (
+                lower.endswith(".db") or lower.endswith(".db-wal")
+            ):
+                return True
+            if lower in {"hardlink/hardlink.db", "hardlink/hardlink.db-wal"}:
                 return True
         return False
 
@@ -275,7 +279,7 @@ class DbWatcher:
                     payload=obs.payload,
                     occurred_at=obs.occurred_at,
                     sensitivity=obs.sensitivity,
-                    deliver_to_subscriptions=obs.payload.get("direction") != "outbound",
+                    deliver_to_subscriptions=obs.payload.get("direction") == "inbound",
                 )
                 success_ids.setdefault(rid, set()).add(local_id)
             except Exception:

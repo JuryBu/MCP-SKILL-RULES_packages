@@ -395,6 +395,164 @@ def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integri
     assert (tmp_path / "scoped-image-keys" / f"{hashlib.sha256(OWNER_KEY.encode()).hexdigest()}.json").is_file()
 
 
+def test_v2_image_waits_for_one_bounded_database_refresh(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 13
+    server_id = 105
+    file_id = "d" * 32
+    aes_key = b"syntheticAESkey1"
+    xor_key = 0xD4
+    payload = b"\xff\xd8\xff\xe0" + (b"delayed-image" * 120) + b"\xff\xd9"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    _write_message_database(
+        decrypted,
+        f'<msg><img originsourcemd5="{content_md5}" hdlength="{len(payload)}"/></msg>',
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    hardlink = decrypted / "hardlink" / "hardlink.db"
+    delayed_database = hardlink.read_bytes()
+    hardlink.unlink()
+    source = (
+        account
+        / "msg"
+        / "attach"
+        / hashlib.md5(USERNAME.encode("utf-8")).hexdigest()
+        / "2024-08"
+        / "Img"
+        / f"{file_id}_h.dat"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_encrypt_v2_image(payload, aes_key, xor_key))
+    key_file = tmp_path / "private-image-key.json"
+    key_file.write_text(
+        json.dumps({"version": 1, "aes_key": aes_key.decode("ascii"), "xor_key": xor_key}),
+        encoding="utf-8",
+    )
+    refresh_calls: list[str] = []
+
+    def refresh_decrypted() -> None:
+        refresh_calls.append("refresh")
+        if len(refresh_calls) == 2:
+            hardlink.write_bytes(delayed_database)
+
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        key_file,
+        tmp_path / "scoped-image-keys",
+        refresh_decrypted=refresh_decrypted,
+        image_index_wait_seconds=0.2,
+        image_index_poll_interval_seconds=0.01,
+        image_index_refresh_interval_seconds=0.01,
+    )
+    destination = tmp_path / "delayed-image.partial"
+
+    source_kind = resolver.materialize(
+        _attachment(
+            kind="image",
+            local_id=local_id,
+            server_id=server_id,
+            size=len(payload),
+            content_md5=content_md5,
+        ),
+        destination,
+    )
+
+    assert refresh_calls == ["refresh", "refresh"]
+    assert source_kind == "wechat_v2_image_dat"
+    assert destination.read_bytes() == payload
+
+
+def test_v2_image_reports_waiting_after_bounded_refresh(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 14
+    server_id = 106
+    file_id = "e" * 32
+    content_md5 = hashlib.md5(b"not-materialized").hexdigest()
+    _write_message_database(
+        decrypted,
+        f'<msg><img originsourcemd5="{content_md5}" hdlength="128"/></msg>',
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=128,
+    )
+    connection = sqlite3.connect(decrypted / "hardlink" / "hardlink.db")
+    try:
+        connection.execute("DELETE FROM image_hardlink_info_v4")
+        connection.commit()
+    finally:
+        connection.close()
+    refresh_calls: list[str] = []
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        refresh_decrypted=lambda: refresh_calls.append("refresh"),
+        image_index_wait_seconds=0.03,
+        image_index_poll_interval_seconds=0.01,
+    )
+    destination = tmp_path / "missing-image.partial"
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(
+            _attachment(
+                kind="image",
+                local_id=local_id,
+                server_id=server_id,
+                size=128,
+                content_md5=content_md5,
+            ),
+            destination,
+        )
+
+    assert refresh_calls == ["refresh"]
+    assert raised.value.code == "ATTACHMENT_IMAGE_WAITING"
+    assert not destination.exists()
+
+
+def test_image_index_temporarily_unavailable_is_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver, _, _, _ = _resolver(tmp_path)
+    resolver.image_index_wait_seconds = 0.1
+    resolver.image_index_poll_interval_seconds = 0.01
+    attempts: list[int] = []
+
+    def image_index(_attachment: object, _username: str) -> list[tuple[str, str, int]]:
+        attempts.append(len(attempts) + 1)
+        if len(attempts) < 3:
+            raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引不可用")
+        return [("synthetic.dat", "a" * 32, 128)]
+
+    monkeypatch.setattr(resolver, "_image_index", image_index)
+
+    indexed = resolver._image_index_with_wait({}, USERNAME)
+
+    assert indexed == [("synthetic.dat", "a" * 32, 128)]
+    assert len(attempts) == 3
+
+
 def test_v2_image_returns_exact_hardlink_preview_without_claiming_original(tmp_path: Path) -> None:
     _, ledger, decrypted, account = _resolver(tmp_path)
     local_id = 12

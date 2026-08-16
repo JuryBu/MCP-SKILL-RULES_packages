@@ -5,6 +5,7 @@
 ## 当前能力
 
 - route 表示一个由 `ownerAccountKey + username + chat_type` 精确识别的微信会话；显示标题不参与身份判定。
+- private binding 可按 route 登记当前账号的 `ownerSenderUsername`。消息作者命中该精确身份时一律按 self-sent/outbound 静默入账；数据库方向不可信时只隔离入账，不向 subscription fan-out。
 - 新账号只在私有 enrollment 明确给出当前 owner identity 哈希后才允许短时扫描图片密钥；账号不明或与 route 不符时保持 `WAITING_FOR_KEY`，不会覆盖其他账号缓存。
 - route 与 Codex conversation 是 M:N。每个 subscription 只属于一个 `(route_id, conversation_id, generation)`，事件按 route 只入账一次，再向所有 active subscription 独立投递。
 - 每个 subscription 有独立 pending、wake、ACK、暂停、关闭和能力策略；一个订阅 ACK 不影响其它订阅。
@@ -15,7 +16,7 @@
 
 ## 微信监听路线
 
-微信 4.1+ 使用 SQLCipher 4 加密本地数据库。本项目调用本机私有层提供的密钥工具，只读解密数据库副本，再轮询获准 route 的消息表。`DbWatcher` 只在完整轮询成功后推进文件快照，`DbObserver` 使用连续基线和 `source_fingerprint` 避免漏读与重复入账。
+微信 4.1+ 使用 SQLCipher 4 加密本地数据库。本项目调用本机私有层提供的密钥工具，只读解密数据库副本，再轮询获准 route 的消息表。`DbWatcher` 只在完整轮询成功后推进文件快照，`DbObserver` 使用连续基线和 `source_fingerprint` 避免漏读与重复入账。方向判定优先使用 private binding 中已验证的 owner sender identity；只有可信 `inbound` 才建立 delivery，`unknown` 保留在账本中供诊断但不会唤醒 Codex。
 
 ## MCP 工具分组
 
@@ -34,6 +35,8 @@
 `wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。微信 V2 普通图片按 owner account identity 分区使用本机私有 key；旧无归属 key 只有通过精确 DAT 的大小、MD5 和格式验证后才会迁入该账号。解密后的 wxgf 原件完整保留，HEVC 只在私有派生目录中用无窗口 ffmpeg 转成可视 PNG。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终记录 SHA-256；XLSX 只下载原件，不自动分页。
 
 当当前账号没有通过目标 DAT 验证的 key 时，普通图片读取返回 `ATTACHMENT_IMAGE_KEY_WAITING`。适配器只允许在一条新图片事件到达后的短窗口执行有截止时间的只读 Weixin 进程扫描；平时不常驻高频盲扫，也不通过点击、窗口消息或可见预览触发 key。`wechat_capture_visible_image_preview` 仍是单独的人工辅助降级：只有用户已手动打开目标查看器并提供确认引用时才可调用，不能替代原件下载，也不能把预览哈希冒充原件哈希。
+
+若图片事件已经入账但 hardlink 索引尚未到达，按需读取会先触发一次无 UI 的 watcher 刷新，并在固定时间预算内等待解密索引出现。`hardlink/hardlink.db` 的单独变化也会触发解密；超时后返回 `ATTACHMENT_IMAGE_WAITING` 并保留同一 `attachment_ref`，不会要求用户缩放、截图或重复发送。微信客户端尚未物化任何原件/预览时，MCP 不能凭空生成原件；此时只允许稍后重试或显式使用独立的低打扰/人工辅助降级，不能把视窗预览冒充原件。
 
 若微信后台只落盘了与该消息精确 hardlink 绑定的本地预览，而事件声明的原件仍不可用，读取工具可以返回该预览，但响应必须标记 `quality=preview`、`matches_event_original=false`，同时保留事件声明的原件大小与 MD5；预览自身仍须通过 hardlink 大小与 MD5 校验，不能被描述为原件。
 

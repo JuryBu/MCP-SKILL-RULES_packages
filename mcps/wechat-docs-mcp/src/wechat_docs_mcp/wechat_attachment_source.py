@@ -6,8 +6,9 @@ import os
 import re
 import sqlite3
 import struct
+import time
 import xml.etree.ElementTree as ET
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ ATTACHMENT_CDN_HOSTS = {"vweixinf.tc.qq.com"}
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 IMAGE_KEY_EVENT_SCAN_WINDOW_SECONDS = 120
 IMAGE_KEY_SCAN_TIMEOUT_SECONDS = 15
+IMAGE_INDEX_WAIT_SECONDS = 20.0
+IMAGE_INDEX_POLL_INTERVAL_SECONDS = 1.0
+IMAGE_INDEX_REFRESH_INTERVAL_SECONDS = 2.0
 
 
 def _md5(path: Path) -> str:
@@ -55,6 +59,10 @@ class WechatAttachmentSourceResolver:
         image_key_root: str | Path | None = None,
         image_key_scanner: ImageKeyScanner | None = None,
         active_owner_account_key_sha256: str | None = None,
+        refresh_decrypted: Callable[[], None] | None = None,
+        image_index_wait_seconds: float = IMAGE_INDEX_WAIT_SECONDS,
+        image_index_poll_interval_seconds: float = IMAGE_INDEX_POLL_INTERVAL_SECONDS,
+        image_index_refresh_interval_seconds: float = IMAGE_INDEX_REFRESH_INTERVAL_SECONDS,
     ) -> None:
         self.ledger = ledger
         self.binding = binding
@@ -82,6 +90,16 @@ class WechatAttachmentSourceResolver:
                 "当前微信账号作用域不是有效的 SHA-256",
             )
         self.active_owner_account_key_sha256 = active_owner_scope
+        self.refresh_decrypted = refresh_decrypted
+        self.image_index_wait_seconds = max(0.0, float(image_index_wait_seconds))
+        self.image_index_poll_interval_seconds = max(
+            0.01,
+            float(image_index_poll_interval_seconds),
+        )
+        self.image_index_refresh_interval_seconds = max(
+            0.01,
+            float(image_index_refresh_interval_seconds),
+        )
 
     @staticmethod
     def _message_xml(content: str) -> ET.Element:
@@ -204,7 +222,9 @@ class WechatAttachmentSourceResolver:
         self._validate_expected(attachment, size=expected_size, content_md5=content_md5)
 
         database = self.decrypted_dir / "emoticon" / "emoticon.db"
-        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
+        connection = sqlite3.connect(
+            f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1
+        )
         try:
             rows = connection.execute(
                 "SELECT cdn_url FROM kNonStoreEmoticonTable WHERE lower(md5)=?",
@@ -254,9 +274,12 @@ class WechatAttachmentSourceResolver:
 
     def _image_index(self, attachment: Mapping[str, Any], username: str) -> list[tuple[str, str, int]]:
         path = self.decrypted_dir / "message" / "message_resource.db"
-        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
+        connection: sqlite3.Connection | None = None
         try:
+            connection = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1
+            )
+            connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
                 SELECT info.packed_info
@@ -272,15 +295,19 @@ class WechatAttachmentSourceResolver:
         except sqlite3.OperationalError as error:
             raise LedgerError("ATTACHMENT_IMAGE_INDEX", "图片资源数据库不可用") from error
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
         if len(rows) != 1:
             raise LedgerError("ATTACHMENT_IMAGE_INDEX", "无法唯一定位图片资源索引")
         file_id = self._image_file_id(rows[0]["packed_info"])
 
         database = self.decrypted_dir / "hardlink" / "hardlink.db"
-        connection = sqlite3.connect(f"{database.resolve().as_uri()}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
+        connection = None
         try:
+            connection = sqlite3.connect(
+                f"{database.resolve().as_uri()}?mode=ro", uri=True, timeout=0.1
+            )
+            connection.row_factory = sqlite3.Row
             indexed = connection.execute(
                 """
                 SELECT md5,file_name,file_size FROM image_hardlink_info_v4
@@ -302,7 +329,8 @@ class WechatAttachmentSourceResolver:
         except sqlite3.OperationalError as error:
             raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引不可用") from error
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
         if not indexed:
             raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引不存在")
         rows = [
@@ -312,6 +340,60 @@ class WechatAttachmentSourceResolver:
         if len({row[0] for row in rows}) != len(rows):
             raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引存在歧义")
         return rows
+
+    @staticmethod
+    def _image_index_pending(error: LedgerError) -> bool:
+        detail = str(error)
+        if error.code == "ATTACHMENT_IMAGE_HARDLINK":
+            return "不存在" in detail or "不可用" in detail
+        return error.code == "ATTACHMENT_IMAGE_INDEX" and "不可用" in detail
+
+    def _image_index_with_wait(
+        self,
+        attachment: Mapping[str, Any],
+        username: str,
+    ) -> list[tuple[str, str, int]]:
+        try:
+            return self._image_index(attachment, username)
+        except LedgerError as error:
+            if not self._image_index_pending(error) or self.image_index_wait_seconds <= 0:
+                raise
+            last_error = error
+
+        deadline = time.monotonic() + self.image_index_wait_seconds
+        next_refresh = time.monotonic()
+        refresh_failures = 0
+        while True:
+            now = time.monotonic()
+            if (
+                self.refresh_decrypted is not None
+                and now >= next_refresh
+                and now < deadline
+            ):
+                try:
+                    self.refresh_decrypted()
+                except Exception:
+                    refresh_failures += 1
+                next_refresh = (
+                    time.monotonic() + self.image_index_refresh_interval_seconds
+                )
+            try:
+                return self._image_index(attachment, username)
+            except LedgerError as error:
+                if not self._image_index_pending(error):
+                    raise
+                last_error = error
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.image_index_poll_interval_seconds, remaining))
+
+        detail = "，本轮数据库刷新存在失败" if refresh_failures else ""
+        raise LedgerError(
+            "ATTACHMENT_IMAGE_WAITING",
+            "微信图片原件在有界等待后仍未物化"
+            f"{detail}；保留 attachment_ref 稍后重试，不应要求用户缩放或截图",
+        ) from last_error
 
     @staticmethod
     def _decrypt_v2_image(data: bytes, aes_key: bytes, xor_key: int) -> bytes:
@@ -439,7 +521,7 @@ class WechatAttachmentSourceResolver:
         destination: Path,
     ) -> str:
         username, owner_account_key_sha256 = self._verified_identity(attachment)
-        indexed = self._image_index(attachment, username)
+        indexed = self._image_index_with_wait(attachment, username)
         expected_event_size = attachment.get("byte_count")
         expected_event_md5 = str(attachment.get("content_md5") or "").casefold()
         available = [
