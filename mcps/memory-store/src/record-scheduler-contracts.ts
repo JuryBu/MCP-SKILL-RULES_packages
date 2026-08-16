@@ -778,7 +778,6 @@ function isCompleteSourceSnapshot(source: RecordSourceSnapshot | undefined): sou
         && source.contentHash.length > 0
         && source.contentRef.hash === source.contentHash
         && source.contentRef.byteLength >= 0
-        && source.readRange.startRound <= 1
         && source.readRange.endRound >= source.readRange.totalRounds
         && source.gaps.length === 0;
 }

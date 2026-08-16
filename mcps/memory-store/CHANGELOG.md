@@ -3,6 +3,7 @@
 ## [1.23.2] - 2026-08-16
 
 - 修复 Record scheduler 在 DSH 增量 Record 更新中把尾部完整读取的 source snapshot 误判为不完整的问题；`Preparing + frozen + selected=1/materialized=0` 的合法中间态现在可继续 materialize 到 `Succeeded`，不再触发 `invalid_current_ledger`。
+- 修正发布层版本常量与刷新提交资格：`dist` 重新构建后启动日志显示 v1.23.2，Record source refresh 同样接受已读到当前尾部且无 gaps 的增量 source snapshot，不再要求从第 1 轮开始。
 
 ## [1.23.1] - 2026-08-16
 

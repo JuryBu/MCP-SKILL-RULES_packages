@@ -725,6 +725,11 @@ assert.throws(() => contracts.assertSnapshotRevision(snapshotRevision, { ...snap
 const validLedger = makeLedger();
 assert.equal(contracts.isCurrentRecordSchedulerLedger(validLedger), true);
 assert.equal(contracts.evaluateRecordSuccess(validLedger, "commit-1").success, true);
+const incrementalSuccessLedger = makeLedger();
+incrementalSuccessLedger.sourceSnapshots[0].readRange = { startRound: 10, endRound: 15, totalRounds: 15 };
+assert.equal(contracts.readRecordSchedulerLedger(incrementalSuccessLedger).kind, "current");
+assert.equal(contracts.evaluateRecordSuccess(incrementalSuccessLedger, "commit-1").success, true);
+assert.equal(contracts.canReportSchedulerLedgerSuccess(incrementalSuccessLedger), true);
 const forceFreshSuccessLedger = makeLedger();
 forceFreshSuccessLedger.candidateSnapshot.requestMode = "force";
 forceFreshSuccessLedger.candidateSnapshot.candidates[0].state = "Fresh";

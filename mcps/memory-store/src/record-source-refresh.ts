@@ -573,7 +573,6 @@ function isCommitEligibleSnapshot(snapshot: ImmutableRecordSourceSnapshot): bool
         && snapshot.complete
         && snapshot.gaps.length === 0
         && snapshot.parseWarnings.length === 0
-        && snapshot.readRange.startRound <= 1
         && snapshot.readRange.endRound >= snapshot.readRange.totalRounds;
 }
 
