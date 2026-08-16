@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.23.2] - 2026-08-16
+
+- 修复 Record scheduler 在 DSH 增量 Record 更新中把尾部完整读取的 source snapshot 误判为不完整的问题；`Preparing + frozen + selected=1/materialized=0` 的合法中间态现在可继续 materialize 到 `Succeeded`，不再触发 `invalid_current_ledger`。
+
 ## [1.23.1] - 2026-08-16
 
 - 修复 DSH 数百/数千个无 Frame Content Size 的拼接 Zstd 小帧在 Node v24 同步逐帧解压时产生异常内部分配的问题；改用受输出上限约束的逐帧纯 JavaScript 解码和 WASM xxHash 校验，保留 live trailing frame、packed rows 与 fail-closed 语义，并提升 reader revision 使旧缓存自动失效。
@@ -37,7 +41,7 @@
 
 ### Verification
 
-- 使用超大真实 Codex 对话脱敏重放：heartbeat 被折叠进短系统事件，用户视图无 heartbeat，完整人类消息聚类未发现其它自动注入残留。
+- 使用约 575MB、123281 steps 的真实 Codex 对话重放：原 step 122825 的 heartbeat 被折叠进短系统事件，用户视图无 heartbeat，完整人类消息聚类未发现其它自动注入残留。
 
 ## [1.22.7] - 2026-08-12
 

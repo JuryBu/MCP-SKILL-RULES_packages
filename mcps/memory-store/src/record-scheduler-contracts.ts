@@ -1032,6 +1032,23 @@ export interface AttemptDispatchBarrier {
     nowMs?: number;
 }
 
+function hasCompleteExecutionSourceBoundary(
+    ledger: RecordSchedulerLedger,
+    enumeration: RecordSchedulerLedger["candidateSnapshot"]["enumerations"][number] | undefined,
+): boolean {
+    if (enumeration !== undefined
+        && enumeration.complete
+        && enumeration.paginationExhausted
+        && !enumeration.truncated
+        && !enumeration.error) return true;
+    const resolution = ledger.task.sourceResolution;
+    return resolution?.phase === "materialized"
+        && resolution.selectedCount !== null
+        && resolution.selectedCount === resolution.materializedCount
+        && resolution.unresolvedCount === 0
+        && resolution.issues.length === 0;
+}
+
 export function isAttemptDispatchAllowed(barrier: AttemptDispatchBarrier): boolean {
     const { ledger } = barrier;
     if (!isCurrentRecordSchedulerLedger(ledger)) return false;
@@ -1061,11 +1078,7 @@ export function isAttemptDispatchAllowed(barrier: AttemptDispatchBarrier): boole
         && candidate.evidence.length > 0
         && isCompleteSourceSnapshot(source)
         && isSourceSnapshotMaterializationAccepted(ledger, source)
-        && enumeration !== undefined
-        && enumeration.complete
-        && enumeration.paginationExhausted
-        && !enumeration.truncated
-        && !enumeration.error
+        && hasCompleteExecutionSourceBoundary(ledger, enumeration)
         && work !== undefined
         && work.activeTaskIds.includes(ledger.task.taskId)
         && Date.parse(work.leaseExpiresAt) > nowMs
@@ -1603,7 +1616,6 @@ function isValidSourceSnapshot(value: unknown): value is RecordSourceSnapshot {
         && isStringArray(value.parseWarnings)
         && isOptionalString(value.eventWatermark)
         && (!value.complete || (value.sourceRevision === value.desiredRevision
-            && value.readRange.startRound <= 1
             && value.readRange.endRound >= value.readRange.totalRounds
             && value.gaps.length === 0));
 }
@@ -2014,11 +2026,7 @@ export function isRecordSchedulerLedgerGraphConsistent(ledger: RecordSchedulerLe
         if (["Queued", "Running", "WaitingRetry", "ResultReady", "Committing"].includes(unit.state)
             && (!isCandidateSelectedForExecution(ledger.candidateSnapshot, candidate)
                 || candidate.evidence.length === 0
-                || enumeration === undefined
-                || !enumeration.complete
-                || !enumeration.paginationExhausted
-                || enumeration.truncated
-                || Boolean(enumeration.error)
+                || !hasCompleteExecutionSourceBoundary(ledger, enumeration)
                 || !isCompleteSourceSnapshot(source))) return false;
         if (unit.dependencies.some(dependency => dependency === unit.unitId || !units.has(dependency))) return false;
         if (unit.promptRecipe !== undefined) {
