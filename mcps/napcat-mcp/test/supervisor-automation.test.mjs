@@ -165,6 +165,18 @@ test("后台启动脚本在 PATH 缺少 node 时回退到受管服务清单", ()
   }
 });
 
+test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置时的旧启动方式", () => {
+  const loginScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url)), "utf8");
+  const supervisorScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), "utf8");
+  assert.match(loginScript, /\$RuntimeConfiguration\.qqExePath/);
+  assert.match(loginScript, /NapCatWinBootMain\.exe/);
+  assert.match(loginScript, /NapCatWinBootHook\.dll/);
+  assert.match(loginScript, /\$Launcher/);
+  assert.match(loginScript, /\$BootMain/);
+  assert.match(supervisorScript, /\$RuntimeConfiguration\.qqExePath/);
+  assert.match(supervisorScript, /"--qq-exe-path"/);
+});
+
 test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-supervisor-manifest-test-"));
   const codeRoot = path.join(root, "code-root");

@@ -28,6 +28,7 @@ const CLI_OPTIONS = new Set([
   "broker-start-script",
   "login-script",
   "napcat-root",
+  "qq-exe-path",
   "probe-timeout-ms",
   "login-timeout-ms",
   "login-cooldown-ms",
@@ -434,6 +435,7 @@ export function parseArguments(argv) {
     brokerStartScriptPath: resolveOptionalPath(values["broker-start-script"]),
     loginScriptPath: resolveOptionalPath(values["login-script"]),
     napcatRoot: resolveOptionalPath(values["napcat-root"]),
+    qqExePath: resolveOptionalPath(values["qq-exe-path"]),
     once: values.once === true,
   };
 }
@@ -511,6 +513,9 @@ export function buildQuickLoginArguments(options = {}) {
     "-NapCatRoot",
     resolveRequiredPath(options.napcatRoot, "napcatRoot"),
   ];
+  if (options.qqExePath) {
+    argumentsList.push("-QqExePath", resolveRequiredPath(options.qqExePath, "qqExePath"));
+  }
   if (options.codexHome) {
     argumentsList.push("-CodexHome", resolveRequiredPath(options.codexHome, "codexHome"));
   }
@@ -727,11 +732,13 @@ export function normalizeNapCatStatus(value) {
 export function checkNapCatRuntime(options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const napcatRoot = resolveOptionalPath(options.napcatRoot);
+  const qqExePath = resolveOptionalPath(options.qqExePath);
   if (!napcatRoot) {
     return {
       known: false,
       ready: false,
       napcatRoot: null,
+      qqExePath,
       requiredFiles: [],
       missingFiles: [],
       error: {
@@ -741,15 +748,22 @@ export function checkNapCatRuntime(options = {}) {
       },
     };
   }
-  const requiredFiles = [
-    path.join(napcatRoot, "launcher-user.bat"),
-    path.join(napcatRoot, "napcat.mjs"),
-  ];
+  const requiredFiles = [path.join(napcatRoot, "napcat.mjs")];
+  if (qqExePath) {
+    requiredFiles.push(
+      qqExePath,
+      path.join(napcatRoot, "NapCatWinBootMain.exe"),
+      path.join(napcatRoot, "NapCatWinBootHook.dll"),
+    );
+  } else {
+    requiredFiles.push(path.join(napcatRoot, "launcher-user.bat"));
+  }
   const missingFiles = requiredFiles.filter((filePath) => !fileExists(filePath, fsImpl));
   return {
     known: true,
     ready: missingFiles.length === 0,
     napcatRoot,
+    qqExePath,
     requiredFiles,
     missingFiles,
     error: missingFiles.length > 0
@@ -768,6 +782,7 @@ export function normalizeNapCatRuntime(value) {
     known: value?.known !== false && ready !== null,
     ready: ready === true,
     napcatRoot: value?.napcatRoot ?? null,
+    qqExePath: value?.qqExePath ?? null,
     requiredFiles: Array.isArray(value?.requiredFiles) ? value.requiredFiles : [],
     missingFiles: Array.isArray(value?.missingFiles) ? value.missingFiles : [],
     error: value?.error ?? null,
@@ -904,6 +919,7 @@ export function createSupervisorDependencies(options = {}) {
     brokerStartScriptPath: resolveOptionalPath(options.brokerStartScriptPath ?? options["broker-start-script"]),
     loginScriptPath: resolveOptionalPath(options.loginScriptPath ?? options["login-script"]),
     napcatRoot: resolveOptionalPath(options.napcatRoot ?? options["napcat-root"]),
+    qqExePath: resolveOptionalPath(options.qqExePath ?? options["qq-exe-path"]),
     notifier,
     registry,
     routerController,
@@ -1185,7 +1201,8 @@ export async function runSupervisorService(options = {}) {
         ...input,
         ...options,
         loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
-        napcatRoot: options.napcatRoot,
+        napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+        qqExePath: options.qqExePath ?? dependencies.qqExePath,
         codexHome: dependencies.codexHome,
         timeoutMs: loginTimeoutMs,
       })
@@ -1262,7 +1279,11 @@ export async function runSupervisorService(options = {}) {
 
       const napcatRuntime = normalizeNapCatRuntime(await capture(
         checkRuntime,
-        { napcatRoot: options.napcatRoot ?? dependencies.napcatRoot, fsImpl },
+        {
+          napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+          qqExePath: options.qqExePath ?? dependencies.qqExePath,
+          fsImpl,
+        },
         { known: false, ready: false, requiredFiles: [], missingFiles: [] },
       ));
       if (napcatRuntime.error) errors.push({ source: "napcat_runtime", error: napcatRuntime.error });
@@ -1381,7 +1402,8 @@ export async function runSupervisorService(options = {}) {
         try {
           await runLogin({
             loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
-            napcatRoot: options.napcatRoot,
+            napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+            qqExePath: options.qqExePath ?? dependencies.qqExePath,
             bindingPath,
             privateEnvPath,
             noQr: true,

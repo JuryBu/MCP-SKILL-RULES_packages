@@ -1,6 +1,7 @@
 ﻿[CmdletBinding()]
 param(
   [string]$NapCatRoot = "",
+  [string]$QqExePath = "",
   [string]$DataRoot = "",
   [string]$BrokerRoot = "",
   [string]$CodexHome = "",
@@ -25,24 +26,45 @@ if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
   }
 }
 $DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $BrokerRoot
+$RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
+$RuntimeConfiguration = $null
+if (Test-Path -LiteralPath $RuntimeStateFile) {
+  try { $RuntimeConfiguration = Get-Content -LiteralPath $RuntimeStateFile -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $RuntimeConfiguration = $null }
+}
 if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
-  $RuntimeStateFile = Join-Path $DataRoot "napcat-runtime.json"
-  if (Test-Path -LiteralPath $RuntimeStateFile) {
-    try { $NapCatRoot = [string](Get-Content -LiteralPath $RuntimeStateFile -Raw -Encoding UTF8 | ConvertFrom-Json).napCatRoot } catch { $NapCatRoot = "" }
-  }
+  if ($null -ne $RuntimeConfiguration) { $NapCatRoot = [string]$RuntimeConfiguration.napCatRoot }
   if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
     $NapCatRoot = Join-Path ([Environment]::GetFolderPath([Environment+SpecialFolder]::Desktop)) "NapCat"
   }
 }
+if ([string]::IsNullOrWhiteSpace($QqExePath) -and $null -ne $RuntimeConfiguration) {
+  $QqExePath = [string]$RuntimeConfiguration.qqExePath
+}
+$NapCatRoot = [System.IO.Path]::GetFullPath($NapCatRoot)
+if (-not [string]::IsNullOrWhiteSpace($QqExePath)) {
+  if (-not [System.IO.Path]::IsPathRooted($QqExePath)) { throw "qqExePath 必须是绝对路径：$QqExePath" }
+  $QqExePath = [System.IO.Path]::GetFullPath($QqExePath)
+}
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
 $CoreModule = Join-Path $NapCatRoot "napcat.mjs"
+$BootMain = Join-Path $NapCatRoot "NapCatWinBootMain.exe"
+$HookModule = Join-Path $NapCatRoot "NapCatWinBootHook.dll"
+$LoaderModule = Join-Path $NapCatRoot "loadNapCat.js"
 $QrCodePath = Join-Path $NapCatRoot "cache\qrcode.png"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
 $BindingPath = Join-Path $DataRoot "binding.json"
 $LogDirectory = Join-Path $NapCatRoot "logs"
-if (-not (Test-Path -LiteralPath $Launcher)) { throw "找不到 NapCat launcher：$Launcher" }
 if (-not (Test-Path -LiteralPath $CoreModule -PathType Leaf)) {
   throw "[NAPCAT_RUNTIME_INCOMPLETE] NapCat 核心模块缺失：$CoreModule。可能被安全软件隔离或安装损坏，这不表示快速登录授权已过期。"
+}
+if ([string]::IsNullOrWhiteSpace($QqExePath)) {
+  if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) { throw "找不到 NapCat launcher：$Launcher" }
+} else {
+  foreach ($RequiredPath in @($QqExePath, $BootMain, $HookModule)) {
+    if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
+      throw "[NAPCAT_RUNTIME_INCOMPLETE] 独立 QQ 运行文件缺失：$RequiredPath"
+    }
+  }
 }
 if (-not (Test-Path -LiteralPath $PrivateEnvPath)) { throw "找不到 broker 私密环境：$PrivateEnvPath" }
 if (-not (Test-Path -LiteralPath $BindingPath)) { throw "找不到 NapCat binding：$BindingPath" }
@@ -159,7 +181,14 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
 } elseif ($NoQr) {
   throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
 }
-$CommandLine = "$env:ComSpec /d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+if ([string]::IsNullOrWhiteSpace($QqExePath)) {
+  $CommandLine = "$env:ComSpec /d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+} else {
+  $CoreUri = ([Uri]$CoreModule).AbsoluteUri
+  $LoaderSource = "(async () => {await import(`"$CoreUri`")})()"
+  [System.IO.File]::WriteAllText($LoaderModule, $LoaderSource, (New-Object System.Text.UTF8Encoding($false)))
+  $CommandLine = "$env:ComSpec /d /c `"`"$BootMain`" `"$QqExePath`" `"$HookModule`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+}
 $CreateResult = $ProcessClass.Create($CommandLine, $NapCatRoot, $StartupInfo)
 if ([int]$CreateResult.ReturnValue -ne 0 -or [int]$CreateResult.ProcessId -le 0) {
   throw "NapCat 无窗口进程启动失败，WMI returnValue=$($CreateResult.ReturnValue)"

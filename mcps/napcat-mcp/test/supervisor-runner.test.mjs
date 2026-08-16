@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   atomicWriteJson,
   buildQuickLoginArguments,
+  checkNapCatRuntime,
   createSupervisorDependencies,
   findBrokerProcesses,
   findCodexProcesses,
@@ -30,6 +31,7 @@ function createFixture() {
     brokerStartScriptPath: path.join(root, "start-broker.ps1"),
     loginScriptPath: path.join(root, "login.ps1"),
     napcatRoot: path.join(root, "NapCat"),
+    qqExePath: path.join(root, "QQ", "QQ.exe"),
   };
   fs.writeFileSync(fixture.bindingPath, JSON.stringify({
     expectedSelfId: "1000000001",
@@ -99,12 +101,14 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
       "--broker-start-script", fixture.brokerStartScriptPath,
       "--login-script", fixture.loginScriptPath,
       "--napcat-root", fixture.napcatRoot,
+      "--qq-exe-path", fixture.qqExePath,
     ]);
     assert.equal(parsed.scanIntervalMs, 30000);
     assert.equal(parsed.brokerHealthUrl, "http://127.0.0.1:14588/health");
     assert.equal(parsed.privateEnvPath, path.resolve(fixture.privateEnvPath));
     assert.equal(parsed.loginScriptPath, path.resolve(fixture.loginScriptPath));
     assert.equal(parsed.napcatRoot, path.resolve(fixture.napcatRoot));
+    assert.equal(parsed.qqExePath, path.resolve(fixture.qqExePath));
     assert.throws(() => parseArguments(["--binding", fixture.bindingPath]), /缺少参数 --registry/);
     assert.throws(() => parseArguments([
       "--binding", fixture.bindingPath,
@@ -126,11 +130,14 @@ test("quick-login 参数固定带 -NoQr、短 timeout 和 NapCat 根目录", () 
   try {
     const argumentsList = buildQuickLoginArguments({
       napcatRoot: fixture.napcatRoot,
+      qqExePath: fixture.qqExePath,
       timeoutMs: 35_000,
       codexHome: fixture.root,
     });
     assert.deepEqual(argumentsList.slice(0, 4), ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot"]);
     assert.equal(argumentsList.includes("-Qr"), false);
+    const qqPathIndex = argumentsList.indexOf("-QqExePath");
+    assert.equal(argumentsList[qqPathIndex + 1], path.resolve(fixture.qqExePath));
     assert.equal(argumentsList.at(-1), path.resolve(fixture.root));
   } finally {
     fixture.cleanup();
@@ -144,6 +151,7 @@ test("quick-login 给登录脚本保留清理隐藏进程的超时余量", async
     await runQuickLogin({
       loginScriptPath: fixture.loginScriptPath,
       napcatRoot: fixture.napcatRoot,
+      qqExePath: fixture.qqExePath,
       timeoutMs: 35_000,
       execFileImpl(executable, argumentsList, options, callback) {
         calls.push({ executable, argumentsList, options });
@@ -153,9 +161,40 @@ test("quick-login 给登录脚本保留清理隐藏进程的超时余量", async
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeout, 50_000);
     assert.deepEqual(
-      calls[0].argumentsList.slice(-5),
-      ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot", path.resolve(fixture.napcatRoot)],
+      calls[0].argumentsList.slice(-7),
+      ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot", path.resolve(fixture.napcatRoot), "-QqExePath", path.resolve(fixture.qqExePath)],
     );
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("独立 QQ 路径会纳入运行完整性检查，旧配置仍保持兼容", () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(fixture.napcatRoot, { recursive: true });
+    fs.writeFileSync(path.join(fixture.napcatRoot, "launcher-user.bat"), "@echo off", "utf8");
+    fs.writeFileSync(path.join(fixture.napcatRoot, "napcat.mjs"), "", "utf8");
+    assert.equal(checkNapCatRuntime({ napcatRoot: fixture.napcatRoot }).ready, true);
+
+    const missingPinnedRuntime = checkNapCatRuntime({
+      napcatRoot: fixture.napcatRoot,
+      qqExePath: fixture.qqExePath,
+    });
+    assert.equal(missingPinnedRuntime.ready, false);
+    assert.equal(missingPinnedRuntime.missingFiles.includes(path.resolve(fixture.qqExePath)), true);
+
+    fs.mkdirSync(path.dirname(fixture.qqExePath), { recursive: true });
+    fs.writeFileSync(fixture.qqExePath, "", "utf8");
+    fs.writeFileSync(path.join(fixture.napcatRoot, "NapCatWinBootMain.exe"), "", "utf8");
+    fs.writeFileSync(path.join(fixture.napcatRoot, "NapCatWinBootHook.dll"), "", "utf8");
+    fs.unlinkSync(path.join(fixture.napcatRoot, "launcher-user.bat"));
+    assert.equal(checkNapCatRuntime({
+      napcatRoot: fixture.napcatRoot,
+      qqExePath: fixture.qqExePath,
+    }).ready, true);
+
+    assert.equal(checkNapCatRuntime({ napcatRoot: fixture.napcatRoot }).ready, false);
   } finally {
     fixture.cleanup();
   }
