@@ -2,7 +2,10 @@
 param(
   [string]$DataRoot = "",
   [ValidateRange(1, 65535)][int]$Port = 18435,
-  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 60,
+  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 30,
+  [ValidateRange(1, 300)][int]$ProgressIdleTimeoutSeconds = 20,
+  [ValidateRange(10, 600)][int]$CompactionAttemptTimeoutSeconds = 150,
+  [ValidateRange(1, 20)][int]$MaxConsecutiveAttempts = 6,
   [ValidateRange(1, 256)][int]$MaxBufferedRequestMiB = 64,
   [string]$UpstreamOrigin = "https://chatgpt.com",
   [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10
@@ -77,6 +80,9 @@ $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_STATE_ROOT"] = $StateRoot
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_PORT"] = [string]$Port
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN"] = $UpstreamOrigin
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS"] = [string]($FirstProgressTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS"] = [string]($ProgressIdleTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS"] = [string]($CompactionAttemptTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS"] = [string]$MaxConsecutiveAttempts
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES"] = [string]($MaxBufferedRequestMiB * 1024 * 1024)
 $Process = [System.Diagnostics.Process]::new()
 $Process.StartInfo = $Info
@@ -101,4 +107,7 @@ if ($null -eq $Health -or $Health.ok -ne $true) { throw "Model stream proxy did 
   endpoint = "http://127.0.0.1:$Port"
   node = $NodePath
   firstProgressTimeoutSeconds = $FirstProgressTimeoutSeconds
+  progressIdleTimeoutSeconds = $ProgressIdleTimeoutSeconds
+  compactionAttemptTimeoutSeconds = $CompactionAttemptTimeoutSeconds
+  maxConsecutiveAttempts = $MaxConsecutiveAttempts
 } | ConvertTo-Json -Depth 5
