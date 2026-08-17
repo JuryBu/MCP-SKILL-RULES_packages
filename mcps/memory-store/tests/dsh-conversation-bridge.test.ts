@@ -118,6 +118,24 @@ async function run(): Promise<void> {
             () => loadConversationData("dsh", sessionId, { source: "ls" }),
             /source=ls 不支持 dsh/u,
         );
+
+        const shellDirectory = path.join(root, "--workspace--", "session-shell");
+        await mkdir(shellDirectory, { recursive: true });
+        const shellId = "session-756f9ff7-ed9c-4b71-8e3d-1532409c0441";
+        await writeFile(path.join(shellDirectory, "session.jsonl"), [
+            line({ type: "session", version: 0, id: shellId, cwd: "C:\\\\workspace", createdAt: "2026-08-17T12:57:00.000Z" }),
+            line({ type: "permission/preset", seq: 1, time: "2026-08-17T12:57:01.000Z", data: { preset: "default" } }),
+            line({ type: "sandbox/mode", seq: 2, time: "2026-08-17T12:57:02.000Z", data: { mode: "workspace-write" } }),
+            line({ type: "approval/policy", seq: 3, time: "2026-08-17T12:57:03.000Z", data: { policy: "on-request" } }),
+            line({ type: "session/end-seed", seq: 4, time: "2026-08-17T12:57:04.000Z", data: { ok: true } }),
+            line({ type: "agent-preset/selected", seq: 5, time: "2026-08-17T12:57:05.000Z", data: { preset: "standard" } }),
+        ].join(""), "utf8");
+        await assert.rejects(
+            () => loadConversationData("dsh", shellId, { source: "local", refresh: true }),
+            /没有可读对话正文/u,
+        );
+        const shellCached = await loadConversationData("dsh", shellId, { source: "cache" });
+        assert.equal(shellCached, null);
     } finally {
         resetConversationSourceCacheForTests();
         if (previousRoot === undefined) delete process.env.MEMORY_STORE_DSH_SESSIONS_ROOT;

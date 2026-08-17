@@ -134,6 +134,24 @@ function countConversationOverview(rounds: ConversationRound[]): { aiResponseCou
     return { aiResponseCount, toolCallCount };
 }
 
+function hasConversationVisibleBody(rounds: ConversationRound[]): boolean {
+    return rounds.some(round =>
+        (round.userMessages || []).some(message => message.text.trim().length > 0)
+        || round.aiResponses.some(response => response.response.trim().length > 0)
+        || round.toolCalls.length > 0
+    );
+}
+
+function assertDshReadableBody(rounds: ConversationRound[], conversationId: string, sourcePath?: string): void {
+    if (hasConversationVisibleBody(rounds)) return;
+    throw new Error([
+        `DSH session ${conversationId} 没有可读对话正文：源文件只包含 session seed/config/preset 等元数据，未发现 user/message 或 assistant/message 正文。`,
+        "Memory Store 拒绝发布空壳 fetch 缓存，避免把稀疏系统事件冒充为成功对话。",
+        "若 DSH UI 将该 ID 展示为可读对话，说明正文可能位于关联 session/分支；当前 Memory Store 尚未获得可验证关联契约。",
+        sourcePath ? `source=${sourcePath}` : "",
+    ].filter(Boolean).join(" "));
+}
+
 function compactConversationCacheSnapshot(loaded: CachedConversationLoadResult): CachedConversationLoadResult {
     const compactionMetadata = loaded.compactionMetadata
         || buildConversationCompactionMetadata(loaded.chainUsed, loaded.rounds);
@@ -921,6 +939,9 @@ function hydrateConversationCache(
         });
     if (options.includeRounds !== false && !roundResult) return null;
     const rounds = roundResult ? roundResult.rounds : [];
+    if (snapshot.chainUsed === "dsh") {
+        assertDshReadableBody(rounds, snapshot.conversationId, snapshot.dshData?.provenance.sourcePath);
+    }
     const roundCount = roundResult?.roundCount || cachedRoundCount || snapshot.roundCount || snapshot.rounds.length;
     const { cacheAuthority: _cacheAuthority, ...snapshotData } = snapshot;
     const loaded: ConversationLoadResult = {
@@ -1103,6 +1124,7 @@ async function loadRawConversationData(
         const read = await readDshSession(effectiveId);
         const converted = normalizeDshSessionReadResult(read);
         const rounds = converted.rounds;
+        assertDshReadableBody(rounds, effectiveId, read.provenance.sourcePath);
         const lastEvent = read.events.at(-1);
         const lastSequence = typeof lastEvent?.seq === "number" ? lastEvent.seq : null;
         return {

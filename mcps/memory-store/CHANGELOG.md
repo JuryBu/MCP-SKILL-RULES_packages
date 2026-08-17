@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.23.4] - 2026-08-17
+
+- DSH seed-only / empty-shell session（只含 session、permission、sandbox、approval、preset 等元数据，没有 user/assistant 正文）不再发布为成功 fetch 缓存；local 与旧 cache 命中都会明确报“没有可读对话正文”，避免把稀疏系统事件冒充成 1 个成功 round。
+
 ## [1.23.3] - 2026-08-16
 
 - 修复 Record scheduler 在只读取尾部增量窗口时，把 `rounds.length` 当作全会话总轮数传给写入校验，导致已覆盖 15/15 轮的合法候选被误拒为“只覆盖到第 6 轮”的问题；写入校验、生成参数和 metadata 现在统一使用 frozen source snapshot 的 `sourceTotalRounds`。
