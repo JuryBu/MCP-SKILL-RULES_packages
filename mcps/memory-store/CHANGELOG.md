@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.23.5] - 2026-08-17
+
+- 修复 DSH fetch 缓存的元数据读取误触发空壳正文校验：`record_manage(update)` 冻结缓存 generation 时可使用 `includeRounds=false`，真正空壳仍在原始源进入缓存前拒绝。
+
 ## [1.23.4] - 2026-08-17
 
 - DSH seed-only / empty-shell session（只含 session、permission、sandbox、approval、preset 等元数据，没有 user/assistant 正文）不再发布为成功 fetch 缓存；local 与旧 cache 命中都会明确报“没有可读对话正文”，避免把稀疏系统事件冒充成 1 个成功 round。

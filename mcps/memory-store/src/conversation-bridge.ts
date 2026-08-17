@@ -939,7 +939,7 @@ function hydrateConversationCache(
         });
     if (options.includeRounds !== false && !roundResult) return null;
     const rounds = roundResult ? roundResult.rounds : [];
-    if (snapshot.chainUsed === "dsh") {
+    if (snapshot.chainUsed === "dsh" && options.includeRounds !== false) {
         assertDshReadableBody(rounds, snapshot.conversationId, snapshot.dshData?.provenance.sourcePath);
     }
     const roundCount = roundResult?.roundCount || cachedRoundCount || snapshot.roundCount || snapshot.rounds.length;

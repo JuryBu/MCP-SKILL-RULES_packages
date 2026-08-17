@@ -108,6 +108,12 @@ async function run(): Promise<void> {
         assert.equal(cached.cacheGeneration, first.cacheGeneration);
         assert.deepEqual(cached.rounds[0].userMessages?.map(item => item.text), ["真人问题"]);
 
+        const metadataOnly = await loadConversationData("dsh", sessionId, { source: "auto", includeRounds: false });
+        assert.ok(metadataOnly);
+        assert.equal(metadataOnly.cacheGeneration, first.cacheGeneration);
+        assert.equal(metadataOnly.roundCount, 1);
+        assert.deepEqual(metadataOnly.rounds, []);
+
         await appendFile(sourcePath, line(messageEvent(4, "user", "追加的人类消息")), "utf8");
         const refreshed = await loadConversationData("dsh", sessionId, { source: "local", refresh: true });
         assert.ok(refreshed);
