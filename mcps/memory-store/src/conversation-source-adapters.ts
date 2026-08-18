@@ -2,12 +2,14 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import type { ConversationAttachment } from "./conversation-attachments.js";
 import {
     LocalPbReaderError,
     readLocalPbFileCandidate,
     type LocalPbCandidateKind,
     type LocalPbErrorCode,
     type LocalPbFileCandidate,
+    type LocalPbPlannerResponse,
     type LocalPbReadResult,
     type LocalPbStep,
     type LocalPbSourceFlavor,
@@ -127,6 +129,56 @@ function toolVariantText(step: LocalPbStep): string {
     })).join("\n");
 }
 
+function estimateLocalPbBase64Bytes(base64: string): number {
+    const clean = base64.replace(/\s+/gu, "");
+    return Math.max(0, Math.floor((clean.length * 3) / 4) - (clean.endsWith("==") ? 2 : clean.endsWith("=") ? 1 : 0));
+}
+
+function localPbImageMimeFromBase64(base64: string): string | null {
+    const clean = base64.replace(/\s+/gu, "");
+    if (clean.startsWith("iVBORw0KGgo")) return "image/png";
+    if (clean.startsWith("/9j/")) return "image/jpeg";
+    if (clean.startsWith("R0lGOD")) return "image/gif";
+    if (clean.startsWith("UklGR")) return "image/webp";
+    return null;
+}
+
+function localPbAttachmentExtension(mimeType: string): string {
+    switch (mimeType) {
+        case "image/jpeg": return ".jpg";
+        case "image/gif": return ".gif";
+        case "image/webp": return ".webp";
+        case "image/png":
+        default: return ".png";
+    }
+}
+
+function projectLocalPbUserText(text: string, stepIndex: number): { text: string; attachments: ConversationAttachment[] } {
+    const trimmed = text.trim();
+    const dataUrlMatch = /^data:(image\/[a-z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/isu.exec(trimmed);
+    const encoded = dataUrlMatch ? dataUrlMatch[2] : trimmed;
+    const compact = encoded.replace(/\s+/gu, "");
+    const mimeType = dataUrlMatch?.[1]?.toLowerCase() || localPbImageMimeFromBase64(compact);
+    if (!mimeType || compact.length < 512) return { text, attachments: [] };
+    const sizeBytes = estimateLocalPbBase64Bytes(compact);
+    const sha256 = createHash("sha256").update(compact, "utf8").digest("hex");
+    const name = `local-pb-step-${stepIndex}-inline-image${localPbAttachmentExtension(mimeType)}`;
+    const placeholder = `[WSF/Antigravity local PB inline image base64 omitted: ${mimeType}, ${sizeBytes} bytes, sha256=${sha256.slice(0, 12)}…]`;
+    return {
+        text: placeholder,
+        attachments: [{
+            kind: "image",
+            source: "local-pb-inline-base64",
+            name,
+            mimeType,
+            sizeBytes,
+            sha256,
+            stepIndex,
+            warning: "Inline image base64 was omitted from conversation text to avoid context pollution",
+        }],
+    };
+}
+
 export function localPbResultToRounds(result: LocalPbReadResult): ConversationRound[] {
     const rounds: ConversationRound[] = [];
     let current: ConversationRound | null = null;
@@ -143,6 +195,7 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
             endStep: stepIndex,
             userMessage: "(无显式用户消息)",
             mediaAttachments: [],
+            attachments: [],
             aiResponses: [],
             toolCalls: [],
             taskBoundaries: [],
@@ -161,10 +214,14 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
             const hasModelActivity = Boolean(activeRound && (activeRound.aiResponses.length || activeRound.toolCalls.length || activeRound.semanticEvents?.some(event => event.semanticRole !== "user")));
             if (hasModelActivity) pushCurrent();
             const round = ensureCurrent(stepIndex);
-            const message = { stepIndex, text: step.user, rawRole: "local_pb.field_19", semanticRole: "user" as const, mediaAttachments: [] };
+            const projectedUser = projectLocalPbUserText(step.user, stepIndex);
+            const message = { stepIndex, text: projectedUser.text, rawRole: "local_pb.field_19", semanticRole: "user" as const, mediaAttachments: [], attachments: projectedUser.attachments };
+            if (projectedUser.attachments.length) {
+                round.attachments = [...(round.attachments || []), ...projectedUser.attachments];
+            }
             round.userMessages = [...(round.userMessages || []), message];
             round.userMessage = round.userMessages.map(item => item.text).join("\n\n");
-            round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_19", semanticRole: "user", kind: "message", text: step.user });
+            round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_19", semanticRole: "user", kind: "message", text: projectedUser.text, attachments: projectedUser.attachments });
             round.endStep = stepIndex;
         }
         const round = ensureCurrent(stepIndex);
@@ -180,28 +237,82 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
         if (step.system) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_114", semanticRole: "system", kind: "system", text: step.system });
         if (step.timestamp?.iso) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.timestamp", semanticRole: "system", kind: "timestamp", text: step.timestamp.iso });
         if (step.planner) {
-            const response = step.planner.modifiedResponse || step.planner.response || "";
-            round.aiResponses.push({ stepIndex, response, thinking: step.planner.thinking || "", toolCalls: [] });
-            if (step.planner.response && step.planner.modifiedResponse && step.planner.response !== step.planner.modifiedResponse) {
-                round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "draft_response", text: step.planner.response });
+            const projected = projectLocalPbPlanner(step.planner);
+            round.aiResponses.push({ stepIndex, response: projected.response, thinking: projected.thinking, toolCalls: [] });
+            if (projected.draftResponse) {
+                round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "draft_response", text: projected.draftResponse });
             }
-            round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "response", text: response });
+            if (projected.thinking) {
+                round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "thinking", text: projected.thinking });
+            }
+            round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_20", semanticRole: "model", kind: "response", text: projected.response });
         }
         if (step.toolVariants.length) {
             for (const variant of step.toolVariants) {
-                round.toolCalls.push({
+                round.semanticEvents?.push({
                     stepIndex,
-                    name: `local_pb.${variant.variantName}`,
-                    argsSummary: JSON.stringify(variant.rawSubfields).slice(0, 120),
-                    resultSummary: "wire-level PB variant retained without cross-host semantic guessing",
+                    rawRole: variant.variantName,
+                    semanticRole: "system",
+                    kind: "pb_wire_variant",
+                    name: variant.variantName,
+                    resultSummary: toolVariantText(step),
+                    text: "wire-level PB variant retained without cross-host semantic guessing",
                 });
-                round.semanticEvents?.push({ stepIndex, rawRole: variant.variantName, semanticRole: "tool", kind: "tool", name: variant.variantName, resultSummary: toolVariantText(step) });
             }
         }
         round.endStep = stepIndex;
     }
     pushCurrent();
     return mergeConsecutiveHumanRounds(rounds);
+}
+
+function projectLocalPbPlanner(planner: LocalPbPlannerResponse): {
+    response: string;
+    thinking: string;
+    draftResponse?: string;
+} {
+    const response = planner.response || "";
+    const thinking = planner.thinking || "";
+    const modified = planner.modifiedResponse || "";
+    const responseLooksLikeThinking = Boolean(response && looksLikeLocalPbReasoningOnly(response));
+    const modifiedLooksLikeThinking = Boolean(modified && looksLikeLocalPbReasoningOnly(modified));
+    const visibleResponse = response && !responseLooksLikeThinking
+        ? response
+        : (modified && !modifiedLooksLikeThinking ? modified : "");
+    const thinkingParts = [thinking]
+        .concat(response && response !== visibleResponse && responseLooksLikeThinking ? [response] : [])
+        .concat(modified && modified !== visibleResponse && (modifiedLooksLikeThinking || !thinking) ? [modified] : [])
+        .filter(Boolean);
+    const uniqueThinking = [...new Set(thinkingParts)];
+    return {
+        response: visibleResponse,
+        thinking: uniqueThinking.join("\n\n"),
+        ...(response && modified && visibleResponse && response !== visibleResponse ? { draftResponse: response } : {}),
+    };
+}
+
+function looksLikeLocalPbReasoningOnly(text: string): boolean {
+    const normalized = text.trim();
+    if (!normalized) return false;
+    const reasoningPrefixes = [
+        "The user",
+        "User",
+        "I need",
+        "I should",
+        "Let me",
+        "Now I",
+        "We need",
+        "用户想",
+        "用户要求",
+        "用户问",
+        "用户让我",
+        "让我",
+        "我需要",
+        "我先",
+        "我来",
+        "我应该",
+    ];
+    return reasoningPrefixes.some(prefix => normalized.startsWith(prefix));
 }
 
 function localPbCandidateFailure(candidate: LocalPbDiscoveredCandidate, error: unknown): LocalPbCandidateDiagnostic {
@@ -251,26 +362,113 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
     };
 }
 
-function canonicalRound(round: ConversationRound): string {
-    return JSON.stringify({
+type ConversationCompletenessRelation = "equal" | "local_contains_live" | "live_contains_local" | "conflict";
+
+function canonicalRound(round: ConversationRound): { userMessages: string[]; modelMessages: string[]; hasAttachments: boolean } {
+    return {
         userMessages: (round.userMessages?.length ? round.userMessages.map(message => message.text) : [round.userMessage])
-            .map(text => text.trim())
+            .map(canonicalComparableText)
             .filter(Boolean),
-        modelResponses: round.aiResponses
-            .map(response => ({ response: response.response.trim(), thinking: response.thinking.trim() }))
-            .filter(response => response.response || response.thinking),
-    });
+        modelMessages: round.aiResponses
+            .map(response => [response.response, response.thinking]
+                .map(canonicalComparableText)
+                .filter(Boolean)
+                .join(" "))
+            .filter(Boolean),
+        hasAttachments: Boolean(
+            round.attachments?.length
+            || round.mediaAttachments?.length
+            || round.userMessages?.some(message => message.attachments?.length || message.mediaAttachments?.length),
+        ),
+    };
+}
+
+function canonicalComparableText(text: string): string {
+    const trimmed = text.trim();
+    if (/^\[WSF\/Antigravity local PB inline image base64 omitted:[^\]\n]+\]$/u.test(trimmed)) {
+        return "";
+    }
+    return trimmed
+        .replace(/\[([^\]\n]+)\]\(cci:[^)]+\)/gu, "$1")
+        .replace(/`([^`\n]+)`/gu, "$1")
+        .replace(/@([a-zA-Z]:[\\/][^\s，。；、)）\]]+)/gu, "$1")
+        .replace(/[\\/]+/gu, "/")
+        .replace(/\s+/gu, " ")
+        .trim();
 }
 
 export function compareConversationRoundCompleteness(
     localRounds: ConversationRound[],
     liveRounds: ConversationRound[],
-): "equal" | "local_contains_live" | "live_contains_local" | "conflict" {
+): ConversationCompletenessRelation {
     const local = localRounds.map(canonicalRound);
     const live = liveRounds.map(canonicalRound);
-    const prefix = (shorter: string[], longer: string[]) => shorter.every((value, index) => value === longer[index]);
-    if (local.length === live.length && prefix(local, live)) return "equal";
-    if (live.length < local.length && prefix(live, local)) return "local_contains_live";
-    if (local.length < live.length && prefix(local, live)) return "live_contains_local";
+    let relation: ConversationCompletenessRelation = "equal";
+    for (let index = 0; index < Math.min(local.length, live.length); index += 1) {
+        const roundRelation = compareCanonicalRounds(local[index], live[index]);
+        relation = mergeCompletenessRelation(relation, roundRelation);
+        if (relation === "conflict") return "conflict";
+    }
+    if (local.length > live.length) return mergeCompletenessRelation(relation, "local_contains_live");
+    if (live.length > local.length) return mergeCompletenessRelation(relation, "live_contains_local");
+    return relation;
+}
+
+function compareCanonicalRounds(
+    local: { userMessages: string[]; modelMessages: string[]; hasAttachments: boolean },
+    live: { userMessages: string[]; modelMessages: string[]; hasAttachments: boolean },
+): ConversationCompletenessRelation {
+    if (!equivalentUserMessages(local, live)) return "conflict";
+    if (sameSequence(local.modelMessages, live.modelMessages)) return "equal";
+    if (isMessageSubsequence(local.modelMessages, live.modelMessages)) return "live_contains_local";
+    if (isMessageSubsequence(live.modelMessages, local.modelMessages)) return "local_contains_live";
+    const localModelText = local.modelMessages.join(" ");
+    const liveModelText = live.modelMessages.join(" ");
+    if (localModelText === liveModelText) return "equal";
+    if (!localModelText && liveModelText) return "live_contains_local";
+    if (!liveModelText && localModelText) return "local_contains_live";
+    if (liveModelText.includes(localModelText)) return "live_contains_local";
+    if (localModelText.includes(liveModelText)) return "local_contains_live";
+    return "conflict";
+}
+
+function sameSequence(left: string[], right: string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function equivalentUserMessages(
+    local: { userMessages: string[]; hasAttachments: boolean },
+    live: { userMessages: string[]; hasAttachments: boolean },
+): boolean {
+    if (sameSequence(local.userMessages, live.userMessages)) return true;
+    if (isAttachmentSentinelOnly(local.userMessages) && live.userMessages.length === 0 && live.hasAttachments) return true;
+    if (isAttachmentSentinelOnly(live.userMessages) && local.userMessages.length === 0 && local.hasAttachments) return true;
+    return false;
+}
+
+function isAttachmentSentinelOnly(messages: string[]): boolean {
+    return messages.length === 1 && messages[0] === "markdown";
+}
+
+function isMessageSubsequence(shorter: string[], longer: string[]): boolean {
+    if (shorter.length === 0) return true;
+    let cursor = 0;
+    for (const value of shorter) {
+        while (cursor < longer.length && longer[cursor] !== value && !longer[cursor].includes(value)) {
+            cursor += 1;
+        }
+        if (cursor >= longer.length) return false;
+        cursor += 1;
+    }
+    return true;
+}
+
+function mergeCompletenessRelation(
+    current: ConversationCompletenessRelation,
+    next: ConversationCompletenessRelation,
+): ConversationCompletenessRelation {
+    if (current === "conflict" || next === "conflict") return "conflict";
+    if (current === "equal") return next;
+    if (next === "equal" || current === next) return current;
     return "conflict";
 }

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.23.6] - 2026-08-18
+
+- 修复 Windsurf/Antigravity 本地 PB 与 LS 读取同一对话时的语义比较：PB 的 reasoning-only planner 字段不再冒充 AI 正文，CCI 链接与路径表现差异会规范化比较，auto 能正确选择完整可用来源。
+- 修复本地 PB wire variant 被统计成工具调用的问题；PB 诊断字段保留为 `pb_wire_variant` 系统事件，不再污染 `toolCallCount`，内容相同且 LS 可用时优先保留 LS 的真实工具名。
+- `record_manage(update/batch_update/bulk_update)` 新增 `source=auto|local|ls|cache` 并透传到冻结 fetch 缓存阶段，避免 WSF/Antigravity Record 无法像 `conversation_read_original` 一样选择原始来源。
+- 本地 PB 内联图片 base64 会折叠为附件占位符和 SHA-256 元数据，不再把整段图片数据注入 read/search/export 文本。
+
 ## [1.23.5] - 2026-08-17
 
 - 修复 DSH fetch 缓存的元数据读取误触发空壳正文校验：`record_manage(update)` 冻结缓存 generation 时可使用 `includeRounds=false`，真正空壳仍在原始源进入缓存前拒绝。

@@ -76,6 +76,7 @@ import {
     type ConversationLoadResult,
     type ResolvedConversationChain,
 } from "../conversation-bridge.js";
+import type { ConversationRawSource } from "../conversation-source-adapters.js";
 import type { ConversationRound, ConversationUserMessage } from "../trajectory.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
@@ -196,6 +197,8 @@ const RecordSourceCacheReferenceSchema = z.object({
     cacheReadStartRound: z.number().int().min(1).optional(),
 });
 
+const ConversationRawSourceSchema = z.enum(["auto", "local", "ls", "cache"]);
+
 const RecordUpdateResumePayloadSchema = z.object({
     kind: z.literal("record-update"),
     conversationId: z.string().min(1),
@@ -206,6 +209,7 @@ const RecordUpdateResumePayloadSchema = z.object({
     parallelMode: z.enum(RECORD_RESUME_PARALLEL_MODES).optional(),
     force: z.boolean().optional(),
     logicalChain: z.enum(RECORD_RESUME_LOGICAL_CHAINS).optional(),
+    source: ConversationRawSourceSchema.optional(),
     sourceCacheReference: RecordSourceCacheReferenceSchema.optional(),
 });
 
@@ -247,6 +251,7 @@ const RecordBatchResumeBaseSchema = z.object({
     modelChain: z.enum(RECORD_RESUME_MODEL_CHAINS),
     force: z.boolean().optional(),
     stale_only: z.boolean().optional(),
+    source: ConversationRawSourceSchema.optional(),
 });
 
 const LegacyRecordBatchResumeBaseSchema = RecordBatchResumeBaseSchema.extend({
@@ -385,6 +390,7 @@ function normalizeRecordBatchReadyPayload(payload: {
     modelChain: Chain;
     force?: boolean;
     stale_only?: boolean;
+    source?: ConversationRawSource;
     diagnostics?: RecordBatchCandidateDiagnostics;
     candidates: unknown[];
 }): RecordBatchReadyResumePayload {
@@ -1591,6 +1597,8 @@ action:
                 .describe("[update] 实验性 Record 并行管线：off=关闭(默认)，auto=高密对话自动启用，force=能切出多批时强制启用"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
                 .describe("[update] Claude Code Record 更新：off=只用指定物理 ID；auto=强证据时合并逻辑续聊链，默认 claude-code 使用 auto"),
+            source: ConversationRawSourceSchema.default("auto")
+                .describe("[update/batch_update/bulk_update] 原始对话来源：auto=自动比较 PB/LS/本地源，local=只读本地 JSONL/PB/DSH，ls=只读 LS，cache=只用最新 fetch 缓存"),
             taskId: z.string().optional()
                 .describe("[task_status/cancel/recover] 后台任务 ID"),
             chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
@@ -1634,6 +1642,7 @@ action:
                             args.parallelMode,
                             args.force,
                             args.logicalChain as ConversationLogicalChainMode | undefined,
+                            args.source as ConversationRawSource | undefined,
                             startMs,
                             decision.useBackground,
                             decision.auto,
@@ -1797,6 +1806,7 @@ export const __recordConcurrencyTest = {
                 onProgress?: (progress: BackgroundTaskProgress) => void;
                 isCancelled?: () => boolean;
                 isSettled?: () => boolean;
+                source?: ConversationRawSource;
             };
         },
     ) {
@@ -1822,6 +1832,7 @@ export const __recordConcurrencyTest = {
         parallelMode?: RecordParallelMode;
         force?: boolean;
         logicalChain?: ConversationLogicalChainMode;
+        source?: ConversationRawSource;
     }): Promise<RecordUpdateResumePayload | null> {
         return buildRecordUpdateResumePayload(
             args.workspaceHash,
@@ -1832,6 +1843,7 @@ export const __recordConcurrencyTest = {
             args.parallelMode,
             args.force,
             args.logicalChain,
+            args.source,
         );
     },
     async runBatchUpdate(
@@ -1843,6 +1855,7 @@ export const __recordConcurrencyTest = {
             dataChain: DataChain;
             modelChain: Chain;
             force?: boolean;
+            source?: ConversationRawSource;
             candidates: Array<{ id: string; workspace: string }>;
         },
         options: {
@@ -2670,6 +2683,7 @@ async function handleUpdate(
         isSettled?: () => boolean;
         frozenSource?: FrozenRuntimeSource;
         schedulerExecution?: RecordSchedulerExecutionContext;
+        source?: ConversationRawSource;
     } = {},
 ) {
     const preflightAbort = buildRecordTaskAbortResponse(startMs, options, "开始加载对话前检查到任务已终止");
@@ -2692,6 +2706,7 @@ async function handleUpdate(
                 link: "summary",
                 logicalChain: effectiveLogicalChain,
                 requestClass: options.background ? "background" : "foreground",
+                source: options.source || "auto",
             });
         if (!loaded) return rt(`❌ 无法通过 dataChain=${dataChain} 获取对话数据`, startMs);
         if (loaded.windsurfData?.partial) {
@@ -2973,6 +2988,7 @@ async function buildRecordUpdateResumePayload(
     parallelMode: RecordParallelMode | undefined,
     force: boolean | undefined,
     logicalChain: ConversationLogicalChainMode | undefined,
+    source: ConversationRawSource | undefined,
     sourceCacheReference?: ProductionSourceCacheReference,
 ): Promise<RecordUpdateResumePayload | null> {
     const resolvedChain = await resolveConversationChain(dataChain);
@@ -2991,7 +3007,7 @@ async function buildRecordUpdateResumePayload(
             link: "summary",
             logicalChain: logicalChain || (resolvedChain === "claude-code" ? "auto" : "off"),
             requestClass: "background",
-            source: "auto",
+            source: source || "auto",
             includeRounds: false,
         });
         if (!cachedSource?.cacheKey || !cachedSource.cacheGeneration) {
@@ -3061,6 +3077,7 @@ async function buildRecordUpdateResumePayload(
         ...(parallelMode ? { parallelMode } : {}),
         ...(force !== undefined ? { force } : {}),
         ...(logicalChain ? { logicalChain } : {}),
+        ...(source && source !== "auto" ? { source } : {}),
         ...(resolvedSourceCacheReference ? { sourceCacheReference: resolvedSourceCacheReference } : {}),
     };
 }
@@ -3074,6 +3091,7 @@ async function handleRecordSchedulerUpdate(
     parallelMode: RecordParallelMode | undefined,
     force: boolean | undefined,
     logicalChain: ConversationLogicalChainMode | undefined,
+    source: ConversationRawSource | undefined,
     startMs: number,
     background: boolean,
     autoBackground: boolean,
@@ -3089,6 +3107,7 @@ async function handleRecordSchedulerUpdate(
         parallelMode,
         force,
         logicalChain,
+        source,
         sourceCacheReference,
     );
     if (!resumePayload) {
@@ -3104,6 +3123,7 @@ async function handleRecordSchedulerUpdate(
         parallelMode: resumePayload.parallelMode || "off",
         force: resumePayload.force === true,
         logicalChain: resumePayload.logicalChain || "off",
+        source: resumePayload.source || "auto",
         sourceCacheReference: resumePayload.sourceCacheReference || null,
     };
     const runtime = getRecordSchedulerRuntime();
@@ -3224,6 +3244,7 @@ export async function admitRecordAutoUpdate(input: RecordAutoUpdateAdmissionInpu
         undefined,
         false,
         input.logicalChain,
+        undefined,
         Date.now(),
         true,
         true,
@@ -5341,6 +5362,7 @@ async function runRecordBatchUpdateFromPayload(
                         : await loadConversationData(payload.dataChain, candidate.id, {
                             link: "summary",
                             requestClass: "background",
+                            source: payload.source || "auto",
                         });
                     const fetchMs = Date.now() - startedAt;
                     if (!loaded) {
@@ -5657,7 +5679,7 @@ function schedulerLegacyBatchStateValidator(
 
 async function handleBatchUpdate(
     _hash: string,
-    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; stale_only?: boolean; workspace?: string; waitSeconds?: number; background?: boolean; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
+    args: { action?: string; after?: string; before?: string; limit?: number; force?: boolean; stale_only?: boolean; workspace?: string; waitSeconds?: number; background?: boolean; source?: ConversationRawSource; chain?: ChainInput | DataChainInput; dataChain?: DataChainInput; modelChain?: ChainInput },
     startMs: number,
 ) {
     await waitForRecordMutationReadiness();
@@ -5684,6 +5706,7 @@ async function handleBatchUpdate(
         modelChain: requestedModelChain,
         force: args.force === true,
         staleOnly: args.stale_only === true,
+        source: args.source || "auto",
         request,
     };
     const requestKey = recordSchedulerRequestKey("record-batch-update", requestSummary);
@@ -5696,6 +5719,7 @@ async function handleBatchUpdate(
         modelChain: requestedModelChain,
         ...(args.force !== undefined ? { force: args.force } : {}),
         ...(args.stale_only !== undefined ? { stale_only: args.stale_only } : {}),
+        ...(args.source && args.source !== "auto" ? { source: args.source } : {}),
         phase: "preparing",
         request,
     };

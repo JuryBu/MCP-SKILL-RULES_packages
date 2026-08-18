@@ -1086,7 +1086,7 @@ async function loadRawConversationData(
             if (relation === "conflict") {
                 throw new Error(`${resolved} 本地 PB 与 LS 内容冲突，拒绝盲目拼接`);
             }
-            const selected = relation === "live_contains_local" ? live : local;
+            const selected = relation === "local_contains_live" ? local : live;
             selected.sourceDiagnostics = [
                 ...(local.sourceDiagnostics || []),
                 ...(live.sourceDiagnostics || []),

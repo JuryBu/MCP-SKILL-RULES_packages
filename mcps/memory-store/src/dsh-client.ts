@@ -332,18 +332,37 @@ export function normalizeDshSessionEvents(
                 currentRound = newRound(rawRounds.length + 1, stepIndex);
             }
             const round = ensureRound(stepIndex);
-            const userMessage: ConversationUserMessage = { stepIndex, text: userText, rawRole: eventType, semanticRole: "user", mediaAttachments: projection.references };
+            const userMessage: ConversationUserMessage = {
+                stepIndex,
+                text: userText,
+                rawRole: eventType,
+                semanticRole: "user",
+                mediaAttachments: projection.references,
+            };
             round.userMessages?.push(userMessage);
             round.userMessage = (round.userMessages || []).map(item => item.text).filter(Boolean).join("\n\n");
             round.mediaAttachments.push(...projection.references);
             round.legacyRoundIndices?.push(round.legacyRoundIndices.length + 1);
-            appendSemanticEvent(stepIndex, { stepIndex, rawRole: eventType, semanticRole: "user", kind: "message", text: userText });
+            appendSemanticEvent(stepIndex, {
+                stepIndex,
+                rawRole: eventType,
+                semanticRole: "user",
+                kind: "message",
+                text: userText,
+            });
             return;
         }
         const sourceKind = getSourceKind(message) || "unknown";
         const rawText = projection.fullText || safeJson(message);
         const automation = projectConversationAutomationInput(rawText);
-        appendSemanticEvent(stepIndex, { stepIndex, rawRole: `${eventType}:${sourceKind}`, semanticRole: "system", kind: automation ? "automation_event" : `${sourceKind}_message`, text: automation ? renderConversationAutomationEvent(automation.event) : rawText, ...(automation ? { automation: automation.event } : {}) });
+        appendSemanticEvent(stepIndex, {
+            stepIndex,
+            rawRole: `${eventType}:${sourceKind}`,
+            semanticRole: "system",
+            kind: automation ? "automation_event" : `${sourceKind}_message`,
+            text: automation ? renderConversationAutomationEvent(automation.event) : rawText,
+            ...(automation ? { automation: automation.event } : {}),
+        });
     };
 
     const appendHeader = (): void => {
@@ -493,7 +512,15 @@ export function normalizeDshSessionEvents(
                 if (isHuman && messageId && canonicalHumanMessageIds.has(messageId)) continue;
                 appendMessage(eventIndex, `${eventType}:${asString(data.target) || "unknown"}`, message);
             }
-            if (inserted.length === 0) appendSemanticEvent(eventIndex, { stepIndex: eventIndex, rawRole: eventType, semanticRole: "system", kind: "inbox_splice", text: `DSH inbox splice | target=${asString(data.target) || "unknown"} | inserted=0 | removed=${String(data.removedCount ?? 0)}` });
+            if (inserted.length === 0) {
+                appendSemanticEvent(eventIndex, {
+                    stepIndex: eventIndex,
+                    rawRole: eventType,
+                    semanticRole: "system",
+                    kind: "inbox_splice",
+                    text: `DSH inbox splice | target=${asString(data.target) || "unknown"} | inserted=0 | removed=${String(data.removedCount ?? 0)}`,
+                });
+            }
             continue;
         }
         if (eventType === "user/message") {

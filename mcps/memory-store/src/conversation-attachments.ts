@@ -18,6 +18,7 @@ export type ConversationAttachmentSource =
     | "claude-code-local-file"
     | "windsurf-data-url"
     | "windsurf-media-attachment"
+    | "local-pb-inline-base64"
     | "attachment-metadata-redacted";
 
 export interface ConversationAttachment {
