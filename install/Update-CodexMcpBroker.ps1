@@ -27,6 +27,8 @@ $SourceBrokerRoot = [System.IO.Path]::GetFullPath($SourceBrokerRoot)
 $SourceBrokerPath = Join-Path $SourceBrokerRoot "broker.mjs"
 $SourceEndpointConfigPath = Join-Path $SourceBrokerRoot "endpoint-config.mjs"
 $SourceLifecyclePath = Join-Path $SourceBrokerRoot "request-lifecycle.mjs"
+$SourcePackagePath = Join-Path $SourceBrokerRoot "package.json"
+$SourcePackageLockPath = Join-Path $SourceBrokerRoot "package-lock.json"
 $SourceStopScript = Join-Path $InstallerRoot "Stop-CodexMcpBroker.ps1"
 $SourceStartScript = Join-Path $InstallerRoot "Start-CodexMcpBroker.ps1"
 $ConfiguredServiceManifestPath = if ($ServiceManifestPathWasBound) {
@@ -71,6 +73,8 @@ $BrokerRoot = [System.IO.Path]::GetFullPath($BrokerRoot)
 $InstalledBrokerPath = if ($ManagedBrokerPath) { $ManagedBrokerPath } else { Join-Path $BrokerRoot "broker.mjs" }
 $InstalledEndpointConfigPath = Join-Path $BrokerRoot "endpoint-config.mjs"
 $InstalledLifecyclePath = Join-Path $BrokerRoot "request-lifecycle.mjs"
+$InstalledPackagePath = Join-Path $BrokerRoot "package.json"
+$InstalledPackageLockPath = Join-Path $BrokerRoot "package-lock.json"
 $StopScript = if ($ManagedStopScript) { $ManagedStopScript } else { Join-Path $BrokerRoot "Stop-CodexMcpBroker.ps1" }
 $StartScript = if ($ManagedStartScript) { $ManagedStartScript } else { Join-Path $BrokerRoot "Start-CodexMcpBroker.ps1" }
 $HealthUrl = "http://127.0.0.1:$BrokerPort/health"
@@ -104,6 +108,18 @@ function Get-CanonicalExistingPath {
     $FullPath = Get-NormalizedFilePath -Path $Path
     $Item = Get-Item -LiteralPath $FullPath -Force -ErrorAction Stop
     return [System.IO.Path]::GetFullPath([string]$Item.FullName)
+}
+
+function Get-NpmCommand {
+    param([string]$NodeExe)
+    if (-not [string]::IsNullOrWhiteSpace($NodeExe) -and [System.IO.Path]::IsPathRooted($NodeExe)) {
+        $NodeDir = Split-Path -Parent $NodeExe
+        foreach ($Name in @("npm.cmd", "npm.exe", "npm")) {
+            $Candidate = Join-Path $NodeDir $Name
+            if (Test-Path -LiteralPath $Candidate -PathType Leaf) { return $Candidate }
+        }
+    }
+    return "npm"
 }
 
 function Get-CommandLineTokens {
@@ -481,8 +497,16 @@ foreach ($Path in $TaskRouterRuntimeStatePaths) {
     }
 }
 
-foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
+foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourcePackagePath, $SourcePackageLockPath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required file is missing: $Path" }
+}
+try {
+    $SourcePackage = Get-Content -LiteralPath $SourcePackagePath -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ([string]::IsNullOrWhiteSpace([string]$SourcePackage.dependencies.'@modelcontextprotocol/sdk')) {
+        throw "Source broker package.json must declare @modelcontextprotocol/sdk."
+    }
+} catch {
+    throw "Source broker package metadata validation failed: $($_.Exception.Message)"
 }
 if ($ManagedStartScript -and -not (Test-Path -LiteralPath $ManagedStartScript -PathType Leaf)) {
     throw "Managed broker start script is missing: $ManagedStartScript"
@@ -514,6 +538,7 @@ try {
     if ([System.IO.Path]::IsPathRooted($ValidationNodeExe) -and -not (Test-Path -LiteralPath $ValidationNodeExe -PathType Leaf)) {
         throw "Configured Node executable is missing: $ValidationNodeExe"
     }
+    $NpmCommand = Get-NpmCommand -NodeExe $ValidationNodeExe
     & $ValidationNodeExe --check $SourceBrokerPath
     if ($LASTEXITCODE -ne 0) { throw "Source broker syntax validation failed." }
     & $ValidationNodeExe --check $SourceEndpointConfigPath
@@ -540,6 +565,7 @@ if (-not $ShouldActivate) {
         serviceManifestPath = if ($ManagedStartScript) { $ConfiguredServiceManifestPath } else { $null }
         lifecycleBootstrap = $true
         endpointConfigBootstrap = -not (Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf)
+        packageBootstrap = -not (Test-Path -LiteralPath $InstalledPackagePath -PathType Leaf)
         protectedState = $ProtectedBefore
         taskRouterRuntimeState = @($TaskRouterBefore.Values)
     } | ConvertTo-Json -Depth 10
@@ -562,6 +588,10 @@ Copy-Item -LiteralPath $InstalledBrokerPath -Destination (Join-Path $BackupRoot 
 Copy-Item -LiteralPath $InstalledLifecyclePath -Destination (Join-Path $BackupRoot "request-lifecycle.mjs") -Force
 $InstalledEndpointConfigExisted = Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf
 if ($InstalledEndpointConfigExisted) { Copy-Item -LiteralPath $InstalledEndpointConfigPath -Destination (Join-Path $BackupRoot "endpoint-config.mjs") -Force }
+$InstalledPackageExisted = Test-Path -LiteralPath $InstalledPackagePath -PathType Leaf
+$InstalledPackageLockExisted = Test-Path -LiteralPath $InstalledPackageLockPath -PathType Leaf
+if ($InstalledPackageExisted) { Copy-Item -LiteralPath $InstalledPackagePath -Destination (Join-Path $BackupRoot "package.json") -Force }
+if ($InstalledPackageLockExisted) { Copy-Item -LiteralPath $InstalledPackageLockPath -Destination (Join-Path $BackupRoot "package-lock.json") -Force }
 $InstalledStartExisted = Test-Path -LiteralPath $StartScript -PathType Leaf
 $InstalledStopExisted = Test-Path -LiteralPath $StopScript -PathType Leaf
 if ($InstalledStartExisted) { Copy-Item -LiteralPath $StartScript -Destination (Join-Path $BackupRoot "Start-CodexMcpBroker.ps1") -Force }
@@ -570,6 +600,8 @@ if ($InstalledStopExisted) { Copy-Item -LiteralPath $StopScript -Destination (Jo
     installedStartExisted = $InstalledStartExisted
     installedStopExisted = $InstalledStopExisted
     installedEndpointConfigExisted = $InstalledEndpointConfigExisted
+    installedPackageExisted = $InstalledPackageExisted
+    installedPackageLockExisted = $InstalledPackageLockExisted
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BackupRoot "lifecycle-state.json") -Encoding UTF8
 
 $Activated = $false
@@ -584,6 +616,15 @@ try {
     Copy-Item -LiteralPath $SourceBrokerPath -Destination $InstalledBrokerPath -Force
     Copy-Item -LiteralPath $SourceEndpointConfigPath -Destination $InstalledEndpointConfigPath -Force
     Copy-Item -LiteralPath $SourceLifecyclePath -Destination $InstalledLifecyclePath -Force
+    Copy-Item -LiteralPath $SourcePackagePath -Destination $InstalledPackagePath -Force
+    Copy-Item -LiteralPath $SourcePackageLockPath -Destination $InstalledPackageLockPath -Force
+    Push-Location $BrokerRoot
+    try {
+        & $NpmCommand ci --omit=dev --ignore-scripts
+        if ($LASTEXITCODE -ne 0) { throw "Broker dependency installation failed." }
+    } finally {
+        Pop-Location
+    }
     if ((Get-FileHashOrNull -Path $InstalledBrokerPath) -ne (Get-FileHashOrNull -Path $SourceBrokerPath)) {
         throw "Installed broker hash does not match the validated source."
     }
@@ -592,6 +633,12 @@ try {
     }
     if ((Get-FileHashOrNull -Path $InstalledEndpointConfigPath) -ne (Get-FileHashOrNull -Path $SourceEndpointConfigPath)) {
         throw "Installed endpoint configuration hash does not match the validated source."
+    }
+    if ((Get-FileHashOrNull -Path $InstalledPackagePath) -ne (Get-FileHashOrNull -Path $SourcePackagePath)) {
+        throw "Installed broker package.json hash does not match the validated source."
+    }
+    if ((Get-FileHashOrNull -Path $InstalledPackageLockPath) -ne (Get-FileHashOrNull -Path $SourcePackageLockPath)) {
+        throw "Installed broker package-lock.json hash does not match the validated source."
     }
     $PreviousManagedNodeExe = [Environment]::GetEnvironmentVariable("CODEX_TOOLKIT_NODE_EXE", "Process")
     $CandidateStartOutput = @()
@@ -653,6 +700,7 @@ try {
         serviceManifestPath = if ($ManagedStartScript) { $ConfiguredServiceManifestPath } else { $null }
         lifecycleBootstrapped = (-not $InstalledStartExisted -or -not $InstalledStopExisted)
         endpointConfigBootstrapped = -not $InstalledEndpointConfigExisted
+        packageBootstrapped = (-not $InstalledPackageExisted -or -not $InstalledPackageLockExisted)
         endpoints = @($DeepHealth | ForEach-Object { [pscustomobject]@{ endpoint = $_.endpoint; toolCount = $_.toolCount; recovered = $_.recovered } })
         protectedState = $ProtectedBefore
         taskRouterRuntimeState = @($TaskRouterRuntimeStatePaths | ForEach-Object {
@@ -677,6 +725,16 @@ try {
                 Copy-Item -LiteralPath (Join-Path $BackupRoot "endpoint-config.mjs") -Destination $InstalledEndpointConfigPath -Force
             } else {
                 Remove-Item -LiteralPath $InstalledEndpointConfigPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($InstalledPackageExisted) {
+                Copy-Item -LiteralPath (Join-Path $BackupRoot "package.json") -Destination $InstalledPackagePath -Force
+            } else {
+                Remove-Item -LiteralPath $InstalledPackagePath -Force -ErrorAction SilentlyContinue
+            }
+            if ($InstalledPackageLockExisted) {
+                Copy-Item -LiteralPath (Join-Path $BackupRoot "package-lock.json") -Destination $InstalledPackageLockPath -Force
+            } else {
+                Remove-Item -LiteralPath $InstalledPackageLockPath -Force -ErrorAction SilentlyContinue
             }
         } catch { $RollbackErrors.Add("code restore: $($_.Exception.Message)") }
         try {

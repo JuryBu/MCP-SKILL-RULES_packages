@@ -9,39 +9,8 @@ import { fingerprintApiKey } from "../exa-key-pool.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const brokerRoot = path.resolve(__dirname, "..");
-const mcpRoot = path.resolve(brokerRoot, "..");
-const memoryStoreCandidates = [
-  process.env.MEMORY_STORE_MCP_ROOT,
-  path.join(mcpRoot, "memory-store"),
-  path.join(os.homedir(), ".gemini", "antigravity", "mcp-memory-store"),
-].filter(Boolean);
-const memoryStoreRoot = memoryStoreCandidates.find((candidate) =>
-  fs.existsSync(
-    path.join(
-      candidate,
-      "node_modules",
-      "@modelcontextprotocol",
-      "sdk",
-      "dist",
-      "esm",
-      "client",
-      "index.js",
-    ),
-  ),
-);
-
-if (!memoryStoreRoot) {
-  throw new Error("Exa bridge failover test requires an installed MCP SDK");
-}
-
-const sdkRoot = path.join(
-  memoryStoreRoot,
-  "node_modules",
-  "@modelcontextprotocol",
-  "sdk",
-  "dist",
-  "esm",
-);
+const sdkRoot = path.join(brokerRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
+assert.equal(fs.existsSync(path.join(sdkRoot, "client", "index.js")), true);
 const [{ Client }, { StdioClientTransport }] = await Promise.all([
   import(pathToFileURL(path.join(sdkRoot, "client", "index.js")).href),
   import(pathToFileURL(path.join(sdkRoot, "client", "stdio.js")).href),
@@ -100,7 +69,7 @@ test("bridge hides an MCP-body 402 and retries the call with the next key", asyn
     cwd: brokerRoot,
     env: {
       ...process.env,
-      MEMORY_STORE_MCP_ROOT: memoryStoreRoot,
+      MEMORY_STORE_MCP_ROOT: path.join(dataRoot, "missing-memory-store"),
       EXA_MCP_REMOTE_URL: `${remoteUrl}?exaApiKey=${quotaKey}`,
       EXA_MCP_REMOTE_BASE_URL: remoteUrl,
       EXA_MCP_API_KEYS: healthyKey,

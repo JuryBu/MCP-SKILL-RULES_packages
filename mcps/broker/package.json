@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "start": "node broker.mjs",
-    "check": "node --check broker.mjs && node --check endpoint-config.mjs && node --check request-lifecycle.mjs && node --check exa-key-pool.mjs && node --check exa-stateless-stdio.mjs && node --test test/endpoint-config.test.mjs test/request-lifecycle.test.mjs test/exa-key-pool.test.mjs test/exa-bridge-failover.test.mjs test/startup-probe-timeout.test.mjs && node test/request-timeout-smoke.mjs && node test/startup-smoke.mjs",
+    "check": "node --check broker.mjs && node --check endpoint-config.mjs && node --check request-lifecycle.mjs && node --check exa-key-pool.mjs && node --check exa-stateless-stdio.mjs && node --test test/endpoint-config.test.mjs test/request-lifecycle.test.mjs test/exa-key-pool.test.mjs test/exa-bridge-failover.test.mjs test/startup-probe-timeout.test.mjs test/startup-sdk-isolation.test.mjs && node test/request-timeout-smoke.mjs && node test/startup-smoke.mjs",
     "health": "npm run check"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1"
   }
 }

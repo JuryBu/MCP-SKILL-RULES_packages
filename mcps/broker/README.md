@@ -55,7 +55,7 @@ Exa stateless bridge:
 - HTTP 402/429/401/403 and matching MCP error bodies drive a persistent circuit breaker. Quota failures cool down for 24 hours with optional jitter, rate limits use a short cooldown, and expired entries receive one half-open probe.
 - Circuit-breaker state is persisted without URLs or credentials. The default path is `exa-key-pool-state.json` beside `CODEX_MCP_BROKER_STATE`; override it with `EXA_MCP_POOL_STATE_PATH`.
 - When no credential is eligible, `EXA_MCP_PUBLIC_FALLBACK_ENABLED=1` forwards the call to the same MCP URL without a credential.
-- The bridge uses the MCP SDK bundled with the portable `memory-store` package, returns a local fallback tool list when remote listing is disabled or unavailable, and retries transient network failures within its configured request deadline.
+- The bridge uses the MCP SDK declared by this broker package, returns a local fallback tool list when remote listing is disabled or unavailable, and retries transient network failures within its configured request deadline.
 - Configure pool behavior with `EXA_MCP_REMOTE_BASE_URL`, `EXA_MCP_API_KEYS`, `EXA_MCP_PUBLIC_FALLBACK_ENABLED`, `EXA_MCP_KEY_COOLDOWN_MS`, `EXA_MCP_KEY_COOLDOWN_JITTER_MS`, `EXA_MCP_RATE_LIMIT_COOLDOWN_MS`, and `EXA_MCP_POOL_STATE_PATH`.
 - Configure request behavior with `EXA_STATELESS_LIST_TIMEOUT_MS`, `EXA_STATELESS_CALL_TIMEOUT_MS`, `EXA_STATELESS_MAX_ATTEMPTS`, `EXA_STATELESS_CALL_MAX_ATTEMPTS`, `EXA_STATELESS_LIST_MAX_ATTEMPTS`, `EXA_STATELESS_RETRY_DELAY_MS`, and `EXA_STATELESS_REMOTE_TOOLS_LIST=1`.
 
@@ -85,7 +85,7 @@ Local secrets:
 
 Commands:
 
-- From each sibling MCP source package, install its declared dependencies before starting the broker. In particular, the Exa bridge loads `../memory-store/node_modules/@modelcontextprotocol/sdk`; run `npm install` in `../memory-store` first, then start this package with `npm start`. Direct startup stores logs and broker state under `%USERPROFILE%\.codex-toolkit\broker` unless `CODEX_TOOLKIT_DATA_ROOT`, `CODEX_MCP_BROKER_LOG`, or `CODEX_MCP_BROKER_STATE` overrides it.
+- Run `npm ci` in this broker package before starting it; the broker owns its MCP SDK dependency and does not rely on `memory-store/node_modules` just to load the HTTP daemon or Exa bridge. Sibling MCP packages still need their own declared dependencies before their endpoint is used. Direct startup stores logs and broker state under `%USERPROFILE%\.codex-toolkit\broker` unless `CODEX_TOOLKIT_DATA_ROOT`, `CODEX_MCP_BROKER_LOG`, or `CODEX_MCP_BROKER_STATE` overrides it.
 - Syntax validation for both entry points: `npm run check`
 - The `npm run health` alias intentionally runs that static validation. This package does not ship the private PowerShell health scripts.
 - A receiver can run `install\Update-CodexMcpBroker.ps1` for either a flat `%USERPROFILE%\.codex\mcp-http-broker` installation or a managed release. Unless `-BrokerRoot` is explicit, the updater prefers `CODEX_TOOLKIT_SERVICE_MANIFEST` or `%USERPROFILE%\.codex-toolkit\services\infrastructure\service-manifest.json` and honors the separate `broker.brokerScript`, `broker.startScript`, and `broker.stopScript` paths. Before any write, the healthy PID must resolve to the target Node entry script; after restart, the PID must change and still resolve to that script. The updater also validates the changed lifecycle tests, backs up installed code and scripts, checks selected deep-health endpoints and caller-supplied protected state hashes, and restores the previous snapshot on failure.

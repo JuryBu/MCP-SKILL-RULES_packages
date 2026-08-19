@@ -13,20 +13,8 @@ const mcpRoot = path.resolve(brokerRoot, "..");
 const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-timeout-"));
 const fakeSandboxRoot = path.join(dataRoot, "fake-sandbox");
 const markerPath = path.join(dataRoot, "abort-marker.json");
-const memoryStoreCandidates = [
-  process.env.MEMORY_STORE_MCP_ROOT,
-  path.join(mcpRoot, "memory-store"),
-  path.join(os.homedir(), ".gemini", "antigravity", "mcp-memory-store"),
-].filter(Boolean);
-const memoryStoreRoot = memoryStoreCandidates.find((candidate) =>
-  fs.existsSync(path.join(candidate, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm", "server", "index.js")),
-);
-
-if (!memoryStoreRoot) {
-  throw new Error("Broker timeout smoke requires an installed memory-store MCP SDK dependency");
-}
-
-const sdkRoot = path.join(memoryStoreRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
+const memoryStoreRoot = path.join(dataRoot, "missing-memory-store");
+const sdkRoot = path.join(brokerRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
 const [{ Client }, { StreamableHTTPClientTransport }] = await Promise.all([
   import(pathToFileURL(path.join(sdkRoot, "client", "index.js")).href),
   import(pathToFileURL(path.join(sdkRoot, "client", "streamableHttp.js")).href),

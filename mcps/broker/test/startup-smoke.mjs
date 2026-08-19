@@ -10,18 +10,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const brokerRoot = path.resolve(__dirname, "..");
 const mcpRoot = path.resolve(brokerRoot, "..");
 const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-smoke-"));
-const memoryStoreCandidates = [
-  process.env.MEMORY_STORE_MCP_ROOT,
-  path.join(mcpRoot, "memory-store"),
-  path.join(os.homedir(), ".gemini", "antigravity", "mcp-memory-store"),
-].filter(Boolean);
-const memoryStoreRoot = memoryStoreCandidates.find((candidate) =>
-  fs.existsSync(path.join(candidate, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm", "server", "index.js")),
-);
-
-if (!memoryStoreRoot) {
-  throw new Error("Broker startup smoke requires an installed memory-store MCP SDK dependency");
-}
+const memoryStoreRoot = path.join(dataRoot, "missing-memory-store");
 
 function reservePort() {
   return new Promise((resolve, reject) => {

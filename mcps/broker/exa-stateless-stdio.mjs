@@ -12,14 +12,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const toolkitMcpRoot = process.env.CODEX_TOOLKIT_MCP_ROOT || path.resolve(__dirname, "..");
 const memoryStoreRoot = process.env.MEMORY_STORE_MCP_ROOT || path.join(toolkitMcpRoot, "memory-store");
-const sdkRoot = path.join(
-  memoryStoreRoot,
-  "node_modules",
-  "@modelcontextprotocol",
-  "sdk",
-  "dist",
-  "esm",
-);
+
+function resolveSdkRoot() {
+  const candidates = [
+    process.env.CODEX_MCP_BROKER_SDK_ROOT,
+    path.join(__dirname, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm"),
+    path.join(memoryStoreRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm"),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (
+      fs.existsSync(path.join(candidate, "server", "index.js")) &&
+      fs.existsSync(path.join(candidate, "server", "stdio.js")) &&
+      fs.existsSync(path.join(candidate, "client", "index.js")) &&
+      fs.existsSync(path.join(candidate, "types.js"))
+    ) {
+      return candidate;
+    }
+  }
+  throw new Error(`MCP SDK not found. Checked: ${candidates.join(", ")}`);
+}
+
+const sdkRoot = resolveSdkRoot();
 
 const [{ Server }, { StdioServerTransport }, types] = await Promise.all([
   import(pathToFileURL(path.join(sdkRoot, "server", "index.js")).href),

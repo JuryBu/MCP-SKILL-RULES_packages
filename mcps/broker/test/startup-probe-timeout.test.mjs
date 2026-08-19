@@ -10,23 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const sourceBrokerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourceMcpRoot = path.resolve(sourceBrokerRoot, "..");
-
-function findMemoryStoreRoot() {
-  return [
-    process.env.MEMORY_STORE_MCP_ROOT,
-    path.join(sourceMcpRoot, "memory-store"),
-    path.join(os.homedir(), ".gemini", "antigravity", "mcp-memory-store"),
-  ].filter(Boolean).find((candidate) => fs.existsSync(path.join(
-    candidate,
-    "node_modules",
-    "@modelcontextprotocol",
-    "sdk",
-    "dist",
-    "esm",
-    "server",
-    "index.js",
-  )));
-}
+const sourceSdkRoot = path.join(sourceBrokerRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm");
 
 function reservePort() {
   return new Promise((resolve, reject) => {
@@ -67,10 +51,10 @@ function requestJson(port, requestPath, options = {}) {
 }
 
 test("private endpoint startup timeout allows a slow backend and survives scoped reload", { timeout: 15000 }, async () => {
-  const memoryStoreRoot = findMemoryStoreRoot();
-  assert.ok(memoryStoreRoot, "slow startup test requires the memory-store MCP SDK");
+  assert.equal(fs.existsSync(path.join(sourceSdkRoot, "server", "index.js")), true);
   const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-slow-startup-"));
   const brokerRoot = path.join(testRoot, "broker");
+  const memoryStoreRoot = path.join(testRoot, "missing-memory-store");
   const napcatRoot = path.join(testRoot, "napcat-mcp");
   const dataRoot = path.join(testRoot, "data");
   const controlToken = "slow-startup-control-token";
@@ -107,6 +91,7 @@ await server.connect(new StdioServerTransport());
       ...process.env,
       CODEX_MCP_BROKER_PORT: String(port),
       CODEX_MCP_BROKER_CONTROL_TOKEN: controlToken,
+      CODEX_MCP_BROKER_SDK_ROOT: sourceSdkRoot,
       CODEX_TOOLKIT_MCP_ROOT: sourceMcpRoot,
       CODEX_TOOLKIT_DATA_ROOT: dataRoot,
       CODEX_TOOLKIT_ENABLE_NAPCAT_MCP: "1",

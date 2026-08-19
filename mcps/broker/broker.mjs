@@ -68,14 +68,26 @@ const wechatDocsPython = process.env.WECHAT_DOCS_MCP_PYTHON || "python";
 const wechatDocsEnabled = process.env.CODEX_TOOLKIT_ENABLE_WECHAT_DOCS_MCP === "1";
 const nodeCommand = process.execPath;
 const brokerControlToken = process.env.CODEX_MCP_BROKER_CONTROL_TOKEN || process.env.NAPCAT_MCP_TOKEN || "";
-const sdkRoot = path.join(
-  memoryStoreRoot,
-  "node_modules",
-  "@modelcontextprotocol",
-  "sdk",
-  "dist",
-  "esm",
-);
+
+function resolveSdkRoot() {
+  const candidates = [
+    process.env.CODEX_MCP_BROKER_SDK_ROOT,
+    path.join(__dirname, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm"),
+    path.join(memoryStoreRoot, "node_modules", "@modelcontextprotocol", "sdk", "dist", "esm"),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (
+      fs.existsSync(path.join(candidate, "server", "index.js")) &&
+      fs.existsSync(path.join(candidate, "client", "index.js")) &&
+      fs.existsSync(path.join(candidate, "types.js"))
+    ) {
+      return candidate;
+    }
+  }
+  throw new Error(`MCP SDK not found. Checked: ${candidates.join(", ")}`);
+}
+
+const sdkRoot = resolveSdkRoot();
 
 const [
   { Server },

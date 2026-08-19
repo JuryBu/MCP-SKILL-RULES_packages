@@ -11,23 +11,6 @@ import { fileURLToPath } from "node:url";
 const brokerRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const mcpRoot = path.resolve(brokerRoot, "..");
 
-function findMemoryStoreRoot() {
-  return [
-    process.env.MEMORY_STORE_MCP_ROOT,
-    path.join(mcpRoot, "memory-store"),
-    path.join(os.homedir(), ".gemini", "antigravity", "mcp-memory-store"),
-  ].filter(Boolean).find((candidate) => fs.existsSync(path.join(
-    candidate,
-    "node_modules",
-    "@modelcontextprotocol",
-    "sdk",
-    "dist",
-    "esm",
-    "server",
-    "index.js",
-  )));
-}
-
 function reservePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -53,9 +36,8 @@ function getJson(port, pathname) {
 }
 
 test("backend connection failures preserve child stderr without PATH node", async () => {
-  const memoryStoreRoot = findMemoryStoreRoot();
-  assert.ok(memoryStoreRoot, "diagnostic test requires the memory-store MCP SDK");
   const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-broker-diagnostics-"));
+  const memoryStoreRoot = path.join(testRoot, "missing-memory-store");
   const napcatRoot = path.join(testRoot, "napcat-mcp");
   const logPath = path.join(testRoot, "broker.log");
   fs.mkdirSync(path.join(napcatRoot, "src"), { recursive: true });
