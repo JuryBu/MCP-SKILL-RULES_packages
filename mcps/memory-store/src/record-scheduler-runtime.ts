@@ -217,6 +217,7 @@ export interface RecordSchedulerRuntimeDiscoveryRecord {
     host?: SourceEvidenceHost;
     lastUpdatedAt: string;
     lastUpdatedRound?: number;
+    totalRounds?: number;
     recordBodyHash: string;
     coveredRevision?: string;
     coveredRevisionSequence?: number | null;
@@ -972,10 +973,17 @@ function sourceCacheReferenceForCandidate(
         && existingRecord.extensions.lastUpdatedRound >= 0
         ? existingRecord.extensions.lastUpdatedRound
         : undefined;
+    const referenceRoundCount = typeof reference?.sourceSnapshot?.roundCount === "number"
+        && Number.isSafeInteger(reference.sourceSnapshot.roundCount)
+        && reference.sourceSnapshot.roundCount > 0
+        ? reference.sourceSnapshot.roundCount
+        : undefined;
     const cacheReadStartRound = reference?.cacheReadStartRound !== undefined
         ? reference.cacheReadStartRound
         : lastUpdatedRound === undefined
             ? undefined
+            : referenceRoundCount !== undefined && lastUpdatedRound > referenceRoundCount
+                ? 1
             : lastUpdatedRound + 1;
     return {
         ...(reference?.cacheGeneration ? { cacheGeneration: reference.cacheGeneration } : {}),
@@ -1859,16 +1867,39 @@ async function collectProductionEvidence(
 function recordCoveredRevision(result: ProductionEvidenceResult) {
     const record = result.seed.record;
     if (!record) return null;
+    const recordUpdatedAtMs = Date.parse(record.lastUpdatedAt);
+    const sourceSequence = result.enumeration.sourceRevision.sequence;
+    const verifiedCacheFallbackSequence = verifiedConversationCacheRecordSequence(result, recordUpdatedAtMs);
     if (record.coveredRevision) {
         const sequence = record.coveredRevisionSequence;
+        if (Number.isSafeInteger(sequence) && (sequence ?? -1) >= 0) {
+            return {
+                revision: record.coveredRevision,
+                sequence: sequence as number,
+            };
+        }
+        if (verifiedCacheFallbackSequence !== null) {
+            return {
+                revision: record.coveredRevision,
+                sequence: verifiedCacheFallbackSequence,
+            };
+        }
         return {
             revision: record.coveredRevision,
-            sequence: sequence === null || (Number.isSafeInteger(sequence) && (sequence ?? -1) >= 0) ? sequence ?? null : null,
+            sequence: null,
         };
     }
-    const recordUpdatedAtMs = Date.parse(record.lastUpdatedAt);
     const sourceUpdatedAtMs = result.seed.sourceUpdatedAtMs;
-    const sourceSequence = result.enumeration.sourceRevision.sequence;
+    if (verifiedCacheFallbackSequence !== null) {
+        return {
+            revision: `record-unbound:${stableJsonHash({
+                conversationId: record.conversationId,
+                lastUpdatedAt: record.lastUpdatedAt,
+                sourceRevision: result.enumeration.sourceRevision.revision,
+            })}`,
+            sequence: Math.max(0, Math.floor(recordUpdatedAtMs)),
+        };
+    }
     if (!sourceUpdatedAtMs
         || !Number.isFinite(recordUpdatedAtMs)
         || sourceSequence !== discoverySequence(sourceUpdatedAtMs)
@@ -1877,6 +1908,21 @@ function recordCoveredRevision(result: ProductionEvidenceResult) {
         revision: `record-unbound:${stableJsonHash({ conversationId: record.conversationId, lastUpdatedAt: record.lastUpdatedAt })}`,
         sequence: Math.max(0, Math.floor(recordUpdatedAtMs)),
     };
+}
+
+function verifiedConversationCacheRecordSequence(
+    result: ProductionEvidenceResult,
+    recordUpdatedAtMs: number,
+): number | null {
+    const sourceSequence = result.enumeration.sourceRevision.sequence;
+    if (!isVerifiedConversationCacheEnumeration(result.enumeration, result.exactFetch)
+        || !Number.isFinite(recordUpdatedAtMs)
+        || !Number.isSafeInteger(sourceSequence)
+        || (sourceSequence ?? -1) < 0
+        || recordUpdatedAtMs >= sourceSequence!) {
+        return null;
+    }
+    return Math.max(0, Math.floor(recordUpdatedAtMs));
 }
 
 export function createProductionRecordSchedulerSourceEvidenceAdapter(
@@ -1927,6 +1973,7 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
                 workspaceHash: record.workspaceHash,
                 lastUpdatedAt: record.lastUpdatedAt,
                 lastUpdatedRound: record.lastUpdatedRound ?? null,
+                totalRounds: record.totalRounds ?? null,
                 recordBodyHash: record.recordBodyHash,
                 coveredRevision: record.coveredRevision || null,
                 coveredRevisionSequence: record.coveredRevisionSequence ?? null,
@@ -1957,8 +2004,17 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
                         recordBodyHash: result.seed.record.recordBodyHash,
                         extensions: Number.isSafeInteger(result.seed.record.lastUpdatedRound)
                             && (result.seed.record.lastUpdatedRound ?? -1) >= 0
-                            ? { lastUpdatedRound: result.seed.record.lastUpdatedRound }
-                            : {},
+                            ? {
+                                lastUpdatedRound: result.seed.record.lastUpdatedRound,
+                                ...(Number.isSafeInteger(result.seed.record.totalRounds)
+                                    && (result.seed.record.totalRounds ?? -1) >= 0
+                                    ? { totalRounds: result.seed.record.totalRounds }
+                                    : {}),
+                            }
+                            : Number.isSafeInteger(result.seed.record.totalRounds)
+                                && (result.seed.record.totalRounds ?? -1) >= 0
+                                ? { totalRounds: result.seed.record.totalRounds }
+                                : {},
                     }));
                 }
                 if (result.enumeration.targetStatus === "absent" && result.exactFetch?.exactFetchResult === "not_found") {

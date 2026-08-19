@@ -1,5 +1,24 @@
 # Changelog
 
+## [1.23.10] - 2026-08-19
+
+- 修复受控重建 Record 的 Phase 标题格式不符合既有解析器模板的问题；`## Phase N：当前缓存保真重建（轮次 X-Y）` 现在可被质量门正确解析到尾段，避免 `51-55` 被误读成只覆盖第 51 轮而拒绝正式写入。
+- 为受控重建测试补充“最后一个 Phase 必须解析到总轮次”的回归断言，防止再次出现内容实际存在但写入校验误判缺尾的情况。
+
+## [1.23.9] - 2026-08-19
+
+- 修复 WSF/Antigravity 旧 Record 正文与当前 fetch 缓存轮次体系不兼容时仍尝试慢速模型整合的问题；这类旧底稿现在直接基于当前 fetch 缓存生成保真重建索引，避免把 55 轮压缩成 2 个 Phase 后冒充完整更新。
+- 新增受控重建 Phase 密度门槛：55 轮级别的全量重建至少拆为多个 Phase；若未来模型候选过度压缩，写入前会拒绝或改用保真索引，不再因旧 Record 不可信而放空缩水校验。
+
+## [1.23.8] - 2026-08-19
+
+- 修复 WSF/Antigravity 旧 Record 使用旧轮次体系时被误判为覆盖当前 fetch 尾部的问题；当旧 Record 声明总轮次或 Phase 轮次超过当前 fetch 总轮次时，Record 更新会忽略旧覆盖轮次并按当前 fetch 缓存重建，避免只读取 `continue` 这类尾部空轮后 local-finalize 原样提交旧 Record。
+
+## [1.23.7] - 2026-08-19
+
+- 修复 WSF/Antigravity 旧 Record 只有 `coveredRevision` 哈希但缺少 sequence 时，可信 fetch 缓存无法判定新旧而卡成 `revision-order-unknown` 的问题；已发布 fetch 缓存能证明来源顺序时会使用旧 Record 更新时间作为保守下界，不放宽候选写入校验。
+- 修复 Record scheduler 的 admission 去重把旧 `Deferred` 终态任务当成永久冲突的问题；同 requestKey 的旧终态不同 identity 不再阻塞修复后的新尝试，活跃不同 identity 仍保持冲突保护。
+
 ## [1.23.6] - 2026-08-18
 
 - 修复 Windsurf/Antigravity 本地 PB 与 LS 读取同一对话时的语义比较：PB 的 reasoning-only planner 字段不再冒充 AI 正文，CCI 链接与路径表现差异会规范化比较，auto 能正确选择完整可用来源。

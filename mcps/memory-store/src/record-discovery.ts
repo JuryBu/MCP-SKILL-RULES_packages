@@ -225,6 +225,7 @@ export type RecordCandidateClassification = z.infer<typeof RecordCandidateClassi
 const ClassificationReasonCodeSchema = z.enum([
     "record-covered-current-source",
     "source-revision-newer-than-record",
+    "record-round-universe-incompatible",
     "source-present-record-absent",
     "source-enumeration-incomplete",
     "source-enumeration-cache-not-bypassed",
@@ -412,6 +413,7 @@ export type RecordDiscoverySelector = "normal" | "stale_only" | "force";
 
 interface DiscoveryMaterial {
     discoveredAtSequence: number;
+    requestExtensions: Record<string, unknown>;
     sourceEnumerations: SourceEnumerationEnvelope[];
     recordIndex: z.infer<typeof RecordIndexSnapshotSchema>;
     absenceObservations: SourceAbsenceObservation[];
@@ -554,6 +556,39 @@ function currentSourceRevision(envelope: SourceEnumerationEnvelope): z.infer<typ
     };
 }
 
+const RUNTIME_SOURCE_CACHE_REFERENCES_EXTENSION_KEY = "record-source-cache-references";
+
+function safeExtensionNumber(value: unknown): number | null {
+    return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function recordRoundUniverseIncompatible(entry: RecordIndexEntry, sourceRoundCount: number | null): boolean {
+    if (sourceRoundCount === null || sourceRoundCount < 1) return false;
+    const lastUpdatedRound = safeExtensionNumber(entry.extensions.lastUpdatedRound);
+    const totalRounds = safeExtensionNumber(entry.extensions.totalRounds);
+    return (lastUpdatedRound !== null && lastUpdatedRound > sourceRoundCount)
+        || (totalRounds !== null && totalRounds > sourceRoundCount);
+}
+
+function sourceCacheRoundCountFor(extensions: Record<string, unknown>, source: RecordSourceIdentity): number | null {
+    const references = extensions[RUNTIME_SOURCE_CACHE_REFERENCES_EXTENSION_KEY];
+    if (!Array.isArray(references)) return null;
+    for (const item of references) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const reference = item as Record<string, unknown>;
+        if (reference.host !== source.host
+            || reference.conversationId !== source.identity.conversationId
+            || reference.workspaceHash !== source.identity.workspace.workspaceId) {
+            continue;
+        }
+        const sourceSnapshot = reference.sourceSnapshot;
+        if (!sourceSnapshot || typeof sourceSnapshot !== "object" || Array.isArray(sourceSnapshot)) continue;
+        const roundCount = safeExtensionNumber((sourceSnapshot as Record<string, unknown>).roundCount);
+        if (roundCount !== null && roundCount > 0) return roundCount;
+    }
+    return null;
+}
+
 function classifyRevision(
     sourceRevision: z.infer<typeof CurrentSourceRevisionSchema>,
     coveredRevision: z.infer<typeof CoveredRevisionSchema> | null,
@@ -627,6 +662,7 @@ function classifyCandidate(args: {
     recordHasMultipleSources: boolean;
     workspaceIdentityConflictRefs: string[];
     sourceIdentityConflictRefs: string[];
+    sourceRoundCount: number | null;
 }): CandidateClassificationResult {
     const sourceRefs = args.enumerations.map(envelope => envelope.evidence.evidenceHash);
     const recordRefs = [
@@ -695,6 +731,14 @@ function classifyCandidate(args: {
         }
         if (record.indexSnapshotId !== indexScope.snapshotId || record.indexRevision !== indexScope.indexRevision) {
             return { classification: "Unresolved", reason: reason("record-index-entry-unbound", recordRefs), sourceRevision };
+        }
+        if (recordRoundUniverseIncompatible(record, args.sourceRoundCount)) {
+            return { classification: "Stale", reason: reason("record-round-universe-incompatible", [...sourceRefs, ...recordRefs]), sourceRevision };
+        }
+        if (isVerifiedConversationCacheEnumeration(authoritative.evidence, authoritative.exactFetch)
+            && record.coveredRevision
+            && record.coveredRevision.revision !== sourceRevision.revision) {
+            return { classification: "Stale", reason: reason("source-revision-newer-than-record", [...sourceRefs, ...recordRefs]), sourceRevision };
         }
         return classifyRevision(sourceRevision, record.coveredRevision, [...sourceRefs, ...recordRefs]);
     }
@@ -837,6 +881,7 @@ function buildCandidates(material: DiscoveryMaterial): RecordDiscoveryCandidate[
             recordHasMultipleSources,
             workspaceIdentityConflictRefs: workspaceIdentityConflictRefs.get(key) || [],
             sourceIdentityConflictRefs: sourceIdentityConflictRefs.get(key) || [],
+            sourceRoundCount: sourceCacheRoundCountFor(material.requestExtensions, source),
         });
         const classification = classified.classification;
         const payload = {
@@ -864,6 +909,7 @@ function assertCandidateSnapshotInternal(snapshot: CandidateSnapshot): void {
     if (evidenceHashFor(snapshotPayload(snapshot)) !== snapshot.snapshotHash) throw new Error("CandidateSnapshot snapshotHash mismatch");
     const expected = buildCandidates({
         discoveredAtSequence: snapshot.discoveredAtSequence,
+        requestExtensions: snapshot.request.filters.extensions,
         sourceEnumerations: snapshot.sourceEnumerations,
         recordIndex: snapshot.recordIndex,
         absenceObservations: snapshot.absenceObservations,
@@ -877,6 +923,7 @@ export function discoverRecordCandidates(input: unknown): Immutable<CandidateSna
     const parsed = RecordDiscoveryInputSchema.parse(input);
     const material: DiscoveryMaterial = {
         discoveredAtSequence: parsed.request.discoveredAtSequence,
+        requestExtensions: parsed.request.filters.extensions,
         sourceEnumerations: sortByCanonical(parsed.sourceEnumerations),
         recordIndex: {
             scopes: sortByCanonical(parsed.recordIndex.scopes),

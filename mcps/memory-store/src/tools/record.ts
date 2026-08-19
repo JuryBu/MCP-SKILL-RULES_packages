@@ -15,7 +15,8 @@ import {
 } from "../record-store.js";
 import { DATA_ROOT, GENERAL_DIR, WORKSPACES_DIR, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
 import {
-    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, resolveRecordSourceReadStartRound, validateRecordCandidateForWrite, type RecordParallelMode,
+    generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, resolveRecordSourceReadStartRound, hasIncompatibleRecordRoundUniverse,
+    isControlledRebuildCandidateTooSparse, minimumControlledRebuildPhaseCount, validateRecordCandidateForWrite, type RecordParallelMode,
 } from "../record-generator.js";
 import { readCachedConversationSourceCache } from "../conversation-source-cache.js";
 import { listDshSessionSnapshots } from "../dsh-session-reader.js";
@@ -2225,7 +2226,7 @@ function buildRecordSchedulerDiscoveryRequest(input: {
     ).filter(record => !input.targetConversationId || record.conversationId === input.targetConversationId).map(record => {
         const identity = record.commitArtifact?.identity;
         const mainIndex = record.commitArtifact?.mainIndex;
-        const coveredRevision = identity
+        const artifactCoveredRevision = identity
             && mainIndex
             && identity.conversationId === record.conversationId
             && mainIndex.conversationId === record.conversationId
@@ -2234,6 +2235,7 @@ function buildRecordSchedulerDiscoveryRequest(input: {
             && identity.recordId === mainIndex.recordId
             ? identity.coveredRevision
             : undefined;
+        const coveredRevision = artifactCoveredRevision || record.coveredRevision;
         return {
             conversationId: record.conversationId,
             title: record.title,
@@ -2245,6 +2247,9 @@ function buildRecordSchedulerDiscoveryRequest(input: {
             lastUpdatedAt: record.lastUpdatedAt,
             ...(Number.isSafeInteger(record.lastUpdatedRound) && record.lastUpdatedRound >= 0
                 ? { lastUpdatedRound: record.lastUpdatedRound }
+                : {}),
+            ...(Number.isSafeInteger(record.totalRounds) && record.totalRounds >= 0
+                ? { totalRounds: record.totalRounds }
                 : {}),
             recordBodyHash: `sha256:${crypto.createHash("sha256").update(JSON.stringify(record), "utf8").digest("hex")}`,
             ...(coveredRevision ? { coveredRevision } : {}),
@@ -2406,6 +2411,7 @@ function completeRecordMetadata(input: {
     timeSpan?: string;
     tags?: string[];
     chain?: string;
+    coveredRevision?: string;
     coveredRevisionSequence?: number;
 }): RecordIndexEntry {
     return {
@@ -2420,6 +2426,7 @@ function completeRecordMetadata(input: {
         sizeBytes: Buffer.byteLength(input.content, "utf8"),
         ...(input.tags ? { tags: input.tags } : {}),
         ...(input.chain ? { chain: input.chain } : {}),
+        ...(input.coveredRevision ? { coveredRevision: input.coveredRevision } : {}),
         ...(Number.isSafeInteger(input.coveredRevisionSequence) && (input.coveredRevisionSequence ?? -1) >= 0
             ? { coveredRevisionSequence: input.coveredRevisionSequence }
             : {}),
@@ -2852,8 +2859,19 @@ async function handleUpdate(
         const beforeWriteAbort = buildRecordTaskAbortResponse(startMs, options, "写回正式 Record 前检查到任务已终止");
         if (beforeWriteAbort) return beforeWriteAbort;
         const oldRecordForGate = await readRecordAsync(effectiveHash, cascadeId) || "";
+        const oldRecordRoundUniverseIncompatible = hasIncompatibleRecordRoundUniverse(oldRecordForGate, sourceTotalRounds);
+        if (oldRecordRoundUniverseIncompatible && isControlledRebuildCandidateTooSparse(result.content!, sourceTotalRounds)) {
+            const minimumPhaseCount = minimumControlledRebuildPhaseCount(sourceTotalRounds);
+            const actualPhaseCount = countPhasesInRecord(result.content!);
+            const error = `Record 受控重建候选过度压缩: phaseCount=${actualPhaseCount}, minimum=${minimumPhaseCount}, totalRounds=${sourceTotalRounds}`;
+            if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, error);
+            return rt(`❌ Record 生成失败: ${error}`, startMs);
+        }
+        const comparableOldRecordForGate = oldRecordRoundUniverseIncompatible
+            ? ""
+            : oldRecordForGate;
         const gate = validateRecordCandidateForWrite(result.content!, cascadeId, sourceTotalRounds, result.coveredRounds || sourceTotalRounds, {
-            oldRecord: oldRecordForGate,
+            oldRecord: comparableOldRecordForGate,
         });
         if (!gate.ok) {
             if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, gate.error);
@@ -2871,6 +2889,7 @@ async function handleUpdate(
             timeSpan: existingIndexEntry?.timeSpan,
             tags: result.tags ?? existingIndexEntry?.tags,
             chain: loaded.chainUsed,
+            coveredRevision: options.frozenSource?.snapshot.desiredRevision,
             coveredRevisionSequence: options.frozenSource?.snapshot.sourceRevisionSequence,
         });
         let readerIndexStatus = "rebuilt";
@@ -5440,8 +5459,23 @@ async function runRecordBatchUpdateFromPayload(
 
                     const content = result.content;
                     const oldRecord = await readRecordAsync(actualHash, candidate.id) || "";
+                    const oldRecordRoundUniverseIncompatible = hasIncompatibleRecordRoundUniverse(oldRecord, sourceTotalRounds);
+                    if (oldRecordRoundUniverseIncompatible && isControlledRebuildCandidateTooSparse(content, sourceTotalRounds)) {
+                        const minimumPhaseCount = minimumControlledRebuildPhaseCount(sourceTotalRounds);
+                        const actualPhaseCount = countPhasesInRecord(content);
+                        const error = `Record 受控重建候选过度压缩: phaseCount=${actualPhaseCount}, minimum=${minimumPhaseCount}, totalRounds=${sourceTotalRounds}`;
+                        if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, error);
+                        ledger = schedulerManaged
+                            ? projectRecordBatchOutcomeInMemory(ledger, "failed", candidate, error)
+                            : await updateRecordBatchLedger(payload, "failed", candidate, error);
+                        updateBatchProgress(`失败 ${current}: ${error}`);
+                        continue;
+                    }
+                    const comparableOldRecord = oldRecordRoundUniverseIncompatible
+                        ? ""
+                        : oldRecord;
                     const gate = validateRecordCandidateForWrite(content, candidate.id, sourceTotalRounds, result.coveredRounds || sourceTotalRounds, {
-                        oldRecord,
+                        oldRecord: comparableOldRecord,
                     });
                     if (!gate.ok) {
                         if (schedulerSession) await failSchedulerRecordGeneration(schedulerSession, gate.error);
@@ -5474,6 +5508,7 @@ async function runRecordBatchUpdateFromPayload(
                             tags: result.tags ?? existingIndexEntry?.tags ?? [],
                             chain: loaded.chainUsed || payload.dataChain || existingIndexEntry?.chain,
                             timeSpan: existingIndexEntry?.timeSpan,
+                            coveredRevision: frozenSource?.snapshot.desiredRevision,
                             coveredRevisionSequence: frozenSource?.snapshot.sourceRevisionSequence,
                         });
                         if (schedulerSession) {

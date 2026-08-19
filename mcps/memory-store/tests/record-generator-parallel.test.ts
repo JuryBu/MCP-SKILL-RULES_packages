@@ -180,11 +180,16 @@ const {
     parseRecordPatchResponse,
     parseSerialComposeStep,
     relabelSerialPhaseMarkdown,
+    resolveRecordSourceReadStartRound,
     salvagePhasesFromTruncatedJson,
     selectLocalComposeBoundary,
     shouldUseParallelPipeline,
     validateComposedRecord,
     inferCoveredRoundFromRecord,
+    countPhasesInRecord,
+    hasIncompatibleRecordRoundUniverse,
+    isControlledRebuildCandidateTooSparse,
+    minimumControlledRebuildPhaseCount,
 } = await import("../src/record-generator.ts");
 const { deleteRecord, readRecordsIndex, writeRecord } = await import("../src/record-store.ts");
 
@@ -796,6 +801,91 @@ try {
     assert.equal(upToDateResult.batches, 0);
     assert.match(upToDateResult.content || "", /Record: existing/u);
     await deleteRecord("general", upToDateConversationId);
+
+    const legacyRoundUniverseRecord = [
+        "# Record: legacy round universe",
+        "",
+        "- 总轮次：80",
+        "- 总步骤：392",
+        "",
+        "## Phase 1：旧编号阶段（轮次 1-54）",
+        "",
+        "- 这是旧 WSF 轮次体系下的阶段，不得用来跳过当前 fetch 的第 54 轮。",
+        "",
+        "<!-- TAGS: legacy -->",
+    ].join("\n");
+    assert.equal(hasIncompatibleRecordRoundUniverse(legacyRoundUniverseRecord, 55), true);
+    assert.equal(minimumControlledRebuildPhaseCount(55), 6);
+    assert.equal(
+        isControlledRebuildCandidateTooSparse([
+            "# 对话记录 Record",
+            "",
+            "- 总轮次：55",
+            "- 总步骤：1118",
+            "",
+            "## Phase 1：过粗阶段（轮次 1-27）",
+            "",
+            "## Phase 2：过粗阶段（轮次 28-55）",
+        ].join("\n"), 55),
+        true,
+        "controlled full rebuild must reject a two-phase summary for a 55-round source",
+    );
+    assert.equal(
+        resolveRecordSourceReadStartRound(legacyRoundUniverseRecord, 55, 55),
+        1,
+        "legacy WSF round numbering must force reading the current fetch cache from round 1",
+    );
+
+    const incompatibleConversationId = `record-incompatible-round-universe-${Date.now()}`;
+    await writeRecord("general", incompatibleConversationId, legacyRoundUniverseRecord, {
+        title: "legacy round universe",
+        totalRounds: 80,
+        totalSteps: 392,
+        lastUpdatedRound: 80,
+        phases: 1,
+        tags: ["legacy"],
+    });
+    const incompatibleResult = await generateRecord("general", incompatibleConversationId, "test", [
+        round(1, 100),
+        round(2, 100),
+    ], 6, "codex", {
+        background: true,
+        parallelMode: "auto",
+    });
+    assert.equal(incompatibleResult.success, true);
+    assert.notEqual(incompatibleResult.upToDate, true, "legacy round universe mismatch must not local-finalize the old Record");
+    assert.doesNotMatch(incompatibleResult.content || "", /旧 WSF 轮次体系/u);
+    assert.ok(incompatibleResult.warnings?.some(warning => warning.includes("轮次体系与当前 fetch 缓存不兼容")));
+    await deleteRecord("general", incompatibleConversationId);
+
+    const controlledRebuildConversationId = `record-controlled-rebuild-${Date.now()}`;
+    await writeRecord("general", controlledRebuildConversationId, legacyRoundUniverseRecord, {
+        title: "legacy round universe",
+        totalRounds: 80,
+        totalSteps: 392,
+        lastUpdatedRound: 80,
+        phases: 1,
+        tags: ["legacy"],
+    });
+    const controlledRebuildRounds = Array.from({ length: 25 }, (_, index) => round(index + 1, 80));
+    const controlledRebuildResult = await generateRecord("general", controlledRebuildConversationId, "test", controlledRebuildRounds, 75, "codex", {
+        background: true,
+        parallelMode: "auto",
+    });
+    assert.equal(controlledRebuildResult.success, true);
+    assert.match(controlledRebuildResult.content || "", /保真重建索引/u);
+    assert.ok(
+        countPhasesInRecord(controlledRebuildResult.content || "") >= minimumControlledRebuildPhaseCount(25),
+        "controlled rebuild should keep enough phase density for the current fetch cache",
+    );
+    const controlledRebuildParsed = parseRecordDocument(controlledRebuildResult.content || "");
+    assert.equal(
+        controlledRebuildParsed.phases.at(-1)?.endRound,
+        25,
+        "controlled rebuild phase headings must be parseable through the final round",
+    );
+    assert.ok(controlledRebuildResult.warnings?.some(warning => warning.includes("跳过慢速模型整合")));
+    await deleteRecord("general", controlledRebuildConversationId);
 
     const brokenCoverageConversationId = `record-broken-coverage-${Date.now()}`;
     await writeRecord("general", brokenCoverageConversationId, [

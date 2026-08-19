@@ -1343,6 +1343,154 @@ export function createRecordChunks(
     return chunks;
 }
 
+export function minimumControlledRebuildPhaseCount(totalRounds: number): number {
+    if (!Number.isFinite(totalRounds) || totalRounds <= 0) return 0;
+    if (totalRounds <= 12) return 1;
+    return Math.min(12, Math.max(3, Math.ceil(totalRounds / 10)));
+}
+
+export function isControlledRebuildCandidateTooSparse(content: string, totalRounds: number): boolean {
+    const minimumPhaseCount = minimumControlledRebuildPhaseCount(totalRounds);
+    if (minimumPhaseCount <= 1) return false;
+    return countPhasesInRecord(content) < minimumPhaseCount;
+}
+
+function normalizeSnippetText(text: string, maxChars: number): string {
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (normalized.length <= maxChars) return normalized;
+    const headChars = Math.max(20, Math.floor(maxChars * 0.65));
+    const tailChars = Math.max(10, maxChars - headChars - 6);
+    return `${normalized.slice(0, headChars)} …… ${normalized.slice(-tailChars)}`;
+}
+
+function summarizeRoundForControlledRebuild(round: ConversationRound): string {
+    const userText = (round.userMessages?.length
+        ? round.userMessages.map(message => message.text).filter(Boolean).join(" / ")
+        : round.userMessage) || "(无用户正文)";
+    const aiText = round.aiResponses
+        .map(ai => ai.response)
+        .filter(Boolean)
+        .join(" / ") || "(无模型正文)";
+    const toolSummary = round.toolCalls.length > 0
+        ? `；工具调用 ${round.toolCalls.length} 次：${round.toolCalls.slice(0, 5).map(call => call.name).join("、")}${round.toolCalls.length > 5 ? " 等" : ""}`
+        : "";
+    const codeFiles = Array.from(new Set(round.codeActions.map(action => action.targetFile).filter(Boolean))).slice(0, 5);
+    const fileSummary = codeFiles.length > 0
+        ? `；涉及文件 ${codeFiles.join("、")}${round.codeActions.length > codeFiles.length ? " 等" : ""}`
+        : "";
+    return `- 轮次 ${round.roundIndex}（steps ${round.startStep}-${round.endStep}）：用户：${normalizeSnippetText(userText, 180)}；AI：${normalizeSnippetText(aiText, 220)}${toolSummary}${fileSummary}`;
+}
+
+function createControlledRebuildFallbackRecord(params: {
+    conversationId: string;
+    workspace: string;
+    totalRounds: number;
+    totalSteps: number;
+    formattedRounds: FormattedRecordRound[];
+    sourceRoundStart: number;
+    warnings: string[];
+}): string {
+    const minimumPhaseCount = minimumControlledRebuildPhaseCount(params.totalRounds);
+    const roundsPerPhase = Math.max(1, Math.ceil(params.formattedRounds.length / Math.max(1, minimumPhaseCount)));
+    const lines: string[] = [
+        "# 对话记录 Record",
+        "",
+        `- 对话ID：${params.conversationId}`,
+        `- 工作区：${params.workspace}`,
+        `- 总轮次：${params.totalRounds}`,
+        `- 总步骤：${params.totalSteps}`,
+        "- 生成模式：旧 Record 与当前 fetch 缓存轮次体系不兼容，已按当前缓存生成保真重建索引",
+        "",
+    ];
+
+    let phaseNo = 1;
+    for (let index = 0; index < params.formattedRounds.length; index += roundsPerPhase) {
+        const slice = params.formattedRounds.slice(index, index + roundsPerPhase);
+        if (slice.length === 0) continue;
+        const startRound = slice[0].round.roundIndex;
+        const endRound = slice[slice.length - 1].round.roundIndex;
+        const toolCalls = slice.reduce((sum, item) => sum + item.round.toolCalls.length, 0);
+        const codeFiles = Array.from(new Set(slice.flatMap(item => item.round.codeActions.map(action => action.targetFile).filter(Boolean)))).slice(0, 8);
+        lines.push(`## Phase ${phaseNo}：当前缓存保真重建（轮次 ${startRound}-${endRound}）`);
+        lines.push("");
+        lines.push(`- 轮次范围：${startRound}-${endRound}`);
+        lines.push(`- 覆盖范围：第 ${startRound}-${endRound} 轮，共 ${slice.length} 轮；工具调用 ${toolCalls} 次。`);
+        if (codeFiles.length > 0) {
+            lines.push(`- 主要文件：${codeFiles.join("、")}`);
+        }
+        lines.push("- 状态：从已提交 fetch 缓存重建，优先保证轮次、人物、文件、验证与决策不丢失。");
+        lines.push("");
+        lines.push("### 轮次要点");
+        for (const item of slice) {
+            lines.push(summarizeRoundForControlledRebuild(item.round));
+        }
+        lines.push("");
+        phaseNo += 1;
+    }
+
+    lines.push("# 产出文件总清单");
+    lines.push("");
+    lines.push("- 受控重建模式保留了每轮涉及文件的索引；详细代码改动、工具结果和附件引用仍以当前 fetch 缓存为准。");
+    lines.push("");
+    lines.push("# 经验教训");
+    lines.push("");
+    lines.push("- 旧 Record 正文与当前 fetch 缓存轮次体系不一致时，不能继续按旧覆盖轮次增量追加，否则会把不同编号体系拼接在一起。");
+    lines.push("- 受控重建宁可生成较长的轮次索引，也不能把几十轮压成少数 Phase 后冒充完整 Record。");
+    lines.push("");
+    lines.push("# 风险与后续建议");
+    lines.push("");
+    lines.push("- 本 Record 是保真重建索引，不是模型深度复盘；如需更高层项目总结，可在此基础上再次执行人工或模型 refine。");
+    if (params.warnings.length > 0) {
+        lines.push("- 生成警告：");
+        for (const warning of params.warnings) {
+            lines.push(`  - ${warning}`);
+        }
+    }
+    lines.push("");
+    lines.push("<!-- TAGS: controlled-rebuild, fetch-cache, record-recovery -->");
+    return lines.join("\n");
+}
+
+function applyControlledRebuildFallbackIfSparse(result: GenerateRecordResult, params: {
+    legacyRoundUniverseIncompatible: boolean;
+    conversationId: string;
+    workspace: string;
+    totalRounds: number;
+    totalSteps: number;
+    formattedRounds: FormattedRecordRound[];
+    sourceRoundStart: number;
+    warnings: string[];
+}): GenerateRecordResult {
+    if (!params.legacyRoundUniverseIncompatible || !result.success || !result.content) return result;
+    if (!isControlledRebuildCandidateTooSparse(result.content, params.totalRounds)) return result;
+    const minimumPhaseCount = minimumControlledRebuildPhaseCount(params.totalRounds);
+    const actualPhaseCount = countPhasesInRecord(result.content);
+    const fallbackWarning = `模型重建候选 Phase 数过少（${actualPhaseCount}/${minimumPhaseCount}），已改用当前 fetch 缓存生成保真轮次索引，避免把 ${params.totalRounds} 轮压缩成过粗 Record`;
+    const fallbackContent = enforceRecordHeaderMetadata(
+        createControlledRebuildFallbackRecord({
+            conversationId: params.conversationId,
+            workspace: params.workspace,
+            totalRounds: params.totalRounds,
+            totalSteps: params.totalSteps,
+            formattedRounds: params.formattedRounds,
+            sourceRoundStart: params.sourceRoundStart,
+            warnings: [...params.warnings, ...(result.warnings || []), fallbackWarning],
+        }),
+        {
+            conversationId: params.conversationId,
+            workspace: params.workspace,
+            totalRounds: params.totalRounds,
+            totalSteps: params.totalSteps,
+        },
+    );
+    return {
+        ...result,
+        content: fallbackContent,
+        tags: Array.from(new Set([...(result.tags || []), "controlled-rebuild", "fetch-cache"])),
+        warnings: [...(result.warnings || []), fallbackWarning],
+    };
+}
+
 function countToolCalls(rounds: ConversationRound[]): number {
     return rounds.reduce((sum, round) => sum + (round.toolCalls?.length || 0), 0);
 }
@@ -2462,6 +2610,7 @@ export function resolveRecordSourceReadStartRound(
 ): number {
     if (!Number.isSafeInteger(totalRounds) || totalRounds < 1) return 1;
     if (!existingRecord.trim()) return 1;
+    if (hasIncompatibleRecordRoundUniverse(existingRecord, totalRounds)) return 1;
     const parsed = parseRecordDocument(existingRecord);
     if (!parsed || parsed.phases.length === 0) return force ? 1 : Math.min(Math.max(coveredRound + 1, 1), totalRounds);
     const preserveExistingForForce = force && !RECORD_FORCE_FULL_REBUILD;
@@ -2475,6 +2624,14 @@ export function resolveRecordSourceReadStartRound(
         }
     }
     return Math.min(resumeFromRound + 1, totalRounds);
+}
+
+export function hasIncompatibleRecordRoundUniverse(existingRecord: string, totalRounds: number): boolean {
+    if (!existingRecord.trim() || !Number.isSafeInteger(totalRounds) || totalRounds < 1) return false;
+    const declaredTotalRounds = inferRecordTotalRounds(existingRecord);
+    const parsed = parseRecordDocument(existingRecord);
+    const maxPhaseEndRound = parsed.phases.reduce((max, phase) => Math.max(max, phase.endRound || 0), 0);
+    return declaredTotalRounds > totalRounds || maxPhaseEndRound > totalRounds;
 }
 
 export async function generateRecord(
@@ -2498,14 +2655,6 @@ export async function generateRecord(
         // 如确实需要旧式全量重建，可显式设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1。
         const storedRecord = await readRecordAsync(hash, conversationId) || "";
         const forceRequested = options.force === true;
-        const storedParsedForForce = storedRecord ? parseRecordDocument(storedRecord) : null;
-        const preserveExistingForForce = forceRequested
-            && !RECORD_FORCE_FULL_REBUILD
-            && storedParsedForForce !== null
-            && storedParsedForForce.phases.length > 0;
-        const forceRebuild = forceRequested && !preserveExistingForForce;
-        let existingRecord = forceRebuild ? "" : storedRecord;
-        let currentRecord = existingRecord;
         const sourceRoundStart = options.sourceRoundStart ?? 1;
         const totalRounds = options.sourceTotalRounds ?? rounds.length;
         if (!Number.isSafeInteger(sourceRoundStart)
@@ -2515,6 +2664,15 @@ export async function generateRecord(
             || (rounds.length > 0 && sourceRoundStart + rounds.length - 1 !== totalRounds)) {
             return { success: false, error: `Record 增量来源轮次窗口非法: start=${sourceRoundStart}, materialized=${rounds.length}, total=${totalRounds}` };
         }
+        const legacyRoundUniverseIncompatible = hasIncompatibleRecordRoundUniverse(storedRecord, totalRounds);
+        const storedParsedForForce = storedRecord && !legacyRoundUniverseIncompatible ? parseRecordDocument(storedRecord) : null;
+        const preserveExistingForForce = forceRequested
+            && !RECORD_FORCE_FULL_REBUILD
+            && storedParsedForForce !== null
+            && storedParsedForForce.phases.length > 0;
+        const forceRebuild = forceRequested && !preserveExistingForForce;
+        let existingRecord = (forceRebuild || legacyRoundUniverseIncompatible) ? "" : storedRecord;
+        let currentRecord = existingRecord;
         const indexBeforeRepair = (await readRecordsIndexAsync(hash)).records[conversationId];
         const indexedBeforeRepair = Math.min(Math.max(indexBeforeRepair?.lastUpdatedRound ?? 0, 0), totalRounds);
         const inferredBeforeRepair = storedRecord ? inferCoveredRoundFromRecord(storedRecord, totalRounds) : 0;
@@ -2526,6 +2684,9 @@ export async function generateRecord(
             : 0;
         const forcePreserveWarning = preserveExistingForForce
             ? "force=true 已按安全刷新处理：保留旧 Record 稳定 Phase，仅回滚尾部并继续增量合成；若确需丢弃旧 Record 全量重建，请设置 MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1"
+            : undefined;
+        const roundUniverseWarning = legacyRoundUniverseIncompatible
+            ? "旧 Record 轮次体系与当前 fetch 缓存不兼容，已忽略旧覆盖轮次并按当前缓存全量重建"
             : undefined;
     // 只要会走 local-compose（force=true 安全刷新 / force=false 增量），就要把 resumeFromRound
     // 预先拉齐到 boundary.stableEndRound——否则 chunks 从旧 lastUpdatedRound 起，会跳过 boundary
@@ -2555,7 +2716,7 @@ export async function generateRecord(
     const repairedCoverageWarning = storedRecord && !forceRebuild && indexBeforeRepair && inferredBeforeRepair !== indexedBeforeRepair
         ? `Record 正文实际覆盖 ${inferredBeforeRepair}/${totalRounds} 轮，索引原为 ${indexedBeforeRepair}/${totalRounds} 轮，提交时会刷新索引`
         : undefined;
-    const warnings = [repairedCoverageWarning, forcePreserveWarning].filter((item): item is string => Boolean(item));
+    const warnings = [repairedCoverageWarning, forcePreserveWarning, roundUniverseWarning].filter((item): item is string => Boolean(item));
     options.onProgress?.({
         stage: roundsToProcess.length > 0 ? "准备生成 Record" : "Record 已是最新",
         current: resumeFromRound,
@@ -2576,6 +2737,33 @@ export async function generateRecord(
             upToDate: true,
             warnings: warnings.length ? warnings : undefined,
         };
+    }
+
+    if (legacyRoundUniverseIncompatible && totalRounds >= 20) {
+        throwIfRecordRunAborted(options, "开始保真重建前检查到任务已终止");
+        const formattedRounds = formatRoundsForRecord(roundsToProcess);
+        const directRebuildWarning = `旧 Record 轮次体系不兼容，已直接基于当前 fetch 缓存生成 ${minimumControlledRebuildPhaseCount(totalRounds)} 个以上 Phase 的保真重建索引，跳过慢速模型整合`;
+        const content = enforceRecordHeaderMetadata(
+            createControlledRebuildFallbackRecord({
+                conversationId,
+                workspace,
+                totalRounds,
+                totalSteps,
+                formattedRounds,
+                sourceRoundStart,
+                warnings: [...warnings, directRebuildWarning],
+            }),
+            { conversationId, workspace, totalRounds, totalSteps },
+        );
+        return withRecordModelUsage({
+            success: true,
+            content,
+            batches: 0,
+            coveredRounds: totalRounds,
+            tags: ["controlled-rebuild", "fetch-cache", "record-recovery"],
+            pipeline: "serial",
+            warnings: [...warnings, directRebuildWarning],
+        }, options);
     }
 
     if (!options.schedulerManagedExecution) {
@@ -2634,7 +2822,17 @@ export async function generateRecord(
             const mergedParallelResult = warnings.length && parallelResult.success
                 ? { ...parallelResult, warnings: [...(parallelResult.warnings || []), ...warnings] }
                 : parallelResult;
-            return withRecordModelUsage(mergedParallelResult, options);
+            const controlledParallelResult = applyControlledRebuildFallbackIfSparse(mergedParallelResult, {
+                legacyRoundUniverseIncompatible,
+                conversationId,
+                workspace,
+                totalRounds,
+                totalSteps,
+                formattedRounds,
+                sourceRoundStart,
+                warnings,
+            });
+            return withRecordModelUsage(controlledParallelResult, options);
         } catch (err) {
             if (isBackgroundTaskSuspension(err)) throw err;
             if (isRecordGenerationAbortedError(err)) throw err;
@@ -2686,7 +2884,25 @@ export async function generateRecord(
 
         const { content: cleanedContent, tags } = cleanFlashResponse(response);
         const finalContent = enforceRecordHeaderMetadata(cleanedContent, { conversationId, workspace, totalRounds, totalSteps });
-        const validation = validateRecordBeforeAccept(finalContent, conversationId, totalRounds, totalRounds, existingRecord);
+        const singleResult = applyControlledRebuildFallbackIfSparse({
+            success: true,
+            content: finalContent,
+            batches: 1,
+            coveredRounds: totalRounds,
+            tags,
+            pipeline: "serial",
+            warnings,
+        }, {
+            legacyRoundUniverseIncompatible,
+            conversationId,
+            workspace,
+            totalRounds,
+            totalSteps,
+            formattedRounds,
+            sourceRoundStart,
+            warnings,
+        });
+        const validation = validateRecordBeforeAccept(singleResult.content!, conversationId, totalRounds, totalRounds, existingRecord);
         if (!validation.ok) {
             return withRecordModelUsage({
                 success: false,
@@ -2701,7 +2917,7 @@ export async function generateRecord(
             unit: "轮",
             detail: `已覆盖到第 ${totalRounds} 轮`,
         });
-        return withRecordModelUsage({ success: true, content: finalContent, batches: 1, coveredRounds: totalRounds, tags, pipeline: "serial", warnings }, options);
+        return withRecordModelUsage(singleResult, options);
     }
 
     // 分批处理
@@ -2803,7 +3019,25 @@ export async function generateRecord(
         unit: "轮",
         detail: `分 ${batchCount} 批完成`,
     });
-    return withRecordModelUsage({ success: true, content: currentRecord, batches: batchCount, coveredRounds: totalRounds, tags: lastTags, pipeline: "serial", warnings }, options);
+    const serialResult = applyControlledRebuildFallbackIfSparse({
+        success: true,
+        content: currentRecord,
+        batches: batchCount,
+        coveredRounds: totalRounds,
+        tags: lastTags,
+        pipeline: "serial",
+        warnings,
+    }, {
+        legacyRoundUniverseIncompatible,
+        conversationId,
+        workspace,
+        totalRounds,
+        totalSteps,
+        formattedRounds,
+        sourceRoundStart,
+        warnings,
+    });
+    return withRecordModelUsage(serialResult, options);
     } catch (err) {
         if (isRecordGenerationAbortedError(err)) {
             return withRecordModelUsage({

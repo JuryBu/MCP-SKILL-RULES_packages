@@ -18,7 +18,7 @@
 
 | 组件 | 版本 | 主要用途 |
 | --- | ---: | --- |
-| `memory-store` | 1.23.6 | 记忆、五宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
+| `memory-store` | 1.23.10 | 记忆、五宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
 | `sandbox` | 1.17.2 | 隔离执行、动态内存调度、流式搜索隔离、Windows 进程树硬限制、按需 artifact、持久会话、Codex 任务与多模型 Council |
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
@@ -34,6 +34,7 @@
 - Memory Store 1.23.0 新增只读 DeepSeek Harness 数据链，可从 v0 JSONL/Zstandard session 日志建立统一 fetch 缓存；仅 DSH `source.kind=user` 的消息计入真人轮，synthetic/tool/subagent/automation 保留来源但不冒充主人，DSH 也不会被当成模型提供者。
 - Memory Store 1.23.1 修复数百/数千个无 Frame Content Size 的拼接 Zstd 小帧导致 Node 24 异常大额内存申请的问题，改为受限逐帧解码并校验 checksum。
 - Memory Store 1.23.6 修复 Windsurf/Antigravity 本地 PB 与 LS 的等价比较：附件占位、planner reasoning 与 PB wire 字段不会再制造冲突，`auto` 会在内容一致时采用 LS 的真实工具语义；Record 更新也可显式选择 `source=auto|local|ls|cache`。
+- Memory Store 1.23.10 修复 WSF/Antigravity 旧 Record 与当前 fetch 缓存轮次体系不兼容时的伪 fresh：可信 fetch 会让旧 revision 正常补新，旧正文轮次超过当前源时改从当前缓存受控重建，并保持候选覆盖门禁。
 - 跨宿主 Conversation 需要接收方自行授权访问对应宿主的本地对话目录；工具包不会携带发送方数据，也不会把读取权限扩展到未配置的机器或账户。
 - `conversation_golden_extract` 从长对话中提取可复用的高价值片段。
 - `record_manage` 维护结构化工作记录，支持读取视图、阶段更新、所有权审计与后台生成。
@@ -178,7 +179,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 
 | Component | Version | Purpose |
 | --- | ---: | --- |
-| `memory-store` | 1.23.6 | Memory, five-host Conversation/Recall, Record, Golden Extract, Stage Guard, scheduling recovery, and host routing |
+| `memory-store` | 1.23.10 | Memory, five-host Conversation/Recall, Record, Golden Extract, Stage Guard, scheduling recovery, and host routing |
 | `sandbox` | 1.17.2 | Isolated execution, adaptive memory admission, streaming search isolation, Windows process-tree hard limits, on-demand artifacts, sessions, Codex tasks, and multi-model Council |
 | `web-fetcher` | 7.0.0 | Headless browsing, authenticated profiles, local file formats, screenshots, inspection, and desktop control |
 | `broker` | 0.1.0 | Stable Streamable HTTP bridge for local stdio MCP servers |
@@ -192,6 +193,7 @@ The project started as an Antigravity toolset and now supports Codex, Antigravit
 - Memory Store 1.23.0 adds a read-only DeepSeek Harness data chain for v0 JSONL/Zstandard session logs. Only DSH messages with `source.kind=user` count as human turns; synthetic, tool, subagent, and automation events retain provenance without impersonating the owner, and DSH is never exposed as a model provider.
 - Memory Store 1.23.1 replaces Node 24's high-allocation path for concatenated Zstd frames without declared content sizes with bounded per-frame decoding and checksum verification.
 - Memory Store 1.23.6 fixes Windsurf/Antigravity local PB versus LS equivalence: attachment placeholders, planner reasoning, and PB wire fields no longer create false conflicts, `auto` preserves LS semantic tool calls when content matches, and Record updates can explicitly select `source=auto|local|ls|cache`.
+- Memory Store 1.23.10 fixes pseudo-fresh WSF/Antigravity Records whose legacy body belongs to a different round universe than the current fetch cache. Verified fetch revisions can advance old Records, while incompatible legacy bodies are rebuilt from the current cache without weakening candidate coverage gates.
 - Cross-host conversation access requires receiver-granted access to each host's local conversation directory; no sender data or remote account access is bundled.
 - Record, Golden Extract, Stage Guard, ownership checks, background recovery, and stable task IDs support long engineering workflows.
 - Memory Store 1.21.1 adds production scheduling, source-evidence tracking, startup barriers, commit protocols, provider admission/control, and unknown-chain migration for recoverable multi-host Record work.

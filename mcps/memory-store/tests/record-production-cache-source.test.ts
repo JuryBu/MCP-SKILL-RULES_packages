@@ -302,6 +302,182 @@ try {
     assert.equal(discovery.input.sourceEnumerations[0].evidence.sourceRevision.revision, authorityRevision.revision);
     const discoverySnapshot = discoverRecordCandidates(discovery.input);
     assert.equal(discoverySnapshot.candidates[0]?.classification, "Missing", "已完整校验的不可变 fetch 缓存必须能进入 Record 生产，不能被普通 cacheBypassed 门槛误判为 Unresolved");
+    const unsequencedAuthorityRevision = { ...authorityRevision, sequence: null };
+    const legacyRecordDiscovery = await discoveryAdapter.buildDiscoveryInput({
+        kind: "record-update",
+        selector: "normal",
+        workspaceHash: "workspace-cache",
+        workspacePath: "C:/workspace-cache",
+        hosts: ["codex"],
+        records: [{
+            conversationId,
+            title: conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+            host: "codex",
+            lastUpdatedAt: new Date(fingerprint.mtime - 120_000).toISOString(),
+            lastUpdatedRound: 1,
+            recordBodyHash: `sha256:${"a".repeat(64)}`,
+        }],
+        targets: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+        }],
+        sourceCacheReferences: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            cacheGeneration,
+            cacheReadStartRound: 2,
+            sourceSnapshot: { authorityRevision: unsequencedAuthorityRevision },
+        }],
+    });
+    const legacyRecordSnapshot = discoverRecordCandidates(legacyRecordDiscovery.input);
+    assert.equal(
+        legacyRecordSnapshot.candidates[0]?.classification,
+        "Stale",
+        "verified fetch cache must classify an older unbound Record as Stale instead of revision-order-unknown",
+    );
+    assert.notEqual(
+        legacyRecordSnapshot.candidates[0]?.classificationReason.code,
+        "revision-order-unknown",
+        "verified fetch cache sequence must bridge legacy Records that do not yet carry coveredRevision metadata",
+    );
+    const legacyCoveredRecordDiscovery = await discoveryAdapter.buildDiscoveryInput({
+        kind: "record-update",
+        selector: "normal",
+        workspaceHash: "workspace-cache",
+        workspacePath: "C:/workspace-cache",
+        hosts: ["codex"],
+        records: [{
+            conversationId,
+            title: conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+            host: "codex",
+            lastUpdatedAt: new Date(fingerprint.mtime - 120_000).toISOString(),
+            lastUpdatedRound: 1,
+            recordBodyHash: `sha256:${"b".repeat(64)}`,
+            coveredRevision: `sha256:${"c".repeat(64)}`,
+        }],
+        targets: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+        }],
+        sourceCacheReferences: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            cacheGeneration,
+            cacheReadStartRound: 2,
+            sourceSnapshot: { authorityRevision: unsequencedAuthorityRevision },
+        }],
+    });
+    const legacyCoveredRecordSnapshot = discoverRecordCandidates(legacyCoveredRecordDiscovery.input);
+    assert.equal(
+        legacyCoveredRecordSnapshot.candidates[0]?.classification,
+        "Stale",
+        "verified fetch cache must bridge legacy Records whose coveredRevision lacks a sequence",
+    );
+    assert.notEqual(
+        legacyCoveredRecordSnapshot.candidates[0]?.classificationReason.code,
+        "revision-order-unknown",
+        "verified fetch cache must not strand legacy coveredRevision metadata without sequence",
+    );
+    const incompatibleUniverseDiscovery = await discoveryAdapter.buildDiscoveryInput({
+        kind: "record-update",
+        selector: "normal",
+        workspaceHash: "workspace-cache",
+        workspacePath: "C:/workspace-cache",
+        hosts: ["codex"],
+        records: [{
+            conversationId,
+            title: conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+            host: "codex",
+            lastUpdatedAt: new Date(fingerprint.mtime + 120_000).toISOString(),
+            lastUpdatedRound: 64,
+            totalRounds: 80,
+            recordBodyHash: `sha256:${"d".repeat(64)}`,
+            coveredRevision: `sha256:${"e".repeat(64)}`,
+            coveredRevisionSequence: authorityRevision.sequence + 10,
+        }],
+        targets: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+        }],
+        sourceCacheReferences: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            cacheGeneration,
+            cacheReadStartRound: 1,
+            sourceSnapshot: { authorityRevision, roundCount: 2 },
+        }],
+    });
+    const incompatibleUniverseSnapshot = discoverRecordCandidates(incompatibleUniverseDiscovery.input);
+    assert.equal(
+        incompatibleUniverseSnapshot.candidates[0]?.classification,
+        "Stale",
+        "旧 Record 轮次体系超过当前 fetch 缓存时必须重建，不能被错误 coveredRevision 拦截",
+    );
+    assert.equal(
+        incompatibleUniverseSnapshot.candidates[0]?.classificationReason.code,
+        "record-round-universe-incompatible",
+        "旧 Record 水印比源新时，应优先按当前 fetch 轮次体系不兼容处理",
+    );
+    const cacheRevisionOrderingDiscovery = await discoveryAdapter.buildDiscoveryInput({
+        kind: "record-update",
+        selector: "normal",
+        workspaceHash: "workspace-cache",
+        workspacePath: "C:/workspace-cache",
+        hosts: ["codex"],
+        records: [{
+            conversationId,
+            title: conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+            host: "codex",
+            lastUpdatedAt: new Date(fingerprint.mtime).toISOString(),
+            lastUpdatedRound: 2,
+            totalRounds: 2,
+            recordBodyHash: `sha256:${"f".repeat(64)}`,
+            coveredRevision: `cache-generation:previous-generation`,
+            coveredRevisionSequence: authorityRevision.sequence + 10,
+        }],
+        targets: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            workspacePath: "C:/workspace-cache",
+        }],
+        sourceCacheReferences: [{
+            host: "codex",
+            conversationId,
+            workspaceHash: "workspace-cache",
+            cacheGeneration,
+            cacheReadStartRound: 1,
+            sourceSnapshot: { authorityRevision, roundCount: 2 },
+        }],
+    });
+    const cacheRevisionOrderingSnapshot = discoverRecordCandidates(cacheRevisionOrderingDiscovery.input);
+    assert.equal(
+        cacheRevisionOrderingSnapshot.candidates[0]?.classification,
+        "Stale",
+        "verified fetch cache 的新 generation 不得被旧 coveredRevisionSequence 误判成 source-revision-older-than-record",
+    );
+    assert.notEqual(
+        cacheRevisionOrderingSnapshot.candidates[0]?.classificationReason.code,
+        "source-revision-older-than-record",
+        "verified fetch cache generation 差异应直接进入更新，而不是卡成不可解决状态",
+    );
 
     fs.writeFileSync(path.join(cacheDirectory, cacheManifest.files.recordProjection.file), "tampered\n", "utf8");
     await assert.rejects(() => reader.scan({

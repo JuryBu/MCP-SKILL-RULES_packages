@@ -285,6 +285,7 @@ async function resolveAdmissionIdentity(
     const ledgerTaskIds = new Set(listRecordSchedulerLedgerTaskIds());
     const untrustedLedgerTaskIds = new Set(ledgerTaskIds);
     const matchingCapsuleTaskIds = new Set<string>();
+    const mismatchedRequestKeyTaskIds = new Set<string>();
     const capsuleReads = await mapWithAdmissionConcurrency(
         listRecordSchedulerAdmissionCapsuleTaskIds(),
         async taskId => ({ taskId, result: await readRecordSchedulerAdmissionCapsule(taskId) }),
@@ -313,8 +314,12 @@ async function resolveAdmissionIdentity(
             continue;
         }
         if (sameRequestKey) {
-            if (!sameIdentity || !sameTaskKind) {
+            if (!sameTaskKind) {
                 conflictingTaskIds.push(taskId);
+                continue;
+            }
+            if (!sameIdentity) {
+                mismatchedRequestKeyTaskIds.add(taskId);
                 continue;
             }
             matchingCapsuleTaskIds.add(taskId);
@@ -333,6 +338,7 @@ async function resolveAdmissionIdentity(
 
     const candidateTaskIds = [...new Set([
         ...matchingCapsuleTaskIds,
+        ...mismatchedRequestKeyTaskIds,
         ...untrustedLedgerTaskIds,
     ])].sort();
     const candidateReads = await mapWithAdmissionConcurrency(
@@ -367,6 +373,18 @@ async function resolveAdmissionIdentity(
             markUnresolved(candidate.taskId, `ledger ${candidate.taskId} 无法判定 admission identity：${candidate.stored.kind}`);
             continue;
         }
+        if (mismatchedRequestKeyTaskIds.has(candidate.taskId)) {
+            const identity = candidate.stored.ledger.task.admissionIdentity;
+            const sameRequestKey = identity.requestKey === admissionIdentity.requestKey;
+            const sameIdentity = sameAdmissionIdentity(identity, admissionIdentity);
+            const sameTaskKind = taskKindFromRequestMode(candidate.stored.ledger.task.requestMode) === taskKind;
+            if (sameRequestKey && !sameIdentity) {
+                if (!sameTaskKind || !isTerminalTaskState(candidate.stored.ledger.task.state)) {
+                    conflictingTaskIds.push(candidate.taskId);
+                }
+                continue;
+            }
+        }
         if (candidate.stored.ledger.task.admission.state !== "LedgerCreated") {
             markUnresolved(candidate.taskId, `ledger ${candidate.taskId} 缺失可信 admission capsule`);
             continue;
@@ -376,8 +394,14 @@ async function resolveAdmissionIdentity(
         const sameIdentity = sameAdmissionIdentity(identity, admissionIdentity);
         const sameTaskKind = taskKindFromRequestMode(candidate.stored.ledger.task.requestMode) === taskKind;
         if (sameRequestKey) {
-            if (!sameIdentity || !sameTaskKind) {
+            if (!sameTaskKind) {
                 conflictingTaskIds.push(candidate.taskId);
+                continue;
+            }
+            if (!sameIdentity) {
+                if (!isTerminalTaskState(candidate.stored.ledger.task.state)) {
+                    conflictingTaskIds.push(candidate.taskId);
+                }
                 continue;
             }
             matching.push(candidate.stored.ledger);

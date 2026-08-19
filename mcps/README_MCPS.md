@@ -2,11 +2,11 @@
 
 ## Components
 
-### memory-store 1.22.10
+### memory-store 1.23.10
 
-Shared memory, four-host Conversation reading/export/Recall, offline PB listing, compaction metadata, Record management, Golden Extract, Stage Guard, ownership repair, trajectories, smart search, background recovery, stable task status, source evidence, provider control and production Record scheduling.
+Shared memory, five-host Conversation reading/export/Recall, offline PB listing, compaction metadata, Record management, Golden Extract, Stage Guard, ownership repair, trajectories, smart search, background recovery, stable task status, source evidence, provider control and production Record scheduling. Version 1.23.10 also repairs WSF/Antigravity pseudo-fresh legacy Records by rebuilding incompatible round universes from the verified fetch cache.
 
-Data routes: `auto | antigravity | codex | claude-code | cc | windsurf | wsf`.
+Data routes: `auto | antigravity | codex | claude-code | cc | windsurf | wsf | dsh | deepseek-harness`.
 
 Model routes: `auto | antigravity | codex | claude-code | cc | grok | agy`.
 

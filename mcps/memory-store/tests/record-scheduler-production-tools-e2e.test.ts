@@ -409,6 +409,11 @@ try {
             Number.isSafeInteger(committedBatchIndex.records[targetConversationId]?.coveredRevisionSequence),
             "Verified Record metadata must persist the authoritative source revision sequence",
         );
+        assert.ok(
+            typeof committedBatchIndex.records[targetConversationId]?.coveredRevision === "string"
+            && committedBatchIndex.records[targetConversationId]!.coveredRevision!.length > 0,
+            "Verified Record metadata must persist the authoritative source revision",
+        );
     }
     const modelRequestsBeforeStaleBatch = modelRequests;
     const deferredBatchSourceSequence = appendStaleRound(deferredBatchConversationId);

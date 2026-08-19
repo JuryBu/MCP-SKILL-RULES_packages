@@ -726,19 +726,28 @@ try {
             if (replay.outcome === "UnknownOutcome") throw new Error(replay.reasons.join("; "));
             assert.equal(replay.taskId, taskId);
 
-            await assert.rejects(
-                () => schedulerAdmission.admitRecordSchedulerTask({
-                    kind: "record-update",
-                    requestKey,
-                    initialLedger: makeAdmissionInitialLedger("record-scheduler-admission-terminal-conflict"),
-                    immutableRequestSummary: { ...requestSummary, conversationId: "terminal-replay-conflict" },
-                    resumePayload,
-                    replayTerminal: false,
-                    run: async () => "must-not-run-terminal-conflict",
-                }),
-                schedulerAdmission.RecordSchedulerAdmissionConflictError,
-                "terminal task 也必须先校验 requestHash/kind，不能被 replayTerminal=false 跳过",
-            );
+            const terminalIdentityRetry = await schedulerAdmission.admitRecordSchedulerTask({
+                kind: "record-update",
+                requestKey,
+                initialLedger: makeAdmissionInitialLedger("record-scheduler-admission-terminal-conflict"),
+                immutableRequestSummary: { ...requestSummary, conversationId: "terminal-replay-conflict" },
+                resumePayload,
+                replayTerminal: false,
+                run: async () => "terminal-new-identity",
+            });
+            assert.equal(terminalIdentityRetry.outcome, "Admitted", "终态不同 identity 不应永久阻塞同 requestKey 的新尝试");
+            if (terminalIdentityRetry.outcome === "UnknownOutcome") throw new Error(terminalIdentityRetry.reasons.join("; "));
+            assert.equal(terminalIdentityRetry.taskId, "record-scheduler-admission-terminal-conflict");
+            await waitForBackgroundTask(terminalIdentityRetry.task.id, 2);
+            const terminalIdentityRetryStored = await schedulerStore.readRecordSchedulerLedgerStore("record-scheduler-admission-terminal-conflict", { expectPublished: true });
+            assert.equal(terminalIdentityRetryStored.kind, "current");
+            if (terminalIdentityRetryStored.kind !== "current") throw new Error("terminal identity retry ledger missing");
+            const terminalIdentityRetryLedger = structuredClone(terminalIdentityRetryStored.ledger);
+            terminalIdentityRetryLedger.task.state = "Succeeded";
+            terminalIdentityRetryLedger.task.terminalState = "Succeeded";
+            terminalIdentityRetryLedger.task.updatedAt = new Date().toISOString();
+            terminalIdentityRetryLedger.persistedHash = schedulerStore.calculateRecordSchedulerLedgerHash(terminalIdentityRetryLedger);
+            fs.writeFileSync(schedulerStore.recordSchedulerLedgerPath("record-scheduler-admission-terminal-conflict"), `${JSON.stringify(terminalIdentityRetryLedger, null, 2)}\n`, "utf8");
 
             const retry = await schedulerAdmission.admitRecordSchedulerTask({
                 kind: "record-update",

@@ -36,6 +36,7 @@ export interface RecordIndexEntry {
     sizeBytes: number;
     tags?: string[];          // v1.8.1: 自动提取的标签
     chain?: string;           // v1.17.2: 对话来源 (codex/claude-code/windsurf/antigravity)，用于 stale_check
+    coveredRevision?: string;
     coveredRevisionSequence?: number;
     commitArtifact?: {
         identity: RecordCommitArtifactIdentity;
@@ -55,6 +56,7 @@ export interface RecordIndexEntryMetadataSnapshot {
     sizeBytes: number;
     tags: string[];
     chain?: string;
+    coveredRevision?: string;
     coveredRevisionSequence?: number;
 }
 
@@ -333,6 +335,7 @@ export function createRecordIndexEntryMetadataSnapshot(
         sizeBytes,
         tags,
         ...(meta?.chain ? { chain: meta.chain } : {}),
+        ...(isNonEmptyString(meta?.coveredRevision) ? { coveredRevision: meta!.coveredRevision } : {}),
         ...(Number.isSafeInteger(meta?.coveredRevisionSequence) && (meta?.coveredRevisionSequence ?? -1) >= 0
             ? { coveredRevisionSequence: meta!.coveredRevisionSequence }
             : {}),
@@ -357,6 +360,7 @@ export function isRecordIndexEntryMetadataSnapshot(value: unknown): value is Rec
         && Number.isInteger(candidate.sizeBytes) && (candidate.sizeBytes ?? -1) >= 0
         && Array.isArray(candidate.tags) && candidate.tags.every(item => typeof item === "string")
         && (candidate.chain === undefined || isNonEmptyString(candidate.chain))
+        && (candidate.coveredRevision === undefined || isNonEmptyString(candidate.coveredRevision))
         && (candidate.coveredRevisionSequence === undefined
             || Number.isSafeInteger(candidate.coveredRevisionSequence) && candidate.coveredRevisionSequence >= 0);
 }
@@ -1163,6 +1167,7 @@ function metadataSnapshotFromRecordIndexEntry(entry: RecordIndexEntry): RecordIn
         sizeBytes: entry.sizeBytes,
         tags: [...(entry.tags || [])],
         ...(entry.chain ? { chain: entry.chain } : {}),
+        ...(entry.coveredRevision ? { coveredRevision: entry.coveredRevision } : {}),
         ...(Number.isSafeInteger(entry.coveredRevisionSequence) && (entry.coveredRevisionSequence ?? -1) >= 0
             ? { coveredRevisionSequence: entry.coveredRevisionSequence }
             : {}),
@@ -1231,6 +1236,7 @@ function recordIndexEntryForCommit(
             sizeBytes: snapshot.sizeBytes,
             tags: [...snapshot.tags],
             ...(snapshot.chain ? { chain: snapshot.chain } : {}),
+            coveredRevision: identity.coveredRevision,
             ...(Number.isSafeInteger(snapshot.coveredRevisionSequence) && (snapshot.coveredRevisionSequence ?? -1) >= 0
                 ? { coveredRevisionSequence: snapshot.coveredRevisionSequence }
                 : {}),
@@ -1252,6 +1258,7 @@ function recordIndexEntryForCommit(
         sizeBytes: Buffer.byteLength(body, "utf8"),
         tags: meta?.tags || existing?.tags || [],
         chain: meta?.chain || existing?.chain,
+        coveredRevision: identity.coveredRevision,
         ...(Number.isSafeInteger(meta?.coveredRevisionSequence) && (meta?.coveredRevisionSequence ?? -1) >= 0
             ? { coveredRevisionSequence: meta!.coveredRevisionSequence }
             : {}),
