@@ -89,6 +89,7 @@ Commands:
 - Syntax validation for both entry points: `npm run check`
 - The `npm run health` alias intentionally runs that static validation. This package does not ship the private PowerShell health scripts.
 - A receiver can run `install\Update-CodexMcpBroker.ps1` for either a flat `%USERPROFILE%\.codex\mcp-http-broker` installation or a managed release. Unless `-BrokerRoot` is explicit, the updater prefers `CODEX_TOOLKIT_SERVICE_MANIFEST` or `%USERPROFILE%\.codex-toolkit\services\infrastructure\service-manifest.json` and honors the separate `broker.brokerScript`, `broker.startScript`, and `broker.stopScript` paths. Before any write, the healthy PID must resolve to the target Node entry script; after restart, the PID must change and still resolve to that script. The updater also validates the changed lifecycle tests, backs up installed code and scripts, checks selected deep-health endpoints and caller-supplied protected state hashes, and restores the previous snapshot on failure.
+- The updater now treats broker package metadata as part of the runtime snapshot: it copies `package.json` and `package-lock.json`, runs `npm ci --omit=dev --ignore-scripts` in the target broker directory before restart, verifies package file hashes, and restores the previous package files during rollback.
 
 Shutdown behavior:
 
