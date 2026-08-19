@@ -27,6 +27,8 @@ $SourceBrokerRoot = [System.IO.Path]::GetFullPath($SourceBrokerRoot)
 $SourceBrokerPath = Join-Path $SourceBrokerRoot "broker.mjs"
 $SourceEndpointConfigPath = Join-Path $SourceBrokerRoot "endpoint-config.mjs"
 $SourceLifecyclePath = Join-Path $SourceBrokerRoot "request-lifecycle.mjs"
+$SourceExaKeyPoolPath = Join-Path $SourceBrokerRoot "exa-key-pool.mjs"
+$SourceExaBridgePath = Join-Path $SourceBrokerRoot "exa-stateless-stdio.mjs"
 $SourcePackagePath = Join-Path $SourceBrokerRoot "package.json"
 $SourcePackageLockPath = Join-Path $SourceBrokerRoot "package-lock.json"
 $SourceStopScript = Join-Path $InstallerRoot "Stop-CodexMcpBroker.ps1"
@@ -73,6 +75,8 @@ $BrokerRoot = [System.IO.Path]::GetFullPath($BrokerRoot)
 $InstalledBrokerPath = if ($ManagedBrokerPath) { $ManagedBrokerPath } else { Join-Path $BrokerRoot "broker.mjs" }
 $InstalledEndpointConfigPath = Join-Path $BrokerRoot "endpoint-config.mjs"
 $InstalledLifecyclePath = Join-Path $BrokerRoot "request-lifecycle.mjs"
+$InstalledExaKeyPoolPath = Join-Path $BrokerRoot "exa-key-pool.mjs"
+$InstalledExaBridgePath = Join-Path $BrokerRoot "exa-stateless-stdio.mjs"
 $InstalledPackagePath = Join-Path $BrokerRoot "package.json"
 $InstalledPackageLockPath = Join-Path $BrokerRoot "package-lock.json"
 $StopScript = if ($ManagedStopScript) { $ManagedStopScript } else { Join-Path $BrokerRoot "Stop-CodexMcpBroker.ps1" }
@@ -497,7 +501,7 @@ foreach ($Path in $TaskRouterRuntimeStatePaths) {
     }
 }
 
-foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourcePackagePath, $SourcePackageLockPath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
+foreach ($Path in @($SourceBrokerPath, $SourceEndpointConfigPath, $SourceLifecyclePath, $SourceExaKeyPoolPath, $SourceExaBridgePath, $SourcePackagePath, $SourcePackageLockPath, $SourceStopScript, $SourceStartScript, $InstalledBrokerPath, $InstalledLifecyclePath)) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Required file is missing: $Path" }
 }
 try {
@@ -588,6 +592,10 @@ Copy-Item -LiteralPath $InstalledBrokerPath -Destination (Join-Path $BackupRoot 
 Copy-Item -LiteralPath $InstalledLifecyclePath -Destination (Join-Path $BackupRoot "request-lifecycle.mjs") -Force
 $InstalledEndpointConfigExisted = Test-Path -LiteralPath $InstalledEndpointConfigPath -PathType Leaf
 if ($InstalledEndpointConfigExisted) { Copy-Item -LiteralPath $InstalledEndpointConfigPath -Destination (Join-Path $BackupRoot "endpoint-config.mjs") -Force }
+$InstalledExaKeyPoolExisted = Test-Path -LiteralPath $InstalledExaKeyPoolPath -PathType Leaf
+$InstalledExaBridgeExisted = Test-Path -LiteralPath $InstalledExaBridgePath -PathType Leaf
+if ($InstalledExaKeyPoolExisted) { Copy-Item -LiteralPath $InstalledExaKeyPoolPath -Destination (Join-Path $BackupRoot "exa-key-pool.mjs") -Force }
+if ($InstalledExaBridgeExisted) { Copy-Item -LiteralPath $InstalledExaBridgePath -Destination (Join-Path $BackupRoot "exa-stateless-stdio.mjs") -Force }
 $InstalledPackageExisted = Test-Path -LiteralPath $InstalledPackagePath -PathType Leaf
 $InstalledPackageLockExisted = Test-Path -LiteralPath $InstalledPackageLockPath -PathType Leaf
 if ($InstalledPackageExisted) { Copy-Item -LiteralPath $InstalledPackagePath -Destination (Join-Path $BackupRoot "package.json") -Force }
@@ -600,6 +608,8 @@ if ($InstalledStopExisted) { Copy-Item -LiteralPath $StopScript -Destination (Jo
     installedStartExisted = $InstalledStartExisted
     installedStopExisted = $InstalledStopExisted
     installedEndpointConfigExisted = $InstalledEndpointConfigExisted
+    installedExaKeyPoolExisted = $InstalledExaKeyPoolExisted
+    installedExaBridgeExisted = $InstalledExaBridgeExisted
     installedPackageExisted = $InstalledPackageExisted
     installedPackageLockExisted = $InstalledPackageLockExisted
 } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $BackupRoot "lifecycle-state.json") -Encoding UTF8
@@ -616,6 +626,8 @@ try {
     Copy-Item -LiteralPath $SourceBrokerPath -Destination $InstalledBrokerPath -Force
     Copy-Item -LiteralPath $SourceEndpointConfigPath -Destination $InstalledEndpointConfigPath -Force
     Copy-Item -LiteralPath $SourceLifecyclePath -Destination $InstalledLifecyclePath -Force
+    Copy-Item -LiteralPath $SourceExaKeyPoolPath -Destination $InstalledExaKeyPoolPath -Force
+    Copy-Item -LiteralPath $SourceExaBridgePath -Destination $InstalledExaBridgePath -Force
     Copy-Item -LiteralPath $SourcePackagePath -Destination $InstalledPackagePath -Force
     Copy-Item -LiteralPath $SourcePackageLockPath -Destination $InstalledPackageLockPath -Force
     Push-Location $BrokerRoot
@@ -633,6 +645,12 @@ try {
     }
     if ((Get-FileHashOrNull -Path $InstalledEndpointConfigPath) -ne (Get-FileHashOrNull -Path $SourceEndpointConfigPath)) {
         throw "Installed endpoint configuration hash does not match the validated source."
+    }
+    if ((Get-FileHashOrNull -Path $InstalledExaKeyPoolPath) -ne (Get-FileHashOrNull -Path $SourceExaKeyPoolPath)) {
+        throw "Installed Exa key pool hash does not match the validated source."
+    }
+    if ((Get-FileHashOrNull -Path $InstalledExaBridgePath) -ne (Get-FileHashOrNull -Path $SourceExaBridgePath)) {
+        throw "Installed Exa bridge hash does not match the validated source."
     }
     if ((Get-FileHashOrNull -Path $InstalledPackagePath) -ne (Get-FileHashOrNull -Path $SourcePackagePath)) {
         throw "Installed broker package.json hash does not match the validated source."
@@ -700,6 +718,7 @@ try {
         serviceManifestPath = if ($ManagedStartScript) { $ConfiguredServiceManifestPath } else { $null }
         lifecycleBootstrapped = (-not $InstalledStartExisted -or -not $InstalledStopExisted)
         endpointConfigBootstrapped = -not $InstalledEndpointConfigExisted
+        exaBridgeBootstrapped = (-not $InstalledExaKeyPoolExisted -or -not $InstalledExaBridgeExisted)
         packageBootstrapped = (-not $InstalledPackageExisted -or -not $InstalledPackageLockExisted)
         endpoints = @($DeepHealth | ForEach-Object { [pscustomobject]@{ endpoint = $_.endpoint; toolCount = $_.toolCount; recovered = $_.recovered } })
         protectedState = $ProtectedBefore
@@ -725,6 +744,16 @@ try {
                 Copy-Item -LiteralPath (Join-Path $BackupRoot "endpoint-config.mjs") -Destination $InstalledEndpointConfigPath -Force
             } else {
                 Remove-Item -LiteralPath $InstalledEndpointConfigPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($InstalledExaKeyPoolExisted) {
+                Copy-Item -LiteralPath (Join-Path $BackupRoot "exa-key-pool.mjs") -Destination $InstalledExaKeyPoolPath -Force
+            } else {
+                Remove-Item -LiteralPath $InstalledExaKeyPoolPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($InstalledExaBridgeExisted) {
+                Copy-Item -LiteralPath (Join-Path $BackupRoot "exa-stateless-stdio.mjs") -Destination $InstalledExaBridgePath -Force
+            } else {
+                Remove-Item -LiteralPath $InstalledExaBridgePath -Force -ErrorAction SilentlyContinue
             }
             if ($InstalledPackageExisted) {
                 Copy-Item -LiteralPath (Join-Path $BackupRoot "package.json") -Destination $InstalledPackagePath -Force

@@ -92,6 +92,8 @@ function Get-StaticTargetSnapshot {
         "broker.mjs",
         "endpoint-config.mjs",
         "request-lifecycle.mjs",
+        "exa-key-pool.mjs",
+        "exa-stateless-stdio.mjs",
         "package.json",
         "package-lock.json",
         "broker-private.env.json",
@@ -151,6 +153,8 @@ if (mode === "unhealthy") {
     Set-Content -LiteralPath (Join-Path $Root "broker.mjs") -Encoding UTF8 -Value ($broker.Replace("__MODE__", $Mode) + "`n// fixture: $fixtureMarker")
     Set-Content -LiteralPath (Join-Path $Root "endpoint-config.mjs") -Encoding UTF8 -Value "export const endpointConfig = '$fixtureMarker';"
     Set-Content -LiteralPath (Join-Path $Root "request-lifecycle.mjs") -Encoding UTF8 -Value "export const lifecycle = true;"
+    Set-Content -LiteralPath (Join-Path $Root "exa-key-pool.mjs") -Encoding UTF8 -Value "export const exaKeyPool = '$fixtureMarker';"
+    Set-Content -LiteralPath (Join-Path $Root "exa-stateless-stdio.mjs") -Encoding UTF8 -Value "export const exaBridge = '$fixtureMarker';"
     Set-Content -LiteralPath (Join-Path $Root "test\request-lifecycle.test.mjs") -Encoding UTF8 -Value 'import test from "node:test"; import assert from "node:assert/strict"; test("fixture", () => assert.equal(1, 1));'
     $packageRoot = Join-Path (Split-Path -Parent $installRoot) "mcps\broker"
     Copy-Item -LiteralPath (Join-Path $packageRoot "package.json") -Destination (Join-Path $Root "package.json") -Force
@@ -269,6 +273,8 @@ function Initialize-Target {
         Copy-Item -LiteralPath (Join-Path $OldSource "endpoint-config.mjs") -Destination (Join-Path $Root "endpoint-config.mjs") -Force
     }
     Copy-Item -LiteralPath (Join-Path $OldSource "request-lifecycle.mjs") -Destination (Join-Path $Root "request-lifecycle.mjs") -Force
+    Copy-Item -LiteralPath (Join-Path $OldSource "exa-key-pool.mjs") -Destination (Join-Path $Root "exa-key-pool.mjs") -Force
+    Copy-Item -LiteralPath (Join-Path $OldSource "exa-stateless-stdio.mjs") -Destination (Join-Path $Root "exa-stateless-stdio.mjs") -Force
     Copy-Item -LiteralPath (Join-Path $OldSource "package.json") -Destination (Join-Path $Root "package.json") -Force
     Copy-Item -LiteralPath (Join-Path $OldSource "package-lock.json") -Destination (Join-Path $Root "package-lock.json") -Force
     [ordered]@{
@@ -400,6 +406,8 @@ server.listen(port, "127.0.0.1", () => {
         $oldBrokerHash = Get-Sha256 (Join-Path $root "broker.mjs")
         $oldEndpointConfigHash = Get-Sha256 (Join-Path $root "endpoint-config.mjs")
         $oldLifecycleHash = Get-Sha256 (Join-Path $root "request-lifecycle.mjs")
+        $oldExaKeyPoolHash = Get-Sha256 (Join-Path $root "exa-key-pool.mjs")
+        $oldExaBridgeHash = Get-Sha256 (Join-Path $root "exa-stateless-stdio.mjs")
         $oldPackageHash = Get-Sha256 (Join-Path $root "package.json")
         $oldPackageLockHash = Get-Sha256 (Join-Path $root "package-lock.json")
         $oldStartHash = Get-Sha256 (Join-Path $root "Start-CodexMcpBroker.ps1")
@@ -413,6 +421,8 @@ server.listen(port, "127.0.0.1", () => {
         if ((Get-Sha256 (Join-Path $root "broker.mjs")) -ne $oldBrokerHash) { throw "Rollback case $caseIndex did not restore broker.mjs." }
         if ((Get-Sha256 (Join-Path $root "endpoint-config.mjs")) -ne $oldEndpointConfigHash) { throw "Rollback case $caseIndex did not restore endpoint-config.mjs state." }
         if ((Get-Sha256 (Join-Path $root "request-lifecycle.mjs")) -ne $oldLifecycleHash) { throw "Rollback case $caseIndex did not restore request-lifecycle.mjs." }
+        if ((Get-Sha256 (Join-Path $root "exa-key-pool.mjs")) -ne $oldExaKeyPoolHash) { throw "Rollback case $caseIndex did not restore exa-key-pool.mjs." }
+        if ((Get-Sha256 (Join-Path $root "exa-stateless-stdio.mjs")) -ne $oldExaBridgeHash) { throw "Rollback case $caseIndex did not restore exa-stateless-stdio.mjs." }
         if ((Get-Sha256 (Join-Path $root "package.json")) -ne $oldPackageHash) { throw "Rollback case $caseIndex did not restore package.json." }
         if ((Get-Sha256 (Join-Path $root "package-lock.json")) -ne $oldPackageLockHash) { throw "Rollback case $caseIndex did not restore package-lock.json." }
         if ((Get-Sha256 (Join-Path $root "Start-CodexMcpBroker.ps1")) -ne $oldStartHash) { throw "Rollback case $caseIndex did not restore Start script state." }
@@ -429,6 +439,8 @@ server.listen(port, "127.0.0.1", () => {
     if ($successPidAfter -eq $successPidBefore) { throw "Successful update did not replace the broker PID." }
     if ((Get-Sha256 (Join-Path $successRoot "broker.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "broker.mjs"))) { throw "Successful update did not install candidate broker.mjs." }
     if ((Get-Sha256 (Join-Path $successRoot "endpoint-config.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "endpoint-config.mjs"))) { throw "Successful update did not install candidate endpoint-config.mjs." }
+    if ((Get-Sha256 (Join-Path $successRoot "exa-key-pool.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "exa-key-pool.mjs"))) { throw "Successful update did not install candidate exa-key-pool.mjs." }
+    if ((Get-Sha256 (Join-Path $successRoot "exa-stateless-stdio.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "exa-stateless-stdio.mjs"))) { throw "Successful update did not install candidate exa-stateless-stdio.mjs." }
     if ((Get-Sha256 (Join-Path $successRoot "package.json")) -ne (Get-Sha256 (Join-Path $healthySource "package.json"))) { throw "Successful update did not install candidate package.json." }
     if ((Get-Sha256 (Join-Path $successRoot "package-lock.json")) -ne (Get-Sha256 (Join-Path $healthySource "package-lock.json"))) { throw "Successful update did not install candidate package-lock.json." }
     foreach ($name in @("Start-CodexMcpBroker.ps1", "Stop-CodexMcpBroker.ps1")) {
@@ -556,11 +568,15 @@ server.listen(port, "127.0.0.1", () => {
         if ((Get-Sha256 $managedStopScript) -ne (Get-Sha256 $stopScriptPath)) { throw "Managed update did not install the source Stop script at the manifest path." }
         if ((Get-Sha256 (Join-Path $managedRoot "broker.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "broker.mjs"))) { throw "Managed update did not install the candidate broker at the manifest path." }
         if ((Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "endpoint-config.mjs"))) { throw "Managed update did not install endpoint-config.mjs at the manifest path." }
+        if ((Get-Sha256 (Join-Path $managedRoot "exa-key-pool.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "exa-key-pool.mjs"))) { throw "Managed update did not install exa-key-pool.mjs at the manifest path." }
+        if ((Get-Sha256 (Join-Path $managedRoot "exa-stateless-stdio.mjs")) -ne (Get-Sha256 (Join-Path $healthySource "exa-stateless-stdio.mjs"))) { throw "Managed update did not install exa-stateless-stdio.mjs at the manifest path." }
         if ((Get-Sha256 (Join-Path $managedRoot "package.json")) -ne (Get-Sha256 (Join-Path $healthySource "package.json"))) { throw "Managed update did not install package.json at the manifest path." }
         if ((Get-Sha256 (Join-Path $managedRoot "package-lock.json")) -ne (Get-Sha256 (Join-Path $healthySource "package-lock.json"))) { throw "Managed update did not install package-lock.json at the manifest path." }
         $managedBrokerHash = Get-Sha256 (Join-Path $managedRoot "broker.mjs")
         $managedEndpointConfigHash = Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")
         $managedLifecycleHash = Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")
+        $managedExaKeyPoolHash = Get-Sha256 (Join-Path $managedRoot "exa-key-pool.mjs")
+        $managedExaBridgeHash = Get-Sha256 (Join-Path $managedRoot "exa-stateless-stdio.mjs")
         $managedPackageHash = Get-Sha256 (Join-Path $managedRoot "package.json")
         $managedPackageLockHash = Get-Sha256 (Join-Path $managedRoot "package-lock.json")
         $managedStartHash = Get-Sha256 $managedStartScript
@@ -586,6 +602,8 @@ server.listen(port, "127.0.0.1", () => {
         if ((Get-Sha256 (Join-Path $managedRoot "broker.mjs")) -ne $managedBrokerHash) { throw "Managed rollback did not restore broker.mjs." }
         if ((Get-Sha256 (Join-Path $managedRoot "endpoint-config.mjs")) -ne $managedEndpointConfigHash) { throw "Managed rollback did not restore endpoint-config.mjs." }
         if ((Get-Sha256 (Join-Path $managedRoot "request-lifecycle.mjs")) -ne $managedLifecycleHash) { throw "Managed rollback did not restore request-lifecycle.mjs." }
+        if ((Get-Sha256 (Join-Path $managedRoot "exa-key-pool.mjs")) -ne $managedExaKeyPoolHash) { throw "Managed rollback did not restore exa-key-pool.mjs." }
+        if ((Get-Sha256 (Join-Path $managedRoot "exa-stateless-stdio.mjs")) -ne $managedExaBridgeHash) { throw "Managed rollback did not restore exa-stateless-stdio.mjs." }
         if ((Get-Sha256 (Join-Path $managedRoot "package.json")) -ne $managedPackageHash) { throw "Managed rollback did not restore package.json." }
         if ((Get-Sha256 (Join-Path $managedRoot "package-lock.json")) -ne $managedPackageLockHash) { throw "Managed rollback did not restore package-lock.json." }
         if ((Get-Sha256 $managedStartScript) -ne $managedStartHash) { throw "Managed rollback did not restore the Start script." }
@@ -607,6 +625,8 @@ server.listen(port, "127.0.0.1", () => {
         Copy-Item -LiteralPath (Join-Path $oldSource "endpoint-config.mjs") -Destination (Join-Path $wrongRoot "endpoint-config.mjs") -Force
     }
     Copy-Item -LiteralPath (Join-Path $oldSource "request-lifecycle.mjs") -Destination (Join-Path $wrongRoot "request-lifecycle.mjs") -Force
+    Copy-Item -LiteralPath (Join-Path $oldSource "exa-key-pool.mjs") -Destination (Join-Path $wrongRoot "exa-key-pool.mjs") -Force
+    Copy-Item -LiteralPath (Join-Path $oldSource "exa-stateless-stdio.mjs") -Destination (Join-Path $wrongRoot "exa-stateless-stdio.mjs") -Force
     Copy-Item -LiteralPath (Join-Path $oldSource "package.json") -Destination (Join-Path $wrongRoot "package.json") -Force
     Copy-Item -LiteralPath (Join-Path $oldSource "package-lock.json") -Destination (Join-Path $wrongRoot "package-lock.json") -Force
     $wrongSnapshotBefore = Get-StaticTargetSnapshot -Root $wrongRoot
