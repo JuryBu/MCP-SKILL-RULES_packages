@@ -35,6 +35,7 @@ def run_process(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=timeout,
         check=False,
     )
@@ -139,7 +140,7 @@ class ReleaseProbeTests(unittest.TestCase):
                     "pending_subscriptions_total": 1,
                     "pending_total": 1,
                     "routes": 1,
-                    "schema_version": 4,
+                    "schema_version": 5,
                     "subscriptions": 2,
                     "subscriptions_total": 2,
                     "wakes": 2,
@@ -329,7 +330,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             connection = sqlite3.connect(case_root / "data" / "state" / "events.sqlite3")
             try:
                 self.assertEqual(
-                    "4",
+                    "5",
                     connection.execute(
                         "SELECT value FROM schema_meta WHERE key='schema_version'"
                     ).fetchone()[0],

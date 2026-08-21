@@ -117,7 +117,7 @@ function Test-LedgerTransition {
   if (Compare-JsonValue $Before $After) { return $true }
   $BeforeVersion = [int]$Before.schema_version
   $AfterVersion = [int]$After.schema_version
-  if ($BeforeVersion -in @(2, 3) -and $AfterVersion -in @(3, 4) -and $AfterVersion -gt $BeforeVersion) {
+  if ($BeforeVersion -in @(2, 3, 4) -and $AfterVersion -in @(3, 4, 5) -and $AfterVersion -gt $BeforeVersion) {
     foreach ($Name in @(
       "routes", "events_total", "subscriptions_total", "pending_total", "pending_subscriptions_total",
       "wakes_total", "active_wakes_total", "events", "subscriptions", "pending",
@@ -127,7 +127,7 @@ function Test-LedgerTransition {
     }
     return $true
   }
-  if ($BeforeVersion -ne 1 -or $AfterVersion -notin @(2, 3, 4)) { return $false }
+  if ($BeforeVersion -ne 1 -or $AfterVersion -notin @(2, 3, 4, 5)) { return $false }
   foreach ($Name in @("routes", "events_total", "pending_total", "pending_subscriptions_total", "events", "pending", "pending_subscriptions")) {
     if ([int]$Before.$Name -ne [int]$After.$Name) { return $false }
   }
@@ -649,7 +649,7 @@ function Invoke-ReleaseSwitch {
       $MigrationRaw = & $SwitchProbePython $ProbeScript migrate-ledger --ledger $LedgerPath --route-id $SwitchRouteId
       if ($LASTEXITCODE -ne 0) { throw "Fixture candidate ledger migration failed" }
       $Migration = ($MigrationRaw -join "`n") | ConvertFrom-Json
-    if ([int]$Migration.schema_version -ne 4) { throw "Fixture candidate did not migrate the ledger to schema 4" }
+    if ([int]$Migration.schema_version -ne 5) { throw "Fixture candidate did not migrate the ledger to schema 5" }
     }
     $Health = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration ($Context.beforeBackendGeneration + 1)
     $Supervisor = Wait-Supervisor -Mode $Mode -SupervisorPath $SupervisorPath -FixtureStatePath $FixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)

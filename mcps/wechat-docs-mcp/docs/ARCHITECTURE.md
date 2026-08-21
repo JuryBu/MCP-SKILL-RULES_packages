@@ -15,6 +15,7 @@ WeChat encrypted DB
   -> events: one durable event per route
   -> event_deliveries: one delivery per active subscription
   -> subscription_wakes: one merged active wake per subscription
+  -> subscription_notification_attempts: bounded re-notification per new event range
   -> Codex conversation selected by that subscription
   -> exact ACK(subscription_id, generation, wake_id, event_ids)
 ```
@@ -82,7 +83,7 @@ UNIQUE(route_id, conversation_id, generation)
 
 启用 `send_capability` 时必须有本机私有 `policy_ref`。暂停不会替其它订阅 ACK；暂停期间的新事件不投递，恢复从当前基线继续，旧 pending 仍保留。
 
-### event_deliveries 与 subscription_wakes
+### event_deliveries、subscription_wakes 与 notification attempts
 
 ```sql
 PRIMARY KEY(subscription_id, event_id)
@@ -90,7 +91,9 @@ PRIMARY KEY(subscription_id, event_id)
 
 每个订阅独立保存 `PENDING/ACKED`。一个订阅 ACK 不会删除另一个订阅的未读。
 
-`subscription_wakes` 对每个 subscription 只允许一个 `prepared/submitted/unknown` 活跃 wake。待处理从 0 变 1 时创建 wake，后续事件合入相同 pending 集合。
+`subscription_wakes` 对每个 subscription 只允许一个 `prepared/submitted/unknown` 活跃 logical wake。它在 pending 归零前保持稳定，因此 partial/late ACK 始终使用同一个 `wake_id`。
+
+`subscription_notification_attempts` 单独记录代理注入身份、覆盖到的最大 `event_seq`、提交时间和传输状态。attempt 生成后身份与覆盖边界不可变，避免候选取出与新事件入账交错时改变同一代理请求。logical wake 已提交后，只有更大的 pending `event_seq` 出现且冷却到期才新建 attempt；冷却内尚未生成 attempt 的事件合并，无新事件不重发。`prepared/unknown` attempt 每个 subscription 最多一个，`unknown` 重试复用原 `notification_id`。
 
 ### outbound_drafts
 
@@ -134,6 +137,7 @@ V1 迁移规则：
 - 每条旧 route/conversation/generation 生成确定性的 legacy subscription。
 - 旧 `events.acked_at` 映射为该 legacy subscription 的 `ACKED/PENDING` delivery。
 - 旧 route wake 复制为 subscription wake；有 pending 且没有活跃 wake 时补建一个。
+- schema v4 的活跃 wake 会补建 notification attempt。旧 `submitted` wake 以 wake 创建时已到达的最大 event_seq 作为历史覆盖边界，之后尚未 ACK 的新事件可在冷却后保守提醒一次。
 - 旧草稿映射到大写状态，保留哈希、TTL、授权引用和 dedupe。
 
 迁移不会删除 V1 表或清空账本。回滚备份能恢复迁移前字节级状态；但一旦 V2 已产生多个 subscription 的独立新投递，V1 无法表达这些差异，因此发布回滚只能保证代码和文件恢复，不能宣称把 V2 新业务状态无损降为 V1。

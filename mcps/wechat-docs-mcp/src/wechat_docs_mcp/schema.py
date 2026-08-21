@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 LEGACY_SUBSCRIPTION_NAMESPACE = uuid.UUID("0f2926e1-71c8-4b22-92f7-4ef81461bdf8")
 REQUIRED_V2_TABLES = {
     "schema_meta",
@@ -30,6 +30,7 @@ REQUIRED_V3_TABLES = REQUIRED_V2_TABLES | {
     "tdocs_subscription_wakes",
 }
 REQUIRED_V4_TABLES = REQUIRED_V3_TABLES | {"attachments", "outbound_attachment_verifications"}
+REQUIRED_V5_TABLES = REQUIRED_V4_TABLES | {"subscription_notification_attempts"}
 
 
 def utc_now() -> str:
@@ -78,7 +79,7 @@ def _is_current_schema(path: Path) -> bool:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if not REQUIRED_V4_TABLES.issubset(tables):
+        if not REQUIRED_V5_TABLES.issubset(tables):
             return False
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
@@ -476,6 +477,30 @@ def _create_v4_tables(connection: sqlite3.Connection) -> None:
         _add_column(connection, "attachment_transfers", definition)
 
 
+def _create_v5_tables(connection: sqlite3.Connection) -> None:
+    _execute_script(
+        connection,
+        """
+        CREATE TABLE IF NOT EXISTS subscription_notification_attempts(
+          notification_id TEXT PRIMARY KEY,
+          wake_id TEXT NOT NULL REFERENCES subscription_wakes(wake_id),
+          subscription_id TEXT NOT NULL REFERENCES subscriptions(subscription_id),
+          generation INTEGER NOT NULL,
+          target_event_seq INTEGER NOT NULL CHECK(target_event_seq >= 0),
+          created_at TEXT NOT NULL,
+          submitted_at TEXT,
+          state TEXT NOT NULL CHECK(state IN ('prepared','submitted','unknown','closed','failed')),
+          UNIQUE(wake_id,target_event_seq)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS subscription_notification_attempts_one_active
+          ON subscription_notification_attempts(subscription_id)
+          WHERE state IN ('prepared','unknown');
+        CREATE INDEX IF NOT EXISTS subscription_notification_attempts_wake
+          ON subscription_notification_attempts(wake_id,target_event_seq);
+        """,
+    )
+
+
 def _backfill_attachment_refs(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         """
@@ -525,6 +550,70 @@ def _backfill_attachment_refs(connection: sqlite3.Connection) -> None:
                 "UPDATE events SET payload_json=? WHERE event_id=?",
                 (json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")), row[0]),
             )
+
+
+def _backfill_notification_attempts(connection: sqlite3.Connection) -> None:
+    wakes = connection.execute(
+        """
+        SELECT wake_id,subscription_id,generation,created_at,state
+        FROM subscription_wakes
+        WHERE state IN ('prepared','submitted','unknown')
+        ORDER BY created_at,wake_id
+        """
+    ).fetchall()
+    for wake in wakes:
+        wake_id, subscription_id, generation, created_at, wake_state = wake
+        if wake_state == "submitted":
+            target_event_seq = connection.execute(
+                """
+                SELECT COALESCE(MAX(events.event_seq),0)
+                FROM event_deliveries
+                JOIN events USING(event_id)
+                WHERE event_deliveries.subscription_id=?
+                  AND event_deliveries.delivered_at<=?
+                """,
+                (subscription_id, created_at),
+            ).fetchone()[0]
+            if target_event_seq == 0:
+                target_event_seq = connection.execute(
+                    """
+                    SELECT COALESCE(MIN(events.event_seq),0)
+                    FROM event_deliveries
+                    JOIN events USING(event_id)
+                    WHERE event_deliveries.subscription_id=?
+                      AND event_deliveries.state='PENDING'
+                    """,
+                    (subscription_id,),
+                ).fetchone()[0]
+        else:
+            target_event_seq = connection.execute(
+                """
+                SELECT COALESCE(MAX(events.event_seq),0)
+                FROM event_deliveries
+                JOIN events USING(event_id)
+                WHERE event_deliveries.subscription_id=?
+                  AND event_deliveries.state='PENDING'
+                """,
+                (subscription_id,),
+            ).fetchone()[0]
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO subscription_notification_attempts(
+              notification_id,wake_id,subscription_id,generation,target_event_seq,
+              created_at,submitted_at,state
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                wake_id,
+                wake_id,
+                subscription_id,
+                generation,
+                target_event_seq,
+                created_at,
+                created_at if wake_state == "submitted" else None,
+                wake_state,
+            ),
+        )
 
 
 def legacy_subscription_id(route_id: str, conversation_id: str, generation: int) -> str:
@@ -679,8 +768,10 @@ def ensure_schema(path: str | Path) -> dict[str, str | int | bool | None]:
             _create_v2_tables(connection)
             _create_v3_tables(connection)
             _create_v4_tables(connection)
+            _create_v5_tables(connection)
             _migrate_v1_rows(connection)
             _backfill_attachment_refs(connection)
+            _backfill_notification_attempts(connection)
             connection.execute(
                 "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

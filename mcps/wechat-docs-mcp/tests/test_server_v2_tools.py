@@ -245,6 +245,7 @@ def test_wechat_status_reports_attachment_only_gate(
     assert status["attachment_outbound_enabled"] is True
     assert status["runtime_gate_mode"] == "private_file_dynamic_fail_closed"
     assert status["wake_message_visibility"] == server.WAKE_MESSAGE_VISIBILITY
+    assert status["wake_reminder_cooldown_seconds"] == server.WAKE_REMINDER_COOLDOWN_SECONDS
 
 
 def test_official_tool_level_error_does_not_verify_draft(

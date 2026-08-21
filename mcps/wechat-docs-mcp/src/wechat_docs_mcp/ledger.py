@@ -7,7 +7,7 @@ import sqlite3
 import unicodedata
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator, Sequence
 
@@ -103,6 +103,22 @@ class EventLedger:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _create_logical_wake(
+        connection: sqlite3.Connection,
+        subscription_id: str,
+        generation: int,
+        created_at: str,
+    ) -> sqlite3.Row:
+        wake_id = str(uuid.uuid4())
+        connection.execute(
+            "INSERT INTO subscription_wakes VALUES(?,?,?,?,?,'prepared')",
+            (wake_id, subscription_id, generation, created_at, str(uuid.uuid4())),
+        )
+        return connection.execute(
+            "SELECT * FROM subscription_wakes WHERE wake_id=?", (wake_id,)
+        ).fetchone()
 
     def schema_info(self) -> dict[str, Any]:
         connection = self._connect()
@@ -593,10 +609,7 @@ class EventLedger:
                     (subscription_id,),
                 ).fetchone()
                 if pending and active_wake is None:
-                    connection.execute(
-                        "INSERT INTO subscription_wakes VALUES(?,?,?,?,?,'prepared')",
-                        (str(uuid.uuid4()), subscription_id, generation, now, str(uuid.uuid4())),
-                    )
+                    self._create_logical_wake(connection, subscription_id, generation, now)
             else:
                 connection.execute(
                     "UPDATE subscriptions SET state=?,updated_at=? WHERE subscription_id=?",
@@ -604,6 +617,10 @@ class EventLedger:
                 )
                 connection.execute(
                     "UPDATE subscription_wakes SET state='closed' WHERE subscription_id=? AND state IN ('prepared','submitted','unknown')",
+                    (subscription_id,),
+                )
+                connection.execute(
+                    "UPDATE subscription_notification_attempts SET state='closed' WHERE subscription_id=? AND state IN ('prepared','unknown')",
                     (subscription_id,),
                 )
         return self.get_subscription(subscription_id)
@@ -747,20 +764,12 @@ class EventLedger:
                     (subscription["subscription_id"],),
                 ).fetchone()
                 if pending_before == 0 and active_wake is None:
-                    wake_id = str(uuid.uuid4())
-                    connection.execute(
-                        "INSERT INTO subscription_wakes VALUES(?,?,?,?,?,'prepared')",
-                        (
-                            wake_id,
-                            subscription["subscription_id"],
-                            subscription["generation"],
-                            observed_at,
-                            str(uuid.uuid4()),
-                        ),
+                    active_wake = self._create_logical_wake(
+                        connection,
+                        subscription["subscription_id"],
+                        subscription["generation"],
+                        observed_at,
                     )
-                    active_wake = connection.execute(
-                        "SELECT * FROM subscription_wakes WHERE wake_id=?", (wake_id,)
-                    ).fetchone()
                 if active_wake is not None:
                     wakes.append(dict(active_wake))
             return {
@@ -784,12 +793,22 @@ class EventLedger:
             connection.close()
         return dict(row) if row else None
 
-    def list_wakes_for_notification(self, limit: int = 100) -> list[dict[str, Any]]:
+    def list_wakes_for_notification(
+        self,
+        limit: int = 100,
+        *,
+        cooldown_seconds: float = 60.0,
+        now: str | None = None,
+    ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 500:
             raise LedgerError("INVALID_LIMIT", "limit 必须在 1 到 500 之间")
-        connection = self._connect()
-        try:
-            rows = connection.execute(
+        if cooldown_seconds < 0 or cooldown_seconds > 86400:
+            raise LedgerError("INVALID_WAKE_COOLDOWN", "wake cooldown 必须在 0 到 86400 秒之间")
+        now_value = now or utc_now()
+        now_datetime = _parse_datetime(now_value)
+        candidates: list[dict[str, Any]] = []
+        with self._transaction() as connection:
+            wakes = connection.execute(
                 """
                 SELECT
                   subscription_wakes.*,
@@ -797,31 +816,148 @@ class EventLedger:
                   subscriptions.conversation_id,
                   subscriptions.policy_ref,
                   routes.profile,
-                  (
-                    SELECT COUNT(*) FROM event_deliveries
-                    WHERE event_deliveries.subscription_id=subscription_wakes.subscription_id
-                      AND event_deliveries.state='PENDING'
-                  ) AS pending_count
+                  COUNT(event_deliveries.event_id) AS pending_count,
+                  MAX(events.event_seq) AS pending_through_sequence,
+                  MAX(event_deliveries.delivered_at) AS pending_through_time
                 FROM subscription_wakes
                 JOIN subscriptions USING(subscription_id)
                 JOIN routes ON routes.route_id=subscriptions.route_id
-                WHERE subscription_wakes.state IN ('prepared','unknown')
+                JOIN event_deliveries
+                  ON event_deliveries.subscription_id=subscription_wakes.subscription_id
+                 AND event_deliveries.state='PENDING'
+                JOIN events USING(event_id)
+                WHERE subscription_wakes.state IN ('prepared','submitted','unknown')
                   AND subscriptions.state='active'
                   AND subscriptions.listen_capability=1
                   AND routes.state='active'
-                  AND EXISTS(
-                    SELECT 1 FROM event_deliveries
-                    WHERE event_deliveries.subscription_id=subscription_wakes.subscription_id
-                      AND event_deliveries.state='PENDING'
-                  )
+                GROUP BY subscription_wakes.wake_id
                 ORDER BY subscription_wakes.created_at,subscription_wakes.wake_id
-                LIMIT ?
                 """,
-                (limit,),
+            ).fetchall()
+            for wake in wakes:
+                attempt = connection.execute(
+                    """
+                    SELECT * FROM subscription_notification_attempts
+                    WHERE wake_id=? AND state IN ('prepared','unknown')
+                    ORDER BY created_at DESC,notification_id DESC LIMIT 1
+                    """,
+                    (wake["wake_id"],),
+                ).fetchone()
+                if attempt is None:
+                    latest = connection.execute(
+                        """
+                        SELECT * FROM subscription_notification_attempts
+                        WHERE wake_id=?
+                        ORDER BY target_event_seq DESC,created_at DESC LIMIT 1
+                        """,
+                        (wake["wake_id"],),
+                    ).fetchone()
+                    if latest is None:
+                        notification_id = wake["wake_id"]
+                    elif (
+                        latest["state"] == "submitted"
+                        and latest["target_event_seq"] < wake["pending_through_sequence"]
+                        and now_datetime
+                        >= _parse_datetime(latest["submitted_at"] or latest["created_at"])
+                        + timedelta(seconds=cooldown_seconds)
+                    ):
+                        notification_id = str(uuid.uuid4())
+                    else:
+                        continue
+                    connection.execute(
+                        """
+                        INSERT INTO subscription_notification_attempts(
+                          notification_id,wake_id,subscription_id,generation,target_event_seq,
+                          created_at,submitted_at,state
+                        ) VALUES(?,?,?,?,?,?,NULL,'prepared')
+                        """,
+                        (
+                            notification_id,
+                            wake["wake_id"],
+                            wake["subscription_id"],
+                            wake["generation"],
+                            wake["pending_through_sequence"],
+                            now_value,
+                        ),
+                    )
+                    attempt = connection.execute(
+                        "SELECT * FROM subscription_notification_attempts WHERE notification_id=?",
+                        (notification_id,),
+                    ).fetchone()
+                candidate = dict(wake)
+                candidate["wake_state"] = candidate["state"]
+                candidate.update(
+                    {
+                        "notification_id": attempt["notification_id"],
+                        "state": attempt["state"],
+                        "notification_created_at": attempt["created_at"],
+                        "notification_submitted_at": attempt["submitted_at"],
+                        "target_event_seq": attempt["target_event_seq"],
+                    }
+                )
+                candidates.append(candidate)
+                if len(candidates) >= limit:
+                    break
+        return candidates
+
+    def list_notification_attempts(self, subscription_id: str) -> list[dict[str, Any]]:
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                """
+                SELECT * FROM subscription_notification_attempts
+                WHERE subscription_id=?
+                ORDER BY target_event_seq,created_at,notification_id
+                """,
+                (subscription_id,),
             ).fetchall()
         finally:
             connection.close()
         return [dict(row) for row in rows]
+
+    def mark_notification_state(
+        self,
+        notification_id: str,
+        expected_states: Sequence[str],
+        next_state: str,
+    ) -> dict[str, Any]:
+        allowed_states = {"prepared", "submitted", "unknown", "closed", "failed"}
+        expected = set(expected_states)
+        if not expected or not expected.issubset(allowed_states) or next_state not in allowed_states:
+            raise LedgerError("INVALID_NOTIFICATION_STATE", "notification state 参数无效")
+        with self._transaction() as connection:
+            attempt = connection.execute(
+                "SELECT * FROM subscription_notification_attempts WHERE notification_id=?",
+                (notification_id,),
+            ).fetchone()
+            if attempt is None:
+                raise LedgerError("NOTIFICATION_NOT_FOUND", f"notification 不存在：{notification_id}")
+            if attempt["state"] not in expected:
+                raise LedgerError("NOTIFICATION_STATE_CONFLICT", "notification state 已变化")
+            submitted_at = utc_now() if next_state == "submitted" else attempt["submitted_at"]
+            connection.execute(
+                "UPDATE subscription_notification_attempts SET state=?,submitted_at=? WHERE notification_id=?",
+                (next_state, submitted_at, notification_id),
+            )
+            wake = connection.execute(
+                "SELECT state FROM subscription_wakes WHERE wake_id=?", (attempt["wake_id"],)
+            ).fetchone()
+            if wake is not None and wake["state"] in {"prepared", "unknown"}:
+                if next_state == "submitted":
+                    connection.execute(
+                        "UPDATE subscription_wakes SET state='submitted' WHERE wake_id=?",
+                        (attempt["wake_id"],),
+                    )
+                elif next_state == "unknown" and wake["state"] == "prepared":
+                    connection.execute(
+                        "UPDATE subscription_wakes SET state='unknown' WHERE wake_id=?",
+                        (attempt["wake_id"],),
+                    )
+            updated = connection.execute(
+                "SELECT * FROM subscription_notification_attempts WHERE notification_id=?",
+                (notification_id,),
+            ).fetchone()
+        return dict(updated)
 
     def mark_wake_state(
         self,
@@ -843,6 +979,15 @@ class EventLedger:
                 raise LedgerError("WAKE_STATE_CONFLICT", "wake state 已变化")
             connection.execute(
                 "UPDATE subscription_wakes SET state=? WHERE wake_id=?", (next_state, wake_id)
+            )
+            submitted_at = utc_now() if next_state == "submitted" else None
+            connection.execute(
+                """
+                UPDATE subscription_notification_attempts
+                SET state=?,submitted_at=COALESCE(?,submitted_at)
+                WHERE wake_id=? AND state IN ('prepared','unknown')
+                """,
+                (next_state, submitted_at, wake_id),
             )
             updated = connection.execute(
                 "SELECT * FROM subscription_wakes WHERE wake_id=?", (wake_id,)
@@ -932,6 +1077,10 @@ class EventLedger:
             if pending == 0:
                 connection.execute(
                     "UPDATE subscription_wakes SET state='closed' WHERE wake_id=?", (wake_id,)
+                )
+                connection.execute(
+                    "UPDATE subscription_notification_attempts SET state='closed' WHERE wake_id=? AND state IN ('prepared','unknown')",
+                    (wake_id,),
                 )
         return {
             "subscription_id": subscription["subscription_id"],

@@ -26,6 +26,7 @@
 | `WECHAT_DOCS_MCP_TDOCS_POLL_INTERVAL` | `60` | 文档监视轮询间隔秒数，最小 15 秒 |
 | `WECHAT_DOCS_MCP_WAKE_ENABLED` | `0` | 将 prepared wake 提交给 Codex 透明代理 |
 | `WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY` | `visible` | `visible` 显示 Codex 用户消息气泡，`hidden` 仅隐藏气泡；两者保持相同注入、重试、wake 与 ACK 语义，非法值拒绝启动 |
+| `WECHAT_DOCS_MCP_WAKE_REMINDER_COOLDOWN_SECONDS` | `60` | 已提交 logical wake 出现更大 pending event_seq 后，再次提醒的冷却秒数；合法范围 30～3600 |
 | `WECHAT_DOCS_MCP_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时文字发送 gate，避免 broker 环境残留覆盖私有关闭状态 |
 | `WECHAT_DOCS_MCP_ATTACHMENT_OUTBOUND_ENABLED` | `0` | 旧版进程启动开关；0.6.1 起不再作为实时附件发送 gate |
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |

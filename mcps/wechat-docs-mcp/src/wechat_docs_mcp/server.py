@@ -32,6 +32,7 @@ from .wake_notifier import (
     CodexWakeNotifier,
     TencentDocsWakeNotifier,
     normalize_wake_message_visibility,
+    normalize_wake_reminder_cooldown_seconds,
 )
 from .wechat_attachment_source import WechatAttachmentSourceResolver
 from .wechat_attachment_outbound import SafeAttachmentOutbound
@@ -103,6 +104,9 @@ WAKE_MESSAGE_VISIBILITY = normalize_wake_message_visibility(
         "WECHAT_DOCS_MCP_WAKE_MESSAGE_VISIBILITY",
         "visible",
     )
+)
+WAKE_REMINDER_COOLDOWN_SECONDS = normalize_wake_reminder_cooldown_seconds(
+    os.environ.get("WECHAT_DOCS_MCP_WAKE_REMINDER_COOLDOWN_SECONDS", "60")
 )
 
 
@@ -310,6 +314,7 @@ def wake_notifier() -> CodexWakeNotifier | None:
             os.environ.get("WECHAT_DOCS_MCP_SOURCE_MACHINE", "local"),
             os.environ.get("WECHAT_DOCS_MCP_TARGET_MACHINE", "local"),
             retry_interval_seconds=float(os.environ.get("WECHAT_DOCS_MCP_WAKE_RETRY_SECONDS", "30")),
+            reminder_cooldown_seconds=WAKE_REMINDER_COOLDOWN_SECONDS,
             message_visibility=WAKE_MESSAGE_VISIBILITY,
         )
         return _wake_notifier
@@ -425,6 +430,7 @@ def wechat_status() -> dict[str, Any]:
         "poll_consecutive_failures": poll_consecutive_failures,
         "wake_notifier_enabled": WAKE_ENABLED,
         "wake_message_visibility": WAKE_MESSAGE_VISIBILITY,
+        "wake_reminder_cooldown_seconds": WAKE_REMINDER_COOLDOWN_SECONDS,
         "wake_notifier_ready": notifier_status["ready"],
         "wake_notifier_error": wake_last_error or notifier_status["error_code"],
         "wake_last_attempt_time": wake_last_attempt_time,

@@ -64,11 +64,13 @@ result = ledger.ingest_event(
 
 `source_fingerprint` 只用于同一 route 内的来源去重。处理顺序必须使用 `event_seq`，不能按微信索引、数字大小、文件大小或 UUID 字典序推断。
 
-## 4. 每 subscription 合并 wake
+## 4. 每 subscription 合并 wake 与提醒 attempt
 
-每个 subscription 最多有一个活跃 wake，活跃状态是 `prepared / submitted / unknown`。只有该订阅 pending 从 0 变 1 时创建 wake；后续事件合入同一 pending 集合，不逐消息注入 Codex。
+每个 subscription 最多有一个活跃 logical wake，活跃状态是 `prepared / submitted / unknown`。只有该订阅 pending 从 0 变 1 时创建 logical wake；它的 `wake_id` 在 pending 归零前保持稳定，专门作为精确 ACK 凭证。
 
-wake 提醒必须包含 `subscription_id`、`route_id`、`generation` 和 `wake_id`，不能包含微信正文。Codex conversation 由 subscription 决定。
+每次向 Codex 注入提醒使用独立的 notification attempt。第一次 attempt 与 logical wake 共用 ID 以兼容旧代理；logical wake 已成功提交后，若又有更大的 `event_seq` 到达，则在冷却期结束后创建新的 `notification_id`，但提醒正文仍携带原 `wake_id`。attempt 一旦生成，其覆盖序号、时间和请求哈希不可变；之后到达的事件留给下一次冷却批次，若 Agent 已在本次读取并 ACK 则自然不会再提醒。冷却内尚未生成 attempt 的多条新事件合并；没有新事件时不会周期性重复旧待办。传输结果不明时，同一 attempt 以原 `notification_id` 重试，不能新建 ID 造成重复注入。
+
+wake 提醒必须包含 `subscription_id`、`route_id`、`generation`、稳定 `wake_id` 和当前 `notification_id`，不能包含微信正文。代理请求用 `notification_id` 去重，Agent ACK 仍只使用 `wake_id`。Codex conversation 由 subscription 决定。
 
 暂停 subscription 会关闭其活跃 wake，但不会 ACK 已有 pending。暂停期间的新 route event 不投递给该 subscription；其它 active subscription 不受影响。closed subscription 不能重新开启。
 

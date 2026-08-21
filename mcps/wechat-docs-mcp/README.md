@@ -8,7 +8,7 @@
 - private binding 可按 route 登记当前账号的 `ownerSenderUsername`。消息作者命中该精确身份时一律按 self-sent/outbound 静默入账；数据库方向不可信时只隔离入账，不向 subscription fan-out。
 - 新账号只在私有 enrollment 明确给出当前 owner identity 哈希后才允许短时扫描图片密钥；账号不明或与 route 不符时保持 `WAITING_FOR_KEY`，不会覆盖其他账号缓存。
 - route 与 Codex conversation 是 M:N。每个 subscription 只属于一个 `(route_id, conversation_id, generation)`，事件按 route 只入账一次，再向所有 active subscription 独立投递。
-- 每个 subscription 有独立 pending、wake、ACK、暂停、关闭和能力策略；一个订阅 ACK 不影响其它订阅。
+- 每个 subscription 有独立 pending、稳定 logical wake、通知 attempt、ACK、暂停、关闭和能力策略；旧 pending 不会永久压住之后的新消息提醒，一个订阅 ACK 也不影响其它订阅。
 - 微信发送与腾讯文档写入都使用不可变草稿、非空 `owner_authorization_refs`、TTL 和 `dedupe_key`。批准只消费一次，`UNKNOWN` 不自动重试。
 - 文件、普通图片和表情先只入账元数据，并生成不可伪造的 `attachment_ref`；按需下载时才解析实体，记录来源事件、实际字节、SHA-256、MIME 和可得尺寸，不自动 OCR、解析、执行或解压。
 - 腾讯文档资源使用独立 monitor 与 M:N subscription，不复用微信 route 身份。首次登记只保存成功只读轮询得到的当前 baseline；变化按 quiet window 5 分钟、max batch 15 分钟合并，同 fingerprint 全局去重。

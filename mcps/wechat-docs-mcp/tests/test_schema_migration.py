@@ -53,7 +53,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
     database = tmp_path / "events.sqlite3"
     _create_v1_database(database)
     ledger = EventLedger(database)
-    assert ledger.schema_info()["schema_version"] == 4
+    assert ledger.schema_info()["schema_version"] == 5
     assert ledger.migration["migrated"] is True
     backup = Path(ledger.migration["backup_path"])
     assert backup.is_file()
@@ -90,7 +90,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
         connection.close()
         reopened = EventLedger(database)
         assert reopened.migration == {
-            "schema_version": 4,
+            "schema_version": 5,
             "backup_path": None,
             "migrated": False,
         }
@@ -173,7 +173,7 @@ def test_v2_to_v3_preserves_existing_rows_and_creates_v2_backup(tmp_path: Path) 
     migrated = EventLedger(database)
     backup = Path(migrated.migration["backup_path"])
 
-    assert migrated.schema_info()["schema_version"] == 4
+    assert migrated.schema_info()["schema_version"] == 5
     assert migrated.get_route("route-preserved")["route_id"] == "route-preserved"
     assert ".v2-backup." in backup.name
     assert backup.is_file()
@@ -224,3 +224,48 @@ def test_v2_to_v3_failure_rolls_back_partial_schema_and_keeps_backup(tmp_path: P
         connection.close()
     backups = list(tmp_path.glob("events.v2-backup.*.sqlite3"))
     assert len(backups) == 1
+
+
+def test_v4_to_v5_failure_rolls_back_attempt_table_and_keeps_backup(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    ledger = EventLedger(database)
+    ledger.register_route("route-preserved", identity={"chat_name": "safe"}, state="active")
+    ledger.register_subscription(
+        "route-preserved", "conversation-preserved", 1, subscription_id="subscription-preserved"
+    )
+    event = ledger.ingest_event("route-preserved", "fp-preserved", "text", {"text": "safe"})
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("DROP TABLE subscription_notification_attempts")
+        connection.execute("UPDATE schema_meta SET value='4' WHERE key='schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    original_create = schema._create_v5_tables
+
+    def fail_after_create(connection: sqlite3.Connection) -> None:
+        original_create(connection)
+        raise RuntimeError("synthetic v5 migration failure")
+
+    with patch.object(schema, "_create_v5_tables", side_effect=fail_after_create):
+        with pytest.raises(RuntimeError, match="synthetic v5 migration failure"):
+            schema.ensure_schema(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        tables = {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "subscription_notification_attempts" not in tables
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "4"
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM event_deliveries").fetchone()[0] == 1
+        assert connection.execute("SELECT COUNT(*) FROM subscription_wakes").fetchone()[0] == 1
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+    assert event["event_id"]
+    assert len(list(tmp_path.glob("events.v4-backup.*.sqlite3"))) == 1

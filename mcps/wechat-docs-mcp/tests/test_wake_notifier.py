@@ -192,9 +192,13 @@ class WakeNotifierTests(unittest.TestCase):
         self.assertEqual([(event["wake"]["wake_id"], "hidden")] * 2, attempts)
 
     def test_busy_proxy_keeps_wake_prepared_for_retry(self) -> None:
-        self.ledger.ingest_event("route-test", "fp-busy", "text", {"visible_text": "private"})
+        first = self.ledger.ingest_event(
+            "route-test", "fp-busy", "text", {"visible_text": "private"}
+        )
+        requests: list[dict[str, object]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
             return httpx.Response(200, json={"ok": True, "outcome": "busy", "duplicateSuppressed": False})
 
         result = self._notifier(handler).submit_pending()
@@ -203,6 +207,31 @@ class WakeNotifierTests(unittest.TestCase):
         self.assertEqual(1, result["deferred_count"])
         self.assertEqual("THREAD_BUSY", result["errors"][0]["code"])
         self.assertEqual("prepared", self.ledger.get_active_wake("route-test")["state"])
+
+        self.ledger.ingest_event(
+            "route-test", "fp-busy-later", "text", {"visible_text": "later"}
+        )
+
+        def accepted(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                json={"ok": True, "outcome": "accepted", "duplicateSuppressed": False},
+            )
+
+        retried = self._notifier(accepted).submit_pending()
+        self.assertEqual(1, retried["submitted_count"])
+        immutable_fields = (
+            "wakeId",
+            "promptSha256",
+            "pendingThroughSequence",
+            "pendingThroughTime",
+        )
+        self.assertEqual(
+            {field: requests[0][field] for field in immutable_fields},
+            {field: requests[1][field] for field in immutable_fields},
+        )
+        self.assertEqual(first["event_seq"], requests[1]["pendingThroughSequence"])
 
     def test_proxy_unknown_outcome_marks_wake_unknown(self) -> None:
         self.ledger.ingest_event("route-test", "fp-unknown", "text", {"visible_text": "private"})
