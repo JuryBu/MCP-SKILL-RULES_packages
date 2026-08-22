@@ -106,11 +106,22 @@ class AttachmentMaterializer(Protocol):
     def materialize(self, attachment: Mapping[str, Any], destination: Path) -> str: ...
 
 
+class AttachmentContextResolver(Protocol):
+    def resolve(self, subscription_id: str, attachment_ref: str) -> dict[str, Any]: ...
+
+
 class AttachmentRegistry:
-    def __init__(self, ledger: EventLedger, intake_root: str | Path, upload_root: str | Path) -> None:
+    def __init__(
+        self,
+        ledger: EventLedger,
+        intake_root: str | Path,
+        upload_root: str | Path,
+        context_resolver: AttachmentContextResolver | None = None,
+    ) -> None:
         self.ledger = ledger
         self.intake_root = Path(intake_root).resolve()
         self.upload_root = Path(upload_root).resolve()
+        self.context_resolver = context_resolver
 
     def _attachment_for_delivery(
         self,
@@ -153,6 +164,13 @@ class AttachmentRegistry:
     def attachment_for_ref(self, subscription_id: str, attachment_ref: str) -> dict[str, Any]:
         if not attachment_ref.strip():
             raise LedgerError("ATTACHMENT_REF_REQUIRED", "attachment_ref 不能为空")
+        if attachment_ref.startswith("attctx_"):
+            if self.context_resolver is None:
+                raise LedgerError(
+                    "ATTACHMENT_CONTEXT_NOT_READY",
+                    "当前服务未配置历史附件 context resolver",
+                )
+            return self.context_resolver.resolve(subscription_id, attachment_ref)
         connection = self.ledger._connect()
         try:
             rows = connection.execute(
@@ -260,9 +278,24 @@ class AttachmentRegistry:
         existing = self._verified_download(subscription_id, attachment_ref)
         if existing is not None:
             return attachment, existing
-        destination = self.intake_root / "read" / hashlib.sha256(
-            subscription_id.encode("utf-8")
-        ).hexdigest()[:16]
+        destination = self._destination_directory(
+            self.intake_root
+            / "read"
+            / hashlib.sha256(subscription_id.encode("utf-8")).hexdigest()[:16]
+        )
+        if attachment_ref.startswith("attctx_"):
+            prepared = self._prepare_context_download(
+                subscription_id,
+                attachment,
+                self._next_read_dedupe_key(subscription_id, attachment_ref),
+            )
+            transfer = self._materialize_prepared_attachment(
+                attachment,
+                prepared,
+                destination,
+                materializer,
+            )
+            return attachment, transfer
         transfer = self.download(
             subscription_id,
             str(attachment["event_id"]),
@@ -272,6 +305,54 @@ class AttachmentRegistry:
             materializer,
         )
         return attachment, transfer
+
+    def _prepare_context_download(
+        self,
+        subscription_id: str,
+        attachment: Mapping[str, Any],
+        dedupe_key: str,
+    ) -> dict[str, Any]:
+        attachment_ref = str(attachment["attachment_ref"])
+        expected_md5 = str(attachment.get("content_md5") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{32}", expected_md5):
+            raise LedgerError(
+                "ATTACHMENT_INTEGRITY_METADATA_REQUIRED",
+                "历史附件缺少可验证的 MD5，不能物化原件",
+            )
+        file_name = _safe_file_name(
+            str(
+                attachment.get("file_name")
+                or f"{attachment['kind']}-{attachment.get('local_id', 'history')}"
+            )
+        )
+        transfer_id = str(uuid.uuid4())
+        now = utc_now()
+        try:
+            with self.ledger._transaction() as connection:
+                connection.execute(
+                    """
+                    INSERT INTO attachment_transfers(
+                      transfer_id,direction,route_id,source_event_id,file_name,byte_count,
+                      content_md5,state,dedupe_key,created_at,updated_at,subscription_id,
+                      attachment_ref
+                    ) VALUES(?,'download',?,NULL,?,?,?,'PREPARED',?,?,?,?,?)
+                    """,
+                    (
+                        transfer_id,
+                        attachment["route_id"],
+                        file_name,
+                        attachment.get("byte_count"),
+                        expected_md5,
+                        dedupe_key,
+                        now,
+                        now,
+                        subscription_id,
+                        attachment_ref,
+                    ),
+                )
+        except sqlite3.IntegrityError as error:
+            raise LedgerError("DEDUPE_KEY_CONFLICT", "dedupe_key 已被使用") from error
+        return self.get(transfer_id)
 
     def prepare_download(
         self,
@@ -479,7 +560,20 @@ class AttachmentRegistry:
             dedupe_key,
             attachment_ref,
         )
-        directory = self._destination_directory(destination_dir or None)
+        return self._materialize_prepared_attachment(
+            attachment,
+            prepared,
+            self._destination_directory(destination_dir or None),
+            materializer,
+        )
+
+    def _materialize_prepared_attachment(
+        self,
+        attachment: Mapping[str, Any],
+        prepared: Mapping[str, Any],
+        directory: Path,
+        materializer: AttachmentMaterializer,
+    ) -> dict[str, Any]:
         partial = directory / f".{prepared['transfer_id']}.partial"
         try:
             source_kind = materializer.materialize(attachment, partial)

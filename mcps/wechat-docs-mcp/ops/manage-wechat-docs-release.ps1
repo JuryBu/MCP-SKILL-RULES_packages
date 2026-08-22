@@ -12,7 +12,7 @@ param(
   [string]$DrillRoot,
   [string]$Endpoint = "wechat-docs",
   [int]$ExpectedCurrentToolCount = 50,
-  [int]$ExpectedToolCount = 50,
+  [int]$ExpectedToolCount = 51,
   [string]$ProtectedEndpoint = "napcat",
   [int]$ExpectedProtectedToolCount = 22,
   [string]$BrokerBaseUrl = "http://127.0.0.1:14588",
@@ -117,7 +117,10 @@ function Test-LedgerTransition {
   if (Compare-JsonValue $Before $After) { return $true }
   $BeforeVersion = [int]$Before.schema_version
   $AfterVersion = [int]$After.schema_version
-  if ($BeforeVersion -in @(2, 3, 4) -and $AfterVersion -in @(3, 4, 5) -and $AfterVersion -gt $BeforeVersion) {
+  if ($BeforeVersion -in @(2, 3, 4, 5) -and $AfterVersion -in @(3, 4, 5, 6) -and $AfterVersion -gt $BeforeVersion) {
+    if ($BeforeVersion -eq 5 -and $AfterVersion -eq 6 -and [string]$Before.business_state_sha256 -ne [string]$After.business_state_sha256) {
+      return $false
+    }
     foreach ($Name in @(
       "routes", "events_total", "subscriptions_total", "pending_total", "pending_subscriptions_total",
       "wakes_total", "active_wakes_total", "events", "subscriptions", "pending",
@@ -127,7 +130,7 @@ function Test-LedgerTransition {
     }
     return $true
   }
-  if ($BeforeVersion -ne 1 -or $AfterVersion -notin @(2, 3, 4, 5)) { return $false }
+  if ($BeforeVersion -ne 1 -or $AfterVersion -notin @(2, 3, 4, 5, 6)) { return $false }
   foreach ($Name in @("routes", "events_total", "pending_total", "pending_subscriptions_total", "events", "pending", "pending_subscriptions")) {
     if ([int]$Before.$Name -ne [int]$After.$Name) { return $false }
   }
@@ -649,7 +652,7 @@ function Invoke-ReleaseSwitch {
       $MigrationRaw = & $SwitchProbePython $ProbeScript migrate-ledger --ledger $LedgerPath --route-id $SwitchRouteId
       if ($LASTEXITCODE -ne 0) { throw "Fixture candidate ledger migration failed" }
       $Migration = ($MigrationRaw -join "`n") | ConvertFrom-Json
-    if ([int]$Migration.schema_version -ne 5) { throw "Fixture candidate did not migrate the ledger to schema 5" }
+    if ([int]$Migration.schema_version -ne 6) { throw "Fixture candidate did not migrate the ledger to schema 6" }
     }
     $Health = Wait-EndpointHealth -Mode $Mode -Name $Endpoint -ToolCount $ExpectedToolCount -FixtureStatePath $FixtureStatePath -MinimumGeneration ($Context.beforeBackendGeneration + 1)
     $Supervisor = Wait-Supervisor -Mode $Mode -SupervisorPath $SupervisorPath -FixtureStatePath $FixtureStatePath -BackendPid ([int]$Health.backend.pid) -BackendGeneration ([int]$Health.backend.generation)
@@ -657,10 +660,10 @@ function Invoke-ReleaseSwitch {
     if ([int]$ProtectedHealth.pid -ne [int]$BeforeProtectedHealth.pid -or [int]$ProtectedHealth.backend.pid -ne [int]$BeforeProtectedHealth.backend.pid -or [int]$ProtectedHealth.backend.generation -ne [int]$BeforeProtectedHealth.backend.generation) {
       throw "Protected endpoint changed during the WeChat release switch"
     }
-    $AfterLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
-    if (-not (Test-LedgerTransition $BeforeLedger $AfterLedger)) { throw "Ledger transition is not unchanged or a supported schema migration" }
     $PhaseAStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython -FixtureStatePath $FixtureStatePath -ToolName "wechat_status"
     Assert-PollStatus -Status $PhaseAStatus -ExpectedRunning $false
+    $AfterLedger = Get-LedgerState -PythonPath $SwitchProbePython -LedgerPath $LedgerPath -BoundRouteId $SwitchRouteId
+    if (-not (Test-LedgerTransition $BeforeLedger $AfterLedger)) { throw "Ledger transition is not unchanged or a supported schema migration" }
     if ($FailBeforePollStart) { throw "Forced failure after Phase A before polling resumes" }
 
     $UpdatedManifest = Update-ServiceManifest -Path (Join-Path $CurrentPath "service-manifest.json") -ReleaseId $SwitchCandidateReleaseId -SourceCommit $SourceCommit -Health $Health -Supervisor $Supervisor

@@ -606,7 +606,7 @@ wheels = [
 
 [[package]]
 name = "wechat-docs-mcp"
-version = "0.6.5"
+version = "0.7.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },

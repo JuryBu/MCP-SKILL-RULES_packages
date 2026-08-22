@@ -30,6 +30,8 @@ ownerAccountKey + internal username + chat_type
 
 subscription 是独占 session，每条只属于一个确定的 `(route_id, conversation_id, generation)`。一个 route 可连接多个 conversation，一个 conversation 也可连接多个 route。新事件只在 `events` 物化一次，然后在同一事务中 fan-out 到该 route 的所有 active、listen-capable subscription。
 
+按锚点读取历史上下文走独立只读旁路：subscription 先通过 `context_read_capability`、精确 route identity 与当前 owner account scope 三重授权，再从微信只读数据库读取有限窗口。该旁路不把历史消息补写进 `events`，不创建 delivery/wake，也不改变 baseline、pending 或 ACK。
+
 ## 3. 核心表
 
 ### routes
@@ -77,11 +79,12 @@ baseline_event_seq INTEGER NOT NULL
 cursor_event_seq INTEGER NOT NULL
 listen_capability INTEGER NOT NULL
 send_capability INTEGER NOT NULL
+context_read_capability INTEGER NOT NULL DEFAULT 0
 policy_ref TEXT
 UNIQUE(route_id, conversation_id, generation)
 ```
 
-启用 `send_capability` 时必须有本机私有 `policy_ref`。暂停不会替其它订阅 ACK；暂停期间的新事件不投递，恢复从当前基线继续，旧 pending 仍保留。
+启用 `send_capability` 或 `context_read_capability` 时必须有本机私有 `policy_ref`。两者都不会由 `listen_capability` 隐式继承。暂停不会替其它订阅 ACK；暂停期间的新事件不投递，恢复从当前基线继续，旧 pending 仍保留。
 
 ### event_deliveries、subscription_wakes 与 notification attempts
 
@@ -122,6 +125,8 @@ error_code TEXT
 
 `attachment_transfers` 记录方向、route、来源事件、文件名、字节数、SHA-256、本地路径和 dedupe。文件只允许落在配置的 intake/upload root，不自动执行或解压。
 
+`wechat_message_context_read` 返回稳定 `msgctx_...` 消息锚点和短期 `attctx_...` 历史附件引用。两者都由本机私有 HMAC key 签名，并绑定 subscription、route、generation、owner account、内部 username、chat type、精确消息身份和 source cutoff。continuation 另使用 `ctxcur_...`，绑定锚点、过滤条件、已选消息身份及字符偏移，续读可以调整本页预算，但不能跨来源快照、跳页或复用到另一 subscription。`attctx_...` 只在读取时重新核对来源行，不会创建历史 event/delivery；物化操作仍单独写入附件 transfer 审计。
+
 本机私有 `binding.json/tencentDocs.monitors` 是文档 allowlist，必须精确绑定 `policy_ref + resource_kind + resource_key + poll_tool + poll_arguments`，并同时设为 `active/listen=true`。`tdocs_monitors` 只是通过 allowlist 后的运行账本：保存资源 ID 哈希、私有调用参数、当前 baseline fingerprint 和失败状态。创建和每次轮询都会重新校验私有 allowlist；撤销策略后不会继续读取，也不会推进 baseline。真实资源 ID、标题与调用参数不会出现在 monitor 列表或 wake 中。
 
 文档资源与 Codex conversation 通过 `tdocs_monitor_subscriptions` 建立 M:N 连接。`tdocs_monitor_batches/changes` 实现 5 分钟 quiet window 与 15 分钟 max batch；`UNIQUE(monitor_id, change_fingerprint)` 保证同一变化跨批次和重启不重复。批次 READY 后才向每个 active subscription 建立独立 `tdocs_batch_deliveries` 与 `tdocs_subscription_wakes`，一个订阅 ACK 不影响其它订阅。
@@ -139,6 +144,7 @@ V1 迁移规则：
 - 旧 route wake 复制为 subscription wake；有 pending 且没有活跃 wake 时补建一个。
 - schema v4 的活跃 wake 会补建 notification attempt。旧 `submitted` wake 以 wake 创建时已到达的最大 event_seq 作为历史覆盖边界，之后尚未 ACK 的新事件可在冷却后保守提醒一次。
 - 旧草稿映射到大写状态，保留哈希、TTL、授权引用和 dedupe。
+- schema v5 升至 v6 时为所有既有 subscription 增加 `context_read_capability=0`；迁移不会自动扩大历史读取权限。
 
 迁移不会删除 V1 表或清空账本。回滚备份能恢复迁移前字节级状态；但一旦 V2 已产生多个 subscription 的独立新投递，V1 无法表达这些差异，因此发布回滚只能保证代码和文件恢复，不能宣称把 V2 新业务状态无损降为 V1。
 

@@ -186,7 +186,7 @@ def test_v4_submitted_wake_migration_preserves_logical_wake_and_rearms(tmp_path:
         connection.close()
 
     migrated = EventLedger(ledger.path)
-    assert migrated.schema_info()["schema_version"] == 5
+    assert migrated.schema_info()["schema_version"] == 6
     assert ".v4-backup." in Path(migrated.migration["backup_path"]).name
     attempts = migrated.list_notification_attempts("subscription-a")
     assert attempts[0]["notification_id"] == first["wake"]["wake_id"]

@@ -227,6 +227,89 @@ class LedgerTests(unittest.TestCase):
             )
         self.assertEqual("SUBSCRIPTION_SEND_DISABLED", raised.exception.code)
 
+    def test_context_read_capability_defaults_false_and_requires_policy_when_enabled(self) -> None:
+        self.assertEqual(False, self.ledger.get_subscription("subscription-test")["context_read_capability"])
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.register_subscription(
+                "route-test",
+                "conversation-context-read",
+                2,
+                context_read_capability=True,
+            )
+        self.assertEqual("POLICY_REF_REQUIRED", raised.exception.code)
+
+        subscription = self.ledger.register_subscription(
+            "route-test",
+            "conversation-context-read",
+            2,
+            context_read_capability=True,
+            policy_ref="context-read-policy",
+        )
+
+        self.assertEqual(1, subscription["context_read_capability"])
+
+    def test_context_read_capability_update_preserves_or_changes_as_requested(self) -> None:
+        with self.assertRaises(LedgerError) as raised:
+            self.ledger.set_subscription_capabilities(
+                "subscription-test",
+                1,
+                listen_capability=True,
+                send_capability=False,
+                context_read_capability=True,
+            )
+        self.assertEqual("POLICY_REF_REQUIRED", raised.exception.code)
+
+        enabled = self.ledger.set_subscription_capabilities(
+            "subscription-test",
+            1,
+            listen_capability=True,
+            send_capability=False,
+            context_read_capability=True,
+            policy_ref="context-read-policy",
+        )
+        self.assertEqual(1, enabled["context_read_capability"])
+
+        preserved = self.ledger.set_subscription_capabilities(
+            "subscription-test",
+            1,
+            listen_capability=False,
+            send_capability=False,
+        )
+        self.assertEqual(0, preserved["listen_capability"])
+        self.assertEqual(1, preserved["context_read_capability"])
+        self.assertEqual("context-read-policy", preserved["policy_ref"])
+
+        disabled = self.ledger.set_subscription_capabilities(
+            "subscription-test",
+            1,
+            listen_capability=True,
+            send_capability=False,
+            context_read_capability=False,
+        )
+        self.assertEqual(0, disabled["context_read_capability"])
+
+    def test_explicit_policy_update_replaces_existing_context_policy(self) -> None:
+        self.ledger.set_subscription_capabilities(
+            "subscription-test",
+            1,
+            listen_capability=True,
+            send_capability=False,
+            context_read_capability=True,
+            policy_ref="context-read-policy",
+        )
+
+        updated = self.ledger.set_subscription_capabilities(
+            "subscription-test",
+            1,
+            listen_capability=True,
+            send_capability=True,
+            policy_ref="send-policy",
+        )
+
+        self.assertEqual(1, updated["send_capability"])
+        self.assertEqual(1, updated["context_read_capability"])
+        self.assertEqual("send-policy", updated["policy_ref"])
+
     def test_expired_execution_becomes_unknown_and_cannot_retry(self) -> None:
         draft, payload = self.approved_wechat_draft("unique", "dedupe-expired")
         lease_expires = datetime.now(timezone.utc) + timedelta(minutes=5)
@@ -917,6 +1000,37 @@ class LedgerTests(unittest.TestCase):
 
             self.assertEqual("ROUTE_IDENTITY_CONFLICT", raised.exception.code)
             self.assertEqual(1, ledger.get_route("legacy-route")["identity_version"])
+
+    def test_read_only_ledger_does_not_initialize_or_write_journal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "events.sqlite3"
+            writable = EventLedger(path)
+            writable.register_route(
+                "route-read-only",
+                profile="test",
+                state="active",
+                owner_account_key="owner",
+                username="friend",
+                chat_type="friend",
+            )
+            writable.register_subscription(
+                "route-read-only",
+                "conversation-read-only",
+                1,
+                subscription_id="subscription-read-only",
+            )
+
+            before = path.read_bytes()
+            read_only = EventLedger(path, read_only=True)
+            self.assertEqual(
+                "subscription-read-only",
+                read_only.get_subscription("subscription-read-only")["subscription_id"],
+            )
+            with self.assertRaises(LedgerError) as raised:
+                with read_only._transaction():
+                    pass
+            self.assertEqual("LEDGER_READ_ONLY", raised.exception.code)
+            self.assertEqual(before, path.read_bytes())
 
 
 class RouteTests(unittest.TestCase):

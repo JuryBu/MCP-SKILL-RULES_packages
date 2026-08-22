@@ -356,6 +356,14 @@ class WechatAttachmentSourceResolver:
         try:
             return self._image_index(attachment, username)
         except LedgerError as error:
+            if (
+                attachment.get("reference_kind") == "context"
+                and self._image_index_pending(error)
+            ):
+                raise LedgerError(
+                    "ATTACHMENT_IMAGE_NOT_AVAILABLE",
+                    "历史图片当前没有可验证 hardlink 索引",
+                ) from error
             if not self._image_index_pending(error) or self.image_index_wait_seconds <= 0:
                 raise
             last_error = error
@@ -513,6 +521,65 @@ class WechatAttachmentSourceResolver:
             and self._scan_allowed(observed_at)
         )
 
+    def _available_image_sources(
+        self,
+        username: str,
+        create_time: int,
+        indexed: Sequence[tuple[str, str, int]],
+    ) -> list[tuple[str, str, int]]:
+        return [
+            (file_name, content_md5, expected_size)
+            for file_name, content_md5, expected_size in indexed
+            if self._image_source(username, create_time, file_name).is_file()
+        ]
+
+    def _image_sources_with_wait(
+        self,
+        attachment: Mapping[str, Any],
+        username: str,
+        create_time: int,
+        indexed: list[tuple[str, str, int]],
+    ) -> tuple[list[tuple[str, str, int]], list[tuple[str, str, int]]]:
+        available = self._available_image_sources(username, create_time, indexed)
+        if available:
+            return indexed, available
+        if (
+            attachment.get("reference_kind") == "context"
+            or not self._scan_allowed(attachment.get("observed_at"))
+        ):
+            raise LedgerError(
+                "ATTACHMENT_IMAGE_NOT_AVAILABLE",
+                "历史图片索引存在，但客户端当前没有可验证原件实体",
+            )
+        if self.image_index_wait_seconds <= 0:
+            raise LedgerError(
+                "ATTACHMENT_IMAGE_WAITING",
+                "新图片索引已出现，但原件实体尚未物化；保留 attachment_ref 稍后重试",
+            )
+
+        deadline = time.monotonic() + self.image_index_wait_seconds
+        next_refresh = time.monotonic()
+        while True:
+            now = time.monotonic()
+            if self.refresh_decrypted is not None and now >= next_refresh and now < deadline:
+                try:
+                    self.refresh_decrypted()
+                    indexed = self._image_index(attachment, username)
+                except Exception:
+                    pass
+                next_refresh = now + self.image_index_refresh_interval_seconds
+            available = self._available_image_sources(username, create_time, indexed)
+            if available:
+                return indexed, available
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(self.image_index_poll_interval_seconds, remaining))
+        raise LedgerError(
+            "ATTACHMENT_IMAGE_WAITING",
+            "新图片在有界等待后仍未物化原件实体；保留 attachment_ref 稍后重试",
+        )
+
     def _materialize_image(
         self,
         attachment: Mapping[str, Any],
@@ -524,13 +591,12 @@ class WechatAttachmentSourceResolver:
         indexed = self._image_index_with_wait(attachment, username)
         expected_event_size = attachment.get("byte_count")
         expected_event_md5 = str(attachment.get("content_md5") or "").casefold()
-        available = [
-            (file_name, content_md5, expected_size)
-            for file_name, content_md5, expected_size in indexed
-            if self._image_source(username, create_time, file_name).is_file()
-        ]
-        if not available:
-            raise LedgerError("ATTACHMENT_IMAGE_ENTITY", "微信图片实体不存在")
+        indexed, available = self._image_sources_with_wait(
+            attachment,
+            username,
+            create_time,
+            indexed,
+        )
         exact = [
             row
             for row in available
@@ -573,9 +639,12 @@ class WechatAttachmentSourceResolver:
                 scan_candidates,
             ),
             validated_content_md5=content_md5,
-            allow_scan=self._account_scan_allowed(
-                owner_account_key_sha256,
-                attachment.get("observed_at"),
+            allow_scan=(
+                attachment.get("reference_kind") != "context"
+                and self._account_scan_allowed(
+                    owner_account_key_sha256,
+                    attachment.get("observed_at"),
+                )
             ),
             scan_timeout_seconds=IMAGE_KEY_SCAN_TIMEOUT_SECONDS,
         )

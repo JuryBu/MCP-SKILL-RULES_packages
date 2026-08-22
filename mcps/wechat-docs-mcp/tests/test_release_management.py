@@ -128,6 +128,9 @@ class ReleaseProbeTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(0, snapshot.returncode, snapshot.stderr)
+            snapshot_state = json.loads(snapshot.stdout)
+            business_state_sha256 = snapshot_state.pop("business_state_sha256")
+            self.assertEqual(64, len(business_state_sha256))
             self.assertEqual(
                 {
                     "active_wakes": 1,
@@ -140,14 +143,76 @@ class ReleaseProbeTests(unittest.TestCase):
                     "pending_subscriptions_total": 1,
                     "pending_total": 1,
                     "routes": 1,
-                    "schema_version": 5,
+                    "schema_version": 6,
                     "subscriptions": 2,
                     "subscriptions_total": 2,
                     "wakes": 2,
                     "wakes_total": 2,
                 },
-                json.loads(snapshot.stdout),
+                snapshot_state,
             )
+
+    def test_ledger_state_hash_detects_delivery_state_swaps(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "events.sqlite3"
+            ledger = EventLedger(path)
+            ledger.register_route("route-hash", profile="test", state="active")
+            ledger.register_subscription(
+                "route-hash",
+                "conversation-hash",
+                1,
+                subscription_id="subscription-hash",
+            )
+            first = ledger.ingest_event("route-hash", "fingerprint-first", "text", {"text": "one"})
+            second = ledger.ingest_event("route-hash", "fingerprint-second", "text", {"text": "two"})
+            wake = ledger.get_active_wake("subscription-hash")
+            self.assertIsNotNone(wake)
+            ledger.ack("subscription-hash", 1, wake["wake_id"], [first["event_id"]])
+
+            before = json.loads(
+                run_process(
+                    [
+                        sys.executable,
+                        str(PROBE_SCRIPT),
+                        "ledger-state",
+                        "--ledger",
+                        str(path),
+                        "--route-id",
+                        "route-hash",
+                    ]
+                ).stdout
+            )
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    "UPDATE event_deliveries SET state='PENDING',acked_at=NULL WHERE event_id=?",
+                    (first["event_id"],),
+                )
+                connection.execute(
+                    "UPDATE event_deliveries SET state='ACKED',acked_at=? WHERE event_id=?",
+                    ("2026-08-22T00:00:00+00:00", second["event_id"]),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            after = json.loads(
+                run_process(
+                    [
+                        sys.executable,
+                        str(PROBE_SCRIPT),
+                        "ledger-state",
+                        "--ledger",
+                        str(path),
+                        "--route-id",
+                        "route-hash",
+                    ]
+                ).stdout
+            )
+
+            self.assertNotEqual(before["business_state_sha256"], after["business_state_sha256"])
+            before.pop("business_state_sha256")
+            after.pop("business_state_sha256")
+            self.assertEqual(before, after)
 
     def test_online_backup_is_complete_and_refuses_overwrite(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -217,7 +282,7 @@ class ReleaseProbeTests(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         package = json.loads(result.stdout)
         self.assertTrue(package["inside_release"])
-        self.assertEqual(50, package["tool_count"])
+        self.assertEqual(51, package["tool_count"])
 
 
 @unittest.skipUnless(os.name == "nt" and POWERSHELL, "Windows PowerShell and Junctions required")
@@ -288,7 +353,7 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         self.assertFalse(summary["productionTouched"])
         self.assertEqual(4, len(summary["successfulCases"]))
         self.assertTrue(all(case["activeBackendPresent"] for case in summary["successfulCases"]))
-        self.assertTrue(all(case["activationToolCount"] == 50 for case in summary["successfulCases"]))
+        self.assertTrue(all(case["activationToolCount"] == 51 for case in summary["successfulCases"]))
         self.assertTrue(all(case["activated"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["phaseAWatcherFrozen"] for case in summary["successfulCases"]))
         self.assertTrue(all(case["postCommitStatusVerified"] for case in summary["successfulCases"]))
@@ -312,9 +377,9 @@ class ReleaseManagerDrillTests(unittest.TestCase):
         null_active_backend = json.loads(
             (drill_root / "null-active-backend" / "service" / "releases" / "release-candidate" / "service-manifest.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(50, missing_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(50, null_validation["validation"]["activeBackend"]["toolCount"])
-        self.assertEqual(50, null_active_backend["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(51, missing_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(51, null_validation["validation"]["activeBackend"]["toolCount"])
+        self.assertEqual(51, null_active_backend["validation"]["activeBackend"]["toolCount"])
 
         for case_name in ("missing-validation", "null-validation", "null-active-backend", "v2-schema"):
             case_root = drill_root / case_name
@@ -330,11 +395,12 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             connection = sqlite3.connect(case_root / "data" / "state" / "events.sqlite3")
             try:
                 self.assertEqual(
-                    "5",
+                    "6",
                     connection.execute(
                         "SELECT value FROM schema_meta WHERE key='schema_version'"
                     ).fetchone()[0],
                 )
+
                 self.assertEqual("ok", connection.execute("PRAGMA integrity_check").fetchone()[0])
             finally:
                 connection.close()
@@ -357,6 +423,17 @@ class ReleaseManagerDrillTests(unittest.TestCase):
             self.assertTrue(rollback["protectedBackendStable"])
             self.assertTrue(rollback["ledgerRestoredExactly"])
             self.assertTrue(Path(rollback["ledgerBackupPath"]).is_file())
+
+    def test_release_reads_post_migration_ledger_after_status(self) -> None:
+        script = RELEASE_SCRIPT.read_text(encoding="utf-8")
+        status_call = script.index(
+            '$PhaseAStatus = Invoke-McpTool -Mode $Mode -PythonPath $SwitchProbePython '
+            '-FixtureStatePath $FixtureStatePath -ToolName "wechat_status"'
+        )
+        ledger_snapshot = script.index(
+            "$AfterLedger = Get-LedgerState -PythonPath $SwitchProbePython"
+        )
+        self.assertLess(status_call, ledger_snapshot)
 
     def test_drill_rejects_missing_candidate_python(self) -> None:
         drill_root = self.root / "missing-python-drill"

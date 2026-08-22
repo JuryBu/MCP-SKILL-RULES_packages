@@ -78,21 +78,61 @@ def _parse_datetime(value: str) -> datetime:
 
 
 class EventLedger:
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, read_only: bool = False) -> None:
         self.path = Path(path)
+        self.read_only = read_only
+        if read_only:
+            if not self.path.is_file():
+                raise LedgerError("LEDGER_NOT_READY", "事件账本尚未初始化")
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30,
+            )
+            try:
+                version = connection.execute(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'"
+                ).fetchone()
+            except sqlite3.Error as error:
+                raise LedgerError("LEDGER_SCHEMA_NOT_READY", "事件账本 schema 不可用") from error
+            finally:
+                connection.close()
+            if version is None or int(version[0]) != SCHEMA_VERSION:
+                raise LedgerError(
+                    "LEDGER_SCHEMA_NOT_READY",
+                    "事件账本必须先由服务启动流程完成 schema 迁移",
+                )
+            self.migration = {
+                "schema_version": SCHEMA_VERSION,
+                "migrated": False,
+                "backup_path": None,
+                "read_only": True,
+            }
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.migration = ensure_schema(self.path)
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+        if self.read_only:
+            connection = sqlite3.connect(
+                f"{self.path.resolve().as_uri()}?mode=ro",
+                uri=True,
+                timeout=30,
+                isolation_level=None,
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
+        if not self.read_only:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
         return connection
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise LedgerError("LEDGER_READ_ONLY", "只读事件账本不允许事务写入")
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -219,8 +259,8 @@ class EventLedger:
                         INSERT INTO subscriptions(
                           subscription_id,route_id,conversation_id,generation,state,
                           baseline_event_seq,cursor_event_seq,listen_capability,send_capability,
-                          policy_ref,created_at,updated_at
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                          context_read_capability,policy_ref,created_at,updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                         """,
                         (
                             legacy_subscription_id(route_id, conversation_id, generation),
@@ -231,6 +271,7 @@ class EventLedger:
                             current_event_seq,
                             current_event_seq,
                             1,
+                            0,
                             0,
                             "legacy-register-route",
                             now,
@@ -433,6 +474,7 @@ class EventLedger:
         state: str = "active",
         listen_capability: bool = True,
         send_capability: bool = False,
+        context_read_capability: bool = False,
         policy_ref: str | None = None,
         baseline_event_seq: int | None = None,
     ) -> dict[str, Any]:
@@ -442,8 +484,8 @@ class EventLedger:
             raise LedgerError("INVALID_GENERATION", "generation 必须大于等于 1")
         if state not in {"active", "paused", "closed"}:
             raise LedgerError("INVALID_SUBSCRIPTION_STATE", "subscription state 无效")
-        if send_capability and not (policy_ref or "").strip():
-            raise LedgerError("POLICY_REF_REQUIRED", "启用发送能力必须提供本机 policy_ref")
+        if (send_capability or context_read_capability) and not (policy_ref or "").strip():
+            raise LedgerError("POLICY_REF_REQUIRED", "启用发送或上下文读取能力必须提供本机 policy_ref")
         subscription_id = subscription_id or str(uuid.uuid4())
         now = utc_now()
         try:
@@ -461,11 +503,11 @@ class EventLedger:
                     raise LedgerError("INVALID_SUBSCRIPTION_BASELINE", "subscription baseline 超出事件账本范围")
                 connection.execute(
                     """
-                    INSERT INTO subscriptions(
-                      subscription_id,route_id,conversation_id,generation,state,
-                      baseline_event_seq,cursor_event_seq,listen_capability,send_capability,
-                      policy_ref,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        INSERT INTO subscriptions(
+                          subscription_id,route_id,conversation_id,generation,state,
+                          baseline_event_seq,cursor_event_seq,listen_capability,send_capability,
+                          context_read_capability,policy_ref,created_at,updated_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         subscription_id,
@@ -477,6 +519,7 @@ class EventLedger:
                         baseline,
                         int(listen_capability),
                         int(send_capability),
+                        int(context_read_capability),
                         policy_ref,
                         now,
                         now,
@@ -632,21 +675,32 @@ class EventLedger:
         *,
         listen_capability: bool,
         send_capability: bool,
+        context_read_capability: bool | None = None,
         policy_ref: str | None = None,
     ) -> dict[str, Any]:
-        if send_capability and not (policy_ref or "").strip():
-            raise LedgerError("POLICY_REF_REQUIRED", "启用发送能力必须提供本机 policy_ref")
+        if (send_capability or context_read_capability) and not (policy_ref or "").strip():
+            raise LedgerError("POLICY_REF_REQUIRED", "启用发送或上下文读取能力必须提供本机 policy_ref")
         with self._transaction() as connection:
             changed = connection.execute(
                 """
                 UPDATE subscriptions
-                SET listen_capability=?,send_capability=?,policy_ref=?,updated_at=?
+                SET listen_capability=?,send_capability=?,
+                    context_read_capability=COALESCE(?,context_read_capability),
+                    policy_ref=CASE
+                      WHEN ? IS NOT NULL THEN ?
+                      WHEN COALESCE(?,context_read_capability)=1 THEN policy_ref
+                      ELSE NULL
+                    END,
+                    updated_at=?
                 WHERE subscription_id=? AND generation=? AND state!='closed'
                 """,
                 (
                     int(listen_capability),
                     int(send_capability),
+                    None if context_read_capability is None else int(context_read_capability),
                     policy_ref,
+                    policy_ref,
+                    None if context_read_capability is None else int(context_read_capability),
                     utc_now(),
                     subscription_id,
                     generation,

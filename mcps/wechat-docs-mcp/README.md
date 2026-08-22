@@ -8,6 +8,7 @@
 - private binding 可按 route 登记当前账号的 `ownerSenderUsername`。消息作者命中该精确身份时一律按 self-sent/outbound 静默入账；数据库方向不可信时只隔离入账，不向 subscription fan-out。
 - 新账号只在私有 enrollment 明确给出当前 owner identity 哈希后才允许短时扫描图片密钥；账号不明或与 route 不符时保持 `WAITING_FOR_KEY`，不会覆盖其他账号缓存。
 - route 与 Codex conversation 是 M:N。每个 subscription 只属于一个 `(route_id, conversation_id, generation)`，事件按 route 只入账一次，再向所有 active subscription 独立投递。
+- 历史上下文读取是独立的、默认关闭的 `context_read_capability`，不会由监听权限自动继承。获准的 subscription 只能按已投递事件或已签名消息锚点读取同一精确 route 的有限双向切片，读取不会创建 delivery/wake，也不会改变 baseline、pending 或 ACK。
 - 每个 subscription 有独立 pending、稳定 logical wake、通知 attempt、ACK、暂停、关闭和能力策略；旧 pending 不会永久压住之后的新消息提醒，一个订阅 ACK 也不影响其它订阅。
 - 微信发送与腾讯文档写入都使用不可变草稿、非空 `owner_authorization_refs`、TTL 和 `dedupe_key`。批准只消费一次，`UNKNOWN` 不自动重试。
 - 文件、普通图片和表情先只入账元数据，并生成不可伪造的 `attachment_ref`；按需下载时才解析实体，记录来源事件、实际字节、SHA-256、MIME 和可得尺寸，不自动 OCR、解析、执行或解压。
@@ -24,6 +25,7 @@
 |---|---|---|
 | 状态与轮询 | `wechat_status`、`wechat_poll*` | 检查各层状态，手动或后台轮询 |
 | 订阅与事件 | `wechat_subscriptions_*`、`wechat_events_*`、`wechat_wake_info` | M:N 建链、独立读取与精确 ACK |
+| 局部上下文 | `wechat_message_context_read` | 按 subscription 与消息锚点只读恢复同会话入站/主人出站局部上下文 |
 | Outbound 治理 | `outbound_prepare/approve/status/recover/verify`、`wechat_outbound_capabilities` | 草稿审批、状态恢复和严格数据库确认 |
 | 附件 | `wechat_attachment_*`、`wechat_read_attachments`、`wechat_read_image`、`wechat_capture_visible_image_preview` | 精确下载、图片/PDF/Office 可视读取、人工辅助视窗预览、上传草稿、受控执行与数据库确认 |
 | 腾讯文档 | `tdocs_*`、`tdocs_monitor_*` | 高频读、官方完整能力入口、allowlist 监视、M:N 批次投递与精确 ACK |
@@ -32,11 +34,11 @@
 
 每次 UI 执行都记录微信可见时长、执行前后可见窗口数、前台焦点、鼠标和剪贴板语义恢复结果；检测到用户在执行期间移动鼠标、切换焦点或更改剪贴板时，恢复会保守停止，避免覆盖用户的新状态。这些前后观测与累计可见时长用于审计，但在没有独立全程采样器时不能单独证明严格无窗口。
 
-`wechat_read_attachments` 只接受当前 subscription 已投递的 `attachment_ref`。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。微信 V2 普通图片按 owner account identity 分区使用本机私有 key；旧无归属 key 只有通过精确 DAT 的大小、MD5 和格式验证后才会迁入该账号。解密后的 wxgf 原件完整保留，HEVC 只在私有派生目录中用无窗口 ffmpeg 转成可视 PNG。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终记录 SHA-256；XLSX 只下载原件，不自动分页。
+`wechat_read_attachments` 接受两类不可伪造引用：当前 subscription 已投递事件生成的 `att_...`，以及 `wechat_message_context_read` 为同一 subscription 的历史来源行签发的短期 `attctx_...`。后者不会把历史消息写入 event/delivery/PENDING，只在读取时重新核对 route、账号、消息身份、类型、MD5、大小和 source cutoff；篡改、过期、账号切换或来源漂移都会拒绝。图片和表情返回 MCP `ImageContent`；PDF 按页渲染；DOCX/PPTX 先在私有派生目录中用禁宏、隔离配置的 LibreOffice 转成 PDF，再复用同一分页合同。微信 V2 普通图片按 owner account identity 分区使用本机私有 key；旧无归属 key 只有通过精确 DAT 的大小、MD5 和格式验证后才会迁入该账号。解密后的 wxgf 原件完整保留，HEVC 只在私有派生目录中用无窗口 ffmpeg 转成可视 PNG。响应受图片数、总像素和总返回字节三重预算约束，超出时返回稳定 continuation cursor，不能静默漏图或跳页。原件始终记录 SHA-256；XLSX 只下载原件，不自动分页。
 
 当当前账号没有通过目标 DAT 验证的 key 时，普通图片读取返回 `ATTACHMENT_IMAGE_KEY_WAITING`。适配器只允许在一条新图片事件到达后的短窗口执行有截止时间的只读 Weixin 进程扫描；平时不常驻高频盲扫，也不通过点击、窗口消息或可见预览触发 key。`wechat_capture_visible_image_preview` 仍是单独的人工辅助降级：只有用户已手动打开目标查看器并提供确认引用时才可调用，不能替代原件下载，也不能把预览哈希冒充原件哈希。
 
-若图片事件已经入账但 hardlink 索引尚未到达，按需读取会先触发一次无 UI 的 watcher 刷新，并在固定时间预算内等待解密索引出现。`hardlink/hardlink.db` 的单独变化也会触发解密；超时后返回 `ATTACHMENT_IMAGE_WAITING` 并保留同一 `attachment_ref`，不会要求用户缩放、截图或重复发送。微信客户端尚未物化任何原件/预览时，MCP 不能凭空生成原件；此时只允许稍后重试或显式使用独立的低打扰/人工辅助降级，不能把视窗预览冒充原件。
+若近期图片事件已经入账但 hardlink 索引或精确 DAT 实体尚未到达，按需读取会先触发一次无 UI 的 watcher 刷新，并在固定时间预算内等待解密索引/实体出现。`hardlink/hardlink.db` 的单独变化也会触发解密；超时后返回 `ATTACHMENT_IMAGE_WAITING` 并保留同一引用，不会要求用户缩放、截图或重复发送。历史 `attctx_...` 所指原件若在有界核对时仍不存在，则诚实返回 `ATTACHMENT_IMAGE_NOT_AVAILABLE`，不能把人工打开查看器或视窗预览包装成自主原件读取。
 
 若微信后台只落盘了与该消息精确 hardlink 绑定的本地预览，而事件声明的原件仍不可用，读取工具可以返回该预览，但响应必须标记 `quality=preview`、`matches_event_original=false`，同时保留事件声明的原件大小与 MD5；预览自身仍须通过 hardlink 大小与 MD5 校验，不能被描述为原件。
 

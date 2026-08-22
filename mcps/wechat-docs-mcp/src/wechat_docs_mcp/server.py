@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import threading
 import uuid
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,12 +18,15 @@ from mcp.types import CallToolResult
 
 from .attachment_reader import VisualAttachmentReader
 from .attachments import AttachmentRegistry
+from .context_attachments import ContextAttachmentResolver
+from .context_tokens import ContextTokenCodec
 from .db_observer import RouteBinding, resolve_owner_sender_username
 from .db_watcher import DbWatcher
 from .document_changes import DocumentChangeCoalescer
 from .document_monitor import DocumentMonitorStore, TencentDocsMonitorService
 from .document_policy import PrivateBindingDocumentMonitorVerifier
 from .ledger import EventLedger, LedgerError
+from .message_context import MessageContextReader
 from .outbound import SafeTextOutbound
 from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
@@ -85,6 +89,12 @@ IMAGE_KEY_ROOT = Path(
         DATA_ROOT / "secrets" / "wechat-image-v2",
     )
 )
+CONTEXT_TOKEN_KEY_FILE = Path(
+    os.environ.get(
+        "WECHAT_DOCS_MCP_CONTEXT_TOKEN_KEY_FILE",
+        DATA_ROOT / "secrets" / "wechat-context-hmac.key",
+    )
+)
 ACTIVE_OWNER_ACCOUNT_KEY_SHA256 = os.environ.get(
     "WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256",
     "",
@@ -131,8 +141,8 @@ mcp = MCPServer(
 )
 
 
-def ledger() -> EventLedger:
-    return EventLedger(DATA_ROOT / "state" / "events.sqlite3")
+def ledger(*, read_only: bool = False) -> EventLedger:
+    return EventLedger(DATA_ROOT / "state" / "events.sqlite3", read_only=read_only)
 
 
 def docs_client() -> TencentDocsMcpClient:
@@ -141,6 +151,38 @@ def docs_client() -> TencentDocsMcpClient:
 
 def attachment_registry() -> AttachmentRegistry:
     return AttachmentRegistry(ledger(), ATTACHMENT_INTAKE_ROOT, ATTACHMENT_UPLOAD_ROOT)
+
+
+def context_token_codec() -> ContextTokenCodec:
+    return ContextTokenCodec.from_file(CONTEXT_TOKEN_KEY_FILE)
+
+
+def context_attachment_resolver(
+    event_ledger: EventLedger,
+) -> ContextAttachmentResolver | None:
+    if not CONTEXT_TOKEN_KEY_FILE.is_file():
+        return None
+    binding_document = _load_binding_document()
+    return ContextAttachmentResolver(
+        event_ledger,
+        binding_document,
+        _load_bindings(),
+        DECRYPTED_DIR,
+        context_token_codec(),
+        active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
+    )
+
+
+def message_context_reader(event_ledger: EventLedger) -> MessageContextReader:
+    binding_document = _load_binding_document()
+    return MessageContextReader(
+        event_ledger,
+        binding_document,
+        _load_bindings(),
+        DECRYPTED_DIR,
+        context_token_codec(),
+        active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
+    )
 
 
 def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSourceResolver:
@@ -158,10 +200,26 @@ def attachment_source_resolver(event_ledger: EventLedger) -> WechatAttachmentSou
     )
 
 
+class _LazyWechatAttachmentMaterializer:
+    def __init__(self, event_ledger: EventLedger) -> None:
+        self.event_ledger = event_ledger
+
+    def materialize(self, attachment: Mapping[str, Any], destination: Path) -> str:
+        return attachment_source_resolver(self.event_ledger).materialize(
+            attachment,
+            destination,
+        )
+
+
 def attachment_reader(event_ledger: EventLedger) -> VisualAttachmentReader:
     return VisualAttachmentReader(
-        AttachmentRegistry(event_ledger, ATTACHMENT_INTAKE_ROOT, ATTACHMENT_UPLOAD_ROOT),
-        attachment_source_resolver(event_ledger),
+        AttachmentRegistry(
+            event_ledger,
+            ATTACHMENT_INTAKE_ROOT,
+            ATTACHMENT_UPLOAD_ROOT,
+            context_attachment_resolver(event_ledger),
+        ),
+        _LazyWechatAttachmentMaterializer(event_ledger),
         ATTACHMENT_DERIVED_ROOT,
         LocalOfficeConverter(ATTACHMENT_DERIVED_ROOT, SOFFICE_PATH),
         WxgfDecoder(ATTACHMENT_DERIVED_ROOT, FFMPEG_PATH),
@@ -419,6 +477,10 @@ def wechat_status() -> dict[str, Any]:
         "data_root_ready": DATA_ROOT.is_dir(),
         "ledger_ready": (DATA_ROOT / "state" / "events.sqlite3").exists(),
         "tencent_docs_token_ready": token_ready,
+        "context_token_ready": (
+            CONTEXT_TOKEN_KEY_FILE.is_file()
+            and CONTEXT_TOKEN_KEY_FILE.stat().st_size >= 32
+        ),
         "decrypted_db_ready": DECRYPTED_DIR.exists(),
         "encrypted_db_configured": ENCRYPTED_DB_DIR is not None and ENCRYPTED_DB_DIR.exists(),
         "route_count": len(bindings),
@@ -475,6 +537,7 @@ def wechat_subscription_create(
     subscription_id: str = "",
     listen_capability: bool = True,
     send_capability: bool = False,
+    context_read_capability: bool = False,
     policy_ref: str = "",
 ) -> dict[str, Any]:
     """Create an exclusive session for one route/conversation/generation at the current event baseline."""
@@ -485,6 +548,7 @@ def wechat_subscription_create(
         subscription_id=subscription_id or None,
         listen_capability=listen_capability,
         send_capability=send_capability,
+        context_read_capability=context_read_capability,
         policy_ref=policy_ref or None,
     )
 
@@ -505,14 +569,16 @@ def wechat_subscription_set_capabilities(
     generation: int,
     listen_capability: bool,
     send_capability: bool,
+    context_read_capability: bool | None = None,
     policy_ref: str = "",
 ) -> dict[str, Any]:
-    """Update listen/send capabilities for one subscription; send requires a private policy reference."""
+    """Update independent listen/send/context-read capabilities; send or context read requires private policy."""
     return ledger().set_subscription_capabilities(
         subscription_id,
         generation,
         listen_capability=listen_capability,
         send_capability=send_capability,
+        context_read_capability=context_read_capability,
         policy_ref=policy_ref or None,
     )
 
@@ -528,6 +594,41 @@ def wechat_events_list(
     if not identifier:
         raise ValueError("subscription_id is required")
     return ledger().list_pending(identifier, limit, route_id=route_id if subscription_id else "")
+
+
+@mcp.tool()
+def wechat_message_context_read(
+    subscription_id: str,
+    anchor_event_id: str = "",
+    anchor_message_ref: str = "",
+    before: int = 5,
+    after: int = 2,
+    start_anchor: str = "",
+    end_anchor: str = "",
+    include_directions: list[str] | None = None,
+    include_kinds: list[str] | None = None,
+    text_only: bool = False,
+    max_messages: int = 50,
+    max_chars: int = 20_000,
+    continuation_cursor: str = "",
+) -> dict[str, Any]:
+    """Read a bounded two-way message slice for one authorized subscription without changing ACK state."""
+    event_ledger = ledger(read_only=True)
+    return message_context_reader(event_ledger).read(
+        subscription_id,
+        anchor_event_id=anchor_event_id,
+        anchor_message_ref=anchor_message_ref,
+        before=before,
+        after=after,
+        start_anchor=start_anchor,
+        end_anchor=end_anchor,
+        include_directions=include_directions,
+        include_kinds=include_kinds,
+        text_only=text_only,
+        max_messages=max_messages,
+        max_chars=max_chars,
+        continuation_cursor=continuation_cursor,
+    )
 
 
 @mcp.tool()

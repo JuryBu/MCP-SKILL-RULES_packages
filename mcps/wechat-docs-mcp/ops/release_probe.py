@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -19,7 +20,50 @@ def connect_read_only(path: Path) -> sqlite3.Connection:
     return connection
 
 
-def ledger_state(path: Path, route_id: str) -> dict[str, int]:
+def _business_state_sha256(
+    connection: sqlite3.Connection,
+    tables: set[str],
+) -> str:
+    normalized: dict[str, list[dict[str, object]]] = {}
+    for table in sorted(
+        name for name in tables if name != "schema_meta" and not name.startswith("sqlite_")
+    ):
+        columns = [
+            str(row[1])
+            for row in connection.execute(f"PRAGMA table_info([{table}])").fetchall()
+        ]
+        records: list[dict[str, object]] = []
+        for row in connection.execute(f"SELECT * FROM [{table}]").fetchall():
+            record: dict[str, object] = {}
+            for column in columns:
+                value = row[column]
+                record[column] = (
+                    {"base64": base64.b64encode(value).decode("ascii")}
+                    if isinstance(value, bytes)
+                    else value
+                )
+            if table == "subscriptions" and "context_read_capability" not in record:
+                record["context_read_capability"] = 0
+            records.append(record)
+        records.sort(
+            key=lambda item: json.dumps(
+                item,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        normalized[table] = records
+    serialized = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
+def ledger_state(path: Path, route_id: str) -> dict[str, object]:
     connection = connect_read_only(path)
     try:
         tables = {
@@ -36,6 +80,7 @@ def ledger_state(path: Path, route_id: str) -> dict[str, int]:
                     schema_version = int(row["value"])
             return {
                 "schema_version": schema_version,
+                "business_state_sha256": _business_state_sha256(connection, tables),
                 "routes": connection.execute("SELECT COUNT(*) FROM routes").fetchone()[0],
                 "events_total": connection.execute("SELECT COUNT(*) FROM events").fetchone()[0],
                 "subscriptions_total": connection.execute("SELECT COUNT(*) FROM subscriptions").fetchone()[0],

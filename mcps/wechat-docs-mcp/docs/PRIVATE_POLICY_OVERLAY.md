@@ -17,7 +17,11 @@ receiver private layer
   secrets/*
 ```
 
-`binding.json` 保存精确 route、M:N subscriptions、逐 route outbound capability，以及独立的 `tencentDocs.monitors` 私有 allowlist。每条文档策略精确绑定资源、官方只读工具、参数和 `policy_ref`；默认 `paused/listen=false`，启用后创建与每次轮询都会重新核验。`owner-authorizations.json` 保存主人原始消息引用、适用 route/capability、有效期和撤销状态。`local-rules.md` 只描述该机器的联系人优先级、人工协助通道和不可扩张边界。
+`binding.json` 保存精确 route、M:N subscriptions、逐 subscription 的 listen/send/context-read capability、逐 route outbound capability，以及独立的 `tencentDocs.monitors` 私有 allowlist。历史上下文读取默认关闭，只有独立 `context_read_capability=true` 且 `policy_ref` 有效时才能使用；listen 不自动扩大为翻阅历史。每条文档策略精确绑定资源、官方只读工具、参数和 `policy_ref`；默认 `paused/listen=false`，启用后创建与每次轮询都会重新核验。`owner-authorizations.json` 保存主人原始消息引用、适用 route/capability、有效期和撤销状态。`local-rules.md` 只描述该机器的联系人优先级、人工协助通道和不可扩张边界。
+
+## 私有历史读取策略
+
+启用局部上下文读取至少同时满足：subscription 精确绑定目标 route/conversation/generation；`context_read_capability=true`；非空 `policy_ref` 明确允许这一 route 的局部双向上下文；当前活动微信账号与 route owner scope 一致。返回的 `msgctx_`、`attctx_` 与 continuation 只在本机私有 HMAC key 下有效，不得写入公开日志或跨 subscription 共享。策略撤销后应关闭 capability，而不是通过删除 event、pending 或 ACK 掩盖历史。
 
 ## 私有发送策略
 
@@ -34,6 +38,7 @@ receiver private layer
 ```text
 - 微信主要用于获准 route 的信息输入；默认主动联系主人走本机私有 owner-contact 通道。
 - 只有 private binding 明确启用的 route/capability 可发送，禁止按显示标题猜目标。
+- 历史上下文读取与监听分开授权，只能按锚点读取有限切片，禁止把整库导出当作默认能力。
 - 真实 route、账号、conversation、policy_ref 和授权引用不得进入公开提交或日志样例。
 - 训练机或其它接收机是否安装微信桥，由各自私有规则决定，公共包不预设。
 ```

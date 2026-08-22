@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LEGACY_SUBSCRIPTION_NAMESPACE = uuid.UUID("0f2926e1-71c8-4b22-92f7-4ef81461bdf8")
 REQUIRED_V2_TABLES = {
     "schema_meta",
@@ -31,6 +31,7 @@ REQUIRED_V3_TABLES = REQUIRED_V2_TABLES | {
 }
 REQUIRED_V4_TABLES = REQUIRED_V3_TABLES | {"attachments", "outbound_attachment_verifications"}
 REQUIRED_V5_TABLES = REQUIRED_V4_TABLES | {"subscription_notification_attempts"}
+REQUIRED_V6_TABLES = REQUIRED_V5_TABLES
 
 
 def utc_now() -> str:
@@ -79,7 +80,9 @@ def _is_current_schema(path: Path) -> bool:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
-        if not REQUIRED_V5_TABLES.issubset(tables):
+        if not REQUIRED_V6_TABLES.issubset(tables):
+            return False
+        if "context_read_capability" not in _column_names(connection, "subscriptions"):
             return False
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key='schema_version'"
@@ -244,6 +247,7 @@ def _create_v2_tables(connection: sqlite3.Connection) -> None:
           cursor_event_seq INTEGER NOT NULL DEFAULT 0,
           listen_capability INTEGER NOT NULL DEFAULT 1 CHECK(listen_capability IN (0,1)),
           send_capability INTEGER NOT NULL DEFAULT 0 CHECK(send_capability IN (0,1)),
+          context_read_capability INTEGER NOT NULL DEFAULT 0 CHECK(context_read_capability IN (0,1)),
           policy_ref TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL,
@@ -498,6 +502,14 @@ def _create_v5_tables(connection: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS subscription_notification_attempts_wake
           ON subscription_notification_attempts(wake_id,target_event_seq);
         """,
+    )
+
+
+def _create_v6_tables(connection: sqlite3.Connection) -> None:
+    _add_column(
+        connection,
+        "subscriptions",
+        "context_read_capability INTEGER NOT NULL DEFAULT 0 CHECK(context_read_capability IN (0,1))",
     )
 
 
@@ -769,6 +781,7 @@ def ensure_schema(path: str | Path) -> dict[str, str | int | bool | None]:
             _create_v3_tables(connection)
             _create_v4_tables(connection)
             _create_v5_tables(connection)
+            _create_v6_tables(connection)
             _migrate_v1_rows(connection)
             _backfill_attachment_refs(connection)
             _backfill_notification_attempts(connection)

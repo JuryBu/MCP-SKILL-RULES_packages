@@ -531,6 +531,99 @@ def test_v2_image_reports_waiting_after_bounded_refresh(tmp_path: Path) -> None:
     assert not destination.exists()
 
 
+def test_v2_image_index_without_recent_entity_reports_waiting(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 15
+    server_id = 107
+    file_id = "f" * 32
+    payload = b"not-yet-materialized"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    _write_message_database(
+        decrypted,
+        f'<msg><img originsourcemd5="{content_md5}" hdlength="{len(payload)}"/></msg>',
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    refresh_calls: list[str] = []
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        refresh_decrypted=lambda: refresh_calls.append("refresh"),
+        image_index_wait_seconds=0.03,
+        image_index_poll_interval_seconds=0.01,
+    )
+    attachment = _attachment(
+        kind="image",
+        local_id=local_id,
+        server_id=server_id,
+        size=len(payload),
+        content_md5=content_md5,
+    )
+    attachment["observed_at"] = datetime.now(timezone.utc).isoformat()
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(attachment, tmp_path / "recent-missing.partial")
+
+    assert raised.value.code == "ATTACHMENT_IMAGE_WAITING"
+    assert refresh_calls
+
+
+def test_v2_historical_image_without_entity_reports_not_available(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    local_id = 16
+    server_id = 108
+    file_id = "1" * 32
+    payload = b"historical-missing"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    _write_message_database(
+        decrypted,
+        f'<msg><img originsourcemd5="{content_md5}" hdlength="{len(payload)}"/></msg>',
+        local_id=local_id,
+        server_id=server_id,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=local_id,
+        server_id=server_id,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        image_index_wait_seconds=0.03,
+        image_index_poll_interval_seconds=0.01,
+    )
+    attachment = _attachment(
+        kind="image",
+        local_id=local_id,
+        server_id=server_id,
+        size=len(payload),
+        content_md5=content_md5,
+    )
+    attachment["observed_at"] = "2020-01-01T00:00:00+00:00"
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(attachment, tmp_path / "historical-missing.partial")
+
+    assert raised.value.code == "ATTACHMENT_IMAGE_NOT_AVAILABLE"
+
+
 def test_image_index_temporarily_unavailable_is_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -551,6 +644,100 @@ def test_image_index_temporarily_unavailable_is_retried(
 
     assert indexed == [("synthetic.dat", "a" * 32, 128)]
     assert len(attempts) == 3
+
+
+def test_historical_context_image_does_not_wait_for_missing_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resolver, _, _, _ = _resolver(tmp_path)
+    resolver.image_index_wait_seconds = 0.1
+    attempts: list[int] = []
+    refreshes: list[int] = []
+
+    def missing_index(_attachment: object, _username: str) -> list[tuple[str, str, int]]:
+        attempts.append(1)
+        raise LedgerError("ATTACHMENT_IMAGE_HARDLINK", "图片硬链接索引不存在")
+
+    resolver.refresh_decrypted = lambda: refreshes.append(1)
+    monkeypatch.setattr(resolver, "_image_index", missing_index)
+
+    with pytest.raises(LedgerError) as raised:
+        resolver._image_index_with_wait({"reference_kind": "context"}, USERNAME)
+
+    assert raised.value.code == "ATTACHMENT_IMAGE_NOT_AVAILABLE"
+    assert len(attempts) == 1
+    assert refreshes == []
+
+
+def test_recent_historical_context_image_never_scans_process_memory(tmp_path: Path) -> None:
+    _, ledger, decrypted, account = _resolver(tmp_path)
+    payload = b"\xff\xd8\xff" + b"context-image" * 100 + b"\xff\xd9"
+    content_md5 = hashlib.md5(payload).hexdigest()
+    file_id = "d" * 32
+    aes_key = b"contextAESkey123"
+    xor_key = 0x91
+    _write_message_database(
+        decrypted,
+        f'<msg><img md5="{content_md5}" originsourcemd5="{content_md5}" '
+        f'hdlength="{len(payload)}"/></msg>',
+        local_id=13,
+        server_id=105,
+        local_type=3,
+    )
+    _write_image_databases(
+        decrypted,
+        local_id=13,
+        server_id=105,
+        file_id=file_id,
+        content_md5=content_md5,
+        size=len(payload),
+    )
+    source = (
+        account
+        / "msg"
+        / "attach"
+        / hashlib.md5(USERNAME.encode("utf-8")).hexdigest()
+        / "2024-08"
+        / "Img"
+        / f"{file_id}_h.dat"
+    )
+    source.parent.mkdir(parents=True)
+    source.write_bytes(_encrypt_v2_image(payload, aes_key, xor_key))
+
+    class RecordingScanner:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scan(self, resolve_candidate: object, timeout_seconds: float) -> None:
+            self.calls += 1
+            return None
+
+    scanner = RecordingScanner()
+    resolver = WechatAttachmentSourceResolver(
+        ledger,
+        _binding(),
+        decrypted,
+        account,
+        None,
+        tmp_path / "scoped-image-keys",
+        image_key_scanner=scanner,
+        active_owner_account_key_sha256=hashlib.sha256(OWNER_KEY.encode()).hexdigest(),
+    )
+    attachment = _attachment(
+        kind="image",
+        local_id=13,
+        server_id=105,
+        size=len(payload),
+        content_md5=content_md5,
+    )
+    attachment["reference_kind"] = "context"
+    attachment["observed_at"] = datetime.now(timezone.utc).isoformat()
+
+    with pytest.raises(LedgerError) as raised:
+        resolver.materialize(attachment, tmp_path / "context-no-scan.partial")
+
+    assert raised.value.code == "ATTACHMENT_IMAGE_KEY_WAITING"
+    assert scanner.calls == 0
 
 
 def test_v2_image_returns_exact_hardlink_preview_without_claiming_original(tmp_path: Path) -> None:

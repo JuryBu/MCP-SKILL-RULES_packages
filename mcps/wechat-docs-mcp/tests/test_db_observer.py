@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from wechat_docs_mcp.db_observer import (
     DbObserver,
@@ -244,6 +245,123 @@ class DbObserverTests(unittest.TestCase):
         observer = DbObserver(self.decrypted_dir, [binding])
         baselines = observer.establish_baseline()
         self.assertEqual(0, baselines["route-missing"])
+
+    def test_context_range_is_inclusive_ordered_and_empty_when_reversed(self) -> None:
+        observations = self.observer.read_route_messages(
+            self.bindings[0], minimum_local_id=2, maximum_local_id=3
+        )
+
+        self.assertEqual([2, 3], [o.payload["local_id"] for o in observations])
+        self.assertEqual(
+            [],
+            self.observer.read_route_messages(
+                self.bindings[0], minimum_local_id=4, maximum_local_id=3
+            ),
+        )
+
+    def test_context_max_and_missing_table_are_empty_and_read_only(self) -> None:
+        missing_binding = RouteBinding(
+            route_id="route-missing",
+            exact_title="Nonexistent",
+            chat_type="friend",
+            username="wxid_nonexistent_user",
+        )
+
+        with patch(
+            "wechat_docs_mcp.db_observer.sqlite3.connect", wraps=sqlite3.connect
+        ) as connect:
+            self.assertEqual(3, self.observer.max_local_id(self.bindings[0]))
+            self.assertEqual(0, self.observer.max_local_id(missing_binding))
+            self.assertEqual([], self.observer.read_route_messages(missing_binding))
+
+        self.assertGreater(connect.call_count, 0)
+        for call in connect.call_args_list:
+            self.assertTrue(call.kwargs["uri"])
+            self.assertIn("mode=ro", call.args[0])
+
+    def test_context_window_reads_only_the_requested_anchor_neighbourhood(self) -> None:
+        observations = self.observer.read_route_message_window(
+            self.bindings[0],
+            2,
+            maximum_local_id=3,
+            rows_before=1,
+            rows_after=1,
+        )
+        self.assertEqual([1, 2, 3], [item.payload["local_id"] for item in observations])
+
+        anchor_only = self.observer.read_route_message_window(
+            self.bindings[0],
+            2,
+            maximum_local_id=3,
+            rows_before=0,
+            rows_after=0,
+        )
+        self.assertEqual([2], [item.payload["local_id"] for item in anchor_only])
+
+    def test_context_reuses_direction_attachment_and_fingerprint_parsing(self) -> None:
+        table = self.observer._msg_table_name("wxid_test_friend")
+        image_md5 = "a" * 32
+        sticker_md5 = "b" * 32
+        connection = sqlite3.connect(self.decrypted_dir / "message" / "message_0.db")
+        try:
+            connection.execute(f"ALTER TABLE [{table}] ADD COLUMN origin_source INTEGER")
+            connection.executemany(
+                f"""
+                INSERT INTO [{table}] (
+                    local_id, server_id, local_type, sort_seq, real_sender_id,
+                    create_time, status, source, message_content,
+                    WCDB_CT_message_content, WCDB_CT_source, origin_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        4, 1004, 3, 1700000004000, 2, 1700000004, 2,
+                        "<msgsource/>",
+                        f'<msg><img md5="{image_md5}" hdlength="2048" width="640" height="480"/></msg>',
+                        0, 0, 1,
+                    ),
+                    (
+                        5, 1005, 49, 1700000005000, 1, 1700000005, 3,
+                        "<msgsource/>",
+                        "<msg><appmsg><type>6</type><title>notes.pdf</title><md5>"
+                        + "c" * 32
+                        + "</md5><appattach><totallen>3072</totallen><fileext>pdf</fileext>"
+                        "</appattach></appmsg></msg>",
+                        0, 0, 2,
+                    ),
+                    (
+                        6, 1006, 47, 1700000006000, 1, 1700000006, 3,
+                        "<msgsource/>",
+                        f'<msg><emoji md5="{sticker_md5}" len="512" width="128" height="64"/></msg>',
+                        0, 0, 2,
+                    ),
+                ],
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        binding = RouteBinding(
+            route_id="route-friend",
+            exact_title="TestFriend",
+            chat_type="friend",
+            username="wxid_test_friend",
+            owner_sender_username="wxid_self",
+        )
+        observations = self.observer.read_route_messages(
+            binding, minimum_local_id=4
+        )
+        image, file, sticker = observations
+
+        self.assertEqual("outbound", image.payload["direction"])
+        self.assertEqual("inbound", file.payload["direction"])
+        self.assertEqual(image_md5, image.payload["attachment_md5"])
+        self.assertEqual(2048, image.payload["attachment_size"])
+        self.assertEqual("notes.pdf", file.payload["attachment_name"])
+        self.assertEqual("application/pdf", file.payload["attachment_mime"])
+        self.assertEqual(sticker_md5, sticker.payload["attachment_md5"])
+        self.assertEqual(128, sticker.payload["attachment_width"])
+        self.assertEqual("wxid_test_friend:4:1004", image.source_fingerprint)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@
       "state": "paused",
       "listen_capability": true,
       "send_capability": false,
+      "context_read_capability": false,
       "policy_ref": "receiver-owned-private-listen-policy"
     },
     {
@@ -54,6 +55,7 @@
       "state": "paused",
       "listen_capability": true,
       "send_capability": false,
+      "context_read_capability": false,
       "policy_ref": "receiver-owned-private-listen-policy"
     },
     {
@@ -64,6 +66,7 @@
       "state": "paused",
       "listen_capability": true,
       "send_capability": false,
+      "context_read_capability": false,
       "policy_ref": "receiver-owned-private-listen-policy"
     }
   ],

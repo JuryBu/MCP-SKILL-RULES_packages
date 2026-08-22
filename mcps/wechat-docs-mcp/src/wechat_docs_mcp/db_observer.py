@@ -119,13 +119,18 @@ class DbObserver:
     def _session_db_path(self) -> Path:
         return self.decrypted_dir / "session" / "session.db"
 
+    @staticmethod
+    def _open_read_only(path: Path) -> sqlite3.Connection:
+        """Open an existing SQLite database without permitting writes."""
+        return sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+
     def _load_sender_cache(self) -> None:
         """Populate sender_id -> display_name cache from Name2Id."""
         path = self._msg_db_path()
         if not path.exists():
             return
         sender_cache: dict[int, str] = {}
-        conn = sqlite3.connect(path)
+        conn = self._open_read_only(path)
         try:
             rows = conn.execute("SELECT rowid, user_name FROM Name2Id").fetchall()
             for rowid, user_name in rows:
@@ -170,7 +175,7 @@ class DbObserver:
         path = self._contact_db_path()
         if not path.exists():
             return username
-        conn = sqlite3.connect(path)
+        conn = self._open_read_only(path)
         try:
             row = conn.execute(
                 "SELECT nick_name FROM contact WHERE username = ?", (username,)
@@ -383,6 +388,115 @@ class DbObserver:
         except (ET.ParseError, ValueError):
             return {}
 
+    @staticmethod
+    def _message_columns(conn: sqlite3.Connection, table_name: str) -> set[str]:
+        return {
+            column[1]
+            for column in conn.execute(f"PRAGMA table_info([{table_name}])").fetchall()
+        }
+
+    def _read_message_rows(
+        self,
+        conn: sqlite3.Connection,
+        binding: RouteBinding,
+        minimum_local_id: int,
+        maximum_local_id: int | None,
+        *,
+        descending: bool = False,
+        limit: int | None = None,
+    ) -> list[sqlite3.Row]:
+        if limit is not None and limit <= 0:
+            return []
+        table_name = self._msg_table_name(binding.username)
+        columns = self._message_columns(conn, table_name)
+        if not columns:
+            return []
+        origin_source = (
+            "origin_source" if "origin_source" in columns else "NULL AS origin_source"
+        )
+        where = "local_id >= ?"
+        parameters: list[int] = [minimum_local_id]
+        if maximum_local_id is not None:
+            where += " AND local_id <= ?"
+            parameters.append(maximum_local_id)
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT ?"
+            parameters.append(limit)
+        order = "DESC" if descending else "ASC"
+        try:
+            return conn.execute(
+                f"""
+                SELECT local_id, server_id, local_type, sort_seq,
+                       real_sender_id, create_time, status,
+                       {origin_source},
+                       source, message_content,
+                       WCDB_CT_message_content, WCDB_CT_source
+                FROM [{table_name}]
+                WHERE {where}
+                ORDER BY local_id {order}{limit_clause}
+                """,
+                parameters,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+    def _observation_from_row(
+        self, binding: RouteBinding, row: sqlite3.Row
+    ) -> Observation:
+        message = dict(row)
+        content = self._decompress_field(
+            message["message_content"], message["WCDB_CT_message_content"]
+        )
+        sender_username = self._sender_name(message["real_sender_id"])
+        if binding.chat_type == "group":
+            content = self._strip_group_sender_prefix(content, sender_username)
+        msg_type = self._classify_message(message["local_type"], content)
+        visible_text = self._extract_text(content, msg_type)
+        attachment_info = self._extract_attachment_info(content, msg_type)
+        sender_display = self._contact_display_name(sender_username)
+        direction, direction_basis = self._message_direction(
+            sender_username,
+            binding.owner_sender_username,
+            message["status"],
+            message["origin_source"],
+        )
+
+        source_fingerprint = (
+            f"{binding.username}:{message['local_id']}:{message['server_id']}"
+        )
+        occurred_at = datetime.fromtimestamp(
+            message["create_time"], tz=timezone.utc
+        ).isoformat()
+        sensitivity = (
+            "awaiting_owner_instruction"
+            if msg_type in ("image", "file", "sticker")
+            else "normal"
+        )
+        payload: dict[str, Any] = {
+            "kind": msg_type,
+            "direction": direction,
+            "direction_basis": direction_basis,
+            "database_status": message["status"],
+            "database_origin_source": message["origin_source"],
+            "sender_display": sender_display,
+            "sender_username": sender_username,
+            "message_time_display": occurred_at,
+            "visible_text": visible_text,
+            "local_id": message["local_id"],
+            "server_id": message["server_id"],
+            "source_window_identity": binding.exact_title,
+        }
+        payload.update(attachment_info)
+        return Observation(
+            route_id=binding.route_id,
+            source_fingerprint=source_fingerprint,
+            event_type=msg_type,
+            payload=payload,
+            occurred_at=occurred_at,
+            sensitivity=sensitivity,
+        )
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -398,7 +512,7 @@ class DbObserver:
         path = self._msg_db_path()
         if not path.exists():
             return baselines
-        conn = sqlite3.connect(path)
+        conn = self._open_read_only(path)
         try:
             for binding in self._bindings.values():
                 tname = self._msg_table_name(binding.username)
@@ -412,6 +526,101 @@ class DbObserver:
         finally:
             conn.close()
         return baselines
+
+    def max_local_id(self, binding: RouteBinding) -> int:
+        """Return the latest local message identifier for one exact route."""
+        path = self._msg_db_path()
+        if not path.exists():
+            return 0
+        conn = self._open_read_only(path)
+        try:
+            table_name = self._msg_table_name(binding.username)
+            if not self._message_columns(conn, table_name):
+                return 0
+            try:
+                row = conn.execute(
+                    f"SELECT MAX(local_id) FROM [{table_name}]"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                return 0
+            return row[0] if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
+    def read_route_messages(
+        self,
+        binding: RouteBinding,
+        minimum_local_id: int = 0,
+        maximum_local_id: int | None = None,
+        *,
+        limit: int | None = None,
+    ) -> list[Observation]:
+        """Read one route's inclusive local-id range in ascending order."""
+        if maximum_local_id is not None and maximum_local_id < minimum_local_id:
+            return []
+        self._load_sender_cache()
+        path = self._msg_db_path()
+        if not path.exists():
+            return []
+        conn = self._open_read_only(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = self._read_message_rows(
+                conn,
+                binding,
+                minimum_local_id,
+                maximum_local_id,
+                limit=limit,
+            )
+            return [self._observation_from_row(binding, row) for row in rows]
+        finally:
+            conn.close()
+
+    def read_route_message_window(
+        self,
+        binding: RouteBinding,
+        anchor_local_id: int,
+        *,
+        maximum_local_id: int,
+        rows_before: int,
+        rows_after: int,
+    ) -> list[Observation]:
+        """Read a bounded source window around one exact route message."""
+        if anchor_local_id < 1 or maximum_local_id < anchor_local_id:
+            return []
+        self._load_sender_cache()
+        path = self._msg_db_path()
+        if not path.exists():
+            return []
+        conn = self._open_read_only(path)
+        conn.row_factory = sqlite3.Row
+        try:
+            before = self._read_message_rows(
+                conn,
+                binding,
+                0,
+                anchor_local_id - 1,
+                descending=True,
+                limit=rows_before,
+            )
+            anchor = self._read_message_rows(
+                conn,
+                binding,
+                anchor_local_id,
+                anchor_local_id,
+                limit=2,
+            )
+            after = self._read_message_rows(
+                conn,
+                binding,
+                anchor_local_id + 1,
+                maximum_local_id,
+                limit=rows_after,
+            )
+            ordered = [*reversed(before), *anchor, *after]
+            return [self._observation_from_row(binding, row) for row in ordered]
+        finally:
+            conn.close()
 
     def poll_new_messages(
         self,
@@ -434,96 +643,15 @@ class DbObserver:
         path = self._msg_db_path()
         if not path.exists():
             return
-        conn = sqlite3.connect(path)
+        conn = self._open_read_only(path)
         conn.row_factory = sqlite3.Row
         try:
             for binding in self._bindings.values():
-                tname = self._msg_table_name(binding.username)
                 baseline = baselines.get(binding.route_id, 0)
-                try:
-                    columns = {
-                        column[1]
-                        for column in conn.execute(f"PRAGMA table_info([{tname}])").fetchall()
-                    }
-                    origin_source = (
-                        "origin_source"
-                        if "origin_source" in columns
-                        else "NULL AS origin_source"
-                    )
-                    rows = conn.execute(
-                        f"""
-                        SELECT local_id, server_id, local_type, sort_seq,
-                               real_sender_id, create_time, status,
-                               {origin_source},
-                               source, message_content,
-                               WCDB_CT_message_content, WCDB_CT_source
-                        FROM [{tname}]
-                        WHERE local_id > ?
-                        ORDER BY local_id ASC
-                        """,
-                        (baseline,),
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    continue
-
-                for row in rows:
-                    r = dict(row)
-                    content = self._decompress_field(
-                        r["message_content"], r["WCDB_CT_message_content"]
-                    )
-                    sender_username = self._sender_name(r["real_sender_id"])
-                    if binding.chat_type == "group":
-                        content = self._strip_group_sender_prefix(content, sender_username)
-                    msg_type = self._classify_message(r["local_type"], content)
-                    visible_text = self._extract_text(content, msg_type)
-                    attachment_info = self._extract_attachment_info(content, msg_type)
-                    sender_display = self._contact_display_name(sender_username)
-                    direction, direction_basis = self._message_direction(
-                        sender_username,
-                        binding.owner_sender_username,
-                        r["status"],
-                        r["origin_source"],
-                    )
-
-                    # Build fingerprint for dedup
-                    fp = f"{binding.username}:{r['local_id']}:{r['server_id']}"
-
-                    # Build occurred_at ISO string
-                    occurred_at = datetime.fromtimestamp(
-                        r["create_time"], tz=timezone.utc
-                    ).isoformat()
-
-                    # Determine sensitivity
-                    sensitivity = "normal"
-                    if msg_type in ("image", "file", "sticker"):
-                        sensitivity = "awaiting_owner_instruction"
-
-                    payload: dict[str, Any] = {
-                        "kind": msg_type,
-                        "direction": direction,
-                        "direction_basis": direction_basis,
-                        "database_status": r["status"],
-                        "database_origin_source": r["origin_source"],
-                        "sender_display": sender_display,
-                        "sender_username": sender_username,
-                        "message_time_display": datetime.fromtimestamp(
-                            r["create_time"], tz=timezone.utc
-                        ).isoformat(),
-                        "visible_text": visible_text,
-                        "local_id": r["local_id"],
-                        "server_id": r["server_id"],
-                        "source_window_identity": binding.exact_title,
-                    }
-                    payload.update(attachment_info)
-
-                    yield Observation(
-                        route_id=binding.route_id,
-                        source_fingerprint=fp,
-                        event_type=msg_type,
-                        payload=payload,
-                        occurred_at=occurred_at,
-                        sensitivity=sensitivity,
-                    )
+                rows = self._read_message_rows(conn, binding, baseline + 1, None)
+                yield from (
+                    self._observation_from_row(binding, row) for row in rows
+                )
         finally:
             conn.close()
 
@@ -539,7 +667,7 @@ class DbObserver:
         if binding.chat_type == "group":
             path = self._contact_db_path()
             if path.exists():
-                conn = sqlite3.connect(path)
+                conn = self._open_read_only(path)
                 try:
                     row = conn.execute(
                         "SELECT id FROM contact WHERE username = ?",

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from wechat_docs_mcp import server
-from wechat_docs_mcp.ledger import EventLedger
+from wechat_docs_mcp.ledger import EventLedger, LedgerError
 from wechat_docs_mcp.route_verifier import RouteVerificationError
 
 
@@ -235,6 +235,9 @@ def test_wechat_status_reports_attachment_only_gate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     configure_private_layer(monkeypatch, tmp_path)
+    context_key = tmp_path / "context-hmac.key"
+    context_key.write_bytes(b"x" * 32)
+    monkeypatch.setattr(server, "CONTEXT_TOKEN_KEY_FILE", context_key)
     monkeypatch.setattr(server, "outbound_runtime_enabled", lambda: False)
     monkeypatch.setattr(server, "attachment_outbound_runtime_enabled", lambda: True)
 
@@ -244,8 +247,59 @@ def test_wechat_status_reports_attachment_only_gate(
     assert status["outbound_text_enabled"] is False
     assert status["attachment_outbound_enabled"] is True
     assert status["runtime_gate_mode"] == "private_file_dynamic_fail_closed"
+    assert status["context_token_ready"] is True
     assert status["wake_message_visibility"] == server.WAKE_MESSAGE_VISIBILITY
     assert status["wake_reminder_cooldown_seconds"] == server.WAKE_REMINDER_COOLDOWN_SECONDS
+
+
+def test_attachment_reader_defers_account_root_until_materialization(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    event_ledger = configure_private_layer(monkeypatch, tmp_path)
+    calls: list[str] = []
+
+    def unavailable(_ledger: EventLedger) -> object:
+        calls.append("resolve")
+        raise LedgerError("WECHAT_ACCOUNT_ROOT_NOT_READY", "synthetic")
+
+    monkeypatch.setattr(server, "attachment_source_resolver", unavailable)
+    reader = server.attachment_reader(event_ledger)
+
+    assert calls == []
+    with pytest.raises(LedgerError) as raised:
+        reader.materializer.materialize({}, tmp_path / "never-created.partial")
+    assert raised.value.code == "WECHAT_ACCOUNT_ROOT_NOT_READY"
+    assert calls == ["resolve"]
+
+
+def test_message_context_tool_opens_existing_ledger_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sentinel = object()
+    observed: list[bool] = []
+
+    def fake_ledger(*, read_only: bool = False) -> object:
+        observed.append(read_only)
+        return sentinel
+
+    class FakeReader:
+        def read(self, subscription_id: str, **arguments: object) -> dict[str, object]:
+            return {"subscription_id": subscription_id, "arguments": arguments}
+
+    monkeypatch.setattr(server, "ledger", fake_ledger)
+    monkeypatch.setattr(
+        server,
+        "message_context_reader",
+        lambda event_ledger: FakeReader() if event_ledger is sentinel else None,
+    )
+
+    result = server.wechat_message_context_read(
+        "subscription-synthetic",
+        anchor_event_id="event-synthetic",
+    )
+
+    assert observed == [True]
+    assert result["subscription_id"] == "subscription-synthetic"
 
 
 def test_official_tool_level_error_does_not_verify_draft(
@@ -338,8 +392,9 @@ def test_document_monitor_tools_are_registered() -> None:
         "wechat_read_attachments",
         "wechat_read_image",
         "wechat_capture_visible_image_preview",
+        "wechat_message_context_read",
         "wechat_text_send_execute",
     }.issubset(names)
-    assert len(names) == 50
+    assert len(names) == 51
     attachment_verify = next(tool for tool in tools if tool.name == "wechat_attachment_upload_verify")
     assert set(attachment_verify.input_schema["required"]) == {"draft_id", "remote_confirmation"}

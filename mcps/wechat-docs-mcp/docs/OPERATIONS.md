@@ -32,6 +32,7 @@
 | `WECHAT_DOCS_MCP_INTAKE_ROOT` | `%TEMP%/wechat-docs-mcp/intake` | 按需物化附件的允许根目录；读取缓存默认 24 小时后清理 |
 | `WECHAT_DOCS_MCP_IMAGE_KEY_ROOT` | `<data_root>/secrets/wechat-image-v2` | 按 owner account identity 哈希分区的图片密钥目录 |
 | `WECHAT_DOCS_MCP_ACTIVE_OWNER_ACCOUNT_KEY_SHA256` | 空 | 私有 enrollment 已核验的当前账号身份哈希；缺失或与 route 不符时禁止进程扫描并返回 `WAITING_FOR_KEY` |
+| `WECHAT_DOCS_MCP_CONTEXT_TOKEN_KEY_FILE` | `<data_root>/secrets/wechat-context-hmac.key` | `msgctx_`、`attctx_` 和 continuation 的本机私有 HMAC key；至少 32 字节，不得写入 repo、日志或公开 Rules |
 | `WECHAT_DOCS_MCP_FFMPEG_PATH` | `PATH` 中的 ffmpeg | wxgf/HEVC 图片的无窗口本地解码器 |
 | `WECHAT_DOCS_MCP_UPLOAD_ROOT` | `<data_root>/upload` | 附件草稿只允许读取此目录内文件，执行前重新校验 SHA-256 |
 | `WECHAT_DOCS_MCP_DERIVED_ROOT` | `<data_root>/derived` | PDF 页面及 DOCX/PPTX 派生 PDF 的私有缓存目录 |
@@ -69,14 +70,15 @@
 ├── intake/                   # 按需下载文件，不自动执行或解压
 ├── upload/                   # 待批准上传文件的允许根目录
 └── secrets/
-    └── tencent-docs-mcp.token
+    ├── tencent-docs-mcp.token
+    └── wechat-context-hmac.key
 ```
 
 ### 2.3 binding.json 格式
 
 使用 `binding.example.json` 的 schema v2 模板。route 只保存精确微信会话身份和本机 outbound capability；conversation 放在独立 `subscriptions` 数组中。一个 route 可出现于多个 subscription，一个 conversation 也可订阅多个 route。`tencentDocs.monitors` 是独立的文档监视 allowlist，不复用微信 route 身份表。
 
-公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 全关闭，示例文档策略也为 `paused/listen=false`。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 时必须同时提供非空 `policy_ref`，真实授权消息引用另存于私有授权链，不得提交。
+公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 与 `context_read_capability` 全关闭，示例文档策略也为 `paused/listen=false`。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 或 `context_read_capability` 时必须同时提供非空 `policy_ref`；监听不自动授权历史读取。真实授权消息引用另存于私有授权链，不得提交。
 
 ## 3. 安装
 
@@ -182,6 +184,7 @@ wechat_status()
 | `encrypted_db_configured` | 加密 DB 目录已配置且存在 |
 | `route_count` | 绑定的路由数量 |
 | `subscription_count` | 当前账本中的 subscription 数量 |
+| `context_token_ready` | 历史消息/附件签名 key 已存在且长度满足要求；不代表任何 subscription 已获历史读取权限 |
 | `watcher_ready` | DbWatcher 实例已创建 |
 | `background_polling` | 后台轮询线程是否活跃 |
 | `poll_last_error` | 后台轮询最后一次错误信息 |
@@ -228,6 +231,8 @@ src.close()
 ```
 
 **不要用 `shutil.copy2`** 复制 WAL 模式的 SQLite 文件，可能丢失 -wal 文件中的事务。
+
+`mode=ro` 与 `PRAGMA query_only=ON` 保证不执行 SQL/业务状态写入，但 SQLite 在读取活跃 WAL 数据库时仍可能建立或刷新空的 `-wal`/`-shm` 协调文件。因此只读验收应比较主数据库与受保护业务表的语义哈希，而不是宣称目录中零文件系统变化。不要对仍可能收到新事务的账本或微信源库使用 `immutable=1`，否则可能漏读 WAL 中尚未合并的最新数据。
 
 ### 6.3 旧 route 精确身份恢复
 

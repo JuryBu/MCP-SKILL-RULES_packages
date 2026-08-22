@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import pytest
 
+from ops.release_probe import ledger_state
 from wechat_docs_mcp import schema
 from wechat_docs_mcp.ledger import EventLedger
 
@@ -53,7 +54,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
     database = tmp_path / "events.sqlite3"
     _create_v1_database(database)
     ledger = EventLedger(database)
-    assert ledger.schema_info()["schema_version"] == 5
+    assert ledger.schema_info()["schema_version"] == 6
     assert ledger.migration["migrated"] is True
     backup = Path(ledger.migration["backup_path"])
     assert backup.is_file()
@@ -90,7 +91,7 @@ def test_v1_migrates_with_backup_and_independent_delivery(tmp_path: Path) -> Non
         connection.close()
         reopened = EventLedger(database)
         assert reopened.migration == {
-            "schema_version": 5,
+            "schema_version": 6,
             "backup_path": None,
             "migrated": False,
         }
@@ -173,7 +174,7 @@ def test_v2_to_v3_preserves_existing_rows_and_creates_v2_backup(tmp_path: Path) 
     migrated = EventLedger(database)
     backup = Path(migrated.migration["backup_path"])
 
-    assert migrated.schema_info()["schema_version"] == 5
+    assert migrated.schema_info()["schema_version"] == 6
     assert migrated.get_route("route-preserved")["route_id"] == "route-preserved"
     assert ".v2-backup." in backup.name
     assert backup.is_file()
@@ -269,3 +270,79 @@ def test_v4_to_v5_failure_rolls_back_attempt_table_and_keeps_backup(tmp_path: Pa
         connection.close()
     assert event["event_id"]
     assert len(list(tmp_path.glob("events.v4-backup.*.sqlite3"))) == 1
+
+
+def test_v5_to_v6_defaults_context_read_capability_with_backup_and_idempotence(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    ledger = EventLedger(database)
+    ledger.register_route("route-v5", identity={"chat_name": "safe"}, state="active")
+    ledger.register_subscription(
+        "route-v5", "conversation-v5", 1, subscription_id="subscription-v5"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("ALTER TABLE subscriptions DROP COLUMN context_read_capability")
+        connection.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+    before = ledger_state(database, "route-v5")
+
+    migrated = EventLedger(database)
+    after = ledger_state(database, "route-v5")
+
+    assert migrated.migration["schema_version"] == 6
+    assert migrated.migration["migrated"] is True
+    backup = Path(migrated.migration["backup_path"])
+    assert backup.is_file()
+    assert ".v5-backup." in backup.name
+    assert migrated.get_subscription("subscription-v5")["context_read_capability"] == 0
+    assert before["schema_version"] == 5
+    assert after["schema_version"] == 6
+    assert before["business_state_sha256"] == after["business_state_sha256"]
+
+    reopened = EventLedger(database)
+
+    assert reopened.migration == {
+        "schema_version": 6,
+        "backup_path": None,
+        "migrated": False,
+    }
+
+
+def test_v5_to_v6_failure_rolls_back_context_column_and_keeps_backup(tmp_path: Path) -> None:
+    database = tmp_path / "events.sqlite3"
+    ledger = EventLedger(database)
+    ledger.register_route("route-preserved", identity={"chat_name": "safe"}, state="active")
+    ledger.register_subscription(
+        "route-preserved", "conversation-preserved", 1, subscription_id="subscription-preserved"
+    )
+    connection = sqlite3.connect(database)
+    try:
+        connection.execute("ALTER TABLE subscriptions DROP COLUMN context_read_capability")
+        connection.execute("UPDATE schema_meta SET value='5' WHERE key='schema_version'")
+        connection.commit()
+    finally:
+        connection.close()
+
+    original_create = schema._create_v6_tables
+
+    def fail_after_create(connection: sqlite3.Connection) -> None:
+        original_create(connection)
+        raise RuntimeError("synthetic v6 migration failure")
+
+    with patch.object(schema, "_create_v6_tables", side_effect=fail_after_create):
+        with pytest.raises(RuntimeError, match="synthetic v6 migration failure"):
+            schema.ensure_schema(database)
+
+    connection = sqlite3.connect(database)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(subscriptions)")}
+        assert "context_read_capability" not in columns
+        assert connection.execute(
+            "SELECT value FROM schema_meta WHERE key='schema_version'"
+        ).fetchone()[0] == "5"
+        assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    finally:
+        connection.close()
+    assert len(list(tmp_path.glob("events.v5-backup.*.sqlite3"))) == 1

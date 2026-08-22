@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "wechat-docs-mcp"
-version = "0.6.5"
+version = "0.7.0"
 description = "Local governed WeChat and Tencent Docs event bridge for Codex"
 requires-python = ">=3.12,<3.14"
 dependencies = [

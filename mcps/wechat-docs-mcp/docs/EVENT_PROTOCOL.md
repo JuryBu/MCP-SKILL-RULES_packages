@@ -98,7 +98,30 @@ ACK 规则：
 
 `route_id` 参数只用于 V1 单订阅兼容。若 route 有多个 active subscription，兼容调用会返回 `AMBIGUOUS_SUBSCRIPTION`，调用者必须改用 `subscription_id`。
 
-## 6. Outbound 草稿与状态
+## 6. 按锚点读取同会话局部上下文
+
+`wechat_events_list` 只返回当前 subscription 的待处理入站事件。需要理解“应该可以”“OK”这类短回复对应的主人前文时，必须调用独立的 `wechat_message_context_read`，不能把整段历史补成 pending：
+
+```python
+context = wechat_message_context_read(
+    subscription_id="subscription-synthetic",
+    anchor_event_id="delivered-event-id",
+    before=5,
+    after=2,
+    include_directions=["inbound", "outbound"],
+    text_only=False,
+    max_messages=50,
+    max_chars=20000,
+)
+```
+
+也可以使用前次响应里的 `msgctx_...` 作为单锚点，或把两个 event/message ref 分别传给 `start_anchor/end_anchor` 读取闭区间。调用要求 subscription 为 active、显式启用 `context_read_capability` 且有非空私有 `policy_ref`，并再次核对 private binding 的精确 route 身份与当前 owner account scope；监听权限本身不授权历史读取。
+
+返回顺序来自同一 route 的微信只读数据库真实消息顺序，可包含 inbound、owner self-sent outbound 与显式标记的 unknown。调用者可按 direction、kind、`text_only`、消息数和字符数限制结果；超预算时使用签名 `ctxcur_...` 续读。cursor 绑定 source cutoff、subscription/route/account、锚点、过滤条件和已选消息身份，篡改、账号切换、来源漂移或跨订阅复用都会拒绝。读取不会写入历史 event、不会创建 delivery/wake，也不会推进 baseline 或 ACK。
+
+范围内的 image/sticker/file 只返回元数据与短期 `attctx_...`。该引用绑定 subscription、route、精确来源消息、kind、MD5、大小和 cutoff，供 `wechat_read_image` / `wechat_read_attachments` 按需解析原件；普通图片、表情和文件不能互相冒充。原件不存在时必须逐项返回 `WAITING/NOT_AVAILABLE`，文本切片成功也不能被描述为所有附件均已读取。
+
+## 7. Outbound 草稿与状态
 
 ```text
 PREPARED -> APPROVED -> EXECUTING -> SEND_ATTEMPTED -> VERIFIED
@@ -144,7 +167,7 @@ UI 键动作成功只表示 `SEND_ATTEMPTED`。文字只有专用数据库验证
 
 当前 Windows 适配器只把 `status=2 AND origin_source=1` 的消息数据库行作为可信文字出站候选，并要求发送前 baseline 之后恰好出现一条 route 与完整正文都匹配的新记录。普通观察器会保存出站事件用于审计，但不会为它建立 subscription delivery 或 wake；兼容工具 `outbound_verify_observed` 对微信草稿固定拒绝，不能用晚入账事件绕过 baseline 或恢复证明。字段缺失、刷新失败、零条或多条匹配都不能进入 `VERIFIED`。
 
-## 7. 附件
+## 8. 附件
 
 附件事件先只入账元数据，并在事务中生成随机 `attachment_ref`。下载必须精确提供 `(subscription_id,event_id,attachment_ref,dedupe_key)`；适配器只能在对应 route 的精确消息身份中解析实体，默认物化到系统临时 intake 且不覆盖同名文件，并登记实际字节、SHA-256、MIME 和可得尺寸。大小、MD5、文件索引、CDN 主机或 route 身份不一致时失败。表情与普通图片是不同来源类型，不能互相冒充；普通图片 key 按 owner account identity 分区，旧无归属 key 必须先通过当前目标验证。
 
@@ -160,7 +183,7 @@ UI 按键完成只算 `SEND_ATTEMPTED`。发送前 baseline 之后出现唯一�
 
 文件永不自动执行或解压。
 
-## 8. 腾讯文档
+## 9. 腾讯文档
 
 高频只读工具可以直接调用。官方完整能力通过工具发现与通用调用入口保留；修改、删除、移动、权限等写操作仍需草稿、授权与 dedupe。
 
@@ -170,6 +193,6 @@ UI 按键完成只算 `SEND_ATTEMPTED`。发送前 baseline 之后出现唯一�
 
 文档 monitor 与 conversation 是 M:N。每个 document subscription 有独立 delivery、wake 和 ACK。`[TDOCS_MONITOR_WAKE]` 只包含 `monitor_id/subscription_id/generation/wake_id/pending_batch_count`；Agent 再调用 `tdocs_monitor_pending_batches` 读取摘要，并用同一 wake 精确 ACK 已完成的 `batch_id`。一个订阅 ACK 不得确认其它订阅。
 
-## 9. 跨通道
+## 10. 跨通道
 
 跨 QQ/微信机器任务保留 `task_id`、`generation`、`source_machine`、`target_machine`、`delivery_id`、`trace_id`、`origin_transport`、`hop_count` 和 dedupe。重复 delivery 或超出 hop 限制必须拒绝，防止 QQ 与微信之间形成回环。
