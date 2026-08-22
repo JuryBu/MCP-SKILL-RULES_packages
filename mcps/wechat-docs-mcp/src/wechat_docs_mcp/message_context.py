@@ -13,6 +13,10 @@ from .context_tokens import ContextTokenCodec
 from .db_observer import DbObserver, Observation, RouteBinding
 from .ledger import EventLedger, LedgerError
 from .route_verifier import PrivateBindingRouteVerifier, RouteVerificationError, VerifiedRoute
+from .subscription_policy import (
+    PrivateBindingSubscriptionPolicyVerifier,
+    SubscriptionPolicyError,
+)
 
 
 MAX_CONTEXT_MESSAGES = 200
@@ -102,6 +106,15 @@ class ContextRouteAuthorizer:
                 "CONTEXT_POLICY_REF_REQUIRED",
                 "subscription 缺少 context read policy_ref，拒绝读取历史上下文",
             )
+        try:
+            PrivateBindingSubscriptionPolicyVerifier(self.binding_document).verify_context(
+                subscription
+            )
+        except SubscriptionPolicyError as error:
+            raise LedgerError(
+                f"CONTEXT_PRIVATE_POLICY_{error.code}",
+                str(error),
+            ) from error
         ledger_route = self.ledger.get_route(str(subscription["route_id"]))
         try:
             verified = PrivateBindingRouteVerifier(self.binding_document).verify_identity(

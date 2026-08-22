@@ -10,6 +10,7 @@ import pytest
 from wechat_docs_mcp import server
 from wechat_docs_mcp.ledger import EventLedger, LedgerError
 from wechat_docs_mcp.route_verifier import RouteVerificationError
+from wechat_docs_mcp.subscription_policy import SubscriptionPolicyError
 
 
 OWNER_KEY = "synthetic-owner-key"
@@ -43,6 +44,19 @@ def configure_private_layer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
                             "file": True,
                             "image": True,
                         },
+                    }
+                ],
+                "subscriptions": [
+                    {
+                        "subscription_id": "subscription-synthetic",
+                        "route_id": "route-synthetic",
+                        "conversation_id": "conversation-synthetic",
+                        "generation": 1,
+                        "state": "active",
+                        "listen_capability": True,
+                        "send_capability": True,
+                        "context_read_capability": False,
+                        "policy_ref": "private-test-policy",
                     }
                 ],
             }
@@ -115,6 +129,169 @@ def test_server_prepare_refuses_route_without_private_outbound_policy(
             subscription_id="subscription-synthetic",
         )
     assert raised.value.code == "UNVERIFIED"
+
+
+def test_context_capability_enable_requires_matching_private_subscription_policy(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    event_ledger = configure_private_layer(monkeypatch, tmp_path)
+
+    with pytest.raises(SubscriptionPolicyError) as forged:
+        server.wechat_subscription_set_capabilities(
+            "subscription-synthetic",
+            1,
+            listen_capability=True,
+            send_capability=True,
+            context_read_capability=True,
+            policy_ref="forged-context-policy",
+        )
+    assert forged.value.code == "UNVERIFIED"
+    assert event_ledger.get_subscription("subscription-synthetic")[
+        "context_read_capability"
+    ] == 0
+
+    binding = json.loads(server.BINDING_FILE.read_text(encoding="utf-8"))
+    binding["subscriptions"][0]["context_read_capability"] = True
+    server.BINDING_FILE.write_text(json.dumps(binding), encoding="utf-8")
+
+    enabled = server.wechat_subscription_set_capabilities(
+        "subscription-synthetic",
+        1,
+        listen_capability=True,
+        send_capability=True,
+        context_read_capability=True,
+        policy_ref="private-test-policy",
+    )
+    assert enabled["context_read_capability"] == 1
+
+    with pytest.raises(SubscriptionPolicyError) as drift:
+        server.wechat_subscription_set_capabilities(
+            "subscription-synthetic",
+            1,
+            listen_capability=True,
+            send_capability=True,
+            context_read_capability=None,
+            policy_ref="forged-context-policy",
+        )
+    assert drift.value.code == "UNVERIFIED"
+    unchanged = event_ledger.get_subscription("subscription-synthetic")
+    assert unchanged["context_read_capability"] == 1
+    assert unchanged["policy_ref"] == "private-test-policy"
+
+    binding["subscriptions"][0]["context_read_capability"] = False
+    server.BINDING_FILE.write_text(json.dumps(binding), encoding="utf-8")
+    disabled = server.wechat_subscription_set_capabilities(
+        "subscription-synthetic",
+        1,
+        listen_capability=True,
+        send_capability=True,
+        context_read_capability=False,
+        policy_ref="private-test-policy",
+    )
+    assert disabled["context_read_capability"] == 0
+
+
+def test_context_capability_create_requires_private_first_stable_subscription(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    configure_private_layer(monkeypatch, tmp_path)
+
+    with pytest.raises(LedgerError) as generated_id:
+        server.wechat_subscription_create(
+            "route-synthetic",
+            "conversation-new",
+            1,
+            context_read_capability=True,
+            policy_ref="private-context-policy",
+        )
+    assert generated_id.value.code == "CONTEXT_SUBSCRIPTION_ID_REQUIRED"
+
+    binding = json.loads(server.BINDING_FILE.read_text(encoding="utf-8"))
+    binding["subscriptions"].append(
+        {
+            "subscription_id": "subscription-context-new",
+            "route_id": "route-synthetic",
+            "conversation_id": "conversation-new",
+            "generation": 1,
+            "state": "active",
+            "listen_capability": True,
+            "send_capability": False,
+            "context_read_capability": True,
+            "policy_ref": "private-context-policy",
+        }
+    )
+    server.BINDING_FILE.write_text(json.dumps(binding), encoding="utf-8")
+
+    created = server.wechat_subscription_create(
+        "route-synthetic",
+        "conversation-new",
+        1,
+        subscription_id="subscription-context-new",
+        context_read_capability=True,
+        policy_ref="private-context-policy",
+    )
+    assert created["context_read_capability"] == 1
+
+
+def test_context_private_gate_does_not_expand_to_listen_send_disable_or_state_checks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    event_ledger = configure_private_layer(monkeypatch, tmp_path)
+    listen_only = server.wechat_subscription_create(
+        "route-synthetic",
+        "conversation-listen-only",
+        1,
+        subscription_id="subscription-listen-only",
+        listen_capability=True,
+        send_capability=False,
+        context_read_capability=False,
+    )
+    assert listen_only["context_read_capability"] == 0
+
+    preserved = server.wechat_subscription_set_capabilities(
+        "subscription-listen-only",
+        1,
+        listen_capability=False,
+        send_capability=False,
+        context_read_capability=None,
+    )
+    assert preserved["listen_capability"] == 0
+    assert preserved["context_read_capability"] == 0
+
+    send_only = server.wechat_subscription_set_capabilities(
+        "subscription-synthetic",
+        1,
+        listen_capability=True,
+        send_capability=True,
+        context_read_capability=False,
+        policy_ref="private-test-policy",
+    )
+    assert send_only["send_capability"] == 1
+    assert send_only["context_read_capability"] == 0
+
+    with pytest.raises(LedgerError) as stale_generation:
+        server.wechat_subscription_set_capabilities(
+            "subscription-listen-only",
+            2,
+            listen_capability=True,
+            send_capability=False,
+            context_read_capability=False,
+        )
+    assert stale_generation.value.code == "SUBSCRIPTION_STATE_CONFLICT"
+
+    event_ledger.set_subscription_state("subscription-listen-only", 1, "closed")
+    with pytest.raises(LedgerError) as closed:
+        server.wechat_subscription_set_capabilities(
+            "subscription-listen-only",
+            1,
+            listen_capability=True,
+            send_capability=False,
+            context_read_capability=False,
+        )
+    assert closed.value.code == "SUBSCRIPTION_STATE_CONFLICT"
 
 
 def test_legacy_binding_without_route_state_remains_listenable(

@@ -115,7 +115,7 @@ context = wechat_message_context_read(
 )
 ```
 
-也可以使用前次响应里的 `msgctx_...` 作为单锚点，或把两个 event/message ref 分别传给 `start_anchor/end_anchor` 读取闭区间。调用要求 subscription 为 active、显式启用 `context_read_capability` 且有非空私有 `policy_ref`，并再次核对 private binding 的精确 route 身份与当前 owner account scope；监听权限本身不授权历史读取。
+也可以使用前次响应里的 `msgctx_...` 作为单锚点，或把两个 event/message ref 分别传给 `start_anchor/end_anchor` 读取闭区间。调用要求账本 subscription 为 active、显式启用 `context_read_capability`，并在 private binding 中唯一匹配同一 `subscription_id/route_id/conversation_id/generation`、active、`context_read_capability=true` 与 constant-time 一致的非空 `policy_ref`；随后仍要核对精确 route 身份与当前 owner account scope。监听权限本身不授权历史读取，任一私有策略缺失、重复、暂停、撤销或漂移都会拒绝读取。
 
 返回顺序来自同一 route 的微信只读数据库真实消息顺序，可包含 inbound、owner self-sent outbound 与显式标记的 unknown。调用者可按 direction、kind、`text_only`、消息数和字符数限制结果；超预算时使用签名 `ctxcur_...` 续读。cursor 绑定 source cutoff、subscription/route/account、锚点、过滤条件和已选消息身份，篡改、账号切换、来源漂移或跨订阅复用都会拒绝。读取不会写入历史 event、不会创建 delivery/wake，也不会推进 baseline 或 ACK。
 

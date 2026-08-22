@@ -189,6 +189,52 @@ def _binding_document() -> dict[str, Any]:
                 "outbound": {"enabled": False},
             },
         ],
+        "subscriptions": [
+            {
+                "subscription_id": SUBSCRIPTION_ID,
+                "route_id": ROUTE_ID,
+                "conversation_id": "conversation-a",
+                "generation": 1,
+                "state": "active",
+                "listen_capability": True,
+                "send_capability": False,
+                "context_read_capability": True,
+                "policy_ref": "context-test-policy",
+            },
+            {
+                "subscription_id": SECOND_SUBSCRIPTION_ID,
+                "route_id": ROUTE_ID,
+                "conversation_id": "conversation-b",
+                "generation": 1,
+                "state": "active",
+                "listen_capability": True,
+                "send_capability": False,
+                "context_read_capability": True,
+                "policy_ref": "context-test-policy",
+            },
+            {
+                "subscription_id": DISABLED_SUBSCRIPTION_ID,
+                "route_id": ROUTE_ID,
+                "conversation_id": "conversation-disabled",
+                "generation": 1,
+                "state": "active",
+                "listen_capability": True,
+                "send_capability": False,
+                "context_read_capability": False,
+                "policy_ref": "context-test-policy",
+            },
+            {
+                "subscription_id": OTHER_SUBSCRIPTION_ID,
+                "route_id": OTHER_ROUTE_ID,
+                "conversation_id": "conversation-other",
+                "generation": 1,
+                "state": "active",
+                "listen_capability": True,
+                "send_capability": False,
+                "context_read_capability": True,
+                "policy_ref": "context-test-policy",
+            },
+        ],
     }
 
 
@@ -284,9 +330,10 @@ def context_fixture(tmp_path: Path) -> dict[str, Any]:
     )
     clock = [1_800_000_000]
     codec = ContextTokenCodec(b"context-test-secret-32-bytes-minimum", now=lambda: clock[0])
+    binding_document = _binding_document()
     reader = MessageContextReader(
         ledger,
-        _binding_document(),
+        binding_document,
         _bindings(),
         decrypted,
         codec,
@@ -294,7 +341,7 @@ def context_fixture(tmp_path: Path) -> dict[str, Any]:
     )
     resolver = ContextAttachmentResolver(
         ledger,
-        _binding_document(),
+        binding_document,
         _bindings(),
         decrypted,
         codec,
@@ -309,6 +356,7 @@ def context_fixture(tmp_path: Path) -> dict[str, Any]:
         "event_id": event["event_id"],
         "decrypted": decrypted,
         "tmp_path": tmp_path,
+        "binding_document": binding_document,
     }
 
 
@@ -536,6 +584,34 @@ def test_context_read_requires_runtime_policy_ref(
         )
 
     assert missing_policy.value.code == "CONTEXT_POLICY_REF_REQUIRED"
+
+
+def test_private_context_policy_revocation_is_immediate_for_reads_and_attctx(
+    context_fixture: dict[str, Any],
+) -> None:
+    result = _full_slice(context_fixture)
+    attachment_ref = next(
+        item["attachment"]["attachment_ref"]
+        for item in result["messages"]
+        if item["kind"] == "image"
+    )
+    private_policy = next(
+        item
+        for item in context_fixture["binding_document"]["subscriptions"]
+        if item["subscription_id"] == SUBSCRIPTION_ID
+    )
+    private_policy["context_read_capability"] = False
+
+    with pytest.raises(LedgerError) as read_denied:
+        context_fixture["reader"].read(
+            SUBSCRIPTION_ID,
+            anchor_event_id=context_fixture["event_id"],
+        )
+    assert read_denied.value.code == "CONTEXT_PRIVATE_POLICY_UNVERIFIED"
+
+    with pytest.raises(LedgerError) as attachment_denied:
+        context_fixture["resolver"].resolve(SUBSCRIPTION_ID, attachment_ref)
+    assert attachment_denied.value.code == "CONTEXT_PRIVATE_POLICY_UNVERIFIED"
 
 
 def test_invalid_kind_filter_is_rejected(context_fixture: dict[str, Any]) -> None:

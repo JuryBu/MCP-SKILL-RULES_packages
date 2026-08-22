@@ -21,7 +21,9 @@ receiver private layer
 
 ## 私有历史读取策略
 
-启用局部上下文读取至少同时满足：subscription 精确绑定目标 route/conversation/generation；`context_read_capability=true`；非空 `policy_ref` 明确允许这一 route 的局部双向上下文；当前活动微信账号与 route owner scope 一致。返回的 `msgctx_`、`attctx_` 与 continuation 只在本机私有 HMAC key 下有效，不得写入公开日志或跨 subscription 共享。策略撤销后应关闭 capability，而不是通过删除 event、pending 或 ACK 掩盖历史。
+启用局部上下文读取至少同时满足：账本与 private binding 都唯一精确匹配同一 `subscription_id/route_id/conversation_id/generation`；两层均为 active 且 `context_read_capability=true`；两层非空 `policy_ref` constant-time 一致并明确允许该 route 的局部双向上下文；当前活动微信账号与 route owner scope 一致。每次上下文读取与 `attctx_` 解析都会重新读取并核验私有策略，缺失、重复、漂移或撤销立即 fail-closed。返回的 `msgctx_`、`attctx_` 与 continuation 只在本机私有 HMAC key 下有效，不得写入公开日志或跨 subscription 共享。
+
+能力启用遵循 private-first：操作者或发布脚本先备份并原子写入 private binding 的完整 subscription 策略，再调用 capability 工具写账本；账本写入失败时，操作者或发布脚本必须恢复 private binding 备份。撤销采用相反的安全意图顺序：先在 private binding 暂停或关闭该策略，使运行时立即拒绝，再关闭账本 capability；不得通过删除 event、pending 或 ACK 掩盖历史。能力工具只接受已经存在且精确匹配的私有策略，任意非空字符串不能制造授权。
 
 ## 私有发送策略
 

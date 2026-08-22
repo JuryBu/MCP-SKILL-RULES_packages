@@ -30,6 +30,7 @@ from .message_context import MessageContextReader
 from .outbound import SafeTextOutbound
 from .office_converter import LocalOfficeConverter
 from .route_verifier import PrivateBindingRouteVerifier
+from .subscription_policy import PrivateBindingSubscriptionPolicyVerifier
 from .runtime_flags import resolve_private_runtime_environment_value, resolve_private_runtime_gate
 from .tencent_docs import TencentDocsMcpClient, classify_tool
 from .wake_notifier import (
@@ -166,7 +167,7 @@ def context_attachment_resolver(
     return ContextAttachmentResolver(
         event_ledger,
         binding_document,
-        _load_bindings(),
+        _bindings_from_document(binding_document),
         DECRYPTED_DIR,
         context_token_codec(),
         active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
@@ -178,7 +179,7 @@ def message_context_reader(event_ledger: EventLedger) -> MessageContextReader:
     return MessageContextReader(
         event_ledger,
         binding_document,
-        _load_bindings(),
+        _bindings_from_document(binding_document),
         DECRYPTED_DIR,
         context_token_codec(),
         active_owner_account_key_sha256=ACTIVE_OWNER_ACCOUNT_KEY_SHA256,
@@ -311,8 +312,7 @@ def _load_binding_document() -> dict[str, Any]:
     return data
 
 
-def _load_bindings() -> list[RouteBinding]:
-    data = _load_binding_document()
+def _bindings_from_document(data: Mapping[str, Any]) -> list[RouteBinding]:
     owner_account_key = str(data.get("ownerAccountKey") or "")
     owner_sender_username = str(data.get("ownerSenderUsername") or "")
     schema_version = int(data.get("schemaVersion") or 1)
@@ -336,6 +336,10 @@ def _load_bindings() -> list[RouteBinding]:
             or (schema_version == 1 and not str(r.get("state") or "").strip())
         )
     ]
+
+
+def _load_bindings() -> list[RouteBinding]:
+    return _bindings_from_document(_load_binding_document())
 
 
 def watcher() -> DbWatcher | None:
@@ -541,6 +545,23 @@ def wechat_subscription_create(
     policy_ref: str = "",
 ) -> dict[str, Any]:
     """Create an exclusive session for one route/conversation/generation at the current event baseline."""
+    if context_read_capability:
+        if not subscription_id.strip():
+            raise LedgerError(
+                "CONTEXT_SUBSCRIPTION_ID_REQUIRED",
+                "启用 context read 时必须先在 private binding 登记稳定 subscription_id",
+            )
+        PrivateBindingSubscriptionPolicyVerifier(_load_binding_document()).verify_context(
+            {
+                "subscription_id": subscription_id,
+                "route_id": route_id,
+                "conversation_id": conversation_id,
+                "generation": generation,
+                "state": "active",
+                "context_read_capability": True,
+                "policy_ref": policy_ref,
+            }
+        )
     return ledger().register_subscription(
         route_id,
         conversation_id,
@@ -573,7 +594,24 @@ def wechat_subscription_set_capabilities(
     policy_ref: str = "",
 ) -> dict[str, Any]:
     """Update independent listen/send/context-read capabilities; send or context read requires private policy."""
-    return ledger().set_subscription_capabilities(
+    event_ledger = ledger()
+    subscription = event_ledger.get_subscription(subscription_id)
+    effective_context_read = (
+        bool(subscription.get("context_read_capability"))
+        if context_read_capability is None
+        else context_read_capability
+    )
+    effective_policy_ref = policy_ref or str(subscription.get("policy_ref") or "")
+    if effective_context_read:
+        PrivateBindingSubscriptionPolicyVerifier(_load_binding_document()).verify_context(
+            {
+                **subscription,
+                "generation": generation,
+                "context_read_capability": True,
+                "policy_ref": effective_policy_ref,
+            }
+        )
+    return event_ledger.set_subscription_capabilities(
         subscription_id,
         generation,
         listen_capability=listen_capability,

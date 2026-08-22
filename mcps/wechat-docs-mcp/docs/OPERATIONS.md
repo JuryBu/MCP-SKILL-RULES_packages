@@ -78,7 +78,7 @@
 
 使用 `binding.example.json` 的 schema v2 模板。route 只保存精确微信会话身份和本机 outbound capability；conversation 放在独立 `subscriptions` 数组中。一个 route 可出现于多个 subscription，一个 conversation 也可订阅多个 route。`tencentDocs.monitors` 是独立的文档监视 allowlist，不复用微信 route 身份表。
 
-公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 与 `context_read_capability` 全关闭，示例文档策略也为 `paused/listen=false`。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `send_capability` 或 `context_read_capability` 时必须同时提供非空 `policy_ref`；监听不自动授权历史读取。真实授权消息引用另存于私有授权链，不得提交。
+公开模板默认 route 为 `enrolling`、subscription 为 `paused`、outbound 与 `context_read_capability` 全关闭，示例文档策略也为 `paused/listen=false`。接收方完成唯一身份核验后，才在本机私有文件中启用。启用 `context_read_capability` 时，操作者或发布脚本必须先备份并原子登记精确的 private subscription 条目，再调用能力工具；工具会逐项匹配 subscription/route/conversation/generation/active/capability/policy_ref，不能用任意非空字符串代替私有授权。账本更新失败时由同一操作者或发布脚本恢复 private binding 备份；撤销先停私有策略、再停账本能力，从第一步起读取即 fail-closed。监听不自动授权历史读取，真实授权消息引用另存于私有授权链，不得提交。
 
 ## 3. 安装
 

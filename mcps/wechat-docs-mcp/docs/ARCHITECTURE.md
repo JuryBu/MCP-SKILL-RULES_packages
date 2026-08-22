@@ -30,7 +30,7 @@ ownerAccountKey + internal username + chat_type
 
 subscription 是独占 session，每条只属于一个确定的 `(route_id, conversation_id, generation)`。一个 route 可连接多个 conversation，一个 conversation 也可连接多个 route。新事件只在 `events` 物化一次，然后在同一事务中 fan-out 到该 route 的所有 active、listen-capable subscription。
 
-按锚点读取历史上下文走独立只读旁路：subscription 先通过 `context_read_capability`、精确 route identity 与当前 owner account scope 三重授权，再从微信只读数据库读取有限窗口。该旁路不把历史消息补写进 `events`，不创建 delivery/wake，也不改变 baseline、pending 或 ACK。
+按锚点读取历史上下文走独立只读旁路：subscription 必须同时通过账本 `context_read_capability`、private binding 中精确匹配 subscription/route/conversation/generation/policy 的 active allowlist、精确 route identity 与当前 owner account scope，再从微信只读数据库读取有限窗口。每次读取和 `attctx_` 解析都会重新核验 private subscription 策略，撤销立即 fail-closed。该旁路不把历史消息补写进 `events`，不创建 delivery/wake，也不改变 baseline、pending 或 ACK。
 
 ## 3. 核心表
 
