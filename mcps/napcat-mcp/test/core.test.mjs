@@ -21,6 +21,7 @@ async function createFixture(options = {}) {
   const calls = [];
   const messages = new Map();
   const groupFiles = [];
+  const privateFiles = [];
   const primedFileIds = new Set();
   const downloadContent = Buffer.from("NapCat fixed-group download test\n", "utf8");
   let downloadBaseUrl = "";
@@ -33,6 +34,8 @@ async function createFixture(options = {}) {
     groupName: options.groupName ?? "ExampleGroup",
     memberCount: options.memberCount ?? 4,
   };
+  const configuredGroups = new Map(Object.entries(options.configuredGroups ?? {}));
+  const friends = options.friends ?? [];
   messages.set("900", {
     message_id: "900",
     message_seq: "900",
@@ -124,7 +127,7 @@ async function createFixture(options = {}) {
     });
   }
   const binding = {
-    schemaVersion: 1,
+    schemaVersion: options.controlPlane ? 2 : 1,
     bindingName: "example-group-notify",
     expectedSelfId: options.expectedSelfId ?? runtime.selfId,
     expectedNickname: options.expectedNickname ?? runtime.nickname,
@@ -136,6 +139,7 @@ async function createFixture(options = {}) {
     dedupeRetentionDays: 30,
     requireGroupIdentityCheckBeforeSend: options.requireGroupIdentityCheckBeforeSend ?? true,
     requireMessageVerification: true,
+    ...(options.controlPlane ? { controlPlane: options.controlPlane } : {}),
   };
   fs.writeFileSync(bindingPath, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
 
@@ -167,11 +171,18 @@ async function createFixture(options = {}) {
         { group_id: 987654321, group_name: "Other", member_count: 9 },
       ];
     } else if (action === "get_group_info") {
+      const configuredGroup = configuredGroups.get(String(body.group_id));
       data = {
-        group_id: Number(runtime.groupId),
-        group_name: runtime.groupName,
-        member_count: runtime.memberCount,
+        group_id: Number(configuredGroup?.groupId ?? runtime.groupId),
+        group_name: configuredGroup?.groupName ?? runtime.groupName,
+        member_count: configuredGroup?.memberCount ?? runtime.memberCount,
       };
+    } else if (action === "get_friend_list") {
+      data = friends.map((friend) => ({
+        user_id: Number(friend.userId),
+        nickname: friend.nickname ?? "",
+        remark: friend.remark ?? "",
+      }));
     } else if (action === "send_group_msg") {
       const isTaskFileIndex = String(body.message ?? "").includes("[Codex][TASK_FILE_INDEX]");
       if (options.failTaskFileIndexOnce && isTaskFileIndex && taskFileIndexFailureCount === 0) {
@@ -225,6 +236,16 @@ async function createFixture(options = {}) {
         }
       }
       data = { messages: returnedMessages };
+    } else if (action === "get_friend_msg_history") {
+      const count = Math.max(1, Math.min(50, Number(body.count || 20)));
+      const history = [...messages.values()]
+        .filter((message) => String(message.private_user_id ?? "") === String(body.user_id))
+        .sort((left, right) => Number(left.message_seq) - Number(right.message_seq));
+      data = {
+        messages: body.reverse_order === true
+          ? history.slice(-count).reverse()
+          : history.slice(-count),
+      };
     } else if (action === "get_msg") {
       const stored = messages.get(String(body.message_id)) ?? null;
       if (options.getMsgMode === "null") {
@@ -245,12 +266,13 @@ async function createFixture(options = {}) {
       const fileId = `raw-file-uuid-${ordinal}`;
       const rootFileId = `root-cache-file-${ordinal}`;
       const fileSize = fs.statSync(body.file).size;
+      const uploadGroupId = Number(body.group_id);
       messageSequence += 1;
       const messageId = String(messageSequence);
       messages.set(messageId, {
         message_id: messageId,
         message_seq: messageId,
-        group_id: Number(runtime.groupId),
+        group_id: uploadGroupId,
         time: 1784869200,
         user_id: runtime.selfId,
         sender: { user_id: runtime.selfId, nickname: runtime.nickname },
@@ -266,7 +288,7 @@ async function createFixture(options = {}) {
         raw_message: `[CQ:file,file=${body.name},file_id=${fileId},file_size=${fileSize},busid=102]`,
       });
       groupFiles.unshift({
-        group_id: Number(runtime.groupId),
+        group_id: uploadGroupId,
         file_id: rootFileId,
         file_name: body.name,
         file_size: fileSize,
@@ -276,8 +298,50 @@ async function createFixture(options = {}) {
         uploader_name: runtime.nickname,
       });
       data = { file_id: fileId };
+      if (options.failUploadGroupFileAfterPersist) {
+        response.end(JSON.stringify({
+          status: "failed",
+          retcode: 200,
+          data: null,
+          wording: "Error: EventChecker Failed: rich media transfer failed",
+        }));
+        return;
+      }
+    } else if (action === "upload_private_file") {
+      const ordinal = privateFiles.length + 1;
+      const fileId = `private-file-uuid-${ordinal}`;
+      const fileSize = fs.statSync(body.file).size;
+      messageSequence += 1;
+      const messageId = String(messageSequence);
+      messages.set(messageId, {
+        message_id: messageId,
+        message_seq: messageId,
+        private_user_id: String(body.user_id),
+        time: 1784869200,
+        user_id: runtime.selfId,
+        sender: { user_id: runtime.selfId, nickname: runtime.nickname },
+        message: [{
+          type: "file",
+          data: {
+            file: body.name,
+            file_id: fileId,
+            file_size: fileSize,
+          },
+        }],
+        raw_message: `[CQ:file,file=${body.name},file_id=${fileId},file_size=${fileSize}]`,
+      });
+      privateFiles.unshift({
+        user_id: String(body.user_id),
+        file_id: fileId,
+        file_name: body.name,
+        file_size: fileSize,
+      });
+      data = { file_id: fileId };
     } else if (action === "get_group_root_files") {
-      data = { files: groupFiles, folders: [] };
+      data = {
+        files: groupFiles.filter((file) => String(file.group_id) === String(body.group_id)),
+        folders: [],
+      };
     } else if (action === "get_group_file_url") {
       if (!primedFileIds.has(String(body.file_id))) {
         response.statusCode = 400;
@@ -760,6 +824,144 @@ test("file preview hashes locally and fixed-group upload verifies by file list",
     assert.equal(second.sent, false);
     assert.equal(second.duplicateSuppressed, true);
     assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("group file upload unknown outcome recovers by read-only file lookup", async () => {
+  const fixture = await createFixture({ failUploadGroupFileAfterPersist: true });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "unknown-but-present.zip");
+    const content = "unknown-outcome-file-present";
+    fs.writeFileSync(filePath, content, "utf8");
+    const input = {
+      file_path: filePath,
+      name: "结果未知但已上传.zip",
+      task_id: "stage89-upload-unknown-recovery",
+      source_machine: "training",
+      target_machine: "development",
+      dedupe_key: "stage89-upload-unknown-recovery:file",
+    };
+
+    const result = await fixture.notifier.sendFile(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.recoveredFromUnknownUpload, true);
+    assert.equal(result.uploadError.code, "ONEBOT_ACTION_FAILED");
+    assert.equal(result.uploadError.details.retcode, 200);
+    assert.match(result.uploadError.details.wording, /rich media transfer failed/);
+    assert.equal(result.taskIndex.status, "sent_verified");
+    assert.equal(result.taskIndex.sent, true);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.some((call) => call.action === "get_group_root_files"), true);
+    assert.equal(fixture.calls.some((call) => call.action === "get_group_msg_history"), true);
+
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "sent_verified");
+    assert.equal(state.entries[input.dedupe_key].recoveredFromUnknownUpload, true);
+    assert.equal(state.entries[input.dedupe_key].uploadError.details.retcode, 200);
+
+    const second = await fixture.notifier.sendFile(input);
+    assert.equal(second.sent, false);
+    assert.equal(second.reason, "file_already_uploaded");
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("configured group file upload uses selected control-plane group only", async () => {
+  const fixture = await createFixture({
+    controlPlane: {
+      enabled: true,
+      defaultTargetKey: "owner-members",
+      targets: {
+        "owner-members": {
+          type: "group",
+          id: "950683114",
+          name: "Members",
+          expectedMemberCount: 3,
+        },
+      },
+    },
+    configuredGroups: {
+      "950683114": { groupId: "950683114", groupName: "Members", memberCount: 3 },
+    },
+  });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "owner-report.pdf");
+    fs.writeFileSync(filePath, "owner-report-content", "utf8");
+    const input = {
+      target_key: "owner-members",
+      file_path: filePath,
+      name: "owner-report.pdf",
+      dedupe_key: "owner-members:file:report",
+    };
+
+    const preview = await fixture.notifier.previewConfiguredFile(input);
+    assert.equal(preview.target.targetKey, "owner-members");
+    assert.equal(preview.target.id, "950683114");
+    assert.equal(preview.fileBytes, 20);
+
+    const result = await fixture.notifier.sendConfiguredFile(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.target.targetKey, "owner-members");
+    assert.equal(result.target.id, "950683114");
+    const uploadCall = fixture.calls.find((call) => call.action === "upload_group_file");
+    assert.equal(String(uploadCall.body.group_id), "950683114");
+    assert.equal(fixture.calls.some((call) =>
+      call.action === "send_group_msg"
+      && String(call.body.message ?? "").includes("[Codex][TASK_FILE_INDEX]")
+    ), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("configured private file target uploads to selected friend and verifies by private history", async () => {
+  const fixture = await createFixture({
+    controlPlane: {
+      enabled: true,
+      defaultTargetKey: "owner-private",
+      targets: {
+        "owner-private": {
+          type: "private",
+          id: "1064964702",
+          name: "Owner",
+        },
+      },
+    },
+    friends: [{ userId: "1064964702", nickname: "Owner" }],
+  });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "private-report.pdf");
+    fs.writeFileSync(filePath, "private-report-content", "utf8");
+    const preview = await fixture.notifier.previewConfiguredFile({
+      target_key: "owner-private",
+      file_path: filePath,
+      name: "private-report.pdf",
+      dedupe_key: "owner-private:file:report",
+    });
+    assert.equal(preview.target.type, "private");
+    assert.equal(preview.target.id, "1064964702");
+
+    const result = await fixture.notifier.sendConfiguredFile({
+      target_key: "owner-private",
+      file_path: filePath,
+      name: "private-report.pdf",
+      dedupe_key: "owner-private:file:report",
+    });
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.target.type, "private");
+    assert.equal(result.target.id, "1064964702");
+    const uploadCall = fixture.calls.find((call) => call.action === "upload_private_file");
+    assert.equal(String(uploadCall.body.user_id), "1064964702");
+    assert.equal(uploadCall.body.file, fs.realpathSync(filePath));
+    assert.equal(fixture.calls.some((call) => call.action === "upload_group_file"), false);
+    assert.equal(fixture.calls.some((call) => call.action === "send_group_msg"), false);
   } finally {
     await fixture.close();
   }

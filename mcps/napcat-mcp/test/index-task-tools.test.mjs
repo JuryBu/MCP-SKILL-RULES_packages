@@ -133,6 +133,8 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       "napcat_task_router_status",
       "napcat_task_ack",
       "napcat_owner_route_migrate",
+      "napcat_preview_configured_file",
+      "napcat_send_configured_file",
     ]) {
       assert.equal(names.includes(name), true, `缺少工具：${name}`);
     }
@@ -141,6 +143,13 @@ test("MCP task tools register, rebind, reject stale generation, and close", asyn
       ["task_id", "source_machine", "target_machine"].filter((field) => !sendFileTool.inputSchema.properties[field]),
       [],
     );
+    const sendConfiguredFileTool = listedTools.result.tools.find((tool) => tool.name === "napcat_send_configured_file");
+    assert.deepEqual(
+      ["target_key", "file_path", "dedupe_key"].filter((field) => !sendConfiguredFileTool.inputSchema.properties[field]),
+      [],
+    );
+    assert.deepEqual(sendConfiguredFileTool.inputSchema.required, ["target_key", "file_path", "dedupe_key"]);
+    assert.equal(Boolean(sendConfiguredFileTool.inputSchema.properties.task_id), false);
     const sendTextTool = listedTools.result.tools.find((tool) => tool.name === "napcat_send_text");
     assert.deepEqual(
       ["reply_required", "expected_reply", "reply_deadline_at", "next_check_at"]

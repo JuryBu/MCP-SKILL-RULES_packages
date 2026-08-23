@@ -604,11 +604,20 @@ function stableDeliveryId(kind, dedupeKey) {
 }
 
 function publicError(error) {
-  return {
+  const result = {
     code: error instanceof NapCatNotifierError ? error.code : "UNEXPECTED_ERROR",
     message: error?.message || String(error),
     outcomeUnknown: Boolean(error?.outcomeUnknown),
   };
+  if (isPlainObject(error?.details)) {
+    result.details = Object.fromEntries(Object.entries(error.details)
+      .filter(([, value]) => value === null || ["string", "number", "boolean"].includes(typeof value))
+      .map(([key, value]) => [
+        key,
+        typeof value === "string" ? value.slice(0, 2000) : value,
+      ]));
+  }
+  return result;
 }
 
 function formatProgress(input) {
@@ -927,13 +936,22 @@ export function createNapCatNotifier(options = {}) {
     }
     if (!response.ok) {
       throw new NapCatNotifierError("ONEBOT_HTTP_ERROR", `OneBot ${action} 返回 HTTP ${response.status}`, {
-        outcomeUnknown: (action === "send_group_msg" || action === "upload_group_file") && response.status >= 500,
+        outcomeUnknown: (
+          action === "send_group_msg"
+          || action === "send_private_msg"
+          || action === "upload_group_file"
+          || action === "upload_private_file"
+        ) && response.status >= 500,
         details: { status: response.status, retcode: envelope?.retcode ?? null },
       });
     }
     if (envelope?.status !== "ok" || Number(envelope?.retcode ?? 0) !== 0) {
       throw new NapCatNotifierError("ONEBOT_ACTION_FAILED", `OneBot ${action} 执行失败`, {
-        outcomeUnknown: action === "send_group_msg" || action === "send_private_msg" || action === "upload_group_file",
+        outcomeUnknown:
+          action === "send_group_msg"
+          || action === "send_private_msg"
+          || action === "upload_group_file"
+          || action === "upload_private_file",
         details: { retcode: envelope?.retcode ?? null, wording: envelope?.wording ?? "" },
       });
     }
@@ -1313,6 +1331,22 @@ export function createNapCatNotifier(options = {}) {
     };
   }
 
+  async function previewConfiguredFile(input) {
+    const binding = loadBinding();
+    const normalizedInput = normalizeFileInput(input, maximumFileBytes);
+    const targetCheck = await checkConfiguredTarget(binding, input.target_key);
+    return {
+      bindingName: binding.bindingName,
+      target: targetCheck.target,
+      dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId,
+      filePath: normalizedInput.filePath,
+      fileName: normalizedInput.fileName,
+      fileBytes: normalizedInput.fileBytes,
+      sha256: await sha256File(normalizedInput.filePath),
+    };
+  }
+
   async function primeGroupFileLookup(binding, normalizedInput) {
     try {
       const history = await callOneBot("get_group_msg_history", {
@@ -1571,7 +1605,136 @@ export function createNapCatNotifier(options = {}) {
     }
   }
 
-  async function sendFile(input) {
+  function groupFileMatches(file, normalizedInput, expectedSelfId) {
+    return String(file?.file_name ?? "") === normalizedInput.fileName
+      && Number(file?.file_size ?? file?.size ?? -1) === normalizedInput.fileBytes
+      && (!file?.uploader || String(file.uploader) === expectedSelfId);
+  }
+
+  function attachmentMatchesFile(attachment, normalizedInput, fileId = "") {
+    return Boolean(attachment)
+      && (
+        (fileId && attachment.fileId === fileId)
+        || (
+          attachment.fileName === normalizedInput.fileName
+          && attachment.fileBytes === normalizedInput.fileBytes
+        )
+      );
+  }
+
+  async function findGroupUploadedFile(uploadGroupId, normalizedInput, binding) {
+    const rootFiles = await callOneBot("get_group_root_files", {
+      group_id: uploadGroupId,
+      file_count: 100,
+    });
+    const candidates = Array.isArray(rootFiles?.files) ? rootFiles.files : [];
+    const verifiedFile = candidates.find((file) =>
+      groupFileMatches(file, normalizedInput, binding.expectedSelfId)
+    ) ?? null;
+    if (!verifiedFile) {
+      throw new NapCatNotifierError("FILE_VERIFY_MISSING", "群文件列表中未找到刚上传的同名同大小文件");
+    }
+    return verifiedFile;
+  }
+
+  async function findGroupFileMessage(uploadGroupId, normalizedInput, binding, fileId = "") {
+    const history = await callOneBot("get_group_msg_history", {
+      group_id: uploadGroupId,
+      count: 50,
+      reverse_order: true,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    });
+    const candidates = (Array.isArray(history?.messages) ? history.messages : [])
+      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+    const fileMessage = candidates.find((message) =>
+      message.isSelf
+      && message.attachments.some((attachment) =>
+        attachmentMatchesFile(attachment, normalizedInput, fileId)
+      )
+    ) ?? null;
+    const messageAttachment = fileMessage?.attachments.find((attachment) =>
+      attachmentMatchesFile(attachment, normalizedInput, fileId)
+    ) ?? null;
+    if (!messageAttachment) {
+      throw new NapCatNotifierError("FILE_MESSAGE_VERIFY_MISSING", "最近消息中未找到刚上传的同名同大小文件");
+    }
+    return { fileMessage, messageAttachment };
+  }
+
+  async function findPrivateFileMessage(uploadUserId, normalizedInput, binding, fileId = "") {
+    const history = await callOneBot("get_friend_msg_history", {
+      user_id: uploadUserId,
+      count: 50,
+      reverse_order: true,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    });
+    const candidates = (Array.isArray(history?.messages) ? history.messages : [])
+      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+    const fileMessage = candidates.find((message) =>
+      message.isSelf
+      && message.attachments.some((attachment) =>
+        attachmentMatchesFile(attachment, normalizedInput, fileId)
+      )
+    ) ?? null;
+    const messageAttachment = fileMessage?.attachments.find((attachment) =>
+      attachmentMatchesFile(attachment, normalizedInput, fileId)
+    ) ?? null;
+    if (!messageAttachment) {
+      throw new NapCatNotifierError("PRIVATE_FILE_VERIFY_MISSING", "私聊最近消息中未找到刚上传的同名同大小文件");
+    }
+    return { fileMessage, messageAttachment };
+  }
+
+  async function recoverUnknownFileUpload({
+    binding,
+    targetType,
+    uploadGroupId,
+    uploadUserId,
+    normalizedInput,
+  }) {
+    if (targetType === "private") {
+      const { fileMessage, messageAttachment } = await findPrivateFileMessage(
+        uploadUserId,
+        normalizedInput,
+        binding,
+      );
+      return {
+        fileId: messageAttachment.fileId,
+        verifiedFile: {
+          file_id: messageAttachment.fileId,
+          busid: messageAttachment.busId,
+        },
+        fileMessage,
+        fileMessageLookupError: null,
+      };
+    }
+
+    const verifiedFile = await findGroupUploadedFile(uploadGroupId, normalizedInput, binding);
+    let fileMessage = null;
+    let messageAttachment = null;
+    let fileMessageLookupError = null;
+    try {
+      ({ fileMessage, messageAttachment } = await findGroupFileMessage(
+        uploadGroupId,
+        normalizedInput,
+        binding,
+      ));
+    } catch (error) {
+      fileMessageLookupError = publicError(error);
+    }
+    return {
+      fileId: String(messageAttachment?.fileId ?? verifiedFile?.file_id ?? ""),
+      verifiedFile,
+      fileMessage,
+      fileMessageLookupError,
+    };
+  }
+
+  async function sendFileToGroupTarget(input, configuredTargetKey = "") {
     const binding = loadBinding();
     const normalizedInput = normalizeFileInput(input, maximumFileBytes);
     const currentTime = now();
@@ -1638,7 +1801,13 @@ export function createNapCatNotifier(options = {}) {
     inFlight.add(normalizedInput.dedupeKey);
     let releaseDedupeLock = null;
     try {
-      const targetCheck = await checkTarget(binding);
+      const targetCheck = configuredTargetKey
+        ? await checkConfiguredTarget(binding, configuredTargetKey)
+        : await checkTarget(binding);
+      const resolvedTarget = configuredTargetKey ? targetCheck.target : targetCheck.group;
+      const targetType = configuredTargetKey ? targetCheck.target.type : "group";
+      const uploadGroupId = configuredTargetKey ? targetCheck.target.id : binding.groupId;
+      const uploadUserId = targetType === "private" ? targetCheck.target.id : "";
       const lockResult = acquireDedupeLock(statePath, normalizedInput.dedupeKey, currentTime);
       releaseDedupeLock = lockResult.release;
       if (!releaseDedupeLock && lockResult.existingLock?.stale) {
@@ -1681,19 +1850,98 @@ export function createNapCatNotifier(options = {}) {
 
       let uploadData;
       try {
-        uploadData = await callOneBot("upload_group_file", {
-          group_id: binding.groupId,
-          file: normalizedInput.filePath,
-          name: normalizedInput.fileName,
-          upload_file: true,
-        }, fileUploadTimeoutMs);
+        uploadData = targetType === "private"
+          ? await callOneBot("upload_private_file", {
+            user_id: uploadUserId,
+            file: normalizedInput.filePath,
+            name: normalizedInput.fileName,
+          }, fileUploadTimeoutMs)
+          : await callOneBot("upload_group_file", {
+            group_id: uploadGroupId,
+            file: normalizedInput.filePath,
+            name: normalizedInput.fileName,
+            upload_file: true,
+          }, fileUploadTimeoutMs);
       } catch (error) {
+        let recovery = null;
+        let recoveryError = null;
+        if (error.outcomeUnknown) {
+          try {
+            recovery = await recoverUnknownFileUpload({
+              binding,
+              targetType,
+              uploadGroupId,
+              uploadUserId,
+              normalizedInput,
+            });
+          } catch (recoveryFailure) {
+            recoveryError = publicError(recoveryFailure);
+          }
+        }
+        if (recovery?.fileId) {
+          const recoveredAttachment = recovery.fileMessage?.attachments.find((attachment) =>
+            attachmentMatchesFile(attachment, normalizedInput, recovery.fileId)
+          ) ?? null;
+          const attachmentBusId = Number(recoveredAttachment?.busId);
+          const fileBusId = Number.isSafeInteger(attachmentBusId) && recoveredAttachment?.busId !== null
+            ? attachmentBusId
+            : (Number.isSafeInteger(Number(recovery.verifiedFile?.busid)) ? Number(recovery.verifiedFile.busid) : null);
+          const finalState = loadState(statePath);
+          finalState.entries[normalizedInput.dedupeKey] = {
+            ...finalState.entries[normalizedInput.dedupeKey],
+            status: "sent_verified",
+            verified: true,
+            fileId: recovery.fileId,
+            verifiedFileId: String(recovery.verifiedFile?.file_id ?? ""),
+            fileMessageId: String(recovery.fileMessage?.messageId ?? ""),
+            fileMessageSeq: String(recovery.fileMessage?.messageSeq ?? ""),
+            fileBusId,
+            fileMessageLookupError: recovery.fileMessageLookupError,
+            recoveredFromUnknownUpload: true,
+            uploadError: publicError(error),
+            updatedAt: now().toISOString(),
+          };
+          const statePersistenceError = writeStateAfterSideEffect(finalState);
+          const taskIndex = targetType === "group" && normalizedInput.hasTaskId
+            ? await sendTaskFileIndex(binding, normalizedInput, {
+              fileId: recovery.fileId,
+              messageSeq: String(recovery.fileMessage?.messageSeq ?? ""),
+              busId: fileBusId,
+              fileName: normalizedInput.fileName,
+              fileBytes: normalizedInput.fileBytes,
+              sha256: fileSha256,
+            })
+            : null;
+          return {
+            sent: true,
+            verified: true,
+            recoveredFromUnknownUpload: true,
+            uploadError: publicError(error),
+            fileId: recovery.fileId,
+            verifiedFileId: String(recovery.verifiedFile?.file_id ?? ""),
+            verificationError: null,
+            fileMessageId: String(recovery.fileMessage?.messageId ?? ""),
+            fileMessageSeq: String(recovery.fileMessage?.messageSeq ?? ""),
+            fileBusId,
+            fileMessageLookupError: recovery.fileMessageLookupError,
+            fileName: normalizedInput.fileName,
+            fileBytes: normalizedInput.fileBytes,
+            sha256: fileSha256,
+            target: resolvedTarget,
+            identity: targetCheck.login,
+            dedupeKey: normalizedInput.dedupeKey,
+            deliveryId: normalizedInput.deliveryId,
+            ...persistenceResult(statePersistenceError),
+            ...(taskIndex ? { taskIndex } : {}),
+          };
+        }
         const failedState = loadState(statePath);
         failedState.entries[normalizedInput.dedupeKey] = {
           ...failedState.entries[normalizedInput.dedupeKey],
           status: error.outcomeUnknown ? "pending_send" : "failed_before_ack",
           updatedAt: now().toISOString(),
           error: publicError(error),
+          recoveryError,
         };
         try {
           writeState(statePath, failedState);
@@ -1739,31 +1987,68 @@ export function createNapCatNotifier(options = {}) {
       let verified = false;
       let verificationError = null;
       let verifiedFile = null;
+      let fileMessage = null;
+      let fileMessageLookupError = null;
       try {
-        const rootFiles = await callOneBot("get_group_root_files", {
-          group_id: binding.groupId,
-          file_count: 100,
-        });
-        const candidates = Array.isArray(rootFiles?.files) ? rootFiles.files : [];
-        verifiedFile = candidates.find((file) =>
-          String(file?.file_name ?? "") === normalizedInput.fileName
-          && Number(file?.file_size ?? file?.size ?? -1) === normalizedInput.fileBytes
-          && (!file?.uploader || String(file.uploader) === binding.expectedSelfId)
-        ) ?? null;
-        if (!verifiedFile) {
-          throw new NapCatNotifierError("FILE_VERIFY_MISSING", "群文件列表中未找到刚上传的同名同大小文件");
+        if (targetType === "private") {
+          const history = await callOneBot("get_friend_msg_history", {
+            user_id: uploadUserId,
+            count: 50,
+            reverse_order: true,
+            disable_get_url: true,
+            parse_mult_msg: false,
+            quick_reply: false,
+          });
+          const candidates = (Array.isArray(history?.messages) ? history.messages : [])
+            .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+          fileMessage = candidates.find((message) =>
+            message.isSelf
+            && message.attachments.some((attachment) =>
+              attachment.fileId === fileId
+              || (
+                attachment.fileName === normalizedInput.fileName
+                && attachment.fileBytes === normalizedInput.fileBytes
+              )
+            )
+          ) ?? null;
+          const messageAttachment = fileMessage?.attachments.find((attachment) =>
+            attachment.fileId === fileId
+            || (
+              attachment.fileName === normalizedInput.fileName
+              && attachment.fileBytes === normalizedInput.fileBytes
+            )
+          ) ?? null;
+          if (!messageAttachment) {
+            throw new NapCatNotifierError("PRIVATE_FILE_VERIFY_MISSING", "私聊最近消息中未找到刚上传的同名同大小文件");
+          }
+          verifiedFile = {
+            file_id: messageAttachment.fileId,
+            busid: messageAttachment.busId,
+          };
+        } else {
+          const rootFiles = await callOneBot("get_group_root_files", {
+            group_id: uploadGroupId,
+            file_count: 100,
+          });
+          const candidates = Array.isArray(rootFiles?.files) ? rootFiles.files : [];
+          verifiedFile = candidates.find((file) =>
+            String(file?.file_name ?? "") === normalizedInput.fileName
+            && Number(file?.file_size ?? file?.size ?? -1) === normalizedInput.fileBytes
+            && (!file?.uploader || String(file.uploader) === binding.expectedSelfId)
+          ) ?? null;
+          if (!verifiedFile) {
+            throw new NapCatNotifierError("FILE_VERIFY_MISSING", "群文件列表中未找到刚上传的同名同大小文件");
+          }
         }
         verified = true;
       } catch (error) {
         verificationError = publicError(error);
       }
 
-      let fileMessage = null;
-      let fileMessageLookupError = null;
-      if (normalizedInput.hasTaskId) {
+      if (targetType === "group" && normalizedInput.hasTaskId) {
         try {
           const history = await callOneBot("get_group_msg_history", {
-            group_id: binding.groupId,
+            group_id: uploadGroupId,
             count: 50,
             reverse_order: true,
             disable_get_url: true,
@@ -1849,7 +2134,7 @@ export function createNapCatNotifier(options = {}) {
         fileName: normalizedInput.fileName,
         fileBytes: normalizedInput.fileBytes,
         sha256: fileSha256,
-        target: targetCheck.group,
+        target: resolvedTarget,
         identity: targetCheck.login,
         dedupeKey: normalizedInput.dedupeKey,
         deliveryId: normalizedInput.deliveryId,
@@ -1860,6 +2145,28 @@ export function createNapCatNotifier(options = {}) {
       if (releaseDedupeLock) releaseDedupeLock();
       inFlight.delete(normalizedInput.dedupeKey);
     }
+  }
+
+  async function sendFile(input) {
+    return sendFileToGroupTarget(input);
+  }
+
+  async function sendConfiguredFile(input) {
+    const binding = loadBinding();
+    const controlPlane = requireControlPlane(binding);
+    const targetKey = boundedString(
+      input.target_key || controlPlane.defaultTargetKey,
+      "target_key",
+      64,
+      true,
+    );
+    if (input.task_id || input.source_machine || input.target_machine) {
+      throw new NapCatNotifierError(
+        "INVALID_ARGUMENT",
+        "napcat_send_configured_file 不发送跨机任务索引；如需训练群任务文件，请继续使用 napcat_send_file",
+      );
+    }
+    return sendFileToGroupTarget(input, targetKey);
   }
 
   async function sendFixedMessage(binding, normalizedInput, configuredTargetKey = "") {
@@ -2148,11 +2455,13 @@ export function createNapCatNotifier(options = {}) {
     previewTrainingEvent,
     previewTextMessage,
     previewFile,
+    previewConfiguredFile,
     downloadFile,
     sendTrainingEvent,
     sendTextMessage,
     sendControlGroupMessage,
     sendConfiguredMessage,
     sendFile,
+    sendConfiguredFile,
   };
 }

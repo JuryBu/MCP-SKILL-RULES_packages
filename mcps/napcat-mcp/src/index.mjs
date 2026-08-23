@@ -147,6 +147,19 @@ const fileInputSchema = {
   additionalProperties: false,
 };
 
+const configuredFileInputSchema = {
+  type: "object",
+  properties: {
+    target_key: { type: "string", minLength: 1, maxLength: 64, description: "binding.controlPlane.targets 中已配置的群聊或私聊目标 key；不会降级到固定训练群。" },
+    file_path: { type: "string", minLength: 1, maxLength: 4096, description: "本机待上传文件的绝对路径。" },
+    name: { type: "string", minLength: 1, maxLength: 255, description: "可选文件显示名，不能包含目录。" },
+    dedupe_key: { type: "string", minLength: 1, maxLength: 200, description: "唯一去重键；同一次重试必须复用。" },
+    delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成。" },
+  },
+  required: ["target_key", "file_path", "dedupe_key"],
+  additionalProperties: false,
+};
+
 const downloadInputSchema = {
   type: "object",
   properties: {
@@ -496,6 +509,18 @@ const tools = [
     inputSchema: fileInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
+  {
+    name: "napcat_preview_configured_file",
+    description: "读取本机文件大小并计算 SHA256，预览 binding.controlPlane.targets 里指定的群聊或私聊目标；不会继承或降级到固定 ExampleGroup。",
+    inputSchema: configuredFileInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_send_configured_file",
+    description: "向 binding.controlPlane.targets 里指定的群聊或私聊目标上传一个本机文件；group 走群文件上传与群文件列表核验，private 走私聊文件上传并从私聊历史尽力回读核验；不会发送跨机任务索引，也不会改用固定 ExampleGroup。",
+    inputSchema: configuredFileInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
 ];
 
 function textResult(value, isError = false) {
@@ -690,6 +715,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         );
       }
       return textResult({ ok: true, ...result });
+    }
+    if (name === "napcat_preview_configured_file") {
+      return textResult({ ok: true, ...(await notifier.previewConfiguredFile(args)) });
+    }
+    if (name === "napcat_send_configured_file") {
+      return textResult({ ok: true, ...(await notifier.sendConfiguredFile(args)) });
     }
     throw new NapCatNotifierError("UNKNOWN_TOOL", `未知工具：${name}`);
   } catch (error) {

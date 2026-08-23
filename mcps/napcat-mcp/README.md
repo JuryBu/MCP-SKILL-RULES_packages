@@ -11,7 +11,7 @@
 | 工具组 | 代表工具 | 用途 |
 |---|---|---|
 | 状态与目标 | `napcat_status`、`napcat_discover_target` | 检查 OneBot、登录账号和固定群身份 |
-| 消息与文件 | `napcat_read_recent`、`napcat_download_file`、`napcat_send_text`、`napcat_send_file` | 按固定群读取、下载、发送与上传；任务文件会附带结构化索引 |
+| 消息与文件 | `napcat_read_recent`、`napcat_download_file`、`napcat_send_text`、`napcat_send_file`、`napcat_send_configured_file` | 按固定群读取、下载、发送与上传；配置群/私聊目标可单独上传文件；任务文件会附带结构化索引 |
 | 任务账本 | `napcat_task_register`、`napcat_task_update`、`napcat_task_status`、`napcat_task_list` | 维护任务、Codex 对话、角色、可信对端、代次和唤醒冷却 |
 | 任务完成 | `napcat_task_ack`、`napcat_task_close` | 处理完明确消息序号后确认，任务结束后关闭路由 |
 | 送达与重连 | `napcat_delivery_status`、`napcat_connection_request` | 查询对端机器/对话送达状态，或向已知对端对话提出重新建链请求 |
@@ -59,6 +59,12 @@
 `napcat_send_file` 只接受本机绝对文件路径、可选显示文件名和去重键，不接受群号。上传前会确认文件存在、不是空文件、大小未超限，计算 SHA256，再次校验登录账号和固定绑定群；上传后调用 `get_group_root_files`，按文件名、大小和可用的上传者信息核验。
 
 若上传请求超时、连接中断、HTTP 错误或缺少 `file_id`，结果按未知处理，同一去重键不会自动重传。正式训练回包应先完成本地双重验包和外置 SHA256，再上传 ZIP；上传结果、群文件 ID、文件大小和 SHA256 写入回包 manifest。
+
+## 配置目标群文件上传
+
+`napcat_preview_configured_file` 与 `napcat_send_configured_file` 用于把本机文件发送到私有 `binding.controlPlane.targets` 中预先命名的群聊或私聊目标。调用方必须传 `target_key`、本机绝对 `file_path` 和 `dedupe_key`；工具会先校验当前登录账号，群聊目标会校验群名和可选成员数，私聊目标会校验目标在好友列表中。群聊发送使用 NapCat `upload_group_file` 并通过群文件列表回读验证；私聊发送使用 NapCat `upload_private_file`，并尽力从最近私聊历史中回读同名同大小文件。它不会接受临时群号或临时 QQ 号，也不会在配置目标失败时降级到固定 ExampleGroup。
+
+配置目标文件工具不会发送跨机任务文件索引；需要训练机任务回包索引时继续使用固定群的 `napcat_send_file`。原 `napcat_send_file` 仍然只走固定 ExampleGroup/训练群，不会继承 `controlPlane.defaultTargetKey`。
 
 ## 固定群文件读取与下载
 
