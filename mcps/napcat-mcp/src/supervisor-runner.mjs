@@ -13,6 +13,7 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
 export const DEFAULT_LOGIN_TIMEOUT_MS = 35_000;
 export const DEFAULT_LOGIN_COOLDOWN_MS = 120_000;
 export const DEFAULT_STALE_NAPCAT_OFFLINE_MS = 120_000;
+export const DEFAULT_STALE_NAPCAT_UNKNOWN_MS = 180_000;
 export const DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS = 300_000;
 export const DEFAULT_BROKER_START_COOLDOWN_MS = 60_000;
 export const DEFAULT_STOP_POLL_MS = 250;
@@ -35,6 +36,7 @@ const CLI_OPTIONS = new Set([
   "login-timeout-ms",
   "login-cooldown-ms",
   "stale-napcat-offline-ms",
+  "stale-napcat-unknown-ms",
   "stale-napcat-recovery-cooldown-ms",
   "broker-start-cooldown-ms",
   "automation-maintenance",
@@ -408,6 +410,11 @@ export function parseArguments(argv) {
     "--stale-napcat-offline-ms",
     DEFAULT_STALE_NAPCAT_OFFLINE_MS,
   );
+  const staleNapCatUnknownMs = normalizePositiveInteger(
+    values["stale-napcat-unknown-ms"],
+    "--stale-napcat-unknown-ms",
+    DEFAULT_STALE_NAPCAT_UNKNOWN_MS,
+  );
   const staleNapCatRecoveryCooldownMs = normalizePositiveInteger(
     values["stale-napcat-recovery-cooldown-ms"],
     "--stale-napcat-recovery-cooldown-ms",
@@ -440,6 +447,7 @@ export function parseArguments(argv) {
     loginTimeoutMs,
     loginCooldownMs,
     staleNapCatOfflineMs,
+    staleNapCatUnknownMs,
     staleNapCatRecoveryCooldownMs,
     brokerStartCooldownMs,
     automationMaintenancePath,
@@ -1154,6 +1162,11 @@ export async function runSupervisorService(options = {}) {
     "staleNapCatOfflineMs",
     DEFAULT_STALE_NAPCAT_OFFLINE_MS,
   );
+  const staleNapCatUnknownMs = normalizePositiveInteger(
+    options.staleNapCatUnknownMs,
+    "staleNapCatUnknownMs",
+    DEFAULT_STALE_NAPCAT_UNKNOWN_MS,
+  );
   const staleNapCatRecoveryCooldownMs = normalizePositiveInteger(
     options.staleNapCatRecoveryCooldownMs,
     "staleNapCatRecoveryCooldownMs",
@@ -1247,6 +1260,8 @@ export async function runSupervisorService(options = {}) {
       blockedReason: previousLogin.blockedReason ?? null,
       offlineProcessSince: previousLogin.offlineProcessSince ?? null,
       offlineProcessFingerprint: previousLogin.offlineProcessFingerprint ?? null,
+      unknownProcessSince: previousLogin.unknownProcessSince ?? null,
+      unknownProcessFingerprint: previousLogin.unknownProcessFingerprint ?? null,
       staleRecoveryLastAttemptAt: previousLogin.staleRecoveryLastAttemptAt ?? null,
       staleRecoveryNextAllowedAt: previousLogin.staleRecoveryNextAllowedAt ?? null,
       staleRecoveryCount: Number(previousLogin.staleRecoveryCount ?? 0),
@@ -1296,6 +1311,8 @@ export async function runSupervisorService(options = {}) {
   let loginBlockedReason = previousLogin.blockedReason ?? null;
   let offlineProcessSince = previousLogin.offlineProcessSince ?? null;
   let offlineProcessFingerprint = previousLogin.offlineProcessFingerprint ?? null;
+  let unknownProcessSince = previousLogin.unknownProcessSince ?? null;
+  let unknownProcessFingerprint = previousLogin.unknownProcessFingerprint ?? null;
   let staleRecoveryLastAttemptAt = previousLogin.staleRecoveryLastAttemptAt ?? null;
   let staleRecoveryNextAllowedAt = previousLogin.staleRecoveryNextAllowedAt ?? null;
   let staleRecoveryCount = Number(previousLogin.staleRecoveryCount ?? 0);
@@ -1440,7 +1457,11 @@ export async function runSupervisorService(options = {}) {
 
       const napcatProcess = normalizeProcessCheck(await capture(
         checkNapCatProcess,
-        { napcatRoot: options.napcatRoot, timeoutMs: probeTimeoutMs },
+        {
+          napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+          qqExePath: options.qqExePath ?? dependencies.qqExePath,
+          timeoutMs: probeTimeoutMs,
+        },
         { known: false, present: false },
       ));
       if (napcatProcess.error) errors.push({ source: "napcat_process", error: napcatProcess.error });
@@ -1557,11 +1578,36 @@ export async function runSupervisorService(options = {}) {
       const offlineProcessDurationMs = Number.isFinite(parsedOfflineProcessSince)
         ? Math.max(0, nowMs(clock) - parsedOfflineProcessSince)
         : 0;
+      const unknownProcessKnown = Boolean(
+        !napcat.known
+        && napcatRuntime.known
+        && napcatRuntime.ready
+        && napcatProcess.known
+        && napcatProcess.present
+      );
+      const currentUnknownProcessFingerprint = unknownProcessKnown
+        ? processSnapshotFingerprint(napcatProcess.processes)
+        : null;
+      if (napcat.ready || napcat.known || (napcatProcess.known && !napcatProcess.present)) {
+        unknownProcessSince = null;
+        unknownProcessFingerprint = null;
+      } else if (unknownProcessKnown && currentUnknownProcessFingerprint !== unknownProcessFingerprint) {
+        unknownProcessSince = checkAt;
+        unknownProcessFingerprint = currentUnknownProcessFingerprint;
+      } else if (unknownProcessKnown && !unknownProcessSince) {
+        unknownProcessSince = checkAt;
+      }
+      const parsedUnknownProcessSince = Date.parse(unknownProcessSince ?? "");
+      const unknownProcessDurationMs = Number.isFinite(parsedUnknownProcessSince)
+        ? Math.max(0, nowMs(clock) - parsedUnknownProcessSince)
+        : 0;
+      const staleProcessTrigger = offlineProcessKnown && offlineProcessDurationMs >= staleNapCatOfflineMs
+        ? "explicit_offline"
+        : (unknownProcessKnown && unknownProcessDurationMs >= staleNapCatUnknownMs ? "status_unknown" : null);
       let staleProcessRecovered = false;
       if (
-        offlineProcessKnown
+        staleProcessTrigger
         && !loginBlocked
-        && offlineProcessDurationMs >= staleNapCatOfflineMs
         && cooldownReady(staleRecoveryLastAttemptAt, clock, staleNapCatRecoveryCooldownMs)
       ) {
         staleRecoveryLastAttemptAt = checkAt;
@@ -1570,16 +1616,20 @@ export async function runSupervisorService(options = {}) {
           const stopped = await stopNapCatProcessTrees({
             processes: napcatProcess.processes,
             napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+            qqExePath: options.qqExePath ?? dependencies.qqExePath,
             startedAt: checkAt,
           });
           staleRecoveryCount += 1;
           staleRecoveryLastResult = "stopped";
           offlineProcessSince = null;
           offlineProcessFingerprint = null;
+          unknownProcessSince = null;
+          unknownProcessFingerprint = null;
           staleProcessRecovered = true;
           actions.staleNapCatRecovery = {
             attempted: true,
             succeeded: true,
+            trigger: staleProcessTrigger,
             stoppedProcessIds: stopped.rootProcessIds ?? [],
           };
         } catch (error) {
@@ -1588,15 +1638,21 @@ export async function runSupervisorService(options = {}) {
           actions.staleNapCatRecovery = { attempted: true, succeeded: false, error: value };
           errors.push({ source: "stale_napcat_recovery", error: value });
         }
-      } else if (offlineProcessKnown) {
+      } else if (offlineProcessKnown || unknownProcessKnown) {
+        const activeDurationMs = offlineProcessKnown ? offlineProcessDurationMs : unknownProcessDurationMs;
+        const activeThresholdMs = offlineProcessKnown ? staleNapCatOfflineMs : staleNapCatUnknownMs;
         actions.staleNapCatRecovery = {
           attempted: false,
+          trigger: offlineProcessKnown ? "explicit_offline" : "status_unknown",
           reason: loginBlocked
             ? "manual_login_required"
-            : (offlineProcessDurationMs < staleNapCatOfflineMs ? "grace_period" : "cooldown"),
+            : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown"),
           offlineProcessSince,
           offlineProcessFingerprint,
           offlineProcessDurationMs,
+          unknownProcessSince,
+          unknownProcessFingerprint,
+          unknownProcessDurationMs,
         };
       }
 
@@ -1886,6 +1942,8 @@ export async function runSupervisorService(options = {}) {
         blockedReason: loginBlockedReason,
         offlineProcessSince,
         offlineProcessFingerprint,
+        unknownProcessSince,
+        unknownProcessFingerprint,
         staleRecoveryLastAttemptAt,
         staleRecoveryNextAllowedAt,
         staleRecoveryCount,

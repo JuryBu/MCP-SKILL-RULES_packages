@@ -192,7 +192,7 @@ try {
 $QuickPasswordMd5 = Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
 $HasPasswordFallback = -not [string]::IsNullOrWhiteSpace($QuickPasswordMd5)
 $StartedAtUtc = [DateTime]::UtcNow
-$PasswordFallbackDeadlineUtc = $StartedAtUtc.AddSeconds([Math]::Min(45, [Math]::Max(15, [Math]::Floor($TimeoutSeconds / 3))))
+$PasswordFallbackDeadlineUtc = $StartedAtUtc.AddSeconds([Math]::Min(60, [Math]::Max(25, $TimeoutSeconds - 5)))
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
 $LogPath = Join-Path $LogDirectory "codex-login-$Stamp.log"

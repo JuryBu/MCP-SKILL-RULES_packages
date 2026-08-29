@@ -106,6 +106,7 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
       "--login-script", fixture.loginScriptPath,
       "--napcat-root", fixture.napcatRoot,
       "--qq-exe-path", fixture.qqExePath,
+      "--stale-napcat-unknown-ms", "180000",
     ]);
     assert.equal(parsed.scanIntervalMs, 30000);
     assert.equal(parsed.brokerHealthUrl, "http://127.0.0.1:14588/health");
@@ -113,6 +114,7 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
     assert.equal(parsed.loginScriptPath, path.resolve(fixture.loginScriptPath));
     assert.equal(parsed.napcatRoot, path.resolve(fixture.napcatRoot));
     assert.equal(parsed.qqExePath, path.resolve(fixture.qqExePath));
+    assert.equal(parsed.staleNapCatUnknownMs, 180_000);
     assert.throws(() => parseArguments(["--binding", fixture.bindingPath]), /缺少参数 --registry/);
     assert.throws(() => parseArguments([
       "--binding", fixture.bindingPath,
@@ -227,7 +229,7 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
 });
 
-test("缺失 online 字段属于未知状态，不能累计到陈旧进程自动停止", async () => {
+test("单次缺失 online 字段只开始未知状态宽限期，不会立即停止进程", async () => {
   const fixture = createFixture();
   let stopCount = 0;
   const processes = [{ pid: 6001, parentPid: 5000, name: "node.exe" }];
@@ -249,6 +251,10 @@ test("缺失 online 字段属于未知状态，不能累计到陈旧进程自动
       },
     }));
     assert.equal(stopCount, 0);
+    const runtime = readRuntime(fixture);
+    assert.equal(runtime.login.unknownProcessSince, "2026-07-24T08:00:00.000Z");
+    assert.equal(runtime.actions.staleNapCatRecovery.trigger, "status_unknown");
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "grace_period");
   } finally {
     fixture.cleanup();
   }
@@ -650,37 +656,123 @@ test("NapCat 连续离线超过宽限期时只停止匹配进程树并立即无�
   }
 });
 
-test("人工登录阻断或未知状态时不会停止现有 NapCat 进程", async () => {
-  for (const scenario of ["blocked", "unknown"]) {
-    const fixture = createFixture();
-    let stopCount = 0;
-    try {
-      if (scenario === "blocked") {
-        atomicWriteJson(fixture.runtimeStatePath, {
-          login: {
-            blocked: true,
-            blockedAt: "2026-07-24T07:00:00.000Z",
-            blockedReason: { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "需要人工登录" },
-            offlineProcessSince: "2026-07-24T07:00:00.000Z",
-          },
-        });
-      }
-      await runSupervisorService(baseOptions(fixture, {
-        now: () => new Date("2026-07-24T08:00:00.000Z"),
-        staleNapCatOfflineMs: 60_000,
-        checkNapCatStatus: async () => scenario === "unknown"
-          ? ({ known: false, reachable: false, online: false, accountMatches: false, error: { code: "TIMEOUT", message: "timeout" } })
-          : ({ known: true, reachable: true, online: false, accountMatches: false }),
-        checkNapCatProcesses: async () => ({ known: true, present: true, processes: [{ pid: 6001, parentPid: 5000, name: "cmd.exe" }] }),
-        getOpenTaskCount: async () => 0,
-        stopNapCatProcesses() {
-          stopCount += 1;
-        },
-      }));
-      assert.equal(stopCount, 0, scenario);
-    } finally {
-      fixture.cleanup();
-    }
+test("人工登录阻断时不会停止现有 NapCat 进程", async () => {
+  const fixture = createFixture();
+  let stopCount = 0;
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        blocked: true,
+        blockedAt: "2026-07-24T07:00:00.000Z",
+        blockedReason: { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "需要人工登录" },
+        offlineProcessSince: "2026-07-24T07:00:00.000Z",
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      staleNapCatOfflineMs: 60_000,
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes: [{ pid: 6001, parentPid: 5000, name: "cmd.exe" }] }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses() {
+        stopCount += 1;
+      },
+    }));
+    assert.equal(stopCount, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat 状态持续未知超过宽限期时停止同一进程树并立即无二维码恢复", async () => {
+  const fixture = createFixture();
+  let currentTime = new Date("2026-07-24T08:00:00.000Z");
+  let waitCount = 0;
+  const processes = [
+    { pid: 6301, parentPid: 5300, name: "cmd.exe" },
+    { pid: 6302, parentPid: 6301, name: "node.exe" },
+  ];
+  const stopCalls = [];
+  const loginCalls = [];
+  try {
+    await runSupervisorService(baseOptions(fixture, {
+      once: false,
+      now: () => currentTime,
+      scanIntervalMs: 60_000,
+      staleNapCatUnknownMs: 180_000,
+      staleNapCatRecoveryCooldownMs: 300_000,
+      checkNapCatStatus: async () => ({
+        known: false,
+        reachable: false,
+        online: false,
+        accountMatches: false,
+        error: { code: "ONEBOT_TIMEOUT", message: "timeout" },
+      }),
+      checkNapCatRuntime: async () => ({ known: true, ready: true, requiredFiles: [], missingFiles: [] }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses(input) {
+        stopCalls.push(input);
+        return { stopped: true, rootProcessIds: [6301] };
+      },
+      quickLogin(input) {
+        loginCalls.push(input);
+      },
+      wait: async () => {
+        waitCount += 1;
+        currentTime = new Date(currentTime.getTime() + 60_000);
+        if (waitCount >= 4) fs.writeFileSync(fixture.stopFilePath, "stop\n", "utf8");
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCalls.length, 1);
+    assert.deepEqual(stopCalls[0].processes.map((item) => item.pid), [6301, 6302]);
+    assert.equal(stopCalls[0].qqExePath, fixture.qqExePath);
+    assert.equal(loginCalls.length, 1);
+    assert.equal(loginCalls[0].noQr, true);
+    assert.equal(runtime.actions.staleNapCatRecovery.succeeded, true);
+    assert.equal(runtime.actions.staleNapCatRecovery.trigger, "status_unknown");
+    assert.equal(runtime.login.unknownProcessSince, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("未知状态期间 NapCat 进程身份变化会重新开始宽限期", async () => {
+  const fixture = createFixture();
+  const currentProcesses = [{ pid: 6401, parentPid: 5400, name: "node.exe" }];
+  let stopCount = 0;
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        unknownProcessSince: "2026-07-24T07:00:00.000Z",
+        unknownProcessFingerprint: "old-process-fingerprint",
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      staleNapCatUnknownMs: 60_000,
+      checkNapCatStatus: async () => ({
+        known: false,
+        reachable: false,
+        online: false,
+        accountMatches: false,
+        error: { code: "ONEBOT_TIMEOUT", message: "timeout" },
+      }),
+      checkNapCatRuntime: async () => ({ known: true, ready: true, requiredFiles: [], missingFiles: [] }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes: currentProcesses }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses() {
+        stopCount += 1;
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCount, 0);
+    assert.equal(runtime.login.unknownProcessSince, "2026-07-24T08:00:00.000Z");
+    assert.equal(runtime.login.unknownProcessFingerprint, processSnapshotFingerprint(currentProcesses));
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "grace_period");
+  } finally {
+    fixture.cleanup();
   }
 });
 
