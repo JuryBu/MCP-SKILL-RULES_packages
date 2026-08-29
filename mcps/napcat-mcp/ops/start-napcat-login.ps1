@@ -5,12 +5,14 @@ param(
   [string]$DataRoot = "",
   [string]$BrokerRoot = "",
   [string]$CodexHome = "",
+  [string]$QuickLoginCredentialPath = "",
   [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
   [switch]$NoQr
 )
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+. (Join-Path $PSScriptRoot "napcat-quick-login-credential.ps1")
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 if ([string]::IsNullOrWhiteSpace($CodexHome)) { $CodexHome = Join-Path $env:USERPROFILE ".codex" }
 if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {
@@ -50,9 +52,13 @@ $CoreModule = Join-Path $NapCatRoot "napcat.mjs"
 $BootMain = Join-Path $NapCatRoot "NapCatWinBootMain.exe"
 $HookModule = Join-Path $NapCatRoot "NapCatWinBootHook.dll"
 $LoaderModule = Join-Path $NapCatRoot "loadNapCat.js"
-$QrCodePath = Join-Path $NapCatRoot "cache\qrcode.png"
+$QrCodePaths = @(
+  (Join-Path $NapCatRoot "napcat\cache\qrcode.png"),
+  (Join-Path $NapCatRoot "cache\qrcode.png")
+) | Select-Object -Unique
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
 $BindingPath = Join-Path $DataRoot "binding.json"
+$DefaultCredentialPath = Join-Path $DataRoot "private\napcat-login\credential.json"
 $LogDirectory = Join-Path $NapCatRoot "logs"
 if (-not (Test-Path -LiteralPath $CoreModule -PathType Leaf)) {
   throw "[NAPCAT_RUNTIME_INCOMPLETE] NapCat 核心模块缺失：$CoreModule。可能被安全软件隔离或安装损坏，这不表示快速登录授权已过期。"
@@ -75,6 +81,16 @@ $BaseUrl = ([string]$PrivateEnv.NAPCAT_HTTP_URL).TrimEnd("/")
 $Token = [string]$PrivateEnv.NAPCAT_ACCESS_TOKEN
 $ExpectedSelfId = [string]$Binding.expectedSelfId
 $ExpectedNickname = [string]$Binding.expectedNickname
+if ([string]::IsNullOrWhiteSpace($QuickLoginCredentialPath)) {
+  $QuickLoginCredentialPath = if (-not [string]::IsNullOrWhiteSpace([string]$PrivateEnv.NAPCAT_QUICK_LOGIN_CREDENTIAL_PATH)) {
+    [string]$PrivateEnv.NAPCAT_QUICK_LOGIN_CREDENTIAL_PATH
+  } else {
+    $DefaultCredentialPath
+  }
+}
+$QuickLoginCredentialPath = [System.IO.Path]::GetFullPath($QuickLoginCredentialPath)
+$QuickPasswordMd5 = $null
+$HasPasswordFallback = $false
 if ($BaseUrl -notmatch '^https?://(127\.0\.0\.1|localhost)(:\d+)?$') {
   throw "NAPCAT_HTTP_URL 不是本机回环地址，拒绝连接"
 }
@@ -84,6 +100,16 @@ function Invoke-OneBot {
   param([string]$Action)
   $Headers = @{ Authorization = "Bearer $Token" }
   return Invoke-RestMethod -Method Post -Uri "$BaseUrl/$Action" -Headers $Headers -ContentType "application/json" -Body "{}" -TimeoutSec 3
+}
+
+function Get-FreshQrCode {
+  param([DateTime]$NotBeforeUtc)
+  return @($QrCodePaths | ForEach-Object {
+    if (Test-Path -LiteralPath $_) {
+      $Candidate = Get-Item -LiteralPath $_
+      if ($Candidate.LastWriteTimeUtc -ge $NotBeforeUtc) { $Candidate }
+    }
+  } | Sort-Object LastWriteTimeUtc -Descending)[0]
 }
 
 function Assert-ExpectedLogin {
@@ -163,7 +189,10 @@ try {
   if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
 }
 
+$QuickPasswordMd5 = Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
+$HasPasswordFallback = -not [string]::IsNullOrWhiteSpace($QuickPasswordMd5)
 $StartedAtUtc = [DateTime]::UtcNow
+$PasswordFallbackDeadlineUtc = $StartedAtUtc.AddSeconds([Math]::Min(45, [Math]::Max(15, [Math]::Floor($TimeoutSeconds / 3))))
 $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
 $LogPath = Join-Path $LogDirectory "codex-login-$Stamp.log"
@@ -172,9 +201,6 @@ $EmptyInputPath = Join-Path $LogDirectory ".codex-empty-input"
 if (-not (Test-Path -LiteralPath $EmptyInputPath)) {
   [System.IO.File]::WriteAllText($EmptyInputPath, "", (New-Object System.Text.UTF8Encoding($false)))
 }
-$StartupInfo = ([WmiClass]"Win32_ProcessStartup").CreateInstance()
-$StartupInfo.ShowWindow = 0
-$ProcessClass = [WmiClass]"Win32_Process"
 $LauncherArguments = ""
 if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
   $LauncherArguments = " `"$ExpectedSelfId`""
@@ -182,18 +208,35 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
   throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
 }
 if ([string]::IsNullOrWhiteSpace($QqExePath)) {
-  $CommandLine = "$env:ComSpec /d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+  $CommandArguments = "/d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 } else {
   $CoreUri = ([Uri]$CoreModule).AbsoluteUri
   $LoaderSource = "(async () => {await import(`"$CoreUri`")})()"
   [System.IO.File]::WriteAllText($LoaderModule, $LoaderSource, (New-Object System.Text.UTF8Encoding($false)))
-  $CommandLine = "$env:ComSpec /d /c `"`"$BootMain`" `"$QqExePath`" `"$HookModule`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+  $CommandArguments = "/d /c `"`"$BootMain`" `"$QqExePath`" `"$HookModule`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 }
-$CreateResult = $ProcessClass.Create($CommandLine, $NapCatRoot, $StartupInfo)
-if ([int]$CreateResult.ReturnValue -ne 0 -or [int]$CreateResult.ProcessId -le 0) {
-  throw "NapCat 无窗口进程启动失败，WMI returnValue=$($CreateResult.ReturnValue)"
+$StartInfo = New-Object System.Diagnostics.ProcessStartInfo
+$StartInfo.FileName = $env:ComSpec
+$StartInfo.Arguments = $CommandArguments
+$StartInfo.WorkingDirectory = $NapCatRoot
+$StartInfo.UseShellExecute = $false
+$StartInfo.CreateNoWindow = $true
+$StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+try {
+  if ($HasPasswordFallback) {
+    $StartInfo.EnvironmentVariables["NAPCAT_QUICK_ACCOUNT"] = $ExpectedSelfId
+    $StartInfo.EnvironmentVariables["NAPCAT_QUICK_PASSWORD_MD5"] = $QuickPasswordMd5
+  }
+  $StartedProcess = [System.Diagnostics.Process]::Start($StartInfo)
+} finally {
+  $StartInfo.EnvironmentVariables.Remove("NAPCAT_QUICK_ACCOUNT")
+  $StartInfo.EnvironmentVariables.Remove("NAPCAT_QUICK_PASSWORD_MD5")
+  $QuickPasswordMd5 = $null
 }
-$ProcessId = [int]$CreateResult.ProcessId
+if ($null -eq $StartedProcess -or [int]$StartedProcess.Id -le 0) {
+  throw "NapCat hidden process failed to start"
+}
+$ProcessId = [int]$StartedProcess.Id
 $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $QrWindow = $null
 while ([DateTime]::UtcNow -lt $Deadline) {
@@ -228,11 +271,20 @@ while ([DateTime]::UtcNow -lt $Deadline) {
       throw
     }
   }
-  if (-not $NoQr -and $null -eq $QrWindow -and (Test-Path -LiteralPath $QrCodePath)) {
-    $QrCode = Get-Item -LiteralPath $QrCodePath
-    if ($QrCode.LastWriteTimeUtc -ge $StartedAtUtc.AddSeconds(-2)) {
-      $QrWindow = New-QrWindow -ImagePath $QrCode.FullName
-    }
+  $QrCode = Get-FreshQrCode -NotBeforeUtc $StartedAtUtc.AddSeconds(-2)
+  $PasswordFallbackNeedsHuman = $false
+  if ($NoQr -and $HasPasswordFallback -and (Test-Path -LiteralPath $LogPath)) {
+    $RecentLoginLog = (Get-Content -LiteralPath $LogPath -Encoding UTF8 -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
+    $PasswordFallbackNeedsHuman = $RecentLoginLog -match '密码回退(?:登录失败|需要验证码|需要新设备验证|需要异常设备验证)'
+  }
+  if ($NoQr -and $null -ne $QrCode -and (-not $HasPasswordFallback -or $PasswordFallbackNeedsHuman -or [DateTime]::UtcNow -ge $PasswordFallbackDeadlineUtc)) {
+    Close-QrWindow -Window $QrWindow
+    Stop-LaunchedProcessTree -RootProcessId $ProcessId
+    $Reason = if ($HasPasswordFallback) { "快速登录和加密密码回退均未恢复账号" } else { "快速登录记录已不可用且尚未配置加密密码回退" }
+    throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] $Reason，NapCat 要求人工验证。日志：$LogPath"
+  }
+  if (-not $NoQr -and $null -eq $QrWindow -and $null -ne $QrCode) {
+    $QrWindow = New-QrWindow -ImagePath $QrCode.FullName
   }
   Start-Sleep -Milliseconds 500
 }

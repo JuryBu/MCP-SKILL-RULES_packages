@@ -17,6 +17,10 @@ const DEFAULT_ALLOWED_EVENTS = [
   "test",
 ];
 const STALE_LOCK_MINUTES = 15;
+const DEFAULT_GROUP_FILE_COUNT_LIMIT = 1500;
+const DEFAULT_GROUP_FILE_CLEANUP_BATCH = 100;
+const DEFAULT_GROUP_FILE_SCAN_COUNT = 2000;
+const RECONCILIATION_CLOCK_SKEW_MS = 60 * 60 * 1000;
 
 export class NapCatNotifierError extends Error {
   constructor(code, message, options = {}) {
@@ -95,6 +99,31 @@ function positiveInteger(value, fallback, minimum, maximum) {
 
 function isPlainObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function positiveNumberOrNull(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function groupFileTimestamp(file) {
+  const raw = positiveNumberOrNull(file?.upload_time)
+    || positiveNumberOrNull(file?.modify_time)
+    || positiveNumberOrNull(file?.create_time)
+    || positiveNumberOrNull(file?.time);
+  return raw && raw > 0 ? raw : null;
+}
+
+function summarizeGroupFileForCleanup(file) {
+  return {
+    fileId: String(file?.file_id ?? ""),
+    fileName: String(file?.file_name ?? ""),
+    fileBytes: positiveNumberOrNull(file?.file_size ?? file?.size),
+    modifyTime: positiveNumberOrNull(file?.modify_time),
+    uploadTime: positiveNumberOrNull(file?.upload_time),
+    uploader: file?.uploader === undefined || file?.uploader === null ? "" : String(file.uploader),
+    uploaderName: String(file?.uploader_name ?? ""),
+  };
 }
 
 function normalizeControlPlane(rawControlPlane) {
@@ -566,13 +595,16 @@ function summarizeGroupMessage(message, expectedSelfId) {
   const taskMetadata = structuredTaskMetadata(text);
   const controlSegments = oneBotControlSegments(message);
   const contentSummary = oneBotContentSummary(message);
+  const senderId = String(message?.sender?.user_id ?? message?.user_id ?? "");
+  const explicitSelfHistory = String(message?.post_type ?? "").trim() === "message_sent"
+    || String(message?.message_sent_type ?? "").trim() === "self";
   return {
     messageId: String(message?.message_id ?? ""),
     messageSeq: String(message?.message_seq ?? message?.message_id ?? ""),
     time: Number.isFinite(timestamp) && timestamp > 0 ? new Date(timestamp * 1000).toISOString() : null,
-    senderId: String(message?.sender?.user_id ?? message?.user_id ?? ""),
+    senderId,
     senderName: String(message?.sender?.card ?? message?.sender?.nickname ?? ""),
-    isSelf: String(message?.sender?.user_id ?? message?.user_id ?? "") === expectedSelfId,
+    isSelf: senderId === expectedSelfId || explicitSelfHistory,
     text,
     taskId: taskMetadata.taskId,
     sourceMachine: taskMetadata.sourceMachine,
@@ -597,6 +629,57 @@ function summarizeGroupMessage(message, expectedSelfId) {
     hasExplicitText: contentSummary.hasExplicitText,
     contentTypes: contentSummary.contentTypes,
   };
+}
+
+function numericRealSeq(value) {
+  const normalized = String(value ?? "").trim();
+  if (!/^\d+$/.test(normalized)) return null;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : null;
+}
+
+function comparableTextSha256(value) {
+  return createHash("sha256").update(normalizeComparableText(value), "utf8").digest("hex");
+}
+
+function summarizeGroupHistory(messages, expectedSelfId) {
+  const records = messages.map((message, index) => ({
+    index,
+    raw: message,
+    summary: summarizeGroupMessage(message, expectedSelfId),
+  }));
+  const evidenceByIndex = new Map();
+  const seenRealSeq = new Set();
+  const chronological = [...records].sort((left, right) => {
+    const leftTime = Number(left.raw?.time ?? 0);
+    const rightTime = Number(right.raw?.time ?? 0);
+    if (leftTime !== rightTime) return leftTime - rightTime;
+    return left.index - right.index;
+  });
+
+  for (const record of chronological) {
+    const realSeq = String(record.raw?.real_seq ?? "").trim();
+    const postType = String(record.raw?.post_type ?? "").trim();
+    const messageSentType = String(record.raw?.message_sent_type ?? "").trim();
+    const selfHistoryRecord = record.summary.isSelf;
+    const realSeqRepeated = Boolean(realSeq && seenRealSeq.has(realSeq));
+    if (realSeq) seenRealSeq.add(realSeq);
+    evidenceByIndex.set(record.index, {
+      realSeq,
+      postType,
+      messageSentType,
+      historyEvidence: selfHistoryRecord
+        ? (realSeqRepeated ? "self_history_reused_sequence" : "self_history_record")
+        : (postType === "message" ? "peer_group_message" : "legacy_history_record"),
+      userVisibilityVerified: false,
+      safeForTaskRead: !selfHistoryRecord,
+    });
+  }
+
+  return records.map((record) => ({
+    ...record.summary,
+    ...evidenceByIndex.get(record.index),
+  }));
 }
 
 function stableDeliveryId(kind, dedupeKey) {
@@ -636,11 +719,13 @@ function normalizeEventInput(input, binding) {
   if (!binding.allowedEvents.includes(event)) {
     throw new NapCatNotifierError("EVENT_NOT_ALLOWED", `binding 不允许事件：${event}`);
   }
+  const dedupeKey = boundedString(input.dedupe_key, "dedupe_key", 200, true);
   return {
     event,
     taskId: boundedString(input.task_id, "task_id", 128, true),
     runId: boundedString(input.run_id, "run_id", 128),
-    dedupeKey: boundedString(input.dedupe_key, "dedupe_key", 200, true),
+    dedupeKey,
+    deliveryId: boundedString(input.delivery_id, "delivery_id", 128) || stableDeliveryId("event", dedupeKey),
     summary: boundedString(input.summary, "summary", 500),
     progress: boundedString(input.progress, "progress", 240),
     checkpointAt: boundedString(input.checkpoint_at, "checkpoint_at", 80),
@@ -652,6 +737,7 @@ function buildTrainingMessage(normalizedInput, nowDate) {
   const lines = [
     `[训练机][${normalizedInput.event.toUpperCase()}]`,
     `任务：${normalizedInput.taskId}`,
+    `delivery_id：${normalizedInput.deliveryId}`,
   ];
   if (normalizedInput.runId) lines.push(`运行：${normalizedInput.runId}`);
   lines.push(...formatProgress({
@@ -721,6 +807,7 @@ function buildTextMessage(normalizedInput, nowDate) {
   }
   return [
     "[Codex][MESSAGE]",
+    `delivery_id：${normalizedInput.deliveryId}`,
     normalizedInput.text,
     `时间：${nowDate.toISOString()}`,
   ].join("\n");
@@ -859,6 +946,25 @@ export function createNapCatNotifier(options = {}) {
   const fileUploadTimeoutMs = positiveInteger(env.NAPCAT_FILE_UPLOAD_TIMEOUT_MS, 600000, 10000, 1800000);
   const fileDownloadTimeoutMs = positiveInteger(env.NAPCAT_FILE_DOWNLOAD_TIMEOUT_MS, 600000, 10000, 1800000);
   const maximumFileBytes = positiveInteger(env.NAPCAT_MAX_FILE_BYTES, 2147483648, 1, 10737418240);
+  const groupFileAutoCleanupEnabled = env.NAPCAT_GROUP_FILE_AUTO_CLEANUP_ENABLED !== "0";
+  const groupFileCountLimit = positiveInteger(
+    env.NAPCAT_GROUP_FILE_COUNT_LIMIT,
+    DEFAULT_GROUP_FILE_COUNT_LIMIT,
+    100,
+    100000,
+  );
+  const groupFileCleanupBatch = positiveInteger(
+    env.NAPCAT_GROUP_FILE_CLEANUP_BATCH,
+    DEFAULT_GROUP_FILE_CLEANUP_BATCH,
+    1,
+    500,
+  );
+  const groupFileScanCount = positiveInteger(
+    env.NAPCAT_GROUP_FILE_SCAN_COUNT,
+    Math.max(DEFAULT_GROUP_FILE_SCAN_COUNT, groupFileCountLimit),
+    100,
+    5000,
+  );
   const inFlight = new Set();
 
   if (typeof fetchImpl !== "function") {
@@ -958,6 +1064,302 @@ export function createNapCatNotifier(options = {}) {
     return envelope.data ?? null;
   }
 
+  async function readGroupHistoryEvidence(groupId, count = 50, messageSeq = "") {
+    const history = await callOneBot("get_group_msg_history", {
+      group_id: groupId,
+      ...(messageSeq ? { message_seq: messageSeq } : {}),
+      count,
+      reverse_order: false,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    });
+    return summarizeGroupHistory(
+      Array.isArray(history?.messages) ? history.messages : [],
+      loadBinding().expectedSelfId,
+    );
+  }
+
+  async function readGroupHistoryForReconciliation(groupId, maxPages = 10) {
+    const messagesByKey = new Map();
+    const seenCursors = new Set();
+    let cursor = "";
+    let pagesScanned = 0;
+    let stopReason = "page_limit_reached";
+    while (pagesScanned < maxPages) {
+      const page = await readGroupHistoryEvidence(groupId, 50, cursor);
+      pagesScanned += 1;
+      let added = 0;
+      for (const message of page) {
+        const key = `${message.messageId}\0${message.messageSeq}\0${message.realSeq}\0${message.time}`;
+        if (messagesByKey.has(key)) continue;
+        messagesByKey.set(key, message);
+        added += 1;
+      }
+      if (!page.length || added === 0) {
+        stopReason = "history_exhausted";
+        break;
+      }
+      const numericMessageSeqs = page
+        .map((message) => numericRealSeq(message.messageSeq))
+        .filter((value) => value !== null);
+      const nextCursor = numericMessageSeqs.length ? String(Math.min(...numericMessageSeqs)) : "";
+      const currentCursor = numericRealSeq(cursor);
+      if (
+        !nextCursor
+        || seenCursors.has(nextCursor)
+        || (currentCursor !== null && Number(nextCursor) >= currentCursor)
+      ) {
+        stopReason = "missing_or_repeated_cursor";
+        break;
+      }
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    return {
+      messages: [...messagesByKey.values()],
+      pagesScanned,
+      stopReason,
+    };
+  }
+
+  async function captureGroupHistoryCheckpoint(groupId) {
+    const messages = await readGroupHistoryEvidence(groupId);
+    const realSeqValues = messages
+      .map((message) => numericRealSeq(message.realSeq))
+      .filter((value) => value !== null);
+    return {
+      maxRealSeq: realSeqValues.length ? Math.max(...realSeqValues) : null,
+      messageCount: messages.length,
+    };
+  }
+
+  async function verifyGroupHistoryDelivery(groupId, expectedMessage, expectedMessageId, checkpoint, expectedSelfId) {
+    const messages = await readGroupHistoryEvidence(groupId);
+    const expectedDigest = comparableTextSha256(expectedMessage);
+    const candidate = messages.find((message) =>
+      message.messageId === expectedMessageId
+      && comparableTextSha256(message.text) === expectedDigest
+    );
+    if (!candidate) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_MISSING", "群历史没有找到本次消息的独立记录");
+    }
+    if (candidate.senderId && candidate.senderId !== expectedSelfId) {
+      throw new NapCatNotifierError(
+        "MESSAGE_VERIFY_HISTORY_SENDER_MISMATCH",
+        "群历史中的匹配消息明确属于另一个发送账号",
+      );
+    }
+    if (!candidate.isSelf) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_NOT_SELF", "群历史中的匹配消息不是当前 OneBot 账号的发送记录");
+    }
+    const beforeRealSeq = numericRealSeq(checkpoint?.maxRealSeq);
+    const deliveredRealSeq = numericRealSeq(candidate.realSeq);
+    const emptyHistoryCheckpoint = Number(checkpoint?.messageCount) === 0;
+    const realSeqAdvanced = deliveredRealSeq !== null
+      && (beforeRealSeq === null ? emptyHistoryCheckpoint : deliveredRealSeq > beforeRealSeq);
+    return {
+      evidence: realSeqAdvanced
+        ? (beforeRealSeq === null
+          ? "onebot_action_and_first_self_history_record"
+          : "onebot_action_and_self_history_sequence_advanced")
+        : "onebot_action_and_matching_self_history_record",
+      userVisibilityVerified: false,
+      realSeqAdvanced,
+      realSeqBefore: beforeRealSeq,
+      deliveredRealSeq,
+      postType: candidate.postType,
+      messageSentType: candidate.messageSentType,
+    };
+  }
+
+  async function reconcilePendingGroupMessage(binding, normalizedInput, existing, configuredTargetKey) {
+    if (existing?.status !== "pending_send") return { entry: existing, reconciled: false };
+    let targetId = String(existing.targetId ?? "");
+    try {
+      if (configuredTargetKey) {
+        const targetCheck = await checkConfiguredTarget(binding, configuredTargetKey);
+        if (targetCheck.target.type !== "group") {
+          return {
+            entry: {
+              ...existing,
+              reconciliation: { status: "unresolved", reason: "private_target_requires_explicit_receipt" },
+            },
+            reconciled: false,
+          };
+        }
+        targetId = targetId || targetCheck.target.id;
+      } else {
+        await checkTarget(binding);
+        targetId = targetId || binding.groupId;
+      }
+      const beforeRealSeq = numericRealSeq(existing.historyRealSeqBefore);
+      const historyScan = await readGroupHistoryForReconciliation(targetId);
+      const messages = historyScan.messages;
+      const expectedDigest = existing.expectedMessageSha256 || comparableTextSha256(normalizedInput.message);
+      const createdAtMs = Date.parse(existing.createdAt ?? "");
+      const candidates = messages.filter((message) =>
+        message.isSelf
+        && comparableTextSha256(message.text) === expectedDigest
+        && (
+          !Number.isFinite(createdAtMs)
+          || (
+            Number.isFinite(Date.parse(message.time ?? ""))
+            && Date.parse(message.time) >= createdAtMs - RECONCILIATION_CLOCK_SKEW_MS
+          )
+        )
+      );
+      const emptyHistoryCheckpoint = Number(existing.historyMessageCountBefore) === 0;
+      const reusedSequenceCandidate = candidates.find((message) => {
+        const candidateRealSeq = numericRealSeq(message.realSeq);
+        return message.historyEvidence === "self_history_reused_sequence"
+          || (beforeRealSeq !== null && candidateRealSeq !== null && candidateRealSeq <= beforeRealSeq);
+      });
+      const checkedAt = now().toISOString();
+      const unresolvedReason = candidates.length > 1
+        ? "multiple_self_history_candidates"
+        : (reusedSequenceCandidate
+            ? "self_history_reused_sequence"
+            : (candidates.length === 1
+                ? "self_history_unconfirmed"
+                : (beforeRealSeq === null && !emptyHistoryCheckpoint
+                    ? "missing_pre_send_checkpoint"
+                    : "no_matching_self_history")));
+      const state = loadState(statePath);
+      const currentEntry = state.entries[normalizedInput.dedupeKey] || existing;
+      const unresolvedEntry = {
+        ...currentEntry,
+        reconciliation: {
+          status: "unresolved",
+          reason: unresolvedReason,
+          candidateCount: candidates.length,
+          candidateMessageId: candidates.length === 1 ? candidates[0].messageId : "",
+          candidateRealSeq: candidates.length === 1 ? numericRealSeq(candidates[0].realSeq) : null,
+          realSeqBefore: beforeRealSeq,
+          userVisibilityVerified: false,
+          historyPagesScanned: historyScan.pagesScanned,
+          historyStopReason: historyScan.stopReason,
+          checkedAt,
+        },
+      };
+      state.entries[normalizedInput.dedupeKey] = unresolvedEntry;
+      writeState(statePath, state);
+      return { entry: unresolvedEntry, reconciled: false };
+    } catch (error) {
+      return {
+        entry: {
+          ...existing,
+          reconciliation: {
+            status: "unresolved",
+            reason: "reconciliation_check_failed",
+            error: publicError(error),
+          },
+        },
+        reconciled: false,
+      };
+    }
+  }
+
+  async function cleanupGroupFilesBeforeUpload(groupId) {
+    const summary = {
+      enabled: groupFileAutoCleanupEnabled,
+      groupId: String(groupId),
+      checked: false,
+      cleanupNeeded: false,
+      deletedCount: 0,
+      failedCount: 0,
+      effectiveLimit: groupFileCountLimit,
+      cleanupBatch: groupFileCleanupBatch,
+      scanCount: groupFileScanCount,
+      reportedFileCount: null,
+      reportedLimitCount: null,
+      reportedUsedSpace: null,
+      reportedTotalSpace: null,
+      listedRootFiles: 0,
+      listedRootBytes: 0,
+      oldestFileTime: null,
+      newestFileTime: null,
+      deletedSample: [],
+      error: null,
+    };
+    if (!groupFileAutoCleanupEnabled) {
+      return summary;
+    }
+
+    let systemInfo;
+    try {
+      systemInfo = await callOneBot("get_group_file_system_info", { group_id: groupId });
+      summary.checked = true;
+      summary.reportedFileCount = positiveNumberOrNull(systemInfo?.file_count);
+      summary.reportedLimitCount = positiveNumberOrNull(systemInfo?.limit_count);
+      summary.reportedUsedSpace = positiveNumberOrNull(systemInfo?.used_space);
+      summary.reportedTotalSpace = positiveNumberOrNull(systemInfo?.total_space);
+    } catch (error) {
+      summary.error = publicError(error);
+      return summary;
+    }
+
+    if (summary.reportedFileCount !== null && summary.reportedFileCount < groupFileCountLimit) {
+      return summary;
+    }
+
+    let rootFiles;
+    try {
+      const rootData = await callOneBot("get_group_root_files", {
+        group_id: groupId,
+        file_count: groupFileScanCount,
+      });
+      rootFiles = Array.isArray(rootData?.files) ? rootData.files : [];
+    } catch (error) {
+      summary.error = publicError(error);
+      return summary;
+    }
+
+    summary.listedRootFiles = rootFiles.length;
+    summary.listedRootBytes = rootFiles.reduce((total, file) => total + (positiveNumberOrNull(file?.file_size ?? file?.size) ?? 0), 0);
+    const fileTimes = rootFiles.map(groupFileTimestamp).filter((value) => value !== null);
+    if (fileTimes.length) {
+      summary.oldestFileTime = Math.min(...fileTimes);
+      summary.newestFileTime = Math.max(...fileTimes);
+    }
+
+    const observedCount = Math.max(summary.reportedFileCount ?? 0, rootFiles.length);
+    if (observedCount < groupFileCountLimit) {
+      return summary;
+    }
+    summary.cleanupNeeded = true;
+
+    const candidates = rootFiles
+      .map((file, index) => ({ file, index, timestamp: groupFileTimestamp(file) }))
+      .filter(({ file }) => String(file?.file_id ?? ""))
+      .sort((left, right) => {
+        const leftTime = left.timestamp ?? Number.MAX_SAFE_INTEGER;
+        const rightTime = right.timestamp ?? Number.MAX_SAFE_INTEGER;
+        if (leftTime !== rightTime) return leftTime - rightTime;
+        return left.index - right.index;
+      })
+      .slice(0, groupFileCleanupBatch);
+
+    for (const { file } of candidates) {
+      try {
+        await callOneBot("delete_group_file", {
+          group_id: groupId,
+          file_id: String(file.file_id),
+        });
+        summary.deletedCount += 1;
+        if (summary.deletedSample.length < 10) {
+          summary.deletedSample.push(summarizeGroupFileForCleanup(file));
+        }
+      } catch (error) {
+        summary.failedCount += 1;
+        summary.error = publicError(error);
+        break;
+      }
+    }
+
+    return summary;
+  }
+
   function verifyLogin(binding, loginInfo) {
     const actualSelfId = String(loginInfo?.user_id ?? loginInfo?.self_id ?? "");
     const actualNickname = String(loginInfo?.nickname ?? "");
@@ -999,7 +1401,7 @@ export function createNapCatNotifier(options = {}) {
       throw new NapCatNotifierError("BINDING_INCOMPLETE", "binding.json 尚未填写 expectedSelfId 和 groupId");
     }
     const runtimeStatus = await callOneBot("get_status");
-    if (runtimeStatus?.online === false || runtimeStatus?.good === false) {
+    if (runtimeStatus?.online !== true || runtimeStatus?.good !== true) {
       throw new NapCatNotifierError("NAPCAT_NOT_READY", "NapCat 当前不在线或状态异常");
     }
     const login = verifyLogin(binding, await callOneBot("get_login_info"));
@@ -1029,7 +1431,7 @@ export function createNapCatNotifier(options = {}) {
       throw new NapCatNotifierError("CONTROL_TARGET_NOT_FOUND", `binding 未定义控制目标：${resolvedKey}`);
     }
     const runtimeStatus = await callOneBot("get_status");
-    if (runtimeStatus?.online === false || runtimeStatus?.good === false) {
+    if (runtimeStatus?.online !== true || runtimeStatus?.good !== true) {
       throw new NapCatNotifierError("NAPCAT_NOT_READY", "NapCat 当前不在线或状态异常");
     }
     const login = verifyLogin(binding, await callOneBot("get_login_info"));
@@ -1162,8 +1564,14 @@ export function createNapCatNotifier(options = {}) {
           groupError = publicError(error);
         }
       }
+      const ready = Boolean(
+        identity
+        && (optionsInput.include_group === false || !binding.groupId || group)
+        && runtimeStatus?.online === true
+        && runtimeStatus?.good === true
+      );
       return {
-        ready: Boolean(identity && (!binding.groupId || group) && runtimeStatus?.online !== false && runtimeStatus?.good !== false),
+        ready,
         reachable: true,
         baseUrl,
         tokenConfigured: Boolean(accessToken),
@@ -1179,7 +1587,8 @@ export function createNapCatNotifier(options = {}) {
           enabled: binding.controlPlane.enabled,
           machineIngressEnabled: binding.controlPlane.machineIngressEnabled,
           machineIngressReady: Boolean(
-            binding.controlPlane.enabled
+            ready
+            && binding.controlPlane.enabled
             && binding.controlPlane.machineIngressEnabled
             && binding.controlPlane.localMachine
             && binding.controlPlane.trustedPeerQq
@@ -1210,12 +1619,7 @@ export function createNapCatNotifier(options = {}) {
         controlPlane: {
           enabled: binding.controlPlane.enabled,
           machineIngressEnabled: binding.controlPlane.machineIngressEnabled,
-          machineIngressReady: Boolean(
-            binding.controlPlane.enabled
-            && binding.controlPlane.machineIngressEnabled
-            && binding.controlPlane.localMachine
-            && binding.controlPlane.trustedPeerQq
-          ),
+          machineIngressReady: false,
           localMachine: binding.controlPlane.localMachine,
           trustedPeerConfigured: Boolean(binding.controlPlane.trustedPeerQq),
           targetCount: Object.keys(binding.controlPlane.targets).length,
@@ -1264,8 +1668,17 @@ export function createNapCatNotifier(options = {}) {
       parse_mult_msg: false,
       quick_reply: false,
     });
-    const scannedMessages = (Array.isArray(history?.messages) ? history.messages : [])
-      .map((message) => summarizeGroupMessage(message, binding.expectedSelfId));
+    const summarizedMessages = summarizeGroupHistory(
+      Array.isArray(history?.messages) ? history.messages : [],
+      binding.expectedSelfId,
+    );
+    const includeSelfHistory = input.include_self_history === true;
+    const suppressedMessages = includeSelfHistory
+      ? []
+      : summarizedMessages.filter((message) => !message.safeForTaskRead);
+    const scannedMessages = includeSelfHistory
+      ? summarizedMessages
+      : summarizedMessages.filter((message) => message.safeForTaskRead);
     const messages = requestedTaskId
       ? scannedMessages.filter((message) => message.taskId === requestedTaskId)
       : scannedMessages;
@@ -1274,7 +1687,13 @@ export function createNapCatNotifier(options = {}) {
       identity: targetCheck.login,
       requestedCount: count,
       requestedTaskId: requestedTaskId || null,
-      scannedCount: scannedMessages.length,
+      includeSelfHistory,
+      scannedCount: summarizedMessages.length,
+      safeScannedCount: scannedMessages.length,
+      suppressedSelfHistoryCount: suppressedMessages.length,
+      suppressedSelfHistoryMessageIds: suppressedMessages.map((message) => message.messageId),
+      suppressedUnverifiedLocalEchoCount: suppressedMessages.length,
+      suppressedUnverifiedLocalEchoMessageIds: suppressedMessages.map((message) => message.messageId),
       returnedCount: messages.length,
       messages,
     };
@@ -1800,6 +2219,7 @@ export function createNapCatNotifier(options = {}) {
     const fileSha256 = await sha256File(normalizedInput.filePath);
     inFlight.add(normalizedInput.dedupeKey);
     let releaseDedupeLock = null;
+    let groupFileCleanup = null;
     try {
       const targetCheck = configuredTargetKey
         ? await checkConfiguredTarget(binding, configuredTargetKey)
@@ -1847,6 +2267,10 @@ export function createNapCatNotifier(options = {}) {
         targetMachine: normalizedInput.targetMachine,
       };
       writeState(statePath, claimedState);
+
+      if (targetType === "group") {
+        groupFileCleanup = await cleanupGroupFilesBeforeUpload(uploadGroupId);
+      }
 
       let uploadData;
       try {
@@ -1899,6 +2323,7 @@ export function createNapCatNotifier(options = {}) {
             fileMessageLookupError: recovery.fileMessageLookupError,
             recoveredFromUnknownUpload: true,
             uploadError: publicError(error),
+            groupFileCleanup,
             updatedAt: now().toISOString(),
           };
           const statePersistenceError = writeStateAfterSideEffect(finalState);
@@ -1929,6 +2354,7 @@ export function createNapCatNotifier(options = {}) {
             sha256: fileSha256,
             target: resolvedTarget,
             identity: targetCheck.login,
+            groupFileCleanup,
             dedupeKey: normalizedInput.dedupeKey,
             deliveryId: normalizedInput.deliveryId,
             ...persistenceResult(statePersistenceError),
@@ -1942,6 +2368,7 @@ export function createNapCatNotifier(options = {}) {
           updatedAt: now().toISOString(),
           error: publicError(error),
           recoveryError,
+          groupFileCleanup,
         };
         try {
           writeState(statePath, failedState);
@@ -1949,6 +2376,17 @@ export function createNapCatNotifier(options = {}) {
           error.details = {
             ...(error.details ?? {}),
             statePersistenceError: publicError(stateError),
+          };
+        }
+        if (groupFileCleanup) {
+          error.details = {
+            ...(error.details ?? {}),
+            groupFileCleanupChecked: groupFileCleanup.checked,
+            groupFileCleanupNeeded: groupFileCleanup.cleanupNeeded,
+            groupFileCleanupDeletedCount: groupFileCleanup.deletedCount,
+            groupFileCleanupFailedCount: groupFileCleanup.failedCount,
+            groupFileReportedCount: groupFileCleanup.reportedFileCount,
+            groupFileEffectiveLimit: groupFileCleanup.effectiveLimit,
           };
         }
         throw error;
@@ -2094,6 +2532,7 @@ export function createNapCatNotifier(options = {}) {
         fileMessageSeq: String(fileMessage?.messageSeq ?? ""),
         fileBusId,
         fileMessageLookupError,
+        groupFileCleanup,
         updatedAt: now().toISOString(),
       };
       statePersistenceError = writeStateAfterSideEffect(finalState);
@@ -2136,6 +2575,7 @@ export function createNapCatNotifier(options = {}) {
         sha256: fileSha256,
         target: resolvedTarget,
         identity: targetCheck.login,
+        groupFileCleanup,
         dedupeKey: normalizedInput.dedupeKey,
         deliveryId: normalizedInput.deliveryId,
         ...persistenceResult(statePersistenceError),
@@ -2182,8 +2622,26 @@ export function createNapCatNotifier(options = {}) {
     };
     const state = loadState(statePath);
     pruneState(state, binding.dedupeRetentionDays, currentTime);
-    const existing = state.entries[normalizedInput.dedupeKey];
+    let existing = state.entries[normalizedInput.dedupeKey];
     if (existing && existing.status !== "failed_before_ack") {
+      if (existing.status === "pending_send") {
+        const reconciliationLock = acquireDedupeLock(statePath, normalizedInput.dedupeKey, currentTime);
+        if (reconciliationLock.release) {
+          try {
+            const currentState = loadState(statePath);
+            const currentEntry = currentState.entries[normalizedInput.dedupeKey] || existing;
+            const reconciliation = await reconcilePendingGroupMessage(
+              binding,
+              normalizedInput,
+              currentEntry,
+              configuredTargetKey,
+            );
+            existing = reconciliation.entry;
+          } finally {
+            reconciliationLock.release();
+          }
+        }
+      }
       return {
         sent: false,
         duplicateSuppressed: true,
@@ -2231,6 +2689,10 @@ export function createNapCatNotifier(options = {}) {
             name: targetCheck.group.actualGroupName,
             memberCount: targetCheck.group.actualMemberCount,
           };
+      const expectedMessageSha256 = comparableTextSha256(preview.message);
+      const groupHistoryCheckpoint = resolvedTarget.type === "group"
+        ? await captureGroupHistoryCheckpoint(resolvedTarget.id)
+        : null;
       const lockResult = acquireDedupeLock(statePath, normalizedInput.dedupeKey, currentTime);
       releaseDedupeLock = lockResult.release;
       if (!releaseDedupeLock && lockResult.existingLock?.stale) {
@@ -2265,6 +2727,11 @@ export function createNapCatNotifier(options = {}) {
         createdAt: claimedExisting?.createdAt || currentTime.toISOString(),
         updatedAt: currentTime.toISOString(),
         attempts: previousAttempts + 1,
+        targetType: resolvedTarget.type,
+        targetId: resolvedTarget.id,
+        expectedMessageSha256,
+        historyRealSeqBefore: groupHistoryCheckpoint?.maxRealSeq ?? null,
+        historyMessageCountBefore: groupHistoryCheckpoint?.messageCount ?? null,
       };
       writeState(statePath, claimedState);
 
@@ -2331,6 +2798,7 @@ export function createNapCatNotifier(options = {}) {
 
       let verified = !binding.requireMessageVerification;
       let verificationError = null;
+      let verificationEvidence = null;
       if (binding.requireMessageVerification) {
         try {
           const message = await callOneBot("get_msg", { message_id: messageId });
@@ -2354,6 +2822,17 @@ export function createNapCatNotifier(options = {}) {
           if (verifiedSenderId && verifiedSenderId !== binding.expectedSelfId) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_SENDER_MISMATCH", "get_msg 返回的发送账号与 binding 不一致");
           }
+          if (resolvedTarget.type === "group") {
+            verificationEvidence = await verifyGroupHistoryDelivery(
+              resolvedTarget.id,
+              preview.message,
+              messageId,
+              groupHistoryCheckpoint,
+              binding.expectedSelfId,
+            );
+          } else {
+            verificationEvidence = { evidence: "private_get_msg_verified" };
+          }
           verified = true;
         } catch (error) {
           verificationError = publicError(error);
@@ -2367,6 +2846,8 @@ export function createNapCatNotifier(options = {}) {
         verified,
         messageId,
         verificationError,
+        verificationEvidence,
+        userVisibilityVerified: false,
         updatedAt: now().toISOString(),
       };
       statePersistenceError = writeStateAfterSideEffect(finalState);
@@ -2376,6 +2857,8 @@ export function createNapCatNotifier(options = {}) {
         verified,
         messageId,
         verificationError,
+        verificationEvidence,
+        userVisibilityVerified: false,
         target: configuredTargetKey ? resolvedTarget : targetCheck.group,
         identity: targetCheck.login,
         event: normalizedInput.event,

@@ -270,13 +270,17 @@ Codex 侧以下操作优先用后台模式：
 
 ### Codex 进程工具
 
-`codex_app__*` 是 Codex 原生任务管理接口，不走 MCP broker，速度更快。**获取当前对话 ID 的首选方法**：`codex_app__list_threads` 筛选 `status=active` + 比对当前工作目录。普通短对话可用 `codex_app__read_thread` 快速读取；没有 `get_current_thread()`，需 `list_threads` + 筛选定位。
+Codex Desktop 的任务管理能力当前由官方 `codex-app-tools` MCP 提供；工具在完整命名中通常显示为 `mcp__codex_app__*`，部分宿主界面会省略 `mcp__` 前缀。当前 alpha 版本虽然仍可能暴露旧的动态 `codex_app__*` 外壳，但调用只会返回「no longer available through dynamic tools；use the codex_app MCP server」，因此不要在每次任务操作前固定先调用旧外壳再失败降级。**获取当前对话 ID 的首选方法**：直接调用可用的 Codex app MCP `list_threads`，筛选 `status=active` 并比对当前工作目录；普通短对话用同一 MCP 的 `read_thread` 快速读取。没有 `get_current_thread()`，仍需 `list_threads` + 筛选定位。
+
+同一 App Server 可能为多个已加载任务分别保留 `compat launcher → 官方 codex-app-tools server` 进程链；看到多组进程不等于展示出多套任务工具，也不应当作僵尸进程清理。一次只读 `list_threads` 探针成功后，本轮持续使用同一接口；只有 Codex app MCP 未暴露、明确不可用或 App Server 已更换时，才允许做一次旧外壳的只读探针。旧外壳返回上述停用提示后，在当前 App Server 生命周期内将它视为不可用，不能对每个 `list/read/send` 操作重复走「A 失败再 B」流程。
+
+`No Codex thread found` 只表示当前 `threadId` / `hostId` 没有可读匹配，不触发切换工具 namespace；应在同一 MCP 链用 `list_threads(limit<=50)` 核对准确身份后再决定。遇到 `Codex app tools pipe closed`、app-server unavailable 或超时，只做一次同链 `list_threads` 健康探针；列表也失败就停止线程工具重试并按任务类型降级，不能在旧外壳与 MCP 之间循环。
 
 历史读取命中以下任一信号时视为长对话：已知源文件达到约 100 MiB、包含数万项工具或步骤，或已有长期高频工具调用历史。长对话绝对优先使用带稳定 `conversationId` 的 `conversation_read_original`，按 `fetch/list → search/read` 分页获取；不能依赖原生工具的 `turnLimit`、`includeOutputs=false` 或输出截断参数控制前置内存占用。
 
-事前不知道体量时可以先做一次有界原生读取；若首次出现 app-server unavailable、超时、stream disconnected、客户端断开重连或异常内存增长，立即停止原生读取重试并改用 `conversation_read_original`，保留真实失败边界，不能把 UI 仍可用或任务列表可见当成定点读取成功。此分流只改变历史读取优先级，不改变 `list_threads`、`wait_threads`、`read_thread_terminal`、`load_workspace_dependencies`、`create_thread`/`fork_thread`/`send_message_to_thread`/`handoff_thread` 和 `automation_update` 等其它原生任务管理用途。
+事前不知道体量时可以先用 Codex app MCP 做一次有界读取；若首次出现 app-server unavailable、超时、stream disconnected、客户端断开重连或异常内存增长，立即停止读取重试并改用 `conversation_read_original`，保留真实失败边界，不能把 UI 仍可用或任务列表可见当成定点读取成功。此分流只改变历史读取优先级，不改变 Codex app MCP 的 `list_threads`、`wait_threads`、`read_thread_terminal`、`load_workspace_dependencies`、`create_thread`/`fork_thread`/`send_message_to_thread`/`handoff_thread` 和 `automation_update` 等其它任务管理用途。
 
-原生任务工具只操作当前 Codex App Server 能列出的本机任务或显式已连接宿主；知道另一台电脑的 `conversationId` 不代表当前 App Server 能访问它。目标任务未出现在 `list_threads` 中，或发送返回 `No Codex thread found` 时，不要反复重试，也不要另建中转任务冒充跨机连接；已登记的开发机/训练机协作改用对应 `task_id` 的 NapCat 双机通道，本机可见任务才继续使用原生线程工具。
+Codex app MCP 只操作当前 App Server 能列出的本机任务或显式已连接宿主；知道另一台电脑的 `conversationId` 不代表当前 App Server 能访问它。目标任务未出现在 `list_threads` 中，或发送返回 `No Codex thread found` 时，不要反复重试，也不要另建中转任务冒充跨机连接；已登记的开发机/训练机协作改用对应 `task_id` 的 NapCat 双机通道，本机可见任务才继续使用线程工具。
 
 通过 `send_message_to_thread` 或 `handoff_thread` 派发需要后续回报的工作时，发送方必须记录目标任务、预期里程碑和下一检查时间。当前轮次仍保持运行时优先用 `wait_threads` 等待；预计需要等待其它对话 20～30 分钟或当前轮次将结束时，创建一次性 `automation_update` 叫回检查，不能让任务因为双方都在等而死锁。收到回报，或任务完成、取消后立即撤销检查；到点先只读确认真实状态再决定是否提醒，不能周期性骚扰，也不能只依赖接收方主动回报。
 

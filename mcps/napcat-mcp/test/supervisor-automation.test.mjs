@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -167,14 +168,181 @@ test("后台启动脚本在 PATH 缺少 node 时回退到受管服务清单", ()
 
 test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置时的旧启动方式", () => {
   const loginScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url)), "utf8");
+  const credentialSetterScript = fs.readFileSync(fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url)), "utf8");
   const supervisorScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), "utf8");
   assert.match(loginScript, /\$RuntimeConfiguration\.qqExePath/);
+  assert.match(loginScript, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+  assert.match(loginScript, /napcat\\cache\\qrcode\.png/);
+  assert.match(loginScript, /cache\\qrcode\.png/);
+  assert.match(loginScript, /Get-FreshQrCode/);
+  assert.match(loginScript, /\$NoQr -and \$null -ne \$QrCode/);
+  assert.match(loginScript, /Read-NapCatQuickLoginCredential/);
+  assert.match(loginScript, /NAPCAT_QUICK_PASSWORD_MD5/);
+  assert.match(loginScript, /PasswordFallbackDeadlineUtc/);
   assert.match(loginScript, /NapCatWinBootMain\.exe/);
   assert.match(loginScript, /NapCatWinBootHook\.dll/);
   assert.match(loginScript, /\$Launcher/);
   assert.match(loginScript, /\$BootMain/);
+  assert.doesNotMatch(credentialSetterScript, /\[string\]\$PasswordMd5/);
+  assert.doesNotMatch(credentialSetterScript, /TestPasswordMd5/);
   assert.match(supervisorScript, /\$RuntimeConfiguration\.qqExePath/);
   assert.match(supervisorScript, /"--qq-exe-path"/);
+});
+
+test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-qrcode-layout-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  const nestedQrPath = path.join(runtimeRoot, "napcat", "cache", "qrcode.png");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      'if not exist "%~dp0napcat\\cache" mkdir "%~dp0napcat\\cache"',
+      `> "${nestedQrPath}" echo qr`,
+      "ping 127.0.0.1 -n 60 >nul",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const scriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const startedAt = Date.now();
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", scriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], {
+    encoding: "utf8",
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+  assert.ok(Date.now() - startedAt < 10_000, "NoQr should stop after detecting the fresh QR instead of waiting 30 seconds");
+});
+
+test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维码就提前杀进程", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-fallback-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  const markerPath = path.join(root, "password-env-present.txt");
+  const nestedQrPath = path.join(runtimeRoot, "napcat", "cache", "qrcode.png");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      `if defined NAPCAT_QUICK_PASSWORD_MD5 (> "${markerPath}" echo present)`,
+      'if not exist "%~dp0napcat\\cache" mkdir "%~dp0napcat\\cache"',
+      `> "${nestedQrPath}" echo qr`,
+      "ping 127.0.0.1 -n 3 >nul",
+      "echo 密码回退登录失败",
+      "ping 127.0.0.1 -n 60 >nul",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const setterPath = fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url));
+  const testPassword = "napcat-test-password";
+  const testPasswordMd5 = createHash("md5").update(testPassword, "utf8").digest("hex");
+  const setterInvocationPath = path.join(root, "configure-test-credential.ps1");
+  const quotePowerShell = (value) => String(value).replaceAll("'", "''");
+  fs.writeFileSync(setterInvocationPath, `\uFEFF${[
+    `$password = ConvertTo-SecureString '${quotePowerShell(testPassword)}' -AsPlainText -Force`,
+    `& '${quotePowerShell(setterPath)}' -Password $password -DataRoot '${quotePowerShell(dataRoot)}' -BrokerRoot '${quotePowerShell(brokerRoot)}'`,
+    "",
+  ].join("\r\n")}`, "utf8");
+  const configured = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", setterInvocationPath,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  assert.equal(configured.status, 0, `${configured.stdout}\n${configured.stderr}`);
+  const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
+  const credentialText = fs.readFileSync(credentialPath, "utf8");
+  assert.equal(credentialText.includes(testPasswordMd5), false);
+  assert.doesNotMatch(credentialText, /10001/);
+  assert.equal(Object.hasOwn(JSON.parse(credentialText), "accountSha256"), false);
+  const aclCommand = [
+    `$acl = Get-Acl -LiteralPath '${quotePowerShell(credentialPath)}'`,
+    "$rules = @($acl.Access | ForEach-Object { $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value })",
+    "$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+    "[pscustomobject]@{ protected = $acl.AreAccessRulesProtected; rules = $rules; currentSid = $currentSid } | ConvertTo-Json -Depth 3 -Compress",
+  ].join("; ");
+  const aclResult = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", aclCommand], {
+    encoding: "utf8",
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  assert.equal(aclResult.status, 0, `${aclResult.stdout}\n${aclResult.stderr}`);
+  const acl = JSON.parse(aclResult.stdout.trim());
+  assert.equal(acl.protected, true);
+  assert.deepEqual(new Set(acl.rules), new Set(["S-1-5-18", acl.currentSid]));
+
+  const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const startedAt = Date.now();
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", loginScriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  const elapsedMs = Date.now() - startedAt;
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+  assert.equal(fs.readFileSync(markerPath, "utf8").trim(), "present");
+  const loginLogs = fs.readdirSync(path.join(runtimeRoot, "logs"))
+    .filter((name) => name.startsWith("codex-login-"))
+    .map((name) => fs.readFileSync(path.join(runtimeRoot, "logs", name), "utf8"))
+    .join("\n");
+  assert.equal(loginLogs.includes(testPasswordMd5), false);
+  assert.ok(elapsedMs >= 1_500, `password fallback should receive a grace period, elapsed=${elapsedMs}`);
+  assert.ok(elapsedMs < 10_000, `explicit password fallback failure should stop quickly, elapsed=${elapsedMs}`);
 });
 
 test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {
@@ -493,6 +661,39 @@ test("已发送事件被旧组件重写为 pending 时自动恢复 sent 状态",
     assert.equal(alertFile.status, "sent");
     assert.equal(alertFile.pending, false);
     assert.equal(alertFile.sentAt, sentAt);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("已被健康实例取代的旧告警不会重新发送", async () => {
+  const fixture = createFixture();
+  const sends = [];
+  try {
+    writeJson(fixture.automationAlertPath, {
+      status: "superseded",
+      pending: false,
+      incidentKey: "codex-app-server-proxy:LISTEN_FAILED",
+      text: "这条旧告警不应重新发送",
+      supersededAt: "2026-08-26T08:36:42.403Z",
+      supersededBy: "healthy-proxy:test-instance",
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      notifier: {
+        async sendTextMessage(input) {
+          sends.push(input);
+          return { sent: true, messageId: "unexpected" };
+        },
+      },
+    }));
+    const runtime = readJson(fixture.runtimeStatePath);
+    const alertFile = readJson(fixture.automationAlertPath);
+    assert.equal(sends.length, 0);
+    assert.equal(runtime.alert.status, "superseded");
+    assert.equal(runtime.alert.pending, false);
+    assert.equal(Object.hasOwn(runtime.actions, "alert"), false);
+    assert.equal(alertFile.status, "superseded");
+    assert.equal(alertFile.pending, false);
   } finally {
     fixture.cleanup();
   }

@@ -20,12 +20,15 @@ async function createFixture(options = {}) {
   const token = "test-token";
   const calls = [];
   const messages = new Map();
-  const groupFiles = [];
+  const groupFiles = Array.isArray(options.groupFiles)
+    ? options.groupFiles.map((file) => ({ ...file }))
+    : [];
   const privateFiles = [];
   const primedFileIds = new Set();
   const downloadContent = Buffer.from("NapCat fixed-group download test\n", "utf8");
   let downloadBaseUrl = "";
   let messageSequence = 1000;
+  let groupRealSequence = 1000;
   let taskFileIndexFailureCount = 0;
   const runtime = {
     selfId: options.selfId ?? "1000000001",
@@ -36,16 +39,22 @@ async function createFixture(options = {}) {
   };
   const configuredGroups = new Map(Object.entries(options.configuredGroups ?? {}));
   const friends = options.friends ?? [];
-  messages.set("900", {
-    message_id: "900",
-    message_seq: "900",
-    group_id: runtime.groupId,
-    time: 1784869200,
-    user_id: "1000000004",
-    sender: { user_id: "1000000004", nickname: "群成员", card: "成员备注" },
-    message: [{ type: "text", data: { text: "历史消息" } }],
-    raw_message: "历史消息",
-  });
+  if (!options.emptyHistory) {
+    messages.set("900", {
+      message_id: "900",
+      message_seq: "900",
+      real_seq: "1000",
+      post_type: "message",
+      message_type: "group",
+      self_id: Number(runtime.selfId),
+      group_id: runtime.groupId,
+      time: 1784869200,
+      user_id: "1000000004",
+      sender: { user_id: "1000000004", nickname: "群成员", card: "成员备注" },
+      message: [{ type: "text", data: { text: "历史消息" } }],
+      raw_message: "历史消息",
+    });
+  }
   if (options.includeHistoryFile) {
     messages.set("901", {
       message_id: "901",
@@ -162,7 +171,9 @@ async function createFixture(options = {}) {
     }
     let data;
     if (action === "get_status") {
-      data = { online: true, good: true };
+      data = {};
+      if (!options.omitRuntimeOnline) data.online = options.runtimeOnline ?? true;
+      if (!options.omitRuntimeGood) data.good = options.runtimeGood ?? true;
     } else if (action === "get_login_info") {
       data = { user_id: Number(runtime.selfId), nickname: runtime.nickname };
     } else if (action === "get_group_list") {
@@ -193,16 +204,73 @@ async function createFixture(options = {}) {
       }
       messageSequence += 1;
       const messageId = String(messageSequence);
-      messages.set(messageId, {
+      const uncertainSendRecord = Boolean(
+        options.ghostEchoOnSend
+        || options.ghostEchoAdvancesRealSeq
+        || options.ghostEchoWithoutRealSeq
+      );
+      const realSeq = options.ghostEchoAdvancesRealSeq || !uncertainSendRecord
+        ? (groupRealSequence += 1)
+        : groupRealSequence;
+      const sentMessage = {
         message_id: messageId,
         message_seq: messageId,
+        ...(options.ghostEchoWithoutRealSeq ? {} : { real_seq: String(realSeq) }),
+        ...(options.omitSelfPostType ? {} : { post_type: "message_sent" }),
+        message_type: "group",
+        ...(options.omitSelfMessageSentType ? {} : { message_sent_type: "self" }),
+        self_id: Number(runtime.selfId),
         message: body.message,
         raw_message: body.message,
         group_id: body.group_id,
         time: 1784869200,
         user_id: runtime.selfId,
         sender: { user_id: runtime.selfId, nickname: runtime.nickname },
-      });
+      };
+      if (options.omitSelfSenderIdentity) {
+        delete sentMessage.user_id;
+        delete sentMessage.sender;
+      }
+      messages.set(messageId, sentMessage);
+      if (options.duplicateAuthoritativeAfterSend && !uncertainSendRecord) {
+        messageSequence += 1;
+        groupRealSequence += 1;
+        const duplicateMessageId = String(messageSequence);
+        messages.set(duplicateMessageId, {
+          message_id: duplicateMessageId,
+          message_seq: duplicateMessageId,
+          real_seq: String(groupRealSequence),
+          post_type: "message_sent",
+          message_type: "group",
+          message_sent_type: "self",
+          self_id: Number(runtime.selfId),
+          message: body.message,
+          raw_message: body.message,
+          group_id: body.group_id,
+          time: 1784869201,
+          user_id: runtime.selfId,
+          sender: { user_id: runtime.selfId, nickname: runtime.nickname },
+        });
+      }
+      for (let index = 0; index < Number(options.appendHistoryAfterSendCount ?? 0); index += 1) {
+        messageSequence += 1;
+        groupRealSequence += 1;
+        const noiseMessageId = String(messageSequence);
+        messages.set(noiseMessageId, {
+          message_id: noiseMessageId,
+          message_seq: noiseMessageId,
+          real_seq: String(groupRealSequence),
+          post_type: "message",
+          message_type: "group",
+          self_id: Number(runtime.selfId),
+          message: `后续群消息-${index}`,
+          raw_message: `后续群消息-${index}`,
+          group_id: body.group_id,
+          time: 1784869202 + index,
+          user_id: "1000000004",
+          sender: { user_id: "1000000004", nickname: "群成员" },
+        });
+      }
       if (options.httpErrorAfterSend) {
         response.statusCode = 500;
         response.end(JSON.stringify({ status: "failed", retcode: 1500, data: null }));
@@ -216,9 +284,20 @@ async function createFixture(options = {}) {
         .filter((message) => String(message.group_id) === String(body.group_id))
         .filter((message) => Number(message.message_seq) <= cursor)
         .sort((left, right) => Number(left.message_seq) - Number(right.message_seq));
-      const returnedMessages = body.reverse_order === true
+      let returnedMessages = body.reverse_order === true
           ? history.slice(-count).reverse()
           : history.slice(-count);
+      if (options.historySelfSenderId) {
+        returnedMessages = returnedMessages.map((message) => (
+          message.post_type === "message_sent" || message.message_sent_type === "self"
+            ? {
+                ...message,
+                user_id: options.historySelfSenderId,
+                sender: { user_id: options.historySelfSenderId, nickname: "冲突账号" },
+              }
+            : message
+        ));
+      }
       for (const message of returnedMessages) {
         if (Array.isArray(message.message)) {
           for (const segment of message.message) {
@@ -296,6 +375,7 @@ async function createFixture(options = {}) {
         busid: 102,
         uploader: Number(runtime.selfId),
         uploader_name: runtime.nickname,
+        modify_time: 1784869200 + ordinal,
       });
       data = { file_id: fileId };
       if (options.failUploadGroupFileAfterPersist) {
@@ -337,11 +417,29 @@ async function createFixture(options = {}) {
         file_size: fileSize,
       });
       data = { file_id: fileId };
-    } else if (action === "get_group_root_files") {
+    } else if (action === "get_group_file_system_info") {
+      const files = groupFiles.filter((file) => String(file.group_id) === String(body.group_id));
       data = {
-        files: groupFiles.filter((file) => String(file.group_id) === String(body.group_id)),
+        file_count: options.groupFileSystemCount ?? files.length,
+        limit_count: options.groupFileSystemLimit ?? 10000,
+        used_space: options.groupFileSystemUsedSpace ?? 0,
+        total_space: options.groupFileSystemTotalSpace ?? 10737418240,
+      };
+    } else if (action === "get_group_root_files") {
+      const count = Math.max(1, Math.min(5000, Number(body.file_count || groupFiles.length || 100)));
+      data = {
+        files: groupFiles.filter((file) => String(file.group_id) === String(body.group_id)).slice(0, count),
         folders: [],
       };
+    } else if (action === "delete_group_file") {
+      const index = groupFiles.findIndex((file) =>
+        String(file.group_id) === String(body.group_id)
+        && String(file.file_id) === String(body.file_id)
+      );
+      if (index >= 0) {
+        groupFiles.splice(index, 1);
+      }
+      data = { result: 0, errMsg: "ok" };
     } else if (action === "get_group_file_url") {
       if (!primedFileIds.has(String(body.file_id))) {
         response.statusCode = 400;
@@ -371,7 +469,15 @@ async function createFixture(options = {}) {
     NAPCAT_MCP_STATE_PATH: statePath,
     NAPCAT_HTTP_TIMEOUT_MS: "2000",
   };
-  const fetchImpl = options.failSendUnknown
+  const fetchImpl = options.failSendUnknownWithLocalEcho
+    ? async (url, requestOptions) => {
+        if (String(url).endsWith("/send_group_msg")) {
+          await fetch(url, requestOptions);
+          throw new TypeError("simulated connection reset after local self echo");
+        }
+        return fetch(url, requestOptions);
+      }
+    : options.failSendUnknown
     ? async (url, requestOptions) => {
       if (String(url).endsWith("/send_group_msg")) {
         throw new TypeError("simulated connection reset after request dispatch");
@@ -395,6 +501,7 @@ async function createFixture(options = {}) {
     temporaryRoot,
     createNotifier,
     clearFileUrlCache: () => primedFileIds.clear(),
+    groupFiles,
     close: async () => {
       await new Promise((resolve) => server.close(resolve));
       fs.rmSync(temporaryRoot, { recursive: true, force: true });
@@ -456,6 +563,7 @@ test("preview does not call OneBot", async () => {
     const result = fixture.notifier.previewTrainingEvent(trainingEvent());
     assert.match(result.message, /\[训练机\]\[STARTED\]/);
     assert.match(result.message, /任务：tgt-20260724-01/);
+    assert.match(result.message, /delivery_id：[0-9a-f]{64}/);
     assert.equal(fixture.calls.length, 0);
   } finally {
     await fixture.close();
@@ -776,6 +884,8 @@ test("text send keeps its verified result when post-send state persistence fails
     assert.equal(duplicate.sent, false);
     assert.equal(duplicate.duplicateSuppressed, true);
     assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.status, "pending_send");
+    assert.equal(duplicate.existing.reconciliation.reason, "self_history_unconfirmed");
     assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
   } finally {
     await fixture.close();
@@ -824,6 +934,252 @@ test("file preview hashes locally and fixed-group upload verifies by file list",
     assert.equal(second.sent, false);
     assert.equal(second.duplicateSuppressed, true);
     assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a successful OneBot response verifies locally without treating real_seq as unique", async () => {
+  const fixture = await createFixture({ ghostEchoOnSend: true });
+  try {
+    const input = {
+      text: "本地回显不能冒充用户端可见",
+      task_id: "visibility-contract",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "visibility-contract:local-echo",
+    };
+    const result = await fixture.notifier.sendTextMessage(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.userVisibilityVerified, false);
+    assert.equal(result.verificationEvidence.evidence, "onebot_action_and_matching_self_history_record");
+    assert.equal(result.verificationEvidence.realSeqAdvanced, false);
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "sent_verified");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a successful OneBot response verifies locally when group history omits real_seq", async () => {
+  const fixture = await createFixture({ ghostEchoWithoutRealSeq: true });
+  try {
+    const result = await fixture.notifier.sendTextMessage({
+      text: "缺失 real_seq 仍只做本机一致性核验",
+      task_id: "missing-real-seq-success",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "missing-real-seq:success",
+    });
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.userVisibilityVerified, false);
+    assert.equal(result.verificationEvidence.evidence, "onebot_action_and_matching_self_history_record");
+    assert.equal(result.verificationEvidence.realSeqAdvanced, false);
+    assert.equal(result.verificationEvidence.deliveredRealSeq, null);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("a conflicting sender id in self history cannot verify a successful send", async () => {
+  const fixture = await createFixture({ historySelfSenderId: "999000111" });
+  try {
+    const input = {
+      text: "冲突账号不能通过成功核验",
+      task_id: "history-sender-conflict",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "history-sender-conflict:success",
+    };
+    const result = await fixture.notifier.sendTextMessage(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, false);
+    assert.equal(result.userVisibilityVerified, false);
+    assert.equal(result.verificationError.code, "MESSAGE_VERIFY_HISTORY_SENDER_MISMATCH");
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "sent_unverified");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("the first message in an empty group verifies from the first observed real_seq", async () => {
+  const fixture = await createFixture({ emptyHistory: true });
+  try {
+    const result = await fixture.notifier.sendTextMessage({
+      text: "空群第一条消息",
+      task_id: "empty-group-first-message",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "empty-group:first-message",
+    });
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.verificationEvidence.evidence, "onebot_action_and_first_self_history_record");
+    assert.equal(result.userVisibilityVerified, false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("offline runtime is reachable but never ready and blocks sending before dispatch", async () => {
+  const fixture = await createFixture({ runtimeOnline: false });
+  try {
+    const status = await fixture.notifier.status({ include_group: true });
+    assert.equal(status.reachable, true);
+    assert.equal(status.runtimeStatus.online, false);
+    assert.equal(status.ready, false);
+    assert.equal(status.controlPlane.machineIngressReady, false);
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(trainingEvent({ dedupe_key: "offline:must-not-send" })),
+      (error) => error.code === "NAPCAT_NOT_READY" && error.outcomeUnknown === false,
+    );
+    assert.equal(fixture.calls.some((call) => call.action === "send_group_msg"), false);
+    assert.equal(fs.existsSync(fixture.statePath), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("missing runtime online state fails closed before any send", async () => {
+  const fixture = await createFixture({ omitRuntimeOnline: true });
+  try {
+    const status = await fixture.notifier.status({ include_group: false });
+    assert.equal(status.reachable, true);
+    assert.equal(status.ready, false);
+    await assert.rejects(
+      () => fixture.notifier.sendTextMessage({
+        text: "状态字段缺失时不发送",
+        dedupe_key: "runtime-status:missing-online",
+      }),
+      (error) => error.code === "NAPCAT_NOT_READY" && error.outcomeUnknown === false,
+    );
+    assert.equal(fixture.calls.some((call) => call.action === "send_group_msg"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("missing runtime good state fails closed before any send", async () => {
+  const fixture = await createFixture({ omitRuntimeGood: true });
+  try {
+    const status = await fixture.notifier.status({ include_group: false });
+    assert.equal(status.reachable, true);
+    assert.equal(status.ready, false);
+    await assert.rejects(
+      () => fixture.notifier.sendTextMessage({
+        text: "健康字段缺失时不发送",
+        dedupe_key: "runtime-status:missing-good",
+      }),
+      (error) => error.code === "NAPCAT_NOT_READY" && error.outcomeUnknown === false,
+    );
+    assert.equal(fixture.calls.some((call) => call.action === "send_group_msg"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("status without group inspection still reports an online verified account ready", async () => {
+  const fixture = await createFixture();
+  try {
+    const status = await fixture.notifier.status({ include_group: false });
+    assert.equal(status.ready, true);
+    assert.equal(status.reachable, true);
+    assert.equal(status.controlPlane.machineIngressReady, false);
+    assert.equal(status.identity.actualSelfId, "1000000001");
+    assert.equal(status.group, null);
+    assert.equal(fixture.calls.some((call) => call.action === "get_group_info"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("group file upload skips cleanup below effective file count cap", async () => {
+  const existingFiles = Array.from({ length: 1499 }, (_, index) => ({
+    group_id: 123456789,
+    file_id: `existing-file-${index}`,
+    file_name: `existing-${index}.zip`,
+    file_size: 100 + index,
+    size: 100 + index,
+    busid: 102,
+    uploader: 1000000001,
+    uploader_name: "ExampleBot",
+    modify_time: 1784000000 + index,
+  })).reverse();
+  const fixture = await createFixture({ groupFiles: existingFiles });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "below-cap.zip");
+    fs.writeFileSync(filePath, "below-count-cap", "utf8");
+
+    const result = await fixture.notifier.sendFile({
+      file_path: filePath,
+      name: "未达上限.zip",
+      dedupe_key: "manual:file:below-count-cap",
+    });
+
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.groupFileCleanup.checked, true);
+    assert.equal(result.groupFileCleanup.cleanupNeeded, false);
+    assert.equal(result.groupFileCleanup.reportedFileCount, 1499);
+    assert.equal(result.groupFileCleanup.effectiveLimit, 1500);
+    assert.equal(fixture.calls.filter((call) => call.action === "delete_group_file").length, 0);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("group file upload deletes oldest files before upload at effective file count cap", async () => {
+  const existingFiles = Array.from({ length: 1500 }, (_, index) => ({
+    group_id: 123456789,
+    file_id: `old-file-${String(index).padStart(4, "0")}`,
+    file_name: `old-${String(index).padStart(4, "0")}.zip`,
+    file_size: 100 + index,
+    size: 100 + index,
+    busid: 102,
+    uploader: index % 2 === 0 ? 1000000001 : 1000000003,
+    uploader_name: index % 2 === 0 ? "ExampleBot" : "ExampleUser",
+    modify_time: 1783000000 + index,
+  })).reverse();
+  const fixture = await createFixture({ groupFiles: existingFiles });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "at-cap.zip");
+    fs.writeFileSync(filePath, "at-count-cap", "utf8");
+
+    const result = await fixture.notifier.sendFile({
+      file_path: filePath,
+      name: "达到上限后上传.zip",
+      dedupe_key: "manual:file:at-count-cap",
+    });
+
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.groupFileCleanup.cleanupNeeded, true);
+    assert.equal(result.groupFileCleanup.reportedFileCount, 1500);
+    assert.equal(result.groupFileCleanup.listedRootFiles, 1500);
+    assert.equal(result.groupFileCleanup.deletedCount, 100);
+    assert.equal(result.groupFileCleanup.failedCount, 0);
+    assert.equal(result.groupFileCleanup.deletedSample[0].fileName, "old-0000.zip");
+
+    const deleteCalls = fixture.calls.filter((call) => call.action === "delete_group_file");
+    assert.equal(deleteCalls.length, 100);
+    assert.deepEqual(
+      deleteCalls.slice(0, 3).map((call) => call.body.file_id),
+      ["old-file-0000", "old-file-0001", "old-file-0002"],
+    );
+    assert.equal(deleteCalls.at(-1).body.file_id, "old-file-0099");
+    assert.equal(fixture.groupFiles.some((file) => file.file_id === "old-file-0000"), false);
+    assert.equal(fixture.groupFiles.some((file) => file.file_id === "old-file-0100"), true);
+    assert.equal(fixture.groupFiles.length, 1401);
+
+    const firstDeleteIndex = fixture.calls.findIndex((call) => call.action === "delete_group_file");
+    const uploadIndex = fixture.calls.findIndex((call) => call.action === "upload_group_file");
+    assert.equal(firstDeleteIndex > -1, true);
+    assert.equal(uploadIndex > firstDeleteIndex, true);
+    assert.equal(uploadIndex > fixture.calls.findLastIndex((call) => call.action === "delete_group_file"), true);
   } finally {
     await fixture.close();
   }
@@ -1002,7 +1358,11 @@ test("task file upload publishes a verified index readable by task id", async ()
     assert.match(indexCall.body.message, new RegExp(`字节数：${Buffer.byteLength(content)}`));
     assert.match(indexCall.body.message, new RegExp(`sha256：${createHash("sha256").update(content).digest("hex")}`));
 
-    const recent = await fixture.notifier.readRecentMessages({ count: 10, task_id: input.task_id });
+    const recent = await fixture.notifier.readRecentMessages({
+      count: 10,
+      task_id: input.task_id,
+      include_self_history: true,
+    });
     assert.equal(recent.returnedCount, 1);
     assert.equal(recent.messages[0].taskId, input.task_id);
     assert.equal(recent.messages[0].sourceMachine, input.source_machine);
@@ -1189,7 +1549,7 @@ test("binding cannot disable fixed group identity checks", async () => {
   }
 });
 
-test("HTTP error after send remains unknown and suppresses retry", async () => {
+test("HTTP error after an accepted send keeps self history unresolved without resending", async () => {
   const fixture = await createFixture({ httpErrorAfterSend: true });
   try {
     const input = trainingEvent({ dedupe_key: "tgt-20260724-01:http-unknown" });
@@ -1203,6 +1563,8 @@ test("HTTP error after send remains unknown and suppresses retry", async () => {
     const second = await fixture.notifier.sendTrainingEvent(input);
     assert.equal(second.sent, false);
     assert.equal(second.reason, "previous_outcome_unknown");
+    assert.equal(second.existing.status, "pending_send");
+    assert.equal(second.existing.reconciliation.reason, "self_history_unconfirmed");
     assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
   } finally {
     await fixture.close();
@@ -1238,6 +1600,180 @@ test("unknown network outcome remains pending and suppresses automatic resend", 
     assert.equal(second.sent, false);
     assert.equal(second.duplicateSuppressed, true);
     assert.equal(second.reason, "previous_outcome_unknown");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("unknown reconciliation paginates beyond the latest fifty messages without treating self history as success", async () => {
+  const fixture = await createFixture({ httpErrorAfterSend: true, appendHistoryAfterSendCount: 60 });
+  try {
+    const input = trainingEvent({ dedupe_key: "tgt-20260724-01:http-unknown-paged" });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_HTTP_ERROR" && error.outcomeUnknown === true,
+    );
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.status, "pending_send");
+    assert.equal(duplicate.existing.reconciliation.reason, "self_history_unconfirmed");
+    assert.equal(duplicate.existing.reconciliation.historyPagesScanned >= 2, true);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("multiple self history matches keep an unknown send unresolved", async () => {
+  const fixture = await createFixture({ httpErrorAfterSend: true, duplicateAuthoritativeAfterSend: true });
+  try {
+    const input = trainingEvent({ dedupe_key: "tgt-20260724-01:http-unknown-ambiguous" });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_HTTP_ERROR" && error.outcomeUnknown === true,
+    );
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.status, "pending_send");
+    assert.equal(duplicate.existing.reconciliation.reason, "multiple_self_history_candidates");
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("timeout local self echo with reused real_seq stays unknown and is hidden from task reads", async () => {
+  const fixture = await createFixture({ failSendUnknownWithLocalEcho: true, ghostEchoOnSend: true });
+  try {
+    const input = trainingEvent({
+      task_id: "ghost-timeout-task",
+      dedupe_key: "ghost-timeout:unknown",
+    });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_NETWORK_ERROR" && error.outcomeUnknown === true,
+    );
+
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedUnverifiedLocalEchoCount, 1);
+    assert.deepEqual(recent.suppressedUnverifiedLocalEchoMessageIds, ["1001"]);
+
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.sent, false);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.status, "pending_send");
+    assert.equal(duplicate.existing.reconciliation.reason, "self_history_reused_sequence");
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("timeout local self echo with a new real_seq is still hidden and never reconciled", async () => {
+  const fixture = await createFixture({ failSendUnknownWithLocalEcho: true, ghostEchoAdvancesRealSeq: true });
+  try {
+    const input = trainingEvent({
+      task_id: "ghost-new-seq-task",
+      dedupe_key: "ghost-new-seq:unknown",
+    });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_NETWORK_ERROR" && error.outcomeUnknown === true,
+    );
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedUnverifiedLocalEchoCount, 1);
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.reconciliation.reason, "self_history_unconfirmed");
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("timeout local self echo without real_seq is hidden and never reconciled", async () => {
+  const fixture = await createFixture({ failSendUnknownWithLocalEcho: true, ghostEchoWithoutRealSeq: true });
+  try {
+    const input = trainingEvent({
+      task_id: "ghost-missing-seq-task",
+      dedupe_key: "ghost-missing-seq:unknown",
+    });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_NETWORK_ERROR" && error.outcomeUnknown === true,
+    );
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedUnverifiedLocalEchoCount, 1);
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.reconciliation.reason, "self_history_unconfirmed");
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("explicit message_sent self history stays hidden when sender identity is absent", async () => {
+  const fixture = await createFixture({
+    failSendUnknownWithLocalEcho: true,
+    ghostEchoOnSend: true,
+    omitSelfSenderIdentity: true,
+    omitSelfMessageSentType: true,
+  });
+  try {
+    const input = trainingEvent({
+      task_id: "ghost-missing-sender-task",
+      dedupe_key: "ghost-missing-sender:unknown",
+    });
+    await assert.rejects(
+      () => fixture.notifier.sendTrainingEvent(input),
+      (error) => error.code === "ONEBOT_NETWORK_ERROR" && error.outcomeUnknown === true,
+    );
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedSelfHistoryCount, 1);
+    const duplicate = await fixture.notifier.sendTrainingEvent(input);
+    assert.equal(duplicate.reason, "previous_outcome_unknown");
+    assert.equal(duplicate.existing.status, "pending_send");
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("post_type message_sent alone hides senderless self history", async () => {
+  const fixture = await createFixture({
+    failSendUnknownWithLocalEcho: true,
+    ghostEchoOnSend: true,
+    omitSelfSenderIdentity: true,
+  });
+  try {
+    const input = trainingEvent({ task_id: "post-type-self-only", dedupe_key: "post-type-self-only:unknown" });
+    await assert.rejects(() => fixture.notifier.sendTrainingEvent(input));
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedSelfHistoryCount, 1);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("message_sent_type self alone hides senderless self history", async () => {
+  const fixture = await createFixture({
+    failSendUnknownWithLocalEcho: true,
+    ghostEchoOnSend: true,
+    omitSelfSenderIdentity: true,
+    omitSelfPostType: true,
+  });
+  try {
+    const input = trainingEvent({ task_id: "message-sent-type-self-only", dedupe_key: "message-sent-type-self-only:unknown" });
+    await assert.rejects(() => fixture.notifier.sendTrainingEvent(input));
+    const recent = await fixture.notifier.readRecentMessages({ count: 20, task_id: input.task_id });
+    assert.equal(recent.returnedCount, 0);
+    assert.equal(recent.suppressedSelfHistoryCount, 1);
   } finally {
     await fixture.close();
   }

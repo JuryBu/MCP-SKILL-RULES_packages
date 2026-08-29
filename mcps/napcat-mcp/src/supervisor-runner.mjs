@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createNapCatNotifier } from "./core.mjs";
 import { createTaskRegistry } from "./task-registry.mjs";
@@ -12,6 +12,8 @@ export const DEFAULT_SUPERVISOR_INTERVAL_MS = 15_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
 export const DEFAULT_LOGIN_TIMEOUT_MS = 35_000;
 export const DEFAULT_LOGIN_COOLDOWN_MS = 120_000;
+export const DEFAULT_STALE_NAPCAT_OFFLINE_MS = 120_000;
+export const DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS = 300_000;
 export const DEFAULT_BROKER_START_COOLDOWN_MS = 60_000;
 export const DEFAULT_STOP_POLL_MS = 250;
 
@@ -32,6 +34,8 @@ const CLI_OPTIONS = new Set([
   "probe-timeout-ms",
   "login-timeout-ms",
   "login-cooldown-ms",
+  "stale-napcat-offline-ms",
+  "stale-napcat-recovery-cooldown-ms",
   "broker-start-cooldown-ms",
   "automation-maintenance",
   "automation-alert",
@@ -236,6 +240,7 @@ function normalizeAlertFile(filePath, fsImpl) {
   };
   const status = textValue(readValue("status", "state")).toLowerCase();
   const sent = booleanValue(readValue("sent")) === true || ["sent", "delivered"].includes(status);
+  const terminal = ["superseded", "resolved", "cancelled", "canceled", "closed", "dismissed", "inactive"].includes(status);
   const explicitIncidentKey = textValue(readValue("incidentKey", "incident_key", "key"));
   const source = textValue(readValue("source"));
   const taskId = textValue(readValue("taskId", "task_id"));
@@ -247,10 +252,10 @@ function normalizeAlertFile(filePath, fsImpl) {
       : ""
   );
   const text = textValue(readValue("text", "message", "alertText", "summary"));
-  const pending = !sent && (
+  const pending = !sent && !terminal && (
     booleanValue(readValue("pending")) === true
     || ["pending", "retry", "queued"].includes(status)
-    || Boolean(incidentKey)
+    || (!status && Boolean(incidentKey))
   );
   const attemptsValue = Number(readValue("attempts", "retryCount", "retry_count") ?? 0);
   const attempts = Number.isSafeInteger(attemptsValue) && attemptsValue >= 0 ? attemptsValue : 0;
@@ -398,6 +403,16 @@ export function parseArguments(argv) {
     "--broker-start-cooldown-ms",
     DEFAULT_BROKER_START_COOLDOWN_MS,
   );
+  const staleNapCatOfflineMs = normalizePositiveInteger(
+    values["stale-napcat-offline-ms"],
+    "--stale-napcat-offline-ms",
+    DEFAULT_STALE_NAPCAT_OFFLINE_MS,
+  );
+  const staleNapCatRecoveryCooldownMs = normalizePositiveInteger(
+    values["stale-napcat-recovery-cooldown-ms"],
+    "--stale-napcat-recovery-cooldown-ms",
+    DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS,
+  );
   const automationMaintenancePath = resolveOptionalPath(
     values["automation-maintenance"]
       ?? values["automation-maintenance-path"]
@@ -424,6 +439,8 @@ export function parseArguments(argv) {
     probeTimeoutMs,
     loginTimeoutMs,
     loginCooldownMs,
+    staleNapCatOfflineMs,
+    staleNapCatRecoveryCooldownMs,
     brokerStartCooldownMs,
     automationMaintenancePath,
     automationAlertPath,
@@ -600,7 +617,7 @@ export async function checkBrokerHealth(options = {}) {
 }
 
 export async function listWindowsProcesses(options = {}) {
-  const command = "$items = @(Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine); if ($items.Count -eq 0) { '[]' } else { $items | ConvertTo-Json -Compress }";
+  const command = "$items = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate,ExecutablePath); if ($items.Count -eq 0) { '[]' } else { $items | ConvertTo-Json -Compress }";
   const result = await invokePowerShellCommand(command, options);
   return result.value;
 }
@@ -614,11 +631,38 @@ function processId(processRecord) {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 }
 
+function parentProcessId(processRecord) {
+  const value = Number(processRecord?.ParentProcessId ?? processRecord?.parentPid ?? processRecord?.parentProcessId);
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function processIdentityKey(processRecord) {
+  const payload = [
+    processId(processRecord),
+    parentProcessId(processRecord),
+    String(processRecord?.Name ?? processRecord?.name ?? "").toLowerCase(),
+    String(processRecord?.CommandLine ?? processRecord?.commandLine ?? ""),
+    String(processRecord?.CreationDate ?? processRecord?.creationDate ?? ""),
+    String(processRecord?.ExecutablePath ?? processRecord?.executablePath ?? "").toLowerCase(),
+  ];
+  return createHash("sha256").update(JSON.stringify(payload), "utf8").digest("hex");
+}
+
 function summarizeProcesses(processes) {
   return processes.map((item) => ({
     pid: processId(item),
+    parentPid: parentProcessId(item),
     name: String(item?.Name ?? item?.name ?? "").slice(0, 120),
+    identityKey: processIdentityKey(item),
   }));
+}
+
+export function processSnapshotFingerprint(processes) {
+  const identities = normalizeProcessRecords(processes)
+    .map((item) => String(item?.identityKey ?? processIdentityKey(item)))
+    .sort();
+  if (identities.length === 0) return null;
+  return createHash("sha256").update(identities.join("\n"), "utf8").digest("hex");
 }
 
 function normalizeProcessRecords(processes) {
@@ -626,18 +670,81 @@ function normalizeProcessRecords(processes) {
   return processes.filter((item) => item && typeof item === "object");
 }
 
-export function findNapCatProcesses(processes, napcatRoot) {
+export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
   const normalizedRoot = napcatRoot ? path.resolve(napcatRoot).replaceAll("\\", "/").toLowerCase() : null;
+  const normalizedRootPrefix = normalizedRoot ? `${normalizedRoot.replace(/\/+$/, "")}/` : null;
+  const normalizedQqExePath = qqExePath ? path.resolve(qqExePath).replaceAll("\\", "/").toLowerCase() : null;
   return normalizeProcessRecords(processes).filter((item) => {
     const text = processText(item).replaceAll("\\", "/");
     const name = String(item?.Name ?? item?.name ?? "");
-    const belongsToRuntime = Boolean(normalizedRoot && text.includes(normalizedRoot));
+    const commandLine = String(item?.CommandLine ?? item?.commandLine ?? "").trim().replaceAll("\\", "/").toLowerCase();
+    const unquotedCommandLine = commandLine.startsWith('"') ? commandLine.slice(1) : commandLine;
+    const belongsToRuntime = Boolean(normalizedRootPrefix && text.includes(normalizedRootPrefix));
+    const isPinnedQq = Boolean(
+      normalizedQqExePath
+      && /^qq\.exe$/i.test(name)
+      && (
+        unquotedCommandLine === normalizedQqExePath
+        || unquotedCommandLine === `${normalizedQqExePath}"`
+        || unquotedCommandLine.startsWith(`${normalizedQqExePath}" `)
+        || unquotedCommandLine.startsWith(`${normalizedQqExePath} `)
+      )
+    );
     return Boolean(
-      /^napcatwinbootmain\.exe$/i.test(name)
+      (belongsToRuntime && /^napcatwinbootmain\.exe$/i.test(name))
+      || isPinnedQq
       || (belongsToRuntime && /launcher-user\.bat/i.test(text))
-      || (belongsToRuntime && /^(powershell|pwsh)(\.exe)?$/i.test(name) && /start-napcat-login\.ps1/i.test(text)),
+      || (belongsToRuntime && /^(powershell|pwsh)(\.exe)?$/i.test(name) && /start-napcat-login\.ps1/i.test(text))
+      || (belongsToRuntime && /^node(?:\.exe)?$/i.test(name) && /(?:^|[\\/])(?:index\.js|napcat[\\/]napcat\.mjs)(?:[\s"]|$)/i.test(text)),
     );
   });
+}
+
+export function processTreeRootIds(processes) {
+  const normalized = normalizeProcessRecords(processes);
+  const ids = new Set(normalized.map(processId).filter(Boolean));
+  return [...new Set(normalized
+    .filter((item) => {
+      const pid = processId(item);
+      const parentPid = parentProcessId(item);
+      return pid && !ids.has(parentPid);
+    })
+    .map(processId)
+    .filter(Boolean))];
+}
+
+export async function stopWindowsProcessTrees(processes, options = {}) {
+  const roots = normalizeProcessRecords(processes).filter((item) => processTreeRootIds(processes).includes(processId(item)));
+  const rootIds = roots.map(processId).filter((pid) => pid !== Number(options.currentPid ?? process.pid));
+  if (rootIds.length === 0) {
+    const error = new Error("没有可安全停止的 NapCat 根进程");
+    error.code = "NAPCAT_PROCESS_ROOT_NOT_FOUND";
+    throw error;
+  }
+  const currentProcesses = await (options.listProcesses ?? listWindowsProcesses)({
+    ...options,
+    timeoutMs: options.timeoutMs ?? 15_000,
+  });
+  const currentMatches = findNapCatProcesses(currentProcesses, options.napcatRoot, options.qqExePath);
+  const currentByPid = new Map(currentMatches.map((item) => [processId(item), item]));
+  const stopped = [];
+  for (const pid of rootIds) {
+    const snapshot = roots.find((item) => processId(item) === pid);
+    const current = currentByPid.get(pid);
+    if (!current || processIdentityKey(current) !== String(snapshot?.identityKey ?? processIdentityKey(snapshot))) {
+      continue;
+    }
+    await execFilePromise(options.taskkillPath ?? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), [
+      "/PID", String(pid), "/T", "/F",
+    ], { ...options, timeoutMs: options.timeoutMs ?? 15_000 });
+    stopped.push(pid);
+  }
+  if (stopped.length === 0) {
+    const error = new Error("NapCat 进程身份已变化，拒绝按旧 PID 停止进程");
+    error.code = "NAPCAT_PROCESS_IDENTITY_CHANGED";
+    throw error;
+  }
+  return { stopped: true, rootProcessIds: stopped };
 }
 
 export function findCodexProcesses(processes) {
@@ -677,7 +784,7 @@ function processCheckResult(processes) {
 
 export async function checkNapCatProcesses(options = {}) {
   const processes = options.processes ?? await listWindowsProcesses(options);
-  return processCheckResult(findNapCatProcesses(processes, options.napcatRoot));
+  return processCheckResult(findNapCatProcesses(processes, options.napcatRoot, options.qqExePath));
 }
 
 export async function checkCodexProcesses(options = {}) {
@@ -713,16 +820,18 @@ export function normalizeNapCatStatus(value) {
     return { known: true, reachable: value, online: value, accountMatches: value, ready: value };
   }
   const runtimeOnline = normalizeBoolean(value?.runtimeStatus?.online);
-  const online = normalizeBoolean(value?.online) ?? runtimeOnline ?? (value?.ready === true ? true : false);
+  const readySignal = normalizeBoolean(value?.ready);
+  const onlineSignal = normalizeBoolean(value?.online) ?? runtimeOnline ?? (readySignal === true ? true : null);
   const accountMatches = normalizeBoolean(value?.accountMatches)
-    ?? (value?.identityError ? false : value?.identity ? true : value?.ready === true);
+    ?? (value?.identityError ? false : value?.identity ? true : readySignal === true ? true : null);
   const reachable = value?.reachable !== false;
+  const known = value?.known !== false && !value?.error && onlineSignal !== null;
   return {
-    known: value?.known !== false && !value?.error,
+    known,
     reachable,
-    online,
-    accountMatches,
-    ready: reachable && online && accountMatches,
+    online: onlineSignal === true,
+    accountMatches: accountMatches === true,
+    ready: known && reachable && onlineSignal === true && accountMatches === true,
     error: value?.error ?? value?.identityError ?? null,
     runtimeStatus: value?.runtimeStatus ?? null,
     identity: value?.identity ?? null,
@@ -994,6 +1103,13 @@ function actionError(error) {
   return publicError(error, "SUPERVISOR_ACTION_FAILED");
 }
 
+function requiresManualLogin(error) {
+  const code = String(error?.code ?? "");
+  const message = String(error?.message ?? "");
+  return code === "NAPCAT_MANUAL_LOGIN_REQUIRED"
+    || message.includes("[NAPCAT_MANUAL_LOGIN_REQUIRED]");
+}
+
 export async function runSupervisorService(options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const processObject = options.processObject ?? process;
@@ -1033,6 +1149,16 @@ export async function runSupervisorService(options = {}) {
   const probeTimeoutMs = normalizePositiveInteger(options.probeTimeoutMs, "probeTimeoutMs", DEFAULT_PROBE_TIMEOUT_MS);
   const loginTimeoutMs = normalizePositiveInteger(options.loginTimeoutMs, "loginTimeoutMs", DEFAULT_LOGIN_TIMEOUT_MS);
   const loginCooldownMs = normalizePositiveInteger(options.loginCooldownMs, "loginCooldownMs", DEFAULT_LOGIN_COOLDOWN_MS);
+  const staleNapCatOfflineMs = normalizePositiveInteger(
+    options.staleNapCatOfflineMs,
+    "staleNapCatOfflineMs",
+    DEFAULT_STALE_NAPCAT_OFFLINE_MS,
+  );
+  const staleNapCatRecoveryCooldownMs = normalizePositiveInteger(
+    options.staleNapCatRecoveryCooldownMs,
+    "staleNapCatRecoveryCooldownMs",
+    DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS,
+  );
   const brokerStartCooldownMs = normalizePositiveInteger(
     options.brokerStartCooldownMs,
     "brokerStartCooldownMs",
@@ -1116,6 +1242,15 @@ export async function runSupervisorService(options = {}) {
       lastAttemptAt: previousLogin.lastAttemptAt ?? null,
       nextAllowedAt: previousLogin.nextAllowedAt ?? null,
       lastResult: previousLogin.lastResult ?? null,
+      blocked: previousLogin.blocked === true,
+      blockedAt: previousLogin.blockedAt ?? null,
+      blockedReason: previousLogin.blockedReason ?? null,
+      offlineProcessSince: previousLogin.offlineProcessSince ?? null,
+      offlineProcessFingerprint: previousLogin.offlineProcessFingerprint ?? null,
+      staleRecoveryLastAttemptAt: previousLogin.staleRecoveryLastAttemptAt ?? null,
+      staleRecoveryNextAllowedAt: previousLogin.staleRecoveryNextAllowedAt ?? null,
+      staleRecoveryCount: Number(previousLogin.staleRecoveryCount ?? 0),
+      staleRecoveryLastResult: previousLogin.staleRecoveryLastResult ?? null,
     },
     brokerStart: {
       lastAttemptAt: previousBrokerStart.lastAttemptAt ?? null,
@@ -1156,6 +1291,15 @@ export async function runSupervisorService(options = {}) {
   let cycleCount = 0;
   let loginLastAttemptAt = previousLogin.lastAttemptAt ?? null;
   let loginNextAllowedAt = previousLogin.nextAllowedAt ?? null;
+  let loginBlocked = previousLogin.blocked === true;
+  let loginBlockedAt = previousLogin.blockedAt ?? null;
+  let loginBlockedReason = previousLogin.blockedReason ?? null;
+  let offlineProcessSince = previousLogin.offlineProcessSince ?? null;
+  let offlineProcessFingerprint = previousLogin.offlineProcessFingerprint ?? null;
+  let staleRecoveryLastAttemptAt = previousLogin.staleRecoveryLastAttemptAt ?? null;
+  let staleRecoveryNextAllowedAt = previousLogin.staleRecoveryNextAllowedAt ?? null;
+  let staleRecoveryCount = Number(previousLogin.staleRecoveryCount ?? 0);
+  let staleRecoveryLastResult = previousLogin.staleRecoveryLastResult ?? null;
   let brokerLastAttemptAt = previousBrokerStart.lastAttemptAt ?? null;
   let brokerNextAllowedAt = previousBrokerStart.nextAllowedAt ?? null;
 
@@ -1242,6 +1386,12 @@ export async function runSupervisorService(options = {}) {
   const checkBrokerProcess = options.checkBrokerProcesses
     ?? options.brokerProcessCheck
     ?? (() => getProcessSnapshot().then((processes) => checkBrokerProcesses(processSnapshotOptions(dependencies, options, processes))));
+  const stopNapCatProcessTrees = options.stopNapCatProcesses
+    ?? ((input) => stopWindowsProcessTrees(input.processes, {
+      ...options,
+      currentPid: pid,
+      timeoutMs: Math.max(15_000, probeTimeoutMs),
+    }));
 
   const capture = async (callback, input, fallback) => {
     try {
@@ -1385,17 +1535,94 @@ export async function runSupervisorService(options = {}) {
         actions.brokerStart = { attempted: false, reason: "script_missing" };
       }
 
+      const offlineProcessKnown = Boolean(
+        napcat.known
+        && !napcat.online
+        && napcatProcess.known
+        && napcatProcess.present
+      );
+      const currentOfflineProcessFingerprint = offlineProcessKnown
+        ? processSnapshotFingerprint(napcatProcess.processes)
+        : null;
+      if (napcat.ready || (napcatProcess.known && !napcatProcess.present)) {
+        offlineProcessSince = null;
+        offlineProcessFingerprint = null;
+      } else if (offlineProcessKnown && currentOfflineProcessFingerprint !== offlineProcessFingerprint) {
+        offlineProcessSince = checkAt;
+        offlineProcessFingerprint = currentOfflineProcessFingerprint;
+      } else if (offlineProcessKnown && !offlineProcessSince) {
+        offlineProcessSince = checkAt;
+      }
+      const parsedOfflineProcessSince = Date.parse(offlineProcessSince ?? "");
+      const offlineProcessDurationMs = Number.isFinite(parsedOfflineProcessSince)
+        ? Math.max(0, nowMs(clock) - parsedOfflineProcessSince)
+        : 0;
+      let staleProcessRecovered = false;
+      if (
+        offlineProcessKnown
+        && !loginBlocked
+        && offlineProcessDurationMs >= staleNapCatOfflineMs
+        && cooldownReady(staleRecoveryLastAttemptAt, clock, staleNapCatRecoveryCooldownMs)
+      ) {
+        staleRecoveryLastAttemptAt = checkAt;
+        staleRecoveryNextAllowedAt = nextTimeIso(clock, staleNapCatRecoveryCooldownMs);
+        try {
+          const stopped = await stopNapCatProcessTrees({
+            processes: napcatProcess.processes,
+            napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+            startedAt: checkAt,
+          });
+          staleRecoveryCount += 1;
+          staleRecoveryLastResult = "stopped";
+          offlineProcessSince = null;
+          offlineProcessFingerprint = null;
+          staleProcessRecovered = true;
+          actions.staleNapCatRecovery = {
+            attempted: true,
+            succeeded: true,
+            stoppedProcessIds: stopped.rootProcessIds ?? [],
+          };
+        } catch (error) {
+          const value = actionError(error);
+          staleRecoveryLastResult = value;
+          actions.staleNapCatRecovery = { attempted: true, succeeded: false, error: value };
+          errors.push({ source: "stale_napcat_recovery", error: value });
+        }
+      } else if (offlineProcessKnown) {
+        actions.staleNapCatRecovery = {
+          attempted: false,
+          reason: loginBlocked
+            ? "manual_login_required"
+            : (offlineProcessDurationMs < staleNapCatOfflineMs ? "grace_period" : "cooldown"),
+          offlineProcessSince,
+          offlineProcessFingerprint,
+          offlineProcessDurationMs,
+        };
+      }
+
       const quickLoginEligible = Boolean(
         !napcat.online
         && napcatRuntime.known
         && napcatRuntime.ready
         && napcatProcess.known
-        && !napcatProcess.present
+        && (!napcatProcess.present || staleProcessRecovered)
       );
-      if (
+      if (napcat.ready && loginBlocked) {
+        loginBlocked = false;
+        loginBlockedAt = null;
+        loginBlockedReason = null;
+      }
+      if (quickLoginEligible && loginBlocked) {
+        actions.quickLogin = {
+          attempted: false,
+          reason: "manual_login_required",
+          noQr: true,
+          error: loginBlockedReason,
+        };
+      } else if (
         quickLoginEligible
         && typeof runLogin === "function"
-        && cooldownReady(loginLastAttemptAt, clock, loginCooldownMs)
+        && (staleProcessRecovered || cooldownReady(loginLastAttemptAt, clock, loginCooldownMs))
       ) {
         loginLastAttemptAt = checkAt;
         loginNextAllowedAt = nextTimeIso(clock, loginCooldownMs);
@@ -1414,6 +1641,11 @@ export async function runSupervisorService(options = {}) {
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: "started" };
         } catch (error) {
           const value = actionError(error);
+          if (requiresManualLogin(value)) {
+            loginBlocked = true;
+            loginBlockedAt = checkAt;
+            loginBlockedReason = value;
+          }
           actions.quickLogin = { attempted: true, succeeded: false, noQr: true, error: value };
           errors.push({ source: "quick_login", error: value });
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
@@ -1430,7 +1662,14 @@ export async function runSupervisorService(options = {}) {
       } else if (quickLoginEligible && typeof runLogin !== "function") {
         actions.quickLogin = { attempted: false, reason: "script_missing", noQr: true };
       } else if (!napcat.online && napcatProcess.present) {
-        actions.quickLogin = { attempted: false, reason: "napcat_process_present", noQr: true };
+        actions.quickLogin = {
+          attempted: false,
+          reason: "napcat_process_present",
+          noQr: true,
+          offlineProcessSince,
+          offlineProcessFingerprint,
+          offlineProcessDurationMs,
+        };
       } else if (quickLoginEligible && !cooldownReady(loginLastAttemptAt, clock, loginCooldownMs)) {
         actions.quickLogin = { attempted: false, reason: "cooldown", noQr: true };
       }
@@ -1642,6 +1881,15 @@ export async function runSupervisorService(options = {}) {
         ...status.login,
         lastAttemptAt: loginLastAttemptAt,
         nextAllowedAt: loginNextAllowedAt,
+        blocked: loginBlocked,
+        blockedAt: loginBlockedAt,
+        blockedReason: loginBlockedReason,
+        offlineProcessSince,
+        offlineProcessFingerprint,
+        staleRecoveryLastAttemptAt,
+        staleRecoveryNextAllowedAt,
+        staleRecoveryCount,
+        staleRecoveryLastResult,
       };
       status.brokerStart = {
         ...status.brokerStart,

@@ -11,9 +11,13 @@ import {
   findBrokerProcesses,
   findCodexProcesses,
   findNapCatProcesses,
+  normalizeNapCatStatus,
   parseArguments,
+  processSnapshotFingerprint,
+  processTreeRootIds,
   runQuickLogin,
   runSupervisorService,
+  stopWindowsProcessTrees,
   invokePowerShellScript,
 } from "../src/supervisor-runner.mjs";
 
@@ -202,6 +206,7 @@ test("独立 QQ 路径会纳入运行完整性检查，旧配置仍保持兼容"
 
 test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径误判为目标进程", () => {
   const napcatRoot = "C:\\Users\\ExampleUser\\NapCat-Codex";
+  const pinnedQqPath = "C:\\Users\\ExampleUser\\NapCat-QQ\\QQ.exe";
   const processes = [
     { ProcessId: 1, Name: "node.exe", CommandLine: `node C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\src\\supervisor-runner.mjs --login-script C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\ops\\start-napcat-login.ps1 --napcat-root "${napcatRoot}"` },
     { ProcessId: 2, Name: "QQ.exe", CommandLine: '"C:\\Program Files\\Tencent\\QQNT\\QQ.exe"' },
@@ -210,10 +215,43 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
     { ProcessId: 5, Name: "ChatGPT.exe", CommandLine: '"C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0_x64\\app\\ChatGPT.exe" --type=crashpad-handler --user-data-dir=C:\\Users\\ExampleUser\\AppData\\Roaming\\Codex' },
     { ProcessId: 6, Name: "ChatGPT.exe", CommandLine: '"C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0_x64\\app\\ChatGPT.exe"' },
     { ProcessId: 7, Name: "codex.exe", CommandLine: '"C:\\Program Files\\WindowsApps\\OpenAI.Codex_1.0_x64\\app\\resources\\codex.exe" app-server' },
+    { ProcessId: 8, Name: "NapCatWinBootMain.exe", CommandLine: '"C:\\Users\\Other\\NapCatWinBootMain.exe"' },
+    { ProcessId: 9, Name: "node.exe", CommandLine: `"C:\\Program Files\\nodejs\\node.exe" "${napcatRoot}\\index.js"` },
+    { ProcessId: 10, Name: "node.exe", CommandLine: `"C:\\Program Files\\nodejs\\node.exe" "${napcatRoot}\\napcat\\napcat.mjs" 10001` },
+    { ProcessId: 11, Name: "QQ.exe", CommandLine: `"${pinnedQqPath}" --no-sandbox` },
+    { ProcessId: 12, Name: "QQ.exe", CommandLine: `"${pinnedQqPath}"` },
+    { ProcessId: 13, Name: "NapCatWinBootMain.exe", CommandLine: '"C:\\Users\\ExampleUser\\NapCat-Codex-Other\\NapCatWinBootMain.exe"' },
   ];
-  assert.deepEqual(findNapCatProcesses(processes, napcatRoot).map((item) => item.ProcessId), [3]);
+  assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12]);
   assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp").map((item) => item.ProcessId), [4]);
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
+});
+
+test("缺失 online 字段属于未知状态，不能累计到陈旧进程自动停止", async () => {
+  const fixture = createFixture();
+  let stopCount = 0;
+  const processes = [{ pid: 6001, parentPid: 5000, name: "node.exe" }];
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        offlineProcessSince: "2026-07-24T07:00:00.000Z",
+        offlineProcessFingerprint: processSnapshotFingerprint(processes),
+      },
+    });
+    assert.equal(normalizeNapCatStatus({ reachable: true, accountMatches: true }).known, false);
+    await runSupervisorService(baseOptions(fixture, {
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      staleNapCatOfflineMs: 60_000,
+      checkNapCatStatus: async () => ({ reachable: true, accountMatches: true }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes }),
+      stopNapCatProcesses() {
+        stopCount += 1;
+      },
+    }));
+    assert.equal(stopCount, 0);
+  } finally {
+    fixture.cleanup();
+  }
 });
 
 test("监督器与 task router 使用彼此独立的 runtime、stop 和 lock 文件", () => {
@@ -501,6 +539,246 @@ test("runtime 中的 quick-login 冷却会跨监督器重启保留", async () =>
     }));
     assert.equal(attempts.length, 1);
     assert.equal(readRuntime(fixture).actions.quickLogin.reason, "cooldown");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat 恢复在线后会清除跨重启保留的离线进程计时", async () => {
+  const fixture = createFixture();
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        offlineProcessSince: "2026-07-24T07:00:00.000Z",
+        staleRecoveryLastAttemptAt: "2026-07-24T07:05:00.000Z",
+        staleRecoveryNextAllowedAt: "2026-07-24T07:10:00.000Z",
+        staleRecoveryCount: 2,
+        staleRecoveryLastResult: "stopped",
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes: [{ pid: 7003, name: "node.exe" }] }),
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(runtime.login.offlineProcessSince, null);
+    assert.equal(runtime.login.staleRecoveryCount, 2);
+    assert.equal(runtime.actions.staleNapCatRecovery, undefined);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("跨重启发现新的 NapCat 进程身份后重新开始离线宽限期", async () => {
+  const fixture = createFixture();
+  let stopCount = 0;
+  const currentProcesses = [{ pid: 7101, parentPid: 5000, name: "node.exe" }];
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        offlineProcessSince: "2026-07-24T07:00:00.000Z",
+        offlineProcessFingerprint: "old-process-fingerprint",
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      staleNapCatOfflineMs: 60_000,
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes: currentProcesses }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses() {
+        stopCount += 1;
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCount, 0);
+    assert.equal(runtime.login.offlineProcessSince, "2026-07-24T08:00:00.000Z");
+    assert.equal(runtime.login.offlineProcessFingerprint, processSnapshotFingerprint(currentProcesses));
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "grace_period");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat 连续离线超过宽限期时只停止匹配进程树并立即无二维码恢复", async () => {
+  const fixture = createFixture();
+  let currentTime = new Date("2026-07-24T08:00:00.000Z");
+  let waitCount = 0;
+  const stopCalls = [];
+  const loginCalls = [];
+  try {
+    await runSupervisorService(baseOptions(fixture, {
+      once: false,
+      now: () => currentTime,
+      scanIntervalMs: 60_000,
+      staleNapCatOfflineMs: 120_000,
+      staleNapCatRecoveryCooldownMs: 300_000,
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({
+        known: true,
+        present: true,
+        processes: [
+          { pid: 6001, parentPid: 5000, name: "cmd.exe" },
+          { pid: 6002, parentPid: 6001, name: "node.exe" },
+        ],
+      }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses(input) {
+        stopCalls.push(input);
+        return { stopped: true, rootProcessIds: [6001] };
+      },
+      quickLogin(input) {
+        loginCalls.push(input);
+      },
+      wait: async () => {
+        waitCount += 1;
+        currentTime = new Date(currentTime.getTime() + 60_000);
+        if (waitCount >= 3) fs.writeFileSync(fixture.stopFilePath, "stop\n", "utf8");
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCalls.length, 1);
+    assert.deepEqual(stopCalls[0].processes.map((item) => item.pid), [6001, 6002]);
+    assert.equal(loginCalls.length, 1);
+    assert.equal(loginCalls[0].noQr, true);
+    assert.equal(runtime.login.staleRecoveryCount, 1);
+    assert.equal(runtime.login.offlineProcessSince, null);
+    assert.equal(runtime.actions.staleNapCatRecovery.succeeded, true);
+    assert.equal(runtime.actions.quickLogin.succeeded, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("人工登录阻断或未知状态时不会停止现有 NapCat 进程", async () => {
+  for (const scenario of ["blocked", "unknown"]) {
+    const fixture = createFixture();
+    let stopCount = 0;
+    try {
+      if (scenario === "blocked") {
+        atomicWriteJson(fixture.runtimeStatePath, {
+          login: {
+            blocked: true,
+            blockedAt: "2026-07-24T07:00:00.000Z",
+            blockedReason: { code: "NAPCAT_MANUAL_LOGIN_REQUIRED", message: "需要人工登录" },
+            offlineProcessSince: "2026-07-24T07:00:00.000Z",
+          },
+        });
+      }
+      await runSupervisorService(baseOptions(fixture, {
+        now: () => new Date("2026-07-24T08:00:00.000Z"),
+        staleNapCatOfflineMs: 60_000,
+        checkNapCatStatus: async () => scenario === "unknown"
+          ? ({ known: false, reachable: false, online: false, accountMatches: false, error: { code: "TIMEOUT", message: "timeout" } })
+          : ({ known: true, reachable: true, online: false, accountMatches: false }),
+        checkNapCatProcesses: async () => ({ known: true, present: true, processes: [{ pid: 6001, parentPid: 5000, name: "cmd.exe" }] }),
+        getOpenTaskCount: async () => 0,
+        stopNapCatProcesses() {
+          stopCount += 1;
+        },
+      }));
+      assert.equal(stopCount, 0, scenario);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+});
+
+test("进程树根节点计算与 taskkill 调用只覆盖匹配根进程", async () => {
+  const napcatRoot = "C:\\Users\\ExampleUser\\NapCat";
+  const processes = [
+    { pid: 6101, parentPid: 5000, name: "cmd.exe", commandLine: `cmd /c "${napcatRoot}\\launcher-user.bat"` },
+    { pid: 6102, parentPid: 6101, name: "node.exe", commandLine: `node "${napcatRoot}\\index.js"` },
+    { pid: 6201, parentPid: 5001, name: "cmd.exe", commandLine: `cmd /c "${napcatRoot}\\launcher-user.bat"` },
+  ];
+  assert.deepEqual(processTreeRootIds(processes), [6101, 6201]);
+  const calls = [];
+  await stopWindowsProcessTrees(processes, {
+    currentPid: 9999,
+    napcatRoot,
+    taskkillPath: "taskkill.exe",
+    listProcesses: async () => processes,
+    execFileImpl(file, args, options, callback) {
+      calls.push({ file, args, options });
+      callback(null, "SUCCESS", "");
+    },
+  });
+  assert.deepEqual(calls.map((call) => call.args), [
+    ["/PID", "6101", "/T", "/F"],
+    ["/PID", "6201", "/T", "/F"],
+  ]);
+});
+
+test("停止前 PID 身份改变时拒绝 taskkill", async () => {
+  const napcatRoot = "C:\\Users\\ExampleUser\\NapCat";
+  const snapshot = [{
+    pid: 6101,
+    parentPid: 5000,
+    name: "cmd.exe",
+    commandLine: `cmd /c "${napcatRoot}\\launcher-user.bat"`,
+  }];
+  let taskkillCount = 0;
+  await assert.rejects(
+    stopWindowsProcessTrees(snapshot, {
+      currentPid: 9999,
+      napcatRoot,
+      listProcesses: async () => [{
+        pid: 6101,
+        parentPid: 5000,
+        name: "codex.exe",
+        commandLine: "codex.exe app-server",
+      }],
+      execFileImpl(file, args, options, callback) {
+        taskkillCount += 1;
+        callback(null, "SUCCESS", "");
+      },
+    }),
+    (error) => error.code === "NAPCAT_PROCESS_IDENTITY_CHANGED",
+  );
+  assert.equal(taskkillCount, 0);
+});
+
+test("快速登录明确要求人工扫码后跨监督器重启停止重试，真实在线后自动解除", async () => {
+  const fixture = createFixture();
+  let attempts = 0;
+  const offline = async () => ({ known: true, reachable: true, online: false, accountMatches: false });
+  const noProcess = async () => ({ known: true, present: false });
+  try {
+    const common = {
+      checkNapCatStatus: offline,
+      checkNapCatProcesses: noProcess,
+      getOpenTaskCount: async () => 0,
+      quickLogin() {
+        attempts += 1;
+        const error = new Error("[NAPCAT_MANUAL_LOGIN_REQUIRED] 快速登录记录已不可用");
+        error.code = "NAPCAT_MANUAL_LOGIN_REQUIRED";
+        throw error;
+      },
+    };
+    await runSupervisorService(baseOptions(fixture, common));
+    let runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.login.blockedReason.code, "NAPCAT_MANUAL_LOGIN_REQUIRED");
+
+    await runSupervisorService(baseOptions(fixture, {
+      ...common,
+      now: () => new Date("2026-07-24T08:05:00.000Z"),
+    }));
+    runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+
+    await runSupervisorService(baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true, ready: true }),
+      checkNapCatProcesses: async () => ({ known: true, present: true }),
+      getOpenTaskCount: async () => 0,
+      now: () => new Date("2026-07-24T08:06:00.000Z"),
+    }));
+    runtime = readRuntime(fixture);
+    assert.equal(runtime.login.blocked, false);
+    assert.equal(runtime.login.blockedAt, null);
+    assert.equal(runtime.login.blockedReason, null);
   } finally {
     fixture.cleanup();
   }

@@ -69,6 +69,7 @@ const eventProperties = {
     type: "string",
     description: "调用方生成的唯一去重键；同一事件重试必须复用同一个值。",
   },
+  delivery_id: { type: "string", minLength: 1, maxLength: 128, description: "可选稳定送达编号；省略时由 dedupe_key 确定性生成。" },
   run_id: { type: "string", description: "可选运行编号。" },
   progress: { type: "string", description: "可选进度，例如 epoch 3/10 或 step 18000。" },
   checkpoint_at: { type: "string", description: "可选最近完整 checkpoint 时间。" },
@@ -90,6 +91,26 @@ const readInputSchema = {
     message_seq: { type: "string", description: "可选起始消息序号，用于向前分页。" },
     reverse_order: { type: "boolean", description: "是否反向排序，默认 false。" },
     task_id: { type: "string", minLength: 1, maxLength: 128, description: "可选任务 ID；提供时只返回正文中含精确“任务：<task_id>”标记的消息。" },
+    include_self_history: { type: "boolean", description: "诊断时显式包含当前账号自己的 self 历史；默认 false，任务扫描不得开启。" },
+  },
+  additionalProperties: false,
+};
+
+const groupFileStatusInputSchema = {
+  type: "object",
+  properties: {
+    target_key: {
+      type: "string",
+      minLength: 1,
+      maxLength: 64,
+      description: "可选 binding.controlPlane.targets 里的群聊目标；省略时查询固定 ExampleGroup 群。",
+    },
+    file_count: {
+      type: "integer",
+      minimum: 1,
+      maximum: 100,
+      description: "读取根目录最近文件数量，默认 20，最多 100。",
+    },
   },
   additionalProperties: false,
 };
@@ -390,6 +411,12 @@ const tools = [
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
   {
+    name: "napcat_group_file_status",
+    description: "只读核对固定 ExampleGroup 群或配置群目标的群文件系统信息和根目录文件列表，用于诊断 upload_group_file/rich media transfer failed；不发送文件、不写去重账本。",
+    inputSchema: groupFileStatusInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
     name: "napcat_download_file",
     description: "通过最近消息或任务文件索引返回的原始 file_id/fileUuid 下载固定 ExampleGroup 群文件；首次 URL 查询失败时会刷新对应群历史后重试，不能指定群号或下载 URL，也不会覆盖已有文件。",
     inputSchema: downloadInputSchema,
@@ -585,6 +612,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_read_recent") {
       return textResult({ ok: true, ...(await notifier.readRecentMessages(args)) });
+    }
+    if (name === "napcat_group_file_status") {
+      return textResult({ ok: true, ...(await notifier.groupFileStatus(args)) });
     }
     if (name === "napcat_download_file") {
       return textResult({ ok: true, ...(await notifier.downloadFile(args)) });

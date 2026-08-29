@@ -44,6 +44,8 @@
 | `NAPCAT_MAX_FILE_BYTES` | `2147483648` | 单文件默认上限 2 GiB |
 | `MCP_SDK_ROOT` | 由 broker 注入 | MCP SDK 的 `dist\esm` 路径 |
 
+`napcat_status` 会分开报告「OneBot HTTP 端口可访问」与「QQ 账号确实在线」。`reachable=true` 只表示本机能访问 OneBot，不能说明 QQ 已登录；只有 `runtimeStatus.online===true`、`runtimeStatus.good===true`、账号身份和所需目标核验都通过时，`ready` 才为 `true`。状态字段缺失、`null` 或明确离线都会按不可发送处理，避免把活着的 HTTP 进程误当成可用 QQ 会话。
+
 缺少 token 时默认拒绝连接。只有测试环境显式设置 `NAPCAT_ALLOW_EMPTY_TOKEN=1` 才允许空 token。
 
 ## 去重与未知结果
@@ -57,6 +59,8 @@
 ## 固定群文件上传
 
 `napcat_send_file` 只接受本机绝对文件路径、可选显示文件名和去重键，不接受群号。上传前会确认文件存在、不是空文件、大小未超限，计算 SHA256，再次校验登录账号和固定绑定群；上传后调用 `get_group_root_files`，按文件名、大小和可用的上传者信息核验。
+
+群文件上传前默认会调用 `get_group_file_system_info` 检查文件数量，并以 `NAPCAT_GROUP_FILE_COUNT_LIMIT`（默认 1500）作为 QQ 客户端实际数量上限；NapCat 返回的 `limit_count` 只作为诊断参考，因为它可能高于 QQ 客户端真实限制。达到或超过上限时，工具会列出根目录文件，按 `upload_time/modify_time` 从旧到新删除最多 `NAPCAT_GROUP_FILE_CLEANUP_BATCH`（默认 100）个根目录文件，再继续上传。清理只覆盖当前上传目标群，不递归删除文件夹；返回值的 `groupFileCleanup` 会写明检查到的数量、空间字段、删除数量和最多 10 个删除样例。当前自动维护只按文件数量触发，不按 10GB 容量触发；容量字段曾出现与 QQ 客户端显示不一致的情况，因此只保留为诊断信息，不能作为自动删除依据。
 
 若上传请求超时、连接中断、HTTP 错误或缺少 `file_id`，结果按未知处理，同一去重键不会自动重传。正式训练回包应先完成本地双重验包和外置 SHA256，再上传 ZIP；上传结果、群文件 ID、文件大小和 SHA256 写入回包 manifest。
 
@@ -76,7 +80,11 @@ NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可�
 
 ## 任务账本与 Codex 自动唤醒
 
-`napcat_send_text` 可选传入 `task_id`、`source_machine` 和 `target_machine`，正文会写成 `[Codex][TASK_MESSAGE]` 并包含精确的「任务：<task_id>」行。`napcat_read_recent` 传同一个 `task_id` 时，只返回扫描范围内匹配该任务的结构化消息，同时给出 `scannedCount` 和 `returnedCount`；没有任务标记的日常聊天不会被当成任务消息。
+`napcat_send_text` 可选传入 `task_id`、`source_machine` 和 `target_machine`，正文会写成 `[Codex][TASK_MESSAGE]` 并包含精确的「任务：<task_id>」行；普通固定群文本也会携带稳定 `delivery_id`，用于区分正文相同的不同发送尝试。`napcat_read_recent` 传同一个 `task_id` 时，只返回扫描范围内匹配该任务的结构化消息，同时给出 `scannedCount` 和 `returnedCount`；没有任务标记的日常聊天不会被当成任务消息。
+
+NapCat 的 `get_group_msg_history` 本来就包含当前账号自己的消息，并把它们解析为 `message_sent/self`；这既可能是真实已发历史，也可能是在 `send_group_msg` 超时后出现的疑似记录。`real_seq` 只是底层 `msgSeq`，不是唯一消息键，单独的消息 ID、`real_seq` 增长或 self 历史记录都不能证明群成员可见。MCP 因此默认从任务读取结果中抑制全部 self 历史记录，并返回 `suppressedSelfHistoryCount` 供诊断；旧字段 `suppressedUnverifiedLocalEchoCount` 暂时保留作兼容别名。
+
+发送结果未知时，原 `dedupe_key` 保持 `pending_send`，后续同 key 调用只分页检查并持久记录群历史线索，绝不自动重发，也绝不因 self 历史出现而升级成功。多条候选、序号复用、缺少序号或没有匹配记录都会保留明确的未决原因；只有独立于本机 self 历史的外部证据才能继续结算。跨机任务以对端 `machine_received` / `conversation_received` 证明真实运输，再以业务回包或 ACK 证明处理完成；普通群消息如需确认用户可见，只能依赖另一个账号观察或人工核对。成功响应后的 `verified` 只表示本机 OneBot 动作与历史字段相互一致，返回中的 `userVisibilityVerified=false` 明确说明它不是群成员可见性回执。
 
 `napcat_send_file` 提供 `task_id`、来源机器和目标机器时，会在文件上传并完成群文件核验后追加 `[Codex][TASK_FILE_INDEX]`，记录文件名、字节数、SHA256 和文件标识。索引发送失败时不会重新上传已核验文件，重试只补索引。
 
@@ -201,7 +209,11 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 
 监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
-有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本会使用 binding 中的 `expectedSelfId` 先尝试该账号的快速登录；授权有效则不显示二维码，授权失效且 NapCat 生成新二维码时才弹出小窗口并阻塞到登录成功或明确失败。监督器始终传 `-NoQr`，不会在无人值守桌面弹出二维码。
+有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本会使用 binding 中的 `expectedSelfId` 先尝试该账号的快速登录；授权有效则不显示二维码，授权失效且 NapCat 生成新二维码时才弹出小窗口并阻塞到登录成功或明确失败。脚本同时兼容 Node 一键包的 `napcat/cache/qrcode.png` 与旧 Shell 布局的 `cache/qrcode.png`。监督器始终传 `-NoQr`，首次检测到本轮新二维码后返回 `NAPCAT_MANUAL_LOGIN_REQUIRED` 并持久阻断后续自动登录；只有真实 OneBot 在线后才解除阻断，因此不会在无人值守桌面弹二维码，也不会按冷却周期反复制造登录尝试。
+
+QQ 服务端主动返回 `KickedOffLine` 或「用户身份已失效」时，本地快速登录票据可能已经不可用。需要无人值守恢复时，可由账号主人在本机交互式运行 `ops/set-napcat-quick-login-credential.ps1`，输入一次账号密码。脚本只在内存中计算密码 MD5，使用 Windows DPAPI CurrentUser 加密后写入私有 data root 的 `private/napcat-login/credential.json`；专用 `napcat-login` 目录在写入前即限制为当前用户与 SYSTEM FullControl，公开仓库、binding、日志和普通环境配置均不保存明文、MD5 或可枚举的账号哈希。登录脚本只把解密后的 MD5 放入新启动的 NapCat 子进程环境，不拼入命令行，并尽量缩短 PowerShell 托管字符串的引用生命周期；受 .NET 字符串和 NapCat 上游环境变量接口限制，这不等于对内存或子进程环境做了可证明的物理擦除，同一 Windows 用户的恶意进程或内存转储仍属于信任边界。MD5 仍属于密码等价物，因此不得复制到其它机器、上传仓库、写入命令行或保存进普通环境配置；训练机必须由训练机主人在当地 Windows 用户下单独配置。
+
+配置了加密密码回退后，`-NoQr` 看到二维码不会立即杀进程，而会给 NapCat 15～45 秒完成密码回退；日志明确出现密码失败、验证码、新设备或异常设备验证时，才进入人工登录阻断。若 OneBot 已明确离线但旧 NapCat 进程仍存活超过默认 120 秒，监督器只停止当前 NapCat runtime 或固定 QQ 路径匹配到的进程树，再执行一次无二维码恢复；不会停止桌面 QQ、broker、Codex App Server 或外层代理。真实在线后会清除跨重启保留的离线计时。QQ 风控、验证码或设备授权被服务端真正撤销时仍可能需要人工验证，本机制负责消除本地僵尸进程、错误二维码路径和重复拉起造成的额外扫码，不宣称绕过 QQ 的服务端安全策略。
 
 需要让机器人 QQ 不受日常桌面 QQ 自动升级影响时，把一个经过官方签名验证、且被当前 NapCat PacketBackend 精确支持的 QQ 版本放在独立目录，并在私有 `napcat-runtime.json` 中同时记录 `napCatRoot` 与绝对 `qqExePath`。`ops/set-napcat-runtime.ps1 -ValidateOnly` 会先核对 QQ 签名、四段版本号、`napcat.mjs` 中的精确 `版本-x64` 映射、必需的 BootMain/Hook 文件和可选 SHA256，全程不写运行态；去掉 `-ValidateOnly` 后才会原字节备份旧 runtime、原子写入新路径并复核，失败自动恢复。输出中的 `backupPath` 可交给同一脚本的 `-Rollback -BackupPath <path>` 精确回退。独立路径启用后，登录脚本会直接使用该 QQ，不再读取系统 QQ 注册表；未配置 `qqExePath` 的旧安装仍保持原行为。
 
