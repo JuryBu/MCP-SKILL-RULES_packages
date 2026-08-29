@@ -297,7 +297,7 @@ MCP memory-store 是跨对话持久化知识的主要方式：
 ### Codex 侧特有要求
 
 - `conversation_read_original`、`record_manage`、`stage_guard`、`conversation_golden_extract` 这类受宿主链路影响的工具，必须显式传入稳定 `conversationId`；HTTP broker 会硬拦截缺少 `conversationId` 的高风险调用
-- 不知道当前线程 ID 时，优先用 Codex 进程工具 `codex_app__list_threads` 筛选 `status=active` + 比对当前工作目录定位当前对话 ID；进程工具不可用时回退到 `conversation_read_original(action="list", dataChain="codex", query="标题或关键词", contextProbe="当前可见聊天中 50-120 字独特片段")`
+- 不知道当前线程 ID 时，优先用当前 Codex app MCP 的 `list_threads` 筛选 `status=active` + 比对当前工作目录定位；只有该 MCP 未暴露或同链健康探针失败时，才回退到 `conversation_read_original(action="list", dataChain="codex", query="标题或关键词", contextProbe="当前可见聊天中 50-120 字独特片段")`，不要先调用已停用的动态 `codex_app__list_threads` 外壳。
 - 不要使用 `record_manage(action="batch_update|batch_delete", chain="codex")`；这类批量操作在共享后端是全局任务，容易跨对话影响
 - `record_manage(list/search, scope="workspace")` 默认严格只读指定 workspace，需要合并 general 时显式传 `includeGeneral=true`
 - 读取超长 Record 时，优先用结构化参数：`view="outline|state|outputs|lessons|risks|verification|phase"`、`phaseIds`、`sectionTypes`、`include/exclude`、`maxChars`、`withCitations`，而不是整篇读取
