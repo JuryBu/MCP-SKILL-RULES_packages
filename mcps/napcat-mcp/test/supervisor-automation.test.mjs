@@ -172,6 +172,10 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   const supervisorScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), "utf8");
   assert.match(loginScript, /\$RuntimeConfiguration\.qqExePath/);
   assert.match(loginScript, /\$RuntimeConfiguration\.qqUserDataDir/);
+  assert.match(loginScript, /\$NodeCoreModule = Join-Path \$NapCatRoot "napcat\\napcat\.mjs"/);
+  assert.match(loginScript, /\$ManualLauncher = Join-Path \$NapCatRoot "napcat\.bat"/);
+  assert.match(loginScript, /\$NoQr -or \$HasPasswordFallback/);
+  assert.match(loginScript, /\$SelectedLauncher = if \(\$NoQr -or \$HasPasswordFallback\) \{ \$Launcher \} else \{ \$ManualLauncher \}/);
   assert.match(loginScript, /\$LauncherArguments = " `"\$ExpectedSelfId`""/);
   assert.match(loginScript, /EnvironmentVariables\["APPDATA"\]/);
   assert.match(loginScript, /NAPCAT_QQ_USER_DATA_DIR/);
@@ -181,6 +185,8 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /cache\\qrcode\.png/);
   assert.match(loginScript, /Get-FreshQrCode/);
   assert.match(loginScript, /\$NoQr -and \$null -ne \$QrCode/);
+  assert.match(loginScript, /CommandLineHints/);
+  assert.match(loginScript, /Stop-LaunchedProcessTree -RootProcessId \$ProcessId -CommandLineHints @\(\$NapCatRoot, \$QqExePath\)/);
   assert.match(loginScript, /Test-PasswordFallbackNeedsHuman/);
   assert.match(loginScript, /proofWaterUrl/);
   assert.match(loginScript, /sms-verify-login/);

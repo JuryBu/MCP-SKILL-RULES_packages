@@ -58,6 +58,34 @@ function createFixture() {
   };
 }
 
+function createNodeFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-node-runtime-config-test-"));
+  const dataRoot = path.join(root, "data");
+  const napcatRoot = path.join(root, "node-runtime");
+  const qqUserDataDir = path.join(root, "qq-user-data");
+  const runtimePath = path.join(dataRoot, "napcat-runtime.json");
+  fs.mkdirSync(napcatRoot, { recursive: true });
+  fs.mkdirSync(path.join(napcatRoot, "napcat"), { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.writeFileSync(path.join(napcatRoot, "launcher-user.bat"), "@echo off\nnode.exe index.js -q %1\n", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "napcat.bat"), "@echo off\nnode.exe index.js\n", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "node.exe"), "node", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "index.js"), "import('./napcat.mjs')\n", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "package.json"), `${JSON.stringify({ version: "9.9.32-50969" }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "config.json"), `${JSON.stringify({ curVersion: "9.9.32-50969" }, null, 2)}\n`, "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "napcat.mjs"), "throw new Error('top-level shim should not be validated for node runtime');\n", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "napcat", "napcat.mjs"), 'export const mapping = { "9.9.32-50969-x64": {} };\n', "utf8");
+  fs.writeFileSync(runtimePath, `${JSON.stringify({ schemaVersion: 1, napCatRoot: "C:\\old", qqExePath: "C:\\old\\QQ.exe", preserved: "yes" }, null, 2)}\n`, "utf8");
+  return {
+    root,
+    dataRoot,
+    napcatRoot,
+    qqUserDataDir,
+    runtimePath,
+    cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
+  };
+}
+
 test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节回滚", { skip: process.platform !== "win32" }, () => {
   const fixture = createFixture();
   try {
@@ -94,6 +122,32 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
     assert.equal(rolledBack.action, "rollback");
     assert.equal(rolledBack.beforeSha256, null);
     assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalBytes);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat node runtime 不需要 QQ.exe，应用时会清除旧 qqExePath", { skip: process.platform !== "win32" }, () => {
+  const fixture = createNodeFixture();
+  try {
+    const commonArguments = [
+      "-DataRoot", fixture.dataRoot,
+      "-NapCatRoot", fixture.napcatRoot,
+      "-QqUserDataDir", fixture.qqUserDataDir,
+    ];
+    const validation = runScript([...commonArguments, "-ValidateOnly"]);
+    assert.equal(validation.action, "validate");
+    assert.equal(validation.qqExePath, null);
+    assert.equal(validation.qqVersion, "9.9.32-50969");
+    assert.equal(validation.packetMappingKey, "9.9.32-50969-x64");
+
+    const applied = runScript(commonArguments);
+    assert.equal(applied.action, "apply");
+    const runtime = JSON.parse(fs.readFileSync(fixture.runtimePath, "utf8"));
+    assert.equal(runtime.napCatRoot, path.resolve(fixture.napcatRoot));
+    assert.equal(runtime.qqExePath, undefined);
+    assert.equal(runtime.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
+    assert.equal(runtime.preserved, "yes");
   } finally {
     fixture.cleanup();
   }

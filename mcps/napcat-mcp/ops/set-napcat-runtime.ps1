@@ -96,14 +96,20 @@ if (-not (Test-Path -LiteralPath $RuntimePath -PathType Leaf)) {
   throw "找不到 NapCat runtime：$RuntimePath"
 }
 
-if ([string]::IsNullOrWhiteSpace($NapCatRoot) -or [string]::IsNullOrWhiteSpace($QqExePath)) {
-  throw "配置或验证独立 QQ 运行环境时必须同时提供 -NapCatRoot 与 -QqExePath"
+if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
+  throw "配置或验证 NapCat 运行环境时必须提供 -NapCatRoot"
 }
-if (-not [System.IO.Path]::IsPathRooted($NapCatRoot) -or -not [System.IO.Path]::IsPathRooted($QqExePath)) {
-  throw "NapCatRoot 与 QqExePath 必须是绝对路径"
+if (-not [System.IO.Path]::IsPathRooted($NapCatRoot)) {
+  throw "NapCatRoot 必须是绝对路径"
 }
 $NapCatRoot = [System.IO.Path]::GetFullPath($NapCatRoot).TrimEnd('\')
-$QqExePath = [System.IO.Path]::GetFullPath($QqExePath)
+$UsesIndependentQq = -not [string]::IsNullOrWhiteSpace($QqExePath)
+if ($UsesIndependentQq) {
+  if (-not [System.IO.Path]::IsPathRooted($QqExePath)) {
+    throw "QqExePath 必须是绝对路径"
+  }
+  $QqExePath = [System.IO.Path]::GetFullPath($QqExePath)
+}
 $ResolvedQqUserDataDir = $null
 if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
   if (-not [System.IO.Path]::IsPathRooted($QqUserDataDir)) {
@@ -111,37 +117,67 @@ if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
   }
   $ResolvedQqUserDataDir = [System.IO.Path]::GetFullPath($QqUserDataDir).TrimEnd('\')
 }
-$RequiredPaths = @(
-  $QqExePath,
-  (Join-Path $NapCatRoot "napcat.mjs"),
-  (Join-Path $NapCatRoot "NapCatWinBootMain.exe"),
-  (Join-Path $NapCatRoot "NapCatWinBootHook.dll")
-)
+$DefaultNapCatModulePath = Join-Path $NapCatRoot "napcat.mjs"
+$NodeNapCatModulePath = Join-Path $NapCatRoot "napcat\napcat.mjs"
+$NapCatModulePath = if ($UsesIndependentQq -or -not (Test-Path -LiteralPath $NodeNapCatModulePath -PathType Leaf)) {
+  $DefaultNapCatModulePath
+} else {
+  $NodeNapCatModulePath
+}
+$RequiredPaths = @($NapCatModulePath)
+if ($UsesIndependentQq) {
+  $RequiredPaths += @(
+    $QqExePath,
+    (Join-Path $NapCatRoot "NapCatWinBootMain.exe"),
+    (Join-Path $NapCatRoot "NapCatWinBootHook.dll")
+  )
+} else {
+  $RequiredPaths += @(
+    (Join-Path $NapCatRoot "launcher-user.bat"),
+    (Join-Path $NapCatRoot "napcat.bat"),
+    (Join-Path $NapCatRoot "node.exe"),
+    (Join-Path $NapCatRoot "index.js"),
+    (Join-Path $NapCatRoot "package.json"),
+    (Join-Path $NapCatRoot "config.json")
+  )
+}
 foreach ($RequiredPath in $RequiredPaths) {
   if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
-    throw "独立 QQ 运行环境缺少文件：$RequiredPath"
+    throw "NapCat 运行环境缺少文件：$RequiredPath"
   }
 }
 
-$QqSignature = Get-AuthenticodeSignature -LiteralPath $QqExePath
-if ([string]$QqSignature.Status -ne "Valid") {
-  throw "独立 QQ 主程序签名无效：status=$($QqSignature.Status) path=$QqExePath"
+$QqSha256 = $null
+$QqVersion = $null
+$SignerSubject = $null
+$PacketMappingKey = $null
+if ($UsesIndependentQq) {
+  $QqSignature = Get-AuthenticodeSignature -LiteralPath $QqExePath
+  if ([string]$QqSignature.Status -ne "Valid") {
+    throw "独立 QQ 主程序签名无效：status=$($QqSignature.Status) path=$QqExePath"
+  }
+  $SignerSubject = [string]$QqSignature.SignerCertificate.Subject
+  if ([string]::IsNullOrWhiteSpace($ExpectedSignerSubject) -or $SignerSubject.IndexOf($ExpectedSignerSubject, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
+    throw "独立 QQ 主程序签名主体不匹配。expectedContains=$ExpectedSignerSubject actual=$SignerSubject"
+  }
+  $QqVersion = [string](Get-Item -LiteralPath $QqExePath).VersionInfo.FileVersion
+  if ($QqVersion -notmatch '^(\d+\.\d+\.\d+)\.(\d+)(?:\s.*)?$') {
+    throw "无法从独立 QQ 主程序读取受支持的四段版本号：$QqVersion"
+  }
+  $PacketMappingKey = "$($Matches[1])-$($Matches[2])-x64"
+  $QqSha256 = Test-ExpectedHash -Path $QqExePath -Expected $ExpectedQqSha256 -Label "QQ.exe"
+} else {
+  $PackageJson = Get-Content -LiteralPath (Join-Path $NapCatRoot "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
+  $QqVersion = [string]$PackageJson.version
+  if ($QqVersion -notmatch '^(\d+\.\d+\.\d+)-(\d+)(?:\s.*)?$') {
+    throw "无法从 NapCat node 包 package.json 读取受支持的 QQ 版本号：$QqVersion"
+  }
+  $PacketMappingKey = "$($Matches[1])-$($Matches[2])-x64"
 }
-$SignerSubject = [string]$QqSignature.SignerCertificate.Subject
-if ([string]::IsNullOrWhiteSpace($ExpectedSignerSubject) -or $SignerSubject.IndexOf($ExpectedSignerSubject, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) {
-  throw "独立 QQ 主程序签名主体不匹配。expectedContains=$ExpectedSignerSubject actual=$SignerSubject"
-}
-$QqVersion = [string](Get-Item -LiteralPath $QqExePath).VersionInfo.FileVersion
-if ($QqVersion -notmatch '^(\d+\.\d+\.\d+)\.(\d+)(?:\s.*)?$') {
-  throw "无法从独立 QQ 主程序读取受支持的四段版本号：$QqVersion"
-}
-$PacketMappingKey = "$($Matches[1])-$($Matches[2])-x64"
-$NapCatModulePath = Join-Path $NapCatRoot "napcat.mjs"
 $NapCatSource = Get-Content -LiteralPath $NapCatModulePath -Raw -Encoding UTF8
 if ($NapCatSource.IndexOf('"' + $PacketMappingKey + '"', [System.StringComparison]::Ordinal) -lt 0) {
   throw "NapCat PacketBackend 不包含独立 QQ 的精确映射：$PacketMappingKey"
 }
-$QqSha256 = Test-ExpectedHash -Path $QqExePath -Expected $ExpectedQqSha256 -Label "QQ.exe"
 $NapCatSha256 = Test-ExpectedHash -Path $NapCatModulePath -Expected $ExpectedNapCatSha256 -Label "napcat.mjs"
 $CurrentBytes = [System.IO.File]::ReadAllBytes($RuntimePath)
 $CurrentHash = Get-NormalizedHash -Path $RuntimePath
@@ -150,7 +186,11 @@ $TargetRuntime = [ordered]@{}
 foreach ($Property in $CurrentRuntime.PSObject.Properties) { $TargetRuntime[$Property.Name] = $Property.Value }
 if (-not $TargetRuntime.Contains("schemaVersion")) { $TargetRuntime["schemaVersion"] = 1 }
 $TargetRuntime["napCatRoot"] = $NapCatRoot
-$TargetRuntime["qqExePath"] = $QqExePath
+if ($UsesIndependentQq) {
+  $TargetRuntime["qqExePath"] = $QqExePath
+} elseif ($TargetRuntime.Contains("qqExePath")) {
+  $TargetRuntime.Remove("qqExePath")
+}
 if (-not [string]::IsNullOrWhiteSpace($ResolvedQqUserDataDir)) {
   $TargetRuntime["qqUserDataDir"] = $ResolvedQqUserDataDir
 } elseif ($TargetRuntime.Contains("qqUserDataDir")) {
@@ -165,7 +205,7 @@ if ($ValidateOnly) {
     currentSha256 = $CurrentHash
     napCatRoot = $NapCatRoot
     napCatSha256 = $NapCatSha256
-    qqExePath = $QqExePath
+    qqExePath = if ($UsesIndependentQq) { $QqExePath } else { $null }
     qqUserDataDir = $ResolvedQqUserDataDir
     qqSha256 = $QqSha256
     qqVersion = $QqVersion
@@ -206,7 +246,7 @@ $AppliedHash = Get-NormalizedHash -Path $RuntimePath
   afterSha256 = $AppliedHash
   napCatRoot = $NapCatRoot
   napCatSha256 = $NapCatSha256
-  qqExePath = $QqExePath
+  qqExePath = if ($UsesIndependentQq) { $QqExePath } else { $null }
   qqUserDataDir = $ResolvedQqUserDataDir
   qqSha256 = $QqSha256
   qqVersion = $QqVersion

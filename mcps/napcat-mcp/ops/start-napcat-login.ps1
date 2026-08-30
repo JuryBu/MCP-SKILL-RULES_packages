@@ -56,7 +56,14 @@ if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
   $QqUserDataDir = [System.IO.Path]::GetFullPath($QqUserDataDir).TrimEnd('\')
 }
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
-$CoreModule = Join-Path $NapCatRoot "napcat.mjs"
+$ManualLauncher = Join-Path $NapCatRoot "napcat.bat"
+$DefaultCoreModule = Join-Path $NapCatRoot "napcat.mjs"
+$NodeCoreModule = Join-Path $NapCatRoot "napcat\napcat.mjs"
+$CoreModule = if ([string]::IsNullOrWhiteSpace($QqExePath) -and (Test-Path -LiteralPath $NodeCoreModule -PathType Leaf)) {
+  $NodeCoreModule
+} else {
+  $DefaultCoreModule
+}
 $BootMain = Join-Path $NapCatRoot "NapCatWinBootMain.exe"
 $HookModule = Join-Path $NapCatRoot "NapCatWinBootHook.dll"
 $LoaderModule = Join-Path $NapCatRoot "loadNapCat.js"
@@ -73,6 +80,7 @@ if (-not (Test-Path -LiteralPath $CoreModule -PathType Leaf)) {
 }
 if ([string]::IsNullOrWhiteSpace($QqExePath)) {
   if (-not (Test-Path -LiteralPath $Launcher -PathType Leaf)) { throw "找不到 NapCat launcher：$Launcher" }
+  if (-not $NoQr -and -not (Test-Path -LiteralPath $ManualLauncher -PathType Leaf)) { throw "找不到 NapCat 人工登录 launcher：$ManualLauncher" }
 } else {
   foreach ($RequiredPath in @($QqExePath, $BootMain, $HookModule)) {
     if (-not (Test-Path -LiteralPath $RequiredPath -PathType Leaf)) {
@@ -217,10 +225,35 @@ function New-VerificationWindow {
 }
 
 function Stop-LaunchedProcessTree {
-  param([int]$RootProcessId)
+  param(
+    [int]$RootProcessId,
+    [string[]]$CommandLineHints = @()
+  )
   if ($RootProcessId -le 0) { return }
   try {
     & "$env:SystemRoot\System32\taskkill.exe" /PID $RootProcessId /T /F 2>$null | Out-Null
+  } catch {
+  }
+  $AllowedNames = @("cmd.exe", "node.exe", "QQ.exe", "NapCatWinBootMain.exe")
+  $NormalizedHints = @()
+  foreach ($Hint in $CommandLineHints) {
+    if ([string]::IsNullOrWhiteSpace($Hint)) { continue }
+    try {
+      $NormalizedHints += [System.IO.Path]::GetFullPath($Hint).TrimEnd("\")
+    } catch {
+      $NormalizedHints += $Hint.TrimEnd("\")
+    }
+  }
+  if ($NormalizedHints.Count -eq 0) { return }
+  try {
+    Get-CimInstance Win32_Process |
+      Where-Object {
+        $_.ProcessId -ne $PID -and
+        $AllowedNames -contains $_.Name -and
+        -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and
+        ($NormalizedHints | Where-Object { $_ -and $_.Length -gt 0 -and $_.CommandLine.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+      } |
+      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   } catch {
   }
 }
@@ -285,7 +318,7 @@ function Stop-AndThrowManualLoginRequired {
     [string]$LogPath
   )
   Close-QrWindow -Window $QrWindow
-  Stop-LaunchedProcessTree -RootProcessId $RootProcessId
+  Stop-LaunchedProcessTree -RootProcessId $RootProcessId -CommandLineHints @($NapCatRoot, $QqExePath)
   throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] $Reason，NapCat 要求人工验证。日志：$LogPath"
 }
 
@@ -322,10 +355,11 @@ if (-not (Test-Path -LiteralPath $EmptyInputPath)) {
   [System.IO.File]::WriteAllText($EmptyInputPath, "", (New-Object System.Text.UTF8Encoding($false)))
 }
 $LauncherArguments = ""
-if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+if ($NoQr -or $HasPasswordFallback) {
+  if ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+    throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
+  }
   $LauncherArguments = " `"$ExpectedSelfId`""
-} elseif ($NoQr) {
-  throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
 }
 $QqAppDataRoot = ""
 if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
@@ -335,7 +369,8 @@ if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
   New-Item -ItemType Directory -Force -Path $QqAppDataRoot | Out-Null
 }
 if ([string]::IsNullOrWhiteSpace($QqExePath)) {
-  $CommandArguments = "/d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
+  $SelectedLauncher = if ($NoQr -or $HasPasswordFallback) { $Launcher } else { $ManualLauncher }
+  $CommandArguments = "/d /c `"`"$SelectedLauncher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 } else {
   $CoreUri = ([Uri]$CoreModule).AbsoluteUri
   $LoaderSource = "(async () => {await import(`"$CoreUri`")})()"
@@ -415,7 +450,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
     if ($_.Exception.Message -like "NapCat 登录了错误*") {
       Close-QrWindow -Window $QrWindow
       Close-QrWindow -Window $VerificationWindow
-      Stop-LaunchedProcessTree -RootProcessId $ProcessId
+      Stop-LaunchedProcessTree -RootProcessId $ProcessId -CommandLineHints @($NapCatRoot, $QqExePath)
       throw
     }
   }
@@ -460,7 +495,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
 
 Close-QrWindow -Window $QrWindow
 Close-QrWindow -Window $VerificationWindow
-Stop-LaunchedProcessTree -RootProcessId $ProcessId
+Stop-LaunchedProcessTree -RootProcessId $ProcessId -CommandLineHints @($NapCatRoot, $QqExePath)
 $DisplayIdentity = if ([string]::IsNullOrWhiteSpace($ExpectedNickname)) {
   $ExpectedSelfId
 } elseif ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
