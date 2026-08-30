@@ -4,6 +4,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { createNapCatNotifier } from "./core.mjs";
+import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import { createTaskRegistry } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { acquireInstanceLock, readPrivateEnvironment } from "./task-router-runner.mjs";
@@ -17,6 +18,10 @@ export const DEFAULT_STALE_NAPCAT_UNKNOWN_MS = 180_000;
 export const DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS = 300_000;
 export const DEFAULT_BROKER_START_COOLDOWN_MS = 60_000;
 export const DEFAULT_STOP_POLL_MS = 250;
+export const DEFAULT_SUPERVISOR_LOG_MAX_BYTES = 4 * 1024 * 1024;
+export const DEFAULT_SUPERVISOR_LOG_MAX_FILES = 8;
+export const DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_BYTES = 1024 * 1024;
+export const DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_FILES = 8;
 
 const CLI_OPTIONS = new Set([
   "private-env",
@@ -287,6 +292,8 @@ function normalizeSentIncidentKeys(value) {
 function sanitizeText(value) {
   return String(value ?? "")
     .replace(/(authorization|access[_-]?token|password|secret)(\s*[=:]\s*)[^\s,;}]+/gi, "$1$2[redacted]")
+    .replace(/proofWaterUrl(\s*[:=]\s*)[^\s,;}]+/gi, "proofWaterUrl$1[redacted]")
+    .replace(/https:\/\/ti\.qq\.com\/[^\s,;}]+/gi, "https://ti.qq.com/[redacted]")
     .slice(0, 1000);
 }
 
@@ -340,13 +347,68 @@ export function writeRuntimeState(runtimeStatePath, patch = {}, options = {}) {
   return next;
 }
 
-function appendLog(logPath, entry, fsImpl) {
+function appendLog(logPath, entry, fsImpl, options = {}) {
   if (!logPath) return;
   try {
-    fsImpl.mkdirSync(path.dirname(logPath), { recursive: true });
-    fsImpl.appendFileSync(logPath, `${JSON.stringify(entry)}\n`, "utf8");
+    createBoundedJsonlWriter({
+      filePath: logPath,
+      fsImpl,
+      maxBytes: options.maxBytes ?? DEFAULT_SUPERVISOR_LOG_MAX_BYTES,
+      maxFiles: options.maxFiles ?? DEFAULT_SUPERVISOR_LOG_MAX_FILES,
+      retentionMs: options.retentionMs,
+      now: options.now,
+    }).append(entry);
   } catch {
   }
+}
+
+function supervisorDiagnosticLogPath(logPath) {
+  const extension = path.extname(logPath);
+  const basename = extension ? logPath.slice(0, -extension.length) : logPath;
+  return `${basename}-diagnostics${extension || ".jsonl"}`;
+}
+
+function compactError(value) {
+  if (!value) return null;
+  if (typeof value === "string") return { message: value.slice(0, 500) };
+  return {
+    code: value.code ?? null,
+    name: value.name ?? null,
+    message: String(value.message ?? value).slice(0, 500),
+  };
+}
+
+function compactAction(value) {
+  if (!value || typeof value !== "object") return value ?? null;
+  const result = {};
+  for (const field of [
+    "attempted",
+    "succeeded",
+    "reason",
+    "trigger",
+    "noQr",
+    "offlineProcessSince",
+    "offlineProcessDurationMs",
+    "unknownProcessSince",
+    "unknownProcessDurationMs",
+    "incidentKey",
+    "attempts",
+  ]) {
+    if (value[field] !== undefined) result[field] = value[field];
+  }
+  if (value.error) result.error = compactError(value.error);
+  if (Array.isArray(value.stoppedProcessIds)) result.stoppedProcessIds = value.stoppedProcessIds;
+  return Object.keys(result).length > 0 ? result : null;
+}
+
+function appendSupervisorDiagnostic(logPath, entry, fsImpl, options = {}) {
+  if (!logPath) return;
+  appendLog(supervisorDiagnosticLogPath(logPath), entry, fsImpl, {
+    maxBytes: options.maxBytes ?? DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_BYTES,
+    maxFiles: options.maxFiles ?? DEFAULT_SUPERVISOR_DIAGNOSTIC_LOG_MAX_FILES,
+    retentionMs: options.retentionMs,
+    now: options.now,
+  });
 }
 
 export function parseArguments(argv) {
@@ -1111,11 +1173,24 @@ function actionError(error) {
   return publicError(error, "SUPERVISOR_ACTION_FAILED");
 }
 
+function manualLoginSignalText(error) {
+  return [
+    error?.code,
+    error?.message,
+    error?.stdout,
+    error?.stderr,
+    error?.details?.wording,
+  ].map((part) => String(part ?? "")).join("\n");
+}
+
 function requiresManualLogin(error) {
   const code = String(error?.code ?? "");
-  const message = String(error?.message ?? "");
+  const message = manualLoginSignalText(error);
   return code === "NAPCAT_MANUAL_LOGIN_REQUIRED"
-    || message.includes("[NAPCAT_MANUAL_LOGIN_REQUIRED]");
+    || message.includes("[NAPCAT_MANUAL_LOGIN_REQUIRED]")
+    || /proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com/i.test(message)
+    || /(需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)/.test(message)
+    || (/(用户身份已失效|身份已失效|登录态已失效|登录态失效|登录状态失效|授权失效|重新登录)/.test(message) && /(快速登录|quick login|KickedOffLine)/i.test(message));
 }
 
 export async function runSupervisorService(options = {}) {
@@ -1696,8 +1771,9 @@ export async function runSupervisorService(options = {}) {
           actions.quickLogin = { attempted: true, succeeded: true, noQr: true };
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: "started" };
         } catch (error) {
-          const value = actionError(error);
-          if (requiresManualLogin(value)) {
+          let value = actionError(error);
+          if (requiresManualLogin(error) || requiresManualLogin(value)) {
+            value = { ...value, code: "NAPCAT_MANUAL_LOGIN_REQUIRED" };
             loginBlocked = true;
             loginBlockedAt = checkAt;
             loginBlockedReason = value;
@@ -1976,6 +2052,62 @@ export async function runSupervisorService(options = {}) {
         maintenance: maintenanceSummary,
         alert: alertSummary,
         error: cycleError ? { code: cycleError.code, message: cycleError.message } : null,
+      }, fsImpl);
+      appendSupervisorDiagnostic(logPath, {
+        at: checkAt,
+        type: "supervisor_diagnostic",
+        pid,
+        gate,
+        openTaskCount,
+        napcat: {
+          known: checkSummary.napcat.known,
+          reachable: checkSummary.napcat.reachable,
+          online: checkSummary.napcat.online,
+          accountMatches: checkSummary.napcat.accountMatches,
+          ready: checkSummary.napcat.ready,
+          error: compactError(checkSummary.napcat.error),
+        },
+        napcatRuntime: {
+          known: checkSummary.napcatRuntime.known,
+          ready: checkSummary.napcatRuntime.ready,
+          missingFiles: checkSummary.napcatRuntime.missingFiles,
+          error: compactError(checkSummary.napcatRuntime.error),
+        },
+        napcatProcess: {
+          known: checkSummary.napcatProcess.known,
+          present: checkSummary.napcatProcess.present,
+          count: checkSummary.napcatProcess.count,
+        },
+        router: {
+          known: checkSummary.router.known,
+          alive: checkSummary.router.alive,
+          state: checkSummary.router.state,
+          pid: checkSummary.router.pid,
+        },
+        login: {
+          blocked: status.login.blocked,
+          blockedAt: status.login.blockedAt,
+          blockedReason: compactError(status.login.blockedReason),
+          lastAttemptAt: status.login.lastAttemptAt,
+          nextAllowedAt: status.login.nextAllowedAt,
+          offlineProcessSince: status.login.offlineProcessSince,
+          unknownProcessSince: status.login.unknownProcessSince,
+          staleRecoveryLastAttemptAt: status.login.staleRecoveryLastAttemptAt,
+          staleRecoveryCount: status.login.staleRecoveryCount,
+          staleRecoveryLastResult: compactError(status.login.staleRecoveryLastResult) ?? status.login.staleRecoveryLastResult ?? null,
+        },
+        actions: {
+          quickLogin: compactAction(actions.quickLogin),
+          staleNapCatRecovery: compactAction(actions.staleNapCatRecovery),
+          brokerStart: compactAction(actions.brokerStart),
+          taskRouter: compactAction(actions.taskRouter),
+          alert: compactAction(actions.alert),
+        },
+        error: cycleError ? {
+          code: cycleError.code,
+          message: cycleError.message.slice(0, 500),
+          sources: errors.map((item) => item.source),
+        } : null,
       }, fsImpl);
 
       if (options.once === true) {

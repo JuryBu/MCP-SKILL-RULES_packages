@@ -2,6 +2,7 @@
 param(
   [string]$NapCatRoot = "",
   [string]$QqExePath = "",
+  [string]$QqUserDataDir = "",
   [string]$DataRoot = "",
   [string]$BrokerRoot = "",
   [string]$ExpectedQqSha256 = "",
@@ -103,6 +104,13 @@ if (-not [System.IO.Path]::IsPathRooted($NapCatRoot) -or -not [System.IO.Path]::
 }
 $NapCatRoot = [System.IO.Path]::GetFullPath($NapCatRoot).TrimEnd('\')
 $QqExePath = [System.IO.Path]::GetFullPath($QqExePath)
+$ResolvedQqUserDataDir = $null
+if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
+  if (-not [System.IO.Path]::IsPathRooted($QqUserDataDir)) {
+    throw "QqUserDataDir 必须是绝对路径"
+  }
+  $ResolvedQqUserDataDir = [System.IO.Path]::GetFullPath($QqUserDataDir).TrimEnd('\')
+}
 $RequiredPaths = @(
   $QqExePath,
   (Join-Path $NapCatRoot "napcat.mjs"),
@@ -143,6 +151,11 @@ foreach ($Property in $CurrentRuntime.PSObject.Properties) { $TargetRuntime[$Pro
 if (-not $TargetRuntime.Contains("schemaVersion")) { $TargetRuntime["schemaVersion"] = 1 }
 $TargetRuntime["napCatRoot"] = $NapCatRoot
 $TargetRuntime["qqExePath"] = $QqExePath
+if (-not [string]::IsNullOrWhiteSpace($ResolvedQqUserDataDir)) {
+  $TargetRuntime["qqUserDataDir"] = $ResolvedQqUserDataDir
+} elseif ($TargetRuntime.Contains("qqUserDataDir")) {
+  $TargetRuntime.Remove("qqUserDataDir")
+}
 
 if ($ValidateOnly) {
   [pscustomobject]@{
@@ -153,6 +166,7 @@ if ($ValidateOnly) {
     napCatRoot = $NapCatRoot
     napCatSha256 = $NapCatSha256
     qqExePath = $QqExePath
+    qqUserDataDir = $ResolvedQqUserDataDir
     qqSha256 = $QqSha256
     qqVersion = $QqVersion
     packetMappingKey = $PacketMappingKey
@@ -174,6 +188,9 @@ try {
   if ([string]$AppliedRuntime.napCatRoot -ne $NapCatRoot -or [string]$AppliedRuntime.qqExePath -ne $QqExePath) {
     throw "NapCat runtime 写入后复核失败"
   }
+  if (-not [string]::IsNullOrWhiteSpace($ResolvedQqUserDataDir) -and [string]$AppliedRuntime.qqUserDataDir -ne $ResolvedQqUserDataDir) {
+    throw "NapCat runtime 写入后独立 QQ 数据目录复核失败"
+  }
 } catch {
   [System.IO.File]::WriteAllBytes($RuntimePath, [System.IO.File]::ReadAllBytes($BackupFile))
   throw
@@ -190,6 +207,7 @@ $AppliedHash = Get-NormalizedHash -Path $RuntimePath
   napCatRoot = $NapCatRoot
   napCatSha256 = $NapCatSha256
   qqExePath = $QqExePath
+  qqUserDataDir = $ResolvedQqUserDataDir
   qqSha256 = $QqSha256
   qqVersion = $QqVersion
   packetMappingKey = $PacketMappingKey

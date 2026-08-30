@@ -11,7 +11,7 @@
 | 工具组 | 代表工具 | 用途 |
 |---|---|---|
 | 状态与目标 | `napcat_status`、`napcat_discover_target` | 检查 OneBot、登录账号和固定群身份 |
-| 消息与文件 | `napcat_read_recent`、`napcat_download_file`、`napcat_send_text`、`napcat_send_file`、`napcat_send_configured_file` | 按固定群读取、下载、发送与上传；配置群/私聊目标可单独上传文件；任务文件会附带结构化索引 |
+| 消息与文件 | `napcat_read_recent`、`napcat_download_file`、`napcat_send_text`、`napcat_group_file_status`、`napcat_send_file`、`napcat_send_chat_file`、`napcat_send_configured_file`、`napcat_send_configured_chat_file` | 按固定群读取、下载、发送与上传；群文件区上传和聊天区文件气泡是两条独立链路；配置群/私聊目标可按目标键发送文件 |
 | 任务账本 | `napcat_task_register`、`napcat_task_update`、`napcat_task_status`、`napcat_task_list` | 维护任务、Codex 对话、角色、可信对端、代次和唤醒冷却 |
 | 任务完成 | `napcat_task_ack`、`napcat_task_close` | 处理完明确消息序号后确认，任务结束后关闭路由 |
 | 送达与重连 | `napcat_delivery_status`、`napcat_connection_request` | 查询对端机器/对话送达状态，或向已知对端对话提出重新建链请求 |
@@ -58,7 +58,7 @@
 
 ## 固定群文件上传
 
-`napcat_send_file` 只接受本机绝对文件路径、可选显示文件名和去重键，不接受群号。上传前会确认文件存在、不是空文件、大小未超限，计算 SHA256，再次校验登录账号和固定绑定群；上传后调用 `get_group_root_files`，按文件名、大小和可用的上传者信息核验。
+`napcat_send_file` 是「群文件区上传」工具，只接受本机绝对文件路径、可选显示文件名和去重键，不接受群号。上传前会确认文件存在、不是空文件、大小未超限，计算 SHA256，再次校验登录账号和固定绑定群；上传后调用 `get_group_root_files`，按文件名、大小和可用的上传者信息核验。它对应 QQ 群文件窗口里的文件，不等同于聊天消息流里的文件气泡。
 
 群文件上传前默认会调用 `get_group_file_system_info` 检查文件数量，并以 `NAPCAT_GROUP_FILE_COUNT_LIMIT`（默认 1500）作为 QQ 客户端实际数量上限；NapCat 返回的 `limit_count` 只作为诊断参考，因为它可能高于 QQ 客户端真实限制。达到或超过上限时，工具会列出根目录文件，按 `upload_time/modify_time` 从旧到新删除最多 `NAPCAT_GROUP_FILE_CLEANUP_BATCH`（默认 100）个根目录文件，再继续上传。清理只覆盖当前上传目标群，不递归删除文件夹；返回值的 `groupFileCleanup` 会写明检查到的数量、空间字段、删除数量和最多 10 个删除样例。当前自动维护只按文件数量触发，不按 10GB 容量触发；容量字段曾出现与 QQ 客户端显示不一致的情况，因此只保留为诊断信息，不能作为自动删除依据。
 
@@ -66,17 +66,25 @@
 
 ## 配置目标群文件上传
 
-`napcat_preview_configured_file` 与 `napcat_send_configured_file` 用于把本机文件发送到私有 `binding.controlPlane.targets` 中预先命名的群聊或私聊目标。调用方必须传 `target_key`、本机绝对 `file_path` 和 `dedupe_key`；工具会先校验当前登录账号，群聊目标会校验群名和可选成员数，私聊目标会校验目标在好友列表中。群聊发送使用 NapCat `upload_group_file` 并通过群文件列表回读验证；私聊发送使用 NapCat `upload_private_file`，并尽力从最近私聊历史中回读同名同大小文件。它不会接受临时群号或临时 QQ 号，也不会在配置目标失败时降级到固定 ExampleGroup。
+`napcat_preview_configured_file` 与 `napcat_send_configured_file` 用于把本机文件上传到私有 `binding.controlPlane.targets` 中预先命名的群聊或私聊目标。调用方必须传 `target_key`、本机绝对 `file_path` 和 `dedupe_key`；工具会先校验当前登录账号，群聊目标会校验群名和可选成员数，私聊目标会校验目标在好友列表中。群聊发送使用 NapCat `upload_group_file` 并通过群文件列表回读验证；私聊发送使用 NapCat `upload_private_file`，并尽力从最近私聊历史中回读同名同大小文件。它不会接受临时群号或临时 QQ 号，也不会在配置目标失败时降级到固定 ExampleGroup。
 
 配置目标文件工具不会发送跨机任务文件索引；需要训练机任务回包索引时继续使用固定群的 `napcat_send_file`。原 `napcat_send_file` 仍然只走固定 ExampleGroup/训练群，不会继承 `controlPlane.defaultTargetKey`。
 
+## 聊天区文件气泡
+
+`napcat_preview_chat_file` 与 `napcat_send_chat_file` 使用 OneBot `send_group_msg` 的 file 消息段，把文件显示成固定任务群聊天区里的文件气泡。它与上面的群文件区上传分开命名、分开返回 `fileTransport=chat_attachment`，不会调用 `upload_group_file`，因此不会把群文件区根目录 ID 冒充成聊天附件 ID。带 `task_id/source_machine/target_machine` 时，它会在聊天附件核验成功后追加 `[Codex][TASK_FILE_INDEX]`，索引中写入 `file_transport：chat_attachment`、聊天消息的 `file_id`、`file_message_seq`、`busid`、文件名、大小和 SHA256。
+
+`napcat_preview_configured_chat_file` 与 `napcat_send_configured_chat_file` 面向私有 `controlPlane.targets` 的明确 `target_key`，群聊目标使用 `send_group_msg`，私聊目标使用 `send_private_msg`，都按聊天附件结构核验。配置目标聊天附件工具不会发送跨机任务索引，也不会在目标键失败时退回固定训练群；如需跨机任务索引，应使用固定群 `napcat_send_chat_file`。
+
+媒体消息验证不会再按原始 `[CQ:file,file=本机路径]` 字符串逐字比较，因为 NapCat/OneBot 会把发送态路径改写成接收态的 `file_id/file_size`。MCP 会比较附件结构、文件名、字节数、可用的 `file_id` 与消息身份；`napcat_send_text` 仍只适合文本，调用方不应再手写 CQ 文件段伪装成文字发送。
+
 ## 固定群文件读取与下载
 
-`napcat_read_recent` 会从数组消息段或 NapCat 的 `[CQ:file,...]` 文本中提取原始 `fileId/fileUuid`、文件名、大小和可用的 `busId`。需要取回文件时，把任务文件索引或附件返回的 `fileId` 交给 `napcat_download_file`，同时给出本机绝对保存目录；若索引同时提供 `file_message_seq` 与 `busid`，应一并传入。工具先复核登录账号和固定绑定群，再向 NapCat 获取临时下载地址并流式落盘，返回本地路径、字节数和 SHA256。
+`napcat_read_recent` 会从数组消息段或 NapCat 的 `[CQ:file,...]` 文本中提取 `fileId/fileUuid`、文件名、大小和可用的 `busId`。需要取回文件时，把任务文件索引或附件返回的 `fileId` 交给 `napcat_download_file`，同时给出本机绝对保存目录；若索引同时提供 `file_message_seq`、`real_seq`、`busid`、`file_name` 或 `file_bytes`，应一并传入。工具先复核登录账号和固定绑定群，再向 NapCat 获取临时下载地址并流式落盘，返回本地路径、字节数和 SHA256。
 
 下载工具不接受群号或调用方提供的 URL，也不覆盖同名文件。目标文件已存在时应先核对是不是同一份，随后换一个明确文件名或目录，不能静默覆盖已有训练材料。
 
-NapCat 的 `get_group_root_files.files[].file_id` 是当前 NapCat 进程内可解码的临时映射，不适合跨机器写入任务索引；上传接口返回的原始 `fileUuid` 才是任务索引发布值，根文件 `file_id` 只用于本机上传核验。接收方 NapCat 重启或内存映射过期后，第一次 URL 查询可能失败；下载工具会按 `file_message_seq` 刷新对应群历史（未提供时刷新最近 50 条）以重建映射，再用同一原始 `fileUuid` 重试一次。
+NapCat 的 `upload_group_file` 返回值和 `get_group_root_files.files[].file_id` 都可能是当前 NapCat 进程内可解码的本地映射，不适合单独当作跨机器下载凭据。任务索引必须同时带文件名、字节数、SHA256 和可定位消息的 `file_message_seq/real_seq`；接收方下载时会先尝试消息附件，再用文件名和大小从群文件根列表解析本机真实可下载 UUID。若只有群文件区记录、没有可见聊天附件，MCP 不再把根文件 ID 发布成已验证的跨机索引。
 
 ## 任务账本与 Codex 自动唤醒
 
@@ -210,6 +218,8 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
 有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本会使用 binding 中的 `expectedSelfId` 先尝试该账号的快速登录；授权有效则不显示二维码，授权失效且 NapCat 生成新二维码时才弹出小窗口并阻塞到登录成功或明确失败。脚本同时兼容 Node 一键包的 `napcat/cache/qrcode.png` 与旧 Shell 布局的 `cache/qrcode.png`。监督器始终传 `-NoQr`，首次检测到本轮新二维码后返回 `NAPCAT_MANUAL_LOGIN_REQUIRED` 并持久阻断后续自动登录；只有真实 OneBot 在线后才解除阻断，因此不会在无人值守桌面弹二维码，也不会按冷却周期反复制造登录尝试。
+
+监督器主日志 `state/supervisor.jsonl` 使用有界 JSONL 轮转，避免长期运行后长到数百 MB 阻塞排障读取；同时写入 `state/supervisor-diagnostics.jsonl` 作为轻量诊断流，只记录端口/在线/进程数/登录阻断/重启动作/错误码等排障字段，不记录 token、私聊目标或密码等敏感信息。定位「为什么掉登录」时优先看诊断流，再按时间点回查主日志与 NapCat 登录日志。
 
 QQ 服务端主动返回 `KickedOffLine` 或「用户身份已失效」时，本地快速登录票据可能已经不可用。需要无人值守恢复时，可由账号主人在本机交互式运行 `ops/set-napcat-quick-login-credential.ps1`，输入一次账号密码。脚本只在内存中计算密码 MD5，使用 Windows DPAPI CurrentUser 加密后写入私有 data root 的 `private/napcat-login/credential.json`；专用 `napcat-login` 目录在写入前即限制为当前用户与 SYSTEM FullControl，公开仓库、binding、日志和普通环境配置均不保存明文、MD5 或可枚举的账号哈希。登录脚本只把解密后的 MD5 放入新启动的 NapCat 子进程环境，不拼入命令行，并尽量缩短 PowerShell 托管字符串的引用生命周期；受 .NET 字符串和 NapCat 上游环境变量接口限制，这不等于对内存或子进程环境做了可证明的物理擦除，同一 Windows 用户的恶意进程或内存转储仍属于信任边界。MD5 仍属于密码等价物，因此不得复制到其它机器、上传仓库、写入命令行或保存进普通环境配置；训练机必须由训练机主人在当地 Windows 用户下单独配置。
 

@@ -108,8 +108,8 @@ const groupFileStatusInputSchema = {
     file_count: {
       type: "integer",
       minimum: 1,
-      maximum: 100,
-      description: "读取根目录最近文件数量，默认 20，最多 100。",
+      maximum: 5000,
+      description: "读取根目录最近文件数量，默认 100，最多 5000。",
     },
   },
   additionalProperties: false,
@@ -181,12 +181,19 @@ const configuredFileInputSchema = {
   additionalProperties: false,
 };
 
+const chatFileInputSchema = fileInputSchema;
+const configuredChatFileInputSchema = configuredFileInputSchema;
+
 const downloadInputSchema = {
   type: "object",
   properties: {
     file_id: { type: "string", minLength: 1, maxLength: 2048, description: "从固定 ExampleGroup 群消息附件或任务文件索引中读取到的原始 file_id/fileUuid。" },
     message_seq: { type: "string", minLength: 1, maxLength: 64, description: "可选文件附件消息或旧 TASK_FILE_INDEX 消息序号；NapCat 重启、缓存失效或旧索引使用内部 ID 时用于刷新历史并恢复真实 fileUuid。" },
+    real_seq: { type: "string", minLength: 1, maxLength: 64, description: "可选真实群历史序号；聊天附件跨机下载时用于定位同一条真实群消息。" },
     busid: { type: "integer", minimum: 0, description: "可选群文件 busid；从附件或任务文件索引中原样传入。" },
+    file_transport: { type: "string", enum: ["group_file_upload", "chat_attachment"], description: "可选文件来源：群文件区上传或聊天气泡附件；来自 TASK_FILE_INDEX 的 file_transport。" },
+    file_name: { type: "string", minLength: 1, maxLength: 255, description: "可选远端文件名；file_id 在接收端缓存失效时用于按名称恢复当前可下载 UUID。" },
+    file_bytes: { type: "integer", minimum: 1, description: "可选远端文件字节数；与 file_name 一起用于避免同名文件误匹配。" },
     destination_dir: { type: "string", minLength: 1, maxLength: 4096, description: "本机保存目录的绝对路径；目录不存在时自动创建。" },
     name: { type: "string", minLength: 1, maxLength: 255, description: "可选本地文件名，不能包含目录；目标已存在时拒绝覆盖。" },
   },
@@ -548,6 +555,30 @@ const tools = [
     inputSchema: configuredFileInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
+  {
+    name: "napcat_preview_chat_file",
+    description: "读取本机文件大小与 SHA256，预览把文件作为固定 ExampleGroup 群聊天区可见文件气泡发送；这是 send_group_msg 文件消息段，不是 napcat_send_file 的群文件区 upload_group_file。",
+    inputSchema: chatFileInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+  },
+  {
+    name: "napcat_send_chat_file",
+    description: "向固定 ExampleGroup 群发送一个聊天区可见文件气泡；提供 task_id 时追加 file_transport=chat_attachment 的任务文件索引。核验按附件名、字节数、file_id 和真实群历史序号执行，不再按原始 CQ 文本逐字比较。",
+    inputSchema: chatFileInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_preview_configured_chat_file",
+    description: "读取本机文件大小与 SHA256，预览向 binding.controlPlane.targets 中指定群聊或私聊发送聊天附件；不会继承或降级到固定 ExampleGroup，也不会发送跨机任务索引。",
+    inputSchema: configuredChatFileInputSchema,
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
+  {
+    name: "napcat_send_configured_chat_file",
+    description: "向 binding.controlPlane.targets 中指定群聊或私聊发送聊天区文件附件；群聊走 send_group_msg 文件消息段，私聊走 send_private_msg 文件消息段。失败或 UNKNOWN 不会降级到固定 ExampleGroup，不会发送跨机任务索引。",
+    inputSchema: configuredChatFileInputSchema,
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  },
 ];
 
 function textResult(value, isError = false) {
@@ -751,6 +782,26 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     if (name === "napcat_send_configured_file") {
       return textResult({ ok: true, ...(await notifier.sendConfiguredFile(args)) });
+    }
+    if (name === "napcat_preview_chat_file") {
+      return textResult({ ok: true, ...(await notifier.previewChatFile(args)) });
+    }
+    if (name === "napcat_send_chat_file") {
+      const result = await notifier.sendChatFile(args);
+      if (args.task_id && args.source_machine && args.target_machine && result.taskIndex) {
+        result.taskIndex = withOutgoingDeliveryTracking(
+          result.taskIndex,
+          args,
+          (delivery) => controlPlane.trackOutgoingDelivery(delivery),
+        );
+      }
+      return textResult({ ok: true, ...result });
+    }
+    if (name === "napcat_preview_configured_chat_file") {
+      return textResult({ ok: true, ...(await notifier.previewConfiguredChatFile(args)) });
+    }
+    if (name === "napcat_send_configured_chat_file") {
+      return textResult({ ok: true, ...(await notifier.sendConfiguredChatFile(args)) });
     }
     throw new NapCatNotifierError("UNKNOWN_TOOL", `未知工具：${name}`);
   } catch (error) {

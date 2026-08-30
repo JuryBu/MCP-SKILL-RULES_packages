@@ -21,6 +21,8 @@ const DEFAULT_GROUP_FILE_COUNT_LIMIT = 1500;
 const DEFAULT_GROUP_FILE_CLEANUP_BATCH = 100;
 const DEFAULT_GROUP_FILE_SCAN_COUNT = 2000;
 const RECONCILIATION_CLOCK_SKEW_MS = 60 * 60 * 1000;
+const FILE_TRANSPORT_GROUP_UPLOAD = "group_file_upload";
+const FILE_TRANSPORT_CHAT_ATTACHMENT = "chat_attachment";
 
 export class NapCatNotifierError extends Error {
   constructor(code, message, options = {}) {
@@ -119,6 +121,7 @@ function summarizeGroupFileForCleanup(file) {
     fileId: String(file?.file_id ?? ""),
     fileName: String(file?.file_name ?? ""),
     fileBytes: positiveNumberOrNull(file?.file_size ?? file?.size),
+    busId: positiveNumberOrNull(file?.busid ?? file?.bus_id),
     modifyTime: positiveNumberOrNull(file?.modify_time),
     uploadTime: positiveNumberOrNull(file?.upload_time),
     uploader: file?.uploader === undefined || file?.uploader === null ? "" : String(file.uploader),
@@ -352,6 +355,34 @@ function decodeCqValue(value) {
     .replace(/&amp;/g, "&");
 }
 
+function encodeCqValue(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/\[/g, "&#91;")
+    .replace(/\]/g, "&#93;")
+    .replace(/,/g, "&#44;");
+}
+
+function stripCqSegments(value) {
+  return String(value ?? "").replace(/\[CQ:[^\]]+\]/g, "");
+}
+
+function comparableTextWithoutMedia(value) {
+  return normalizeComparableText(stripCqSegments(value)
+    .replace(/\[(?:file|image|record|video|forward|node|face|mface|json|xml)\]/g, ""));
+}
+
+function normalizedFileId(value) {
+  return String(value ?? "").trim().replace(/^\/+/, "");
+}
+
+function fileIdEquivalent(left, right) {
+  const leftRaw = String(left ?? "").trim();
+  const rightRaw = String(right ?? "").trim();
+  if (!leftRaw || !rightRaw) return false;
+  return leftRaw === rightRaw || normalizedFileId(leftRaw) === normalizedFileId(rightRaw);
+}
+
 function summarizeFileAttachment(data = {}) {
   const fileId = String(data.file_id ?? data.fileId ?? data.file_uuid ?? data.fileUuid ?? "");
   const fileName = decodeCqValue(data.file_name ?? data.name ?? data.file ?? "");
@@ -432,6 +463,41 @@ function oneBotDeferredAttachments(message) {
     if (!unique.has(key)) unique.set(key, attachment);
   }
   return [...unique.values()];
+}
+
+function attachmentMatchesExpected(attachment, expected) {
+  if (!attachment || !expected || attachment.type !== expected.type) return false;
+  if (expected.type === "file") {
+    return (!expected.fileId || fileIdEquivalent(attachment.fileId, expected.fileId))
+      && (!expected.fileName || attachment.fileName === expected.fileName)
+      && (expected.fileBytes === null || expected.fileBytes === undefined || attachment.fileBytes === expected.fileBytes);
+  }
+  return JSON.stringify(attachment) === JSON.stringify(expected);
+}
+
+function attachmentsContainExpected(actualAttachments = [], expectedAttachments = []) {
+  if (!expectedAttachments.length) return true;
+  return expectedAttachments.every((expected) =>
+    actualAttachments.some((attachment) => attachmentMatchesExpected(attachment, expected))
+  );
+}
+
+function messageHasExpectedAttachments(message, expectedAttachments = []) {
+  return attachmentsContainExpected(oneBotDeferredAttachments(message), expectedAttachments);
+}
+
+function summarizedMessageHasExpectedAttachments(message, expectedAttachments = []) {
+  return attachmentsContainExpected(message?.attachments ?? [], expectedAttachments);
+}
+
+function expectedAttachmentsFromMessageText(text) {
+  return oneBotDeferredAttachments({ raw_message: text });
+}
+
+function expectedMessageComparableText(message, expectedAttachments = []) {
+  return expectedAttachments.length
+    ? comparableTextWithoutMedia(message)
+    : normalizeComparableText(message);
 }
 
 function oneBotContentSummary(message) {
@@ -564,15 +630,19 @@ function taskFileIndexMetadata(text) {
   const metadata = {
     fileId: "",
     fileMessageSeq: "",
+    fileTransport: "",
     busId: null,
     fileName: "",
     fileBytes: null,
+    indexedAt: "",
   };
   for (const line of normalizedText.split("\n")) {
     const fileIdMatch = line.match(/^file_id\s*[：:]\s*(.+)$/i);
     if (fileIdMatch) metadata.fileId = fileIdMatch[1].trim();
     const messageSeqMatch = line.match(/^file_message_seq\s*[：:]\s*(.+)$/i);
     if (messageSeqMatch) metadata.fileMessageSeq = messageSeqMatch[1].trim();
+    const transportMatch = line.match(/^file_transport\s*[：:]\s*(.+)$/i);
+    if (transportMatch) metadata.fileTransport = transportMatch[1].trim();
     const busIdMatch = line.match(/^busid\s*[：:]\s*(.+)$/i);
     if (busIdMatch) {
       const parsedBusId = Number(busIdMatch[1].trim());
@@ -585,6 +655,8 @@ function taskFileIndexMetadata(text) {
       const parsedFileBytes = Number(fileBytesMatch[1].trim());
       if (Number.isSafeInteger(parsedFileBytes) && parsedFileBytes > 0) metadata.fileBytes = parsedFileBytes;
     }
+    const timeMatch = line.match(/^时间\s*[：:]\s*(.+)$/);
+    if (timeMatch) metadata.indexedAt = timeMatch[1].trim();
   }
   return metadata.fileId ? metadata : null;
 }
@@ -640,6 +712,10 @@ function numericRealSeq(value) {
 
 function comparableTextSha256(value) {
   return createHash("sha256").update(normalizeComparableText(value), "utf8").digest("hex");
+}
+
+function comparableDeliveryTextSha256(value, expectedAttachments = []) {
+  return createHash("sha256").update(expectedMessageComparableText(value, expectedAttachments), "utf8").digest("hex");
 }
 
 function summarizeGroupHistory(messages, expectedSelfId) {
@@ -820,6 +896,7 @@ function buildTaskFileIndexMessage(normalizedInput, file, nowDate) {
     `来源机器：${normalizedInput.sourceMachine || "未指定"}`,
     `目标机器：${normalizedInput.targetMachine || "未指定"}`,
     `delivery_id：${normalizedInput.deliveryId}`,
+    `file_transport：${file.fileTransport || normalizedInput.fileTransport || FILE_TRANSPORT_GROUP_UPLOAD}`,
     `file_id：${file.fileId}`,
   ];
   if (file.messageSeq) lines.push(`file_message_seq：${file.messageSeq}`);
@@ -836,6 +913,10 @@ function buildTaskFileIndexMessage(normalizedInput, file, nowDate) {
 function taskFileIndexDedupeKey(fileDedupeKey) {
   const digest = createHash("sha256").update(fileDedupeKey, "utf8").digest("hex");
   return `task-file-index:${digest}`;
+}
+
+function buildChatFileCqMessage(normalizedInput) {
+  return `[CQ:file,file=${encodeCqValue(normalizedInput.filePath)},name=${encodeCqValue(normalizedInput.fileName)}]`;
 }
 
 function normalizeFileInput(input, maximumFileBytes) {
@@ -880,6 +961,19 @@ function normalizeFileInput(input, maximumFileBytes) {
     fileBytes: fileStat.size,
     sourceMachine,
     targetMachine,
+    fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
+  };
+}
+
+function normalizeChatFileInput(input, maximumFileBytes) {
+  const normalizedInput = normalizeFileInput(input, maximumFileBytes);
+  return {
+    ...normalizedInput,
+    event: "chat_file",
+    taskId: normalizedInput.hasTaskId ? normalizedInput.taskId : "fixed-group-chat-file",
+    deliveryId: boundedString(input.delivery_id, "delivery_id", 128)
+      || stableDeliveryId("chat-file-index", normalizedInput.dedupeKey),
+    fileTransport: FILE_TRANSPORT_CHAT_ATTACHMENT,
   };
 }
 
@@ -893,6 +987,20 @@ function normalizeDownloadInput(input) {
   if (requestedName && (requestedName !== path.basename(requestedName) || requestedName === "." || requestedName === "..")) {
     throw new NapCatNotifierError("INVALID_FILE_NAME", "name 只能是文件名，不能包含目录");
   }
+  const expectedFileName = boundedString(input.file_name, "file_name", 255);
+  if (expectedFileName && (expectedFileName !== path.basename(expectedFileName) || expectedFileName === "." || expectedFileName === "..")) {
+    throw new NapCatNotifierError("INVALID_FILE_NAME", "file_name 只能是文件名，不能包含目录");
+  }
+  let expectedFileBytes = null;
+  if (input.file_bytes !== undefined && input.file_bytes !== null && input.file_bytes !== "") {
+    const parsedFileBytes = Number(input.file_bytes);
+    if (!Number.isSafeInteger(parsedFileBytes) || parsedFileBytes <= 0) {
+      throw new NapCatNotifierError("INVALID_FILE_BYTES", "file_bytes 必须是正安全整数");
+    }
+    expectedFileBytes = parsedFileBytes;
+  }
+  const realSeq = boundedString(input.real_seq, "real_seq", 64);
+  const fileTransport = boundedString(input.file_transport, "file_transport", 64);
   const messageSeq = boundedString(input.message_seq, "message_seq", 64);
   let busId = null;
   if (input.busid !== undefined && input.busid !== null && input.busid !== "") {
@@ -906,6 +1014,10 @@ function normalizeDownloadInput(input) {
     fileId,
     destinationDirectory: path.resolve(destinationDirectory),
     requestedName,
+    expectedFileName,
+    expectedFileBytes,
+    realSeq,
+    fileTransport,
     messageSeq,
     busId,
   };
@@ -1134,12 +1246,20 @@ export function createNapCatNotifier(options = {}) {
     };
   }
 
-  async function verifyGroupHistoryDelivery(groupId, expectedMessage, expectedMessageId, checkpoint, expectedSelfId) {
+  async function verifyGroupHistoryDelivery(
+    groupId,
+    expectedMessage,
+    expectedMessageId,
+    checkpoint,
+    expectedSelfId,
+    expectedAttachments = [],
+  ) {
     const messages = await readGroupHistoryEvidence(groupId);
-    const expectedDigest = comparableTextSha256(expectedMessage);
+    const expectedText = expectedMessageComparableText(expectedMessage, expectedAttachments);
     const candidate = messages.find((message) =>
       message.messageId === expectedMessageId
-      && comparableTextSha256(message.text) === expectedDigest
+      && expectedMessageComparableText(message.text, expectedAttachments) === expectedText
+      && summarizedMessageHasExpectedAttachments(message, expectedAttachments)
     );
     if (!candidate) {
       throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_MISSING", "群历史没有找到本次消息的独立记录");
@@ -1158,6 +1278,16 @@ export function createNapCatNotifier(options = {}) {
     const emptyHistoryCheckpoint = Number(checkpoint?.messageCount) === 0;
     const realSeqAdvanced = deliveredRealSeq !== null
       && (beforeRealSeq === null ? emptyHistoryCheckpoint : deliveredRealSeq > beforeRealSeq);
+    if (!realSeqAdvanced) {
+      throw new NapCatNotifierError("MESSAGE_VERIFY_HISTORY_NOT_VISIBLE", "群历史只找到本地 self 记录，但真实序号没有前进，不能证明用户端可见", {
+        details: {
+          realSeqBefore: beforeRealSeq,
+          deliveredRealSeq,
+          postType: candidate.postType,
+          messageSentType: candidate.messageSentType,
+        },
+      });
+    }
     return {
       evidence: realSeqAdvanced
         ? (beforeRealSeq === null
@@ -1168,6 +1298,7 @@ export function createNapCatNotifier(options = {}) {
       realSeqAdvanced,
       realSeqBefore: beforeRealSeq,
       deliveredRealSeq,
+      messageSeq: candidate.messageSeq,
       postType: candidate.postType,
       messageSentType: candidate.messageSentType,
     };
@@ -1196,11 +1327,13 @@ export function createNapCatNotifier(options = {}) {
       const beforeRealSeq = numericRealSeq(existing.historyRealSeqBefore);
       const historyScan = await readGroupHistoryForReconciliation(targetId);
       const messages = historyScan.messages;
-      const expectedDigest = existing.expectedMessageSha256 || comparableTextSha256(normalizedInput.message);
+      const expectedAttachments = Array.isArray(existing.expectedAttachments) ? existing.expectedAttachments : [];
+      const expectedDigest = existing.expectedMessageSha256 || comparableDeliveryTextSha256(normalizedInput.message, expectedAttachments);
       const createdAtMs = Date.parse(existing.createdAt ?? "");
       const candidates = messages.filter((message) =>
         message.isSelf
-        && comparableTextSha256(message.text) === expectedDigest
+        && comparableDeliveryTextSha256(message.text, expectedAttachments) === expectedDigest
+        && summarizedMessageHasExpectedAttachments(message, expectedAttachments)
         && (
           !Number.isFinite(createdAtMs)
           || (
@@ -1766,8 +1899,53 @@ export function createNapCatNotifier(options = {}) {
     };
   }
 
+  async function groupFileStatus(input = {}) {
+    const binding = loadBinding();
+    const fileCount = positiveInteger(input.file_count, 100, 1, 5000);
+    let targetCheck;
+    let target;
+    if (input.target_key) {
+      targetCheck = await checkConfiguredTarget(binding, input.target_key);
+      if (targetCheck.target.type !== "group") {
+        throw new NapCatNotifierError("GROUP_FILE_STATUS_PRIVATE_UNSUPPORTED", "群文件状态只支持群聊目标，私聊没有群文件根目录");
+      }
+      target = targetCheck.target;
+    } else {
+      targetCheck = await checkTarget(binding);
+      target = {
+        targetKey: "fixed-group",
+        type: "group",
+        id: binding.groupId,
+        name: targetCheck.group.actualGroupName,
+        memberCount: targetCheck.group.actualMemberCount,
+      };
+    }
+    const [systemInfo, rootData] = await Promise.all([
+      callOneBot("get_group_file_system_info", { group_id: target.id }),
+      callOneBot("get_group_root_files", { group_id: target.id, file_count: fileCount }),
+    ]);
+    const files = (Array.isArray(rootData?.files) ? rootData.files : [])
+      .map((file) => summarizeGroupFileForCleanup(file));
+    return {
+      target,
+      identity: targetCheck.login,
+      requestedFileCount: fileCount,
+      systemInfo: {
+        fileCount: positiveNumberOrNull(systemInfo?.file_count),
+        limitCount: positiveNumberOrNull(systemInfo?.limit_count),
+        usedSpace: positiveNumberOrNull(systemInfo?.used_space),
+        totalSpace: positiveNumberOrNull(systemInfo?.total_space),
+      },
+      returnedFileCount: files.length,
+      files,
+      folders: Array.isArray(rootData?.folders) ? rootData.folders : [],
+    };
+  }
+
   async function primeGroupFileLookup(binding, normalizedInput) {
     try {
+      const expectedInputFileName = normalizedInput.expectedFileName || normalizedInput.requestedName || "";
+      const expectedInputFileBytes = normalizedInput.expectedFileBytes;
       const history = await callOneBot("get_group_msg_history", {
         group_id: binding.groupId,
         ...(normalizedInput.messageSeq ? { message_seq: normalizedInput.messageSeq } : {}),
@@ -1787,17 +1965,45 @@ export function createNapCatNotifier(options = {}) {
           return leftTimestamp - rightTimestamp;
         });
       const matchingMessage = summarizedMessages
-        .find((message) => message.attachments.some((attachment) => attachment.fileId === normalizedInput.fileId));
+        .find((message) => message.attachments.some((attachment) =>
+          fileIdEquivalent(attachment.fileId, normalizedInput.fileId)
+        ));
       const matchingAttachment = matchingMessage?.attachments
-        .find((attachment) => attachment.fileId === normalizedInput.fileId) ?? null;
+        .find((attachment) =>
+          fileIdEquivalent(attachment.fileId, normalizedInput.fileId)
+        ) ?? null;
       if (matchingAttachment) {
         return {
           attempted: true,
           matched: true,
-          resolution: "exact_file_id",
+          resolution: fileIdEquivalent(matchingAttachment.fileId, normalizedInput.fileId)
+            ? "exact_file_id"
+            : "history_name_bytes",
           messageSeq: matchingMessage.messageSeq,
           resolvedFileId: matchingAttachment.fileId,
           resolvedBusId: matchingAttachment.busId,
+        };
+      }
+
+      const realSeqMessage = normalizedInput.realSeq
+        ? summarizedMessages.find((message) => String(message.realSeq ?? "") === normalizedInput.realSeq)
+        : null;
+      const realSeqAttachment = realSeqMessage?.attachments.find((attachment) =>
+        attachmentMatchesDownloadCriteria(
+          attachment,
+          normalizedInput,
+          expectedInputFileName,
+          expectedInputFileBytes,
+        )
+      ) ?? null;
+      if (realSeqAttachment) {
+        return {
+          attempted: true,
+          matched: true,
+          resolution: "real_seq_attachment",
+          messageSeq: realSeqMessage.messageSeq,
+          resolvedFileId: realSeqAttachment.fileId,
+          resolvedBusId: realSeqAttachment.busId,
         };
       }
 
@@ -1806,17 +2012,26 @@ export function createNapCatNotifier(options = {}) {
         : -1;
       const anchorMessage = anchorIndex >= 0 ? summarizedMessages[anchorIndex] : null;
       const indexMetadata = anchorMessage ? taskFileIndexMetadata(anchorMessage.text) : null;
-      const expectedFileName = indexMetadata?.fileName || normalizedInput.requestedName;
-      const requestedNameMatches = !normalizedInput.requestedName
+      const expectedFileName = indexMetadata?.fileName || expectedInputFileName;
+      const expectedFileBytes = indexMetadata?.fileBytes ?? expectedInputFileBytes;
+      const requestedNameMatches = !expectedInputFileName
         || !indexMetadata?.fileName
-        || normalizedInput.requestedName === indexMetadata.fileName;
+        || expectedInputFileName === indexMetadata.fileName;
       let resolvedMessage = null;
       let resolvedAttachment = null;
+      const directAnchorAttachment = anchorMessage?.attachments.find((attachment) =>
+        attachmentMatchesDownloadCriteria(attachment, normalizedInput, expectedFileName, expectedFileBytes)
+      ) ?? null;
+      if (directAnchorAttachment) {
+        resolvedMessage = anchorMessage;
+        resolvedAttachment = directAnchorAttachment;
+      }
       if (
-        anchorMessage
-        && indexMetadata?.fileId === normalizedInput.fileId
+        !resolvedAttachment
+        && anchorMessage
+        && fileIdEquivalent(indexMetadata?.fileId, normalizedInput.fileId)
         && expectedFileName
-        && indexMetadata.fileBytes !== null
+        && expectedFileBytes !== null
         && requestedNameMatches
       ) {
         const anchorTimestamp = Date.parse(anchorMessage.time ?? "");
@@ -1842,7 +2057,7 @@ export function createNapCatNotifier(options = {}) {
           if (candidateMessage.senderId !== anchorMessage.senderId) continue;
           const candidateAttachment = candidateMessage.attachments.find((attachment) =>
             attachment.fileName === expectedFileName
-            && attachment.fileBytes === indexMetadata.fileBytes
+            && attachment.fileBytes === expectedFileBytes
           );
           if (!candidateAttachment) continue;
           resolvedMessage = candidateMessage;
@@ -1850,13 +2065,61 @@ export function createNapCatNotifier(options = {}) {
           break;
         }
       }
+      if (resolvedAttachment) {
+        return {
+          attempted: true,
+          matched: true,
+          resolution: directAnchorAttachment ? "message_seq_attachment" : "legacy_task_index",
+          messageSeq: resolvedMessage?.messageSeq ?? null,
+          resolvedFileId: resolvedAttachment.fileId,
+          resolvedBusId: resolvedAttachment.busId,
+        };
+      }
+      const broadHistoryMessage = expectedInputFileName
+        ? summarizedMessages.find((message) => message.attachments.some((attachment) =>
+          attachmentMatchesDownloadCriteria(
+            attachment,
+            normalizedInput,
+            expectedInputFileName,
+            expectedInputFileBytes,
+          )
+        ))
+        : null;
+      const broadHistoryAttachment = broadHistoryMessage?.attachments.find((attachment) =>
+        attachmentMatchesDownloadCriteria(
+          attachment,
+          normalizedInput,
+          expectedInputFileName,
+          expectedInputFileBytes,
+        )
+      ) ?? null;
+      if (broadHistoryAttachment) {
+        return {
+          attempted: true,
+          matched: true,
+          resolution: "history_name_bytes",
+          messageSeq: broadHistoryMessage.messageSeq,
+          resolvedFileId: broadHistoryAttachment.fileId,
+          resolvedBusId: broadHistoryAttachment.busId,
+        };
+      }
+      const rootResolution = await resolveGroupRootFileLookup(
+        binding.groupId,
+        normalizedInput,
+        expectedFileName,
+        expectedFileBytes,
+      );
+      if (rootResolution?.matched) {
+        return rootResolution;
+      }
       return {
         attempted: true,
-        matched: Boolean(resolvedAttachment),
-        resolution: resolvedAttachment ? "legacy_task_index" : null,
-        messageSeq: resolvedMessage?.messageSeq ?? null,
-        resolvedFileId: resolvedAttachment?.fileId ?? null,
-        resolvedBusId: resolvedAttachment?.busId ?? null,
+        matched: false,
+        resolution: null,
+        messageSeq: null,
+        resolvedFileId: null,
+        resolvedBusId: null,
+        rootRefresh: rootResolution,
       };
     } catch (error) {
       return {
@@ -1886,7 +2149,7 @@ export function createNapCatNotifier(options = {}) {
       urlData = await callOneBot("get_group_file_url", lookupPayload);
     } catch (firstError) {
       cacheRefresh = await primeGroupFileLookup(binding, normalizedInput);
-      if (cacheRefresh.resolvedFileId && cacheRefresh.resolvedFileId !== normalizedInput.fileId) {
+      if (cacheRefresh.resolvedFileId) {
         lookupPayload = {
           group_id: binding.groupId,
           file_id: cacheRefresh.resolvedFileId,
@@ -2033,12 +2296,91 @@ export function createNapCatNotifier(options = {}) {
   function attachmentMatchesFile(attachment, normalizedInput, fileId = "") {
     return Boolean(attachment)
       && (
-        (fileId && attachment.fileId === fileId)
+        (fileId && fileIdEquivalent(attachment.fileId, fileId))
         || (
           attachment.fileName === normalizedInput.fileName
           && attachment.fileBytes === normalizedInput.fileBytes
         )
       );
+  }
+
+  function attachmentMatchesDownloadCriteria(attachment, normalizedInput, expectedFileName, expectedFileBytes) {
+    return Boolean(attachment)
+      && attachment.type === "file"
+      && (
+        fileIdEquivalent(attachment.fileId, normalizedInput.fileId)
+        || (
+          expectedFileName
+          && attachment.fileName === expectedFileName
+          && (expectedFileBytes === null || attachment.fileBytes === expectedFileBytes)
+        )
+      );
+  }
+
+  function groupRootFileMatchesDownloadCriteria(file, normalizedInput, expectedFileName, expectedFileBytes) {
+    const fileId = String(file?.file_id ?? "");
+    const fileName = String(file?.file_name ?? "");
+    const fileBytes = positiveNumberOrNull(file?.file_size ?? file?.size);
+    return fileIdEquivalent(fileId, normalizedInput.fileId)
+      || (
+        expectedFileName
+        && fileName === expectedFileName
+        && (expectedFileBytes === null || fileBytes === expectedFileBytes)
+      );
+  }
+
+  async function resolveGroupRootFileLookup(groupId, normalizedInput, expectedFileName, expectedFileBytes) {
+    if (!expectedFileName && !normalizedInput.fileId) {
+      return null;
+    }
+    const rootData = await callOneBot("get_group_root_files", {
+      group_id: groupId,
+      file_count: groupFileScanCount,
+    });
+    const rootFiles = Array.isArray(rootData?.files) ? rootData.files : [];
+    const matches = rootFiles
+      .filter((file) => groupRootFileMatchesDownloadCriteria(file, normalizedInput, expectedFileName, expectedFileBytes))
+      .sort((left, right) => (groupFileTimestamp(right) ?? 0) - (groupFileTimestamp(left) ?? 0));
+    if (matches.length === 1) {
+      const match = matches[0];
+      return {
+        attempted: true,
+        matched: true,
+        resolution: fileIdEquivalent(match.file_id, normalizedInput.fileId)
+          ? "group_root_exact_file_id"
+          : "group_root_name_bytes",
+        rootCandidateCount: matches.length,
+        messageSeq: null,
+        resolvedFileId: String(match.file_id ?? ""),
+        resolvedBusId: Number.isSafeInteger(Number(match.busid)) ? Number(match.busid) : null,
+        resolvedFile: summarizeGroupFileForCleanup(match),
+      };
+    }
+    if (matches.length > 1) {
+      return {
+        attempted: true,
+        matched: false,
+        resolution: null,
+        rootCandidateCount: matches.length,
+        messageSeq: null,
+        resolvedFileId: null,
+        resolvedBusId: null,
+        error: {
+          code: "FILE_LOOKUP_AMBIGUOUS",
+          message: "群文件根目录存在多份同名同大小候选，拒绝自动猜测下载目标",
+          outcomeUnknown: false,
+        },
+      };
+    }
+    return {
+      attempted: true,
+      matched: false,
+      resolution: null,
+      rootCandidateCount: 0,
+      messageSeq: null,
+      resolvedFileId: null,
+      resolvedBusId: null,
+    };
   }
 
   async function findGroupUploadedFile(uploadGroupId, normalizedInput, binding) {
@@ -2146,7 +2488,7 @@ export function createNapCatNotifier(options = {}) {
       fileMessageLookupError = publicError(error);
     }
     return {
-      fileId: String(messageAttachment?.fileId ?? verifiedFile?.file_id ?? ""),
+      fileId: String(messageAttachment?.fileId ?? ""),
       verifiedFile,
       fileMessage,
       fileMessageLookupError,
@@ -2163,6 +2505,7 @@ export function createNapCatNotifier(options = {}) {
       if (normalizedInput.hasTaskId && existing && existing.status !== "failed_before_ack") {
       if (existing.status === "sent_verified" && existing.fileId) {
         const file = {
+          fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
           fileId: String(existing.fileId),
           messageSeq: String(existing.fileMessageSeq || ""),
           busId: Number.isSafeInteger(existing.fileBusId) ? existing.fileBusId : null,
@@ -2175,6 +2518,7 @@ export function createNapCatNotifier(options = {}) {
           duplicateSuppressed: true,
           reason: "file_already_uploaded",
           verified: true,
+          fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
           fileId: file.fileId,
           verifiedFileId: String(existing.verifiedFileId ?? ""),
           verificationError: existing.verificationError ?? null,
@@ -2263,6 +2607,7 @@ export function createNapCatNotifier(options = {}) {
         fileName: normalizedInput.fileName,
         fileBytes: normalizedInput.fileBytes,
         sha256: fileSha256,
+        fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
         sourceMachine: normalizedInput.sourceMachine,
         targetMachine: normalizedInput.targetMachine,
       };
@@ -2315,6 +2660,7 @@ export function createNapCatNotifier(options = {}) {
             ...finalState.entries[normalizedInput.dedupeKey],
             status: "sent_verified",
             verified: true,
+            fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
             fileId: recovery.fileId,
             verifiedFileId: String(recovery.verifiedFile?.file_id ?? ""),
             fileMessageId: String(recovery.fileMessage?.messageId ?? ""),
@@ -2330,6 +2676,7 @@ export function createNapCatNotifier(options = {}) {
           const taskIndex = targetType === "group" && normalizedInput.hasTaskId
             ? await sendTaskFileIndex(binding, normalizedInput, {
               fileId: recovery.fileId,
+              fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
               messageSeq: String(recovery.fileMessage?.messageSeq ?? ""),
               busId: fileBusId,
               fileName: normalizedInput.fileName,
@@ -2342,6 +2689,7 @@ export function createNapCatNotifier(options = {}) {
             verified: true,
             recoveredFromUnknownUpload: true,
             uploadError: publicError(error),
+            fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
             fileId: recovery.fileId,
             verifiedFileId: String(recovery.verifiedFile?.file_id ?? ""),
             verificationError: null,
@@ -2417,6 +2765,7 @@ export function createNapCatNotifier(options = {}) {
       sentState.entries[normalizedInput.dedupeKey] = {
         ...sentState.entries[normalizedInput.dedupeKey],
         status: "sent_unverified",
+        fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
         fileId,
         updatedAt: now().toISOString(),
       };
@@ -2541,6 +2890,7 @@ export function createNapCatNotifier(options = {}) {
         ? (verified
           ? await sendTaskFileIndex(binding, normalizedInput, {
             fileId,
+            fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
             messageSeq: String(fileMessage?.messageSeq ?? ""),
             busId: fileBusId,
             fileName: normalizedInput.fileName,
@@ -2563,6 +2913,7 @@ export function createNapCatNotifier(options = {}) {
       return {
         sent: true,
         verified,
+        fileTransport: FILE_TRANSPORT_GROUP_UPLOAD,
         fileId,
         verifiedFileId: String(verifiedFile?.file_id ?? ""),
         verificationError,
@@ -2607,6 +2958,182 @@ export function createNapCatNotifier(options = {}) {
       );
     }
     return sendFileToGroupTarget(input, targetKey);
+  }
+
+  async function previewChatFile(input) {
+    const binding = loadBinding();
+    const normalizedInput = normalizeChatFileInput(input, maximumFileBytes);
+    return {
+      bindingName: binding.bindingName,
+      target: {
+        groupId: binding.groupId,
+        groupName: binding.groupName,
+        expectedMemberCount: binding.expectedMemberCount,
+      },
+      dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId,
+      fileTransport: normalizedInput.fileTransport,
+      filePath: normalizedInput.filePath,
+      fileName: normalizedInput.fileName,
+      fileBytes: normalizedInput.fileBytes,
+      sha256: await sha256File(normalizedInput.filePath),
+      message: buildChatFileCqMessage(normalizedInput),
+    };
+  }
+
+  async function previewConfiguredChatFile(input) {
+    const binding = loadBinding();
+    const controlPlane = requireControlPlane(binding);
+    const targetKey = boundedString(
+      input.target_key || controlPlane.defaultTargetKey,
+      "target_key",
+      64,
+      true,
+    );
+    if (input.task_id || input.source_machine || input.target_machine) {
+      throw new NapCatNotifierError(
+        "INVALID_ARGUMENT",
+        "napcat_preview_configured_chat_file 不发送跨机任务索引；如需训练群任务文件，请使用 napcat_preview_chat_file",
+      );
+    }
+    const normalizedInput = normalizeChatFileInput(input, maximumFileBytes);
+    const targetCheck = await checkConfiguredTarget(binding, targetKey);
+    return {
+      bindingName: binding.bindingName,
+      target: targetCheck.target,
+      dedupeKey: normalizedInput.dedupeKey,
+      deliveryId: normalizedInput.deliveryId,
+      fileTransport: normalizedInput.fileTransport,
+      filePath: normalizedInput.filePath,
+      fileName: normalizedInput.fileName,
+      fileBytes: normalizedInput.fileBytes,
+      sha256: await sha256File(normalizedInput.filePath),
+      message: buildChatFileCqMessage(normalizedInput),
+    };
+  }
+
+  function selectChatFileAttachment(attachments, normalizedInput) {
+    return (Array.isArray(attachments) ? attachments : []).find((attachment) =>
+      attachment?.type === "file"
+      && attachment.fileName === normalizedInput.fileName
+      && (attachment.fileBytes === normalizedInput.fileBytes || attachment.fileBytes === null)
+    ) ?? null;
+  }
+
+  async function sendChatFileToTarget(input, configuredTargetKey = "") {
+    const binding = loadBinding();
+    const normalizedInput = normalizeChatFileInput(input, maximumFileBytes);
+    if (configuredTargetKey && (input.task_id || input.source_machine || input.target_machine)) {
+      throw new NapCatNotifierError(
+        "INVALID_ARGUMENT",
+        "napcat_send_configured_chat_file 不发送跨机任务索引；如需训练群任务文件，请使用 napcat_send_chat_file",
+      );
+    }
+    const fileSha256 = await sha256File(normalizedInput.filePath);
+    const expectedAttachments = [{
+      type: "file",
+      fileId: "",
+      fileName: normalizedInput.fileName,
+      fileBytes: normalizedInput.fileBytes,
+    }];
+    const result = await sendFixedMessage(binding, {
+      ...normalizedInput,
+      message: buildChatFileCqMessage(normalizedInput),
+      expectedAttachments,
+    }, configuredTargetKey);
+
+    const existing = result.existing ?? {};
+    const verifiedAttachment = selectChatFileAttachment(result.verifiedAttachments, normalizedInput);
+    const fileId = String(verifiedAttachment?.fileId ?? existing.fileId ?? "");
+    const fileBusId = Number.isSafeInteger(verifiedAttachment?.busId)
+      ? verifiedAttachment.busId
+      : (Number.isSafeInteger(existing.fileBusId) ? existing.fileBusId : null);
+    const fileMessageSeq = String(
+      result.verificationEvidence?.messageSeq
+      ?? result.messageId
+      ?? existing.fileMessageSeq
+      ?? existing.messageId
+      ?? "",
+    );
+    const fileRealSeq = result.verificationEvidence?.deliveredRealSeq ?? existing.fileRealSeq ?? null;
+
+    let chatFileStatePersistenceError = null;
+    if (result.sent) {
+      const state = loadState(statePath);
+      state.entries[normalizedInput.dedupeKey] = {
+        ...state.entries[normalizedInput.dedupeKey],
+        fileTransport: FILE_TRANSPORT_CHAT_ATTACHMENT,
+        fileName: normalizedInput.fileName,
+        fileBytes: normalizedInput.fileBytes,
+        sha256: fileSha256,
+        fileId,
+        fileMessageId: String(result.messageId ?? ""),
+        fileMessageSeq,
+        fileRealSeq,
+        fileBusId,
+        updatedAt: now().toISOString(),
+      };
+      chatFileStatePersistenceError = writeStateAfterSideEffect(state);
+    }
+
+    let taskIndex = null;
+    if (!configuredTargetKey && normalizedInput.hasTaskId) {
+      if ((result.verified || existing.verified) && fileId) {
+        taskIndex = await sendTaskFileIndex(binding, normalizedInput, {
+          fileTransport: FILE_TRANSPORT_CHAT_ATTACHMENT,
+          fileId,
+          messageSeq: fileMessageSeq,
+          busId: fileBusId,
+          fileName: normalizedInput.fileName,
+          fileBytes: normalizedInput.fileBytes,
+          sha256: fileSha256,
+        });
+      } else {
+        taskIndex = {
+          status: "blocked",
+          sent: false,
+          verified: false,
+          duplicateSuppressed: false,
+          reason: "chat_file_unverified",
+          messageId: "",
+          dedupeKey: taskFileIndexDedupeKey(normalizedInput.dedupeKey),
+          verificationError: result.verificationError ?? null,
+          error: null,
+        };
+      }
+    }
+
+    return {
+      ...result,
+      fileTransport: FILE_TRANSPORT_CHAT_ATTACHMENT,
+      fileId,
+      fileMessageId: String(result.messageId ?? existing.fileMessageId ?? ""),
+      fileMessageSeq,
+      fileRealSeq,
+      fileBusId,
+      fileName: normalizedInput.fileName,
+      fileBytes: normalizedInput.fileBytes,
+      sha256: fileSha256,
+      chatFileStatePersisted: !chatFileStatePersistenceError,
+      chatFileStatePersistenceError,
+      ...(taskIndex ? { taskIndex } : {}),
+    };
+  }
+
+  async function sendChatFile(input) {
+    return sendChatFileToTarget(input);
+  }
+
+  async function sendConfiguredChatFile(input) {
+    const binding = loadBinding();
+    const controlPlane = requireControlPlane(binding);
+    const targetKey = boundedString(
+      input.target_key || controlPlane.defaultTargetKey,
+      "target_key",
+      64,
+      true,
+    );
+    return sendChatFileToTarget(input, targetKey);
   }
 
   async function sendFixedMessage(binding, normalizedInput, configuredTargetKey = "") {
@@ -2689,7 +3216,10 @@ export function createNapCatNotifier(options = {}) {
             name: targetCheck.group.actualGroupName,
             memberCount: targetCheck.group.actualMemberCount,
           };
-      const expectedMessageSha256 = comparableTextSha256(preview.message);
+      const expectedAttachments = Array.isArray(normalizedInput.expectedAttachments)
+        ? normalizedInput.expectedAttachments
+        : expectedAttachmentsFromMessageText(preview.message);
+      const expectedMessageSha256 = comparableDeliveryTextSha256(preview.message, expectedAttachments);
       const groupHistoryCheckpoint = resolvedTarget.type === "group"
         ? await captureGroupHistoryCheckpoint(resolvedTarget.id)
         : null;
@@ -2730,6 +3260,7 @@ export function createNapCatNotifier(options = {}) {
         targetType: resolvedTarget.type,
         targetId: resolvedTarget.id,
         expectedMessageSha256,
+        expectedAttachments,
         historyRealSeqBefore: groupHistoryCheckpoint?.maxRealSeq ?? null,
         historyMessageCountBefore: groupHistoryCheckpoint?.messageCount ?? null,
       };
@@ -2799,14 +3330,16 @@ export function createNapCatNotifier(options = {}) {
       let verified = !binding.requireMessageVerification;
       let verificationError = null;
       let verificationEvidence = null;
+      let verifiedAttachments = [];
       if (binding.requireMessageVerification) {
         try {
           const message = await callOneBot("get_msg", { message_id: messageId });
           const verifiedMessageId = String(message?.message_id ?? "");
           const verifiedGroupId = String(message?.group_id ?? "");
-          const verifiedText = normalizeComparableText(oneBotMessageText(message));
-          const expectedText = normalizeComparableText(preview.message);
+          const verifiedText = expectedMessageComparableText(oneBotMessageText(message), expectedAttachments);
+          const expectedText = expectedMessageComparableText(preview.message, expectedAttachments);
           const verifiedSenderId = String(message?.sender?.user_id ?? message?.user_id ?? "");
+          verifiedAttachments = oneBotDeferredAttachments(message);
           if (verifiedMessageId !== messageId) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_ID_MISMATCH", "get_msg 返回的 message_id 不一致");
           }
@@ -2816,7 +3349,10 @@ export function createNapCatNotifier(options = {}) {
           if (resolvedTarget.type === "private" && verifiedGroupId) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_TYPE_MISMATCH", "get_msg 返回的消息不是私聊消息");
           }
-          if (!verifiedText || verifiedText !== expectedText) {
+          if (expectedAttachments.length && !messageHasExpectedAttachments(message, expectedAttachments)) {
+            throw new NapCatNotifierError("MESSAGE_VERIFY_ATTACHMENT_MISMATCH", "get_msg 返回的媒体附件与发送内容不一致");
+          }
+          if ((!expectedAttachments.length || expectedText) && (!verifiedText || verifiedText !== expectedText)) {
             throw new NapCatNotifierError("MESSAGE_VERIFY_TEXT_MISMATCH", "get_msg 返回的通知正文与发送内容不一致");
           }
           if (verifiedSenderId && verifiedSenderId !== binding.expectedSelfId) {
@@ -2829,6 +3365,7 @@ export function createNapCatNotifier(options = {}) {
               messageId,
               groupHistoryCheckpoint,
               binding.expectedSelfId,
+              expectedAttachments,
             );
           } else {
             verificationEvidence = { evidence: "private_get_msg_verified" };
@@ -2847,6 +3384,7 @@ export function createNapCatNotifier(options = {}) {
         messageId,
         verificationError,
         verificationEvidence,
+        verifiedAttachments,
         userVisibilityVerified: false,
         updatedAt: now().toISOString(),
       };
@@ -2858,6 +3396,7 @@ export function createNapCatNotifier(options = {}) {
         messageId,
         verificationError,
         verificationEvidence,
+        verifiedAttachments,
         userVisibilityVerified: false,
         target: configuredTargetKey ? resolvedTarget : targetCheck.group,
         identity: targetCheck.login,
@@ -2935,10 +3474,13 @@ export function createNapCatNotifier(options = {}) {
     getControlPlaneConfig,
     readRecentMessages,
     readConfiguredTargetMessages,
+    groupFileStatus,
     previewTrainingEvent,
     previewTextMessage,
     previewFile,
     previewConfiguredFile,
+    previewChatFile,
+    previewConfiguredChatFile,
     downloadFile,
     sendTrainingEvent,
     sendTextMessage,
@@ -2946,5 +3488,7 @@ export function createNapCatNotifier(options = {}) {
     sendConfiguredMessage,
     sendFile,
     sendConfiguredFile,
+    sendChatFile,
+    sendConfiguredChatFile,
   };
 }

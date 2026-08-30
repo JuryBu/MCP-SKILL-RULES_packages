@@ -333,6 +333,27 @@ test("满足 broker、NapCat 固定账号、Codex 和 open task 后才启动 tas
   }
 });
 
+test("supervisor 主日志会轮转，并写出轻量诊断日志", async () => {
+  const fixture = createFixture();
+  try {
+    fs.mkdirSync(path.dirname(fixture.logPath), { recursive: true });
+    fs.writeFileSync(fixture.logPath, `${"x".repeat(5 * 1024 * 1024)}\n`, "utf8");
+    await runSupervisorService(baseOptions(fixture));
+    const diagnosticPath = path.join(path.dirname(fixture.logPath), "supervisor-diagnostics.jsonl");
+    const currentLog = fs.readFileSync(fixture.logPath, "utf8");
+    const diagnosticLog = fs.readFileSync(diagnosticPath, "utf8");
+    assert.equal(fs.existsSync(`${fixture.logPath}.1`), true);
+    assert.ok(fs.statSync(fixture.logPath).size < 4 * 1024 * 1024);
+    assert.match(currentLog, /"type":"supervisor_check"/);
+    assert.match(diagnosticLog, /"type":"supervisor_diagnostic"/);
+    assert.match(diagnosticLog, /"online":true/);
+    assert.match(diagnosticLog, /"ready":true/);
+    assert.doesNotMatch(diagnosticLog, /test-token/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("任一前置条件不满足时不启动 task router，也不恢复 heartbeat", async () => {
   const fixture = createFixture();
   let startCount = 0;
@@ -871,6 +892,42 @@ test("快速登录明确要求人工扫码后跨监督器重启停止重试，�
     assert.equal(runtime.login.blocked, false);
     assert.equal(runtime.login.blockedAt, null);
     assert.equal(runtime.login.blockedReason, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("快速登录输出短信验证链接时即使没有专用错误码也会停止重试", async () => {
+  const fixture = createFixture();
+  let attempts = 0;
+  const offline = async () => ({ known: true, reachable: true, online: false, accountMatches: false });
+  const noProcess = async () => ({ known: true, present: false });
+  try {
+    const common = {
+      checkNapCatStatus: offline,
+      checkNapCatProcesses: noProcess,
+      getOpenTaskCount: async () => 0,
+      quickLogin() {
+        attempts += 1;
+        const error = new Error("Command failed: powershell start-napcat-login.ps1");
+        error.code = 1;
+        error.stdout = "快速登录错误： 登录态已失效，请重新登录。\n需要验证码, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login";
+        throw error;
+      },
+    };
+    await runSupervisorService(baseOptions(fixture, common));
+    let runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.login.blockedReason.code, "NAPCAT_MANUAL_LOGIN_REQUIRED");
+
+    await runSupervisorService(baseOptions(fixture, {
+      ...common,
+      now: () => new Date("2026-07-24T08:05:00.000Z"),
+    }));
+    runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
   } finally {
     fixture.cleanup();
   }

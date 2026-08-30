@@ -13,6 +13,31 @@ async function readRequestBody(request) {
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
 
+function decodeCqValueForTest(value) {
+  return String(value ?? "")
+    .replace(/&#91;/g, "[")
+    .replace(/&#93;/g, "]")
+    .replace(/&#44;/g, ",")
+    .replace(/&amp;/g, "&");
+}
+
+function encodeCqValueForTest(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/\[/g, "&#91;")
+    .replace(/\]/g, "&#93;")
+    .replace(/,/g, "&#44;");
+}
+
+function parseCqAttributesForTest(rawAttributes) {
+  const attributes = {};
+  for (const part of String(rawAttributes ?? "").split(",")) {
+    const separator = part.indexOf("=");
+    if (separator > 0) attributes[part.slice(0, separator)] = decodeCqValueForTest(part.slice(separator + 1));
+  }
+  return attributes;
+}
+
 async function createFixture(options = {}) {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-mcp-test-"));
   const bindingPath = path.join(temporaryRoot, "binding.json");
@@ -29,6 +54,7 @@ async function createFixture(options = {}) {
   let downloadBaseUrl = "";
   let messageSequence = 1000;
   let groupRealSequence = 1000;
+  let chatFileSequence = 0;
   let taskFileIndexFailureCount = 0;
   const runtime = {
     selfId: options.selfId ?? "1000000001",
@@ -152,6 +178,50 @@ async function createFixture(options = {}) {
   };
   fs.writeFileSync(bindingPath, `${JSON.stringify(binding, null, 2)}\n`, "utf8");
 
+  function materializeOutgoingMessage(message) {
+    const text = String(message ?? "");
+    const regex = /\[CQ:file,([^\]]+)\]/g;
+    let match;
+    let offset = 0;
+    const segments = [];
+    const rawParts = [];
+    while ((match = regex.exec(text)) !== null) {
+      const before = text.slice(offset, match.index);
+      if (before) {
+        segments.push({ type: "text", data: { text: before } });
+        rawParts.push(before);
+      }
+      const attributes = parseCqAttributesForTest(match[1]);
+      const originalFilePath = attributes.file ?? "";
+      const displayName = attributes.name || attributes.file_name || path.basename(originalFilePath) || "file";
+      const fileSize = fs.existsSync(originalFilePath)
+        ? fs.statSync(originalFilePath).size
+        : Number(attributes.file_size ?? attributes.size ?? 0);
+      chatFileSequence += 1;
+      const fileId = `/chat-file-uuid-${chatFileSequence}`;
+      const fileSegment = {
+        type: "file",
+        data: {
+          file: displayName,
+          file_id: fileId,
+          file_size: Number.isFinite(fileSize) && fileSize > 0 ? fileSize : 0,
+          busid: 104,
+        },
+      };
+      segments.push(fileSegment);
+      rawParts.push(`[CQ:file,file=${encodeCqValueForTest(displayName)},file_id=${fileId},file_size=${fileSegment.data.file_size},busid=104]`);
+      offset = match.index + match[0].length;
+    }
+    const after = text.slice(offset);
+    if (after) {
+      segments.push({ type: "text", data: { text: after } });
+      rawParts.push(after);
+    }
+    return segments.length
+      ? { message: segments, rawMessage: rawParts.join("") }
+      : { message: text, rawMessage: text };
+  }
+
   const server = http.createServer(async (request, response) => {
     if (request.method === "GET" && request.url === "/download/history-file-1") {
       response.statusCode = 200;
@@ -212,6 +282,7 @@ async function createFixture(options = {}) {
       const realSeq = options.ghostEchoAdvancesRealSeq || !uncertainSendRecord
         ? (groupRealSequence += 1)
         : groupRealSequence;
+      const materialized = materializeOutgoingMessage(body.message);
       const sentMessage = {
         message_id: messageId,
         message_seq: messageId,
@@ -220,8 +291,8 @@ async function createFixture(options = {}) {
         message_type: "group",
         ...(options.omitSelfMessageSentType ? {} : { message_sent_type: "self" }),
         self_id: Number(runtime.selfId),
-        message: body.message,
-        raw_message: body.message,
+        message: materialized.message,
+        raw_message: materialized.rawMessage,
         group_id: body.group_id,
         time: 1784869200,
         user_id: runtime.selfId,
@@ -236,6 +307,7 @@ async function createFixture(options = {}) {
         messageSequence += 1;
         groupRealSequence += 1;
         const duplicateMessageId = String(messageSequence);
+        const duplicateMaterialized = materializeOutgoingMessage(body.message);
         messages.set(duplicateMessageId, {
           message_id: duplicateMessageId,
           message_seq: duplicateMessageId,
@@ -244,8 +316,8 @@ async function createFixture(options = {}) {
           message_type: "group",
           message_sent_type: "self",
           self_id: Number(runtime.selfId),
-          message: body.message,
-          raw_message: body.message,
+          message: duplicateMaterialized.message,
+          raw_message: duplicateMaterialized.rawMessage,
           group_id: body.group_id,
           time: 1784869201,
           user_id: runtime.selfId,
@@ -276,6 +348,21 @@ async function createFixture(options = {}) {
         response.end(JSON.stringify({ status: "failed", retcode: 1500, data: null }));
         return;
       }
+      data = { message_id: messageId };
+    } else if (action === "send_private_msg") {
+      messageSequence += 1;
+      const messageId = String(messageSequence);
+      const materialized = materializeOutgoingMessage(body.message);
+      messages.set(messageId, {
+        message_id: messageId,
+        message_seq: messageId,
+        private_user_id: String(body.user_id),
+        time: 1784869200,
+        user_id: runtime.selfId,
+        sender: { user_id: runtime.selfId, nickname: runtime.nickname },
+        message: materialized.message,
+        raw_message: materialized.rawMessage,
+      });
       data = { message_id: messageId };
     } else if (action === "get_group_msg_history") {
       const cursor = Number(body.message_seq || Number.POSITIVE_INFINITY);
@@ -346,26 +433,28 @@ async function createFixture(options = {}) {
       const rootFileId = `root-cache-file-${ordinal}`;
       const fileSize = fs.statSync(body.file).size;
       const uploadGroupId = Number(body.group_id);
-      messageSequence += 1;
-      const messageId = String(messageSequence);
-      messages.set(messageId, {
-        message_id: messageId,
-        message_seq: messageId,
-        group_id: uploadGroupId,
-        time: 1784869200,
-        user_id: runtime.selfId,
-        sender: { user_id: runtime.selfId, nickname: runtime.nickname },
-        message: [{
-          type: "file",
-          data: {
-            file: body.name,
-            file_id: fileId,
-            file_size: fileSize,
-            busid: 102,
-          },
-        }],
-        raw_message: `[CQ:file,file=${body.name},file_id=${fileId},file_size=${fileSize},busid=102]`,
-      });
+      if (!options.omitUploadGroupFileMessage) {
+        messageSequence += 1;
+        const messageId = String(messageSequence);
+        messages.set(messageId, {
+          message_id: messageId,
+          message_seq: messageId,
+          group_id: uploadGroupId,
+          time: 1784869200,
+          user_id: runtime.selfId,
+          sender: { user_id: runtime.selfId, nickname: runtime.nickname },
+          message: [{
+            type: "file",
+            data: {
+              file: body.name,
+              file_id: fileId,
+              file_size: fileSize,
+              busid: 102,
+            },
+          }],
+          raw_message: `[CQ:file,file=${body.name},file_id=${fileId},file_size=${fileSize},busid=102]`,
+        });
+      }
       groupFiles.unshift({
         group_id: uploadGroupId,
         file_id: rootFileId,
@@ -427,8 +516,12 @@ async function createFixture(options = {}) {
       };
     } else if (action === "get_group_root_files") {
       const count = Math.max(1, Math.min(5000, Number(body.file_count || groupFiles.length || 100)));
+      const files = groupFiles.filter((file) => String(file.group_id) === String(body.group_id)).slice(0, count);
+      for (const file of files) {
+        if (file?.file_id) primedFileIds.add(String(file.file_id));
+      }
       data = {
-        files: groupFiles.filter((file) => String(file.group_id) === String(body.group_id)).slice(0, count),
+        files,
         folders: [],
       };
     } else if (action === "delete_group_file") {
@@ -939,7 +1032,7 @@ test("file preview hashes locally and fixed-group upload verifies by file list",
   }
 });
 
-test("a successful OneBot response verifies locally without treating real_seq as unique", async () => {
+test("a successful OneBot response without real_seq advance stays unverified", async () => {
   const fixture = await createFixture({ ghostEchoOnSend: true });
   try {
     const input = {
@@ -951,18 +1044,17 @@ test("a successful OneBot response verifies locally without treating real_seq as
     };
     const result = await fixture.notifier.sendTextMessage(input);
     assert.equal(result.sent, true);
-    assert.equal(result.verified, true);
+    assert.equal(result.verified, false);
     assert.equal(result.userVisibilityVerified, false);
-    assert.equal(result.verificationEvidence.evidence, "onebot_action_and_matching_self_history_record");
-    assert.equal(result.verificationEvidence.realSeqAdvanced, false);
+    assert.equal(result.verificationError.code, "MESSAGE_VERIFY_HISTORY_NOT_VISIBLE");
     const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
-    assert.equal(state.entries[input.dedupe_key].status, "sent_verified");
+    assert.equal(state.entries[input.dedupe_key].status, "sent_unverified");
   } finally {
     await fixture.close();
   }
 });
 
-test("a successful OneBot response verifies locally when group history omits real_seq", async () => {
+test("a successful OneBot response without group history real_seq stays unverified", async () => {
   const fixture = await createFixture({ ghostEchoWithoutRealSeq: true });
   try {
     const result = await fixture.notifier.sendTextMessage({
@@ -973,11 +1065,9 @@ test("a successful OneBot response verifies locally when group history omits rea
       dedupe_key: "missing-real-seq:success",
     });
     assert.equal(result.sent, true);
-    assert.equal(result.verified, true);
+    assert.equal(result.verified, false);
     assert.equal(result.userVisibilityVerified, false);
-    assert.equal(result.verificationEvidence.evidence, "onebot_action_and_matching_self_history_record");
-    assert.equal(result.verificationEvidence.realSeqAdvanced, false);
-    assert.equal(result.verificationEvidence.deliveredRealSeq, null);
+    assert.equal(result.verificationError.code, "MESSAGE_VERIFY_HISTORY_NOT_VISIBLE");
   } finally {
     await fixture.close();
   }
@@ -1185,6 +1275,79 @@ test("group file upload deletes oldest files before upload at effective file cou
   }
 });
 
+test("group file status reports file system info for fixed and configured groups", async () => {
+  const fixture = await createFixture({
+    controlPlane: {
+      enabled: true,
+      defaultTargetKey: "owner-members",
+      targets: {
+        "owner-members": {
+          type: "group",
+          id: "987654321",
+          name: "ExampleMembers",
+          expectedMemberCount: 3,
+        },
+        "owner-private": {
+          type: "private",
+          id: "1000000001",
+          name: "ExampleOwner",
+        },
+      },
+    },
+    configuredGroups: {
+      "987654321": { groupId: "987654321", groupName: "ExampleMembers", memberCount: 3 },
+    },
+    friends: [{ userId: "1000000001", nickname: "ExampleOwner" }],
+    groupFiles: [
+      {
+        group_id: 123456789,
+        file_id: "fixed-root-1",
+        file_name: "fixed-old.zip",
+        file_size: 11,
+        busid: 102,
+        uploader_name: "ExampleBot",
+        modify_time: 1783000100,
+      },
+      {
+        group_id: 987654321,
+        file_id: "members-root-1",
+        file_name: "members-old.pdf",
+        file_size: 22,
+        busid: 104,
+        uploader_name: "ExampleBot",
+        modify_time: 1783000200,
+      },
+    ],
+    groupFileSystemCount: 1001,
+    groupFileSystemUsedSpace: 310040000,
+    groupFileSystemTotalSpace: 10737418240,
+  });
+  try {
+    const fixed = await fixture.notifier.groupFileStatus({ file_count: 10 });
+    assert.equal(fixed.target.id, "123456789");
+    assert.equal(fixed.systemInfo.fileCount, 1001);
+    assert.equal(fixed.systemInfo.usedSpace, 310040000);
+    assert.equal(fixed.files[0].fileId, "fixed-root-1");
+    assert.equal(fixed.files[0].busId, 102);
+
+    const configured = await fixture.notifier.groupFileStatus({
+      target_key: "owner-members",
+      file_count: 10,
+    });
+    assert.equal(configured.target.targetKey, "owner-members");
+    assert.equal(configured.target.id, "987654321");
+    assert.equal(configured.files[0].fileId, "members-root-1");
+    assert.equal(configured.files[0].busId, 104);
+
+    await assert.rejects(
+      () => fixture.notifier.groupFileStatus({ target_key: "owner-private" }),
+      (error) => error.code === "GROUP_FILE_STATUS_PRIVATE_UNSUPPORTED",
+    );
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("group file upload unknown outcome recovers by read-only file lookup", async () => {
   const fixture = await createFixture({ failUploadGroupFileAfterPersist: true });
   try {
@@ -1227,6 +1390,43 @@ test("group file upload unknown outcome recovers by read-only file lookup", asyn
   }
 });
 
+test("group file upload unknown outcome without a visible file message stays pending", async () => {
+  const fixture = await createFixture({
+    failUploadGroupFileAfterPersist: true,
+    omitUploadGroupFileMessage: true,
+  });
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "root-only.zip");
+    fs.writeFileSync(filePath, "root-only-upload", "utf8");
+    const input = {
+      file_path: filePath,
+      name: "只有群文件区没有聊天附件.zip",
+      task_id: "root-only-upload-task",
+      source_machine: "training",
+      target_machine: "development",
+      dedupe_key: "root-only-upload-task:file",
+    };
+
+    await assert.rejects(
+      () => fixture.notifier.sendFile(input),
+      (error) =>
+        error.code === "ONEBOT_ACTION_FAILED"
+        && error.outcomeUnknown === true
+        && error.details?.retcode === 200,
+    );
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "pending_send");
+    assert.equal(state.entries[input.dedupe_key].fileId ?? "", "");
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 1);
+    assert.equal(fixture.calls.some((call) =>
+      call.action === "send_group_msg"
+      && String(call.body.message ?? "").includes("[Codex][TASK_FILE_INDEX]")
+    ), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("configured group file upload uses selected control-plane group only", async () => {
   const fixture = await createFixture({
     controlPlane: {
@@ -1235,14 +1435,14 @@ test("configured group file upload uses selected control-plane group only", asyn
       targets: {
         "owner-members": {
           type: "group",
-          id: "950683114",
-          name: "Members",
+          id: "987654321",
+          name: "ExampleMembers",
           expectedMemberCount: 3,
         },
       },
     },
     configuredGroups: {
-      "950683114": { groupId: "950683114", groupName: "Members", memberCount: 3 },
+      "987654321": { groupId: "987654321", groupName: "ExampleMembers", memberCount: 3 },
     },
   });
   try {
@@ -1257,16 +1457,16 @@ test("configured group file upload uses selected control-plane group only", asyn
 
     const preview = await fixture.notifier.previewConfiguredFile(input);
     assert.equal(preview.target.targetKey, "owner-members");
-    assert.equal(preview.target.id, "950683114");
+    assert.equal(preview.target.id, "987654321");
     assert.equal(preview.fileBytes, 20);
 
     const result = await fixture.notifier.sendConfiguredFile(input);
     assert.equal(result.sent, true);
     assert.equal(result.verified, true);
     assert.equal(result.target.targetKey, "owner-members");
-    assert.equal(result.target.id, "950683114");
+    assert.equal(result.target.id, "987654321");
     const uploadCall = fixture.calls.find((call) => call.action === "upload_group_file");
-    assert.equal(String(uploadCall.body.group_id), "950683114");
+    assert.equal(String(uploadCall.body.group_id), "987654321");
     assert.equal(fixture.calls.some((call) =>
       call.action === "send_group_msg"
       && String(call.body.message ?? "").includes("[Codex][TASK_FILE_INDEX]")
@@ -1284,12 +1484,12 @@ test("configured private file target uploads to selected friend and verifies by 
       targets: {
         "owner-private": {
           type: "private",
-          id: "1064964702",
-          name: "Owner",
+          id: "1000000001",
+          name: "ExampleOwner",
         },
       },
     },
-    friends: [{ userId: "1064964702", nickname: "Owner" }],
+    friends: [{ userId: "1000000001", nickname: "ExampleOwner" }],
   });
   try {
     const filePath = path.join(fixture.temporaryRoot, "private-report.pdf");
@@ -1301,7 +1501,7 @@ test("configured private file target uploads to selected friend and verifies by 
       dedupe_key: "owner-private:file:report",
     });
     assert.equal(preview.target.type, "private");
-    assert.equal(preview.target.id, "1064964702");
+    assert.equal(preview.target.id, "1000000001");
 
     const result = await fixture.notifier.sendConfiguredFile({
       target_key: "owner-private",
@@ -1312,12 +1512,166 @@ test("configured private file target uploads to selected friend and verifies by 
     assert.equal(result.sent, true);
     assert.equal(result.verified, true);
     assert.equal(result.target.type, "private");
-    assert.equal(result.target.id, "1064964702");
+    assert.equal(result.target.id, "1000000001");
     const uploadCall = fixture.calls.find((call) => call.action === "upload_private_file");
-    assert.equal(String(uploadCall.body.user_id), "1064964702");
+    assert.equal(String(uploadCall.body.user_id), "1000000001");
     assert.equal(uploadCall.body.file, fs.realpathSync(filePath));
     assert.equal(fixture.calls.some((call) => call.action === "upload_group_file"), false);
     assert.equal(fixture.calls.some((call) => call.action === "send_group_msg"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("send_text with a CQ file segment verifies by media structure after OneBot rewrites it", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "manual-cq.md");
+    fs.writeFileSync(filePath, "manual cq file", "utf8");
+    const result = await fixture.notifier.sendTextMessage({
+      text: `[CQ:file,file=${encodeCqValueForTest(filePath)},name=手写CQ文件.md]`,
+      dedupe_key: "manual-cq-file:text",
+    });
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.verificationError, null);
+    assert.equal(result.verifiedAttachments[0].fileName, "手写CQ文件.md");
+    assert.equal(result.verifiedAttachments[0].fileBytes, Buffer.byteLength("manual cq file"));
+    assert.equal(result.verifiedAttachments[0].fileId, "/chat-file-uuid-1");
+    const sendCall = fixture.calls.find((call) => call.action === "send_group_msg");
+    assert.match(sendCall.body.message, /\[CQ:file,/);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("chat file send uses visible group message attachments and publishes chat transport index", async () => {
+  const fixture = await createFixture();
+  try {
+    const filePath = path.join(fixture.temporaryRoot, "chat-task.zip");
+    const content = "chat attachment transport";
+    fs.writeFileSync(filePath, content, "utf8");
+    const input = {
+      file_path: filePath,
+      name: "聊天附件回包.zip",
+      task_id: "chat-file-task",
+      source_machine: "development",
+      target_machine: "training",
+      dedupe_key: "chat-file-task:return-package",
+    };
+
+    const preview = await fixture.notifier.previewChatFile(input);
+    assert.equal(preview.fileTransport, "chat_attachment");
+    assert.match(preview.message, /\[CQ:file,/);
+    assert.match(preview.message, /name=聊天附件回包\.zip/);
+
+    const result = await fixture.notifier.sendChatFile(input);
+    assert.equal(result.sent, true);
+    assert.equal(result.verified, true);
+    assert.equal(result.fileTransport, "chat_attachment");
+    assert.equal(result.fileId, "/chat-file-uuid-1");
+    assert.equal(result.fileMessageSeq, "1001");
+    assert.equal(result.fileBusId, 104);
+    assert.equal(result.taskIndex.status, "sent_verified");
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 0);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 2);
+
+    const fileMessageCall = fixture.calls.find((call) =>
+      call.action === "send_group_msg"
+      && String(call.body.message ?? "").includes("[CQ:file,")
+    );
+    assert.equal(String(fileMessageCall.body.group_id), "123456789");
+    const indexCall = fixture.calls.find((call) =>
+      call.action === "send_group_msg"
+      && String(call.body.message ?? "").includes("[Codex][TASK_FILE_INDEX]")
+    );
+    assert.match(indexCall.body.message, /file_transport：chat_attachment/);
+    assert.match(indexCall.body.message, /file_id：\/chat-file-uuid-1/);
+    assert.match(indexCall.body.message, /file_message_seq：1001/);
+    assert.match(indexCall.body.message, /busid：104/);
+
+    const state = JSON.parse(fs.readFileSync(fixture.statePath, "utf8"));
+    assert.equal(state.entries[input.dedupe_key].status, "sent_verified");
+    assert.equal(state.entries[input.dedupe_key].fileTransport, "chat_attachment");
+    assert.equal(state.entries[input.dedupe_key].fileId, "/chat-file-uuid-1");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("configured chat file send supports group and private targets without task indexes", async () => {
+  const fixture = await createFixture({
+    controlPlane: {
+      enabled: true,
+      defaultTargetKey: "owner-members",
+      targets: {
+        "owner-members": {
+          type: "group",
+          id: "987654321",
+          name: "ExampleMembers",
+          expectedMemberCount: 3,
+        },
+        "owner-private": {
+          type: "private",
+          id: "1000000001",
+          name: "ExampleOwner",
+        },
+      },
+    },
+    configuredGroups: {
+      "987654321": { groupId: "987654321", groupName: "ExampleMembers", memberCount: 3 },
+    },
+    friends: [{ userId: "1000000001", nickname: "ExampleOwner" }],
+  });
+  try {
+    const groupPath = path.join(fixture.temporaryRoot, "members-chat.pdf");
+    fs.writeFileSync(groupPath, "members chat file", "utf8");
+    const groupResult = await fixture.notifier.sendConfiguredChatFile({
+      target_key: "owner-members",
+      file_path: groupPath,
+      name: "members-chat.pdf",
+      dedupe_key: "owner-members:chat-file",
+    });
+    assert.equal(groupResult.sent, true);
+    assert.equal(groupResult.verified, true);
+    assert.equal(groupResult.fileTransport, "chat_attachment");
+    assert.equal(groupResult.target.targetKey, "owner-members");
+    assert.equal(groupResult.fileId, "/chat-file-uuid-1");
+
+    const privatePath = path.join(fixture.temporaryRoot, "owner-chat.pdf");
+    fs.writeFileSync(privatePath, "owner chat file", "utf8");
+    const privateResult = await fixture.notifier.sendConfiguredChatFile({
+      target_key: "owner-private",
+      file_path: privatePath,
+      name: "owner-chat.pdf",
+      dedupe_key: "owner-private:chat-file",
+    });
+    assert.equal(privateResult.sent, true);
+    assert.equal(privateResult.verified, true);
+    assert.equal(privateResult.target.targetKey, "owner-private");
+    assert.equal(privateResult.fileId, "/chat-file-uuid-2");
+
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_group_file").length, 0);
+    assert.equal(fixture.calls.filter((call) => call.action === "upload_private_file").length, 0);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_group_msg").length, 1);
+    assert.equal(fixture.calls.filter((call) => call.action === "send_private_msg").length, 1);
+    assert.equal(fixture.calls.some((call) =>
+      call.action === "send_group_msg"
+      && String(call.body.message ?? "").includes("[Codex][TASK_FILE_INDEX]")
+    ), false);
+
+    await assert.rejects(
+      () => fixture.notifier.sendConfiguredChatFile({
+        target_key: "owner-members",
+        file_path: groupPath,
+        name: "members-chat.pdf",
+        task_id: "should-not-index",
+        source_machine: "development",
+        target_machine: "training",
+        dedupe_key: "owner-members:chat-file:task-fields",
+      }),
+      (error) => error.code === "INVALID_ARGUMENT",
+    );
   } finally {
     await fixture.close();
   }
@@ -1412,6 +1766,41 @@ test("task file index stays downloadable after the receiving NapCat cache is cle
     const finalUrlCall = fixture.calls.filter((call) => call.action === "get_group_file_url").at(-1);
     assert.equal(finalUrlCall.body.file_id, "raw-file-uuid-1");
     assert.equal(finalUrlCall.body.file_id.includes("root-cache-file"), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("download file resolves sender-local id from root list by file name and bytes", async () => {
+  const fixture = await createFixture({
+    groupFiles: [{
+      group_id: 123456789,
+      file_id: "receiver-real-root-uuid",
+      file_name: "接收侧真实文件.zip",
+      file_size: Buffer.byteLength("NapCat fixed-group download test\n"),
+      size: Buffer.byteLength("NapCat fixed-group download test\n"),
+      busid: 102,
+      uploader: 1000000001,
+      uploader_name: "ExampleBot",
+      modify_time: 1784869440,
+    }],
+  });
+  try {
+    const destinationDirectory = path.join(fixture.temporaryRoot, "received-root");
+    const downloaded = await fixture.notifier.downloadFile({
+      file_id: "sender-local-chat-or-root-id",
+      file_name: "接收侧真实文件.zip",
+      file_bytes: Buffer.byteLength("NapCat fixed-group download test\n"),
+      destination_dir: destinationDirectory,
+      name: "received-root.zip",
+    });
+    assert.equal(downloaded.downloaded, true);
+    assert.equal(downloaded.cacheRefresh.matched, true);
+    assert.equal(downloaded.cacheRefresh.resolution, "group_root_name_bytes");
+    assert.equal(downloaded.cacheRefresh.resolvedFileId, "receiver-real-root-uuid");
+    assert.equal(fs.readFileSync(downloaded.filePath, "utf8"), "NapCat fixed-group download test\n");
+    const finalUrlCall = fixture.calls.filter((call) => call.action === "get_group_file_url").at(-1);
+    assert.equal(finalUrlCall.body.file_id, "receiver-real-root-uuid");
   } finally {
     await fixture.close();
   }

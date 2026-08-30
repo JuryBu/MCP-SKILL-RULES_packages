@@ -171,11 +171,23 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   const credentialSetterScript = fs.readFileSync(fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url)), "utf8");
   const supervisorScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-supervisor.ps1", import.meta.url)), "utf8");
   assert.match(loginScript, /\$RuntimeConfiguration\.qqExePath/);
+  assert.match(loginScript, /\$RuntimeConfiguration\.qqUserDataDir/);
+  assert.match(loginScript, /\$LauncherArguments = " `"\$ExpectedSelfId`""/);
+  assert.match(loginScript, /EnvironmentVariables\["APPDATA"\]/);
+  assert.match(loginScript, /NAPCAT_QQ_USER_DATA_DIR/);
+  assert.doesNotMatch(loginScript, /--user-data-dir/);
   assert.match(loginScript, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
   assert.match(loginScript, /napcat\\cache\\qrcode\.png/);
   assert.match(loginScript, /cache\\qrcode\.png/);
   assert.match(loginScript, /Get-FreshQrCode/);
   assert.match(loginScript, /\$NoQr -and \$null -ne \$QrCode/);
+  assert.match(loginScript, /Test-PasswordFallbackNeedsHuman/);
+  assert.match(loginScript, /proofWaterUrl/);
+  assert.match(loginScript, /sms-verify-login/);
+  assert.match(loginScript, /KickedOffLine/);
+  assert.match(loginScript, /\$ActualNickname\) -and \$ActualNickname -ne \$ExpectedNickname/);
+  assert.match(loginScript, /按安全策略停止自动重试/);
+  assert.match(loginScript, /短信验证/);
   assert.match(loginScript, /Read-NapCatQuickLoginCredential/);
   assert.match(loginScript, /NAPCAT_QUICK_PASSWORD_MD5/);
   assert.match(loginScript, /PasswordFallbackDeadlineUtc/);
@@ -336,6 +348,10 @@ test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维�
   assert.notEqual(result.status, 0);
   assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
   assert.equal(fs.readFileSync(markerPath, "utf8").trim(), "present");
+  assert.equal(fs.existsSync(credentialPath), false);
+  const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
+  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
+  assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
   const loginLogs = fs.readdirSync(path.join(runtimeRoot, "logs"))
     .filter((name) => name.startsWith("codex-login-"))
     .map((name) => fs.readFileSync(path.join(runtimeRoot, "logs", name), "utf8"))
@@ -343,6 +359,203 @@ test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维�
   assert.equal(loginLogs.includes(testPasswordMd5), false);
   assert.ok(elapsedMs >= 1_500, `password fallback should receive a grace period, elapsed=${elapsedMs}`);
   assert.ok(elapsedMs < 10_000, `explicit password fallback failure should stop quickly, elapsed=${elapsedMs}`);
+});
+
+test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻断自动重试", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-captcha-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      "ping 127.0.0.1 -n 3 >nul",
+      "echo 快速登录错误： 登录态已失效，请重新登录。",
+      "echo 正在尝试密码回退登录 10001",
+      "echo 需要验证码, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login",
+      "ping 127.0.0.1 -n 60 >nul",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const setterPath = fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url));
+  const setterInvocationPath = path.join(root, "configure-test-credential.ps1");
+  const quotePowerShell = (value) => String(value).replaceAll("'", "''");
+  fs.writeFileSync(setterInvocationPath, `\uFEFF${[
+    "$password = ConvertTo-SecureString 'napcat-test-password' -AsPlainText -Force",
+    `& '${quotePowerShell(setterPath)}' -Password $password -DataRoot '${quotePowerShell(dataRoot)}' -BrokerRoot '${quotePowerShell(brokerRoot)}'`,
+    "",
+  ].join("\r\n")}`, "utf8");
+  const configured = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", setterInvocationPath,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  assert.equal(configured.status, 0, `${configured.stdout}\n${configured.stderr}`);
+
+  const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const startedAt = Date.now();
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", loginScriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  const elapsedMs = Date.now() - startedAt;
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+  assert.ok(elapsedMs >= 1_500, `password fallback should have a short grace period, elapsed=${elapsedMs}`);
+  assert.ok(elapsedMs < 10_000, `SMS verification should stop quickly without requiring a QR file, elapsed=${elapsedMs}`);
+  assert.equal(fs.existsSync(path.join(runtimeRoot, "napcat", "cache", "qrcode.png")), false);
+  const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
+  assert.equal(fs.existsSync(credentialPath), false);
+  const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
+  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
+  assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
+});
+
+test("登录进程提前退出前输出 KickedOffLine 时 NoQr 仍会持久阻断", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-fast-exit-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      "echo [KickedOffLine] 你的帐号当前登录态失效，请重新登录",
+      "exit /b 1",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", loginScriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+});
+
+test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-stderr-captcha-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      "ping 127.0.0.1 -n 3 >nul",
+      ">&2 echo 正在尝试密码回退登录 10001",
+      ">&2 echo 需要短信验证, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login",
+      "ping 127.0.0.1 -n 60 >nul",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const setterPath = fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url));
+  const setterInvocationPath = path.join(root, "configure-test-credential.ps1");
+  const quotePowerShell = (value) => String(value).replaceAll("'", "''");
+  fs.writeFileSync(setterInvocationPath, `\uFEFF${[
+    "$password = ConvertTo-SecureString 'napcat-test-password' -AsPlainText -Force",
+    `& '${quotePowerShell(setterPath)}' -Password $password -DataRoot '${quotePowerShell(dataRoot)}' -BrokerRoot '${quotePowerShell(brokerRoot)}'`,
+    "",
+  ].join("\r\n")}`, "utf8");
+  const configured = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", setterInvocationPath,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  assert.equal(configured.status, 0, `${configured.stdout}\n${configured.stderr}`);
+
+  const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const startedAt = Date.now();
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", loginScriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], { encoding: "utf8", timeout: 15_000, windowsHide: true });
+  const elapsedMs = Date.now() - startedAt;
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
+  assert.ok(elapsedMs >= 1_500, `password fallback should have a short grace period, elapsed=${elapsedMs}`);
+  assert.ok(elapsedMs < 10_000, `stderr SMS verification should stop quickly, elapsed=${elapsedMs}`);
+  const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
+  assert.equal(fs.existsSync(credentialPath), false);
+  const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
+  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
+  assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
 });
 
 test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {

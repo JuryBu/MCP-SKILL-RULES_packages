@@ -26,6 +26,7 @@ function createFixture() {
   const dataRoot = path.join(root, "data");
   const napcatRoot = path.join(root, "napcat");
   const qqRoot = path.join(root, "qq");
+  const qqUserDataDir = path.join(root, "qq-user-data");
   const runtimePath = path.join(dataRoot, "napcat-runtime.json");
   fs.mkdirSync(napcatRoot, { recursive: true });
   fs.mkdirSync(qqRoot, { recursive: true });
@@ -51,6 +52,7 @@ function createFixture() {
     dataRoot,
     napcatRoot,
     qqExePath,
+    qqUserDataDir,
     runtimePath,
     cleanup() { fs.rmSync(root, { recursive: true, force: true }); },
   };
@@ -64,6 +66,7 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
       "-DataRoot", fixture.dataRoot,
       "-NapCatRoot", fixture.napcatRoot,
       "-QqExePath", fixture.qqExePath,
+      "-QqUserDataDir", fixture.qqUserDataDir,
       "-ExpectedSignerSubject", "Microsoft",
     ];
     const validation = runScript([...commonArguments, "-ValidateOnly"]);
@@ -78,6 +81,7 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
     const runtime = JSON.parse(fs.readFileSync(fixture.runtimePath, "utf8"));
     assert.equal(runtime.napCatRoot, path.resolve(fixture.napcatRoot));
     assert.equal(runtime.qqExePath, path.resolve(fixture.qqExePath));
+    assert.equal(runtime.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
     assert.equal(runtime.preserved, "yes");
 
     fs.rmSync(fixture.runtimePath);
@@ -90,6 +94,22 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
     assert.equal(rolledBack.action, "rollback");
     assert.equal(rolledBack.beforeSha256, null);
     assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalBytes);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("独立 QQ 数据目录必须使用绝对路径", { skip: process.platform !== "win32" }, () => {
+  const fixture = createFixture();
+  try {
+    assert.throws(() => runScript([
+      "-DataRoot", fixture.dataRoot,
+      "-NapCatRoot", fixture.napcatRoot,
+      "-QqExePath", fixture.qqExePath,
+      "-QqUserDataDir", "relative-qq-user-data",
+      "-ExpectedSignerSubject", "Microsoft",
+      "-ValidateOnly",
+    ]), /QqUserDataDir/);
   } finally {
     fixture.cleanup();
   }

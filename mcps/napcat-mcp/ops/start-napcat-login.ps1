@@ -6,6 +6,7 @@ param(
   [string]$BrokerRoot = "",
   [string]$CodexHome = "",
   [string]$QuickLoginCredentialPath = "",
+  [string]$QqUserDataDir = "",
   [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
   [switch]$NoQr
 )
@@ -42,10 +43,17 @@ if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
 if ([string]::IsNullOrWhiteSpace($QqExePath) -and $null -ne $RuntimeConfiguration) {
   $QqExePath = [string]$RuntimeConfiguration.qqExePath
 }
+if ([string]::IsNullOrWhiteSpace($QqUserDataDir) -and $null -ne $RuntimeConfiguration) {
+  $QqUserDataDir = [string]$RuntimeConfiguration.qqUserDataDir
+}
 $NapCatRoot = [System.IO.Path]::GetFullPath($NapCatRoot)
 if (-not [string]::IsNullOrWhiteSpace($QqExePath)) {
   if (-not [System.IO.Path]::IsPathRooted($QqExePath)) { throw "qqExePath 必须是绝对路径：$QqExePath" }
   $QqExePath = [System.IO.Path]::GetFullPath($QqExePath)
+}
+if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
+  if (-not [System.IO.Path]::IsPathRooted($QqUserDataDir)) { throw "qqUserDataDir 必须是绝对路径：$QqUserDataDir" }
+  $QqUserDataDir = [System.IO.Path]::GetFullPath($QqUserDataDir).TrimEnd('\')
 }
 $Launcher = Join-Path $NapCatRoot "launcher-user.bat"
 $CoreModule = Join-Path $NapCatRoot "napcat.mjs"
@@ -119,7 +127,7 @@ function Assert-ExpectedLogin {
   if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId) -and $ActualSelfId -ne $ExpectedSelfId) {
     throw "NapCat 登录了错误 QQ：expected=$ExpectedSelfId actual=$ActualSelfId"
   }
-  if (-not [string]::IsNullOrWhiteSpace($ExpectedNickname) -and $ActualNickname -ne $ExpectedNickname) {
+  if (-not [string]::IsNullOrWhiteSpace($ExpectedNickname) -and -not [string]::IsNullOrWhiteSpace($ActualNickname) -and $ActualNickname -ne $ExpectedNickname) {
     throw "NapCat 登录了错误昵称：expected=$ExpectedNickname actual=$ActualNickname"
   }
   return [pscustomobject]@{ userId = $ActualSelfId; nickname = $ActualNickname }
@@ -155,9 +163,57 @@ function New-QrWindow {
 function Close-QrWindow {
   param($Window)
   if ($null -eq $Window) { return }
-  if ($null -ne $Window.Picture.Image) { $Window.Picture.Image.Dispose() }
-  $Window.Form.Close()
-  $Window.Form.Dispose()
+  try {
+    if ($null -ne $Window.Picture -and $null -ne $Window.Picture.Image) { $Window.Picture.Image.Dispose() }
+  } catch {
+  }
+  if ($null -ne $Window.Form) {
+    try { $Window.Form.Close() } catch {}
+    try { $Window.Form.Dispose() } catch {}
+  }
+}
+
+function Get-LoginVerificationUrl {
+  param([string]$RecentLoginLog)
+  if ([string]::IsNullOrWhiteSpace($RecentLoginLog)) { return $null }
+  $Match = [regex]::Match($RecentLoginLog, 'https://ti\.qq\.com/[^\s]+')
+  if ($Match.Success) { return $Match.Value.TrimEnd('"', "'", ",", ".", ";", "}", ")", "]") }
+  return $null
+}
+
+function Copy-TextToClipboard {
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value)) { return }
+  try {
+    Set-Clipboard -Value $Value
+  } catch {
+  }
+}
+
+function New-VerificationWindow {
+  param([string]$VerificationUrl)
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type -AssemblyName System.Drawing
+  Copy-TextToClipboard -Value $VerificationUrl
+  $Form = New-Object System.Windows.Forms.Form
+  $Form.Text = "NapCat 登录 - 需要 QQ 安全验证"
+  $Form.StartPosition = "CenterScreen"
+  $Form.ClientSize = New-Object System.Drawing.Size(520, 180)
+  $Form.TopMost = $true
+  $Form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedDialog
+  $Form.MaximizeBox = $false
+  $Label = New-Object System.Windows.Forms.Label
+  $Label.Text = "QQ 要求人机/短信/设备安全验证。验证链接已复制到剪贴板，请在浏览器地址栏粘贴打开并完成验证。"
+  $Label.SetBounds(24, 24, 470, 52)
+  $Label.Font = New-Object System.Drawing.Font("Microsoft YaHei UI", 10)
+  $Button = New-Object System.Windows.Forms.Button
+  $Button.Text = "重新复制验证链接"
+  $Button.SetBounds(170, 98, 180, 34)
+  $Button.Add_Click({ Copy-TextToClipboard -Value $VerificationUrl })
+  $Form.Controls.Add($Label)
+  $Form.Controls.Add($Button)
+  $Form.Show()
+  return [pscustomobject]@{ Form = $Form; Picture = $null }
 }
 
 function Stop-LaunchedProcessTree {
@@ -167,6 +223,70 @@ function Stop-LaunchedProcessTree {
     & "$env:SystemRoot\System32\taskkill.exe" /PID $RootProcessId /T /F 2>$null | Out-Null
   } catch {
   }
+}
+
+function Read-RecentLoginLog {
+  param([string[]]$Path)
+  $Parts = @()
+  foreach ($CandidatePath in $Path) {
+    if ([string]::IsNullOrWhiteSpace($CandidatePath) -or -not (Test-Path -LiteralPath $CandidatePath)) { continue }
+    try {
+      $Parts += (Get-Content -LiteralPath $CandidatePath -Encoding UTF8 -Tail 120 -ErrorAction SilentlyContinue) -join "`n"
+    } catch {
+    }
+  }
+  return ($Parts | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join "`n"
+}
+
+function Test-PasswordFallbackNeedsHuman {
+  param([string]$RecentLoginLog)
+  if ([string]::IsNullOrWhiteSpace($RecentLoginLog)) { return $false }
+  return $RecentLoginLog -match '(?i)(proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com|密码回退登录失败|密码回退.*登录失败|需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)'
+}
+
+function Disable-QuickLoginCredential {
+  param(
+    [string]$CredentialPath,
+    [string]$Reason
+  )
+  if ([string]::IsNullOrWhiteSpace($CredentialPath) -or -not (Test-Path -LiteralPath $CredentialPath -PathType Leaf)) { return $null }
+  try {
+    $CredentialDirectory = Split-Path -Parent $CredentialPath
+    $Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+    $DisabledPath = Join-Path $CredentialDirectory "credential.disabled-$Stamp.json"
+    Move-Item -LiteralPath $CredentialPath -Destination $DisabledPath -Force
+    Protect-NapCatCredentialPath -Path $DisabledPath
+    $MarkerPath = Join-Path $CredentialDirectory "credential.disabled.json"
+    $Payload = [ordered]@{
+      schemaVersion = 1
+      disabledAt = [DateTime]::UtcNow.ToString("o")
+      reason = $Reason
+      disabledCredentialPath = $DisabledPath
+    }
+    [System.IO.File]::WriteAllText($MarkerPath, ($Payload | ConvertTo-Json -Depth 4), (New-Object System.Text.UTF8Encoding($false)))
+    Protect-NapCatCredentialPath -Path $MarkerPath
+    return $DisabledPath
+  } catch {
+    return $null
+  }
+}
+
+function Test-QuickLoginCredentialInvalid {
+  param([string]$RecentLoginLog)
+  if ([string]::IsNullOrWhiteSpace($RecentLoginLog)) { return $false }
+  return $RecentLoginLog -match '(?i)(快速登录错误|quick login|KickedOffLine)' -and $RecentLoginLog -match '(用户身份已失效|身份已失效|登录态已失效|登录态失效|登录状态失效|授权失效|重新登录)'
+}
+
+function Stop-AndThrowManualLoginRequired {
+  param(
+    [int]$RootProcessId,
+    $QrWindow,
+    [string]$Reason,
+    [string]$LogPath
+  )
+  Close-QrWindow -Window $QrWindow
+  Stop-LaunchedProcessTree -RootProcessId $RootProcessId
+  throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] $Reason，NapCat 要求人工验证。日志：$LogPath"
 }
 
 try {
@@ -207,6 +327,13 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
 } elseif ($NoQr) {
   throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
 }
+$QqAppDataRoot = ""
+if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
+  New-Item -ItemType Directory -Force -Path $QqUserDataDir | Out-Null
+  $QqAppDataRoot = Split-Path -Parent $QqUserDataDir
+  if ([string]::IsNullOrWhiteSpace($QqAppDataRoot)) { throw "qqUserDataDir 必须位于一个有效父目录下：$QqUserDataDir" }
+  New-Item -ItemType Directory -Force -Path $QqAppDataRoot | Out-Null
+}
 if ([string]::IsNullOrWhiteSpace($QqExePath)) {
   $CommandArguments = "/d /c `"`"$Launcher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 } else {
@@ -223,12 +350,18 @@ $StartInfo.UseShellExecute = $false
 $StartInfo.CreateNoWindow = $true
 $StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
 try {
+  if (-not [string]::IsNullOrWhiteSpace($QqAppDataRoot)) {
+    $StartInfo.EnvironmentVariables["APPDATA"] = $QqAppDataRoot
+    $StartInfo.EnvironmentVariables["NAPCAT_QQ_USER_DATA_DIR"] = $QqUserDataDir
+  }
   if ($HasPasswordFallback) {
     $StartInfo.EnvironmentVariables["NAPCAT_QUICK_ACCOUNT"] = $ExpectedSelfId
     $StartInfo.EnvironmentVariables["NAPCAT_QUICK_PASSWORD_MD5"] = $QuickPasswordMd5
   }
   $StartedProcess = [System.Diagnostics.Process]::Start($StartInfo)
 } finally {
+  $StartInfo.EnvironmentVariables.Remove("APPDATA")
+  $StartInfo.EnvironmentVariables.Remove("NAPCAT_QQ_USER_DATA_DIR")
   $StartInfo.EnvironmentVariables.Remove("NAPCAT_QUICK_ACCOUNT")
   $StartInfo.EnvironmentVariables.Remove("NAPCAT_QUICK_PASSWORD_MD5")
   $QuickPasswordMd5 = $null
@@ -239,11 +372,24 @@ if ($null -eq $StartedProcess -or [int]$StartedProcess.Id -le 0) {
 $ProcessId = [int]$StartedProcess.Id
 $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $QrWindow = $null
+$VerificationWindow = $null
+$LastVerificationUrl = $null
 while ([DateTime]::UtcNow -lt $Deadline) {
   if ($null -ne $QrWindow) { [System.Windows.Forms.Application]::DoEvents() }
+  if ($null -ne $VerificationWindow) { [System.Windows.Forms.Application]::DoEvents() }
   $CurrentProcess = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
   if ($null -eq $CurrentProcess) {
+    $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
+    $PasswordFallbackNeedsHuman = Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog
+    if ($NoQr -and $HasPasswordFallback -and $PasswordFallbackNeedsHuman) {
+      Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_requires_human_verification" | Out-Null
+      $HasPasswordFallback = $false
+    }
+    if ($NoQr -and ($PasswordFallbackNeedsHuman -or (Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog))) {
+      Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "NapCat 登录进程提前退出前已报告登录态失效或人工验证" -LogPath $LogPath
+    }
     Close-QrWindow -Window $QrWindow
+    Close-QrWindow -Window $VerificationWindow
     throw "NapCat 登录进程提前退出，日志：$LogPath，错误日志：$ErrorLogPath"
   }
   try {
@@ -252,6 +398,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
       $Login = Invoke-OneBot -Action "get_login_info"
       $VerifiedLogin = Assert-ExpectedLogin -LoginData $Login.data
       Close-QrWindow -Window $QrWindow
+      Close-QrWindow -Window $VerificationWindow
       [pscustomobject]@{
         state = "online"
         launched = $true
@@ -267,29 +414,52 @@ while ([DateTime]::UtcNow -lt $Deadline) {
   } catch {
     if ($_.Exception.Message -like "NapCat 登录了错误*") {
       Close-QrWindow -Window $QrWindow
+      Close-QrWindow -Window $VerificationWindow
       Stop-LaunchedProcessTree -RootProcessId $ProcessId
       throw
     }
   }
   $QrCode = Get-FreshQrCode -NotBeforeUtc $StartedAtUtc.AddSeconds(-2)
   $PasswordFallbackNeedsHuman = $false
-  if ($NoQr -and $HasPasswordFallback -and (Test-Path -LiteralPath $LogPath)) {
-    $RecentLoginLog = (Get-Content -LiteralPath $LogPath -Encoding UTF8 -Tail 80 -ErrorAction SilentlyContinue) -join "`n"
-    $PasswordFallbackNeedsHuman = $RecentLoginLog -match '密码回退(?:登录失败|需要验证码|需要新设备验证|需要异常设备验证)'
+  $QuickLoginCredentialInvalid = $false
+  if ($NoQr -and $HasPasswordFallback -and ((Test-Path -LiteralPath $LogPath) -or (Test-Path -LiteralPath $ErrorLogPath))) {
+    $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
+    $PasswordFallbackNeedsHuman = Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog
+    $QuickLoginCredentialInvalid = Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog
+  } elseif ($NoQr -and ((Test-Path -LiteralPath $LogPath) -or (Test-Path -LiteralPath $ErrorLogPath))) {
+    $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
+    $QuickLoginCredentialInvalid = Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog
   }
-  if ($NoQr -and $null -ne $QrCode -and (-not $HasPasswordFallback -or $PasswordFallbackNeedsHuman -or [DateTime]::UtcNow -ge $PasswordFallbackDeadlineUtc)) {
-    Close-QrWindow -Window $QrWindow
-    Stop-LaunchedProcessTree -RootProcessId $ProcessId
-    $Reason = if ($HasPasswordFallback) { "快速登录和加密密码回退均未恢复账号" } else { "快速登录记录已不可用且尚未配置加密密码回退" }
-    throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] $Reason，NapCat 要求人工验证。日志：$LogPath"
+  if ($NoQr -and $PasswordFallbackNeedsHuman) {
+    if ($HasPasswordFallback) {
+      Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_requires_human_verification" | Out-Null
+      $HasPasswordFallback = $false
+    }
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退已触发短信验证或验证码，不能无人值守继续重试" -LogPath $LogPath
+  }
+  if ($NoQr -and (-not $HasPasswordFallback) -and ($QuickLoginCredentialInvalid -or $null -ne $QrCode)) {
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "快速登录记录已不可用且尚未配置加密密码回退" -LogPath $LogPath
+  }
+  if ($NoQr -and $null -ne $QrCode -and ($HasPasswordFallback -and [DateTime]::UtcNow -ge $PasswordFallbackDeadlineUtc)) {
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "快速登录和加密密码回退均未恢复账号" -LogPath $LogPath
   }
   if (-not $NoQr -and $null -eq $QrWindow -and $null -ne $QrCode) {
     $QrWindow = New-QrWindow -ImagePath $QrCode.FullName
+  }
+  if (-not $NoQr -and ((Test-Path -LiteralPath $LogPath) -or (Test-Path -LiteralPath $ErrorLogPath))) {
+    $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
+    $VerificationUrl = Get-LoginVerificationUrl -RecentLoginLog $RecentLoginLog
+    if (-not [string]::IsNullOrWhiteSpace($VerificationUrl) -and $VerificationUrl -ne $LastVerificationUrl) {
+      Close-QrWindow -Window $VerificationWindow
+      $VerificationWindow = New-VerificationWindow -VerificationUrl $VerificationUrl
+      $LastVerificationUrl = $VerificationUrl
+    }
   }
   Start-Sleep -Milliseconds 500
 }
 
 Close-QrWindow -Window $QrWindow
+Close-QrWindow -Window $VerificationWindow
 Stop-LaunchedProcessTree -RootProcessId $ProcessId
 $DisplayIdentity = if ([string]::IsNullOrWhiteSpace($ExpectedNickname)) {
   $ExpectedSelfId
@@ -299,6 +469,10 @@ $DisplayIdentity = if ([string]::IsNullOrWhiteSpace($ExpectedNickname)) {
   "$ExpectedNickname / $ExpectedSelfId"
 }
 if ($NoQr) {
-  throw "NapCat 快速登录在 $TimeoutSeconds 秒内没有恢复 $DisplayIdentity；快速登录记录不可用或启动器未接受该账号，本次未弹二维码。请在有人值守时运行不带 -NoQr 的登录脚本重新扫码。日志：$LogPath"
+  $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
+  if ((Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog) -or (Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog)) {
+    throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] NapCat 快速登录在 $TimeoutSeconds 秒内没有恢复 $DisplayIdentity；日志显示登录态失效或需要人工验证，本次未弹二维码。日志：$LogPath"
+  }
+  throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] NapCat 快速登录在 $TimeoutSeconds 秒内没有恢复 $DisplayIdentity；按安全策略停止自动重试，本次未弹二维码。日志：$LogPath"
 }
 throw "NapCat 在 $TimeoutSeconds 秒内没有以 $DisplayIdentity 登录成功，日志：$LogPath"
