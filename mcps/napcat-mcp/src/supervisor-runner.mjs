@@ -2128,7 +2128,7 @@ export async function runSupervisorService(options = {}) {
         blockedAt: loginBlockedAt,
         blockedReason: loginBlockedReason,
         manualBlockRecheckLastAttemptAt,
-        manualBlockRecheckNextAllowedAt: loginBlocked ? null : manualBlockRecheckNextAllowedAt,
+        manualBlockRecheckNextAllowedAt: null,
         manualBlockRecheckCount,
         offlineProcessSince,
         offlineProcessFingerprint,
