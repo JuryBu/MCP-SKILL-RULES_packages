@@ -217,7 +217,7 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 
 监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
-有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本不传 `-NoQr` 时走普通人工登录流程，不强行把 binding 中的 `expectedSelfId` 拼成快速登录参数，避免快速票据失效时卡在隐藏进程里却不显示二维码或安全验证。脚本同时兼容 Node 一键包的 `napcat/cache/qrcode.png` 与旧 Shell 布局的 `cache/qrcode.png`。监督器始终传 `-NoQr` 与 `-NoPasswordFallback`，无人值守场景只尝试该账号已有的本地快速登录票据，不再主动撞密码/验证码回退；检测到二维码、安全验证或登录态失效后返回 `NAPCAT_MANUAL_LOGIN_REQUIRED` 并阻断同一窗口内的自动登录，默认 30 分钟后才允许一次后台无二维码复查。真实 OneBot 在线会立即解除阻断，因此不会在无人值守桌面弹二维码，也不会按普通冷却周期反复制造登录尝试。
+有人值守恢复时直接运行 `ops/start-napcat-login.ps1`：脚本不传 `-NoQr` 时走普通人工登录流程，不强行把 binding 中的 `expectedSelfId` 拼成快速登录参数，避免快速票据失效时卡在隐藏进程里却不显示二维码或安全验证。脚本同时兼容 Node 一键包的 `napcat/cache/qrcode.png` 与旧 Shell 布局的 `cache/qrcode.png`。监督器始终传 `-NoQr` 与 `-NoPasswordFallback`，无人值守场景只尝试该账号已有的本地快速登录票据，不再主动撞密码/验证码回退；检测到二维码、安全验证或登录态失效后返回 `NAPCAT_MANUAL_LOGIN_REQUIRED` 并持续阻断自动登录，不再按 30 分钟复查窗口重新拉起登录器。真实 OneBot 在线会立即解除阻断；需要重新尝试登录时必须由有人值守的显式登录脚本或外部恢复动作触发，因此不会在无人值守桌面弹二维码，也不会按普通冷却周期反复制造登录尝试。
 
 监督器主日志 `state/supervisor.jsonl` 使用有界 JSONL 轮转，避免长期运行后长到数百 MB 阻塞排障读取；同时写入 `state/supervisor-diagnostics.jsonl` 作为轻量诊断流，只记录端口/在线/进程数/登录阻断/重启动作/错误码等排障字段，不记录 token、私聊目标或密码等敏感信息。定位「为什么掉登录」时优先看诊断流，再按时间点回查主日志与 NapCat 登录日志。
 

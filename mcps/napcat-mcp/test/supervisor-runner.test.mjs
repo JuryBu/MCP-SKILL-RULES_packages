@@ -36,6 +36,7 @@ function createFixture() {
     loginScriptPath: path.join(root, "login.ps1"),
     napcatRoot: path.join(root, "NapCat"),
     qqExePath: path.join(root, "QQ", "QQ.exe"),
+    qqUserDataDir: path.join(root, "QQData", "1000000001", "QQ"),
   };
   fs.writeFileSync(fixture.bindingPath, JSON.stringify({
     expectedSelfId: "1000000001",
@@ -102,10 +103,13 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
       "--lock", fixture.lockPath,
       "--interval-ms", "30000",
       "--broker-health-url", "http://127.0.0.1:14588/health",
+      "--data-root", fixture.root,
+      "--broker-root", path.join(fixture.root, "broker"),
       "--broker-start-script", fixture.brokerStartScriptPath,
       "--login-script", fixture.loginScriptPath,
       "--napcat-root", fixture.napcatRoot,
       "--qq-exe-path", fixture.qqExePath,
+      "--qq-user-data-dir", fixture.qqUserDataDir,
       "--stale-napcat-unknown-ms", "180000",
     ]);
     assert.equal(parsed.scanIntervalMs, 30000);
@@ -114,6 +118,9 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
     assert.equal(parsed.loginScriptPath, path.resolve(fixture.loginScriptPath));
     assert.equal(parsed.napcatRoot, path.resolve(fixture.napcatRoot));
     assert.equal(parsed.qqExePath, path.resolve(fixture.qqExePath));
+    assert.equal(parsed.rootDir, path.resolve(fixture.root));
+    assert.equal(parsed.brokerRoot, path.resolve(fixture.root, "broker"));
+    assert.equal(parsed.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
     assert.equal(parsed.staleNapCatUnknownMs, 180_000);
     assert.throws(() => parseArguments(["--binding", fixture.bindingPath]), /缺少参数 --registry/);
     assert.throws(() => parseArguments([
@@ -137,14 +144,23 @@ test("quick-login 参数固定带 -NoQr、禁用密码回退、短 timeout 和 N
     const argumentsList = buildQuickLoginArguments({
       napcatRoot: fixture.napcatRoot,
       qqExePath: fixture.qqExePath,
+      rootDir: fixture.root,
+      brokerRoot: path.join(fixture.root, "broker"),
+      qqUserDataDir: fixture.qqUserDataDir,
       timeoutMs: 35_000,
       codexHome: fixture.root,
     });
     assert.deepEqual(argumentsList.slice(0, 4), ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot"]);
     assert.equal(argumentsList.includes("-NoPasswordFallback"), true);
     assert.equal(argumentsList.includes("-Qr"), false);
+    const dataRootIndex = argumentsList.indexOf("-DataRoot");
+    assert.equal(argumentsList[dataRootIndex + 1], path.resolve(fixture.root));
+    const brokerRootIndex = argumentsList.indexOf("-BrokerRoot");
+    assert.equal(argumentsList[brokerRootIndex + 1], path.resolve(fixture.root, "broker"));
     const qqPathIndex = argumentsList.indexOf("-QqExePath");
     assert.equal(argumentsList[qqPathIndex + 1], path.resolve(fixture.qqExePath));
+    const qqDataIndex = argumentsList.indexOf("-QqUserDataDir");
+    assert.equal(argumentsList[qqDataIndex + 1], path.resolve(fixture.qqUserDataDir));
     assert.equal(argumentsList.at(-1), path.resolve(fixture.root));
   } finally {
     fixture.cleanup();
@@ -234,8 +250,10 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
     { ProcessId: 12, Name: "QQ.exe", CommandLine: `"${pinnedQqPath}"` },
     { ProcessId: 13, Name: "NapCatWinBootMain.exe", CommandLine: '"C:\\Users\\ExampleUser\\NapCat-Codex-Other\\NapCatWinBootMain.exe"' },
     { ProcessId: 14, Name: "node.exe", CommandLine: '"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\Other\\.codex\\mcp-http-broker\\broker.mjs' },
+    { ProcessId: 15, Name: "powershell.exe", CommandLine: `powershell.exe -NoProfile -File C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\ops\\start-napcat-login.ps1 -NapCatRoot "${napcatRoot}"` },
+    { ProcessId: 16, Name: "powershell.exe", CommandLine: `powershell -NoProfile -Command "node supervisor-runner.mjs --login-script C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\ops\\start-napcat-login.ps1 --napcat-root '${napcatRoot}'"` },
   ];
-  assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12]);
+  assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12, 15]);
   assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker").map((item) => item.ProcessId), [4]);
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
 });
@@ -866,7 +884,7 @@ test("停止前 PID 身份改变时拒绝 taskkill", async () => {
   assert.equal(taskkillCount, 0);
 });
 
-test("快速登录明确要求人工扫码后短期停止重试，过复查窗口后允许一次无二维码复查", async () => {
+test("快速登录明确要求人工扫码后持续停止自动重试，直到真实在线后解除", async () => {
   const fixture = createFixture();
   let attempts = 0;
   const offline = async () => ({ known: true, reachable: true, online: false, accountMatches: false });
@@ -905,11 +923,11 @@ test("快速登录明确要求人工扫码后短期停止重试，过复查窗�
       now: () => new Date("2026-07-24T08:05:02.000Z"),
     }));
     runtime = readRuntime(fixture);
-    assert.equal(attempts, 2);
-    assert.equal(runtime.actions.quickLogin.succeeded, true);
-    assert.equal(runtime.actions.quickLogin.manualBlockRecheck, true);
-    assert.equal(runtime.login.blocked, false);
-    assert.equal(runtime.login.manualBlockRecheckCount, 1);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+    assert.equal(runtime.actions.quickLogin.autoRecheck, false);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.login.manualBlockRecheckCount, 0);
 
     await runSupervisorService(baseOptions(fixture, {
       checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true, ready: true }),
@@ -926,7 +944,7 @@ test("快速登录明确要求人工扫码后短期停止重试，过复查窗�
   }
 });
 
-test("人工登录阻断过复查窗口且残留离线进程陈旧时先清理再无二维码复查", async () => {
+test("人工登录阻断后即使残留离线进程陈旧也不自动清理重登", async () => {
   const fixture = createFixture();
   const processes = [
     { pid: 6801, parentPid: 5800, name: "cmd.exe", commandLine: `cmd /c "${fixture.napcatRoot}\\launcher-user.bat"` },
@@ -963,14 +981,15 @@ test("人工登录阻断过复查窗口且残留离线进程陈旧时先清理�
       },
     }));
     const runtime = readRuntime(fixture);
-    assert.equal(stopCalls.length, 1);
-    assert.equal(loginAttempts, 1);
-    assert.equal(runtime.actions.staleNapCatRecovery.succeeded, true);
-    assert.equal(runtime.actions.staleNapCatRecovery.manualBlockRecheck, true);
-    assert.equal(runtime.actions.quickLogin.succeeded, true);
-    assert.equal(runtime.actions.quickLogin.manualBlockRecheck, true);
-    assert.equal(runtime.login.blocked, false);
-    assert.equal(runtime.login.manualBlockRecheckCount, 1);
+    assert.equal(stopCalls.length, 0);
+    assert.equal(loginAttempts, 0);
+    assert.equal(runtime.actions.staleNapCatRecovery.attempted, false);
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "manual_login_required");
+    assert.equal(runtime.actions.quickLogin.attempted, false);
+    assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+    assert.equal(runtime.actions.quickLogin.autoRecheck, false);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.login.manualBlockRecheckCount, 0);
   } finally {
     fixture.cleanup();
   }
@@ -1007,6 +1026,35 @@ test("快速登录输出短信验证链接时即使没有专用错误码也会�
     runtime = readRuntime(fixture);
     assert.equal(attempts, 1);
     assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("快速登录返回人工登录状态对象时不能被记为成功", async () => {
+  const fixture = createFixture();
+  let attempts = 0;
+  try {
+    await runSupervisorService(baseOptions(fixture, {
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: false }),
+      getOpenTaskCount: async () => 0,
+      quickLogin(args) {
+        attempts += 1;
+        assert.equal(args.rootDir, path.resolve(fixture.root));
+        assert.equal(args.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
+        return {
+          state: "manual_login_required",
+          reason: "快速登录记录已不可用且尚未配置加密密码回退",
+          qrCodePath: path.join(fixture.napcatRoot, "napcat", "cache", "qrcode.png"),
+        };
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.actions.quickLogin.succeeded, false);
+    assert.equal(runtime.login.lastResult.code, "NAPCAT_MANUAL_LOGIN_REQUIRED");
   } finally {
     fixture.cleanup();
   }

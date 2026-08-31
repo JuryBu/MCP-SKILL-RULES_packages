@@ -187,6 +187,8 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /\$NoQr -and \$null -ne \$QrCode/);
   assert.match(loginScript, /CommandLineHints/);
   assert.match(loginScript, /Stop-LaunchedProcessTree -RootProcessId \$ProcessId -CommandLineHints @\(\$NapCatRoot, \$QqExePath\)/);
+  assert.match(loginScript, /taskkill\.exe" \/PID \$RootProcessId \/T \/F/);
+  assert.doesNotMatch(loginScript, /Get-CimInstance Win32_Process\s*\|[\s\S]*Stop-Process/);
   assert.match(loginScript, /Test-PasswordFallbackNeedsHuman/);
   assert.match(loginScript, /proofWaterUrl/);
   assert.match(loginScript, /sms-verify-login/);

@@ -266,16 +266,6 @@ function Stop-LaunchedProcessTree {
     }
   } catch {
   }
-  try {
-    Get-CimInstance Win32_Process |
-      Where-Object {
-        $_.ProcessId -ne $PID -and
-        $AllowedNames -contains $_.Name -and
-        (Test-ProcessCommandLineMatchesHint -CommandLine $_.CommandLine -NormalizedHints $NormalizedHints)
-      } |
-      ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-  } catch {
-  }
 }
 
 function Read-RecentLoginLog {

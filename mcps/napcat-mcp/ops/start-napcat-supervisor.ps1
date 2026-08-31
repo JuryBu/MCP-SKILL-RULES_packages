@@ -42,6 +42,10 @@ if ([string]::IsNullOrWhiteSpace($NapCatRoot)) {
 if ([string]::IsNullOrWhiteSpace($QqExePath) -and $null -ne $RuntimeConfiguration) {
   $QqExePath = [string]$RuntimeConfiguration.qqExePath
 }
+$QqUserDataDir = ""
+if ($null -ne $RuntimeConfiguration) {
+  $QqUserDataDir = [string]$RuntimeConfiguration.qqUserDataDir
+}
 $ToolkitRoot = Split-Path -Parent $NapCatParent
 $RunnerPath = Join-Path $NapCatMcpRoot "src\supervisor-runner.mjs"
 $PrivateEnvPath = Join-Path $BrokerRoot "broker-private.env.json"
@@ -192,6 +196,8 @@ $Arguments = @(
   "--lock", $LockPath,
   "--interval-ms", ([string]$IntervalMilliseconds),
   "--broker-health-url", "http://127.0.0.1:14588/health?endpoint=napcat&deep=1",
+  "--data-root", $DataRoot,
+  "--broker-root", $BrokerRoot,
   "--broker-start-script", $BrokerStartScript,
   "--login-script", $LoginScript,
   "--napcat-root", $NapCatRoot,
@@ -200,6 +206,9 @@ $Arguments = @(
 )
 if (-not [string]::IsNullOrWhiteSpace($QqExePath)) {
   $Arguments += @("--qq-exe-path", $QqExePath)
+}
+if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
+  $Arguments += @("--qq-user-data-dir", $QqUserDataDir)
 }
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru

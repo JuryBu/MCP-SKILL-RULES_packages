@@ -34,10 +34,13 @@ const CLI_OPTIONS = new Set([
   "lock",
   "interval-ms",
   "broker-health-url",
+  "data-root",
+  "broker-root",
   "broker-start-script",
   "login-script",
   "napcat-root",
   "qq-exe-path",
+  "qq-user-data-dir",
   "probe-timeout-ms",
   "login-timeout-ms",
   "login-cooldown-ms",
@@ -302,7 +305,7 @@ function sanitizeText(value) {
 export function publicError(error, fallbackCode = "SUPERVISOR_ERROR") {
   return {
     code: error?.code ?? fallbackCode,
-    message: sanitizeText(error?.message ?? String(error)),
+    message: sanitizeText(error?.message ?? error?.reason ?? error?.state ?? String(error)),
     outcomeUnknown: Boolean(error?.outcomeUnknown),
   };
 }
@@ -527,10 +530,13 @@ export function parseArguments(argv) {
     maintenancePath: automationMaintenancePath,
     alertPath: automationAlertPath,
     brokerHealthUrl: String(values["broker-health-url"]).trim(),
+    rootDir: resolveOptionalPath(values["data-root"]),
+    brokerRoot: resolveOptionalPath(values["broker-root"]),
     brokerStartScriptPath: resolveOptionalPath(values["broker-start-script"]),
     loginScriptPath: resolveOptionalPath(values["login-script"]),
     napcatRoot: resolveOptionalPath(values["napcat-root"]),
     qqExePath: resolveOptionalPath(values["qq-exe-path"]),
+    qqUserDataDir: resolveOptionalPath(values["qq-user-data-dir"]),
     once: values.once === true,
   };
 }
@@ -608,11 +614,20 @@ export function buildQuickLoginArguments(options = {}) {
     "-NapCatRoot",
     resolveRequiredPath(options.napcatRoot, "napcatRoot"),
   ];
+  if (options.rootDir) {
+    argumentsList.push("-DataRoot", resolveRequiredPath(options.rootDir, "dataRoot"));
+  }
+  if (options.brokerRoot) {
+    argumentsList.push("-BrokerRoot", resolveRequiredPath(options.brokerRoot, "brokerRoot"));
+  }
   if (options.noPasswordFallback !== false) {
     argumentsList.push("-NoPasswordFallback");
   }
   if (options.qqExePath) {
     argumentsList.push("-QqExePath", resolveRequiredPath(options.qqExePath, "qqExePath"));
+  }
+  if (options.qqUserDataDir) {
+    argumentsList.push("-QqUserDataDir", resolveRequiredPath(options.qqUserDataDir, "qqUserDataDir"));
   }
   if (options.codexHome) {
     argumentsList.push("-CodexHome", resolveRequiredPath(options.codexHome, "codexHome"));
@@ -751,16 +766,28 @@ function normalizeProcessRecords(processes) {
   return processes.filter((item) => item && typeof item === "object");
 }
 
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
   const normalizedRoot = napcatRoot ? path.resolve(napcatRoot).replaceAll("\\", "/").toLowerCase() : null;
-  const normalizedRootPrefix = normalizedRoot ? `${normalizedRoot.replace(/\/+$/, "")}/` : null;
+  const normalizedRootBare = normalizedRoot ? normalizedRoot.replace(/\/+$/, "") : null;
+  const normalizedRootPrefix = normalizedRootBare ? `${normalizedRootBare}/` : null;
+  const runtimeRootReferencePattern = normalizedRootBare
+    ? new RegExp(`${escapeRegExp(normalizedRootBare)}(?:[/"\\s]|$)`, "i")
+    : null;
   const normalizedQqExePath = qqExePath ? path.resolve(qqExePath).replaceAll("\\", "/").toLowerCase() : null;
+  const isSupervisorOrProbeCommand = (text) => /(?:^|[\\/])(?:supervisor-runner\.mjs|start-napcat-supervisor\.ps1|stop-napcat-supervisor(?:-watchdog)?\.ps1|get-napcat-supervisor-status\.ps1|run-napcatsupervisorwatchdog\.ps1)(?:[\s"]|$)/i.test(text);
+  const isLoginScriptExecution = (text) => /(?:^|[\s"])-(?:file|f)\s+"?[^"\r\n]*[\\/]start-napcat-login\.ps1(?:["\s]|$)/i.test(text);
   return normalizeProcessRecords(processes).filter((item) => {
     const text = processText(item).replaceAll("\\", "/");
     const name = String(item?.Name ?? item?.name ?? "");
     const commandLine = String(item?.CommandLine ?? item?.commandLine ?? "").trim().replaceAll("\\", "/").toLowerCase();
     const unquotedCommandLine = commandLine.startsWith('"') ? commandLine.slice(1) : commandLine;
     const belongsToRuntime = Boolean(normalizedRootPrefix && text.includes(normalizedRootPrefix));
+    const referencesRuntimeRoot = Boolean(runtimeRootReferencePattern?.test(text));
+    if (isSupervisorOrProbeCommand(text)) return false;
     const isPinnedQq = Boolean(
       normalizedQqExePath
       && /^qq\.exe$/i.test(name)
@@ -775,7 +802,7 @@ export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
       (belongsToRuntime && /^napcatwinbootmain\.exe$/i.test(name))
       || isPinnedQq
       || (belongsToRuntime && /launcher-user\.bat/i.test(text))
-      || (belongsToRuntime && /^(powershell|pwsh)(\.exe)?$/i.test(name) && /start-napcat-login\.ps1/i.test(text))
+      || (referencesRuntimeRoot && /^(powershell|pwsh)(\.exe)?$/i.test(name) && isLoginScriptExecution(text))
       || (belongsToRuntime && /^node(?:\.exe)?$/i.test(name) && /(?:^|[\\/])(?:index\.js|napcat[\\/]napcat\.mjs)(?:[\s"]|$)/i.test(text)),
     );
   });
@@ -1121,6 +1148,7 @@ export function createSupervisorDependencies(options = {}) {
     loginScriptPath: resolveOptionalPath(options.loginScriptPath ?? options["login-script"]),
     napcatRoot: resolveOptionalPath(options.napcatRoot ?? options["napcat-root"]),
     qqExePath: resolveOptionalPath(options.qqExePath ?? options["qq-exe-path"]),
+    qqUserDataDir: resolveOptionalPath(options.qqUserDataDir ?? options["qq-user-data-dir"]),
     notifier,
     registry,
     routerController,
@@ -1173,7 +1201,8 @@ function processSnapshotOptions(dependencies, options, snapshot) {
     processes: snapshot,
     timeoutMs: options.probeTimeoutMs,
     brokerRoot: dependencies.brokerRoot,
-    napcatRoot: options.napcatRoot,
+    napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+    qqExePath: options.qqExePath ?? dependencies.qqExePath,
   };
 }
 
@@ -1191,12 +1220,6 @@ function cooldownReady(lastAttemptAt, clock, cooldownMs) {
   return !Number.isFinite(lastAttemptMs) || nowMs(clock) >= lastAttemptMs + cooldownMs;
 }
 
-function manualLoginBlockRecheckReady({ blocked, blockedAt, lastRecheckAt, clock, recheckMs }) {
-  if (!blocked) return false;
-  if (!cooldownReady(blockedAt, clock, recheckMs)) return false;
-  return cooldownReady(lastRecheckAt, clock, recheckMs);
-}
-
 function actionError(error) {
   return publicError(error, "SUPERVISOR_ACTION_FAILED");
 }
@@ -1204,18 +1227,24 @@ function actionError(error) {
 function manualLoginSignalText(error) {
   return [
     error?.code,
+    error?.state,
+    error?.reason,
     error?.message,
     error?.stdout,
     error?.stderr,
+    error?.qrCodePath,
     error?.details?.wording,
   ].map((part) => String(part ?? "")).join("\n");
 }
 
 function requiresManualLogin(error) {
   const code = String(error?.code ?? "");
+  const state = String(error?.state ?? "");
   const message = manualLoginSignalText(error);
   return code === "NAPCAT_MANUAL_LOGIN_REQUIRED"
+    || state === "manual_login_required"
     || message.includes("[NAPCAT_MANUAL_LOGIN_REQUIRED]")
+    || /qrcode\.png|qrCodePath/i.test(message)
     || /proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com/i.test(message)
     || /(需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)/.test(message)
     || (/(用户身份已失效|身份已失效|登录态已失效|登录态失效|登录状态失效|授权失效|重新登录)/.test(message) && /(快速登录|quick login|KickedOffLine)/i.test(message));
@@ -1478,6 +1507,9 @@ export async function runSupervisorService(options = {}) {
         loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
         napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
         qqExePath: options.qqExePath ?? dependencies.qqExePath,
+        rootDir: dependencies.rootDir,
+        brokerRoot: dependencies.brokerRoot,
+        qqUserDataDir: options.qqUserDataDir ?? dependencies.qqUserDataDir,
         codexHome: dependencies.codexHome,
         timeoutMs: loginTimeoutMs,
       })
@@ -1723,14 +1755,9 @@ export async function runSupervisorService(options = {}) {
         loginBlocked = false;
         loginBlockedAt = null;
         loginBlockedReason = null;
+        manualBlockRecheckNextAllowedAt = null;
       }
-      const manualBlockRecheckDue = manualLoginBlockRecheckReady({
-        blocked: loginBlocked,
-        blockedAt: loginBlockedAt,
-        lastRecheckAt: manualBlockRecheckLastAttemptAt,
-        clock,
-        recheckMs: manualLoginBlockRecheckMs,
-      });
+      const manualBlockRecheckDue = false;
       if (
         staleProcessTrigger
         && (!loginBlocked || manualBlockRecheckDue)
@@ -1772,7 +1799,7 @@ export async function runSupervisorService(options = {}) {
           attempted: false,
           trigger: offlineProcessKnown ? "explicit_offline" : "status_unknown",
           reason: loginBlocked
-            ? (manualBlockRecheckDue ? "manual_login_recheck_waiting_for_stale_recovery" : "manual_login_required")
+            ? "manual_login_required"
             : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown"),
           offlineProcessSince,
           offlineProcessFingerprint,
@@ -1801,9 +1828,8 @@ export async function runSupervisorService(options = {}) {
           attempted: false,
           reason: "manual_login_required",
           noQr: true,
-          nextRecheckAt: manualBlockRecheckNextAllowedAt ?? (Number.isFinite(Date.parse(loginBlockedAt ?? ""))
-            ? new Date(Date.parse(loginBlockedAt) + manualLoginBlockRecheckMs).toISOString()
-            : null),
+          autoRecheck: false,
+          nextRecheckAt: null,
           error: loginBlockedReason,
         };
       } else if (
@@ -1819,18 +1845,32 @@ export async function runSupervisorService(options = {}) {
           manualBlockRecheckCount += 1;
         }
         try {
-          await runLogin({
+          const loginResult = await runLogin({
             loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
             napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
             qqExePath: options.qqExePath ?? dependencies.qqExePath,
+            rootDir: dependencies.rootDir,
+            brokerRoot: dependencies.brokerRoot,
+            qqUserDataDir: options.qqUserDataDir ?? dependencies.qqUserDataDir,
             bindingPath,
             privateEnvPath,
             noQr: true,
             timeoutMs: loginTimeoutMs,
             hidden: true,
           });
-          actions.quickLogin = { attempted: true, succeeded: true, noQr: true, manualBlockRecheck: recheckManualLoginBlock };
-          status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: "started" };
+          if (requiresManualLogin(loginResult)) {
+            const value = { ...actionError(loginResult), code: "NAPCAT_MANUAL_LOGIN_REQUIRED" };
+            loginBlocked = true;
+            loginBlockedAt = checkAt;
+            loginBlockedReason = value;
+            manualBlockRecheckNextAllowedAt = null;
+            actions.quickLogin = { attempted: true, succeeded: false, noQr: true, manualBlockRecheck: recheckManualLoginBlock, error: value };
+            errors.push({ source: "quick_login", error: value });
+            status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
+          } else {
+            actions.quickLogin = { attempted: true, succeeded: true, noQr: true, manualBlockRecheck: recheckManualLoginBlock };
+            status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: loginResult?.state ?? "started" };
+          }
         } catch (error) {
           let value = actionError(error);
           if (requiresManualLogin(error) || requiresManualLogin(value)) {
@@ -1838,6 +1878,7 @@ export async function runSupervisorService(options = {}) {
             loginBlocked = true;
             loginBlockedAt = checkAt;
             loginBlockedReason = value;
+            manualBlockRecheckNextAllowedAt = null;
           }
           actions.quickLogin = { attempted: true, succeeded: false, noQr: true, manualBlockRecheck: recheckManualLoginBlock, error: value };
           errors.push({ source: "quick_login", error: value });
@@ -1854,6 +1895,15 @@ export async function runSupervisorService(options = {}) {
         };
       } else if (quickLoginEligible && typeof runLogin !== "function") {
         actions.quickLogin = { attempted: false, reason: "script_missing", noQr: true };
+      } else if (!napcat.online && loginBlocked) {
+        actions.quickLogin = {
+          attempted: false,
+          reason: "manual_login_required",
+          noQr: true,
+          autoRecheck: false,
+          nextRecheckAt: null,
+          error: loginBlockedReason,
+        };
       } else if (!napcat.online && napcatProcess.present) {
         actions.quickLogin = {
           attempted: false,
@@ -2078,7 +2128,7 @@ export async function runSupervisorService(options = {}) {
         blockedAt: loginBlockedAt,
         blockedReason: loginBlockedReason,
         manualBlockRecheckLastAttemptAt,
-        manualBlockRecheckNextAllowedAt,
+        manualBlockRecheckNextAllowedAt: loginBlocked ? null : manualBlockRecheckNextAllowedAt,
         manualBlockRecheckCount,
         offlineProcessSince,
         offlineProcessFingerprint,
