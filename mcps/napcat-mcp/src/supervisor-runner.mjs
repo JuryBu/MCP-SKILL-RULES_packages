@@ -13,6 +13,7 @@ export const DEFAULT_SUPERVISOR_INTERVAL_MS = 15_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
 export const DEFAULT_LOGIN_TIMEOUT_MS = 35_000;
 export const DEFAULT_LOGIN_COOLDOWN_MS = 120_000;
+export const DEFAULT_MANUAL_LOGIN_BLOCK_RECHECK_MS = 30 * 60_000;
 export const DEFAULT_STALE_NAPCAT_OFFLINE_MS = 120_000;
 export const DEFAULT_STALE_NAPCAT_UNKNOWN_MS = 180_000;
 export const DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS = 300_000;
@@ -40,6 +41,7 @@ const CLI_OPTIONS = new Set([
   "probe-timeout-ms",
   "login-timeout-ms",
   "login-cooldown-ms",
+  "manual-login-block-recheck-ms",
   "stale-napcat-offline-ms",
   "stale-napcat-unknown-ms",
   "stale-napcat-recovery-cooldown-ms",
@@ -467,6 +469,11 @@ export function parseArguments(argv) {
     "--broker-start-cooldown-ms",
     DEFAULT_BROKER_START_COOLDOWN_MS,
   );
+  const manualLoginBlockRecheckMs = normalizePositiveInteger(
+    values["manual-login-block-recheck-ms"],
+    "--manual-login-block-recheck-ms",
+    DEFAULT_MANUAL_LOGIN_BLOCK_RECHECK_MS,
+  );
   const staleNapCatOfflineMs = normalizePositiveInteger(
     values["stale-napcat-offline-ms"],
     "--stale-napcat-offline-ms",
@@ -508,6 +515,7 @@ export function parseArguments(argv) {
     probeTimeoutMs,
     loginTimeoutMs,
     loginCooldownMs,
+    manualLoginBlockRecheckMs,
     staleNapCatOfflineMs,
     staleNapCatUnknownMs,
     staleNapCatRecoveryCooldownMs,
@@ -600,6 +608,9 @@ export function buildQuickLoginArguments(options = {}) {
     "-NapCatRoot",
     resolveRequiredPath(options.napcatRoot, "napcatRoot"),
   ];
+  if (options.noPasswordFallback !== false) {
+    argumentsList.push("-NoPasswordFallback");
+  }
   if (options.qqExePath) {
     argumentsList.push("-QqExePath", resolveRequiredPath(options.qqExePath, "qqExePath"));
   }
@@ -831,13 +842,16 @@ export function findCodexProcesses(processes) {
 }
 
 export function findBrokerProcesses(processes, brokerRoot) {
-  void brokerRoot;
+  const normalizedBrokerRoot = typeof brokerRoot === "string" && brokerRoot.trim()
+    ? path.resolve(brokerRoot).replaceAll("\\", "/").toLowerCase()
+    : null;
   return normalizeProcessRecords(processes).filter((item) => {
     const text = processText(item).replaceAll("\\", "/");
     const name = String(item?.Name ?? item?.name ?? "");
     return Boolean(
       /^node(?:\.exe)?$/i.test(name)
-      && /(?:^|[\s"])[^\r\n"]*broker\.mjs(?:[\s"]|$)/i.test(text),
+      && /(?:^|[\s"])[^\r\n"]*broker\.mjs(?:[\s"]|$)/i.test(text)
+      && (!normalizedBrokerRoot || text.toLowerCase().includes(normalizedBrokerRoot))
     );
   });
 }
@@ -1024,6 +1038,13 @@ export function createSupervisorDependencies(options = {}) {
   const privateEnvironment = options.privateEnvironment
     ?? (privateEnvPath ? readPrivateEnvironment(privateEnvPath) : {});
   const rootDir = path.resolve(options.rootDir ?? path.dirname(bindingPath));
+  const brokerRoot = path.resolve(
+    options.brokerRoot
+      ?? options["broker-root"]
+      ?? privateEnvironment.CODEX_TOOLKIT_BROKER_ROOT
+      ?? process.env.CODEX_TOOLKIT_BROKER_ROOT
+      ?? rootDir,
+  );
   const codeRoot = path.resolve(
     options.codeRoot
       ?? privateEnvironment.NAPCAT_MCP_ROOT
@@ -1087,6 +1108,7 @@ export function createSupervisorDependencies(options = {}) {
     privateEnvPath,
     privateEnvironment,
     codeRoot,
+    brokerRoot,
     environment,
     rootDir,
     statePath,
@@ -1150,7 +1172,7 @@ function processSnapshotOptions(dependencies, options, snapshot) {
     ...dependencies,
     processes: snapshot,
     timeoutMs: options.probeTimeoutMs,
-    brokerRoot: dependencies.rootDir,
+    brokerRoot: dependencies.brokerRoot,
     napcatRoot: options.napcatRoot,
   };
 }
@@ -1167,6 +1189,12 @@ function cooldownReady(lastAttemptAt, clock, cooldownMs) {
   if (!lastAttemptAt) return true;
   const lastAttemptMs = Date.parse(lastAttemptAt);
   return !Number.isFinite(lastAttemptMs) || nowMs(clock) >= lastAttemptMs + cooldownMs;
+}
+
+function manualLoginBlockRecheckReady({ blocked, blockedAt, lastRecheckAt, clock, recheckMs }) {
+  if (!blocked) return false;
+  if (!cooldownReady(blockedAt, clock, recheckMs)) return false;
+  return cooldownReady(lastRecheckAt, clock, recheckMs);
 }
 
 function actionError(error) {
@@ -1232,6 +1260,11 @@ export async function runSupervisorService(options = {}) {
   const probeTimeoutMs = normalizePositiveInteger(options.probeTimeoutMs, "probeTimeoutMs", DEFAULT_PROBE_TIMEOUT_MS);
   const loginTimeoutMs = normalizePositiveInteger(options.loginTimeoutMs, "loginTimeoutMs", DEFAULT_LOGIN_TIMEOUT_MS);
   const loginCooldownMs = normalizePositiveInteger(options.loginCooldownMs, "loginCooldownMs", DEFAULT_LOGIN_COOLDOWN_MS);
+  const manualLoginBlockRecheckMs = normalizePositiveInteger(
+    options.manualLoginBlockRecheckMs,
+    "manualLoginBlockRecheckMs",
+    DEFAULT_MANUAL_LOGIN_BLOCK_RECHECK_MS,
+  );
   const staleNapCatOfflineMs = normalizePositiveInteger(
     options.staleNapCatOfflineMs,
     "staleNapCatOfflineMs",
@@ -1333,6 +1366,9 @@ export async function runSupervisorService(options = {}) {
       blocked: previousLogin.blocked === true,
       blockedAt: previousLogin.blockedAt ?? null,
       blockedReason: previousLogin.blockedReason ?? null,
+      manualBlockRecheckLastAttemptAt: previousLogin.manualBlockRecheckLastAttemptAt ?? null,
+      manualBlockRecheckNextAllowedAt: previousLogin.manualBlockRecheckNextAllowedAt ?? null,
+      manualBlockRecheckCount: Number(previousLogin.manualBlockRecheckCount ?? 0),
       offlineProcessSince: previousLogin.offlineProcessSince ?? null,
       offlineProcessFingerprint: previousLogin.offlineProcessFingerprint ?? null,
       unknownProcessSince: previousLogin.unknownProcessSince ?? null,
@@ -1384,6 +1420,9 @@ export async function runSupervisorService(options = {}) {
   let loginBlocked = previousLogin.blocked === true;
   let loginBlockedAt = previousLogin.blockedAt ?? null;
   let loginBlockedReason = previousLogin.blockedReason ?? null;
+  let manualBlockRecheckLastAttemptAt = previousLogin.manualBlockRecheckLastAttemptAt ?? null;
+  let manualBlockRecheckNextAllowedAt = previousLogin.manualBlockRecheckNextAllowedAt ?? null;
+  let manualBlockRecheckCount = Number(previousLogin.manualBlockRecheckCount ?? 0);
   let offlineProcessSince = previousLogin.offlineProcessSince ?? null;
   let offlineProcessFingerprint = previousLogin.offlineProcessFingerprint ?? null;
   let unknownProcessSince = previousLogin.unknownProcessSince ?? null;
@@ -1680,9 +1719,21 @@ export async function runSupervisorService(options = {}) {
         ? "explicit_offline"
         : (unknownProcessKnown && unknownProcessDurationMs >= staleNapCatUnknownMs ? "status_unknown" : null);
       let staleProcessRecovered = false;
+      if (napcat.ready && loginBlocked) {
+        loginBlocked = false;
+        loginBlockedAt = null;
+        loginBlockedReason = null;
+      }
+      const manualBlockRecheckDue = manualLoginBlockRecheckReady({
+        blocked: loginBlocked,
+        blockedAt: loginBlockedAt,
+        lastRecheckAt: manualBlockRecheckLastAttemptAt,
+        clock,
+        recheckMs: manualLoginBlockRecheckMs,
+      });
       if (
         staleProcessTrigger
-        && !loginBlocked
+        && (!loginBlocked || manualBlockRecheckDue)
         && cooldownReady(staleRecoveryLastAttemptAt, clock, staleNapCatRecoveryCooldownMs)
       ) {
         staleRecoveryLastAttemptAt = checkAt;
@@ -1705,6 +1756,7 @@ export async function runSupervisorService(options = {}) {
             attempted: true,
             succeeded: true,
             trigger: staleProcessTrigger,
+            manualBlockRecheck: manualBlockRecheckDue,
             stoppedProcessIds: stopped.rootProcessIds ?? [],
           };
         } catch (error) {
@@ -1720,7 +1772,7 @@ export async function runSupervisorService(options = {}) {
           attempted: false,
           trigger: offlineProcessKnown ? "explicit_offline" : "status_unknown",
           reason: loginBlocked
-            ? "manual_login_required"
+            ? (manualBlockRecheckDue ? "manual_login_recheck_waiting_for_stale_recovery" : "manual_login_required")
             : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown"),
           offlineProcessSince,
           offlineProcessFingerprint,
@@ -1738,7 +1790,8 @@ export async function runSupervisorService(options = {}) {
         && napcatProcess.known
         && (!napcatProcess.present || staleProcessRecovered)
       );
-      if (napcat.ready && loginBlocked) {
+      const recheckManualLoginBlock = quickLoginEligible && manualBlockRecheckDue;
+      if (recheckManualLoginBlock) {
         loginBlocked = false;
         loginBlockedAt = null;
         loginBlockedReason = null;
@@ -1748,6 +1801,9 @@ export async function runSupervisorService(options = {}) {
           attempted: false,
           reason: "manual_login_required",
           noQr: true,
+          nextRecheckAt: manualBlockRecheckNextAllowedAt ?? (Number.isFinite(Date.parse(loginBlockedAt ?? ""))
+            ? new Date(Date.parse(loginBlockedAt) + manualLoginBlockRecheckMs).toISOString()
+            : null),
           error: loginBlockedReason,
         };
       } else if (
@@ -1757,6 +1813,11 @@ export async function runSupervisorService(options = {}) {
       ) {
         loginLastAttemptAt = checkAt;
         loginNextAllowedAt = nextTimeIso(clock, loginCooldownMs);
+        if (recheckManualLoginBlock) {
+          manualBlockRecheckLastAttemptAt = checkAt;
+          manualBlockRecheckNextAllowedAt = nextTimeIso(clock, manualLoginBlockRecheckMs);
+          manualBlockRecheckCount += 1;
+        }
         try {
           await runLogin({
             loginScriptPath: options.loginScriptPath ?? dependencies.loginScriptPath,
@@ -1768,7 +1829,7 @@ export async function runSupervisorService(options = {}) {
             timeoutMs: loginTimeoutMs,
             hidden: true,
           });
-          actions.quickLogin = { attempted: true, succeeded: true, noQr: true };
+          actions.quickLogin = { attempted: true, succeeded: true, noQr: true, manualBlockRecheck: recheckManualLoginBlock };
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: "started" };
         } catch (error) {
           let value = actionError(error);
@@ -1778,7 +1839,7 @@ export async function runSupervisorService(options = {}) {
             loginBlockedAt = checkAt;
             loginBlockedReason = value;
           }
-          actions.quickLogin = { attempted: true, succeeded: false, noQr: true, error: value };
+          actions.quickLogin = { attempted: true, succeeded: false, noQr: true, manualBlockRecheck: recheckManualLoginBlock, error: value };
           errors.push({ source: "quick_login", error: value });
           status.login = { lastAttemptAt: loginLastAttemptAt, nextAllowedAt: loginNextAllowedAt, lastResult: value };
         }
@@ -2016,6 +2077,9 @@ export async function runSupervisorService(options = {}) {
         blocked: loginBlocked,
         blockedAt: loginBlockedAt,
         blockedReason: loginBlockedReason,
+        manualBlockRecheckLastAttemptAt,
+        manualBlockRecheckNextAllowedAt,
+        manualBlockRecheckCount,
         offlineProcessSince,
         offlineProcessFingerprint,
         unknownProcessSince,

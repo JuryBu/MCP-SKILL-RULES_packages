@@ -96,6 +96,7 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
       "-QqExePath", fixture.qqExePath,
       "-QqUserDataDir", fixture.qqUserDataDir,
       "-ExpectedSignerSubject", "Microsoft",
+      "-MinimumQqBuild", "0",
     ];
     const validation = runScript([...commonArguments, "-ValidateOnly"]);
     assert.equal(validation.action, "validate");
@@ -179,8 +180,27 @@ test("独立 QQ 版本没有精确 PacketBackend 映射时拒绝写入", { skip:
       "-NapCatRoot", fixture.napcatRoot,
       "-QqExePath", fixture.qqExePath,
       "-ExpectedSignerSubject", "Microsoft",
+      "-MinimumQqBuild", "0",
       "-ValidateOnly",
     ]), /PacketBackend/);
+    assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalBytes);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("独立 QQ 版本低于官方最低支持 build 时拒绝写入", { skip: process.platform !== "win32" }, () => {
+  const fixture = createFixture();
+  try {
+    const originalBytes = fs.readFileSync(fixture.runtimePath);
+    assert.throws(() => runScript([
+      "-DataRoot", fixture.dataRoot,
+      "-NapCatRoot", fixture.napcatRoot,
+      "-QqExePath", fixture.qqExePath,
+      "-ExpectedSignerSubject", "Microsoft",
+      "-MinimumQqBuild", "999999",
+      "-ValidateOnly",
+    ]), /minimum=999999/);
     assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalBytes);
   } finally {
     fixture.cleanup();

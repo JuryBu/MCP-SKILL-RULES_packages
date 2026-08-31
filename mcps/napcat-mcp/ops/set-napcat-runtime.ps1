@@ -8,6 +8,7 @@ param(
   [string]$ExpectedQqSha256 = "",
   [string]$ExpectedNapCatSha256 = "",
   [string]$ExpectedSignerSubject = "Tencent Technology",
+  [int]$MinimumQqBuild = 40768,
   [switch]$ValidateOnly,
   [switch]$Rollback,
   [string]$BackupPath = ""
@@ -164,7 +165,11 @@ if ($UsesIndependentQq) {
   if ($QqVersion -notmatch '^(\d+\.\d+\.\d+)\.(\d+)(?:\s.*)?$') {
     throw "无法从独立 QQ 主程序读取受支持的四段版本号：$QqVersion"
   }
-  $PacketMappingKey = "$($Matches[1])-$($Matches[2])-x64"
+  $QqBuild = [int]$Matches[2]
+  if ($MinimumQqBuild -gt 0 -and $QqBuild -lt $MinimumQqBuild) {
+    throw "独立 QQ 版本低于 NapCat 官方最低支持 build：version=$QqVersion build=$QqBuild minimum=$MinimumQqBuild"
+  }
+  $PacketMappingKey = "$($Matches[1])-$QqBuild-x64"
   $QqSha256 = Test-ExpectedHash -Path $QqExePath -Expected $ExpectedQqSha256 -Label "QQ.exe"
 } else {
   $PackageJson = Get-Content -LiteralPath (Join-Path $NapCatRoot "package.json") -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -172,7 +177,11 @@ if ($UsesIndependentQq) {
   if ($QqVersion -notmatch '^(\d+\.\d+\.\d+)-(\d+)(?:\s.*)?$') {
     throw "无法从 NapCat node 包 package.json 读取受支持的 QQ 版本号：$QqVersion"
   }
-  $PacketMappingKey = "$($Matches[1])-$($Matches[2])-x64"
+  $QqBuild = [int]$Matches[2]
+  if ($MinimumQqBuild -gt 0 -and $QqBuild -lt $MinimumQqBuild) {
+    throw "NapCat node 包 QQ 版本低于 NapCat 官方最低支持 build：version=$QqVersion build=$QqBuild minimum=$MinimumQqBuild"
+  }
+  $PacketMappingKey = "$($Matches[1])-$QqBuild-x64"
 }
 $NapCatSource = Get-Content -LiteralPath $NapCatModulePath -Raw -Encoding UTF8
 if ($NapCatSource.IndexOf('"' + $PacketMappingKey + '"', [System.StringComparison]::Ordinal) -lt 0) {
@@ -209,6 +218,8 @@ if ($ValidateOnly) {
     qqUserDataDir = $ResolvedQqUserDataDir
     qqSha256 = $QqSha256
     qqVersion = $QqVersion
+    qqBuild = $QqBuild
+    minimumQqBuild = $MinimumQqBuild
     packetMappingKey = $PacketMappingKey
     signerSubject = $SignerSubject
   } | ConvertTo-Json -Depth 10
@@ -250,6 +261,8 @@ $AppliedHash = Get-NormalizedHash -Path $RuntimePath
   qqUserDataDir = $ResolvedQqUserDataDir
   qqSha256 = $QqSha256
   qqVersion = $QqVersion
+  qqBuild = $QqBuild
+  minimumQqBuild = $MinimumQqBuild
   packetMappingKey = $PacketMappingKey
   signerSubject = $SignerSubject
 } | ConvertTo-Json -Depth 10

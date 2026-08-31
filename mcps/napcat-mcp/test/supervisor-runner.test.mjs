@@ -131,7 +131,7 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
   }
 });
 
-test("quick-login 参数固定带 -NoQr、短 timeout 和 NapCat 根目录", () => {
+test("quick-login 参数固定带 -NoQr、禁用密码回退、短 timeout 和 NapCat 根目录", () => {
   const fixture = createFixture();
   try {
     const argumentsList = buildQuickLoginArguments({
@@ -141,6 +141,7 @@ test("quick-login 参数固定带 -NoQr、短 timeout 和 NapCat 根目录", () 
       codexHome: fixture.root,
     });
     assert.deepEqual(argumentsList.slice(0, 4), ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot"]);
+    assert.equal(argumentsList.includes("-NoPasswordFallback"), true);
     assert.equal(argumentsList.includes("-Qr"), false);
     const qqPathIndex = argumentsList.indexOf("-QqExePath");
     assert.equal(argumentsList[qqPathIndex + 1], path.resolve(fixture.qqExePath));
@@ -167,8 +168,17 @@ test("quick-login 给登录脚本保留清理隐藏进程的超时余量", async
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeout, 50_000);
     assert.deepEqual(
-      calls[0].argumentsList.slice(-7),
-      ["-NoQr", "-TimeoutSeconds", "35", "-NapCatRoot", path.resolve(fixture.napcatRoot), "-QqExePath", path.resolve(fixture.qqExePath)],
+      calls[0].argumentsList.slice(-8),
+      [
+        "-NoQr",
+        "-TimeoutSeconds",
+        "35",
+        "-NapCatRoot",
+        path.resolve(fixture.napcatRoot),
+        "-NoPasswordFallback",
+        "-QqExePath",
+        path.resolve(fixture.qqExePath),
+      ],
     );
   } finally {
     fixture.cleanup();
@@ -223,9 +233,10 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
     { ProcessId: 11, Name: "QQ.exe", CommandLine: `"${pinnedQqPath}" --no-sandbox` },
     { ProcessId: 12, Name: "QQ.exe", CommandLine: `"${pinnedQqPath}"` },
     { ProcessId: 13, Name: "NapCatWinBootMain.exe", CommandLine: '"C:\\Users\\ExampleUser\\NapCat-Codex-Other\\NapCatWinBootMain.exe"' },
+    { ProcessId: 14, Name: "node.exe", CommandLine: '"C:\\Program Files\\nodejs\\node.exe" C:\\Users\\Other\\.codex\\mcp-http-broker\\broker.mjs' },
   ];
   assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12]);
-  assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp").map((item) => item.ProcessId), [4]);
+  assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker").map((item) => item.ProcessId), [4]);
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
 });
 
@@ -283,11 +294,13 @@ test("监督器与 task router 使用彼此独立的 runtime、stop 和 lock 文
 test("监督器从 NAPCAT_MCP_ROOT 启动 task router，但仍把状态保存在 DataRoot", () => {
   const fixture = createFixture();
   const codeRoot = path.join(fixture.root, "services", "napcat-bridge", "current");
+  const brokerRoot = path.join(fixture.root, "broker-root");
   let controllerOptions = null;
   try {
     const dependencies = createSupervisorDependencies({
       ...fixture,
       privateEnvironment: {
+        CODEX_TOOLKIT_BROKER_ROOT: brokerRoot,
         NAPCAT_MCP_ROOT: codeRoot,
         NAPCAT_HTTP_URL: "http://127.0.0.1:3010",
         NAPCAT_ACCESS_TOKEN: "test-token",
@@ -300,6 +313,8 @@ test("监督器从 NAPCAT_MCP_ROOT 启动 task router，但仍把状态保存在
       },
     });
     assert.equal(dependencies.codeRoot, path.resolve(codeRoot));
+    assert.equal(dependencies.brokerRoot, path.resolve(brokerRoot));
+    assert.notEqual(dependencies.brokerRoot, dependencies.rootDir);
     assert.equal(controllerOptions.rootDir, path.resolve(fixture.root));
     assert.equal(controllerOptions.runnerPath, path.join(path.resolve(codeRoot), "src", "task-router-runner.mjs"));
     assert.equal(controllerOptions.env.NAPCAT_TASK_REGISTRY_PATH, path.resolve(fixture.registryPath));
@@ -851,7 +866,7 @@ test("停止前 PID 身份改变时拒绝 taskkill", async () => {
   assert.equal(taskkillCount, 0);
 });
 
-test("快速登录明确要求人工扫码后跨监督器重启停止重试，真实在线后自动解除", async () => {
+test("快速登录明确要求人工扫码后短期停止重试，过复查窗口后允许一次无二维码复查", async () => {
   const fixture = createFixture();
   let attempts = 0;
   const offline = async () => ({ known: true, reachable: true, online: false, accountMatches: false });
@@ -863,6 +878,7 @@ test("快速登录明确要求人工扫码后跨监督器重启停止重试，�
       getOpenTaskCount: async () => 0,
       quickLogin() {
         attempts += 1;
+        if (attempts >= 2) return { state: "started" };
         const error = new Error("[NAPCAT_MANUAL_LOGIN_REQUIRED] 快速登录记录已不可用");
         error.code = "NAPCAT_MANUAL_LOGIN_REQUIRED";
         throw error;
@@ -881,6 +897,19 @@ test("快速登录明确要求人工扫码后跨监督器重启停止重试，�
     runtime = readRuntime(fixture);
     assert.equal(attempts, 1);
     assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+    assert.equal(runtime.login.blocked, true);
+
+    await runSupervisorService(baseOptions(fixture, {
+      ...common,
+      manualLoginBlockRecheckMs: 1_000,
+      now: () => new Date("2026-07-24T08:05:02.000Z"),
+    }));
+    runtime = readRuntime(fixture);
+    assert.equal(attempts, 2);
+    assert.equal(runtime.actions.quickLogin.succeeded, true);
+    assert.equal(runtime.actions.quickLogin.manualBlockRecheck, true);
+    assert.equal(runtime.login.blocked, false);
+    assert.equal(runtime.login.manualBlockRecheckCount, 1);
 
     await runSupervisorService(baseOptions(fixture, {
       checkNapCatStatus: async () => ({ known: true, reachable: true, online: true, accountMatches: true, ready: true }),
@@ -892,6 +921,56 @@ test("快速登录明确要求人工扫码后跨监督器重启停止重试，�
     assert.equal(runtime.login.blocked, false);
     assert.equal(runtime.login.blockedAt, null);
     assert.equal(runtime.login.blockedReason, null);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("人工登录阻断过复查窗口且残留离线进程陈旧时先清理再无二维码复查", async () => {
+  const fixture = createFixture();
+  const processes = [
+    { pid: 6801, parentPid: 5800, name: "cmd.exe", commandLine: `cmd /c "${fixture.napcatRoot}\\launcher-user.bat"` },
+    { pid: 6802, parentPid: 6801, name: "node.exe", commandLine: `node "${fixture.napcatRoot}\\napcat.mjs"` },
+  ];
+  const stopCalls = [];
+  let loginAttempts = 0;
+  try {
+    atomicWriteJson(fixture.runtimeStatePath, {
+      login: {
+        blocked: true,
+        blockedAt: "2026-07-24T07:00:00.000Z",
+        blockedReason: { code: "NAPCAT_MANUAL_LOGIN_REQUIRED" },
+        offlineProcessSince: "2026-07-24T07:00:00.000Z",
+        offlineProcessFingerprint: processSnapshotFingerprint(processes),
+      },
+    });
+    await runSupervisorService(baseOptions(fixture, {
+      now: () => new Date("2026-07-24T08:00:00.000Z"),
+      staleNapCatOfflineMs: 60_000,
+      staleNapCatRecoveryCooldownMs: 300_000,
+      manualLoginBlockRecheckMs: 1_000,
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses(args) {
+        stopCalls.push(args);
+        return { rootProcessIds: [6801] };
+      },
+      quickLogin(args) {
+        loginAttempts += 1;
+        assert.equal(args.noQr, true);
+        return { state: "started" };
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCalls.length, 1);
+    assert.equal(loginAttempts, 1);
+    assert.equal(runtime.actions.staleNapCatRecovery.succeeded, true);
+    assert.equal(runtime.actions.staleNapCatRecovery.manualBlockRecheck, true);
+    assert.equal(runtime.actions.quickLogin.succeeded, true);
+    assert.equal(runtime.actions.quickLogin.manualBlockRecheck, true);
+    assert.equal(runtime.login.blocked, false);
+    assert.equal(runtime.login.manualBlockRecheckCount, 1);
   } finally {
     fixture.cleanup();
   }

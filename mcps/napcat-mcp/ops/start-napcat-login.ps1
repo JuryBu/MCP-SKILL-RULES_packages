@@ -8,7 +8,8 @@ param(
   [string]$QuickLoginCredentialPath = "",
   [string]$QqUserDataDir = "",
   [ValidateRange(30, 900)][int]$TimeoutSeconds = 300,
-  [switch]$NoQr
+  [switch]$NoQr,
+  [switch]$NoPasswordFallback
 )
 
 $ErrorActionPreference = "Stop"
@@ -224,16 +225,25 @@ function New-VerificationWindow {
   return [pscustomobject]@{ Form = $Form; Picture = $null }
 }
 
+function Test-ProcessCommandLineMatchesHint {
+  param(
+    [string]$CommandLine,
+    [string[]]$NormalizedHints = @()
+  )
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
+  foreach ($Hint in $NormalizedHints) {
+    if ([string]::IsNullOrWhiteSpace($Hint)) { continue }
+    if ($CommandLine.IndexOf($Hint, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  }
+  return $false
+}
+
 function Stop-LaunchedProcessTree {
   param(
     [int]$RootProcessId,
     [string[]]$CommandLineHints = @()
   )
   if ($RootProcessId -le 0) { return }
-  try {
-    & "$env:SystemRoot\System32\taskkill.exe" /PID $RootProcessId /T /F 2>$null | Out-Null
-  } catch {
-  }
   $AllowedNames = @("cmd.exe", "node.exe", "QQ.exe", "NapCatWinBootMain.exe")
   $NormalizedHints = @()
   foreach ($Hint in $CommandLineHints) {
@@ -246,12 +256,22 @@ function Stop-LaunchedProcessTree {
   }
   if ($NormalizedHints.Count -eq 0) { return }
   try {
+    $RootProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $RootProcessId" -ErrorAction SilentlyContinue
+    if (
+      $null -ne $RootProcess -and
+      $AllowedNames -contains $RootProcess.Name -and
+      (Test-ProcessCommandLineMatchesHint -CommandLine $RootProcess.CommandLine -NormalizedHints $NormalizedHints)
+    ) {
+      & "$env:SystemRoot\System32\taskkill.exe" /PID $RootProcessId /T /F 2>$null | Out-Null
+    }
+  } catch {
+  }
+  try {
     Get-CimInstance Win32_Process |
       Where-Object {
         $_.ProcessId -ne $PID -and
         $AllowedNames -contains $_.Name -and
-        -not [string]::IsNullOrWhiteSpace($_.CommandLine) -and
-        ($NormalizedHints | Where-Object { $_ -and $_.Length -gt 0 -and $_.CommandLine.IndexOf($_, [System.StringComparison]::OrdinalIgnoreCase) -ge 0 })
+        (Test-ProcessCommandLineMatchesHint -CommandLine $_.CommandLine -NormalizedHints $NormalizedHints)
       } |
       ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
   } catch {
@@ -274,7 +294,14 @@ function Read-RecentLoginLog {
 function Test-PasswordFallbackNeedsHuman {
   param([string]$RecentLoginLog)
   if ([string]::IsNullOrWhiteSpace($RecentLoginLog)) { return $false }
-  return $RecentLoginLog -match '(?i)(proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com|密码回退登录失败|密码回退.*登录失败|需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)'
+  return $RecentLoginLog -match '(?i)(proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com|需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)'
+}
+
+function Test-PasswordFallbackRejected {
+  param([string]$RecentLoginLog)
+  if ([string]::IsNullOrWhiteSpace($RecentLoginLog)) { return $false }
+  if (Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog) { return $false }
+  return $RecentLoginLog -match '(?i)(密码错误|密码不正确|账号或密码错误|密码无效|wrong password|incorrect password|invalid password|login password.*incorrect|password.*incorrect)'
 }
 
 function Disable-QuickLoginCredential {
@@ -342,7 +369,11 @@ try {
   if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
 }
 
-$QuickPasswordMd5 = Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
+$QuickPasswordMd5 = if ($NoPasswordFallback) {
+  $null
+} else {
+  Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
+}
 $HasPasswordFallback = -not [string]::IsNullOrWhiteSpace($QuickPasswordMd5)
 $StartedAtUtc = [DateTime]::UtcNow
 $PasswordFallbackDeadlineUtc = $StartedAtUtc.AddSeconds([Math]::Min(60, [Math]::Max(25, $TimeoutSeconds - 5)))
@@ -416,12 +447,16 @@ while ([DateTime]::UtcNow -lt $Deadline) {
   if ($null -eq $CurrentProcess) {
     $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
     $PasswordFallbackNeedsHuman = Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog
-    if ($NoQr -and $HasPasswordFallback -and $PasswordFallbackNeedsHuman) {
-      Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_requires_human_verification" | Out-Null
+    $PasswordFallbackRejected = Test-PasswordFallbackRejected -RecentLoginLog $RecentLoginLog
+    if ($NoQr -and $PasswordFallbackNeedsHuman) {
+      Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退已触发短信验证或验证码，保留本地凭据并等待人工验证" -LogPath $LogPath
+    }
+    if ($NoQr -and $PasswordFallbackRejected) {
+      Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_login_failed" | Out-Null
       $HasPasswordFallback = $false
     }
-    if ($NoQr -and ($PasswordFallbackNeedsHuman -or (Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog))) {
-      Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "NapCat 登录进程提前退出前已报告登录态失效或人工验证" -LogPath $LogPath
+    if ($NoQr -and (Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog)) {
+      Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "NapCat 登录进程提前退出前已报告登录态失效" -LogPath $LogPath
     }
     Close-QrWindow -Window $QrWindow
     Close-QrWindow -Window $VerificationWindow
@@ -456,21 +491,24 @@ while ([DateTime]::UtcNow -lt $Deadline) {
   }
   $QrCode = Get-FreshQrCode -NotBeforeUtc $StartedAtUtc.AddSeconds(-2)
   $PasswordFallbackNeedsHuman = $false
+  $PasswordFallbackRejected = $false
   $QuickLoginCredentialInvalid = $false
   if ($NoQr -and $HasPasswordFallback -and ((Test-Path -LiteralPath $LogPath) -or (Test-Path -LiteralPath $ErrorLogPath))) {
     $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
     $PasswordFallbackNeedsHuman = Test-PasswordFallbackNeedsHuman -RecentLoginLog $RecentLoginLog
+    $PasswordFallbackRejected = Test-PasswordFallbackRejected -RecentLoginLog $RecentLoginLog
     $QuickLoginCredentialInvalid = Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog
   } elseif ($NoQr -and ((Test-Path -LiteralPath $LogPath) -or (Test-Path -LiteralPath $ErrorLogPath))) {
     $RecentLoginLog = Read-RecentLoginLog -Path @($LogPath, $ErrorLogPath)
     $QuickLoginCredentialInvalid = Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog
   }
   if ($NoQr -and $PasswordFallbackNeedsHuman) {
-    if ($HasPasswordFallback) {
-      Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_requires_human_verification" | Out-Null
-      $HasPasswordFallback = $false
-    }
-    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退已触发短信验证或验证码，不能无人值守继续重试" -LogPath $LogPath
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退已触发短信验证或验证码，保留本地凭据并等待人工验证" -LogPath $LogPath
+  }
+  if ($NoQr -and $PasswordFallbackRejected) {
+    Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_login_failed" | Out-Null
+    $HasPasswordFallback = $false
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退登录明确返回密码错误，已禁用本地凭据" -LogPath $LogPath
   }
   if ($NoQr -and (-not $HasPasswordFallback) -and ($QuickLoginCredentialInvalid -or $null -ne $QrCode)) {
     Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "快速登录记录已不可用且尚未配置加密密码回退" -LogPath $LogPath

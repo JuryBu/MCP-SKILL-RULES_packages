@@ -195,6 +195,8 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /按安全策略停止自动重试/);
   assert.match(loginScript, /短信验证/);
   assert.match(loginScript, /Read-NapCatQuickLoginCredential/);
+  assert.match(loginScript, /\[switch\]\$NoPasswordFallback/);
+  assert.match(loginScript, /if \(\$NoPasswordFallback\)/);
   assert.match(loginScript, /NAPCAT_QUICK_PASSWORD_MD5/);
   assert.match(loginScript, /PasswordFallbackDeadlineUtc/);
   assert.match(loginScript, /NapCatWinBootMain\.exe/);
@@ -262,7 +264,7 @@ test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断
   assert.ok(Date.now() - startedAt < 10_000, "NoQr should stop after detecting the fresh QR instead of waiting 30 seconds");
 });
 
-test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维码就提前杀进程", { skip: process.platform !== "win32" }, (t) => {
+test("加密密码回退明确返回密码错误时才禁用 DPAPI 凭据", { skip: process.platform !== "win32" }, (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-fallback-test-"));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
@@ -283,7 +285,7 @@ test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维�
       'if not exist "%~dp0napcat\\cache" mkdir "%~dp0napcat\\cache"',
       `> "${nestedQrPath}" echo qr`,
       "ping 127.0.0.1 -n 3 >nul",
-      "echo 密码回退登录失败",
+      "echo incorrect password",
       "ping 127.0.0.1 -n 60 >nul",
       "",
     ].join("\r\n"),
@@ -356,7 +358,7 @@ test("加密密码回退通过 DPAPI 注入子进程，NoQr 不会见到二维�
   assert.equal(fs.readFileSync(markerPath, "utf8").trim(), "present");
   assert.equal(fs.existsSync(credentialPath), false);
   const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
-  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
+  assert.equal(disabledMarker.reason, "password_fallback_login_failed");
   assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
   const loginLogs = fs.readdirSync(path.join(runtimeRoot, "logs"))
     .filter((name) => name.startsWith("codex-login-"))
@@ -386,6 +388,7 @@ test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻�
       "echo 快速登录错误： 登录态已失效，请重新登录。",
       "echo 正在尝试密码回退登录 10001",
       "echo 需要验证码, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login",
+      "echo 密码回退登录失败",
       "ping 127.0.0.1 -n 60 >nul",
       "",
     ].join("\r\n"),
@@ -437,10 +440,8 @@ test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻�
   assert.ok(elapsedMs < 10_000, `SMS verification should stop quickly without requiring a QR file, elapsed=${elapsedMs}`);
   assert.equal(fs.existsSync(path.join(runtimeRoot, "napcat", "cache", "qrcode.png")), false);
   const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
-  assert.equal(fs.existsSync(credentialPath), false);
-  const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
-  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
-  assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
+  assert.equal(fs.existsSync(credentialPath), true);
+  assert.equal(fs.existsSync(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json")), false);
 });
 
 test("登录进程提前退出前输出 KickedOffLine 时 NoQr 仍会持久阻断", { skip: process.platform !== "win32" }, (t) => {
@@ -508,6 +509,7 @@ test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip
       "ping 127.0.0.1 -n 3 >nul",
       ">&2 echo 正在尝试密码回退登录 10001",
       ">&2 echo 需要短信验证, proofWaterUrl: https://ti.qq.com/safe/tools/captcha/sms-verify-login",
+      ">&2 echo 密码回退登录失败",
       "ping 127.0.0.1 -n 60 >nul",
       "",
     ].join("\r\n"),
@@ -558,10 +560,8 @@ test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip
   assert.ok(elapsedMs >= 1_500, `password fallback should have a short grace period, elapsed=${elapsedMs}`);
   assert.ok(elapsedMs < 10_000, `stderr SMS verification should stop quickly, elapsed=${elapsedMs}`);
   const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
-  assert.equal(fs.existsSync(credentialPath), false);
-  const disabledMarker = readJson(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json"));
-  assert.equal(disabledMarker.reason, "password_fallback_requires_human_verification");
-  assert.equal(fs.existsSync(disabledMarker.disabledCredentialPath), true);
+  assert.equal(fs.existsSync(credentialPath), true);
+  assert.equal(fs.existsSync(path.join(dataRoot, "private", "napcat-login", "credential.disabled.json")), false);
 });
 
 test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {
