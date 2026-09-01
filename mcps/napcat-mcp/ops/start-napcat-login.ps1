@@ -339,6 +339,61 @@ function Stop-AndThrowManualLoginRequired {
   throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] $Reason，NapCat 要求人工验证。日志：$LogPath"
 }
 
+function New-NapCatLoginAttemptLock {
+  param(
+    [string]$DataRoot,
+    [string]$NapCatRoot,
+    [string]$ExpectedSelfId,
+    [switch]$NoQr
+  )
+  $StateDirectory = Join-Path $DataRoot "state"
+  New-Item -ItemType Directory -Force -Path $StateDirectory | Out-Null
+  $SafeAccount = if ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+    "unknown"
+  } else {
+    $ExpectedSelfId -replace '[^0-9A-Za-z_.-]', '_'
+  }
+  $LockPath = Join-Path $StateDirectory "napcat-login-attempt-$SafeAccount.lock"
+  try {
+    $LockStream = [System.IO.File]::Open(
+      $LockPath,
+      [System.IO.FileMode]::OpenOrCreate,
+      [System.IO.FileAccess]::ReadWrite,
+      [System.IO.FileShare]::None
+    )
+  } catch [System.IO.IOException] {
+    throw "[NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS] 已有 NapCat 登录尝试正在进行，拒绝并发启动同一账号：$ExpectedSelfId。lock=$LockPath"
+  }
+  $Payload = [ordered]@{
+    schemaVersion = 1
+    pid = $PID
+    account = $ExpectedSelfId
+    napCatRoot = $NapCatRoot
+    mode = if ($NoQr) { "no_qr" } else { "manual" }
+    acquiredAt = [DateTime]::UtcNow.ToString("o")
+  }
+  $Bytes = [System.Text.Encoding]::UTF8.GetBytes(($Payload | ConvertTo-Json -Depth 4))
+  $LockStream.SetLength(0)
+  $LockStream.Write($Bytes, 0, $Bytes.Length)
+  $LockStream.Flush()
+  return [pscustomobject]@{ Path = $LockPath; Stream = $LockStream }
+}
+
+function Release-NapCatLoginAttemptLock {
+  param($Lock)
+  if ($null -eq $Lock) { return }
+  try {
+    if ($null -ne $Lock.Stream) { $Lock.Stream.Dispose() }
+  } catch {
+  }
+  try {
+    if (-not [string]::IsNullOrWhiteSpace([string]$Lock.Path) -and (Test-Path -LiteralPath $Lock.Path -PathType Leaf)) {
+      Remove-Item -LiteralPath $Lock.Path -Force
+    }
+  } catch {
+  }
+}
+
 try {
   $Status = Invoke-OneBot -Action "get_status"
   if ($Status.status -eq "ok" -and $Status.data.online -eq $true) {
@@ -359,6 +414,8 @@ try {
   if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
 }
 
+$LoginAttemptLock = New-NapCatLoginAttemptLock -DataRoot $DataRoot -NapCatRoot $NapCatRoot -ExpectedSelfId $ExpectedSelfId -NoQr:$NoQr
+try {
 $QuickPasswordMd5 = if ($NoQr -and (-not $NoPasswordFallback)) {
   try {
     Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
@@ -379,12 +436,10 @@ $EmptyInputPath = Join-Path $LogDirectory ".codex-empty-input"
 if (-not (Test-Path -LiteralPath $EmptyInputPath)) {
   [System.IO.File]::WriteAllText($EmptyInputPath, "", (New-Object System.Text.UTF8Encoding($false)))
 }
-$LauncherArguments = ""
-if ($NoQr -or $HasPasswordFallback) {
-  if ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
-    throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
-  }
-  $LauncherArguments = " `"$ExpectedSelfId`""
+$LauncherArguments = if ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+  ""
+} else {
+  " `"$ExpectedSelfId`""
 }
 $QqAppDataRoot = ""
 if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
@@ -394,7 +449,10 @@ if (-not [string]::IsNullOrWhiteSpace($QqUserDataDir)) {
   New-Item -ItemType Directory -Force -Path $QqAppDataRoot | Out-Null
 }
 if ([string]::IsNullOrWhiteSpace($QqExePath)) {
-  $SelectedLauncher = if ($NoQr -or $HasPasswordFallback) { $Launcher } else { $ManualLauncher }
+  if (($NoQr -or $HasPasswordFallback) -and [string]::IsNullOrWhiteSpace($ExpectedSelfId)) {
+    throw "NapCat 快速登录要求 binding.json 提供 expectedSelfId"
+  }
+  $SelectedLauncher = if (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId)) { $Launcher } else { $ManualLauncher }
   $CommandArguments = "/d /c `"`"$SelectedLauncher`"$LauncherArguments < `"$EmptyInputPath`" >> `"$LogPath`" 2>> `"$ErrorLogPath`"`""
 } else {
   $CoreUri = ([Uri]$CoreModule).AbsoluteUri
@@ -475,7 +533,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
         logPath = $LogPath
         errorLogPath = $ErrorLogPath
       } | ConvertTo-Json -Depth 5
-      exit 0
+      return
     }
   } catch {
     if ($_.Exception.Message -like "NapCat 登录了错误*") {
@@ -552,3 +610,6 @@ if ($NoQr) {
   throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] NapCat 快速登录在 $TimeoutSeconds 秒内没有恢复 $DisplayIdentity；按安全策略停止自动重试，本次未弹二维码。日志：$LogPath"
 }
 throw "NapCat 在 $TimeoutSeconds 秒内没有以 $DisplayIdentity 登录成功，日志：$LogPath"
+} finally {
+  Release-NapCatLoginAttemptLock -Lock $LoginAttemptLock
+}

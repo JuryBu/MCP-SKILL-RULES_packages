@@ -227,6 +227,8 @@ QQ 服务端主动返回 `KickedOffLine` 或「用户身份已失效」时，本
 
 需要让机器人 QQ 不受日常桌面 QQ 自动升级影响时，优先使用完整 NapCat node 包，或把一个经过官方签名验证、且被当前 NapCat PacketBackend 精确支持的 QQ 版本放在独立目录。当前 `ops/set-napcat-runtime.ps1` 默认拒绝低于 NapCat 官方最低支持 build `40768` 的 QQ 包，防止重新切到已知会触发「文件已损坏，请重新安装 QQ」的旧运行包。私有 `napcat-runtime.json` 至少记录 `napCatRoot`；只有固定 QQ 模式才记录绝对 `qqExePath`。`ops/set-napcat-runtime.ps1 -ValidateOnly` 会先核对 node 包入口或 QQ 签名、QQ 版本、`napcat.mjs` 中的精确 `版本-x64` 映射、必需文件和可选 SHA256，全程不写运行态；去掉 `-ValidateOnly` 后才会原字节备份旧 runtime、原子写入新路径并复核，失败自动恢复。输出中的 `backupPath` 可交给同一脚本的 `-Rollback -BackupPath <path>` 精确回退。独立路径启用后，登录脚本会直接使用该 runtime，不再读取系统 QQ 注册表；未配置 runtime 的旧安装仍保持原行为。
 
+NapCat node 包配置 `qqUserDataDir` 时还必须确认干净 profile 贯穿到 QQNT 启动路径。脚本现在会检查并按需补丁 `napcat/napcat.mjs` 中的 `core.dataPath` 与 QQNT 启动数据目录函数，让 `NAPCAT_QQ_USER_DATA_DIR` 同时覆盖两处；`-ValidateOnly` 只报告 `nodeUserDataPatch.wouldChange`，正式应用会把 `napcat.mjs` 原字节备份到同一回滚目录并在补丁点缺失时拒绝继续。否则会出现 runtime 配置看似指向独立目录，但真实缓存仍写进 `Documents\Tencent Files\<QQ号>` 的风险，进而把快速登录票据、QQNT 缓存和风控现场混在一起。WebUI 的 token 页面只是 NapCat 管理面板登录，不代表 QQ 已在线；发送门槛仍以 `napcat_status` 中 OneBot 可达、账号匹配、`runtimeStatus.online=true` 和绑定群校验同时通过为准。
+
 `install-napcat-autostart.ps1 -StartNow` 只注册固定名称的当前用户登录计划任务，替换前会导出同名旧任务并记录回滚状态。`remove-napcat-autostart.ps1` 只移除该固定任务，并在存在备份时恢复前任任务。所有运行状态默认写入接收方的 `.codex-toolkit/napcat-mcp` 数据目录，不写回源码目录。
 
 ## 已知兼容性说明

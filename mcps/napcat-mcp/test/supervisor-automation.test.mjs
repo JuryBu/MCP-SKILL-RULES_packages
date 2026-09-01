@@ -166,6 +166,18 @@ test("后台启动脚本在 PATH 缺少 node 时回退到受管服务清单", ()
   }
 });
 
+test("登录时间线采集脚本联合输出登录、掉线、profile 和进程线索", () => {
+  const script = fs.readFileSync(fileURLToPath(new URL("../ops/collect-napcat-login-timeline.ps1", import.meta.url)), "utf8");
+  assert.match(script, /codex-login-\*\.log/);
+  assert.match(script, /KickedOffLine/);
+  assert.match(script, /账号状态变更为离线/);
+  assert.match(script, /本账号数据\/缓存目录/);
+  assert.match(script, /cleanProfileRecentWrites/);
+  assert.match(script, /legacyProfileRecentWrites/);
+  assert.match(script, /relevantProcesses/);
+  assert.match(script, /expectedSelfId/);
+});
+
 test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置时的旧启动方式", () => {
   const loginScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url)), "utf8");
   const credentialSetterScript = fs.readFileSync(fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url)), "utf8");
@@ -175,8 +187,9 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /\$NodeCoreModule = Join-Path \$NapCatRoot "napcat\\napcat\.mjs"/);
   assert.match(loginScript, /\$ManualLauncher = Join-Path \$NapCatRoot "napcat\.bat"/);
   assert.match(loginScript, /\$NoQr -or \$HasPasswordFallback/);
-  assert.match(loginScript, /\$SelectedLauncher = if \(\$NoQr -or \$HasPasswordFallback\) \{ \$Launcher \} else \{ \$ManualLauncher \}/);
-  assert.match(loginScript, /\$LauncherArguments = " `"\$ExpectedSelfId`""/);
+  assert.match(loginScript, /\$SelectedLauncher = if \(-not \[string\]::IsNullOrWhiteSpace\(\$ExpectedSelfId\)\) \{ \$Launcher \} else \{ \$ManualLauncher \}/);
+  assert.match(loginScript, /\$LauncherArguments = if \(\[string\]::IsNullOrWhiteSpace\(\$ExpectedSelfId\)\)/);
+  assert.match(loginScript, /" `"\$ExpectedSelfId`""/);
   assert.match(loginScript, /EnvironmentVariables\["APPDATA"\]/);
   assert.match(loginScript, /NAPCAT_QQ_USER_DATA_DIR/);
   assert.doesNotMatch(loginScript, /--user-data-dir/);
@@ -209,6 +222,10 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /NapCatWinBootHook\.dll/);
   assert.match(loginScript, /\$Launcher/);
   assert.match(loginScript, /\$BootMain/);
+  assert.match(loginScript, /napcat-login-attempt-\$SafeAccount\.lock/);
+  assert.match(loginScript, /\[System\.IO\.FileShare\]::None/);
+  assert.match(loginScript, /NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS/);
+  assert.match(loginScript, /Release-NapCatLoginAttemptLock -Lock \$LoginAttemptLock/);
   assert.doesNotMatch(credentialSetterScript, /\[string\]\$PasswordMd5/);
   assert.doesNotMatch(credentialSetterScript, /TestPasswordMd5/);
   assert.match(supervisorScript, /\$RuntimeConfiguration\.qqExePath/);

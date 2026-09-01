@@ -58,7 +58,7 @@ function createFixture() {
   };
 }
 
-function createNodeFixture() {
+function createNodeFixture(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-node-runtime-config-test-"));
   const dataRoot = path.join(root, "data");
   const napcatRoot = path.join(root, "node-runtime");
@@ -73,8 +73,30 @@ function createNodeFixture() {
   fs.writeFileSync(path.join(napcatRoot, "index.js"), "import('./napcat.mjs')\n", "utf8");
   fs.writeFileSync(path.join(napcatRoot, "package.json"), `${JSON.stringify({ version: "9.9.32-50969" }, null, 2)}\n`, "utf8");
   fs.writeFileSync(path.join(napcatRoot, "config.json"), `${JSON.stringify({ curVersion: "9.9.32-50969" }, null, 2)}\n`, "utf8");
-  fs.writeFileSync(path.join(napcatRoot, "napcat.mjs"), "throw new Error('top-level shim should not be validated for node runtime');\n", "utf8");
-  fs.writeFileSync(path.join(napcatRoot, "napcat", "napcat.mjs"), 'export const mapping = { "9.9.32-50969-x64": {} };\n', "utf8");
+  const nodeModuleSource = [
+    'export const mapping = { "9.9.32-50969-x64": {} };',
+    "class QQPaths {",
+    "  get dataPath() {",
+    "    let e = this.context.wrapper.NodeQQNTWrapperUtil.getNTUserDataInfoConfig();",
+    "    return e || (e = Ps.join(Dn.homedir(), \".config\", \"QQ\"), Fs.existsSync(e) || Fs.mkdirSync(e, { recursive: !0 }), e);",
+    "  }",
+    "}",
+    "function zEe(t) {",
+    "  if (Dn.platform() === \"darwin\") {",
+    "    const r = Dn.homedir(), i = be.resolve(r, \"./Library/Application Support/QQ\");",
+    "    return [i, be.join(i, \"global\")];",
+    "  }",
+    "  let e = t.NodeQQNTWrapperUtil.getNTUserDataInfoConfig();",
+    "  e || (e = be.resolve(Dn.homedir(), \"./.config/QQ\"), de.mkdirSync(e, { recursive: !0 }));",
+    "  const n = be.resolve(e, \"./nt_qq/global\");",
+    "  return [e, n];",
+    "}",
+    "",
+  ].join("\n");
+  fs.writeFileSync(path.join(napcatRoot, "napcat.mjs"), options.duplicateTopLevelModule
+    ? nodeModuleSource
+    : "throw new Error('top-level shim should not be validated for node runtime');\n", "utf8");
+  fs.writeFileSync(path.join(napcatRoot, "napcat", "napcat.mjs"), nodeModuleSource, "utf8");
   fs.writeFileSync(runtimePath, `${JSON.stringify({ schemaVersion: 1, napCatRoot: "C:\\old", qqExePath: "C:\\old\\QQ.exe", preserved: "yes" }, null, 2)}\n`, "utf8");
   return {
     root,
@@ -128,9 +150,55 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
   }
 });
 
+test("NapCat node runtime 会同时补丁顶层和嵌套真实模块，并可原字节回滚", { skip: process.platform !== "win32" }, () => {
+  const fixture = createNodeFixture({ duplicateTopLevelModule: true });
+  try {
+    const topLevelModulePath = path.join(fixture.napcatRoot, "napcat.mjs");
+    const nestedModulePath = path.join(fixture.napcatRoot, "napcat", "napcat.mjs");
+    const originalTopLevelModule = fs.readFileSync(topLevelModulePath);
+    const originalNestedModule = fs.readFileSync(nestedModulePath);
+    const originalRuntime = fs.readFileSync(fixture.runtimePath);
+    const commonArguments = [
+      "-DataRoot", fixture.dataRoot,
+      "-NapCatRoot", fixture.napcatRoot,
+      "-QqUserDataDir", fixture.qqUserDataDir,
+    ];
+
+    const validation = runScript([...commonArguments, "-ValidateOnly"]);
+    assert.equal(validation.nodeUserDataPatch.modules.length, 2);
+    assert.equal(validation.nodeUserDataPatch.modules.every((item) => item.wouldChange), true);
+
+    const applied = runScript(commonArguments);
+    assert.equal(applied.nodeUserDataPatch.changed, true);
+    assert.equal(applied.nodeUserDataPatch.modules.length, 2);
+    assert.equal(applied.nodeUserDataPatch.modules.every((item) => item.changed), true);
+    assert.equal(fs.existsSync(applied.nodeUserDataPatch.rollbackManifestPath), true);
+    for (const modulePath of [topLevelModulePath, nestedModulePath]) {
+      const patched = fs.readFileSync(modulePath, "utf8");
+      assert.equal((patched.match(/NAPCAT_QQ_USER_DATA_DIR/g) ?? []).length, 2);
+      assert.match(patched, /function zEe\(t\)[\s\S]{0,1200}NAPCAT_QQ_USER_DATA_DIR/);
+    }
+
+    const rolledBack = runScript([
+      "-DataRoot", fixture.dataRoot,
+      "-Rollback",
+      "-BackupPath", applied.backupPath,
+    ]);
+    assert.equal(rolledBack.action, "rollback");
+    assert.equal(rolledBack.moduleRollbacks.length, 2);
+    assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalRuntime);
+    assert.deepEqual(fs.readFileSync(topLevelModulePath), originalTopLevelModule);
+    assert.deepEqual(fs.readFileSync(nestedModulePath), originalNestedModule);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("NapCat node runtime 不需要 QQ.exe，应用时会清除旧 qqExePath", { skip: process.platform !== "win32" }, () => {
   const fixture = createNodeFixture();
   try {
+    const napcatModulePath = path.join(fixture.napcatRoot, "napcat", "napcat.mjs");
+    const originalModule = fs.readFileSync(napcatModulePath, "utf8");
     const commonArguments = [
       "-DataRoot", fixture.dataRoot,
       "-NapCatRoot", fixture.napcatRoot,
@@ -141,14 +209,45 @@ test("NapCat node runtime 不需要 QQ.exe，应用时会清除旧 qqExePath", {
     assert.equal(validation.qqExePath, null);
     assert.equal(validation.qqVersion, "9.9.32-50969");
     assert.equal(validation.packetMappingKey, "9.9.32-50969-x64");
+    assert.equal(validation.nodeUserDataPatch.enabled, true);
+    assert.equal(validation.nodeUserDataPatch.wouldChange, true);
+    assert.equal(validation.nodeUserDataPatch.dataPathPatched, true);
+    assert.equal(validation.nodeUserDataPatch.startupPatched, true);
+    assert.equal(fs.readFileSync(napcatModulePath, "utf8"), originalModule);
 
     const applied = runScript(commonArguments);
     assert.equal(applied.action, "apply");
+    assert.equal(applied.nodeUserDataPatch.changed, true);
+    assert.equal(applied.nodeUserDataPatch.wouldChange, false);
+    assert.equal(fs.existsSync(applied.nodeUserDataPatch.backupPath), true);
     const runtime = JSON.parse(fs.readFileSync(fixture.runtimePath, "utf8"));
     assert.equal(runtime.napCatRoot, path.resolve(fixture.napcatRoot));
     assert.equal(runtime.qqExePath, undefined);
     assert.equal(runtime.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
     assert.equal(runtime.preserved, "yes");
+    const patchedModule = fs.readFileSync(napcatModulePath, "utf8");
+    assert.equal((patchedModule.match(/NAPCAT_QQ_USER_DATA_DIR/g) ?? []).length, 2);
+    assert.match(patchedModule, /get dataPath\(\)[\s\S]{0,800}NAPCAT_QQ_USER_DATA_DIR/);
+    assert.match(patchedModule, /function zEe\(t\)[\s\S]{0,1200}NAPCAT_QQ_USER_DATA_DIR/);
+
+    const reapplied = runScript(commonArguments);
+    assert.equal(reapplied.nodeUserDataPatch.changed, false);
+    assert.equal(reapplied.nodeUserDataPatch.wouldChange, false);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat node runtime 配置独立数据目录时拒绝不可补丁的包", { skip: process.platform !== "win32" }, () => {
+  const fixture = createNodeFixture();
+  try {
+    fs.writeFileSync(path.join(fixture.napcatRoot, "napcat", "napcat.mjs"), 'export const mapping = { "9.9.32-50969-x64": {} };\n', "utf8");
+    assert.throws(() => runScript([
+      "-DataRoot", fixture.dataRoot,
+      "-NapCatRoot", fixture.napcatRoot,
+      "-QqUserDataDir", fixture.qqUserDataDir,
+      "-ValidateOnly",
+    ]));
   } finally {
     fixture.cleanup();
   }
