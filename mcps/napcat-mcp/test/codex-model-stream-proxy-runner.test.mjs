@@ -62,6 +62,20 @@ test("start script validates model stream lock PID by runner command line", () =
   );
 });
 
+test("stop script refuses stale model stream runtime PID before signalling stop", () => {
+  const stopScript = fs.readFileSync(path.resolve("ops/stop-codex-model-stream-proxy.ps1"), "utf8");
+  const processCheckIndex = stopScript.indexOf("Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Runtime.pid)");
+  const stopFileIndex = stopScript.indexOf("Set-Content -LiteralPath $StopPath");
+  const forceStopIndex = stopScript.indexOf("Stop-Process -Id ([int]$Runtime.pid) -Force");
+  assert.match(stopScript, /function Test-ExpectedModelStreamProxyProcess/u);
+  assert.match(stopScript, /Get-CimInstance Win32_Process/u);
+  assert.match(stopScript, /codex-model-stream-proxy-runner\.mjs/u);
+  assert.ok(processCheckIndex > 0, "runtime-state PID reuse must be fenced by command-line validation");
+  assert.ok(stopFileIndex > processCheckIndex, "stop signal must not be written before PID identity validation");
+  assert.ok(forceStopIndex > processCheckIndex, "force stop must not run before PID identity validation");
+  assert.match(stopScript, /Refusing to stop PID/u);
+});
+
 async function modelRequest(port) {
   const payload = Buffer.from(JSON.stringify({ stream: true, tools: [{ type: "function", name: "safe" }] }));
   return new Promise((resolve, reject) => {

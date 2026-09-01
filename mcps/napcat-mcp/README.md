@@ -177,7 +177,7 @@ Codex 仍负责 ChatGPT 登录和 OAuth 生命周期。看门人只在内存中�
 
 公开代码目录和私有 data root 必须分开。推荐代码安装到 `%USERPROFILE%\.codex\services\napcat-bridge\current`，绑定、任务账本、控制状态、ACK 游标、唤醒租约、心跳、日志、二维码和登录态继续留在 `%USERPROFILE%\.codex-toolkit\napcat-mcp`。GitHub 更新不得整目录覆盖 data root，也不得把接收机私有文件反向复制进仓库。`control-state.json` 固定与任务账本共享 data root；升级器会备份并迁移旧代码目录中的同名状态，若两处同时存在且内容不同则拒绝切换，保留两份文件等待人工核对。
 
-监督器和登录脚本在尝试快速登录前会检查当前启动模式所需文件。NapCat node 包模式要求 `launcher-user.bat`、`napcat.bat`、`node.exe`、`index.js` 与 `napcat.mjs`；固定 QQ 模式要求指定的 `QQ.exe`、`napcat.mjs`、`NapCatWinBootMain.exe` 与 `NapCatWinBootHook.dll`。两种模式不能混用：node 包人工登录应走 `napcat.bat`，无人值守快登才走 `launcher-user.bat`；固定 QQ 模式才由 BootMain 注入独立 `QQ.exe`。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
+监督器和登录脚本在尝试登录前会检查当前启动模式所需文件。NapCat node 包模式要求 `launcher-user.bat`、`napcat.bat`、`node.exe`、`index.js` 与 `napcat.mjs`；固定 QQ 模式要求指定的 `QQ.exe`、`napcat.mjs`、`NapCatWinBootMain.exe` 与 `NapCatWinBootHook.dll`。两种模式不能混用：node 包在绑定了 `expectedSelfId` 时，人工扫码登录和无人值守快登都必须走 `launcher-user.bat "<expectedSelfId>"`，只有没有绑定账号的旧环境才允许回退 `napcat.bat`；固定 QQ 模式才由 BootMain 注入独立 `QQ.exe`。核心文件缺失时状态应明确为 `NAPCAT_RUNTIME_INCOMPLETE`，自动登录暂停且不会生成或索要二维码；这通常表示安装损坏或安全软件隔离，不等于快速登录授权过期。恢复时应先核对安全软件记录，再从相同 NapCat 版本的官方发布包恢复文件并校验哈希，不能用关闭安全软件或排除整个目录代替诊断。
 
 面向日常使用者的安装应优先采用「先准备、后退出 Codex 激活」：候选代码、私有路径和登录计划任务先在不触碰当前 Codex 进程的情况下写好，隐藏激活器等待 Codex 与代理自然断开后，只清理受管代理和它启动的官方 App Server。用户正常退出 Codex、等待约 10 秒再打开即可，不需要重启 Windows；任何清理失败都必须保留旧任务和本地状态、暂停自动唤醒并报警，不能终止 Codex Desktop 或按进程名误杀其它实例。
 

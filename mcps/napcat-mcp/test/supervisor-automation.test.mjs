@@ -175,6 +175,11 @@ test("登录时间线采集脚本联合输出登录、掉线、profile 和进程
   assert.match(script, /cleanProfileRecentWrites/);
   assert.match(script, /legacyProfileRecentWrites/);
   assert.match(script, /relevantProcesses/);
+  assert.match(script, /qqProcesses/);
+  assert.match(script, /commandLineHasExpectedSelfId/);
+  assert.match(script, /commandLineHasCleanProfile/);
+  assert.match(script, /commandLineHasLegacyProfile/);
+  assert.match(script, /executableUnderNapCatRoot/);
   assert.match(script, /expectedSelfId/);
 });
 

@@ -119,8 +119,26 @@ if (Test-Path -LiteralPath $LogDirectory) {
             event = $Line
             file = $Leaf
           }) | Out-Null
-        }
-      }
+  }
+}
+
+function Get-ProcessCreationTimeText {
+  param([object]$Process)
+  try {
+    return ([Management.ManagementDateTimeConverter]::ToDateTime($Process.CreationDate)).ToString("yyyy-MM-dd HH:mm:ss")
+  } catch {
+    return [string]$Process.CreationDate
+  }
+}
+
+function Test-CommandLineContainsPath {
+  param(
+    [string]$CommandLine,
+    [string]$Path
+  )
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
+  return $CommandLine.IndexOf($Path, [StringComparison]::OrdinalIgnoreCase) -ge 0
+}
     }
 }
 
@@ -148,18 +166,28 @@ $Processes = @(Get-CimInstance Win32_Process |
     ($_.CommandLine -match 'NapCat|3406694168|QQNT|Tencent')
   } |
   ForEach-Object {
-    $CreatedAt = $null
-    try {
-      $CreatedAt = ([Management.ManagementDateTimeConverter]::ToDateTime($_.CreationDate)).ToString("yyyy-MM-dd HH:mm:ss")
-    } catch {
-      $CreatedAt = [string]$_.CreationDate
-    }
     [pscustomobject]@{
       pid = [int]$_.ProcessId
       parentPid = [int]$_.ParentProcessId
       name = $_.Name
-      createdAt = $CreatedAt
+      createdAt = Get-ProcessCreationTimeText -Process $_
       commandLine = $_.CommandLine
+    }
+  })
+
+$QqProcesses = @(Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq "QQ.exe" } |
+  ForEach-Object {
+    [pscustomobject]@{
+      pid = [int]$_.ProcessId
+      parentPid = [int]$_.ParentProcessId
+      createdAt = Get-ProcessCreationTimeText -Process $_
+      executablePath = $_.ExecutablePath
+      commandLine = $_.CommandLine
+      commandLineHasExpectedSelfId = (-not [string]::IsNullOrWhiteSpace($ExpectedSelfId) -and $_.CommandLine -match [regex]::Escape($ExpectedSelfId))
+      commandLineHasCleanProfile = Test-CommandLineContainsPath -CommandLine $_.CommandLine -Path $QqUserDataDir
+      commandLineHasLegacyProfile = Test-CommandLineContainsPath -CommandLine $_.CommandLine -Path $LegacyTencentFilesDir
+      executableUnderNapCatRoot = Test-CommandLineContainsPath -CommandLine $_.ExecutablePath -Path $NapCatRoot
     }
   })
 
@@ -174,4 +202,5 @@ $Processes = @(Get-CimInstance Win32_Process |
   cleanProfileRecentWrites = Get-RecentFileWrites -Path $QqUserDataDir
   legacyProfileRecentWrites = Get-RecentFileWrites -Path $LegacyTencentFilesDir
   relevantProcesses = $Processes
+  qqProcesses = $QqProcesses
 } | ConvertTo-Json -Depth 8
