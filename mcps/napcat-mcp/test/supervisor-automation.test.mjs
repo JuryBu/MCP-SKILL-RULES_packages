@@ -183,6 +183,23 @@ test("登录时间线采集脚本联合输出登录、掉线、profile 和进程
   assert.match(script, /expectedSelfId/);
 });
 
+test("运行包 manifest 采集脚本输出版本哈希和登录态计数", () => {
+  const script = fs.readFileSync(fileURLToPath(new URL("../ops/collect-napcat-runtime-manifest.ps1", import.meta.url)), "utf8");
+  assert.match(script, /Get-FileHash -Algorithm SHA256/);
+  assert.match(script, /VersionInfo\.FileVersion/);
+  assert.match(script, /napcat\\napcat\.mjs/);
+  assert.match(script, /NapCatWinBootMain\.exe/);
+  assert.match(script, /NapCatWinBootHook\.dll/);
+  assert.match(script, /QQ\.exe/);
+  assert.match(script, /kickedOffLine/);
+  assert.match(script, /quickLoginInvalid/);
+  assert.match(script, /humanVerification/);
+  assert.match(script, /recentLoginEvents/);
+  assert.match(script, /relevantProcesses/);
+  assert.doesNotMatch(script, /token/i);
+  assert.doesNotMatch(script, /send_group_msg/);
+});
+
 test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置时的旧启动方式", () => {
   const loginScript = fs.readFileSync(fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url)), "utf8");
   const credentialSetterScript = fs.readFileSync(fileURLToPath(new URL("../ops/set-napcat-quick-login-credential.ps1", import.meta.url)), "utf8");
