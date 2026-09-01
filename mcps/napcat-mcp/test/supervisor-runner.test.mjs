@@ -121,6 +121,7 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
     assert.equal(parsed.rootDir, path.resolve(fixture.root));
     assert.equal(parsed.brokerRoot, path.resolve(fixture.root, "broker"));
     assert.equal(parsed.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
+    assert.equal(parsed.staleNapCatOfflineMs, 30 * 60_000);
     assert.equal(parsed.staleNapCatUnknownMs, 180_000);
     assert.throws(() => parseArguments(["--binding", fixture.bindingPath]), /缺少参数 --registry/);
     assert.throws(() => parseArguments([
@@ -133,6 +134,33 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
       "--broker-health-url", "http://127.0.0.1:14588/health",
       "--interval-ms", "0",
     ]), /--interval-ms 必须是不小于 1 的整数/);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("supervisor 默认离线宽限不会回退成几分钟内重登", () => {
+  const fixture = createFixture();
+  try {
+    const parsed = parseArguments([
+      "--private-env", fixture.privateEnvPath,
+      "--binding", fixture.bindingPath,
+      "--registry", fixture.registryPath,
+      "--runtime-state", fixture.runtimeStatePath,
+      "--log", fixture.logPath,
+      "--stop-file", fixture.stopFilePath,
+      "--lock", fixture.lockPath,
+      "--broker-health-url", "http://127.0.0.1:14588/health",
+      "--data-root", fixture.root,
+      "--broker-root", path.join(fixture.root, "broker"),
+      "--broker-start-script", fixture.brokerStartScriptPath,
+      "--login-script", fixture.loginScriptPath,
+      "--napcat-root", fixture.napcatRoot,
+      "--qq-exe-path", fixture.qqExePath,
+      "--qq-user-data-dir", fixture.qqUserDataDir,
+    ]);
+    assert.equal(parsed.staleNapCatOfflineMs, 30 * 60_000);
+    assert.equal(parsed.staleNapCatUnknownMs, 10 * 60_000);
   } finally {
     fixture.cleanup();
   }
@@ -280,6 +308,19 @@ test("单次缺失 online 字段只开始未知状态宽限期，不会立即停
   } finally {
     fixture.cleanup();
   }
+});
+
+test("真实 status 形状里 reachable=true 且 runtimeStatus.online=false 不会被归类为未知", () => {
+  const normalized = normalizeNapCatStatus({
+    reachable: true,
+    runtimeStatus: { online: false, good: false },
+    accountMatches: false,
+  });
+  assert.equal(normalized.known, true);
+  assert.equal(normalized.reachable, true);
+  assert.equal(normalized.online, false);
+  assert.equal(normalized.ready, false);
+  assert.equal(normalized.accountMatches, false);
 });
 
 test("quick-login 可显式允许密码回退", () => {
@@ -637,7 +678,7 @@ test("NapCat 恢复在线后会清除跨重启保留的离线进程计时", asyn
   }
 });
 
-test("跨重启发现新的 NapCat 进程身份后重新开始离线宽限期", async () => {
+test("跨重启发现新的可达 NapCat 离线进程时重新记录身份但不停止", async () => {
   const fixture = createFixture();
   let stopCount = 0;
   const currentProcesses = [{ pid: 7101, parentPid: 5000, name: "node.exe" }];
@@ -662,13 +703,14 @@ test("跨重启发现新的 NapCat 进程身份后重新开始离线宽限期", 
     assert.equal(stopCount, 0);
     assert.equal(runtime.login.offlineProcessSince, "2026-07-24T08:00:00.000Z");
     assert.equal(runtime.login.offlineProcessFingerprint, processSnapshotFingerprint(currentProcesses));
-    assert.equal(runtime.actions.staleNapCatRecovery.reason, "grace_period");
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "reachable_offline_preserved");
+    assert.equal(runtime.actions.staleNapCatRecovery.reachableOfflinePreserved, true);
   } finally {
     fixture.cleanup();
   }
 });
 
-test("NapCat 连续离线超过宽限期时只停止匹配进程树并立即无二维码恢复", async () => {
+test("NapCat HTTP 不可达且连续离线超过宽限期时只停止匹配进程树并立即无二维码恢复", async () => {
   const fixture = createFixture();
   let currentTime = new Date("2026-07-24T08:00:00.000Z");
   let waitCount = 0;
@@ -681,7 +723,7 @@ test("NapCat 连续离线超过宽限期时只停止匹配进程树并立即无�
       scanIntervalMs: 60_000,
       staleNapCatOfflineMs: 120_000,
       staleNapCatRecoveryCooldownMs: 300_000,
-      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatStatus: async () => ({ known: true, reachable: false, online: false, accountMatches: false }),
       checkNapCatProcesses: async () => ({
         known: true,
         present: true,
@@ -713,6 +755,54 @@ test("NapCat 连续离线超过宽限期时只停止匹配进程树并立即无�
     assert.equal(runtime.login.offlineProcessSince, null);
     assert.equal(runtime.actions.staleNapCatRecovery.succeeded, true);
     assert.equal(runtime.actions.quickLogin.succeeded, true);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("NapCat HTTP 可达但 online=false 时保留现有进程，不把状态抖动升级成重登", async () => {
+  const fixture = createFixture();
+  let currentTime = new Date("2026-07-24T08:00:00.000Z");
+  let waitCount = 0;
+  const stopCalls = [];
+  const loginCalls = [];
+  const processes = [
+    { pid: 6101, parentPid: 5100, name: "cmd.exe" },
+    { pid: 6102, parentPid: 6101, name: "node.exe" },
+  ];
+  try {
+    await runSupervisorService(baseOptions(fixture, {
+      once: false,
+      now: () => currentTime,
+      scanIntervalMs: 60_000,
+      staleNapCatOfflineMs: 60_000,
+      staleNapCatRecoveryCooldownMs: 60_000,
+      checkNapCatStatus: async () => ({ known: true, reachable: true, online: false, accountMatches: false }),
+      checkNapCatProcesses: async () => ({ known: true, present: true, processes }),
+      getOpenTaskCount: async () => 0,
+      stopNapCatProcesses(input) {
+        stopCalls.push(input);
+        return { stopped: true, rootProcessIds: [6101] };
+      },
+      quickLogin(input) {
+        loginCalls.push(input);
+      },
+      wait: async () => {
+        waitCount += 1;
+        currentTime = new Date(currentTime.getTime() + 60_000);
+        if (waitCount >= 3) fs.writeFileSync(fixture.stopFilePath, "stop\n", "utf8");
+      },
+    }));
+    const runtime = readRuntime(fixture);
+    assert.equal(stopCalls.length, 0);
+    assert.equal(loginCalls.length, 0);
+    assert.equal(runtime.actions.staleNapCatRecovery.attempted, false);
+    assert.equal(runtime.actions.staleNapCatRecovery.trigger, "reachable_offline");
+    assert.equal(runtime.actions.staleNapCatRecovery.reason, "reachable_offline_preserved");
+    assert.equal(runtime.actions.staleNapCatRecovery.reachableOfflinePreserved, true);
+    assert.equal(runtime.actions.quickLogin.reason, "napcat_process_present");
+    assert.equal(runtime.login.offlineProcessSince, "2026-07-24T08:00:00.000Z");
+    assert.equal(runtime.login.staleRecoveryCount, 0);
   } finally {
     fixture.cleanup();
   }

@@ -14,8 +14,8 @@ export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
 export const DEFAULT_LOGIN_TIMEOUT_MS = 35_000;
 export const DEFAULT_LOGIN_COOLDOWN_MS = 120_000;
 export const DEFAULT_MANUAL_LOGIN_BLOCK_RECHECK_MS = 30 * 60_000;
-export const DEFAULT_STALE_NAPCAT_OFFLINE_MS = 120_000;
-export const DEFAULT_STALE_NAPCAT_UNKNOWN_MS = 180_000;
+export const DEFAULT_STALE_NAPCAT_OFFLINE_MS = 30 * 60_000;
+export const DEFAULT_STALE_NAPCAT_UNKNOWN_MS = 10 * 60_000;
 export const DEFAULT_STALE_NAPCAT_RECOVERY_COOLDOWN_MS = 300_000;
 export const DEFAULT_BROKER_START_COOLDOWN_MS = 60_000;
 export const DEFAULT_STOP_POLL_MS = 250;
@@ -1748,7 +1748,9 @@ export async function runSupervisorService(options = {}) {
       const unknownProcessDurationMs = Number.isFinite(parsedUnknownProcessSince)
         ? Math.max(0, nowMs(clock) - parsedUnknownProcessSince)
         : 0;
-      const staleProcessTrigger = offlineProcessKnown && offlineProcessDurationMs >= staleNapCatOfflineMs
+      const reachableOfflineProcessKnown = offlineProcessKnown && napcat.reachable === true;
+      const restartableOfflineProcessKnown = offlineProcessKnown && napcat.reachable !== true;
+      const staleProcessTrigger = restartableOfflineProcessKnown && offlineProcessDurationMs >= staleNapCatOfflineMs
         ? "explicit_offline"
         : (unknownProcessKnown && unknownProcessDurationMs >= staleNapCatUnknownMs ? "status_unknown" : null);
       let staleProcessRecovered = false;
@@ -1798,10 +1800,11 @@ export async function runSupervisorService(options = {}) {
         const activeThresholdMs = offlineProcessKnown ? staleNapCatOfflineMs : staleNapCatUnknownMs;
         actions.staleNapCatRecovery = {
           attempted: false,
-          trigger: offlineProcessKnown ? "explicit_offline" : "status_unknown",
+          trigger: reachableOfflineProcessKnown ? "reachable_offline" : (offlineProcessKnown ? "explicit_offline" : "status_unknown"),
           reason: loginBlocked
             ? "manual_login_required"
-            : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown"),
+            : (reachableOfflineProcessKnown ? "reachable_offline_preserved" : (activeDurationMs < activeThresholdMs ? "grace_period" : "cooldown")),
+          reachableOfflinePreserved: reachableOfflineProcessKnown,
           offlineProcessSince,
           offlineProcessFingerprint,
           offlineProcessDurationMs,

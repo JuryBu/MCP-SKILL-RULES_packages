@@ -213,7 +213,7 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 
 整机关机、Windows 卡死、runner 被终止、QQ 或 NapCat 离线后，心跳都会停止。缺失心跳因此能作为失联线索，但本机死亡时无法主动发送“我死了”；真正的超时报警仍应由群外接收端判断。
 
-`ops/` 中还提供任务路由器与 `CodexNapCatSupervisor` 的启动、停止、状态和登录后自动启动脚本。监督器是当前 Windows 用户下的隐藏普通进程，不是系统服务；它同时核对 broker 健康与进程、NapCat OneBot 与进程、Codex 进程和 open task，条件齐全才保持任务路由运行。NapCat 完全未运行时才尝试无二维码快速登录，已有进程但 OneBot 离线时不会启动第二份。无二维码快登超时或账号不符时，登录脚本会结束本次启动的隐藏进程树，避免留下一个拿不到二维码、又阻止后续恢复的僵尸 NapCat。
+`ops/` 中还提供任务路由器与 `CodexNapCatSupervisor` 的启动、停止、状态和登录后自动启动脚本。监督器是当前 Windows 用户下的隐藏普通进程，不是系统服务；它同时核对 broker 健康与进程、NapCat OneBot 与进程、Codex 进程和 open task，条件齐全才保持任务路由运行。NapCat 完全未运行时才尝试无二维码快速登录；已有进程且 OneBot 端口仍可达但 QQ 状态暂时报 `online=false` 时，只把发送门槛降为未就绪并记录诊断，不再把活进程当僵尸停止。无二维码快登超时或账号不符时，登录脚本会结束本次启动的隐藏进程树，避免留下一个拿不到二维码、又阻止后续恢复的僵尸 NapCat。
 
 监督器对 broker 的判断使用 `/health?endpoint=napcat&deep=1`，必须完成 NapCat 子后端的只读 `tools/list` 往返才算健康。只有 14588 端口或 broker 主进程仍在、但子 transport 已断开的情况会被识别并恢复；恢复不会读取群消息、发送内容、ACK 或重放先前结果未知的工具调用。
 
@@ -223,7 +223,7 @@ $brokerRoot = (Resolve-Path ".\mcps\broker").Path
 
 QQ 服务端主动返回 `KickedOffLine` 或「用户身份已失效」时，本地快速登录票据可能已经不可用。需要无人值守恢复时，可由账号主人在本机交互式运行 `ops/set-napcat-quick-login-credential.ps1`，输入一次账号密码。脚本只在内存中计算密码 MD5，使用 Windows DPAPI CurrentUser 加密后写入私有 data root 的 `private/napcat-login/credential.json`；专用 `napcat-login` 目录在写入前即限制为当前用户与 SYSTEM FullControl，公开仓库、binding、日志和普通环境配置均不保存明文、MD5 或可枚举的账号哈希。登录脚本只把解密后的 MD5 放入新启动的 NapCat 子进程环境，不拼入命令行，并尽量缩短 PowerShell 托管字符串的引用生命周期；受 .NET 字符串和 NapCat 上游环境变量接口限制，这不等于对内存或子进程环境做了可证明的物理擦除，同一 Windows 用户的恶意进程或内存转储仍属于信任边界。MD5 仍属于密码等价物，因此不得复制到其它机器、上传仓库、写入命令行或保存进普通环境配置；训练机必须由训练机主人在当地 Windows 用户下单独配置。
 
-加密密码回退只保留为有人值守的显式诊断路线，不是监督器默认自愈路线。确需诊断时，调用方必须显式传入 `noPasswordFallback: false`，并只在私有凭据已存在、且登录脚本处于 `-NoQr` 模式时启用；它不会把密码 MD5 写入命令行或公开配置。`-NoQr` 看到二维码不会立即杀进程，而会给 NapCat 15～45 秒完成密码回退；日志明确出现密码失败、验证码、新设备或异常设备验证时，才进入人工登录阻断。若 OneBot 已明确离线但旧 NapCat 进程仍存活超过默认 120 秒，监督器只停止当前 NapCat runtime 或固定 QQ 路径匹配到的进程树，再执行一次无二维码恢复；不会停止桌面 QQ、broker、Codex App Server 或外层代理。真实在线后会清除跨重启保留的离线计时。QQ 风控、验证码或设备授权被服务端真正撤销时仍可能需要人工验证，本机制负责消除本地僵尸进程、错误二维码路径、密码回退风控和重复拉起造成的额外扫码，不宣称绕过 QQ 的服务端安全策略。
+加密密码回退只保留为有人值守的显式诊断路线，不是监督器默认自愈路线。确需诊断时，调用方必须显式传入 `noPasswordFallback: false`，并只在私有凭据已存在、且登录脚本处于 `-NoQr` 模式时启用；它不会把密码 MD5 写入命令行或公开配置。`-NoQr` 看到二维码不会立即杀进程，而会给 NapCat 15～45 秒完成密码回退；日志明确出现密码失败、验证码、新设备或异常设备验证时，才进入人工登录阻断。若 OneBot 端口不可达、状态未知且旧 NapCat 进程持续卡死，监督器只停止当前 NapCat runtime 或固定 QQ 路径匹配到的进程树，再执行一次无二维码恢复；不会停止桌面 QQ、broker、Codex App Server 或外层代理。OneBot 端口仍可达但 QQ 状态暂时报离线时默认观察 30 分钟且不自动停进程，避免把短暂心跳/状态抖动升级成重新登录。真实在线后会清除跨重启保留的离线计时。QQ 风控、验证码或设备授权被服务端真正撤销时仍可能需要人工验证，本机制负责消除本地僵尸进程、错误二维码路径、密码回退风控和重复拉起造成的额外扫码，不宣称绕过 QQ 的服务端安全策略。
 
 需要让机器人 QQ 不受日常桌面 QQ 自动升级影响时，优先使用完整 NapCat node 包，或把一个经过官方签名验证、且被当前 NapCat PacketBackend 精确支持的 QQ 版本放在独立目录。当前 `ops/set-napcat-runtime.ps1` 默认拒绝低于 NapCat 官方最低支持 build `40768` 的 QQ 包，防止重新切到已知会触发「文件已损坏，请重新安装 QQ」的旧运行包。私有 `napcat-runtime.json` 至少记录 `napCatRoot`；只有固定 QQ 模式才记录绝对 `qqExePath`。`ops/set-napcat-runtime.ps1 -ValidateOnly` 会先核对 node 包入口或 QQ 签名、QQ 版本、`napcat.mjs` 中的精确 `版本-x64` 映射、必需文件和可选 SHA256，全程不写运行态；去掉 `-ValidateOnly` 后才会原字节备份旧 runtime、原子写入新路径并复核，失败自动恢复。输出中的 `backupPath` 可交给同一脚本的 `-Rollback -BackupPath <path>` 精确回退。独立路径启用后，登录脚本会直接使用该 runtime，不再读取系统 QQ 注册表；未配置 runtime 的旧安装仍保持原行为。
 
