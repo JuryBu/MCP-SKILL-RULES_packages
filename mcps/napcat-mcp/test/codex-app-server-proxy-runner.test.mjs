@@ -11,6 +11,7 @@ import {
   acquireInstanceLock,
   atomicWriteJson,
   findExecutableRefresh,
+  observeEmptyDesktopRestart,
   parseArguments,
   runCodexAppServerProxyService,
   terminateManagedAppServer,
@@ -97,6 +98,57 @@ test("parseArguments requires all durable state paths", () => {
   assert.equal(parsed.upstreamPort, 18433);
   assert.equal(parsed.requestTimeoutMs, 30000);
   assert.equal(parsed.resumeRequestTimeoutMs, 120000);
+  assert.equal(parsed.emptyClientRestartMs, 10000);
+});
+
+test("empty Desktop restart waits for a real client disconnect epoch", () => {
+  let observed = observeEmptyDesktopRestart({}, { clientCount: 0, nowMs: 0, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: false, emptySinceMs: null });
+
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 1, nowMs: 1, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: true, emptySinceMs: null });
+
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 0, nowMs: 2, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: true, emptySinceMs: 2 });
+
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 1, nowMs: 8, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: true, emptySinceMs: null });
+
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 0, nowMs: 9, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 0, nowMs: 19, restartMs: 10 });
+  assert.equal(observed.shouldRestart, true);
+  assert.equal(observed.emptyForMs, 10);
+
+  observed = observeEmptyDesktopRestart({ sawDesktopClient: true, emptySinceMs: 0 }, {
+    clientCount: "not-a-number",
+    nowMs: 100,
+    restartMs: 10,
+  });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: true, emptySinceMs: null });
+
+  observed = observeEmptyDesktopRestart({ sawDesktopClient: true, emptySinceMs: null }, {
+    clientCount: 2,
+    nowMs: 100,
+    restartMs: 10,
+  });
+  assert.equal(observed.shouldRestart, false);
+  observed = observeEmptyDesktopRestart(observed.state, { clientCount: 1, nowMs: 110, restartMs: 10 });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: true, emptySinceMs: null });
+
+  observed = observeEmptyDesktopRestart({ sawDesktopClient: true, emptySinceMs: 0 }, {
+    clientCount: 0,
+    nowMs: 100,
+    restartMs: 0,
+  });
+  assert.equal(observed.shouldRestart, false);
+  assert.deepEqual(observed.state, { sawDesktopClient: false, emptySinceMs: null });
 });
 
 test("missing compatible Codex binary pauses automation and requests native fallback", async () => {
@@ -328,6 +380,103 @@ test("proxy listener starts before Codex binary probing and managed App Server l
       },
     });
     assert.deepEqual(events, ["proxy_start", "probe_executable", "spawn_app_server", "upstream_ready"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("empty Desktop restart does not fire before any Desktop client has connected", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-empty-start-test-"));
+  const paths = runtimePaths(root);
+  const child = createChildThatRequiresForceVerification((processHandle) => {
+    processHandle.exitCode = 0;
+    processHandle.emit("exit", 0, null);
+  });
+  let spawnCount = 0;
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      executablePath: process.execPath,
+      pid: process.pid,
+      emptyClientRestartMs: 3,
+      lifecyclePollIntervalMs: 1,
+      probeExecutable: async () => {},
+      createProxy: () => ({
+        async start() {},
+        async close() {},
+        status() { return { clientCount: 0 }; },
+      }),
+      spawnAppServer: () => {
+        spawnCount += 1;
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        setTimeout(() => fs.writeFileSync(paths.stopFilePath, "stop\n", "utf8"), 15);
+      },
+      terminateChild: async () => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    assert.equal(spawnCount, 1);
+    const logText = fs.readFileSync(paths.logPath, "utf8");
+    assert.equal(logText.includes("app_server_desktop_empty_restart"), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("empty Desktop restart fires once after the last Desktop client disconnects", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-empty-restart-test-"));
+  const paths = runtimePaths(root);
+  let clientCount = 1;
+  let spawnCount = 0;
+  let nextPid = 43210;
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      executablePath: process.execPath,
+      pid: process.pid,
+      emptyClientRestartMs: 5,
+      lifecyclePollIntervalMs: 1,
+      probeExecutable: async () => {},
+      createProxy: () => ({
+        async start() {},
+        async close() {},
+        status() { return { clientCount }; },
+      }),
+      spawnAppServer: () => {
+        spawnCount += 1;
+        const child = createChildThatRequiresForceVerification();
+        child.pid = nextPid;
+        nextPid += 1;
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        if (spawnCount === 1) {
+          clientCount = 1;
+          setTimeout(() => { clientCount = 0; }, 2);
+          return;
+        }
+        fs.writeFileSync(paths.stopFilePath, "stop\n", "utf8");
+      },
+      terminateChild: async (child) => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    assert.equal(spawnCount, 2);
+    const logEntries = fs.readFileSync(paths.logPath, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+    assert.equal(logEntries.some((entry) => entry.type === "app_server_desktop_empty_restart"), true);
+    assert.equal(logEntries.some((entry) => entry.type === "app_server_exited"), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

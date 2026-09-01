@@ -1246,6 +1246,7 @@ function requiresManualLogin(error) {
     || message.includes("[NAPCAT_MANUAL_LOGIN_REQUIRED]")
     || /qrcode\.png|qrCodePath/i.test(message)
     || /proofWaterUrl|sms-verify-login|captcha|ti\.qq\.com/i.test(message)
+    || /quick-login credential|加密密码回退凭据不可用|DPAPI|credential cannot be decrypted|Unsupported NapCat quick-login credential schema/i.test(message)
     || /(需要验证码|短信验证|手机验证|需要新设备验证|需要异常设备验证|设备验证|安全验证)/.test(message)
     || (/(用户身份已失效|身份已失效|登录态已失效|登录态失效|登录状态失效|授权失效|重新登录)/.test(message) && /(快速登录|quick login|KickedOffLine)/i.test(message));
 }

@@ -6,7 +6,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { renameReplaceSync } from "./atomic-file.mjs";
-import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import {
   CodexAppServerProxyError,
   createCodexAppServerProxy,
@@ -22,6 +21,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
 const DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS = 250;
+const DEFAULT_EMPTY_CLIENT_RESTART_MS = 10000;
 const DEFAULT_LIVENESS_INTERVAL_MS = 15000;
 
 const CLI_OPTIONS = new Set([
@@ -41,6 +41,7 @@ const CLI_OPTIONS = new Set([
   "start-timeout-ms",
   "request-timeout-ms",
   "resume-timeout-ms",
+  "empty-client-restart-ms",
   "codex-exe",
 ]);
 
@@ -60,6 +61,34 @@ function boundedInteger(value, name, fallback, minimum, maximum) {
   const normalized = Math.trunc(parsed);
   if (normalized < minimum || normalized > maximum) throw new Error(`${name} 超出范围`);
   return normalized;
+}
+
+export function observeEmptyDesktopRestart(previousState = {}, input = {}) {
+  const restartMs = Number(input.restartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS);
+  if (!Number.isFinite(restartMs) || restartMs <= 0) {
+    return { state: { sawDesktopClient: false, emptySinceMs: null }, shouldRestart: false, emptyForMs: 0 };
+  }
+  const nowMs = Number(input.nowMs);
+  const rawClientCount = Number(input.clientCount);
+  const clientCount = Number.isFinite(rawClientCount) && rawClientCount >= 0 ? rawClientCount : 1;
+  const sawDesktopClient = Boolean(previousState.sawDesktopClient) || clientCount > 0;
+  if (!sawDesktopClient) {
+    return { state: { sawDesktopClient: false, emptySinceMs: null }, shouldRestart: false, emptyForMs: 0 };
+  }
+  if (clientCount > 0) {
+    return { state: { sawDesktopClient: true, emptySinceMs: null }, shouldRestart: false, emptyForMs: 0 };
+  }
+  const emptySinceMs = previousState.emptySinceMs !== null
+    && previousState.emptySinceMs !== undefined
+    && Number.isFinite(Number(previousState.emptySinceMs))
+    ? Number(previousState.emptySinceMs)
+    : nowMs;
+  const emptyForMs = Math.max(0, nowMs - emptySinceMs);
+  return {
+    state: { sawDesktopClient: true, emptySinceMs },
+    shouldRestart: emptyForMs >= restartMs,
+    emptyForMs,
+  };
 }
 
 function publicError(error, fallbackCode = "UNEXPECTED_ERROR") {
@@ -91,19 +120,16 @@ function readJsonObject(filePath, fsImpl = fs) {
   }
 }
 
+function appendJsonLine(filePath, value, fsImpl = fs) {
+  if (!filePath) return;
+  fsImpl.mkdirSync(path.dirname(filePath), { recursive: true });
+  fsImpl.appendFileSync(filePath, `${JSON.stringify(value)}\n`, "utf8");
+}
+
 function processAlive(pid) {
   if (!Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return false;
   try {
     process.kill(Number(pid), 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function bestEffortAppend(writer, value) {
-  try {
-    writer.append(value);
     return true;
   } catch {
     return false;
@@ -390,7 +416,7 @@ export async function terminateManagedAppServer(child, port, options = {}) {
   if (!child) return true;
   await (options.terminateChild ?? terminateChild)(child);
   const verifyPortReleased = options.verifyPortReleased ?? loopbackPortAvailable;
-  const deadline = Date.now() + (options.portReleaseTimeoutMs ?? 5000);
+  const deadline = Date.now() + (options.portReleaseTimeoutMs ?? 20000);
   let released = false;
   do {
     released = await verifyPortReleased(port);
@@ -571,6 +597,13 @@ export function parseArguments(argv) {
       250,
       300000,
     ),
+    emptyClientRestartMs: boundedInteger(
+      values["empty-client-restart-ms"],
+      "empty-client-restart-ms",
+      DEFAULT_EMPTY_CLIENT_RESTART_MS,
+      0,
+      300000,
+    ),
     executablePath: values["codex-exe"] ? path.resolve(values["codex-exe"]) : null,
   };
 }
@@ -578,16 +611,6 @@ export function parseArguments(argv) {
 export async function runCodexAppServerProxyService(options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const now = options.now ?? (() => new Date());
-  const operationalLog = createBoundedJsonlWriter({
-    filePath: options.logPath,
-    fsImpl,
-    now,
-  });
-  const anomalyLog = createBoundedJsonlWriter({
-    filePath: options.anomalyLogPath ?? path.join(path.dirname(options.logPath), "codex-app-server-turn-anomalies.jsonl"),
-    fsImpl,
-    now,
-  });
   const pid = Number(options.pid ?? process.pid);
   const startedAt = now().toISOString();
   const lock = acquireInstanceLock(options.lockPath, {
@@ -641,6 +664,7 @@ export async function runCodexAppServerProxyService(options = {}) {
     controlUrl: `http://127.0.0.1:${options.controlPort}`,
     upstreamUrl: `ws://127.0.0.1:${options.upstreamPort}`,
     appServerPid: null,
+    emptyClientRestartMs: options.emptyClientRestartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS,
     proxy: null,
     restartFailureCount: 0,
     lastError: null,
@@ -655,12 +679,12 @@ export async function runCodexAppServerProxyService(options = {}) {
     atomicWriteJson(options.runtimeStatePath, status, fsImpl);
     return status;
   };
-  const log = (type, details = {}) => bestEffortAppend(operationalLog, {
+  const log = (type, details = {}) => appendJsonLine(options.logPath, {
     at: now().toISOString(),
     type,
     pid,
     ...details,
-  });
+  }, fsImpl);
   const requestStop = (reason) => {
     stopRequested = true;
     if (!stopReason) stopReason = reason;
@@ -738,8 +762,6 @@ export async function runCodexAppServerProxyService(options = {}) {
       controlToken,
       requestTimeoutMs: options.requestTimeoutMs,
       resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
-      turnFirstOutputTimeoutMs: options.turnFirstOutputTimeoutMs
-        ?? Number(process.env.CODEX_APP_SERVER_PROXY_FIRST_OUTPUT_TIMEOUT_MS ?? 60000),
       journal,
       maintenanceFilePath: options.maintenanceFilePath,
       onEvent: (event) => {
@@ -752,13 +774,6 @@ export async function runCodexAppServerProxyService(options = {}) {
           persist({
             proxy: proxy?.status() ?? null,
             ...(event.type === "proxy_error" ? { lastError: event.error } : {}),
-          });
-        }
-        if (String(event.type ?? "").startsWith("app_server_turn_")) {
-          bestEffortAppend(anomalyLog, {
-            at: now().toISOString(),
-            layer: "app_server_proxy",
-            ...event,
           });
         }
         log(event.type, event);
@@ -833,20 +848,34 @@ export async function runCodexAppServerProxyService(options = {}) {
         log("app_server_started", { executablePath: currentExecutable, appServerPid: appServer.pid ?? null });
         const appServerExit = waitForExit(appServer);
         let exit;
+        let emptyDesktopRestartState = {
+          sawDesktopClient: Number(proxy.status()?.clientCount ?? 0) > 0,
+          emptySinceMs: null,
+        };
         while (true) {
           let cycleActive = true;
           const lifecycleWatch = (async () => {
             let nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
             let nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
             while (cycleActive) {
-              await wait(250);
+              await wait(options.lifecyclePollIntervalMs ?? 250);
               if (!cycleActive) return { code: null, signal: "watch_stopped" };
               if (stopRequested || fsImpl.existsSync(options.stopFilePath)) {
                 return { code: null, signal: "stop_requested" };
               }
+              const proxySnapshot = proxy.status();
+              const emptyDesktop = observeEmptyDesktopRestart(emptyDesktopRestartState, {
+                clientCount: proxySnapshot?.clientCount,
+                nowMs: Date.now(),
+                restartMs: options.emptyClientRestartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS,
+              });
+              emptyDesktopRestartState = emptyDesktop.state;
+              if (emptyDesktop.shouldRestart) {
+                return { code: null, signal: "desktop_empty_restart", emptyForMs: emptyDesktop.emptyForMs };
+              }
               if (Date.now() >= nextLivenessAt) {
                 nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
-                persist({ proxy: proxy.status() });
+                persist({ proxy: proxySnapshot });
               }
               if (Date.now() < nextRefreshAt) continue;
               nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
@@ -865,6 +894,13 @@ export async function runCodexAppServerProxyService(options = {}) {
           })();
           exit = await Promise.race([appServerExit, lifecycleWatch]);
           cycleActive = false;
+          if (exit.signal === "desktop_empty_restart" && Number(proxy.status()?.clientCount ?? 0) !== 0) {
+            log("app_server_desktop_empty_restart_deferred", {
+              clientCount: Number(proxy.status()?.clientCount ?? 0),
+            });
+            emptyDesktopRestartState = {};
+            continue;
+          }
           if (exit.signal !== "executable_refresh" || Number(proxy.status()?.clientCount ?? 0) === 0) break;
           log("app_server_executable_refresh_deferred", {
             nextExecutable: exit.revision,
@@ -885,6 +921,22 @@ export async function runCodexAppServerProxyService(options = {}) {
             lastError: null,
           });
           log("app_server_executable_refresh", { previousExecutable, nextExecutable: exit.revision });
+          continue;
+        }
+        if (exit.signal === "desktop_empty_restart") {
+          restartFailureCount = 0;
+          pauseForUpstream("APP_SERVER_DESKTOP_EMPTY_RESTARTING", "Desktop 已全部断开，正在重启受管 App Server");
+          persist({
+            state: "restarting",
+            automationEnabled: false,
+            proxy: proxy.status(),
+            restartFailureCount,
+            lastError: null,
+          });
+          log("app_server_desktop_empty_restart", {
+            emptyForMs: exit.emptyForMs ?? null,
+            appServerPid: appServer.pid ?? null,
+          });
           continue;
         }
         restartFailureCount += 1;

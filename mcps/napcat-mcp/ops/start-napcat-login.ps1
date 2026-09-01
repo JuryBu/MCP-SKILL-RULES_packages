@@ -359,10 +359,14 @@ try {
   if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
 }
 
-$QuickPasswordMd5 = if ($NoPasswordFallback) {
-  $null
+$QuickPasswordMd5 = if ($NoQr -and (-not $NoPasswordFallback)) {
+  try {
+    Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
+  } catch {
+    throw "[NAPCAT_MANUAL_LOGIN_REQUIRED] 加密密码回退凭据不可用：$($_.Exception.Message)"
+  }
 } else {
-  Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
+  $null
 }
 $HasPasswordFallback = -not [string]::IsNullOrWhiteSpace($QuickPasswordMd5)
 $StartedAtUtc = [DateTime]::UtcNow
@@ -430,6 +434,7 @@ $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 $QrWindow = $null
 $VerificationWindow = $null
 $LastVerificationUrl = $null
+$ManualVerificationExtensionSeconds = 900
 while ([DateTime]::UtcNow -lt $Deadline) {
   if ($null -ne $QrWindow) { [System.Windows.Forms.Application]::DoEvents() }
   if ($null -ne $VerificationWindow) { [System.Windows.Forms.Application]::DoEvents() }
@@ -444,6 +449,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
     if ($NoQr -and $PasswordFallbackRejected) {
       Disable-QuickLoginCredential -CredentialPath $QuickLoginCredentialPath -Reason "password_fallback_login_failed" | Out-Null
       $HasPasswordFallback = $false
+      Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退登录明确返回密码错误，已禁用本地凭据" -LogPath $LogPath
     }
     if ($NoQr -and (Test-QuickLoginCredentialInvalid -RecentLoginLog $RecentLoginLog)) {
       Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "NapCat 登录进程提前退出前已报告登录态失效" -LogPath $LogPath
@@ -501,7 +507,12 @@ while ([DateTime]::UtcNow -lt $Deadline) {
     Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "加密密码回退登录明确返回密码错误，已禁用本地凭据" -LogPath $LogPath
   }
   if ($NoQr -and (-not $HasPasswordFallback) -and ($QuickLoginCredentialInvalid -or $null -ne $QrCode)) {
-    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "快速登录记录已不可用且尚未配置加密密码回退" -LogPath $LogPath
+    $Reason = if ($NoPasswordFallback) {
+      "快速登录记录已不可用，自动路径已禁用密码回退"
+    } else {
+      "快速登录记录已不可用且尚未配置加密密码回退"
+    }
+    Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason $Reason -LogPath $LogPath
   }
   if ($NoQr -and $null -ne $QrCode -and ($HasPasswordFallback -and [DateTime]::UtcNow -ge $PasswordFallbackDeadlineUtc)) {
     Stop-AndThrowManualLoginRequired -RootProcessId $ProcessId -QrWindow $QrWindow -Reason "快速登录和加密密码回退均未恢复账号" -LogPath $LogPath
@@ -516,6 +527,8 @@ while ([DateTime]::UtcNow -lt $Deadline) {
       Close-QrWindow -Window $VerificationWindow
       $VerificationWindow = New-VerificationWindow -VerificationUrl $VerificationUrl
       $LastVerificationUrl = $VerificationUrl
+      $ExtendedDeadline = [DateTime]::UtcNow.AddSeconds($ManualVerificationExtensionSeconds)
+      if ($ExtendedDeadline -gt $Deadline) { $Deadline = $ExtendedDeadline }
     }
   }
   Start-Sleep -Milliseconds 500

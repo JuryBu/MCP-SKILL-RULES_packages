@@ -46,6 +46,22 @@ function readEvents(logPath) {
     .map((line) => JSON.parse(line));
 }
 
+test("start script validates model stream lock PID by runner command line", () => {
+  const startScript = fs.readFileSync(path.resolve("ops/start-codex-model-stream-proxy.ps1"), "utf8");
+  const runtimeProcessCheckIndex = startScript.indexOf("Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Current.pid)");
+  const lockProcessCheckIndex = startScript.indexOf("Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Lock.pid)");
+  assert.match(startScript, /function Test-ExpectedModelStreamProxyProcess/u);
+  assert.match(startScript, /Get-CimInstance Win32_Process/u);
+  assert.match(startScript, /codex-model-stream-proxy-runner\.mjs/u);
+  assert.match(startScript, /function Move-StaleModelStreamLock/u);
+  assert.ok(runtimeProcessCheckIndex > 0, "runtime-state PID reuse must be fenced by command-line validation");
+  assert.ok(lockProcessCheckIndex > runtimeProcessCheckIndex, "lock PID reuse must be fenced after runtime-state handling");
+  assert.doesNotMatch(
+    startScript,
+    /throw "Model stream proxy lock belongs to a live process:[\s\S]{0,120}Get-Process -Id \(\[int\]\$Lock\.pid\)/u,
+  );
+});
+
 async function modelRequest(port) {
   const payload = Buffer.from(JSON.stringify({ stream: true, tools: [{ type: "function", name: "safe" }] }));
   return new Promise((resolve, reject) => {
@@ -134,8 +150,7 @@ test("runtime heartbeat write failure never aborts an active model stream and la
   assert.equal(readEvents(logPath).some((event) => event.type === "runner_uncaught_exception"), false);
 
   fs.rmSync(runtimePath, { recursive: true, force: true });
-  fs.copyFileSync(runtimeBackupPath, runtimePath);
-  fs.rmSync(runtimeBackupPath, { force: true });
+  fs.renameSync(runtimeBackupPath, runtimePath);
   await waitFor(() => readEvents(logPath).some((event) => event.type === "runtime_state_write_recovered"), 3_000);
   const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8"));
   assert.equal(runtime.status, "running");

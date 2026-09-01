@@ -38,11 +38,15 @@ const anomalyLog = createBoundedJsonlWriter({
   filePath: path.join(stateRoot, "codex-model-stream-anomalies.jsonl"),
 });
 const ANOMALY_EVENT_TYPES = new Set([
-  "attempt_no_progress_timeout",
-  "attempt_abort_unconfirmed",
-  "attempt_ended_without_progress",
-  "guarded_request_failed",
+  "attempt_progress_timeout",
+  "native_retry_signal",
+  "retry_exhausted_completed_idle",
+  "usage_limit_completed_idle",
+  "permanent_failure_completed_idle",
+  "compaction_retry_signal",
   "guarded_request_error",
+  "guarded_error_retry_signal",
+  "guarded_error_completed_idle",
   "passthrough_error",
 ]);
 
@@ -76,7 +80,10 @@ const proxy = createCodexModelStreamProxy({
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
   port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, 1, 65535),
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
-  firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 60_000, 1_000, 300_000),
+  firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 30_000, 1_000, 300_000),
+  progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 30_000, 1_000, 300_000),
+  compactionAttemptTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS", 150_000, 10_000, 600_000),
+  maxConsecutiveAttempts: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS", 6, 1, 20),
   maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 64 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
   onEvent(event) {
     appendRunnerEvent(event);
@@ -94,6 +101,9 @@ function runtimeState(status = "running", error = null) {
     endpoint: `http://${proxy.status().host}:${proxy.status().port}`,
     upstreamOrigin: proxy.status().upstreamOrigin,
     firstProgressTimeoutMs: proxy.status().firstProgressTimeoutMs,
+    progressIdleTimeoutMs: proxy.status().progressIdleTimeoutMs,
+    compactionAttemptTimeoutMs: proxy.status().compactionAttemptTimeoutMs,
+    maxConsecutiveAttempts: proxy.status().maxConsecutiveAttempts,
     heartbeatIntervalMs,
     activeRequests: proxy.status().activeRequests,
     counters: proxy.status().counters,

@@ -2,7 +2,10 @@
 param(
   [string]$DataRoot = "",
   [ValidateRange(1, 65535)][int]$Port = 18435,
-  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 60,
+  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 30,
+  [ValidateRange(1, 300)][int]$ProgressIdleTimeoutSeconds = 30,
+  [ValidateRange(10, 600)][int]$CompactionAttemptTimeoutSeconds = 150,
+  [ValidateRange(1, 20)][int]$MaxConsecutiveAttempts = 6,
   [ValidateRange(1, 256)][int]$MaxBufferedRequestMiB = 64,
   [string]$UpstreamOrigin = "https://chatgpt.com",
   [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10
@@ -40,11 +43,37 @@ function Resolve-NodeExecutable {
 if (-not (Test-Path -LiteralPath $RunnerPath -PathType Leaf)) { throw "Missing model stream proxy runner: $RunnerPath" }
 New-Item -ItemType Directory -Path $StateRoot -Force | Out-Null
 
+function Get-ProcessCommandLine {
+  param([int]$ProcessId)
+  try {
+    return [string](Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction Stop).CommandLine
+  } catch {
+    return ""
+  }
+}
+
+function Test-ExpectedModelStreamProxyProcess {
+  param([int]$ProcessId)
+  $CommandLine = Get-ProcessCommandLine -ProcessId $ProcessId
+  if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
+  $ExpectedRunnerPath = (Resolve-Path -LiteralPath $RunnerPath).Path
+  return $CommandLine.IndexOf("codex-model-stream-proxy-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -ge 0 `
+    -and $CommandLine.IndexOf($ExpectedRunnerPath, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+}
+
+function Move-StaleModelStreamLock {
+  if (-not (Test-Path -LiteralPath $LockPath)) { return $null }
+  $Timestamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
+  $StalePath = "$LockPath.stale-$Timestamp"
+  Move-Item -LiteralPath $LockPath -Destination $StalePath -Force
+  return $StalePath
+}
+
 if (Test-Path -LiteralPath $RuntimePath) {
   try {
     $Current = Get-Content -LiteralPath $RuntimePath -Encoding UTF8 -Raw | ConvertFrom-Json
     $Existing = Get-Process -Id ([int]$Current.pid) -ErrorAction SilentlyContinue
-    if ($null -ne $Existing) {
+    if ($null -ne $Existing -and (Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Current.pid))) {
       $Health = Invoke-RestMethod -Uri ("{0}/health" -f [string]$Current.endpoint) -TimeoutSec 2
       if ($Health.ok -eq $true) {
         [pscustomobject]@{ changed = $false; running = $true; pid = [int]$Current.pid; endpoint = [string]$Current.endpoint; node = $Existing.Path } | ConvertTo-Json -Depth 5
@@ -60,10 +89,10 @@ if (Test-Path -LiteralPath $RuntimePath) {
 if (Test-Path -LiteralPath $LockPath) {
   $Lock = $null
   try { $Lock = Get-Content -LiteralPath $LockPath -Encoding UTF8 -Raw | ConvertFrom-Json } catch {}
-  if ($null -ne $Lock -and $null -ne (Get-Process -Id ([int]$Lock.pid) -ErrorAction SilentlyContinue)) {
+  if ($null -ne $Lock -and $null -ne (Get-Process -Id ([int]$Lock.pid) -ErrorAction SilentlyContinue) -and (Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Lock.pid))) {
     throw "Model stream proxy lock belongs to a live process: $($Lock.pid)"
   }
-  Remove-Item -LiteralPath $LockPath -Force
+  Move-StaleModelStreamLock | Out-Null
 }
 if (Test-Path -LiteralPath $StopPath) { Remove-Item -LiteralPath $StopPath -Force }
 
@@ -77,6 +106,9 @@ $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_STATE_ROOT"] = $StateRoot
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_PORT"] = [string]$Port
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN"] = $UpstreamOrigin
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS"] = [string]($FirstProgressTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS"] = [string]($ProgressIdleTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS"] = [string]($CompactionAttemptTimeoutSeconds * 1000)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS"] = [string]$MaxConsecutiveAttempts
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES"] = [string]($MaxBufferedRequestMiB * 1024 * 1024)
 $Process = [System.Diagnostics.Process]::new()
 $Process.StartInfo = $Info
@@ -101,4 +133,7 @@ if ($null -eq $Health -or $Health.ok -ne $true) { throw "Model stream proxy did 
   endpoint = "http://127.0.0.1:$Port"
   node = $NodePath
   firstProgressTimeoutSeconds = $FirstProgressTimeoutSeconds
+  progressIdleTimeoutSeconds = $ProgressIdleTimeoutSeconds
+  compactionAttemptTimeoutSeconds = $CompactionAttemptTimeoutSeconds
+  maxConsecutiveAttempts = $MaxConsecutiveAttempts
 } | ConvertTo-Json -Depth 5

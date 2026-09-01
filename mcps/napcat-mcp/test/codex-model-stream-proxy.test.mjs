@@ -61,14 +61,14 @@ async function request(port, body, options = {}) {
   });
 }
 
-test("request classification uses x-codex-turn-metadata and guards only normal turns", () => {
+test("request classification uses x-codex-turn-metadata and guards resumable turn kinds", () => {
   assert.deepEqual(classifyCodexModelRequest({ headers: { "x-codex-turn-metadata": metadataHeader("turn") } }).requestKind, "turn");
   assert.equal(classifyCodexModelRequest({ headers: { "x-codex-turn-metadata": metadataHeader("turn") } }).guarded, true);
-  assert.equal(classifyCodexModelRequest({ headers: { "x-codex-turn-metadata": metadataHeader("compaction") } }).guarded, false);
+  assert.equal(classifyCodexModelRequest({ headers: { "x-codex-turn-metadata": metadataHeader("compaction") } }).guarded, true);
   assert.equal(classifyCodexModelRequest({ headers: {} }).guarded, false);
 });
 
-test("late output from a cancelled attempt is discarded before retry output is exposed", async (t) => {
+test("late output from a timed out attempt is discarded before the client retry exposes output", async (t) => {
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
@@ -84,12 +84,20 @@ test("late output from a cancelled attempt is discarded before retry output is e
     res.end(sse({ type: "response.output_text.delta", delta: "NEW" }) + sse({ type: "response.completed" }));
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 40 });
+  const proxy = createCodexModelStreamProxy({
+    port: 0,
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    firstProgressTimeoutMs: 40,
+    maxConsecutiveAttempts: 2,
+  });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
-  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] });
+  const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "late-output-thread" });
   await new Promise((resolve) => setTimeout(resolve, 140));
+  assert.equal(attempts, 1);
+  assert.doesNotMatch(first.body, /OLD|NEW/u);
+  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "late-output-thread" });
   assert.equal(attempts, 2);
   assert.match(result.body, /NEW/u);
   assert.doesNotMatch(result.body, /OLD/u);
@@ -124,7 +132,7 @@ test("SSE progress ignores status-only frames and accepts text, reasoning, tool 
   assert.equal(isMeaningfulResponsesSseFrame(sse({ type: "response.completed" }).trim()), true);
 });
 
-test("ordinary turn retries once without exposing the stalled first attempt", async (t) => {
+test("ordinary turn records a retry signal and exposes only the client retry output", async (t) => {
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
@@ -142,17 +150,23 @@ test("ordinary turn retries once without exposing the stalled first attempt", as
     port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
     firstProgressTimeoutMs: 80,
+    maxConsecutiveAttempts: 2,
     onEvent: (event) => events.push(event),
   });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
-  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] });
+  const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
+  assert.equal(first.statusCode, 200);
+  assert.equal(attempts, 1);
+  assert.doesNotMatch(first.body, /recovered|attempt/u);
+  assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 1);
+  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
   assert.equal(result.statusCode, 200);
   assert.equal(attempts, 2);
   assert.match(result.body, /recovered/u);
   assert.doesNotMatch(result.body, /"attempt":1/u);
-  assert.equal(events.filter((event) => event.type === "attempt_retrying").length, 1);
+  assert.equal(events.filter((event) => event.type === "retry_exhausted_completed_idle").length, 0);
 });
 
 test("concurrent healthy request is not delayed or cancelled by another stalled request", async (t) => {
@@ -168,7 +182,12 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
     }
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 100 });
+  const proxy = createCodexModelStreamProxy({
+    port: 0,
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    firstProgressTimeoutMs: 100,
+    maxConsecutiveAttempts: 2,
+  });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
@@ -178,11 +197,13 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   assert.equal(fast.statusCode, 200);
   assert.ok(Date.now() - started < 80, "fast request should complete before the slow watchdog fires");
   assert.match(fast.body, /fast/u);
-  const slowResult = await slow;
+  const slowFirst = await slow;
+  assert.doesNotMatch(slowFirst.body, /slow/u);
+  const slowResult = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "slow-thread" });
   assert.match(slowResult.body, /slow/u);
 });
 
-test("compaction bypasses replay while ordinary turns with hosted tool declarations remain guarded", async (t) => {
+test("compaction uses bounded internal retry while ordinary hosted turns use the retry guard", async (t) => {
   let attempts = 0;
   let turnAttempts = 0;
   const upstream = http.createServer((req, res) => {
@@ -201,21 +222,29 @@ test("compaction bypasses replay while ordinary turns with hosted tool declarati
     res.end(sse({ type: "response.output_text.delta", delta: "recovered" }) + sse({ type: "response.completed" }));
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 40 });
+  const proxy = createCodexModelStreamProxy({
+    port: 0,
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    firstProgressTimeoutMs: 40,
+    maxConsecutiveAttempts: 2,
+  });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
   const compact = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
   assert.equal(compact.statusCode, 200);
-  assert.equal(attempts, 1);
-  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd" });
+  assert.equal(attempts, 2);
+  assert.equal(proxy.status().counters.compactionInternalRetries, 1);
+  const firstHosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd", threadId: "hosted-thread" });
+  assert.doesNotMatch(firstHosted.body, /recovered/u);
+  const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd", threadId: "hosted-thread" });
   assert.equal(hosted.statusCode, 200);
   assert.match(hosted.body, /recovered/u);
-  assert.equal(attempts, 3);
+  assert.equal(attempts, 4);
   assert.equal(turnAttempts, 2);
 });
 
-test("two stalled attempts end within the bounded deadline", async (t) => {
+test("two stalled client attempts end with a synthetic no-side-effect completion", async (t) => {
   let attempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
@@ -223,13 +252,21 @@ test("two stalled attempts end within the bounded deadline", async (t) => {
     res.write(sse({ type: "response.in_progress" }));
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 50 });
+  const proxy = createCodexModelStreamProxy({
+    port: 0,
+    upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
+    firstProgressTimeoutMs: 50,
+    maxConsecutiveAttempts: 2,
+  });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
+  const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "stalled-thread" });
+  assert.equal(first.statusCode, 200);
+  assert.doesNotMatch(first.body, /网络重试/u);
   const started = Date.now();
-  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] });
-  assert.equal(result.statusCode, 504);
+  const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "stalled-thread" });
+  assert.equal(result.statusCode, 200);
   assert.equal(attempts, 2);
   assert.ok(Date.now() - started < 250);
-  assert.match(result.body, /model_stream_no_progress/u);
+  assert.match(result.body, /网络重试|response.completed/u);
 });

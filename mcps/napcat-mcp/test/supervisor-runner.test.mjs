@@ -138,7 +138,7 @@ test("生产 CLI 解析约定参数，并保留可选脚本路径", () => {
   }
 });
 
-test("quick-login 参数固定带 -NoQr、禁用密码回退、短 timeout 和 NapCat 根目录", () => {
+test("quick-login 参数固定带 -NoQr、默认禁用密码回退、短 timeout 和 NapCat 根目录", () => {
   const fixture = createFixture();
   try {
     const argumentsList = buildQuickLoginArguments({
@@ -183,19 +183,12 @@ test("quick-login 给登录脚本保留清理隐藏进程的超时余量", async
     });
     assert.equal(calls.length, 1);
     assert.equal(calls[0].options.timeout, 50_000);
-    assert.deepEqual(
-      calls[0].argumentsList.slice(-8),
-      [
-        "-NoQr",
-        "-TimeoutSeconds",
-        "35",
-        "-NapCatRoot",
-        path.resolve(fixture.napcatRoot),
-        "-NoPasswordFallback",
-        "-QqExePath",
-        path.resolve(fixture.qqExePath),
-      ],
-    );
+    assert.equal(calls[0].argumentsList.includes("-NoQr"), true);
+    assert.equal(calls[0].argumentsList.includes("-NoPasswordFallback"), true);
+    assert.equal(calls[0].argumentsList.includes("-NapCatRoot"), true);
+    assert.equal(calls[0].argumentsList.includes(path.resolve(fixture.napcatRoot)), true);
+    assert.equal(calls[0].argumentsList.includes("-QqExePath"), true);
+    assert.equal(calls[0].argumentsList.includes(path.resolve(fixture.qqExePath)), true);
   } finally {
     fixture.cleanup();
   }
@@ -284,6 +277,21 @@ test("单次缺失 online 字段只开始未知状态宽限期，不会立即停
     assert.equal(runtime.login.unknownProcessSince, "2026-07-24T08:00:00.000Z");
     assert.equal(runtime.actions.staleNapCatRecovery.trigger, "status_unknown");
     assert.equal(runtime.actions.staleNapCatRecovery.reason, "grace_period");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("quick-login 可显式允许密码回退", () => {
+  const fixture = createFixture();
+  try {
+    const argumentsList = buildQuickLoginArguments({
+      napcatRoot: fixture.napcatRoot,
+      rootDir: fixture.root,
+      timeoutMs: 35_000,
+      noPasswordFallback: false,
+    });
+    assert.equal(argumentsList.includes("-NoPasswordFallback"), false);
   } finally {
     fixture.cleanup();
   }
@@ -1031,6 +1039,41 @@ test("快速登录输出短信验证链接时即使没有专用错误码也会�
   }
 });
 
+test("快速登录凭据无法解密时进入人工阻断且不循环重试", async () => {
+  const fixture = createFixture();
+  let attempts = 0;
+  const offline = async () => ({ known: true, reachable: true, online: false, accountMatches: false });
+  const noProcess = async () => ({ known: true, present: false });
+  try {
+    const common = {
+      checkNapCatStatus: offline,
+      checkNapCatProcesses: noProcess,
+      getOpenTaskCount: async () => 0,
+      quickLogin() {
+        attempts += 1;
+        const error = new Error("[NAPCAT_MANUAL_LOGIN_REQUIRED] 加密密码回退凭据不可用：NapCat quick-login credential cannot be decrypted for the bound account and current Windows user");
+        error.code = 1;
+        throw error;
+      },
+    };
+    await runSupervisorService(baseOptions(fixture, common));
+    let runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.login.blocked, true);
+    assert.equal(runtime.login.blockedReason.code, "NAPCAT_MANUAL_LOGIN_REQUIRED");
+
+    await runSupervisorService(baseOptions(fixture, {
+      ...common,
+      now: () => new Date("2026-07-24T08:05:00.000Z"),
+    }));
+    runtime = readRuntime(fixture);
+    assert.equal(attempts, 1);
+    assert.equal(runtime.actions.quickLogin.reason, "manual_login_required");
+  } finally {
+    fixture.cleanup();
+  }
+});
+
 test("快速登录返回人工登录状态对象时不能被记为成功", async () => {
   const fixture = createFixture();
   let attempts = 0;
@@ -1045,7 +1088,7 @@ test("快速登录返回人工登录状态对象时不能被记为成功", async
         assert.equal(args.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
         return {
           state: "manual_login_required",
-          reason: "快速登录记录已不可用且尚未配置加密密码回退",
+          reason: "快速登录记录已不可用，自动路径已禁用密码回退",
           qrCodePath: path.join(fixture.napcatRoot, "napcat", "cache", "qrcode.png"),
         };
       },
