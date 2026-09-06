@@ -2,13 +2,14 @@
 param(
   [string]$DataRoot = "",
   [ValidateRange(1, 65535)][int]$Port = 18435,
-  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 30,
-  [ValidateRange(1, 300)][int]$ProgressIdleTimeoutSeconds = 30,
-  [ValidateRange(10, 600)][int]$CompactionAttemptTimeoutSeconds = 150,
+  [ValidateRange(1, 300)][int]$FirstProgressTimeoutSeconds = 40,
+  [ValidateRange(1, 300)][int]$ProgressIdleTimeoutSeconds = 40,
+  [ValidateRange(10, 600)][int]$CompactionAttemptTimeoutSeconds = 600,
   [ValidateRange(1, 20)][int]$MaxConsecutiveAttempts = 6,
   [ValidateRange(1, 256)][int]$MaxBufferedRequestMiB = 64,
   [string]$UpstreamOrigin = "https://chatgpt.com",
-  [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10
+  [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10,
+  [string]$MaintenanceToken = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,17 @@ $StateRoot = Join-Path $DataRoot "state"
 $RuntimePath = Join-Path $StateRoot "codex-model-stream-proxy-runtime.json"
 $LockPath = Join-Path $StateRoot "codex-model-stream-proxy.lock.json"
 $StopPath = Join-Path $StateRoot "codex-model-stream-proxy.stop"
+$MaintenancePath = Join-Path $StateRoot "codex-model-stream-proxy.maintenance.json"
+
+if (Test-Path -LiteralPath $MaintenancePath) {
+  $Maintenance = Get-Content -LiteralPath $MaintenancePath -Encoding UTF8 -Raw | ConvertFrom-Json
+  $MaintenanceExpiry = [DateTimeOffset]::Parse([string]$Maintenance.expiresAt)
+  if ($MaintenanceExpiry -gt [DateTimeOffset]::UtcNow -and
+    ([string]::IsNullOrWhiteSpace($MaintenanceToken) -or $MaintenanceToken -cne [string]$Maintenance.token)) {
+    [pscustomobject]@{ changed = $false; reason = "model_proxy_maintenance"; expiresAt = $Maintenance.expiresAt } | ConvertTo-Json
+    return
+  }
+}
 
 function Resolve-NodeExecutable {
   $Candidates = @()
@@ -75,7 +87,7 @@ if (Test-Path -LiteralPath $RuntimePath) {
     $Existing = Get-Process -Id ([int]$Current.pid) -ErrorAction SilentlyContinue
     if ($null -ne $Existing -and (Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Current.pid))) {
       $Health = Invoke-RestMethod -Uri ("{0}/health" -f [string]$Current.endpoint) -TimeoutSec 2
-      if ($Health.ok -eq $true) {
+      if ($Health.ok -eq $true -and ($null -eq $Health.pid -or [int]$Health.pid -eq [int]$Current.pid)) {
         [pscustomobject]@{ changed = $false; running = $true; pid = [int]$Current.pid; endpoint = [string]$Current.endpoint; node = $Existing.Path } | ConvertTo-Json -Depth 5
         return
       }
@@ -120,11 +132,21 @@ while ((Get-Date) -lt $Deadline) {
   if ($Process.HasExited) { throw "Model stream proxy exited during startup with code $($Process.ExitCode)." }
   try {
     $Health = Invoke-RestMethod -Uri ("http://127.0.0.1:{0}/health" -f $Port) -TimeoutSec 1
-    if ($Health.ok -eq $true) { break }
+    if ($Health.ok -eq $true -and [int]$Health.pid -eq $Process.Id) {
+      $StartedRuntime = Get-Content -LiteralPath $RuntimePath -Encoding UTF8 -Raw | ConvertFrom-Json
+      if ([int]$StartedRuntime.pid -eq $Process.Id -and $StartedRuntime.instanceToken -eq $Health.instanceToken) { break }
+    }
+    $Health = $null
   } catch {}
   Start-Sleep -Milliseconds 200
 }
-if ($null -eq $Health -or $Health.ok -ne $true) { throw "Model stream proxy did not become healthy within $StartupTimeoutSeconds seconds." }
+if ($null -eq $Health -or $Health.ok -ne $true -or [int]$Health.pid -ne $Process.Id) {
+  if (-not $Process.HasExited -and (Test-ExpectedModelStreamProxyProcess -ProcessId $Process.Id)) {
+    $Process.Kill()
+    $Process.WaitForExit(3000) | Out-Null
+  }
+  throw "Model stream proxy did not become healthy within $StartupTimeoutSeconds seconds."
+}
 
 [pscustomobject]@{
   changed = $true

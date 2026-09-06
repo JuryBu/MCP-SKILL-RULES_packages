@@ -67,22 +67,21 @@ function appendRunnerEvent(event) {
 
 const startedAt = new Date().toISOString();
 const instanceToken = crypto.randomUUID();
-const lockHandle = fs.openSync(lockPath, "wx");
-fs.writeFileSync(lockHandle, `${JSON.stringify({ pid: process.pid, instanceToken, startedAt })}\n`, "utf8");
-fs.closeSync(lockHandle);
 
 let stopping = false;
 let heartbeat = null;
 let stopWatcher = null;
 let consecutiveRuntimeWriteFailures = 0;
 const heartbeatIntervalMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_HEARTBEAT_INTERVAL_MS", 5_000, 100, 60_000);
+const drainTimeoutMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_DRAIN_TIMEOUT_MS", 45_000, 100, 120_000);
 const proxy = createCodexModelStreamProxy({
+  instanceToken,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
   port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, 1, 65535),
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
-  firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 30_000, 1_000, 300_000),
-  progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 30_000, 1_000, 300_000),
-  compactionAttemptTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS", 150_000, 10_000, 600_000),
+  firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 40_000, 1_000, 300_000),
+  progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 40_000, 1_000, 300_000),
+  compactionAttemptTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS", 600_000, 10_000, 600_000),
   maxConsecutiveAttempts: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS", 6, 1, 20),
   maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 64 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
   onEvent(event) {
@@ -90,12 +89,27 @@ const proxy = createCodexModelStreamProxy({
   },
 });
 
+const lockHandle = fs.openSync(lockPath, "wx");
+try {
+  fs.writeFileSync(lockHandle, `${JSON.stringify({ pid: process.pid, instanceToken, startedAt })}\n`, "utf8");
+} finally {
+  fs.closeSync(lockHandle);
+}
+
+function releaseOwnLock() {
+  try {
+    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
+    if (lock.pid === process.pid && lock.instanceToken === instanceToken) fs.unlinkSync(lockPath);
+  } catch {}
+}
+
 function runtimeState(status = "running", error = null) {
   return {
     schemaVersion: 1,
     status,
     pid: process.pid,
     instanceToken,
+    implementationVersion: proxy.status().implementationVersion,
     startedAt,
     livenessAt: new Date().toISOString(),
     endpoint: `http://${proxy.status().host}:${proxy.status().port}`,
@@ -104,7 +118,10 @@ function runtimeState(status = "running", error = null) {
     progressIdleTimeoutMs: proxy.status().progressIdleTimeoutMs,
     compactionAttemptTimeoutMs: proxy.status().compactionAttemptTimeoutMs,
     maxConsecutiveAttempts: proxy.status().maxConsecutiveAttempts,
+    retryDelaysMs: proxy.status().retryDelaysMs,
     heartbeatIntervalMs,
+    drainTimeoutMs,
+    draining: proxy.status().draining,
     activeRequests: proxy.status().activeRequests,
     counters: proxy.status().counters,
     error,
@@ -143,16 +160,20 @@ async function shutdown(reason, exitCode = 0) {
   clearInterval(heartbeat);
   clearInterval(stopWatcher);
   try {
+    proxy.beginDrain();
+    writeRuntimeState("draining", null, "drain");
+    const deadline = Date.now() + drainTimeoutMs;
+    while (proxy.status().activeRequests > 0 && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    if (proxy.status().activeRequests > 0) appendRunnerEvent({ type: "drain_timeout", activeRequests: proxy.status().activeRequests });
     await proxy.stop();
     writeRuntimeState("stopped", null, "shutdown");
   } catch (error) {
     writeRuntimeState("failed", { code: error.code ?? "STOP_FAILED", message: error.message }, "shutdown_failed");
     exitCode = 1;
   }
-  try {
-    const lock = JSON.parse(fs.readFileSync(lockPath, "utf8"));
-    if (lock.pid === process.pid && lock.instanceToken === instanceToken) fs.unlinkSync(lockPath);
-  } catch {}
+  releaseOwnLock();
   appendRunnerEvent({ type: "runner_stopped", reason, exitCode });
   process.exitCode = exitCode;
 }
@@ -180,6 +201,8 @@ try {
   }, 500);
 } catch (error) {
   writeRuntimeState("failed", { code: error.code ?? "START_FAILED", message: error.message }, "startup_failed");
-  try { fs.unlinkSync(lockPath); } catch {}
-  throw error;
+  releaseOwnLock();
+  appendRunnerEvent({ type: "runner_start_failed", code: error.code ?? "START_FAILED", message: error.message });
+  await proxy.stop();
+  process.exitCode = 1;
 }

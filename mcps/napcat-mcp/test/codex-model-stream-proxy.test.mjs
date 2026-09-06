@@ -34,7 +34,7 @@ async function request(port, body, options = {}) {
     const req = http.request({
       host: "127.0.0.1",
       port,
-      path: "/backend-api/codex/responses",
+      path: options.path ?? "/backend-api/codex/responses",
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -103,8 +103,9 @@ test("late output from a timed out attempt is discarded before the client retry 
   assert.doesNotMatch(result.body, /OLD/u);
 });
 
-test("a stream that already exposed meaningful output is never replayed after disconnect", async (t) => {
+test("a stream that already exposed text ends for a native retry without losing the streamed text", async (t) => {
   let attempts = 0;
+  const events = [];
   const upstream = http.createServer((req, res) => {
     attempts += 1;
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -112,15 +113,16 @@ test("a stream that already exposed meaningful output is never replayed after di
     setTimeout(() => res.destroy(new Error("simulated disconnect")), 10);
   });
   const upstreamPort = await listen(upstream);
-  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 40 });
+  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}`, firstProgressTimeoutMs: 40, onEvent: (event) => events.push(event) });
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
   const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] });
   await new Promise((resolve) => setTimeout(resolve, 70));
-  assert.equal(result.aborted, true);
+  assert.equal(result.aborted, false);
   assert.equal(attempts, 1);
   assert.match(result.body, /visible/u);
+  assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 1);
 });
 
 test("SSE progress ignores status-only frames and accepts text, reasoning, tool arguments, and completion", () => {
@@ -159,7 +161,7 @@ test("ordinary turn records a retry signal and exposes only the client retry out
   const first = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
   assert.equal(first.statusCode, 200);
   assert.equal(attempts, 1);
-  assert.doesNotMatch(first.body, /recovered|attempt/u);
+  assert.match(first.body, /"attempt":1/u);
   assert.equal(events.filter((event) => event.type === "native_retry_signal").length, 1);
   const result = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "ordinary-retry-thread" });
   assert.equal(result.statusCode, 200);
@@ -206,12 +208,18 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
 test("compaction uses bounded internal retry while ordinary hosted turns use the retry guard", async (t) => {
   let attempts = 0;
   let turnAttempts = 0;
+  let compactionAttempts = 0;
   const upstream = http.createServer((req, res) => {
     attempts += 1;
     res.writeHead(200, { "content-type": "text/event-stream" });
     const metadata = JSON.parse(req.headers["x-codex-turn-metadata"]);
     if (metadata.request_kind === "compaction") {
-      res.end(sse({ type: "response.in_progress" }));
+      compactionAttempts += 1;
+      if (compactionAttempts === 1) {
+        res.write(sse({ type: "response.in_progress" }));
+        return;
+      }
+      res.end(sse({ type: "response.output_text.delta", delta: "summary" }) + sse({ type: "response.completed" }));
       return;
     }
     turnAttempts += 1;
@@ -231,10 +239,13 @@ test("compaction uses bounded internal retry while ordinary hosted turns use the
   await proxy.start();
   t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
 
+  const compactFirst = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
+  assert.equal(compactFirst.statusCode, 200);
   const compact = await request(proxy.status().port, { stream: true, tools: [] }, { requestKind: "compaction" });
   assert.equal(compact.statusCode, 200);
   assert.equal(attempts, 2);
-  assert.equal(proxy.status().counters.compactionInternalRetries, 1);
+  assert.match(compact.body, /summary/u);
+  assert.equal(proxy.status().counters.compactionInternalRetries, 0);
   const firstHosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd", threadId: "hosted-thread" });
   assert.doesNotMatch(firstHosted.body, /recovered/u);
   const hosted = await request(proxy.status().port, { tools: [{ type: "web_search" }] }, { contentEncoding: "zstd", threadId: "hosted-thread" });
@@ -242,6 +253,55 @@ test("compaction uses bounded internal retry while ordinary hosted turns use the
   assert.match(hosted.body, /recovered/u);
   assert.equal(attempts, 4);
   assert.equal(turnAttempts, 2);
+});
+
+test("unary compact JSON preserves the real upstream output", async (t) => {
+  const upstream = http.createServer((req, res) => {
+    assert.match(req.url, /\/responses\/compact$/u);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({
+      id: "compact-real",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "real compact output" }] }],
+    }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}` });
+  await proxy.start();
+  t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
+
+  const result = await request(
+    proxy.status().port,
+    { stream: false, tools: [] },
+    { requestKind: "compaction", path: "/backend-api/codex/responses/compact" },
+  );
+
+  assert.equal(result.statusCode, 200);
+  assert.match(result.body, /real compact output/u);
+  assert.doesNotMatch(result.body, /网络重试|proxy_/u);
+});
+
+test("unary compact transient failure makes one upstream request and returns JSON 502", async (t) => {
+  let attempts = 0;
+  const upstream = http.createServer((_req, res) => {
+    attempts += 1;
+    res.writeHead(503, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { code: "server_error", message: "temporary failure" } }));
+  });
+  const upstreamPort = await listen(upstream);
+  const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstreamPort}` });
+  await proxy.start();
+  t.after(async () => { await proxy.stop(); upstream.closeAllConnections?.(); upstream.close(); });
+
+  const result = await request(
+    proxy.status().port,
+    { stream: false, tools: [] },
+    { requestKind: "compaction", path: "/backend-api/codex/responses/compact" },
+  );
+
+  assert.equal(attempts, 1);
+  assert.equal(result.statusCode, 502);
+  assert.match(String(result.headers["content-type"]), /application\/json/u);
+  assert.doesNotMatch(result.body, /response\.completed|response\.output_item/u);
 });
 
 test("two stalled client attempts end with a synthetic no-side-effect completion", async (t) => {

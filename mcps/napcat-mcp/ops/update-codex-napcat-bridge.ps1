@@ -346,6 +346,7 @@ function Assert-BackendOnlyCompatible {
   )
   $NextStartProxyPaths = @(
     "src\codex-model-stream-proxy.mjs",
+    "src\codex-stream-recovery.mjs",
     "src\codex-model-stream-proxy-runner.mjs"
   )
   foreach ($RelativePath in $LoadedProxyPaths) {

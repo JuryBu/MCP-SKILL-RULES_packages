@@ -4,20 +4,25 @@ import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
 import zlib from "node:zlib";
 import { correlationQuality, hashIdentity } from "./observability-utils.mjs";
+import { createStreamRecovery, waitForRetry } from "./codex-stream-recovery.mjs";
 
-const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 30_000;
-const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 30_000;
-const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 150_000;
+const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
+const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
+const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONSECUTIVE_ATTEMPTS = 6;
+const DEFAULT_RETRY_DELAYS_MS = [0, 0, 0, 0, 0];
 const DEFAULT_ATTEMPT_STATE_TTL_MS = 30 * 60_000;
 const DEFAULT_UPSTREAM_ORIGIN = "https://chatgpt.com";
 const MAX_METADATA_HEADER_BYTES = 64 * 1024;
-const NETWORK_EXHAUSTED_NOTICE = "\n\n网络重试六次仍失败，本轮没有执行新的工具操作，请重新发送。";
+const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
+const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
+const IMPLEMENTATION_VERSION = "2026-09-06.1";
+const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
 const CAPACITY_EXHAUSTED_NOTICE = "\n\n当前模型暂时满载，已自动尝试六次仍未恢复，请稍后重试或切换模型。";
 const USAGE_LIMIT_NOTICE = "\n\n当前账号额度已耗尽，请等待额度恢复、购买额外额度或切换账号。";
-const PERMANENT_FAILURE_NOTICE = "\n\n请求未能完成，服务器返回了不可重试的错误，本轮没有执行新的工具操作，请重新发送。";
+const PERMANENT_FAILURE_NOTICE = "\n\n本次模型响应因不可重试错误未完成，已有信息已保留，请继续。";
 const INTERRUPTED_AFTER_PROGRESS_NOTICE = "\n\n模型流在已产生内容或工具调用后中断。为避免重复执行，本轮已停止，请重新发送。";
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -45,6 +50,8 @@ const TRANSIENT_CODES = new Set([
   "timeout",
   ...CAPACITY_CODES,
 ]);
+const EXPLICIT_PERMANENT_CODE = /(?:auth|unauthori[sz]ed|forbidden|permission|invalid|bad_request|unsupported|not_found)/iu;
+const EXPLICIT_PERMANENT_MESSAGE = /(?:invalid (?:request|api key|authorization)|authentication(?: failed)?|unauthori[sz]ed|forbidden|permission denied)/iu;
 
 function integerOption(value, fallback, minimum, maximum, name) {
   const number = Number(value ?? fallback);
@@ -108,7 +115,11 @@ function parseTurnMetadata(headers) {
 
 export function classifyCodexModelRequest(request) {
   const metadata = parseTurnMetadata(request?.headers ?? {});
-  const requestKind = typeof metadata?.request_kind === "string" ? metadata.request_kind : null;
+  const pathname = String(request?.url ?? "").split("?")[0].replace(/\/+$/u, "");
+  const fallbackKind = request?.method === "POST" && /\/responses(?:\/compact)?$/u.test(pathname)
+    ? (pathname.endsWith("/compact") ? "compaction" : "turn")
+    : null;
+  const requestKind = typeof metadata?.request_kind === "string" ? metadata.request_kind : fallbackKind;
   return {
     requestKind,
     guarded: requestKind === "turn" || requestKind === "compaction",
@@ -137,12 +148,34 @@ function decodeRequestBody(body, contentEncoding, maxOutputLength) {
   return decoded.length <= maxOutputLength ? decoded : null;
 }
 
-function isJsonRequestBody(body, contentEncoding, maxOutputLength) {
+function parseJsonRequestBody(body, contentEncoding, maxOutputLength) {
   const decoded = decodeRequestBody(body, contentEncoding, maxOutputLength);
-  if (decoded === null) return false;
+  if (decoded === null) return null;
   try {
     const payload = JSON.parse(decoded.toString("utf8"));
-    return payload !== null && typeof payload === "object" && !Array.isArray(payload);
+    return payload !== null && typeof payload === "object" && !Array.isArray(payload) ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+function isJsonRequestBody(body, contentEncoding, maxOutputLength) {
+  return parseJsonRequestBody(body, contentEncoding, maxOutputLength) !== null;
+}
+
+function compactionTransport(targetUrl, payload, headers) {
+  const pathname = targetUrl.pathname.replace(/\/+$/u, "");
+  const wantsSse = payload?.stream === true || /text\/event-stream/iu.test(String(headerValue(headers, "accept") ?? ""));
+  if (/\/responses\/compact$/iu.test(pathname)) return wantsSse ? "remote_sse" : "remote_unary";
+  return wantsSse ? "sampling_sse" : "remote_unary";
+}
+
+function successfulUnaryJson(body) {
+  try {
+    const value = JSON.parse(body.toString("utf8"));
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (value.error || value.response?.error) return false;
+    return Boolean(value.output || value.compaction || value.response || value.id);
   } catch {
     return false;
   }
@@ -170,7 +203,7 @@ function parseSseFrame(frame) {
 
 function isToolResponseItem(item) {
   const type = typeof item?.type === "string" ? item.type : "";
-  return Boolean(type) && type !== "message" && type !== "reasoning" && type !== "compaction";
+  return Boolean(type) && type !== "message" && type !== "reasoning" && !COMPACTION_CONTROL_TYPES.has(type);
 }
 
 function eventPayloadHasContent(event) {
@@ -180,7 +213,9 @@ function eventPayloadHasContent(event) {
   if (type === "response.output_item.done") {
     const content = event.item?.content;
     if (Array.isArray(content) && content.some((item) => typeof item?.text === "string" && item.text.length > 0)) return true;
-    if (isToolResponseItem(event.item)) return true;
+    if (isToolResponseItem(event.item)) {
+      return ["arguments", "input", "code", "output"].some(key => typeof event.item[key] === "string" && event.item[key].length > 0);
+    }
   }
   if (!type.endsWith(".delta")) return false;
   for (const key of ["delta", "text", "arguments", "input", "code"]) {
@@ -206,6 +241,25 @@ function isToolEvent(event) {
   return /(?:function|custom_tool|local_shell|web_search|file_search|computer|mcp|tool_search|image_generation)_call/iu.test(type);
 }
 
+function isExecutableToolDone(event) {
+  return event?.type === "response.output_item.done" && isToolResponseItem(event.item);
+}
+
+function isIndependentKeepalive(event) {
+  if (!event || typeof event !== "object") return false;
+  const type = typeof event.type === "string" ? event.type : "";
+  return ["response.in_progress", "response.queued", "ping", "keepalive", "keep_alive", "heartbeat", "proxy.keepalive"].includes(type);
+}
+
+function eventHasSubstantiveWork(event) {
+  if (!event || typeof event !== "object") return false;
+  const type = typeof event.type === "string" ? event.type : "";
+  if (type === "response.output_text.delta" && typeof event.delta === "string" && event.delta.length > 0) return true;
+  return type === "response.output_item.done"
+    && Array.isArray(event.item?.content)
+    && event.item.content.some((part) => typeof part?.text === "string" && part.text.length > 0);
+}
+
 function responseFailureDetails(event) {
   const source = event?.response?.error ?? event?.error ?? event;
   const incompleteReason = typeof event?.response?.incomplete_details?.reason === "string" ? event.response.incomplete_details.reason : "";
@@ -216,17 +270,19 @@ function responseFailureDetails(event) {
   const usageLimit = USAGE_LIMIT_CODES.has(code)
     || /you(?:'|’)ve hit your usage limit|codex\/settings\/usage|purchase more credits|quota exceeded/iu.test(message);
   const capacity = CAPACITY_CODES.has(code) || /selected model is at capacity|server overloaded/iu.test(message);
-  const transient = !usageLimit && (capacity || TRANSIENT_CODES.has(code));
+  const permanent = !usageLimit && !capacity
+    && (EXPLICIT_PERMANENT_CODE.test(code) || EXPLICIT_PERMANENT_MESSAGE.test(message));
+  const transient = !usageLimit && !capacity && !permanent;
   return {
     code: code || null,
     message: message.slice(0, 512) || null,
-    category: usageLimit ? "usage_limit" : capacity ? "capacity" : transient ? "transient" : "permanent",
+    category: usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
   };
 }
 
 function responseFailureDetailsFromBody(body) {
   const text = body.toString("utf8").replace(/[\r\n]+/gu, " ").trim();
-  if (!text) return { code: null, message: null, category: "permanent" };
+  if (!text) return { code: null, message: null, category: "transient" };
   try {
     const parsed = JSON.parse(text);
     return responseFailureDetails({ error: parsed?.error ?? parsed?.response?.error ?? parsed });
@@ -239,31 +295,65 @@ function retryableStatus(statusCode) {
   return statusCode === 408 || statusCode === 409 || statusCode === 425 || statusCode === 429 || statusCode >= 500;
 }
 
-function createSseFrameParser(onFrame) {
+function createSseFrameParser(onFrame, options = {}) {
   const decoder = new StringDecoder("utf8");
+  const maximumPendingBytes = options.maximumPendingBytes ?? DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
+  const onError = typeof options.onError === "function" ? options.onError : () => {};
   let pending = "";
+  let failed = false;
+  const fail = (error) => {
+    if (failed) return;
+    failed = true;
+    pending = "";
+    try {
+      onError(error);
+    } catch {
+    }
+  };
+  const deliver = (wire, frame) => {
+    if (failed) return;
+    try {
+      onFrame(wire, frame);
+    } catch (error) {
+      fail(Object.assign(error instanceof Error ? error : new Error("SSE callback failed"), {
+        code: error?.code ?? "SSE_CALLBACK_ERROR",
+      }));
+    }
+  };
   const drain = (ending = false) => {
+    if (failed) return;
     while (true) {
       const match = /\r?\n\r?\n/u.exec(pending);
       if (!match) break;
       const frame = pending.slice(0, match.index);
       const wire = `${frame}${match[0]}`;
       pending = pending.slice(match.index + match[0].length);
-      onFrame(wire, frame);
+      deliver(wire, frame);
+      if (failed) return;
     }
     if (ending && pending) {
       const frame = pending;
       pending = "";
-      onFrame(frame, frame);
+      deliver(frame, frame);
     }
   };
   return {
     push(chunk) {
+      if (failed) return;
       pending += decoder.write(chunk);
+      if (Buffer.byteLength(pending, "utf8") > maximumPendingBytes) {
+        fail(Object.assign(new Error("SSE frame exceeded proxy buffer limit"), { code: "SSE_FRAME_LIMIT" }));
+        return;
+      }
       drain(false);
     },
     end() {
+      if (failed) return;
       pending += decoder.end();
+      if (Buffer.byteLength(pending, "utf8") > maximumPendingBytes) {
+        fail(Object.assign(new Error("SSE frame exceeded proxy buffer limit"), { code: "SSE_FRAME_LIMIT" }));
+        return;
+      }
       drain(true);
     },
   };
@@ -414,7 +504,7 @@ function executeTurnAttempt(options) {
     targetUrl,
     firstProgressTimeoutMs,
     progressIdleTimeoutMs,
-    finalAttempt,
+    compactionAttemptTimeoutMs,
     maxBufferedResponseBytes,
     onEvent,
     requestState,
@@ -428,12 +518,16 @@ function executeTurnAttempt(options) {
     let sawCompleted = false;
     let sawContent = false;
     let sawTool = false;
+    let sawSubstantiveWork = false;
+    let sawExecutableToolDone = false;
+    let sawCompaction = false;
+    let sawHostedTool = false;
+    const toolItemTypes = new Set();
+    const toolNames = new Set();
     let terminalFailure = null;
-    let pendingPrelude = [];
     let heldAfterTool = [];
     let heldBytes = 0;
-    let finalBuffer = [];
-    let finalBytes = 0;
+    let holdingToolDone = false;
     let upstreamHeaders = {};
     let frames = 0;
     let sawResponsesProtocol = false;
@@ -452,7 +546,7 @@ function executeTurnAttempt(options) {
       settled = true;
       clearTimeout(timer);
       requestState.currentAbort = null;
-      resolve({ ...outcome, elapsedMs: Date.now() - startedAt, frames, sawContent, sawTool });
+      resolve({ ...outcome, elapsedMs: Date.now() - startedAt, frames, sawContent, sawSubstantiveWork, sawExecutableToolDone, sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
     };
     const abortWith = (reason) => {
       upstreamResponse?.destroy();
@@ -472,6 +566,9 @@ function executeTurnAttempt(options) {
           frames,
           sawContent,
           sawTool,
+          sawCompaction,
+          toolItemTypes: [...toolItemTypes],
+          toolNames: [...toolNames],
           firstFrameDelayMs: firstFrameAt ? firstFrameAt - startedAt : null,
           msSinceLastFrame: lastFrameAt ? now - lastFrameAt : null,
           msSinceLastProgress: lastProgressAt ? now - lastProgressAt : null,
@@ -488,19 +585,7 @@ function executeTurnAttempt(options) {
       ensureSseHead(downstream, upstreamHeaders);
       downstream.write(wire);
       requestState.downstreamFrames += 1;
-    };
-    const flushPrelude = () => {
-      for (const wire of pendingPrelude) writeWire(wire);
-      pendingPrelude = [];
-    };
-    const bufferFinal = (wire) => {
-      finalBytes += Buffer.byteLength(wire, "utf8");
-      if (finalBytes > maxBufferedResponseBytes) {
-        abortWith("FINAL_ATTEMPT_BUFFER_LIMIT");
-        return false;
-      }
-      finalBuffer.push(wire);
-      return true;
+      requestState.recovery.markDelivered(parseSseFrame(wire).event);
     };
     const holdToolWire = (wire) => {
       heldBytes += Buffer.byteLength(wire, "utf8");
@@ -510,6 +595,24 @@ function executeTurnAttempt(options) {
       }
       heldAfterTool.push(wire);
       return true;
+    };
+    const flushHeldAfterTool = () => {
+      for (const wire of heldAfterTool) writeWire(wire);
+      heldAfterTool = [];
+      heldBytes = 0;
+      holdingToolDone = false;
+    };
+    const completeFromUpstream = (wire) => {
+      if (holdingToolDone) {
+        if (!holdToolWire(wire)) return;
+        flushHeldAfterTool();
+      } else {
+        writeWire(wire);
+      }
+      if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
+      finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
+      upstreamResponse?.destroy();
+      upstream.destroy();
     };
 
     const upstream = client.request(targetUrl, {
@@ -563,41 +666,84 @@ function executeTurnAttempt(options) {
         lastFrameAt = now;
         lastFrameType = type ?? (parsed.doneMarker ? "[DONE]" : null);
         if (isResponsesProtocolType(type ?? "")) sawResponsesProtocol = true;
-        if (eventPayloadHasContent(event)) {
+        requestState.recovery.observe(event);
+        const contextControlFunction = event?.item?.type === "function_call" && CONTEXT_CONTROL_FUNCTION_NAMES.has(event.item.name);
+        if (COMPACTION_CONTROL_TYPES.has(event?.item?.type) && !sawCompaction) {
+          sawCompaction = true;
+          onEvent({ type: "compaction_control_passthrough", itemType: event.item.type, functionName: null, timeoutMs: compactionAttemptTimeoutMs });
+          armTimer(compactionAttemptTimeoutMs, "COMPACTION_CONTROL_TIMEOUT");
+        }
+        if (!sawCompaction && eventPayloadHasContent(event)) {
           sawContent = true;
           lastProgressAt = now;
           lastProgressType = type ?? null;
           armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         }
+        if (eventHasSubstantiveWork(event)) sawSubstantiveWork = true;
         if (isToolEvent(event)) {
           sawTool = true;
           lastToolType = type ?? null;
+          if (event.item?.name && toolNames.size < 16) {
+            const functionName = String(event.item.name).replace(/[^a-zA-Z0-9_.:-]/gu, "_").slice(0,96);
+            if (!toolNames.has(functionName)) {
+              toolNames.add(functionName);
+              onEvent({ type: "tool_call_observed", itemType: event.item.type, functionName, eventType: type, argumentBytes: typeof event.item.arguments === "string" ? Buffer.byteLength(event.item.arguments, "utf8") : null, contextControlFunction });
+            }
+          }
+          if (event.item?.type) {
+            toolItemTypes.add(event.item.type);
+            if (!["function_call", "custom_tool_call", "local_shell_call"].includes(event.item.type)) sawHostedTool = true;
+          } else if (!/^response\.(?:function_call_arguments|custom_tool_call_input|local_shell_call)/u.test(type ?? "")) {
+            sawHostedTool = true;
+          }
         }
         if (type === "response.failed" || type === "response.incomplete" || type === "error") {
           terminalFailure = responseFailureDetails(event);
+          const kind = terminalFailure.category === "usage_limit"
+            ? "usage_limit"
+            : terminalFailure.category === "permanent"
+              ? "permanent_failure"
+              : "retryable_failure";
+          finish({ kind, reason: terminalFailure.code ?? "RESPONSE_FAILED", failure: terminalFailure, upstreamHeaders });
+          upstreamResponse?.destroy();
+          upstream.destroy();
           return;
         }
         if (parsed.doneMarker && !sawCompleted) return;
-        if (type === "response.completed") sawCompleted = true;
-
-        if (finalAttempt) {
-          bufferFinal(wire);
+        if (type === "response.completed") {
+          sawCompleted = true;
+          completeFromUpstream(wire);
           return;
         }
-        if (sawTool) {
-          if (pendingPrelude.length > 0) {
-            for (const prelude of pendingPrelude) holdToolWire(prelude);
-            pendingPrelude = [];
-          }
+
+        if (sawCompaction) {
+          writeWire(wire);
+          return;
+        }
+
+        if (isIndependentKeepalive(event)) {
+          writeWire(holdingToolDone ? sseFrame({ type: "proxy.keepalive" }) : wire);
+          return;
+        }
+        if (holdingToolDone) {
           holdToolWire(wire);
           return;
         }
-        if (!sawContent && type !== "response.completed") {
-          pendingPrelude.push(wire);
+        if (isExecutableToolDone(event)) {
+          sawExecutableToolDone = true;
+          holdingToolDone = true;
+          holdToolWire(wire);
           return;
         }
-        flushPrelude();
         writeWire(wire);
+      }, {
+        maximumPendingBytes: maxBufferedResponseBytes,
+        onError: (error) => {
+          if (settled || requestState.cancelled) return;
+          finish({ kind: "retryable_failure", reason: error.code ?? "SSE_PARSE_ERROR", upstreamHeaders });
+          upstreamResponse?.destroy();
+          upstream.destroy();
+        },
       });
       response.on("data", (chunk) => {
         if (!advertisedResponsesSse && frames === 0 && rawBodyBeforeProtocolBytes <= 1024 * 1024) {
@@ -611,26 +757,15 @@ function executeTurnAttempt(options) {
         if (settled) return;
         if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
         if (sawCompleted) {
-          if (finalAttempt) {
-            ensureSseHead(downstream, upstreamHeaders);
-            downstream.end(finalBuffer.join(""));
-          } else if (sawTool) {
-            ensureSseHead(downstream, upstreamHeaders);
-            downstream.end(heldAfterTool.join(""));
-          } else {
-            flushPrelude();
-            downstream.end();
-          }
+          flushHeldAfterTool();
+          if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
           return finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
         }
-        if (terminalFailure?.category === "usage_limit" && (!sawContent || finalAttempt)) {
+        if (terminalFailure?.category === "usage_limit") {
           return finish({ kind: "usage_limit", reason: "USAGE_LIMIT", failure: terminalFailure, upstreamHeaders });
         }
         if (terminalFailure?.category === "permanent") {
-          if (finalAttempt || (!sawContent && !sawTool)) {
-            return finish({ kind: "permanent_failure", reason: terminalFailure.code ?? "RESPONSE_FAILED", failure: terminalFailure, upstreamHeaders });
-          }
-          return finish({ kind: "retryable_failure", reason: terminalFailure.code ?? "RESPONSE_FAILED_AFTER_CONTENT", failure: terminalFailure, upstreamHeaders });
+          return finish({ kind: "permanent_failure", reason: terminalFailure.code ?? "RESPONSE_FAILED", failure: terminalFailure, upstreamHeaders });
         }
         if (!advertisedResponsesSse && !sawResponsesProtocol && rawBodyBeforeProtocolBytes > 0 && rawBodyBeforeProtocolBytes <= 1024 * 1024) {
           const failure = responseFailureDetailsFromBody(Buffer.concat(rawBodyBeforeProtocol, rawBodyBeforeProtocolBytes));
@@ -728,12 +863,10 @@ function executeBufferedCompactionAttempt(options) {
             body: responseBody,
           });
         }
-        const analysis = analyzeBufferedSse(responseBody);
-        if (analysis.sawCompleted && analysis.compactionItems === 1) {
-          return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
-        }
-        const permanent = analysis.failure?.category === "usage_limit" || analysis.failure?.category === "permanent";
-        if (!analysis.sawResponsesProtocol && !contentType.includes("text/event-stream")) {
+        if (!contentType.includes("text/event-stream")) {
+          if (successfulUnaryJson(responseBody)) {
+            return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
+          }
           const failure = responseFailureDetailsFromBody(responseBody);
           const retryable = retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient";
           return finish({
@@ -746,6 +879,11 @@ function executeBufferedCompactionAttempt(options) {
             body: responseBody,
           });
         }
+        const analysis = analyzeBufferedSse(responseBody);
+        if (analysis.sawCompleted && analysis.compactionItems === 1) {
+          return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
+        }
+        const permanent = analysis.failure?.category === "usage_limit" || analysis.failure?.category === "permanent";
         return finish({
           kind: permanent ? "permanent_failure" : "retryable_failure",
           reason: analysis.failure?.code ?? "COMPACTION_INCOMPLETE",
@@ -771,16 +909,36 @@ export function createCodexModelStreamProxy(options = {}) {
   const host = options.host ?? "127.0.0.1";
   const port = integerOption(options.port, 18435, 0, 65535, "port");
   const upstreamOrigin = new URL(options.upstreamOrigin ?? DEFAULT_UPSTREAM_ORIGIN);
+  if (!["http:", "https:"].includes(upstreamOrigin.protocol)) {
+    throw new Error("upstreamOrigin must use http or https");
+  }
   const firstProgressTimeoutMs = integerOption(options.firstProgressTimeoutMs, DEFAULT_FIRST_PROGRESS_TIMEOUT_MS, 10, 300_000, "firstProgressTimeoutMs");
   const progressIdleTimeoutMs = integerOption(options.progressIdleTimeoutMs, DEFAULT_PROGRESS_IDLE_TIMEOUT_MS, 10, 300_000, "progressIdleTimeoutMs");
   const compactionAttemptTimeoutMs = integerOption(options.compactionAttemptTimeoutMs, DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS, 10_000, 600_000, "compactionAttemptTimeoutMs");
   const maxBufferedRequestBytes = integerOption(options.maxBufferedRequestBytes, DEFAULT_MAX_BUFFERED_REQUEST_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedRequestBytes");
   const maxBufferedResponseBytes = integerOption(options.maxBufferedResponseBytes, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedResponseBytes");
   const maxConsecutiveAttempts = integerOption(options.maxConsecutiveAttempts, DEFAULT_MAX_CONSECUTIVE_ATTEMPTS, 1, 20, "maxConsecutiveAttempts");
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+  if (!Array.isArray(retryDelaysMs) || retryDelaysMs.length === 0 || retryDelaysMs.length > 20
+    || retryDelaysMs.some(delay => !Number.isSafeInteger(delay) || delay < 0 || delay > 60_000)) {
+    throw new Error("retryDelaysMs must contain 1-20 integer delays between 0 and 60000 ms");
+  }
   const attemptStateTtlMs = integerOption(options.attemptStateTtlMs, DEFAULT_ATTEMPT_STATE_TTL_MS, 1_000, 24 * 60 * 60_000, "attemptStateTtlMs");
-  const onEvent = typeof options.onEvent === "function" ? options.onEvent : () => {};
+  const instanceToken = options.instanceToken ?? null;
+  const onEvent = typeof options.onEvent === "function"
+    ? (event) => {
+      try {
+        options.onEvent(event);
+      } catch {
+      }
+    }
+    : () => {};
   const active = new Map();
   const attempts = new Map();
+  const emptyIdleTurns = new Map();
+  const businessProgress = new Map();
+  const sockets = new Set();
+  let draining = false;
   const counters = {
     total: 0,
     guarded: 0,
@@ -788,6 +946,8 @@ export function createCodexModelStreamProxy(options = {}) {
     retrySignals: 0,
     syntheticCompletions: 0,
     completed: 0,
+    actualCompletions: 0,
+    softCompletions: 0,
     failed: 0,
     cancelled: 0,
     compactionInternalRetries: 0,
@@ -796,6 +956,36 @@ export function createCodexModelStreamProxy(options = {}) {
   const pruneAttempts = () => {
     const cutoff = Date.now() - attemptStateTtlMs;
     for (const [key, state] of attempts) if (state.updatedAt < cutoff) attempts.delete(key);
+    for (const [key, state] of emptyIdleTurns) if (state.updatedAt < cutoff) emptyIdleTurns.delete(key);
+    for (const [key, state] of businessProgress) if (state.updatedAt < cutoff) businessProgress.delete(key);
+  };
+  const recordBusinessProgress = (identity) => {
+    const key = attemptKey(identity);
+    if (key) businessProgress.set(key, { updatedAt: Date.now() });
+    resetEmptyIdleTurns(identity);
+  };
+  const hasBusinessProgress = (identity) => {
+    const key = attemptKey(identity);
+    return Boolean(key && businessProgress.has(key));
+  };
+  const resetEmptyIdleTurns = (identity) => {
+    if (identity.threadId) emptyIdleTurns.delete(identity.threadId);
+  };
+  const recordEmptyIdleTurn = (identity) => {
+    if (!identity.threadId || !identity.turnId) return 0;
+    const previous = emptyIdleTurns.get(identity.threadId);
+    const count = previous?.turnId === identity.turnId ? previous.count : (previous?.count ?? 0) + 1;
+    emptyIdleTurns.set(identity.threadId, {
+      count,
+      turnId: identity.turnId,
+      terminalTurnId: count >= 3 ? identity.turnId : previous?.terminalTurnId ?? null,
+      updatedAt: Date.now(),
+    });
+    return count;
+  };
+  const isTerminalEmptyTurn = (identity) => {
+    return Boolean(identity.threadId && identity.turnId
+      && emptyIdleTurns.get(identity.threadId)?.terminalTurnId === identity.turnId);
   };
 
   const server = http.createServer(async (request, response) => {
@@ -804,16 +994,31 @@ export function createCodexModelStreamProxy(options = {}) {
       response.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
       response.end(JSON.stringify({
         ok: true,
+        pid: process.pid,
+        instanceToken,
+        implementationVersion: IMPLEMENTATION_VERSION,
+        draining,
+        contextControlFunctions: [...CONTEXT_CONTROL_FUNCTION_NAMES],
         activeRequests: active.size,
         attemptChains: attempts.size,
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
         maxConsecutiveAttempts,
+        retryDelaysMs: [...retryDelaysMs],
         maxBufferedRequestBytes,
         maxBufferedResponseBytes,
         counters,
       }));
+      return;
+    }
+    if (draining) {
+      response.writeHead(503, {
+        "content-type": "application/json; charset=utf-8",
+        "connection": "close",
+        "cache-control": "no-store",
+      });
+      response.end(JSON.stringify({ error: { type: "proxy_draining", message: "Local model stream proxy is draining existing requests." } }));
       return;
     }
     counters.total += 1;
@@ -821,6 +1026,7 @@ export function createCodexModelStreamProxy(options = {}) {
     const identity = classifyCodexModelRequest(request);
     const requestId = crypto.randomUUID();
     const requestState = { cancelled: false, currentAbort: null, downstreamFrames: 0 };
+    requestState.recovery = createStreamRecovery(requestId);
     active.set(requestId, requestState);
     const threadHash = hashIdentity(identity.threadId);
     const turnHash = hashIdentity(identity.turnId);
@@ -841,6 +1047,28 @@ export function createCodexModelStreamProxy(options = {}) {
       headerState: summarizeRequestHeaders(request.headers),
     });
     const key = attemptKey(identity);
+    const finishSoftTerminal = (notice, eventType, details = {}, headers = {}) => {
+      const canCountEmptyIdle = identity.requestKind === "turn" && Boolean(key);
+      const emptyIdleCount = canCountEmptyIdle && !hasBusinessProgress(identity)
+        ? recordEmptyIdleTurn(identity)
+        : 0;
+      ensureSseHead(response, headers);
+      if (canCountEmptyIdle && emptyIdleCount >= 3) {
+        response.end(requestState.recovery.fail(
+          "proxy_repeated_empty_idle",
+          "Three distinct turns ended without model text or completed tool work. The proxy stopped native retry for this turn.",
+        ));
+        counters.failed += 1;
+        emit({ type: "empty_idle_terminal_failure", emptyIdleCount, ...details });
+        return { hardFailure: true, emptyIdleCount };
+      }
+      response.end(requestState.recovery.finish(notice));
+      counters.syntheticCompletions += 1;
+      counters.softCompletions += 1;
+      emit({ type: eventType, emptyIdleCount, ...details });
+      if (!key) emit({ type: "untracked_identity_soft_terminal", reason: details.reason ?? null });
+      return { hardFailure: false, emptyIdleCount };
+    };
     const finish = () => active.delete(requestId);
     response.once("close", () => {
       if (response.writableEnded) return;
@@ -851,12 +1079,19 @@ export function createCodexModelStreamProxy(options = {}) {
       emit({ type: "downstream_cancelled" });
       finish();
     });
-    const targetUrl = new URL(request.url ?? "/", upstreamOrigin);
-    const declaredLength = Number(headerValue(request.headers, "content-length"));
-    const canBuffer = Number.isSafeInteger(declaredLength) && declaredLength >= 0 && declaredLength <= maxBufferedRequestBytes;
-    if (!identity.guarded || request.method !== "POST" || !canBuffer) {
+    let targetUrl;
+    try {
+      targetUrl = new URL(request.url ?? "/", upstreamOrigin);
+      if (targetUrl.origin !== upstreamOrigin.origin) throw new Error("Model request URL must use the configured upstream origin.");
+    } catch {
+      response.writeHead(400, { "content-type": "application/json", "connection": "close" });
+      response.end(JSON.stringify({ error: { type: "invalid_proxy_url", message: "Invalid model request URL." } }));
+      finish();
+      return;
+    }
+    if (!identity.guarded || request.method !== "POST") {
       counters.passthrough += 1;
-      emit({ type: "passthrough", reason: !identity.guarded ? "request_kind" : "body_not_bufferable" });
+      emit({ type: "passthrough", reason: !identity.guarded ? "request_kind" : "method" });
       forwardPassthrough(request, response, targetUrl, emit);
       response.once("finish", finish);
       return;
@@ -864,7 +1099,8 @@ export function createCodexModelStreamProxy(options = {}) {
 
     try {
       const body = await collectRequestBody(request, maxBufferedRequestBytes);
-      if (!isJsonRequestBody(body, request.headers["content-encoding"], maxBufferedRequestBytes)) {
+      const payload = parseJsonRequestBody(body, request.headers["content-encoding"], maxBufferedRequestBytes);
+      if (!payload) {
         counters.failed += 1;
         response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
         response.end(JSON.stringify({ error: { type: "invalid_proxy_request", message: "Buffered model request was not valid JSON." } }));
@@ -872,43 +1108,68 @@ export function createCodexModelStreamProxy(options = {}) {
         return;
       }
       counters.guarded += 1;
+      const transport = identity.requestKind === "compaction"
+        ? compactionTransport(targetUrl, payload, request.headers)
+        : "sampling_sse";
+      if (identity.requestKind === "turn" && isTerminalEmptyTurn(identity)) {
+        ensureSseHead(response);
+        response.end(requestState.recovery.fail(
+          "proxy_repeated_empty_idle",
+          "Three distinct turns ended without model text or completed tool work. The proxy stopped native retry for this turn.",
+        ));
+        counters.failed += 1;
+        emit({ type: "empty_idle_terminal_replayed" });
+        return;
+      }
 
-      if (identity.requestKind === "compaction") {
-        let outcome = null;
-        for (let internalAttempt = 1; internalAttempt <= 2; internalAttempt += 1) {
-          emit({ type: "compaction_attempt_started", internalAttempt, timeoutMs: compactionAttemptTimeoutMs });
-          outcome = await executeBufferedCompactionAttempt({
-            body,
-            headers: request.headers,
-            method: request.method,
-            targetUrl,
-            timeoutMs: compactionAttemptTimeoutMs,
-            maxBufferedResponseBytes,
-            requestState,
-          });
-          emit({ type: "compaction_attempt_finished", internalAttempt, kind: outcome.kind, reason: outcome.reason ?? null });
-          if (outcome.kind !== "retryable_failure" || internalAttempt === 2) break;
-          counters.compactionInternalRetries += 1;
-        }
+      if (identity.requestKind === "compaction" && transport === "remote_unary") {
+        emit({ type: "compaction_attempt_started", internalAttempt: 1, timeoutMs: compactionAttemptTimeoutMs });
+        const outcome = await executeBufferedCompactionAttempt({
+          body,
+          headers: request.headers,
+          method: request.method,
+          targetUrl,
+          timeoutMs: compactionAttemptTimeoutMs,
+          maxBufferedResponseBytes,
+          requestState,
+        });
+        emit({ type: "compaction_attempt_finished", internalAttempt: 1, kind: outcome.kind, reason: outcome.reason ?? null });
         if (requestState.cancelled || outcome?.kind === "cancelled") return;
-        if (outcome?.kind === "completed" || outcome?.kind === "permanent_failure") {
+        const preserveUpstreamError = outcome?.kind === "permanent_failure"
+          || outcome?.failure?.category === "usage_limit";
+        if (outcome?.kind === "completed" || preserveUpstreamError) {
           writeHeadOnce(response, outcome.statusCode ?? 502, outcome.statusMessage, outcome.headers ?? {});
           response.end(outcome.body ?? Buffer.alloc(0));
-          if (outcome.kind === "completed") counters.completed += 1;
+          if (outcome.kind === "completed") {
+            counters.completed += 1;
+            counters.actualCompletions += 1;
+          }
           else counters.failed += 1;
           return;
         }
-        ensureSseHead(response, outcome?.headers ?? {});
-        response.end();
+        response.writeHead(502, {
+          "content-type": "application/json; charset=utf-8",
+          "cache-control": "no-store",
+          "connection": "close",
+        });
+        response.end(JSON.stringify({
+          error: {
+            type: "upstream_retryable_failure",
+            code: outcome?.reason ?? "COMPACTION_UPSTREAM_FAILURE",
+            message: "The upstream compact request failed before producing a valid JSON result.",
+          },
+        }));
+        counters.failed += 1;
         counters.retrySignals += 1;
-        emit({ type: "compaction_retry_signal", reason: outcome?.reason ?? "UNKNOWN" });
+        emit({ type: "compaction_retryable_http_failure", reason: outcome?.reason ?? "UNKNOWN" });
         return;
       }
 
       const prior = key ? attempts.get(key) : null;
-      const attemptNumber = (prior?.failures ?? 0) + 1;
-      const finalAttempt = attemptNumber >= maxConsecutiveAttempts;
-      emit({ type: "turn_attempt_started", attemptNumber, maxConsecutiveAttempts, finalAttempt, firstProgressTimeoutMs, progressIdleTimeoutMs });
+      const chainStartedAt = prior?.startedAt ?? Date.now();
+      const attemptNumber = key ? (prior?.failures ?? 0) + 1 : null;
+      const finalAttempt = Boolean(key && attemptNumber >= maxConsecutiveAttempts);
+      emit({ type: "turn_attempt_started", attemptNumber, maxConsecutiveAttempts, finalAttempt, untrackedIdentity: !key, firstProgressTimeoutMs, progressIdleTimeoutMs });
       const outcome = await executeTurnAttempt({
         body,
         downstream: response,
@@ -917,6 +1178,7 @@ export function createCodexModelStreamProxy(options = {}) {
         targetUrl,
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
+        compactionAttemptTimeoutMs,
         finalAttempt,
         maxBufferedResponseBytes,
         onEvent: emit,
@@ -930,7 +1192,12 @@ export function createCodexModelStreamProxy(options = {}) {
         elapsedMs: outcome.elapsedMs,
         frames: outcome.frames,
         sawContent: outcome.sawContent,
+        sawSubstantiveWork: outcome.sawSubstantiveWork,
+        sawExecutableToolDone: outcome.sawExecutableToolDone,
         sawTool: outcome.sawTool,
+        sawCompaction: outcome.sawCompaction,
+        sawHostedTool: outcome.sawHostedTool,
+        toolItemTypes: outcome.toolItemTypes,
       });
       if (requestState.cancelled || outcome.kind === "cancelled") {
         if (key) attempts.delete(key);
@@ -938,65 +1205,85 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       if (outcome.kind === "completed") {
         if (key) attempts.delete(key);
+        if (outcome.sawSubstantiveWork || outcome.sawExecutableToolDone) recordBusinessProgress(identity);
         counters.completed += 1;
+        counters.actualCompletions += 1;
+        return;
+      }
+      if (outcome.sawSubstantiveWork) recordBusinessProgress(identity);
+      if (identity.requestKind === "compaction" || outcome.sawCompaction) {
+        const terminalCompactionFailure = !key || finalAttempt
+          || outcome.kind === "permanent_failure"
+          || outcome.kind === "usage_limit";
+        if (terminalCompactionFailure) {
+          ensureSseHead(response, outcome.upstreamHeaders);
+          response.end(requestState.recovery.fail(
+            "proxy_compaction_failed",
+            "The compaction stream failed before a valid upstream completion.",
+          ));
+          if (key) attempts.delete(key);
+          counters.failed += 1;
+          emit({ type: "compaction_stream_terminal_failure", reason: outcome.reason, untrackedIdentity: !key });
+          return;
+        }
+        attempts.set(key, { failures: attemptNumber, startedAt: chainStartedAt, updatedAt: Date.now() });
+        ensureSseHead(response, outcome.upstreamHeaders ?? {});
+        response.end();
+        counters.retrySignals += 1;
+        emit({ type: "compaction_retry_signal", reason: outcome.reason ?? "UNKNOWN" });
+        return;
+      }
+      if (!key) {
+        const notice = outcome.kind === "usage_limit"
+          ? USAGE_LIMIT_NOTICE
+          : outcome.kind === "permanent_failure"
+            ? PERMANENT_FAILURE_NOTICE
+            : NETWORK_EXHAUSTED_NOTICE;
+        finishSoftTerminal(notice, "untracked_identity_soft_terminal", {
+          reason: outcome.reason,
+          category: outcome.failure?.category ?? "network",
+        }, outcome.upstreamHeaders);
         return;
       }
       if (outcome.kind === "permanent_failure") {
-        if (key) attempts.delete(key);
-        sendSyntheticCompletion(response, requestId, PERMANENT_FAILURE_NOTICE, outcome.upstreamHeaders);
-        counters.syntheticCompletions += 1;
-        counters.completed += 1;
-        emit({ type: "permanent_failure_completed_idle", code: outcome.failure?.code ?? null });
+        attempts.delete(key);
+        finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "permanent_failure_completed_idle", {
+          code: outcome.failure?.code ?? null,
+          reason: outcome.reason,
+        }, outcome.upstreamHeaders);
         return;
       }
       if (outcome.kind === "usage_limit") {
-        if (key) attempts.delete(key);
-        sendSyntheticCompletion(response, requestId, USAGE_LIMIT_NOTICE, outcome.upstreamHeaders);
-        counters.syntheticCompletions += 1;
-        counters.completed += 1;
-        emit({ type: "usage_limit_completed_idle" });
+        attempts.delete(key);
+        finishSoftTerminal(USAGE_LIMIT_NOTICE, "usage_limit_completed_idle", {
+          reason: outcome.reason,
+        }, outcome.upstreamHeaders);
         return;
       }
-
-      if (outcome.sawContent || outcome.sawTool || requestState.downstreamFrames > 0) {
-        if (key) attempts.delete(key);
-        if (requestState.downstreamFrames === 0 && !response.headersSent && !response.destroyed && !response.writableEnded) {
-          sendSyntheticCompletion(response, requestId, INTERRUPTED_AFTER_PROGRESS_NOTICE, outcome.upstreamHeaders);
-          counters.syntheticCompletions += 1;
-          counters.completed += 1;
-          emit({
-            type: "retry_suppressed_completed_idle",
-            reason: outcome.reason,
-            sawContent: outcome.sawContent,
-            sawTool: outcome.sawTool,
-          });
-        } else {
-          if (!response.destroyed && !response.writableEnded) {
-            response.destroy(Object.assign(new Error(outcome.reason ?? "STREAM_FAILED_AFTER_PROGRESS"), {
-              code: outcome.reason ?? "STREAM_FAILED_AFTER_PROGRESS",
-            }));
-          }
-          counters.failed += 1;
-          emit({
-            type: "retry_suppressed_after_progress",
-            reason: outcome.reason,
-            sawContent: outcome.sawContent,
-            sawTool: outcome.sawTool,
-            downstreamFrames: requestState.downstreamFrames,
-          });
-        }
-        return;
-      }
-
-      if (key) attempts.set(key, { failures: attemptNumber, updatedAt: Date.now() });
+      attempts.set(key, { failures: attemptNumber, startedAt: chainStartedAt, updatedAt: Date.now() });
       if (finalAttempt) {
         const notice = outcome.failure?.category === "capacity" ? CAPACITY_EXHAUSTED_NOTICE : NETWORK_EXHAUSTED_NOTICE;
-        sendSyntheticCompletion(response, requestId, notice, outcome.upstreamHeaders);
-        if (key) attempts.delete(key);
-        counters.syntheticCompletions += 1;
-        counters.completed += 1;
-        emit({ type: "retry_exhausted_completed_idle", attemptNumber, category: outcome.failure?.category ?? "network" });
+        attempts.delete(key);
+        finishSoftTerminal(notice, "retry_exhausted_completed_idle", {
+          attemptNumber,
+          category: outcome.failure?.category ?? "network",
+          reason: outcome.reason,
+        }, outcome.upstreamHeaders);
         return;
+      }
+      const rapidDelayMs = attemptNumber === 5 && maxConsecutiveAttempts >= 6
+        ? Math.max(0, firstProgressTimeoutMs - (Date.now() - chainStartedAt))
+        : 0;
+      if (rapidDelayMs > 0) {
+        emit({ type: "rapid_retry_wait_started", attemptNumber, delayMs: rapidDelayMs, reason: outcome.reason });
+        if (!await waitForRetry(rapidDelayMs, requestState, {
+          onKeepalive: () => {
+            if (!response.destroyed && !response.writableEnded) {
+              ensureSseHead(response, outcome.upstreamHeaders ?? {});
+              response.write(sseFrame({ type: "proxy.keepalive" }));
+            }
+          },
+        })) return;
       }
       ensureSseHead(response, outcome.upstreamHeaders ?? {});
       response.end();
@@ -1005,19 +1292,43 @@ export function createCodexModelStreamProxy(options = {}) {
     } catch (error) {
       counters.failed += 1;
       emit({ type: "guarded_request_error", code: error.code ?? "UNEXPECTED_ERROR", message: error.message });
+      if (error.code === "BODY_LIMIT_EXCEEDED") {
+        response.writeHead(413, { "content-type": "application/json; charset=utf-8", "connection": "close" });
+        response.end(JSON.stringify({ error: { type: "request_too_large", message: "Model request exceeded proxy buffer limit." } }));
+        return;
+      }
       if (!response.destroyed) {
-        const priorFailures = key ? (attempts.get(key)?.failures ?? 0) : 0;
-        const nextFailure = priorFailures + 1;
-        const canCompleteIdle = identity.requestKind === "turn" && requestState.downstreamFrames === 0
-          && (!key || nextFailure >= maxConsecutiveAttempts);
-        if (canCompleteIdle) {
-          sendSyntheticCompletion(response, requestId, PERMANENT_FAILURE_NOTICE);
-          if (key) attempts.delete(key);
-          counters.syntheticCompletions += 1;
-          counters.completed += 1;
-          emit({ type: "guarded_error_completed_idle", attemptNumber: nextFailure });
+        const prior = key ? attempts.get(key) : null;
+        const nextFailure = key ? (prior?.failures ?? 0) + 1 : null;
+        const chainStartedAt = prior?.startedAt ?? Date.now();
+        if (identity.requestKind === "compaction") {
+          const terminalCompactionFailure = !key || nextFailure >= maxConsecutiveAttempts;
+          ensureSseHead(response);
+          if (terminalCompactionFailure) {
+            response.end(requestState.recovery.fail("proxy_compaction_failed", "The compaction request could not be forwarded."));
+            if (key) attempts.delete(key);
+            counters.failed += 1;
+          } else {
+            attempts.set(key, { failures: nextFailure, startedAt: chainStartedAt, updatedAt: Date.now() });
+            response.end();
+            counters.retrySignals += 1;
+          }
+          return;
+        }
+        if (!key) {
+          finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "untracked_identity_soft_terminal", {
+            reason: error.code ?? "UNEXPECTED_ERROR",
+          });
+          return;
+        }
+        if (nextFailure >= maxConsecutiveAttempts) {
+          attempts.delete(key);
+          finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "guarded_error_completed_idle", {
+            attemptNumber: nextFailure,
+            reason: error.code ?? "UNEXPECTED_ERROR",
+          });
         } else {
-          if (key) attempts.set(key, { failures: nextFailure, updatedAt: Date.now() });
+          attempts.set(key, { failures: nextFailure, startedAt: chainStartedAt, updatedAt: Date.now() });
           ensureSseHead(response);
           response.end();
           counters.retrySignals += 1;
@@ -1031,6 +1342,10 @@ export function createCodexModelStreamProxy(options = {}) {
   server.requestTimeout = 0;
   server.headersTimeout = 30_000;
   server.keepAliveTimeout = 5_000;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+  });
 
   return {
     async start() {
@@ -1045,17 +1360,30 @@ export function createCodexModelStreamProxy(options = {}) {
       return this.status();
     },
     async stop() {
+      draining = true;
       for (const state of active.values()) {
         state.cancelled = true;
         state.currentAbort?.();
       }
       if (!server.listening) return;
-      await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      for (const socket of sockets) socket.destroy();
+      server.closeAllConnections?.();
+      await closed;
+    },
+    beginDrain() {
+      draining = true;
+      return this.status();
     },
     status() {
       const address = server.address();
       return {
         running: server.listening,
+        pid: process.pid,
+        instanceToken,
+        implementationVersion: IMPLEMENTATION_VERSION,
+        draining,
+        contextControlFunctions: [...CONTEXT_CONTROL_FUNCTION_NAMES],
         host,
         port: typeof address === "object" && address ? address.port : port,
         upstreamOrigin: upstreamOrigin.origin,
@@ -1065,6 +1393,7 @@ export function createCodexModelStreamProxy(options = {}) {
         progressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
         maxConsecutiveAttempts,
+        retryDelaysMs: [...retryDelaysMs],
         maxBufferedRequestBytes,
         maxBufferedResponseBytes,
         counters: { ...counters },

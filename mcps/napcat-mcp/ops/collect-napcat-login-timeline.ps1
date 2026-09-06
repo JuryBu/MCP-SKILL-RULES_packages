@@ -163,7 +163,7 @@ $Attempts = @($Events.ToArray() |
 $Processes = @(Get-CimInstance Win32_Process |
   Where-Object {
     $_.Name -match '^(QQ|node|cmd|NapCatWinBootMain)\.exe$' -and
-    ($_.CommandLine -match 'NapCat|3406694168|QQNT|Tencent')
+    ($_.CommandLine -match 'NapCat|QQNT|Tencent')
   } |
   ForEach-Object {
     [pscustomobject]@{

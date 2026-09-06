@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [string]$DataRoot = "",
-  [ValidateRange(1, 30)][int]$TimeoutSeconds = 10,
+  [ValidateRange(1, 120)][int]$TimeoutSeconds = 60,
   [switch]$Force
 )
 
@@ -52,7 +52,11 @@ while ((Get-Date) -lt $Deadline -and $null -ne (Get-Process -Id ([int]$Runtime.p
 }
 $Remaining = Get-Process -Id ([int]$Runtime.pid) -ErrorAction SilentlyContinue
 if ($null -ne $Remaining -and $Force) {
+  if (-not (Test-ExpectedModelStreamProxyProcess -ProcessId ([int]$Runtime.pid))) {
+    throw "Refusing to stop PID $([int]$Runtime.pid): process identity changed while draining."
+  }
   Stop-Process -Id ([int]$Runtime.pid) -Force
+  $Remaining.WaitForExit(3000) | Out-Null
   $Remaining = Get-Process -Id ([int]$Runtime.pid) -ErrorAction SilentlyContinue
 }
 if ($null -ne $Remaining) { throw "Model stream proxy did not stop within $TimeoutSeconds seconds." }

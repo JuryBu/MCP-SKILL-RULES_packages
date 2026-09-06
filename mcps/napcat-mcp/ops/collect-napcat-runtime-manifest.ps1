@@ -176,7 +176,7 @@ $LogCounters = [ordered]@{
 $Processes = @(Get-CimInstance Win32_Process |
   Where-Object {
     $_.Name -match '^(QQ|node|cmd|NapCatWinBootMain)\.exe$' -and
-    ($_.CommandLine -match 'NapCat|QQNT|Tencent|3406694168|1559404764' -or $_.ExecutablePath -match 'NapCat|QQNT|Tencent')
+    ($_.CommandLine -match 'NapCat|QQNT|Tencent' -or $_.ExecutablePath -match 'NapCat|QQNT|Tencent')
   } |
   ForEach-Object {
     [pscustomobject]@{
