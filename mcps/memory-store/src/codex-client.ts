@@ -5,6 +5,14 @@ import os from "os";
 import path from "path";
 import { StringDecoder } from "string_decoder";
 import { promisify } from "util";
+import {
+    assertCodexHistorySource,
+    parseCodexRolloutFilename,
+    normalizeCodexHistoryPath,
+    resolveCodexHistorySource,
+    resolveCodexHistorySourceAsync,
+    type CodexHistorySource,
+} from "./codex-history-source.js";
 import { getRoundSubagentSummaries, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
@@ -69,6 +77,7 @@ export interface CodexSubagentSummary {
 
 export interface CodexConversationData {
     thread: CodexThreadInfo;
+    historySource?: CodexHistorySource;
     parentThread?: CodexThreadInfo | null;
     rounds: ConversationRound[];
     totalSteps: number;
@@ -155,7 +164,7 @@ const CODEX_AGENTS_HEADER_LEGACY = "# AGENTS.md instructions for ";
 const CODEX_RECOMMENDED_PLUGINS_OPEN = "<recommended_plugins>";
 const CODEX_RECOMMENDED_PLUGINS_CLOSE = "</recommended_plugins>";
 const CODEX_AGENTS_FOLDED_MARKER = "[Codex AGENTS/RULES 注入已折叠";
-const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu;
+const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/iu;
 const execFileAsync = promisify(execFile);
 
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -695,7 +704,7 @@ function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
             if (!id.startsWith(normalized)) continue;
             const thread = threadFromRolloutPath(fullPath);
             if (thread) matches.push(thread);
-            if (id === normalized || matches.length >= 2) return true;
+            if (matches.length >= 2) return true;
         }
         return false;
     };
@@ -730,7 +739,7 @@ async function findRolloutThreadByIdLookupAsync(query: string): Promise<CodexThr
                     if (id.startsWith(normalized)) {
                         const thread = await threadFromRolloutPathAsync(fullPath);
                         if (thread) matches.push(thread);
-                        if (id === normalized || matches.length >= 2) return true;
+                        if (matches.length >= 2) return true;
                     }
                 }
             }
@@ -1387,18 +1396,21 @@ function makeSkippedRolloutLineEvent(reason: string, chars: number): any {
     };
 }
 
-export function readRolloutEvents(rolloutPath: string): any[] {
+export function readRolloutEvents(rolloutPath: string, options: { endByte?: number; onEvent?: (event: any) => void } = {}): any[] {
     if (!fs.existsSync(rolloutPath)) return [];
     const events: any[] = [];
+    const addEvent = options.onEvent || ((event: any) => events.push(event));
 
     const processLine = (line: string) => {
         const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
         if (!trimmed.trim()) return;
+        let event: any;
         try {
-            events.push(sanitizeCodexEvent(JSON.parse(trimmed)));
+            event = sanitizeCodexEvent(JSON.parse(trimmed));
         } catch {
-            // skip malformed lines
+            return;
         }
+        addEvent(event);
     };
 
     const fd = fs.openSync(rolloutPath, "r");
@@ -1407,10 +1419,12 @@ export function readRolloutEvents(rolloutPath: string): any[] {
     let pending = "";
     let skippingOversizedLine = false;
     let skippedChars = 0;
+    let bytesRemaining = options.endByte ?? Infinity;
     try {
-        while (true) {
-            const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+        while (bytesRemaining > 0) {
+            const bytesRead = fs.readSync(fd, buffer, 0, Math.min(buffer.length, bytesRemaining), null);
             if (bytesRead === 0) break;
+            bytesRemaining -= bytesRead;
             let chunk = decoder.write(buffer.subarray(0, bytesRead));
 
             if (skippingOversizedLine) {
@@ -1420,7 +1434,7 @@ export function readRolloutEvents(rolloutPath: string): any[] {
                     continue;
                 }
                 skippedChars += newlineIndex;
-                events.push(makeSkippedRolloutLineEvent("Codex rollout 单行超过安全上限", skippedChars));
+                addEvent(makeSkippedRolloutLineEvent("Codex rollout 单行超过安全上限", skippedChars));
                 chunk = chunk.slice(newlineIndex + 1);
                 skippingOversizedLine = false;
                 skippedChars = 0;
@@ -1445,7 +1459,7 @@ export function readRolloutEvents(rolloutPath: string): any[] {
         if (tail) pending += tail;
         if (skippingOversizedLine) {
             skippedChars += pending.length;
-            events.push(makeSkippedRolloutLineEvent("Codex rollout 尾部单行超过安全上限", skippedChars));
+            addEvent(makeSkippedRolloutLineEvent("Codex rollout 尾部单行超过安全上限", skippedChars));
         } else {
             processLine(pending);
         }
@@ -3123,6 +3137,74 @@ function buildCodexRoundsFromEvents(events: any[], link: ConversationLinkMode, o
     return collector.finish();
 }
 
+async function forEachCodexHistoryEventAsync(
+    source: CodexHistorySource,
+    onEvent: (event: any, sourceByte?: number) => void,
+    isCancelled?: () => boolean,
+): Promise<void> {
+    assertCodexHistorySource(source);
+    let ordinal = 0;
+    for (const [segmentIndex, segment] of source.segments.entries()) {
+        if (segment.startOrdinal !== ordinal) throw new Error("Codex history prefix ordinal mismatch");
+        const isLeaf = segmentIndex === source.segments.length - 1;
+        await forEachCodexJsonlLineAsync(segment.path, (line, sourceByte) => {
+            ordinal += 1;
+            let event: any;
+            try {
+                event = sanitizeCodexEvent(JSON.parse(line));
+            } catch {
+                throw new Error(`Codex history contains invalid JSON at ordinal ${ordinal - 1}`);
+            }
+            onEvent(event, isLeaf ? sourceByte : undefined);
+        }, {
+            endByte: segment.endByte,
+            isCancelled,
+            onOversizedLine: () => {
+                throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+            },
+        });
+        if (segment.endOrdinalExclusive !== undefined && segment.endOrdinalExclusive !== ordinal) {
+            throw new Error("Codex history prefix byte and ordinal boundaries disagree");
+        }
+    }
+    assertCodexHistorySource(source);
+}
+
+function buildCodexRoundsFromHistory(
+    source: CodexHistorySource,
+    link: ConversationLinkMode,
+    options: { cwd?: string } = {},
+): CodexRoundBuildResult {
+    assertCodexHistorySource(source);
+    const collector = new CodexRoundEventCollector(link, options);
+    let ordinal = 0;
+    for (const segment of source.segments) {
+        if (segment.startOrdinal !== ordinal) throw new Error("Codex history prefix ordinal mismatch");
+        readRolloutEvents(segment.path, {
+            endByte: segment.endByte,
+            onEvent: event => {
+                ordinal += 1;
+                collector.addEvent(event);
+            },
+        });
+        if (segment.endOrdinalExclusive !== undefined && segment.endOrdinalExclusive !== ordinal) {
+            throw new Error("Codex history prefix byte and ordinal boundaries disagree");
+        }
+    }
+    assertCodexHistorySource(source);
+    return collector.finish();
+}
+
+export async function buildCodexRoundsFromHistoryAsync(
+    source: CodexHistorySource,
+    link: ConversationLinkMode,
+    options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean; isCancelled?: () => boolean } = {},
+): Promise<CodexRoundBuildResult> {
+    const collector = new CodexRoundEventCollector(link, options);
+    await forEachCodexHistoryEventAsync(source, (event, sourceByte) => collector.addEvent(event, sourceByte), options.isCancelled);
+    return collector.finish();
+}
+
 async function buildCodexRoundsFromRolloutAsync(
     rolloutPath: string,
     link: ConversationLinkMode,
@@ -3429,8 +3511,8 @@ export function loadCodexConversation(
     if (!thread || !thread.rolloutPath) return null;
     const parentThread = getCodexParentThread(thread.id);
 
-    const events = readRolloutEvents(thread.rolloutPath);
-    const built = buildCodexRoundsForTest(events, link, { cwd: thread.cwd });
+    const historySource = resolveCodexHistorySource(thread.rolloutPath);
+    const built = buildCodexRoundsFromHistory(historySource, link, { cwd: thread.cwd });
     const edgeChildren = readSpawnChildren(thread.id);
     for (const child of edgeChildren) {
         if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
@@ -3480,7 +3562,8 @@ export function loadCodexConversation(
         thread,
         parentThread,
         rounds: built.rounds,
-        totalSteps: events.length,
+        totalSteps: built.totalSteps,
+        historySource,
         childThreads: built.childThreads,
         expandedChildren,
         childDiagnostics,
@@ -3494,12 +3577,20 @@ export async function loadCodexConversationAsync(
 ): Promise<CodexConversationData | null> {
     const thread = await getCodexThreadAsync(conversationId);
     if (!thread || !thread.rolloutPath) return null;
+    const historySource = await resolveCodexHistorySourceAsync(thread.rolloutPath);
     const [parentThread, built, edgeChildren] = await Promise.all([
         getCodexParentThreadAsync(thread.id),
-        buildCodexRoundsFromRolloutAsync(thread.rolloutPath, link, { cwd: thread.cwd }),
+        buildCodexRoundsFromHistoryAsync(historySource, link, { cwd: thread.cwd }),
         readSpawnChildrenAsync(thread.id),
     ]);
-    const sourceCheckpoint = await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built);
+    const sourceCheckpoint = built.sourceCheckpoints.some(item => item.kind === "round_start")
+        ? await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built, {
+            ...captureCodexSourceVersion(thread.rolloutPath),
+            sourceSize: historySource.segments.at(-1)!.endByte,
+            sourceMtimeMs: historySource.segments.at(-1)!.mtimeMs,
+            historySource,
+        })
+        : undefined;
     for (const child of edgeChildren) {
         if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
             built.childThreads.push(child);
@@ -3555,6 +3646,7 @@ export async function loadCodexConversationAsync(
         childDiagnostics,
         sourceCheckpoints: built.sourceCheckpoints,
         sourceCheckpoint,
+        historySource,
     };
 }
 
@@ -3577,11 +3669,12 @@ export async function loadCodexConversationToRoundSinkAsync(
     const thread = await getCodexThreadAsync(conversationId);
     if (!thread || !thread.rolloutPath) return null;
     await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "before read");
+    const historySource = control.expectedSource?.historySource
+        || await resolveCodexHistorySourceAsync(thread.rolloutPath, { endByte: control.expectedSource?.sourceSize });
     const [parentThread, built, edgeChildren] = await Promise.all([
         getCodexParentThreadAsync(thread.id),
-        buildCodexRoundsFromRolloutAsync(thread.rolloutPath, link, {
+        buildCodexRoundsFromHistoryAsync(historySource, link, {
             cwd: thread.cwd,
-            endByte: control.expectedSource?.sourceSize,
             onRound,
             retainRounds: false,
             isCancelled: control.isCancelled,
@@ -3590,7 +3683,14 @@ export async function loadCodexConversationToRoundSinkAsync(
     ]);
     throwIfCancelled();
     await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "after read");
-    const sourceCheckpoint = await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built, control.expectedSource);
+    const sourceCheckpoint = built.sourceCheckpoints.some(item => item.kind === "round_start")
+        ? await codexRoundTailCheckpointFromBuild(thread.rolloutPath, built, control.expectedSource || {
+            ...captureCodexSourceVersion(thread.rolloutPath),
+            sourceSize: historySource.segments.at(-1)!.endByte,
+            sourceMtimeMs: historySource.segments.at(-1)!.mtimeMs,
+            historySource,
+        })
+        : undefined;
     await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "after checkpoint");
     for (const child of edgeChildren) {
         if (!built.childThreads.find((existing) => existing.threadId === child.threadId)) {
@@ -3607,6 +3707,7 @@ export async function loadCodexConversationToRoundSinkAsync(
         childDiagnostics: [],
         sourceCheckpoints: built.sourceCheckpoints,
         sourceCheckpoint,
+        historySource,
     };
 }
 
@@ -3616,10 +3717,11 @@ export interface CodexSourceVersionExpectation {
     sourceMtimeMs: number;
     anchorStartByte: number;
     anchorSha256: string;
+    historySource?: CodexHistorySource;
 }
 
 function canonicalCodexSourcePath(filePath: string): string {
-    const resolved = path.resolve(filePath);
+    const resolved = normalizeCodexHistoryPath(filePath);
     return process.platform === "win32" ? resolved.toLowerCase() : resolved;
 }
 
@@ -3632,16 +3734,19 @@ export async function assertCodexSourceVersion(
 }
 
 export function captureCodexSourceVersion(filePath: string): CodexSourceVersionExpectation {
-    const sourcePath = path.resolve(filePath);
+    const sourcePath = normalizeCodexHistoryPath(filePath);
     const stat = fs.statSync(sourcePath);
     if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
-    const anchor = codexCheckpointAnchorSync(sourcePath, stat.size);
+    const historySource = parseCodexRolloutFilename(sourcePath) ? resolveCodexHistorySource(sourcePath) : undefined;
+    const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
+    const anchor = codexCheckpointAnchorSync(sourcePath, sourceSize);
     return {
         sourcePath,
-        sourceSize: stat.size,
+        sourceSize,
         sourceMtimeMs: Math.trunc(stat.mtimeMs),
         anchorStartByte: anchor.anchorStartByte,
         anchorSha256: anchor.anchorSha256,
+        historySource,
     };
 }
 
@@ -3651,6 +3756,7 @@ export function assertCodexSourceVersionSync(
     stage: string,
 ): void {
     if (!expected) return;
+    if (expected.historySource) assertCodexHistorySource(expected.historySource);
     const actualPath = canonicalCodexSourcePath(rolloutPath);
     const expectedPath = canonicalCodexSourcePath(expected.sourcePath);
     let stat: fs.Stats;
@@ -4476,7 +4582,7 @@ function codexEvidenceRolloutId(filePath: string, sessionMeta: Record<string, un
     return path.basename(filePath).match(CODEX_ROLLOUT_ID_RE)?.[1] || null;
 }
 
-async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvidenceRollout> {
+async function readCodexEvidenceRollout(rolloutPath: string, roots?: string[]): Promise<CodexEvidenceRollout> {
     const errors: SourceEvidenceIssue[] = [];
     const projector = new CodexEvidenceRoundProjector();
     const collector = new CodexRoundEventCollector("reference", {
@@ -4510,35 +4616,38 @@ async function readCodexEvidenceRollout(rolloutPath: string): Promise<CodexEvide
     }
     let lineNumber = 0;
     try {
-        await forEachCodexJsonlLineAsync(
-            rolloutPath,
-            (line) => {
+        const historySource = await resolveCodexHistorySourceAsync(rolloutPath, { roots });
+        byteLength = historySource.totalBytes;
+        const leaf = historySource.segments.at(-1)!;
+        if (leaf.endByte < leaf.size) {
+            errors.push(codexEvidenceIssue("parse_error", "Codex rollout 尾部存在未完成或无效 JSONL，完整来源证据不可发布"));
+        }
+        await forEachCodexHistoryEventAsync(
+            historySource,
+            (event, sourceByte) => {
                 lineNumber += 1;
                 try {
-                    const event = JSON.parse(line) as unknown;
                     const eventFields = event && typeof event === "object" && !Array.isArray(event)
                         ? event as Record<string, unknown>
                         : {};
-                    if (!sawSessionMeta && eventFields.type === "session_meta") {
+                    if (sourceByte !== undefined && !sawSessionMeta && eventFields.type === "session_meta") {
                         sawSessionMeta = true;
                         const payload = eventFields.payload;
                         sessionMeta = payload && typeof payload === "object" && !Array.isArray(payload)
                             ? payload as Record<string, unknown>
                             : null;
                     }
-                    collector.addEvent(sanitizeCodexEvent(event));
+                    collector.addEvent(event);
                 } catch {
                     errors.push(codexEvidenceIssue("parse_error", `Codex rollout 第 ${lineNumber} 个非空 JSONL 行无法解析`));
                 }
             },
-            {
-                onOversizedLine: () => {
-                    errors.push(codexEvidenceIssue("limit_reached", "Codex rollout 存在超过安全上限的 JSONL 行"));
-                },
-            },
         );
     } catch (error) {
-        errors.push(codexEvidenceIoIssue(error, "Codex rollout 文件"));
+        const detail = error instanceof Error ? error.message : String(error);
+        errors.push(/invalid JSON|Invalid first JSONL|safe read limit/iu.test(detail)
+            ? codexEvidenceIssue("parse_error", detail)
+            : codexEvidenceIoIssue(error, "Codex rollout 文件"));
     }
     try {
         const after = await fs.promises.stat(rolloutPath);
@@ -4664,7 +4773,7 @@ async function scanCodexSourceEvidence(options: CodexSourceEvidenceOptions): Pro
     const rolloutsByPath = new Map<string, CodexEvidenceRollout>();
     const rolloutsByConversationId = new Map<string, CodexEvidenceRollout>();
     for (const rolloutPath of selectedPaths) {
-        const rollout = await readCodexEvidenceRollout(rolloutPath);
+        const rollout = await readCodexEvidenceRollout(rolloutPath, allowedRolloutRoots.map(root => root.configuredPath));
         rolloutsByPath.set(path.resolve(rolloutPath), rollout);
         if (rollout.conversationId) rolloutsByConversationId.set(rollout.conversationId, rollout);
         issues.push(...rollout.errors);
@@ -4831,7 +4940,7 @@ export async function readCodexFullSourceEvidence(options: CodexSourceEvidenceOp
     if (context.exactFetchResult !== "present" || !context.exact.thread) {
         return { evidence: exactFetch, thread: context.exact.thread, parentThread: context.exact.parentThread };
     }
-    const rollout = await readCodexEvidenceRollout(context.exact.thread.rolloutPath);
+    const rollout = await readCodexEvidenceRollout(context.exact.thread.rolloutPath, context.scan.rolloutRoots);
     const fullErrors = dedupeCodexEvidenceIssues([...context.exact.errors, ...rollout.errors]);
     const fullRevision = rollout.contentCursor || codexEvidenceSha256({
         conversationId: options.conversationId,

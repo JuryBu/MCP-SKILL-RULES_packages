@@ -45,6 +45,7 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
             sourceMtimeMs: payload.sourceMtimeMs,
             anchorStartByte: payload.anchorStartByte,
             anchorSha256: payload.anchorSha256,
+            historySource: payload.historySource,
         },
     });
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");

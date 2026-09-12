@@ -1,16 +1,21 @@
-# Package Manifest（2026-08-19）
+# Package Manifest（2026-09-12）
 
 ## Included
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.23.10, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0 |
+| MCP | memory-store 1.24.0, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 18 license-reviewed portable user skills plus manifest |
 | Setup | PowerShell build, broker, config, validation, and packaging scripts |
 | Templates | Four host configs and receiver-private environment example |
 | Tests | HTTP smoke helper, local pages, memory workspace, expected results |
+
+## 2026-09-12 Memory Store update
+
+- Memory Store 1.24.0 follows Codex `history_base` references using physical rollout identifiers and bounded inherited prefixes. The complete source manifest participates in cache invalidation and background fetch snapshots, including same-thread rollout replacement.
+- Only Memory Store and its package metadata are updated by this change; receiver-private configuration, raw history, and persistent data remain outside the package.
 
 ## 2026-08-05 Changes
 

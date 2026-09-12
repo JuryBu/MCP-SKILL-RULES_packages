@@ -58,14 +58,14 @@ assert.equal(fallbackThread.titleSource, "sqlite");
 
 function agentsRulesText(marker: string): string {
     return [
-        "# AGENTS.md instructions for C:\\Users\\Stardust\\.gemini\\antigravity",
+        "# AGENTS.md instructions for C:\\Users\\Example\\.gemini\\antigravity",
         "",
         "<INSTRUCTIONS>",
         "# Codex Global Rules",
         "这是一段很长的 RULES 正文，用于验证读取层会折叠系统注入。",
         `${marker} ${"不要输出这段规则正文 ".repeat(120)}`,
         "</INSTRUCTIONS><environment_context>",
-        "  <cwd>C:\\Users\\Stardust\\.gemini\\antigravity\\mcp-memory-store</cwd>",
+        "  <cwd>C:\\Users\\Example\\.gemini\\antigravity\\mcp-memory-store</cwd>",
         "  <shell>powershell</shell>",
         "</environment_context>",
     ].join("\n");
@@ -73,7 +73,7 @@ function agentsRulesText(marker: string): string {
 
 function agentsRulesTextNewHeader(marker: string): string {
     return agentsRulesText(marker).replace(
-        "# AGENTS.md instructions for C:\\Users\\Stardust\\.gemini\\antigravity",
+        "# AGENTS.md instructions for C:\\Users\\Example\\.gemini\\antigravity",
         "# AGENTS.md instructions",
     );
 }
@@ -831,7 +831,7 @@ const evidenceStreamTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-stor
 try {
     const rolloutPath = path.join(evidenceStreamTempDir, "rollout-2026-08-03T20-00-00-019ddbe1-5242-7873-b86e-c653a957eabc.jsonl");
     const evidenceEvents = [
-        { type: "session_meta", payload: { id: "evidence-stream-conversation" } },
+        { type: "session_meta", payload: { id: "019ddbe1-5242-7873-b86e-c653a957eabc" } },
         { type: "response_item", payload: { type: "message", role: "user", message_id: "mirror-1", content: [{ type: "input_text", text: "证据用户消息" }] } },
         { type: "event_msg", payload: { type: "user_message", message_id: "mirror-1", message: "证据用户消息" } },
         { type: "response_item", payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "证据助手消息" }] } },
@@ -844,7 +844,7 @@ try {
         canonicalSerialize({ messages: arrayEvidence.messages }),
         "utf8",
     ).digest("hex");
-    assert.equal(streamedEvidence.conversationId, "evidence-stream-conversation");
+    assert.equal(streamedEvidence.conversationId, "019ddbe1-5242-7873-b86e-c653a957eabc");
     assert.deepEqual(streamedEvidence.messages, arrayEvidence.messages);
     assert.equal(streamedEvidence.roundEnd, arrayEvidence.roundEnd);
     assert.equal(streamedEvidence.contentHash, expectedHash);
@@ -902,7 +902,7 @@ const antigravityRounds = parseRounds([
         type: "CORTEX_STEP_TYPE_USER_INPUT",
         userInput: {
             userResponse: "AG 用户",
-            media: [{ uri: "C:\\Users\\Stardust\\.gemini\\antigravity\\brain\\demo\\media__1.png", mimeType: "image/png" }],
+            media: [{ uri: "C:\\Users\\Example\\.gemini\\antigravity\\brain\\demo\\media__1.png", mimeType: "image/png" }],
         },
     },
     { type: "CORTEX_STEP_TYPE_PLANNER_RESPONSE", plannerResponse: { response: "AG 回复", thinking: "AG thinking" } },

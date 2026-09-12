@@ -1,6 +1,7 @@
 import type { ConversationSourceCacheBuildFailure, ConversationSourceCacheKey, ConversationSourceFingerprint } from "./conversation-source-cache.js";
 import type { StreamedFetchArtifact } from "./conversation-fetch-artifact.js";
 import type { Chain } from "./chain.js";
+import type { CodexHistorySource } from "./codex-history-source.js";
 
 export interface CodexFetchWorkerPayload {
     version: 1;
@@ -12,6 +13,7 @@ export interface CodexFetchWorkerPayload {
     sourceMtimeMs: number;
     anchorStartByte: number;
     anchorSha256: string;
+    historySource?: CodexHistorySource;
     artifactBucket: number;
     modelChain: Chain;
 }

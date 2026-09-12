@@ -2,6 +2,7 @@ import { normalizeDataChain, type DataChain, type ConversationLinkMode, type Con
 import {
     getCodexThread,
     assertCodexSourceVersion,
+    captureCodexSourceVersion,
     createCodexSourceRevisionAccumulator,
     codexSourceRevisionFromRounds,
     loadCodexConversationAsync,
@@ -13,6 +14,7 @@ import {
     type CodexConversationData,
     type CodexSourceVersionExpectation,
 } from "./codex-client.js";
+import { assertCodexHistorySource, type CodexHistorySource } from "./codex-history-source.js";
 import {
     getClaudeCodeThread,
     loadClaudeCodeConversationAsync,
@@ -371,6 +373,12 @@ async function loadFromResolvedChain(
         ? conversationId
         : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass);
     if (!effectiveId) return null;
+    if (resolved === "codex" && source !== "cache" && !options.expectedCodexSource) {
+        const currentThread = getCodexThread(effectiveId);
+        if (currentThread?.rolloutPath) {
+            options = { ...options, expectedCodexSource: captureCodexSourceVersion(currentThread.rolloutPath) };
+        }
+    }
     if (resolved === "codex" && options.expectedCodexSource) {
         const expectedThread = getCodexThread(effectiveId);
         if (!expectedThread?.rolloutPath) throw new Error("Codex source changed before cache lookup; start a fresh fetch");
@@ -398,6 +406,7 @@ async function loadFromResolvedChain(
                 path: options.expectedCodexSource.sourcePath,
                 size: options.expectedCodexSource.sourceSize,
                 mtime: options.expectedCodexSource.sourceMtimeMs,
+                revision: options.expectedCodexSource.historySource?.revision,
             }
             : freshness.fingerprint,
         refresh: options.forceRawCacheRebuild === true
@@ -408,7 +417,11 @@ async function loadFromResolvedChain(
             : undefined,
         build: async () => withConversationSourcePressure(options.requestClass || "foreground", async () => {
             throwIfConversationLoadCancelled(options);
-            if (!buildPrevious && resolved === "codex" && (options.link || "summary") !== "expand_children") {
+            const incremental = buildPrevious
+                ? await tryBuildIncrementalConversation(resolved, effectiveId, options, buildPrevious)
+                : null;
+            if (incremental) return incremental;
+            if (resolved === "codex" && (options.link || "summary") !== "expand_children") {
                 const spool = createConversationSourceCacheRoundSpool<ConversationRound>({
                     key,
                     getRoundNumber: (round, index) => round.roundIndex || index + 1,
@@ -461,10 +474,6 @@ async function loadFromResolvedChain(
                     throw error;
                 }
             }
-            const incremental = buildPrevious
-                ? await tryBuildIncrementalConversation(resolved, effectiveId, options, buildPrevious)
-                : null;
-            if (incremental) return incremental;
             const loaded = await loadRawConversationData(
                 resolved,
                 effectiveId,
@@ -541,6 +550,23 @@ export async function rebuildConversationCacheForRecord(
     return rebuilt;
 }
 
+function codexHistoryCanAppend(previous: CodexHistorySource | undefined, current: CodexHistorySource | undefined): boolean {
+    if (!previous || !current || previous.segments.length !== current.segments.length) return false;
+    const stableSegment = (source: CodexHistorySource, index: number): string => {
+        const segment = source.segments[index];
+        const leaf = index === source.segments.length - 1;
+        return JSON.stringify({
+            path: segment.path,
+            rolloutId: segment.rolloutId,
+            startOrdinal: segment.startOrdinal,
+            endOrdinalExclusive: segment.endOrdinalExclusive,
+            headerSha256: segment.headerSha256,
+            ...(leaf ? {} : { endByte: segment.endByte, anchorSha256: segment.anchorSha256 }),
+        });
+    };
+    return previous.segments.every((segment, index) => stableSegment(previous, index) === stableSegment(current, index));
+}
+
 async function tryBuildIncrementalConversation(
     resolved: ResolvedConversationChain,
     conversationId: string,
@@ -563,6 +589,9 @@ async function tryBuildIncrementalConversation(
         const checkpoint = oldData?.sourceCheckpoint;
         const rolloutPath = oldData?.thread.rolloutPath;
         if (!checkpoint || !rolloutPath) return null;
+        const historySource = options.expectedCodexSource?.historySource;
+        if (!codexHistoryCanAppend(oldData.historySource, historySource)) return null;
+        assertCodexHistorySource(oldData.historySource!);
         const tail = await readCodexRoundTail(rolloutPath, options.link || "summary", {
             checkpoint,
             cwd: oldData.thread.cwd,
@@ -605,7 +634,7 @@ async function tryBuildIncrementalConversation(
                 aiResponseCount,
                 toolCallCount,
                 sourceRevision: revisionAccumulator.finish(Math.floor(checkpoint.sourceMtimeMs)),
-                codexData: { ...oldData, rounds: [] },
+                codexData: { ...oldData, rounds: [], historySource },
                 compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
             };
             return { snapshot, preparedRounds };
@@ -668,6 +697,7 @@ async function tryBuildIncrementalConversation(
                 childThreads,
                 sourceCheckpoints: tail.sourceCheckpoints,
                 sourceCheckpoint: tail.checkpoint,
+                historySource,
             },
             compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
             sourceDiagnostics: [...(previous.snapshot.sourceDiagnostics || []), `Codex JSONL 仅重放第 ${tail.replaceFromRound} 轮起的追加尾部`],
@@ -783,7 +813,12 @@ function localConversationSourceFingerprint(
     conversationId: string,
     source: ConversationRawSource,
 ): ConversationSourceFingerprint | null {
-    if (resolved === "codex") return fileFingerprint(getCodexThread(conversationId)?.rolloutPath);
+    if (resolved === "codex") {
+        const rolloutPath = getCodexThread(conversationId)?.rolloutPath;
+        if (!rolloutPath) return null;
+        const version = captureCodexSourceVersion(rolloutPath);
+        return { path: version.sourcePath, size: version.sourceSize, mtime: version.sourceMtimeMs, revision: version.historySource?.revision };
+    }
     if (resolved === "claude-code") return fileFingerprint(getClaudeCodeThread(conversationId)?.jsonlPath);
     if (resolved === "windsurf" || resolved === "antigravity") {
         if (source === "ls") return null;

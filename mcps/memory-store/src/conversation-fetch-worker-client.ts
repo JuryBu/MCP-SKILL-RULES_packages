@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { assertCodexSourceVersionSync, captureCodexSourceVersion, getCodexThread } from "./codex-client.js";
 import { stableJsonHash, type BackgroundTaskContext } from "./background-tasks.js";
 import type { Chain } from "./chain.js";
+import type { CodexHistorySource } from "./codex-history-source.js";
 import type { CodexFetchWorkerMessage, CodexFetchWorkerPayload, CodexFetchWorkerResult } from "./conversation-fetch-worker-types.js";
 
 const DEFAULT_GIANT_FETCH_BYTES = 256 * 1024 * 1024;
@@ -22,6 +23,7 @@ export interface CodexFetchWorkEstimate {
     sourceMtimeMs: number;
     anchorStartByte: number;
     anchorSha256: string;
+    historySource?: CodexHistorySource;
     thresholdBytes: number;
     shouldBackground: boolean;
 }
@@ -35,7 +37,7 @@ export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEs
         return {
             ...sourceVersion,
             thresholdBytes,
-            shouldBackground: sourceVersion.sourceSize >= thresholdBytes,
+            shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes,
         };
     } catch {
         return null;
@@ -60,6 +62,7 @@ export function createCodexFetchWorkerPayload(input: {
         sourceMtimeMs: input.estimate.sourceMtimeMs,
         anchorStartByte: input.estimate.anchorStartByte,
         anchorSha256: input.estimate.anchorSha256,
+        historySource: input.estimate.historySource,
         artifactBucket: Math.floor((input.now ?? Date.now()) / CODEX_FETCH_ARTIFACT_BUCKET_MS),
         modelChain: input.modelChain,
     };

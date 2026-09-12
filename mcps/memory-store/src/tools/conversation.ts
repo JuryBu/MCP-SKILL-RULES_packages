@@ -2800,7 +2800,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                 type: "text" as const,
                                 text: [
                                     "❌ 该 Codex 对话不允许以前台同步方式执行 fetch",
-                                    `源文件大小: ${(estimate.sourceSize / (1024 * 1024)).toFixed(1)} MiB`,
+                                    `历史来源总大小: ${((estimate.historySource?.totalBytes ?? estimate.sourceSize) / (1024 * 1024)).toFixed(1)} MiB | ${estimate.historySource?.segments.length ?? 1} 个来源文件`,
                                     `自动后台阈值: ${(estimate.thresholdBytes / (1024 * 1024)).toFixed(1)} MiB`,
                                     "原因：同步读取会阻塞 Memory Store 控制链路，并可能先触发 broker -32001 超时。请省略 background 或设为 true。",
                                 ].join("\n"),
@@ -2838,7 +2838,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                         ? "🚀 巨型 Codex 对话 fetch 已自动转入独立后台进程"
                                         : "🚀 Codex 对话 fetch 已按 background=true 转入独立后台进程",
                                     `🆔 taskId: ${task.id}`,
-                                    `📦 源文件: ${(estimate.sourceSize / (1024 * 1024)).toFixed(1)} MiB | 自动后台阈值 ${(estimate.thresholdBytes / (1024 * 1024)).toFixed(1)} MiB`,
+                                    `📦 历史来源: ${((estimate.historySource?.totalBytes ?? estimate.sourceSize) / (1024 * 1024)).toFixed(1)} MiB | ${estimate.historySource?.segments.length ?? 1} 个文件 | 自动后台阈值 ${(estimate.thresholdBytes / (1024 * 1024)).toFixed(1)} MiB`,
                                     `📍 当前状态: ${task.status}${task.progress?.detail ? ` | ${task.progress.detail}` : ""}`,
                                     "💡 使用 background_task_status(taskId=\"...\", waitSeconds=30-45) 查询；取消时使用 background_task_cancel(taskId=\"...\")。",
                                     "♻️ 相同源版本、link/source 与 1 小时临时文件窗口会复用同一稳定 taskId；进程热重启后也从该 ID 恢复。",
