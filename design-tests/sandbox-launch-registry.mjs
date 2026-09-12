@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sandbox-launch-registry-"));
 const launchRoot = path.join(dataRoot, "launches");
@@ -65,12 +65,25 @@ for (let index = 0; index < 1500; index += 1) {
 }
 
 const targetId = "terminal-target";
+let historicalZeroPath;
+if (process.platform === "win32") {
+    historicalZeroPath = taskPath("historical-zero-record");
+    fs.writeFileSync(historicalZeroPath, Buffer.alloc(1024));
+    const oldDate = new Date("2000-01-01T00:00:00Z");
+    fs.utimesSync(historicalZeroPath, oldDate, oldDate);
+    const creation = spawnSync("powershell.exe", ["-NoProfile", "-Command",
+        `[IO.File]::SetCreationTimeUtc('${historicalZeroPath.replace(/'/gu, "''")}', [DateTime]::Parse('2000-01-01T00:00:00Z').ToUniversalTime())`,
+    ], { windowsHide: true, encoding: "utf8", timeout: 5000 });
+    assert.equal(creation.status, 0, creation.stderr);
+    terminalFiles.push(historicalZeroPath);
+}
 const target = writeTask(targetId);
 const largeLog = `${Array.from({ length: 600_000 }, (_, index) => `tail-${index}`).join("\n")}\n`;
 const unicodeTail = "日志🙂".repeat(5000);
 fs.writeFileSync(target.stdoutLog, `${largeLog}${unicodeTail}\n`, "utf8");
 const tombstonedLegacyId = "legacy-tombstone";
 fs.writeFileSync(path.join(launchRoot, "registry.json"), JSON.stringify([
+    ...(historicalZeroPath ? [{ ...target, id: "historical-zero-record" }] : []),
     {
         ...writeTask(tombstonedLegacyId),
         id: tombstonedLegacyId,
@@ -87,7 +100,7 @@ const testKeepAlive = setInterval(() => {}, 1000);
 
 try {
     const { getResourceAdmissionState } = await import("../mcps/sandbox/dist/resource-admission-runtime.js");
-    const { readLaunchProcessIdentity, registerLaunch } = await import("../mcps/sandbox/dist/tools/launch.js");
+    const { readLaunchProcessIdentity, registerLaunch, getLaunchRecoveryState } = await import("../mcps/sandbox/dist/tools/launch.js");
     await waitFor(() => Boolean(readLaunchProcessIdentity(process.pid)), 10_000, "current-process identity unavailable");
     await waitFor(() => Boolean(readLaunchProcessIdentity(child.pid)), 10_000, "child identity unavailable");
 
@@ -133,6 +146,7 @@ try {
         "launch recovery did not adopt all running leases",
     );
     clearInterval(recoveryPulse);
+    assert.equal(getLaunchRecoveryState().ignoredHistoricalRecords, historicalZeroPath ? 1 : 0);
     console.log(JSON.stringify({ recoveryMs: Date.now() - recoveryStartedAt, recoveryLoopDelayMs }));
 
     const deniedStatus = await handler({ action: "status", taskId: targetId, ownerId: "owner-beta" }, {});
@@ -144,6 +158,10 @@ try {
     assert.equal(JSON.parse(fs.readFileSync(taskPath(targetId), "utf8")).status, "done");
     const tombstonedLegacy = await handler({ action: "status", taskId: tombstonedLegacyId, ownerId: "owner-alpha" }, {});
     assert.match(tombstonedLegacy.content[0].text, /未找到任务/u);
+    if (historicalZeroPath) {
+        const historicalClean = await handler({ action: "clean", taskId: "historical-zero-record", ownerId: "owner-alpha" }, {});
+        assert.match(historicalClean.content[0].text, /清理了 0 个/u);
+    }
 
     const unknownKill = await handler({ action: "kill", taskId: unknownId, ownerId: "owner-alpha" }, {});
     assert.match(unknownKill.content[0].text, /仍保留运行/u);

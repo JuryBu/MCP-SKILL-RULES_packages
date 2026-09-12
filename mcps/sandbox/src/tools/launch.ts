@@ -4,6 +4,7 @@ import path from "path";
 import os from "os";
 import { createHash } from "crypto";
 import { promisify } from "util";
+import { isPreviousBootZeroRecord } from "./launch-record-compat.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, ensureModelVisibleToolResult, formatElapsed } from "../lifecycle.js";
@@ -114,6 +115,8 @@ const activeReaperTasks = new Map<string, LaunchTask>();
 const scannedTaskFiles = new Set<string>();
 let legacyRegistryScanned = false;
 let launchReaperReady = false;
+const bootStartedAtMs = Date.now() - os.uptime() * 1000;
+const ignoredHistoricalTaskFiles = new Set<string>();
 const execFileAsync = promisify(execFile);
 const WINDOWS_PROCESS_INFO_CONCURRENCY = 2;
 let activeWindowsProcessInfoQueries = 0;
@@ -171,13 +174,15 @@ function readLegacyRegistry(): LaunchTask[] {
     return [];
 }
 
-function readTaskRegistryFiles(): { tasks: LaunchTask[]; tombstones: Set<string> } {
+function readTaskRegistryFiles(): { tasks: LaunchTask[]; tombstones: Set<string>; authoritativeFiles: Set<string> } {
     const tasks: LaunchTask[] = [];
     const tombstones = new Set<string>();
+    const authoritativeFiles = new Set<string>();
     try {
-        if (!fs.existsSync(TASK_REGISTRY_DIR)) return { tasks, tombstones };
+        if (!fs.existsSync(TASK_REGISTRY_DIR)) return { tasks, tombstones, authoritativeFiles };
         for (const entry of fs.readdirSync(TASK_REGISTRY_DIR, { withFileTypes: true })) {
             if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+            authoritativeFiles.add(entry.name);
             try {
                 const parsed = JSON.parse(fs.readFileSync(path.join(TASK_REGISTRY_DIR, entry.name), "utf-8"));
                 if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") {
@@ -193,7 +198,7 @@ function readTaskRegistryFiles(): { tasks: LaunchTask[]; tombstones: Set<string>
     } catch {
         // 注册目录不可读时回退到 legacy registry。
     }
-    return { tasks, tombstones };
+    return { tasks, tombstones, authoritativeFiles };
 }
 
 function readAllTasks(): LaunchTask[] {
@@ -201,7 +206,7 @@ function readAllTasks(): LaunchTask[] {
     const byId = new Map<string, LaunchTask>();
     for (const task of current.tasks) byId.set(task.id, task);
     for (const task of readLegacyRegistry()) {
-        if (current.tombstones.has(task.id) || byId.has(task.id)) continue;
+        if (current.tombstones.has(task.id) || byId.has(task.id) || current.authoritativeFiles.has(path.basename(taskRegistryPath(task.id)))) continue;
         byId.set(task.id, task);
     }
     return [...byId.values()];
@@ -234,14 +239,30 @@ function readTask(taskId: string): LaunchTask | null {
     return readLegacyRegistry().find(task => task.id === taskId) || null;
 }
 
-async function readTaskFile(fileName: string): Promise<LaunchTask | LaunchTombstone> {
-    const parsed = JSON.parse(await fs.promises.readFile(path.join(TASK_REGISTRY_DIR, fileName), "utf-8"));
-    if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") {
-        return { id: parsed.id, deleted: true, deletedAtMs: typeof parsed.deletedAtMs === "number" ? parsed.deletedAtMs : 0 };
+export function getLaunchRecoveryState(): { ready: boolean; ignoredHistoricalRecords: number } {
+    return { ready: launchReaperReady, ignoredHistoricalRecords: ignoredHistoricalTaskFiles.size };
+}
+
+async function readTaskFile(fileName: string, allowHistoricalZeroRecords = false): Promise<LaunchTask | LaunchTombstone | null> {
+    const filePath = path.join(TASK_REGISTRY_DIR, fileName);
+    const handle = await fs.promises.open(filePath, "r");
+    try {
+        const content = await handle.readFile();
+        if (allowHistoricalZeroRecords && content[0] === 0
+            && isPreviousBootZeroRecord(content, await handle.stat(), bootStartedAtMs)) {
+            ignoredHistoricalTaskFiles.add(fileName);
+            return null;
+        }
+        const parsed = JSON.parse(content.toString("utf-8"));
+        if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") {
+            return { id: parsed.id, deleted: true, deletedAtMs: typeof parsed.deletedAtMs === "number" ? parsed.deletedAtMs : 0 };
+        }
+        const task = normalizeLaunchTask(parsed);
+        if (!task) throw new Error(`invalid launch task registry file: ${fileName}`);
+        return task;
+    } finally {
+        await handle.close();
     }
-    const task = normalizeLaunchTask(parsed);
-    if (!task) throw new Error(`invalid launch task registry file: ${fileName}`);
-    return task;
 }
 
 function writeTaskIfUnchanged(task: LaunchTask, before: string): boolean {
@@ -822,11 +843,12 @@ async function reapLaunchTasksInBackground(): Promise<void> {
 
     for (let index = 0; index < newFiles.length; index += 64) {
         const batch = newFiles.slice(index, index + 64);
-        const parsed = await Promise.allSettled(batch.map(async fileName => ({ fileName, value: await readTaskFile(fileName) })));
+        const parsed = await Promise.allSettled(batch.map(async fileName => ({ fileName, value: await readTaskFile(fileName, true) })));
         for (const result of parsed) {
             if (result.status !== "fulfilled") throw result.reason;
             const { fileName, value } = result.value;
             scannedTaskFiles.add(fileName);
+            if (!value) continue;
             if (!("deleted" in value) && value.status === "running") activeReaperTasks.set(value.id, value);
         }
         await yieldToEventLoop();

@@ -14,6 +14,7 @@
     "test:low-memory-replay": "node --test ../../design-tests/sandbox-low-memory-replay.mjs",
     "test:low-memory-process": "node ../../design-tests/sandbox-low-memory-process.mjs",
     "test:launch-registry": "node ../../design-tests/sandbox-launch-registry.mjs",
+    "test:launch-record-compat": "node --test ../../design-tests/sandbox-launch-record-compat.mjs",
     "test:output-delivery": "node ../../design-tests/sandbox-output-delivery.mjs",
     "test:exec-batch": "node ../../design-tests/sandbox-exec-batch-integration.mjs",
     "test:short-burst": "node ../../design-tests/sandbox-short-command-burst.mjs",

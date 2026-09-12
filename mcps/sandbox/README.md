@@ -69,6 +69,8 @@ Windows 在首份完整压力样本到达前、样本过期或仅有物理内存
 
 `sandbox_launch` 周期维护增量处理新文件与运行任务，终态不再反复重写；单任务查询直接定位任务文件，日志尾读有512KiB上限。进程身份核对采用异步调用，避免同步 PowerShell 查询阻塞同一后端的其它请求。
 
+首次恢复兼容一种不可恢复的历史残留：只有内容非空且全部为零、创建和修改时间均早于本次系统启动至少60秒的记录，才只读保留并跳过，数量在状态中显示。它们不可能对应跨越系统重启仍存活的旧进程；当前启动后损坏、普通坏JSON、读取失败和正在跟踪的任务记录不使用此例外，仍保持恢复保护或已有租约，不自动删除或伪造任务状态。
+
 ## 安全重拉 Sandbox backend
 
 `ops/reload-broker-backend.ps1` 只访问 loopback broker 控制接口，endpoint 固定为 `sandbox`。脚本不复用 NapCat 的 legacy child recycle、不直接查找或终止任何进程；它在重拉前后核对 broker PID 不变，并重新执行 MCP `initialize` 与真实短 `sandbox_exec` 调用，确认新的 Sandbox backend 已经实际启动。

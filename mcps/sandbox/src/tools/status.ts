@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { getLaunchRecoveryState } from "./launch.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { getCachedEnvInfo, detectEnvironment } from "../env-detector.js";
@@ -128,6 +129,7 @@ async function buildOverview() {
     lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
     lines.push(`  小请求未观测预留物理折算: ${admission.limits.smallRequestPhysicalWeight * 100}% | 压力样本最长有效: ${admission.limits.pressureSampleMaxAgeMs}ms | 仅提交余量充足时启用，提交预留不折算`);
     lines.push(`  后台任务资源恢复: ${admission.recoveryPending ? "进行中，暂停新执行" : "完成"}`);
+    lines.push(`  启动前遗留全零记录: ${getLaunchRecoveryState().ignoredHistoricalRecords}（原文件保留，不作为运行任务）`);
 
     const loopMeanMs = Number.isFinite(eventLoopDelay.mean) ? eventLoopDelay.mean / 1e6 : 0;
     const loopMaxMs = Number.isFinite(eventLoopDelay.max) ? eventLoopDelay.max / 1e6 : 0;
