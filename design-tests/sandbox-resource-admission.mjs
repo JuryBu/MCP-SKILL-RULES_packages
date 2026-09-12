@@ -24,6 +24,8 @@ test("20 small commands start immediately without a process-count ceiling", asyn
         commitCriticalFloorMB: 1536,
         yellowPhysicalMemoryMB: 1536,
         yellowMaxReservationMB: 192,
+        smallRequestPhysicalWeight: 0.25,
+        pressureSampleMaxAgeMs: 2000,
         maxQueueSize: 256,
     });
     assert.equal(state.activeLeases, 20);

@@ -126,6 +126,8 @@ async function buildOverview() {
     lines.push(`  压力等级: ${admission.pressureLevel} | 物理可用: ${admission.systemAvailableMemoryMB === null ? "未知" : `${admission.systemAvailableMemoryMB.toFixed(0)} MB`} | 临界底线: ${admission.limits.systemHeadroomMB} MB | 黄色线: ${admission.limits.yellowPhysicalMemoryMB} MB`);
     lines.push(`  提交余量: ${admission.commitAvailableMemoryMB === null ? "未知" : `${admission.commitAvailableMemoryMB.toFixed(0)} MB`} | 重任务目标: ${admission.limits.commitHeadroomMB} MB | 紧急底线: ${admission.limits.commitCriticalFloorMB} MB | Windows 高/低内存信号: ${admission.highMemorySignaled ?? "未知"}/${admission.lowMemorySignaled ?? "未知"}`);
     lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
+    lines.push(`  小请求未观测预留物理折算: ${admission.limits.smallRequestPhysicalWeight * 100}% | 压力样本最长有效: ${admission.limits.pressureSampleMaxAgeMs}ms | 仅提交余量充足时启用，提交预留不折算`);
+    lines.push(`  后台任务资源恢复: ${admission.recoveryPending ? "进行中，暂停新执行" : "完成"}`);
 
     const loopMeanMs = Number.isFinite(eventLoopDelay.mean) ? eventLoopDelay.mean / 1e6 : 0;
     const loopMaxMs = Number.isFinite(eventLoopDelay.max) ? eventLoopDelay.max / 1e6 : 0;

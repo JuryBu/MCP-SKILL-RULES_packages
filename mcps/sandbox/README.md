@@ -1,4 +1,4 @@
-# MCP Sandbox v1.17.2
+# MCP Sandbox v1.17.3
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -36,6 +36,8 @@ Sandbox backend 在同一进程内统一管理会创建本机子进程的工具�
 
 单任务参数允许的最高硬上限由 `SANDBOX_PROCESS_TREE_MAX_MEMORY_MB` 配置，默认 4096MB，并在 `sandbox_status overview` 的「工具内存配置」中展示。提高这项上限不会提高全局接纳额度，也不会动用 1536MB 紧急提交内存底线；例如 `maxMemoryMB=2048,memoryRequestMB=512` 仍只按 512MB 参与接纳，实际进程树越过 2048MB 才会被 Job Object 终止。
 
+1.17.3 的轻任务通道只在 Windows 完整压力样本未过期（默认 2000ms）、未发低内存警报、扣除完整未观测预留和新请求后提交余量仍不低于 4096MB 时启用：不超过 192MB 的请求在物理侧按默认 25% 折算未观测预留，新请求与老任务保护额度仍按全量扣除。提交侧始终全量计算，512MB 物理底线和 1536MB 提交紧急底线不变。比例 `SANDBOX_ADMISSION_SMALL_PHYSICAL_WEIGHT` 可设为大于 0 且不超过 1；设为 1 恢复原保守行为，`SANDBOX_ADMISSION_PRESSURE_MAX_AGE_MS` 控制样本有效期。`admissionDecision` 会返回具体阻断条件、预计剩余物理/提交内存与样本年龄，不把未知观测冒充实际 0MB。
+
 `smart_search exact` 逐行解析 ripgrep JSON，达到全局 `maxResults` 后立即停止底层搜索，不再先缓存整棵目录的全部命中。模糊/语义索引使用异步目录读取、分批让出事件循环并默认跳过超过 2MiB 的单文件；后台搜索可用 `taskId + cancel=true` 显式取消。`sandbox_status overview` 同时报告事件循环延迟和后台任务数，便于区分「进程存活」与「后端仍能及时响应」。
 
 Windows 上 helper 或 cwd 缺失会在命令启动前明确失败，禁止退回普通进程绕过内存硬限制。失败结果通过 `commandStarted`、`mayHaveStarted`、`errorType` 与 `runMs` 区分未启动、已经启动和启动状态未知；历史上缺少 cwd 证据的 ENOENT 仍不能被事后反推归因。
@@ -62,6 +64,10 @@ Windows 运行时同时读取物理可用内存、系统提交余量（物理内
 超过任一条件、显式选择 `file|manifest`，或命令被超时/取消中断而需要恢复部分输出时，响应保留有界头尾预览，并把完整 stdout、stderr 与 manifest 写入 `SANDBOX_DATA_ROOT/output-artifacts`。artifact 默认保留 6 小时，返回稳定 ID、绝对路径、SHA256、原始字节数、行数、创建/过期时间与完整性标记；调用方应读取 artifact 获取全文，并可用 SHA256 核对内容。
 
 `maxLines`、`tailLines`、`maxOutput` 继续表示调用方希望的展示预算，不再作为 200 行或 50000 字符的 schema 强制上限。`maxOutput` 按正文字符计算，16KiB 元数据预留另计；`maxLines` 即使配合显式 `deliveryMode=inline` 也不会先删除全文再截断，而会保留完整 artifact。`sandbox_batch` 的任务共享单次响应预算，避免多项各自合规却合并突破 1MiB。`outputMode=full|head|tail|silent` 保持原语义，服务端仍保留可配置的 1MiB 应急保护线。
+
+Windows 在首份完整压力样本到达前、样本过期或仅有物理内存 fallback 时暂停新执行请求，不把未知提交余量当作无限可用；控制与查询仍可用。已有后台任务的首次资源记账恢复完成前也暂停新执行，失败时继续保留保护。观测值仅抵扣同一租约的预留上限，原始观测仍用于总硬线与诊断；它可能来自驻留内存或 Job 峰值，不等同于当前物理内存。
+
+`sandbox_launch` 周期维护增量处理新文件与运行任务，终态不再反复重写；单任务查询直接定位任务文件，日志尾读有512KiB上限。进程身份核对采用异步调用，避免同步 PowerShell 查询阻塞同一后端的其它请求。
 
 ## 安全重拉 Sandbox backend
 
@@ -266,6 +272,7 @@ Windsurf / WSF 通过本机共享 HTTP broker 使用 Sandbox MCP，不新增任�
 - v1.16.4：包含 v1.16.3 的输出预算、模型可见性、batch 总响应与孤儿 artifact 清理修复，并消除目录创建到 manifest 初始化之间的统计/GC 竞态；运行中 artifact 统一显示为未完成并受保护，不再短暂误报无效。
 - v1.17.0：调度请求与进程树硬上限分离，Windows 使用 Job Object 对短命令和多层子进程实施内核级内存限制并返回可信峰值；接纳器同时参考物理内存、系统提交余量与 Windows 压力通知，在黄区继续放行小任务，跳过暂时不可接纳的队首大任务并为老请求渐进保留额度。接纳等待封顶 10 秒并定期上报进度；SDK 提供 MCP session 身份时会用作默认 owner，匿名同 owner 仍允许小任务绕过暂时放不下的大请求。新增 `npm run test:short-burst`，实测 20 路匿名短 PowerShell 可直接并行且均有真实峰值。
 - v1.17.1：修复 4096MB 提交余量目标被误作全局红线的问题。新增默认 1536MB 紧急底线；中间黄区继续放行不超过 192MB、且接纳后仍守住紧急底线的小请求，重任务仍需守住 4096MB 目标线。状态与结构化错误同时展示目标线和紧急底线，新增 `npm run test:resource-admission` 锁定训练机低提交余量场景。
+- v1.17.3：按事故附近压力数值回放修复低物理内存、提交空间充足时的小请求接纳；未观测预留仅在新鲜完整样本、低内存信号关闭和完整提交预算守住4096MB时按25%计入物理风险，未知采样不放行，观测抵扣逐租约封顶。launch增量异步维护、终态零重写、直接查询、有界尾读与启动恢复屏障；错误保留具体阻塞条件。增加压力回放、真实子进程与大注册表专项测试。
 - v1.17.2：exact 搜索改为流式全局结果上限，索引扫描分批让出事件循环，后台取消会继续传到本地扫描及模型调用；Windows helper 缺失不再绕过 Job Object，cwd/helper/payload 启动错误与 commandStarted 契约分开，取消或超时会等待进程树清理后才释放调度额度，`runMs` 只统计命令实际运行阶段；五类执行工具共享默认 4096MB、服务端可配置的进程树参数天花板，整机接纳与紧急底线不变。新增 `test:smart-search-isolation`、`test:memory-limits` 和启动失败后下一调用回归。
 - `webSearch` 现默认优先走 Exa MCP；Exa 失败或无结果时才降级到 360/Bing HTML fallback，并在结果里带降级说明。DuckDuckGo 当前环境常见 403/timeout，默认跳过，可传 `duckDuckGo=true` 强制尝试
 - v1.12.1 补充 `sandbox_council` 参数防呆：schema 和文档明确 `moderator` 必须是对象，并给出最小 JSON 示例

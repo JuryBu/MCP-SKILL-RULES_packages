@@ -3,6 +3,7 @@ import {
     ResourceAdmissionError,
     type ResourceAdmissionRequest,
     type ResourceAdmissionState,
+    type ResourceAdmissionDecision,
     type ResourceLease,
 } from "./resource-admission.js";
 import os from "node:os";
@@ -32,6 +33,9 @@ export const resourceAdmission = new ResourceAdmissionController({
     commitCriticalFloorMB: readEnvNumber("SANDBOX_ADMISSION_COMMIT_CRITICAL_FLOOR_MB", 1536),
     yellowPhysicalMemoryMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_PHYSICAL_MB", 1536),
     yellowMaxReservationMB: readEnvNumber("SANDBOX_ADMISSION_YELLOW_MAX_REQUEST_MB", 192),
+    smallRequestPhysicalWeight: readEnvNumber("SANDBOX_ADMISSION_SMALL_PHYSICAL_WEIGHT", 0.25),
+    pressureSampleMaxAgeMs: readEnvNumber("SANDBOX_ADMISSION_PRESSURE_MAX_AGE_MS", 2000),
+    requireFreshPressureSample: process.platform === "win32",
     maxAgedReservationMB: readEnvNumber("SANDBOX_ADMISSION_MAX_AGED_RESERVATION_MB", 256),
     maxQueueSize: readEnvNumber("SANDBOX_ADMISSION_MAX_QUEUE", 256),
     admissionBudgetMinMs: readEnvNumber("SANDBOX_ADMISSION_WAIT_MIN_MS", 8000),
@@ -89,8 +93,12 @@ const observedMemoryByLease = new Map<ManagedResourceLease, number>();
 
 function refreshObservedMemory(): void {
     let totalMemoryMB = 0;
-    for (const memoryMB of observedMemoryByLease.values()) totalMemoryMB += memoryMB;
-    resourceAdmission.updateObservedMemoryMB(totalMemoryMB);
+    let reservationCreditMB = 0;
+    for (const [lease, memoryMB] of observedMemoryByLease) {
+        totalMemoryMB += memoryMB;
+        reservationCreditMB += Math.min(memoryMB, lease.reservedMB);
+    }
+    resourceAdmission.updateObservedMemoryMB(totalMemoryMB, reservationCreditMB);
 }
 
 export async function acquireResourceLease(
@@ -143,6 +151,8 @@ export function serializeResourceAdmissionError(error: unknown): {
     queueWaitMs: number;
     retryAfterMs: number;
     commandStarted: false;
+    mayHaveStarted: false;
+    admissionDecision?: ResourceAdmissionDecision;
     memoryPressure: {
         activeReservedMB: number;
         admissionLimitMB: number;
@@ -165,6 +175,8 @@ export function serializeResourceAdmissionError(error: unknown): {
         queueWaitMs: error.queueWaitMs,
         retryAfterMs: error.retryAfterMs,
         commandStarted: false,
+        mayHaveStarted: false,
+        admissionDecision: error.admissionDecision,
         memoryPressure: {
             activeReservedMB: state.activeReservedMB,
             admissionLimitMB: state.limits.admissionLimitMB,

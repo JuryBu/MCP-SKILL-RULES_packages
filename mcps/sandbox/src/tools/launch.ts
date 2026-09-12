@@ -1,14 +1,15 @@
-import { execFileSync, spawn } from "child_process";
+import { execFile, execFileSync, spawn } from "child_process";
 import fs from "fs";
 import path from "path";
 import os from "os";
 import { createHash } from "crypto";
+import { promisify } from "util";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, ensureModelVisibleToolResult, formatElapsed } from "../lifecycle.js";
 import { killProcessTree } from "../executor.js";
 import { hasOwnerAccess, newUuid, normalizeOwnerId, ownerMismatchText } from "../owner.js";
-import { acquireResourceLease, adoptResourceLease, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
+import { acquireResourceLease, adoptResourceLease, resourceAdmission, serializeResourceAdmissionError, type ManagedResourceLease } from "../resource-admission-runtime.js";
 import { getWindowsJobRunnerPath, hasWindowsJobRunner, readWindowsJobMetadata } from "../windows-job-runner.js";
 import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB, validateProcessTreeMemory } from "../memory-limits.js";
 
@@ -108,6 +109,16 @@ export type LaunchProcessIdentityValidationResult = "matching" | "not_running" |
 const LAUNCH_REAPER_INTERVAL_MS = 15_000;
 const LAUNCH_EXIT_MARKER_GRACE_MS = 2_000;
 let launchReaperStarted = false;
+let launchReaperRunning = false;
+const activeReaperTasks = new Map<string, LaunchTask>();
+const scannedTaskFiles = new Set<string>();
+let legacyRegistryScanned = false;
+let launchReaperReady = false;
+const execFileAsync = promisify(execFile);
+const WINDOWS_PROCESS_INFO_CONCURRENCY = 2;
+let activeWindowsProcessInfoQueries = 0;
+const queuedWindowsProcessInfoQueries: Array<() => void> = [];
+const processInfoInFlight = new Map<number, Promise<ProcessInfo | null>>();
 
 // ── 注册表管理 ──
 
@@ -194,6 +205,52 @@ function readAllTasks(): LaunchTask[] {
         byId.set(task.id, task);
     }
     return [...byId.values()];
+}
+
+async function readLegacyRegistryStrict(): Promise<LaunchTask[]> {
+    let raw: string;
+    try {
+        raw = await fs.promises.readFile(REGISTRY_FILE, "utf-8");
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw err;
+    }
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) throw new Error("invalid legacy launch registry");
+    const tasks = parsed.map(normalizeLaunchTask);
+    if (tasks.some(task => !task)) throw new Error("invalid task in legacy launch registry");
+    return tasks as LaunchTask[];
+}
+
+function readTask(taskId: string): LaunchTask | null {
+    try {
+        const parsed = JSON.parse(fs.readFileSync(taskRegistryPath(taskId), "utf-8"));
+        if (isRecord(parsed) && parsed.deleted === true) return null;
+        const task = normalizeLaunchTask(parsed);
+        return task?.id === taskId ? task : null;
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    }
+    return readLegacyRegistry().find(task => task.id === taskId) || null;
+}
+
+async function readTaskFile(fileName: string): Promise<LaunchTask | LaunchTombstone> {
+    const parsed = JSON.parse(await fs.promises.readFile(path.join(TASK_REGISTRY_DIR, fileName), "utf-8"));
+    if (isRecord(parsed) && parsed.deleted === true && typeof parsed.id === "string") {
+        return { id: parsed.id, deleted: true, deletedAtMs: typeof parsed.deletedAtMs === "number" ? parsed.deletedAtMs : 0 };
+    }
+    const task = normalizeLaunchTask(parsed);
+    if (!task) throw new Error(`invalid launch task registry file: ${fileName}`);
+    return task;
+}
+
+function writeTaskIfUnchanged(task: LaunchTask, before: string): boolean {
+    const fileName = `${safeTaskFileName(task.id)}.json`;
+    const current = readTask(task.id);
+    if (!current || JSON.stringify(current) !== before) return false;
+    writeTask(task);
+    scannedTaskFiles.add(fileName);
+    return true;
 }
 
 function writeJsonAtomic(filePath: string, value: unknown): void {
@@ -407,6 +464,20 @@ function readExitMarker(task: LaunchTask): ExitMarker | null {
     }
 }
 
+function scheduleWindowsProcessInfoQuery<T>(query: () => Promise<T>): Promise<T> {
+    return new Promise((resolve, reject) => {
+        const run = () => {
+            activeWindowsProcessInfoQueries += 1;
+            void query().then(resolve, reject).finally(() => {
+                activeWindowsProcessInfoQueries -= 1;
+                queuedWindowsProcessInfoQueries.shift()?.();
+            });
+        };
+        if (activeWindowsProcessInfoQueries < WINDOWS_PROCESS_INFO_CONCURRENCY) run();
+        else queuedWindowsProcessInfoQueries.push(run);
+    });
+}
+
 function getProcessInfo(pid: number): ProcessInfo | null {
     try {
         if (process.platform === "win32") {
@@ -456,21 +527,81 @@ function getProcessInfo(pid: number): ProcessInfo | null {
     return null;
 }
 
+async function getProcessInfoAsync(pid: number): Promise<ProcessInfo | null> {
+    if (process.platform === "win32") {
+        const existing = processInfoInFlight.get(pid);
+        if (existing) return existing;
+        const pending = scheduleWindowsProcessInfoQuery(async () => {
+            try {
+            const script = `$p=Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}"; if ($null -ne $p) { @{CreationDate=$p.CreationDate.ToUniversalTime().ToString('o'); StartId=$p.CreationDate.ToUniversalTime().Ticks.ToString(); CommandLine=$p.CommandLine} | ConvertTo-Json -Compress }`;
+            const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-Command", script], {
+                encoding: "utf-8",
+                windowsHide: true,
+                timeout: 5000,
+            });
+            const raw = stdout.trim();
+            if (!raw) return null;
+            const parsed = JSON.parse(raw);
+            const createdAtMs = parsed.CreationDate ? new Date(parsed.CreationDate).getTime() : undefined;
+            return {
+                commandLine: typeof parsed.CommandLine === "string" ? parsed.CommandLine : undefined,
+                createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined,
+                startId: typeof parsed.StartId === "string" && parsed.StartId ? parsed.StartId : undefined,
+            };
+            } catch {
+                return null;
+            }
+        }).finally(() => {
+            processInfoInFlight.delete(pid);
+        });
+        processInfoInFlight.set(pid, pending);
+        return pending;
+    }
+
+    const cmdlinePath = `/proc/${pid}/cmdline`;
+    const statPath = `/proc/${pid}/stat`;
+    try {
+        const [commandLineRaw, stat] = await Promise.all([
+            fs.promises.readFile(cmdlinePath, "utf-8"),
+            fs.promises.readFile(statPath, "utf-8"),
+        ]);
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/u);
+        return { commandLine: commandLineRaw.replace(/\0/g, " ").trim(), startId: fields[19] || undefined };
+    } catch {
+        try {
+            const { stdout: startIdRaw } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)], { encoding: "utf-8", timeout: 3000 });
+            const startId = startIdRaw.trim();
+            if (!startId) return null;
+            const { stdout: commandLineRaw } = await execFileAsync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf-8", timeout: 3000 });
+            const createdAtMs = new Date(startId).getTime();
+            return { commandLine: commandLineRaw.trim() || undefined, createdAtMs: Number.isFinite(createdAtMs) ? createdAtMs : undefined, startId };
+        } catch {
+            return null;
+        }
+    }
+}
+
 export function readLaunchProcessIdentity(pid: number): LaunchProcessIdentity | undefined {
     if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) return undefined;
     const info = getProcessInfo(pid);
     return info?.startId ? { pid, startId: info.startId } : undefined;
 }
 
+async function readLaunchProcessIdentityAsync(pid: number): Promise<LaunchProcessIdentity | undefined> {
+    if (!Number.isInteger(pid) || pid <= 0 || !isPidAlive(pid)) return undefined;
+    const info = await getProcessInfoAsync(pid);
+    return info?.startId ? { pid, startId: info.startId } : undefined;
+}
+
 async function waitForLaunchProcessIdentity(pid: number, timeoutMs = 3_000): Promise<LaunchProcessIdentity | undefined> {
     const deadline = Date.now() + timeoutMs;
     do {
-        const identity = readLaunchProcessIdentity(pid);
+        const identity = await readLaunchProcessIdentityAsync(pid);
         if (identity) return identity;
         if (!isPidAlive(pid)) return undefined;
         await new Promise(resolve => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
-    return readLaunchProcessIdentity(pid);
+    return readLaunchProcessIdentityAsync(pid);
 }
 
 async function waitForLaunchWorkerHandshake(
@@ -525,24 +656,53 @@ function migrateLegacyLaunchIdentity(
     return "matching";
 }
 
+type TaskPidValidation = { ok: true } | { ok: false; terminal: boolean; reason: string };
+
 function validatePidForTask(
     task: LaunchTask,
     dependencies: LaunchProcessIdentityDependencies = {},
-): { ok: boolean; reason?: string } {
+): TaskPidValidation {
     const validation = task.processIdentity
         ? validateLaunchProcessIdentity(task.processIdentity, dependencies)
         : migrateLegacyLaunchIdentity(task, dependencies);
     if (validation === "matching") return { ok: true };
-    if (validation === "not_running") return { ok: false, reason: "PID 已不存在" };
-    if (validation === "identity_mismatch") return { ok: false, reason: "PID 启动标识不匹配当前任务" };
-    return { ok: false, reason: "无法读取或安全迁移 PID 启动标识，拒绝继续以避免 PID 复用误杀" };
+    if (validation === "not_running") return { ok: false, terminal: true, reason: "PID 已不存在" };
+    if (validation === "identity_mismatch") return { ok: false, terminal: true, reason: "PID 启动标识不匹配当前任务" };
+    return { ok: false, terminal: false, reason: "无法读取或安全迁移 PID 启动标识，保留任务以便重试" };
+}
+
+async function validatePidForTaskAsync(task: LaunchTask): Promise<TaskPidValidation> {
+    if (task.processIdentity) {
+        const observed = await readLaunchProcessIdentityAsync(task.processIdentity.pid);
+        if (observed?.pid === task.processIdentity.pid && observed.startId === task.processIdentity.startId) return { ok: true };
+        if (!observed && !isPidAlive(task.processIdentity.pid)) return { ok: false, terminal: true, reason: "PID 已不存在" };
+        return observed
+            ? { ok: false, terminal: true, reason: "PID 启动标识不匹配当前任务" }
+            : { ok: false, terminal: false, reason: "无法读取 PID 启动标识，保留任务以便重试" };
+    }
+
+    const info = await getProcessInfoAsync(task.pid);
+    if (!info) return isPidAlive(task.pid)
+        ? { ok: false, terminal: false, reason: "无法读取 PID 启动标识，保留任务以便重试" }
+        : { ok: false, terminal: true, reason: "PID 已不存在" };
+    if (!info.startId) return { ok: false, terminal: false, reason: "无法读取 PID 启动标识，保留任务以便重试" };
+    const hash = task.commandHash || commandHash(task.command, task.cwd);
+    const markerName = task.exitMarkerPath ? path.basename(task.exitMarkerPath) : "";
+    if (!info.commandLine || (!info.commandLine.includes(hash) && (!markerName || !info.commandLine.includes(markerName)))) {
+        return { ok: false, terminal: false, reason: "无法安全迁移 PID 启动标识，保留任务以便重试" };
+    }
+    const createdAtMs = task.createdAtMs ?? task.startTime;
+    if (!info.createdAtMs || Math.abs(info.createdAtMs - createdAtMs) > 60_000) return { ok: false, terminal: true, reason: "PID 启动标识不匹配当前任务" };
+    task.processIdentity = { pid: task.pid, startId: info.startId };
+    return { ok: true };
 }
 
 /**
  * 刷新任务状态（检查 PID 是否还在）
  */
-function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentityDependencies = {}): void {
-    if (task.status !== "running") return;
+function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentityDependencies = {}): boolean {
+    if (task.status !== "running") return false;
+    const before = JSON.stringify(task);
 
     const marker = readExitMarker(task);
     if (marker?.done) {
@@ -556,17 +716,21 @@ function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentity
         task.statusReason = task.memoryLimitHit ? "memory_limit" : undefined;
         task.missingPidSinceMs = undefined;
         releaseLaunchLease(task.id);
-        return;
+        return JSON.stringify(task) !== before;
     }
 
     const validation = validatePidForTask(task, dependencies);
     if (!validation.ok) {
+        if (!validation.terminal) {
+            task.statusReason = validation.reason;
+            return JSON.stringify(task) !== before;
+        }
         const pidMissing = validation.reason === "PID 已不存在";
         if (pidMissing && task.exitMarkerPath) {
             const now = Date.now();
             task.missingPidSinceMs ??= now;
             task.statusReason = "PID 已退出，等待完成标记落盘";
-            if (now - task.missingPidSinceMs < LAUNCH_EXIT_MARKER_GRACE_MS) return;
+            if (now - task.missingPidSinceMs < LAUNCH_EXIT_MARKER_GRACE_MS) return JSON.stringify(task) !== before;
         }
         task.status = pidMissing && !task.exitMarkerPath ? "done" : "failed";
         task.exitCode = task.status === "done" ? 0 : null;
@@ -576,6 +740,47 @@ function refreshTaskStatus(task: LaunchTask, dependencies: LaunchProcessIdentity
             : `无法确认任务 PID 身份: ${validation.reason || "未知原因"}`;
         releaseLaunchLease(task.id);
     }
+    return JSON.stringify(task) !== before;
+}
+
+async function refreshTaskStatusAsync(task: LaunchTask): Promise<boolean> {
+    if (task.status !== "running") return false;
+    const before = JSON.stringify(task);
+    const marker = readExitMarker(task);
+    if (marker?.done) {
+        task.exitCode = typeof marker.exitCode === "number" ? marker.exitCode : null;
+        task.finishedAtMs = marker.finishedAtMs;
+        task.status = task.exitCode === 0 ? "done" : "failed";
+        task.peakMemoryMB = Number.isFinite(marker.peakMemoryBytes)
+            ? Math.round(Number(marker.peakMemoryBytes) / 1024 / 1024)
+            : undefined;
+        task.memoryLimitHit = marker.memoryLimitHit === true;
+        task.statusReason = task.memoryLimitHit ? "memory_limit" : undefined;
+        task.missingPidSinceMs = undefined;
+        releaseLaunchLease(task.id);
+        return JSON.stringify(task) !== before;
+    }
+
+    const validation = await validatePidForTaskAsync(task);
+    if (!validation.ok) {
+        if (!validation.terminal) {
+            task.statusReason = validation.reason;
+            return JSON.stringify(task) !== before;
+        }
+        const pidMissing = validation.reason === "PID 已不存在";
+        if (pidMissing && task.exitMarkerPath) {
+            const now = Date.now();
+            task.missingPidSinceMs ??= now;
+            task.statusReason = "PID 已退出，等待完成标记落盘";
+            if (now - task.missingPidSinceMs < LAUNCH_EXIT_MARKER_GRACE_MS) return JSON.stringify(task) !== before;
+        }
+        task.status = pidMissing && !task.exitMarkerPath ? "done" : "failed";
+        task.exitCode = task.status === "done" ? 0 : null;
+        task.finishedAtMs = Date.now();
+        task.statusReason = pidMissing ? undefined : `无法确认任务 PID 身份: ${validation.reason || "未知原因"}`;
+        releaseLaunchLease(task.id);
+    }
+    return JSON.stringify(task) !== before;
 }
 
 export function reapLaunchTasksOnce(
@@ -585,12 +790,12 @@ export function reapLaunchTasksOnce(
     const tasks = readAllTasks();
     let adopted = 0;
     for (const task of tasks) {
-        refreshTaskStatus(task, dependencies);
+        const changed = refreshTaskStatus(task, dependencies);
         if (task.status === "running" && adoptMissingLeases && !launchLeases.has(task.id)) {
             launchLeases.set(task.id, adoptResourceLease(task.reservationMB || 256));
             adopted += 1;
         }
-        writeTask(task);
+        if (changed) writeTask(task);
     }
     return {
         running: tasks.filter(task => task.status === "running").length,
@@ -599,12 +804,88 @@ export function reapLaunchTasksOnce(
     };
 }
 
+function yieldToEventLoop(): Promise<void> {
+    return new Promise(resolve => setImmediate(resolve));
+}
+
+async function reapLaunchTasksInBackground(): Promise<void> {
+    let entries: fs.Dirent[];
+    try {
+        entries = await fs.promises.readdir(TASK_REGISTRY_DIR, { withFileTypes: true });
+    } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") entries = [];
+        else throw err;
+    }
+    const newFiles = entries
+        .filter(entry => entry.isFile() && entry.name.endsWith(".json") && !scannedTaskFiles.has(entry.name))
+        .map(entry => entry.name);
+
+    for (let index = 0; index < newFiles.length; index += 64) {
+        const batch = newFiles.slice(index, index + 64);
+        const parsed = await Promise.allSettled(batch.map(async fileName => ({ fileName, value: await readTaskFile(fileName) })));
+        for (const result of parsed) {
+            if (result.status !== "fulfilled") throw result.reason;
+            const { fileName, value } = result.value;
+            scannedTaskFiles.add(fileName);
+            if (!("deleted" in value) && value.status === "running") activeReaperTasks.set(value.id, value);
+        }
+        await yieldToEventLoop();
+    }
+
+    if (!legacyRegistryScanned) {
+        for (const task of await readLegacyRegistryStrict()) {
+            if (!scannedTaskFiles.has(`${safeTaskFileName(task.id)}.json`) && task.status === "running") activeReaperTasks.set(task.id, task);
+        }
+        legacyRegistryScanned = true;
+    }
+
+    for (const trackedTask of [...activeReaperTasks.values()]) {
+        const fileName = `${safeTaskFileName(trackedTask.id)}.json`;
+        let task: LaunchTask | LaunchTombstone | null = await readTaskFile(fileName);
+        if (!task && !scannedTaskFiles.has(fileName)) {
+            task = readLegacyRegistry().find(candidate => candidate.id === trackedTask.id) || null;
+        }
+        if (!task || "deleted" in task || task.status !== "running") {
+            activeReaperTasks.delete(trackedTask.id);
+            releaseLaunchLease(trackedTask.id);
+            continue;
+        }
+
+        const beforeRefresh = JSON.stringify(task);
+        const changed = await refreshTaskStatusAsync(task);
+        if (task.status === "running" && !launchLeases.has(task.id)) {
+            launchLeases.set(task.id, adoptResourceLease(task.reservationMB || 256));
+        }
+        if (changed) {
+            writeTaskIfUnchanged(task, beforeRefresh);
+        }
+        if (task.status !== "running") activeReaperTasks.delete(task.id);
+        await yieldToEventLoop();
+    }
+}
+
 function ensureLaunchReaper(): void {
     if (launchReaperStarted) return;
     launchReaperStarted = true;
+    resourceAdmission.setRecoveryPending(true);
+    const run = () => {
+        if (launchReaperRunning) return;
+        launchReaperRunning = true;
+        void reapLaunchTasksInBackground().then(() => {
+            if (!launchReaperReady) {
+                launchReaperReady = true;
+                resourceAdmission.setRecoveryPending(false);
+            }
+        }).catch(err => {
+            console.warn(`[launch] resource reaper failed: ${err instanceof Error ? err.message : String(err)}`);
+        }).finally(() => {
+            launchReaperRunning = false;
+        });
+    };
+    run();
     const timer = setInterval(() => {
         try {
-            reapLaunchTasksOnce();
+            run();
         } catch (err) {
             console.warn(`[launch] resource reaper failed: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -612,13 +893,14 @@ function ensureLaunchReaper(): void {
     timer.unref?.();
 }
 
-async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise<void> {
+async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise<boolean> {
     const waitMs = Math.max(0, Math.min(waitSeconds, 300)) * 1000;
-    refreshTaskStatus(task);
-    if (waitMs <= 0 || task.status !== "running") return;
+    let changed = await refreshTaskStatusAsync(task);
+    if (waitMs <= 0 || task.status !== "running") return changed;
 
-    await new Promise<void>((resolve) => {
+    return new Promise<boolean>((resolve) => {
         let done = false;
+        let refreshRunning = false;
         let timer: NodeJS.Timeout;
         let interval: NodeJS.Timeout;
         const finish = () => {
@@ -626,13 +908,19 @@ async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise
             done = true;
             clearTimeout(timer);
             clearInterval(interval);
-            resolve();
+            resolve(changed);
         };
 
         timer = setTimeout(finish, waitMs);
         interval = setInterval(() => {
-            refreshTaskStatus(task);
+            if (refreshRunning) return;
+            refreshRunning = true;
+            void refreshTaskStatusAsync(task).then(didChange => {
+            changed ||= didChange;
             if (task.status !== "running") finish();
+            }).finally(() => {
+                refreshRunning = false;
+            });
         }, 2000);
         timer.unref?.();
         interval.unref?.();
@@ -645,11 +933,32 @@ async function waitForLaunchTask(task: LaunchTask, waitSeconds: number): Promise
 function tailFile(filePath: string, lines: number): string {
     try {
         if (!fs.existsSync(filePath)) return "(日志文件尚未创建)";
-        const content = fs.readFileSync(filePath, "utf-8");
-        if (!content.trim()) return "(日志为空)";
-        const allLines = content.trimEnd().split("\n");
-        if (allLines.length <= lines) return allLines.join("\n");
-        return allLines.slice(-lines).join("\n");
+        const descriptor = fs.openSync(filePath, "r");
+        try {
+            const size = fs.fstatSync(descriptor).size;
+            if (size === 0) return "(日志为空)";
+            const chunkSize = 8 * 1024;
+            const maxBytes = 512 * 1024;
+            let remaining = size;
+            let readBytes = 0;
+            const chunks: Buffer[] = [];
+            let newlineCount = 0;
+            while (remaining > 0 && readBytes < maxBytes && newlineCount <= lines) {
+                const length = Math.min(chunkSize, remaining, maxBytes - readBytes);
+                remaining -= length;
+                const buffer = Buffer.allocUnsafe(length);
+                fs.readSync(descriptor, buffer, 0, length, remaining);
+                chunks.unshift(buffer);
+                for (const byte of buffer) if (byte === 10) newlineCount += 1;
+                readBytes += length;
+            }
+            const content = Buffer.concat(chunks).toString("utf-8");
+            const allLines = content.trimEnd().split("\n");
+            const tail = allLines.slice(-lines).join("\n");
+            return remaining > 0 ? `(日志尾部已限于 ${maxBytes} bytes)\n${tail}` : tail || "(日志为空)";
+        } finally {
+            fs.closeSync(descriptor);
+        }
     } catch (err) {
         return `(读取失败: ${err})`;
     }
@@ -670,7 +979,6 @@ function getFileSize(filePath: string): number {
 
 export function getLaunchTaskCount(): { running: number; total: number } {
     const tasks = readAllTasks();
-    tasks.forEach(task => refreshTaskStatus(task));
     return {
         running: tasks.filter(t => t.status === "running").length,
         total: tasks.length,
@@ -703,7 +1011,6 @@ const LaunchParamsShape = {
 };
 
 export function registerLaunch(server: McpServer): void {
-    reapLaunchTasksOnce();
     ensureLaunchReaper();
     server.tool(
         "sandbox_launch",
@@ -738,8 +1045,9 @@ export function registerLaunch(server: McpServer): void {
             // ── list ──
             if (action === "list") {
                 const tasks = readAllTasks();
-                tasks.forEach(task => refreshTaskStatus(task));
-                tasks.forEach(writeTask);
+                for (const task of tasks) {
+                    if (await refreshTaskStatusAsync(task)) writeTask(task);
+                }
                 const visibleTasks = tasks.filter(t => hasOwnerAccess(t.ownerId, ownerId));
 
                 if (visibleTasks.length === 0) {
@@ -762,7 +1070,9 @@ export function registerLaunch(server: McpServer): void {
             // ── clean ──
             if (action === "clean") {
                 const tasks = readAllTasks();
-                tasks.forEach(task => refreshTaskStatus(task));
+                for (const task of tasks) {
+                    if (await refreshTaskStatusAsync(task)) writeTask(task);
+                }
                 const taskId = params.taskId as string | undefined;
 
                 const toClean = taskId
@@ -780,11 +1090,8 @@ export function registerLaunch(server: McpServer): void {
                     cleaned++;
                 }
 
-                const remaining = tasks.filter(t => !toClean.includes(t));
-                remaining.forEach(writeTask);
-
                 return appendTiming({
-                    content: [{ type: "text" as const, text: `🧹 清理了 ${cleaned} 个已完成任务（剩余 ${remaining.length} 个）\n` }],
+                    content: [{ type: "text" as const, text: `🧹 清理了 ${cleaned} 个已完成任务（剩余 ${tasks.length - cleaned} 个）\n` }],
                 });
             }
 
@@ -797,14 +1104,12 @@ export function registerLaunch(server: McpServer): void {
                     });
                 }
 
-                const tasks = readAllTasks();
-                const task = tasks.find(t => t.id === taskId);
+                const task = readTask(taskId);
                 if (!task) {
-                    const available = tasks.map(t => t.id);
                     return appendTiming({
                         content: [{
                             type: "text" as const,
-                            text: `❌ 未找到任务 ${taskId}\n可用任务: ${available.length > 0 ? available.join(", ") : "(无)"}`,
+                            text: `❌ 未找到任务 ${taskId}，可使用 list 查看当前可见任务`,
                         }],
                     });
                 }
@@ -816,22 +1121,30 @@ export function registerLaunch(server: McpServer): void {
 
                 // ── kill ──
                 if (action === "kill") {
-                    refreshTaskStatus(task);
-                    writeTask(task);
+                    const beforeRefresh = JSON.stringify(task);
+                    if (await refreshTaskStatusAsync(task)) writeTaskIfUnchanged(task, beforeRefresh);
                     if (task.status !== "running") {
                         return appendTiming({
                             content: [{ type: "text" as const, text: `⚠️ 任务 ${taskId} 已结束 (${task.status})\n` }],
                         });
                     }
 
-                    const validation = validatePidForTask(task);
+                    const beforeValidation = JSON.stringify(task);
+                    const validation = await validatePidForTaskAsync(task);
                     if (!validation.ok) {
+                        if (!validation.terminal) {
+                            task.statusReason = validation.reason;
+                            writeTaskIfUnchanged(task, beforeValidation);
+                            return appendTiming({
+                                content: [{ type: "text" as const, text: `⚠️ 终止前暂无法确认 PID 身份，任务仍保留运行并将重试: ${validation.reason}\n` }],
+                            });
+                        }
                         task.status = "failed";
                         task.exitCode = null;
                         task.finishedAtMs = Date.now();
-                        task.statusReason = `无法确认任务 PID 身份: ${validation.reason || "未知原因"}`;
+                        task.statusReason = `无法确认任务 PID 身份: ${validation.reason}`;
                         releaseLaunchLease(task.id);
-                        writeTask(task);
+                        writeTaskIfUnchanged(task, beforeValidation);
                         return appendTiming({
                             content: [{ type: "text" as const, text: `❌ 终止前校验失败: ${validation.reason}\n` }],
                         });
@@ -843,7 +1156,7 @@ export function registerLaunch(server: McpServer): void {
                         task.exitCode = -1;
                         task.finishedAtMs = Date.now();
                         releaseLaunchLease(task.id);
-                        writeTask(task);
+                        writeTaskIfUnchanged(task, beforeValidation);
                         return appendTiming({
                             content: [{ type: "text" as const, text: `🛑 已终止任务 ${taskId} (PID ${task.pid})\n` }],
                         });
@@ -857,13 +1170,15 @@ export function registerLaunch(server: McpServer): void {
                 // ── status ──
                 const waitSeconds = (params.waitSeconds as number | undefined) || 0;
                 const tailLines = (params.tailLines as number | undefined) || 10;
+                const beforeWaiting = JSON.stringify(task);
 
                 // 主动等待
-                await waitForLaunchTask(task, waitSeconds);
+                const changedWhileWaiting = await waitForLaunchTask(task, waitSeconds);
 
                 // 刷新状态
-                refreshTaskStatus(task);
-                writeTask(task);
+                if (changedWhileWaiting || await refreshTaskStatusAsync(task)) {
+                    writeTaskIfUnchanged(task, beforeWaiting);
+                }
 
                 const elapsed = formatElapsed(Date.now() - task.startTime);
                 const logTail = tailFile(task.stdoutLog, tailLines);

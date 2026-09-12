@@ -4,7 +4,7 @@
 
 | Area | Contents |
 | --- | --- |
-| MCP | memory-store 1.24.0, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0 |
+| MCP | memory-store 1.24.0, web-fetcher 7.0.0, sandbox 1.17.3, broker 0.1.0 |
 | Optional MCP | Windsurf-only mcp-subagent 1.1.0, NapCat QQ group collaboration 0.2.0 |
 | Rules | Four composable Codex profiles, Antigravity, Claude Code, Windsurf global + five system fragments |
 | Skills | 18 license-reviewed portable user skills plus manifest |
@@ -17,13 +17,18 @@
 - Memory Store 1.24.0 follows Codex `history_base` references using physical rollout identifiers and bounded inherited prefixes. The complete source manifest participates in cache invalidation and background fetch snapshots, including same-thread rollout replacement.
 - Only Memory Store and its package metadata are updated by this change; receiver-private configuration, raw history, and persistent data remain outside the package.
 
+## 2026-09-12 Sandbox update
+
+- Sandbox 1.17.3 adds incident-shaped low-memory admission replay, full-pressure freshness checks on Windows, per-lease observation credit, and explicit blocking decisions. Only existing unobserved reservations receive the configurable 25% physical weighting when complete commit accounting preserves 4096MB; new requests, aged protection, and commit accounting remain undiscounted.
+- Launch maintenance becomes incremental and asynchronous, does not rewrite unchanged terminal tasks, keeps recovery admission blocked until existing leases are accounted for, and preserves task identity and deletion boundaries during concurrent queries. Focused tests include real Windows child execution and 1500 synthetic terminal records, without stressing the production host's memory.
+
 ## 2026-08-05 Changes
 
 - Codex Rules now separate a shared engineering core from optional catgirl, development-machine, and training-machine overlays. Four profile manifests build `neutral`, `catgirl`, `development`, and `training` configurations without duplicating the engineering workflow.
 - Added Codex profile build and install scripts. Installation backs up overwritten AGENTS, guidance, and optional system-prompt files; real machine identities and bindings must be supplied through a repository-external local override.
 - NapCat autostart now uses an internal windowless launcher plus a long-running supervisor watchdog, so interactive logon does not expose PowerShell consoles and unexpected supervisor exits are retried without replacing receiver-private state.
 - Added public-safe Bug/compatibility and Feature Request Issue forms for cross-machine MCP maintenance.
-- Common MCP versions are memory-store 1.23.10, web-fetcher 7.0.0, sandbox 1.17.2, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
+- Common MCP versions are memory-store 1.24.0, web-fetcher 7.0.0, sandbox 1.17.3, broker 0.1.0, and Windsurf-only mcp-subagent 1.1.0.
 - Memory Store 1.23.0 adds read-only DeepSeek Harness v0 JSONL/Zstandard sessions as a fifth data source, publishes them through the existing verified fetch-generation cache, keeps synthetic/tool/subagent/automation events out of human turns, and never exposes DSH as a model provider.
 - Memory Store 1.23.1 replaces Node's high-allocation Zstd path with bounded per-frame JavaScript decoding plus WASM checksum verification, preserving live trailing-frame recovery and cache revision invalidation.
 - Memory Store 1.23.6 keeps Windsurf/Antigravity PB and LS fetch generations equivalent when they differ only by attachment placeholders, planner reasoning placement, or PB wire variants; `auto` preserves LS semantic tool calls when content matches, and Record update/batch update can explicitly select `source=auto|local|ls|cache`.

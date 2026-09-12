@@ -227,6 +227,9 @@ Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表�
 
 `maxMemoryMB` 的允许上限由服务端配置并在 `sandbox_status` 的「工具内存配置」中展示，不能把参数越界误解成整机内存压力。`working_directory_missing`、`windows_job_runner_missing` 等启动前错误必须保持 `commandStarted=false`，不得绕过 Sandbox 改用原生命令；`mayHaveStarted=true` 时先检查副作用再决定是否重试。大目录 exact 搜索会流式到全局 `maxResults` 后停止；fuzzy/smart 仍优先后台运行，需要取消时用同一 `taskId` 加 `cancel=true`，不要靠并发重发制造更多压力。
 
+Sandbox 对不超过 192MB 的小请求仅在新鲜 Windows 压力样本、无低内存警报且扣足完整预留后提交余量仍守住 4096MB 时，按默认 25% 折算未观测预留的物理占用；提交预留不折算，512MB 物理与 1536MB 提交底线不变。等待失败时先看 `admissionDecision.blockedBy` 的具体原因，不能用并发重试绕过保护。
+Windows 完整压力样本缺失/过期，或后台任务资源记账尚未恢复时，新执行请求会继续排队或返回未启动的接纳超时；查询与取消仍可用，应等待状态恢复而不是绕过 Sandbox。
+
 以上是 Sandbox 内部状态，不替代 Codex 宿主自己的 MCP 外层期限与短轮询策略：
 
 共享 Codex HTTP broker 的普通 tool call 默认超时 120 秒。参数含 `waitSeconds>0` 时按 `waitSeconds*1000+15000` 计算；`timeout` 大于普通上限时按 `timeout+15000` 计算；默认上限 30 分钟。

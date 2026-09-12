@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { execute, ExecResult, normalizeExecutionInput } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import type { ResourceAdmissionDecision } from "../resource-admission.js";
 import { DEFAULT_METADATA_RESERVE_BYTES, HARD_RESPONSE_BYTE_LIMIT } from "../output-delivery.js";
 import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB } from "../memory-limits.js";
 
@@ -73,6 +74,7 @@ interface BatchTaskResult {
     mayHaveStarted?: boolean;
     runMs?: number;
     retryAfterMs?: number;
+    admissionDecision?: ResourceAdmissionDecision;
     deliveryMode?: ExecResult["deliveryMode"];
     artifact?: ExecResult["artifact"];
     outputStats?: ExecResult["outputStats"];
@@ -188,6 +190,7 @@ export function registerBatch(server: McpServer): void {
                             killed: result.killed,
                             killReason: result.killReason,
                             retryAfterMs: result.retryAfterMs,
+                            admissionDecision: result.admissionDecision,
                             artifact: result.artifact,
                         })),
                     } } : {}),
@@ -333,7 +336,7 @@ async function executeTask(
             index,
             exitCode: 1,
             stdout: "",
-            stderr: `${admissionError.type}: 命令尚未启动`,
+            stderr: `${admissionError.type}: 命令尚未启动；${admissionError.admissionDecision?.blockedBy.join(", ") || "resource_admission"}`,
             elapsed: "0ms",
             killed: false,
             killReason: null,
@@ -343,6 +346,10 @@ async function executeTask(
             queueWaitMs: admissionError.queueWaitMs,
             errorType: admissionError.type,
             retryAfterMs: admissionError.retryAfterMs,
+            admissionDecision: admissionError.admissionDecision,
+            commandStarted: false,
+            mayHaveStarted: false,
+            runMs: 0,
         };
     }
 

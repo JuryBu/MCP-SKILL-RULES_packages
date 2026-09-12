@@ -7,6 +7,8 @@ export const RESOURCE_ADMISSION_DEFAULTS = Object.freeze({
     commitCriticalFloorMB: 1536,
     yellowPhysicalMemoryMB: 1536,
     yellowMaxReservationMB: 192,
+    smallRequestPhysicalWeight: 0.25,
+    pressureSampleMaxAgeMs: 2000,
     maxAgedReservationMB: 256,
     maxQueueSize: 256,
     admissionBudgetMinMs: 8000,
@@ -28,18 +30,21 @@ export class ResourceAdmissionError extends Error {
     readonly code: ResourceAdmissionErrorCode;
     readonly queueWaitMs: number;
     readonly retryAfterMs: number;
+    readonly admissionDecision?: ResourceAdmissionDecision;
 
     constructor(
         code: ResourceAdmissionErrorCode,
         message: string,
         queueWaitMs = 0,
         retryAfterMs = 0,
+        admissionDecision?: ResourceAdmissionDecision,
     ) {
         super(message);
         this.name = "ResourceAdmissionError";
         this.code = code;
         this.queueWaitMs = queueWaitMs;
         this.retryAfterMs = retryAfterMs;
+        this.admissionDecision = admissionDecision;
     }
 
     toJSON(): {
@@ -48,6 +53,7 @@ export class ResourceAdmissionError extends Error {
         message: string;
         queueWaitMs: number;
         retryAfterMs: number;
+        admissionDecision?: ResourceAdmissionDecision;
     } {
         return {
             name: this.name,
@@ -55,6 +61,7 @@ export class ResourceAdmissionError extends Error {
             message: this.message,
             queueWaitMs: this.queueWaitMs,
             retryAfterMs: this.retryAfterMs,
+            admissionDecision: this.admissionDecision,
         };
     }
 }
@@ -68,6 +75,9 @@ export interface ResourceAdmissionOptions {
     commitCriticalFloorMB?: number;
     yellowPhysicalMemoryMB?: number;
     yellowMaxReservationMB?: number;
+    smallRequestPhysicalWeight?: number;
+    pressureSampleMaxAgeMs?: number;
+    requireFreshPressureSample?: boolean;
     maxAgedReservationMB?: number;
     maxQueueSize?: number;
     admissionBudgetMinMs?: number;
@@ -92,6 +102,16 @@ export interface ResourceAdmissionRequest {
 
 export type ResourcePressureLevel = "green" | "yellow" | "red";
 
+export interface ResourceAdmissionDecision {
+    reservedMB: number;
+    protectedReservationMB: number;
+    physicalReservationWeight: number;
+    projectedPhysicalAvailableMB: number | null;
+    projectedCommitAvailableMB: number | null;
+    pressureSampleAgeMs: number | null;
+    blockedBy: string[];
+}
+
 export interface ResourceWaitProgress {
     queueWaitMs: number;
     queuePosition: number;
@@ -101,6 +121,7 @@ export interface ResourceWaitProgress {
     observedMemoryMB: number;
     systemAvailableMemoryMB: number | null;
     commitAvailableMemoryMB: number | null;
+    admissionDecision?: ResourceAdmissionDecision;
 }
 
 export interface ResourceLease {
@@ -120,6 +141,8 @@ export interface ResourceAdmissionState {
         commitCriticalFloorMB: number;
         yellowPhysicalMemoryMB: number;
         yellowMaxReservationMB: number;
+        smallRequestPhysicalWeight: number;
+        pressureSampleMaxAgeMs: number;
         maxQueueSize: number;
     };
     activeReservedMB: number;
@@ -132,6 +155,7 @@ export interface ResourceAdmissionState {
     lowMemorySignaled: boolean | null;
     pressureLevel: ResourcePressureLevel;
     hardLimitExceeded: boolean;
+    recoveryPending: boolean;
     peak: {
         activeReservedMB: number;
         queued: number;
@@ -188,6 +212,9 @@ export class ResourceAdmissionController {
     readonly commitCriticalFloorMB: number;
     readonly yellowPhysicalMemoryMB: number;
     readonly yellowMaxReservationMB: number;
+    readonly smallRequestPhysicalWeight: number;
+    readonly pressureSampleMaxAgeMs: number;
+    readonly requireFreshPressureSample: boolean;
     readonly maxQueueSize: number;
 
     private readonly admissionBudgetMinMs: number;
@@ -215,10 +242,13 @@ export class ResourceAdmissionController {
     private activeReservedMB = 0;
     private activeLeases = 0;
     private observedMemoryMB = 0;
+    private observedReservationCreditMB = 0;
     private systemAvailableMemoryMB = Number.POSITIVE_INFINITY;
     private commitAvailableMemoryMB = Number.POSITIVE_INFINITY;
     private highMemorySignaled: boolean | null = null;
     private lowMemorySignaled: boolean | null = null;
+    private pressureSampleAt: number | null = null;
+    private recoveryPending = false;
     private peakActiveReservedMB = 0;
     private peakQueued = 0;
     private peakObservedMemoryMB = 0;
@@ -267,6 +297,20 @@ export class ResourceAdmissionController {
             RESOURCE_ADMISSION_DEFAULTS.yellowMaxReservationMB,
             "yellowMaxReservationMB",
         );
+        this.smallRequestPhysicalWeight = positiveNumber(
+            options.smallRequestPhysicalWeight,
+            RESOURCE_ADMISSION_DEFAULTS.smallRequestPhysicalWeight,
+            "smallRequestPhysicalWeight",
+        );
+        if (this.smallRequestPhysicalWeight > 1) {
+            throw new RangeError("smallRequestPhysicalWeight must be at most 1");
+        }
+        this.pressureSampleMaxAgeMs = positiveNumber(
+            options.pressureSampleMaxAgeMs,
+            RESOURCE_ADMISSION_DEFAULTS.pressureSampleMaxAgeMs,
+            "pressureSampleMaxAgeMs",
+        );
+        this.requireFreshPressureSample = options.requireFreshPressureSample === true;
         this.maxAgedReservationMB = nonNegativeNumber(
             options.maxAgedReservationMB,
             RESOURCE_ADMISSION_DEFAULTS.maxAgedReservationMB,
@@ -401,16 +445,21 @@ export class ResourceAdmissionController {
         return this.createLease(this.normalizeReservation(reservationMB), false);
     }
 
-    updateObservedMemoryMB(observedMemoryMB: number): ResourceAdmissionState {
+    updateObservedMemoryMB(observedMemoryMB: number, reservationCreditMB = observedMemoryMB): ResourceAdmissionState {
         if (!Number.isFinite(observedMemoryMB) || observedMemoryMB < 0) {
             throw new RangeError("observedMemoryMB must be a finite non-negative number");
         }
+        if (!Number.isFinite(reservationCreditMB) || reservationCreditMB < 0 || reservationCreditMB > observedMemoryMB) {
+            throw new RangeError("reservationCreditMB must be finite and between zero and observedMemoryMB");
+        }
 
-        const wasBlocked = this.observedMemoryMB >= this.hardLimitMB;
+        const previousObservedMemoryMB = this.observedMemoryMB;
+        const previousCreditMB = this.observedReservationCreditMB;
         this.observedMemoryMB = observedMemoryMB;
+        this.observedReservationCreditMB = reservationCreditMB;
         this.peakObservedMemoryMB = Math.max(this.peakObservedMemoryMB, observedMemoryMB);
 
-        if (wasBlocked && observedMemoryMB < this.hardLimitMB) {
+        if (observedMemoryMB !== previousObservedMemoryMB || reservationCreditMB !== previousCreditMB) {
             this.drainQueue();
         }
 
@@ -423,6 +472,7 @@ export class ResourceAdmissionController {
         }
 
         const previous = this.systemAvailableMemoryMB;
+        this.pressureSampleAt = null;
         this.systemAvailableMemoryMB = systemAvailableMemoryMB;
         if (systemAvailableMemoryMB > previous) this.drainQueue();
         return this.getState();
@@ -446,10 +496,14 @@ export class ResourceAdmissionController {
         this.commitAvailableMemoryMB = sample.commitAvailableMemoryMB;
         this.highMemorySignaled = sample.highMemorySignaled;
         this.lowMemorySignaled = sample.lowMemorySignaled;
+        const previousSampleAt = this.pressureSampleAt;
+        this.pressureSampleAt = this.now();
         if (sample.systemAvailableMemoryMB > previousPhysical
             || sample.commitAvailableMemoryMB > previousCommit
             || (previousLowMemory === true && !sample.lowMemorySignaled)
-            || (previousHighMemory === false && sample.highMemorySignaled)) {
+            || (previousHighMemory === false && sample.highMemorySignaled)
+            || previousSampleAt === null
+            || this.pressureSampleAt - previousSampleAt > this.pressureSampleMaxAgeMs) {
             this.drainQueue();
         }
         return this.getState();
@@ -467,6 +521,8 @@ export class ResourceAdmissionController {
                 commitCriticalFloorMB: this.commitCriticalFloorMB,
                 yellowPhysicalMemoryMB: this.yellowPhysicalMemoryMB,
                 yellowMaxReservationMB: this.yellowMaxReservationMB,
+                smallRequestPhysicalWeight: this.smallRequestPhysicalWeight,
+                pressureSampleMaxAgeMs: this.pressureSampleMaxAgeMs,
                 maxQueueSize: this.maxQueueSize,
             },
             activeReservedMB: this.activeReservedMB,
@@ -483,6 +539,7 @@ export class ResourceAdmissionController {
             lowMemorySignaled: this.lowMemorySignaled,
             pressureLevel: this.getPressureLevel(),
             hardLimitExceeded: this.observedMemoryMB >= this.hardLimitMB,
+            recoveryPending: this.recoveryPending,
             peak: {
                 activeReservedMB: this.peakActiveReservedMB,
                 queued: this.peakQueued,
@@ -495,6 +552,11 @@ export class ResourceAdmissionController {
                     : this.waitCounters.totalMs / completedTotal,
             },
         };
+    }
+
+    setRecoveryPending(pending: boolean): void {
+        this.recoveryPending = pending;
+        if (!pending) this.drainQueue();
     }
 
     private normalizeReservation(reservationMB: number | undefined): number {
@@ -524,13 +586,16 @@ export class ResourceAdmissionController {
             || this.systemAvailableMemoryMB < this.systemHeadroomMB
             || this.commitAvailableMemoryMB < this.commitCriticalFloorMB) return "red";
         if (this.highMemorySignaled === false
+            || this.recoveryPending
+            || (this.requireFreshPressureSample && (this.pressureSampleAt === null
+                || this.now() - this.pressureSampleAt > this.pressureSampleMaxAgeMs))
             || this.systemAvailableMemoryMB < this.yellowPhysicalMemoryMB
             || this.commitAvailableMemoryMB < this.commitHeadroomMB) return "yellow";
         return "green";
     }
 
-    private canGrant(reservedMB: number, protectedReservationMB = 0): boolean {
-        const reservedButNotObservedMB = Math.max(0, this.activeReservedMB - this.observedMemoryMB);
+    inspectAdmission(reservedMB: number, protectedReservationMB = 0): ResourceAdmissionDecision {
+        const reservedButNotObservedMB = Math.max(0, this.activeReservedMB - this.observedReservationCreditMB);
         const isSmallRequest = reservedMB <= this.yellowMaxReservationMB;
         const requiredPhysicalHeadroomMB = isSmallRequest
             ? this.systemHeadroomMB
@@ -538,21 +603,49 @@ export class ResourceAdmissionController {
         const requiredCommitHeadroomMB = isSmallRequest
             ? this.commitCriticalFloorMB
             : this.commitHeadroomMB;
-        const preservesSystemHeadroom = this.systemAvailableMemoryMB
+        const projectedCommitAvailableMB = this.commitAvailableMemoryMB
             - reservedButNotObservedMB
             - reservedMB
-            - protectedReservationMB >= requiredPhysicalHeadroomMB;
-        const preservesCommitHeadroom = this.commitAvailableMemoryMB
-            - reservedButNotObservedMB
+            - protectedReservationMB;
+        const pressureSampleAgeMs = this.pressureSampleAt === null
+            ? null : Math.max(0, this.now() - this.pressureSampleAt);
+        const canUseCommitSlack = isSmallRequest
+            && this.lowMemorySignaled === false
+            && pressureSampleAgeMs !== null
+            && pressureSampleAgeMs <= this.pressureSampleMaxAgeMs
+            && Number.isFinite(projectedCommitAvailableMB)
+            && projectedCommitAvailableMB >= this.commitHeadroomMB;
+        const physicalReservationWeight = canUseCommitSlack ? this.smallRequestPhysicalWeight : 1;
+        const projectedPhysicalAvailableMB = this.systemAvailableMemoryMB
+            - reservedButNotObservedMB * physicalReservationWeight
             - reservedMB
-            - protectedReservationMB >= requiredCommitHeadroomMB;
+            - protectedReservationMB;
         const pressureLevel = this.getPressureLevel();
-        return pressureLevel !== "red"
-            && !(pressureLevel === "yellow" && !isSmallRequest)
-            && this.observedMemoryMB < this.hardLimitMB
-            && this.activeReservedMB + reservedMB + protectedReservationMB <= this.admissionLimitMB
-            && preservesSystemHeadroom
-            && preservesCommitHeadroom;
+        const blockedBy: string[] = [];
+        if (this.recoveryPending) blockedBy.push("resource_recovery_pending");
+        if (this.requireFreshPressureSample && pressureSampleAgeMs === null) blockedBy.push("missing_pressure_sample");
+        if (this.requireFreshPressureSample && pressureSampleAgeMs !== null
+            && pressureSampleAgeMs > this.pressureSampleMaxAgeMs) blockedBy.push("stale_pressure_sample");
+        if (this.lowMemorySignaled === true) blockedBy.push("windows_low_memory");
+        if (pressureLevel === "red") blockedBy.push("emergency_pressure");
+        if (pressureLevel === "yellow" && !isSmallRequest) blockedBy.push("heavy_request_yellow");
+        if (this.observedMemoryMB >= this.hardLimitMB) blockedBy.push("observed_hard_limit");
+        if (this.activeReservedMB + reservedMB + protectedReservationMB > this.admissionLimitMB) blockedBy.push("reservation_capacity");
+        if (projectedPhysicalAvailableMB < requiredPhysicalHeadroomMB) blockedBy.push("physical_headroom");
+        if (projectedCommitAvailableMB < requiredCommitHeadroomMB) blockedBy.push("commit_headroom");
+        return {
+            reservedMB,
+            protectedReservationMB,
+            physicalReservationWeight,
+            projectedPhysicalAvailableMB: Number.isFinite(projectedPhysicalAvailableMB) ? projectedPhysicalAvailableMB : null,
+            projectedCommitAvailableMB: Number.isFinite(projectedCommitAvailableMB) ? projectedCommitAvailableMB : null,
+            pressureSampleAgeMs,
+            blockedBy,
+        };
+    }
+
+    private canGrant(reservedMB: number, protectedReservationMB = 0): boolean {
+        return this.inspectAdmission(reservedMB, protectedReservationMB).blockedBy.length === 0;
     }
 
     private grantImmediate(reservedMB: number): ResourceLease {
@@ -684,6 +777,7 @@ export class ResourceAdmissionController {
                     commitAvailableMemoryMB: Number.isFinite(this.commitAvailableMemoryMB)
                         ? this.commitAvailableMemoryMB
                         : null,
+                    admissionDecision: this.inspectPending(pending),
                 });
             } catch {
             }
@@ -709,6 +803,7 @@ export class ResourceAdmissionController {
     ): void {
         if (pending.settled) return;
 
+        const admissionDecision = this.inspectPending(pending);
         const queueWaitMs = this.finishPending(pending);
         this.recordCompletedWait(queueWaitMs);
 
@@ -722,10 +817,19 @@ export class ResourceAdmissionController {
                 "Sandbox resource admission timed out before the command started",
                 queueWaitMs,
                 this.computeRetryAfterMs(pending.retryAttempt),
+                admissionDecision,
             ));
         }
 
         this.drainQueue();
+    }
+
+    private inspectPending(pending: PendingRequest): ResourceAdmissionDecision {
+        const oldest = this.queue.find((request) => !request.settled);
+        const protectedReservationMB = oldest && oldest !== pending
+            ? this.computeAgedReservation(oldest, Math.max(0, this.now() - oldest.enqueuedAt))
+            : 0;
+        return this.inspectAdmission(pending.reservedMB, protectedReservationMB);
     }
 
     private finishPending(pending: PendingRequest): number {

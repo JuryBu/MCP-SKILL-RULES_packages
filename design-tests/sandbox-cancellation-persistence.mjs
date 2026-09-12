@@ -349,6 +349,7 @@ test("launch waits for an atomic exit marker before declaring a missing PID fail
 });
 
 let passed = 0;
+const testKeepAlive = setInterval(() => {}, 1000);
 try {
     for (const { name, run } of tests) {
         await run();
@@ -357,5 +358,6 @@ try {
     }
     console.log(`\n${passed}/${tests.length} sandbox cancellation/persistence tests passed`);
 } finally {
+    clearInterval(testKeepAlive);
     fs.rmSync(dataRoot, { recursive: true, force: true });
 }

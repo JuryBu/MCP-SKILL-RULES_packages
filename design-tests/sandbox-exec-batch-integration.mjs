@@ -299,6 +299,7 @@ test("runMs measures execution after admission waiting without subtracting the q
         "--input-type=module",
         "--eval",
         `process.env.SANDBOX_DATA_ROOT=${JSON.stringify(path.join(dataRoot, "run-ms-probe"))};
+         setInterval(() => {}, 1000);
          process.env.SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB="0";
          process.env.SANDBOX_ADMISSION_LIMIT_MB="64";
          const { acquireResourceLease } = await import("./dist/resource-admission-runtime.js");
@@ -387,6 +388,7 @@ test("batch preserves startup classification for a missing cwd", async () => {
 });
 
 let passed = 0;
+const testKeepAlive = setInterval(() => {}, 1000);
 try {
     for (const { name, run } of tests) {
         await run();
@@ -395,5 +397,6 @@ try {
     }
     console.log(`\n${passed}/${tests.length} sandbox exec/batch integration tests passed`);
 } finally {
+    clearInterval(testKeepAlive);
     fs.rmSync(dataRoot, { recursive: true, force: true });
 }
