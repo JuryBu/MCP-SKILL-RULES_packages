@@ -32,3 +32,11 @@ dataChain=windsurf 读 WSF 对话，dataChain=dsh 只读 DeepSeek Harness sessio
 ## MCP web-fetcher
 
 网页截图/文本/交互/表格/链接提取、file://查看Office/PDF/图片/视频、格式转换(web_convert)、桌面应用调试(desktop_*)。需要登录态的网站由接收方在自己的设备上独立登录，模板不携带任何 Cookie 或账号状态。
+
+### 图文交付与人工登录（web-fetcher 7.1+）
+
+- 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。
+- 多图按页码、分片或标签顺序查看，检查报告的 `screenshotRef` 对应随附图片；数量、尺寸与总量限制以实时工具说明为准，超限应缩小范围或显式选择 file，不能把部分结果当成完整成功。
+- `web_login_browser` 与自动弹出的人工验证窗口最多提供 600 秒人工操作；登录建议 `background=true` 后持同一 `taskId` 以 `waitSeconds=30–45` 短轮询，避免宿主同步调用期限截断，不将十分钟人工窗口等同于单次 MCP 调用期限。
+- Cookie／localStorage 已写入不等于网站认证成功，纯 localStorage 登录也可能有 0 Cookie；应检查保存警告并实际访问目标页面验证，不能仅凭数量让用户重复登录。
+- 自动化测试在能力允许时优先无界面，仅确需人工处理时打开可见窗口；结束后只清理本任务拥有的会话、窗口和进程，不关闭借用的用户浏览器，不清理共享 Cookie、localStorage 或 profile。

@@ -339,8 +339,14 @@ Codex 链路特性：`read(startRound, endRound)` 按轮次精读，`depth="full
 - **网页调试**：`web_interact` 支持 DOM 检查、JS evaluate、点击输入、截图，可以像用开发者工具一样调试页面
 - 需要检查网页/PDF/PPTX 的结构、重叠、溢出、可读性或 AI 视觉审查时：用 `web_inspect`
 - 需要局域截图或截图对比时：用 `web_fetch_screenshot` 的 `target`、`scale`、`diff` 参数
-- `web_login_browser` 支持后台模式（`background=true`），Codex 侧推荐后台模式避免 60 秒超时
-- Cookie/localStorage 是全局共享登录态，不要当僵尸进程清理
+
+### 图文交付与人工登录（web-fetcher 7.1+）
+
+- 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。
+- 多图按页码、分片或标签顺序查看，检查报告的 `screenshotRef` 对应随附图片；数量、尺寸与总量限制以实时工具说明为准，超限应缩小范围或显式选择 file，不能把部分结果当成完整成功。
+- `web_login_browser` 与自动弹出的人工验证窗口最多提供 600 秒人工操作；登录建议 `background=true` 后持同一 `taskId` 以 `waitSeconds=30–45` 短轮询，避免宿主同步调用期限截断，不将十分钟人工窗口等同于单次 MCP 调用期限。
+- Cookie／localStorage 已写入不等于网站认证成功，纯 localStorage 登录也可能有 0 Cookie；应检查保存警告并实际访问目标页面验证，不能仅凭数量让用户重复登录。
+- 自动化测试在能力允许时优先无界面，仅确需人工处理时打开可见窗口；结束后只清理本任务拥有的会话、窗口和进程，不关闭借用的用户浏览器，不清理共享 Cookie、localStorage 或 profile。
 
 ### Session 管理与 Pipeline 复用
 

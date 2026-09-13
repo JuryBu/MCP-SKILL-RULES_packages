@@ -293,7 +293,12 @@ smart_search 提供三种搜索模式，按需选择：
   · 会话管理：web_interact 支持 sessionId 复用同一页面进行多轮交互；web_list_sessions 可列出保留会话，web_close_sessions 可关闭单个会话或清理指定 ownerId 的会话
   · 桌面工具族：desktop_* 工具（launch/connect_cdp/list_windows/register_window/screenshot/inspect/interact/close）可操作 Electron 应用和普通 Windows exe。Electron 推荐 native 启动 + CDP 附着；普通 exe 走 Windows UI Automation + 截图，能力为 best-effort。desktop_register_window 可桥接到 web_interact session
   · Human Browser：web_human_browser_open/attach/status/list_pages/register_page/detach/close 是用户辅助验证旁路。它可打开或附着真实 Chrome，让用户手动处理人机验证、登录检测、异常弹窗，再把页面注册成 web_interact/web_pipeline 可复用的 sessionId；默认不影响旧 URL 主链路
-  · web_login_browser 支持后台模式（background/taskId/waitSeconds），Codex 侧推荐优先使用避免同步 60s 超时截断
+- 图文交付与人工登录（web-fetcher 7.1+）：
+  · 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。
+  · 多图按页码、分片或标签顺序查看，检查报告的 `screenshotRef` 对应随附图片；数量、尺寸与总量限制以实时工具说明为准，超限应缩小范围或显式选择 file，不能把部分结果当成完整成功。
+  · `web_login_browser` 与自动弹出的人工验证窗口最多提供 600 秒人工操作；登录建议 `background=true` 后持同一 `taskId` 以 `waitSeconds=30–45` 短轮询，避免宿主同步调用期限截断，不将十分钟人工窗口等同于单次 MCP 调用期限。
+  · Cookie／localStorage 已写入不等于网站认证成功，纯 localStorage 登录也可能有 0 Cookie；应检查保存警告并实际访问目标页面验证，不能仅凭数量让用户重复登录。
+  · 自动化测试在能力允许时优先无界面，仅确需人工处理时打开可见窗口；结束后只清理本任务拥有的会话、窗口和进程，不关闭借用的用户浏览器，不清理共享 Cookie、localStorage 或 profile。
 - 仅在以下情况使用浏览器子代理（browser_subagent）：
   1. 需要"边看边做"的探索性任务（搜索并筛选、滚动查找特定内容等需要实时视觉判断的）
   2. 需要录制完整操作流程视频（子代理自动录制 WebP）

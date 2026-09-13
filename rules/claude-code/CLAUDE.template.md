@@ -340,7 +340,7 @@ Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record
 
 ## MCP web-fetcher 工具
 
-37 个工具，核心能力按功能分组：
+工具清单以当前 MCP `tools/list` 为准，核心能力按功能分组：
 
 - **内容获取**：`web_fetch_page`（Markdown正文）、`web_fetch_screenshot`（截图）、`web_fetch_rich`（截图+文本）、`web_fetch_html`（原始HTML）
 - **交互操作**：`web_interact`（点击/输入/滚动/会话复用）、`web_pipeline`（多步序列）
@@ -349,11 +349,17 @@ Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record
 - **页面检查**：`web_inspect`（DOM结构/溢出/可读性/AI审查）
 - **桌面工具**：`desktop_*` 系列（Electron/Windows exe 操作）
 
-注意：图片尺寸不能超 8000px，截图默认开启自动分片。
+### 图文交付与人工登录（web-fetcher 7.1+）
+
+- 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。
+- 多图按页码、分片或标签顺序查看，检查报告的 `screenshotRef` 对应随附图片；数量、尺寸与总量限制以实时工具说明为准，超限应缩小范围或显式选择 file，不能把部分结果当成完整成功。
+- `web_login_browser` 与自动弹出的人工验证窗口最多提供 600 秒人工操作；登录建议 `background=true` 后持同一 `taskId` 以 `waitSeconds=30–45` 短轮询，避免宿主同步调用期限截断，不将十分钟人工窗口等同于单次 MCP 调用期限。
+- Cookie／localStorage 已写入不等于网站认证成功，纯 localStorage 登录也可能有 0 Cookie；应检查保存警告并实际访问目标页面验证，不能仅凭数量让用户重复登录。
+- 自动化测试在能力允许时优先无界面，仅确需人工处理时打开可见窗口；结束后只清理本任务拥有的会话、窗口和进程，不关闭借用的用户浏览器，不清理共享 Cookie、localStorage 或 profile。
 
 ### 典型工程场景（不止抓网页）
 
-- **产出文件视觉检查**：docx/pptx/xlsx/pdf/html 等产出必须截图核验（见 Skills 章节强制规则），不能只看代码就交付。✅ 实测 `web_fetch_screenshot` 用 `file:///C:/...` 直接吃 docx/pptx/xlsx/pdf，**不用转 PDF**（底层 LibreOffice 渲染），用 `page`/`pages` 翻页。CC 原生 `Read` 只能读纯文本/图片/PDF，**读不了 docx/pptx 二进制**，别拿 Read 去看 office。⚠️ 两个实测坑：① 多个 office 文件别并发截，LibreOffice 会抢临时目录报 EPERM，要串行；② 首次渲染慢（实测 pptx 单页 ~45s，逼近 MCP 60s 超时），一次别截太多页、必要时调大 `timeout`。
+- **产出文件视觉检查**：docx/pptx/xlsx/pdf/html 等产出必须截图核验（见 Skills 章节强制规则），不能只看代码就交付。✅ 实测 `web_fetch_screenshot` 用 `file:///C:/...` 直接吃 docx/pptx/xlsx/pdf，**不用转 PDF**（底层 LibreOffice 渲染），用 `page`/`pages` 翻页。CC 原生 `Read` 只能读纯文本/图片/PDF，**读不了 docx/pptx 二进制**，别拿 Read 去看 office。⚠️ 两个实测坑：① 多个 office 文件别并发截，LibreOffice 会抢临时目录报 EPERM，要串行；② 首次渲染可能较慢，应结合宿主同步调用期限合理分页，必要时调整工具支持的 `timeout`，不假定固定的 60 秒外层上限。
 - **前端调试**：`web_fetch_screenshot` 截 localhost 页面、`web_inspect` 查 DOM 结构/溢出/可读性、`web_interact` 模拟点击输入滚动、`web_pipeline` 跑多步交互序列。改完前端别脑补效果，开页面截图看。
 - **Electron 调试**：`desktop_launch` 启动 exe → `desktop_connect_cdp` 连 CDP → `desktop_screenshot` 截图 + `desktop_inspect` 查结构 + `desktop_interact` 交互，`desktop_list_windows`/`desktop_register_window` 管理多窗口。
 
