@@ -2,11 +2,6 @@ import { chromium, type BrowserContext, type Page } from "playwright";
 import fs from "fs";
 import path from "path";
 import iconv from "iconv-lite";
-import {
-    launchSystemChrome, connectCDP,
-    saveCookiesToBackup, cleanupTempProfile, waitForChromeClose,
-    terminateOwnedChrome, snapshotBrowserStorage,
-} from "./chrome-helper.js";
 import { getStealthScript, type StealthLevel } from "./stealth.js";
 import {
     BROWSER_PROFILES_BASE_DIR,
@@ -45,6 +40,7 @@ import {
     formatHumanVerificationDetection,
 } from "./human-verification.js";
 import { logHumanVerificationAudit } from "./human-audit.js";
+import { BrowserAuthState, installOriginStorage } from "./browser-auth-state.js";
 
 function readPositiveIntEnv(name: string, fallback: number): number {
     const raw = process.env[name];
@@ -58,6 +54,7 @@ function readPositiveIntEnv(name: string, fallback: number): number {
  * 使用独立的 persistent context 保存登录态
  */
 class BrowserManager {
+    private authState = new BrowserAuthState();
     private context: BrowserContext | null = null;
     private launching: Promise<BrowserContext> | null = null;
     private activePages = new Set<Page>();
@@ -89,6 +86,7 @@ class BrowserManager {
         if (this.context) {
             try {
                 await this.context.pages();
+                await this.refreshAuthState();
                 this.resetIdleTimer();
                 return this.context;
             } catch {
@@ -221,6 +219,9 @@ class BrowserManager {
         if (this.bareContext) {
             try {
                 await this.bareContext.pages();
+                await this.authState.refresh(this.bareContext).catch(() => {
+                    console.error("[web-fetcher] shared Cookie refresh failed; existing context preserved");
+                });
                 return this.bareContext;
             } catch {
                 this.bareContext = null;
@@ -753,26 +754,11 @@ class BrowserManager {
                 try {
                 const currentTimeout = navigationAttempt === 0 ? timeout : Math.min(timeout * 2, 120000);
 
-                // v6.4: 在 goto 之前预注入 localStorage — SPA 路由检查 token 在 JS 执行最早期
                 if (navigationAttempt === 0) {
                     try {
-                        const { loadLocalStorageBackup } = await import('./chrome-helper.js');
-                        const pageDomain = new URL(url).hostname;
-                        const lsData = loadLocalStorageBackup(pageDomain);
-                        if (lsData && Object.keys(lsData).length > 0) {
-                            const lsDataJson = JSON.stringify(lsData);
-                            await page.addInitScript((dataStr: string) => {
-                                try {
-                                    const data = JSON.parse(dataStr);
-                                    for (const [key, value] of Object.entries(data)) {
-                                        localStorage.setItem(key, value as string);
-                                    }
-                                } catch { /* ignore */ }
-                            }, lsDataJson);
-                            console.error(`[web-fetcher] 💾 addInitScript 预注入 localStorage: ${pageDomain} (${Object.keys(lsData).length} 个 key)`);
-                        }
-                    } catch (lsErr) {
-                        console.error(`[web-fetcher] localStorage 预注入失败:`, lsErr);
+                        await installOriginStorage(page, url);
+                    } catch {
+                        console.error("[web-fetcher] localStorage restore unavailable for this navigation");
                     }
                 }
 
@@ -1013,6 +999,7 @@ class BrowserManager {
         url: string,
         options?: { timeout?: number; scrollCount?: number; waitFor?: string }
     ): Promise<any> {
+        let accessRetryStarted = false;
         try {
             const pageSnapshot = await page.evaluate(() => {
                 const scripts = Array.from(document.scripts)
@@ -1100,15 +1087,9 @@ class BrowserManager {
                 const uavSuccess = await this.userAssistedVerification(url);
 
                 if (uavSuccess) {
+                    accessRetryStarted = true;
                     // UAV 成功，重新导航
-                    console.error('[web-fetcher] UAV 成功，重新导航...');
-                    logHumanVerificationAudit({
-                        phase: "human_verification_completed",
-                        url,
-                        confidence: detection.confidence,
-                        reasonCodes: detection.reasonCodes,
-                        metadata: { mode: "uav-cookie-fallback" },
-                    });
+                    console.error('[web-fetcher] UAV 状态已保存，重新访问确认...');
                     logHumanVerificationAudit({
                         phase: "cookie_copy_fallback",
                         url,
@@ -1120,11 +1101,37 @@ class BrowserManager {
                     const timeout = options?.timeout || DEFAULT_TIMEOUT;
                     const newPage = await (await this.getContext()).newPage();
                     try {
-                        await newPage.goto(url, {
+                        await installOriginStorage(newPage, url);
+                        const retryResponse = await newPage.goto(url, {
                             waitUntil: 'domcontentloaded',
                             timeout,
                         });
+                        if (retryResponse && retryResponse.status() >= 400) {
+                            throw new Error(`ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问返回 HTTP ${retryResponse.status()}；未确认通过验证`);
+                        }
                         await this.waitForContentReady(newPage, timeout, url);
+                        const retrySnapshot = await newPage.evaluate(() => ({
+                            title: document.title,
+                            visibleText: document.body?.innerText ?? "",
+                            html: document.documentElement.outerHTML.slice(0, 120_000),
+                            scriptUrls: Array.from(document.scripts, script => script.src).filter(Boolean),
+                            iframeUrls: Array.from(document.querySelectorAll("iframe"), frame => frame.src).filter(Boolean),
+                        }));
+                        const retryDetection = detectHumanVerificationSignals({
+                            url,
+                            ...retrySnapshot,
+                            hasCookieForDomain: this.hasCookieBackupForDomain(uavDomain),
+                        });
+                        if (retryDetection.shouldOfferUav || retryDetection.status === "challenge_cleared_but_content_unavailable" || (retryDetection.status === "suspected_challenge" && !retryDetection.hasUsableContent)) {
+                            throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问仍未确认通过验证；不会自动重复弹出登录窗口");
+                        }
+                        logHumanVerificationAudit({
+                            phase: retryDetection.hasUsableContent ? "human_verification_completed" : "cookie_copy_fallback",
+                            url,
+                            confidence: retryDetection.confidence,
+                            reasonCodes: retryDetection.reasonCodes,
+                            metadata: { mode: "uav-storage-fallback", accessRechecked: true, usableContentConfirmed: retryDetection.hasUsableContent },
+                        });
                         // 反爬延迟
                         await newPage.waitForTimeout(ANTI_BOT_DELAY_MIN + Math.random() * (ANTI_BOT_DELAY_MAX - ANTI_BOT_DELAY_MIN));
                         // 滚动
@@ -1134,7 +1141,8 @@ class BrowserManager {
                         return newPage;
                     } catch (retryErr) {
                         await newPage.close().catch(() => { });
-                        throw retryErr;
+                        if (retryErr instanceof Error && retryErr.message.startsWith("ERR_HUMAN_VERIFICATION_PENDING:")) throw retryErr;
+                        throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问失败；未确认通过验证，不会返回已关闭的旧页面", { cause: retryErr });
                     }
                 } else {
                     console.error('[web-fetcher] UAV 未完成，返回验证原页');
@@ -1148,6 +1156,8 @@ class BrowserManager {
                 }
             }
         } catch (err) {
+            if (err instanceof Error && err.message.startsWith("ERR_HUMAN_VERIFICATION_PENDING:")) throw err;
+            if (accessRetryStarted) throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问失败；未确认通过验证", { cause: err });
             // UAV 检测失败不影响正常流程
             console.error(`[web-fetcher] UAV 检测异常: ${err instanceof Error ? err.message : err}`);
         }
@@ -1531,170 +1541,26 @@ class BrowserManager {
      * @returns 是否成功完成验证
      */
     async userAssistedVerification(url: string): Promise<boolean> {
-        console.error(`[web-fetcher] \u{1F510} UAV 触发：检测到人机验证拦截`);
-        console.error(`[web-fetcher] \u{1F510} URL: ${url}`);
-
-        const MAX_UAV_RETRIES = 1; // v6.3.1: 降为 1 次，域名冷却已防重复触发
         const context = this.context;
-        if (!context) {
-            console.error('[web-fetcher] \u{1F510} UAV 失败：无活跃的浏览器上下文');
+        if (!context) return false;
+        try {
+            const { runLoginBrowserSession } = await import("./login-session.js");
+            const result = await runLoginBrowserSession(url, {
+                initialCookies: await context.cookies(),
+                profilePrefix: "mcp-chrome-uav",
+                maxRunMs: BrowserManager.UAV_TIMEOUT,
+            });
+            await this.refreshAuthState();
+            const saved = Boolean(result.snapshot.savedAt)
+                && (result.snapshot.savedCookieCount > 0 || result.snapshot.localStorageDomains.length > 0);
+            console.error(saved
+                ? "[web-fetcher] UAV storage saved; page access still requires verification"
+                : "[web-fetcher] UAV storage not confirmed; recovery profile preserved when available");
+            return saved;
+        } catch {
+            console.error("[web-fetcher] UAV could not complete; no automatic repeat login");
             return false;
         }
-
-        for (let attempt = 1; attempt <= MAX_UAV_RETRIES; attempt++) {
-            console.error(`[web-fetcher] \u{1F510} UAV 尝试 ${attempt}/${MAX_UAV_RETRIES}`);
-
-            let verifiedCookies: any[] = [];
-            let tempProfile: string | undefined;
-
-            try {
-                // 1. 导出当前 Playwright context 的 Cookie
-                const playwrightCookies = await context.cookies();
-
-                // 2. 启动系统 Chrome（动态空闲 CDP 端口）
-                const chromeResult = await launchSystemChrome({
-                    startUrl: url,
-                    profilePrefix: 'mcp-chrome-uav',
-                });
-                const chromeProcess = chromeResult.process;
-                tempProfile = chromeResult.tempProfile;
-
-                // 3. 等待 Chrome 启动（v6.3: CDP 端口轮询，替代固定 3s 死等）
-                const cdpReady = await (async () => {
-                    const maxWait = 5000;
-                    const pollInterval = 300;
-                    const startMs = Date.now();
-                    // 最少等 500ms 让 Chrome 进程初始化
-                    await new Promise(r => setTimeout(r, 500));
-                    while (Date.now() - startMs < maxWait) {
-                        try {
-                            const http = await import('http');
-                            const ok = await new Promise<boolean>((resolve) => {
-                                const req = http.default.get(
-                                    `http://127.0.0.1:${chromeResult.cdpPort}/json/version`,
-                                    { timeout: 500 },
-                                    (res) => { resolve(res.statusCode === 200); }
-                                );
-                                req.on('error', () => resolve(false));
-                                req.on('timeout', () => { req.destroy(); resolve(false); });
-                            });
-                            if (ok) {
-                                console.error(`[web-fetcher] 🔐 Chrome CDP 就绪 (${Date.now() - startMs}ms)`);
-                                return true;
-                            }
-                        } catch { /* 继续轮询 */ }
-                        await new Promise(r => setTimeout(r, pollInterval));
-                    }
-                    console.error(`[web-fetcher] 🔐 Chrome CDP 轮询超时 (${maxWait}ms)，继续尝试连接`);
-                    return false;
-                })();
-
-                // 4. CDP 连接 + Cookie 注入
-                let cdpBrowser: any = null;
-
-                try {
-                    cdpBrowser = await connectCDP(chromeResult.cdpPort);
-                    const contexts = cdpBrowser.contexts();
-
-                    if (contexts.length > 0) {
-                        const ctx = contexts[0];
-
-                        // 注入 Playwright Cookie 到系统 Chrome
-                        if (playwrightCookies.length > 0) {
-                            await ctx.addCookies(playwrightCookies);
-                            console.error(`[web-fetcher] \u{1F510} 已注入 ${playwrightCookies.length} 个 Cookie 到系统 Chrome`);
-
-                            // 刷新页面让 Cookie 生效
-                            const pages = ctx.pages();
-                            if (pages.length > 0) {
-                                await pages[0].reload({ waitUntil: 'domcontentloaded' }).catch(() => { });
-                            }
-                        }
-
-                        // 定期快照 Cookie + localStorage（每 2 秒立即落盘）
-                        const interval = setInterval(async () => {
-                            try {
-                                const snapshot = await snapshotBrowserStorage(ctx, { reason: "uav-periodic" });
-                                verifiedCookies = snapshot.cookies;
-                            } catch { /* Chrome 可能已关闭 */ }
-                        }, 2000);
-
-                        // 5. 等待用户关闭浏览器 OR 超时
-                        const closePromise = waitForChromeClose(chromeProcess);
-                        const timeoutPromise = new Promise<'timeout'>(resolve =>
-                            setTimeout(() => resolve('timeout'), BrowserManager.UAV_TIMEOUT)
-                        );
-
-                        const result = await Promise.race([closePromise, timeoutPromise]);
-                        clearInterval(interval);
-
-                        if (result === 'timeout') {
-                            console.error('[web-fetcher] \u{1F510} UAV 超时（600s），关闭 Chrome 前先导出最近 Cookie/localStorage');
-                            try {
-                                const timeoutSnapshot = await snapshotBrowserStorage(ctx, { reason: "uav-timeout-before-close" });
-                                if (timeoutSnapshot.cookies.length > 0) verifiedCookies = timeoutSnapshot.cookies;
-                            } catch { /* Chrome 可能已关闭 */ }
-                            terminateOwnedChrome(chromeResult);
-                            await waitForChromeClose(chromeProcess);
-                        }
-
-                        // 最后一次导出（加超时保护）；主动关闭后可能失败，周期快照已提前落盘
-                        try {
-                            const finalSnapshot = await snapshotBrowserStorage(ctx, {
-                                reason: "uav-final",
-                                cookieTimeoutMs: 5000,
-                                localStorageTimeoutMs: 5000,
-                            });
-                            if (finalSnapshot.cookies.length > 0) verifiedCookies = finalSnapshot.cookies;
-                        } catch { /* Chrome 已关闭或超时 */ }
-                    }
-                } catch (cdpErr) {
-                    console.error('[web-fetcher] \u{1F510} CDP 连接失败:', cdpErr);
-                    await waitForChromeClose(chromeProcess);
-                }
-
-                // 6. 断开 CDP（加超时保护）
-                try {
-                    if (cdpBrowser) {
-                        const closePromise2 = cdpBrowser.close();
-                        const closeTimeout = new Promise<void>((resolve) =>
-                            setTimeout(() => resolve(), 5000)
-                        );
-                        await Promise.race([closePromise2, closeTimeout]);
-                    }
-                } catch { }
-
-                // 7. 清理临时 profile
-                if (tempProfile) {
-                    cleanupTempProfile(tempProfile);
-                    tempProfile = undefined;
-                }
-
-                // 8. 检查结果
-                if (verifiedCookies.length > 0) {
-                    // 成功！回写 Cookie 并返回
-                    await context.addCookies(verifiedCookies);
-                    const totalCount = saveCookiesToBackup(verifiedCookies);
-                    console.error(`[web-fetcher] \u{1F510} UAV 成功 (尝试 ${attempt}): ${verifiedCookies.length} 个 Cookie，合并后 ${totalCount} 个`);
-                    return true;
-                }
-
-                // Cookie 为空，判断是否重试
-                if (attempt < MAX_UAV_RETRIES) {
-                    console.error(`[web-fetcher] \u{1F510} Cookie 回收为空，自动重新打开浏览器...`);
-                }
-
-            } catch (error) {
-                console.error(`[web-fetcher] \u{1F510} UAV 尝试 ${attempt} 异常:`, error);
-                // 确保清理临时 profile
-                if (tempProfile) {
-                    cleanupTempProfile(tempProfile);
-                }
-            }
-        }
-
-        console.error(`[web-fetcher] \u{1F510} UAV 失败：${MAX_UAV_RETRIES} 次尝试均未回收到 Cookie`);
-        return false;
     }
 
     /**
@@ -1737,85 +1603,53 @@ class BrowserManager {
      * 以有头模式启动浏览器，让用户登录
      */
     async launchLoginMode(): Promise<void> {
-        // 关闭现有无头浏览器
-        await this.close();
-
-        console.error("[web-fetcher] 启动有头浏览器进行登录...");
-
-        const context = await chromium.launchPersistentContext(
-            BROWSER_USER_DATA_DIR,
-            {
-                headless: false,
-                userAgent: DEFAULT_USER_AGENT,
-                viewport: { width: 1920, height: 1080 },
-                locale: "zh-CN",
-                timezoneId: "Asia/Shanghai",
-                args: [
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
-            }
-        );
-
-        // 打开一个空白页
-        const page = await context.newPage();
-        await page.goto("about:blank");
-
-        console.error("[web-fetcher] 有头浏览器已启动，等待用户关闭浏览器...");
-
-        // 等待浏览器关闭
-        await new Promise<void>((resolve) => {
-            // 浏览器关闭前尝试保存 Cookie
-            context.on("close", () => resolve());
-        });
-
-        // 保存 Cookie 备份（使用关闭前的 context 可能已不可用，
-        // 所以我们在页面导航后定时保存）
-        console.error("[web-fetcher] 用户已关闭浏览器，登录完成");
-        this.context = null;
+        const { runLoginBrowserSession } = await import("./login-session.js");
+        const result = await runLoginBrowserSession("about:blank");
+        await this.refreshAuthState();
+        if (!result.snapshot.savedAt) throw new Error("登录窗口已结束，但未确认保存登录状态；请检查保留的恢复资料");
+        console.error("[web-fetcher] 登录窗口已结束，状态已保存；站点认证有效性需要访问验证");
     }
 
     /**
      * 保存当前所有 Cookie 到备份文件（合并模式，保留未访问域名的 Cookie）
      */
-    async saveCookies(): Promise<void> {
-        if (!this.context) return;
-        await this.saveCookiesFromContext(this.context, "主 context");
+    async saveCookies(): Promise<boolean> {
+        if (!this.context) return true;
+        return this.saveCookiesFromContext(this.context, "主 context");
     }
 
-    private async saveCookiesFromContext(context: BrowserContext, label: string): Promise<void> {
+    private async saveCookiesFromContext(context: BrowserContext, label: string): Promise<boolean> {
+        let saved = true;
         try {
-            const cookies = await context.cookies();
-            // v6.4: 使用 merge 模式而非全量覆盖
-            // context.cookies() 只返回当前会话中实际使用过的域名的 Cookie
-            // 全量覆盖会丢失通过 login_browser 登录但本会话未访问的域名的 Cookie
-            const totalCount = saveCookiesToBackup(cookies);
-            console.error(`[web-fetcher] Cookie 已备份(${label}): ${cookies.length} 个 (合并后 ${totalCount} 个) → ${COOKIES_BACKUP_FILE}`);
-        } catch (error) {
-            console.error(`[web-fetcher] Cookie 备份失败(${label}):`, error);
+            await this.authState.save(context);
+        } catch {
+            saved = false;
+            console.error(`[web-fetcher] Cookie backup failed (${label})`);
         }
+        try {
+            if (!await this.authState.saveLocalStorage(context)) saved = false;
+        } catch {
+            saved = false;
+            console.error(`[web-fetcher] localStorage backup failed (${label})`);
+        }
+        if (saved) console.error(`[web-fetcher] Cookie/localStorage changes saved (${label}); concurrent shared updates preserved`);
+        return saved;
     }
 
     /**
      * 从备份文件恢复 Cookie
      */
     private async restoreCookies(context: BrowserContext): Promise<void> {
-        if (!fs.existsSync(COOKIES_BACKUP_FILE)) {
-            console.error("[web-fetcher] 没有 Cookie 备份文件，跳过恢复");
-            return;
-        }
-
         try {
-            const data = fs.readFileSync(COOKIES_BACKUP_FILE, "utf-8");
-            const cookies = JSON.parse(data);
+            await this.authState.refresh(context);
+        } catch {
+            console.error("[web-fetcher] Cookie restore unavailable; existing context preserved");
+        }
+    }
 
-            if (Array.isArray(cookies) && cookies.length > 0) {
-                await context.addCookies(cookies);
-                console.error(`[web-fetcher] Cookie 已恢复: ${cookies.length} 个`);
-            }
-        } catch (error) {
-            console.error("[web-fetcher] Cookie 恢复失败:", error);
+    async refreshAuthState(): Promise<void> {
+        for (const context of [this.context, this.bareContext]) {
+            if (context) await this.restoreCookies(context);
         }
     }
 
@@ -1828,39 +1662,12 @@ class BrowserManager {
             clearTimeout(this.idleTimer);
             this.idleTimer = null;
         }
-        if (this.bareContext) {
-            try {
-                await this.saveCookiesFromContext(this.bareContext, "bare context");
-                await this.bareContext.close();
-            } catch {
-                // 忽略关闭错误
-            }
-            this.bareContext = null;
-        }
+        if (this.bareContext) await this.closeContextPreservingStorage(this.bareContext, BROWSER_USER_DATA_DIR + "-bare", "bare context");
+        if (this.context) await this.closeContextPreservingStorage(this.context, BROWSER_USER_DATA_DIR, "主 context");
+        this.bareContext = null;
+        this.context = null;
         this.bareLaunching = null;
-        if (this.context) {
-            try {
-                // v6.1: 清理 profile 前先保存 Cookie 到共享备份
-                await this.saveCookies();
-                await this.context.close();
-            } catch {
-                // 忽略关闭错误
-            }
-            this.context = null;
-        }
         this.launching = null;
-        // v6.1: 清理当前实例的 profile 目录（Cookie 已在共享备份中持久化）
-        try {
-            if (fs.existsSync(BROWSER_USER_DATA_DIR)) {
-                fs.rmSync(BROWSER_USER_DATA_DIR, { recursive: true, force: true });
-                console.error(`[web-fetcher] 已清理 profile: ${BROWSER_USER_DATA_DIR}`);
-            }
-            const bareProfileDir = BROWSER_USER_DATA_DIR + '-bare';
-            if (fs.existsSync(bareProfileDir)) {
-                fs.rmSync(bareProfileDir, { recursive: true, force: true });
-                console.error(`[web-fetcher] 已清理 bare profile: ${bareProfileDir}`);
-            }
-        } catch { /* 忽略清理失败 */ }
         this.activePages.clear();
         console.error("[web-fetcher] 浏览器已关闭");
     }
@@ -1870,42 +1677,51 @@ class BrowserManager {
      * 下次 getContext() 调用时会自动重新启动浏览器
      */
     async closeBrowser(): Promise<void> {
-        if (this.idleTimer) {
-            clearTimeout(this.idleTimer);
-            this.idleTimer = null;
-        }
-        if (this.bareContext) {
-            try {
-                await this.saveCookiesFromContext(this.bareContext, "bare context");
-                await this.bareContext.close();
-            } catch {
-                // 忽略关闭错误
-            }
-            this.bareContext = null;
-            this.bareLaunching = null;
-        }
-        if (this.context) {
-            try {
-                // 备份 Cookie 再关闭
-                await this.saveCookies();
-                await this.context.close();
-            } catch {
-                // 忽略关闭错误
-            }
-            this.context = null;
-            this.activePages.clear();
-            console.error("[web-fetcher] 浏览器空闲超时，已关闭释放内存");
-        }
-        this.launching = null;
-        this.activePages.clear();
+        await this.close();
+    }
+
+    private closingContexts = new WeakMap<BrowserContext, Promise<void>>();
+
+    private closeContextPreservingStorage(context: BrowserContext, profileDir: string, label: string): Promise<void> {
+        const previous = this.closingContexts.get(context);
+        if (previous) return previous;
+        const pending = this.persistAndCloseContext(context, profileDir, label);
+        this.closingContexts.set(context, pending);
+        return pending;
+    }
+
+    private async persistAndCloseContext(context: BrowserContext, profileDir: string, label: string): Promise<void> {
+        const marker = path.join(profileDir, ".web-fetcher-recovery.json");
+        const alreadyRetained = fs.existsSync(marker);
+        let marked = alreadyRetained;
         try {
-            for (const profileDir of [BROWSER_USER_DATA_DIR, BROWSER_USER_DATA_DIR + '-bare']) {
-                if (fs.existsSync(profileDir)) {
-                    fs.rmSync(profileDir, { recursive: true, force: true });
-                    console.error(`[web-fetcher] 已清理 profile: ${profileDir}`);
-                }
+            if (!marked) {
+                fs.mkdirSync(profileDir, { recursive: true });
+                fs.writeFileSync(marker, JSON.stringify({ version: 1, createdAt: new Date().toISOString(), reason: "storage-close-pending" }), { encoding: "utf8", flag: "wx" });
+                marked = true;
             }
-        } catch { /* 忽略清理失败 */ }
+        } catch {
+            console.error(`[web-fetcher] recovery marker could not be written (${label}); profile cleanup disabled`);
+        }
+        const saved = await this.saveCookiesFromContext(context, label);
+        let closed = false;
+        try {
+            await context.close();
+            closed = true;
+        } catch {
+            console.error(`[web-fetcher] context close failed (${label}); profile retained`);
+        }
+        if (!saved || !closed || !marked || alreadyRetained) {
+            console.error(`[web-fetcher] recovery profile retained (${label}): ${profileDir}`);
+            return;
+        }
+        try {
+            if (path.dirname(path.resolve(profileDir)) !== path.resolve(BROWSER_PROFILES_BASE_DIR)) throw new Error("unexpected profile directory");
+            fs.rmSync(profileDir, { recursive: true, force: true });
+            console.error(`[web-fetcher] 已清理 profile: ${profileDir}`);
+        } catch {
+            console.error(`[web-fetcher] profile cleanup incomplete (${label}); recovery marker retained when available`);
+        }
     }
 
     /**
@@ -1964,18 +1780,20 @@ class BrowserManager {
 
                 const pid = parseInt(match[1]);
                 if (pid === process.pid) continue; // 不清理自己的
+                const staleDir = path.join(BROWSER_PROFILES_BASE_DIR, entry);
+                if (fs.existsSync(path.join(staleDir, ".web-fetcher-recovery.json"))) continue;
+                if (fs.lstatSync(staleDir).isSymbolicLink()) continue;
 
                 // 检查进程是否存活
                 let alive = false;
                 try {
                     process.kill(pid, 0); // signal 0 只检测不杀
                     alive = true;
-                } catch {
-                    alive = false;
+                } catch (error: any) {
+                    alive = error?.code !== "ESRCH";
                 }
 
                 if (!alive) {
-                    const staleDir = path.join(BROWSER_PROFILES_BASE_DIR, entry);
                     try {
                         fs.rmSync(staleDir, { recursive: true, force: true });
                         cleaned++;

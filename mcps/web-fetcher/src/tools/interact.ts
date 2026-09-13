@@ -7,9 +7,11 @@ import { extractContent, safePageEvaluate, safePageContent } from "../extractor.
 import { QUALITY_PRESETS, appendTiming } from "../constants.js";
 import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-store.js";
 import { buildPageSnapshot } from "./page-snapshot.js";
+import { inlineImageContent } from "../image-output.js";
 import * as fs from "fs";
 
 const InteractInputSchema = z.object({
+    saveMode: z.enum(["inline", "file"]).optional().describe("截图/快照输出：inline 默认直接返回图片与文本；file 显式返回临时文件路径"),
     sessionId: z
         .string()
         .optional()
@@ -71,7 +73,7 @@ export function registerInteract(server: McpServer): void {
   - screenshot: 对当前页面截图
   - content: 提取正文内容（有 selector 时只提取该区域）
   - visible: 提取当前视口可见的文本（不滚动，只取屏幕上能看到的内容）
-  - snapshot: 一次返回当前视口截图文件、可见文本和 DOM 摘要
+  - snapshot: 一次返回当前视口图片、可见文本和 DOM 摘要；saveMode=file 返回旧截图路径
   - find: 在页面中搜索文本（需要 value 参数），返回匹配数量和上下文
   - press: v6.8 键盘操作。快捷键用 value="Control+z" 等；增量输入用 value="文字内容"。有 selector 时先点击获取焦点。支持 frame 穿透
   - evaluate: v6.9 在页面上下文中执行 JS。value 为本地 .js 文件路径时自动读取文件内容执行（绕过 AI 输出长度限制）；否则作为内联 JS 直接执行。支持 async/await，返回 evaluate 结果。支持 frame 穿透
@@ -93,6 +95,7 @@ export function registerInteract(server: McpServer): void {
   - timeout (number, 可选): 超时毫秒数
    - frame (string, 可选): iframe CSS 选择器，操作在 iframe 内执行`,
             inputSchema: {
+                saveMode: InteractInputSchema.shape.saveMode,
                 sessionId: InteractInputSchema.shape.sessionId,
                 ownerId: InteractInputSchema.shape.ownerId,
                 url: InteractInputSchema.shape.url,
@@ -142,7 +145,7 @@ export function registerInteract(server: McpServer): void {
 
                 const timeout = params.timeout ?? 30000;
                 const finalize = (
-                    result: { content?: Array<{ type: "text"; text: string }>; isError?: boolean },
+                    result: { content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; isError?: boolean },
                     _startTime?: number,
                     retryCount?: number,
                 ) => {
@@ -150,8 +153,9 @@ export function registerInteract(server: McpServer): void {
                     if (hint && Array.isArray(result.content)) {
                         const content = [...result.content];
                         for (let i = content.length - 1; i >= 0; i--) {
-                            if (content[i]?.type === "text" && typeof content[i].text === "string") {
-                                content[i] = { ...content[i], text: `${content[i].text}\n${hint}` };
+                            const item = content[i];
+                            if (item?.type === "text") {
+                                content[i] = { ...item, text: `${item.text}\n${hint}` };
                                 return appendTiming({ ...result, content }, startTime, retryCount);
                             }
                         }
@@ -373,6 +377,10 @@ export function registerInteract(server: McpServer): void {
                         }
                         const sizeKB = (buffer.length / 1024).toFixed(1);
 
+                        if (params.saveMode !== "file") {
+                            return finalize({ content: await inlineImageContent(buffer, `截图\nSessionId: ${sessionId}\n当前 URL: ${page.url()}`) }, startTime);
+                        }
+
                         // 自动分片保存
                         const cacheKey = generateCacheKey(page.url(), "interact", Date.now());
                         const splitResult = await splitOversizedImage(buffer, "screenshots", cacheKey, ".jpg");
@@ -507,15 +515,8 @@ export function registerInteract(server: McpServer): void {
                     }
 
                     case "snapshot": {
-                        const snapshot = await buildPageSnapshot(page, { sessionId });
-                        return finalize({
-                            content: [
-                                {
-                                    type: "text" as const,
-                                    text: snapshot,
-                                },
-                            ],
-                        }, startTime);
+                        const content = await buildPageSnapshot(page, { sessionId, saveMode: params.saveMode });
+                        return finalize({ content }, startTime);
                     }
 
                     case "find": {

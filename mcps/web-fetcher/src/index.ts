@@ -62,7 +62,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.0.0",
+    version: "7.1.0",
 });
 
 // 注册所有工具
@@ -136,9 +136,12 @@ server.registerResource(
             "- `web_interact` / `web_pipeline` 支持 `ownerId`；未传时按 global 兼容旧调用，访问或关闭已有 session 时按 owner 校验。",
             "- `web_list_sessions` 可列出当前 owner 或全部 owner 的保留会话；`web_close_sessions` 可关闭单个 session 或清理指定 owner 的全部 session。",
             "- `web_pipeline` 支持传入已有 `sessionId`，可在登录后的页面、弹窗 session、Electron renderer 注册 session 上继续执行多步操作；不传 `sessionId` 时仍按旧行为用 `url` 新建页面。",
-            "- `web_interact(action=\"snapshot\")` / `web_pipeline(steps=[{action:\"snapshot\"}])` 会一次返回截图文件、视口可见文本和 DOM 摘要，适合动态课程平台、登录后页面和复杂单页应用的快速定位。",
+            "- `web_interact(action=\"snapshot\")` / `web_pipeline(steps=[{action:\"snapshot\"}])` 默认一次返回图片、视口可见文本和 DOM 摘要；截图工具统一用 `saveMode=\"file\"` 显式选择旧路径模式。",
+            "- 图片默认以 MCP image 内容块与文本一起返回，多页/分片有序排列；每次最多 10 张、图片 base64 总长 12 MiB。超限请缩小 pages/截图范围或显式 file，不会静默漏图或回退路径。web_inspect/desktop_inspect 的 screenshotRef 对应随附图片，后台 check 也可指定 saveMode。",
             "- Cookie/localStorage 是全局共享网页登录态，写入时使用文件锁 + 临时文件 rename 合并，不能按对话隔离。",
             "- 登录/UAV 浏览器使用动态空闲 CDP 端口，只清理自有临时 profile/lockfile 对应的 Chrome。",
+            "- web_login_browser 与 UAV 共用 600 秒人工窗口，周期串行保存 Cookie/localStorage，截止先保存再关窗；手动关窗后只恢复本次已退出的自有 profile。失败保留恢复来源，不要求用户额外等两秒，也不把状态已保存当成网站认证成功。后台轮询推荐 30–45 秒。",
+            "- 新 Cookie 会同步到已有浏览器上下文，旧状态不能覆盖更新的备份；localStorage 按 origin 隔离并在新导航恢复，不自动刷新用户现有页面。纯 localStorage 登录不要求 Cookie 数量大于零。",
             "- 主 context 与 bareContext 在 close/closeBrowser 时都会关闭并清理 profile。",
             "",
             "## Human Browser 用户辅助浏览器",
@@ -187,7 +190,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.0.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.1.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -284,7 +287,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.0.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.1.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -317,7 +320,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[web-fetcher] MCP Server v7.0.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.1.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

@@ -10,6 +10,20 @@
 
 ## 工具列表
 
+### 图片返回方式（7.1）
+
+截图默认直接返回 MCP `image` 内容块和文本说明，客户端不必再次打开临时路径。同一结果可包含多张有序图片，适用于 `web_fetch_screenshot`（含多页）、`web_fetch_rich`、`web_interact`/`web_pipeline` 的 screenshot/snapshot、`desktop_screenshot`，以及 `web_inspect`/`desktop_inspect` 已生成的检查附图。
+
+- 省略 `saveMode` 或设置 `saveMode="inline"`：直接返回图片＋文本。检查报告中的 `screenshotRef` 对应后续图片标签。
+- 显式设置 `saveMode="file"`：保留原临时图片路径、路径清单和报告字段，不返回 image 块；依赖旧路径格式的自动化调用应明确传此参数。
+- 多页示例：`web_fetch_screenshot(url="file:///path/slides.pptx", pages="1-6")`；超过范围请分批设置 pages，而不是反复请求全部页。
+- 每次 inline 响应最多 10 张图片（含大图分片），图片 base64 总长不超过 12 MiB；超过限制明确报错，不静默漏图或自动切为地址。Pipeline/检查报告可能保留已交付部分，并明确标识未交付内容。
+- 大图默认按行、列切片，单片各维最多 7800 像素。`web_fetch_screenshot(autoSplit=false)` 保留原始尺寸，宿主可能拒绝超大图片，建议仅文件模式使用。
+
+此行为使用标准 MCP content 数组，四宿主接入方式和模型链路不变；具体界面能否显示、一次能显示多少图片仍取决于宿主。`web_inspect` 后台查询也可传 `saveMode`；只改变结果交付，不重新运行模型。
+
+测试：`npm run test:images` 为图像与返回协议的针对性测试；`npm run test:images:http` 使用独立 Edge profile 和临时本地 HTTP MCP 服务验证真实截图、交互、多页与旧模式，不读取真实登录态。后者需要本机 Edge。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |
@@ -209,7 +223,7 @@ web_inspect(action="check", taskId="...", waitSeconds=30)
 - `web_list_sessions(ownerId="project-a")` 可查看当前 owner 的保留会话；排查共享 broker 占用时可传 `includeAllOwners=true`。
 - `web_close_sessions(sessionId="session_...", ownerId="project-a")` 关闭单个会话；`web_close_sessions(ownerId="project-a", closeAllForOwner=true)` 只清理该 owner 下的会话，不跨 owner 关闭。
 - `web_pipeline` 可传 `sessionId` 复用已登录页面、弹窗 session 或 `desktop_register_window` 注册来的 Electron renderer；不传 `sessionId` 时仍按旧行为用 `url` 新建页面。
-- `web_interact(action="snapshot")` 与 `web_pipeline(steps=[{action:"snapshot"}])` 会一次返回截图文件、视口可见文本和 DOM 摘要，适合动态课程平台、登录后页面和复杂单页应用的定位。
+- `web_interact(action="snapshot")` 与 `web_pipeline(steps=[{action:"snapshot"}])` 默认一次返回图片、视口可见文本和 DOM 摘要；显式 `saveMode="file"` 保留旧截图路径输出。
 - 页面池默认允许 5 个并发页面（可用 `WEB_FETCHER_MAX_CONCURRENT_PAGES` 覆盖）；达到 3 个活跃页面起会在 `web_interact`、`web_pipeline`、`web_list_sessions` 输出中提示接近上限，并建议用 `web_close_sessions` 顺手清理旧会话（提醒阈值可用 `WEB_FETCHER_PAGE_POOL_WARNING_THRESHOLD` 覆盖）。
 - Cookie 与 localStorage 是全局共享资源，会通过文件锁和临时文件 rename 合并写入；它们不按对话或项目隔离。首次启用登录态功能前，应确认同一 Windows 账户下的四个宿主都被允许访问这些站点身份；需要隔离时使用不同的 `CODEX_TOOLKIT_DATA_ROOT`，不要共享 profile。
 - 有头登录 / UAV 会使用动态空闲 CDP 端口，并只清理带匹配临时 profile 或 lockfile owner 的自有 Chrome，不按固定端口粗暴杀进程。
@@ -314,8 +328,8 @@ NGA（ngabbs.com）等使用 GBK 编码的站点现在可以正确显示中文�
 1. 编译：`npm run build`
 2. 调用 `web_login_browser` 工具，打开有头浏览器
 3. 在浏览器中登录需要的网站（知乎、X 等）
-4. 登录完成后等待约 2 秒，再关闭浏览器窗口
-5. 之后就可以用 `web_fetch_page` 等工具抓取需要登录的页面了
+4. 完成操作后可以直接关闭本次窗口，工具会保存状态并报告结果，不要求额外等待两秒
+5. 确认工具报告已保存后，重新访问目标页面验证实际登录状态；状态已保存不等于网站认证成功
 
 Codex 侧手动登录建议使用后台模式，避免同步 MCP 调用在用户登录完成前超时：
 
@@ -324,7 +338,15 @@ web_login_browser(startUrl="https://example.com/login", background=true)
 web_login_browser(taskId="web-login-...", waitSeconds=30)
 ```
 
-后台登录任务会在可见 Chrome 打开期间每 2 秒快照 Cookie 与 localStorage 并立即写入共享备份，避免主动关闭或 600 秒超时后 CDP 页面不可用导致导出结果不一致。如果还没关闭，查询会返回运行中状态；`waitSeconds` 入参最大支持 600 秒，但 Codex / 部分宿主建议继续用 30-45 秒短轮询，避免宿主同步调用窗口先断开。
+同步和后台登录共用 600 秒人工操作窗口，UAV（访问过程中弹出的人工验证窗口）使用相同保存流程。周期采样串行执行，截止时先等待保存再关闭；手动关闭后只允许有界恢复本次工具自有、已经退出的 Chrome profile，恢复失败会保留来源并明确告警，不能把空导出报告成登录完成。纯 localStorage 登录也可以报告保存成功，不以 Cookie 数量作为唯一判断。
+
+共享 Cookie 更新会刷新已有浏览器上下文，旧上下文未更新的认证值不能覆盖新备份。localStorage 按协议、主机和端口组成的 origin 隔离，在新页面导航时恢复；不会悄悄刷新用户正在操作的旧页面。旧版按主机保存的备份仅兼容该主机的默认 HTTPS 来源，不注入其它协议或端口。
+
+Human Browser 同样使用串行快照，关闭或解绑会等待在途保存；借用外部浏览器时只断开连接，不关闭浏览器或清理对方 profile。保存计数、最近成功写入时间和当前错误分开报告。若工具提示保留恢复来源，请勿删除该目录或反复扫码；先核查导出与目标站点访问结果。
+
+后台查询仍建议 `waitSeconds=30–45`，人工窗口结束后可能短暂继续保存和清理。`waitSeconds` 是本次查询等待时长，不是重新开启十分钟窗口。
+
+验证命令：`npm run test:login` 覆盖隔离存储、并发与来源规则。设置 `WEB_FETCHER_LIVE_LOGIN_TEST=1` 后运行 `npm run test:login:browser` 可用本地合成站点与临时 Chrome/Edge 验证关窗、超时、纯 localStorage 和失败保留；设置 `WEB_FETCHER_600S_TEST=1` 后运行 `npm run test:login:600s` 会实际等待十分钟，验证截止前最后修改的状态能在新浏览器恢复。测试不使用真实账号。
 
 ## MCP 配置
 

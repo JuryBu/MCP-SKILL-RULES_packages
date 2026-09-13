@@ -17,9 +17,11 @@ import { COOKIES_BACKUP_FILE, LOCALSTORAGE_BACKUP_FILE } from "./constants.js";
 
 const PROFILE_LOCK_FILE = ".mcp-web-fetcher-chrome.json";
 const BACKUP_LOCK_STALE_MS = 30_000;
+const ownedChromeLaunches = new Map<string, { profile: string; chromePath: string; executableIdentity: string; chromeProcess?: ChildProcess }>();
 
 /** Chrome 启动配置 */
 export interface ChromeLaunchOptions {
+    headless?: boolean;
     /** 起始 URL */
     startUrl?: string;
     /** CDP 远程调试端口，默认 19222 */
@@ -95,6 +97,7 @@ export async function launchSystemChrome(options?: ChromeLaunchOptions): Promise
     fs.mkdirSync(tempProfile, { recursive: true });
     fs.writeFileSync(lockFile, JSON.stringify({
         pid: process.pid,
+        ownerPid: process.pid,
         ownerToken,
         cdpPort,
         createdAt: new Date().toISOString(),
@@ -108,14 +111,16 @@ export async function launchSystemChrome(options?: ChromeLaunchOptions): Promise
     const chromeProcess = spawn(chromePath, [
         `--user-data-dir=${tempProfile}`,
         `--remote-debugging-port=${cdpPort}`,
+        "--remote-debugging-address=127.0.0.1",
         "--no-first-run",
         "--no-default-browser-check",
         "--disable-default-apps",
+        ...(options?.headless === true ? ["--headless=new"] : []),
         startUrl,
     ], {
         detached: false,
         stdio: "ignore",
-        windowsHide: false,  // v6.1: 确保 Windows 上窗口可见
+        windowsHide: options?.headless === true,
     });
 
     // v6.1: 启动验证
@@ -130,6 +135,11 @@ export async function launchSystemChrome(options?: ChromeLaunchOptions): Promise
         console.error(`[web-fetcher] Chrome 进程错误: ${err.message}`);
     });
 
+    const executableStat = fs.statSync(chromePath);
+    ownedChromeLaunches.set(ownerToken, {
+        profile: fs.realpathSync(tempProfile), chromePath, chromeProcess,
+        executableIdentity: `${executableStat.size}:${executableStat.mtimeMs}`,
+    });
     return { process: chromeProcess, tempProfile, cdpPort, ownerToken, lockFile };
 }
 
@@ -138,9 +148,9 @@ export async function launchSystemChrome(options?: ChromeLaunchOptions): Promise
  * @param port CDP 远程调试端口
  * @returns Playwright Browser 实例（CDP 连接）
  */
-export async function connectCDP(port: number): Promise<any> {
+export async function connectCDP(port: number, timeoutMs = 10_000): Promise<any> {
     const { chromium } = await import("playwright");
-    return chromium.connectOverCDP(`http://127.0.0.1:${port}`);
+    return chromium.connectOverCDP(`http://127.0.0.1:${port}`, { timeout: timeoutMs });
 }
 
 /**
@@ -149,15 +159,23 @@ export async function connectCDP(port: number): Promise<any> {
  * @param incoming 新 Cookie 列表
  * @returns 合并后的 Cookie 列表
  */
+export function cookieStorageKey(cookie: any): string {
+    return `${cookie.domain}|${cookie.name}|${cookie.path || "/"}`;
+}
+
+function cookieState(cookie: any): string {
+    if (cookie === undefined) return "absent";
+    return JSON.stringify(Object.keys(cookie).sort().map(key => [key, cookie[key]]));
+}
+
 export function mergeCookies(existing: any[], incoming: any[]): any[] {
-    const cookieKey = (c: any) => `${c.domain}|${c.name}|${c.path || "/"}`;
     const cookieMap = new Map<string, any>();
 
     for (const c of existing) {
-        cookieMap.set(cookieKey(c), c);
+        cookieMap.set(cookieStorageKey(c), c);
     }
     for (const c of incoming) {
-        cookieMap.set(cookieKey(c), c);
+        cookieMap.set(cookieStorageKey(c), c);
     }
 
     return Array.from(cookieMap.values());
@@ -170,7 +188,7 @@ function ensureBackupDir(filePath: string): void {
     }
 }
 
-function withFileLock<T>(filePath: string, fn: () => T): T {
+function withFileLock<T>(filePath: string, fn: () => T, waitBudgetMs = BACKUP_LOCK_STALE_MS): T {
     ensureBackupDir(filePath);
     const lockPath = `${filePath}.lock`;
     const started = Date.now();
@@ -190,7 +208,7 @@ function withFileLock<T>(filePath: string, fn: () => T): T {
             } catch {
                 continue;
             }
-            if (Date.now() - started > BACKUP_LOCK_STALE_MS) {
+            if (Date.now() - started >= waitBudgetMs) {
                 throw new Error(`等待备份文件锁超时: ${lockPath}`);
             }
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
@@ -217,8 +235,12 @@ function readJsonFile<T>(filePath: string, fallback: T): T {
 function writeJsonAtomic(filePath: string, data: unknown): void {
     ensureBackupDir(filePath);
     const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${randomUUID().slice(0, 8)}.tmp`;
-    fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
-    fs.renameSync(tmpPath, filePath);
+    try {
+        fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), "utf-8");
+        fs.renameSync(tmpPath, filePath);
+    } finally {
+        if (fs.existsSync(tmpPath)) fs.rmSync(tmpPath, { force: true });
+    }
 }
 
 /**
@@ -226,13 +248,23 @@ function writeJsonAtomic(filePath: string, data: unknown): void {
  * @param newCookies 要保存的新 Cookie
  * @returns 合并后的总 Cookie 数
  */
-export function saveCookiesToBackup(newCookies: any[]): number {
+export function saveCookiesToBackup(newCookies: any[], expectedBase?: any[], waitBudgetMs?: number): number {
+    return saveCookieChangesToBackup(newCookies, expectedBase, waitBudgetMs).total;
+}
+
+export function saveCookieChangesToBackup(newCookies: any[], expectedBase?: any[], waitBudgetMs?: number): { total: number; acceptedCookies: any[] } {
     return withFileLock(COOKIES_BACKUP_FILE, () => {
         const existingCookies = readJsonFile<any[]>(COOKIES_BACKUP_FILE, []);
-        const merged = mergeCookies(Array.isArray(existingCookies) ? existingCookies : [], newCookies);
+        const existing = Array.isArray(existingCookies) ? existingCookies : [];
+        const currentByKey = new Map(existing.map(cookie => [cookieStorageKey(cookie), cookie]));
+        const baseByKey = new Map(expectedBase?.map(cookie => [cookieStorageKey(cookie), cookie]));
+        const accepted = expectedBase === undefined ? newCookies : newCookies.filter(cookie =>
+            cookieState(currentByKey.get(cookieStorageKey(cookie))) === cookieState(baseByKey.get(cookieStorageKey(cookie)))
+        );
+        const merged = mergeCookies(existing, accepted);
         writeJsonAtomic(COOKIES_BACKUP_FILE, merged);
-        return merged.length;
-    });
+        return { total: merged.length, acceptedCookies: accepted.map(cookie => ({ ...cookie })) };
+    }, waitBudgetMs);
 }
 
 /**
@@ -241,6 +273,9 @@ export function saveCookiesToBackup(newCookies: any[]): number {
 export function cleanupTempProfile(tempProfile: string): void {
     try {
         fs.rmSync(tempProfile, { recursive: true, force: true });
+        for (const [token, owned] of ownedChromeLaunches) {
+            if (path.resolve(tempProfile) === owned.profile) ownedChromeLaunches.delete(token);
+        }
         console.error("[web-fetcher] 临时 profile 已清理");
     } catch { /* 忽略 */ }
 }
@@ -277,6 +312,9 @@ export function waitForChromeClose(chromeProcess: ChildProcess): Promise<void> {
         const finish = () => {
             if (settled) return;
             settled = true;
+            chromeProcess.removeListener("close", finish);
+            chromeProcess.removeListener("exit", finish);
+            chromeProcess.removeListener("error", finish);
             resolve();
         };
         chromeProcess.once("close", finish);
@@ -295,23 +333,25 @@ interface LocalStorageBackup {
 /**
  * 保存某域名的 localStorage 到备份文件（merge 模式）
  */
-export function saveLocalStorageToBackup(domain: string, data: Record<string, string>): void {
-    withFileLock(LOCALSTORAGE_BACKUP_FILE, () => {
-        const existing = readJsonFile<LocalStorageBackup>(LOCALSTORAGE_BACKUP_FILE, {});
+function filterLocalStorageValues(data: Record<string, string>): Record<string, string> {
+    return Object.fromEntries(Object.entries(data).filter(([key]) =>
+        key !== '__mcp_web_fetcher_restore_revision__' &&
+        !key.startsWith('__BEACON_') && !key.startsWith('dt_task_lock_') &&
+        key !== 'monaco-parts-splash'
+    ));
+}
 
-        // 过滤掉纯遥测/分析的 key，只保留有价值的认证和配置数据
-        const filtered: Record<string, string> = {};
-        for (const [key, value] of Object.entries(data)) {
-            // 跳过 BEACON/aegis 遥测、超长的 monaco 编辑器状态等
-            if (key.startsWith('__BEACON_') || key.startsWith('dt_task_lock_')) continue;
-            if (key === 'monaco-parts-splash') continue;
-            filtered[key] = value;
-        }
+export function saveLocalStorageToBackup(domain: string, data: Record<string, string>, waitBudgetMs?: number): number {
+    return withFileLock(LOCALSTORAGE_BACKUP_FILE, () => {
+        const existing = readJsonFile<LocalStorageBackup>(LOCALSTORAGE_BACKUP_FILE, {});
+        const filtered = filterLocalStorageValues(data);
 
         existing[domain] = { ...(existing[domain] || {}), ...filtered };
+        delete existing[domain]['__mcp_web_fetcher_restore_revision__'];
         writeJsonAtomic(LOCALSTORAGE_BACKUP_FILE, existing);
         console.error(`[web-fetcher] localStorage 已备份: ${domain} (${Object.keys(filtered).length} 个 key)`);
-    });
+        return Object.keys(filtered).length;
+    }, waitBudgetMs);
 }
 
 /**
@@ -327,6 +367,48 @@ export function loadLocalStorageBackup(domain: string): Record<string, string> |
     }
 }
 
+export function saveLocalStorageChangesToBackup(origin: string, newValues: Record<string, string>, expectedBase: Record<string, string>): {
+    acceptedValues: Record<string, string>; rejectedKeys: string[];
+} {
+    const parsed = new URL(origin);
+    if ((parsed.protocol !== "http:" && parsed.protocol !== "https:") || parsed.origin !== origin) {
+        throw new Error("localStorage changes require an exact HTTP(S) origin");
+    }
+    return withFileLock(LOCALSTORAGE_BACKUP_FILE, () => {
+        const existing = readJsonFile<LocalStorageBackup>(LOCALSTORAGE_BACKUP_FILE, {});
+        const current = existing[origin] ?? (parsed.protocol === "https:" && !parsed.port ? existing[parsed.hostname] : undefined) ?? {};
+        const acceptedValues: Record<string, string> = {};
+        const rejectedKeys: string[] = [];
+        for (const [key, value] of Object.entries(filterLocalStorageValues(newValues))) {
+            if (Object.hasOwn(expectedBase, key) && value === expectedBase[key]) continue;
+            const matchesBase = Object.hasOwn(current, key) === Object.hasOwn(expectedBase, key)
+                && (!Object.hasOwn(current, key) || current[key] === expectedBase[key]);
+            if (matchesBase) Object.defineProperty(acceptedValues, key, { value, enumerable: true, configurable: true, writable: true });
+            else rejectedKeys.push(key);
+        }
+        if (Object.keys(acceptedValues).length > 0) {
+            existing[origin] = filterLocalStorageValues({ ...current, ...acceptedValues });
+            writeJsonAtomic(LOCALSTORAGE_BACKUP_FILE, existing);
+        }
+        return { acceptedValues, rejectedKeys };
+    });
+}
+
+export function getLocalStorageForOrigin(origin: string): Record<string, string> | null {
+    try {
+        const parsed = new URL(origin);
+        if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return null;
+        const exact = loadLocalStorageBackup(parsed.origin);
+        if (exact) return exact;
+        if (parsed.protocol === "https:" && !parsed.port) {
+            return loadLocalStorageBackup(parsed.hostname);
+        }
+        return null;
+    } catch {
+        return null;
+    }
+}
+
 export interface BrowserStorageSnapshotResult {
     reason: string;
     cookieCount: number;
@@ -334,6 +416,97 @@ export interface BrowserStorageSnapshotResult {
     localStorageDomains: Array<{ domain: string; keyCount: number }>;
     errors: string[];
     cookies: any[];
+    savedCookieCount: number;
+    savedAt?: string;
+    capturedAt?: string;
+    recoveryBrowserClosed?: boolean;
+}
+
+export async function recoverClosedChromeStorage(chrome: ChromeLaunchResult, startUrl: string): Promise<BrowserStorageSnapshotResult> {
+    let result: BrowserStorageSnapshotResult = {
+        reason: "closed-profile-recovery", cookieCount: 0, savedCookieCount: 0,
+        cookies: [], localStorageDomains: [], errors: [], capturedAt: new Date().toISOString(),
+    };
+    const deadline = Date.now() + 30_000;
+    let recoveryProcess: ChildProcess | undefined;
+    let browser: any;
+    let verifiedEndpoint = false;
+    let navigationFailed = false;
+    const remaining = (reserve = 0) => Math.max(1, deadline - Date.now() - reserve);
+    try {
+        const owned = ownedChromeLaunches.get(chrome.ownerToken);
+        if (!owned || owned.chromeProcess !== chrome.process ||
+            (chrome.process.exitCode === null && chrome.process.signalCode === null)) {
+            throw new Error("recovery requires an exited owned process");
+        }
+        const realProfile = fs.realpathSync(chrome.tempProfile);
+        const tempRoot = fs.realpathSync(os.tmpdir());
+        const lock = JSON.parse(fs.readFileSync(chrome.lockFile, "utf8"));
+        if (owned.profile !== realProfile || path.dirname(realProfile) !== tempRoot ||
+            !/^mcp-chrome-(?:login|uav|human)-/.test(path.basename(realProfile)) ||
+            fs.realpathSync(chrome.lockFile) !== path.join(realProfile, PROFILE_LOCK_FILE) ||
+            lock.ownerToken !== chrome.ownerToken || (lock.ownerPid ?? lock.pid) !== process.pid ||
+            lock.cdpPort !== chrome.cdpPort || lock.chromePath !== owned.chromePath) {
+            throw new Error("recovery ownership validation failed");
+        }
+        const executableStat = fs.statSync(owned.chromePath);
+        if (`${executableStat.size}:${executableStat.mtimeMs}` !== owned.executableIdentity) {
+            throw new Error("recovery Chrome version changed");
+        }
+        const port = await getFreePort();
+        recoveryProcess = spawn(owned.chromePath, [
+            `--user-data-dir=${realProfile}`, `--remote-debugging-port=${port}`,
+            "--remote-debugging-address=127.0.0.1", "--headless=new", "--enable-automation",
+            "--no-first-run", "--no-default-browser-check", "--restore-last-session", "about:blank",
+        ], { stdio: "ignore", windowsHide: true });
+        let spawnFailed = false;
+        recoveryProcess.on("error", () => { spawnFailed = true; });
+        while (Date.now() < deadline - 20_000) {
+            if (spawnFailed || recoveryProcess.exitCode !== null || recoveryProcess.signalCode !== null) break;
+            try {
+                browser = await connectCDP(port, Math.min(1000, remaining(20_000)));
+                break;
+            } catch {
+                await new Promise(resolve => setTimeout(resolve, 150));
+            }
+        }
+        if (!browser) throw new Error("recovery CDP unavailable");
+        const session = await withTimeout<any>(browser.newBrowserCDPSession(), Math.min(1500, remaining(18_000)), "recovery identity session");
+        const command = await withTimeout<any>(session.send("Browser.getBrowserCommandLine"), Math.min(1500, remaining(18_000)), "recovery identity");
+        await withTimeout(session.detach(), Math.min(500, remaining(18_000)), "recovery identity detach");
+        if (!command.arguments?.includes(`--user-data-dir=${realProfile}`)) throw new Error("recovery endpoint ownership mismatch");
+        verifiedEndpoint = true;
+        const context = browser.contexts()[0];
+        if (!context) throw new Error("recovery context unavailable");
+        if (startUrl !== "about:blank") {
+            const parsed = new URL(startUrl);
+            if (parsed.protocol === "https:" || parsed.protocol === "http:") {
+                const page = await withTimeout<any>(context.newPage(), Math.min(1000, remaining(16_000)), "recovery page");
+                await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.min(5000, remaining(16_000)) }).catch(() => { navigationFailed = true; });
+            }
+        }
+        result = await snapshotBrowserStorage(context, {
+            reason: "closed-profile-recovery", totalTimeoutMs: Math.min(15_000, remaining(4000)),
+        });
+        if (navigationFailed) result.errors.push("closed-profile-recovery: final origin navigation incomplete");
+    } catch {
+        result.errors.push("closed-profile-recovery: unavailable; original profile retained");
+    } finally {
+        if (browser && verifiedEndpoint) {
+            try {
+                const session = await withTimeout<any>(browser.newBrowserCDPSession(), Math.min(500, remaining()), "recovery close session");
+                await withTimeout(session.send("Browser.close"), Math.min(1500, remaining()), "recovery close");
+            } catch { }
+        }
+        if (browser) await withTimeout(Promise.resolve(browser.close()), Math.min(500, remaining()), "recovery disconnect").catch(() => undefined);
+        if (recoveryProcess) {
+            if (recoveryProcess.exitCode === null && recoveryProcess.signalCode === null) recoveryProcess.kill();
+            await withTimeout(waitForChromeClose(recoveryProcess), Math.min(1500, remaining()), "recovery process exit").catch(() => undefined);
+            result.recoveryBrowserClosed = recoveryProcess.exitCode !== null || recoveryProcess.signalCode !== null;
+            if (!result.recoveryBrowserClosed) result.errors.push("closed-profile-recovery: process cleanup incomplete; profile retained");
+        }
+    }
+    return result;
 }
 
 export interface BrowserStorageSnapshotOptions {
@@ -342,6 +515,7 @@ export interface BrowserStorageSnapshotOptions {
     saveLocalStorage?: boolean;
     cookieTimeoutMs?: number;
     localStorageTimeoutMs?: number;
+    totalTimeoutMs?: number;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -371,7 +545,7 @@ function isUsableLocalStorageUrl(url: string): boolean {
     if (!url || url === "about:blank") return false;
     try {
         const parsed = new URL(url);
-        return parsed.protocol === "http:" || parsed.protocol === "https:" || parsed.protocol === "file:";
+        return parsed.protocol === "http:" || parsed.protocol === "https:";
     } catch {
         return false;
     }
@@ -379,7 +553,7 @@ function isUsableLocalStorageUrl(url: string): boolean {
 
 function localStorageDomainForUrl(url: string): string {
     const parsed = new URL(url);
-    return parsed.protocol === "file:" ? "file" : parsed.hostname;
+    return parsed.origin;
 }
 
 /**
@@ -394,24 +568,30 @@ export async function snapshotBrowserStorage(context: any, options?: BrowserStor
     const saveLocalStorage = options?.saveLocalStorage !== false;
     const cookieTimeoutMs = options?.cookieTimeoutMs ?? 5000;
     const localStorageTimeoutMs = options?.localStorageTimeoutMs ?? 5000;
+    const deadline = Date.now() + (options?.totalTimeoutMs ?? 15_000);
+    const remaining = () => Math.max(1, deadline - Date.now());
     const result: BrowserStorageSnapshotResult = {
         reason,
         cookieCount: 0,
         localStorageDomains: [],
         errors: [],
         cookies: [],
+        savedCookieCount: 0,
+        capturedAt: new Date().toISOString(),
     };
 
     if (saveCookies) {
         try {
-            const cookies = await withTimeout(context.cookies(), cookieTimeoutMs, "cookie snapshot");
+            const cookies = await withTimeout(context.cookies(), Math.min(cookieTimeoutMs, remaining()), "cookie snapshot");
             result.cookies = Array.isArray(cookies) ? cookies : [];
             result.cookieCount = result.cookies.length;
             if (result.cookies.length > 0) {
-                result.mergedCookieCount = saveCookiesToBackup(result.cookies);
+                result.mergedCookieCount = saveCookiesToBackup(result.cookies, undefined, remaining());
+                result.savedCookieCount = result.cookieCount;
+                result.savedAt = new Date().toISOString();
             }
         } catch (error) {
-            result.errors.push(`cookies: ${error instanceof Error ? error.message : String(error)}`);
+            result.errors.push("cookies: capture or persistence failed");
         }
     }
 
@@ -420,31 +600,44 @@ export async function snapshotBrowserStorage(context: any, options?: BrowserStor
         try {
             pages = typeof context.pages === "function" ? context.pages() : [];
         } catch (error) {
-            result.errors.push(`pages: ${error instanceof Error ? error.message : String(error)}`);
+            result.errors.push("pages: unavailable");
         }
 
         for (const page of pages) {
+            if (Date.now() >= deadline) {
+                result.errors.push("localStorage: total snapshot budget exhausted");
+                break;
+            }
             try {
                 if (typeof page?.isClosed === "function" && page.isClosed()) continue;
                 const url = safePageUrl(page);
                 if (!isUsableLocalStorageUrl(url)) continue;
                 const domain = localStorageDomainForUrl(url);
-                const lsData = await withTimeout<Record<string, string>>(page.evaluate(() => {
+                const evaluated = await withTimeout<{ origin: string; data: Record<string, string> }>(page.evaluate(() => {
                     const data: Record<string, string> = {};
                     for (let i = 0; i < localStorage.length; i++) {
                         const key = localStorage.key(i);
                         if (key) data[key] = localStorage.getItem(key) || "";
                     }
-                    return data;
-                }), localStorageTimeoutMs, "localStorage snapshot");
+                    return { origin: location.origin, data };
+                }), Math.min(localStorageTimeoutMs, remaining()), "localStorage snapshot");
+                if (evaluated.origin !== domain) {
+                    result.errors.push("localStorage: origin changed during capture");
+                    continue;
+                }
+                const lsData = evaluated.data;
                 const keyCount = Object.keys(lsData || {}).length;
                 if (keyCount > 0) {
-                    saveLocalStorageToBackup(domain, lsData);
-                    result.localStorageDomains.push({ domain, keyCount });
+                    const savedKeys = saveLocalStorageToBackup(domain, lsData, remaining());
+                    if (savedKeys > 0) {
+                        const previous = result.localStorageDomains.find(entry => entry.domain === domain);
+                        if (previous) previous.keyCount = savedKeys;
+                        else result.localStorageDomains.push({ domain, keyCount: savedKeys });
+                        result.savedAt = new Date().toISOString();
+                    }
                 }
             } catch (error) {
-                const url = safePageUrl(page);
-                result.errors.push(`localStorage${url ? `(${url})` : ""}: ${error instanceof Error ? error.message : String(error)}`);
+                result.errors.push("localStorage: capture or persistence failed");
             }
         }
     }

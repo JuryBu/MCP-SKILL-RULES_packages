@@ -2,18 +2,21 @@ import type { Page } from "playwright";
 import { browserManager } from "../browser.js";
 import { safePageEvaluate } from "../extractor.js";
 import { extractDomStructureFromPage } from "../inspector/dom-inspector.js";
-import { QUALITY_PRESETS } from "../constants.js";
+import { QUALITY_PRESETS, type SaveMode } from "../constants.js";
+import { inlineImageContent } from "../image-output.js";
+import type { TextContent, ImageContent } from "@modelcontextprotocol/sdk/types.js";
 import { generateCacheKey, splitOversizedImage } from "../temp-store.js";
 import type { InspectElement } from "../inspector/types.js";
 
 export interface PageSnapshotOptions {
+    saveMode?: SaveMode;
     sessionId?: string;
     fullPage?: boolean;
     maxVisibleChars?: number;
     maxDomElements?: number;
 }
 
-export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions = {}): Promise<string> {
+export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions = {}): Promise<Array<TextContent | ImageContent>> {
     const maxVisibleChars = options.maxVisibleChars ?? 8000;
     const maxDomElements = options.maxDomElements ?? 30;
 
@@ -25,10 +28,16 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
         fullPage: options.fullPage ?? false,
     });
     const cacheKey = generateCacheKey(page.url(), "snapshot", Date.now(), options.fullPage ?? false);
-    const splitResult = await splitOversizedImage(buffer, "screenshots", cacheKey, ".jpg");
-    const screenshotText = splitResult.wasSplit
-        ? `${splitResult.description}\n${splitResult.paths.map((path, index) => `  ${index + 1}. ${path} (${splitResult.sizes[index]} KB)`).join("\n")}`
-        : `${splitResult.paths[0]} (${splitResult.sizes[0]} KB)`;
+    let screenshotText = "图片随结果直接返回";
+    let images: Array<TextContent | ImageContent> = [];
+    if (options.saveMode === "file") {
+        const splitResult = await splitOversizedImage(buffer, "screenshots", cacheKey, ".jpg");
+        screenshotText = splitResult.wasSplit
+            ? `${splitResult.description}\n${splitResult.paths.map((path, index) => `  ${index + 1}. ${path} (${splitResult.sizes[index]} KB)`).join("\n")}`
+            : `${splitResult.paths[0]} (${splitResult.sizes[0]} KB)`;
+    } else {
+        images = await inlineImageContent(buffer, "页面快照");
+    }
 
     const visibleText = await safePageEvaluate(page, () => {
         const vh = window.innerHeight;
@@ -81,11 +90,11 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
         ? `${visibleText.slice(0, maxVisibleChars)}\n...[截断 ${visibleText.length - maxVisibleChars} 字符]`
         : visibleText;
 
-    return [
+    const text = [
         options.sessionId ? `SessionId: ${options.sessionId}` : "",
         `当前 URL: ${page.url()}`,
         "",
-        `## 截图文件`,
+        options.saveMode === "file" ? "## 截图文件" : "## 截图",
         screenshotText,
         "",
         `## 视口可见文本 (${visibleText.length} 字符)`,
@@ -94,6 +103,7 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
         `## DOM 摘要 (${domElements.length} 个可见元素，显示前 ${Math.min(maxDomElements, domElements.length)} 个)`,
         domSummary || "(未提取到 DOM 元素)",
     ].filter(Boolean).join("\n");
+    return [{ type: "text", text }, ...images];
 }
 
 function describeElement(element: InspectElement): string {

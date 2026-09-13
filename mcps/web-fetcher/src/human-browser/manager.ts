@@ -3,11 +3,12 @@ import {
     cleanupTempProfile,
     connectCDP,
     launchSystemChrome,
-    snapshotBrowserStorage,
+    recoverClosedChromeStorage,
     terminateOwnedChrome,
     type BrowserStorageSnapshotResult,
     type ChromeLaunchResult,
 } from "../chrome-helper.js";
+import { StorageSnapshotTracker } from "../storage-snapshot-tracker.js";
 import { desktopManager } from "../desktop/manager.js";
 import { normalizeOwnerId } from "../session.js";
 import { sessionManager } from "../session.js";
@@ -38,6 +39,10 @@ export interface HumanBrowserSessionInfo {
     storageSnapshot?: {
         cookieCount: number;
         mergedCookieCount?: number;
+        savedCookieCount?: number;
+        savedAt?: string;
+        capturedAt?: string;
+        recoveryPending?: boolean;
         localStorageDomains: Array<{ domain: string; keyCount: number }>;
         errors: string[];
     };
@@ -57,6 +62,13 @@ interface HumanBrowserSession {
     lastAccess: number;
     pages: Map<string, any>;
     registeredSessionIds: Map<string, string>;
+    tracker: StorageSnapshotTracker;
+    startUrl: string;
+    recovery?: Promise<void>;
+    recoveredSnapshot?: BrowserStorageSnapshotResult;
+    recoveryPending: boolean;
+    removeListeners: () => void;
+    closing?: Promise<boolean>;
 }
 
 class HumanBrowserManager {
@@ -72,11 +84,15 @@ class HumanBrowserManager {
             startUrl: params.startUrl ?? "about:blank",
             profilePrefix: "mcp-chrome-human",
         });
+        let desktopSessionId: string | undefined;
+        let cdpBrowser: any;
+        let session: HumanBrowserSession | undefined;
         try {
             await waitForCdpReady(chrome.cdpPort, params.waitMs ?? 2500);
             const connected = await desktopManager.connectCdp({ port: chrome.cdpPort, ownerId });
-            const cdpBrowser = await connectCDP(chrome.cdpPort);
-            const session = this.createSession({
+            desktopSessionId = connected.desktopSessionId;
+            cdpBrowser = await connectCDP(chrome.cdpPort);
+            session = await this.createSession({
                 ownerId,
                 desktopSessionId: connected.desktopSessionId,
                 source: "managed-chrome",
@@ -84,12 +100,19 @@ class HumanBrowserManager {
                 cdpBrowser,
                 cdpPort: chrome.cdpPort,
                 endpoint: `http://127.0.0.1:${chrome.cdpPort}`,
+                startUrl: params.startUrl ?? "about:blank",
             });
-            return this.describe(session.id, ownerId);
+            return await this.describe(session.id, ownerId);
         } catch (error) {
+            if (session) {
+                session.removeListeners();
+                await session.tracker.stop().catch(() => undefined);
+                this.sessions.delete(session.id);
+            }
+            if (desktopSessionId) await desktopManager.close(desktopSessionId, ownerId).catch(() => false);
+            if (cdpBrowser) await cdpBrowser.close().catch(() => undefined);
             terminateOwnedChrome(chrome);
-            cleanupTempProfile(chrome.tempProfile);
-            throw error;
+            throw new Error(`${error instanceof Error ? error.message : String(error)}; owned recovery profile retained: ${chrome.tempProfile}`);
         }
     }
 
@@ -102,20 +125,34 @@ class HumanBrowserManager {
         const endpoint = params.endpoint ?? (params.port ? `http://127.0.0.1:${params.port}` : undefined);
         if (!endpoint) throw new Error("web_human_browser_attach requires endpoint or port");
         const connected = await desktopManager.connectCdp({ endpoint, ownerId });
-        const cdpBrowser = params.port ? await connectCDP(params.port) : await connectEndpoint(endpoint);
-        const session = this.createSession({
-            ownerId,
-            desktopSessionId: connected.desktopSessionId,
-            source: "cdp-attach",
-            cdpBrowser,
-            cdpPort: params.port,
-            endpoint,
-        });
-        return this.describe(session.id, ownerId);
+        let cdpBrowser: any;
+        let session: HumanBrowserSession | undefined;
+        try {
+            cdpBrowser = params.port ? await connectCDP(params.port) : await connectEndpoint(endpoint);
+            session = await this.createSession({
+                ownerId,
+                desktopSessionId: connected.desktopSessionId,
+                source: "cdp-attach",
+                cdpBrowser,
+                cdpPort: params.port,
+                endpoint,
+            });
+            return await this.describe(session.id, ownerId);
+        } catch (error) {
+            if (session) {
+                session.removeListeners();
+                await session.tracker.stop().catch(() => undefined);
+                this.sessions.delete(session.id);
+            }
+            await desktopManager.close(connected.desktopSessionId, ownerId).catch(() => false);
+            if (cdpBrowser) await cdpBrowser.close().catch(() => undefined);
+            throw error;
+        }
     }
 
     async describe(humanSessionId: string, ownerId?: string): Promise<HumanBrowserSessionInfo> {
         const session = this.getSession(humanSessionId, ownerId);
+        await this.recoverExitedSession(session);
         const pages = await this.refreshPages(session);
         const storageSnapshot = await this.snapshotStorage(session, "human-status");
         session.lastAccess = Date.now();
@@ -130,7 +167,7 @@ class HumanBrowserManager {
             lastAccess: session.lastAccess,
             alive: pages.some(page => page.alive),
             cookieCount: storageSnapshot.cookieCount,
-            storageSnapshot: this.publicStorageSnapshot(storageSnapshot),
+            storageSnapshot: { ...this.publicStorageSnapshot(storageSnapshot), recoveryPending: session.recoveryPending },
             pages,
         };
     }
@@ -185,33 +222,72 @@ class HumanBrowserManager {
     async close(humanSessionId: string, ownerId?: string): Promise<boolean> {
         const session = this.sessions.get(humanSessionId);
         if (!session || session.ownerId !== normalizeOwnerId(ownerId)) return false;
-        await this.detach(humanSessionId, session.ownerId).catch(() => false);
-        if (session.chrome) {
-            terminateOwnedChrome(session.chrome);
-            cleanupTempProfile(session.chrome.tempProfile);
-        }
-        return true;
+        return session.closing ??= this.finishSession(session, true);
     }
 
     async detach(humanSessionId: string, ownerId?: string): Promise<boolean> {
         const session = this.sessions.get(humanSessionId);
         if (!session || session.ownerId !== normalizeOwnerId(ownerId)) return false;
-        await this.snapshotStorage(session, "human-detach").catch(() => undefined);
+        return session.closing ??= this.finishSession(session, false);
+    }
+
+    private async finishSession(session: HumanBrowserSession, terminate: boolean): Promise<boolean> {
+        session.removeListeners();
+        await this.recoverExitedSession(session);
+        const capturedBeforeClose = session.cdpBrowser.isConnected();
+        await session.tracker.stop(capturedBeforeClose ? "human-close" : undefined);
+        if (session.recovery) await session.recovery;
+        const snapshot = this.storageSummary(session);
+        let profileRetained = Boolean(session.chrome);
+        if (terminate && session.chrome && session.cdpBrowser.isConnected()) {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            await Promise.race([
+                (async () => {
+                    const control = await session.cdpBrowser.newBrowserCDPSession();
+                    await control.send("Browser.close");
+                })().catch(() => undefined),
+                new Promise<void>(resolve => { timer = setTimeout(resolve, 2000); timer.unref(); }),
+            ]).finally(() => { if (timer) clearTimeout(timer); });
+        }
         for (const sessionId of session.registeredSessionIds.values()) {
             await sessionManager.close(sessionId, session.ownerId).catch(() => false);
         }
         await desktopManager.close(session.desktopSessionId, session.ownerId).catch(() => false);
-        if (session.source === "managed-chrome") {
-            await session.cdpBrowser.close().catch(() => undefined);
+        await session.cdpBrowser.close().catch(() => undefined);
+        if (terminate && session.chrome) {
+            terminateOwnedChrome(session.chrome);
+            const exited = await this.waitForOwnedExit(session.chrome);
+            if (exited && (capturedBeforeClose || session.recoveredSnapshot?.savedAt)
+                && snapshot.savedAt && ((snapshot.savedCookieCount ?? 0) > 0 || snapshot.localStorageDomains.length > 0)
+                && snapshot.errors.length === 0 && session.recoveredSnapshot?.recoveryBrowserClosed !== false) {
+                cleanupTempProfile(session.chrome.tempProfile);
+                profileRetained = false;
+            }
         }
+        if (!terminate && session.chrome) session.chrome.process.unref();
         logHumanVerificationAudit({
             phase: "detached",
             ownerId: session.ownerId,
-            humanSessionId,
-            metadata: { source: session.source },
+            humanSessionId: session.id,
+            metadata: { source: session.source, savedAt: snapshot.savedAt, storageErrors: snapshot.errors.length,
+                profileRetained },
         });
-        this.sessions.delete(humanSessionId);
+        this.sessions.delete(session.id);
         return true;
+    }
+
+    private async waitForOwnedExit(chrome: ChromeLaunchResult): Promise<boolean> {
+        if (chrome.process.exitCode !== null || chrome.process.signalCode !== null) return true;
+        return new Promise(resolve => {
+            const finish = () => {
+                clearTimeout(timer);
+                chrome.process.removeListener("exit", finish);
+                resolve(chrome.process.exitCode !== null || chrome.process.signalCode !== null);
+            };
+            const timer = setTimeout(finish, 5000);
+            timer.unref();
+            chrome.process.once("exit", finish);
+        });
     }
 
     async closeAll(): Promise<void> {
@@ -220,17 +296,62 @@ class HumanBrowserManager {
         }
     }
 
-    private createSession(params: Omit<HumanBrowserSession, "id" | "createdAt" | "lastAccess" | "pages" | "registeredSessionIds">): HumanBrowserSession {
+    private async createSession(params: Pick<HumanBrowserSession,
+        "ownerId" | "desktopSessionId" | "source" | "chrome" | "cdpBrowser" | "cdpPort" | "endpoint"> & { startUrl?: string }): Promise<HumanBrowserSession> {
         const id = `human_${randomUUID()}`;
-        const session: HumanBrowserSession = {
+        const contexts = () => {
+            if (!params.cdpBrowser.isConnected()) throw new Error("human browser disconnected");
+            const active = params.cdpBrowser.contexts();
+            if (!active.length) throw new Error("human browser contexts unavailable");
+            return active;
+        };
+        let session: HumanBrowserSession;
+        const tracker = new StorageSnapshotTracker({
+            cookies: async () => {
+                const cookies: any[] = [];
+                for (const context of contexts()) cookies.push(...await context.cookies());
+                return cookies;
+            },
+            pages: () => {
+                const pages = contexts().flatMap((context: any) => context.pages());
+                for (const page of pages) {
+                    const url = page.url();
+                    if (session && /^https?:\/\//.test(url)) session.startUrl = url;
+                }
+                return pages;
+            },
+        }, { reasonPrefix: "human-browser" });
+        session = {
             id,
             createdAt: Date.now(),
             lastAccess: Date.now(),
             ...params,
             pages: new Map(),
             registeredSessionIds: new Map(),
+            tracker,
+            startUrl: params.startUrl ?? params.cdpBrowser.contexts()[0]?.pages()[0]?.url() ?? "about:blank",
+            recoveryPending: false,
+            removeListeners: () => undefined,
         };
         this.sessions.set(id, session);
+        const disconnected = () => {
+            void tracker.stop().catch(() => undefined);
+            void this.recoverExitedSession(session).catch(() => undefined);
+        };
+        params.cdpBrowser.once("disconnected", disconnected);
+        params.chrome?.process.once("exit", disconnected);
+        session.removeListeners = () => {
+            params.cdpBrowser.removeListener("disconnected", disconnected);
+            params.chrome?.process.removeListener("exit", disconnected);
+        };
+        try {
+            await tracker.start();
+        } catch (error) {
+            session.removeListeners();
+            await tracker.stop().catch(() => undefined);
+            this.sessions.delete(id);
+            throw error;
+        }
         return session;
     }
 
@@ -243,9 +364,12 @@ class HumanBrowserManager {
     }
 
     private async refreshPages(session: HumanBrowserSession): Promise<HumanBrowserPageInfo[]> {
-        const activePages = session.cdpBrowser.contexts().flatMap((context: any) => context.pages());
+        const activePages = session.cdpBrowser.isConnected()
+            ? session.cdpBrowser.contexts().flatMap((context: any) => context.pages()) : [];
         for (const [pageId, page] of Array.from(session.pages.entries())) {
             if (!activePages.includes(page) || page.isClosed()) {
+                const registered = session.registeredSessionIds.get(pageId);
+                if (registered) await sessionManager.close(registered, session.ownerId).catch(() => false);
                 session.pages.delete(pageId);
                 session.registeredSessionIds.delete(pageId);
             }
@@ -260,6 +384,7 @@ class HumanBrowserManager {
             const alive = !page.isClosed();
             const title = alive ? await page.title().catch(() => "") : "";
             const url = alive ? page.url() : "";
+            if (/^https?:\/\//.test(url)) session.startUrl = url;
             result.push({
                 humanSessionId: session.id,
                 pageId,
@@ -298,34 +423,58 @@ class HumanBrowserManager {
     }
 
     private async snapshotStorage(session: HumanBrowserSession, reason: string): Promise<BrowserStorageSnapshotResult> {
-        const empty: BrowserStorageSnapshotResult = {
-            reason,
-            cookieCount: 0,
-            localStorageDomains: [],
-            errors: [],
-            cookies: [],
-        };
-        try {
-            const contexts = session.cdpBrowser.contexts();
-            const snapshots = await Promise.all(contexts.map((context: any) => snapshotBrowserStorage(context, { reason })));
-            return snapshots.reduce<BrowserStorageSnapshotResult>((combined, snapshot) => ({
-                reason,
-                cookieCount: combined.cookieCount + snapshot.cookieCount,
-                mergedCookieCount: snapshot.mergedCookieCount ?? combined.mergedCookieCount,
-                localStorageDomains: [...combined.localStorageDomains, ...snapshot.localStorageDomains],
-                errors: [...combined.errors, ...snapshot.errors],
-                cookies: [...combined.cookies, ...snapshot.cookies],
-            }), empty);
-        } catch (error) {
-            empty.errors.push(error instanceof Error ? error.message : String(error));
-            return empty;
-        }
+        if (session.cdpBrowser.isConnected() && !session.closing) await session.tracker.capture(reason);
+        return this.storageSummary(session);
     }
 
-    private publicStorageSnapshot(snapshot: BrowserStorageSnapshotResult): HumanBrowserSessionInfo["storageSnapshot"] {
+    private storageSummary(session: HumanBrowserSession): BrowserStorageSnapshotResult {
+        const tracked = session.tracker.summary();
+        const recovered = session.recoveredSnapshot;
+        if (!recovered) return tracked;
+        if (recovered.savedAt && (!tracked.savedAt || recovered.savedAt >= tracked.savedAt)) {
+            const origins = new Map(tracked.localStorageDomains.map(entry => [entry.domain, entry]));
+            for (const entry of recovered.localStorageDomains) origins.set(entry.domain, entry);
+            return {
+                ...tracked,
+                ...recovered,
+                cookies: (recovered.savedCookieCount ?? 0) > 0 ? recovered.cookies : tracked.cookies,
+                cookieCount: (recovered.savedCookieCount ?? 0) > 0 ? recovered.cookieCount : tracked.cookieCount,
+                savedCookieCount: (recovered.savedCookieCount ?? 0) > 0 ? recovered.savedCookieCount : tracked.savedCookieCount,
+                localStorageDomains: [...origins.values()],
+            };
+        }
+        return { ...tracked, errors: [...new Set([...tracked.errors, ...recovered.errors])] };
+    }
+
+    private async recoverExitedSession(session: HumanBrowserSession): Promise<void> {
+        if (!session.chrome || (session.chrome.process.exitCode === null && session.chrome.process.signalCode === null)) return;
+        if (!session.recovery) {
+            session.recoveryPending = true;
+            session.recovery = (async () => {
+                await session.tracker.stop();
+                session.recoveredSnapshot = await recoverClosedChromeStorage(session.chrome!, session.startUrl);
+            })().catch(() => {
+                const summary = session.tracker.summary();
+                session.recoveredSnapshot = { ...summary, errors: [...summary.errors, "owned profile recovery failed; profile retained"] };
+            }).finally(() => {
+                session.recoveryPending = false;
+                session.removeListeners();
+            });
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([
+            session.recovery,
+            new Promise<void>(resolve => { timer = setTimeout(resolve, 20_000); timer.unref(); }),
+        ]).finally(() => { if (timer) clearTimeout(timer); });
+    }
+
+    private publicStorageSnapshot(snapshot: BrowserStorageSnapshotResult): NonNullable<HumanBrowserSessionInfo["storageSnapshot"]> {
         return {
             cookieCount: snapshot.cookieCount,
             mergedCookieCount: snapshot.mergedCookieCount,
+            savedCookieCount: snapshot.savedCookieCount,
+            savedAt: snapshot.savedAt,
+            capturedAt: snapshot.capturedAt,
             localStorageDomains: snapshot.localStorageDomains,
             errors: snapshot.errors,
         };

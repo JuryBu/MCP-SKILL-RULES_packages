@@ -1,10 +1,11 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { inlineImageContent } from "../image-output.js";
 import { browserManager } from "../browser.js";
 import { extractContent, compactContent, truncateContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
 import { touchActivity } from "../lifecycle.js";
 import {
-    QUALITY_PRESETS, SCREENSHOT_MIME_TYPE,
+    QUALITY_PRESETS,
     type ImageQuality, type SaveMode,
     appendTiming,
     resolveSummaryModelChain,
@@ -51,7 +52,7 @@ const FetchRichInputSchema = z.object({
     saveMode: z
         .enum(["file", "inline"])
         .optional()
-        .describe("截图输出模式: file(临时文件,默认)/inline(base64)"),
+        .describe("截图输出模式: inline(默认，直接图片+文本)/file(显式返回临时文件路径)"),
     page: z
         .number()
         .int()
@@ -83,7 +84,7 @@ export function registerFetchRich(server: McpServer): void {
   - modelChain (string, 可选): 仅 ai_summary 生效，可选 auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
   - chain (string, 可选): 兼容旧参数，仅 ai_summary 生效；modelChain 未填时使用
   - quality (string, 可选): 图片质量 hd/clear/default/compact/fast，默认 default
-  - saveMode (string, 可选): file(临时文件,默认)/inline(base64)
+  - saveMode (string, 可选): inline(默认，直接图片+文本，最多10张含分片、base64总长12MiB)/file(显式返回临时文件路径)
   - page (number, 可选): PDF/Office文件的页码（默认1），截取指定页
   - pages (string, 可选): PDF/Office多页截取: "all"/"1-5"/"1,4,5"/"1-3,6-9,18"
 
@@ -111,7 +112,7 @@ export function registerFetchRich(server: McpServer): void {
             touchActivity();
             const startTime = Date.now();
             const quality: ImageQuality = (params.quality || "default") as ImageQuality;
-            const saveMode: SaveMode = params.saveMode || "file";
+            const saveMode: SaveMode = params.saveMode || "inline";
             const modelChain = resolveSummaryModelChain(params.chain, params.modelChain);
             const qConfig = QUALITY_PRESETS[quality];
 
@@ -307,18 +308,10 @@ export function registerFetchRich(server: McpServer): void {
                         }],
                     }, startTime, browserManager.lastRetryCount);
                 } else {
-                    const base64 = screenshotBuffer.toString("base64");
                     return appendTiming({
                         content: [
-                            {
-                                type: "text" as const,
-                                text: `截图 (${sizeKB} KB)${pageInfo} + 文本提取完成 [${compactMode}]\n\n${finalContent}`,
-                            },
-                            {
-                                type: "image" as const,
-                                data: base64,
-                                mimeType: SCREENSHOT_MIME_TYPE,
-                            },
+                            { type: "text" as const, text: `截图 (${sizeKB} KB)${pageInfo} + 文本提取完成 [${compactMode}]\n\n${finalContent}` },
+                            ...await inlineImageContent(screenshotBuffer, `截图${pageInfo}`),
                         ],
                     }, startTime, browserManager.lastRetryCount);
                 }

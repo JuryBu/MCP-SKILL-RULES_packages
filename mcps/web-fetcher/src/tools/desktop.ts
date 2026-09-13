@@ -3,6 +3,9 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { desktopManager } from "../desktop/manager.js";
 import { touchActivity } from "../lifecycle.js";
 import { appendTiming } from "../constants.js";
+import fs from "fs";
+import { inlineImageContent } from "../image-output.js";
+import { inspectionContent } from "../inspection-output.js";
 
 const OwnerSchema = z.string().optional().describe("持久资源所有者标识；Antigravity/Codex 共享 MCP 后端时建议显式传入");
 
@@ -32,6 +35,7 @@ const DesktopWindowInputSchema = DesktopSessionInputSchema.extend({
 });
 
 const DesktopInspectInputSchema = DesktopWindowInputSchema.extend({
+    saveMode: z.enum(["inline", "file"]).optional().describe("visual 附图：inline 默认返回图片与结构；file 返回截图路径"),
     mode: z.enum(["structure", "accessibility", "native", "visual", "all"])
         .optional()
         .default("structure")
@@ -39,6 +43,7 @@ const DesktopInspectInputSchema = DesktopWindowInputSchema.extend({
 });
 
 const DesktopScreenshotInputSchema = DesktopWindowInputSchema.extend({
+    saveMode: z.enum(["inline", "file"]).optional().describe("inline 默认直接返回图片与文本；file 显式返回临时文件路径"),
     fullPage: z.boolean().optional().default(false).describe("renderer/CDP 目标是否截完整页面"),
 });
 
@@ -169,6 +174,7 @@ export function registerDesktopTools(server: McpServer): void {
                 windowId: DesktopInspectInputSchema.shape.windowId,
                 ownerId: DesktopInspectInputSchema.shape.ownerId,
                 mode: DesktopInspectInputSchema.shape.mode,
+                saveMode: DesktopInspectInputSchema.shape.saveMode,
             },
             annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
         },
@@ -176,9 +182,9 @@ export function registerDesktopTools(server: McpServer): void {
             touchActivity();
             const start = Date.now();
             try {
-                return appendTiming({
-                    content: [{ type: "text" as const, text: jsonText(await desktopManager.inspect(params.desktopSessionId, params.windowId, params.mode ?? "structure", params.ownerId)) }],
-                }, start);
+                const response = await desktopManager.inspect(params.desktopSessionId, params.windowId, params.mode ?? "structure", params.ownerId);
+                const generatedPaths = response.visualTree?.screenshotPath ? [response.visualTree.screenshotPath] : [];
+                return appendTiming(await inspectionContent(response, params.saveMode, generatedPaths), start);
             } catch (error) {
                 return errorResult(error instanceof Error ? error.message : String(error));
             }
@@ -189,12 +195,13 @@ export function registerDesktopTools(server: McpServer): void {
         "desktop_screenshot",
         {
             title: "桌面窗口截图",
-            description: "截取 renderer/CDP 页面或 native 窗口截图，返回本地图片路径。",
+            description: "截取 renderer/CDP 页面或 native 窗口截图，默认直接返回图片与文本；saveMode=file 返回本地图片路径。",
             inputSchema: {
                 desktopSessionId: DesktopScreenshotInputSchema.shape.desktopSessionId,
                 windowId: DesktopScreenshotInputSchema.shape.windowId,
                 ownerId: DesktopScreenshotInputSchema.shape.ownerId,
                 fullPage: DesktopScreenshotInputSchema.shape.fullPage,
+                saveMode: DesktopScreenshotInputSchema.shape.saveMode,
             },
             annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
         },
@@ -202,9 +209,12 @@ export function registerDesktopTools(server: McpServer): void {
             touchActivity();
             const start = Date.now();
             try {
-                return appendTiming({
-                    content: [{ type: "text" as const, text: jsonText(await desktopManager.screenshot(params.desktopSessionId, params.windowId, params.ownerId, params.fullPage ?? false)) }],
-                }, start);
+                const screenshot = await desktopManager.screenshot(params.desktopSessionId, params.windowId, params.ownerId, params.fullPage ?? false);
+                if (params.saveMode === "file") {
+                    return appendTiming({ content: [{ type: "text" as const, text: jsonText(screenshot) }] }, start);
+                }
+                const { path: screenshotPath, ...metadata } = screenshot;
+                return appendTiming({ content: await inlineImageContent(await fs.promises.readFile(screenshotPath), jsonText(metadata)) }, start);
             } catch (error) {
                 return errorResult(error instanceof Error ? error.message : String(error));
             }

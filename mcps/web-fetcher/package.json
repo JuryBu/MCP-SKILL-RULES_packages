@@ -1,6 +1,6 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.0.0",
+  "version": "7.1.0",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",
@@ -9,7 +9,13 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "clean": "rimraf dist",
-    "test:portable": "npm run build"
+    "test:portable": "npm run build",
+    "test:images": "node --import tsx --test tests/image-output.test.mjs tests/inspection-output.test.mjs",
+    "test:images:http": "npm run build && node tests/image-delivery-http.test.mjs",
+    "test:login": "node --import tsx --test --test-concurrency=1 tests/login-lifecycle.test.mjs tests/login-lifecycle-deadline.test.mjs tests/browser-auth-state.test.mjs tests/browser-auth-state-review.test.mjs tests/browser-close-storage.test.mjs",
+    "test:login:browser": "node --import tsx --test --test-concurrency=1 tests/login-lifecycle-browser.test.mjs tests/human-storage-lifecycle.test.mjs tests/browser-close-storage.test.mjs",
+    "test:login:600s": "node --import tsx --test tests/login-600s.test.mjs",
+    "test": "npm run build && npm run test:images && npm run test:login"
   },
   "engines": {
     "node": ">=18"

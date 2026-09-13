@@ -1,197 +1,76 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";
-import {
-    findChromePath, launchSystemChrome, connectCDP,
-    cleanupTempProfile, waitForChromeClose, snapshotBrowserStorage,
-    type BrowserStorageSnapshotResult,
-} from "../chrome-helper.js";
+import { runLoginBrowserSession } from "../login-session.js";
 import { startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
 
 const MANUAL_LOGIN_MAX_RUN_MS = 600_000;
-const STORAGE_SNAPSHOT_INTERVAL_MS = 2000;
+const LOGIN_CLEANUP_ALLOWANCE_MS = 120_000;
 
 const LoginBrowserInputSchema = z.object({
-    startUrl: z
-        .string()
-        .url()
-        .optional()
-        .describe("可选，启动浏览器后首先打开的 URL（如 'https://www.zhihu.com/signin'）"),
-    background: z
-        .boolean()
-        .optional()
-        .describe("Codex 侧推荐设为 true：立即返回 taskId，登录窗口在后台等待用户关闭并导出 Cookie"),
-    taskId: z
-        .string()
-        .optional()
-        .describe("查询后台登录任务的 taskId"),
-    waitSeconds: z
-        .number()
-        .int()
-        .min(0)
-        .max(600)
-        .optional()
-        .describe("查询后台任务时等待秒数，任务完成时提前返回"),
+    startUrl: z.string().url().optional().describe("可选，启动后打开的网址"),
+    background: z.boolean().optional().describe("推荐 true：返回 taskId，人工登录不占用同步 MCP 调用"),
+    taskId: z.string().optional().describe("查询已有后台登录任务"),
+    waitSeconds: z.number().int().min(0).max(600).optional().describe("轮询等待秒数，建议 30–45 秒"),
 });
 
 type LoginBrowserInput = z.infer<typeof LoginBrowserInputSchema>;
 
-async function runLoginBrowser(startUrl: string): Promise<string> {
-    // 检查系统 Chrome
-    if (!findChromePath()) {
-        throw new Error("未找到系统 Chrome 浏览器。请确保已安装 Google Chrome。");
-    }
-
-    // 启动系统 Chrome（动态空闲 CDP 端口）
-    const { process: chromeProcess, tempProfile, cdpPort } = await launchSystemChrome({
-        startUrl,
-        profilePrefix: 'mcp-chrome-login',
-    });
-
-    // 等待 Chrome 启动完成
-    await new Promise(r => setTimeout(r, 3000));
-
-    // 通过 CDP 连接到 Chrome，定期备份 Cookie + localStorage
-    const snapshotState: { last?: BrowserStorageSnapshotResult } = {};
-    let cdpBrowser: any = null;
-
-    try {
-        cdpBrowser = await connectCDP(cdpPort);
-        console.error("[web-fetcher] CDP 连接成功，开始定期保存 Cookie + localStorage");
-
-        const contexts = cdpBrowser.contexts();
-        if (contexts.length > 0) {
-            const ctx = contexts[0];
-
-            const snapshot = async (reason: string) => {
-                try {
-                    touchActivity(); // 防止心跳超时杀进程
-                    snapshotState.last = await snapshotBrowserStorage(ctx, { reason });
-                } catch (error) {
-                    console.error(`[web-fetcher] 存储快照失败(${reason}): ${error instanceof Error ? error.message : String(error)}`);
-                }
-            };
-
-            await snapshot("login-initial");
-
-            // 定期保存 Cookie + localStorage（每 2 秒立即落盘）
-            const interval = setInterval(() => {
-                void snapshot("login-periodic");
-            }, STORAGE_SNAPSHOT_INTERVAL_MS);
-
-            // 等待 Chrome 进程退出
-            await waitForChromeClose(chromeProcess);
-            clearInterval(interval);
-
-            // 主动关闭后 CDP 可能已不可用；最后一次只作 best-effort，主要依赖周期快照已落盘
-            await snapshot("login-final").catch(() => undefined);
+async function runLoginBrowser(startUrl: string, runSession = runLoginBrowserSession): Promise<string> {
+    const result = await runSession(startUrl);
+    const snapshot = result.snapshot;
+    const saved = snapshot.savedCookieCount > 0 || snapshot.localStorageDomains.length > 0;
+    const warnings = [...snapshot.errors];
+    if (saved) {
+        try {
+            const { browserManager } = await import("../browser.js");
+            await browserManager.refreshAuthState();
+        } catch {
+            warnings.push("共享浏览器登录态刷新失败，备份仍保留；后续访问需重新检查登录状态");
         }
-    } catch (cdpErr) {
-        console.error("[web-fetcher] CDP 连接失败，将等待 Chrome 退出后从文件导出:", cdpErr);
-        await waitForChromeClose(chromeProcess);
     }
-
-    // 断开 CDP 连接
-    try {
-        if (cdpBrowser) await cdpBrowser.close();
-    } catch { /* 忽略 */ }
-
-    const cookieCount = snapshotState.last?.cookieCount ?? 0;
-    const mergedCount = snapshotState.last?.mergedCookieCount ?? 0;
-    const localStorageDomains = snapshotState.last?.localStorageDomains ?? [];
-    console.error(`[web-fetcher] Chrome 已关闭，最近快照 Cookie: ${cookieCount} 个，localStorage 域名: ${localStorageDomains.length} 个`);
-
-    // 清理临时 profile
-    cleanupTempProfile(tempProfile);
-
-    const exportMsg = cookieCount > 0 || localStorageDomains.length > 0
-        ? `🔒 已快照 ${cookieCount} 个 Cookie，合并后总计 ${mergedCount} 个；localStorage ${localStorageDomains.length} 个域名。`
-        : `⚠️ 未捕获到新 Cookie/localStorage（CDP 连接可能未成功或浏览器关闭太快）。已有备份不受影响。`;
-
-    return `✅ 登录完成！浏览器已关闭。\n${exportMsg}\n服务重启后会自动恢复，不需要重新登录。`;
+    return [
+        result.timedOut ? "人工操作已达到 600 秒，已先尝试保存，再关闭本次自有浏览器。" : "本次人工浏览器会话已结束。",
+        result.browserClosed ? "本次浏览器已关闭。" : "⚠️ 浏览器退出尚未确认，已保留专用 profile。",
+        saved
+            ? `已确认写入 ${snapshot.savedCookieCount} 个 Cookie，localStorage ${snapshot.localStorageDomains.length} 个来源；最近保存 ${snapshot.savedAt ?? "未知"}。这只证明状态已保存，不代表网站已验证登录。`
+            : "⚠️ 尚未确认保存新的 Cookie/localStorage，不能宣称登录成功；已有备份不受影响。",
+        ...warnings.map(warning => `⚠️ ${warning}`),
+        ...(result.recoveryProfile ? [`恢复来源已保留：${result.recoveryProfile}。不要删除此目录或反复扫码，应先排查导出结果。`] : []),
+    ].join("\n");
 }
 
-export function registerLoginBrowser(server: McpServer): void {
-    server.registerTool(
-        "web_login_browser",
-        {
-            title: "打开浏览器登录",
-            description: `打开浏览器窗口让用户手动登录网站。
-使用系统 Chrome（完全原生，不受 Playwright 影响），确保所有网站都能正常加载。
-登录后的 Cookie 与 localStorage 会自动周期性备份，服务重启后自动恢复。
-
-⚠️ 调用此工具后，MCP Server 会暂时阻塞，直到用户关闭浏览器窗口。
-Codex 侧建议传 background=true，先返回 taskId，再用 taskId + waitSeconds 轮询，避免手动登录超过同步 MCP 调用窗口。
-人工操作上限按 600s 设计；请提醒用户：登录完成后等 2 秒再关闭浏览器窗口，确保最新登录态已快照。
-
-参数:
-  - startUrl (string, 可选): 启动后打开的 URL
-  - background (boolean, 可选): 后台登录模式，立即返回 taskId
-  - taskId (string, 可选): 查询后台登录任务
-  - waitSeconds (number, 可选): 查询后台任务时等待秒数，最大 600
-
-返回: 登录操作完成的确认信息`,
-            inputSchema: {
-                startUrl: LoginBrowserInputSchema.shape.startUrl,
-                background: LoginBrowserInputSchema.shape.background,
-                taskId: LoginBrowserInputSchema.shape.taskId,
-                waitSeconds: LoginBrowserInputSchema.shape.waitSeconds,
-            },
-            annotations: {
-                readOnlyHint: false,
-                destructiveHint: false,
-                idempotentHint: false,
-                openWorldHint: true,
-            },
-        },
-        async (params: LoginBrowserInput) => {
-            touchActivity();
-            const startUrl = params.startUrl || "about:blank";
-            if (params.taskId) {
-                const task = await waitForBackgroundTask(params.taskId, params.waitSeconds || 0);
-                return {
-                    content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
-                };
-            }
-            try {
-                if (params.background) {
-                    const task = startBackgroundTask(
-                        "web-login",
-                        async () => runLoginBrowser(startUrl),
-                        {
-                            maxRunMs: MANUAL_LOGIN_MAX_RUN_MS,
-                            timeoutMessage: "登录浏览器后台任务超时（600s）。最近一次 Cookie/localStorage 快照已尽量落盘；可重新打开登录浏览器继续。",
-                        }
-                    );
-                    return {
-                        content: [{
-                            type: "text" as const,
-                            text: [
-                                "🚀 登录浏览器已在后台打开",
-                                `🆔 taskId: ${task.id}`,
-                                "请在弹出的 Chrome 窗口完成登录，完成后等 2 秒再关闭该窗口。",
-                                "后台人工操作上限 600s；随后调用 web_login_browser(taskId=\"...\", waitSeconds=30-45) 查询 Cookie/localStorage 导出结果。",
-                            ].join("\n"),
-                        }],
-                    };
-                }
-                return {
-                    content: [{
-                        type: "text" as const,
-                        text: await runLoginBrowser(startUrl),
-                    }],
-                };
-            } catch (error) {
-                const message =
-                    error instanceof Error ? error.message : String(error);
-                return {
-                    isError: true,
-                    content: [{
-                        type: "text" as const,
-                        text: `启动登录浏览器失败: ${message}`,
-                    }],
-                };
-            }
+export function registerLoginBrowser(server: McpServer, options?: { runSession?: typeof runLoginBrowserSession }): void {
+    server.registerTool("web_login_browser", {
+        title: "打开浏览器登录",
+        description: `打开专用系统 Chrome 窗口供用户手动登录，周期性保存 Cookie 与 localStorage。
+同步与后台模式都给予最多 600 秒人工操作时间，截止后先保存再关闭；手动关闭后会有界恢复本次专用 profile，失败则保留恢复来源。
+建议 background=true，取得 taskId 后每次 waitSeconds=30–45 轮询，不必让同步调用等待几分钟。
+返回区分「状态写入成功」和「网站登录已验证」，不保证已有 Cookie 就是有效登录；不要求用户为导出额外等待两秒。
+后台任务可能在人工操作结束后短暂继续保存和清理，最终返回结果及警告。`,
+        inputSchema: LoginBrowserInputSchema.shape,
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+    }, async (params: LoginBrowserInput) => {
+        touchActivity();
+        if (params.taskId) {
+            const task = await waitForBackgroundTask(params.taskId, params.waitSeconds || 0);
+            return { content: [{ type: "text" as const, text: formatBackgroundTask(task) }] };
         }
-    );
+        try {
+            if (params.background) {
+                const task = startBackgroundTask("web-login", () => runLoginBrowser(params.startUrl || "about:blank", options?.runSession), {
+                    maxRunMs: MANUAL_LOGIN_MAX_RUN_MS + LOGIN_CLEANUP_ALLOWANCE_MS,
+                    timeoutMessage: "登录保存/清理超过受控期限，结果未确认；请保留专用 profile 排查，不要据此重新扫码。",
+                });
+                return { content: [{ type: "text" as const, text: [
+                    "登录浏览器任务已启动。请在本次 Chrome 窗口操作，完成后可以关闭窗口。",
+                    `taskId: ${task.id}`,
+                    "人工操作最多 600 秒，之后执行保存和清理；请用同一 taskId、waitSeconds=30–45 查询最终结果。",
+                ].join("\n") }] };
+            }
+            return { content: [{ type: "text" as const, text: await runLoginBrowser(params.startUrl || "about:blank", options?.runSession) }] };
+        } catch {
+            return { isError: true, content: [{ type: "text" as const, text: "启动或完成登录浏览器失败，请检查系统 Chrome 与本次专用 profile；未确认新的登录状态已保存。" }] };
+        }
+    });
 }

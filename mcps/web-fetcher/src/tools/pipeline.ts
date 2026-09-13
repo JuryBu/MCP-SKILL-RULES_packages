@@ -7,6 +7,7 @@ import { extractContent, compactContent, safePageEvaluate, safePageContent, type
 import { QUALITY_PRESETS, appendTiming } from "../constants.js";
 import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-store.js";
 import { buildPageSnapshot } from "./page-snapshot.js";
+import { inlineImageContent, assertInlineImageBudget } from "../image-output.js";
 import * as fs from "fs";
 
 // 单步 action schema
@@ -44,6 +45,7 @@ const PipelineStepSchema = z.object({
 });
 
 const PipelineInputSchema = z.object({
+    saveMode: z.enum(["inline", "file"]).optional().describe("截图/快照输出：inline 默认直接返回多张图片与文本；file 返回临时文件路径"),
     sessionId: z
         .string()
         .optional()
@@ -95,7 +97,7 @@ export function registerPipeline(server: McpServer): void {
   - scroll: 滚动（有 selector 时滚动到元素；无则滚动 scrollCount 次，正数向下负数向上）
   - content: 提取文本（有 selector 时只提取该区域）
   - visible: 提取当前视口可见文本
-  - snapshot: 一次返回当前视口截图文件、可见文本和 DOM 摘要
+  - snapshot: 一次返回当前视口图片、可见文本和 DOM 摘要；saveMode=file 返回旧截图路径
   - click: 点击元素（需要 selector）
   - type: 输入文本（需要 selector + value）
   - wait: 等待元素出现（需要 selector）或纯等待（用 waitMs）
@@ -115,6 +117,7 @@ export function registerPipeline(server: McpServer): void {
 返回: 所有步骤的结果按顺序排列（文本/截图混合）
 如果某步失败，返回已完成的结果 + 错误信息`,
             inputSchema: {
+                saveMode: PipelineInputSchema.shape.saveMode,
                 sessionId: PipelineInputSchema.shape.sessionId,
                 url: PipelineInputSchema.shape.url,
                 timeout: PipelineInputSchema.shape.timeout,
@@ -136,6 +139,7 @@ export function registerPipeline(server: McpServer): void {
 
             const timeout = params.timeout ?? 30000;
             const results: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
+            let failed = false;
             const finalize = (
                 result: { content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; isError?: boolean },
                 _startTime?: number,
@@ -218,6 +222,12 @@ export function registerPipeline(server: McpServer): void {
                                     });
                                 }
                                 const sizeKB = (buf.length / 1024).toFixed(1);
+                                if (params.saveMode !== "file") {
+                                    const images = await inlineImageContent(buf, `${stepLabel} 截图`);
+                                    assertInlineImageBudget([...results, ...images]);
+                                    results.push(...images);
+                                    break;
+                                }
                                 // 自动分片保存
                                 const cacheKey = generateCacheKey(params.url, "pipeline", i, step.fullPage);
                                 const splitResult = await splitOversizedImage(buf, "screenshots", cacheKey, ".jpg");
@@ -354,11 +364,13 @@ export function registerPipeline(server: McpServer): void {
                                 const snapshot = await buildPageSnapshot(page, {
                                     sessionId: sessionId ?? undefined,
                                     fullPage: step.fullPage ?? false,
+                                    saveMode: params.saveMode,
                                 });
+                                assertInlineImageBudget([...results, ...snapshot]);
                                 results.push({
                                     type: "text" as const,
-                                    text: `${stepLabel} 页面快照\n\n${snapshot}`,
-                                });
+                                    text: `${stepLabel} 页面快照`,
+                                }, ...snapshot);
                                 break;
                             }
 
@@ -543,6 +555,7 @@ export function registerPipeline(server: McpServer): void {
                             await page.waitForTimeout(step.waitMs);
                         }
                     } catch (stepError) {
+                        failed = true;
                         const msg = stepError instanceof Error ? stepError.message : String(stepError);
                         results.push({
                             type: "text" as const,
@@ -558,7 +571,7 @@ export function registerPipeline(server: McpServer): void {
                     await sessionManager.close(sessionId, params.ownerId);
                     results.push({
                         type: "text" as const,
-                        text: `\n✅ Pipeline 完成，会话已关闭`,
+                        text: failed ? "\nPipeline 已中断，会话已关闭" : "\n✅ Pipeline 完成，会话已关闭",
                     });
                 } else if (sessionId) {
                     const suffix = createdSession
@@ -566,11 +579,11 @@ export function registerPipeline(server: McpServer): void {
                         : `复用会话仍保留: ${sessionId}`;
                     results.push({
                         type: "text" as const,
-                        text: `\n✅ Pipeline 完成，${suffix}`,
+                        text: `\n${failed ? "Pipeline 已中断" : "✅ Pipeline 完成"}，${suffix}`,
                     });
                 }
 
-                return finalize({ content: results }, startTime, browserManager.lastRetryCount);
+                return finalize({ content: results, ...(failed ? { isError: true } : {}) }, startTime, browserManager.lastRetryCount);
             } catch (error) {
                 const message = error instanceof Error ? error.message : String(error);
 

@@ -24,8 +24,10 @@ import {
 } from "../inspector/dom-inspector.js";
 import { extractEpubStructure } from "../ebook/epub.js";
 import type { AIReviewReport, InspectResult, PageStructure } from "../inspector/types.js";
+import { inspectionContent } from "../inspection-output.js";
 
 const InspectInputSchema = z.object({
+    saveMode: z.enum(["inline", "file"]).optional().describe("检查附图输出：inline 默认返回图片与报告；file 显式保留截图路径。后台 check 也可指定"),
     action: z
         .enum(["check"])
         .optional()
@@ -259,6 +261,7 @@ export function registerInspect(server: McpServer): void {
   - batchSize (number, 可选): AI 批量并发大小，默认 5
   - thresholds (object, 可选): smallFontPx/smallFontPt/contrastRatio/titleTopVarianceEmu/sizeVarianceRatio/gapVarianceRatio 阈值覆盖`,
             inputSchema: {
+                saveMode: InspectInputSchema.shape.saveMode,
                 url: InspectInputSchema.shape.url,
                 mode: InspectInputSchema.shape.mode,
                 action: InspectInputSchema.shape.action,
@@ -284,14 +287,20 @@ export function registerInspect(server: McpServer): void {
         async (params: InspectInput) => {
             touchActivity();
             const response = await handleInspect(params);
-            return {
-                content: [
-                    {
-                        type: "text" as const,
-                        text: JSON.stringify(response, null, 2),
-                    },
-                ],
-            };
+            const saveMode = params.saveMode ?? (params.action === "check" && params.taskId
+                ? backgroundTasks.get(params.taskId)?.params.saveMode
+                : undefined);
+            const generatedPaths: string[] = [];
+            for (const issue of response.detection?.issues ?? []) {
+                if (issue.screenshotPath) generatedPaths.push(issue.screenshotPath);
+            }
+            for (const report of [response.aiReview, response.result]) {
+                for (const finding of report?.aiFindings ?? []) {
+                    const screenshotPath = finding.metadata?.screenshotPath;
+                    if (typeof screenshotPath === "string") generatedPaths.push(screenshotPath);
+                }
+            }
+            return await inspectionContent(response, saveMode, generatedPaths);
         }
     );
 }
@@ -370,6 +379,7 @@ type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | 
 
 function normalizeParams(params: InspectInput): NormalizedInspectInput {
     return {
+        saveMode: params.saveMode ?? "inline",
         url: params.url!,
         mode: params.mode!,
         page: params.page ?? null,

@@ -1,5 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ImageContent, TextContent } from "@modelcontextprotocol/sdk/types.js";
+import { inlineImageContent, assertInlineImageBudget, INLINE_IMAGE_LIMIT } from "../image-output.js";
 import type { Page } from "playwright";
 import fs from "fs";
 import path from "path";
@@ -11,7 +13,7 @@ import { searchPptxTextRegion } from "../inspector/pptx-inspector.js";
 import type { Rect } from "../inspector/types.js";
 import { touchActivity } from "../lifecycle.js";
 import {
-    QUALITY_PRESETS, SCREENSHOT_MIME_TYPE,
+    QUALITY_PRESETS,
     type ImageQuality, type QualityConfig, type SaveMode,
     appendTiming,
 } from "../constants.js";
@@ -26,8 +28,12 @@ import {
 
 // ========== pages 参数解析器 ==========
 // 支持: "all", "1-5", "1,4,5", "1-3,6-9,18" 等格式
-function parsePages(pagesStr: string, totalPages: number): number[] {
+function parsePages(pagesStr: string, totalPages: number, limit = Infinity): number[] {
+    const assertPageBudget = (count: number) => {
+        if (count > limit) throw new Error(`ERR_INLINE_IMAGE_BUDGET: 请求页数超过 ${limit} 张图片上限，请缩小页码范围或显式设置 saveMode="file"`);
+    };
     if (pagesStr.trim().toLowerCase() === "all") {
+        assertPageBudget(totalPages);
         return Array.from({ length: totalPages }, (_, i) => i + 1);
     }
 
@@ -44,6 +50,7 @@ function parsePages(pagesStr: string, totalPages: number): number[] {
             }
             for (let i = start; i <= Math.min(end, totalPages); i++) {
                 pages.add(i);
+                assertPageBudget(pages.size);
             }
         } else {
             const num = parseInt(part, 10);
@@ -52,6 +59,7 @@ function parsePages(pagesStr: string, totalPages: number): number[] {
             }
             if (num <= totalPages) {
                 pages.add(num);
+                assertPageBudget(pages.size);
             }
         }
     }
@@ -113,7 +121,7 @@ const FetchScreenshotInputSchema = z.object({
     saveMode: z
         .enum(["file", "inline"])
         .optional()
-        .describe("输出模式: file(保存临时文件返回路径，默认)/inline(返回base64图片)"),
+        .describe("输出模式: inline(默认，直接返回图片+文本，最多10张且base64总长12MiB)/file(显式选择后返回临时文件路径)"),
     page: z
         .number()
         .int()
@@ -513,7 +521,7 @@ async function formatScreenshotResult(
     warning = "",
     detail = "",
 ) {
-    const saveMode: SaveMode = params.saveMode || "file";
+    const saveMode: SaveMode = params.saveMode || "inline";
     const sizeKB = (screenshotBuffer.length / 1024).toFixed(1);
 
     if (saveMode === "file") {
@@ -549,17 +557,7 @@ async function formatScreenshotResult(
     }
 
     return appendTiming({
-        content: [
-            {
-                type: "text" as const,
-                text: `截图完成 (${sizeKB} KB)${pageInfo}${warning}${detail ? `\n${detail}` : ""}`,
-            },
-            {
-                type: "image" as const,
-                data: screenshotBuffer.toString("base64"),
-                mimeType: SCREENSHOT_MIME_TYPE,
-            },
-        ],
+        content: await inlineImageContent(screenshotBuffer, `截图完成 (${sizeKB} KB)${pageInfo}${warning}${detail ? `\n${detail}` : ""}`, params.autoSplit !== false),
     }, startTime, browserManager.lastRetryCount);
 }
 
@@ -609,14 +607,15 @@ export function registerFetchScreenshot(server: McpServer): void {
   - timeout (number, 可选): 超时毫秒数，默认 30000
   - scrollCount (number, 可选): 截图前滚动次数，默认 0
   - quality (string, 可选): 图片质量 hd/clear/default/compact/fast，默认 default
-  - saveMode (string, 可选): file(临时文件,默认)/inline(base64)
+  - saveMode (string, 可选): inline(默认，直接图片+文本)/file(显式返回临时文件地址)
   - page (number, 可选): PDF/Office文件的页码（默认1），截取指定页
   - pages (string, 可选): PDF/Office多页截取: "all"(全部), "1-5"(范围), "1,4,5"(指定), "1-3,6-9,18"(混合)
 
 返回: 
   - file 模式: 临时文件路径 + 元信息（用 view_file 查看图片）
-  - inline 模式: JPEG 图片（base64）
-  - 多页模式: 各页独立保存，返回清单文件路径`,
+  - inline 模式（默认）: 图片+文本；超大图片按行列有序分片，每维不超过7800像素
+  - 多页模式: 按页码直接返回有序多图；file 模式保持路径/清单
+  - inline 单次最多10张（含分片），base64总长不超过12MiB；超限请缩小范围或显式选择file`,
             inputSchema: {
                 url: FetchScreenshotInputSchema.shape.url,
                 fullPage: FetchScreenshotInputSchema.shape.fullPage,
@@ -643,7 +642,7 @@ export function registerFetchScreenshot(server: McpServer): void {
             touchActivity();
             const startTime = Date.now();
             const quality: ImageQuality = params.quality || "default";
-            const saveMode: SaveMode = params.saveMode || "file";
+            const saveMode: SaveMode = params.saveMode || "inline";
             const qConfig = QUALITY_PRESETS[quality];
 
             if (isEpubUrl(params.url)) {
@@ -858,19 +857,8 @@ export function registerFetchScreenshot(server: McpServer): void {
                         }, startTime, browserManager.lastRetryCount);
                     }
                 } else {
-                    const base64 = screenshotBuffer.toString("base64");
                     return appendTiming({
-                        content: [
-                            {
-                                type: "text" as const,
-                                text: `截图完成 (${sizeKB} KB)${pageInfo}${warning}`,
-                            },
-                            {
-                                type: "image" as const,
-                                data: base64,
-                                mimeType: SCREENSHOT_MIME_TYPE,
-                            },
-                        ],
+                        content: await inlineImageContent(screenshotBuffer, `截图完成 (${sizeKB} KB)${pageInfo}${warning}`, params.autoSplit !== false),
                     }, startTime, browserManager.lastRetryCount);
                 }
             } catch (error) {
@@ -904,19 +892,9 @@ async function handleMultiPageScreenshot(
     qConfig: typeof QUALITY_PRESETS[ImageQuality],
     startTime: number,
 ) {
-    const saveMode: SaveMode = params.saveMode || "file";
-
-    // 多页模式只支持 file 保存
-    if (saveMode === "inline") {
-        return {
-            isError: true,
-            content: [{
-                type: "text" as const,
-                text: `多页截图不支持 inline 模式（图片过多），请使用 file 模式`,
-            }],
-        };
-    }
-
+    const saveMode: SaveMode = params.saveMode || "inline";
+    const capturedPages: number[] = [];
+    let requestedPages: number[] = [];
     let page;
     try {
         // 第一步：先用 pageNumber:1 导航以获取总页数
@@ -939,7 +917,7 @@ async function handleMultiPageScreenshot(
         const totalPages = pdfInfo.totalPages;
 
         // 解析 pages 参数为具体页码数组
-        const requestedPages = parsePages(params.pages!, totalPages);
+        requestedPages = parsePages(params.pages!, totalPages, saveMode === "inline" ? INLINE_IMAGE_LIMIT : Infinity);
 
         console.error(`[web-fetcher] 多页截图: 解析 "${params.pages}" → [${requestedPages.join(',')}] (${requestedPages.length}页/${totalPages}页)`);
 
@@ -955,13 +933,13 @@ async function handleMultiPageScreenshot(
 
         // 逐页截图：对每个 canvas 使用 element.screenshot()
         const results: Array<{ pageNum: number; filePath: string; sizeKB: string }> = [];
+        const inlineContent: Array<TextContent | ImageContent> = [];
         let totalSize = 0;
 
         for (const pageNum of requestedPages) {
             const canvas = await page.$(`#pdf-page-${pageNum}`);
             if (!canvas) {
-                console.error(`[web-fetcher] 警告: 未找到第 ${pageNum} 页的 canvas`);
-                continue;
+                throw new Error(`未找到第 ${pageNum} 页的 canvas`);
             }
 
             const buffer = await canvas.screenshot({
@@ -969,15 +947,20 @@ async function handleMultiPageScreenshot(
                 quality: qConfig.jpegQuality,
             });
 
-            const cacheKey = generateCacheKey(params.url, quality, "multi", pageNum);
-            const filePath = saveTempFile("screenshots", cacheKey, ".jpg", buffer);
             const sizeKB = (buffer.length / 1024).toFixed(1);
             totalSize += buffer.length;
-
-            results.push({ pageNum, filePath, sizeKB });
+            if (saveMode === "inline") {
+                inlineContent.push(...await inlineImageContent(buffer, `第${pageNum}页/共${totalPages}页 (${sizeKB}KB)`, params.autoSplit !== false));
+                assertInlineImageBudget(inlineContent);
+            } else {
+                const cacheKey = generateCacheKey(params.url, quality, "multi", pageNum);
+                const filePath = saveTempFile("screenshots", cacheKey, ".jpg", buffer);
+                results.push({ pageNum, filePath, sizeKB });
+            }
+            capturedPages.push(pageNum);
         }
 
-        if (results.length === 0) {
+        if (capturedPages.length === 0) {
             return {
                 isError: true,
                 content: [{
@@ -990,6 +973,16 @@ async function handleMultiPageScreenshot(
         const totalSizeStr = totalSize > 1024 * 1024
             ? `${(totalSize / 1024 / 1024).toFixed(1)}MB`
             : `${(totalSize / 1024).toFixed(1)}KB`;
+
+        if (saveMode === "inline") {
+            assertInlineImageBudget(inlineContent);
+            return appendTiming({
+                content: [
+                    { type: "text" as const, text: `${capturedPages.length}页截图完成 (共${totalSizeStr}, ${quality}质量) — 文档共${totalPages}页` },
+                    ...inlineContent,
+                ],
+            }, startTime, browserManager.lastRetryCount);
+        }
 
         // ≤3 页: 直接返回路径列表
         if (results.length <= 3) {
@@ -1031,7 +1024,7 @@ async function handleMultiPageScreenshot(
             isError: true,
             content: [{
                 type: "text" as const,
-                text: `多页截图失败: ${message}`,
+                text: `多页截图失败: ${message}\n已捕获页码: ${capturedPages.join(",") || "无"}；未完成页码: ${requestedPages.filter(pageNum => !capturedPages.includes(pageNum)).join(",") || "尚未确定"}。本次请求未完整完成，未返回部分图片冒充成功。`,
             }],
         };
     } finally {
