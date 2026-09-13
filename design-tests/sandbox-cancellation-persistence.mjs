@@ -44,6 +44,7 @@ async function waitFor(predicate, timeoutMs = 1000) {
 
 test("late cancellation after resource admission does not start executor command", async () => {
     const holder = await resourceAdmission.acquire({ ownerId: "late-cancel-holder", reservationMB: 64 });
+    resourceAdmission.setRecoveryPending(true);
     const markerPath = path.join(dataRoot, "late-cancel-marker.txt");
     const controller = new AbortController();
     try {
@@ -55,6 +56,7 @@ test("late cancellation after resource admission does not start executor command
         });
         await waitFor(() => getResourceAdmissionState().queued === 1);
         holder.release();
+        resourceAdmission.setRecoveryPending(false);
         controller.abort();
 
         const result = await pending;
@@ -64,6 +66,7 @@ test("late cancellation after resource admission does not start executor command
         assert.equal(getResourceAdmissionState().activeLeases, 0);
     } finally {
         holder.release();
+        resourceAdmission.setRecoveryPending(false);
     }
 });
 

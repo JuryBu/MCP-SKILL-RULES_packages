@@ -302,6 +302,7 @@ test("runMs measures execution after admission waiting without subtracting the q
          setInterval(() => {}, 1000);
          process.env.SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB="0";
          process.env.SANDBOX_ADMISSION_LIMIT_MB="64";
+         process.env.SANDBOX_ADMISSION_MODE="fixed";
          const { acquireResourceLease } = await import("./dist/resource-admission-runtime.js");
          const { execute } = await import("./dist/executor.js");
          const held = await acquireResourceLease({ ownerId: "holder", reservationMB: 64 });

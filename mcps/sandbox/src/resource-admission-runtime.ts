@@ -25,6 +25,8 @@ function readEnvNumber(name: string, fallback: number): number {
 }
 
 export const resourceAdmission = new ResourceAdmissionController({
+    admissionMode: (process.env.SANDBOX_ADMISSION_MODE || "watermark") as "watermark" | "fixed",
+    startupObservationMs: readEnvNumber("SANDBOX_ADMISSION_STARTUP_OBSERVATION_MS", 1000),
     minReservationMB: readEnvNumber("SANDBOX_ADMISSION_MIN_RESERVATION_MB", 64),
     admissionLimitMB: readEnvNumber("SANDBOX_ADMISSION_LIMIT_MB", 1536),
     hardLimitMB: readEnvNumber("SANDBOX_ADMISSION_HARD_LIMIT_MB", 2048),
@@ -121,12 +123,15 @@ function manageLease(lease: ResourceLease, queueWaitMs: number): ManagedResource
         control: lease.control,
         acquiredAt: lease.acquiredAt,
         queueWaitMs,
+        markStarted(): void { lease.markStarted(); },
+        observeMemoryMB(memoryMB: number): void { lease.observeMemoryMB(memoryMB); },
         updateObservedMemoryMB(memoryMB: number): void {
             if (released || lease.control) return;
             if (!Number.isFinite(memoryMB) || memoryMB < 0) {
                 throw new RangeError("memoryMB must be a finite non-negative number");
             }
             observedMemoryByLease.set(managedLease, memoryMB);
+            lease.observeMemoryMB(memoryMB);
             refreshObservedMemory();
         },
         release(): boolean {

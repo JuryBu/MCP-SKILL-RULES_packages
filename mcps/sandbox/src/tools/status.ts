@@ -122,12 +122,14 @@ async function buildOverview() {
 
     lines.push("");
     lines.push("全局资源调度:");
-    lines.push(`  预留: ${admission.activeReservedMB}/${admission.limits.admissionLimitMB} MB | 活跃租约: ${admission.activeLeases} | 等待: ${admission.queued}/${admission.limits.maxQueueSize}`);
-    lines.push(`  实测进程树: ${admission.observedMemoryMB.toFixed(1)}/${admission.limits.hardLimitMB} MB | 峰值预留: ${admission.peak.activeReservedMB} MB | 峰值等待: ${admission.peak.queued}`);
+    lines.push(`  模式: ${admission.limits.admissionMode === "watermark" ? "实时水位（预留与总观测不设固定封顶）" : "显式固定额度"}`);
+    lines.push(`  预估记账: ${admission.activeReservedMB} MB | 启动待观测: ${admission.startupReservedMB} MB | 活跃租约: ${admission.activeLeases} | 等待: ${admission.queued}/${admission.limits.maxQueueSize}`);
+    lines.push(`  实测进程树: ${admission.observedMemoryMB.toFixed(1)} MB | 峰值预估: ${admission.peak.activeReservedMB} MB | 峰值等待: ${admission.peak.queued}`);
+    if (admission.limits.admissionMode === "fixed") lines.push(`  固定接纳/观测上限: ${admission.limits.admissionLimitMB}/${admission.limits.hardLimitMB} MB`);
     lines.push(`  压力等级: ${admission.pressureLevel} | 物理可用: ${admission.systemAvailableMemoryMB === null ? "未知" : `${admission.systemAvailableMemoryMB.toFixed(0)} MB`} | 临界底线: ${admission.limits.systemHeadroomMB} MB | 黄色线: ${admission.limits.yellowPhysicalMemoryMB} MB`);
     lines.push(`  提交余量: ${admission.commitAvailableMemoryMB === null ? "未知" : `${admission.commitAvailableMemoryMB.toFixed(0)} MB`} | 重任务目标: ${admission.limits.commitHeadroomMB} MB | 紧急底线: ${admission.limits.commitCriticalFloorMB} MB | Windows 高/低内存信号: ${admission.highMemorySignaled ?? "未知"}/${admission.lowMemorySignaled ?? "未知"}`);
     lines.push(`  等待统计: 完成 ${admission.wait.completedTotal} | 超时 ${admission.wait.timedOutTotal} | 取消 ${admission.wait.cancelledTotal} | 平均 ${admission.wait.averageMs.toFixed(0)}ms | 最长 ${admission.wait.maxMs}ms`);
-    lines.push(`  小请求未观测预留物理折算: ${admission.limits.smallRequestPhysicalWeight * 100}% | 压力样本最长有效: ${admission.limits.pressureSampleMaxAgeMs}ms | 仅提交余量充足时启用，提交预留不折算`);
+    lines.push(`  启动观测窗口: ${admission.limits.startupObservationMs}ms | 压力样本最长有效: ${admission.limits.pressureSampleMaxAgeMs}ms | 实时模式仅扣除尚未被系统采样覆盖的启动预估`);
     lines.push(`  后台任务资源恢复: ${admission.recoveryPending ? "进行中，暂停新执行" : "完成"}`);
     lines.push(`  启动前遗留全零记录: ${getLaunchRecoveryState().ignoredHistoricalRecords}（原文件保留，不作为运行任务）`);
 

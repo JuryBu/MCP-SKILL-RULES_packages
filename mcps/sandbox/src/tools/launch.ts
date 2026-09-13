@@ -1360,6 +1360,7 @@ export function registerLaunch(server: McpServer): void {
                 };
 
                 launchLeases.set(taskId, acquiredLease);
+                acquiredLease.markStarted();
 
                 writeTask(task);
 

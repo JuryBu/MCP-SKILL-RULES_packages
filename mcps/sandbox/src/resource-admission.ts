@@ -1,4 +1,6 @@
 export const RESOURCE_ADMISSION_DEFAULTS = Object.freeze({
+    admissionMode: "watermark" as const,
+    startupObservationMs: 1000,
     minReservationMB: 64,
     admissionLimitMB: 1536,
     hardLimitMB: 2048,
@@ -67,6 +69,8 @@ export class ResourceAdmissionError extends Error {
 }
 
 export interface ResourceAdmissionOptions {
+    admissionMode?: "watermark" | "fixed";
+    startupObservationMs?: number;
     minReservationMB?: number;
     admissionLimitMB?: number;
     hardLimitMB?: number;
@@ -103,6 +107,8 @@ export interface ResourceAdmissionRequest {
 export type ResourcePressureLevel = "green" | "yellow" | "red";
 
 export interface ResourceAdmissionDecision {
+    admissionMode: "watermark" | "fixed";
+    startupReservedMB: number;
     reservedMB: number;
     protectedReservationMB: number;
     physicalReservationWeight: number;
@@ -128,11 +134,15 @@ export interface ResourceLease {
     readonly reservedMB: number;
     readonly control: boolean;
     readonly acquiredAt: number;
+    markStarted(): void;
+    observeMemoryMB(memoryMB: number): void;
     release(): boolean;
 }
 
 export interface ResourceAdmissionState {
     limits: {
+        admissionMode: "watermark" | "fixed";
+        startupObservationMs: number;
         minReservationMB: number;
         admissionLimitMB: number;
         hardLimitMB: number;
@@ -147,6 +157,7 @@ export interface ResourceAdmissionState {
     };
     activeReservedMB: number;
     activeLeases: number;
+    startupReservedMB: number;
     queued: number;
     observedMemoryMB: number;
     systemAvailableMemoryMB: number | null;
@@ -204,6 +215,8 @@ interface WaitCounters {
 }
 
 export class ResourceAdmissionController {
+    readonly admissionMode: "watermark" | "fixed";
+    readonly startupObservationMs: number;
     readonly minReservationMB: number;
     readonly admissionLimitMB: number;
     readonly hardLimitMB: number;
@@ -240,6 +253,12 @@ export class ResourceAdmissionController {
     };
 
     private activeReservedMB = 0;
+    private readonly startupReservations = new Map<object, {
+        reservedMB: number; startedAt: number | null; sampleGeneration: number;
+        observedMB: number; coveredObservedMB: number; observedGeneration: number;
+    }>();
+    private systemSampleGeneration = 0;
+    private systemSampleAt: number | null = null;
     private activeLeases = 0;
     private observedMemoryMB = 0;
     private observedReservationCreditMB = 0;
@@ -257,6 +276,11 @@ export class ResourceAdmissionController {
     private draining = false;
 
     constructor(options: ResourceAdmissionOptions = {}) {
+        this.admissionMode = options.admissionMode ?? RESOURCE_ADMISSION_DEFAULTS.admissionMode;
+        if (this.admissionMode !== "watermark" && this.admissionMode !== "fixed") {
+            throw new RangeError("admissionMode must be watermark or fixed");
+        }
+        this.startupObservationMs = nonNegativeNumber(options.startupObservationMs, RESOURCE_ADMISSION_DEFAULTS.startupObservationMs, "startupObservationMs");
         this.minReservationMB = positiveNumber(
             options.minReservationMB,
             RESOURCE_ADMISSION_DEFAULTS.minReservationMB,
@@ -354,10 +378,10 @@ export class ResourceAdmissionController {
         this.now = options.now ?? Date.now;
         this.random = options.random ?? Math.random;
 
-        if (this.minReservationMB > this.admissionLimitMB) {
+        if (this.admissionMode === "fixed" && this.minReservationMB > this.admissionLimitMB) {
             throw new RangeError("minReservationMB cannot exceed admissionLimitMB");
         }
-        if (this.admissionLimitMB > this.hardLimitMB) {
+        if (this.admissionMode === "fixed" && this.admissionLimitMB > this.hardLimitMB) {
             throw new RangeError("admissionLimitMB cannot exceed hardLimitMB");
         }
         if (this.commitCriticalFloorMB > this.commitHeadroomMB) {
@@ -391,6 +415,7 @@ export class ResourceAdmissionController {
                 "Sandbox resource admission queue is full",
                 0,
                 this.computeRetryAfterMs(request.retryAttempt),
+                this.inspectAdmission(reservedMB),
             ));
         }
 
@@ -442,7 +467,9 @@ export class ResourceAdmissionController {
     }
 
     adopt(reservationMB?: number): ResourceLease {
-        return this.createLease(this.normalizeReservation(reservationMB), false);
+        const lease = this.createLease(this.normalizeReservation(reservationMB), false);
+        lease.markStarted();
+        return lease;
     }
 
     updateObservedMemoryMB(observedMemoryMB: number, reservationCreditMB = observedMemoryMB): ResourceAdmissionState {
@@ -474,7 +501,9 @@ export class ResourceAdmissionController {
         const previous = this.systemAvailableMemoryMB;
         this.pressureSampleAt = null;
         this.systemAvailableMemoryMB = systemAvailableMemoryMB;
-        if (systemAvailableMemoryMB > previous) this.drainQueue();
+        this.systemSampleAt = this.now();
+        this.systemSampleGeneration += 1;
+        if (this.admissionMode === "watermark" || systemAvailableMemoryMB > previous) this.drainQueue();
         return this.getState();
     }
 
@@ -498,7 +527,9 @@ export class ResourceAdmissionController {
         this.lowMemorySignaled = sample.lowMemorySignaled;
         const previousSampleAt = this.pressureSampleAt;
         this.pressureSampleAt = this.now();
-        if (sample.systemAvailableMemoryMB > previousPhysical
+        this.systemSampleAt = this.pressureSampleAt;
+        this.systemSampleGeneration += 1;
+        if (this.admissionMode === "watermark" || sample.systemAvailableMemoryMB > previousPhysical
             || sample.commitAvailableMemoryMB > previousCommit
             || (previousLowMemory === true && !sample.lowMemorySignaled)
             || (previousHighMemory === false && sample.highMemorySignaled)
@@ -513,6 +544,8 @@ export class ResourceAdmissionController {
         const completedTotal = this.waitCounters.completedTotal;
         return {
             limits: {
+                admissionMode: this.admissionMode,
+                startupObservationMs: this.startupObservationMs,
                 minReservationMB: this.minReservationMB,
                 admissionLimitMB: this.admissionLimitMB,
                 hardLimitMB: this.hardLimitMB,
@@ -527,6 +560,7 @@ export class ResourceAdmissionController {
             },
             activeReservedMB: this.activeReservedMB,
             activeLeases: this.activeLeases,
+            startupReservedMB: this.getStartupReservedMB(),
             queued: this.queue.length,
             observedMemoryMB: this.observedMemoryMB,
             systemAvailableMemoryMB: Number.isFinite(this.systemAvailableMemoryMB)
@@ -538,7 +572,7 @@ export class ResourceAdmissionController {
             highMemorySignaled: this.highMemorySignaled,
             lowMemorySignaled: this.lowMemorySignaled,
             pressureLevel: this.getPressureLevel(),
-            hardLimitExceeded: this.observedMemoryMB >= this.hardLimitMB,
+            hardLimitExceeded: this.admissionMode === "fixed" && this.observedMemoryMB >= this.hardLimitMB,
             recoveryPending: this.recoveryPending,
             peak: {
                 activeReservedMB: this.peakActiveReservedMB,
@@ -563,15 +597,16 @@ export class ResourceAdmissionController {
         const requestedMB = reservationMB === undefined
             ? this.minReservationMB
             : positiveNumber(reservationMB, this.minReservationMB, "reservationMB");
-        const reservedMB = Math.max(this.minReservationMB, Math.ceil(requestedMB));
+        const reservedMB = this.admissionMode === "fixed"
+            ? Math.max(this.minReservationMB, Math.ceil(requestedMB)) : Math.ceil(requestedMB);
 
-        if (reservedMB > this.hardLimitMB) {
+        if (this.admissionMode === "fixed" && reservedMB > this.hardLimitMB) {
             throw new ResourceAdmissionError(
                 "reservation_exceeds_hard_limit",
                 `Requested reservation exceeds the ${this.hardLimitMB}MB hard limit`,
             );
         }
-        if (reservedMB > this.admissionLimitMB) {
+        if (this.admissionMode === "fixed" && reservedMB > this.admissionLimitMB) {
             throw new ResourceAdmissionError(
                 "reservation_exceeds_admission_limit",
                 `Requested reservation exceeds the ${this.admissionLimitMB}MB admission limit`,
@@ -595,7 +630,9 @@ export class ResourceAdmissionController {
     }
 
     inspectAdmission(reservedMB: number, protectedReservationMB = 0): ResourceAdmissionDecision {
-        const reservedButNotObservedMB = Math.max(0, this.activeReservedMB - this.observedReservationCreditMB);
+        const startupReservedMB = this.getStartupReservedMB();
+        const reservedButNotObservedMB = this.admissionMode === "watermark"
+            ? startupReservedMB : Math.max(0, this.activeReservedMB - this.observedReservationCreditMB);
         const isSmallRequest = reservedMB <= this.yellowMaxReservationMB;
         const requiredPhysicalHeadroomMB = isSmallRequest
             ? this.systemHeadroomMB
@@ -615,7 +652,7 @@ export class ResourceAdmissionController {
             && pressureSampleAgeMs <= this.pressureSampleMaxAgeMs
             && Number.isFinite(projectedCommitAvailableMB)
             && projectedCommitAvailableMB >= this.commitHeadroomMB;
-        const physicalReservationWeight = canUseCommitSlack ? this.smallRequestPhysicalWeight : 1;
+        const physicalReservationWeight = this.admissionMode === "fixed" && canUseCommitSlack ? this.smallRequestPhysicalWeight : 1;
         const projectedPhysicalAvailableMB = this.systemAvailableMemoryMB
             - reservedButNotObservedMB * physicalReservationWeight
             - reservedMB
@@ -629,11 +666,13 @@ export class ResourceAdmissionController {
         if (this.lowMemorySignaled === true) blockedBy.push("windows_low_memory");
         if (pressureLevel === "red") blockedBy.push("emergency_pressure");
         if (pressureLevel === "yellow" && !isSmallRequest) blockedBy.push("heavy_request_yellow");
-        if (this.observedMemoryMB >= this.hardLimitMB) blockedBy.push("observed_hard_limit");
-        if (this.activeReservedMB + reservedMB + protectedReservationMB > this.admissionLimitMB) blockedBy.push("reservation_capacity");
+        if (this.admissionMode === "fixed" && this.observedMemoryMB >= this.hardLimitMB) blockedBy.push("observed_hard_limit");
+        if (this.admissionMode === "fixed" && this.activeReservedMB + reservedMB + protectedReservationMB > this.admissionLimitMB) blockedBy.push("reservation_capacity");
         if (projectedPhysicalAvailableMB < requiredPhysicalHeadroomMB) blockedBy.push("physical_headroom");
         if (projectedCommitAvailableMB < requiredCommitHeadroomMB) blockedBy.push("commit_headroom");
         return {
+            admissionMode: this.admissionMode,
+            startupReservedMB,
             reservedMB,
             protectedReservationMB,
             physicalReservationWeight,
@@ -648,6 +687,20 @@ export class ResourceAdmissionController {
         return this.inspectAdmission(reservedMB, protectedReservationMB).blockedBy.length === 0;
     }
 
+    private getStartupReservedMB(): number {
+        let reservedMB = 0;
+        for (const startup of this.startupReservations.values()) {
+            const sampled = startup.startedAt !== null && this.systemSampleAt !== null
+                && this.systemSampleGeneration > startup.sampleGeneration
+                && this.systemSampleAt - startup.startedAt >= this.startupObservationMs;
+            if (!sampled) reservedMB += startup.reservedMB;
+            else if (startup.observedGeneration === this.systemSampleGeneration) {
+                reservedMB += Math.max(0, startup.observedMB - startup.coveredObservedMB);
+            }
+        }
+        return reservedMB;
+    }
+
     private grantImmediate(reservedMB: number): ResourceLease {
         this.waitCounters.admittedTotal += 1;
         return this.createLease(reservedMB, false);
@@ -656,8 +709,14 @@ export class ResourceAdmissionController {
     private createLease(reservedMB: number, control: boolean): ResourceLease {
         const acquiredAt = this.now();
         let released = false;
+        const startupKey = {};
+        const startup = {
+            reservedMB, startedAt: null as number | null, sampleGeneration: this.systemSampleGeneration,
+            observedMB: 0, coveredObservedMB: 0, observedGeneration: this.systemSampleGeneration,
+        };
 
         if (!control) {
+            this.startupReservations.set(startupKey, startup);
             this.activeReservedMB += reservedMB;
             this.activeLeases += 1;
             this.peakActiveReservedMB = Math.max(
@@ -670,11 +729,28 @@ export class ResourceAdmissionController {
             reservedMB,
             control,
             acquiredAt,
+            markStarted: (): void => {
+                if (released || control || startup.startedAt !== null) return;
+                startup.startedAt = this.now();
+                startup.sampleGeneration = this.systemSampleGeneration;
+            },
+            observeMemoryMB: (memoryMB: number): void => {
+                if (released || control || !Number.isFinite(memoryMB) || memoryMB <= 0) return;
+                if (startup.observedGeneration !== this.systemSampleGeneration) startup.coveredObservedMB = startup.observedMB;
+                startup.observedMB = memoryMB;
+                startup.observedGeneration = this.systemSampleGeneration;
+                startup.reservedMB = Math.max(startup.reservedMB, memoryMB);
+                if (startup.startedAt === null) {
+                    startup.startedAt = this.now();
+                    startup.sampleGeneration = this.systemSampleGeneration;
+                }
+            },
             release: (): boolean => {
                 if (released) return false;
                 released = true;
 
                 if (!control) {
+                    this.startupReservations.delete(startupKey);
                     this.activeReservedMB = Math.max(0, this.activeReservedMB - reservedMB);
                     this.activeLeases = Math.max(0, this.activeLeases - 1);
                     this.drainQueue();
@@ -748,6 +824,7 @@ export class ResourceAdmissionController {
 
     private computeAgedReservation(oldest: PendingRequest, oldestWaitMs: number): number {
         if (oldestWaitMs < this.agingThresholdMs || this.agingThresholdMs <= 0) return 0;
+        if (this.admissionMode === "watermark") return 0;
         if (this.activeReservedMB + oldest.reservedMB <= this.admissionLimitMB) return 0;
         const agingSteps = Math.max(1, Math.floor(oldestWaitMs / this.agingThresholdMs));
         return Math.min(

@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-    ResourceAdmissionController,
+    ResourceAdmissionController as WatermarkController,
     ResourceAdmissionError,
 } from "../mcps/sandbox/src/resource-admission.ts";
+
+class ResourceAdmissionController extends WatermarkController {
+    constructor(options = {}) { super({ admissionMode: "fixed", ...options }); }
+}
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
@@ -16,6 +20,8 @@ test("20 small commands start immediately without a process-count ceiling", asyn
 
     const state = admission.getState();
     assert.deepEqual(state.limits, {
+        admissionMode: "fixed",
+        startupObservationMs: 1000,
         minReservationMB: 64,
         admissionLimitMB: 1536,
         hardLimitMB: 2048,

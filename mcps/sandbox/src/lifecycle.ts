@@ -2,6 +2,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { exec } from "child_process";
+import { formatAdmissionDiagnostic } from "./admission-diagnostics.js";
 
 /**
  * MCP Sandbox 进程生命周期管理 v1.6
@@ -194,9 +195,18 @@ const STRUCTURED_TEXT_TRANSFER_NOTICE = "完整工具文本已放入 structuredC
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function ensureModelVisibleToolResult(result: any): any {
     if (!result?.structuredContent || typeof result.structuredContent !== "object") return result;
-    const textContent = [...(result.content || [])]
+    let textContent = [...(result.content || [])]
         .reverse()
         .find((item) => item?.type === "text" && typeof item.text === "string" && item.text.length > 0);
+    const admissionDiagnostic = formatAdmissionDiagnostic(result.structuredContent.error);
+    if (admissionDiagnostic) {
+        if (!textContent) {
+            textContent = { type: "text", text: admissionDiagnostic };
+            result.content = [...(result.content || []), textContent];
+        } else if (!textContent.text.startsWith(admissionDiagnostic)) {
+            textContent.text = admissionDiagnostic;
+        }
+    }
     if (!textContent) return result;
     const serializedTextBytes = Buffer.byteLength(JSON.stringify(textContent.text), "utf8");
     const serializedMetadataBytes = Buffer.byteLength(JSON.stringify(result.structuredContent), "utf8");

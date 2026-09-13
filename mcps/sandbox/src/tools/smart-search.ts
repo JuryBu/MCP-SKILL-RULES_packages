@@ -18,6 +18,7 @@ import { callModelBridge, isCodexCliAvailable, type ModelChain, type ResolvedMod
 import { cancelBackgroundTask, startBackgroundTask, waitForBackgroundTask, formatBackgroundTask } from "../background-tasks.js";
 import { normalizeOwnerId } from "../owner.js";
 import { acquireResourceLease, serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import { formatAdmissionDiagnostic } from "../admission-diagnostics.js";
 import { initParentLs, isLsReady } from "../ls-client.js";
 import { ensureModelVisibleToolResult } from "../lifecycle.js";
 import {
@@ -2017,6 +2018,7 @@ export function registerSmartSearch(server: McpServer): void {
                     signal: q.signal,
                 });
                 try {
+                    resourceLease.markStarted();
                     switch (q.mode) {
                     case "exact": {
                         const data = await searchExact(q.query, q.searchPath, {
@@ -2170,7 +2172,9 @@ export function registerSmartSearch(server: McpServer): void {
                                 const elapsed = ((Date.now() - start) / 1000).toFixed(1);
                                 results[idx] = `[${idx + 1}/${total}] ${merged.mode} "${q.query}" (${elapsed}s)\n${output}`;
                             } catch (err: any) {
-                                results[idx] = `[${idx + 1}/${total}] ❌ "${q.query}" 失败: ${err.message}`;
+                                const admissionError = serializeResourceAdmissionError(err);
+                                const reason = admissionError ? formatAdmissionDiagnostic(admissionError) ?? admissionError.message : err.message;
+                                results[idx] = `[${idx + 1}/${total}] ❌ "${q.query}" 失败: ${reason}`;
                             }
                         }
                     }

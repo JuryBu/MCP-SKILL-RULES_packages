@@ -272,6 +272,7 @@ export function registerCouncil(server: McpServer): void {
                 });
                 const artifactRun = createCouncilArtifactRun({ ownerId });
                 synchronousRunId = artifactRun.runId;
+                resourceLease.markStarted();
                 const result = await runCouncil({
                     ...baseParams,
                     runId: artifactRun.runId,

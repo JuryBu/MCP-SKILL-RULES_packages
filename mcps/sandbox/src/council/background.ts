@@ -779,6 +779,7 @@ export async function startPersistentCouncilTask(runParams: CouncilRunParams, ow
             windowsHide: true,
         });
         child.unref();
+        if (child.pid) resourceLease.markStarted();
         councilResourceLeases.set(taskId, resourceLease);
         child.on("close", () => releaseCouncilResourceLease(taskId));
         const workerIdentity = readCouncilWorkerIdentity(child.pid);

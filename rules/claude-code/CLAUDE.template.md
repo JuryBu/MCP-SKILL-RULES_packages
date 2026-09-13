@@ -213,7 +213,7 @@ plans/
 - 执行命令/脚本优先走 sandbox（`sandbox_exec` 硬超时+内存隔离、`sandbox_session` 持久 REPL、`sandbox_launch` 长任务脱离），替代 CC 原生 run command 跑命令/计算/验证。✅ 实测 sandbox 能直接访问本地真实目录与文件（`os.listdir`、读写本地路径都通，还能 python-docx/pptx 提取 office 文本），所以本地文件操作也能交给它；仅当需要 CC 权限 UI 留痕、或依赖 CC 专属上下文时才用原生 Bash/PowerShell
 - Sandbox 用 `memoryRequestMB` 表示预计调度占用，用 `maxMemoryMB` 表示整棵进程树硬上限；短命令可在 Windows 提交余量安全时继续并行，队首大任务放不下也不会堵住后续小任务。默认 4096MB 提交余量是重任务目标线，不是所有任务的绝对红线；目标线与 1536MB 紧急底线之间只放行不超过 192MB、且接纳后仍守住紧急底线的小请求。`admission_timeout` 表示命令尚未启动，按 `retryAfterMs` 最多重试一次；再次失败就拆小、降低请求量、改后台或明确反馈排队超时，不能把同一重命令绕到原生 Bash/PowerShell
 - `maxMemoryMB` 的允许上限由服务端配置并在 `sandbox_status` 的「工具内存配置」中展示；参数越界或 `working_directory_missing`、`windows_job_runner_missing` 等启动前错误不等于 Sandbox 不可用，`commandStarted=false` 时修正参数或路径，禁止改用原生命令绕过保护。大目录 exact 搜索在全局 `maxResults` 到达后停止；fuzzy/smart 优先后台，取消时用同一 `taskId` 加 `cancel=true`
-- Sandbox 对不超过 192MB 的小请求仅在新鲜 Windows 压力样本、无低内存警报且扣足完整预留后提交余量仍守住 4096MB 时，按默认 25% 折算未观测预留的物理占用；提交预留不折算，512MB 物理与 1536MB 提交底线不变。等待失败时先看 `admissionDecision.blockedBy` 的具体原因，不能用并发重试绕过保护
+- Sandbox 1.18 起默认按实时物理/提交水位接纳，预估总额1536MB和总观测2048MB不再单独否决，显式24MB请求按24MB记账。估计仅覆盖未开始任务、默认1秒启动窗口及尚未被后续系统采样覆盖的观测增长，不能长期重复扣除已被系统余量计入的任务。黄色水位仍允许安全小请求，512MB物理/1536MB提交紧急底线、Windows低内存信号、完整样本有效期与单进程树硬保护保留；`fixed`仅供管理员明确选择旧额度模式。错误正文与`admissionDecision.blockedBy`均须说明实际阻断、有效请求和水位，0ms退避不表示立即重试，不用并发重发绕过保护。
 - Windows 完整压力样本缺失/过期，或后台任务资源记账尚未恢复时，新执行请求会继续排队或返回未启动的接纳超时；查询与取消仍可用，应等待状态恢复而不是绕过 Sandbox。
 - 排队超过约 1 秒后 Sandbox 会尝试定期发送等待位置和内存压力，但 Claude Code 界面未必展示 MCP progress；以最终结构化结果为准，不因没有中途提示就并发重发
 - 分清四类超时：`admission_timeout` 是资源等待超时，`execution_timeout` 是命令已经启动后运行超时，`caller_deadline_exceeded` 是排队与执行合计超过调用方总期限，`broker_backend_timeout` 是 broker 与 Sandbox backend 通信超时。后三类可能已经开始执行，先检查状态再重试

@@ -11,8 +11,11 @@ $env:MEMORY_STORE_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\memory-store"
 $env:SANDBOX_DATA_ROOT = "$env:CODEX_TOOLKIT_DATA_ROOT\sandbox-data"
 $env:WEB_FETCHER_PROFILE_BASE_DIR = "$env:CODEX_TOOLKIT_DATA_ROOT\web-fetcher-profiles"
 
-# Optional Sandbox-wide resource admission. Requests reserve expected working memory; maxMemoryMB remains the per-process-tree hard limit.
+# Optional Sandbox admission. Watermarks govern admission; explicit request sizes are estimates, not fixed global quotas.
+# $env:SANDBOX_ADMISSION_MODE = "watermark"
+# $env:SANDBOX_ADMISSION_STARTUP_OBSERVATION_MS = "1000"
 # $env:SANDBOX_ADMISSION_MIN_RESERVATION_MB = "64"
+# LIMIT_MB, HARD_LIMIT_MB and SMALL_PHYSICAL_WEIGHT apply only in explicit fixed mode.
 # $env:SANDBOX_ADMISSION_LIMIT_MB = "1536"
 # $env:SANDBOX_ADMISSION_HARD_LIMIT_MB = "2048"
 # $env:SANDBOX_ADMISSION_SYSTEM_HEADROOM_MB = "512"

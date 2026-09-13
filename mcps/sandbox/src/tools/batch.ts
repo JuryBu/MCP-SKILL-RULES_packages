@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity, appendTiming } from "../lifecycle.js";
 import { execute, ExecResult, normalizeExecutionInput } from "../executor.js";
 import { serializeResourceAdmissionError } from "../resource-admission-runtime.js";
+import { formatAdmissionDiagnostic } from "../admission-diagnostics.js";
 import type { ResourceAdmissionDecision } from "../resource-admission.js";
 import { DEFAULT_METADATA_RESERVE_BYTES, HARD_RESPONSE_BYTE_LIMIT } from "../output-delivery.js";
 import { inferMemoryRequestMB, PROCESS_TREE_MAX_MEMORY_MB } from "../memory-limits.js";
@@ -336,7 +337,7 @@ async function executeTask(
             index,
             exitCode: 1,
             stdout: "",
-            stderr: `${admissionError.type}: 命令尚未启动；${admissionError.admissionDecision?.blockedBy.join(", ") || "resource_admission"}`,
+            stderr: formatAdmissionDiagnostic(admissionError) ?? admissionError.message,
             elapsed: "0ms",
             killed: false,
             killReason: null,

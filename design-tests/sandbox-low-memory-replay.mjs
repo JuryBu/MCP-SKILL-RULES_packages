@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ResourceAdmissionController } from "../mcps/sandbox/src/resource-admission.ts";
+import { ResourceAdmissionController as WatermarkController } from "../mcps/sandbox/src/resource-admission.ts";
+
+class ResourceAdmissionController extends WatermarkController {
+    constructor(options = {}) { super({ admissionMode: "fixed", ...options }); }
+}
 
 const delay = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const snapshot = {

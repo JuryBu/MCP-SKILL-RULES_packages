@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.17.3
+ * MCP Sandbox Server v1.18.0
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -43,7 +43,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.17.3",
+    version: "1.18.0",
 });
 
 // 注册所有 8 个工具
@@ -68,7 +68,9 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-            text: `# MCP Sandbox v1.17.3 使用指南
+            text: `# MCP Sandbox v1.18.0 使用指南
+
+默认实时水位调度：实际物理/提交余量和Windows压力信号决定接纳，不再因1536MB预估记账或2048MB总观测线单独拒绝；显式24MB按24MB记账。已开始任务经过默认1秒启动观察窗口、被后续系统采样覆盖后退出预估扣账；新增观测增长继续保留到下一采样。小请求在黄色水位继续前进，红色水位、过期采样和恢复未完成仍暂停新执行。单进程树maxMemoryMB硬保护不变。错误正文与结构化结果同时解释有效请求、真实阻断和水位。SANDBOX_ADMISSION_MODE=fixed仅供显式选择旧额度模式。
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -556,7 +558,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.17.3 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.18.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -616,7 +618,7 @@ console.error(`[sandbox] MCP Server v1.17.3 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.17.3 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.18.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

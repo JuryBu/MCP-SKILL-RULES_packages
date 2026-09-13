@@ -1,6 +1,6 @@
 {
   "name": "sandbox-mcp-server",
-  "version": "1.17.3",
+  "version": "1.18.0",
   "description": "MCP Server - 代码执行沙箱，支持硬超时、内存限制、持久会话、并行执行、GPU/CUDA",
   "type": "module",
   "main": "dist/index.js",
@@ -11,6 +11,8 @@
     "clean": "rimraf dist",
     "test:portable": "npm run build",
     "test:resource-admission": "node ../../design-tests/sandbox-resource-admission.mjs",
+    "test:watermark": "node --test ../../design-tests/sandbox-watermark-admission.mjs ../../design-tests/sandbox-watermark-simulation.mjs ../../design-tests/sandbox-admission-diagnostics.mjs",
+    "test:watermark-process": "node ../../design-tests/sandbox-watermark-process.mjs",
     "test:low-memory-replay": "node --test ../../design-tests/sandbox-low-memory-replay.mjs",
     "test:low-memory-process": "node ../../design-tests/sandbox-low-memory-process.mjs",
     "test:launch-registry": "node ../../design-tests/sandbox-launch-registry.mjs",
