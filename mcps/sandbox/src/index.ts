@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * MCP Sandbox Server v1.18.0
+ * MCP Sandbox Server v1.18.1
  *
  * 代码执行沙箱，解决 Antigravity IDE 中 run_command 的痛点。
  *
@@ -43,7 +43,7 @@ import { initParentLs } from "./ls-client.js";
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "sandbox-mcp-server",
-    version: "1.18.0",
+    version: "1.18.1",
 });
 
 // 注册所有 8 个工具
@@ -68,9 +68,13 @@ server.resource(
         contents: [
             {
                 uri: "sandbox://guide",
-            text: `# MCP Sandbox v1.18.0 使用指南
+            text: `# MCP Sandbox v1.18.1 使用指南
 
 默认实时水位调度：实际物理/提交余量和Windows压力信号决定接纳，不再因1536MB预估记账或2048MB总观测线单独拒绝；显式24MB按24MB记账。已开始任务经过默认1秒启动观察窗口、被后续系统采样覆盖后退出预估扣账；新增观测增长继续保留到下一采样。小请求在黄色水位继续前进，红色水位、过期采样和恢复未完成仍暂停新执行。单进程树maxMemoryMB硬保护不变。错误正文与结构化结果同时解释有效请求、真实阻断和水位。SANDBOX_ADMISSION_MODE=fixed仅供显式选择旧额度模式。
+
+参数与判断：memoryRequestMB合法范围为16～maxMemoryMB，显式24MB不会提升；普通工具省略时取min(硬上限,max(64,ceil(硬上限/4)))，Codex使用其单独配置的默认请求。admission_timeout只证明启动前等待超时，先看admissionDecision.blockedBy：水位、过期/不完整采样、后台恢复和显式fixed额度是不同原因。按有效retryAfterMs最多重试一次，不为排队而盲目低报估计；memory/execution_timeout等已启动失败先核对副作用。
+
+局部限制：batch仍有本次maxParallel与maxTotalMemoryMB预算，Session仍有会话数和请求总额限制；它们不代表系统缺内存，实时水位模式没有移除这些可配置工具限制。短命令优先exec/batch，持久资源显式传ownerId，不清理他人会话。长任务采用后台taskId，Codex宿主按30～45秒短轮询，不超过60秒。当前会话可能缓存旧说明，实际版本以新连接的tools/list与sandbox://guide为准，不因刷新说明重启整个Codex。
 
 ## 核心优势（vs run_command）
 | 功能 | run_command | sandbox |
@@ -196,7 +200,7 @@ sandbox_codex(prompt="简单任务", outputFile="报告.md")
 **后台模式**（推荐，长任务不阻塞）：
 sandbox_codex(prompt="请阅读 任务.md 并执行", outputFile="报告.md", background=true)
 → 返回 taskId，然后：
-sandbox_codex(action="check", taskId="codex-001", waitSeconds=90)  — 等 90s 后查看（推荐）
+sandbox_codex(action="check", taskId="codex-001", waitSeconds=45)  — 等待最多45秒后查看（Codex宿主短轮询）
 sandbox_codex(action="kill",  taskId="codex-001")  — 终止任务
 ⚠️ action="wait" 会阻塞MCP直到完成，仅限短任务/调试
 
@@ -208,7 +212,7 @@ sandbox_codex(action="kill",  taskId="codex-001")  — 终止任务
 | background | false | 后台模式，立刻返回 taskId |
 | action | 无 | check（推荐）/wait（⚠️阻塞）/kill |
 | taskId | 无 | 后台任务 ID（action 时必须） |
-| **waitSeconds** | 无 | **check 前等待秒数（1-300），Codex 建议 90-120s** |
+| **waitSeconds** | 无 | **check前等待秒数（1-300），Codex宿主建议30～45秒，不超过60秒** |
 | cwd | 当前目录 | 工作目录 |
 | timeout | 0(无超时) | Codex 子进程执行超时(ms)，不再限制为 30 分钟 |
 | model | 无 | 指定模型（-m 参数），不传使用默认 |
@@ -235,7 +239,7 @@ sandbox_launch(command="python train.py --epochs 100", cwd="D:/Projects/MyModel"
 → 返回 taskId + PID + 日志路径
 
 **查看进度**（配合 waitSeconds 避免频繁轮询）：
-sandbox_launch(action="status", taskId="launch-001", tailLines=5, waitSeconds=60)
+sandbox_launch(action="status", taskId="launch-001", tailLines=5, waitSeconds=45)
 → 等 60s 后返回日志尾部（任务完成时提前返回）
 
 **其他操作**：
@@ -558,7 +562,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // === 启动 ===
 async function main(): Promise<void> {
-console.error(`[sandbox] MCP Server v1.18.0 启动中... (ppid=${process.ppid})`);
+console.error(`[sandbox] MCP Server v1.18.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 初始化数据目录
@@ -618,7 +622,7 @@ console.error(`[sandbox] MCP Server v1.18.0 启动中... (ppid=${process.ppid})`
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-console.error(`[sandbox] MCP Server v1.18.0 已启动，绑定父 LS PID=${process.ppid}`);
+console.error(`[sandbox] MCP Server v1.18.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

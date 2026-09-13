@@ -1,4 +1,4 @@
-# MCP Sandbox v1.17.3
+# MCP Sandbox v1.18.1
 
 > Grok / ProGrok 支持仅包含客户端桥接代码；本包不提供代理服务、账号、API Key，也不会自动安装、启动或修补接收方的 ProGrok。任何 `yolo` / 自动批准模式都属于高权限执行选项，通用安装不要默认启用。
 
@@ -21,7 +21,7 @@
 
 - ✅ 直接传代码字符串，不用写临时文件
 - ✅ 硬超时 + 自动杀进程，不会卡死
-- ✅ 内存限制，防止吃光系统内存
+- ✅ 实时水位接纳与进程树硬上限，降低内存超用风险（不承诺任意负载下整机永不耗尽）
 - ✅ 小输出完整内联，大输出自动写入 artifact，不丢原始 stdout/stderr
 - ✅ 连续重复输出自动折叠（`[× N 重复]`）
 - ✅ maxLines 行数限制（保留头尾，折叠中间）
@@ -36,6 +36,8 @@ Sandbox backend 在同一进程内统一管理会创建本机子进程的工具�
 
 单任务参数允许的最高硬上限由 `SANDBOX_PROCESS_TREE_MAX_MEMORY_MB` 配置，默认 4096MB，并在 `sandbox_status overview` 的「工具内存配置」中展示。提高这项上限不会放松系统紧急水位；例如 `maxMemoryMB=2048,memoryRequestMB=512` 以 512MB 作为启动估计，实际进程树越过2048MB才会被 Job Object 终止。
 
+工具参数合法范围从16MB起，64MB只是普通工具省略请求量时的推导下限，而且不会超过硬上限；Codex使用其单独配置的默认请求。不要为了等待而低报，只有拆小了实际任务或有证据证明原估计过高时才修正。Session会话数量/请求合计、batch的maxParallel/maxTotalMemoryMB仍是独立可配置局部限制，实时水位模式没有移除它们，也不能把它们的限制误报成系统缺内存。1.18.1补齐工具schema、指南和RULES说明，不改变1.18.0调度算法。发布后用真实`tools/list`、`sandbox://guide`核验，当前会话可能缓存旧说明；长任务在Codex宿主使用30～45秒短轮询，不为刷新说明重启整个宿主。
+
 预估只在启动盲区扣账：同一系统采样期间新获准的请求逐个扣除，未确认开始的任务不会仅因时间过去而免记账。确认进程开始、经过默认1000ms观察窗口且后续系统采样覆盖后，真实系统余量已包含该任务，原预估退出扣账，不因长期高估反复阻塞小命令。首份实际观测大于估计时立即补足启动风险；成熟任务的新观测增长也保留到后续采样覆盖，避免同一采样被重复消费。`SANDBOX_ADMISSION_STARTUP_OBSERVATION_MS` 控制观察窗口，`SANDBOX_ADMISSION_PRESSURE_MAX_AGE_MS` 控制完整样本有效期（默认2000ms）。这不是预测未来任意内存增长的保证，运行时仍靠Windows压力通知、持续采样及单任务硬保护。
 
 `smart_search exact` 逐行解析 ripgrep JSON，达到全局 `maxResults` 后立即停止底层搜索，不再先缓存整棵目录的全部命中。模糊/语义索引使用异步目录读取、分批让出事件循环并默认跳过超过 2MiB 的单文件；后台搜索可用 `taskId + cancel=true` 显式取消。`sandbox_status overview` 同时报告事件循环延迟和后台任务数，便于区分「进程存活」与「后端仍能及时响应」。
@@ -48,7 +50,7 @@ Windows 默认保留512MB物理内存和1536MB提交紧急余量；重请求接�
 
 | 错误类型 | 是否已启动 | 处理方式 |
 |---|---|---|
-| `admission_timeout` | 否 | 资源等待超时；读取 `queueWaitMs`、`memoryPressure`、`retryAfterMs` 后再重试 |
+| `admission_timeout` | 否 | 启动前接纳等待超时；先读 `admissionDecision.blockedBy` 区分水位、采样、恢复或显式fixed额度，不一概归因缺内存；按有效 `retryAfterMs` 最多重试一次，不盲目低报估计 |
 | `execution_timeout` | 是 | 命令超过自身运行时限；确认已产生的状态或副作用后再决定是否重试 |
 | `caller_deadline_exceeded` | 可能 | 排队与执行合计超过调用方总期限；结合 `mayHaveStarted` 判断 |
 | `broker_backend_timeout` | 未知 | broker 与 backend 连接或响应超时；先检查持久任务或外部状态 |

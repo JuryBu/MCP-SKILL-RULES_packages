@@ -22,8 +22,10 @@ const TaskItemSchema = z.object({
     cwd: z.string().optional(),
     env: z.string().optional(),
     timeout: z.number().min(0).optional(),
-    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional(),
-    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional(),
+    maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe("此子任务的进程树硬上限(MB)，与调度启动估计分开"),
+    memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
+        .describe("此子任务启动预计内存(MB)，16～maxMemoryMB；显式24MB按24MB。省略时取min(硬上限,max(64,ceil(硬上限/4)))，不要为绕过等待而低报"),
     maxOutput: z.number().min(100).optional(),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional(),
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional(),
@@ -39,11 +41,11 @@ const BatchParamsSchema = z.object({
     maxParallel: z.number().min(1).max(20).optional()
         .describe("最大并行数，默认3"),
     maxTotalMemoryMB: z.number().int().min(64).optional()
-        .describe("batch 内同时运行任务的调度请求量上限(MB)，默认768；每项 maxMemoryMB 仍是独立进程树硬上限"),
+        .describe("本次batch的局部并发请求预算(MB)，默认768；不是整机内存水位。影响子任务并发，单项请求不能超过它；每项maxMemoryMB仍独立"),
     ownerId: z.string().min(1).max(200).optional()
         .describe("稳定调用方标识，用于全局公平调度"),
     admissionBudgetMs: z.number().min(0).max(10000).optional()
-        .describe("资源不足时单个任务最多等待多久，服务端最多10秒"),
+        .describe("每项启动前接纳等待预算(ms)，最多10秒，不是执行时限；超时看该项admissionDecision.blockedBy，不一概归因缺内存"),
     retryAttempt: z.number().int().min(0).max(4).optional(),
 });
 
@@ -87,7 +89,8 @@ export function registerBatch(server: McpServer): void {
         `一次调用并行执行多个代码片段或命令。适用于同时安装依赖、批量测试、多文件编译等场景。
 
 每个任务独立计时、独立超时、独立内存限制，结果互不影响。
-最多 20 个任务，默认并行（maxParallel=3）；全局内存调度仍会限制真正同时启动的任务。`,
+最多20个任务，maxParallel默认3、maxTotalMemoryMB默认768MB，这两个是本次batch局部并发限制，不是整机内存不足。
+每项分别参与实时水位接纳，显式24MB按24MB；失败先看该项commandStarted和admissionDecision.blockedBy，不把整批成功/失败替代逐项状态，不并发重发失败项绕过保护。`,
         BatchParamsSchema.shape,
         async (params, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const startTime = Date.now();

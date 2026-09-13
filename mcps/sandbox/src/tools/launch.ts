@@ -1029,7 +1029,7 @@ const LaunchParamsShape = {
     maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe(`长期任务进程树提交内存硬上限，默认256MB、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}MB`),
     memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
-        .describe("长期任务调度预期内存，必须不大于 maxMemoryMB"),
+        .describe("启动预计内存(MB)，16～maxMemoryMB；显式24MB按24MB。省略时取min(硬上限,max(64,ceil(硬上限/4)))；不代表长期实际占用，不要盲目低报"),
 };
 
 export function registerLaunch(server: McpServer): void {
@@ -1040,7 +1040,7 @@ export function registerLaunch(server: McpServer): void {
 适合：模型训练、大规模数据处理、长时间编译等。
 
 启动：sandbox_launch(command="python train.py", cwd="项目目录")
-查看：sandbox_launch(action="status", taskId="launch-001", tailLines=5, waitSeconds=60)
+查看：sandbox_launch(action="status", taskId="launch-001", tailLines=5, waitSeconds=45)
 终止：sandbox_launch(action="kill", taskId="launch-001")
 列表：sandbox_launch(action="list")
 清理：sandbox_launch(action="clean")
@@ -1049,7 +1049,9 @@ export function registerLaunch(server: McpServer): void {
 - 进程脱离 MCP，关闭 IDE / 换对话不影响
 - 日志写磁盘，按需读取尾部几行
 - 注册表持久化，新对话可用 list 找回任务
-- waitSeconds 主动等待后返回，避免频繁轮询`,
+- waitSeconds主动等待后返回，Codex侧建议30～45秒短轮询
+- 启动按实时水位接纳；admission_timeout表示尚未启动，先看admissionDecision.blockedBy，不一概归因缺内存
+- 显式ownerId管理自己的任务，通信结果不确定时先按已有taskId查状态，勿重复启动或清理他人任务`,
         LaunchParamsShape,
         async (params: Record<string, unknown>, extra?: { signal?: AbortSignal; sessionId?: string }) => {
             const startTime = Date.now();

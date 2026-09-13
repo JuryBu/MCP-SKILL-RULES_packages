@@ -39,7 +39,7 @@ export function registerStatus(server: McpServer): void {
     const description = `查看沙箱系统状态。包括可用环境列表、CUDA 信息、资源占用、活跃会话列表。
 
 action:
-- overview (默认): 系统资源 + 活跃会话 + 临时文件 + 输出 artifact 统计
+- overview (默认): 系统资源、实时水位/兼容fixed模式、启动待观测、采样/恢复、会话与工具局部额度、输出artifact；判断阻断仍以失败调用的admissionDecision.blockedBy为准
 - envs: 可用语言环境列表（Python/Node/conda/bash）
 - gpu: GPU/CUDA/DirectML 详细信息
 - gc: 不传 gcScope 时清理过期临时文件与输出 artifact，并报告保留/无效数量；gcScope=council 时支持 dryRun/apply/restore/purge 的受控 council GC。服务启动会自动先 apply 托管 council artifact（includeLegacy=false），再按 15 天清理 task；legacy 迁移仍需显式 gc apply。task 目录只存 checkpoint 和 resume transcript 快照，不是完整 artifact 根目录；仅名称恰为 .preserve 的标记文件受保护`;

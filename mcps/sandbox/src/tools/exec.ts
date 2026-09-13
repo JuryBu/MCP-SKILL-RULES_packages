@@ -25,7 +25,7 @@ const ExecParamsShape = {
     maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe(`进程树提交内存硬上限(MB)，默认256、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}；Windows 从进程恢复运行前开始强制执行`),
     memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
-        .describe("调度预期内存(MB)，必须不大于 maxMemoryMB；不填时按硬上限的约25%推导，最少64MB"),
+        .describe("启动预计内存(MB)，16～maxMemoryMB；显式24MB按24MB，不提升到64MB。省略时取min(硬上限,max(64,ceil(硬上限/4)))；不等于硬上限，不应为绕过等待而低报"),
     maxOutput: z.number().min(100).optional()
         .describe("兼容参数：调用方希望的内联字符预算；最终仍受服务端响应保护线约束"),
     outputMode: z.enum(["full", "tail", "head", "silent"]).optional()
@@ -39,7 +39,7 @@ const ExecParamsShape = {
     ownerId: z.string().min(1).max(200).optional()
         .describe("稳定调用方标识，用于多对话公平调度"),
     admissionBudgetMs: z.number().min(0).max(10000).optional()
-        .describe("资源不足时最多等待多久；不填使用服务端8～10秒预算，服务端最多10秒"),
+        .describe("启动前接纳等待预算(ms)，不是运行时限；默认8～10秒、最多10秒。超时先看admissionDecision.blockedBy，可能是水位、采样或恢复等待，不等于电脑缺内存"),
     retryAttempt: z.number().int().min(0).max(4).optional()
         .describe("调用方重试级别，用于生成随机指数退避建议"),
     gpu: z.boolean().optional()
@@ -59,11 +59,10 @@ export function registerExec(server: McpServer): void {
 code 模式：直接传代码字符串，无需写临时文件
 command 模式：执行系统命令，自动用 shell 包装
 
-比 run_command 更安全高效：
-- 硬超时自动杀进程（不会卡死）
-- 内存超限自动杀（不会吃光内存）
-- 输出智能截断（不爆上下文）
-- 失败原因清晰（killed + killReason）`,
+默认按实时物理/提交水位接纳，固定预估总额不会在安全水位下单独阻断；短请求可在黄色水位前进，危险水位、过期采样和后台恢复仍会等待。
+maxMemoryMB限制整棵进程树，memoryRequestMB只是启动估计；小估计不能替代硬保护。
+admission_timeout表示尚未启动，先看错误正文和admissionDecision.blockedBy；执行/通信超时先核对commandStarted、mayHaveStarted及副作用，勿并发重发或盲目低报估计。
+小输出完整返回，大输出保留完整artifact及预览。`,
         ExecParamsShape,
         async (params, extra) => {
             const startTime = Date.now();

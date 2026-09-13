@@ -36,7 +36,7 @@ const SessionParamsSchema = z.object({
     maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe(`会话内存上限(MB)，默认256、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}`),
     memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
-        .describe("会话调度预期内存(MB)，必须不大于 maxMemoryMB"),
+        .describe("会话启动预计内存(MB)，16～maxMemoryMB；显式24MB按24MB。省略时按硬上限约四分之一推导，下限64但不超过硬上限；仍计入Session局部额度"),
     maxLines: z.number().min(1).optional()
         .describe("兼容的内联行数预算，不再硬限制为200"),
     maxOutput: z.number().min(100).optional()
@@ -60,7 +60,9 @@ action:
 - close: 关闭会话
 - list: 列出所有活跃会话
 
-默认限制：同一 MCP 进程内最多 ${limits.maxSessions} 个并发会话、调度请求量合计 ${limits.maxTotalMemoryMB}MB、单会话默认硬上限 ${limits.defaultMemoryMB}MB、空闲 ${Math.round(limits.idleTimeoutMs / 60000)} 分钟自动关闭；均可通过 SANDBOX_SESSION_* 环境变量调整。`,
+默认限制：同一MCP进程内最多${limits.maxSessions}个并发会话、请求量合计${limits.maxTotalMemoryMB}MB、单会话硬上限${limits.defaultMemoryMB}MB、空闲${Math.round(limits.idleTimeoutMs / 60000)}分钟自动关闭，可通过SANDBOX_SESSION_*调整。
+这是持久会话局部限制，1.18实时水位模式没有移除它；会话名额/额度耗尽不等于整机内存不足。普通短命令优先sandbox_exec/batch，不必创建持久会话。
+新会话仍按实时水位接纳；admission_timeout先看admissionDecision.blockedBy，显式ownerId，不为腾额度关闭他人的会话。`,
         SessionParamsSchema.shape,
         async (params, extra) => {
             const startTime = Date.now();

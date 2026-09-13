@@ -802,12 +802,12 @@ const CodexParamsShape = {
     deliveryMode: z.enum(["auto", "inline", "file", "manifest"]).optional()
         .describe("交付模式，默认auto"),
     admissionBudgetMs: z.number().min(0).optional()
-        .describe("资源不足时最多等待多久"),
+        .describe("启动前接纳等待预算(ms)，服务端最多10秒，不是Codex运行时限；超时看admissionDecision.blockedBy，不一概归因缺内存"),
     retryAttempt: z.number().int().min(0).max(4).optional(),
     maxMemoryMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
         .describe(`Codex 进程树提交内存硬上限，默认${CODEX_DEFAULT_MAX_MEMORY_MB}MB、服务端最高${PROCESS_TREE_MAX_MEMORY_MB}MB`),
     memoryRequestMB: z.number().int().min(16).max(PROCESS_TREE_MAX_MEMORY_MB).optional()
-        .describe(`Codex 调度预期内存，默认${CODEX_DEFAULT_MEMORY_REQUEST_MB}MB，必须不大于 maxMemoryMB`),
+        .describe(`Codex启动预计内存(MB)，16～maxMemoryMB；默认${CODEX_DEFAULT_MEMORY_REQUEST_MB}MB。显式24MB不会提升到64MB，但应按真实CLI开销估计，不要盲目低报；maxMemoryMB是独立硬上限`),
     // 新增参数（v1.8）
     image: z.string().optional()
         .describe("图片文件路径（-i 参数），让 Codex 看截图做 UI Review 等"),
@@ -838,7 +838,7 @@ const CodexParamsShape = {
     taskId: z.string().optional()
         .describe("后台任务 ID（action 时必须）"),
     waitSeconds: z.number().min(1).max(300).optional()
-        .describe("check 前等待秒数（1-300），避免频繁轮询。Codex 任务建议 90-120s"),
+        .describe("check前等待秒数（1-300）；Codex宿主建议30～45秒短轮询，保持同一taskId，不超过60秒"),
     ownerId: z.string().optional()
         .describe("任务归属 ID；未传时优先使用当前 MCP session 身份"),
 };
@@ -861,10 +861,10 @@ export function registerCodex(server: McpServer): void {
 
 后台模式（推荐用于长任务）：
 - background: true 启动后立刻返回 taskId，不阻塞
-- action: "check" + waitSeconds=90 等待 90s 后查看状态（推荐，避免频繁轮询）
+- action: "check" + waitSeconds=45 等待最多45秒后查看状态，始终查询首次返回的同一taskId
 - action: "wait" 会阻塞 MCP 直到完成，⚠️ 仅短任务/调试用
 - action: "kill" 终止后台任务
-- waitSeconds: check 前等待的秒数（1-300），Codex 任务建议 90-120s
+- waitSeconds: check前等待的秒数（1-300），Codex宿主建议30～45秒且不超过60秒
 
 v1.8 新增参数：
 - image: 图片文件路径（-i），让 Codex 看截图做 UI Review
