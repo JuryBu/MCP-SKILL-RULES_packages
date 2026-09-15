@@ -12,8 +12,8 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
 - `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
 - `windsurf/global_rules.template.md` → short per-conversation Windsurf rules.
-- `windsurf/system_rules/*.template.md` → long-lived Windsurf system rules, split by concern.
-- `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance.
+- `windsurf/system_rules/*.template.md` → long-lived Windsurf system rules, split by concern; on Devin Desktop (Devin Local) install them under `~/.devin/rules/` with a `trigger: always_on` frontmatter.
+- `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance, including the Devin Desktop layout and rule budget.
 - `windsurf/Windsurf_Global_Rules.template.md` → condensed compatibility entry for older import scripts; use the new split layout for full coverage.
 
 The templates preserve natural Chinese communication, anti-report-writing guidance, engineering workflow, subagent/council boundaries, evidence discipline, visual QA, bounded visible waiting, `chain` / `dataChain` / `modelChain`, stable `conversationId` / `ownerId`, background-task rules, project-trust checks before treating Codex `.codex/` layers as effective, and Council artifact safety (`dryRun` before approved cleanup). Dual-machine profiles additionally document explicit reply contracts, exact ACK fields, bounded stale-task reminders, and short production hot switches. Automatic bridge notices are described as compact channel/type/summary events for history restoration; the memory-store implementation remains a separate responsibility. The Codex catgirl voice is optional rather than embedded in the shared engineering core. General model-selection guidance may remain as a receiver-editable workflow preference; sender-specific identity, account data, local paths, credentials, active sessions, private entitlements, pricing claims, and quota promises are removed.

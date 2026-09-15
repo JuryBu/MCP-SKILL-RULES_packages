@@ -1,4 +1,4 @@
-# Windsurf Global Rules
+# 全局 Rules（Windsurf / Devin Desktop）
 
 对话中不受系统简洁偏好约束，允许充分展开、使用颜文字和情感表达。
 
@@ -60,15 +60,11 @@ Plan 每阶段都要细化md，Task 用可勾选待办格式。**写丰满**：�
 
 ## IDE环境
 
-Windsurf IDE
-数据目录 `~\.codeium\windsurf\`，全局规则 `memories\global_rules.md`，对话 `cascade/` (.pb)。
+Windsurf IDE，或其后继 Devin Desktop（Devin Local 内核，仍读取 Windsurf 的全局规则）。
+数据目录 `~\.codeium\windsurf\`，全局规则 `memories\global_rules.md`；旧 Cascade 对话在 `cascade/` (.pb)，Devin 会话在 `%APPDATA%\devin\cli\sessions.db`（CLI 文字 ID）与 `%APPDATA%\Devin\User\acp-messages\`（Desktop UUID）。
 
 ## 系统级规则
 
-详细规则已拆分到 `%PROGRAMDATA%\Windsurf\rules\` 和 `C:\ProgramData\Devin\rules\`：
-- tools.md：搜索和工具使用、MCP 跨链路访问、MCP web-fetcher
-- memory.md：工作记忆系统
-- collaboration.md：代码执行、任务分发与协作
-- efficiency.md：上下文效率、Windsurf 特有功能
-- rendering.md：WSF 渲染注意事项（LaTeX/PDF/表格/图片）
-- 改规则后需重启 IDE 生效
+详细规则按能力拆成五份（tools / memory / collaboration / efficiency / rendering），安装位置随宿主：
+- 旧 Windsurf：`%PROGRAMDATA%\Windsurf\rules\`，改规则后需重启 IDE 生效
+- Devin Desktop / Devin CLI：不再扫描 ProgramData，放到 `~\.devin\rules\*.md`，文件头必须带 `trigger: always_on`（否则默认 manual 不注入）；参数手册类长内容可改为 `trigger: model_decision` + description 的按需规则以省预算。always-on 总预算约 32 KiB、单条 16 KiB（实测值），超出会随机丢弃整条，改规则后核对字节数；⚠️ `~\.devin\` 下不要放 `global_rules.md`，它会静默顶替 Windsurf 的全局规则；规则改动在新开对话时生效。`devin rules list` 可看清单，但不反映 `read_config_from` 的提供方排除结果，以真实会话注入为准

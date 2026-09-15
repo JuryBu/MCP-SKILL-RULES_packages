@@ -6,17 +6,17 @@ MCP memory-store 是跨对话持久化知识的主要方式，是你和下一个
 - 对话结束时持久化关键信息供下次使用
 - 写入时写好 searchSummary（含关键词、近义词、技术栈），方便未来检索
 
-对话原文读取（conversation_read_original）：
+对话原文读取（conversation_read_original；memory-store ≥1.25 起 `dataChain=windsurf` 同时覆盖旧 Windsurf Cascade 对话（.pb）与 Devin Desktop / Devin Local 会话（SQLite），内部自动路由，不需要用户判断新旧格式；`conversationId` 接受 UUID 或 Devin 文字会话 ID，返回时给出两种别名）：
 - 用户说"我们之前讨论过""你之前做的" → 先 search 确认原文再回答
 - 操作顺序：先search定位→read精读→需要时depth="full"深度查看
 - `fetch` 建立或更新规范化缓存，后续 search/read/full/diff 从同一缓存派生；fetch/search/read/export 都要显式传稳定 conversationId
-- `source="auto"` 以本地 PB 为一等来源并按需比较 LS，`local` 只读 PB，`ls` 只读 Language Server，`cache` 只读上一份完整可用缓存
+- `source="auto"`（默认）按真实来源路由；Devin 会话用 auto/local/cache（local=只读 SQLite），`ls` 只对旧 Cascade / Antigravity 的 Language Server 有效、对 Devin 会话会明确拒绝；`cache` 只读上一份完整可用缓存
 - `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含用户/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 - 单次返回默认约 100K 字符，超出时使用响应给出的 continuationCursor / 下一段参数继续，不能把截断当成完整结果
 - `messageRoles=["user"]` 只含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取子代理事件；批注搜索返回命中的单条 Annotation 与命中字段
-- 遇到图片/附件路径要主动查看内容，不要只报路径
+- 遇到图片/附件路径要主动查看内容，不要只报路径；Devin 会话里用户粘贴的图片以 base64 内嵌在库中，工具会材料化为附件引用，正文不带 base64
 - 导出对话图片：conversation_read_original读自己对话→图片导出到临时路径→复制到项目 `assets/` 归档
-- CHECKPOINT 压缩后需要恢复细节时主动使用，不要凭摘要回答
+- 上下文压缩（Cascade 的 CHECKPOINT / Devin 的 compaction）后需要恢复细节时主动 `recall`，不要凭摘要回答；recall 只从已提交的 fetch 缓存恢复用户/模型可见内容，不把压缩摘要当原文。阶段性 `memory_write` 落盘与 Plan/Task 写丰满仍是第一保险
 
 对话记录（record_manage）：对话粒度的结构化过程日志，由模型自动生成，抗 LS 过期。
 - update 触发生成/更新，支持 list/read/search/guide/edit/delete
@@ -25,4 +25,4 @@ MCP memory-store 是跨对话持久化知识的主要方式，是你和下一个
 - Record 只接纳已校验且未过期的 fetch 缓存 generation；Guard start 只核对缓存元数据，check 再按实际范围读取，不应预先扫整份对话
 - 创建、排队、恢复到完成始终轮询同一个公开 taskId；普通后台任务也可统一用 background_task_status / background_task_cancel
 
-任务验证（stage_guard）：只要按 Plan/Task 开始修改，每个 Stage 必须 start+check，通过才标记完成，连续3次未过上报用户。
+任务验证（stage_guard）：只要按 Plan/Task 开始修改，每个 Stage 必须 start+check，通过才标记完成，连续3次未过上报用户。start 传 `conversationId`（跨宿主场景必传）与 `dataChain`；check 的 `evidence` 接受字符串或字符串数组（1.25.1+）；Guard 会真的读对话核对勾选项，没做完的不要预先打 [x]；check 返回 partial/stale 是来源或证据问题，先 `fetch` 刷新缓存或补 evidence 再查，不要同参数连打三次。
