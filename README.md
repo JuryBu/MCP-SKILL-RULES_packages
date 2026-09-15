@@ -18,7 +18,7 @@
 
 | 组件 | 版本 | 主要用途 |
 | --- | ---: | --- |
-| `memory-store` | 1.24.0 | 记忆、五宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
+| `memory-store` | 1.25.0 | 记忆、五宿主 Conversation/Recall、Record、Golden Extract、Stage Guard、调度恢复与跨宿主路由 |
 | `sandbox` | 1.17.3 | 隔离执行、动态内存调度、流式搜索隔离、Windows 进程树硬限制、按需 artifact、持久会话、Codex 任务与多模型 Council |
 | `web-fetcher` | 7.0.0 | 无头浏览、登录态浏览、本地多格式文件、截图、视觉检查与桌面交互 |
 | `broker` | 0.1.0 | 将本地 stdio MCP 暴露为稳定的 Streamable HTTP endpoint |
@@ -35,6 +35,7 @@
 - Memory Store 1.23.1 修复数百/数千个无 Frame Content Size 的拼接 Zstd 小帧导致 Node 24 异常大额内存申请的问题，改为受限逐帧解码并校验 checksum。
 - Memory Store 1.23.6 修复 Windsurf/Antigravity 本地 PB 与 LS 的等价比较：附件占位、planner reasoning 与 PB wire 字段不会再制造冲突，`auto` 会在内容一致时采用 LS 的真实工具语义；Record 更新也可显式选择 `source=auto|local|ls|cache`。
 - Memory Store 1.24.0 支持 Codex 引用式历史和同任务更换 rollout 文件，按继承前缀恢复完整记录，并让缓存指纹、后台快照和体积判断覆盖全部有效来源。
+- Memory Store 1.25.0 在 WSF 数据链内自动兼容 Devin Local SQLite 与旧 Cascade LS/PB，支持文字 ID/已验证 UUID、原生子代理、只读缓存及五源限定上下文定位；Devin SQLite 功能要求 Node.js 22.16+，推荐 24。
 - 跨宿主 Conversation 需要接收方自行授权访问对应宿主的本地对话目录；工具包不会携带发送方数据，也不会把读取权限扩展到未配置的机器或账户。
 - `conversation_golden_extract` 从长对话中提取可复用的高价值片段。
 - `record_manage` 维护结构化工作记录，支持读取视图、阶段更新、所有权审计与后台生成。
