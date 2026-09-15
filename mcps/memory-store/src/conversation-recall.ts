@@ -19,7 +19,7 @@ export type ConversationRecallMode = "auto" | "manual" | "full";
 export type ConversationRecallHost = "antigravity" | "codex" | "claude-code" | "windsurf" | "dsh";
 
 export interface ConversationCompactionEvent {
-    kind: "windsurf_token_drop" | "codex_agents_reinjection" | "claude_code_compact_summary";
+    kind: "windsurf_token_drop" | "codex_agents_reinjection" | "claude_code_compact_summary" | "devin_compact_summary";
     roundIndex: number;
     stepIndex: number;
     preContextChars: number;
@@ -110,7 +110,7 @@ export function formatConversationRecallRound(round: ConversationRound): string 
         lines.push(`### 🔔 自动通道事件 (step ${automation.stepIndex ?? round.startStep})`);
         lines.push(renderConversationAutomationEvent(automation.event), "");
     }
-    if (!round.compactionSummaries?.length) {
+    if (!round.compactionSummaries?.some(summary => summary.provider === "claude-code")) {
         for (const message of getUserMessages(round)) renderRecallUserMessage(lines, message, round.startStep);
     }
     for (const response of round.aiResponses) {
@@ -226,6 +226,12 @@ export function buildConversationCompactionMetadata(
                 reason: summary?.trigger || "isCompactSummary",
             });
         } else if (host === "windsurf") {
+            for (const summary of round.compactionSummaries || []) {
+                if (summary.provider !== "devin") continue;
+                pendingEvents.push({ kind: "devin_compact_summary", roundIndex: round.roundIndex, stepIndex: round.endStep,
+                    preContextChars: charsBeforeRound + chars, boundaryChars: charsBeforeRound + chars,
+                    reason: `verified summarized_from=${summary.boundaryNodeId}; summary_node=${summary.sourceNodeId}` });
+            }
             for (const observation of contextTokenObservations(round)) {
                 latestObservedTokens = observation.value;
                 if (previousWindsurfTokens) {

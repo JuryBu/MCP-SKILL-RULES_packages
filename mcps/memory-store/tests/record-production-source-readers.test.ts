@@ -313,6 +313,7 @@ function assertUnresolvedAttachment(result: ProductionSourceReadResult, label: s
     const antigravity = createAntigravityController();
     let scanSequence = 0;
     const reader = createProductionSourceReader({
+        devinReader: async () => null,
         now: () => new Date("2026-07-14T00:00:00.000Z"),
         scanIdFactory: host => `fixture-${host}-${++scanSequence}`,
         antigravityIo: antigravity.io,
@@ -535,6 +536,7 @@ function assertUnresolvedAttachment(result: ProductionSourceReadResult, label: s
         ],
     });
     const attachmentReader = createProductionSourceReader({
+        devinReader: async () => null,
         now: () => new Date("2026-07-14T00:00:00.000Z"),
         scanIdFactory: host => `attachment-${host}`,
         antigravityIo: antigravity.io,
@@ -571,6 +573,7 @@ function assertUnresolvedAttachment(result: ProductionSourceReadResult, label: s
     });
     let unverifiedScanSequence = 0;
     const unverifiedAttachmentReader = createProductionSourceReader({
+        devinReader: async () => null,
         now: () => new Date("2026-07-14T00:00:00.000Z"),
         scanIdFactory: host => `unverified-${host}-${++unverifiedScanSequence}`,
         antigravityIo: antigravity.io,

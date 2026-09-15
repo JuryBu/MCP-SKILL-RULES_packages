@@ -19,6 +19,7 @@ import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "../ls-model-defaults.js";
 import { formatToolError } from "../error-format.js";
 import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
 import type { ResumePayloadValue } from "../background-recovery.js";
+import { assertConversationConsumerSourceComplete } from "../devin-source-evidence.js";
 
 /**
  * conversation_golden_extract — 黄金片段提取
@@ -199,6 +200,7 @@ async function runGoldenExtract(
                 }
 
                 const cascadeId = loaded.conversationId;
+                if (loaded.windsurfData?.thread.sourceKind) assertConversationConsumerSourceComplete(loaded);
                 let rounds = loaded.rounds;
 
                 // 截取轮次范围（兼容旧 stepStart/stepEnd 参数名）

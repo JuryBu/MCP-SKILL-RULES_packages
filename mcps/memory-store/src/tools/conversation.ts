@@ -27,7 +27,6 @@ import { formatToolError } from "../error-format.js";
 import { dataChainInputSchema, dataChainValueSchema, modelChainInputSchema } from "./schema-utils.js";
 import { listConversationsByMtime } from "../ls-client.js";
 import {
-    deepLocateCodexConversations,
     findCodexContextProbeMatches,
     getCodexParentThread,
     getCodexThread,
@@ -37,7 +36,6 @@ import {
     type CodexThreadInfo,
 } from "../codex-client.js";
 import {
-    deepLocateClaudeCodeConversations,
     findClaudeCodeContextProbeMatches,
     getClaudeCodeThread,
     listRecentClaudeCodeThreads,
@@ -88,6 +86,8 @@ import {
     type CodexFetchWorkerResult,
 } from "../conversation-fetch-worker-types.js";
 import { withConversationSourcePressure } from "../conversation-source-pressure.js";
+import type { ConversationContextLocateResult } from "../conversation-context-locate.js";
+import { buildDeepLocateResumePayload, parseDeepLocateResumePayload, runConversationDeepLocate } from "../conversation-context-locate-task.js";
 
 const CONVERSATION_DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness";
 const CONVERSATION_MODEL_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|grok|agy";
@@ -118,7 +118,6 @@ function conversationModelChainInputSchema(parameterName = "modelChain", descrip
         return input;
     }, modelChainInputSchema(parameterName)).describe(schemaDescription);
 }
-import { listLocalPbConversationCandidates } from "../conversation-local-list.js";
 import {
     formatConversationRecallRound,
     selectConversationRecallRange,
@@ -134,11 +133,6 @@ const CONVERSATION_READ_DELIVERY_MAX_CHARS = readFiniteIntegerEnv("MEMORY_STORE_
 const CONVERSATION_READ_TAIL_PREVIEW_CHARS = readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_READ_TAIL_PREVIEW_CHARS", 2_000);
 const CONVERSATION_LIST_TITLE_MAX_CHARS = Math.max(readFiniteIntegerEnv("MEMORY_STORE_CONVERSATION_LIST_TITLE_MAX_CHARS", 120), 20);
 const CONVERSATION_DIRECT_ACTIONS = new Set(["fetch", "search", "read", "recall", "export"]);
-
-function candidateLimitForLocalList(limit?: number): number {
-    const requested = Math.min(Math.max(limit || 20, 1), 100);
-    return Math.max(requested * 3, 300);
-}
 
 export interface ConversationReadSourcePosition {
     charPosition: number;
@@ -537,6 +531,10 @@ export function splitListQueryTerms(input: string): string[] {
 
 export interface ConversationListCandidate {
     id: string;
+    aliases?: string[];
+    uuid?: string;
+    sessionId?: string;
+    sourceKind?: string;
     title: string;
     workspace: string;
     workspaces?: string[];
@@ -712,7 +710,8 @@ function buildConversationListLines(
             const probe = item.contextProbe?.length
                 ? `\n   🎯 contextProbe: ${item.contextProbe.join("；")}`
                 : "";
-            return `${idx + 1}. ${title}\n   ID: ${item.id}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${ws}${probe}`;
+            const aliases = [item.uuid ? `UUID=${item.uuid}` : "", item.sessionId ? `sessionId=${item.sessionId}` : "", item.aliases?.length ? `aliases=${item.aliases.join(" | ")}` : ""].filter(Boolean);
+            return `${idx + 1}. ${title}\n   ID: ${item.id}${aliases.length ? `\n   ${aliases.join(" / ")}` : ""}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${ws}${probe}`;
         }),
     ];
 }
@@ -789,10 +788,13 @@ function candidateFromClaudeCodeThread(item: ClaudeCodeThreadInfo): Conversation
 }
 
 function candidateFromWindsurfThread(item: WindsurfConversationSummary): ConversationListCandidate {
+    const identity = item as WindsurfConversationSummary & { aliases?: string[]; uuid?: string; sessionId?: string; sourceKind?: string };
     const isChildThread = Boolean(item.isChildThread || item.parentConversationId);
     const parentConversationId = item.parentConversationId || null;
     return {
         id: item.id,
+        aliases: identity.aliases, uuid: identity.uuid, sessionId: identity.sessionId, sourceKind: identity.sourceKind,
+        searchAliases: [identity.uuid, identity.sessionId, ...(identity.aliases || [])].filter((value): value is string => Boolean(value)),
         title: item.titleBestEffort || item.title || item.summary || "",
         workspace: item.cwd || "",
         workspaces: item.workspaceUris,
@@ -1191,12 +1193,11 @@ export function getConversationListFallbackPlan(
         return {
             includeRawPreview: false,
             allowSmartSearch: requestedMode === "smart",
-            returnContextProbeHitsFirst: false,
-            deepSearchSuggested: false,
+            returnContextProbeHitsFirst: contextProbeHitCount > 0,
+            deepSearchSuggested: true,
             skipped: [
                 "raw-trajectory-preview",
                 requestedMode === "auto" ? "smart-auto" : "",
-                "deep-locate-unsupported",
             ].filter(Boolean),
         };
     }
@@ -1786,23 +1787,35 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024 / 1024 / 1024).toFixed(2)}GB`;
 }
 
-export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCodeDeepLocateResult, query: string): string {
+export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCodeDeepLocateResult | ConversationContextLocateResult, query: string): string {
     const lines: string[] = [
         `🔎 deep_locate 完成`,
         `📌 状态: ${result.status}`,
         `🔤 query: ${query}`,
-        `📈 扫描: ${result.scannedFiles}/${result.totalFiles} 文件，${formatBytes(result.scannedBytes)} / ${formatBytes(result.totalBytes)}`,
+        "scope" in result
+            ? `📈 扫描: ${result.scannedFiles}/${result.totalFiles} 候选，${formatBytes(result.scannedBytes)}（JSONL 源字节 / 其它源可搜索正文 UTF-8 字节；不含首次缓存建立成本）`
+            : `📈 扫描: ${result.scannedFiles}/${result.totalFiles} 文件，${formatBytes(result.scannedBytes)} / ${formatBytes(result.totalBytes)}`,
         `🎯 命中: ${result.hits.length}${result.truncated ? "（partial/truncated）" : ""}`,
     ];
     if (result.reason) lines.push(`⚠️ 原因: ${result.reason}`);
+    if ("resolution" in result) {
+        lines.push(`身份判断: ${result.resolution}；仅针对已列出的候选范围，不代表全库唯一，不自动选择 ID。`);
+        lines.push(...result.warnings.map(warning => `⚠️ ${warning}`));
+    }
     if (result.hits.length > 0) {
         lines.push("");
         for (const [idx, hit] of result.hits.slice(0, 20).entries()) {
             lines.push(`${idx + 1}. ${hit.title || hit.conversationId}`);
             lines.push(`   ID: ${hit.conversationId}`);
+            if ("dataChain" in hit) lines.push(`   链路: ${hit.dataChain}${hit.sourceKind ? ` / ${hit.sourceKind}` : ""}`);
+            if ("isChildThread" in hit && hit.isChildThread) lines.push(`   子代理对话: parent=${hit.parentConversationId || "unknown"}`);
+            if ("aliases" in hit && hit.aliases?.length) lines.push(`   aliases: ${hit.aliases.join(" | ")}`);
+            if ("uuid" in hit && hit.uuid) lines.push(`   UUID: ${hit.uuid}`);
+            if ("sessionId" in hit && hit.sessionId) lines.push(`   sessionId: ${hit.sessionId}`);
             lines.push(`   来源: ${hit.source} / ${hit.mode} / R${hit.roundIndex} / ${hit.role}`);
-            lines.push(`   文件: ${hit.filePath}`);
-            lines.push(`   offset: ${hit.byteOffset}`);
+            if (hit.filePath) lines.push(`   文件: ${hit.filePath}`);
+            if (hit.byteOffset !== undefined) lines.push(`   offset: ${hit.byteOffset}`);
+            else if ("sourcePosition" in hit) lines.push(`   位置: ${JSON.stringify(hit.sourcePosition)}（非 JSONL 字节偏移）`);
             lines.push(`   片段: ${hit.snippet}`);
         }
     }
@@ -1837,37 +1850,16 @@ function selectBalancedBatchCandidates<T extends { dataChain: string }>(candidat
     return selected;
 }
 
-interface DeepLocateResumePayload {
-    version: 1;
-    query: string;
-    dataChain: "codex" | "claude-code";
-    mode: "exact" | "fuzzy";
-    conversationIds?: string[];
-    maxFiles: number;
-    maxBytes: number;
-    maxHits: number;
-}
-
-function buildDeepLocateResumePayload(args: {
-    query: string;
-    dataChain: "codex" | "claude-code";
-    mode: "exact" | "fuzzy";
-    conversationIds?: string[];
-    maxFiles: number;
-    maxBytes: number;
-    maxHits: number;
-}): DeepLocateResumePayload {
+registerBackgroundTaskRecoveryHandler("conversation-deep-locate", async task => {
+    const payload = parseDeepLocateResumePayload(task.resumePayload);
     return {
-        version: 1,
-        query: args.query,
-        dataChain: args.dataChain,
-        mode: args.mode,
-        conversationIds: args.conversationIds?.length ? [...args.conversationIds] : undefined,
-        maxFiles: args.maxFiles,
-        maxBytes: args.maxBytes,
-        maxHits: args.maxHits,
+        mode: "restart",
+        run: async ({ isCancelled, isSettled, updateProgress }) => formatDeepLocateResult(await runConversationDeepLocate(payload, {
+            isCancelled: () => isCancelled() || isSettled(),
+            onProgress: progress => updateProgress({ ...progress, unit: "候选" }),
+        }), payload.query),
     };
-}
+});
 
 function isConversationBatchExportResumePayload(value: unknown): value is ConversationBatchExportResumePayload {
     if (!value || typeof value !== "object") return false;
@@ -1928,9 +1920,12 @@ registerBackgroundTaskRecoveryHandler("conversation-batch-export", async (task) 
  *   read   — 读取指定轮次范围的对话内容
  *   recall — 从最新 fetch 缓存恢复压缩前的 context-only 上下文
  *   export — 将可读对话原文持久化导出为 Markdown / PDF
- *   deep_locate — 后台流式深搜 Codex / Claude Code JSONL，用正文片段定位 conversationId
+ *   deep_locate — 五源有预算正文定位，Codex / Claude Code 保持流式 JSONL 扫描
  */
-export function registerConversation(server: McpServer): void {
+export function registerConversation(server: McpServer, dependencies: {
+    listCandidates?: typeof listConversationCandidates;
+    runDeepLocate?: typeof runConversationDeepLocate;
+} = {}): void {
     server.tool(
         "conversation_read_original",
         `读取对话的原始完整内容（绕过上下文压缩机制）。
@@ -1941,19 +1936,19 @@ export function registerConversation(server: McpServer): void {
   read — 读取指定轮次范围的对话内容
   recall — 自动、按轮次或全量恢复 context-only 上下文
   export — 将可读对话原文持久化导出为 Markdown / PDF
-  deep_locate — Codex/Claude Code 后台深搜正文片段以定位 conversationId
+  deep_locate — 五个数据源后台有预算地深搜正文片段，Codex/Claude Code 保持流式 JSONL 读取
 fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
             action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
                 .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / recall=恢复压缩上下文 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
             conversationId: z.string().optional()
-                .describe("对话 UUID；fetch/search/read/export 建议总是显式传入，避免共享后端串到其它当前对话"),
+                .describe("稳定对话 ID，WSF 同时接受已验证关联的 UUID/Devin 文字 ID；fetch/search/read/export 建议总是显式传入"),
             conversationIds: z.array(z.string()).optional()
-                .describe("[deep_locate] 可选：限制只扫描这些 Codex conversationId"),
+                .describe("[deep_locate] 可选：限制只扫描指定链路内的这些稳定 conversationId 或 WSF 别名"),
             query: z.string().optional()
                 .describe("[list/search] 搜索关键词"),
             contextProbe: z.string().optional()
-                .describe("[list] Codex/Claude Code：从当前可见对话截取的 50-120 字上下文指纹，用 fixed-string 语义的硬匹配标记候选；不会自动选中"),
+                .describe("[list] 在指定 dataChain(s)/workspaces 中以 50-120 字独特正文匹配五源候选；有时间/字节预算，多命中和 partial 均不自动选中"),
             depth: z.enum(["brief", "normal", "full"]).default("normal")
                 .describe("[fetch/search/read] 返回详细度：brief=截断100字 / normal=完整文本 / full=含思考+工具结果"),
             compactionMode: z.enum(["folded", "full", "omit"]).optional()
@@ -1976,6 +1971,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[deep_locate] 最大扫描字节数；[read] 单段交付字节上限，会覆盖默认约 100K 字符预算"),
             maxHits: z.number().optional()
                 .describe("[deep_locate] 最大命中数"),
+            deadlineMs: z.number().int().min(1).max(600000).optional()
+                .describe("[list contextProbe/deep_locate] 候选发现和正文定位的总时间预算（毫秒）；到期返回已取得的部分证据，不冒充完整扫描"),
             startRound: z.number().optional()
                 .describe("[read/recall manual] 起始轮次（1-indexed）"),
             endRound: z.number().optional()
@@ -2004,9 +2001,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\"/\"dsh\"（含别名）只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
             dataChain: conversationDataChainInputSchema("dataChain", "读取对话数据的宿主链路；未填用 chain。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
             source: z.enum(["auto", "local", "ls", "cache"]).default("auto")
-                .describe("fetch/read/search/export 原文来源：auto=本地一等来源并按需比较 LS；local=只读 JSONL/PB；ls=仅 Windsurf/Antigravity；cache=只读已发布 fetch 缓存"),
+                .describe("原文来源：auto=按真实来源路由；local=只读 JSONL/PB/Devin SQLite；ls=仅旧 Windsurf/Antigravity；cache=只读已发布 fetch 缓存"),
             dataChains: z.array(conversationDataChainValueSchema("dataChains")).optional()
-                .describe("[list/export] 批量模式：并行查询多个数据源；例如 [\"codex\",\"windsurf\",\"dsh\"]。未传时保持旧单 dataChain 行为"),
+                .describe("[list/deep_locate/export] 批量模式：查询限定的多个数据源；例如 [\"codex\",\"windsurf\",\"dsh\"]。未传时保持单 dataChain 行为"),
             workspaces: z.array(z.string()).optional()
                 .describe("[list/export] 批量模式：按工作区路径过滤，可传一个或多个目录"),
             workspaceMode: z.enum(["contains", "exact", "under", "any", "all"]).optional()
@@ -2024,7 +2021,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             idResolutionMode: z.enum(["unique", "priority"]).optional()
                 .describe("dataChain=auto 且传 conversationId 时：unique=并行全源唯一匹配，priority=保留旧优先级顺序；默认 unique"),
             threadMode: z.enum(["main", "children", "all"]).optional()
-                .describe("[list/export] Codex 线程过滤：main=默认只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程都返回"),
+                .describe("[list/deep_locate/export] 线程过滤：main=只返回主线程，children=只列某个父线程的子线程，all=主线程和子线程；具体关联以来源可验证结构为准"),
             parentConversationId: z.string().optional()
                 .describe("[list/export] threadMode=children 时指定父线程 conversationId"),
             parentQuery: z.string().optional()
@@ -2032,7 +2029,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             parentDataChain: conversationDataChainInputSchema("parentDataChain", "预留：父线程定位的数据源；当前主要用于 Codex 子线程过滤。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
             modelChain: conversationModelChainInputSchema("modelChain", "smart 搜索调用模型的链路；未填用 chain；agy=本地 agy CLI（三模型内部 fallback），Grok=本机 progrok proxy。Windsurf 与 DSH 只支持 dataChain"),
             link: z.enum(["reference", "summary", "expand_children"]).default(DEFAULT_LINK_MODE)
-                .describe("Codex 链路下对子代理线程的呈现方式"),
+                .describe("Codex / WSF Devin 原生子代理呈现：reference=只给身份引用，summary=摘要，expand_children=展开可读取的子代理记录"),
             logicalChain: z.enum(["off", "explain", "auto", "strict"]).optional()
                 .describe("Claude Code 链路：off=默认只读指定物理 ID；explain=只展示可能续聊候选；auto/strict=强证据时合并为逻辑对话"),
         },
@@ -2069,6 +2066,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     maxFiles,
                     maxBytes,
                     maxHits,
+                    deadlineMs,
                     conversationIds,
                     chain = DEFAULT_CHAIN,
                     dataChain,
@@ -2115,12 +2113,6 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
 
                 if (action === "deep_locate") {
-                    const resolved = await resolveConversationChain(chains.dataChain);
-                    if (resolved !== "codex" && resolved !== "claude-code") {
-                        return appendTiming({
-                            content: [{ type: "text" as const, text: `❌ deep_locate 支持 dataChain=\"codex\" 或 \"claude-code\"；当前为 ${resolved || chains.dataChain}` }],
-                        }, startTime);
-                    }
                     if (!query?.trim()) {
                         return appendTiming({
                             content: [{ type: "text" as const, text: "❌ deep_locate 需要 query 正文片段" }],
@@ -2134,51 +2126,20 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     const requestedMode = (mode === "fuzzy" ? "fuzzy" : "exact") as "exact" | "fuzzy";
                     const deepLocatePayload = buildDeepLocateResumePayload({
                         query,
-                        dataChain: resolved,
+                        dataChains: dataChains?.length ? dataChains : [chains.dataChain],
+                        source, workspaces, workspaceMode, workspaceScope, threadMode,
+                        parentConversationId, parentQuery, parentDataChain, sourceFailureMode,
                         mode: requestedMode,
                         conversationIds: conversationIds?.length ? [...conversationIds] : undefined,
                         maxFiles: maxFiles || 20,
                         maxBytes: maxBytes || 512 * 1024 * 1024,
                         maxHits: maxHits || limit || 20,
+                        deadlineMs,
                     });
-                    const task = startBackgroundTask("conversation-deep-locate", async ({ updateProgress, isCancelled }) => {
-                        const threads = resolved === "codex"
-                            ? (conversationIds?.length
-                                ? conversationIds.map(id => getCodexThread(id)).filter((item): item is CodexThreadInfo => Boolean(item))
-                                : listRecentCodexThreads(Math.max(maxFiles || 20, 1)))
-                            : (conversationIds?.length
-                                ? conversationIds.map(id => getClaudeCodeThread(id)).filter((item): item is ClaudeCodeThreadInfo => Boolean(item))
-                                : listRecentClaudeCodeThreads(Math.max(maxFiles || 20, 1)));
-                        const result: CodexDeepLocateResult | ClaudeCodeDeepLocateResult = resolved === "codex"
-                            ? deepLocateCodexConversations(query, threads as CodexThreadInfo[], {
-                                mode: requestedMode,
-                                maxFiles: maxFiles || 20,
-                                maxBytes: maxBytes || 512 * 1024 * 1024,
-                                maxHits: maxHits || limit || 20,
-                                deadlineMs: Number(process.env.MEMORY_STORE_DEEP_LOCATE_DEFAULT_MAX_MS || 5 * 60 * 1000),
-                                isCancelled,
-                                onProgress: progress => updateProgress({
-                                    stage: progress.stage,
-                                    detail: progress.detail ? `${progress.detail}；已扫 ${formatBytes(progress.scannedBytes || 0)}；命中 ${progress.hits || 0}` : undefined,
-                                    current: progress.current,
-                                    total: progress.total,
-                                    unit: "文件",
-                                }),
-                            })
-                            : deepLocateClaudeCodeConversations(query, threads as ClaudeCodeThreadInfo[], {
-                            mode: requestedMode,
-                            maxFiles: maxFiles || 20,
-                            maxBytes: maxBytes || 512 * 1024 * 1024,
-                            maxHits: maxHits || limit || 20,
-                            deadlineMs: Number(process.env.MEMORY_STORE_DEEP_LOCATE_DEFAULT_MAX_MS || 5 * 60 * 1000),
-                            isCancelled,
-                            onProgress: progress => updateProgress({
-                                stage: progress.stage,
-                                detail: progress.detail ? `${progress.detail}；已扫 ${formatBytes(progress.scannedBytes || 0)}；命中 ${progress.hits || 0}` : undefined,
-                                current: progress.current,
-                                total: progress.total,
-                                unit: "文件",
-                            }),
+                    const task = startBackgroundTask("conversation-deep-locate", async ({ updateProgress, isCancelled, isSettled }) => {
+                        const result = await (dependencies.runDeepLocate || runConversationDeepLocate)(deepLocatePayload, {
+                            isCancelled: () => isCancelled() || isSettled(),
+                            onProgress: progress => updateProgress({ ...progress, unit: "候选" }),
                         });
                         return formatDeepLocateResult(result, query);
                     }, {
@@ -2192,7 +2153,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             text: [
                                 background === true ? "🚀 deep_locate 已转入后台任务" : "🚀 deep_locate 未显式指定 background，已自动转入后台任务",
                                 `🆔 taskId: ${task.id}`,
-                                `🔗 dataChain: ${resolved}`,
+                                `🔗 dataChains: ${deepLocatePayload.dataChains.join(" | ")}`,
                                 `🔎 mode: ${requestedMode}`,
                                 `📁 maxFiles: ${maxFiles || 20}`,
                                 `💾 maxBytes: ${formatBytes(maxBytes || 512 * 1024 * 1024)}`,
@@ -2204,30 +2165,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
 
                 if (action === "list") {
-                    if (source === "local" && (chains.dataChain === "auto" || chains.dataChain === "antigravity" || chains.dataChain === "windsurf")) {
-                        const hosts = chains.dataChain === "auto"
-                            ? (["antigravity", "windsurf"] as const)
-                            : ([chains.dataChain] as Array<"antigravity" | "windsurf">);
-                        const localCandidates = hosts.flatMap(host => listLocalPbConversationCandidates(host, { limit: candidateLimitForLocalList(limit), query })
-                            .map(candidate => ({ host, ...candidate })));
-                        localCandidates.sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt));
-                        const selected = localCandidates.slice(0, Math.min(Math.max(limit || 20, 1), 100));
-                        const lines = [
-                            "🔎 本地 PB 对话目录（仅元数据，未解密正文）",
-                            `候选对话: ${selected.length}${query ? ` | 关键词: ${query}` : ""}`,
-                            "说明: active/cascade 与 implicit 同 ID 已合并；implicit 仅表示本机仍存在的隐藏/归档候选。",
-                            "",
-                            ...selected.map((item, index) => [
-                                `${index + 1}. [${item.host}] ${item.id}`,
-                                `   ID: ${item.id}`,
-                                `   位置: ${item.kinds.join("+")} | 更新时间: ${item.updatedAt} | ${formatBytes(item.bytes)}${item.files > 1 ? ` | ${item.files} 个候选文件` : ""}`,
-                            ].join("\n")),
-                        ];
-                        return appendTiming({ content: [{ type: "text" as const, text: lines.join("\n") }] }, startTime);
-                    }
-                    if (chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
-                        const result = await listConversationCandidates({
+                    if (contextProbe?.trim() || source === "local" || source === "cache" || chains.dataChain === "dsh" || dataChains?.length || workspaces?.length || threadMode || parentConversationId || parentQuery) {
+                        const result = await (dependencies.listCandidates || listConversationCandidates)({
                             dataChains: dataChains?.length ? dataChains : [chains.dataChain],
+                            source, contextProbe, maxBytes, maxHits, candidateLimit: maxFiles, deadlineMs,
                             query,
                             workspaces,
                             workspaceMode,
@@ -2255,8 +2196,11 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             }, startTime);
                         }
                         const lines = [
-                            "🔎 多源候选查询",
+                            source === "local" ? "🔎 本地对话目录（PB / JSONL / Devin SQLite，按指定链路过滤）" : "🔎 多源候选查询",
                             `候选对话: ${result.candidates.length}${query ? ` | 关键词: ${query}` : ""}`,
+                            result.partial ? "⚠️ partial：候选或正文扫描受预算/源可用性限制，单一命中也不代表全源唯一。" : "",
+                            result.contextLocate ? `contextProbe: ${result.contextLocate.status} / ${result.contextLocate.resolution}；不自动选择 ID。` : "",
+                            ...(result.contextLocate?.warnings || []).map(warning => `⚠️ ${warning}`),
                             workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode}, ${workspaceScope})` : "",
                             threadMode ? `线程模式: ${threadMode}${parentConversationId ? ` | parent=${parentConversationId}` : ""}${parentQuery ? ` | parentQuery=${parentQuery}` : ""}` : "",
                             "",
@@ -2271,7 +2215,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                 });
                                 const workspaceLine = formatWorkspaceLines(item.workspace, item.workspaces);
                                 const detail = item.detail ? ` | ${item.detail}` : "";
-                                return `${idx + 1}. [${item.dataChain}] ${title}\n   ID: ${item.id}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${workspaceLine}`;
+                                const aliases = [item.uuid ? `UUID=${item.uuid}` : "", item.sessionId ? `sessionId=${item.sessionId}` : "", item.aliases?.length ? `aliases=${item.aliases.join(" | ")}` : ""].filter(Boolean);
+                                const probe = item.contextProbe?.length ? `\n   🎯 contextProbe: ${item.contextProbe.join("；")}` : "";
+                                return `${idx + 1}. [${item.dataChain}] ${title}\n   ID: ${item.id}${aliases.length ? `\n   ${aliases.join(" / ")}` : ""}\n   更新时间: ${item.updatedAt || "(未知)"}${detail}${workspaceLine}${probe}`;
                             }),
                         ].filter(Boolean);
                         return appendTiming({
@@ -3037,7 +2983,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                 ? " (Claude Code 本地会话)"
                                 : loaded.chainUsed === "dsh"
                                     ? " (DeepSeek Harness 本地会话)"
-                                    : " (Windsurf Cascade)";
+                                    : loaded.windsurfData?.thread.sourceKind ? " (Devin Local / WSF)" : " (Windsurf Cascade)";
 
                     const workspace = loaded.codexData?.thread.cwd
                         || loaded.claudeCodeData?.thread.cwd

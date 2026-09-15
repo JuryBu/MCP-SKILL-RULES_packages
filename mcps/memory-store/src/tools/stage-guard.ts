@@ -13,7 +13,9 @@ import {
     type GuardLockOperationResult,
 } from "../guard-store.js";
 import { CHAIN_COMPAT_INPUT_VALUES, DATA_CHAIN_INPUT_VALUES, DEFAULT_CHAIN, resolveChainSplit, decideBackground, type Chain, type DataChain } from "../chain.js";
-import { loadConversationData } from "../conversation-bridge.js";
+import { loadConversationData, resolveConversationId } from "../conversation-bridge.js";
+import { assertConversationConsumerSourceComplete } from "../devin-source-evidence.js";
+import { resolveCachedDevinIdentity } from "../devin-identity.js";
 import {
     cancelBackgroundTask,
     formatBackgroundTask,
@@ -102,7 +104,7 @@ function resolveModelChain(params: z.infer<typeof StageGuardSchema>): Chain {
 }
 
 function resolveDataChain(params: z.infer<typeof StageGuardSchema>): DataChain {
-    return resolveChainSplit({ chain: DEFAULT_CHAIN, dataChain: params.dataChain }).dataChain;
+    return resolveChainSplit({ chain: params.chain, dataChain: params.dataChain }).dataChain;
 }
 
 function normalizeScopeSelectors(scopeSelectors?: string[]): string[] {
@@ -132,14 +134,12 @@ async function resolveActiveGuard(params: z.infer<typeof StageGuardSchema>): Pro
         const resolved = await resolveGuardConversationId(params);
         conversationId = resolved.conversationId;
         dataChain = resolved.dataChain;
+    } else {
+        conversationId = await resolveGuardIdentity(conversationId, dataChain, params.action === "status" || params.action === "cancel");
     }
     if (!conversationId) return { error: "❌ 无法通过当前宿主链路确定要守卫的对话" };
 
-    const candidates = listGuardStates(conversationId).filter(state => {
-        if (params.stageId !== undefined && state.stageId !== params.stageId.trim()) return false;
-        if (params.childScopeId !== undefined && state.childScopeId !== normalizeChildScopeId(params.childScopeId)) return false;
-        return true;
-    });
+    const candidates = await findEquivalentGuards(conversationId, dataChain, params.stageId, params.childScopeId);
     if (candidates.length === 0) return { error: "❌ 没有活跃的 Stage Guard 匹配当前选择器。请先调用 stage_guard(action=\"start\")" };
     if (candidates.length > 1) {
         return {
@@ -152,8 +152,8 @@ async function resolveActiveGuard(params: z.infer<typeof StageGuardSchema>): Pro
     }
 
     const candidate = candidates[0];
-    const state = readGuardState(conversationId, candidate.stageId, candidate.childScopeId) || candidate;
-    return { state, conversationId, dataChain };
+    const state = readGuardState(candidate.conversationId, candidate.stageId, candidate.childScopeId) || candidate;
+    return { state, conversationId: state.conversationId, dataChain };
 }
 
 function staleGuardCheckText(): ReturnType<typeof text> {
@@ -176,12 +176,40 @@ function summarizeLockResults(results: Array<{ file: string; result: GuardLockOp
 
 type GuardConversationLoader = typeof loadConversationData;
 let guardConversationLoader: GuardConversationLoader = loadConversationData;
+let guardConversationIdResolver: typeof resolveConversationId = resolveConversationId;
 
 type GuardCheckRunner = typeof runGuardCheck;
 let guardCheckRunner: GuardCheckRunner = runGuardCheck;
 
 export function __testSetStageGuardConversationLoader(loader?: GuardConversationLoader): void {
     guardConversationLoader = loader || loadConversationData;
+}
+
+export function __testSetStageGuardConversationIdResolver(resolver?: typeof resolveConversationId): void {
+    guardConversationIdResolver = resolver || resolveConversationId;
+}
+
+async function resolveGuardIdentity(conversationId: string, dataChain: DataChain, cachedOnly = false): Promise<string> {
+    if (dataChain !== "windsurf" || !conversationId.trim()) return conversationId.trim();
+    const cached = resolveCachedDevinIdentity(conversationId.trim());
+    if (cachedOnly) return cached;
+    return await guardConversationIdResolver(cached, dataChain) || "";
+}
+
+async function findEquivalentGuards(conversationId: string, dataChain: DataChain, stageId?: string, childScopeId?: string): Promise<GuardState[]> {
+    const states = dataChain === "windsurf" ? listGuardStates() : listGuardStates(conversationId);
+    const candidates: GuardState[] = [];
+    for (const state of states) {
+        if (stageId !== undefined && state.stageId !== stageId.trim()) continue;
+        if (childScopeId !== undefined && state.childScopeId !== normalizeChildScopeId(childScopeId)) continue;
+        if (state.conversationId === conversationId) {
+            candidates.push(state);
+        } else if (dataChain === "windsurf" && state.chain === "windsurf"
+            && await resolveGuardIdentity(state.conversationId, dataChain, true) === conversationId) {
+            candidates.push(state);
+        }
+    }
+    return candidates;
 }
 
 export function __testSetStageGuardCheckRunner(runner?: GuardCheckRunner): void {
@@ -196,7 +224,7 @@ async function resolveGuardConversationId(params: z.infer<typeof StageGuardSchem
         includeRounds: false,
     });
     return {
-        conversationId: loaded?.conversationId || params.conversationId || "",
+        conversationId: loaded?.conversationId || await resolveGuardIdentity(params.conversationId || "", dataChain),
         dataChain: loaded?.chainUsed || dataChain,
         roundsLength: loaded?.roundCount ?? loaded?.rounds.length ?? 0,
         cacheAvailable: Boolean(loaded),
@@ -225,7 +253,7 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
 
     const hasExplicitStartBoundary = Boolean(params.conversationId?.trim() && Number.isFinite(params.startRound) && (params.startRound || 0) > 0);
     const resolved = hasExplicitStartBoundary
-        ? { conversationId: params.conversationId!.trim(), dataChain: resolveDataChain(params), roundsLength: 0, cacheAvailable: false }
+        ? { conversationId: await resolveGuardIdentity(params.conversationId!, resolveDataChain(params)), dataChain: resolveDataChain(params), roundsLength: 0, cacheAvailable: false }
         : await resolveGuardConversationId(params);
     if (!resolved.conversationId) {
         return text(`❌ 无法通过当前宿主链路确定要守卫的对话`);
@@ -240,7 +268,11 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
     }
     const childScopeId = normalizeChildScopeId(params.childScopeId);
 
-    const existing = readGuardState(conversationId, params.stageId || "", childScopeId);
+    const equivalents = await findEquivalentGuards(conversationId, resolved.dataChain, params.stageId || "", childScopeId);
+    if (equivalents.length > 1) {
+        return text(`❌ 同一对话别名对应多个活跃 Guard，拒绝覆盖，请先按原始身份处理冲突。\n${formatAmbiguousGuardCandidates(equivalents)}`);
+    }
+    const existing = equivalents[0];
     if (existing) {
         if (!params.force) {
             return text([
@@ -706,6 +738,14 @@ async function handleCheck(
     if (isBackgroundTaskAborted(taskContext)) {
         return formatAbortedGuardCheckText(taskContext);
     }
+    if (state.chain === "windsurf") {
+        const source = await guardConversationLoader("windsurf", convId, { link: "summary", includeRounds: false });
+        try {
+            assertConversationConsumerSourceComplete(source);
+        } catch {
+            return text("🛡 Stage Guard 检查未完成：WSF 原文证据不可用、过期或不完整，未调用模型，也未写入检查结果或 PASS receipt。");
+        }
+    }
 
     // Plan_30：stage_guard check 默认保持同步，避免阶段还未明确通过就被提前标记完成；
     // 仅显式 background=true 时才转后台。
@@ -948,12 +988,18 @@ async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
         ? {
             ...params,
             conversationId: taskPayload.conversationId,
+            dataChain: taskPayload.dataChain,
             stageId: taskPayload.stageId,
             childScopeId: taskPayload.version === 2 ? taskPayload.childScopeId : "main",
             scopeSelectors: taskPayload.version === 2 ? [...taskPayload.scopeSelectors] : undefined,
         }
         : params;
-    const resolvedGuard = await resolveActiveGuard(guardParams);
+    const savedState = taskPayload
+        ? readGuardState(taskPayload.conversationId, taskPayload.stageId, taskPayload.version === 2 ? taskPayload.childScopeId : "main")
+        : null;
+    const resolvedGuard = taskPayload
+        ? savedState ? { state: savedState } : { error: "❌ 没有活跃的 Stage Guard 匹配当前选择器" }
+        : await resolveActiveGuard(guardParams);
     if ("error" in resolvedGuard) {
         return text(resolvedGuard.error.includes("没有活跃的 Stage Guard 匹配当前选择器")
             ? "🛡 Stage Guard 未激活，无需取消。"
@@ -1006,9 +1052,9 @@ export async function runStageGuard(params: z.infer<typeof StageGuardSchema>): P
             case "check":
                 return await handleCheck(params);
             case "status":
-                return handleStatus(params);
+                return await handleStatus(params);
             case "cancel":
-                return handleCancel(params);
+                return await handleCancel(params);
             default:
                 return text(`❌ 未知 action: ${params.action}`);
         }

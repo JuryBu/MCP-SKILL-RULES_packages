@@ -19,6 +19,7 @@ export type ConversationAttachmentSource =
     | "windsurf-data-url"
     | "windsurf-media-attachment"
     | "local-pb-inline-base64"
+    | "devin-inline-image"
     | "attachment-metadata-redacted";
 
 export interface ConversationAttachment {
@@ -30,6 +31,8 @@ export interface ConversationAttachment {
     originalPath?: string;
     dataUrl?: string;
     sizeBytes?: number;
+    width?: number;
+    height?: number;
     sha256?: string;
     exists?: boolean;
     tempPath?: string;
@@ -137,6 +140,7 @@ function isMaterializableDataUrlSource(source: ConversationAttachmentSource): bo
     return source === "codex-data-url"
         || source === "claude-code-data-url"
         || source === "windsurf-data-url"
+        || source === "devin-inline-image"
         || source === "antigravity-tool-image";
 }
 
@@ -504,7 +508,7 @@ export async function materializeRoundAttachments(
                 continue;
             }
             // E4 快路径：同一附件自身既有可用本地路径又有 data-url → 本地路径已够，跳过 data-url。
-            if (attachment.originalPath && attachment.exists !== false) {
+            if (attachment.source !== "devin-inline-image" && attachment.originalPath && attachment.exists !== false) {
                 attachments[index] = { ...attachment, warning: "已有本地图片路径，未生成临时文件" };
                 continue;
             }

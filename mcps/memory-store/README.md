@@ -1,6 +1,16 @@
-# MCP Memory Store v1.23.1
+# MCP Memory Store v1.25.0
 
 AI 主动记忆管理系统 + 五数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
+
+## Devin Local 与旧 Windsurf
+
+保持 `dataChain="windsurf"`（或 `wsf`）不变，读取器按真实来源自动选择旧 Cascade LS/PB 或 Devin Local SQLite。`conversationId` 可用 CLI 的文字 ID，也可用经过结构化消息身份核验的 Desktop UUID，不按标题猜关联。CLI 主链作为正文来源，Desktop 补充 UUID、资源与子代理；两个库的记录数不等于完整性证明。仅 Desktop 或无法完整恢复的来源明确标为 partial，不能作为 Record/Guard 的完整证据。
+
+Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库，不依赖 Python、不复制活动 WAL/SHM。该功能要求 Node.js 22.16+，推荐 24；无 Devin 来源时不会加载 SQLite 模块。默认发现 Windows 的 `%APPDATA%/Devin/cli/sessions.db` 与 `%APPDATA%/Devin/User/acp-messages/`，可用 `MEMORY_STORE_DEVIN_CLI_DB_PATH`、`MEMORY_STORE_DEVIN_DESKTOP_ROOT` 精确覆盖位置。
+
+`source="auto|local"` 读取 Devin SQLite，`source="cache"` 只读已提交缓存；Devin 没有 Cascade LS/PB，`source="ls"` 不会伪装成等价成功。旧 Cascade 的在线 LS 和离线 PB 行为保留。文字 ID 与已核验 UUID 共享缓存，原生子代理可从父轮展开，或按返回的稳定子代理 ID 单独读取。
+
+使用 `list` 的 `contextProbe` 或后台 `deep_locate`，可在指定 `dataChain/dataChains` 的候选内按上下文找对话。Antigravity、Codex、Claude Code、WSF 与现有 DSH 均可参与，返回命中片段、真实来源位置和扫描范围；多候选或预算未覆盖全范围时不自动指定唯一 UUID。
 
 ## 功能
 

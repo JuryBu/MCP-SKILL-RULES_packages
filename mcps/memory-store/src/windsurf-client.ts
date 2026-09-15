@@ -16,6 +16,12 @@ import {
     type RouterEndpoint,
 } from "./conversation-router.js";
 import { windsurfCascadeExistsLocally } from "./windsurf-local-store.js";
+import { isDevinStoreAvailable, listDevinConversations, resolveDevinConversation } from "./devin-sqlite.js";
+import { readDevinConversation, splitDevinSubagentId, devinSubagentId } from "./devin-conversation.js";
+import { rememberDevinIdentity } from "./devin-identity.js";
+import type { DevinConversationSummary, DevinReadOptions } from "./devin-types.js";
+import type { ConversationLinkMode } from "./chain.js";
+import type { ConversationSourceFingerprint } from "./conversation-source-cache.js";
 import {
     buildExactFetchEvidence,
     buildFullSourceReadEvidence,
@@ -69,6 +75,13 @@ export interface WindsurfLsEndpoint extends WindsurfLsProcessCandidate {
 }
 
 export interface WindsurfConversationSummary {
+    aliases?: string[];
+    uuid?: string;
+    sessionId?: string;
+    sourceKind?: "devin-cli" | "devin-desktop";
+    sourcePath?: string;
+    partial?: boolean;
+    discoveryWarnings?: string[];
     id: string;
     cascadeId: string;
     trajectoryId?: string;
@@ -93,6 +106,8 @@ export interface WindsurfConversationSummary {
 }
 
 export interface WindsurfConversationReadResult {
+    normalizationVersion?: number;
+    sourceFingerprint?: ConversationSourceFingerprint;
     cascadeId: string;
     thread: WindsurfConversationSummary;
     steps: unknown[];
@@ -1187,7 +1202,18 @@ async function getWindsurfEndpointPool(): Promise<WindsurfLsEndpoint[]> {
 }
 
 export async function isWindsurfStoreAvailable(): Promise<boolean> {
-    return (await getWindsurfEndpointPool()).length > 0 || readWindsurfSubagentJobs().size > 0;
+    return isDevinStoreAvailable() || (await getWindsurfEndpointPool()).length > 0 || readWindsurfSubagentJobs().size > 0;
+}
+
+export function windsurfSummaryFromDevin(summary: DevinConversationSummary): WindsurfConversationSummary {
+    return {
+        id: summary.canonicalId, cascadeId: summary.canonicalId, title: summary.title,
+        aliases: summary.aliases, uuid: summary.uuid, sessionId: summary.sessionId,
+        summary: summary.title, stepCount: 0, createdTime: summary.createdAt,
+        lastModifiedTime: summary.updatedAt, cwd: summary.cwd, workspaceUris: summary.workspaceUris,
+        sourceKind: summary.sourceKind, sourcePath: summary.sourcePath, partial: summary.partial,
+        isChildThread: summary.isChildThread, parentConversationId: summary.parentConversationId,
+    };
 }
 
 
@@ -1469,7 +1495,7 @@ export function windsurfListContainsId(data: unknown, cascadeId: string): boolea
  * 列出近期 WSF 对话：跨「全部」活跃 WSF LS 端点聚合去重（同 cascadeId 取 stepCount 最大），
  * 修「list 只看一个窗口」（失败路径 ④ 连带）。
  */
-export async function listRecentWindsurfThreads(
+async function listLegacyWindsurfThreads(
     limit = 50,
     options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
 ): Promise<WindsurfConversationSummary[]> {
@@ -1524,16 +1550,66 @@ export async function listRecentWindsurfThreads(
         .slice(0, Math.max(0, limit));
 }
 
+export async function listRecentWindsurfThreads(
+    limit = 50,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+): Promise<WindsurfConversationSummary[]> {
+    const legacy = await listLegacyWindsurfThreads(limit, options);
+    let devin;
+    try {
+        devin = await listDevinConversations();
+    } catch (error) {
+        if (!legacy.length) throw error;
+        return legacy.map(item => ({ ...item, discoveryWarnings: ["DEVIN_DISCOVERY_UNAVAILABLE: legacy candidates only"] }));
+    }
+    const merged = new Map(legacy.map(item => [item.id, item]));
+    for (const summary of devin) {
+        const item = windsurfSummaryFromDevin(summary);
+        if (merged.has(item.id)) throw new Error(`WSF conversation identity collides between Cascade and Devin: ${item.id}`);
+        merged.set(item.id, item);
+    }
+    return [...merged.values()].sort((left, right) =>
+        (Date.parse(right.lastModifiedTime || right.createdTime || "") || 0)
+        - (Date.parse(left.lastModifiedTime || left.createdTime || "") || 0),
+    ).slice(0, Math.max(0, limit));
+}
+
+export async function withLegacyWindsurfFallback<Result>(
+    conversationId: string,
+    operation: () => Promise<Result | null>,
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> & { source?: string } = {},
+): Promise<Result | null> {
+    try {
+        return await operation();
+    } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (/cancel|abort|deadline|budget|ambig|colli|conflict/iu.test(message)) throw error;
+        if (/^[a-zA-Z0-9_-]+$/u.test(conversationId) && windsurfCascadeExistsLocally(conversationId)) return null;
+        if (options.source !== "local") {
+            const legacy = await listLegacyWindsurfThreads(500, options);
+            if (legacy.some(item => item.id === conversationId || item.cascadeId === conversationId)) return null;
+        }
+        throw error;
+    }
+}
+
 export async function resolveWindsurfThreadId(
     input: string,
-    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> & DevinReadOptions = {},
 ): Promise<string | null> {
     const query = input.trim().toLowerCase();
     if (!query) return null;
-    const threads = await listRecentWindsurfThreads(500, options);
-    const exact = threads.find(item => item.id.toLowerCase() === query || item.cascadeId.toLowerCase() === query);
+    const child = splitDevinSubagentId(input);
+    const devin = await withLegacyWindsurfFallback(input, () => resolveDevinConversation(child?.parentId || input, options), options);
+    if (devin) {
+        rememberDevinIdentity(devin);
+        return child ? devinSubagentId(devin.canonicalId, child.agentId) : devin.canonicalId;
+    }
+    if (windsurfCascadeExistsLocally(input)) return input;
+    const threads = await listLegacyWindsurfThreads(500, options);
+    const exact = threads.find(item => [item.id, item.cascadeId, ...(item.aliases || [])].some(id => id.toLowerCase() === query));
     if (exact) return exact.id;
-    const prefix = threads.filter(item => item.id.toLowerCase().startsWith(query) || item.cascadeId.toLowerCase().startsWith(query));
+    const prefix = threads.filter(item => [item.id, item.cascadeId, ...(item.aliases || [])].some(id => id.toLowerCase().startsWith(query)));
     return prefix.length === 1 ? prefix[0].id : null;
 }
 
@@ -1844,9 +1920,19 @@ function buildSourceMetadata(
 export async function loadWindsurfConversation(
     cascadeId: string,
     refresh = false,
-    loadOptions: { requestClass?: ConcurrencyGateRequestClass } = {},
+    loadOptions: { requestClass?: ConcurrencyGateRequestClass; link?: ConversationLinkMode } = {},
 ): Promise<WindsurfConversationReadResult | null> {
     const requestedId = cascadeId.trim();
+    const devin = await withLegacyWindsurfFallback(requestedId, () => readDevinConversation(requestedId, { link: loadOptions.link }), loadOptions);
+    if (devin) {
+        rememberDevinIdentity(devin.raw.summary);
+        return {
+            cascadeId: devin.raw.summary.canonicalId, thread: windsurfSummaryFromDevin(devin.raw.summary),
+            steps: [], rounds: devin.rounds, pagesRead: 1,
+            totalSteps: devin.raw.nodes.length || devin.raw.desktopMessages.length,
+            partial: devin.raw.partial, warnings: devin.raw.warnings, sourceFingerprint: devin.raw.fingerprint,
+        };
+    }
     const directCachedEntry = requestedId ? getCachedWindsurfConversation(requestedId) : null;
     const requestClass = loadOptions.requestClass || "foreground";
     const resolvedId = directCachedEntry

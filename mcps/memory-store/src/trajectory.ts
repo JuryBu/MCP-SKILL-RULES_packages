@@ -25,6 +25,7 @@ import {
 // ===== 类型定义 =====
 
 export interface ConversationRound {
+    createdAt?: string;
     roundIndex: number;          // 1-indexed
     startStep: number;           // step index in trajectory
     endStep: number;
@@ -47,7 +48,9 @@ export interface ConversationRound {
 }
 
 export interface CompactionSummaryInfo {
-    provider: "claude-code";
+    provider: "claude-code" | "devin";
+    sourceNodeId?: number;
+    boundaryNodeId?: number;
     kind: "compact_summary";
     text: string;
     summaryChars: number;
@@ -84,6 +87,7 @@ export interface ConversationAnnotation {
 }
 
 export interface ConversationUserMessage {
+    createdAt?: string;
     stepIndex?: number;
     text: string;
     rawRole?: string;
@@ -94,6 +98,7 @@ export interface ConversationUserMessage {
 }
 
 export interface ConversationSemanticEvent {
+    createdAt?: string;
     stepIndex?: number;
     rawRole?: string;
     semanticRole: ConversationMessageRole;
@@ -766,7 +771,8 @@ export function getRoundSubagentSummaries(round: ConversationRound): SubagentSum
 
 function formatSubagentLabel(subagent: SubagentSummary): string {
     const nickname = subagent.nickname || "subagent";
-    const shortId = subagent.threadId ? `${subagent.threadId.slice(0, 8)}${subagent.threadId.length > 8 ? "…" : ""}` : "unknown";
+    const shortId = subagent.threadId.includes("--subagent-") ? subagent.threadId
+        : subagent.threadId ? `${subagent.threadId.slice(0, 8)}${subagent.threadId.length > 8 ? "…" : ""}` : "unknown";
     return `Subagent-${nickname} (${shortId})`;
 }
 
@@ -867,9 +873,11 @@ export function formatRound(
 
     // 用户消息
     if (round.compactionSummaries?.length) {
-        lines.push(`### 👤 用户 (step ${round.startStep})`);
+        const onlyDevin = round.compactionSummaries.every(summary => summary.provider === "devin");
+        lines.push(`### ${onlyDevin ? "🧩 系统/压缩内容" : "👤 用户"} (step ${round.startStep})`);
         lines.push(formatCompactionUserMessage(round, depth, options.compactionMode || (depth === "full" ? "full" : "folded")));
-    } else {
+    }
+    if (!round.compactionSummaries?.some(summary => summary.provider === "claude-code")) {
         for (const message of userMessages) {
             lines.push(`### 👤 用户 (step ${message.stepIndex ?? round.startStep})`);
             renderHumanMessageContent(lines, message, depth, (text, selectedDepth) => selectedDepth === "brief" ? truncate(text, 100) : text);
@@ -1080,7 +1088,7 @@ export function formatRound(
             lines.push("#### 🤝 子代理线程");
             for (const item of subagentSummaries) {
                 const label = formatSubagentLabel(item);
-                const detail = item.status || item.summary || item.prompt || "";
+                const detail = item.threadId.includes("--subagent-") ? [item.status, item.summary, item.prompt && depth === "full" ? item.prompt : ""].filter(Boolean).join("\n") : item.status || item.summary || item.prompt || "";
                 lines.push(detail ? `- ${label}: ${truncate(detail, depth === "full" ? 300 : 120)}` : `- ${label}`);
             }
         }
@@ -1119,7 +1127,8 @@ function thinkingSummaryLabelForRoleView(thinking: string): string {
 }
 
 function isSystemLikeRound(round: ConversationRound): boolean {
-    if (round.compactionSummaries?.length) return true;
+    if (round.compactionSummaries?.some(summary => summary.provider === "claude-code")) return true;
+    if (round.userMessages?.some(message => message.rawRole === "devin-user")) return false;
     if (round.semanticEvents?.some((event) => event.semanticRole === "system" && event.kind !== "automation_event" && !event.automation)) return true;
     const text = getRoundUserMessages(round).map((message) => message.text).join("\n").trimStart();
     return text.startsWith("[Codex AGENTS/RULES 注入已折叠")
@@ -1209,7 +1218,7 @@ export function formatRoundForMessageRoles(
     const toolCalls = getRoundToolCalls(round);
     const subagentSummaries = getRoundSubagentSummaries(round);
     const includeUser = roles.has("user") && !legacySystemLike && userMessages.length > 0;
-    const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0 || automationEvents.length > 0);
+    const includeSystem = roles.has("system") && (legacySystemLike || explicitSystemEvents.length > 0 || automationEvents.length > 0 || Boolean(round.compactionSummaries?.length));
     const includeModel = roles.has("model") || roles.has("assistant");
     const includeTool = roles.has("tool");
     const includeSubagent = roles.has("subagent");
@@ -1262,16 +1271,18 @@ export function formatRoundForMessageRoles(
                 return finalizeResult(lines.join("\n").trimEnd());
             }
             for (const item of round.compactionSummaries) {
+                const provider = item.provider === "devin" ? "Devin Local" : "Claude Code";
+                const marker = item.provider === "devin" ? "DEVIN_COMPACT_SUMMARY" : "CLAUDE_CODE_COMPACT_SUMMARY";
                 const meta = `chars=${item.summaryChars}, sha256=${item.summarySha256.slice(0, 12)}`;
                 if (compactionMode === "full" || depth === "full") {
-                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`)) break;
-                    if (!pushLine(lines, "<<<CLAUDE_CODE_COMPACT_SUMMARY>>>")) break;
+                    if (!pushLine(lines, `🧩 ${provider} 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`)) break;
+                    if (!pushLine(lines, `<<<${marker}>>>`)) break;
                     if (!pushLine(lines, truncateForRoleView(item.text, depth))) break;
-                    if (!pushLine(lines, "<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>")) break;
+                    if (!pushLine(lines, `<<<END_${marker}>>>`)) break;
                 } else if (compactionMode === "omit") {
-                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要已省略（${meta}）`)) break;
+                    if (!pushLine(lines, `🧩 ${provider} 压缩续聊摘要已省略（${meta}）`)) break;
                 } else {
-                    if (!pushLine(lines, `🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`)) break;
+                    if (!pushLine(lines, `🧩 ${provider} 压缩续聊摘要已折叠（${meta}）`)) break;
                     if (!pushLine(lines, "说明：这是上下文压缩后的 summary，不是原始用户发言；可用 depth=\"full\" 或 compactionMode=\"full\" 展开。")) break;
                 }
             }
@@ -1383,7 +1394,7 @@ export function formatRoundForMessageRoles(
     if (!budgetState.exceeded && includeSubagent && subagentSummaries.length > 0) {
         if (pushLine(lines, "#### 🤝 子代理线程")) {
             for (const subagent of subagentSummaries) {
-                const detail = subagent.status || subagent.summary || subagent.prompt || "";
+                const detail = subagent.threadId.includes("--subagent-") ? [subagent.status, subagent.summary, subagent.prompt && depth === "full" ? subagent.prompt : ""].filter(Boolean).join("\n") : subagent.status || subagent.summary || subagent.prompt || "";
                 if (!pushLine(lines, detail
                     ? `- ${formatSubagentLabel(subagent)}: ${truncateForRoleView(detail, depth)}`
                     : `- ${formatSubagentLabel(subagent)}`)) break;
@@ -1463,6 +1474,8 @@ function formatCompactionUserMessage(round: ConversationRound, depth: Depth, mod
     const items = round.compactionSummaries || [];
     const lines: string[] = [];
     for (const item of items) {
+        const provider = item.provider === "devin" ? "Devin Local" : "Claude Code";
+        const marker = item.provider === "devin" ? "DEVIN_COMPACT_SUMMARY" : "CLAUDE_CODE_COMPACT_SUMMARY";
         const meta = [
             `chars=${item.summaryChars}`,
             `sha256=${item.summarySha256.slice(0, 12)}`,
@@ -1470,18 +1483,18 @@ function formatCompactionUserMessage(round: ConversationRound, depth: Depth, mod
             `duration=${formatDurationMs(item.durationMs)}`,
         ].join(", ");
         if (mode === "omit") {
-            lines.push(`🧩 Claude Code 压缩续聊摘要已省略（${meta}）`);
+            lines.push(`🧩 ${provider} 压缩续聊摘要已省略（${meta}）`);
             continue;
         }
         if (mode === "full") {
-            lines.push(`🧩 Claude Code 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
-            lines.push("<<<CLAUDE_CODE_COMPACT_SUMMARY>>>");
+            lines.push(`🧩 ${provider} 压缩续聊摘要（已展开；这不是用户真实输入，${meta}）`);
+            lines.push(`<<<${marker}>>>`);
             lines.push(depth === "brief" ? truncate(item.text, 100) : item.text);
-            lines.push("<<<END_CLAUDE_CODE_COMPACT_SUMMARY>>>");
+            lines.push(`<<<END_${marker}>>>`);
             continue;
         }
         const artifactPath = materializeCompactionSummary(item);
-        lines.push(`🧩 Claude Code 压缩续聊摘要已折叠（${meta}）`);
+        lines.push(`🧩 ${provider} 压缩续聊摘要已折叠（${meta}）`);
         lines.push(`📄 完整压缩摘要临时文件: ${artifactPath}`);
         lines.push("说明：这是上下文压缩后的 summary，不是原始用户发言；默认搜索、Record、Guard 不把它当事实正文。");
     }

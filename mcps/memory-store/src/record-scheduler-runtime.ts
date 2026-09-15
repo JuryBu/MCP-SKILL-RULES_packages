@@ -100,7 +100,9 @@ import {
     listRecentClaudeCodeThreads,
     resolveClaudeCodeSourceEvidenceIdentity,
 } from "./claude-code-client.js";
-import { listRecentWindsurfThreads, scanWindsurfSourceEvidence } from "./windsurf-client.js";
+import { listRecentWindsurfThreads } from "./windsurf-client.js";
+import { scanWindsurfConsumerSourceEvidence } from "./devin-source-evidence.js";
+import { resolveConversationId } from "./conversation-bridge.js";
 import {
     createAntigravityLsSourceEvidenceAdapter,
     listConversationsByMtime,
@@ -308,7 +310,8 @@ export interface RecordSchedulerProductionSourceApis {
     enumerateClaudeCode: typeof enumerateClaudeCodeSourceEvidence;
     fetchClaudeCode: typeof fetchClaudeCodeSourceEvidence;
     listWindsurfThreads: typeof listRecentWindsurfThreads;
-    scanWindsurf: typeof scanWindsurfSourceEvidence;
+    scanWindsurf: typeof scanWindsurfConsumerSourceEvidence;
+    resolveWindsurfId: (conversationId: string) => Promise<string | null>;
     listAntigravityConversations: typeof listConversationsByMtime;
     createAntigravityAdapter: typeof createAntigravityLsSourceEvidenceAdapter;
 }
@@ -1311,7 +1314,8 @@ const DEFAULT_PRODUCTION_SOURCE_APIS: RecordSchedulerProductionSourceApis = {
     enumerateClaudeCode: enumerateClaudeCodeSourceEvidence,
     fetchClaudeCode: fetchClaudeCodeSourceEvidence,
     listWindsurfThreads: listRecentWindsurfThreads,
-    scanWindsurf: scanWindsurfSourceEvidence,
+    scanWindsurf: scanWindsurfConsumerSourceEvidence,
+    resolveWindsurfId: conversationId => resolveConversationId(conversationId, "windsurf", process.cwd(), "background"),
     listAntigravityConversations: listConversationsByMtime,
     createAntigravityAdapter: createAntigravityLsSourceEvidenceAdapter,
 };
@@ -1335,10 +1339,21 @@ async function listProductionDiscoverySeeds(
     const workspaceHash = request.workspaceHash || "general";
     const seeds = new Map<string, ProductionDiscoverySeed>();
     const enumerations = new Map<SourceEvidenceHost, SchedulerCandidateSnapshot["enumerations"][number]>();
+    const windsurfIds = new Map<string, Promise<string | null>>();
+    const resolveSeedId = async (host: SourceEvidenceHost, conversationId: string) => {
+        if (host !== "windsurf" || !hosts.includes(host)) return conversationId;
+        if (!windsurfIds.has(conversationId)) windsurfIds.set(conversationId, apis.resolveWindsurfId(conversationId));
+        const canonicalId = await windsurfIds.get(conversationId);
+        if (!canonicalId) throw new Error(`WSF conversation identity is unresolved: ${conversationId}`);
+        return canonicalId;
+    };
     const add = (seed: ProductionDiscoverySeed) => {
         if (!hosts.includes(seed.host) || !seed.conversationId.trim() || !matchesDiscoveryTime(seed, request.filters)) return;
         const key = productionSeedKey(seed);
         const existing = seeds.get(key);
+        if (seed.host === "windsurf" && existing?.record && seed.record && existing.record.conversationId !== seed.record.conversationId) {
+            throw new Error(`WSF Record aliases refer to multiple existing records: ${existing.record.conversationId}, ${seed.record.conversationId}`);
+        }
         seeds.set(key, {
             ...(existing || seed),
             ...seed,
@@ -1381,7 +1396,7 @@ async function listProductionDiscoverySeeds(
         for (const host of recordHosts) {
             add({
                 host,
-                conversationId: record.conversationId,
+                conversationId: await resolveSeedId(host, record.conversationId),
                 title: record.title,
                 workspaceHash: record.workspaceHash,
                 workspacePath: record.workspacePath,
@@ -1394,7 +1409,7 @@ async function listProductionDiscoverySeeds(
     for (const target of request.targets || []) {
         add({
             host: target.host,
-            conversationId: target.conversationId,
+            conversationId: await resolveSeedId(target.host, target.conversationId),
             title: target.title || target.conversationId,
             workspaceHash: target.workspaceHash,
             workspacePath: target.workspacePath,
@@ -1475,7 +1490,14 @@ async function listProductionDiscoverySeeds(
                     workspacePath: thread.cwd || request.workspacePath || null,
                     sourceUpdatedAtMs: Date.parse(thread.lastModifiedTime || thread.createdTime || "") || null,
                     listed: true,
-                    sourceAuthorityRoot: thread.workspaceUris?.[0] || thread.cwd || request.workspacePath || null,
+                    sourceAuthorityRoot: thread.sourcePath ? path.dirname(thread.sourcePath) : thread.workspaceUris?.[0] || thread.cwd || request.workspacePath || null,
+                    ...(thread.sourceKind && thread.sourcePath ? { sourceIdentity: {
+                        kind: "database" as const,
+                        authority: `windsurf-${thread.sourceKind}`,
+                        authoritativeRoot: path.dirname(thread.sourcePath),
+                        canonicalPath: thread.sourcePath,
+                    } } : {}),
+                    ...(thread.partial ? { discoveryError: "Devin metadata discovery is partial" } : {}),
                     sourceRevisionHint: stableJsonHash({
                         id: thread.cascadeId || thread.id,
                         stepCount: thread.stepCount,
@@ -1600,6 +1622,7 @@ function metadataProductionEvidence(
             message: hostEnumeration.error,
         }]
         : [];
+    if (seed.discoveryError) enumerationIssue.push({ code: "source_unavailable", message: seed.discoveryError });
     const sourceKind = seed.host === "windsurf"
         ? "hybrid" as const
         : seed.host === "antigravity"
@@ -1632,9 +1655,9 @@ function metadataProductionEvidence(
                 limit: hostEnumeration?.truncated ? PRODUCTION_DISCOVERY_HARD_LIMIT : null,
                 truncated: hostEnumeration?.truncated !== false,
             },
-            enumerationComplete: hostEnumeration?.complete === true,
+            enumerationComplete: hostEnumeration?.complete === true && !seed.discoveryError,
             cacheBypassed: cacheDescriptor === null,
-            exactFetchResult: "present" as const,
+            exactFetchResult: seed.discoveryError ? "unresolved" as const : "present" as const,
             errors: [],
             warnings: enumerationIssue,
             observedAt: {
@@ -1646,7 +1669,7 @@ function metadataProductionEvidence(
     };
     const enumeration = buildSourceEnumerationEvidence({
             ...evidenceInput,
-            targetStatus: "present",
+            targetStatus: seed.discoveryError ? "unknown" : "present",
     });
     const exactFetch = cacheDescriptor
         ? buildExactFetchEvidence({
@@ -1950,6 +1973,12 @@ export function createProductionRecordSchedulerSourceEvidenceAdapter(
             const seeds = listing.seeds;
             const antigravityIds = seeds.filter(seed => seed.host === "antigravity").map(seed => seed.conversationId);
             const sourceCacheReferences = sourceCacheReferencesForDiscovery(request);
+            for (const reference of sourceCacheReferences) {
+                if (reference.host !== "windsurf") continue;
+                const canonicalId = await apis.resolveWindsurfId(reference.conversationId);
+                if (!canonicalId) throw new Error(`WSF cache source identity is unresolved: ${reference.conversationId}`);
+                reference.conversationId = canonicalId;
+            }
             const enumerationsByHost = new Map(listing.enumerations.map(enumeration => [enumeration.chain, enumeration] as const));
             const evidence: ProductionEvidenceResult[] = [];
             for (const seed of seeds) {

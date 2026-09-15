@@ -28,6 +28,7 @@ import {
     loadWindsurfConversation,
     resolveWindsurfThreadId,
     isWindsurfStoreAvailable,
+    withLegacyWindsurfFallback,
     type WindsurfConversationReadResult,
 } from "./windsurf-client.js";
 import {
@@ -81,6 +82,11 @@ import {
     type SourceFailureMode,
 } from "./conversation-filter.js";
 import type { SourceRevision } from "./source-evidence-contracts.js";
+import { fingerprintDevinConversation, resolveDevinConversation } from "./devin-sqlite.js";
+import { readDevinConversation, splitDevinSubagentId, devinSubagentId, DEVIN_NORMALIZATION_VERSION } from "./devin-conversation.js";
+import { rememberDevinIdentity, resolveCachedDevinIdentity } from "./devin-identity.js";
+import { windsurfSummaryFromDevin } from "./windsurf-client.js";
+import type { DevinReadOptions } from "./devin-types.js";
 
 export type ResolvedConversationChain = Exclude<DataChain, "auto">;
 
@@ -199,6 +205,7 @@ interface ConversationLoadOptions {
     isCancelled?: () => boolean;
     expectedCodexSource?: CodexSourceVersionExpectation;
     requireCompactionMetadata?: boolean;
+    sourceReadBudget?: DevinReadOptions;
 }
 
 function throwIfConversationLoadCancelled(options: Pick<ConversationLoadOptions, "isCancelled">): void {
@@ -245,6 +252,7 @@ export async function resolveConversationId(
     chain: ResolvedConversationChain,
     cwd: string = process.cwd(),
     requestClass?: ConcurrencyGateRequestClass,
+    sourceReadBudget?: DevinReadOptions,
 ): Promise<string | null> {
     if (chain === "antigravity") {
         if (requestedId) return requestedId;
@@ -255,7 +263,7 @@ export async function resolveConversationId(
         return null;
     }
     if (chain === "windsurf") {
-        if (requestedId) return await resolveWindsurfThreadId(requestedId, { requestClass }) || requestedId;
+        if (requestedId) return await resolveWindsurfThreadId(requestedId, { requestClass, ...sourceReadBudget }) || requestedId;
         return null;
     }
     if (chain === "dsh") return requestedId || null;
@@ -369,10 +377,23 @@ async function loadFromResolvedChain(
     if (source === "ls" && (resolved === "codex" || resolved === "claude-code" || resolved === "dsh")) {
         throw new Error(`source=ls 不支持 ${resolved}；该宿主的权威原始源是本地 JSONL`);
     }
-    const effectiveId = (source === "cache" || source === "local") && conversationId
+    let effectiveId = (source === "cache" || source === "local") && conversationId
         ? conversationId
-        : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass);
+        : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass, options.sourceReadBudget);
     if (!effectiveId) return null;
+    if (resolved === "windsurf") {
+        if (source === "cache") effectiveId = resolveCachedDevinIdentity(effectiveId);
+        else {
+            const child = splitDevinSubagentId(effectiveId);
+            const requestedDevinId = child?.parentId || effectiveId;
+            const devin = await withLegacyWindsurfFallback(effectiveId, () => resolveDevinConversation(requestedDevinId, options.sourceReadBudget), { source, requestClass: options.requestClass });
+            if (devin) {
+                if (source === "ls") throw new Error("Devin Local 没有 Cascade LS/PB 来源；请使用 source=auto 或 local 只读 SQLite，或 cache 读取已提交缓存");
+                rememberDevinIdentity(devin);
+                effectiveId = child ? devinSubagentId(devin.canonicalId, child.agentId) : devin.canonicalId;
+            }
+        }
+    }
     if (resolved === "codex" && source !== "cache" && !options.expectedCodexSource) {
         const currentThread = getCodexThread(effectiveId);
         if (currentThread?.rolloutPath) {
@@ -396,9 +417,10 @@ async function loadFromResolvedChain(
             (options.requireCompactionMetadata && previous.snapshot.compactionMetadata?.version !== 1)
             || previous.snapshot.aiResponseCount === undefined
             || previous.snapshot.toolCallCount === undefined
+            || (previous.snapshot.windsurfData?.thread.sourceKind && previous.snapshot.windsurfData.normalizationVersion !== DEVIN_NORMALIZATION_VERSION)
         ),
     );
-    const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass);
+    const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass, options.sourceReadBudget);
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
         key,
         fingerprint: options.expectedCodexSource
@@ -481,6 +503,9 @@ async function loadFromResolvedChain(
             );
             throwIfConversationLoadCancelled(options);
             if (!loaded) throw new Error(`无法从 ${resolved} 的 ${source} 原始源构建 fetch 缓存`);
+            if (loaded.windsurfData?.sourceFingerprint && fingerprintRevision(loaded.windsurfData.sourceFingerprint) !== fingerprintRevision(freshness.fingerprint)) {
+                throw new Error("Devin source changed between discovery and readonly snapshot; retry fetch to publish one consistent revision");
+            }
             if (resolved === "codex" && !loaded.sourceRevision) {
                 loaded.sourceRevision = codexSourceRevisionFromRounds(
                     loaded.rounds,
@@ -793,7 +818,7 @@ function conversationSourceCacheKey(
     conversationId: string,
     options: Pick<ConversationLoadOptions, "link" | "logicalChain" | "source">,
 ): ConversationSourceCacheKey {
-    const variant = resolved === "codex"
+    const variant = resolved === "codex" || (resolved === "windsurf" && options.link && options.link !== "summary")
         ? `:link=${options.link || "summary"}`
         : resolved === "claude-code"
             ? `:logical=${options.logicalChain || "off"}`
@@ -910,7 +935,16 @@ async function prepareConversationCacheFreshness(
     source: ConversationRawSource,
     previous: ReturnType<typeof readCachedConversationSourceCache<CachedConversationLoadResult>>,
     requestClass?: ConcurrencyGateRequestClass,
+    sourceReadBudget?: DevinReadOptions,
 ): Promise<ConversationCacheFreshness> {
+    if (resolved === "windsurf") {
+        const child = splitDevinSubagentId(conversationId);
+        const fingerprint = await withLegacyWindsurfFallback(conversationId, () => fingerprintDevinConversation(child?.parentId || conversationId, sourceReadBudget), { source, requestClass });
+        if (fingerprint) {
+            if (source === "ls") throw new Error("Devin Local 不支持 source=ls；请使用 auto/local/cache");
+            return { fingerprint, buildSource: "local" };
+        }
+    }
     if (resolved !== "antigravity" && resolved !== "windsurf") {
         if (resolved === "dsh") {
             const snapshot = (await listDshSessionSnapshots()).find(item => item.id === conversationId);
@@ -1098,6 +1132,33 @@ async function loadRawConversationData(
     options: ConversationLoadOptions,
 ): Promise<CachedConversationLoadResult | null> {
     const source = options.source || "auto";
+
+    if (resolved === "windsurf") {
+        const devin = await withLegacyWindsurfFallback(effectiveId, () => readDevinConversation(effectiveId, { ...options.sourceReadBudget, link: options.link, isCancelled: options.isCancelled }), { source, requestClass: options.requestClass });
+        throwIfConversationLoadCancelled(options);
+        if (devin) {
+            if (source === "ls") throw new Error("Devin Local 不支持 source=ls；请使用 auto/local/cache");
+            if (!hasConversationVisibleBody(devin.rounds)) throw new Error("Devin source contains no readable conversation body; empty fetch cache was not published");
+            rememberDevinIdentity(devin.raw.summary);
+            const totalSteps = devin.raw.nodes.length || devin.raw.desktopMessages.length;
+            return {
+                chainUsed: "windsurf", conversationId: devin.raw.summary.canonicalId,
+                rounds: devin.rounds, totalSteps, cacheAuthority: "local",
+                windsurfData: {
+                    normalizationVersion: DEVIN_NORMALIZATION_VERSION,
+                    cascadeId: devin.raw.summary.canonicalId, thread: windsurfSummaryFromDevin(devin.raw.summary),
+                    steps: [], rounds: devin.rounds, pagesRead: 1, totalSteps,
+                    partial: devin.raw.partial, warnings: devin.raw.warnings, sourceFingerprint: devin.raw.fingerprint,
+                },
+                sourceRevision: { revision: devin.raw.fingerprint.revision || "", contentCursor: String(devin.raw.summary.mainChainId ?? ""), eventWatermark: devin.raw.summary.updatedAt || null, sequence: devin.raw.summary.mainChainId ?? null },
+                sourceDiagnostics: [
+                    `Devin Local readonly SQLite: ${devin.raw.summary.sourceKind}, ${devin.rounds.length} rounds/${totalSteps} nodes`,
+                    `identity=${devin.raw.summary.canonicalId}; aliases=${devin.raw.summary.aliases.join(",")}; partial=${devin.raw.partial}`,
+                    ...devin.raw.warnings,
+                ],
+            };
+        }
+    }
 
     if (resolved === "antigravity" || resolved === "windsurf") {
         if (source === "local") return localPbToConversationResult(resolved, effectiveId);

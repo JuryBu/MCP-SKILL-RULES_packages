@@ -91,9 +91,11 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - list/search 均支持 mode="auto|exact|fuzzy|smart"；list 会综合标题、ID、工作区、Record 摘要和近期上下文指纹定位对话
 - list 的标题、ID、来源、工作区和主/子线程查询走轻量元数据定位；只有正文搜索才使用候选预算和 deep_locate
 - Codex list 快查止血(v1.13.0): dataChain="codex" 且 mode="auto" 时，query 未命中不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 模型搜索；若 query 是古老正文片段，会提示后续使用 deep_locate 后台深搜能力
-- deep_locate(v1.17.3): conversation_read_original(action="deep_locate", dataChain="codex|claude-code", query="...") 默认自动进入后台 FIFO 队列并返回 taskId；支持 exact/fuzzy、进度、预算、partial hits 和 cancel/status；显式 background=false 不支持；Windsurf 首版不支持 deep_locate
+- deep_locate(v1.25): conversation_read_original(action="deep_locate", dataChain="antigravity|codex|claude-code|windsurf|dsh", query="...") 默认进入后台队列并返回 taskId；支持指定 dataChains、exact/fuzzy、进度、预算、partial hits 和 cancel/status，显式 background=false 不支持；未完整扫描或多候选时不能声称唯一命中
 - Record list / list ID 排序 / ETA 修复(v1.13.1): Record 归属 sidecar 出现 superseded 互指环时不再把所有副本都隐藏，列表和搜索会继续按完整度去重显示；conversation list 用完整 ID 查询时真实 ID 命中优先于标题正文提及；后台任务预计剩余时间改按当前阶段开始时间估算，避免把前一阶段耗时算入新阶段。
-- Codex / Claude Code list 支持 contextProbe：从当前可见聊天截取 50-120 字独特上下文，硬匹配本地 JSONL 并标记候选；不会自动选中
+- 五数据链路 list 支持 contextProbe：从当前可见聊天截取 50-120 字独特上下文，只在指定来源候选中匹配正文并标记候选；返回来源位置、歧义与扫描预算，不会自动选中
+- WSF 新旧兼容(v1.25)：dataChain=windsurf|wsf 自动路由旧 Cascade LS/PB 与 Devin Local SQLite；不需要新旧格式参数。Devin 的文字 ID 和经过结构化消息 ID 核验的 UUID 指向同一缓存，CLI 主链为正文权威源，Desktop 补充原生子代理与界面记录；不按同名标题猜 UUID
+- Devin Local 使用只读 SQLite 事务，Node.js 22.16+（推荐24）；source=auto/local 读取在线或已关闭的本地数据库，cache 只读既有缓存。Devin 无 Cascade LS/PB，source=ls 明确拒绝；旧 Cascade 在线LS/离线PB不变。partial/断链/未恢复压缩/未绑定子代理不会冒充完整来源，Record/Guard拒绝采用
 - 三级详细度：brief(截断100字) / normal(完整文本) / full(含思考+工具结果；Codex 链路会展开可读 reasoning、工具事件、patch diff 和文件/计划视图)
 - Antigravity LS 链路下，conversationId 不填可默认当前对话；Codex / Claude Code / Windsurf 通过共享后端、本地 JSONL 或只读 LS 接口定位，必须显式传稳定 conversationId
 - extraTypes: 额外拉取 thinking/tool_results/code_actions/code_diffs/file_views

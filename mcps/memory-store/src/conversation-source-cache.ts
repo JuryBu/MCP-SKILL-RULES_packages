@@ -1482,6 +1482,65 @@ export function getConversationSourceCacheEntryDirectory(key: ConversationSource
     return entryDirectory(key);
 }
 
+export function listConversationSourceCacheSnapshots<TSnapshot>(options: {
+    source: string;
+    keys?: ConversationSourceCacheKey[];
+    limit?: number;
+    maxBytes?: number;
+    maxEntries?: number;
+    deadlineAt?: number;
+    isCancelled?: () => boolean;
+}): { entries: ConversationSourceCacheReadResult<TSnapshot>[]; partial: boolean; warnings: string[] } {
+    const entries: ConversationSourceCacheReadResult<TSnapshot>[] = [];
+    const warnings: string[] = [];
+    const limit = Math.max(1, options.limit || 50);
+    const maxBytes = Math.max(1, options.maxBytes || 16 * 1024 * 1024);
+    let bytes = 0;
+    let examined = 0;
+    const stopped = () => Boolean(options.isCancelled?.()) || Date.now() >= (options.deadlineAt || Infinity);
+    const inspect = (key: ConversationSourceCacheKey) => {
+        if (key.source.split(":")[0] !== options.source) return;
+        const filename = manifestPath(key);
+        if (!fs.existsSync(filename)) return;
+        const manifestBytes = fs.statSync(filename).size;
+        if (manifestBytes > 1024 * 1024 || bytes + manifestBytes > maxBytes) { warnings.push("cache_metadata_budget"); return; }
+        bytes += manifestBytes;
+        const manifest = readManifest(key);
+        if (!manifest) { warnings.push(`cache_manifest_invalid:${key.conversationId}`); return; }
+        const metadataBytes = manifest.files.snapshot.bytes + manifest.files.roundIndex.bytes;
+        if (bytes + metadataBytes > maxBytes) { warnings.push("cache_metadata_budget"); return; }
+        bytes += metadataBytes;
+        const cached = readCachedInternal<TSnapshot>({ key, generation: manifest.generation });
+        if (cached) entries.push(cached);
+        else warnings.push(`cache_incomplete:${key.conversationId}`);
+    };
+    if (options.keys) {
+        for (const key of options.keys) {
+            if (stopped() || entries.length >= limit) { warnings.push("cache_candidate_budget"); break; }
+            inspect(key);
+        }
+    } else if (fs.existsSync(cacheRoot())) {
+        const directory = fs.opendirSync(cacheRoot());
+        try {
+            for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+                if (stopped() || ++examined > (options.maxEntries || 20_000) || entries.length >= limit) { warnings.push("cache_candidate_budget"); break; }
+                if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+                const filename = path.join(cacheRoot(), entry.name, "manifest.json");
+                if (!fs.existsSync(filename)) continue;
+                try {
+                    const size = fs.statSync(filename).size;
+                    if (size > 1024 * 1024 || bytes + size > maxBytes) { warnings.push("cache_metadata_budget"); break; }
+                    bytes += size;
+                    const raw = JSON.parse(fs.readFileSync(filename, "utf8"));
+                    if (raw.key && typeof raw.key.source === "string" && typeof raw.key.conversationId === "string" && entryDirectory(raw.key) === path.dirname(filename)) inspect(raw.key);
+                    else warnings.push("cache_manifest_invalid");
+                } catch { warnings.push("cache_manifest_unreadable"); }
+            }
+        } finally { directory.closeSync(); }
+    }
+    return { entries, partial: warnings.length > 0, warnings: [...new Set(warnings)] };
+}
+
 export function setConversationSourceCacheDataRootForTests(dataRoot: string | undefined): void {
     dataRootOverrideForTests = dataRoot;
 }

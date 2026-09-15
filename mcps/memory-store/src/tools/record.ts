@@ -78,6 +78,7 @@ import {
     type ResolvedConversationChain,
 } from "../conversation-bridge.js";
 import type { ConversationRawSource } from "../conversation-source-adapters.js";
+import { assertConversationConsumerSourceComplete } from "../devin-source-evidence.js";
 import type { ConversationRound, ConversationUserMessage } from "../trajectory.js";
 import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
 import { getClaudeCodeThread } from "../claude-code-client.js";
@@ -3035,9 +3036,7 @@ async function buildRecordUpdateResumePayload(
         if (cachedSource.cacheState === "stale") {
             throw new Error(`Record 拒绝使用过期 fetch 缓存: ${resolvedChain}/${resolvedConversationId}`);
         }
-        if (cachedSource.windsurfData?.partial) {
-            throw new Error(`Record 拒绝使用不完整 fetch 缓存: ${resolvedChain}/${resolvedConversationId}`);
-        }
+        assertConversationConsumerSourceComplete(cachedSource);
         resolvedSourceCacheReference = {
             cacheGeneration: {
                 key: cachedSource.cacheKey,
@@ -4307,8 +4306,9 @@ async function detectOwnershipSource(
     if (allowWindsurf) {
         try {
             const { loadWindsurfConversation } = await import("../windsurf-client.js");
-            const conversation = await loadWindsurfConversation(conversationId, false, { requestClass });
-            const workspace = conversation?.thread.cwd;
+            const canonicalId = await resolveConversationId(conversationId, "windsurf", process.cwd(), requestClass);
+            const conversation = canonicalId ? await loadWindsurfConversation(canonicalId, false, { requestClass }) : null;
+            const workspace = conversation && !conversation.partial ? conversation.thread.cwd : undefined;
             if (workspace) {
                 sources.push({ workspace, hash: resolveWorkspaceHashForRecord(workspace), identityHash: workspaceHash(workspace), sourceType: "windsurf_cwd" });
             }

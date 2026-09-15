@@ -48,9 +48,9 @@ assert.equal(antigravitySmartPlan.allowSmartSearch, true);
 const windsurfAutoPlan = getConversationListFallbackPlan("windsurf", "auto", 0);
 assert.equal(windsurfAutoPlan.includeRawPreview, false, "Windsurf list(auto) must not pull raw Cascade previews");
 assert.equal(windsurfAutoPlan.allowSmartSearch, false, "Windsurf list(auto) must stay metadata-only");
-assert.equal(windsurfAutoPlan.deepSearchSuggested, false, "Windsurf has no deep_locate background scanner yet");
+assert.equal(windsurfAutoPlan.deepSearchSuggested, true, "Windsurf now supports bounded deep_locate without changing lightweight list(auto)");
 assert.ok(windsurfAutoPlan.skipped.includes("raw-trajectory-preview"));
-assert.ok(windsurfAutoPlan.skipped.includes("deep-locate-unsupported"));
+assert.ok(!windsurfAutoPlan.skipped.includes("deep-locate-unsupported"));
 
 const windsurfSmartPlan = getConversationListFallbackPlan("windsurf", "smart", 0);
 assert.equal(windsurfSmartPlan.includeRawPreview, false, "Windsurf list(smart) still uses lightweight candidate material");

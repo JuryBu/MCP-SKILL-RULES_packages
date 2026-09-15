@@ -45,19 +45,20 @@ import {
     type SourceEvidenceIssue,
 } from "./source-evidence-contracts.js";
 import {
-    scanWindsurfSourceEvidence,
     windsurfStepsToConversationRounds,
     type WindsurfLsEndpoint,
     type WindsurfLsTransport,
     type WindsurfSourceEvidenceScanOptions,
 } from "./windsurf-client.js";
+import { assertConversationConsumerSourceComplete, scanWindsurfConsumerSourceEvidence, type DevinEvidenceReader } from "./devin-source-evidence.js";
 import {
     getConversationSourceCacheGenerationKind,
+    readCached,
     readConversationSourceCacheRecordProjection,
     type ConversationSourceCacheGenerationRef,
 } from "./conversation-source-cache.js";
 import { rebuildConversationCacheForRecord } from "./conversation-bridge.js";
-import type { ConversationRecordProjectionRound } from "./conversation-record-projection.js";
+import { projectConversationRoundForRecord, type ConversationRecordProjectionRound } from "./conversation-record-projection.js";
 import { getRoundUserMessages, type ConversationMessageRole, type ConversationRound } from "./trajectory.js";
 import { projectConversationAutomationInput } from "./conversation-automation-event.js";
 import { projectConversationSubagentInput } from "./conversation-subagent-event.js";
@@ -273,6 +274,7 @@ export interface ProductionSourceReaderOptions {
     antigravityReader?: AntigravityLsEvidenceReader;
     antigravityIo?: Partial<AntigravityProductionSourceIo>;
     maxContentBytes?: number;
+    devinReader?: DevinEvidenceReader;
     rebuildLegacyCache?: (
         request: ProductionSourceReadRequest,
     ) => Promise<{ cacheGeneration: ConversationSourceCacheGenerationRef; sourceSnapshot?: Record<string, unknown> }>;
@@ -1112,6 +1114,11 @@ function verifiedCacheScan(
 ): ProductionSourceReadResult | null {
     const reference = request.cacheGeneration;
     if (!reference) return null;
+    if (request.host === "windsurf") {
+        const metadata = readCached({ key: reference.key, generation: reference.generation, expectedFingerprint: reference.fingerprint });
+        assertConversationConsumerSourceComplete(metadata?.snapshot);
+        if (request.sourceSnapshot) assertConversationConsumerSourceComplete(request.sourceSnapshot);
+    }
     if (request.sourceSnapshot?.cacheState === "stale") {
         throw new Error(`stale fetch 缓存不可作为 Record 生产来源: ${reference.generation}`);
     }
@@ -1699,7 +1706,9 @@ export function createProductionSourceReader(options: ProductionSourceReaderOpti
             };
         }
         if (request.host === "windsurf") {
-            const result = await scanWindsurfSourceEvidence(request.conversationId, {
+            const result = await scanWindsurfConsumerSourceEvidence(request.conversationId, {
+                readDevin: options.devinReader,
+                maxBytes: maxContentBytes,
                 transport: request.transport,
                 endpoint: request.endpoint,
                 workspaceId: request.workspaceId,
@@ -1718,11 +1727,15 @@ export function createProductionSourceReader(options: ProductionSourceReaderOpti
                 : [];
             const fullSourceRead = buildProductionFullRead({
                 host: request.host,
-                conversationId: request.conversationId,
+                conversationId: result.identity.conversationId,
                 enumeration: result.enumeration,
                 exactFetch: result.exactFetch,
                 nativeEvidence: result.fullSourceRead || null,
-                messages: result.readResult ? messagesFromWindsurfRounds(result.readResult.rounds) : null,
+                messages: result.readResult
+                    ? result.identity.source.authority.startsWith("windsurf-devin-")
+                        ? messagesFromRecordProjection(result.readResult.rounds.map(projectConversationRoundForRecord))
+                        : messagesFromWindsurfRounds(result.readResult.rounds)
+                    : null,
                 messageIssues,
                 maxContentBytes,
             }, contentHashesByAuthorityRevision);

@@ -12,6 +12,7 @@ import {
 import type { GuardState } from "./guard-store.js";
 import { callModelResponse, resolveModelChainCandidates } from "./model-bridge.js";
 import { loadConversationData } from "./conversation-bridge.js";
+import { assertConversationConsumerSourceComplete } from "./devin-source-evidence.js";
 import { iterateCachedConversationSourceCacheRounds } from "./conversation-source-cache.js";
 import type { Chain, DataChain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
@@ -1022,7 +1023,9 @@ async function getConversationExecutionRecord(
                 includeRounds: false,
                 ...(dataChain === "dsh" ? { source: "cache" as const } : {}),
             });
+            if (dataChain === "windsurf" && !loaded) throw new Error("Guard refuses missing WSF conversation execution evidence");
             if (loaded) {
+                if (loaded.chainUsed === "windsurf") assertConversationConsumerSourceComplete(loaded);
                 const cachedRounds = loaded.cacheKey && loaded.cacheGeneration
                     ? iterateCachedConversationSourceCacheRounds<ConversationRound>({
                         key: loaded.cacheKey,
@@ -1059,6 +1062,7 @@ async function getConversationExecutionRecord(
                 }
             }
         } catch (err) {
+            if (dataChain === "windsurf") throw err;
             console.error(`[guard-engine] 对话原文获取失败: ${err}`);
         }
     }

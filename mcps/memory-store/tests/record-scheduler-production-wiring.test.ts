@@ -944,6 +944,7 @@ const defaultLegacyDiscoveryRuntime = createRecordSchedulerRuntime({
                 lastModifiedTime: new Date(fixtureTimeMs).toISOString(),
             })) as never;
         },
+        resolveWindsurfId: async conversationId => conversationId,
         scanWindsurf: async conversationId => {
             productionApiCalls.push("windsurf:evidence");
             const enumeration = productionEnvelope("windsurf", conversationId);
@@ -995,6 +996,7 @@ const readerDelegationRuntime = createRecordSchedulerRuntime({
         listCodexThreads: () => [{ id: "reader-codex", title: "reader-codex", cwd: productionFixtureWorkspace, updatedAtMs: fixtureTimeMs }] as never,
         listClaudeCodeThreads: () => [{ id: "reader-claude-code", title: "reader-claude-code", cwd: productionFixtureWorkspace, updatedAtMs: fixtureTimeMs }] as never,
         listWindsurfThreads: async () => [{ id: "reader-windsurf", cascadeId: "reader-windsurf", title: "reader-windsurf", cwd: productionFixtureWorkspace, lastModifiedTime: new Date(fixtureTimeMs).toISOString() }] as never,
+        resolveWindsurfId: async conversationId => conversationId,
         listAntigravityConversations: () => [{ id: "reader-antigravity", title: "reader-antigravity", mtime: new Date(fixtureTimeMs), sizeKB: 1 }],
     },
     productionSourceReader: {
@@ -1255,6 +1257,7 @@ const zeroSeedFailureRuntime = createRecordSchedulerRuntime({
             zeroSeedHostCalls.push("windsurf");
             throw new Error("windsurf zero-seed list failure");
         },
+        resolveWindsurfId: async conversationId => conversationId,
         listAntigravityConversations: () => {
             zeroSeedHostCalls.push("antigravity");
             throw new Error("antigravity zero-seed list failure");

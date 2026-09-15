@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.24.0",
+  "version": "1.25.0",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、五数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -14,6 +14,7 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "test:devin": "tsx tests/devin-sqlite.test.ts && tsx tests/devin-conversation.test.ts && tsx tests/devin-bridge.test.ts && tsx tests/devin-consumers.test.ts && tsx tests/conversation-context-locate.test.ts && tsx tests/devin-legacy-isolation.test.ts && tsx tests/devin-tool-attachments.test.ts && tsx tests/devin-discovery-offline.test.ts",
     "test:codex-history": "tsx tests/codex-history-source.test.ts && tsx tests/codex-history-bridge.test.ts",
     "test:portable": "npm run build",
     "pretest": "npm run test:dsh && npm run test:batch-candidate-selection && npm run test:grok-batch-concurrency && npm run test:record-batch-stale-e2e && npm run test:mcp-stdio-smoke",

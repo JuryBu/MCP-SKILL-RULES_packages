@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.25.0] - 2026-09-15
+
+- 在现有 `windsurf|wsf` 数据链内自动读取 Devin Local SQLite 与旧 Cascade LS/PB，不增加手动新旧格式参数；CLI 文字 ID 和经过结构化用户消息 ID 核验的 Desktop UUID 共享稳定身份与 fetch 缓存。
+- 使用只读 SQLite 事务重建活动父链，识别真实压缩引用、原始消息时间、资源引用、内联附件及原生子代理；不把 Desktop 缺页、断链、歧义关联或丢失子代理转录冒充完整来源。
+- 将限定链路的上下文定位扩展到 Antigravity、Codex、Claude Code、WSF 和现有 DSH，保留预算、取消、多候选、来源位置和未扫描范围证据。
+- Record、Stage Guard 与共用原文读取使用相同身份和版本证据，拒绝不完整来源；图片二进制不进入普通正文与搜索输出。
+- Devin SQLite 读取需要 Node.js 22.16+，推荐 24；模块按需加载，不改变旧宿主的原有启动要求。Devin 不提供 Cascade LS/PB，显式 `source=ls` 返回明确说明。
+
 ## [1.24.0] - 2026-09-12
 
 - 支持 Codex `history_base` 引用式历史与同任务双 UUID rollout 文件，按物理来源 ID、字节和全局记录边界顺序读取继承前缀，不重新引入回退操作排除的尾部。
