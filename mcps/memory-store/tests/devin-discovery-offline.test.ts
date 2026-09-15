@@ -90,12 +90,14 @@ try {
         windsurf: { list: () => [{ id: "old", cascadeId: "old", summary: "old", stepCount: 1, discoveryWarnings: ["DEVIN_DISCOVERY_UNAVAILABLE: legacy candidates only"] }], resolve: () => "old" },
     } as any, contextAdapters: { readRounds: async () => ({ rounds: [{ roundIndex: 1, startStep: 1, endStep: 1, userMessage: "old marker", mediaAttachments: [], aiResponses: [], toolCalls: [], taskBoundaries: [], codeActions: [], subagentSummaries: [] }] }) } });
     assert.equal(failedOld.partial, true);
-    assert.equal(failedOld.contextLocate?.resolution, "unverified");
+    assert.equal(failedOld.contextLocate?.resolution, "single_match_in_partial_scan");
     assert.ok(failedOld.statuses[0].warnings?.some(warning => warning.startsWith("DEVIN_DISCOVERY_UNAVAILABLE")));
     console.log("PASS discovery failure/cancellation/parent budget remains partial and preserves legacy hits");
 
     const loaded = await loadConversationData("windsurf", uuid, { source: "local" });
     assert.ok(loaded?.cacheGeneration);
+    const loadedChild = await loadConversationData("windsurf", childId, { source: "local" });
+    assert.ok(loadedChild?.cacheGeneration);
     const taskFile = path.join(root, "Task.md");
     fs.writeFileSync(taskFile, "# Offline guard\n- [ ] Synthetic check\n", "utf8");
     const guardOptions = { dataChain: "windsurf" as const, modelChain: "codex" as const, stageId: "offline guard" };

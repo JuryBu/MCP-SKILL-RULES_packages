@@ -30,13 +30,18 @@ function collectMessageIds(nodes: DevinMessageNode[]): Set<string> {
 }
 
 async function readChain(database: DatabaseSync, sessionId: string, head: number | null,
-    budget: ReadBudget, memo: Map<number, DevinMessageNode>): Promise<ChainResult> {
+    budget: ReadBudget, memo: Map<number, DevinMessageNode>, identityOnly = false): Promise<ChainResult> {
     if (head === null) return { nodes: [], compactions: [], warnings: ["DEVIN_MAIN_CHAIN_MISSING"] };
-    const statement = database.prepare(`SELECT node_id, parent_node_id, created_at,
+    const messageExpression = identityOnly
+        ? `CASE WHEN json_valid(chat_message) THEN CASE WHEN json_type(chat_message)='object' THEN json_object('role', json_extract(chat_message, '$.role'), 'metadata', json_object('created_at', json_extract(chat_message, '$.metadata.created_at'), 'extensions', json_object('chisel/client-message-id', json_extract(chat_message, '$.metadata.extensions."chisel/client-message-id"')))) ELSE chat_message END ELSE chat_message END`
+        : "chat_message";
+    const statement = database.prepare(`WITH selected AS (SELECT node_id, parent_node_id, created_at, metadata,
+        ${messageExpression} AS chat_message FROM message_nodes WHERE session_id=? AND node_id=?)
+        SELECT node_id, parent_node_id, created_at,
         length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)), 0) AS bytes,
         CASE WHEN length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)), 0) <= ? THEN chat_message END AS chat_message,
         CASE WHEN length(CAST(chat_message AS BLOB)) + coalesce(length(CAST(metadata AS BLOB)), 0) <= ? THEN metadata END AS metadata
-        FROM message_nodes WHERE session_id=? AND node_id=?`);
+        FROM selected`);
     const nodes: DevinMessageNode[] = [];
     const compactions: DevinCompaction[] = [];
     const complete = new Set<number>();
@@ -68,7 +73,7 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
             let node = memo.get(frame.id);
             if (!node) {
                 const remaining = budget.remainingBytes;
-                const row = statement.get(remaining, remaining, sessionId, frame.id);
+                const row = statement.get(sessionId, frame.id, remaining, remaining);
                 if (!row) throw new DevinReadError("DEVIN_CHAIN_NODE_MISSING", "A referenced Devin chain node is missing.");
                 await budget.take(Number(row.bytes));
                 const message = jsonObject(row.chat_message, true);
@@ -192,7 +197,8 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
     return { messages, state, warnings };
 }
 
-export async function readCliConversations(filename: string, budget: ReadBudget): Promise<CliConversation[]> {
+export async function readCliConversations(filename: string, budget: ReadBudget,
+    options: { identityOnly?: boolean; sessionId?: string } = {}): Promise<CliConversation[]> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         const sessionColumns = columns(database, "sessions");
         const nodeColumns = columns(database, "message_nodes");
@@ -201,16 +207,18 @@ export async function readCliConversations(filename: string, budget: ReadBudget)
             throw new DevinReadError("DEVIN_SCHEMA_UNSUPPORTED", "The Devin CLI database does not have the supported sessions/message_nodes schema.");
         }
         const selectedColumns = ["id", "main_chain_id", "working_directory", "workspace_dirs", "title", "created_at", "last_activity_at", "hidden", "metadata"];
-        const select = selectedColumns.map(column => sessionColumns.has(column) ? column : `NULL AS ${column}`).join(", ");
+        const select = selectedColumns.map(column => sessionColumns.has(column) && !(options.identityOnly && column === "metadata") ? column : `NULL AS ${column}`).join(", ");
         const results: CliConversation[] = [];
-        for (const session of database.prepare(`SELECT ${select} FROM sessions ORDER BY id`).iterate()) {
+        const sessions = database.prepare(`SELECT ${select} FROM sessions ${options.sessionId === undefined ? "" : "WHERE id=?"} ORDER BY id`);
+        for (const session of sessions.iterate(...(options.sessionId === undefined ? [] : [options.sessionId]))) {
             await budget.take(Buffer.byteLength(JSON.stringify(session)));
             const sessionId = String(session.id);
             const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
             const memo = new Map<number, DevinMessageNode>();
             const chain = empty ? { nodes: [], compactions: [], warnings: ["DEVIN_EMPTY_CONVERSATION"] }
-                : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo);
-            const supplement = await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget);
+                : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
+            const supplement = options.identityOnly ? { messages: [], state: [], warnings: [] }
+                : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget);
             const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
             const summary: DevinConversationSummary = {
                 id: sessionId, canonicalId: sessionId, sessionId, aliases: [sessionId],

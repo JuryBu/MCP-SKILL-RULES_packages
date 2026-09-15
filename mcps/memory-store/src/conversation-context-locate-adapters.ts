@@ -81,6 +81,20 @@ export const defaultContextLocateAdapters: ConversationContextLocateAdapters = {
             return { rounds: [], partial: true, warnings: ["source size exceeds remaining locate budget; increase maxBytes or use a narrower source"] };
         }
         const cancelled = () => budget.isCancelled() || Date.now() >= budget.deadlineAt;
+        if (candidate.dataChain === "windsurf" && candidate.sourceKind?.startsWith("devin-") && budget.source !== "ls") {
+            const { readDevinConversation } = await import("./devin-conversation.js");
+            const loaded = await readDevinConversation(candidate.id, {
+                maxBytes: budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: cancelled,
+                link: "summary", materializeAttachments: false,
+            });
+            if (cancelled()) return { rounds: [], partial: true, warnings: ["Devin context scan was cancelled or exceeded its deadline"] };
+            if (!loaded) throw new Error("Devin conversation source is unavailable");
+            const firstRound = budget.probe ? Math.max(1, loaded.rounds.length - budget.maxRounds + 1) : 1;
+            const partial = firstRound > 1 || loaded.raw.partial;
+            return { rounds: loaded.rounds.filter(round => round.roundIndex >= firstRound), partial,
+                filePath: loaded.raw.summary.sourcePath, freshness: partial ? "unknown" : "fresh",
+                warnings: [...loaded.raw.warnings, ...(firstRound > 1 ? ["contextProbe searched a bounded recent-round window"] : [])] };
+        }
         const loaded = await loadConversationData(candidate.dataChain, candidate.id, {
             source: budget.source, includeRounds: false, link: "summary", isCancelled: cancelled,
             sourceReadBudget: { maxBytes: budget.maxBytes, deadlineMs: budget.deadlineAt, isCancelled: cancelled },

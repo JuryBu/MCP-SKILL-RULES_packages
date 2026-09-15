@@ -465,6 +465,26 @@ try {
             database.close();
         }
     });
+    await test("target reads charge lightweight identity plus selected bodies, not unrelated payloads", async () => {
+        const paths = configure("target-budget");
+        const database = cliDatabase(paths.cli);
+        try {
+            session(database, "target", 1);
+            node(database, "target", 1, null, user("target-message"));
+            session(database, "unrelated", 2);
+            node(database, "unrelated", 1, null, user("unrelated-message"));
+            node(database, "unrelated", 2, 1, { role: "assistant", content: "Z".repeat(2 * 1024 * 1024) });
+            desktopDatabase(paths.desktop, uuid(90), [desktopUser("target-message")]);
+            desktopDatabase(paths.desktop, uuid(91), [desktopUser("unrelated-message"), { kind: "agent_message", content: [{ content: { type: "text", text: "Y".repeat(2 * 1024 * 1024) } }] }], { unusedLargeMetadata: "X".repeat(1024 * 1024) });
+            const options = { maxBytes: 16 * 1024 };
+            assert.equal((await resolveDevinConversation(uuid(90), options))?.canonicalId, "target");
+            const result = await readDevinRawConversation(uuid(90), options);
+            assert.equal(result?.summary.canonicalId, "target");
+            assert.equal(result?.nodes.length, 1);
+            assert.equal(result?.partial, false);
+            await assert.rejects(readDevinRawConversation("unrelated", options), error => error instanceof DevinReadError && error.code === "DEVIN_BYTE_BUDGET");
+        } finally { database.close(); }
+    });
     console.log(`Devin SQLite tests: ${passed} groups passed; synthetic databases only.`);
 } finally {
     for (const [key, value] of Object.entries({ MEMORY_STORE_DEVIN_CLI_DB_PATH: oldEnvironment.cli, MEMORY_STORE_DEVIN_DESKTOP_ROOT: oldEnvironment.desktop, MEMORY_STORE_DATA_ROOT: oldEnvironment.data })) {

@@ -1800,6 +1800,7 @@ export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCod
     if (result.reason) lines.push(`⚠️ 原因: ${result.reason}`);
     if ("resolution" in result) {
         lines.push(`身份判断: ${result.resolution}；仅针对已列出的候选范围，不代表全库唯一，不自动选择 ID。`);
+        if (result.resolution === "single_match_in_partial_scan") lines.push("已找到一个匹配对话，不是多命中歧义；其它候选未完整检查，不能保证全范围唯一。");
         lines.push(...result.warnings.map(warning => `⚠️ ${warning}`));
     }
     if (result.hits.length > 0) {
@@ -2199,7 +2200,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             source === "local" ? "🔎 本地对话目录（PB / JSONL / Devin SQLite，按指定链路过滤）" : "🔎 多源候选查询",
                             `候选对话: ${result.candidates.length}${query ? ` | 关键词: ${query}` : ""}`,
                             result.partial ? "⚠️ partial：候选或正文扫描受预算/源可用性限制，单一命中也不代表全源唯一。" : "",
-                            result.contextLocate ? `contextProbe: ${result.contextLocate.status} / ${result.contextLocate.resolution}；不自动选择 ID。` : "",
+                            result.contextLocate ? `contextProbe: ${result.contextLocate.status} / ${result.contextLocate.resolution}；实际命中 ${result.contextLocate.matchedConversationCount ?? new Set(result.contextLocate.hits.map(hit => `${hit.dataChain}:${hit.conversationId}`)).size} 个对话身份。` : "",
+                            result.contextLocate?.resolution === "single_match_in_partial_scan" ? "已找到一个匹配对话，不是多命中歧义；其它候选未完整检查，不能保证全范围唯一。可使用下方命中ID明确读取。" : "",
                             ...(result.contextLocate?.warnings || []).map(warning => `⚠️ ${warning}`),
                             workspaces?.length ? `工作区过滤: ${workspaces.join(" | ")} (${workspaceMode}, ${workspaceScope})` : "",
                             threadMode ? `线程模式: ${threadMode}${parentConversationId ? ` | parent=${parentConversationId}` : ""}${parentQuery ? ` | parentQuery=${parentQuery}` : ""}` : "",

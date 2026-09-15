@@ -45,7 +45,10 @@ export interface ConversationContextLocateResult {
     truncated: boolean;
     reason?: string;
     warnings: string[];
-    resolution: "ambiguous" | "unique_in_scope" | "unverified" | "no_match";
+    resolution: "ambiguous" | "unique_in_scope" | "single_match_in_partial_scan" | "unverified" | "no_match";
+    matchedConversationCount?: number;
+    matchIdentityScope?: "provided_candidates" | "listed_threads";
+    candidateFailures?: Array<{ dataChain: ConversationSource; conversationId: string; error: string }>;
     scope: "provided_candidates";
 }
 
@@ -232,6 +235,7 @@ export async function locateConversationContext(candidates: UnifiedConversationC
     });
     const hits: ConversationContextHit[] = [];
     const warnings: string[] = [];
+    const candidateFailures: NonNullable<ConversationContextLocateResult["candidateFailures"]> = [];
     let scannedFiles = 0;
     let scannedBytes = 0;
     let totalBytes = 0;
@@ -259,7 +263,9 @@ export async function locateConversationContext(candidates: UnifiedConversationC
         } catch (error) {
             partial = true;
             if (options.isCancelled?.()) cancelled = true;
-            warnings.push(`${candidate.dataChain}:${candidate.id}: ${error instanceof Error ? error.message : String(error)}`);
+            const message = error instanceof Error ? error.message : String(error);
+            candidateFailures.push({ dataChain: candidate.dataChain, conversationId: candidate.id, error: message });
+            warnings.push(`${candidate.dataChain}:${candidate.id}: ${message}`);
         }
         scannedFiles++;
         options.onProgress?.({ current: scannedFiles, total: unique.length, scannedBytes, hits: hits.length, stage: "context_scan", detail: `${candidate.dataChain}:${candidate.id}` });
@@ -273,9 +279,14 @@ export async function locateConversationContext(candidates: UnifiedConversationC
         scannedFiles, totalFiles: unique.length, scannedBytes, totalBytes, hits, truncated: partial,
         reason: cancelled ? "cancelled" : partial ? "bounded_or_incomplete_source_scan" : undefined,
         warnings: [...new Set(warnings)].slice(0, 20),
-        resolution: identities.size > 1 ? "ambiguous" : partial ? "unverified" : identities.size === 1 ? "unique_in_scope" : "no_match",
+        resolution: contextLocateResolution(identities.size, partial),
+        matchedConversationCount: identities.size, matchIdentityScope: "provided_candidates", candidateFailures,
         scope: "provided_candidates",
     };
+}
+
+export function contextLocateResolution(matches: number, partial: boolean): ConversationContextLocateResult["resolution"] {
+    return matches > 1 ? "ambiguous" : matches === 1 ? partial ? "single_match_in_partial_scan" : "unique_in_scope" : partial ? "unverified" : "no_match";
 }
 
 export function annotateContextLocateCandidates(candidates: UnifiedConversationCandidate[], result: ConversationContextLocateResult): UnifiedConversationCandidate[] {

@@ -68,8 +68,9 @@ const StageGuardSchema = z.object({
         .describe("start 时可选：起始轮次（默认当前轮次）。可手动设为更早的轮次以覆盖已完成的工作"),
     appealNote: z.string().optional()
         .describe("check 时可选：AI 申诉说明（附加给 Flash 参考）"),
-    evidence: z.string().optional()
-        .describe("check 时可选：补录证据（如 Guard start 之前完成的修改，格式：文件名:行号 内容描述）"),
+    evidence: z.union([z.string(), z.array(z.string())]).optional()
+        .transform(value => Array.isArray(value) ? value.join("\n") : value)
+        .describe("check 时可选：补录证据，支持字符串或字符串数组；数组按换行合并，后台恢复保持相同文本（格式：文件名:行号 内容描述）"),
     evidenceFiles: z.array(z.string()).optional()
         .describe("check 时可选：外部证据文件路径列表。PDF/Word/Excel/EPUB/图片/视频会先生成纯文本证据索引，再进入 Guard 审查"),
     evidenceAssets: z.array(z.object({
@@ -1043,9 +1044,10 @@ async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
  * ⚠️ C3 块A：注册回调原本没有顶层 try/catch——任一 handler 抛异常会冒泡到 MCP
  * 协议层导致服务崩溃。这里补一层兜底，把异常转成结构化错误文本返回，绝不让它冒泡。
  */
-export async function runStageGuard(params: z.infer<typeof StageGuardSchema>): Promise<ReturnType<typeof text>> {
+export async function runStageGuard(input: Omit<z.infer<typeof StageGuardSchema>, "evidence"> & { evidence?: z.input<typeof StageGuardSchema>["evidence"] }): Promise<ReturnType<typeof text>> {
     touchActivity();
     try {
+        const params = { ...input, evidence: StageGuardSchema.shape.evidence.parse(input.evidence) };
         switch (params.action) {
             case "start":
                 return await handleStart(params);
@@ -1059,14 +1061,14 @@ export async function runStageGuard(params: z.infer<typeof StageGuardSchema>): P
                 return text(`❌ 未知 action: ${params.action}`);
         }
     } catch (err) {
-        return text(formatToolError(`stage_guard(${params.action})`, err, {
-            action: params.action,
-            conversationId: params.conversationId,
-            stageId: params.stageId,
-            chain: params.chain,
-            dataChain: params.dataChain,
-            modelChain: params.modelChain,
-            background: params.background,
+        return text(formatToolError(`stage_guard(${input.action})`, err, {
+            action: input.action,
+            conversationId: input.conversationId,
+            stageId: input.stageId,
+            chain: input.chain,
+            dataChain: input.dataChain,
+            modelChain: input.modelChain,
+            background: input.background,
         }));
     }
 }

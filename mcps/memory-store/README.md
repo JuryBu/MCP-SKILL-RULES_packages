@@ -1,4 +1,10 @@
-# MCP Memory Store v1.25.0
+# MCP Memory Store v1.25.1
+
+Devin 上下文定位先读取轻量身份信息，再读取目标主链与对应 Desktop 数据，不再为每个候选重复加载其它会话正文；定位过程不生成附件文件。默认读取预算未放宽，显式预算、取消及不完整扫描仍如实报告。
+
+`contextProbe` 的 `single_match_in_partial_scan` 表示只命中一个对话、但还有未完整检查的来源，不是多命中歧义，也不保证全范围唯一。`candidateFailures` 定位到失败候选；列表按请求的主/子对话范围计算匹配身份，默认主对话视图不会把父对话与其子代理重复判为两个候选。
+
+`stage_guard.evidence` 接受字符串或字符串数组，数组按行连接；Devin 子代理读取别名与列表一致，旧规范化缓存通过 `auto/local` 读取刷新，`source=cache` 保持离线只读旧代次。
 
 AI 主动记忆管理系统 + 五数据链路对话原文阅读器 + 附件懒解析 + Auto Summary + 黄金片段提取 + 对话记录 Record + Record Reader 读侧治理 + Stage Guard 任务完整性验证，基于 MCP 实现。
 

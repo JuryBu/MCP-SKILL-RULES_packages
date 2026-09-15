@@ -395,9 +395,9 @@ async function listLocalSourceCandidates(source: "antigravity" | "windsurf", lim
         detail: `${item.kinds.join("+")} / ${item.bytes} bytes / ${item.files} files`,
     }));
     if (source === "windsurf") {
-        const { listDevinConversations } = await import("./devin-sqlite.js");
+        const { listDevinConversations, listDevinConversationIdentities } = await import("./devin-sqlite.js");
         try {
-            candidates.push(...(await listDevinConversations({
+            candidates.push(...(await (options.contextProbe ? listDevinConversationIdentities : listDevinConversations)({
                 maxBytes: options.maxBytes || (options.contextProbe ? 16 * 1024 * 1024 : 128 * 1024 * 1024),
                 deadlineMs: Date.now() + (options.deadlineMs || 12_000),
                 isCancelled: options.isCancelled,
@@ -788,7 +788,7 @@ export async function listConversationCandidates(options: ListConversationCandid
     });
 
     if (options.contextProbe?.trim()) {
-        const { locateConversationContext, annotateContextLocateCandidates } = await import("./conversation-context-locate.js");
+        const { locateConversationContext, annotateContextLocateCandidates, contextLocateResolution } = await import("./conversation-context-locate.js");
         const contextLocate = await locateConversationContext(collected, options.contextProbe, {
             probe: true, source: options.source, maxFiles: options.candidateLimit || 50,
             maxBytes: options.maxBytes, maxHits: options.maxHits || Math.max(sourceLimit * 3, 20),
@@ -811,6 +811,10 @@ export async function listConversationCandidates(options: ListConversationCandid
                 if (status) status.warnings = [...(status.warnings || []), ...threadResult.warnings];
             }
         }
+        const matchCount = new Set(selected.map(item => `${item.dataChain}:${item.id}`)).size;
+        contextLocate.matchedConversationCount = matchCount;
+        contextLocate.matchIdentityScope = "listed_threads";
+        contextLocate.resolution = contextLocateResolution(matchCount, contextLocate.truncated);
         return { candidates: selected.slice(0, sourceLimit), statuses, partial: partial || contextLocate.truncated || selected.length > sourceLimit, contextLocate };
     }
     return { candidates: collected.slice(0, sourceLimit), statuses, partial: partial || collected.length > sourceLimit };

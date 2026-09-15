@@ -10,9 +10,10 @@ export { redactDevinBinary } from "./devin-conversation-content.js";
 
 export interface DevinConversationOptions extends DevinReadOptions {
     link?: ConversationLinkMode;
+    materializeAttachments?: boolean;
 }
 
-export const DEVIN_NORMALIZATION_VERSION = 1;
+export const DEVIN_NORMALIZATION_VERSION = 2;
 
 function originalTime(node: DevinMessageNode): string | undefined {
     const original = node.message.metadata?.created_at;
@@ -226,9 +227,11 @@ export async function readDevinConversation(id: string, options: DevinConversati
         if (!payload) return null;
         const messages = (payload.childMessages || []).map((message: any, position: number) => ({ position, kind: message.kind, payload: message }));
         const canonicalId = devinSubagentId(raw.summary.canonicalId, child.agentId);
-        raw = { ...raw, nodes: Array.isArray(payload.rawNodes) && payload.rawNodes.length ? payload.rawNodes : desktopNodes(messages, text(payload.task)), desktopMessages: messages.filter((message: DevinDesktopMessage) => message.kind === "subagent" || message.kind === "tool_call"), compactions: Array.isArray(payload.compactions) ? payload.compactions : [], partial: raw.partial || payload.partial === true, summary: { ...raw.summary, id: canonicalId, canonicalId, uuid: undefined, aliases: [canonicalId, id], isChildThread: true, parentConversationId: raw.summary.canonicalId, agentId: child.agentId, title: text(payload.title || child.agentId) } };
+        const aliases = [...new Set([canonicalId, ...raw.summary.aliases.map(alias => devinSubagentId(alias, child.agentId))])];
+        raw = { ...raw, nodes: Array.isArray(payload.rawNodes) && payload.rawNodes.length ? payload.rawNodes : desktopNodes(messages, text(payload.task)), desktopMessages: messages.filter((message: DevinDesktopMessage) => message.kind === "subagent" || message.kind === "tool_call"), compactions: Array.isArray(payload.compactions) ? payload.compactions : [], partial: raw.partial || payload.partial === true, summary: { ...raw.summary, id: canonicalId, canonicalId, uuid: undefined, aliases, isChildThread: true, parentConversationId: raw.summary.canonicalId, agentId: child.agentId, title: text(payload.title || child.agentId) } };
     }
     const converted = devinRawToRounds(raw, options);
+    if (options.materializeAttachments === false) return { raw, rounds: converted };
     attachDevinToolImages(raw, converted);
     const materialized = await materializeRoundAttachments(converted, raw.summary.canonicalId, { deadlineAt: options.deadlineMs, shouldAbort: () => Boolean(options.signal?.aborted || options.isCancelled?.()) });
     for (const round of materialized.rounds) {

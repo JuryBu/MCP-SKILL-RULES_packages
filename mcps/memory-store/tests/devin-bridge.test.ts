@@ -43,13 +43,19 @@ desktop.close();
 try {
     const { loadConversationData } = await import("../src/conversation-bridge.ts");
     const { listRecentWindsurfThreads, __setWindsurfEndpointResolverForTest } = await import("../src/windsurf-client.ts");
-    const { readDevinConversation } = await import("../src/devin-conversation.ts");
+    const { readDevinConversation, DEVIN_NORMALIZATION_VERSION } = await import("../src/devin-conversation.ts");
     __setWindsurfEndpointResolverForTest(async () => []);
     const list = await listRecentWindsurfThreads(20);
     assert.equal(list.length, 1, JSON.stringify(list.map(item => ({ id: item.id, sourceKind: item.sourceKind, partial: item.partial }))));
     assert.equal(list[0].id, identifier);
     assert.equal(list[0].uuid, alias);
     assert.equal(list[0].sourceKind, "devin-cli");
+    const pure = await readDevinConversation(identifier, { materializeAttachments: false });
+    const pureImage = pure?.rounds[0].attachments?.[0];
+    assert.ok(pureImage?.dataUrl?.includes(png));
+    assert.equal(pureImage.tempPath, undefined);
+    assert.equal(pureImage.exists, false);
+    assert.equal(fs.existsSync(pureImage.originalPath!), false);
     const fetched = await loadConversationData("windsurf", alias, { source: "local" });
     assert.ok(fetched);
     assert.equal(fetched.conversationId, identifier);
@@ -70,6 +76,35 @@ try {
     assert.equal(fetched.rounds[1].subagentSummaries[0].summary, "short child result");
     const child = await readDevinConversation(`${alias}--subagent-child-one`);
     assert.equal(child?.raw.summary.canonicalId, `${identifier}--subagent-child-one`);
+    const childAliases = [`${identifier}--subagent-child-one`, `${alias}--subagent-child-one`];
+    assert.deepEqual(child?.raw.summary.aliases, childAliases);
+    const canonicalChild = await readDevinConversation(childAliases[0]);
+    assert.deepEqual(canonicalChild?.raw.summary.aliases, childAliases);
+    const { discoverDevinChildCandidates } = await import("../src/devin-child-discovery.ts");
+    const listedChildren = await discoverDevinChildCandidates([{ id: identifier, aliases: [identifier, alias], dataChain: "windsurf", sourceKind: "devin-cli", title: "Synthetic source", workspace: root, updatedAt: "" }], {});
+    assert.deepEqual(listedChildren.candidates[0]?.aliases, childAliases);
+    const childFetched = await loadConversationData("windsurf", childAliases[0], { source: "local" });
+    assert.ok(childFetched?.windsurfData && childFetched.cacheKey && childFetched.cacheGeneration);
+    assert.equal(childFetched.windsurfData.normalizationVersion, DEVIN_NORMALIZATION_VERSION);
+    assert.equal(DEVIN_NORMALIZATION_VERSION, 2);
+    const cache = await import("../src/conversation-source-cache.ts");
+    const previousChildCache = cache.readCachedConversationSourceCache<any>({ key: childFetched.cacheKey });
+    assert.ok(previousChildCache);
+    const oldChildSnapshot = structuredClone(previousChildCache.snapshot);
+    oldChildSnapshot.windsurfData.normalizationVersion = 1;
+    oldChildSnapshot.windsurfData.thread.aliases = [childAliases[0], childAliases[0]];
+    const legacyChildCache = await cache.readOrBuildConversationSourceCache({
+        key: childFetched.cacheKey, fingerprint: previousChildCache.fingerprint, refresh: true,
+        build: () => ({ snapshot: oldChildSnapshot, rounds: childFetched.rounds }),
+    });
+    const offlineOldChild = await loadConversationData("windsurf", childAliases[0], { source: "cache" });
+    assert.equal(offlineOldChild?.cacheGeneration, legacyChildCache.generation);
+    assert.equal(offlineOldChild?.windsurfData?.normalizationVersion, 1);
+    assert.deepEqual(offlineOldChild?.windsurfData?.thread.aliases, [childAliases[0], childAliases[0]]);
+    const refreshedChild = await loadConversationData("windsurf", childAliases[0], { source: "local" });
+    assert.notEqual(refreshedChild?.cacheGeneration, legacyChildCache.generation);
+    assert.equal(refreshedChild?.windsurfData?.normalizationVersion, DEVIN_NORMALIZATION_VERSION);
+    assert.deepEqual(refreshedChild?.windsurfData?.thread.aliases, childAliases);
     assert.match(child?.rounds[0].aiResponses[0].response || "", /Full child transcript marker/u);
     await assert.rejects(() => loadConversationData("windsurf", alias, { source: "ls" }), /没有 Cascade LS|不支持 source=ls/u);
     database.prepare("UPDATE tool_call_state SET tool_call_update_json=?").run(JSON.stringify({ status: "completed", content: [{ type: "text", text: "Updated in place" }] }));
@@ -85,6 +120,7 @@ try {
     newerDesktop.close();
     const parentNew = await loadConversationData("windsurf", identifier, { source: "local", link: "expand_children" });
     const childNew = await readDevinConversation(`${secondAlias}--subagent-child-one`);
+    assert.deepEqual(childNew?.raw.summary.aliases, [...childAliases, `${secondAlias}--subagent-child-one`]);
     assert.match(parentNew?.rounds[1].subagentSummaries[0].summary || "", /NEW_CHILD_BODY/u);
     assert.match(childNew?.rounds[0].aiResponses[0].response || "", /NEW_CHILD_BODY/u);
     assert.equal(parentNew?.rounds.flatMap(round => round.subagentSummaries).length, 1);
@@ -106,7 +142,7 @@ try {
     const offlineAlias = await loadConversationData("windsurf", alias, { source: "cache" });
     assert.equal(offlineAlias?.conversationId, identifier);
     assert.equal(offlineAlias?.cacheGeneration, changed?.cacheGeneration);
-    console.log("PASS Devin bridge: aliases/generation, live readonly fetch, stale-path image materialization, revision, child expansion/IDs/version selection, CLI child authority, Desktop-ahead partial, LS rejection and offline cache aliases");
+    console.log("PASS Devin bridge: aliases/generation, pure read skips attachment materialization while default fetch preserves images, revision, child expansion/IDs/version selection, child list/read aliases and v1 cache refresh, CLI child authority, Desktop-ahead partial, LS rejection and offline cache aliases");
 } finally {
     database.close();
     for (const key of ["MEMORY_STORE_DATA_ROOT", "MEMORY_STORE_AUTO_RECORD", "MEMORY_STORE_DEVIN_CLI_DB_PATH", "MEMORY_STORE_DEVIN_DESKTOP_ROOT", "MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH"]) {

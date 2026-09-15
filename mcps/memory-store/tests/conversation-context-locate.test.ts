@@ -62,14 +62,25 @@ try {
 
     const bounded = await locateConversationContext(fixtureCandidates, marker, { adapters: syntheticReaders, maxFiles: 1 });
     assert.equal(bounded.hits.length, 1);
-    assert.equal(bounded.resolution, "unverified");
+    assert.equal(bounded.resolution, "single_match_in_partial_scan");
     assert.equal(bounded.status, "partial_found_scanning");
     const byteBounded = await locateConversationContext([candidate("windsurf")], marker, { adapters: syntheticReaders, maxBytes: 2 });
     assert.equal(byteBounded.hits.length, 0);
     assert.equal(byteBounded.scannedBytes, 0);
     assert.equal(byteBounded.truncated, true);
     const hitBounded = await locateConversationContext(fixtureCandidates, marker, { adapters: syntheticReaders, maxHits: 1 });
-    assert.equal(hitBounded.resolution, "unverified");
+    assert.equal(hitBounded.resolution, "single_match_in_partial_scan");
+    const oneMatchAndFailure = await locateConversationContext([candidate("windsurf", "match"), candidate("windsurf", "unread")], marker, {
+        adapters: { readRounds: async item => {
+            if (item.id === "unread") throw new Error("PB and LS conflict");
+            return { rounds: [round(marker), round(marker, 2)] };
+        } },
+    });
+    assert.equal(oneMatchAndFailure.matchedConversationCount, 1);
+    assert.equal(oneMatchAndFailure.resolution, "single_match_in_partial_scan");
+    assert.equal(oneMatchAndFailure.hits.length, 2);
+    assert.deepEqual(oneMatchAndFailure.candidateFailures, [{ dataChain: "windsurf", conversationId: "unread", error: "PB and LS conflict" }]);
+    assert.equal(oneMatchAndFailure.truncated, true);
     const stopped = await locateConversationContext(fixtureCandidates, marker, { adapters: syntheticReaders, isCancelled: () => true });
     assert.equal(stopped.status, "cancelled");
     assert.equal(stopped.scannedFiles, 0);
@@ -120,7 +131,7 @@ try {
     const aliasQuery = await listConversationCandidates({ dataChains: ["wsf"], query: "gentle-falcon", adapters });
     assert.equal(aliasQuery.candidates[0].uuid, fixtureCandidates[3].uuid);
     const failed = await listConversationCandidates({ dataChains: ["wsf", "dsh"], contextProbe: marker, adapters: { ...adapters, dsh: { list: () => { throw new Error("offline"); }, get: () => null } }, contextAdapters: syntheticReaders });
-    assert.equal(failed.contextLocate?.resolution, "unverified");
+    assert.equal(failed.contextLocate?.resolution, "single_match_in_partial_scan");
 
     const parent = { ...fixtureCandidates[3], id: "parent", aliases: ["parent-alias"] };
     const child = { ...fixtureCandidates[3], id: "child", aliases: [], isChildThread: true, parentConversationId: "parent" };
@@ -132,6 +143,14 @@ try {
     const promoted = await listConversationCandidates({ dataChains: ["wsf"], source: "local", contextProbe: marker, adapters: childAdapters, contextAdapters: childReader });
     assert.equal(promoted.candidates[0].id, "parent");
     assert.match(promoted.candidates[0].contextProbe![0], /child-hit:child/u);
+    const familyReader: ConversationContextLocateAdapters = { readRounds: async item => ({ rounds: [round(item.id === "sibling" ? "unrelated" : marker)] }) };
+    const family = await listConversationCandidates({ dataChains: ["wsf"], source: "local", contextProbe: marker, adapters: childAdapters, contextAdapters: familyReader });
+    assert.equal(family.contextLocate?.matchedConversationCount, 1);
+    assert.equal(family.contextLocate?.resolution, "unique_in_scope");
+    assert.equal(family.contextLocate?.matchIdentityScope, "listed_threads");
+    const allFamily = await listConversationCandidates({ dataChains: ["wsf"], source: "local", contextProbe: marker, threadMode: "all", adapters: childAdapters, contextAdapters: familyReader });
+    assert.equal(allFamily.contextLocate?.matchedConversationCount, 2);
+    assert.equal(allFamily.contextLocate?.resolution, "ambiguous");
 
     const codexPath = path.join(temporary, "codex.jsonl");
     const claudePath = path.join(temporary, "claude.jsonl");
@@ -161,7 +180,7 @@ try {
     assert.deepEqual(listedOptions.workspaces, [workspace]);
     assert.equal(listedOptions.source, "local");
     assert.equal(deep.hits.length, 1, "DSH explicit missing ID should not expand to unrelated sessions");
-    assert.equal(deep.resolution, "unverified");
+    assert.equal(deep.resolution, "single_match_in_partial_scan");
     assert.ok(deep.warnings.some(warning => warning.includes("dsh-main")));
     assert.ok(getBackgroundTaskRecoveryHandler("conversation-deep-locate"));
 

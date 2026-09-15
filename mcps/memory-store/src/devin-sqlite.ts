@@ -74,21 +74,27 @@ function desktopMessageIds(messages: DevinDesktopMessage[]): Set<string> {
     return result;
 }
 
-async function readDesktop(filename: string, budget: ReadBudget): Promise<DesktopConversation> {
+async function readDesktop(filename: string, budget: ReadBudget, identityOnly = false): Promise<DesktopConversation> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         if (!["position", "kind", "payload"].every(column => columns(database, "messages").has(column)) ||
             !["key", "value"].every(column => columns(database, "meta").has(column))) {
             throw new DevinReadError("DEVIN_SCHEMA_UNSUPPORTED", "The Devin Desktop database does not have the supported meta/messages schema.");
         }
         const metadata: Record<string, string> = {};
-        for (const row of database.prepare("SELECT key, value FROM meta ORDER BY key").iterate()) {
+        const metadataValue = identityOnly ? `CASE WHEN key='info' AND json_valid(value) THEN json_object('title', json_extract(value,'$.title'), 'cwd',json_extract(value,'$.cwd'), 'workingDirectory',json_extract(value,'$.workingDirectory'), 'workspaceUris',json_extract(value,'$.workspaceUris'), 'hidden',json_extract(value,'$.hidden'), 'truncated',json_extract(value,'$.truncated')) ELSE value END` : "value";
+        for (const row of database.prepare(`SELECT key, ${metadataValue} AS value FROM meta ${identityOnly ? "WHERE key IN ('info','message_count','hidden','truncated')" : ""} ORDER BY key`).iterate()) {
             await budget.take(Buffer.byteLength(String(row.value)));
             metadata[String(row.key)] = String(row.value);
         }
         const info = jsonObject(metadata.info);
         const messages: DevinDesktopMessage[] = [];
-        const statement = database.prepare(`SELECT position, kind, length(CAST(payload AS BLOB)) AS bytes,
-            CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload END AS payload FROM messages ORDER BY position`);
+        const payloadExpression = identityOnly
+            ? `CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload)='object' THEN json_object('content', json((SELECT json_group_array(json_object('_meta', json_object('cognition.ai/clientMessageId', json_extract(block.value, '$._meta."cognition.ai/clientMessageId"'), 'cognition.ai/timestamp', json_extract(block.value, '$._meta."cognition.ai/timestamp"'))))
+                FROM json_each(messages.payload, '$.content') AS block WHERE block.type='object'))) ELSE payload END ELSE payload END`
+            : "payload";
+        const statement = database.prepare(`WITH selected AS (SELECT position, kind, ${payloadExpression} AS payload FROM messages)
+            SELECT position, kind, length(CAST(payload AS BLOB)) AS bytes,
+            CASE WHEN length(CAST(payload AS BLOB)) <= ? THEN payload END AS payload FROM selected ORDER BY position`);
         for (const row of statement.iterate(budget.remainingBytes)) {
             await budget.take(Number(row.bytes));
             messages.push({ position: Number(row.position), kind: String(row.kind), payload: jsonObject(row.payload, true), sourcePath: filename });
@@ -116,10 +122,10 @@ async function readDesktop(filename: string, budget: ReadBudget): Promise<Deskto
     });
 }
 
-async function readCatalog(budget: ReadBudget): Promise<CatalogEntry[]> {
+async function readCatalog(budget: ReadBudget, identityOnly = false): Promise<CatalogEntry[]> {
     const paths = devinPaths();
     const filenames = desktopFiles(paths.desktop, budget.maxDesktopFiles, () => budget.check());
-    const cli = isFile(paths.cli) ? await readCliConversations(paths.cli, budget) : [];
+    const cli = isFile(paths.cli) ? await readCliConversations(paths.cli, budget, { identityOnly }) : [];
     const results: CatalogEntry[] = cli.map(item => ({ summary: item.summary, cli: item, desktops: [], excludedFromList: item.hidden || item.empty }));
     const entryById = new Map(results.map(entry => [entry.summary.canonicalId, entry]));
     const incompleteIdentityScan = cli.some(conversation => !conversation.empty && conversation.summary.partial && conversation.nodes.length === 0);
@@ -133,7 +139,7 @@ async function readCatalog(budget: ReadBudget): Promise<CatalogEntry[]> {
     }
     for (const filename of filenames) {
         budget.check();
-        const desktop = await readDesktop(filename, budget);
+        const desktop = await readDesktop(filename, budget, identityOnly);
         if (desktop.hidden || desktop.empty) {
             results.push({ summary: desktop.summary, desktops: [desktop], excludedFromList: true });
             continue;
@@ -165,7 +171,7 @@ async function readCatalog(budget: ReadBudget): Promise<CatalogEntry[]> {
         }
     }
     for (const entry of results) {
-        if (!entry.cli) continue;
+        if (!entry.cli || identityOnly) continue;
         const coverage = subagentCoverage(entry);
         if (coverage.unresolved) {
             entry.summary = { ...entry.summary, partial: true,
@@ -220,15 +226,48 @@ export async function listDevinConversations(options: DevinReadOptions = {}): Pr
     return (await readCatalog(new ReadBudget(options))).filter(entry => !entry.excludedFromList).map(entry => entry.summary);
 }
 
+export async function listDevinConversationIdentities(options: DevinReadOptions = {}): Promise<DevinConversationSummary[]> {
+    return (await readCatalog(new ReadBudget(options), true)).filter(entry => !entry.excludedFromList).map(entry => entry.summary);
+}
+
 export async function resolveDevinConversation(id: string, options: DevinReadOptions = {}): Promise<DevinConversationSummary | null> {
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
-    return findEntry(await readCatalog(new ReadBudget(options)), id)?.summary ?? null;
+    const budget = new ReadBudget(options);
+    const entry = findEntry(await readCatalog(budget, true), id);
+    return entry?.summary ?? null;
 }
 
 export async function readDevinRawConversation(id: string, options: DevinReadOptions = {}): Promise<DevinRawConversation | null> {
     if (!id.trim()) throw new DevinReadError("DEVIN_INVALID_ID", "A non-empty Devin conversation ID is required.");
     const budget = new ReadBudget(options);
-    const entry = findEntry(await readCatalog(budget), id);
+    const entry = findEntry(await readCatalog(budget, true), id);
+    if (entry) {
+        const sameIds = (left: Set<string>, right: Set<string>) => left.size === right.size && [...left].every(value => right.has(value));
+        if (entry.cli) {
+            const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId }))[0];
+            if (!loaded || !sameIds(entry.cli.messageIds, loaded.messageIds)) {
+                throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin identity changed during source reading; retry with a fresh snapshot.");
+            }
+            entry.cli = loaded;
+            entry.summary.partial ||= loaded.summary.partial;
+            entry.summary.warnings = [...new Set([...entry.summary.warnings, ...loaded.summary.warnings])];
+        }
+        for (const [index, desktop] of entry.desktops.entries()) {
+            const loaded = await readDesktop(desktop.summary.sourcePath, budget);
+            if (!sameIds(desktop.messageIds, loaded.messageIds)) {
+                throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin Desktop identity changed during source reading; retry with a fresh snapshot.");
+            }
+            entry.desktops[index] = loaded;
+            entry.summary.partial ||= loaded.summary.warnings.some(warning => warning !== "DEVIN_DESKTOP_ONLY_PARTIAL");
+            entry.summary.warnings = [...new Set([...entry.summary.warnings, ...loaded.summary.warnings.filter(warning => warning !== "DEVIN_DESKTOP_ONLY_PARTIAL")])];
+        }
+        const coverage = subagentCoverage(entry);
+        if (coverage.unresolved) {
+            entry.summary.partial = true;
+            entry.summary.warnings = [...new Set([...entry.summary.warnings, "DEVIN_SUBAGENT_TRANSCRIPT_UNRESOLVED",
+                ...(coverage.ambiguous ? ["DEVIN_SUBAGENT_TRANSCRIPT_AMBIGUOUS"] : [])])];
+        }
+    }
     const result = entry ? toRaw(entry) : null;
     budget.check();
     return result;
