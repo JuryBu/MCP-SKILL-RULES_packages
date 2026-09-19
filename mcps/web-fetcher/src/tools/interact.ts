@@ -12,6 +12,7 @@ import { inlineImageContent } from "../image-output.js";
 import * as fs from "fs";
 
 const InteractInputSchema = z.object({
+    waitForEvents: z.boolean().optional().describe("click 时是否等待并收集下载/新窗口，默认 true（最长约 8 秒探测）；已知普通控件无此副作用时传 false 快速返回，不自动收集稍后发生的下载/弹窗，也不等待页面业务更新"),
     viewport: viewportSchema.optional(),
     fullPage: z.boolean().optional().describe("screenshot/snapshot 截取整个滚动页面，默认 false；不改变 CSS viewport；frame 截图仍限于指定 iframe 元素"),
     saveMode: z.enum(["inline", "file"]).optional().describe("截图/快照输出：inline 默认直接返回图片与文本；file 显式返回临时文件路径"),
@@ -112,6 +113,7 @@ export function registerInteract(server: McpServer): void {
                 scrollCount: InteractInputSchema.shape.scrollCount,
                 timeout: InteractInputSchema.shape.timeout,
                 frame: InteractInputSchema.shape.frame,
+                waitForEvents: InteractInputSchema.shape.waitForEvents,
             },
             annotations: {
                 readOnlyHint: false,
@@ -234,7 +236,7 @@ export function registerInteract(server: McpServer): void {
                         let popupUrl: string | null = null;
                         let popupSessionId: string | null = null;
 
-                        const downloadPromise = page.waitForEvent('download', { timeout: 8000 })
+                        const downloadPromise = params.waitForEvents === false ? Promise.resolve() : page.waitForEvent('download', { timeout: 8000 })
                             .then(async (dl) => {
                                 const { DOWNLOADS_DIR } = await import('../constants.js');
                                 const fs = await import('fs');
@@ -246,7 +248,7 @@ export function registerInteract(server: McpServer): void {
                             })
                             .catch(() => { });
 
-                        const popupPromise = page.waitForEvent('popup', { timeout: 5000 })
+                        const popupPromise = params.waitForEvents === false ? Promise.resolve() : page.waitForEvent('popup', { timeout: 5000 })
                             .then(async (popup) => {
                                 await popup.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
                                 popupUrl = popup.url();
@@ -263,10 +265,11 @@ export function registerInteract(server: McpServer): void {
                             await page.click(params.selector);
                         }
                         await Promise.all([downloadPromise, popupPromise]);
-                        await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => { });
+                        if (params.waitForEvents !== false) await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => { });
 
                         // 构建响应
                         let resultText = `✅ 已点击 "${params.selector}"\n当前 URL: ${page.url()}\nSessionId: ${sessionId}`;
+                        if (params.waitForEvents === false) resultText += "\n快速点击：未等待或收集异步下载/新窗口；后续内容更新请显式 wait。";
                         if (downloadFile) resultText += `\n📥 文件已下载: ${downloadFile}`;
                         if (popupUrl) resultText += `\n🔗 新窗口已打开: ${popupUrl}`;
                         if (popupSessionId) resultText += `\n🆕 可用 sessionId="${popupSessionId}" 继续操作新窗口`;

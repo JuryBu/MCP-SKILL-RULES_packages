@@ -13,6 +13,7 @@ import * as fs from "fs";
 
 // 单步 action schema
 const PipelineStepSchema = z.object({
+    waitForEvents: z.boolean().optional().describe("click 默认等待并收集下载/新窗口（最长约 8 秒探测）；确认普通控件无此副作用时传 false 快速返回，不自动收集延迟下载/弹窗；需要内容更新时追加 wait 步骤"),
     action: z.enum([
         "screenshot", "scroll", "content", "visible",
         "snapshot", "click", "type", "wait", "links", "find", "evaluate",
@@ -413,7 +414,7 @@ export function registerPipeline(server: McpServer): void {
                                 let popupUrl: string | null = null;
                                 let popupSid: string | null = null;
 
-                                const dlPromise = page.waitForEvent('download', { timeout: 8000 })
+                                const dlPromise = step.waitForEvents === false ? Promise.resolve() : page.waitForEvent('download', { timeout: 8000 })
                                     .then(async (dl) => {
                                         const { DOWNLOADS_DIR } = await import('../constants.js');
                                         const fs = await import('fs');
@@ -424,7 +425,7 @@ export function registerPipeline(server: McpServer): void {
                                     })
                                     .catch(() => { });
 
-                                const popPromise = page.waitForEvent('popup', { timeout: 5000 })
+                                const popPromise = step.waitForEvents === false ? Promise.resolve() : page.waitForEvent('popup', { timeout: 5000 })
                                     .then(async (popup) => {
                                         await popup.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
                                         popupUrl = popup.url();
@@ -436,6 +437,7 @@ export function registerPipeline(server: McpServer): void {
                                 await Promise.all([dlPromise, popPromise]);
 
                                 let clickText = `${stepLabel} 🖱️ 已点击 "${step.selector}"`;
+                                if (step.waitForEvents === false) clickText += "\n快速点击：未等待或收集异步下载/新窗口；需要更新内容时追加 wait 步骤。";
                                 if (downloadFile) clickText += `\n📥 文件已下载: ${downloadFile}`;
                                 if (popupUrl) clickText += `\n🔗 新窗口: ${popupUrl}`;
                                 if (popupSid) clickText += `\n🆕 sessionId="${popupSid}" 可继续操作`;

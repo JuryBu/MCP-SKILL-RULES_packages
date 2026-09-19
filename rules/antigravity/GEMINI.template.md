@@ -297,7 +297,7 @@ smart_search 提供三种搜索模式，按需选择：
   · Human Browser：web_human_browser_open/attach/status/list_pages/register_page/detach/close 是用户辅助验证旁路。它可打开或附着真实 Chrome，让用户手动处理人机验证、登录检测、异常弹窗，再把页面注册成 web_interact/web_pipeline 可复用的 sessionId；默认不影响旧 URL 主链路
 - 响应式检查与资源限制（web-fetcher 7.2+）：
   · 网页抓取/截图/交互/pipeline/inspect 可显式传 viewport={width,height}（例如390×844、1366×768）；省略保留默认或已有尺寸。viewport改布局，fullPage改覆盖范围，scale/quality改输出，不模拟手机UA/触摸，不用于Office/PDF。
-  · 不盲目缩短慢图片、字体、懒加载等待；partial/未检查frame/扫描预算不是完整成功，必要时用waitFor等待具体业务元素。
+  · 不盲目缩短慢图片、字体、懒加载等待；partial/未检查frame/扫描预算不是完整成功，必要时用waitFor等待具体业务元素。确定无下载/新窗口的普通click可显式waitForEvents=false（pipeline步骤内设置），省略保留旧事件收集；异步内容仍需显式等待。
   · Windows页面池默认目标8，真实内存和旧显式配置仍限制接纳；非Windows保守5。复用sessionId、显式ownerId，资源不足看原因并清理自己不用的会话，不并发重发或跨owner清理。
   · web_inspect的candidate是几何候选，confirmed仅确认覆盖等测量事实，不证明设计错误；结合图片与limitations/detectionTruncated/截图缺口复核，零issue不是全页验收。
 - 图文交付与人工登录（web-fetcher 7.1+）：

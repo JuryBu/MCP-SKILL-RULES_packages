@@ -39,7 +39,7 @@ dataChain=windsurf 读 WSF 对话——memory-store ≥1.25 起旧 Windsurf Casc
 ### 响应式检查与资源限制（web-fetcher 7.2+）
 
 - 前端多尺寸测试可在网页抓取、截图、交互、pipeline、inspect 中显式传 `viewport={width,height}`，例如 390×844 或 1366×768；省略时保留默认或已有 session 尺寸。`viewport` 改布局，`fullPage` 改截图覆盖范围，`scale/quality` 改输出，不模拟手机 UA/触摸，也不用于 Office/PDF。
-- 视觉就绪检查保留慢图片、字体与懒加载等待；`partial`、未检查 frame 或扫描预算提示不是完整成功，必要时使用目标元素的 `waitFor`，不要为了快而接受空白封面。
+- 视觉就绪检查保留慢图片、字体与懒加载等待；`partial`、未检查 frame 或扫描预算提示不是完整成功，必要时使用目标元素的 `waitFor`，不要为了快而接受空白封面。已确认无下载/新窗口的普通 click 可显式 `waitForEvents=false`（pipeline 在步骤内设置），省略保留旧事件收集；异步内容仍需显式等待。
 - Windows 页面池默认目标 8，仍受真实内存水位和旧显式配置约束；非 Windows 保守上限 5。持续复用 `sessionId`、显式带 `ownerId`，遇到接纳阻断先看原因并清理自己不用的会话，不并发重发、跨 owner 清理或无条件调高上限。
 - `web_inspect` 的 `candidate` 是几何候选；`confirmed` 只确认覆盖等测量事实，不代表设计必然错误。结合附图复核背景/装饰/内容，检查 `limitations`、`detectionTruncated` 与截图缺口，零 issue 不是全页已验收。
 
