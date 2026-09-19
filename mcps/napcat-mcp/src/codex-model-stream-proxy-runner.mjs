@@ -5,6 +5,8 @@ import process from "node:process";
 import crypto from "node:crypto";
 import { createCodexModelStreamProxy } from "./codex-model-stream-proxy.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { parseToolDeliveryProfile } from "./tool-delivery-profile.mjs";
+import { createAdaptiveDeliveryRegistry } from "./adaptive-delivery.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
   const value = Number(process.env[name] ?? fallback);
@@ -31,7 +33,18 @@ const runtimePath = path.join(stateRoot, "codex-model-stream-proxy-runtime.json"
 const logPath = path.join(stateRoot, "codex-model-stream-proxy.jsonl");
 const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
 const lockPath = path.join(stateRoot, "codex-model-stream-proxy.lock.json");
+const deliveryProfilePath = path.join(stateRoot, "codex-model-stream-delivery-profiles.json");
+const adaptiveStatePath = path.join(stateRoot, "codex-model-adaptive-delivery.json");
 fs.mkdirSync(stateRoot, { recursive: true });
+
+function readToolDeliveryProfile() {
+  if (!fs.existsSync(deliveryProfilePath)) {
+    return { schemaVersion: 1, bufferedToolIdentityHashes: [] };
+  }
+  return parseToolDeliveryProfile(fs.readFileSync(deliveryProfilePath, "utf8"));
+}
+
+const deliveryProfile = readToolDeliveryProfile();
 
 const operationalLog = createBoundedJsonlWriter({ filePath: logPath });
 const anomalyLog = createBoundedJsonlWriter({
@@ -40,14 +53,23 @@ const anomalyLog = createBoundedJsonlWriter({
 const ANOMALY_EVENT_TYPES = new Set([
   "attempt_progress_timeout",
   "native_retry_signal",
+  "local_tool_phase_retry_signal",
+  "local_tool_phase_timeout",
   "retry_exhausted_completed_idle",
   "usage_limit_completed_idle",
   "permanent_failure_completed_idle",
+  "safety_policy_completed_idle",
+  "safety_policy_terminal_failure",
   "compaction_retry_signal",
   "guarded_request_error",
   "guarded_error_retry_signal",
   "guarded_error_completed_idle",
   "passthrough_error",
+  "adaptive_delivery_probe_started",
+  "adaptive_delivery_mode_changed",
+  "adaptive_late_streaming_success",
+  "adaptive_wait_stopped",
+  "adaptive_delivery_state_write_failed",
 ]);
 
 function appendRunnerEvent(event) {
@@ -74,6 +96,16 @@ let stopWatcher = null;
 let consecutiveRuntimeWriteFailures = 0;
 const heartbeatIntervalMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_HEARTBEAT_INTERVAL_MS", 5_000, 100, 60_000);
 const drainTimeoutMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_DRAIN_TIMEOUT_MS", 45_000, 100, 120_000);
+function readAdaptiveState() {
+  if (!fs.existsSync(adaptiveStatePath)) return undefined;
+  try {
+    if (fs.statSync(adaptiveStatePath).size > 128 * 1024) throw new Error("State exceeds size limit");
+    return createAdaptiveDeliveryRegistry({ state: JSON.parse(fs.readFileSync(adaptiveStatePath, "utf8")) }).snapshot();
+  } catch {
+    appendRunnerEvent({ type: "adaptive_delivery_state_ignored", reason: "invalid_or_expired_state" });
+    return undefined;
+  }
+}
 const proxy = createCodexModelStreamProxy({
   instanceToken,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
@@ -81,9 +113,15 @@ const proxy = createCodexModelStreamProxy({
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
   firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 40_000, 1_000, 300_000),
   progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 40_000, 1_000, 300_000),
+  adaptiveWaitLimitMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_ADAPTIVE_WAIT_LIMIT_MS", 300_000, 1_000, 300_000),
+  upstreamIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_UPSTREAM_IDLE_TIMEOUT_MS", 90_000, 1_000, 300_000),
+  adaptiveDeliveryState: readAdaptiveState(),
+  onAdaptiveDeliveryStateChange(state) { writeJsonAtomic(adaptiveStatePath, state); },
   compactionAttemptTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS", 600_000, 10_000, 600_000),
   maxConsecutiveAttempts: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS", 6, 1, 20),
   maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 64 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
+  bufferedToolIdentityHashes: deliveryProfile.bufferedToolIdentityHashes,
+  bufferedToolPreparationGraceMs: 300_000,
   onEvent(event) {
     appendRunnerEvent(event);
   },
@@ -115,9 +153,16 @@ function runtimeState(status = "running", error = null) {
     endpoint: `http://${proxy.status().host}:${proxy.status().port}`,
     upstreamOrigin: proxy.status().upstreamOrigin,
     firstProgressTimeoutMs: proxy.status().firstProgressTimeoutMs,
+    toolPreparationGraceMs: proxy.status().toolPreparationGraceMs,
+    bufferedToolPreparationGraceMs: proxy.status().bufferedToolPreparationGraceMs,
+    bufferedToolProfileCount: proxy.status().bufferedToolProfileCount,
     progressIdleTimeoutMs: proxy.status().progressIdleTimeoutMs,
+    adaptiveWaitLimitMs: proxy.status().adaptiveWaitLimitMs,
+    upstreamIdleTimeoutMs: proxy.status().upstreamIdleTimeoutMs,
+    adaptiveDelivery: proxy.status().adaptiveDelivery,
     compactionAttemptTimeoutMs: proxy.status().compactionAttemptTimeoutMs,
     maxConsecutiveAttempts: proxy.status().maxConsecutiveAttempts,
+    maxLocalToolAttempts: proxy.status().maxLocalToolAttempts,
     retryDelaysMs: proxy.status().retryDelaysMs,
     heartbeatIntervalMs,
     drainTimeoutMs,

@@ -5,6 +5,11 @@ import { StringDecoder } from "node:string_decoder";
 import zlib from "node:zlib";
 import { correlationQuality, hashIdentity } from "./observability-utils.mjs";
 import { createStreamRecovery, waitForRetry } from "./codex-stream-recovery.mjs";
+import { createToolPreparationDeadline, classifyContextHint } from "./tool-preparation-deadline.mjs";
+import { createReasoningProgressTracker } from "./reasoning-progress.mjs";
+import { partialResponsesSseProgress } from "./partial-response-progress.mjs";
+import { parseToolDeliveryProfile, toolIdentityHash } from "./tool-delivery-profile.mjs";
+import { createAdaptiveDeliveryRegistry, deliveryProfileKey } from "./adaptive-delivery.mjs";
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
@@ -12,13 +17,16 @@ const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONSECUTIVE_ATTEMPTS = 6;
+const MAX_LOCAL_TOOL_ATTEMPTS = 3;
 const DEFAULT_RETRY_DELAYS_MS = [0, 0, 0, 0, 0];
 const DEFAULT_ATTEMPT_STATE_TTL_MS = 30 * 60_000;
 const DEFAULT_UPSTREAM_ORIGIN = "https://chatgpt.com";
 const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
-const IMPLEMENTATION_VERSION = "2026-09-06.1";
+const IMPLEMENTATION_VERSION = "2026-09-19.4";
+const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
+const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
 const CAPACITY_EXHAUSTED_NOTICE = "\n\n当前模型暂时满载，已自动尝试六次仍未恢复，请稍后重试或切换模型。";
 const USAGE_LIMIT_NOTICE = "\n\n当前账号额度已耗尽，请等待额度恢复、购买额外额度或切换账号。";
@@ -263,19 +271,21 @@ function eventHasSubstantiveWork(event) {
 function responseFailureDetails(event) {
   const source = event?.response?.error ?? event?.error ?? event;
   const incompleteReason = typeof event?.response?.incomplete_details?.reason === "string" ? event.response.incomplete_details.reason : "";
-  const rawCode = typeof source?.code === "string" ? source.code : typeof source?.type === "string" ? source.type : incompleteReason;
+  const rawCode = typeof source?.code === "string" ? source.code : incompleteReason || (typeof source?.type === "string" ? source.type : "");
   const rawMessage = typeof source?.message === "string" ? source.message : incompleteReason;
   const code = rawCode.trim().toLowerCase();
   const message = rawMessage.replace(/[\r\n]+/gu, " ").trim();
+  const safetyPolicy = SAFETY_POLICY_CODES.has(code);
   const usageLimit = USAGE_LIMIT_CODES.has(code)
     || /you(?:'|’)ve hit your usage limit|codex\/settings\/usage|purchase more credits|quota exceeded/iu.test(message);
   const capacity = CAPACITY_CODES.has(code) || /selected model is at capacity|server overloaded/iu.test(message);
   const permanent = !usageLimit && !capacity
-    && (EXPLICIT_PERMANENT_CODE.test(code) || EXPLICIT_PERMANENT_MESSAGE.test(message));
+    && (safetyPolicy || EXPLICIT_PERMANENT_CODE.test(code) || EXPLICIT_PERMANENT_MESSAGE.test(message));
   const transient = !usageLimit && !capacity && !permanent;
   return {
     code: code || null,
     message: message.slice(0, 512) || null,
+    safetyPolicy,
     category: usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
   };
 }
@@ -299,7 +309,10 @@ function createSseFrameParser(onFrame, options = {}) {
   const decoder = new StringDecoder("utf8");
   const maximumPendingBytes = options.maximumPendingBytes ?? DEFAULT_MAX_BUFFERED_RESPONSE_BYTES;
   const onError = typeof options.onError === "function" ? options.onError : () => {};
+  const classifyPartialProgress = typeof options.classifyPartialProgress === "function" ? options.classifyPartialProgress : () => null;
+  const onPartialProgress = typeof options.onPartialProgress === "function" ? options.onPartialProgress : () => {};
   let pending = "";
+  let pendingPartialProgress = null;
   let failed = false;
   const fail = (error) => {
     if (failed) return;
@@ -328,6 +341,7 @@ function createSseFrameParser(onFrame, options = {}) {
       const frame = pending.slice(0, match.index);
       const wire = `${frame}${match[0]}`;
       pending = pending.slice(match.index + match[0].length);
+      pendingPartialProgress = null;
       deliver(wire, frame);
       if (failed) return;
     }
@@ -335,6 +349,35 @@ function createSseFrameParser(onFrame, options = {}) {
       const frame = pending;
       pending = "";
       deliver(frame, frame);
+    }
+  };
+  const observePartialProgress = () => {
+    if (failed || !pending) {
+      pendingPartialProgress = null;
+      return;
+    }
+    let progress;
+    try {
+      progress = classifyPartialProgress(pending);
+    } catch (error) {
+      fail(Object.assign(error instanceof Error ? error : new Error("SSE partial-progress callback failed"), {
+        code: error?.code ?? "SSE_PARTIAL_PROGRESS_ERROR",
+      }));
+      return;
+    }
+    if (!progress || typeof progress.key !== "string" || !Number.isFinite(progress.bytes)) {
+      pendingPartialProgress = null;
+      return;
+    }
+    const previous = pendingPartialProgress;
+    pendingPartialProgress = progress;
+    if (previous?.key === progress.key && previous.bytes >= progress.bytes) return;
+    try {
+      onPartialProgress(progress);
+    } catch (error) {
+      fail(Object.assign(error instanceof Error ? error : new Error("SSE partial-progress callback failed"), {
+        code: error?.code ?? "SSE_PARTIAL_PROGRESS_ERROR",
+      }));
     }
   };
   return {
@@ -346,6 +389,7 @@ function createSseFrameParser(onFrame, options = {}) {
         return;
       }
       drain(false);
+      observePartialProgress();
     },
     end() {
       if (failed) return;
@@ -505,6 +549,15 @@ function executeTurnAttempt(options) {
     firstProgressTimeoutMs,
     progressIdleTimeoutMs,
     compactionAttemptTimeoutMs,
+    toolPreparationGraceMs,
+    bufferedToolIdentityHashes,
+    bufferedToolPreparationGraceMs,
+    contextHint,
+    adaptiveRegistry,
+    adaptiveKey,
+    adaptiveWaitLimitMs,
+    upstreamIdleTimeoutMs,
+    adaptiveStreamMinSpanMs,
     maxBufferedResponseBytes,
     onEvent,
     requestState,
@@ -512,12 +565,15 @@ function executeTurnAttempt(options) {
   return new Promise((resolve) => {
     const client = requestClient(targetUrl);
     const startedAt = Date.now();
+    const adaptive = adaptiveRegistry?.begin({ key: adaptiveKey, startedAt, firstProgressTimeoutMs,
+      waitLimitMs: adaptiveWaitLimitMs, upstreamIdleTimeoutMs, streamMinSpanMs: adaptiveStreamMinSpanMs, onEvent });
     let upstreamResponse = null;
     let settled = false;
     let timer = null;
     let sawCompleted = false;
     let sawContent = false;
     let sawTool = false;
+    let sawLocalTool = false;
     let sawSubstantiveWork = false;
     let sawExecutableToolDone = false;
     let sawCompaction = false;
@@ -528,6 +584,7 @@ function executeTurnAttempt(options) {
     let heldAfterTool = [];
     let heldBytes = 0;
     let holdingToolDone = false;
+    let deliveredExecutableToolDone = false;
     let upstreamHeaders = {};
     let frames = 0;
     let sawResponsesProtocol = false;
@@ -540,24 +597,67 @@ function executeTurnAttempt(options) {
     let lastFrameType = null;
     let lastProgressType = null;
     let lastToolType = null;
+    let currentChunkAt = null;
+    const preparation = createToolPreparationDeadline(toolPreparationGraceMs, { bufferedToolIdentityHashes, bufferedToolPreparationGraceMs });
+    const observeReasoningProgress = createReasoningProgressTracker();
+    const completedReasoningIds = new Set();
+    let normalDeadline = startedAt + firstProgressTimeoutMs;
+    let normalReason = "FIRST_PROGRESS_TIMEOUT";
 
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (outcome.kind === "completed") adaptive?.complete(Date.now(), !sawCompaction);
       requestState.currentAbort = null;
-      resolve({ ...outcome, elapsedMs: Date.now() - startedAt, frames, sawContent, sawSubstantiveWork, sawExecutableToolDone, sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
+      const phase = holdingToolDone ? "tool_completion_barrier" : sawLocalTool ? "tool_parameters"
+        : contextHint?.contextPreparationHint === true ? "context_preparation_hint" : sawSubstantiveWork ? "ordinary_generation" : "unknown";
+      const endCause = outcome.origin ?? (outcome.reason === "DOWNSTREAM_CANCELLED" ? "downstream_cancel_user_origin_unknown"
+        : /^HTTP_/u.test(outcome.reason ?? "") ? "upstream_http"
+        : terminalFailure ? "upstream_error" : outcome.kind === "completed" ? "upstream_completed" : "unknown");
+      resolve({ ...outcome, phase, endCause, contextPreparationHint: contextHint?.contextPreparationHint ?? null, elapsedMs: Date.now() - startedAt, frames, sawContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
     };
     const abortWith = (reason) => {
       upstreamResponse?.destroy();
       upstream.destroy(Object.assign(new Error(reason), { code: reason }));
-      finish({ kind: "retryable_failure", reason, upstreamHeaders });
+      const category = reason === "TOOL_PREPARATION_TIMEOUT" ? "tool_preparation"
+        : reason === "TOOL_COMPLETION_TIMEOUT" ? "tool_completion" : null;
+      finish({ kind: reason.startsWith("ADAPTIVE_") ? "adaptive_wait_timeout" : category ? "local_phase_timeout" : "retryable_failure", reason, origin: /TIMEOUT$/u.test(reason) ? "local_timer" : "local_limit",
+        ...(category || /TIMEOUT$/u.test(reason) ? { failure: { category: category ?? "local_timer" } } : {}), upstreamHeaders });
     };
-    const armTimer = (timeoutMs, reason) => {
+    const adaptiveDeadlineExpired = () => {
+      if (settled || requestState.cancelled) return true;
+      if (sawCompaction || !adaptive?.active()) return false;
+      const deadline = adaptive.deadline(normalDeadline, normalReason);
+      if (Date.now() < deadline.at) return false;
+      abortWith(deadline.reason);
+      return true;
+    };
+    const armTimer = (timeoutMs, reason, preserveNormalDeadline = false) => {
       clearTimeout(timer);
+      if (!sawCompaction) {
+        if (!preserveNormalDeadline) {
+          normalDeadline = Date.now() + timeoutMs;
+          normalReason = reason;
+        }
+        timeoutMs = Math.max(0, preparation.deadline(normalDeadline) - Date.now());
+        if (preparation.active()) reason = "TOOL_PREPARATION_TIMEOUT";
+        else if (holdingToolDone && toolItemTypes.has("function_call")) reason = "TOOL_COMPLETION_TIMEOUT";
+        if (adaptive?.active()) {
+          const phaseDeadline = preparation.active() || holdingToolDone ? { at: Date.now() + timeoutMs, reason } : null;
+          const deadline = adaptive.deadline(normalDeadline, normalReason, phaseDeadline);
+          timeoutMs = Math.max(0, deadline.at - Date.now());
+          reason = deadline.reason;
+        }
+      }
       timer = setTimeout(() => {
         if (settled || requestState.cancelled) return;
         const now = Date.now();
+        if (!sawCompaction && !preparation.active() && !holdingToolDone
+          && ["FIRST_PROGRESS_TIMEOUT", "PROGRESS_IDLE_TIMEOUT"].includes(reason) && adaptive?.tryProbe(now)) {
+          armTimer(0, normalReason, true);
+          return;
+        }
         onEvent({
           type: "attempt_progress_timeout",
           reason,
@@ -582,10 +682,14 @@ function executeTurnAttempt(options) {
       timer.unref?.();
     };
     const writeWire = (wire) => {
+      if (adaptiveDeadlineExpired()) return false;
       ensureSseHead(downstream, upstreamHeaders);
       downstream.write(wire);
       requestState.downstreamFrames += 1;
-      requestState.recovery.markDelivered(parseSseFrame(wire).event);
+      const deliveredEvent = parseSseFrame(wire).event;
+      if (isExecutableToolDone(deliveredEvent)) deliveredExecutableToolDone = true;
+      requestState.recovery.markDelivered(deliveredEvent);
+      return true;
     };
     const holdToolWire = (wire) => {
       heldBytes += Buffer.byteLength(wire, "utf8");
@@ -597,17 +701,20 @@ function executeTurnAttempt(options) {
       return true;
     };
     const flushHeldAfterTool = () => {
-      for (const wire of heldAfterTool) writeWire(wire);
+      if (adaptiveDeadlineExpired()) return false;
+      for (const wire of heldAfterTool) if (!writeWire(wire)) return false;
       heldAfterTool = [];
       heldBytes = 0;
       holdingToolDone = false;
+      return true;
     };
     const completeFromUpstream = (wire) => {
+      if (adaptiveDeadlineExpired()) return;
       if (holdingToolDone) {
         if (!holdToolWire(wire)) return;
-        flushHeldAfterTool();
+        if (!flushHeldAfterTool()) return;
       } else {
-        writeWire(wire);
+        if (!writeWire(wire)) return;
       }
       if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
       finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
@@ -644,6 +751,7 @@ function executeTurnAttempt(options) {
           const responseBody = await collectResponseBody(response, Math.min(maxBufferedResponseBytes, 1024 * 1024));
           if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
           const failure = responseFailureDetailsFromBody(responseBody);
+          if (failure.safetyPolicy) return finish({ kind: "permanent_failure", reason: failure.code, failure, upstreamHeaders });
           if (failure.category === "usage_limit") return finish({ kind: "usage_limit", reason: `HTTP_${statusCode}`, failure, upstreamHeaders });
           if (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient") {
             return finish({ kind: "retryable_failure", reason: `HTTP_${statusCode}`, failure, upstreamHeaders });
@@ -656,7 +764,7 @@ function executeTurnAttempt(options) {
 
       ensureSseHead(downstream, upstreamHeaders);
       const parser = createSseFrameParser((wire, frame) => {
-        if (settled || requestState.cancelled) return;
+        if (adaptiveDeadlineExpired()) return;
         frames += 1;
         const parsed = parseSseFrame(frame);
         const event = parsed.event;
@@ -665,21 +773,33 @@ function executeTurnAttempt(options) {
         firstFrameAt ??= now;
         lastFrameAt = now;
         lastFrameType = type ?? (parsed.doneMarker ? "[DONE]" : null);
+        adaptive?.observe(event, currentChunkAt ?? now);
         if (isResponsesProtocolType(type ?? "")) sawResponsesProtocol = true;
         requestState.recovery.observe(event);
         const contextControlFunction = event?.item?.type === "function_call" && CONTEXT_CONTROL_FUNCTION_NAMES.has(event.item.name);
+        const preparationWasActive = preparation.active();
+        preparation.observe(event, now);
+        if (!sawCompaction && (preparationWasActive || preparation.active())) {
+          armTimer(Math.max(0, normalDeadline - now), normalReason, true);
+        }
         if (COMPACTION_CONTROL_TYPES.has(event?.item?.type) && !sawCompaction) {
           sawCompaction = true;
           onEvent({ type: "compaction_control_passthrough", itemType: event.item.type, functionName: null, timeoutMs: compactionAttemptTimeoutMs });
           armTimer(compactionAttemptTimeoutMs, "COMPACTION_CONTROL_TIMEOUT");
         }
-        if (!sawCompaction && eventPayloadHasContent(event)) {
+        const finalizedFunctionArguments = type === "response.function_call_arguments.done"
+          && typeof event.arguments === "string" && event.arguments.length > 0;
+        const completedReasoningProgress = observeReasoningProgress(event);
+        if (completedReasoningProgress) completedReasoningIds.add(event.item.id);
+        if (!sawCompaction && (eventPayloadHasContent(event) || finalizedFunctionArguments || completedReasoningProgress)) {
           sawContent = true;
           lastProgressAt = now;
           lastProgressType = type ?? null;
           armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         }
         if (eventHasSubstantiveWork(event)) sawSubstantiveWork = true;
+        if (["function_call", "custom_tool_call", "local_shell_call"].includes(event?.item?.type)
+          || /^response\.(?:function_call_arguments|custom_tool_call_input|local_shell_call)\./u.test(type ?? "")) sawLocalTool = true;
         if (isToolEvent(event)) {
           sawTool = true;
           lastToolType = type ?? null;
@@ -687,7 +807,7 @@ function executeTurnAttempt(options) {
             const functionName = String(event.item.name).replace(/[^a-zA-Z0-9_.:-]/gu, "_").slice(0,96);
             if (!toolNames.has(functionName)) {
               toolNames.add(functionName);
-              onEvent({ type: "tool_call_observed", itemType: event.item.type, functionName, eventType: type, argumentBytes: typeof event.item.arguments === "string" ? Buffer.byteLength(event.item.arguments, "utf8") : null, contextControlFunction });
+              onEvent({ type: "tool_call_observed", itemType: event.item.type, functionName, toolIdentityHash: toolIdentityHash(event.item), eventType: type, argumentBytes: typeof event.item.arguments === "string" ? Buffer.byteLength(event.item.arguments, "utf8") : null, contextControlFunction });
             }
           }
           if (event.item?.type) {
@@ -721,6 +841,8 @@ function executeTurnAttempt(options) {
           return;
         }
 
+        if (adaptive?.active()) armTimer(0, normalReason, true);
+
         if (isIndependentKeepalive(event)) {
           writeWire(holdingToolDone ? sseFrame({ type: "proxy.keepalive" }) : wire);
           return;
@@ -732,12 +854,27 @@ function executeTurnAttempt(options) {
         if (isExecutableToolDone(event)) {
           sawExecutableToolDone = true;
           holdingToolDone = true;
+          armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
           holdToolWire(wire);
           return;
         }
         writeWire(wire);
       }, {
         maximumPendingBytes: maxBufferedResponseBytes,
+        classifyPartialProgress: frame => partialResponsesSseProgress(frame, completedReasoningIds),
+        onPartialProgress: progress => {
+            if (settled || requestState.cancelled || sawCompaction) return;
+            if (adaptiveDeadlineExpired()) return;
+            const now = Date.now();
+            adaptive?.notePartialProgress(now);
+            if (progress.argumentsProgress) {
+              preparation.observe({ type: "response.function_call_arguments.delta", delta: "fragment" }, now);
+            }
+            sawContent = true;
+            lastProgressAt = now;
+            lastProgressType = progress.type;
+            armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
+        },
         onError: (error) => {
           if (settled || requestState.cancelled) return;
           finish({ kind: "retryable_failure", reason: error.code ?? "SSE_PARSE_ERROR", upstreamHeaders });
@@ -746,6 +883,7 @@ function executeTurnAttempt(options) {
         },
       });
       response.on("data", (chunk) => {
+        currentChunkAt = Date.now();
         if (!advertisedResponsesSse && frames === 0 && rawBodyBeforeProtocolBytes <= 1024 * 1024) {
           rawBodyBeforeProtocol.push(chunk);
           rawBodyBeforeProtocolBytes += chunk.length;
@@ -757,7 +895,7 @@ function executeTurnAttempt(options) {
         if (settled) return;
         if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
         if (sawCompleted) {
-          flushHeldAfterTool();
+          if (!flushHeldAfterTool()) return;
           if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
           return finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
         }
@@ -786,12 +924,12 @@ function executeTurnAttempt(options) {
       });
       response.once("error", (error) => {
         if (settled || requestState.cancelled) return;
-        finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", upstreamHeaders });
+        finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
       });
     });
     upstream.once("error", (error) => {
       if (settled || requestState.cancelled) return;
-      finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", upstreamHeaders });
+      finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
     });
     upstream.end(body);
   });
@@ -852,7 +990,7 @@ function executeBufferedCompactionAttempt(options) {
         const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
         if (statusCode < 200 || statusCode >= 300) {
           const failure = responseFailureDetailsFromBody(responseBody);
-          const retryable = retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient";
+          const retryable = !failure.safetyPolicy && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
           return finish({
             kind: retryable ? "retryable_failure" : "permanent_failure",
             reason: `HTTP_${statusCode}`,
@@ -868,7 +1006,7 @@ function executeBufferedCompactionAttempt(options) {
             return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
           }
           const failure = responseFailureDetailsFromBody(responseBody);
-          const retryable = retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient";
+          const retryable = !failure.safetyPolicy && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
           return finish({
             kind: retryable ? "retryable_failure" : "permanent_failure",
             reason: failure.code ?? "HTTP_200_NON_SSE",
@@ -914,6 +1052,16 @@ export function createCodexModelStreamProxy(options = {}) {
   }
   const firstProgressTimeoutMs = integerOption(options.firstProgressTimeoutMs, DEFAULT_FIRST_PROGRESS_TIMEOUT_MS, 10, 300_000, "firstProgressTimeoutMs");
   const progressIdleTimeoutMs = integerOption(options.progressIdleTimeoutMs, DEFAULT_PROGRESS_IDLE_TIMEOUT_MS, 10, 300_000, "progressIdleTimeoutMs");
+  const adaptiveWaitLimitMs = integerOption(options.adaptiveWaitLimitMs, 300_000, 10, 300_000, "adaptiveWaitLimitMs");
+  const upstreamIdleTimeoutMs = integerOption(options.upstreamIdleTimeoutMs, 90_000, 10, 300_000, "upstreamIdleTimeoutMs");
+  const adaptiveProbeCooldownMs = integerOption(options.adaptiveProbeCooldownMs, 600_000, 10, 86_400_000, "adaptiveProbeCooldownMs");
+  const adaptiveStreamMinSpanMs = integerOption(options.adaptiveStreamMinSpanMs, 1500, 1, 10_000, "adaptiveStreamMinSpanMs");
+  const adaptiveRegistry = createAdaptiveDeliveryRegistry({ state: options.adaptiveDeliveryState,
+    probeCooldownMs: adaptiveProbeCooldownMs, onChange: options.onAdaptiveDeliveryStateChange,
+    onPersistenceError: () => onEvent({ type: "adaptive_delivery_state_write_failed" }) });
+  const toolPreparationGraceMs = integerOption(options.toolPreparationGraceMs, 120_000, 10, 300_000, "toolPreparationGraceMs");
+  const bufferedToolPreparationGraceMs = integerOption(options.bufferedToolPreparationGraceMs, 300_000, 10, 300_000, "bufferedToolPreparationGraceMs");
+  const bufferedToolIdentityHashes = parseToolDeliveryProfile({ schemaVersion: 1, bufferedToolIdentityHashes: options.bufferedToolIdentityHashes ?? [] }).bufferedToolIdentityHashes;
   const compactionAttemptTimeoutMs = integerOption(options.compactionAttemptTimeoutMs, DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS, 10_000, 600_000, "compactionAttemptTimeoutMs");
   const maxBufferedRequestBytes = integerOption(options.maxBufferedRequestBytes, DEFAULT_MAX_BUFFERED_REQUEST_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedRequestBytes");
   const maxBufferedResponseBytes = integerOption(options.maxBufferedResponseBytes, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedResponseBytes");
@@ -937,6 +1085,7 @@ export function createCodexModelStreamProxy(options = {}) {
   const attempts = new Map();
   const emptyIdleTurns = new Map();
   const businessProgress = new Map();
+  const waitTerminals = new Map();
   const sockets = new Set();
   let draining = false;
   const counters = {
@@ -958,6 +1107,7 @@ export function createCodexModelStreamProxy(options = {}) {
     for (const [key, state] of attempts) if (state.updatedAt < cutoff) attempts.delete(key);
     for (const [key, state] of emptyIdleTurns) if (state.updatedAt < cutoff) emptyIdleTurns.delete(key);
     for (const [key, state] of businessProgress) if (state.updatedAt < cutoff) businessProgress.delete(key);
+    for (const [key, state] of waitTerminals) if (state.updatedAt < cutoff) waitTerminals.delete(key);
   };
   const recordBusinessProgress = (identity) => {
     const key = attemptKey(identity);
@@ -1003,8 +1153,15 @@ export function createCodexModelStreamProxy(options = {}) {
         attemptChains: attempts.size,
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
+        adaptiveWaitLimitMs,
+        upstreamIdleTimeoutMs,
+        adaptiveDelivery: adaptiveRegistry.summary(),
+        toolPreparationGraceMs,
+        bufferedToolPreparationGraceMs,
+        bufferedToolProfileCount: bufferedToolIdentityHashes.length,
         compactionAttemptTimeoutMs,
         maxConsecutiveAttempts,
+        maxLocalToolAttempts: Math.min(MAX_LOCAL_TOOL_ATTEMPTS, maxConsecutiveAttempts),
         retryDelaysMs: [...retryDelaysMs],
         maxBufferedRequestBytes,
         maxBufferedResponseBytes,
@@ -1048,7 +1205,7 @@ export function createCodexModelStreamProxy(options = {}) {
     });
     const key = attemptKey(identity);
     const finishSoftTerminal = (notice, eventType, details = {}, headers = {}) => {
-      const canCountEmptyIdle = identity.requestKind === "turn" && Boolean(key);
+      const canCountEmptyIdle = identity.requestKind === "turn" && Boolean(key) && details.category !== "safety_policy";
       const emptyIdleCount = canCountEmptyIdle && !hasBusinessProgress(identity)
         ? recordEmptyIdleTurn(identity)
         : 0;
@@ -1108,6 +1265,12 @@ export function createCodexModelStreamProxy(options = {}) {
         return;
       }
       counters.guarded += 1;
+      const contextHint = classifyContextHint(payload);
+      if (key && waitTerminals.has(key)) {
+        finishSoftTerminal(waitTerminals.get(key).notice, "adaptive_wait_terminal_replayed", { reason: waitTerminals.get(key).reason });
+        return;
+      }
+      emit({ type: "request_phase_observed", ...contextHint });
       const transport = identity.requestKind === "compaction"
         ? compactionTransport(targetUrl, payload, request.headers)
         : "sampling_sse";
@@ -1135,6 +1298,14 @@ export function createCodexModelStreamProxy(options = {}) {
         });
         emit({ type: "compaction_attempt_finished", internalAttempt: 1, kind: outcome.kind, reason: outcome.reason ?? null });
         if (requestState.cancelled || outcome?.kind === "cancelled") return;
+        if (outcome.failure?.safetyPolicy) {
+          if (key) attempts.delete(key);
+          response.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          response.end(JSON.stringify({ error: { type: "safety_policy", code: outcome.failure.code, message: SAFETY_POLICY_NOTICE } }));
+          counters.failed += 1;
+          emit({ type: "safety_policy_terminal_failure", category: "safety_policy", code: outcome.failure.code });
+          return;
+        }
         const preserveUpstreamError = outcome?.kind === "permanent_failure"
           || outcome?.failure?.category === "usage_limit";
         if (outcome?.kind === "completed" || preserveUpstreamError) {
@@ -1179,6 +1350,15 @@ export function createCodexModelStreamProxy(options = {}) {
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
+        toolPreparationGraceMs,
+        bufferedToolIdentityHashes,
+        bufferedToolPreparationGraceMs,
+        contextHint,
+        adaptiveRegistry,
+        adaptiveKey: identity.requestKind === "turn" ? deliveryProfileKey(request.headers, payload, upstreamOrigin.origin) : null,
+        adaptiveWaitLimitMs,
+        upstreamIdleTimeoutMs,
+        adaptiveStreamMinSpanMs,
         finalAttempt,
         maxBufferedResponseBytes,
         onEvent: emit,
@@ -1188,6 +1368,9 @@ export function createCodexModelStreamProxy(options = {}) {
         type: "turn_attempt_finished",
         attemptNumber,
         kind: outcome.kind,
+        phase: outcome.phase,
+        endCause: outcome.endCause,
+        contextPreparationHint: outcome.contextPreparationHint,
         reason: outcome.reason,
         elapsedMs: outcome.elapsedMs,
         frames: outcome.frames,
@@ -1211,6 +1394,58 @@ export function createCodexModelStreamProxy(options = {}) {
         return;
       }
       if (outcome.sawSubstantiveWork) recordBusinessProgress(identity);
+      if (outcome.kind === "adaptive_wait_timeout") {
+        if (key) attempts.delete(key);
+        const notice = outcome.reason === "ADAPTIVE_WAIT_LIMIT"
+          ? `\n\n本次模型请求已达到${Math.ceil(adaptiveWaitLimitMs / 1000)}秒等待上限，已停止，未自动重试。`
+          : "\n\n上游连接长时间未发送任何有效事件，本次等待已停止，未自动重试。";
+        if (key) waitTerminals.set(key, { notice, reason: outcome.reason, updatedAt: Date.now() });
+        finishSoftTerminal(notice, "adaptive_wait_stopped", { reason: outcome.reason, category: "wait_budget" }, outcome.upstreamHeaders);
+        return;
+      }
+      if (outcome.failure?.safetyPolicy) {
+        if (key) attempts.delete(key);
+        const details = { category: "safety_policy", code: outcome.failure.code, reason: outcome.reason };
+        if (identity.requestKind === "compaction" || outcome.sawCompaction) {
+          ensureSseHead(response, outcome.upstreamHeaders ?? {});
+          response.end(requestState.recovery.fail(outcome.failure.code, SAFETY_POLICY_NOTICE));
+          counters.failed += 1;
+          emit({ type: "safety_policy_terminal_failure", ...details });
+        } else {
+          finishSoftTerminal(`\n\n${SAFETY_POLICY_NOTICE}`, "safety_policy_completed_idle", details, outcome.upstreamHeaders);
+        }
+        return;
+      }
+      if (outcome.kind === "local_phase_timeout") {
+        const onlyLocalFunctions = outcome.toolItemTypes.length > 0
+          && outcome.toolItemTypes.every(type => type === "function_call")
+          && !outcome.sawHostedTool && !outcome.sawCompaction;
+        const preparationNotDelivered = outcome.failure.category === "tool_preparation"
+          && outcome.preparationPending && !outcome.sawExecutableToolDone;
+        const heldContextCompletion = outcome.failure.category === "tool_completion"
+          && outcome.holdingToolDone && outcome.toolNames.length > 0
+          && outcome.toolNames.every(name => CONTEXT_CONTROL_FUNCTION_NAMES.has(name));
+        const safeLocalRetry = onlyLocalFunctions && !outcome.sawSubstantiveWork
+          && !outcome.deliveredExecutableToolDone && (preparationNotDelivered || heldContextCompletion);
+        const localAttemptLimit = Math.min(MAX_LOCAL_TOOL_ATTEMPTS, maxConsecutiveAttempts);
+        if (safeLocalRetry && key && attemptNumber < localAttemptLimit) {
+          attempts.set(key, { failures: attemptNumber, startedAt: chainStartedAt, updatedAt: Date.now() });
+          ensureSseHead(response, outcome.upstreamHeaders ?? {});
+          response.end();
+          counters.retrySignals += 1;
+          emit({ type: "local_tool_phase_retry_signal", reason: outcome.reason, category: outcome.failure.category,
+            attemptNumber, maxAttempts: localAttemptLimit, retrySafety: preparationNotDelivered ? "arguments_not_delivered" : "context_completion_held" });
+          return;
+        }
+        if (key) attempts.delete(key);
+        const notice = safeLocalRetry && key
+          ? "\n\n本地工具阶段等待超时，已达到有限自动重试上限，请继续。"
+          : "\n\n本地工具准备或完成确认等待超时，本轮未自动重试，请继续。";
+        finishSoftTerminal(notice, "local_tool_phase_timeout", {
+          category: outcome.failure.category, reason: outcome.reason, safeLocalRetry, attemptNumber, maxAttempts: localAttemptLimit,
+        }, outcome.upstreamHeaders);
+        return;
+      }
       if (identity.requestKind === "compaction" || outcome.sawCompaction) {
         const terminalCompactionFailure = !key || finalAttempt
           || outcome.kind === "permanent_failure"
@@ -1392,11 +1627,18 @@ export function createCodexModelStreamProxy(options = {}) {
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
+        adaptiveWaitLimitMs,
+        upstreamIdleTimeoutMs,
+        adaptiveDelivery: adaptiveRegistry.summary(),
         maxConsecutiveAttempts,
+        maxLocalToolAttempts: Math.min(MAX_LOCAL_TOOL_ATTEMPTS, maxConsecutiveAttempts),
         retryDelaysMs: [...retryDelaysMs],
         maxBufferedRequestBytes,
         maxBufferedResponseBytes,
         counters: { ...counters },
+        toolPreparationGraceMs,
+        bufferedToolPreparationGraceMs,
+        bufferedToolProfileCount: bufferedToolIdentityHashes.length,
       };
     },
     server,

@@ -470,6 +470,11 @@ test("backend-only hot reload protects loaded proxy code but allows next-start l
   assert.match(compatibilityBlock, /\$LoadedProxyPaths/);
   assert.match(compatibilityBlock, /\$NextStartProxyPaths/);
   assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\codex-stream-recovery\.mjs"[\s\S]*?\)/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\adaptive-delivery\.mjs"[\s\S]*?\)/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\tool-preparation-deadline\.mjs"[\s\S]*?\)/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\partial-response-progress\.mjs"[\s\S]*?\)/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\tool-delivery-profile\.mjs"[\s\S]*?\)/);
+  assert.match(compatibilityBlock, /\$NextStartProxyPaths = @\([\s\S]*?"src\\reasoning-progress\.mjs"[\s\S]*?\)/);
   assert.match(compatibilityBlock, /next-start proxy file is missing/);
   assert.match(compatibilityBlock, /if \(-not \(Test-Path -LiteralPath \$PreviousPath\)\) \{ continue \}/);
   assert.match(compatibilityBlock, /next-start proxy file changed/);
