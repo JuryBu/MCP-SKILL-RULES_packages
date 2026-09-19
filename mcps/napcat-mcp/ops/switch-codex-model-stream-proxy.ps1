@@ -68,7 +68,7 @@ $ProviderBlock = @(
   'wire_api = "responses"',
   'requires_openai_auth = true',
   'supports_websockets = false',
-  'stream_max_retries = 0',
+  'stream_max_retries = 5',
   'stream_idle_timeout_ms = 150000'
 ) -join $NewLine
 $UpdatedText = ($Top.TrimEnd("`r", "`n") + $NewLine + $Rest.TrimStart("`r", "`n")).TrimEnd("`r", "`n") + $NewLine + $NewLine + $ProviderBlock + $NewLine
