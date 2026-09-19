@@ -3,6 +3,7 @@ import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
+import { createWakeVisibilityAdapter } from "./wake-visibility.mjs";
 import { createTurnLifecycleObserver } from "./turn-observability.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -405,6 +406,7 @@ export class CodexAppServerProxy {
     this.WebSocketImpl = options.WebSocketImpl ?? WebSocket;
     this.WebSocketServerImpl = options.WebSocketServerImpl ?? WebSocketServer;
     this.journal = options.journal ?? null;
+    this.wakeVisibility = createWakeVisibilityAdapter();
     this.maintenanceFilePath = options.maintenanceFilePath
       ? path.resolve(String(options.maintenanceFilePath))
       : null;
@@ -501,6 +503,7 @@ export class CodexAppServerProxy {
       writerEpoch: this.writerEpoch,
       maintenance: this.#maintenanceStatus(),
       journal: this.journal?.status?.() ?? null,
+      wakeVisibility: this.wakeVisibility.snapshot(),
       lastError: this.lastError,
       lastIncident: this.lastIncident,
       limits: {
@@ -623,6 +626,7 @@ export class CodexAppServerProxy {
     }
 
     let mutationAttempted = false;
+    let visibilityRegistration = null;
     try {
       const maintenance = this.#maintenanceStatus();
       if (maintenance.active) {
@@ -671,6 +675,12 @@ export class CodexAppServerProxy {
           : {}),
       };
       mutationAttempted = true;
+      visibilityRegistration = this.wakeVisibility.registerWake({
+        threadId,
+        wakeId,
+        prompt,
+        messageVisibility,
+      });
       const result = await this.#injectRequest(
         primary,
         method,
@@ -712,6 +722,7 @@ export class CodexAppServerProxy {
       };
     } catch (error) {
       const outcomeUnknown = Boolean(error?.outcomeUnknown);
+      if (!outcomeUnknown) this.wakeVisibility.forgetWake(visibilityRegistration);
       try {
         this.journal.writeWake(wakeId, {
           status: outcomeUnknown ? "unknown" : "failed_before_send",
@@ -729,6 +740,7 @@ export class CodexAppServerProxy {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
     for (const client of [...this.clients]) this.#closeClient(client, "proxy_closed");
+    this.wakeVisibility.close();
     await Promise.all([
       this.#closeServer(this.websocketServer),
       this.#closeServer(this.controlServer),
@@ -790,6 +802,7 @@ export class CodexAppServerProxy {
       nextReconnectAt: null,
       downstreamAlive: true,
       upstreamAlive: false,
+      wakeVisibility: this.wakeVisibility.createView(),
       turnObserver: this.createTurnObserver({
         timeoutMs: this.turnFirstOutputTimeoutMs,
         onAnomaly: (event) => this.onEvent(event),
@@ -880,6 +893,7 @@ export class CodexAppServerProxy {
         }
         return;
       }
+      if (client.wakeVisibility.shouldSuppress(message)) return;
       if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
         this.#sendOrClose(client, client.downstream, data, isBinary, "upstream_to_downstream");
       }
@@ -1038,6 +1052,7 @@ export class CodexAppServerProxy {
   #closeClient(client, reason, error = null, closeCode = 1000) {
     if (client.closed) return;
     client.closed = true;
+    client.wakeVisibility.close();
     this.clients.delete(client);
     if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
     client.reconnectTimer = null;
