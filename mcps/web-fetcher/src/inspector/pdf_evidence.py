@@ -1,4 +1,9 @@
-import fitz
+try:
+    import pymupdf as fitz
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    import fitz
 
 from inspection_geometry import contains, evidence
 

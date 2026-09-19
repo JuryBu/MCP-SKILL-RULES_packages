@@ -6,7 +6,12 @@ import tempfile
 import traceback
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import fitz
+try:
+    import pymupdf as fitz
+except ModuleNotFoundError as error:
+    if error.name != "pymupdf":
+        raise
+    import fitz
 
 from inspection_geometry import BoundedIssues, MAX_AUTO_SCREENSHOTS, PairBudget, evidence
 from pdf_evidence import add_paint_evidence, internal_text_collisions, overlap_evidence, page_rect
