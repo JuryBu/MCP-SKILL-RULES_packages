@@ -2025,6 +2025,11 @@ function readRecordFallback(hash: string, convId: string): string | null {
 
 function resolveRecordLocation(hash: string, convId: string): { hash: string; conversationId: string; content: string } | null {
     const resolvedId = resolveRecordConversationId(convId, hash) || convId;
+    if (hash !== "general") {
+        const preferredHash = resolveSupersededTargetHash(hash, resolvedId) || hash;
+        const preferredContent = readRecord(preferredHash, resolvedId);
+        if (preferredContent) return { hash: preferredHash, conversationId: resolvedId, content: preferredContent };
+    }
     const candidates: Array<{ hash: string; conversationId: string; content: string }> = [];
     const content = readRecord(hash, resolvedId);
     if (content && !isSupersededRecord(hash, resolvedId)) candidates.push({ hash, conversationId: resolvedId, content });
@@ -2053,14 +2058,19 @@ async function resolveRecordConversationIdAsync(input: string, preferredHash?: s
     const entries = indexes.flatMap(index => Object.values(index.records));
     const exact = entries.find(entry => entry.conversationId === query);
     if (exact) return exact.conversationId;
-    const prefixMatches = entries.filter(entry => entry.conversationId.startsWith(query));
-    if (prefixMatches.length === 1) return prefixMatches[0].conversationId;
-    const titleMatches = entries.filter(entry => entry.title.toLowerCase() === queryLower);
-    return titleMatches.length === 1 ? titleMatches[0].conversationId : null;
+    const prefixMatches = [...new Set(entries.filter(entry => entry.conversationId.startsWith(query)).map(entry => entry.conversationId))];
+    if (prefixMatches.length === 1) return prefixMatches[0];
+    const titleMatches = [...new Set(entries.filter(entry => entry.title.toLowerCase() === queryLower).map(entry => entry.conversationId))];
+    return titleMatches.length === 1 ? titleMatches[0] : null;
 }
 
 async function resolveRecordLocationAsync(hash: string, convId: string): Promise<{ hash: string; conversationId: string; content: string } | null> {
     const resolvedId = await resolveRecordConversationIdAsync(convId, hash) || convId;
+    if (hash !== "general") {
+        const preferredHash = await resolveSupersededTargetHashAsync(hash, resolvedId) || hash;
+        const preferredContent = await readRecordAsync(preferredHash, resolvedId);
+        if (preferredContent) return { hash: preferredHash, conversationId: resolvedId, content: preferredContent };
+    }
     const candidateHashes = [
         hash,
         ...(hash !== "general" ? ["general"] : []),
@@ -3846,6 +3856,7 @@ export async function buildStructuredRecordSearchBlocks(
     const blocks: TextBlock[] = [];
     const targets = await collectRecordSearchTargetsAsync(hash, scope, includeGeneral, options.conversationId, options.recordIds);
     for (const target of targets) {
+        const workspace = (await readRecordWorkspaceMetaAsync(target.hash))?.originalPath;
         const { index, indexStatus } = await readOrBuildReaderIndex(target.hash, target.conversationId, target.content, options.indexMode || "auto");
         const selected = blocksForSearchScope(index, options.searchScope || "section")
             .filter(block => matchesPhaseAndSection(block, options.phaseIds, options.sectionTypes));
@@ -3869,6 +3880,7 @@ export async function buildStructuredRecordSearchBlocks(
                     indexStatus,
                     readHint: {
                         action: "read",
+                        workspace,
                         conversationId: target.conversationId,
                         view: block.phaseId ? "phase" : "custom",
                         phaseIds: block.phaseId ? [block.phaseId] : undefined,
@@ -4101,6 +4113,7 @@ export async function buildRecordGuideRecommendations(
                 readHint: result.metadata?.readHint,
                 searchHint: {
                     action: "search",
+                    workspace: result.metadata?.readHint?.workspace,
                     query: options.goal,
                     conversationId: result.metadata?.recordId,
                     phaseIds: result.metadata?.phaseId ? [result.metadata.phaseId] : undefined,
@@ -4121,23 +4134,24 @@ export async function buildRecordGuideRecommendations(
     if (recommendations.length === 0) {
         const targets = await collectRecordSearchTargetsAsync(hash, scope, includeGeneral, options.conversationId, ids);
         for (const target of targets) {
+            const workspace = (await readRecordWorkspaceMetaAsync(target.hash))?.originalPath;
             const { index } = await readOrBuildReaderIndex(target.hash, target.conversationId, target.content, options.indexMode || "auto");
             recommendations.push({
                 type: "read",
                 reason: `先读目录，确认 ${target.title} 的 Phase 与结构入口`,
-                readHint: { action: "read", conversationId: target.conversationId, view: "outline", format: "json" },
+                readHint: { action: "read", workspace, conversationId: target.conversationId, view: "outline", format: "json" },
                 provenance: { recordId: target.conversationId, hash: target.hash, phaseCount: index.phases.length, blockCount: index.blocks.length },
             });
             recommendations.push({
                 type: "read",
                 reason: "再读当前状态与风险，快速判断后续工作入口",
-                readHint: { action: "read", conversationId: target.conversationId, view: "state", withCitations: true },
+                readHint: { action: "read", workspace, conversationId: target.conversationId, view: "state", withCitations: true },
                 provenance: { recordId: target.conversationId, hash: target.hash },
             });
             recommendations.push({
                 type: "read",
                 reason: "需要文件线索时读取产出文件区块",
-                readHint: { action: "read", conversationId: target.conversationId, view: "outputs", withCitations: true },
+                readHint: { action: "read", workspace, conversationId: target.conversationId, view: "outputs", withCitations: true },
                 provenance: { recordId: target.conversationId, hash: target.hash },
             });
             if (recommendations.length >= max) break;
@@ -4695,6 +4709,11 @@ async function handleEdit(
         let readerIndexStatus = "rebuilt";
         await withRecordPersistenceWrite(async () => {
             await withRecordCommitArtifactLock(hash, async () => {
+                const supersededBy = await resolveSupersededTargetHashAsync(hash, resolvedId);
+                if (supersededBy) {
+                    const targetMeta = await readRecordWorkspaceMetaAsync(supersededBy);
+                    throw new Error(`Record 当前副本已被替代 (superseded)，本次未写入；目标工作区: ${targetMeta?.originalPath || supersededBy} (${supersededBy})，请明确指定目标工作区后编辑`);
+                }
                 await withRecordManagementPublicationFenceWithinArtifactLock(hash, resolvedId, "manual_edit", async () => {
                     await runRecordPersistenceTestHook("before_write", resolvedId);
                     await writeRecordWithCommitArtifactLockHeld(hash, resolvedId, newContent, { phases });

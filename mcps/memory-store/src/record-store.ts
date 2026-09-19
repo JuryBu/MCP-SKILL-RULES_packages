@@ -1706,11 +1706,11 @@ export function resolveRecordConversationId(input: string, preferredHash?: strin
     const exact = entries.find((entry) => entry.conversationId === query);
     if (exact) return exact.conversationId;
 
-    const prefixMatches = entries.filter((entry) => entry.conversationId.startsWith(query));
-    if (prefixMatches.length === 1) return prefixMatches[0].conversationId;
+    const prefixMatches = [...new Set(entries.filter((entry) => entry.conversationId.startsWith(query)).map(entry => entry.conversationId))];
+    if (prefixMatches.length === 1) return prefixMatches[0];
 
-    const titleMatches = entries.filter((entry) => entry.title.toLowerCase() === queryLower);
-    if (titleMatches.length === 1) return titleMatches[0].conversationId;
+    const titleMatches = [...new Set(entries.filter((entry) => entry.title.toLowerCase() === queryLower).map(entry => entry.conversationId))];
+    if (titleMatches.length === 1) return titleMatches[0];
 
     return null;
 }
