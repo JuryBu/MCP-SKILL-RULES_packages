@@ -3,8 +3,19 @@ import type { ImageContent, TextContent } from "@modelcontextprotocol/sdk/types.
 import { inlineImageContent, assertInlineImageBudget } from "./image-output.js";
 
 export async function inspectionContent(response: unknown, saveMode?: "inline" | "file", generatedPaths: readonly string[] = []) {
+    let budgetOmissions = 0;
+    function countOmissions(value: unknown) {
+        if (Array.isArray(value)) { for (const item of value) countOmissions(item); return; }
+        if (!value || typeof value !== "object") return;
+        const fields = value as Record<string, unknown>;
+        if (fields.screenshotStatus === "budget_exceeded") budgetOmissions += 1;
+        for (const item of Object.values(fields)) countOmissions(item);
+    }
+    countOmissions(response);
+    const omittedMessage = budgetOmissions ? `${budgetOmissions} 个问题未生成截图：达到检查截图预算；报告已保留，请缩小检查范围。` : "";
     if (saveMode === "file") {
-        return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
+        return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) },
+            ...(omittedMessage ? [{ type: "text" as const, text: omittedMessage }] : [])], ...(budgetOmissions ? { isError: true } : {}) };
     }
     const references = new Map<string, string>();
     const allowed = new Set(generatedPaths);
@@ -37,5 +48,6 @@ export async function inspectionContent(response: unknown, saveMode?: "inline" |
     if (errors.length) {
         content.push({ type: "text", text: `报告已保留，但有 ${errors.length} 张截图未交付。请缩小 page 范围，或显式设置 saveMode="file"。\n${errors.join("\n")}` });
     }
-    return { content, ...(errors.length ? { isError: true } : {}) };
+    if (omittedMessage) content.push({ type: "text", text: omittedMessage });
+    return { content, ...((errors.length || budgetOmissions) ? { isError: true } : {}) };
 }

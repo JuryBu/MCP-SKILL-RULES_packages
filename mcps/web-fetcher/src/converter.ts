@@ -137,7 +137,20 @@ export function categorizeFile(filePath: string): FileCategory {
  * 将文件转换为 PDF（带缓存）
  * @returns 临时 PDF 文件路径
  */
+const pendingConversions = new Map<string, Promise<string>>();
+
 export async function convertToPDF(filePath: string): Promise<string> {
+    const resolvedPath = path.resolve(filePath);
+    const key = fileHashKey(resolvedPath);
+    const previous = pendingConversions.get(key);
+    if (previous) return previous;
+    const pending = performConvertToPDF(resolvedPath);
+    pendingConversions.set(key, pending);
+    try { return await pending; }
+    finally { if (pendingConversions.get(key) === pending) pendingConversions.delete(key); }
+}
+
+async function performConvertToPDF(filePath: string): Promise<string> {
     // 检查源文件存在
     if (!fs.existsSync(filePath)) {
         throw new Error(`文件不存在: ${filePath}`);

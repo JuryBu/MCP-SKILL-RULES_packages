@@ -1,4 +1,6 @@
 import { randomUUID } from "crypto";
+import { performance } from 'node:perf_hooks';
+import { getRequestContext, OperationGate, runWithRequestContext, throwIfRequestExpired } from './request-context.js';
 
 export type BackgroundTaskStatus = "running" | "done" | "error";
 
@@ -14,6 +16,8 @@ export interface BackgroundTask {
     finishedAt?: string;
     result?: string;
     error?: string;
+    phase?: 'queued' | 'running' | 'finished';
+    executionStartedAt?: string;
 }
 
 export interface StartBackgroundTaskOptions {
@@ -25,6 +29,34 @@ export interface StartBackgroundTaskOptions {
 const tasks = new Map<string, BackgroundTask>();
 const TASK_TTL_MS = Number(process.env.WEB_FETCHER_BACKGROUND_TASK_TTL || 30 * 60 * 1000);
 const MAX_WAIT_SECONDS = 600;
+const backgroundGate = new OperationGate(2, 16, 'background-work');
+const manualGate = new OperationGate(2, 8, 'background-login');
+
+function isManualTask(kind: string): boolean { return kind === 'web-login' || kind === 'human-browser-open'; }
+
+export function runBackgroundWork<Result>(kind: string, run: () => Promise<Result>, maxRunMs = 30 * 60_000, onStarted?: () => void): Promise<Result> {
+    const parent = getRequestContext();
+    const manual = isManualTask(kind);
+    return runWithRequestContext({
+        ownerId: parent?.ownerId,
+        viewport: parent?.viewport,
+        toolName: `${kind}.background`,
+        intent: `${kind}.background`,
+        timeoutMs: manual ? 10_000 : maxRunMs,
+    }, async () => {
+        const context = getRequestContext()!;
+        const gate = manual ? manualGate : backgroundGate;
+        const release = await gate.acquire({ ownerId: context.ownerId, deadline: context.deadline, queueTimeoutMs: manual ? 10_000 : maxRunMs });
+        try {
+            throwIfRequestExpired();
+            if (manual) context.deadline = performance.now() + maxRunMs;
+            onStarted?.();
+            throwIfRequestExpired();
+            return await run();
+        }
+        finally { release(); }
+    });
+}
 
 function nowIso(): string {
     return new Date().toISOString();
@@ -72,13 +104,15 @@ export function startBackgroundTask(
 ): BackgroundTask {
     cleanupTasks();
     const { deadlineMs, maxRunMs } = resolveDeadline(options);
+    const deferredManualDeadline = isManualTask(kind) && options?.deadlineAt === undefined;
     const task: BackgroundTask = {
         id: makeTaskId(kind),
         kind,
         status: "running",
+        phase: 'queued',
         startedAt: nowIso(),
         updatedAt: nowIso(),
-        ...(deadlineMs ? { deadlineAt: new Date(deadlineMs).toISOString() } : {}),
+        ...(deadlineMs && !deferredManualDeadline ? { deadlineAt: new Date(deadlineMs).toISOString() } : {}),
         ...(maxRunMs !== undefined ? { maxRunMs } : {}),
     };
     tasks.set(task.id, task);
@@ -93,6 +127,7 @@ export function startBackgroundTask(
             timeout = null;
         }
         task.status = status;
+        task.phase = 'finished';
         task.timedOut = timedOut || undefined;
         if (status === "done") {
             task.result = value;
@@ -103,17 +138,32 @@ export function startBackgroundTask(
         task.updatedAt = task.finishedAt;
     };
 
-    if (deadlineMs !== undefined) {
-        const delay = Math.max(0, deadlineMs - Date.now());
+    const armDeadline = (absoluteDeadline: number) => {
+        const delay = Math.max(0, absoluteDeadline - Date.now());
         timeout = setTimeout(() => {
             settle("error", options?.timeoutMessage || `后台任务超时（maxRunMs=${maxRunMs ?? delay}）`, true);
         }, delay);
         timeout.unref?.();
-    }
+    };
+    if (deadlineMs !== undefined && !deferredManualDeadline) armDeadline(deadlineMs);
 
     void (async () => {
         try {
-            settle("done", await run());
+            const result = await runBackgroundWork(kind, run, maxRunMs, () => {
+                if (settled) throw new Error('后台任务已在排队期间结束，未启动操作');
+                task.phase = 'running';
+                task.executionStartedAt = nowIso();
+                task.updatedAt = task.executionStartedAt;
+                if (deferredManualDeadline && maxRunMs !== undefined) {
+                    const manualDeadline = Date.now() + maxRunMs;
+                    task.deadlineAt = new Date(manualDeadline).toISOString();
+                    armDeadline(manualDeadline);
+                } else if (deadlineMs !== undefined) {
+                    const context = getRequestContext();
+                    if (context) context.deadline = performance.now() + Math.max(0, deadlineMs - Date.now());
+                }
+            });
+            settle("done", result);
         } catch (err) {
             settle("error", err instanceof Error ? err.message : String(err));
         }
@@ -139,7 +189,7 @@ export function formatBackgroundTask(task: BackgroundTask | null): string {
         const elapsed = ((Date.now() - new Date(task.startedAt).getTime()) / 1000).toFixed(0);
         const deadlineLine = task.deadlineAt ? [`⏳ 截止: ${task.deadlineAt}`] : [];
         return [
-            "⏳ 后台任务运行中",
+            task.phase === 'queued' ? '⏳ 后台任务排队中（尚未开始操作）' : "⏳ 后台任务运行中",
             `🆔 taskId: ${task.id}`,
             `📌 类型: ${task.kind}`,
             `⏱ 已用: ${elapsed}s`,

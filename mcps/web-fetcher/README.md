@@ -24,6 +24,10 @@
 
 测试：`npm run test:images` 为图像与返回协议的针对性测试；`npm run test:images:http` 使用独立 Edge profile 和临时本地 HTTP MCP 服务验证真实截图、交互、多页与旧模式，不读取真实登录态。后者需要本机 Edge。
 
+### 7.2 增量升级
+
+7.2 新增页面池资源接纳、可选响应式 `viewport`、按用途等待页面就绪与检查证据分级，使用和部署注意事项见 [docs/7.2-upgrade.md](docs/7.2-upgrade.md)。四宿主接入方式、旧调用默认值与模型链路保持不变；更新源代码不等于本机正在运行的后端已更新，应核对实际工具与资源说明。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |
@@ -224,7 +228,7 @@ web_inspect(action="check", taskId="...", waitSeconds=30)
 - `web_close_sessions(sessionId="session_...", ownerId="project-a")` 关闭单个会话；`web_close_sessions(ownerId="project-a", closeAllForOwner=true)` 只清理该 owner 下的会话，不跨 owner 关闭。
 - `web_pipeline` 可传 `sessionId` 复用已登录页面、弹窗 session 或 `desktop_register_window` 注册来的 Electron renderer；不传 `sessionId` 时仍按旧行为用 `url` 新建页面。
 - `web_interact(action="snapshot")` 与 `web_pipeline(steps=[{action:"snapshot"}])` 默认一次返回图片、视口可见文本和 DOM 摘要；显式 `saveMode="file"` 保留旧截图路径输出。
-- 页面池默认允许 5 个并发页面（可用 `WEB_FETCHER_MAX_CONCURRENT_PAGES` 覆盖）；达到 3 个活跃页面起会在 `web_interact`、`web_pipeline`、`web_list_sessions` 输出中提示接近上限，并建议用 `web_close_sessions` 顺手清理旧会话（提醒阈值可用 `WEB_FETCHER_PAGE_POOL_WARNING_THRESHOLD` 覆盖）。
+- Windows 在实时资源接纳允许时，页面池默认目标为 8 个并发页面；显式设置的既有 `WEB_FETCHER_MAX_CONCURRENT_PAGES` 仍优先。非 Windows 保守限制为 5 个，Windows 也会因物理/提交内存余量、采样状态或队列而少于 8 个；细节见 [7.2 升级说明](docs/7.2-upgrade.md)。
 - Cookie 与 localStorage 是全局共享资源，会通过文件锁和临时文件 rename 合并写入；它们不按对话或项目隔离。首次启用登录态功能前，应确认同一 Windows 账户下的四个宿主都被允许访问这些站点身份；需要隔离时使用不同的 `CODEX_TOOLKIT_DATA_ROOT`，不要共享 profile。
 - 有头登录 / UAV 会使用动态空闲 CDP 端口，并只清理带匹配临时 profile 或 lockfile owner 的自有 Chrome，不按固定端口粗暴杀进程。
 - 浏览器主 context 与 bareContext 在 `close()` / `closeBrowser()` 时都会关闭并清理各自临时 profile。

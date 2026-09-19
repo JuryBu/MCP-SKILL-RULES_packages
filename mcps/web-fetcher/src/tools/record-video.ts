@@ -290,7 +290,7 @@ async function handleWebRecording(params: RecordVideoInput, startTime: number): 
             } catch { /* 忽略 */ }
         }
 
-        const page = await context!.newPage();
+        const page = await browserManager.createOwnedPage(context!);
 
         await page.goto(params.url, { waitUntil: "domcontentloaded", timeout });
         await page.waitForLoadState("networkidle", { timeout }).catch(() => { });

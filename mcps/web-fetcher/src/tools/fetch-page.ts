@@ -1,6 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { extractContent, truncateContent, compactContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
 import { pageCache } from "../cache.js";
 import { touchActivity } from "../lifecycle.js";
@@ -30,6 +31,7 @@ const WEB_AI_BACKGROUND_MAX_RUN_MS =
     ?? 15 * 60_000;
 
 const FetchPageInputSchema = z.object({
+    viewport: viewportSchema.optional(),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
@@ -117,6 +119,7 @@ export function registerFetchPage(server: McpServer): void {
 参数:
   - url (string, 必须): 要抓取的网页 URL（支持 http/https/file 协议）
 - waitFor (string, 可选): CSS 选择器，等待该元素出现后再提取
+- viewport (object, 可选): 网页 CSS 视口 {width,height}；仅响应式布局，非设备 UA/触摸模拟，文件预览不适用
 - timeout (number, 可选): 超时毫秒数，默认 30000
 - scrollCount (number, 可选): 滚动次数，用于加载评论区等懒加载内容，默认 0
 - outputMode (string, 可选): 输出模式 summary(默认)/full/compact/minimal/headings/ai_summary
@@ -133,6 +136,7 @@ export function registerFetchPage(server: McpServer): void {
   - headings: 只保留标题大纲(1500字)
   - ai_summary: 🤖 AI 智能摘要（支持 Antigravity LS / Codex / Claude Code 三链路），精炼中文概括+完整内容临时文件路径`,
             inputSchema: {
+                viewport: FetchPageInputSchema.shape.viewport,
                 url: FetchPageInputSchema.shape.url,
                 waitFor: FetchPageInputSchema.shape.waitFor,
                 timeout: FetchPageInputSchema.shape.timeout,
@@ -169,6 +173,11 @@ export function registerFetchPage(server: McpServer): void {
 
             const outputMode = params.outputMode || "summary";
             const modelChain = resolveSummaryModelChain(params.chain, params.modelChain);
+            try {
+                assertViewportTarget(params.url, params.viewport);
+            } catch (error) {
+                return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
+            }
 
             // v4.0: 本地文件快捷通道 — xlsx/纯文本文件无需浏览器
             if (params.url.startsWith("file://")) {
@@ -279,7 +288,7 @@ export function registerFetchPage(server: McpServer): void {
             }
 
             // PageCache: 无特殊参数时使用缓存（scrollCount/waitFor 跳过）
-            const useCache = !params.scrollCount && !params.waitFor;
+            const useCache = !params.scrollCount && !params.waitFor && !params.viewport;
             if (useCache) {
                 const cached = pageCache.get(params.url);
                 if (cached) {
@@ -291,10 +300,12 @@ export function registerFetchPage(server: McpServer): void {
             let page;
             try {
                 page = await browserManager.navigateTo(params.url, {
+                    viewport: params.viewport,
                     waitFor: params.waitFor,
                     timeout: params.timeout,
                     scrollCount: params.scrollCount,
                 });
+                await applyExplicitViewport(page, params.viewport);
 
                 // === iframe 内容智能提取 ===
                 let iframeHtmlParts: string[] = [];

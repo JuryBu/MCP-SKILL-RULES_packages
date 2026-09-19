@@ -2,6 +2,8 @@ import type { Page } from "playwright";
 import { browserManager } from "./browser.js";
 import { touchActivity } from "./lifecycle.js";
 import { randomUUID } from "crypto";
+import { getRequestContext, OperationGate, RequestAdmissionError, runWithRequestContext, throwIfRequestExpired, withRequestStage, type AdmissionOptions } from "./request-context.js";
+import { performance } from "node:perf_hooks";
 
 /**
  * 页面会话管理器
@@ -17,6 +19,8 @@ interface Session {
     ownership: SessionOwnership;
     closePolicy: SessionClosePolicy;
     browserSource: SessionBrowserSource;
+    closing?: boolean;
+    closePromise?: Promise<boolean>;
 }
 
 const SESSION_TIMEOUT = 10 * 60 * 1000; // 10 分钟无操作自动关闭
@@ -52,13 +56,23 @@ export function normalizeOwnerId(ownerId?: string): string {
     return normalized || DEFAULT_OWNER_ID;
 }
 
-class SessionManager {
-    private sessions = new Map<string, Session>();
-    private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+interface PageOperations {
+    gate: OperationGate;
+    inFlight: number;
+    idleWaiters: Array<() => void>;
+    closing?: Promise<boolean>;
+}
 
-    constructor() {
+export class SessionManager {
+    private sessions = new Map<string, Session>();
+    private pageOperations = new Map<Page, PageOperations>();
+    private cleanupTimer: ReturnType<typeof setInterval> | null = null;
+    private readonly sessionTimeout: number;
+
+    constructor(options: { cleanupIntervalMs?: number; sessionTimeoutMs?: number } = {}) {
+        this.sessionTimeout = options.sessionTimeoutMs ?? SESSION_TIMEOUT;
         // 每 30 秒检查一次过期会话
-        this.cleanupTimer = setInterval(() => this.cleanup(), 30000);
+        this.cleanupTimer = setInterval(() => this.cleanup(), options.cleanupIntervalMs ?? 30000);
         // 防止 cleanup 定时器阻止进程退出
         if (this.cleanupTimer.unref) this.cleanupTimer.unref();
     }
@@ -71,13 +85,14 @@ class SessionManager {
         timeout?: number;
         scrollCount?: number;
         ownerId?: string;
+        viewport?: { width: number; height: number };
     }): Promise<string> {
         let page: Page;
         try {
             page = await browserManager.navigateTo(url, options);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            if (message.includes("已达到最大并发页面数")) {
+            if (message.includes("已达到最大并发页面数") || message.includes('page_admission_timeout') || message.includes('page_queue_full')) {
                 const active = this.list(options?.ownerId);
                 const activeText = formatSessionList(active);
                 const hint = active.length > 0
@@ -88,6 +103,16 @@ class SessionManager {
             throw error;
         }
         const id = `session_${randomUUID()}`;
+        const context = getRequestContext();
+        if (context) {
+            try {
+                const release = await this.acquirePage(page, { ownerId: normalizeOwnerId(options?.ownerId), signal: context.signal, deadline: context.deadline });
+                context.finalizers.push(release);
+            } catch (error) {
+                await page.close().catch(() => { });
+                throw error;
+            }
+        }
 
         this.sessions.set(id, {
             page,
@@ -108,6 +133,12 @@ class SessionManager {
      * v6.6: 注册一个已有的 Page 对象为会话（用于 popup 等外部页面）
      */
     registerPage(page: Page, ownerId?: string, options?: RegisterPageOptions): string {
+        const owner = normalizeOwnerId(ownerId);
+        for (const session of this.sessions.values()) {
+            if (session.page === page && (session.ownerId !== owner || session.closing)) {
+                throw new Error("同一页面不能跨 owner 注册，或页面正在关闭");
+            }
+        }
         const id = `session_${randomUUID()}`;
         const resourcePolicy = normalizeResourcePolicy(options);
         this.sessions.set(id, {
@@ -129,7 +160,7 @@ class SessionManager {
      */
     get(id: string, ownerId?: string): Page | null {
         const session = this.sessions.get(id);
-        if (!session) return null;
+        if (!session || session.closing) return null;
         if (session.ownerId !== normalizeOwnerId(ownerId)) {
             console.error(`[web-fetcher] 会话 ${id} owner 校验失败`);
             return null;
@@ -137,7 +168,7 @@ class SessionManager {
 
         // 检测页面是否仍然存活（防止浏览器关闭后的僵尸引用）
         if (session.page.isClosed()) {
-            this.sessions.delete(id);
+            this.forgetClosedSession(id, session);
             console.error(`[web-fetcher] 会话 ${id} 页面已死亡，自动清理`);
             return null;
         }
@@ -146,6 +177,90 @@ class SessionManager {
         // 刷新全局活动时间戳，防止浏览器 idle timer 误杀活跃会话
         touchActivity();
         return session.page;
+    }
+
+    async withOperation<Result>(id: string, ownerId: string | undefined, handler: (page: Page) => Promise<Result>, options: AdmissionOptions = {}): Promise<Result> {
+        if (!getRequestContext()) {
+            return runWithRequestContext({ ownerId, signal: options.signal, deadline: options.deadline }, () => this.withOperation(id, ownerId, handler, options));
+        }
+        const session = this.sessions.get(id);
+        if (!session || session.ownerId !== normalizeOwnerId(ownerId) || session.closing || session.page.isClosed()) {
+            throw new RequestAdmissionError("session_unavailable", `会话 "${id}" 不存在、已关闭或 ownerId 不匹配`);
+        }
+        const context = getRequestContext();
+        if (context?.leasedPages.has(session.page)) return handler(session.page);
+        const release = await withRequestStage("page_queue", () => this.acquirePage(session.page, {
+            ...options,
+            ownerId: normalizeOwnerId(ownerId),
+            signal: options.signal ?? context?.signal,
+            deadline: options.deadline ?? context?.deadline,
+        }));
+        try {
+            throwIfRequestExpired();
+            if (options.signal?.aborted) throw new RequestAdmissionError("request_cancelled", "请求已取消，页面动作未开始");
+            if (options.deadline !== undefined && options.deadline <= performance.now()) throw new RequestAdmissionError("admission_timeout", "页面动作开始前总期限已到");
+            if (this.sessions.get(id) !== session || session.closing || session.page.isClosed()) {
+                throw new RequestAdmissionError("session_unavailable", "排队期间会话已关闭，操作未开始");
+            }
+            session.lastAccess = Date.now();
+            touchActivity();
+            return await handler(session.page);
+        } finally {
+            session.lastAccess = Date.now();
+            await release();
+        }
+    }
+
+    hasBusySessions(): boolean {
+        return [...this.pageOperations.values()].some(state => state.gate.getStats().active > 0 || state.gate.getStats().queued > 0);
+    }
+
+    getOperationStats() {
+        const states = [...this.pageOperations.values()];
+        return {
+            active: states.reduce((sum, state) => sum + state.inFlight, 0),
+            queued: states.reduce((sum, state) => sum + state.gate.getStats().queued, 0),
+            closing: [...this.sessions.values()].filter(session => session.closing).length,
+        };
+    }
+
+    private stateFor(page: Page): PageOperations {
+        let state = this.pageOperations.get(page);
+        if (!state) {
+            state = { gate: new OperationGate(1, 32, "page-operation"), inFlight: 0, idleWaiters: [] };
+            this.pageOperations.set(page, state);
+        }
+        return state;
+    }
+
+    private forgetClosedSession(id: string, session: Session): void {
+        this.sessions.delete(id);
+        const state = this.pageOperations.get(session.page);
+        if (state && state.gate.getStats().active === 0 && state.gate.getStats().queued === 0 && ![...this.sessions.values()].some(entry => entry.page === session.page)) {
+            this.pageOperations.delete(session.page);
+        }
+    }
+
+    private async acquirePage(page: Page, options: AdmissionOptions): Promise<() => Promise<void>> {
+        const state = this.stateFor(page);
+        const releaseGate = await state.gate.acquire(options);
+        state.inFlight++;
+        const context = getRequestContext();
+        context?.leasedPages.add(page);
+        let released = false;
+        return async () => {
+            if (released) return;
+            released = true;
+            const closing = [...this.sessions.values()].filter(session => session.page === page && session.closePromise).map(session => session.closePromise!);
+            context?.leasedPages.delete(page);
+            state.inFlight--;
+            if (state.inFlight === 0) for (const resolve of state.idleWaiters.splice(0)) resolve();
+            releaseGate();
+            if (state.gate.getStats().active === 0 && state.gate.getStats().queued === 0 && ![...this.sessions.values()].some(session => session.page === page)) {
+                this.pageOperations.delete(page);
+            }
+            await Promise.all(closing);
+        };
     }
 
     /**
@@ -159,10 +274,34 @@ class SessionManager {
             return false;
         }
 
-        await closeSessionResources(session);
-        this.sessions.delete(id);
-        console.error(`[web-fetcher] 会话已关闭: ${id}`);
-        return true;
+        const state = this.stateFor(session.page);
+        if (!session.closePromise) {
+            const affected = session.closePolicy === "close-page"
+                ? [...this.sessions.entries()].filter(([, entry]) => entry.page === session.page)
+                : [[id, session] as const];
+            for (const [, entry] of affected) entry.closing = true;
+            const closing = state.closing ?? (async () => {
+                if (state.gate.getStats().active > 0) {
+                    await new Promise<void>(resolve => state.idleWaiters.push(resolve));
+                }
+                await closeSessionResources(session);
+                for (const [affectedId, entry] of affected) {
+                    if (this.sessions.get(affectedId) === entry) this.sessions.delete(affectedId);
+                }
+                if (state.gate.getStats().active === 0 && state.gate.getStats().queued === 0 && ![...this.sessions.values()].some(entry => entry.page === session.page)) {
+                    this.pageOperations.delete(session.page);
+                }
+                return true;
+            })();
+            if (session.closePolicy === "close-page") state.closing = closing;
+            session.closePromise = closing;
+            void closing.catch(() => {
+                for (const [, entry] of affected) { entry.closing = false; entry.closePromise = undefined; }
+                if (state.closing === closing) state.closing = undefined;
+            });
+        }
+        if (getRequestContext()?.leasedPages.has(session.page)) return true;
+        return session.closePromise;
     }
 
     /**
@@ -175,7 +314,7 @@ class SessionManager {
         const now = Date.now();
         for (const [id, session] of this.sessions) {
             if (session.page.isClosed()) {
-                this.sessions.delete(id);
+                this.forgetClosedSession(id, session);
                 continue;
             }
             if (!includeAllOwners && session.ownerId !== owner) continue;
@@ -218,9 +357,10 @@ class SessionManager {
         const now = Date.now();
         for (const [id, session] of this.sessions) {
             // 超时清理 或 页面已死亡（浏览器被心跳关闭）
-            if (now - session.lastAccess > SESSION_TIMEOUT || session.page.isClosed()) {
-                closeSessionResources(session).catch(() => { });
-                this.sessions.delete(id);
+            const state = this.pageOperations.get(session.page);
+            if (state && (state.gate.getStats().active > 0 || state.gate.getStats().queued > 0)) continue;
+            if (now - session.lastAccess > this.sessionTimeout || session.page.isClosed()) {
+                void this.close(id, session.ownerId).catch(error => console.error("[web-fetcher] 会话清理失败，保留记录", error));
                 console.error(`[web-fetcher] 会话清理: ${id}`);
             }
         }
@@ -230,10 +370,7 @@ class SessionManager {
      * 关闭所有会话
      */
     async closeAll(): Promise<void> {
-        for (const [_id, session] of this.sessions) {
-            await closeSessionResources(session);
-        }
-        this.sessions.clear();
+        await Promise.all([...this.sessions.entries()].map(([id, session]) => this.close(id, session.ownerId)));
         if (this.cleanupTimer) {
             clearInterval(this.cleanupTimer);
         }
@@ -292,7 +429,8 @@ function formatDuration(ms: number): string {
 
 function normalizeResourcePolicy(options?: RegisterPageOptions): Required<RegisterPageOptions> {
     const ownership = options?.ownership ?? (options?.ownsPage === false ? "borrowed" : "managed");
-    const closePolicy = options?.closePolicy ?? (ownership === "managed" ? "close-page" : "noop");
+    const closePolicy = ownership === "borrowed" && options?.closePolicy === "close-page"
+        ? "noop" : options?.closePolicy ?? (ownership === "managed" ? "close-page" : "noop");
     const browserSource = options?.browserSource ?? (ownership === "managed" ? "playwright-launch" : "external-page");
     return {
         ownsPage: closePolicy === "close-page",
@@ -308,6 +446,6 @@ async function closeSessionResources(session: Session): Promise<void> {
         return;
     }
     if (!session.page.isClosed()) {
-        await session.page.close().catch(() => { });
+        await session.page.close();
     }
 }

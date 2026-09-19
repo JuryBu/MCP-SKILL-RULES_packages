@@ -24,6 +24,8 @@ const { inspectionContent } = await import("../dist/inspection-output.js");
 const { stopAllServers } = await import("../dist/local-server.js");
 const ownerId = "image-delivery-fixture";
 const service = new McpServer({ name: "web-fetcher-isolated-image-test", version: "1.0.0" });
+const { installToolConcurrency } = await import("../dist/tool-concurrency.js");
+installToolConcurrency(service);
 for (const [moduleName, register] of [
     ["fetch-screenshot", "registerFetchScreenshot"], ["fetch-rich", "registerFetchRich"],
     ["interact", "registerInteract"], ["pipeline", "registerPipeline"],
@@ -207,7 +209,7 @@ try {
     await new Promise(resolve => httpServer.close(resolve));
     await sessionManager.closeAll().catch(() => {});
     await desktopManager.closeAll().catch(() => {});
-    await browserManager.close().catch(() => {});
+    await browserManager.shutdown().catch(() => {});
     await context?.close().catch(() => {});
     stopAllServers();
     const resolved = path.resolve(temporaryRoot);

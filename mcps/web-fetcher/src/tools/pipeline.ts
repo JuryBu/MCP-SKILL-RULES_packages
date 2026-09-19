@@ -1,6 +1,7 @@
 ﻿import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { touchActivity } from "../lifecycle.js";
 import { formatPoolPressureHint, sessionManager } from "../session.js";
 import { extractContent, compactContent, safePageEvaluate, safePageContent, type OutputMode } from "../extractor.js";
@@ -41,10 +42,11 @@ const PipelineStepSchema = z.object({
     fullPage: z
         .boolean()
         .optional()
-        .describe("screenshot 时是否截全页，默认 false"),
+        .describe("screenshot/snapshot 时是否截全页，默认 false；不改变 CSS 视口"),
 });
 
 const PipelineInputSchema = z.object({
+    viewport: viewportSchema.optional(),
     saveMode: z.enum(["inline", "file"]).optional().describe("截图/快照输出：inline 默认直接返回多张图片与文本；file 返回临时文件路径"),
     sessionId: z
         .string()
@@ -111,12 +113,14 @@ export function registerPipeline(server: McpServer): void {
   - url (string, 可选): 目标网页 URL（支持 http/https/file 协议）；不传 sessionId 时必须提供
   - timeout (number, 可选): 页面加载超时，默认 30000
   - keepSession (boolean, 可选): 完成后是否保留会话，默认 false
+  - viewport (object, 可选): 网页 CSS 视口 {width,height}；全管道开始前显式调整一次，省略不改变复用会话，不模拟设备 UA/触摸
   - ownerId (string, 可选): 会话所有者标识，未传兼容 global
   - steps (array, 必须): 操作步骤列表，最多 20 步
 
 返回: 所有步骤的结果按顺序排列（文本/截图混合）
 如果某步失败，返回已完成的结果 + 错误信息`,
             inputSchema: {
+                viewport: PipelineInputSchema.shape.viewport,
                 saveMode: PipelineInputSchema.shape.saveMode,
                 sessionId: PipelineInputSchema.shape.sessionId,
                 url: PipelineInputSchema.shape.url,
@@ -173,7 +177,8 @@ export function registerPipeline(server: McpServer): void {
                         };
                     }
                 } else if (params.url) {
-                    sessionId = await sessionManager.create(params.url, { timeout, ownerId: params.ownerId });
+                    assertViewportTarget(params.url, params.viewport);
+                    sessionId = await sessionManager.create(params.url, { timeout, ownerId: params.ownerId, viewport: params.viewport });
                     page = sessionManager.get(sessionId, params.ownerId);
                     createdSession = true;
                 } else {
@@ -190,6 +195,7 @@ export function registerPipeline(server: McpServer): void {
                     };
                 }
 
+                await applyExplicitViewport(page, params.viewport);
                 results.push({
                     type: "text" as const,
                     text: `🚀 Pipeline 开始 (${params.steps.length} 步)\nURL: ${page.url()}\nSessionId: ${sessionId}${createdSession ? "\n会话来源: 新建 URL" : "\n会话来源: 复用已有 session"}`,
@@ -206,14 +212,17 @@ export function registerPipeline(server: McpServer): void {
                             case "screenshot": {
                                 const qConfig = QUALITY_PRESETS["default"];
                                 // v6.1: 截图前等待视觉资源就绪
-                                await browserManager.waitForVisualReady(page);
+                                const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: step.fullPage ?? false });
+                                if (readiness.complete === false && readiness.note) {
+                                    results.push({ type: "text" as const, text: `${stepLabel} ⚠️ ${readiness.note}` });
+                                }
                                 let buf = await page.screenshot({
                                     type: "jpeg",
                                     quality: qConfig.jpegQuality,
                                     fullPage: step.fullPage ?? false,
                                 });
                                 // 重试机制
-                                if (buf.length < 5 * 1024) {
+                                if (!readiness.complete && buf.length < 5 * 1024) {
                                     await page.waitForTimeout(3000);
                                     buf = await page.screenshot({
                                         type: "jpeg",

@@ -8,6 +8,9 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import fitz
 
+from inspection_geometry import BoundedIssues, MAX_AUTO_SCREENSHOTS, PairBudget, evidence
+from pdf_evidence import add_paint_evidence, internal_text_collisions, overlap_evidence, page_rect
+
 
 Rect = Dict[str, float]
 InspectElement = Dict[str, Any]
@@ -166,7 +169,7 @@ def _text_from_block(block: Dict[str, Any]) -> Tuple[str, Optional[float], Dict[
 
 def _page_structure(doc: fitz.Document, page_index: int) -> PageStructure:
     page = doc[page_index]
-    page_rect = page.rect
+    page_bounds = page.rect
     raw = page.get_text("dict")
     elements: List[InspectElement] = []
 
@@ -176,7 +179,7 @@ def _page_structure(doc: fitz.Document, page_index: int) -> PageStructure:
             continue
 
         block_type = block.get("type")
-        bounds = _rect_from_bbox(bbox)
+        bounds = page_rect(bbox, page)
         page_number = page_index + 1
 
         if block_type == 0:
@@ -219,12 +222,13 @@ def _page_structure(doc: fitz.Document, page_index: int) -> PageStructure:
 
         elements.append(element)
 
+    limitations = add_paint_evidence(page, elements)
     return {
         "page": page_index + 1,
-        "dimensions": {"width": float(page_rect.width), "height": float(page_rect.height)},
+        "dimensions": {"width": float(page_bounds.width), "height": float(page_bounds.height)},
         "elements": elements,
         "source": "pdf",
-        "metadata": {"rotation": page.rotation},
+        "metadata": {"rotation": page.rotation, "inspectionLimitations": limitations},
     }
 
 
@@ -249,22 +253,21 @@ def _overflow_sides(bounds: Rect, page_bounds: Rect) -> List[str]:
     return sides
 
 
-def _overlap_severity(a: InspectElement, b: InspectElement, percent: float) -> str:
-    types = {a.get("type"), b.get("type")}
-    if "text" in types and percent >= 15:
-        return "error"
-    if "text" in types:
-        return "warning"
-    return "info" if percent < 25 else "warning"
-
-
 def _issue_screenshot(
     pdf_path: str,
     issue: InspectIssue,
     scale: float,
     output_dir: str,
     index: int,
-) -> str:
+) -> Optional[str]:
+    bounds = issue['bounds']
+    expansion = max(1.0, scale) if math.isfinite(scale) else 1.0
+    pixel_width = max(0.0, bounds['x1'] - bounds['x0']) * expansion * 200 / 72
+    pixel_height = max(0.0, bounds['y1'] - bounds['y0']) * expansion * 200 / 72
+    if pixel_width * pixel_height > 4000000 or max(pixel_width, pixel_height) > 4096:
+        issue.setdefault('metadata', {}).update({'screenshotOmittedReason': 'auto_screenshot_pixel_budget_exceeded',
+                                                'screenshotStatus': 'budget_exceeded', 'screenshotPending': False})
+        return None
     os.makedirs(output_dir, exist_ok=True)
     output_path = os.path.join(output_dir, f"pdf-issue-page{issue['page']}-{index}.png")
     region_screenshot(pdf_path, issue["page"], issue["bounds"], scale, output_path)
@@ -283,11 +286,14 @@ def detect_issues(
     active_checks = set(checks or ["overlap", "overflow"])
     thresholds = thresholds or {}
     structures = extract_structure(pdf_path, page_num)
-    issues: List[InspectIssue] = []
+    issues = BoundedIssues()
+    pair_budget = PairBudget()
     min_overlap_area = 4.0
     min_overlap_percent = 1.0
 
     for structure in structures:
+        if issues.full():
+            break
         page = structure["page"]
         dimensions = structure["dimensions"]
         page_bounds = {"x0": 0.0, "y0": 0.0, "x1": dimensions["width"], "y1": dimensions["height"]}
@@ -295,6 +301,10 @@ def detect_issues(
 
         if "overflow" in active_checks:
             for element in elements:
+                if issues.full():
+                    break
+                if element['type'] == 'shape':
+                    continue
                 sides = _overflow_sides(element["bounds"], page_bounds)
                 if not sides:
                     continue
@@ -306,32 +316,50 @@ def detect_issues(
                         "description": f"{element['name']} overflows page bounds on {', '.join(sides)}",
                         "elements": [element],
                         "bounds": _union_rect([element["bounds"]]),
-                        "metadata": {"sides": sides, "pageBounds": page_bounds},
+                        "metadata": {"sides": sides, "pageBounds": page_bounds,
+                                     **evidence('native-content-bounds', ['content_outside_page'])},
                     }
                 )
 
         if "overlap" in active_checks:
+            for element in elements:
+                if issues.full():
+                    break
+                if element['type'] == 'text' and internal_text_collisions(element):
+                    limited = element['metadata'].get('textComparisonLimited', False)
+                    issues.append({'type': 'overlap', 'severity': 'warning', 'page': page,
+                        'description': f"{element['name']}: text comparison budget reached" if limited else f"{element['name']} contains intersecting text runs; review glyph contours",
+                        'elements': [element], 'bounds': element['bounds'],
+                        'metadata': evidence('native-glyph-boxes', ['text_comparison_budget_exceeded'] if limited else ['intra_block_text_intersection', 'glyph_contours_unresolved'], 'low' if limited else 'medium')})
             for left_index, left in enumerate(elements):
+                if issues.full() or pair_budget.limit_reached:
+                    break
                 for right in elements[left_index + 1 :]:
+                    if issues.full() or not pair_budget.allow():
+                        break
                     overlap = _overlap_rect(left["bounds"], right["bounds"])
                     if overlap is None or _rect_area(overlap) < min_overlap_area:
                         continue
                     percent = _overlap_percent(left["bounds"], right["bounds"])
                     if percent < min_overlap_percent:
                         continue
+                    assessment = overlap_evidence(left, right)
+                    if assessment is None:
+                        continue
                     union = _union_rect([left["bounds"], right["bounds"]])
                     issues.append(
                         {
                             "type": "overlap",
-                            "severity": _overlap_severity(left, right, percent),
+                            "severity": "error" if assessment['assessment'] == 'confirmed' else "warning",
                             "page": page,
-                            "description": f"{left['name']} overlaps {right['name']} by {percent:.1f}%",
+                            "description": f"{left['name']} / {right['name']}: {'confirmed opaque cover' if assessment['assessment'] == 'confirmed' else 'candidate content intersection'} (bounds overlap {percent:.1f}%)",
                             "elements": [left, right],
                             "bounds": union,
                             "metadata": {
                                 "overlapBounds": overlap,
                                 "overlapArea": _rect_area(overlap),
                                 "overlapPercent": percent,
+                                **assessment,
                             },
                         }
                     )
@@ -339,6 +367,8 @@ def detect_issues(
         if "readability" in active_checks:
             min_font_threshold = float(thresholds.get("smallFontPt") or 7.0)
             for element in elements:
+                if issues.full():
+                    break
                 if element.get("type") != "text":
                     continue
                 metadata = element.get("metadata") or {}
@@ -358,14 +388,38 @@ def detect_issues(
                             "fontSize": float(font_size),
                             "threshold": min_font_threshold,
                             "source": "pdf",
+                            **evidence('native-font-size', ['font_size_below_threshold']),
                         },
                     }
                 )
 
+    pair_budget.annotate(structures, issues)
     if auto_screenshot and issues:
         output_dir = screenshot_dir or tempfile.mkdtemp(prefix="pdf-inspector-")
-        for index, issue in enumerate(issues, start=1):
-            issue["screenshotPath"] = _issue_screenshot(pdf_path, issue, screenshot_scale, output_dir, index)
+        for index, issue in enumerate(issues[:MAX_AUTO_SCREENSHOTS], start=1):
+            screenshot = _issue_screenshot(pdf_path, issue, screenshot_scale, output_dir, index)
+            if screenshot is not None:
+                issue["screenshotPath"] = screenshot
+        if len(issues) > MAX_AUTO_SCREENSHOTS:
+            for issue in issues[MAX_AUTO_SCREENSHOTS:]:
+                issue.setdefault('metadata', {}).update({'screenshotOmittedReason': 'auto_screenshot_budget_exceeded',
+                                                        'screenshotStatus': 'budget_exceeded', 'screenshotPending': False})
+            for structure in structures:
+                structure['metadata']['inspectionLimitations'].append(
+                    f'Only the first {MAX_AUTO_SCREENSHOTS} issues were automatically screenshotted; {len(issues) - MAX_AUTO_SCREENSHOTS} remain without screenshots.')
+                structure['metadata']['inspectionBudget']['maxAutoScreenshots'] = MAX_AUTO_SCREENSHOTS
+                structure['metadata']['inspectionBudget']['screenshotsOmitted'] = len(issues) - MAX_AUTO_SCREENSHOTS
+        pixel_omissions = sum(issue.get('metadata', {}).get('screenshotOmittedReason') == 'auto_screenshot_pixel_budget_exceeded' for issue in issues)
+        if pixel_omissions:
+            for structure in structures:
+                structure['metadata']['inspectionLimitations'].append(f'{pixel_omissions} automatic screenshots exceeded the 4 megapixel / 4096 edge budget and were omitted.')
+        for structure in structures:
+            structure['metadata']['inspectionBudget'].update({
+                'maxAutoScreenshots': MAX_AUTO_SCREENSHOTS, 'maxAutoScreenshotPixels': 4000000,
+                'maxAutoScreenshotEdge': 4096,
+                'screenshotsProduced': sum('screenshotPath' in issue for issue in issues),
+                'screenshotsOmitted': sum('screenshotOmittedReason' in issue.get('metadata', {}) for issue in issues),
+            })
 
     warnings = sum(1 for issue in issues if issue.get("severity") == "warning")
     errors = sum(1 for issue in issues if issue.get("severity") == "error")

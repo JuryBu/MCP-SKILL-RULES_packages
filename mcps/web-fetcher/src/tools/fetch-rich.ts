@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { inlineImageContent } from "../image-output.js";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { extractContent, compactContent, truncateContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
 import { touchActivity } from "../lifecycle.js";
 import {
@@ -15,6 +16,7 @@ import { saveTempFile, generateCacheKey, splitOversizedImage } from "../temp-sto
 import { buildSummaryPrompt, generateSummaryText } from "../model-bridge.js";
 
 const FetchRichInputSchema = z.object({
+    viewport: viewportSchema.optional(),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
@@ -84,12 +86,14 @@ export function registerFetchRich(server: McpServer): void {
   - modelChain (string, 可选): 仅 ai_summary 生效，可选 auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
   - chain (string, 可选): 兼容旧参数，仅 ai_summary 生效；modelChain 未填时使用
   - quality (string, 可选): 图片质量 hd/clear/default/compact/fast，默认 default
+  - viewport (object, 可选): 网页 CSS 视口 {width,height}，显式指定时不会被 quality 重设；不模拟设备 UA/触摸，文件预览不适用
   - saveMode (string, 可选): inline(默认，直接图片+文本，最多10张含分片、base64总长12MiB)/file(显式返回临时文件路径)
   - page (number, 可选): PDF/Office文件的页码（默认1），截取指定页
   - pages (string, 可选): PDF/Office多页截取: "all"/"1-5"/"1,4,5"/"1-3,6-9,18"
 
 返回: 同时包含截图和 Markdown 文本`,
             inputSchema: {
+                viewport: FetchRichInputSchema.shape.viewport,
                 url: FetchRichInputSchema.shape.url,
                 timeout: FetchRichInputSchema.shape.timeout,
                 scrollCount: FetchRichInputSchema.shape.scrollCount,
@@ -118,6 +122,7 @@ export function registerFetchRich(server: McpServer): void {
 
             let page;
             try {
+                assertViewportTarget(params.url, params.viewport);
                 // 解析多页参数
                 let pageNumbers: number[] | undefined;
                 if (params.pages) {
@@ -142,6 +147,7 @@ export function registerFetchRich(server: McpServer): void {
                     // pages="all" 返回空数组，需先导航获取总页数再展开
                     if (pageNumbers.length === 0) {
                         const probePage = await browserManager.navigateTo(params.url, {
+                            viewport: params.viewport,
                             timeout: params.timeout,
                         });
                         try {
@@ -156,6 +162,7 @@ export function registerFetchRich(server: McpServer): void {
                 }
 
                 page = await browserManager.navigateTo(params.url, {
+                    viewport: params.viewport,
                     timeout: params.timeout,
                     scrollCount: params.scrollCount,
                     pageNumber: params.page,
@@ -164,7 +171,8 @@ export function registerFetchRich(server: McpServer): void {
 
                 // 根据 quality 调整视口（file:// 跳过，防止裁剪）
                 const isLocalFile = params.url.startsWith("file://");
-                if (!isLocalFile && qConfig.viewportWidth !== 1920) {
+                await applyExplicitViewport(page, params.viewport);
+                if (!params.viewport && !isLocalFile && qConfig.viewportWidth !== 1920) {
                     const currentSize = page.viewportSize();
                     if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                         await page.setViewportSize({
@@ -177,7 +185,8 @@ export function registerFetchRich(server: McpServer): void {
 
                 // 1) 截图
                 // v6.1: 截图前等待视觉资源就绪
-                await browserManager.waitForVisualReady(page);
+                const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: false });
+                const readinessWarning = readiness.complete === false && readiness.note ? `\n⚠️ ${readiness.note}` : "";
                 let screenshotBuffer = await page.screenshot({
                     type: "jpeg",
                     quality: qConfig.jpegQuality,
@@ -185,7 +194,7 @@ export function registerFetchRich(server: McpServer): void {
                 });
 
                 // 截图有效性验证
-                if (screenshotBuffer.length < 5 * 1024) {
+                if (!readiness.complete && screenshotBuffer.length < 5 * 1024) {
                     await page.waitForTimeout(3000);
                     screenshotBuffer = await page.screenshot({
                         type: "jpeg",
@@ -197,11 +206,11 @@ export function registerFetchRich(server: McpServer): void {
                 const sizeKB = (screenshotBuffer.length / 1024).toFixed(1);
 
                 // 读取 PDF 页码信息（如有）
-                let pageInfo = "";
+                let pageInfo = readinessWarning;
                 try {
                     const pdfInfo = await page.evaluate(() => (window as any).__mcpPdfInfo);
                     if (pdfInfo) {
-                        pageInfo = ` — 第${pdfInfo.currentPage}页/共${pdfInfo.totalPages}页`;
+                        pageInfo = ` — 第${pdfInfo.currentPage}页/共${pdfInfo.totalPages}页${readinessWarning}`;
                     }
                 } catch { }
 
@@ -288,7 +297,7 @@ export function registerFetchRich(server: McpServer): void {
 
                 // 根据 saveMode 返回截图
                 if (saveMode === "file") {
-                    const cacheKey = generateCacheKey(params.url, quality, "rich", params.scrollCount, params.page);
+                    const cacheKey = generateCacheKey(params.url, quality, "rich", params.scrollCount, params.page, ...(params.viewport ? [params.viewport.width, params.viewport.height] : []));
                     const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", cacheKey, ".jpg");
                     if (splitResult.wasSplit) {
                         const fileList = splitResult.paths.map((p, i) =>

@@ -67,6 +67,7 @@ export function registerSessionTools(server: McpServer): void {
                 includeSessionList: false,
             });
             return appendTiming({
+                _meta: { webFetcherPool: pool },
                 content: [{
                     type: "text" as const,
                     text: `活跃会话 (${sessions.length}) - ${scope}\n页面池: ${pool.activePages}/${pool.maxConcurrentPages}\n\n${formatSessionList(sessions)}${pressureHint ? `\n${pressureHint}` : ""}`,

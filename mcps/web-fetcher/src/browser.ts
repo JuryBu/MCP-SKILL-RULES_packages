@@ -41,6 +41,11 @@ import {
 } from "./human-verification.js";
 import { logHumanVerificationAudit } from "./human-audit.js";
 import { BrowserAuthState, installOriginStorage } from "./browser-auth-state.js";
+import { waitForPageReadiness, type ReadinessResult } from './readiness.js';
+import { getRequestContext, getActiveRequestCount, remainingRequestMs, throwIfRequestExpired, withRequestStage, withSuspendedRequestDeadline } from './request-context.js';
+import { PageAdmissionController, type PageLease } from './page-admission.js';
+import { getRuntimeMemorySampler } from './memory-sampler.js';
+import { applyExplicitViewport, assertViewportTarget, type ResponsiveViewport } from './viewport.js';
 
 function readPositiveIntEnv(name: string, fallback: number): number {
     const raw = process.env[name];
@@ -58,7 +63,10 @@ class BrowserManager {
     private context: BrowserContext | null = null;
     private launching: Promise<BrowserContext> | null = null;
     private activePages = new Set<Page>();
-    private static readonly MAX_CONCURRENT_PAGES = readPositiveIntEnv("WEB_FETCHER_MAX_CONCURRENT_PAGES", 5);
+    private admission?: PageAdmissionController;
+    private pageLeases = new WeakMap<Page, PageLease>();
+    private retryCounts = new WeakMap<object, number>();
+    private fallbackRetryCount = 0;
     private static readonly PAGE_POOL_WARNING_THRESHOLD = readPositiveIntEnv("WEB_FETCHER_PAGE_POOL_WARNING_THRESHOLD", 3);
     private static readonly LOCAL_DEV_NO_CACHE_HEADERS = {
         "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
@@ -71,7 +79,8 @@ class BrowserManager {
     private domainLastRequest: Map<string, number> = new Map();
     // v6.3.1: UAV 域名冷却 — 同域同会话只弹一次，防止 Cookie 无效时反复弹窗
     private uavAttemptedDomains: Set<string> = new Set();
-    public lastRetryCount = 0;
+    public get lastRetryCount(): number { const request = getRequestContext(); return request ? this.retryCounts.get(request) ?? 0 : this.fallbackRetryCount; }
+    public set lastRetryCount(value: number) { const request = getRequestContext(); if (request) this.retryCounts.set(request, value); else this.fallbackRetryCount = value; }
     // v6.4: 域名级 stealth 降级记忆 — 避免同域每次都要试错
     private domainStealthLevel: Map<string, StealthLevel> = new Map();
     // v6.4: 裸奔 context（L1）— WAF 域名用独立 context，不影响主 context 的 stealth
@@ -320,29 +329,25 @@ class BrowserManager {
             fullPage?: boolean;
             pageNumber?: number;
             pageNumbers?: number[];
+            viewport?: ResponsiveViewport;
         }
     ): Promise<Page> {
         // 每次导航重置重试计数
-        this.lastRetryCount = 0;
+        if (!getRequestContext()) this.lastRetryCount = 0;
 
-        // 并发控制
-        this.pruneClosedActivePages();
-        if (this.activePages.size >= BrowserManager.MAX_CONCURRENT_PAGES) {
-            throw new Error(
-                `已达到最大并发页面数 (${BrowserManager.MAX_CONCURRENT_PAGES})，请等待其他页面关闭后重试`
-            );
-        }
-
-        let page;
+        const viewport = options?.viewport ?? getRequestContext()?.viewport;
+        assertViewportTarget(url, viewport);
+        let page: Page;
         try {
             // v6.4: 域名级 context 路由 — WAF 域名用 bareContext，其他用主 context
             const targetDomain = this.extractDomain(url);
             const domainLevel = this.domainStealthLevel.get(targetDomain);
-            const context = domainLevel === 1
-                ? await this.getBareContext()
-                : await this.getContext();
-            page = await context.newPage();
-            this.trackActivePage(page);
+            const context = await withRequestStage('browser.context', () => domainLevel === 1
+                ? this.getBareContext()
+                : this.getContext());
+            page = await this.createManagedPage(context);
+            try { await applyExplicitViewport(page, viewport); }
+            catch (error) { await this.closeFailedPage(page, 'viewport-error'); throw error; }
         } catch (err) {
             throw err;
         }
@@ -656,7 +661,7 @@ class BrowserManager {
             const isHighRisk = this.isHighRiskDomain(domain);
             const isLocalDevUrl = this.isLocalDevUrl(url);
             const lastReq = this.domainLastRequest.get(domain);
-            if (lastReq) {
+            if (lastReq && !isLocalDevUrl) {
                 const elapsed = Date.now() - lastReq;
                 const cooldown = isHighRisk ? DOMAIN_REQUEST_COOLDOWN * 2 : DOMAIN_REQUEST_COOLDOWN;
                 if (elapsed < cooldown) {
@@ -752,7 +757,8 @@ class BrowserManager {
 
             while (navigationAttempt < maxNavigationAttempts) {
                 try {
-                const currentTimeout = navigationAttempt === 0 ? timeout : Math.min(timeout * 2, 120000);
+                throwIfRequestExpired();
+                const currentTimeout = Math.max(1, Math.min(timeout, remainingRequestMs(timeout)));
 
                 if (navigationAttempt === 0) {
                     try {
@@ -762,55 +768,12 @@ class BrowserManager {
                     }
                 }
 
-                await page.goto(url, {
+                await withRequestStage('navigation', () => page.goto(url, {
                     waitUntil: "domcontentloaded",
                     timeout: currentTimeout,
-                });
+                }));
 
-                // v6.3: SPA 域名跳过 networkidle（SPA 有 WebSocket 长连接，必然超时白等）
-                const isSPADomain = SPA_LAZY_LOAD_DOMAINS.some(d => url.includes(d));
-                if (!isSPADomain) {
-                    // 普通站点等 networkidle，超时从 5s 降为 3s（SmartLoad 兜底）
-                    await page.waitForLoadState("networkidle", { timeout: 3000 }).catch(() => {
-                        console.error("[web-fetcher] networkidle 3s 未达到，交给 SmartLoad");
-                    });
-                } else {
-                    console.error("[web-fetcher] SPA 域名，跳过 networkidle → 直接 SmartLoad");
-                }
-
-                // 智能内容就绪检测：等待 DOM 稳定 + iframe 加载（SmartLoad v6.1）
                 await this.waitForContentReady(page, currentTimeout, url);
-
-                // v6.4: SPA 空壳追加等待 — SmartLoad 超时后页面仍空白时，额外等待 React 渲染
-                const spaShellResult = await page.evaluate(() => {
-                    const root = document.querySelector('#root') || document.querySelector('#app') || document.querySelector('#__next');
-                    const bodyText = (document.body?.innerText || '').trim();
-                    return {
-                        hasSpaRoot: !!root,
-                        rootEmpty: root ? (root.children.length === 0 || root.innerHTML.trim().length < 50) : false,
-                        bodyTextLength: bodyText.length,
-                    };
-                }).catch(() => ({ hasSpaRoot: false, rootEmpty: false, bodyTextLength: 0 }));
-
-                if (spaShellResult.hasSpaRoot && spaShellResult.rootEmpty && spaShellResult.bodyTextLength < 100) {
-                    console.error(`[web-fetcher] ⏳ SPA 空壳检测到 (#root 为空, body=${spaShellResult.bodyTextLength}字符) → 追加等待 React 渲染`);
-
-                    // 追加等待 React 渲染
-                    console.error(`[web-fetcher] ⏳ 追加等待 React 渲染`);
-                    const spaExtraWait = 15000;
-                    const spaCheckInterval = 500;
-                    const spaStart = Date.now();
-                    while (Date.now() - spaStart < spaExtraWait) {
-                        await page.waitForTimeout(spaCheckInterval);
-                        const textLen = await page.evaluate(() => (document.body?.innerText || '').trim().length).catch(() => 0);
-                        if (textLen >= 100) {
-                            // React 渲染了内容，再等 500ms 让它稳定
-                            await page.waitForTimeout(500);
-                            console.error(`[web-fetcher] ✅ SPA 渲染完成: ${textLen}字符, 追加等待 ${Date.now() - spaStart}ms`);
-                            break;
-                        }
-                    }
-                }
 
                 lastNavigationError = null;
                 break; // 成功，跳出重试循环
@@ -869,14 +832,15 @@ class BrowserManager {
 
             // 如果指定了等待选择器
             if (options?.waitFor) {
-                await page.waitForSelector(options.waitFor, { timeout });
+                throwIfRequestExpired();
+                await page.waitForSelector(options.waitFor, { timeout: Math.max(1, Math.min(timeout, remainingRequestMs(timeout))) });
             }
 
             // 反爬随机延迟（高风控站点用更大延迟范围）
             const delayMin = isHighRisk ? HIGH_RISK_DELAY_MIN : ANTI_BOT_DELAY_MIN;
             const delayMax = isHighRisk ? HIGH_RISK_DELAY_MAX : ANTI_BOT_DELAY_MAX;
             const delay = delayMin + Math.random() * (delayMax - delayMin);
-            await page.waitForTimeout(delay);
+            if (!isLocalDevUrl) await page.waitForTimeout(Math.min(delay, remainingRequestMs(delay)));
 
             // 更新请求时间
             this.domainLastRequest.set(domain, Date.now());
@@ -901,25 +865,57 @@ class BrowserManager {
 
     private trackActivePage(page: Page): void {
         this.activePages.add(page);
+        const screenshot = page.screenshot.bind(page);
+        page.screenshot = options => withRequestStage('screenshot', () => screenshot(options));
         page.once("close", () => {
             this.activePages.delete(page);
+            this.pageLeases.get(page)?.release();
+            this.pageLeases.delete(page);
         });
+    }
+
+    private async createManagedPage(context: BrowserContext): Promise<Page> {
+        const request = getRequestContext();
+        const controller = this.admission ??= new PageAdmissionController();
+        const lease = await withRequestStage('page_admission', () => controller.acquire({ ownerId: request?.ownerId ?? 'global', signal: request?.signal, deadlineAt: request?.deadline }));
+        let page: Page | undefined;
+        try {
+            throwIfRequestExpired();
+            page = await withRequestStage('page.create', () => context.newPage());
+            lease.markCreated();
+            this.pageLeases.set(page, lease);
+            this.trackActivePage(page);
+            if (page.isClosed()) throw new Error('新建页面已关闭');
+            throwIfRequestExpired();
+            return page;
+        } catch (error) {
+            if (page) await this.closeFailedPage(page, 'page-create-expired');
+            else lease.release();
+            throw error;
+        }
+    }
+
+    async createOwnedPage(context: BrowserContext): Promise<Page> {
+        return this.createManagedPage(context);
     }
 
     private pruneClosedActivePages(): void {
         for (const page of Array.from(this.activePages)) {
             if (page.isClosed()) {
                 this.activePages.delete(page);
+                this.pageLeases.get(page)?.release();
+                this.pageLeases.delete(page);
             }
         }
     }
 
     private async closeFailedPage(page: Page, reason: string): Promise<void> {
-        if (!this.activePages.has(page) && page.isClosed()) return;
+        if (page.isClosed()) { this.pruneClosedActivePages(); return; }
         try {
+            this.pageLeases.get(page)?.markClosing();
             await page.close();
         } catch {
-            this.activePages.delete(page);
+            this.pruneClosedActivePages();
             return;
         }
         this.activePages.delete(page);
@@ -975,13 +971,15 @@ class BrowserManager {
         }
     }
 
-    getPoolStats(): { activePages: number; maxConcurrentPages: number; warningThreshold: number; isNearLimit: boolean } {
+    getPoolStats() {
         this.pruneClosedActivePages();
+        const admission = this.admission?.stats();
         return {
             activePages: this.activePages.size,
-            maxConcurrentPages: BrowserManager.MAX_CONCURRENT_PAGES,
+            maxConcurrentPages: admission?.max ?? readPositiveIntEnv('WEB_FETCHER_MAX_CONCURRENT_PAGES', 8),
             warningThreshold: BrowserManager.PAGE_POOL_WARNING_THRESHOLD,
             isNearLimit: this.activePages.size >= BrowserManager.PAGE_POOL_WARNING_THRESHOLD,
+            admission,
         };
     }
 
@@ -1099,7 +1097,7 @@ class BrowserManager {
                     });
                     await page.close().catch(() => { });
                     const timeout = options?.timeout || DEFAULT_TIMEOUT;
-                    const newPage = await (await this.getContext()).newPage();
+                    const newPage = await this.createManagedPage(await this.getContext());
                     try {
                         await installOriginStorage(newPage, url);
                         const retryResponse = await newPage.goto(url, {
@@ -1188,141 +1186,9 @@ class BrowserManager {
      * @param maxWait - 最大等待毫秒数，默认 IMAGE_LOAD_MAX_WAIT (10000)
      * @returns 检测结果（total/ready/waited/note）
      */
-    async waitForVisualReady(
-        page: Page,
-        maxWait: number = IMAGE_LOAD_MAX_WAIT
-    ): Promise<{ waited: number; total: number; ready: number; note?: string }> {
-        const startTime = Date.now();
-        let lastReady = -1;
-        let stableCount = 0;
-
-        try {
-            while (Date.now() - startTime < maxWait) {
-                const result = await page.evaluate((bgMinArea: number) => {
-                    const viewportHeight = window.innerHeight;
-                    let total = 0;
-                    let ready = 0;
-
-                    // 视口过滤函数
-                    const inViewport = (el: Element): boolean => {
-                        const rect = el.getBoundingClientRect();
-                        return rect.width > 0 && rect.height > 0
-                            && rect.top < viewportHeight + 100
-                            && rect.bottom > -100;
-                    };
-
-                    // === 第一层：<img> 标签 ===
-                    const images = document.querySelectorAll('img');
-                    for (const img of images) {
-                        if (!inViewport(img)) continue;
-                        total++;
-                        if ((img as HTMLImageElement).complete) {
-                            ready++; // complete 包含成功和失败，都算"有结果"
-                        }
-                    }
-
-                    // === 第二层：<video> 元素 ===
-                    const videos = document.querySelectorAll('video');
-                    for (const video of videos) {
-                        if (!inViewport(video)) continue;
-                        total++;
-                        if ((video as HTMLVideoElement).readyState >= 1) {
-                            ready++; // HAVE_METADATA: 元数据已加载
-                        }
-                    }
-
-                    // === 第三层：CSS background-image（大块元素） ===
-                    const bgSelectors = 'div, section, header, figure, main, [class*="avatar"], [class*="banner"], [class*="cover"], [class*="thumb"], [class*="poster"]';
-                    const bgElements = document.querySelectorAll(bgSelectors);
-                    const checkedUrls = new Set<string>();
-
-                    for (const el of bgElements) {
-                        const rect = el.getBoundingClientRect();
-                        if (rect.width * rect.height < bgMinArea) continue;
-                        if (!inViewport(el)) continue;
-
-                        const style = getComputedStyle(el);
-                        const bgValue = style.backgroundImage;
-                        if (!bgValue || bgValue === 'none') continue;
-
-                        // 解析 url(...) — 可能有多个
-                        const urlMatches = bgValue.match(/url\(["']?([^"')]+)["']?\)/g);
-                        if (!urlMatches) continue;
-
-                        for (const urlMatch of urlMatches) {
-                            const url = urlMatch.replace(/url\(["']?/, '').replace(/["']?\)/, '');
-                            if (checkedUrls.has(url) || url.startsWith('data:')) continue;
-                            checkedUrls.add(url);
-
-                            total++;
-                            // 临时 Image 检测加载状态
-                            const tempImg = new Image();
-                            tempImg.src = url;
-                            if (tempImg.complete) {
-                                ready++;
-                            }
-                        }
-                    }
-
-                    // === 第四层：同域 iframe 内的 <img> ===
-                    try {
-                        const iframes = document.querySelectorAll('iframe');
-                        for (const iframe of iframes) {
-                            try {
-                                const iframeDoc = (iframe as HTMLIFrameElement).contentWindow?.document;
-                                if (!iframeDoc) continue;
-                                const iframeImages = iframeDoc.querySelectorAll('img');
-                                for (const img of iframeImages) {
-                                    // iframe 内的图用 iframe 的 viewport 判断太复杂，直接检查 complete
-                                    total++;
-                                    if ((img as HTMLImageElement).complete) {
-                                        ready++;
-                                    }
-                                }
-                            } catch { /* 跨域 iframe，跳过 */ }
-                        }
-                    } catch { /* ignore */ }
-
-                    return { total, ready };
-                }, IMAGE_LOAD_BG_MIN_AREA).catch(() => ({ total: 0, ready: 0 }));
-
-                // 无视觉资源 → 立即通过
-                if (result.total === 0) {
-                    return { waited: 0, total: 0, ready: 0 };
-                }
-
-                // 全部加载完 → 成功退出
-                if (result.ready >= result.total) {
-                    const waited = Date.now() - startTime;
-                    console.error(`[web-fetcher] VisualReady: ${result.ready}/${result.total} 资源就绪 (${waited}ms)`);
-                    return { waited, total: result.total, ready: result.ready };
-                }
-
-                // 停滞检测：连续多次 ready 不变 → 不会再有新的了
-                if (result.ready === lastReady) {
-                    stableCount++;
-                    if (stableCount >= IMAGE_LOAD_STABLE_CHECKS) {
-                        const waited = Date.now() - startTime;
-                        console.error(`[web-fetcher] VisualReady: ${result.ready}/${result.total} 资源就绪 (${waited}ms, ${result.total - result.ready}个加载停滞)`);
-                        return { waited, total: result.total, ready: result.ready, note: '部分资源加载停滞' };
-                    }
-                } else {
-                    stableCount = 0;
-                }
-                lastReady = result.ready;
-
-                await page.waitForTimeout(IMAGE_LOAD_CHECK_INTERVAL);
-            }
-
-            // 超时
-            const waited = Date.now() - startTime;
-            console.error(`[web-fetcher] VisualReady: ${lastReady === -1 ? '?' : lastReady}/? 资源 (${waited}ms, 超时)`);
-            return { waited, total: -1, ready: lastReady === -1 ? 0 : lastReady, note: '超时' };
-        } catch (err) {
-            // VisualReady 失败不影响截图
-            console.error(`[web-fetcher] VisualReady 异常: ${err instanceof Error ? err.message : err}`);
-            return { waited: Date.now() - startTime, total: 0, ready: 0, note: '检测异常' };
-        }
+    async waitForVisualReady(page: Page, maxWait: number = IMAGE_LOAD_MAX_WAIT, options: { fullPage?: boolean } = {}): Promise<ReadinessResult> {
+        try { return await waitForPageReadiness(page, { mode: 'visual', maxWait, fullPage: options.fullPage }); }
+        finally { this.pageLeases.get(page)?.markReady(); }
     }
 
     /**
@@ -1353,126 +1219,10 @@ class BrowserManager {
      * 智能内容就绪检测：等待 DOM 稳定（元素数量不再增长）+ iframe 加载
      * 解决 SPA / iframe 页面（如网易云音乐）在 networkidle 后内容仍未渲染的问题
      */
-    private async waitForContentReady(
-        page: Page,
-        timeout: number,
-        url?: string
-    ): Promise<void> {
-        // SmartLoad v6.1: SPA 域名使用更长的等待时间和更严格的稳定判定
-        const isSPA = url ? SPA_LAZY_LOAD_DOMAINS.some(d => url.includes(d)) : false;
-        const maxWait = Math.min(timeout, isSPA ? SMART_LOAD_MAX_WAIT_SPA : SMART_LOAD_MAX_WAIT_NORMAL);
-        const checkInterval = SMART_LOAD_CHECK_INTERVAL;
-        const stableThreshold = isSPA ? SMART_LOAD_STABLE_CHECKS : 2; // SPA 需要 3 次，普通 2 次
-
-        let stableCount = 0;
-        let lastElementCount = 0;
-        let lastTextLength = 0;
-        const startTime = Date.now();
-
-        try {
-            while (Date.now() - startTime < maxWait) {
-                const { elementCount, textLength } = await page.evaluate(() => {
-                    const selector = "img, video, p, h1, h2, h3, h4, span, a, li, td, article, section";
-                    let visibleCount = 0;
-
-                    // 统计主文档可见元素
-                    const mainEls = document.querySelectorAll(selector);
-                    mainEls.forEach((el) => {
-                        const rect = (el as HTMLElement).getBoundingClientRect();
-                        if (rect.width > 0 && rect.height > 0) visibleCount++;
-                    });
-
-                    // 同时统计同域 iframe 内的可见元素
-                    try {
-                        const iframes = document.querySelectorAll("iframe");
-                        for (const iframe of iframes) {
-                            try {
-                                const iframeDoc = (iframe as HTMLIFrameElement).contentWindow?.document;
-                                if (iframeDoc) {
-                                    const iframeEls = iframeDoc.querySelectorAll(selector);
-                                    iframeEls.forEach((el) => {
-                                        const rect = (el as HTMLElement).getBoundingClientRect();
-                                        if (rect.width > 0 && rect.height > 0) visibleCount++;
-                                    });
-                                }
-                            } catch { /* 跨域 iframe 跳过 */ }
-                        }
-                    } catch { /* 忽略 */ }
-
-                    return {
-                        elementCount: visibleCount,
-                        textLength: document.body?.innerText?.length || 0,
-                    };
-                }).catch(() => ({ elementCount: 0, textLength: 0 }));
-
-                const elementDelta = Math.abs(elementCount - lastElementCount);
-                const textDelta = Math.abs(textLength - lastTextLength);
-
-                // SmartLoad: 元素数稳定 + 文本长度变化小于阈值 + 超过最小内容要求
-                const elementsStable = elementDelta === 0 && elementCount > 0;
-                const textStable = textDelta < SMART_LOAD_STABILITY_THRESHOLD;
-                const hasMinContent = textLength >= SMART_LOAD_MIN_CONTENT_LENGTH;
-
-                if (elementsStable && textStable && hasMinContent) {
-                    stableCount++;
-                    if (stableCount >= stableThreshold) {
-                        console.error(
-                            `[web-fetcher] SmartLoad: 内容稳定 — ${elementCount}元素, ${textLength}字符, ${Date.now() - startTime}ms${isSPA ? ' (SPA模式)' : ''}`
-                        );
-                        break;
-                    }
-                } else {
-                    stableCount = 0;
-                }
-                lastElementCount = elementCount;
-                lastTextLength = textLength;
-
-                await page.waitForTimeout(checkInterval);
-            }
-
-            // 额外检查 iframe 是否加载
-            const iframeCount = await page.evaluate(
-                () => document.querySelectorAll("iframe").length
-            );
-            if (iframeCount > 0) {
-                // 等待所有 iframe load 事件（最多 3 秒）
-                await page.evaluate(() => {
-                    return new Promise<void>((resolve) => {
-                        const iframes = document.querySelectorAll("iframe");
-                        let loaded = 0;
-                        const total = iframes.length;
-                        const timer = setTimeout(resolve, 3000);
-
-                        iframes.forEach((iframe) => {
-                            if ((iframe as HTMLIFrameElement).contentDocument?.readyState === "complete") {
-                                loaded++;
-                            } else {
-                                iframe.addEventListener("load", () => {
-                                    loaded++;
-                                    if (loaded >= total) {
-                                        clearTimeout(timer);
-                                        resolve();
-                                    }
-                                });
-                            }
-                        });
-
-                        if (loaded >= total) {
-                            clearTimeout(timer);
-                            resolve();
-                        }
-                    });
-                }).catch(() => {
-                    // 跨域 iframe 无法访问 contentDocument，忽略
-                });
-                console.error(
-                    `[web-fetcher] ${iframeCount} 个 iframe 加载检查完成`
-                );
-            }
-        } catch {
-            // 检测过程出错不影响主流程
-            console.error("[web-fetcher] 内容就绪检测出错，继续处理");
-        }
+    private async waitForContentReady(page: Page, timeout: number, url?: string): Promise<void> {
+        const isSPA = url ? SPA_LAZY_LOAD_DOMAINS.some(domain => url.includes(domain)) : false;
+        await waitForPageReadiness(page, { mode: 'content', maxWait: Math.min(timeout, isSPA ? 15000 : 8000), minimumObserveMs: isSPA ? 1000 : 500 });
+        if (!/screenshot|snapshot|inspect/.test(getRequestContext()?.intent ?? '')) this.pageLeases.get(page)?.markReady();
     }
 
     /**
@@ -1495,11 +1245,7 @@ class BrowserManager {
                     );
                 }
 
-                // 等待新内容加载
-                await page.waitForTimeout(1500);
-
-                // 如果有 networkidle 就等一下
-                await page.waitForLoadState("networkidle", { timeout: 5000 }).catch(() => { });
+                await waitForPageReadiness(page, { mode: 'content', maxWait: 4000, minimumObserveMs: 1000 });
 
                 const newScroll = await page.evaluate(() => window.scrollY);
                 const newHeight = await page.evaluate(() => document.body.scrollHeight);
@@ -1541,6 +1287,10 @@ class BrowserManager {
      * @returns 是否成功完成验证
      */
     async userAssistedVerification(url: string): Promise<boolean> {
+        return withSuspendedRequestDeadline(() => this.performUserAssistedVerification(url), 600000);
+    }
+
+    private async performUserAssistedVerification(url: string): Promise<boolean> {
         const context = this.context;
         if (!context) return false;
         try {
@@ -1662,13 +1412,12 @@ class BrowserManager {
             clearTimeout(this.idleTimer);
             this.idleTimer = null;
         }
-        if (this.bareContext) await this.closeContextPreservingStorage(this.bareContext, BROWSER_USER_DATA_DIR + "-bare", "bare context");
-        if (this.context) await this.closeContextPreservingStorage(this.context, BROWSER_USER_DATA_DIR, "主 context");
-        this.bareContext = null;
-        this.context = null;
+        if (this.bareContext && await this.closeContextPreservingStorage(this.bareContext, BROWSER_USER_DATA_DIR + "-bare", "bare context")) this.bareContext = null;
+        if (this.context && await this.closeContextPreservingStorage(this.context, BROWSER_USER_DATA_DIR, "主 context")) this.context = null;
         this.bareLaunching = null;
         this.launching = null;
-        this.activePages.clear();
+        this.pruneClosedActivePages();
+        if (this.context || this.bareContext || this.activePages.size) throw new Error('浏览器关闭未确认，保留页面占用与恢复信息');
         console.error("[web-fetcher] 浏览器已关闭");
     }
 
@@ -1680,17 +1429,24 @@ class BrowserManager {
         await this.close();
     }
 
-    private closingContexts = new WeakMap<BrowserContext, Promise<void>>();
+    async shutdown(): Promise<void> {
+        this.admission?.dispose();
+        try { await this.close(); }
+        finally { await getRuntimeMemorySampler().close(); }
+    }
 
-    private closeContextPreservingStorage(context: BrowserContext, profileDir: string, label: string): Promise<void> {
+    private closingContexts = new WeakMap<BrowserContext, Promise<boolean>>();
+
+    private closeContextPreservingStorage(context: BrowserContext, profileDir: string, label: string): Promise<boolean> {
         const previous = this.closingContexts.get(context);
         if (previous) return previous;
         const pending = this.persistAndCloseContext(context, profileDir, label);
         this.closingContexts.set(context, pending);
+        void pending.then(closed => { if (!closed) this.closingContexts.delete(context); }, () => this.closingContexts.delete(context));
         return pending;
     }
 
-    private async persistAndCloseContext(context: BrowserContext, profileDir: string, label: string): Promise<void> {
+    private async persistAndCloseContext(context: BrowserContext, profileDir: string, label: string): Promise<boolean> {
         const marker = path.join(profileDir, ".web-fetcher-recovery.json");
         const alreadyRetained = fs.existsSync(marker);
         let marked = alreadyRetained;
@@ -1713,7 +1469,7 @@ class BrowserManager {
         }
         if (!saved || !closed || !marked || alreadyRetained) {
             console.error(`[web-fetcher] recovery profile retained (${label}): ${profileDir}`);
-            return;
+            return closed;
         }
         try {
             if (path.dirname(path.resolve(profileDir)) !== path.resolve(BROWSER_PROFILES_BASE_DIR)) throw new Error("unexpected profile directory");
@@ -1722,6 +1478,7 @@ class BrowserManager {
         } catch {
             console.error(`[web-fetcher] profile cleanup incomplete (${label}); recovery marker retained when available`);
         }
+        return closed;
     }
 
     /**
@@ -1732,8 +1489,10 @@ class BrowserManager {
             clearTimeout(this.idleTimer);
         }
         this.idleTimer = setTimeout(() => {
-            this.closeBrowser();
+            if (getActiveRequestCount() > 0 || this.activePages.size > 0) this.resetIdleTimer();
+            else void this.closeBrowser().catch(error => console.error('[web-fetcher] idle close failed', error));
         }, BrowserManager.BROWSER_IDLE_TIMEOUT);
+        this.idleTimer.unref();
     }
 
     /**

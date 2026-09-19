@@ -7,6 +7,9 @@ from typing import Any, Dict, List, Optional
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx import Presentation
 
+from inspection_geometry import BoundedIssues, IDENTITY, PairBudget, contains, evidence, local_peer_groups, transform_rect
+from pptx_evidence import assign_containers, paint_metadata, shape_transform, text_metadata
+
 
 Rect = Dict[str, float]
 SMALL_FONT_THRESHOLD_PT = 7.0
@@ -62,54 +65,65 @@ def _shape_kind(shape: Any, text: str) -> str:
 def _font_size(shape: Any) -> Optional[float]:
     if not getattr(shape, "has_text_frame", False):
         return None
+    sizes = []
     for paragraph in shape.text_frame.paragraphs:
+        if paragraph.font.size:
+            sizes.append(float(paragraph.font.size.pt))
         for run in paragraph.runs:
             if run.font.size:
-                return float(run.font.size.pt)
-    return None
+                sizes.append(float(run.font.size.pt))
+    return max(sizes) if sizes else None
 
 
 def _text_clipping_sides(element: Dict[str, Any]) -> List[str]:
-    text = str(element.get("text") or "")
-    font_size = element.get("fontSize")
-    if not text or not isinstance(font_size, (int, float)) or float(font_size) <= 0:
-        return []
-
-    bounds = element["bounds"]
-    width = max(0.0, float(bounds["x1"] - bounds["x0"]))
-    height = max(0.0, float(bounds["y1"] - bounds["y0"]))
-    font_emu = float(font_size) * 12700.0
-    lines = [line for line in text.splitlines() if line.strip()] or [text]
-    longest_line = max(lines, key=len)
-    estimated_line_width = len(longest_line) * font_emu * 0.55
-    estimated_text_height = len(lines) * font_emu * 1.25
-    sides: List[str] = []
-    if estimated_line_width > width * 1.08:
-        sides.append("right")
-    if estimated_text_height > height * 1.08:
-        sides.append("bottom")
-    return sides
+    return list(element.get("metadata", {}).get("estimatedOverflowSides", []))
 
 
-def _element_from_shape(shape: Any, z_order: int, page: int) -> Dict[str, Any]:
+def _element_from_shape(shape: Any, z_order: int, page: int, parent=IDENTITY, parent_id=None) -> Dict[str, Any]:
     text = _shape_text(shape)
     kind = _shape_kind(shape, text)
+    local_bounds, matrix, _ = shape_transform(shape, parent)
     element: Dict[str, Any] = {
         "type": kind,
         "name": getattr(shape, "name", f"shape-{z_order + 1}"),
         "text": text,
-        "bounds": _rect_from_shape(shape),
+        "bounds": transform_rect(local_bounds, matrix),
         "zOrder": z_order,
         "source": "pptx",
         "page": page,
         "metadata": {
             "shapeType": str(getattr(shape, "shape_type", "unknown")),
+            "shapeId": f"{parent_id or page}/{shape.shape_id}",
+            "parentId": parent_id,
+            "paintOrder": z_order,
+            **paint_metadata(shape, kind, matrix),
         },
     }
     size = _font_size(shape)
     if size is not None:
         element["fontSize"] = size
+    element["metadata"].update(text_metadata(shape, local_bounds, matrix, size))
+    if getattr(shape, "is_placeholder", False):
+        element["metadata"]["placeholderType"] = str(shape.placeholder_format.type)
     return element
+
+
+def _slide_elements(slide: Any, page: int, width: float, height: float) -> List[Dict[str, Any]]:
+    elements: List[Dict[str, Any]] = []
+
+    def visit(shapes, parent=IDENTITY, parent_id=None):
+        for shape in shapes:
+            if float(getattr(shape, "width", 0) or 0) <= 0 or float(getattr(shape, "height", 0) or 0) <= 0:
+                continue
+            element = _element_from_shape(shape, len(elements), page, parent, parent_id)
+            elements.append(element)
+            if getattr(shape, "shape_type", None) == MSO_SHAPE_TYPE.GROUP:
+                _, _, child_matrix = shape_transform(shape, parent)
+                visit(shape.shapes, child_matrix, element["metadata"]["shapeId"])
+
+    visit(slide.shapes)
+    assign_containers(elements, width, height)
+    return elements
 
 
 def _union_rect(rects: List[Rect]) -> Rect:
@@ -159,11 +173,7 @@ def extract_structure(pptx_path: str, slide_num: Optional[int] = None) -> List[D
     for slide_index in _slide_indices(prs, slide_num):
         slide = prs.slides[slide_index]
         page = slide_index + 1
-        elements = [
-            _element_from_shape(shape, z_order, page)
-            for z_order, shape in enumerate(slide.shapes)
-            if float(getattr(shape, "width", 0) or 0) > 0 and float(getattr(shape, "height", 0) or 0) > 0
-        ]
+        elements = _slide_elements(slide, page, float(prs.slide_width), float(prs.slide_height))
         results.append({
             "page": page,
             "dimensions": {
@@ -173,6 +183,16 @@ def extract_structure(pptx_path: str, slide_num: Optional[int] = None) -> List[D
             },
             "elements": elements,
             "source": "pptx",
+            "metadata": {
+                "layoutName": slide.slide_layout.name,
+                "inspectionLimitations": [
+                    "Text line positions are estimates, not rendered font metrics; text collisions and clipping require visual review.",
+                    "Inherited fonts/fills, complex paths, image alpha, tables/charts, master artwork and animation visibility are not fully resolved.",
+                    "Group transforms are applied; arbitrary rotated bounds and unsupported vertical/multicolumn text remain candidates.",
+                    "Translucent fills are not treated as opaque masks; local peer filtering does not prove equal-size or equal-spacing design intent.",
+                    "Text estimates retain at most 512 lines per element; textLayoutLimited marks incomplete line evidence.",
+                ],
+            },
         })
 
     return results
@@ -191,19 +211,51 @@ def _overflow_sides(rect: Rect, width: float, height: float) -> List[str]:
     return sides
 
 
-def _severity_for_overlap(a: Dict[str, Any], b: Dict[str, Any]) -> str:
-    types = {a["type"], b["type"]}
-    if types == {"text"}:
-        return "error"
-    if "text" in types and "image" in types:
-        text_elem = a if a["type"] == "text" else b
-        image_elem = a if a["type"] == "image" else b
-        if image_elem["zOrder"] > text_elem["zOrder"]:
-            return "error"
-        return "warning"
-    if "text" in types:
-        return "warning"
-    return "info"
+def _overlap_evidence(first: Dict[str, Any], second: Dict[str, Any]):
+    if any(element['metadata'].get('visibleText') is False for element in (first, second)):
+        return None
+    if "group" in {first["type"], second["type"]}:
+        return None
+    behind, front = sorted((first, second), key=lambda item: item['zOrder'])
+    front_meta, behind_meta = front['metadata'], behind['metadata']
+    if behind['type'] in {'text', 'image', 'table'} and front_meta.get('opaqueRectangle'):
+        frame_resolved = behind['type'] != 'text' or (
+            behind_meta.get('autoFit') in {'none', 'shrink'} and behind_meta.get('textMetrics') == 'estimated'
+            and not behind_meta.get('textLayoutLimited')
+            and behind_meta.get('textRegions') and not behind_meta.get('estimatedOverflowSides')
+            and all(contains(behind['bounds'], region, 1) for region in behind_meta['textRegions']))
+        if contains(front['bounds'], behind['bounds'], 1) and frame_resolved:
+            return evidence('paint-order-opaque-rectangle', ['later_opaque_rectangle', 'content_bounds_fully_covered'], 'high', True)
+        regions = behind_meta.get('textRegions') if behind['type'] == 'text' else [behind['bounds']]
+        if regions and any(_overlap_percent(region, front['bounds']) >= 15 for region in regions):
+            return evidence('estimated-text-occlusion', ['later_opaque_rectangle', 'estimated_content_intersection'])
+        if not regions:
+            return evidence('unresolved-text-occlusion', ['later_opaque_rectangle', 'font_metrics_unresolved'], 'low')
+    if first['type'] == second['type'] == 'text':
+        first_regions = first['metadata'].get('textRegions', [])
+        second_regions = second['metadata'].get('textRegions', [])
+        if first_regions and second_regions:
+            comparisons = 0
+            for left in first_regions:
+                for right in second_regions:
+                    comparisons += 1
+                    if comparisons > 4096:
+                        first['metadata']['textComparisonLimited'] = True
+                        return evidence('estimated-text-lines', ['text_comparison_budget_exceeded'], 'low')
+                    if _overlap_percent(left, right) >= 15:
+                        return evidence('estimated-text-lines', ['estimated_text_line_intersection'])
+            return evidence('text-frame-intersection',
+                            ['text_frames_intersect', 'estimated_lines_separate', 'rendered_metrics_required'], 'low')
+        else:
+            return evidence('text-frame-intersection', ['font_metrics_unresolved'], 'low')
+    elif behind['type'] == 'text' and front['type'] in {'image', 'shape'}:
+        if front['type'] == 'shape' and (front_meta.get('fillOpacity') == 0 or
+                isinstance(front_meta.get('fillOpacity'), (float, int)) and front_meta['fillOpacity'] < 1):
+            return None
+        regions = behind_meta.get('textRegions', [])
+        if regions and any(_overlap_percent(region, front['bounds']) >= 15 for region in regions):
+            return evidence('unresolved-paint-intersection', ['later_paint', 'complex_geometry_or_alpha_unresolved'], 'low')
+    return None
 
 
 def detect_issues(
@@ -215,9 +267,12 @@ def detect_issues(
     active_checks = set(checks or ["overlap", "overflow"])
     thresholds = thresholds or {}
     structures = extract_structure(pptx_path, slide_num)
-    issues: List[Dict[str, Any]] = []
+    issues = BoundedIssues()
+    pair_budget = PairBudget()
 
     for structure in structures:
+        if issues.full():
+            break
         page = structure["page"]
         width = float(structure["dimensions"]["width"])
         height = float(structure["dimensions"]["height"])
@@ -225,41 +280,66 @@ def detect_issues(
 
         if "overflow" in active_checks:
             for element in elements:
+                if issues.full():
+                    break
+                if element['metadata'].get('visibleText') is False:
+                    continue
+                if element['type'] in {'shape', 'group'}:
+                    continue
                 sides = _overflow_sides(element["bounds"], width, height)
                 if not sides:
                     continue
+                if element['type'] == 'text':
+                    regions = element['metadata'].get('textRegions', [])
+                    if regions and not any(_overflow_sides(region, width, height) for region in regions):
+                        continue
+                confirmed = element['type'] in {'image', 'table'}
                 issues.append({
                     "type": "overflow",
-                    "severity": "error",
+                    "severity": "error" if confirmed else "warning",
                     "page": page,
                     "description": f"{element['name']} 超出幻灯片边界: {', '.join(sides)}",
                     "elements": [element],
                     "bounds": element["bounds"],
-                    "metadata": {"sides": sides, "source": "pptx-native"},
+                    "metadata": {"sides": sides, "source": "pptx-native", **evidence(
+                        'page-boundary', ['content_outside_page'] if confirmed else ['estimated_text_outside_page'],
+                        'high' if confirmed else 'medium', confirmed)},
                 })
 
         if "overlap" in active_checks:
             for i, first in enumerate(elements):
+                if issues.full() or pair_budget.limit_reached:
+                    break
                 for second in elements[i + 1:]:
+                    if issues.full() or not pair_budget.allow():
+                        break
                     percent = _overlap_percent(first["bounds"], second["bounds"])
                     if percent < 2:
                         continue
+                    assessment = _overlap_evidence(first, second)
+                    if assessment is None:
+                        continue
                     issues.append({
                         "type": "overlap",
-                        "severity": _severity_for_overlap(first, second),
+                        "severity": "error" if assessment['assessment'] == 'confirmed' else "info" if assessment['confidence'] == 'low' else "warning",
                         "page": page,
-                        "description": f"{first['name']} 与 {second['name']} 重叠 {percent:.1f}%",
+                        "description": f"{first['name']} 与 {second['name']} {'遮挡' if assessment['assessment'] == 'confirmed' else '疑似内容相交，需视觉复核'}（外框交叠 {percent:.1f}%）",
                         "elements": [first, second],
                         "bounds": _union_rect([first["bounds"], second["bounds"]]),
                         "metadata": {
                             "overlapPercent": round(percent, 2),
                             "source": "pptx-native",
+                            **assessment,
                         },
                     })
 
         if "readability" in active_checks:
             small_font_threshold = float(thresholds.get("smallFontPt") or SMALL_FONT_THRESHOLD_PT)
             for element in elements:
+                if issues.full():
+                    break
+                if element['metadata'].get('visibleText') is False:
+                    continue
                 if element.get("type") != "text":
                     continue
                 font_size = element.get("fontSize")
@@ -294,7 +374,7 @@ def detect_issues(
                         },
                     })
 
-    if "alignment" in active_checks:
+    if "alignment" in active_checks and not issues.full():
         issues.extend(_detect_title_alignment(
             structures,
             float(thresholds.get("titleTopVarianceEmu") or TITLE_TOP_VARIANCE_THRESHOLD_EMU),
@@ -308,6 +388,14 @@ def detect_issues(
             float(thresholds.get("gapVarianceRatio") or GAP_VARIANCE_THRESHOLD_RATIO),
         ))
 
+    pair_budget.annotate(structures, issues)
+    for issue in issues:
+        metadata = issue.setdefault('metadata', {})
+        if 'assessment' not in metadata:
+            metadata.update(evidence(
+                'estimated-text-layout' if issue['type'] == 'clipped' else 'local-layout-heuristic',
+                ['font_metrics_estimated'] if issue['type'] == 'clipped' else [metadata.get('check', issue['type'])],
+            ))
     errors = sum(1 for issue in issues if issue["severity"] == "error")
     warnings = sum(1 for issue in issues if issue["severity"] == "warning")
     return {
@@ -327,8 +415,10 @@ def _candidate_title(structure: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     text_elements = [element for element in structure["elements"] if element.get("type") == "text" and element.get("text")]
     if not text_elements:
         return None
-    named = [element for element in text_elements if "title" in str(element.get("name", "")).lower()]
-    candidates = named or text_elements
+    candidates = [element for element in text_elements
+                  if element.get('metadata', {}).get('placeholderType') == 'TITLE (1)']
+    if not candidates:
+        return None
     return sorted(
         candidates,
         key=lambda element: (
@@ -340,6 +430,10 @@ def _candidate_title(structure: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 
 
 def _detect_title_alignment(structures: List[Dict[str, Any]], threshold: float) -> List[Dict[str, Any]]:
+    layouts = {structure.get('metadata', {}).get('layoutName') for structure in structures}
+    if len(layouts) > 1:
+        return [issue for layout in layouts for issue in _detect_title_alignment(
+            [structure for structure in structures if structure.get('metadata', {}).get('layoutName') == layout], threshold)]
     titles = [title for title in (_candidate_title(structure) for structure in structures) if title]
     if len(titles) < 2:
         return []
@@ -371,23 +465,19 @@ def _detect_title_alignment(structures: List[Dict[str, Any]], threshold: float) 
     }]
 
 
-def _normalized_size_group(element: Dict[str, Any]) -> str:
-    name = str(element.get("name") or "").lower()
-    normalized = "".join(ch if ch.isalpha() else " " for ch in name).strip()
-    first_word = normalized.split()[0] if normalized.split() else str(element.get("type") or "shape")
-    return f"{element.get('type')}:{first_word}"
-
-
 def _detect_size_consistency(structures: List[Dict[str, Any]], threshold: float) -> List[Dict[str, Any]]:
     groups: Dict[str, List[Dict[str, Any]]] = {}
     for structure in structures:
-        for element in structure["elements"]:
-            if element.get("type") not in {"text", "image", "shape"}:
-                continue
-            groups.setdefault(_normalized_size_group(element), []).append(element)
+        if len(structure['elements']) > 500:
+            continue
+        for axis in ('x', 'y'):
+            for index, peers in enumerate(local_peer_groups(structure['elements'], axis)):
+                groups[f"page-{structure['page']}:{axis}:{index}"] = peers
 
-    issues: List[Dict[str, Any]] = []
+    issues = BoundedIssues()
     for group, elements in groups.items():
+        if issues.full():
+            break
         if len(elements) < 2:
             continue
         widths = [float(element["bounds"]["x1"] - element["bounds"]["x0"]) for element in elements]
@@ -396,7 +486,12 @@ def _detect_size_consistency(structures: List[Dict[str, Any]], threshold: float)
         avg_h = sum(heights) / len(heights)
         width_ratio = ((max(widths) - min(widths)) / avg_w) if avg_w else 0
         height_ratio = ((max(heights) - min(heights)) / avg_h) if avg_h else 0
-        if max(width_ratio, height_ratio) <= threshold:
+        axis = group.split(':')[1]
+        tiled = all(abs(right['bounds'][axis + '0'] - left['bounds'][axis + '1']) <= 2
+                    for left, right in zip(elements, elements[1:]))
+        compared_dimensions = ['height' if axis == 'x' else 'width'] if tiled else ['width', 'height']
+        compared_ratios = [width_ratio if dimension == 'width' else height_ratio for dimension in compared_dimensions]
+        if max(compared_ratios) <= threshold:
             continue
         issues.append({
             "type": "inconsistent-size",
@@ -410,6 +505,7 @@ def _detect_size_consistency(structures: List[Dict[str, Any]], threshold: float)
                 "group": group,
                 "widthVarianceRatio": round(width_ratio, 3),
                 "heightVarianceRatio": round(height_ratio, 3),
+                "comparedDimensions": compared_dimensions,
                 "threshold": threshold,
                 "source": "pptx-native",
             },
@@ -418,27 +514,25 @@ def _detect_size_consistency(structures: List[Dict[str, Any]], threshold: float)
 
 
 def _detect_uneven_spacing(structures: List[Dict[str, Any]], threshold: float) -> List[Dict[str, Any]]:
-    issues: List[Dict[str, Any]] = []
+    issues = BoundedIssues()
     for structure in structures:
-        text_elements = [
-            element for element in structure["elements"]
-            if element.get("type") == "text" and float(element["bounds"]["x1"] - element["bounds"]["x0"]) > 0
-        ]
-        rows: Dict[int, List[Dict[str, Any]]] = {}
-        row_bucket = 120000
-        for element in text_elements:
-            bucket = round(float(element["bounds"]["y0"]) / row_bucket)
-            rows.setdefault(bucket, []).append(element)
-        for bucket, row in rows.items():
-            if len(row) < 4:
+        if issues.full():
+            break
+        if len(structure['elements']) > 500:
+            continue
+        groups = [(axis, group) for axis in ('x', 'y') for group in local_peer_groups(structure['elements'], axis)]
+        for bucket, (axis, row) in enumerate(groups):
+            if issues.full():
+                break
+            if len(row) < 3:
                 continue
-            ordered = sorted(row, key=lambda element: float(element["bounds"]["x0"]))
+            ordered = sorted(row, key=lambda element: float(element["bounds"][axis + '0']))
             gaps = [
-                float(right["bounds"]["x0"] - left["bounds"]["x1"])
+                float(right["bounds"][axis + '0'] - left["bounds"][axis + '1'])
                 for left, right in zip(ordered, ordered[1:])
-                if right["bounds"]["x0"] >= left["bounds"]["x1"]
+                if right["bounds"][axis + '0'] >= left["bounds"][axis + '1']
             ]
-            if len(gaps) < 3:
+            if len(gaps) < 2:
                 continue
             avg_gap = sum(gaps) / len(gaps)
             if avg_gap <= 0:
@@ -450,12 +544,13 @@ def _detect_uneven_spacing(structures: List[Dict[str, Any]], threshold: float) -
                 "type": "uneven-spacing",
                 "severity": "info",
                 "page": int(structure["page"]),
-                "description": f"第 {structure['page']} 页同一行元素间距差异 {variance:.2f}，超过阈值 {threshold:.2f}",
+                "description": f"第 {structure['page']} 页局部同类元素间距差异 {variance:.2f}，超过阈值 {threshold:.2f}，需复核布局意图",
                 "elements": ordered,
                 "bounds": _union_rect([element["bounds"] for element in ordered]),
                 "metadata": {
                     "check": "row-gap-consistency",
                     "rowBucket": bucket,
+                    "axis": axis,
                     "gaps": [round(gap, 2) for gap in gaps],
                     "varianceRatio": round(variance, 3),
                     "threshold": threshold,
@@ -479,14 +574,12 @@ def search_text_region(pptx_path: str, target: str, slide_num: Optional[int] = N
         slide = prs.slides[slide_index]
         matches: List[Rect] = []
         names: List[str] = []
-        for shape in slide.shapes:
-            if not getattr(shape, "has_text_frame", False):
-                continue
-            text = (getattr(shape, "text", "") or "").strip()
+        for element in _slide_elements(slide, slide_index + 1, float(prs.slide_width), float(prs.slide_height)):
+            text = element.get('text', '')
             if target_text not in text.lower():
                 continue
-            matches.append(_rect_from_shape(shape))
-            names.append(getattr(shape, "name", f"shape-{len(names) + 1}"))
+            matches.append(element['bounds'])
+            names.append(element['name'])
 
         if matches:
             return {

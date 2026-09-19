@@ -1,6 +1,7 @@
 ﻿import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { touchActivity } from "../lifecycle.js";
 import { formatPoolPressureHint, sessionManager } from "../session.js";
 import { extractContent, safePageEvaluate, safePageContent } from "../extractor.js";
@@ -11,6 +12,8 @@ import { inlineImageContent } from "../image-output.js";
 import * as fs from "fs";
 
 const InteractInputSchema = z.object({
+    viewport: viewportSchema.optional(),
+    fullPage: z.boolean().optional().describe("screenshot/snapshot 截取整个滚动页面，默认 false；不改变 CSS viewport；frame 截图仍限于指定 iframe 元素"),
     saveMode: z.enum(["inline", "file"]).optional().describe("截图/快照输出：inline 默认直接返回图片与文本；file 显式返回临时文件路径"),
     sessionId: z
         .string()
@@ -86,6 +89,8 @@ export function registerInteract(server: McpServer): void {
 
 参数:
   - sessionId (string, 可选): 复用会话
+  - viewport (object, 可选): 网页 CSS 视口 {width,height}；仅明确指定时调整已有会话，不模拟设备 UA/触摸
+  - fullPage (boolean, 可选): screenshot/snapshot 是否包括滚动区域，默认 false，不改变 CSS 视口
   - ownerId (string, 可选): 会话所有者标识，未传兼容 global
   - url (string, 可选): 新页面 URL
   - action (string): click / type / scroll / wait / screenshot / content / visible / snapshot / find / press / evaluate / close
@@ -95,6 +100,8 @@ export function registerInteract(server: McpServer): void {
   - timeout (number, 可选): 超时毫秒数
    - frame (string, 可选): iframe CSS 选择器，操作在 iframe 内执行`,
             inputSchema: {
+                viewport: InteractInputSchema.shape.viewport,
+                fullPage: InteractInputSchema.shape.fullPage,
                 saveMode: InteractInputSchema.shape.saveMode,
                 sessionId: InteractInputSchema.shape.sessionId,
                 ownerId: InteractInputSchema.shape.ownerId,
@@ -131,9 +138,11 @@ export function registerInteract(server: McpServer): void {
                         };
                     }
                 } else if (params.url) {
+                    assertViewportTarget(params.url, params.viewport);
                     sessionId = await sessionManager.create(params.url, {
                         timeout: params.timeout,
                         ownerId,
+                        viewport: params.viewport,
                     });
                     page = sessionManager.get(sessionId, ownerId)!;
                 } else {
@@ -143,6 +152,7 @@ export function registerInteract(server: McpServer): void {
                     };
                 }
 
+                if (params.action !== "close") await applyExplicitViewport(page, params.viewport);
                 const timeout = params.timeout ?? 30000;
                 const finalize = (
                     result: { content?: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }>; isError?: boolean },
@@ -367,18 +377,19 @@ export function registerInteract(server: McpServer): void {
 
                     case "screenshot": {
                         const qConfig = QUALITY_PRESETS["default"];
-                        await browserManager.waitForVisualReady(page);
+                        const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: !params.frame && (params.fullPage ?? false) });
+                        const readinessWarning = readiness.complete === false && readiness.note ? `\n⚠️ ${readiness.note}` : "";
                         // v6.7: frame-aware screenshot
                         let buffer: Buffer;
                         if (params.frame) {
                             buffer = await page.locator(params.frame.split(' >> ')[0]).screenshot({ type: "jpeg", quality: qConfig.jpegQuality });
                         } else {
-                            buffer = await page.screenshot({ type: "jpeg", quality: qConfig.jpegQuality, fullPage: false });
+                            buffer = await page.screenshot({ type: "jpeg", quality: qConfig.jpegQuality, fullPage: params.fullPage ?? false });
                         }
                         const sizeKB = (buffer.length / 1024).toFixed(1);
 
                         if (params.saveMode !== "file") {
-                            return finalize({ content: await inlineImageContent(buffer, `截图\nSessionId: ${sessionId}\n当前 URL: ${page.url()}`) }, startTime);
+                            return finalize({ content: await inlineImageContent(buffer, `截图${readinessWarning}\nSessionId: ${sessionId}\n当前 URL: ${page.url()}`) }, startTime);
                         }
 
                         // 自动分片保存
@@ -391,7 +402,7 @@ export function registerInteract(server: McpServer): void {
                             return finalize({
                                 content: [{
                                     type: "text" as const,
-                                    text: `📐 ${splitResult.description}\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n\n${fileList}\n\n使用 view_file 工具按顺序查看各片`,
+                                    text: `📐 ${splitResult.description}${readinessWarning}\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n\n${fileList}\n\n使用 view_file 工具按顺序查看各片`,
                                 }],
                             }, startTime);
                         }
@@ -399,7 +410,7 @@ export function registerInteract(server: McpServer): void {
                         return finalize({
                             content: [{
                                 type: "text" as const,
-                                text: `📸 截图 (${sizeKB} KB)\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n文件: ${splitResult.paths[0]}\n\n使用 view_file 工具查看此图片`,
+                                text: `📸 截图 (${sizeKB} KB)${readinessWarning}\nSessionId: ${sessionId}\n当前 URL: ${page.url()}\n文件: ${splitResult.paths[0]}\n\n使用 view_file 工具查看此图片`,
                             }],
                         }, startTime);
                     }
@@ -515,7 +526,7 @@ export function registerInteract(server: McpServer): void {
                     }
 
                     case "snapshot": {
-                        const content = await buildPageSnapshot(page, { sessionId, saveMode: params.saveMode });
+                        const content = await buildPageSnapshot(page, { sessionId, saveMode: params.saveMode, fullPage: params.fullPage });
                         return finalize({ content }, startTime);
                     }
 

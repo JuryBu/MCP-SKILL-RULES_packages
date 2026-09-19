@@ -116,7 +116,7 @@ function mockPage(buffer, { totalPages = 3, missingPage, failPage } = {}) {
 }
 
 test("screenshot defaults to inline for PNG/JPEG; explicit file retains file-only result", async context => {
-    context.mock.method(browserManager, "waitForVisualReady", async () => {});
+    context.mock.method(browserManager, "waitForVisualReady", async () => ({ complete: true, total: 0, ready: 0, pending: 0, failed: 0, waited: 0, fontsReady: true, scanLimited: false }));
     const { callback, definition } = getTool(registerFetchScreenshot);
     assert.match(definition.inputSchema.saveMode.description, /inline.*默认/);
     for (const format of ["png", "jpeg"]) {
@@ -193,7 +193,7 @@ test("multi-page explicit file keeps legacy path list and manifest thresholds", 
 test("rich defaults to image plus text and explicit file remains text-only", async context => {
     const buffer = await makeImage();
     context.mock.method(browserManager, "navigateTo", async () => mockPage(buffer));
-    context.mock.method(browserManager, "waitForVisualReady", async () => {});
+    context.mock.method(browserManager, "waitForVisualReady", async () => ({ complete: true, total: 0, ready: 0, pending: 0, failed: 0, waited: 0, fontsReady: true, scanLimited: false }));
     const { callback, definition } = getTool(registerFetchRich);
     assert.match(definition.inputSchema.saveMode.description, /inline.*默认/);
     const inline = await callback({ url: "https://image-output.test/rich", compact: "full" });

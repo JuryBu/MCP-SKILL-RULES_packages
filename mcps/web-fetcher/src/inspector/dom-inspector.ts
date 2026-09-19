@@ -1,5 +1,8 @@
 import type { Page } from "playwright";
 import { browserManager } from "../browser.js";
+import { applyExplicitViewport, type ResponsiveViewport } from "../viewport.js";
+import { throwIfRequestExpired } from "../request-context.js";
+import { extractVisibleDomElements, type RawDomElement } from "./dom-evidence.js";
 import { ensureTempDirs, generateCacheKey, TEMP_DIRS } from "../temp-store.js";
 import {
     expandRect,
@@ -10,7 +13,6 @@ import {
 import type {
     InspectElement,
     InspectIssue,
-    InspectIssueSeverity,
     InspectMetadataValue,
     InspectResult,
     PageStructure,
@@ -20,6 +22,7 @@ import type {
 export type DomCheck = "overlap" | "overflow" | "readability" | "alignment" | (string & {});
 
 export interface DomInspectorOptions {
+    viewport?: ResponsiveViewport;
     timeout?: number;
     scrollCount?: number;
     maxDepth?: number;
@@ -37,31 +40,16 @@ export interface DomInspectElement extends InspectElement {
     backgroundColor: string;
 }
 
-interface RawDomElement {
-    tag: string;
-    id: string;
-    className: string;
-    text: string;
-    bounds: Rect;
-    zIndex: string;
-    zOrder: number;
-    visibility: string;
-    opacity: number;
-    overflow: string;
-    position: string;
-    fontSize: number;
-    color: string;
-    backgroundColor: string;
-    domPath: string;
-    clippingBounds: Rect | null;
-}
-
 const DEFAULT_OVERLAP_THRESHOLD_PERCENT = 15;
 const DEFAULT_MAX_DEPTH = 20;
 const MIN_VISIBLE_ELEMENT_SIZE = 5;
 const SMALL_FONT_THRESHOLD_PX = 10;
 const MIN_CONTRAST_RATIO = 4.5;
 const ISSUE_BOUNDS_PADDING = 12;
+const MAX_DOM_OVERLAP_ISSUES = 200;
+const MAX_DOM_PAIR_CHECKS = 30_000;
+const MAX_DOM_RECT_CHECKS = 100_000;
+const MAX_DOM_ISSUE_SCREENSHOTS = 10;
 
 export async function extractDomStructure(url: string, options: DomInspectorOptions = {}): Promise<PageStructure[]> {
     return await withDomPage(url, options, async page => await extractDomStructureFromPage(page, options));
@@ -85,7 +73,16 @@ export async function detectDomIssues(
 }
 
 export async function extractDomStructureFromPage(page: Page, options: DomInspectorOptions = {}): Promise<PageStructure[]> {
-    await browserManager.waitForVisualReady(page, 3_000).catch(() => undefined);
+    let readinessNote: string | undefined;
+    try {
+        const readiness = await browserManager.waitForVisualReady(page, 3_000, { fullPage: false });
+        if (readiness.complete === false) readinessNote = readiness.note;
+    } catch (error) {
+        throwIfRequestExpired();
+        const code = (error as { code?: string })?.code;
+        if (code === "request_cancelled" || code === "request_deadline_exceeded" || (error instanceof Error && error.name === "AbortError")) throw error;
+        readinessNote = `视觉资源就绪检查失败，结构可能不完整：${error instanceof Error ? error.message : String(error)}`;
+    }
     const raw = await page.evaluate(extractVisibleDomElements, {
         maxDepth: options.maxDepth ?? DEFAULT_MAX_DEPTH,
         minElementSize: MIN_VISIBLE_ELEMENT_SIZE,
@@ -107,6 +104,8 @@ export async function extractDomStructureFromPage(page: Page, options: DomInspec
                 title: raw.title,
                 viewportWidth: raw.dimensions.viewportWidth,
                 viewportHeight: raw.dimensions.viewportHeight,
+                inspectionLimitations: raw.inspectionLimitations,
+                ...(readinessNote ? { readinessNote } : {}),
             },
         },
     ];
@@ -125,16 +124,38 @@ export function detectDomIssuesFromStructure(
     for (const page of structure) {
         const elements = page.elements as DomInspectElement[];
         if (enabled.has("overlap")) {
-            issues.push(...detectOverlapIssues(page.page, elements, page.dimensions.width, page.dimensions.height, autoScreenshot, scale, options));
+            const overlap = detectOverlapIssues(page.page, elements, page.dimensions.width, page.dimensions.height, autoScreenshot, scale, options);
+            issues.push(...overlap.issues);
+            if (overlap.truncated) {
+                page.metadata ??= {};
+                const existing = page.metadata.inspectionLimitations;
+                page.metadata.inspectionLimitations = [...(Array.isArray(existing) ? existing : []), "Overlap analysis reached its 200-issue / 30000-pair / 100000-rectangle budget; unexamined pairs are not confirmed clean."];
+                page.metadata.detectionTruncated = true;
+            }
         }
         if (enabled.has("overflow")) {
             issues.push(...detectOverflowIssues(page.page, elements, autoScreenshot, scale));
         }
         if (enabled.has("readability")) {
-            issues.push(...detectReadabilityIssues(page.page, elements, autoScreenshot, scale, options));
+            issues.push(...detectReadabilityIssues(page.page, elements, autoScreenshot, scale, options)
+                .filter(issue => !enabled.has("overflow") || issue.type !== "clipped"));
+        }
+        if (enabled.has("alignment")) {
+            page.metadata ??= {};
+            const existing = page.metadata.inspectionLimitations;
+            page.metadata.inspectionLimitations = [...(Array.isArray(existing) ? existing : []), "DOM alignment is not inferred across unrelated layout groups; use visual review for alignment."];
         }
     }
 
+    if (issues.length > 200) {
+        issues.splice(200);
+        for (const page of structure) {
+            page.metadata ??= {};
+            const existing = page.metadata.inspectionLimitations;
+            page.metadata.inspectionLimitations = [...(Array.isArray(existing) ? existing : []), "Only the first 200 rule findings are returned; additional findings were omitted."];
+            page.metadata.detectionTruncated = true;
+        }
+    }
     const errors = issues.filter(issue => issue.severity === "error").length;
     const warnings = issues.filter(issue => issue.severity === "warning").length;
     const elementsCount = structure.reduce((sum, page) => sum + page.elements.length, 0);
@@ -156,9 +177,11 @@ async function withDomPage<T>(url: string, options: DomInspectorOptions, callbac
     let page: Page | undefined;
     try {
         page = await browserManager.navigateTo(url, {
+            viewport: options.viewport,
             timeout: options.timeout,
             scrollCount: options.scrollCount,
         });
+        await applyExplicitViewport(page, options.viewport);
         return await callback(page);
     } finally {
         if (page) {
@@ -174,8 +197,15 @@ async function captureDomIssueScreenshots(page: Page, issues: InspectIssue[], sc
         height: Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0, window.innerHeight),
     }));
 
-    for (const [index, issue] of issues.entries()) {
+    const prioritized = issues.map((issue, index) => ({ issue, index })).sort((first, second) =>
+        Number(second.issue.metadata?.assessment === "confirmed") - Number(first.issue.metadata?.assessment === "confirmed"));
+    let captured = 0;
+    for (const { issue, index } of prioritized) {
         if (!issue.bounds) {
+            continue;
+        }
+        if (captured >= MAX_DOM_ISSUE_SCREENSHOTS) {
+            issue.metadata = { ...issue.metadata, screenshotPending: false, screenshotStatus: "budget_exceeded", screenshotReason: "At most 10 issue screenshots per DOM inspection; narrow the page or inspect a smaller region." };
             continue;
         }
         const clip = clampToPage(issue.bounds, pageBounds.width, pageBounds.height, Math.max(1, scale));
@@ -194,6 +224,7 @@ async function captureDomIssueScreenshots(page: Page, issues: InspectIssue[], sc
                 height,
             },
         });
+        captured += 1;
         issue.screenshotPath = outputPath;
         if (issue.metadata) {
             issue.metadata.screenshotPending = false;
@@ -231,6 +262,16 @@ function toInspectElement(raw: RawDomElement, index: number): DomInspectElement 
             domPath: raw.domPath,
             clippingBounds: raw.clippingBounds ? rectToMetadata(raw.clippingBounds) : null,
             domIndex: index,
+            evidenceVersion: 2,
+            ownText: raw.ownText,
+            textRects: raw.textRects.map(rectToMetadata),
+            contentKind: raw.contentKind,
+            visualImage: raw.visualImage,
+            opaqueFill: raw.opaqueFill,
+            pointerEvents: raw.pointerEvents,
+            parentPath: raw.parentPath,
+            complexPaint: raw.complexPaint,
+            occludedBy: raw.occludedBy,
         },
     };
 }
@@ -270,25 +311,27 @@ function detectOverlapIssues(
     autoScreenshot: boolean,
     scale: number,
     options: DomInspectorOptions,
-): InspectIssue[] {
+): { issues: InspectIssue[]; truncated: boolean } {
     const threshold = options.overlapThresholdPercent ?? DEFAULT_OVERLAP_THRESHOLD_PERCENT;
     const candidates = elements.filter(element => isRenderableElement(element));
     const issues: InspectIssue[] = [];
+    let pairChecks = 0;
+    const budget = { remaining: MAX_DOM_RECT_CHECKS };
 
-    for (let i = 0; i < candidates.length; i++) {
-        for (let j = i + 1; j < candidates.length; j++) {
-            const first = candidates[i];
-            const second = candidates[j];
-            if (areDomRelatives(first, second)) {
+    for (let firstIndex = 0; firstIndex < candidates.length; firstIndex++) {
+        for (let secondIndex = firstIndex + 1; secondIndex < candidates.length; secondIndex++) {
+            if (pairChecks++ >= MAX_DOM_PAIR_CHECKS || budget.remaining <= 0 || issues.length >= MAX_DOM_OVERLAP_ISSUES) return { issues, truncated: true };
+            const first = candidates[firstIndex];
+            const second = candidates[secondIndex];
+            if (areDomRelatives(first, second) && !sampledCover(first, second) && !sampledCover(second, first)
+                && !possibleImageCover(first, second) && !possibleImageCover(second, first)) {
                 continue;
             }
 
-            const area = overlapArea(first.bounds, second.bounds);
-            if (area <= 0) {
-                continue;
-            }
-
-            const percent = overlapPercent(first.bounds, second.bounds);
+            if (overlapArea(first.bounds, second.bounds) <= 0) continue;
+            const evidence = overlapEvidence(first, second, budget);
+            if (!evidence) continue;
+            const { area, percent } = evidence;
             if (percent < threshold) {
                 continue;
             }
@@ -296,21 +339,27 @@ function detectOverlapIssues(
             const bounds = clampToPage(unionBounds(first.bounds, second.bounds), pageWidth, pageHeight, scale);
             issues.push({
                 type: "overlap",
-                severity: overlapSeverity(percent),
+                severity: evidence.confirmed ? "warning" : "info",
                 page,
-                description: `DOM elements "${first.name}" and "${second.name}" overlap by ${percent.toFixed(1)}% of the smaller element.`,
+                description: evidence.confirmed
+                    ? `Opaque paint covers sampled content positions between "${first.name}" and "${second.name}"; review whether this layer is intentional.`
+                    : `Content-region overlap candidate between "${first.name}" and "${second.name}" (${percent.toFixed(1)}%); geometry alone does not prove unreadable content.`,
                 elements: [first, second],
                 bounds: autoScreenshot ? bounds : undefined,
                 metadata: {
                     overlapArea: area,
                     overlapPercent: Number(percent.toFixed(2)),
                     screenshotPending: autoScreenshot,
+                    confidence: evidence.confirmed ? "high" : "medium",
+                    assessment: evidence.confirmed ? "confirmed" : "candidate",
+                    evidenceKind: evidence.confirmed ? "sampled-opaque-paint" : "content-rectangles",
+                    reasonCodes: [evidence.reason],
                 },
             });
         }
     }
 
-    return issues;
+    return { issues, truncated: false };
 }
 
 function detectOverflowIssues(
@@ -327,7 +376,9 @@ function detectOverflowIssues(
             continue;
         }
 
-        const overflow = isOverflowing(element.bounds, clippingBounds);
+        const contentBounds = elementContentBounds(element);
+        if (!contentBounds) continue;
+        const overflow = contentOverflow(contentBounds, clippingBounds);
         if (!overflow.overflowing) {
             continue;
         }
@@ -343,6 +394,10 @@ function detectOverflowIssues(
                 sides: overflow.sides,
                 clippingBounds: rectToMetadata(clippingBounds),
                 screenshotPending: autoScreenshot,
+                confidence: "medium",
+                assessment: "candidate",
+                evidenceKind: "content-rectangles",
+                reasonCodes: ["CONTENT_EXCEEDS_NON_SCROLLING_CLIP"],
             },
         });
     }
@@ -362,7 +417,7 @@ function detectReadabilityIssues(
     const contrastThreshold = options.contrastRatioThreshold ?? MIN_CONTRAST_RATIO;
 
     for (const element of elements) {
-        if (!isRenderableElement(element) || !element.text) {
+        if (!isRenderableElement(element) || !(element.metadata?.evidenceVersion === 2 ? stringMetadata(element, "ownText") : element.text)) {
             continue;
         }
 
@@ -380,6 +435,10 @@ function detectReadabilityIssues(
                     fontSize,
                     threshold: smallFontThreshold,
                     screenshotPending: autoScreenshot,
+                    confidence: "high",
+                    assessment: "candidate",
+                    evidenceKind: "computed-font-size",
+                    reasonCodes: ["FONT_BELOW_CONFIGURED_THRESHOLD"],
                 },
             });
         }
@@ -400,13 +459,19 @@ function detectReadabilityIssues(
                     color: element.color ?? "",
                     backgroundColor: element.backgroundColor ?? "",
                     screenshotPending: autoScreenshot,
+                    confidence: "medium",
+                    assessment: "candidate",
+                    evidenceKind: "computed-style-contrast",
+                    reasonCodes: ["STYLE_CONTRAST_BELOW_THRESHOLD"],
                 },
             });
         }
 
         const clippingBounds = rectMetadata(element, "clippingBounds");
         if (clippingBounds) {
-            const overflow = isOverflowing(element.bounds, clippingBounds);
+            const contentBounds = elementContentBounds(element);
+            if (!contentBounds) continue;
+            const overflow = contentOverflow(contentBounds, clippingBounds);
             if (overflow.overflowing) {
                 issues.push({
                     type: "clipped",
@@ -420,6 +485,10 @@ function detectReadabilityIssues(
                         sides: overflow.sides,
                         clippingBounds: rectToMetadata(clippingBounds),
                         screenshotPending: autoScreenshot,
+                        confidence: "medium",
+                        assessment: "candidate",
+                        evidenceKind: "text-line-rectangles",
+                        reasonCodes: ["TEXT_EXCEEDS_NON_SCROLLING_CLIP"],
                     },
                 });
             }
@@ -441,11 +510,73 @@ function areDomRelatives(first: DomInspectElement, second: DomInspectElement): b
     return Boolean(firstPath && secondPath && (firstPath.startsWith(`${secondPath}/`) || secondPath.startsWith(`${firstPath}/`)));
 }
 
-function overlapSeverity(percent: number): InspectIssueSeverity {
-    if (percent >= 60) {
-        return "error";
+function contentRects(element: DomInspectElement): Rect[] {
+    if (element.metadata?.evidenceVersion !== 2) return [element.bounds];
+    if (stringMetadata(element, "contentKind") === "image") return [element.bounds];
+    const values = element.metadata?.textRects;
+    if (!Array.isArray(values)) return [];
+    return values.filter(value => value && typeof value === "object" && !Array.isArray(value)
+        && ["x0", "y0", "x1", "y1"].every(key => typeof value[key] === "number")) as unknown as Rect[];
+}
+
+function elementContentBounds(element: DomInspectElement): Rect | null {
+    const rectangles = contentRects(element);
+    return rectangles.length ? rectangles.reduce(unionBounds) : null;
+}
+
+function contentOverflow(bounds: Rect, clip: Rect) {
+    return isOverflowing(bounds, expandRect(clip, 2));
+}
+
+function sampledCover(content: DomInspectElement, cover: DomInspectElement): boolean {
+    const values = content.metadata?.occludedBy;
+    return Array.isArray(values) && values.some(value => value && typeof value === "object" && !Array.isArray(value)
+        && value.domPath === stringMetadata(cover, "domPath") && typeof value.samples === "number" && value.samples >= 2);
+}
+
+function possibleImageCover(content: DomInspectElement, cover: DomInspectElement): boolean {
+    return stringMetadata(content, "contentKind") === "text" && cover.metadata?.visualImage === true
+        && cover.position !== "static" && (stringMetadata(cover, "domPath") ?? "").startsWith(`${stringMetadata(content, "domPath")}/`);
+}
+
+function overlapEvidence(first: DomInspectElement, second: DomInspectElement, budget: { remaining: number }) {
+    const firstRects = contentRects(first);
+    const secondRects = contentRects(second);
+    const firstCovered = sampledCover(first, second);
+    const secondCovered = sampledCover(second, first);
+    const confirmed = firstCovered || secondCovered;
+    const known = first.metadata?.evidenceVersion === 2 && second.metadata?.evidenceVersion === 2;
+    if (known && !firstRects.length && !secondRects.length) return null;
+    let reason = "CONTENT_RECTS_INTERSECT";
+    let left = secondCovered ? [first.bounds] : firstRects;
+    let right = firstCovered ? [second.bounds] : secondRects;
+    if (confirmed) reason = "OPAQUE_COVER_SAMPLED";
+    if (!left.length || !right.length) {
+        const cover = left.length ? second : first;
+        const content = left.length ? first : second;
+        if (!confirmed) {
+            const sameParent = stringMetadata(content, "parentPath") === stringMetadata(cover, "parentPath");
+            const positioned = content.position !== "static" && cover.position !== "static";
+            const later = cover.zOrder > content.zOrder || (cover.zOrder === content.zOrder
+                && Number(cover.metadata?.domIndex) > Number(content.metadata?.domIndex));
+            if (possibleImageCover(content, cover)) {
+                reason = "IMAGE_FRONT_LAYER_GEOMETRY";
+            } else if (!(cover.metadata?.opaqueFill === true || cover.metadata?.visualImage === true) || !sameParent || !positioned || !later) return null;
+        }
+        reason = confirmed ? "OPAQUE_COVER_SAMPLED" : cover.metadata?.visualImage === true ? "IMAGE_FRONT_LAYER_GEOMETRY" : "OPAQUE_FRONT_LAYER_GEOMETRY";
+        if (!left.length) left = [first.bounds];
+        if (!right.length) right = [second.bounds];
     }
-    return "warning";
+    let area = 0;
+    let percent = 0;
+    for (const leftRect of left) for (const rightRect of right) {
+        if (budget.remaining-- <= 0) return null;
+        const intersection = overlapArea(leftRect, rightRect);
+        if (intersection <= 0) continue;
+        area += intersection;
+        percent = Math.max(percent, overlapPercent(leftRect, rightRect));
+    }
+    return area > 0 ? { area, percent, confirmed, reason } : null;
 }
 
 function unionBounds(first: Rect, second: Rect): Rect {
@@ -551,124 +682,4 @@ function contrastRatioForElement(element: DomInspectElement): number | null {
     const lighter = Math.max(fgLuminance, bgLuminance);
     const darker = Math.min(fgLuminance, bgLuminance);
     return (lighter + 0.05) / (darker + 0.05);
-}
-
-function extractVisibleDomElements(args: { maxDepth: number; minElementSize: number }) {
-    const excludedTags = new Set(["script", "style", "noscript", "meta", "link", "title", "head", "template"]);
-    const maxDepth = Math.max(1, args.maxDepth || 20);
-    const minElementSize = Math.max(1, args.minElementSize || 5);
-    const viewportWidth = window.innerWidth;
-    const viewportHeight = window.innerHeight;
-    const width = Math.max(document.documentElement.scrollWidth, document.body?.scrollWidth ?? 0, viewportWidth);
-    const height = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight ?? 0, viewportHeight);
-
-    const toRect = (rect: DOMRect): Rect => ({
-        x0: rect.left + window.scrollX,
-        y0: rect.top + window.scrollY,
-        x1: rect.right + window.scrollX,
-        y1: rect.bottom + window.scrollY,
-    });
-
-    const isVisible = (element: Element, style: CSSStyleDeclaration, rect: DOMRect): boolean => {
-        if (excludedTags.has(element.tagName.toLowerCase())) return false;
-        if (style.display === "none") return false;
-        if (style.visibility === "hidden" || style.visibility === "collapse") return false;
-        if (Number.parseFloat(style.opacity || "1") <= 0) return false;
-        if (rect.width < minElementSize || rect.height < minElementSize) return false;
-        return true;
-    };
-
-    const domPathParts = (element: Element): string[] => {
-        const parts: string[] = [];
-        let current: Element | null = element;
-        while (current && current !== document.documentElement) {
-            const parent = current.parentElement as Element | null;
-            if (!parent) break;
-            const index = Array.prototype.indexOf.call(parent.children, current);
-            parts.push(`${current.tagName.toLowerCase()}[${index}]`);
-            current = parent;
-        }
-        return parts.reverse();
-    };
-
-    const domPath = (element: Element): string => {
-        return domPathParts(element).join("/");
-    };
-
-    const clippingBounds = (element: Element, position: string): Rect | null => {
-        if (position === "fixed" || position === "sticky") {
-            return {
-                x0: window.scrollX,
-                y0: window.scrollY,
-                x1: window.scrollX + viewportWidth,
-                y1: window.scrollY + viewportHeight,
-            };
-        }
-
-        let current = element.parentElement;
-        while (current && current !== document.documentElement) {
-            const style = getComputedStyle(current);
-            const overflow = `${style.overflow} ${style.overflowX} ${style.overflowY}`;
-            if (/(hidden|clip|auto|scroll)/.test(overflow)) {
-                const rect = current.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0) {
-                    return toRect(rect);
-                }
-            }
-            current = current.parentElement;
-        }
-        return { x0: 0, y0: 0, x1: width, y1: height };
-    };
-
-    const elements = Array.from(document.body?.querySelectorAll("*") ?? [])
-        .map(element => {
-            const style = getComputedStyle(element);
-            const rect = element.getBoundingClientRect();
-            if (!isVisible(element, style, rect)) {
-                return null;
-            }
-            if (domPathParts(element).length > maxDepth) {
-                return null;
-            }
-
-            const zIndex = style.zIndex || "auto";
-            const parsedZIndex = Number.parseInt(zIndex, 10);
-            const position = style.position || "static";
-            const text = ((element as HTMLElement).innerText || element.textContent || "")
-                .replace(/\s+/g, " ")
-                .trim()
-                .slice(0, 100);
-
-            return {
-                tag: element.tagName.toLowerCase(),
-                id: element.id || "",
-                className: typeof element.className === "string" ? element.className : "",
-                text,
-                bounds: toRect(rect),
-                zIndex,
-                zOrder: Number.isFinite(parsedZIndex) ? parsedZIndex : 0,
-                visibility: style.visibility,
-                opacity: Number.parseFloat(style.opacity || "1"),
-                overflow: `${style.overflow} ${style.overflowX} ${style.overflowY}`,
-                position,
-                fontSize: Number.parseFloat(style.fontSize || "0") || 0,
-                color: style.color,
-                backgroundColor: style.backgroundColor,
-                domPath: domPath(element),
-                clippingBounds: clippingBounds(element, position),
-            };
-        })
-        .filter((element): element is RawDomElement => element !== null);
-
-    return {
-        url: window.location.href,
-        title: document.title,
-        dimensions: {
-            width,
-            height,
-            viewportWidth,
-            viewportHeight,
-        },
-        elements,
-    };
 }

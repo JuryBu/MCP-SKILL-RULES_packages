@@ -53,6 +53,8 @@ import { registerDesktopTools } from "./tools/desktop.js";
 import { registerHumanBrowserTools } from "./tools/human-browser.js";
 import { desktopManager } from "./desktop/manager.js";
 import { humanBrowserManager } from "./human-browser/manager.js";
+import { installToolConcurrency } from './tool-concurrency.js';
+import { getActiveRequestCount } from './request-context.js';
 import { isLsAvailable, getLsStatus } from "./ls-client.js";
 import { getModelBridgeStatus } from "./model-bridge.js";
 
@@ -62,10 +64,11 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.1.0",
+    version: "7.2.0",
 });
 
 // 注册所有工具
+installToolConcurrency(server);
 registerFetchPage(server);
 registerFetchHtml(server);
 registerFetchScreenshot(server);
@@ -127,9 +130,19 @@ server.registerResource(
             "",
             "- `mode=\"structure\"`：提取 DOM/PDF/PPTX/EPUB 结构树。",
             "- `mode=\"detect\"`：检测 overlap/overflow/readability/alignment。",
+            "- 规则检测不是视觉验收：issue.metadata 中 confidence/assessment/evidenceKind/reasonCodes 区分已采样覆盖与几何候选。confirmed 只证明相关覆盖/测量事实，不证明设计一定错误；candidate 候选需要结合截图复核。",
+            "- DOM 使用直接文字行框、绘制顺序采样与非滚动裁剪区域，正常背景/留白/滚动不再直接当成缺陷；PPTX/PDF 区分背景装饰、绘制顺序与真实内容。structure.metadata.inspectionLimitations 说明扫描、字体、复杂绘制等边界，零 issue 不等于整页已验收；DOM alignment 不跨无关布局组推断。",
             "- `mode=\"ai_review\"`：使用截图、结构树与规则检测结果生成 AI 审查报告。注意 Antigravity LS 的 `GetModelResponse` 只接收 `{model,prompt}`，不能直接读取截图像素；需要真正多模态视觉审查时应使用 `modelChain=\"codex\"`；`modelChain=\"claude-code\"` 第一阶段作为低优先级 CLI fallback。",
             "- EPUB 路线第一阶段只提供静态结构；`ai_review` 返回结构说明，不执行截图型视觉审查。",
             "- `background=true` 可用于多页文档后台批量审查，再用 `web_inspect(action=\"check\", taskId=\"...\", waitSeconds=30-45)` 查询。",
+            "",
+            "## 页面容量、并发与响应式视口（7.2）",
+            "",
+            "- Windows 默认页面容量目标为 8，按新鲜的物理/提交内存采样接纳；既有 WEB_FETCHER_MAX_CONCURRENT_PAGES 配置优先，非 Windows 保守上限 5。资源不足时有界排队并返回具体阻断原因，不保证始终能打开 8 页。",
+            "- 请求按 ownerId 公平排队，同一实际 Page 的操作串行；关闭/取消/状态查询使用独立控制通道。返回的 _meta.webFetcherTiming 与 _meta.webFetcherPool 提供耗时和池状态，不能仅用总耗时判断网页加载速度。",
+            "- web_fetch_page、web_fetch_screenshot、web_fetch_rich、web_interact、web_pipeline、web_inspect 支持可选 viewport={width,height}，宽高为 240–4096 整数、面积最多 8388608 CSS 像素，例如 390×844、1366×768、844×390。",
+            "- viewport 在网页导航前设置；省略时保留默认尺寸或已有 session 尺寸，显式传入才调整已有页面。它不是移动设备 UA/触摸模拟，也不改变 Office/PDF/EPUB 或 native 窗口尺寸；这些非网页路线会明确拒绝不适用的 viewport。",
+            "- viewport 控制布局宽高，fullPage 控制是否覆盖整页滚动范围，scale/quality 控制输出倍率/清晰度，三者不能互相替代。截图会等待图片、字体与有限的布局稳定；超时/扫描预算/跨域 frame 留下未检查说明，不把 partial 当完整成功。特定业务内容仍应使用 waitFor 等显式就绪条件。",
             "",
             "## 持久会话与登录态",
             "",
@@ -190,7 +203,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.1.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.2.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -279,7 +292,7 @@ async function heartbeatCheck(): Promise<void> {
 
     // 浏览器空闲释放：20 分钟无工具调用 → 关闭 Chromium 释放内存
     const idle = getIdleTime();
-    if (idle > HEARTBEAT_BROWSER_TIMEOUT) {
+    if (idle > HEARTBEAT_BROWSER_TIMEOUT && getActiveRequestCount() === 0 && browserManager.getPoolStats().activePages === 0) {
         console.error(`[web-fetcher] ${Math.round(idle / 60000)} 分钟无活动，关闭浏览器释放内存`);
         await browserManager.closeBrowser();
     }
@@ -287,7 +300,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.1.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.2.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -320,7 +333,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[web-fetcher] MCP Server v7.1.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.2.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -388,7 +401,7 @@ const cleanup = async () => {
     await sessionManager.closeAll();
     await desktopManager.closeAll();
     await humanBrowserManager.closeAll();
-    await browserManager.close();
+    await browserManager.shutdown();
 };
 
 process.on("SIGINT", async () => {

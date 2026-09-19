@@ -3,10 +3,12 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ImageContent, TextContent } from "@modelcontextprotocol/sdk/types.js";
 import { inlineImageContent, assertInlineImageBudget, INLINE_IMAGE_LIMIT } from "../image-output.js";
 import type { Page } from "playwright";
+import { randomUUID } from "node:crypto";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { categorizeFile } from "../converter.js";
 import { extractPdfStructure, resolvePdfPathFromUrl, renderPdfRegion, searchPdfTextRegion } from "../inspector/pdf-inspector.js";
 import { searchPptxTextRegion } from "../inspector/pptx-inspector.js";
@@ -72,6 +74,7 @@ function parsePages(pagesStr: string, totalPages: number, limit = Infinity): num
 }
 
 const FetchScreenshotInputSchema = z.object({
+    viewport: viewportSchema.optional(),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
@@ -353,6 +356,7 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
     let page: Page | undefined;
     try {
         page = await browserManager.navigateTo(params.url, {
+            viewport: params.viewport,
             waitFor: params.selector,
             timeout: params.timeout,
             scrollCount: params.scrollCount,
@@ -361,7 +365,8 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
         });
 
         const isLocalFile = params.url.startsWith("file://");
-        if (!isLocalFile && !params.selector && !params.target && qConfig.viewportWidth !== 1920) {
+        await applyExplicitViewport(page, params.viewport);
+        if (!params.viewport && !isLocalFile && !params.selector && !params.target && qConfig.viewportWidth !== 1920) {
             const currentSize = page.viewportSize();
             if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                 await page.setViewportSize({
@@ -374,6 +379,8 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
 
         let buffer: Buffer | null = null;
         let warning = "";
+        const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: params.fullPage ?? false });
+        if (readiness.complete === false && readiness.note) warning += `\n⚠️ ${readiness.note}`;
 
         if (params.selector) {
             const element = await page.$(params.selector);
@@ -387,12 +394,11 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
         } else if (params.target) {
             buffer = await captureDomTarget(page, params.target, params.scale ?? 1.4, qConfig.jpegQuality);
             if (!buffer) {
-                warning = `\n⚠️ 未找到文本 "${params.target}"，已返回全页截图`;
+                warning += `\n⚠️ 未找到文本 "${params.target}"，已返回全页截图`;
             }
         }
 
         if (!buffer) {
-            await browserManager.waitForVisualReady(page);
             buffer = await page.screenshot({
                 type: "jpeg",
                 quality: qConfig.jpegQuality,
@@ -401,7 +407,7 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
         }
         // Small-buffer retry guard: only for full-page/viewport shots, NOT for target/selector crops
         const isTargetCrop = !!(params.target || params.selector) && buffer.length > 0;
-        if (!isTargetCrop && buffer.length < 5 * 1024) {
+        if (!isTargetCrop && !readiness.complete && buffer.length < 5 * 1024) {
             console.error(`[web-fetcher] 截图过小 (${buffer.length} bytes)，等待 3s 重试...`);
             await page.waitForTimeout(3000);
             buffer = await page.screenshot({
@@ -419,7 +425,7 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
             }
         } catch { }
 
-        const smallWarning = (!isTargetCrop && buffer.length < 5 * 1024)
+        const smallWarning = (!isTargetCrop && !readiness.complete && buffer.length < 5 * 1024)
             ? "\n⚠️ 截图可能为空白页面（文件极小），页面可能未完成渲染或被反爬拦截"
             : "";
 
@@ -522,12 +528,13 @@ async function formatScreenshotResult(
     detail = "",
 ) {
     const saveMode: SaveMode = params.saveMode || "inline";
+    const storageKey = warning ? generateCacheKey(cacheKey, "partial", randomUUID()) : cacheKey;
     const sizeKB = (screenshotBuffer.length / 1024).toFixed(1);
 
     if (saveMode === "file") {
         const autoSplit = params.autoSplit !== false;
         if (autoSplit) {
-            const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", cacheKey, ".jpg");
+            const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", storageKey, ".jpg");
             if (splitResult.wasSplit) {
                 const fileList = splitResult.paths.map((p, i) =>
                     `  片 ${i + 1}/${splitResult.paths.length} (${splitResult.sizes[i]} KB): ${p}`
@@ -547,7 +554,7 @@ async function formatScreenshotResult(
             }, startTime, browserManager.lastRetryCount);
         }
 
-        const filePath = saveTempFile("screenshots", cacheKey, ".jpg", screenshotBuffer);
+        const filePath = saveTempFile("screenshots", storageKey, ".jpg", screenshotBuffer);
         return appendTiming({
             content: [{
                 type: "text" as const,
@@ -600,6 +607,7 @@ export function registerFetchScreenshot(server: McpServer): void {
 参数:
   - url (string, 必须): 要截图的网页 URL（支持 http/https/file 协议）
   - fullPage (boolean, 可选): 是否全页截图，默认 false
+  - viewport (object, 可选): 网页 CSS 视口 {width,height}，如 {width:390,height:844}；优先于 quality 的旧默认宽度，不模拟设备 UA/触摸。fullPage 只扩大截图滚动范围，不改变布局宽高
   - selector (string, 可选): CSS 选择器，截取指定元素
   - target (string, 可选): 按文本内容定位局域截图，与 selector 互斥
   - scale (number, 可选): target 局域截图放大比例，默认 1.4
@@ -617,6 +625,7 @@ export function registerFetchScreenshot(server: McpServer): void {
   - 多页模式: 按页码直接返回有序多图；file 模式保持路径/清单
   - inline 单次最多10张（含分片），base64总长不超过12MiB；超限请缩小范围或显式选择file`,
             inputSchema: {
+                viewport: FetchScreenshotInputSchema.shape.viewport,
                 url: FetchScreenshotInputSchema.shape.url,
                 fullPage: FetchScreenshotInputSchema.shape.fullPage,
                 selector: FetchScreenshotInputSchema.shape.selector,
@@ -644,6 +653,13 @@ export function registerFetchScreenshot(server: McpServer): void {
             const quality: ImageQuality = params.quality || "default";
             const saveMode: SaveMode = params.saveMode || "inline";
             const qConfig = QUALITY_PRESETS[quality];
+
+            try {
+                assertViewportTarget(params.url, params.viewport);
+                if (params.diff) assertViewportTarget(params.diff, params.viewport);
+            } catch (error) {
+                return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
+            }
 
             if (isEpubUrl(params.url)) {
                 return {
@@ -691,6 +707,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                 params.diff,
                 params.scrollCount,
                 params.page,
+                ...(params.viewport ? [params.viewport.width, params.viewport.height] : []),
             );
             if (saveMode === "file") {
                 const cached = getTempFile("screenshots", cacheKey, ".jpg");
@@ -750,6 +767,7 @@ export function registerFetchScreenshot(server: McpServer): void {
             let page;
             try {
                 page = await browserManager.navigateTo(params.url, {
+                    viewport: params.viewport,
                     waitFor: params.selector,
                     timeout: params.timeout,
                     scrollCount: params.scrollCount,
@@ -759,7 +777,8 @@ export function registerFetchScreenshot(server: McpServer): void {
 
                 // 根据 quality 调整视口宽度
                 const isLocalFile = params.url.startsWith("file://");
-                if (!isLocalFile && !params.selector && qConfig.viewportWidth !== 1920) {
+                await applyExplicitViewport(page, params.viewport);
+                if (!params.viewport && !isLocalFile && !params.selector && qConfig.viewportWidth !== 1920) {
                     const currentSize = page.viewportSize();
                     if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                         await page.setViewportSize({
@@ -771,6 +790,8 @@ export function registerFetchScreenshot(server: McpServer): void {
                 }
 
                 let screenshotBuffer: Buffer;
+                const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: params.fullPage ?? false });
+                const readinessWarning = readiness.complete === false && readiness.note ? `\n⚠️ ${readiness.note}` : "";
 
                 if (params.selector) {
                     const element = await page.$(params.selector);
@@ -789,7 +810,6 @@ export function registerFetchScreenshot(server: McpServer): void {
                     });
                 } else {
                     // v6.1: 截图前等待视觉资源就绪
-                    await browserManager.waitForVisualReady(page);
                     screenshotBuffer = await page.screenshot({
                         type: "jpeg",
                         quality: qConfig.jpegQuality,
@@ -798,7 +818,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                 }
 
                 // 截图有效性验证
-                if (screenshotBuffer.length < 5 * 1024) {
+                if (!params.selector && !readiness.complete && screenshotBuffer.length < 5 * 1024) {
                     console.error(
                         `[web-fetcher] 截图过小 (${screenshotBuffer.length} bytes)，等待 3s 重试...`
                     );
@@ -811,9 +831,9 @@ export function registerFetchScreenshot(server: McpServer): void {
                 }
 
                 const sizeKB = (screenshotBuffer.length / 1024).toFixed(1);
-                const warning = screenshotBuffer.length < 5 * 1024
+                const warning = readinessWarning + (!params.selector && !readiness.complete && screenshotBuffer.length < 5 * 1024
                     ? "\n⚠️ 截图可能为空白页面（文件极小），页面可能未完成渲染或被反爬拦截"
-                    : "";
+                    : "");
 
                 // 读取 PDF 页码信息（如有）
                 let pageInfo = "";
@@ -826,9 +846,10 @@ export function registerFetchScreenshot(server: McpServer): void {
 
                 // 根据 saveMode 返回
                 if (saveMode === "file") {
+                    const storageKey = warning ? generateCacheKey(cacheKey, "partial", randomUUID()) : cacheKey;
                     const autoSplit = params.autoSplit !== false;
                     if (autoSplit) {
-                        const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", cacheKey, ".jpg");
+                        const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", storageKey, ".jpg");
                         if (splitResult.wasSplit) {
                             const fileList = splitResult.paths.map((p, i) =>
                                 `  片 ${i + 1}/${splitResult.paths.length} (${splitResult.sizes[i]} KB): ${p}`
@@ -848,7 +869,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                             }],
                         }, startTime, browserManager.lastRetryCount);
                     } else {
-                        const filePath = saveTempFile("screenshots", cacheKey, ".jpg", screenshotBuffer);
+                        const filePath = saveTempFile("screenshots", storageKey, ".jpg", screenshotBuffer);
                         return appendTiming({
                             content: [{
                                 type: "text" as const,

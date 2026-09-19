@@ -4,6 +4,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import { browserManager } from "../browser.js";
+import { viewportSchema, assertViewportTarget, applyExplicitViewport, type ResponsiveViewport } from "../viewport.js";
+import { throwIfRequestExpired } from "../request-context.js";
 import { touchActivity } from "../lifecycle.js";
 import { generateModelText } from "../model-bridge.js";
 import { ensureTempDirs, generateCacheKey, saveTempFile, TEMP_DIRS } from "../temp-store.js";
@@ -25,8 +27,10 @@ import {
 import { extractEpubStructure } from "../ebook/epub.js";
 import type { AIReviewReport, InspectResult, PageStructure } from "../inspector/types.js";
 import { inspectionContent } from "../inspection-output.js";
+import { runBackgroundWork } from '../background-tasks.js';
 
 const InspectInputSchema = z.object({
+    viewport: viewportSchema.optional(),
     saveMode: z.enum(["inline", "file"]).optional().describe("检查附图输出：inline 默认返回图片与报告；file 显式保留截图路径。后台 check 也可指定"),
     action: z
         .enum(["check"])
@@ -135,6 +139,7 @@ interface EmptyAIReviewReport {
 }
 
 interface InspectResponse {
+    viewport?: ResponsiveViewport;
     tool: "web_inspect";
     url?: string;
     route: InspectRoute;
@@ -244,6 +249,7 @@ export function registerInspect(server: McpServer): void {
             description: `检查网页或文档的结构、重叠、溢出、可读性、一致性与 AI 视觉审查。
 
 支持 DOM、PDF、PPTX 与 EPUB 静态结构路线的 structure/detect/ai_review/all；AI Review 会打包截图、结构树与几何检测结果，并支持后台批量处理。
+规则检测区分可证实覆盖与几何候选：issue.metadata 的 confidence/assessment/evidenceKind/reasonCodes 描述证据，不把矩形相交直接认定为排版错误。structure.metadata.inspectionLimitations 记录未检查范围，零 issue 不等于视觉验收通过。DOM alignment 不跨无关布局组推断，需视觉复核。
 
 参数:
   - url (string, 必须): 要检查的网页/文件 URL（支持 http/https/file 协议）
@@ -253,7 +259,7 @@ export function registerInspect(server: McpServer): void {
   - waitSeconds (number, 可选): check 等待秒数
   - page (number|string, 可选): 页码或 "all"，适用于 PDF/PPTX
   - detect (array, 可选): overlap/overflow/readability/alignment，默认全部
-  - autoScreenshot (boolean, 可选): 自动为问题生成局域截图，默认 true
+  - autoScreenshot (boolean, 可选): DOM/PDF 问题局域截图，默认 true；有数量/像素预算，未附图会明确报告。PPTX detect 返回原生结构证据，需另用截图工具或 ai_review 看图
   - scale (number, 可选): 局域截图放大倍率，默认 1.4
   - modelChain (string, 可选): AI 模型链路，auto/antigravity/codex/claude-code；未填回退到 chain，再默认 auto
   - chain (string, 可选): 兼容旧参数，AI 模型链路；modelChain 未填时使用
@@ -261,6 +267,7 @@ export function registerInspect(server: McpServer): void {
   - batchSize (number, 可选): AI 批量并发大小，默认 5
   - thresholds (object, 可选): smallFontPx/smallFontPt/contrastRatio/titleTopVarianceEmu/sizeVarianceRatio/gapVarianceRatio 阈值覆盖`,
             inputSchema: {
+                viewport: InspectInputSchema.shape.viewport,
                 saveMode: InspectInputSchema.shape.saveMode,
                 url: InspectInputSchema.shape.url,
                 mode: InspectInputSchema.shape.mode,
@@ -313,6 +320,7 @@ async function handleInspect(params: InspectInput): Promise<InspectResponse> {
         throw new Error("url 和 mode 是必填参数；查询后台任务时请使用 action=\"check\" + taskId");
     }
     const normalized = normalizeParams(params);
+    assertViewportTarget(normalized.url, normalized.viewport);
     const route = detectRoute(normalized.url);
     const base = {
         tool: "web_inspect" as const,
@@ -328,6 +336,7 @@ async function handleInspect(params: InspectInput): Promise<InspectResponse> {
         background: normalized.background,
         batchSize: normalized.batchSize,
         thresholds: normalized.thresholds,
+        ...(normalized.viewport ? { viewport: normalized.viewport } : {}),
     };
 
     switch (normalized.mode) {
@@ -366,7 +375,8 @@ async function handleInspect(params: InspectInput): Promise<InspectResponse> {
     throw new Error(`unsupported inspect mode: ${normalized.mode}`);
 }
 
-type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | "waitSeconds" | "url" | "mode" | "page" | "detect" | "modelChain" | "chain" | "background" | "thresholds">> & {
+type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | "waitSeconds" | "url" | "mode" | "page" | "detect" | "modelChain" | "chain" | "background" | "thresholds" | "viewport">> & {
+    viewport?: ResponsiveViewport;
     url: string;
     mode: InspectMode;
     page: number | "all" | null;
@@ -380,6 +390,7 @@ type NormalizedInspectInput = Required<Omit<InspectInput, "action" | "taskId" | 
 function normalizeParams(params: InspectInput): NormalizedInspectInput {
     return {
         saveMode: params.saveMode ?? "inline",
+        viewport: params.viewport,
         url: params.url!,
         mode: params.mode!,
         page: params.page ?? null,
@@ -396,7 +407,7 @@ function normalizeParams(params: InspectInput): NormalizedInspectInput {
 
 async function getStructure(route: InspectRoute, params: NormalizedInspectInput): Promise<PageStructure[] | EmptyStructure> {
     if (route === "dom") {
-        return await extractDomStructure(params.url, { timeout: 30_000 });
+        return await extractDomStructure(params.url, { timeout: 30_000, viewport: params.viewport });
     }
     if (route === "pdf") {
         const pdfPath = await resolvePdfPathFromUrl(params.url);
@@ -416,6 +427,7 @@ async function getStructure(route: InspectRoute, params: NormalizedInspectInput)
 async function runDetection(route: InspectRoute, params: NormalizedInspectInput): Promise<InspectResult | EmptyInspectResult> {
     if (route === "dom") {
         return await detectDomIssues(params.url, params.detect, params.autoScreenshot, params.scale, {
+            viewport: params.viewport,
             timeout: 30_000,
             smallFontThresholdPx: params.thresholds?.smallFontPx,
             contrastRatioThreshold: params.thresholds?.contrastRatio,
@@ -486,8 +498,11 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
             const pageStructure = structure.find(page => page.page === pageNumber);
             if (!pageStructure) return null;
             const pageIssues = detection.issues.filter(issue => issue.page === pageNumber);
-            const screenshotPath = await captureReviewScreenshot(route, params.url, pageNumber, params.scale);
-            const prompt = buildAIReviewPrompt(route, params.url, pageNumber, pageStructure, pageIssues, screenshotPath);
+            const screenshot = await captureReviewScreenshot(route, params.url, pageNumber, params.scale, params.viewport);
+            const screenshotPath = screenshot?.path ?? null;
+            const readinessNote = screenshot?.note;
+            const prompt = buildAIReviewPrompt(route, params.url, pageNumber, pageStructure, pageIssues, screenshotPath)
+                + (readinessNote ? `\n截图完整性警告：${readinessNote}。不要把未完成加载当成确定的设计缺陷。` : "");
             const model = await generateModelText({
                 prompt,
                 chain: params.modelChain,
@@ -505,6 +520,7 @@ async function runAIReview(route: InspectRoute, params: NormalizedInspectInput, 
                 error: model.error,
                 knownIssues: pageIssues,
             });
+            if (readinessNote) report.summary += `\n⚠️ ${readinessNote}`;
             if (progress) progress.completed += 1;
             return report;
         }));
@@ -583,7 +599,7 @@ function startAIReviewTask(route: InspectRoute, params: NormalizedInspectInput):
     timeout.unref?.();
     void (async () => {
         try {
-            settle("done", await runAIReview(route, params, task.progress));
+            settle("done", await runBackgroundWork('inspect-ai', () => runAIReview(route, params, task.progress), BACKGROUND_TASK_TIMEOUT_MS));
         } catch (error) {
             settle("error", error instanceof Error ? error.message : String(error));
         }
@@ -638,15 +654,17 @@ function cleanupBackgroundTasks(): void {
     }
 }
 
-async function captureReviewScreenshot(route: InspectRoute, url: string, pageNumber: number, scale: number): Promise<string | null> {
+async function captureReviewScreenshot(route: InspectRoute, url: string, pageNumber: number, scale: number, viewport?: ResponsiveViewport): Promise<{ path: string; note?: string } | null> {
     ensureTempDirs();
     let page;
     try {
         page = await browserManager.navigateTo(url, {
+            viewport,
             timeout: 30_000,
             pageNumber: route === "dom" ? undefined : pageNumber,
         });
-        await browserManager.waitForVisualReady(page, 3_000).catch(() => undefined);
+        await applyExplicitViewport(page, viewport);
+        const readiness = await browserManager.waitForVisualReady(page, 3_000, { fullPage: route === "dom" });
         const key = generateCacheKey("ai-review", url, route, pageNumber, scale, Date.now());
         const outputPath = `${TEMP_DIRS.screenshots}\\${key}_ai_review.jpg`;
         await page.screenshot({
@@ -655,8 +673,11 @@ async function captureReviewScreenshot(route: InspectRoute, url: string, pageNum
             quality: QUALITY_PRESETS.default.jpegQuality,
             fullPage: route === "dom",
         });
-        return fs.existsSync(outputPath) ? outputPath : null;
-    } catch {
+        return fs.existsSync(outputPath) ? { path: outputPath, note: readiness.complete === false ? readiness.note : undefined } : null;
+    } catch (error) {
+        throwIfRequestExpired();
+        const code = (error as { code?: string })?.code;
+        if (code === "request_cancelled" || code === "request_deadline_exceeded" || (error instanceof Error && error.name === "AbortError")) throw error;
         return null;
     } finally {
         if (page) {

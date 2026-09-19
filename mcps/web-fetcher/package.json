@@ -1,13 +1,13 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.1.0",
+  "version": "7.2.0",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-inspector-assets.mjs",
     "clean": "rimraf dist",
     "test:portable": "npm run build",
     "test:images": "node --import tsx --test tests/image-output.test.mjs tests/inspection-output.test.mjs",
@@ -15,7 +15,12 @@
     "test:login": "node --import tsx --test --test-concurrency=1 tests/login-lifecycle.test.mjs tests/login-lifecycle-deadline.test.mjs tests/browser-auth-state.test.mjs tests/browser-auth-state-review.test.mjs tests/browser-close-storage.test.mjs",
     "test:login:browser": "node --import tsx --test --test-concurrency=1 tests/login-lifecycle-browser.test.mjs tests/human-storage-lifecycle.test.mjs tests/browser-close-storage.test.mjs",
     "test:login:600s": "node --import tsx --test tests/login-600s.test.mjs",
-    "test": "npm run build && npm run test:images && npm run test:login"
+    "test:resources": "node --import tsx --test --test-concurrency=1 tests/browser-admission.test.mjs tests/background-context.test.mjs tests/tool-concurrency.test.mjs tests/session-concurrency.test.mjs tests/page-admission.test.mjs tests/memory-sampler.test.mjs tests/viewport.test.mjs",
+    "test:inspection:python": "python tests/pptx-inspection-v2.py && python tests/pdf-inspection-v2.py",
+    "test:inspection:http": "npm run build && node --test --test-concurrency=1 tests/inspection-runtime-assets.test.mjs tests/inspection-http.test.mjs tests/dom-inspection-v2-browser.test.mjs",
+    "test:viewport": "npm run build && node --test tests/viewport-browser.test.mjs",
+    "test:contract": "npm run build && node --test tests/release-contract.test.mjs",
+    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && node --test tests/inspection-runtime-assets.test.mjs"
   },
   "engines": {
     "node": ">=18"

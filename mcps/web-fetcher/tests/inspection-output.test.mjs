@@ -126,6 +126,18 @@ test("file mode preserves all original fields and performs no image reads", asyn
     assert.deepEqual(JSON.parse(textOf(result)), response);
 });
 
+test("bounded screenshot omissions are explicit in both delivery modes", async context => {
+    const reads = interceptReads(context);
+    const response = { issues: [{ metadata: { screenshotStatus: "budget_exceeded", screenshotPending: false } }] };
+    for (const saveMode of ["inline", "file"]) {
+        const result = await inspectionContent(response, saveMode);
+        assert.equal(result.isError, true);
+        assert.match(textOf(result), /1 个问题未生成截图/);
+        assert.deepEqual(JSON.parse(result.content[0].text), response);
+    }
+    assert.deepEqual(reads, []);
+});
+
 test("missing authorized image keeps report and returns explicit delivery error", async context => {
     interceptReads(context, new Map([[trustedPath, new Error(`ENOENT: ${trustedPath}`)]]));
     const result = await inspectionContent({ summary: "kept", screenshotPath: trustedPath }, "inline", [trustedPath]);

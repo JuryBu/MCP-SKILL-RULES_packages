@@ -1,5 +1,6 @@
 import type { Page } from "playwright";
 import { browserManager } from "../browser.js";
+import { throwIfRequestExpired } from "../request-context.js";
 import { safePageEvaluate } from "../extractor.js";
 import { extractDomStructureFromPage } from "../inspector/dom-inspector.js";
 import { QUALITY_PRESETS, type SaveMode } from "../constants.js";
@@ -20,7 +21,7 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
     const maxVisibleChars = options.maxVisibleChars ?? 8000;
     const maxDomElements = options.maxDomElements ?? 30;
 
-    await browserManager.waitForVisualReady(page);
+    const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: options.fullPage ?? false });
     const qConfig = QUALITY_PRESETS.default;
     const buffer = await page.screenshot({
         type: "jpeg",
@@ -79,7 +80,11 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
         return lines.join("\n");
     });
 
-    const structure = await extractDomStructureFromPage(page, { maxDepth: 12 }).catch(() => []);
+    const structure = await extractDomStructureFromPage(page, { maxDepth: 12 }).catch(error => {
+        throwIfRequestExpired();
+        if (error?.code === "request_cancelled" || error?.code === "request_deadline_exceeded" || error?.name === "AbortError") throw error;
+        return [];
+    });
     const pageStructure = structure[0];
     const domElements = pageStructure?.elements ?? [];
     const domSummary = domElements
@@ -93,6 +98,7 @@ export async function buildPageSnapshot(page: Page, options: PageSnapshotOptions
     const text = [
         options.sessionId ? `SessionId: ${options.sessionId}` : "",
         `当前 URL: ${page.url()}`,
+        readiness.complete === false && readiness.note ? `⚠️ ${readiness.note}` : "",
         "",
         options.saveMode === "file" ? "## 截图文件" : "## 截图",
         screenshotText,

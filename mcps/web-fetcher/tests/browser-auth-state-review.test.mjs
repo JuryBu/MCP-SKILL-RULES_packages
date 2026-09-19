@@ -65,8 +65,9 @@ function challengePage() {
 }
 
 async function withUavRetry(retry, run) {
-    const original = { getContext: browserManager.getContext, userAssistedVerification: browserManager.userAssistedVerification, waitForContentReady: browserManager.waitForContentReady };
+    const original = { getContext: browserManager.getContext, createManagedPage: browserManager.createManagedPage, userAssistedVerification: browserManager.userAssistedVerification, waitForContentReady: browserManager.waitForContentReady };
     browserManager.getContext = async () => ({ async newPage() { return retry; } });
+    browserManager.createManagedPage = async () => retry;
     browserManager.userAssistedVerification = async () => true;
     browserManager.waitForContentReady = async () => undefined;
     browserManager.uavAttemptedDomains.clear();

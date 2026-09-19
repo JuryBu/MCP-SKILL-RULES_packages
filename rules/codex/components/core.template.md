@@ -342,6 +342,13 @@ Codex 链路特性：`read(startRound, endRound)` 按轮次精读，`depth="full
 - 需要检查网页/PDF/PPTX 的结构、重叠、溢出、可读性或 AI 视觉审查时：用 `web_inspect`
 - 需要局域截图或截图对比时：用 `web_fetch_screenshot` 的 `target`、`scale`、`diff` 参数
 
+### 响应式检查与资源限制（web-fetcher 7.2+）
+
+- 前端多尺寸测试可在网页抓取、截图、交互、pipeline、inspect 中显式传 `viewport={width,height}`，例如 390×844 或 1366×768；省略时保留默认或已有 session 尺寸。`viewport` 改布局，`fullPage` 改截图覆盖范围，`scale/quality` 改输出，不模拟手机 UA/触摸，也不用于 Office/PDF。
+- 视觉就绪检查保留慢图片、字体与懒加载等待；`partial`、未检查 frame 或扫描预算提示不是完整成功，必要时使用目标元素的 `waitFor`，不要为了快而接受空白封面。
+- Windows 页面池默认目标 8，仍受真实内存水位和旧显式配置约束；非 Windows 保守上限 5。持续复用 `sessionId`、显式带 `ownerId`，遇到接纳阻断先看原因并清理自己不用的会话，不并发重发、跨 owner 清理或无条件调高上限。
+- `web_inspect` 的 `candidate` 是几何候选；`confirmed` 只确认覆盖等测量事实，不代表设计必然错误。结合附图复核背景/装饰/内容，检查 `limitations`、`detectionTruncated` 与截图缺口，零 issue 不是全页已验收。
+
 ### 图文交付与人工登录（web-fetcher 7.1+）
 
 - 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。

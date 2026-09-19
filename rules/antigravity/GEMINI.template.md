@@ -295,6 +295,11 @@ smart_search 提供三种搜索模式，按需选择：
   · 会话管理：web_interact 支持 sessionId 复用同一页面进行多轮交互；web_list_sessions 可列出保留会话，web_close_sessions 可关闭单个会话或清理指定 ownerId 的会话
   · 桌面工具族：desktop_* 工具（launch/connect_cdp/list_windows/register_window/screenshot/inspect/interact/close）可操作 Electron 应用和普通 Windows exe。Electron 推荐 native 启动 + CDP 附着；普通 exe 走 Windows UI Automation + 截图，能力为 best-effort。desktop_register_window 可桥接到 web_interact session
   · Human Browser：web_human_browser_open/attach/status/list_pages/register_page/detach/close 是用户辅助验证旁路。它可打开或附着真实 Chrome，让用户手动处理人机验证、登录检测、异常弹窗，再把页面注册成 web_interact/web_pipeline 可复用的 sessionId；默认不影响旧 URL 主链路
+- 响应式检查与资源限制（web-fetcher 7.2+）：
+  · 网页抓取/截图/交互/pipeline/inspect 可显式传 viewport={width,height}（例如390×844、1366×768）；省略保留默认或已有尺寸。viewport改布局，fullPage改覆盖范围，scale/quality改输出，不模拟手机UA/触摸，不用于Office/PDF。
+  · 不盲目缩短慢图片、字体、懒加载等待；partial/未检查frame/扫描预算不是完整成功，必要时用waitFor等待具体业务元素。
+  · Windows页面池默认目标8，真实内存和旧显式配置仍限制接纳；非Windows保守5。复用sessionId、显式ownerId，资源不足看原因并清理自己不用的会话，不并发重发或跨owner清理。
+  · web_inspect的candidate是几何候选，confirmed仅确认覆盖等测量事实，不证明设计错误；结合图片与limitations/detectionTruncated/截图缺口复核，零issue不是全页验收。
 - 图文交付与人工登录（web-fetcher 7.1+）：
   · 截图及检查附图默认返回原生 MCP 图片＋文本；需要旧临时路径时显式传 `saveMode="file"`，不要把再次打开路径作为默认查看步骤。
   · 多图按页码、分片或标签顺序查看，检查报告的 `screenshotRef` 对应随附图片；数量、尺寸与总量限制以实时工具说明为准，超限应缩小范围或显式选择 file，不能把部分结果当成完整成功。
