@@ -8,6 +8,30 @@
   ],
   "guidance": [
     {
+      "source": "guidance/engineering-workflow.template.md",
+      "target": "engineering-workflow.md"
+    },
+    {
+      "source": "guidance/maintenance-upgrades.template.md",
+      "target": "maintenance-upgrades.md"
+    },
+    {
+      "source": "guidance/design-writing.template.md",
+      "target": "design-writing.md"
+    },
+    {
+      "source": "guidance/communication-bridges.template.md",
+      "target": "communication-bridges.md"
+    },
+    {
+      "source": "guidance/sandbox-runtime.template.md",
+      "target": "sandbox-runtime.md"
+    },
+    {
+      "source": "guidance/web-visual.template.md",
+      "target": "web-visual.md"
+    },
+    {
       "source": "guidance/development-machine.template.md",
       "target": "development-machine.md"
     }

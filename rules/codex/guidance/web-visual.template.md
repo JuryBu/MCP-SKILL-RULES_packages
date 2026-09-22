@@ -1,0 +1,35 @@
+# 网页、文件与视觉验收
+
+适用：使用web-fetcher进行网页交互、登录、文件预览、截图或视觉交付时必读。本文件按用途组织，不作为插件版本更新日志；字段和容量以当前工具说明为准。
+
+## 选择工具与验证对象
+
+web-fetcher优先处理网页文字、截图、表格、页面交互和本地文件预览，复用已有登录态与session；代码搜索、批量文件处理和系统命令仍由Sandbox承担。网页交互用 `web_interact`，结构和视觉检查用 `web_inspect`，局部/对比截图用 `web_fetch_screenshot`。
+
+Word、PPT、Excel、PDF优先通过 `file://` 原生打开。Office验收不以转PDF替代；PPT逐页检查文本、图片、图表、重叠和溢出，不能只看源码或生成脚本。遇到原生查看不可用，报告真实限制并按适用skill/已授权替代路径处理，不把另一种渲染当作原生验收。
+
+## 截图必须覆盖真实状态
+
+桌面和移动网页按目标尺寸设置 `viewport`；它控制布局，`fullPage`控制截图覆盖，`scale/quality`控制输出，不自动模拟手机UA、触摸或Office页面尺寸。视觉就绪要等字体、图片、懒加载及目标元素；明确不会下载/开新窗的普通点击可关闭多余事件等待，但不能跳过必要异步就绪。
+
+按页码、分片或标签核对图片与 `screenshotRef`，记录缺页、未检查frame、`partial`、`limitations`及截断。`candidate`是几何候选，`confirmed`只是测量事实；结合截图判断内容和装饰，不能把零告警当作全页验收通过。
+
+原生MCP图片直接查看；只有需要留存文件时才用 `saveMode="file"`，不默认再次打开同一截图。超出图片数、像素或字节预算时分批、沿稳定游标继续或显式使用文件模式，不能静默漏页。
+
+## 会话与资源
+
+持久session显式带 `ownerId`，复用 `sessionId` 或 `web_pipeline(sessionId=...)`，需要时用 `snapshot` 同时读取截图、可见文本和结构。页面池和内存门槛以当前运行状态为准，接纳受阻先查原因，只清理自己的闲置会话，不并发重发、跨owner清理或无条件提高上限。
+
+`web_list_sessions`只列当前owner资源；通过明确session或 `closeAllForOwner` 回收本任务资源。借用的用户浏览器、共享登录态、Cookie、localStorage、profile不得随任务结束一并删除。
+
+## 登录与可见窗口
+
+自动验证默认无界面，确需人工登录时才打开可见窗口。`web_login_browser`优先后台启动并持同一 `taskId` 每30～45秒检查；人工操作窗口与单次MCP调用期限不同，不能用同步长等待替代。
+
+写入Cookie或localStorage不证明认证成功，纯localStorage登录也可能没有Cookie。核对保存警告并实际访问目标页面，再决定是否需要用户重新登录；结束只关闭本任务新建的窗口。
+
+## 桌面工具与降级
+
+Electron/Chromium/CEF程序可在能力与授权允许时通过 `desktop_launch`、调试端口、`desktop_connect_cdp` 和 `desktop_register_window` 附着。桌面状态独立于网页页面池，不为调试重启用户生产程序。
+
+web-fetcher确实不适用或失败时说明原因，再选可用浏览器/桌面工具，遵守各工具和skill边界。使用Playwright时按本机偏好操控Edge。不能将缺少可视化能力伪装成截图通过。

@@ -13,6 +13,10 @@
 - Stage Guard / Record / conversation-reading discipline.
 - Council manifest ownership, stable `ownerId`, `antigravityCli` naming, and `dryRun` before any artifact cleanup.
 - A shared Codex engineering core, with optional catgirl, development-machine, and training-machine overlays.
+- Six shared trigger-read topics, with a short core retaining mandatory reading triggers and authorization/privacy boundaries.
+- Separate scheduling and route/progress reviews, concrete failure hypotheses, autonomous main/auxiliary coordination and bounded recovery after state checks.
+- Image-generated style approval before asset production, reference-led implementation, and actual-reader/visual quality checks.
+- Specific human-facing responses, independent judgment and commitments consistent with evidence, without performed emotion or irrelevant defensive explanations.
 
 ## Removed or Replaced
 
@@ -33,3 +37,6 @@
 - Which search provider, models, and background-task limits are available in the receiver's environment.
 - Local authorization and credential storage; keep it outside package files.
 - Which Codex profile to install. Put machine-private facts in a repository-external override copied from `codex/local-overrides.example.md`.
+- Local network-disruption windows and owner-notification routes; no sender-specific time window or contact is a public default.
+- Machine author display name and role provenance. Public Git source trailers are the narrow documented exception; private conversation bodies and bindings remain excluded.
+- Installation versus effective task loading. Confirm both separately; a published commit is not evidence that another machine or existing task has updated.

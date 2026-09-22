@@ -175,6 +175,12 @@ function Test-PackageStructure {
         "rules\codex\profiles\catgirl.profile.json",
         "rules\codex\profiles\development.profile.json",
         "rules\codex\profiles\training.profile.json",
+        "rules\codex\guidance\engineering-workflow.template.md",
+        "rules\codex\guidance\maintenance-upgrades.template.md",
+        "rules\codex\guidance\design-writing.template.md",
+        "rules\codex\guidance\communication-bridges.template.md",
+        "rules\codex\guidance\sandbox-runtime.template.md",
+        "rules\codex\guidance\web-visual.template.md",
         "rules\codex\guidance\development-machine.template.md",
         "rules\codex\guidance\training-machine.template.md",
         "rules\codex\local-overrides.example.md",
@@ -197,6 +203,7 @@ function Test-PackageStructure {
         "install\Start-CodexMcpBroker.ps1",
         "install\Stop-CodexMcpBroker.ps1",
         "install\Test-CodexMcpBrokerLifecycle.ps1",
+        "install\Test-CodexRulesProfiles.ps1",
         "install\Test-NapCatLegacyRollbackCompatibility.ps1",
         "install\Update-CodexMcpBroker.ps1",
         "install\rollback-napcat-mcp.ps1",
@@ -335,145 +342,7 @@ function Test-PackageStructure {
         throw "Codex system prompt helper did not maintain one canonical model_instructions_file setting."
     }
 
-    $utf8 = [System.Text.Encoding]::UTF8
-    $timeboxHeading = $utf8.GetString([Convert]::FromBase64String("IyMjIOiuoeWIkuaXtumXtOebkg=="))
-    $boundedFlexibility = $utf8.GetString([Convert]::FromBase64String("5pyJ6L6555WM55qE54G15rS75oCn"))
-    $noForcedCutoff = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95Y+q5Zug5Yiw5pe26KKr5by66KGM5omT5pat"))
-    $noPassiveWaiting = $utf8.GetString([Convert]::FromBase64String("5LiN6IO95LiA55u0562J5Yiw6aKE566X6ICX5bC9"))
-    $noMechanicalAnnotationReply = $utf8.GetString([Convert]::FromBase64String("5LiN6KaB6buY6K6k5py65qKw6L6T5Ye6"))
-    $profileIds = @("neutral", "catgirl", "development", "training")
-    $buildScript = Join-Path $toolkitRoot "install\Build-CodexRulesProfile.ps1"
-    $profileTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-profile-test-" + [guid]::NewGuid().ToString("N"))
-    try {
-        foreach ($profileId in $profileIds) {
-            $outputRoot = Join-Path $profileTestRoot $profileId
-            & $buildScript -Profile $profileId -OutputDirectory $outputRoot | Out-Null
-            $agentsPath = Join-Path $outputRoot "AGENTS.md"
-            if (-not (Test-Path -LiteralPath $agentsPath)) { throw "Profile did not produce AGENTS.md: $profileId" }
-            if ((Get-Item -LiteralPath $agentsPath).Length -gt 65536) {
-                throw "Profile exceeds the default installed 64K project document limit: $profileId"
-            }
-            $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
-            if (-not ($agentsText.Contains("stage_guard")) -or -not ($agentsText.Contains("sandbox_council"))) {
-                throw "Profile lost shared engineering rules: $profileId"
-            }
-            if (
-                -not ($agentsText.Contains($timeboxHeading)) -or
-                -not ($agentsText.Contains($boundedFlexibility)) -or
-                -not ($agentsText.Contains($noForcedCutoff)) -or
-                -not ($agentsText.Contains($noPassiveWaiting))
-            ) {
-                throw "Profile lost bounded planning timebox rules: $profileId"
-            }
-            if (
-                -not ($agentsText.Contains("response annotations")) -or
-                -not ($agentsText.Contains($noMechanicalAnnotationReply))
-            ) {
-                throw "Profile lost natural response annotation rules: $profileId"
-            }
-            if ($profileId -eq "neutral" -and ($agentsText.Contains("kaomoji"))) {
-                throw "Neutral profile unexpectedly contains the catgirl component."
-            }
-            if ($profileId -ne "neutral" -and -not ($agentsText.Contains("kaomoji"))) {
-                throw "Catgirl profile is missing the catgirl component: $profileId"
-            }
-            if ($profileId -eq "development") {
-                if (-not ($agentsText.Contains("local_role=development"))) { throw "Development profile missing its component." }
-                if (-not (Test-Path -LiteralPath (Join-Path $outputRoot "guidance\development-machine.md"))) {
-                    throw "Development profile missing generated guidance."
-                }
-            }
-            if ($profileId -eq "training") {
-                if (-not ($agentsText.Contains("local_role=training"))) { throw "Training profile missing its component." }
-                if (-not (Test-Path -LiteralPath (Join-Path $outputRoot "guidance\training-machine.md"))) {
-                    throw "Training profile missing generated guidance."
-                }
-            }
-        }
-
-        $reuseRoot = Join-Path $profileTestRoot "reuse"
-        & $buildScript -Profile "development" -OutputDirectory $reuseRoot | Out-Null
-        & $buildScript -Profile "catgirl" -OutputDirectory $reuseRoot | Out-Null
-        if (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) {
-            throw "Reused build directory kept stale development guidance."
-        }
-        & $buildScript -Profile "training" -OutputDirectory $reuseRoot | Out-Null
-        if (-not (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\training-machine.md"))) {
-            throw "Reused build directory lost selected training guidance."
-        }
-        if (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) {
-            throw "Reused build directory mixed development and training guidance."
-        }
-        & $buildScript -Profile "neutral" -OutputDirectory $reuseRoot | Out-Null
-        if (
-            (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\development-machine.md")) -or
-            (Test-Path -LiteralPath (Join-Path $reuseRoot "guidance\training-machine.md"))
-        ) {
-            throw "Reused build directory kept role guidance for neutral profile."
-        }
-    } finally {
-        if (Test-Path -LiteralPath $profileTestRoot) {
-            Remove-Item -LiteralPath $profileTestRoot -Recurse -Force
-        }
-    }
-
-    $installScript = Join-Path $toolkitRoot "install\Install-CodexRulesProfile.ps1"
-    $profileInstallRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-rules-install-test-" + [guid]::NewGuid().ToString("N"))
-    try {
-        & $installScript -Profile "development" -CodexHome $profileInstallRoot -InstallSystemPrompt -InstallRecommendedDesktopFeatures | Out-Null
-        $installedConfigPath = Join-Path $profileInstallRoot "config.toml"
-        $installedConfig = Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8
-        $installedLimit = [regex]::Match($installedConfig, "(?m)^project_doc_max_bytes\s*=\s*(\d+)\s*$")
-        if (-not $installedLimit.Success -or [long]$installedLimit.Groups[1].Value -lt 65536) {
-            throw "Rules profile install did not ensure a 64K Codex project document limit."
-        }
-        $developmentGuidance = Join-Path $profileInstallRoot "guidance\development-machine.md"
-        if (-not (Test-Path -LiteralPath $developmentGuidance)) {
-            throw "Development profile install did not create role guidance."
-        }
-        if (-not (Test-Path -LiteralPath (Join-Path $profileInstallRoot "prompts\system-prompt.md")) -or
-            -not $installedConfig.Contains('model_instructions_file = "~/.codex/prompts/system-prompt.md"') -or
-            -not $installedConfig.Contains("[features.current_time_reminder]") -or
-            -not $installedConfig.Contains("reminder_interval_seconds = 120")) {
-            throw "Rules profile install did not apply the requested system prompt or Desktop feature configuration."
-        }
-
-        Set-Content -LiteralPath $installedConfigPath -Encoding UTF8 -Value @(
-            "project_doc_max_bytes = 131_072",
-            "",
-            "[features]",
-            "test_feature = true"
-        )
-        & $installScript -Profile "catgirl" -CodexHome $profileInstallRoot | Out-Null
-        $preservedInstalledConfig = Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8
-        if (-not $preservedInstalledConfig.Contains("project_doc_max_bytes = 131_072")) {
-            throw "Rules profile install did not preserve an existing higher TOML-formatted project document limit."
-        }
-        if (Test-Path -LiteralPath $developmentGuidance) {
-            throw "Profile switch left stale development role guidance."
-        }
-        $backedUpGuidance = @(
-            Get-ChildItem -LiteralPath (Join-Path $profileInstallRoot "backups") -Recurse -File -Filter "development-machine.md" -ErrorAction SilentlyContinue
-        )
-        if ($backedUpGuidance.Count -lt 1) {
-            throw "Profile switch did not back up stale development role guidance."
-        }
-        $installedAgents = Get-Content -LiteralPath (Join-Path $profileInstallRoot "AGENTS.md") -Raw -Encoding UTF8
-        if (-not ($installedAgents.Contains("kaomoji")) -or $installedAgents.Contains("local_role=development")) {
-            throw "Profile switch did not replace AGENTS.md with the selected profile."
-        }
-        $limitCount = [regex]::Matches(
-            (Get-Content -LiteralPath $installedConfigPath -Raw -Encoding UTF8),
-            "(?m)^project_doc_max_bytes\s*="
-        ).Count
-        if ($limitCount -ne 1) {
-            throw "Repeated Rules profile installs duplicated project_doc_max_bytes."
-        }
-    } finally {
-        if (Test-Path -LiteralPath $profileInstallRoot) {
-            Remove-Item -LiteralPath $profileInstallRoot -Recurse -Force
-        }
-    }
+    & (Join-Path $toolkitRoot "install\Test-CodexRulesProfiles.ps1") | Out-Host
 
     $applyConfigScript = Join-Path $toolkitRoot "install\\Apply-CodexConfig.ps1"
     $configApplyRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("codex-config-apply-test-" + [guid]::NewGuid().ToString("N"))
