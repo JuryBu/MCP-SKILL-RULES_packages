@@ -2,6 +2,7 @@ import { z } from "zod";
 import { performance } from "node:perf_hooks";
 import { sessionManager, type SessionManager } from "./session.js";
 import { getRequestContext, OperationGate, RequestAdmissionError, runWithRequestContext, throwIfRequestExpired, withRequestStage } from "./request-context.js";
+import { assertPageAccessible, pageAccessResult, PageAccessError } from './page-access.js';
 
 type ToolArguments = Record<string, unknown>;
 type ToolHandler = (args: ToolArguments, extra?: any) => any;
@@ -71,6 +72,7 @@ export class ToolConcurrency {
             signal: extra?.signal,
             timeoutMs,
             viewport: validViewport,
+            humanAssistance: args.humanAssistance === 'never' ? 'never' : 'auto',
         }, async () => {
             const context = getRequestContext()!;
             let started = false;
@@ -78,14 +80,21 @@ export class ToolConcurrency {
                 const invoke = async () => this.withPermit(requestClass, async () => {
                     throwIfRequestExpired();
                     started = true;
+                    const inspectedPage = typeof args.sessionId === 'string' && ['web_interact', 'web_pipeline', 'web_inspect', 'web_fetch_page', 'web_fetch_rich', 'web_fetch_screenshot'].includes(name)
+                        ? this.sessions.get(args.sessionId, context.ownerId) : null;
+                    if (inspectedPage && !['navigate', 'goto'].includes(String(args.action))) {
+                        await assertPageAccessible(inspectedPage, { url: inspectedPage.url(), waitFor: typeof args.waitFor === 'string' ? args.waitFor : undefined });
+                    }
                     const result = await withRequestStage("handler", () => Promise.resolve(handler(args, extra)));
+                    if (context.pageAccessIssue) return pageAccessResult(context.pageAccessIssue);
+                    if (inspectedPage && !inspectedPage.isClosed() && !result?.isError) await assertPageAccessible(inspectedPage, { url: inspectedPage.url() });
                     if (context.signal?.aborted || performance.now() >= context.deadline) {
                         return this.failure(context.signal?.aborted ? "request_cancelled" : "request_deadline_exceeded", true, result);
                     }
                     return result;
                 });
                 const usePageLock = requestClass !== "control" && requestClass !== "poll" && typeof args.sessionId === "string"
-                    && ["web_interact", "web_pipeline", "web_inspect", "desktop_inspect", "desktop_screenshot"].includes(name);
+                    && ["web_interact", "web_pipeline", "web_inspect", "desktop_inspect", "desktop_screenshot", "web_fetch_page", "web_fetch_rich", "web_fetch_screenshot"].includes(name);
                 const result = await (usePageLock
                     ? this.sessions.withOperation(args.sessionId as string, context.ownerId, invoke, { signal: context.signal, deadline: context.deadline, queueTimeoutMs: this.options.queueTimeoutMs })
                     : invoke());
@@ -94,6 +103,8 @@ export class ToolConcurrency {
                     _meta: { ...(result._meta ?? {}), webFetcherTiming: { totalMs: Math.round(performance.now() - context.startedAt), stages: context.timings } },
                 } : result;
             } catch (error) {
+                if (error instanceof PageAccessError) return pageAccessResult(error.assessment);
+                if (context.pageAccessIssue) return pageAccessResult(context.pageAccessIssue);
                 if (error instanceof RequestAdmissionError) return this.failure(error.code, started);
                 if (context.signal?.aborted || performance.now() >= context.deadline) return this.failure(context.signal?.aborted ? "request_cancelled" : "request_deadline_exceeded", started);
                 throw error;
@@ -138,21 +149,24 @@ export function installToolConcurrency(server: { tool?: (...args: any[]) => any;
     const existing = installedServers.get(server);
     if (existing) return existing;
     const controller = new ToolConcurrency(options);
-    const addOwner = (schema: any) => {
+    const addOwner = (schema: any, name: string) => {
         const ownerId = z.string().optional().describe("调用方标识，未传兼容 global；已有会话必须使用创建时的 ownerId");
-        if (schema instanceof z.ZodObject) return schema.shape.ownerId ? schema : schema.extend({ ownerId });
-        return schema && typeof schema === "object" && "ownerId" in schema ? schema : { ...(schema ?? {}), ownerId };
+        const humanAssistance = z.enum(['auto', 'never']).optional().describe('遇到强人机验证：auto在明确ownerId下创建后台人工任务并短返回；never只报告受阻，不弹窗。人工窗口保留600秒，用web_human_verification查询/关闭。');
+        const supportsAssistance = /^web_(fetch_|interact$|inspect$|pipeline$|extract_|record_video$|batch_screenshot$)/.test(name);
+        const additions = { ownerId, ...(supportsAssistance ? { humanAssistance } : {}) };
+        if (schema instanceof z.ZodObject) return schema.extend({ ...additions, ...schema.shape });
+        return { ...additions, ...(schema ?? {}) };
     };
     if (server.registerTool) {
         const original = server.registerTool.bind(server);
-        server.registerTool = (name: string, config: any, handler: ToolHandler) => original(name, { ...config, inputSchema: addOwner(config.inputSchema) }, (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
+        server.registerTool = (name: string, config: any, handler: ToolHandler) => original(name, { ...config, inputSchema: addOwner(config.inputSchema, name) }, (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
     }
     if (server.tool) {
         const original = server.tool.bind(server);
         server.tool = (...registration: any[]) => {
             if (registration.length !== 4 || typeof registration[3] !== "function") return original(...registration);
             const [name, description, schema, handler] = registration;
-            return original(name, description, addOwner(schema), (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
+            return original(name, description, addOwner(schema, name), (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
         };
     }
     installedServers.set(server, controller);

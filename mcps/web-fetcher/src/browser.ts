@@ -46,6 +46,7 @@ import { getRequestContext, getActiveRequestCount, remainingRequestMs, throwIfRe
 import { PageAdmissionController, type PageLease } from './page-admission.js';
 import { getRuntimeMemorySampler } from './memory-sampler.js';
 import { applyExplicitViewport, assertViewportTarget, type ResponsiveViewport } from './viewport.js';
+import { assertPageAccessible } from './page-access.js';
 
 function readPositiveIntEnv(name: string, fallback: number): number {
     const raw = process.env[name];
@@ -77,8 +78,6 @@ class BrowserManager {
     private static readonly BROWSER_IDLE_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动关闭浏览器
     // 域名级请求时间记录 — 防止同域高频请求触发封禁
     private domainLastRequest: Map<string, number> = new Map();
-    // v6.3.1: UAV 域名冷却 — 同域同会话只弹一次，防止 Cookie 无效时反复弹窗
-    private uavAttemptedDomains: Set<string> = new Set();
     public get lastRetryCount(): number { const request = getRequestContext(); return request ? this.retryCounts.get(request) ?? 0 : this.fallbackRetryCount; }
     public set lastRetryCount(value: number) { const request = getRequestContext(); if (request) this.retryCounts.set(request, value); else this.fallbackRetryCount = value; }
     // v6.4: 域名级 stealth 降级记忆 — 避免同域每次都要试错
@@ -773,11 +772,15 @@ class BrowserManager {
                     timeout: currentTimeout,
                 }));
 
+                await assertPageAccessible(page, { url, waitFor: options?.waitFor, early: true });
                 await this.waitForContentReady(page, currentTimeout, url);
 
                 lastNavigationError = null;
                 break; // 成功，跳出重试循环
                 } catch (navErr) {
+                    if (this.isTransientError(navErr)) {
+                        await assertPageAccessible(page, { url, waitFor: options?.waitFor });
+                    }
                     lastNavigationError = navErr;
                     navigationAttempt++;
 
@@ -833,7 +836,12 @@ class BrowserManager {
             // 如果指定了等待选择器
             if (options?.waitFor) {
                 throwIfRequestExpired();
-                await page.waitForSelector(options.waitFor, { timeout: Math.max(1, Math.min(timeout, remainingRequestMs(timeout))) });
+                try {
+                    await page.waitForSelector(options.waitFor, { timeout: Math.max(1, Math.min(timeout, remainingRequestMs(timeout))) });
+                } catch (error) {
+                    await this.checkAndHandleVerification(page, url, options);
+                    throw error;
+                }
             }
 
             // 反爬随机延迟（高风控站点用更大延迟范围）
@@ -992,175 +1000,13 @@ class BrowserManager {
      *   3. 可用正文作为反证，避免普通页面因安全脚本误弹窗
      *   4. Cookie 只作为辅助状态，不能让强挑战页直接跳过 UAV
      */
-    private async checkAndHandleVerification(
+    async checkAndHandleVerification(
         page: any,
         url: string,
         options?: { timeout?: number; scrollCount?: number; waitFor?: string }
     ): Promise<any> {
-        let accessRetryStarted = false;
-        try {
-            const pageSnapshot = await page.evaluate(() => {
-                const scripts = Array.from(document.scripts)
-                    .map(script => script.src || script.textContent?.slice(0, 200) || '')
-                    .filter(Boolean)
-                    .slice(0, 80);
-                const iframes = Array.from(document.querySelectorAll('iframe'))
-                    .map(iframe => iframe.getAttribute('src') || '')
-                    .filter(Boolean)
-                    .slice(0, 40);
-                return {
-                    title: document.title || '',
-                    visibleText: document.body?.innerText || '',
-                    html: (document.documentElement?.outerHTML || '').slice(0, 120_000),
-                    scriptUrls: scripts,
-                    iframeUrls: iframes,
-                };
-            }).catch(() => ({
-                title: '',
-                visibleText: '',
-                html: '',
-                scriptUrls: [] as string[],
-                iframeUrls: [] as string[],
-            }));
-
-            let frameText = '';
-            try {
-                const frames = page.frames();
-                for (const frame of frames) {
-                    if (frame === page.mainFrame()) continue;
-                    try {
-                        frameText += ' ' + await frame.evaluate(() => document.body?.innerText || '').catch(() => '');
-                    } catch { /* iframe 访问受限，跳过 */ }
-                }
-            } catch { /* frames() 失败，跳过 */ }
-
-            let uavDomain = '';
-            try { uavDomain = new URL(url).hostname; } catch { uavDomain = url; }
-            const hasCookieForDomain = this.hasCookieBackupForDomain(uavDomain);
-            const detection = detectHumanVerificationSignals({
-                url,
-                title: pageSnapshot.title,
-                visibleText: pageSnapshot.visibleText,
-                frameText,
-                html: pageSnapshot.html,
-                scriptUrls: pageSnapshot.scriptUrls,
-                iframeUrls: pageSnapshot.iframeUrls,
-                waitForMatched: Boolean(options?.waitFor),
-                hasCookieForDomain,
-            });
-
-            if (detection.status !== "normal") {
-                console.error(`[web-fetcher] UAV 检测结果: ${formatHumanVerificationDetection(detection)}`);
-                logHumanVerificationAudit({
-                    phase: detection.status,
-                    url,
-                    confidence: detection.confidence,
-                    reasonCodes: detection.reasonCodes,
-                    evidence: detection.evidence,
-                    metadata: {
-                        hasCookieForDomain: detection.hasCookieForDomain,
-                        hasUsableContent: detection.hasUsableContent,
-                        shouldOfferUav: detection.shouldOfferUav,
-                    },
-                });
-            }
-
-            if (detection.shouldOfferUav) {
-                if (this.uavAttemptedDomains.has(uavDomain)) {
-                    console.error(`[web-fetcher] ℹ️ 域名 ${uavDomain} 已尝试过 UAV，跳过重复弹窗 (${detection.reasonCodes.join(",")})`);
-                    return page;
-                }
-
-                console.error(`[web-fetcher] ℹ️ navigateTo 层检测到需要用户辅助验证 (${detection.reasonCodes.join(",")})。触发 UAV...`);
-                logHumanVerificationAudit({
-                    phase: "human_verification_opened",
-                    url,
-                    confidence: detection.confidence,
-                    reasonCodes: detection.reasonCodes,
-                    metadata: { mode: "uav-cookie-fallback" },
-                });
-
-                // 记录已尝试，无论成功失败都不再对此域名弹窗
-                this.uavAttemptedDomains.add(uavDomain);
-                const uavSuccess = await this.userAssistedVerification(url);
-
-                if (uavSuccess) {
-                    accessRetryStarted = true;
-                    // UAV 成功，重新导航
-                    console.error('[web-fetcher] UAV 状态已保存，重新访问确认...');
-                    logHumanVerificationAudit({
-                        phase: "cookie_copy_fallback",
-                        url,
-                        confidence: detection.confidence,
-                        reasonCodes: detection.reasonCodes,
-                        metadata: { bestEffort: true },
-                    });
-                    await page.close().catch(() => { });
-                    const timeout = options?.timeout || DEFAULT_TIMEOUT;
-                    const newPage = await this.createManagedPage(await this.getContext());
-                    try {
-                        await installOriginStorage(newPage, url);
-                        const retryResponse = await newPage.goto(url, {
-                            waitUntil: 'domcontentloaded',
-                            timeout,
-                        });
-                        if (retryResponse && retryResponse.status() >= 400) {
-                            throw new Error(`ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问返回 HTTP ${retryResponse.status()}；未确认通过验证`);
-                        }
-                        await this.waitForContentReady(newPage, timeout, url);
-                        const retrySnapshot = await newPage.evaluate(() => ({
-                            title: document.title,
-                            visibleText: document.body?.innerText ?? "",
-                            html: document.documentElement.outerHTML.slice(0, 120_000),
-                            scriptUrls: Array.from(document.scripts, script => script.src).filter(Boolean),
-                            iframeUrls: Array.from(document.querySelectorAll("iframe"), frame => frame.src).filter(Boolean),
-                        }));
-                        const retryDetection = detectHumanVerificationSignals({
-                            url,
-                            ...retrySnapshot,
-                            hasCookieForDomain: this.hasCookieBackupForDomain(uavDomain),
-                        });
-                        if (retryDetection.shouldOfferUav || retryDetection.status === "challenge_cleared_but_content_unavailable" || (retryDetection.status === "suspected_challenge" && !retryDetection.hasUsableContent)) {
-                            throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问仍未确认通过验证；不会自动重复弹出登录窗口");
-                        }
-                        logHumanVerificationAudit({
-                            phase: retryDetection.hasUsableContent ? "human_verification_completed" : "cookie_copy_fallback",
-                            url,
-                            confidence: retryDetection.confidence,
-                            reasonCodes: retryDetection.reasonCodes,
-                            metadata: { mode: "uav-storage-fallback", accessRechecked: true, usableContentConfirmed: retryDetection.hasUsableContent },
-                        });
-                        // 反爬延迟
-                        await newPage.waitForTimeout(ANTI_BOT_DELAY_MIN + Math.random() * (ANTI_BOT_DELAY_MAX - ANTI_BOT_DELAY_MIN));
-                        // 滚动
-                        if (options?.scrollCount && options.scrollCount > 0) {
-                            await this.scrollPage(newPage, options.scrollCount);
-                        }
-                        return newPage;
-                    } catch (retryErr) {
-                        await newPage.close().catch(() => { });
-                        if (retryErr instanceof Error && retryErr.message.startsWith("ERR_HUMAN_VERIFICATION_PENDING:")) throw retryErr;
-                        throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问失败；未确认通过验证，不会返回已关闭的旧页面", { cause: retryErr });
-                    }
-                } else {
-                    console.error('[web-fetcher] UAV 未完成，返回验证原页');
-                    logHumanVerificationAudit({
-                        phase: "failed",
-                        url,
-                        confidence: detection.confidence,
-                        reasonCodes: detection.reasonCodes,
-                        metadata: { mode: "uav-cookie-fallback", userCompleted: false },
-                    });
-                }
-            }
-        } catch (err) {
-            if (err instanceof Error && err.message.startsWith("ERR_HUMAN_VERIFICATION_PENDING:")) throw err;
-            if (accessRetryStarted) throw new Error("ERR_HUMAN_VERIFICATION_PENDING: 状态已保存，但重新访问失败；未确认通过验证", { cause: err });
-            // UAV 检测失败不影响正常流程
-            console.error(`[web-fetcher] UAV 检测异常: ${err instanceof Error ? err.message : err}`);
-        }
-
-        return page; // 未触发 UAV 或 UAV 失败，返回原页
+        await assertPageAccessible(page, { url, waitFor: options?.waitFor });
+        return page;
     }
 
     private hasCookieBackupForDomain(domain: string): boolean {

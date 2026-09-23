@@ -8,6 +8,8 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { browserManager } from "../browser.js";
+import { sessionManager } from "../session.js";
+import { samePageTarget } from "../page-access.js";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { categorizeFile } from "../converter.js";
 import { extractPdfStructure, resolvePdfPathFromUrl, renderPdfRegion, searchPdfTextRegion } from "../inspector/pdf-inspector.js";
@@ -75,9 +77,12 @@ function parsePages(pagesStr: string, totalPages: number, limit = Infinity): num
 
 const FetchScreenshotInputSchema = z.object({
     viewport: viewportSchema.optional(),
+    sessionId: z.string().optional().describe("已有网页会话 ID；借用当前页截图，不导航、不读取缓存"),
+    ownerId: z.string().optional().describe("会话所属 ownerId"),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
+        .optional()
         .describe("要截图的网页 URL（支持 http/https/file 协议，如 file:///C:/path/to/file.pdf）"),
     fullPage: z
         .boolean()
@@ -142,7 +147,7 @@ const FetchScreenshotInputSchema = z.object({
         .describe("是否自动分片超大截图（默认 true）。IDE 限制图片任何维度不能超过 8000px，开启时超限图片会自动切割为多张。设为 false 可保留原始完整图片（用于保存到文件等场景）"),
 });
 
-type FetchScreenshotInput = z.infer<typeof FetchScreenshotInputSchema>;
+type FetchScreenshotInput = z.infer<typeof FetchScreenshotInputSchema> & { url: string };
 
 interface CaptureResult {
     buffer: Buffer;
@@ -355,7 +360,7 @@ async function capturePdfTarget(params: FetchScreenshotInput, quality: ImageQual
 async function captureWithBrowser(params: FetchScreenshotInput, qConfig: QualityConfig): Promise<CaptureResult> {
     let page: Page | undefined;
     try {
-        page = await browserManager.navigateTo(params.url, {
+        page = params.sessionId ? sessionManager.get(params.sessionId, params.ownerId) ?? undefined : await browserManager.navigateTo(params.url, {
             viewport: params.viewport,
             waitFor: params.selector,
             timeout: params.timeout,
@@ -363,10 +368,15 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
             fullPage: params.fullPage,
             pageNumber: params.page,
         });
+        if (!page) throw new Error("会话不存在、已关闭或 ownerId 不匹配");
+        if (params.sessionId) {
+            if (params.selector) await page.waitForSelector(params.selector, { timeout: params.timeout ?? 30000 });
+            if (params.scrollCount) await browserManager.scrollPage(page, params.scrollCount);
+        }
 
         const isLocalFile = params.url.startsWith("file://");
         await applyExplicitViewport(page, params.viewport);
-        if (!params.viewport && !isLocalFile && !params.selector && !params.target && qConfig.viewportWidth !== 1920) {
+        if (!params.sessionId && !params.viewport && !isLocalFile && !params.selector && !params.target && qConfig.viewportWidth !== 1920) {
             const currentSize = page.viewportSize();
             if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                 await page.setViewportSize({
@@ -381,6 +391,7 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
         let warning = "";
         const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: params.fullPage ?? false });
         if (readiness.complete === false && readiness.note) warning += `\n⚠️ ${readiness.note}`;
+        await browserManager.checkAndHandleVerification(page, page.url?.() ?? params.url, { waitFor: params.selector });
 
         if (params.selector) {
             const element = await page.$(params.selector);
@@ -431,7 +442,7 @@ async function captureWithBrowser(params: FetchScreenshotInput, qConfig: Quality
 
         return { buffer, pageInfo, warning: `${warning}${smallWarning}` };
     } finally {
-        if (page) {
+        if (page && !params.sessionId) {
             await page.close().catch(() => { });
         }
     }
@@ -605,7 +616,9 @@ export function registerFetchScreenshot(server: McpServer): void {
 支持 file:// 协议打开本地文件（HTML、PDF、DOCX、PPTX、XLSX、图片等）进行截图。
 
 参数:
-  - url (string, 必须): 要截图的网页 URL（支持 http/https/file 协议）
+  - url (string, 可选): 要截图的网页 URL（支持 http/https/file 协议）；与 sessionId 至少提供一个
+  - sessionId (string, 可选): 从已有网页会话当前页截图，不导航；不支持文档与 diff 路线
+  - ownerId (string, 可选): 借用会话的 ownerId
   - fullPage (boolean, 可选): 是否全页截图，默认 false
   - viewport (object, 可选): 网页 CSS 视口 {width,height}，如 {width:390,height:844}；优先于 quality 的旧默认宽度，不模拟设备 UA/触摸。fullPage 只扩大截图滚动范围，不改变布局宽高
   - selector (string, 可选): CSS 选择器，截取指定元素
@@ -627,6 +640,8 @@ export function registerFetchScreenshot(server: McpServer): void {
             inputSchema: {
                 viewport: FetchScreenshotInputSchema.shape.viewport,
                 url: FetchScreenshotInputSchema.shape.url,
+                sessionId: FetchScreenshotInputSchema.shape.sessionId,
+                ownerId: FetchScreenshotInputSchema.shape.ownerId,
                 fullPage: FetchScreenshotInputSchema.shape.fullPage,
                 selector: FetchScreenshotInputSchema.shape.selector,
                 target: FetchScreenshotInputSchema.shape.target,
@@ -647,12 +662,23 @@ export function registerFetchScreenshot(server: McpServer): void {
                 openWorldHint: true,
             },
         },
-        async (params: FetchScreenshotInput) => {
+        async (input: z.infer<typeof FetchScreenshotInputSchema>) => {
             touchActivity();
             const startTime = Date.now();
-            const quality: ImageQuality = params.quality || "default";
-            const saveMode: SaveMode = params.saveMode || "inline";
+            const quality: ImageQuality = input.quality || "default";
+            const saveMode: SaveMode = input.saveMode || "inline";
             const qConfig = QUALITY_PRESETS[quality];
+            const borrowedPage = input.sessionId ? sessionManager.get(input.sessionId, input.ownerId) : null;
+            if (input.sessionId && !borrowedPage) return { isError: true, content: [{ type: "text" as const, text: "会话不存在、已关闭或 ownerId 不匹配" }] };
+            const sourceUrl = borrowedPage?.url() ?? input.url;
+            if (!sourceUrl) return { isError: true, content: [{ type: "text" as const, text: "需要 url 或 sessionId 参数" }] };
+            if (borrowedPage) {
+                if (!/^https?:\/\//i.test(sourceUrl) || /\.(?:pdf|docx?|pptx?|xlsx?|epub)(?:[?#]|$)/i.test(sourceUrl) || input.page || input.pages || input.diff) {
+                    return { isError: true, content: [{ type: "text" as const, text: "sessionId 只支持已打开的普通 http(s) 网页，不支持文档页码或 diff 路线" }] };
+                }
+                if (input.url && !samePageTarget(sourceUrl, input.url)) return { isError: true, content: [{ type: "text" as const, text: `url 与现有会话页面不匹配：当前为 ${sourceUrl}` }] };
+            }
+            const params: FetchScreenshotInput = { ...input, url: sourceUrl };
 
             try {
                 assertViewportTarget(params.url, params.viewport);
@@ -697,7 +723,7 @@ export function registerFetchScreenshot(server: McpServer): void {
             }
 
             // ========== 单页模式（原有逻辑）==========
-            const cacheKey = generateCacheKey(
+            const cacheKey = params.sessionId ? randomUUID() : generateCacheKey(
                 params.url,
                 quality,
                 params.fullPage,
@@ -709,7 +735,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                 params.page,
                 ...(params.viewport ? [params.viewport.width, params.viewport.height] : []),
             );
-            if (saveMode === "file") {
+            if (saveMode === "file" && !params.sessionId) {
                 const cached = getTempFile("screenshots", cacheKey, ".jpg");
                 if (cached) {
                     const stat = (await import("fs")).statSync(cached);
@@ -766,7 +792,7 @@ export function registerFetchScreenshot(server: McpServer): void {
 
             let page;
             try {
-                page = await browserManager.navigateTo(params.url, {
+                page = borrowedPage ?? await browserManager.navigateTo(params.url, {
                     viewport: params.viewport,
                     waitFor: params.selector,
                     timeout: params.timeout,
@@ -774,11 +800,15 @@ export function registerFetchScreenshot(server: McpServer): void {
                     fullPage: params.fullPage,
                     pageNumber: params.page,
                 });
+                if (borrowedPage) {
+                    if (params.selector) await page.waitForSelector(params.selector, { timeout: params.timeout ?? 30000 });
+                    if (params.scrollCount) await browserManager.scrollPage(page, params.scrollCount);
+                }
 
                 // 根据 quality 调整视口宽度
                 const isLocalFile = params.url.startsWith("file://");
                 await applyExplicitViewport(page, params.viewport);
-                if (!params.viewport && !isLocalFile && !params.selector && qConfig.viewportWidth !== 1920) {
+                if (!borrowedPage && !params.viewport && !isLocalFile && !params.selector && qConfig.viewportWidth !== 1920) {
                     const currentSize = page.viewportSize();
                     if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                         await page.setViewportSize({
@@ -792,6 +822,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                 let screenshotBuffer: Buffer;
                 const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: params.fullPage ?? false });
                 const readinessWarning = readiness.complete === false && readiness.note ? `\n⚠️ ${readiness.note}` : "";
+                await browserManager.checkAndHandleVerification(page, page.url?.() ?? params.url, { waitFor: params.selector });
 
                 if (params.selector) {
                     const element = await page.$(params.selector);
@@ -846,7 +877,7 @@ export function registerFetchScreenshot(server: McpServer): void {
 
                 // 根据 saveMode 返回
                 if (saveMode === "file") {
-                    const storageKey = warning ? generateCacheKey(cacheKey, "partial", randomUUID()) : cacheKey;
+                    const storageKey = params.sessionId ? generateCacheKey(cacheKey, randomUUID()) : warning ? generateCacheKey(cacheKey, "partial", randomUUID()) : cacheKey;
                     const autoSplit = params.autoSplit !== false;
                     if (autoSplit) {
                         const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", storageKey, ".jpg");
@@ -898,7 +929,7 @@ export function registerFetchScreenshot(server: McpServer): void {
                     }],
                 };
             } finally {
-                if (page) {
+                if (page && !borrowedPage) {
                     await page.close().catch(() => { });
                 }
             }

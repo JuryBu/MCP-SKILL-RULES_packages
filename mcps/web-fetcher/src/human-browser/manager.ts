@@ -14,6 +14,7 @@ import { normalizeOwnerId } from "../session.js";
 import { sessionManager } from "../session.js";
 import { detectHumanVerificationSignals, type HumanVerificationDetection } from "../human-verification.js";
 import { logHumanVerificationAudit } from "../human-audit.js";
+import { BrowserAuthState, installOriginStorage } from '../browser-auth-state.js';
 
 export interface HumanBrowserPageInfo {
     humanSessionId: string;
@@ -78,10 +79,13 @@ class HumanBrowserManager {
         startUrl?: string;
         ownerId?: string;
         waitMs?: number;
+        restoreState?: boolean;
+        signal?: AbortSignal;
     }): Promise<HumanBrowserSessionInfo> {
         const ownerId = normalizeOwnerId(params.ownerId);
+        params.signal?.throwIfAborted();
         const chrome = await launchSystemChrome({
-            startUrl: params.startUrl ?? "about:blank",
+            startUrl: params.restoreState ? 'about:blank' : params.startUrl ?? "about:blank",
             profilePrefix: "mcp-chrome-human",
         });
         let desktopSessionId: string | undefined;
@@ -92,6 +96,15 @@ class HumanBrowserManager {
             const connected = await desktopManager.connectCdp({ port: chrome.cdpPort, ownerId });
             desktopSessionId = connected.desktopSessionId;
             cdpBrowser = await connectCDP(chrome.cdpPort);
+            params.signal?.throwIfAborted();
+            if (params.restoreState && params.startUrl) {
+                const context = cdpBrowser.contexts()[0];
+                await new BrowserAuthState().refresh(context);
+                const page = context.pages()[0] ?? await context.newPage();
+                await installOriginStorage(page, params.startUrl);
+                await page.goto(params.startUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
+                params.signal?.throwIfAborted();
+            }
             session = await this.createSession({
                 ownerId,
                 desktopSessionId: connected.desktopSessionId,
@@ -102,17 +115,28 @@ class HumanBrowserManager {
                 endpoint: `http://127.0.0.1:${chrome.cdpPort}`,
                 startUrl: params.startUrl ?? "about:blank",
             });
+            params.signal?.throwIfAborted();
             return await this.describe(session.id, ownerId);
         } catch (error) {
-            if (session) {
-                session.removeListeners();
-                await session.tracker.stop().catch(() => undefined);
-                this.sessions.delete(session.id);
-            }
-            if (desktopSessionId) await desktopManager.close(desktopSessionId, ownerId).catch(() => false);
-            if (cdpBrowser) await cdpBrowser.close().catch(() => undefined);
-            terminateOwnedChrome(chrome);
-            throw new Error(`${error instanceof Error ? error.message : String(error)}; owned recovery profile retained: ${chrome.tempProfile}`);
+            let cleanupAttempt: Promise<void> | undefined;
+            const retryCleanup = (): Promise<void> => {
+                if (cleanupAttempt) return cleanupAttempt;
+                cleanupAttempt = (async () => {
+                    if (session) {
+                        session.removeListeners();
+                        await session.tracker.stop().catch(() => undefined);
+                    }
+                    if (desktopSessionId) await desktopManager.close(desktopSessionId, ownerId).catch(() => false);
+                    if (cdpBrowser) await cdpBrowser.close().catch(() => undefined);
+                    terminateOwnedChrome(chrome);
+                    if (!await this.waitForOwnedExit(chrome)) throw new Error('owned process exit unconfirmed');
+                    if (session) this.sessions.delete(session.id);
+                })().finally(() => { cleanupAttempt = undefined; });
+                return cleanupAttempt;
+            };
+            let cleanupFailed = false;
+            await retryCleanup().catch(() => { cleanupFailed = true; });
+            throw Object.assign(new Error(`${error instanceof Error ? error.message : String(error)}; owned recovery profile retained: ${chrome.tempProfile}${cleanupFailed ? '; owned process exit unconfirmed' : ''}`), { cleanupFailed, retryCleanup });
         }
     }
 
@@ -172,6 +196,17 @@ class HumanBrowserManager {
         };
     }
 
+    getPage(humanSessionId: string, pageId: string, ownerId: string): any | null {
+        const session = this.getSession(humanSessionId, ownerId);
+        const page = session.pages.get(pageId);
+        return page && !page.isClosed() ? page : null;
+    }
+
+    peekStorage(humanSessionId: string, ownerId: string): NonNullable<HumanBrowserSessionInfo['storageSnapshot']> {
+        const session = this.getSession(humanSessionId, ownerId);
+        return { ...this.publicStorageSnapshot(this.storageSummary(session)), recoveryPending: session.recoveryPending };
+    }
+
     async registerPage(humanSessionId: string, pageId: string | undefined, ownerId?: string): Promise<{
         humanSessionId: string;
         sessionId: string;
@@ -222,13 +257,13 @@ class HumanBrowserManager {
     async close(humanSessionId: string, ownerId?: string): Promise<boolean> {
         const session = this.sessions.get(humanSessionId);
         if (!session || session.ownerId !== normalizeOwnerId(ownerId)) return false;
-        return session.closing ??= this.finishSession(session, true);
+        return session.closing ??= this.finishSession(session, true).catch(error => { session.closing = undefined; throw error; });
     }
 
     async detach(humanSessionId: string, ownerId?: string): Promise<boolean> {
         const session = this.sessions.get(humanSessionId);
         if (!session || session.ownerId !== normalizeOwnerId(ownerId)) return false;
-        return session.closing ??= this.finishSession(session, false);
+        return session.closing ??= this.finishSession(session, false).catch(error => { session.closing = undefined; throw error; });
     }
 
     private async finishSession(session: HumanBrowserSession, terminate: boolean): Promise<boolean> {
@@ -239,6 +274,7 @@ class HumanBrowserManager {
         if (session.recovery) await session.recovery;
         const snapshot = this.storageSummary(session);
         let profileRetained = Boolean(session.chrome);
+        const cleanupErrors: string[] = [];
         if (terminate && session.chrome && session.cdpBrowser.isConnected()) {
             let timer: ReturnType<typeof setTimeout> | undefined;
             await Promise.race([
@@ -250,13 +286,15 @@ class HumanBrowserManager {
             ]).finally(() => { if (timer) clearTimeout(timer); });
         }
         for (const sessionId of session.registeredSessionIds.values()) {
-            await sessionManager.close(sessionId, session.ownerId).catch(() => false);
+            await sessionManager.close(sessionId, session.ownerId).catch(() => { cleanupErrors.push('registered session close failed'); return false; });
         }
         await desktopManager.close(session.desktopSessionId, session.ownerId).catch(() => false);
         await session.cdpBrowser.close().catch(() => undefined);
+        if (session.cdpBrowser.isConnected()) cleanupErrors.push('CDP disconnect unconfirmed');
         if (terminate && session.chrome) {
             terminateOwnedChrome(session.chrome);
             const exited = await this.waitForOwnedExit(session.chrome);
+            if (!exited) cleanupErrors.push('owned process exit unconfirmed');
             if (exited && (capturedBeforeClose || session.recoveredSnapshot?.savedAt)
                 && snapshot.savedAt && ((snapshot.savedCookieCount ?? 0) > 0 || snapshot.localStorageDomains.length > 0)
                 && snapshot.errors.length === 0 && session.recoveredSnapshot?.recoveryBrowserClosed !== false) {
@@ -272,6 +310,7 @@ class HumanBrowserManager {
             metadata: { source: session.source, savedAt: snapshot.savedAt, storageErrors: snapshot.errors.length,
                 profileRetained },
         });
+        if (cleanupErrors.length) throw new Error(`人工浏览器清理未确认：${cleanupErrors.join('; ')}`);
         this.sessions.delete(session.id);
         return true;
     }

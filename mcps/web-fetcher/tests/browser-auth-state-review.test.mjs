@@ -64,38 +64,20 @@ function challengePage() {
     };
 }
 
-async function withUavRetry(retry, run) {
-    const original = { getContext: browserManager.getContext, createManagedPage: browserManager.createManagedPage, userAssistedVerification: browserManager.userAssistedVerification, waitForContentReady: browserManager.waitForContentReady };
-    browserManager.getContext = async () => ({ async newPage() { return retry; } });
-    browserManager.createManagedPage = async () => retry;
-    browserManager.userAssistedVerification = async () => true;
-    browserManager.waitForContentReady = async () => undefined;
-    browserManager.uavAttemptedDomains.clear();
-    try { await run(); }
-    finally { Object.assign(browserManager, original); browserManager.uavAttemptedDomains.clear(); }
-}
-
-test("review: HTTP 403 retry cannot be reported as verified access", async () => {
-    const page = challengePage();
-    const retry = {
-        async addInitScript() {},
-        async goto() { return { status() { return 403; }, ok() { return false; } }; },
+test("review: explicit forbidden page cannot be reported as verified access", async () => {
+    const page = {
         url() { return "https://review.test/"; },
         async evaluate() { return { title: "Forbidden", visibleText: "Forbidden", html: "<h1>Forbidden</h1>", scriptUrls: [], iframeUrls: [] }; },
         async waitForTimeout() {},
         async close() {},
     };
-    await withUavRetry(retry, async () => {
-        await assert.rejects(browserManager.checkAndHandleVerification(page, "https://review.test/"), /ERR_HUMAN_VERIFICATION_PENDING/);
-    });
+    await assert.rejects(browserManager.checkAndHandleVerification(page, "https://review.test/"), /access_denied/);
 });
 
-test("review: retry navigation failure cannot return the already closed original page", async () => {
+test("review: unresolved challenge never returns the original page or claims stored state is verified", async () => {
     const page = challengePage();
-    const retry = { async addInitScript() {}, async goto() { throw new Error("synthetic navigation timeout"); }, async close() {} };
-    await withUavRetry(retry, async () => {
-        await assert.rejects(browserManager.checkAndHandleVerification(page, "https://review.test/"));
-    });
+    await assert.rejects(browserManager.checkAndHandleVerification(page, "https://review.test/"), /challenge_required/);
+    assert.equal(page.closed, false);
 });
 
 test("review: failed normal-browser persistence must preserve its only on-disk profile", async () => {

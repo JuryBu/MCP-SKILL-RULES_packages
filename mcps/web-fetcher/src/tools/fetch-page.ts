@@ -1,6 +1,9 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
+import { sessionManager } from "../session.js";
+import { samePageTarget } from "../page-access.js";
+import { detectHumanVerificationSignals } from "../human-verification.js";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { extractContent, truncateContent, compactContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
 import { pageCache } from "../cache.js";
@@ -32,6 +35,8 @@ const WEB_AI_BACKGROUND_MAX_RUN_MS =
 
 const FetchPageInputSchema = z.object({
     viewport: viewportSchema.optional(),
+    sessionId: z.string().optional().describe("已有页面会话 ID；与 url 至少提供一个，借用页面不导航"),
+    ownerId: z.string().optional().describe("会话所属 ownerId；使用 sessionId 时须与创建会话时一致"),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
@@ -117,7 +122,9 @@ export function registerFetchPage(server: McpServer): void {
 支持 file:// 协议打开本地文件（如 HTML）。
 
 参数:
-  - url (string, 必须): 要抓取的网页 URL（支持 http/https/file 协议）
+  - url (string, 可选): 要抓取的网页 URL（支持 http/https/file 协议）；与 sessionId 至少提供一个
+  - sessionId (string, 可选): 从已有网页会话的当前页面继续读取，不导航、不使用缓存；不支持文档路线
+  - ownerId (string, 可选): 借用会话的 ownerId
 - waitFor (string, 可选): CSS 选择器，等待该元素出现后再提取
 - viewport (object, 可选): 网页 CSS 视口 {width,height}；仅响应式布局，非设备 UA/触摸模拟，文件预览不适用
 - timeout (number, 可选): 超时毫秒数，默认 30000
@@ -138,6 +145,8 @@ export function registerFetchPage(server: McpServer): void {
             inputSchema: {
                 viewport: FetchPageInputSchema.shape.viewport,
                 url: FetchPageInputSchema.shape.url,
+                sessionId: FetchPageInputSchema.shape.sessionId,
+                ownerId: FetchPageInputSchema.shape.ownerId,
                 waitFor: FetchPageInputSchema.shape.waitFor,
                 timeout: FetchPageInputSchema.shape.timeout,
                 scrollCount: FetchPageInputSchema.shape.scrollCount,
@@ -164,24 +173,28 @@ export function registerFetchPage(server: McpServer): void {
                     content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
                 }, startTime);
             }
-            if (!params.url) {
+            if (!params.url && !params.sessionId) {
                 return {
                     isError: true,
-                    content: [{ type: "text" as const, text: "web_fetch_page 需要 url 参数；查询后台任务时只需 taskId。" }],
+                    content: [{ type: "text" as const, text: "web_fetch_page 需要 url 或 sessionId 参数；查询后台任务时只需 taskId。" }],
                 };
             }
 
             const outputMode = params.outputMode || "summary";
             const modelChain = resolveSummaryModelChain(params.chain, params.modelChain);
-            try {
-                assertViewportTarget(params.url, params.viewport);
-            } catch (error) {
-                return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
+            let sourceUrl = params.url ?? "";
+            let borrowedPage = false;
+            if (!params.sessionId) {
+                try {
+                    assertViewportTarget(sourceUrl, params.viewport);
+                } catch (error) {
+                    return { isError: true, content: [{ type: "text" as const, text: String(error) }] };
+                }
             }
 
             // v4.0: 本地文件快捷通道 — xlsx/纯文本文件无需浏览器
-            if (params.url.startsWith("file://")) {
-                const filePath = decodeURIComponent(params.url.replace(/^file:\/\/\/?/, ''));
+            if (!params.sessionId && sourceUrl.startsWith("file://")) {
+                const filePath = decodeURIComponent(sourceUrl.replace(/^file:\/\/\/?/, ''));
                 const { categorizeFile } = await import("../converter.js");
                 const category = categorizeFile(filePath);
 
@@ -190,7 +203,7 @@ export function registerFetchPage(server: McpServer): void {
                         const { extractEpubDocument, formatEpubAsMarkdown } = await import("../ebook/epub.js");
                         const document = extractEpubDocument(filePath);
                         const markdown = formatEpubAsMarkdown(document);
-                        return appendTiming(await formatOutput(markdown, params.url, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(markdown, sourceUrl, outputMode, modelChain, params.background), startTime);
                     } catch (e: any) {
                         const code = e?.code ? `${e.code}: ` : "";
                         const stage = e?.stage ? `\n阶段: ${e.stage}` : "";
@@ -212,7 +225,7 @@ export function registerFetchPage(server: McpServer): void {
                         const ext = path.extname(filePath);
                         const name = path.basename(filePath);
                         const header = `# ${name}\n\n\`\`\`${ext.slice(1)}\n${textContent}\n\`\`\``;
-                        return appendTiming(await formatOutput(header, params.url, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
                     } catch (e: any) {
                         return { isError: true, content: [{ type: "text" as const, text: `读取文件失败: ${e.message}` }] };
                     }
@@ -223,7 +236,7 @@ export function registerFetchPage(server: McpServer): void {
                     try {
                         const { xlsxToTextSummary } = await import("../converter.js");
                         const summary = await xlsxToTextSummary(filePath);
-                        return appendTiming(await formatOutput(summary, params.url, outputMode, modelChain, params.background), startTime);
+                        return appendTiming(await formatOutput(summary, sourceUrl, outputMode, modelChain, params.background), startTime);
                     } catch (e: any) {
                         return { isError: true, content: [{ type: "text" as const, text: `Excel 解析失败: ${e.message}` }] };
                     }
@@ -258,7 +271,7 @@ export function registerFetchPage(server: McpServer): void {
                                     const name = path.basename(filePath);
                                     const header = `# ${name}\n\n${mdContent || "(空文档)"}`;
                                     try { fs.unlinkSync(htmlPath); } catch { }
-                                    return appendTiming(await formatOutput(header, params.url, outputMode, modelChain, params.background), startTime);
+                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
                                 }
                             } else {
                                 // DOCX: 转 txt 已经足够好
@@ -275,7 +288,7 @@ export function registerFetchPage(server: McpServer): void {
                                     const name = path.basename(filePath);
                                     const header = `# ${name}\n\n${textContent || "(空文档)"}`;
                                     try { fs.unlinkSync(txtPath); } catch { }
-                                    return appendTiming(await formatOutput(header, params.url, outputMode, modelChain, params.background), startTime);
+                                    return appendTiming(await formatOutput(header, sourceUrl, outputMode, modelChain, params.background), startTime);
                                 }
                             }
                         }
@@ -288,23 +301,45 @@ export function registerFetchPage(server: McpServer): void {
             }
 
             // PageCache: 无特殊参数时使用缓存（scrollCount/waitFor 跳过）
-            const useCache = !params.scrollCount && !params.waitFor && !params.viewport;
+            const useCache = !params.sessionId && !params.scrollCount && !params.waitFor && !params.viewport;
             if (useCache) {
-                const cached = pageCache.get(params.url);
+                const cached = pageCache.get(sourceUrl);
                 if (cached) {
-                    // 缓存命中也需要按 outputMode 处理
-                return appendTiming(await formatOutput(cached, params.url, outputMode, modelChain, params.background), startTime);
+                    const title = cached.match(/^#\s+(.+)$/m)?.[1];
+                    const detection = detectHumanVerificationSignals({ url: sourceUrl, title, visibleText: cached });
+                    if (detection.status === "challenge_required") {
+                        pageCache.delete(sourceUrl);
+                    } else {
+                        return appendTiming(await formatOutput(cached, sourceUrl, outputMode, modelChain, params.background), startTime);
+                    }
                 }
             }
 
             let page;
             try {
-                page = await browserManager.navigateTo(params.url, {
-                    viewport: params.viewport,
-                    waitFor: params.waitFor,
-                    timeout: params.timeout,
-                    scrollCount: params.scrollCount,
-                });
+                if (params.sessionId) {
+                    page = sessionManager.get(params.sessionId, params.ownerId);
+                    if (!page) throw new Error("会话不存在、已关闭或 ownerId 不匹配");
+                    borrowedPage = true;
+                    sourceUrl = page.url();
+                    if (!/^https?:\/\//i.test(sourceUrl) || /\.(?:pdf|docx?|pptx?|xlsx?|epub)(?:[?#]|$)/i.test(sourceUrl)) {
+                        throw new Error("sessionId 只支持已打开的普通 http(s) 网页，不支持 file/Office/PDF/EPUB 文档路线");
+                    }
+                    if (params.url && !samePageTarget(sourceUrl, params.url)) {
+                        throw new Error(`url 与现有会话页面不匹配：当前为 ${sourceUrl}`);
+                    }
+                    await browserManager.checkAndHandleVerification(page, sourceUrl, { waitFor: params.waitFor });
+                    if (params.waitFor) await page.waitForSelector(params.waitFor, { timeout: params.timeout ?? 30000 });
+                    if (params.scrollCount) await browserManager.scrollPage(page, params.scrollCount);
+                } else {
+                    assertViewportTarget(sourceUrl, params.viewport);
+                    page = await browserManager.navigateTo(sourceUrl, {
+                        viewport: params.viewport,
+                        waitFor: params.waitFor,
+                        timeout: params.timeout,
+                        scrollCount: params.scrollCount,
+                    });
+                }
                 await applyExplicitViewport(page, params.viewport);
 
                 // === iframe 内容智能提取 ===
@@ -329,6 +364,7 @@ export function registerFetchPage(server: McpServer): void {
                                 let contentLoaded = false;
                                 for (let round = 0; round < 2 && !contentLoaded; round++) {
                                     if (round === 1) {
+                                        if (borrowedPage) break;
                                         const pageUrl = page.url();
                                         if (pageUrl.includes("#")) {
                                             await page.evaluate(() => {
@@ -406,7 +442,7 @@ export function registerFetchPage(server: McpServer): void {
                     const textParts = pageNums.map(pn =>
                         `## 第 ${pn} 页\n\n${pdfTexts[pn]}`
                     );
-                    const fileName = params.url.split('/').pop() || 'PDF';
+                    const fileName = sourceUrl.split('/').pop() || 'PDF';
                     resultContent = `# ${decodeURIComponent(fileName)}\n\n> PDF 文档，共 ${totalPages} 页，提取了 ${pageNums.length} 页文本\n\n${textParts.join('\n\n---\n\n')}`;
                 } else if (iframeHtmlParts.length > 0) {
                     const td = new TurndownService({
@@ -422,22 +458,22 @@ export function registerFetchPage(server: McpServer): void {
                     resultContent = cleanFooterGarbage(truncateContent(`# ${pageTitle}\n\n${iframeMarkdown}`));
                 } else {
                     const html = await safePageContent(page);
-                    let { content } = extractContent(html, params.url);
+                    let { content } = extractContent(html, sourceUrl);
 
                     // v5.2: NGA 等 GBK 编码站点修复 — 检测到锟斤拷乱码时，
                     // 用 Node.js HTTP 请求获取原始字节流，iconv-lite 解码 GBK→UTF-8
-                    if (detectEncodingIssue(content)) {
+                    if (!borrowedPage && detectEncodingIssue(content)) {
                         try {
                             const iconv = (await import('iconv-lite')).default;
                             const https = await import('https');
                             const http = await import('http');
                             // 从浏览器 context 获取 Cookie 传给独立 HTTP 请求
                             const context = page.context();
-                            const cookies = await context.cookies(params.url);
+                            const cookies = await context.cookies(sourceUrl);
                             const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
                             const rawHtml = await new Promise<string>((resolve, reject) => {
-                                const mod = params.url!.startsWith('https') ? https : http;
-                                const req = mod.get(params.url!, {
+                                const mod = sourceUrl.startsWith('https') ? https : http;
+                                const req = mod.get(sourceUrl, {
                                     headers: {
                                         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                                         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -471,7 +507,7 @@ export function registerFetchPage(server: McpServer): void {
                                 req.on('error', reject);
                                 req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
                             });
-                            const reDecoded = extractContent(rawHtml, params.url);
+                            const reDecoded = extractContent(rawHtml, sourceUrl);
                             if (!detectEncodingIssue(reDecoded.content)) {
                                 content = reDecoded.content;
                             }
@@ -485,14 +521,16 @@ export function registerFetchPage(server: McpServer): void {
                 // 所有工具（screenshot/rich/page/html/interact）自动受益
 
                 // v5.2: SPA 空壳检测 — 内容过少时提示用户添加 scrollCount
-                const spaHint = detectSPAIssue(resultContent, params.url);
+                await browserManager.checkAndHandleVerification(page, page.url(), { waitFor: params.waitFor });
+                sourceUrl = page.url();
+                const spaHint = detectSPAIssue(resultContent, sourceUrl);
                 if (spaHint) {
                     resultContent += spaHint;
                 }
 
                 // v5.2: URL 跳转诊断 — 检测 B站视频页等被重定向的情况
                 const finalUrl = page.url();
-                if (finalUrl !== params.url) {
+                if (params.url && finalUrl !== params.url) {
                     const requestedVideo = params.url.match(/bilibili\.com\/video\/(BV[a-zA-Z0-9]+)/);
                     if (requestedVideo && !finalUrl.includes('/video/')) {
                         resultContent += `\n\n⚠️ URL 跳转检测：请求的视频页 ${requestedVideo[1]} 被重定向到了 ${finalUrl}，BV 号可能不正确或视频已下架。`;
@@ -501,10 +539,10 @@ export function registerFetchPage(server: McpServer): void {
 
                 // 缓存成功结果（仅内容足够丰富时）
                 if (useCache && resultContent && resultContent.length > 100) {
-                    pageCache.set(params.url, resultContent);
+                    pageCache.set(params.url ?? sourceUrl, resultContent);
                 }
 
-                return appendTiming(await formatOutput(resultContent, params.url, outputMode, modelChain, params.background), startTime, browserManager.lastRetryCount);
+                return appendTiming(await formatOutput(resultContent, sourceUrl, outputMode, modelChain, params.background), startTime, browserManager.lastRetryCount);
             } catch (error) {
                 const message =
                     error instanceof Error ? error.message : String(error);
@@ -529,7 +567,7 @@ export function registerFetchPage(server: McpServer): void {
                     ],
                 };
             } finally {
-                if (page) {
+                if (page && !borrowedPage) {
                     await page.close().catch(() => { });
                 }
             }

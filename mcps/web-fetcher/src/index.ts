@@ -51,6 +51,7 @@ import { registerExtractTables } from "./tools/extract-tables.js";
 import { registerInspect } from "./tools/inspect.js";
 import { registerDesktopTools } from "./tools/desktop.js";
 import { registerHumanBrowserTools } from "./tools/human-browser.js";
+import { registerHumanVerification } from './tools/human-verification.js';
 import { desktopManager } from "./desktop/manager.js";
 import { humanBrowserManager } from "./human-browser/manager.js";
 import { installToolConcurrency } from './tool-concurrency.js';
@@ -64,7 +65,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.2.0",
+    version: "7.3.0",
 });
 
 // 注册所有工具
@@ -87,6 +88,7 @@ registerExtractTables(server);
 registerInspect(server);
 registerDesktopTools(server);
 registerHumanBrowserTools(server);
+registerHumanVerification(server);
 
 // === 测试 Resource 注册（方案D已验证通过，保留供后续使用） ===
 server.registerResource(
@@ -154,13 +156,16 @@ server.registerResource(
             "- 图片默认以 MCP image 内容块与文本一起返回，多页/分片有序排列；每次最多 10 张、图片 base64 总长 12 MiB。超限请缩小 pages/截图范围或显式 file，不会静默漏图或回退路径。web_inspect/desktop_inspect 的 screenshotRef 对应随附图片，后台 check 也可指定 saveMode。",
             "- Cookie/localStorage 是全局共享网页登录态，写入时使用文件锁 + 临时文件 rename 合并，不能按对话隔离。",
             "- 登录/UAV 浏览器使用动态空闲 CDP 端口，只清理自有临时 profile/lockfile 对应的 Chrome。",
-            "- web_login_browser 与 UAV 共用 600 秒人工窗口，周期串行保存 Cookie/localStorage，截止先保存再关窗；手动关窗后只恢复本次已退出的自有 profile。失败保留恢复来源，不要求用户额外等两秒，也不把状态已保存当成网站认证成功。后台轮询推荐 30–45 秒。",
+            "- web_login_browser 保留600秒登录/保存行为。访问中检测到强挑战后不再同步等人工：有明确ownerId时auto创建web_human_verification后台任务，原工具以isError和pageAccess短返回；humanAssistance=never或缺明确ownerId时不弹窗。后台查询最多45秒，人工窗口就绪后另给600秒。",
             "- 新 Cookie 会同步到已有浏览器上下文，旧状态不能覆盖更新的备份；localStorage 按 origin 隔离并在新导航恢复，不自动刷新用户现有页面。纯 localStorage 登录不要求 Cookie 数量大于零。",
             "- 主 context 与 bareContext 在 close/closeBrowser 时都会关闭并清理 profile。",
             "",
             "## Human Browser 用户辅助浏览器",
             "",
-            "- `web_human_browser_open` 打开可见系统 Chrome，让用户手动完成验证/登录/异常弹窗；这是显式旁路，默认不改变 `web_fetch_page` / `web_interact` / `web_pipeline` 的 URL 主链路。",
+            "- 7.3新增web_human_verification(action=start/status/cancel/close)，是普通MCP工具，不要求宿主支持额外Tasks协议。auto只对强挑战启动，登录页/无权限/未知状态不能冒充正文成功或认证完成。",
+            "- web_human_verification的ready表示原目标同页内容已确认；保留人工窗口，用同一ownerId和返回sessionId调用web_fetch_page/web_fetch_rich/web_fetch_screenshot继续只读任务，不重建浏览器、不复制Cookie代替同页。原有URL/file路径和inline/file图片语义不变。",
+            "- 人工600秒租约包含ready后的读取时间，读完action=close；取消/超时先清理自有资源。手动关窗后只报告保存状态，不能保证认证成功。taskId属于当前后端代次，重启后失效，不会自动重开或重播动作。",
+            "- `web_human_browser_open` 仍可显式打开可见系统 Chrome，让用户手动完成验证/登录/异常弹窗；旧工具接口保留。",
             "- `web_human_browser_attach` 可附着已有本机 CDP 端点；`web_human_browser_status` / `web_human_browser_list_pages` 返回页面 URL、title、存活状态、Cookie 数量和最近 challenge 检测结果。",
             "- `web_human_browser_register_page` 把页面注册为普通 `sessionId`，后续继续用 `web_interact(sessionId=...)` 或 `web_pipeline(sessionId=...)`。",
             "- 注册出的 session 是 borrowed/noop；`web_close_sessions` 只移除 alias，不关闭真实 Chrome 页面。",
@@ -204,7 +209,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.2.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.3.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -281,7 +286,7 @@ async function heartbeatCheck(): Promise<void> {
         console.error(`[web-fetcher] ppid 检测恢复正常，切回 30s 间隔`);
     }
 
-    if (enableDuplicateRetirement && getIdleTime() > DUPLICATE_RETIRE_IDLE_MS) {
+    if (enableDuplicateRetirement && getActiveRequestCount() === 0 && getIdleTime() > DUPLICATE_RETIRE_IDLE_MS) {
         const hasNewer = await hasNewerSiblingInstance();
         if (hasNewer) {
             logStdinEvent("检测到同父进程下更新的 web-fetcher 实例，当前实例空闲超时，主动让位退出");
@@ -301,7 +306,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.2.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.3.0 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -334,7 +339,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[web-fetcher] MCP Server v7.2.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.3.0 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -346,7 +351,7 @@ async function main(): Promise<void> {
         logStdinEvent(`非 LS 环境，启用 1 小时空闲超时兜底`);
         enableDuplicateRetirement = process.env.WEB_FETCHER_ENABLE_DUPLICATE_RETIREMENT === "1";
         const idleGuard = setInterval(async () => {
-            if (getIdleTime() > 3600000) { // 1 小时
+            if (getActiveRequestCount() === 0 && getIdleTime() > 3600000) { // 1 小时
                 logStdinEvent("非 LS 环境空闲超过 1 小时，兜底退出");
                 console.error("[web-fetcher] 非 LS 环境空闲超过 1 小时，兜底退出");
                 await cleanup();

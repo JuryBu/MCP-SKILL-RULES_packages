@@ -204,6 +204,7 @@ export function registerPipeline(server: McpServer): void {
 
                 // 逐步执行
                 for (let i = 0; i < params.steps.length; i++) {
+                    await browserManager.checkAndHandleVerification(page, page.url());
                     touchActivity(); // 每步刷新活动时间，防止心跳误判
                     const step = params.steps[i];
                     const stepLabel = `[${i + 1}/${params.steps.length}]`;

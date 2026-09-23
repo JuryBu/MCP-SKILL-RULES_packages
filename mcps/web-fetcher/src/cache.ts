@@ -52,6 +52,10 @@ class PageCache {
         return this.get(url) !== null;
     }
 
+    delete(url: string): void {
+        this.cache.delete(url);
+    }
+
     /**
      * 清空缓存
      */

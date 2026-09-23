@@ -1,7 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
+import type { PageAccessIssue } from './page-access.js';
 
 export interface RequestContext {
+    humanAssistance?: 'auto' | 'never';
+    pageAccessIssue?: PageAccessIssue;
     ownerId: string;
     toolName: string;
     intent: string;
@@ -15,6 +18,7 @@ export interface RequestContext {
 }
 
 export interface RequestOptions {
+    humanAssistance?: 'auto' | 'never';
     ownerId?: string;
     toolName?: string;
     intent?: string;
@@ -43,6 +47,7 @@ export function getRequestContext(): RequestContext | undefined {
 export async function runWithRequestContext<Result>(options: RequestOptions, handler: () => Promise<Result>): Promise<Result> {
     const startedAt = performance.now();
     const context: RequestContext = {
+        humanAssistance: options.humanAssistance,
         ownerId: options.ownerId?.trim() || "global",
         toolName: options.toolName || "unknown",
         intent: options.intent || "operation",

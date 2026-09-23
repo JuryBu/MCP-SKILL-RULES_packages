@@ -2,6 +2,9 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { inlineImageContent } from "../image-output.js";
 import { browserManager } from "../browser.js";
+import { sessionManager } from "../session.js";
+import { samePageTarget } from "../page-access.js";
+import { randomUUID } from "node:crypto";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
 import { extractContent, compactContent, truncateContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
 import { touchActivity } from "../lifecycle.js";
@@ -17,9 +20,12 @@ import { buildSummaryPrompt, generateSummaryText } from "../model-bridge.js";
 
 const FetchRichInputSchema = z.object({
     viewport: viewportSchema.optional(),
+    sessionId: z.string().optional().describe("已有网页会话 ID；借用当前页，不导航、不使用缓存"),
+    ownerId: z.string().optional().describe("会话所属 ownerId"),
     url: z
         .string()
         .refine(s => /^(https?|file):\/\//i.test(s), "请提供有效的 URL（支持 http/https/file 协议）")
+        .optional()
         .describe("要抓取的网页 URL"),
     timeout: z
         .number()
@@ -79,7 +85,9 @@ export function registerFetchRich(server: McpServer): void {
 支持 file:// 协议打开本地文件（HTML、PDF、DOCX 等）。
 
 参数:
-  - url (string, 必须): 要抓取的网页 URL（支持 http/https/file 协议）
+  - url (string, 可选): 要抓取的网页 URL（支持 http/https/file 协议）；与 sessionId 至少提供一个
+  - sessionId (string, 可选): 从已有网页会话当前页读取，不导航；不支持文档路线
+  - ownerId (string, 可选): 借用会话的 ownerId
   - timeout (number, 可选): 超时毫秒数，默认 30000
   - scrollCount (number, 可选): 滚动次数，默认 0
   - compact (string, 可选): 文本压缩模式 full/compact/minimal/headings/ai_summary，默认 compact
@@ -95,6 +103,8 @@ export function registerFetchRich(server: McpServer): void {
             inputSchema: {
                 viewport: FetchRichInputSchema.shape.viewport,
                 url: FetchRichInputSchema.shape.url,
+                sessionId: FetchRichInputSchema.shape.sessionId,
+                ownerId: FetchRichInputSchema.shape.ownerId,
                 timeout: FetchRichInputSchema.shape.timeout,
                 scrollCount: FetchRichInputSchema.shape.scrollCount,
                 compact: FetchRichInputSchema.shape.compact,
@@ -121,11 +131,15 @@ export function registerFetchRich(server: McpServer): void {
             const qConfig = QUALITY_PRESETS[quality];
 
             let page;
+            let borrowedPage = false;
+            let sourceUrl = params.url ?? "";
             try {
-                assertViewportTarget(params.url, params.viewport);
+                if (!params.url && !params.sessionId) throw new Error("需要 url 或 sessionId 参数");
+                if (params.sessionId && (params.page || params.pages)) throw new Error("sessionId 不支持 PDF/Office 文档页码路线");
+                if (params.url && !params.sessionId) assertViewportTarget(params.url, params.viewport);
                 // 解析多页参数
                 let pageNumbers: number[] | undefined;
-                if (params.pages) {
+                if (params.pages && params.url) {
                     const parsePagesStr = (s: string): number[] => {
                         if (s.toLowerCase() === "all") return [];
                         const pages = new Set<number>();
@@ -161,18 +175,31 @@ export function registerFetchRich(server: McpServer): void {
                     }
                 }
 
-                page = await browserManager.navigateTo(params.url, {
-                    viewport: params.viewport,
-                    timeout: params.timeout,
-                    scrollCount: params.scrollCount,
-                    pageNumber: params.page,
-                    pageNumbers: pageNumbers && pageNumbers.length > 0 ? pageNumbers : undefined,
-                });
+                if (params.sessionId) {
+                    page = sessionManager.get(params.sessionId, params.ownerId);
+                    if (!page) throw new Error("会话不存在、已关闭或 ownerId 不匹配");
+                    borrowedPage = true;
+                    sourceUrl = page.url();
+                    if (!/^https?:\/\//i.test(sourceUrl) || /\.(?:pdf|docx?|pptx?|xlsx?|epub)(?:[?#]|$)/i.test(sourceUrl)) {
+                        throw new Error("sessionId 只支持已打开的普通 http(s) 网页，不支持 file/Office/PDF/EPUB 文档路线");
+                    }
+                    if (params.url && !samePageTarget(sourceUrl, params.url)) throw new Error(`url 与现有会话页面不匹配：当前为 ${sourceUrl}`);
+                    await browserManager.checkAndHandleVerification(page, sourceUrl);
+                    if (params.scrollCount) await browserManager.scrollPage(page, params.scrollCount);
+                } else {
+                    page = await browserManager.navigateTo(sourceUrl, {
+                        viewport: params.viewport,
+                        timeout: params.timeout,
+                        scrollCount: params.scrollCount,
+                        pageNumber: params.page,
+                        pageNumbers: pageNumbers && pageNumbers.length > 0 ? pageNumbers : undefined,
+                    });
+                }
 
                 // 根据 quality 调整视口（file:// 跳过，防止裁剪）
-                const isLocalFile = params.url.startsWith("file://");
+                const isLocalFile = sourceUrl.startsWith("file://");
                 await applyExplicitViewport(page, params.viewport);
-                if (!params.viewport && !isLocalFile && qConfig.viewportWidth !== 1920) {
+                if (!borrowedPage && !params.viewport && !isLocalFile && qConfig.viewportWidth !== 1920) {
                     const currentSize = page.viewportSize();
                     if (currentSize && currentSize.width !== qConfig.viewportWidth) {
                         await page.setViewportSize({
@@ -187,6 +214,7 @@ export function registerFetchRich(server: McpServer): void {
                 // v6.1: 截图前等待视觉资源就绪
                 const readiness = await browserManager.waitForVisualReady(page, undefined, { fullPage: false });
                 const readinessWarning = readiness.complete === false && readiness.note ? `\n⚠️ ${readiness.note}` : "";
+                await browserManager.checkAndHandleVerification(page, page.url?.() ?? sourceUrl);
                 let screenshotBuffer = await page.screenshot({
                     type: "jpeg",
                     quality: qConfig.jpegQuality,
@@ -216,21 +244,21 @@ export function registerFetchRich(server: McpServer): void {
 
                 // 2) 文本提取
                 const html = await safePageContent(page);
-                let { content } = extractContent(html, params.url);
+                let { content } = extractContent(html, sourceUrl);
 
                 // v5.2: NGA 等 GBK 编码站点修复 — Node.js HTTP + iconv
-                if (detectEncodingIssue(content)) {
+                if (!borrowedPage && detectEncodingIssue(content)) {
                     try {
                         const iconv = (await import('iconv-lite')).default;
                         const https = await import('https');
                         const http = await import('http');
                         // 从浏览器 context 获取 Cookie
                         const context = page.context();
-                        const cookies = await context.cookies(params.url);
+                        const cookies = await context.cookies(sourceUrl);
                         const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
                         const rawHtml = await new Promise<string>((resolve, reject) => {
-                            const mod = params.url.startsWith('https') ? https : http;
-                            const req = mod.get(params.url, {
+                            const mod = sourceUrl.startsWith('https') ? https : http;
+                            const req = mod.get(sourceUrl, {
                                 headers: {
                                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
                                     'Accept': 'text/html',
@@ -258,7 +286,7 @@ export function registerFetchRich(server: McpServer): void {
                             req.on('error', reject);
                             req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
                         });
-                        const reDecoded = extractContent(rawHtml, params.url);
+                        const reDecoded = extractContent(rawHtml, sourceUrl);
                         if (!detectEncodingIssue(reDecoded.content)) {
                             content = reDecoded.content;
                         }
@@ -269,7 +297,9 @@ export function registerFetchRich(server: McpServer): void {
                 // 所有工具（screenshot/rich/page/html/interact）自动受益
 
                 // v5.2: SPA 空壳检测
-                const spaHint = detectSPAIssue(content, params.url);
+                await browserManager.checkAndHandleVerification(page, page.url?.() ?? sourceUrl);
+                sourceUrl = page.url?.() ?? sourceUrl;
+                const spaHint = detectSPAIssue(content, sourceUrl);
                 if (spaHint) {
                     content += spaHint;
                 }
@@ -279,7 +309,7 @@ export function registerFetchRich(server: McpServer): void {
                 if (compactMode === "ai_summary") {
                     // AI Summary 模式：通过模型桥生成智能摘要
                     try {
-                        const { prompt } = buildSummaryPrompt(content, params.url);
+                        const { prompt } = buildSummaryPrompt(content, sourceUrl);
                         const result = await generateSummaryText(prompt, modelChain);
                         if (result.text && result.providerLabel && result.chainUsed) {
                             const ratio = ((1 - result.text.length / content.length) * 100).toFixed(0);
@@ -297,7 +327,7 @@ export function registerFetchRich(server: McpServer): void {
 
                 // 根据 saveMode 返回截图
                 if (saveMode === "file") {
-                    const cacheKey = generateCacheKey(params.url, quality, "rich", params.scrollCount, params.page, ...(params.viewport ? [params.viewport.width, params.viewport.height] : []));
+                    const cacheKey = borrowedPage ? randomUUID() : generateCacheKey(params.url ?? sourceUrl, quality, "rich", params.scrollCount, params.page, ...(params.viewport ? [params.viewport.width, params.viewport.height] : []));
                     const splitResult = await splitOversizedImage(screenshotBuffer, "screenshots", cacheKey, ".jpg");
                     if (splitResult.wasSplit) {
                         const fileList = splitResult.paths.map((p, i) =>
@@ -340,7 +370,7 @@ export function registerFetchRich(server: McpServer): void {
                     }],
                 };
             } finally {
-                if (page) {
+                if (page && !borrowedPage) {
                     await page.close().catch(() => { });
                 }
             }

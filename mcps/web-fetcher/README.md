@@ -28,6 +28,10 @@
 
 7.2 新增页面池资源接纳、可选响应式 `viewport`、按用途等待页面就绪与检查证据分级，使用和部署注意事项见 [docs/7.2-upgrade.md](docs/7.2-upgrade.md)。四宿主接入方式、旧调用默认值与模型链路保持不变；更新源代码不等于本机正在运行的后端已更新，应核对实际工具与资源说明。
 
+### 7.3 人工验证与同页续接
+
+强挑战页不再作为成功内容返回、缓存或送入摘要。原调用短返回明确的 `pageAccess` 状态，人工操作在独立后台任务中进行，窗口就绪后保留600秒。通过后直接复用同一页面读取，不依赖把 Cookie 复制给另一个浏览器。新增普通 MCP 工具 `web_human_verification`，并为三个只读抓取工具增加可选 `sessionId`，四宿主与原模型链路不变，详见 [docs/7.3-human-verification.md](docs/7.3-human-verification.md)。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |
@@ -47,6 +51,7 @@
 | `web_inspect` | 检查网页/PDF/PPTX/EPUB 的结构、重叠、溢出、可读性、一致性和 AI 视觉审查 |
 | `web_list_cookies` | 列出 Cookie 概要 |
 | `web_login_browser` | 打开有头浏览器登录 |
+| `web_human_verification` | 后台人工验证任务、600秒窗口、状态查询与同页续接、取消/清理 |
 | `web_human_browser_open` | 打开可见 Chrome，供用户手动处理验证/登录/弹窗 |
 | `web_human_browser_attach` | 附着已有 CDP 浏览器为 human session |
 | `web_human_browser_status` / `web_human_browser_list_pages` | 查询 human session 页面、Cookie 数量和 challenge 状态 |
@@ -122,7 +127,7 @@ desktop_close(desktopSessionId="desktop_...", ownerId="project-a")
 
 ## Human Browser 用户辅助浏览器
 
-Human Browser 是 Plan 7 新增的显式旁路能力，用于处理 Cloudflare / Turnstile、登录检测、异常弹窗等需要用户手动完成的页面。它不默认接入 `web_fetch_page` / `web_interact` / `web_pipeline` 的 URL 主链路，因此不会改变普通网页抓取和交互行为。
+Human Browser 用于处理 Cloudflare / Turnstile、登录检测、异常弹窗等需要用户手动完成的页面。7.3保留以下显式工具，同时用同一浏览器管理器承载强挑战自动辅助任务。普通无挑战页面保持原行为；强挑战默认在提供明确 `ownerId` 时创建后台任务并短返回，不再同步等待用户几分钟。`humanAssistance="never"` 禁止自动开窗。
 
 核心边界：
 
@@ -272,7 +277,7 @@ NGA（ngabbs.com）等使用 GBK 编码的站点现在可以正确显示中文�
 - Cookie 与 localStorage 备份文件共享，所有实例间登录态同步
 
 ### UAV（用户辅助验证）
-- 检测人机验证拦截 → 自动弹出系统 Chrome → 用户完成验证 → Cookie 回收到 Playwright
+- 旧版流程为检测拦截后同步等待 Chrome 登录及 Cookie 回灌；7.3改为强挑战短返回后台任务，并优先在原人工页面续接，避免把浏览器绑定认证误当作可移植 Cookie。
 - v7.1 起检测器增加 Cloudflare challenge-platform / Turnstile / `cf-chl-*` 强信号；强挑战页不会因为已有 Cookie 备份就直接跳过 UAV
 - 对 Cookie 可能绑定浏览器实例/指纹的站点，优先使用 Human Browser 复用同一真实浏览器会话；Cookie 回灌仍保留为 best-effort
 - CDP 连接注入 Cookie + 定期快照 + 超时保护
@@ -342,7 +347,7 @@ web_login_browser(startUrl="https://example.com/login", background=true)
 web_login_browser(taskId="web-login-...", waitSeconds=30)
 ```
 
-同步和后台登录共用 600 秒人工操作窗口，UAV（访问过程中弹出的人工验证窗口）使用相同保存流程。周期采样串行执行，截止时先等待保存再关闭；手动关闭后只允许有界恢复本次工具自有、已经退出的 Chrome profile，恢复失败会保留来源并明确告警，不能把空导出报告成登录完成。纯 localStorage 登录也可以报告保存成功，不以 Cookie 数量作为唯一判断。
+同步和后台登录共用600秒人工操作窗口。7.3访问中的人工验证改为独立后台任务，使用 Human Browser 的串行存储快照，窗口就绪后另计600秒，不受原抓取调用期限影响。截止时先等待保存再关闭；手动关闭后只允许有界恢复本次工具自有、已经退出的 Chrome profile，恢复失败保留来源并告警，不能把空导出报告成登录完成。纯 localStorage 登录也可报告保存成功，不以 Cookie 数量作为唯一判断。
 
 共享 Cookie 更新会刷新已有浏览器上下文，旧上下文未更新的认证值不能覆盖新备份。localStorage 按协议、主机和端口组成的 origin 隔离，在新页面导航时恢复；不会悄悄刷新用户正在操作的旧页面。旧版按主机保存的备份仅兼容该主机的默认 HTTPS 来源，不注入其它协议或端口。
 
