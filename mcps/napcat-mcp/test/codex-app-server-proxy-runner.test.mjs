@@ -22,6 +22,11 @@ import { inspectCodexSource, prepareCodexRuntimeBundle } from "../src/codex-runt
 
 const execFileAsync = promisify(execFile);
 
+function writeRuntimeHelpers(directory) {
+  fs.writeFileSync(path.join(directory, "codex-command-runner.exe"), "fake command runner");
+  fs.writeFileSync(path.join(directory, "codex-windows-sandbox-setup.exe"), "fake sandbox setup");
+}
+
 function runtimePaths(root) {
   return {
     runtimeStatePath: path.join(root, "proxy-runtime.json"),
@@ -86,7 +91,7 @@ function createStoppingServiceOptions(paths, child, terminateChild) {
 
 test("parseArguments requires all durable state paths", () => {
   const root = path.resolve("test-root");
-  const parsed = parseArguments([
+  const argumentsList = [
     "--runtime-state", path.join(root, "runtime.json"),
     "--log", path.join(root, "proxy.jsonl"),
     "--stop-file", path.join(root, "proxy.stop"),
@@ -96,13 +101,20 @@ test("parseArguments requires all durable state paths", () => {
     "--maintenance-file", path.join(root, "maintenance.json"),
     "--alert-file", path.join(root, "alert.json"),
     "--fallback-file", path.join(root, "fallback.json"),
-  ]);
+  ];
+  const parsed = parseArguments(argumentsList);
   assert.equal(parsed.downstreamPort, 18432);
   assert.equal(parsed.controlPort, 18431);
   assert.equal(parsed.upstreamPort, 18433);
   assert.equal(parsed.requestTimeoutMs, 30000);
   assert.equal(parsed.resumeRequestTimeoutMs, 120000);
   assert.equal(parsed.emptyClientRestartMs, 10000);
+  assert.equal(parsed.startTimeoutMs, 45000);
+  assert.equal(parsed.startupBudgetMs, 105000);
+  assert.equal(parseArguments([...argumentsList, "--startup-budget-ms", "165000"]).startupBudgetMs, 165000);
+  for (const invalid of ["0", "999", "300001", "invalid"]) {
+    assert.throws(() => parseArguments([...argumentsList, "--startup-budget-ms", invalid]), /startup-budget-ms/u);
+  }
 });
 
 test("empty Desktop restart waits for a real client disconnect epoch", () => {
@@ -540,6 +552,7 @@ test("managed runner retains the complete Desktop runtime after its source direc
     fs.mkdirSync(sourceDirectory, { recursive: true });
     fs.writeFileSync(sourceExecutable, "fake codex");
     fs.writeFileSync(path.join(sourceDirectory, "codex-code-mode-host.exe"), "fake tool host");
+    writeRuntimeHelpers(sourceDirectory);
     fs.writeFileSync(path.join(sourceDirectory, "support.dat"), "needed companion");
     const result = await runCodexAppServerProxyService({
       ...paths,
@@ -604,6 +617,7 @@ test("managed runner refreshes to a verified bundle only after clients disconnec
     fs.mkdirSync(oldSource, { recursive: true });
     fs.writeFileSync(path.join(oldSource, "codex.exe"), "version one");
     fs.writeFileSync(path.join(oldSource, "codex-code-mode-host.exe"), "host one");
+    writeRuntimeHelpers(oldSource);
     const result = await runCodexAppServerProxyService({
       ...paths,
       localAppData: root,
@@ -628,6 +642,7 @@ test("managed runner refreshes to a verified bundle only after clients disconnec
           fs.mkdirSync(newSource, { recursive: true });
           fs.writeFileSync(path.join(newSource, "codex.exe"), "version two");
           fs.writeFileSync(path.join(newSource, "codex-code-mode-host.exe"), "host two");
+          writeRuntimeHelpers(newSource);
           const olderTime = new Date(Date.now() - 100000);
           fs.utimesSync(path.join(newSource, "codex.exe"), olderTime, olderTime);
           setTimeout(() => { clientCount = 0; }, 25);
@@ -666,6 +681,7 @@ test("managed refresh reuses identical content and eventually detects a metadata
       fs.mkdirSync(directory, { recursive: true });
       fs.writeFileSync(path.join(directory, "codex.exe"), "same contents");
       fs.writeFileSync(path.join(directory, "codex-code-mode-host.exe"), "same host");
+      writeRuntimeHelpers(directory);
     }
     const later = new Date(Date.now() + 10000);
     fs.utimesSync(path.join(secondSource, "codex.exe"), later, later);
@@ -715,6 +731,7 @@ test("stop during a slow signature prevents probe and leaves no published bundle
     fs.mkdirSync(source, { recursive: true });
     fs.writeFileSync(path.join(source, "codex.exe"), "fake executable");
     fs.writeFileSync(path.join(source, "codex-code-mode-host.exe"), "fake host");
+    writeRuntimeHelpers(source);
     const startedAt = Date.now();
     const result = await runCodexAppServerProxyService({
       ...paths,
@@ -739,6 +756,56 @@ test("stop during a slow signature prevents probe and leaves no published bundle
   }
 });
 
+for (const preparationMs of [30000, 80000]) {
+  test(`shared startup budget preserves remaining probe time after ${preparationMs}ms preparation`, async (context) => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-shared-budget-test-"));
+    const paths = runtimePaths(root);
+    const source = path.join(root, "OpenAI", "Codex", "bin", "revision");
+    let clockMs = Date.now();
+    context.mock.method(Date, "now", () => clockMs);
+    let preparationAdvanced = false;
+    let probeBudget;
+    const child = createChildThatRequiresForceVerification();
+    try {
+      fs.mkdirSync(source, { recursive: true });
+      fs.writeFileSync(path.join(source, "codex.exe"), "fake executable");
+      fs.writeFileSync(path.join(source, "codex-code-mode-host.exe"), "fake host");
+      writeRuntimeHelpers(source);
+      const result = await runCodexAppServerProxyService({
+        ...paths,
+        startTimeoutMs: 45000,
+        localAppData: root,
+        pid: process.pid,
+        createProxy: createProxyStub,
+        validateBundleSignature: async () => {
+          if (!preparationAdvanced) clockMs += preparationMs;
+          preparationAdvanced = true;
+        },
+        probeExecutable: async (_executable, _port, probeOptions) => {
+          probeBudget = probeOptions.timeoutMs;
+          clockMs += 10000;
+          return { launched: { child, stderr: () => "" } };
+        },
+        spawnAppServer: () => { throw new Error("verified probe child must be reused"); },
+        waitForWebSocketReady: async () => fs.writeFileSync(paths.stopFilePath, "stop\n"),
+        terminateChild: async (managedChild) => {
+          managedChild.exitCode = 0;
+          managedChild.emit("exit", 0, null);
+        },
+        verifyPortReleased: async () => true,
+      });
+      assert.equal(result.state, "stopped");
+      assert.equal(probeBudget, Math.min(45000, 105000 - preparationMs));
+      const runtime = JSON.parse(fs.readFileSync(paths.runtimeStatePath, "utf8"));
+      assert.equal(runtime.startupBudgetMs, 105000);
+      assert.equal(runtime.startTimeoutMs, 45000);
+      assert.equal(fs.existsSync(paths.lockPath), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("startup deadline cancels a slow signature without publishing later", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-deadline-test-"));
   const paths = runtimePaths(root);
@@ -748,6 +815,7 @@ test("startup deadline cancels a slow signature without publishing later", async
     fs.mkdirSync(source, { recursive: true });
     fs.writeFileSync(path.join(source, "codex.exe"), "fake executable");
     fs.writeFileSync(path.join(source, "codex-code-mode-host.exe"), "fake host");
+    writeRuntimeHelpers(source);
     const result = await runCodexAppServerProxyService({
       ...paths,
       localAppData: root,
@@ -764,6 +832,56 @@ test("startup deadline cancels a slow signature without publishing later", async
     assert.equal(probes, 0);
     assert.deepEqual(fs.readdirSync(path.join(root, "codex-runtime-bundles")), []);
   } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("shared startup deadline remains active across an initial readiness failure and retry", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-retry-deadline-test-"));
+  const paths = runtimePaths(root);
+  let readinessAttempts = 0;
+  let resumed = 0;
+  let cleaned = 0;
+  const watchdog = setTimeout(() => fs.writeFileSync(paths.stopFilePath, "test watchdog\n"), 5000);
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      executablePath: process.execPath,
+      pid: process.pid,
+      startupBudgetMs: 1200,
+      createProxy: () => ({
+        ...createProxyStub(),
+        resumeUpstream() {
+          resumed += 1;
+          fs.writeFileSync(paths.stopFilePath, "unexpected readiness\n");
+        },
+      }),
+      probeExecutable: async () => {},
+      spawnAppServer: () => ({ child: createChildThatRequiresForceVerification(), stderr: () => "" }),
+      waitForWebSocketReady: async () => {
+        readinessAttempts += 1;
+        if (readinessAttempts === 1) throw new Error("first readiness failed");
+        await new Promise((resolve) => setTimeout(resolve, 400));
+      },
+      terminateChild: async (managedChild) => {
+        cleaned += 1;
+        managedChild.exitCode = 0;
+        managedChild.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "failed");
+    assert.equal(result.error.code, "APP_SERVER_PREPARE_TIMEOUT");
+    assert.equal(readinessAttempts, 2);
+    assert.equal(resumed, 0);
+    assert.equal(cleaned, 2);
+    assert.equal(fs.existsSync(paths.lockPath), false);
+    const events = fs.readFileSync(paths.logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.some((event) => event.type === "app_server_started"), false);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    assert.equal(resumed, 0);
+  } finally {
+    clearTimeout(watchdog);
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
@@ -967,12 +1085,18 @@ test("start script keeps outer readiness waiting separate from the backend start
   const parameterBlock = startScript.match(/^param\([\s\S]*?\r?\n\)/mu)?.[0];
   assert.ok(parameterBlock);
   assert.match(startScript, /"--start-timeout-ms", \(\[string\]\$StartTimeoutMs\)/u);
+  assert.match(startScript, /"--startup-budget-ms", \(\[string\]\$StartupBudgetMs\)/u);
   assert.match(startScript, /\$Deadline = \[DateTime\]::UtcNow\.AddSeconds\(\$StartupTimeoutSeconds\)/u);
   assert.doesNotMatch(startScript, /runtime state within 30 seconds/u);
+  const budgetBlock = startScript.slice(startScript.indexOf("$StartupBudgetMs ="), startScript.indexOf(". (Join-Path"));
+  assert.ok(budgetBlock.includes("- 15000"));
   const command = [
-    `function Read-StartupParameters { ${parameterBlock}; [pscustomobject]@{ backend = $StartTimeoutMs; outer = $StartupTimeoutSeconds } }`,
+    `$ErrorActionPreference = 'Stop'; function Read-StartupParameters { ${parameterBlock}; ${budgetBlock}; [pscustomobject]@{ backend = $StartTimeoutMs; budget = $StartupBudgetMs; outer = $StartupTimeoutSeconds } }`,
     "@(Read-StartupParameters; Read-StartupParameters -StartTimeoutMs 60000 -StartupTimeoutSeconds 180) | ConvertTo-Json -Compress",
   ].join("; ");
   const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide: true });
-  assert.deepEqual(JSON.parse(stdout), [{ backend: 45000, outer: 120 }, { backend: 60000, outer: 180 }]);
+  assert.deepEqual(JSON.parse(stdout), [{ backend: 45000, budget: 105000, outer: 120 }, { backend: 60000, budget: 165000, outer: 180 }]);
+  await assert.rejects(execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+    `$ErrorActionPreference = 'Stop'; function Read-StartupParameters { ${parameterBlock}; ${budgetBlock} }; Read-StartupParameters -StartupTimeoutSeconds 30`,
+  ], { windowsHide: true }), /15-second readiness margin/u);
 });

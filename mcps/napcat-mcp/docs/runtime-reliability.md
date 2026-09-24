@@ -16,7 +16,7 @@ The new idle retry requires a stable request identity and no previous content, s
 
 The runner verifies the official companion executables and signatures, then publishes a content-addressed runtime directory atomically. A missing, altered, incomplete or unverified candidate cannot replace the verified running package. Refresh still requires a client-free window; normal use is not interrupted to force an update. A stopped CLI runner exits only after its owned shutdown has successfully completed.
 
-The PowerShell launcher forwards a 45-second backend startup timeout and allows up to 120 seconds for overall readiness by default, returning as soon as readiness is proven. The outer wait covers setup and coordination rather than treating a live process or an old state file as success. Both timeouts are configurable separately.
+The PowerShell launcher defaults to a 45-second backend startup timeout and 120-second outer readiness wait. It forwards a total startup budget equal to the outer wait minus a 15-second readiness margin, so the default shared budget is 105 seconds rather than the former hidden 26-second cap. This shared deadline covers package preparation, signatures, candidate probes and initial readiness; each backend probe is capped by both its own timeout and the remaining shared budget. The CLI exposes `--startup-budget-ms` with the same 105-second default, and runtime state records both budgets. Changing the PowerShell outer wait changes its forwarded shared budget; a backend timeout larger than that budget is rejected before any runtime modification. Readiness returns immediately when proven, not after the full wait, and a live process or old state file is not success.
 
 ## Dependency and installation boundary
 

@@ -11,6 +11,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$StartupBudgetMs = ($StartupTimeoutSeconds * 1000) - 15000
+if ($StartTimeoutMs -gt $StartupBudgetMs) {
+  throw "StartTimeoutMs must fit within StartupTimeoutSeconds minus the 15-second readiness margin"
+}
 . (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
 $ResolverBrokerRoot = if (Get-Variable -Name BrokerRoot -ErrorAction SilentlyContinue) { [string]$BrokerRoot } else { "" }
 $DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $ResolverBrokerRoot
@@ -144,6 +148,7 @@ $Arguments = @(
   "--upstream-port", ([string]$UpstreamPort),
   "--probe-port", ([string]$ProbePort),
   "--start-timeout-ms", ([string]$StartTimeoutMs),
+  "--startup-budget-ms", ([string]$StartupBudgetMs),
   "--resume-timeout-ms", ([string]$ResumeTimeoutMs)
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "

@@ -7,7 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
-const REQUIRED_FILES = ["codex.exe", "codex-code-mode-host.exe"];
+const REQUIRED_FILES = ["codex.exe", "codex-code-mode-host.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe"];
 const MANIFEST_NAME = ".codex-runtime-manifest.json";
 const MAX_FILES = 128;
 const MAX_BYTES = 2 * 1024 * 1024 * 1024;

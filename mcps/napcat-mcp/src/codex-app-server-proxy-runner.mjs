@@ -28,7 +28,7 @@ const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
 const DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS = 250;
 const DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS = 300000;
-const DEFAULT_STARTUP_BUDGET_MS = 26000;
+const DEFAULT_STARTUP_BUDGET_MS = 105000;
 const DEFAULT_REFRESH_BUDGET_MS = 20000;
 const DEFAULT_EMPTY_CLIENT_RESTART_MS = 10000;
 const DEFAULT_LIVENESS_INTERVAL_MS = 15000;
@@ -48,6 +48,7 @@ const CLI_OPTIONS = new Set([
   "upstream-port",
   "probe-port",
   "start-timeout-ms",
+  "startup-budget-ms",
   "request-timeout-ms",
   "resume-timeout-ms",
   "empty-client-restart-ms",
@@ -723,6 +724,7 @@ export function parseArguments(argv) {
     upstreamPort: boundedInteger(values["upstream-port"], "upstream-port", DEFAULT_UPSTREAM_PORT, 1, 65535),
     probePort: boundedInteger(values["probe-port"], "probe-port", DEFAULT_PROBE_PORT, 1, 65535),
     startTimeoutMs: boundedInteger(values["start-timeout-ms"], "start-timeout-ms", DEFAULT_START_TIMEOUT_MS, 1000, 300000),
+    startupBudgetMs: boundedInteger(values["startup-budget-ms"], "startup-budget-ms", DEFAULT_STARTUP_BUDGET_MS, 1000, 300000),
     requestTimeoutMs: boundedInteger(values["request-timeout-ms"], "request-timeout-ms", DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000),
     resumeRequestTimeoutMs: boundedInteger(
       values["resume-timeout-ms"],
@@ -747,7 +749,8 @@ export async function runCodexAppServerProxyService(options = {}) {
   const now = options.now ?? (() => new Date());
   const pid = Number(options.pid ?? process.pid);
   const startedAt = now().toISOString();
-  const startupDeadlineAt = Date.now() + (options.startupBudgetMs ?? DEFAULT_STARTUP_BUDGET_MS);
+  const startupBudgetMs = options.startupBudgetMs ?? DEFAULT_STARTUP_BUDGET_MS;
+  const startupDeadlineAt = Date.now() + startupBudgetMs;
   const lock = acquireInstanceLock(options.lockPath, {
     fsImpl,
     pid,
@@ -805,6 +808,8 @@ export async function runCodexAppServerProxyService(options = {}) {
     upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
     appServerPid: null,
     emptyClientRestartMs: options.emptyClientRestartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS,
+    startupBudgetMs,
+    startTimeoutMs: options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS,
     proxy: null,
     restartFailureCount: 0,
     lastError: null,
@@ -1167,7 +1172,7 @@ export async function runCodexAppServerProxyService(options = {}) {
         });
         log("app_server_start_failed", { error: publicError(error), restartFailureCount });
       } finally {
-        launchGuard.close();
+        if (launchGuard !== startupGuard) launchGuard.close();
         proxy.pauseUpstream?.();
         try {
           await terminateManagedAppServer(appServer, upstreamPort, options);
@@ -1205,7 +1210,8 @@ export async function runCodexAppServerProxyService(options = {}) {
         break;
       }
       const backoff = DEFAULT_RESTART_BACKOFF_MS[Math.min(restartFailureCount - 1, DEFAULT_RESTART_BACKOFF_MS.length - 1)];
-      await wait(backoff);
+      if (startupGuard) await waitWithAbort(wait(backoff), startupGuard.signal);
+      else await wait(backoff);
     }
     stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
     persist({ state: "stopping", automationEnabled: false, stopReason });
