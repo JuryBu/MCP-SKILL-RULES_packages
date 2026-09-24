@@ -128,6 +128,7 @@ function createActivatorFixture() {
   const opsRoot = path.join(root, "service", "current", "ops");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
+  const supervisorTaskName = `CodexNapCatTest-${process.pid}-${Date.now()}`;
   fs.mkdirSync(opsRoot, { recursive: true });
   fs.mkdirSync(path.join(dataRoot, "state"), { recursive: true });
   fs.mkdirSync(brokerRoot, { recursive: true });
@@ -160,14 +161,14 @@ function createActivatorFixture() {
     reasons: { packageUpdate: { code: "PACKAGE_UPDATE_PENDING_ACTIVATION" } },
   });
   fs.writeFileSync(path.join(dataRoot, "state", "task-router.stop"), "stop\n", "utf8");
-  return { root, opsRoot, dataRoot, brokerRoot };
+  return { root, opsRoot, dataRoot, brokerRoot, supervisorTaskName };
 }
 
 test("activation timeout preserves staging and restores automation", () => {
   const fixture = createActivatorFixture();
   try {
     const result = runPowerShell(
-      ["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-TimeoutSeconds", "1", "-IdleConfirmMilliseconds", "500"],
+      ["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-SupervisorTaskName", fixture.supervisorTaskName, "-TimeoutSeconds", "1", "-IdleConfirmMilliseconds", "500"],
       { TEST_PROXY_BUSY: "1" },
       10_000,
     );
@@ -188,7 +189,7 @@ test("activation cancellation and repeated finalization are idempotent", () => {
   const fixture = createActivatorFixture();
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      const result = runPowerShell(["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-CancelPendingActivation"]);
+      const result = runPowerShell(["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-SupervisorTaskName", fixture.supervisorTaskName, "-CancelPendingActivation"]);
       assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
     }
     const activationState = JSON.parse(fs.readFileSync(path.join(fixture.dataRoot, "state", "codex-app-server-pending-activation.json"), "utf8"));
@@ -204,7 +205,7 @@ test("activation failure rolls automation back without clearing pending staging"
   const fixture = createActivatorFixture();
   try {
     const result = runPowerShell(
-      ["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-TimeoutSeconds", "2", "-IdleConfirmMilliseconds", "500"],
+      ["-File", path.join(fixture.opsRoot, "activate-codex-app-server-when-idle.ps1"), "-DataRoot", fixture.dataRoot, "-BrokerRoot", fixture.brokerRoot, "-SupervisorTaskName", fixture.supervisorTaskName, "-TimeoutSeconds", "2", "-IdleConfirmMilliseconds", "500"],
       { TEST_RELOAD_FAIL: "1" },
       10_000,
     );

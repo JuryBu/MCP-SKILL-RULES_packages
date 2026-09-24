@@ -187,7 +187,7 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   const proxy = createCodexModelStreamProxy({
     port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstreamPort}`,
-    firstProgressTimeoutMs: 100,
+    firstProgressTimeoutMs: 1000,
     maxConsecutiveAttempts: 2,
   });
   await proxy.start();
@@ -197,7 +197,7 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   const started = Date.now();
   const fast = await request(proxy.status().port, { stream: true, tools: [{ type: "function", name: "safe" }] }, { threadId: "fast-thread" });
   assert.equal(fast.statusCode, 200);
-  assert.ok(Date.now() - started < 80, "fast request should complete before the slow watchdog fires");
+  assert.ok(Date.now() - started < 750, "fast request including bounded inspection should complete before the slow watchdog fires");
   assert.match(fast.body, /fast/u);
   const slowFirst = await slow;
   assert.doesNotMatch(slowFirst.body, /slow/u);

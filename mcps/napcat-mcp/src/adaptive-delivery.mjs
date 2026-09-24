@@ -61,7 +61,7 @@ export function createAdaptiveDeliveryRegistry(options = {}) {
       prune(Date.now());
       return { profiles: profiles.size, buffered: [...profiles.values()].filter(entry => entry.mode === "buffered").length, probeCooldownMs: cooldownMs };
     },
-    begin({ key, startedAt, firstProgressTimeoutMs, waitLimitMs, upstreamIdleTimeoutMs, streamMinSpanMs = 1500, onEvent = () => {} }) {
+    begin({ key, startedAt, firstProgressTimeoutMs, waitLimitMs, waitDeadlineAt = startedAt + waitLimitMs, upstreamIdleTimeoutMs, streamMinSpanMs = 1500, onEvent = () => {} }) {
       if (!key) return null;
       const attemptOrder = ++attemptSequence;
       const initialProfile = profile(key, startedAt);
@@ -108,18 +108,18 @@ export function createAdaptiveDeliveryRegistry(options = {}) {
         },
         tryProbe(time) {
           if (extended || !heartbeatSeen || lastUpstreamAt === null || time - lastUpstreamAt >= upstreamIdleTimeoutMs
-            || evidence() === "streaming" || time >= startedAt + waitLimitMs) return false;
+            || evidence() === "streaming" || time >= waitDeadlineAt) return false;
           const current = profile(key, time);
           if (current.mode !== "buffered" && current.probeAfter > time) return false;
           if (current.mode !== "buffered") save({ ...current, updatedAt: time, probeAfter: time + cooldownMs });
           extended = true;
           probing = current.mode !== "buffered";
-          emit("adaptive_delivery_probe_started", { mode: probing ? "probe" : "buffered", elapsedMs: time - startedAt, deadlineAt: startedAt + waitLimitMs });
+          emit("adaptive_delivery_probe_started", { mode: probing ? "probe" : "buffered", elapsedMs: time - startedAt, deadlineAt: waitDeadlineAt });
           return true;
         },
         deadline(normalDeadline, normalReason, phaseDeadline = null) {
           if (!extended) return { at: normalDeadline, reason: normalReason };
-          let next = { at: startedAt + waitLimitMs, reason: "ADAPTIVE_WAIT_LIMIT" };
+          let next = { at: waitDeadlineAt, reason: "ADAPTIVE_WAIT_LIMIT" };
           const idle = { at: (lastUpstreamAt ?? startedAt) + upstreamIdleTimeoutMs, reason: "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT" };
           if (idle.at < next.at) next = idle;
           if (phaseDeadline && phaseDeadline.at < next.at) next = phaseDeadline;

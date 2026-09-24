@@ -5,7 +5,9 @@ param(
   [ValidateRange(1, 65535)][int]$ControlPort = 18431,
   [ValidateRange(1, 65535)][int]$UpstreamPort = 18433,
   [ValidateRange(1, 65535)][int]$ProbePort = 18434,
-  [ValidateRange(250, 300000)][int]$ResumeTimeoutMs = 120000
+  [ValidateRange(250, 300000)][int]$ResumeTimeoutMs = 120000,
+  [ValidateRange(1000, 120000)][int]$StartTimeoutMs = 45000,
+  [ValidateRange(30, 300)][int]$StartupTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = "Stop"
@@ -141,13 +143,14 @@ $Arguments = @(
   "--control-port", ([string]$ControlPort),
   "--upstream-port", ([string]$UpstreamPort),
   "--probe-port", ([string]$ProbePort),
+  "--start-timeout-ms", ([string]$StartTimeoutMs),
   "--resume-timeout-ms", ([string]$ResumeTimeoutMs)
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
 
 $RuntimeState = $null
-$Deadline = [DateTime]::UtcNow.AddSeconds(30)
+$Deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
 do {
   Start-Sleep -Milliseconds 200
   if (Test-Path -LiteralPath $RuntimeStatePath) {
@@ -174,7 +177,7 @@ do {
   if ($Process.HasExited -and $null -eq $RuntimeState) { throw "Codex App Server proxy exited immediately, exitCode=$($Process.ExitCode)" }
 } while ([DateTime]::UtcNow -lt $Deadline)
 
-if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not publish runtime state within 30 seconds" }
+if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become ready within $StartupTimeoutSeconds seconds; runtime: $RuntimeStatePath" }
 [pscustomobject]@{
   started = $true
   pid = [int]$RuntimeState.pid

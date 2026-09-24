@@ -853,6 +853,53 @@ test("disconnect after a mutating wake write becomes unknown and is never replay
   assert.equal(JSON.parse(fs.readFileSync(journalPath, "utf8")).wakes[wake.wakeId].status, "unknown");
 });
 
+test("managed upstream stays paused until verified and can move to another loopback listener", {timeout:10000}, async context => {
+  const ports = await Promise.all([freePort(), freePort(), freePort(), freePort()]);
+  const connections = [0, 0];
+  const servers = ports.slice(0, 2).map((port, index) => {
+    const server = new WebSocketServer({host:"127.0.0.1",port});
+    server.on("connection", socket => {
+      connections[index]++;
+      socket.on("message", data => {
+        const message = JSON.parse(data.toString());
+        if (message.id !== undefined) socket.send(JSON.stringify({id:message.id,result:{}}));
+      });
+    });
+    return server;
+  });
+  const proxy = createCodexAppServerProxy({downstreamPort:ports[2],controlPort:ports[3],upstreamUrl:`ws://127.0.0.1:${ports[0]}`,upstreamPaused:true,controlToken:"managed-listener-test",reconnectInitialMs:50,reconnectMaxMs:100});
+  let desktop;
+  context.after(async () => {
+    desktop?.terminate();
+    await proxy.close();
+    for (const server of servers) {
+      for (const socket of server.clients) socket.terminate();
+      await new Promise(resolve => server.close(resolve));
+    }
+  });
+  await proxy.start();
+  desktop = new WebSocket(`ws://127.0.0.1:${ports[2]}`);
+  await new Promise((resolve,reject) => {desktop.once("open",resolve);desktop.once("error",reject);});
+  desktop.send(JSON.stringify({id:1,method:"initialize",params:{clientInfo:{name:"fixture"}}}));
+  await new Promise(resolve => setTimeout(resolve,150));
+  assert.deepEqual(connections,[0,0]);
+  proxy.resumeUpstream();
+  await waitFor(() => connections[0] === 1);
+  proxy.pauseUpstream();
+  await waitFor(() => desktop.readyState === WebSocket.CLOSED);
+  await new Promise(resolve => setTimeout(resolve,200));
+  assert.deepEqual(connections,[1,0]);
+  assert.throws(() => proxy.setUpstreamUrl("ws://example.invalid:1234"),error => error.code === "INVALID_UPSTREAM_URL");
+  assert.throws(() => proxy.setUpstreamUrl(`ws://127.0.0.1:${ports[1]}/wrong`),error => error.code === "INVALID_UPSTREAM_URL");
+  proxy.setUpstreamUrl(`ws://127.0.0.1:${ports[1]}`);
+  desktop = new WebSocket(`ws://127.0.0.1:${ports[2]}`);
+  await new Promise((resolve,reject) => {desktop.once("open",resolve);desktop.once("error",reject);});
+  assert.deepEqual(connections,[1,0]);
+  proxy.resumeUpstream();
+  await waitFor(() => connections[1] === 1);
+  assert.deepEqual(connections,[1,1]);
+});
+
 test("corrupted wake journal fails closed instead of forgetting prior turns", () => {
   const temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-corrupt-test-"));
   try {

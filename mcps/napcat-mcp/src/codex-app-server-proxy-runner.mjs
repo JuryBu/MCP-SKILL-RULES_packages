@@ -2,10 +2,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { execFile, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import {
+  digestCodexSource,
+  inspectCodexSource,
+  prepareCodexRuntimeBundle,
+  verifyCodexRuntimeBundle,
+} from "./codex-runtime-bundle.mjs";
 import {
   CodexAppServerProxyError,
   createCodexAppServerProxy,
@@ -16,11 +22,14 @@ const DEFAULT_DOWNSTREAM_PORT = 18432;
 const DEFAULT_CONTROL_PORT = 18431;
 const DEFAULT_UPSTREAM_PORT = 18433;
 const DEFAULT_PROBE_PORT = 18434;
-const DEFAULT_START_TIMEOUT_MS = 15000;
+const DEFAULT_START_TIMEOUT_MS = 45000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_RESUME_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_RESTART_BACKOFF_MS = [1000, 3000, 10000, 30000];
 const DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS = 250;
+const DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS = 300000;
+const DEFAULT_STARTUP_BUDGET_MS = 26000;
+const DEFAULT_REFRESH_BUDGET_MS = 20000;
 const DEFAULT_EMPTY_CLIENT_RESTART_MS = 10000;
 const DEFAULT_LIVENESS_INTERVAL_MS = 15000;
 
@@ -309,15 +318,17 @@ function codexCandidates(options = {}) {
   } catch {
   }
   return [...new Set(candidates)]
-    .filter((candidate) => {
+    .flatMap((candidate) => {
       try {
-        return fsImpl.statSync(candidate).isFile();
+        const stat = fsImpl.statSync(candidate);
+        if (!stat.isFile()) return [];
+        const directory = fsImpl.statSync(path.dirname(candidate));
+        return [{ candidate, installedAt: Math.max(stat.birthtimeMs, directory.birthtimeMs), modifiedAt: stat.mtimeMs }];
       } catch {
-        return false;
+        return [];
       }
     })
-    .map((candidate) => ({ candidate, modifiedAt: fsImpl.statSync(candidate).mtimeMs }))
-    .sort((left, right) => right.modifiedAt - left.modifiedAt || right.candidate.localeCompare(left.candidate))
+    .sort((left, right) => right.installedAt - left.installedAt || right.modifiedAt - left.modifiedAt || right.candidate.localeCompare(left.candidate))
     .map((entry) => entry.candidate);
 }
 
@@ -332,12 +343,46 @@ function executableRevision(executablePath, fsImpl = fs) {
 }
 
 export async function findExecutableRefresh(currentRevision, options = {}) {
+  options.checkActive?.();
   const fsImpl = options.fsImpl ?? fs;
   const candidate = codexCandidates({
     fsImpl,
     executablePath: options.executablePath,
     localAppData: options.localAppData,
   })[0];
+  if (!options.executablePath) {
+    if (!candidate || Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
+    const refreshState = options.bundleRefreshState ?? {};
+    const nowMs = options.nowMs?.() ?? Date.now();
+    if (nowMs < (refreshState.nextAttemptAt ?? 0)) return null;
+    const source = await inspectCodexSource(candidate, options);
+    const sameMetadata = currentRevision?.sourcePath === source.sourcePath
+      && currentRevision?.sourceMetadata === source.sourceMetadata;
+    if (sameMetadata && nowMs < (refreshState.nextDeepCheckAt ?? 0)) return null;
+    if (sameMetadata && await digestCodexSource(source, options) === currentRevision.digest) {
+      refreshState.nextDeepCheckAt = nowMs + (options.bundleDeepCheckIntervalMs ?? DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS);
+      return null;
+    }
+    const revision = await prepareCodexRuntimeBundle(candidate, {
+      bundleRoot: options.bundleRoot ?? path.join(path.dirname(options.runtimeStatePath), "codex-runtime-bundles"),
+      validateBundleSignature: options.validateBundleSignature,
+      signal: options.signal,
+      shouldStop: options.shouldStop,
+    });
+    options.checkActive?.();
+    refreshState.nextDeepCheckAt = nowMs + (options.bundleDeepCheckIntervalMs ?? DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS);
+    if (revision.digest === currentRevision?.digest && revision.executablePath === currentRevision.executablePath) {
+      Object.assign(currentRevision, revision);
+      return null;
+    }
+    await runExecutableProbe(revision.executablePath, options.probePort, {
+      ...options,
+      timeoutMs: options.startTimeoutMs,
+    });
+    options.checkActive?.();
+    if (Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
+    return revision;
+  }
   const nextRevision = executableRevision(candidate, fsImpl);
   if (!nextRevision) return null;
   const changed = !currentRevision
@@ -345,16 +390,61 @@ export async function findExecutableRefresh(currentRevision, options = {}) {
     || nextRevision.modifiedAt !== currentRevision.modifiedAt
     || nextRevision.size !== currentRevision.size;
   if (!changed || Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
-  await (options.probeExecutable ?? probeExecutable)(nextRevision.executablePath, options.probePort, {
+  options.checkActive?.();
+  await runExecutableProbe(nextRevision.executablePath, options.probePort, {
     ...options,
     timeoutMs: options.startTimeoutMs,
   });
+  options.checkActive?.();
   if (Number(options.proxyStatus?.()?.clientCount ?? 0) !== 0) return null;
   return nextRevision;
 }
 
 function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function operationError(code, message) {
+  return Object.assign(new Error(message), { code });
+}
+
+function createOperationGuard(timeoutMs, shouldStop) {
+  const controller = new AbortController();
+  const inspectStop = () => {
+    if (shouldStop()) controller.abort(operationError("APP_SERVER_START_CANCELLED", "Codex App Server 启动已停止"));
+  };
+  const stopTimer = setInterval(inspectStop, 25);
+  const deadlineTimer = setTimeout(() => controller.abort(operationError("APP_SERVER_PREPARE_TIMEOUT", "Codex App Server 准备超过总截止时间")), timeoutMs);
+  const check = () => {
+    inspectStop();
+    if (controller.signal.aborted) throw controller.signal.reason;
+  };
+  return {
+    signal: controller.signal,
+    check,
+    close: () => { clearInterval(stopTimer); clearTimeout(deadlineTimer); },
+  };
+}
+
+async function waitWithAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) throw signal.reason;
+  let onAbort;
+  const aborted = new Promise((_, reject) => {
+    onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+  }
+}
+
+function runExecutableProbe(executablePath, port, options = {}) {
+  const probe = options.probeExecutable ?? probeExecutable;
+  const operation = probe(executablePath, port, options);
+  return options.probeExecutable ? waitWithAbort(operation, options.signal) : operation;
 }
 
 function waitForExit(child) {
@@ -412,6 +502,31 @@ function loopbackPortAvailable(port) {
   });
 }
 
+export async function selectRecoveryUpstreamPort(basePort, excludedPorts, options = {}) {
+  const available = options.verifyPortReleased ?? loopbackPortAvailable;
+  for (let candidatePort = basePort + 2; candidatePort <= Math.min(65535, basePort + 32); candidatePort += 1) {
+    if (options.shouldStop?.()) throw operationError("APP_SERVER_START_CANCELLED", "备用端口选择已停止");
+    if (!excludedPorts.has(candidatePort) && await available(candidatePort)) return candidatePort;
+  }
+  throw new CodexAppServerProxyError(
+    "APP_SERVER_RECOVERY_PORTS_EXHAUSTED",
+    "受管 Codex App Server 的有限备用端口均不可用，未终止任何其它进程",
+  );
+}
+
+async function verifyManagedListenerOwner(child, port, options = {}) {
+  if (child.exitCode !== null || child.signalCode !== null) return false;
+  if (process.platform !== "win32") return true;
+  const ownerPid = await new Promise((resolve) => {
+    execFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
+      `Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort ${Number(port)} -State Listen -ErrorAction Stop | Select-Object -ExpandProperty OwningProcess -Unique`,
+    ], { windowsHide: true, timeout: 5000, maxBuffer: 4096, signal: options.signal }, (error, stdout) => {
+      resolve(error ? null : Number(stdout.trim()));
+    });
+  });
+  return ownerPid === Number(child.pid) && child.exitCode === null && child.signalCode === null;
+}
+
 export async function terminateManagedAppServer(child, port, options = {}) {
   if (!child) return true;
   await (options.terminateChild ?? terminateChild)(child);
@@ -452,6 +567,7 @@ function probeWebSocket(url, options = {}) {
   const WebSocketImpl = options.WebSocketImpl ?? WebSocket;
   const timeoutMs = options.timeoutMs ?? DEFAULT_START_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
+    if (options.signal?.aborted) return reject(options.signal.reason);
     const socket = new WebSocketImpl(url);
     const requestId = 1;
     const timeout = setTimeout(() => {
@@ -464,8 +580,15 @@ function probeWebSocket(url, options = {}) {
     }, timeoutMs);
     const cleanup = () => {
       clearTimeout(timeout);
+      options.signal?.removeEventListener("abort", onAbort);
       socket.removeAllListeners();
     };
+    const onAbort = () => {
+      cleanup();
+      socket.close();
+      reject(options.signal.reason);
+    };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
     socket.on("open", () => {
       socket.send(JSON.stringify({
         jsonrpc: "2.0",
@@ -508,12 +631,14 @@ async function waitForWebSocketReady(url, options = {}) {
   const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_START_TIMEOUT_MS);
   let lastError = null;
   while (Date.now() < deadline) {
+    if (options.signal?.aborted) throw options.signal.reason;
     try {
       return await probeWebSocket(url, {
         ...options,
         timeoutMs: Math.min(1500, Math.max(250, deadline - Date.now())),
       });
     } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
       lastError = error;
       await wait(150);
     }
@@ -521,12 +646,15 @@ async function waitForWebSocketReady(url, options = {}) {
   throw lastError ?? new CodexAppServerProxyError("APP_SERVER_PROBE_TIMEOUT", `App Server 探针超时：${url}`);
 }
 
-async function probeExecutable(executablePath, port, options = {}) {
-  const launched = spawnAppServer(executablePath, port, options);
+export async function probeExecutable(executablePath, port, options = {}) {
+  if (options.signal?.aborted) throw options.signal.reason;
+  const launched = (options.spawnAppServer ?? spawnAppServer)(executablePath, port, options);
+  let retained = false;
   try {
     const deadline = Date.now() + (options.timeoutMs ?? DEFAULT_START_TIMEOUT_MS);
     let lastError = null;
     while (Date.now() < deadline) {
+      if (options.signal?.aborted) throw options.signal.reason;
       if (launched.child.exitCode !== null || launched.child.signalCode !== null) {
         throw new CodexAppServerProxyError(
           "APP_SERVER_PROBE_EXITED",
@@ -538,15 +666,21 @@ async function probeExecutable(executablePath, port, options = {}) {
           ...options,
           timeoutMs: Math.min(1500, Math.max(250, deadline - Date.now())),
         });
+        if (options.signal?.aborted) throw options.signal.reason;
+        if (options.keepAliveAfterProbe) {
+          retained = true;
+          return { result, launched };
+        }
         return result;
       } catch (error) {
+        if (options.signal?.aborted) throw options.signal.reason;
         lastError = error;
         await wait(150);
       }
     }
     throw lastError ?? new CodexAppServerProxyError("APP_SERVER_PROBE_TIMEOUT", "App Server 探针超时");
   } finally {
-    await terminateManagedAppServer(launched.child, port, options);
+    if (!retained) await terminateManagedAppServer(launched.child, port, options);
   }
 }
 
@@ -613,6 +747,7 @@ export async function runCodexAppServerProxyService(options = {}) {
   const now = options.now ?? (() => new Date());
   const pid = Number(options.pid ?? process.pid);
   const startedAt = now().toISOString();
+  const startupDeadlineAt = Date.now() + (options.startupBudgetMs ?? DEFAULT_STARTUP_BUDGET_MS);
   const lock = acquireInstanceLock(options.lockPath, {
     fsImpl,
     pid,
@@ -642,11 +777,16 @@ export async function runCodexAppServerProxyService(options = {}) {
   const previous = readJsonObject(options.runtimeStatePath, fsImpl);
   let currentExecutable = null;
   let currentExecutableRevision = null;
+  let upstreamPort = options.upstreamPort;
+  const excludedUpstreamPorts = new Set([options.downstreamPort, options.controlPort, options.probePort]);
+  let preparedLaunch = null;
+  const bundleRefreshState = { nextDeepCheckAt: 0 };
   let appServer = null;
   let proxy = null;
   let stopRequested = false;
   let stopReason = null;
   let signalCleanup = () => {};
+  let startupGuard = null;
   let restartFailureCount = 0;
   let shutdownError = null;
   let status = {
@@ -662,7 +802,7 @@ export async function runCodexAppServerProxyService(options = {}) {
     lastKnownGoodExecutablePath: previous.lastKnownGoodExecutablePath ?? null,
     downstreamUrl: `ws://127.0.0.1:${options.downstreamPort}`,
     controlUrl: `http://127.0.0.1:${options.controlPort}`,
-    upstreamUrl: `ws://127.0.0.1:${options.upstreamPort}`,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
     appServerPid: null,
     emptyClientRestartMs: options.emptyClientRestartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS,
     proxy: null,
@@ -756,6 +896,7 @@ export async function runCodexAppServerProxyService(options = {}) {
       fsImpl,
     );
     proxy = (options.createProxy ?? createCodexAppServerProxy)({
+      upstreamPaused: true,
       downstreamPort: options.downstreamPort,
       controlPort: options.controlPort,
       upstreamUrl: status.upstreamUrl,
@@ -781,6 +922,8 @@ export async function runCodexAppServerProxyService(options = {}) {
     });
     await proxy.start();
     persist({ proxy: proxy.status() });
+    const shouldStop = () => stopRequested || fsImpl.existsSync(options.stopFilePath);
+    startupGuard = createOperationGuard(Math.max(1, startupDeadlineAt - Date.now()), shouldStop);
     const candidates = codexCandidates({
       fsImpl,
       executablePath: options.executablePath,
@@ -791,16 +934,42 @@ export async function runCodexAppServerProxyService(options = {}) {
       status.lastKnownGoodExecutablePath,
     ].filter(Boolean))];
     let lastProbeError = null;
+    const bundleRoot = options.bundleRoot ?? path.join(path.dirname(options.runtimeStatePath), "codex-runtime-bundles");
     for (const candidate of orderedCandidates) {
       try {
-        await (options.probeExecutable ?? probeExecutable)(candidate, options.probePort, {
+        startupGuard.check();
+        const preparationOptions = {
+          bundleRoot,
+          validateBundleSignature: options.validateBundleSignature,
+          signal: startupGuard.signal,
+          shouldStop,
+        };
+        const candidateBundleRoot = path.dirname(path.dirname(path.resolve(candidate)));
+        const isCachedBundle = process.platform === "win32"
+          ? candidateBundleRoot.toLowerCase() === path.resolve(bundleRoot).toLowerCase()
+          : candidateBundleRoot === path.resolve(bundleRoot);
+        const revision = options.executablePath
+          ? executableRevision(candidate, fsImpl)
+          : isCachedBundle
+            ? await verifyCodexRuntimeBundle(candidate, preparationOptions)
+            : await prepareCodexRuntimeBundle(candidate, preparationOptions);
+        startupGuard.check();
+        const probed = await runExecutableProbe(revision.executablePath, upstreamPort, {
           ...options,
-          timeoutMs: options.startTimeoutMs,
+          signal: startupGuard.signal,
+          timeoutMs: Math.min(options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, Math.max(1, startupDeadlineAt - Date.now())),
+          keepAliveAfterProbe: true,
         });
-        currentExecutable = candidate;
-        currentExecutableRevision = executableRevision(candidate, fsImpl);
+        preparedLaunch = probed?.launched ?? null;
+        appServer = preparedLaunch?.child ?? null;
+        startupGuard.check();
+        currentExecutable = revision.executablePath;
+        currentExecutableRevision = revision;
+        bundleRefreshState.nextDeepCheckAt = Date.now() + (options.bundleDeepCheckIntervalMs ?? DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS);
         break;
       } catch (error) {
+        if (error?.code === "APP_SERVER_START_CANCELLED") throw error;
+        if (startupGuard.signal.aborted) throw startupGuard.signal.reason;
         lastProbeError = error;
         log("candidate_probe_failed", { executablePath: candidate, error: publicError(error) });
       }
@@ -816,17 +985,33 @@ export async function runCodexAppServerProxyService(options = {}) {
       lastError: null,
     });
     while (!stopRequested && !fsImpl.existsSync(options.stopFilePath)) {
-      const launched = (options.spawnAppServer ?? spawnAppServer)(currentExecutable, options.upstreamPort, options);
+      const launchGuard = startupGuard ?? createOperationGuard(options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, shouldStop);
+      launchGuard.check();
+      const launched = preparedLaunch ?? (options.spawnAppServer ?? spawnAppServer)(currentExecutable, upstreamPort, options);
+      preparedLaunch = null;
       appServer = launched.child;
       persist({
         appServerPid: appServer.pid ?? null,
         appServerStartedAt: now().toISOString(),
       });
       try {
-        await (options.waitForWebSocketReady ?? waitForWebSocketReady)(status.upstreamUrl, {
+        await waitWithAbort((options.waitForWebSocketReady ?? waitForWebSocketReady)(status.upstreamUrl, {
           ...options,
+          signal: launchGuard.signal,
           timeoutMs: options.startTimeoutMs,
-        });
+        }), launchGuard.signal);
+        launchGuard.check();
+        if (appServer.exitCode !== null || appServer.signalCode !== null) {
+          throw new CodexAppServerProxyError("APP_SERVER_START_EXITED", "受管 App Server 在启动验证期间退出，不能将其它监听者视为启动成功");
+        }
+        const listenerOwned = await (options.verifyListenerOwner ?? verifyManagedListenerOwner)(appServer, upstreamPort, { signal: launchGuard.signal });
+        launchGuard.check();
+        if (!listenerOwned) {
+          throw new CodexAppServerProxyError("APP_SERVER_LISTENER_OWNER_MISMATCH", "启动探针对应的监听端口不属于受管子进程，尚未放行桌面消息");
+        }
+        launchGuard.close();
+        if (launchGuard === startupGuard) startupGuard = null;
+        proxy.resumeUpstream?.();
         resumeAfterUpstream();
         restartFailureCount = 0;
         persist({
@@ -879,14 +1064,29 @@ export async function runCodexAppServerProxyService(options = {}) {
               }
               if (Date.now() < nextRefreshAt) continue;
               nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
-              const revision = await findExecutableRefresh(currentExecutableRevision, {
-                ...options,
-                fsImpl,
-                proxyStatus: () => proxy.status(),
-              }).catch((error) => {
+              const refreshGuard = createOperationGuard(options.refreshBudgetMs ?? DEFAULT_REFRESH_BUDGET_MS, shouldStop);
+              let revision;
+              try {
+                revision = await findExecutableRefresh(currentExecutableRevision, {
+                  ...options,
+                  fsImpl,
+                  bundleRefreshState,
+                  proxyStatus: () => proxy.status(),
+                  signal: refreshGuard.signal,
+                  shouldStop,
+                  checkActive: refreshGuard.check,
+                });
+                refreshGuard.check();
+              } catch (error) {
+                if (error?.code === "APP_SERVER_START_CANCELLED" || shouldStop()) {
+                  return { code: null, signal: "stop_requested" };
+                }
+                bundleRefreshState.nextAttemptAt = Date.now() + 5000;
                 log("candidate_refresh_probe_failed", { error: publicError(error) });
-                return null;
-              });
+                revision = null;
+              } finally {
+                refreshGuard.close();
+              }
               if (!cycleActive) return { code: null, signal: "watch_stopped" };
               if (revision) return { code: null, signal: "executable_refresh", revision };
             }
@@ -955,6 +1155,7 @@ export async function runCodexAppServerProxyService(options = {}) {
         });
         log("app_server_exited", { ...exit, stderr: launched.stderr(), restartFailureCount });
       } catch (error) {
+        if (error?.code === "APP_SERVER_START_CANCELLED") throw error;
         restartFailureCount += 1;
         pauseForUpstream("APP_SERVER_START_FAILED", "Codex App Server 启动失败，自动唤醒已暂停并等待重试");
         persist({
@@ -966,9 +1167,33 @@ export async function runCodexAppServerProxyService(options = {}) {
         });
         log("app_server_start_failed", { error: publicError(error), restartFailureCount });
       } finally {
-        await terminateManagedAppServer(appServer, options.upstreamPort, options);
-        appServer = null;
-        persist({ appServerPid: null });
+        launchGuard.close();
+        proxy.pauseUpstream?.();
+        try {
+          await terminateManagedAppServer(appServer, upstreamPort, options);
+          appServer = null;
+          persist({ appServerPid: null });
+        } catch (error) {
+          if (error.code !== "APP_SERVER_PORT_STILL_OCCUPIED"
+            || (appServer.exitCode === null && appServer.signalCode === null && processAlive(Number(appServer.pid)))) throw error;
+          const previousPort = upstreamPort;
+          excludedUpstreamPorts.add(previousPort);
+          appServer = null;
+          persist({ appServerPid: null });
+          if (shouldStop()) {
+            log("app_server_retained_port_on_stop", { port: previousPort });
+          } else {
+            upstreamPort = await selectRecoveryUpstreamPort(options.upstreamPort, excludedUpstreamPorts, {
+              ...options,
+              shouldStop,
+            });
+            if (shouldStop()) break;
+            const upstreamUrl = `ws://127.0.0.1:${upstreamPort}`;
+            proxy.setUpstreamUrl(upstreamUrl);
+            persist({ upstreamUrl, proxy: proxy.status() });
+            log("app_server_upstream_port_rotated", { previousPort, upstreamPort });
+          }
+        }
       }
       if (restartFailureCount >= DEFAULT_RESTART_BACKOFF_MS.length) {
         markFatal(new CodexAppServerProxyError(
@@ -985,13 +1210,19 @@ export async function runCodexAppServerProxyService(options = {}) {
     stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
     persist({ state: "stopping", automationEnabled: false, stopReason });
   } catch (error) {
-    markFatal(error);
-    return { state: "failed", pid, error: publicError(error) };
+    if (error?.code === "APP_SERVER_START_CANCELLED" || stopRequested || fsImpl.existsSync(options.stopFilePath)) {
+      stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
+      persist({ state: "stopping", automationEnabled: false, stopReason });
+    } else {
+      markFatal(error);
+      return { state: "failed", pid, error: publicError(error) };
+    }
   } finally {
+    startupGuard?.close();
     signalCleanup();
     await proxy?.close().catch(() => {});
     try {
-      await terminateManagedAppServer(appServer, options.upstreamPort, options);
+      await terminateManagedAppServer(appServer, upstreamPort, options);
       appServer = null;
     } catch (error) {
       shutdownError = error;
@@ -1026,6 +1257,7 @@ export async function runCodexAppServerProxyService(options = {}) {
 async function main() {
   const options = parseArguments(process.argv.slice(2));
   const result = await runCodexAppServerProxyService(options);
+  if (result.state === "stopped") process.exit(0);
   if (result.state === "failed") {
     process.stderr.write(`${JSON.stringify(result)}\n`);
     process.exitCode = 1;

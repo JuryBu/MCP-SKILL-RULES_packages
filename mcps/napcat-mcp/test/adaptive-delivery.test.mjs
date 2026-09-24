@@ -81,6 +81,16 @@ test("heartbeats never move the hard cap and a silent upstream has an earlier de
   assert.deepEqual(attempt.deadline(now + 330_000, "PROGRESS_IDLE_TIMEOUT"), { at: now + 300_000, reason: "ADAPTIVE_WAIT_LIMIT" });
 });
 
+test("a retry uses the original absolute wait deadline instead of gaining a fresh budget", () => {
+  const now = Date.now();
+  const registry = createAdaptiveDeliveryRegistry();
+  const attempt = begin(registry, now + 200_000, { waitDeadlineAt: now + 300_000 });
+  attempt.observe(heartbeat, now + 231_000);
+  assert.equal(attempt.tryProbe(now + 240_000), true);
+  attempt.observe(heartbeat, now + 290_000);
+  assert.deepEqual(attempt.deadline(now + 340_000, "FIRST_PROGRESS_TIMEOUT"), { at: now + 300_000, reason: "ADAPTIVE_WAIT_LIMIT" });
+});
+
 test("in-flight probes cannot multiply and a failed request does not learn buffered mode", () => {
   const now = Date.now();
   const registry = createAdaptiveDeliveryRegistry();

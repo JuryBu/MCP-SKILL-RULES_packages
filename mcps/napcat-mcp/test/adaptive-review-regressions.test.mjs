@@ -126,22 +126,23 @@ test("review: an overdue hard cap blocks a co-batched tool commit and completion
 });
 
 for (const headersOnly of [false, true]) {
-  test(`review: known buffered silence is terminal with ${headersOnly ? "headers but no frames" : "no response headers"}`, { timeout: 5000 }, async context => {
+  test(`review: known buffered silence retries within budget with ${headersOnly ? "headers but no frames" : "no response headers"}`, { timeout: 5000 }, async context => {
     const setup = await fixture(context, (_request, response) => {
       if (headersOnly) {
         response.writeHead(200, { "content-type": "text/event-stream" });
         response.flushHeaders();
       }
-    }, { buffered: true, initialEvent: false, upstreamIdleTimeoutMs: 180 });
+    }, { buffered: true, initialEvent: false, upstreamIdleTimeoutMs: 180, maxConsecutiveAttempts: 2 });
+    await setup.request("silent-same-turn");
     await setup.request("silent-same-turn");
     await setup.request("silent-same-turn");
     const outcomes = setup.events.filter(event => event.type === "turn_attempt_finished");
     context.diagnostic(JSON.stringify({ scenario: "buffered-silence", headersOnly, upstreamRequests: setup.count(), outcomes: outcomes.map(event => ({ kind: event.kind, reason: event.reason, elapsedMs: event.elapsedMs })) }));
-    assert.equal(setup.count(), 1, "replaying the same turn must not start another silent upstream request");
+    assert.equal(setup.count(), 2, "one native retry is permitted, then the shared attempt budget stops replay");
     assert.equal(outcomes[0]?.kind, "adaptive_wait_timeout");
     assert.equal(outcomes[0]?.reason, "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT");
     assert.ok(outcomes[0].elapsedMs >= 170, "known buffered mode must use the 180ms idle budget, not the 80ms first-progress budget");
-    assert.equal(setup.events.some(event => event.type === "native_retry_signal"), false);
+    assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
     assert.ok(setup.events.some(event => event.type === "adaptive_wait_terminal_replayed"));
     assert.equal(setup.proxy.status().activeRequests, 0);
   });

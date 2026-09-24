@@ -39,7 +39,10 @@ async function fixture(context, handler, options = {}) {
     if (!settings.anonymous) headers["chatgpt-account-id"] = settings.account ?? "account-a";
     const client = http.request({ host: "127.0.0.1", port: proxy.status().port, path: "/backend-api/codex/responses", method: "POST", headers, signal: settings.signal }, response => {
       let output = "";
-      response.on("data", chunk => { output += chunk; });
+      response.on("data", chunk => {
+        output += chunk;
+        settings.onData?.(output);
+      });
       response.once("end", () => resolve({ body: output, events: parse(output) }));
       response.once("error", reject);
     });
@@ -52,6 +55,12 @@ async function fixture(context, handler, options = {}) {
 function heartbeat(response, interval = 20) {
   const timer = setInterval(() => { if (!response.destroyed) response.write(wire({ type: "keepalive" })); }, interval);
   response.once("close", () => clearInterval(timer));
+}
+
+async function waitForRequestCleanup(setup) {
+  const deadline = Date.now() + 2000;
+  while (setup.proxy.status().activeRequests > 0 && Date.now() < deadline) await sleep(10);
+  assert.equal(setup.proxy.status().activeRequests, 0);
 }
 
 test("concentrated completion is learned, used by the next request, then real streaming restores normal mode", async context => {
@@ -103,12 +112,183 @@ test("endless heartbeats stop at the absolute budget and replay does not make an
   assert.equal(setup.proxy.status().activeRequests, 0);
 });
 
-test("known buffered mode stops a dead upstream before the hard budget", async context => {
-  const setup = await fixture(context, () => {}, { buffered: true, upstreamIdleTimeoutMs: 120 });
-  const result = await setup.request();
-  assert.match(result.body, /长时间未发送/u);
-  assert.ok(setup.events.some(event => event.type === "adaptive_wait_stopped" && event.reason === "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT"));
+test("known buffered silence signals a native retry and the next attempt can complete", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 2) response.end(wire(text("RECOVERED")) + wire(done));
+  }, { buffered: true, upstreamIdleTimeoutMs: 120 });
+  const first = await setup.request({ turn: "silent-retry" });
+  assert.equal(first.events.some(event => event.type === "response.completed"), false);
+  assert.ok(setup.events.some(event => event.type === "native_retry_signal" && event.reason === "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT"));
+  const second = await setup.request({ turn: "silent-retry" });
+  assert.match(second.body, /RECOVERED/u);
+  assert.equal(setup.count(), 2);
+  assert.deepEqual(setup.events.filter(event => event.type === "turn_attempt_started").map(event => event.attemptNumber), [1, 2]);
+});
+
+test("a probed idle timeout retries without resetting its absolute budget during cooldown", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 1) {
+      const timer = setInterval(() => response.write(wire({ type: "keepalive" })), 20);
+      setTimeout(() => clearInterval(timer), 120);
+      response.once("close", () => clearInterval(timer));
+    } else heartbeat(response);
+  }, { adaptiveWaitLimitMs: 400, upstreamIdleTimeoutMs: 140, firstProgressTimeoutMs: 80 });
+  const first = await setup.request({ turn: "probe-retry-budget" });
+  assert.equal(first.events.some(event => event.type === "response.completed"), false);
+  assert.ok(setup.events.some(event => event.type === "adaptive_delivery_probe_started"));
+  while (!setup.events.some(event => event.type === "adaptive_wait_stopped") && setup.count() < 6) {
+    await setup.request({ turn: "probe-retry-budget" });
+  }
+  const terminal = setup.events.find(event => event.type === "adaptive_wait_stopped");
+  assert.equal(terminal?.reason, "ADAPTIVE_WAIT_LIMIT");
+  const count = setup.count();
+  await setup.request({ turn: "probe-retry-budget" });
+  assert.equal(setup.count(), count);
+  assert.ok(setup.events.some(event => event.type === "adaptive_wait_terminal_replayed"));
+});
+
+test("an expired idle retry budget prevents opening another upstream connection", async context => {
+  const setup = await fixture(context, () => {}, { buffered: true, adaptiveWaitLimitMs: 280, upstreamIdleTimeoutMs: 120 });
+  const first = await setup.request({ turn: "budget-before-connect" });
+  assert.equal(first.events.some(event => event.type === "response.completed"), false);
+  await sleep(300);
+  const final = await setup.request({ turn: "budget-before-connect" });
+  assert.match(final.body, /等待上限/u);
   assert.equal(setup.count(), 1);
+});
+
+test("disconnect regression: an idle retry keeps its absolute deadline after downstream cancellation", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count > 2) response.end(wire(text("UNEXPECTED_REPLAY")) + wire(done));
+  }, { buffered: true, adaptiveWaitLimitMs: 600, upstreamIdleTimeoutMs: 120 });
+  const turn = "disconnect-idle-budget";
+  await setup.request({ turn });
+  const deadline = setup.events.find(event => event.type === "adaptive_idle_retry_eligible")?.deadlineAt;
+  assert.ok(Number.isFinite(deadline));
+  const controller = new AbortController();
+  await assert.rejects(setup.request({ turn, signal: controller.signal, onData: () => controller.abort() }));
+  await waitForRequestCleanup(setup);
+  assert.equal(setup.count(), 2);
+  assert.ok(setup.events.some(event => event.type === "downstream_cancelled"));
+  await sleep(Math.max(0, deadline - Date.now()) + 30);
+  const terminal = await setup.request({ turn });
+  assert.equal(setup.count(), 2, "an expired pre-disconnect deadline must block another upstream request");
+  assert.match(terminal.body, /等待上限/u);
+  await setup.request({ turn });
+  assert.equal(setup.count(), 2);
+});
+
+test("disconnect regression: exposed hosted work stays unsafe after downstream cancellation", async context => {
+  const hostedId = "hosted-before-disconnect";
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 1) response.write(wire({ type: "response.output_item.added", output_index: 0,
+      item: { type: "web_search_call", id: hostedId, status: "in_progress" } }));
+    else if (count > 2) response.end(wire(text("UNEXPECTED_REPLAY")) + wire(done));
+  }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 180 });
+  const turn = "disconnect-hosted-safety";
+  const controller = new AbortController();
+  let hostedDelivered = false;
+  await assert.rejects(setup.request({ turn, signal: controller.signal, onData: output => {
+    if (parse(output).some(event => event.item?.id === hostedId)) {
+      hostedDelivered = true;
+      controller.abort();
+    }
+  } }));
+  await waitForRequestCleanup(setup);
+  assert.equal(hostedDelivered, true);
+  assert.equal(setup.count(), 1);
+  const terminal = await setup.request({ turn });
+  assert.equal(setup.events.some(event => event.type === "native_retry_signal"), false,
+    "a disconnect must not erase hosted work and make an empty idle retry safe");
+  assert.ok(terminal.events.some(event => event.type === "response.completed"));
+  const countBeforeReplay = setup.count();
+  await setup.request({ turn });
+  assert.equal(setup.count(), countBeforeReplay);
+});
+
+test("local terminal regression: tool retry exhaustion caches an earlier idle chain terminal", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 2 || count === 3) response.write(wire({ type: "response.output_item.added", output_index: 0,
+      item: { type: "function_call", id: "pending", call_id: "pending-call", name: "safe", arguments: "" } }));
+    else if (count > 3) response.end(wire(text("UNEXPECTED_REPLAY")) + wire(done));
+  }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 180, toolPreparationGraceMs: 60 });
+  const turn = "idle-then-tool-exhaustion";
+  await setup.request({ turn });
+  await setup.request({ turn });
+  const terminal = await setup.request({ turn });
+  assert.equal(setup.count(), 3);
+  assert.ok(setup.events.some(event => event.type === "local_tool_phase_retry_signal"));
+  assert.ok(setup.events.some(event => event.type === "local_tool_phase_timeout" && event.attemptNumber === 3));
+  assert.match(terminal.body, /自动重试上限/u);
+  const replay = await setup.request({ turn });
+  assert.equal(setup.count(), 3, "the local terminal must be replayed instead of resetting the idle chain");
+  assert.match(replay.body, /自动重试上限/u);
+  assert.deepEqual(setup.events.filter(event => event.type === "turn_attempt_started").map(event => event.attemptNumber), [1, 2, 3]);
+});
+
+test("idle retries obey the shared attempt limit and terminal replays do not restart it", async context => {
+  const setup = await fixture(context, () => {}, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 120, maxConsecutiveAttempts: 2 });
+  await setup.request({ turn: "bounded-idle" });
+  const final = await setup.request({ turn: "bounded-idle" });
+  assert.ok(final.events.some(event => event.type === "response.completed"));
+  assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+  await setup.request({ turn: "bounded-idle" });
+  assert.equal(setup.count(), 2);
+});
+
+for (const partial of [text("PARTIAL"), { type: "response.output_item.added", output_index: 0, item: { type: "web_search_call", id: "hosted", status: "in_progress" } }]) {
+  test(`idle timeout after ${partial.type} does not replay exposed or hosted work`, async context => {
+    const setup = await fixture(context, (_request, response) => response.write(wire(partial)), { buffered: true, adaptiveWaitLimitMs: 1000, upstreamIdleTimeoutMs: 120 });
+    await setup.request({ turn: "partial-idle" });
+    await setup.request({ turn: "partial-idle" });
+    assert.equal(setup.count(), 1);
+    assert.equal(setup.events.some(event => event.type === "native_retry_signal"), false);
+  });
+}
+
+test("prior streamed work also blocks a later empty adaptive idle replay", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 1) response.end(wire(text("EARLIER")));
+  }, { buffered: true, adaptiveWaitLimitMs: 1000, upstreamIdleTimeoutMs: 120 });
+  await setup.request({ turn: "prior-progress" });
+  await setup.request({ turn: "prior-progress" });
+  await setup.request({ turn: "prior-progress" });
+  assert.equal(setup.count(), 2);
+  assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+});
+
+test("a tool preparation timeout cannot discard an earlier idle retry deadline", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 2) {
+      response.write(wire({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "pending", call_id: "pending-call", name: "safe", arguments: "" } }));
+    } else if (count > 2) response.end(wire(text("UNEXPECTED")) + wire(done));
+  }, { buffered: true, adaptiveWaitLimitMs: 600, upstreamIdleTimeoutMs: 180, toolPreparationGraceMs: 60 });
+  await setup.request({ turn: "idle-then-preparation" });
+  await setup.request({ turn: "idle-then-preparation" });
+  assert.ok(setup.events.some(event => event.type === "local_tool_phase_retry_signal"));
+  await sleep(650);
+  const final = await setup.request({ turn: "idle-then-preparation" });
+  assert.equal(setup.count(), 2);
+  assert.match(final.body, /等待上限/u);
+});
+
+test("a tool preparation timeout cannot discard an earlier hosted work safety marker", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 1) {
+      response.end(wire({ type: "response.output_item.added", item: { type: "web_search_call", id: "hosted-prior", status: "in_progress" } })
+        + wire({ type: "response.failed", response: { error: { code: "server_error", message: "temporary" } } }));
+    } else if (count === 2) {
+      response.write(wire({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "pending", call_id: "pending-call", name: "safe", arguments: "" } }));
+    }
+  }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 180, toolPreparationGraceMs: 60 });
+  await setup.request({ turn: "hosted-then-preparation" });
+  await setup.request({ turn: "hosted-then-preparation" });
+  const final = await setup.request({ turn: "hosted-then-preparation" });
+  assert.ok(final.events.some(event => event.type === "response.completed"));
+  assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+  assert.equal(setup.events.filter(event => event.type === "local_tool_phase_retry_signal").length, 1);
+  await setup.request({ turn: "hosted-then-preparation" });
+  assert.equal(setup.count(), 3);
 });
 
 test("body progress cannot reset a buffered request hard budget", async context => {

@@ -63,7 +63,7 @@ async function runScenario(schedule, options = {}) {
   const proxy = createCodexModelStreamProxy({
     host: "127.0.0.1", port: 0,
     upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`,
-    firstProgressTimeoutMs: 200, progressIdleTimeoutMs: 200,
+    firstProgressTimeoutMs: options.firstProgressTimeoutMs ?? 200, progressIdleTimeoutMs: 200,
     toolPreparationGraceMs: 600,
     onEvent: event => events.push(event),
   });
@@ -287,7 +287,7 @@ test("reasoning progress does not renew fixed function preparation grace", async
 });
 
 test("genuine connection resets retain five native retries and rapid wait", async () => {
-  const result = await runScenario(({ response, later }) => later(5, () => response.destroy()), { attempts: 6 });
+  const result = await runScenario(({ response, later }) => later(5, () => response.destroy()), { attempts: 6, firstProgressTimeoutMs: 1500 });
   assert.equal(result.upstreamRequests, 6);
   assert.equal(result.events.filter(event => event.type === "native_retry_signal").length, 5);
   assert.equal(result.events.filter(event => event.type === "rapid_retry_wait_started").length, 1);

@@ -13,9 +13,12 @@ import {
   findExecutableRefresh,
   observeEmptyDesktopRestart,
   parseArguments,
+  probeExecutable,
   runCodexAppServerProxyService,
+  selectRecoveryUpstreamPort,
   terminateManagedAppServer,
 } from "../src/codex-app-server-proxy-runner.mjs";
+import { inspectCodexSource, prepareCodexRuntimeBundle } from "../src/codex-runtime-bundle.mjs";
 
 const execFileAsync = promisify(execFile);
 
@@ -36,6 +39,7 @@ function runtimePaths(root) {
     probePort: 18454,
     startTimeoutMs: 1000,
     requestTimeoutMs: 1000,
+    verifyListenerOwner: async () => true,
   };
 }
 
@@ -521,6 +525,371 @@ test("Codex executable refresh is accepted only while the Desktop proxy has no c
   }
 });
 
+test("managed runner retains the complete Desktop runtime after its source directory disappears", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-runtime-bundle-test-"));
+  const paths = runtimePaths(root);
+  const sourceDirectory = path.join(root, "OpenAI", "Codex", "bin", "revision-one");
+  const sourceExecutable = path.join(sourceDirectory, "codex.exe");
+  const launchedPaths = [];
+  let companionAvailableAfterDeletion = false;
+  const child = createChildThatRequiresForceVerification((processHandle) => {
+    processHandle.exitCode = 137;
+    processHandle.emit("exit", 137, "SIGKILL");
+  });
+  try {
+    fs.mkdirSync(sourceDirectory, { recursive: true });
+    fs.writeFileSync(sourceExecutable, "fake codex");
+    fs.writeFileSync(path.join(sourceDirectory, "codex-code-mode-host.exe"), "fake tool host");
+    fs.writeFileSync(path.join(sourceDirectory, "support.dat"), "needed companion");
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      localAppData: root,
+      pid: process.pid,
+      validateBundleSignature: async () => {},
+      probeExecutable: async () => {},
+      createProxy: createProxyStub,
+      spawnAppServer: (executable) => {
+        launchedPaths.push(executable);
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        fs.rmSync(sourceDirectory, { recursive: true });
+        companionAvailableAfterDeletion = fs.existsSync(path.join(path.dirname(launchedPaths[0]), "codex-code-mode-host.exe"))
+          && fs.existsSync(path.join(path.dirname(launchedPaths[0]), "support.dat"));
+        fs.writeFileSync(paths.stopFilePath, "stop\n");
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    assert.equal(launchedPaths.length, 1);
+    assert.notEqual(launchedPaths[0], sourceExecutable);
+    assert.equal(companionAvailableAfterDeletion, true);
+    const restartedPaths = [];
+    const restartedChild = createChildThatRequiresForceVerification((processHandle) => {
+      processHandle.exitCode = 137;
+      processHandle.emit("exit", 137, "SIGKILL");
+    });
+    const restarted = await runCodexAppServerProxyService({
+      ...paths,
+      localAppData: root,
+      pid: process.pid,
+      validateBundleSignature: async () => {},
+      probeExecutable: async () => {},
+      createProxy: createProxyStub,
+      spawnAppServer: (executable) => {
+        restartedPaths.push(executable);
+        return { child: restartedChild, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => fs.writeFileSync(paths.stopFilePath, "stop\n"),
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(restarted.state, "stopped");
+    assert.deepEqual(restartedPaths, launchedPaths);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed runner refreshes to a verified bundle only after clients disconnect", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-bundle-refresh-test-"));
+  const paths = runtimePaths(root);
+  const binRoot = path.join(root, "OpenAI", "Codex", "bin");
+  const oldSource = path.join(binRoot, "revision-one");
+  const newSource = path.join(binRoot, "revision-two");
+  const launches = [];
+  let clientCount = 1;
+  let oldBundleSurvived = false;
+  const timeout = setTimeout(() => fs.writeFileSync(paths.stopFilePath, "timeout\n"), 3000);
+  try {
+    fs.mkdirSync(oldSource, { recursive: true });
+    fs.writeFileSync(path.join(oldSource, "codex.exe"), "version one");
+    fs.writeFileSync(path.join(oldSource, "codex-code-mode-host.exe"), "host one");
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      localAppData: root,
+      pid: process.pid,
+      executableRefreshIntervalMs: 2,
+      lifecyclePollIntervalMs: 2,
+      validateBundleSignature: async () => {},
+      probeExecutable: async () => {},
+      createProxy: () => ({
+        async start() {},
+        async close() {},
+        status() { return { clientCount }; },
+      }),
+      spawnAppServer: (executable) => {
+        launches.push(executable);
+        const child = createChildThatRequiresForceVerification();
+        child.pid = 43000 + launches.length;
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        if (launches.length === 1) {
+          fs.mkdirSync(newSource, { recursive: true });
+          fs.writeFileSync(path.join(newSource, "codex.exe"), "version two");
+          fs.writeFileSync(path.join(newSource, "codex-code-mode-host.exe"), "host two");
+          const olderTime = new Date(Date.now() - 100000);
+          fs.utimesSync(path.join(newSource, "codex.exe"), olderTime, olderTime);
+          setTimeout(() => { clientCount = 0; }, 25);
+        } else {
+          fs.rmSync(oldSource, { recursive: true });
+          oldBundleSurvived = fs.readFileSync(path.join(path.dirname(launches[0]), "codex-code-mode-host.exe"), "utf8") === "host one";
+          fs.writeFileSync(paths.stopFilePath, "stop\n");
+        }
+      },
+      terminateChild: async (child) => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    assert.equal(launches.length, 2);
+    assert.notEqual(launches[0], launches[1]);
+    assert.equal(oldBundleSurvived, true);
+    const events = fs.readFileSync(paths.logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.filter((entry) => entry.type === "app_server_executable_refresh").length, 1);
+  } finally {
+    clearTimeout(timeout);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("managed refresh reuses identical content and eventually detects a metadata-spoofed replacement", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-bundle-digest-test-"));
+  const binRoot = path.join(root, "OpenAI", "Codex", "bin");
+  const firstSource = path.join(binRoot, "first");
+  const secondSource = path.join(binRoot, "second");
+  const bundleRoot = path.join(root, "managed");
+  try {
+    for (const directory of [firstSource, secondSource]) {
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, "codex.exe"), "same contents");
+      fs.writeFileSync(path.join(directory, "codex-code-mode-host.exe"), "same host");
+    }
+    const later = new Date(Date.now() + 10000);
+    fs.utimesSync(path.join(secondSource, "codex.exe"), later, later);
+    const current = await prepareCodexRuntimeBundle(path.join(firstSource, "codex.exe"), {
+      bundleRoot,
+      validateBundleSignature: async () => {},
+    });
+    const refreshState = { nextDeepCheckAt: 0 };
+    const options = {
+      localAppData: root,
+      bundleRoot,
+      runtimeStatePath: path.join(root, "runtime.json"),
+      bundleRefreshState: refreshState,
+      proxyStatus: () => ({ clientCount: 0 }),
+      probeExecutable: async () => {},
+      validateBundleSignature: async () => {},
+    };
+    assert.equal(await findExecutableRefresh(current, options), null);
+    assert.equal(current.sourcePath, path.join(secondSource, "codex.exe"));
+    assert.equal(fs.readdirSync(bundleRoot).length, 1);
+
+    const secondExecutable = path.join(secondSource, "codex.exe");
+    const preservedTime = fs.statSync(secondExecutable).mtime;
+    fs.writeFileSync(secondExecutable, "new! contents");
+    fs.utimesSync(secondExecutable, preservedTime, preservedTime);
+    current.sourceMetadata = (await inspectCodexSource(secondExecutable)).sourceMetadata;
+    refreshState.nextDeepCheckAt = 0;
+    assert.equal(await findExecutableRefresh(current, {
+      ...options,
+      proxyStatus: () => ({ clientCount: 1 }),
+    }), null);
+    const changed = await findExecutableRefresh(current, options);
+    assert.notEqual(changed.digest, current.digest);
+    assert.equal(fs.readdirSync(bundleRoot).length, 2);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("stop during a slow signature prevents probe and leaves no published bundle", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-stop-prepare-test-"));
+  const paths = runtimePaths(root);
+  const source = path.join(root, "OpenAI", "Codex", "bin", "revision");
+  let probeAfterStop = false;
+  let launches = 0;
+  try {
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "codex.exe"), "fake executable");
+    fs.writeFileSync(path.join(source, "codex-code-mode-host.exe"), "fake host");
+    const startedAt = Date.now();
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      localAppData: root,
+      pid: process.pid,
+      createProxy: createProxyStub,
+      validateBundleSignature: async () => {
+        fs.writeFileSync(paths.stopFilePath, "stop\n");
+        await new Promise((resolve) => setTimeout(resolve, 150));
+      },
+      probeExecutable: async () => { probeAfterStop = fs.existsSync(paths.stopFilePath); },
+      spawnAppServer: () => { launches += 1; throw new Error("unexpected launch"); },
+    });
+    assert.equal(result.state, "stopped");
+    assert.ok(Date.now() - startedAt < 150);
+    await new Promise((resolve) => setTimeout(resolve, 180));
+    assert.equal(probeAfterStop, false);
+    assert.equal(launches, 0);
+    assert.deepEqual(fs.readdirSync(path.join(root, "codex-runtime-bundles")), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("startup deadline cancels a slow signature without publishing later", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-deadline-test-"));
+  const paths = runtimePaths(root);
+  const source = path.join(root, "OpenAI", "Codex", "bin", "revision");
+  let probes = 0;
+  try {
+    fs.mkdirSync(source, { recursive: true });
+    fs.writeFileSync(path.join(source, "codex.exe"), "fake executable");
+    fs.writeFileSync(path.join(source, "codex-code-mode-host.exe"), "fake host");
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      localAppData: root,
+      pid: process.pid,
+      startupBudgetMs: 35,
+      createProxy: createProxyStub,
+      validateBundleSignature: async () => new Promise((resolve) => setTimeout(resolve, 150)),
+      probeExecutable: async () => { probes += 1; },
+      spawnAppServer: () => { throw new Error("unexpected launch"); },
+    });
+    assert.equal(result.state, "failed");
+    assert.equal(result.error.code, "APP_SERVER_PREPARE_TIMEOUT");
+    await new Promise((resolve) => setTimeout(resolve, 170));
+    assert.equal(probes, 0);
+    assert.deepEqual(fs.readdirSync(path.join(root, "codex-runtime-bundles")), []);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("foreign listener owner is rejected before automation is enabled", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-owner-test-"));
+  const paths = runtimePaths(root);
+  const child = createChildThatRequiresForceVerification();
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      executablePath: process.execPath,
+      pid: process.pid,
+      createProxy: createProxyStub,
+      probeExecutable: async () => ({ launched: { child, stderr: () => "" } }),
+      spawnAppServer: () => { throw new Error("probe child must be reused"); },
+      waitForWebSocketReady: async () => {},
+      verifyListenerOwner: async () => {
+        setTimeout(() => fs.writeFileSync(paths.stopFilePath, "stop\n"), 20);
+        return false;
+      },
+      terminateChild: async (managedChild) => {
+        managedChild.exitCode = 0;
+        managedChild.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    const events = fs.readFileSync(paths.logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.some((entry) => entry.type === "app_server_started"), false);
+    assert.equal(events.some((entry) => entry.type === "app_server_start_failed"
+      && entry.error?.code === "APP_SERVER_LISTENER_OWNER_MISMATCH"), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("successful default probe reuses its verified child instead of terminating it", async () => {
+  const child = createChildThatRequiresForceVerification();
+  let terminations = 0;
+  class ProbeSocket extends EventEmitter {
+    constructor() {
+      super();
+      queueMicrotask(() => this.emit("open"));
+    }
+    send(payload) {
+      if (JSON.parse(payload).method === "initialize") {
+        queueMicrotask(() => this.emit("message", Buffer.from(JSON.stringify({ id: 1, result: {} }))));
+      }
+    }
+    close() {}
+  }
+  const launched = { child, stderr: () => "" };
+  const result = await probeExecutable("fake.exe", 18454, {
+    spawnAppServer: () => launched,
+    WebSocketImpl: ProbeSocket,
+    keepAliveAfterProbe: true,
+    terminateChild: async () => { terminations += 1; },
+    verifyPortReleased: async () => true,
+  });
+  assert.equal(result.launched, launched);
+  assert.equal(child.exitCode, null);
+  assert.equal(terminations, 0);
+});
+
+test("occupied former upstream port rotates without terminating its foreign listener", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-port-rotation-test-"));
+  const paths = runtimePaths(root);
+  const firstChild = createChildThatRequiresForceVerification();
+  const secondChild = createChildThatRequiresForceVerification();
+  firstChild.pid = 43211;
+  secondChild.pid = 43212;
+  const foreignPid = 49999;
+  const portOwners = new Map([[paths.upstreamPort, foreignPid]]);
+  const terminated = [];
+  const launchedPorts = [];
+  const upstreamUrls = [];
+  let readyCalls = 0;
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      executablePath: process.execPath,
+      pid: process.pid,
+      portReleaseTimeoutMs: 10,
+      portReleasePollIntervalMs: 1,
+      lifecyclePollIntervalMs: 1,
+      createProxy: () => ({
+        async start() {}, async close() {},
+        status() { return { clientCount: 0 }; },
+        pauseUpstream() {}, resumeUpstream() {},
+        setUpstreamUrl(url) { upstreamUrls.push(url); },
+      }),
+      probeExecutable: async () => ({ launched: { child: firstChild, stderr: () => "" } }),
+      spawnAppServer: (_, port) => {
+        launchedPorts.push(port);
+        return { child: secondChild, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        readyCalls += 1;
+        if (readyCalls === 1) throw new Error("first managed listener exited");
+        setTimeout(() => fs.writeFileSync(paths.stopFilePath, "stop\n"), 20);
+      },
+      terminateChild: async (child) => {
+        terminated.push(child.pid);
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      },
+      verifyPortReleased: async (port) => !portOwners.has(port),
+    });
+    assert.equal(result.state, "stopped");
+    assert.deepEqual(terminated, [firstChild.pid, secondChild.pid]);
+    assert.equal(portOwners.get(paths.upstreamPort), foreignPid);
+    assert.equal(terminated.includes(foreignPid), false);
+    assert.deepEqual(launchedPorts, [paths.upstreamPort + 2]);
+    assert.deepEqual(upstreamUrls, [`ws://127.0.0.1:${paths.upstreamPort + 2}`]);
+    const events = fs.readFileSync(paths.logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(events.some((entry) => entry.type === "app_server_upstream_port_rotated"), true);
+    assert.equal(events.some((entry) => entry.type === "app_server_started"), true);
+    assert.equal(await selectRecoveryUpstreamPort(paths.upstreamPort, new Set([paths.upstreamPort + 2]), {
+      verifyPortReleased: async () => true,
+    }), paths.upstreamPort + 3);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("a healthy managed App Server supersedes stale proxy alerts and fallback requests", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-recovery-artifacts-test-"));
   const paths = runtimePaths(root);
@@ -539,7 +908,12 @@ test("a healthy managed App Server supersedes stale proxy alerts and fallback re
     expectedProxyUrl: `ws://127.0.0.1:${paths.downstreamPort}`,
   })}\n`, "utf8");
   try {
-    const result = await runCodexAppServerProxyService(createStoppingServiceOptions(paths, child));
+    const result = await runCodexAppServerProxyService({
+      ...createStoppingServiceOptions(paths, child),
+      waitForWebSocketReady: async () => {
+        setTimeout(() => fs.writeFileSync(paths.stopFilePath, "stop\n", "utf8"), 25);
+      },
+    });
     assert.equal(result.state, "stopped");
     const alert = JSON.parse(fs.readFileSync(paths.alertFilePath, "utf8"));
     assert.equal(alert.pending, false);
@@ -586,4 +960,19 @@ test("start script ignores stale degraded runtime state from the previous proxy 
   const degradedCheckIndex = startScript.indexOf('[string]$CandidateState.state -eq "degraded"');
   assert.ok(staleGuardIndex >= 0, "start script must fence runtime state by the newly spawned PID");
   assert.ok(degradedCheckIndex > staleGuardIndex, "stale PID fencing must run before degraded-state handling");
+});
+
+test("start script keeps outer readiness waiting separate from the backend startup timeout", { skip: process.platform !== "win32" }, async () => {
+  const startScript = fs.readFileSync(path.resolve("ops/start-codex-app-server-proxy.ps1"), "utf8");
+  const parameterBlock = startScript.match(/^param\([\s\S]*?\r?\n\)/mu)?.[0];
+  assert.ok(parameterBlock);
+  assert.match(startScript, /"--start-timeout-ms", \(\[string\]\$StartTimeoutMs\)/u);
+  assert.match(startScript, /\$Deadline = \[DateTime\]::UtcNow\.AddSeconds\(\$StartupTimeoutSeconds\)/u);
+  assert.doesNotMatch(startScript, /runtime state within 30 seconds/u);
+  const command = [
+    `function Read-StartupParameters { ${parameterBlock}; [pscustomobject]@{ backend = $StartTimeoutMs; outer = $StartupTimeoutSeconds } }`,
+    "@(Read-StartupParameters; Read-StartupParameters -StartTimeoutMs 60000 -StartupTimeoutSeconds 180) | ConvertTo-Json -Compress",
+  ].join("; ");
+  const { stdout } = await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", command], { windowsHide: true });
+  assert.deepEqual(JSON.parse(stdout), [{ backend: 45000, outer: 120 }, { backend: 60000, outer: 180 }]);
 });

@@ -118,14 +118,14 @@ test('rapid retry top-up counts time spent in the first attempt', async context 
 });
 
 test('fast five failures add only a single bounded wait before the last retry', async context => {
-  const setup = await fixture(context, (_request, response) => response.end(), { firstProgressTimeoutMs: 150 });
+  const setup = await fixture(context, (_request, response) => response.end(), { firstProgressTimeoutMs: 1500 });
   const started = Date.now();
   for (let index = 0; index < 5; index += 1) await setup.request();
   const waits = setup.events.filter(event => event.type === 'rapid_retry_wait_started');
   assert.equal(waits.length, 1);
   assert.equal(waits[0].attemptNumber, 5);
-  assert.ok(Date.now() - started >= 130);
-  assert.ok(waits[0].delayMs <= 150);
+  assert.ok(Date.now() - started >= 1400);
+  assert.ok(waits[0].delayMs > 0 && waits[0].delayMs <= 1500);
 });
 
 test('new_context failure has safe IDLE without completing a tool or reusing its index', async context => {

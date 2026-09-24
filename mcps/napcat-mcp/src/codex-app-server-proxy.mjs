@@ -354,6 +354,7 @@ export class CodexAppServerProxy {
     this.controlHost = options.controlHost ?? "127.0.0.1";
     this.controlPort = boundedInteger(options.controlPort, 18431, 1, 65535);
     this.upstreamUrl = requiredString(options.upstreamUrl ?? "ws://127.0.0.1:18433", "upstreamUrl", 2048);
+    this.upstreamPaused = Boolean(options.upstreamPaused);
     this.controlToken = requiredString(options.controlToken, "controlToken", 4096);
     this.requestTimeoutMs = boundedInteger(options.requestTimeoutMs, DEFAULT_REQUEST_TIMEOUT_MS, 250, 300000);
     this.resumeRequestTimeoutMs = boundedInteger(
@@ -842,10 +843,36 @@ export class CodexAppServerProxy {
     this.#connectUpstream(client);
   }
 
+  pauseUpstream() {
+    this.upstreamPaused = true;
+    for (const client of [...this.clients]) {
+      if (!client.upstream) continue;
+      const upstream = client.upstream;
+      upstream.terminate?.();
+      this.#handleUpstreamDisconnect(client, upstream, "managed_upstream_restarting");
+    }
+  }
+
+  setUpstreamUrl(value) {
+    const target = new URL(value);
+    if (target.protocol !== "ws:" || target.hostname !== "127.0.0.1" || !target.port
+      || target.username || target.password || target.pathname !== "/" || target.search || target.hash) {
+      throw new CodexAppServerProxyError("INVALID_UPSTREAM_URL", "受管 App Server 地址必须是本机回环 WebSocket 端口");
+    }
+    this.pauseUpstream();
+    this.upstreamUrl = value;
+  }
+
+  resumeUpstream() {
+    this.upstreamPaused = false;
+    for (const client of this.clients) this.#connectUpstream(client);
+  }
+
   #connectUpstream(client) {
     if (
       client.closed
       || this.closed
+      || this.upstreamPaused
       || client.downstream.readyState >= this.WebSocketImpl.CLOSING
       || [this.WebSocketImpl.CONNECTING, this.WebSocketImpl.OPEN].includes(client.upstream?.readyState)
     ) return;
