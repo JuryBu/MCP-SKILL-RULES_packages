@@ -91,7 +91,7 @@ Rules 保留少汇报腔、解释技术概念、Plan / Task / Stage Guard、子�
 | Claude Code | `rules/claude-code/CLAUDE.template.md` |
 | Windsurf | `rules/windsurf/global_rules.template.md` 与五个 `system_rules` 分片 |
 
-Codex 四种配置都复用 `components/core.template.md`，所以工程流程、工具说明和证据要求不会因角色风格变化而丢失。开发机与训练机配置可能超过常见的 32K 项目说明读取上限，`Apply-CodexConfig.ps1` 与 Rules 安装器都会幂等保证 `project_doc_max_bytes >= 65536`，并保留已有更高值。`system-prompt.template.md` 是四种配置共用的可选模板，集中放置时间与质量、先查证再实现、提问边界和写作组织等通用原则；`Install-CodexRulesProfile.ps1 -InstallSystemPrompt -InstallRecommendedDesktopFeatures` 可在备份后维护提示词指针和当前 Desktop 功能配置，不会整份覆盖 `config.toml`。开发机与训练机的真实账号、群号、路径和信任边界必须写入仓库外的私有覆盖文件，公开示例不能直接当真实配置安装。
+Codex 四种配置都复用 `components/core.template.md`，所以工程流程、工具说明和证据要求不会因角色风格变化而丢失。开发机与训练机配置可能超过常见的 32K 项目说明读取上限，`Apply-CodexConfig.ps1` 与 Rules 安装器都会幂等保证 `project_doc_max_bytes >= 65536`，并保留已有更高值。当前 AGENTS 与 `system-prompt.template.md` 的通用基线 `2026-09-24.1` 成对使用：通用交流、时间表达、验证和配置生效原则放提示词，个人、工具与角色约定留在 AGENTS。首次安装或升级基线需经接收方确认后加 `-InstallSystemPrompt`，备份并更新提示词及指针；不加时只接受已配置且正文完整一致的基线，避免规则迁移后遗漏。`-InstallRecommendedDesktopFeatures` 仍是独立可选项，不会整份覆盖 `config.toml`。开发机与训练机的真实账号、群号、路径和信任边界必须写入仓库外的私有覆盖文件，公开示例不能直接当真实配置安装。
 
 Rules 已删除生日、学业、账号链接、登录态、本机路径、真实服务额度和私人项目上下文。接收方应根据自己的环境再修改。
 
@@ -110,11 +110,11 @@ Rules 已删除生日、学业、账号链接、登录态、本机路径、真�
 ./install/Start-CodexMcpBroker.ps1
 ./install/Status-CodexMcpBroker.ps1
 ./install/Apply-CodexConfig.ps1
-./install/Install-CodexRulesProfile.ps1 -Profile catgirl
+./install/Install-CodexRulesProfile.ps1 -Profile catgirl -InstallSystemPrompt
 ./install/Test-CodexToolkit.ps1
 ```
 
-Codex Rules 还可选择 `neutral`、`development` 或 `training`。需要部署公共 `system-prompt.template.md` 时追加 `-InstallSystemPrompt`；需要机器私有配置时先把 `rules/codex/local-overrides.example.md` 复制到仓库外，再通过 `-LocalOverridePath` 传入。
+Codex Rules 还可选择 `neutral`、`development` 或 `training`。上面的命令会备份并替换提示词和配置入口，已有自定义提示词时先审查差异，选择性同步应手动成对合并，不把同步许可当成整体覆盖许可。需要机器私有配置时先把 `rules/codex/local-overrides.example.md` 复制到仓库外，再通过 `-LocalOverridePath` 传入。磁盘安装不等于所有旧任务已加载，验收说明见 `rules/README_RULES.md`。
 
 构建 Windsurf 专属 subagent：
 

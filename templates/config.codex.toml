@@ -1,7 +1,8 @@
 ﻿# Add or merge these blocks into %USERPROFILE%/.codex/config.toml
 # Apply-CodexConfig.ps1 separately ensures the top-level project_doc_max_bytes is at least 65536.
-# Optional top-level setting. Install-CodexRulesProfile.ps1 -InstallSystemPrompt
-# installs the template and maintains this pointer idempotently:
+# The paired Codex Rules profiles require the matching common baseline.
+# With consent, Install-CodexRulesProfile.ps1 -InstallSystemPrompt installs it
+# and maintains this top-level pointer idempotently; MCP-only use is independent:
 # model_instructions_file = "~/.codex/prompts/system-prompt.md"
 
 # Optional current Codex Desktop features. Prefer applying them through

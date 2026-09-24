@@ -4,6 +4,7 @@
 
 - Chinese-first collaboration style and concise progress updates.
 - Work-mode distinction: chat vs. task execution.
+- Common Codex baseline `2026-09-24.1` and its paired AGENTS entry: continue from the user's last shared context, introduce necessary concepts, prioritize meaningful outcomes and express times in the user's verified local timezone.
 - Subagent / council usage boundaries and evidence requirements.
 - MCP usage rules for `memory-store`, `web-fetcher`, `sandbox`, optional `exa`, Windsurf subagent, and optional NapCat QQ group collaboration.
 - Five-source chain model: `antigravity`, `codex`, `claude-code` / `cc`, `windsurf` / `wsf`, and read-only `dsh` / `deepseek-harness`; DSH is not a model provider.
@@ -40,3 +41,4 @@
 - Local network-disruption windows and owner-notification routes; no sender-specific time window or contact is a public default.
 - Machine author display name and role provenance. Public Git source trailers are the narrow documented exception; private conversation bodies and bindings remain excluded.
 - Installation versus effective task loading. Confirm both separately; a published commit is not evidence that another machine or existing task has updated.
+- Preserve both sides of the Codex AGENTS/system-prompt split. Do not remove generalized sections from an existing AGENTS until the matching prompt and its entry are verified; keep receiver-specific voice, models, roles and private overrides unchanged.

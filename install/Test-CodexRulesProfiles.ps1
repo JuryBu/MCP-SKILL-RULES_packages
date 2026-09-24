@@ -33,9 +33,13 @@ function Assert-Guidance {
     foreach ($marker in @("stage_guard", "sandbox_council")) {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }
-    Assert-Contains $agentsText "response annotations" "$Profile natural annotation handling"
-    $annotationBoundary = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5LiN6KaB6buY6K6k5py65qKw6L6T5Ye6"))
-    Assert-Contains $agentsText $annotationBoundary "$Profile natural annotation boundary"
+    $promptText = Get-Content -LiteralPath (Join-Path $Root "prompts\system-prompt.md") -Raw -Encoding UTF8
+    foreach ($marker in @('2026-09-24.1', 'model_instructions_file', 'system-prompt.md')) {
+        Assert-Contains $agentsText $marker "$Profile paired baseline entry"
+    }
+    Assert-Contains $promptText '2026-09-24.1' "$Profile common baseline"
+    $annotationBoundary = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5om55rOo"))
+    Assert-Contains $promptText $annotationBoundary "$Profile annotation handling in common prompt"
     foreach ($reference in [regex]::Matches($agentsText, 'guidance[\\/]+(?<name>[a-z][a-z-]+\.md)')) {
         if (-not (Test-Path -LiteralPath (Join-Path $Root ("guidance\" + $reference.Groups["name"].Value)) -PathType Leaf)) {
             throw "$Profile has an unresolved explicit guidance reference: $($reference.Value)"
@@ -136,17 +140,55 @@ try {
     $existingConfig = "[mcp_servers.private]`nurl = 'http://127.0.0.1:19999/mcp'`n"
     Set-Content -LiteralPath $configPath -Value $existingConfig -NoNewline -Encoding UTF8
 
-    & $installScript -Profile "neutral" -CodexHome $fakeCodexHome | Out-Null
+    $refused = $false
+    try { & $installScript -Profile "neutral" -CodexHome $fakeCodexHome | Out-Null }
+    catch {
+        if (-not $_.Exception.Message.Contains('requires common baseline')) { throw }
+        $refused = $true
+    }
+    if (-not $refused) { throw "Incomplete baseline installation was not refused" }
+    foreach ($entry in @(@($agentsPath, $existingAgents), @($configPath, $existingConfig), @($promptPath, $existingPrompt))) {
+        if ((Get-Content -LiteralPath $entry[0] -Raw -Encoding UTF8) -ne $entry[1]) {
+            throw "Refused installation changed a target: $($entry[0])"
+        }
+    }
+    $bundledPrompt = Get-Content -LiteralPath (Join-Path $buildRoot "neutral\prompts\system-prompt.md") -Raw -Encoding UTF8
+    foreach ($case in @(
+        @{ Name = 'old-version'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $existingPrompt },
+        @{ Name = 'custom-pointer'; Config = ('model_instructions_file = "D:/private/custom-prompt.md"' + "`n" + $existingConfig); Prompt = $bundledPrompt },
+        @{ Name = 'missing-prompt'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $null },
+        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-09-24.1') }) -join "`n") }
+    )) {
+        Set-Content -LiteralPath $configPath -Value $case.Config -NoNewline -Encoding UTF8
+        if ($null -eq $case.Prompt) { Remove-Item -LiteralPath $promptPath -Force }
+        else { Set-Content -LiteralPath $promptPath -Value $case.Prompt -NoNewline -Encoding UTF8 }
+        $beforeHashes = @{}
+        foreach ($target in @($agentsPath, $configPath, $promptPath, (Join-Path $guidanceRoot 'engineering-workflow.md'))) {
+            $beforeHashes[$target] = if (Test-Path -LiteralPath $target) { (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash } else { 'absent' }
+        }
+        $refused = $false
+        try { & $installScript -Profile 'neutral' -CodexHome $fakeCodexHome | Out-Null }
+        catch {
+            if (-not $_.Exception.Message.Contains('requires common baseline')) { throw }
+            $refused = $true
+        }
+        if (-not $refused) { throw "Unsafe baseline accepted: $($case.Name)" }
+        foreach ($target in $beforeHashes.Keys) {
+            $afterHash = if (Test-Path -LiteralPath $target) { (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash } else { 'absent' }
+            if ($afterHash -ne $beforeHashes[$target]) { throw "Refusal changed $target in $($case.Name)" }
+        }
+    }
+    Set-Content -LiteralPath $configPath -Value $existingConfig -NoNewline -Encoding UTF8
+    Set-Content -LiteralPath $promptPath -Value $existingPrompt -NoNewline -Encoding UTF8
+    & $installScript -Profile "neutral" -CodexHome $fakeCodexHome -InstallSystemPrompt | Out-Null
     $null = Assert-Guidance $fakeCodexHome "neutral"
     $neutralConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
     Assert-Contains $neutralConfig "[mcp_servers.private]" "existing config"
     if ($neutralConfig -notmatch '(?m)^project_doc_max_bytes\s*=\s*65536\s*$') {
         throw "Neutral install did not set the minimum project document limit"
     }
-    if ((Get-Content -LiteralPath $promptPath -Raw -Encoding UTF8) -ne $existingPrompt -or
-        $neutralConfig.Contains("model_instructions_file")) {
-        throw "InstallSystemPrompt opt-in was not respected"
-    }
+    Assert-Contains $neutralConfig 'model_instructions_file = "~/.codex/prompts/system-prompt.md"' "paired baseline config"
+    Assert-Backup "prompts\system-prompt.md" $existingPrompt
     Assert-Backup "AGENTS.md" $existingAgents
     Assert-Backup "guidance\engineering-workflow.md" $existingGuidance
     Assert-Backup "config.toml" $existingConfig
@@ -183,7 +225,7 @@ try {
         throw "Install discarded unknown private guidance"
     }
     Assert-Backup "guidance\training-machine.md" (Get-Content -LiteralPath (Join-Path $buildRoot "training\guidance\training-machine.md") -Raw -Encoding UTF8)
-    Write-Output "Codex Rules profiles passed: four builds, four installs, guidance, isolation, overrides, config, and backups."
+    Write-Output "Codex Rules profiles passed: four builds, four installs, paired baseline refusal, guidance, isolation, overrides, config, and backups."
 } finally {
     $resolvedRoot = [System.IO.Path]::GetFullPath($fakeCodexHome).TrimEnd('\', '/')
     $resolvedParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $resolvedRoot)).TrimEnd('\', '/')

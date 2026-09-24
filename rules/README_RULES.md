@@ -8,7 +8,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `codex/profiles/*.profile.json` → four installable compositions: `neutral`, `catgirl`, `development`, and `training`.
 - `codex/guidance/*.template.md` → six shared, trigger-read topics in every profile, plus the selected development/training role manual.
 - `codex/local-overrides.example.md` → placeholder schema; copy it outside the repository before adding private values.
-- `codex/system-prompt.template.md` → optional Codex model-instructions target.
+- `codex/system-prompt.template.md` → common Codex baseline paired with the profile AGENTS.
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
 - `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
 - `windsurf/global_rules.template.md` → short per-conversation Windsurf rules.
@@ -20,9 +20,11 @@ The templates preserve natural Chinese communication, anti-report-writing guidan
 
 Sections titled `【可选配置 RULES 段】` apply only when the receiver explicitly installs and enables the corresponding integration. They may describe a neutral ecosystem role, but they never select the receiver's default owner-contact channel; that preference belongs in a private local overlay.
 
-Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. Add `-InstallSystemPrompt -InstallRecommendedDesktopFeatures` only when the receiver wants the shared system prompt and the currently tested Desktop feature tables merged into its existing config. A real local override remains receiver-private and is ignored by package creation.
+Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. This profile generation requires common baseline `2026-09-24.1`: obtain receiver consent and use `-InstallSystemPrompt` on first installation or baseline upgrades. `-InstallRecommendedDesktopFeatures` remains independent and optional. A real local override remains receiver-private and is ignored by package creation.
 
-The Codex `system-prompt.template.md` is an optional receiver-installed model-instructions file shared by all four profiles. It reinforces following AGENTS user rules when the host supports this setting and never overwrites a host configuration automatically.
+All four profiles retain their personal, tool and role-specific rules in AGENTS, and reference the shared system prompt for general communication, local-time presentation, verification and configuration-loading principles. The installer refuses to replace AGENTS without `-InstallSystemPrompt` unless the canonical top-level pointer and the full bundled prompt already exist, allowing line-ending and outer-whitespace differences. It installs the prompt/configuration before the reduced AGENTS. Custom prompt paths or merged prompts require a deliberate manual paired migration rather than silently replacing the receiver's prompt. The explicit `-InstallSystemPrompt` option replaces the prompt and its pointer after backup; do not use it merely because a selective sync was authorized. Content equality is an installation consistency check, not proof of automatic runtime injection.
+
+For selective cross-machine updates, compare both rule files and preserve receiver-specific overrides, personality, models, roles, private bindings and unrelated guidance. Back up changed files, verify preserved sections and the effective model-instructions entry, then separately report disk changes, manual reading and actual task loading. Do not restart a host or change project trust merely to claim immediate adoption; an old task can explicitly read the required baseline while automatic loading remains unverified.
 
 Reinstallation replaces the composed AGENTS file: supply the receiver's existing private `-LocalOverridePath` on every rebuild/install. The installer does not extract a private tail from an old mixed AGENTS file. Before updating such a file, separate and verify its private overlay; do not treat an installation without that argument as automatic preservation. Existing files are backed up, and unrelated private guidance files are left untouched.
 

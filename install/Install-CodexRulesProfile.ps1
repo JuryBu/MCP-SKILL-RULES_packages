@@ -32,13 +32,38 @@ try {
     $agentsBytes = (Get-Item -LiteralPath (Join-Path $tempRoot "AGENTS.md")).Length
     $requiredProjectDocBytes = [Math]::Max(65536, $agentsBytes + 8192)
 
-    New-Item -ItemType Directory -Force -Path $resolvedCodexHome | Out-Null
     $configPath = Join-Path $resolvedCodexHome "config.toml"
     $currentConfig = if (Test-Path -LiteralPath $configPath) {
         Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
     } else {
         ""
     }
+    $candidatePrompt = Get-Content -LiteralPath (Join-Path $tempRoot "prompts\system-prompt.md") -Raw -Encoding UTF8
+    $baselinePattern = '(?m)^\u901a\u7528\u57fa\u7ebf\u7248\u672c\uff1a(?<version>\d{4}-\d{2}-\d{2}\.\d+)\u3002\r?$'
+    $baselineMatch = [regex]::Match($candidatePrompt, $baselinePattern)
+    if (-not $baselineMatch.Success) {
+        throw "The bundled common prompt has no valid baseline version. No target files were changed."
+    }
+    if (-not $InstallSystemPrompt) {
+        $firstTable = [regex]::Match($currentConfig, '(?m)^\s*\[')
+        $rootConfig = if ($firstTable.Success) { $currentConfig.Substring(0, $firstTable.Index) } else { $currentConfig }
+        $pointerMatches = [regex]::Matches($rootConfig, '(?m)^\s*model_instructions_file\s*=\s*(["''])(?<path>[^"''\r\n]+)\1\s*(?:#.*)?$')
+        $existingPromptPath = Join-Path $resolvedCodexHome "prompts\system-prompt.md"
+        $compatible = $pointerMatches.Count -eq 1 -and
+            $pointerMatches[0].Groups['path'].Value -eq '~/.codex/prompts/system-prompt.md' -and
+            (Test-Path -LiteralPath $existingPromptPath -PathType Leaf)
+        if ($compatible) {
+            $existingPrompt = Get-Content -LiteralPath $existingPromptPath -Raw -Encoding UTF8
+            $existingBaseline = [regex]::Match($existingPrompt, $baselinePattern)
+            $compatible = $existingBaseline.Success -and
+                $existingBaseline.Groups['version'].Value -eq $baselineMatch.Groups['version'].Value -and
+                ($existingPrompt -replace "`r`n", "`n").Trim() -eq ($candidatePrompt -replace "`r`n", "`n").Trim()
+        }
+        if (-not $compatible) {
+            throw "This AGENTS profile requires common baseline $($baselineMatch.Groups['version'].Value). No target files were changed. Use -InstallSystemPrompt with consent to update the prompt and pointer, or manually merge and verify a custom prompt before migrating AGENTS."
+        }
+    }
+    New-Item -ItemType Directory -Force -Path $resolvedCodexHome | Out-Null
     $nextConfig = Set-CodexProjectDocMaxBytes -Content $currentConfig -MinimumBytes $requiredProjectDocBytes
     if ($InstallSystemPrompt) {
         $nextConfig = Set-CodexModelInstructionsFile -Content $nextConfig
@@ -103,13 +128,15 @@ try {
         Remove-Item -LiteralPath $staleTarget -Force
     }
 
-    foreach ($copy in $copies) {
+    $agentsTarget = Join-Path $resolvedCodexHome "AGENTS.md"
+    foreach ($copy in @($copies | Where-Object { $_.Target -ne $agentsTarget })) {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $copy.Target) | Out-Null
         Copy-Item -LiteralPath $copy.Source -Destination $copy.Target -Force
     }
     if ($configNeedsUpdate) {
         Set-Content -LiteralPath $configPath -Value $nextConfig -Encoding UTF8 -NoNewline
     }
+    Copy-Item -LiteralPath (Join-Path $tempRoot "AGENTS.md") -Destination $agentsTarget -Force
 
     Write-Output "Installed Codex Rules profile: $Profile"
     Write-Output "Codex home: $resolvedCodexHome"
