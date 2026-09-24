@@ -401,8 +401,20 @@ export async function findExecutableRefresh(currentRevision, options = {}) {
   return nextRevision;
 }
 
-function wait(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function wait(milliseconds, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, milliseconds);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function operationError(code, message) {
@@ -1210,8 +1222,7 @@ export async function runCodexAppServerProxyService(options = {}) {
         break;
       }
       const backoff = DEFAULT_RESTART_BACKOFF_MS[Math.min(restartFailureCount - 1, DEFAULT_RESTART_BACKOFF_MS.length - 1)];
-      if (startupGuard) await waitWithAbort(wait(backoff), startupGuard.signal);
-      else await wait(backoff);
+      await wait(backoff, startupGuard?.signal);
     }
     stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
     persist({ state: "stopping", automationEnabled: false, stopReason });

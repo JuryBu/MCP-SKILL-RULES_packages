@@ -886,6 +886,43 @@ test("shared startup deadline remains active across an initial readiness failure
   }
 });
 
+test("startup cancellation clears the pending backoff timer so failed CLI work can exit", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-backoff-exit-test-"));
+  try {
+    const runnerUrl = new URL("../src/codex-app-server-proxy-runner.mjs", import.meta.url).href;
+    const script = `
+      import { runCodexAppServerProxyService } from ${JSON.stringify(runnerUrl)};
+      import { EventEmitter } from 'node:events';
+      const paths = ${JSON.stringify(runtimePaths(root))};
+      const result = await runCodexAppServerProxyService({
+        ...paths, executablePath: process.execPath, pid: process.pid, startupBudgetMs: 40,
+        probeExecutable: async () => {},
+        createProxy: () => ({ async start() {}, async close() {}, status() { return {}; } }),
+        spawnAppServer: () => {
+          const child = new EventEmitter();
+          Object.assign(child, { pid: 43210, exitCode: null, signalCode: null });
+          return { child, stderr: () => '' };
+        },
+        waitForWebSocketReady: async () => { throw new Error('immediate readiness failure'); },
+        terminateChild: async child => { child.exitCode = 0; child.emit('exit', 0, null); },
+        verifyPortReleased: async () => true,
+        verifyListenerOwner: async () => true,
+      });
+      const returnedAt = Date.now();
+      process.once('beforeExit', () => console.log(JSON.stringify({
+        state: result.state, code: result.error?.code, afterResultMs: Date.now() - returnedAt,
+      })));
+    `;
+    const { stdout } = await execFileAsync(process.execPath, ["--input-type=module", "-e", script], { windowsHide: true, timeout: 10000 });
+    const result = JSON.parse(stdout.trim());
+    assert.equal(result.state, "failed");
+    assert.equal(result.code, "APP_SERVER_PREPARE_TIMEOUT");
+    assert.ok(result.afterResultMs < 400, `cancelled backoff kept the child alive for ${result.afterResultMs}ms`);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("foreign listener owner is rejected before automation is enabled", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-owner-test-"));
   const paths = runtimePaths(root);
