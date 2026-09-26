@@ -3,10 +3,11 @@ import type { FailureClass } from "./record-scheduler-contracts.js";
 import { getProviderTransportAdapter, mapProviderTrafficClass, type ProviderTransportLease, type ProviderTransportSettlementKind } from "./provider-transport-adapter.js";
 import type { ProviderTrafficClass } from "./provider-control-contracts.js";
 import { ProviderAdmissionCancelledError } from "./provider-admission.js";
+import { spawnWindowsJobProcess, type WindowsJobProcess } from "./windows-job-process.js";
 
 export const AGY_MODEL_SEQUENCE = [
-    "Gemini 3.5 Flash (High)",
-    "Gemini 3.5 Flash (Medium)",
+    "Gemini 3.8 Flash (High)",
+    "Gemini 3.8 Flash (Medium)",
     "Gemini 3.1 Pro (Low)",
 ] as const;
 
@@ -40,6 +41,8 @@ export interface AgyExecResult {
     timedOut?: boolean;
     cancelled?: boolean;
     truncated?: boolean;
+    phase?: "validation" | "admission" | "execution" | "fallback";
+    timing?: { totalMs: number; admissionWaitMs: number; executionMs: number };
 }
 
 export interface AgyAttempt {
@@ -51,6 +54,8 @@ export interface AgyAttempt {
     timedOut?: boolean;
     cancelled?: boolean;
     truncated?: boolean;
+    phase?: AgyExecResult["phase"];
+    timing?: AgyExecResult["timing"];
 }
 
 export interface AgyFallbackResult extends AgyExecResult {
@@ -76,7 +81,7 @@ interface OutputBudget {
 }
 
 export type AgyTerminationPolicy =
-    | { strategy: "windows_taskkill"; timeoutMs: number }
+    | { strategy: "windows_job_object"; timeoutMs: number }
     | { strategy: "posix_process_group"; termSignal: "SIGTERM"; killSignal: "SIGKILL"; graceMs: number };
 
 const DEFAULT_AGY_COMMAND = "agy";
@@ -101,10 +106,61 @@ const RESERVED_COMMAND_ARGS = [
 ] as const;
 const DANGEROUS_COMMAND_ARG = "--dangerously-skip-permissions";
 const AGY_GRANTED_TRANSPORT = Symbol("agy-granted-transport");
+const AGY_DEADLINE = Symbol("agy-deadline");
+
+interface AgyDeadline {
+    expiresAt: number;
+    signal: AbortSignal;
+    reason: "abort" | "timeout" | null;
+    expireIfNeeded(): void;
+    dispose(): void;
+}
+
+interface AgyTrace {
+    phase: NonNullable<AgyExecResult["phase"]>;
+    admissionStartedAt: number | null;
+    admissionWaitMs: number;
+    executionStartedAt: number | null;
+}
 
 type AgyInternalInvocationOptions = AgyInvocationOptions & {
     [AGY_GRANTED_TRANSPORT]?: true;
+    [AGY_DEADLINE]?: AgyDeadline;
 };
+
+function createAgyDeadline(options: AgyInvocationOptions): AgyDeadline {
+    const controller = new AbortController();
+    const timeoutMs = resolveTimeoutMs(options);
+    const expiresAt = performance.now() + timeoutMs;
+    let reason: AgyDeadline["reason"] = null;
+    const stop = (cause: "abort" | "timeout") => {
+        if (reason) return;
+        reason = cause;
+        controller.abort();
+    };
+    const onAbort = () => stop("abort");
+    if (options.signal?.aborted) onAbort();
+    else options.signal?.addEventListener("abort", onAbort, { once: true });
+    const timer = reason ? null : setTimeout(() => stop("timeout"), timeoutMs);
+    return {
+        expiresAt,
+        signal: controller.signal,
+        get reason() { return reason; },
+        expireIfNeeded() {
+            if (!reason && performance.now() >= expiresAt) stop("timeout");
+        },
+        dispose() {
+            if (timer) clearTimeout(timer);
+            options.signal?.removeEventListener("abort", onAbort);
+        },
+    };
+}
+
+function deadlineResult(deadline: AgyDeadline, model: AgyModel, startedAt: number): AgyExecResult {
+    return deadline.reason === "abort"
+        ? terminationResult("abort", model, startedAt, false, "", "", null, null)
+        : timeoutBeforeFallback(model, startedAt);
+}
 
 function isGrantedTransportExecution(options: AgyInvocationOptions): boolean {
     return (options as AgyInternalInvocationOptions)[AGY_GRANTED_TRANSPORT] === true;
@@ -137,7 +193,7 @@ function resolveTermGraceMs(): number {
 
 export function getAgyTerminationPolicy(platform: NodeJS.Platform = process.platform): AgyTerminationPolicy {
     return platform === "win32"
-        ? { strategy: "windows_taskkill", timeoutMs: resolveKillTimeoutMs() }
+        ? { strategy: "windows_job_object", timeoutMs: resolveKillTimeoutMs() }
         : { strategy: "posix_process_group", termSignal: "SIGTERM", killSignal: "SIGKILL", graceMs: resolveTermGraceMs() };
 }
 
@@ -379,39 +435,7 @@ async function terminateProcessTree(pid: number | undefined): Promise<void> {
         signalPosixProcessTree(pid, policy.killSignal);
         return;
     }
-    await new Promise<void>(resolve => {
-        let settled = false;
-        let timer: NodeJS.Timeout | undefined;
-        const finish = () => {
-            if (settled) return;
-            settled = true;
-            if (timer) clearTimeout(timer);
-            resolve();
-        };
-        let killer;
-        try {
-            killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-                stdio: ["ignore", "ignore", "ignore"],
-                windowsHide: true,
-                shell: false,
-            });
-        } catch {
-            finish();
-            return;
-        }
-        timer = setTimeout(() => {
-            try {
-                killer.kill();
-            } catch {
-                finish();
-                return;
-            }
-            finish();
-        }, policy.timeoutMs);
-        timer.unref?.();
-        killer.once("error", finish);
-        killer.once("close", finish);
-    });
+    throw new Error("Windows model process requires its Job Object cleanup handle");
 }
 
 function isFallbackEligible(result: AgyExecResult): boolean {
@@ -433,6 +457,8 @@ function toAttempt(result: AgyExecResult): AgyAttempt {
         ...(result.timedOut ? { timedOut: true } : {}),
         ...(result.cancelled ? { cancelled: true } : {}),
         ...(result.truncated ? { truncated: true } : {}),
+        ...(result.phase ? { phase: result.phase } : {}),
+        ...(result.timing ? { timing: result.timing } : {}),
     };
 }
 
@@ -455,11 +481,42 @@ export async function callAgyModel(
     model: AgyModel,
     options: AgyInvocationOptions = {},
 ): Promise<AgyExecResult> {
-    try {
     const startedAt = Date.now();
-    if (options.signal?.aborted) {
-        return terminationResult("abort", model, startedAt, false, "", "", null, null);
+    const timingStartedAt = performance.now();
+    const existingDeadline = (options as AgyInternalInvocationOptions)[AGY_DEADLINE];
+    const deadline = existingDeadline || createAgyDeadline(options);
+    const trace: AgyTrace = { phase: "validation", admissionStartedAt: null, admissionWaitMs: 0, executionStartedAt: null };
+    try {
+        const result = await executeAgyModel(prompt, model, options, startedAt, deadline, trace);
+        const completedAt = performance.now();
+        const totalMs = Math.max(0, Math.round(completedAt - timingStartedAt));
+        const admissionWaitMs = trace.admissionWaitMs || (trace.admissionStartedAt === null ? 0 : Math.max(0, completedAt - trace.admissionStartedAt));
+        return {
+            ...result,
+            elapsedMs: totalMs,
+            phase: trace.phase,
+            timing: {
+                totalMs,
+                admissionWaitMs,
+                executionMs: trace.executionStartedAt === null ? 0 : Math.max(0, completedAt - trace.executionStartedAt),
+            },
+        };
+    } finally {
+        if (!existingDeadline) deadline.dispose();
+        await cancelUnusedProviderLease(options.providerLease);
     }
+}
+
+async function executeAgyModel(
+    prompt: string,
+    model: AgyModel,
+    options: AgyInvocationOptions,
+    startedAt: number,
+    deadline: AgyDeadline,
+    trace: AgyTrace,
+): Promise<AgyExecResult> {
+    deadline.expireIfNeeded();
+    if (deadline.signal.aborted) return deadlineResult(deadline, model, startedAt);
     const maxOutputBytes = resolveMaxOutputBytes(options);
     const command = resolveCommand(options);
     const commandArgs = options.commandArgs || [];
@@ -470,21 +527,38 @@ export async function callAgyModel(
         "--model", model,
     ];
     const inputError = validateAgyInvocation(command, commandArgs, args, prompt);
+    deadline.expireIfNeeded();
+    if (deadline.signal.aborted) return deadlineResult(deadline, model, startedAt);
     if (inputError) return invalidInputResult(model, startedAt, inputError);
     const stdoutCapture = createCapture();
     const stderrCapture = createCapture();
     const outputBudget = createOutputBudget(maxOutputBytes);
-    const timeoutMs = resolveTimeoutMs(options);
-
     try {
-        const executeAgy = () => {
-                if (options.signal?.aborted) {
-                    return Promise.resolve(terminationResult("abort", model, startedAt, false, "", "", null, null));
+        const executeAgy = async () => {
+                if (trace.admissionStartedAt !== null) trace.admissionWaitMs += Math.max(0, performance.now() - trace.admissionStartedAt);
+                trace.admissionStartedAt = null;
+                deadline.expireIfNeeded();
+                if (deadline.signal.aborted) {
+                    return Promise.resolve(deadlineResult(deadline, model, startedAt));
+                }
+                trace.phase = "execution";
+                trace.executionStartedAt = performance.now();
+                let windowsJob: WindowsJobProcess | undefined;
+                if (process.platform === "win32") {
+                    try {
+                        windowsJob = await spawnWindowsJobProcess(command, args, { cwd: options.cwd || process.cwd(), env: options.env || process.env, signal: deadline.signal, deadlineAt: Date.now() + Math.max(0, deadline.expiresAt - performance.now()) });
+                        windowsJob.stdin.end();
+                    } catch (error) {
+                        deadline.expireIfNeeded();
+                        const launchMayHaveStarted = Boolean((error as { launchMayHaveStarted?: boolean })?.launchMayHaveStarted);
+                        if (deadline.signal.aborted) return { ...deadlineResult(deadline, model, startedAt), launched: launchMayHaveStarted, ...(launchMayHaveStarted ? { failureClass: "UnknownOutcome" as const } : {}) };
+                        return { text: null, model, elapsedMs: Math.max(0, Date.now() - startedAt), launched: launchMayHaveStarted, stdout: "", stderr: "", error: `agy CLI 受控启动失败: ${errorMessage(error)}`, failureClass: launchMayHaveStarted ? "UnknownOutcome" as const : classifySpawnError(error) };
+                    }
                 }
                 return new Promise<AgyExecResult>(resolve => {
         let child;
         try {
-            child = spawn(command, args, {
+            child = windowsJob ? undefined : spawn(command, args, {
                 cwd: options.cwd || process.cwd(),
                 env: options.env || process.env,
                 detached: process.platform !== "win32",
@@ -506,7 +580,7 @@ export async function callAgyModel(
             return;
         }
 
-        let launched = false;
+        let launched = Boolean(windowsJob);
         let settled = false;
         let closeCode: number | null = null;
         let closeSignal: NodeJS.Signals | null = null;
@@ -515,8 +589,7 @@ export async function callAgyModel(
         let terminationPromise: Promise<void> | null = null;
 
         const cleanup = () => {
-            clearTimeout(timeoutTimer);
-            options.signal?.removeEventListener("abort", onAbort);
+            deadline.signal.removeEventListener("abort", onAbort);
         };
         const finish = (result: AgyExecResult) => {
             if (settled) return;
@@ -539,34 +612,36 @@ export async function callAgyModel(
                 closeSignal,
             ));
         };
+        const finishCleanupFailure = (error: unknown) => {
+            const output = currentOutput();
+            finish({ text: null, model, elapsedMs: Math.max(0, Date.now() - startedAt), launched, stdout: output.stdout, stderr: output.stderr, error: `agy CLI 进程结束状态异常: ${errorMessage(error)}`, failureClass: "UnknownOutcome", ...(terminationReason === "timeout" ? { timedOut: true } : terminationReason === "abort" ? { cancelled: true } : {}) });
+        };
         const requestTermination = (reason: TerminationReason) => {
             if (terminationReason || settled) return;
             terminationReason = reason;
-            terminationPromise = terminateProcessTree(child.pid);
-            void terminationPromise.finally(finishTermination);
+            terminationPromise = windowsJob ? windowsJob.terminate().then(() => {}) : terminateProcessTree(child?.pid);
+            void terminationPromise.then(finishTermination, finishCleanupFailure);
         };
-        const onAbort = () => requestTermination("abort");
-        const timeoutTimer = setTimeout(() => requestTermination("timeout"), timeoutMs);
-        timeoutTimer.unref?.();
+        const onAbort = () => requestTermination(deadline.reason === "timeout" ? "timeout" : "abort");
+        deadline.signal.addEventListener("abort", onAbort, { once: true });
+        if (deadline.signal.aborted) onAbort();
 
-        if (options.signal) options.signal.addEventListener("abort", onAbort, { once: true });
-
-        child.once("spawn", () => {
+        child?.once("spawn", () => {
             launched = true;
         });
-        child.stdout.on("data", chunk => {
+        (windowsJob?.stdout ?? child!.stdout).on("data", chunk => {
             if (appendCapture(stdoutCapture, outputBudget, chunk)) requestTermination("output_limit");
         });
-        child.stderr.on("data", chunk => {
+        (windowsJob?.stderr ?? child!.stderr).on("data", chunk => {
             if (appendCapture(stderrCapture, outputBudget, chunk)) requestTermination("output_limit");
         });
-        child.stdout.on("error", error => {
+        (windowsJob?.stdout ?? child!.stdout).on("error", error => {
             streamError = errorMessage(error);
         });
-        child.stderr.on("error", error => {
+        (windowsJob?.stderr ?? child!.stderr).on("error", error => {
             streamError = errorMessage(error);
         });
-        child.once("error", error => {
+        child?.once("error", error => {
             if (terminationReason) return;
             const output = currentOutput();
             finish({
@@ -580,11 +655,11 @@ export async function callAgyModel(
                 failureClass: classifySpawnError(error),
             });
         });
-        child.once("close", (code, signal) => {
+        const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
             closeCode = code;
             closeSignal = signal;
             if (terminationReason) {
-                if (terminationPromise) void terminationPromise.finally(finishTermination);
+                if (terminationPromise) void terminationPromise.then(finishTermination, finishCleanupFailure);
                 return;
             }
             const output = currentOutput();
@@ -651,18 +726,22 @@ export async function callAgyModel(
                 exitCode: code,
                 signal,
             });
-        });
+        };
+        if (windowsJob) void windowsJob.completion.then(result => onClose(result.exitCode, null), finishCleanupFailure);
+        else child!.once("close", onClose);
                 });
         };
         if (isGrantedTransportExecution(options)) return await executeAgy();
         const adapter = getProviderTransportAdapter();
+        trace.phase = "admission";
+        trace.admissionStartedAt = performance.now();
         return await (options.providerLease
             ? adapter.executeGranted(options.providerLease, executeAgy, classifyAgyTransportResult)
             : adapter.execute(
                 "agy",
                 {
                     trafficClass: mapProviderTrafficClass(options.trafficClass),
-                    signal: options.signal,
+                    signal: deadline.signal,
                     probe: options.probe,
                     attemptId: options.attemptId,
                 },
@@ -671,12 +750,10 @@ export async function callAgyModel(
             ));
     } catch (error) {
         if (error instanceof ProviderAdmissionCancelledError) {
-            return terminationResult("abort", model, startedAt, false, "", "", null, null);
+            deadline.expireIfNeeded();
+            return deadlineResult(deadline, model, startedAt);
         }
         throw error;
-    }
-    } finally {
-        await cancelUnusedProviderLease(options.providerLease);
     }
 }
 
@@ -684,38 +761,54 @@ export async function callAgyWithFallback(
     prompt: string,
     options: AgyInvocationOptions = {},
 ): Promise<AgyFallbackResult> {
+    const timingStartedAt = performance.now();
+    const deadline = createAgyDeadline(options);
+    const scopedOptions: AgyInternalInvocationOptions = { ...options, [AGY_DEADLINE]: deadline };
     try {
-    if (options.providerLease) {
-        const grantedOptions: AgyInternalInvocationOptions = {
-            ...options,
-            providerLease: undefined,
-            [AGY_GRANTED_TRANSPORT]: true,
+        let result: AgyFallbackResult;
+        if (options.providerLease) {
+            const grantedOptions: AgyInternalInvocationOptions = {
+                ...scopedOptions,
+                providerLease: undefined,
+                [AGY_GRANTED_TRANSPORT]: true,
+            };
+            result = await getProviderTransportAdapter().executeGranted(
+                options.providerLease,
+                () => callAgyFallbackSequence(prompt, grantedOptions, deadline),
+                value => classifyAgyTransportResult(value),
+            );
+        } else {
+            result = await callAgyFallbackSequence(prompt, scopedOptions, deadline);
+        }
+        const totalMs = Math.max(0, Math.round(performance.now() - timingStartedAt));
+        return {
+            ...result,
+            elapsedMs: totalMs,
+            timing: {
+                totalMs,
+                admissionWaitMs: result.attempts.reduce((sum, attempt) => sum + (attempt.timing?.admissionWaitMs || 0), 0),
+                executionMs: result.attempts.reduce((sum, attempt) => sum + (attempt.timing?.executionMs || 0), 0),
+            },
         };
-        return await getProviderTransportAdapter().executeGranted(
-            options.providerLease,
-            () => callAgyFallbackSequence(prompt, grantedOptions),
-            result => classifyAgyTransportResult(result),
-        );
-    }
-    return await callAgyFallbackSequence(prompt, options);
     } finally {
+        deadline.dispose();
         await cancelUnusedProviderLease(options.providerLease);
     }
 }
 
 async function callAgyFallbackSequence(
     prompt: string,
-    options: AgyInvocationOptions,
+    options: AgyInternalInvocationOptions,
+    deadline: AgyDeadline,
 ): Promise<AgyFallbackResult> {
     const startedAt = Date.now();
-    const timeoutMs = resolveTimeoutMs(options);
     const attempts: AgyAttempt[] = [];
     let latest: AgyExecResult | null = null;
     for (const model of AGY_MODEL_SEQUENCE) {
-        const remainingMs = timeoutMs - (Date.now() - startedAt);
-        const result = remainingMs > 0
-            ? await callAgyModel(prompt, model, { ...options, timeoutMs: remainingMs })
-            : timeoutBeforeFallback(model, startedAt);
+        deadline.expireIfNeeded();
+        const result = deadline.signal.aborted
+            ? { ...deadlineResult(deadline, model, startedAt), phase: "fallback" as const }
+            : await callAgyModel(prompt, model, options);
         attempts.push(toAttempt(result));
         latest = result;
         if (result.text !== null || !isFallbackEligible(result)) {

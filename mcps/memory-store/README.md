@@ -1,4 +1,12 @@
-# MCP Memory Store v1.25.4
+# MCP Memory Store v1.25.5
+
+Codex 继承历史按记录自身的显式 `ordinal` 校验，允许严格递增的跳号，不再把物理行数误当全局序号；旧记录仍按原有计数读取。每段选定前缀使用完整 SHA256 内容身份，首行继承信息、边界与实际解析字节须来自同一内容，等长改写或首行/正文混合捕获不能发布新缓存。缺少强内容身份的旧缓存经 `auto/local` 成功完整重建后升级，失败保留旧代并报告 stale 或明确拒绝当前读取，`source=cache` 仍为离线读取。物理事件步数、轮次和序号分开，不将坏 JSON、混用序号或倒退伪装成合法跳号。
+
+Guard 输入预算支持合法的上下调，必需模板超预算时在模型调用前报错；输出预留只是提示词预算说明，不代表供应方硬输出 token 上限。Claude Code 的 stdout/stderr 限制按 UTF-8 字节计数，跨数据块字符保持完整，超限返回明确失败而不是截断成功。模型桥从调用入口计算总期限，AGY 的可用性预检、接纳排队与内部候选共用剩余时间，到期不再启动后续模型；确定的快速失败仍可按既有顺序回退，执行结果未知时不自动重复付费调用。Guard 后台状态记录定位、证据、模型与解析阶段，便于区分等待与执行。供应方本身的上下文或输出限制仍然有效。
+
+Windows 下 AGY、其 `--help` 预检及 Claude Code 执行通过专用 Job Object 启动，进程恢复运行前就加入受控范围，取消或结束时确认成员清空。父进程先退出但仍有后代时，即使已有输出也返回不完整失败，不当成成功答案。原生启动器源码随包提供，首次使用借助系统 .NET Framework C# 编译器在临时目录建立校验缓存；编译或清理无法验证时明确失败，不降级成不受控启动，不自动安装系统组件。首次编译也计入调用期限，POSIX 保留进程组清理。
+
+部署前应在服务账号与相同临时目录中预编译、校验并试运行启动器。首次编译若崩溃遗留该版本的 `.lock`，调用会失败关闭；不要按文件年龄自动抢锁，应先协调停止该版本的编译请求，核实没有相关编译进程，再仅隔离对应锁并重新校验。已校验的有效缓存不受残留编译锁影响。LS 旧接口尚不支持外部取消信号，取消返回可能等到已有请求期限，不保证远端模型已停止；任何结果未知的请求均不自动追加模型调用。
 
 Codex 摘要、对话展示、搜索上下文以及 Guard/Record 的相关提示词截断按完整 Unicode 码点处理，避免将 emoji 或扩展汉字截成孤立代理码元，导致严格 JSON 接收端拒绝请求。旧工具摘要已经含不完整码元时，展示优先从缓存保留的完整字段安全重建；没有可用完整字段则显示明确的码元转义提示，不重写缓存或原文。保留现有省略提示和长度预算，不宣称保留完整字素簇或修复损坏的原始数据。
 
@@ -86,7 +94,7 @@ Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库�
 - **Claude Code 逻辑续聊链与 Record 防缩水** (v1.15.14+)：`conversation_read_original(fetch/read/search/export, dataChain="claude-code")` 新增 `logicalChain="off|explain|auto|strict"`；默认 `off` 仍只读指定物理 JSONL，`explain` 只展示同工作区前序候选，`auto/strict` 仅在明确引用 ID/标题、压缩摘要或首尾内容重叠等强证据成立且无“从 0 开始/不要继承”信号时合并。`record_manage(update, dataChain="claude-code")` 默认用 `logicalChain="auto"`，但不会按标题语义强行合并。`force=true` 改为安全刷新：可解析旧 Record 时保留稳定 Phase、回滚尾部并走 RecordPatch + 本地合成，避免超长 Record 被整篇重生成压缩缩水；确需旧式全量重建可设置 `MEMORY_STORE_RECORD_FORCE_FULL_REBUILD=1`。最终写入门禁会容忍旧 Record 已存在且完全一致的稳定区 Phase 范围重叠，但仍拒绝新生成部分新增的重叠或倒退。
 - **Record stale_check 与后台任务分层** (v1.17.3+ / v1.20+)：`record_manage(stale_check)` 用于检查 Record 是否落后于源对话，未在近期列表中找到的对话会标记为跳过而非确定丢失；`record_manage(update)` 与 `batch_update/bulk_update` 分别进入至少 8 槽的专用 materialization lane，模型并发仍只由持久 scheduler 与 provider admission 决定。Golden Extract、deep locate、批量导出等普通后台任务继续使用默认 2 槽 FIFO；`stage_guard(check)` 默认同步，仅在显式 `background=true` 时返回后台任务。
 - **Grok/progrok 模型链路** (v1.18.0+)：`chain="grok"` 作为 `modelChain="grok"` 的兼容写法，`dataChain` 仍保持 `auto`；`modelChain="auto"` 优先探测本机 progrok proxy，成功时 Record、Stage Guard、smart search 等模型任务会按场景使用 Grok 模型，失败时继续按既有链路 fallback。Record prompt 预算、输出 token 上限、checkpoint/cache key 与报告输出会携带实际链路、实际模型和 `grokContext`，避免 `auto→grok` 与 fallback 结果串用；`finish_reason="length"` 会按截断失败处理并触发 fallback。
-- **agy CLI 模型链路** (v1.20.0+)：`chain="agy"` 是 `modelChain="agy"` 的兼容写法，`agy` 永远不是 `dataChain`。显式 `modelChain="agy"` 只会调用本地 agy CLI 内置顺序「Gemini 3.5 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」，失败不会跨到 Antigravity、Codex 或 Claude Code。`auto` 仅在设置 `MEMORY_STORE_AGY_AUTO_ENABLED=1` 时于 Grok 后尝试 agy；默认关闭以保持兼容路由。
+- **agy CLI 模型链路** (v1.20.0+)：`chain="agy"` 是 `modelChain="agy"` 的兼容写法，`agy` 永远不是 `dataChain`。显式 `modelChain="agy"` 只会调用本地 agy CLI 内置顺序「Gemini 3.8 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」，失败不会跨到 Antigravity、Codex 或 Claude Code。`auto` 仅在设置 `MEMORY_STORE_AGY_AUTO_ENABLED=1` 时于 Grok 后尝试 agy；默认关闭以保持兼容路由。
 - **Record 生产 provider 接线、调度 pump 与 unknown-chain 迁移** (v1.20.0+)：Grok、agy 与模型桥已接入统一的 provider transport，前台与 Record 分别携带对应流量类别申请物理许可；Record 更新由 production pump 和持久 coordinator 驱动，并保留恢复时的 claim/lease 处理。历史 `chain=unknown` 回填会对四宿主做完整证据核验，只有唯一匹配才生成带 CAS 前置条件的补丁，证据不完整或多宿主命中会保留为 `Unresolved` / `Conflict`，不会猜测性改写。
 - **离线测试与公开包边界** (v1.20.0+)：默认 `npm test` 会执行 scheduler、source evidence、materialization/recovery、unit、commit 与 provider 的离线契约测试；npm 发布仅包含编译后的运行时代码、类型声明和公开说明文件，不会携带源码、测试、计划、工作资料或 source map。
 - **持久恢复与来源证据边界** (v1.20.0+)：hard-exit 矩阵沿真实 runtime → production pump → provider → immutable spool → commit 路径注入进程退出，并只依赖同一 data root 恢复；`UnknownOutcome` 在宽限期内禁止重发，到期后最多消费一次预算并取得新的权威 fence，第二次仍不确定则终止。若 provider 不支持幂等键或结果状态查询，远端执行不能保证 exactly-once，系统只保证本地发布与索引提交不会重复生效，并明确保留可能重复调用的审计状态。四宿主附件只有具备可验证内容 SHA-256 时才进入冻结快照，data URL / base64 / 本地路径原文不会写入 Record payload；Codex SQLite 的 `rollout_path` 同时执行词法根目录与真实路径约束。缺少 identity sidecar 的旧 Record 正文仍可在持久锁和正文哈希匹配时安全刷新，提交协议会保存可条件恢复的 legacy before-image，而不会猜造历史所有权。

@@ -12,6 +12,7 @@ interface FakeAgyEvent {
     model: string;
     prompt: string;
     startedAt: number;
+    pid: number;
 }
 
 function fakeOptions(mode: string, extraEnv: NodeJS.ProcessEnv = {}) {
@@ -178,6 +179,19 @@ async function main(): Promise<void> {
         assert.deepEqual(fallback.attempts.map(attempt => attempt.model), AGY_MODEL_SEQUENCE.slice(0, 2));
         assert.deepEqual(newEvents().map(event => event.model), AGY_MODEL_SEQUENCE.slice(0, 2));
 
+        const sharedDeadline = await callAgyWithFallback("shared deadline", {
+            ...fakeOptions("fallback-budget", { FAKE_AGY_FIRST_DELAY_MS: "400", FAKE_AGY_SECOND_DELAY_MS: "950" }),
+            timeoutMs: 1_200,
+        });
+        assert.equal(sharedDeadline.timedOut, true);
+        assert.equal(sharedDeadline.cancelled, undefined);
+        assert.equal(sharedDeadline.attempts.length, 2);
+        assert.equal(sharedDeadline.attempts[0]?.exitCode, 29);
+        assert.equal(sharedDeadline.attempts[1]?.timedOut, true);
+        assert.equal(sharedDeadline.attempts[1]?.phase, "execution");
+        assert.equal(sharedDeadline.elapsedMs, sharedDeadline.timing?.totalMs);
+        assert.deepEqual(newEvents().map(event => event.model), AGY_MODEL_SEQUENCE.slice(0, 2));
+
         const exhausted = await callAgyWithFallback("all models fail", fakeOptions("fail-all"));
         assert.equal(exhausted.text, null);
         assert.equal(exhausted.model, AGY_MODEL_SEQUENCE[2]);
@@ -232,13 +246,63 @@ async function main(): Promise<void> {
         assert.equal(timeout.failureClass, "UnknownOutcome");
         newEvents();
 
+        const pipeDescendantPidPath = path.join(temporaryRoot, "pipe-descendant.pid");
+        const pipeTreeTimeout = await callAgyModel("pipe tree timeout", AGY_MODEL_SEQUENCE[0], {
+            ...fakeOptions("pipe-tree", { FAKE_AGY_DESCENDANT_PID: pipeDescendantPidPath }),
+            timeoutMs: 800,
+        });
+        assert.equal(pipeTreeTimeout.timedOut, true);
+        assert.equal(pipeTreeTimeout.phase, "execution");
+        assert.equal(fs.existsSync(pipeDescendantPidPath), true);
+        const pipeTreeParent = newEvents()[0];
+        const pipeTreeDescendantPid = Number(fs.readFileSync(pipeDescendantPidPath, "utf8"));
+        if (process.platform === "win32") assert.equal(isProcessAlive(pipeTreeDescendantPid), false, "timeout response must follow confirmed job cleanup");
+        assert.equal(await waitForProcessExit(pipeTreeParent.pid, 2_000), true, "timed-out parent must exit");
+        assert.equal(await waitForProcessExit(pipeTreeDescendantPid, 2_000), true, "timed-out pipe-holding descendant must exit");
+
+        const abortedDescendantPidPath = path.join(temporaryRoot, "aborted-pipe-descendant.pid");
+        const pipeTreeController = new AbortController();
+        const pipeTreeAbortPromise = callAgyModel("pipe tree abort", AGY_MODEL_SEQUENCE[0], {
+            ...fakeOptions("pipe-tree", { FAKE_AGY_DESCENDANT_PID: abortedDescendantPidPath }),
+            timeoutMs: 3_000,
+            signal: pipeTreeController.signal,
+        });
+        const abortWaitUntil = Date.now() + 2_000;
+        while (!fs.existsSync(abortedDescendantPidPath) && Date.now() < abortWaitUntil) {
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        pipeTreeController.abort();
+        const pipeTreeAbort = await pipeTreeAbortPromise;
+        assert.equal(fs.existsSync(abortedDescendantPidPath), true);
+        assert.equal(pipeTreeAbort.cancelled, true);
+        assert.equal(pipeTreeAbort.timedOut, undefined);
+        const abortedPipeParent = newEvents()[0];
+        const abortedPipeDescendantPid = Number(fs.readFileSync(abortedDescendantPidPath, "utf8"));
+        if (process.platform === "win32") assert.equal(isProcessAlive(abortedPipeDescendantPid), false, "cancel response must follow confirmed job cleanup");
+        assert.equal(await waitForProcessExit(abortedPipeParent.pid, 2_000), true, "cancelled parent must exit");
+        assert.equal(await waitForProcessExit(abortedPipeDescendantPid, 2_000), true, "cancelled pipe-holding descendant must exit");
+
+        if (process.platform === "win32") {
+            const orphanPidPath = path.join(temporaryRoot, "orphan-pipe.pid");
+            const orphan = await callAgyWithFallback("orphan pipe", { ...fakeOptions("orphan-pipe", { FAKE_AGY_DESCENDANT_PID: orphanPidPath }), timeoutMs: 2000 });
+            assert.equal(orphan.text, null, "partial output before parent exits is not success");
+            assert.equal(orphan.failureClass, "UnknownOutcome");
+            assert.equal(orphan.attempts.length, 1, "unknown parent/descendant completion must not cause another paid call");
+            assert.equal(newEvents().length, 1);
+            assert.equal(isProcessAlive(Number(fs.readFileSync(orphanPidPath, "utf8"))), false, "orphan must be gone before returning");
+        }
+
         const controller = new AbortController();
+        const callsBeforeAbort = readEvents().length;
         const abortedPromise = callAgyModel("abort", AGY_MODEL_SEQUENCE[0], {
             ...fakeOptions("delay", { FAKE_AGY_DELAY_MS: "5000" }),
             timeoutMs: 2_000,
             signal: controller.signal,
         });
-        setTimeout(() => controller.abort(), 40).unref?.();
+        const abortStartedDeadline = Date.now() + 1500;
+        while (readEvents().length === callsBeforeAbort && Date.now() < abortStartedDeadline) await new Promise(resolve => setTimeout(resolve, 10));
+        assert.ok(readEvents().length > callsBeforeAbort, "execution cancellation must wait for the CLI to start");
+        controller.abort();
         const aborted = await abortedPromise;
         assert.equal(aborted.text, null);
         assert.equal(aborted.cancelled, true);

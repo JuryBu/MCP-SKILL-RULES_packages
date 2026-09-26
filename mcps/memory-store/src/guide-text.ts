@@ -105,7 +105,7 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - modelChain 不支持 windsurf/wsf，dataChain 不支持 grok 或 agy；Windsurf 只提供对话数据，Grok 与 agy 都只提供模型调用链路
 - memory_query、memory_batch(query)、memory_write、memory_update、memory_stats(action="enhance") 也支持 modelChain；旧 chain 继续作为模型链路兼容别名
 - "chain=\"auto\"" 优先当前宿主链路；模型调用按 Grok →（仅 MEMORY_STORE_AGY_AUTO_ENABLED=1 时）agy → Antigravity → Codex → 可选 Claude Code CLI 探测
-- 显式指定 "modelChain=\"grok\""、"modelChain=\"agy\"" 或对应旧 chain 时只使用该模型链路，不可用直接报错；agy 内部仅按「Gemini 3.5 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」fallback，不会跨到其它宿主模型链路；显式指定 "chain=\"antigravity\""、"chain=\"codex\"" 或 "chain=\"claude-code\"" 时同样不静默回退
+- 显式指定 "modelChain=\"grok\""、"modelChain=\"agy\"" 或对应旧 chain 时只使用该模型链路，不可用直接报错；agy 内部仅按「Gemini 3.8 Flash (High) → Flash (Medium) → Gemini 3.1 Pro (Low)」fallback，不会跨到其它宿主模型链路；显式指定 "chain=\"antigravity\""、"chain=\"codex\"" 或 "chain=\"claude-code\"" 时同样不静默回退
 - Antigravity 链路通过 Language Server 本地 API 获取解密数据，无需手动解密 .pb 文件
 - Codex 链路通过本地线程索引与原始事件流重建轮次
 - Codex 附件懒解析(v1.12.2): fetch 只返回附件统计；read/search 只对实际输出轮次按需处理图片和文件路径。local_images 本地路径优先；仅当图片只存在于 JSONL 的 data:image base64 时，才并行限流写入 memory-store/temp/codex-attachments/<conversationId>/round-xxxxxx/sha256-*.png。普通 PDF/DOCX/Markdown 文件从 Files mentioned 文本块解析路径并标注存在性，不读取正文。可用 MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_LIMIT / MEMORY_STORE_CODEX_ATTACHMENT_MATERIALIZE_CONCURRENCY / MEMORY_STORE_CODEX_ATTACHMENT_MAX_BYTES / MEMORY_STORE_CODEX_ATTACHMENT_MAX_TOTAL_BYTES 控制数量、并发、单图大小和单次总解码量。

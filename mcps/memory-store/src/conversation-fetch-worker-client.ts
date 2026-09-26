@@ -2,7 +2,7 @@ import { fork } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertCodexSourceVersionSync, captureCodexSourceVersion, getCodexThread } from "./codex-client.js";
+import { assertCodexSourceVersion, captureCodexSourceVersion, captureCodexSourceVersionAsync, getCodexThread } from "./codex-client.js";
 import { stableJsonHash, type BackgroundTaskContext } from "./background-tasks.js";
 import type { Chain } from "./chain.js";
 import type { CodexHistorySource } from "./codex-history-source.js";
@@ -39,6 +39,18 @@ export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEs
             thresholdBytes,
             shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes,
         };
+    } catch {
+        return null;
+    }
+}
+
+export async function estimateCodexFetchWorkAsync(conversationId: string): Promise<CodexFetchWorkEstimate | null> {
+    const thread = getCodexThread(conversationId);
+    if (!thread?.rolloutPath) return null;
+    try {
+        const sourceVersion = await captureCodexSourceVersionAsync(thread.rolloutPath);
+        const thresholdBytes = readThreshold();
+        return { ...sourceVersion, thresholdBytes, shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes };
     } catch {
         return null;
     }
@@ -84,7 +96,7 @@ export interface CodexFetchWorkerRunOptions {
     cancelGraceMs?: number;
 }
 
-export function runCodexFetchWorker(
+export async function runCodexFetchWorker(
     payload: CodexFetchWorkerPayload,
     taskContext: Pick<BackgroundTaskContext, "updateProgress" | "isCancelled" | "isSettled">,
     options: CodexFetchWorkerRunOptions = {},
@@ -95,7 +107,7 @@ export function runCodexFetchWorker(
             : "conversation fetch worker stopped before start after task settlement"));
     }
     try {
-        assertCodexSourceVersionSync(payload.sourcePath, payload, "before worker start");
+        await assertCodexSourceVersion(payload.sourcePath, payload, "before worker start", () => taskContext.isCancelled() || taskContext.isSettled());
     } catch (error) {
         return Promise.reject(error instanceof Error ? error : new Error(String(error)));
     }

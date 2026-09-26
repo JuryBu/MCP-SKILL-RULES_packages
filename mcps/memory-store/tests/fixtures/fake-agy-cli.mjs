@@ -2,6 +2,8 @@ import fs from "node:fs";
 import { spawn } from "node:child_process";
 
 const DESCENDANT_MODE = "__agy_ignore_term_descendant__";
+const PIPE_DESCENDANT_MODE = "__agy_pipe_descendant__";
+const ORPHAN_DESCENDANT_MODE = "__agy_orphan_descendant__";
 
 const args = process.argv.slice(2);
 const modelIndex = args.indexOf("--model");
@@ -13,7 +15,7 @@ const prompt = promptIndex >= 0 ? args[promptIndex + 1] || "" : "";
 
 function writeLog() {
     if (!process.env.FAKE_AGY_LOG) return;
-    fs.appendFileSync(process.env.FAKE_AGY_LOG, `${JSON.stringify({ args, model, prompt, startedAt: Date.now() })}\n`, "utf8");
+    fs.appendFileSync(process.env.FAKE_AGY_LOG, `${JSON.stringify({ args, model, prompt, startedAt: Date.now(), pid: process.pid })}\n`, "utf8");
 }
 
 function succeed() {
@@ -31,6 +33,10 @@ function keepAliveIgnoringTerm() {
     setInterval(() => {}, 1000);
 }
 
+function keepPipeOpen() {
+    setInterval(() => process.stdout.write("."), 50);
+}
+
 function main() {
     writeLog();
     if (promptIndex < 0) {
@@ -38,8 +44,13 @@ function main() {
         return;
     }
     if (mode === "fallback") {
-        if (model === "Gemini 3.5 Flash (High)") fail("rate limit", 29, "partial high output");
+        if (model === "Gemini 3.8 Flash (High)") fail("rate limit", 29, "partial high output");
         else succeed();
+        return;
+    }
+    if (mode === "fallback-budget") {
+        if (model === "Gemini 3.8 Flash (High)") setTimeout(() => fail("rate limit", 29), Number(process.env.FAKE_AGY_FIRST_DELAY_MS || 250));
+        else setTimeout(succeed, Number(process.env.FAKE_AGY_SECOND_DELAY_MS || 2000));
         return;
     }
     if (mode === "fail-all") {
@@ -71,6 +82,24 @@ function main() {
         setInterval(() => {}, 1000);
         return;
     }
+    if (mode === "pipe-tree") {
+        const descendant = spawn(process.execPath, [process.argv[1], PIPE_DESCENDANT_MODE], { stdio: ["ignore", "pipe", "pipe"] });
+        descendant.stdout.pipe(process.stdout);
+        descendant.stderr.pipe(process.stderr);
+        if (process.env.FAKE_AGY_DESCENDANT_PID && descendant.pid) {
+            fs.writeFileSync(process.env.FAKE_AGY_DESCENDANT_PID, String(descendant.pid), "utf8");
+        }
+        setInterval(() => {}, 1000);
+        return;
+    }
+    if (mode === "orphan-pipe") {
+        const descendant = spawn(process.execPath, [process.argv[1], ORPHAN_DESCENDANT_MODE], { stdio: ["ignore", "inherit", "inherit"], detached: true, windowsHide: true });
+        descendant.unref();
+        if (process.env.FAKE_AGY_DESCENDANT_PID && descendant.pid) fs.writeFileSync(process.env.FAKE_AGY_DESCENDANT_PID, String(descendant.pid), "utf8");
+        process.stdout.write("incomplete response");
+        setTimeout(() => process.exit(0), 100);
+        return;
+    }
     if (mode === "delay") {
         setTimeout(succeed, delayMs);
         return;
@@ -78,5 +107,8 @@ function main() {
     succeed();
 }
 
-if (process.argv[2] === DESCENDANT_MODE) keepAliveIgnoringTerm();
+if (args.includes("--help")) console.log("fake agy help");
+else if (process.argv[2] === DESCENDANT_MODE) keepAliveIgnoringTerm();
+else if (process.argv[2] === PIPE_DESCENDANT_MODE) keepPipeOpen();
+else if (process.argv[2] === ORPHAN_DESCENDANT_MODE) setTimeout(() => process.exit(0), 6000);
 else main();

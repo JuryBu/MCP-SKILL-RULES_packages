@@ -3,7 +3,7 @@ import { spawn } from 'child_process';
 import { performance } from 'perf_hooks';
 
 const AGY_CMD = process.env.MEMORY_STORE_AGY_COMMAND || 'agy';
-const MODEL = 'Gemini 3.5 Flash (High)';
+const MODEL = 'Gemini 3.8 Flash (High)';
 const PROMPT = 'What is 17 times 23? Answer with just the number.';
 
 function runAgyOnce() {

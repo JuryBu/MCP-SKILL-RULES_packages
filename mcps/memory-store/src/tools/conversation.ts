@@ -77,7 +77,7 @@ import { writeFetchedConversationArtifact, type StreamedFetchArtifact } from "..
 import {
     buildCodexFetchTaskId,
     createCodexFetchWorkerPayload,
-    estimateCodexFetchWork,
+    estimateCodexFetchWorkAsync,
     runCodexFetchWorker,
 } from "../conversation-fetch-worker-client.js";
 import {
@@ -2740,7 +2740,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 if (action === "fetch" && conversationId && source !== "ls") {
                     const resolvedFetchChain = await resolveConversationChain(chains.dataChain);
                     const estimate = resolvedFetchChain === "codex"
-                        ? estimateCodexFetchWork(conversationId)
+                        ? await estimateCodexFetchWorkAsync(conversationId)
                         : null;
                     if (estimate?.shouldBackground && background === false) {
                         return appendTiming({

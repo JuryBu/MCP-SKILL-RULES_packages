@@ -9,7 +9,7 @@ import type { RecordSchedulerProductionRegistration } from "../src/record-schedu
 import type { FrozenRuntimeSourceSet } from "../src/record-scheduler-runtime.ts";
 import type { RecordSchedulerModelCallContext } from "../src/record-types.ts";
 
-const AGY_MODEL = "Gemini 3.5 Flash (High)";
+const AGY_MODEL = "Gemini 3.8 Flash (High)";
 const DEAD_GROK_PROXY_URL = "http://127.0.0.1:9";
 const GROK_MODEL = "grok-4.5";
 const GROK_TIMEOUT_MS = 10_000;

@@ -334,7 +334,7 @@ export async function callGrokExec(
     ): GrokExecResult => {
         recordTransportOutcome(outcome, adaptiveGate);
         const metrics = timeoutKind ? { ...queue, timeoutKind } : queue;
-        const failureClass = failureClassForOutcome(outcome);
+        const failureClass = result.failureClass ?? failureClassForOutcome(outcome);
         return {
             ...result,
             ...(timeoutKind ? { timeoutKind } : {}),
@@ -488,8 +488,10 @@ export async function callGrokExec(
             );
         }
         const message = error instanceof Error ? error.message : String(error);
+        const causeCode = (error as { cause?: { code?: string } })?.cause?.code;
+        const definitelyNotSent = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN"].includes(causeCode || "");
         return finishTransport(
-            { text: null, error: `Grok 模型桥调用失败: ${message}` },
+            { text: null, error: `Grok 模型桥调用失败: ${message}`, ...(fetchStarted && !bodyComplete && !definitelyNotSent ? { failureClass: "UnknownOutcome" as const } : {}) },
             { success: false, errorKind: fetchStarted && (!receivedResponse || !bodyComplete) ? "network" : "unknown" },
         );
     }

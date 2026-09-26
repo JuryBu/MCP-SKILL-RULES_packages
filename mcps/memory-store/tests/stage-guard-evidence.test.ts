@@ -24,8 +24,9 @@ const taskIdFrom = (response: unknown) => responseText(response).match(/taskId:\
 
 guard.__testSetStageGuardConversationIdResolver(async identifier => identifier || null);
 guard.__testSetStageGuardConversationLoader(async () => ({ chainUsed: "codex", conversationId, rounds: [], roundCount: 1, totalSteps: 2 }) as any);
-guard.__testSetStageGuardCheckRunner(async (_state, _appeal, evidence) => {
+guard.__testSetStageGuardCheckRunner(async (_state, _appeal, evidence, options) => {
     observed.push(evidence);
+    options?.onProgress?.("model");
     await checkGate;
     return { passed: false, summary: "Synthetic evidence input inspected", missingItems: [] } as any;
 });
@@ -61,8 +62,11 @@ try {
     backgroundTaskId = taskIdFrom(background);
     assert.ok(backgroundTaskId, responseText(background));
     assert.equal((getBackgroundTask(backgroundTaskId)?.resumePayload as any).evidence, evidence.join("\n"));
+    for (let attempt = 0; attempt < 100 && getBackgroundTask(backgroundTaskId)?.progress?.stage !== "guard:model"; attempt++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.equal(getBackgroundTask(backgroundTaskId)?.progress?.stage, "guard:model");
     const persisted = JSON.parse(fs.readFileSync(path.join(fixtureRoot, "tasks", `${backgroundTaskId}.json`), "utf8"));
     assert.equal(persisted.resumePayload.evidence, evidence.join("\n"));
+    assert.equal(persisted.progress.stage, "guard:model");
     const equivalent = await client.callTool({ name: "stage_guard", arguments: { ...guardOptions, action: "check", evidence: evidence.join("\n"), background: true } });
     assert.equal(taskIdFrom(equivalent), backgroundTaskId);
     releaseCheck();

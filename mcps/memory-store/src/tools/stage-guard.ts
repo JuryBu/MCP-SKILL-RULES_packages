@@ -722,7 +722,7 @@ registerBackgroundTaskRecoveryHandler("stage-guard-check", async (task) => {
 async function handleCheck(
     params: z.infer<typeof StageGuardSchema>,
     backgroundModel = false,
-    taskContext?: Pick<BackgroundTaskContext, "taskId" | "isCancelled" | "isSettled">,
+    taskContext?: Pick<BackgroundTaskContext, "taskId" | "isCancelled" | "isSettled" | "updateProgress">,
     expectedGuard?: GuardState,
 ): Promise<ReturnType<typeof text>> {
     if (params.taskId) {
@@ -800,6 +800,7 @@ async function handleCheck(
         evidenceIndexMode: params.evidenceIndexMode,
         isCancelled: taskContext?.isCancelled,
         isSettled: taskContext?.isSettled,
+        onProgress: stage => taskContext?.updateProgress({ stage: `guard:${stage}`, detail: `Stage Guard ${stage}` }),
     });
     if (result.cancelled || isBackgroundTaskAborted(taskContext)) {
         return formatAbortedGuardCheckText(taskContext);

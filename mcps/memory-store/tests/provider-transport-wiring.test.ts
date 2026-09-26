@@ -105,7 +105,7 @@ if (mode === "fail") {
     process.exit(1);
 }
 if (mode === "hang") {
-    setTimeout(() => console.log("late"), 1_000);
+    setTimeout(() => console.log("late"), Number(process.env.FAKE_AGY_DELAY_MS || 1_000));
 } else {
     console.log("agy:" + model);
 }
@@ -455,15 +455,71 @@ if (mode === "hang") {
         queuedAgyAbort.abort();
         const cancelledAgyResult = await cancelledBeforeSpawn;
         assert.equal(cancelledAgyResult.cancelled, true);
+        assert.equal(cancelledAgyResult.timedOut, undefined);
+        assert.equal(cancelledAgyResult.phase, "admission");
         assert.equal(cancelledAgyResult.launched, false);
         assert.equal(await lineCount(fakeAgyLogPath), agySpawnsBeforeQueue + 2, "cancelled provider-queued agy request must not spawn a CLI process");
         const agyAfterQueueCancel = await getProviderTransportAdapter().admissionSnapshot("agy");
         assert.equal(agyAfterQueueCancel.queuedForeground, 0);
         assert.ok(agyAfterQueueCancel.active <= 2);
+        const deadlineBeforeSpawn = callAgyModel("agy deadline in provider queue", AGY_MODEL_SEQUENCE[0], {
+            command: process.execPath,
+            commandArgs: [fakeAgyPath],
+            env: agyQueueEnv,
+            timeoutMs: 250,
+        });
+        const fallbackDeadlineBeforeSpawn = callAgyWithFallback("agy fallback deadline in provider queue", {
+            command: process.execPath,
+            commandArgs: [fakeAgyPath],
+            env: agyQueueEnv,
+            timeoutMs: 250,
+        });
+        await waitFor(
+            async () => (await getProviderTransportAdapter().admissionSnapshot("agy")).queuedForeground === 2,
+            "agy deadline requests did not enter provider admission queue",
+        );
+        const [deadlineResult, fallbackDeadlineResult] = await Promise.all([deadlineBeforeSpawn, fallbackDeadlineBeforeSpawn]);
+        assert.equal(deadlineResult.timedOut, true);
+        assert.equal(deadlineResult.cancelled, undefined);
+        assert.equal(deadlineResult.launched, false);
+        assert.equal(deadlineResult.phase, "admission");
+        assert.ok((deadlineResult.timing?.admissionWaitMs || 0) >= 200);
+        assert.equal(fallbackDeadlineResult.timedOut, true);
+        assert.equal(fallbackDeadlineResult.cancelled, undefined);
+        assert.equal(fallbackDeadlineResult.attempts.length, 1);
+        assert.equal(fallbackDeadlineResult.attempts[0]?.phase, "admission");
+        assert.equal(await lineCount(fakeAgyLogPath), agySpawnsBeforeQueue + 2, "expired agy calls must not spawn after their permit is released");
+        assert.equal((await getProviderTransportAdapter().admissionSnapshot("agy")).queuedForeground, 0);
         await Promise.all([firstAgyHolder, secondAgyHolder]);
         const agyAfterQueueDrain = await getProviderTransportAdapter().admissionSnapshot("agy");
         assert.equal(agyAfterQueueDrain.queuedForeground, 0);
         assert.equal(agyAfterQueueDrain.active, 0);
+        assert.equal(await lineCount(fakeAgyLogPath), agySpawnsBeforeQueue + 2, "expired queue entries must not launch after holders drain");
+
+        const firstManualHolder = await getProviderTransportAdapter().acquire("agy", { attemptId: "agy-shared-deadline-holder-one" });
+        const secondManualHolder = await getProviderTransportAdapter().acquire("agy", { attemptId: "agy-shared-deadline-holder-two" });
+        try {
+            const remainingBudgetCall = callAgyModel("agy remaining budget", AGY_MODEL_SEQUENCE[0], {
+                command: process.execPath,
+                commandArgs: [fakeAgyPath],
+                env: { ...agyQueueEnv, FAKE_AGY_DELAY_MS: "1000" },
+                timeoutMs: 1_100,
+            });
+            await waitFor(
+                async () => (await getProviderTransportAdapter().admissionSnapshot("agy")).queuedForeground === 1,
+                "agy remaining-budget call did not queue",
+            );
+            await delay(350);
+            await getProviderTransportAdapter().release(firstManualHolder);
+            const remainingBudgetResult = await remainingBudgetCall;
+            assert.equal(remainingBudgetResult.timedOut, true);
+            assert.equal(remainingBudgetResult.launched, true);
+            assert.equal(remainingBudgetResult.phase, "execution");
+            assert.ok((remainingBudgetResult.timing?.admissionWaitMs || 0) >= 300);
+            assert.ok((remainingBudgetResult.timing?.totalMs || 0) < 1_650, "CLI must receive only the budget left after admission");
+        } finally {
+            await getProviderTransportAdapter().release(secondManualHolder);
+        }
 
         await configureProviderTransportAdapterForTest({ mode: "test", dataRoot, ownerId: "provider-transport-wiring-test" });
         grokMode = "success";

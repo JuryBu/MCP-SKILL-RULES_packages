@@ -3,6 +3,7 @@ import {
     getCodexThread,
     assertCodexSourceVersion,
     captureCodexSourceVersion,
+    captureCodexSourceVersionAsync,
     createCodexSourceRevisionAccumulator,
     codexSourceRevisionFromRounds,
     loadCodexConversationAsync,
@@ -14,7 +15,7 @@ import {
     type CodexConversationData,
     type CodexSourceVersionExpectation,
 } from "./codex-client.js";
-import { assertCodexHistorySource, CodexHistorySourceMismatchError, type CodexHistorySource } from "./codex-history-source.js";
+import { assertCodexHistorySourceAsync, CodexHistorySourceMismatchError, type CodexHistorySource } from "./codex-history-source.js";
 import {
     getClaudeCodeThread,
     loadClaudeCodeConversationAsync,
@@ -397,13 +398,13 @@ async function loadFromResolvedChain(
     if (resolved === "codex" && source !== "cache" && !options.expectedCodexSource) {
         const currentThread = getCodexThread(effectiveId);
         if (currentThread?.rolloutPath) {
-            options = { ...options, expectedCodexSource: captureCodexSourceVersion(currentThread.rolloutPath) };
+            options = { ...options, expectedCodexSource: await captureCodexSourceVersionAsync(currentThread.rolloutPath, options.isCancelled) };
         }
     }
     if (resolved === "codex" && options.expectedCodexSource) {
         const expectedThread = getCodexThread(effectiveId);
         if (!expectedThread?.rolloutPath) throw new Error("Codex source changed before cache lookup; start a fresh fetch");
-        await assertCodexSourceVersion(expectedThread.rolloutPath, options.expectedCodexSource, "before cache lookup");
+        await assertCodexSourceVersion(expectedThread.rolloutPath, options.expectedCodexSource, "before cache lookup", options.isCancelled);
     }
 
     const key = conversationSourceCacheKey(resolved, effectiveId, options);
@@ -417,10 +418,13 @@ async function loadFromResolvedChain(
             (options.requireCompactionMetadata && previous.snapshot.compactionMetadata?.version !== 1)
             || previous.snapshot.aiResponseCount === undefined
             || previous.snapshot.toolCallCount === undefined
+            || (resolved === "codex" && (!previous.snapshot.codexData?.historySource?.segments.length || previous.snapshot.codexData.historySource.segments.some(segment => !segment.prefixSha256 || !segment.ordinalMode)))
             || (previous.snapshot.windsurfData?.thread.sourceKind && previous.snapshot.windsurfData.normalizationVersion !== DEVIN_NORMALIZATION_VERSION)
         ),
     );
-    const freshness = await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass, options.sourceReadBudget);
+    const freshness = resolved === "codex" && options.expectedCodexSource
+        ? { fingerprint: null, buildSource: source }
+        : await prepareConversationCacheFreshness(resolved, effectiveId, source, previous, options.requestClass, options.sourceReadBudget);
     const cached = await readOrBuildConversationSourceCache<CachedConversationLoadResult, ConversationRound>({
         key,
         fingerprint: options.expectedCodexSource
@@ -435,7 +439,7 @@ async function loadFromResolvedChain(
             || requiresMetadataRefresh
             || (options.refresh === true && (resolved === "antigravity" || resolved === "windsurf")),
         assertPublishable: resolved === "codex" && options.expectedCodexSource
-            ? () => assertCodexSourceVersion(options.expectedCodexSource!.sourcePath, options.expectedCodexSource, "before cache publication")
+            ? () => assertCodexSourceVersion(options.expectedCodexSource!.sourcePath, options.expectedCodexSource, "before cache publication", options.isCancelled)
             : undefined,
         build: async () => withConversationSourcePressure(options.requestClass || "foreground", async () => {
             throwIfConversationLoadCancelled(options);
@@ -577,6 +581,7 @@ export async function rebuildConversationCacheForRecord(
 
 function codexHistoryCanAppend(previous: CodexHistorySource | undefined, current: CodexHistorySource | undefined): boolean {
     if (!previous || !current || previous.segments.length !== current.segments.length) return false;
+    if ([...previous.segments, ...current.segments].some(segment => !segment.prefixSha256 || !segment.ordinalMode)) return false;
     const stableSegment = (source: CodexHistorySource, index: number): string => {
         const segment = source.segments[index];
         const leaf = index === source.segments.length - 1;
@@ -586,7 +591,8 @@ function codexHistoryCanAppend(previous: CodexHistorySource | undefined, current
             startOrdinal: segment.startOrdinal,
             endOrdinalExclusive: segment.endOrdinalExclusive,
             headerSha256: segment.headerSha256,
-            ...(leaf ? {} : { endByte: segment.endByte, anchorSha256: segment.anchorSha256 }),
+            ordinalMode: segment.ordinalMode,
+            ...(leaf ? {} : { endByte: segment.endByte, anchorSha256: segment.anchorSha256, prefixSha256: segment.prefixSha256 }),
         });
     };
     return previous.segments.every((segment, index) => stableSegment(previous, index) === stableSegment(current, index));
@@ -617,7 +623,7 @@ async function tryBuildIncrementalConversation(
         const historySource = options.expectedCodexSource?.historySource;
         if (!codexHistoryCanAppend(oldData.historySource, historySource)) return null;
         try {
-            assertCodexHistorySource(oldData.historySource!);
+            await assertCodexHistorySourceAsync(oldData.historySource!, options.isCancelled);
         } catch (error) {
             if (error instanceof CodexHistorySourceMismatchError) return null;
             throw error;
@@ -627,6 +633,8 @@ async function tryBuildIncrementalConversation(
             cwd: oldData.thread.cwd,
             endByte: options.expectedCodexSource?.sourceSize,
             sourceMtimeMs: options.expectedCodexSource?.sourceMtimeMs,
+            historySegment: historySource?.segments.at(-1),
+            isCancelled: options.isCancelled,
         });
         if (tail.status === "unchanged") {
             const spool = createConversationSourceCacheRoundSpool<ConversationRound>({

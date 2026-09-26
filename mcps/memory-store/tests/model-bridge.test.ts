@@ -175,7 +175,7 @@ if (mode === "fail") {
   console.error("forced agy failure");
   process.exit(1);
 }
-if (mode === "fallback" && args.includes("Gemini 3.5 Flash (High)")) {
+if (mode === "fallback" && args.includes("Gemini 3.8 Flash (High)")) {
   console.error("first agy model failed");
   process.exit(1);
 }
@@ -277,13 +277,13 @@ try {
     const explicitAgy = await callModelResponse("flash", "hello", "agy", 5_000, agyBridgeOptions);
     assert.equal(explicitAgy.text, "fake agy output", explicitAgy.error);
     assert.equal(explicitAgy.chainUsed, "agy");
-    assert.equal(explicitAgy.modelUsed, "Gemini 3.5 Flash (High)");
+    assert.equal(explicitAgy.modelUsed, "Gemini 3.8 Flash (High)");
 
     process.env.FAKE_AGY_MODE = "fallback";
     const agyInternalFallback = await callModelResponse("flash", "hello", "agy", 5_000, agyBridgeOptions);
     assert.equal(agyInternalFallback.text, "fake agy output");
     assert.equal(agyInternalFallback.chainUsed, "agy");
-    assert.equal(agyInternalFallback.modelUsed, "Gemini 3.5 Flash (Medium)");
+    assert.equal(agyInternalFallback.modelUsed, "Gemini 3.8 Flash (Medium)");
 
     process.env.FAKE_AGY_MODE = "fail";
     const explicitAgyFailure = await callModelResponse("flash", "hello", "agy", 5_000, agyBridgeOptions);
@@ -293,8 +293,8 @@ try {
     assert.equal(explicitAgyFailure.failureClass, "Availability");
     assert.equal(explicitAgyFailure.retryStrategy, "provider-fallback-exhausted");
     assert.deepEqual(explicitAgyFailure.agyAttempts?.map(attempt => attempt.model), [
-        "Gemini 3.5 Flash (High)",
-        "Gemini 3.5 Flash (Medium)",
+        "Gemini 3.8 Flash (High)",
+        "Gemini 3.8 Flash (Medium)",
         "Gemini 3.1 Pro (Low)",
     ]);
 
@@ -396,9 +396,11 @@ try {
     resetGrokBridgeAvailabilityForTest();
     grokMode = "delay";
     grokDelayMs = 6_000;
+    lastLsBody = null;
     const grokTimeoutFallback = await callModelResponse("flash", "hello", "auto", 5_000);
-    assert.equal(grokTimeoutFallback.text, "fake ls output");
-    assert.equal(grokTimeoutFallback.chainUsed, "antigravity");
+    assert.equal(grokTimeoutFallback.text, null);
+    assert.equal(grokTimeoutFallback.timedOut, true);
+    assert.equal(lastLsBody, null, "an exhausted operation deadline must not start another model");
 
     resetGrokBridgeAvailabilityForTest();
     grokMode = "delay";
@@ -407,7 +409,7 @@ try {
     assert.equal(grokTimeoutExplicit.text, null);
     assert.equal(grokTimeoutExplicit.chainUsed, null);
     assert.equal(grokTimeoutExplicit.timedOut, true);
-    assert.equal(grokTimeoutExplicit.failureClass, "Availability");
+    assert.equal(grokTimeoutExplicit.failureClass, "UnknownOutcome");
     assert.match(grokTimeoutExplicit.error || "", /超时/u);
 
     lsMode = "empty";
@@ -427,7 +429,7 @@ try {
     const lsTimeout = await callModelResponse("flash", "hello", "antigravity", 30);
     assert.equal(lsTimeout.text, null);
     assert.equal(lsTimeout.timedOut, true);
-    assert.equal(lsTimeout.failureClass, "Availability");
+    assert.equal(lsTimeout.failureClass, "UnknownOutcome");
 
     __disableLsForTest();
     const lsUnavailable = await callModelResponse("flash", "hello", "antigravity", 5_000);

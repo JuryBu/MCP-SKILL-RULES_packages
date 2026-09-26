@@ -1166,7 +1166,8 @@ function scheduleBackgroundTask(
                     updatedAt,
                 };
                 task.updatedAt = updatedAt;
-                persistTaskThrottled(task);
+                if (task.kind === "stage-guard-check" && stageChanged) persistTask(task, "progress");
+                else persistTaskThrottled(task);
             };
 
             const settle = (status: Exclude<BackgroundTaskStatus, "running" | "suspended">, payload: { result?: string; error?: string; timedOut?: boolean }): boolean => {

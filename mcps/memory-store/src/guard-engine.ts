@@ -40,33 +40,39 @@ const RECORD_CONTEXT_BUDGET = Number(process.env.MEMORY_STORE_GUARD_RECORD_CONTE
 const EXECUTION_RECORD_BUDGET = Number(process.env.MEMORY_STORE_GUARD_EXECUTION_BUDGET || 120_000);
 const EVIDENCE_CONTEXT_BUDGET = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_BUDGET || 80_000);
 
-function configuredPromptBudget(name: string, minimum: number): number {
-    const configured = Number(process.env[name]);
-    return Number.isFinite(configured) && configured > 0 ? Math.max(minimum, Math.floor(configured)) : minimum;
+function configuredPromptBudget(name: string, defaultValue: number): number {
+    const raw = process.env[name];
+    if (raw === undefined) return defaultValue;
+    const trimmed = raw.trim();
+    if (!/^[1-9]\d*$/u.test(trimmed)) return defaultValue;
+    const configured = Number(trimmed);
+    return Number.isSafeInteger(configured) ? configured : defaultValue;
 }
 
-const GUARD_PROVIDER_PROMPT_BUDGETS = {
-    grok: {
-        inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_GROK_PROMPT_BUDGET", 200_000),
-        outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_GROK_OUTPUT_RESERVE", 24_000),
-    },
-    agy: {
-        inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_AGY_PROMPT_BUDGET", 24_000),
-        outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_AGY_OUTPUT_RESERVE", 4_000),
-    },
-    antigravity: {
-        inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_ANTIGRAVITY_PROMPT_BUDGET", 24_000),
-        outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_ANTIGRAVITY_OUTPUT_RESERVE", 4_000),
-    },
-    codex: {
-        inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_CODEX_PROMPT_BUDGET", 100_000),
-        outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_CODEX_OUTPUT_RESERVE", 16_000),
-    },
-    "claude-code": {
-        inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_CLAUDE_CODE_PROMPT_BUDGET", 100_000),
-        outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_CLAUDE_CODE_OUTPUT_RESERVE", 16_000),
-    },
-} as const;
+function guardProviderPromptBudgets() {
+    return {
+        grok: {
+            inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_GROK_PROMPT_BUDGET", 200_000),
+            outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_GROK_OUTPUT_RESERVE", 24_000),
+        },
+        agy: {
+            inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_AGY_PROMPT_BUDGET", 24_000),
+            outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_AGY_OUTPUT_RESERVE", 4_000),
+        },
+        antigravity: {
+            inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_ANTIGRAVITY_PROMPT_BUDGET", 24_000),
+            outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_ANTIGRAVITY_OUTPUT_RESERVE", 4_000),
+        },
+        codex: {
+            inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_CODEX_PROMPT_BUDGET", 100_000),
+            outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_CODEX_OUTPUT_RESERVE", 16_000),
+        },
+        "claude-code": {
+            inputChars: configuredPromptBudget("MEMORY_STORE_GUARD_CLAUDE_CODE_PROMPT_BUDGET", 100_000),
+            outputReserveChars: configuredPromptBudget("MEMORY_STORE_GUARD_CLAUDE_CODE_OUTPUT_RESERVE", 16_000),
+        },
+    } as const;
+}
 
 // ============= 类型定义 =============
 
@@ -234,12 +240,17 @@ async function callFlashWithChain(
         : isClaudeCodeOnly
             ? Number(process.env.MEMORY_STORE_CC_GUARD_TIMEOUT_MS || FLASH_TIMEOUT)
         : FLASH_TIMEOUT;
+    const modelCallStartedAt = performance.now();
     const bridgeOptions = {
         allowClaudeCodeFallback: options.dataChain === "claude-code",
         grokContext: "guard" as const,
         shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
+        signal: AbortSignal.timeout(timeoutMs),
     };
     const candidates = await resolveModelChainCandidates(modelChain || "auto", bridgeOptions);
+    if (bridgeOptions.signal.aborted || shouldAbortGuardRun(options)) {
+        return { text: null, error: shouldAbortGuardRun(options) ? "Guard 模型调用已取消" : "Guard 模型预检超过总时限 [phase=preflight]", infrastructureError: true };
+    }
     if (candidates.length === 0) {
         return {
             text: null,
@@ -254,9 +265,23 @@ async function callFlashWithChain(
         if (shouldAbortGuardRun(options)) {
             return { text: null, error: "Guard 模型调用已取消", promptBudget: lastRender?.budget };
         }
-        const rendered = renderPrompt(candidate);
+        let rendered: GuardPromptRender;
+        try {
+            rendered = renderPrompt(candidate);
+        } catch (error) {
+            return {
+                text: null,
+                error: error instanceof Error ? error.message : String(error),
+                infrastructureError: true,
+                promptBudget: lastRender?.budget,
+            };
+        }
         lastRender = rendered;
-        const response = await callModelResponse(FLASH_MODEL, rendered.prompt, candidate, timeoutMs, bridgeOptions);
+        const remainingMs = Math.floor(timeoutMs - (performance.now() - modelCallStartedAt));
+        if (remainingMs <= 0) {
+            return { text: null, error: "Guard 模型调用超过总时限 [phase=preflight]", infrastructureError: true, promptBudget: rendered.budget };
+        }
+        const response = await callModelResponse(FLASH_MODEL, rendered.prompt, candidate, remainingMs, { ...bridgeOptions, preResolvedCandidate: candidate });
         if (response.text) {
             console.error(`[guard-engine] Guard model call success requestedChain=${modelChain || "auto"} actualChain=${response.chainUsed || "unknown"} actualModel=${response.modelUsed || "unknown"} promptProvider=${candidate} grokContext=guard`);
             return {
@@ -266,10 +291,10 @@ async function callFlashWithChain(
                 promptBudget: rendered.budget,
             };
         }
-        if (response.cancelled) {
+        if (response.cancelled || response.timedOut || response.failureClass === "UnknownOutcome") {
             return {
                 text: null,
-                error: response.error || "Guard 模型调用已取消",
+                error: response.error || "Guard 模型调用已停止或执行结果未知，不自动再次请求",
                 infrastructureError: true,
                 chainUsed: response.chainUsed,
                 modelUsed: response.modelUsed,
@@ -863,7 +888,9 @@ async function enhanceGuardInputBundleWithModelLocator(
     taskFiles: string[],
     stageId: string | undefined,
     modelChain: Chain,
+    options: { isCancelled?: () => boolean; isSettled?: () => boolean; onProgress?: (stage: string) => void } = {},
 ): Promise<GuardInputBundle> {
+    if (shouldAbortGuardRun(options)) return bundle;
     const shouldLocate = stageId && (
         bundle.coverage.confidence !== "high" ||
         bundle.coverage.truncationRisk !== "none" ||
@@ -892,7 +919,12 @@ async function enhanceGuardInputBundleWithModelLocator(
         `输出格式：{"suggestions":[]}`,
     ].join("\n");
 
-    const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), { grokContext: "default" });
+    try { options.onProgress?.("locator"); } catch {}
+    const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), {
+        grokContext: "default",
+        shouldCancel: () => shouldAbortGuardRun(options),
+    });
+    if (shouldAbortGuardRun(options)) return bundle;
     if (!response.text) {
         return {
             ...bundle,
@@ -1168,8 +1200,8 @@ function buildGuardPromptFromInput(input: GuardPromptInput): string {
 type GuardPromptTextSection = "planContent" | "taskContent" | "executionRecord" | "coverageText" | "evidenceText" | "evidenceIndexText" | "appealNote" | "evidence";
 
 export function renderGuardPromptForProvider(input: GuardPromptInput, provider: string): GuardPromptRender {
-    const providerBudget = GUARD_PROVIDER_PROMPT_BUDGETS[provider as keyof typeof GUARD_PROVIDER_PROMPT_BUDGETS]
-        || GUARD_PROVIDER_PROMPT_BUDGETS.agy;
+    const budgets = guardProviderPromptBudgets();
+    const providerBudget = budgets[provider as keyof typeof budgets] || budgets.agy;
     const sections: Array<{ name: GuardPromptTextSection; text: string; sourceChars: number }> = [
         { name: "planContent", text: input.planContent, sourceChars: input.planContent.length },
         { name: "taskContent", text: input.taskContent, sourceChars: input.taskContent.length },
@@ -1194,7 +1226,7 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
     let prompt = buildGuardPromptFromInput(currentInput());
     const compressionReasons: string[] = [];
     if (prompt.length > providerBudget.inputChars) {
-        compressionReasons.push(`provider=${provider} 输入上限 ${providerBudget.inputChars} chars，已预留 ${providerBudget.outputReserveChars} chars 输出`);
+        compressionReasons.push(`provider=${provider} 输入上限 ${providerBudget.inputChars} chars；输出预留估计 ${providerBudget.outputReserveChars} chars，非模型输出硬上限`);
         while (prompt.length > providerBudget.inputChars) {
             const reducible = sections.filter(section => section.text.length > 0)
                 .sort((left, right) => right.text.length - left.text.length)[0];
@@ -1206,6 +1238,9 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
             reducible.text = truncateGuardPromptSection(reducible.text, reducible.text.length - reduction);
             prompt = buildGuardPromptFromInput(currentInput());
         }
+    }
+    if (prompt.length > providerBudget.inputChars) {
+        throw new RangeError(`Guard provider=${provider} 输入预算 ${providerBudget.inputChars} chars 小于必需模板 ${prompt.length} chars，模型调用已阻止`);
     }
     const usages = sections.map(section => ({
         name: section.name,
@@ -1238,7 +1273,7 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
 function formatGuardPromptBudgetUsage(usage: GuardPromptBudgetUsage | undefined): string {
     if (!usage) return "unavailable";
     return [
-        `provider=${usage.provider}, prompt=${usage.promptChars}/${usage.inputBudgetChars} chars, outputReserve=${usage.outputReserveChars} chars, template=${usage.templateChars} chars`,
+        `provider=${usage.provider}, prompt=${usage.promptChars}/${usage.inputBudgetChars} chars, outputReserveEstimate=${usage.outputReserveChars} chars (not model max_tokens), template=${usage.templateChars} chars`,
         ...usage.sections.map(section => `${section.name}: ${section.includedChars}/${section.sourceChars} chars${section.compressedChars > 0 ? `（压缩 ${section.compressedChars}）` : ""}`),
         ...usage.compressionReasons.map(reason => `reason: ${reason}`),
     ].join("\n");
@@ -1337,11 +1372,17 @@ export async function runGuardCheck(
         evidenceIndexMode?: GuardEvidenceIndexMode;
         isCancelled?: () => boolean;
         isSettled?: () => boolean;
+        onProgress?: (stage: string) => void;
     } = {},
 ): Promise<GuardCheckResult> {
+    const progress = (stage: string) => {
+        try { options.onProgress?.(stage); } catch {}
+    };
+    progress("input");
     // 1. 分段读取 Plan + Task 文件并生成 coverage / evidence manifest
     const scopeSelectors = normalizeGuardScopeSelectors(state.scopeSelectors);
     const initialInputBundle = buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId, scopeSelectors);
+    if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     const inputBundle = scopeSelectors.length > 0
         ? initialInputBundle
         : await enhanceGuardInputBundleWithModelLocator(
@@ -1350,6 +1391,7 @@ export async function runGuardCheck(
             state.taskFiles,
             state.stageId,
             resolveGuardModelChain(state),
+            options,
         );
     const planContent = inputBundle.planContent;
     const taskContent = inputBundle.taskContent;
@@ -1367,6 +1409,7 @@ export async function runGuardCheck(
     }
 
     // 2. 有明确 startRound 时只注入该轮及之后的对话，不混入无轮次边界的旧 Record 摘要。
+    progress("evidence");
     const recordContext = state.conversationId && state.startRound <= 0
         ? getRecordContext(state.conversationId, state.stageId, RECORD_CONTEXT_BUDGET, scopeSelectors)
         : "";
@@ -1420,6 +1463,7 @@ export async function runGuardCheck(
     if (shouldAbortGuardRun(options)) {
         return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     }
+    progress("model");
     const response = await callFlashWithChain(
         provider => renderGuardPromptForProvider(promptInput, provider),
         resolveGuardModelChain(state),
@@ -1430,6 +1474,7 @@ export async function runGuardCheck(
     }
 
     if (!response.text) {
+        progress("complete");
         return {
             passed: false,
             summary: response.error || "Flash 模型调用失败",
@@ -1443,6 +1488,7 @@ export async function runGuardCheck(
     }
 
     // 5. 解析结果
+    progress("parse");
     const result = resolveGuardSelfReferenceResult(parseGuardResult(response.text));
     result.evidenceIndexManifestPath = externalEvidence.manifestPath;
     result.modelChainUsed = response.chainUsed;
@@ -1504,5 +1550,6 @@ export async function runGuardCheck(
         reportContent
     );
 
+    progress("complete");
     return result;
 }

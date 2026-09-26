@@ -8,7 +8,7 @@ import { mutateProviderControlAsOwner } from "../src/provider-control-store.ts";
 import { configureProviderTransportAdapterForTest, resetProviderTransportAdapterForTest } from "../src/provider-transport-adapter.ts";
 import type { ProviderId, ProviderTrafficClass } from "../src/provider-control-contracts.ts";
 
-const AGY_MODEL = "Gemini 3.5 Flash (High)" as const;
+const AGY_MODEL = "Gemini 3.8 Flash (High)" as const;
 const CALLS_PER_CLASS = 4;
 const MAX_ACTIVE = 8;
 

@@ -43,16 +43,21 @@ try {
     replaceSource(serialize([metadata, message("user", longerUser), message("assistant", "NEW_ANSWER")]));
     assert.notEqual(fs.readFileSync(rolloutPath)[Buffer.byteLength(originalText) - 1], 0x0a);
     assert.throws(() => history.assertCodexHistorySource(original!.codexData!.historySource!), /complete JSONL line/);
-    const originalReadSync = fs.readSync;
+    const originalOpen = fs.promises.open;
     let injectedReadFailure = false;
-    Object.defineProperty(fs, "readSync", {
+    Object.defineProperty(fs.promises, "open", {
         configurable: true,
-        value: (descriptor: number, buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
-            if (!injectedReadFailure && length === 1 && position === Buffer.byteLength(originalText) - 1) {
-                injectedReadFailure = true;
-                throw Object.assign(new Error("injected old-boundary read failure"), { code: "EIO" });
-            }
-            return originalReadSync(descriptor, buffer, offset, length, position);
+        value: async (...args: Parameters<typeof fs.promises.open>) => {
+            const handle = await originalOpen(...args);
+            const originalRead = handle.read.bind(handle);
+            handle.read = ((buffer: NodeJS.ArrayBufferView, offset: number, length: number, position: number | null) => {
+                if (!injectedReadFailure && length === 1 && position === Buffer.byteLength(originalText) - 1) {
+                    injectedReadFailure = true;
+                    throw Object.assign(new Error("injected old-boundary read failure"), { code: "EIO" });
+                }
+                return originalRead(buffer, offset, length, position);
+            }) as typeof handle.read;
+            return handle;
         },
     });
     try {
@@ -62,7 +67,7 @@ try {
         assert.match(readFailure.cacheBuildFailure?.message || "", /injected old-boundary read failure/);
         assert.equal(readFailure.cacheGeneration, original!.cacheGeneration);
     } finally {
-        Object.defineProperty(fs, "readSync", { configurable: true, value: originalReadSync });
+        Object.defineProperty(fs.promises, "open", { configurable: true, value: originalOpen });
     }
     const rewritten = await bridge.loadConversationData("codex", conversationId, options);
     assert.equal(rewritten?.cacheState, "built", "obsolete cache boundary must fall back to a full read");
