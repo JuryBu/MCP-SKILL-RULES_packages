@@ -1,6 +1,7 @@
 // Record 生成引擎 —— 解析 / 校验 / 合成（纯函数）。
 // 由 record-generator.ts 拆分而来（E2-B2），纯结构搬运、零行为变更。
 import { saveTempFile } from "./temp-store.js";
+import { sliceUnicodeSafe } from "./unicode-text.js";
 import {
     roundRangeLabel, patchRangeLabel,
     RECORD_COMPOSE_ROLLBACK_PHASES, RECORD_COMPOSE_MAX_ROLLBACK_PHASES,
@@ -825,9 +826,9 @@ export function buildOpenPhaseSnippet(openPhase: { startRound: number; endRound:
     const tailChars = RECORD_SERIAL_OPEN_PHASE_CONTEXT_CHARS - headChars;
     return [
         header,
-        md.slice(0, headChars),
+        sliceUnicodeSafe(md, 0, headChars),
         `\n\n[开放 Phase 原文 ${md.length} 字，超上限 ${RECORD_SERIAL_OPEN_PHASE_CONTEXT_CHARS} 字，中段省略约 ${md.length - headChars - tailChars} 字（请保留头尾两端内容）]\n\n`,
-        md.slice(-tailChars),
+        sliceUnicodeSafe(md, md.length - tailChars, md.length),
     ].join("");
 }
 

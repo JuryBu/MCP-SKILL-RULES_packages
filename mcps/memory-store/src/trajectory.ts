@@ -1,4 +1,5 @@
 import { saveTempFile } from "./temp-store.js";
+import { escapeUnpairedUnicode, sliceUnicodeSafe } from "./unicode-text.js";
 
 import fs from "fs";
 import path from "path";
@@ -612,9 +613,9 @@ function renderAiResponseLines(
 function renderToolCallLine(lines: string[], tc: ToolCallInfo, depth: Depth, extraTypes: ExtraType[]): void {
     let line = `- ${tc.name}`;
     if (depth === "full" || extraTypes.includes("tool_results")) {
-        line += `(${tc.argsSummary})`;
+        line += `(${recoverToolSummary(tc.argsSummary, tc.argsFull, 120)})`;
         if (tc.resultSummary) {
-            line += ` → ${truncate(tc.resultSummary, depth === "full" ? 500 : 200)}`;
+            line += ` → ${truncate(recoverToolSummary(tc.resultSummary, tc.resultFull, 500), depth === "full" ? 500 : 200)}`;
         }
     }
     lines.push(line);
@@ -1103,7 +1104,7 @@ function truncateForRoleView(input: string, depth: Depth): string {
     const text = input || "";
     const limit = depth === "brief" ? 100 : depth === "normal" ? 20_000 : Number.POSITIVE_INFINITY;
     if (text.length <= limit) return text;
-    return `${text.slice(0, limit)}\n\n⚠️ 本段过长已截断（${text.length}→${limit}字），可用 depth="full" 展开`;
+    return `${sliceUnicodeSafe(text, 0, limit)}\n\n⚠️ 本段过长已截断（${text.length}→${limit}字），可用 depth="full" 展开`;
 }
 
 export function normalizeMessageRoles(input?: ConversationMessageRole[]): Set<ConversationMessageRole> {
@@ -1319,8 +1320,8 @@ export function formatRoundForMessageRoles(
     const renderToolLine = (tc: ConversationRound["toolCalls"][number]): boolean => {
         let line = `- ${tc.name}`;
         if (depth === "full" || extraTypes.includes("tool_results")) {
-            line += `(${tc.argsSummary})`;
-            if (tc.resultSummary) line += ` → ${truncateForRoleView(tc.resultSummary, depth === "full" ? "normal" : depth)}`;
+            line += `(${recoverToolSummary(tc.argsSummary, tc.argsFull, 120)})`;
+            if (tc.resultSummary) line += ` → ${truncateForRoleView(recoverToolSummary(tc.resultSummary, tc.resultFull, 500), depth === "full" ? "normal" : depth)}`;
         }
         return pushLine(lines, line);
     };
@@ -1694,7 +1695,14 @@ function toSearchableText(value: unknown): string {
 
 function truncate(text: string, maxLen: number): string {
     if (text.length <= maxLen) return text;
-    return text.slice(0, maxLen) + "...";
+    return sliceUnicodeSafe(text, 0, maxLen) + "...";
+}
+
+function recoverToolSummary(summary: string, full: string | undefined, maxLen: number): string {
+    const escaped = escapeUnpairedUnicode(summary);
+    if (escaped === summary) return summary;
+    if (typeof full === "string" && full.length > 0 && escapeUnpairedUnicode(full) === full) return truncate(full, maxLen);
+    return `[摘要含不完整UTF-16码元，已转义] ${escaped}`;
 }
 
 function truncateLines(text: string, headLines: number, tailLines: number): string {
@@ -1710,7 +1718,7 @@ function truncateLines(text: string, headLines: number, tailLines: number): stri
 function extractContext(text: string, matchStart: number, matchLen: number, contextLen: number): string {
     const start = Math.max(0, matchStart - contextLen);
     const end = Math.min(text.length, matchStart + matchLen + contextLen);
-    let snippet = text.slice(start, end);
+    let snippet = sliceUnicodeSafe(text, start, end);
     if (start > 0) snippet = "..." + snippet;
     if (end < text.length) snippet = snippet + "...";
     return snippet;

@@ -1,6 +1,7 @@
 import fs from "fs";
 import { createHash } from "crypto";
 import { formatRound, type ConversationRound } from "./trajectory.js";
+import { sliceUnicodeSafe } from "./unicode-text.js";
 import { AGY_MODEL_SEQUENCE } from "./agy-client.js";
 import {
     readRecordAsync, readRecordsIndex, readRecordsIndexAsync,
@@ -412,7 +413,7 @@ function createRecordProviderCall(
     };
 }
 
-function buildRecordSchedulerSplitPrompt(
+export function buildRecordSchedulerSplitPrompt(
     prompt: string,
     parentRange: RecordSchedulerModelCallRecipe["range"],
     childRange: RecordSchedulerModelCallRecipe["range"],
@@ -441,10 +442,10 @@ function buildRecordSchedulerSplitPrompt(
     const sliceEnd = bodyStart + Math.ceil(bodyChars * relativeEnd);
     return [
         `【Record scheduler split】仅处理 ${childRange.axis} ${childRange.start}-${childRange.end}，这是父任务 ${parentRange.start}-${parentRange.end} 的确定性子区间。`,
-        prompt.slice(0, headChars),
+        sliceUnicodeSafe(prompt, 0, headChars),
         `【子区间正文 ${childRange.start}-${childRange.end}】`,
-        prompt.slice(sliceStart, sliceEnd),
-        prompt.slice(bodyEnd),
+        sliceUnicodeSafe(prompt, sliceStart, sliceEnd),
+        sliceUnicodeSafe(prompt, bodyEnd, prompt.length),
     ].join("\n\n");
 }
 
@@ -1080,9 +1081,9 @@ function capSingleRoundText(text: string, roundIndex: number): string {
         const headChars = Math.floor(RECORD_MAX_SINGLE_ROUND_CHARS * 0.6);
         const tailChars = RECORD_MAX_SINGLE_ROUND_CHARS - headChars;
         return [
-            text.slice(0, headChars),
+            sliceUnicodeSafe(text, 0, headChars),
             `\n\n[轮次 ${roundIndex} 原文 ${text.length} 字，超单轮上限 ${RECORD_MAX_SINGLE_ROUND_CHARS} 字，中段已省略约 ${text.length - headChars - tailChars} 字]\n\n`,
-            text.slice(-tailChars),
+            sliceUnicodeSafe(text, text.length - tailChars, text.length),
         ].join("");
     }
     return [
@@ -1355,12 +1356,12 @@ export function isControlledRebuildCandidateTooSparse(content: string, totalRoun
     return countPhasesInRecord(content) < minimumPhaseCount;
 }
 
-function normalizeSnippetText(text: string, maxChars: number): string {
+export function normalizeSnippetText(text: string, maxChars: number): string {
     const normalized = text.replace(/\s+/g, " ").trim();
     if (normalized.length <= maxChars) return normalized;
     const headChars = Math.max(20, Math.floor(maxChars * 0.65));
     const tailChars = Math.max(10, maxChars - headChars - 6);
-    return `${normalized.slice(0, headChars)} …… ${normalized.slice(-tailChars)}`;
+    return `${sliceUnicodeSafe(normalized, 0, headChars)} …… ${sliceUnicodeSafe(normalized, normalized.length - tailChars, normalized.length)}`;
 }
 
 function summarizeRoundForControlledRebuild(round: ConversationRound): string {
@@ -1528,7 +1529,7 @@ function resolveParallelMode(mode?: RecordParallelMode): RecordParallelMode {
     return "off";
 }
 
-function summarizeRecordStructure(record: string, maxChars = 12_000): string {
+export function summarizeRecordStructure(record: string, maxChars = 12_000): string {
     if (!record.trim()) return "";
     const lines = record.split(/\r?\n/u);
     const kept: string[] = [];
@@ -1543,13 +1544,13 @@ function summarizeRecordStructure(record: string, maxChars = 12_000): string {
             kept.push(line);
         }
     }
-    const summary = kept.join("\n").trim() || record.slice(0, maxChars);
+    const summary = kept.join("\n").trim() || sliceUnicodeSafe(record, 0, maxChars);
     return summary.length > maxChars
-        ? `${summary.slice(0, maxChars)}\n...（旧 Record 结构摘要已截断）`
+        ? `${sliceUnicodeSafe(summary, 0, maxChars)}\n...（旧 Record 结构摘要已截断）`
         : summary;
 }
 
-function buildAdjacentContext(allFormatted: FormattedRecordRound[], chunk: RecordChunk): string {
+export function buildAdjacentContext(allFormatted: FormattedRecordRound[], chunk: RecordChunk): string {
     const startIndex = allFormatted.findIndex(item => item.round.roundIndex === chunk.startRound);
     const endIndex = allFormatted.findIndex(item => item.round.roundIndex === chunk.endRound);
     if (startIndex < 0 || endIndex < 0) return "";
@@ -1557,10 +1558,10 @@ function buildAdjacentContext(allFormatted: FormattedRecordRound[], chunk: Recor
     const after = allFormatted.slice(endIndex + 1, endIndex + 1 + RECORD_ADJACENT_CONTEXT_ROUNDS);
     const parts: string[] = [];
     for (const item of before) {
-        parts.push(`### 前文轮次 ${item.round.roundIndex}\n${item.text.slice(0, RECORD_ADJACENT_CONTEXT_CHARS)}`);
+        parts.push(`### 前文轮次 ${item.round.roundIndex}\n${sliceUnicodeSafe(item.text, 0, RECORD_ADJACENT_CONTEXT_CHARS)}`);
     }
     for (const item of after) {
-        parts.push(`### 后文轮次 ${item.round.roundIndex}\n${item.text.slice(0, RECORD_ADJACENT_CONTEXT_CHARS)}`);
+        parts.push(`### 后文轮次 ${item.round.roundIndex}\n${sliceUnicodeSafe(item.text, 0, RECORD_ADJACENT_CONTEXT_CHARS)}`);
     }
     return parts.join("\n\n---\n\n");
 }
@@ -1577,7 +1578,7 @@ export function getMinBatchRounds(modelChain: Chain): number {
     return isLocalTextModelBridge(modelChain) ? 1 : MIN_BATCH_ROUNDS;
 }
 
-function trimRecordForPrompt(record: string, modelChain: Chain): string {
+export function trimRecordForPrompt(record: string, modelChain: Chain): string {
     const contextChars = modelChain === "claude-code" ? CC_RECORD_CONTEXT_CHARS : CODEX_RECORD_CONTEXT_CHARS;
     if (!isLocalTextModelBridge(modelChain) || record.length <= contextChars) {
         return record;
@@ -1586,11 +1587,11 @@ function trimRecordForPrompt(record: string, modelChain: Chain): string {
     const bridgeName = modelChain === "claude-code" ? "Claude Code CLI" : "Codex";
     const headChars = Math.min(8_000, Math.floor(contextChars * 0.3));
     const tailChars = Math.max(4_000, contextChars - headChars);
-    const head = record.slice(0, headChars);
-    const tail = record.slice(-tailChars);
+    const head = sliceUnicodeSafe(record, 0, headChars);
+    const tail = sliceUnicodeSafe(record, record.length - tailChars, record.length);
     // B5/M3 治标：中段省略时保留被截区间内的所有 `## Phase` 标题行作为骨架，避免模型看不到
     // 中段 Phase 结构（头尾纯字符截断会连 Phase 标题一起截掉，模型续写时易丢失/重写中段阶段）。
-    const middle = record.slice(headChars, record.length - tailChars);
+    const middle = sliceUnicodeSafe(record, headChars, record.length - tailChars);
     const middlePhaseTitles = middle
         .split(/\r?\n/u)
         .filter(line => /^##\s*Phase\b/iu.test(line.trim()))

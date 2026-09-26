@@ -1,4 +1,5 @@
 import fs from "fs";
+import { sliceUnicodeSafe } from "./unicode-text.js";
 import path from "path";
 import { formatRound, type ConversationRound } from "./trajectory.js";
 import { readRecord, findRecordHash, resolveWorkspaceHashForRecord } from "./record-store.js";
@@ -298,12 +299,7 @@ function lineRangeLabel(startLine: number, endLine: number): string {
 
 function truncateText(text: string, maxChars: number): string {
     if (text.length <= maxChars) return text;
-    let end = Math.max(0, maxChars - 80);
-    if (end > 0) {
-        const lastCodeUnit = text.charCodeAt(end - 1);
-        if (lastCodeUnit >= 0xD800 && lastCodeUnit <= 0xDBFF) end -= 1;
-    }
-    return `${text.slice(0, end)}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
+    return `${sliceUnicodeSafe(text, 0, Math.max(0, maxChars - 80))}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
 }
 
 export function truncateGuardTextForTest(text: string, maxChars: number): string {
@@ -485,7 +481,7 @@ function findEvidenceWindows(lines: string[], anchors: string[], maxWindows = 12
         windows.push({
             startLine: clamp(index + 1 - 2, 1, lines.length),
             endLine: clamp(index + 1 + 2, 1, lines.length),
-            anchor: line.trim().slice(0, 120),
+            anchor: sliceUnicodeSafe(line.trim(), 0, 120),
         });
     });
     return windows.slice(0, maxWindows);
@@ -799,7 +795,7 @@ function buildLocatorFileMap(filePaths: string[], stageId?: string): string {
             .map((line, index) => ({ line, lineNumber: index + 1 }))
             .filter(item => lineMatchesAnyAnchor(item.line, anchors) || /npm run|tests[\\/]|runs?[\\/]|obs_|run_|报告|验证|Guard|Stage/iu.test(item.line))
             .slice(0, 80)
-            .map(item => `L${item.lineNumber}: ${item.line.slice(0, 220)}`);
+            .map(item => `L${item.lineNumber}: ${sliceUnicodeSafe(item.line, 0, 220)}`);
         sections.push([
             `### ${filePath}`,
             `totalLines=${lines.length}, totalChars=${content.length}`,
@@ -1150,8 +1146,8 @@ function truncateGuardPromptSection(text: string, targetChars: number): string {
     if (text.length <= targetChars) return text;
     if (targetChars <= 0) return "";
     const marker = "\n…[Guard 提示词预算压缩]";
-    if (targetChars <= marker.length) return text.slice(0, targetChars);
-    return `${text.slice(0, targetChars - marker.length)}${marker}`;
+    if (targetChars <= marker.length) return sliceUnicodeSafe(text, 0, targetChars);
+    return `${sliceUnicodeSafe(text, 0, targetChars - marker.length)}${marker}`;
 }
 
 function buildGuardPromptFromInput(input: GuardPromptInput): string {

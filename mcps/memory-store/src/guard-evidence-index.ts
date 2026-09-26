@@ -1,4 +1,5 @@
 import crypto from "crypto";
+import { sliceUnicodeSafe } from "./unicode-text.js";
 import fs from "fs";
 import path from "path";
 import { spawn, execFile } from "child_process";
@@ -121,7 +122,7 @@ const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm"]);
 
 function clip(text: string, maxChars: number): string {
     if (text.length <= maxChars) return text;
-    return `${text.slice(0, Math.max(0, maxChars - 80))}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
+    return `${sliceUnicodeSafe(text, 0, Math.max(0, maxChars - 80))}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
 }
 
 function sha256Text(text: string): string {

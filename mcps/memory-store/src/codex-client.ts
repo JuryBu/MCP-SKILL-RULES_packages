@@ -1,4 +1,5 @@
 import { execFile, execFileSync } from "child_process";
+import { sliceUnicodeSafe } from "./unicode-text.js";
 import { createHash } from "crypto";
 import fs from "fs";
 import os from "os";
@@ -978,7 +979,7 @@ function extractTextFromCodexContentItem(item: any): string {
                 ? item.url
                 : "";
     if (itemType === "input_image" && imageUrl) return "";
-    return `[Codex 未识别内容块：type=${(itemType || "untyped").slice(0, 120)}]`;
+    return `[Codex 未识别内容块：type=${sliceUnicodeSafe(itemType || "untyped", 0, 120)}]`;
 }
 
 function sha256Short(text: string): string {
@@ -1187,7 +1188,7 @@ function extractCodexMessageText(
 
 function truncate(text: string, maxLen: number): string {
     if (text.length <= maxLen) return text;
-    return text.slice(0, maxLen) + "...";
+    return sliceUnicodeSafe(text, 0, maxLen) + "...";
 }
 
 function codexBinaryReference(value: string, mimeType?: string): string {
@@ -1307,7 +1308,7 @@ function normalizeProbeText(input: string): string {
 
 function snippet(text: string, maxLen = 160): string {
     const clean = text.replace(/\s+/gu, " ").trim();
-    return clean.length <= maxLen ? clean : `${clean.slice(0, maxLen)}...`;
+    return clean.length <= maxLen ? clean : `${sliceUnicodeSafe(clean, 0, maxLen)}...`;
 }
 
 function extractEventMessageText(payload: any): string {
