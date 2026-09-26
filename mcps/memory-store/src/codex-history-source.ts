@@ -10,6 +10,13 @@ const ANCHOR_BYTES = 8 * 1024;
 const UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const ROLLOUT_FILENAME = new RegExp(`^rollout-.*-(${UUID})(?:_(${UUID}))?\\.jsonl$`, "i");
 
+export class CodexHistorySourceMismatchError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "CodexHistorySourceMismatchError";
+    }
+}
+
 export interface CodexHistorySegment {
     path: string;
     rolloutId: string;
@@ -198,13 +205,13 @@ async function readAnchor(filePath: string, endByte: number): Promise<{ start: n
 }
 
 function assertLineBoundarySync(filePath: string, endByte: number, size: number): void {
-    if (endByte > size) throw new Error(`Codex history byte boundary exceeds source size: ${filePath}`);
+    if (endByte > size) throw new CodexHistorySourceMismatchError(`Codex history byte boundary exceeds source size: ${filePath}`);
     if (endByte === 0) return;
     const byte = Buffer.alloc(1);
     const descriptor = fs.openSync(filePath, "r");
     try {
         if (fs.readSync(descriptor, byte, 0, 1, endByte - 1) !== 1 || byte[0] !== 0x0a) {
-            throw new Error(`Codex history byte boundary is not a complete JSONL line: ${filePath}`);
+            throw new CodexHistorySourceMismatchError(`Codex history byte boundary is not a complete JSONL line: ${filePath}`);
         }
     } finally {
         fs.closeSync(descriptor);
@@ -491,10 +498,10 @@ export function assertCodexHistorySource(source: CodexHistorySource): void {
     let totalBytes = 0;
     for (const segment of source.segments) {
         const stats = fs.statSync(segment.path);
-        if (!stats.isFile() || stats.size < segment.endByte) throw new Error(`Codex history source is shorter or unavailable: ${segment.path}`);
+        if (!stats.isFile() || stats.size < segment.endByte) throw new CodexHistorySourceMismatchError(`Codex history source is shorter or unavailable: ${segment.path}`);
         const header = parseHeader(segment.path, readFirstLineSync(segment.path));
         if (header.identity.rolloutId !== segment.rolloutId || header.identity.threadId !== segment.threadId || sha256(header.header) !== segment.headerSha256) {
-            throw new Error(`Codex history source header changed: ${segment.path}`);
+            throw new CodexHistorySourceMismatchError(`Codex history source header changed: ${segment.path}`);
         }
         if (segment.unterminatedLeaf) {
             if (segment !== source.segments.at(-1) || segment.endOrdinalExclusive !== undefined || segment.endByte !== segment.size) {
@@ -505,11 +512,11 @@ export function assertCodexHistorySource(source: CodexHistorySource): void {
         }
         const anchor = readAnchorSync(segment.path, segment.endByte);
         if (anchor.start !== segment.anchorStartByte || sha256(anchor.value) !== segment.anchorSha256) {
-            throw new Error(`Codex history source boundary changed: ${segment.path}`);
+            throw new CodexHistorySourceMismatchError(`Codex history source boundary changed: ${segment.path}`);
         }
         totalBytes += segment.endByte;
     }
     if (totalBytes !== source.totalBytes || buildRevision(source.leafPath, source.segments) !== source.revision) {
-        throw new Error("Codex history source manifest changed");
+        throw new CodexHistorySourceMismatchError("Codex history source manifest changed");
     }
 }

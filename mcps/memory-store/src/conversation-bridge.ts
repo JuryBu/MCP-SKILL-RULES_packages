@@ -14,7 +14,7 @@ import {
     type CodexConversationData,
     type CodexSourceVersionExpectation,
 } from "./codex-client.js";
-import { assertCodexHistorySource, type CodexHistorySource } from "./codex-history-source.js";
+import { assertCodexHistorySource, CodexHistorySourceMismatchError, type CodexHistorySource } from "./codex-history-source.js";
 import {
     getClaudeCodeThread,
     loadClaudeCodeConversationAsync,
@@ -616,7 +616,12 @@ async function tryBuildIncrementalConversation(
         if (!checkpoint || !rolloutPath) return null;
         const historySource = options.expectedCodexSource?.historySource;
         if (!codexHistoryCanAppend(oldData.historySource, historySource)) return null;
-        assertCodexHistorySource(oldData.historySource!);
+        try {
+            assertCodexHistorySource(oldData.historySource!);
+        } catch (error) {
+            if (error instanceof CodexHistorySourceMismatchError) return null;
+            throw error;
+        }
         const tail = await readCodexRoundTail(rolloutPath, options.link || "summary", {
             checkpoint,
             cwd: oldData.thread.cwd,
