@@ -58,6 +58,17 @@ function Assert-Guidance {
         $guidanceText = Get-Content -LiteralPath $guidancePath -Raw -Encoding UTF8
         Assert-Contains $guidanceText $guidanceBoundaries[$name] "$Profile guidance boundary $name"
     }
+    $loginWallMarker = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("55m75b2V5aKZ"))
+    $loginTriggerLines = @($agentsText -split "`r?`n" | Where-Object {
+        $_.Contains($loginWallMarker) -and $_.Contains($mustRead) -and
+        $_.Contains("web-visual.md") -and $_.Contains("web-fetcher")
+    })
+    if ($loginTriggerLines.Count -eq 0) { throw "$Profile lacks login-wall routing before tool selection" }
+    $webGuidanceText = Get-Content -LiteralPath (Join-Path $Root "guidance\web-visual.md") -Raw -Encoding UTF8
+    foreach ($encodedBoundary in @("55m75b2V5aKZ", "6K6k6K+B5aSx5pWI", "6K6/6Zeu6ZmQ5Yi2", "5LuY6LS55aKZ", "5LiN5b6X57uV6L+H")) {
+        $boundary = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedBoundary))
+        Assert-Contains $webGuidanceText $boundary "$Profile login-state and access-control boundary"
+    }
     Assert-Contains $agentsText "sandbox_codex" "$Profile sandbox prohibition"
     if ($agentsText -notmatch '(?is)Git.{0,500}maintenance-upgrades\.md|maintenance-upgrades\.md.{0,500}Git') {
         throw "$Profile core does not route the general Git source rule to maintenance-upgrades.md"
