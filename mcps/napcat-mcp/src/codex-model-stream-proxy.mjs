@@ -28,7 +28,8 @@ const DEFAULT_UPSTREAM_ORIGIN = "https://chatgpt.com";
 const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
-const IMPLEMENTATION_VERSION = "2026-09-24.1";
+const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
+const IMPLEMENTATION_VERSION = "2026-09-26.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
@@ -236,6 +237,11 @@ function eventHasSubstantiveWork(event) {
   return type === "response.output_item.done"
     && Array.isArray(event.item?.content)
     && event.item.content.some((part) => typeof part?.text === "string" && part.text.length > 0);
+}
+
+function isRetrySafeReasoningProgress(event, completedReasoningProgress) {
+  return completedReasoningProgress || (RETRY_SAFE_REASONING_DELTAS.has(event?.type)
+    && typeof event.delta === "string" && event.delta.length > 0);
 }
 
 function responseFailureDetails(event) {
@@ -528,6 +534,7 @@ function executeTurnAttempt(options) {
     let timer = null;
     let sawCompleted = false;
     let sawContent = false;
+    let sawReplayUnsafeContent = false;
     let sawTool = false;
     let sawLocalTool = false;
     let sawSubstantiveWork = false;
@@ -572,7 +579,7 @@ function executeTurnAttempt(options) {
       const endCause = outcome.origin ?? (outcome.reason === "DOWNSTREAM_CANCELLED" ? "downstream_cancel_user_origin_unknown"
         : /^HTTP_/u.test(outcome.reason ?? "") ? "upstream_http"
         : terminalFailure ? "upstream_error" : outcome.kind === "completed" ? "upstream_completed" : "unknown");
-      resolve({ ...outcome, phase, endCause, contextPreparationHint: contextHint?.contextPreparationHint ?? null, elapsedMs: Date.now() - startedAt, frames, sawContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
+      resolve({ ...outcome, phase, endCause, contextPreparationHint: contextHint?.contextPreparationHint ?? null, elapsedMs: Date.now() - startedAt, frames, sawContent, sawReplayUnsafeContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
     };
     const abortWith = (reason) => {
       upstreamResponse?.destroy();
@@ -762,6 +769,7 @@ function executeTurnAttempt(options) {
         if (completedReasoningProgress) completedReasoningIds.add(event.item.id);
         if (!sawCompaction && (eventPayloadHasContent(event) || finalizedFunctionArguments || completedReasoningProgress)) {
           sawContent = true;
+          if (!isRetrySafeReasoningProgress(event, completedReasoningProgress)) sawReplayUnsafeContent = true;
           lastProgressAt = now;
           lastProgressType = type ?? null;
           armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
@@ -840,6 +848,7 @@ function executeTurnAttempt(options) {
               preparation.observe({ type: "response.function_call_arguments.delta", delta: "fragment" }, now);
             }
             sawContent = true;
+            if (!RETRY_SAFE_REASONING_DELTAS.has(progress.type) && !progress.reasoningId) sawReplayUnsafeContent = true;
             lastProgressAt = now;
             lastProgressType = progress.type;
             armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
@@ -1400,6 +1409,7 @@ export function createCodexModelStreamProxy(options = {}) {
         elapsedMs: outcome.elapsedMs,
         frames: outcome.frames,
         sawContent: outcome.sawContent,
+        sawReplayUnsafeContent: outcome.sawReplayUnsafeContent,
         sawSubstantiveWork: outcome.sawSubstantiveWork,
         sawExecutableToolDone: outcome.sawExecutableToolDone,
         sawTool: outcome.sawTool,
@@ -1407,8 +1417,8 @@ export function createCodexModelStreamProxy(options = {}) {
         sawHostedTool: outcome.sawHostedTool,
         toolItemTypes: outcome.toolItemTypes,
       });
-      const replayUnsafe = Boolean(prior?.replayUnsafe || hasBusinessProgress(identity)
-        || outcome.sawContent || outcome.sawSubstantiveWork || outcome.sawTool
+      const replayUnsafe = Boolean(prior?.replayUnsafe
+        || outcome.sawReplayUnsafeContent || outcome.sawSubstantiveWork || outcome.sawTool
         || outcome.sawExecutableToolDone || outcome.sawCompaction || outcome.sawHostedTool);
       if (requestState.cancelled || outcome.kind === "cancelled") {
         rememberAttemptFailure(attemptNumber, chainStartedAt, { replayUnsafe, adaptiveWaitDeadlineAt });

@@ -2,7 +2,7 @@
 
 ## Scope
 
-Model proxy `2026-09-24.1` adds bounded native retry for an adaptive upstream-idle timeout before replay-unsafe progress. The managed App Server retains a complete verified official runtime package instead of depending on a Desktop cache directory that an update may remove.
+Model proxy `2026-09-26.1` extends the bounded native upstream-idle retry introduced in `2026-09-24.1` to reasoning-only progress. It separates earlier completed requests from unsafe delivery in the current failed-request chain. The managed App Server retains a complete verified official runtime package instead of depending on a Desktop cache directory that an update may remove.
 
 These changes do not authorize stopping other tasks, changing accounts, enabling active model probes, or copying another machine's private configuration. Source publication, local installation, and a receiving machine's live acceptance are separate states.
 
@@ -10,7 +10,9 @@ These changes do not authorize stopping other tasks, changing accounts, enabling
 
 Normal first-progress and progress-idle limits remain 40 seconds. Adaptive delivery retains a 90-second upstream-idle limit and a 300-second total waiting budget. An eligible idle failure uses the existing client retry path, not a second proxy-owned upstream retry loop. The chain shares its original deadline and at most six attempts including the first; cancellation or another failure branch must not reset its budget or discard replay-safety evidence.
 
-The new idle retry requires a stable request identity and no previous content, substantive work, tool activity or compaction in the chain. An exhausted deadline, exhausted attempts or unsafe replay terminates instead. Existing quota, permanent-error, safety-policy, local-tool and compaction rules remain distinct. Before the sixth attempt, the existing rapid-failure rule only fills any shortfall to 40 seconds of total elapsed time; it does not add another 40 seconds after every failure.
+The idle retry requires a stable thread/turn identity and no replay-unsafe delivery in the current or preceding failed attempts. The allowed progress is limited to nonempty reasoning-summary/text deltas and the existing recognized encrypted-reasoning item, including parser-classified partial fragments of those reasoning types. Ordinary output, unknown content deltas, tool activity, executable tool completion, hosted tools and compaction remain unsafe even when only a fragment has arrived. Earlier successfully completed requests, including tool calls whose results the App Server already retained, do not alone forbid retrying a later reasoning-only request. Failure-chain safety markers persist until successful completion; cancellation and different failures do not clear them.
+
+An exhausted deadline, exhausted attempts or unsafe replay terminates instead. Existing quota, permanent-error (including HTTP 401), safety-policy, local-tool and compaction rules remain distinct. Before the sixth attempt, the existing rapid-failure rule only fills any shortfall to 40 seconds of total elapsed time; it does not add another 40 seconds after every failure. The retry belongs to the current model request with its existing input and tool results, not a new `turn/start` or replay of the whole task.
 
 ## Complete runtime package
 
@@ -33,5 +35,7 @@ Reject a preflight before stopping services if ownership, baseline, quiescence o
 ## Acceptance evidence
 
 Unit and loopback tests cover the idle retry budget, mixed failures, cancellation and unsafe replay, package completeness, candidate refresh, startup deadlines and owned shutdown. The launcher parameter test checks defaults and explicit overrides without starting production. Local cold-boot acceptance has separately verified actual backend/tool paths and normal tool calls; no deliberately induced live model failure is implied by those tests.
+
+An isolated `codex-cli 0.158.0-alpha.2` App Server was tested against the unmodified final proxy source and a loopback fake upstream. After one completed read-only tool, a reasoning-only response stalled for the full 90-second upstream-idle interval. Native retry retained identical request input and the existing tool result, completed successfully and executed the tool only once, with a single `turn/start`. Separate cases retained the text/tool-uncertain, 401, cancellation, deadline and attempt-limit stops. These tests do not prove behavior for every App Server version or replace a receiving machine's live acceptance.
 
 A receiver must return its own transaction outcome, deployed hashes, running version, backend and tool-host paths, normal tool/message behavior, preserved private state, and cleanup of one-shot maintenance markers. Transport receipts, file copies and HTTP health alone are not application acceptance.

@@ -246,6 +246,102 @@ for (const partial of [text("PARTIAL"), { type: "response.output_item.added", ou
   });
 }
 
+for (const previous of [text("EARLIER_COMPLETED"), { type: "response.output_item.done", output_index: 0,
+  item: { type: "function_call", id: "finished-tool", call_id: "finished-call", name: "read_file", arguments: "{}" } }]) {
+  test(`completed ${previous.type} does not block reasoning-only idle in the next request`, async context => {
+    const setup = await fixture(context, (_request, response, count) => {
+      if (count === 1) response.end(wire(previous) + wire(done));
+      else if (count === 2) response.write(wire({ type: "response.reasoning_summary_text.delta", delta: "Thinking after the completed result" }));
+      else response.end(wire(text("RECOVERED")) + wire(done));
+    }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 120 });
+    const turn = "completed-work-next-request";
+    await setup.request({ turn });
+    const stalled = await setup.request({ turn });
+    assert.equal(stalled.events.some(event => event.type === "response.completed"), false);
+    assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+    const recovered = await setup.request({ turn });
+    assert.match(recovered.body, /RECOVERED/u);
+    assert.equal(setup.count(), 3);
+  });
+}
+
+for (const reasoning of [
+  { type: "response.reasoning_summary_text.delta", delta: "Reasoning summary" },
+  { type: "response.reasoning_text.delta", delta: "Reasoning text" },
+  { type: "response.output_item.done", output_index: 0, item: { id: "reasoning-only", type: "reasoning", encrypted_content: "opaque-reasoning", summary: [] } },
+]) {
+  test(`${reasoning.type} alone permits idle retry but preserves the attempt limit`, async context => {
+    const setup = await fixture(context, (_request, response) => response.write(wire(reasoning)),
+      { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 120, maxConsecutiveAttempts: 2 });
+    const first = await setup.request({ turn: "reasoning-only" });
+    assert.equal(first.events.some(event => event.type === "response.completed"), false);
+    const final = await setup.request({ turn: "reasoning-only" });
+    assert.ok(final.events.some(event => event.type === "response.completed"));
+    assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+    assert.ok(setup.events.some(event => event.type === "retry_exhausted_completed_idle"));
+    await setup.request({ turn: "reasoning-only" });
+    assert.equal(setup.count(), 2);
+  });
+}
+
+test("unknown non-text content still prevents adaptive idle replay", async context => {
+  const setup = await fixture(context, (_request, response) => response.write(wire({ type: "response.unknown_output.delta", delta: "opaque output" })),
+    { buffered: true, adaptiveWaitLimitMs: 1000, upstreamIdleTimeoutMs: 120 });
+  await setup.request({ turn: "unknown-output" });
+  await setup.request({ turn: "unknown-output" });
+  assert.equal(setup.count(), 1);
+  assert.equal(setup.events.some(event => event.type === "native_retry_signal"), false);
+});
+
+for (const [label, fragment, retrySafe] of [
+  ["unknown", 'data: {"type":"response.unknown_output.delta","delta":"opaque', false],
+  ["text", 'data: {"type":"response.output_text.delta","delta":"visible', false],
+  ["arguments", 'data: {"type":"response.function_call_arguments.delta","delta":"{', false],
+  ["tool-done", 'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"tool","arguments":"{', false],
+  ["reasoning-summary", 'data: {"type":"response.reasoning_summary_text.delta","delta":"Thinking', true],
+  ["reasoning-text", 'data: {"type":"response.reasoning_text.delta","delta":"Thinking', true],
+  ["reasoning-item", 'data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"reasoning","encrypted_content":"opaque', true],
+]) {
+  test(`partial ${label} retains the same narrow adaptive idle replay boundary`, async context => {
+    const setup = await fixture(context, (_request, response) => response.write(fragment),
+      { buffered: true, adaptiveWaitLimitMs: 1200, upstreamIdleTimeoutMs: 100, progressIdleTimeoutMs: 1000, toolPreparationGraceMs: 1000 });
+    const result = await setup.request({ turn: `partial-${label}` });
+    assert.equal(setup.events.some(event => event.type === "native_retry_signal"), retrySafe);
+    assert.equal(result.events.some(event => event.type === "response.completed"), !retrySafe);
+    const outcome = setup.events.find(event => event.type === "turn_attempt_finished");
+    assert.equal(outcome.sawReplayUnsafeContent, !retrySafe);
+  });
+}
+
+test("a failed reasoning-only attempt does not poison the next idle attempt", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    response.write(wire({ type: "response.reasoning_summary_text.delta", delta: "Reasoning only" }));
+    if (count === 1) response.end();
+    if (count === 3) response.end(wire(text("RECOVERED")) + wire(done));
+  }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 120 });
+  await setup.request({ turn: "failed-reasoning" });
+  const second = await setup.request({ turn: "failed-reasoning" });
+  assert.equal(second.events.some(event => event.type === "response.completed"), false);
+  assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 2);
+  const final = await setup.request({ turn: "failed-reasoning" });
+  assert.match(final.body, /RECOVERED/u);
+});
+
+test("reasoning cannot erase an executable tool from an earlier failed attempt", async context => {
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count === 1) response.end(wire({ type: "response.output_item.done", output_index: 0,
+      item: { type: "function_call", id: "uncertain-tool", call_id: "uncertain-call", name: "write_file", arguments: "{}" } })
+      + wire({ type: "response.failed", response: { error: { code: "server_error", message: "temporary" } } }));
+    else response.write(wire({ type: "response.reasoning_summary_text.delta", delta: "Reasoning on retry" }));
+  }, { buffered: true, adaptiveWaitLimitMs: 1500, upstreamIdleTimeoutMs: 120 });
+  await setup.request({ turn: "uncertain-tool" });
+  const final = await setup.request({ turn: "uncertain-tool" });
+  assert.ok(final.events.some(event => event.type === "response.completed"));
+  assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
+  await setup.request({ turn: "uncertain-tool" });
+  assert.equal(setup.count(), 2);
+});
+
 test("prior streamed work also blocks a later empty adaptive idle replay", async context => {
   const setup = await fixture(context, (_request, response, count) => {
     if (count === 1) response.end(wire(text("EARLIER")));
