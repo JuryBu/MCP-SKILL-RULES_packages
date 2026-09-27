@@ -4,7 +4,7 @@
 
 - Chinese-first collaboration style and concise progress updates.
 - Work-mode distinction: chat vs. task execution.
-- Common Codex baseline `2026-09-24.1` and its paired AGENTS entry: continue from the user's last shared context, introduce necessary concepts, prioritize meaningful outcomes and express times in the user's verified local timezone.
+- Common Codex baseline `2026-09-27.2` and its paired AGENTS entry: continue from the user's last shared context, introduce necessary concepts, prioritize meaningful outcomes and express times in the user's verified local timezone.
 - Subagent / council usage boundaries and evidence requirements.
 - MCP usage rules for `memory-store`, `web-fetcher`, `sandbox`, optional `exa`, Windsurf subagent, and optional NapCat QQ group collaboration.
 - Five-source chain model: `antigravity`, `codex`, `claude-code` / `cc`, `windsurf` / `wsf`, and read-only `dsh` / `deepseek-harness`; DSH is not a model provider.

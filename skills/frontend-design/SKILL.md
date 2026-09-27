@@ -8,11 +8,15 @@ This skill guides creation of distinctive, production-grade frontend interfaces 
 
 The user provides frontend requirements: a component, page, application, or interface to build. They may include context about the purpose, audience, or technical constraints.
 
+## Shared content and approval workflow
+
+Before creating or substantially redesigning an artifact, read the configured `design-writing.md` (on this Codex setup: `%USERPROFILE%/.codex/guidance/design-writing.md`). It owns audience, reference research, representative samples, approval and reader-facing language; this skill owns frontend implementation. If no such local guide is configured, apply those steps here without treating a missing optional guide as a blocker. Reuse an approved template or reference for small edits instead of reopening style selection. Use working prototypes for interaction and responsive states; generated mockups do not prove implementation quality. If `web-visual.md` is configured, follow it for final rendering checks; otherwise use the available tools to inspect the actual target page, including desktop and mobile layouts.
+
 ## Design Thinking
 
-Before coding, understand the context and commit to a BOLD aesthetic direction:
+Before coding, understand the context and choose a deliberate aesthetic direction. Existing brand requirements, accessibility, the audience and approved samples govern the choice; expressive novelty is appropriate for new unconstrained designs, not mandatory for every interface:
 - **Purpose**: What problem does this interface solve? Who uses it?
-- **Tone**: Pick an extreme: brutally minimal, maximalist chaos, retro-futuristic, organic/natural, luxury/refined, playful/toy-like, editorial/magazine, brutalist/raw, art deco/geometric, soft/pastel, industrial/utilitarian, etc. There are so many flavors to choose from. Use these for inspiration but design one that is true to the aesthetic direction.
+- **Tone**: Choose a tone that fits the intended use: minimal, editorial, playful, refined, industrial, organic or more expressive when justified. These are options, not a requirement to choose an extreme or abandon an approved style.
 - **Constraints**: Technical requirements (framework, performance, accessibility).
 - **Differentiation**: What makes this UNFORGETTABLE? What's the one thing someone will remember?
 
@@ -27,15 +31,15 @@ Then implement working code (HTML/CSS/JS, React, Vue, etc.) that is:
 ## Frontend Aesthetics Guidelines
 
 Focus on:
-- **Typography**: Choose fonts that are beautiful, unique, and interesting. Avoid generic fonts like Arial and Inter; opt instead for distinctive choices that elevate the frontend's aesthetics; unexpected, characterful font choices. Pair a distinctive display font with a refined body font.
+- **Typography**: Respect brand, readability and accessibility requirements. For an unconstrained design, choose expressive fonts that suit its character rather than defaulting to a familiar font stack. Pair a distinctive display font with a readable body font when that serves the content.
 - **Color & Theme**: Commit to a cohesive aesthetic. Use CSS variables for consistency. Dominant colors with sharp accents outperform timid, evenly-distributed palettes.
 - **Motion**: Use animations for effects and micro-interactions. Prioritize CSS-only solutions for HTML. Use Motion library for React when available. Focus on high-impact moments: one well-orchestrated page load with staggered reveals (animation-delay) creates more delight than scattered micro-interactions. Use scroll-triggering and hover states that surprise.
 - **Spatial Composition**: Unexpected layouts. Asymmetry. Overlap. Diagonal flow. Grid-breaking elements. Generous negative space OR controlled density.
 - **Backgrounds & Visual Details**: Create atmosphere and depth rather than defaulting to solid colors. Add contextual effects and textures that match the overall aesthetic. Apply creative forms like gradient meshes, noise textures, geometric patterns, layered transparencies, dramatic shadows, decorative borders, custom cursors, and grain overlays.
 
-NEVER use generic AI-generated aesthetics like overused font families (Inter, Roboto, Arial, system fonts), cliched color schemes (particularly purple gradients on white backgrounds), predictable layouts and component patterns, and cookie-cutter design that lacks context-specific character.
+Avoid applying generic AI-generated aesthetics without context: habitual font choices, purple gradients on white backgrounds, repetitive layouts and cookie-cutter components. A required brand font, accessible system font or familiar interaction pattern can be the correct choice; judge whether it serves this design rather than banning it by name.
 
-Interpret creatively and make unexpected choices that feel genuinely designed for the context. No design should be the same. Vary between light and dark themes, different fonts, different aesthetics. NEVER converge on common choices (Space Grotesk, for example) across generations.
+Interpret creatively within the confirmed direction. Different projects may need different themes, fonts and aesthetics; related pages should retain the consistency readers need. Do not force novelty into every generation or replace an approved design simply to avoid repetition.
 
 **IMPORTANT**: Match implementation complexity to the aesthetic vision. Maximalist designs need elaborate code with extensive animations and effects. Minimalist or refined designs need restraint, precision, and careful attention to spacing, typography, and subtle details. Elegance comes from executing the vision well.
 

@@ -34,10 +34,10 @@ function Assert-Guidance {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }
     $promptText = Get-Content -LiteralPath (Join-Path $Root "prompts\system-prompt.md") -Raw -Encoding UTF8
-    foreach ($marker in @('2026-09-24.1', 'model_instructions_file', 'system-prompt.md')) {
+    foreach ($marker in @('2026-09-27.2', 'model_instructions_file', 'system-prompt.md')) {
         Assert-Contains $agentsText $marker "$Profile paired baseline entry"
     }
-    Assert-Contains $promptText '2026-09-24.1' "$Profile common baseline"
+    Assert-Contains $promptText '2026-09-27.2' "$Profile common baseline"
     $annotationBoundary = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5om55rOo"))
     Assert-Contains $promptText $annotationBoundary "$Profile annotation handling in common prompt"
     foreach ($reference in [regex]::Matches($agentsText, 'guidance[\\/]+(?<name>[a-z][a-z-]+\.md)')) {
@@ -119,6 +119,12 @@ try {
         $outputRoot = Join-Path $buildRoot $profileId
         & $buildScript -Profile $profileId -OutputDirectory $outputRoot | Out-Null
         $null = Assert-Guidance $outputRoot $profileId
+        foreach ($publicFile in @(Get-Item -LiteralPath (Join-Path $outputRoot 'AGENTS.md')) + @(Get-ChildItem -LiteralPath (Join-Path $outputRoot 'guidance') -File -Filter '*.md')) {
+            $publicText = Get-Content -LiteralPath $publicFile.FullName -Raw -Encoding UTF8
+            if ($publicText -match 'writing-examples[\\/]index\.md|conversation-tone\.local\.md') {
+                throw "$profileId public rules contain a private calibration entry: $($publicFile.Name)"
+            }
+        }
     }
 
     $reuseRoot = Join-Path $buildRoot "reuse"
@@ -135,7 +141,7 @@ try {
     }
 
     $overridePath = Join-Path $fakeCodexHome "private-override.md"
-    Set-Content -LiteralPath $overridePath -Value "private override test marker" -Encoding UTF8
+    Set-Content -LiteralPath $overridePath -Value "private override test marker`nOptional reference: guidance/writing-examples/index.md" -Encoding UTF8
     $existingAgents = "prior AGENTS marker`n"
     $existingGuidance = "prior guidance marker`n"
     $existingPrompt = "prior prompt marker`n"
@@ -147,6 +153,9 @@ try {
     Set-Content -LiteralPath $agentsPath -Value $existingAgents -NoNewline -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $guidanceRoot "engineering-workflow.md") -Value $existingGuidance -NoNewline -Encoding UTF8
     Set-Content -LiteralPath (Join-Path $guidanceRoot "private-note.md") -Value "private guidance marker" -Encoding UTF8
+    $privateExamplesRoot = Join-Path $guidanceRoot 'writing-examples'
+    New-Item -ItemType Directory -Path $privateExamplesRoot -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $privateExamplesRoot 'index.md') -Value 'receiver-private example marker' -Encoding UTF8
     Set-Content -LiteralPath $promptPath -Value $existingPrompt -NoNewline -Encoding UTF8
     $existingConfig = "[mcp_servers.private]`nurl = 'http://127.0.0.1:19999/mcp'`n"
     Set-Content -LiteralPath $configPath -Value $existingConfig -NoNewline -Encoding UTF8
@@ -168,7 +177,7 @@ try {
         @{ Name = 'old-version'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $existingPrompt },
         @{ Name = 'custom-pointer'; Config = ('model_instructions_file = "D:/private/custom-prompt.md"' + "`n" + $existingConfig); Prompt = $bundledPrompt },
         @{ Name = 'missing-prompt'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $null },
-        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-09-24.1') }) -join "`n") }
+        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-09-27.2') }) -join "`n") }
     )) {
         Set-Content -LiteralPath $configPath -Value $case.Config -NoNewline -Encoding UTF8
         if ($null -eq $case.Prompt) { Remove-Item -LiteralPath $promptPath -Force }
@@ -208,6 +217,8 @@ try {
     & $installScript -Profile "development" -LocalOverridePath $overridePath -CodexHome $fakeCodexHome -InstallSystemPrompt -InstallRecommendedDesktopFeatures | Out-Null
     $installedAgents = Assert-Guidance $fakeCodexHome "development"
     Assert-Contains $installedAgents "private override test marker" "LocalOverridePath"
+    Assert-Contains $installedAgents 'guidance/writing-examples/index.md' 'private example entry'
+    Assert-Contains (Get-Content -LiteralPath (Join-Path $privateExamplesRoot 'index.md') -Raw -Encoding UTF8) 'receiver-private example marker' 'private example preservation'
     $developmentConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
     foreach ($marker in @("project_doc_max_bytes = 131_072", "[mcp_servers.private]", 'model_instructions_file = "~/.codex/prompts/system-prompt.md"', "[features.current_time_reminder]", "reminder_interval_seconds = 120")) {
         Assert-Contains $developmentConfig $marker "development config"
