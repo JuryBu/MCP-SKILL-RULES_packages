@@ -6,7 +6,8 @@ param(
   [ValidateRange(1, 300)][int]$ProgressIdleTimeoutSeconds = 40,
   [ValidateRange(10, 600)][int]$CompactionAttemptTimeoutSeconds = 600,
   [ValidateRange(1, 20)][int]$MaxConsecutiveAttempts = 6,
-  [ValidateRange(1, 256)][int]$MaxBufferedRequestMiB = 64,
+  [ValidateRange(1, 256)][int]$MaxBufferedRequestMiB = 128,
+  [ValidateRange(1, 256)][int]$MaxDecodedRequestMiB = 192,
   [string]$UpstreamOrigin = "https://chatgpt.com",
   [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10,
   [string]$MaintenanceToken = ""
@@ -122,6 +123,7 @@ $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS"] 
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS"] = [string]($CompactionAttemptTimeoutSeconds * 1000)
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS"] = [string]$MaxConsecutiveAttempts
 $Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES"] = [string]($MaxBufferedRequestMiB * 1024 * 1024)
+$Info.EnvironmentVariables["CODEX_MODEL_STREAM_PROXY_MAX_DECODED_REQUEST_BYTES"] = [string]($MaxDecodedRequestMiB * 1024 * 1024)
 $Process = [System.Diagnostics.Process]::new()
 $Process.StartInfo = $Info
 if (-not $Process.Start()) { throw "Failed to start model stream proxy." }
@@ -158,4 +160,6 @@ if ($null -eq $Health -or $Health.ok -ne $true -or [int]$Health.pid -ne $Process
   progressIdleTimeoutSeconds = $ProgressIdleTimeoutSeconds
   compactionAttemptTimeoutSeconds = $CompactionAttemptTimeoutSeconds
   maxConsecutiveAttempts = $MaxConsecutiveAttempts
+  maxBufferedRequestMiB = $MaxBufferedRequestMiB
+  maxDecodedRequestMiB = $MaxDecodedRequestMiB
 } | ConvertTo-Json -Depth 5

@@ -16,8 +16,8 @@ import { createAdaptiveDeliveryRegistry, deliveryProfileKey } from "./adaptive-d
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
 const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
-const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 64 * 1024 * 1024;
-const DEFAULT_MAX_DECODED_REQUEST_BYTES = 96 * 1024 * 1024;
+const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 128 * 1024 * 1024;
+const DEFAULT_MAX_DECODED_REQUEST_BYTES = 192 * 1024 * 1024;
 const DEFAULT_MAX_TOTAL_REQUEST_BYTES = 256 * 1024 * 1024;
 const DEFAULT_MAX_BUFFERED_RESPONSE_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_CONSECUTIVE_ATTEMPTS = 6;
@@ -29,13 +29,14 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-09-26.1";
+const IMPLEMENTATION_VERSION = "2026-09-27.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
 const CAPACITY_EXHAUSTED_NOTICE = "\n\n当前模型暂时满载，已自动尝试六次仍未恢复，请稍后重试或切换模型。";
 const USAGE_LIMIT_NOTICE = "\n\n当前账号额度已耗尽，请等待额度恢复、购买额外额度或切换账号。";
 const PERMANENT_FAILURE_NOTICE = "\n\n本次模型响应因不可重试错误未完成，已有信息已保留，请继续。";
+const LOCAL_REQUEST_TOO_LARGE_NOTICE = "\n\n本次请求体超过本地中转上限，未发送到上游，已停止重复重试；请减少本轮图片或上下文后继续。";
 const INTERRUPTED_AFTER_PROGRESS_NOTICE = "\n\n模型流在已产生内容或工具调用后中断。为避免重复执行，本轮已停止，请重新发送。";
 const HOP_BY_HOP_HEADERS = new Set([
   "connection",
@@ -909,6 +910,10 @@ function executeTurnAttempt(options) {
       if (settled || requestState.cancelled) return;
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
     });
+    upstream.once("finish", () => {
+      onEvent({ type: "upstream_request_finished", elapsedMs: Date.now() - startedAt, bodyBytes: body.length,
+        meaning: "local_os_handoff" });
+    });
     upstream.end(body);
     observation?.submitted(nativeAttempt);
   });
@@ -933,7 +938,7 @@ function analyzeBufferedSse(body, observation = null) {
 }
 
 function executeBufferedCompactionAttempt(options) {
-  const { body, headers, method, targetUrl, timeoutMs, maxBufferedResponseBytes, requestState, observation } = options;
+  const { body, headers, method, targetUrl, timeoutMs, maxBufferedResponseBytes, requestState, observation, onEvent } = options;
   return new Promise((resolve) => {
     const client = requestClient(targetUrl);
     let settled = false;
@@ -1020,6 +1025,9 @@ function executeBufferedCompactionAttempt(options) {
     upstream.once("error", (error) => {
       if (settled || requestState.cancelled) return;
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR" });
+    });
+    upstream.once("finish", () => {
+      onEvent?.({ type: "upstream_request_finished", bodyBytes: body.length, meaning: "local_os_handoff" });
     });
     upstream.end(body);
     observation?.submitted();
@@ -1320,6 +1328,7 @@ export function createCodexModelStreamProxy(options = {}) {
           maxBufferedResponseBytes,
           requestState,
           observation,
+          onEvent: emit,
         });
         emit({ type: "compaction_attempt_finished", internalAttempt: 1, kind: outcome.kind, reason: outcome.reason ?? null });
         if (requestState.cancelled || outcome?.kind === "cancelled") return;
@@ -1578,7 +1587,15 @@ export function createCodexModelStreamProxy(options = {}) {
       if (error instanceof RequestInspectionError || error.localRequestFailure) {
         emit({ type: "request_body_rejected", code: error.code, stage: error.stage ?? "inspect",
           encodedBytes: error.encodedBytes ?? null, decodedBytes: error.decodedBytes ?? null,
-          limit: error.limit ?? null, upstreamRequestStarted: false });
+          limit: error.limit ?? null, upstreamRequestStarted: false, retryable: error.statusCode === 503 });
+        if (error.statusCode === 413 && identity.requestKind === "turn"
+          && !/\/responses\/compact\/?$/u.test(targetUrl.pathname)) {
+          if (!response.destroyed && !response.headersSent) {
+            ensureSseHead(response);
+            response.end(requestState.recovery.finish(LOCAL_REQUEST_TOO_LARGE_NOTICE));
+          }
+          return;
+        }
         if (!response.destroyed && !response.headersSent) {
           const headers = { "content-type": "application/json; charset=utf-8", "connection": "close" };
           if (error.statusCode === 503) headers["retry-after"] = "1";

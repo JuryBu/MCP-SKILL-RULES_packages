@@ -119,7 +119,9 @@ const proxy = createCodexModelStreamProxy({
   onAdaptiveDeliveryStateChange(state) { writeJsonAtomic(adaptiveStatePath, state); },
   compactionAttemptTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_COMPACTION_ATTEMPT_TIMEOUT_MS", 600_000, 10_000, 600_000),
   maxConsecutiveAttempts: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_CONSECUTIVE_ATTEMPTS", 6, 1, 20),
-  maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 64 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
+  maxBufferedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_BUFFERED_REQUEST_BYTES", 128 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
+  maxDecodedRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_DECODED_REQUEST_BYTES", 192 * 1024 * 1024, 1_024, 256 * 1024 * 1024),
+  maxTotalRequestBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MAX_TOTAL_REQUEST_BYTES", 256 * 1024 * 1024, 1_024, 512 * 1024 * 1024),
   bufferedToolIdentityHashes: deliveryProfile.bufferedToolIdentityHashes,
   bufferedToolPreparationGraceMs: 300_000,
   onEvent(event) {
@@ -168,6 +170,10 @@ function runtimeState(status = "running", error = null) {
     drainTimeoutMs,
     draining: proxy.status().draining,
     activeRequests: proxy.status().activeRequests,
+    maxBufferedRequestBytes: proxy.status().maxBufferedRequestBytes,
+    maxDecodedRequestBytes: proxy.status().maxDecodedRequestBytes,
+    requestBuffer: proxy.status().requestBuffer,
+    requestInspection: proxy.status().requestInspection,
     counters: proxy.status().counters,
     error,
   };

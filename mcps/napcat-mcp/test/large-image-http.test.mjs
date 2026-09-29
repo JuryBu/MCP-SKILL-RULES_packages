@@ -40,13 +40,13 @@ function buildFixture() {
   const url = `data:image/png;base64,${png.toString("base64")}`;
   const body = Buffer.from(JSON.stringify({ model: "fixture-model", stream: true, input: [{ role: "user", content: [
     { type: "input_text", text: "Synthetic PNG integrity fixture; never sent outside loopback." },
-    ...Array.from({ length: 27 }, () => ({ type: "input_image", image_url: url })),
+    ...Array.from({ length: 32 }, () => ({ type: "input_image", image_url: url })),
   ] }] }));
   const encoded = encoding === "zstd" ? zlib.zstdCompressSync(body) : zlib.gzipSync(body);
-  return { encoded, decodedBytes: body.length, decodedHash: digest(body), encodedHash: digest(encoded), imageCount: 27, pngBytes: png.length };
+  return { encoded, decodedBytes: body.length, decodedHash: digest(body), encodedHash: digest(encoded), imageCount: 32, pngBytes: png.length };
 }
 
-async function serve(context, create, events) {
+async function serve(context, create, events, proxyOptions = {}) {
   const received = [];
   const upstream = http.createServer(async (request, response) => {
     const wireHash = crypto.createHash("sha256");
@@ -63,7 +63,7 @@ async function serve(context, create, events) {
   });
   upstream.listen(0, "127.0.0.1");
   await once(upstream, "listening");
-  const proxy = create({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, onEvent: event => events.push(event) });
+  const proxy = create({ port: 0, upstreamOrigin: `http://127.0.0.1:${upstream.address().port}`, onEvent: event => events.push(event), ...proxyOptions });
   await proxy.start();
   const close = async () => { await proxy.stop(); upstream.closeAllConnections(); await new Promise(resolve => upstream.close(resolve)); };
   context.after(close);
@@ -82,10 +82,10 @@ async function serve(context, create, events) {
   return { proxy, send, received };
 }
 
-test("real 27-PNG request over 64 MiB decoded preserves all bytes repeatedly", { timeout: 120000, skip: process.env.RUN_LARGE_REQUEST_TESTS !== "1" }, async context => {
+test("real 32-PNG request over the former 64 MiB wire limit preserves all bytes repeatedly", { timeout: 120000, skip: process.env.RUN_LARGE_REQUEST_TESTS !== "1" }, async context => {
   const fixture = buildFixture();
-  assert.ok(fixture.decodedBytes > 64 * mebibyte && fixture.decodedBytes < 96 * mebibyte);
-  assert.ok(fixture.encoded.length < 64 * mebibyte);
+  assert.ok(fixture.decodedBytes > 64 * mebibyte && fixture.decodedBytes < 192 * mebibyte);
+  assert.ok(fixture.encoded.length > 64 * mebibyte && fixture.encoded.length < 128 * mebibyte);
   global.gc?.();
   if (createBaseline) {
     const baseline = await serve(context, createBaseline, []);
@@ -97,6 +97,8 @@ test("real 27-PNG request over 64 MiB decoded preserves all bytes repeatedly", {
   global.gc?.();
   const events = [];
   const candidate = await serve(context, createCodexModelStreamProxy, events);
+  assert.equal(candidate.proxy.status().maxBufferedRequestBytes, 128 * mebibyte);
+  assert.equal(candidate.proxy.status().maxDecodedRequestBytes, 192 * mebibyte);
   const samples = [];
   const cycleResults = [];
   const initialRss = process.memoryUsage().rss;
@@ -148,7 +150,7 @@ test("real 27-PNG request over 64 MiB decoded preserves all bytes repeatedly", {
     cancellationPreventedLargeUpstreamRequest: true, budgetAfter: candidate.proxy.status().requestBuffer }));
 });
 
-test("actual 96 MiB decoded boundary: exact accepted and plus one rejected before upstream", { timeout: 60000, skip: process.env.RUN_LARGE_REQUEST_TESTS !== "1" }, async context => {
+test("configured 96 MiB decoded boundary: exact accepted and plus one rejected before upstream", { timeout: 60000, skip: process.env.RUN_LARGE_REQUEST_TESTS !== "1" }, async context => {
   let plain = Buffer.from(JSON.stringify({ data: "x".repeat(96 * mebibyte - 11) }));
   assert.equal(plain.length, 96 * mebibyte);
   const exact = zlib.zstdCompressSync(plain);
@@ -156,14 +158,17 @@ test("actual 96 MiB decoded boundary: exact accepted and plus one rejected befor
   const over = zlib.zstdCompressSync(Buffer.concat([plain, Buffer.from(" ")]));
   plain = null;
   global.gc?.();
-  const state = await serve(context, createCodexModelStreamProxy, []);
+  const state = await serve(context, createCodexModelStreamProxy, [], {
+    maxBufferedRequestBytes: 128 * mebibyte,
+    maxDecodedRequestBytes: 96 * mebibyte,
+  });
   const accepted = await state.send(exact, "zstd");
   assert.equal(accepted.status, 200);
   assert.equal(accepted.text, completion);
   assert.equal(state.received[0].plainHash, expectedHash);
   const rejected = await state.send(over, "zstd");
-  assert.equal(rejected.status, 413);
-  assert.equal(JSON.parse(rejected.text).error.code, "decoded_body_too_large");
+  assert.equal(rejected.status, 200);
+  assert.match(rejected.text, /已停止重复重试/u);
   assert.equal(state.received.length, 1);
   assert.equal(state.proxy.status().requestBuffer.usedBytes, 0);
 });

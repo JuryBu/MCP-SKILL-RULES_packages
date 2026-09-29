@@ -44,6 +44,7 @@ for (const split of [false, true]) {
     });
     assert.equal(state.response.body, delta.repeat(2) + complete);
     assert.equal(state.events.some(event => event.reason === "SSE_FRAME_LIMIT"), false);
+    assert.ok(state.events.some(event => event.type === "upstream_request_finished" && event.meaning === "local_os_handoff"));
   });
 }
 
