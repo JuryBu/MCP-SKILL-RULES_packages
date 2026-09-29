@@ -15,6 +15,7 @@ import { createAdaptiveDeliveryRegistry, deliveryProfileKey } from "./adaptive-d
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
+const DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 128 * 1024 * 1024;
 const DEFAULT_MAX_DECODED_REQUEST_BYTES = 192 * 1024 * 1024;
@@ -29,7 +30,7 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-09-27.1";
+const IMPLEMENTATION_VERSION = "2026-09-30.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
@@ -498,6 +499,10 @@ function sendSyntheticCompletion(response, requestId, notice, headers = {}) {
   response.end(syntheticCompletion(requestId, notice));
 }
 
+function isToolInputProgressType(type) {
+  return /^response\.(?:function_call_arguments|custom_tool_call_input|local_shell_call)\.delta$/u.test(type ?? "");
+}
+
 function executeTurnAttempt(options) {
   const {
     body,
@@ -507,6 +512,7 @@ function executeTurnAttempt(options) {
     targetUrl,
     firstProgressTimeoutMs,
     progressIdleTimeoutMs,
+    toolInputProgressIdleTimeoutMs = progressIdleTimeoutMs,
     compactionAttemptTimeoutMs,
     toolPreparationGraceMs,
     bufferedToolIdentityHashes,
@@ -773,7 +779,8 @@ function executeTurnAttempt(options) {
           if (!isRetrySafeReasoningProgress(event, completedReasoningProgress)) sawReplayUnsafeContent = true;
           lastProgressAt = now;
           lastProgressType = type ?? null;
-          armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
+          const toolInputProgress = !sawExecutableToolDone && isToolInputProgressType(type);
+          armTimer(toolInputProgress ? toolInputProgressIdleTimeoutMs : progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         }
         if (eventHasSubstantiveWork(event)) sawSubstantiveWork = true;
         if (["function_call", "custom_tool_call", "local_shell_call"].includes(event?.item?.type)
@@ -852,7 +859,8 @@ function executeTurnAttempt(options) {
             if (!RETRY_SAFE_REASONING_DELTAS.has(progress.type) && !progress.reasoningId) sawReplayUnsafeContent = true;
             lastProgressAt = now;
             lastProgressType = progress.type;
-            armTimer(progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
+            armTimer((progress.argumentsProgress || isToolInputProgressType(progress.type)) && !sawExecutableToolDone
+              ? toolInputProgressIdleTimeoutMs : progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         },
         onError: (error) => {
           if (settled || requestState.cancelled) return;
@@ -1043,6 +1051,10 @@ export function createCodexModelStreamProxy(options = {}) {
   }
   const firstProgressTimeoutMs = integerOption(options.firstProgressTimeoutMs, DEFAULT_FIRST_PROGRESS_TIMEOUT_MS, 10, 300_000, "firstProgressTimeoutMs");
   const progressIdleTimeoutMs = integerOption(options.progressIdleTimeoutMs, DEFAULT_PROGRESS_IDLE_TIMEOUT_MS, 10, 300_000, "progressIdleTimeoutMs");
+  const retryProgressIdleTimeoutMs = integerOption(options.retryProgressIdleTimeoutMs,
+    Math.max(progressIdleTimeoutMs, Math.min(DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS,
+      Math.round(progressIdleTimeoutMs * DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_PROGRESS_IDLE_TIMEOUT_MS))),
+    10, 300_000, "retryProgressIdleTimeoutMs");
   const adaptiveWaitLimitMs = integerOption(options.adaptiveWaitLimitMs, 300_000, 10, 300_000, "adaptiveWaitLimitMs");
   const upstreamIdleTimeoutMs = integerOption(options.upstreamIdleTimeoutMs, 90_000, 10, 300_000, "upstreamIdleTimeoutMs");
   const adaptiveProbeCooldownMs = integerOption(options.adaptiveProbeCooldownMs, 600_000, 10, 86_400_000, "adaptiveProbeCooldownMs");
@@ -1220,6 +1232,8 @@ export function createCodexModelStreamProxy(options = {}) {
         updatedAt: Date.now(),
         replayUnsafe: Boolean(previous?.replayUnsafe || details.replayUnsafe),
         adaptiveWaitDeadlineAt: previous?.adaptiveWaitDeadlineAt ?? details.adaptiveWaitDeadlineAt ?? null,
+        progressRetryProbeUsed: Boolean(previous?.progressRetryProbeUsed || details.progressRetryProbeUsed),
+        progressRetryProbePending: Boolean(details.progressRetryProbePending ?? previous?.progressRetryProbePending),
       });
     };
     const finishSoftTerminal = (notice, eventType, details = {}, headers = {}) => {
@@ -1374,12 +1388,21 @@ export function createCodexModelStreamProxy(options = {}) {
       const chainStartedAt = prior?.startedAt ?? Date.now();
       const attemptNumber = key ? (prior?.failures ?? 0) + 1 : null;
       const finalAttempt = Boolean(key && attemptNumber >= maxConsecutiveAttempts);
+      const progressRetryProbe = Boolean(key && prior?.progressRetryProbePending && !prior?.progressRetryProbeUsed);
+      const attemptToolInputProgressIdleTimeoutMs = progressRetryProbe
+        ? Math.max(progressIdleTimeoutMs, retryProgressIdleTimeoutMs)
+        : progressIdleTimeoutMs;
       const adaptiveWaitDeadlineAt = prior?.adaptiveWaitDeadlineAt ?? chainStartedAt + adaptiveWaitLimitMs;
       if (prior?.adaptiveWaitDeadlineAt && Date.now() >= adaptiveWaitDeadlineAt) {
         finishAdaptiveWait("ADAPTIVE_WAIT_LIMIT");
         return;
       }
-      emit({ type: "turn_attempt_started", attemptNumber, maxConsecutiveAttempts, finalAttempt, untrackedIdentity: !key, firstProgressTimeoutMs, progressIdleTimeoutMs });
+      if (progressRetryProbe) {
+        attempts.set(key, { ...prior, progressRetryProbePending: false, progressRetryProbeUsed: true, updatedAt: Date.now() });
+      }
+      emit({ type: "turn_attempt_started", attemptNumber, maxConsecutiveAttempts, finalAttempt, untrackedIdentity: !key,
+        firstProgressTimeoutMs, progressIdleTimeoutMs,
+        toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs, progressRetryProbe });
       const outcome = await executeTurnAttempt({
         body,
         downstream: response,
@@ -1388,6 +1411,7 @@ export function createCodexModelStreamProxy(options = {}) {
         targetUrl,
         firstProgressTimeoutMs,
         progressIdleTimeoutMs,
+        toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
         toolPreparationGraceMs,
         bufferedToolIdentityHashes,
@@ -1444,8 +1468,13 @@ export function createCodexModelStreamProxy(options = {}) {
       const retryableAdaptiveIdle = outcome.kind === "adaptive_wait_timeout"
         && outcome.reason === "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT"
         && Boolean(key) && !replayUnsafe && Date.now() < adaptiveWaitDeadlineAt;
+      const progressRetryProbeUsed = Boolean(prior?.progressRetryProbeUsed || progressRetryProbe);
       const retryState = { replayUnsafe,
-        adaptiveWaitDeadlineAt: retryableAdaptiveIdle || prior?.adaptiveWaitDeadlineAt ? adaptiveWaitDeadlineAt : null };
+        adaptiveWaitDeadlineAt: retryableAdaptiveIdle || prior?.adaptiveWaitDeadlineAt ? adaptiveWaitDeadlineAt : null,
+        progressRetryProbeUsed,
+        progressRetryProbePending: !progressRetryProbeUsed && retryProgressIdleTimeoutMs > progressIdleTimeoutMs
+          && outcome.reason === "PROGRESS_IDLE_TIMEOUT" && outcome.endCause === "local_timer"
+          && outcome.phase === "tool_parameters" && !outcome.sawExecutableToolDone };
       if (outcome.kind === "adaptive_wait_timeout") {
         if (!retryableAdaptiveIdle) {
           finishAdaptiveWait(Date.now() >= adaptiveWaitDeadlineAt ? "ADAPTIVE_WAIT_LIMIT" : outcome.reason, outcome.upstreamHeaders);
