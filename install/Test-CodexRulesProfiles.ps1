@@ -30,6 +30,13 @@ function Assert-Guidance {
     if (-not (Test-Path -LiteralPath $agentsPath -PathType Leaf)) { throw "$Profile did not produce AGENTS.md" }
     if ((Get-Item -LiteralPath $agentsPath).Length -gt 65536) { throw "$Profile AGENTS.md exceeds 65536 bytes" }
     $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
+    $engineeringText = Get-Content -LiteralPath (Join-Path $Root "guidance\engineering-workflow.md") -Raw -Encoding UTF8
+    $bridgeText = Get-Content -LiteralPath (Join-Path $Root "guidance\communication-bridges.md") -Raw -Encoding UTF8
+    Assert-Contains $engineeringText "automation_update" "$Profile persistent continuation tool"
+    Assert-Contains $engineeringText "10$([char]0xff5e)30" "$Profile recurring continuation interval"
+    Assert-Contains $engineeringText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5Li757q/5a6M5oiQ5YmN5L+d5oyB5pyJ5pWI"))) "$Profile continuation lifetime"
+    Assert-Contains $agentsText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5LiN6IO95Zug5pS25Yiw5LiA5Liq5Zue5YyF"))) "$Profile reply does not end mainline"
+    Assert-Contains $bridgeText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5pS25Yiw5Zue5YyF5ZCO5pu05paw5qOA5p+l54K5"))) "$Profile bridge updates mainline checkpoint"
     foreach ($marker in @("stage_guard", "sandbox_council")) {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }

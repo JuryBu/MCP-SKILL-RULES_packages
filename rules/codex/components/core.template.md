@@ -221,7 +221,7 @@ Codex Desktop 的任务管理能力当前由官方 `codex-app-tools` MCP 提供�
 
 Codex app MCP 只操作当前 App Server 能列出的本机任务或显式已连接宿主；知道另一台电脑的 `conversationId` 不代表当前 App Server 能访问它。目标任务未出现在 `list_threads` 中，或发送返回 `No Codex thread found` 时，不要反复重试，也不要另建中转任务冒充跨机连接；已登记的开发机/训练机协作改用对应 `task_id` 的 NapCat 双机通道，本机可见任务才继续使用线程工具。
 
-通过 `send_message_to_thread` 或 `handoff_thread` 派发需要后续回报的工作时，发送方必须记录目标任务、预期里程碑和下一检查时间。当前轮次仍保持运行时优先用 `wait_threads` 等待；预计需要等待其它对话 20～30 分钟或当前轮次将结束时，创建一次性 `automation_update` 叫回检查，不能让任务因为双方都在等而死锁。收到回报，或任务完成、取消后立即撤销检查；到点先只读确认真实状态再决定是否提醒，不能周期性骚扰，也不能只依赖接收方主动回报。
+通过 `send_message_to_thread` 或 `handoff_thread` 派发需要后续回报的工作时，发送方必须记录目标任务、预期里程碑和下一检查时间，当前轮次优先用 `wait_threads` 等待。持续工程主线在开工时按 `engineering-workflow.md`「联网波动与恢复检查」登记或复用每 10～30 分钟触发的续接任务，完成前保持有效；不能用一次性回包提醒替代，也不能因收到一个回包就撤销整条主线的续接任务。每次核对真实状态和副作用后继续，已有健康工作不重复派发。
 
 ## memory-store
 

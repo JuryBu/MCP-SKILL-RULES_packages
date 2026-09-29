@@ -104,7 +104,7 @@ NapCat 的 `get_group_msg_history` 本来就包含当前账号自己的消息，
 
 每次唤醒携带 `generation`、`wake_id`、全部 `pending_message_seqs`、本次 `new_message_seqs` 和 `previously_pending_message_seqs`。模型实际处理完一条或多条后，调用 `napcat_task_ack`，明确传 `expected_generation=唤醒提示中的 generation`、该消息所在唤醒的 `wake_id`，并在 `processed_message_seqs` 中只列出已完成消息；未列出的消息继续待处理。旧唤醒的迟到 ACK 只确认明确列出的消息，不能清除后来消息。`pending_through_message_seq` 仅保留作兼容摘要，不再是整批 ACK 边界。`napcat_task_update` 可把单任务冷却调整到 30～120 秒。换对话或修改路由身份时 generation 增加，旧代次不能继续 ACK；任务仍有待处理消息或活动唤醒时，路由换绑会被拒绝，必须先处理或安全恢复账本，不能靠换绑清空现场。
 
-需要对端业务回信的结构化任务在正文或索引中显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。`machine_received` 与 `conversation_received` 只证明运输链路，不是业务回信；预计处理超过 60 秒时接收方先回 `IN_PROGRESS` 和新的检查时间。发送方等待其它对话 20～30 分钟时设置一次性 `automation_update` 叫回检查，收到回信后撤销，避免两端互等。
+需要对端业务回信的结构化任务在正文或索引中显式写 `reply_required=true`、`expected_reply`、带时区回复期限和 `next_check`。`machine_received` 与 `conversation_received` 只证明运输链路，不是业务回信；预计处理超过 60 秒时接收方先回 `IN_PROGRESS` 和新的检查时间。持续工程按[工程续接规则](../../rules/codex/guidance/engineering-workflow.template.md#八联网波动与恢复检查)，开工时登记或复用每 10～30 分钟的主线续接任务；收到单项业务回信后更新检查点，整条主线未结束时继续保留。自动续接先核真实副作用，不重复发送或执行业务。
 
 生产对话已经长期空闲、但旧版留下多批 `sent` 唤醒且待处理消息仍不能判定完成时，只能使用 `ops/rearm-stale-sent-wake.mjs` 做受控重新提醒。先用 `--prepare` 固定 registry/dedupe/router log 哈希、任务绑定、精确 pending 与 wake 身份，再在确认对话空闲和业务进程为 0 后用 `--execute`；脚本会备份三文件、归档旧 wake、保持消息与 ACK 状态不变，并向同一对话注入恰好一个随机新 `wake_id`。任一身份或文件漂移都会拒绝执行，注入失败则恢复备份；禁止用它代 ACK、清 pending、换 generation 或启动新业务。
 
