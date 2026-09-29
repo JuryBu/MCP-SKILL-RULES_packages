@@ -32,6 +32,31 @@ function Assert-Guidance {
     $agentsText = Get-Content -LiteralPath $agentsPath -Raw -Encoding UTF8
     $engineeringText = Get-Content -LiteralPath (Join-Path $Root "guidance\engineering-workflow.md") -Raw -Encoding UTF8
     $bridgeText = Get-Content -LiteralPath (Join-Path $Root "guidance\communication-bridges.md") -Raw -Encoding UTF8
+    foreach ($modelRow in @('`gpt-6-luna` | `max`', '`gpt-6.1-sol` | `xhigh`', '`gpt-6.1-sol` | `max`', '`gpt-6-astra` | `xhigh`')) {
+        Assert-Contains $agentsText $modelRow "$Profile model policy"
+    }
+    foreach ($encodedRow in @(
+        'fCDpnIDopoHnkIbop6Plj5boiI3nmoTosIPmn6XjgIHkuIDoiKzlrp7njrDkuI7mnZDmlpnliLbkvZwgfCBgZ3B0LTYuMS1zb2xgIHwgYHhoaWdoYCB8',
+        'fCDlpI3mnYLlrp7njrDjgIHnoJTnqbbliIbmnpDjgIHku6PnoIHlrqHmn6XjgIHlt6XnqIvop4TliJLkuI7op4bop4npqozmlLYgfCBgZ3B0LTYuMS1zb2xgIHwgYG1heGAgfA=='
+    )) {
+        Assert-Contains $agentsText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedRow))) "$Profile task-to-effort binding"
+    }
+    if ($agentsText.Contains('`gpt-6-sol`')) { throw "$Profile retains the previous Sol default" }
+    Assert-Contains $engineeringText 'GPT-6.1 Sol max' "$Profile routine independent reviews"
+    Assert-Contains $engineeringText 'Astra xhigh' "$Profile key-point independent reviews"
+    foreach ($boundary in @(
+        '6aaW5qyh56Gu5a6a5aSn5pa55ZCR',
+        '6YeN5aSn6Lev57q/6LCD5pW0',
+        '5Y+N5aSN56Kw5aOB',
+        '6buY6K6k5pyA5aSa6L+e57utIDMg6L2u5L2/55SoIFNvbA==',
+        '5LiL5LiA6L2u5Lik6aG55Z2H55SoIEFzdHJhIHhoaWdoIOeLrOeri+WkjeaguA==',
+        '5YWz6ZSu5LiN5Y+v6YCG5Yaz562W5YmN',
+        '5bey6IO96K+G5Yir6aOO6Zmp5pe256uL5Y2z6Kem5Y+R77yM5LiN562J5bi46KeE6L2u5qyh55So5ruh',
+        '5Lit5pat5oGi5aSN5oiW5pu05o2i5omn6KGM57q/56iL5LiN6YeN572u6K6h5pWw',
+        '5Lik6aG55a6h5p+l5YiG5Yir5aeU5omY44CB5L2/55So54us56uL5LiK5LiL5paH'
+    )) {
+        Assert-Contains $engineeringText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($boundary))) "$Profile review cadence and escalation"
+    }
     Assert-Contains $engineeringText "automation_update" "$Profile persistent continuation tool"
     Assert-Contains $engineeringText "10$([char]0xff5e)30" "$Profile recurring continuation interval"
     Assert-Contains $engineeringText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5Li757q/5a6M5oiQ5YmN5L+d5oyB5pyJ5pWI"))) "$Profile continuation lifetime"
