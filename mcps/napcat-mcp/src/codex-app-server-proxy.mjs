@@ -4,6 +4,7 @@ import http from "node:http";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
 import { createWakeVisibilityAdapter } from "./wake-visibility.mjs";
+import { createReasoningPlaceholderView } from "./reasoning-placeholder.mjs";
 import { createTurnLifecycleObserver } from "./turn-observability.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
@@ -408,6 +409,8 @@ export class CodexAppServerProxy {
     this.WebSocketServerImpl = options.WebSocketServerImpl ?? WebSocketServer;
     this.journal = options.journal ?? null;
     this.wakeVisibility = createWakeVisibilityAdapter();
+    this.reasoningPlaceholderEnabled = options.reasoningPlaceholderEnabled !== false;
+    this.reasoningPlaceholderClientNames = options.reasoningPlaceholderClientNames;
     this.maintenanceFilePath = options.maintenanceFilePath
       ? path.resolve(String(options.maintenanceFilePath))
       : null;
@@ -483,6 +486,7 @@ export class CodexAppServerProxy {
       reconnectAttempt: client.reconnectAttempt,
       nextReconnectAt: client.nextReconnectAt,
       connectedAt: client.connectedAt,
+      reasoningPlaceholder: client.reasoningPlaceholder.status(),
       turnObservation: client.turnObserver.status(),
     }));
     return {
@@ -804,6 +808,10 @@ export class CodexAppServerProxy {
       downstreamAlive: true,
       upstreamAlive: false,
       wakeVisibility: this.wakeVisibility.createView(),
+      reasoningPlaceholder: createReasoningPlaceholderView({
+        enabled: this.reasoningPlaceholderEnabled,
+        clientNames: this.reasoningPlaceholderClientNames,
+      }),
       turnObserver: this.createTurnObserver({
         timeoutMs: this.turnFirstOutputTimeoutMs,
         onAnomaly: (event) => this.onEvent(event),
@@ -813,6 +821,7 @@ export class CodexAppServerProxy {
     downstream.on("message", (data, isBinary) => {
       client.downstreamAlive = true;
       const message = parseJsonMessage(data, this.maxJsonParseBytes);
+      client.reasoningPlaceholder.observeRequest(message);
       client.turnObserver.observeDownstream(message);
       if (message?.method === "initialize") {
         client.initializationRequestId = message.id ?? null;
@@ -922,7 +931,9 @@ export class CodexAppServerProxy {
       }
       if (client.wakeVisibility.shouldSuppress(message)) return;
       if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
-        this.#sendOrClose(client, client.downstream, data, isBinary, "upstream_to_downstream");
+        const projected = client.reasoningPlaceholder.project(message);
+        const payload = projected !== message ? JSON.stringify(projected) : data;
+        this.#sendOrClose(client, client.downstream, payload, isBinary, "upstream_to_downstream");
       }
     });
     upstream.on("close", () => this.#handleUpstreamDisconnect(client, upstream, "upstream_closed"));
@@ -1081,6 +1092,7 @@ export class CodexAppServerProxy {
     client.closed = true;
     client.wakeVisibility.close();
     this.clients.delete(client);
+    client.reasoningPlaceholder.close();
     if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
     client.reconnectTimer = null;
     client.turnObserver.close(reason);
