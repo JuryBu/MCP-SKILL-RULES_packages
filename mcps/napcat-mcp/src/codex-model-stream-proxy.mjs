@@ -1317,7 +1317,15 @@ export function createCodexModelStreamProxy(options = {}) {
       requestState.inspectionAbort.abort();
       requestState.currentAbort?.();
       counters.cancelled += 1;
-      emit({ type: "downstream_cancelled" });
+      emit({
+        type: "downstream_cancelled",
+        closeTrigger: "response_close",
+        responseWritableEnded: response.writableEnded,
+        responseDestroyed: response.destroyed,
+        responseHeadersSent: response.headersSent,
+        requestAborted: request.aborted,
+        requestComplete: request.complete,
+      });
       if (!identity.guarded || request.method !== "POST") finish();
     });
     let targetUrl;

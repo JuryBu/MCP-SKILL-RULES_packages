@@ -63,6 +63,63 @@ async function waitForRequestCleanup(setup) {
   assert.equal(setup.proxy.status().activeRequests, 0);
 }
 
+test("normal response completion is not reported as a downstream cancellation", async context => {
+  const setup = await fixture(context, (_request, response) => {
+    response.end(wire(text("NORMAL_COMPLETION")) + wire(done));
+  });
+  const result = await setup.request({ turn: "normal-close-observation" });
+  await waitForRequestCleanup(setup);
+  assert.match(result.body, /NORMAL_COMPLETION/u);
+  assert.equal(setup.events.some(event => event.type === "downstream_cancelled"), false);
+});
+
+test("partial tool cancellation records only close metadata and leaves the next sampling usable", async context => {
+  let upstreamCancelled = false;
+  const setup = await fixture(context, (_request, response, count) => {
+    if (count > 1) {
+      response.end(wire(text("AFTER_PENDING_MESSAGE")) + wire(done));
+      return;
+    }
+    response.once("close", () => { upstreamCancelled = true; });
+    response.write(wire({
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { id: "partial-tool", type: "custom_tool_call", call_id: "partial-tool", name: "exec", input: "" },
+    }));
+    response.write(wire({ type: "response.custom_tool_call_input.delta", output_index: 0, item_id: "partial-tool", delta: "PARTIAL_INPUT_MARKER" }));
+  }, { firstProgressTimeoutMs: 1000, progressIdleTimeoutMs: 1000, upstreamIdleTimeoutMs: 1200 });
+  const controller = new AbortController();
+  const turn = "pending-message-sampling";
+  await assert.rejects(setup.request({
+    turn,
+    signal: controller.signal,
+    onData: output => {
+      if (output.includes("PARTIAL_INPUT_MARKER")) controller.abort();
+    },
+  }));
+  await waitForRequestCleanup(setup);
+  const cancellation = setup.events.find(event => event.type === "downstream_cancelled");
+  assert.ok(cancellation);
+  assert.equal(cancellation.closeTrigger, "response_close");
+  assert.equal(cancellation.responseWritableEnded, false);
+  assert.equal(typeof cancellation.responseDestroyed, "boolean");
+  assert.equal(cancellation.responseHeadersSent, true);
+  assert.equal(cancellation.requestAborted, false);
+  assert.equal(cancellation.requestComplete, true);
+  assert.equal(JSON.stringify(cancellation).includes("PARTIAL_INPUT_MARKER"), false);
+  const cancelled = setup.events.find(event => event.type === "turn_attempt_finished" && event.kind === "cancelled");
+  assert.equal(cancelled?.reason, "DOWNSTREAM_CANCELLED");
+  assert.equal(cancelled?.phase, "tool_parameters");
+  assert.equal(cancelled?.sawExecutableToolDone, false);
+  assert.equal(setup.proxy.status().counters.syntheticCompletions, 0);
+  const next = await setup.request({ turn });
+  await waitForRequestCleanup(setup);
+  assert.match(next.body, /AFTER_PENDING_MESSAGE/u);
+  assert.equal(next.events.some(event => event.type === "response.completed"), true);
+  assert.equal(setup.count(), 2);
+  assert.equal(upstreamCancelled, true);
+});
+
 test("concentrated completion is learned, used by the next request, then real streaming restores normal mode", async context => {
   const setup = await fixture(context, async (_request, response, count) => {
     heartbeat(response);
