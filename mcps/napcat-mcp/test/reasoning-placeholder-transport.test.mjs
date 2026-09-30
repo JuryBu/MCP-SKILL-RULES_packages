@@ -273,6 +273,16 @@ test("Desktop 真实传输仅投影空 completed reasoning，外部请求及分�
     assertBytePass(context, "真实 delta 后的空完成项", deltaCompletion.original, deltaCompletion.received,
       deltaItem, deltaCompletion.received.message.params.item);
 
+    for (const [itemId, index] of [["after-real", 1], ["after-real", 1], ["following-empty", 2]]) {
+      const item = { ...emptyItem, id: itemId };
+      const message = completion(item);
+      const reply = await fixture.deliver(connection, "真实文字后连续空摘要", message);
+      const expected = structuredClone(message);
+      expected.params.item.summary = [`推理片段${index}已收到，摘要为空`];
+      assertProjection(context, "真实文字后连续空摘要", reply.original, reply.received,
+        item, reply.received.message.params.item, expected);
+    }
+
     const historyResult = {
       data: [
         { item: { ...emptyItem, id: "history-empty" }, turnId: "history-turn", completedAtMs: 1750000000000, ordinal: 9, rowMetadata: { preserved: true } },

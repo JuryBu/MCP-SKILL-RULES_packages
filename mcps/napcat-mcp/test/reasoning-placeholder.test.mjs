@@ -72,7 +72,127 @@ test("stable item ids do not increment numbering on repeated completion or histo
   assert.deepEqual(projector.project(first).params.item.summary, ["推理片段1已收到，摘要为空"]);
   projector.project(notification("item/completed", reasoning("reason-2", ["真实第二段"])));
   const third = notification("item/completed", reasoning("reason-3"));
-  assert.deepEqual(projector.project(third).params.item.summary, ["推理片段3已收到，摘要为空"]);
+  assert.deepEqual(projector.project(third).params.item.summary, ["推理片段1已收到，摘要为空"]);
+});
+
+test("genuine summaries, content and deltas restart consecutive empty numbering", () => {
+  for (const realSource of ["summary", "content", "summaryTextDelta", "textDelta"]) {
+    const projector = view();
+    startTurn(projector);
+    for (const [itemId, index] of [["empty-a", 1], ["empty-b", 2]]) {
+      assert.deepEqual(projector.project(notification("item/completed", reasoning(itemId))).params.item.summary,
+        [`推理片段${index}已收到，摘要为空`]);
+    }
+    const genuine = realSource.endsWith("Delta")
+      ? { method: `item/reasoning/${realSource}`, params: { threadId: "thread-1", turnId: "turn-1", itemId: "real", delta: "真实文字" } }
+      : notification("item/completed", reasoning("real", realSource === "summary" ? ["真实文字"] : [], realSource === "content" ? ["真实文字"] : []));
+    assert.equal(projector.project(genuine), genuine);
+    const next = notification("item/completed", reasoning("empty-c"));
+    assert.deepEqual(projector.project(next).params.item.summary, ["推理片段1已收到，摘要为空"]);
+    assert.equal(projector.project(genuine), genuine);
+    assert.deepEqual(projector.project(next).params.item.summary, ["推理片段1已收到，摘要为空"]);
+    assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-d"))).params.item.summary,
+      ["推理片段2已收到，摘要为空"]);
+  }
+});
+
+test("full history consistently resets empty runs after actual reasoning text", () => {
+  const projector = view();
+  startTurn(projector);
+  projector.project(notification("item/completed", reasoning("last")));
+  const turn = { id: "turn-1", status: "completed", itemsView: "full", items: [reasoning("first"), reasoning("second"),
+    reasoning("real", ["真实摘要"]), { type: "agentMessage", id: "message", text: "普通正文" }, reasoning("after"), reasoning("last")] };
+  for (let repeat = 0; repeat < 2; repeat += 1) {
+    const output = history(projector, "thread/read", { thread: { id: "thread-1", turns: [turn] } });
+    assert.deepEqual(output.result.thread.turns[0].items.filter(item => item.type === "reasoning").map(item => item.summary[0]),
+      ["推理片段1已收到，摘要为空", "推理片段2已收到，摘要为空", "真实摘要", "推理片段1已收到，摘要为空", "推理片段2已收到，摘要为空"]);
+  }
+});
+
+test("late genuine text recalculates the following empty run without overwriting text", () => {
+  const projector = view();
+  startTurn(projector);
+  for (const itemId of ["late", "following", "last"]) projector.project(notification("item/completed", reasoning(itemId)));
+  const genuine = notification("item/completed", reasoning("late", ["晚到真实摘要"]));
+  assert.equal(projector.project(genuine), genuine);
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("following"))).params.item.summary,
+    ["推理片段1已收到，摘要为空"]);
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("last"))).params.item.summary,
+    ["推理片段2已收到，摘要为空"]);
+});
+
+test("descending partial history cannot reset or reorder a known live empty run", () => {
+  const projector = view();
+  startTurn(projector);
+  projector.project(notification("item/completed", reasoning("empty-a")));
+  const result = { data: [{ turnId: "turn-1", completedAtMs: 1000, item: reasoning("unpositioned", ["历史真实摘要"]) }], nextCursor: "next" };
+  const output = history(projector, "thread/items/list", result, { threadId: "thread-1", sortDirection: "desc" });
+  assert.equal(output.result, result);
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-b"))).params.item.summary,
+    ["推理片段2已收到，摘要为空"]);
+});
+
+test("unknown reasoning content prevents guessed numbering until the next genuine item", () => {
+  const projector = view();
+  startTurn(projector);
+  projector.project(notification("item/completed", reasoning("empty-a")));
+  const unknown = notification("item/completed", { ...reasoning("unknown"), content: { unknown: true } });
+  assert.equal(projector.project(unknown), unknown);
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-b"))).params.item.summary,
+    ["推理片段已收到，摘要为空"]);
+  projector.project(notification("item/completed", reasoning("real", ["真实摘要"])));
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-c"))).params.item.summary,
+    ["推理片段1已收到，摘要为空"]);
+});
+
+test("partial discoveries become ordered when genuine live text arrives", () => {
+  for (const realSource of ["summary", "content", "summaryTextDelta", "textDelta"]) {
+    const projector = view();
+    startTurn(projector);
+    projector.project(notification("item/completed", reasoning("empty-a")));
+    history(projector, "thread/items/list", { data: [{ turnId: "turn-1", completedAtMs: 1000, item: reasoning("real") }] },
+      { threadId: "thread-1", sortDirection: "desc" });
+    const genuine = realSource.endsWith("Delta")
+      ? { method: `item/reasoning/${realSource}`, params: { threadId: "thread-1", turnId: "turn-1", itemId: "real", delta: "真实文字" } }
+      : notification("item/completed", reasoning("real", realSource === "summary" ? ["真实文字"] : [], realSource === "content" ? ["真实文字"] : []));
+    assert.equal(projector.project(genuine), genuine);
+    assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-b"))).params.item.summary,
+      ["推理片段1已收到，摘要为空"]);
+  }
+});
+
+test("a genuine live boundary restores numbering even without a known turn prefix", () => {
+  const projector = view();
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("before"))).params.item.summary,
+    ["推理片段已收到，摘要为空"]);
+  projector.project(notification("item/completed", reasoning("real", ["真实摘要"])));
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("after"))).params.item.summary,
+    ["推理片段1已收到，摘要为空"]);
+});
+
+test("a live item omitted from a full snapshot can establish a later genuine boundary", () => {
+  const projector = view();
+  startTurn(projector);
+  projector.project(notification("item/completed", reasoning("empty-a")));
+  projector.project(notification("item/started", reasoning("real")));
+  history(projector, "thread/read", { thread: { id: "thread-1", turns: [{ id: "turn-1", status: "inProgress", itemsView: "full", items: [reasoning("empty-a")] }] } });
+  projector.project({ method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "real", delta: "真实摘要" } });
+  assert.deepEqual(projector.project(notification("item/completed", reasoning("empty-b"))).params.item.summary,
+    ["推理片段1已收到，摘要为空"]);
+});
+
+test("untrackable reasoning identity falls back to the entire original frame instead of guessing a boundary", () => {
+  for (const invalidId of [undefined, "", "x".repeat(257)]) {
+    const projector = view();
+    const turn = { id: "turn-1", status: "completed", itemsView: "full", items: [reasoning("first"), reasoning(invalidId, ["真实文字"]), reasoning("last")] };
+    turn.items[1].id = invalidId;
+    const original = { thread: { id: "thread-1", turns: [turn] } };
+    const output = history(projector, "thread/read", original);
+    assert.equal(output.result, original);
+    assert.equal(projector.status().trackingAvailable, false);
+    const subsequent = notification("item/completed", reasoning("later"));
+    assert.equal(projector.project(subsequent), subsequent);
+  }
 });
 
 test("thread and turn scopes do not share item indexes or visible state", () => {

@@ -48,29 +48,54 @@ export function createReasoningPlaceholderView(options = {}) {
     return turns.get(key);
   }
 
-  function observeItem(threadId, turnId, item, prefixKnown = false) {
-    if (item?.type !== "reasoning" || !validId(item.id)) return null;
+  function refreshIndexes(state) {
+    let consecutiveEmpty = 0;
+    let numberingKnown = state.prefixKnown;
+    for (const record of state.items.values()) {
+      record.index = null;
+      if (!record.ordered) continue;
+      if (record.visible) { consecutiveEmpty = 0; numberingKnown = true; }
+      else if (!record.shapeKnown) numberingKnown = false;
+      else if (numberingKnown) record.index = ++consecutiveEmpty;
+    }
+  }
+
+  function observeItem(threadId, turnId, item, prefixKnown = false, ordered = true) {
+    if (item?.type !== "reasoning") return null;
+    if (!validId(item.id)) { trackingAvailable = false; return null; }
     const state = turnState(threadId, turnId, prefixKnown);
     if (!state) return null;
     if (!state.items.has(item.id)) {
       if (state.items.size >= maximumItems) { trackingAvailable = false; return null; }
       if (!reserve(Buffer.byteLength(item.id) + 128)) return null;
-      state.items.set(item.id, { index: state.prefixKnown ? state.items.size + 1 : null, visible: false, completed: false });
+      state.items.set(item.id, { index: null, ordered, shapeKnown: false, visible: false, completed: false });
     }
     const record = state.items.get(item.id);
+    if (ordered && !record.ordered) {
+      state.items.delete(item.id);
+      state.items.set(item.id, record);
+      record.ordered = true;
+    }
+    if (Object.hasOwn(item, "summary") || Object.hasOwn(item, "content")) {
+      record.shapeKnown = Array.isArray(item.summary) && Array.isArray(item.content)
+        && item.summary.every(part => typeof part === "string") && item.content.every(part => typeof part === "string");
+    }
     if (textPresent(item.summary) || textPresent(item.content)) record.visible = true;
+    refreshIndexes(state);
     return record;
   }
 
-  function projectItem(threadId, turnId, item, prefixKnown = false, completed = true, canonicalIndex) {
+  function projectItem(threadId, turnId, item, prefixKnown = false, completed = true, ordered = true) {
     if (!Array.isArray(item?.summary) || !Array.isArray(item?.content)
-      || item.summary.some(part => typeof part !== "string") || item.content.some(part => typeof part !== "string")) return item;
-    const record = observeItem(threadId, turnId, item, prefixKnown);
+      || item.summary.some(part => typeof part !== "string") || item.content.some(part => typeof part !== "string")) {
+      observeItem(threadId, turnId, item, prefixKnown, ordered);
+      return item;
+    }
+    const record = observeItem(threadId, turnId, item, prefixKnown, ordered);
     if (!record) return item;
-    if (Number.isInteger(canonicalIndex) && canonicalIndex > 0) record.index = canonicalIndex;
     if (completed) record.completed = true;
     if (!record.completed || record.visible || textPresent(item.summary) || textPresent(item.content)) return item;
-    const label = record.index === null ? "推理片段" : `推理片段${record.index}`;
+    const label = !ordered || record.index === null ? "推理片段" : `推理片段${record.index}`;
     projectedItems += 1;
     return { ...item, summary: [`${label}已收到，摘要为空`] };
   }
@@ -79,11 +104,23 @@ export function createReasoningPlaceholderView(options = {}) {
     if (!turn || !Array.isArray(turn.items)) return turn;
     const prefixKnown = turn.itemsView === "full";
     const completed = turn.status === "completed";
-    let reasoningIndex = 0;
-    const items = turn.items.map(item => {
-      if (item?.type === "reasoning") reasoningIndex += 1;
-      return projectItem(threadId, turn.id, item, prefixKnown, completed, prefixKnown ? reasoningIndex : undefined);
-    });
+    if (prefixKnown) {
+      const state = turnState(threadId, turn.id, true);
+      if (state) {
+        const orderedItems = new Map();
+        for (const item of turn.items) {
+          const record = observeItem(threadId, turn.id, item, false, false);
+          if (record) { record.ordered = true; orderedItems.set(item.id, record); }
+        }
+        for (const [itemId, record] of state.items) {
+          if (!orderedItems.has(itemId)) { record.ordered = false; orderedItems.set(itemId, record); }
+        }
+        state.items = orderedItems;
+        state.prefixKnown = true;
+        refreshIndexes(state);
+      }
+    }
+    const items = turn.items.map(item => projectItem(threadId, turn.id, item, prefixKnown, completed, prefixKnown));
     return items.some((item, index) => item !== turn.items[index]) ? { ...turn, items } : turn;
   }
 
@@ -122,7 +159,7 @@ export function createReasoningPlaceholderView(options = {}) {
       const prefixKnown = !request.params.hasCursor && !request.params.descending;
       const data = result.data.map(entry => {
         if (!entry || !Number.isFinite(entry.completedAtMs)) return entry;
-        const item = projectItem(request.params.threadId, entry.turnId, entry.item, prefixKnown);
+        const item = projectItem(request.params.threadId, entry.turnId, entry.item, prefixKnown, true, prefixKnown);
         return item === entry.item ? entry : { ...entry, item };
       });
       return data.some((entry, index) => entry !== result.data[index]) ? { ...message, result: { ...result, data } } : message;
@@ -152,7 +189,7 @@ export function createReasoningPlaceholderView(options = {}) {
     if (message.method === "item/reasoning/summaryTextDelta" || message.method === "item/reasoning/textDelta") {
       if (textPresent(params?.delta)) {
         const record = observeItem(params?.threadId, params?.turnId, { type: "reasoning", id: params?.itemId });
-        if (record) record.visible = true;
+        if (record) { record.visible = true; refreshIndexes(turnState(params.threadId, params.turnId)); }
       }
       return message;
     }
