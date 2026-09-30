@@ -205,7 +205,7 @@ test("concurrent healthy request is not delayed or cancelled by another stalled 
   assert.match(slowResult.body, /slow/u);
 });
 
-test("compaction uses bounded internal retry while ordinary hosted turns use the retry guard", async (t) => {
+test("compaction uses native retry without ordinary idle completion while hosted turns use the guard", async (t) => {
   let attempts = 0;
   let turnAttempts = 0;
   let compactionAttempts = 0;
@@ -216,7 +216,7 @@ test("compaction uses bounded internal retry while ordinary hosted turns use the
     if (metadata.request_kind === "compaction") {
       compactionAttempts += 1;
       if (compactionAttempts === 1) {
-        res.write(sse({ type: "response.in_progress" }));
+        res.end(sse({ type: "response.in_progress" }));
         return;
       }
       res.end(sse({ type: "response.output_text.delta", delta: "summary" }) + sse({ type: "response.completed" }));

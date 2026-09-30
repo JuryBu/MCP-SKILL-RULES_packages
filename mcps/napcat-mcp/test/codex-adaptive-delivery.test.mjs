@@ -147,35 +147,40 @@ test("a probed idle timeout retries without resetting its absolute budget during
   assert.ok(setup.events.some(event => event.type === "adaptive_wait_terminal_replayed"));
 });
 
-test("an expired idle retry budget prevents opening another upstream connection", async context => {
+test("only active no-progress waiting exhausts the retry balance, not the reconnect gap", async context => {
   const setup = await fixture(context, () => {}, { buffered: true, adaptiveWaitLimitMs: 280, upstreamIdleTimeoutMs: 120 });
   const first = await setup.request({ turn: "budget-before-connect" });
   assert.equal(first.events.some(event => event.type === "response.completed"), false);
   await sleep(300);
+  const second = await setup.request({ turn: "budget-before-connect" });
+  assert.equal(second.events.some(event => event.type === "response.completed"), false);
+  assert.equal(setup.count(), 2);
   const final = await setup.request({ turn: "budget-before-connect" });
   assert.match(final.body, /等待上限/u);
-  assert.equal(setup.count(), 1);
+  assert.equal(setup.count(), 3);
+  await setup.request({ turn: "budget-before-connect" });
+  assert.equal(setup.count(), 3);
 });
 
-test("disconnect regression: an idle retry keeps its absolute deadline after downstream cancellation", async context => {
+test("disconnect regression: cancellation preserves the spent balance without charging the reconnect gap", async context => {
   const setup = await fixture(context, (_request, response, count) => {
-    if (count > 2) response.end(wire(text("UNEXPECTED_REPLAY")) + wire(done));
+    if (count > 2) response.end(wire(text("AFTER_RECONNECT")) + wire(done));
   }, { buffered: true, adaptiveWaitLimitMs: 600, upstreamIdleTimeoutMs: 120 });
   const turn = "disconnect-idle-budget";
   await setup.request({ turn });
-  const deadline = setup.events.find(event => event.type === "adaptive_idle_retry_eligible")?.deadlineAt;
-  assert.ok(Number.isFinite(deadline));
+  const remaining = setup.events.find(event => event.type === "adaptive_idle_retry_eligible")?.waitBudgetRemainingMs;
+  assert.ok(remaining > 400 && remaining < 500);
   const controller = new AbortController();
   await assert.rejects(setup.request({ turn, signal: controller.signal, onData: () => controller.abort() }));
   await waitForRequestCleanup(setup);
   assert.equal(setup.count(), 2);
   assert.ok(setup.events.some(event => event.type === "downstream_cancelled"));
-  await sleep(Math.max(0, deadline - Date.now()) + 30);
-  const terminal = await setup.request({ turn });
-  assert.equal(setup.count(), 2, "an expired pre-disconnect deadline must block another upstream request");
-  assert.match(terminal.body, /等待上限/u);
-  await setup.request({ turn });
-  assert.equal(setup.count(), 2);
+  await sleep(650);
+  const result = await setup.request({ turn });
+  assert.equal(setup.count(), 3);
+  assert.match(result.body, /AFTER_RECONNECT/u);
+  const starts = setup.events.filter(event => event.type === "turn_attempt_started");
+  assert.ok(starts[2].waitBudgetRemainingMs <= remaining && starts[2].waitBudgetRemainingMs > 350);
 });
 
 test("disconnect regression: exposed hosted work stays unsafe after downstream cancellation", async context => {
@@ -353,19 +358,21 @@ test("prior streamed work also blocks a later empty adaptive idle replay", async
   assert.equal(setup.events.filter(event => event.type === "native_retry_signal").length, 1);
 });
 
-test("a tool preparation timeout cannot discard an earlier idle retry deadline", async context => {
+test("a tool preparation timeout preserves the spent balance but excludes the reconnect gap", async context => {
   const setup = await fixture(context, (_request, response, count) => {
     if (count === 2) {
       response.write(wire({ type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "pending", call_id: "pending-call", name: "safe", arguments: "" } }));
-    } else if (count > 2) response.end(wire(text("UNEXPECTED")) + wire(done));
+    } else if (count > 2) response.end(wire(text("AFTER_PREPARATION")) + wire(done));
   }, { buffered: true, adaptiveWaitLimitMs: 600, upstreamIdleTimeoutMs: 180, toolPreparationGraceMs: 60 });
   await setup.request({ turn: "idle-then-preparation" });
   await setup.request({ turn: "idle-then-preparation" });
   assert.ok(setup.events.some(event => event.type === "local_tool_phase_retry_signal"));
   await sleep(650);
   const final = await setup.request({ turn: "idle-then-preparation" });
-  assert.equal(setup.count(), 2);
-  assert.match(final.body, /等待上限/u);
+  assert.equal(setup.count(), 3);
+  assert.match(final.body, /AFTER_PREPARATION/u);
+  const starts = setup.events.filter(event => event.type === "turn_attempt_started");
+  assert.ok(starts[2].waitBudgetRemainingMs > 250 && starts[2].waitBudgetRemainingMs < 450);
 });
 
 test("a tool preparation timeout cannot discard an earlier hosted work safety marker", async context => {
@@ -387,16 +394,21 @@ test("a tool preparation timeout cannot discard an earlier hosted work safety ma
   assert.equal(setup.count(), 3);
 });
 
-test("body progress cannot reset a buffered request hard budget", async context => {
+test("healthy body progress can continue beyond the initial buffered wait budget", async context => {
   const setup = await fixture(context, (_request, response) => {
-    const timer = setInterval(() => response.write(wire(text("a"))), 20);
+    let count = 0;
+    const timer = setInterval(() => {
+      response.write(wire(text("a")));
+      count += 1;
+      if (count === 20) { clearInterval(timer); response.end(wire(done)); }
+    }, 20);
     response.once("close", () => clearInterval(timer));
   }, { buffered: true, adaptiveWaitLimitMs: 240 });
   const began = Date.now();
   const result = await setup.request();
-  assert.match(result.body, /等待上限/u);
-  assert.ok(Date.now() - began < 750);
-  assert.equal(setup.proxy.status().adaptiveDelivery.buffered, 1);
+  assert.ok(result.events.some(event => event.type === "response.completed"));
+  assert.doesNotMatch(result.body, /等待上限/u);
+  assert.ok(Date.now() - began >= 350 && Date.now() - began < 1000);
 });
 
 test("a creation acknowledgement without sustained upstream activity cannot trigger a probe", async context => {
