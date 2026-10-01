@@ -66,12 +66,25 @@ function Invoke-ComponentOperator([string]$Operation,[hashtable]$OperationArgume
   }
 }
 $Results=@()
+$ExcludedRuntimeArtifacts=@()
 foreach($Scenario in $Scenarios){
   Write-Output ('SCENARIO_START='+$Scenario)
   $Branch=Join-Path $OutputRoot $Scenario
   $Code=Join-Path $Branch 'code';$Candidate=Join-Path $Branch 'candidate';$Data=Join-Path $Branch 'data';$Backup=Join-Path $Branch 'backup'
   New-Item -ItemType Directory -Path $Code,(Join-Path $Candidate 'src'),(Join-Path $Data 'state'),$Backup|Out-Null
-  Copy-Item -LiteralPath (Join-Path $RuntimeSourceRoot 'src'),(Join-Path $RuntimeSourceRoot 'ops') -Destination $Code -Recurse
+  foreach($SourceFolderName in @('src','ops')){
+    $SourceFolder=Join-Path $RuntimeSourceRoot $SourceFolderName
+    foreach($SourceFile in @(Get-ChildItem -LiteralPath $SourceFolder -File -Recurse)){
+      $SourceRelative=Join-Path $SourceFolderName $SourceFile.FullName.Substring(($SourceFolder.TrimEnd('\')+'\').Length)
+      if($SourceFile.Name -like '*.tmp'){
+        $ExcludedRuntimeArtifacts+=@{scenario=$Scenario;relative=$SourceRelative;bytes=$SourceFile.Length;sha=(Get-FileHash -LiteralPath $SourceFile.FullName).Hash}
+        continue
+      }
+      $DestinationFile=Join-Path $Code $SourceRelative
+      New-Item -ItemType Directory -Path (Split-Path $DestinationFile) -Force|Out-Null
+      Copy-Item -LiteralPath $SourceFile.FullName -Destination $DestinationFile
+    }
+  }
   foreach($Relative in $Files){Copy-Item -LiteralPath (Join-Path $Code $Relative) -Destination (Join-Path $Candidate $Relative)}
   $Core=Join-Path $Code 'src\codex-model-stream-proxy.mjs'
   $CoreText=[IO.File]::ReadAllText($Core)
@@ -158,5 +171,5 @@ foreach($Scenario in $Scenarios){
   }
   Write-Output ('SCENARIO_PASSED='+$Scenario)
 }
-$Result=@{root=$OutputRoot;passed=$true;powerShellVersion=$PSVersionTable.PSVersion.ToString();nodeVersion=$NodeVersion;nodePath=$Node;invocationPath=$InvocationPath;operatorSha=(Get-FileHash -LiteralPath $OperatorPath).Hash;helperSha=(Get-FileHash -LiteralPath (Join-Path (Split-Path $OperatorPath) 'model-proxy-recovery-intent.ps1')).Hash;results=$Results;scope='owned TEMP actual runtime, original PowerShell startup and stop, controlled loopback, no production writes'}
+$Result=@{root=$OutputRoot;passed=$true;powerShellVersion=$PSVersionTable.PSVersion.ToString();nodeVersion=$NodeVersion;nodePath=$Node;invocationPath=$InvocationPath;operatorSha=(Get-FileHash -LiteralPath $OperatorPath).Hash;helperSha=(Get-FileHash -LiteralPath (Join-Path (Split-Path $OperatorPath) 'model-proxy-recovery-intent.ps1')).Hash;results=$Results;excludedRuntimeArtifacts=$ExcludedRuntimeArtifacts;scope='owned TEMP actual runtime, original PowerShell startup and stop, controlled loopback, no production writes'}
 $Result|ConvertTo-Json -Depth 8|Tee-Object -FilePath (Join-Path $OutputRoot 'result.json')

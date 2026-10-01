@@ -45,4 +45,6 @@
 
 `test/fixtures/model-proxy-component-maintenance.ps1` 使用实际安装的启动/停止入口和自有 TEMP 状态、端口、受控环回上游，覆盖真实 Busy 后空闲再次安装、最后停止拒绝、停止后意图写入失败、候选启动后失败及发布清单变化。显式传入 `NodePath` 选择目标实际二进制，传入 `InvocationPath` 则经公共调用器完成真正的独立 Prepare/Inspect/Apply/Rollback，而非在同一进程伪造入口函数。夹具只修改 TEMP 中的合成候选版本，不重放真实图片或调用付费模型；所有自有进程正常收尾。每台机器使用同一源码并记录真实 PowerShell 版本、入口哈希、原始日志、字节/权限和正常业务结果。
 
+复制运行源码时不复制既有 `*.tmp` 事务暂存文件，并在结果中记录其来源路径、大小和哈希，避免把历史文件误判为本次 Busy 新增残留。该处理只影响测试复制范围，不删除或修改生产中未知归属的文件。
+
 `node --test --test-concurrency=1 test/maintenance-powershell-process.test.mjs` 覆盖实际 WinPS5/PS7 的有限后台 Node、真实非零退出、空输出、字面 JSON 参数、解析失败及超时自然退出。需要指定便携 PS7 时使用 `MAINTENANCE_TEST_PWSH`，不修改系统安装或永久执行策略；没有该版本时如实保留未测边界，不把跳过算通过。
