@@ -57,6 +57,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
     task.settled = true;
     clearTimeout(task.timer);
     task.signal?.removeEventListener("abort", task.onAbort);
+    task.body = null;
     if (error) task.reject(error);
     else task.resolve(value);
     task.complete();
@@ -87,6 +88,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
         workerData: { body: task.body, contentEncoding: task.contentEncoding, maxDecodedBytes },
         resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
       });
+      task.body = null;
     } catch (error) {
       active.delete(task);
       settle(task, new RequestInspectionError("inspection_worker_failed", { limit: maxDecodedBytes, cause: error }));
@@ -136,6 +138,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
     return new Promise((resolve, reject) => {
       const task = { body, contentEncoding, signal, resolve, reject, settled: false, terminalError: null,
         worker: null, result: null };
+      body = null;
       task.done = new Promise(complete => { task.complete = complete; });
       task.onAbort = () => cancel(task, new RequestInspectionError("inspection_aborted", {
         limit: maxDecodedBytes, cause: signal.reason,

@@ -3,7 +3,7 @@ import http from "node:http";
 import https from "node:https";
 import { StringDecoder } from "node:string_decoder";
 import { createRequestInspector, RequestInspectionError } from "./request-body-inspector.mjs";
-import { collectRequestBody, createRequestBufferBudget } from "./request-body-buffer.mjs";
+import { collectRequestBody, createRequestBodyOwner, createRequestBufferBudget } from "./request-body-buffer.mjs";
 import { createRequestObservation } from "./model-observation-hooks.mjs";
 import { correlationQuality, hashIdentity } from "./observability-utils.mjs";
 import { createStreamRecovery, waitForRetry } from "./codex-stream-recovery.mjs";
@@ -31,7 +31,7 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-10-01.1";
+const IMPLEMENTATION_VERSION = "2026-10-01.2";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
@@ -506,7 +506,7 @@ function isToolInputProgressType(type) {
 
 function executeTurnAttempt(options) {
   const {
-    body,
+    requestBody,
     downstream,
     headers,
     method,
@@ -587,6 +587,7 @@ function executeTurnAttempt(options) {
       clearTimeout(timer);
       if (outcome.kind === "completed") adaptive?.complete(Date.now(), !sawCompaction);
       requestState.currentAbort = null;
+      if (!upstream.writableFinished) upstream.destroy();
       const phase = holdingToolDone ? "tool_completion_barrier" : sawLocalTool ? "tool_parameters"
         : contextHint?.contextPreparationHint === true ? "context_preparation_hint" : sawSubstantiveWork ? "ordinary_generation" : "unknown";
       const endCause = outcome.origin ?? (outcome.reason === "DOWNSTREAM_CANCELLED" ? "downstream_cancel_user_origin_unknown"
@@ -701,7 +702,7 @@ function executeTurnAttempt(options) {
     const noteProgress = (time, type) => {
       if (waitBudget?.noteProgress(time)) {
         onEvent({ type: "first_progress_observed", elapsedMs: time - startedAt, progressType: type,
-          encodedBytes: body.length, uploadAllowanceMs });
+          encodedBytes: requestBody.bytes, uploadAllowanceMs });
       }
     };
     const completeFromUpstream = (wire) => {
@@ -720,7 +721,7 @@ function executeTurnAttempt(options) {
 
     const upstream = client.request(targetUrl, {
       method,
-      headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, body.length), "accept-encoding": "identity" },
+      headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, requestBody.bytes), "accept-encoding": "identity" },
     });
     requestState.currentAbort = () => {
       upstreamResponse?.destroy();
@@ -939,11 +940,10 @@ function executeTurnAttempt(options) {
       if (settled || requestState.cancelled) return;
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
     });
-    upstream.once("finish", () => {
-      onEvent({ type: "upstream_request_finished", elapsedMs: Date.now() - startedAt, bodyBytes: body.length,
+    requestBody.submit(upstream, bodyBytes => {
+      onEvent({ type: "upstream_request_finished", elapsedMs: Date.now() - startedAt, bodyBytes,
         meaning: "local_os_handoff" });
     });
-    upstream.end(body);
     observation?.submitted(nativeAttempt);
   });
 }
@@ -967,7 +967,7 @@ function analyzeBufferedSse(body, observation = null) {
 }
 
 function executeBufferedCompactionAttempt(options) {
-  const { body, headers, method, targetUrl, timeoutMs, maxBufferedResponseBytes, requestState, observation, onEvent } = options;
+  const { requestBody, headers, method, targetUrl, timeoutMs, maxBufferedResponseBytes, requestState, observation, onEvent } = options;
   return new Promise((resolve) => {
     const client = requestClient(targetUrl);
     let settled = false;
@@ -978,6 +978,7 @@ function executeBufferedCompactionAttempt(options) {
       observation?.ended(outcome.kind);
       clearTimeout(timer);
       requestState.currentAbort = null;
+      if (!upstream.writableFinished) upstream.destroy();
       resolve(outcome);
     };
     const timer = setTimeout(() => {
@@ -989,7 +990,7 @@ function executeBufferedCompactionAttempt(options) {
     timer.unref?.();
     const upstream = client.request(targetUrl, {
       method,
-      headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, body.length), "accept-encoding": "identity" },
+      headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, requestBody.bytes), "accept-encoding": "identity" },
     });
     requestState.currentAbort = () => {
       upstreamResponse?.destroy();
@@ -1055,10 +1056,9 @@ function executeBufferedCompactionAttempt(options) {
       if (settled || requestState.cancelled) return;
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR" });
     });
-    upstream.once("finish", () => {
-      onEvent?.({ type: "upstream_request_finished", bodyBytes: body.length, meaning: "local_os_handoff" });
+    requestBody.submit(upstream, bodyBytes => {
+      onEvent?.({ type: "upstream_request_finished", bodyBytes, meaning: "local_os_handoff" });
     });
-    upstream.end(body);
     observation?.submitted();
   });
 }
@@ -1234,6 +1234,7 @@ export function createCodexModelStreamProxy(options = {}) {
     const compactionDeadlineAt = identity.requestKind === "compaction" ? Date.now() + compactionAttemptTimeoutMs : null;
     let compactionPreparationTimer = null;
     const bodyLease = requestBufferBudget.lease();
+    const requestBody = createRequestBodyOwner(bodyLease);
     requestState.recovery = createStreamRecovery(requestId);
     active.set(requestId, requestState);
     const threadHash = hashIdentity(identity.threadId);
@@ -1308,7 +1309,7 @@ export function createCodexModelStreamProxy(options = {}) {
     const finish = () => {
       observation?.ended(requestState.cancelled ? "cancelled" : "ended_unknown");
       clearTimeout(compactionPreparationTimer);
-      bodyLease.release();
+      requestBody.releaseUnused();
       active.delete(requestId);
     };
     response.once("close", () => {
@@ -1355,14 +1356,14 @@ export function createCodexModelStreamProxy(options = {}) {
           requestState.inspectionAbort.abort();
         }, Math.max(0, compactionDeadlineAt - Date.now()));
       }
-      const body = await collectRequestBody(request, maxBufferedRequestBytes, bodyLease, requestState.inspectionAbort.signal);
-      const inspected = await requestInspector.inspect(body, request.headers["content-encoding"], { signal: requestState.inspectionAbort.signal });
+      requestBody.assign(await collectRequestBody(request, maxBufferedRequestBytes, bodyLease, requestState.inspectionAbort.signal));
+      const inspected = await requestInspector.inspect(requestBody.body, request.headers["content-encoding"], { signal: requestState.inspectionAbort.signal });
       clearTimeout(compactionPreparationTimer);
       if (requestState.cancelled) return;
       const compactionRemainingMs = compactionDeadlineAt === null ? compactionAttemptTimeoutMs : Math.max(0, compactionDeadlineAt - Date.now());
       if (compactionDeadlineAt !== null && compactionRemainingMs === 0) throw Object.assign(new Error("Compaction classification budget exhausted"), { code: "COMPACTION_CONTROL_TIMEOUT" });
       observation?.parsed(inspected.modelInvalid ? { invalid: true } : inspected.model);
-      emit({ type: "request_body_inspected", encodedBytes: body.length, decodedBytes: inspected.decodedBytes,
+      emit({ type: "request_body_inspected", encodedBytes: requestBody.bytes, decodedBytes: inspected.decodedBytes,
         contentEncoding: inspected.contentEncoding, decodedLimit: maxDecodedRequestBytes });
       counters.guarded += 1;
       const contextHint = inspected.contextHint;
@@ -1390,7 +1391,7 @@ export function createCodexModelStreamProxy(options = {}) {
       if (identity.requestKind === "compaction" && transport !== "sampling_sse") {
         emit({ type: "compaction_attempt_started", internalAttempt: 1, timeoutMs: compactionRemainingMs, classifiedTimeoutMs: compactionAttemptTimeoutMs });
         const outcome = await executeBufferedCompactionAttempt({
-          body,
+          requestBody,
           headers: request.headers,
           method: request.method,
           targetUrl,
@@ -1450,7 +1451,7 @@ export function createCodexModelStreamProxy(options = {}) {
       const attemptFirstProgressTimeoutMs = firstProgressRetryProbe
         ? Math.max(firstProgressTimeoutMs, retryFirstProgressTimeoutMs) : firstProgressTimeoutMs;
       const uploadAllowanceMs = compactionRequest ? 0
-        : requestUploadAllowanceMs(body.length, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
+        : requestUploadAllowanceMs(requestBody.bytes, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
       const progressRetryProbe = Boolean(key && prior?.progressRetryProbePending && !prior?.progressRetryProbeUsed);
       const attemptToolInputProgressIdleTimeoutMs = progressRetryProbe
         ? Math.max(progressIdleTimeoutMs, retryProgressIdleTimeoutMs)
@@ -1472,7 +1473,7 @@ export function createCodexModelStreamProxy(options = {}) {
         progressIdleTimeoutMs,
         toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs, progressRetryProbe });
       const outcome = await executeTurnAttempt({
-        body,
+        requestBody,
         downstream: response,
         headers: request.headers,
         method: request.method,

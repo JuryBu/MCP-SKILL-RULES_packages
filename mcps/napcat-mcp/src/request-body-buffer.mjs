@@ -27,6 +27,39 @@ export function createRequestBufferBudget(maxBytes) {
   };
 }
 
+export function createRequestBodyOwner(lease) {
+  let body = null;
+  let bytes = 0;
+  let submitted = false;
+  return {
+    get body() { return body; },
+    get bytes() { return bytes; },
+    assign(value) {
+      if (body !== null || submitted) throw new Error("Request body already assigned");
+      body = value;
+      bytes = value.length;
+    },
+    releaseUnused() {
+      if (submitted) return;
+      body = null;
+      lease.release();
+    },
+    submit(upstream, onFinished) {
+      if (submitted || body === null) throw new Error("Request body cannot be submitted twice");
+      submitted = true;
+      const release = () => lease.release();
+      upstream.once("finish", () => {
+        release();
+        if (!upstream.destroyed) onFinished?.(bytes);
+      });
+      upstream.once("close", release);
+      try { upstream.end(body); }
+      catch (error) { upstream.destroy(); throw error; }
+      finally { body = null; }
+    },
+  };
+}
+
 export function collectRequestBody(request, maximumBytes, lease, signal) {
   return new Promise((resolve, reject) => {
     const chunks = [];
