@@ -31,9 +31,11 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-10-01.2";
+const IMPLEMENTATION_VERSION = "2026-10-02.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
-const SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
+const LEGACY_SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
+const SAFETY_POLICY_CODES = new Set([...LEGACY_SAFETY_POLICY_CODES, "cyber_policy", "misalignment_policy_violation", "invalid_prompt"]);
+const EXPLICIT_PERMANENT_CODES = new Set(["context_length_exceeded"]);
 const NETWORK_EXHAUSTED_NOTICE = "\n\n本次模型响应未完成，已有信息已保留，请继续。";
 const CAPACITY_EXHAUSTED_NOTICE = "\n\n当前模型暂时满载，已自动尝试六次仍未恢复，请稍后重试或切换模型。";
 const USAGE_LIMIT_NOTICE = "\n\n当前账号额度已耗尽，请等待额度恢复、购买额外额度或切换账号。";
@@ -56,6 +58,9 @@ const USAGE_LIMIT_CODES = new Set([
   "usage_limit_exceeded",
   "quota_exceeded",
   "insufficient_quota",
+  "credit_balance_exhausted",
+  "organization_spend_limit_exceeded",
+  "project_spend_limit_exceeded",
   "usage_not_included",
 ]);
 const TRANSIENT_CODES = new Set([
@@ -255,18 +260,36 @@ function responseFailureDetails(event) {
   const code = rawCode.trim().toLowerCase();
   const message = rawMessage.replace(/[\r\n]+/gu, " ").trim();
   const safetyPolicy = SAFETY_POLICY_CODES.has(code);
-  const usageLimit = USAGE_LIMIT_CODES.has(code)
-    || /you(?:'|’)ve hit your usage limit|codex\/settings\/usage|purchase more credits|quota exceeded/iu.test(message);
-  const capacity = CAPACITY_CODES.has(code) || /selected model is at capacity|server overloaded/iu.test(message);
-  const permanent = !usageLimit && !capacity
-    && (safetyPolicy || EXPLICIT_PERMANENT_CODE.test(code) || EXPLICIT_PERMANENT_MESSAGE.test(message));
-  const transient = !usageLimit && !capacity && !permanent;
+  const explicitPermanent = safetyPolicy || EXPLICIT_PERMANENT_CODES.has(code) || EXPLICIT_PERMANENT_CODE.test(code);
+  const knownTransient = TRANSIENT_CODES.has(code) || /^(?:internal_server_error|internal_error|flex_unavailable)$/u.test(code);
+  const usageLimit = !explicitPermanent && (USAGE_LIMIT_CODES.has(code)
+    || (!knownTransient && !CAPACITY_CODES.has(code)
+      && /you(?:'|’)ve hit your usage limit|codex\/settings\/usage|purchase more credits|quota exceeded/iu.test(message)));
+  const capacity = !explicitPermanent && !usageLimit && (CAPACITY_CODES.has(code)
+    || (!knownTransient && /selected model is at capacity|server overloaded/iu.test(message)));
+  const permanent = explicitPermanent || (!knownTransient && !usageLimit && !capacity && EXPLICIT_PERMANENT_MESSAGE.test(message));
   return {
     code: code || null,
     message: message.slice(0, 512) || null,
     safetyPolicy,
-    category: usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
+    category: safetyPolicy ? "permanent" : usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
   };
+}
+
+function safetyPolicyNotice(failure) {
+  if (LEGACY_SAFETY_POLICY_CODES.has(failure.code)) return SAFETY_POLICY_NOTICE;
+  const reasons = {
+    cyber_policy: "上游网络安全策略拒绝",
+    misalignment_policy_violation: "上游安全策略拒绝",
+    invalid_prompt: "上游判定请求输入无效",
+  };
+  return `${reasons[failure.code]}（${failure.code}），本轮已停止，未继续自动重试。`;
+}
+
+function permanentFailureNotice(failure) {
+  return failure?.code === "context_length_exceeded"
+    ? "\n\n本次请求超过上游上下文长度限制，已停止自动重试，请缩减或压缩上下文后再试。"
+    : PERMANENT_FAILURE_NOTICE;
 }
 
 function responseFailureDetailsFromBody(body, observation = null) {
@@ -752,6 +775,7 @@ function executeTurnAttempt(options) {
           const failure = responseFailureDetailsFromBody(responseBody, observation);
           if (failure.safetyPolicy) return finish({ kind: "permanent_failure", reason: failure.code, failure, upstreamHeaders });
           if (failure.category === "usage_limit") return finish({ kind: "usage_limit", reason: `HTTP_${statusCode}`, failure, upstreamHeaders });
+          if (failure.category === "permanent") return finish({ kind: "permanent_failure", reason: failure.code ?? `HTTP_${statusCode}`, failure, upstreamHeaders });
           if (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient") {
             return finish({ kind: "retryable_failure", reason: `HTTP_${statusCode}`, failure, upstreamHeaders });
           }
@@ -959,7 +983,11 @@ function analyzeBufferedSse(body, observation = null) {
     if (isResponsesProtocolType(parsed.type ?? "")) sawResponsesProtocol = true;
     if (parsed.type === "response.completed") sawCompleted = true;
     if (parsed.type === "response.output_item.done" && parsed.event?.item?.type === "compaction") compactionItems += 1;
-    if (parsed.type === "response.failed" || parsed.type === "response.incomplete" || parsed.type === "error") failure = responseFailureDetails(parsed.event);
+    if (parsed.type === "response.failed" || parsed.type === "response.incomplete" || parsed.type === "error") {
+      const nextFailure = responseFailureDetails(parsed.event);
+      if (!failure || (!["permanent", "usage_limit"].includes(failure.category)
+        && ["permanent", "usage_limit"].includes(nextFailure.category))) failure = nextFailure;
+    }
   });
   parser.push(body);
   parser.end();
@@ -1007,7 +1035,8 @@ function executeBufferedCompactionAttempt(options) {
         const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
         if (statusCode < 200 || statusCode >= 300) {
           const failure = responseFailureDetailsFromBody(responseBody, observation);
-          const retryable = !failure.safetyPolicy && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
+          const retryable = !["permanent", "usage_limit"].includes(failure.category)
+            && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
           return finish({
             kind: retryable ? "retryable_failure" : "permanent_failure",
             reason: `HTTP_${statusCode}`,
@@ -1023,7 +1052,8 @@ function executeBufferedCompactionAttempt(options) {
             return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
           }
           const failure = responseFailureDetailsFromBody(responseBody, observation);
-          const retryable = !failure.safetyPolicy && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
+          const retryable = !["permanent", "usage_limit"].includes(failure.category)
+            && (retryableStatus(statusCode) || failure.category === "capacity" || failure.category === "transient");
           return finish({
             kind: retryable ? "retryable_failure" : "permanent_failure",
             reason: failure.code ?? "HTTP_200_NON_SSE",
@@ -1035,7 +1065,7 @@ function executeBufferedCompactionAttempt(options) {
           });
         }
         const analysis = analyzeBufferedSse(responseBody, observation);
-        if (analysis.sawCompleted && analysis.compactionItems === 1) {
+        if (!analysis.failure && analysis.sawCompleted && analysis.compactionItems === 1) {
           return finish({ kind: "completed", statusCode, statusMessage: response.statusMessage, headers: response.headers, body: responseBody });
         }
         const permanent = analysis.failure?.category === "usage_limit" || analysis.failure?.category === "permanent";
@@ -1406,7 +1436,7 @@ export function createCodexModelStreamProxy(options = {}) {
         if (outcome.failure?.safetyPolicy) {
           if (key) attempts.delete(key);
           response.writeHead(400, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
-          response.end(JSON.stringify({ error: { type: "safety_policy", code: outcome.failure.code, message: SAFETY_POLICY_NOTICE } }));
+          response.end(JSON.stringify({ error: { type: "safety_policy", code: outcome.failure.code, message: safetyPolicyNotice(outcome.failure) } }));
           counters.failed += 1;
           emit({ type: "safety_policy_terminal_failure", category: "safety_policy", code: outcome.failure.code });
           return;
@@ -1567,13 +1597,14 @@ export function createCodexModelStreamProxy(options = {}) {
       if (outcome.failure?.safetyPolicy) {
         if (key) attempts.delete(key);
         const details = { category: "safety_policy", code: outcome.failure.code, reason: outcome.reason };
+        const notice = safetyPolicyNotice(outcome.failure);
         if (identity.requestKind === "compaction" || outcome.sawCompaction) {
           ensureSseHead(response, outcome.upstreamHeaders ?? {});
-          response.end(requestState.recovery.fail(outcome.failure.code, SAFETY_POLICY_NOTICE));
+          response.end(requestState.recovery.fail(outcome.failure.code, notice));
           counters.failed += 1;
           emit({ type: "safety_policy_terminal_failure", ...details });
         } else {
-          finishSoftTerminal(`\n\n${SAFETY_POLICY_NOTICE}`, "safety_policy_completed_idle", details, outcome.upstreamHeaders);
+          finishSoftTerminal(`\n\n${notice}`, "safety_policy_completed_idle", details, outcome.upstreamHeaders);
         }
         return;
       }
@@ -1636,7 +1667,7 @@ export function createCodexModelStreamProxy(options = {}) {
         const notice = outcome.kind === "usage_limit"
           ? USAGE_LIMIT_NOTICE
           : outcome.kind === "permanent_failure"
-            ? PERMANENT_FAILURE_NOTICE
+            ? permanentFailureNotice(outcome.failure)
             : NETWORK_EXHAUSTED_NOTICE;
         finishSoftTerminal(notice, "untracked_identity_soft_terminal", {
           reason: outcome.reason,
@@ -1646,7 +1677,7 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       if (outcome.kind === "permanent_failure") {
         attempts.delete(key);
-        finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "permanent_failure_completed_idle", {
+        finishSoftTerminal(permanentFailureNotice(outcome.failure), "permanent_failure_completed_idle", {
           code: outcome.failure?.code ?? null,
           reason: outcome.reason,
         }, outcome.upstreamHeaders);
