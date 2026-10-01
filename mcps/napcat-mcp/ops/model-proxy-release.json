@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "implementationVersion": "2026-10-01.2",
+  "files": [
+    "src\\codex-model-stream-proxy.mjs",
+    "src\\adaptive-delivery.mjs",
+    "src\\request-wait-budget.mjs",
+    "src\\request-body-buffer.mjs",
+    "src\\request-body-inspector.mjs"
+  ],
+  "maxBufferedRequestMiB": 128,
+  "maxDecodedRequestMiB": 192
+}
