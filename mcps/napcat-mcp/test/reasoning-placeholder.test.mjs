@@ -353,3 +353,116 @@ test("retained budget and long ids disable only display tracking while passing o
   assert.equal(requests.status().requestCount, 1);
   assert.equal(requests.status().trackingAvailable, false);
 });
+
+test("completed turns can exceed the lifetime limit without disabling new live placeholders", () => {
+  const projector = view();
+  for (let turnIndex = 1; turnIndex <= 1000; turnIndex += 1) {
+    const turnId = `turn-${turnIndex}`;
+    startTurn(projector, "thread-1", turnId);
+    const turn = { id: turnId, status: "completed", itemsView: "full", items: [reasoning()] };
+    const message = { method: "turn/completed", params: { threadId: "thread-1", turn } };
+    assert.deepEqual(projector.project(message).params.turn.items[0].summary, ["推理片段1已收到，摘要为空"]);
+  }
+  assert.equal(projector.status().trackingAvailable, true);
+  assert.equal(projector.status().turnCount, 128);
+  assert.equal(projector.status().evictedTurns, 872);
+  assert.equal(projector.status().disabledReason, null);
+  assert.ok(projector.status().retainedBytes <= 1024 * 1024);
+});
+
+test("eviction preserves active genuine deltas and passes unknown late items through", () => {
+  const projector = view({ maximumTurns: 2 });
+  startTurn(projector, "thread-1", "active");
+  projector.project({ method: "item/reasoning/summaryTextDelta",
+    params: { threadId: "thread-1", turnId: "active", itemId: "genuine", delta: "真实摘要" } });
+  for (const turnId of ["old", "new"]) {
+    startTurn(projector, "thread-1", turnId);
+    projector.project({ method: "turn/completed", params: { threadId: "thread-1",
+      turn: { id: turnId, status: "completed", itemsView: "full", items: [reasoning("closed")] } } });
+  }
+  const real = notification("item/completed", reasoning("genuine"), "thread-1", "active");
+  assert.equal(projector.project(real), real);
+  const late = notification("item/completed", reasoning("closed"), "thread-1", "old");
+  assert.equal(projector.project(late), late);
+  assert.equal(projector.status().trackingAvailable, true);
+});
+
+test("evicted history remains original while fresh live turns retain exact numbering", () => {
+  const projector = view({ maximumTurns: 1 });
+  for (const turnId of ["old", "new"]) {
+    startTurn(projector, "thread-1", turnId);
+    projector.project({ method: "turn/completed", params: { threadId: "thread-1",
+      turn: { id: turnId, status: "completed", itemsView: "full", items: [reasoning()] } } });
+  }
+  const partial = { id: "old", status: "completed", itemsView: "partial", items: [reasoning()] };
+  assert.equal(history(projector, "thread/read", { thread: { id: "thread-1", turns: [partial] } }).result.thread.turns[0], partial);
+  const full = { ...partial, itemsView: "full", items: [reasoning("one"), reasoning("real", ["真实文字"]), reasoning("two")] };
+  assert.equal(history(projector, "thread/read", { thread: { id: "thread-1", turns: [full] } }).result.thread.turns[0], full);
+  startTurn(projector, "thread-1", "fresh");
+  const fresh = { ...full, id: "fresh" };
+  const projected = projector.project({ method: "turn/completed", params: { threadId: "thread-1", turn: fresh } }).params.turn;
+  assert.deepEqual(projected.items.map(item => item.summary[0]),
+    ["推理片段1已收到，摘要为空", "真实文字", "推理片段1已收到，摘要为空"]);
+  assert.equal(projector.status().trackingAvailable, true);
+});
+
+test("an evicted genuine delta cannot turn into a placeholder in a later full empty snapshot", () => {
+  const projector = view({ maximumTurns: 1 });
+  startTurn(projector, "thread-1", "genuine-old");
+  projector.project({ method: "item/reasoning/summaryTextDelta",
+    params: { threadId: "thread-1", turnId: "genuine-old", itemId: "real", delta: "真实摘要" } });
+  const old = { id: "genuine-old", status: "completed", itemsView: "full", items: [reasoning("real")] };
+  assert.equal(projector.project({ method: "turn/completed", params: { threadId: "thread-1", turn: old } }).params.turn, old);
+  startTurn(projector, "thread-1", "fresh");
+  const response = history(projector, "thread/read", { thread: { id: "thread-1", turns: [old] } });
+  assert.equal(response.result.thread.turns[0], old);
+  assert.deepEqual(response.result.thread.turns[0].items[0].summary, []);
+  assert.equal(projector.status().trackingAvailable, true);
+});
+
+test("a sorted old items page cannot consume a live turn slot after eviction", () => {
+  const projector = view({ maximumTurns: 1 });
+  startTurn(projector, "thread-1", "old");
+  projector.project({ method: "turn/completed", params: { threadId: "thread-1",
+    turn: { id: "old", status: "completed", itemsView: "full", items: [reasoning()] } } });
+  startTurn(projector, "thread-1", "active");
+  const entry = { turnId: "old", completedAtMs: 1000, item: reasoning() };
+  const projected = history(projector, "thread/items/list", { data: [entry] });
+  assert.equal(projected.result.data[0], entry);
+  assert.equal(projector.status().trackingAvailable, true);
+  assert.equal(projector.status().turnCount, 1);
+  const active = notification("item/completed", reasoning("active-item"), "thread-1", "active");
+  assert.deepEqual(projector.project(active).params.item.summary, ["推理片段1已收到，摘要为空"]);
+});
+
+test("completed state frees byte capacity without reclaiming pending RPC bytes", () => {
+  const projector = view({ maximumRetainedBytes: 950 });
+  startTurn(projector, "thread-1", "old");
+  projector.project({ method: "turn/completed", params: { threadId: "thread-1",
+    turn: { id: "old", status: "completed", itemsView: "full", items: [reasoning("closed")] } } });
+  projector.observeRequest({ id: "pending", method: "thread/read", params: { threadId: "other-thread" } });
+  const requestBytes = projector.status().retainedBytes;
+  startTurn(projector, "thread-1", "active");
+  const message = notification("item/completed", reasoning("long-" + "x".repeat(180)), "thread-1", "active");
+  assert.notEqual(projector.project(message), message);
+  assert.equal(projector.status().evictedTurns, 1);
+  assert.equal(projector.status().requestCount, 1);
+  projector.project({ id: "pending", error: { code: 1 } });
+  assert.equal(projector.status().requestCount, 0);
+  assert.ok(projector.status().retainedBytes < requestBytes + 400);
+  assert.equal(projector.status().trackingAvailable, true);
+});
+
+test("diagnostics preserve fatal invalid-ID pass-through and reset on initialization", () => {
+  const projector = view();
+  startTurn(projector);
+  const invalid = notification("item/completed", reasoning(""));
+  assert.equal(projector.project(invalid), invalid);
+  assert.equal(projector.status().disabledReason, "invalid_item_id");
+  startTurn(projector, "thread-1", "next");
+  const next = notification("item/completed", reasoning(), "thread-1", "next");
+  assert.equal(projector.project(next), next);
+  projector.observeRequest({ method: "initialize", params: { clientInfo: { name: "Codex Desktop" } } });
+  assert.equal(projector.status().disabledReason, null);
+  assert.equal(projector.status().trackingAvailable, true);
+});

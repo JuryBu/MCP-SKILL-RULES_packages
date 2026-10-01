@@ -235,6 +235,38 @@ async function initialize(context, fixture, connection, name, id) {
   await waitFor(() => fixture.proxy.status().readyClientCount > 0, "initialize 完成");
 }
 
+test("Desktop completed-turn lifecycle stays bounded beyond 128 real socket rounds", { timeout: 15000 }, async (context) => {
+  const fixture = await createFixture(context);
+  try {
+    const connection = await fixture.connect();
+    await initialize(context, fixture, connection, "Codex Desktop", 1);
+    for (let turnIndex = 1; turnIndex <= 150; turnIndex += 1) {
+      const turnId = `lifetime-${turnIndex}`;
+      await fixture.deliver(connection, "new live turn", { method: "turn/started",
+        params: { threadId: "lifetime-thread", turn: { id: turnId, status: "inProgress", items: [] } } });
+      const item = { ...emptyItem, id: `lifetime-item-${turnIndex}`,
+        summary: turnIndex % 10 === 0 ? ["合成真实摘要"] : [] };
+      const message = { method: "turn/completed", params: { threadId: "lifetime-thread",
+        turn: { id: turnId, status: "completed", itemsView: "full", items: [item] } } };
+      const reply = await fixture.deliver(connection, "completed live turn", message);
+      assert.deepEqual(reply.received.message.params.turn.items[0].summary,
+        turnIndex % 10 === 0 ? ["合成真实摘要"] : ["推理片段1已收到，摘要为空"]);
+      if (turnIndex % 10 === 0) assert.deepEqual(reply.original, reply.received.bytes);
+    }
+    const state = fixture.proxy.status().clients[0].reasoningPlaceholder;
+    assert.equal(state.trackingAvailable, true);
+    assert.equal(state.turnCount, 128);
+    assert.equal(state.evictedTurns, 22);
+    assert.ok(state.retainedBytes <= 1024 * 1024);
+    const late = completion({ ...emptyItem, id: "lifetime-item-1" }, "lifetime-thread", "lifetime-1");
+    const reply = await fixture.deliver(connection, "evicted late completion", late);
+    assert.deepEqual(reply.original, reply.received.bytes);
+    context.diagnostic(JSON.stringify({ lifetimeCompletedTurns: 150, state, latePayloadUnchanged: true }));
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("Desktop 真实传输仅投影空 completed reasoning，外部请求及分页字段保真", { timeout: 15000 }, async (context) => {
   const fixture = await createFixture(context);
   try {

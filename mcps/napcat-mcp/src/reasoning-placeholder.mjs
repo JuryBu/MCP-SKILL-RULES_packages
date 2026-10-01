@@ -30,22 +30,56 @@ export function createReasoningPlaceholderView(options = {}) {
   let projectedItems = 0;
   let retainedBytes = 0;
   let trackingAvailable = true;
+  let disabledReason = null;
+  let evictedTurns = 0;
+  let requireKnownTurn = false;
 
-  function reserve(bytes) {
-    if (retainedBytes + bytes > maximumRetainedBytes) { trackingAvailable = false; return false; }
+  function disable(reason) {
+    trackingAvailable = false;
+    disabledReason = reason;
+    return false;
+  }
+
+  function releaseCompletedTurn(protectedKey = null) {
+    for (const [key, state] of turns) {
+      if (key === protectedKey || !state.completed) continue;
+      turns.delete(key);
+      retainedBytes -= state.bytes;
+      evictedTurns += 1;
+      requireKnownTurn = true;
+      return true;
+    }
+    return false;
+  }
+
+  function reserve(bytes, protectedKey = null) {
+    while (retainedBytes + bytes > maximumRetainedBytes && releaseCompletedTurn(protectedKey)) {}
+    if (retainedBytes + bytes > maximumRetainedBytes) return disable("retained_bytes_capacity");
     retainedBytes += bytes;
     return true;
   }
 
-  function turnState(threadId, turnId, prefixKnown = false) {
+  function turnState(threadId, turnId, prefixKnown = false, allowNewTurn = false) {
     const key = scopeKey(threadId, turnId);
     if (!key || !trackingAvailable) return null;
     if (!turns.has(key)) {
-      if (turns.size >= maximumTurns) { trackingAvailable = false; return null; }
-      if (!reserve(Buffer.byteLength(key) + 128)) return null;
-      turns.set(key, { items: new Map(), prefixKnown });
+      if (requireKnownTurn && !allowNewTurn) return null;
+      while (turns.size >= maximumTurns && releaseCompletedTurn()) {}
+      if (turns.size >= maximumTurns) { disable("active_turns_capacity"); return null; }
+      const bytes = Buffer.byteLength(key) + 128;
+      if (!reserve(bytes)) return null;
+      turns.set(key, { items: new Map(), prefixKnown, bytes, completed: false });
     }
     return turns.get(key);
+  }
+
+  function completeTurn(threadId, turnId) {
+    const key = scopeKey(threadId, turnId);
+    const state = turns.get(key);
+    if (!state) return;
+    state.completed = true;
+    turns.delete(key);
+    turns.set(key, state);
   }
 
   function refreshIndexes(state) {
@@ -62,12 +96,14 @@ export function createReasoningPlaceholderView(options = {}) {
 
   function observeItem(threadId, turnId, item, prefixKnown = false, ordered = true) {
     if (item?.type !== "reasoning") return null;
-    if (!validId(item.id)) { trackingAvailable = false; return null; }
+    if (!validId(item.id)) { disable("invalid_item_id"); return null; }
     const state = turnState(threadId, turnId, prefixKnown);
     if (!state) return null;
     if (!state.items.has(item.id)) {
-      if (state.items.size >= maximumItems) { trackingAvailable = false; return null; }
-      if (!reserve(Buffer.byteLength(item.id) + 128)) return null;
+      if (state.items.size >= maximumItems) { disable("items_capacity"); return null; }
+      const bytes = Buffer.byteLength(item.id) + 128;
+      if (!reserve(bytes, scopeKey(threadId, turnId))) return null;
+      state.bytes += bytes;
       state.items.set(item.id, { index: null, ordered, shapeKnown: false, visible: false, completed: false });
     }
     const record = state.items.get(item.id);
@@ -121,6 +157,7 @@ export function createReasoningPlaceholderView(options = {}) {
       }
     }
     const items = turn.items.map(item => projectItem(threadId, turn.id, item, prefixKnown, completed, prefixKnown));
+    if (completed) completeTurn(threadId, turn.id);
     return items.some((item, index) => item !== turn.items[index]) ? { ...turn, items } : turn;
   }
 
@@ -138,12 +175,15 @@ export function createReasoningPlaceholderView(options = {}) {
       turns.clear();
       retainedBytes = 0;
       trackingAvailable = true;
+      disabledReason = null;
+      evictedTurns = 0;
+      requireKnownTurn = false;
     }
     if (!enabled || !trackingAvailable || !HISTORY_METHODS.has(message?.method) || !Object.hasOwn(message, "id")) return;
     if (!validId(message.id) && !Number.isFinite(message.id)) return;
     const originalParams = message.params ?? {};
     if (!validId(originalParams.threadId)) return;
-    if (requests.size >= maximumRequests) { trackingAvailable = false; return; }
+    if (requests.size >= maximumRequests) { disable("requests_capacity"); return; }
     const params = { threadId: originalParams.threadId, hasCursor: Boolean(originalParams.cursor), descending: originalParams.sortDirection === "desc" };
     const bytes = Buffer.byteLength(JSON.stringify([message.id, message.method, params])) + 128;
     if (!reserve(bytes)) return;
@@ -183,7 +223,8 @@ export function createReasoningPlaceholderView(options = {}) {
     }
     const params = message.params;
     if (message.method === "turn/started") {
-      turnState(params?.threadId, params?.turn?.id, true);
+      const state = turnState(params?.threadId, params?.turn?.id, true, true);
+      if (state) state.completed = false;
       return message;
     }
     if (message.method === "item/reasoning/summaryTextDelta" || message.method === "item/reasoning/textDelta") {
@@ -203,6 +244,7 @@ export function createReasoningPlaceholderView(options = {}) {
     }
     if (message.method === "turn/completed") {
       const turn = projectTurn(params?.threadId, params?.turn);
+      completeTurn(params?.threadId, params?.turn?.id);
       return turn === params?.turn ? message : { ...message, params: { ...params, turn } };
     }
     if (message.method === "thread/started") {
@@ -223,7 +265,8 @@ export function createReasoningPlaceholderView(options = {}) {
   return {
     observeRequest,
     project,
-    status: () => ({ enabled, trackingAvailable, retainedBytes, clientName, projectedItems, turnCount: turns.size, requestCount: requests.size }),
+    status: () => ({ enabled, trackingAvailable, disabledReason, retainedBytes, clientName, projectedItems,
+      turnCount: turns.size, requestCount: requests.size, evictedTurns }),
     close: () => { enabled = false; requests.clear(); turns.clear(); retainedBytes = 0; },
   };
 }
