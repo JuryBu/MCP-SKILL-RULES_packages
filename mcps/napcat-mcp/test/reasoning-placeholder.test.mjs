@@ -282,8 +282,9 @@ test("bounded state does not overwrite genuine content at item overflow", () => 
   assert.equal(projector.status().turnCount, 1);
   projector.observeRequest({ id: 3, method: "thread/read", params: { threadId: "t" } });
   projector.observeRequest({ id: 4, method: "thread/read", params: { threadId: "t" } });
-  assert.equal(projector.status().requestCount, 0);
-  assert.equal(projector.status().trackingAvailable, false);
+  assert.equal(projector.status().requestCount, 1);
+  assert.equal(projector.status().trackingAvailable, true);
+  assert.equal(projector.status().lastCapacity.reason, "requests_capacity");
   projector.close();
   assert.equal(projector.status().enabled, false);
   assert.equal(projector.status().turnCount, 0);
@@ -316,7 +317,8 @@ test("capacity exhaustion cannot forget prior genuine delta or project an evicte
   projector.project({ method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "item-513", delta: "真实摘要" } });
   const message = notification("item/completed", reasoning("item-513"));
   assert.equal(projector.project(message), message);
-  assert.equal(projector.status().trackingAvailable, false);
+  assert.equal(projector.status().trackingAvailable, true);
+  assert.equal(projector.status().suspendedTurns, 1);
   const turnLimited = view({ maximumTurns: 1 });
   startTurn(turnLimited);
   turnLimited.project({ method: "item/reasoning/summaryTextDelta", params: { threadId: "thread-1", turnId: "turn-1", itemId: "reason-1", delta: "真实摘要" } });
@@ -337,21 +339,23 @@ test("full authoritative history fixes numbering after out-of-order or partial d
   }
 });
 
-test("retained budget and long ids disable only display tracking while passing original data", () => {
+test("retained budget bypasses only affected data and long ids retain fatal pass-through", () => {
   const projector = view({ maximumRetainedBytes: 200 });
   startTurn(projector);
   const message = notification("item/completed", reasoning());
   assert.equal(projector.project(message), message);
-  assert.equal(projector.status().trackingAvailable, false);
+  assert.equal(projector.status().trackingAvailable, true);
+  assert.equal(projector.status().lastCapacity.reason, "retained_bytes_capacity");
   assert.ok(projector.status().retainedBytes <= 200);
   const longId = notification("item/completed", reasoning("x".repeat(257)));
   assert.equal(view().project(longId), longId);
   const requests = view({ maximumRequests: 1 });
   requests.observeRequest({ id: 1, method: "thread/read", params: { threadId: "thread-1", unrelated: "x".repeat(200000) } });
-  assert.ok(requests.status().retainedBytes < 1000);
+  assert.ok(requests.status().retainedBytes - requests.status().turnHistoryBytes < 1000);
   requests.observeRequest({ id: 2, method: "thread/read", params: { threadId: "thread-1" } });
   assert.equal(requests.status().requestCount, 1);
-  assert.equal(requests.status().trackingAvailable, false);
+  assert.equal(requests.status().trackingAvailable, true);
+  assert.equal(requests.status().lastCapacity.reason, "requests_capacity");
 });
 
 test("completed turns can exceed the lifetime limit without disabling new live placeholders", () => {

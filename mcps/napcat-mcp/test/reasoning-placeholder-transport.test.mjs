@@ -242,6 +242,10 @@ test("Desktop completed-turn lifecycle stays bounded beyond 128 real socket roun
     await initialize(context, fixture, connection, "Codex Desktop", 1);
     for (let turnIndex = 1; turnIndex <= 150; turnIndex += 1) {
       const turnId = `lifetime-${turnIndex}`;
+      const started = await fixture.request(connection, "confirmed Desktop turn/start", {
+        id: 100 + turnIndex, method: "turn/start", params: { threadId: "lifetime-thread", input: [] },
+      }, { id: 100 + turnIndex, result: { turn: { id: turnId, status: "inProgress", items: [] } } });
+      assert.deepEqual(started.received.bytes, started.original);
       await fixture.deliver(connection, "new live turn", { method: "turn/started",
         params: { threadId: "lifetime-thread", turn: { id: turnId, status: "inProgress", items: [] } } });
       const item = { ...emptyItem, id: `lifetime-item-${turnIndex}`,
@@ -262,6 +266,50 @@ test("Desktop completed-turn lifecycle stays bounded beyond 128 real socket roun
     const reply = await fixture.deliver(connection, "evicted late completion", late);
     assert.deepEqual(reply.original, reply.received.bytes);
     context.diagnostic(JSON.stringify({ lifetimeCompletedTurns: 150, state, latePayloadUnchanged: true }));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("Desktop item overflow stays scoped across real sockets and preserves late genuine data", { timeout: 15000 }, async (context) => {
+  const fixture = await createFixture(context);
+  try {
+    const connection = await fixture.connect();
+    await initialize(context, fixture, connection, "Codex Desktop", 1);
+    await fixture.deliver(connection, "long turn begins", { method: "turn/started",
+      params: { threadId: "capacity-thread", turn: { id: "long", status: "inProgress", items: [] } } });
+    const startingFrame = connection.downstreamFrames.length;
+    for (let itemIndex = 1; itemIndex <= 512; itemIndex += 1) {
+      connection.upstream.send(rawJson(completion({ ...emptyItem, id: `capacity-${itemIndex}` }, "capacity-thread", "long")), { binary: false });
+    }
+    await waitFor(() => connection.downstreamFrames.length >= startingFrame + 512, "512 real reasoning frames");
+    for (let itemIndex = 1; itemIndex <= 512; itemIndex += 1) {
+      assert.deepEqual(connection.downstreamFrames[startingFrame + itemIndex - 1].message.params.item.summary,
+        [`推理片段${itemIndex}已收到，摘要为空`]);
+    }
+    const delta = { method: "item/reasoning/summaryTextDelta",
+      params: { threadId: "capacity-thread", turnId: "long", itemId: "capacity-1", delta: "真实文字仍然保留" } };
+    const deltaReply = await fixture.deliver(connection, "genuine delta before overflow", delta);
+    assert.deepEqual(deltaReply.received.bytes, deltaReply.original);
+    const overflow = completion({ ...emptyItem, id: "capacity-513" }, "capacity-thread", "long");
+    const overflowReply = await fixture.deliver(connection, "overflow bypass", overflow);
+    assert.deepEqual(overflowReply.received.bytes, overflowReply.original);
+    const late = completion({ ...emptyItem, id: "capacity-1" }, "capacity-thread", "long");
+    const lateReply = await fixture.deliver(connection, "late genuine item remains original", late);
+    assert.deepEqual(lateReply.received.bytes, lateReply.original);
+    await fixture.deliver(connection, "other thread begins", { method: "turn/started",
+      params: { threadId: "healthy-thread", turn: { id: "fresh", status: "inProgress", items: [] } } });
+    const freshReply = await fixture.deliver(connection, "healthy thread placeholder",
+      completion({ ...emptyItem, id: "fresh-item" }, "healthy-thread", "fresh"));
+    assert.deepEqual(freshReply.received.message.params.item.summary, ["推理片段1已收到，摘要为空"]);
+    const state = fixture.proxy.status().clients[0].reasoningPlaceholder;
+    assert.equal(state.trackingAvailable, true);
+    assert.equal(state.disabledReason, null);
+    assert.equal(state.suspendedTurns, 1);
+    assert.equal(state.capacityBypasses, 1);
+    assert.ok(state.retainedBytes - state.turnHistoryBytes < 1000);
+    context.diagnostic(JSON.stringify({ liveReasoningFrames: 513, otherThreadHealthy: true,
+      genuineAndOverflowWireUnchanged: true, state }));
   } finally {
     await fixture.close();
   }
