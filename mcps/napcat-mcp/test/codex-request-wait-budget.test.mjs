@@ -73,7 +73,7 @@ async function fixture(context, handler, options = {}) {
   await new Promise(resolve => upstream.listen(0, "127.0.0.1", resolve));
   const origin = `http://127.0.0.1:${upstream.address().port}`;
   const proxy = createCodexModelStreamProxy({ port: 0, upstreamOrigin: origin, firstProgressTimeoutMs: 150,
-    progressIdleTimeoutMs: 150, onEvent: event => events.push(event),
+    firstLastProgressTimeoutMs: 150, progressIdleTimeoutMs: 150, reasoningProgressIdleTimeoutMs: 150, onEvent: event => events.push(event),
     ...options, ...(options.buffered ? { adaptiveDeliveryState: { schemaVersion: 1, profiles: [{
       key: deliveryProfileKey({ "chatgpt-account-id": "fixture-account" }, { model: "fixture-model" }, origin),
       mode: "buffered", updatedAt: Date.now(), evidenceStartedAt: Date.now() - 1, probeAfter: Date.now() + 60_000,

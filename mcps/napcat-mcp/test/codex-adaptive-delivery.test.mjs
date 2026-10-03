@@ -226,7 +226,8 @@ test("disconnect regression: cancellation preserves the spent balance without ch
   const turn = "disconnect-idle-budget";
   await setup.request({ turn });
   const remaining = setup.events.find(event => event.type === "adaptive_idle_retry_eligible")?.waitBudgetRemainingMs;
-  assert.ok(remaining > 400 && remaining < 500);
+  const chainLimit = setup.proxy.status().consecutiveWaitLimitMs;
+  assert.ok(chainLimit - remaining > 100 && chainLimit - remaining < 200);
   const controller = new AbortController();
   await assert.rejects(setup.request({ turn, signal: controller.signal, onData: () => controller.abort() }));
   await waitForRequestCleanup(setup);

@@ -16,6 +16,9 @@ import { createRequestProgressTracker, createRequestWaitBudget, mergeRequestProg
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
+const DEFAULT_FIRST_LAST_PROGRESS_TIMEOUT_MS = 60_000;
+const DEFAULT_REASONING_PROGRESS_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_RAPID_RETRY_MINIMUM_MS = 70_000;
 const DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 128 * 1024 * 1024;
@@ -31,7 +34,7 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-10-02.1";
+const IMPLEMENTATION_VERSION = "2026-10-03.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const LEGACY_SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const SAFETY_POLICY_CODES = new Set([...LEGACY_SAFETY_POLICY_CODES, "cyber_policy", "misalignment_policy_violation", "invalid_prompt"]);
@@ -536,6 +539,7 @@ function executeTurnAttempt(options) {
     targetUrl,
     firstProgressTimeoutMs,
     progressIdleTimeoutMs,
+    reasoningProgressIdleTimeoutMs = progressIdleTimeoutMs,
     toolInputProgressIdleTimeoutMs = progressIdleTimeoutMs,
     compactionAttemptTimeoutMs,
     toolPreparationGraceMs,
@@ -545,6 +549,7 @@ function executeTurnAttempt(options) {
     adaptiveRegistry,
     adaptiveKey,
     adaptiveWaitLimitMs,
+    consecutiveWaitLimitMs = adaptiveWaitLimitMs,
     priorWaitState,
     uploadAllowanceMs = 0,
     compactionRequest = false,
@@ -559,8 +564,14 @@ function executeTurnAttempt(options) {
   return new Promise((resolve) => {
     const client = requestClient(targetUrl);
     const startedAt = Date.now();
-    const waitBudget = compactionRequest ? null : createRequestWaitBudget({ startedAt, uploadAllowanceMs,
-      waitLimitMs: adaptiveWaitLimitMs, previous: priorWaitState });
+    const chainWaitBudget = compactionRequest ? null : createRequestWaitBudget({ startedAt, uploadAllowanceMs,
+      waitLimitMs: consecutiveWaitLimitMs, previous: priorWaitState });
+    const attemptWaitBudget = compactionRequest ? null : createRequestWaitBudget({ startedAt, uploadAllowanceMs,
+      waitLimitMs: adaptiveWaitLimitMs });
+    const waitBudget = chainWaitBudget ? { ...chainWaitBudget,
+      deadline: () => Math.min(chainWaitBudget.deadline(), attemptWaitBudget.deadline()),
+      noteProgress(time) { attemptWaitBudget.noteProgress(time); return chainWaitBudget.noteProgress(time); },
+    } : null;
     const progressTracker = createRequestProgressTracker(priorWaitState?.progressIdentityState, `attempt-${nativeAttempt ?? startedAt}`);
     const adaptive = compactionRequest ? null : adaptiveRegistry?.begin({ key: adaptiveKey, startedAt, firstProgressTimeoutMs,
       waitLimitMs: adaptiveWaitLimitMs, waitBudget, uploadAllowanceMs, upstreamIdleTimeoutMs,
@@ -825,7 +836,9 @@ function executeTurnAttempt(options) {
           lastProgressType = type ?? null;
           noteProgress(now, lastProgressType);
           const toolInputProgress = !sawExecutableToolDone && isToolInputProgressType(type);
-          armTimer(toolInputProgress ? toolInputProgressIdleTimeoutMs : progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
+          const progressTimeoutMs = toolInputProgress ? toolInputProgressIdleTimeoutMs
+            : !holdingToolDone && isRetrySafeReasoningProgress(event, completedReasoningProgress) ? reasoningProgressIdleTimeoutMs : progressIdleTimeoutMs;
+          armTimer(progressTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         }
         if (eventHasSubstantiveWork(event)) sawSubstantiveWork = true;
         if (["function_call", "custom_tool_call", "local_shell_call"].includes(event?.item?.type)
@@ -905,8 +918,10 @@ function executeTurnAttempt(options) {
             lastProgressAt = now;
             lastProgressType = progress.type;
             noteProgress(now, lastProgressType);
-            armTimer((progress.argumentsProgress || isToolInputProgressType(progress.type)) && !sawExecutableToolDone
-              ? toolInputProgressIdleTimeoutMs : progressIdleTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
+            const progressTimeoutMs = (progress.argumentsProgress || isToolInputProgressType(progress.type)) && !sawExecutableToolDone
+              ? toolInputProgressIdleTimeoutMs : !holdingToolDone && (RETRY_SAFE_REASONING_DELTAS.has(progress.type) || progress.reasoningId)
+                ? reasoningProgressIdleTimeoutMs : progressIdleTimeoutMs;
+            armTimer(progressTimeoutMs, "PROGRESS_IDLE_TIMEOUT");
         },
         onError: (error) => {
           if (settled || requestState.cancelled) return;
@@ -1101,6 +1116,14 @@ export function createCodexModelStreamProxy(options = {}) {
     throw new Error("upstreamOrigin must use http or https");
   }
   const firstProgressTimeoutMs = integerOption(options.firstProgressTimeoutMs, DEFAULT_FIRST_PROGRESS_TIMEOUT_MS, 10, 300_000, "firstProgressTimeoutMs");
+  const firstLastProgressTimeoutMs = integerOption(options.firstLastProgressTimeoutMs,
+    Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_FIRST_LAST_PROGRESS_TIMEOUT_MS,
+      Math.round(firstProgressTimeoutMs * DEFAULT_FIRST_LAST_PROGRESS_TIMEOUT_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
+    10, 300_000, "firstLastProgressTimeoutMs");
+  const rapidRetryMinimumMs = integerOption(options.rapidRetryMinimumMs,
+    Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_RAPID_RETRY_MINIMUM_MS,
+      Math.round(firstProgressTimeoutMs * DEFAULT_RAPID_RETRY_MINIMUM_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
+    10, 300_000, "rapidRetryMinimumMs");
   const retryFirstProgressTimeoutMs = integerOption(options.retryFirstProgressTimeoutMs,
     Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS,
       Math.round(firstProgressTimeoutMs * DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
@@ -1108,6 +1131,10 @@ export function createCodexModelStreamProxy(options = {}) {
   const uploadAllowanceMsPerMiB = integerOption(options.uploadAllowanceMsPerMiB, 1000, 0, 60_000, "uploadAllowanceMsPerMiB");
   const maxUploadAllowanceMs = integerOption(options.maxUploadAllowanceMs, 128_000, 0, 600_000, "maxUploadAllowanceMs");
   const progressIdleTimeoutMs = integerOption(options.progressIdleTimeoutMs, DEFAULT_PROGRESS_IDLE_TIMEOUT_MS, 10, 300_000, "progressIdleTimeoutMs");
+  const reasoningProgressIdleTimeoutMs = integerOption(options.reasoningProgressIdleTimeoutMs,
+    Math.max(progressIdleTimeoutMs, Math.min(DEFAULT_REASONING_PROGRESS_IDLE_TIMEOUT_MS,
+      Math.round(progressIdleTimeoutMs * DEFAULT_REASONING_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_PROGRESS_IDLE_TIMEOUT_MS))),
+    10, 300_000, "reasoningProgressIdleTimeoutMs");
   const retryProgressIdleTimeoutMs = integerOption(options.retryProgressIdleTimeoutMs,
     Math.max(progressIdleTimeoutMs, Math.min(DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS,
       Math.round(progressIdleTimeoutMs * DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_PROGRESS_IDLE_TIMEOUT_MS))),
@@ -1131,6 +1158,9 @@ export function createCodexModelStreamProxy(options = {}) {
   const requestBufferBudget = createRequestBufferBudget(maxTotalRequestBytes);
   const maxBufferedResponseBytes = integerOption(options.maxBufferedResponseBytes, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedResponseBytes");
   const maxConsecutiveAttempts = integerOption(options.maxConsecutiveAttempts, DEFAULT_MAX_CONSECUTIVE_ATTEMPTS, 1, 20, "maxConsecutiveAttempts");
+  const consecutiveWaitLimitMs = integerOption(options.consecutiveWaitLimitMs,
+    adaptiveWaitLimitMs + Math.max(0, firstLastProgressTimeoutMs - firstProgressTimeoutMs) * Math.min(2, maxConsecutiveAttempts),
+    10, 900_000, "consecutiveWaitLimitMs");
   const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
   if (!Array.isArray(retryDelaysMs) || retryDelaysMs.length === 0 || retryDelaysMs.length > 20
     || retryDelaysMs.some(delay => !Number.isSafeInteger(delay) || delay < 0 || delay > 60_000)) {
@@ -1218,11 +1248,15 @@ export function createCodexModelStreamProxy(options = {}) {
         activeRequests: active.size,
         attemptChains: attempts.size,
         firstProgressTimeoutMs,
+        firstLastProgressTimeoutMs,
+        rapidRetryMinimumMs,
         retryFirstProgressTimeoutMs,
         uploadAllowanceMsPerMiB,
         maxUploadAllowanceMs,
         progressIdleTimeoutMs,
+        reasoningProgressIdleTimeoutMs,
         adaptiveWaitLimitMs,
+        consecutiveWaitLimitMs,
         upstreamIdleTimeoutMs,
         adaptiveDelivery: adaptiveRegistry.summary(),
         toolPreparationGraceMs,
@@ -1472,21 +1506,24 @@ export function createCodexModelStreamProxy(options = {}) {
       }
 
       const prior = key ? attempts.get(key) : null;
+      const chainWaitLimitMs = prior?.waitBudgetProgressAt > 0 ? adaptiveWaitLimitMs : consecutiveWaitLimitMs;
       const chainStartedAt = prior?.startedAt ?? Date.now();
       const attemptNumber = key ? (prior?.failures ?? 0) + 1 : null;
       const finalAttempt = Boolean(key && attemptNumber >= maxConsecutiveAttempts);
       const compactionRequest = identity.requestKind === "compaction";
       const firstProgressRetryProbe = Boolean(!compactionRequest && key && prior?.firstProgressRetryProbePending
         && !prior.firstProgressRetryProbeUsed && !prior.replayUnsafe);
+      const ordinaryFirstProgressTimeoutMs = !compactionRequest && key && (attemptNumber === 1 || finalAttempt)
+        ? Math.max(firstProgressTimeoutMs, firstLastProgressTimeoutMs) : firstProgressTimeoutMs;
       const attemptFirstProgressTimeoutMs = firstProgressRetryProbe
-        ? Math.max(firstProgressTimeoutMs, retryFirstProgressTimeoutMs) : firstProgressTimeoutMs;
+        ? Math.max(ordinaryFirstProgressTimeoutMs, retryFirstProgressTimeoutMs) : ordinaryFirstProgressTimeoutMs;
       const uploadAllowanceMs = compactionRequest ? 0
         : requestUploadAllowanceMs(requestBody.bytes, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
       const progressRetryProbe = Boolean(key && prior?.progressRetryProbePending && !prior?.progressRetryProbeUsed);
       const attemptToolInputProgressIdleTimeoutMs = progressRetryProbe
         ? Math.max(progressIdleTimeoutMs, retryProgressIdleTimeoutMs)
         : progressIdleTimeoutMs;
-      if (!compactionRequest && (prior?.waitBudgetSpentMs ?? 0) >= adaptiveWaitLimitMs) {
+      if (!compactionRequest && (prior?.waitBudgetSpentMs ?? 0) >= chainWaitLimitMs) {
         finishAdaptiveWait("ADAPTIVE_WAIT_LIMIT");
         return;
       }
@@ -1499,8 +1536,9 @@ export function createCodexModelStreamProxy(options = {}) {
       emit({ type: "turn_attempt_started", attemptNumber, maxConsecutiveAttempts, finalAttempt, untrackedIdentity: !key,
         firstProgressTimeoutMs: attemptFirstProgressTimeoutMs, uploadAllowanceMs,
         firstProgressDeadlineMs: compactionRequest ? compactionAttemptTimeoutMs : uploadAllowanceMs + attemptFirstProgressTimeoutMs,
-        firstProgressRetryProbe, waitBudgetRemainingMs: compactionRequest ? null : Math.max(0, adaptiveWaitLimitMs - (prior?.waitBudgetSpentMs ?? 0)),
+        firstProgressRetryProbe, waitBudgetRemainingMs: compactionRequest ? null : Math.max(0, chainWaitLimitMs - (prior?.waitBudgetSpentMs ?? 0)),
         progressIdleTimeoutMs,
+        reasoningProgressIdleTimeoutMs,
         toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs, progressRetryProbe });
       const outcome = await executeTurnAttempt({
         requestBody,
@@ -1510,6 +1548,7 @@ export function createCodexModelStreamProxy(options = {}) {
         targetUrl,
         firstProgressTimeoutMs: attemptFirstProgressTimeoutMs,
         progressIdleTimeoutMs,
+        reasoningProgressIdleTimeoutMs,
         toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs,
         compactionAttemptTimeoutMs: compactionRequest ? compactionRemainingMs : compactionAttemptTimeoutMs,
         toolPreparationGraceMs,
@@ -1519,6 +1558,7 @@ export function createCodexModelStreamProxy(options = {}) {
         adaptiveRegistry,
         adaptiveKey: identity.requestKind === "turn" ? deliveryProfileKey(request.headers, inspected, upstreamOrigin.origin) : null,
         adaptiveWaitLimitMs,
+        consecutiveWaitLimitMs: chainWaitLimitMs,
         priorWaitState: prior,
         uploadAllowanceMs,
         compactionRequest,
@@ -1569,9 +1609,10 @@ export function createCodexModelStreamProxy(options = {}) {
         return;
       }
       if (outcome.sawSubstantiveWork) recordBusinessProgress(identity);
+      const remainingChainWaitLimitMs = outcome.waitBudgetProgressAt > 0 ? adaptiveWaitLimitMs : chainWaitLimitMs;
       const retryableAdaptiveIdle = outcome.kind === "adaptive_wait_timeout"
         && outcome.reason === "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT"
-        && Boolean(key) && !replayUnsafe && (outcome.waitBudgetSpentMs ?? 0) < adaptiveWaitLimitMs;
+        && Boolean(key) && !replayUnsafe && (outcome.waitBudgetSpentMs ?? 0) < remainingChainWaitLimitMs;
       const progressRetryProbeUsed = Boolean(prior?.progressRetryProbeUsed || progressRetryProbe);
       const retryState = { replayUnsafe,
         ...(!compactionRequest && !outcome.sawCompaction ? mergeRequestWaitState({}, outcome) : {}),
@@ -1588,11 +1629,11 @@ export function createCodexModelStreamProxy(options = {}) {
           && outcome.phase === "tool_parameters" && !outcome.sawExecutableToolDone };
       if (outcome.kind === "adaptive_wait_timeout") {
         if (!retryableAdaptiveIdle) {
-          finishAdaptiveWait((outcome.waitBudgetSpentMs ?? 0) >= adaptiveWaitLimitMs ? "ADAPTIVE_WAIT_LIMIT" : outcome.reason, outcome.upstreamHeaders);
+          finishAdaptiveWait((outcome.waitBudgetSpentMs ?? 0) >= remainingChainWaitLimitMs ? "ADAPTIVE_WAIT_LIMIT" : outcome.reason, outcome.upstreamHeaders);
           return;
         }
         emit({ type: "adaptive_idle_retry_eligible", attemptNumber, finalAttempt,
-          waitBudgetRemainingMs: Math.max(0, adaptiveWaitLimitMs - (outcome.waitBudgetSpentMs ?? 0)) });
+          waitBudgetRemainingMs: Math.max(0, remainingChainWaitLimitMs - (outcome.waitBudgetSpentMs ?? 0)) });
       }
       if (outcome.failure?.safetyPolicy) {
         if (key) attempts.delete(key);
@@ -1705,7 +1746,7 @@ export function createCodexModelStreamProxy(options = {}) {
         return;
       }
       const rapidDelayMs = attemptNumber === 5 && maxConsecutiveAttempts >= 6
-        ? Math.max(0, firstProgressTimeoutMs - (Date.now() - chainStartedAt))
+        ? Math.max(0, rapidRetryMinimumMs - (Date.now() - chainStartedAt))
         : 0;
       if (rapidDelayMs > 0) {
         emit({ type: "rapid_retry_wait_started", attemptNumber, delayMs: rapidDelayMs, reason: outcome.reason });
@@ -1860,12 +1901,16 @@ export function createCodexModelStreamProxy(options = {}) {
         activeRequests: active.size,
         attemptChains: attempts.size,
         firstProgressTimeoutMs,
+        firstLastProgressTimeoutMs,
+        rapidRetryMinimumMs,
         retryFirstProgressTimeoutMs,
         uploadAllowanceMsPerMiB,
         maxUploadAllowanceMs,
         progressIdleTimeoutMs,
+        reasoningProgressIdleTimeoutMs,
         compactionAttemptTimeoutMs,
         adaptiveWaitLimitMs,
+        consecutiveWaitLimitMs,
         upstreamIdleTimeoutMs,
         adaptiveDelivery: adaptiveRegistry.summary(),
         maxConsecutiveAttempts,
