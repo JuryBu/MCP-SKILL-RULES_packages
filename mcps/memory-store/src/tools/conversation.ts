@@ -7,7 +7,6 @@ import {
     formatOverview,
     formatRoundForMessageRoles,
     normalizeMessageRoles,
-    searchInRounds,
     type ConversationMessageRole,
     type Depth,
     type ExtraType,
@@ -18,6 +17,7 @@ import { shouldAutoUpdateRecordAsync } from "../record-generator.js";
 import { readRecordAsync, resolveWorkspaceHashForRecord, findRecordHashAsync } from "../record-store.js";
 import {
     loadConversationData,
+    describeConversationCacheReadFailure,
     resolveConversationChain,
     type ConversationLoadResult,
     type ResolvedConversationChain,
@@ -88,6 +88,25 @@ import {
 import { withConversationSourcePressure } from "../conversation-source-pressure.js";
 import type { ConversationContextLocateResult } from "../conversation-context-locate.js";
 import { buildDeepLocateResumePayload, parseDeepLocateResumePayload, runConversationDeepLocate } from "../conversation-context-locate-task.js";
+import {
+    conversationSearchContextIndices,
+    conversationSearchSnippet,
+    iterateConversationSearchRounds,
+    iterateConversationSearchBlocks,
+    resolveConversationSearchLimit,
+    searchConversationRoundsExact,
+    validateConversationSearchFilter,
+    type ConversationSearchFilter,
+    type ConversationSearchMatch,
+} from "../conversation-search.js";
+import {
+    assertConversationStrictCacheState,
+    conversationSearchReadNextParams,
+    formatConversationSearchReadCache,
+    formatConversationFetchCacheContinuation,
+    selectConversationFetchTaskId,
+    shouldUsePublishedConversationCache,
+} from "../conversation-search-policy.js";
 
 const CONVERSATION_DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness";
 const CONVERSATION_MODEL_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|grok|agy";
@@ -1427,9 +1446,10 @@ function formatCodexFetchWorkerCompletion(result: CodexFetchWorkerResult, record
         subagentNote,
         "🔗 数据链路: codex",
         sourceDiagnostics,
+        formatConversationFetchCacheContinuation(result),
         attachmentOverview,
         `📁 临时文件: ${result.artifact.tempPath}`,
-        `💡 使用 search(query="关键词") 搜索或 read(startRound=1, endRound=3) 阅读${recordNote}`,
+        recordNote,
         `⏱ fetch 分段: 缓存 ${formatSegmentDuration(result.timings.cacheMs)} | 格式化 ${formatSegmentDuration(result.timings.artifactMs)} | 总计 ${formatSegmentDuration(result.timings.totalMs)}`,
     ].filter(Boolean).join("\n");
     return text;
@@ -1447,6 +1467,9 @@ async function runCodexFetchBackgroundTask(
         throw new Error(taskContext.isCancelled()
             ? "conversation fetch cancelled after worker completion"
             : "conversation fetch settled before result publication");
+    }
+    if (result.cacheState === "stale") {
+        throw new Error(`fetch 原文校验失败，上一份完整缓存仍保留；source=cache, link=${payload.link}, cacheGeneration=${result.cacheGeneration || "unknown"}${result.cacheBuildFailure ? ` | ${result.cacheBuildFailure.name}: ${result.cacheBuildFailure.message}` : ""}`);
     }
     const recordNote = await scheduleFetchRecordAutoUpdate({
         conversationId: result.conversationId,
@@ -1468,19 +1491,7 @@ async function runCodexFetchBackgroundTask(
 }
 
 function selectCodexFetchTaskId(payload: CodexFetchWorkerPayload): string {
-    const baseTaskId = buildCodexFetchTaskId(payload);
-    const baseTask = getBackgroundTask(baseTaskId);
-    if (!baseTask || baseTask.status === "running" || baseTask.status === "suspended" || baseTask.status === "done") {
-        return baseTaskId;
-    }
-    for (let attempt = 1; attempt < 1_000; attempt += 1) {
-        const retryTaskId = `${baseTaskId}-retry-${attempt}`;
-        const retryTask = getBackgroundTask(retryTaskId);
-        if (!retryTask || retryTask.status === "running" || retryTask.status === "suspended" || retryTask.status === "done") {
-            return retryTaskId;
-        }
-    }
-    throw new Error("conversation fetch 重试任务编号已耗尽");
+    return selectConversationFetchTaskId(buildCodexFetchTaskId(payload), payload, getBackgroundTask);
 }
 
 function formatLoadedOverview(loaded: LoadedConversationData, stats?: Omit<StreamedFetchArtifact, "tempPath" | "attachmentCount">): string {
@@ -1495,21 +1506,8 @@ function formatLoadedOverview(loaded: LoadedConversationData, stats?: Omit<Strea
     ].join("\n");
 }
 
-function searchLoadedConversationExact(loaded: LoadedConversationData, query: string, limit?: number) {
-    if (loaded.rounds.length > 0) return searchInRounds(loaded.rounds, query, limit);
-    if (!loaded.cacheKey || !loaded.cacheGeneration) return [];
-    const cached = iterateCachedConversationSourceCacheRounds<ConversationRound>({
-        key: loaded.cacheKey,
-        generation: loaded.cacheGeneration,
-    });
-    if (!cached) return [];
-    const matches: ReturnType<typeof searchInRounds> = [];
-    const maxMatches = Math.max(1, limit || 20);
-    for (const round of cached.rounds) {
-        matches.push(...searchInRounds([round], query, maxMatches - matches.length));
-        if (matches.length >= maxMatches) break;
-    }
-    return matches;
+function searchLoadedConversationExact(loaded: LoadedConversationData, query: string, limit: number, filter: ConversationSearchFilter) {
+    return searchConversationRoundsExact(iterateConversationSearchRounds(loaded, filter), query, limit, filter);
 }
 
 function loadConversationRoundWindow(
@@ -1519,15 +1517,7 @@ function loadConversationRoundWindow(
 ): { rounds: ConversationRound[]; endRound: number; hasMore: boolean } {
     const totalRoundCount = loaded.roundCount ?? loaded.rounds.length;
     const boundedEnd = Math.min(endRound, totalRoundCount);
-    const cached = loaded.cacheKey && loaded.cacheGeneration
-        ? iterateCachedConversationSourceCacheRounds<ConversationRound>({
-            key: loaded.cacheKey,
-            generation: loaded.cacheGeneration,
-            startRound,
-            endRound: boundedEnd,
-        })
-        : null;
-    const source = cached?.rounds || loaded.rounds.slice(startRound - 1, boundedEnd);
+    const source = iterateConversationSearchRounds(loaded, { startRound, endRound: boundedEnd });
     const rounds: ConversationRound[] = [];
     let estimatedChars = 0;
     for (const round of source) {
@@ -1621,8 +1611,8 @@ function buildConversationRecallText(
 function loadConversationRoundsByIndex(loaded: LoadedConversationData, roundIndices: readonly number[]): ConversationRound[] {
     if (roundIndices.length === 0) return [];
     const wanted = new Set(roundIndices);
-    if (loaded.rounds.length > 0) return loaded.rounds.filter(round => wanted.has(round.roundIndex));
-    if (!loaded.cacheKey || !loaded.cacheGeneration) return [];
+    if (!loaded.cacheKey && !loaded.cacheGeneration && loaded.rounds.length > 0) return loaded.rounds.filter(round => wanted.has(round.roundIndex));
+    if (!loaded.cacheKey || !loaded.cacheGeneration) throw new Error("fetch 缓存缺少 key/generation，无法读取命中轮次；请先 fetch");
     const sorted = [...wanted].sort((left, right) => left - right);
     const rounds: ConversationRound[] = [];
     let groupStart = sorted[0];
@@ -1634,7 +1624,7 @@ function loadConversationRoundsByIndex(loaded: LoadedConversationData, roundIndi
             startRound: groupStart,
             endRound: groupEnd,
         });
-        if (!cached) return false;
+        if (!cached) throw new Error(`fetch 缓存 generation=${loaded.cacheGeneration} 缺失或损坏，无法读取命中轮次；请重新 fetch`);
         for (const round of cached.rounds) if (wanted.has(round.roundIndex)) rounds.push(round);
         return true;
     };
@@ -1651,23 +1641,8 @@ function loadConversationRoundsByIndex(loaded: LoadedConversationData, roundIndi
     return rounds;
 }
 
-function iterateLoadedConversationSearchBlocks(loaded: LoadedConversationData): Iterable<TextBlock> {
-    const cached = loaded.rounds.length === 0 && loaded.cacheKey && loaded.cacheGeneration
-        ? iterateCachedConversationSourceCacheRounds<ConversationRound>({ key: loaded.cacheKey, generation: loaded.cacheGeneration })
-        : null;
-    const source = cached?.rounds || loaded.rounds;
-    return {
-        *[Symbol.iterator](): Iterator<TextBlock> {
-            for (const round of source) {
-                yield {
-                    id: String(round.roundIndex),
-                    title: `轮次 ${round.roundIndex}`,
-                    content: buildSearchBlockContent(round).slice(0, 8_000),
-                    tags: [],
-                };
-            }
-        },
-    };
+function iterateLoadedConversationSearchBlocks(loaded: LoadedConversationData, filter: ConversationSearchFilter): Iterable<TextBlock> {
+    return iterateConversationSearchBlocks(iterateConversationSearchRounds(loaded, filter), filter);
 }
 
 async function searchLoadedConversationRanked(
@@ -1676,29 +1651,38 @@ async function searchLoadedConversationRanked(
     mode: "fuzzy" | "smart",
     limit: number | undefined,
     modelChain: Chain,
+    filter: ConversationSearchFilter,
 ): Promise<SearchResult[]> {
     const { search: engineSearch } = await import("../search-engine.js");
     const maxResults = Math.max(1, limit || 20);
     const results = new Map<string, SearchResult>();
+    const queryTokens = query.split(/\s+/).filter(token => token.length > 0);
     let blocks: TextBlock[] = [];
     let blockChars = 0;
     const flush = async (): Promise<void> => {
         if (blocks.length === 0) return;
         const chunkResults = await engineSearch(blocks, query, {
             mode,
-            limit: maxResults,
+            limit: blocks.length,
             dataChain: loaded.chainUsed,
             modelChain,
         });
         for (const result of chunkResults) {
-            const previous = results.get(result.id);
-            if (!previous || result.score > previous.score) results.set(result.id, result);
+            const roundId = String(result.metadata?.roundIndex ?? result.id.split(":")[0]);
+            const previous = results.get(roundId);
+            if (!previous || result.score > previous.score) results.set(roundId, { ...result, id: roundId });
         }
         blocks = [];
         blockChars = 0;
     };
-    for (const block of iterateLoadedConversationSearchBlocks(loaded)) {
-        if (blocks.length >= 128 || blockChars + block.content.length > 512_000) await flush();
+    for (const block of iterateLoadedConversationSearchBlocks(loaded, filter)) {
+        if (blocks.length >= 128 || blockChars + block.content.length > 512_000) {
+            if (mode === "smart") throw new Error("smart 暂不支持超过 128 个完整正文分片或 512K 字的搜索范围；请缩小 startRound/endRound、限定 messageRoles，或使用 exact/fuzzy");
+            await flush();
+        }
+        const anchorToken = queryTokens.find(token => block.content.toLowerCase().includes(token.toLowerCase()));
+        const anchorPosition = anchorToken ? block.content.toLowerCase().indexOf(anchorToken.toLowerCase()) : 0;
+        block.metadata = { ...block.metadata, searchSnippet: conversationSearchSnippet(block.content, anchorPosition, anchorToken?.length ?? 40) };
         blocks.push(block);
         blockChars += block.content.length;
     }
@@ -1738,13 +1722,6 @@ function pushConversationReadRoundOutput(
     return pushed;
 }
 
-function buildSearchBlockContent(round: ConversationRound): string {
-    return [
-        round.userMessage,
-        ...round.aiResponses.map(item => item.response),
-    ].filter(Boolean).join("\n");
-}
-
 function formatConversationSearchDelivery(text: string, roundIndices: number[]): string {
     if (text.length <= CONVERSATION_READ_DELIVERY_MAX_CHARS) return text;
     const uniqueRounds = [...new Set(roundIndices)].sort((left, right) => left - right);
@@ -1759,23 +1736,12 @@ function formatConversationSearchDelivery(text: string, roundIndices: number[]):
     return `${text.slice(0, headEnd)}${omittedNote}${text.slice(tailStart)}`;
 }
 
-function truncateAnnotationSearchField(text: string, maxCodePoints: number): string {
-    const codePoints = Array.from(text);
-    return codePoints.length <= maxCodePoints
-        ? text
-        : `${codePoints.slice(0, maxCodePoints).join("")}…`;
-}
-
-function formatAnnotationSearchMatch(match: ReturnType<typeof searchInRounds>[number]): string {
+function formatAnnotationSearchMatch(match: ConversationSearchMatch): string {
     const field = match.annotationField === "comment" ? "用户评论" : "被批注文本";
-    const selectedText = truncateAnnotationSearchField(match.annotationSelectedText || "", 1_200);
-    const comment = truncateAnnotationSearchField(match.annotationComment || "", 1_200);
     return [
         `## 轮次 ${match.roundIndex} · Annotation ${match.annotationIndex || 1}`,
         `- 命中字段: ${field}`,
         `- 命中片段: ${match.matchText}`,
-        `- 被批注文本: ${selectedText}`,
-        `- 用户评论: ${comment}`,
     ].join("\n");
 }
 
@@ -1878,7 +1844,7 @@ registerBackgroundTaskRecoveryHandler("conversation-fetch", async task => {
     }
     const payload = task.resumePayload;
     return {
-        mode: "restart",
+        mode: "resume",
         run: context => runCodexFetchBackgroundTask(payload, context),
         timeoutMessage: "Codex 巨型对话 fetch 后台任务超时；缓存未完成发布时仍保留上一份完整可用缓存",
     };
@@ -1926,6 +1892,9 @@ registerBackgroundTaskRecoveryHandler("conversation-batch-export", async (task) 
 export function registerConversation(server: McpServer, dependencies: {
     listCandidates?: typeof listConversationCandidates;
     runDeepLocate?: typeof runConversationDeepLocate;
+    loadConversation?: typeof loadConversationData;
+    resolveFetchChain?: typeof resolveConversationChain;
+    estimateCodexFetchWork?: typeof estimateCodexFetchWorkAsync;
 } = {}): void {
     server.tool(
         "conversation_read_original",
@@ -1956,9 +1925,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[read] Claude Code 压缩续聊摘要读取方式：folded=默认折叠为临时文件 / full=展开但标记 / omit=仅保留省略标记；未传时 depth=full 自动 full，其余 folded"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
                 .describe("[list/search] 匹配模式：auto/exact/fuzzy/smart，默认 auto"),
-            contextRounds: z.number().default(2).optional()
-                .describe("[search] 匹配位置前后显示多少轮对话"),
-            limit: z.number().default(8).optional()
+            contextRounds: z.number().int().min(0).optional()
+                .describe("[search] 显式请求匹配轮次及前后上下文；未传或 0 只返回短匹配摘录"),
+            limit: z.number().optional()
                 .describe("[list/search] 最多返回多少个匹配"),
             background: z.boolean().optional()
                 .describe("[deep_locate/exportBatch] 三态后台：true=强制后台 / false=同步兜底（deep_locate 不支持）/ 不传时自动后台返回 taskId"),
@@ -1971,7 +1940,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             maxBytes: z.number().optional()
                 .describe("[deep_locate] 最大扫描字节数；[read] 单段交付字节上限，会覆盖默认约 100K 字符预算"),
             maxHits: z.number().optional()
-                .describe("[deep_locate] 最大命中数"),
+                .describe("[deep_locate/search] 最大命中数；search 的 limit 别名，与 limit 不同值时报错"),
             deadlineMs: z.number().int().min(1).max(600000).optional()
                 .describe("[list contextProbe/deep_locate] 候选发现和正文定位的总时间预算（毫秒）；到期返回已取得的部分证据，不冒充完整扫描"),
             startRound: z.number().optional()
@@ -1982,6 +1951,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[recall] auto=按宿主压缩信号恢复 / manual=按 startRound/endRound / full=全部 context-only 内容写临时文件"),
             continuationCursor: z.string().optional()
                 .describe("[read] 上一段返回的续读光标；来源或参数变化时会拒绝，避免重复或串读"),
+            cacheGeneration: z.string().min(1).optional()
+                .describe("[search/read] 固定已发布缓存的同一 generation；可用 search 返回值继续 read，旧代缺失时报恢复建议"),
             exportFormat: z.enum(["markdown", "pdf", "both"]).optional()
                 .describe("[export] 导出格式，markdown=只导出 Markdown，pdf=Markdown+PDF 且以 PDF 为目标，both=两者都生成"),
             exportScope: z.enum(["full", "rounds", "search"]).optional()
@@ -1997,12 +1968,12 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             extraTypes: z.array(z.enum(["thinking", "tool_results", "code_actions", "code_diffs", "file_views"])).optional()
                 .describe("[fetch/search/read] 额外拉取的内容类型"),
             messageRoles: z.array(z.enum(["user", "system", "model", "assistant", "tool", "subagent"])).optional()
-                .describe("[read/export] 按消息角色选择性读取或导出。user=真实人类输入，system=规则/压缩/系统注入，model/assistant=模型回复，tool=工具/代码/任务事件，subagent=挂在父轮的子代理摘要"),
+                .describe("[search/read/export] 按消息角色选择性匹配、读取或导出。user=真实人类输入与批注，system=规则/压缩/自动事件，model/assistant=模型回复，tool=工具/代码/任务事件，subagent=子代理摘要"),
             chain: z.enum(CHAIN_COMPAT_INPUT_VALUES).default(DEFAULT_CHAIN)
                 .describe("兼容旧参数：dataChain/modelChain 未填时沿用此链路；chain=\"windsurf\"/\"dsh\"（含别名）只作为 dataChain，chain=\"grok\"/\"agy\" 只作为 modelChain"),
             dataChain: conversationDataChainInputSchema("dataChain", "读取对话数据的宿主链路；未填用 chain。DSH（DeepSeek Harness，含 deepseek-harness 别名）与 Windsurf 只支持 dataChain；agy 与 Grok 只支持 modelChain"),
-            source: z.enum(["auto", "local", "ls", "cache"]).default("auto")
-                .describe("原文来源：auto=按真实来源路由；local=只读 JSONL/PB/Devin SQLite；ls=仅旧 Windsurf/Antigravity；cache=只读已发布 fetch 缓存"),
+            source: z.enum(["auto", "local", "ls", "cache"]).optional()
+                .describe("原文来源：Codex search/read 未传时只读已发布缓存；显式 auto/local 与 fetch 保持原文校验；ls=旧 Windsurf/Antigravity；cache=固定已发布缓存"),
             dataChains: z.array(conversationDataChainValueSchema("dataChains")).optional()
                 .describe("[list/deep_locate/export] 批量模式：查询限定的多个数据源；例如 [\"codex\",\"windsurf\",\"dsh\"]。未传时保持单 dataChain 行为"),
             workspaces: z.array(z.string()).optional()
@@ -2047,12 +2018,13 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     depth = "normal",
                     compactionMode,
                     mode = "auto",
-                    contextRounds = 2,
-                    limit = 8,
+                    contextRounds: requestedContextRounds,
+                    limit: requestedLimit,
                     startRound,
                     endRound,
                     recallMode = "auto",
                     continuationCursor,
+                    cacheGeneration,
                     exportFormat,
                     exportScope,
                     outputDir,
@@ -2089,7 +2061,14 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     link = DEFAULT_LINK_MODE,
                     logicalChain,
                 } = params;
+                const sourceExplicit = params.source !== undefined;
+                const limit = action === "search" ? resolveConversationSearchLimit(requestedLimit, maxHits) : requestedLimit ?? 8;
+                const contextRounds = requestedContextRounds ?? (action === "search" ? 0 : action === "read" ? 1 : 2);
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
+                const searchFilter: ConversationSearchFilter = { startRound, endRound, messageRoles: messageRoles as ConversationMessageRole[] | undefined };
+                if (action === "search" || action === "read") validateConversationSearchFilter(searchFilter);
+                const cacheRequest = { source, sourceExplicit, link, cacheGeneration, logicalChain: logicalChain as ConversationLogicalChainMode | undefined };
+                const publishedCacheOnly = shouldUsePublishedConversationCache(action, chains.dataChain, sourceExplicit);
                 const effectiveCompactionMode: CompactionMode = compactionMode || (depth === "full" ? "full" : "folded");
                 const isBatchConversationExport = action === "export" && !conversationId?.trim() && Boolean(exportBatch || dataChains?.length || workspaces?.length);
 
@@ -2737,10 +2716,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     }, startTime);
                 }
 
-                if (action === "fetch" && conversationId && source !== "ls") {
-                    const resolvedFetchChain = await resolveConversationChain(chains.dataChain);
+                if (action === "fetch" && conversationId && source !== "ls" && source !== "cache") {
+                    const resolvedFetchChain = await (dependencies.resolveFetchChain || resolveConversationChain)(chains.dataChain);
                     const estimate = resolvedFetchChain === "codex"
-                        ? await estimateCodexFetchWorkAsync(conversationId)
+                        ? await (dependencies.estimateCodexFetchWork || estimateCodexFetchWorkAsync)(conversationId)
                         : null;
                     if (estimate?.shouldBackground && background === false) {
                         return appendTiming({
@@ -2789,14 +2768,14 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                     `📦 历史来源: ${((estimate.historySource?.totalBytes ?? estimate.sourceSize) / (1024 * 1024)).toFixed(1)} MiB | ${estimate.historySource?.segments.length ?? 1} 个文件 | 自动后台阈值 ${(estimate.thresholdBytes / (1024 * 1024)).toFixed(1)} MiB`,
                                     `📍 当前状态: ${task.status}${task.progress?.detail ? ` | ${task.progress.detail}` : ""}`,
                                     "💡 使用 background_task_status(taskId=\"...\", waitSeconds=30-45) 查询；取消时使用 background_task_cancel(taskId=\"...\")。",
-                                    "♻️ 相同源版本、link/source 与 1 小时临时文件窗口会复用同一稳定 taskId；进程热重启后也从该 ID 恢复。",
+                                    "♻️ 相同来源与 link/source 的在途请求可共用 taskId；轻量估算的新 fetch 会重新校验完整原文，已完成任务不作为本次校验结果。",
                                 ].join("\n"),
                             }],
                         }, startTime);
                     }
                 }
 
-                const loaded = await loadConversationData(chains.dataChain, conversationId, {
+                const loadOptions: Parameters<typeof loadConversationData>[2] = {
                     refresh: action === "fetch" || action === "recall",
                     link,
                     dataChains: dataChains as DataChain[] | undefined,
@@ -2804,17 +2783,34 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     sourceFailureMode: sourceFailureMode as SourceFailureMode,
                     logicalChain: logicalChain as ConversationLogicalChainMode | undefined,
                     source,
+                    publishedCacheOnly,
+                    cacheGeneration,
                     includeRounds: action === "recall"
                         ? false
                         : action === "export"
                             && (exportScope === "search" || (!exportScope && Boolean(query))),
                     requireCompactionMetadata: action === "recall",
-                });
+                };
+                const readConversation = dependencies.loadConversation || loadConversationData;
+                let loaded = await readConversation(chains.dataChain, conversationId, loadOptions);
+                if (publishedCacheOnly && loaded && loaded.chainUsed !== "codex") {
+                    const cachedRecovery = loaded;
+                    loaded = await readConversation(loaded.chainUsed, loaded.conversationId, { ...loadOptions, publishedCacheOnly: false });
+                    if (!loaded) throw new Error(`dataChain=auto 定位到 ${cachedRecovery.chainUsed}，原文来源读取失败；旧缓存仍可使用 source=cache, link=${link}, cacheGeneration=${cachedRecovery.cacheGeneration || "unknown"} 读取`);
+                }
                 if (!loaded) {
                     return appendTiming({
-                        content: [{ type: "text" as const, text: `❌ 无法通过 dataChain=${chains.dataChain} 获取对话数据` }],
+                        content: [{ type: "text" as const, text: source === "cache" || publishedCacheOnly || cacheGeneration
+                            ? describeConversationCacheReadFailure(chains.dataChain, conversationId!, { link, logicalChain, cacheGeneration })
+                            : `❌ 无法通过 dataChain=${chains.dataChain} 获取对话数据` }],
                     }, startTime);
                 }
+                assertConversationStrictCacheState(loaded, action, cacheRequest);
+                if (cacheGeneration && loaded.cacheGeneration !== cacheGeneration) {
+                    throw new Error(`请求固定 cacheGeneration=${cacheGeneration}，实际 generation=${loaded.cacheGeneration || "unknown"}；请使用 source=cache 固定同代，或重新 fetch 后使用新的 generation`);
+                }
+                const cacheReadDetail = formatConversationSearchReadCache(loaded, cacheRequest);
+                const cacheNextParams = conversationSearchReadNextParams(loaded, cacheRequest);
 
                 const cascadeId = loaded.conversationId;
                 const rounds = loaded.rounds;
@@ -3030,118 +3026,70 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     }
 
                     const matches = (mode === "auto" || mode === "exact")
-                        ? searchLoadedConversationExact(loaded, query, limit)
+                        ? searchLoadedConversationExact(loaded, query, limit, searchFilter)
                         : [];
-                    const searchHeader = formatConversationSearchHeader(cascadeId, loaded);
+                    const searchHeader = [formatConversationSearchHeader(cascadeId, loaded), cacheReadDetail,
+                        `🎯 搜索范围: ${startRound ?? 1}-${endRound ?? loaded.roundCount ?? "end"} | 角色: ${messageRoles?.join(", ") || "all"}`].join("\n");
                     if (matches.length === 0 && mode === "exact") {
                         return appendTiming({
-                                    content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
+                            content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
                         }, startTime);
                     }
+                    let rankedResults: SearchResult[] = [];
+                    let actualMode = "exact";
                     if (matches.length === 0) {
                         const requestedMode = mode as "auto" | "exact" | "fuzzy" | "smart";
-                        let fuzzyResults = requestedMode === "smart"
+                        rankedResults = requestedMode === "smart"
                             ? []
-                            : await searchLoadedConversationRanked(loaded, query, "fuzzy", limit, chains.modelChain);
-                        if (fuzzyResults.length === 0 && (requestedMode === "auto" || requestedMode === "smart")) {
-                            const smartResults = await searchLoadedConversationRanked(loaded, query, "smart", limit, chains.modelChain);
-                            if (smartResults.length === 0) {
-                                return appendTiming({
-                                    content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — 未找到匹配` }],
-                                }, startTime);
-                            }
-                            const smartRoundIndices = smartResults.map(r => Number(r.id));
-                            const output: string[] = [`🔍 搜索 "${query}" — smart 模式命中 ${smartResults.length} 轮\n`];
-                            const selectedRounds = loadConversationRoundsByIndex(loaded, smartRoundIndices);
-                            const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
-                                searchTiming,
-                                "附件物化",
-                                () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
-                            );
-                            await measureConversationReadSegment(searchTiming, "格式化", async () => {
-                                for (let index = 0; index < smartRoundIndices.length; index++) {
-                                    const ri = smartRoundIndices[index];
-                                    const round = displayRounds.find(item => item.roundIndex === ri);
-                                    if (!round) continue;
-                                    output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                                    output.push("");
-                                    await yieldConversationFormatIfNeeded(index + 1);
-                                }
-                            });
-                            if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
-                            let text = formatConversationSearchDelivery(output.join("\n"), smartRoundIndices);
-                            text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
-                            return appendTiming({
-                                content: [{ type: "text" as const, text: `${formatConversationSearchHeader(cascadeId, loaded, chains.modelChain)}\n\n${text}` }],
-                            }, startTime);
+                            : await searchLoadedConversationRanked(loaded, query, "fuzzy", limit, chains.modelChain, searchFilter);
+                        actualMode = "fuzzy";
+                        if (rankedResults.length === 0 && (requestedMode === "auto" || requestedMode === "smart")) {
+                            rankedResults = await searchLoadedConversationRanked(loaded, query, "smart", limit, chains.modelChain, searchFilter);
+                            actualMode = "smart";
                         }
-                        // 将 fuzzy 结果转换回轮次索引
-                        const fuzzyRoundIndices = fuzzyResults.map(r => Number(r.id));
-                        const output: string[] = [`🔍 搜索 "${query}" — fuzzy 模式命中 ${fuzzyResults.length} 轮\n`];
-                        const selectedRounds = loadConversationRoundsByIndex(loaded, fuzzyRoundIndices);
-                        const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
-                            searchTiming,
-                            "附件物化",
-                            () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
-                        );
+                        if (rankedResults.length === 0) return appendTiming({
+                            content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — ${actualMode} 模式未找到匹配` }],
+                        }, startTime);
+                    }
+                    const matchedRoundIndices = matches.length > 0 ? matches.map(match => match.roundIndex) : rankedResults.map(result => Number(result.id));
+                    const output: string[] = [`🔍 搜索 "${query}" — ${actualMode} 模式命中 ${matches.length || rankedResults.length} 处\n`];
+                    for (const match of matches) {
+                        output.push(match.matchType === "annotation" ? formatAnnotationSearchMatch(match)
+                            : `## 轮次 ${match.roundIndex} · ${match.role}\n${match.matchText}`);
+                        output.push("");
+                    }
+                    for (const result of rankedResults) {
+                        const annotationLabel = result.metadata?.matchType === "annotation"
+                            ? ` · Annotation ${result.metadata.annotationIndex} · 命中字段: ${result.metadata.annotationField === "comment" ? "用户评论" : "被批注文本"}` : "";
+                        output.push(`## 轮次 ${result.id} · ${actualMode}${result.metadata?.role ? ` · ${result.metadata.role}` : ""}${annotationLabel}`);
+                        if (result.metadata?.searchSnippet) output.push(result.metadata.searchSnippet);
+                        else for (const detail of result.matches.slice(0, 3)) {
+                            const text = detail.context || detail.line;
+                            const position = query.split(/\s+/).map(token => text.toLowerCase().indexOf(token.toLowerCase())).find(offset => offset >= 0) ?? 0;
+                            output.push(conversationSearchSnippet(text, position, 40));
+                        }
+                        output.push("");
+                    }
+                    if (contextRounds > 0) {
+                        const totalRoundCount = loaded.roundCount ?? rounds.at(-1)?.roundIndex ?? rounds.length;
+                        const contextIndices = conversationSearchContextIndices(matchedRoundIndices.map(roundIndex => ({ roundIndex })), totalRoundCount, contextRounds, searchFilter);
+                        const selectedRounds = loadConversationRoundsByIndex(loaded, contextIndices);
+                        const { rounds: displayRounds, truncated } = await measureConversationReadSegment(searchTiming, "附件物化",
+                            () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId));
+                        const roleFilter = normalizeMessageRoles(messageRoles as ConversationMessageRole[] | undefined);
                         await measureConversationReadSegment(searchTiming, "格式化", async () => {
-                            for (let index = 0; index < fuzzyRoundIndices.length; index++) {
-                                const ri = fuzzyRoundIndices[index];
-                                const round = displayRounds.find(item => item.roundIndex === ri);
-                                if (!round) continue;
-                                output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                                output.push("");
+                            for (const [index, round] of displayRounds.entries()) {
+                                const formatted = formatRoundForMessageRolesWithOptionalBudget(round, depth as Depth, extraTypes as ExtraType[], roleFilter, effectiveCompactionMode);
+                                if (formatted.text) output.push(formatted.text, "");
                                 await yieldConversationFormatIfNeeded(index + 1);
                             }
                         });
                         if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
-                        let text = formatConversationSearchDelivery(output.join("\n"), fuzzyRoundIndices);
-                        text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
-                        return appendTiming({
-                            content: [{ type: "text" as const, text: `${searchHeader}\n\n${text}` }],
-                        }, startTime);
                     }
-
-                    const output: string[] = [];
-                    output.push(`🔍 搜索 "${query}" — 命中 ${matches.length} 处\n`);
-
-                    const annotationMatches = matches.filter(match => match.matchType === "annotation");
-                    const roundMatches = matches.filter(match => match.matchType !== "annotation");
-                    for (const match of annotationMatches) {
-                        output.push(formatAnnotationSearchMatch(match));
-                        output.push("");
-                    }
-
-                    // 收集需要展示的轮次（去重 + 上下文）
-                    const roundsToShow = new Set<number>();
-                    const totalRoundCount = loaded.roundCount ?? rounds.length;
-                    for (const m of roundMatches) {
-                        const ctx = contextRounds ?? 1;
-                        for (let r = Math.max(1, m.roundIndex - ctx); r <= Math.min(totalRoundCount, m.roundIndex + ctx); r++) {
-                            roundsToShow.add(r);
-                        }
-                    }
-
-                    const sortedRounds = [...roundsToShow].sort((a, b) => a - b);
-                    const selectedRounds = loadConversationRoundsByIndex(loaded, sortedRounds);
-                    const { rounds: displayRounds, truncated } = await measureConversationReadSegment(
-                        searchTiming,
-                        "附件物化",
-                        () => materializeRoundAttachmentsWithOptionalBudget(selectedRounds, cascadeId),
-                    );
-                    await measureConversationReadSegment(searchTiming, "格式化", async () => {
-                        for (let index = 0; index < sortedRounds.length; index++) {
-                            const ri = sortedRounds[index];
-                            const round = displayRounds.find(item => item.roundIndex === ri);
-                            if (!round) continue;
-                            output.push(formatRound(round, depth as Depth, extraTypes as ExtraType[], { compactionMode: effectiveCompactionMode }));
-                            output.push("");
-                            await yieldConversationFormatIfNeeded(index + 1);
-                        }
-                    });
-                    if (truncated > 0) output.push(`⚠️ ${truncated} 个附件超过单次生成上限，未生成临时文件\n`);
-
-                    const matchedRoundIndices = matches.map(match => match.roundIndex);
+                    const orderedMatches = [...new Set(matchedRoundIndices)].sort((left, right) => left - right);
+                    output.push("💡 固定同代读取参数", JSON.stringify({ action: "read", conversationId: cascadeId, dataChain: loaded.chainUsed,
+                        startRound: orderedMatches[0], endRound: orderedMatches.at(-1), ...cacheNextParams,
+                        ...(messageRoles?.length ? { messageRoles } : {}) }));
                     let text = formatConversationSearchDelivery(output.join("\n"), matchedRoundIndices);
                     text = appendConversationReadDetail(text, formatConversationReadSegmentTiming(searchTiming));
 
@@ -3161,6 +3109,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         const output = [
                             formatLoadedOverview(loaded),
                             `🔗 数据链路: ${loaded.chainUsed}`,
+                            cacheReadDetail,
                             windsurfSourceDiagnostics,
                             incompleteWindsurfWarning,
                         ].filter(Boolean).join("\n");
@@ -3171,13 +3120,13 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
                     if (start > totalRoundCount) {
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `❌ startRound ${start} 超出范围（共 ${totalRoundCount} 轮）` }],
+                            content: [{ type: "text" as const, text: `${cacheReadDetail}\n❌ startRound ${start} 超出范围（共 ${totalRoundCount} 轮）` }],
                         }, startTime);
                     }
                     const roundWindow = loadConversationRoundWindow(loaded, start, end);
                     if (roundWindow.rounds.length === 0) {
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `❌ 无法从 fetch 缓存读取第 ${start}-${Math.min(end, totalRoundCount)} 轮` }],
+                            content: [{ type: "text" as const, text: `${cacheReadDetail}\n❌ 无法从 fetch 缓存读取第 ${start}-${Math.min(end, totalRoundCount)} 轮` }],
                         }, startTime);
                     }
 
@@ -3291,7 +3240,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         sourcePositions,
                         continuationCursor,
                         maxBytes,
-                        detail: formatConversationReadSegmentTiming(readTiming),
+                        detail: [cacheReadDetail, formatConversationReadSegmentTiming(readTiming)].filter(Boolean).join("\n"),
                         nextParams: {
                             action: "read",
                             conversationId: cascadeId,
@@ -3303,7 +3252,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             ...(extraTypes.length ? { extraTypes } : {}),
                             ...(messageRoles?.length ? { messageRoles } : {}),
                             ...(maxBytes !== undefined ? { maxBytes } : {}),
-                            link,
+                            ...cacheNextParams,
+                            ...(logicalChain ? { logicalChain } : {}),
                         },
                         ...(roundWindow.hasMore ? {
                             terminalNextParams: {
@@ -3317,7 +3267,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                 ...(extraTypes.length ? { extraTypes } : {}),
                                 ...(messageRoles?.length ? { messageRoles } : {}),
                                 ...(maxBytes !== undefined ? { maxBytes } : {}),
-                                link,
+                                ...cacheNextParams,
+                                ...(logicalChain ? { logicalChain } : {}),
                             },
                         } : {}),
                     });

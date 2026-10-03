@@ -383,7 +383,7 @@ function segmentForSync(rollout: LoadedRollout, startOrdinal: number, endOrdinal
     };
 }
 
-async function segmentFor(rollout: LoadedRollout, startOrdinal: number, endOrdinalExclusive: number | undefined, endByte: number, allowUnterminatedLeaf = false, isCancelled?: () => boolean): Promise<CodexHistorySegment> {
+async function segmentFor(rollout: LoadedRollout, startOrdinal: number, endOrdinalExclusive: number | undefined, endByte: number, allowUnterminatedLeaf = false, isCancelled?: () => boolean, metadataOnly = false): Promise<CodexHistorySegment> {
     if (endByte > rollout.size) throw new Error(`Codex history byte boundary exceeds source size: ${rollout.path}`);
     const anchor = await readAnchor(rollout.path, endByte);
     const unterminatedLeaf = allowUnterminatedLeaf && endByte === rollout.size && endByte > 0 && anchor.value.at(-1) !== 0x0a;
@@ -400,7 +400,7 @@ async function segmentFor(rollout: LoadedRollout, startOrdinal: number, endOrdin
         headerSha256: sha256(rollout.header.header),
         anchorStartByte: anchor.start,
         anchorSha256: sha256(anchor.value),
-        prefixSha256: await hashCodexPrefix(rollout.path, endByte, isCancelled, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }),
+        ...(metadataOnly ? {} : { prefixSha256: await hashCodexPrefix(rollout.path, endByte, isCancelled, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }) }),
         ordinalMode: rollout.header.ordinalMode,
         ...(unterminatedLeaf ? { unterminatedLeaf: true } : {}),
     };
@@ -468,7 +468,7 @@ export function resolveCodexHistorySource(rolloutPath: string, options: { roots?
     return sourceFromSegments(leafPath, reverseSegments.reverse());
 }
 
-export async function resolveCodexHistorySourceAsync(rolloutPath: string, options: { roots?: string[]; endByte?: number; isCancelled?: () => boolean } = {}): Promise<CodexHistorySource> {
+export async function resolveCodexHistorySourceAsync(rolloutPath: string, options: { roots?: string[]; endByte?: number; isCancelled?: () => boolean; metadataOnly?: boolean } = {}): Promise<CodexHistorySource> {
     const leafPath = normalizeCodexHistoryPath(rolloutPath);
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
@@ -482,7 +482,7 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         if (seen.has(currentKey)) throw new Error(`Circular Codex history_base reference for rollout: ${currentKey}`);
         seen.add(currentKey);
         const startOrdinal = current.header.historyBase?.endOrdinalExclusive || 0;
-        reverseSegments.push(await segmentFor(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined, options.isCancelled));
+        reverseSegments.push(await segmentFor(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined, options.isCancelled, options.metadataOnly));
         const base = current.header.historyBase;
         if (!base || base.endByte === 0) break;
         index ??= await indexRoots(uniqueRoots(leafPath, options.roots));

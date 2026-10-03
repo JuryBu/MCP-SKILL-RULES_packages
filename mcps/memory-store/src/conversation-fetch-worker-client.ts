@@ -2,7 +2,7 @@ import { fork } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { assertCodexSourceVersion, captureCodexSourceVersion, captureCodexSourceVersionAsync, getCodexThread } from "./codex-client.js";
+import { assertCodexSourceVersion, captureCodexSourceVersion, inspectCodexSourceVersionAsync, getCodexThread } from "./codex-client.js";
 import { stableJsonHash, type BackgroundTaskContext } from "./background-tasks.js";
 import type { Chain } from "./chain.js";
 import type { CodexHistorySource } from "./codex-history-source.js";
@@ -26,6 +26,7 @@ export interface CodexFetchWorkEstimate {
     historySource?: CodexHistorySource;
     thresholdBytes: number;
     shouldBackground: boolean;
+    verificationDeferred?: boolean;
 }
 
 export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEstimate | null {
@@ -48,9 +49,9 @@ export async function estimateCodexFetchWorkAsync(conversationId: string): Promi
     const thread = getCodexThread(conversationId);
     if (!thread?.rolloutPath) return null;
     try {
-        const sourceVersion = await captureCodexSourceVersionAsync(thread.rolloutPath);
+        const sourceVersion = await inspectCodexSourceVersionAsync(thread.rolloutPath);
         const thresholdBytes = readThreshold();
-        return { ...sourceVersion, thresholdBytes, shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes };
+        return { ...sourceVersion, thresholdBytes, shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes, verificationDeferred: true };
     } catch {
         return null;
     }
@@ -65,7 +66,8 @@ export function createCodexFetchWorkerPayload(input: {
     now?: number;
 }): CodexFetchWorkerPayload {
     return {
-        version: 1,
+        version: input.estimate.verificationDeferred ? 2 : 1,
+        ...(input.estimate.verificationDeferred ? { verificationDeferred: true } : {}),
         conversationId: input.conversationId,
         link: input.link,
         source: input.source,
@@ -106,10 +108,12 @@ export async function runCodexFetchWorker(
             ? "conversation fetch worker cancelled before start"
             : "conversation fetch worker stopped before start after task settlement"));
     }
-    try {
-        await assertCodexSourceVersion(payload.sourcePath, payload, "before worker start", () => taskContext.isCancelled() || taskContext.isSettled());
-    } catch (error) {
-        return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+    if (payload.version === 1) {
+        try {
+            await assertCodexSourceVersion(payload.sourcePath, payload, "before worker start", () => taskContext.isCancelled() || taskContext.isSettled());
+        } catch (error) {
+            return Promise.reject(error instanceof Error ? error : new Error(String(error)));
+        }
     }
     return new Promise((resolve, reject) => {
         const target = options.target || workerTarget();

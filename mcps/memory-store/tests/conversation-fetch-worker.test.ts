@@ -243,15 +243,25 @@ try {
     await import("../src/tools/conversation.ts");
     const recoveryHandler = getBackgroundTaskRecoveryHandler("conversation-fetch");
     assert.ok(recoveryHandler, "conversation-fetch must register a startup recovery handler");
-    const recoveryAction = await recoveryHandler?.({
+    for (const resumePayload of [payload, { ...payload, version: 2, verificationDeferred: true }]) {
+        const recoveryAction = await recoveryHandler?.({
+            id: buildCodexFetchTaskId(payload),
+            kind: "conversation-fetch",
+            status: "running",
+            startedAt: new Date(0).toISOString(),
+            updatedAt: new Date(0).toISOString(),
+            resumePayload,
+        });
+        assert.equal(recoveryAction?.mode, "resume");
+    }
+    await assert.rejects(() => Promise.resolve(recoveryHandler?.({
         id: buildCodexFetchTaskId(payload),
         kind: "conversation-fetch",
         status: "running",
         startedAt: new Date(0).toISOString(),
         updatedAt: new Date(0).toISOString(),
-        resumePayload: payload,
-    });
-    assert.equal(recoveryAction?.mode, "restart");
+        resumePayload: { version: 3 },
+    })), /缺少可恢复/u);
 
     console.log("conversation fetch worker tests passed");
 } finally {

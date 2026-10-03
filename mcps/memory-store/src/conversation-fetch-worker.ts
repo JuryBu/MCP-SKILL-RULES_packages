@@ -1,6 +1,6 @@
 import process from "node:process";
 import { loadConversationData } from "./conversation-bridge.js";
-import { assertCodexSourceVersion } from "./codex-client.js";
+import { assertCodexSourceVersion, captureCodexSourceVersionAsync } from "./codex-client.js";
 import { writeFetchedConversationArtifact } from "./conversation-fetch-artifact.js";
 import {
     createCodexFetchWorkerLinkDiagnostics,
@@ -23,12 +23,17 @@ function send(message: CodexFetchWorkerMessage): Promise<void> {
 }
 
 async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWorkerResult> {
+    const startedAt = Date.now();
+    if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
+    await send({ type: "progress", stage: "source:verify", detail: "正在捕获并完整校验 Codex 历史来源前缀" });
+    const expectedSource = payload.version === 2
+        ? await captureCodexSourceVersionAsync(payload.sourcePath, () => cancellationRequested)
+        : payload;
     const assertSourceCurrent = async (stage: string): Promise<void> => {
-        await assertCodexSourceVersion(payload.sourcePath, payload, stage);
+        await assertCodexSourceVersion(expectedSource.sourcePath, expectedSource, stage, () => cancellationRequested);
     };
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
-    await assertSourceCurrent("before cache build");
-    const startedAt = Date.now();
+    if (payload.version === 1) await assertSourceCurrent("before cache build");
     const linkResolution = resolveCodexFetchWorkerLink(payload.link);
     await send({ type: "progress", stage: "cache", detail: "独立进程正在构建或复用 Codex fetch 缓存" });
     const cacheStartedAt = Date.now();
@@ -39,14 +44,7 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
         includeRounds: false,
         requestClass: "background",
         isCancelled: () => cancellationRequested,
-        expectedCodexSource: {
-            sourcePath: payload.sourcePath,
-            sourceSize: payload.sourceSize,
-            sourceMtimeMs: payload.sourceMtimeMs,
-            anchorStartByte: payload.anchorStartByte,
-            anchorSha256: payload.anchorSha256,
-            historySource: payload.historySource,
-        },
+        expectedCodexSource: expectedSource,
     });
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
     await assertSourceCurrent("after cache build");
@@ -82,6 +80,12 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
         linkDiagnostics,
         cacheKey: loaded.cacheKey,
         cacheGeneration: loaded.cacheGeneration,
+        cacheCreatedAt: loaded.cacheCreatedAt,
+        cacheReadPolicy: loaded.cacheReadPolicy,
+        sourceCoverageBytes: loaded.codexData.historySource?.totalBytes ?? loaded.cacheFingerprint?.size,
+        sourceFileCount: loaded.codexData.historySource?.segments.length,
+        sourceEndByte: loaded.codexData.historySource?.segments.at(-1)?.endByte,
+        sourceEndOrdinalExclusive: loaded.codexData.historySource?.segments.at(-1)?.endOrdinalExclusive,
         cacheState: loaded.cacheState,
         cacheBuildFailure: loaded.cacheBuildFailure,
         cacheFingerprint: loaded.cacheFingerprint,

@@ -835,6 +835,16 @@ export function readConversationSourceCacheOnly<TSnapshot = unknown>(
     return readCachedConversationSourceCache<TSnapshot>(options);
 }
 
+export function getConversationSourceCacheReadStatus(
+    options: ConversationSourceCacheReadOptions,
+): "missing" | "ready" | "corrupt" {
+    const filename = options.generation
+        ? generationManifestPath(options.key, options.generation)
+        : manifestPath(options.key);
+    if (!fs.existsSync(filename)) return "missing";
+    return readCachedInternal(options) ? "ready" : "corrupt";
+}
+
 export function iterateCachedConversationSourceCacheRounds<TRound = unknown>(
     options: ConversationSourceCacheRoundRange,
 ): ConversationSourceCacheRoundIterable<TRound> | null {

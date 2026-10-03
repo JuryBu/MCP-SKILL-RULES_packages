@@ -63,6 +63,7 @@ import {
     readOrBuildConversationSourceCache,
     createConversationSourceCacheRoundSpool,
     getConversationSourceCacheGenerationKind,
+    getConversationSourceCacheReadStatus,
     type ConversationSourceCacheKey,
     type ConversationSourceCacheGenerationRef,
     type ConversationSourceFingerprint,
@@ -115,6 +116,7 @@ export interface ConversationLoadResult {
     cacheGeneration?: string;
     cacheState?: "hit" | "built" | "stale";
     cacheCreatedAt?: string;
+    cacheReadPolicy?: "published" | "verified";
     cacheBuildFailure?: ConversationSourceCacheBuildFailure;
     cacheFingerprint?: ConversationSourceFingerprint | null;
     sourceMode?: ConversationRawSource;
@@ -198,6 +200,8 @@ interface ConversationLoadOptions {
     requestClass?: ConcurrencyGateRequestClass;
     source?: ConversationRawSource;
     includeRounds?: boolean;
+    publishedCacheOnly?: boolean;
+    cacheGeneration?: string;
     roundRange?: {
         startRound?: number;
         endRound?: number;
@@ -280,7 +284,7 @@ export async function loadConversationData(
     chain = normalizeDataChain(chain);
     const source = options.source || "auto";
     if (chain === "auto") {
-        if (conversationId && source === "cache") {
+        if (conversationId && (source === "cache" || options.publishedCacheOnly)) {
             const cached = (await Promise.all(
                 (["codex", "antigravity", "claude-code", "windsurf", "dsh"] as ResolvedConversationChain[])
                     .map(candidate => loadFromResolvedChain(candidate, conversationId, options).catch(() => null)),
@@ -351,7 +355,7 @@ export async function loadConversationData(
         return null;
     }
 
-    const resolved = source === "cache" || source === "local"
+    const resolved = source === "cache" || source === "local" || options.publishedCacheOnly
         ? chain as ResolvedConversationChain
         : await resolveConversationChain(chain);
     if (!resolved) return null;
@@ -378,12 +382,12 @@ async function loadFromResolvedChain(
     if (source === "ls" && (resolved === "codex" || resolved === "claude-code" || resolved === "dsh")) {
         throw new Error(`source=ls 不支持 ${resolved}；该宿主的权威原始源是本地 JSONL`);
     }
-    let effectiveId = (source === "cache" || source === "local") && conversationId
+    let effectiveId = (source === "cache" || source === "local" || options.publishedCacheOnly) && conversationId
         ? conversationId
         : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass, options.sourceReadBudget);
     if (!effectiveId) return null;
     if (resolved === "windsurf") {
-        if (source === "cache") effectiveId = resolveCachedDevinIdentity(effectiveId);
+        if (source === "cache" || options.publishedCacheOnly) effectiveId = resolveCachedDevinIdentity(effectiveId);
         else {
             const child = splitDevinSubagentId(effectiveId);
             const requestedDevinId = child?.parentId || effectiveId;
@@ -395,7 +399,10 @@ async function loadFromResolvedChain(
             }
         }
     }
-    if (resolved === "codex" && source !== "cache" && !options.expectedCodexSource) {
+    const key = conversationSourceCacheKey(resolved, effectiveId, options);
+    if (source === "cache" || options.publishedCacheOnly) return loadConversationCacheOnly(key, "cache", options);
+    if (options.cacheGeneration) throw new Error("cacheGeneration 只能与 source=cache 或固定缓存读取一起使用");
+    if (resolved === "codex" && !options.expectedCodexSource) {
         const currentThread = getCodexThread(effectiveId);
         if (currentThread?.rolloutPath) {
             options = { ...options, expectedCodexSource: await captureCodexSourceVersionAsync(currentThread.rolloutPath, options.isCancelled) };
@@ -406,9 +413,6 @@ async function loadFromResolvedChain(
         if (!expectedThread?.rolloutPath) throw new Error("Codex source changed before cache lookup; start a fresh fetch");
         await assertCodexSourceVersion(expectedThread.rolloutPath, options.expectedCodexSource, "before cache lookup", options.isCancelled);
     }
-
-    const key = conversationSourceCacheKey(resolved, effectiveId, options);
-    if (source === "cache") return loadConversationCacheOnly(key, source, options);
 
     const previous = readCachedConversationSourceCache<CachedConversationLoadResult>({ key });
     const buildPrevious = options.forceRawCacheRebuild ? undefined : previous;
@@ -1006,7 +1010,7 @@ function hydrateConversationCache(
     fingerprint: ConversationSourceFingerprint | null,
     key: ConversationSourceCacheKey,
     sourceMode: ConversationRawSource,
-    options: Pick<ConversationLoadOptions, "includeRounds" | "roundRange"> = {},
+    options: Pick<ConversationLoadOptions, "includeRounds" | "roundRange" | "publishedCacheOnly"> = {},
     cachedRoundCount?: number,
     cacheBuildFailure?: ConversationSourceCacheBuildFailure,
     cacheCreatedAt?: string,
@@ -1034,6 +1038,7 @@ function hydrateConversationCache(
         cacheKey: { ...key },
         cacheGeneration: generation,
         cacheCreatedAt,
+        cacheReadPolicy: sourceMode === "cache" ? "published" : "verified",
         cacheState,
         cacheBuildFailure,
         cacheFingerprint: fingerprint,
@@ -1049,11 +1054,44 @@ function hydrateConversationCache(
 function loadConversationCacheOnly(
     key: ConversationSourceCacheKey,
     sourceMode: ConversationRawSource,
-    options: Pick<ConversationLoadOptions, "includeRounds" | "roundRange"> = {},
+    options: Pick<ConversationLoadOptions, "includeRounds" | "roundRange" | "cacheGeneration" | "publishedCacheOnly"> = {},
 ): ConversationLoadResult | null {
-    const cached = readConversationSourceCacheOnly<ConversationLoadResult>({ key });
+    const cached = readConversationSourceCacheOnly<ConversationLoadResult>({ key, generation: options.cacheGeneration });
     if (!cached) return null;
     return hydrateConversationCache(cached.snapshot, cached.generation, cached.cacheState, cached.fingerprint, key, sourceMode, options, cached.roundCount, cached.buildFailure, cached.createdAt);
+}
+
+export function describeConversationCacheReadFailure(
+    chain: DataChain,
+    conversationId: string,
+    options: Pick<ConversationLoadOptions, "link" | "logicalChain" | "cacheGeneration"> = {},
+): string {
+    const normalized = normalizeDataChain(chain);
+    const requestedLink = options.link || "summary";
+    const sources: ResolvedConversationChain[] = normalized === "auto"
+        ? ["codex", "antigravity", "claude-code", "windsurf", "dsh"]
+        : [normalized];
+    const available: string[] = [];
+    let corrupted = false;
+    for (const source of sources) {
+        const requestedKey = conversationSourceCacheKey(source, conversationId, options);
+        corrupted ||= getConversationSourceCacheReadStatus({ key: requestedKey, generation: options.cacheGeneration }) === "corrupt";
+        const links: ConversationLinkMode[] = source === "codex" || source === "claude-code"
+            ? ["summary", "reference", "expand_children"]
+            : [requestedLink];
+        for (const link of links) {
+            const key = conversationSourceCacheKey(source, conversationId, { ...options, link });
+            const cached = readConversationSourceCacheOnly<ConversationLoadResult>({ key });
+            if (cached) available.push(`${source}/link=${link}, generation=${cached.generation}, createdAt=${cached.createdAt}`);
+        }
+    }
+    return [
+        corrupted ? "❌ 请求的已发布缓存损坏，无法读取" : "❌ 请求的已发布缓存不存在或该 generation 已清理",
+        `conversationId=${conversationId} | dataChain=${normalized} | link=${requestedLink}${options.logicalChain ? ` | logicalChain=${options.logicalChain}` : ""}${options.cacheGeneration ? ` | generation=${options.cacheGeneration}` : ""}`,
+        available.length ? `可用缓存视图：\n${available.join("\n")}` : "当前没有可用的已发布缓存视图",
+        `恢复调用：conversation_read_original(action="fetch", conversationId=${JSON.stringify(conversationId)}, dataChain=${JSON.stringify(normalized)}, link=${JSON.stringify(requestedLink)}${options.logicalChain ? `, logicalChain=${JSON.stringify(options.logicalChain)}` : ""}, source="auto", background=true)`,
+        "fetch 完成后使用返回的实际 link 和 generation 进行 search/read；缓存读取不会自动切换到其他视图。",
+    ].join("\n");
 }
 
 function localPbToConversationResult(

@@ -4,7 +4,8 @@ import type { Chain } from "./chain.js";
 import type { CodexHistorySource } from "./codex-history-source.js";
 
 export interface CodexFetchWorkerPayload {
-    version: 1;
+    version: 1 | 2;
+    verificationDeferred?: boolean;
     conversationId: string;
     link: "reference" | "summary" | "expand_children";
     source: "auto" | "local" | "cache";
@@ -78,6 +79,12 @@ export interface CodexFetchWorkerResult {
     linkDiagnostics: CodexFetchWorkerLinkDiagnostic[];
     cacheKey?: ConversationSourceCacheKey;
     cacheGeneration?: string;
+    cacheCreatedAt?: string;
+    cacheReadPolicy?: "published" | "verified";
+    sourceCoverageBytes?: number;
+    sourceFileCount?: number;
+    sourceEndByte?: number;
+    sourceEndOrdinalExclusive?: number;
     cacheState?: "hit" | "built" | "stale";
     cacheBuildFailure?: ConversationSourceCacheBuildFailure;
     cacheFingerprint?: ConversationSourceFingerprint | null;
@@ -105,7 +112,7 @@ export type CodexFetchWorkerCommand =
 export function isCodexFetchWorkerPayload(value: unknown): value is CodexFetchWorkerPayload {
     if (!value || typeof value !== "object") return false;
     const payload = value as Partial<CodexFetchWorkerPayload>;
-    return payload.version === 1
+    return (payload.version === 1 || (payload.version === 2 && payload.verificationDeferred === true))
         && typeof payload.conversationId === "string"
         && (payload.link === "reference" || payload.link === "summary" || payload.link === "expand_children")
         && (payload.source === "auto" || payload.source === "local" || payload.source === "cache")

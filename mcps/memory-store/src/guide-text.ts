@@ -16,6 +16,14 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - 全局概览: memory_query(scope="global") 查看所有工作区
 - 写入记忆: memory_write(title, content, searchSummary, tags, workspace)
 
+## 长对话查询与缓存（v1.25.6）
+
+Codex 的 search/read 省略 source 时只读已发布缓存。响应显示 generation、缓存时间/年龄、实际视图与本次原文校验状态；显式 source="auto" 或 "local"、fetch 继续检查原始来源，source="cache" 保持离线读取。缺少所需 link 视图或缓存损坏时，按响应里的同设置 fetch 调用恢复，完成后沿用返回的实际 link。
+
+search 支持 messageRoles 和 startRound/endRound，先筛选再匹配、限量。maxHits 是 search 的 limit 别名，冲突会报错；默认短摘录，显式 contextRounds 可增加上下文。匹配使用完整内容，后续 read/续读可传 cacheGeneration 固定同一缓存代；已清理的代次会明确报错。
+
+长 fetch 的文件头/边界检查仅用于进入后台任务，完整前缀 SHA 在 worker 内捕获并在发布前校验。在途同源同视图刷新共用原 taskId，完成后的新刷新重新校验；background_task_status 的一次等待取消与 background_task_cancel(taskId) 的任务级取消分别处理。严格刷新失败仍保留上一份完整缓存，需读旧代时显式使用 source="cache"。
+
 ## 11 个工具
 
 ### memory_write — 写入新记忆

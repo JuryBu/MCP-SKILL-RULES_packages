@@ -3836,15 +3836,18 @@ export async function assertCodexSourceVersion(
     isCancelled?: () => boolean,
 ): Promise<void> {
     if (!expected) return;
-    if (expected.historySource) await assertCodexHistorySourceAsync(expected.historySource, isCancelled);
-    const stat = await fs.promises.stat(rolloutPath);
-    if (canonicalCodexSourcePath(rolloutPath) !== canonicalCodexSourcePath(expected.sourcePath) || !stat.isFile() || stat.size < expected.sourceSize) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
-    if (stat.size === expected.sourceSize) {
-        if (Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs)) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
-    } else {
-        const anchor = await codexCheckpointAnchor(rolloutPath, expected.sourceSize);
-        if (anchor.anchorStartByte !== expected.anchorStartByte || anchor.anchorSha256 !== expected.anchorSha256) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
-    }
+    const { runSharedCodexSourceWork } = await import("./codex-source-work.js");
+    await runSharedCodexSourceWork(`assert:${stage}:${canonicalCodexSourcePath(rolloutPath)}:${JSON.stringify(expected)}`, async sharedIsCancelled => {
+        if (expected.historySource) await assertCodexHistorySourceAsync(expected.historySource, sharedIsCancelled);
+        const stat = await fs.promises.stat(rolloutPath);
+        if (canonicalCodexSourcePath(rolloutPath) !== canonicalCodexSourcePath(expected.sourcePath) || !stat.isFile() || stat.size < expected.sourceSize) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+        if (stat.size === expected.sourceSize) {
+            if (Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs)) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+        } else {
+            const anchor = await codexCheckpointAnchor(rolloutPath, expected.sourceSize);
+            if (anchor.anchorStartByte !== expected.anchorStartByte || anchor.anchorSha256 !== expected.anchorSha256) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+        }
+    }, isCancelled);
 }
 
 function codexSourceVersionFromHistory(historySource: CodexHistorySource): CodexSourceVersionExpectation {
@@ -3854,9 +3857,24 @@ function codexSourceVersionFromHistory(historySource: CodexHistorySource): Codex
 
 export async function captureCodexSourceVersionAsync(filePath: string, isCancelled?: () => boolean): Promise<CodexSourceVersionExpectation> {
     const sourcePath = normalizeCodexHistoryPath(filePath);
+    const { runSharedCodexSourceWork } = await import("./codex-source-work.js");
+    return runSharedCodexSourceWork(`capture:${canonicalCodexSourcePath(sourcePath)}`, async sharedIsCancelled => {
+        const stat = await fs.promises.stat(sourcePath);
+        if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
+        const historySource = parseCodexRolloutFilename(sourcePath) ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled: sharedIsCancelled }) : undefined;
+        const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
+        const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
+        return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
+    }, isCancelled);
+}
+
+export async function inspectCodexSourceVersionAsync(filePath: string, isCancelled?: () => boolean): Promise<CodexSourceVersionExpectation> {
+    const sourcePath = normalizeCodexHistoryPath(filePath);
     const stat = await fs.promises.stat(sourcePath);
     if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
-    const historySource = parseCodexRolloutFilename(sourcePath) ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled }) : undefined;
+    const historySource = parseCodexRolloutFilename(sourcePath)
+        ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled, metadataOnly: true })
+        : undefined;
     const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
     const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
     return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
