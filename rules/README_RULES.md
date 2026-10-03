@@ -6,7 +6,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `codex/components/catgirl.template.md` → optional natural catgirl voice.
 - `codex/components/development.template.md` and `training.template.md` → optional dual-machine role overlays.
 - `codex/profiles/*.profile.json` → four installable compositions: `neutral`, `catgirl`, `development`, and `training`.
-- `codex/guidance/*.template.md` → six shared, trigger-read topics in every profile, plus the selected development/training role manual.
+- `codex/guidance/*.template.md` → five shared, trigger-read topics in every profile, plus the selected development/training role manual; the old Sandbox path is a migration pointer.
 - `codex/local-overrides.example.md` → placeholder schema; copy it outside the repository before adding private values.
 - `codex/system-prompt.template.md` → common Codex baseline paired with the profile AGENTS.
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
@@ -20,7 +20,9 @@ The templates preserve natural Chinese communication, anti-report-writing guidan
 
 Sections titled `【可选配置 RULES 段】` apply only when the receiver explicitly installs and enables the corresponding integration. They may describe a neutral ecosystem role, but they never select the receiver's default owner-contact channel; that preference belongs in a private local overlay.
 
-Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. This profile generation requires common baseline `2026-09-27.2`: obtain receiver consent and use `-InstallSystemPrompt` on first installation or baseline upgrades. `-InstallRecommendedDesktopFeatures` remains independent and optional. A real local override remains receiver-private and is ignored by package creation.
+Build a Codex profile with `install/Build-CodexRulesProfile.ps1`, or install it with `install/Install-CodexRulesProfile.ps1`. Existing target files are backed up before replacement. This profile generation requires common baseline `2026-10-04.1`: obtain receiver consent and use `-InstallSystemPrompt` on first installation or baseline upgrades. `-InstallRecommendedDesktopFeatures` remains independent and optional. A real local override remains receiver-private and is ignored by package creation.
+
+Public core and shared topics use neutral audience wording. The builder converts public components and topics to the selected catgirl audience for catgirl/development/training; private overrides remain verbatim, and the common system prompt stays neutral. Expression calibration and public examples are composed directly into AGENTS; receiver-private historical examples are merged only into its private AGENTS.
 
 All four profiles retain their personal, tool and role-specific rules in AGENTS, and reference the shared system prompt for general communication, local-time presentation, verification and configuration-loading principles. The installer refuses to replace AGENTS without `-InstallSystemPrompt` unless the canonical top-level pointer and the full bundled prompt already exist, allowing line-ending and outer-whitespace differences. It installs the prompt/configuration before the reduced AGENTS. Custom prompt paths or merged prompts require a deliberate manual paired migration rather than silently replacing the receiver's prompt. The explicit `-InstallSystemPrompt` option replaces the prompt and its pointer after backup; do not use it merely because a selective sync was authorized. Content equality is an installation consistency check, not proof of automatic runtime injection.
 
@@ -34,7 +36,7 @@ After import, the receiver should set personal style, host-specific paths, insta
 
 ## Codex core and trigger-read topics
 
-AGENTS keeps the essential preferences, privacy/authority boundaries and explicit reading triggers. Longer procedures have one authoritative topic rather than repeated version/incident patches:
+Expression calibration, worked examples and the full Sandbox runtime contract are organized inside AGENTS. They apply directly from the loaded core without a per-reply or first-execution file read. Receiver-specific historical examples belong in its private AGENTS and remain outside the public source. Less frequent long procedures retain explicit event-driven reading triggers:
 
 | Topic | Read before |
 |---|---|
@@ -42,9 +44,9 @@ AGENTS keeps the essential preferences, privacy/authority boundaries and explici
 | `maintenance-upgrades.md` | Upgrading, switching or publishing tools; its Git identity section applies to every local commit |
 | `design-writing.md` | Creating design, slides, scripts or documents for actual readers |
 | `communication-bridges.md` | Using an installed NapCat, WeChat or Tencent Docs bridge |
-| `sandbox-runtime.md` / `web-visual.md` | Resource/time/output handling or web/file visual work respectively |
+| `web-visual.md` | Browser interaction, login walls and native file visual work |
 
-Every profile installs these six topics; role profiles additionally install their own machine manual. A file existing on disk does not prove automatic injection: check the effective project trust/configuration and the actual task's instruction source, and distinguish explicit manual reading from automatic loading. Running tasks, new tasks and resumed tasks are separate evidence cases.
+Every profile installs these five topics; role profiles additionally install their own machine manual. A file existing on disk does not prove automatic injection: check the effective project trust/configuration and the actual task's instruction source, and distinguish explicit manual reading from automatic loading. Running tasks, new tasks and resumed tasks are separate evidence cases.
 
 The workflow separates Astra scheduling and route/progress reviews, adds hypothesis-driven artifact checks and realistic long-path acceptance, and keeps auxiliary-task scheduling autonomous within existing authority. It prohibits grandchild agents and `sandbox_codex` without disabling ordinary Sandbox execution. Model names and efforts are receiver-editable preferences, not availability or billing promises.
 

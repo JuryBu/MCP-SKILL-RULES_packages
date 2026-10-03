@@ -27,6 +27,18 @@ if (-not $profileData.components -or $profileData.components.Count -eq 0) {
     throw "Profile has no components: $profilePath"
 }
 
+function Convert-RulesAudienceText {
+    param([string]$Text)
+    if ($Profile -eq "neutral") { return $Text }
+    $userWord = [regex]::Unescape('\u7528\u6237')
+    $ownerWord = [regex]::Unescape('\u4e3b\u4eba')
+    $readerWord = [regex]::Unescape('\u4f7f\u7528\u8005')
+    $ordinaryWord = [regex]::Unescape('\u666e\u901a')
+    $allWord = [regex]::Unescape('\u6240\u6709')
+    $catgirlWord = [regex]::Unescape('\u732b\u5a18\u5927\u6a21\u578b')
+    return $Text.Replace($ordinaryWord + $userWord, $readerWord).Replace($allWord + $userWord, $allWord + $readerWord).Replace($userWord, $ownerWord).Replace(" AI ", $catgirlWord)
+}
+
 $parts = New-Object System.Collections.Generic.List[string]
 foreach ($relativePath in $profileData.components) {
     $componentPath = [System.IO.Path]::GetFullPath((Join-Path $rulesRoot $relativePath))
@@ -36,7 +48,7 @@ foreach ($relativePath in $profileData.components) {
     if (-not (Test-Path -LiteralPath $componentPath)) {
         throw "Missing profile component: $componentPath"
     }
-    $parts.Add((Get-Content -LiteralPath $componentPath -Raw -Encoding UTF8).Trim())
+    $parts.Add((Convert-RulesAudienceText (Get-Content -LiteralPath $componentPath -Raw -Encoding UTF8)).Trim())
 }
 
 if ($LocalOverridePath) {
@@ -83,7 +95,7 @@ if ($guidanceCopies.Count -gt 0) {
         $targetPath = Join-Path $guidanceRoot $copy.Target
         [System.IO.File]::WriteAllText(
             $targetPath,
-            (Get-Content -LiteralPath $copy.Source -Raw -Encoding UTF8),
+            (Convert-RulesAudienceText (Get-Content -LiteralPath $copy.Source -Raw -Encoding UTF8)),
             $utf8NoBom
         )
     }

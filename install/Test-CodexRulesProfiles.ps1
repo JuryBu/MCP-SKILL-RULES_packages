@@ -6,14 +6,13 @@ $installScript = Join-Path $toolkitRoot "install\Install-CodexRulesProfile.ps1"
 $profileIds = @("neutral", "catgirl", "development", "training")
 $commonGuidance = @(
     "engineering-workflow.md", "maintenance-upgrades.md", "design-writing.md",
-    "communication-bridges.md", "sandbox-runtime.md", "web-visual.md"
+    "communication-bridges.md", "web-visual.md"
 )
 $guidanceBoundaries = @{
     "engineering-workflow.md" = "Astra xhigh"
     "maintenance-upgrades.md" = "Git"
     "design-writing.md" = "PPT"
     "communication-bridges.md" = "ACK"
-    "sandbox-runtime.md" = "admission_timeout"
     "web-visual.md" = "web_fetch_screenshot"
 }
 $tempParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath()).TrimEnd('\', '/')
@@ -66,10 +65,44 @@ function Assert-Guidance {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }
     $promptText = Get-Content -LiteralPath (Join-Path $Root "prompts\system-prompt.md") -Raw -Encoding UTF8
-    foreach ($marker in @('2026-09-27.2', 'model_instructions_file', 'system-prompt.md')) {
+    foreach ($marker in @('2026-10-04.1', 'model_instructions_file', 'system-prompt.md')) {
         Assert-Contains $agentsText $marker "$Profile paired baseline entry"
     }
-    Assert-Contains $promptText '2026-09-27.2' "$Profile common baseline"
+    Assert-Contains $promptText '2026-10-04.1' "$Profile common baseline"
+    foreach ($expressionMarker in @(
+        ([regex]::Unescape('K \u57285\uff5e15\u4e4b\u95f4\uff0c\u9ed8\u8ba410')),
+        ([regex]::Unescape('\u7ef4\u62a4\u6709\u4e24\u4e2a\u660e\u786e\u65f6\u70b9')),
+        ([regex]::Unescape('\u51c6\u5907\u5b8c\u6574\u5de5\u7a0b\u89e3\u91ca\u6216\u6c47\u62a5\u65f6')),
+        ([regex]::Unescape('\u96c6\u4e2d\u56de\u6eaf\u5e76\u8865\u9f50\u6700\u8fd1K\u6b21')),
+        ([regex]::Unescape('\u65e5\u5e38\u804a\u5929\u548c\u8fde\u7eed\u8ba8\u8bba\u4e0d\u9010\u8f6e\u89e6\u53d1\u8fd1\u51b5\u6587\u4ef6\u7ef4\u62a4')),
+        ([regex]::Unescape('\u5230\u5b9e\u9645\u5f00\u5de5\u65f6\u7ed3\u675f')),
+        ([regex]::Unescape('\u672c\u6b21\u56de\u590d\u8349\u7a3f')),
+        ([regex]::Unescape('\u6807\u660e\u5c1a\u672a\u53d1\u9001')),
+        ([regex]::Unescape('\u6bcf\u6bb5\u627f\u62c5\u7684\u4fe1\u606f')),
+        ([regex]::Unescape('\u6392\u5e8f\u7406\u7531')),
+        ([regex]::Unescape('\u8868\u8fbe\u5ba1\u7a3f\u5931\u8bef')),
+        ([regex]::Unescape('\u7981\u6b62\u4efb\u4f55\u9632\u5fa1\u6027\u8868\u8ff0')),
+        ([regex]::Unescape('\u80af\u5b9a\u53e5\u5305\u88c5')),
+        ([regex]::Unescape('\u6bb5\u9996\u3001\u6bb5\u4e2d')),
+        ([regex]::Unescape('\u4e25\u8c28\u3001\u8c28\u614e\u3001\u62c5\u5fc3\u8bef\u89e3\u5747\u4e0d\u5f97')),
+        ([regex]::Unescape('\u7528\u6237\u7279\u522b\u751f\u6c14'))
+    )) {
+        Assert-Contains $promptText $expressionMarker "$Profile expression contract"
+    }
+    foreach ($triggerMarker in @(
+        ([regex]::Unescape('\u4e13\u9898\u9605\u8bfb\u5165\u53e3')),
+        ([regex]::Unescape('\u56de\u590d\u524d\u6821\u51c6')),
+        ([regex]::Unescape('\u76f4\u63a5\u5e94\u7528\u672c\u6587\u4ef6')),
+        ([regex]::Unescape('Sandbox\u7684\u4f18\u5148\u6267\u884c\u3001\u8d44\u6e90\u63a5\u7eb3')),
+        ([regex]::Unescape('\u672c\u8f6e\u4e3b\u52a8\u67e5\u8be2\u76f8\u5173\u8bb0\u5fc6')),
+        ([regex]::Unescape('\u5728\u672c\u8f6e\u4ea4\u56de'))
+    )) {
+        Assert-Contains $agentsText $triggerMarker "$Profile reading and conversation-memory contract"
+    }
+    foreach ($runtimeMarker in @("admission_timeout", "execution_timeout", "caller_deadline_exceeded", "broker_backend_timeout", "commandStarted=false", "mayHaveStarted", "memoryRequestMB", "maxMemoryMB", "retryAfterMs", "sandbox://guide", "background_task_status", "background_task_cancel", "waitSeconds=45")) {
+        Assert-Contains $agentsText $runtimeMarker "$Profile embedded Sandbox contract"
+    }
+    if ($agentsText.Contains("conversation-tone.md") -or $agentsText.Contains("sandbox-runtime.md")) { throw "$Profile retains mandatory high-frequency guidance file references" }
     $annotationBoundary = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5om55rOo"))
     Assert-Contains $promptText $annotationBoundary "$Profile annotation handling in common prompt"
     foreach ($reference in [regex]::Matches($agentsText, 'guidance[\\/]+(?<name>[a-z][a-z-]+\.md)')) {
@@ -105,10 +138,31 @@ function Assert-Guidance {
     if ($agentsText -notmatch '(?is)Git.{0,500}maintenance-upgrades\.md|maintenance-upgrades\.md.{0,500}Git') {
         throw "$Profile core does not route the general Git source rule to maintenance-upgrades.md"
     }
+    $ownerWord = [regex]::Unescape('\u4e3b\u4eba')
+    $catgirlWord = [regex]::Unescape('\u732b\u5a18')
+    $facesWord = [regex]::Unescape('\u989c\u6587\u5b57')
     if ($Profile -eq "neutral") {
-        if ($agentsText.Contains("kaomoji")) { throw "Neutral profile contains catgirl instructions" }
-    } elseif (-not $agentsText.Contains("kaomoji")) {
-        throw "$Profile is missing catgirl instructions"
+        if ($agentsText.Contains($catgirlWord) -or $agentsText.Contains($ownerWord)) { throw "Neutral profile contains catgirl instructions or audience" }
+    } elseif (-not $agentsText.Contains($catgirlWord) -or -not $agentsText.Contains($facesWord) -or -not $agentsText.Contains($ownerWord)) {
+        throw "$Profile is missing catgirl persona, audience or expression density"
+    }
+    $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
+    $toneText = $agentsText
+    Assert-Contains $toneText ($audienceWord + ([regex]::Unescape('\u8865\u5145\u4fe1\u606f\u540e\uff0c\u76f8\u5e94\u6539\u53d8\u8ba8\u8bba\u65b9\u5411'))) "$Profile embedded calibration audience"
+    Assert-Contains $agentsText ([regex]::Unescape('\u957f\u671f\u5de5\u7a0b\u5f00\u5de5\u3001\u63a5\u624b\u6216\u6062\u590d')) "$Profile sustained engineering entry"
+    if ($Profile -ne "neutral") {
+        foreach ($densityMarker in @(
+            '\u989c\u6587\u5b57\u6bcf\u6b21\u56de\u590d\u90fd\u5e94\u6709',
+            '\u666e\u901a\u81ea\u7136\u6bb52\uff5e3\u4e2a\u4f5c\u4e3a\u6d53\u5ea6\u53c2\u7167',
+            '\u77ed\u53e5\u611f\u53f9\u548c\u53e3\u8bed\u8fde\u63a5\u8bcd',
+            '\u6280\u672f\u8ba8\u8bba\u50cf\u8ddf\u540c\u4e8b\u804a'
+        )) { Assert-Contains $agentsText ([regex]::Unescape($densityMarker)) "$Profile catgirl expression contract" }
+    }
+    if ($promptText.Contains($ownerWord) -or $promptText.Contains($catgirlWord)) { throw "$Profile prompt contains profile-specific persona" }
+    foreach ($publicGuide in @(Get-ChildItem -LiteralPath (Join-Path $Root "guidance") -File -Filter "*.md" | Where-Object { $_.Name -ne "private-note.md" })) {
+        $guideContent = Get-Content -LiteralPath $publicGuide.FullName -Raw -Encoding UTF8
+        if ($Profile -eq "neutral" -and $guideContent.Contains($ownerWord)) { throw "Neutral guidance has catgirl audience: $($publicGuide.Name)" }
+        if ($Profile -ne "neutral" -and $guideContent.Contains([regex]::Unescape('\u666e\u901a\u4e3b\u4eba'))) { throw "$Profile guidance has malformed generic audience: $($publicGuide.Name)" }
     }
     foreach ($role in @("development", "training")) {
         $rolePath = Join-Path $Root "guidance\$role-machine.md"
@@ -173,7 +227,7 @@ try {
     }
 
     $overridePath = Join-Path $fakeCodexHome "private-override.md"
-    Set-Content -LiteralPath $overridePath -Value "private override test marker`nOptional reference: guidance/writing-examples/index.md" -Encoding UTF8
+    Set-Content -LiteralPath $overridePath -Value ("private override test marker`n" + [regex]::Unescape('private original \u7528\u6237 text') + "`nOptional reference: guidance/writing-examples/index.md") -Encoding UTF8
     $existingAgents = "prior AGENTS marker`n"
     $existingGuidance = "prior guidance marker`n"
     $existingPrompt = "prior prompt marker`n"
@@ -209,7 +263,7 @@ try {
         @{ Name = 'old-version'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $existingPrompt },
         @{ Name = 'custom-pointer'; Config = ('model_instructions_file = "D:/private/custom-prompt.md"' + "`n" + $existingConfig); Prompt = $bundledPrompt },
         @{ Name = 'missing-prompt'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $null },
-        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-09-27.2') }) -join "`n") }
+        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-10-04.1') }) -join "`n") }
     )) {
         Set-Content -LiteralPath $configPath -Value $case.Config -NoNewline -Encoding UTF8
         if ($null -eq $case.Prompt) { Remove-Item -LiteralPath $promptPath -Force }
@@ -249,6 +303,7 @@ try {
     & $installScript -Profile "development" -LocalOverridePath $overridePath -CodexHome $fakeCodexHome -InstallSystemPrompt -InstallRecommendedDesktopFeatures | Out-Null
     $installedAgents = Assert-Guidance $fakeCodexHome "development"
     Assert-Contains $installedAgents "private override test marker" "LocalOverridePath"
+    Assert-Contains $installedAgents ([regex]::Unescape('private original \u7528\u6237 text')) "private override original audience"
     Assert-Contains $installedAgents 'guidance/writing-examples/index.md' 'private example entry'
     Assert-Contains (Get-Content -LiteralPath (Join-Path $privateExamplesRoot 'index.md') -Raw -Encoding UTF8) 'receiver-private example marker' 'private example preservation'
     $developmentConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8

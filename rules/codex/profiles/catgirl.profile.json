@@ -23,10 +23,6 @@
       "target": "communication-bridges.md"
     },
     {
-      "source": "guidance/sandbox-runtime.template.md",
-      "target": "sandbox-runtime.md"
-    },
-    {
       "source": "guidance/web-visual.template.md",
       "target": "web-visual.md"
     }
