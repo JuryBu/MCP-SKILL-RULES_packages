@@ -65,10 +65,10 @@ function Assert-Guidance {
         Assert-Contains $agentsText $marker "$Profile core boundary"
     }
     $promptText = Get-Content -LiteralPath (Join-Path $Root "prompts\system-prompt.md") -Raw -Encoding UTF8
-    foreach ($marker in @('2026-10-04.1', 'model_instructions_file', 'system-prompt.md')) {
+    foreach ($marker in @('2026-10-04.2', 'model_instructions_file', 'system-prompt.md')) {
         Assert-Contains $agentsText $marker "$Profile paired baseline entry"
     }
-    Assert-Contains $promptText '2026-10-04.1' "$Profile common baseline"
+    Assert-Contains $promptText '2026-10-04.2' "$Profile common baseline"
     foreach ($expressionMarker in @(
         ([regex]::Unescape('K \u57285\uff5e15\u4e4b\u95f4\uff0c\u9ed8\u8ba410')),
         ([regex]::Unescape('\u7ef4\u62a4\u6709\u4e24\u4e2a\u660e\u786e\u65f6\u70b9')),
@@ -88,6 +88,20 @@ function Assert-Guidance {
         ([regex]::Unescape('\u7528\u6237\u7279\u522b\u751f\u6c14'))
     )) {
         Assert-Contains $promptText $expressionMarker "$Profile expression contract"
+    }
+    foreach ($visualMarker in @(
+        ([regex]::Unescape('\u7528\u5408\u9002\u7684\u5f62\u5f0f\u5e2e\u52a9\u7406\u89e3')),
+        ([regex]::Unescape('\u4e3b\u52a8\u4f7f\u7528\u6709\u52a9\u4e8e\u7406\u89e3\u7684\u8868\u8fbe\u5f62\u5f0f')),
+        ([regex]::Unescape('\u7b80\u5355\u95ee\u9898\u4fdd\u6301\u8f7b\u91cf')),
+        ([regex]::Unescape('\u6bcf\u5f20\u56fe\u96c6\u4e2d\u56de\u7b54\u4e00\u4e2a\u5b8c\u6574\u95ee\u9898')),
+        ([regex]::Unescape('\u7ec6\u8282\u8fc7\u5bc6\u65f6\u7ee7\u7eed\u62c6\u56fe')),
+        ([regex]::Unescape('\u5bf9\u5e94\u7684\u6570\u636e\u548c\u89e3\u91ca\u653e\u5728\u76f8\u5173\u56fe\u65c1')),
+        ([regex]::Unescape('\u540e\u7eed\u8ba8\u8bba\u6cbf\u7528\u5df2\u7ecf\u5efa\u7acb\u7684\u540d\u79f0\u4e0e\u5173\u7cfb')),
+        ([regex]::Unescape('\u53ef\u4f7f\u7528\u751f\u6210\u56fe\u6a21\u578b')),
+        ([regex]::Unescape('\u80fd\u51c6\u786e\u6838\u5bf9\u8fd9\u4e9b\u5185\u5bb9\u7684\u56fe\u8868\u6216\u7ed8\u56fe\u5de5\u5177')),
+        ([regex]::Unescape('\u56fe\u793a\u662f\u5426\u6df7\u5408\u591a\u4e2a\u95ee\u9898'))
+    )) {
+        Assert-Contains $promptText $visualMarker "$Profile visual explanation contract"
     }
     foreach ($triggerMarker in @(
         ([regex]::Unescape('\u4e13\u9898\u9605\u8bfb\u5165\u53e3')),
@@ -263,7 +277,7 @@ try {
         @{ Name = 'old-version'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $existingPrompt },
         @{ Name = 'custom-pointer'; Config = ('model_instructions_file = "D:/private/custom-prompt.md"' + "`n" + $existingConfig); Prompt = $bundledPrompt },
         @{ Name = 'missing-prompt'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = $null },
-        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-10-04.1') }) -join "`n") }
+        @{ Name = 'marker-only'; Config = ('model_instructions_file = "~/.codex/prompts/system-prompt.md"' + "`n" + $existingConfig); Prompt = (($bundledPrompt -split "`r?`n" | Where-Object { $_.Contains('2026-10-04.2') }) -join "`n") }
     )) {
         Set-Content -LiteralPath $configPath -Value $case.Config -NoNewline -Encoding UTF8
         if ($null -eq $case.Prompt) { Remove-Item -LiteralPath $promptPath -Force }
