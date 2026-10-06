@@ -26,6 +26,14 @@ search 支持 messageRoles 和 startRound/endRound，先筛选再匹配、限量
 
 ## 11 个工具
 
+### Record归属核查范围与续页（v1.25.7）
+
+record_manage(action="audit_ownership")默认只核conversationId目标。显式recordIds覆盖目标列表，conversationId此时保留调用来源；auditAll=true明确选择全部范围，与recordIds互斥。没有目标时拒绝，目标不匹配时返回0项和unmatchedIds。
+
+有workspace默认scope="workspace"，否则general；workspace默认排除general，includeGeneral=true可合并。limit默认50、最大200，按唯一Record对话ID限制实际核查，同ID范围内全部副本一起分类。
+
+format="json"和structuredContent包含items、selection、coverage、sourceTimings及共享lookupDiagnostics。coverage.hasMore指示续页，保持范围/目标参数，将nextAuditCursor传为auditCursor；所选索引变化会拒绝继续。complete仅在本页覆盖全部目标时为true，多个页面的完整性按并集核对。来源采用精确身份和异步共享查找，未确认来源保留unknown及原因，正文与索引只读。
+
 ### memory_write — 写入新记忆
 - searchSummary 应由 AI 精心撰写，包含关键词、近义词、技术栈名称
 - 自动检测相似记忆并提醒（不阻止写入）

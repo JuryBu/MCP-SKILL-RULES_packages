@@ -962,6 +962,127 @@ export async function getCodexThreadAsync(conversationId: string): Promise<Codex
     return rolloutMatches.length === 1 ? rolloutMatches[0] : null;
 }
 
+export interface CodexOwnershipMetadata {
+    cwd?: string;
+    parentCwd?: string;
+    issue?: string;
+    hasThread?: boolean;
+}
+
+export async function getCodexOwnershipMetadataAsync(conversationIds: string[]): Promise<{
+    entries: Map<string, CodexOwnershipMetadata>;
+    diagnostics: { sqliteProcesses: number; sqliteQueries: number; sqliteMs: number; rolloutDirectoriesRead: number; rolloutFilesRead: number; failures: string[] };
+}> {
+    const requestedIds = new Set(conversationIds.map(value => value.trim().toLowerCase()).filter(Boolean));
+    const entries = new Map<string, CodexOwnershipMetadata>([...requestedIds].map(identifier => [identifier, {}]));
+    const diagnostics = { sqliteProcesses: 0, sqliteQueries: 0, sqliteMs: 0, rolloutDirectoriesRead: 0, rolloutFilesRead: 0, failures: [] as string[] };
+    if (requestedIds.size === 0) return { entries, diagnostics };
+
+    if (await pathExistsAsync(STATE_DB)) {
+        const startedAt = Date.now();
+        diagnostics.sqliteProcesses = 1;
+        const script = `
+import json, sqlite3, sys
+from pathlib import Path
+identifiers = json.loads(sys.argv[2])
+connection = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
+connection.row_factory = sqlite3.Row
+result = {}
+queries = 0
+try:
+    has_edges = connection.execute("select name from sqlite_master where type='table' and name='thread_spawn_edges'").fetchone() is not None
+    for start in range(0, len(identifiers), 200):
+        batch = identifiers[start:start + 200]
+        placeholders = ",".join("?" for identifier in batch)
+        rows = connection.execute("select id, cwd from threads where id in (" + placeholders + ")", batch).fetchall()
+        queries += 1
+        for row in rows:
+            metadata = result.setdefault(row["id"].lower(), {})
+            metadata["cwd"] = row["cwd"] or ""
+            metadata["hasThread"] = True
+        if has_edges:
+            parents = connection.execute("select edge.child_thread_id as child_id, parent.cwd as cwd from thread_spawn_edges edge join threads parent on parent.id=edge.parent_thread_id where edge.child_thread_id in (" + placeholders + ") order by coalesce(parent.updated_at_ms, 0) desc", batch).fetchall()
+            queries += 1
+            for row in parents:
+                metadata = result.setdefault(row["child_id"].lower(), {})
+                if "parentCwd" not in metadata:
+                    metadata["parentCwd"] = row["cwd"] or ""
+    print(json.dumps({"entries": result, "queries": queries}, ensure_ascii=False))
+finally:
+    connection.close()
+`;
+        try {
+            const result = await execPythonJsonAsync(script, [STATE_DB, JSON.stringify([...requestedIds])]) as {
+                entries?: Record<string, CodexOwnershipMetadata>;
+                queries?: number;
+            } | null;
+            diagnostics.sqliteQueries = result?.queries || 0;
+            for (const [identifier, metadata] of Object.entries(result?.entries || {})) {
+                if (requestedIds.has(identifier)) entries.set(identifier, metadata);
+            }
+        } catch (error) {
+            diagnostics.failures.push(`sqlite: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        diagnostics.sqliteMs = Date.now() - startedAt;
+    }
+
+    const unresolvedIds = new Set([...requestedIds].filter(identifier => {
+        const metadata = entries.get(identifier);
+        return !metadata?.cwd && metadata?.hasThread !== true && isLikelyCodexIdLookup(identifier) && identifier.length === 36;
+    }));
+    if (unresolvedIds.size === 0) return { entries, diagnostics };
+    const rolloutMatches = new Map<string, string[]>();
+    const directories = [CODEX_ARCHIVED_SESSIONS_DIR, CODEX_SESSIONS_DIR];
+    let entriesSinceYield = 0;
+    while (directories.length > 0) {
+        const directory = directories.pop()!;
+        let children: fs.Dirent[];
+        try {
+            children = await fs.promises.readdir(directory, { withFileTypes: true });
+            diagnostics.rolloutDirectoriesRead += 1;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+                diagnostics.failures.push(`rollout directory: ${error instanceof Error ? error.message : String(error)}`);
+            }
+            continue;
+        }
+        for (const child of children) {
+            const childPath = path.join(directory, child.name);
+            if (child.isDirectory()) {
+                directories.push(childPath);
+            } else if (child.isFile()) {
+                const match = child.name.match(CODEX_ROLLOUT_ID_RE);
+                const identifier = match?.[1].toLowerCase();
+                if (identifier && unresolvedIds.has(identifier)) {
+                    const matches = rolloutMatches.get(identifier) || [];
+                    matches.push(childPath);
+                    rolloutMatches.set(identifier, matches);
+                }
+            }
+            entriesSinceYield += 1;
+            if (entriesSinceYield >= CODEX_JSONL_ASYNC_YIELD_INTERVAL) {
+                entriesSinceYield = 0;
+                await eventLoopYield();
+            }
+        }
+    }
+    for (const identifier of unresolvedIds) {
+        const matches = rolloutMatches.get(identifier) || [];
+        if (matches.length !== 1) {
+            entries.set(identifier, { ...entries.get(identifier), issue: matches.length > 1 ? "rollout_id_ambiguous" : "exact_source_unresolved" });
+            continue;
+        }
+        diagnostics.rolloutFilesRead += 1;
+        const metadata = await readSessionMetaFromRolloutAsync(matches[0]);
+        if (typeof metadata?.id === "string" && metadata.id.toLowerCase() === identifier && typeof metadata.cwd === "string" && metadata.cwd) {
+            entries.set(identifier, { ...entries.get(identifier), cwd: metadata.cwd });
+        } else {
+            entries.set(identifier, { ...entries.get(identifier), issue: "rollout_metadata_unresolved" });
+        }
+    }
+    return { entries, diagnostics };
+}
+
 export function resolveCurrentCodexThreadId(cwd: string = process.cwd()): string | null {
     const threads = readThreads(200);
     if (threads.length === 0) return null;

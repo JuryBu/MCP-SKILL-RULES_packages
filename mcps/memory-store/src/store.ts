@@ -731,6 +731,59 @@ export function findWorkspaceHash(workspacePath: string): string | null {
     return null;
 }
 
+export async function createWorkspaceHashResolverAsync() {
+    const hashes = await listWorkspaceHashesAsync();
+    const existingHashes = new Set(hashes);
+    const metadata = new Map<string, WorkspaceMeta>();
+    const failures = new Map<string, unknown>();
+    const canonicalPaths = new Map<string, { hash: string; position: number }>();
+    let firstFailure: { position: number; error: unknown } | undefined;
+    for (let offset = 0; offset < hashes.length; offset += 16) {
+        await Promise.all(hashes.slice(offset, offset + 16).map(async hash => {
+            try {
+                const meta = await readWorkspaceMetaAsync(hash);
+                if (meta) metadata.set(hash, meta);
+            } catch (error) {
+                failures.set(hash, error);
+            }
+        }));
+    }
+    for (const [hashPosition, hash] of hashes.entries()) {
+        try {
+            if (failures.has(hash)) throw failures.get(hash);
+            const meta = metadata.get(hash);
+            if (meta) {
+                const candidates = [meta.originalPath, meta.canonicalPath || "", ...(meta.aliases || [])].filter(Boolean);
+                for (const candidate of candidates) {
+                    const canonical = canonicalWorkspacePath(candidate);
+                    if (!canonicalPaths.has(canonical)) canonicalPaths.set(canonical, { hash, position: hashPosition });
+                }
+            }
+        } catch (error) {
+            failures.set(hash, error);
+            firstFailure ||= { position: hashPosition, error };
+        }
+    }
+    return {
+        metadataReads: hashes.length,
+        resolve(workspacePath: string): string {
+            for (const hash of legacyWorkspaceHashCandidates(workspacePath)) {
+                if (existingHashes.has(hash)) return hash;
+            }
+            const canonical = canonicalWorkspacePath(workspacePath);
+            const match = canonicalPaths.get(canonical);
+            if (firstFailure && (!match || firstFailure.position < match.position)) throw firstFailure.error;
+            return match?.hash || workspaceHash(workspacePath);
+        },
+        isAlias(currentHash: string, expectedHash: string): boolean {
+            if (currentHash === "general" || currentHash === expectedHash) return false;
+            if (failures.has(currentHash)) throw failures.get(currentHash);
+            const meta = metadata.get(currentHash);
+            return !!meta && workspaceHash(meta.canonicalPath || meta.originalPath) === expectedHash;
+        },
+    };
+}
+
 /**
  * 获取所有工作区 hash 列表
  */

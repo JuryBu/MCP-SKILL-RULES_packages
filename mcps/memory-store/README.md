@@ -1,4 +1,14 @@
-# MCP Memory Store v1.25.6
+# MCP Memory Store v1.25.7
+
+## Record归属核查
+
+`record_manage(action="audit_ownership")`只读核查。默认以`conversationId`选择单条Record；显式`recordIds`选择多条，此时`conversationId`保留调用来源身份。检查整个范围须明确传`auditAll=true`，它与`recordIds`互斥；目标未匹配返回零项及未匹配ID，不扩大查询。
+
+有`workspace`时默认`scope="workspace"`，没有时默认`general`；工作区默认排除general，显式`includeGeneral=true`可合并。`limit`默认50、最大200，限制实际检查的唯一对话ID数，同一ID在范围内的全部副本一起参与判定。
+
+`format="json"`返回全部本页分类、范围覆盖、共享来源查找开销与逐ID检测耗时；文本展示异常预览，并同时返回同一`structuredContent`。保留相同范围和目标参数，以`nextAuditCursor`作为下一次`auditCursor`继续。游标绑定所选索引，范围或目标索引变化会拒绝续页；`coverage.hasMore`表示还有下一页，`complete`只在本页覆盖整个目标集时为true，分页并集由调用者逐页核对。
+
+来源使用精确对话身份、SQLite/首行元数据、cwd及parent关系，子对话自己的精确来源优先于父目录。Codex本页共用一次异步数据库查询及一次缺失ID文件名枚举，Claude Code共用异步目录和cwd读取，工作区元信息按请求异步读取并复用。来源未确认时返回unknown及原因，同ID物理来源不唯一时返回conflict并要求人工复核，Record正文与索引保持原样。
 
 Codex 的 `search/read` 省略 `source` 时读取已发布的对话缓存，响应列出 `generation`、生成时间、年龄和本次原文校验状态。首次使用且没有对应缓存时会立即给出 `fetch` 恢复参数；默认查询不会扫描全部原始历史。需要检查当前原文时显式使用 `source="auto"|"local"`，或先执行 `fetch`；`source="cache"` 始终只读缓存。子代理显示方式 `link` 选择不同缓存视图，缺失或损坏会列出可用视图及同设置的恢复调用。
 

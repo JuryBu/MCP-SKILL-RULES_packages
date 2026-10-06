@@ -286,6 +286,10 @@ function parseClaudeCodeDesktopIndexFile(root: string, filePath: string): Claude
     } catch {
         return null;
     }
+    return parseClaudeCodeDesktopIndexData(root, filePath, data);
+}
+
+function parseClaudeCodeDesktopIndexData(root: string, filePath: string, data: any): ClaudeCodeDesktopIndexEntry | null {
     const conversationId = firstString(
         data?.cliSessionId,
         data?.sessionId,
@@ -1052,6 +1056,110 @@ export function getClaudeCodeThread(conversationId: string): ClaudeCodeThreadInf
     const directMatches = listJsonlFiles(root, 5000).filter(filePath => path.basename(filePath, ".jsonl").toLowerCase() === resolved.toLowerCase());
     if (directMatches.length === 1) return readThreadMetadata(directMatches[0], desktopIndex);
     return listRecentClaudeCodeThreads(1000).find(thread => thread.id === resolved) || null;
+}
+
+export async function getClaudeCodeOwnershipMetadataAsync(conversationIds: string[]): Promise<{
+    entries: Map<string, { cwd?: string; issue?: string }>;
+    diagnostics: { directoriesRead: number; transcriptFilesRead: number; desktopFilesRead: number; failures: string[] };
+}> {
+    const requestedIds = new Set(conversationIds.map(value => value.trim().toLowerCase()).filter(Boolean));
+    const entries = new Map<string, { cwd?: string; issue?: string }>([...requestedIds].map(identifier => [identifier, {}]));
+    const diagnostics = { directoriesRead: 0, transcriptFilesRead: 0, desktopFilesRead: 0, failures: [] as string[] };
+    if (requestedIds.size === 0) return { entries, diagnostics };
+    const transcripts = new Map<string, string[]>();
+    const visit = async (roots: string[], onFile: (filePath: string, name: string) => Promise<void>): Promise<void> => {
+        const directories = [...roots];
+        let entriesSinceYield = 0;
+        while (directories.length > 0) {
+            const directory = directories.pop()!;
+            let children: fs.Dirent[];
+            try {
+                children = await fs.promises.readdir(directory, { withFileTypes: true });
+                diagnostics.directoriesRead += 1;
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== "ENOENT") diagnostics.failures.push(`directory: ${error instanceof Error ? error.message : String(error)}`);
+                continue;
+            }
+            for (const child of children) {
+                const childPath = path.join(directory, child.name);
+                if (child.isDirectory()) directories.push(childPath);
+                else if (child.isFile()) await onFile(childPath, child.name);
+                entriesSinceYield += 1;
+                if (entriesSinceYield >= CLAUDE_JSONL_YIELD_EVERY_LINES) {
+                    entriesSinceYield = 0;
+                    await yieldToEventLoop();
+                }
+            }
+        }
+    };
+    await visit([claudeProjectsDir()], async (filePath, name) => {
+        if (!name.toLowerCase().endsWith(".jsonl")) return;
+        const identifier = path.basename(name, ".jsonl").toLowerCase();
+        if (!requestedIds.has(identifier)) return;
+        const matches = transcripts.get(identifier) || [];
+        matches.push(filePath);
+        transcripts.set(identifier, matches);
+    });
+    for (const [identifier, matches] of transcripts) {
+        if (matches.length !== 1) {
+            entries.set(identifier, { issue: "transcript_id_ambiguous" });
+            continue;
+        }
+        diagnostics.transcriptFilesRead += 1;
+        try {
+            let cwd: string | undefined;
+            await readJsonlLinesAsync(matches[0], line => {
+                const event = parseJsonLine(line);
+                if (typeof event?.cwd === "string" && event.cwd) {
+                    cwd = event.cwd;
+                    return false;
+                }
+            }, { maxLineChars: CLAUDE_JSONL_MAX_LINE_CHARS });
+            entries.set(identifier, cwd ? { cwd } : { issue: "transcript_cwd_unresolved" });
+        } catch (error) {
+            entries.set(identifier, { issue: "transcript_read_failed" });
+            diagnostics.failures.push(`transcript: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    }
+
+    const unresolvedIds = new Set([...requestedIds].filter(identifier => transcripts.has(identifier) && !entries.get(identifier)?.cwd && entries.get(identifier)?.issue !== "transcript_id_ambiguous"));
+    if (unresolvedIds.size === 0) return { entries, diagnostics };
+    const configuredRoots = process.env.MEMORY_STORE_CLAUDE_DESKTOP_INDEX_ROOTS;
+    const desktopRoots = configuredRoots ? configuredRoots.split(path.delimiter).map(value => value.trim()).filter(Boolean) : [
+        path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Claude", "claude-code-sessions"),
+        path.join(process.env.APPDATA || path.join(os.homedir(), "AppData", "Roaming"), "Claude", "local-agent-mode-sessions"),
+    ];
+    if (!configuredRoots) {
+        const packagesRoot = path.join(process.env.LOCALAPPDATA || path.join(os.homedir(), "AppData", "Local"), "Packages");
+        const packages = await fs.promises.readdir(packagesRoot, { withFileTypes: true }).catch(() => [] as fs.Dirent[]);
+        for (const packageEntry of packages) {
+            if (!packageEntry.isDirectory() || !packageEntry.name.toLowerCase().startsWith("claude")) continue;
+            const packagedRoot = path.join(packagesRoot, packageEntry.name, "LocalCache", "Roaming", "Claude");
+            desktopRoots.push(path.join(packagedRoot, "claude-code-sessions"), path.join(packagedRoot, "local-agent-mode-sessions"));
+        }
+    }
+    const desktopEntries = new Map<string, ClaudeCodeDesktopIndexEntry>();
+    await visit([...new Set(desktopRoots)], async (filePath, name) => {
+        if (!/^local_.*\.json$/iu.test(name)) return;
+        diagnostics.desktopFilesRead += 1;
+        try {
+            const data = JSON.parse(await fs.promises.readFile(filePath, "utf8"));
+            const root = desktopRoots.find(candidate => path.relative(candidate, filePath).split(path.sep)[0] !== "..") || path.dirname(filePath);
+            const entry = parseClaudeCodeDesktopIndexData(root, filePath, data);
+            const identifier = entry?.conversationId.toLowerCase();
+            if (!entry || !identifier || !unresolvedIds.has(identifier)) return;
+            const existing = desktopEntries.get(identifier);
+            if (!existing || (entry.updatedAtMs || 0) > (existing.updatedAtMs || 0)) desktopEntries.set(identifier, entry);
+        } catch (error) {
+            diagnostics.failures.push(`desktop index: ${error instanceof Error ? error.message : String(error)}`);
+        }
+    });
+    for (const identifier of unresolvedIds) {
+        const desktop = desktopEntries.get(identifier);
+        if (desktop?.cwd) entries.set(identifier, { cwd: desktop.cwd });
+        else if (!entries.get(identifier)?.issue) entries.set(identifier, { issue: "exact_source_unresolved" });
+    }
+    return { entries, diagnostics };
 }
 
 function normalizeLogicalChainPath(input?: string): string {

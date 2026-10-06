@@ -13,7 +13,7 @@ import {
     resolveWorkspaceHashForRecord, readRecordsIndex, readRecordsIndexAsync, findRecordHash, findRecordHashAsync, resolveRecordConversationId,
     readRecordSidecar, readRecordSidecarAsync, writeRecordSidecar, type RecordIndexEntry,
 } from "../record-store.js";
-import { DATA_ROOT, GENERAL_DIR, WORKSPACES_DIR, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
+import { DATA_ROOT, GENERAL_DIR, WORKSPACES_DIR, createWorkspaceHashResolverAsync, ensureWorkspace, ensureWorkspaceAsync, listWorkspaceHashes, listWorkspaceHashesAsync, readWorkspaceMeta, workspaceHash, writeJsonAtomic, writeJsonAtomicAsync, withIndexLock } from "../store.js";
 import {
     generateRecord, countPhasesInRecord, inferCoveredRoundFromRecord, resolveRecordSourceReadStartRound, hasIncompatibleRecordRoundUniverse,
     isControlledRebuildCandidateTooSparse, minimumControlledRebuildPhaseCount, validateRecordCandidateForWrite, type RecordParallelMode,
@@ -80,8 +80,8 @@ import {
 import type { ConversationRawSource } from "../conversation-source-adapters.js";
 import { assertConversationConsumerSourceComplete } from "../devin-source-evidence.js";
 import type { ConversationRound, ConversationUserMessage } from "../trajectory.js";
-import { getCodexParentThread, getCodexThread, listRecentCodexThreads } from "../codex-client.js";
-import { getClaudeCodeThread } from "../claude-code-client.js";
+import { getCodexParentThread, getCodexThread, getCodexOwnershipMetadataAsync, listRecentCodexThreads } from "../codex-client.js";
+import { getClaudeCodeThread, getClaudeCodeOwnershipMetadataAsync } from "../claude-code-client.js";
 import {
     BACKGROUND_TASK_RESUME_VERSION,
     cancelBackgroundTask,
@@ -1514,7 +1514,7 @@ action:
 - guide: 为长 Record 生成带来源的 read/search 阅读建议，不生成事实摘要
 - edit: 手动修改 Record（content 替换 / append 追加）
 - delete: 删除指定 Record（不传 conversationId 则清空工作区全部 Record）
-- audit_ownership: 审计 Record 归属，不按语义猜测，只看 workspaceUri/cwd/派生关系/重复副本
+- audit_ownership: 只读核查指定conversationId；recordIds显式多目标，auditAll=true明确全范围，limit按唯一ID分组，支持auditCursor续页
 - repair_ownership: 归属修复，默认 dry-run，只输出迁移计划
 - migrate_unknown_chain: 扫描 chain="unknown" 的历史索引，默认只读；仅四宿主权威证据唯一且完整时可显式 apply
 - batch_update: 批量更新工作区内多个对话的 Record（按时间/源/工作区筛选候选，后台执行）
@@ -1528,13 +1528,13 @@ action:
             action: z.enum(["update", "list", "read", "search", "guide", "edit", "delete", "batch_update", "bulk_update", "recover", "batch_delete", "task_status", "cancel", "audit_ownership", "repair_ownership", "migrate_unknown_chain", "stale_check"])
                 .describe("操作类型"),
             conversationId: z.string().optional()
-                .describe("对话 ID（update 不传则自动获取当前对话）"),
+                .describe("对话 ID（update 不传则自动获取当前对话）；audit默认目标，显式recordIds/auditAll时仅保留调用来源身份"),
             workspace: z.string().optional()
                 .describe("工作区路径（不传则 general）"),
             scope: z.enum(["workspace", "global", "general"]).optional()
                 .describe("[search/list/audit/migrate_unknown_chain/stale_check] 范围，默认 workspace；workspace 严格只读指定工作区"),
             includeGeneral: z.boolean().optional()
-                .describe("[list/search/stale_check] 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
+                .describe("[list/search/audit_ownership/stale_check] 兼容开关：显式把 general 也并入 workspace 结果，默认 false"),
             query: z.string().optional()
                 .describe("[search] 搜索关键词"),
             mode: z.enum(["auto", "exact", "fuzzy", "smart"]).optional()
@@ -1562,13 +1562,17 @@ action:
             maxChars: z.number().optional()
                 .describe("[read/search/guide] 最大输出字符数，结构化读取会按 block 边界截断"),
             format: z.enum(["text", "json"]).optional()
-                .describe("[read/search/guide] 返回格式，默认 text"),
+                .describe("[read/search/guide/audit_ownership] 返回格式，默认 text；audit JSON包含本页全部结果、覆盖范围及继续游标"),
             withCitations: z.boolean().optional()
                 .describe("[read] 是否输出 block/行号来源，默认 true"),
             indexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
                 .describe("[read/search/guide] reader index 策略，auto=复用新鲜索引或懒重建"),
             recordIds: z.array(z.string()).optional()
-                .describe("[search/guide] 限定多个 Record ID"),
+                .describe("[search/guide/audit_ownership] 限定多个 Record ID；audit中显式列表覆盖conversationId目标，不能与auditAll并用"),
+            auditAll: z.boolean().optional()
+                .describe("[audit_ownership] 显式检查所选scope的全部Record，默认false；conversationId此时只作调用来源，按limit分页"),
+            auditCursor: z.string().max(1024).optional()
+                .describe("[audit_ownership] 上一页返回的nextAuditCursor，须保持范围和目标参数；索引变化时拒绝继续"),
             searchScope: z.enum(["record", "phase", "section", "item"]).optional()
                 .describe("[search] 结果粒度，不复用 scope，避免和 workspace/global/general 冲突"),
             goal: z.string().optional()
@@ -1580,7 +1584,7 @@ action:
             before: z.string().optional()
                 .describe("[batch_update/bulk_update] 只处理此时间之前的对话"),
             limit: z.number().int().min(1).max(200).optional()
-                .describe("[list/search/batch_update/bulk_update/stale_check] 1..200 的正整数；批量更新有效上限为非 force 50、force 200，默认分别为 10、200"),
+                .describe("[list/search/batch_update/bulk_update/audit_ownership/stale_check] 1..200正整数；audit默认50，实际核查唯一ID数，同ID全部副本保留；批量更新非force上限50、force上限200，默认10/200"),
             force: z.boolean().optional()
                 .describe("[update/batch_update/bulk_update] 强制更新已有Record；update 时绕过“已是最新”短路并重新生成"),
             stale_only: z.boolean().optional()
@@ -1616,6 +1620,7 @@ action:
                     || args.action === "task_status"
                     || args.action === "cancel"
                     || args.action === "recover"
+                    || args.action === "audit_ownership"
                     || args.action === "stale_check",
             });
             try {
@@ -1686,8 +1691,25 @@ action:
                             indexMode: args.indexMode,
                             background: args.background,
                         });
-                    case "audit_ownership":
-                        return await handleAuditOwnership(hash, args.scope, chains.dataChain, startMs);
+                    case "audit_ownership": {
+                        try {
+                            return await handleAuditOwnership(hash, args.scope, chains.dataChain, startMs, {
+                                conversationId: args.conversationId,
+                                recordIds: args.recordIds,
+                                auditAll: args.auditAll,
+                                auditCursor: args.auditCursor,
+                                limit: args.limit,
+                                includeGeneral: args.includeGeneral,
+                                format: args.format,
+                            });
+                        } catch (error) {
+                            return { ...rt(formatToolError("record_manage(audit_ownership)", error, {
+                                conversationId: args.conversationId,
+                                workspace: args.workspace,
+                                scope: args.scope,
+                            }), startMs), isError: true };
+                        }
+                    }
                     case "repair_ownership":
                         return await handleRepairOwnership(hash, args.scope, chains.dataChain, args.dryRun ?? true, args.backup ?? true, startMs);
                     case "migrate_unknown_chain":
@@ -4222,14 +4244,14 @@ async function buildRecordSearchBlocksForScopeAsync(hash: string, scope: RecordM
 
 // ============= ownership audit / repair =============
 
-function collectRecordLocations(hash: string, scope: RecordManageScope | undefined) {
-    const hashes = recordHashesForScope(hash, scope, false);
+async function collectRecordLocations(hash: string, scope: RecordManageScope | undefined, includeGeneral = false) {
+    const hashes = await recordHashesForScopeAsync(hash, scope, includeGeneral);
     const locations: Array<{ hash: string; conversationId: string; title: string; totalRounds: number; lastUpdatedRound: number; lastUpdatedAt: string; sizeBytes: number }> = [];
-    for (const h of hashes) {
-        const index = readRecordsIndex(h);
+    for (const recordHash of hashes) {
+        const index = await readRecordsIndexAsync(recordHash);
         for (const entry of Object.values(index.records)) {
             locations.push({
-                hash: h,
+                hash: recordHash,
                 conversationId: entry.conversationId,
                 title: entry.title,
                 totalRounds: entry.totalRounds,
@@ -4237,6 +4259,7 @@ function collectRecordLocations(hash: string, scope: RecordManageScope | undefin
                 lastUpdatedAt: entry.lastUpdatedAt,
                 sizeBytes: entry.sizeBytes,
             });
+            if (locations.length % 128 === 0) await new Promise<void>(resolve => setImmediate(resolve));
         }
     }
     return locations;
@@ -4268,23 +4291,30 @@ async function detectOwnershipSource(
     conversationId: string,
     dataChain: DataChain,
     requestClass?: ConcurrencyGateRequestClass,
+    metadata?: OwnershipSourceMetadata,
 ): Promise<{
     expectedHash?: string;
     expectedWorkspace?: string;
     sourceType: OwnershipSourceType;
     conflict?: string;
+    issue?: string;
 }> {
     const sources: Array<{ hash: string; identityHash: string; workspace: string; sourceType: OwnershipSourceType }> = [];
     const allowAntigravity = dataChain === "auto" || dataChain === "antigravity";
     const allowCodex = dataChain === "auto" || dataChain === "codex";
     const allowClaudeCode = dataChain === "auto" || dataChain === "claude-code";
     const allowWindsurf = dataChain === "windsurf";
+    const identifier = conversationId.trim().toLowerCase();
+    const ambiguity = [allowCodex ? metadata?.codex?.get(identifier)?.issue : undefined, allowClaudeCode ? metadata?.claudeCode?.get(identifier)?.issue : undefined]
+        .filter(issue => issue?.endsWith("_ambiguous")).join(", ");
+    if (ambiguity) return { sourceType: "unknown", conflict: `来源ID存在多个物理副本：${ambiguity}` };
+    const resolveWorkspace = metadata?.workspaceResolver?.resolve || resolveWorkspaceHashForRecord;
 
     if (allowAntigravity) {
         try {
             const steps = await fetchFirstPageSteps(conversationId);
             const workspace = steps ? detectWorkspaceFromSteps(steps) : null;
-            if (workspace) sources.push({ workspace, hash: resolveWorkspaceHashForRecord(workspace), identityHash: workspaceHash(workspace), sourceType: "antigravity_workspace_uri" });
+            if (workspace) sources.push({ workspace, hash: resolveWorkspace(workspace), identityHash: workspaceHash(workspace), sourceType: "antigravity_workspace_uri" });
         } catch {
             // keep unknown; audit must not fail because one chain is unavailable
         }
@@ -4292,13 +4322,14 @@ async function detectOwnershipSource(
 
     if (allowCodex) {
         try {
-            const thread = getCodexThread(conversationId);
+            const codexMetadata = metadata?.codex?.get(conversationId.trim().toLowerCase());
+            const thread = metadata?.codex ? codexMetadata : getCodexThread(conversationId);
             if (thread?.cwd) {
-                sources.push({ workspace: thread.cwd, hash: resolveWorkspaceHashForRecord(thread.cwd), identityHash: workspaceHash(thread.cwd), sourceType: "codex_cwd" });
+                sources.push({ workspace: thread.cwd, hash: resolveWorkspace(thread.cwd), identityHash: workspaceHash(thread.cwd), sourceType: "codex_cwd" });
             } else {
-                const parent = getCodexParentThread(conversationId);
+                const parent = metadata?.codex ? { cwd: codexMetadata?.parentCwd } : getCodexParentThread(conversationId);
                 if (parent?.cwd) {
-                    sources.push({ workspace: parent.cwd, hash: resolveWorkspaceHashForRecord(parent.cwd), identityHash: workspaceHash(parent.cwd), sourceType: "child_parent" });
+                    sources.push({ workspace: parent.cwd, hash: resolveWorkspace(parent.cwd), identityHash: workspaceHash(parent.cwd), sourceType: "child_parent" });
                 }
             }
         } catch {
@@ -4308,9 +4339,9 @@ async function detectOwnershipSource(
 
     if (allowClaudeCode) {
         try {
-            const thread = getClaudeCodeThread(conversationId);
+            const thread = metadata?.claudeCode ? metadata.claudeCode.get(conversationId.trim().toLowerCase()) : getClaudeCodeThread(conversationId);
             if (thread?.cwd) {
-                sources.push({ workspace: thread.cwd, hash: resolveWorkspaceHashForRecord(thread.cwd), identityHash: workspaceHash(thread.cwd), sourceType: "claude_code_cwd" });
+                sources.push({ workspace: thread.cwd, hash: resolveWorkspace(thread.cwd), identityHash: workspaceHash(thread.cwd), sourceType: "claude_code_cwd" });
             }
         } catch {
             // keep unknown; audit must not fail because one chain is unavailable
@@ -4324,14 +4355,17 @@ async function detectOwnershipSource(
             const conversation = canonicalId ? await loadWindsurfConversation(canonicalId, false, { requestClass }) : null;
             const workspace = conversation && !conversation.partial ? conversation.thread.cwd : undefined;
             if (workspace) {
-                sources.push({ workspace, hash: resolveWorkspaceHashForRecord(workspace), identityHash: workspaceHash(workspace), sourceType: "windsurf_cwd" });
+                sources.push({ workspace, hash: resolveWorkspace(workspace), identityHash: workspaceHash(workspace), sourceType: "windsurf_cwd" });
             }
         } catch {
             // keep unknown; audit must not fail because WSF LS is unavailable
         }
     }
 
-    if (sources.length === 0) return { sourceType: "unknown" };
+    if (sources.length === 0) {
+        const issue = [metadata?.codex?.get(conversationId.trim().toLowerCase())?.issue, metadata?.claudeCode?.get(conversationId.trim().toLowerCase())?.issue].filter(Boolean).join(", ");
+        return { sourceType: "unknown", ...(issue ? { issue } : {}) };
+    }
     const first = sources[0];
     const conflict = sources.find(s => s.identityHash !== first.identityHash);
     if (conflict) {
@@ -4349,9 +4383,40 @@ export async function auditRecordOwnership(
     hash: string,
     scope: RecordManageScope | undefined,
     dataChain: DataChain,
-    sourceResolver: typeof detectOwnershipSource = detectOwnershipSource,
+    sourceResolver?: typeof detectOwnershipSource,
 ): Promise<OwnershipAuditItem[]> {
-    const locations = collectRecordLocations(hash, scope);
+    const locations = await collectRecordLocations(hash, scope);
+    return auditRecordLocations(locations, dataChain, sourceResolver);
+}
+
+interface OwnershipSourceMetadata {
+    codex?: Map<string, { cwd?: string; parentCwd?: string; issue?: string }>;
+    claudeCode?: Map<string, { cwd?: string; issue?: string }>;
+    workspaceResolver?: Awaited<ReturnType<typeof createWorkspaceHashResolverAsync>>;
+}
+
+async function createOwnershipAuditSourceResolver(conversationIds: string[], dataChain: DataChain) {
+    const startedAt = Date.now();
+    const [codex, claudeCode, workspaceResolver] = await Promise.all([
+        dataChain === "auto" || dataChain === "codex" ? getCodexOwnershipMetadataAsync(conversationIds) : undefined,
+        dataChain === "auto" || dataChain === "claude-code" ? getClaudeCodeOwnershipMetadataAsync(conversationIds) : undefined,
+        createWorkspaceHashResolverAsync(),
+    ]);
+    const metadata: OwnershipSourceMetadata = { codex: codex?.entries, claudeCode: claudeCode?.entries, workspaceResolver };
+    return {
+        sourceResolver: (conversationId: string, chain: DataChain) => detectOwnershipSource(conversationId, chain, undefined, metadata),
+        aliasResolver: workspaceResolver.isAlias,
+        lookupDiagnostics: { preparationMs: Date.now() - startedAt, workspaceMetadataReads: workspaceResolver.metadataReads, codex: codex?.diagnostics, claudeCode: claudeCode?.diagnostics },
+    };
+}
+
+async function auditRecordLocations(
+    locations: Awaited<ReturnType<typeof collectRecordLocations>>,
+    dataChain: DataChain,
+    sourceResolver?: typeof detectOwnershipSource,
+    sourceTimings?: Array<{ conversationId: string; elapsedMs: number }>,
+    aliasResolver?: typeof isWorkspacePathAliasHash,
+): Promise<OwnershipAuditItem[]> {
     const byConversation = new Map<string, typeof locations>();
     for (const loc of locations) {
         const group = byConversation.get(loc.conversationId) || [];
@@ -4359,11 +4424,22 @@ export async function auditRecordOwnership(
         byConversation.set(loc.conversationId, group);
     }
 
+    const prepared = sourceResolver ? undefined : await createOwnershipAuditSourceResolver([...byConversation.keys()], dataChain);
+    const resolver = sourceResolver || prepared!.sourceResolver;
+    const resolveAlias = aliasResolver || prepared?.aliasResolver || isWorkspacePathAliasHash;
+    const sourceCache = new Map<string, Awaited<ReturnType<typeof detectOwnershipSource>>>();
     const items: OwnershipAuditItem[] = [];
     for (const loc of locations) {
+        if (items.length % 64 === 0) await new Promise<void>(resolve => setImmediate(resolve));
         const siblings = byConversation.get(loc.conversationId) || [loc];
         const best = betterRecordLocation(siblings);
-        const detected = await sourceResolver(loc.conversationId, dataChain);
+        let detected = sourceCache.get(loc.conversationId);
+        if (!detected) {
+            const startedAt = Date.now();
+            detected = await resolver(loc.conversationId, dataChain);
+            sourceCache.set(loc.conversationId, detected);
+            sourceTimings?.push({ conversationId: loc.conversationId, elapsedMs: Date.now() - startedAt });
+        }
 
         if (detected.conflict) {
             items.push({
@@ -4409,7 +4485,7 @@ export async function auditRecordOwnership(
                         : "general 中 Record 可由结构来源确定目标 workspace",
                     suggestedAction: targetSibling && !locIsBest ? "archiveDuplicate" : "move",
                 });
-            } else if (isWorkspacePathAliasHash(loc.hash, detected.expectedHash)) {
+            } else if (resolveAlias(loc.hash, detected.expectedHash)) {
                 const targetSibling = siblings.find(s => s.hash === detected.expectedHash);
                 const locIsBest = best?.hash === loc.hash;
                 items.push({
@@ -4460,7 +4536,7 @@ export async function auditRecordOwnership(
                 currentHash: loc.hash,
                 sourceType: "unknown",
                 status: "unknown",
-                reason: "未找到 workspaceUri、Codex cwd 或 parent/root 派生关系",
+                reason: `未找到 workspaceUri、Codex cwd 或 parent/root 派生关系${detected.issue ? `（${detected.issue}）` : ""}`,
                 suggestedAction: "keep",
             });
         }
@@ -4489,9 +4565,93 @@ function summarizeOwnershipAudit(items: OwnershipAuditItem[], title: string): st
     return lines.join("\n");
 }
 
-async function handleAuditOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, startMs: number) {
-    const items = await auditRecordOwnership(hash, scope || "general", dataChain);
-    return rt(summarizeOwnershipAudit(items, "🔎 Record 归属审计（只读）"), startMs);
+export interface OwnershipAuditOptions {
+    conversationId?: string;
+    recordIds?: string[];
+    auditAll?: boolean;
+    auditCursor?: string;
+    limit?: number;
+    includeGeneral?: boolean;
+    format?: "text" | "json";
+}
+
+export async function auditRecordOwnershipPage(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, options: OwnershipAuditOptions = {}) {
+    const startedAt = Date.now();
+    if (options.auditAll && options.recordIds !== undefined) throw new Error("auditAll与recordIds不能同时指定");
+    const requestedIds = options.auditAll ? undefined : options.recordIds !== undefined ? options.recordIds : options.conversationId ? [options.conversationId] : undefined;
+    if (!options.auditAll && !requestedIds?.length) throw new Error("audit_ownership需要conversationId、非空recordIds或明确auditAll=true");
+    if (requestedIds?.some(identifier => !identifier.trim())) throw new Error("audit目标ID不能为空");
+    const uniqueRequestedIds = requestedIds ? [...new Set(requestedIds.map(identifier => identifier.trim()))].sort() : undefined;
+    const limit = options.limit ?? 50;
+    if (!Number.isInteger(limit) || limit < 1 || limit > 200) throw new Error("audit limit必须是1..200的整数");
+    const effectiveScope = scope || (hash === "general" ? "general" : "workspace");
+    const includeGeneral = effectiveScope === "workspace" && options.includeGeneral === true;
+    const locations = (await collectRecordLocations(hash, effectiveScope, includeGeneral))
+        .filter(location => !uniqueRequestedIds || uniqueRequestedIds.includes(location.conversationId))
+        .sort((left, right) => left.conversationId < right.conversationId ? -1 : left.conversationId > right.conversationId ? 1 : left.hash < right.hash ? -1 : left.hash > right.hash ? 1 : 0);
+    const matchedIds = [...new Set(locations.map(location => location.conversationId))];
+    const fingerprint = crypto.createHash("sha256").update(JSON.stringify({ hash, scope: effectiveScope, includeGeneral, dataChain, requestedIds: uniqueRequestedIds, locations })).digest("hex");
+    let offset = 0;
+    if (options.auditCursor) {
+        let cursor: { version?: number; fingerprint?: string; offset?: number };
+        try {
+            if (options.auditCursor.length > 1024 || !/^[A-Za-z0-9_-]+$/u.test(options.auditCursor)) throw new Error("invalid encoding");
+            cursor = JSON.parse(Buffer.from(options.auditCursor, "base64url").toString("utf8"));
+        } catch {
+            throw new Error("auditCursor无效，请重新开始核查");
+        }
+        if (cursor.version !== 1 || cursor.fingerprint !== fingerprint) throw new Error("auditCursor范围或索引已变化，请重新开始核查");
+        if (!Number.isInteger(cursor.offset) || cursor.offset! < 0 || cursor.offset! > matchedIds.length) throw new Error("auditCursor位置无效");
+        offset = cursor.offset!;
+    }
+    const pageIds = matchedIds.slice(offset, offset + limit);
+    const selectedIds = new Set(pageIds);
+    const pageLocations = locations.filter(location => selectedIds.has(location.conversationId));
+    const { sourceResolver, aliasResolver, lookupDiagnostics } = await createOwnershipAuditSourceResolver(pageIds, dataChain);
+    const sourceTimings: Array<{ conversationId: string; elapsedMs: number }> = [];
+    const items = await auditRecordLocations(pageLocations, dataChain, sourceResolver, sourceTimings, aliasResolver);
+    const endOffset = offset + pageIds.length;
+    const complete = offset === 0 && endOffset === matchedIds.length;
+    return {
+        action: "audit_ownership" as const,
+        readOnly: true,
+        scope: effectiveScope,
+        includeGeneral,
+        dataChain,
+        selection: {
+            mode: options.auditAll ? "all" : options.recordIds !== undefined ? "recordIds" : "conversationId",
+            requestedIds: uniqueRequestedIds,
+            unmatchedIds: uniqueRequestedIds?.filter(identifier => !matchedIds.includes(identifier)) || [],
+        },
+        coverage: {
+            matchedConversations: matchedIds.length,
+            matchedLocations: locations.length,
+            offset,
+            processedConversations: pageIds.length,
+            processedLocations: pageLocations.length,
+            complete,
+            partial: !complete,
+            hasMore: endOffset < matchedIds.length,
+        },
+        nextAuditCursor: endOffset < matchedIds.length ? Buffer.from(JSON.stringify({ version: 1, fingerprint, offset: endOffset })).toString("base64url") : undefined,
+        lookupDiagnostics,
+        sourceTimings,
+        items,
+        elapsedMs: Date.now() - startedAt,
+    };
+}
+
+async function handleAuditOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, startMs: number, options: OwnershipAuditOptions) {
+    const page = await auditRecordOwnershipPage(hash, scope, dataChain, options);
+    page.elapsedMs = Date.now() - startMs;
+    if (options.format === "json") return { content: [{ type: "text" as const, text: JSON.stringify(page) }], structuredContent: page };
+    const lines = [
+        summarizeOwnershipAudit(page.items, "🔎 Record 归属审计（只读）"),
+        `范围=${page.scope}，目标=${page.selection.mode}，本页唯一ID=${page.coverage.processedConversations}/${page.coverage.matchedConversations}，副本位置=${page.coverage.processedLocations}/${page.coverage.matchedLocations}，offset=${page.coverage.offset}，partial=${page.coverage.partial}`,
+    ];
+    if (page.selection.unmatchedIds.length > 0) lines.push(`未匹配目标：${page.selection.unmatchedIds.join(", ")}`);
+    if (page.nextAuditCursor) lines.push(`下一页保持范围/目标参数，传auditCursor=${JSON.stringify(page.nextAuditCursor)}`);
+    return { ...rt(lines.join("\n"), startMs), structuredContent: page };
 }
 
 async function handleRepairOwnership(hash: string, scope: RecordManageScope | undefined, dataChain: DataChain, dryRun: boolean, backup: boolean, startMs: number) {
@@ -4539,7 +4699,7 @@ export async function planOwnershipRepair(
     hash: string,
     scope: RecordManageScope | undefined,
     dataChain: DataChain,
-    sourceResolver: typeof detectOwnershipSource = detectOwnershipSource,
+    sourceResolver?: typeof detectOwnershipSource,
 ) {
     const items = await auditRecordOwnership(hash, scope || "general", dataChain, sourceResolver);
     const moves = items.filter(item => item.status === "migratable" && item.expectedHash && item.expectedWorkspace && item.suggestedAction === "move");

@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.25.6",
+  "version": "1.25.7",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、五数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -101,6 +101,8 @@
     "test:conversation-exporter": "tsx tests/conversation-exporter.test.ts",
     "test:conversation-batch-export": "tsx tests/conversation-batch-export.test.ts",
     "test:record-ownership": "tsx tests/record-ownership.test.ts",
+    "test:record-ownership-metadata": "tsx tests/record-ownership-metadata.test.ts",
+    "test:record-ownership-response": "node tests/record-ownership-response.test.mjs",
     "test:record-reader": "tsx tests/record-reader.test.ts && tsx tests/record-workspace-consistency.test.ts",
     "test:record-reader-tools": "tsx tests/record-reader-tools.test.ts",
     "test:stage-guard-self-reference": "tsx tests/guard-engine-self-reference.test.ts",
