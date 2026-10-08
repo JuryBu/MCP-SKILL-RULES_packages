@@ -6,7 +6,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `codex/components/catgirl.template.md` → optional natural catgirl voice.
 - `codex/components/development.template.md` and `training.template.md` → optional dual-machine role overlays.
 - `codex/profiles/*.profile.json` → four installable compositions: `neutral`, `catgirl`, `development`, and `training`.
-- `codex/guidance/*.template.md` → five shared, trigger-read topics in every profile, plus the selected development/training role manual; the old Sandbox path is a migration pointer.
+- `codex/guidance/*.template.md` → six shared, trigger-read topics in every profile, plus the selected development/training role manual; the model observer topic applies only to an installed and explicitly enabled observer, and the old Sandbox path is a migration pointer.
 - `codex/local-overrides.example.md` → placeholder schema; copy it outside the repository before adding private values.
 - `codex/system-prompt.template.md` → common Codex baseline paired with the profile AGENTS.
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
@@ -45,8 +45,9 @@ Expression calibration, worked examples and the full Sandbox runtime contract ar
 | `design-writing.md` | Creating design, slides, scripts or documents for actual readers |
 | `communication-bridges.md` | Using an installed NapCat, WeChat or Tencent Docs bridge |
 | `web-visual.md` | Browser interaction, login walls and native file visual work |
+| `model-observer.md` | Queries or tests through an installed, explicitly enabled local model observer |
 
-Every profile installs these five topics; role profiles additionally install their own machine manual. A file existing on disk does not prove automatic injection: check the effective project trust/configuration and the actual task's instruction source, and distinguish explicit manual reading from automatic loading. Running tasks, new tasks and resumed tasks are separate evidence cases.
+Every profile installs these six topics; role profiles additionally install their own machine manual. A file existing on disk does not prove automatic injection: check the effective project trust/configuration and the actual task's instruction source, and distinguish explicit manual reading from automatic loading. Running tasks, new tasks and resumed tasks are separate evidence cases.
 
 The workflow separates Astra scheduling and route/progress reviews, adds hypothesis-driven artifact checks and realistic long-path acceptance, and keeps auxiliary-task scheduling autonomous within existing authority. It prohibits grandchild agents and `sandbox_codex` without disabling ordinary Sandbox execution. Model names and efforts are receiver-editable preferences, not availability or billing promises.
 

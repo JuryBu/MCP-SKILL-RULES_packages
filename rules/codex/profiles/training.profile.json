@@ -28,6 +28,10 @@
       "target": "web-visual.md"
     },
     {
+      "source": "guidance/model-observer.template.md",
+      "target": "model-observer.md"
+    },
+    {
       "source": "guidance/training-machine.template.md",
       "target": "training-machine.md"
     }

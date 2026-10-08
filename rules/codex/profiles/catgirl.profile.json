@@ -25,6 +25,10 @@
     {
       "source": "guidance/web-visual.template.md",
       "target": "web-visual.md"
+    },
+    {
+      "source": "guidance/model-observer.template.md",
+      "target": "model-observer.md"
     }
   ]
 }

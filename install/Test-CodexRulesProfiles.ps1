@@ -6,9 +6,10 @@ $installScript = Join-Path $toolkitRoot "install\Install-CodexRulesProfile.ps1"
 $profileIds = @("neutral", "catgirl", "development", "training")
 $commonGuidance = @(
     "engineering-workflow.md", "maintenance-upgrades.md", "design-writing.md",
-    "communication-bridges.md", "web-visual.md"
+    "communication-bridges.md", "web-visual.md", "model-observer.md"
 )
 $guidanceBoundaries = @{
+    "model-observer.md" = "Luna"
     "engineering-workflow.md" = "Astra xhigh"
     "maintenance-upgrades.md" = "Git"
     "design-writing.md" = "PPT"
@@ -52,7 +53,7 @@ function Assert-Guidance {
         '5YWz6ZSu5LiN5Y+v6YCG5Yaz562W5YmN',
         '5bey6IO96K+G5Yir6aOO6Zmp5pe256uL5Y2z6Kem5Y+R77yM5LiN562J5bi46KeE6L2u5qyh55So5ruh',
         '5Lit5pat5oGi5aSN5oiW5pu05o2i5omn6KGM57q/56iL5LiN6YeN572u6K6h5pWw',
-        '5Lik6aG55a6h5p+l5YiG5Yir5aeU5omY44CB5L2/55So54us56uL5LiK5LiL5paH'
+        ([Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([regex]::Unescape('\u4e24\u9879\u5ba1\u67e5\u5206\u522b\u59d4\u6258\uff0c\u5c3d\u91cf\u4f7f\u7528\u5f7c\u6b64\u72ec\u7acb\u7684\u4e0a\u4e0b\u6587'))))
     )) {
         Assert-Contains $engineeringText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($boundary))) "$Profile review cadence and escalation"
     }
@@ -70,7 +71,7 @@ function Assert-Guidance {
     }
     Assert-Contains $promptText '2026-10-04.2' "$Profile common baseline"
     foreach ($expressionMarker in @(
-        ([regex]::Unescape('K \u57285\uff5e15\u4e4b\u95f4\uff0c\u9ed8\u8ba410')),
+        ([regex]::Unescape('K\u57285\uff5e15\u4e4b\u95f4\uff0c\u9ed8\u8ba410')),
         ([regex]::Unescape('\u7ef4\u62a4\u6709\u4e24\u4e2a\u660e\u786e\u65f6\u70b9')),
         ([regex]::Unescape('\u51c6\u5907\u5b8c\u6574\u5de5\u7a0b\u89e3\u91ca\u6216\u6c47\u62a5\u65f6')),
         ([regex]::Unescape('\u96c6\u4e2d\u56de\u6eaf\u5e76\u8865\u9f50\u6700\u8fd1K\u6b21')),
@@ -161,6 +162,61 @@ function Assert-Guidance {
         throw "$Profile is missing catgirl persona, audience or expression density"
     }
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
+    $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
+    $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
+    Assert-Contains $agentsText "2026-10-08.1" "$Profile core content revision"
+    Assert-Contains $promptText "2026-10-08.1" "$Profile prompt content revision"
+    Assert-Contains $agentsText ([regex]::Unescape('\u540c\u4e00\u57fa\u7ebf\u4e0b\u7684\u5185\u5bb9\u66f4\u65b0\u4e5f\u6309\u65b0\u4fee\u8ba2\u5b8c\u6574\u8bfb\u53d6')) "$Profile same-baseline reread guard"
+    Assert-Contains $observerText "nextProbeAt" "$Profile observer due time"
+    Assert-Contains $observerText ([regex]::Unescape('20\u5206\u949f\u7eed\u63a5\u4f1a\u4f7f\u5230\u671f\u68c0\u67e5\u63a8\u8fdf\u523040\u5206\u949f')) "$Profile observer cadence mismatch"
+    Assert-Contains $observerText ([regex]::Unescape('\u7f3a\u5931\u7684\u65e7\u5230\u671f\u70b9\u4e0d\u96c6\u4e2d\u8865\u53d1')) "$Profile observer delayed wake guard"
+    foreach ($marker in @(
+        ([regex]::Unescape('\u4e0e\u5f53\u524d\u8ba8\u8bba\u6709\u5173\u7684\u5168\u90e8\u4ea4\u6d41\u53ca\u53cd\u9988')),
+        ([regex]::Unescape('\u9010\u53e5\u5bf9\u7167\u7528\u6237\u5b9e\u9645\u8bc9\u6c42')),
+        ([regex]::Unescape('\u540c\u4e00\u5bf9\u8c61\u6301\u7eed\u4fdd\u6301\u540c\u4e00\u540d\u79f0')),
+        ([regex]::Unescape('\u7d27\u8ddf\u4e00\u53e5\u7b80\u77ed\u62ec\u53f7\u8bf4\u660e')),
+        ([regex]::Unescape('\u5199MEMORY')),
+        ([regex]::Unescape('\u95ee\u9898\u6709\u6548\u72b6\u6001'))
+    )) {
+        Assert-Contains $promptText $marker "$Profile prompt update contract"
+    }
+    foreach ($marker in @(
+        ([regex]::Unescape('\u5c3d\u91cf\u4f7f\u7528\u5f7c\u6b64\u72ec\u7acb\u7684\u4e0a\u4e0b\u6587')),
+        ([regex]::Unescape('\u660e\u786e\u5047\u5b9a\u5b89\u6392\u6216\u8def\u7ebf\u5df2\u7ecf\u5b58\u5728\u95ee\u9898')),
+        ([regex]::Unescape('\u8fde\u7eed\u4e24\u8f6e\u5b8c\u6574\u5ba1\u67e5')),
+        ([regex]::Unescape('\u8d26\u53f7\u989d\u5ea6\u8017\u5c3d')),
+        ([regex]::Unescape('\u7981\u6b62\u5728\u5f53\u524d\u7a97\u53e3\u91cd\u8bd5')),
+        ([regex]::Unescape('\u540c\u4e00\u7a97\u53e3\u76f8\u90bb\u4e24\u8f6e'))
+    )) {
+        Assert-Contains $engineeringText $marker "$Profile engineering update contract"
+    }
+    foreach ($marker in @(
+        ([regex]::Unescape('\u521b\u4f5c\u524d\u7981\u6b62\u8bfb\u53d6\u8d1f\u9762\u5e93')),
+        ([regex]::Unescape('\u5b8c\u6574\u6210\u7a3f\u6216\u6210\u54c1\u5236\u4f5c\u5b8c\u6210\u540e')),
+        ([regex]::Unescape('\u7528\u6237\u8bf4\u660e\u662f\u8be5\u6848\u4f8b\u501f\u9274\u8303\u56f4\u4e0e\u53d6\u820d\u7684\u9996\u8981\u4f9d\u636e')),
+        ([regex]::Unescape('\u6807\u9898\u3001\u53e5\u5f0f\u3001\u9875\u5185\u5173\u7cfb\u4e0e\u9875\u95f4\u9012\u8fdb')),
+        ([regex]::Unescape('\u4e3b\u52a8\u8be2\u95ee')),
+        ([regex]::Unescape('\u9ed8\u8ba4\u76f4\u63a5\u6b63\u5f0f\u6392\u7248')),
+        ([regex]::Unescape('PPT\u9875\u9762\u6587\u6848\u7981\u6b62\u53e5\u53f7')),
+        ([regex]::Unescape('PPT\u6807\u9898\u4e2d\u7684\u95ee\u53e5\u53ea\u5141\u8bb8\u8bbe\u95ee\u6216\u53cd\u95ee')),
+        ([regex]::Unescape('\u4e09\u4e2a\u300c\u4e3b\u8bed\uff0b\u52a8\u8bcd\uff0b\u5bbe\u8bed\u300d')),
+        ([regex]::Unescape('\u5185\u5bb9\u591a\u4f59\u68c0\u67e5\u6574\u9875')),
+        ([regex]::Unescape('\u5185\u5bb9\u7f3a\u5931\u68c0\u67e5\u5fc5\u8981\u5bf9\u8c61')),
+        ([regex]::Unescape('\u6a21\u62df\u5b8c\u5168\u4e0d\u4e86\u89e3\u9879\u76ee\u3001\u53ea\u613f\u626b\u4e00\u773c\u7684\u8bfb\u8005'))
+    )) {
+        $marker = $marker.Replace(([regex]::Unescape('\u7528\u6237')), $audienceWord)
+        Assert-Contains $designText $marker "$Profile design update contract"
+    }
+    foreach ($marker in @(
+        ([regex]::Unescape('\u4ec5\u5728\u63a5\u6536\u65b9\u5df2\u5b89\u88c5\u5e76\u660e\u786e\u542f\u7528\u89c2\u6d4b\u5668\u65f6\u9002\u7528')),
+        ([regex]::Unescape('\u4e00\u6b21\u8c03\u7528\u53ea\u53d1\u9001\u4e00\u4e2a\u72ec\u7acb\u8bf7\u6c42')),
+        ([regex]::Unescape('\u6bcf\u534a\u5c0f\u65f6')),
+        ([regex]::Unescape('\u7acb\u5373\u518d\u8c03\u7528\u4e24\u6b21CLI')),
+        ([regex]::Unescape('\u4e09\u6b21\u7ecf\u590d\u6838\u90fd\u7b26\u5408Luna\u7279\u5f81')),
+        ([regex]::Unescape('\u5f53\u524d\u5bf9\u8bdd\u540d\u79f0'))
+    )) {
+        Assert-Contains $observerText $marker "$Profile observer update contract"
+    }
     $toneText = $agentsText
     Assert-Contains $toneText ($audienceWord + ([regex]::Unescape('\u8865\u5145\u4fe1\u606f\u540e\uff0c\u76f8\u5e94\u6539\u53d8\u8ba8\u8bba\u65b9\u5411'))) "$Profile embedded calibration audience"
     Assert-Contains $agentsText ([regex]::Unescape('\u957f\u671f\u5de5\u7a0b\u5f00\u5de5\u3001\u63a5\u624b\u6216\u6062\u590d')) "$Profile sustained engineering entry"
