@@ -178,7 +178,12 @@ function Assert-Hash([string]$Path, [string]$Expected, [string]$Code) {
 
 function Initialize-NativeAcl {
     if (-not ('MergedCandidateMaintenance.NativeAcl' -as [type])) {
-        $Assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly([Reflection.AssemblyName]::new('MergedCandidateMaintenance.NativeAcl'), [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $AssemblyName = [Reflection.AssemblyName]::new('MergedCandidateMaintenance.NativeAcl')
+        if ($PSVersionTable.PSEdition -eq 'Core') {
+            $Assembly = [Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($AssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        } else {
+            $Assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($AssemblyName, [Reflection.Emit.AssemblyBuilderAccess]::Run)
+        }
         $Module = $Assembly.DefineDynamicModule('NativeAcl')
         $Builder = $Module.DefineType('MergedCandidateMaintenance.NativeAcl', [Reflection.TypeAttributes]::Public -bor [Reflection.TypeAttributes]::Abstract -bor [Reflection.TypeAttributes]::Sealed)
         $Attributes = [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
@@ -240,7 +245,7 @@ function Read-CandidateManifest {
     $script:ManifestHash = Get-Sha256 $ManifestPath
     $Document = Read-Json $ManifestPath
     Assert-ObjectKeys $Document @('schemaVersion', 'state', 'sourceCommit', 'profiles') 'manifest'
-    if ($Document.schemaVersion -isnot [int] -or $Document.schemaVersion -ne 3) { Fail 'UNKNOWN_SCHEMA' 'manifest' }
+    if (($Document.schemaVersion -isnot [int] -and $Document.schemaVersion -isnot [long]) -or $Document.schemaVersion -ne 3) { Fail 'UNKNOWN_SCHEMA' 'manifest' }
     if ($Document.state -cne 'PREPARED_NOT_APPLIED') { Fail 'UNKNOWN_STATE' 'manifest' }
     if ($Document.sourceCommit -isnot [string] -or $Document.sourceCommit -cnotmatch '^[0-9a-fA-F]{40}$') { Fail 'INVALID_SOURCE_COMMIT' 'manifest' }
     Assert-ObjectKeys $Document.profiles @('development', 'training') 'profiles'
@@ -353,7 +358,7 @@ function Assert-Backup {
     Assert-Hash $RecoveryPath $Digest 'RECOVERY_MANIFEST_DRIFT'
     $Document = Read-Json $RecoveryPath
     Assert-ObjectKeys $Document @('schemaVersion', 'state', 'sourceCommit', 'manifestSha256', 'machineProfile', 'targetRoot', 'backupRoot', 'targets', 'unchangedProductionDependencies') 'recovery'
-    if ($Document.schemaVersion -isnot [int] -or $Document.schemaVersion -ne 1) { Fail 'UNKNOWN_SCHEMA' 'recovery' }
+    if (($Document.schemaVersion -isnot [int] -and $Document.schemaVersion -isnot [long]) -or $Document.schemaVersion -ne 1) { Fail 'UNKNOWN_SCHEMA' 'recovery' }
     if ($Document.state -cne 'PREPARED_NOT_APPLIED') { Fail 'UNKNOWN_STATE' 'recovery' }
     if ($Document.machineProfile -cne $MachineProfile) { Fail 'BACKUP_PROFILE_MISMATCH' $MachineProfile }
     if ($Document.targetRoot -isnot [string] -or $Document.backupRoot -isnot [string] -or -not $TargetRoot.Equals($Document.targetRoot, [StringComparison]::OrdinalIgnoreCase) -or -not $BackupRoot.Equals($Document.backupRoot, [StringComparison]::OrdinalIgnoreCase)) { Fail 'BACKUP_ROOT_MISMATCH' $BackupRoot }

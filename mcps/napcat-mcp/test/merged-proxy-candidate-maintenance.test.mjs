@@ -10,8 +10,9 @@ import { fileURLToPath } from 'node:url';
 const windows = process.platform === 'win32';
 const scriptPath = fileURLToPath(new URL('../ops/manage-merged-proxy-candidate.ps1', import.meta.url));
 const windowsRoot = process.env.SystemRoot || 'C:/Windows';
-const powershellPath = path.join(windowsRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
-const fixtureParent = path.join(tmpdir(), 'outer-status-hidden-prep-20261009/recovery-fixtures');
+const powershellPath = process.env.MERGED_PROXY_TEST_POWERSHELL_PATH || path.join(windowsRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe');
+assert.ok(path.isAbsolute(powershellPath), 'Explicit test runtime must be an absolute path');
+const fixtureParent = path.join(fs.realpathSync.native(tmpdir()), 'outer-status-hidden-prep-20261009/recovery-fixtures');
 const targetPaths = [
   'src/codex-app-server-proxy.mjs',
   'src/codex-thread-bridge.mjs',
@@ -187,7 +188,8 @@ function aclSnapshot(fixture, profile) {
   const pathsExpression = targetPaths.map((member) => quotePs(path.join(fixture.targetRoots[profile], member))).join(',');
   return JSON.parse(runPsCommand(`
     $ErrorActionPreference='Stop'
-    $assembly=[AppDomain]::CurrentDomain.DefineDynamicAssembly([Reflection.AssemblyName]::new('FixtureAclRead'),[Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $assemblyName=[Reflection.AssemblyName]::new('FixtureAclRead')
+    $assembly=if($PSVersionTable.PSEdition -eq 'Core'){[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($assemblyName,[Reflection.Emit.AssemblyBuilderAccess]::Run)}else{[AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName,[Reflection.Emit.AssemblyBuilderAccess]::Run)}
     $module=$assembly.DefineDynamicModule('FixtureAclRead')
     $builder=$module.DefineType('FixtureAclRead',[Reflection.TypeAttributes]::Public)
     $method=$builder.DefinePInvokeMethod('Read','advapi32.dll','GetFileSecurityW',[Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl,[Reflection.CallingConventions]::Standard,[bool],[type[]]@([string],[uint32],[byte[]],[uint32],([uint32]).MakeByRefType()),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
@@ -221,7 +223,8 @@ const noAiLayouts = [
 function nativeFixtureAclPrelude() {
   return `
     $ErrorActionPreference='Stop'
-    $assembly=[AppDomain]::CurrentDomain.DefineDynamicAssembly([Reflection.AssemblyName]::new('IndependentFixtureAcl'),[Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $assemblyName=[Reflection.AssemblyName]::new('IndependentFixtureAcl')
+    $assembly=if($PSVersionTable.PSEdition -eq 'Core'){[Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($assemblyName,[Reflection.Emit.AssemblyBuilderAccess]::Run)}else{[AppDomain]::CurrentDomain.DefineDynamicAssembly($assemblyName,[Reflection.Emit.AssemblyBuilderAccess]::Run)}
     $module=$assembly.DefineDynamicModule('IndependentFixtureAcl')
     $builder=$module.DefineType('IndependentFixtureAcl',[Reflection.TypeAttributes]::Public)
     $attributes=[Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
@@ -423,13 +426,43 @@ test('native no-AI fixtures retain their requested control bits and ACE order be
   });
 }));
 
-test('merged candidate maintenance: standalone Windows PowerShell 5.1 fixture acceptance', { skip: !windows, timeout: 600000 }, async (context) => {
+test('selected runtime rejects noninteger and incorrect manifest and recovery schemas', { skip: !windows }, async () => withFixture(async (fixture) => {
+  const manifestText = JSON.stringify(fixture.manifest);
+  for (const invalidVersion of ['"3"', '3.0', '3.5', '4', 'true', 'null']) {
+    writeFixtureFile(fixture.manifestPath, manifestText.replace('"schemaVersion":3', `"schemaVersion":${invalidVersion}`));
+    expectRefusal(fixture, {}, /UNKNOWN_SCHEMA: manifest/);
+  }
+  writeFixtureFile(fixture.manifestPath, manifestText);
+  expectSuccess(runManager(fixture, { mode: 'Prepare' }), 'PREPARED');
+  const recoveryPath = path.join(fixture.backupRoots.development, 'recovery-manifest.json');
+  const recoveryText = JSON.stringify(JSON.parse(fs.readFileSync(recoveryPath, 'utf8')));
+  for (const invalidVersion of ['"1"', '1.0', '1.5', '2', 'true', 'null']) {
+    const invalidRecovery = recoveryText.replace('"schemaVersion":1', `"schemaVersion":${invalidVersion}`);
+    writeFixtureFile(recoveryPath, invalidRecovery);
+    writeFixtureFile(path.join(fixture.backupRoots.development, 'recovery-manifest.sha256'), digest(invalidRecovery));
+    expectRefusal(fixture, {}, /UNKNOWN_SCHEMA: recovery/);
+  }
+}));
+
+test('selected runtime native ACL roundtrip on both profiles', { skip: !windows, timeout: 180000 }, async (context) => {
+  for (const profile of profiles) await withFixture(async (fixture) => {
+    const seeded = seedNoAiTargetAcls(fixture, profile);
+    expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+    assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'prepared');
+    expectSuccess(runManager(fixture, { mode: 'Apply', profile, acknowledged: true }), 'APPLIED');
+    assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'applied');
+    expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+    assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'restored');
+  });
+});
+
+test('merged candidate maintenance: standalone selected PowerShell fixture acceptance', { skip: !windows, timeout: 600000 }, async (context) => {
   const frozenScriptSha256 = digest(fs.readFileSync(scriptPath));
   context.diagnostic(`Maintenance script SHA256 ${frozenScriptSha256}`);
-  await context.test('environment has Windows PowerShell 5.1 and no Node on the child PATH', async () => withFixture(async (fixture) => {
+  await context.test('environment has the selected supported PowerShell and no Node on the child PATH', async () => withFixture(async (fixture) => {
     const environment = JSON.parse(runPsCommand("$info=[ordered]@{powershell=$PSVersionTable.PSVersion.ToString();edition=$PSVersionTable.PSEdition;nodeAvailable=($null -ne (Get-Command node -ErrorAction SilentlyContinue))}; $info | ConvertTo-Json -Compress", fixture.root));
-    assert.match(environment.powershell, /^5\.1\./);
-    assert.equal(environment.edition, 'Desktop');
+    assert.match(environment.powershell, process.env.MERGED_PROXY_TEST_POWERSHELL_PATH ? /^7\./ : /^5\.1\./);
+    assert.equal(environment.edition, process.env.MERGED_PROXY_TEST_POWERSHELL_PATH ? 'Core' : 'Desktop');
     assert.equal(environment.nodeAvailable, false);
     context.diagnostic(`Node ${process.version}; Windows PowerShell ${environment.powershell}; child Node PATH absent`);
   }));
