@@ -184,8 +184,10 @@ function Initialize-NativeAcl {
         $Attributes = [Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
         $Getter = $Builder.DefinePInvokeMethod('Get', 'advapi32.dll', 'GetFileSecurityW', $Attributes, [Reflection.CallingConventions]::Standard, [bool], [type[]]@([string], [uint32], [byte[]], [uint32], ([uint32]).MakeByRefType()), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
         $Setter = $Builder.DefinePInvokeMethod('Set', 'advapi32.dll', 'SetNamedSecurityInfoW', $Attributes, [Reflection.CallingConventions]::Standard, [uint32], [type[]]@([string], [int], [uint32], [byte[]], [byte[]], [byte[]], [IntPtr]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
+        $RawSetter = $Builder.DefinePInvokeMethod('SetRaw', 'advapi32.dll', 'SetFileSecurityW', $Attributes, [Reflection.CallingConventions]::Standard, [bool], [type[]]@([string], [uint32], [byte[]]), [Runtime.InteropServices.CallingConvention]::Winapi, [Runtime.InteropServices.CharSet]::Unicode)
         $Getter.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
         $Setter.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+        $RawSetter.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
         [void]$Builder.CreateType()
     }
 }
@@ -216,8 +218,15 @@ function Set-SavedAcl([string]$Path, [string]$Sddl) {
     $Protect = ($Descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0
     [uint32]$Information = 7
     if ($Protect) { $Information = $Information -bor [uint32]2147483648 } else { $Information = $Information -bor [uint32]536870912 }
-    $ReturnCode = [MergedCandidateMaintenance.NativeAcl]::Set($Path, 1, $Information, $OwnerBytes, $GroupBytes, $DaclBytes, [IntPtr]::Zero)
-    if ($ReturnCode -ne 0) { Fail 'ACL_WRITE_FAILED' ([ComponentModel.Win32Exception]::new([int]$ReturnCode).Message) }
+    $AutoInherited = ($Descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited) -ne 0
+    if ($AutoInherited) {
+        $ReturnCode = [MergedCandidateMaintenance.NativeAcl]::Set($Path, 1, $Information, $OwnerBytes, $GroupBytes, $DaclBytes, [IntPtr]::Zero)
+        if ($ReturnCode -ne 0) { Fail 'ACL_WRITE_FAILED' ([ComponentModel.Win32Exception]::new([int]$ReturnCode).Message) }
+    } else {
+        $DescriptorBytes = [byte[]]::new($Descriptor.BinaryLength)
+        $Descriptor.GetBinaryForm($DescriptorBytes, 0)
+        if (-not [MergedCandidateMaintenance.NativeAcl]::SetRaw($Path, $Information, $DescriptorBytes)) { Fail 'ACL_WRITE_FAILED' $Path }
+    }
     if ((Get-AclSddl $Path) -cne $Sddl) { Fail 'ACL_MISMATCH' $Path }
 }
 
@@ -457,6 +466,7 @@ function Invoke-Replacement($Stage, [string]$CurrentHash) {
     Write-ReceiptEvent 'replaceStarted' ([ordered]@{ path = $Entry.path; beforeSha256 = $CurrentHash; afterSha256 = $Stage.hash })
     [IO.File]::Replace($Stage.newPath, $Entry.targetPath, $Stage.oldPath, $false)
     Assert-Hash $Entry.targetPath $Stage.hash 'REPLACED_TARGET_DRIFT'
+    if ((Get-AclSddl $Entry.targetPath) -cne $Entry.aclSddl) { Set-SavedAcl $Entry.targetPath $Entry.aclSddl }
     if ((Get-AclSddl $Entry.targetPath) -cne $Entry.aclSddl) { Fail 'REPLACED_TARGET_ACL_MISMATCH' $Entry.path }
     Write-ReceiptEvent 'replaceCompleted' ([ordered]@{ path = $Entry.path; sha256 = $Stage.hash })
 }

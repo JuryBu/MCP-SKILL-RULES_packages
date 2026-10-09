@@ -34,6 +34,12 @@ function quotePs(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+function traceFixtureProcess(executable, args, cwd, result) {
+  if (process.env.MERGED_PROXY_TEST_TRACE === '1') {
+    console.log(JSON.stringify({ executable, args, cwd, status: result.status, stdout: result.stdout, stderr: result.stderr }));
+  }
+}
+
 function assertNoReparseAncestors(absolutePath) {
   let current = path.resolve(absolutePath);
   while (true) {
@@ -126,15 +132,20 @@ async function withFixture(callback) {
 }
 
 function runPsCommand(command, cwd) {
-  const result = spawnSync(powershellPath, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], {
+  const args = ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command];
+  const result = spawnSync(powershellPath, args, {
     cwd, env: { ...childEnvironment, TEMP: cwd, TMP: cwd }, windowsHide: true, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024,
   });
+  traceFixtureProcess(powershellPath, args, cwd, result);
   assert.ifError(result.error);
   assert.equal(result.status, 0, result.stderr || result.stdout);
   return result.stdout.trim();
 }
 
 function runManager(fixture, options = {}) {
+  if (process.env.MERGED_PROXY_TEST_SCRIPT_SHA256) {
+    assert.equal(digest(fs.readFileSync(scriptPath)), process.env.MERGED_PROXY_TEST_SCRIPT_SHA256.toLowerCase(), 'Frozen maintenance script SHA256');
+  }
   const profile = options.profile || 'development';
   const argumentsList = ['-NoLogo', '-NoProfile', '-NonInteractive', '-File', scriptPath,
     '-ManifestPath', options.manifestPath || fixture.manifestPath,
@@ -147,6 +158,7 @@ function runManager(fixture, options = {}) {
   const result = spawnSync(powershellPath, argumentsList, {
     cwd: fixture.root, env: { ...childEnvironment, TEMP: fixture.root, TMP: fixture.root }, windowsHide: true, encoding: 'utf8', timeout: 30000, maxBuffer: 2 * 1024 * 1024,
   });
+  traceFixtureProcess(powershellPath, argumentsList, fixture.root, result);
   assert.ifError(result.error);
   let report;
   try { report = JSON.parse(result.stdout.trim()); }
@@ -199,6 +211,152 @@ function protectTargetAcls(fixture, profile) {
   runPsCommand(`$ErrorActionPreference='Stop'; foreach($file in @(${pathsExpression})){$security=Get-Acl -LiteralPath $file; $security.SetAccessRuleProtection($true,$true); Set-Acl -LiteralPath $file -AclObject $security}`, fixture.root);
 }
 
+const noAiLayouts = [
+  { protected: false, noncanonical: false, inherited: false },
+  { protected: true, noncanonical: true, inherited: false },
+  { protected: false, noncanonical: true, inherited: true },
+  { protected: true, noncanonical: true, inherited: true },
+];
+
+function nativeFixtureAclPrelude() {
+  return `
+    $ErrorActionPreference='Stop'
+    $assembly=[AppDomain]::CurrentDomain.DefineDynamicAssembly([Reflection.AssemblyName]::new('IndependentFixtureAcl'),[Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $module=$assembly.DefineDynamicModule('IndependentFixtureAcl')
+    $builder=$module.DefineType('IndependentFixtureAcl',[Reflection.TypeAttributes]::Public)
+    $attributes=[Reflection.MethodAttributes]::Public -bor [Reflection.MethodAttributes]::Static -bor [Reflection.MethodAttributes]::PinvokeImpl
+    $reader=$builder.DefinePInvokeMethod('Read','advapi32.dll','GetFileSecurityW',$attributes,[Reflection.CallingConventions]::Standard,[bool],[type[]]@([string],[uint32],[byte[]],[uint32],([uint32]).MakeByRefType()),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+    $writer=$builder.DefinePInvokeMethod('Write','advapi32.dll','SetFileSecurityW',$attributes,[Reflection.CallingConventions]::Standard,[bool],[type[]]@([string],[uint32],[byte[]]),[Runtime.InteropServices.CallingConvention]::Winapi,[Runtime.InteropServices.CharSet]::Unicode)
+    $reader.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    $writer.SetImplementationFlags([Reflection.MethodImplAttributes]::PreserveSig)
+    [void]$builder.CreateType()
+    $sections=[Security.AccessControl.AccessControlSections]::Access -bor [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Group
+    function Read-FixtureDescriptor([string]$file) {
+      [uint32]$needed=0
+      [void][IndependentFixtureAcl]::Read($file,7,$null,0,[ref]$needed)
+      if($needed -eq 0){throw 'Independent fixture ACL size read failed'}
+      $bytes=[byte[]]::new($needed)
+      if(-not [IndependentFixtureAcl]::Read($file,7,$bytes,$needed,[ref]$needed)){throw 'Independent fixture ACL read failed'}
+      return [Security.AccessControl.RawSecurityDescriptor]::new($bytes,0)
+    }
+    function Get-FixtureAclState($descriptor,[string]$file) {
+      $aces=@(foreach($ace in $descriptor.DiscretionaryAcl){
+        [ordered]@{type=$ace.AceType.ToString();flags=[int]$ace.AceFlags;mask=$ace.AccessMask;sid=$ace.SecurityIdentifier.Value}
+      })
+      $daclBytes=[byte[]]::new($descriptor.DiscretionaryAcl.BinaryLength)
+      $descriptor.DiscretionaryAcl.GetBinaryForm($daclBytes,0)
+      return [ordered]@{sddl=$descriptor.GetSddlForm($sections);controlFlags=[int]$descriptor.ControlFlags;owner=$descriptor.Owner.Value;group=$descriptor.Group.Value;dacl=[Convert]::ToBase64String($daclBytes);aces=$aces;sha256=(Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()}
+    }
+    function Write-FixtureDescriptor([string]$file,$descriptor) {
+      $bytes=[byte[]]::new($descriptor.BinaryLength)
+      $descriptor.GetBinaryForm($bytes,0)
+      [uint32]$information=7
+      if(($descriptor.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected) -ne 0){$information=$information -bor [uint32]2147483648}
+      else{$information=$information -bor [uint32]536870912}
+      if(-not [IndependentFixtureAcl]::Write($file,$information,$bytes)){throw 'Independent fixture ACL write failed'}
+      $actual=Read-FixtureDescriptor $file
+      if($actual.GetSddlForm($sections) -cne $descriptor.GetSddlForm($sections) -or $actual.ControlFlags -ne $descriptor.ControlFlags){throw 'Independent fixture ACL readback differs from requested descriptor'}
+      return $actual
+    }
+  `;
+}
+
+function nativeFixturePaths(fixture, root) {
+  assert.ok(root.startsWith(`${fixture.root}${path.sep}`));
+  assertNoReparseAncestors(root);
+  return targetPaths.map((member) => quotePs(path.join(root, member))).join(',');
+}
+
+function seedNoAiTargetAcls(fixture, profile, mixedOuter = false) {
+  const seeded = JSON.parse(runPsCommand(`${nativeFixtureAclPrelude()}
+    $files=@(${nativeFixturePaths(fixture, fixture.targetRoots[profile])})
+    $layouts=${quotePs(JSON.stringify(noAiLayouts))} | ConvertFrom-Json
+    $mixedOuter=$${mixedOuter ? 'true' : 'false'}
+    $currentUser=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $syntheticSid=[Security.Principal.SecurityIdentifier]::new('S-1-5-21-111111111-222222222-333333333-4242').Value
+    $worldSid=[Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::WorldSid,$null).Value
+    $values=@(for($index=0;$index -lt $files.Count;$index++){
+      $file=$files[$index]
+      $original=Read-FixtureDescriptor $file
+      $layout=$layouts[$index]
+      $flags=if($layout.protected){'P'}else{''}
+      $dacl='(A;;FA;;;'+$currentUser+')'
+      if($layout.noncanonical){$dacl+='(A;;0x12019f;;;'+$syntheticSid+')(D;;0x2;;;'+$syntheticSid+')'}
+      if($layout.inherited){$dacl+='(A;ID;0x120089;;;'+$worldSid+')'}
+      if($mixedOuter -and $index -eq 0){$expected=$original;$actual=$original}
+      else{
+        $expected=[Security.AccessControl.RawSecurityDescriptor]::new('O:'+$original.Owner.Value+'G:'+$original.Group.Value+'D:'+$flags+$dacl)
+        $actual=Write-FixtureDescriptor $file $expected
+      }
+      $expectedBackup=[Security.AccessControl.RawSecurityDescriptor]::new($expected.GetSddlForm($sections))
+      $expectedBackup.SetFlags($expectedBackup.ControlFlags -bor [Security.AccessControl.ControlFlags]::DiscretionaryAclProtected)
+      foreach($ace in $expectedBackup.DiscretionaryAcl){$ace.AceFlags=[Security.AccessControl.AceFlags]([int]$ace.AceFlags -band (-bnot [int][Security.AccessControl.AceFlags]::Inherited))}
+      [ordered]@{expected=(Get-FixtureAclState $expected $file);actual=(Get-FixtureAclState $actual $file);backup=(Get-FixtureAclState $expectedBackup $file)}
+    })
+    ConvertTo-Json -InputObject $values -Depth 8 -Compress
+  `, fixture.root));
+  for (const [index, entry] of seeded.entries()) {
+    const layout = noAiLayouts[index];
+    assert.deepEqual(entry.actual, entry.expected, `Initial native descriptor ${targetPaths[index]}`);
+    if (mixedOuter && index === 0) {
+      assert.equal(entry.actual.controlFlags & 0x0400, 0x0400, 'Mixed outer retains its valid inherited AI descriptor');
+      assert.equal(entry.actual.controlFlags & 0x1000, 0);
+      assert.ok(entry.actual.aces.some((ace) => (ace.flags & 0x10) !== 0));
+      assert.equal(entry.actual.sha256, fixture.manifest.profiles[profile].targets[index].beforeSha256);
+      continue;
+    }
+    assert.equal(entry.actual.controlFlags, 0x8004 | (layout.protected ? 0x1000 : 0));
+    assert.equal(entry.actual.controlFlags & 0x0400, 0, 'Initial descriptor must have no AI');
+    assert.equal(entry.actual.aces.length, 1 + (layout.noncanonical ? 2 : 0) + (layout.inherited ? 1 : 0));
+    assert.equal(entry.actual.aces[0].type, 'AccessAllowed');
+    assert.equal(entry.actual.aces[0].flags, 0);
+    if (layout.noncanonical) {
+      assert.equal(entry.actual.aces[1].type, 'AccessAllowed');
+      assert.equal(entry.actual.aces[2].type, 'AccessDenied');
+      assert.equal(entry.actual.aces[1].sid, entry.actual.aces[2].sid);
+      assert.equal(entry.actual.aces[1].mask & entry.actual.aces[2].mask, entry.actual.aces[2].mask);
+    }
+    assert.deepEqual(entry.actual.aces.map((ace) => ace.flags), entry.actual.aces.map((_, aceIndex) => layout.inherited && aceIndex === entry.actual.aces.length - 1 ? 0x10 : 0));
+    assert.equal(entry.actual.sha256, fixture.manifest.profiles[profile].targets[index].beforeSha256);
+  }
+  return seeded;
+}
+
+function nativeAclStates(fixture, root) {
+  return JSON.parse(runPsCommand(`${nativeFixtureAclPrelude()}
+    $values=@(foreach($file in @(${nativeFixturePaths(fixture, root)})){Get-FixtureAclState (Read-FixtureDescriptor $file) $file})
+    ConvertTo-Json -InputObject $values -Depth 8 -Compress
+  `, fixture.root));
+}
+
+function rewriteFixtureSddl(fixture, file, sddl) {
+  assert.ok(file.startsWith(`${fixture.root}${path.sep}`));
+  assertNoReparseAncestors(file);
+  runPsCommand(`${nativeFixtureAclPrelude()}
+    $descriptor=[Security.AccessControl.RawSecurityDescriptor]::new(${quotePs(sddl)})
+    [void](Write-FixtureDescriptor ${quotePs(file)} $descriptor)
+  `, fixture.root);
+}
+
+function assertNativePhase(context, fixture, profile, seeded, hashField, phase) {
+  assertTargets(fixture, profile, hashField);
+  const targetStates = nativeAclStates(fixture, fixture.targetRoots[profile]);
+  assert.deepEqual(targetStates, seeded.map((entry, index) => ({ ...entry.actual, sha256: fixture.manifest.profiles[profile].targets[index][hashField] })));
+  const backupStates = nativeAclStates(fixture, path.join(fixture.backupRoots[profile], 'original'));
+  assert.deepEqual(backupStates, seeded.map((entry) => entry.backup));
+  context.diagnostic(JSON.stringify({ profile, phase, targets: targetStates, backups: backupStates }));
+  assertNoMaintenanceResidue(fixture);
+}
+
+function expectNativeRefusal(fixture, profile, options, code) {
+  const targetsBefore = nativeAclStates(fixture, fixture.targetRoots[profile]);
+  const backupsBefore = nativeAclStates(fixture, path.join(fixture.backupRoots[profile], 'original'));
+  const report = expectRefusal(fixture, { ...options, profile }, code);
+  assert.deepEqual(nativeAclStates(fixture, fixture.targetRoots[profile]), targetsBefore);
+  assert.deepEqual(nativeAclStates(fixture, path.join(fixture.backupRoots[profile], 'original')), backupsBefore);
+  return report;
+}
+
 function assertTargets(fixture, profile, hashField) {
   for (const target of fixture.manifest.profiles[profile].targets) {
     assert.equal(digest(fs.readFileSync(path.join(fixture.targetRoots[profile], target.path))), target[hashField], target.path);
@@ -246,11 +404,26 @@ async function startHelper(fixture, command) {
   });
   return async () => {
     child.stdin.end('\n');
-    assert.equal(await exited, 0, errors);
+    const status = await exited;
+    traceFixtureProcess(powershellPath, ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command', command], fixture.root, { status, stdout: output, stderr: errors });
+    assert.equal(status, 0, errors);
   };
 }
 
-test('merged candidate maintenance: standalone Windows PowerShell 5.1 fixture acceptance', { skip: !windows, timeout: 300000 }, async (context) => {
+test('native no-AI fixtures retain their requested control bits and ACE order before maintenance', { skip: !windows }, async (context) => withFixture(async (fixture) => {
+  for (const profile of profiles) {
+    const seeded = seedNoAiTargetAcls(fixture, profile);
+    assert.deepEqual(nativeAclStates(fixture, fixture.targetRoots[profile]), seeded.map((entry) => entry.actual));
+    context.diagnostic(JSON.stringify({ profile, initialNativeDescriptors: seeded }));
+  }
+  await withFixture(async (mixedFixture) => {
+    const seeded = seedNoAiTargetAcls(mixedFixture, 'development', true);
+    assert.deepEqual(nativeAclStates(mixedFixture, mixedFixture.targetRoots.development), seeded.map((entry) => entry.actual));
+    context.diagnostic(JSON.stringify({ profile: 'development', mixedAiAndNoAiInitialDescriptors: seeded }));
+  });
+}));
+
+test('merged candidate maintenance: standalone Windows PowerShell 5.1 fixture acceptance', { skip: !windows, timeout: 600000 }, async (context) => {
   const frozenScriptSha256 = digest(fs.readFileSync(scriptPath));
   context.diagnostic(`Maintenance script SHA256 ${frozenScriptSha256}`);
   await context.test('environment has Windows PowerShell 5.1 and no Node on the child PATH', async () => withFixture(async (fixture) => {
@@ -545,6 +718,169 @@ test('merged candidate maintenance: standalone Windows PowerShell 5.1 fixture ac
       for (const mode of ['Apply', 'Restore']) expectRefusal(fixture, { mode, acknowledged: true, isolated: false }, /OFFLINE_PROCESSES_RUNNING/);
     } finally { await release(); }
     assertTargets(fixture, 'development', 'beforeSha256');
+  }));
+
+  for (const profile of profiles) {
+    await context.test(`${profile}: native no-AI descriptors survive Inspect, Prepare, Apply, Restore and repeated recovery exactly`, async () => withFixture(async (fixture) => {
+      const seeded = seedNoAiTargetAcls(fixture, profile);
+      const otherProfile = profiles.find((member) => member !== profile);
+      const otherBefore = treeSnapshot(fixture.targetRoots[otherProfile]);
+      const otherAcls = aclSnapshot(fixture, otherProfile);
+      const packageBefore = treeSnapshot(fixture.packageRoot);
+      const baselineBefore = treeSnapshot(fixture.targetRoots[profile]);
+      const inspectBefore = treeSnapshot(fixture.root);
+      const inspected = expectSuccess(runManager(fixture, { profile }), 'INSPECTED');
+      assert.equal(inspected.receiptPath, null);
+      assert.equal(inspected.backupPrepared, false);
+      assert.deepEqual(treeSnapshot(fixture.root), inspectBefore);
+      assert.deepEqual(nativeAclStates(fixture, fixture.targetRoots[profile]), seeded.map((entry) => entry.actual));
+      const prepared = expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+      assert.deepEqual(treeSnapshot(fixture.targetRoots[profile]), baselineBefore);
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'Prepare');
+      const recoveryPath = path.join(fixture.backupRoots[profile], 'recovery-manifest.json');
+      const recoveryBytes = fs.readFileSync(recoveryPath);
+      const recovery = JSON.parse(recoveryBytes);
+      assert.equal(recovery.machineProfile, profile);
+      assert.deepEqual(recovery.targets.map((entry) => entry.path), targetPaths);
+      assert.deepEqual(recovery.targets.map((entry) => entry.aclSddl), seeded.map((entry) => entry.actual.sddl));
+      assert.deepEqual(recovery.targets.map((entry) => entry.backupAclSddl), seeded.map((entry) => entry.backup.sddl));
+      assert.equal(fs.readFileSync(path.join(fixture.backupRoots[profile], 'recovery-manifest.sha256'), 'utf8').trim(), digest(recoveryBytes));
+      assert.equal(receiptEvents(prepared).at(-1).data.status, 'PREPARED');
+      const backupBefore = treeSnapshot(path.join(fixture.backupRoots[profile], 'original'));
+      expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'ALREADY_PREPARED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'repeated Prepare');
+      assert.deepEqual(fs.readFileSync(recoveryPath), recoveryBytes);
+      const preparedInspectBefore = treeSnapshot(fixture.root);
+      expectSuccess(runManager(fixture, { profile }), 'INSPECTED');
+      assert.deepEqual(treeSnapshot(fixture.root), preparedInspectBefore);
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'prepared Inspect');
+      const applyResult = runManager(fixture, { mode: 'Apply', profile, acknowledged: true });
+      if (applyResult.report.status === 'FAILED_ROLLED_BACK') assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'unexpected Apply failure independently verified');
+      const applied = expectSuccess(applyResult, 'APPLIED');
+      assert.deepEqual(receiptEvents(applied).filter((event) => event.event === 'replaceCompleted').map((event) => event.data.path), targetPaths);
+      assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'Apply');
+      const appliedBefore = treeSnapshot(fixture.targetRoots[profile]);
+      expectSuccess(runManager(fixture, { mode: 'Apply', profile, acknowledged: true }), 'ALREADY_APPLIED');
+      assert.deepEqual(treeSnapshot(fixture.targetRoots[profile]), appliedBefore);
+      assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'repeated Apply');
+      const appliedInspectBefore = treeSnapshot(fixture.root);
+      expectSuccess(runManager(fixture, { profile }), 'INSPECTED');
+      assert.deepEqual(treeSnapshot(fixture.root), appliedInspectBefore);
+      assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'applied Inspect');
+      for (const phase of ['Restore', 'repeated Restore']) {
+        const restored = expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+        assert.equal(restored.fourFileResult, 'RESTORED_SHA256_AND_ACL_VERIFIED');
+        assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', phase);
+        assert.deepEqual(treeSnapshot(path.join(fixture.backupRoots[profile], 'original')), backupBefore);
+        assert.deepEqual(fs.readFileSync(recoveryPath), recoveryBytes);
+      }
+      assert.deepEqual(treeSnapshot(fixture.packageRoot), packageBefore);
+      assert.deepEqual(treeSnapshot(fixture.targetRoots[otherProfile]), otherBefore);
+      assert.deepEqual(aclSnapshot(fixture, otherProfile), otherAcls);
+    }));
+
+    await context.test(`${profile}: no-AI maintenance keeps offline, SHA, control-bit, ACE-order and backup-lock refusals strict`, async () => withFixture(async (fixture) => {
+      const seeded = seedNoAiTargetAcls(fixture, profile);
+      expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'refusal fixture prepared');
+      for (const mode of ['Apply', 'Restore']) expectNativeRefusal(fixture, profile, { mode }, /OFFLINE_WINDOW_REQUIRED/);
+      const lockFile = path.join(fixture.backupRoots[profile], 'maintenance.lock');
+      writeFixtureFile(lockFile, 'synthetic abandoned lock\n');
+      const lockTreeBefore = treeSnapshot(fixture.root);
+      const lockTargetsBefore = nativeAclStates(fixture, fixture.targetRoots[profile]);
+      const lockBackupsBefore = nativeAclStates(fixture, path.join(fixture.backupRoots[profile], 'original'));
+      const release = await startHelper(fixture, `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${quotePs(lockFile)},[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None); try {Write-Output 'FIXTURE_READY'; [void][Console]::ReadLine()} finally {$stream.Dispose()}`);
+      try {
+        for (const mode of ['Apply', 'Restore']) {
+          const result = runManager(fixture, { mode, profile, acknowledged: true });
+          assert.equal(result.status, 1, JSON.stringify(result.report));
+          const report = result.report;
+          assert.equal(report.status, 'REFUSED');
+          assert.match(report.error, /maintenance\.lock/);
+          assert.equal(report.phase, 'lock');
+          assert.equal(report.receiptPath, null);
+          assert.deepEqual(nativeAclStates(fixture, fixture.targetRoots[profile]), lockTargetsBefore);
+          assert.deepEqual(nativeAclStates(fixture, path.join(fixture.backupRoots[profile], 'original')), lockBackupsBefore);
+        }
+      } finally { await release(); }
+      assert.deepEqual(treeSnapshot(fixture.root), lockTreeBefore);
+      fs.unlinkSync(lockFile);
+      for (const location of ['target', 'backup']) {
+        const root = location === 'target' ? fixture.targetRoots[profile] : path.join(fixture.backupRoots[profile], 'original');
+        const file = path.join(root, targetPaths[2]);
+        const original = fs.readFileSync(file);
+        fs.appendFileSync(file, '\nsynthetic no-AI SHA drift\n');
+        for (const mode of ['Apply', 'Restore']) expectNativeRefusal(fixture, profile, { mode, acknowledged: true }, location === 'target' ? /TARGET_DRIFT/ : /BACKUP_DRIFT/);
+        writeFixtureFile(file, original);
+      }
+      const explicitFile = path.join(fixture.targetRoots[profile], targetPaths[0]);
+      rewriteFixtureSddl(fixture, explicitFile, seeded[0].actual.sddl.replace('D:', 'D:P'));
+      for (const mode of ['Apply', 'Restore']) expectNativeRefusal(fixture, profile, { mode, acknowledged: true }, /TARGET_ACL_DRIFT/);
+      rewriteFixtureSddl(fixture, explicitFile, seeded[0].actual.sddl);
+      const noncanonicalFile = path.join(fixture.targetRoots[profile], targetPaths[2]);
+      const noncanonicalSddl = seeded[2].actual.sddl;
+      const aces = noncanonicalSddl.match(/\([^)]*\)/g);
+      const reordered = noncanonicalSddl.slice(0, noncanonicalSddl.indexOf('(')) + [aces[0], aces[2], aces[1], ...aces.slice(3)].join('');
+      rewriteFixtureSddl(fixture, noncanonicalFile, reordered);
+      for (const mode of ['Apply', 'Restore']) expectNativeRefusal(fixture, profile, { mode, acknowledged: true }, /TARGET_ACL_DRIFT/);
+      rewriteFixtureSddl(fixture, noncanonicalFile, noncanonicalSddl);
+      const backupFile = path.join(fixture.backupRoots[profile], 'original', targetPaths[2]);
+      rewriteFixtureSddl(fixture, backupFile, seeded[2].backup.sddl.replace('D:P', 'D:'));
+      for (const mode of ['Apply', 'Restore']) expectNativeRefusal(fixture, profile, { mode, acknowledged: true }, /BACKUP_ACL_DRIFT/);
+      rewriteFixtureSddl(fixture, backupFile, seeded[2].backup.sddl);
+      expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'healthy recovery after refusals');
+    }));
+
+    await context.test(`${profile}: a real no-AI third-file sharing violation restores full descriptors and SHA in reverse order`, async () => withFixture(async (fixture) => {
+      const seeded = seedNoAiTargetAcls(fixture, profile);
+      expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'sharing fixture prepared');
+      const backupBefore = treeSnapshot(path.join(fixture.backupRoots[profile], 'original'));
+      const lockedFile = path.join(fixture.targetRoots[profile], targetPaths[2]);
+      const release = await startHelper(fixture, `$ErrorActionPreference='Stop'; $stream=[IO.File]::Open(${quotePs(lockedFile)},[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read); try {Write-Output 'FIXTURE_READY'; [void][Console]::ReadLine()} finally {$stream.Dispose()}`);
+      try {
+        const result = runManager(fixture, { mode: 'Apply', profile, acknowledged: true });
+        assert.equal(result.status, 1, JSON.stringify(result.report));
+        assert.equal(result.report.status, 'FAILED_ROLLED_BACK', JSON.stringify(result.report));
+        assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'sharing failure independently verified');
+        assert.deepEqual(treeSnapshot(path.join(fixture.backupRoots[profile], 'original')), backupBefore);
+        assert.equal(result.report.failedTarget, targetPaths[2]);
+        assert.equal(result.report.failurePhase, 'replace');
+        assert.deepEqual(result.report.cleanupErrors, []);
+        const events = receiptEvents(result.report);
+        assert.deepEqual(events.filter((event) => event.event === 'replaceCompleted').map((event) => event.data.path), targetPaths.slice(0, 2));
+        assert.deepEqual(events.filter((event) => event.event === 'rollbackCompleted').map((event) => event.data.path), targetPaths.slice(0, 2).reverse());
+        assert.equal(events.at(-1).data.status, 'FAILED_ROLLED_BACK');
+        assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'third-file failure rolled back');
+        assert.deepEqual(treeSnapshot(path.join(fixture.backupRoots[profile], 'original')), backupBefore);
+      } finally { await release(); }
+      expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'recovery after sharing lock released');
+      expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'repeated recovery after sharing lock released');
+    }));
+  }
+
+  await context.test('development: valid inherited AI outer and no-AI bridge/wake/updater select independent write paths in one operation', async () => withFixture(async (fixture) => {
+    const profile = 'development';
+    const seeded = seedNoAiTargetAcls(fixture, profile, true);
+    const baselineBefore = treeSnapshot(fixture.targetRoots[profile]);
+    const otherBefore = treeSnapshot(fixture.targetRoots.training);
+    const otherAcls = aclSnapshot(fixture, 'training');
+    expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+    assert.deepEqual(treeSnapshot(fixture.targetRoots[profile]), baselineBefore);
+    assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'mixed AI/no-AI Prepare');
+    const backupBefore = treeSnapshot(path.join(fixture.backupRoots[profile], 'original'));
+    expectSuccess(runManager(fixture, { mode: 'Apply', profile, acknowledged: true }), 'APPLIED');
+    assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'mixed AI/no-AI Apply');
+    for (const phase of ['mixed AI/no-AI Restore', 'mixed AI/no-AI repeated Restore']) {
+      expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+      assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', phase);
+      assert.deepEqual(treeSnapshot(path.join(fixture.backupRoots[profile], 'original')), backupBefore);
+    }
+    assert.deepEqual(treeSnapshot(fixture.targetRoots.training), otherBefore);
+    assert.deepEqual(aclSnapshot(fixture, 'training'), otherAcls);
   }));
 
   assert.equal(ownedRoots.size, 0);

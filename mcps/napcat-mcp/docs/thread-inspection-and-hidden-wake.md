@@ -65,6 +65,8 @@
 
 `Apply` 核对完整候选和既有依赖。`Restore` 使用归属固定的本机四份原件备份，核对原件哈希、权限及目标已知状态；候选正文损坏或缺失时仍可恢复。未写入的依赖缺失或漂移记在 `dependencyWarnings`，四文件恢复返回 `fourFileResult`，服务调用链继续保留 `chainValidation=PENDING`，由维护任务核验后再恢复运行。
 
+权限核对使用原生读取的完整 owner、group 和 DACL 描述，保留继承控制位及 ACE 顺序。Windows 的[文件替换接口](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew)会合并原文件权限；入口在替换后重新读取，出现变化时写回已验证的原描述，再做完整比较。写回或比较失败时进入原件回退，回退后再次验证文件哈希及完整权限。
+
 应用前让活动任务保存状态，退出 Codex 并按维护约定停到安全位置。外层与路由分别加载 proxy 和 bridge，重新启动后需要确认两者都加载本次文件，再验证实际消息、读取、去重和精确确认。代码文件替换与进程加载分别验收。
 
 ## 验证范围
