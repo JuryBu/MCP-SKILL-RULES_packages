@@ -441,12 +441,16 @@ function Start-Receipt($Snapshot) {
     Write-ReceiptEvent 'started' ([ordered]@{ mode = $Mode; machineProfile = $MachineProfile; targetRoot = $TargetRoot; backupRoot = $BackupRoot; manifestSha256 = $ManifestHash; sourceCommit = $Manifest.sourceCommit; isolatedFixture = [bool]$IsolatedFixture; targetsBefore = @($Snapshot) })
 }
 
+function New-TemporaryFileName([ValidateSet('.new', '.old')][string]$Extension) {
+    return '.merged-' + [Guid]::NewGuid().ToString('N') + $Extension
+}
+
 function New-ReplacementStage($Entry, [string]$Source, [string]$Hash) {
     Assert-File $Entry.targetPath
     Assert-Hash $Source $Hash 'REPLACEMENT_SOURCE_DRIFT'
     $Parent = [IO.Path]::GetDirectoryName($Entry.targetPath)
-    $NewPath = Join-Safe $Parent ('.merged-' + $OperationId + '-' + [Guid]::NewGuid().ToString('N') + '.new')
-    $OldPath = Join-Safe $Parent ('.merged-' + $OperationId + '-' + [Guid]::NewGuid().ToString('N') + '.old')
+    $NewPath = Join-Safe $Parent (New-TemporaryFileName '.new')
+    $OldPath = Join-Safe $Parent (New-TemporaryFileName '.old')
     $TemporaryPaths.Add($NewPath)
     $TemporaryPaths.Add($OldPath)
     [IO.File]::Copy($Source, $NewPath, $false)
@@ -497,7 +501,7 @@ function Restore-BaselineAfterFailure {
             $Entry = $Item.entry
             if ($null -eq $Item.currentHash) {
                 $Parent = [IO.Path]::GetDirectoryName($Entry.targetPath)
-                $NewPath = Join-Safe $Parent ('.merged-' + $OperationId + '-' + [Guid]::NewGuid().ToString('N') + '.new')
+                $NewPath = Join-Safe $Parent (New-TemporaryFileName '.new')
                 $TemporaryPaths.Add($NewPath)
                 [IO.File]::Copy($Entry.backupPath, $NewPath, $false)
                 Set-SavedAcl $NewPath $Entry.aclSddl

@@ -887,3 +887,61 @@ test('merged candidate maintenance: standalone Windows PowerShell 5.1 fixture ac
   assert.equal(digest(fs.readFileSync(scriptPath)), frozenScriptSha256, 'Maintenance script changed during the fixture run');
   context.diagnostic('All synthetic fixture roots and helper processes cleaned; no candidate payload, updater, production service or shared source executed');
 });
+
+test('WinPS5 long atomic staging preserves original target roots and full native permissions', { skip: !windows, timeout: 600000 }, async (context) => {
+  const names = await withFixture(async (fixture) => JSON.parse(runPsCommand(`
+$parseTokens=$null
+$parseErrors=$null
+$syntax=[Management.Automation.Language.Parser]::ParseFile(${quotePs(scriptPath)},[ref]$parseTokens,[ref]$parseErrors)
+if($parseErrors.Count -ne 0){throw 'Maintenance entry did not parse'}
+$nameFunction=$syntax.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'New-TemporaryFileName'},$true)
+if($null -eq $nameFunction){throw 'Bounded temporary filename function is missing'}
+. ([scriptblock]::Create($nameFunction.Extent.Text))
+[ordered]@{newName=(New-TemporaryFileName '.new');oldName=(New-TemporaryFileName '.old');anotherNewName=(New-TemporaryFileName '.new')} | ConvertTo-Json -Compress
+`, fixture.root)));
+  assert.equal(new Set(Object.values(names)).size, 3);
+  for (const temporaryName of Object.values(names)) {
+    assert.match(temporaryName, /^\.merged-[a-f0-9]{32}\.(?:new|old)$/);
+    assert.equal(temporaryName.length, 44);
+  }
+  for (const profile of profiles) {
+    for (const historicalLength of [260, 263]) {
+      await context.test(`${profile}: historical temporary path length ${historicalLength}`, async () => withFixture(async (fixture) => {
+        const historicalName = `.merged-${'1'.repeat(32)}-${'2'.repeat(32)}.new`;
+        const minimumPath = path.join(fixture.root, 't', 'src', historicalName);
+        const paddingLength = historicalLength - minimumPath.length;
+        assert.ok(paddingLength >= 0, 'The fixture parent must allow the exact historical path length');
+        const nextTargetRoot = path.join(fixture.root, `t${'p'.repeat(paddingLength)}`);
+        assert.equal(path.dirname(path.resolve(nextTargetRoot)), path.resolve(fixture.root));
+        assertNoReparseAncestors(fixture.targetRoots[profile]);
+        assertNoReparseAncestors(nextTargetRoot);
+        fs.renameSync(fixture.targetRoots[profile], nextTargetRoot);
+        fixture.targetRoots[profile] = nextTargetRoot;
+        assert.equal(path.join(nextTargetRoot, 'src', historicalName).length, historicalLength);
+        assert.equal(path.join(nextTargetRoot, 'src', names.newName).length, historicalLength - 33);
+        assert.equal(path.join(nextTargetRoot, 'src', names.oldName).length, historicalLength - 33);
+        const targetRootsBefore = { ...fixture.targetRoots };
+        const seeded = seedNoAiTargetAcls(fixture, profile);
+        const otherProfile = profiles.find((candidate) => candidate !== profile);
+        const otherBefore = treeSnapshot(fixture.targetRoots[otherProfile]);
+        const baselineBefore = treeSnapshot(nextTargetRoot);
+        expectSuccess(runManager(fixture, { mode: 'Inspect', profile }), 'INSPECTED');
+        assert.deepEqual(treeSnapshot(nextTargetRoot), baselineBefore);
+        expectSuccess(runManager(fixture, { mode: 'Prepare', profile }), 'PREPARED');
+        assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', 'long-path Prepare');
+        const backupBefore = treeSnapshot(path.join(fixture.backupRoots[profile], 'original'));
+        expectSuccess(runManager(fixture, { mode: 'Apply', profile, acknowledged: true }), 'APPLIED');
+        assertNativePhase(context, fixture, profile, seeded, 'candidateSha256', 'long-path Apply');
+        for (const phase of ['long-path Restore', 'long-path repeated Restore']) {
+          expectSuccess(runManager(fixture, { mode: 'Restore', profile, acknowledged: true }), 'RESTORED');
+          assertNativePhase(context, fixture, profile, seeded, 'beforeSha256', phase);
+          assert.deepEqual(treeSnapshot(path.join(fixture.backupRoots[profile], 'original')), backupBefore);
+        }
+        assert.deepEqual(fixture.targetRoots, targetRootsBefore);
+        assert.deepEqual(treeSnapshot(fixture.targetRoots[otherProfile]), otherBefore);
+        assertNoMaintenanceResidue(fixture);
+      }));
+    }
+  }
+  assert.equal(ownedRoots.size, 0);
+});
