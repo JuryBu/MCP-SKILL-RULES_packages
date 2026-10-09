@@ -442,7 +442,9 @@ test("内部 RPC 不泄漏或投影，hidden busy wake 过滤与 Desktop reasoni
     const steer = internalRequests[2].message;
     assert.deepEqual(steer.params, {
       threadId: "transport-hidden-thread", input: [{ type: "text", text: prompt }], expectedTurnId: "transport-hidden-turn",
+      clientUserMessageId: steer.params.clientUserMessageId,
     });
+    assert.match(steer.params.clientUserMessageId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
     context.diagnostic(JSON.stringify({
       label: "隔离 hidden wake 内部请求",
       originalUtf8: internalRequests.map((entry) => entry.bytes.toString("utf8")),
@@ -458,7 +460,7 @@ test("内部 RPC 不泄漏或投影，hidden busy wake 过滤与 Desktop reasoni
     const genuineUser = { type: "userMessage", id: "genuine-first-user", content: [{ type: "text", text: "原始用户消息" }] };
     const genuine = await fixture.deliver(connection, "真实用户项", completion(genuineUser, "transport-hidden-thread", "transport-hidden-turn"));
     assertBytePass(context, "真实用户项", genuine.original, genuine.received, genuineUser, genuine.received.message.params.item);
-    const hiddenUser = { type: "userMessage", id: "hidden-wake-user", content: [{ type: "text", text: prompt }] };
+    const hiddenUser = { type: "userMessage", id: "hidden-wake-user", clientId: steer.params.clientUserMessageId, content: [{ type: "text", text: prompt }] };
     const beforeHidden = connection.downstreamFrames.length;
     for (const method of ["item/started", "item/completed"]) {
       const hiddenMessage = { ...completion(hiddenUser, "transport-hidden-thread", "transport-hidden-turn"), method };

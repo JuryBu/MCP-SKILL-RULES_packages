@@ -16,7 +16,7 @@ function send(message) {
 
 function runFakeAppServer(mode) {
   let inputBuffer = "";
-  let running = mode === "busy";
+  let running = mode === "busy" || mode === "notify-item-completed";
   const log = (value) => process.stderr.write(`fake:${value}\n`);
   const resumeResult = (threadId) => ({
     thread: {
@@ -36,16 +36,81 @@ function runFakeAppServer(mode) {
       send({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: "test" } });
       return;
     }
-    if (message.method === "thread/resume") {
+    if (message.method === "thread/read" || message.method === "thread/resume") {
       if (mode === "rpc-error") {
         send({
           jsonrpc: "2.0",
           id: message.id,
-          error: { code: -32004, message: "thread not found" },
+          error: { code: -32004, message: `thread not found: ${message.params.threadId}` },
         });
         return;
       }
+      const readErrors = {
+        "rpc-method-error": { code: -32601, message: "thread/read: method not found" },
+        "rpc-storage-error": { code: -32603, message: "thread storage: database missing required table" },
+        "rpc-unloaded-error": { code: -32602, message: `thread not loaded: ${message.params.threadId}` },
+        "rpc-wrong-missing-id": { code: -32602, message: "thread not found: unrelated-thread" },
+      };
+      if (readErrors[mode]) {
+        send({ jsonrpc: "2.0", id: message.id, error: readErrors[mode] });
+        return;
+      }
+      const invalidSummaries = {
+        "null-summary": null,
+        "missing-summary": {},
+        "array-summary": { thread: [] },
+        "missing-id-summary": { thread: { status: { type: "idle" } } },
+        "wrong-id-summary": { thread: { id: "unrelated-thread", status: { type: "idle" }, metadata: { id: message.params.threadId, status: "idle" } } },
+      };
+      if (Object.hasOwn(invalidSummaries, mode)) {
+        send({ jsonrpc: "2.0", id: message.id, result: invalidSummaries[mode] });
+        return;
+      }
+      if (mode === "wrong-resume-summary" && message.method === "thread/resume") {
+        send({ jsonrpc: "2.0", id: message.id, result: { thread: { id: "unrelated-thread", status: { type: "idle" } } } });
+        return;
+      }
+      const conflictingTypes = {
+        "summary-priority-active": "active",
+        "summary-priority-system-error": "systemError",
+        "summary-priority-found-false": "active",
+        "summary-priority-future-notfound": "futureNotFoundReason",
+        "summary-priority-object-busy": "busy",
+        "resume-priority-active": "active",
+        "resume-priority-system-error": "systemError",
+      };
+      if (Object.hasOwn(conflictingTypes, mode)) {
+        const type = mode.startsWith("resume-priority-") && message.method === "thread/read"
+          ? "notLoaded" : conflictingTypes[mode];
+        send({ jsonrpc: "2.0", id: message.id, result: {
+          threadId: message.params.threadId,
+          status: "idle",
+          ...(mode === "summary-priority-found-false" ? { found: false } : {}),
+          thread: { id: message.params.threadId, status: { type } },
+        } });
+        return;
+      }
+      if (message.method === "thread/read" && (mode === "not-loaded" || mode === "system-error")) {
+        send({ jsonrpc: "2.0", id: message.id, result: { thread: {
+          id: message.params.threadId,
+          status: { type: mode === "not-loaded" ? "notLoaded" : "systemError" },
+          turns: [{ id: "old-completed", status: "completed" }],
+        } } });
+        return;
+      }
+      if (message.method === "thread/resume" && mode === "resume-busy") running = true;
       send({ jsonrpc: "2.0", id: message.id, result: resumeResult(message.params.threadId) });
+      if (message.method === "thread/read" && mode.startsWith("notify-")) {
+        setTimeout(() => send(mode === "notify-item-completed" ? {
+          method: "item/completed",
+          params: { threadId: message.params.threadId, item: { id: "tool-item", type: "commandExecution", status: "completed" } },
+        } : mode === "notify-closed" ? {
+          method: "thread/closed", params: { threadId: message.params.threadId },
+        } : {
+          method: "thread/status/changed",
+          params: { threadId: message.params.threadId, status: { type: mode === "notify-not-loaded" ? "notLoaded" : "systemError" } },
+        }), 10);
+      }
       return;
     }
     if (message.method === "turn/start") {
@@ -143,7 +208,104 @@ function createFixture(mode, overrides = {}) {
 if (fakeArgumentIndex >= 0) {
   runFakeAppServer(process.argv[fakeArgumentIndex + 1] || "complete");
 } else {
-  test("handshake, resume/read, wake accepted, and completion state", async () => {
+  for (const [mode, inspectedStatus, outcome, resumed] of [
+    ["summary-priority-active", "busy", "busy", false],
+    ["summary-priority-system-error", "system_error", "unknown", false],
+    ["summary-priority-found-false", "busy", "busy", false],
+    ["summary-priority-future-notfound", "unknown", "unknown", false],
+    ["summary-priority-object-busy", "unknown", "unknown", false],
+    ["resume-priority-active", "not_loaded", "busy", true],
+    ["resume-priority-system-error", "not_loaded", "unknown", true],
+  ]) {
+    test(`direct ${mode} keeps the validated official summary and never submits a conflicting turn`, async () => {
+      const fixture = createFixture(mode);
+      try {
+        const inspected = await fixture.bridge.inspectThread("thread-target");
+        assert.equal(inspected.status, inspectedStatus);
+        assert.equal(inspected.found, true);
+        const result = await fixture.bridge.wake({ threadId: "thread-target", prompt: "fixture input" });
+        assert.equal(result.outcome, outcome);
+        const log = fixture.stderr.join("");
+        assert.equal(log.includes("fake:thread/resume"), resumed);
+        assert.doesNotMatch(log, /fake:turn\/start|fake:turn\/steer/);
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
+  for (const [type, expected] of [["active", "busy"], ["systemError", "system_error"], ["futureNotFoundReason", "unknown"], ["busy", "unknown"]]) {
+    test(`transparent official ${type} has priority over a same-id wrapper and false existence`, async () => {
+      const bridge = createCodexThreadBridge({
+        mode: "transparent_proxy", controlToken: "fixture-token",
+        fetchImpl: async () => new Response(JSON.stringify({
+          threadId: "thread-target", status: "idle", found: false,
+          thread: { id: "thread-target", status: { type } },
+        }), { status: 200 }),
+      });
+      try {
+        const inspected = await bridge.inspectThread("thread-target");
+        assert.equal(inspected.status, expected);
+        assert.equal(inspected.found, true);
+        assert.equal(inspected.thread.status.type, type);
+      } finally {
+        await bridge.close();
+      }
+    });
+  }
+
+  for (const mode of ["null-summary", "missing-summary", "array-summary", "missing-id-summary", "wrong-id-summary"]) {
+    test(`direct ${mode} is rejected without resume or turn submission`, async () => {
+      const fixture = createFixture(mode);
+      try {
+        await assert.rejects(() => fixture.bridge.inspectThread("thread-target"), { code: "INVALID_THREAD_SUMMARY" });
+        await assert.rejects(() => fixture.bridge.wake({ threadId: "thread-target", prompt: "fixture input" }), { code: "INVALID_THREAD_SUMMARY" });
+        assert.doesNotMatch(fixture.stderr.join(""), /fake:thread\/resume|fake:turn\/start|fake:turn\/steer/);
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
+  test("direct rejects a mismatched resume summary before turn submission", async () => {
+    const fixture = createFixture("wrong-resume-summary");
+    try {
+      await assert.rejects(() => fixture.bridge.wake({ threadId: "thread-target", prompt: "fixture input" }), { code: "INVALID_THREAD_SUMMARY" });
+      assert.match(fixture.stderr.join(""), /fake:thread\/resume/);
+      assert.doesNotMatch(fixture.stderr.join(""), /fake:turn\/start|fake:turn\/steer/);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  for (const mode of ["rpc-method-error", "rpc-storage-error", "rpc-unloaded-error", "rpc-wrong-missing-id"]) {
+    test(`direct ${mode} preserves the RPC error instead of claiming a missing thread`, async () => {
+      const fixture = createFixture(mode);
+      try {
+        await assert.rejects(() => fixture.bridge.inspectThread("thread-target"), { code: "APP_SERVER_RPC_ERROR" });
+        assert.doesNotMatch(fixture.stderr.join(""), /fake:thread\/resume|fake:turn\/start/);
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
+  for (const [mode, status] of [["notify-not-loaded", "not_loaded"], ["notify-system-error", "system_error"], ["notify-closed", "not_loaded"], ["notify-item-completed", "busy"]]) {
+    test(`direct ${mode} retains thread existence and correct runtime state`, async () => {
+      const fixture = createFixture(mode);
+      try {
+        await fixture.bridge.inspectThread("thread-target");
+        await sleep(35);
+        const state = fixture.bridge.status().threads.find(entry => entry.threadId === "thread-target");
+        assert.equal(state.status, status);
+        assert.equal(state.found, true);
+      } finally {
+        await fixture.close();
+      }
+    });
+  }
+
+  test("handshake, read-only inspection, resumed wake, and completion state", async () => {
     const fixture = createFixture("complete", {
       requestTimeoutMs: 1000,
       startTimeoutMs: fixtureStartTimeoutMs,
@@ -152,6 +314,9 @@ if (fakeArgumentIndex >= 0) {
       const initial = await fixture.bridge.inspectThread("thread-example-primary");
       assert.equal(initial.status, "idle");
       assert.equal(initial.found, true);
+      await fixture.bridge.inspectThread("thread-example-primary");
+      assert.match(fixture.stderr.join(""), /fake:thread\/read:\{"threadId":"thread-example-primary","includeTurns":false\}/);
+      assert.doesNotMatch(fixture.stderr.join(""), /fake:thread\/resume|fake:turn\/start|fake:turn\/steer/);
 
       const wake = await fixture.bridge.wake({
         threadId: "thread-example-primary",
@@ -189,6 +354,48 @@ if (fakeArgumentIndex >= 0) {
     }
   });
 
+  test("direct inspection leaves a stored thread unloaded and a real wake resumes it", async () => {
+    const fixture = createFixture("not-loaded");
+    try {
+      const state = await fixture.bridge.inspectThread("thread-stored");
+      assert.equal(state.status, "not_loaded");
+      assert.equal(state.found, true);
+      assert.doesNotMatch(fixture.stderr.join(""), /fake:thread\/resume|fake:turn\/start/);
+      const result = await fixture.bridge.wake({ threadId: "thread-stored", prompt: "fixture wake" });
+      assert.equal(result.outcome, "accepted");
+      const log = fixture.stderr.join("");
+      assert.ok(log.indexOf("fake:thread/resume") < log.indexOf("fake:turn/start"));
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("direct wake rechecks resumed state before starting a turn", async () => {
+    const fixture = createFixture("resume-busy");
+    try {
+      const result = await fixture.bridge.wake({ threadId: "thread-raced", prompt: "fixture wake" });
+      assert.equal(result.outcome, "busy");
+      assert.match(fixture.stderr.join(""), /fake:thread\/resume/);
+      assert.doesNotMatch(fixture.stderr.join(""), /fake:turn\/start/);
+    } finally {
+      await fixture.close();
+    }
+  });
+
+  test("systemError is preserved despite a completed historical turn and never resumes", async () => {
+    const fixture = createFixture("system-error");
+    try {
+      const state = await fixture.bridge.inspectThread("thread-system-error");
+      assert.equal(state.status, "system_error");
+      assert.equal(state.found, true);
+      const result = await fixture.bridge.wake({ threadId: "thread-system-error", prompt: "fixture wake" });
+      assert.equal(result.outcome, "unknown");
+      assert.doesNotMatch(fixture.stderr.join(""), /fake:thread\/resume|fake:turn\/start/);
+    } finally {
+      await fixture.close();
+    }
+  });
+
   test("wake does not start a second turn while the thread is busy", async () => {
     const fixture = createFixture("busy");
     try {
@@ -209,7 +416,7 @@ if (fakeArgumentIndex >= 0) {
     }
   });
 
-  test("resume RPC not-found response becomes a stable not_found state", async () => {
+  test("read RPC not-found response becomes a stable not_found state", async () => {
     const fixture = createFixture("rpc-error");
     try {
       const state = await fixture.bridge.inspectThread("thread-missing");
@@ -349,7 +556,7 @@ if (fakeArgumentIndex >= 0) {
     }
   });
 
-  test("transparent proxy bridge interprets existing resume payloads without proxy changes", async () => {
+  test("transparent proxy bridge retains legacy payload parsing without a runtime thread status", async () => {
     const responses = [
       { threadId: "thread-proxy", results: [{ thread: { id: "thread-proxy", turns: [{ status: "in_progress" }] } }] },
       { threadId: "thread-proxy", results: [{ thread: { id: "thread-proxy", turns: [{ status: "completed" }] } }] },

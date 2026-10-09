@@ -8,7 +8,7 @@ function notification(id, text, overrides = {}) {
     params: {
       threadId: "thread-fixture",
       turnId: "turn-fixture",
-      item: { type: "userMessage", id, clientId: null, content: [{ type: "text", text }] },
+      item: { type: "userMessage", id, clientId: `fixture-wake-client-${text}`, content: [{ type: "text", text }] },
     },
     ...overrides,
   };
@@ -17,8 +17,10 @@ function notification(id, text, overrides = {}) {
 function setup(options) {
   const adapter = createWakeVisibilityAdapter(options);
   const view = adapter.createView();
-  const register = (prompt, messageVisibility = "hidden", wakeId = prompt) => adapter.registerWake({
+  const register = (prompt, messageVisibility = "hidden", wakeId = prompt, metadata = {}) => adapter.registerWake({
     threadId: "thread-fixture", wakeId, prompt, messageVisibility,
+    visibilityClientId: `fixture-wake-client-${prompt}`,
+    ...metadata,
   });
   return { adapter, view, register };
 }
@@ -189,4 +191,55 @@ test("state is bounded and connection cleanup releases its turn records", () => 
   adapter.close();
   assert.equal(adapter.snapshot().trackedTurns, 0);
   assert.equal(adapter.snapshot().registeredWakes, 0);
+});
+
+test("an authoritative steer hides the first observed middle wake without its opening event", () => {
+  const { view, register } = setup();
+  register("first-middle", "hidden", "first-middle", { turnId: "turn-fixture", injectionMethod: "turn/steer" });
+  for (const method of ["item/started", "item/completed"]) {
+    assert.equal(view.shouldSuppress(notification("middle", "first-middle", { method })), true);
+  }
+  assert.equal(view.shouldSuppress(notification("human", "original human input")), false);
+});
+
+test("steer evidence is scoped to its turn and visible or explicit-client messages remain visible", () => {
+  const { view, register } = setup();
+  register("middle", "hidden", "middle", { turnId: "different-turn", injectionMethod: "turn/steer" });
+  assert.equal(view.shouldSuppress(notification("middle", "middle")), false);
+  register("visible", "visible", "visible", { turnId: "turn-fixture", injectionMethod: "turn/steer" });
+  assert.equal(view.shouldSuppress(notification("visible", "visible")), false);
+  register("explicit", "hidden", "explicit", { turnId: "turn-fixture", injectionMethod: "turn/steer" });
+  const explicit = notification("explicit", "explicit");
+  explicit.params.item.clientId = "human-client";
+  assert.equal(view.shouldSuppress(explicit), false);
+});
+
+test("history projection hides only matched middle items without changing authoritative history", () => {
+  const { view, register } = setup();
+  register("opening");
+  register("middle", "hidden", "middle", { turnId: "turn-fixture", injectionMethod: "turn/steer", itemKey: JSON.stringify(["thread-fixture", "turn-fixture", "middle"]) });
+  const items = [notification("first", "opening").params.item, notification("middle", "middle").params.item,
+    { id: "assistant", type: "agentMessage", text: "kept" }];
+  const message = { id: 17, result: { thread: { id: "thread-fixture", turns: [{ id: "turn-fixture", items }] } } };
+  const original = structuredClone(message);
+  view.observeRequest({ id: 17, method: "thread/read", params: { threadId: "thread-fixture" } });
+  assert.deepEqual(view.project(message).result.thread.turns[0].items.map(item => item.id), ["first", "assistant"]);
+  assert.deepEqual(message, original);
+  const completion = { method: "turn/completed", params: { threadId: "thread-fixture", turn: message.result.thread.turns[0] } };
+  assert.deepEqual(view.project(completion).params.turn.items.map(item => item.id), ["first", "assistant"]);
+});
+
+test("paged full history is projected while summaries, unrelated replies and mismatched threads pass", () => {
+  const { view, register } = setup();
+  register("middle", "hidden", "middle", { turnId: "turn-fixture", injectionMethod: "turn/steer", itemKey: JSON.stringify(["thread-fixture", "turn-fixture", "middle"]) });
+  const turn = { id: "turn-fixture", itemsView: "full", items: [notification("middle", "middle").params.item] };
+  view.observeRequest({ id: 21, method: "thread/turns/list", params: { threadId: "thread-fixture" } });
+  const page = { id: 21, result: { data: [turn], nextCursor: "next" } };
+  assert.deepEqual(view.project(page).result, { data: [{ ...turn, items: [] }], nextCursor: "next" });
+  for (const requestId of [22, 23]) view.observeRequest({ id: requestId, method: "thread/read", params: { threadId: "thread-fixture" } });
+  const summary = { id: 22, result: { thread: { id: "thread-fixture", turns: [{ ...turn, itemsView: "summary" }] } } };
+  const wrongThread = { id: 23, result: { thread: { id: "other", turns: [turn] } } };
+  assert.equal(view.project(summary), summary);
+  assert.equal(view.project(wrongThread), wrongThread);
+  assert.equal(view.project(page), page);
 });

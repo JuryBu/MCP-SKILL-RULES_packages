@@ -50,17 +50,19 @@ test("real WebSocket forwarding hides only registered middle wakes across Deskto
     if (message.method === "initialize") respond({});
     else if (message.method === "thread/resume") {
       respond({ thread: { id: threadId, status: { type: history.length ? "active" : "idle" }, turns: [] } });
-    } else if (message.method === "turn/start") {
+    } else if (message.method === "thread/turns/list") {
+      respond({ data: [{ id: turnId, status: "inProgress", items: [], itemsView: "notLoaded" }] });
+    } else if (["turn/start", "turn/steer"].includes(message.method)) {
       requests.push(structuredClone(message.params));
       if (!history.length) notify({ method: "turn/started", params: { threadId, turn: { id: turnId, status: "inProgress", items: [] } } });
       emitUser(`wake-item-${requests.length}`, message.params.input, message.params.clientUserMessageId ?? null);
-      respond({ turn: { id: turnId, status: "inProgress" } });
+      respond(message.method === "turn/steer" ? { turnId } : { turn: { id: turnId, status: "inProgress" } });
     } else if (message.method === "thread/read") {
       respond({ thread: { id: threadId, turns: [{ id: turnId, items: history, status: "inProgress" }] } });
     }
   }));
   const journalPath = path.join(root, "wake-journal.json");
-  const proxy = createCodexAppServerProxy({
+  let proxy = createCodexAppServerProxy({
     upstreamUrl: `ws://127.0.0.1:${upstreamPort}`, downstreamPort, controlPort,
     controlToken: "transport-fixture", journal: createWakeJournal({ filePath: journalPath }),
   });
@@ -117,8 +119,25 @@ test("real WebSocket forwarding hides only registered middle wakes across Deskto
   desktops[0].socket.send(JSON.stringify({ jsonrpc: "2.0", id: 99, method: "thread/read", params: { threadId } }));
   await waitFor(() => desktops[0].messages.some(message => message.id === 99));
   const persisted = desktops[0].messages.find(message => message.id === 99).result.thread.turns[0].items;
-  assert.deepEqual(persisted, history);
-  assert.equal(persisted.some(item => item.id === "wake-item-2"), true);
+  assert.deepEqual(persisted, history.filter(item => item.id !== "wake-item-2"));
+  assert.equal(persisted.some(item => item.id === "wake-item-2"), false);
+  assert.equal(history.some(item => item.id === "wake-item-2"), true);
+  await proxy.close();
+  proxy = createCodexAppServerProxy({
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`, downstreamPort, controlPort,
+    controlToken: "transport-fixture", journal: createWakeJournal({ filePath: journalPath }),
+  });
+  await proxy.start();
+  const restoredSocket = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  const restoredMessages = [];
+  desktops.push({ socket: restoredSocket, messages: restoredMessages });
+  restoredSocket.on("message", data => restoredMessages.push(JSON.parse(data.toString("utf8"))));
+  await new Promise((resolve, reject) => { restoredSocket.once("open", resolve); restoredSocket.once("error", reject); });
+  restoredSocket.send(JSON.stringify({ id: 100, method: "initialize", params: {} }));
+  await waitFor(() => proxy.status().readyClientCount === 1);
+  restoredSocket.send(JSON.stringify({ id: 101, method: "thread/read", params: { threadId } }));
+  await waitFor(() => restoredMessages.some(message => message.id === 101));
+  assert.deepEqual(restoredMessages.find(message => message.id === 101).result.thread.turns[0].items, persisted);
   const journal = JSON.parse(fs.readFileSync(journalPath, "utf8"));
   assert.equal(Object.values(journal.wakes).every(wake => wake.status === "accepted"), true);
 });

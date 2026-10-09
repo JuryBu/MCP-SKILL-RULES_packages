@@ -416,6 +416,8 @@ test("wake visibility only controls client ids while busy and idle injection sem
           },
         },
       }));
+    } else if (message.method === "thread/turns/list") {
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { data: [] } }));
     } else if (message.method === "turn/steer") {
       steerRequests.push(message.params);
       socket.send(JSON.stringify({
@@ -508,7 +510,7 @@ test("wake visibility only controls client ids while busy and idle injection sem
   assert.equal(hiddenIdle.messageVisibility, "hidden");
   assert.equal(hiddenIdle.clientUserMessageId, null);
   assert.equal(startRequests.length, 2);
-  assert.equal(Object.hasOwn(startRequests[1], "clientUserMessageId"), false);
+  assert.match(startRequests[1].clientUserMessageId, /^[0-9a-f-]{36}$/i);
 
   const busyWithoutTurnId = await proxy.wakeThread({
     ...wake,
@@ -540,7 +542,7 @@ test("wake visibility only controls client ids while busy and idle injection sem
   assert.equal(startRequests.length, 2);
   assert.equal(steerRequests.length, 2);
   assert.equal(steerRequests[1].expectedTurnId, "active-turn-1");
-  assert.equal(Object.hasOwn(steerRequests[1], "clientUserMessageId"), false);
+  assert.match(steerRequests[1].clientUserMessageId, /^[0-9a-f-]{36}$/i);
 
   const state = JSON.parse(fs.readFileSync(journalPath, "utf8"));
   assert.equal(state.wakes["wake-visible"].clientUserMessageId, visible.clientUserMessageId);

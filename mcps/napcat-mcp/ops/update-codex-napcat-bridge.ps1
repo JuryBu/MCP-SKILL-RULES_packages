@@ -342,7 +342,9 @@ function Assert-BackendOnlyCompatible {
   }
   $LoadedProxyPaths = @(
     "src\codex-app-server-proxy.mjs",
-    "src\codex-app-server-proxy-runner.mjs"
+    "src\codex-app-server-proxy-runner.mjs",
+    "src\wake-visibility.mjs",
+    "src\reasoning-placeholder.mjs"
   )
   $NextStartProxyPaths = @(
     "src\codex-model-stream-proxy.mjs",

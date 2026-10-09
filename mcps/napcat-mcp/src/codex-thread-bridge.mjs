@@ -81,18 +81,28 @@ function readWakeMessageVisibility(bindingPath, fsImpl = fs) {
 }
 
 function normalizeProtocolStatus(value) {
-  if (typeof value !== "string") return "";
-  return value.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  const status = isObject(value) ? value.type : value;
+  if (typeof status !== "string") return "";
+  return status.trim().toLowerCase().replace(/[\s_-]+/g, "");
 }
 
 function bridgeStatusFromProtocolStatus(value) {
   const normalized = normalizeProtocolStatus(value);
   if (!normalized) return null;
-  if (normalized.includes("notfound") || normalized === "missing" || normalized === "deleted") {
+  if (isObject(value)) {
+    if (normalized === "idle") return "idle";
+    if (normalized === "active") return "busy";
+    if (normalized === "notloaded") return "not_loaded";
+    if (normalized === "systemerror") return "system_error";
+    return null;
+  }
+  if (normalized === "notfound" || normalized === "missing" || normalized === "deleted") {
     return "not_found";
   }
   if (BUSY_PROTOCOL_STATUSES.has(normalized)) return "busy";
   if (IDLE_PROTOCOL_STATUSES.has(normalized)) return "idle";
+  if (normalized === "notloaded") return "not_loaded";
+  if (normalized === "systemerror") return "system_error";
   return null;
 }
 
@@ -173,8 +183,12 @@ function responseIndicatesNotFound(value) {
 }
 
 function interpretThreadResponse(threadId, response, source) {
+  const thread = isObject(response?.thread) && response.thread.id === threadId
+    ? response.thread : extractThread(response, threadId);
   let status = "unknown";
-  if (responseIndicatesNotFound(response)) {
+  if (thread && Object.hasOwn(thread, "status")) {
+    status = bridgeStatusFromProtocolStatus(thread.status) ?? "unknown";
+  } else if (responseIndicatesNotFound(response)) {
     status = "not_found";
   } else {
     const statuses = collectProtocolStatuses(response);
@@ -192,9 +206,10 @@ function interpretThreadResponse(threadId, response, source) {
     threadId,
     status,
     busy: status === "busy",
-    found: status === "idle" || status === "busy",
+    found: status !== "not_found" && (Boolean(thread) || threadExistsInPayload(response, threadId)
+      || status === "idle" || status === "busy"),
     source,
-    thread: extractThread(response, threadId),
+    thread,
     raw: response,
   };
 }
@@ -208,13 +223,27 @@ function errorSummary(error) {
   };
 }
 
-function isNotFoundRpcError(error) {
+function validateThreadSummary(threadId, response, method) {
+  if (!isObject(response) || !isObject(response.thread) || response.thread.id !== threadId) {
+    throw new CodexThreadBridgeError(
+      "INVALID_THREAD_SUMMARY",
+      `${method} 未返回匹配目标的对话摘要`,
+      { details: { method, threadId } },
+    );
+  }
+  return response;
+}
+
+function isNotFoundRpcError(error, threadId) {
   if (!(error instanceof CodexThreadBridgeError) || error.code !== "APP_SERVER_RPC_ERROR") {
     return false;
   }
   const rpcError = error.details?.rpcError;
-  const text = `${rpcError?.message ?? ""} ${rpcError?.code ?? ""}`.toLowerCase();
-  return /not[ _-]?found|unknown[ _-]?thread|thread.+does not exist|missing/.test(text);
+  if (![-32602, -32004].includes(rpcError?.code) || typeof rpcError.message !== "string") return false;
+  const escapedId = threadId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const message = rpcError.message.trim();
+  return new RegExp(`^(?:thread not found|unknown thread|thread does not exist):\\s*["']?${escapedId}["']?[.!]?$`, "i").test(message)
+    || new RegExp(`^thread\\s+["']?${escapedId}["']?\\s+(?:not found|does not exist)[.!]?$`, "i").test(message);
 }
 
 function isFile(filePath, fsImpl = fs) {
@@ -375,19 +404,20 @@ class CodexThreadBridge {
     try {
       await this.#ensureStarted();
       const response = await this.#request(
-        "thread/resume",
-        this.makeResumeParams(normalizedThreadId),
+        "thread/read",
+        { threadId: normalizedThreadId, includeTurns: false },
         { threadId: normalizedThreadId },
       );
-      return this.#cacheThreadState(interpretThreadResponse(normalizedThreadId, response, "thread/resume"));
+      validateThreadSummary(normalizedThreadId, response, "thread/read");
+      return this.#cacheThreadState(interpretThreadResponse(normalizedThreadId, response, "thread/read"));
     } catch (error) {
-      if (isNotFoundRpcError(error)) {
+      if (isNotFoundRpcError(error, normalizedThreadId)) {
         return this.#cacheThreadState({
           threadId: normalizedThreadId,
           status: "not_found",
           busy: false,
           found: false,
-          source: "thread/resume",
+          source: "thread/read",
           thread: null,
           raw: error.details?.rpcError ?? null,
         });
@@ -402,7 +432,16 @@ class CodexThreadBridge {
     }
     const threadId = requiredString(input.threadId, "threadId", 256);
     const prompt = requiredString(input.prompt, "prompt", 100000);
-    const current = await this.inspectThread(threadId);
+    let current = await this.inspectThread(threadId);
+    if (current.status === "idle" || current.status === "not_loaded") {
+      const response = await this.#request(
+        "thread/resume",
+        this.makeResumeParams(threadId),
+        { threadId },
+      );
+      validateThreadSummary(threadId, response, "thread/resume");
+      current = this.#cacheThreadState(interpretThreadResponse(threadId, response, "thread/resume"));
+    }
     if (current.status === "busy") {
       return {
         threadId,
@@ -626,19 +665,22 @@ class CodexThreadBridge {
     if (threadId) {
       let status = null;
       const method = message.method.toLowerCase();
-      if (/not[ _/-]?found|deleted/.test(method)) status = "not_found";
-      else if (/completed|failed|cancelled|canceled|stopped|interrupted/.test(method)) status = "idle";
-      else if (/started|running|streaming|updated/.test(method)) status = "busy";
-      if (!status) status = interpretThreadResponse(threadId, params, message.method).status;
-      snapshot = this.#cacheThreadState({
-        threadId,
-        status,
-        busy: status === "busy",
-        found: status === "idle" || status === "busy",
-        source: message.method,
-        thread: extractThread(params, threadId),
-        raw: params,
-      });
+      if (/^thread\/(?:not_found|notfound|deleted)$/.test(method)) status = "not_found";
+      else if (method === "thread/closed") status = "not_loaded";
+      else if (/^turn\/(?:completed|failed|cancelled|canceled|stopped|interrupted)$/.test(method)) status = "idle";
+      else if (method === "turn/started") status = "busy";
+      const threadStateEvent = ["thread/status/changed", "thread/started", "thread/updated"].includes(method);
+      if (status || threadStateEvent) {
+        const interpreted = interpretThreadResponse(threadId, params, message.method);
+        snapshot = this.#cacheThreadState({
+          ...interpreted,
+          status: status ?? interpreted.status,
+          busy: (status ?? interpreted.status) === "busy",
+          found: status ? status !== "not_found" : interpreted.found,
+        });
+      } else {
+        snapshot = this.threadStates.get(threadId) ?? null;
+      }
     }
     try {
       this.onNotification?.(message, snapshot);
@@ -763,7 +805,8 @@ class CodexThreadBridge {
     const snapshot = {
       ...state,
       busy: state.status === "busy" ? true : state.status === "unknown" ? null : false,
-      found: state.status === "idle" || state.status === "busy" ? true : state.status === "unknown" ? null : false,
+      found: Object.hasOwn(state, "found") ? state.found
+        : state.status === "idle" || state.status === "busy" ? true : state.status === "unknown" ? null : false,
     };
     this.threadStates.set(snapshot.threadId, snapshot);
     return snapshot;
@@ -864,8 +907,8 @@ class CodexProxyThreadBridge {
 
   async inspectThread(threadId) {
     const normalizedThreadId = requiredString(threadId, "threadId", 256);
-    const response = await this.#request("/subscribe", { threadId: normalizedThreadId });
-    return interpretThreadResponse(normalizedThreadId, response, "proxy/thread/resume");
+    const response = await this.#request("/v1/threads/inspect", { threadId: normalizedThreadId });
+    return interpretThreadResponse(normalizedThreadId, response, "proxy/thread/read");
   }
 
   async wake(input) {
