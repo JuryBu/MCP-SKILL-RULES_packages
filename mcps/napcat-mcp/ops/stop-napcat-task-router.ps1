@@ -1,7 +1,10 @@
 ﻿[CmdletBinding()]
 param(
   [ValidateRange(1, 120)][int]$WaitSeconds = 15,
-  [string]$DataRoot = ""
+  [string]$DataRoot = "",
+  [string]$StopMarkerProofPath = "",
+  [string]$StopMarkerAttemptId = "",
+  [string]$StopMarkerOperationId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -16,7 +19,17 @@ $RunnerPath = Join-Path $NapCatMcpRoot "src\task-router-runner.mjs"
 
 New-Item -ItemType Directory -Force -Path $StateDirectory | Out-Null
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($StopFilePath, ((Get-Date).ToUniversalTime().ToString("o") + "`n"), $Utf8NoBom)
+$OwnedMarker = $null
+$ProofRequested = -not [string]::IsNullOrWhiteSpace($StopMarkerProofPath)
+if ($ProofRequested -or $StopMarkerAttemptId -or $StopMarkerOperationId) {
+  if (-not $ProofRequested -or -not [IO.Path]::IsPathRooted($StopMarkerProofPath) -or -not $StopMarkerAttemptId -or -not $StopMarkerOperationId) { throw 'INVALID_OWNED_STOP_ARGUMENTS' }
+  if ((Get-Item -LiteralPath $StopMarkerProofPath -ErrorAction Stop).Length -gt 65536) { throw 'STOP_MARKER_PROOF_TOO_LARGE' }
+  . (Join-Path $PSScriptRoot 'owned-stop-marker.ps1')
+  $ProofJson = [IO.File]::ReadAllText($StopMarkerProofPath)
+  $OwnedMarker = Assert-OwnedStopMarkerProof -ProofJson $ProofJson -Path $StopFilePath -Component 'router' -AttemptId $StopMarkerAttemptId -OperationId $StopMarkerOperationId
+} else {
+  [System.IO.File]::WriteAllText($StopFilePath, ((Get-Date).ToUniversalTime().ToString("o") + "`n"), $Utf8NoBom)
+}
 
 $PidValue = 0
 if (Test-Path -LiteralPath $RuntimeStatePath) {
@@ -39,10 +52,13 @@ do {
 
 $OutputPid = if ($PidValue -gt 0) { $PidValue } else { $null }
 $OutputNote = if ($Alive) { "Router is still shutting down; no force kill was used" } else { "Task router stopped" }
-[pscustomobject]@{
+if ($ProofRequested) { $OwnedMarker = Assert-OwnedStopMarkerProof -ProofJson $ProofJson -Path $StopFilePath -Component 'router' -AttemptId $StopMarkerAttemptId -OperationId $StopMarkerOperationId }
+$Output = [pscustomobject]@{
   stopRequested = $true
   stopped = (-not $Alive)
   pid = $OutputPid
   stopFilePath = $StopFilePath
   note = $OutputNote
-} | ConvertTo-Json -Depth 6
+}
+if ($ProofRequested) { $Output | Add-Member -NotePropertyName ownedStopMarker -NotePropertyValue $OwnedMarker }
+$Output | ConvertTo-Json -Depth 6

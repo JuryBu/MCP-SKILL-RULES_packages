@@ -3,7 +3,10 @@ param(
   [string]$DataRoot = "",
   [ValidateRange(1, 120)][int]$TimeoutSeconds = 20,
   [ValidateRange(5, 300)][int]$ChildTimeoutSeconds = 120,
-  [switch]$AllowVerifiedForceStop
+  [switch]$AllowVerifiedForceStop,
+  [string]$StopMarkerProofPath = "",
+  [string]$StopMarkerAttemptId = "",
+  [string]$StopMarkerOperationId = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -30,7 +33,17 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
     $ExpectedUpstreamUrl = [string]$RuntimeState.upstreamUrl
   } catch { $PidValue = $null }
 }
-[System.IO.File]::WriteAllText($StopFilePath, ((Get-Date).ToString("o") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+$OwnedMarker = $null
+$ProofRequested = -not [string]::IsNullOrWhiteSpace($StopMarkerProofPath)
+if ($ProofRequested -or $StopMarkerAttemptId -or $StopMarkerOperationId) {
+  if (-not $ProofRequested -or -not [IO.Path]::IsPathRooted($StopMarkerProofPath) -or -not $StopMarkerAttemptId -or -not $StopMarkerOperationId -or $AllowVerifiedForceStop) { throw 'INVALID_OWNED_STOP_ARGUMENTS' }
+  if ((Get-Item -LiteralPath $StopMarkerProofPath -ErrorAction Stop).Length -gt 65536) { throw 'STOP_MARKER_PROOF_TOO_LARGE' }
+  . (Join-Path $PSScriptRoot 'owned-stop-marker.ps1')
+  $ProofJson = [IO.File]::ReadAllText($StopMarkerProofPath)
+  $OwnedMarker = Assert-OwnedStopMarkerProof -ProofJson $ProofJson -Path $StopFilePath -Component 'proxy' -AttemptId $StopMarkerAttemptId -OperationId $StopMarkerOperationId
+} else {
+  [System.IO.File]::WriteAllText($StopFilePath, ((Get-Date).ToString("o") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+}
 $Deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
 do {
   $Process = if ($null -ne $PidValue) { Get-Process -Id $PidValue -ErrorAction SilentlyContinue } else { $null }
@@ -112,7 +125,8 @@ if ($null -ne $AppServerPid) {
   $ChildStopped = $true
 }
 $ChildWaitSeconds = [Math]::Round(([DateTime]::UtcNow - $ChildWaitStartedAt).TotalSeconds, 3)
-[pscustomobject]@{
+if ($ProofRequested) { $OwnedMarker = Assert-OwnedStopMarkerProof -ProofJson $ProofJson -Path $StopFilePath -Component 'proxy' -AttemptId $StopMarkerAttemptId -OperationId $StopMarkerOperationId }
+$Output = [pscustomobject]@{
   stopped = $ProxyStopped
   clean = ($ProxyStopped -and $ChildStopped)
   pid = $PidValue
@@ -127,4 +141,6 @@ $ChildWaitSeconds = [Math]::Round(([DateTime]::UtcNow - $ChildWaitStartedAt).Tot
   childWaitSeconds = $ChildWaitSeconds
   staleListener = $StaleListener
   orphanedListener = ($null -ne $ChildListenerRemaining -and $ChildListenerOwnerAlive)
-} | ConvertTo-Json -Depth 6
+}
+if ($ProofRequested) { $Output | Add-Member -NotePropertyName ownedStopMarker -NotePropertyValue $OwnedMarker }
+$Output | ConvertTo-Json -Depth 6

@@ -7,7 +7,8 @@ param(
   [ValidateRange(1, 65535)][int]$ProbePort = 18434,
   [ValidateRange(250, 300000)][int]$ResumeTimeoutMs = 120000,
   [ValidateRange(1000, 120000)][int]$StartTimeoutMs = 45000,
-  [ValidateRange(30, 300)][int]$StartupTimeoutSeconds = 120
+  [ValidateRange(30, 300)][int]$StartupTimeoutSeconds = 120,
+  [switch]$RequireNoStopMarker
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,7 @@ $FallbackFilePath = Join-Path $StateRoot "codex-app-server-proxy-fallback.json"
 
 if (-not (Test-Path -LiteralPath $RunnerPath)) { throw "Missing Codex App Server proxy runner: $RunnerPath" }
 New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
+if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 
 function Test-ExpectedProxyRuntime {
   param($RuntimeState, $ProcessInfo)
@@ -70,7 +72,10 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
   }
 }
 
-if (Test-Path -LiteralPath $StopFilePath) { Remove-Item -LiteralPath $StopFilePath -Force }
+if (Test-Path -LiteralPath $StopFilePath) {
+  if ($RequireNoStopMarker) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
+  Remove-Item -LiteralPath $StopFilePath -Force
+}
 
 function Resolve-NodeExecutable {
   $ConfiguredNode = [string]$env:CODEX_TOOLKIT_NODE_EXE
@@ -152,6 +157,7 @@ $Arguments = @(
   "--resume-timeout-ms", ([string]$ResumeTimeoutMs)
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
+if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
 
 $RuntimeState = $null

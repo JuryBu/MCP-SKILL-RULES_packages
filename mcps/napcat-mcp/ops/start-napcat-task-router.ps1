@@ -2,7 +2,8 @@
 param(
   [ValidateRange(1, 3600)][int]$IntervalSeconds = 30,
   [string]$DataRoot = "",
-  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT
+  [string]$BrokerRoot = $env:CODEX_TOOLKIT_BROKER_ROOT,
+  [switch]$RequireNoStopMarker
 )
 
 $ErrorActionPreference = "Stop"
@@ -22,6 +23,7 @@ $StopFilePath = Join-Path $DataRoot "state\task-router.stop"
 $LockPath = Join-Path $DataRoot "state\task-router.lock"
 $MaintenanceFilePath = Join-Path $DataRoot "state\task-router.maintenance.json"
 $AlertFilePath = Join-Path $DataRoot "state\automation-alert.json"
+if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 
 foreach ($RequiredPath in @($RunnerPath, $PrivateEnvPath, $BindingPath)) {
   if (-not (Test-Path -LiteralPath $RequiredPath)) { throw "缺少任务路由运行文件：$RequiredPath" }
@@ -62,7 +64,10 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
 }
 
 New-Item -ItemType Directory -Force -Path (Join-Path $DataRoot "state") | Out-Null
-if (Test-Path -LiteralPath $StopFilePath) { Remove-Item -LiteralPath $StopFilePath -Force }
+if (Test-Path -LiteralPath $StopFilePath) {
+  if ($RequireNoStopMarker) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
+  Remove-Item -LiteralPath $StopFilePath -Force
+}
 function Resolve-NodeExecutable {
   $ConfiguredNode = [string]$env:CODEX_TOOLKIT_NODE_EXE
   if (-not [string]::IsNullOrWhiteSpace($ConfiguredNode) -and (Test-Path -LiteralPath $ConfiguredNode -PathType Leaf)) {
@@ -107,6 +112,7 @@ $Arguments = @(
   "--private-env", $PrivateEnvPath
 )
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
+if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
 
 $RuntimeState = $null
