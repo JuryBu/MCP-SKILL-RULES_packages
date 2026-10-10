@@ -89,6 +89,69 @@ function createStoppingServiceOptions(paths, child, terminateChild) {
   };
 }
 
+test("existing stop requirement is preserved before runner startup", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-existing-stop-"));
+  const paths = runtimePaths(root);
+  const original = "external owner stop\n";
+  try {
+    fs.writeFileSync(paths.stopFilePath, original);
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      createProxy: () => { throw new Error("must not start proxy"); },
+    });
+    assert.equal(result.state, "failed");
+    assert.equal(result.error.code, "STOP_REQUIREMENT_STILL_PRESENT");
+    assert.equal(fs.readFileSync(paths.stopFilePath, "utf8"), original);
+    assert.equal(fs.existsSync(paths.lockPath), false);
+    assert.equal(fs.existsSync(paths.tokenFilePath), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+for (const replaceDuringClose of [false, true]) {
+  test(`runner shutdown preserves externally owned stop and releases own lock: replacement=${replaceDuringClose}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-owned-stop-"));
+    const paths = runtimePaths(root);
+    const child = createChildThatRequiresForceVerification();
+    let stopDeleteAttempts = 0;
+    const guardedFs = {
+      ...fs,
+      rmSync(target, options) {
+        if (path.resolve(target) === paths.stopFilePath) {
+          stopDeleteAttempts += 1;
+          throw Object.assign(new Error("externally held stop"), { code: "EPERM" });
+        }
+        return fs.rmSync(target, options);
+      },
+    };
+    try {
+      const result = await runCodexAppServerProxyService({
+        ...createStoppingServiceOptions(paths, child, async (managedChild) => {
+          managedChild.exitCode = 0;
+          managedChild.emit("exit", 0, null);
+        }),
+        fsImpl: guardedFs,
+        createProxy: () => ({
+          ...createProxyStub(),
+          async close() {
+            if (replaceDuringClose) fs.writeFileSync(paths.stopFilePath, "new independent stop\n");
+          },
+        }),
+      });
+      assert.equal(result.state, "stopped");
+      assert.equal(stopDeleteAttempts, 0);
+      assert.equal(fs.readFileSync(paths.stopFilePath, "utf8"), replaceDuringClose ? "new independent stop\n" : "stop\n");
+      assert.equal(fs.existsSync(paths.lockPath), false);
+      const runtime = JSON.parse(fs.readFileSync(paths.runtimeStatePath, "utf8"));
+      assert.equal(runtime.state, "stopped");
+      assert.equal(runtime.appServerPid, null);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("parseArguments requires all durable state paths", () => {
   const root = path.resolve("test-root");
   const argumentsList = [
@@ -578,6 +641,7 @@ test("managed runner retains the complete Desktop runtime after its source direc
     assert.notEqual(launchedPaths[0], sourceExecutable);
     assert.equal(companionAvailableAfterDeletion, true);
     const restartedPaths = [];
+    fs.rmSync(paths.stopFilePath);
     const restartedChild = createChildThatRequiresForceVerification((processHandle) => {
       processHandle.exitCode = 137;
       processHandle.emit("exit", 137, "SIGKILL");

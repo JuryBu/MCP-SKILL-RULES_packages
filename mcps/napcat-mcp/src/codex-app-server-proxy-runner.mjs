@@ -763,6 +763,9 @@ export async function runCodexAppServerProxyService(options = {}) {
   const startedAt = now().toISOString();
   const startupBudgetMs = options.startupBudgetMs ?? DEFAULT_STARTUP_BUDGET_MS;
   const startupDeadlineAt = Date.now() + startupBudgetMs;
+  if (fsImpl.existsSync(options.stopFilePath)) {
+    return { state: "failed", pid, error: { code: "STOP_REQUIREMENT_STILL_PRESENT", message: "The existing stop requirement must be resolved by its owner before starting." } };
+  }
   const lock = acquireInstanceLock(options.lockPath, {
     fsImpl,
     pid,
@@ -787,7 +790,10 @@ export async function runCodexAppServerProxyService(options = {}) {
     },
   });
   if (!lock.acquired) return { state: "duplicate", pid, existingLock: lock.existing };
-  fsImpl.rmSync(options.stopFilePath, { force: true });
+  if (fsImpl.existsSync(options.stopFilePath)) {
+    lock.release();
+    return { state: "failed", pid, error: { code: "STOP_REQUIREMENT_STILL_PRESENT", message: "A stop requirement appeared while acquiring the instance lock." } };
+  }
   const controlToken = ensureControlToken(options.tokenFilePath, fsImpl);
   const previous = readJsonObject(options.runtimeStatePath, fsImpl);
   let currentExecutable = null;
@@ -1249,7 +1255,6 @@ export async function runCodexAppServerProxyService(options = {}) {
         error: publicError(error),
       });
     }
-    if (ownsLock()) fsImpl.rmSync(options.stopFilePath, { force: true });
     if (ownsLock() && !shutdownError && status.state !== "degraded") {
       persist({
         state: "stopped",
