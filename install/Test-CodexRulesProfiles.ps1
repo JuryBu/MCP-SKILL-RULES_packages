@@ -59,8 +59,30 @@ function Assert-Guidance {
     }
     Assert-Contains $engineeringText "automation_update" "$Profile persistent continuation tool"
     Assert-Contains $engineeringText "10$([char]0xff5e)30" "$Profile recurring continuation interval"
-    Assert-Contains $engineeringText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5Li757q/5a6M5oiQ5YmN5L+d5oyB5pyJ5pWI"))) "$Profile continuation lifetime"
-    Assert-Contains $agentsText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5LiN6IO95Zug5pS25Yiw5LiA5Liq5Zue5YyF"))) "$Profile reply does not end mainline"
+    foreach ($continuationMarker in @(
+        '\u4e0d\u628a\u53ef\u6267\u884c\u5de5\u4f5c\u7559\u5230\u4e0b\u6b21\u5b9a\u65f6\u5524\u9192',
+        '\u542f\u505c\u5747\u6309\u8be5\u4e13\u9898\u6838\u9a8c',
+        '\u4e00\u6b21\u6027\u56de\u5305\u63d0\u9192\u4e0d\u80fd\u66ff\u4ee3\u6574\u6761\u4e3b\u7ebf\u6062\u590d\u5b89\u6392'
+    )) {
+        Assert-Contains $agentsText ([regex]::Unescape($continuationMarker)) "$Profile mainline continuation contract"
+    }
+    foreach ($continuationMarker in @(
+        '\u6bcf\u6b21\u4e2d\u671f\u6392\u671f\u5ba1\u67e5',
+        '\u771f\u5b9e\u6267\u884c\u533a\u95f4',
+        '\u6bcf\u6b21\u4e2d\u671f\u8def\u7ebf\u5ba1\u67e5',
+        '\u6536\u5230\u62a5\u544a\u540e\u5f53\u8f6e\u5904\u7406\u53ef\u6267\u884c\u610f\u89c1',
+        '\u7981\u6b62\u4e3b\u52a8\u7ed3\u675f\u5f53\u524d\u8f6e\u6b21',
+        '\u6709\u53ef\u63a8\u8fdb\u5de5\u4f5c\uff0c\u6216\u5065\u5eb7\u4efb\u52a1\u4ecd\u5728\u8fd0\u884c',
+        '\u6c47\u62a5\u540e\u6682\u505c',
+        '\u5b9e\u9645\u6682\u505c\u5bf9\u5e94\u7eed\u63a5\u4efb\u52a1\u5e76\u8bfb\u56de\u72b6\u6001',
+        '\u4e0d\u5173\u95ed\u534f\u4f5c\u901a\u9053\u3001\u4e0d\u786e\u8ba4\u672a\u5b8c\u6210\u6d88\u606f\u3001\u4e0d\u5f71\u54cd\u5176\u5b83\u5065\u5eb7\u5de5\u4f5c'
+    )) {
+        Assert-Contains $engineeringText ([regex]::Unescape($continuationMarker)) "$Profile continuation lifecycle and effective review"
+    }
+    $obsoleteLifetime = [regex]::Unescape('\u5b8c\u6210\u524d\u4fdd\u6301\u6709\u6548')
+    if ($agentsText.Contains($obsoleteLifetime) -or $engineeringText.Contains($obsoleteLifetime)) {
+        throw "$Profile retains an unconditional continuation lifetime"
+    }
     Assert-Contains $bridgeText ([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String("5pS25Yiw5Zue5YyF5ZCO5pu05paw5qOA5p+l54K5"))) "$Profile bridge updates mainline checkpoint"
     foreach ($marker in @("stage_guard", "sandbox_council")) {
         Assert-Contains $agentsText $marker "$Profile core boundary"
