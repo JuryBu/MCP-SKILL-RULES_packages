@@ -186,8 +186,17 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-10-08.1" "$Profile core content revision"
-    Assert-Contains $promptText "2026-10-08.1" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-10-11.1" "$Profile core content revision"
+    Assert-Contains $promptText "2026-10-11.1" "$Profile prompt content revision"
+    foreach ($recentExchangeMarker in @(
+        '\u6b63\u6587\u4ec5\u4fdd\u7559\u6700\u8fd1\u004b\u6b21\u771f\u5b9e\u4ea4\u6d41\u7684\u5b8c\u6574\u8bb0\u5f55',
+        '\u8d85\u51fa\u004b\u8303\u56f4\u7684\u65e7\u4ea4\u6d41',
+        '\u4fdd\u7559\u539f\u6587\u68c0\u7d22\u5165\u53e3',
+        '\u5c1a\u672a\u89e3\u51b3\u7684\u65e7\u8981\u6c42\u6301\u7eed\u4fdd\u7559\u5728\u5f85\u7b54\u533a',
+        '\u7981\u6b62\u628a\u8fd1\u51b5\u7ef4\u62a4\u6210\u65e0\u9650\u589e\u957f\u7684\u5386\u53f2\u5168\u6587'
+    )) {
+        Assert-Contains $promptText ([regex]::Unescape($recentExchangeMarker)) "$Profile bounded recent exchanges and archive readability"
+    }
     Assert-Contains $agentsText ([regex]::Unescape('\u540c\u4e00\u57fa\u7ebf\u4e0b\u7684\u5185\u5bb9\u66f4\u65b0\u4e5f\u6309\u65b0\u4fee\u8ba2\u5b8c\u6574\u8bfb\u53d6')) "$Profile same-baseline reread guard"
     Assert-Contains $observerText "nextProbeAt" "$Profile observer due time"
     Assert-Contains $observerText ([regex]::Unescape('20\u5206\u949f\u7eed\u63a5\u4f1a\u4f7f\u5230\u671f\u68c0\u67e5\u63a8\u8fdf\u523040\u5206\u949f')) "$Profile observer cadence mismatch"
