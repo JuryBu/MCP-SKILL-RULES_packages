@@ -539,7 +539,7 @@ const tools = [
   },
   {
     name: "napcat_send_file",
-    description: "向 binding 固定 ExampleGroup 群上传一个本机文件；提供 task_id 时追加含 file_id 与 SHA256 的结构化索引，供对端任务自动唤醒、读取和下载。",
+    description: "向 binding 固定 ExampleGroup 群上传一个本机文件；达到已配置的群文件数量上限时，会按既有策略清理最旧的一批根目录文件再上传，groupFileCleanup 的 cleanupNeeded=true、deletedCount>0 且 failedCount=0 是正常清理结果，核上传结果后继续原任务。提供 task_id 时追加含 file_id 与 SHA256 的结构化索引，供对端任务自动唤醒、读取和下载。",
     inputSchema: fileInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },
@@ -551,7 +551,7 @@ const tools = [
   },
   {
     name: "napcat_send_configured_file",
-    description: "向 binding.controlPlane.targets 里指定的群聊或私聊目标上传一个本机文件；group 走群文件上传与群文件列表核验，private 走私聊文件上传并从私聊历史尽力回读核验；不会发送跨机任务索引，也不会改用固定 ExampleGroup。",
+    description: "向 binding.controlPlane.targets 里指定的群聊或私聊目标上传一个本机文件；group 走群文件上传与群文件列表核验，达到已配置数量上限时按既有策略清理最旧根目录文件，groupFileCleanup 的 cleanupNeeded=true、deletedCount>0 且 failedCount=0 是正常清理结果，核上传结果后继续原任务；private 走私聊文件上传并从私聊历史尽力回读核验；不会发送跨机任务索引，也不会改用固定 ExampleGroup。",
     inputSchema: configuredFileInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   },

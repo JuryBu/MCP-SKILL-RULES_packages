@@ -186,8 +186,8 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-10-11.1" "$Profile core content revision"
-    Assert-Contains $promptText "2026-10-11.1" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-10-11.2" "$Profile core content revision"
+    Assert-Contains $promptText "2026-10-11.2" "$Profile prompt content revision"
     foreach ($recentExchangeMarker in @(
         '\u6b63\u6587\u4ec5\u4fdd\u7559\u6700\u8fd1\u004b\u6b21\u771f\u5b9e\u4ea4\u6d41\u7684\u5b8c\u6574\u8bb0\u5f55',
         '\u8d85\u51fa\u004b\u8303\u56f4\u7684\u65e7\u4ea4\u6d41',
