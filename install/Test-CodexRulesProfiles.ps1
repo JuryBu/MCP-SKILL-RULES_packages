@@ -94,10 +94,10 @@ function Assert-Guidance {
     Assert-Contains $promptText '2026-10-04.2' "$Profile common baseline"
     foreach ($expressionMarker in @(
         ([regex]::Unescape('K\u57285\uff5e15\u4e4b\u95f4\uff0c\u9ed8\u8ba410')),
-        ([regex]::Unescape('\u7ef4\u62a4\u6709\u4e24\u4e2a\u660e\u786e\u65f6\u70b9')),
+        ([regex]::Unescape('\u96c6\u4e2d\u56de\u6eaf\u548c\u7ed3\u6784\u6574\u7406\u6709\u4e24\u4e2a\u660e\u786e\u65f6\u70b9')),
         ([regex]::Unescape('\u51c6\u5907\u5b8c\u6574\u5de5\u7a0b\u89e3\u91ca\u6216\u6c47\u62a5\u65f6')),
-        ([regex]::Unescape('\u96c6\u4e2d\u56de\u6eaf\u5e76\u8865\u9f50\u6700\u8fd1K\u6b21')),
-        ([regex]::Unescape('\u65e5\u5e38\u804a\u5929\u548c\u8fde\u7eed\u8ba8\u8bba\u4e0d\u9010\u8f6e\u89e6\u53d1\u8fd1\u51b5\u6587\u4ef6\u7ef4\u62a4')),
+        ([regex]::Unescape('\u8865\u9f50\u6700\u8fd1K\u6b21\u771f\u5b9e\u4ea4\u6d41')),
+        ([regex]::Unescape('\u5373\u65f6\u66f4\u65b0\u6cbf\u7528\u5df2\u6709\u8bb0\u5f55')),
         ([regex]::Unescape('\u5230\u5b9e\u9645\u5f00\u5de5\u65f6\u7ed3\u675f')),
         ([regex]::Unescape('\u672c\u6b21\u56de\u590d\u8349\u7a3f')),
         ([regex]::Unescape('\u6807\u660e\u5c1a\u672a\u53d1\u9001')),
@@ -108,7 +108,7 @@ function Assert-Guidance {
         ([regex]::Unescape('\u80af\u5b9a\u53e5\u5305\u88c5')),
         ([regex]::Unescape('\u6bb5\u9996\u3001\u6bb5\u4e2d')),
         ([regex]::Unescape('\u4e25\u8c28\u3001\u8c28\u614e\u3001\u62c5\u5fc3\u8bef\u89e3\u5747\u4e0d\u5f97')),
-        ([regex]::Unescape('\u7528\u6237\u7279\u522b\u751f\u6c14'))
+        ([regex]::Unescape('\u7528\u6237\u751f\u6c14\u6216\u53d7\u632b\u65f6'))
     )) {
         Assert-Contains $promptText $expressionMarker "$Profile expression contract"
     }
@@ -186,8 +186,18 @@ function Assert-Guidance {
     $audienceWord = if ($Profile -eq "neutral") { [regex]::Unescape('\u7528\u6237') } else { $ownerWord }
     $designText = Get-Content -LiteralPath (Join-Path $Root "guidance\design-writing.md") -Raw -Encoding UTF8
     $observerText = Get-Content -LiteralPath (Join-Path $Root "guidance\model-observer.md") -Raw -Encoding UTF8
-    Assert-Contains $agentsText "2026-10-11.2" "$Profile core content revision"
-    Assert-Contains $promptText "2026-10-11.2" "$Profile prompt content revision"
+    Assert-Contains $agentsText "2026-10-12.1" "$Profile core content revision"
+    Assert-Contains $promptText "2026-10-12.1" "$Profile prompt content revision"
+    foreach ($encodedMarker in @('\u9884\u7b97\u5305\u542b\u771f\u5b9e\u64cd\u4f5c', '\u4e24\u9879\u5ba1\u67e5\u90fd\u987b\u76f4\u63a5\u8bfb\u53d6', '\u53d6\u5f97\u660e\u786e\u540c\u610f')) {
+        Assert-Contains $engineeringText ([regex]::Unescape($encodedMarker)) "$Profile scope and review decisions"
+    }
+    $maintenanceText = Get-Content -LiteralPath (Join-Path $Root "guidance\maintenance-upgrades.md") -Raw -Encoding UTF8
+    foreach ($encodedMarker in @('\u81ea\u52a8\u91cd\u5f00\u6309\u72ec\u7acb\u76ee\u6807', '\u672c\u5730\u8bca\u65ad\u3001\u9002\u914d\u3001\u4f9d\u8d56\u53ca\u73af\u5883\u51c6\u5907', '\u7981\u6b62\u6539\u5305\u88c5\u3001\u66f4\u6362\u5de5\u5177', '\u5b8c\u6574\u53ef\u590d\u5236\u5757')) {
+        Assert-Contains $maintenanceText ([regex]::Unescape($encodedMarker)) "$Profile manual maintenance and safety boundaries"
+    }
+    foreach ($encodedMarker in @('\u6bcf\u6761\u771f\u5b9e', '\u5f71\u54cd\u7684\u51b3\u5b9a\u53ca\u4e0b\u4e00\u52a8\u4f5c', '\u5df2\u7ecf\u5931\u6548\u7684\u5b89\u6392', '\u4e0d\u81ea\u884c\u63d0\u51fa', '\u4fdd\u6301\u6b63\u5e38\u3001\u53cb\u597d\u7684\u4ea4\u6d41')) {
+        Assert-Contains $promptText ([regex]::Unescape($encodedMarker)) "$Profile discussion decisions and criticism response"
+    }
     foreach ($recentExchangeMarker in @(
         '\u6b63\u6587\u4ec5\u4fdd\u7559\u6700\u8fd1\u004b\u6b21\u771f\u5b9e\u4ea4\u6d41\u7684\u5b8c\u6574\u8bb0\u5f55',
         '\u8d85\u51fa\u004b\u8303\u56f4\u7684\u65e7\u4ea4\u6d41',
