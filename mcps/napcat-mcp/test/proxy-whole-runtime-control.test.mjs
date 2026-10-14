@@ -141,6 +141,54 @@ test("successive registrations retain four approvals and protect a live source",
   }
 });
 
+test("registration reclaims retired workers before trimming four live source approvals and preserves failures", async context => {
+  for (const release of [true, false]) {
+    const value = fixture(context);
+    const templates = value.profile.approvedCandidates[0];
+    const candidates = [];
+    let nextInput;
+    for (let index = 0; index < 5; index += 1) {
+      const installationRoot = path.join(value.root, `registered-source-${release}-${index}`);
+      fs.cpSync(templates.installationRoot, installationRoot, { recursive: true });
+      const sourceRoot = path.join(installationRoot, path.relative(templates.installationRoot, value.sourceRoot));
+      const controlPath = path.join(sourceRoot, "inner-runner-handoff-control.mjs");
+      fs.appendFileSync(controlPath, `\nexport const sourceVersion = ${index};\n`);
+      const candidate = { ...templates, id: `source-${index}`, installationRoot,
+        runnerPath: path.join(sourceRoot, "codex-model-stream-proxy-runner.mjs"),
+        expectedHashes: { ...templates.expectedHashes, control: digest(fs.readFileSync(controlPath)) } };
+      const manifestPath = path.join(sourceRoot, "manifest.json");
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+      manifest.files.find(file => file.path === "inner-runner-handoff-control.mjs").sha256 = candidate.expectedHashes.control;
+      fs.writeFileSync(manifestPath, JSON.stringify(manifest));
+      candidates.push(candidate);
+      if (index === 4) nextInput = { instanceId: "instance", expectedRevision: 0, expectedRegistrySha256: null,
+        manifestPath, manifestSha256: digest(fs.readFileSync(manifestPath)), candidate };
+    }
+    value.profile.approvedCandidates.splice(0, 1, ...candidates.slice(0, 4));
+    const registeredWorkers = candidates.slice(0, 4).map((candidate, index) => ({ workerId: `source-worker-${index}`,
+      alive: true, ready: true, sourceHashes: candidate.expectedHashes }));
+    value.workers.push(...registeredWorkers);
+    let reclamations = 0;
+    value.coordinator.liveCodeParticipant = () => ({ snapshot: () => ({ state: { dispatch: async method => {
+      assert.equal(method, "reclaimRetiredWorkers");
+      reclamations += 1;
+      assert.equal(value.runtime.status().busy, true);
+      if (release) registeredWorkers[0].alive = false;
+    } } }) });
+    if (release) {
+      const result = await value.runtime.register(nextInput);
+      assert.equal(result.registeredCandidateId, "source-4");
+      assert.deepEqual(value.profile.approvedCandidates.map(candidate => candidate.id), ["source-1", "source-2", "source-3", "source-4"]);
+    } else {
+      await assert.rejects(value.runtime.register(nextInput), { code: "LIVE_WHOLE_APPROVALS_IN_USE" });
+      assert.equal(readInnerCandidateRegistry(value.profile), null);
+      assert.deepEqual(value.profile.approvedCandidates.map(candidate => candidate.id), ["source-0", "source-1", "source-2", "source-3"]);
+    }
+    assert.equal(reclamations, 1);
+    assert.equal(value.runtime.status().busy, false);
+  }
+});
+
 test("registration rejects stale registry, foreign owner and mismatched source without changing approvals", context => {
   const value = fixture(context);
   const candidate = value.profile.approvedCandidates[0];

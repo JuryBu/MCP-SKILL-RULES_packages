@@ -137,23 +137,38 @@ export function createProxyWholeRuntimeControlImplementation(state) {
       const duplicate = existing.find(entry => entry.id === candidate.id);
       if (duplicate && (duplicate.installationRoot !== candidate.installationRoot || duplicate.runnerPath !== candidate.runnerPath
         || !sameHashes(duplicate.expectedHashes, candidate.expectedHashes))) fail("LIVE_WHOLE_APPROVAL_ID_CONFLICT");
-      const next = duplicate ? [...existing] : [...existing, { id: candidate.id, installationRoot: candidate.installationRoot,
-        runnerPath: candidate.runnerPath, expectedHashes: candidate.expectedHashes }];
-      const protectedIds = new Set(coordinator.status().workers.filter(worker => worker.alive)
-        .map(worker => existing.find(entry => sameHashes(entry.expectedHashes, worker.sourceHashes))?.id).filter(Boolean));
-      if (state.selected?.sourceSpec.candidateApprovalId) protectedIds.add(state.selected.sourceSpec.candidateApprovalId);
-      if (state.selected?.previousSelection) protectedIds.add(state.selected.previousSelection.candidateId);
-      const durableSelection = readInnerCandidateRegistry(profile)?.selection;
-      if (durableSelection) protectedIds.add(durableSelection.candidateId);
-      while (next.length > 4) {
-        const removable = next.findIndex(entry => entry.id !== candidate.id && !protectedIds.has(entry.id));
-        if (removable < 0) fail("LIVE_WHOLE_APPROVALS_IN_USE");
-        next.splice(removable, 1);
+      if ((readInnerCandidateRegistry(profile)?.sha256 ?? null) !== input.expectedRegistrySha256) fail("INNER_PROFILE_CANDIDATE_REGISTRY_CHANGED");
+      const commit = () => {
+        const next = duplicate ? [...existing] : [...existing, { id: candidate.id, installationRoot: candidate.installationRoot,
+          runnerPath: candidate.runnerPath, expectedHashes: candidate.expectedHashes }];
+        const protectedIds = new Set(coordinator.status().workers.filter(worker => worker.alive)
+          .map(worker => existing.find(entry => sameHashes(entry.expectedHashes, worker.sourceHashes))?.id).filter(Boolean));
+        if (state.selected?.sourceSpec.candidateApprovalId) protectedIds.add(state.selected.sourceSpec.candidateApprovalId);
+        if (state.selected?.previousSelection) protectedIds.add(state.selected.previousSelection.candidateId);
+        const durableSelection = readInnerCandidateRegistry(profile)?.selection;
+        if (durableSelection) protectedIds.add(durableSelection.candidateId);
+        while (next.length > 4) {
+          const removable = next.findIndex(entry => entry.id !== candidate.id && !protectedIds.has(entry.id));
+          if (removable < 0) fail("LIVE_WHOLE_APPROVALS_IN_USE");
+          next.splice(removable, 1);
+        }
+        if (!Array.isArray(profile.approvedCandidates) || Object.isFrozen(profile.approvedCandidates)) fail("LIVE_WHOLE_APPROVAL_ARRAY_REQUIRED");
+        const registrySha256 = saveInnerCandidateRegistry(profile, next, input.expectedRegistrySha256);
+        profile.approvedCandidates.splice(0, profile.approvedCandidates.length, ...next);
+        return { ...this.status(), registeredCandidateId: candidate.id, candidateRegistrySha256: registrySha256 };
+      };
+      try { return commit(); }
+      catch (error) {
+        if (error.code !== "LIVE_WHOLE_APPROVALS_IN_USE") throw error;
+        const shared = coordinator.liveCodeParticipant?.().snapshot().state;
+        if (typeof shared?.dispatch !== "function") throw error;
+        state.busy = true;
+        return Promise.resolve().then(() => shared.dispatch("reclaimRetiredWorkers")).then(() => {
+          state.busy = false;
+          guard(input);
+          return commit();
+        }).finally(() => { state.busy = false; });
       }
-      if (!Array.isArray(profile.approvedCandidates) || Object.isFrozen(profile.approvedCandidates)) fail("LIVE_WHOLE_APPROVAL_ARRAY_REQUIRED");
-      const registrySha256 = saveInnerCandidateRegistry(profile, next, input.expectedRegistrySha256);
-      profile.approvedCandidates.splice(0, profile.approvedCandidates.length, ...next);
-      return { ...this.status(), registeredCandidateId: candidate.id, candidateRegistrySha256: registrySha256 };
     },
     async prepare(input) {
       guard(input);

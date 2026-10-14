@@ -11,6 +11,66 @@ const require = createRequire(import.meta.url);
 const compilerPath = process.env.CODEX_LIVE_ESBUILD_MODULE;
 const digest = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 
+test("six full HTTP registration and activation cycles reclaim distinct retired source approvals", { timeout: 30000, skip: !compilerPath }, async context => {
+  const candidates = [];
+  const value = await fixture(context, { parent: true, production: true, async configure({ candidateRoot, configuration, sourceRoot }) {
+    const controlPath = path.join(sourceRoot, "inner-runner-handoff-control.mjs");
+    const original = fs.readFileSync(controlPath, "utf8");
+    const names = { runner: "codex-model-stream-proxy-runner.mjs", core: "codex-model-stream-proxy.mjs",
+      helper: "thread-recovery-handoff.mjs", control: "inner-runner-handoff-control.mjs" };
+    try {
+      for (let index = 0; index < 6; index += 1) {
+        const installationRoot = path.join(candidateRoot, `whole-generation-${index}`);
+        const source = path.join(installationRoot, "src");
+        fs.mkdirSync(installationRoot);
+        fs.writeFileSync(controlPath, original + `\nexport const registrationGeneration = ${index};\n`);
+        const built = await buildProxyParentLiveBundle({ sourceRoot, destinationRoot: source,
+          version: `whole-generation-${index}`, compiler: require(compilerPath) });
+        const expectedHashes = Object.fromEntries(Object.entries(names).map(([key, name]) => [key, digest(fs.readFileSync(path.join(source, name)))]));
+        fs.writeFileSync(path.join(installationRoot, ".inner-runtime-owner.json"), JSON.stringify({ schemaVersion: 1, kind: "candidate",
+          ownerId: configuration.ownerId, nativeSourceId: configuration.nativeSourceId }));
+        candidates.push({ built, candidate: { id: `whole-generation-${index}`, installationRoot,
+          runnerPath: path.join(source, names.runner), expectedHashes } });
+      }
+    } finally { fs.writeFileSync(controlPath, original); }
+    configuration.approvedCandidates = [];
+  } });
+  const token = fs.readFileSync(value.shared.options.tokenFilePath, "utf8").trim();
+  const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+  const endpoint = `http://127.0.0.1:${value.ports.control}/v1/full-runtime`;
+  const status = async () => (await fetch(endpoint, { headers })).json();
+  const call = async (method, body) => {
+    const response = await fetch(`${endpoint}/${method}`, { method: "POST", headers, body: JSON.stringify(body) });
+    const result = await response.json();
+    assert.equal(response.status, 200, JSON.stringify(result));
+    return result;
+  };
+  const socket = await value.connect();
+  await value.rpc(socket, "initialize", { clientInfo: { name: "repeated-whole-source", version: "1" } });
+  for (const [index, entry] of candidates.entries()) {
+    const threadId = `finished-generation-${index}`;
+    const turnId = `finished-turn-${index}`;
+    await value.turn(socket, threadId, turnId);
+    await value.rpc(socket, "test/complete", { threadId, turnId });
+    await until(() => value.shared.coordinator.status().threads.find(thread => thread.threadId === threadId)?.phase === "terminal");
+    const before = await status();
+    const binding = { instanceId: before.instanceId, expectedRevision: before.revision };
+    await call("register", { ...binding, expectedRegistrySha256: before.candidateRegistrySha256,
+      manifestPath: entry.built.manifestPath, manifestSha256: entry.built.manifestSha256, candidate: entry.candidate });
+    const prepared = await call("prepare", { ...binding, manifestPath: entry.built.manifestPath,
+      manifestSha256: entry.built.manifestSha256, workerCandidateId: entry.candidate.id });
+    await call("activate", { ...binding, preparationId: prepared.id });
+  }
+  const final = await status();
+  assert.equal(final.revision, 6);
+  assert.equal(final.approvedCandidateIds.length, 4);
+  assert.ok(value.shared.coordinator.status().reclaimedWorkers.length >= 3);
+  assert.equal(socket.readyState, 1);
+  assert.equal((await value.rpc(socket, "test/tool", { value: "after-six-registrations" })).result.value, "after-six-registrations");
+  context.diagnostic(JSON.stringify({ fullHttpCycles: 6, distinctSourceApprovals: 4,
+    reclaimedWorkers: value.shared.coordinator.status().reclaimedWorkers.length, sameSocket: true, paidRequests: 0 }));
+});
+
 test("the same pinned whole source registers then switches five parents and a model worker through authenticated production-mode HTTP", { timeout: 20000, skip: !compilerPath }, async context => {
   let built;
   let approved;
