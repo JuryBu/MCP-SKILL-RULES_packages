@@ -182,6 +182,28 @@ export function readRecoveryWorkerSources(context, registrySha256) {
   }
   return sources;
 }
+export function readRecoveryWorkerBindings(context, snapshot, registrySha256) {
+  const { config, profile } = context;
+  if (config.mode === "TempFixture") return snapshot.workerBindings;
+  readRecoveryWorkerSources(context, registrySha256);
+  const candidates = registrySha256 == null ? [] : read(config.registryPath).candidates ?? [];
+  const sources = [profile.initial, ...candidates];
+  return snapshot.managed.coordinator.workers.filter(worker => worker.alive).map(worker => {
+    if (typeof worker.workerId !== "string" || !/^[a-zA-Z0-9-]+$/u.test(worker.workerId)) fail("RECOVERY_WORKER_STATE_ID_INVALID");
+    const runnerPaths = sources.filter(source => Object.entries(source.expectedHashes).every(([name, value]) => worker.sourceHashes[name] === value)).map(source => source.runnerPath);
+    if (!runnerPaths.length || runnerPaths.some(runner => typeof runner !== "string")) fail("RECOVERY_WORKER_SOURCE_CHANGED");
+    const workerRoot = path.join(profile.stateRoot, worker.workerId);
+    const runtimePath = path.join(workerRoot, "codex-model-stream-proxy-runtime.json");
+    const lockPath = path.join(workerRoot, "codex-model-stream-proxy.lock.json");
+    plain(runtimePath); plain(lockPath);
+    const runtime = read(runtimePath);
+    const lock = read(lockPath);
+    if (runtime.pid !== worker.pid || lock.pid !== worker.pid || typeof runtime.instanceToken !== "string" || !runtime.instanceToken
+      || runtime.instanceToken !== lock.instanceToken || runtime.startedAt !== lock.startedAt || runtime.status !== "running") fail("RECOVERY_WORKER_RUNTIME_IDENTITY_CHANGED");
+    return { workerId: worker.workerId, pid: worker.pid, nodePath: config.nodePath, runnerPaths,
+      startedAt: runtime.startedAt, livenessAt: runtime.livenessAt };
+  });
+}
 export function inspectRecovery(context, action, snapshotPath, proofPath) {
   if (action === "Inspect") return { status: "RECOVERY_MATERIAL_PREPARED_NOT_EXECUTED", baselineFiles: 47 };
   if (action === "Bind") return bindAcceptanceRegistry(context);
@@ -190,7 +212,8 @@ export function inspectRecovery(context, action, snapshotPath, proofPath) {
     const registry = bindAcceptanceRegistry(context);
     const proof = assertRecoveryQuiescent({ input: bindCurrentApp(context.input, snapshot), profile: context.profile,
       runtime: snapshot.runtime, managed: snapshot.managed, processes: snapshot.processes,
-      listeners: snapshot.listeners, now: snapshot.now, workerSources: readRecoveryWorkerSources(context, registry.registrySha256) });
+      listeners: snapshot.listeners, now: snapshot.now, workerSources: readRecoveryWorkerSources(context, registry.registrySha256),
+      workerBindings: readRecoveryWorkerBindings(context, snapshot, registry.registrySha256) });
     const current = { ...proof, registry, instanceId: context.input.instanceId };
     return proofPath ? mergeRecoveryProof(read(proofPath), current) : current;
   }
@@ -221,7 +244,8 @@ export async function verifyRestartedRecovery(context, snapshotPath, proofPath) 
   const proof = assertRecoveryQuiescent({ input: { ...input, parentPid: runtime.pid, appServerPid: runtime.appServerPid,
     instanceId: runtime.instanceToken, processBindings }, profile, runtime, managed: snapshot.managed,
     processes: snapshot.processes, listeners: snapshot.listeners, now: snapshot.now,
-    workerSources: readRecoveryWorkerSources(context, input.expectedRegistrySha256 ?? null) });
+    workerSources: readRecoveryWorkerSources(context, input.expectedRegistrySha256 ?? null),
+    workerBindings: readRecoveryWorkerBindings(context, snapshot, input.expectedRegistrySha256 ?? null) });
   if (snapshot.managed.coordinator.workers.filter(worker => worker.alive && !worker.retired).length !== 1
     || snapshot.managed.controlRevision !== 0) fail("RECOVERY_NEW_WORKER_NOT_READY");
   let status;

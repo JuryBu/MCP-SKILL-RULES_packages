@@ -6,7 +6,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { readRecoveryConfiguration, bindAcceptanceRegistry, readRecoveryWorkerSources } from "../ops/full-runtime-owner-recovery-io.mjs";
+import { readRecoveryConfiguration, bindAcceptanceRegistry, readRecoveryWorkerSources, readRecoveryWorkerBindings } from "../ops/full-runtime-owner-recovery-io.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const digest = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
@@ -76,7 +76,7 @@ $next.runtime.livenessAt=[DateTime]::UtcNow.ToString('o');$next.runtime.updatedA
   const processes = [
     { pid: 100, parentPid: 1, creationDate, executablePath: "C:\\fixture\\node.exe", commandLine: "node parent" },
     { pid: 101, parentPid: 100, creationDate, executablePath: "C:\\fixture\\codex.exe", commandLine: "codex app-server --listen fixture" },
-    { pid: 102, parentPid: 100, creationDate, executablePath: "C:\\fixture\\node.exe", commandLine: "node worker" },
+    { pid: 102, parentPid: 100, creationDate, executablePath: process.execPath, commandLine: `"${process.execPath}" "C:\\fixture\\worker.mjs"` },
     { pid: 103, parentPid: 102, creationDate, executablePath: "C:\\fixture\\helper.exe", commandLine: "helper child" },
   ];
   const inputPath = write(path.join(directory, "input.json"), { schemaVersion: 1, machine: "fixture", candidateId: "same-source-proof",
@@ -89,12 +89,15 @@ $next.runtime.livenessAt=[DateTime]::UtcNow.ToString('o');$next.runtime.updatedA
         sourceHashes, retired: false, cleanupPending: false }] } };
   write(runtimePath, runtime); write(managedStatePath, managed);
   write(path.join(outerStateRoot, "supervisor-runtime.json"), { pid: 200 });
-  write(snapshotPath, { now, runtime, managed, processes, listeners: [{ localPort: 18431, owningProcess: 100, state: "Listen" }] });
+  const workerBindings = [{ workerId: "fixture-worker", pid: 102, nodePath: process.execPath,
+    runnerPaths: ["C:\\fixture\\worker.mjs"], startedAt: new Date(Date.parse(creationDate) + 1000).toISOString(), livenessAt: now }];
+  write(snapshotPath, { now, runtime, managed, processes, workerBindings, listeners: [{ localPort: 18431, owningProcess: 100, state: "Listen" }] });
   if (["app-replaced-before", "app-replaced-between", "late-child-remains"].includes(fault)) {
     const changed = JSON.parse(fs.readFileSync(snapshotPath, "utf8"));
     if (fault === "late-child-remains") {
-      changed.processes.push({ ...processes[2], pid: 200, commandLine: "node replacement-worker" }, { ...processes[3], pid: 201, parentPid: 200 });
+      changed.processes.push({ ...processes[2], pid: 200 }, { ...processes[3], pid: 201, parentPid: 200 });
       changed.managed.coordinator.workers.push({ ...managed.coordinator.workers[0], pid: 200, workerId: "new-fixture-worker" });
+      changed.workerBindings.push({ ...workerBindings[0], pid: 200, workerId: "new-fixture-worker" });
     } else {
       changed.runtime.appServerPid = 201;
       changed.processes[1] = { ...changed.processes[1], pid: 201, creationDate: new Date(Date.parse(creationDate) + 1000).toISOString() };
@@ -102,10 +105,11 @@ $next.runtime.livenessAt=[DateTime]::UtcNow.ToString('o');$next.runtime.updatedA
     write(fault === "app-replaced-before" ? snapshotPath : path.join(directory, "second-snapshot.json"), changed);
   }
   if (fault === "disable-readback") write(path.join(directory, "disable-readback-fault"), "synthetic failure");
-  const restarted = structuredClone({ now, runtime, managed, processes, listeners: [{ localPort: 18431, owningProcess: 300, state: "Listen" }] });
+  const restarted = structuredClone({ now, runtime, managed, processes, workerBindings, listeners: [{ localPort: 18431, owningProcess: 300, state: "Listen" }] });
   restarted.runtime.pid = 300; restarted.runtime.appServerPid = 301; restarted.runtime.instanceToken = "restarted-instance";
   restarted.managed.pid = 300; restarted.managed.instanceToken = "restarted-instance";
   restarted.managed.coordinator.workers[0].pid = 302;
+  restarted.workerBindings[0].pid = 302;
   restarted.processes = restarted.processes.slice(0, 3).map((runtimeProcess, index) => ({ ...runtimeProcess, pid: 300 + index,
     parentPid: index === 0 ? 1 : 300, executablePath: index === 1 ? path.join(directory, "codex.exe") : process.execPath }));
   restarted.fullRuntime = { ok: true, instanceId: "restarted-instance", revision: fault === "wrong-restarted" ? 1 : 0,
@@ -190,6 +194,22 @@ test("recovery derives worker sources from a pinned registry and verifies candid
   write(value.registryPath, { candidates: [{ installationRoot, runnerPath: path.join(installationRoot, "src", names.runner), expectedHashes }] });
   const registrySha = sha(value.registryPath);
   assert.deepEqual(readRecoveryWorkerSources(configuration, registrySha), [configuration.profile.initial.expectedHashes, expectedHashes]);
+  configuration.config.mode = "ManualProduction";
+  const worker = { workerId: "fixture-worker", pid: 102, alive: true, sourceHashes: expectedHashes };
+  const workerRoot = path.join(configuration.profile.stateRoot, worker.workerId);
+  const startedAt = new Date().toISOString();
+  const runtimePath = write(path.join(workerRoot, "codex-model-stream-proxy-runtime.json"), { pid: 102, status: "running",
+    instanceToken: "worker-instance", startedAt, livenessAt: startedAt });
+  const lockPath = write(path.join(workerRoot, "codex-model-stream-proxy.lock.json"), { pid: 102, instanceToken: "worker-instance", startedAt });
+  const snapshot = { managed: { coordinator: { workers: [worker] } } };
+  const bindings = readRecoveryWorkerBindings(configuration, snapshot, registrySha);
+  assert.equal(bindings[0].pid, 102);
+  assert.deepEqual(bindings[0].runnerPaths, [path.join(installationRoot, "src", names.runner)]);
+  write(lockPath, { pid: 102, instanceToken: "reused-instance", startedAt });
+  assert.throws(() => readRecoveryWorkerBindings(configuration, snapshot, registrySha), /RECOVERY_WORKER_RUNTIME_IDENTITY_CHANGED/);
+  write(lockPath, { pid: 102, instanceToken: "worker-instance", startedAt });
+  write(runtimePath, { pid: 103, status: "running", instanceToken: "worker-instance", startedAt, livenessAt: startedAt });
+  assert.throws(() => readRecoveryWorkerBindings(configuration, snapshot, registrySha), /RECOVERY_WORKER_RUNTIME_IDENTITY_CHANGED/);
   fs.appendFileSync(path.join(installationRoot, "src", names.control), "changed");
   assert.throws(() => readRecoveryWorkerSources(configuration, registrySha), /RECOVERY_PIN_CHANGED/);
 });

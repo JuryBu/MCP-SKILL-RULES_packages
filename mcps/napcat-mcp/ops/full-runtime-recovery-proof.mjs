@@ -150,7 +150,7 @@ function expectedHashes(profile) {
   return hashes;
 }
 
-export function assertRecoveryQuiescent({ input, profile, runtime, managed, processes, listeners, now, workerSources } = {}) {
+export function assertRecoveryQuiescent({ input, profile, runtime, managed, processes, listeners, now, workerSources, workerBindings } = {}) {
   const instant = now instanceof Date ? now.getTime() : typeof now === 'string'
     ? timestamp(now, 'RECOVERY_NOW_INVALID') : now;
   if (!Number.isSafeInteger(instant) || instant < 0 || !Number.isFinite(new Date(instant).getTime())) fail('RECOVERY_NOW_INVALID');
@@ -218,6 +218,15 @@ export function assertRecoveryQuiescent({ input, profile, runtime, managed, proc
     if (!worker.ready || (worker.retired && !workerSources) || !indexed.has(worker.pid) || !ownedTree.has(worker.pid)) fail('RECOVERY_WORKER_RELATION_UNKNOWN');
     if (!object(worker.sourceHashes) || Object.keys(worker.sourceHashes).length !== Object.keys(hashes).length
       || !sources.some(source => Object.entries(source).every(([name, value]) => worker.sourceHashes[name] === value))) fail('RECOVERY_WORKER_SOURCE_CHANGED');
+    const binding = workerBindings?.find(entry => entry.workerId === worker.workerId && entry.pid === worker.pid);
+    if (!binding || !Array.isArray(binding.runnerPaths) || binding.runnerPaths.length === 0) fail('RECOVERY_WORKER_OS_BINDING_MISSING');
+    const process = indexed.get(worker.pid);
+    if (process.parentPid !== input.parentPid || executable(process.executablePath) !== executable(binding.nodePath)) fail('RECOVERY_WORKER_OS_IDENTITY_CHANGED');
+    const command = typeof process.commandLine === 'string' && process.commandLine.match(/^(?:"([^"]+)"|([^\s"]+))\s+(?:"([^"]+)"|([^\s"]+))\s*$/u);
+    if (!command || executable(command[1] ?? command[2]) !== executable(binding.nodePath)
+      || !binding.runnerPaths.some(runner => executable(runner) === executable(command[3] ?? command[4]))) fail('RECOVERY_WORKER_COMMAND_CHANGED');
+    const startedAt = timestamp(binding.startedAt, 'RECOVERY_WORKER_START_UNKNOWN');
+    if (timestamp(process.creationDate, 'RECOVERY_PROCESS_CREATION_UNKNOWN') > startedAt || startedAt > instant) fail('RECOVERY_WORKER_CREATION_CHANGED');
     bindings.add(worker.pid);
   }
   const captured = descendants(bindings, indexed);

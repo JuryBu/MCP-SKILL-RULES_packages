@@ -15,7 +15,7 @@ function fixture() {
   const processes = [
     makeProcess(100, 1, 'C:\\fixture\\node.exe', 'node fixture-parent --token synthetic-secret'),
     makeProcess(101, 100, 'C:\\fixture\\codex.exe', 'codex app-server --listen fixture'),
-    makeProcess(102, 100, 'C:\\fixture\\node.exe', 'node fixture-worker'),
+    makeProcess(102, 100, 'C:\\fixture\\node.exe', '"C:\\fixture\\node.exe" "C:\\fixture\\worker.mjs"'),
     makeProcess(103, 102, 'C:\\fixture\\helper.exe', 'helper fixture-child'),
     makeProcess(104, 103, 'C:\\fixture\\helper.exe', 'helper fixture-grandchild'),
     makeProcess(900, 1, 'C:\\fixture\\unrelated.exe', 'unrelated fixture'),
@@ -39,6 +39,8 @@ function fixture() {
         workers: [{ workerId: 'synthetic-worker', pid: 102, ready: true, alive: true,
           sourceHashes: { ...sourceHashes }, retired: false, cleanupPending: false }] } },
     processes,
+    workerBindings: [{ workerId: 'synthetic-worker', pid: 102, nodePath: 'C:\\fixture\\node.exe',
+      runnerPaths: ['C:\\fixture\\worker.mjs'], startedAt: '2030-01-02T03:00:01.000Z', livenessAt: instant }],
     listeners: [{ localPort: 18431, owningProcess: 100, state: 'Listen' },
       { localPort: 18435, owningProcess: 102, state: 'Listen' }],
     now: instant,
@@ -63,6 +65,22 @@ test('registered changed-source workers and idle activation can be stopped witho
   assert.deepEqual(assertRecoveryQuiescent(snapshot).workerPids, [102]);
   worker.sourceHashes = { ...changed, core: digest('unregistered-core') };
   assert.throws(() => assertRecoveryQuiescent(snapshot), /RECOVERY_WORKER_SOURCE_CHANGED/);
+});
+
+test('registered workers reject changed operating system identity before the first snapshot', () => {
+  for (const [field, value, code] of [
+    ['executablePath', 'C:\\fixture\\foreign.exe', 'RECOVERY_WORKER_OS_IDENTITY_CHANGED'],
+    ['commandLine', 'foreign-operation', 'RECOVERY_WORKER_COMMAND_CHANGED'],
+    ['creationDate', '2030-01-02T03:01:00.000Z', 'RECOVERY_WORKER_CREATION_CHANGED'],
+    ['parentPid', 101, 'RECOVERY_WORKER_OS_IDENTITY_CHANGED'],
+  ]) {
+    const snapshot = fixture();
+    snapshot.workerSources = [snapshot.profile.initial.expectedHashes];
+    snapshot.managed.coordinator.workers[0].retired = true;
+    snapshot.processes[2][field] = value;
+    if (field === 'creationDate') for (const child of snapshot.processes.slice(3, 5)) child.creationDate = value;
+    assert.throws(() => assertRecoveryQuiescent(snapshot), error => error.code === code);
+  }
 });
 
 test('registered source does not permit pending requests or an unknown deferred thread', () => {
