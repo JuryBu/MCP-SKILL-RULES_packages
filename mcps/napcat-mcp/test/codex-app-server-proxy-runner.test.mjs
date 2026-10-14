@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { createProxyServiceImplementation } from "../src/proxy-service-code-runtime.mjs";
+import crypto from "node:crypto";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
@@ -17,10 +19,42 @@ import {
   runCodexAppServerProxyService,
   selectRecoveryUpstreamPort,
   terminateManagedAppServer,
+  waitForLaunchPublication,
 } from "../src/codex-app-server-proxy-runner.mjs";
 import { inspectCodexSource, prepareCodexRuntimeBundle } from "../src/codex-runtime-bundle.mjs";
 
 const execFileAsync = promisify(execFile);
+
+test('startup publication missing or partial preserves original runtime and acquires no lock', async () => {
+  for (const partial of [false, true]) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'outer-launch-publication-'));
+    try {
+      const options = runtimePaths(root);
+      const original = JSON.stringify({ state: 'stopped', instanceToken: crypto.randomUUID() });
+      fs.writeFileSync(options.runtimeStatePath, original);
+      const receipt = path.join(root, 'launch.json');
+      if (partial) fs.writeFileSync(receipt, '{');
+      const result = await runCodexAppServerProxyService({ ...options, instanceToken: crypto.randomUUID(), launchReceiptPath: receipt, launchPublicationTimeoutMs: 30 });
+      assert.equal(result.error.code, 'START_LAUNCH_NOT_PUBLISHED');
+      assert.equal(fs.readFileSync(options.runtimeStatePath, 'utf8'), original);
+      for (const target of [options.lockPath, options.tokenFilePath, options.logPath]) assert.equal(fs.existsSync(target), false);
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+  }
+});
+
+test('startup publication binds complete bytes pid token and runtime path', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'outer-launch-publication-'));
+  try {
+    const instanceToken = crypto.randomUUID();
+    const runtimeStatePath = path.join(root, 'runtime.json');
+    const launchReceiptPath = path.join(root, 'launch.json');
+    const bytes = JSON.stringify({ pid: process.pid, instanceToken, runtimeStatePath });
+    fs.writeFileSync(launchReceiptPath, bytes);
+    fs.writeFileSync(`${launchReceiptPath}.ready`, JSON.stringify({ instanceToken, receiptSha256: crypto.createHash('sha256').update(bytes).digest('hex') }));
+    assert.equal(await waitForLaunchPublication({ instanceToken, runtimeStatePath, launchReceiptPath, launchPublicationTimeoutMs: 30 }), true);
+    assert.equal(await waitForLaunchPublication({ instanceToken: crypto.randomUUID(), runtimeStatePath, launchReceiptPath, launchPublicationTimeoutMs: 30 }), false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 
 function writeRuntimeHelpers(directory) {
   fs.writeFileSync(path.join(directory, "codex-command-runner.exe"), "fake command runner");
@@ -88,6 +122,114 @@ function createStoppingServiceOptions(paths, child, terminateChild) {
     verifyPortReleased: async () => true,
   };
 }
+
+for (const scenario of [
+  { name: "storage recovers", persistent: false, observer: "normal" },
+  { name: "storage remains full during normal stop", persistent: true, observer: "normal" },
+  { name: "warning and observer throw", persistent: false, observer: "throw" },
+  { name: "warning and observer reject", persistent: false, observer: "reject" },
+]) test(`ENOSPC diagnostic writes keep the existing proxy and backend alive: ${scenario.name}`, async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-enospc-test-"));
+  const paths = runtimePaths(root);
+  const child = createChildThatRequiresForceVerification();
+  let diskFull = false;
+  let spawnCount = 0;
+  let terminateCount = 0;
+  let closeCount = 0;
+  let liveProbe = null;
+  let emitProxyEvent = null;
+  let warningCount = 0;
+  let serviceParticipant = null;
+  let replacedLogCalls = 0;
+  const failures = [];
+  const storageError = () => Object.assign(new Error("simulated diagnostic disk full"), { code: "ENOSPC" });
+  const guardedFs = {
+    ...fs,
+    writeFileSync(target, ...args) {
+      if (diskFull && String(target).startsWith(paths.runtimeStatePath)) throw storageError();
+      return fs.writeFileSync(target, ...args);
+    },
+    appendFileSync(target, ...args) {
+      if (diskFull && target === paths.logPath) throw storageError();
+      return fs.appendFileSync(target, ...args);
+    },
+  };
+  try {
+    const result = await runCodexAppServerProxyService({
+      ...paths,
+      fsImpl: guardedFs,
+      executablePath: process.execPath,
+      pid: process.pid,
+      lifecyclePollIntervalMs: 1,
+      livenessIntervalMs: 1,
+      executableRefreshIntervalMs: 10_000,
+      onServiceCodeParticipant: participant => { serviceParticipant = participant; },
+      probeExecutable: async () => {},
+      onDiagnosticStorageFailure: failure => {
+        failures.push(failure);
+        if (scenario.observer === "throw") throw new Error("observer unavailable");
+        if (scenario.observer === "reject") return Promise.reject(new Error("observer unavailable"));
+      },
+      writeDiagnosticWarning: () => {
+        warningCount += 1;
+        if (scenario.observer === "throw") throw Object.assign(new Error("stderr unavailable"), { code: "EPIPE" });
+        if (scenario.observer === "reject") return Promise.reject(new Error("stderr unavailable"));
+      },
+      createProxy: ({ onEvent }) => {
+        emitProxyEvent = onEvent;
+        return {
+        async start() {},
+        async close() { closeCount += 1; },
+        status() { return { clientCount: 1 }; },
+        };
+      },
+      spawnAppServer: () => {
+        spawnCount += 1;
+        return { child, stderr: () => "" };
+      },
+      waitForWebSocketReady: async () => {
+        diskFull = true;
+        setTimeout(() => {
+          const retained = serviceParticipant.snapshot();
+          const candidate = serviceParticipant.prepare({ createProxyServiceImplementation: shared => {
+            const implementation = createProxyServiceImplementation(shared);
+            return { ...implementation, log(...args) { replacedLogCalls++; return implementation.log(...args); } };
+          } });
+          serviceParticipant.activate(candidate);
+          emitProxyEvent({ type: "client_notice" });
+          liveProbe = { terminateCount, closeCount };
+          serviceParticipant.restore(retained);
+          if (!scenario.persistent) diskFull = false;
+          emitProxyEvent({ type: "client_notice" });
+        }, 40);
+        setTimeout(() => fs.writeFileSync(paths.stopFilePath, "stop\n"), 70);
+      },
+      terminateChild: async () => {
+        terminateCount += 1;
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      },
+      verifyPortReleased: async () => true,
+    });
+    assert.equal(result.state, "stopped");
+    assert.equal(spawnCount, 1);
+    assert.equal(terminateCount, 1);
+    assert.equal(closeCount, 1);
+    assert.deepEqual(liveProbe, { terminateCount: 0, closeCount: 0 });
+    assert.ok(failures.some(failure => failure.target === "runtime_state"));
+    assert.ok(failures.some(failure => failure.target === "diagnostic_log"));
+    assert.equal(warningCount, 1);
+    assert.ok(replacedLogCalls >= 1);
+    if (!scenario.persistent) {
+      const saved = JSON.parse(fs.readFileSync(paths.runtimeStatePath, "utf8"));
+      assert.equal(saved.state, "stopped");
+      assert.equal(saved.diagnosticStorageDegraded, false);
+    }
+    assert.equal(fs.existsSync(paths.lockPath), false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("existing stop requirement is preserved before runner startup", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-existing-stop-"));
@@ -174,11 +316,50 @@ test("parseArguments requires all durable state paths", () => {
   assert.equal(parsed.emptyClientRestartMs, 10000);
   assert.equal(parsed.startTimeoutMs, 45000);
   assert.equal(parsed.startupBudgetMs, 105000);
+  assert.equal(parsed.executablePath, null);
+  assert.equal(parseArguments([...argumentsList, "--codex-exe", process.execPath]).executablePath, process.execPath);
+  for (const invalid of ["", " ", "\t"]) {
+    assert.throws(() => parseArguments([...argumentsList, "--codex-exe", invalid]), /CODEX_EXECUTABLE_EXPLICIT_EMPTY/u);
+  }
+  assert.deepEqual(parsed.requestMetadata, { enabled: false });
+  assert.deepEqual(parseArguments([...argumentsList, "--request-metadata-enabled", "true"]).requestMetadata, { enabled: true });
+  assert.deepEqual(parseArguments([...argumentsList, "--request-metadata-enabled", "false"]).requestMetadata, { enabled: false });
+  for (const invalid of ["1", "yes", "TRUE", "", "invalid"]) {
+    assert.throws(() => parseArguments([...argumentsList, "--request-metadata-enabled", invalid]), /request-metadata-enabled/u);
+  }
   assert.equal(parseArguments([...argumentsList, "--startup-budget-ms", "165000"]).startupBudgetMs, 165000);
   for (const invalid of ["0", "999", "300001", "invalid"]) {
     assert.throws(() => parseArguments([...argumentsList, "--startup-budget-ms", invalid]), /startup-budget-ms/u);
   }
 });
+
+for (const enabled of [undefined, false, true]) {
+  test(`normal runner forwards bounded metadata options only when configured: enabled=${enabled}`, async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-metadata-options-"));
+    const paths = runtimePaths(root);
+    const child = createChildThatRequiresForceVerification();
+    const requestMetadata = enabled === undefined ? undefined : { enabled, maxPending: 32 };
+    let receivedOptions;
+    try {
+      const result = await runCodexAppServerProxyService({
+        ...createStoppingServiceOptions(paths, child, async managedChild => {
+          managedChild.exitCode = 0;
+          managedChild.emit("exit", 0, null);
+        }),
+        requestMetadata,
+        createProxy: options => {
+          receivedOptions = options;
+          return createProxyStub();
+        },
+      });
+      assert.equal(result.state, "stopped");
+      assert.equal(receivedOptions.requestMetadata, requestMetadata);
+      assert.equal(Object.hasOwn(result.proxy ?? {}, "requestMetadata"), false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("empty Desktop restart waits for a real client disconnect epoch", () => {
   let observed = observeEmptyDesktopRestart({}, { clientCount: 0, nowMs: 0, restartMs: 10 });

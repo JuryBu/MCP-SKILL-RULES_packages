@@ -6,6 +6,9 @@ import { execFile, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { renameReplaceSync } from "./atomic-file.mjs";
+import { windowsPowerShellEnvironment } from "./windows-powershell-environment.mjs";
+import { createManagedEventObserver } from "./inner-managed-events.mjs";
+import { createProxyServiceCodeRuntime } from "./proxy-service-code-runtime.mjs";
 import {
   digestCodexSource,
   inspectCodexSource,
@@ -53,6 +56,13 @@ const CLI_OPTIONS = new Set([
   "resume-timeout-ms",
   "empty-client-restart-ms",
   "codex-exe",
+  "display-policy-root",
+  "outer-runtime-root",
+  "request-metadata-enabled",
+  "instance-token",
+  "launch-receipt",
+  "inner-managed-profile",
+  "inner-managed-profile-sha256",
 ]);
 
 function isObject(value) {
@@ -71,6 +81,13 @@ function boundedInteger(value, name, fallback, minimum, maximum) {
   const normalized = Math.trunc(parsed);
   if (normalized < minimum || normalized > maximum) throw new Error(`${name} 超出范围`);
   return normalized;
+}
+
+function strictBoolean(value, name, fallback = false) {
+  if (value === undefined) return fallback;
+  if (value === "true") return true;
+  if (value === "false") return false;
+  throw new Error(`${name} 必须为 true 或 false`);
 }
 
 export function observeEmptyDesktopRestart(previousState = {}, input = {}) {
@@ -147,15 +164,17 @@ function processAlive(pid) {
 }
 
 function processCommandLine(pid) {
-  if (process.platform !== "win32" || !processAlive(pid)) return "";
-  const executable = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const script = `(Get-CimInstance Win32_Process -Filter \"ProcessId = ${Number(pid)}\" -ErrorAction SilentlyContinue).CommandLine`;
-  const result = spawnSync(executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+  if (process.platform !== "win32" || !processAlive(pid)) return null;
+  const child = windowsPowerShellEnvironment();
+  const script = `$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); (Get-CimInstance Win32_Process -Filter \"ProcessId = ${Number(pid)}\" -ErrorAction Stop).CommandLine`;
+  const result = spawnSync(child.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+    env: child.environment,
     encoding: "utf8",
     windowsHide: true,
     timeout: 5000,
   });
-  return result.status === 0 ? String(result.stdout ?? "").trim() : "";
+  if (result.error || result.status !== 0) return null;
+  return String(result.stdout ?? "").trim() || null;
 }
 
 function sameLockOwner(left, right) {
@@ -208,35 +227,40 @@ export function acquireInstanceLock(lockPath, options = {}) {
   const fsImpl = options.fsImpl ?? fs;
   const pid = Number(options.pid ?? process.pid);
   const startedAt = options.startedAt ?? new Date().toISOString();
-  const token = crypto.randomUUID();
+  const token = options.instanceToken ?? crypto.randomUUID();
+  if (typeof token !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(token)) throw new Error("Invalid instance token");
   const metadata = { pid, startedAt, token };
   fsImpl.mkdirSync(path.dirname(lockPath), { recursive: true });
   const validateOwner = (existing) => {
     let existingOwnerValid = processAlive(Number(existing?.pid));
     if (existingOwnerValid && typeof options.validateExistingProcess === "function") {
       try {
-        existingOwnerValid = options.validateExistingProcess(existing) !== false;
+        const identity = options.validateExistingProcess(existing);
+        if (identity === null || identity === "unknown") return "unknown";
+        existingOwnerValid = identity !== false;
       } catch {
-        existingOwnerValid = false;
+        return "unknown";
       }
     }
     if (existingOwnerValid && typeof options.validateExistingLock === "function") {
       try {
         existingOwnerValid = options.validateExistingLock(existing) !== false;
       } catch {
-        existingOwnerValid = false;
+        return "unknown";
       }
     }
-    return existingOwnerValid;
+    return existingOwnerValid ? "owned" : "absent";
   };
   if (!createLockFile(lockPath, metadata, fsImpl)) {
     const existing = readJsonObject(lockPath, fsImpl);
-    if (validateOwner(existing)) return { acquired: false, existing };
+    const identity = validateOwner(existing);
+    if (identity !== "absent") return { acquired: false, existing, identityUnknown: identity === "unknown" };
     const recovery = acquireRecoveryGuard(lockPath, { fsImpl, pid });
     if (!recovery) return { acquired: false, existing: { ...existing, recoveryInProgress: true } };
     try {
       const current = readJsonObject(lockPath, fsImpl);
-      if (validateOwner(current)) return { acquired: false, existing: current };
+      const currentIdentity = validateOwner(current);
+      if (currentIdentity !== "absent") return { acquired: false, existing: current, identityUnknown: currentIdentity === "unknown" };
       if (fsImpl.existsSync(lockPath)) {
         const stalePath = `${lockPath}.stale-${Date.now()}-${crypto.randomUUID()}`;
         fsImpl.renameSync(lockPath, stalePath);
@@ -708,6 +732,9 @@ export function parseArguments(argv) {
     values[name] = argv[index + 1];
     index += 1;
   }
+  if (values["codex-exe"] !== undefined && values["codex-exe"].trim().length === 0) {
+    throw new Error("CODEX_EXECUTABLE_EXPLICIT_EMPTY");
+  }
   for (const name of [
     "runtime-state",
     "log",
@@ -721,7 +748,15 @@ export function parseArguments(argv) {
   ]) {
     if (!values[name]) throw new Error(`缺少参数 --${name}`);
   }
+  if (Boolean(values["inner-managed-profile"]) !== Boolean(values["inner-managed-profile-sha256"])
+    || (values["inner-managed-profile-sha256"] && !/^[0-9a-f]{64}$/u.test(values["inner-managed-profile-sha256"]))) {
+    throw new Error("INNER_PROFILE_PATH_SHA256_PAIR_REQUIRED");
+  }
   return {
+    ...(values["inner-managed-profile"] ? { innerManagedProfilePath: requiredPath(values["inner-managed-profile"], "inner-managed-profile"),
+      innerManagedProfileSha256: values["inner-managed-profile-sha256"] } : {}),
+    instanceToken: values["instance-token"] ?? null,
+    launchReceiptPath: values["launch-receipt"] ? requiredPath(values["launch-receipt"], "launch-receipt") : null,
     runtimeStatePath: requiredPath(values["runtime-state"], "runtime-state"),
     logPath: requiredPath(values.log, "log"),
     stopFilePath: requiredPath(values["stop-file"], "stop-file"),
@@ -753,8 +788,44 @@ export function parseArguments(argv) {
       300000,
     ),
     executablePath: values["codex-exe"] ? path.resolve(values["codex-exe"]) : null,
+    displayPolicyRoot: values["display-policy-root"] ? requiredPath(values["display-policy-root"], "display-policy-root") : null,
+    outerRuntimeRoot: values["outer-runtime-root"] ? requiredPath(values["outer-runtime-root"], "outer-runtime-root") : null,
+    requestMetadata: { enabled: strictBoolean(values["request-metadata-enabled"], "request-metadata-enabled") },
   };
 }
+
+export async function waitForLaunchPublication(options = {}) {
+  if (!options.launchReceiptPath) return true;
+  const fsImpl = options.fsImpl ?? fs;
+  const expectedPid = Number(options.pid ?? process.pid);
+  const deadline = Date.now() + (options.launchPublicationTimeoutMs ?? 10000);
+  do {
+    try {
+      const receiptBytes = fsImpl.readFileSync(options.launchReceiptPath);
+      const ready = JSON.parse(fsImpl.readFileSync(`${options.launchReceiptPath}.ready`, "utf8"));
+      const receipt = JSON.parse(receiptBytes.toString("utf8"));
+      if (ready.instanceToken === options.instanceToken
+        && ready.receiptSha256 === crypto.createHash("sha256").update(receiptBytes).digest("hex")
+        && receipt.instanceToken === options.instanceToken
+        && Number(receipt.pid) === expectedPid
+        && path.resolve(receipt.runtimeStatePath) === path.resolve(options.runtimeStatePath)) return true;
+    } catch {}
+    await new Promise(resolve => setTimeout(resolve, 25));
+  } while (Date.now() < deadline);
+  return false;
+}
+
+export const proxyServiceDependencies = Object.freeze({
+  atomicWriteJson, appendJsonLine, updateMaintenance, publicError, wait, observeEmptyDesktopRestart,
+  createOperationGuard, findExecutableRefresh, createWakeJournal, createCodexAppServerProxy, codexCandidates,
+  executableRevision, verifyCodexRuntimeBundle, prepareCodexRuntimeBundle, runExecutableProbe, spawnAppServer,
+  waitWithAbort, waitForWebSocketReady, verifyManagedListenerOwner, resolveProxyFailureArtifacts, waitForExit,
+  terminateManagedAppServer, processAlive, selectRecoveryUpstreamPort,
+  defaults: Object.freeze({ emptyClientRestartMs: DEFAULT_EMPTY_CLIENT_RESTART_MS,
+    executableRefreshIntervalMs: DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS, livenessIntervalMs: DEFAULT_LIVENESS_INTERVAL_MS,
+    refreshBudgetMs: DEFAULT_REFRESH_BUDGET_MS, startTimeoutMs: DEFAULT_START_TIMEOUT_MS,
+    bundleDeepCheckIntervalMs: DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS, restartBackoffMs: DEFAULT_RESTART_BACKOFF_MS }),
+});
 
 export async function runCodexAppServerProxyService(options = {}) {
   const fsImpl = options.fsImpl ?? fs;
@@ -766,12 +837,17 @@ export async function runCodexAppServerProxyService(options = {}) {
   if (fsImpl.existsSync(options.stopFilePath)) {
     return { state: "failed", pid, error: { code: "STOP_REQUIREMENT_STILL_PRESENT", message: "The existing stop requirement must be resolved by its owner before starting." } };
   }
+  if (!await waitForLaunchPublication({ ...options, fsImpl, pid })) {
+    return { state: "failed", pid, error: { code: "START_LAUNCH_NOT_PUBLISHED", message: "The bound startup receipt was not completely published; runtime resources were not acquired." } };
+  }
   const lock = acquireInstanceLock(options.lockPath, {
     fsImpl,
     pid,
     startedAt,
+    instanceToken: options.instanceToken ?? undefined,
     validateExistingProcess: (metadata) => {
       const commandLine = (options.processCommandLine ?? processCommandLine)(Number(metadata?.pid));
+      if (typeof commandLine !== "string" || !commandLine.trim()) return "unknown";
       const normalized = commandLine.toLowerCase();
       return normalized.includes("codex-app-server-proxy-runner.mjs")
         && normalized.includes(options.runtimeStatePath.toLowerCase())
@@ -789,7 +865,10 @@ export async function runCodexAppServerProxyService(options = {}) {
         && processAlive(Number(metadata?.pid));
     },
   });
-  if (!lock.acquired) return { state: "duplicate", pid, existingLock: lock.existing };
+  if (!lock.acquired) {
+    if (lock.identityUnknown) return { state: "failed", pid, existingLock: lock.existing, error: { code: "EXISTING_PROCESS_IDENTITY_UNKNOWN", message: "The existing process identity could not be queried; its runtime and lock were preserved." } };
+    return { state: "duplicate", pid, existingLock: lock.existing };
+  }
   if (fsImpl.existsSync(options.stopFilePath)) {
     lock.release();
     return { state: "failed", pid, error: { code: "STOP_REQUIREMENT_STILL_PRESENT", message: "A stop requirement appeared while acquiring the instance lock." } };
@@ -803,6 +882,7 @@ export async function runCodexAppServerProxyService(options = {}) {
   let preparedLaunch = null;
   const bundleRefreshState = { nextDeepCheckAt: 0 };
   let appServer = null;
+  const createdChildPids = new Set();
   let proxy = null;
   let stopRequested = false;
   let stopReason = null;
@@ -835,450 +915,77 @@ export async function runCodexAppServerProxyService(options = {}) {
     livenessAt: startedAt,
   };
   const ownsLock = () => lock.isOwner();
-  const persist = (patch = {}) => {
-    if (!ownsLock()) throw new CodexAppServerProxyError("INSTANCE_LOCK_LOST", "Codex App Server proxy instance no longer owns the lifecycle lock");
-    const persistedAt = now().toISOString();
-    status = { ...status, ...patch, livenessAt: persistedAt, updatedAt: persistedAt };
-    atomicWriteJson(options.runtimeStatePath, status, fsImpl);
-    return status;
-  };
-  const log = (type, details = {}) => appendJsonLine(options.logPath, {
-    at: now().toISOString(),
-    type,
-    pid,
-    ...details,
-  }, fsImpl);
-  const requestStop = (reason) => {
-    stopRequested = true;
-    if (!stopReason) stopReason = reason;
-  };
-  const installSignals = () => {
-    const handlers = new Map();
-    for (const signal of ["SIGINT", "SIGTERM"]) {
-      const handler = () => requestStop(`signal:${signal}`);
-      process.on(signal, handler);
-      handlers.set(signal, handler);
-    }
-    return () => {
-      for (const [signal, handler] of handlers) process.removeListener(signal, handler);
-    };
-  };
-  const markFatal = (error) => {
-    if (!ownsLock()) return false;
-    const errorValue = publicError(error, "CODEX_PROXY_INCOMPATIBLE");
-    const at = now().toISOString();
-    updateMaintenance(options.maintenanceFilePath, "codexAppServerProxy", {
-      at,
-      code: errorValue.code,
-      message: errorValue.message,
-    }, fsImpl);
-    atomicWriteJson(options.alertFilePath, {
-      schemaVersion: 1,
-      pending: true,
-      status: "pending",
-      createdAt: at,
-      source: "codex-app-server-proxy",
-      incidentKey: `codex-app-server-proxy:${errorValue.code}`,
-      code: errorValue.code,
-      message: errorValue.message,
-      text: `[Codex 自动唤醒已暂停]\n原因：${errorValue.code}\n详情：${errorValue.message}\n普通 Codex 启动将回退到原生 App Server，请检查本机状态。`,
-    }, fsImpl);
-    atomicWriteJson(options.fallbackFilePath, {
-      schemaVersion: 1,
-      pending: true,
-      createdAt: at,
-      expectedProxyUrl: status.downstreamUrl,
-      code: errorValue.code,
-      message: errorValue.message,
-    }, fsImpl);
-    persist({
-      state: "degraded",
-      compatible: false,
-      automationEnabled: false,
-      fallbackRequired: true,
-      lastError: errorValue,
-    });
-    log("proxy_fatal", { error: errorValue });
-    return true;
-  };
+  const diagnosticStorageFailures = new Set();
+  const serviceRuntimeState = { options, fsImpl, now, pid, lock, diagnosticStorageFailures, bundleRefreshState,
+    controlToken, createdChildPids, excludedUpstreamPorts, startupDeadlineAt, diagnosticStorageWarningAt: 0, dependencies: {} };
+  Object.defineProperties(serviceRuntimeState, {
+    currentExecutableRevision: { get: () => currentExecutableRevision, set: value => { currentExecutableRevision = value; } },
+    currentExecutable: { get: () => currentExecutable, set: value => { currentExecutable = value; } },
+    upstreamPort: { get: () => upstreamPort, set: value => { upstreamPort = value; } },
+    preparedLaunch: { get: () => preparedLaunch, set: value => { preparedLaunch = value; } },
+    appServer: { get: () => appServer, set: value => { appServer = value; } },
+    proxy: { get: () => proxy, set: value => { proxy = value; } },
+    stopRequested: { get: () => stopRequested, set: value => { stopRequested = value; } },
+    stopReason: { get: () => stopReason, set: value => { stopReason = value; } },
+    signalCleanup: { get: () => signalCleanup, set: value => { signalCleanup = value; } },
+    startupGuard: { get: () => startupGuard, set: value => { startupGuard = value; } },
+    restartFailureCount: { get: () => restartFailureCount, set: value => { restartFailureCount = value; } },
+    shutdownError: { get: () => shutdownError, set: value => { shutdownError = value; } },
+    status: { get: () => status, set: value => { status = value; } },
+  });
+  const serviceRuntime = createProxyServiceCodeRuntime(serviceRuntimeState);
+  const { persist, log, requestStop, installSignals, markFatal, pauseForUpstream, resumeAfterUpstream } = serviceRuntime;
 
   try {
-    signalCleanup = installSignals();
-    persist();
-    const journal = options.journal ?? createWakeJournal({ filePath: options.journalPath, fsImpl, now });
-    const pauseForUpstream = (code, message) => ownsLock() && updateMaintenance(
-      options.maintenanceFilePath,
-      "codexAppServerProxyUpstream",
-      { at: now().toISOString(), code, message },
-      fsImpl,
-    );
-    const resumeAfterUpstream = () => ownsLock() && updateMaintenance(
-      options.maintenanceFilePath,
-      "codexAppServerProxyUpstream",
-      null,
-      fsImpl,
-    );
-    proxy = (options.createProxy ?? createCodexAppServerProxy)({
-      upstreamPaused: true,
-      downstreamPort: options.downstreamPort,
-      controlPort: options.controlPort,
-      upstreamUrl: status.upstreamUrl,
-      controlToken,
-      requestTimeoutMs: options.requestTimeoutMs,
-      resumeRequestTimeoutMs: options.resumeRequestTimeoutMs,
-      journal,
-      maintenanceFilePath: options.maintenanceFilePath,
-      onEvent: (event) => {
-        if (event.type === "upstream_reconnect_scheduled") {
-          pauseForUpstream("APP_SERVER_RECONNECTING", "Codex App Server 上游暂时不可用，自动唤醒已暂停并等待恢复");
-        } else if (event.type === "upstream_connected") {
-          resumeAfterUpstream();
-        }
-        if (["proxy_error", "upstream_session_lost", "upstream_connected"].includes(event.type)) {
-          persist({
-            proxy: proxy?.status() ?? null,
-            ...(event.type === "proxy_error" ? { lastError: event.error } : {}),
-          });
-        }
-        log(event.type, event);
-      },
-    });
-    await proxy.start();
-    persist({ proxy: proxy.status() });
-    const shouldStop = () => stopRequested || fsImpl.existsSync(options.stopFilePath);
-    startupGuard = createOperationGuard(Math.max(1, startupDeadlineAt - Date.now()), shouldStop);
-    const candidates = codexCandidates({
-      fsImpl,
-      executablePath: options.executablePath,
-      localAppData: options.localAppData,
-    });
-    const orderedCandidates = [...new Set([
-      ...candidates,
-      status.lastKnownGoodExecutablePath,
-    ].filter(Boolean))];
-    let lastProbeError = null;
-    const bundleRoot = options.bundleRoot ?? path.join(path.dirname(options.runtimeStatePath), "codex-runtime-bundles");
-    for (const candidate of orderedCandidates) {
-      try {
-        startupGuard.check();
-        const preparationOptions = {
-          bundleRoot,
-          validateBundleSignature: options.validateBundleSignature,
-          signal: startupGuard.signal,
-          shouldStop,
-        };
-        const candidateBundleRoot = path.dirname(path.dirname(path.resolve(candidate)));
-        const isCachedBundle = process.platform === "win32"
-          ? candidateBundleRoot.toLowerCase() === path.resolve(bundleRoot).toLowerCase()
-          : candidateBundleRoot === path.resolve(bundleRoot);
-        const revision = options.executablePath
-          ? executableRevision(candidate, fsImpl)
-          : isCachedBundle
-            ? await verifyCodexRuntimeBundle(candidate, preparationOptions)
-            : await prepareCodexRuntimeBundle(candidate, preparationOptions);
-        startupGuard.check();
-        const probed = await runExecutableProbe(revision.executablePath, upstreamPort, {
-          ...options,
-          signal: startupGuard.signal,
-          timeoutMs: Math.min(options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, Math.max(1, startupDeadlineAt - Date.now())),
-          keepAliveAfterProbe: true,
-        });
-        preparedLaunch = probed?.launched ?? null;
-        appServer = preparedLaunch?.child ?? null;
-        startupGuard.check();
-        currentExecutable = revision.executablePath;
-        currentExecutableRevision = revision;
-        bundleRefreshState.nextDeepCheckAt = Date.now() + (options.bundleDeepCheckIntervalMs ?? DEFAULT_BUNDLE_DEEP_CHECK_INTERVAL_MS);
-        break;
-      } catch (error) {
-        if (error?.code === "APP_SERVER_START_CANCELLED") throw error;
-        if (startupGuard.signal.aborted) throw startupGuard.signal.reason;
-        lastProbeError = error;
-        log("candidate_probe_failed", { executablePath: candidate, error: publicError(error) });
-      }
-    }
-    if (!currentExecutable) {
-      throw lastProbeError ?? new CodexAppServerProxyError("CODEX_APP_SERVER_NOT_FOUND", "没有可用的 Codex App Server 可执行文件");
-    }
-    persist({
-      executablePath: currentExecutable,
-      lastKnownGoodExecutablePath: currentExecutable,
-      compatible: true,
-      fallbackRequired: false,
-      lastError: null,
-    });
+    options.onServiceCodeParticipant?.(serviceRuntime.liveCodeParticipant());
+    await serviceRuntime.initializeService();
     while (!stopRequested && !fsImpl.existsSync(options.stopFilePath)) {
-      const launchGuard = startupGuard ?? createOperationGuard(options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, shouldStop);
-      launchGuard.check();
-      const launched = preparedLaunch ?? (options.spawnAppServer ?? spawnAppServer)(currentExecutable, upstreamPort, options);
-      preparedLaunch = null;
-      appServer = launched.child;
-      persist({
-        appServerPid: appServer.pid ?? null,
-        appServerStartedAt: now().toISOString(),
-      });
-      try {
-        await waitWithAbort((options.waitForWebSocketReady ?? waitForWebSocketReady)(status.upstreamUrl, {
-          ...options,
-          signal: launchGuard.signal,
-          timeoutMs: options.startTimeoutMs,
-        }), launchGuard.signal);
-        launchGuard.check();
-        if (appServer.exitCode !== null || appServer.signalCode !== null) {
-          throw new CodexAppServerProxyError("APP_SERVER_START_EXITED", "受管 App Server 在启动验证期间退出，不能将其它监听者视为启动成功");
-        }
-        const listenerOwned = await (options.verifyListenerOwner ?? verifyManagedListenerOwner)(appServer, upstreamPort, { signal: launchGuard.signal });
-        launchGuard.check();
-        if (!listenerOwned) {
-          throw new CodexAppServerProxyError("APP_SERVER_LISTENER_OWNER_MISMATCH", "启动探针对应的监听端口不属于受管子进程，尚未放行桌面消息");
-        }
-        launchGuard.close();
-        if (launchGuard === startupGuard) startupGuard = null;
-        proxy.resumeUpstream?.();
-        resumeAfterUpstream();
-        restartFailureCount = 0;
-        persist({
-          state: "running",
-          compatible: true,
-          automationEnabled: true,
-          fallbackRequired: false,
-          executablePath: currentExecutable,
-          lastKnownGoodExecutablePath: currentExecutable,
-          appServerPid: appServer.pid ?? null,
-          proxy: proxy.status(),
-          restartFailureCount,
-          lastError: null,
-        });
-        if (ownsLock()) {
-          updateMaintenance(options.maintenanceFilePath, "codexAppServerProxy", null, fsImpl);
-          resolveProxyFailureArtifacts(options, status, fsImpl, now);
-        }
-        log("app_server_started", { executablePath: currentExecutable, appServerPid: appServer.pid ?? null });
-        const appServerExit = waitForExit(appServer);
-        let exit;
-        let emptyDesktopRestartState = {
-          sawDesktopClient: Number(proxy.status()?.clientCount ?? 0) > 0,
-          emptySinceMs: null,
-        };
-        while (true) {
-          let cycleActive = true;
-          const lifecycleWatch = (async () => {
-            let nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
-            let nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
-            while (cycleActive) {
-              await wait(options.lifecyclePollIntervalMs ?? 250);
-              if (!cycleActive) return { code: null, signal: "watch_stopped" };
-              if (stopRequested || fsImpl.existsSync(options.stopFilePath)) {
-                return { code: null, signal: "stop_requested" };
-              }
-              const proxySnapshot = proxy.status();
-              const emptyDesktop = observeEmptyDesktopRestart(emptyDesktopRestartState, {
-                clientCount: proxySnapshot?.clientCount,
-                nowMs: Date.now(),
-                restartMs: options.emptyClientRestartMs ?? DEFAULT_EMPTY_CLIENT_RESTART_MS,
-              });
-              emptyDesktopRestartState = emptyDesktop.state;
-              if (emptyDesktop.shouldRestart) {
-                return { code: null, signal: "desktop_empty_restart", emptyForMs: emptyDesktop.emptyForMs };
-              }
-              if (Date.now() >= nextLivenessAt) {
-                nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
-                persist({ proxy: proxySnapshot });
-              }
-              if (Date.now() < nextRefreshAt) continue;
-              nextRefreshAt = Date.now() + (options.executableRefreshIntervalMs ?? DEFAULT_EXECUTABLE_REFRESH_INTERVAL_MS);
-              const refreshGuard = createOperationGuard(options.refreshBudgetMs ?? DEFAULT_REFRESH_BUDGET_MS, shouldStop);
-              let revision;
-              try {
-                revision = await findExecutableRefresh(currentExecutableRevision, {
-                  ...options,
-                  fsImpl,
-                  bundleRefreshState,
-                  proxyStatus: () => proxy.status(),
-                  signal: refreshGuard.signal,
-                  shouldStop,
-                  checkActive: refreshGuard.check,
-                });
-                refreshGuard.check();
-              } catch (error) {
-                if (error?.code === "APP_SERVER_START_CANCELLED" || shouldStop()) {
-                  return { code: null, signal: "stop_requested" };
-                }
-                bundleRefreshState.nextAttemptAt = Date.now() + 5000;
-                log("candidate_refresh_probe_failed", { error: publicError(error) });
-                revision = null;
-              } finally {
-                refreshGuard.close();
-              }
-              if (!cycleActive) return { code: null, signal: "watch_stopped" };
-              if (revision) return { code: null, signal: "executable_refresh", revision };
-            }
-            return { code: null, signal: "watch_stopped" };
-          })();
-          exit = await Promise.race([appServerExit, lifecycleWatch]);
-          cycleActive = false;
-          if (exit.signal === "desktop_empty_restart" && Number(proxy.status()?.clientCount ?? 0) !== 0) {
-            log("app_server_desktop_empty_restart_deferred", {
-              clientCount: Number(proxy.status()?.clientCount ?? 0),
-            });
-            emptyDesktopRestartState = {};
-            continue;
-          }
-          if (exit.signal !== "executable_refresh" || Number(proxy.status()?.clientCount ?? 0) === 0) break;
-          log("app_server_executable_refresh_deferred", {
-            nextExecutable: exit.revision,
-            clientCount: Number(proxy.status()?.clientCount ?? 0),
-          });
-        }
-        if (stopRequested || fsImpl.existsSync(options.stopFilePath)) break;
-        if (exit.signal === "executable_refresh") {
-          const previousExecutable = currentExecutableRevision;
-          currentExecutableRevision = exit.revision;
-          currentExecutable = exit.revision.executablePath;
-          pauseForUpstream("APP_SERVER_REFRESHING", "检测到 Codex 更新，正在安全切换受管 App Server");
-          persist({
-            state: "refreshing",
-            automationEnabled: false,
-            executablePath: currentExecutable,
-            lastKnownGoodExecutablePath: currentExecutable,
-            lastError: null,
-          });
-          log("app_server_executable_refresh", { previousExecutable, nextExecutable: exit.revision });
-          continue;
-        }
-        if (exit.signal === "desktop_empty_restart") {
-          restartFailureCount = 0;
-          pauseForUpstream("APP_SERVER_DESKTOP_EMPTY_RESTARTING", "Desktop 已全部断开，正在重启受管 App Server");
-          persist({
-            state: "restarting",
-            automationEnabled: false,
-            proxy: proxy.status(),
-            restartFailureCount,
-            lastError: null,
-          });
-          log("app_server_desktop_empty_restart", {
-            emptyForMs: exit.emptyForMs ?? null,
-            appServerPid: appServer.pid ?? null,
-          });
-          continue;
-        }
-        restartFailureCount += 1;
-        pauseForUpstream("APP_SERVER_EXITED", "Codex App Server 意外退出，自动唤醒已暂停并等待透明中转恢复");
-        persist({
-          state: "restarting",
-          automationEnabled: false,
-          appServerPid: null,
-          proxy: proxy.status(),
-          restartFailureCount,
-          lastError: {
-            code: "APP_SERVER_EXITED",
-            message: `App Server 意外退出：code=${exit.code ?? "null"}, signal=${exit.signal ?? "null"}`,
-            stderr: launched.stderr(),
-          },
-        });
-        log("app_server_exited", { ...exit, stderr: launched.stderr(), restartFailureCount });
-      } catch (error) {
-        if (error?.code === "APP_SERVER_START_CANCELLED") throw error;
-        restartFailureCount += 1;
-        pauseForUpstream("APP_SERVER_START_FAILED", "Codex App Server 启动失败，自动唤醒已暂停并等待重试");
-        persist({
-          state: "restarting",
-          automationEnabled: false,
-          appServerPid: null,
-          restartFailureCount,
-          lastError: publicError(error),
-        });
-        log("app_server_start_failed", { error: publicError(error), restartFailureCount });
-      } finally {
-        if (launchGuard !== startupGuard) launchGuard.close();
-        proxy.pauseUpstream?.();
-        try {
-          await terminateManagedAppServer(appServer, upstreamPort, options);
-          appServer = null;
-          persist({ appServerPid: null });
-        } catch (error) {
-          if (error.code !== "APP_SERVER_PORT_STILL_OCCUPIED"
-            || (appServer.exitCode === null && appServer.signalCode === null && processAlive(Number(appServer.pid)))) throw error;
-          const previousPort = upstreamPort;
-          excludedUpstreamPorts.add(previousPort);
-          appServer = null;
-          persist({ appServerPid: null });
-          if (shouldStop()) {
-            log("app_server_retained_port_on_stop", { port: previousPort });
-          } else {
-            upstreamPort = await selectRecoveryUpstreamPort(options.upstreamPort, excludedUpstreamPorts, {
-              ...options,
-              shouldStop,
-            });
-            if (shouldStop()) break;
-            const upstreamUrl = `ws://127.0.0.1:${upstreamPort}`;
-            proxy.setUpstreamUrl(upstreamUrl);
-            persist({ upstreamUrl, proxy: proxy.status() });
-            log("app_server_upstream_port_rotated", { previousPort, upstreamPort });
-          }
-        }
-      }
-      if (restartFailureCount >= DEFAULT_RESTART_BACKOFF_MS.length) {
-        markFatal(new CodexAppServerProxyError(
-          "APP_SERVER_RESTART_EXHAUSTED",
-          "Codex App Server 连续恢复失败，已暂停 NapCat 自动唤醒并请求下次启动回到原生模式",
-          { details: { restartFailureCount } },
-        ));
-        requestStop("fallback_required");
-        break;
-      }
-      const backoff = DEFAULT_RESTART_BACKOFF_MS[Math.min(restartFailureCount - 1, DEFAULT_RESTART_BACKOFF_MS.length - 1)];
-      await wait(backoff, startupGuard?.signal);
+      const decision = await serviceRuntime.runBackendCycle();
+      if (decision?.stop || stopRequested || fsImpl.existsSync(options.stopFilePath)) break;
+      if (!decision?.skipBackoff && await serviceRuntime.restartBackoff()) break;
     }
     stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
-    persist({ state: "stopping", automationEnabled: false, stopReason });
+    persist({ state: "stopping", automationEnabled: false, stopReason }, { allowStorageDegradation: true });
   } catch (error) {
     if (error?.code === "APP_SERVER_START_CANCELLED" || stopRequested || fsImpl.existsSync(options.stopFilePath)) {
       stopReason = stopReason ?? (fsImpl.existsSync(options.stopFilePath) ? "stop_file" : "requested");
-      persist({ state: "stopping", automationEnabled: false, stopReason });
+      persist({ state: "stopping", automationEnabled: false, stopReason }, { allowStorageDegradation: true });
     } else {
       markFatal(error);
       return { state: "failed", pid, error: publicError(error) };
     }
   } finally {
-    startupGuard?.close();
-    signalCleanup();
-    await proxy?.close().catch(() => {});
-    try {
-      await terminateManagedAppServer(appServer, upstreamPort, options);
-      appServer = null;
-    } catch (error) {
-      shutdownError = error;
-      markFatal(error);
-      log("app_server_termination_failed", {
-        appServerPid: appServer?.pid ?? status.appServerPid ?? null,
-        error: publicError(error),
-      });
-    }
-    if (ownsLock() && !shutdownError && status.state !== "degraded") {
-      persist({
-        state: "stopped",
-        automationEnabled: false,
-        appServerPid: null,
-        proxy: proxy?.status() ?? null,
-        stopReason: stopReason ?? "completed",
-      });
-    }
-    log(ownsLock() ? (shutdownError ? "proxy_service_degraded" : "proxy_service_stopped") : "proxy_service_lock_lost", {
-      stopReason: stopReason ?? "completed",
-      appServerPid: shutdownError ? (appServer?.pid ?? status.appServerPid ?? null) : null,
-      error: shutdownError ? publicError(shutdownError) : null,
-    });
-    lock.release();
+    await serviceRuntime.finishService();
   }
   return shutdownError
     ? { state: "failed", pid, stopReason, error: publicError(shutdownError) }
     : { state: "stopped", pid, stopReason };
 }
+export async function runManagedInnerProfile(options, argv, serviceDependencies = {}) {
+  const names = argv.filter((_value, index) => index % 2 === 0);
+  if (names.filter(name => name === "--inner-managed-profile").length !== 1
+    || names.filter(name => name === "--inner-managed-profile-sha256").length !== 1
+    || new Set(names).size !== names.length) throw new Error("INNER_PROFILE_DUPLICATE_ARGUMENTS");
+  if (!/^[0-9a-f]{64}$/u.test(options.innerManagedProfileSha256 ?? "")) throw new Error("INNER_PROFILE_PATH_SHA256_PAIR_REQUIRED");
+  const { readInnerRuntimeProfile } = await import("./inner-runtime-profile.mjs");
+  const profile = readInnerRuntimeProfile(options.innerManagedProfilePath, { options, runnerPath: fileURLToPath(import.meta.url) });
+  if (!await waitForLaunchPublication(options)) throw new Error("START_LAUNCH_NOT_PUBLISHED");
+  const outerArguments = argv.filter((value, index) => !["--inner-managed-profile", "--inner-managed-profile-sha256"].includes(value)
+    && !["--inner-managed-profile", "--inner-managed-profile-sha256"].includes(argv[index - 1]));
+  const { createManagedInnerProxySession } = await import("./inner-managed-session.mjs");
+  const managedEvents = serviceDependencies.onManagedEvent ?? createManagedEventObserver({
+    filePath: path.join(profile.stateRoot, "inner-coordinator-events.jsonl"),
+  });
+  const session = createManagedInnerProxySession({ ...profile, outerArguments }, managedEvents, serviceDependencies);
+  await session.start();
+  return session.waitForClose();
+}
 
 async function main() {
   const options = parseArguments(process.argv.slice(2));
-  const result = await runCodexAppServerProxyService(options);
+  const result = options.innerManagedProfilePath
+    ? await runManagedInnerProfile(options, process.argv.slice(2))
+    : await runCodexAppServerProxyService(options);
   if (result.state === "stopped") process.exit(0);
   if (result.state === "failed") {
     process.stderr.write(`${JSON.stringify(result)}\n`);

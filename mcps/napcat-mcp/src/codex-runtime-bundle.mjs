@@ -5,6 +5,7 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 import { pipeline } from "node:stream/promises";
 import { promisify } from "node:util";
+import { windowsPowerShellEnvironment } from "./windows-powershell-environment.mjs";
 
 const execFileAsync = promisify(execFile);
 const REQUIRED_FILES = ["codex.exe", "codex-code-mode-host.exe", "codex-command-runner.exe", "codex-windows-sandbox-setup.exe"];
@@ -110,8 +111,10 @@ export async function validateOpenAiSignatures(bundleRoot, entries, options = {}
   if (process.platform !== "win32") throw new Error("OpenAI runtime signature verification requires Windows");
   const executables = entries.filter((entry) => entry.name.toLowerCase().endsWith(".exe"));
   const encodedPaths = executables.map((entry) => path.join(bundleRoot, entry.name));
-  const script = `$ErrorActionPreference = 'Stop'; $paths = ConvertFrom-Json '${JSON.stringify(encodedPaths).replaceAll("'", "''")}'; foreach ($item in $paths) { $signature = Get-AuthenticodeSignature -LiteralPath $item; if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O="OpenAI OpCo, LLC"') { throw "Invalid OpenAI signature: $item" } }`;
-  await execFileAsync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true, timeout: 60000, signal: options.signal });
+  const child = windowsPowerShellEnvironment();
+  const securityModule = path.win32.join(child.modulesPath, "Microsoft.PowerShell.Security", "Microsoft.PowerShell.Security.psd1").replaceAll("'", "''");
+  const script = `$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); Import-Module '${securityModule}' -ErrorAction Stop; $paths = ConvertFrom-Json '${JSON.stringify(encodedPaths).replaceAll("'", "''")}'; foreach ($item in $paths) { $signature = Get-AuthenticodeSignature -LiteralPath $item; if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch 'O="OpenAI OpCo, LLC"') { throw "Invalid OpenAI signature: $item" } }`;
+  await execFileAsync(child.executable, ["-NoProfile", "-NonInteractive", "-Command", script], { env: child.environment, windowsHide: true, timeout: 60000, signal: options.signal });
   checkActive(options);
 }
 

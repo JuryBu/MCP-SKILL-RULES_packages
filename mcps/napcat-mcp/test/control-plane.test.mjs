@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { createControlPlane } from "../src/control-plane.mjs";
 import { createControlState } from "../src/control-state.mjs";
+import { createWakeJournal } from "../src/codex-app-server-proxy.mjs";
 
 const BASE_TIME = "2026-08-09T00:00:00.000Z";
 const PLACEHOLDER_OWNER_PRIVATE_ID = "1999000001";
@@ -84,8 +85,10 @@ function createFixture(options = {}) {
     },
   };
   const bridge = {
+    ...(options.inspectWake ? { inspectWake: options.inspectWake } : {}),
     wake: async (input) => {
       wakeCalls.push(structuredClone(input));
+      if (options.wakeImplementation) return options.wakeImplementation(input);
       return options.wakeResult ?? {
         outcome: "accepted",
         status: "busy",
@@ -988,6 +991,173 @@ test("owner routes without business task ids use distinct bridge subscriptions",
       "owner-reply:group-route",
     ]);
     assert.notEqual(fixture.wakeCalls[0].taskId, fixture.wakeCalls[1].taskId);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("owner routes linked to one machine task keep independent owner subscriptions", async () => {
+  const fixture = createFixture();
+  try {
+    for (const [routeKey, targetKey, conversationId] of [
+      ["private-route", "owner-private", "conversation-private"],
+      ["group-route", "owner-group", "conversation-group"],
+    ]) {
+      await fixture.controlPlane.registerOwnerRoute({
+        route_key: routeKey,
+        conversation_id: conversationId,
+        target_key: targetKey,
+        task_id: "shared-machine-task",
+      });
+      await fixture.controlPlane.sendOwnerAlert({
+        route_key: routeKey,
+        summary: "linked task alert",
+        dedupe_key: `linked-${routeKey}`,
+      });
+    }
+    for (const [targetKey, replyMessageId, messageSeq] of [
+      ["owner-private", "500", 31],
+      ["owner-group", "501", 32],
+    ]) {
+      fixture.targetHistory.set(targetKey, [{
+        isSelf: false,
+        replyMessageId,
+        senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+        messageSeq,
+        time: BASE_TIME,
+        text: "owner reply for linked task",
+        mentionedUserIds: ["1000000001"],
+      }]);
+    }
+
+    const scan = await fixture.controlPlane.scanOwnerReplies();
+    assert.deepEqual(scan.results.map(result => result.outcome), [
+      "owner_reply_delivered",
+      "owner_reply_delivered",
+    ]);
+    assert.deepEqual(fixture.wakeCalls.map(call => call.taskId), [
+      "owner-reply:private-route",
+      "owner-reply:group-route",
+    ]);
+    for (const call of fixture.wakeCalls) {
+      assert.equal(call.generation, 1);
+      assert.equal(call.sourceMachine, "owner");
+      assert.match(call.prompt, /task_id=shared-machine-task/);
+    }
+    assert.equal(fixture.state.getOwnerRoute("private-route").taskId, "shared-machine-task");
+    await fixture.controlPlane.scanOwnerReplies();
+    assert.equal(fixture.wakeCalls.length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+for (const priorStatus of ["prepared", "unknown", "accepted", "completed", "recovered", "failed_before_send"]) {
+  test(`legacy owner wake retains its original identity without replay: ${priorStatus}`, async () => {
+    let journal;
+    let seeding = true;
+    let dispatched = 0;
+    const fixture = createFixture({
+      inspectWake: async wakeId => journal?.getWake(wakeId) ?? null,
+      wakeImplementation: async input => {
+        if (seeding) return { outcome: "unknown", status: "unknown" };
+        journal.registerSubscription(input);
+        const claimed = journal.claimWake(input);
+        if (claimed.acquired) {
+          dispatched += 1;
+          journal.writeWake(input.wakeId, { status: "accepted" });
+          return { outcome: "accepted", started: true };
+        }
+        return ["accepted", "completed", "recovered"].includes(claimed.wake.status)
+          ? { outcome: "accepted", duplicateSuppressed: true }
+          : { outcome: "unknown", started: null, duplicateSuppressed: true };
+      },
+    });
+    try {
+      await fixture.controlPlane.registerOwnerRoute({ route_key: "legacy-route", conversation_id: "conversation-private", task_id: "shared-machine-task" });
+      await fixture.controlPlane.sendOwnerAlert({ route_key: "legacy-route", summary: "legacy alert", dedupe_key: "legacy-alert" });
+      fixture.targetHistory.set("owner-private", [{ isSelf: false, replyMessageId: "500", senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+        messageSeq: 31, time: BASE_TIME, text: "legacy owner reply", mentionedUserIds: [] }]);
+      await fixture.controlPlane.scanOwnerReplies();
+      const original = { ...fixture.wakeCalls[0], taskId: "shared-machine-task" };
+      journal = createWakeJournal({ filePath: path.join(fixture.root, "wake-journal.json") });
+      journal.registerSubscription(original);
+      journal.claimWake(original);
+      journal.writeWake(original.wakeId, { status: priorStatus });
+      seeding = false;
+      const scan = await fixture.controlPlane.scanOwnerReplies();
+      const accepted = ["accepted", "completed", "recovered", "failed_before_send"].includes(priorStatus);
+      assert.equal(scan.results[0].outcome, accepted ? "owner_reply_delivered" : "owner_thread_unavailable");
+      assert.equal(fixture.wakeCalls[1].taskId, original.taskId);
+      assert.equal(fixture.wakeCalls[1].wakeId, original.wakeId);
+      assert.equal(dispatched, priorStatus === "failed_before_send" ? 1 : 0);
+      assert.equal(fixture.state.hasSeenControlMessage("owner:owner-private:31"), accepted);
+      await fixture.controlPlane.scanOwnerReplies();
+      assert.equal(dispatched, priorStatus === "failed_before_send" ? 1 : 0);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+for (const [field, driftedValue] of [
+  ["taskId", "unrelated-task"], ["threadId", "unrelated-thread"], ["generation", 2],
+  ["promptSha256", "0".repeat(64)], ["pendingThroughSequence", 99], ["pendingThroughTime", "2026-08-10T00:00:00.000Z"],
+]) {
+  test(`legacy owner wake rejects identity drift before bridge mutation: ${field}`, async () => {
+    let priorWake = null;
+    const fixture = createFixture({ inspectWake: async () => priorWake, wakeResult: { outcome: "unknown" } });
+    try {
+      await fixture.controlPlane.registerOwnerRoute({ route_key: "legacy-route", conversation_id: "conversation-private", task_id: "shared-machine-task" });
+      await fixture.controlPlane.sendOwnerAlert({ route_key: "legacy-route", summary: "legacy alert", dedupe_key: "legacy-alert" });
+      fixture.targetHistory.set("owner-private", [{ isSelf: false, replyMessageId: "500", senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+        messageSeq: 31, time: BASE_TIME, text: "legacy owner reply", mentionedUserIds: [] }]);
+      await fixture.controlPlane.scanOwnerReplies();
+      priorWake = { ...fixture.wakeCalls[0], taskId: "shared-machine-task", status: "accepted", [field]: driftedValue };
+      const original = structuredClone(priorWake);
+      const scan = await fixture.controlPlane.scanOwnerReplies();
+      assert.equal(scan.results[0].outcome, "owner_reply_failed");
+      assert.equal(scan.results[0].error.code, "OWNER_WAKE_IDENTITY_CONFLICT");
+      assert.equal(fixture.wakeCalls.length, 1);
+      assert.equal(fixture.state.hasSeenControlMessage("owner:owner-private:31"), false);
+      assert.deepEqual(priorWake, original);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
+test("long owner route keys yield stable bounded subscription ids", async () => {
+  const fixture = createFixture();
+  const routeKey = "long-owner-route-".repeat(15);
+  try {
+    await fixture.controlPlane.registerOwnerRoute({
+      route_key: routeKey,
+      conversation_id: "conversation-private",
+      target_key: "owner-private",
+      task_id: "shared-machine-task",
+    });
+    await fixture.controlPlane.sendOwnerAlert({
+      route_key: routeKey,
+      summary: "long route alert",
+      dedupe_key: "long-route-alert",
+    });
+    for (const messageSeq of [31, 32]) {
+      fixture.targetHistory.set("owner-private", [{
+        isSelf: false,
+        replyMessageId: "500",
+        senderId: PLACEHOLDER_OWNER_PRIVATE_ID,
+        messageSeq,
+        time: BASE_TIME,
+        text: "owner reply",
+        mentionedUserIds: [],
+      }]);
+      await fixture.controlPlane.scanOwnerReplies();
+    }
+    assert.equal(fixture.wakeCalls.length, 2);
+    assert.match(fixture.wakeCalls[0].taskId, /^owner-reply-[a-f0-9]{32}$/);
+    assert.equal(fixture.wakeCalls[0].taskId, fixture.wakeCalls[1].taskId);
+    assert.ok(fixture.wakeCalls[0].taskId.length <= 128);
   } finally {
     fixture.cleanup();
   }

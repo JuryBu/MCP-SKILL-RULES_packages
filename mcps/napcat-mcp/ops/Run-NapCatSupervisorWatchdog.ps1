@@ -16,6 +16,7 @@ $ModelProxyStartScript = Join-Path $PSScriptRoot "start-codex-model-stream-proxy
 $ProxyFallbackPath = Join-Path $DataRoot "state\codex-app-server-proxy-fallback.json"
 $WatchdogStatePath = Join-Path $DataRoot "supervisor-watchdog.json"
 $WatchdogLogPath = Join-Path $DataRoot "supervisor-watchdog.jsonl"
+$WatchdogStopPath = Join-Path $DataRoot "state\supervisor-watchdog.stop"
 $NormalizedDataRoot = [System.IO.Path]::GetFullPath($DataRoot).TrimEnd('\').ToLowerInvariant()
 $HashProvider = [System.Security.Cryptography.SHA256]::Create()
 try {
@@ -86,10 +87,12 @@ try {
   }
 
   New-Item -ItemType Directory -Force -Path $DataRoot | Out-Null
-  while ($true) {
+  while (-not (Test-Path -LiteralPath $WatchdogStopPath)) {
     try {
       & $ModelProxyStartScript -DataRoot $DataRoot | Out-Null
+      if (Test-Path -LiteralPath $WatchdogStopPath) {break}
       & $ProxyStartScript -DataRoot $DataRoot | Out-Null
+      if (Test-Path -LiteralPath $WatchdogStopPath) {break}
       Apply-ProxyFallbackRequest
       $StartArguments = @{ DataRoot = $DataRoot }
       if (-not [string]::IsNullOrWhiteSpace($BrokerRoot)) {
@@ -100,8 +103,11 @@ try {
     } catch {
       Write-WatchdogRecord -Status "retrying" -Message $_.Exception.Message
     }
-    Start-Sleep -Seconds $IntervalSeconds
+    for ($WaitedSeconds=0; $WaitedSeconds -lt $IntervalSeconds -and -not (Test-Path -LiteralPath $WatchdogStopPath); $WaitedSeconds++) {
+      Start-Sleep -Seconds 1
+    }
   }
+  Write-WatchdogRecord -Status "stopped" -Message "Watchdog stop requirement observed."
 } finally {
   if ($OwnsMutex) { $Mutex.ReleaseMutex() }
   $Mutex.Dispose()

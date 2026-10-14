@@ -166,6 +166,33 @@ test("supervisor 默认离线宽限不会回退成几分钟内重登", () => {
   }
 });
 
+test("NapCat 状态归一化不会把明确失败洗成 ready", () => {
+  assert.equal(normalizeNapCatStatus({
+    known: true,
+    reachable: true,
+    online: true,
+    accountMatches: true,
+    ready: false,
+    runtimeStatus: { online: true, good: true },
+  }).ready, false);
+  assert.equal(normalizeNapCatStatus({
+    known: true,
+    reachable: true,
+    online: true,
+    accountMatches: true,
+    ready: true,
+    runtimeStatus: { online: true, good: false },
+  }).ready, false);
+  assert.equal(normalizeNapCatStatus({
+    known: true,
+    reachable: true,
+    online: true,
+    accountMatches: true,
+    ready: true,
+    runtimeStatus: { online: true, good: true },
+  }).ready, true);
+});
+
 test("quick-login 参数固定带 -NoQr、默认禁用密码回退、短 timeout 和 NapCat 根目录", () => {
   const fixture = createFixture();
   try {
@@ -277,6 +304,19 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
   assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12, 15]);
   assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker").map((item) => item.ProcessId), [4]);
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
+});
+
+test("进程识别会按固定 QQ 路径接受 QQNT 和 QQEx 进程名", () => {
+  const qqntPath = "C:\\Users\\ExampleUser\\NapCat-QQ\\QQNT.exe";
+  const qqexPath = "C:\\Users\\ExampleUser\\NapCat-QQ\\QQEX.exe";
+  assert.deepEqual(findNapCatProcesses([
+    { ProcessId: 21, Name: "QQNT.exe", CommandLine: `"${qqntPath}" --no-sandbox` },
+    { ProcessId: 22, Name: "QQ.exe", CommandLine: '"C:\\Program Files\\Tencent\\QQNT\\QQ.exe"' },
+  ], null, qqntPath).map((item) => item.ProcessId), [21]);
+  assert.deepEqual(findNapCatProcesses([
+    { ProcessId: 23, Name: "QQEx.exe", CommandLine: `"${qqexPath}" --profile C:\\Users\\ExampleUser\\NapCatProfile` },
+    { ProcessId: 24, Name: "QQ.exe", CommandLine: '"C:\\Program Files\\Tencent\\QQNT\\QQ.exe"' },
+  ], null, qqexPath).map((item) => item.ProcessId), [23]);
 });
 
 test("单次缺失 online 字段只开始未知状态宽限期，不会立即停止进程", async () => {

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -248,6 +248,20 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /\[System\.IO\.FileShare\]::None/);
   assert.match(loginScript, /NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS/);
   assert.match(loginScript, /Release-NapCatLoginAttemptLock -Lock \$LoginAttemptLock/);
+  assert.match(loginScript, /Get-ExistingNapCatRuntimeProcesses/);
+  assert.match(loginScript, /\[string\]\$QqExePath/);
+  assert.match(loginScript, /MatchesQqExePath/);
+  assert.match(loginScript, /\$Status\.data\.good -eq \$true/);
+  assert.doesNotMatch(loginScript, /\$Haystack\.Contains\(\$Needle\)/);
+  assert.match(loginScript, /LooksLikeManagedWrapper/);
+  assert.match(loginScript, /supervisor-runner\\\.mjs/);
+  assert.match(loginScript, /existing_napcat_runtime_detected/);
+  assert.match(loginScript, /refuse_second_launch=true/);
+  assert.match(loginScript, /NAPCAT_PROCESS_PRESENT/);
+  assert.match(loginScript, /online_existing/);
+  assert.match(loginScript, /Set-OneBotSafeStartupConfig/);
+  assert.match(loginScript, /parseMultMsg/);
+  assert.match(loginScript, /NotePropertyValue \$false/);
   assert.doesNotMatch(credentialSetterScript, /\[string\]\$PasswordMd5/);
   assert.doesNotMatch(credentialSetterScript, /TestPasswordMd5/);
   assert.match(supervisorScript, /\$RuntimeConfiguration\.qqExePath/);
@@ -307,6 +321,154 @@ test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断
   assert.notEqual(result.status, 0);
   assert.match(output, /NAPCAT_MANUAL_LOGIN_REQUIRED/);
   assert.ok(Date.now() - startedAt < 10_000, "NoQr should stop after detecting the fresh QR instead of waiting 30 seconds");
+});
+
+test("登录脚本检测到已有 NapCat 运行态时拒绝启动第二个实例", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-existing-process-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  const markerPath = path.join(root, "launcher-count.txt");
+  let existingProcess = null;
+  t.after(() => {
+    if (existingProcess?.pid) terminateProcessTreeAndWait(existingProcess.pid);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      `echo launch %*>> "${markerPath}"`,
+      'if "%2"=="hold" ping 127.0.0.1 -n 30 >nul',
+      'if not "%2"=="hold" exit /b 0',
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  fs.mkdirSync(path.join(runtimeRoot, "napcat"), { recursive: true });
+  const nestedCorePath = path.join(runtimeRoot, "napcat", "napcat.mjs");
+  const holdScriptPath = path.join(runtimeRoot, "hold-napcat-runtime.js");
+  fs.writeFileSync(nestedCorePath, "export {};\n", "utf8");
+  fs.writeFileSync(holdScriptPath, "setInterval(() => {}, 1000);\n", "utf8");
+  existingProcess = spawn(process.execPath, [holdScriptPath, nestedCorePath], {
+    cwd: runtimeRoot,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  const processDeadline = Date.now() + 5_000;
+  while (!isProcessAlive(existingProcess.pid) && Date.now() < processDeadline) waitSync(25);
+  assert.equal(isProcessAlive(existingProcess.pid), true, "fixture runtime process should still be alive before the second login attempt");
+
+  const scriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const startedAt = Date.now();
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", scriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], {
+    encoding: "utf8",
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.match(output, /NAPCAT_PROCESS_PRESENT/);
+  assert.ok(Date.now() - startedAt < 10_000, "existing runtime guard should fail fast instead of starting another login loop");
+  const launchRecords = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").split(/\r?\n/).filter(Boolean) : [];
+  assert.equal(launchRecords.length, 0, "the guarded login script must not invoke launcher-user.bat a second time");
+});
+
+test("登录脚本不会把 supervisor 自身误判成 NapCat 运行态", { skip: process.platform !== "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-supervisor-process-test-"));
+  const runtimeRoot = path.join(root, "runtime");
+  const dataRoot = path.join(root, "data");
+  const brokerRoot = path.join(root, "broker");
+  const markerPath = path.join(root, "launcher-count.txt");
+  let supervisorProcess = null;
+  t.after(() => {
+    if (supervisorProcess?.pid) terminateProcessTreeAndWait(supervisorProcess.pid);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  fs.mkdirSync(runtimeRoot, { recursive: true });
+  fs.mkdirSync(dataRoot, { recursive: true });
+  fs.mkdirSync(brokerRoot, { recursive: true });
+  fs.writeFileSync(path.join(runtimeRoot, "napcat.mjs"), "export {};\n", "utf8");
+  fs.writeFileSync(
+    path.join(runtimeRoot, "launcher-user.bat"),
+    [
+      "@echo off",
+      `echo launch %*>> "${markerPath}"`,
+      "exit /b 0",
+      "",
+    ].join("\r\n"),
+    "utf8",
+  );
+  writeJson(path.join(brokerRoot, "broker-private.env.json"), {
+    NAPCAT_HTTP_URL: "http://127.0.0.1:65534",
+    NAPCAT_ACCESS_TOKEN: "test-token",
+  });
+  writeJson(path.join(dataRoot, "binding.json"), {
+    expectedSelfId: "10001",
+    expectedNickname: "test-account",
+  });
+
+  const scriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
+  const supervisorScriptPath = path.join(runtimeRoot, "supervisor-runner.mjs");
+  fs.writeFileSync(supervisorScriptPath, "setInterval(() => {}, 1000);\n", "utf8");
+  supervisorProcess = spawn(process.execPath, [
+    supervisorScriptPath,
+    "--napcat-root", runtimeRoot,
+    "--login-script", scriptPath,
+  ], {
+    cwd: runtimeRoot,
+    stdio: "ignore",
+    windowsHide: true,
+  });
+  const processDeadline = Date.now() + 5_000;
+  while (!isProcessAlive(supervisorProcess.pid) && Date.now() < processDeadline) waitSync(25);
+  assert.equal(isProcessAlive(supervisorProcess.pid), true, "fixture supervisor process should still be alive before login");
+
+  const result = spawnSync("powershell.exe", [
+    "-NoProfile",
+    "-NonInteractive",
+    "-ExecutionPolicy", "Bypass",
+    "-File", scriptPath,
+    "-NoQr",
+    "-TimeoutSeconds", "30",
+    "-NapCatRoot", runtimeRoot,
+    "-DataRoot", dataRoot,
+    "-BrokerRoot", brokerRoot,
+  ], {
+    encoding: "utf8",
+    timeout: 15_000,
+    windowsHide: true,
+  });
+  const output = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+  assert.notEqual(result.status, 0);
+  assert.doesNotMatch(output, /NAPCAT_PROCESS_PRESENT/);
+  const launchRecords = fs.existsSync(markerPath) ? fs.readFileSync(markerPath, "utf8").split(/\r?\n/).filter(Boolean) : [];
+  assert.ok(launchRecords.length >= 1, "supervisor wrapper must not block a real launcher invocation");
 });
 
 test("加密密码回退明确返回密码错误时才禁用 DPAPI 凭据", { skip: process.platform !== "win32" }, (t) => {

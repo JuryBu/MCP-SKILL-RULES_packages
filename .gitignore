@@ -79,6 +79,8 @@ Thumbs.db
 
 # Planning/private scratch files
 /plans/
+/mcps/napcat-mcp/plans/
+/mcps/napcat-mcp/test/inner-proxy-session-native.mjs
 /profile-preview/
 Plan_*.md
 Task.md

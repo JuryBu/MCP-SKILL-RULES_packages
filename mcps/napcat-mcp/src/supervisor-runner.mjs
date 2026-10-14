@@ -780,6 +780,7 @@ export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
   const normalizedQqExePath = qqExePath ? path.resolve(qqExePath).replaceAll("\\", "/").toLowerCase() : null;
   const isSupervisorOrProbeCommand = (text) => /(?:^|[\\/])(?:supervisor-runner\.mjs|start-napcat-supervisor\.ps1|stop-napcat-supervisor(?:-watchdog)?\.ps1|get-napcat-supervisor-status\.ps1|run-napcatsupervisorwatchdog\.ps1)(?:[\s"]|$)/i.test(text);
   const isLoginScriptExecution = (text) => /(?:^|[\s"])-(?:file|f)\s+"?[^"\r\n]*[\\/]start-napcat-login\.ps1(?:["\s]|$)/i.test(text);
+  const isKnownQqProcessName = (value) => /^(?:qq|qqnt|qqex)(?:\.exe)?$/i.test(value);
   return normalizeProcessRecords(processes).filter((item) => {
     const text = processText(item).replaceAll("\\", "/");
     const name = String(item?.Name ?? item?.name ?? "");
@@ -790,7 +791,7 @@ export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
     if (isSupervisorOrProbeCommand(text)) return false;
     const isPinnedQq = Boolean(
       normalizedQqExePath
-      && /^qq\.exe$/i.test(name)
+      && isKnownQqProcessName(name)
       && (
         unquotedCommandLine === normalizedQqExePath
         || unquotedCommandLine === `${normalizedQqExePath}"`
@@ -931,18 +932,20 @@ export function normalizeNapCatStatus(value) {
     return { known: true, reachable: value, online: value, accountMatches: value, ready: value };
   }
   const runtimeOnline = normalizeBoolean(value?.runtimeStatus?.online);
+  const runtimeGood = normalizeBoolean(value?.runtimeStatus?.good);
   const readySignal = normalizeBoolean(value?.ready);
   const onlineSignal = normalizeBoolean(value?.online) ?? runtimeOnline ?? (readySignal === true ? true : null);
   const accountMatches = normalizeBoolean(value?.accountMatches)
     ?? (value?.identityError ? false : value?.identity ? true : readySignal === true ? true : null);
   const reachable = value?.reachable !== false;
   const known = value?.known !== false && !value?.error && onlineSignal !== null;
+  const readyAllowed = readySignal !== false && runtimeGood !== false;
   return {
     known,
     reachable,
     online: onlineSignal === true,
     accountMatches: accountMatches === true,
-    ready: known && reachable && onlineSignal === true && accountMatches === true,
+    ready: known && reachable && onlineSignal === true && accountMatches === true && readyAllowed,
     error: value?.error ?? value?.identityError ?? null,
     runtimeStatus: value?.runtimeStatus ?? null,
     identity: value?.identity ?? null,

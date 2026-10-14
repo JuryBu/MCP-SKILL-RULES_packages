@@ -60,12 +60,14 @@ export function createRequestBodyOwner(lease) {
   };
 }
 
-export function collectRequestBody(request, maximumBytes, lease, signal) {
+export function collectRequestBody(request, maximumBytes, lease, signal, { idleTimeoutMs = 15_000 } = {}) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let length = 0;
     let settled = false;
+    let idleTimer = null;
     const cleanup = () => {
+      clearTimeout(idleTimer);
       request.off("data", onData);
       request.off("end", onEnd);
       request.off("aborted", onAborted);
@@ -78,11 +80,19 @@ export function collectRequestBody(request, maximumBytes, lease, signal) {
       cleanup();
       chunks.length = 0;
       if (error) {
+        lease.release();
         request.resume();
         reject(error);
       } else resolve(body);
     };
+    const armIdleTimer = () => {
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => finish(failure("REQUEST_BODY_IDLE_TIMEOUT", 408, "request_timeout",
+        "Model request body stopped making upload progress.", { encodedBytes: length, stage: "receive", idleTimeoutMs })), idleTimeoutMs);
+      idleTimer.unref?.();
+    };
     const onData = (chunk) => {
+      if (chunk.length > 0) armIdleTimer();
       length += chunk.length;
       if (length > maximumBytes) {
         finish(failure("ENCODED_BODY_TOO_LARGE", 413, "request_too_large",
@@ -107,6 +117,7 @@ export function collectRequestBody(request, maximumBytes, lease, signal) {
     request.once("aborted", onAborted);
     request.once("error", onError);
     signal?.addEventListener("abort", onAborted, { once: true });
+    armIdleTimer();
     if (signal?.aborted || request.aborted) onAborted();
   });
 }

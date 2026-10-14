@@ -1,4 +1,9 @@
 import crypto from "node:crypto";
+import { createProxyLiveCodeRuntime } from "./proxy-live-code-runtime.mjs";
+import { createOuterRuntime } from "./outer-runtime.mjs";
+import { createOuterRuntimeHost } from "./outer-runtime-host.mjs";
+import { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
+export { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -6,6 +11,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { createWakeVisibilityAdapter } from "./wake-visibility.mjs";
 import { createReasoningPlaceholderView } from "./reasoning-placeholder.mjs";
 import { createTurnLifecycleObserver } from "./turn-observability.mjs";
+import { createCodexDisplayPolicyManager, createCodexDisplayPolicyControl } from "./codex-display-policy.mjs";
+import { createCodexRequestMetadata } from "./codex-request-metadata.mjs";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const FIRST_INJECTED_REQUEST_ID = -1_000_000_000;
@@ -52,8 +59,8 @@ function messageByteLength(data) {
   return Buffer.byteLength(String(data));
 }
 
-function parseJsonMessage(data, maximumBytes = DEFAULT_MAX_JSON_PARSE_BYTES) {
-  if (messageByteLength(data) > maximumBytes) return null;
+function parseJsonMessage(data, maximumBytes = DEFAULT_MAX_JSON_PARSE_BYTES, byteLength = messageByteLength(data)) {
+  if (byteLength > maximumBytes) return null;
   try {
     return JSON.parse(Buffer.isBuffer(data) ? data.toString("utf8") : String(data));
   } catch {
@@ -418,15 +425,6 @@ function sameFields(left, right, fields) {
   return fields.every((field) => left?.[field] === right?.[field]);
 }
 
-export class CodexAppServerProxyError extends Error {
-  constructor(code, message, options = {}) {
-    super(message, options.cause ? { cause: options.cause } : undefined);
-    this.name = "CodexAppServerProxyError";
-    this.code = code;
-    this.outcomeUnknown = Boolean(options.outcomeUnknown);
-    this.details = options.details ?? null;
-  }
-}
 
 export function createWakeJournal(options = {}) {
   const filePath = requiredString(options.filePath, "filePath", 32768);
@@ -577,6 +575,10 @@ export function createWakeJournal(options = {}) {
 }
 
 export class CodexAppServerProxy {
+  static hotRuntimeSchema = "proxy-live-state-v1";
+  _liveRequestMetadata = null;
+  _liveRequestMetadataEnabled = false;
+
   constructor(options = {}) {
     this.downstreamHost = options.downstreamHost ?? "127.0.0.1";
     this.downstreamPort = boundedInteger(options.downstreamPort, 18432, 1, 65535);
@@ -635,24 +637,40 @@ export class CodexAppServerProxy {
     this.createTurnObserver = options.createTurnObserver ?? createTurnLifecycleObserver;
     this.WebSocketImpl = options.WebSocketImpl ?? WebSocket;
     this.WebSocketServerImpl = options.WebSocketServerImpl ?? WebSocketServer;
+    try {
+      this._liveRequestMetadata = createCodexRequestMetadata(options.requestMetadata);
+      this._liveRequestMetadataEnabled = this._liveRequestMetadata.snapshot().enabled;
+    } catch {}
     this.journal = options.journal ?? null;
+    this.displayPolicy = createCodexDisplayPolicyManager({
+      maximumRequests: this.maxQueuedMessages,
+      onEvent: (event) => this.onEvent?.(event),
+    });
     this.wakeVisibility = createWakeVisibilityAdapter({
       onItemBound: (registration) => {
         try {
+          const binding = this.displayPolicy.prepareReminderBinding(registration);
           this.journal.writeWake(registration.wakeId, {
             turnId: registration.turnId,
             injectionMethod: registration.injectionMethod,
             visibilityItemKey: registration.itemKey,
+            displayPolicyVersion: binding.version,
+            displayDecision: binding.decision,
           }, ["dispatching", "accepted", "completed", "unknown"]);
+          this.displayPolicy.commitReminderBinding(registration, binding);
           return true;
         } catch (error) {
-          this.#recordError("wake_visibility_identity", error);
+          this._liveRecordError("wake_visibility_identity", error);
           return false;
         }
       },
     });
     for (const wake of this.journal?.visibilityWakes?.() ?? []) {
-      this.wakeVisibility.registerWake({ ...wake, itemKey: wake.visibilityItemKey ?? null });
+      const registration = this.wakeVisibility.registerWake({
+        ...wake, itemKey: wake.visibilityItemKey ?? null,
+        visibilityClientId: wake.visibilityClientId ?? wake.clientUserMessageId,
+      });
+      this.displayPolicy.registerReminder(registration, wake);
     }
     this.reasoningPlaceholderEnabled = options.reasoningPlaceholderEnabled !== false;
     this.reasoningPlaceholderClientNames = options.reasoningPlaceholderClientNames;
@@ -661,7 +679,19 @@ export class CodexAppServerProxy {
       : null;
     this.writerEpoch = requiredString(options.writerEpoch ?? crypto.randomUUID(), "writerEpoch", 256);
     this.onEvent = typeof options.onEvent === "function" ? options.onEvent : () => {};
+    this.onNativeTurn = typeof options.onNativeTurn === "function" ? options.onNativeTurn : null;
+    this.managedInnerControl = options.managedInnerControl ?? null;
+    if (this.managedInnerControl && !["127.0.0.1", "::1"].includes(this.controlHost)) throw new Error("INNER_MANAGED_CONTROL_REQUIRES_LOOPBACK");
+    if (options.displayPolicyRoot && !["127.0.0.1", "::1"].includes(this.controlHost)) {
+      throw new Error("DISPLAY_POLICY_CONTROL_REQUIRES_LOOPBACK");
+    }
+    this.displayPolicyControl = createCodexDisplayPolicyControl(this.displayPolicy, {
+      candidateRoot: options.displayPolicyRoot, instanceId: options.instanceToken ?? this.writerEpoch, onEvent: this.onEvent,
+    });
     this.clients = new Set();
+    this.liveCodeRuntime = createProxyLiveCodeRuntime(this, {
+      candidateRoot: options.outerRuntimeRoot, instanceId: options.instanceToken ?? this.writerEpoch,
+    });
     this.nextInjectedRequestId = FIRST_INJECTED_REQUEST_ID;
     this.websocketServer = null;
     this.controlServer = null;
@@ -670,24 +700,46 @@ export class CodexAppServerProxy {
     this.closed = false;
     this.lastError = null;
     this.lastIncident = null;
+    if (options.outerRuntimeRoot && !["127.0.0.1", "::1"].includes(this.controlHost)) throw new Error("OUTER_RUNTIME_CONTROL_REQUIRES_LOOPBACK");
+    this.outerRuntime = createOuterRuntime({
+      instanceId: options.instanceToken ?? this.writerEpoch, candidateRoot: options.outerRuntimeRoot,
+      maximumTurns: this.maxQueuedMessages, onEvent: this.onEvent,
+      createHost: entry => createOuterRuntimeHost({
+        entry,
+        state: {
+          journal: this.journal,
+          wakeVisibility: this.wakeVisibility,
+          displayPolicy: this.displayPolicy,
+          resumeRequestTimeoutMs: this.resumeRequestTimeoutMs,
+          writerEpoch: this.writerEpoch,
+        },
+        readyClients: () => this._liveReadyClients(),
+        maintenanceStatus: () => this._liveMaintenanceStatus(),
+        recordError: (source, error) => this._liveRecordError(source, error),
+        injectRequest: (client, method, params, requestOptions = {}) => {
+          return this._liveInjectRequest(client, method, params, { ...requestOptions, outerEntry: entry });
+        },
+      }),
+    });
   }
 
   async start() {
     if (this.websocketServer || this.controlServer) return this.status();
     this.closed = false;
     try {
+      await this.outerRuntime.reopenSelection();
       this.websocketServer = new this.WebSocketServerImpl({
         host: this.downstreamHost,
         port: this.downstreamPort,
         maxPayload: this.maxWebSocketPayloadBytes,
       });
-      this.websocketServer.on("connection", (socket) => this.#acceptDownstream(socket));
-      this.websocketServer.on("error", (error) => this.#recordError("downstream_server", error));
-      await this.#waitForListening(this.websocketServer, "WebSocket");
+      this.websocketServer.on("connection", (socket) => this._liveAcceptDownstream(socket));
+      this.websocketServer.on("error", (error) => this._liveRecordError("downstream_server", error));
+      await this._liveWaitForListening(this.websocketServer, "WebSocket");
 
       this.controlServer = http.createServer((request, response) => {
-        this.#handleControlRequest(request, response).catch((error) => {
-          this.#recordError("control_request", error);
+        this._liveHandleControlRequest(request, response).catch((error) => {
+          if (!/^\/v1\/display-policy(?:\/|\?|$)/.test(request.url ?? "")) this._liveRecordError("control_request", error);
           if (!response.headersSent) response.setHeader("content-type", "application/json; charset=utf-8");
           response.statusCode = error?.code === "UNAUTHORIZED"
             ? 401
@@ -699,22 +751,43 @@ export class CodexAppServerProxy {
           response.end(JSON.stringify({ ok: false, error: publicError(error) }));
         });
       });
-      this.controlServer.on("error", (error) => this.#recordError("control_server", error));
-      await this.#listenHttp(this.controlServer, this.controlPort, this.controlHost);
+      this.controlServer.on("error", (error) => this._liveRecordError("control_server", error));
+      await this._liveListenHttp(this.controlServer, this.controlPort, this.controlHost);
       this.startedAt = new Date().toISOString();
-      this.heartbeatTimer = setInterval(() => this.#checkHeartbeats(), this.heartbeatIntervalMs);
+      this.heartbeatTimer = setInterval(() => this._liveCheckHeartbeats(), this.heartbeatIntervalMs);
       this.heartbeatTimer.unref?.();
       this.onEvent({ type: "proxy_started", status: this.status() });
       return this.status();
     } catch (error) {
       await Promise.all([
-        this.#closeServer(this.websocketServer),
-        this.#closeServer(this.controlServer),
+        this._liveCloseServer(this.websocketServer),
+        this._liveCloseServer(this.controlServer),
       ]);
       this.websocketServer = null;
       this.controlServer = null;
       throw error;
     }
+  }
+
+  requestMetadataSnapshot() {
+    try {
+      return this._liveRequestMetadata?.snapshot() ?? { schemaVersion: 1, enabled: false, unavailable: true };
+    } catch {
+      return { schemaVersion: 1, enabled: false, unavailable: true };
+    }
+  }
+
+  _liveNewMetadataGeneration() {
+    if (!this._liveRequestMetadataEnabled) return null;
+    try { return crypto.randomUUID(); } catch { return null; }
+  }
+
+  _liveObserveRequestMetadata(direction, generation, parsed, byteLength) {
+    try { this._liveRequestMetadata?.observe({ direction, generation, parsed, byteLength }); } catch {}
+  }
+
+  _liveCloseMetadataConnection(generation) {
+    try { this._liveRequestMetadata?.closeConnection(generation); } catch {}
   }
 
   status() {
@@ -733,6 +806,7 @@ export class CodexAppServerProxy {
       connectedAt: client.connectedAt,
       reasoningPlaceholder: client.reasoningPlaceholder.status(),
       turnObservation: client.turnObserver.status(),
+      displayPolicy: client.displayPolicy.snapshot(),
     }));
     return {
       ok: true,
@@ -751,9 +825,12 @@ export class CodexAppServerProxy {
       ).length,
       clients,
       writerEpoch: this.writerEpoch,
-      maintenance: this.#maintenanceStatus(),
+      maintenance: this._liveMaintenanceStatus(),
       journal: this.journal?.status?.() ?? null,
       wakeVisibility: this.wakeVisibility.snapshot(),
+      displayPolicy: this.displayPolicy.status(),
+      displayPolicyControl: this.displayPolicyControl.status(),
+      outerRuntime: this.outerRuntime.status(),
       lastError: this.lastError,
       lastIncident: this.lastIncident,
       limits: {
@@ -768,285 +845,35 @@ export class CodexAppServerProxy {
     };
   }
 
-  async inspectThread(threadId) {
-    const normalizedThreadId = requiredString(threadId, "threadId", 256);
-    const primary = this.#readyClients()[0];
-    if (!primary) {
-      throw new CodexAppServerProxyError(
-        "NO_DESKTOP_CLIENT",
-        "没有已初始化且上下游均在线的 Codex Desktop 连接",
-      );
-    }
-    let result;
-    try {
-      result = await this.#injectRequest(
-        primary,
-        "thread/read",
-        { threadId: normalizedThreadId, includeTurns: false },
-        { threadId: normalizedThreadId },
-      );
-    } catch (error) {
-      if (error.code === "APP_SERVER_RPC_ERROR"
-        && isNotFoundRpcError(error.details?.rpcError, normalizedThreadId)) {
-        return { threadId: normalizedThreadId, found: false, thread: null };
-      }
-      throw error;
-    }
-    if (!isObject(result?.thread) || result.thread.id !== normalizedThreadId) {
-      throw new CodexAppServerProxyError("INVALID_THREAD_SUMMARY", "App Server 未返回匹配的对话摘要");
-    }
-    return { threadId: normalizedThreadId, found: true, thread: result.thread };
+  async prepareDisplayPolicy(modulePath) {
+    return this.displayPolicy.prepare(modulePath);
   }
 
-  async subscribeThread(threadId) {
-    const normalizedThreadId = requiredString(threadId, "threadId", 256);
-    const readyClients = this.#readyClients();
-    if (!readyClients.length) {
-      throw new CodexAppServerProxyError(
-        "NO_DESKTOP_CLIENT",
-        "没有已初始化且上下游均在线的 Codex Desktop 连接",
-      );
-    }
-    const primary = readyClients[0];
-    const result = await this.#injectRequest(
-      primary,
-      "thread/resume",
-      { threadId: normalizedThreadId, excludeTurns: true },
-      { threadId: normalizedThreadId, timeoutMs: this.resumeRequestTimeoutMs },
-    );
-    return { threadId: normalizedThreadId, readyClients: [primary], results: [result] };
+  activateDisplayPolicy(preparation) {
+    return this.displayPolicy.activate(preparation);
   }
 
-  async subscribeTask(input) {
-    if (!this.journal?.registerSubscription) {
-      throw new CodexAppServerProxyError("WAKE_JOURNAL_REQUIRED", "任务订阅需要持久化唤醒日志");
-    }
-    const subscription = normalizeSubscription(input);
-    const readyClients = this.#readyClients();
-    if (!readyClients.length) {
-      throw new CodexAppServerProxyError(
-        "NO_DESKTOP_CLIENT",
-        "没有已初始化且上下游均在线的 Codex Desktop 连接",
-      );
-    }
-    const registration = this.journal.registerSubscription(subscription);
-    return {
-      ...registration,
-      threadId: subscription.threadId,
-      readyClientCount: readyClients.length,
-    };
-  }
+  async inspectThread(input) { return this.outerRuntime.invoke("inspectThread", input); }
+  async subscribeThread(input) { return this.outerRuntime.invoke("subscribeThread", input); }
+  async subscribeTask(input) { return this.outerRuntime.invoke("subscribeTask", input); }
+  async wakeThread(input) { return this.outerRuntime.invoke("wakeThread", input); }
 
-  async wakeThread(input) {
-    if (!isObject(input)) throw new CodexAppServerProxyError("INVALID_ARGUMENT", "wake 必须接收对象");
-    if (!this.journal?.claimWake || !this.journal?.registerSubscription) {
-      throw new CodexAppServerProxyError("WAKE_JOURNAL_REQUIRED", "自动唤醒需要持久化唤醒日志");
-    }
-    const subscriptionInput = normalizeSubscription(input);
-    const threadId = subscriptionInput.threadId;
-    const prompt = requiredString(input.prompt, "prompt", 100000);
-    const wakeId = requiredString(input.wakeId, "wakeId", 256);
-    const messageVisibility = normalizeWakeMessageVisibility(input.messageVisibility);
-    const promptHash = promptSha256(prompt);
-    if (input.promptSha256 && input.promptSha256 !== promptHash) {
-      throw new CodexAppServerProxyError("PROMPT_HASH_MISMATCH", `promptSha256 与正文不一致：${wakeId}`);
-    }
-    this.journal.registerSubscription(subscriptionInput);
-    const claim = this.journal.claimWake({
-      ...subscriptionInput,
-      wakeId,
-      promptSha256: promptHash,
-      pendingThroughSequence: input.pendingThroughSequence,
-      pendingThroughTime: input.pendingThroughTime,
-      messageVisibility,
-    });
-    const existing = claim.wake;
-    if (!claim.acquired && ["accepted", "completed", "recovered"].includes(existing.status)) {
-      return {
-        threadId,
-        wakeId,
-        outcome: existing.status === "completed" ? "completed" : "accepted",
-        started: false,
-        duplicateSuppressed: true,
-        recovered: existing.status === "recovered",
-        turn: existing.turnId ? { id: existing.turnId, status: existing.turnStatus ?? null } : null,
-        messageVisibility: existing.messageVisibility ?? "hidden",
-        clientUserMessageId: existing.clientUserMessageId ?? null,
-      };
-    }
-
-    if (!claim.acquired) {
-      return {
-        threadId,
-        wakeId,
-        outcome: "unknown",
-        started: null,
-        duplicateSuppressed: true,
-        recovered: false,
-        error: {
-          code: "PREVIOUS_WAKE_OUTCOME_UNKNOWN",
-          message: "同一 wakeId 已在准备、发送或结果未知状态，拒绝自动重复发送",
-          outcomeUnknown: true,
-        },
-      };
-    }
-
-    let subscription;
-    try {
-      subscription = await this.subscribeThread(threadId);
-    } catch (error) {
-      try {
-        this.journal.writeWake(wakeId, {
-          status: "failed_before_send",
-          error: publicError(error),
-        }, ["prepared"]);
-      } catch {
-      }
-      throw error;
-    }
-
-    let mutationAttempted = false;
-    let visibilityRegistration = null;
-    try {
-      const maintenance = this.#maintenanceStatus();
-      if (maintenance.active) {
-        throw new CodexAppServerProxyError(
-          "AUTOMATION_PAUSED",
-          "自动唤醒处于维护暂停状态",
-          { details: maintenance },
-        );
-      }
-      const primary = subscription.readyClients[0];
-      const resumeBusy = subscription.results.map((result) => resumeThreadState(result, threadId)).includes("busy");
-      let activeTurn = resumeBusy ? subscription.results
-        .map((result) => activeTurnFromResumeResult(result.thread))
-        .find(Boolean) ?? null : null;
-      if (resumeBusy && !activeTurn) {
-        try {
-          const latest = await this.#injectRequest(primary, "thread/turns/list", {
-            threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded",
-          }, { threadId });
-          activeTurn = activeTurnFromResumeResult(latest);
-        } catch (error) {
-          this.#recordError("active_turn_lookup", error);
-        }
-      }
-      if (resumeBusy && !activeTurn) {
-        const busy = this.journal.writeWake(wakeId, {
-          status: "failed_before_send",
-          error: {
-            code: "THREAD_BUSY",
-            message: "目标线程忙碌，但 App Server 未返回可安全 steer 的 active turn id",
-          },
-        }, ["prepared"]);
-        return {
-          threadId,
-          wakeId,
-          outcome: "busy",
-          started: false,
-          duplicateSuppressed: false,
-          recovered: false,
-          messageVisibility,
-          clientUserMessageId: busy?.clientUserMessageId ?? existing.clientUserMessageId ?? null,
-          turn: null,
-        };
-      }
-      const method = activeTurn ? "turn/steer" : "turn/start";
-      this.journal.writeWake(wakeId, {
-        status: "dispatching",
-        writerEpoch: this.writerEpoch,
-        turnId: activeTurn?.id ?? activeTurn?.turnId ?? null,
-        injectionMethod: method,
-      }, ["prepared"]);
-      const params = {
-        threadId,
-        input: [{ type: "text", text: prompt }],
-        ...(activeTurn ? { expectedTurnId: activeTurn.id ?? activeTurn.turnId } : {}),
-        clientUserMessageId: existing.clientUserMessageId ?? existing.visibilityClientId,
-      };
-      mutationAttempted = true;
-      visibilityRegistration = this.wakeVisibility.registerWake({
-        threadId,
-        wakeId,
-        prompt,
-        messageVisibility,
-        turnId: activeTurn?.id ?? activeTurn?.turnId ?? null,
-        injectionMethod: method,
-        visibilityClientId: existing.visibilityClientId,
-      });
-      const result = await this.#injectRequest(
-        primary,
-        method,
-        params,
-        { mutating: true, threadId },
-      );
-      const turn = responseTurn(result);
-      if (activeTurn && turn?.id !== (activeTurn.id ?? activeTurn.turnId)) {
-        throw new CodexAppServerProxyError("WAKE_RESULT_IDENTITY_MISMATCH", "App Server 返回的轮次身份与当前轮次不一致", { outcomeUnknown: true });
-      }
-      if (visibilityRegistration && turn?.id) visibilityRegistration.turnId = turn.id;
-      const status = String(turn?.status ?? "").toLowerCase();
-      const outcome = ["completed", "done", "failed", "cancelled", "canceled"].includes(status)
-        ? "completed"
-        : "accepted";
-      try {
-        this.journal.writeWake(wakeId, {
-          status: outcome,
-          turnId: turn?.id ?? turn?.turnId ?? null,
-          turnStatus: turn?.status ?? null,
-          injectionMethod: method,
-          visibilityItemKey: visibilityRegistration?.itemKey ?? null,
-        }, ["dispatching"]);
-      } catch (cause) {
-        throw new CodexAppServerProxyError(
-          "WAKE_JOURNAL_COMMIT_FAILED",
-          `App Server 已响应，但无法持久化唤醒结果：${wakeId}`,
-          { cause, outcomeUnknown: true },
-        );
-      }
-      return {
-        threadId,
-        wakeId,
-        outcome,
-        started: true,
-        duplicateSuppressed: false,
-        recovered: false,
-        messageVisibility,
-        clientUserMessageId: existing.clientUserMessageId ?? null,
-        injectionMethod: method,
-        subscribedClientCount: subscription.readyClients.length,
-        turn,
-        raw: result,
-      };
-    } catch (error) {
-      const outcomeUnknown = Boolean(error?.outcomeUnknown);
-      if (!outcomeUnknown) this.wakeVisibility.forgetWake(visibilityRegistration);
-      try {
-        this.journal.writeWake(wakeId, {
-          status: outcomeUnknown ? "unknown" : "failed_before_send",
-          ...(visibilityRegistration ? {
-            turnId: visibilityRegistration.turnId,
-            injectionMethod: visibilityRegistration.injectionMethod,
-            visibilityItemKey: visibilityRegistration.itemKey,
-          } : {}),
-          error: publicError(error),
-        }, mutationAttempted ? ["dispatching"] : ["prepared"]);
-      } catch {
-      }
-      throw error;
-    }
-  }
+  prepareOuterRuntime(input) { return this.outerRuntime.prepare(input); }
+  activateOuterRuntime(input) { return this.outerRuntime.activate(input); }
+  restoreOuterRuntime(input) { return this.outerRuntime.restore(input); }
 
   async close() {
     if (this.closed) return { closed: true };
     this.closed = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
-    for (const client of [...this.clients]) this.#closeClient(client, "proxy_closed");
+    for (const client of [...this.clients]) this._liveCloseClient(client, "proxy_closed");
+    try { this._liveRequestMetadata?.close(); } catch {}
     this.wakeVisibility.close();
+    this.outerRuntime.close();
     await Promise.all([
-      this.#closeServer(this.websocketServer),
-      this.#closeServer(this.controlServer),
+      this._liveCloseServer(this.websocketServer),
+      this._liveCloseServer(this.controlServer),
     ]);
     this.websocketServer = null;
     this.controlServer = null;
@@ -1054,7 +881,7 @@ export class CodexAppServerProxy {
     return { closed: true };
   }
 
-  #readyClients() {
+  _liveReadyClients() {
     return [...this.clients].filter((client) =>
       client.initialized
       && client.upstreamReady
@@ -1063,7 +890,7 @@ export class CodexAppServerProxy {
     );
   }
 
-  #maintenanceStatus() {
+  _liveMaintenanceStatus() {
     if (!this.maintenanceFilePath) return { active: false, reasons: [] };
     try {
       const state = JSON.parse(fs.readFileSync(this.maintenanceFilePath, "utf8").replace(/^\uFEFF/, ""));
@@ -1087,10 +914,12 @@ export class CodexAppServerProxy {
     }
   }
 
-  #acceptDownstream(downstream) {
+  _liveAcceptDownstream(downstream) {
     const client = {
       downstream,
       upstream: null,
+      metadataDownstreamGeneration: this._liveNewMetadataGeneration(),
+      metadataUpstreamGeneration: null,
       initialized: false,
       initializationRequestId: null,
       upstreamReady: false,
@@ -1109,6 +938,7 @@ export class CodexAppServerProxy {
       downstreamAlive: true,
       upstreamAlive: false,
       wakeVisibility: this.wakeVisibility.createView(),
+      displayPolicy: this.displayPolicy.createView(),
       reasoningPlaceholder: createReasoningPlaceholderView({
         enabled: this.reasoningPlaceholderEnabled,
         clientNames: this.reasoningPlaceholderClientNames,
@@ -1119,61 +949,172 @@ export class CodexAppServerProxy {
       }),
     };
     this.clients.add(client);
-    downstream.on("message", (data, isBinary) => {
-      client.downstreamAlive = true;
-      const envelope = this.#readRpcEnvelope(client, data, "downstream");
-      if (!envelope) return;
-      const message = parseJsonMessage(data, this.maxJsonParseBytes) ?? envelope.message;
-      client.wakeVisibility.observeRequest(message);
-      client.reasoningPlaceholder.observeRequest(message);
-      client.turnObserver.observeDownstream(message);
-      if (message?.method === "initialize") {
-        client.initializationRequestId = message.id ?? null;
-      } else if (message?.method === "initialized") {
-        client.initialized = true;
-      }
-      let payload = data;
-      if (typeof message?.method === "string" && ["string", "number"].includes(typeof message.id)) {
-        const idRange = envelope.fields.get("id");
-        const requestIdBytes = Buffer.byteLength(String(message.id), "utf8") + 16
-          + (this.#isInternalRequestId(message.id) ? idRange.end - idRange.start : 0);
-        if (client.desktopRequestIds.has(message.id) || client.desktopRequestIds.size >= this.maxQueuedMessages
-          || client.desktopRequestBytes + requestIdBytes > this.maxQueuedBytes) {
-          this.#closeClient(client, "desktop_request_tracking_conflict");
-          return;
-        }
-        client.desktopRequestIds.set(message.id, { bytes: requestIdBytes, upstreamId: message.id });
-        client.desktopRequestBytes += requestIdBytes;
-        if (this.#isInternalRequestId(message.id)) {
-          const forwardedId = this.#allocateRequestId(client);
-          client.forwardedRequestIds.set(forwardedId, message.id);
-          const tracking = client.desktopRequestIds.get(message.id);
-          tracking.upstreamId = forwardedId;
-          tracking.idJson = Buffer.from(envelope.bytes.subarray(idRange.start, idRange.end));
-          payload = rewriteRpcId(envelope, JSON.stringify(forwardedId));
-        }
-      }
-      const payloadBytes = messageByteLength(payload);
-      if (client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
-        if (this.#sendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream")) {
-          client.turnObserver.markForwarded(message);
-        }
-        return;
-      }
-      if (client.queued.length >= this.maxQueuedMessages || client.queuedBytes + payloadBytes > this.maxQueuedBytes) {
-        this.#closeClient(client, "downstream_queue_overflow", new CodexAppServerProxyError(
-          "DOWNSTREAM_QUEUE_OVERFLOW",
-          `App Server 启动期间累计消息超过安全上限，已关闭当前连接以避免无界占用`,
-        ));
-        return;
-      }
-      client.queued.push({ data: payload, isBinary, bytes: payloadBytes, observation: { id: message.id, method: message.method } });
-      client.queuedBytes += payloadBytes;
-    });
-    downstream.on("close", () => this.#closeClient(client, "downstream_closed"));
-    downstream.on("error", (error) => this.#closeClient(client, "downstream_error", error));
+    downstream.on("message", (data, isBinary) => this._liveReceiveDownstream(client, data, isBinary));
+    downstream.on("close", () => this._liveCloseClient(client, "downstream_closed"));
+    downstream.on("error", (error) => this._liveCloseClient(client, "downstream_error", error));
     downstream.on("pong", () => { client.downstreamAlive = true; });
-    this.#connectUpstream(client);
+    this._liveConnectUpstream(client);
+  }
+
+  _liveReceiveDownstream(client, data, isBinary) {
+    const originalByteLength = messageByteLength(data);
+    if (client.closed) {
+      this._liveObserveRequestMetadata("downstream", null, null, originalByteLength);
+      return;
+    }
+    client.downstreamAlive = true;
+    const envelope = this._liveReadRpcEnvelope(client, data, "downstream");
+    if (!envelope) {
+      this._liveObserveRequestMetadata("downstream", null, null, originalByteLength);
+      return;
+    }
+    const message = parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength) ?? envelope.message;
+    this._liveObserveRequestMetadata("downstream", isRpcResponse(message)
+      ? client.metadataUpstreamGeneration : client.metadataDownstreamGeneration, message, originalByteLength);
+    this.outerRuntime.downstream(client, message);
+    if (message?.method === "initialize") {
+      client.initializationRequestId = message.id ?? null;
+    } else if (message?.method === "initialized") {
+      client.initialized = true;
+    }
+    let payload = data;
+    if (typeof message?.method === "string" && ["string", "number"].includes(typeof message.id)) {
+      const idRange = envelope.fields.get("id");
+      const requestIdBytes = Buffer.byteLength(String(message.id), "utf8") + 16
+        + (this._liveIsInternalRequestId(message.id) ? idRange.end - idRange.start : 0);
+      if (client.desktopRequestIds.has(message.id) || client.desktopRequestIds.size >= this.maxQueuedMessages
+        || client.desktopRequestBytes + requestIdBytes > this.maxQueuedBytes) {
+        this._liveCloseClient(client, "desktop_request_tracking_conflict");
+        return;
+      }
+      client.desktopRequestIds.set(message.id, { bytes: requestIdBytes, upstreamId: message.id });
+      client.desktopRequestBytes += requestIdBytes;
+      if (this._liveIsInternalRequestId(message.id)) {
+        const forwardedId = this._liveAllocateRequestId(client);
+        client.forwardedRequestIds.set(forwardedId, message.id);
+        const tracking = client.desktopRequestIds.get(message.id);
+        tracking.upstreamId = forwardedId;
+        tracking.idJson = Buffer.from(envelope.bytes.subarray(idRange.start, idRange.end));
+        payload = rewriteRpcId(envelope, JSON.stringify(forwardedId));
+      }
+    }
+    const payloadBytes = payload === data ? originalByteLength : messageByteLength(payload);
+    if (client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
+      if (this._liveSendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream")) {
+        client.turnObserver.markForwarded(message);
+      }
+      return;
+    }
+    if (client.queued.length >= this.maxQueuedMessages || client.queuedBytes + payloadBytes > this.maxQueuedBytes) {
+      this._liveCloseClient(client, "downstream_queue_overflow", new CodexAppServerProxyError(
+        "DOWNSTREAM_QUEUE_OVERFLOW",
+        `App Server 启动期间累计消息超过安全上限，已关闭当前连接以避免无界占用`,
+      ));
+      return;
+    }
+    client.queued.push({ data: payload, isBinary, bytes: payloadBytes, observation: { id: message.id, method: message.method } });
+    client.queuedBytes += payloadBytes;
+  }
+
+  _liveReceiveUpstream(client, upstream, metadataGeneration, data, isBinary) {
+    const originalByteLength = messageByteLength(data);
+    if (client.closed || client.upstream !== upstream) {
+      this._liveObserveRequestMetadata("upstream", null, null, originalByteLength);
+      return;
+    }
+    client.upstreamAlive = true;
+    const envelope = this._liveReadRpcEnvelope(client, data, "upstream");
+    if (!envelope) {
+      this._liveObserveRequestMetadata("upstream", null, null, originalByteLength);
+      return;
+    }
+    let message = parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength);
+    let rpcMessage = message ?? envelope.message;
+    const response = isRpcResponse(rpcMessage);
+    let metadataMessage = rpcMessage;
+    let responseGeneration = metadataGeneration;
+    if (response && client.forwardedRequestIds.has(rpcMessage.id)) {
+      responseGeneration = client.metadataDownstreamGeneration;
+      metadataMessage = { id: client.forwardedRequestIds.get(rpcMessage.id) };
+      if (Object.hasOwn(rpcMessage, "error")) metadataMessage.error = rpcMessage.error;
+      else metadataMessage.result = rpcMessage.result;
+    } else if (response && !client.injected.has(rpcMessage.id)
+      && (!this._liveIsInternalRequestId(rpcMessage.id)
+        || client.desktopRequestIds.get(rpcMessage.id)?.upstreamId === rpcMessage.id)) {
+      responseGeneration = client.metadataDownstreamGeneration;
+    }
+    this._liveObserveRequestMetadata("upstream", responseGeneration, metadataMessage, originalByteLength);
+    if (response && client.injected.has(rpcMessage.id)) {
+      const pending = client.injected.get(rpcMessage.id);
+      this.outerRuntime.injectedResponse(client, message ?? rpcMessage, pending.outerEntry);
+      client.injected.delete(rpcMessage.id);
+      clearTimeout(pending.timeout);
+      if (!message) {
+        pending.reject(new CodexAppServerProxyError(
+          "APP_SERVER_RESPONSE_TOO_LARGE",
+          `App Server 回复超过正文解析预算：${pending.method}`,
+          { outcomeUnknown: pending.mutating && pending.written,
+            details: { method: pending.method, id: pending.id, bytes: envelope.bytes.length, maxJsonParseBytes: this.maxJsonParseBytes } },
+        ));
+      } else if (message.error) {
+        pending.reject(new CodexAppServerProxyError(
+          "APP_SERVER_RPC_ERROR",
+          message.error.message ?? `App Server 请求失败：${pending.method}`,
+          { details: { method: pending.method, rpcError: message.error } },
+        ));
+      } else {
+        pending.resolve(message.result);
+      }
+      this.displayPolicyControl.observeRpc("consumed", pending.id, pending.method);
+      return;
+    }
+    if (response) {
+      const upstreamId = rpcMessage.id;
+      if (client.forwardedRequestIds.has(upstreamId)) {
+        const originalId = client.forwardedRequestIds.get(upstreamId);
+        client.forwardedRequestIds.delete(upstreamId);
+        data = rewriteRpcId(envelope, client.desktopRequestIds.get(originalId)?.idJson ?? JSON.stringify(originalId));
+        rpcMessage = { ...rpcMessage, id: originalId };
+        if (message) message = rpcMessage;
+      } else if (this._liveIsInternalRequestId(upstreamId) && client.desktopRequestIds.get(upstreamId)?.upstreamId !== upstreamId) {
+        this.outerRuntime.orphanResponse(client, message ?? rpcMessage);
+        return;
+      }
+      const tracking = client.desktopRequestIds.get(rpcMessage.id);
+      if (tracking?.upstreamId === upstreamId) {
+        if (client.initializationRequestId !== null && rpcMessage.id === client.initializationRequestId && !rpcMessage.error) {
+          client.initialized = true;
+        }
+        client.turnObserver.observeUpstream(rpcMessage);
+        client.desktopRequestBytes -= tracking.bytes;
+        client.desktopRequestIds.delete(rpcMessage.id);
+      }
+    } else if (typeof rpcMessage.method === "string" && !Object.hasOwn(rpcMessage, "id")) {
+      if (this.onNativeTurn && ["turn/started", "turn/completed"].includes(rpcMessage.method)) {
+        try {
+          Promise.resolve(this.onNativeTurn(structuredClone(rpcMessage))).catch(error => this._liveRecordError("native_turn_observer", error));
+        } catch (error) { this._liveRecordError("native_turn_observer", error); }
+      }
+      client.turnObserver.observeUpstream(rpcMessage);
+    }
+    const projected = this.outerRuntime.upstream(client, message ?? rpcMessage, { projectionMessage: message });
+    if (!projected && message) return;
+    if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
+      const payload = projected !== message ? JSON.stringify(projected) : data;
+      this._liveSendOrClose(client, client.downstream, payload, isBinary, "upstream_to_downstream");
+    }
+  }
+
+  _liveUpstreamOpened(client, upstream) {
+    if (client.closed || client.upstream !== upstream) return;
+    client.reconnectAttempt = 0;
+    client.nextReconnectAt = null;
+    client.upstreamAlive = true;
+    client.hasConnectedBefore = true;
+    client.upstreamReady = true;
+    this.lastError = null;
+    this._liveFlushQueuedMessages(client, upstream);
+    this.onEvent({ type: "upstream_connected", connectedAt: client.connectedAt, restored: false });
   }
 
   pauseUpstream() {
@@ -1182,7 +1123,7 @@ export class CodexAppServerProxy {
       if (!client.upstream) continue;
       const upstream = client.upstream;
       upstream.terminate?.();
-      this.#handleUpstreamDisconnect(client, upstream, "managed_upstream_restarting");
+      this._liveHandleUpstreamDisconnect(client, upstream, "managed_upstream_restarting");
     }
   }
 
@@ -1198,10 +1139,10 @@ export class CodexAppServerProxy {
 
   resumeUpstream() {
     this.upstreamPaused = false;
-    for (const client of this.clients) this.#connectUpstream(client);
+    for (const client of this.clients) this._liveConnectUpstream(client);
   }
 
-  #connectUpstream(client) {
+  _liveConnectUpstream(client) {
     if (
       client.closed
       || this.closed
@@ -1216,89 +1157,22 @@ export class CodexAppServerProxy {
     client.nextReconnectAt = null;
     const upstream = new this.WebSocketImpl(this.upstreamUrl, { maxPayload: this.maxWebSocketPayloadBytes });
     client.upstream = upstream;
-    upstream.on("open", () => {
-      if (client.closed || client.upstream !== upstream) return;
-      client.reconnectAttempt = 0;
-      client.nextReconnectAt = null;
-      client.upstreamAlive = true;
-      client.hasConnectedBefore = true;
-      client.upstreamReady = true;
-      this.lastError = null;
-      this.#flushQueuedMessages(client, upstream);
-      this.onEvent({ type: "upstream_connected", connectedAt: client.connectedAt, restored: false });
-    });
-    upstream.on("message", (data, isBinary) => {
-      if (client.closed || client.upstream !== upstream) return;
-      client.upstreamAlive = true;
-      const envelope = this.#readRpcEnvelope(client, data, "upstream");
-      if (!envelope) return;
-      let message = parseJsonMessage(data, this.maxJsonParseBytes);
-      let rpcMessage = message ?? envelope.message;
-      const response = isRpcResponse(rpcMessage);
-      if (response && client.injected.has(rpcMessage.id)) {
-        const pending = client.injected.get(rpcMessage.id);
-        client.injected.delete(rpcMessage.id);
-        clearTimeout(pending.timeout);
-        if (!message) {
-          pending.reject(new CodexAppServerProxyError(
-            "APP_SERVER_RESPONSE_TOO_LARGE",
-            `App Server 回复超过正文解析预算：${pending.method}`,
-            { outcomeUnknown: pending.mutating && pending.written,
-              details: { method: pending.method, id: pending.id, bytes: envelope.bytes.length, maxJsonParseBytes: this.maxJsonParseBytes } },
-          ));
-        } else if (message.error) {
-          pending.reject(new CodexAppServerProxyError(
-            "APP_SERVER_RPC_ERROR",
-            message.error.message ?? `App Server 请求失败：${pending.method}`,
-            { details: { method: pending.method, rpcError: message.error } },
-          ));
-        } else {
-          pending.resolve(message.result);
-        }
-        return;
-      }
-      if (response) {
-        const upstreamId = rpcMessage.id;
-        if (client.forwardedRequestIds.has(upstreamId)) {
-          const originalId = client.forwardedRequestIds.get(upstreamId);
-          client.forwardedRequestIds.delete(upstreamId);
-          data = rewriteRpcId(envelope, client.desktopRequestIds.get(originalId)?.idJson ?? JSON.stringify(originalId));
-          rpcMessage = { ...rpcMessage, id: originalId };
-          if (message) message = rpcMessage;
-        } else if (this.#isInternalRequestId(upstreamId) && client.desktopRequestIds.get(upstreamId)?.upstreamId !== upstreamId) {
-          return;
-        }
-        const tracking = client.desktopRequestIds.get(rpcMessage.id);
-        if (tracking?.upstreamId === upstreamId) {
-          if (client.initializationRequestId !== null && rpcMessage.id === client.initializationRequestId && !rpcMessage.error) {
-            client.initialized = true;
-          }
-          client.turnObserver.observeUpstream(rpcMessage);
-          client.desktopRequestBytes -= tracking.bytes;
-          client.desktopRequestIds.delete(rpcMessage.id);
-        }
-      } else if (typeof rpcMessage.method === "string" && !Object.hasOwn(rpcMessage, "id")) {
-        client.turnObserver.observeUpstream(rpcMessage);
-      }
-      if (client.wakeVisibility.shouldSuppress(message)) return;
-      if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
-        const projected = client.reasoningPlaceholder.project(client.wakeVisibility.project(message));
-        const payload = projected !== message ? JSON.stringify(projected) : data;
-        this.#sendOrClose(client, client.downstream, payload, isBinary, "upstream_to_downstream");
-      }
-    });
-    upstream.on("close", () => this.#handleUpstreamDisconnect(client, upstream, "upstream_closed"));
-    upstream.on("error", (error) => this.#handleUpstreamDisconnect(client, upstream, "upstream_error", error));
+    const metadataGeneration = this._liveNewMetadataGeneration();
+    client.metadataUpstreamGeneration = metadataGeneration;
+    upstream.on("open", () => this._liveUpstreamOpened(client, upstream));
+    upstream.on("message", (data, isBinary) => this._liveReceiveUpstream(client, upstream, metadataGeneration, data, isBinary));
+    upstream.on("close", () => this._liveHandleUpstreamDisconnect(client, upstream, "upstream_closed"));
+    upstream.on("error", (error) => this._liveHandleUpstreamDisconnect(client, upstream, "upstream_error", error));
     upstream.on("pong", () => { client.upstreamAlive = true; });
   }
 
-  #checkHeartbeats() {
+  _liveCheckHeartbeats() {
     for (const client of [...this.clients]) {
       if (client.closed) continue;
       if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
         if (!client.downstreamAlive) {
           client.downstream.terminate?.();
-          this.#closeClient(client, "downstream_heartbeat_timeout", new CodexAppServerProxyError(
+          this._liveCloseClient(client, "downstream_heartbeat_timeout", new CodexAppServerProxyError(
             "DOWNSTREAM_HEARTBEAT_TIMEOUT",
             "Codex Desktop WebSocket 心跳超时",
           ), 1012);
@@ -1311,7 +1185,7 @@ export class CodexAppServerProxy {
         if (!client.upstreamAlive) {
           const upstream = client.upstream;
           upstream.terminate?.();
-          this.#handleUpstreamDisconnect(client, upstream, "upstream_heartbeat_timeout", new CodexAppServerProxyError(
+          this._liveHandleUpstreamDisconnect(client, upstream, "upstream_heartbeat_timeout", new CodexAppServerProxyError(
             "UPSTREAM_HEARTBEAT_TIMEOUT",
             "Codex App Server WebSocket 心跳超时",
           ));
@@ -1323,8 +1197,10 @@ export class CodexAppServerProxy {
     }
   }
 
-  #handleUpstreamDisconnect(client, upstream, reason, error = null) {
+  _liveHandleUpstreamDisconnect(client, upstream, reason, error = null) {
     if (client.closed || client.upstream !== upstream) return;
+    this._liveCloseMetadataConnection(client.metadataUpstreamGeneration);
+    client.metadataUpstreamGeneration = null;
     client.upstream = null;
     client.upstreamReady = false;
     for (const pending of client.injected.values()) {
@@ -1344,49 +1220,49 @@ export class CodexAppServerProxy {
         error: error ? publicError(error) : null,
       };
       this.onEvent({ type: "upstream_session_lost", incident: this.lastIncident });
-      this.#closeClient(client, "upstream_session_lost", error, 1012);
+      this._liveCloseClient(client, "upstream_session_lost", error, 1012);
       return;
     }
-    if (error) this.#recordError(reason, error);
-    this.#scheduleReconnect(client, reason);
+    if (error) this._liveRecordError(reason, error);
+    this._liveScheduleReconnect(client, reason);
   }
 
-  #flushQueuedMessages(client, upstream) {
+  _liveFlushQueuedMessages(client, upstream) {
     if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) return;
     for (const queued of client.queued.splice(0)) {
       client.queuedBytes -= queued.bytes;
-      if (!this.#sendOrClose(client, upstream, queued.data, queued.isBinary, "queued_to_upstream")) break;
+      if (!this._liveSendOrClose(client, upstream, queued.data, queued.isBinary, "queued_to_upstream")) break;
       client.turnObserver.markForwarded(queued.observation);
     }
     if (!client.queued.length) client.queuedBytes = 0;
   }
 
-  #readRpcEnvelope(client, data, source) {
+  _liveReadRpcEnvelope(client, data, source) {
     try {
       return scanRpcEnvelope(data, this.maxJsonParseBytes);
     } catch (error) {
-      this.#closeClient(client, `${source}_protocol_error`, error instanceof CodexAppServerProxyError ? error
+      this._liveCloseClient(client, `${source}_protocol_error`, error instanceof CodexAppServerProxyError ? error
         : new CodexAppServerProxyError("APP_SERVER_PROTOCOL_ERROR", "RPC JSON envelope 无法解析", { cause: error }), 1002);
       return null;
     }
   }
 
-  #sendOrClose(client, socket, data, isBinary, source) {
+  _liveSendOrClose(client, socket, data, isBinary, source) {
     if (socket.readyState !== this.WebSocketImpl.OPEN) return false;
     if ((socket.bufferedAmount ?? 0) > this.maxBufferedBytes) {
-      this.#closeClient(client, `${source}_backpressure`, new CodexAppServerProxyError(
+      this._liveCloseClient(client, `${source}_backpressure`, new CodexAppServerProxyError(
         "WEBSOCKET_BACKPRESSURE",
         `WebSocket 待发送数据超过 ${this.maxBufferedBytes} 字节，已关闭连接以触发权威重连`,
       ), 1013);
       return false;
     }
     socket.send(data, { binary: isBinary }, (error) => {
-      if (error) this.#closeClient(client, `${source}_write_failed`, error, 1011);
+      if (error) this._liveCloseClient(client, `${source}_write_failed`, error, 1011);
     });
     return true;
   }
 
-  #scheduleReconnect(client, reason) {
+  _liveScheduleReconnect(client, reason) {
     if (client.closed || this.closed || client.reconnectTimer) return;
     client.reconnectAttempt += 1;
     const delayMs = Math.min(
@@ -1403,15 +1279,15 @@ export class CodexAppServerProxy {
     });
     client.reconnectTimer = setTimeout(() => {
       client.reconnectTimer = null;
-      this.#connectUpstream(client);
+      this._liveConnectUpstream(client);
     }, delayMs);
   }
 
-  #isInternalRequestId(id) {
+  _liveIsInternalRequestId(id) {
     return Number.isSafeInteger(id) && id <= FIRST_INJECTED_REQUEST_ID && id > this.nextInjectedRequestId;
   }
 
-  #allocateRequestId(client) {
+  _liveAllocateRequestId(client) {
     let id;
     do {
       id = this.nextInjectedRequestId;
@@ -1420,17 +1296,18 @@ export class CodexAppServerProxy {
     return id;
   }
 
-  #injectRequest(client, method, params, options = {}) {
+  _liveInjectRequest(client, method, params, options = {}) {
     if (client.upstream?.readyState !== this.WebSocketImpl.OPEN) {
       return Promise.reject(new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 上游连接未就绪"));
     }
-    const id = this.#allocateRequestId(client);
+    const id = this._liveAllocateRequestId(client);
     const timeoutMs = boundedInteger(options.timeoutMs, this.requestTimeoutMs, 250, 300000);
     return new Promise((resolve, reject) => {
       const pending = {
         id,
         method,
         mutating: Boolean(options.mutating),
+        outerEntry: options.outerEntry,
         written: false,
         resolve,
         reject,
@@ -1438,6 +1315,7 @@ export class CodexAppServerProxy {
       };
       pending.timeout = setTimeout(() => {
         if (!client.injected.delete(id)) return;
+        this.outerRuntime.forgetRequest(client, id, { retainTurn: pending.mutating && pending.written });
         reject(new CodexAppServerProxyError(
           "APP_SERVER_TIMEOUT",
           `App Server 在 ${timeoutMs}ms 内未响应：${method}`,
@@ -1446,10 +1324,16 @@ export class CodexAppServerProxy {
       }, timeoutMs);
       client.injected.set(id, pending);
       try {
-        client.upstream.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+        this.outerRuntime.injectedRequest(client, { id, method, params }, options.outerEntry);
+        const request = { jsonrpc: "2.0", id, method, params };
+        const payload = JSON.stringify(request);
+        this._liveObserveRequestMetadata("downstream", client.metadataUpstreamGeneration, request, messageByteLength(payload));
+        client.upstream.send(payload);
         pending.written = true;
+        this.displayPolicyControl.observeRpc("written", id, method);
       } catch (cause) {
         client.injected.delete(id);
+        this.outerRuntime.forgetRequest(client, id);
         clearTimeout(pending.timeout);
         reject(new CodexAppServerProxyError(
           "APP_SERVER_WRITE_FAILED",
@@ -1460,10 +1344,20 @@ export class CodexAppServerProxy {
     });
   }
 
-  #closeClient(client, reason, error = null, closeCode = 1000) {
+  _liveCloseClient(client, reason, error = null, closeCode = 1000) {
     if (client.closed) return;
     client.closed = true;
+    this._liveCloseMetadataConnection(client.metadataDownstreamGeneration);
+    this._liveCloseMetadataConnection(client.metadataUpstreamGeneration);
+    client.metadataDownstreamGeneration = null;
+    client.metadataUpstreamGeneration = null;
+    client.upstreamReady = false;
+    client.nextReconnectAt = null;
+    client.queued.length = 0;
+    client.queuedBytes = 0;
+    this.outerRuntime.closeClient(client);
     client.wakeVisibility.close();
+    client.displayPolicy.close();
     this.clients.delete(client);
     client.reasoningPlaceholder.close();
     if (client.reconnectTimer) clearTimeout(client.reconnectTimer);
@@ -1485,11 +1379,11 @@ export class CodexAppServerProxy {
       client.downstream.close(closeCode, String(reason).slice(0, 120));
     }
     if (client.upstream?.readyState < this.WebSocketImpl.CLOSING) client.upstream.close();
-    if (error) this.#recordError(reason, error);
+    if (error) this._liveRecordError(reason, error);
     this.onEvent({ type: "client_closed", reason, connectedAt: client.connectedAt });
   }
 
-  async #handleControlRequest(request, response) {
+  async _liveHandleControlRequest(request, response) {
     response.setHeader("content-type", "application/json; charset=utf-8");
     const authorization = String(request.headers.authorization ?? "");
     const expectedAuthorization = `Bearer ${this.controlToken}`;
@@ -1497,6 +1391,89 @@ export class CodexAppServerProxy {
       && crypto.timingSafeEqual(Buffer.from(authorization), Buffer.from(expectedAuthorization));
     if (!authorized) throw new CodexAppServerProxyError("UNAUTHORIZED", "代理控制口令不正确");
     const requestUrl = new URL(request.url ?? "/", `http://${this.controlHost}:${this.controlPort}`);
+    if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback)$/.test(requestUrl.pathname)) {
+      if (!this.managedInnerControl) {
+        response.statusCode = 404;
+        response.end(JSON.stringify({ ok: false, error: { code: "INNER_MANAGED_CONTROL_DISABLED" } }));
+        return;
+      }
+      try {
+        if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) throw new Error("INNER_CONTROL_LOOPBACK_REQUIRED");
+        const method = requestUrl.pathname.split("/").at(-1);
+        if ((method === "status" && request.method !== "GET") || (method !== "status" && request.method !== "POST")) throw new Error("INNER_CONTROL_METHOD_INVALID");
+        let input;
+        if (method === "status") input = { ownerId: request.headers["x-inner-owner-id"], nativeSourceId: request.headers["x-inner-native-source-id"],
+          instanceToken: request.headers["x-inner-instance-token"] };
+        else {
+          if (Number(request.headers["content-length"] ?? 0) > 16 * 1024) {
+            request.resume();
+            throw new CodexAppServerProxyError("BODY_TOO_LARGE", "控制请求正文过大");
+          }
+          const body = await this._liveReadBody(request, 16 * 1024);
+          if (!body.trim()) throw new Error("INNER_CONTROL_BODY_REQUIRED");
+          input = JSON.parse(body);
+          if (!isObject(input)) throw new Error("INNER_CONTROL_REQUEST_INVALID");
+        }
+        const context = this.status();
+        const result = await this.managedInnerControl.dispatch(method, input, { outerBusy: context.clients.some(client =>
+          client.pendingInjectionCount > 0 || client.queuedMessageCount > 0 || client.downstreamBufferedBytes > 0 || client.upstreamBufferedBytes > 0) });
+        response.statusCode = result.httpStatus ?? 200;
+        response.end(JSON.stringify(result));
+      } catch (error) {
+        response.statusCode = error.code === "BODY_TOO_LARGE" ? 413 : /NOT_READY|BUSY/.test(error.message) ? 503 : 409;
+        response.end(JSON.stringify({ ok: false, error: { code: error.code ?? error.message } }));
+      }
+      return;
+    }
+    if (requestUrl.pathname === "/v1/full-runtime" && request.method === "GET") {
+      response.end(JSON.stringify({ ok: true, ...this.liveCodeRuntime.status() }));
+      return;
+    }
+    if (request.method === "POST" && /^\/v1\/full-runtime\/(register|prepare|activate|restore)$/.test(requestUrl.pathname)) {
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) throw new Error("LIVE_CODE_LOOPBACK_REQUIRED");
+      const input = JSON.parse(await this._liveReadBody(request, 16 * 1024));
+      const result = await this.liveCodeRuntime[requestUrl.pathname.split("/").at(-1)](input);
+      response.end(JSON.stringify({ ok: true, ...result }));
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/v1/request-metadata") {
+      response.end(JSON.stringify(this.requestMetadataSnapshot()));
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/v1/outer-runtime") {
+      response.end(JSON.stringify({ ok: true, ...this.outerRuntime.status() }));
+      return;
+    }
+    if (request.method === "POST" && /^\/v1\/outer-runtime\/(prepare|activate|restore)$/.test(requestUrl.pathname)) {
+      try {
+        if (!this.outerRuntime.status().enabled) throw new Error("OUTER_RUNTIME_CONTROL_DISABLED");
+        const input = JSON.parse(await this._liveReadBody(request));
+        if (!isObject(input)) throw new Error("OUTER_RUNTIME_REQUEST_INVALID");
+        const result = await this.outerRuntime[requestUrl.pathname.split("/").at(-1)](input);
+        response.end(JSON.stringify({ ok: true, ...result }));
+      } catch (error) {
+        response.statusCode = 400;
+        response.end(JSON.stringify({ ok: false, error: { code: error.code ?? error.message, message: error.message } }));
+      }
+      return;
+    }
+    if (request.method === "GET" && requestUrl.pathname === "/v1/display-policy") {
+      response.end(JSON.stringify({ ok: true, ...this.displayPolicyControl.status() }));
+      return;
+    }
+    if (request.method === "POST" && /^\/v1\/display-policy\/(prepare|activate|restore|discard)$/.test(requestUrl.pathname)) {
+      let result;
+      try {
+        const input = JSON.parse(await this._liveReadBody(request));
+        result = await this.displayPolicyControl[requestUrl.pathname.split("/").at(-1)](input);
+        result = { ...result, busy: this.displayPolicyControl.status().busy };
+      } catch (error) {
+        result = { ok: false, httpStatus: 400, error: { code: "INVALID_DISPLAY_POLICY_REQUEST", message: String(error.message ?? error) } };
+      }
+      response.statusCode = result.httpStatus ?? 200;
+      response.end(JSON.stringify({ ...result, httpStatus: undefined }));
+      return;
+    }
     if (request.method === "GET" && ["/status", "/v1/status"].includes(requestUrl.pathname)) {
       response.end(JSON.stringify(this.status()));
       return;
@@ -1512,7 +1489,7 @@ export class CodexAppServerProxy {
       response.end(JSON.stringify({ ok: false, error: { code: "NOT_FOUND", message: "控制接口不存在" } }));
       return;
     }
-    const body = await this.#readBody(request);
+    const body = await this._liveReadBody(request);
     const input = JSON.parse(body || "{}");
     const result = requestUrl.pathname === "/v1/threads/inspect"
       ? await this.inspectThread(input.threadId)
@@ -1529,12 +1506,12 @@ export class CodexAppServerProxy {
     }));
   }
 
-  async #readBody(request) {
+  async _liveReadBody(request, maximumBytes = this.maxBodyBytes) {
     let total = 0;
     const chunks = [];
     for await (const chunk of request) {
       total += chunk.length;
-      if (total > this.maxBodyBytes) {
+      if (total > maximumBytes) {
         throw new CodexAppServerProxyError("BODY_TOO_LARGE", "控制请求正文过大");
       }
       chunks.push(chunk);
@@ -1542,7 +1519,7 @@ export class CodexAppServerProxy {
     return Buffer.concat(chunks).toString("utf8");
   }
 
-  #recordError(source, error) {
+  _liveRecordError(source, error) {
     this.lastError = {
       at: new Date().toISOString(),
       source,
@@ -1551,7 +1528,7 @@ export class CodexAppServerProxy {
     this.onEvent({ type: "proxy_error", error: this.lastError });
   }
 
-  #waitForListening(server, name) {
+  _liveWaitForListening(server, name) {
     if (server.address()) return Promise.resolve();
     return new Promise((resolve, reject) => {
       const cleanup = () => {
@@ -1571,7 +1548,7 @@ export class CodexAppServerProxy {
     });
   }
 
-  #listenHttp(server, port, host) {
+  _liveListenHttp(server, port, host) {
     return new Promise((resolve, reject) => {
       const onError = (cause) => {
         server.off("listening", onListening);
@@ -1587,7 +1564,7 @@ export class CodexAppServerProxy {
     });
   }
 
-  #closeServer(server) {
+  _liveCloseServer(server) {
     if (!server) return Promise.resolve();
     return new Promise((resolve) => server.close(() => resolve()));
   }

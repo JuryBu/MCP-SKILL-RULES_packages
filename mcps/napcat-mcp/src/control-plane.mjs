@@ -59,6 +59,13 @@ function stableId(prefix, values) {
   return `${prefix}-${crypto.createHash("sha256").update(values.join("\0"), "utf8").digest("hex").slice(0, 32)}`;
 }
 
+function ownerReplySubscriptionId(routeKey) {
+  const subscriptionId = `owner-reply:${routeKey}`;
+  return subscriptionId.length <= 128
+    ? subscriptionId
+    : stableId("owner-reply", [routeKey]);
+}
+
 function publicError(error) {
   return {
     code: error?.code ?? "UNEXPECTED_ERROR",
@@ -722,12 +729,27 @@ export function createControlPlane(options = {}) {
         const prompt = ownerReplyPrompt(route, message, bufferedMessages);
         const pendingSequences = [...new Set([...bufferedMessages.map((item) => item.messageSeq), sequence])];
         const wakeId = stableId("owner-reply", [route.routeKey, ...bufferedMessages.map((item) => item.messageKey), key]);
+        const promptSha256 = crypto.createHash("sha256").update(prompt, "utf8").digest("hex");
         try {
+          let subscriptionId = ownerReplySubscriptionId(route.routeKey);
+          const priorWake = typeof bridge.inspectWake === "function" ? await bridge.inspectWake(wakeId) : null;
+          if (priorWake && priorWake.taskId !== subscriptionId) {
+            const legacySubscriptionId = route.taskId || `owner-reply:${route.routeKey}`;
+            if (priorWake.taskId !== legacySubscriptionId
+              || priorWake.generation !== 1
+              || priorWake.threadId !== route.conversationId
+              || priorWake.promptSha256 !== promptSha256
+              || priorWake.pendingThroughSequence !== sequence
+              || priorWake.pendingThroughTime !== message.time) {
+              throw Object.assign(new Error("主人回复的旧唤醒身份已变化，保留原记录等待核查"), { code: "OWNER_WAKE_IDENTITY_CONFLICT" });
+            }
+            subscriptionId = legacySubscriptionId;
+          }
           const wake = await bridge.wake({
             threadId: route.conversationId,
             prompt,
             wakeId,
-            taskId: route.taskId || `owner-reply:${route.routeKey}`,
+            taskId: subscriptionId,
             generation: 1,
             localRole: configuration.localMachine,
             sourceMachine: "owner",
@@ -737,7 +759,7 @@ export function createControlPlane(options = {}) {
             newMessageSeqs: pendingSequences,
             pendingThroughSequence: sequence,
             pendingThroughTime: message.time,
-            promptSha256: crypto.createHash("sha256").update(prompt, "utf8").digest("hex"),
+            promptSha256,
           });
           if (!acceptedWake(wake)) {
             results.push({ outcome: wake?.outcome === "busy" ? "owner_thread_busy" : "owner_thread_unavailable", routeKey: route.routeKey, messageSeq: sequence });

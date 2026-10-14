@@ -13,12 +13,22 @@ import { partialResponsesSseProgress } from "./partial-response-progress.mjs";
 import { parseToolDeliveryProfile, toolIdentityHash } from "./tool-delivery-profile.mjs";
 import { createAdaptiveDeliveryRegistry, deliveryProfileKey } from "./adaptive-delivery.mjs";
 import { createRequestProgressTracker, createRequestWaitBudget, mergeRequestProgressState, mergeRequestWaitState, requestUploadAllowanceMs } from "./request-wait-budget.mjs";
+import { createThreadRecoveryHandoff } from "./thread-recovery-handoff.mjs";
+import { createModelStreamFailureDiagnostics } from "./model-stream-failure-diagnostics.mjs";
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
 const DEFAULT_FIRST_LAST_PROGRESS_TIMEOUT_MS = 60_000;
 const DEFAULT_REASONING_PROGRESS_IDLE_TIMEOUT_MS = 60_000;
 const DEFAULT_RAPID_RETRY_MINIMUM_MS = 70_000;
+export function nativeRetryDelay({ elapsedMs, attemptNumber, maxConsecutiveAttempts, chainElapsedMs,
+  rapidRetryMinimumMs, fastRetryThresholdMs = 8000, fastRetryDelayMs = 30000 }) {
+  const fast = Number.isFinite(elapsedMs) && elapsedMs >= 0 && elapsedMs <= fastRetryThresholdMs;
+  const finalGap = attemptNumber === 5 && maxConsecutiveAttempts >= 6
+    ? Math.max(0, rapidRetryMinimumMs - chainElapsedMs) : 0;
+  return { delayMs: Math.max(fast ? fastRetryDelayMs : 0, finalGap),
+    fast, fastRetryThresholdMs, fastRetryDelayMs, finalGapMs: finalGap };
+}
 const DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS = 90_000;
 const DEFAULT_COMPACTION_ATTEMPT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_BUFFERED_REQUEST_BYTES = 128 * 1024 * 1024;
@@ -317,9 +327,11 @@ function createSseFrameParser(onFrame, options = {}) {
   const onError = typeof options.onError === "function" ? options.onError : () => {};
   const classifyPartialProgress = typeof options.classifyPartialProgress === "function" ? options.classifyPartialProgress : () => null;
   const onPartialProgress = typeof options.onPartialProgress === "function" ? options.onPartialProgress : () => {};
+  const shouldPause = typeof options.shouldPause === "function" ? options.shouldPause : () => false;
   let pending = "";
   let pendingPartialProgress = null;
   let failed = false;
+  let ending = false;
   const fail = (error) => {
     if (failed) return;
     failed = true;
@@ -346,6 +358,7 @@ function createSseFrameParser(onFrame, options = {}) {
   const drain = (ending = false) => {
     if (failed) return;
     while (true) {
+      if (shouldPause()) return;
       const match = /\r?\n\r?\n/u.exec(pending);
       if (!match) break;
       const frame = pending.slice(0, match.index);
@@ -353,7 +366,7 @@ function createSseFrameParser(onFrame, options = {}) {
       pending = pending.slice(match.index + match[0].length);
       pendingPartialProgress = null;
       deliver(wire, frame);
-      if (failed) return;
+      if (failed || shouldPause()) return;
     }
     if (ending && pending) {
       const frame = pending;
@@ -395,6 +408,7 @@ function createSseFrameParser(onFrame, options = {}) {
       if (failed) return;
       pending += decoder.write(chunk);
       drain(false);
+      if (shouldPause()) return;
       if (Buffer.byteLength(pending, "utf8") > maximumPendingBytes) {
         fail(Object.assign(new Error("SSE frame exceeded proxy buffer limit"), { code: "SSE_FRAME_LIMIT" }));
         return;
@@ -403,8 +417,24 @@ function createSseFrameParser(onFrame, options = {}) {
     },
     end() {
       if (failed) return;
-      pending += decoder.end();
+      if (!ending) pending += decoder.end();
+      ending = true;
       drain(true);
+    },
+    resume() {
+      if (failed) return;
+      drain(ending);
+      if (shouldPause()) return;
+      if (Buffer.byteLength(pending, "utf8") > maximumPendingBytes) {
+        fail(Object.assign(new Error("SSE frame exceeded proxy buffer limit"), { code: "SSE_FRAME_LIMIT" }));
+        return;
+      }
+      observePartialProgress();
+    },
+    dispose() {
+      failed = true;
+      pending = "";
+      pendingPartialProgress = null;
     },
   };
 }
@@ -579,6 +609,12 @@ function executeTurnAttempt(options) {
     let upstreamResponse = null;
     let settled = false;
     let timer = null;
+    let drainTimer = null;
+    let waitingForDrain = false;
+    let completionPending = false;
+    let parser = null;
+    let upstreamEnded = false;
+    let finishUpstreamResponse = null;
     let sawCompleted = false;
     let sawContent = false;
     let sawReplayUnsafeContent = false;
@@ -613,21 +649,38 @@ function executeTurnAttempt(options) {
     const completedReasoningIds = new Set();
     let normalDeadline = startedAt + uploadAllowanceMs + firstProgressTimeoutMs;
     let normalReason = "FIRST_PROGRESS_TIMEOUT";
+    const failureDiagnostics = createModelStreamFailureDiagnostics();
+    let diagnosticSocket = null;
+    const noteConnection = () => failureDiagnostics.connected();
+    const noteTlsConnection = () => failureDiagnostics.connected(true);
 
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
       observation?.ended(outcome.kind);
       clearTimeout(timer);
+      clearTimeout(drainTimer);
+      downstream.off("drain", resumeAfterDrain);
+      downstream.off("finish", onDownstreamFinished);
+      downstream.off("error", cancelDownstream);
+      parser?.dispose();
+      heldAfterTool = [];
+      heldBytes = 0;
+      rawBodyBeforeProtocol = [];
+      rawBodyBeforeProtocolBytes = 0;
+      diagnosticSocket?.removeListener("connect", noteConnection);
+      diagnosticSocket?.removeListener("secureConnect", noteTlsConnection);
       if (outcome.kind === "completed") adaptive?.complete(Date.now(), !sawCompaction);
       requestState.currentAbort = null;
       if (!upstream.writableFinished) upstream.destroy();
+      upstreamResponse?.destroy();
       const phase = holdingToolDone ? "tool_completion_barrier" : sawLocalTool ? "tool_parameters"
         : contextHint?.contextPreparationHint === true ? "context_preparation_hint" : sawSubstantiveWork ? "ordinary_generation" : "unknown";
       const endCause = outcome.origin ?? (outcome.reason === "DOWNSTREAM_CANCELLED" ? "downstream_cancel_user_origin_unknown"
         : /^HTTP_/u.test(outcome.reason ?? "") ? "upstream_http"
         : terminalFailure ? "upstream_error" : outcome.kind === "completed" ? "upstream_completed" : "unknown");
       resolve({ ...outcome, phase, endCause, contextPreparationHint: contextHint?.contextPreparationHint ?? null,
+        failureDiagnostics: failureDiagnostics.snapshot({ frames, progressObserved: lastProgressAt !== null }),
         elapsedMs: Date.now() - startedAt, uploadAllowanceMs, firstProgressDelayMs: waitBudget?.firstProgressDelayMs() ?? null,
         ...(!sawCompaction ? { ...waitBudget?.snapshot(Date.now()), progressIdentityState: progressTracker.snapshot() } : {}),
         frames, sawContent, sawReplayUnsafeContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
@@ -642,6 +695,7 @@ function executeTurnAttempt(options) {
     };
     const adaptiveDeadlineExpired = () => {
       if (settled || requestState.cancelled) return true;
+      if (completionPending) return false;
       if (sawCompaction) return false;
       let deadline = adaptive?.active() ? adaptive.deadline(normalDeadline, normalReason) : null;
       const waitDeadlineAt = waitBudget?.deadline();
@@ -677,6 +731,7 @@ function executeTurnAttempt(options) {
       }
       timer = setTimeout(() => {
         if (settled || requestState.cancelled) return;
+        if (waitingForDrain) return cancelDownstream();
         const now = Date.now();
         if (!sawCompaction && !preparation.active() && !holdingToolDone
           && ["FIRST_PROGRESS_TIMEOUT", "PROGRESS_IDLE_TIMEOUT"].includes(reason) && adaptive?.tryProbe(now)) {
@@ -708,8 +763,19 @@ function executeTurnAttempt(options) {
     };
     const writeWire = (wire) => {
       if (adaptiveDeadlineExpired()) return false;
+      if (downstream.destroyed || downstream.writableEnded) {
+        cancelDownstream();
+        return false;
+      }
       ensureSseHead(downstream, upstreamHeaders);
-      downstream.write(wire);
+      if (!downstream.write(wire)) {
+        waitingForDrain = true;
+        upstreamResponse?.pause();
+        downstream.once("drain", resumeAfterDrain);
+        clearTimeout(drainTimer);
+        drainTimer = setTimeout(cancelDownstream, upstreamIdleTimeoutMs);
+        drainTimer.unref?.();
+      }
       requestState.downstreamFrames += 1;
       const deliveredEvent = parseSseFrame(wire).event;
       if (isExecutableToolDone(deliveredEvent)) deliveredExecutableToolDone = true;
@@ -727,11 +793,39 @@ function executeTurnAttempt(options) {
     };
     const flushHeldAfterTool = () => {
       if (adaptiveDeadlineExpired()) return false;
-      for (const wire of heldAfterTool) if (!writeWire(wire)) return false;
-      heldAfterTool = [];
+      while (heldAfterTool.length > 0) {
+        if (waitingForDrain) return false;
+        const wire = heldAfterTool.shift();
+        heldBytes -= Buffer.byteLength(wire, "utf8");
+        if (!writeWire(wire)) return false;
+      }
       heldBytes = 0;
       holdingToolDone = false;
       return true;
+    };
+    const cancelDownstream = () => {
+      if (settled) return;
+      requestState.cancelled = true;
+      upstreamResponse?.destroy();
+      upstream.destroy();
+      downstream.destroy();
+    };
+    const onDownstreamFinished = () => {
+      if (completionPending) finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
+    };
+    const finishDelivery = () => {
+      if (settled || requestState.cancelled || !flushHeldAfterTool() || waitingForDrain) return;
+      if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
+      if (downstream.writableFinished) onDownstreamFinished();
+    };
+    const resumeAfterDrain = () => {
+      waitingForDrain = false;
+      clearTimeout(drainTimer);
+      if (settled || requestState.cancelled) return;
+      if (completionPending) return finishDelivery();
+      parser?.resume();
+      if (upstreamEnded && !waitingForDrain && !completionPending) finishUpstreamResponse?.();
+      if (!settled && !waitingForDrain && !completionPending) upstreamResponse?.resume();
     };
     const noteProgress = (time, type) => {
       if (waitBudget?.noteProgress(time)) {
@@ -741,27 +835,35 @@ function executeTurnAttempt(options) {
     };
     const completeFromUpstream = (wire) => {
       if (adaptiveDeadlineExpired()) return;
+      completionPending = true;
+      clearTimeout(timer);
       if (holdingToolDone) {
         if (!holdToolWire(wire)) return;
-        if (!flushHeldAfterTool()) return;
       } else {
         if (!writeWire(wire)) return;
       }
-      if (!downstream.destroyed && !downstream.writableEnded) downstream.end();
-      finish({ kind: "completed", reason: "RESPONSE_COMPLETED" });
-      upstreamResponse?.destroy();
-      upstream.destroy();
+      upstreamResponse?.pause();
+      finishDelivery();
     };
 
     const upstream = client.request(targetUrl, {
       method,
       headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, requestBody.bytes), "accept-encoding": "identity" },
     });
+    upstream.once("socket", (socket) => {
+      if (settled) return;
+      diagnosticSocket = socket;
+      failureDiagnostics.socketAssigned({ reusedSocket: upstream.reusedSocket === true });
+      socket.once("connect", noteConnection);
+      if (socket.encrypted) socket.once("secureConnect", noteTlsConnection);
+    });
     requestState.currentAbort = () => {
       upstreamResponse?.destroy();
       upstream.destroy();
       finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
     };
+    downstream.once("finish", onDownstreamFinished);
+    downstream.once("error", cancelDownstream);
     armTimer(compactionRequest ? compactionAttemptTimeoutMs : firstProgressTimeoutMs + uploadAllowanceMs,
       compactionRequest ? "COMPACTION_CONTROL_TIMEOUT" : "FIRST_PROGRESS_TIMEOUT");
 
@@ -769,6 +871,8 @@ function executeTurnAttempt(options) {
       upstreamResponse = response;
       upstreamHeaders = response.headers;
       const statusCode = response.statusCode ?? 502;
+      failureDiagnostics.responseStarted(statusCode, upstreamHeaders);
+      response.on("data", (chunk) => failureDiagnostics.responseData(chunk.length));
       observation?.headers(response.headers, statusCode);
       const contentType = String(response.headers["content-type"] ?? "").toLowerCase();
       advertisedResponsesSse = contentType.includes("text/event-stream");
@@ -784,6 +888,7 @@ function executeTurnAttempt(options) {
           const responseBody = await collectResponseBody(response, Math.min(maxBufferedResponseBytes, 1024 * 1024));
           if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
           const failure = responseFailureDetailsFromBody(responseBody, observation);
+          failureDiagnostics.httpFailure(responseBody, failure);
           if (failure.safetyPolicy) return finish({ kind: "permanent_failure", reason: failure.code, failure, upstreamHeaders });
           if (failure.category === "usage_limit") return finish({ kind: "usage_limit", reason: `HTTP_${statusCode}`, failure, upstreamHeaders });
           if (failure.category === "permanent") return finish({ kind: "permanent_failure", reason: failure.code ?? `HTTP_${statusCode}`, failure, upstreamHeaders });
@@ -794,12 +899,13 @@ function executeTurnAttempt(options) {
         } catch (error) {
           if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
           onEvent({ type: "upstream_error_body_unavailable", statusCode, reason: error.code ?? "HTTP_BODY_ERROR" });
+          failureDiagnostics.transportError("response", error);
           return finish({ kind: retryableStatus(statusCode) ? "retryable_failure" : "permanent_failure", reason: `HTTP_${statusCode}`, upstreamHeaders });
         }
       }
 
       ensureSseHead(downstream, upstreamHeaders);
-      const parser = createSseFrameParser((wire, frame) => {
+      parser = createSseFrameParser((wire, frame) => {
         if (adaptiveDeadlineExpired()) return;
         frames += 1;
         const parsed = parseSseFrame(frame);
@@ -904,6 +1010,7 @@ function executeTurnAttempt(options) {
         writeWire(wire);
       }, {
         maximumPendingBytes: maxBufferedResponseBytes,
+        shouldPause: () => waitingForDrain || completionPending || settled || requestState.cancelled,
         classifyPartialProgress: frame => partialResponsesSseProgress(frame, completedReasoningIds),
         onPartialProgress: progress => {
             if (settled || requestState.cancelled || sawCompaction) return;
@@ -938,8 +1045,10 @@ function executeTurnAttempt(options) {
         }
         parser.push(chunk);
       });
-      response.once("end", () => {
+      finishUpstreamResponse = () => {
+        if (waitingForDrain) return;
         parser.end();
+        if (waitingForDrain || completionPending) return;
         if (settled) return;
         if (requestState.cancelled) return finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
         if (sawCompleted) {
@@ -969,17 +1078,24 @@ function executeTurnAttempt(options) {
           failure: terminalFailure,
           upstreamHeaders,
         });
+      };
+      response.once("end", () => {
+        upstreamEnded = true;
+        finishUpstreamResponse();
       });
       response.once("error", (error) => {
         if (settled || requestState.cancelled) return;
+        failureDiagnostics.transportError("response", error);
         finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
       });
     });
     upstream.once("error", (error) => {
       if (settled || requestState.cancelled) return;
+      failureDiagnostics.transportError("request", error);
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
     });
     requestBody.submit(upstream, bodyBytes => {
+      failureDiagnostics.requestFinished(bodyBytes);
       onEvent({ type: "upstream_request_finished", elapsedMs: Date.now() - startedAt, bodyBytes,
         meaning: "local_os_handoff" });
     });
@@ -1124,6 +1240,8 @@ export function createCodexModelStreamProxy(options = {}) {
     Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_RAPID_RETRY_MINIMUM_MS,
       Math.round(firstProgressTimeoutMs * DEFAULT_RAPID_RETRY_MINIMUM_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
     10, 300_000, "rapidRetryMinimumMs");
+  const fastRetryThresholdMs = integerOption(options.fastRetryThresholdMs, 8000, 0, 300_000, "fastRetryThresholdMs");
+  const fastRetryDelayMs = integerOption(options.fastRetryDelayMs, 30000, 0, 300_000, "fastRetryDelayMs");
   const retryFirstProgressTimeoutMs = integerOption(options.retryFirstProgressTimeoutMs,
     Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS,
       Math.round(firstProgressTimeoutMs * DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
@@ -1182,6 +1300,12 @@ export function createCodexModelStreamProxy(options = {}) {
   const emptyIdleTurns = new Map();
   const businessProgress = new Map();
   const waitTerminals = new Map();
+  const recoveryHandoff = createThreadRecoveryHandoff({
+    maps: { attempts, emptyIdleTurns, businessProgress, waitTerminals },
+    active,
+    policy: { upstreamOrigin: upstreamOrigin.origin, attemptStateTtlMs, maxConsecutiveAttempts,
+      consecutiveWaitLimitMs, adaptiveWaitLimitMs },
+  });
   const sockets = new Set();
   let draining = false;
   const counters = {
@@ -1250,6 +1374,8 @@ export function createCodexModelStreamProxy(options = {}) {
         firstProgressTimeoutMs,
         firstLastProgressTimeoutMs,
         rapidRetryMinimumMs,
+        fastRetryThresholdMs,
+        fastRetryDelayMs,
         retryFirstProgressTimeoutMs,
         uploadAllowanceMsPerMiB,
         maxUploadAllowanceMs,
@@ -1287,6 +1413,12 @@ export function createCodexModelStreamProxy(options = {}) {
     counters.total += 1;
     pruneAttempts();
     const identity = classifyCodexModelRequest(request);
+    if (identity.guarded && recoveryHandoff.blocked(identity.threadId)) {
+      response.writeHead(503, { "content-type": "application/json", "connection": "close" });
+      response.end(JSON.stringify({ error: { type: "thread_handoff_pending", message: "This thread is moving to another proxy generation." } }));
+      return;
+    }
+    if (identity.guarded) recoveryHandoff.noteRequest(identity.threadId);
     const requestId = crypto.randomUUID();
     const pathname = String(request.url ?? "").split("?")[0].replace(/\/+$/u, "");
     const endpoint = request.method === "POST" && identity.guarded
@@ -1294,7 +1426,7 @@ export function createCodexModelStreamProxy(options = {}) {
       : "unsupported";
     const observation = createRequestObservation({ emit: options.onModelObservation,
       producerInstance: observationInstance, requestId, endpoint });
-    const requestState = { cancelled: false, currentAbort: null, downstreamFrames: 0, inspectionAbort: new AbortController() };
+    const requestState = { threadId: identity.threadId, cancelled: false, currentAbort: null, downstreamFrames: 0, inspectionAbort: new AbortController() };
     const compactionDeadlineAt = identity.requestKind === "compaction" ? Date.now() + compactionAttemptTimeoutMs : null;
     let compactionPreparationTimer = null;
     const bodyLease = requestBufferBudget.lease();
@@ -1377,7 +1509,7 @@ export function createCodexModelStreamProxy(options = {}) {
       active.delete(requestId);
     };
     response.once("close", () => {
-      if (response.writableEnded) return;
+      if (response.writableFinished) return;
       requestState.cancelled = true;
       requestState.inspectionAbort.abort();
       requestState.currentAbort?.();
@@ -1420,7 +1552,8 @@ export function createCodexModelStreamProxy(options = {}) {
           requestState.inspectionAbort.abort();
         }, Math.max(0, compactionDeadlineAt - Date.now()));
       }
-      requestBody.assign(await collectRequestBody(request, maxBufferedRequestBytes, bodyLease, requestState.inspectionAbort.signal));
+      requestBody.assign(await collectRequestBody(request, maxBufferedRequestBytes, bodyLease, requestState.inspectionAbort.signal,
+        { idleTimeoutMs: requestInspectionTimeoutMs }));
       const inspected = await requestInspector.inspect(requestBody.body, request.headers["content-encoding"], { signal: requestState.inspectionAbort.signal });
       clearTimeout(compactionPreparationTimer);
       if (requestState.cancelled) return;
@@ -1577,6 +1710,7 @@ export function createCodexModelStreamProxy(options = {}) {
         kind: outcome.kind,
         phase: outcome.phase,
         endCause: outcome.endCause,
+        failureDiagnostics: outcome.failureDiagnostics,
         contextPreparationHint: outcome.contextPreparationHint,
         reason: outcome.reason,
         elapsedMs: outcome.elapsedMs,
@@ -1745,11 +1879,12 @@ export function createCodexModelStreamProxy(options = {}) {
         }, outcome.upstreamHeaders);
         return;
       }
-      const rapidDelayMs = attemptNumber === 5 && maxConsecutiveAttempts >= 6
-        ? Math.max(0, rapidRetryMinimumMs - (Date.now() - chainStartedAt))
-        : 0;
+      const retryDelay = nativeRetryDelay({ elapsedMs: outcome.elapsedMs, attemptNumber, maxConsecutiveAttempts,
+        chainElapsedMs: Date.now() - chainStartedAt, rapidRetryMinimumMs, fastRetryThresholdMs, fastRetryDelayMs });
+      const rapidDelayMs = retryDelay.delayMs;
       if (rapidDelayMs > 0) {
-        emit({ type: "rapid_retry_wait_started", attemptNumber, delayMs: rapidDelayMs, reason: outcome.reason });
+        emit({ type: "rapid_retry_wait_started", attemptNumber, delayMs: rapidDelayMs, reason: outcome.reason,
+          fastFailure: retryDelay.fast, fastRetryThresholdMs, fastRetryDelayMs, finalGapMs: retryDelay.finalGapMs });
         if (!await waitForRetry(rapidDelayMs, requestState, {
           onKeepalive: () => {
             if (!response.destroyed && !response.writableEnded) {
@@ -1762,7 +1897,8 @@ export function createCodexModelStreamProxy(options = {}) {
       ensureSseHead(response, outcome.upstreamHeaders ?? {});
       response.end();
       counters.retrySignals += 1;
-      emit({ type: "native_retry_signal", attemptNumber, reason: outcome.reason, category: outcome.failure?.category ?? "network" });
+      emit({ type: "native_retry_signal", attemptNumber, reason: outcome.reason, category: outcome.failure?.category ?? "network",
+        failureDiagnostics: outcome.failureDiagnostics });
     } catch (error) {
       if (requestState.compactionPreparationTimedOut && !requestState.cancelled) {
         error = Object.assign(new Error("Compaction classification budget exhausted"), { code: "COMPACTION_CONTROL_TIMEOUT" });
@@ -1857,6 +1993,9 @@ export function createCodexModelStreamProxy(options = {}) {
   });
 
   return {
+    prepareThreadHandoff(threadId) { return recoveryHandoff.prepare(threadId); },
+    cancelThreadHandoff(threadId, token) { return recoveryHandoff.cancel(threadId, token); },
+    acceptThreadHandoff(snapshot) { return recoveryHandoff.accept(snapshot); },
     async start() {
       if (server.listening) return this.status();
       await new Promise((resolve, reject) => {
@@ -1903,6 +2042,8 @@ export function createCodexModelStreamProxy(options = {}) {
         firstProgressTimeoutMs,
         firstLastProgressTimeoutMs,
         rapidRetryMinimumMs,
+        fastRetryThresholdMs,
+        fastRetryDelayMs,
         retryFirstProgressTimeoutMs,
         uploadAllowanceMsPerMiB,
         maxUploadAllowanceMs,

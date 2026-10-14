@@ -4,9 +4,11 @@ import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import process from "node:process";
 import crypto from "node:crypto";
 import { createCodexModelStreamProxy } from "./codex-model-stream-proxy.mjs";
+import { createModelObserver } from "./model-observer.mjs";
 import { renameReplaceSync } from "./atomic-file.mjs";
 import { parseToolDeliveryProfile } from "./tool-delivery-profile.mjs";
 import { createAdaptiveDeliveryRegistry } from "./adaptive-delivery.mjs";
+import { isolatedHandoffConfiguration, attachInnerRunnerHandoffControl } from "./inner-runner-handoff-control.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
   const value = Number(process.env[name] ?? fallback);
@@ -35,6 +37,11 @@ const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
 const lockPath = path.join(stateRoot, "codex-model-stream-proxy.lock.json");
 const deliveryProfilePath = path.join(stateRoot, "codex-model-stream-delivery-profiles.json");
 const adaptiveStatePath = path.join(stateRoot, "codex-model-adaptive-delivery.json");
+const handoffConfig = isolatedHandoffConfiguration({
+  stateRoot,
+  host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
+  upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
+});
 fs.mkdirSync(stateRoot, { recursive: true });
 
 function readToolDeliveryProfile() {
@@ -93,6 +100,7 @@ const instanceToken = crypto.randomUUID();
 let stopping = false;
 let heartbeat = null;
 let stopWatcher = null;
+let handoffControl = null;
 let consecutiveRuntimeWriteFailures = 0;
 const heartbeatIntervalMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_HEARTBEAT_INTERVAL_MS", 5_000, 100, 60_000);
 const drainTimeoutMs = integerEnvironment("CODEX_MODEL_STREAM_PROXY_DRAIN_TIMEOUT_MS", 45_000, 100, 120_000);
@@ -107,9 +115,10 @@ function readAdaptiveState() {
   }
 }
 const proxy = createCodexModelStreamProxy({
+  onModelObservation: event => modelObserver.observe(event),
   instanceToken,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
-  port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, 1, 65535),
+  port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, handoffConfig ? 0 : 1, 65535),
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
   firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 40_000, 1_000, 300_000),
   progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 40_000, 1_000, 300_000),
@@ -135,6 +144,11 @@ try {
 } finally {
   fs.closeSync(lockHandle);
 }
+const modelObserver = createModelObserver({
+  filePath: path.join(stateRoot, "codex-model-observations.jsonl"),
+  statusPath: path.join(stateRoot, "codex-model-observer-runtime.json"),
+  producerInstance: instanceToken,
+});
 
 function releaseOwnLock() {
   try {
@@ -205,6 +219,15 @@ function writeRuntimeState(status = "running", error = null, phase = "heartbeat"
   }
 }
 
+async function closeModelObserver() {
+  const timely = await modelObserver.close();
+  if (!timely) {
+    writeRuntimeState("failed", { code: "MODEL_OBSERVER_CLOSE_PENDING", message: "Observer writes are still settling; instance lock is retained." }, "observer_close_pending");
+    await modelObserver.flush();
+  }
+  return timely;
+}
+
 async function shutdown(reason, exitCode = 0) {
   if (stopping) return;
   stopping = true;
@@ -219,14 +242,23 @@ async function shutdown(reason, exitCode = 0) {
     }
     if (proxy.status().activeRequests > 0) appendRunnerEvent({ type: "drain_timeout", activeRequests: proxy.status().activeRequests });
     await proxy.stop();
-    writeRuntimeState("stopped", null, "shutdown");
   } catch (error) {
     writeRuntimeState("failed", { code: error.code ?? "STOP_FAILED", message: error.message }, "shutdown_failed");
     exitCode = 1;
   }
-  releaseOwnLock();
+  try {
+    if (!await closeModelObserver()) exitCode = 1;
+    if (!proxy.status().running && proxy.status().activeRequests === 0) {
+      writeRuntimeState("stopped", null, "shutdown");
+      releaseOwnLock();
+    } else exitCode = 1;
+  } catch (error) {
+    writeRuntimeState("failed", { code: "MODEL_OBSERVER_CLOSE_FAILED", message: "Observer ownership was not released." }, "observer_close_failed");
+    exitCode = 1;
+  }
   appendRunnerEvent({ type: "runner_stopped", reason, exitCode });
   process.exitCode = exitCode;
+  handoffControl?.close();
 }
 
 process.once("SIGINT", () => void shutdown("SIGINT"));
@@ -245,6 +277,10 @@ try {
   await proxy.start();
   writeRuntimeState("running", null, "startup", true);
   appendRunnerEvent({ type: "runner_started", pid: process.pid, endpoint: runtimeState().endpoint });
+  handoffControl = attachInnerRunnerHandoffControl({
+    config: handoffConfig, proxy, instanceToken, runnerPath: new URL(import.meta.url),
+    onEvent: appendRunnerEvent, shutdown, isStopping: () => stopping,
+  });
   heartbeat = setInterval(() => writeRuntimeState("running", null, "heartbeat"), heartbeatIntervalMs);
   heartbeat.unref?.();
   stopWatcher = setInterval(() => {
@@ -252,8 +288,10 @@ try {
   }, 500);
 } catch (error) {
   writeRuntimeState("failed", { code: error.code ?? "START_FAILED", message: error.message }, "startup_failed");
-  releaseOwnLock();
   appendRunnerEvent({ type: "runner_start_failed", code: error.code ?? "START_FAILED", message: error.message });
   await proxy.stop();
+  await closeModelObserver();
+  if (!proxy.status().running && proxy.status().activeRequests === 0) releaseOwnLock();
   process.exitCode = 1;
+  handoffControl?.close();
 }

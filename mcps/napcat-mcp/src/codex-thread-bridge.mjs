@@ -911,6 +911,12 @@ class CodexProxyThreadBridge {
     return interpretThreadResponse(normalizedThreadId, response, "proxy/thread/read");
   }
 
+  async inspectWake(wakeId) {
+    const normalizedWakeId = requiredString(wakeId, "wakeId", 256);
+    const response = await this.#request(`/v1/wakes/${encodeURIComponent(normalizedWakeId)}`, null, { method: "GET" });
+    return response.wake ?? null;
+  }
+
   async wake(input) {
     if (!isObject(input)) {
       throw new CodexThreadBridgeError("INVALID_ARGUMENT", "wake 必须接收 { threadId, prompt, wakeId }");

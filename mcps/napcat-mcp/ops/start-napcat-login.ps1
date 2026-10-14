@@ -119,6 +119,36 @@ function Invoke-OneBot {
   return Invoke-RestMethod -Method Post -Uri "$BaseUrl/$Action" -Headers $Headers -ContentType "application/json" -Body "{}" -TimeoutSec 3
 }
 
+function Set-OneBotSafeStartupConfig {
+  param(
+    [string]$NapCatRoot,
+    [string]$ExpectedSelfId,
+    [string]$LogPath
+  )
+  if ([string]::IsNullOrWhiteSpace($ExpectedSelfId)) { return }
+  $CandidateConfigPaths = @(
+    (Join-Path $NapCatRoot ("napcat\config\onebot11_{0}.json" -f $ExpectedSelfId)),
+    (Join-Path $NapCatRoot ("config\onebot11_{0}.json" -f $ExpectedSelfId))
+  ) | Select-Object -Unique
+  foreach ($ConfigPath in $CandidateConfigPaths) {
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) { continue }
+    try {
+      $Config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($Config.parseMultMsg -eq $false) { continue }
+      $Config | Add-Member -NotePropertyName "parseMultMsg" -NotePropertyValue $false -Force
+      $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+      [System.IO.File]::WriteAllText($ConfigPath, (($Config | ConvertTo-Json -Depth 30) + [Environment]::NewLine), $Utf8NoBom)
+      if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ("[{0}] [codex] forced_onebot_safe_startup_config parseMultMsg=false config={1}" -f (Get-Date).ToString("o"), $ConfigPath)
+      }
+    } catch {
+      if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ("[{0}] [codex] warn_onebot_safe_startup_config_failed config={1} error={2}" -f (Get-Date).ToString("o"), $ConfigPath, $_.Exception.Message)
+      }
+    }
+  }
+}
+
 function Get-FreshQrCode {
   param([DateTime]$NotBeforeUtc)
   return @($QrCodePaths | ForEach-Object {
@@ -394,9 +424,132 @@ function Release-NapCatLoginAttemptLock {
   }
 }
 
+function ConvertTo-NapCatCommandLineText {
+  param([string]$Value)
+  if ([string]::IsNullOrWhiteSpace($Value)) { return "" }
+  $Comparable = $Value.Trim('"').TrimEnd('\')
+  return $Comparable.ToLowerInvariant().Replace('\', '/')
+}
+
+function Test-CommandLineContainsPath {
+  param(
+    [string]$CommandLine,
+    [string]$Path
+  )
+  if ([string]::IsNullOrWhiteSpace($CommandLine) -or [string]::IsNullOrWhiteSpace($Path)) { return $false }
+  $Haystack = ConvertTo-NapCatCommandLineText -Value $CommandLine
+  $Needle = ConvertTo-NapCatCommandLineText -Value $Path
+  if ([string]::IsNullOrWhiteSpace($Needle)) { return $false }
+  $StartAt = 0
+  while ($StartAt -lt $Haystack.Length) {
+    $FoundAt = $Haystack.IndexOf($Needle, $StartAt, [System.StringComparison]::Ordinal)
+    if ($FoundAt -lt 0) { return $false }
+    $AfterAt = $FoundAt + $Needle.Length
+    $Before = if ($FoundAt -eq 0) { "" } else { $Haystack.Substring($FoundAt - 1, 1) }
+    $After = if ($AfterAt -ge $Haystack.Length) { "" } else { $Haystack.Substring($AfterAt, 1) }
+    $BeforeOk = $FoundAt -eq 0 -or $Before -match '[`"''\s=]'
+    $AfterOk = $AfterAt -ge $Haystack.Length -or $After -match '[`"''\s<>/]'
+    if ($BeforeOk -and $AfterOk) { return $true }
+    $StartAt = $FoundAt + 1
+  }
+  return $false
+}
+
+function Get-ExistingNapCatRuntimeProcesses {
+  param(
+    [string]$NapCatRoot,
+    [string]$QqExePath,
+    [string]$QqUserDataDir
+  )
+  $Processes = foreach ($Process in @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)) {
+    $ProcessId = [int]$Process.ProcessId
+    if ($ProcessId -eq $PID) { continue }
+    $Name = ([string]$Process.Name).ToLowerInvariant()
+    $CommandLine = [string]$Process.CommandLine
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { continue }
+    $MatchesRuntimeRoot = Test-CommandLineContainsPath -CommandLine $CommandLine -Path $NapCatRoot
+    $MatchesQqExePath = Test-CommandLineContainsPath -CommandLine $CommandLine -Path $QqExePath
+    $MatchesProfile = Test-CommandLineContainsPath -CommandLine $CommandLine -Path $QqUserDataDir
+    $ComparableCommandLine = ConvertTo-NapCatCommandLineText -Value $CommandLine
+    $LooksLikeManagedWrapper = $ComparableCommandLine -match '(supervisor-runner\.mjs|runnapcatsupervisorwatchdog\.ps1|task-router-runner\.mjs|codex-app-server-proxy|codex-app-tools-compat-launcher|codex-model-stream-proxy|/src/index\.mjs)'
+    $LooksLikeNapCatLauncher = (-not $LooksLikeManagedWrapper) -and ($ComparableCommandLine -match '(launcher-user\.bat|napcat\.bat|napcatwinbootmain\.exe|loadnapcat\.js|napcat/napcat\.mjs|/napcat\.mjs|/index\.js)')
+    $LooksLikeFixedQq = $MatchesQqExePath -and $Name -match '^(qq|qqnt|qqex)(\.exe)?$'
+    $LooksLikeProfileBoundQq = $MatchesProfile -and $Name -match '^(qq|qqnt|qqex)(\.exe)?$'
+    if (-not [string]::IsNullOrWhiteSpace($env:NAPCAT_LOGIN_PROCESS_SCAN_DEBUG) -and ($MatchesRuntimeRoot -or $MatchesQqExePath -or $MatchesProfile -or $LooksLikeNapCatLauncher)) {
+      Write-Host ("[NAPCAT_PROCESS_SCAN_DEBUG] pid={0} name={1} runtime={2} qqExe={3} profile={4} looksNapCat={5} cmd={6}" -f $ProcessId, $Name, $MatchesRuntimeRoot, $MatchesQqExePath, $MatchesProfile, $LooksLikeNapCatLauncher, $CommandLine)
+    }
+    if (($MatchesRuntimeRoot -and $LooksLikeNapCatLauncher) -or $LooksLikeFixedQq -or $LooksLikeProfileBoundQq) {
+      [pscustomobject]@{
+        processId = $ProcessId
+        name = [string]$Process.Name
+        commandLine = $CommandLine
+      }
+    }
+  }
+  return @($Processes | Sort-Object ProcessId | ForEach-Object {
+    [pscustomobject]@{
+      processId = [int]$_.ProcessId
+      name = [string]$_.Name
+      commandLine = [string]$_.CommandLine
+    }
+  })
+}
+
+function Get-AliveNapCatRuntimeProcessIds {
+  param([object[]]$Processes)
+  return @($Processes | ForEach-Object {
+    $ProcessId = [int]$_.processId
+    if ($null -ne (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue)) { $ProcessId }
+  } | Sort-Object -Unique)
+}
+
+function Wait-ExistingNapCatRuntimeOnline {
+  param(
+    [object[]]$Processes,
+    [int]$WaitSeconds,
+    [string]$LogPath
+  )
+  $Deadline = [DateTime]::UtcNow.AddSeconds([Math]::Max(1, $WaitSeconds))
+  $ObservedProcessIds = @($Processes | ForEach-Object { [int]$_.processId } | Sort-Object -Unique)
+  $LastProbe = "尚未完成 OneBot 探测"
+  Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ("[{0}] [codex] existing_napcat_runtime_detected pid={1}; waitSeconds={2}; refuse_second_launch=true" -f (Get-Date).ToString("o"), ($ObservedProcessIds -join ","), $WaitSeconds)
+  while ([DateTime]::UtcNow -lt $Deadline) {
+    $AliveProcessIds = Get-AliveNapCatRuntimeProcessIds -Processes $Processes
+    if ($AliveProcessIds.Count -eq 0) {
+      Add-Content -LiteralPath $LogPath -Encoding UTF8 -Value ("[{0}] [codex] existing_napcat_runtime_gone; continue_launch=true" -f (Get-Date).ToString("o"))
+      return $null
+    }
+    try {
+      $Status = Invoke-OneBot -Action "get_status"
+      if ($Status.status -eq "ok" -and $Status.data.online -eq $true -and $Status.data.good -eq $true) {
+        $Login = Invoke-OneBot -Action "get_login_info"
+        $VerifiedLogin = Assert-ExpectedLogin -LoginData $Login.data
+        [pscustomobject]@{
+          state = "online_existing"
+          launched = $false
+          processId = $null
+          existingProcessIds = $AliveProcessIds
+          userId = $VerifiedLogin.userId
+          nickname = $VerifiedLogin.nickname
+          qrCodePath = $null
+          logPath = $LogPath
+        }
+        return
+      }
+      $LastProbe = "get_status 返回 online=$($Status.data.online) good=$($Status.data.good)"
+    } catch {
+      if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
+      $LastProbe = $_.Exception.Message
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  $AliveAtDeadline = Get-AliveNapCatRuntimeProcessIds -Processes $Processes
+  throw "[NAPCAT_PROCESS_PRESENT] 检测到已有 NapCat 运行态或登录窗口（pid=$($AliveAtDeadline -join ',')），但 OneBot 在 $WaitSeconds 秒内没有上线；为避免同一账号被第二个 NapCat 顶下线，本次拒绝再启动。日志：$LogPath；最后探测：$LastProbe"
+}
+
 try {
   $Status = Invoke-OneBot -Action "get_status"
-  if ($Status.status -eq "ok" -and $Status.data.online -eq $true) {
+  if ($Status.status -eq "ok" -and $Status.data.online -eq $true -and $Status.data.good -eq $true) {
     $Login = Invoke-OneBot -Action "get_login_info"
     $VerifiedLogin = Assert-ExpectedLogin -LoginData $Login.data
     [pscustomobject]@{
@@ -410,12 +563,35 @@ try {
     } | ConvertTo-Json -Depth 5
     exit 0
   }
+  if ($Status.status -eq "ok" -and $Status.data.online -eq $true) {
+    throw "[NAPCAT_PROCESS_PRESENT] OneBot 已有在线运行态但 good=false；拒绝启动第二个 NapCat，避免同一账号被重复登录顶下线。"
+  }
 } catch {
   if ($_.Exception.Message -like "NapCat 登录了错误*") { throw }
+  if ($_.Exception.Message.StartsWith("[NAPCAT_PROCESS_PRESENT]")) { throw }
 }
 
 $LoginAttemptLock = New-NapCatLoginAttemptLock -DataRoot $DataRoot -NapCatRoot $NapCatRoot -ExpectedSelfId $ExpectedSelfId -NoQr:$NoQr
 try {
+$StartedAtUtc = [DateTime]::UtcNow
+$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
+New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
+$LogPath = Join-Path $LogDirectory "codex-login-$Stamp.log"
+$ErrorLogPath = Join-Path $LogDirectory "codex-login-$Stamp.error.log"
+Set-OneBotSafeStartupConfig -NapCatRoot $NapCatRoot -ExpectedSelfId $ExpectedSelfId -LogPath $LogPath
+$ExistingNapCatProcesses = Get-ExistingNapCatRuntimeProcesses -NapCatRoot $NapCatRoot -QqExePath $QqExePath -QqUserDataDir $QqUserDataDir
+if (@($ExistingNapCatProcesses).Count -gt 0) {
+  $ExistingProcessWaitSeconds = if ($NoQr) {
+    [Math]::Min(3, $TimeoutSeconds)
+  } else {
+    [Math]::Min(30, $TimeoutSeconds)
+  }
+  $ExistingRuntimeResult = Wait-ExistingNapCatRuntimeOnline -Processes $ExistingNapCatProcesses -WaitSeconds $ExistingProcessWaitSeconds -LogPath $LogPath
+  if ($null -ne $ExistingRuntimeResult) {
+    $ExistingRuntimeResult | ConvertTo-Json -Depth 5
+    return
+  }
+}
 $QuickPasswordMd5 = if ($NoQr -and (-not $NoPasswordFallback)) {
   try {
     Read-NapCatQuickLoginCredential -CredentialPath $QuickLoginCredentialPath -ExpectedAccount $ExpectedSelfId
@@ -426,12 +602,7 @@ $QuickPasswordMd5 = if ($NoQr -and (-not $NoPasswordFallback)) {
   $null
 }
 $HasPasswordFallback = -not [string]::IsNullOrWhiteSpace($QuickPasswordMd5)
-$StartedAtUtc = [DateTime]::UtcNow
 $PasswordFallbackDeadlineUtc = $StartedAtUtc.AddSeconds([Math]::Min(60, [Math]::Max(25, $TimeoutSeconds - 5)))
-$Stamp = Get-Date -Format "yyyyMMdd-HHmmss"
-New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
-$LogPath = Join-Path $LogDirectory "codex-login-$Stamp.log"
-$ErrorLogPath = Join-Path $LogDirectory "codex-login-$Stamp.error.log"
 $EmptyInputPath = Join-Path $LogDirectory ".codex-empty-input"
 if (-not (Test-Path -LiteralPath $EmptyInputPath)) {
   [System.IO.File]::WriteAllText($EmptyInputPath, "", (New-Object System.Text.UTF8Encoding($false)))
@@ -518,7 +689,7 @@ while ([DateTime]::UtcNow -lt $Deadline) {
   }
   try {
     $Status = Invoke-OneBot -Action "get_status"
-    if ($Status.status -eq "ok" -and $Status.data.online -eq $true) {
+    if ($Status.status -eq "ok" -and $Status.data.online -eq $true -and $Status.data.good -eq $true) {
       $Login = Invoke-OneBot -Action "get_login_info"
       $VerifiedLogin = Assert-ExpectedLogin -LoginData $Login.data
       Close-QrWindow -Window $QrWindow

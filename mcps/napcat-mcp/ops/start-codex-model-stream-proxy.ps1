@@ -10,7 +10,8 @@ param(
   [ValidateRange(1, 256)][int]$MaxDecodedRequestMiB = 192,
   [string]$UpstreamOrigin = "https://chatgpt.com",
   [ValidateRange(1, 30)][int]$StartupTimeoutSeconds = 10,
-  [string]$MaintenanceToken = ""
+  [string]$MaintenanceToken = "",
+  [string]$CodexExecutablePath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -33,6 +34,34 @@ if (Test-Path -LiteralPath $MaintenancePath) {
     [pscustomobject]@{ changed = $false; reason = "model_proxy_maintenance"; expiresAt = $Maintenance.expiresAt } | ConvertTo-Json
     return
   }
+}
+
+. (Join-Path $PSScriptRoot 'resolve-codex-outer-runtime-startup.ps1')
+$ManagedStartup = Resolve-CodexOuterRuntimeStartup -DataRoot $DataRoot
+$ManagedProfile = Get-CodexInnerManagedStartupProfile -Startup $ManagedStartup -DataRoot $DataRoot
+if ($null -ne $ManagedProfile) {
+  if (Test-Path -LiteralPath $StopPath) { throw 'INNER_MANAGED_EXISTING_STOP_REQUIREMENT_PRESERVED' }
+  if ($PSBoundParameters.ContainsKey('Port') -and $Port -ne $ManagedProfile.ports.inner) {
+    throw 'INNER_MANAGED_REQUESTED_PORT_MISMATCH'
+  }
+  if ($PSBoundParameters.ContainsKey('UpstreamOrigin') -and $UpstreamOrigin -cne $ManagedProfile.upstreamOrigin) {
+    throw 'INNER_MANAGED_REQUESTED_ORIGIN_MISMATCH'
+  }
+  foreach ($Setting in @('FirstProgressTimeoutSeconds', 'ProgressIdleTimeoutSeconds', 'CompactionAttemptTimeoutSeconds',
+      'MaxConsecutiveAttempts', 'MaxBufferedRequestMiB', 'MaxDecodedRequestMiB')) {
+    if ($PSBoundParameters.ContainsKey($Setting)) { throw "INNER_MANAGED_USE_BOUND_PROFILE_SETTING: $Setting" }
+  }
+  $ManagedArguments = @{ DataRoot = $DataRoot; DownstreamPort = [int]$ManagedProfile.ports.downstream;
+    ControlPort = [int]$ManagedProfile.ports.control; UpstreamPort = [int]$ManagedProfile.ports.upstream;
+    ProbePort = [int]$ManagedProfile.ports.probe; RequireNoStopMarker = $true }
+  if ($CodexExecutablePath) { $ManagedArguments.CodexExecutablePath = $CodexExecutablePath }
+  $ManagedResultText = & (Join-Path $PSScriptRoot 'start-codex-app-server-proxy.ps1') @ManagedArguments | Out-String
+  $ManagedResult = $ManagedResultText | ConvertFrom-Json
+  [pscustomobject]@{ changed = [bool]$ManagedResult.started; running = [string]$ManagedResult.state -eq 'running';
+    mode = 'managed'; pid = $ManagedResult.pid; endpoint = "http://127.0.0.1:$($ManagedProfile.ports.inner)";
+    ownerId = $ManagedProfile.ownerId; nativeSourceId = $ManagedProfile.nativeSourceId;
+    innerManagedProfileSha256 = $ManagedStartup.innerManagedProfileSha256; outer = $ManagedResult } | ConvertTo-Json -Depth 10
+  return
 }
 
 function Resolve-NodeExecutable {

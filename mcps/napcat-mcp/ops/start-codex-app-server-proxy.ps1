@@ -8,7 +8,12 @@ param(
   [ValidateRange(250, 300000)][int]$ResumeTimeoutMs = 120000,
   [ValidateRange(1000, 120000)][int]$StartTimeoutMs = 45000,
   [ValidateRange(30, 300)][int]$StartupTimeoutSeconds = 120,
-  [switch]$RequireNoStopMarker
+  [switch]$RequireNoStopMarker,
+  [switch]$RequestMetadataEnabled,
+  [string]$ExpectedInstanceToken = "",
+  [string]$LaunchReceiptPath = "",
+  [string]$CodexExecutablePath = "",
+  [ValidateSet('Auto', 'Plan', 'Reject')][string]$StartupRecoveryMode = 'Auto'
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,9 +37,21 @@ $MaintenanceFilePath = Join-Path $StateRoot "task-router.maintenance.json"
 $AlertFilePath = Join-Path $StateRoot "automation-alert.json"
 $FallbackFilePath = Join-Path $StateRoot "codex-app-server-proxy-fallback.json"
 
+. (Join-Path $PSScriptRoot "resolve-codex-outer-runtime-startup.ps1")
+$OuterRuntimeStartup = Resolve-CodexOuterRuntimeStartup -DataRoot $DataRoot
+if (-not [string]::IsNullOrWhiteSpace($CodexExecutablePath)) {
+  if ($CodexExecutablePath -notmatch '^[A-Za-z]:[\\/]' -and $CodexExecutablePath -notmatch '^\\\\[^\\/]+[\\/][^\\/]+[\\/]') {
+    throw "CodexExecutablePath must be an absolute existing executable path"
+  }
+  $CodexExecutablePath = [System.IO.Path]::GetFullPath($CodexExecutablePath)
+  if (-not (Test-Path -LiteralPath $CodexExecutablePath -PathType Leaf)) {
+    throw "Missing explicit Codex executable: $CodexExecutablePath"
+  }
+}
+
 if (-not (Test-Path -LiteralPath $RunnerPath)) { throw "Missing Codex App Server proxy runner: $RunnerPath" }
-New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null
-if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
+if ($StartupRecoveryMode -ne 'Plan') { New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null }
+if (($RequireNoStopMarker -or $OuterRuntimeStartup.innerManagedProfilePath) -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 
 function Test-ExpectedProxyRuntime {
   param($RuntimeState, $ProcessInfo)
@@ -55,7 +72,56 @@ function Test-ExpectedProxyRuntime {
   }
 }
 
-if (Test-Path -LiteralPath $RuntimeStatePath) {
+function Get-OuterRuntimeStartupStatus {
+  param($RuntimeState, $ProcessInfo, [bool]$AppliedByThisStart)
+
+  $LoadedCandidateRoot = $null
+  $RootArgument = [regex]::Match([string]$ProcessInfo.CommandLine, '(?:^|\s)"?--outer-runtime-root"?\s+(?:"([^"]*)"|(\S+))')
+  if ($RootArgument.Success) {
+    $LoadedCandidateRoot = if ($RootArgument.Groups[1].Success) { $RootArgument.Groups[1].Value } else { $RootArgument.Groups[2].Value }
+  }
+  $ObservedOuterRuntime = $RuntimeState.proxy.outerRuntime
+  $StatusSource = if ($null -ne $ObservedOuterRuntime) { "runtime_state" } else { "unavailable" }
+  if (-not $AppliedByThisStart -and $OuterRuntimeStartup.configured) {
+    try {
+      $ControlToken = (Get-Content -LiteralPath $TokenFilePath -Raw -Encoding UTF8).Trim()
+      $LiveStatus = Invoke-RestMethod -Uri "http://127.0.0.1:$ControlPort/v1/status" -Headers @{ Authorization = "Bearer $ControlToken" } -TimeoutSec 3
+      if ([string]$LiveStatus.outerRuntime.instanceId -eq [string]$RuntimeState.instanceToken -and $LiveStatus.closed -eq $false) {
+        $ObservedOuterRuntime = $LiveStatus.outerRuntime
+        $StatusSource = "control_status"
+      }
+    } catch {}
+  }
+  $RequestedCandidateRoot = if ($OuterRuntimeStartup.enabled) { $OuterRuntimeStartup.candidateRoot } else { $null }
+  $ProfileArgument = [regex]::Match([string]$ProcessInfo.CommandLine, '(?:^|\s)"?--inner-managed-profile"?\s+(?:"([^"]*)"|(\S+))')
+  $ProfileHashArgument = [regex]::Match([string]$ProcessInfo.CommandLine, '(?:^|\s)"?--inner-managed-profile-sha256"?\s+(?:"([^"]*)"|(\S+))')
+  $LoadedProfilePath = if ($ProfileArgument.Success) { if ($ProfileArgument.Groups[1].Success) { $ProfileArgument.Groups[1].Value } else { $ProfileArgument.Groups[2].Value } } else { $null }
+  $LoadedProfileHash = if ($ProfileHashArgument.Success) { if ($ProfileHashArgument.Groups[1].Success) { $ProfileHashArgument.Groups[1].Value } else { $ProfileHashArgument.Groups[2].Value } } else { $null }
+  $ConfigurationMatchesRunning = $null
+  if ($null -ne $ObservedOuterRuntime -and $ObservedOuterRuntime.enabled -is [bool]) {
+    $ConfigurationMatchesRunning = [bool]$ObservedOuterRuntime.enabled -eq [bool]$OuterRuntimeStartup.enabled -and
+      [string]::Equals([string]$LoadedCandidateRoot, [string]$RequestedCandidateRoot, [System.StringComparison]::OrdinalIgnoreCase) -and
+      [string]::Equals([string]$LoadedProfilePath, [string]$OuterRuntimeStartup.innerManagedProfilePath, [System.StringComparison]::OrdinalIgnoreCase) -and
+      [string]$LoadedProfileHash -ceq [string]$OuterRuntimeStartup.innerManagedProfileSha256
+  }
+  return [pscustomobject]@{
+    configurationPath = $OuterRuntimeStartup.configurationPath
+    configured = $OuterRuntimeStartup.configured
+    requestedEnabled = $OuterRuntimeStartup.enabled
+    requestedCandidateRoot = $RequestedCandidateRoot
+    appliedByThisStart = $AppliedByThisStart -and $OuterRuntimeStartup.configured
+    loadedCandidateRoot = $LoadedCandidateRoot
+    requestedInnerManagedProfilePath = $OuterRuntimeStartup.innerManagedProfilePath
+    loadedInnerManagedProfilePath = $LoadedProfilePath
+    loadedInnerManagedProfileSha256 = $LoadedProfileHash
+    runningOuterRuntime = $ObservedOuterRuntime
+    runningStatusSource = $StatusSource
+    configurationMatchesRunning = $ConfigurationMatchesRunning
+    restartRequired = if ($null -eq $ConfigurationMatchesRunning) { $null } else { -not $ConfigurationMatchesRunning }
+  }
+}
+
+if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePath)) {
   try {
     $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $ExistingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$ExistingState.pid)" -ErrorAction SilentlyContinue
@@ -65,6 +131,7 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
         reason = "already_running"
         pid = [int]$ExistingState.pid
         runtimeState = $ExistingState
+        outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $ExistingState -ProcessInfo $ExistingProcess -AppliedByThisStart $false
       } | ConvertTo-Json -Depth 12
       return
     }
@@ -73,7 +140,7 @@ if (Test-Path -LiteralPath $RuntimeStatePath) {
 }
 
 if (Test-Path -LiteralPath $StopFilePath) {
-  if ($RequireNoStopMarker) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
+  if ($RequireNoStopMarker -or $OuterRuntimeStartup.innerManagedProfilePath) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
   Remove-Item -LiteralPath $StopFilePath -Force
 }
 
@@ -101,6 +168,15 @@ function Resolve-NodeExecutable {
 
 $NodePath = Resolve-NodeExecutable
 
+if ($OuterRuntimeStartup.innerManagedProfilePath -and ($StartupRecoveryMode -eq 'Plan' -or (Test-Path -LiteralPath $LockPath))) {
+  if ($StartupRecoveryMode -eq 'Reject') { throw 'INNER_PROFILE_EXISTING_LEASE' }
+  $RecoveryMode = if ($StartupRecoveryMode -eq 'Plan') { 'Plan' } else { 'Apply' }
+  $RecoveryOutput = & $NodePath (Join-Path $PSScriptRoot 'recover-inner-startup.mjs') $RecoveryMode $DataRoot $OuterRuntimeStartup.configurationPath $OuterRuntimeStartup.innerManagedProfilePath $OuterRuntimeStartup.innerManagedProfileSha256 $DownstreamPort $ControlPort $UpstreamPort $ProbePort
+  if ($LASTEXITCODE -ne 0) { throw 'INNER_STARTUP_RECOVERY_REFUSED' }
+  if ($StartupRecoveryMode -eq 'Plan') { $RecoveryOutput; return }
+}
+if ($StartupRecoveryMode -eq 'Plan') { throw 'INNER_STARTUP_RECOVERY_PROFILE_REQUIRED' }
+
 function Test-LoopbackPortAvailable {
   param([int]$Port)
   $Listener = $null
@@ -118,6 +194,7 @@ function Test-LoopbackPortAvailable {
 }
 
 if (-not (Test-LoopbackPortAvailable -Port $UpstreamPort)) {
+  if ($OuterRuntimeStartup.innerManagedProfilePath) { throw 'INNER_STARTUP_BOUND_UPSTREAM_PORT_BUSY' }
   $SelectedUpstreamPort = $null
   foreach ($CandidatePort in (($UpstreamPort + 2)..([Math]::Min(65535, $UpstreamPort + 32)))) {
     if ($CandidatePort -eq $DownstreamPort -or $CandidatePort -eq $ControlPort -or $CandidatePort -eq $ProbePort) { continue }
@@ -156,14 +233,53 @@ $Arguments = @(
   "--startup-budget-ms", ([string]$StartupBudgetMs),
   "--resume-timeout-ms", ([string]$ResumeTimeoutMs)
 )
+if ($OuterRuntimeStartup.enabled) {
+  $Arguments += @("--outer-runtime-root", [string]$OuterRuntimeStartup.candidateRoot)
+}
+if ($OuterRuntimeStartup.innerManagedProfilePath) {
+  $Arguments += @('--inner-managed-profile', [string]$OuterRuntimeStartup.innerManagedProfilePath,
+    '--inner-managed-profile-sha256', [string]$OuterRuntimeStartup.innerManagedProfileSha256)
+  if (-not $ExpectedInstanceToken -and -not $LaunchReceiptPath) {
+    $ExpectedInstanceToken = [guid]::NewGuid().ToString()
+    $ManagedLaunchRoot = Join-Path ([IO.Path]::GetTempPath()) ('napcat-inner-managed-launch-' + $ExpectedInstanceToken)
+    if (Test-Path -LiteralPath $ManagedLaunchRoot) { throw 'INNER_STARTUP_LAUNCH_ROOT_EXISTS' }
+    New-Item -ItemType Directory -Path $ManagedLaunchRoot -ErrorAction Stop | Out-Null
+    Assert-CodexStartupPathWithoutReparsePoint -Path $ManagedLaunchRoot
+    $LaunchReceiptPath = Join-Path $ManagedLaunchRoot 'launch.json'
+  }
+}
+if ($RequestMetadataEnabled) {
+  $Arguments += @("--request-metadata-enabled", "true")
+}
+if (-not [string]::IsNullOrWhiteSpace($CodexExecutablePath)) {
+  $Arguments += @("--codex-exe", $CodexExecutablePath)
+}
 $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
+if ($ExpectedInstanceToken -or $LaunchReceiptPath) {
+  if ($ExpectedInstanceToken -cnotmatch '^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$' -or $LaunchReceiptPath -notmatch '^[A-Za-z]:[\\/]' -or $LaunchReceiptPath.Substring(2).Contains(':')) { throw 'START_LAUNCH_BINDING_REQUIRED' }
+  $LaunchReceiptPath = [IO.Path]::GetFullPath($LaunchReceiptPath)
+  if (-not $LaunchReceiptPath.StartsWith([IO.Path]::GetTempPath().TrimEnd('\', '/') + '\', [StringComparison]::OrdinalIgnoreCase) -or -not (Test-Path -LiteralPath (Split-Path -Parent $LaunchReceiptPath) -PathType Container) -or (Test-Path -LiteralPath $LaunchReceiptPath)) { throw 'START_NEW_TEMP_LAUNCH_RECEIPT_REQUIRED' }
+  if (Test-Path -LiteralPath ($LaunchReceiptPath + '.ready')) { throw 'START_NEW_TEMP_LAUNCH_READY_REQUIRED' }
+  $Arguments += @('--instance-token', $ExpectedInstanceToken, '--launch-receipt', $LaunchReceiptPath)
+  $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
+}
 if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
+if ($LaunchReceiptPath) {
+  $PinnedHandle = $Process.Handle
+  $Launch = [ordered]@{ schemaVersion = 1; instanceToken = $ExpectedInstanceToken; pid = $Process.Id; createdAt = $Process.StartTime.ToUniversalTime().ToString('o'); nodePath = $NodePath; nodeSha256 = (Get-FileHash -LiteralPath $NodePath -Algorithm SHA256).Hash.ToLowerInvariant(); runnerPath = $RunnerPath; runnerSha256 = (Get-FileHash -LiteralPath $RunnerPath -Algorithm SHA256).Hash.ToLowerInvariant(); entrySha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(); runtimeStatePath = $RuntimeStatePath; commandLine = $ArgumentLine; ports = @($DownstreamPort, $ControlPort, $UpstreamPort, $ProbePort); recordedAt = [DateTimeOffset]::UtcNow.ToString('o') }
+  $ReceiptStream = [IO.File]::Open($LaunchReceiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  try { $ReceiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Launch | ConvertTo-Json -Depth 8 -Compress)); $ReceiptStream.Write($ReceiptBytes, 0, $ReceiptBytes.Length); $ReceiptStream.Flush($true) } finally { $ReceiptStream.Dispose() }
+  $Ready = [ordered]@{ instanceToken = $ExpectedInstanceToken; receiptSha256 = (Get-FileHash -LiteralPath $LaunchReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+  $ReadyStream = [IO.File]::Open(($LaunchReceiptPath + '.ready'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+  try { $ReadyBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Ready | ConvertTo-Json -Compress)); $ReadyStream.Write($ReadyBytes, 0, $ReadyBytes.Length); $ReadyStream.Flush($true) } finally { $ReadyStream.Dispose() }
+}
 
 $RuntimeState = $null
 $Deadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
 do {
   Start-Sleep -Milliseconds 200
+  if ($Process.HasExited -and $null -eq $RuntimeState) { throw "Codex App Server proxy exited immediately, exitCode=$($Process.ExitCode)" }
   if (Test-Path -LiteralPath $RuntimeStatePath) {
     $CandidateState = $null
     try {
@@ -185,7 +301,6 @@ do {
       $RuntimeState = $null
     }
   }
-  if ($Process.HasExited -and $null -eq $RuntimeState) { throw "Codex App Server proxy exited immediately, exitCode=$($Process.ExitCode)" }
 } while ([DateTime]::UtcNow -lt $Deadline)
 
 if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become ready within $StartupTimeoutSeconds seconds; runtime: $RuntimeStatePath" }
@@ -198,4 +313,5 @@ if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become read
   runtimeStatePath = $RuntimeStatePath
   tokenFilePath = $TokenFilePath
   fallbackRequired = [bool]$RuntimeState.fallbackRequired
+  outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $RuntimeState -ProcessInfo $RuntimeProcess -AppliedByThisStart $true
 } | ConvertTo-Json -Depth 12

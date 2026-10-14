@@ -489,6 +489,24 @@ if (fakeArgumentIndex >= 0) {
     );
   });
 
+  test("transparent proxy bridge inspects an existing wake without a mutation", async () => {
+    const calls = [];
+    const existing = { wakeId: "owner-existing", taskId: "legacy-owner-task", status: "accepted" };
+    const bridge = createCodexThreadBridge({
+      mode: "transparent_proxy", controlUrl: "http://127.0.0.1:18431", controlToken: "proxy-test-token",
+      fetchImpl: async (url, options) => {
+        calls.push({ route: new URL(url).pathname, method: options.method, body: options.body, authorization: options.headers.authorization });
+        return new Response(JSON.stringify({ ok: true, wake: existing }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    try {
+      assert.deepEqual(await bridge.inspectWake("owner-existing"), existing);
+      assert.deepEqual(calls, [{ route: "/v1/wakes/owner-existing", method: "GET", body: undefined, authorization: "Bearer proxy-test-token" }]);
+    } finally {
+      await bridge.close();
+    }
+  });
+
   test("transparent proxy bridge registers the full task subscription before wake", async () => {
     const calls = [];
     let configuredVisibility = "visible";
