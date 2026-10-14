@@ -1,5 +1,11 @@
 # Changelog
 
+## [1.25.8] - 2026-10-15
+
+- Codex模型桥默认改为gpt-6.1-sol/max，每次请求显式启用Fast，使用service_tier=priority与features.fast_mode=true，保留独立配置及环境覆盖。
+- 使用严格配置检查，移除旧model_speed_tier；Grok及其它模型链路保持原设置。
+- 失败优先显示CLI JSON stdout中的真实错误与HTTP状态，结果与诊断报告映射后的实际模型名，补充逐次参数和错误优先级回归。
+
 ## [1.25.7] - 2026-10-06
 
 - 归属核查实际应用单conversationId、显式recordIds及分组limit，整个范围须明确auditAll；缺失目标返回零匹配。

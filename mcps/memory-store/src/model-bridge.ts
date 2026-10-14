@@ -14,9 +14,12 @@ import { spawnWindowsJobProcess, type WindowsJobProcess } from "./windows-job-pr
 
 const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
-const CODEX_DEFAULT_MODEL = process.env.MEMORY_STORE_CODEX_MODEL || "gpt-5.5";
-const CODEX_DEFAULT_REASONING_EFFORT = process.env.MEMORY_STORE_CODEX_REASONING || "medium";
+const CODEX_DEFAULT_MODEL = process.env.MEMORY_STORE_CODEX_MODEL || "gpt-6.1-sol";
+const CODEX_DEFAULT_REASONING_EFFORT = process.env.MEMORY_STORE_CODEX_REASONING || "max";
 const CODEX_DEFAULT_SPEED_TIER = process.env.MEMORY_STORE_CODEX_SPEED || "fast";
+const CODEX_SERVICE_TIER = CODEX_DEFAULT_SPEED_TIER === "fast" ? "priority"
+    : CODEX_DEFAULT_SPEED_TIER === "standard" ? "default" : CODEX_DEFAULT_SPEED_TIER;
+const CODEX_FAST_MODE = CODEX_SERVICE_TIER === "priority";
 const CODEX_DEFAULT_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CODEX_TIMEOUT || 5 * 60_000);
 const CODEX_MAX_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CODEX_MAX_TIMEOUT || Math.max(CODEX_DEFAULT_TIMEOUT_MS, 10 * 60_000));
 const CODEX_KILL_TREE_TIMEOUT_MS = Number(process.env.MEMORY_STORE_CODEX_KILL_TIMEOUT || 8_000);
@@ -360,6 +363,40 @@ function previewStderr(stderr: string): string {
         .join(" | ");
 }
 
+function extractCodexError(stdout: string): string {
+    const failures: Array<{ eventType: string; message: string; status?: number; errorType?: string }> = [];
+    for (const line of stdout.split(/\r?\n/u)) {
+        try {
+            const event = JSON.parse(line);
+            if (event?.type !== "error" && event?.type !== "turn.failed") continue;
+            const error = event.error;
+            const message = typeof error === "string" ? error : error?.message ?? event.message;
+            if (typeof message !== "string" || !message.trim()) continue;
+            failures.push({
+                eventType: event.type,
+                message: message.trim(),
+                status: typeof (event.status ?? error?.status) === "number" ? event.status ?? error.status : undefined,
+                errorType: typeof error?.type === "string" ? error.type : undefined,
+            });
+        } catch {
+            continue;
+        }
+    }
+    failures.reverse();
+    const terminal = failures.find(failure => failure.eventType === "turn.failed");
+    const matchingError = terminal
+        ? failures.find(candidate => candidate.eventType === "error" && candidate.message === terminal.message)
+        : undefined;
+    const failure = terminal ? {
+        ...terminal,
+        status: terminal.status ?? matchingError?.status,
+        errorType: terminal.errorType ?? matchingError?.errorType,
+    } : failures[0];
+    if (!failure) return "";
+    return [failure.status ? `HTTP ${failure.status}` : "", failure.errorType, failure.message]
+        .filter(Boolean).join(": ").slice(0, 2_000);
+}
+
 function cleanupOutputFile(outputPath: string): void {
     try {
         if (fs.existsSync(outputPath)) fs.unlinkSync(outputPath);
@@ -580,6 +617,7 @@ export async function resolveModelChain(chain: Chain = "auto", options: ModelBri
 function mapModelName(model: string): string {
     const lower = model.toLowerCase();
     if (lower.includes("flash")) return CODEX_DEFAULT_MODEL;
+    if (lower === "gpt-6.1-sol") return "gpt-6.1-sol";
     if (lower.includes("gpt-5.5")) return "gpt-5.5";
     if (lower.includes("gpt-5.4")) return "gpt-5.4";
     if (lower.includes("gpt-5.3")) return "gpt-5.3-codex";
@@ -588,21 +626,24 @@ function mapModelName(model: string): string {
 
 export async function callCodexExec(prompt: string, model: string, timeoutMs: number): Promise<CodexExecResult> {
     const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, CODEX_MAX_TIMEOUT_MS));
+    const codexModel = mapModelName(model);
     const outputPath = path.join(
         os.tmpdir(),
         `memory-store-codex-bridge-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
     );
     const args = [
         "exec",
+        "--strict-config",
         "--skip-git-repo-check",
         "--json",
         "--ephemeral",
         "--ignore-rules",
         "--ignore-user-config",
         "--sandbox", "read-only",
-        "-m", mapModelName(model),
+        "-m", codexModel,
         "-c", `model_reasoning_effort=${CODEX_DEFAULT_REASONING_EFFORT}`,
-        "-c", `model_speed_tier=${CODEX_DEFAULT_SPEED_TIER}`,
+        "-c", `service_tier=${CODEX_SERVICE_TIER}`,
+        "-c", `features.fast_mode=${CODEX_FAST_MODE}`,
         "-C", process.cwd(),
         "-o", outputPath,
         "-",
@@ -631,7 +672,9 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         let closeCode: number | null = null;
         let killTreeResult = "";
 
-        console.error(`[model-bridge] Codex bridge spawn pid=${child.pid ?? "?"} timeoutMs=${effectiveTimeoutMs} outputPath=${outputPath}`);
+        console.error(`[model-bridge] Codex bridge spawn pid=${child.pid ?? "?"} model=${codexModel}` +
+            ` reasoning=${CODEX_DEFAULT_REASONING_EFFORT} requestedServiceTier=${CODEX_SERVICE_TIER}` +
+            ` fastMode=${CODEX_FAST_MODE} timeoutMs=${effectiveTimeoutMs} outputPath=${outputPath}`);
 
         const finish = (result: CodexExecResult) => {
             if (settled) return;
@@ -729,9 +772,10 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             }
 
             const stderrSummary = previewStderr(stderr);
+            const errorSummary = extractCodexError(stdout) || stderrSummary;
             finish({
                 text: null,
-                error: stderrSummary ? `Codex 模型桥调用失败: ${stderrSummary}` : `Codex 模型桥调用失败，退出码 ${code}`,
+                error: errorSummary ? `Codex 模型桥调用失败: ${errorSummary}` : `Codex 模型桥调用失败，退出码 ${code}`,
                 failureClass: "Availability",
             });
             })();
@@ -1079,13 +1123,13 @@ export async function callModelResponse(
             const result = await callCodexExec(prompt, model, remainingMs);
             if (deadline.remainingMs() === 0) return deadlineFailure("execution");
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
-            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: model };
+            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: mapModelName(model) };
             errors.push(result.error || "Codex 模型桥调用失败");
             if (result.timedOut || chain === "codex") {
                 return {
                     text: null,
                     chainUsed: null,
-                    modelUsed: model,
+                    modelUsed: mapModelName(model),
                     error: result.error || "Codex 模型桥调用失败",
                     timedOut: result.timedOut,
                     failureClass: result.failureClass,

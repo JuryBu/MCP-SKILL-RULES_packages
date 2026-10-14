@@ -15,6 +15,9 @@ const fakeAgyJs = path.join(tempDir, "fake-agy.js");
 const fakeAgyCmd = path.join(tempDir, "fake-agy.cmd");
 const outputPathMarker = path.join(tempDir, "output-path.txt");
 const childPidMarker = path.join(tempDir, "child-pid.txt");
+const argsMarker = path.join(tempDir, "codex-args.json");
+const originalCodexDefaults = Object.fromEntries(["MEMORY_STORE_CODEX_MODEL", "MEMORY_STORE_CODEX_REASONING", "MEMORY_STORE_CODEX_SPEED"].map(name => [name, process.env[name]]));
+for (const name of Object.keys(originalCodexDefaults)) delete process.env[name];
 let grokMode: "success" | "length" | "status-429" | "status-502" | "delay" = "success";
 let grokModelsOk = true;
 let grokCalls = 0;
@@ -126,6 +129,9 @@ if (process.argv.includes("--version")) {
 const mode = process.env.FAKE_CODEX_MODE || "success";
 const outputIndex = process.argv.indexOf("-o");
 const outputPath = outputIndex >= 0 ? process.argv[outputIndex + 1] : "";
+if (process.env.FAKE_CODEX_ARGS_MARKER) {
+  fs.writeFileSync(process.env.FAKE_CODEX_ARGS_MARKER, JSON.stringify(process.argv.slice(2)), "utf-8");
+}
 if (process.env.FAKE_CODEX_OUTPUT_MARKER && outputPath) {
   fs.writeFileSync(process.env.FAKE_CODEX_OUTPUT_MARKER, outputPath, "utf-8");
 }
@@ -148,6 +154,22 @@ if (mode === "error") {
   console.log("partial codex output");
   console.error("fake codex error");
   process.exit(7);
+}
+
+if (mode === "json-error" || mode === "turn-failed" || mode === "terminal-metadata") {
+  const message = "The 'gpt-retired' model is not supported when using Codex with a ChatGPT account.";
+  console.error("model-list refresh timed out");
+  console.log("startup noise");
+  if (mode === "json-error") {
+    console.log(JSON.stringify({type: "error", status: 400, error: {type: "invalid_request_error", message}}));
+  }
+  if (mode === "terminal-metadata") {
+    console.log(JSON.stringify({type: "error", error: {message}}));
+    console.log(JSON.stringify({type: "turn.failed", error: {message, status: 429, type: "rate_limit_error"}}));
+  } else {
+    console.log(JSON.stringify({type: "turn.failed", error: {message}}));
+  }
+  process.exit(1);
 }
 
 if (mode === "sleep") {
@@ -193,6 +215,7 @@ process.env.MEMORY_STORE_CODEX_COMMAND = fakeCodexCmd;
 process.env.MEMORY_STORE_AGY_COMMAND = fakeAgyCmd;
 process.env.FAKE_CODEX_OUTPUT_MARKER = outputPathMarker;
 process.env.FAKE_CODEX_CHILD_PID_MARKER = childPidMarker;
+process.env.FAKE_CODEX_ARGS_MARKER = argsMarker;
 process.env.MEMORY_STORE_GROK_PROXY_URL = `http://127.0.0.1:${grokAddress.port}`;
 process.env.MEMORY_STORE_GROK_API_KEY = "bridge-test-key";
 
@@ -248,6 +271,20 @@ try {
         platform: "win32",
         localAppData,
     }), "codex-custom", "a configured PATH command should not be replaced by Desktop discovery");
+
+    process.env.FAKE_CODEX_MODE = "success";
+    const defaultCodex = await callModelResponse("flash", "hello", "codex", 5_000);
+    assert.equal(defaultCodex.text, "fake bridge output");
+    assert.equal(defaultCodex.modelUsed, "gpt-6.1-sol");
+    const capturedArgs: string[] = JSON.parse(fs.readFileSync(argsMarker, "utf-8"));
+    assert.equal(capturedArgs[capturedArgs.indexOf("-m") + 1], "gpt-6.1-sol");
+    for (const setting of ["model_reasoning_effort=max", "service_tier=priority", "features.fast_mode=true"]) {
+        assert.ok(capturedArgs.includes(setting), `missing per-request setting: ${setting}`);
+    }
+    for (const flag of ["--strict-config", "--ignore-rules", "--ignore-user-config", "--ephemeral"]) {
+        assert.ok(capturedArgs.includes(flag), `missing isolation flag: ${flag}`);
+    }
+    assert.equal(capturedArgs.some(argument => argument.startsWith("model_speed_tier=")), false);
 
     process.env.FAKE_CODEX_MODE = "success";
     delete process.env.MEMORY_STORE_AGY_AUTO_ENABLED;
@@ -484,6 +521,23 @@ try {
     assert.equal(failedExplicit.text, null);
     assert.equal(failedExplicit.failureClass, "Availability");
 
+    process.env.FAKE_CODEX_MODE = "json-error";
+    const structuredFailure = await callCodexExec("hello", "flash", 5_000);
+    assert.equal(structuredFailure.text, null);
+    assert.equal(structuredFailure.failureClass, "Availability");
+    assert.match(structuredFailure.error || "", /HTTP 400.*invalid_request_error.*not supported/u);
+    assert.doesNotMatch(structuredFailure.error || "", /model-list refresh/u);
+    assert.equal(fs.existsSync(readOutputPath()), false);
+
+    process.env.FAKE_CODEX_MODE = "turn-failed";
+    const terminalFailure = await callCodexExec("hello", "flash", 5_000);
+    assert.match(terminalFailure.error || "", /gpt-retired.*not supported/u);
+    assert.doesNotMatch(terminalFailure.error || "", /model-list refresh/u);
+
+    process.env.FAKE_CODEX_MODE = "terminal-metadata";
+    const terminalMetadata = await callCodexExec("hello", "flash", 5_000);
+    assert.match(terminalMetadata.error || "", /HTTP 429.*rate_limit_error.*not supported/u);
+
     process.env.FAKE_CODEX_MODE = "sleep";
     fs.rmSync(outputPathMarker, { force: true });
     fs.rmSync(childPidMarker, { force: true });
@@ -505,6 +559,11 @@ try {
     delete process.env.MEMORY_STORE_GROK_API_KEY;
     delete process.env.MEMORY_STORE_AGY_AUTO_ENABLED;
     delete process.env.MEMORY_STORE_AGY_COMMAND;
+    delete process.env.FAKE_CODEX_ARGS_MARKER;
+    for (const [name, value] of Object.entries(originalCodexDefaults)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+    }
     await new Promise<void>(resolve => grokServer.close(() => resolve()));
     await new Promise<void>(resolve => lsServer.close(() => resolve()));
 }
