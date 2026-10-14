@@ -122,6 +122,25 @@ test("new same-source candidate registration persists across control reload and 
   assert.equal(value.runtime.status().approvedCandidateIds[0], candidate.id);
 });
 
+test("successive registrations retain four approvals and protect a live source", context => {
+  const value = fixture(context);
+  const source = value.profile.approvedCandidates[0];
+  value.profile.approvedCandidates.splice(0, 1, ...Array.from({ length: 4 }, (_, index) => ({ ...source, id: `registered-${index}` })));
+  value.workers.push({ workerId: "live-registered", alive: true, ready: true, sourceHashes: source.expectedHashes });
+  let registrySha256 = null;
+  for (const index of [4, 5]) {
+    const result = value.runtime.register({ instanceId: "instance", expectedRevision: 0, expectedRegistrySha256: registrySha256,
+      manifestPath: value.input.manifestPath, manifestSha256: value.input.manifestSha256,
+      candidate: { ...source, id: `registered-${index}` } });
+    registrySha256 = result.candidateRegistrySha256;
+    const registry = readInnerCandidateRegistry(value.profile);
+    assert.equal(registry.candidates.length, 4);
+    assert.ok(registry.candidates.some(candidate => candidate.id === "registered-0"));
+    assert.ok(registry.candidates.some(candidate => candidate.id === `registered-${index}`));
+    assert.ok(fs.existsSync(source.runnerPath));
+  }
+});
+
 test("registration rejects stale registry, foreign owner and mismatched source without changing approvals", context => {
   const value = fixture(context);
   const candidate = value.profile.approvedCandidates[0];
