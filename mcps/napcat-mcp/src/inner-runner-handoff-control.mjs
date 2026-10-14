@@ -221,9 +221,22 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
   }
 
   function execute(message) {
-    if (message.method === "check") return { status: proxy.status(), native: findNativeTurn(message.threadId) ?? null,
-      nativeHistory: { retained: nativeTurns.size, archived: terminalTurns.size, limit: MAX_THREADS },
-      prepared: prepared.has(message.threadId) };
+    if (message.method === "check") {
+      const status = proxy.status();
+      const native = findNativeTurn(message.threadId) ?? null;
+      let historicalRecovery;
+      if (message.inspectExpired === true && !native && validThread(message.threadId)
+        && status.running && !status.draining && status.activeRequests === 0 && !pinnedThread(message.threadId)) {
+        const snapshot = proxy.prepareThreadHandoff(message.threadId);
+        try {
+          const entries = Object.values(snapshot.state).reduce((total, values) => total + values.length, 0);
+          historicalRecovery = { threadId: message.threadId, empty: entries === 0, entries,
+            capturedAt: snapshot.capturedAt, snapshotSha256: digest(JSON.stringify(snapshot)) };
+        } finally { proxy.cancelThreadHandoff(message.threadId, snapshot.token); }
+      }
+      return { status, native, nativeHistory: { retained: nativeTurns.size, archived: terminalTurns.size, limit: MAX_THREADS },
+        prepared: prepared.has(message.threadId), ...(historicalRecovery ? { historicalRecovery } : {}) };
+    }
     if (message.method === "authorizeMigration") {
       if (config.allowRuntimeCompatibility !== true) fail("HANDOFF_RUNTIME_PLAN_DISABLED");
       if (prepared.size !== 0) fail("HANDOFF_THREAD_FROZEN");

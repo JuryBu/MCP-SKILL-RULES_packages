@@ -102,6 +102,107 @@ async function fixture(context, { emptyIdle = false } = {}) {
     specification: { runnerPath: path.join(sourceRoot, "codex-model-stream-proxy-runner.mjs"), expectedHashes } };
 }
 
+test("six successive real worker activations transfer ended histories and preserve one inflight POST", { timeout: 20000 }, async context => {
+  const value = await fixture(context);
+  const participant = value.coordinator.liveCodeParticipant();
+  const shared = participant.snapshot().state;
+  const originalMaps = [shared.workers, shared.threads, shared.terminalThreads, shared.requests];
+  const steps = [];
+  for (let index = 0; index < 7; index += 1) {
+    await value.notify(`completed-${index}`, `completed-turn-${index}`, "started");
+    await value.notify(`completed-${index}`, `completed-turn-${index}`, "completed");
+    if (index === 6) break;
+    if (index === 2) participant.activate(participant.prepare(coordinatorModule));
+    const candidate = await value.coordinator.prepareCandidate(value.specification);
+    const receipt = await value.coordinator.activate({ candidateId: candidate.workerId });
+    assert.deepEqual(receipt.deferredThreadIds, []);
+    steps.push({ index, alive: value.coordinator.status().workers.filter(worker => worker.alive).length,
+      reclaimed: shared.reclaimedWorkers.length });
+  }
+  assert.ok(shared.reclaimedWorkers.length >= 3);
+  assert.deepEqual([shared.workers, shared.threads, shared.terminalThreads, shared.requests], originalMaps);
+  assert.equal(value.coordinator.status().nativeHealthy, true);
+  await value.notify("working-thread", "working-turn", "started");
+  const original = shared.threads.get("working-thread");
+  const oldest = [...shared.workers.values()].find(worker => worker.retired
+    && worker !== shared.activation.source && worker !== shared.defaultWorker);
+  const stream = value.request();
+  await waitUntil(() => value.held.length === 1);
+  await value.notify("working-thread", "working-turn", "completed");
+  const worker = original.worker;
+  const candidate = await value.coordinator.prepareCandidate(value.specification);
+  assert.equal(shared.workers.has(oldest.workerId), false);
+  assert.equal(original.activeHttp, 1);
+  await value.coordinator.activate({ candidateId: candidate.workerId });
+  await shared.dispatch("reclaimRetiredWorkers");
+  assert.strictEqual(original.worker, worker);
+  assert.equal(original.activeHttp, 1);
+  assert.ok(value.coordinator.status().workers.find(current => current.workerId === worker.workerId).alive);
+  value.release();
+  assert.match((await stream).body, /response.completed/u);
+  await waitUntil(() => shared.requests.size === 0);
+  assert.equal(value.calls.filter(call => call.method === "POST").length, 1);
+  assert.ok(value.events.some(event => event.type === "retired_history_transferred"));
+  context.diagnostic(JSON.stringify({ evidence: "six-activate-retained-terminal-reclamation", steps,
+    postExecutions: 1, sameSharedMaps: true, inflightWorkerPreserved: true }));
+});
+
+test("640 real ended histories release only empty expired recovery and transfer retained archives", { timeout: 20000 }, async context => {
+  const value = await fixture(context);
+  const shared = value.coordinator.liveCodeParticipant().snapshot().state;
+  const source = shared.defaultWorker;
+  for (let index = 0; index < 640; index += 1) {
+    await value.notify(`old-history-${index}`, `old-turn-${index}`, "started");
+    await value.notify(`old-history-${index}`, `old-turn-${index}`, "completed");
+  }
+  for (let index = 0; index < 3; index += 1) {
+    const prepared = await value.coordinator.prepareCandidate(value.specification);
+    await value.coordinator.activate({ candidateId: prepared.workerId });
+  }
+  const prepared = await value.coordinator.prepareCandidate(value.specification);
+  assert.equal(shared.workers.has(source.workerId), false);
+  assert.equal(source.releasedThreadHistory.size, 640);
+  assert.equal(shared.threads.size, 128);
+  assert.equal(shared.terminalThreads.size, 128);
+  assert.equal(value.events.filter(event => event.type === "retired_empty_history_released").length, 384);
+  assert.equal(value.events.filter(event => event.type === "retired_history_transferred").length, 256);
+  await value.coordinator.activate({ candidateId: prepared.workerId });
+  assert.equal(value.calls.length, 0);
+  context.diagnostic(JSON.stringify({ evidence: "640-history-safe-worker-release", endedThreads: 640,
+    emptyExpiredProofs: 384, migratedRetained: 256, retained: 128, archived: 128, sourceExitCode: source.child.exitCode }));
+});
+
+test("expired terminal bookkeeping with unique recovery state keeps its real source worker", { timeout: 20000 }, async context => {
+  const value = await fixture(context, { emptyIdle: true });
+  const shared = value.coordinator.liveCodeParticipant().snapshot().state;
+  const source = shared.defaultWorker;
+  await value.notify("unique-expired", "unique-turn", "started");
+  assert.equal((await value.request("unique-expired", "unique-turn")).status, 200);
+  await value.notify("unique-expired", "unique-turn", "completed");
+  for (let index = 0; index < 260; index += 1) {
+    await value.notify(`unique-overflow-${index}`, `overflow-turn-${index}`, "started");
+    await value.notify(`unique-overflow-${index}`, `overflow-turn-${index}`, "completed");
+  }
+  assert.equal(shared.threads.has("unique-expired"), false);
+  assert.equal(shared.terminalThreads.has("unique-expired"), false);
+  const before = await shared.dispatch("control", source, "check", { threadId: "unique-expired", inspectExpired: true });
+  assert.equal(before.native, null);
+  assert.equal(before.historicalRecovery.empty, false);
+  assert.ok(before.historicalRecovery.entries > 0);
+  for (let index = 0; index < 3; index += 1) {
+    const prepared = await value.coordinator.prepareCandidate(value.specification);
+    await value.coordinator.activate({ candidateId: prepared.workerId });
+  }
+  await value.coordinator.prepareCandidate(value.specification);
+  assert.equal(shared.workers.has(source.workerId), true);
+  assert.equal(source.releasedThreadHistory.has("unique-expired"), false);
+  const after = await shared.dispatch("control", source, "check", { threadId: "unique-expired", inspectExpired: true });
+  assert.equal(after.historicalRecovery.entries, before.historicalRecovery.entries);
+  assert.equal(value.calls.filter(call => call.method === "POST").length, 1);
+  context.diagnostic(JSON.stringify({ evidence: "unique-expired-recovery-source-preserved", retainedRecoveryEntries: after.historicalRecovery.entries,
+    sourceAlive: true, postExecutions: 1 }));
+});
+
 test("nine ended histories survive successive real worker selections and resume once on the latest worker", { timeout: 15000 }, async context => {
   const value = await fixture(context);
   const shared = value.coordinator.liveCodeParticipant().snapshot().state;
@@ -452,16 +553,18 @@ test("terminal HTTP remains on the original state until its SSE finishes once, t
   await fixtureState.notify("working-thread", "working-turn", "completed");
   await fixtureState.notify("second-thread", "second-turn", "started");
   await fixtureState.notify("second-thread", "second-turn", "completed");
-  assert.throws(() => fixtureState.notify("third-thread", "third-turn", "started"), { code: "COORDINATOR_THREAD_LIMIT" });
+  await fixtureState.notify("third-thread", "third-turn", "started");
+  await fixtureState.notify("third-thread", "third-turn", "completed");
   assert.strictEqual(shared.threads.get("working-thread"), original);
   assert.equal(original.activeHttp, 1);
   assert.equal(shared.requests.size, 1);
-  assert.equal(shared.terminalThreads.size, 0);
+  assert.equal(shared.terminalThreads.size, 1);
+  assert.equal(shared.terminalThreads.get("second-thread").activeHttp, 0);
   fixtureState.release();
   assert.equal((await inflight).status, 200);
   await waitUntil(() => shared.requests.size === 0);
-  await fixtureState.notify("third-thread", "third-turn", "started");
-  await fixtureState.notify("third-thread", "third-turn", "completed");
+  await fixtureState.notify("fourth-thread", "fourth-turn", "started");
+  await fixtureState.notify("fourth-thread", "fourth-turn", "completed");
   assert.strictEqual(shared.terminalThreads.get("working-thread"), original);
   await fixtureState.notify("working-thread", "continued-turn", "started");
   assert.strictEqual(shared.threads.get("working-thread"), original);

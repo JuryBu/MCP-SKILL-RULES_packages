@@ -350,6 +350,74 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     shared.workerMaintenance = true;
     try {
       for (const worker of [...workers.values()]) {
+        const transferable = () => [...workers.values()].filter(candidate => alive(candidate)).length >= 4
+          && shared.nativeHealthy && !shared.closing && worker.retired && alive(worker)
+          && worker !== shared.defaultWorker && !worker.cleanupPending && !worker.startup && worker.activeHttp === 0
+          && shared.activation?.source !== worker
+          && !threadStates().some(state => state.pendingActivation
+            && (state.worker === worker || state.pendingActivation.source === worker || state.pendingActivation.target === worker)
+            && !idleTerminal(state, true))
+          && threadStates().filter(state => state.worker === worker).every(state => idleTerminal(state, true))
+          && ![...shared.requests.values()].some(request => request.worker === worker || request.thread?.worker === worker)
+          && ![...pending.values()].some(request => request.worker === worker);
+        if (transferable()) {
+          for (const threadId of worker.threadHistory) {
+            if (worker.releasedThreadHistory?.has(threadId)) continue;
+            if (!transferable()) break;
+            const target = [...new Set([shared.defaultWorker, shared.activation?.source, ...workers.values()])].find(candidate =>
+              candidate && candidate !== worker && alive(candidate) && candidate.wasDefault
+              && !candidate.startup && !candidate.cleanupPending && candidate.activeHttp === 0
+              && !candidate.threadHistory.has(threadId)
+              && ![...pending.values()].some(request => request.worker === candidate)
+              && !threadStates().some(state => state.worker === candidate && (state.nativeRelays > 0
+                || (state.pendingActivation && !idleTerminal(state, true))))
+              && (identity(worker).core === identity(candidate).core && identity(worker).helper === identity(candidate).helper
+                || shared.activation?.compatibility?.manifest.edges.some(edge => edge.source.core === identity(worker).core
+                  && edge.source.helper === identity(worker).helper && edge.target.core === identity(candidate).core
+                  && edge.target.helper === identity(candidate).helper)));
+            if (!target) break;
+            let state = findThread(threadId);
+            if (state && state.worker !== worker) continue;
+            if (!state) {
+              const owners = historyOwners(threadId);
+              if (owners.length !== 1 || owners[0] !== worker) continue;
+              const health = await shared.dispatch("control", worker, "check", { threadId, inspectExpired: true });
+              const native = health.native;
+              if (!native && health.historicalRecovery?.empty === true
+                && health.historicalRecovery.threadId === threadId && health.historicalRecovery.entries === 0
+                && health.status.running && !health.status.draining && health.status.activeRequests === 0
+                && transferable() && !findThread(threadId) && historyOwners(threadId).length === 1) {
+                (worker.releasedThreadHistory ??= new Set()).add(threadId);
+                emit("retired_empty_history_released", { workerId: worker.workerId, threadId,
+                  snapshotSha256: health.historicalRecovery.snapshotSha256 });
+                continue;
+              }
+              if (!native || native.phase !== "terminal" || typeof native.turnId !== "string" || !native.turnId
+                || native.turnId.length > 512 || native.turnId.includes("\u0000")
+                || !["completed", "failed", "interrupted"].includes(native.status)) {
+                emit("retired_history_preserved", { workerId: worker.workerId, threadId,
+                  code: "COORDINATOR_TERMINAL_HISTORY_UNAVAILABLE" });
+                continue;
+              }
+              state = { threadId, turnId: native.turnId, phase: "terminal", epoch: shared.nativeSequence,
+                worker, activeHttp: 0, nativeRelays: 0,
+                start: { threadId, turnId: native.turnId, phase: "active", sequence: native.sequence },
+                completion: { threadId, turnId: native.turnId, phase: "terminal", status: native.status, sequence: native.sequence } };
+            }
+            try {
+              const receipt = await shared.dispatch("migrate", { threadId, candidateId: target.workerId,
+                compatibility: shared.activation?.compatibility, drainTimeoutMs: 0 },
+              { selectDefault: false, reclamation: true, historicalState: findThread(threadId) ? undefined : state });
+              if (state.pendingActivation?.target === target) delete state.pendingActivation;
+              emit("retired_history_transferred", { workerId: worker.workerId, targetWorkerId: target.workerId,
+                threadId, checkpointSha256: receipt.checkpointSha256 });
+            } catch (error) {
+              emit("retired_history_preserved", { workerId: worker.workerId, threadId,
+                code: error.code ?? "COORDINATOR_TERMINAL_TRANSFER_FAILED" });
+              break;
+            }
+          }
+        }
         if (!eligible(worker)) continue;
         await releaseWorker(worker, eligible);
       }
@@ -493,11 +561,12 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     shared.requests.delete(routed.id);
   }
 
-  async function migrate({ threadId, candidateId, compatibility, live = false, drainTimeoutMs = 1000 }, { selectDefault = true } = {}) {
+  async function migrate({ threadId, candidateId, compatibility, live = false, drainTimeoutMs = 1000 },
+    { selectDefault = true, reclamation = false, historicalState } = {}) {
     if (typeof live !== "boolean" || !Number.isSafeInteger(drainTimeoutMs) || drainTimeoutMs < 0 || drainTimeoutMs > 5000) fail("COORDINATOR_INVALID_HANDOFF_OPTIONS");
     if (selectDefault && shared.activation?.active) fail("COORDINATOR_ACTIVATION_BUSY");
-    if (shared.transactionActive || shared.closing || !shared.nativeHealthy || shared.workerMaintenance
-      || (runtimeProfile && shared.preparationTask)) fail("COORDINATOR_MIGRATION_BUSY");
+    if (shared.transactionActive || shared.closing || !shared.nativeHealthy || (shared.workerMaintenance && !reclamation)
+      || (runtimeProfile && shared.preparationTask && !reclamation)) fail("COORDINATOR_MIGRATION_BUSY");
     shared.transactionActive = true;
     let finishMigration;
     let source;
@@ -506,7 +575,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     let committed = false;
     try {
       await shared.relay;
-      const state = findThread(threadId);
+      const state = findThread(threadId) ?? historicalState;
       candidate = workers.get(candidateId);
       source = state?.worker;
       const phase = live ? "active" : "terminal";
@@ -548,7 +617,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       const accepted = await shared.dispatch("control", candidate, "accept", { threadId, fileName: prepared.fileName,
         sha256: prepared.sha256, sourceInstanceToken: source.ready.instanceToken, live });
       const health = await shared.dispatch("control", candidate, "check", { threadId });
-      const current = findThread(threadId);
+      const current = findThread(threadId) ?? historicalState;
       if (current.epoch !== epoch || current.phase !== phase || current.activeHttp !== 0 || !alive(candidate) || !shared.nativeHealthy
         || !health.status.running || health.status.draining || health.native?.turnId !== state.turnId
         || health.native?.phase !== phase
@@ -564,7 +633,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       catch { receipt.cleanupPending = true; }
       source.retired = true;
       source.cleanupPending = source.cleanupPending === true || receipt.cleanupPending;
-      candidate.retired = false;
+      if (selectDefault || candidate === shared.defaultWorker) candidate.retired = false;
       emit("migration_committed", { generation: shared.generation, threadId, sourceWorkerId: source.workerId, targetWorkerId: candidate.workerId,
         checkpointSha256: prepared.sha256, cleanupPending: receipt.cleanupPending });
       return receipt;
@@ -662,7 +731,8 @@ export function createInnerProxyCoordinatorImplementation(shared) {
 
   function rollbackActivation({ activationId }) {
     if (!shared.activation?.active || shared.activation.id !== activationId) fail("COORDINATOR_ACTIVATION_NOT_CURRENT");
-    if (shared.transactionActive || shared.closing || !alive(shared.activation.source)) fail("COORDINATOR_ACTIVATION_BUSY");
+    if (shared.transactionActive || shared.workerMaintenance || shared.preparationTask
+      || shared.closing || !alive(shared.activation.source)) fail("COORDINATOR_ACTIVATION_BUSY");
     shared.activation.active = false;
     shared.defaultWorker = shared.activation.source;
     for (const state of threadStates()) if (state.pendingActivation === shared.activation) {

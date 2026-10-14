@@ -495,6 +495,83 @@ for (const [name, protect] of Object.entries({
   });
 }
 
+test("reclamation transfers retained and expired terminal boundaries and preserves the rollback source", async () => {
+  const current = fixture();
+  await current.fill(260);
+  for (const workerId of ["second", "third", "fourth"]) {
+    const candidate = current.worker(workerId);
+    current.state.workers.set(workerId, candidate);
+    await current.state.dispatch("activate", { candidateId: workerId });
+  }
+  const history = current.state.terminalThreads;
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.equal(current.source.child.exitCode, 0);
+  assert.equal(current.source.releasedThreadHistory.size, 260);
+  assert.strictEqual(current.state.terminalThreads, history);
+  assert.equal(history.size, 128);
+  assert.ok([...current.state.threads.values(), ...history.values()].every(state => state.worker === current.state.defaultWorker));
+  assert.equal(current.state.activation.source.child.exitCode, null);
+});
+
+test("reclamation acceptance failure preserves the old owner and snapshot cancellation", async () => {
+  const current = fixture();
+  await current.finish("failed-transfer");
+  for (const workerId of ["second", "third", "fourth"]) {
+    const candidate = current.worker(workerId);
+    current.state.workers.set(workerId, candidate);
+    await current.state.dispatch("activate", { candidateId: workerId });
+  }
+  const original = current.state.threads.get("failed-transfer");
+  const control = current.state.implementation.control;
+  current.state.implementation.control = (owner, method, params) => {
+    if (method === "accept") throw Object.assign(new Error("synthetic acceptance failure"), { code: "FIXTURE_ACCEPT_FAILED" });
+    return control(owner, method, params);
+  };
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.strictEqual(original.worker, current.source);
+  assert.equal(current.source.releasedThreadHistory.size, 0);
+  assert.equal(current.source.child.exitCode, null);
+  assert.ok(current.controls.some(entry => entry.owner === current.source && entry.method === "cancel"));
+  assert.ok(current.events.some(event => event.type === "retired_history_preserved" && event.code === "FIXTURE_ACCEPT_FAILED"));
+});
+
+test("expired history without a terminal boundary or empty recovery proof retains its only owner", async () => {
+  const current = fixture();
+  await current.fill(260);
+  current.source.native.delete("thread-0");
+  for (const workerId of ["second", "third", "fourth"]) {
+    const candidate = current.worker(workerId);
+    current.state.workers.set(workerId, candidate);
+    await current.state.dispatch("activate", { candidateId: workerId });
+  }
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.equal(current.source.releasedThreadHistory.has("thread-0"), false);
+  assert.equal(current.source.child.exitCode, null);
+  assert.ok(current.events.some(event => event.type === "retired_history_preserved"
+    && event.code === "COORDINATOR_TERMINAL_HISTORY_UNAVAILABLE"));
+});
+
+test("unrelated active default HTTP and pending activation do not pin an idle older owner", async () => {
+  const current = fixture();
+  await current.finish("old-terminal");
+  for (const workerId of ["second", "third", "fourth"]) {
+    const candidate = current.worker(workerId);
+    current.state.workers.set(workerId, candidate);
+    await current.state.dispatch("activate", { candidateId: workerId });
+  }
+  const defaultWorker = current.state.defaultWorker;
+  defaultWorker.activeHttp = 1;
+  current.state.threads.set("unrelated-active", { threadId: "unrelated-active", phase: "active", activeHttp: 1,
+    nativeRelays: 0, worker: defaultWorker, pendingActivation: { active: true, source: defaultWorker, target: defaultWorker } });
+  current.state.requests.set("unrelated-post", { worker: defaultWorker });
+  await current.state.dispatch("reclaimRetiredWorkers");
+  assert.equal(current.source.child.exitCode, 0);
+  assert.strictEqual(current.state.threads.get("old-terminal").worker, current.state.activation.source);
+  assert.equal(defaultWorker.activeHttp, 1);
+  assert.equal(current.state.requests.size, 1);
+  assert.equal(current.state.activation.source.retired, true);
+});
+
 test("successfully migrated history can expire and later returns to its committed owner", async () => {
   const current = fixture();
   await current.finish("moved-thread");
