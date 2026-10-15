@@ -57,7 +57,8 @@ if ($null -ne $ManagedProfile) {
   if ($CodexExecutablePath) { $ManagedArguments.CodexExecutablePath = $CodexExecutablePath }
   $ManagedResultText = & (Join-Path $PSScriptRoot 'start-codex-app-server-proxy.ps1') @ManagedArguments | Out-String
   $ManagedResult = $ManagedResultText | ConvertFrom-Json
-  [pscustomobject]@{ changed = [bool]$ManagedResult.started; running = [string]$ManagedResult.state -eq 'running';
+  [pscustomobject]@{ changed = [bool]$ManagedResult.started; running = [string]$ManagedResult.state -in @('running','waiting_for_desktop');
+    waitingForDesktop = [string]$ManagedResult.state -eq 'waiting_for_desktop';
     mode = 'managed'; pid = $ManagedResult.pid; endpoint = "http://127.0.0.1:$($ManagedProfile.ports.inner)";
     ownerId = $ManagedProfile.ownerId; nativeSourceId = $ManagedProfile.nativeSourceId;
     innerManagedProfileSha256 = $ManagedStartup.innerManagedProfileSha256; outer = $ManagedResult } | ConvertTo-Json -Depth 10

@@ -3,13 +3,43 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { windowsPowerShellEnvironment } from "./windows-powershell-environment.mjs";
-import { checkedRuntimePath, readInnerRuntimeProfile, withinRuntimeRoot } from "./inner-runtime-profile.mjs";
+import { checkedRuntimePath, readInnerRuntimeProfile, withinRuntimeRoot, approvedInnerCandidate,
+  innerCandidateRegistryPath, INNER_RUNTIME_STATE_MAX_BYTES } from "./inner-runtime-profile.mjs";
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const digest = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
-const samePath = (left, right) => path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase();
+function canonicalPath(value) {
+  let current = checkedRuntimePath(value);
+  const suffix = [];
+  while (!fs.existsSync(current)) {
+    suffix.unshift(path.basename(current));
+    current = path.dirname(current);
+  }
+  return path.join(fs.realpathSync.native(current), ...suffix).toLowerCase();
+}
+
+const samePath = (left, right) => canonicalPath(left) === canonicalPath(right);
 const validPid = value => Number.isSafeInteger(value) && value > 0;
 const uuid = value => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(value);
+const validWorkerId = value => {
+  const match = typeof value === "string" && /^(.{36})-worker-([1-9][0-9]*)$/u.exec(value);
+  return Boolean(match && uuid(match[1]) && Number.isSafeInteger(Number(match[2])));
+};
+
+function settledActivation(coordinator) {
+  const activation = coordinator?.activation;
+  if (activation == null) return true;
+  return typeof activation.active === "boolean" && uuid(activation.activationId)
+    && validWorkerId(activation.sourceWorkerId) && validWorkerId(activation.targetWorkerId)
+    && activation.sourceWorkerId !== activation.targetWorkerId
+    && coordinator.defaultWorkerId === (activation.active ? activation.targetWorkerId : activation.sourceWorkerId)
+    && Array.isArray(activation.deferredThreadIds) && activation.deferredThreadIds.length === 0
+    && coordinator.activeHttp === 0 && coordinator.pendingControl === 0
+    && Array.isArray(coordinator.threads) && coordinator.threads.every(thread => thread.phase === "terminal"
+      && thread.activeHttp === 0 && thread.pendingActivationId == null && thread.activationError == null)
+    && [activation.sourceWorkerId, activation.targetWorkerId].every(workerId =>
+      coordinator.workers?.some(worker => worker.workerId === workerId));
+}
 
 function record(filePath, maximum = 1048576) {
   const target = checkedRuntimePath(filePath, { existing: true });
@@ -77,7 +107,7 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     || configuration.innerManagedProfileSha256 !== input.profileSha256) fail("STARTUP_RECOVERY_CONFIGURATION_MISMATCH");
   const profileEntry = read(input.profilePath, 65536);
   if (profileEntry.sha256 !== input.profileSha256) fail("STARTUP_RECOVERY_PROFILE_HASH_MISMATCH");
-  const profile = readInnerRuntimeProfile(input.profilePath);
+  const profile = readInnerRuntimeProfile(configuration.innerManagedProfilePath);
   const outerRoot = checkedRuntimePath(path.join(input.dataRoot, "state"), { directory: true });
   if (!samePath(profile.outerStateRoot ?? profile.stateRoot, outerRoot)) fail("STARTUP_RECOVERY_ROOT_MISMATCH");
   for (const [name, filename] of Object.entries({ runtimeStatePath: "codex-app-server-proxy-runtime.json",
@@ -93,8 +123,8 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
   for (const target of [path.join(profile.checkpointRoot, ".inner-runtime-owner.json"),
     path.join(profile.stateRoot, ".inner-runtime-owner.json")]) read(target, 65536);
   if (read(profile.outerPaths.tokenFilePath, 4096).sha256 !== profile.controlTokenSha256) fail("STARTUP_RECOVERY_TOKEN_MISMATCH");
-  const outerEntry = read(profile.outerPaths.runtimeStatePath, preserveHistory ? 16777216 : 65536);
-  const managedEntry = read(profile.managedStatePath, preserveHistory ? 16777216 : 65536);
+  const outerEntry = read(profile.outerPaths.runtimeStatePath, preserveHistory ? INNER_RUNTIME_STATE_MAX_BYTES : 65536);
+  const managedEntry = read(profile.managedStatePath, preserveHistory ? INNER_RUNTIME_STATE_MAX_BYTES : 65536);
   const lockEntry = read(profile.outerPaths.lockPath, 65536);
   const outer = json(outerEntry);
   const managed = json(managedEntry);
@@ -107,13 +137,15 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     || lease.startedAt !== outer.startedAt || !samePath(managed.stopFilePath ?? "", profile.outerPaths.stopFilePath)) {
     fail("STARTUP_RECOVERY_INSTANCE_IDENTITY_MISMATCH");
   }
-  if (!(preserveHistory ? ["running", "restarting", "degraded", "stopped"] : ["running", "stopped"]).includes(outer.state)
+  if (!(preserveHistory ? ["running", "restarting", "degraded", "stopped", "waiting_for_desktop"] : ["running", "stopped"]).includes(outer.state)
+    || (outer.state === "waiting_for_desktop" && (outer.waitingForDesktop !== true || outer.appServerPid !== null))
     || !(preserveHistory ? ["running", "closed"] : ["running"]).includes(managed.state) || (!preserveHistory && managed.healthy !== true)
     || managed.controlBusy !== false || !Array.isArray(managed.controlOperations) || managed.controlOperations.length
     || !managed.nativeSource || !Number.isSafeInteger(managed.nativeSource.delivered) || managed.nativeSource.delivered < 0
     || (!preserveHistory && (managed.nativeSource.healthy !== true || managed.nativeSource.delivered !== 0))
     || managed.coordinator?.transactionActive !== false || managed.coordinator.workerMaintenance !== false
-    || managed.coordinator.activation != null || !Array.isArray(managed.coordinator.threads)
+    || !(preserveHistory ? settledActivation(managed.coordinator) : managed.coordinator.activation == null)
+    || !Array.isArray(managed.coordinator.threads)
     || (!preserveHistory && managed.coordinator.threads.length)
     || managed.coordinator.threads.some(thread => !["active", "terminal"].includes(thread.phase)
       || thread.activeHttp !== 0 || thread.pendingActivationId != null)
@@ -144,10 +176,27 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
   const ports = Object.values(profile.ports);
   const processPaths = [profile.outerPaths.runtimeStatePath, input.profilePath, profile.checkpointRoot,
     path.join(profile.installationRoot, "src", "codex-app-server-proxy-runner.mjs"), profile.initial.runnerPath];
+  const registryPath = innerCandidateRegistryPath(profile);
+  if (fs.existsSync(registryPath)) read(registryPath, 65536);
+  const sources = [profile.initial, ...(profile.approvedCandidates ?? []).map(candidate => approvedInnerCandidate(profile, candidate.id))];
+  const verifiedSources = new Set();
+  const workerIds = new Set();
   for (const worker of managed.coordinator.workers) {
-    if (!validPid(worker.pid) || typeof worker.workerId !== "string" || !/^[a-f0-9-]{36}-worker-[1-4]$/iu.test(worker.workerId)
-      || Object.entries(profile.initial.expectedHashes).some(([name, hash]) => worker.sourceHashes?.[name] !== hash)) {
+    const source = sources.find(candidate => Object.entries(candidate.expectedHashes).every(([name, hash]) => worker.sourceHashes?.[name] === hash));
+    if (!validPid(worker.pid) || !validWorkerId(worker.workerId) || workerIds.has(worker.workerId) || !source) {
       fail("STARTUP_RECOVERY_WORKER_IDENTITY_UNKNOWN");
+    }
+    workerIds.add(worker.workerId);
+    if (!verifiedSources.has(source.runnerPath)) {
+      verifiedSources.add(source.runnerPath);
+      if (source.installationRoot) read(path.join(source.installationRoot, ".inner-runtime-owner.json"), 65536);
+      for (const [name, file] of Object.entries({ runner: "codex-model-stream-proxy-runner.mjs", core: "codex-model-stream-proxy.mjs",
+        helper: "thread-recovery-handoff.mjs", control: "inner-runner-handoff-control.mjs" })) {
+        if (read(path.join(path.dirname(source.runnerPath), file), 4194304).sha256 !== source.expectedHashes[name]) {
+          fail("STARTUP_RECOVERY_SOURCE_CHANGED");
+        }
+      }
+      processPaths.push(source.runnerPath);
     }
     pids.push(worker.pid);
     const workerRoot = checkedRuntimePath(path.join(profile.stateRoot, worker.workerId), { directory: true });
@@ -225,7 +274,7 @@ export function applyInnerStartupRecovery(input, expectedPlan, inspectHost = ins
       }
     }
     requireAbsent(fresh, inspectHost());
-    for (const target of [fresh.runtimeStatePath, fresh.managedStatePath]) {
+    const replacements = [fresh.runtimeStatePath, fresh.managedStatePath].map(target => {
       const original = originals.find(entry => entry.path === target);
       const previous = json(original);
       const terminal = target === fresh.runtimeStatePath
@@ -233,14 +282,18 @@ export function applyInnerStartupRecovery(input, expectedPlan, inspectHost = ins
         : { ...previous, state: "closed", healthy: false };
       terminal.startupRecovery = { reason: fresh.historyPolicy === "preserve" ? "verified_dead_process_history_preserved" : "verified_dead_idle_instance",
         evidenceRoot, instanceToken: fresh.instanceToken, ...(fresh.preservedHistory ? { preservedHistory: fresh.preservedHistory } : {}) };
-      const content = Buffer.from(JSON.stringify(terminal, null, 2));
+      const content = Buffer.from(JSON.stringify(terminal));
+      if (content.length > INNER_RUNTIME_STATE_MAX_BYTES) fail("STARTUP_RECOVERY_OUTPUT_TOO_LARGE");
+      return { target, original, content };
+    });
+    for (const { target, original, content } of replacements) {
       const temporary = path.join(path.dirname(target), `.startup-recovery-${crypto.randomUUID()}.tmp`);
       fs.writeFileSync(temporary, content, { flag: "wx" });
-      temporaryPaths.push({ path: temporary, sha256: digest(content) });
-      if (record(target).sha256 !== original.sha256) fail("STARTUP_RECOVERY_ORIGINAL_CHANGED");
+      temporaryPaths.push({ path: temporary, sha256: digest(content), bytes: content.length });
+      if (record(target, Math.max(original.bytes, content.length)).sha256 !== original.sha256) fail("STARTUP_RECOVERY_ORIGINAL_CHANGED");
       const retiredPath = path.join(evidenceRoot, target === fresh.runtimeStatePath ? "retired-runtime.original" : "retired-managed.original");
       fs.renameSync(target, retiredPath);
-      written.push({ original, sha256: digest(content), retiredPath });
+      written.push({ original, sha256: digest(content), bytes: content.length, retiredPath });
       fs.renameSync(temporary, target);
     }
     const lease = originals.find(entry => entry.path === fresh.lockPath);
@@ -250,7 +303,7 @@ export function applyInnerStartupRecovery(input, expectedPlan, inspectHost = ins
     return { recovered: true, instanceToken: fresh.instanceToken, evidenceRoot };
   } catch (error) {
     for (const entry of written.reverse()) {
-      if (!fs.existsSync(entry.original.path) || record(entry.original.path).sha256 === entry.sha256) {
+      if (!fs.existsSync(entry.original.path) || record(entry.original.path, Math.max(entry.original.bytes, entry.bytes)).sha256 === entry.sha256) {
         if (fs.existsSync(entry.original.path)) fs.unlinkSync(entry.original.path);
         fs.renameSync(entry.retiredPath, entry.original.path);
       }
@@ -260,7 +313,7 @@ export function applyInnerStartupRecovery(input, expectedPlan, inspectHost = ins
     throw error;
   } finally {
     for (const temporary of temporaryPaths) {
-      if (fs.existsSync(temporary.path) && record(temporary.path).sha256 === temporary.sha256) fs.unlinkSync(temporary.path);
+      if (fs.existsSync(temporary.path) && record(temporary.path, temporary.bytes).sha256 === temporary.sha256) fs.unlinkSync(temporary.path);
     }
     if (fs.existsSync(guardPath) && fs.readFileSync(guardPath, "utf8") === guard) fs.unlinkSync(guardPath);
   }

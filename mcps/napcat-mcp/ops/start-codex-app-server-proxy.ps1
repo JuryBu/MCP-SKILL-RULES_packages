@@ -53,16 +53,13 @@ if (-not (Test-Path -LiteralPath $RunnerPath)) { throw "Missing Codex App Server
 if ($StartupRecoveryMode -ne 'Plan') { New-Item -ItemType Directory -Force -Path $StateRoot | Out-Null }
 if (($RequireNoStopMarker -or $OuterRuntimeStartup.innerManagedProfilePath) -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
 
-function Test-ExpectedProxyRuntime {
+function Test-ExpectedProxyIdentity {
   param($RuntimeState, $ProcessInfo)
-  if ($null -eq $RuntimeState -or $null -eq $ProcessInfo -or [string]$RuntimeState.state -ne "running") { return $false }
+  if ($null -eq $RuntimeState -or $null -eq $ProcessInfo) { return $false }
   $CommandLine = [string]$ProcessInfo.CommandLine
   if ($CommandLine.IndexOf("codex-app-server-proxy-runner.mjs", [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($RuntimeStatePath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
   if ($CommandLine.IndexOf($LockPath, [System.StringComparison]::OrdinalIgnoreCase) -lt 0) { return $false }
-  $DownstreamOwner = Get-NetTCPConnection -State Listen -LocalPort $DownstreamPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @("127.0.0.1", "::1") } | Select-Object -First 1 -ExpandProperty OwningProcess
-  $ControlOwner = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @("127.0.0.1", "::1") } | Select-Object -First 1 -ExpandProperty OwningProcess
-  if ([int]$DownstreamOwner -ne [int]$RuntimeState.pid -or [int]$ControlOwner -ne [int]$RuntimeState.pid) { return $false }
   if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
   try {
     $LockState = Get-Content -LiteralPath $LockPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -70,6 +67,15 @@ function Test-ExpectedProxyRuntime {
   } catch {
     return $false
   }
+}
+
+function Test-ExpectedProxyRuntime {
+  param($RuntimeState, $ProcessInfo)
+  if (-not (Test-ExpectedProxyIdentity -RuntimeState $RuntimeState -ProcessInfo $ProcessInfo) -or [string]$RuntimeState.state -notin @('running','waiting_for_desktop')) { return $false }
+  if ($RuntimeState.state -eq 'waiting_for_desktop' -and ($RuntimeState.waitingForDesktop -ne $true -or $null -ne $RuntimeState.appServerPid)) { return $false }
+  $DownstreamOwner = Get-NetTCPConnection -State Listen -LocalPort $DownstreamPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @('127.0.0.1', '::1') } | Select-Object -First 1 -ExpandProperty OwningProcess
+  $ControlOwner = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @('127.0.0.1', '::1') } | Select-Object -First 1 -ExpandProperty OwningProcess
+  return [int]$DownstreamOwner -eq [int]$RuntimeState.pid -and [int]$ControlOwner -eq [int]$RuntimeState.pid
 }
 
 function Get-OuterRuntimeStartupStatus {
@@ -122,20 +128,41 @@ function Get-OuterRuntimeStartupStatus {
 }
 
 if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePath)) {
+  $ExistingState = $null
+  $ExistingProcess = $null
   try {
     $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
     $ExistingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$ExistingState.pid)" -ErrorAction SilentlyContinue
+  } catch {}
+  if (Test-ExpectedProxyIdentity -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
+    $ExistingPid = [int]$ExistingState.pid
+    $ExistingToken = [string]$ExistingState.instanceToken
+    $ExistingDeadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
+    while (-not (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess)) {
+      if ([string]$ExistingState.state -notin @('starting', 'restarting', 'running')) { throw 'EXISTING_PROXY_NOT_READY_PRESERVED' }
+      if ([DateTime]::UtcNow -ge $ExistingDeadline) { throw 'EXISTING_PROXY_STARTUP_TIMEOUT_PRESERVED' }
+      Start-Sleep -Milliseconds 200
+      $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
+      $ExistingProcess = Get-CimInstance Win32_Process -Filter "ProcessId = $ExistingPid" -ErrorAction SilentlyContinue
+      if ([int]$ExistingState.pid -ne $ExistingPid -or [string]$ExistingState.instanceToken -cne $ExistingToken -or
+          -not (Test-ExpectedProxyIdentity -RuntimeState $ExistingState -ProcessInfo $ExistingProcess)) { throw 'EXISTING_PROXY_CHANGED_PRESERVED' }
+    }
     if (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
       [pscustomobject]@{
         started = $false
         reason = "already_running"
         pid = [int]$ExistingState.pid
+        state = [string]$ExistingState.state
+        downstreamUrl = [string]$ExistingState.downstreamUrl
+        controlUrl = [string]$ExistingState.controlUrl
+        runtimeStatePath = $RuntimeStatePath
+        tokenFilePath = $TokenFilePath
+        fallbackRequired = [bool]$ExistingState.fallbackRequired
         runtimeState = $ExistingState
         outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $ExistingState -ProcessInfo $ExistingProcess -AppliedByThisStart $false
       } | ConvertTo-Json -Depth 12
       return
     }
-  } catch {
   }
 }
 

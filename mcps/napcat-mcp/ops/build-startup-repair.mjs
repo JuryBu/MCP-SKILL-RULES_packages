@@ -10,12 +10,21 @@ const sourceFiles = ["src/control-plane.mjs", "src/codex-thread-bridge.mjs", "sr
   "src/inner-startup-residual-recovery.mjs", "ops/Run-NapCatSupervisorWatchdog.ps1"];
 
 export function repairDesktopLauncher(content) {
-  if (!content.includes("gate_resolved_unclean_exit")) return content;
-  const start = content.indexOf("    try {\n      $MpPath=Join-Path $Plan.dataRoot");
-  const end = content.indexOf("    $StartModelArgs=@{", start);
-  if (start < 0 || end < 0 || content.indexOf("gate_resolved_unclean_exit", end) >= 0
-    || !content.slice(start, end).includes(".crash-")) throw new Error("DESKTOP_RECOVERY_SOURCE_UNRECOGNIZED");
-  return content.slice(0, start) + content.slice(end);
+  if (content.includes("gate_resolved_unclean_exit")) {
+    const start = content.indexOf("    try {\n      $MpPath=Join-Path $Plan.dataRoot");
+    const end = content.indexOf("    $StartModelArgs=@{", start);
+    if (start < 0 || end < 0 || content.indexOf("gate_resolved_unclean_exit", end) >= 0
+      || !content.slice(start, end).includes(".crash-")) throw new Error("DESKTOP_RECOVERY_SOURCE_UNRECOGNIZED");
+    content = content.slice(0, start) + content.slice(end);
+  }
+  const fallback = "    if($null -eq $ProxyStatus) {\n      $StartAppArgs=@{";
+  const managedFailure = "    if($null -eq $ProxyStatus -and $null -ne $ModelStatus -and $ModelStatus.mode -eq 'managed') {throw 'APP_SERVER_PROXY_NOT_READY'}\n";
+  if (content.includes("$AppDeadline=") && content.includes(fallback) && !content.includes(managedFailure)) {
+    content = content.replace(fallback, managedFailure + fallback);
+  }
+  content = content.replaceAll("$Ps.runtime.state -eq 'running'", "$Ps.runtime.state -in @('running','waiting_for_desktop')")
+    .replaceAll("$ProxyStatus.runtime.state -ne 'running'", "$ProxyStatus.runtime.state -notin @('running','waiting_for_desktop')");
+  return content;
 }
 
 export function buildStartupRepairPayload({ sourceRoot, installedRoot, desktopLauncherPath, outputRoot }) {

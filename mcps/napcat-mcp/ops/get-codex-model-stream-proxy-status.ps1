@@ -13,7 +13,7 @@ if ($null -ne $ManagedProfile) {
   }
   Assert-CodexStartupPathWithoutReparsePoint -Path $ManagedProfile.managedStatePath
   $ManagedItem = Get-Item -LiteralPath $ManagedProfile.managedStatePath -Force
-  if ($ManagedItem.Length -gt 262144) { throw 'INNER_MANAGED_RUNTIME_TOO_LARGE' }
+  if ($ManagedItem.Length -gt 16777216) { throw 'INNER_MANAGED_RUNTIME_TOO_LARGE' }
   $ManagedRuntime = Get-Content -LiteralPath $ManagedProfile.managedStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
   if ($ManagedRuntime.schemaVersion -ne 1 -or $ManagedRuntime.ownerId -cne $ManagedProfile.ownerId -or
       $ManagedRuntime.nativeSourceId -cne $ManagedProfile.nativeSourceId -or $ManagedRuntime.front.pid -ne $ManagedRuntime.pid -or

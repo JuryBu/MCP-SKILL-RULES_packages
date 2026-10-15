@@ -18,7 +18,7 @@ const evidence = [];
 let base;
 
 function generate() {
-  const target = path.join(root, "old state");
+  const target = path.join(root, `old state ${evidence.length}`);
   fs.mkdirSync(target);
   const result = spawnSync(process.execPath, [native, target], { encoding: "utf8", windowsHide: true, timeout: 25000 });
   evidence.push({ command: [process.execPath, native, target], status: result.status, stderr: result.stderr, stdout: result.stdout });
@@ -97,7 +97,25 @@ test("strict plan rejects live/reused PID, orphan, listeners, missing inventory,
   finally { restore(); }
 });
 
+test("recovery binds Windows short and long paths to the same files", { skip: process.platform !== "win32" }, context => {
+  const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    "$ErrorActionPreference='Stop';$files=New-Object -ComObject Scripting.FileSystemObject;[pscustomobject]@{profilePath=$files.GetFile($env:PROFILE_PATH).ShortPath;dataRoot=$files.GetFolder($env:DATA_ROOT).ShortPath}|ConvertTo-Json -Compress"],
+  { encoding: "utf8", windowsHide: true, env: { ...process.env, PROFILE_PATH: base.profilePath, DATA_ROOT: base.dataRoot } });
+  assert.equal(result.status, 0, result.stderr);
+  const aliases = JSON.parse(result.stdout);
+  if (aliases.profilePath.toLowerCase() === fs.realpathSync.native(base.profilePath).toLowerCase()) {
+    context.skip("Windows short path aliases are disabled on this volume");
+    return;
+  }
+  const canonical = { ...base, profilePath: fs.realpathSync.native(base.profilePath), dataRoot: fs.realpathSync.native(base.dataRoot) };
+  const expected = planInnerStartupRecovery(canonical, emptyHost);
+  const actual = planInnerStartupRecovery({ ...base, ...aliases }, emptyHost);
+  assert.deepEqual(actual.pids, expected.pids);
+  assert.equal(actual.instanceToken, expected.instanceToken);
+});
+
 test("normal Auto entry applies verified residuals and proceeds through readiness; original bytes and private data survive", { skip: process.platform !== "win32" }, () => {
+  generate();
   const profile = JSON.parse(fs.readFileSync(base.profilePath));
   const privatePath = path.join(base.dataRoot, "private-ledger-binding-account.json");
   fs.writeFileSync(privatePath, '{"pending":"retain","unknown":"retain"}');
@@ -129,6 +147,32 @@ function Start-Process { param($FilePath,$ArgumentList,$WindowStyle,[switch]$Pas
   assert.deepEqual(fs.readFileSync(path.join(managed.startupRecovery.evidenceRoot, "retired-managed.original")), originals[2].bytes);
   assert.equal(fs.readFileSync(privatePath, "utf8"), '{"pending":"retain","unknown":"retain"}');
   assert.equal(fs.existsSync(`${profile.outerPaths.lockPath}.recovery`), false);
+});
+
+test("repeated managed start returns the complete ready shape and waits for an existing starting instance without launching twice", { skip: process.platform !== "win32" }, () => {
+  const continuation = `
+$global:ResidualCommand='codex-app-server-proxy-runner.mjs '+(Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy-runtime.json')+' '+(Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy.lock')
+function Get-CimInstance { param($ClassName,$Filter,$ErrorAction) [pscustomobject]@{CommandLine=$global:ResidualCommand} }
+function Get-NetTCPConnection { param($State,$LocalPort,$ErrorAction) [pscustomobject]@{LocalAddress='127.0.0.1';OwningProcess=54321} }
+function Start-Process { throw 'SECOND_START_FORBIDDEN' }
+function Start-Sleep { param($Milliseconds) $runtime=Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy-runtime.json';$state=Get-Content $runtime -Raw -Encoding UTF8|ConvertFrom-Json;$state.state='running';$state|ConvertTo-Json|Set-Content $runtime -Encoding UTF8 }
+`;
+  for (const phase of ["running", "starting", "waiting_for_desktop"]) {
+    const runtimePath = path.join(base.dataRoot, "state", "codex-app-server-proxy-runtime.json");
+    const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8").replace(/^\uFEFF/u, ""));
+    runtime.state = phase;
+    runtime.waitingForDesktop = phase === "waiting_for_desktop";
+    runtime.appServerPid = null;
+    fs.writeFileSync(runtimePath, JSON.stringify(runtime));
+    const result = shell(base, "Auto", continuation);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const output = JSON.parse(result.stdout);
+    assert.equal(output.started, false);
+    assert.equal(output.reason, "already_running");
+    assert.equal(output.state, phase === "waiting_for_desktop" ? phase : "running");
+    assert.equal(output.pid, 54321);
+    assert.equal(output.runtimeStatePath, runtimePath);
+  }
 });
 
 after(() => {

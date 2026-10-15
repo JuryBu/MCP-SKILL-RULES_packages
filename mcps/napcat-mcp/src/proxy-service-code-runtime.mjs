@@ -136,6 +136,7 @@ export function createProxyServiceImplementation(state) {
     return ownsLock() && dependencies.updateMaintenance(options.maintenanceFilePath, "codexAppServerProxyUpstream", null, fsImpl);
   }
   function handleProxyEvent(event) {
+    if (event.type === "client_closed") state.sawDesktopClient = true;
     if (event.type === "upstream_reconnect_scheduled") {
       state.dispatch("pauseForUpstream", "APP_SERVER_RECONNECTING", "Codex App Server 上游暂时不可用，自动唤醒已暂停并等待恢复");
     } else if (event.type === "upstream_connected") state.dispatch("resumeAfterUpstream");
@@ -144,17 +145,26 @@ export function createProxyServiceImplementation(state) {
     }
     state.dispatch("log", event.type, event);
   }
+  function canStopEmptyDesktop(snapshot) {
+    return Number(snapshot?.clientCount) === 0
+      && ["activeOperationCount", "trackedRequestCount", "pendingToolCount"]
+        .every(name => Number(snapshot?.outerRuntime?.[name] ?? 0) === 0);
+  }
   async function watchLifecycleStep(cycle) {
     await dependencies.wait(options.lifecyclePollIntervalMs ?? 250);
     if (!cycle.active) return { code: null, signal: "watch_stopped" };
     const shouldStop = () => state.stopRequested || fsImpl.existsSync(options.stopFilePath);
     if (shouldStop()) return { code: null, signal: "stop_requested" };
     const proxySnapshot = state.proxy.status();
-    const emptyDesktop = dependencies.observeEmptyDesktopRestart(cycle.emptyDesktopRestartState, {
+    if (Number(proxySnapshot?.clientCount) > 0) state.sawDesktopClient = true;
+    const emptyDesktop = dependencies.observeEmptyDesktopRestart({ ...cycle.emptyDesktopRestartState,
+      sawDesktopClient: state.sawDesktopClient || cycle.emptyDesktopRestartState?.sawDesktopClient }, {
       clientCount: proxySnapshot?.clientCount, nowMs: Date.now(),
       restartMs: options.emptyClientRestartMs ?? dependencies.defaults.emptyClientRestartMs });
     cycle.emptyDesktopRestartState = emptyDesktop.state;
-    if (emptyDesktop.shouldRestart) return { code: null, signal: "desktop_empty_restart", emptyForMs: emptyDesktop.emptyForMs };
+    if (emptyDesktop.shouldRestart && canStopEmptyDesktop(proxySnapshot)) {
+      return { code: null, signal: "desktop_empty_restart", emptyForMs: emptyDesktop.emptyForMs };
+    }
     if (Date.now() >= cycle.nextLivenessAt) {
       cycle.nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? dependencies.defaults.livenessIntervalMs);
       state.dispatch("persist", { proxy: proxySnapshot });
@@ -264,6 +274,24 @@ export function createProxyServiceImplementation(state) {
 
   }
   async function runBackendCycle() {
+      if (state.waitingForDesktop) {
+        let nextLivenessAt = 0;
+        while (!shouldStop()) {
+          const proxySnapshot = state.proxy.status();
+          if (Number(proxySnapshot?.clientCount) > 0) {
+            state.waitingForDesktop = false;
+            state.sawDesktopClient = true;
+            log("app_server_desktop_returned", { clientCount: proxySnapshot.clientCount });
+            break;
+          }
+          if (Date.now() >= nextLivenessAt) {
+            nextLivenessAt = Date.now() + (options.livenessIntervalMs ?? DEFAULT_LIVENESS_INTERVAL_MS);
+            persist({ proxy: proxySnapshot });
+          }
+          await dependencies.wait(options.lifecyclePollIntervalMs ?? 250);
+        }
+        if (shouldStop()) return { stop: true };
+      }
       const launchGuard = state.startupGuard ?? createOperationGuard(options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS, shouldStop);
       launchGuard.check();
       const launched = state.preparedLaunch ?? (options.spawnAppServer ?? spawnAppServer)(state.currentExecutable, state.upstreamPort, options);
@@ -296,6 +324,7 @@ export function createProxyServiceImplementation(state) {
         state.restartFailureCount = 0;
         persist({
           state: "running",
+          waitingForDesktop: false,
           compatible: true,
           automationEnabled: true,
           fallbackRequired: false,
@@ -314,7 +343,7 @@ export function createProxyServiceImplementation(state) {
         const appServerExit = waitForExit(state.appServer);
         let exit;
         let emptyDesktopRestartState = {
-          sawDesktopClient: Number(state.proxy.status()?.clientCount ?? 0) > 0,
+          sawDesktopClient: state.sawDesktopClient || Number(state.proxy.status()?.clientCount ?? 0) > 0,
           emptySinceMs: null,
         };
         while (true) {
@@ -331,7 +360,7 @@ export function createProxyServiceImplementation(state) {
           exit = await Promise.race([appServerExit, lifecycleWatch]);
           lifecycleCycle.active = false;
           emptyDesktopRestartState = lifecycleCycle.emptyDesktopRestartState;
-          if (exit.signal === "desktop_empty_restart" && Number(state.proxy.status()?.clientCount ?? 0) !== 0) {
+          if (exit.signal === "desktop_empty_restart" && !canStopEmptyDesktop(state.proxy.status())) {
             log("app_server_desktop_empty_restart_deferred", {
               clientCount: Number(state.proxy.status()?.clientCount ?? 0),
             });
@@ -371,9 +400,11 @@ export function createProxyServiceImplementation(state) {
         }
         if (exit.signal === "desktop_empty_restart") {
           state.restartFailureCount = 0;
-          pauseForUpstream("APP_SERVER_DESKTOP_EMPTY_RESTARTING", "Desktop 已全部断开，正在重启受管 App Server");
+          state.waitingForDesktop = true;
+          pauseForUpstream("APP_SERVER_WAITING_FOR_DESKTOP", "Desktop 已全部断开，受管 App Server 停止后等待新的 Desktop 连接");
           persist({
-            state: "restarting",
+            state: "waiting_for_desktop",
+            waitingForDesktop: true,
             automationEnabled: false,
             proxy: state.proxy.status(),
             restartFailureCount: state.restartFailureCount,
@@ -482,6 +513,7 @@ export function createProxyServiceImplementation(state) {
       if (ownsLock() && !state.shutdownError && state.status.state !== "degraded") {
         persist({
           state: "stopped",
+          waitingForDesktop: false,
           automationEnabled: false,
           appServerPid: null,
           proxy: state.proxy?.status() ?? null,

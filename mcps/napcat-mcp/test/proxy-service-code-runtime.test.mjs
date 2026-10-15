@@ -84,3 +84,50 @@ test("an existing asynchronous lifecycle tick finishes once and the next tick us
   assert.equal(nextTicks, 1);
   assert.equal(cycle.active, true);
 });
+
+test("empty Desktop shutdown waits for operations, tracked requests and pending tools to finish", async () => {
+  for (const counter of ["activeOperationCount", "trackedRequestCount", "pendingToolCount"]) {
+    const { state, runtime } = fixture();
+    state.fsImpl.existsSync = () => false;
+    state.dependencies.wait = async () => {};
+    state.dependencies.observeEmptyDesktopRestart = value => ({ state: value, shouldRestart: true, emptyForMs: 10000 });
+    const outerRuntime = { activeOperationCount: 0, trackedRequestCount: 0, pendingToolCount: 0, [counter]: 1 };
+    state.proxy = { status: () => ({ clientCount: 0, outerRuntime }) };
+    const cycle = { active: true, emptyDesktopRestartState: { sawDesktopClient: true },
+      nextLivenessAt: Infinity, nextRefreshAt: Infinity };
+    assert.equal(await runtime.watchLifecycleStep(cycle), null, counter);
+    outerRuntime[counter] = 0;
+    assert.equal((await runtime.watchLifecycleStep(cycle)).signal, "desktop_empty_restart", counter);
+    outerRuntime[counter] = NaN;
+    assert.equal(await runtime.watchLifecycleStep(cycle), null, `${counter}: unknown`);
+  }
+});
+
+test("a Desktop that closes between lifecycle polls is still observed", async () => {
+  const { state, runtime } = fixture();
+  state.fsImpl.existsSync = () => false;
+  state.dependencies.wait = async () => {};
+  state.proxy = { status: () => ({ clientCount: 0 }) };
+  runtime.handleProxyEvent({ type: "client_closed" });
+  let sawDesktopClient;
+  state.dependencies.observeEmptyDesktopRestart = value => {
+    sawDesktopClient = value.sawDesktopClient;
+    return { state: value, shouldRestart: false };
+  };
+  await runtime.watchLifecycleStep({ active: true, emptyDesktopRestartState: {}, nextLivenessAt: Infinity, nextRefreshAt: Infinity });
+  assert.equal(sawDesktopClient, true);
+});
+
+test("waiting for Desktop remains stoppable without launching another backend", async () => {
+  const { state, runtime } = fixture();
+  state.waitingForDesktop = true;
+  state.fsImpl.existsSync = () => false;
+  state.proxy = { status: () => ({ clientCount: 0 }) };
+  let release;
+  state.dependencies.wait = () => new Promise(resolve => { release = resolve; });
+  const pending = runtime.runBackendCycle();
+  assert.equal(typeof release, "function");
+  runtime.requestStop("owned-test");
+  release();
+  assert.deepEqual(await pending, { stop: true });
+});

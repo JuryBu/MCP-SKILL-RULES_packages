@@ -688,12 +688,13 @@ test("empty Desktop restart does not fire before any Desktop client has connecte
   }
 });
 
-test("empty Desktop restart fires once after the last Desktop client disconnects", async () => {
+test("empty Desktop stops the backend and starts it only after a new Desktop connects", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-proxy-empty-restart-test-"));
   const paths = runtimePaths(root);
   let clientCount = 1;
   let spawnCount = 0;
   let nextPid = 43210;
+  let waitingObservation;
   try {
     const result = await runCodexAppServerProxyService({
       ...paths,
@@ -725,11 +726,17 @@ test("empty Desktop restart fires once after the last Desktop client disconnects
       terminateChild: async (child) => {
         child.exitCode = 0;
         child.emit("exit", 0, null);
+        if (spawnCount === 1) setTimeout(() => {
+          const snapshot = JSON.parse(fs.readFileSync(paths.runtimeStatePath, "utf8"));
+          waitingObservation = { spawnCount, state: snapshot.state, appServerPid: snapshot.appServerPid };
+          clientCount = 1;
+        }, 20);
       },
       verifyPortReleased: async () => true,
     });
     assert.equal(result.state, "stopped");
     assert.equal(spawnCount, 2);
+    assert.deepEqual(waitingObservation, { spawnCount: 1, state: "waiting_for_desktop", appServerPid: null });
     const logEntries = fs.readFileSync(paths.logPath, "utf8")
       .trim()
       .split("\n")

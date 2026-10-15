@@ -36,11 +36,13 @@ export function checkedRuntimePath(value, { directory = false, existing = false 
   return resolved;
 }
 
-function boundedJson(filePath, expectedSha256) {
+export const INNER_RUNTIME_STATE_MAX_BYTES = 16777216;
+
+function boundedJson(filePath, expectedSha256, maximum = 65536) {
   const target = checkedRuntimePath(filePath, { existing: true });
-  if (fs.statSync(target).size > 65536) fail("INNER_PROFILE_FILE_TOO_LARGE");
+  if (fs.statSync(target).size > maximum) fail("INNER_PROFILE_FILE_TOO_LARGE");
   const bytes = fs.readFileSync(target);
-  if (bytes.length > 65536) fail("INNER_PROFILE_FILE_TOO_LARGE");
+  if (bytes.length > maximum) fail("INNER_PROFILE_FILE_TOO_LARGE");
   if (expectedSha256 !== undefined && (!/^[0-9a-f]{64}$/u.test(expectedSha256)
     || digest(bytes) !== expectedSha256)) fail("INNER_PROFILE_SHA256_MISMATCH");
   try { return JSON.parse(bytes.toString("utf8")); }
@@ -193,11 +195,11 @@ export function validateInnerRuntimeProfile(profile, { options, workerStateRoot,
     if (tokenBytes.length < 32 || tokenBytes.length > 4096 || tokenBytes.toString("utf8").trim().length < 32
       || digest(tokenBytes) !== profile.controlTokenSha256) fail("INNER_PROFILE_CONTROL_TOKEN_MISMATCH");
     if (fs.existsSync(options.runtimeStatePath)) {
-      const previous = boundedJson(options.runtimeStatePath);
+      const previous = boundedJson(options.runtimeStatePath, undefined, INNER_RUNTIME_STATE_MAX_BYTES);
       if (previous.state !== "stopped" || previous.appServerPid) fail("INNER_PROFILE_OUTER_RUNTIME_UNRESOLVED");
     }
     if (fs.existsSync(managedStatePath)) {
-      const previous = boundedJson(managedStatePath);
+      const previous = boundedJson(managedStatePath, undefined, INNER_RUNTIME_STATE_MAX_BYTES);
       if (previous.ownerId !== profile.ownerId || previous.nativeSourceId !== profile.nativeSourceId
         || previous.state !== "closed") fail("INNER_PROFILE_PREVIOUS_SESSION_UNRESOLVED");
       if (previous.instanceToken === options.instanceToken) fail("INNER_PROFILE_RETIRED_INSTANCE_REUSED");
