@@ -151,7 +151,7 @@ function Start-Process { param($FilePath,$ArgumentList,$WindowStyle,[switch]$Pas
 
 test("repeated managed start returns the complete ready shape and waits for an existing starting instance without launching twice", { skip: process.platform !== "win32" }, () => {
   const continuation = `
-$global:ResidualCommand='codex-app-server-proxy-runner.mjs '+(Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy-runtime.json')+' '+(Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy.lock')
+$global:ResidualCommand='codex-app-server-proxy-runner.mjs '+[IO.Path]::GetFullPath((Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy-runtime.json'))+' '+[IO.Path]::GetFullPath((Join-Path $env:RESIDUAL_ROOT 'state\\codex-app-server-proxy.lock'))
 function Get-CimInstance { param($ClassName,$Filter,$ErrorAction) [pscustomobject]@{CommandLine=$global:ResidualCommand} }
 function Get-NetTCPConnection { param($State,$LocalPort,$ErrorAction) [pscustomobject]@{LocalAddress='127.0.0.1';OwningProcess=54321} }
 function Start-Process { throw 'SECOND_START_FORBIDDEN' }
@@ -171,7 +171,7 @@ function Start-Sleep { param($Milliseconds) $runtime=Join-Path $env:RESIDUAL_ROO
     assert.equal(output.reason, "already_running");
     assert.equal(output.state, phase === "waiting_for_desktop" ? phase : "running");
     assert.equal(output.pid, 54321);
-    assert.equal(output.runtimeStatePath, runtimePath);
+    assert.equal(fs.realpathSync.native(output.runtimeStatePath), fs.realpathSync.native(runtimePath));
   }
 });
 
