@@ -34,7 +34,15 @@ async function fixture(mode, launchDelay = 0) {
     };
     const browser = {
         contexts: () => { if (mode === "context-error") throw new Error("synthetic context failure"); return [context]; },
-        newBrowserCDPSession: async () => ({ send: async () => { processHandle.kill(); } }),
+        newBrowserCDPSession: async () => ({ send: async () => {
+            if (mode === "slow-close") {
+                setTimeout(() => {
+                    processHandle.exitCode = 0;
+                    closedAt = Date.now();
+                    processHandle.emit("exit");
+                }, 3500);
+            } else processHandle.kill();
+        } }),
         close: async () => {},
     };
     const runner = createLoginSessionRunner({
@@ -60,6 +68,15 @@ test("launch latency does not consume any manual-operation budget", async () => 
     assert.equal(result.browserClosed, true);
     assert.ok(probe.times().launchedAt - started >= 140);
     assert.ok(probe.times().closedAt - probe.times().launchedAt >= 170);
+});
+
+test("slow graceful exit is awaited before forced termination", async () => {
+    const probe = await fixture("slow-close");
+    const result = await probe.runner("https://example.test", { maxRunMs: 180 });
+    assert.equal(result.timedOut, true);
+    assert.equal(result.browserClosed, true);
+    assert.equal(probe.processHandle.killed, false);
+    assert.ok(probe.times().closedAt - probe.times().launchedAt >= 3600);
 });
 
 for (const mode of ["connect-error", "cookie-error", "context-error", "tracker-error"]) {

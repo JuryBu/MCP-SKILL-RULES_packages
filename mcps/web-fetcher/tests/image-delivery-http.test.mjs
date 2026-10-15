@@ -186,8 +186,10 @@ try {
                 loginResult = await call("web_login_browser", { taskId: loginTaskId, waitSeconds: 1 }, 0);
                 if (textOf(loginResult).includes("本次人工浏览器会话已结束")) break;
             }
-            assert.match(textOf(loginResult), /已确认写入/);
-            assert.doesNotMatch(textOf(loginResult), /恢复来源已保留|尚未确认保存/);
+            assert.match(textOf(loginResult), /会话期间已写入/);
+            assert.match(textOf(loginResult), /最终 Cookie：已写入/);
+            assert.match(textOf(loginResult), /关窗后的已知来源恢复已完成/);
+            assert.doesNotMatch(textOf(loginResult), /恢复来源已保留|本次尚未确认写入|读取失败|写入失败/);
             const loggedIn = await call("web_interact", { url: loginUrl, ownerId, action: "content" }, 0);
             assert.match(textOf(loggedIn), /Synthetic authenticated page/);
             await call("web_fetch_screenshot", { url: loginUrl }, 1);

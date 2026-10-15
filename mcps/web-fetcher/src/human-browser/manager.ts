@@ -9,6 +9,7 @@ import {
     type ChromeLaunchResult,
 } from "../chrome-helper.js";
 import { StorageSnapshotTracker } from "../storage-snapshot-tracker.js";
+import { mergeStorageSnapshots, type OriginStorageEvidence, type StorageSnapshotIssue, type StorageCaptureEvidence } from "../storage-snapshot.js";
 import { desktopManager } from "../desktop/manager.js";
 import { normalizeOwnerId } from "../session.js";
 import { sessionManager } from "../session.js";
@@ -46,6 +47,10 @@ export interface HumanBrowserSessionInfo {
         recoveryPending?: boolean;
         localStorageDomains: Array<{ domain: string; keyCount: number }>;
         errors: string[];
+        cookieEvidence?: StorageCaptureEvidence;
+        originEvidence?: OriginStorageEvidence[];
+        issues?: StorageSnapshotIssue[];
+        recoveryComplete?: boolean;
     };
     pages: HumanBrowserPageInfo[];
 }
@@ -81,12 +86,14 @@ class HumanBrowserManager {
         waitMs?: number;
         restoreState?: boolean;
         signal?: AbortSignal;
+        headless?: boolean;
     }): Promise<HumanBrowserSessionInfo> {
         const ownerId = normalizeOwnerId(params.ownerId);
         params.signal?.throwIfAborted();
         const chrome = await launchSystemChrome({
-            startUrl: params.restoreState ? 'about:blank' : params.startUrl ?? "about:blank",
+            startUrl: "about:blank",
             profilePrefix: "mcp-chrome-human",
+            headless: params.headless === true,
         });
         let desktopSessionId: string | undefined;
         let cdpBrowser: any;
@@ -97,14 +104,6 @@ class HumanBrowserManager {
             desktopSessionId = connected.desktopSessionId;
             cdpBrowser = await connectCDP(chrome.cdpPort);
             params.signal?.throwIfAborted();
-            if (params.restoreState && params.startUrl) {
-                const context = cdpBrowser.contexts()[0];
-                await new BrowserAuthState().refresh(context);
-                const page = context.pages()[0] ?? await context.newPage();
-                await installOriginStorage(page, params.startUrl);
-                await page.goto(params.startUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
-                params.signal?.throwIfAborted();
-            }
             session = await this.createSession({
                 ownerId,
                 desktopSessionId: connected.desktopSessionId,
@@ -115,6 +114,18 @@ class HumanBrowserManager {
                 endpoint: `http://127.0.0.1:${chrome.cdpPort}`,
                 startUrl: params.startUrl ?? "about:blank",
             });
+            if (params.restoreState && params.startUrl) {
+                const context = cdpBrowser.contexts()[0];
+                await new BrowserAuthState().refresh(context);
+                const page = context.pages()[0] ?? await context.newPage();
+                await installOriginStorage(page, params.startUrl);
+                params.signal?.throwIfAborted();
+            }
+            if (params.startUrl && params.startUrl !== "about:blank") {
+                const context = cdpBrowser.contexts()[0];
+                const page = context.pages()[0] ?? await context.newPage();
+                await page.goto(params.startUrl, { waitUntil: 'domcontentloaded', timeout: 10_000 }).catch(() => undefined);
+            }
             params.signal?.throwIfAborted();
             return await this.describe(session.id, ownerId);
         } catch (error) {
@@ -272,7 +283,6 @@ class HumanBrowserManager {
         const capturedBeforeClose = session.cdpBrowser.isConnected();
         await session.tracker.stop(capturedBeforeClose ? "human-close" : undefined);
         if (session.recovery) await session.recovery;
-        const snapshot = this.storageSummary(session);
         let profileRetained = Boolean(session.chrome);
         const cleanupErrors: string[] = [];
         if (terminate && session.chrome && session.cdpBrowser.isConnected()) {
@@ -295,13 +305,16 @@ class HumanBrowserManager {
             terminateOwnedChrome(session.chrome);
             const exited = await this.waitForOwnedExit(session.chrome);
             if (!exited) cleanupErrors.push('owned process exit unconfirmed');
-            if (exited && (capturedBeforeClose || session.recoveredSnapshot?.savedAt)
-                && snapshot.savedAt && ((snapshot.savedCookieCount ?? 0) > 0 || snapshot.localStorageDomains.length > 0)
-                && snapshot.errors.length === 0 && session.recoveredSnapshot?.recoveryBrowserClosed !== false) {
-                cleanupTempProfile(session.chrome.tempProfile);
-                profileRetained = false;
+            if (exited) await this.recoverExitedSession(session);
+            if (session.recovery) await session.recovery;
+            const finalSnapshot = this.storageSummary(session);
+            if (exited && session.recoveredSnapshot?.recoveryComplete === true
+                && finalSnapshot.errors.length === 0 && session.recoveredSnapshot?.recoveryBrowserClosed === true) {
+                profileRetained = !cleanupTempProfile(session.chrome.tempProfile);
+                if (profileRetained) cleanupErrors.push(`owned profile cleanup failed; retained ${session.chrome.tempProfile}`);
             }
         }
+        const snapshot = this.storageSummary(session);
         if (!terminate && session.chrome) session.chrome.process.unref();
         logHumanVerificationAudit({
             phase: "detached",
@@ -359,7 +372,13 @@ class HumanBrowserManager {
                 }
                 return pages;
             },
-        }, { reasonPrefix: "human-browser" });
+            on: (event: string, listener: (...args: any[]) => void) => {
+                for (const context of contexts()) context.on(event, listener);
+            },
+            removeListener: (event: string, listener: (...args: any[]) => void) => {
+                for (const context of params.cdpBrowser.contexts()) context.removeListener(event, listener);
+            },
+        }, { reasonPrefix: "human-browser", writeState: params.chrome?.storageWriteState });
         session = {
             id,
             createdAt: Date.now(),
@@ -470,19 +489,7 @@ class HumanBrowserManager {
         const tracked = session.tracker.summary();
         const recovered = session.recoveredSnapshot;
         if (!recovered) return tracked;
-        if (recovered.savedAt && (!tracked.savedAt || recovered.savedAt >= tracked.savedAt)) {
-            const origins = new Map(tracked.localStorageDomains.map(entry => [entry.domain, entry]));
-            for (const entry of recovered.localStorageDomains) origins.set(entry.domain, entry);
-            return {
-                ...tracked,
-                ...recovered,
-                cookies: (recovered.savedCookieCount ?? 0) > 0 ? recovered.cookies : tracked.cookies,
-                cookieCount: (recovered.savedCookieCount ?? 0) > 0 ? recovered.cookieCount : tracked.cookieCount,
-                savedCookieCount: (recovered.savedCookieCount ?? 0) > 0 ? recovered.savedCookieCount : tracked.savedCookieCount,
-                localStorageDomains: [...origins.values()],
-            };
-        }
-        return { ...tracked, errors: [...new Set([...tracked.errors, ...recovered.errors])] };
+        return mergeStorageSnapshots(tracked, recovered);
     }
 
     private async recoverExitedSession(session: HumanBrowserSession): Promise<void> {
@@ -491,7 +498,11 @@ class HumanBrowserManager {
             session.recoveryPending = true;
             session.recovery = (async () => {
                 await session.tracker.stop();
-                session.recoveredSnapshot = await recoverClosedChromeStorage(session.chrome!, session.startUrl);
+                const tracked = session.tracker.summary();
+                session.recoveredSnapshot = await recoverClosedChromeStorage(session.chrome!, session.startUrl, {
+                    origins: tracked.observedOrigins, originTrackingComplete: tracked.originTrackingComplete ?? false,
+                    writeState: session.tracker.writeState,
+                });
             })().catch(() => {
                 const summary = session.tracker.summary();
                 session.recoveredSnapshot = { ...summary, errors: [...summary.errors, "owned profile recovery failed; profile retained"] };
@@ -516,6 +527,10 @@ class HumanBrowserManager {
             capturedAt: snapshot.capturedAt,
             localStorageDomains: snapshot.localStorageDomains,
             errors: snapshot.errors,
+            cookieEvidence: snapshot.cookieEvidence,
+            originEvidence: snapshot.originEvidence,
+            issues: snapshot.issues,
+            recoveryComplete: snapshot.recoveryComplete,
         };
     }
 }

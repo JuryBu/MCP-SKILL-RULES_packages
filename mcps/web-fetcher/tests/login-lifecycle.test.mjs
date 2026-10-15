@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, beforeEach, test } from "node:test";
 import fs from "node:fs/promises";
+import fsSync from "node:fs";
 import path from "node:path";
 import os from "node:os";
 
@@ -26,6 +27,50 @@ test("capture and persistence evidence are separate", async () => {
     assert.equal(result.savedCookieCount, 1);
     assert.ok(result.savedAt && result.capturedAt);
     assert.deepEqual(result.localStorageDomains, [{ domain: "https://login.example.test", keyCount: 1 }]);
+});
+
+test("removed Cookie and localStorage keys remain explicitly unresolved", async () => {
+    const facade = context([cookie("one")], { token: "synthetic" });
+    const state = new helper.StorageWriteState();
+    await helper.snapshotBrowserStorage(facade, {}, state);
+    const empty = context([], {});
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await helper.snapshotBrowserStorage(empty, {}, state);
+        assert.deepEqual(result.issues.map(issue => issue.code), ["deletion-unresolved", "deletion-unresolved"]);
+        assert.equal(result.cookieEvidence.status, "persist-failed");
+        assert.equal(result.originEvidence[0].status, "persist-failed");
+    }
+    assert.equal(JSON.parse(await fs.readFile(COOKIES_BACKUP_FILE, "utf8"))[0].value, "one");
+    assert.equal(helper.getLocalStorageForOrigin("https://login.example.test").token, "synthetic");
+});
+
+test("corrupt backup is preserved and reported as persistence failure", async () => {
+    await fs.writeFile(LOCALSTORAGE_BACKUP_FILE, "{invalid-private-backup");
+    const result = await helper.snapshotBrowserStorage(context([], { token: "synthetic" }));
+    assert.equal(result.originEvidence[0].status, "persist-failed");
+    assert.equal(await fs.readFile(LOCALSTORAGE_BACKUP_FILE, "utf8"), "{invalid-private-backup");
+    assert.ok(!result.errors.join().includes("invalid-private-backup"));
+});
+
+test("profile cleanup failure returns a real failure without removing ownership", () => {
+    const originalRemove = fsSync.rmSync;
+    try {
+        fsSync.rmSync = () => { throw Object.assign(new Error("synthetic denied"), { code: "EACCES" }); };
+        assert.equal(helper.cleanupTempProfile(root), false);
+        assert.equal(fsSync.existsSync(root), true);
+    } finally {
+        fsSync.rmSync = originalRemove;
+    }
+});
+
+test("per-context baseline prevents stale closure from overwriting newer login", async () => {
+    helper.saveLocalStorageToBackup("https://login.example.test", { token: "initial" });
+    const older = new helper.StorageWriteState();
+    helper.saveLocalStorageToBackup("https://login.example.test", { token: "newer-login" });
+    const result = await helper.snapshotBrowserStorage(context([], { token: "initial" }), {}, older);
+    assert.equal(result.originEvidence[0].status, "persist-failed");
+    assert.equal(result.issues[0].code, "backup-conflict");
+    assert.equal(helper.getLocalStorageForOrigin("https://login.example.test").token, "newer-login");
 });
 
 test("write failure does not claim saved cookies or expose error contents", async () => {
@@ -81,7 +126,7 @@ test("navigation between URL lookup and capture cannot write into the wrong orig
     const result = await helper.snapshotBrowserStorage(facade);
     assert.equal(result.savedAt, undefined);
     assert.equal(result.localStorageDomains.length, 0);
-    assert.deepEqual(result.errors, ["localStorage: origin changed during capture"]);
+    assert.deepEqual(result.issues, [{ area: "localStorage", phase: "capture", code: "origin-changed", origin: "https://login.example.test" }]);
     assert.equal(helper.getLocalStorageForOrigin("https://login.example.test"), null);
 });
 
@@ -178,7 +223,7 @@ test("final closed-context failure cannot replace last saved values", async () =
     assert.equal(saved.savedCookieCount, 1);
     assert.equal(saved.cookies[0].value, "fresh");
     assert.ok(saved.savedAt);
-    assert.deepEqual(saved.errors, ["cookies: capture or persistence failed"]);
+    assert.deepEqual(saved.issues, [{ area: "cookies", phase: "capture", code: "unavailable" }]);
 });
 
 test("slow periodic and explicit snapshots are serialized and drained", async () => {

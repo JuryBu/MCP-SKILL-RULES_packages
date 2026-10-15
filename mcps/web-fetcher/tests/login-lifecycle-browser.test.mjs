@@ -15,7 +15,8 @@ process.env.TMP = root;
 process.env.TMPDIR = root;
 const helper = await import("../src/chrome-helper.ts");
 const { StorageSnapshotTracker } = await import("../src/storage-snapshot-tracker.ts");
-const { runLoginBrowserSession } = await import("../src/login-session.ts");
+const { createLoginSessionRunner } = await import("../src/login-session.ts");
+const runLoginBrowserSession = createLoginSessionRunner({ launch: options => helper.launchSystemChrome({ ...options, headless: true }) });
 const server = http.createServer((request, response) => {
     response.setHeader("Content-Type", "text/html; charset=utf-8");
     response.setHeader("Cache-Control", "no-store");
@@ -40,7 +41,7 @@ async function attach(chrome) {
 }
 
 test("real Chrome immediate manual close recovers the final cookie and localStorage", { skip: !enabled, timeout: 60000 }, async () => {
-    const chrome = await helper.launchSystemChrome({ startUrl: `${origin}/cookie`, profilePrefix: "mcp-chrome-login" });
+    const chrome = await helper.launchSystemChrome({ startUrl: `${origin}/cookie`, profilePrefix: "mcp-chrome-login", headless: true });
     let browser;
     let tracker;
     try {

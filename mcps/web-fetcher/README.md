@@ -32,6 +32,12 @@
 
 强挑战页不再作为成功内容返回、缓存或送入摘要。原调用短返回明确的 `pageAccess` 状态，人工操作在独立后台任务中进行，窗口就绪后保留600秒。通过后直接复用同一页面读取，不依赖把 Cookie 复制给另一个浏览器。新增普通 MCP 工具 `web_human_verification`，并为三个只读抓取工具增加可选 `sessionId`，四宿主与原模型链路不变，详见 [docs/7.3-human-verification.md](docs/7.3-human-verification.md)。
 
+### 7.3.1 登录关窗后的存储恢复
+
+人工登录仍保留最多 600 秒，工具名和参数保持兼容。关窗后只读复制本次自有 profile，在无头隔离副本中恢复 session Cookie，并通过阻网的同源空白页读取已记录来源的 localStorage，避免重访慢站、重定向或重新执行页面脚本。
+
+结果按来源说明读取、写入及完整恢复状态。出现读取失败、备份冲突、未知来源或退出未确认时保留原件，已有备份继续可用。保存结束后应访问目标页确认账号与页面，详见 [docs/7.3.1-login-recovery.md](docs/7.3.1-login-recovery.md)。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |

@@ -65,7 +65,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.3.0",
+    version: "7.3.1",
 });
 
 // 注册所有工具
@@ -156,6 +156,7 @@ server.registerResource(
             "- 图片默认以 MCP image 内容块与文本一起返回，多页/分片有序排列；每次最多 10 张、图片 base64 总长 12 MiB。超限请缩小 pages/截图范围或显式 file，不会静默漏图或回退路径。web_inspect/desktop_inspect 的 screenshotRef 对应随附图片，后台 check 也可指定 saveMode。",
             "- Cookie/localStorage 是全局共享网页登录态，写入时使用文件锁 + 临时文件 rename 合并，不能按对话隔离。",
             "- 登录/UAV 浏览器使用动态空闲 CDP 端口，只清理自有临时 profile/lockfile 对应的 Chrome。",
+            "- 7.3.1 关窗恢复只读复制自有已退出 profile；隔离副本启动即阻网，受控空白页按精确 origin 导出 Cookie/localStorage。结果按来源区分读取、写入与待确认；范围不完整、写入冲突或退出未确认时保留原件。",
             "- web_login_browser 保留600秒登录/保存行为。访问中检测到强挑战后不再同步等人工：有明确ownerId时auto创建web_human_verification后台任务，原工具以isError和pageAccess短返回；humanAssistance=never或缺明确ownerId时不弹窗。后台查询最多45秒，人工窗口就绪后另给600秒。",
             "- 新 Cookie 会同步到已有浏览器上下文，旧状态不能覆盖更新的备份；localStorage 按 origin 隔离并在新导航恢复，不自动刷新用户现有页面。纯 localStorage 登录不要求 Cookie 数量大于零。",
             "- 主 context 与 bareContext 在 close/closeBrowser 时都会关闭并清理 profile。",
@@ -209,7 +210,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.3.0 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.3.1 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -306,7 +307,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.3.0 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.3.1 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -339,7 +340,7 @@ async function main(): Promise<void> {
     const transport = new StdioServerTransport();
     await server.connect(transport);
 
-    console.error(`[web-fetcher] MCP Server v7.3.0 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.3.1 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

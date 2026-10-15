@@ -1,10 +1,11 @@
 import { touchActivity } from "./lifecycle.js";
 import {
     launchSystemChrome, connectCDP, waitForChromeClose, terminateOwnedChrome, cleanupTempProfile,
-    recoverClosedChromeStorage, type BrowserStorageSnapshotResult,
+    recoverClosedChromeStorage, StorageWriteState, type BrowserStorageSnapshotResult,
     type ChromeLaunchResult,
 } from "./chrome-helper.js";
 import { StorageSnapshotTracker } from "./storage-snapshot-tracker.js";
+import { mergeStorageSnapshots } from "./storage-snapshot.js";
 
 export interface LoginSessionResult {
     snapshot: BrowserStorageSnapshotResult;
@@ -37,7 +38,8 @@ interface LoginSessionDependencies {
 async function runSession(startUrl: string, options: LoginSessionOptions | undefined, dependencies: LoginSessionDependencies): Promise<LoginSessionResult> {
     const maxRunMs = Math.max(1, Math.min(600_000, options?.maxRunMs ?? 600_000));
     const prefix = options?.profilePrefix === "mcp-chrome-uav" ? "mcp-chrome-uav" : "mcp-chrome-login";
-    const launching = (dependencies.launch ?? launchSystemChrome)({ startUrl: options?.initialCookies ? "about:blank" : startUrl, profilePrefix: prefix });
+    const writeState = new StorageWriteState();
+    const launching = (dependencies.launch ?? launchSystemChrome)({ startUrl: "about:blank", profilePrefix: prefix, storageWriteState: writeState });
     let chrome: ChromeLaunchResult;
     try {
         chrome = await bounded(launching, 15_000);
@@ -71,15 +73,17 @@ async function runSession(startUrl: string, options: LoginSessionOptions | undef
         }
         if (browser?.contexts()[0]) {
             const context = browser.contexts()[0];
+            tracker = dependencies.createTracker?.(context) ?? new StorageSnapshotTracker(context, { reasonPrefix: prefix, intervalMs: 2000, writeState });
+            await tracker.start();
             if (options?.initialCookies) {
                 await bounded(context.addCookies(options.initialCookies), 3000).catch(() => {
                     warnings.push("初始 Cookie 导入失败，人工窗口继续保留，可直接完成登录");
                 });
+            }
+            if (startUrl !== "about:blank") {
                 const page = context.pages()[0] ?? await bounded<any>(context.newPage(), 1000);
                 await page.goto(startUrl, { waitUntil: "domcontentloaded", timeout: Math.max(1, Math.min(5000, deadline - Date.now())) }).catch(() => undefined);
             }
-            tracker = dependencies.createTracker?.(context) ?? new StorageSnapshotTracker(context, { reasonPrefix: prefix, intervalMs: 2000 });
-            await tracker.start();
         } else {
             warnings.push("CDP 未连接，关闭后将尝试从本次专用 profile 恢复；尚未确认保存");
         }
@@ -106,36 +110,33 @@ async function runSession(startUrl: string, options: LoginSessionOptions | undef
                     await bounded(session.send("Browser.close"), 2000);
                 } catch { }
             }
-            await bounded(closed, 1500).catch(() => undefined);
+            await bounded(closed, 7500).catch(() => undefined);
             if (chrome.process.exitCode === null && chrome.process.signalCode === null) terminateOwnedChrome(chrome);
-            await bounded(closed, 1500).catch(() => undefined);
+            await bounded(closed, 3000).catch(() => undefined);
         }
         if (browser) await bounded(Promise.resolve(browser.close()), 1000).catch(() => undefined);
     }
     const originalClosed = chrome.process.exitCode !== null || chrome.process.signalCode !== null;
-    if (originalClosed && !finalStateSaved) {
-        const recovered = await recoverClosedChromeStorage(chrome, startUrl);
-        if (recovered.savedCookieCount > 0) {
-            snapshot.cookies = recovered.cookies;
-            snapshot.cookieCount = recovered.cookieCount;
-            snapshot.savedCookieCount = recovered.savedCookieCount;
-            snapshot.mergedCookieCount = recovered.mergedCookieCount;
-        }
-        const origins = new Map(snapshot.localStorageDomains.map(entry => [entry.domain, entry]));
-        for (const entry of recovered.localStorageDomains) origins.set(entry.domain, entry);
-        snapshot.localStorageDomains = [...origins.values()];
-        snapshot.capturedAt = recovered.capturedAt;
-        snapshot.savedAt = recovered.savedAt ?? snapshot.savedAt;
-        snapshot.errors = recovered.errors;
+    if (originalClosed) {
+        const recovered = await recoverClosedChromeStorage(chrome, startUrl, {
+            origins: snapshot.observedOrigins,
+            originTrackingComplete: snapshot.originTrackingComplete ?? false,
+            writeState,
+        });
+        snapshot = mergeStorageSnapshots(snapshot, recovered);
         recoveryClosed = recovered.recoveryBrowserClosed !== false;
-        finalStateSaved = recovered.errors.length === 0 && Boolean(recovered.savedAt) && recoveryClosed;
+        finalStateSaved = recovered.recoveryComplete === true && snapshot.errors.length === 0 && Boolean(recovered.savedAt) && recoveryClosed;
     }
     snapshot.errors.push(...warnings);
     const browserClosed = originalClosed && recoveryClosed;
-    if (browserClosed && finalStateSaved && snapshot.errors.length === 0) cleanupTempProfile(chrome.tempProfile);
+    let profileRemoved = false;
+    if (browserClosed && finalStateSaved && snapshot.errors.length === 0) {
+        profileRemoved = cleanupTempProfile(chrome.tempProfile);
+        if (!profileRemoved) snapshot.errors.push("recovery: cleanup failed (original-profile-retained)");
+    }
     return {
         snapshot, timedOut, browserClosed,
-        recoveryProfile: browserClosed && finalStateSaved && snapshot.errors.length === 0 ? undefined : chrome.tempProfile,
+        recoveryProfile: profileRemoved ? undefined : chrome.tempProfile,
     };
 }
 

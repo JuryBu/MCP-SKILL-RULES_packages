@@ -61,7 +61,7 @@ async function readSaved() {
 }
 
 async function openOwned() {
-    const info = await humanBrowserManager.open({ startUrl: origin, ownerId, waitMs: 8000 });
+    const info = await humanBrowserManager.open({ startUrl: origin, ownerId, waitMs: 8000, headless: true });
     const session = humanBrowserManager.sessions.get(info.humanSessionId);
     let page;
     await eventually(() => {
@@ -70,8 +70,24 @@ async function openOwned() {
     }, 8000);
     assert.ok(page);
     assert.ok(session.chrome.tempProfile.startsWith(testRoot + path.sep));
+    assert.equal(session.tracker.summary().originTrackingComplete, true);
     return { session, page, info };
 }
+
+liveTest("managed origin events include a popup closed before the next sample", { timeout: 40_000 }, async () => {
+    const { session, page, info } = await openOwned();
+    const popupOrigin = origin.replace("127.0.0.1", "localhost");
+    await page.evaluate(() => localStorage.setItem("synthetic-root-popup-test", "root-value"));
+    const popup = await session.cdpBrowser.contexts()[0].newPage();
+    await popup.goto(popupOrigin);
+    await popup.evaluate(() => localStorage.setItem("synthetic-closed-popup-test", "popup-value"));
+    await popup.close();
+    assert.ok(session.tracker.summary().observedOrigins.includes(popupOrigin));
+    assert.equal(await humanBrowserManager.close(info.humanSessionId, ownerId), true);
+    const saved = await readSaved();
+    assert.equal(saved.localStorage[popupOrigin]["synthetic-closed-popup-test"], "popup-value");
+    assert.equal(await fs.access(session.chrome.tempProfile).then(() => true, () => false), false);
+});
 
 after(async () => {
     await humanBrowserManager.closeAll();

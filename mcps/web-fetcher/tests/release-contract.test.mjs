@@ -19,9 +19,9 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
     transport.stderr?.resume();
     try {
         await client.connect(transport);
-        assert.equal(client.getServerVersion()?.version, '7.3.0');
+        assert.equal(client.getServerVersion()?.version, '7.3.1');
         const hello = await client.readResource({ uri: 'web-fetcher://test/hello' });
-        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.0')));
+        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.1')));
         const listed = await client.listTools();
         assert.equal(listed.tools.length, 33);
         const byName = new Map(listed.tools.map(tool => [tool.name, tool]));

@@ -17,10 +17,16 @@ test("default login grants 600 real seconds and restores the final authenticated
     process.env.TMPDIR = root;
     const helper = await import("../src/chrome-helper.ts");
     const { createLoginSessionRunner } = await import("../src/login-session.ts");
+    let ownedLaunchedAt;
+    let ownedClosedAt;
     const runLoginBrowserSession = createLoginSessionRunner({ launch: async options => {
         const chrome = await helper.launchSystemChrome({ ...options, headless: true });
+        ownedLaunchedAt = Date.now();
         console.log(JSON.stringify({ event: "owned-chrome-launched", pid: chrome.process.pid, at: new Date().toISOString() }));
-        chrome.process.on("exit", (code, signal) => console.log(JSON.stringify({ event: "owned-chrome-exited", code, signal, at: new Date().toISOString() })));
+        chrome.process.on("exit", (code, signal) => {
+            ownedClosedAt = Date.now();
+            console.log(JSON.stringify({ event: "owned-chrome-exited", code, signal, at: new Date(ownedClosedAt).toISOString() }));
+        });
         return chrome;
     } });
     const { BrowserAuthState, installOriginStorage } = await import("../src/browser-auth-state.ts");
@@ -72,6 +78,7 @@ test("default login grants 600 real seconds and restores the final authenticated
         const elapsedMs = Date.now() - started;
         console.log(JSON.stringify({ event: "login-result", elapsedMs, monotonicElapsedMs: performance.now() - monotonicStarted, timedOut: result.timedOut, browserClosed: result.browserClosed, savedAt: result.snapshot.savedAt, errors: result.snapshot.errors }));
         assert.ok(elapsedMs >= 600000, `elapsed ${elapsedMs}`);
+        assert.ok(ownedClosedAt - ownedLaunchedAt >= 599900, "original browser itself must remain open for the complete manual-operation window");
         assert.ok(Date.now() - firstRequestAt >= 599000, "page must retain almost the full human window");
         assert.equal(writeFailure, undefined);
         assert.equal(result.timedOut, true);
