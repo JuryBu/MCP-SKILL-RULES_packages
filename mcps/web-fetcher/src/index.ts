@@ -364,11 +364,11 @@ async function main(): Promise<void> {
 }
 
 /**
- * 清理超过 1 小时的 MCP 临时目录
+ * 清理超过 1 小时的 MCP 视频临时目录
  */
 function cleanStaleTempDirs(): void {
     const tmpBase = os.tmpdir();
-    const prefixes = ["mcp-video-", "mcp-chrome-login-"];
+    const prefixes = ["mcp-video-"];
     const maxAge = 60 * 60 * 1000; // 1 小时
 
     try {

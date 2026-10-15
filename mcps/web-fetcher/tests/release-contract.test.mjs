@@ -8,6 +8,17 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 
 test('real server advertises additive 7.3 tool and resource contracts', { timeout: 45000 }, async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'web-fetcher-contract-'));
+    const retainedProfile = path.join(root, 'mcp-chrome-login-retained-fixture');
+    const staleVideo = path.join(root, 'mcp-video-stale-fixture');
+    const recentVideo = path.join(root, 'mcp-video-recent-fixture');
+    const unrelatedDirectory = path.join(root, 'unrelated-retained-fixture');
+    const marker = 'synthetic recovery evidence';
+    const aged = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    for (const directory of [retainedProfile, staleVideo, recentVideo, unrelatedDirectory]) {
+        await fs.mkdir(directory);
+        await fs.writeFile(path.join(directory, 'sentinel.txt'), marker);
+        if (directory !== recentVideo) await fs.utimes(directory, aged, aged);
+    }
     const client = new Client({ name: 'host-neutral-contract-test', version: '1' });
     const transport = new StdioClientTransport({
         command: process.execPath,
@@ -19,6 +30,10 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
     transport.stderr?.resume();
     try {
         await client.connect(transport);
+        assert.equal(await fs.readFile(path.join(retainedProfile, 'sentinel.txt'), 'utf8'), marker);
+        assert.equal(await fs.readFile(path.join(recentVideo, 'sentinel.txt'), 'utf8'), marker);
+        assert.equal(await fs.readFile(path.join(unrelatedDirectory, 'sentinel.txt'), 'utf8'), marker);
+        await assert.rejects(fs.stat(staleVideo), { code: 'ENOENT' });
         assert.equal(client.getServerVersion()?.version, '7.3.1');
         const hello = await client.readResource({ uri: 'web-fetcher://test/hello' });
         assert.ok(hello.contents.some(item => item.text?.includes('v7.3.1')));
