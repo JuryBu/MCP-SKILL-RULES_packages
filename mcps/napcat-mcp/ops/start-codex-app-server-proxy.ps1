@@ -37,6 +37,53 @@ $MaintenanceFilePath = Join-Path $StateRoot "task-router.maintenance.json"
 $AlertFilePath = Join-Path $StateRoot "automation-alert.json"
 $FallbackFilePath = Join-Path $StateRoot "codex-app-server-proxy-fallback.json"
 
+$DiagnosticRoot = Join-Path $StateRoot 'startup-diagnostics'
+$AttemptId = [guid]::NewGuid().ToString()
+$AttemptPath = Join-Path $DiagnosticRoot ($AttemptId + '.json')
+$RunnerStdoutPath = Join-Path $DiagnosticRoot ($AttemptId + '.stdout.log')
+$RunnerStderrPath = Join-Path $DiagnosticRoot ($AttemptId + '.stderr.log')
+$RecoveryOutputPath = Join-Path $DiagnosticRoot ($AttemptId + '.recovery.log')
+$StartupClock = [Diagnostics.Stopwatch]::StartNew()
+$StartupDiagnostic = [ordered]@{ schemaVersion = 1; attemptId = $AttemptId; startedAt = [DateTimeOffset]::UtcNow.ToString('o'); launcherPid = $PID; runnerPid = $null; stage = 'configuration'; status = 'running'; elapsedMs = 0; error = $null; stdoutPath = $RunnerStdoutPath; stderrPath = $RunnerStderrPath; recoveryOutputPath = $RecoveryOutputPath; events = @() }
+
+function Write-StartupDiagnostic {
+  param([string]$Stage, [string]$Status = 'running', [string]$Message = '')
+  if ($StartupRecoveryMode -eq 'Plan') { return }
+  try {
+    New-Item -ItemType Directory -Force -Path $DiagnosticRoot | Out-Null
+    $StartupDiagnostic.stage = $Stage
+    $StartupDiagnostic.status = $Status
+    $StartupDiagnostic.elapsedMs = $StartupClock.ElapsedMilliseconds
+    if ($Message) { $StartupDiagnostic.error = $Message.Substring(0, [Math]::Min(4096, $Message.Length)) }
+    $StartupDiagnostic.events = @($StartupDiagnostic.events | Select-Object -Last 15) + @([ordered]@{ at = [DateTimeOffset]::UtcNow.ToString('o'); stage = $Stage; status = $Status; elapsedMs = $StartupClock.ElapsedMilliseconds })
+    [IO.File]::WriteAllText($AttemptPath, ($StartupDiagnostic | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+  } catch {
+    Write-Warning ('Startup diagnostic could not be saved: ' + $_.Exception.Message)
+  }
+}
+
+function Remove-OldStartupDiagnostics {
+  try {
+  if ($StartupRecoveryMode -eq 'Plan' -or -not (Test-Path -LiteralPath $DiagnosticRoot)) { return }
+  foreach ($Old in @(Get-ChildItem -LiteralPath $DiagnosticRoot -Filter '*.json' -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 32)) {
+    if ($Old.BaseName -cnotmatch '^[a-f0-9-]{36}$' -or $Old.FullName -eq $AttemptPath) { continue }
+    try {
+      $Previous = Get-Content -LiteralPath $Old.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+      if ($Previous.schemaVersion -ne 1 -or $Previous.attemptId -cne $Old.BaseName) { continue }
+      if ($Previous.runnerPid -and (Get-Process -Id $Previous.runnerPid -ErrorAction SilentlyContinue)) { continue }
+      if ($Previous.status -eq 'running' -and (Get-Process -Id $Previous.launcherPid -ErrorAction SilentlyContinue)) { continue }
+      foreach ($Suffix in @('.stdout.log', '.stderr.log', '.recovery.log', '.json')) {
+        $OldPath = Join-Path $DiagnosticRoot ($Old.BaseName + $Suffix)
+        if (Test-Path -LiteralPath $OldPath -PathType Leaf) { [IO.File]::Delete($OldPath) }
+      }
+    } catch {}
+  }
+  } catch { Write-Warning ('Old startup diagnostics could not be rotated: ' + $_.Exception.Message) }
+}
+
+Write-StartupDiagnostic -Stage 'configuration'
+Remove-OldStartupDiagnostics
+try {
 . (Join-Path $PSScriptRoot "resolve-codex-outer-runtime-startup.ps1")
 $OuterRuntimeStartup = Resolve-CodexOuterRuntimeStartup -DataRoot $DataRoot
 if (-not [string]::IsNullOrWhiteSpace($CodexExecutablePath)) {
@@ -128,6 +175,7 @@ function Get-OuterRuntimeStartupStatus {
 }
 
 if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePath)) {
+  Write-StartupDiagnostic -Stage 'existing_runtime'
   $ExistingState = $null
   $ExistingProcess = $null
   try {
@@ -148,6 +196,8 @@ if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePa
           -not (Test-ExpectedProxyIdentity -RuntimeState $ExistingState -ProcessInfo $ExistingProcess)) { throw 'EXISTING_PROXY_CHANGED_PRESERVED' }
     }
     if (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
+      $StartupDiagnostic.observedRunnerPid = [int]$ExistingState.pid
+      Write-StartupDiagnostic -Stage 'existing_runtime' -Status 'ready'
       [pscustomobject]@{
         started = $false
         reason = "already_running"
@@ -196,14 +246,28 @@ function Resolve-NodeExecutable {
 $NodePath = Resolve-NodeExecutable
 
 if ($OuterRuntimeStartup.innerManagedProfilePath -and ($StartupRecoveryMode -eq 'Plan' -or (Test-Path -LiteralPath $LockPath))) {
+  Write-StartupDiagnostic -Stage 'recovery'
   if ($StartupRecoveryMode -eq 'Reject') { throw 'INNER_PROFILE_EXISTING_LEASE' }
   $RecoveryMode = if ($StartupRecoveryMode -eq 'Plan') { 'Plan' } else { 'Apply' }
-  $RecoveryOutput = & $NodePath (Join-Path $PSScriptRoot 'recover-inner-startup.mjs') $RecoveryMode $DataRoot $OuterRuntimeStartup.configurationPath $OuterRuntimeStartup.innerManagedProfilePath $OuterRuntimeStartup.innerManagedProfileSha256 $DownstreamPort $ControlPort $UpstreamPort $ProbePort
-  if ($LASTEXITCODE -ne 0) { throw 'INNER_STARTUP_RECOVERY_REFUSED' }
+  $RecoveryErrorPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = 'Continue'
+    $RecoveryOutput = @(& $NodePath (Join-Path $PSScriptRoot 'recover-inner-startup.mjs') $RecoveryMode $DataRoot $OuterRuntimeStartup.configurationPath $OuterRuntimeStartup.innerManagedProfilePath $OuterRuntimeStartup.innerManagedProfileSha256 $DownstreamPort $ControlPort $UpstreamPort $ProbePort 2>&1)
+    $RecoveryExitCode = $LASTEXITCODE
+  } finally { $ErrorActionPreference = $RecoveryErrorPreference }
+  if ($StartupRecoveryMode -ne 'Plan') {
+    try { [IO.File]::WriteAllText($RecoveryOutputPath, (($RecoveryOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine), [Text.UTF8Encoding]::new($false)) }
+    catch { Write-Warning ('Startup recovery output could not be saved: ' + $_.Exception.Message) }
+  }
+  if ($RecoveryExitCode -ne 0) {
+    if ($StartupRecoveryMode -eq 'Plan') { throw ('INNER_STARTUP_RECOVERY_REFUSED: ' + (($RecoveryOutput | ForEach-Object { [string]$_ }) -join [Environment]::NewLine)) }
+    throw 'INNER_STARTUP_RECOVERY_REFUSED'
+  }
   if ($StartupRecoveryMode -eq 'Plan') { $RecoveryOutput; return }
 }
 if ($StartupRecoveryMode -eq 'Plan') { throw 'INNER_STARTUP_RECOVERY_PROFILE_REQUIRED' }
 
+Write-StartupDiagnostic -Stage 'ports'
 function Test-LoopbackPortAvailable {
   param([int]$Port)
   $Listener = $null
@@ -291,9 +355,18 @@ if ($ExpectedInstanceToken -or $LaunchReceiptPath) {
   $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 }
 if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
-$Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru
+Write-StartupDiagnostic -Stage 'runner_launch'
+$RedirectOutput = @{}
+try {
+  [IO.File]::WriteAllText($RunnerStdoutPath, '', [Text.UTF8Encoding]::new($false))
+  [IO.File]::WriteAllText($RunnerStderrPath, '', [Text.UTF8Encoding]::new($false))
+  $RedirectOutput = @{ RedirectStandardOutput = $RunnerStdoutPath; RedirectStandardError = $RunnerStderrPath }
+} catch { Write-Warning ('Startup process output could not be captured: ' + $_.Exception.Message) }
+$Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru @RedirectOutput
+$PinnedHandle = $Process.Handle
+$StartupDiagnostic.runnerPid = $Process.Id
+Write-StartupDiagnostic -Stage 'runner_wait'
 if ($LaunchReceiptPath) {
-  $PinnedHandle = $Process.Handle
   $Launch = [ordered]@{ schemaVersion = 1; instanceToken = $ExpectedInstanceToken; pid = $Process.Id; createdAt = $Process.StartTime.ToUniversalTime().ToString('o'); nodePath = $NodePath; nodeSha256 = (Get-FileHash -LiteralPath $NodePath -Algorithm SHA256).Hash.ToLowerInvariant(); runnerPath = $RunnerPath; runnerSha256 = (Get-FileHash -LiteralPath $RunnerPath -Algorithm SHA256).Hash.ToLowerInvariant(); entrySha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(); runtimeStatePath = $RuntimeStatePath; commandLine = $ArgumentLine; ports = @($DownstreamPort, $ControlPort, $UpstreamPort, $ProbePort); recordedAt = [DateTimeOffset]::UtcNow.ToString('o') }
   $ReceiptStream = [IO.File]::Open($LaunchReceiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
   try { $ReceiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Launch | ConvertTo-Json -Depth 8 -Compress)); $ReceiptStream.Write($ReceiptBytes, 0, $ReceiptBytes.Length); $ReceiptStream.Flush($true) } finally { $ReceiptStream.Dispose() }
@@ -331,6 +404,7 @@ do {
 } while ([DateTime]::UtcNow -lt $Deadline)
 
 if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become ready within $StartupTimeoutSeconds seconds; runtime: $RuntimeStatePath" }
+Write-StartupDiagnostic -Stage 'ready' -Status 'ready'
 [pscustomobject]@{
   started = $true
   pid = [int]$RuntimeState.pid
@@ -342,3 +416,7 @@ if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become read
   fallbackRequired = [bool]$RuntimeState.fallbackRequired
   outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $RuntimeState -ProcessInfo $RuntimeProcess -AppliedByThisStart $true
 } | ConvertTo-Json -Depth 12
+} catch {
+  Write-StartupDiagnostic -Stage $StartupDiagnostic.stage -Status 'failed' -Message $_.Exception.Message
+  throw
+}

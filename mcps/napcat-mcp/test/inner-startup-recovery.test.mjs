@@ -70,6 +70,8 @@ function exerciseExistingLoop(state, { readyAfter = 1 } = {}) {
     $DownstreamPort=40001;
     $ControlPort=40002;
     $script:FixtureSleeps=0;
+    $StartupDiagnostic=@{};
+    function Write-StartupDiagnostic { param($Stage,$Status,$Message) }
     ${existingRuntimeChecks}
     function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
       [pscustomobject]@{CommandLine=('codex-app-server-proxy-runner.mjs ' + $RuntimeStatePath + ' ' + $LockPath)} }
@@ -81,7 +83,7 @@ function exerciseExistingLoop(state, { readyAfter = 1 } = {}) {
       Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds }
     function Get-OuterRuntimeStartupStatus { param($RuntimeState,$ProcessInfo,$AppliedByThisStart) return $null }
     try { $Observed=& { ${existingStartup} };
-      [pscustomobject]@{runtime=($Observed | ConvertFrom-Json);sleeps=$script:FixtureSleeps} | ConvertTo-Json -Depth 15 }
+      [pscustomobject]@{runtime=($Observed | ConvertFrom-Json);sleeps=$script:FixtureSleeps;diagnostic=$StartupDiagnostic} | ConvertTo-Json -Depth 15 }
     catch { [pscustomobject]@{error=$_.Exception.Message;sleeps=$script:FixtureSleeps} | ConvertTo-Json }`;
   try {
     const result = execute(script, { STARTUP_TEST_RUNTIME: runtimePath, STARTUP_TEST_LOCK: lockPath });
@@ -100,6 +102,8 @@ test("an existing waiting-for-desktop proxy waits for its ports before reuse", w
   assert.equal(observed.runtime.started, false);
   assert.equal(observed.runtime.reason, "already_running");
   assert.equal(observed.runtime.state, "waiting_for_desktop");
+  assert.equal(observed.diagnostic.observedRunnerPid, 54321);
+  assert.equal(observed.diagnostic.runnerPid, undefined);
   assert.equal(observed.sleeps, 1);
 });
 
