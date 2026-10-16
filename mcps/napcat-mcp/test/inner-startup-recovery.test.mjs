@@ -17,6 +17,8 @@ const windowsOnly = { skip: process.platform !== "win32" };
 const source = fs.readFileSync(entry, "utf8");
 const loop = /\$RuntimeState = \$null\r?\n\$Deadline = [\s\S]+?\} while \(\[DateTime\]::UtcNow -lt \$Deadline\)/u.exec(source)?.[0];
 const exitCheck = 'if ($Process.HasExited -and $null -eq $RuntimeState) { throw "Codex App Server proxy exited immediately, exitCode=$($Process.ExitCode)" }';
+const existingRuntimeChecks = /function Test-ExpectedProxyIdentity \{[\s\S]+?(?=function Get-OuterRuntimeStartupStatus \{)/u.exec(source)?.[0];
+const existingStartup = /if \(\$StartupRecoveryMode -ne 'Plan' -and \(Test-Path -LiteralPath \$RuntimeStatePath\)\) \{[\s\S]+?\r?\n\}\r?\n/u.exec(source)?.[0];
 
 function execute(script, environment = {}, timeout = 10000) {
   return spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
@@ -48,6 +50,70 @@ function exerciseLoop(state, { exited = true, legacy = false } = {}) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+function exerciseExistingLoop(state, { readyAfter = 1 } = {}) {
+  assert.ok(existingRuntimeChecks, "original entry identity and runtime checks are available");
+  assert.ok(existingStartup, "original entry existing-instance readiness loop is available");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-existing-loop-"));
+  const runtimePath = path.join(root, "runtime.json");
+  const lockPath = path.join(root, "proxy.lock");
+  const fixtureState = { pid: 54321, instanceToken: randomUUID(), waitingForDesktop: true, appServerPid: null, ...state };
+  fs.writeFileSync(runtimePath, JSON.stringify(fixtureState));
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: fixtureState.pid, token: fixtureState.instanceToken }));
+  const originalState = fs.readFileSync(runtimePath);
+  const originalLock = fs.readFileSync(lockPath);
+  const script = `$ErrorActionPreference='Stop';
+    $RuntimeStatePath=$env:STARTUP_TEST_RUNTIME;
+    $LockPath=$env:STARTUP_TEST_LOCK;
+    $StartupRecoveryMode='Auto';
+    $StartupTimeoutSeconds=0.25;
+    $DownstreamPort=40001;
+    $ControlPort=40002;
+    $script:FixtureSleeps=0;
+    ${existingRuntimeChecks}
+    function Get-CimInstance { param($ClassName,$Filter,$ErrorAction)
+      [pscustomobject]@{CommandLine=('codex-app-server-proxy-runner.mjs ' + $RuntimeStatePath + ' ' + $LockPath)} }
+    function Get-NetTCPConnection { param($State,$LocalPort,$ErrorAction)
+      if (${readyAfter} -ge 0 -and $script:FixtureSleeps -ge ${readyAfter}) {
+        [pscustomobject]@{LocalAddress='127.0.0.1';OwningProcess=54321} } }
+    function Start-Sleep { param($Milliseconds)
+      $script:FixtureSleeps++;
+      Microsoft.PowerShell.Utility\\Start-Sleep -Milliseconds $Milliseconds }
+    function Get-OuterRuntimeStartupStatus { param($RuntimeState,$ProcessInfo,$AppliedByThisStart) return $null }
+    try { $Observed=& { ${existingStartup} };
+      [pscustomobject]@{runtime=($Observed | ConvertFrom-Json);sleeps=$script:FixtureSleeps} | ConvertTo-Json -Depth 15 }
+    catch { [pscustomobject]@{error=$_.Exception.Message;sleeps=$script:FixtureSleeps} | ConvertTo-Json }`;
+  try {
+    const result = execute(script, { STARTUP_TEST_RUNTIME: runtimePath, STARTUP_TEST_LOCK: lockPath });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(fs.readFileSync(runtimePath), originalState);
+    assert.deepEqual(fs.readFileSync(lockPath), originalLock);
+    return JSON.parse(result.stdout);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+test("an existing waiting-for-desktop proxy waits for its ports before reuse", windowsOnly, () => {
+  const observed = exerciseExistingLoop({ state: "waiting_for_desktop" });
+  assert.equal(observed.error, undefined);
+  assert.equal(observed.runtime.started, false);
+  assert.equal(observed.runtime.reason, "already_running");
+  assert.equal(observed.runtime.state, "waiting_for_desktop");
+  assert.equal(observed.sleeps, 1);
+});
+
+test("an existing waiting-for-desktop proxy retains its bounded startup timeout", windowsOnly, () => {
+  const observed = exerciseExistingLoop({ state: "waiting_for_desktop" }, { readyAfter: -1 });
+  assert.equal(observed.error, "EXISTING_PROXY_STARTUP_TIMEOUT_PRESERVED");
+  assert.ok(observed.sleeps > 0);
+});
+
+test("an existing proxy in an unknown state is rejected without waiting", windowsOnly, () => {
+  const observed = exerciseExistingLoop({ state: "unknown" });
+  assert.equal(observed.error, "EXISTING_PROXY_NOT_READY_PRESERVED");
+  assert.equal(observed.sleeps, 0);
+});
 
 test("legacy PID-mismatch continue reproduces the false timeout", windowsOnly, () => {
   assert.equal(exerciseLoop({ pid: 11111, state: "running" }, { legacy: true }), "TIMED_OUT");

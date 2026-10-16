@@ -139,7 +139,7 @@ if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePa
     $ExistingToken = [string]$ExistingState.instanceToken
     $ExistingDeadline = [DateTime]::UtcNow.AddSeconds($StartupTimeoutSeconds)
     while (-not (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess)) {
-      if ([string]$ExistingState.state -notin @('starting', 'restarting', 'running')) { throw 'EXISTING_PROXY_NOT_READY_PRESERVED' }
+      if ([string]$ExistingState.state -notin @('starting', 'restarting', 'running', 'waiting_for_desktop')) { throw 'EXISTING_PROXY_NOT_READY_PRESERVED' }
       if ([DateTime]::UtcNow -ge $ExistingDeadline) { throw 'EXISTING_PROXY_STARTUP_TIMEOUT_PRESERVED' }
       Start-Sleep -Milliseconds 200
       $ExistingState = Get-Content -LiteralPath $RuntimeStatePath -Raw -Encoding UTF8 | ConvertFrom-Json
