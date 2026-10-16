@@ -63,11 +63,13 @@ export function createCodexFetchWorkerPayload(input: {
     source: CodexFetchWorkerPayload["source"];
     estimate: CodexFetchWorkEstimate;
     modelChain: Chain;
+    forceRawCacheRebuild?: boolean;
     now?: number;
 }): CodexFetchWorkerPayload {
     return {
         version: input.estimate.verificationDeferred ? 2 : 1,
         ...(input.estimate.verificationDeferred ? { verificationDeferred: true } : {}),
+        ...(input.forceRawCacheRebuild === true ? { forceRawCacheRebuild: true } : {}),
         conversationId: input.conversationId,
         link: input.link,
         source: input.source,

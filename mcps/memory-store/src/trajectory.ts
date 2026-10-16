@@ -470,8 +470,25 @@ export function normalizeConversationAutomationRound(round: ConversationRound): 
  */
 export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], startRound = 1): ConversationRound[] {
     const merged: ConversationRound[] = [];
+    const merger = createConsecutiveHumanRoundMerger(round => merged.push(round), startRound);
+    for (const round of sourceRounds) merger.append(round);
+    merger.finish();
+    return merged;
+}
+
+export function createConsecutiveHumanRoundMerger(onRound: (round: ConversationRound) => void, startRound = 1): {
+    append(round: ConversationRound): void;
+    finish(): void;
+} {
+    let pending: ConversationRound | null = null;
     let leadingNonHuman: ConversationRound | null = null;
-    for (const rawSource of sourceRounds) {
+    let nextRound = startRound;
+    const flush = (): void => {
+        if (!pending) return;
+        onRound({ ...pending, roundIndex: nextRound++ });
+        pending = null;
+    };
+    const append = (rawSource: ConversationRound): void => {
         const source = normalizeConversationAutomationRound(rawSource);
         const next: ConversationRound = {
             ...source,
@@ -489,24 +506,23 @@ export function mergeConsecutiveHumanRounds(sourceRounds: ConversationRound[], s
         };
         const nextMessages = getRoundUserMessages(next);
         if (nextMessages.length === 0) {
-            const previous = merged[merged.length - 1];
-            if (previous) mergeRoundData(previous, next);
+            if (pending) mergeRoundData(pending, next);
             else if (leadingNonHuman) mergeRoundData(leadingNonHuman, next);
             else leadingNonHuman = next;
-            continue;
+            return;
         }
         if (leadingNonHuman) {
             mergeRoundData(next, leadingNonHuman, true);
             leadingNonHuman = null;
         }
-        const previous = merged[merged.length - 1];
-        if (previous && !hasModelSideActivity(previous)) {
-            mergeRoundData(previous, next);
-            continue;
+        if (pending && !hasModelSideActivity(pending)) {
+            mergeRoundData(pending, next);
+            return;
         }
-        merged.push(next);
-    }
-    return merged.map((round, index) => ({ ...round, roundIndex: startRound + index }));
+        flush();
+        pending = next;
+    };
+    return { append, finish: flush };
 }
 
 // ===== 格式化输出 =====

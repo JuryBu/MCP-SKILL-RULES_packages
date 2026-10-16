@@ -17,6 +17,7 @@ import { shouldAutoUpdateRecordAsync } from "../record-generator.js";
 import { readRecordAsync, resolveWorkspaceHashForRecord, findRecordHashAsync } from "../record-store.js";
 import {
     loadConversationData,
+    getConversationRoundIndexBounds,
     describeConversationCacheReadFailure,
     resolveConversationChain,
     type ConversationLoadResult,
@@ -1515,14 +1516,18 @@ function loadConversationRoundWindow(
     startRound: number,
     endRound: number,
 ): { rounds: ConversationRound[]; endRound: number; hasMore: boolean } {
-    const totalRoundCount = loaded.roundCount ?? loaded.rounds.length;
+    const totalRoundCount = getConversationRoundIndexBounds(loaded).last;
     const boundedEnd = Math.min(endRound, totalRoundCount);
     const source = iterateConversationSearchRounds(loaded, { startRound, endRound: boundedEnd });
     const rounds: ConversationRound[] = [];
     let estimatedChars = 0;
+    let hasMore = false;
     for (const round of source) {
         const roundChars = JSON.stringify(round).length;
-        if (rounds.length > 0 && estimatedChars + roundChars > CONVERSATION_READ_WINDOW_MAX_CHARS) break;
+        if (rounds.length > 0 && estimatedChars + roundChars > CONVERSATION_READ_WINDOW_MAX_CHARS) {
+            hasMore = true;
+            break;
+        }
         rounds.push(round);
         estimatedChars += roundChars;
     }
@@ -1530,7 +1535,7 @@ function loadConversationRoundWindow(
     return {
         rounds,
         endRound: loadedEndRound,
-        hasMore: loadedEndRound < boundedEnd,
+        hasMore,
     };
 }
 
@@ -1953,6 +1958,8 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 .describe("[read] 上一段返回的续读光标；来源或参数变化时会拒绝，避免重复或串读"),
             cacheGeneration: z.string().min(1).optional()
                 .describe("[search/read] 固定已发布缓存的同一 generation；可用 search 返回值继续 read，旧代缺失时报恢复建议"),
+            forceRefresh: z.boolean().optional()
+                .describe("[fetch] true=仅本次显式全量重建原文缓存，修复旧检查点映射；可能耗时较长，旧generation及pin保留。默认继续正常增量，不与source=cache/ls或cacheGeneration合用"),
             exportFormat: z.enum(["markdown", "pdf", "both"]).optional()
                 .describe("[export] 导出格式，markdown=只导出 Markdown，pdf=Markdown+PDF 且以 PDF 为目标，both=两者都生成"),
             exportScope: z.enum(["full", "rounds", "search"]).optional()
@@ -2025,6 +2032,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     recallMode = "auto",
                     continuationCursor,
                     cacheGeneration,
+                    forceRefresh,
                     exportFormat,
                     exportScope,
                     outputDir,
@@ -2065,6 +2073,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 const limit = action === "search" ? resolveConversationSearchLimit(requestedLimit, maxHits) : requestedLimit ?? 8;
                 const contextRounds = requestedContextRounds ?? (action === "search" ? 0 : action === "read" ? 1 : 2);
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
+                if (forceRefresh === true && (action !== "fetch" || source === "cache" || source === "ls" || cacheGeneration || continuationCursor)) {
+                    throw new Error("forceRefresh=true 仅支持 action=fetch 且 source=auto/local；请移除cacheGeneration和continuationCursor，旧generation仍可单独只读");
+                }
                 const searchFilter: ConversationSearchFilter = { startRound, endRound, messageRoles: messageRoles as ConversationMessageRole[] | undefined };
                 if (action === "search" || action === "read") validateConversationSearchFilter(searchFilter);
                 const cacheRequest = { source, sourceExplicit, link, cacheGeneration, logicalChain: logicalChain as ConversationLogicalChainMode | undefined };
@@ -2741,6 +2752,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             source: source as CodexFetchWorkerPayload["source"],
                             estimate,
                             modelChain: chains.modelChain,
+                            forceRawCacheRebuild: forceRefresh === true,
                         });
                         const stableTaskId = selectCodexFetchTaskId(payload);
                         const task = startBackgroundTask(
@@ -2777,6 +2789,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
                 const loadOptions: Parameters<typeof loadConversationData>[2] = {
                     refresh: action === "fetch" || action === "recall",
+                    forceRawCacheRebuild: forceRefresh === true,
                     link,
                     dataChains: dataChains as DataChain[] | undefined,
                     idResolutionMode: idResolutionMode as IdResolutionMode,
@@ -3029,7 +3042,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         ? searchLoadedConversationExact(loaded, query, limit, searchFilter)
                         : [];
                     const searchHeader = [formatConversationSearchHeader(cascadeId, loaded), cacheReadDetail,
-                        `🎯 搜索范围: ${startRound ?? 1}-${endRound ?? loaded.roundCount ?? "end"} | 角色: ${messageRoles?.join(", ") || "all"}`].join("\n");
+                        `🎯 搜索范围: ${startRound ?? 1}-${endRound ?? getConversationRoundIndexBounds(loaded).last} | 角色: ${messageRoles?.join(", ") || "all"}`].join("\n");
                     if (matches.length === 0 && mode === "exact") {
                         return appendTiming({
                             content: [{ type: "text" as const, text: `${searchHeader}\n🔍 搜索 "${query}" — exact 模式未找到匹配` }],
@@ -3071,7 +3084,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         output.push("");
                     }
                     if (contextRounds > 0) {
-                        const totalRoundCount = loaded.roundCount ?? rounds.at(-1)?.roundIndex ?? rounds.length;
+                        const totalRoundCount = getConversationRoundIndexBounds(loaded).last;
                         const contextIndices = conversationSearchContextIndices(matchedRoundIndices.map(roundIndex => ({ roundIndex })), totalRoundCount, contextRounds, searchFilter);
                         const selectedRounds = loadConversationRoundsByIndex(loaded, contextIndices);
                         const { rounds: displayRounds, truncated } = await measureConversationReadSegment(searchTiming, "附件物化",
@@ -3101,7 +3114,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 // === read 模式 ===
                 if (action === "read") {
                     const readTiming = createConversationReadTimingState("read");
-                    const totalRoundCount = loaded.roundCount ?? rounds.length;
+                    const totalRoundCount = getConversationRoundIndexBounds(loaded).last;
                     const start = startRound || 1;
                     const end = endRound || totalRoundCount;
                     const incompleteWindsurfWarning = formatWindsurfIncompleteReadWarning(loaded);
@@ -3120,7 +3133,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
                     if (start > totalRoundCount) {
                         return appendTiming({
-                            content: [{ type: "text" as const, text: `${cacheReadDetail}\n❌ startRound ${start} 超出范围（共 ${totalRoundCount} 轮）` }],
+                            content: [{ type: "text" as const, text: `${cacheReadDetail}\n❌ startRound ${start} 超出轮号范围（轮号上限 ${totalRoundCount}，共 ${loaded.roundCount ?? rounds.length} 条）` }],
                         }, startTime);
                     }
                     const roundWindow = loadConversationRoundWindow(loaded, start, end);

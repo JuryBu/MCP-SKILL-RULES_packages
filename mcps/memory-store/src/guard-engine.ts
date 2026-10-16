@@ -9,6 +9,8 @@ import {
     buildGuardEvidenceIndexes,
     type GuardEvidenceAssetInput,
     type GuardEvidenceIndexMode,
+    type GuardEvidenceCoverage,
+    type GuardEvidenceIndexResult,
 } from "./guard-evidence-index.js";
 import type { GuardState } from "./guard-store.js";
 import { callModelResponse, resolveModelChainCandidates } from "./model-bridge.js";
@@ -17,6 +19,7 @@ import { assertConversationConsumerSourceComplete } from "./devin-source-evidenc
 import { iterateCachedConversationSourceCacheRounds } from "./conversation-source-cache.js";
 import type { Chain, DataChain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
+import { hasCodexModelRefusalClaim, type CodexBridgeDiagnostics, type CodexDiagnosticContext } from "./codex-bridge-diagnostics.js";
 
 /**
  * Stage Guard 比对引擎
@@ -92,6 +95,10 @@ export interface GuardCheckResult {
     modelChainUsed?: Chain | null;
     modelUsed?: string | null;
     promptBudget?: GuardPromptBudgetUsage;
+    coverage?: GuardCoverage;
+    codexDiagnostics?: CodexBridgeDiagnostics;
+    codexDiagnosticAttempts?: CodexBridgeDiagnostics[];
+    safetyStopped?: boolean;
 }
 
 export interface GuardPromptSectionUsage {
@@ -99,7 +106,10 @@ export interface GuardPromptSectionUsage {
     sourceChars: number;
     includedChars: number;
     compressedChars: number;
+    availableChars?: number;
+    preCompressedChars?: number;
     compressionReason?: string;
+    requiredEvidenceIncomplete?: boolean;
 }
 
 export interface GuardPromptBudgetUsage {
@@ -119,6 +129,14 @@ export interface GuardPromptInput {
     coverageText: string;
     evidenceText: string;
     evidenceIndexText: string;
+    evidenceIndexSourceChars?: number;
+    executionRecordSourceChars?: number;
+    evidenceTextSourceChars?: number;
+    requiredExternalBlocks?: string[];
+    executionEvidenceRole?: "required" | "reference";
+    finalCoverageNotice?: string;
+    coverageState?: Pick<GuardCoverage, "confidence" | "truncationRisk" | "requiredGaps">;
+    hasRequiredExternalAssets?: boolean;
     stageId?: string;
     scopeSelectors?: string[];
     appealNote?: string;
@@ -164,15 +182,34 @@ interface GuardInputBundle {
     planContent: string;
     taskContent: string;
     coverageText: string;
-    coverage: {
-        confidence: "high" | "medium" | "low";
-        truncationRisk: "none" | "low" | "medium" | "high";
-        sources: GuardSourceCoverage[];
-        coverageGaps: string[];
-    };
+    coverage: GuardCoverage;
     evidenceText: string;
     evidenceManifest: GuardEvidenceManifest;
     evidenceSourceText: string;
+    locatorResponse?: FlashCallResult;
+}
+
+export interface GuardExecutionEvidence {
+    text: string;
+    startRound: number;
+    firstIncludedRound?: number;
+    lastIncludedRound?: number;
+    includedRounds: number;
+    sourceChars: number;
+    includedChars: number;
+    sourceCharsKnown: boolean;
+    coverageGaps: string[];
+    role?: "required" | "reference";
+}
+
+export interface GuardCoverage {
+    confidence: "high" | "medium" | "low";
+    truncationRisk: "none" | "low" | "medium" | "high";
+    sources: GuardSourceCoverage[];
+    coverageGaps: string[];
+    requiredGaps?: string[];
+    externalEvidence?: GuardEvidenceCoverage;
+    executionEvidence?: Omit<GuardExecutionEvidence, "text">;
 }
 
 export interface GuardLocatorSuggestion {
@@ -195,6 +232,12 @@ interface FlashCallResult {
     chainUsed?: Chain | null;
     modelUsed?: string | null;
     promptBudget?: GuardPromptBudgetUsage;
+    codexDiagnostics?: CodexBridgeDiagnostics;
+    safetyStopped?: boolean;
+    codexDiagnosticAttempts?: CodexBridgeDiagnostics[];
+    failureClass?: string;
+    timedOut?: boolean;
+    cancelled?: boolean;
 }
 
 export function isGuardInfrastructureError(result: GuardCheckResult): boolean {
@@ -211,13 +254,18 @@ function shouldAbortGuardRun(
     return Boolean(options.isCancelled?.() || options.isSettled?.());
 }
 
-function createAbortedGuardResult(cancelled: boolean): GuardCheckResult {
+function createAbortedGuardResult(cancelled: boolean, response?: FlashCallResult): GuardCheckResult {
     return {
         passed: false,
         summary: cancelled ? "后台 Guard 检查已取消" : "后台 Guard 检查已结束，已跳过后续写回",
         missingItems: [],
         rawResponse: "",
         cancelled: true,
+        codexDiagnostics: response?.codexDiagnostics,
+        codexDiagnosticAttempts: response?.codexDiagnosticAttempts,
+        modelChainUsed: response?.chainUsed,
+        modelUsed: response?.modelUsed,
+        promptBudget: response?.promptBudget,
     };
 }
 
@@ -231,6 +279,8 @@ async function callFlashWithChain(
         dataChain?: DataChain;
         isCancelled?: () => boolean;
         isSettled?: () => boolean;
+        diagnosticContext?: CodexDiagnosticContext;
+        onCodexDiagnostics?: (diagnostics: CodexBridgeDiagnostics) => void;
     } = {},
 ): Promise<FlashCallResult> {
     const isCodexOnly = modelChain === "codex";
@@ -246,6 +296,7 @@ async function callFlashWithChain(
         grokContext: "guard" as const,
         shouldCancel: () => Boolean(options.isCancelled?.() || options.isSettled?.()),
         signal: AbortSignal.timeout(timeoutMs),
+        diagnosticContext: options.diagnosticContext,
     };
     const candidates = await resolveModelChainCandidates(modelChain || "auto", bridgeOptions);
     if (bridgeOptions.signal.aborted || shouldAbortGuardRun(options)) {
@@ -260,10 +311,11 @@ async function callFlashWithChain(
     }
 
     const errors: string[] = [];
+    const diagnosticAttempts: CodexBridgeDiagnostics[] = [];
     let lastRender: GuardPromptRender | undefined;
     for (const candidate of candidates) {
         if (shouldAbortGuardRun(options)) {
-            return { text: null, error: "Guard 模型调用已取消", promptBudget: lastRender?.budget };
+            return { text: null, error: "Guard 模型调用已取消", promptBudget: lastRender?.budget, codexDiagnostics: diagnosticAttempts.at(-1), codexDiagnosticAttempts: [...diagnosticAttempts] };
         }
         let rendered: GuardPromptRender;
         try {
@@ -274,14 +326,19 @@ async function callFlashWithChain(
                 error: error instanceof Error ? error.message : String(error),
                 infrastructureError: true,
                 promptBudget: lastRender?.budget,
+                codexDiagnostics: diagnosticAttempts.at(-1), codexDiagnosticAttempts: [...diagnosticAttempts],
             };
         }
         lastRender = rendered;
         const remainingMs = Math.floor(timeoutMs - (performance.now() - modelCallStartedAt));
         if (remainingMs <= 0) {
-            return { text: null, error: "Guard 模型调用超过总时限 [phase=preflight]", infrastructureError: true, promptBudget: rendered.budget };
+            return { text: null, error: "Guard 模型调用超过总时限 [phase=preflight]", infrastructureError: true, promptBudget: rendered.budget, codexDiagnostics: diagnosticAttempts.at(-1), codexDiagnosticAttempts: [...diagnosticAttempts] };
         }
         const response = await callModelResponse(FLASH_MODEL, rendered.prompt, candidate, remainingMs, { ...bridgeOptions, preResolvedCandidate: candidate });
+        if (response.codexDiagnostics) {
+            diagnosticAttempts.push(response.codexDiagnostics);
+            options.onCodexDiagnostics?.(response.codexDiagnostics);
+        }
         if (response.text) {
             console.error(`[guard-engine] Guard model call success requestedChain=${modelChain || "auto"} actualChain=${response.chainUsed || "unknown"} actualModel=${response.modelUsed || "unknown"} promptProvider=${candidate} grokContext=guard`);
             return {
@@ -289,9 +346,12 @@ async function callFlashWithChain(
                 chainUsed: response.chainUsed,
                 modelUsed: response.modelUsed,
                 promptBudget: rendered.budget,
+                codexDiagnostics: response.codexDiagnostics || diagnosticAttempts.at(-1),
+                safetyStopped: response.safetyStopped,
+                codexDiagnosticAttempts: [...diagnosticAttempts],
             };
         }
-        if (response.cancelled || response.timedOut || response.failureClass === "UnknownOutcome") {
+        if (response.cancelled || response.timedOut || response.safetyStopped || response.failureClass === "UnknownOutcome" || response.codexDiagnostics?.eventCoverage === "partial" || response.codexDiagnostics?.captureError) {
             return {
                 text: null,
                 error: response.error || "Guard 模型调用已停止或执行结果未知，不自动再次请求",
@@ -299,16 +359,31 @@ async function callFlashWithChain(
                 chainUsed: response.chainUsed,
                 modelUsed: response.modelUsed,
                 promptBudget: rendered.budget,
+                codexDiagnostics: response.codexDiagnostics,
+                safetyStopped: response.safetyStopped,
+                codexDiagnosticAttempts: [...diagnosticAttempts],
+                failureClass: response.failureClass,
+                timedOut: response.timedOut,
+                cancelled: response.cancelled,
             };
         }
         errors.push(`${candidate}: ${response.error || "模型调用失败"}`);
-        if ((isCodexOnly || isClaudeCodeOnly) && candidates.length === 1) break;
+        if ((isCodexOnly || isClaudeCodeOnly) && candidates.length === 1) {
+            return {
+                text: null, error: errors.join("；"), infrastructureError: true,
+                chainUsed: response.chainUsed, modelUsed: response.modelUsed, promptBudget: rendered.budget,
+                codexDiagnostics: response.codexDiagnostics, safetyStopped: response.safetyStopped,
+                codexDiagnosticAttempts: [...diagnosticAttempts],
+            };
+        }
     }
     return {
         text: null,
         error: errors.join("；") || "Flash 模型调用失败",
         infrastructureError: true,
         promptBudget: lastRender?.budget,
+        codexDiagnostics: diagnosticAttempts.at(-1),
+        codexDiagnosticAttempts: diagnosticAttempts,
     };
 }
 
@@ -736,8 +811,17 @@ function formatCoverageText(bundle: Pick<GuardInputBundle, "coverage">): string 
         `confidence: ${coverage.confidence}`,
         `truncationRisk: ${coverage.truncationRisk}`,
         `coverageGaps: ${coverage.coverageGaps.length ? coverage.coverageGaps.join("; ") : "none"}`,
+        `requiredGaps: ${coverage.requiredGaps?.length ? coverage.requiredGaps.join("; ") : "none"}`,
         ``,
     ];
+    if (coverage.externalEvidence) {
+        const external = coverage.externalEvidence;
+        lines.push(`externalEvidence: requested=${external.requestedAssets}, complete=${external.completeAssets}, partial=${external.partialAssets}, unread=${external.unreadAssets}, included/source=${external.includedChars}/${external.sourceChars} chars`, "");
+    }
+    if (coverage.executionEvidence) {
+        const execution = coverage.executionEvidence;
+        lines.push(`executionEvidence: requestedFrom=${execution.startRound}, includedRounds=${execution.includedRounds}, includedRange=${execution.firstIncludedRound ?? "none"}-${execution.lastIncludedRound ?? "none"}, included/source=${execution.includedChars}/${execution.sourceChars} chars, sourceCharsKnown=${execution.sourceCharsKnown}`, "");
+    }
     for (const source of coverage.sources) {
         lines.push(`### ${source.basename} (${source.totalLines} 行, ${source.totalChars} 字, ${source.mode})`);
         for (const segment of source.segments) {
@@ -749,6 +833,66 @@ function formatCoverageText(bundle: Pick<GuardInputBundle, "coverage">): string 
         lines.push("");
     }
     return lines.join("\n");
+}
+
+export function mergeGuardFinalCoverage(
+    base: GuardCoverage,
+    external: GuardEvidenceIndexResult,
+    promptBudget?: GuardPromptBudgetUsage,
+): GuardCoverage {
+    const coverageGaps = [...base.coverageGaps];
+    const requiredAssets = external.items.filter(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
+    const referenceExecution = base.executionEvidence?.role === "reference" && requiredAssets.length > 0;
+    const requiredGaps = [...(base.requiredGaps || []), ...base.sources.filter(source => source.truncated).map(source => `${source.basename}: selected scope truncated`)];
+    if (!referenceExecution) requiredGaps.push(...(base.executionEvidence?.coverageGaps || []));
+    if (base.executionEvidence?.role === "reference" && !referenceExecution) requiredGaps.push("executionEvidenceRole=reference requires explicit required external evidence");
+    coverageGaps.push(...(base.executionEvidence?.coverageGaps || []));
+    coverageGaps.push(...external.coverage.coverageGaps);
+    for (const item of requiredAssets) {
+        if (item.readStatus !== "complete") requiredGaps.push(`${item.label || path.basename(item.path)}: ${item.readStatus || "unknown"}`);
+    }
+    const requiredSections = new Set(["planContent", "taskContent", "evidence", "appealNote", "executionRecord", "evidenceText"]);
+    if (referenceExecution) requiredSections.delete("executionRecord");
+    for (const section of promptBudget?.sections || []) {
+        if (section.compressedChars <= 0) continue;
+        const gap = `${section.name}: ${section.sourceChars} -> ${section.includedChars} chars`;
+        coverageGaps.push(gap);
+        if (requiredSections.has(section.name) || (section.name === "evidenceIndexText" && requiredAssets.length > 0 && (section.requiredEvidenceIncomplete ?? section.includedChars < (section.availableChars ?? section.sourceChars)))) requiredGaps.push(gap);
+    }
+    const gaps = [...new Set(coverageGaps)];
+    const required = [...new Set(requiredGaps)];
+    return {
+        ...base, externalEvidence: external.coverage, coverageGaps: gaps, requiredGaps: required,
+        confidence: required.length ? "low" : gaps.length && base.confidence === "high" ? "medium" : base.confidence,
+        truncationRisk: required.length ? "high" : gaps.length && base.truncationRisk === "none" ? "low" : base.truncationRisk,
+    };
+}
+
+export function applyGuardCoverageConstraints(result: GuardCheckResult, coverage: GuardCoverage, diagnostics?: CodexBridgeDiagnostics): GuardCheckResult {
+    const withMetadata = { ...result, coverage, codexDiagnostics: diagnostics };
+    const modelRefusalClaim = diagnostics?.modelReportedRefusal || hasCodexModelRefusalClaim(result.rawResponse);
+    if (diagnostics?.rejectedCommandCount) {
+        return {
+            ...withMetadata, passed: false, infrastructureError: false, evidenceInsufficient: true, safetyStopped: true,
+            evidenceInsufficientReason: "COMMAND_REJECTED",
+            summary: `CLI记录到${diagnostics.rejectedCommandCount}项明确工具拒绝，原动作已停止，诊断已保留`,
+        };
+    }
+    if (!modelRefusalClaim && diagnostics?.eventCoverage !== "partial" && !diagnostics?.captureError && !result.infrastructureError && coverage.requiredGaps?.length) {
+        return {
+            ...withMetadata, passed: false, evidenceInsufficient: true, selfReferenceResolved: false,
+            evidenceInsufficientReason: modelRefusalClaim ? "MODEL_REPORTED_REFUSAL_UNVERIFIED" : "REQUIRED_EVIDENCE_INCOMPLETE",
+            safetyStopped: Boolean(modelRefusalClaim),
+            summary: `本次必需证据覆盖不完整：${coverage.requiredGaps.join("；")}`,
+        };
+    }
+    if (modelRefusalClaim) {
+        return { ...withMetadata, passed: false, infrastructureError: false, evidenceInsufficient: true, selfReferenceResolved: false, safetyStopped: true, evidenceInsufficientReason: "MODEL_REPORTED_REFUSAL_UNVERIFIED", summary: "模型声称读取被拒绝，原始事件尚待核实，原动作保持停止" };
+    }
+    if (diagnostics && (diagnostics.eventCoverage === "partial" || diagnostics.captureError)) {
+        return { ...withMetadata, passed: false, evidenceInsufficient: true, infrastructureError: false, selfReferenceResolved: false, safetyStopped: true, evidenceInsufficientReason: "CLI_DIAGNOSTICS_INCOMPLETE", summary: `CLI诊断覆盖不完整，当前检查停止：${diagnostics.captureError || "事件流未完整观察"}` };
+    }
+    return withMetadata;
 }
 
 function computeCoverage(sources: GuardSourceCoverage[]) {
@@ -888,7 +1032,7 @@ async function enhanceGuardInputBundleWithModelLocator(
     taskFiles: string[],
     stageId: string | undefined,
     modelChain: Chain,
-    options: { isCancelled?: () => boolean; isSettled?: () => boolean; onProgress?: (stage: string) => void } = {},
+    options: { isCancelled?: () => boolean; isSettled?: () => boolean; onProgress?: (stage: string) => void; diagnosticContext?: CodexDiagnosticContext; onCodexDiagnostics?: (diagnostics: CodexBridgeDiagnostics) => void } = {},
 ): Promise<GuardInputBundle> {
     if (shouldAbortGuardRun(options)) return bundle;
     const shouldLocate = stageId && (
@@ -923,8 +1067,12 @@ async function enhanceGuardInputBundleWithModelLocator(
     const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), {
         grokContext: "default",
         shouldCancel: () => shouldAbortGuardRun(options),
+        diagnosticContext: options.diagnosticContext,
     });
-    if (shouldAbortGuardRun(options)) return bundle;
+    if (response.codexDiagnostics) options.onCodexDiagnostics?.(response.codexDiagnostics);
+    const locatorResponse: FlashCallResult = { ...response, safetyStopped: response.safetyStopped || Boolean(response.codexDiagnostics?.rejectedCommandCount) || hasCodexModelRefusalClaim(response.text || "") || response.codexDiagnostics?.eventCoverage === "partial" || Boolean(response.codexDiagnostics?.captureError) };
+    bundle = { ...bundle, locatorResponse };
+    if (shouldAbortGuardRun(options) || locatorResponse.safetyStopped || response.cancelled || response.timedOut || response.failureClass === "UnknownOutcome") return bundle;
     if (!response.text) {
         return {
             ...bundle,
@@ -1037,13 +1185,48 @@ function getRecordContext(
     return parts.length ? `### Record（局部 Guard 视图）\n\n${parts.join("\n\n---\n\n")}` : "";
 }
 
+export function collectGuardExecutionEvidence(rounds: Iterable<ConversationRound>, startRound: number, charBudget: number, chain: string): GuardExecutionEvidence {
+    const parts: string[] = [];
+    const coverageGaps: string[] = [];
+    let chars = 0;
+    let sourceChars = 0;
+    let sourceCharsKnown = true;
+    let firstIncludedRound: number | undefined;
+    let lastIncludedRound: number | undefined;
+    for (const round of rounds) {
+        if (round.roundIndex < Math.max(1, startRound)) continue;
+        const formatted = formatRound(round, "normal", ["tool_results", "code_actions", "code_diffs", "file_views"]);
+        const separator = parts.length ? "\n\n---\n\n" : "";
+        sourceChars += separator.length + formatted.length;
+        if (chars + separator.length + formatted.length > charBudget) {
+            const brief = formatRound(round, "brief");
+            if (chars + separator.length + brief.length > charBudget) {
+                coverageGaps.push(`executionRecord: round ${round.roundIndex} and subsequent rounds unread (budget)`);
+                sourceCharsKnown = false;
+                break;
+            }
+            parts.push(brief);
+            chars += separator.length + brief.length;
+            coverageGaps.push(`executionRecord: round ${round.roundIndex} reduced to brief`);
+        } else {
+            parts.push(formatted);
+            chars += separator.length + formatted.length;
+        }
+        firstIncludedRound ??= round.roundIndex;
+        lastIncludedRound = round.roundIndex;
+    }
+    const header = parts.length ? `### 对话原文（chain=${chain}，轮次 ${firstIncludedRound}-${lastIncludedRound}，共 ${parts.length} 轮）\n\n` : "";
+    const text = header + parts.join("\n\n---\n\n");
+    return { text, startRound, firstIncludedRound, lastIncludedRound, includedRounds: parts.length, sourceChars: header.length + sourceChars, includedChars: text.length, sourceCharsKnown, coverageGaps };
+}
+
 async function getConversationExecutionRecord(
     conversationId: string,
     startRound: number,
     charBudget: number,
     dataChain: DataChain = "auto",
-): Promise<string> {
-    const parts: string[] = [];
+): Promise<GuardExecutionEvidence> {
+    const unavailable = (reason: string): GuardExecutionEvidence => ({ text: "", startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: false, coverageGaps: [`executionRecord: ${reason}`] });
     if (charBudget > 10_000) {
         try {
             const loaded = await loadConversationData(dataChain || "auto", conversationId, {
@@ -1063,39 +1246,17 @@ async function getConversationExecutionRecord(
                     : null;
                 const targetRounds: Iterable<ConversationRound> = cachedRounds?.rounds || loaded.rounds;
 
-                const convParts: string[] = [];
-                let convChars = 0;
-                let firstRound: number | undefined;
-                let lastRound: number | undefined;
-                for (const round of targetRounds) {
-                    firstRound ??= round.roundIndex;
-                    lastRound = round.roundIndex;
-                    const formatted = formatRound(round, "normal", ["tool_results", "code_actions", "code_diffs", "file_views"]);
-                    if (convChars + formatted.length > charBudget) {
-                        const brief = formatRound(round, "brief");
-                        if (convChars + brief.length > charBudget) break;
-                        convParts.push(brief);
-                        convChars += brief.length;
-                    } else {
-                        convParts.push(formatted);
-                        convChars += formatted.length;
-                    }
-                }
-
-                if (convParts.length > 0) {
-                    parts.push(
-                        `### 对话原文（chain=${loaded.chainUsed}，轮次 ${firstRound || "?"}-${lastRound || "?"}，共 ${convParts.length} 轮）\n\n` +
-                        convParts.join("\n\n---\n\n")
-                    );
-                }
+                return collectGuardExecutionEvidence(targetRounds, startRound, charBudget, loaded.chainUsed);
             }
+            return unavailable("conversation source unavailable");
         } catch (err) {
             if (dataChain === "windsurf") throw err;
             console.error(`[guard-engine] 对话原文获取失败: ${err}`);
+            return unavailable(`source read failed: ${err instanceof Error ? err.message : String(err)}`);
         }
     }
 
-    return parts.join("\n\n===\n\n");
+    return unavailable("execution budget too small to read source");
 }
 
 // ============= Prompt 构建 =============
@@ -1183,7 +1344,7 @@ function truncateGuardPromptSection(text: string, targetChars: number): string {
 }
 
 function buildGuardPromptFromInput(input: GuardPromptInput): string {
-    return buildGuardPrompt(
+    return [input.finalCoverageNotice, buildGuardPrompt(
         input.planContent,
         input.taskContent,
         input.executionRecord,
@@ -1194,7 +1355,7 @@ function buildGuardPromptFromInput(input: GuardPromptInput): string {
         input.scopeSelectors,
         input.appealNote,
         input.evidence,
-    );
+    )].filter(Boolean).join("\n\n");
 }
 
 type GuardPromptTextSection = "planContent" | "taskContent" | "executionRecord" | "coverageText" | "evidenceText" | "evidenceIndexText" | "appealNote" | "evidence";
@@ -1205,14 +1366,31 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
     const sections: Array<{ name: GuardPromptTextSection; text: string; sourceChars: number }> = [
         { name: "planContent", text: input.planContent, sourceChars: input.planContent.length },
         { name: "taskContent", text: input.taskContent, sourceChars: input.taskContent.length },
-        { name: "executionRecord", text: input.executionRecord, sourceChars: input.executionRecord.length },
+        { name: "executionRecord", text: input.executionRecord, sourceChars: Math.max(input.executionRecordSourceChars || 0, input.executionRecord.length) },
         { name: "coverageText", text: input.coverageText, sourceChars: input.coverageText.length },
-        { name: "evidenceText", text: input.evidenceText, sourceChars: input.evidenceText.length },
-        { name: "evidenceIndexText", text: input.evidenceIndexText, sourceChars: input.evidenceIndexText.length },
+        { name: "evidenceText", text: input.evidenceText, sourceChars: Math.max(input.evidenceTextSourceChars || 0, input.evidenceText.length) },
+        { name: "evidenceIndexText", text: input.evidenceIndexText, sourceChars: Math.max(input.evidenceIndexSourceChars || 0, input.evidenceIndexText.length) },
         { name: "appealNote", text: input.appealNote || "", sourceChars: (input.appealNote || "").length },
         { name: "evidence", text: input.evidence || "", sourceChars: (input.evidence || "").length },
     ];
-    const currentInput = (): GuardPromptInput => ({
+    const availableChars = new Map(sections.map(section => [section.name, section.text.length]));
+    const currentInput = (): GuardPromptInput => {
+        const reduced = sections.filter(section => section.sourceChars > section.text.length);
+        const requiredSections = new Set(["planContent", "taskContent", "evidence", "appealNote", "executionRecord", "evidenceText"]);
+        if (input.executionEvidenceRole === "reference" && input.hasRequiredExternalAssets) requiredSections.delete("executionRecord");
+        const externalIncomplete = input.requiredExternalBlocks
+            ? input.requiredExternalBlocks.some(block => !sections[5].text.includes(block))
+            : input.hasRequiredExternalAssets !== false && sections[5].text.length < (availableChars.get("evidenceIndexText") || 0);
+        const requiredIncomplete = Boolean(input.coverageState?.requiredGaps?.length) || externalIncomplete || reduced.some(section => requiredSections.has(section.name));
+        const confidence = requiredIncomplete ? "low" : input.coverageState?.confidence === "low" ? "low" : reduced.length ? "medium" : input.coverageState?.confidence || "high";
+        const truncationRisk = requiredIncomplete ? "high" : reduced.length ? "low" : input.coverageState?.truncationRisk || "none";
+        const finalCoverageNotice = [
+            "## 最终模型输入覆盖（包含预处理与本次provider预算删减）",
+            `confidence: ${confidence}; truncationRisk: ${truncationRisk}`,
+            ...reduced.map(section => `${section.name}: source=${section.sourceChars}, available=${availableChars.get(section.name)}, included=${section.text.length} chars`),
+            requiredIncomplete ? "本次必需内容存在缺口，程序将保留EVIDENCE_INSUFFICIENT；模型原文另存。" : "",
+        ].filter(Boolean).join("\n");
+        return {
         ...input,
         planContent: sections[0].text,
         taskContent: sections[1].text,
@@ -1222,7 +1400,9 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
         evidenceIndexText: sections[5].text,
         appealNote: sections[6].text || undefined,
         evidence: sections[7].text || undefined,
-    });
+        finalCoverageNotice,
+        };
+    };
     let prompt = buildGuardPromptFromInput(currentInput());
     const compressionReasons: string[] = [];
     if (prompt.length > providerBudget.inputChars) {
@@ -1245,10 +1425,15 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
     const usages = sections.map(section => ({
         name: section.name,
         sourceChars: section.sourceChars,
+        availableChars: availableChars.get(section.name),
+        preCompressedChars: section.sourceChars - (availableChars.get(section.name) || 0),
         includedChars: section.text.length,
         compressedChars: section.sourceChars - section.text.length,
+        ...(section.name === "evidenceIndexText" ? { requiredEvidenceIncomplete: input.requiredExternalBlocks
+            ? input.requiredExternalBlocks.some(block => !section.text.includes(block))
+            : input.hasRequiredExternalAssets !== false && section.text.length < (availableChars.get(section.name) || 0) } : {}),
         ...(section.sourceChars > section.text.length
-            ? { compressionReason: `provider=${provider} 输入预算压缩` }
+            ? { compressionReason: section.sourceChars > (availableChars.get(section.name) || 0) ? `预处理裁剪；provider=${provider} 当前预算已核对` : `provider=${provider} 输入预算压缩` }
             : {}),
     }));
     for (const section of usages) {
@@ -1274,14 +1459,14 @@ function formatGuardPromptBudgetUsage(usage: GuardPromptBudgetUsage | undefined)
     if (!usage) return "unavailable";
     return [
         `provider=${usage.provider}, prompt=${usage.promptChars}/${usage.inputBudgetChars} chars, outputReserveEstimate=${usage.outputReserveChars} chars (not model max_tokens), template=${usage.templateChars} chars`,
-        ...usage.sections.map(section => `${section.name}: ${section.includedChars}/${section.sourceChars} chars${section.compressedChars > 0 ? `（压缩 ${section.compressedChars}）` : ""}`),
+        ...usage.sections.map(section => `${section.name}: ${section.includedChars}/${section.sourceChars} chars, preProvider=${section.availableChars ?? section.sourceChars}${section.compressedChars > 0 ? `（共减少 ${section.compressedChars}）` : ""}`),
         ...usage.compressionReasons.map(reason => `reason: ${reason}`),
     ].join("\n");
 }
 
 // ============= 结果解析 =============
 
-function parseGuardResult(rawResponse: string): GuardCheckResult {
+export function parseGuardResult(rawResponse: string): GuardCheckResult {
     const lines = rawResponse.trim().split("\n");
     const firstLine = (lines[0] || "").trim().toUpperCase();
     const passed = firstLine === "PASS";
@@ -1339,6 +1524,7 @@ function isGuardSelfReferenceMissingItem(item: string): boolean {
 }
 
 export function resolveGuardSelfReferenceResult(result: GuardCheckResult): GuardCheckResult {
+    if (result.evidenceInsufficient || result.infrastructureError || result.safetyStopped) return result;
     if (result.passed || result.missingItems.length === 0) return result;
     const selfReferenceItems = result.missingItems.filter(isGuardSelfReferenceMissingItem);
     if (selfReferenceItems.length !== result.missingItems.length) return result;
@@ -1373,6 +1559,9 @@ export async function runGuardCheck(
         isCancelled?: () => boolean;
         isSettled?: () => boolean;
         onProgress?: (stage: string) => void;
+        backgroundTaskId?: string;
+        onCodexDiagnostics?: (diagnostics: CodexBridgeDiagnostics) => void;
+        executionEvidenceRole?: "required" | "reference";
     } = {},
 ): Promise<GuardCheckResult> {
     const progress = (stage: string) => {
@@ -1383,6 +1572,7 @@ export async function runGuardCheck(
     const scopeSelectors = normalizeGuardScopeSelectors(state.scopeSelectors);
     const initialInputBundle = buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId, scopeSelectors);
     if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    const diagnosticContext = { conversationId: state.conversationId, guardId: state.guardId, childScopeId: state.childScopeId, stageId: state.stageId, backgroundTaskId: options.backgroundTaskId };
     const inputBundle = scopeSelectors.length > 0
         ? initialInputBundle
         : await enhanceGuardInputBundleWithModelLocator(
@@ -1391,10 +1581,24 @@ export async function runGuardCheck(
             state.taskFiles,
             state.stageId,
             resolveGuardModelChain(state),
-            options,
+            { ...options, diagnosticContext },
         );
     const planContent = inputBundle.planContent;
     const taskContent = inputBundle.taskContent;
+    const locator = inputBundle.locatorResponse;
+    if (locator && (locator.safetyStopped || locator.cancelled || locator.timedOut || locator.failureClass === "UnknownOutcome" || shouldAbortGuardRun(options))) {
+        const diagnostics = locator.codexDiagnostics;
+        const result = applyGuardCoverageConstraints({ passed: false, summary: locator.error || "辅助定位调用已停止，未发起最终检查", missingItems: [], rawResponse: locator.text || "", infrastructureError: !locator.safetyStopped, evidenceInsufficient: Boolean(locator.safetyStopped), safetyStopped: locator.safetyStopped }, inputBundle.coverage, diagnostics);
+        result.cancelled = locator.cancelled || shouldAbortGuardRun(options);
+        result.codexDiagnosticAttempts = diagnostics ? [diagnostics] : [];
+        result.modelChainUsed = locator.chainUsed;
+        result.modelUsed = locator.modelUsed;
+        result.reportPath = saveTempFile(`stage_guard_locator_stop_${Date.now()}`, "Stage Guard 定位停止报告", [
+            "# Stage Guard 定位停止报告", `Guard Id: ${state.guardId}`, `结果: ${result.evidenceInsufficient ? "EVIDENCE_INSUFFICIENT" : "INFRASTRUCTURE_ERROR"}`, result.summary,
+            "最终检查未发起，原动作保持停止。", `CLI诊断: ${diagnostics?.manifestPath || "unavailable"}`, `callId: ${diagnostics?.callId || "none"}`, `captureError: ${diagnostics?.captureError || "none"}`, "## 定位原始返回", locator.text || locator.error || "no response",
+        ].join("\n\n"));
+        return result;
+    }
 
     if (!taskContent) {
         return {
@@ -1415,7 +1619,7 @@ export async function runGuardCheck(
         : "";
     const conversationExecution = state.conversationId
         ? await getConversationExecutionRecord(state.conversationId, state.startRound, EXECUTION_RECORD_BUDGET, state.chain || "auto")
-        : "";
+        : { text: "", startRound: state.startRound, includedRounds: 0, sourceChars: 0, includedChars: 0, sourceCharsKnown: true, coverageGaps: [] };
 
     const externalEvidence = await buildGuardEvidenceIndexes(options.evidenceAssets, {
         indexMode: options.evidenceIndexMode || "auto",
@@ -1427,11 +1631,12 @@ export async function runGuardCheck(
     const roundScopeNotice = state.startRound > 0
         ? `### Guard 执行范围\n\n仅注入对话第 ${state.startRound} 轮及之后的执行记录；无轮次边界的 Record 摘要不会作为本次 Guard 证据。`
         : "";
-    const executionRecord = [roundScopeNotice, recordContext, conversationExecution].filter(Boolean).join("\n\n===\n\n");
+    const executionRecord = [roundScopeNotice, recordContext, conversationExecution.text].filter(Boolean).join("\n\n===\n\n");
     const runtimeEvidence = extractEvidenceManifest(executionRecord);
     const externalEvidenceManifest = extractEvidenceManifest(externalEvidence.text);
     const mergedEvidenceManifest = mergeEvidenceManifest([inputBundle.evidenceManifest, runtimeEvidence, externalEvidenceManifest]);
-    const evidenceText = formatEvidenceManifest(mergedEvidenceManifest);
+    const evidenceTextSource = formatEvidenceManifest(mergedEvidenceManifest, Number.MAX_SAFE_INTEGER);
+    const evidenceText = truncateText(evidenceTextSource, EVIDENCE_CONTEXT_BUDGET);
     if (shouldAbortGuardRun(options)) {
         return createAbortedGuardResult(Boolean(options.isCancelled?.()));
     }
@@ -1440,19 +1645,26 @@ export async function runGuardCheck(
         "Stage Guard Evidence Manifest",
         JSON.stringify(mergedEvidenceManifest, null, 2)
     );
-    const extractionManifestPath = saveTempFile(
-        `stage_guard_extraction_manifest_${Date.now()}`,
-        "Stage Guard Extraction Manifest",
-        JSON.stringify(inputBundle.coverage, null, 2)
-    );
+    const { text: executionText, ...executionEvidence } = conversationExecution;
+    const hasRequiredAssets = externalEvidence.items.some(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
+    const referenceExecution = options.executionEvidenceRole === "reference" && hasRequiredAssets;
+    const baseCoverage = { ...inputBundle.coverage, executionEvidence: { ...executionEvidence, role: referenceExecution ? "reference" as const : "required" as const }, requiredGaps: options.executionEvidenceRole === "reference" && !hasRequiredAssets ? ["executionEvidenceRole=reference requires explicit required external evidence"] : [] };
+    const initialCoverage = mergeGuardFinalCoverage(baseCoverage, externalEvidence);
 
     const promptInput: GuardPromptInput = {
         planContent,
         taskContent,
         executionRecord: truncateText(executionRecord, RECORD_CONTEXT_BUDGET + EXECUTION_RECORD_BUDGET),
-        coverageText: inputBundle.coverageText,
+        executionRecordSourceChars: executionRecord.length + Math.max(0, conversationExecution.sourceChars - executionText.length),
+        executionEvidenceRole: referenceExecution ? "reference" : "required",
+        coverageText: formatCoverageText({ coverage: initialCoverage }),
+        coverageState: initialCoverage,
         evidenceText,
+        evidenceTextSourceChars: evidenceTextSource.length,
         evidenceIndexText: externalEvidence.text,
+        evidenceIndexSourceChars: externalEvidence.coverage.sourceChars,
+        hasRequiredExternalAssets: hasRequiredAssets,
+        requiredExternalBlocks: externalEvidence.items.filter(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()) && item.includedStart !== undefined && item.includedEnd !== undefined).map(item => externalEvidence.text.slice(item.includedStart, item.includedEnd)),
         stageId: state.stageId,
         scopeSelectors,
         appealNote,
@@ -1467,15 +1679,15 @@ export async function runGuardCheck(
     const response = await callFlashWithChain(
         provider => renderGuardPromptForProvider(promptInput, provider),
         resolveGuardModelChain(state),
-        { ...options, dataChain: state.chain },
+        { ...options, dataChain: state.chain, diagnosticContext },
     );
     if (shouldAbortGuardRun(options)) {
-        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()), response);
     }
 
-    if (!response.text) {
-        progress("complete");
-        return {
+    progress("parse");
+    const finalCoverage = mergeGuardFinalCoverage(baseCoverage, externalEvidence, response.promptBudget);
+    const modelResult: GuardCheckResult = response.text ? parseGuardResult(response.text) : {
             passed: false,
             summary: response.error || "Flash 模型调用失败",
             missingItems: [],
@@ -1485,15 +1697,19 @@ export async function runGuardCheck(
             modelUsed: response.modelUsed,
             promptBudget: response.promptBudget,
         };
-    }
-
-    // 5. 解析结果
-    progress("parse");
-    const result = resolveGuardSelfReferenceResult(parseGuardResult(response.text));
+    const result = resolveGuardSelfReferenceResult(applyGuardCoverageConstraints(modelResult, finalCoverage, response.codexDiagnostics));
     result.evidenceIndexManifestPath = externalEvidence.manifestPath;
     result.modelChainUsed = response.chainUsed;
     result.modelUsed = response.modelUsed;
     result.promptBudget = response.promptBudget;
+    result.codexDiagnosticAttempts = [...(locator?.codexDiagnostics ? [locator.codexDiagnostics] : []), ...(response.codexDiagnosticAttempts || [])];
+    const extractionManifestPath = saveTempFile(
+        `stage_guard_extraction_manifest_${Date.now()}`,
+        "Stage Guard Extraction Manifest",
+        JSON.stringify({ ...finalCoverage, promptBudget: response.promptBudget }, null, 2),
+    );
+    const finalCoverageText = formatCoverageText({ coverage: finalCoverage });
+    const resultType = result.infrastructureError ? "INFRASTRUCTURE_ERROR" : result.evidenceInsufficient ? "EVIDENCE_INSUFFICIENT" : result.passed ? "PASS" : "FAIL";
 
     // 6. 生成详细报告写入临时文件
     const reportLines = [
@@ -1504,9 +1720,10 @@ export async function runGuardCheck(
         `- **Guard Id**: ${state.guardId}`,
         `- **Child Scope**: ${state.childScopeId || "main"}`,
         scopeSelectors.length > 0 ? `- **Scope Selectors**: ${scopeSelectors.join("; ")}` : "",
-        `- **结果**: ${result.passed ? "✅ PASS" : "❌ FAIL"}`,
+        `- **结果**: ${resultType}`,
+        `- **模型原始首行**: ${(response.text || "未返回模型正文").split("\n")[0]}`,
         `- **总结**: ${result.summary}`,
-        `- **Coverage**: confidence=${inputBundle.coverage.confidence}, truncationRisk=${inputBundle.coverage.truncationRisk}`,
+        `- **Coverage**: confidence=${finalCoverage.confidence}, truncationRisk=${finalCoverage.truncationRisk}`,
         `- **Model Chain**: requested=${resolveGuardModelChain(state)}, actual=${response.chainUsed || "unknown"}, model=${response.modelUsed || "unknown"}, grokContext=guard`,
         `- **Prompt Budget**: ${formatGuardPromptBudgetUsage(response.promptBudget).replace(/\n/g, " | ")}`,
         `- **Extraction Manifest**: ${extractionManifestPath}`,
@@ -1515,11 +1732,21 @@ export async function runGuardCheck(
         ``,
     ].filter(Boolean);
 
-    reportLines.push(`## 取证覆盖范围`, ``, "```", inputBundle.coverageText, "```", ``);
+    reportLines.push(`## 取证覆盖范围`, ``, "```", finalCoverageText, "```", ``);
     reportLines.push(`## 强制执行证据`, ``, "```", evidenceText, "```", ``);
     reportLines.push(`## Prompt 预算与压缩`, ``, "```", formatGuardPromptBudgetUsage(response.promptBudget), "```", ``);
     if (externalEvidence.text) {
         reportLines.push(`## 外部证据文件索引`, ``, "```", externalEvidence.text, "```", ``);
+    }
+    for (const diagnostics of result.codexDiagnosticAttempts.length ? result.codexDiagnosticAttempts : result.codexDiagnostics ? [result.codexDiagnostics] : []) {
+        reportLines.push("## Codex CLI 私有诊断", "", `- callId: ${diagnostics.callId}`,
+            `- manifest: ${diagnostics.manifestPath || "unavailable"}`,
+            `- manifestSha256: ${diagnostics.manifestSha256 || "unavailable"}`,
+            `- observedCommands: ${diagnostics.commandCount}; rejected: ${diagnostics.rejectedCommandCount}; failed: ${diagnostics.failedCommandCount}; running: ${diagnostics.runningCommandCount}`,
+            `- eventCoverage: ${diagnostics.eventCoverage}; modelReportedRefusal: ${diagnostics.modelReportedRefusal}`,
+            `- stdout: ${diagnostics.stdout.path || "unavailable"}; captured/total=${diagnostics.stdout.capturedBytes}/${diagnostics.stdout.bytes}; sha256=${diagnostics.stdout.sha256}; streamSha256=${diagnostics.stdout.streamSha256}`,
+            `- stderr: ${diagnostics.stderr.path || "unavailable"}; captured/total=${diagnostics.stderr.capturedBytes}/${diagnostics.stderr.bytes}; sha256=${diagnostics.stderr.sha256}; streamSha256=${diagnostics.stderr.streamSha256}`,
+            `- retention: ${diagnostics.retention}`, diagnostics.captureError ? `- captureError: ${diagnostics.captureError}` : "", "");
     }
 
     if (result.missingItems.length > 0) {
@@ -1542,7 +1769,7 @@ export async function runGuardCheck(
 
     const reportContent = reportLines.join("\n");
     if (shouldAbortGuardRun(options)) {
-        return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+        return createAbortedGuardResult(Boolean(options.isCancelled?.()), response);
     }
     result.reportPath = saveTempFile(
         `stage_guard_report_${Date.now()}`,

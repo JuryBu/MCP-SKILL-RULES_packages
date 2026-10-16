@@ -6,6 +6,7 @@ import type { CodexHistorySource } from "./codex-history-source.js";
 export interface CodexFetchWorkerPayload {
     version: 1 | 2;
     verificationDeferred?: boolean;
+    forceRawCacheRebuild?: boolean;
     conversationId: string;
     link: "reference" | "summary" | "expand_children";
     source: "auto" | "local" | "cache";
@@ -116,6 +117,8 @@ export function isCodexFetchWorkerPayload(value: unknown): value is CodexFetchWo
         && typeof payload.conversationId === "string"
         && (payload.link === "reference" || payload.link === "summary" || payload.link === "expand_children")
         && (payload.source === "auto" || payload.source === "local" || payload.source === "cache")
+        && (payload.forceRawCacheRebuild === undefined || typeof payload.forceRawCacheRebuild === "boolean")
+        && !(payload.forceRawCacheRebuild === true && payload.source === "cache")
         && typeof payload.sourcePath === "string"
         && payload.sourcePath.length > 0
         && Number.isFinite(payload.sourceSize)

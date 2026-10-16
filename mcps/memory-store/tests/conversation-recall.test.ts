@@ -26,6 +26,10 @@ import {
 } from "../src/windsurf-client.ts";
 
 process.env.MEMORY_STORE_AUTO_RECORD = "0";
+process.env.MEMORY_STORE_LIFECYCLE_ENABLED = "false";
+const isolatedSources = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-recall-sources-"));
+process.env.MEMORY_STORE_DEVIN_CLI_DB_PATH = path.join(isolatedSources, "sessions.db");
+process.env.MEMORY_STORE_DEVIN_DESKTOP_ROOT = path.join(isolatedSources, "desktop");
 
 function round(index: number, options: {
     user?: string;
@@ -149,6 +153,23 @@ function round(index: number, options: {
     const full = selectConversationRecallRange(metadata, "full");
     assert.deepEqual([full?.startRound, full?.endRound], [1, 8]);
     assert.throws(() => selectConversationRecallRange(metadata, "manual", 0, 2), /manual recall round range/u);
+}
+
+{
+    const sparseRounds = [round(1, { foldedRules: true }), round(670), round(673), round(676, { foldedRules: true })];
+    const metadata = buildConversationCompactionMetadata("codex", sparseRounds);
+    assert.equal(metadata.roundCount, 4);
+    const manual = selectConversationRecallRange(metadata, "manual", 664, 676);
+    assert.deepEqual([manual?.startRound, manual?.endRound], [664, 676]);
+    assert.equal(selectConversationRecallRange(metadata, "manual", 670)?.endRound, 676);
+    assert.deepEqual(selectConversationRecallRange(metadata, "full")?.endRound, 676);
+    assert.equal(selectConversationRecallRange(metadata, "auto")?.endRound, 673, "auto recall must end at an existing predecessor across gaps");
+    const fallback = buildConversationCompactionMetadata("antigravity", [round(670), round(676)]);
+    assert.equal(selectConversationRecallRange(fallback, "auto")?.endRound, 676);
+    const singleton = buildConversationCompactionMetadata("codex", [round(1556)]);
+    const full = selectConversationRecallRange(singleton, "full");
+    assert.deepEqual([full?.startRound, full?.endRound], [1556, 1556]);
+    assert.throws(() => selectConversationRecallRange(metadata, "manual", 670, 677), /manual recall round range/u);
 }
 
 {
@@ -308,3 +329,5 @@ function round(index: number, options: {
 }
 
 console.log("✅ conversation-recall 通过：离线枚举、四宿主压缩元数据、上下文投影、三种范围与 artifact 均符合预期");
+assert.equal(path.dirname(path.resolve(isolatedSources)), path.resolve(os.tmpdir()));
+fs.rmSync(isolatedSources, { recursive: true, force: true });

@@ -24,6 +24,8 @@ import {
     startBackgroundTask,
     stableJsonHash,
     waitForBackgroundTask,
+    bindBackgroundTaskDiagnostics,
+    appendBackgroundTaskDiagnostic,
 } from "../background-tasks.js";
 import type { BackgroundTaskContext } from "../background-tasks.js";
 import { formatToolError } from "../error-format.js";
@@ -84,6 +86,8 @@ const StageGuardSchema = z.object({
         .describe("check 时可选：结构化外部证据文件输入，比 evidenceFiles 能提供更多标签和范围信息"),
     evidenceIndexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
         .describe("外部证据索引策略：auto=复用新鲜索引或重建，reuse=只复用缓存，rebuild=强制重建，off=只记录未读取提示"),
+    executionEvidenceRole: z.enum(["required", "reference"]).optional()
+        .describe("check 时可选，默认 required；仅有显式必需外部证据时可把对话执行记录设为参考，覆盖缺口仍显示"),
         background: z.boolean().optional()
             .describe("check 三态后台：true=强制后台立即返回 taskId / false=强制同步 / 不传时保持同步；Guard 默认不自动后台化"),
     taskId: z.string().optional()
@@ -366,6 +370,7 @@ interface StageGuardCheckResumePayloadV1 {
     evidenceFiles?: string[];
     evidenceAssets?: z.infer<typeof StageGuardSchema>["evidenceAssets"];
     evidenceIndexMode?: z.infer<typeof StageGuardSchema>["evidenceIndexMode"];
+    executionEvidenceRole?: z.infer<typeof StageGuardSchema>["executionEvidenceRole"];
 }
 
 interface StageGuardCheckResumePayloadV2 extends Omit<StageGuardCheckResumePayloadV1, "version"> {
@@ -502,6 +507,7 @@ function buildStageGuardCheckResumePayload(
         evidenceFiles: params.evidenceFiles ? [...params.evidenceFiles] : undefined,
         evidenceAssets: params.evidenceAssets ? params.evidenceAssets.map(asset => ({ ...asset })) : undefined,
         evidenceIndexMode: params.evidenceIndexMode,
+        executionEvidenceRole: params.executionEvidenceRole || "required",
     };
 }
 
@@ -565,6 +571,7 @@ function makeStageGuardCheckTaskId(
         evidenceFiles: normalizeEvidenceFiles(params.evidenceFiles),
         evidenceAssets: normalizeEvidenceAssets(params.evidenceAssets),
         evidenceIndexMode: params.evidenceIndexMode || "auto",
+        executionEvidenceRole: params.executionEvidenceRole || "required",
     };
     const guardKey = stableJsonHash({ guardId: state.guardId }).slice(0, 24);
     return `stage-guard-check-${guardKey}-${stableJsonHash(normalizedInput)}`;
@@ -577,7 +584,7 @@ function isStageGuardCheckResumePayload(value: unknown): value is StageGuardChec
         && typeof payload.conversationId === "string"
         && typeof payload.stageId === "string"
         && typeof payload.guardStartedAt === "string";
-    if (!isBasePayload) return false;
+    if (!isBasePayload || (payload.executionEvidenceRole !== undefined && payload.executionEvidenceRole !== "required" && payload.executionEvidenceRole !== "reference")) return false;
     return payload.version !== 2 || (
         typeof payload.guardId === "string"
         && typeof payload.childScopeId === "string"
@@ -600,6 +607,7 @@ function buildStageGuardCheckParamsFromPayload(payload: StageGuardCheckResumePay
         evidenceFiles: payload.evidenceFiles ? [...payload.evidenceFiles] : undefined,
         evidenceAssets: payload.evidenceAssets ? payload.evidenceAssets.map(asset => ({ ...asset })) : undefined,
         evidenceIndexMode: payload.evidenceIndexMode,
+        executionEvidenceRole: payload.executionEvidenceRole || "required",
         background: false,
     };
 }
@@ -794,18 +802,37 @@ async function handleCheck(
         ...(params.evidenceFiles || []).map(filePath => ({ path: filePath })),
         ...(params.evidenceAssets || []),
     ];
+    if (taskContext?.taskId && !bindBackgroundTaskDiagnostics(taskContext.taskId, {
+        guardId: state.guardId, conversationId: state.conversationId, stageId: state.stageId, childScopeId: state.childScopeId,
+    })) {
+        return text("🛡 后台Guard诊断关联未建立，本次未调用模型；请保留原task并核对诊断存储。");
+    }
+    const diagnosticCalls = new Set<string>();
+    let diagnosticLinked = true;
+    const retainDiagnostic: NonNullable<Parameters<GuardCheckRunner>[3]>["onCodexDiagnostics"] = diagnostic => {
+        if (!taskContext?.taskId || diagnosticCalls.has(diagnostic.callId)) return;
+        diagnosticCalls.add(diagnostic.callId);
+        if (!appendBackgroundTaskDiagnostic(taskContext.taskId, state.guardId, diagnostic)) diagnosticLinked = false;
+    };
     const result = await guardCheckRunner(effectiveState, params.appealNote, params.evidence, {
         background: backgroundModel,
+        backgroundTaskId: taskContext?.taskId,
+        onCodexDiagnostics: retainDiagnostic,
         evidenceAssets,
         evidenceIndexMode: params.evidenceIndexMode,
+        executionEvidenceRole: params.executionEvidenceRole || "required",
         isCancelled: taskContext?.isCancelled,
         isSettled: taskContext?.isSettled,
         onProgress: stage => taskContext?.updateProgress({ stage: `guard:${stage}`, detail: `Stage Guard ${stage}` }),
     });
+    if (result.codexDiagnostics) retainDiagnostic?.(result.codexDiagnostics);
+    const diagnosticNotice = result.codexDiagnostics
+        ? `🧾 CLI诊断: ${result.codexDiagnostics.manifestPath || result.codexDiagnostics.callId}；事件覆盖=${result.codexDiagnostics.eventCoverage}；观察到的拒绝=${result.codexDiagnostics.rejectedCommandCount}${diagnosticLinked ? "" : "；原task诊断关联保存失败，请保留本路径"}`
+        : "";
     if (result.cancelled || isBackgroundTaskAborted(taskContext)) {
-        return formatAbortedGuardCheckText(taskContext);
+        return text([responseText(formatAbortedGuardCheckText(taskContext)), diagnosticNotice].filter(Boolean).join("\n"));
     }
-    if (!isCurrentGuard(state)) return staleGuardCheckText();
+    if (!isCurrentGuard(state)) return text([responseText(staleGuardCheckText()), diagnosticNotice].filter(Boolean).join("\n"));
 
     if (isGuardInfrastructureError(result)) {
         const checkCount = state.checkHistory.length;
@@ -813,10 +840,12 @@ async function handleCheck(
             `🛡 Stage Guard 检查: ⚠️ 未完成（模型链路失败，未计入未通过次数）`,
             ``,
             `📊 ${result.summary}`,
+            result.reportPath ? `📄 详细报告: ${result.reportPath}` : "",
+            diagnosticNotice,
             ``,
             `🔍 当前已记录的审查未通过次数仍为 ${checkCount} 次。`,
-            `💡 请稍后重试 stage_guard(action="check")，或改用可用的 modelChain；这不是任务内容缺口。`,
-        ].join("\n"));
+            `💡 先核对原任务、诊断与在途副作用，明确可重试后再发起新检查；涉及安全拒绝的原动作继续停止。`,
+        ].filter(Boolean).join("\n"));
     }
 
     if (isGuardEvidenceInsufficient(result)) {
@@ -828,9 +857,12 @@ async function handleCheck(
             result.evidenceInsufficientReason ? `📌 类型: ${result.evidenceInsufficientReason}` : "",
             result.reportPath ? `📄 详细报告: ${result.reportPath}` : "",
             result.evidenceIndexManifestPath ? `🧾 外部证据索引: ${result.evidenceIndexManifestPath}` : "",
+            diagnosticNotice,
             ``,
             `🔍 当前已记录的审查未通过次数仍为 ${checkCount} 次。`,
-            `💡 请补充 evidence、缩小 stageId，或根据报告里的 coverage 补读缺失片段后重试。`,
+            result.safetyStopped
+                ? `💡 原补读或被拒动作继续停止，保留本次诊断并核对拒绝依据与有效安全边界。`
+                : `💡 根据报告补全本次必需证据范围，保留原检查记录后再核验。`,
         ].filter(Boolean).join("\n"));
     }
 
@@ -867,7 +899,7 @@ async function handleCheck(
 
     if (result.passed) {
         if (passReceipt) {
-            return text(finalizeGuardPassReceipt(passReceipt, false));
+            return text([finalizeGuardPassReceipt(passReceipt, false), diagnosticNotice].filter(Boolean).join("\n"));
         }
 
         const lockResults = state.taskFiles.map(file => ({ file, result: removeLockMark(file, state) }));
@@ -883,6 +915,7 @@ async function handleCheck(
                 ? "⚠️ 已自动识别 Guard 自指收口项：实质证据已充分，缺口仅是 Guard 通过后才能写入的后置记录"
                 : "",
             `🔓 本 Guard 锁已移除${remainingLocks > 0 ? `，相关文件仍有 ${remainingLocks} 个其它 Guard 锁` : ""}`,
+            diagnosticNotice,
             ...summarizeLockResults(lockResults),
             result.reportPath ? `📄 详细报告: ${result.reportPath}` : "",
             result.evidenceIndexManifestPath ? `🧾 外部证据索引: ${result.evidenceIndexManifestPath}` : "",
@@ -913,6 +946,7 @@ async function handleCheck(
     if (result.evidenceIndexManifestPath) {
         lines.push(`🧾 外部证据索引: ${result.evidenceIndexManifestPath}`);
     }
+    if (diagnosticNotice) lines.push(diagnosticNotice);
 
     if (checkCount >= maxChecks) {
         lines.push(
@@ -1048,7 +1082,8 @@ async function handleCancel(params: z.infer<typeof StageGuardSchema>) {
 export async function runStageGuard(input: Omit<z.infer<typeof StageGuardSchema>, "evidence"> & { evidence?: z.input<typeof StageGuardSchema>["evidence"] }): Promise<ReturnType<typeof text>> {
     touchActivity();
     try {
-        const params = { ...input, evidence: StageGuardSchema.shape.evidence.parse(input.evidence) };
+        const params = { ...input, evidence: StageGuardSchema.shape.evidence.parse(input.evidence),
+            executionEvidenceRole: StageGuardSchema.shape.executionEvidenceRole.parse(input.executionEvidenceRole) || "required" };
         switch (params.action) {
             case "start":
                 return await handleStart(params);

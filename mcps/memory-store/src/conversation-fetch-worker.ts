@@ -39,6 +39,7 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
     const cacheStartedAt = Date.now();
     const loaded = await loadConversationData("codex", payload.conversationId, {
         refresh: true,
+        forceRawCacheRebuild: payload.forceRawCacheRebuild === true,
         link: linkResolution.effectiveLink,
         source: payload.source,
         includeRounds: false,

@@ -10,6 +10,7 @@ import {
     assertCodexHistorySource,
     assertCodexHistorySourceAsync,
     assertCodexHistoryManifest,
+    codexHistorySegmentReadPath,
     CodexHistorySourceMismatchError,
     parseCodexRolloutFilename,
     normalizeCodexHistoryPath,
@@ -92,6 +93,7 @@ export interface CodexConversationData {
     childDiagnostics?: CodexChildThreadDiagnostic[];
     sourceCheckpoints?: CodexSourceByteCheckpoint[];
     sourceCheckpoint?: CodexRoundTailCheckpoint;
+    sourceCheckpointUnavailableReason?: "last_merged_round_starts_before_leaf";
 }
 
 export interface CodexChildThreadDiagnostic {
@@ -2635,6 +2637,7 @@ export type CodexSourceCheckpointKind = "round_start" | "thinking" | "tool_call"
 export interface CodexSourceByteCheckpoint {
     kind: CodexSourceCheckpointKind;
     roundIndex: number;
+    sourceRoundIndex?: number;
     sourceByte: number;
     sourceOrdinal?: number;
 }
@@ -3323,7 +3326,7 @@ async function forEachCodexHistoryEventAsync(
         if (segment.startOrdinal !== ordinal) throw new Error("Codex history prefix ordinal mismatch");
         const isLeaf = segmentIndex === source.segments.length - 1;
         const validator = new CodexOrdinalValidator(segment.startOrdinal, segment.ordinalMode, previousMode);
-        await forEachCodexJsonlLineAsync(segment.path, (line, sourceByte) => {
+        await forEachCodexJsonlLineAsync(codexHistorySegmentReadPath(segment), (line, sourceByte) => {
             let event: any;
             try {
                 event = sanitizeCodexEvent(JSON.parse(line.replace(/^\uFEFF/u, "")));
@@ -3360,7 +3363,7 @@ function buildCodexRoundsFromHistory(
     for (const segment of source.segments) {
         if (segment.startOrdinal !== ordinal) throw new Error("Codex history prefix ordinal mismatch");
         const validator = new CodexOrdinalValidator(segment.startOrdinal, segment.ordinalMode, previousMode);
-        readRolloutEvents(segment.path, {
+        readRolloutEvents(codexHistorySegmentReadPath(segment), {
             endByte: segment.endByte,
             strict: true,
             expectedPrefixSha256: segment.prefixSha256,
@@ -3466,6 +3469,8 @@ export interface CodexRoundTailCheckpoint {
     replayStartByte: number;
     replayStartStep: number;
     replaceFromRound: number;
+    sourceRoundIndex?: number;
+    roundIndexSpace?: "normalized-cache-v1";
     prefixSha256?: string;
     ordinalMode?: CodexOrdinalMode;
     replayStartOrdinal?: number;
@@ -3568,17 +3573,29 @@ export async function readCodexRoundTail(
     link: ConversationLinkMode,
     options: CodexRoundTailReadOptions = {},
 ): Promise<CodexRoundTailReadResult> {
+    let historySegment = options.historySegment;
+    if (!historySegment && /\.jsonl\.zst$/iu.test(rolloutPath)) {
+        historySegment = (await resolveCodexHistorySourceAsync(rolloutPath, { isCancelled: options.isCancelled })).segments.at(-1);
+    }
+    const readPath = historySegment ? codexHistorySegmentReadPath(historySegment) : rolloutPath;
+    const archive = historySegment?.archive;
     let before: fs.Stats;
+    let readBefore: fs.Stats;
     try {
         before = await fs.promises.stat(rolloutPath);
+        readBefore = readPath === rolloutPath ? before : await fs.promises.stat(readPath);
     } catch {
         return codexTailRebuildRequired("source_unavailable", options.startByte || 0, 0);
     }
     if (!before.isFile()) return codexTailRebuildRequired("source_unavailable", options.startByte || 0, before.size);
-    const sourceSize = options.endByte ?? before.size;
-    const sourceMtimeMs = options.sourceMtimeMs ?? before.mtimeMs;
-    if (!Number.isSafeInteger(sourceSize) || sourceSize < 0 || sourceSize > before.size) {
-        return codexTailRebuildRequired("source_truncated", options.startByte || 0, before.size);
+    if (archive && (before.size !== archive.sourceSize || before.mtimeMs !== archive.sourceMtimeMs
+        || await hashCodexPrefix(rolloutPath, before.size, options.isCancelled) !== archive.sourceSha256)) {
+        return codexTailRebuildRequired("source_replaced", options.startByte || 0, readBefore.size);
+    }
+    const sourceSize = options.endByte ?? historySegment?.endByte ?? readBefore.size;
+    const sourceMtimeMs = Math.trunc(options.sourceMtimeMs ?? before.mtimeMs);
+    if (!Number.isSafeInteger(sourceSize) || sourceSize < 0 || sourceSize > readBefore.size) {
+        return codexTailRebuildRequired("source_truncated", options.startByte || 0, readBefore.size);
     }
 
     const checkpoint = options.checkpoint;
@@ -3603,67 +3620,71 @@ export async function readCodexRoundTail(
         if (sourceSize < checkpoint.sourceSize) {
             return codexTailRebuildRequired("source_truncated", startByte, sourceSize);
         }
-        if (sourceSize === checkpoint.sourceSize && sourceMtimeMs !== checkpoint.sourceMtimeMs) {
+        if (!archive && sourceSize === checkpoint.sourceSize && sourceMtimeMs !== checkpoint.sourceMtimeMs) {
             return codexTailRebuildRequired("source_replaced", startByte, sourceSize);
         }
         try {
-            const anchor = await codexCheckpointAnchor(rolloutPath, checkpoint.sourceSize);
+            const anchor = await codexCheckpointAnchor(readPath, checkpoint.sourceSize);
             if (anchor.anchorStartByte !== checkpoint.anchorStartByte || anchor.anchorSha256 !== checkpoint.anchorSha256) {
                 return codexTailRebuildRequired("source_replaced", startByte, sourceSize);
             }
         } catch {
             return codexTailRebuildRequired("source_unavailable", startByte, sourceSize);
         }
-        if (sourceSize === checkpoint.sourceSize && sourceMtimeMs === checkpoint.sourceMtimeMs) {
-            if (await hashCodexPrefix(rolloutPath, sourceSize, options.isCancelled) !== checkpoint.prefixSha256) return codexTailRebuildRequired("source_replaced", startByte, sourceSize);
+        if (sourceSize === checkpoint.sourceSize && (archive || sourceMtimeMs === checkpoint.sourceMtimeMs)) {
+            if (await hashCodexPrefix(readPath, sourceSize, options.isCancelled) !== checkpoint.prefixSha256) return codexTailRebuildRequired("source_replaced", startByte, sourceSize);
             return {
                 status: "unchanged",
                 replaceFromRound: checkpoint.replaceFromRound,
                 startByte,
                 sourceSize,
-                roundIndexOffset: checkpoint.replaceFromRound - 1,
+                roundIndexOffset: (checkpoint.sourceRoundIndex ?? checkpoint.replaceFromRound) - 1,
                 rounds: [],
                 childThreads: [],
                 totalSteps: 0,
                 sourceCheckpoints: [],
-                checkpoint,
+                checkpoint: { ...checkpoint, sourceMtimeMs },
             };
         }
     }
 
-    const prefixSha256 = options.historySegment?.prefixSha256 ?? await hashCodexPrefix(rolloutPath, sourceSize, options.isCancelled);
+    const prefixSha256 = historySegment?.prefixSha256 ?? await hashCodexPrefix(readPath, sourceSize, options.isCancelled);
     const ordinalValidator = new CodexOrdinalValidator(
-        checkpoint?.ordinalMode === "explicit" ? checkpoint.replayStartOrdinal! : options.historySegment?.startOrdinal ?? 0,
-        checkpoint?.ordinalMode ?? options.historySegment?.ordinalMode,
+        checkpoint?.ordinalMode === "explicit" ? checkpoint.replayStartOrdinal! : historySegment?.startOrdinal ?? 0,
+        checkpoint?.ordinalMode ?? historySegment?.ordinalMode,
     );
-    const built = await buildCodexRoundsFromRolloutAsync(rolloutPath, link, {
+    const built = await buildCodexRoundsFromRolloutAsync(readPath, link, {
         cwd: options.cwd,
         startByte,
         endByte: sourceSize,
         strict: true,
         expectedPrefixSha256: prefixSha256,
-        prefixIdentity: options.historySegment,
+        prefixIdentity: historySegment,
         previousPrefix: checkpoint ? { endByte: checkpoint.sourceSize, sha256: checkpoint.prefixSha256! } : undefined,
         ordinalValidator,
         isCancelled: options.isCancelled,
     });
     ordinalValidator.finish();
     let after: fs.Stats;
+    let readAfter: fs.Stats;
     try {
         after = await fs.promises.stat(rolloutPath);
+        readAfter = readPath === rolloutPath ? after : await fs.promises.stat(readPath);
     } catch {
         return codexTailRebuildRequired("source_unavailable", startByte, sourceSize);
     }
-    if (after.size < sourceSize) {
-        return codexTailRebuildRequired("source_changed_during_read", startByte, after.size);
+    if (readAfter.size < sourceSize || (archive && (after.size !== before.size || after.mtimeMs !== before.mtimeMs
+        || readAfter.size !== readBefore.size || readAfter.mtimeMs !== readBefore.mtimeMs
+        || await hashCodexPrefix(rolloutPath, after.size, options.isCancelled) !== archive.sourceSha256))) {
+        return codexTailRebuildRequired("source_changed_during_read", startByte, readAfter.size);
     }
-    const sourceAnchor = await codexCheckpointAnchor(rolloutPath, sourceSize);
+    const sourceAnchor = await codexCheckpointAnchor(readPath, sourceSize);
     if (options.endByte === undefined && (after.size !== before.size || after.mtimeMs !== before.mtimeMs)) {
         return codexTailRebuildRequired("source_changed_during_read", startByte, after.size);
     }
 
     const replaceFromRound = checkpoint?.replaceFromRound || 1;
-    const roundIndexOffset = replaceFromRound - 1;
+    const roundIndexOffset = (checkpoint?.sourceRoundIndex ?? replaceFromRound) - 1;
     const stepIndexOffset = checkpoint ? checkpoint.replayStartStep - 1 : 0;
     rebaseCodexRoundTail(built.rounds, roundIndexOffset, stepIndexOffset);
     const sourceCheckpoints = built.sourceCheckpoints.map(item => ({ ...item, roundIndex: item.roundIndex + roundIndexOffset }));
@@ -3692,7 +3713,7 @@ export async function readCodexRoundTail(
             replaceFromRound: lastRoundCheckpoint?.roundIndex ?? replaceFromRound,
             prefixSha256,
             ordinalMode: ordinalValidator.mode ?? checkpoint?.ordinalMode,
-            replayStartOrdinal: lastRoundCheckpoint?.sourceOrdinal ?? (startByte === 0 ? options.historySegment?.startOrdinal ?? 0 : checkpoint?.replayStartOrdinal),
+            replayStartOrdinal: lastRoundCheckpoint?.sourceOrdinal ?? (startByte === 0 ? historySegment?.startOrdinal ?? 0 : checkpoint?.replayStartOrdinal),
         },
     };
 }
@@ -3702,7 +3723,9 @@ async function codexRoundTailCheckpointFromBuild(
     built: CodexRoundBuildResult,
     expectedSource?: CodexSourceVersionExpectation,
 ): Promise<CodexRoundTailCheckpoint | undefined> {
-    const stat = await fs.promises.stat(rolloutPath);
+    const leaf = expectedSource?.historySource?.segments.at(-1);
+    const readPath = leaf ? codexHistorySegmentReadPath(leaf) : rolloutPath;
+    const stat = await fs.promises.stat(readPath);
     if (!stat.isFile()) return undefined;
     const sourceSize = expectedSource?.sourceSize ?? stat.size;
     if (stat.size < sourceSize) return undefined;
@@ -3711,19 +3734,19 @@ async function codexRoundTailCheckpointFromBuild(
     const lastRound = built.lastRound || (lastRoundCheckpoint
         ? built.rounds.find(round => round.roundIndex === lastRoundCheckpoint.roundIndex)
         : undefined);
-    const anchor = await codexCheckpointAnchor(rolloutPath, sourceSize);
+    const anchor = await codexCheckpointAnchor(readPath, sourceSize);
     return {
         version: 1,
         sourceSize,
-        sourceMtimeMs: expectedSource?.sourceMtimeMs ?? stat.mtimeMs,
+        sourceMtimeMs: Math.trunc(expectedSource?.sourceMtimeMs ?? stat.mtimeMs),
         anchorStartByte: anchor.anchorStartByte,
         anchorSha256: anchor.anchorSha256,
         replayStartByte: lastRoundCheckpoint?.sourceByte ?? 0,
         replayStartStep: lastRound?.startStep ?? 1,
         replaceFromRound: lastRoundCheckpoint?.roundIndex ?? 1,
-        prefixSha256: expectedSource?.historySource?.segments.at(-1)?.prefixSha256 ?? await hashCodexPrefix(rolloutPath, sourceSize),
-        ordinalMode: expectedSource?.historySource?.segments.at(-1)?.ordinalMode ?? "legacy",
-        replayStartOrdinal: lastRoundCheckpoint?.sourceOrdinal ?? (lastRoundCheckpoint ? undefined : expectedSource?.historySource?.segments.at(-1)?.startOrdinal ?? 0),
+        prefixSha256: leaf?.prefixSha256 ?? await hashCodexPrefix(readPath, sourceSize),
+        ordinalMode: leaf?.ordinalMode ?? "legacy",
+        replayStartOrdinal: lastRoundCheckpoint?.sourceOrdinal ?? (lastRoundCheckpoint ? undefined : leaf?.startOrdinal ?? 0),
     };
 }
 
@@ -3961,6 +3984,15 @@ export async function assertCodexSourceVersion(
     await runSharedCodexSourceWork(`assert:${stage}:${canonicalCodexSourcePath(rolloutPath)}:${JSON.stringify(expected)}`, async sharedIsCancelled => {
         if (expected.historySource) await assertCodexHistorySourceAsync(expected.historySource, sharedIsCancelled);
         const stat = await fs.promises.stat(rolloutPath);
+        const leaf = expected.historySource?.segments.at(-1);
+        if (leaf?.archive) {
+            if (canonicalCodexSourcePath(rolloutPath) !== canonicalCodexSourcePath(expected.sourcePath) || !stat.isFile()
+                || stat.size !== leaf.archive.sourceSize || Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs)
+                || expected.sourceSize !== leaf.endByte) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+            const anchor = await codexCheckpointAnchor(codexHistorySegmentReadPath(leaf), expected.sourceSize);
+            if (anchor.anchorStartByte !== expected.anchorStartByte || anchor.anchorSha256 !== expected.anchorSha256) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+            return;
+        }
         if (canonicalCodexSourcePath(rolloutPath) !== canonicalCodexSourcePath(expected.sourcePath) || !stat.isFile() || stat.size < expected.sourceSize) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
         if (stat.size === expected.sourceSize) {
             if (Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs)) throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
@@ -3983,7 +4015,8 @@ export async function captureCodexSourceVersionAsync(filePath: string, isCancell
         const stat = await fs.promises.stat(sourcePath);
         if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
         const historySource = parseCodexRolloutFilename(sourcePath) ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled: sharedIsCancelled }) : undefined;
-        const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
+        if (historySource) return codexSourceVersionFromHistory(historySource);
+        const sourceSize = stat.size;
         const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
         return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
     }, isCancelled);
@@ -3996,7 +4029,8 @@ export async function inspectCodexSourceVersionAsync(filePath: string, isCancell
     const historySource = parseCodexRolloutFilename(sourcePath)
         ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled, metadataOnly: true })
         : undefined;
-    const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
+    if (historySource) return codexSourceVersionFromHistory(historySource);
+    const sourceSize = stat.size;
     const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
     return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
 }
@@ -4006,7 +4040,8 @@ export function captureCodexSourceVersion(filePath: string): CodexSourceVersionE
     const stat = fs.statSync(sourcePath);
     if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
     const historySource = parseCodexRolloutFilename(sourcePath) ? resolveCodexHistorySource(sourcePath) : undefined;
-    const sourceSize = historySource?.segments.at(-1)?.endByte ?? stat.size;
+    if (historySource) return codexSourceVersionFromHistory(historySource);
+    const sourceSize = stat.size;
     const anchor = codexCheckpointAnchorSync(sourcePath, sourceSize);
     return {
         sourcePath,
@@ -4032,6 +4067,18 @@ export function assertCodexSourceVersionSync(
         stat = fs.statSync(rolloutPath);
     } catch {
         throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+    }
+    const leaf = expected.historySource?.segments.at(-1);
+    if (leaf?.archive) {
+        if (actualPath !== expectedPath || !stat.isFile() || stat.size !== leaf.archive.sourceSize
+            || Math.trunc(stat.mtimeMs) !== Math.trunc(expected.sourceMtimeMs) || expected.sourceSize !== leaf.endByte) {
+            throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+        }
+        const anchor = codexCheckpointAnchorSync(codexHistorySegmentReadPath(leaf), expected.sourceSize);
+        if (anchor.anchorStartByte !== expected.anchorStartByte || anchor.anchorSha256 !== expected.anchorSha256) {
+            throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
+        }
+        return;
     }
     if (
         actualPath !== expectedPath

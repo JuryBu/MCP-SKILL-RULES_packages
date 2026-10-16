@@ -2,25 +2,29 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import {
+const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-conversation-fetch-worker-"));
+const originalHome = os.homedir;
+os.homedir = () => testRoot;
+process.env.MEMORY_STORE_DATA_ROOT = path.join(testRoot, "data");
+process.env.MEMORY_STORE_AUTO_RECORD = "0";
+process.env.MEMORY_STORE_LIFECYCLE_ENABLED = "false";
+const {
     buildCodexFetchTaskId,
     createCodexFetchWorkerPayload,
     runCodexFetchWorker,
-} from "../src/conversation-fetch-worker-client.ts";
-import {
+} = await import("../src/conversation-fetch-worker-client.ts");
+const {
     createCodexFetchWorkerLinkDiagnostics,
     isCodexFetchWorkerPayload,
     resolveCodexFetchWorkerLink,
-} from "../src/conversation-fetch-worker-types.ts";
-import { writeFetchedConversationArtifact } from "../src/conversation-fetch-artifact.ts";
-import { getBackgroundTaskRecoveryHandler } from "../src/background-tasks.ts";
-import {
+} = await import("../src/conversation-fetch-worker-types.ts");
+const { writeFetchedConversationArtifact } = await import("../src/conversation-fetch-artifact.ts");
+const { getBackgroundTaskRecoveryHandler } = await import("../src/background-tasks.ts");
+const {
     assertCodexSourceVersion,
     buildCodexRoundsFromRolloutForTest,
     captureCodexSourceVersion,
-} from "../src/codex-client.ts";
-
-const testRoot = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-conversation-fetch-worker-"));
+} = await import("../src/codex-client.ts");
 const fixturePath = path.join(testRoot, "fixture-worker.mjs");
 const sourcePath = path.join(testRoot, "source.jsonl");
 fs.writeFileSync(sourcePath, "fixture source\n", "utf8");
@@ -105,6 +109,22 @@ try {
     writeFixture();
     assert.equal(isCodexFetchWorkerPayload(payload), true);
     assert.equal(isCodexFetchWorkerPayload({ ...payload, modelChain: "windsurf" }), false);
+    assert.equal(payload.forceRawCacheRebuild, undefined);
+    const forcePayload = createCodexFetchWorkerPayload({
+        conversationId: payload.conversationId,
+        link: payload.link,
+        source: payload.source,
+        estimate: { ...sourceVersion, thresholdBytes: 1, shouldBackground: true },
+        modelChain: payload.modelChain,
+        now: payload.artifactBucket * 60 * 60 * 1000,
+        forceRawCacheRebuild: true,
+    });
+    assert.equal(forcePayload.forceRawCacheRebuild, true);
+    assert.equal(isCodexFetchWorkerPayload(forcePayload), true);
+    assert.equal(isCodexFetchWorkerPayload({ ...forcePayload, forceRawCacheRebuild: "true" }), false);
+    assert.equal(isCodexFetchWorkerPayload({ ...forcePayload, source: "cache" }), false);
+    assert.notEqual(buildCodexFetchTaskId(payload), buildCodexFetchTaskId(forcePayload));
+    assert.equal(buildCodexFetchTaskId(forcePayload), buildCodexFetchTaskId(JSON.parse(JSON.stringify(forcePayload))));
     const expandedLink = resolveCodexFetchWorkerLink("expand_children");
     assert.deepEqual(expandedLink, {
         requestedLink: "expand_children",
@@ -243,7 +263,7 @@ try {
     await import("../src/tools/conversation.ts");
     const recoveryHandler = getBackgroundTaskRecoveryHandler("conversation-fetch");
     assert.ok(recoveryHandler, "conversation-fetch must register a startup recovery handler");
-    for (const resumePayload of [payload, { ...payload, version: 2, verificationDeferred: true }]) {
+    for (const resumePayload of [payload, forcePayload, { ...forcePayload, version: 2, verificationDeferred: true }]) {
         const recoveryAction = await recoveryHandler?.({
             id: buildCodexFetchTaskId(payload),
             kind: "conversation-fetch",
@@ -265,6 +285,7 @@ try {
 
     console.log("conversation fetch worker tests passed");
 } finally {
+    os.homedir = originalHome;
     delete process.env.MEMORY_STORE_FETCH_WORKER_FIXTURE_MODE;
     delete process.env.MEMORY_STORE_FETCH_WORKER_FIXTURE_ARTIFACT;
     fs.rmSync(testRoot, { recursive: true, force: true });

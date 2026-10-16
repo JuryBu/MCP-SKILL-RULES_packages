@@ -1,4 +1,4 @@
-# MCP Memory Store v1.25.7
+# MCP Memory Store v1.25.9
 
 ## Record归属核查
 
@@ -333,6 +333,12 @@ Antigravity LS 模型默认值：`MEMORY_STORE_LS_MODEL` 未设置时使用 `MOD
 
 ### Stage Guard 调用约束
 
+Guard 分别记录材料读取、索引序列化和最终模型输入的覆盖情况。外部材料默认是必需证据；`role="reference|context|optional"` 表示参考材料，`range` 则限定本次要求读取的范围。必需材料未读、执行原文缺失或必需内容被裁剪时，即使模型返回 PASS，程序仍保留 `EVIDENCE_INSUFFICIENT` 与原始模型回复。参考材料的缺口单独显示，完整保留的必需材料按其实际内容验收。
+
+长对话可在明确提供必需外部材料时，显式设置 `executionEvidenceRole="reference"`，让本次验收以完整的必需材料为依据，对话执行记录的缺口继续展示。默认值为 `required`；缺少必需外部材料时，参考设置会返回证据不足。该角色随后台任务保存，恢复后沿用原要求。
+
+Codex CLI 每次调用把有界 stdout、stderr、参数和终态写入私有 `model-bridge-diagnostics/codex/<callId>`，该目录与临时报告目录同级。单次保留 stdout 至多4MiB、stderr至多1MiB，分别记录保留文件哈希和完整流哈希；全流字节数与截断标记随诊断返回。目录持续保留至维护者明确归档或删除，原始输出可能包含私有内容，发布时只提供脱敏摘要。结构化工具拒绝会停止当前调用；模型自述拒绝、事件缺失及诊断保存失败都有独立状态。后台取消或超期后的诊断引用继续挂在原task，原终态保留。
+
 在 Codex / Claude Code / Windsurf 侧使用 `stage_guard` 时，必须显式传入稳定的 `conversationId`。如果不知道当前线程 ID，先调用 `conversation_read_original(action="list", dataChain="codex|claude-code|windsurf", query="标题或关键词", contextProbe="当前可见对话片段")` 定位完整 ID，再把同一个 ID 用于后续 `start/status/check/cancel`。Guard 的对话数据固定绑定当前宿主的明确对话，只有审核模型通过 `modelChain` 选择；Windsurf 不作为审核模型链路，Grok 可通过 `modelChain="grok"` 或 `auto` 的第一优先路由参与审核。
 
 v1.19.2 起，`childScopeId` 只负责区分并行 Guard，传入时必须同时提供 `scopeSelectors`（Task 编号、小标题或稳定锚点）来定义实际审核范围。同一 GuardKey 重复 start 默认拒绝，只有 `force=true` 才会精确替换；selector 不完整且存在多个候选时 check/status/cancel 返回候选列表，不会静默选择。后台 check 与 PASS receipt 会携带 guardId，旧结果若遇到 force 替换会判定过期并拒绝写回。
@@ -426,6 +432,10 @@ memory-store/             ← 记忆数据（分离存储）
 ## 开发
 
 ### Codex 引用式历史
+
+支持 `.jsonl.zst` 归档来源。解析器校验压缩原件的stat和SHA256，使用独立、可重建的JSONL视图校验逻辑字节与继承截止位置；两种字节身份分别记录。解压默认限制压缩输入256MiB、逻辑输出512MiB、窗口128MiB，并检查磁盘余量、checksum及来源变化。临时视图按owner和来源身份隔离，清理前须确认活动读取和持久来源清单已解除引用。
+
+旧缓存的记录条数和轮号范围分别表示，例如655条记录可以保留1～676的原轮号。搜索、读取、恢复和导出沿用真实轮号；正常追加从最后一个完整合并轮重放，并保留源轮号到缓存轮号的映射。旧generation保持可读，检查点不一致时保留旧代并要求显式重建，避免把错误映射带入下一代。
 
 支持 `session_meta.history_base` 与双 UUID rollout 文件：从当前线程表指定的叶文件追溯物理来源，严格按字节及全局记录截止位置读取继承前缀。回退或分叉后排除的旧尾部不会重新进入当前历史；缺失、歧义、循环和边界不一致会使读取失败，而不会把局部记录称为完整历史。
 

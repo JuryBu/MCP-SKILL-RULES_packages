@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import * as zlib from "node:zlib";
 import {
     assertCodexHistorySource,
+    assertCodexHistorySourceAsync,
+    codexHistorySegmentReadPath,
     parseCodexRolloutFilename,
     resolveCodexHistorySource,
     resolveCodexHistorySourceAsync,
+    type CodexHistorySource,
 } from "../src/codex-history-source.ts";
+import { CodexOrdinalValidator, type CodexOrdinalMode } from "../src/codex-history-integrity.ts";
 
 const ROOT = "11111111-1111-4111-8111-111111111111";
 const MID_LOGICAL = "22222222-2222-4222-8222-222222222222";
@@ -37,12 +42,28 @@ function base(rolloutId: string, ordinal: number, endByte: number): Record<strin
     return { thread_id: rolloutId, end_ordinal_exclusive: ordinal, end_byte_offset: endByte };
 }
 
+function assertSyntheticOrdinals(source: CodexHistorySource): void {
+    let ordinal = 0;
+    let previousMode: CodexOrdinalMode | undefined;
+    for (const segment of source.segments) {
+        assert.equal(segment.startOrdinal, ordinal);
+        const validator = new CodexOrdinalValidator(segment.startOrdinal, segment.ordinalMode, previousMode);
+        const prefix = fs.readFileSync(codexHistorySegmentReadPath(segment)).subarray(0, segment.endByte).toString("utf8");
+        for (const line of prefix.split("\n").filter(Boolean)) validator.add(JSON.parse(line));
+        validator.finish(segment.endOrdinalExclusive);
+        ordinal = validator.nextOrdinal;
+        previousMode = validator.mode ?? previousMode;
+    }
+}
+
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "codex-history-source-test-"));
 try {
     const parsedLegacy = parseCodexRolloutFilename(filename(ROOT));
     assert.deepEqual(parsedLegacy, { threadId: ROOT, rolloutId: ROOT });
     assert.deepEqual(parseCodexRolloutFilename(filename(MID_LOGICAL, MID_PHYSICAL)), { threadId: MID_LOGICAL, rolloutId: MID_PHYSICAL });
     assert.equal(parseCodexRolloutFilename("not-a-rollout.jsonl"), null);
+    assert.deepEqual(parseCodexRolloutFilename(`${filename(MID_LOGICAL, MID_PHYSICAL)}.zst`), { threadId: MID_LOGICAL, rolloutId: MID_PHYSICAL });
+    assert.equal(parseCodexRolloutFilename(`${filename(ROOT)}.zst.partial`), null);
 
     const noNewline = writeRollout(path.join(temp, "no-newline"), ROOT);
     fs.writeFileSync(noNewline.file, noNewline.text.trimEnd());
@@ -146,6 +167,88 @@ try {
     const mutableSource = resolveCodexHistorySource(mutable.file, { roots: [path.dirname(mutable.file)] });
     fs.writeFileSync(mutable.file, mutable.text.replace("alpha", "omega"));
     assert.throws(() => assertCodexHistorySource(mutableSource), /boundary changed/);
+
+    if (typeof zlib.zstdCompressSync === "function") {
+        const archive = { cacheRoot: path.join(temp, "archive-views"), ownerId: "synthetic-source-test", maxDecompressedBytes: 4 * 1024 * 1024 };
+        const compressedDirectory = path.join(temp, "compressed-chain");
+        const compressedRoot = writeRollout(compressedDirectory, ROOT, ROOT, undefined, ['{"type":"event","value":"中文🙂"}']);
+        const compressedMiddle = writeRollout(compressedDirectory, MID_LOGICAL, MID_PHYSICAL, base(ROOT, 2, Buffer.byteLength(compressedRoot.text)));
+        const compressedLeaf = writeRollout(compressedDirectory, LEAF, LEAF_PHYSICAL, base(MID_PHYSICAL, 4, Buffer.byteLength(compressedMiddle.text)));
+        fs.writeFileSync(`${compressedRoot.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedRoot.text)));
+        fs.unlinkSync(compressedRoot.file);
+        const compressedSource = resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive });
+        assert.equal(compressedSource.segments[0]!.path, `${compressedRoot.file}.zst`);
+        assert.equal(compressedSource.segments[0]!.size, Buffer.byteLength(compressedRoot.text));
+        assert.notEqual(codexHistorySegmentReadPath(compressedSource.segments[0]!), compressedSource.segments[0]!.path);
+        assert.equal(fs.readFileSync(codexHistorySegmentReadPath(compressedSource.segments[0]!), "utf8"), compressedRoot.text);
+        assertCodexHistorySource(compressedSource);
+        assertSyntheticOrdinals(compressedSource);
+        await assertCodexHistorySourceAsync(compressedSource);
+        assert.equal((await resolveCodexHistorySourceAsync(compressedLeaf.file, { roots: [compressedDirectory], archive })).revision, compressedSource.revision);
+        const metadata = await resolveCodexHistorySourceAsync(compressedLeaf.file, { roots: [compressedDirectory], archive, metadataOnly: true });
+        assert.equal(metadata.segments[0]!.archive!.sourceSha256, compressedSource.segments[0]!.archive!.sourceSha256);
+        assert.equal(metadata.segments[0]!.endByte, compressedSource.segments[0]!.endByte);
+
+        const secondView = resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive: { ...archive, ownerId: "another-view-owner" } });
+        assert.notEqual(secondView.segments[0]!.readPath, compressedSource.segments[0]!.readPath);
+        assert.equal(secondView.revision, compressedSource.revision, "view ownership and regeneration must not alter physical source revision");
+        const tampered = structuredClone(compressedSource);
+        tampered.segments[0]!.readPath = compressedLeaf.file;
+        assert.throws(() => assertCodexHistorySource(tampered), /identity mismatch/);
+
+        fs.writeFileSync(`${compressedMiddle.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedMiddle.text)));
+        const pair = resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive });
+        assert.equal(pair.segments[1]!.replicas!.length, 1);
+        assert.equal((await resolveCodexHistorySourceAsync(compressedLeaf.file, { roots: [compressedDirectory], archive })).revision, pair.revision);
+        assertCodexHistorySource(pair);
+        fs.writeFileSync(`${compressedMiddle.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedMiddle.text.replace('"a"', '"b"'))));
+        assert.throws(() => resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive }), /Conflicting/);
+        await assert.rejects(resolveCodexHistorySourceAsync(compressedLeaf.file, { roots: [compressedDirectory], archive }), /Conflicting/);
+        await assert.rejects(assertCodexHistorySourceAsync(pair), /physical archive changed/);
+        fs.unlinkSync(`${compressedMiddle.file}.zst`);
+
+        fs.writeFileSync(`${compressedMiddle.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedMiddle.text)));
+        fs.unlinkSync(compressedMiddle.file);
+        fs.writeFileSync(`${compressedLeaf.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedLeaf.text)));
+        const pairedPlainLeaf = resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive });
+        const pairedCompressedLeaf = await resolveCodexHistorySourceAsync(`${compressedLeaf.file}.zst`, { roots: [compressedDirectory], archive });
+        assert.equal(pairedPlainLeaf.segments.at(-1)!.path, compressedLeaf.file);
+        assert.equal(pairedCompressedLeaf.segments.at(-1)!.path, `${compressedLeaf.file}.zst`);
+        assert.equal(pairedPlainLeaf.segments.at(-1)!.replicas!.length, 1);
+        assertCodexHistorySource(pairedPlainLeaf);
+        await assertCodexHistorySourceAsync(pairedCompressedLeaf);
+        fs.writeFileSync(`${compressedLeaf.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedLeaf.text.replace('"a"', '"b"'))));
+        assert.throws(() => resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive }), /Conflicting/);
+        await assert.rejects(resolveCodexHistorySourceAsync(`${compressedLeaf.file}.zst`, { roots: [compressedDirectory], archive }), /Conflicting/);
+        fs.writeFileSync(`${compressedLeaf.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedLeaf.text)));
+        fs.unlinkSync(compressedLeaf.file);
+        const allCompressed = resolveCodexHistorySource(`${compressedLeaf.file}.zst`, { roots: [compressedDirectory], archive });
+        assert.ok(allCompressed.segments.every(segment => segment.archive && segment.readPath));
+        assert.equal(allCompressed.leafPath, `${compressedLeaf.file}.zst`);
+        assert.equal((await resolveCodexHistorySourceAsync(allCompressed.leafPath, { roots: [compressedDirectory], archive })).revision, allCompressed.revision);
+        assertCodexHistorySource(allCompressed);
+        assertSyntheticOrdinals(allCompressed);
+        fs.unlinkSync(allCompressed.segments[0]!.readPath!);
+        assert.equal(resolveCodexHistorySource(allCompressed.leafPath, { roots: [compressedDirectory], archive }).revision, allCompressed.revision);
+        assertCodexHistorySource(allCompressed);
+        const oldRootBytes = fs.readFileSync(`${compressedRoot.file}.zst`);
+        fs.writeFileSync(`${compressedRoot.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedRoot.text.replace("中文", "改写"))));
+        assert.throws(() => assertCodexHistorySource(allCompressed), /physical archive changed/);
+        await assert.rejects(assertCodexHistorySourceAsync(allCompressed), /physical archive changed/);
+        fs.writeFileSync(`${compressedRoot.file}.zst`, oldRootBytes);
+
+        const boundaryDirectory = path.join(temp, "compressed-boundary");
+        const boundaryRoot = writeRollout(boundaryDirectory, ROOT);
+        const boundaryLeaf = writeRollout(boundaryDirectory, LEAF, LEAF_PHYSICAL, base(ROOT, 1, boundaryRoot.headerEnd + 1));
+        fs.writeFileSync(`${boundaryRoot.file}.zst`, zlib.zstdCompressSync(Buffer.from(boundaryRoot.text)));
+        fs.unlinkSync(boundaryRoot.file);
+        assert.throws(() => resolveCodexHistorySource(boundaryLeaf.file, { roots: [boundaryDirectory], archive }), /complete JSONL line/);
+        await assert.rejects(resolveCodexHistorySourceAsync(boundaryLeaf.file, { roots: [boundaryDirectory], archive }), /complete JSONL line/);
+        const wrongOrdinalLeaf = writeRollout(boundaryDirectory, LEAF, LEAF_PHYSICAL, base(ROOT, 99, Buffer.byteLength(boundaryRoot.text)));
+        const wrongOrdinalSource = resolveCodexHistorySource(wrongOrdinalLeaf.file, { roots: [boundaryDirectory], archive });
+        assert.throws(() => assertSyntheticOrdinals(wrongOrdinalSource), /byte and ordinal boundaries disagree/);
+        await assert.rejects(resolveCodexHistorySourceAsync(allCompressed.leafPath, { roots: [compressedDirectory], archive, isCancelled: () => true }), { name: "AbortError" });
+    }
 } finally {
     fs.rmSync(temp, { recursive: true, force: true });
 }

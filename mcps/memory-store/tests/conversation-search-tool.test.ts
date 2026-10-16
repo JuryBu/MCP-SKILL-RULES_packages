@@ -43,6 +43,17 @@ try {
     assert.equal(schema.contextRounds.parse(undefined), undefined);
     assert.equal(schema.limit.parse(undefined), undefined);
     assert.equal(schema.source.parse("auto"), "auto");
+    assert.equal(schema.forceRefresh.parse(true), true);
+    const beforeForceRead = loads.length;
+    assert.match(await call({ action: "read", forceRefresh: true }), /forceRefresh=true 仅支持 action=fetch/u);
+    assert.match(await call({ action: "fetch", source: "cache", forceRefresh: true }), /forceRefresh=true 仅支持 action=fetch/u);
+    assert.match(await call({ action: "fetch", cacheGeneration: "pinned-old", forceRefresh: true }), /forceRefresh=true 仅支持 action=fetch/u);
+    assert.equal(loads.length, beforeForceRead);
+    await call({ action: "fetch", source: "local", forceRefresh: true });
+    assert.equal(loads.at(-1)?.options?.forceRawCacheRebuild, true);
+    await call({ action: "fetch", source: "local" });
+    assert.equal(loads.at(-1)?.options?.forceRawCacheRebuild, false);
+    estimates = 0;
     const text = await call({ query: "needle", messageRoles: ["user"], startRound: 2, endRound: 2, maxHits: 1 });
     assert.match(text, /exact 模式命中 1 处/u);
     assert.match(text, /轮次 2 · user/u);
@@ -133,6 +144,7 @@ try {
         loads.push({ chain, conversationId, options });
         const cached = cache.readConversationSourceCacheOnly<ConversationLoadResult>({ key, generation: options?.cacheGeneration });
         return cached ? { ...cached.snapshot, cacheKey: key, cacheGeneration: cached.generation, cacheCreatedAt: cached.createdAt,
+            roundIndexBounds: cached.roundIndexBounds,
             cacheState: "hit", cacheReadPolicy: "published", sourceMode: "cache" } : null;
     };
     const cacheSearch = await call({ query: "old-generation-ending", source: "cache" });
@@ -168,6 +180,37 @@ try {
     assert.match(nextPage, /本次原文校验: no/u);
     assert.equal(loads.at(-1)?.options?.cacheGeneration, original.generation);
     assert.match(await call({ action: "read", source: "cache", cacheGeneration: "missing-generation", startRound: 1 }), /恢复调用/u);
+    const gaps = new Set([582, 601, 602, 603, 604, 605, 606, 607, 608, 609, 610, 611, 612, 613, 631, 632, 633, 634, 635, 674, 675]);
+    const sparseRounds = Array.from({ length: 676 }, (_, index) => index + 1).filter(index => !gaps.has(index)).map(index => round(index, `sparse-body-${index}`));
+    const annotationRound = sparseRounds.find(item => item.roundIndex === 670)!;
+    annotationRound.userMessage = "sparse-user-body " + "片段".repeat(6_000);
+    annotationRound.userMessages = [{ text: annotationRound.userMessage, annotations: [{ selectedText: "synthetic selection", comment: "sparse-annotation-needle" }] }];
+    sparseRounds.at(-1)!.userMessage = "last-sparse-676";
+    const sparse = await cache.readOrBuild({ key, refresh: true, fingerprint: { revision: "sparse" },
+        build: () => ({ snapshot: { ...snapshot, roundCount: 655 }, rounds: sparseRounds }), getRoundNumber: item => item.roundIndex });
+    const sparseSearch = await call({ query: "sparse-annotation-needle", source: "cache", cacheGeneration: sparse.generation, contextRounds: 1, messageRoles: ["user"] });
+    assert.match(sparseSearch, /轮次 670 · Annotation 1/u);
+    assert.match(sparseSearch, /轮次 669 \(steps/u);
+    assert.match(sparseSearch, /轮次 671 \(steps/u);
+    const sparseRead = await call({ action: "read", source: "cache", cacheGeneration: sparse.generation, startRound: 664, endRound: 676, messageRoles: ["user"] });
+    assert.ok(!sparseRead.includes("超出范围") && !sparseRead.includes("超出轮号范围"));
+    assert.match(sparseRead, /last-sparse-676/u);
+    assert.match(sparseRead, /655 轮对话/u);
+    const defaultEnd = await call({ action: "read", source: "cache", cacheGeneration: sparse.generation, startRound: 676 });
+    assert.match(defaultEnd, /last-sparse-676/u);
+    let sparsePage = await call({ action: "read", source: "cache", cacheGeneration: sparse.generation, startRound: 670, endRound: 676, maxBytes: 8_192 });
+    let delivered = sparsePage;
+    let pages = 1;
+    while (true) {
+        const continuation = sparsePage.split("\n").find(line => line.startsWith('{"action":"read"') && line.includes("continuationCursor"));
+        if (!continuation) break;
+        assert.ok(pages++ < 20);
+        sparsePage = await call(JSON.parse(continuation));
+        assert.match(sparsePage, new RegExp(sparse.generation));
+        delivered += sparsePage;
+    }
+    assert.ok(pages > 1);
+    assert.match(delivered, /last-sparse-676/u);
     console.log("conversation-search-tool: PASS schema/source explicitness/filters/short excerpts/fuzzy/cache diagnostics/fixed generation/continuation");
 } finally {
     cache.resetConversationSourceCacheForTests();

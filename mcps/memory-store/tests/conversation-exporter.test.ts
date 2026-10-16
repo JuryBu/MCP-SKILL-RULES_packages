@@ -305,6 +305,30 @@ assert.equal(cachedRangeResult.stats.totalRounds, 3);
 assert.equal(cachedRangeResult.stats.roundsExported, 1);
 
 const previousExportMaxChars = process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS;
+const sparseRounds = [makeRound(1, "sparse first"), makeRound(670, "sparse before"), makeRound(673, "sparseNeedleUnique"), makeRound(676, "sparse last")];
+const sparseKey = { source: "codex:link=summary", conversationId: "synthetic-sparse-export" };
+const sparseCache = await readOrBuildConversationSourceCache({
+    key: sparseKey, fingerprint: { revision: "sparse" },
+    build: () => ({ snapshot: {}, rounds: sparseRounds }), getRoundNumber: round => round.roundIndex,
+});
+for (const cached of [false, true]) {
+    for (const scope of ["rounds", "search", "full"] as const) {
+        const result = await exportConversation({
+            conversationId: sparseKey.conversationId, chainUsed: "codex", rounds: cached ? [] : sparseRounds,
+            totalSteps: 6761, ...(cached ? { cacheKey: sparseKey, cacheGeneration: sparseCache.generation } : {}),
+            format: "markdown", scope, startRound: 664, endRound: cached ? 676 : undefined,
+            query: scope === "search" ? "sparseNeedleUnique" : undefined, mode: "exact", contextRounds: 0,
+            outputDir: path.join(dataRoot, "sparse-export", `${cached}-${scope}`), overwrite: true, includeAssets: false,
+        });
+        const markdown = fs.readFileSync(result.markdownPath || "", "utf8");
+        assert.equal(result.stats.totalRounds, 4);
+        assert.equal(result.stats.roundsExported, scope === "search" ? 1 : scope === "rounds" ? 3 : 4);
+        assert.match(markdown, /sparseNeedleUnique/u);
+        if (scope === "full") assert.match(markdown, /1-676/u);
+        else assert.doesNotMatch(markdown, /sparse first/u);
+        if (scope === "search") assert.doesNotMatch(markdown, /sparse before|sparse last/u);
+    }
+}
 try {
     process.env.MEMORY_STORE_CONVERSATION_EXPORT_MAX_CHARS = "6000000";
     const largeBody = `开头-${"x".repeat(5_100_000)}-结尾`;

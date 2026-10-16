@@ -14,6 +14,8 @@ import {
     isCodexSessionStoreAvailable,
     type CodexConversationData,
     type CodexSourceVersionExpectation,
+    type CodexSourceByteCheckpoint,
+    type CodexRoundTailCheckpoint,
 } from "./codex-client.js";
 import { assertCodexHistorySourceAsync, CodexHistorySourceMismatchError, type CodexHistorySource } from "./codex-history-source.js";
 import {
@@ -48,7 +50,7 @@ import { withConversationSourcePressure } from "./conversation-source-pressure.j
 import { isAntigravityLS } from "./lifecycle.js";
 import { fetchTrajectory, getCurrentCascadeId, isLsAvailable, listLiveAntigravityConversationIds } from "./ls-client.js";
 import { setCurrentContext } from "./conversation-router.js";
-import { mergeConsecutiveHumanRounds, normalizeConversationAutomationRound, parseRounds, type ConversationRound } from "./trajectory.js";
+import { createConsecutiveHumanRoundMerger, mergeConsecutiveHumanRounds, normalizeConversationAutomationRound, parseRounds, type ConversationRound } from "./trajectory.js";
 import {
     buildConversationCompactionMetadata,
     projectConversationRoundForRecallMetadata,
@@ -64,11 +66,14 @@ import {
     createConversationSourceCacheRoundSpool,
     getConversationSourceCacheGenerationKind,
     getConversationSourceCacheReadStatus,
+    getConversationSourceCacheRoundBounds,
     type ConversationSourceCacheKey,
     type ConversationSourceCacheGenerationRef,
     type ConversationSourceFingerprint,
     type ConversationSourceCacheBuildResult,
     type ConversationSourceCacheBuildFailure,
+    type ConversationSourceCacheRoundBounds,
+    type ConversationSourceCachePreparedRounds,
 } from "./conversation-source-cache.js";
 import {
     compareConversationRoundCompleteness,
@@ -97,6 +102,7 @@ export interface ConversationLoadResult {
     conversationId: string;
     rounds: ConversationRound[];
     roundCount?: number;
+    roundIndexBounds?: ConversationSourceCacheRoundBounds;
     roundStart?: number;
     aiResponseCount?: number;
     toolCallCount?: number;
@@ -126,6 +132,17 @@ export interface ConversationLoadResult {
 }
 
 type ConversationCacheAuthority = Extract<ConversationRawSource, "local" | "ls">;
+
+export function getConversationRoundIndexBounds(loaded: Pick<ConversationLoadResult, "rounds" | "roundCount" | "roundIndexBounds">): ConversationSourceCacheRoundBounds {
+    if (loaded.roundIndexBounds) return loaded.roundIndexBounds;
+    let first = Number.POSITIVE_INFINITY;
+    let last = 0;
+    for (const round of loaded.rounds) {
+        first = Math.min(first, round.roundIndex);
+        last = Math.max(last, round.roundIndex);
+    }
+    return last > 0 ? { first, last } : { first: loaded.roundCount ? 1 : 0, last: loaded.roundCount || 0 };
+}
 
 interface CachedConversationLoadResult extends ConversationLoadResult {
     cacheAuthority?: ConversationCacheAuthority;
@@ -445,6 +462,7 @@ async function loadFromResolvedChain(
         assertPublishable: resolved === "codex" && options.expectedCodexSource
             ? () => assertCodexSourceVersion(options.expectedCodexSource!.sourcePath, options.expectedCodexSource, "before cache publication", options.isCancelled)
             : undefined,
+        validateBuild: resolved === "codex" ? assertCodexNormalizedCacheBuild : undefined,
         build: async () => withConversationSourcePressure(options.requestClass || "foreground", async () => {
             throwIfConversationLoadCancelled(options);
             const incremental = buildPrevious
@@ -461,17 +479,22 @@ async function loadFromResolvedChain(
                 let toolCallCount = 0;
                 const recallMetadataRounds: ConversationRound[] = [];
                 const revisionAccumulator = createCodexSourceRevisionAccumulator();
+                const roundMappings: CodexCacheRoundMapping[] = [];
+                const merger = createConsecutiveHumanRoundMerger(round => {
+                    spool.append(round);
+                    roundMappings.push(codexCacheRoundMapping(round));
+                    recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
+                    revisionAccumulator.addRound(round);
+                    aiResponseCount += round.aiResponses.length;
+                    toolCallCount += round.toolCalls.length;
+                });
                 try {
                     const streamedLink = options.link === "reference" ? "reference" : "summary";
                     const codexData = await loadCodexConversationToRoundSinkAsync(
                         effectiveId,
                         (round) => {
                             throwIfConversationLoadCancelled(options);
-                            spool.append(round);
-                            recallMetadataRounds.push(projectConversationRoundForRecallMetadata(round));
-                            revisionAccumulator.addRound(round);
-                            aiResponseCount += round.aiResponses.length;
-                            toolCallCount += round.toolCalls.length;
+                            merger.append(round);
                         },
                         streamedLink,
                         {
@@ -480,6 +503,8 @@ async function loadFromResolvedChain(
                         },
                     );
                     if (!codexData) throw new Error("Codex JSONL 对话不存在或无法读取");
+                    merger.finish();
+                    const normalizedCheckpoints = normalizeCodexCacheCheckpoints(codexData, roundMappings);
                     const preparedRounds = spool.finish();
                     const snapshot: CachedConversationLoadResult = {
                         chainUsed: "codex",
@@ -494,9 +519,14 @@ async function loadFromResolvedChain(
                                 ? Math.floor(codexData.sourceCheckpoint!.sourceMtimeMs)
                                 : null,
                         ),
-                        codexData: { ...codexData, rounds: [] },
+                        codexData: { ...codexData, ...normalizedCheckpoints, rounds: [] },
                         compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
-                        sourceDiagnostics: [`Codex JSONL 已流式规范化为 fetch 缓存，共 ${preparedRounds.roundCount} 轮/${codexData.totalSteps} 步`],
+                        sourceDiagnostics: [
+                            `Codex JSONL 已流式规范化为 fetch 缓存，共 ${preparedRounds.roundCount} 轮/${codexData.totalSteps} 步`,
+                            ...(normalizedCheckpoints.sourceCheckpointUnavailableReason
+                                ? ["Codex 最后合并轮从历史base开始，leaf没有完整重放起点；已发布完整结果，下次来源变化时全量解析，直到尾轮完整位于leaf"]
+                                : []),
+                        ],
                     };
                     return { snapshot, preparedRounds };
                 } catch (error) {
@@ -602,6 +632,135 @@ function codexHistoryCanAppend(previous: CodexHistorySource | undefined, current
     return previous.segments.every((segment, index) => stableSegment(previous, index) === stableSegment(current, index));
 }
 
+interface CodexCacheRoundMapping {
+    roundIndex: number;
+    sourceRoundIndices: number[];
+    startStep: number;
+}
+
+function codexCacheRoundMapping(round: ConversationRound): CodexCacheRoundMapping {
+    return { roundIndex: round.roundIndex, sourceRoundIndices: round.legacyRoundIndices || [round.roundIndex], startStep: round.startStep };
+}
+
+export function normalizeCodexCacheCheckpoints(
+    data: Pick<CodexConversationData, "sourceCheckpoints" | "sourceCheckpoint" | "historySource">,
+    mappings: readonly CodexCacheRoundMapping[],
+): Pick<CodexConversationData, "sourceCheckpoints" | "sourceCheckpoint" | "sourceCheckpointUnavailableReason"> {
+    const sourceToCache = new Map<number, CodexCacheRoundMapping>();
+    for (const mapping of mappings) {
+        for (const sourceRoundIndex of mapping.sourceRoundIndices) {
+            if (sourceToCache.has(sourceRoundIndex)) throw new Error(`Codex source round ${sourceRoundIndex} has multiple cache mappings`);
+            sourceToCache.set(sourceRoundIndex, mapping);
+        }
+    }
+    const starts = new Map<number, CodexSourceByteCheckpoint>();
+    const sourceCheckpoints: CodexSourceByteCheckpoint[] = [];
+    for (const point of data.sourceCheckpoints || []) {
+        const mapping = sourceToCache.get(point.roundIndex);
+        if (!mapping) continue;
+        if (point.kind === "round_start") {
+            const previous = starts.get(mapping.roundIndex);
+            if (!previous || point.sourceByte < previous.sourceByte) starts.set(mapping.roundIndex, point);
+        } else sourceCheckpoints.push({ ...point, sourceRoundIndex: point.sourceRoundIndex ?? point.roundIndex, roundIndex: mapping.roundIndex });
+    }
+    for (const [roundIndex, point] of starts) sourceCheckpoints.push({ ...point, sourceRoundIndex: point.sourceRoundIndex ?? point.roundIndex, roundIndex });
+    sourceCheckpoints.sort((left, right) => left.sourceByte - right.sourceByte || Number(right.kind === "round_start") - Number(left.kind === "round_start"));
+    const last = mappings.at(-1);
+    if (!last) return { sourceCheckpoints, sourceCheckpoint: undefined, sourceCheckpointUnavailableReason: undefined };
+    const start = starts.get(last.roundIndex);
+    const earliestSourceRound = last.sourceRoundIndices.reduce((minimum, sourceRoundIndex) => Math.min(minimum, sourceRoundIndex), Number.POSITIVE_INFINITY);
+    if ((data.historySource?.segments.length ?? 0) > 1
+        && (!start || (start.sourceRoundIndex ?? start.roundIndex) > earliestSourceRound)) {
+        return { sourceCheckpoints, sourceCheckpoint: undefined, sourceCheckpointUnavailableReason: "last_merged_round_starts_before_leaf" };
+    }
+    if (!data.sourceCheckpoint) return { sourceCheckpoints, sourceCheckpoint: undefined, sourceCheckpointUnavailableReason: undefined };
+    if (!start) throw new Error(`Codex cache round ${last.roundIndex} is missing its complete replay boundary`);
+    return {
+        sourceCheckpoints,
+        sourceCheckpointUnavailableReason: undefined,
+        sourceCheckpoint: {
+            ...data.sourceCheckpoint,
+            replaceFromRound: last.roundIndex,
+            sourceRoundIndex: start.sourceRoundIndex ?? start.roundIndex,
+            replayStartByte: start.sourceByte,
+            replayStartOrdinal: start.sourceOrdinal,
+            replayStartStep: last.startStep,
+            roundIndexSpace: "normalized-cache-v1",
+        },
+    };
+}
+
+export class CodexCacheCheckpointRebuildRequiredError extends Error {
+    constructor() {
+        super("Codex cache checkpoint 与已发布轮次映射失配，旧 generation 保留只读；请显式调用 conversation_read_original(action=\"fetch\", conversationId=\"目标ID\", dataChain=\"codex\", forceRefresh=true) 全量重建一次，再恢复增量读取（内部选项forceRawCacheRebuild=true）");
+        this.name = "CodexCacheCheckpointRebuildRequiredError";
+    }
+}
+
+export function assertCodexCacheCheckpointCompatible(
+    checkpoint: CodexRoundTailCheckpoint,
+    bounds: ConversationSourceCacheRoundBounds | undefined,
+    roundCount: number,
+    points: readonly CodexSourceByteCheckpoint[],
+    mapping?: CodexCacheRoundMapping,
+): void {
+    const start = points.find(point => point.kind === "round_start" && point.roundIndex === checkpoint.replaceFromRound && point.sourceByte === checkpoint.replayStartByte);
+    const normalized = checkpoint.roundIndexSpace === "normalized-cache-v1";
+    if (!bounds || bounds.first !== 1 || bounds.last !== roundCount || checkpoint.replaceFromRound !== bounds.last
+        || !start || (checkpoint.replayStartOrdinal !== undefined && start.sourceOrdinal !== checkpoint.replayStartOrdinal)
+        || (normalized && (!Number.isSafeInteger(checkpoint.sourceRoundIndex) || checkpoint.sourceRoundIndex! < 1 || start?.sourceRoundIndex !== checkpoint.sourceRoundIndex))
+        || (mapping && (mapping.roundIndex !== checkpoint.replaceFromRound || mapping.startStep !== checkpoint.replayStartStep
+            || !mapping.sourceRoundIndices.length
+            || mapping.sourceRoundIndices.some(index => !Number.isSafeInteger(index) || index < 1)
+            || mapping.sourceRoundIndices.reduce((minimum, sourceRoundIndex) => Math.min(minimum, sourceRoundIndex), Number.POSITIVE_INFINITY) !== (checkpoint.sourceRoundIndex ?? checkpoint.replaceFromRound)))) {
+        throw new CodexCacheCheckpointRebuildRequiredError();
+    }
+}
+
+async function assertCodexNormalizedCacheBuild(snapshot: CachedConversationLoadResult, prepared: ConversationSourceCachePreparedRounds): Promise<void> {
+    const points = snapshot.codexData?.sourceCheckpoints || [];
+    const checkpoint = snapshot.codexData?.sourceCheckpoint;
+    const unavailableReason = snapshot.codexData?.sourceCheckpointUnavailableReason;
+    const entries = prepared.index.entries;
+    if (entries.some((entry, index) => entry.round !== index + 1)) throw new Error("New Codex cache must publish contiguous normalized round numbers");
+    if (points.some(point => point.roundIndex < 1 || point.roundIndex > entries.length)) throw new Error("Codex source checkpoint refers to a missing normalized round");
+    if (!checkpoint && !unavailableReason) {
+        if (entries.length > 0 && points.some(point => point.kind === "round_start")) throw new Error("New Codex cache is missing its replay checkpoint");
+        return;
+    }
+    if (checkpoint && checkpoint.roundIndexSpace !== "normalized-cache-v1") throw new Error("New Codex cache checkpoint must identify the normalized round space");
+    const entry = entries.at(-1);
+    if (!entry) throw new Error("Codex cache checkpoint refers to an empty generation");
+    const handle = await fs.promises.open(prepared.temporaryPath, "r");
+    let round: ConversationRound;
+    try {
+        const bytes = Buffer.alloc(entry.endByte - entry.startByte);
+        let offset = 0;
+        while (offset < bytes.length) {
+            const { bytesRead } = await handle.read(bytes, offset, bytes.length - offset, entry.startByte + offset);
+            if (!bytesRead) throw new Error("Short Codex final-round validation read");
+            offset += bytesRead;
+        }
+        round = JSON.parse(bytes.toString("utf8"));
+    } finally {
+        await handle.close();
+    }
+    if (unavailableReason) {
+        const mapping = codexCacheRoundMapping(round);
+        const earliest = mapping.sourceRoundIndices.reduce((minimum, sourceRoundIndex) => Math.min(minimum, sourceRoundIndex), Number.POSITIVE_INFINITY);
+        const leafStart = points.find(point => point.kind === "round_start" && point.roundIndex === mapping.roundIndex);
+        if (checkpoint || unavailableReason !== "last_merged_round_starts_before_leaf"
+            || (snapshot.codexData?.historySource?.segments.length ?? 0) <= 1
+            || mapping.roundIndex !== entries.length || !Number.isSafeInteger(earliest) || earliest < 1
+            || mapping.sourceRoundIndices.some(sourceRoundIndex => !Number.isSafeInteger(sourceRoundIndex) || sourceRoundIndex < 1)
+            || (leafStart && (leafStart.sourceRoundIndex ?? leafStart.roundIndex) <= earliest)) {
+            throw new Error("Invalid Codex full-history replay boundary");
+        }
+        return;
+    }
+    assertCodexCacheCheckpointCompatible(checkpoint!, { first: 1, last: entries.length }, entries.length, points, codexCacheRoundMapping(round));
+}
+
 async function tryBuildIncrementalConversation(
     resolved: ResolvedConversationChain,
     conversationId: string,
@@ -624,10 +783,17 @@ async function tryBuildIncrementalConversation(
         const checkpoint = oldData?.sourceCheckpoint;
         const rolloutPath = oldData?.thread.rolloutPath;
         if (!checkpoint || !rolloutPath) return null;
+        assertCodexCacheCheckpointCompatible(checkpoint, previous.roundIndexBounds, previous.roundCount, oldData.sourceCheckpoints || []);
+        const lastRound = readCachedConversationSourceCacheRounds<ConversationRound>({
+            key: previous.key, generation: previous.generation,
+            startRound: checkpoint.replaceFromRound, endRound: checkpoint.replaceFromRound,
+        })?.rounds[0];
+        if (!lastRound) throw new CodexCacheCheckpointRebuildRequiredError();
+        assertCodexCacheCheckpointCompatible(checkpoint, previous.roundIndexBounds, previous.roundCount, oldData.sourceCheckpoints || [], codexCacheRoundMapping(lastRound));
         const historySource = options.expectedCodexSource?.historySource;
         if (!codexHistoryCanAppend(oldData.historySource, historySource)) return null;
         try {
-            await assertCodexHistorySourceAsync(oldData.historySource!, options.isCancelled);
+            await assertCodexHistorySourceAsync(oldData.historySource?.segments.at(-1)?.archive ? historySource! : oldData.historySource!, options.isCancelled);
         } catch (error) {
             if (error instanceof CodexHistorySourceMismatchError) return null;
             throw error;
@@ -675,8 +841,10 @@ async function tryBuildIncrementalConversation(
                 roundCount: preparedRounds.roundCount,
                 aiResponseCount,
                 toolCallCount,
-                sourceRevision: revisionAccumulator.finish(Math.floor(checkpoint.sourceMtimeMs)),
-                codexData: { ...oldData, rounds: [], historySource },
+                sourceRevision: revisionAccumulator.finish(Math.floor(tail.checkpoint?.sourceMtimeMs ?? checkpoint.sourceMtimeMs)),
+                codexData: { ...oldData, rounds: [], historySource,
+                    sourceCheckpoints: oldData.sourceCheckpoints?.map(point => ({ ...point, sourceRoundIndex: point.sourceRoundIndex ?? point.roundIndex })),
+                    sourceCheckpoint: { ...tail.checkpoint!, sourceRoundIndex: checkpoint.sourceRoundIndex ?? checkpoint.replaceFromRound, roundIndexSpace: "normalized-cache-v1" } },
                 compactionMetadata: buildConversationCompactionMetadata("codex", recallMetadataRounds),
             };
             return { snapshot, preparedRounds };
@@ -710,7 +878,12 @@ async function tryBuildIncrementalConversation(
                 if (!prefix) throw new Error("Codex 增量更新无法读取上一代 fetch 缓存前缀");
                 for (const round of prefix.rounds) appendRound(round);
             }
-            for (const round of mergeConsecutiveHumanRounds(tail.rounds, tail.replaceFromRound)) appendRound(round);
+            const normalizedTail = mergeConsecutiveHumanRounds(tail.rounds, tail.replaceFromRound);
+            const mapped = normalizeCodexCacheCheckpoints({ sourceCheckpoints: tail.sourceCheckpoints, sourceCheckpoint: tail.checkpoint }, normalizedTail.map(codexCacheRoundMapping));
+            if (!mapped.sourceCheckpoint) throw new CodexCacheCheckpointRebuildRequiredError();
+            for (const round of normalizedTail) appendRound(round);
+            tail.checkpoint = mapped.sourceCheckpoint;
+            tail.sourceCheckpoints = [...(oldData.sourceCheckpoints || []).filter(point => point.roundIndex < tail.replaceFromRound), ...(mapped.sourceCheckpoints || [])];
         } catch (error) {
             spool.abort();
             throw error;
@@ -1029,12 +1202,14 @@ function hydrateConversationCache(
         assertDshReadableBody(rounds, snapshot.conversationId, snapshot.dshData?.provenance.sourcePath);
     }
     const roundCount = roundResult?.roundCount || cachedRoundCount || snapshot.roundCount || snapshot.rounds.length;
+    const roundIndexBounds = roundResult?.roundIndexBounds || getConversationSourceCacheRoundBounds({ key, generation }) || undefined;
     const { cacheAuthority: _cacheAuthority, ...snapshotData } = snapshot;
     const loaded: ConversationLoadResult = {
         ...snapshotData,
         rounds,
         roundCount,
         roundStart: options.roundRange?.startRound || 1,
+        roundIndexBounds,
         cacheKey: { ...key },
         cacheGeneration: generation,
         cacheCreatedAt,
@@ -1306,11 +1481,12 @@ async function loadRawConversationData(
     const codexData = await loadCodexConversationAsync(effectiveId, options.link || "summary");
     if (!codexData) return null;
     const rounds = mergeConsecutiveHumanRounds(codexData.rounds);
+    const normalizedCheckpoints = normalizeCodexCacheCheckpoints(codexData, rounds.map(codexCacheRoundMapping));
     return {
         chainUsed: "codex",
         conversationId: effectiveId,
         rounds,
         totalSteps: codexData.totalSteps,
-        codexData: { ...codexData, rounds },
+        codexData: { ...codexData, ...normalizedCheckpoints, rounds },
     };
 }

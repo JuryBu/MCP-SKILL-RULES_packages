@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import {
     BACKGROUND_TASK_RESUME_VERSION,
     getBackgroundTaskRecoveryHandler,
@@ -100,6 +101,31 @@ export interface BackgroundTaskOptions {
     resumePayload?: unknown;
     resumeVersion?: number;
     resumeHash?: string;
+}
+
+export interface BackgroundTaskDiagnosticIdentity {
+    guardId: string;
+    conversationId: string;
+    stageId: string;
+    childScopeId: string;
+}
+
+export interface BackgroundTaskCliDiagnosticReference {
+    callId: string;
+    manifestPath?: string;
+    manifestSha256?: string;
+    eventCoverage: "complete" | "partial";
+    rejectedCommandCount: number;
+    captureError?: string;
+}
+
+export interface BackgroundTaskDiagnostics extends BackgroundTaskDiagnosticIdentity {
+    version: 1;
+    taskId: string;
+    linkedAt: string;
+    updatedAt: string;
+    references: BackgroundTaskCliDiagnosticReference[];
+    omittedReferences: number;
 }
 
 export interface RecordSchedulerBackgroundTaskOptions extends Omit<BackgroundTaskOptions, "maxRunMs"> {
@@ -509,6 +535,110 @@ function taskFilePath(taskId: string): string {
 
 export function isValidBackgroundTaskId(taskId: string): boolean {
     return BACKGROUND_TASK_ID_PATTERN.test(taskId);
+}
+
+function backgroundTaskDiagnosticsPath(taskId: string): string {
+    return path.join(DATA_ROOT, "task-diagnostics", `${taskId}.json`);
+}
+
+function diagnosticIdentityMatches(task: BackgroundTask, identity: BackgroundTaskDiagnosticIdentity): boolean {
+    const payload = task.resumePayload;
+    if (task.kind !== "stage-guard-check" || !payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+    return payload.conversationId === identity.conversationId && payload.stageId === identity.stageId
+        && (payload.version === 2 ? payload.guardId === identity.guardId && payload.childScopeId === identity.childScopeId
+            : payload.version === 1 && identity.childScopeId === "main");
+}
+
+function validDiagnosticIdentity(identity: BackgroundTaskDiagnosticIdentity): boolean {
+    return [identity.guardId, identity.conversationId, identity.stageId, identity.childScopeId].every(value => typeof value === "string" && value.length <= 512 && !value.includes("\0"))
+        && Boolean(identity.guardId && identity.conversationId && identity.childScopeId);
+}
+
+function normalizeTaskDiagnosticReference(reference: BackgroundTaskCliDiagnosticReference): BackgroundTaskCliDiagnosticReference | null {
+    if (!reference || typeof reference.callId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/u.test(reference.callId)) return null;
+    if (!["complete", "partial"].includes(reference.eventCoverage) || !Number.isSafeInteger(reference.rejectedCommandCount) || reference.rejectedCommandCount < 0) return null;
+    if (reference.manifestSha256 !== undefined && !/^[a-f0-9]{64}$/u.test(reference.manifestSha256)) return null;
+    if (reference.manifestPath !== undefined) {
+        if (typeof reference.manifestPath !== "string" || reference.manifestPath.length > 4096) return null;
+        const expected = path.join(DATA_ROOT, "model-bridge-diagnostics", "codex", reference.callId, "manifest.json");
+        if (path.resolve(reference.manifestPath) !== path.resolve(expected)) return null;
+    }
+    return {
+        callId: reference.callId,
+        ...(reference.manifestPath ? { manifestPath: reference.manifestPath } : {}),
+        ...(reference.manifestSha256 ? { manifestSha256: reference.manifestSha256 } : {}),
+        eventCoverage: reference.eventCoverage,
+        rejectedCommandCount: reference.rejectedCommandCount,
+        ...(typeof reference.captureError === "string" ? { captureError: reference.captureError.slice(0, 512) } : {}),
+    };
+}
+
+export function readBackgroundTaskDiagnostics(taskId: string): BackgroundTaskDiagnostics | null {
+    if (!isValidBackgroundTaskId(taskId)) return null;
+    try {
+        const file = backgroundTaskDiagnosticsPath(taskId);
+        const stat = fs.statSync(file);
+        if (!stat.isFile() || stat.size > 64 * 1024) return null;
+        const record = JSON.parse(fs.readFileSync(file, "utf8")) as BackgroundTaskDiagnostics;
+        const task = getBackgroundTask(taskId);
+        if (!task || record.version !== 1 || record.taskId !== taskId || !validDiagnosticIdentity(record) || !diagnosticIdentityMatches(task, record)) return null;
+        if (![record.linkedAt, record.updatedAt].every(value => typeof value === "string" && value.length <= 64 && Number.isFinite(Date.parse(value)))) return null;
+        if (!Array.isArray(record.references) || record.references.length > 8 || !Number.isSafeInteger(record.omittedReferences) || record.omittedReferences < 0) return null;
+        const references = record.references.map(reference => normalizeTaskDiagnosticReference(reference));
+        if (references.some(reference => !reference)) return null;
+        return { version: 1, taskId, guardId: record.guardId, conversationId: record.conversationId, stageId: record.stageId,
+            childScopeId: record.childScopeId, linkedAt: record.linkedAt, updatedAt: record.updatedAt,
+            references: references as BackgroundTaskCliDiagnosticReference[], omittedReferences: record.omittedReferences };
+    } catch {
+        return null;
+    }
+}
+
+function writeBackgroundTaskDiagnostics(record: BackgroundTaskDiagnostics): boolean {
+    try {
+        if (Buffer.byteLength(JSON.stringify(record), "utf8") > 64 * 1024) return false;
+        fs.mkdirSync(path.dirname(backgroundTaskDiagnosticsPath(record.taskId)), { recursive: true });
+        writeJsonAtomic(backgroundTaskDiagnosticsPath(record.taskId), record);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+export function bindBackgroundTaskDiagnostics(taskId: string, identity: BackgroundTaskDiagnosticIdentity): boolean {
+    if (!isValidBackgroundTaskId(taskId) || !validDiagnosticIdentity(identity)) return false;
+    const task = getBackgroundTask(taskId);
+    if (!task || task.status !== "running" || !diagnosticIdentityMatches(task, identity)) return false;
+    const existing = readBackgroundTaskDiagnostics(taskId);
+    if (existing) return existing.guardId === identity.guardId;
+    if (fs.existsSync(backgroundTaskDiagnosticsPath(taskId))) return false;
+    const now = nowIso();
+    return writeBackgroundTaskDiagnostics({ version: 1, taskId, guardId: identity.guardId, conversationId: identity.conversationId,
+        stageId: identity.stageId, childScopeId: identity.childScopeId, linkedAt: now, updatedAt: now, references: [], omittedReferences: 0 });
+}
+
+export function appendBackgroundTaskDiagnostic(taskId: string, guardId: string, diagnostic: BackgroundTaskCliDiagnosticReference): boolean {
+    const record = readBackgroundTaskDiagnostics(taskId);
+    if (!record || record.guardId !== guardId) return false;
+    const reference = normalizeTaskDiagnosticReference(diagnostic);
+    if (!reference) return false;
+    if (reference.manifestPath) {
+        try {
+            const stat = fs.statSync(reference.manifestPath);
+            if (!stat.isFile() || stat.size > 2 * 1024 * 1024) return false;
+            const manifestText = fs.readFileSync(reference.manifestPath, "utf8");
+            if (reference.manifestSha256 && createHash("sha256").update(manifestText, "utf8").digest("hex") !== reference.manifestSha256) return false;
+            const manifest = JSON.parse(manifestText);
+            if (manifest.callId !== reference.callId || manifest.metadata?.context?.backgroundTaskId !== taskId || manifest.metadata?.context?.guardId !== guardId) return false;
+        } catch {
+            return false;
+        }
+    }
+    if (record.references.some(existing => existing.callId === reference.callId)) return true;
+    if (record.references.length >= 8) record.omittedReferences += 1;
+    else record.references.push(reference);
+    record.updatedAt = nowIso();
+    return writeBackgroundTaskDiagnostics(record);
 }
 
 function taskPreservePath(taskId: string): string {
@@ -2232,7 +2362,7 @@ function formatProgress(task: BackgroundTask): string[] {
     return lines;
 }
 
-export function formatBackgroundTask(task: BackgroundTask | null): string {
+function formatBackgroundTaskState(task: BackgroundTask | null): string {
     if (!task) return "❌ 未找到后台任务";
     if (task.status === "running") {
         const elapsed = ((Date.now() - new Date(task.startedAt).getTime()) / 1000).toFixed(0);
@@ -2275,6 +2405,17 @@ export function formatBackgroundTask(task: BackgroundTask | null): string {
         ].filter(Boolean).join("\n");
     }
     return task.result || `✅ 后台任务完成: ${task.id}`;
+}
+
+export function formatBackgroundTask(task: BackgroundTask | null): string {
+    const stateText = formatBackgroundTaskState(task);
+    const diagnostics = task?.kind === "stage-guard-check" ? readBackgroundTaskDiagnostics(task.id) : null;
+    if (!diagnostics) return stateText;
+    return [stateText, "", `🧾 CLI诊断关联: taskId=${diagnostics.taskId}；Guard=${diagnostics.guardId}；Stage=${diagnostics.stageId}；scope=${diagnostics.childScopeId}`,
+        ...diagnostics.references.map(reference => `🧾 CLI诊断: ${reference.manifestPath || reference.callId}；callId=${reference.callId}；事件覆盖=${reference.eventCoverage}；观察到的拒绝=${reference.rejectedCommandCount}${reference.manifestSha256 ? `；sha256=${reference.manifestSha256}` : ""}${reference.captureError ? `；captureError=${reference.captureError}` : ""}`),
+        diagnostics.references.length === 0 ? "🧾 当前没有已保存的CLI诊断引用" : "",
+        diagnostics.omittedReferences > 0 ? `🧾 另有 ${diagnostics.omittedReferences} 项诊断引用超出展示上限，按原 taskId 核对私有诊断目录` : "",
+    ].filter(Boolean).join("\n");
 }
 
 // ============= 测试专用钩子（仅供单测模拟「另一进程」场景，勿在业务代码使用） =============

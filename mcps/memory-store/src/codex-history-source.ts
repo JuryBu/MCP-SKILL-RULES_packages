@@ -3,6 +3,7 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { materializeCodexHistoryArchive, materializeCodexHistoryArchiveSync, type CodexHistoryArchiveOptions, type CodexHistoryArchiveView } from "./codex-history-archive.js";
 import { CodexHistorySourceMismatchError, hashCodexPrefix, hashCodexPrefixSync, throwIfCodexReadCancelled, type CodexOrdinalMode } from "./codex-history-integrity.js";
 export { CodexHistorySourceMismatchError } from "./codex-history-integrity.js";
 
@@ -10,10 +11,13 @@ const MAX_HEADER_BYTES = 64 * 1024 * 1024;
 const HEADER_READ_CHUNK_BYTES = 64 * 1024;
 const ANCHOR_BYTES = 8 * 1024;
 const UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
-const ROLLOUT_FILENAME = new RegExp(`^rollout-.*-(${UUID})(?:_(${UUID}))?\\.jsonl$`, "i");
+const ROLLOUT_FILENAME = new RegExp(`^rollout-.*-(${UUID})(?:_(${UUID}))?\\.jsonl(?:\\.zst)?$`, "i");
 
 export interface CodexHistorySegment {
     path: string;
+    readPath?: string;
+    archive?: CodexHistoryArchiveView;
+    replicas?: CodexHistoryReplica[];
     rolloutId: string;
     threadId: string;
     startOrdinal: number;
@@ -27,6 +31,24 @@ export interface CodexHistorySegment {
     prefixSha256?: string;
     ordinalMode?: CodexOrdinalMode;
     unterminatedLeaf?: boolean;
+}
+
+export interface CodexHistoryReplica {
+    path: string;
+    size: number;
+    sha256: string;
+    archive?: CodexHistoryArchiveView;
+}
+
+export function codexHistorySegmentReadPath(segment: CodexHistorySegment): string {
+    if (segment.archive) {
+        if (segment.path !== segment.archive.sourcePath || segment.readPath !== segment.archive.viewPath || segment.size !== segment.archive.logicalSize) {
+            throw new CodexHistorySourceMismatchError("Codex history archive/view identity mismatch");
+        }
+        return segment.archive.viewPath;
+    }
+    if (segment.readPath && segment.readPath !== segment.path) throw new CodexHistorySourceMismatchError("Unexpected Codex history read view");
+    return segment.path;
 }
 
 export interface CodexHistorySource {
@@ -66,6 +88,9 @@ interface RolloutHeader {
 
 interface LoadedRollout {
     path: string;
+    readPath: string;
+    archive?: CodexHistoryArchiveView;
+    replicas?: CodexHistoryReplica[];
     size: number;
     mtimeMs: number;
     header: RolloutHeader;
@@ -285,7 +310,7 @@ function completeJsonSuffix(chunks: Buffer[]): boolean {
     }
 }
 
-function indexRootsSync(roots: string[]): Map<string, string[]> {
+function indexRootsSync(roots: string[], isCancelled?: () => boolean): Map<string, string[]> {
     const index = new Map<string, string[]>();
     const add = (filePath: string) => {
         const parsed = parseCodexRolloutFilename(filePath);
@@ -295,12 +320,14 @@ function indexRootsSync(roots: string[]): Map<string, string[]> {
         index.set(parsed.rolloutId, paths);
     };
     const visit = (directory: string) => {
+        throwIfCodexReadCancelled(isCancelled);
         let entries: fs.Dirent[];
         try { entries = fs.readdirSync(directory, { withFileTypes: true }); } catch (error: unknown) {
             if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
             throw error;
         }
         for (const entry of entries) {
+            throwIfCodexReadCancelled(isCancelled);
             const child = path.join(directory, entry.name);
             if (entry.isDirectory()) visit(child);
             else if (entry.isFile()) add(child);
@@ -310,7 +337,7 @@ function indexRootsSync(roots: string[]): Map<string, string[]> {
     return index;
 }
 
-async function indexRoots(roots: string[]): Promise<Map<string, string[]>> {
+async function indexRoots(roots: string[], isCancelled?: () => boolean): Promise<Map<string, string[]>> {
     const index = new Map<string, string[]>();
     const add = (filePath: string) => {
         const parsed = parseCodexRolloutFilename(filePath);
@@ -320,12 +347,14 @@ async function indexRoots(roots: string[]): Promise<Map<string, string[]>> {
         index.set(parsed.rolloutId, paths);
     };
     const visit = async (directory: string): Promise<void> => {
+        throwIfCodexReadCancelled(isCancelled);
         let entries: fs.Dirent[];
         try { entries = await fsPromises.readdir(directory, { withFileTypes: true }); } catch (error: unknown) {
             if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
             throw error;
         }
         for (const entry of entries) {
+            throwIfCodexReadCancelled(isCancelled);
             const child = path.join(directory, entry.name);
             if (entry.isDirectory()) await visit(child);
             else if (entry.isFile()) add(child);
@@ -348,25 +377,66 @@ function uniqueRoots(rolloutPath: string, roots?: string[]): string[] {
     }));
 }
 
-function loadSync(filePath: string): LoadedRollout {
+function loadSync(filePath: string, options?: CodexHistoryArchiveOptions): LoadedRollout {
+    if (/\.jsonl\.zst$/i.test(filePath)) {
+        const archive = materializeCodexHistoryArchiveSync(filePath, options);
+        return { path: filePath, readPath: archive.viewPath, archive, size: archive.logicalSize, mtimeMs: archive.sourceMtimeMs, header: parseHeader(filePath, readFirstLineSync(archive.viewPath)) };
+    }
     const stats = fs.statSync(filePath);
     if (!stats.isFile()) throw new Error(`Codex rollout source is not a file: ${filePath}`);
-    return { path: filePath, size: stats.size, mtimeMs: stats.mtimeMs, header: parseHeader(filePath, readFirstLineSync(filePath)) };
+    return { path: filePath, readPath: filePath, size: stats.size, mtimeMs: stats.mtimeMs, header: parseHeader(filePath, readFirstLineSync(filePath)) };
 }
 
-async function load(filePath: string): Promise<LoadedRollout> {
+async function load(filePath: string, options?: CodexHistoryArchiveOptions): Promise<LoadedRollout> {
+    if (/\.jsonl\.zst$/i.test(filePath)) {
+        const archive = await materializeCodexHistoryArchive(filePath, options);
+        return { path: filePath, readPath: archive.viewPath, archive, size: archive.logicalSize, mtimeMs: archive.sourceMtimeMs, header: parseHeader(filePath, await readFirstLine(archive.viewPath)) };
+    }
     const stats = await fsPromises.stat(filePath);
     if (!stats.isFile()) throw new Error(`Codex rollout source is not a file: ${filePath}`);
-    return { path: filePath, size: stats.size, mtimeMs: stats.mtimeMs, header: parseHeader(filePath, await readFirstLine(filePath)) };
+    return { path: filePath, readPath: filePath, size: stats.size, mtimeMs: stats.mtimeMs, header: parseHeader(filePath, await readFirstLine(filePath)) };
+}
+
+function assertReplicaPair(matches: string[]): void {
+    if (matches.length === 1) return;
+    if (matches.length !== 2 || matches.filter(file => /\.zst$/i.test(file)).length !== 1) throw new Error(`Ambiguous Codex history_base rollout: ${matches.join(", ")}`);
+}
+
+function selectRolloutSync(matches: string[], options?: CodexHistoryArchiveOptions, preferred?: string): LoadedRollout {
+    assertReplicaPair(matches);
+    const ordered = [...matches].sort((left, right) => preferred ? Number(right === preferred) - Number(left === preferred) : Number(/\.zst$/i.test(left)) - Number(/\.zst$/i.test(right)) || left.localeCompare(right));
+    const selected = loadSync(ordered[0]!, options);
+    if (ordered.length === 1) return selected;
+    const replica = loadSync(ordered[1]!, options);
+    const selectedHash = hashCodexPrefixSync(selected.readPath, selected.size);
+    const replicaHash = hashCodexPrefixSync(replica.readPath, replica.size);
+    if (selected.size !== replica.size || selectedHash !== replicaHash || selected.header.identity.threadId !== replica.header.identity.threadId) throw new CodexHistorySourceMismatchError("Conflicting plaintext/compressed Codex history replicas");
+    selected.replicas = [{ path: replica.path, size: replica.size, sha256: replicaHash, ...(replica.archive ? { archive: replica.archive } : {}) }];
+    return selected;
+}
+
+async function selectRollout(matches: string[], options?: CodexHistoryArchiveOptions, preferred?: string): Promise<LoadedRollout> {
+    assertReplicaPair(matches);
+    const ordered = [...matches].sort((left, right) => preferred ? Number(right === preferred) - Number(left === preferred) : Number(/\.zst$/i.test(left)) - Number(/\.zst$/i.test(right)) || left.localeCompare(right));
+    const selected = await load(ordered[0]!, options);
+    if (ordered.length === 1) return selected;
+    const replica = await load(ordered[1]!, options);
+    const selectedHash = await hashCodexPrefix(selected.readPath, selected.size, options?.isCancelled);
+    const replicaHash = await hashCodexPrefix(replica.readPath, replica.size, options?.isCancelled);
+    if (selected.size !== replica.size || selectedHash !== replicaHash || selected.header.identity.threadId !== replica.header.identity.threadId) throw new CodexHistorySourceMismatchError("Conflicting plaintext/compressed Codex history replicas");
+    selected.replicas = [{ path: replica.path, size: replica.size, sha256: replicaHash, ...(replica.archive ? { archive: replica.archive } : {}) }];
+    return selected;
 }
 
 function segmentForSync(rollout: LoadedRollout, startOrdinal: number, endOrdinalExclusive: number | undefined, endByte: number, allowUnterminatedLeaf = false): CodexHistorySegment {
     if (endByte > rollout.size) throw new Error(`Codex history byte boundary exceeds source size: ${rollout.path}`);
-    const anchor = readAnchorSync(rollout.path, endByte);
+    const anchor = readAnchorSync(rollout.readPath, endByte);
     const unterminatedLeaf = allowUnterminatedLeaf && endByte === rollout.size && endByte > 0 && anchor.value.at(-1) !== 0x0a;
-    if (!unterminatedLeaf) assertLineBoundarySync(rollout.path, endByte, rollout.size);
+    if (!unterminatedLeaf) assertLineBoundarySync(rollout.readPath, endByte, rollout.size);
     return {
         path: rollout.path,
+        ...(rollout.archive ? { readPath: rollout.readPath, archive: rollout.archive } : {}),
+        ...(rollout.replicas ? { replicas: rollout.replicas } : {}),
         rolloutId: rollout.header.identity.rolloutId,
         threadId: rollout.header.identity.threadId,
         startOrdinal,
@@ -377,7 +447,7 @@ function segmentForSync(rollout: LoadedRollout, startOrdinal: number, endOrdinal
         headerSha256: sha256(rollout.header.header),
         anchorStartByte: anchor.start,
         anchorSha256: sha256(anchor.value),
-        prefixSha256: hashCodexPrefixSync(rollout.path, endByte, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }),
+        prefixSha256: hashCodexPrefixSync(rollout.readPath, endByte, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }),
         ordinalMode: rollout.header.ordinalMode,
         ...(unterminatedLeaf ? { unterminatedLeaf: true } : {}),
     };
@@ -385,11 +455,13 @@ function segmentForSync(rollout: LoadedRollout, startOrdinal: number, endOrdinal
 
 async function segmentFor(rollout: LoadedRollout, startOrdinal: number, endOrdinalExclusive: number | undefined, endByte: number, allowUnterminatedLeaf = false, isCancelled?: () => boolean, metadataOnly = false): Promise<CodexHistorySegment> {
     if (endByte > rollout.size) throw new Error(`Codex history byte boundary exceeds source size: ${rollout.path}`);
-    const anchor = await readAnchor(rollout.path, endByte);
+    const anchor = await readAnchor(rollout.readPath, endByte);
     const unterminatedLeaf = allowUnterminatedLeaf && endByte === rollout.size && endByte > 0 && anchor.value.at(-1) !== 0x0a;
-    if (!unterminatedLeaf) await assertLineBoundary(rollout.path, endByte, rollout.size);
+    if (!unterminatedLeaf) await assertLineBoundary(rollout.readPath, endByte, rollout.size);
     return {
         path: rollout.path,
+        ...(rollout.archive ? { readPath: rollout.readPath, archive: rollout.archive } : {}),
+        ...(rollout.replicas ? { replicas: rollout.replicas } : {}),
         rolloutId: rollout.header.identity.rolloutId,
         threadId: rollout.header.identity.threadId,
         startOrdinal,
@@ -400,7 +472,7 @@ async function segmentFor(rollout: LoadedRollout, startOrdinal: number, endOrdin
         headerSha256: sha256(rollout.header.header),
         anchorStartByte: anchor.start,
         anchorSha256: sha256(anchor.value),
-        ...(metadataOnly ? {} : { prefixSha256: await hashCodexPrefix(rollout.path, endByte, isCancelled, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }) }),
+        ...(metadataOnly ? {} : { prefixSha256: await hashCodexPrefix(rollout.readPath, endByte, isCancelled, { headerSha256: sha256(rollout.header.header), anchorStartByte: anchor.start, anchorSha256: sha256(anchor.value), unterminatedLeaf }) }),
         ordinalMode: rollout.header.ordinalMode,
         ...(unterminatedLeaf ? { unterminatedLeaf: true } : {}),
     };
@@ -415,6 +487,8 @@ function buildRevision(leafPath: string, segments: CodexHistorySegment[]): strin
         leafMtimeMs: leaf.mtimeMs,
         segments: segments.map(segment => ({
             path: segment.path,
+            ...(segment.archive ? { archive: archiveIdentity(segment.archive) } : {}),
+            ...(segment.replicas ? { replicas: segment.replicas.map(replica => ({ path: replica.path, size: replica.size, sha256: replica.sha256, ...(replica.archive ? { archive: archiveIdentity(replica.archive) } : {}) })) } : {}),
             rolloutId: segment.rolloutId,
             threadId: segment.threadId,
             startOrdinal: segment.startOrdinal,
@@ -431,6 +505,10 @@ function buildRevision(leafPath: string, segments: CodexHistorySegment[]): strin
     return sha256(JSON.stringify(manifest));
 }
 
+function archiveIdentity(archive: CodexHistoryArchiveView) {
+    return { format: archive.format, sourcePath: archive.sourcePath, sourceSize: archive.sourceSize, sourceSha256: archive.sourceSha256, logicalSize: archive.logicalSize, logicalSha256: archive.logicalSha256 };
+}
+
 function sourceFromSegments(leafPath: string, segments: CodexHistorySegment[]): CodexHistorySource {
     return {
         version: 1,
@@ -441,13 +519,15 @@ function sourceFromSegments(leafPath: string, segments: CodexHistorySegment[]): 
     };
 }
 
-export function resolveCodexHistorySource(rolloutPath: string, options: { roots?: string[]; endByte?: number } = {}): CodexHistorySource {
+export function resolveCodexHistorySource(rolloutPath: string, options: { roots?: string[]; endByte?: number; archive?: CodexHistoryArchiveOptions } = {}): CodexHistorySource {
+    throwIfCodexReadCancelled(options.archive?.isCancelled);
     const leafPath = normalizeCodexHistoryPath(rolloutPath);
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
     const reverseSegments: CodexHistorySegment[] = [];
-    let current = loadSync(leafPath);
-    let currentEndByte = options.endByte === undefined ? lastCompleteLineEndSync(current.path, current.size) : finiteInteger(options.endByte, "endByte");
+    const counterpart = /\.zst$/i.test(leafPath) ? leafPath.slice(0, -4) : `${leafPath}.zst`;
+    let current = fs.existsSync(counterpart) ? selectRolloutSync([leafPath, counterpart], options.archive, leafPath) : loadSync(leafPath, options.archive);
+    let currentEndByte = options.endByte === undefined ? lastCompleteLineEndSync(current.readPath, current.size) : finiteInteger(options.endByte, "endByte");
     let currentEndOrdinal: number | undefined;
     while (true) {
         const currentKey = current.header.identity.rolloutId;
@@ -457,24 +537,26 @@ export function resolveCodexHistorySource(rolloutPath: string, options: { roots?
         reverseSegments.push(segmentForSync(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined));
         const base = current.header.historyBase;
         if (!base || base.endByte === 0) break;
-        index ??= indexRootsSync(uniqueRoots(leafPath, options.roots));
+        index ??= indexRootsSync(uniqueRoots(leafPath, options.roots), options.archive?.isCancelled);
         const matches = [...new Set(index.get(base.rolloutId) || [])];
         if (matches.length === 0) throw new Error(`Missing Codex history_base rollout: ${base.rolloutId}`);
-        if (matches.length !== 1) throw new Error(`Ambiguous Codex history_base rollout ${base.rolloutId}: ${matches.join(", ")}`);
-        current = loadSync(matches[0]!);
+        current = selectRolloutSync(matches, options.archive);
         currentEndByte = base.endByte;
         currentEndOrdinal = base.endOrdinalExclusive;
     }
     return sourceFromSegments(leafPath, reverseSegments.reverse());
 }
 
-export async function resolveCodexHistorySourceAsync(rolloutPath: string, options: { roots?: string[]; endByte?: number; isCancelled?: () => boolean; metadataOnly?: boolean } = {}): Promise<CodexHistorySource> {
+export async function resolveCodexHistorySourceAsync(rolloutPath: string, options: { roots?: string[]; endByte?: number; isCancelled?: () => boolean; metadataOnly?: boolean; archive?: CodexHistoryArchiveOptions } = {}): Promise<CodexHistorySource> {
+    throwIfCodexReadCancelled(options.isCancelled ?? options.archive?.isCancelled);
     const leafPath = normalizeCodexHistoryPath(rolloutPath);
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
     const reverseSegments: CodexHistorySegment[] = [];
-    let current = await load(leafPath);
-    let currentEndByte = options.endByte === undefined ? await lastCompleteLineEnd(current.path, current.size) : finiteInteger(options.endByte, "endByte");
+    const archiveOptions = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
+    const counterpart = /\.zst$/i.test(leafPath) ? leafPath.slice(0, -4) : `${leafPath}.zst`;
+    let current = fs.existsSync(counterpart) ? await selectRollout([leafPath, counterpart], archiveOptions, leafPath) : await load(leafPath, archiveOptions);
+    let currentEndByte = options.endByte === undefined ? await lastCompleteLineEnd(current.readPath, current.size) : finiteInteger(options.endByte, "endByte");
     let currentEndOrdinal: number | undefined;
     while (true) {
         throwIfCodexReadCancelled(options.isCancelled);
@@ -485,11 +567,10 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         reverseSegments.push(await segmentFor(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined, options.isCancelled, options.metadataOnly));
         const base = current.header.historyBase;
         if (!base || base.endByte === 0) break;
-        index ??= await indexRoots(uniqueRoots(leafPath, options.roots));
+        index ??= await indexRoots(uniqueRoots(leafPath, options.roots), archiveOptions.isCancelled);
         const matches = [...new Set(index.get(base.rolloutId) || [])];
         if (matches.length === 0) throw new Error(`Missing Codex history_base rollout: ${base.rolloutId}`);
-        if (matches.length !== 1) throw new Error(`Ambiguous Codex history_base rollout ${base.rolloutId}: ${matches.join(", ")}`);
-        current = await load(matches[0]!);
+        current = await selectRollout(matches, archiveOptions);
         currentEndByte = base.endByte;
         currentEndOrdinal = base.endOrdinalExclusive;
     }
@@ -501,6 +582,7 @@ export function assertCodexHistoryManifest(source: CodexHistorySource): void {
         throw new Error("Invalid Codex history source shape");
     }
     for (const segment of source.segments) {
+        codexHistorySegmentReadPath(segment);
         if (!segment.prefixSha256 || !/^[a-f0-9]{64}$/u.test(segment.prefixSha256) || (segment.ordinalMode !== "legacy" && segment.ordinalMode !== "explicit")) {
             throw new CodexHistorySourceMismatchError("Codex history source requires a content-verified cache rebuild");
         }
@@ -516,9 +598,12 @@ export function assertCodexHistoryManifest(source: CodexHistorySource): void {
 export function assertCodexHistorySource(source: CodexHistorySource): void {
     assertCodexHistoryManifest(source);
     for (const segment of source.segments) {
-        const stats = fs.statSync(segment.path);
+        const loaded = loadSync(segment.path, archiveOptionsForSegment(segment));
+        assertArchiveIdentity(segment.archive, loaded.archive);
+        const readPath = loaded.readPath;
+        const stats = fs.statSync(readPath);
         if (!stats.isFile() || stats.size < segment.endByte) throw new CodexHistorySourceMismatchError(`Codex history source is shorter or unavailable: ${segment.path}`);
-        const header = parseHeader(segment.path, readFirstLineSync(segment.path));
+        const header = loaded.header;
         if (header.identity.rolloutId !== segment.rolloutId || header.identity.threadId !== segment.threadId || sha256(header.header) !== segment.headerSha256) {
             throw new CodexHistorySourceMismatchError(`Codex history source header changed: ${segment.path}`);
         }
@@ -527,14 +612,19 @@ export function assertCodexHistorySource(source: CodexHistorySource): void {
                 throw new Error("Invalid unterminated Codex leaf boundary");
             }
         } else {
-            assertLineBoundarySync(segment.path, segment.endByte, stats.size);
+            assertLineBoundarySync(readPath, segment.endByte, stats.size);
         }
-        const anchor = readAnchorSync(segment.path, segment.endByte);
+        const anchor = readAnchorSync(readPath, segment.endByte);
         if (anchor.start !== segment.anchorStartByte || sha256(anchor.value) !== segment.anchorSha256) {
             throw new CodexHistorySourceMismatchError(`Codex history source boundary changed: ${segment.path}`);
         }
-        if (hashCodexPrefixSync(segment.path, segment.endByte, segment) !== segment.prefixSha256) {
+        if (hashCodexPrefixSync(readPath, segment.endByte, segment) !== segment.prefixSha256) {
             throw new CodexHistorySourceMismatchError(`Codex history source content changed: ${segment.path}`);
+        }
+        for (const replica of segment.replicas ?? []) {
+            const current = loadSync(replica.path, archiveOptionsForSegment({ archive: replica.archive }));
+            assertArchiveIdentity(replica.archive, current.archive);
+            if (current.size !== replica.size || hashCodexPrefixSync(current.readPath, current.size) !== replica.sha256) throw new CodexHistorySourceMismatchError("Codex history replica changed");
         }
     }
 }
@@ -543,19 +633,36 @@ export async function assertCodexHistorySourceAsync(source: CodexHistorySource, 
     assertCodexHistoryManifest(source);
     for (const segment of source.segments) {
         throwIfCodexReadCancelled(isCancelled);
-        const stats = await fsPromises.stat(segment.path);
+        const loaded = await load(segment.path, { ...archiveOptionsForSegment(segment), isCancelled });
+        assertArchiveIdentity(segment.archive, loaded.archive);
+        const readPath = loaded.readPath;
+        const stats = await fsPromises.stat(readPath);
         if (!stats.isFile() || stats.size < segment.endByte) throw new CodexHistorySourceMismatchError(`Codex history source is shorter or unavailable: ${segment.path}`);
         if (segment.endByte === 0) {
-            const header = parseHeader(segment.path, await readFirstLine(segment.path));
+            const header = loaded.header;
             if (sha256(header.header) !== segment.headerSha256) throw new CodexHistorySourceMismatchError(`Codex history source header changed: ${segment.path}`);
         }
         if (segment.unterminatedLeaf) {
             if (segment !== source.segments.at(-1) || segment.endOrdinalExclusive !== undefined || segment.endByte !== segment.size) throw new Error("Invalid unterminated Codex leaf boundary");
         } else {
-            await assertLineBoundary(segment.path, segment.endByte, stats.size);
+            await assertLineBoundary(readPath, segment.endByte, stats.size);
         }
-        if (await hashCodexPrefix(segment.path, segment.endByte, isCancelled, segment) !== segment.prefixSha256) {
+        if (await hashCodexPrefix(readPath, segment.endByte, isCancelled, segment) !== segment.prefixSha256) {
             throw new CodexHistorySourceMismatchError(`Codex history source content changed: ${segment.path}`);
         }
+        for (const replica of segment.replicas ?? []) {
+            const current = await load(replica.path, { ...archiveOptionsForSegment({ archive: replica.archive }), isCancelled });
+            assertArchiveIdentity(replica.archive, current.archive);
+            if (current.size !== replica.size || await hashCodexPrefix(current.readPath, current.size, isCancelled) !== replica.sha256) throw new CodexHistorySourceMismatchError("Codex history replica changed");
+        }
     }
+}
+
+function archiveOptionsForSegment(segment: { archive?: CodexHistoryArchiveView }): CodexHistoryArchiveOptions | undefined {
+    if (!segment.archive) return undefined;
+    return { cacheRoot: path.dirname(path.dirname(path.dirname(segment.archive.viewPath))), ownerId: segment.archive.ownerId };
+}
+
+function assertArchiveIdentity(expected?: CodexHistoryArchiveView, actual?: CodexHistoryArchiveView): void {
+    if (JSON.stringify(expected && archiveIdentity(expected)) !== JSON.stringify(actual && archiveIdentity(actual))) throw new CodexHistorySourceMismatchError("Codex history physical archive changed");
 }

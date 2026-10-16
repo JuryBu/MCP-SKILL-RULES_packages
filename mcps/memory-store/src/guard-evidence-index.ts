@@ -5,10 +5,11 @@ import path from "path";
 import { spawn, execFile } from "child_process";
 import { promisify } from "util";
 import { TEMP_DIR, ensureTempDir } from "./temp-store.js";
+import { StringDecoder } from "string_decoder";
 
 export const GUARD_EVIDENCE_INDEX_START = "<<<GUARD_EVIDENCE_INDEX>>>";
 export const GUARD_EVIDENCE_INDEX_END = "<<<END_GUARD_EVIDENCE_INDEX>>>";
-const GUARD_EVIDENCE_INDEX_VERSION = 1;
+const GUARD_EVIDENCE_INDEX_VERSION = 2;
 const DEFAULT_PER_FILE_CHARS = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_FILE_CHARS || 24_000);
 const DEFAULT_TOTAL_CHARS = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_TOTAL_CHARS || 80_000);
 const DIRECT_TEXT_MAX_BYTES = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_DIRECT_TEXT_BYTES || 2 * 1024 * 1024);
@@ -25,6 +26,18 @@ export type GuardEvidenceIngestMode =
     | "structured_extract"
     | "unreadable_stub";
 export type GuardEvidenceIndexMode = "auto" | "reuse" | "rebuild" | "off";
+export type GuardEvidenceReadStatus = "complete" | "partial" | "unread";
+
+export interface GuardEvidenceCoverage {
+    requestedAssets: number;
+    completeAssets: number;
+    partialAssets: number;
+    unreadAssets: number;
+    sourceChars: number;
+    includedChars: number;
+    truncated: boolean;
+    coverageGaps: string[];
+}
 
 export interface GuardEvidenceAssetInput {
     path: string;
@@ -49,12 +62,24 @@ export interface GuardEvidenceIndexItem {
     mtimeMs?: number;
     text: string;
     warnings: string[];
+    requestedRange?: string;
+    sourceReadStatus: GuardEvidenceReadStatus;
+    readStatus: GuardEvidenceReadStatus;
+    sourceChars: number;
+    includedChars: number;
+    truncated: boolean;
+    coverageGaps: string[];
+    includedStart?: number;
+    includedEnd?: number;
 }
+
+type GuardEvidenceSourceItem = Omit<GuardEvidenceIndexItem, "sourceChars" | "includedChars">;
 
 export interface GuardEvidenceIndexResult {
     text: string;
     items: GuardEvidenceIndexItem[];
     manifestPath: string;
+    coverage: GuardEvidenceCoverage;
 }
 
 interface BuildGuardEvidenceIndexOptions {
@@ -121,8 +146,21 @@ const EPUB_EXTENSIONS = new Set([".epub"]);
 const VIDEO_EXTENSIONS = new Set([".mp4", ".mov", ".mkv", ".avi", ".webm"]);
 
 function clip(text: string, maxChars: number): string {
-    if (text.length <= maxChars) return text;
-    return `${sliceUnicodeSafe(text, 0, Math.max(0, maxChars - 80))}\n\n...[truncated ${text.length} -> ${maxChars} chars]`;
+    const budget = normalizeBudget(maxChars, 0);
+    if (text.length <= budget) return text;
+    const fenceLength = (text.match(/`+/gu) || []).reduce((longest, run) => Math.max(longest, run.length + 1), 3);
+    const fence = "`".repeat(fenceLength);
+    const opening = `...[truncated ${text.length} chars; full index in artifactPath]\n${fence}text\n`;
+    const closing = `\n${fence}`;
+    if (opening.length + closing.length >= budget) return "";
+    return `${opening}${sliceUnicodeSafe(text, 0, budget - opening.length - closing.length)}${closing}`;
+}
+
+function normalizeBudget(value: number | undefined, fallback: number): number {
+    const candidate = value === undefined ? fallback : value;
+    return typeof candidate === "number" && Number.isFinite(candidate)
+        ? Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(candidate)))
+        : 0;
 }
 
 function sha256Text(text: string): string {
@@ -163,19 +201,31 @@ function classifyEvidencePath(filePath: string, explicitType?: string): GuardEvi
     return "binary";
 }
 
-function parseRange(range: string | undefined, lines: string[]): string {
-    if (!range) return lines.join("\n");
+function parseRange(range: string | undefined, lines: string[], prefixTruncated: boolean): { text: string; complete: boolean; gaps: string[] } {
+    const result = (text: string, complete: boolean) => ({ text, complete, gaps: complete ? [] : [prefixTruncated
+        ? "requested_range_incomplete: 请求范围超出已读取前缀，剩余源文本字符数未知"
+        : "requested_range_incomplete: 请求行超出文件末尾"] });
+    if (!range) return result(lines.join("\n"), !prefixTruncated);
+    const completeLines = prefixTruncated ? Math.max(0, lines.length - 1) : lines.length;
     const lineRange = range.match(/^#?(\d+)-(\d+)$/u);
     if (lineRange) {
-        const start = Math.max(0, Number(lineRange[1]) - 1);
-        const end = Math.min(lines.length, Number(lineRange[2]));
-        return lines.slice(start, end).join("\n");
+        const start = Number(lineRange[1]);
+        const end = Number(lineRange[2]);
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || end < start) throw new Error(`无效文本范围: ${range}`);
+        return result(lines.slice(start - 1, end).join("\n"), end <= completeLines);
     }
     const first = range.match(/^first(\d+)$/iu);
-    if (first) return lines.slice(0, Number(first[1])).join("\n");
     const last = range.match(/^last(\d+)$/iu);
-    if (last) return lines.slice(-Number(last[1])).join("\n");
-    return lines.join("\n");
+    if (first || last) {
+        const count = Number((first || last)![1]);
+        if (!Number.isSafeInteger(count) || count < 1) throw new Error(`无效文本范围: ${range}`);
+        if (last && prefixTruncated) return {
+            text: "", complete: false,
+            gaps: ["requested_range_unreached: lastN 请求的文件尾部超出直接读取前缀，未取得请求范围，源文本字符数未知"],
+        };
+        return result((first ? lines.slice(0, count) : lines.slice(-count)).join("\n"), !prefixTruncated || count <= completeLines);
+    }
+    throw new Error(`不支持的文本范围: ${range}`);
 }
 
 function readUtf8Prefix(filePath: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -185,10 +235,9 @@ function readUtf8Prefix(filePath: string, maxBytes: number): { text: string; tru
     try {
         const buffer = Buffer.alloc(byteCount);
         const bytesRead = fs.readSync(descriptor, buffer, 0, byteCount, 0);
-        return {
-            text: buffer.subarray(0, bytesRead).toString("utf-8"),
-            truncated: stat.size > byteCount,
-        };
+        const truncated = bytesRead < stat.size;
+        const decoder = new StringDecoder("utf8");
+        return { text: decoder.write(buffer.subarray(0, bytesRead)) + (truncated ? "" : decoder.end()), truncated };
     } finally {
         fs.closeSync(descriptor);
     }
@@ -211,13 +260,18 @@ function extractMarkedIndex(text: string, artifactPath: string): string {
     throw new Error(`${artifactPath} 未找到 ${GUARD_EVIDENCE_INDEX_START}/${GUARD_EVIDENCE_INDEX_END} 标记`);
 }
 
-function readMarkedArtifact(artifactPath: string): string {
+function readMarkedArtifact(artifactPath: string, maxBytes = ARTIFACT_MAX_BYTES, storeFramed = false): string {
     const stat = fs.statSync(artifactPath);
-    if (stat.size > ARTIFACT_MAX_BYTES) {
-        throw new Error(`${artifactPath} 过大 (${stat.size} bytes > ${ARTIFACT_MAX_BYTES} bytes)，拒绝读入 Guard prompt`);
+    if (stat.size > maxBytes) {
+        throw new Error(`${artifactPath} 过大 (${stat.size} bytes > ${maxBytes} bytes)，拒绝读入 Guard prompt`);
     }
     const raw = fs.readFileSync(artifactPath, "utf-8");
-    const text = extractMarkedIndex(raw, artifactPath);
+    if (storeFramed && (!raw.startsWith(`${GUARD_EVIDENCE_INDEX_START}\n`) || !raw.endsWith(`${GUARD_EVIDENCE_INDEX_END}\n`))) {
+        throw new Error(`${artifactPath} 缺少完整索引外层标记`);
+    }
+    const text = storeFramed
+        ? raw.slice(GUARD_EVIDENCE_INDEX_START.length + 1, raw.length - GUARD_EVIDENCE_INDEX_END.length - 1).trim()
+        : extractMarkedIndex(raw, artifactPath);
     if (text.length < 40) {
         throw new Error(`Guard 证据索引过短 (${text.length} chars): ${artifactPath}`);
     }
@@ -248,20 +302,24 @@ function cachePathFor(key: string): string {
     return path.join(guardEvidenceIndexDir(), `${key}.json`);
 }
 
-function readCachedIndex(cachePath: string): GuardEvidenceIndexItem | null {
+function readCachedIndex(cachePath: string): GuardEvidenceSourceItem | null {
     try {
         if (!fs.existsSync(cachePath)) return null;
-        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as GuardEvidenceIndexItem & { version?: number };
-        if (cached.version !== undefined && cached.version !== GUARD_EVIDENCE_INDEX_VERSION) return null;
+        const cached = JSON.parse(fs.readFileSync(cachePath, "utf-8")) as GuardEvidenceSourceItem & { version?: number };
+        if (cached.version !== GUARD_EVIDENCE_INDEX_VERSION) return null;
+        if (!["complete", "partial", "unread"].includes(cached.sourceReadStatus)
+            || cached.readStatus !== cached.sourceReadStatus || typeof cached.truncated !== "boolean"
+            || !Array.isArray(cached.coverageGaps) || !Array.isArray(cached.warnings)) return null;
         if (!cached.artifactPath || !fs.existsSync(cached.artifactPath)) return null;
-        const text = readMarkedArtifact(cached.artifactPath);
+        const maxBytes = cached.ingestMode === "direct_text" ? Math.max(ARTIFACT_MAX_BYTES, DIRECT_TEXT_MAX_BYTES + 64 * 1024) : ARTIFACT_MAX_BYTES;
+        const text = readMarkedArtifact(cached.artifactPath, maxBytes, cached.ingestMode !== "agentic_index");
         return { ...cached, text };
     } catch {
         return null;
     }
 }
 
-function writeCachedIndex(cachePath: string, item: GuardEvidenceIndexItem): void {
+function writeCachedIndex(cachePath: string, item: GuardEvidenceSourceItem): void {
     fs.writeFileSync(cachePath, JSON.stringify({ version: GUARD_EVIDENCE_INDEX_VERSION, ...item, text: undefined }, null, 2), "utf-8");
 }
 
@@ -286,7 +344,7 @@ function formatBaseHeader(input: GuardEvidenceAssetInput, resolvedPath: string, 
     ].filter((line): line is string => Boolean(line));
 }
 
-function buildUnreadableItem(input: GuardEvidenceAssetInput, resolvedPath: string, kind: GuardEvidenceKind, reason: string): GuardEvidenceIndexItem {
+function buildUnreadableItem(input: GuardEvidenceAssetInput, resolvedPath: string, kind: GuardEvidenceKind, reason: string): GuardEvidenceSourceItem {
     const markdown = [
         ...formatBaseHeader(input, resolvedPath, kind),
         "## 读取状态",
@@ -308,13 +366,17 @@ function buildUnreadableItem(input: GuardEvidenceAssetInput, resolvedPath: strin
         artifactPath,
         text: markdown,
         warnings: [reason],
+        requestedRange: input.range,
+        sourceReadStatus: "unread",
+        readStatus: "unread",
+        truncated: false,
+        coverageGaps: [reason, "source_text_unknown: 未读取源内容，源文本字符数未知"],
     };
 }
 
-function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kind: GuardEvidenceKind, maxChars: number): GuardEvidenceIndexItem {
+function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kind: GuardEvidenceKind): GuardEvidenceSourceItem {
     const prefix = readUtf8Prefix(resolvedPath, DIRECT_TEXT_MAX_BYTES);
-    const scoped = parseRange(input.range, prefix.text.split(/\r?\n/u));
-    const clipped = clip(scoped, maxChars);
+    const scoped = parseRange(input.range, prefix.text.split(/\r?\n/u), prefix.truncated);
     const markdown = [
         ...formatBaseHeader(input, resolvedPath, kind),
         "## 类型与读取方式",
@@ -322,11 +384,11 @@ function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kin
         "",
         "## 文本摘录",
         "```text",
-        clipped,
+        scoped.text,
         "```",
         "",
         "## 不确定性与盲点",
-        prefix.truncated ? "- 源文件未全量读取；如证据可能位于后半段，应补充更精确 range 或单独证据。" : "- 已读取请求范围内文本。",
+        scoped.complete ? "- 已读取请求范围内文本。" : "- 请求范围未全量读取；剩余源文本字符数未知。",
     ].join("\n");
     const artifactPath = writeIndexArtifact(resolvedPath, "text", markdown);
     return {
@@ -339,12 +401,17 @@ function indexTextFile(input: GuardEvidenceAssetInput, resolvedPath: string, kin
         ok: true,
         artifactPath,
         text: markdown,
-        warnings: prefix.truncated ? ["源文件超过直接读取字节预算，已截断"] : [],
+        warnings: scoped.gaps,
+        requestedRange: input.range,
+        sourceReadStatus: scoped.complete ? "complete" : scoped.text ? "partial" : "unread",
+        readStatus: scoped.complete ? "complete" : scoped.text ? "partial" : "unread",
+        truncated: !scoped.complete,
+        coverageGaps: scoped.gaps,
         ...metadataFor(resolvedPath),
     };
 }
 
-function indexImageMetadata(input: GuardEvidenceAssetInput, resolvedPath: string): GuardEvidenceIndexItem {
+function indexImageMetadata(input: GuardEvidenceAssetInput, resolvedPath: string): GuardEvidenceSourceItem {
     const markdown = [
         ...formatBaseHeader(input, resolvedPath, "image"),
         "## 类型与读取方式",
@@ -369,6 +436,11 @@ function indexImageMetadata(input: GuardEvidenceAssetInput, resolvedPath: string
         artifactPath,
         text: markdown,
         warnings: ["图片未做 OCR/视觉理解，仅记录元信息"],
+        requestedRange: input.range,
+        sourceReadStatus: "partial",
+        readStatus: "partial",
+        truncated: false,
+        coverageGaps: ["image_metadata_only: 图片内容未读取，源文本字符数未知"],
         ...metadataFor(resolvedPath),
     };
 }
@@ -775,14 +847,16 @@ output_path.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
     return { text, parser: payload.method, warnings: payload.warnings, artifactPath };
 }
 
-async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<BuildGuardEvidenceIndexOptions>, remainingChars: number): Promise<GuardEvidenceIndexItem> {
+async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<BuildGuardEvidenceIndexOptions>): Promise<GuardEvidenceSourceItem> {
     const resolvedPath = path.resolve(input.path);
     const kind = classifyEvidencePath(resolvedPath, input.type);
+    if (options.indexMode === "off") {
+        return buildUnreadableItem(input, resolvedPath, kind, "evidenceIndexMode=off，未读取外部证据文件");
+    }
     if (!fs.existsSync(resolvedPath)) {
         return buildUnreadableItem(input, resolvedPath, kind, "文件不存在");
     }
     const metadata = metadataFor(resolvedPath);
-    const maxChars = Math.max(800, Math.min(input.maxChars || options.maxFileChars, remainingChars));
     const cachePath = cachePathFor(cacheKey(input, resolvedPath, kind));
     if (options.indexMode === "reuse" || options.indexMode === "auto") {
         const cached = readCachedIndex(cachePath);
@@ -791,14 +865,10 @@ async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<B
             return buildUnreadableItem(input, resolvedPath, kind, `未找到可复用索引缓存: ${cachePath}`);
         }
     }
-    if (options.indexMode === "off") {
-        return buildUnreadableItem(input, resolvedPath, kind, "evidenceIndexMode=off，未读取外部证据文件");
-    }
-
-    let item: GuardEvidenceIndexItem;
+    let item: GuardEvidenceSourceItem;
     try {
         if (kind === "text" || kind === "csv") {
-            item = indexTextFile(input, resolvedPath, kind, maxChars);
+            item = indexTextFile(input, resolvedPath, kind);
         } else if (kind === "image" && !shouldTryCli(kind)) {
             item = indexImageMetadata(input, resolvedPath);
         } else {
@@ -814,8 +884,13 @@ async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<B
                     parser: `${cliResult.cli}-cli`,
                     ok: true,
                     artifactPath: cliResult.artifactPath,
-                    text: clip(cliResult.text, maxChars),
+                    text: cliResult.text,
                     warnings: cliResult.notes,
+                    requestedRange: input.range,
+                    sourceReadStatus: "partial",
+                    readStatus: "partial",
+                    truncated: false,
+                    coverageGaps: ["agentic_index_coverage_unknown: CLI 索引未提供可校验的逐段覆盖，原材料完整读取状态与源文本字符数未知"],
                     ...metadata,
                 };
             } catch (cliError) {
@@ -831,8 +906,13 @@ async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<B
                             parser: fallback.parser,
                             ok: true,
                             artifactPath: fallback.artifactPath,
-                            text: clip(fallback.text, maxChars),
+                            text: fallback.text,
                             warnings: [`CLI 索引降级: ${cliError instanceof Error ? cliError.message : String(cliError)}`, ...fallback.warnings],
+                            requestedRange: input.range,
+                            sourceReadStatus: "partial",
+                            readStatus: "partial",
+                            truncated: true,
+                            coverageGaps: ["structured_extract_sample: 结构化索引只包含抽样段落、页面或单元格，未覆盖内容与源文本字符数未知", ...(input.range ? ["requested_range_unverified: 结构化兜底未核验请求范围"] : [])],
                             ...metadata,
                         };
                     } catch (fallbackError) {
@@ -852,10 +932,71 @@ async function buildOneIndex(input: GuardEvidenceAssetInput, options: Required<B
         item = buildUnreadableItem(input, resolvedPath, kind, error instanceof Error ? error.message : String(error));
     }
 
-    item.text = clip(item.text, maxChars);
     item.cachePath = cachePath;
     if (item.ok && item.artifactPath) writeCachedIndex(cachePath, item);
     return item;
+}
+
+const ITEM_SEPARATOR = "\n\n---\n\n";
+
+function serializeItem(item: GuardEvidenceSourceItem, index: number): string {
+    return [
+        `### 证据文件 ${index + 1}: ${item.label || path.basename(item.path)}`,
+        `- path: ${item.path}`,
+        `- kind: ${item.kind}`,
+        `- ingestMode: ${item.ingestMode}`,
+        `- parser: ${item.parser}`,
+        `- ok: ${item.ok}`,
+        `- readStatus: ${item.readStatus}`,
+        `- sourceReadStatus: ${item.sourceReadStatus}`,
+        `- truncated: ${item.truncated}`,
+        item.requestedRange ? `- requestedRange: ${item.requestedRange}` : undefined,
+        item.artifactPath ? `- artifactPath: ${item.artifactPath}` : undefined,
+        item.warnings.length ? `- warnings: ${item.warnings.join(" | ")}` : undefined,
+        item.coverageGaps.length ? `- coverageGaps: ${item.coverageGaps.join(" | ")}` : undefined,
+        "",
+        item.text,
+    ].filter((line): line is string => line !== undefined).join("\n");
+}
+
+function fitItem(source: GuardEvidenceSourceItem, index: number, maxChars: number, fileLimited: boolean): { item: GuardEvidenceIndexItem; block: string } {
+    const sourceChars = serializeItem(source, index).length;
+    const item: GuardEvidenceIndexItem = { ...source, warnings: [...source.warnings], coverageGaps: [...source.coverageGaps], sourceChars, includedChars: 0 };
+    if (sourceChars <= maxChars) {
+        const block = serializeItem(item, index);
+        item.includedChars = block.length;
+        return { item, block };
+    }
+    const gap = fileLimited ? "per_file_budget_truncated: 单文件序列化预算不足" : "total_budget_truncated: 总序列化预算不足";
+    item.truncated = true;
+    item.coverageGaps.push(gap);
+    item.warnings.push(gap);
+    item.readStatus = source.sourceReadStatus === "unread" ? "unread" : "partial";
+    item.text = "";
+    const overhead = serializeItem(item, index).length;
+    item.text = clip(source.text, Math.max(0, maxChars - overhead));
+    if (!item.text) item.readStatus = "unread";
+    const block = serializeItem(item, index);
+    if (block.length > maxChars) {
+        item.readStatus = "unread";
+        item.text = "";
+        item.coverageGaps.push("budget_skipped: 完整元数据块无法放入预算，未注入该材料");
+        return { item, block: "" };
+    }
+    item.includedChars = block.length;
+    return { item, block };
+}
+
+function coveragePreamble(coverage: GuardEvidenceCoverage, manifestPath: string): string {
+    const width = String(coverage.requestedAssets).length;
+    const count = (value: number) => String(value).padStart(width, "0");
+    return [
+        "## 外部证据文件索引",
+        `- coverage: requested=${count(coverage.requestedAssets)}, complete=${count(coverage.completeAssets)}, partial=${count(coverage.partialAssets)}, unread=${count(coverage.unreadAssets)}`,
+        `- 完整覆盖状态、缺失与未注入材料记录: ${manifestPath}`,
+        "",
+        "",
+    ].join("\n");
 }
 
 export async function buildGuardEvidenceIndexes(
@@ -864,51 +1005,89 @@ export async function buildGuardEvidenceIndexes(
 ): Promise<GuardEvidenceIndexResult> {
     const normalizedOptions: Required<BuildGuardEvidenceIndexOptions> = {
         indexMode: options.indexMode || "auto",
-        maxTotalChars: options.maxTotalChars || DEFAULT_TOTAL_CHARS,
-        maxFileChars: options.maxFileChars || DEFAULT_PER_FILE_CHARS,
+        maxTotalChars: normalizeBudget(options.maxTotalChars, DEFAULT_TOTAL_CHARS),
+        maxFileChars: normalizeBudget(options.maxFileChars, DEFAULT_PER_FILE_CHARS),
+    };
+    const requestedInputs: GuardEvidenceAssetInput[] = Array.isArray(inputs) ? inputs : inputs == null ? [] : [{ path: "" }];
+    const manifestPath = path.join(guardEvidenceIndexDir(), `guard_evidence_manifest_${nowStamp()}.json`);
+    const coverage: GuardEvidenceCoverage = {
+        requestedAssets: requestedInputs.length, completeAssets: 0, partialAssets: 0, unreadAssets: 0,
+        sourceChars: 0, includedChars: 0, truncated: false, coverageGaps: [],
     };
     const items: GuardEvidenceIndexItem[] = [];
-    let usedChars = 0;
-    for (const input of inputs || []) {
-        if (!input.path?.trim()) continue;
-        const remainingChars = normalizedOptions.maxTotalChars - usedChars;
-        if (remainingChars <= 800) {
-            items.push(buildUnreadableItem(input, path.resolve(input.path), classifyEvidencePath(input.path, input.type), "Guard 外部证据索引总预算已用尽，未读取该文件"));
-            continue;
+    const blocks: string[] = [];
+    const preambleChars = requestedInputs.length ? coveragePreamble(coverage, manifestPath).length : 0;
+    let usedChars = preambleChars;
+    for (const [index, rawInput] of requestedInputs.entries()) {
+        const input: GuardEvidenceAssetInput = {
+            path: typeof rawInput?.path === "string" ? rawInput.path : "",
+            label: typeof rawInput?.label === "string" ? rawInput.label : undefined,
+            role: typeof rawInput?.role === "string" ? rawInput.role : undefined,
+            type: typeof rawInput?.type === "string" ? rawInput.type : undefined,
+            range: typeof rawInput?.range === "string" ? rawInput.range : undefined,
+            maxChars: rawInput?.maxChars,
+        };
+        const validPath = Boolean(input.path.trim()) && !input.path.includes("\0");
+        const resolvedPath = validPath ? path.resolve(input.path) : "[invalid evidence path]";
+        const kind = classifyEvidencePath(resolvedPath, input.type);
+        const remainingChars = Math.max(0, normalizedOptions.maxTotalChars - usedChars - (blocks.length ? ITEM_SEPARATOR.length : 0));
+        const fileChars = normalizeBudget(input.maxChars, normalizedOptions.maxFileChars);
+        const minimumHeaderChars = serializeItem({
+            path: resolvedPath, label: input.label, kind, ingestMode: "unreadable_stub", parser: "stub", ok: false,
+            text: "", warnings: [], requestedRange: input.range, sourceReadStatus: "unread", readStatus: "unread", truncated: true, coverageGaps: [],
+        }, index).length;
+        let source: GuardEvidenceSourceItem;
+        if (!validPath) {
+            source = buildUnreadableItem(input, resolvedPath, kind, "invalid_path: 证据路径无效，未读取源文件");
+        } else if (normalizedOptions.indexMode === "off") {
+            source = await buildOneIndex(input, normalizedOptions);
+        } else if (Math.min(remainingChars, fileChars) < minimumHeaderChars) {
+            source = buildUnreadableItem(input, resolvedPath, kind, fileChars <= remainingChars
+                ? "per_file_budget_skipped: 单文件预算无法容纳元数据，未读取源文件"
+                : "total_budget_skipped: 总预算无法容纳元数据，未读取源文件");
+            source.truncated = true;
+        } else {
+            source = await buildOneIndex(input, normalizedOptions);
         }
-        const item = await buildOneIndex(input, normalizedOptions, remainingChars);
+        const { item, block } = fitItem(source, index, Math.min(fileChars, remainingChars), fileChars <= remainingChars);
         items.push(item);
-        usedChars += item.text.length + 80;
+        if (block) {
+            item.includedStart = usedChars + (blocks.length ? ITEM_SEPARATOR.length : 0);
+            item.includedEnd = item.includedStart + block.length;
+            usedChars += (blocks.length ? ITEM_SEPARATOR.length : 0) + block.length;
+            blocks.push(block);
+        }
+        coverage.sourceChars += item.sourceChars;
+        if (item.readStatus === "complete") coverage.completeAssets += 1;
+        else if (item.readStatus === "partial") coverage.partialAssets += 1;
+        else coverage.unreadAssets += 1;
+        coverage.truncated ||= item.truncated;
+        coverage.coverageGaps.push(...item.coverageGaps.map((gap) => `asset ${index + 1}: ${gap}`));
     }
 
-    const text = items.length === 0
-        ? ""
-        : [
-            "## 外部证据文件索引",
+    coverage.sourceChars += preambleChars + Math.max(0, items.length - 1) * ITEM_SEPARATOR.length;
+    let text = items.length ? coveragePreamble(coverage, manifestPath) + blocks.join(ITEM_SEPARATOR) : "";
+    if (preambleChars > normalizedOptions.maxTotalChars) {
+        text = [
+            `Guard evidence unread; manifestPath: ${manifestPath}`,
+            "Guard evidence unread; see manifest",
+            "证据未读",
+            "!",
             "",
-            items.map((item, index) => [
-                `### 证据文件 ${index + 1}: ${item.label || path.basename(item.path)}`,
-                `- path: ${item.path}`,
-                `- kind: ${item.kind}`,
-                `- ingestMode: ${item.ingestMode}`,
-                `- parser: ${item.parser}`,
-                `- ok: ${item.ok}`,
-                item.artifactPath ? `- artifactPath: ${item.artifactPath}` : undefined,
-                item.warnings.length ? `- warnings: ${item.warnings.slice(0, 3).join(" | ")}` : undefined,
-                "",
-                item.text,
-            ].filter((line): line is string => Boolean(line)).join("\n")).join("\n\n---\n\n"),
-        ].join("\n");
+        ].find((hint) => hint.length <= normalizedOptions.maxTotalChars)!;
+    }
+    coverage.includedChars = text.length;
 
-    const manifestPath = path.join(guardEvidenceIndexDir(), `guard_evidence_manifest_${nowStamp()}.json`);
     fs.writeFileSync(manifestPath, JSON.stringify({
         version: GUARD_EVIDENCE_INDEX_VERSION,
         createdAt: new Date().toISOString(),
         indexMode: normalizedOptions.indexMode,
         maxTotalChars: normalizedOptions.maxTotalChars,
         maxFileChars: normalizedOptions.maxFileChars,
+        charUnit: "UTF-16 code units; acquired index text and serialized metadata only; unknown source content is recorded in coverageGaps",
+        coverage,
         items: items.map((item) => ({ ...item, text: undefined })),
     }, null, 2), "utf-8");
 
-    return { text: clip(text, normalizedOptions.maxTotalChars), items, manifestPath };
+    return { text, items, manifestPath, coverage };
 }

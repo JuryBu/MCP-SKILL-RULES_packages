@@ -196,6 +196,8 @@ function buildSearchBlockContent(round: ConversationRound, options?: Conversatio
 async function selectRounds(options: ConversationExportOptions): Promise<{ rounds: ConversationRound[]; warnings: string[]; rangeLabel: string }> {
     const scope = options.scope || "full";
     const warnings: string[] = [];
+    const lastRound = options.rounds.reduce((last, round) => Math.max(last, round.roundIndex), 0);
+    const firstRound = options.rounds.reduce((first, round) => Math.min(first, round.roundIndex), Number.POSITIVE_INFINITY);
     if (scope === "search") {
         if (!options.query?.trim()) {
             warnings.push("scope=search 未提供 query，已导出空范围");
@@ -233,22 +235,17 @@ async function selectRounds(options: ConversationExportOptions): Promise<{ round
             }
         }
         const context = Math.max(0, options.contextRounds ?? 2);
-        const selected = new Set<number>();
-        for (const index of roundIndices) {
-            for (let current = Math.max(1, index - context); current <= Math.min(options.rounds.length, index + context); current++) {
-                selected.add(current);
-            }
-        }
-        const rounds = [...selected].sort((a, b) => a - b).map(index => options.rounds[index - 1]).filter(Boolean);
+        const rounds = options.rounds.filter(round => roundIndices.some(index => Math.abs(round.roundIndex - index) <= context))
+            .sort((left, right) => left.roundIndex - right.roundIndex);
         return { rounds, warnings, rangeLabel: `search(${options.query})` };
     }
     if (scope === "rounds") {
         const start = Math.max(1, options.startRound || 1);
-        const end = Math.min(options.rounds.length, options.endRound || options.rounds.length);
-        if (start > end || start > options.rounds.length) return { rounds: [], warnings: [`轮次范围 ${start}-${end} 为空`], rangeLabel: `${start}-${end}` };
-        return { rounds: options.rounds.slice(start - 1, end), warnings, rangeLabel: `${start}-${end}` };
+        const end = Math.min(lastRound, options.endRound || lastRound);
+        if (start > end) return { rounds: [], warnings: [`轮次范围 ${start}-${end} 为空`], rangeLabel: `${start}-${end}` };
+        return { rounds: options.rounds.filter(round => round.roundIndex >= start && round.roundIndex <= end), warnings, rangeLabel: `${start}-${end}` };
     }
-    return { rounds: options.rounds, warnings, rangeLabel: `1-${options.rounds.length}` };
+    return { rounds: options.rounds, warnings, rangeLabel: `${Number.isFinite(firstRound) ? firstRound : 1}-${lastRound}` };
 }
 
 function pathFromUriOrPath(input: string): string | null {
@@ -629,7 +626,7 @@ async function streamCachedFullMarkdown(
         markdownChars += content.length;
     };
     try {
-        await write(`${buildMarkdownHeader(options, warnings, `1-${cached.roundCount}`, cached.roundCount, true)}\n`);
+        await write(`${buildMarkdownHeader(options, warnings, `${cached.roundIndexBounds?.first || 1}-${cached.roundIndexBounds?.last ?? cached.roundCount}`, cached.roundCount, true)}\n`);
         for (const round of cached.rounds) {
             throwIfExportAborted(options, `cache round ${round.roundIndex}`);
             const materialized = await materializeRoundAttachments([round], options.conversationId, {
@@ -708,7 +705,8 @@ export async function exportConversation(options: ConversationExportOptions): Pr
             } else {
                 const cachedRange = readCachedRounds(options, startRound, endRound);
                 if (cachedRange) {
-                    const effectiveEnd = Math.min(cachedRange.roundCount, endRound || cachedRange.roundCount);
+                    const lastRound = cachedRange.roundIndexBounds?.last ?? cachedRange.roundCount;
+                    const effectiveEnd = Math.min(lastRound, endRound || lastRound);
                     selected = startRound > effectiveEnd
                         ? { rounds: [], warnings: [`轮次范围 ${startRound}-${effectiveEnd} 为空`], rangeLabel: `${startRound}-${effectiveEnd}` }
                         : { rounds: Array.from(cachedRange.rounds), warnings: [], rangeLabel: `${startRound}-${effectiveEnd}` };

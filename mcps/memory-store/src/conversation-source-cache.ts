@@ -62,6 +62,7 @@ export interface ConversationSourceCacheReadOrBuildOptions<TSnapshot, TRound> {
     fingerprint: ConversationSourceFingerprint | null;
     refresh?: boolean;
     assertPublishable?: () => Promise<void> | void;
+    validateBuild?: (snapshot: TSnapshot, prepared: ConversationSourceCachePreparedRounds) => Promise<void> | void;
     build: () => Promise<ConversationSourceCacheBuildResult<TSnapshot, TRound>> | ConversationSourceCacheBuildResult<TSnapshot, TRound>;
     getRoundNumber?: (round: TRound, index: number) => number;
     projectRecordRound?: (round: TRound, index: number) => unknown;
@@ -89,6 +90,7 @@ export interface ConversationSourceCacheReadResult<TSnapshot> {
     fingerprint: ConversationSourceFingerprint | null;
     snapshot: TSnapshot;
     roundCount: number;
+    roundIndexBounds?: ConversationSourceCacheRoundBounds;
     createdAt: string;
     cacheState: "hit" | "built" | "stale";
     buildFailure?: ConversationSourceCacheBuildFailure;
@@ -99,6 +101,7 @@ export interface ConversationSourceCacheRoundsResult<TRound> {
     generation: string;
     fingerprint: ConversationSourceFingerprint | null;
     roundCount: number;
+    roundIndexBounds?: ConversationSourceCacheRoundBounds;
     rounds: TRound[];
 }
 
@@ -107,6 +110,7 @@ export interface ConversationSourceCacheRoundIterable<TRound> {
     generation: string;
     fingerprint: ConversationSourceFingerprint | null;
     roundCount: number;
+    roundIndexBounds?: ConversationSourceCacheRoundBounds;
     roundsBytes: number;
     roundsSha256: string;
     recordProjection?: {
@@ -172,6 +176,21 @@ interface RoundOffset {
 interface RoundOffsetIndex {
     version: 1;
     entries: RoundOffset[];
+}
+
+export interface ConversationSourceCacheRoundBounds {
+    first: number;
+    last: number;
+}
+
+function roundIndexBounds(index: RoundOffsetIndex): ConversationSourceCacheRoundBounds {
+    let first = Number.POSITIVE_INFINITY;
+    let last = 0;
+    for (const entry of index.entries) {
+        first = Math.min(first, entry.round);
+        last = Math.max(last, entry.round);
+    }
+    return { first: last > 0 ? first : 0, last };
 }
 
 function hasUniquePositiveRoundNumbers(index: RoundOffsetIndex, expectedCount: number): boolean {
@@ -399,12 +418,13 @@ function verifyFileDescriptorSize(directory: string, descriptor: CacheFileDescri
     }
 }
 
-function cacheState(manifest: ConversationSourceCacheManifest): CacheState {
+function cacheState(manifest: ConversationSourceCacheManifest, index?: RoundOffsetIndex): CacheState {
     return {
         key: { ...manifest.key },
         generation: manifest.generation,
         fingerprint: normalizeFingerprint(manifest.fingerprint),
         roundCount: manifest.roundCount,
+        ...(index ? { roundIndexBounds: roundIndexBounds(index) } : {}),
         createdAt: manifest.createdAt,
     };
 }
@@ -426,7 +446,7 @@ function readCachedInternal<TSnapshot>(
         const index = JSON.parse(indexBytes.toString("utf8")) as RoundOffsetIndex;
         if (!hasUniquePositiveRoundNumbers(index, manifest.roundCount)) throw new Error("invalid round offset index");
         return {
-            ...cacheState(manifest),
+            ...cacheState(manifest, index),
             snapshot: JSON.parse(snapshotBytes.toString("utf8")) as TSnapshot,
             cacheState: cacheStateValue,
         };
@@ -759,6 +779,7 @@ async function publishGeneration<TSnapshot, TRound>(
         if (options.projectRecordRound && !preparedRounds.recordProjection) {
             throw new Error("prepared conversation cache rounds are missing the required Record projection");
         }
+        await options.validateBuild?.(built.snapshot, preparedRounds);
         const roundsFile = await publishPreparedFile(directory, cacheFileName("rounds", generation), preparedRounds);
         const roundIndex = await writeGenerationFile(
             directory,
@@ -800,7 +821,7 @@ async function publishGeneration<TSnapshot, TRound>(
         });
         cleanupOldGenerations(options.key, directory, generation);
         return {
-            ...cacheState(manifest),
+            ...cacheState(manifest, preparedRounds.index),
             snapshot: built.snapshot,
             cacheState: "built",
         };
@@ -845,6 +866,11 @@ export function getConversationSourceCacheReadStatus(
     return readCachedInternal(options) ? "ready" : "corrupt";
 }
 
+export function getConversationSourceCacheRoundBounds(options: ConversationSourceCacheReadOptions): ConversationSourceCacheRoundBounds | null {
+    const cached = iterateCachedConversationSourceCacheRounds(options);
+    return cached?.roundIndexBounds || null;
+}
+
 export function iterateCachedConversationSourceCacheRounds<TRound = unknown>(
     options: ConversationSourceCacheRoundRange,
 ): ConversationSourceCacheRoundIterable<TRound> | null {
@@ -883,7 +909,7 @@ export function iterateCachedConversationSourceCacheRounds<TRound = unknown>(
     }
 
     return {
-        ...cacheState(manifest),
+        ...cacheState(manifest, index),
         roundsBytes: manifest.files.rounds.bytes,
         roundsSha256: manifest.files.rounds.sha256,
         recordProjection: manifest.files.recordProjection

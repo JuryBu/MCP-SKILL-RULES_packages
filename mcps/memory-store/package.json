@@ -1,6 +1,6 @@
 {
   "name": "memory-store-mcp-server",
-  "version": "1.25.8",
+  "version": "1.25.9",
   "description": "MCP Server - AI 主动记忆管理系统，支持多工作区、冷热分层、批量操作、五数据链路对话原文读取、Auto Summary 双轨制、黄金片段提取、进程生命周期容错",
   "type": "module",
   "main": "dist/index.js",
@@ -16,6 +16,8 @@
     "start": "node dist/index.js",
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
+    "test:guard-diagnostics": "tsx tests/codex-bridge-diagnostics.test.ts && tsx tests/guard-final-coverage.test.ts && tsx tests/guard-final-coverage-tool.test.ts && tsx tests/background-task-diagnostics.test.ts",
+    "test:history-round-boundaries": "tsx tests/conversation-source-cache-round-index.test.ts && tsx tests/conversation-bridge-round-bounds.test.ts && tsx tests/conversation-codex-checkpoint-map.test.ts && tsx tests/conversation-codex-archive-client.test.ts && tsx tests/conversation-search-tool.test.ts",
     "test:devin": "tsx tests/devin-sqlite.test.ts && tsx tests/devin-conversation.test.ts && tsx tests/devin-bridge.test.ts && tsx tests/devin-consumers.test.ts && tsx tests/conversation-context-locate.test.ts && tsx tests/devin-legacy-isolation.test.ts && tsx tests/devin-tool-attachments.test.ts && tsx tests/devin-discovery-offline.test.ts",
     "test:codex-history": "tsx tests/codex-history-source.test.ts && tsx tests/codex-history-bridge.test.ts && tsx tests/codex-cache-source-rewrite.test.ts && tsx tests/codex-history-integrity.test.ts && tsx tests/codex-source-inspection.test.ts && tsx tests/codex-source-work.test.ts",
     "test:conversation-search": "tsx tests/conversation-search-fields.test.ts && tsx tests/conversation-search-tool.test.ts && tsx tests/conversation-search-cache.test.ts && tsx tests/conversation-search-followup.test.ts && tsx tests/conversation-published-cache.test.ts",

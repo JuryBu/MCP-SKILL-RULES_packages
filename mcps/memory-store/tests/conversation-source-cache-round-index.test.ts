@@ -57,6 +57,30 @@ try {
         null,
         "旧缓存即使文件哈希正确，只要轮号重复也必须判为损坏并触发重建",
     );
+    const sparseKey = { ...key, conversationId: "sparse-round-index" };
+    const sparse = await cache.readOrBuild({
+        key: sparseKey,
+        fingerprint: { revision: "sparse" },
+        getRoundNumber: (round: { roundIndex: number }) => round.roundIndex,
+        build: () => ({ snapshot: {}, rounds: [{ roundIndex: 1 }, { roundIndex: 670 }, { roundIndex: 676 }] }),
+    });
+    assert.equal(sparse.roundCount, 3);
+    assert.deepEqual(sparse.roundIndexBounds, { first: 1, last: 676 });
+    assert.deepEqual(cache.getConversationSourceCacheRoundBounds({ key: sparseKey, generation: sparse.generation }), { first: 1, last: 676 });
+    assert.deepEqual(cache.readCachedConversationSourceCacheRounds<{ roundIndex: number }>({
+        key: sparseKey, generation: sparse.generation, startRound: 664, endRound: 676,
+    })?.rounds.map(round => round.roundIndex), [670, 676]);
+    const rejected = await cache.readOrBuild({
+        key: sparseKey,
+        fingerprint: { revision: "reject-checkpoint" },
+        getRoundNumber: (round: { roundIndex: number }) => round.roundIndex,
+        validateBuild: () => { throw new Error("fixture checkpoint mapping mismatch"); },
+        build: () => ({ snapshot: {}, rounds: [{ roundIndex: 1 }] }),
+    });
+    assert.equal(rejected.generation, sparse.generation);
+    assert.equal(rejected.cacheState, "stale");
+    assert.match(rejected.buildFailure?.message || "", /checkpoint mapping mismatch/u);
+    assert.equal(cache.readConversationSourceCacheOnly({ key: sparseKey })?.generation, sparse.generation);
 } finally {
     cache.resetConversationSourceCacheForTests();
     fs.rmSync(dataRoot, { recursive: true, force: true });

@@ -299,11 +299,14 @@ export function selectConversationRecallRange(
     endRound?: number,
 ): ConversationRecallSelection | null {
     if (metadata.roundCount <= 0) return null;
+    const firstRound = metadata.roundContextChars.reduce((first, item) => Math.min(first, item.roundIndex), Number.POSITIVE_INFINITY);
+    const lastRound = metadata.roundContextChars.reduce((last, item) => Math.max(last, item.roundIndex), 0) || metadata.roundCount;
+    const first = Number.isFinite(firstRound) ? firstRound : 1;
     if (mode === "manual") {
         const start = startRound ?? 1;
-        const end = endRound ?? metadata.roundCount;
-        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > metadata.roundCount) {
-            throw new Error(`manual recall round range must satisfy 1 <= startRound <= endRound <= ${metadata.roundCount}`);
+        const end = endRound ?? lastRound;
+        if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start || end > lastRound) {
+            throw new Error(`manual recall round range must satisfy 1 <= startRound <= endRound <= ${lastRound} (${metadata.roundCount} cached rounds)`);
         }
         const selected = metadata.roundContextChars.filter(item => item.roundIndex >= start && item.roundIndex <= end);
         return {
@@ -316,8 +319,8 @@ export function selectConversationRecallRange(
     }
     if (mode === "full") {
         return {
-            startRound: 1,
-            endRound: metadata.roundCount,
+            startRound: first,
+            endRound: lastRound,
             targetContextChars: metadata.contextChars,
             selectedContextChars: metadata.contextChars,
             reason: "full context-only recall",
@@ -325,10 +328,10 @@ export function selectConversationRecallRange(
     }
     if (metadata.host === "antigravity") {
         const target = metadata.fallbackChars || ANTIGRAVITY_RECALL_FALLBACK_CHARS;
-        const selected = selectBackward(metadata, metadata.roundCount, target);
+        const selected = selectBackward(metadata, lastRound, target);
         return {
             startRound: selected.startRound,
-            endRound: metadata.roundCount,
+            endRound: lastRound,
             targetContextChars: target,
             selectedContextChars: selected.selectedChars,
             reason: `Antigravity has no reliable compaction marker; return about ${metadata.fallbackTokens || ANTIGRAVITY_RECALL_FALLBACK_TOKENS} recent tokens (${target} context characters)`,
@@ -347,17 +350,18 @@ export function selectConversationRecallRange(
     } else {
         targetChars = Math.max(0, Math.floor(event.preContextChars * 0.6) - event.postContextChars);
     }
-    if (targetChars <= 0 || event.roundIndex <= 1) {
+    const previousRound = metadata.roundContextChars.filter(item => item.roundIndex < event.roundIndex).at(-1)?.roundIndex;
+    if (targetChars <= 0 || previousRound === undefined) {
         return {
-            startRound: Math.max(1, event.roundIndex - 1),
-            endRound: Math.max(1, event.roundIndex - 1),
+            startRound: previousRound ?? first,
+            endRound: previousRound ?? first,
             targetContextChars: 0,
             selectedContextChars: 0,
-            reason: "post-compaction visible context already reaches 60% of the pre-compaction scale",
+            reason: previousRound === undefined ? "no earlier cached round before the compaction event" : "post-compaction visible context already reaches 60% of the pre-compaction scale",
             event,
         };
     }
-    const end = event.roundIndex - 1;
+    const end = previousRound;
     const selected = selectBackward(metadata, end, targetChars);
     return {
         startRound: selected.startRound,

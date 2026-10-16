@@ -3,6 +3,8 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { promisify } from "util";
+import crypto from "node:crypto";
+import { StringDecoder } from "node:string_decoder";
 import { callGetModelResponseDetailed as callLsModelDetailed, isLsAvailable } from "./ls-client.js";
 import { normalizeChain, type Chain } from "./chain.js";
 import { callAgyWithFallback, type AgyAttempt } from "./agy-client.js";
@@ -11,6 +13,7 @@ import { getProviderTransportAdapter, mapProviderTrafficClass, type ProviderTran
 import type { ProviderTrafficClass } from "./provider-control-contracts.js";
 import type { FailureClass } from "./record-scheduler-contracts.js";
 import { spawnWindowsJobProcess, type WindowsJobProcess } from "./windows-job-process.js";
+import { CodexDiagnosticRecorder, type CodexBridgeDiagnostics, type CodexDiagnosticContext } from "./codex-bridge-diagnostics.js";
 
 const execAsync = promisify(exec);
 const CODEX_STATUS_TTL = 60_000;
@@ -61,13 +64,18 @@ export interface ModelBridgeResult {
     failureClass?: FailureClass;
     retryStrategy?: ModelBridgeRetryStrategy;
     agyAttempts?: readonly AgyAttempt[];
+    codexDiagnostics?: CodexBridgeDiagnostics;
+    safetyStopped?: boolean;
 }
 
 export interface CodexExecResult {
     text: string | null;
     error?: string;
     timedOut?: boolean;
+    cancelled?: boolean;
     failureClass?: FailureClass;
+    codexDiagnostics?: CodexBridgeDiagnostics;
+    safetyStopped?: boolean;
 }
 
 export interface ClaudeCodeExecResult {
@@ -92,6 +100,7 @@ export interface ModelBridgeOptions {
     shouldCancel?: () => boolean;
     signal?: AbortSignal;
     preResolvedCandidate?: ResolvedChain;
+    diagnosticContext?: CodexDiagnosticContext;
 }
 
 function isModelBridgeCancelled(options: ModelBridgeOptions): boolean {
@@ -624,7 +633,8 @@ function mapModelName(model: string): string {
     return CODEX_DEFAULT_MODEL;
 }
 
-export async function callCodexExec(prompt: string, model: string, timeoutMs: number): Promise<CodexExecResult> {
+export async function callCodexExec(prompt: string, model: string, timeoutMs: number, diagnosticContext?: CodexDiagnosticContext, control: Pick<ModelBridgeOptions, "shouldCancel" | "signal"> & { isDeadlineTimeout?: () => boolean } = {}): Promise<CodexExecResult> {
+    if (isModelBridgeCancelled(control)) return { text: null, cancelled: true, error: "Codex 模型桥已取消，CLI未启动" };
     const effectiveTimeoutMs = Math.max(1, Math.min(timeoutMs, CODEX_MAX_TIMEOUT_MS));
     const codexModel = mapModelName(model);
     const outputPath = path.join(
@@ -649,25 +659,37 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         "-",
     ];
 
-    const commandString = `${quoteForCmd(getCodexCommand())} ${args.map(quoteForCmd).join(" ")}`;
+    const codexCommand = getCodexCommand();
+    const commandString = `${quoteForCmd(codexCommand)} ${args.map(quoteForCmd).join(" ")}`;
+    const diagnostics = new CodexDiagnosticRecorder({
+        command: codexCommand, args, cwd: process.cwd(), model: codexModel,
+        reasoningEffort: CODEX_DEFAULT_REASONING_EFFORT, requestedServiceTier: CODEX_SERVICE_TIER,
+        requestedFastMode: CODEX_FAST_MODE, timeoutMs: effectiveTimeoutMs,
+        promptSha256: crypto.createHash("sha256").update(prompt, "utf8").digest("hex"), context: diagnosticContext,
+    });
 
     return new Promise<CodexExecResult>((resolve) => {
         const child = spawn(
             process.platform === "win32" ? "cmd.exe" : "sh",
-            process.platform === "win32" ? ["/d", "/s", "/c", commandString] : ["-lc", commandString],
+            process.platform === "win32" ? ["/d", "/s", "/c", `"${commandString}"`] : ["-lc", commandString],
             {
                 stdio: ["pipe", "pipe", "pipe"],
                 windowsHide: true,
                 cwd: process.cwd(),
                 env: process.env,
                 detached: process.platform !== "win32",
+                windowsVerbatimArguments: process.platform === "win32",
             }
         );
 
         let stdout = "";
         let stderr = "";
+        const stdoutDecoder = new StringDecoder("utf8");
+        const stderrDecoder = new StringDecoder("utf8");
         let settled = false;
         let timedOut = false;
+        let cancelled = false;
+        let stopRequested = false;
         let killTreePending = false;
         let closeCode: number | null = null;
         let killTreeResult = "";
@@ -680,9 +702,28 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
             if (settled) return;
             settled = true;
             clearTimeout(timer);
-            const finalResult = timedOut
+            if (cancelInterval) clearInterval(cancelInterval);
+            control.signal?.removeEventListener("abort", onAbort);
+            let finalResult = timedOut
                 ? { ...result, timedOut: true, error: result.error || "Codex 模型桥超时", failureClass: "Availability" as const }
+                : cancelled ? { ...result, text: null, cancelled: true, error: "Codex 模型桥已取消" }
                 : result;
+            if (result.safetyStopped && !result.text) {
+                try {
+                    const retainedText = fs.existsSync(outputPath) && fs.statSync(outputPath).isFile() ? fs.readFileSync(outputPath, "utf8").trim() : "";
+                    if (retainedText) finalResult = { ...finalResult, text: retainedText };
+                } catch {}
+            }
+            const audit = diagnostics.finish({
+                exitCode: closeCode, timedOut, cancelled, childPid: child.pid, lastText: finalResult.text,
+                error: finalResult.error, killTree: killTreeResult || undefined,
+            });
+            if (audit.rejectedCommandCount > 0) {
+                finalResult = { ...finalResult, safetyStopped: true, ...(finalResult.error ? { failureClass: "DeterministicInput" as const } : {}) };
+            } else if (finalResult.error && audit.runningCommandCount > 0) {
+                finalResult = { ...finalResult, failureClass: "UnknownOutcome" };
+            }
+            finalResult = { ...finalResult, codexDiagnostics: audit };
             try {
                 cleanupOutputFile(outputPath);
             } finally {
@@ -695,32 +736,48 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
                         `${killTreeResult ? ` killTree=${killTreeResult}` : ""}`
                     );
                 }
+                console.error(`[model-bridge] Codex diagnostics callId=${audit.callId} manifest=${audit.manifestPath || "unavailable"}` +
+                    ` commands=${audit.commandCount} rejected=${audit.rejectedCommandCount} eventCoverage=${audit.eventCoverage}`);
                 resolve(finalResult);
             }
         };
 
-        const timer = setTimeout(() => {
-            timedOut = true;
-            console.error(`[model-bridge] Codex bridge timeout pid=${child.pid ?? "?"} timeoutMs=${effectiveTimeoutMs} outputPath=${outputPath}`);
+        const requestStop = (reason: "timeout" | "cancel" | "rejection") => {
+            if (settled || stopRequested) return;
+            stopRequested = true;
+            timedOut = reason === "timeout";
+            cancelled = reason === "cancel";
+            const stopped: CodexExecResult = { text: null, error: reason === "rejection" ? "Codex CLI观察到明确拒绝，原调用已停止" : cancelled ? "Codex 模型桥已取消" : "Codex 模型桥超时", timedOut, cancelled, safetyStopped: reason === "rejection", failureClass: reason === "rejection" ? "DeterministicInput" : "Availability" };
+            console.error(`[model-bridge] Codex bridge ${reason} pid=${child.pid ?? "?"} timeoutMs=${effectiveTimeoutMs} outputPath=${outputPath}`);
             if (!child.pid) {
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
+                finish(stopped);
                 return;
             }
             killTreePending = true;
             void killProcessTree(child.pid).then(async (message) => {
-                killTreePending = false;
                 const byOutputPath = await killProcessesByOutputPath(outputPath);
                 killTreeResult = [message, byOutputPath].filter(Boolean).join("; ");
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
+                killTreePending = false;
+                finish(stopped);
             });
-        }, effectiveTimeoutMs);
+        };
+        const timer = setTimeout(() => requestStop("timeout"), effectiveTimeoutMs);
+        const onAbort = () => requestStop(control.isDeadlineTimeout?.() || control.signal?.reason?.name === "TimeoutError" ? "timeout" : "cancel");
+        const cancelInterval = control.shouldCancel ? setInterval(() => {
+            if (isModelBridgeCancelled(control)) requestStop("cancel");
+        }, 100) : undefined;
+        control.signal?.addEventListener("abort", onAbort, { once: true });
+        if (isModelBridgeCancelled(control)) requestStop("cancel");
 
         child.stdout.on("data", (chunk) => {
-            stdout += chunk.toString("utf-8");
+            diagnostics.recordStdout(chunk);
+            stdout = (stdout + stdoutDecoder.write(chunk)).slice(-4 * 1024 * 1024);
+            if (diagnostics.hasObservedRejection()) requestStop("rejection");
         });
 
         child.stderr.on("data", (chunk) => {
-            stderr += chunk.toString("utf-8");
+            diagnostics.recordStderr(chunk);
+            stderr = (stderr + stderrDecoder.write(chunk)).slice(-512 * 1024);
         });
 
         child.stdin.on("error", () => {
@@ -734,9 +791,11 @@ export async function callCodexExec(prompt: string, model: string, timeoutMs: nu
         child.on("close", (code) => {
             void (async () => {
             closeCode = code;
-            if (timedOut) {
+            stdout += stdoutDecoder.end();
+            stderr += stderrDecoder.end();
+            if (stopRequested) {
                 if (killTreePending) return;
-                finish({ text: null, error: "Codex 模型桥超时", timedOut: true, failureClass: "Availability" });
+                finish({ text: null, error: diagnostics.hasObservedRejection() ? "Codex CLI观察到明确拒绝，原调用已停止" : cancelled ? "Codex 模型桥已取消" : "Codex 模型桥超时", timedOut, cancelled, safetyStopped: diagnostics.hasObservedRejection(), failureClass: diagnostics.hasObservedRejection() ? "DeterministicInput" : "Availability" });
                 return;
             }
 
@@ -970,6 +1029,7 @@ export async function callModelResponse(
 
     const errors: string[] = [];
     let grokDiagnostics: GrokExecDiagnostics | undefined;
+    let codexDiagnostics: CodexBridgeDiagnostics | undefined;
     let singleCandidateFailureClass: FailureClass | undefined;
     const providerTrafficClass = mapProviderTrafficClass(options.providerTrafficClass || options.trafficClass);
     for (const resolved of candidates) {
@@ -1120,12 +1180,14 @@ export async function callModelResponse(
         }
 
         if (resolved === "codex") {
-            const result = await callCodexExec(prompt, model, remainingMs);
-            if (deadline.remainingMs() === 0) return deadlineFailure("execution");
+            const result = await callCodexExec(prompt, model, remainingMs, options.diagnosticContext, { ...options, signal: deadline.signal, isDeadlineTimeout: () => deadline.reason === "timeout" });
+            codexDiagnostics = result.codexDiagnostics;
+            if (deadline.remainingMs() === 0) return { ...deadlineFailure("execution"), codexDiagnostics, cancelled: result.cancelled, safetyStopped: result.safetyStopped, failureClass: result.failureClass ?? "UnknownOutcome" };
+            if (result.cancelled) return { ...result, chainUsed: "codex", modelUsed: mapModelName(model) };
             if (candidates.length === 1) singleCandidateFailureClass = result.failureClass;
-            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: mapModelName(model) };
+            if (result.text) return { text: result.text, chainUsed: "codex", modelUsed: mapModelName(model), codexDiagnostics, safetyStopped: result.safetyStopped };
             errors.push(result.error || "Codex 模型桥调用失败");
-            if (result.timedOut || chain === "codex") {
+            if (result.timedOut || result.safetyStopped || result.failureClass === "UnknownOutcome" || chain === "codex") {
                 return {
                     text: null,
                     chainUsed: null,
@@ -1133,6 +1195,8 @@ export async function callModelResponse(
                     error: result.error || "Codex 模型桥调用失败",
                     timedOut: result.timedOut,
                     failureClass: result.failureClass,
+                    codexDiagnostics,
+                    safetyStopped: result.safetyStopped,
                 };
             }
             continue;
@@ -1162,6 +1226,7 @@ export async function callModelResponse(
         error: errors.join("；") || "模型桥调用失败",
         ...(singleCandidateFailureClass ? { failureClass: singleCandidateFailureClass } : {}),
         ...(grokDiagnostics ? { grokDiagnostics } : {}),
+        ...(codexDiagnostics ? { codexDiagnostics } : {}),
     };
     } finally {
         deadline.dispose();

@@ -6,23 +6,34 @@ import path from "node:path";
 
 import type { ConversationLoadResult } from "../src/conversation-bridge.ts";
 import type { ConversationRound } from "../src/trajectory.ts";
-import { __setLsRpcImplForTest, type LsProcessInfo, type RpcResult } from "../src/ls-rpc.ts";
-import {
+import type { LsProcessInfo, RpcResult } from "../src/ls-rpc.ts";
+
+const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-conversation-bridge-cache-"));
+const originalHome = os.homedir;
+os.homedir = () => dataRoot;
+fs.mkdirSync(path.join(dataRoot, ".codex", "sessions"), { recursive: true });
+fs.writeFileSync(path.join(dataRoot, ".codex", "state_5.sqlite"), "");
+process.env.MEMORY_STORE_DATA_ROOT = path.join(dataRoot, "data");
+process.env.MEMORY_STORE_AUTO_RECORD = "0";
+process.env.MEMORY_STORE_LIFECYCLE_ENABLED = "false";
+process.env.MEMORY_STORE_DEVIN_CLI_DB_PATH = path.join(dataRoot, "isolated-devin", "sessions.db");
+process.env.MEMORY_STORE_DEVIN_DESKTOP_ROOT = path.join(dataRoot, "isolated-devin", "desktop");
+const { __setLsRpcImplForTest } = await import("../src/ls-rpc.ts");
+const {
     __resetLsTestOverridesForTest,
     __setConvCacheDirForTest,
     __setParentLsForTest,
-} from "../src/ls-client.ts";
-import {
+} = await import("../src/ls-client.ts");
+const {
     __resetWindsurfConversationCacheForTest,
     __resetWindsurfEndpointCacheForTest,
     __setWindsurfEndpointResolverForTest,
     __setWindsurfTransportFactoryForTest,
-} from "../src/windsurf-client.ts";
+} = await import("../src/windsurf-client.ts");
 
 const cache = await import("../src/conversation-source-cache.ts");
 const bridge = await import("../src/conversation-bridge.ts");
 
-const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-conversation-bridge-cache-"));
 const conversationId = "cache-only-conversation";
 const key = { source: "codex:link=summary", conversationId };
 const round: ConversationRound = {
@@ -131,6 +142,11 @@ try {
     assert.equal(loaded?.sourceMode, "cache");
     assert.equal(loaded?.rounds[0]?.userMessage, "用户消息");
     assert.equal(loaded?.rounds[0]?.roundIndex, 1556, "缓存水合不得把稳定轮次重新编号为 1");
+    assert.equal(loaded?.roundCount, 1);
+    assert.deepEqual(loaded?.roundIndexBounds, { first: 1556, last: 1556 });
+    const metadataOnly = await bridge.loadConversationData("codex", conversationId, { source: "cache", link: "summary", includeRounds: false });
+    assert.deepEqual(metadataOnly?.roundIndexBounds, { first: 1556, last: 1556 });
+    assert.deepEqual(metadataOnly?.rounds, []);
     assert.equal(loaded?.codexData?.rounds[0]?.aiResponses[0]?.response, "模型回复");
     const ranged = await bridge.loadConversationData("codex", conversationId, {
         source: "cache",
@@ -358,5 +374,7 @@ try {
     console.log("✅ conversation-bridge-cache 通过：cache-only、代次正文恢复、宿主元数据保留、LS 拒绝与变体隔离、LS 水位新鲜度、WSF/Antigravity local authority 迁移与 auto 重建");
 } finally {
     cache.resetConversationSourceCacheForTests();
+    os.homedir = originalHome;
+    assert.equal(path.dirname(path.resolve(dataRoot)), path.resolve(os.tmpdir()));
     fs.rmSync(dataRoot, { recursive: true, force: true });
 }

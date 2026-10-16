@@ -141,6 +141,21 @@ if (mode === "success") {
   process.exit(0);
 }
 
+if (["rejected-success", "rejected-error", "rejected-pending", "ordinary-command-error", "claimed-refusal", "running-error"].includes(mode)) {
+  if (mode === "claimed-refusal") {
+    console.log(JSON.stringify({type: "thread.started", thread_id: "fixture-thread"}));
+    fs.writeFileSync(outputPath, "EVIDENCE_INSUFFICIENT\\n本机读取命令被策略拒绝", "utf-8");
+  } else {
+    console.log(JSON.stringify({type: "item.completed", item: {id: "fixture-command", type: "command_execution", command: "echo ordinary-fixture", status: mode.startsWith("rejected-") ? "declined" : mode === "running-error" ? "in_progress" : "failed", exit_code: mode === "ordinary-command-error" ? 1 : null}}));
+    if (!mode.endsWith("error") || mode === "ordinary-command-error") fs.writeFileSync(outputPath, "PASS\\nordinary fixture reply", "utf-8");
+  }
+  if (mode === "rejected-pending") {
+    fs.writeFileSync(process.env.FAKE_CODEX_REJECTION_PID, String(process.pid));
+    setTimeout(() => fs.writeFileSync(process.env.FAKE_CODEX_REJECTION_CONTINUED, "unexpected continuation"), 2500);
+    setInterval(() => {}, 1000);
+  } else process.exit(mode === "rejected-error" || mode === "running-error" ? 7 : 0);
+}
+
 if (mode === "empty") {
   process.exit(0);
 }
@@ -285,6 +300,62 @@ try {
         assert.ok(capturedArgs.includes(flag), `missing isolation flag: ${flag}`);
     }
     assert.equal(capturedArgs.some(argument => argument.startsWith("model_speed_tier=")), false);
+    assert.ok(defaultCodex.codexDiagnostics?.manifestPath, "successful CLI calls must retain their diagnostic reference");
+
+    process.env.FAKE_CODEX_MODE = "rejected-success";
+    const rejectedSuccess = await callModelResponse("flash", "ordinary fixture", "codex", 5_000, { diagnosticContext: { conversationId: "fixture-owner", guardId: "fixture-guard" } });
+    assert.match(rejectedSuccess.text || "", /^PASS/u);
+    assert.equal(rejectedSuccess.safetyStopped, true);
+    assert.equal(rejectedSuccess.codexDiagnostics?.rejectedCommandCount, 1);
+    const rejectionManifest = JSON.parse(fs.readFileSync(rejectedSuccess.codexDiagnostics!.manifestPath!, "utf8"));
+    assert.equal(rejectionManifest.metadata.context.guardId, "fixture-guard");
+    assert.equal(rejectionManifest.outcome.exitCode, 0);
+
+    process.env.FAKE_CODEX_MODE = "rejected-error";
+    const rejectedError = await callModelResponse("flash", "ordinary fixture", "codex", 5_000);
+    assert.equal(rejectedError.text, null);
+    assert.equal(rejectedError.safetyStopped, true);
+    assert.equal(rejectedError.failureClass, "DeterministicInput");
+    assert.ok(rejectedError.codexDiagnostics?.manifestPath);
+
+    process.env.FAKE_CODEX_MODE = "rejected-pending";
+    process.env.FAKE_CODEX_REJECTION_PID = path.join(tempDir, "rejected-pending.pid");
+    process.env.FAKE_CODEX_REJECTION_CONTINUED = path.join(tempDir, "rejected-pending-continued.txt");
+    const rejectedPending = await callModelResponse("flash", "ordinary fixture", "codex", 8000);
+    assert.equal(rejectedPending.safetyStopped, true);
+    assert.equal(rejectedPending.codexDiagnostics?.rejectedCommandCount, 1);
+    const rejectedPid = Number(fs.readFileSync(process.env.FAKE_CODEX_REJECTION_PID, "utf8"));
+    assert.equal(await waitForDead(rejectedPid), true);
+    assert.equal(fs.existsSync(process.env.FAKE_CODEX_REJECTION_CONTINUED), false);
+
+    process.env.FAKE_CODEX_MODE = "ordinary-command-error";
+    const ordinaryCommandError = await callModelResponse("flash", "ordinary fixture", "codex", 5_000);
+    assert.equal(ordinaryCommandError.codexDiagnostics?.failedCommandCount, 1);
+    assert.equal(ordinaryCommandError.codexDiagnostics?.rejectedCommandCount, 0);
+    assert.notEqual(ordinaryCommandError.safetyStopped, true);
+
+    process.env.FAKE_CODEX_MODE = "claimed-refusal";
+    const claimedRefusal = await callModelResponse("flash", "ordinary fixture", "codex", 5_000);
+    assert.equal(claimedRefusal.codexDiagnostics?.modelReportedRefusal, true);
+    assert.equal(claimedRefusal.codexDiagnostics?.rejectedCommandCount, 0);
+
+    process.env.FAKE_CODEX_MODE = "running-error";
+    const runningError = await callModelResponse("flash", "ordinary fixture", "codex", 5_000);
+    assert.equal(runningError.failureClass, "UnknownOutcome");
+    assert.equal(runningError.codexDiagnostics?.runningCommandCount, 1);
+    assert.ok(runningError.codexDiagnostics?.manifestPath);
+
+    process.env.FAKE_CODEX_MODE = "sleep";
+    const abortController = new AbortController();
+    const abortTimer = setTimeout(() => abortController.abort(), 500);
+    const cancelledCodex = await callCodexExec("ordinary cancelled fixture", "gpt-6.1-sol", 5_000, { conversationId: "fixture-owner" }, { signal: abortController.signal });
+    clearTimeout(abortTimer);
+    assert.equal(cancelledCodex.cancelled, true);
+    assert.notEqual(cancelledCodex.timedOut, true);
+    assert.ok(cancelledCodex.codexDiagnostics?.manifestPath);
+    const cancelledManifest = JSON.parse(fs.readFileSync(cancelledCodex.codexDiagnostics!.manifestPath!, "utf8"));
+    assert.equal(cancelledManifest.outcome.cancelled, true);
+    if (fs.existsSync(childPidMarker)) assert.equal(await waitForDead(Number(fs.readFileSync(childPidMarker, "utf8"))), true);
 
     process.env.FAKE_CODEX_MODE = "success";
     delete process.env.MEMORY_STORE_AGY_AUTO_ENABLED;
