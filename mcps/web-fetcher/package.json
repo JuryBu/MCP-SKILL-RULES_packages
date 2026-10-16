@@ -1,11 +1,14 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.3.1",
+  "version": "7.3.2",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",
   "scripts": {
     "start": "node dist/index.js",
+    "runtime:status": "node scripts/runtime-status.mjs",
+    "test:runtime-status": "node --import tsx --test tests/runtime-status.test.mjs",
+    "test:runtime-status:integration": "npm run build && node --test --test-concurrency=1 tests/runtime-lifecycle.test.mjs",
     "dev": "tsx watch src/index.ts",
     "build": "tsc && node scripts/copy-inspector-assets.mjs",
     "clean": "rimraf dist",
@@ -22,7 +25,7 @@
     "test:contract": "npm run build && node --test tests/release-contract.test.mjs",
     "test:verification": "node --import tsx --test --test-concurrency=1 tests/page-access.test.mjs tests/background-lifecycle.test.mjs tests/read-continuation.test.mjs tests/assisted-ownership.test.mjs",
     "test:verification:browser": "node --test tests/assisted-continuation-http.test.mjs",
-    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && node --test tests/inspection-runtime-assets.test.mjs"
+    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:runtime-status && node --test tests/inspection-runtime-assets.test.mjs"
   },
   "engines": {
     "node": ">=18"

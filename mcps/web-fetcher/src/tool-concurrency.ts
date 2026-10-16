@@ -3,6 +3,7 @@ import { performance } from "node:perf_hooks";
 import { sessionManager, type SessionManager } from "./session.js";
 import { getRequestContext, OperationGate, RequestAdmissionError, runWithRequestContext, throwIfRequestExpired, withRequestStage } from "./request-context.js";
 import { assertPageAccessible, pageAccessResult, PageAccessError } from './page-access.js';
+import { decorateRuntimeResult } from './runtime-status.js';
 
 type ToolArguments = Record<string, unknown>;
 type ToolHandler = (args: ToolArguments, extra?: any) => any;
@@ -159,14 +160,14 @@ export function installToolConcurrency(server: { tool?: (...args: any[]) => any;
     };
     if (server.registerTool) {
         const original = server.registerTool.bind(server);
-        server.registerTool = (name: string, config: any, handler: ToolHandler) => original(name, { ...config, inputSchema: addOwner(config.inputSchema, name) }, (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
+        server.registerTool = (name: string, config: any, handler: ToolHandler) => original(name, { ...config, inputSchema: addOwner(config.inputSchema, name) }, async (args: ToolArguments, extra?: any) => decorateRuntimeResult(await controller.run(name, args, handler, extra)));
     }
     if (server.tool) {
         const original = server.tool.bind(server);
         server.tool = (...registration: any[]) => {
             if (registration.length !== 4 || typeof registration[3] !== "function") return original(...registration);
             const [name, description, schema, handler] = registration;
-            return original(name, description, addOwner(schema, name), (args: ToolArguments, extra?: any) => controller.run(name, args, handler, extra));
+            return original(name, description, addOwner(schema, name), async (args: ToolArguments, extra?: any) => decorateRuntimeResult(await controller.run(name, args, handler, extra)));
         };
     }
     installedServers.set(server, controller);

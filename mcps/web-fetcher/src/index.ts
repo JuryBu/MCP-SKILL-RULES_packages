@@ -58,6 +58,9 @@ import { installToolConcurrency } from './tool-concurrency.js';
 import { getActiveRequestCount } from './request-context.js';
 import { isLsAvailable, getLsStatus } from "./ls-client.js";
 import { getModelBridgeStatus } from "./model-bridge.js";
+import { initializeRuntimeLifecycle, shouldExitForIdle } from './runtime-status.js';
+
+const runtimeLifecycle = initializeRuntimeLifecycle();
 
 // === 进程生命周期常量 ===
 const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关闭浏览器（下次调用自动重启）
@@ -65,7 +68,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.3.1",
+    version: "7.3.2",
 });
 
 // 注册所有工具
@@ -161,6 +164,14 @@ server.registerResource(
             "- 新 Cookie 会同步到已有浏览器上下文，旧状态不能覆盖更新的备份；localStorage 按 origin 隔离并在新导航恢复，不自动刷新用户现有页面。纯 localStorage 登录不要求 Cookie 数量大于零。",
             "- 主 context 与 bareContext 在 close/closeBrowser 时都会关闭并清理 profile。",
             "",
+            "## 空闲休眠与自动唤醒（7.3.2）",
+            "",
+            "- 非Antigravity LS后端一小时没有工具调用且没有正在处理的请求时，按现有规则退出释放资源；共享broker收到下一次调用会按需启动。20分钟浏览器空闲回收保持不变。",
+            "- web_list_sessions显示当前后端状态和上一次退出原因；web-fetcher://runtime返回结构化诊断及本机stateFile。读取MCP工具/资源会连接后端，休眠期间用npm run runtime:status只读检查，命令不会启动后端或浏览器。",
+            "- 诊断区分starting、ready、sleeping、startup-failed、stopped及未知退出，保留时间与原因。仅有明确idle-timeout记录才显示自动唤醒，connected=false/pid=null时先检查原因并尝试正常只读调用。",
+            "- 空闲唤醒后的首个成功工具结果附带一次提示，_meta.webFetcherLifecycle保留状态和startupMs；该耗时从后端进程启动计到MCP就绪，不含broker排队和随后网页操作。原content和图片顺序保持。",
+            "- Cookie/localStorage备份继续保留；进程内sessionId、后台taskId和桌面附着随原退出清理而失效，重新取得后再操作，禁止自动重播点击、提交或未知结果请求。",
+            "",
             "## Human Browser 用户辅助浏览器",
             "",
             "- 7.3新增web_human_verification(action=start/status/cancel/close)，是普通MCP工具，不要求宿主支持额外Tasks协议。auto只对强挑战启动，登录页/无权限/未知状态不能冒充正文成功或认证完成。",
@@ -200,6 +211,13 @@ server.registerResource(
 );
 
 server.registerResource(
+    'web-fetcher-runtime',
+    'web-fetcher://runtime',
+    { description: '当前后端生命周期、上次退出原因与本机只读诊断位置；读取本资源会连接后端', mimeType: 'application/json' },
+    async () => ({ contents: [{ uri: 'web-fetcher://runtime', mimeType: 'application/json', text: JSON.stringify({ ...runtimeLifecycle.status(), stateFile: runtimeLifecycle.stateFile }, null, 2) }] }),
+);
+
+server.registerResource(
     "test-resource",
     "web-fetcher://test/hello",
     {
@@ -210,7 +228,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.3.1 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.3.2 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -225,6 +243,7 @@ async function safeCleanupAndExit(reason: string): Promise<void> {
     logStdinEvent(reason);
     console.error(`[web-fetcher] ${reason}`);
     await cleanup();
+    runtimeLifecycle.exit('unknown');
     process.exit(0);
 }
 
@@ -237,6 +256,7 @@ process.stdin.on("end", async () => {
     const parentStillAlive = isParentAlive();
     logStdinEvent(`stdin END 等待3s后 — 父 LS ${parentStillAlive ? "仍存活" : "已死亡"}，退出`);
     await cleanup();
+    runtimeLifecycle.exit('stdin-end');
     process.exit(0);
 });
 
@@ -244,12 +264,14 @@ process.stdin.on("close", async () => {
     const parentAlive = isParentAlive();
     logStdinEvent(`stdin CLOSE — 父 LS ${parentAlive ? "仍存活" : "已死亡"}`);
     await cleanup();
+    runtimeLifecycle.exit('stdin-close');
     process.exit(0);
 });
 
 process.stdin.on("error", async (err) => {
     logStdinEvent(`stdin ERROR: ${err.message} — 父 LS ${isParentAlive() ? "仍存活" : "已死亡"}`);
     await cleanup();
+    runtimeLifecycle.exit('stdin-error');
     process.exit(0);
 });
 
@@ -266,6 +288,7 @@ async function heartbeatCheck(): Promise<void> {
         logStdinEvent(`父 LS (PID=${process.ppid}) 连续3次检测失败，确认死亡，MCP 退出`);
         console.error(`[web-fetcher] 父 LS (PID=${process.ppid}) 连续3次检测失败，自动退出`);
         await cleanup();
+        runtimeLifecycle.exit('parent-exit');
         process.exit(0);
     } else if (status === "degraded") {
         // 单次失败，切换快速检测模式（5s 间隔，加速确认）
@@ -293,6 +316,7 @@ async function heartbeatCheck(): Promise<void> {
             logStdinEvent("检测到同父进程下更新的 web-fetcher 实例，当前实例空闲超时，主动让位退出");
             console.error("[web-fetcher] 检测到更新实例，当前实例空闲超时，主动让位退出");
             await cleanup();
+            runtimeLifecycle.exit('duplicate-retirement');
             process.exit(0);
         }
     }
@@ -307,7 +331,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.3.1 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.3.2 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -339,8 +363,9 @@ async function main(): Promise<void> {
 
     const transport = new StdioServerTransport();
     await server.connect(transport);
+    runtimeLifecycle.ready();
 
-    console.error(`[web-fetcher] MCP Server v7.3.1 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.3.2 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===
@@ -352,10 +377,11 @@ async function main(): Promise<void> {
         logStdinEvent(`非 LS 环境，启用 1 小时空闲超时兜底`);
         enableDuplicateRetirement = process.env.WEB_FETCHER_ENABLE_DUPLICATE_RETIREMENT === "1";
         const idleGuard = setInterval(async () => {
-            if (getActiveRequestCount() === 0 && getIdleTime() > 3600000) { // 1 小时
+            if (shouldExitForIdle(getIdleTime(), getActiveRequestCount())) {
                 logStdinEvent("非 LS 环境空闲超过 1 小时，兜底退出");
                 console.error("[web-fetcher] 非 LS 环境空闲超过 1 小时，兜底退出");
                 await cleanup();
+                runtimeLifecycle.exit('idle-timeout');
                 process.exit(0);
             }
         }, 60000); // 每分钟检查一次
@@ -392,6 +418,7 @@ function cleanStaleTempDirs(): void {
 }
 
 main().catch((error) => {
+    runtimeLifecycle.exit('startup-error');
     console.error("[web-fetcher] 启动失败:", error);
     process.exit(1);
 });
@@ -413,10 +440,12 @@ const cleanup = async () => {
 
 process.on("SIGINT", async () => {
     await cleanup();
+    runtimeLifecycle.exit('signal-int');
     process.exit(0);
 });
 
 process.on("SIGTERM", async () => {
     await cleanup();
+    runtimeLifecycle.exit('signal-term');
     process.exit(0);
 });

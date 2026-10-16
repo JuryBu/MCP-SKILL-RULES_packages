@@ -34,9 +34,9 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
         assert.equal(await fs.readFile(path.join(recentVideo, 'sentinel.txt'), 'utf8'), marker);
         assert.equal(await fs.readFile(path.join(unrelatedDirectory, 'sentinel.txt'), 'utf8'), marker);
         await assert.rejects(fs.stat(staleVideo), { code: 'ENOENT' });
-        assert.equal(client.getServerVersion()?.version, '7.3.1');
+        assert.equal(client.getServerVersion()?.version, '7.3.2');
         const hello = await client.readResource({ uri: 'web-fetcher://test/hello' });
-        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.1')));
+        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.2')));
         const listed = await client.listTools();
         assert.equal(listed.tools.length, 33);
         const byName = new Map(listed.tools.map(tool => [tool.name, tool]));
@@ -56,7 +56,7 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
         }
         const guide = await client.readResource({ uri: 'web-fetcher://guide' });
         const body = guide.contents.map(item => item.text ?? '').join('\n');
-        for (const marker of ['viewport', '600', 'candidate', '全局共享', 'partial', '_meta.webFetcherTiming', 'web_human_verification', 'pageAccess']) {
+        for (const marker of ['viewport', '600', 'candidate', '全局共享', 'partial', '_meta.webFetcherTiming', 'web_human_verification', 'pageAccess', 'runtime:status', '_meta.webFetcherLifecycle', 'web-fetcher://runtime']) {
             assert.ok(body.includes(marker), marker);
         }
         const verification = byName.get('web_human_verification');
@@ -67,6 +67,10 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
         assert.ok(!sessions.isError);
         assert.ok(sessions._meta?.webFetcherTiming);
         assert.ok(sessions._meta?.webFetcherPool);
+        assert.equal(sessions._meta?.webFetcherLifecycle.state, 'ready');
+        assert.equal(sessions._meta?.webFetcherLifecycle.resumedFromIdle, false);
+        const runtime = await client.readResource({ uri: 'web-fetcher://runtime' });
+        assert.equal(JSON.parse(runtime.contents[0].text).state, 'ready');
     } finally {
         await client.close().catch(() => {});
         await transport.close().catch(() => {});

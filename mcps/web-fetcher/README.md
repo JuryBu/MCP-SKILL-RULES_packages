@@ -38,6 +38,12 @@
 
 结果按来源说明读取、写入及完整恢复状态。出现读取失败、备份冲突、未知来源或退出未确认时保留原件，已有备份继续可用。保存结束后应访问目标页确认账号与页面，详见 [docs/7.3.1-login-recovery.md](docs/7.3.1-login-recovery.md)。
 
+### 7.3.2 空闲状态与自动唤醒提示
+
+非 Antigravity LS 环境中，后端连续一小时没有工具活动且没有执行中的请求时，会按原有机制清理并退出；共享 broker 在下次调用时重新启动它。浏览器空闲二十分钟释放内存的策略保持原样。
+
+`npm run runtime:status` 只读查看保存的状态，不启动后端。连接后可通过 `web_list_sessions` 或资源 `web-fetcher://runtime` 获取诊断；确认为空闲退出后的首个成功工具结果会附带一次简短唤醒提示和后端启动耗时。缺失记录、启动失败和未知退出分别呈现，详见 [docs/7.3.2-runtime-status.md](docs/7.3.2-runtime-status.md)。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |

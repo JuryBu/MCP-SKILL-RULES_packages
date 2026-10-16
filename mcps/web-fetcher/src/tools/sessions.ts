@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appendTiming } from "../constants.js";
 import { browserManager } from "../browser.js";
 import { formatPoolPressureHint, formatSessionList, normalizeOwnerId, sessionManager } from "../session.js";
+import { getRuntimeLifecycle } from '../runtime-status.js';
 
 const ListSessionsInputSchema = z.object({
     ownerId: z
@@ -43,7 +44,8 @@ export function registerSessionTools(server: McpServer): void {
             description: `列出 web_interact / web_pipeline / desktop_register_window 保留的页面会话。
 
 用于排查已有 sessionId、最大并发页面占用、弹窗 session 和 Electron renderer 注册后的 web session。
-默认只列出当前 ownerId（未传为 global）；需要诊断共享 broker 下的占用时可传 includeAllOwners=true。`,
+默认只列出当前 ownerId（未传为 global）；需要诊断共享 broker 下的占用时可传 includeAllOwners=true。
+非 Antigravity LS 环境中，共享后端空闲一小时且没有执行中请求会休眠，由 broker 在下次调用时自动唤醒；本工具同时返回当前生命周期诊断，休眠期间可用 npm run runtime:status 只读检查。`,
             inputSchema: {
                 ownerId: ListSessionsInputSchema.shape.ownerId,
                 includeAllOwners: ListSessionsInputSchema.shape.includeAllOwners,
@@ -62,6 +64,8 @@ export function registerSessionTools(server: McpServer): void {
                 ? "全部 ownerId"
                 : `ownerId="${normalizeOwnerId(params.ownerId)}"`;
             const pool = browserManager.getPoolStats();
+            const runtime = getRuntimeLifecycle()?.status();
+            const lifecycle = runtime ? `\n后端状态: ${runtime.state} | 上次退出: ${runtime.previousExit?.reason ?? '无记录'}${runtime.previousExit?.at ? ` (${runtime.previousExit.at})` : ''}` : '';
             const pressureHint = formatPoolPressureHint(params.ownerId, {
                 includeAllOwners: params.includeAllOwners,
                 includeSessionList: false,
@@ -70,7 +74,7 @@ export function registerSessionTools(server: McpServer): void {
                 _meta: { webFetcherPool: pool },
                 content: [{
                     type: "text" as const,
-                    text: `活跃会话 (${sessions.length}) - ${scope}\n页面池: ${pool.activePages}/${pool.maxConcurrentPages}\n\n${formatSessionList(sessions)}${pressureHint ? `\n${pressureHint}` : ""}`,
+                    text: `活跃会话 (${sessions.length}) - ${scope}\n页面池: ${pool.activePages}/${pool.maxConcurrentPages}${lifecycle}\n\n${formatSessionList(sessions)}${pressureHint ? `\n${pressureHint}` : ""}`,
                 }],
             }, startTime);
         },
