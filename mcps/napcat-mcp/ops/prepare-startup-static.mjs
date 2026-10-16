@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { repairDesktopLauncher } from "./build-startup-repair.mjs";
 
 export const startupStaticFiles = ["src/inner-runtime-profile.mjs", "src/inner-startup-residual-recovery.mjs",
+  "ops/recover-inner-startup.mjs",
   "ops/start-codex-app-server-proxy.ps1", "ops/start-codex-model-stream-proxy.ps1", "ops/get-codex-model-stream-proxy-status.ps1"];
 const digest = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 

@@ -21,7 +21,9 @@ test("startup-only replacement preserves state and independently restores bytes,
     }
     const ledger = path.join(installed, "private-state.json");
     fs.writeFileSync(ledger, '{"unknown":"keep","active":"keep"}');
-    const prepared = prepareStartupStatic({ sourceRoot, installedRoot: installed, packageRoot });
+    const desktopLauncherPath = path.join(root, "desktop-launcher.ps1");
+    fs.writeFileSync(desktopLauncherPath, "if(-not $ModelStatus.healthy) {throw 'MODEL_PROXY_NOT_READY'}");
+    const prepared = prepareStartupStatic({ sourceRoot, installedRoot: installed, packageRoot, desktopLauncherPath });
     const manifest = JSON.parse(fs.readFileSync(prepared.manifestPath));
     assert.equal(prepared.targetWrites, 0);
     const child = windowsPowerShellEnvironment();
@@ -37,7 +39,7 @@ test("startup-only replacement preserves state and independently restores bytes,
     for (const file of manifest.files) assert.deepEqual(fs.readFileSync(file.target), fs.readFileSync(path.join(packageRoot, file.original)));
     const updated = execute("Update");
     assert.equal(updated.status, 0, updated.stderr);
-    assert.equal(JSON.parse(updated.stdout).targetWrites, 5);
+    assert.equal(JSON.parse(updated.stdout).targetWrites, startupStaticFiles.length + 1);
     for (const file of manifest.files) assert.deepEqual(fs.readFileSync(file.target), fs.readFileSync(path.join(packageRoot, file.candidate)));
     const rollback = execute("Rollback");
     assert.equal(rollback.status, 0, rollback.stderr);

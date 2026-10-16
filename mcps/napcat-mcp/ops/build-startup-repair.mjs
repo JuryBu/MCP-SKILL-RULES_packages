@@ -24,6 +24,9 @@ export function repairDesktopLauncher(content) {
   }
   content = content.replaceAll("$Ps.runtime.state -eq 'running'", "$Ps.runtime.state -in @('running','waiting_for_desktop')")
     .replaceAll("$ProxyStatus.runtime.state -ne 'running'", "$ProxyStatus.runtime.state -notin @('running','waiting_for_desktop')");
+  content = content.replace(/^[ \t]*\$Parked=\$false\n[ \t]*try \{\$Parked=.*waiting_for_desktop.*\n/gmu, "");
+  content = content.replaceAll("if(-not $ModelStatus.healthy -and -not $Parked)", "if(-not $ModelStatus.healthy -and -not $ModelStatus.readyForDesktop)")
+    .replaceAll("if(-not $ModelStatus.healthy)", "if(-not $ModelStatus.healthy -and -not $ModelStatus.readyForDesktop)");
   return content;
 }
 

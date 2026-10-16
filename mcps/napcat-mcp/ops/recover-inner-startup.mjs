@@ -3,7 +3,7 @@ import { planInnerStartupRecovery, applyInnerStartupRecovery } from "../src/inne
 try {
   const [mode, dataRoot, configurationPath, profilePath, profileSha256, downstream, control, upstream, probe] = process.argv.slice(2);
   if (!["Plan", "Apply"].includes(mode) || !probe) throw new Error("STARTUP_RECOVERY_MODE_REQUIRED");
-  const input = { dataRoot, configurationPath, profilePath, profileSha256, historyPolicy: "preserve",
+  const input = { dataRoot, configurationPath, profilePath, profileSha256, historyPolicy: "preserve", allowInterruptedSnapshot: true,
     ports: { downstream: Number(downstream), control: Number(control), upstream: Number(upstream), probe: Number(probe) } };
   const plan = planInnerStartupRecovery(input);
   console.log(JSON.stringify(mode === "Plan" ? plan : applyInnerStartupRecovery(input, plan)));

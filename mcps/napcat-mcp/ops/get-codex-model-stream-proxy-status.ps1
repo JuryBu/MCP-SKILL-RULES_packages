@@ -34,6 +34,8 @@ if ($null -ne $ManagedProfile) {
   try { $Age = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$ManagedRuntime.livenessAt)).TotalSeconds; $Fresh = $Age -ge -2 -and $Age -le 15 } catch {}
   $Health = $null
   $ControlIdentityMatches = $false
+  $ReadyForDesktop = $false
+  $TokenMatches = $false
   if ($IdentityMatches -and $null -ne $Listener) {
     try {
       $TokenPath = [string]$ManagedProfile.outerPaths.tokenFilePath
@@ -42,6 +44,7 @@ if ($null -ne $ManagedProfile) {
       $TokenItem = Get-Item -LiteralPath $TokenPath -Force
       if ($TokenItem.Length -lt 1 -or $TokenItem.Length -gt 4096 -or
           (Get-FileHash -LiteralPath $TokenPath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ManagedProfile.controlTokenSha256) { throw 'INNER_CONTROL_TOKEN_IDENTITY_MISMATCH' }
+      $TokenMatches = $true
       $Headers = @{ Authorization = 'Bearer ' + [IO.File]::ReadAllText($TokenPath).Trim();
         'x-inner-owner-id' = [string]$ManagedProfile.ownerId; 'x-inner-native-source-id' = [string]$ManagedProfile.nativeSourceId;
         'x-inner-instance-token' = [string]$ManagedRuntime.instanceToken }
@@ -52,8 +55,20 @@ if ($null -ne $ManagedProfile) {
         @($Health.coordinator.workers | Where-Object { $_.workerId -ceq $Health.selectedWorkerId -and $_.alive -eq $true }).Count -eq 1
     } catch {}
   }
+  if ($IdentityMatches -and $null -ne $Listener -and $Fresh -and $TokenMatches -and $ManagedRuntime.state -ceq 'running' -and -not $ControlIdentityMatches) {
+    try {
+      $OuterStatus = & (Join-Path $PSScriptRoot 'get-codex-app-server-proxy-status.ps1') -DataRoot $DataRoot | ConvertFrom-Json
+      $OuterAge = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$OuterStatus.runtime.livenessAt)).TotalSeconds
+      $ReadyForDesktop = $OuterStatus.ok -eq $true -and $OuterAge -ge -2 -and $OuterAge -le 15 -and
+        $OuterStatus.runtime.pid -eq $ManagedRuntime.pid -and $OuterStatus.runtime.instanceToken -ceq $ManagedRuntime.instanceToken -and
+        $OuterStatus.runtime.state -ceq 'waiting_for_desktop' -and $OuterStatus.runtime.waitingForDesktop -eq $true -and
+        $null -eq $OuterStatus.runtime.appServerPid -and $OuterStatus.control.closed -eq $false -and
+        $OuterStatus.control.outerRuntime.instanceId -ceq $ManagedRuntime.instanceToken
+    } catch {}
+  }
   [pscustomobject]@{ running = $IdentityMatches -and $null -ne $Listener;
     healthy = $IdentityMatches -and $null -ne $Listener -and $Fresh -and $ManagedRuntime.state -ceq 'running' -and $ControlIdentityMatches;
+    readyForDesktop = $ReadyForDesktop;
     mode = 'managed'; state = $ManagedRuntime.state; pid = $ManagedRuntime.pid; instanceToken = $ManagedRuntime.instanceToken;
     endpoint = "http://127.0.0.1:$($ManagedProfile.ports.inner)"; livenessAt = $ManagedRuntime.livenessAt;
     ownerId = $ManagedRuntime.ownerId; nativeSourceId = $ManagedRuntime.nativeSourceId;

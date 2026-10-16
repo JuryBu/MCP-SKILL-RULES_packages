@@ -638,6 +638,15 @@ $StartInfo.WorkingDirectory = $NapCatRoot
 $StartInfo.UseShellExecute = $false
 $StartInfo.CreateNoWindow = $true
 $StartInfo.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+if (-not [string]::IsNullOrWhiteSpace($QqExePath)) {
+  $PatchPackage = Join-Path $NapCatRoot 'qqnt.json'
+  if (-not (Test-Path -LiteralPath $PatchPackage -PathType Leaf)) { throw '[NAPCAT_RUNTIME_INCOMPLETE] NapCat package template is missing' }
+  $StartInfo.EnvironmentVariables['NAPCAT_PATCH_PACKAGE'] = $PatchPackage
+  $StartInfo.EnvironmentVariables['NAPCAT_LOAD_PATH'] = $LoaderModule
+  $StartInfo.EnvironmentVariables['NAPCAT_INJECT_PATH'] = $HookModule
+  $StartInfo.EnvironmentVariables['NAPCAT_LAUNCHER_PATH'] = $BootMain
+  $StartInfo.EnvironmentVariables['NAPCAT_MAIN_PATH'] = $CoreModule.Replace('\', '/')
+}
 try {
   if (-not [string]::IsNullOrWhiteSpace($QqAppDataRoot)) {
     $StartInfo.EnvironmentVariables["APPDATA"] = $QqAppDataRoot

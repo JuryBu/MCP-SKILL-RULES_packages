@@ -26,17 +26,23 @@ const validWorkerId = value => {
   return Boolean(match && uuid(match[1]) && Number.isSafeInteger(Number(match[2])));
 };
 
-function settledActivation(coordinator) {
+function settledActivation(coordinator, interrupted = false) {
   const activation = coordinator?.activation;
   if (activation == null) return true;
   return typeof activation.active === "boolean" && uuid(activation.activationId)
     && validWorkerId(activation.sourceWorkerId) && validWorkerId(activation.targetWorkerId)
     && activation.sourceWorkerId !== activation.targetWorkerId
     && coordinator.defaultWorkerId === (activation.active ? activation.targetWorkerId : activation.sourceWorkerId)
-    && Array.isArray(activation.deferredThreadIds) && activation.deferredThreadIds.length === 0
+    && Array.isArray(activation.deferredThreadIds) && (interrupted
+      ? new Set(activation.deferredThreadIds).size === activation.deferredThreadIds.length
+        && activation.deferredThreadIds.every(threadId => coordinator.threads?.some(thread =>
+          thread.threadId === threadId && thread.pendingActivationId === activation.activationId))
+      : activation.deferredThreadIds.length === 0)
     && coordinator.activeHttp === 0 && coordinator.pendingControl === 0
-    && Array.isArray(coordinator.threads) && coordinator.threads.every(thread => thread.phase === "terminal"
-      && thread.activeHttp === 0 && thread.pendingActivationId == null && thread.activationError == null)
+    && Array.isArray(coordinator.threads) && coordinator.threads.every(thread => (interrupted || thread.phase === "terminal")
+      && thread.activeHttp === 0 && (thread.pendingActivationId == null || (interrupted && activation.active
+        && thread.pendingActivationId === activation.activationId && activation.deferredThreadIds.includes(thread.threadId)))
+      && thread.activationError == null)
     && [activation.sourceWorkerId, activation.targetWorkerId].every(workerId =>
       coordinator.workers?.some(worker => worker.workerId === workerId));
 }
@@ -77,8 +83,19 @@ function requireAbsent(plan, observed) {
   if (observed?.complete !== true || !Array.isArray(observed.processes) || !Array.isArray(observed.listeners)) {
     fail("STARTUP_RECOVERY_HOST_INVENTORY_UNKNOWN");
   }
+  const reused = new Map();
+  if (plan.allowInterruptedSnapshot && Number.isFinite(plan.snapshotAt)) {
+    for (const processInfo of observed.processes) {
+      const raw = processInfo.CreationDate;
+      const serialized = typeof raw === "string" && /^\/Date\((\d+)(?:[+-]\d+)?\)\/$/u.exec(raw);
+      const createdAt = serialized ? Number(serialized[1]) : Date.parse(raw);
+      const command = String(processInfo.CommandLine ?? "").toLowerCase();
+      if (plan.pids.includes(processInfo.ProcessId) && createdAt > plan.snapshotAt + 2000 && command
+        && !plan.processPaths.some(target => command.includes(target.toLowerCase()))) reused.set(processInfo.ProcessId, createdAt);
+    }
+  }
   for (const processInfo of observed.processes) {
-    if (plan.pids.includes(processInfo.ProcessId) || plan.pids.includes(processInfo.ParentProcessId)) {
+    if ((plan.pids.includes(processInfo.ProcessId) && !reused.has(processInfo.ProcessId)) || plan.pids.includes(processInfo.ParentProcessId)) {
       fail("STARTUP_RECOVERY_PROCESS_STILL_PRESENT");
     }
     if (processInfo.ProcessId === process.pid) continue;
@@ -90,7 +107,8 @@ function requireAbsent(plan, observed) {
       fail("STARTUP_RECOVERY_RELATED_PROCESS_PRESENT");
     }
   }
-  if (observed.listeners.some(listener => plan.ports.includes(listener.LocalPort) || plan.pids.includes(listener.OwningProcess))) {
+  if (observed.listeners.some(listener => plan.ports.includes(listener.LocalPort)
+    || (plan.pids.includes(listener.OwningProcess) && !reused.has(listener.OwningProcess)))) {
     fail("STARTUP_RECOVERY_LISTENER_STILL_PRESENT");
   }
 }
@@ -98,6 +116,9 @@ function requireAbsent(plan, observed) {
 export function planInnerStartupRecovery(input, inspectHost = inspectStartupRecoveryHost) {
   if (input.historyPolicy !== undefined && input.historyPolicy !== "preserve") fail("STARTUP_RECOVERY_HISTORY_POLICY_INVALID");
   const preserveHistory = input.historyPolicy === "preserve";
+  if (input.allowInterruptedSnapshot !== undefined && typeof input.allowInterruptedSnapshot !== "boolean") fail("STARTUP_RECOVERY_INTERRUPTED_POLICY_INVALID");
+  const interrupted = input.allowInterruptedSnapshot === true;
+  if (interrupted && !preserveHistory) fail("STARTUP_RECOVERY_INTERRUPTED_REQUIRES_HISTORY");
   const originals = [];
   const read = (target, maximum) => { const entry = record(target, maximum); originals.push(entry); return entry; };
   const configurationEntry = read(input.configurationPath, 65536);
@@ -144,13 +165,17 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     || !managed.nativeSource || !Number.isSafeInteger(managed.nativeSource.delivered) || managed.nativeSource.delivered < 0
     || (!preserveHistory && (managed.nativeSource.healthy !== true || managed.nativeSource.delivered !== 0))
     || managed.coordinator?.transactionActive !== false || managed.coordinator.workerMaintenance !== false
-    || !(preserveHistory ? settledActivation(managed.coordinator) : managed.coordinator.activation == null)
+    || !(preserveHistory ? settledActivation(managed.coordinator, interrupted) : managed.coordinator.activation == null)
+    || (interrupted && (managed.coordinator.activeHttp !== 0 || managed.coordinator.pendingControl !== 0))
     || !Array.isArray(managed.coordinator.threads)
     || (!preserveHistory && managed.coordinator.threads.length)
     || managed.coordinator.threads.some(thread => !["active", "terminal"].includes(thread.phase)
-      || thread.activeHttp !== 0 || thread.pendingActivationId != null)
+      || thread.activeHttp !== 0 || (!interrupted && thread.pendingActivationId != null)
+      || (thread.pendingActivationId != null && managed.coordinator.activation == null))
     || !Array.isArray(managed.coordinator.workers) || !managed.coordinator.workers.length
-    || outer.proxy?.clientCount !== 0 || !Array.isArray(outer.proxy.clients) || outer.proxy.clients.length
+    || (interrupted && managed.coordinator.threads.some(thread => !managed.coordinator.workers.some(worker => worker.workerId === thread.workerId)))
+    || !Array.isArray(outer.proxy?.clients) || outer.proxy.clientCount !== outer.proxy.clients.length
+    || (!interrupted && outer.proxy.clientCount !== 0)
     || !Number.isSafeInteger(outer.proxy.journal?.unknownWakeCount) || outer.proxy.journal.unknownWakeCount < 0
     || (!preserveHistory && outer.proxy.journal.unknownWakeCount !== 0) || outer.proxy.outerRuntime?.instanceId !== outer.instanceToken
     || outer.proxy.outerRuntime.busy !== false
@@ -232,6 +257,8 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     instanceToken: outer.instanceToken, checkpointRoot: profile.checkpointRoot,
     pids: [...new Set(pids)], ports: [...new Set(ports)], processPaths, originals: originals.map(publicRecord),
     runtimeStatePath: outerEntry.path, managedStatePath: managedEntry.path, lockPath: lockEntry.path,
+    ...(interrupted ? { allowInterruptedSnapshot: true,
+      snapshotAt: Math.max(Date.parse(outer.livenessAt), Date.parse(managed.livenessAt)) } : {}),
     ...(preserveHistory ? { historyPolicy: "preserve", preservedHistory: {
       deliveredEvents: managed.nativeSource.delivered, threadCount: managed.coordinator.threads.length,
       unknownWakeCount: outer.proxy.journal.unknownWakeCount, journalReplayed: false,
@@ -298,8 +325,8 @@ export function applyInnerStartupRecovery(input, expectedPlan, inspectHost = ins
     }
     const lease = originals.find(entry => entry.path === fresh.lockPath);
     if (record(fresh.lockPath).sha256 !== lease.sha256) fail("STARTUP_RECOVERY_ORIGINAL_CHANGED");
-    fs.renameSync(fresh.lockPath, path.join(evidenceRoot, "retired.lock"));
     fs.writeFileSync(path.join(evidenceRoot, "applied.json"), JSON.stringify({ instanceToken: fresh.instanceToken, written: written.map(entry => ({ path: entry.original.path, sha256: entry.sha256 })) }), { flag: "wx" });
+    fs.renameSync(fresh.lockPath, path.join(evidenceRoot, "retired.lock"));
     return { recovered: true, instanceToken: fresh.instanceToken, evidenceRoot };
   } catch (error) {
     for (const entry of written.reverse()) {

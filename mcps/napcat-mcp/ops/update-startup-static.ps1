@@ -23,10 +23,10 @@ function Sha([string]$Value) { (Get-FileHash -LiteralPath (PlainFile $Value) -Al
 if ((Sha $ManifestPath) -cne $ManifestSha256) { throw 'MANIFEST_CHANGED' }
 $Manifest = Get-Content -LiteralPath $ManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($Manifest.schemaVersion -ne 1 -or $Manifest.scope -cne 'next-startup-files-only' -or $Manifest.serviceActions -ne 0 -or $Manifest.stateWrites -ne 0) { throw 'STARTUP_ONLY_MANIFEST_REQUIRED' }
-$Allowed = @('src/inner-runtime-profile.mjs','src/inner-startup-residual-recovery.mjs','ops/start-codex-app-server-proxy.ps1','ops/start-codex-model-stream-proxy.ps1','ops/get-codex-model-stream-proxy-status.ps1')
+$Allowed = @('src/inner-runtime-profile.mjs','src/inner-startup-residual-recovery.mjs','ops/recover-inner-startup.mjs','ops/start-codex-app-server-proxy.ps1','ops/start-codex-model-stream-proxy.ps1','ops/get-codex-model-stream-proxy-status.ps1')
 $Root = Split-Path -Parent ([IO.Path]::GetFullPath($ManifestPath))
 $Files = @($Manifest.files)
-if ($Files.Count -gt 6 -or @($Files.name | Select-Object -Unique).Count -ne $Files.Count) { throw 'EXACT_STARTUP_FILES_REQUIRED' }
+if ($Files.Count -gt ($Allowed.Count + 1) -or @($Files.name | Select-Object -Unique).Count -ne $Files.Count) { throw 'EXACT_STARTUP_FILES_REQUIRED' }
 $Changes = @()
 $Lock = $null
 try {
