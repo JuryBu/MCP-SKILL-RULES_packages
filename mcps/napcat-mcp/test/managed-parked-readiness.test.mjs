@@ -8,6 +8,23 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { windowsPowerShellEnvironment } from "../src/windows-powershell-environment.mjs";
 
+test("readiness timestamps preserve UTC for both ISO strings and typed JSON dates", { skip: process.platform !== "win32" }, () => {
+  const source = fs.readFileSync(fileURLToPath(new URL("../ops/get-codex-model-stream-proxy-status.ps1", import.meta.url)), "utf8");
+  const age = source.match(/\$Age = [^;\r\n]+/u)?.[0];
+  const outerAge = source.match(/\$OuterAge = [^;\r\n]+/u)?.[0];
+  assert.ok(age && outerAge);
+  const script = `$ErrorActionPreference='Stop';foreach($stamp in @([DateTime]::UtcNow,[DateTime]::UtcNow.ToString('o'))){
+    $ManagedRuntime=@{livenessAt=$stamp};$OuterStatus=@{runtime=@{livenessAt=$stamp}};
+    ${age};${outerAge};
+    if([Math]::Abs($Age) -gt 5 -or [Math]::Abs($OuterAge) -gt 5){throw 'UTC_DATE_KIND_LOST'}
+  };'UTC_DATE_KINDS_PASSED'`;
+  const shell = windowsPowerShellEnvironment();
+  const result = spawnSync(process.env.NAPCAT_TEST_POWERSHELL ?? shell.executable, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+    { env: shell.environment, encoding: "utf8", windowsHide: true, timeout: 7000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /UTC_DATE_KINDS_PASSED/u);
+});
+
 test("managed readiness verifies a parked parent's live identity without claiming model health", { skip: process.platform !== "win32", timeout: 45000 }, () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "parked-readiness-owned-"));
   const quote = value => "'" + value.replaceAll("'", "''") + "'";

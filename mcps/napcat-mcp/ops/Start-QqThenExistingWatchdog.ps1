@@ -14,7 +14,7 @@ foreach ($File in $Plan.inputs) {
   if (-not [IO.Path]::IsPathRooted([string]$File.path) -or (Get-FileHash -LiteralPath $File.path -Algorithm SHA256).Hash -ine $File.sha256) {throw 'STARTUP_ATTACHMENT_INPUT_DRIFT'}
 }
 function Invoke-StartupChild {
-  param([string[]]$Arguments,[switch]$Capture)
+  param([string[]]$Arguments)
   $Start=[Diagnostics.ProcessStartInfo]::new()
   $Start.FileName=$Plan.ps7Path
   $Start.UseShellExecute=$false
@@ -25,22 +25,27 @@ function Invoke-StartupChild {
   $Start.Environment['CODEX_TOOLKIT_NODE_EXE']=$Plan.nodePath
   $Start.Environment['CODEX_REAL_NODE_EXE']=$Plan.nodePath
   foreach ($Argument in $Arguments) {$Start.ArgumentList.Add($Argument)}
-  $Start.RedirectStandardOutput=[bool]$Capture
-  $Start.RedirectStandardError=[bool]$Capture
   $Child=[Diagnostics.Process]::Start($Start)
   try {
-    if ($Capture) {$Output=$Child.StandardOutput.ReadToEndAsync();$ErrorText=$Child.StandardError.ReadToEndAsync()}
+    $ChildStartedAt=$Child.StartTime.ToUniversalTime()
     $Child.WaitForExit()
-    return [pscustomobject]@{exitCode=$Child.ExitCode;stdout=$(if($Capture){$Output.GetAwaiter().GetResult()}else{''});stderr=$(if($Capture){$ErrorText.GetAwaiter().GetResult()}else{''})}
+    return [pscustomobject]@{exitCode=$Child.ExitCode;processId=$Child.Id;startedAt=$ChildStartedAt}
   } finally {$Child.Dispose()}
 }
 $RecoveryArguments=@('-NoLogo','-NoProfile','-NonInteractive','-File',$Plan.recoveryPath,'-AccountRoot',$Plan.accountRoot,'-ExpectedAccountId',$Plan.accountId,'-LoginScriptPath',$Plan.loginPath,'-LoginScriptSha256',$Plan.loginSha256,'-RouterScriptPath',$Plan.routerPath,'-RouterScriptSha256',$Plan.routerSha256,'-NodeExePath',$Plan.nodePath,'-TriggerSource','logon')
 $RecoveryState='unverified'
 try {
-  $Recovered=Invoke-StartupChild -Arguments $RecoveryArguments -Capture
+  $Recovered=Invoke-StartupChild -Arguments $RecoveryArguments
   if ($Recovered.exitCode -eq 0) {
-    $Parsed=$Recovered.stdout | ConvertFrom-Json
-    if ($Parsed.ok -is [bool] -and $Parsed.ok -and [string]$Parsed.account -ceq [string]$Plan.accountId) {$RecoveryState='verified'}
+    $Parsed=Get-Content -LiteralPath (Join-Path $Plan.accountRoot 'state/last-start.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    $MatchingEnd=@(Get-Content -LiteralPath (Join-Path $Plan.accountRoot 'state/startup-history.jsonl') -Tail 32 -Encoding UTF8 | ForEach-Object {
+      try {$Event=$_ | ConvertFrom-Json} catch {return}
+      if ($Event.event -ceq 'run_end' -and [string]$Event.runId -ceq [string]$Parsed.runId -and
+          $Event.wrapperPid -eq $Recovered.processId -and $Event.exitCode -eq 0 -and $Event.ok -eq $true -and
+          ([DateTimeOffset]$Event.startedAt).UtcDateTime -ge $Recovered.startedAt) {$Event}
+    })
+    if ($Parsed.ok -is [bool] -and $Parsed.ok -and [string]$Parsed.account -ceq [string]$Plan.accountId -and
+        -not [string]::IsNullOrWhiteSpace([string]$Parsed.runId) -and $MatchingEnd.Count -eq 1) {$RecoveryState='verified'}
   }
 } catch {$RecoveryState='failed'}
 if ($RecoveryState -cne 'verified') {Write-Warning 'QQ recovery requires attention; existing watchdog startup remains available. See the account startup history.'}

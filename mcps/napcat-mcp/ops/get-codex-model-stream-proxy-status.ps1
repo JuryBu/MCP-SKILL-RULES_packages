@@ -31,7 +31,7 @@ if ($null -ne $ManagedProfile) {
   $Listener = Get-NetTCPConnection -State Listen -LocalPort ([int]$ManagedProfile.ports.inner) -ErrorAction SilentlyContinue |
     Where-Object { $_.LocalAddress -eq '127.0.0.1' -and $_.OwningProcess -eq [int]$ManagedRuntime.pid }
   $Fresh = $false
-  try { $Age = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$ManagedRuntime.livenessAt)).TotalSeconds; $Fresh = $Age -ge -2 -and $Age -le 15 } catch {}
+  try { $Age = ([DateTimeOffset]::UtcNow - [DateTimeOffset]$ManagedRuntime.livenessAt).TotalSeconds; $Fresh = $Age -ge -2 -and $Age -le 15 } catch {}
   $Health = $null
   $ControlIdentityMatches = $false
   $ReadyForDesktop = $false
@@ -58,7 +58,7 @@ if ($null -ne $ManagedProfile) {
   if ($IdentityMatches -and $null -ne $Listener -and $Fresh -and $TokenMatches -and $ManagedRuntime.state -ceq 'running' -and -not $ControlIdentityMatches) {
     try {
       $OuterStatus = & (Join-Path $PSScriptRoot 'get-codex-app-server-proxy-status.ps1') -DataRoot $DataRoot | ConvertFrom-Json
-      $OuterAge = ([DateTimeOffset]::UtcNow - [DateTimeOffset]::Parse([string]$OuterStatus.runtime.livenessAt)).TotalSeconds
+      $OuterAge = ([DateTimeOffset]::UtcNow - [DateTimeOffset]$OuterStatus.runtime.livenessAt).TotalSeconds
       $ReadyForDesktop = $OuterStatus.ok -eq $true -and $OuterAge -ge -2 -and $OuterAge -le 15 -and
         $OuterStatus.runtime.pid -eq $ManagedRuntime.pid -and $OuterStatus.runtime.instanceToken -ceq $ManagedRuntime.instanceToken -and
         $OuterStatus.runtime.state -ceq 'waiting_for_desktop' -and $OuterStatus.runtime.waitingForDesktop -eq $true -and
