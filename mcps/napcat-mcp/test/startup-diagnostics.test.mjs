@@ -139,6 +139,32 @@ Remove-OldStartupDiagnostics
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("repeated successful health checks do not displace failure evidence", windowsOnly, () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-diagnostic-reuse-"));
+  const source = fs.readFileSync(path.join(repository, "ops", "start-codex-app-server-proxy.ps1"), "utf8");
+  const writer = /function Write-StartupDiagnostic \{[\s\S]+?(?=\r?\nfunction Remove-OldStartupDiagnostics)/u.exec(source)?.[0];
+  assert.ok(writer);
+  assert.match(source, /Write-StartupDiagnostic -Stage 'configuration'\r?\ntry \{/u);
+  const originalNames = Array.from({ length: 32 }, () => `${randomUUID()}.json`);
+  for (const name of originalNames) fs.writeFileSync(path.join(root, name), "preserved failure");
+  try {
+    const script = `$ErrorActionPreference='Stop';$StartupRecoveryMode='Auto';$DiagnosticRoot=$env:DIAG_TEST_ROOT;
+${writer}
+foreach($iteration in 1..40){
+  $AttemptId=[guid]::NewGuid().ToString();$AttemptPath=Join-Path $DiagnosticRoot ($AttemptId+'.json');
+  $StartupClock=[Diagnostics.Stopwatch]::StartNew();$StartupDiagnostic=[ordered]@{attemptId=$AttemptId;stage='configuration';status='running';elapsedMs=0;error=$null;events=@()};
+  Write-StartupDiagnostic -Stage 'configuration';Write-StartupDiagnostic -Stage 'existing_runtime' -Status 'ready'
+}`;
+    const result = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true, encoding: "utf8", timeout: 10000, env: { ...process.env, DIAG_TEST_ROOT: root },
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(fs.readdirSync(root).length, 33);
+    for (const name of originalNames) assert.equal(fs.readFileSync(path.join(root, name), "utf8"), "preserved failure");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, "latest-existing-runtime.json"), "utf8")).status, "ready");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a ready runner outlives the launcher and keeps its redirected output", windowsOnly, async () => {
   const listeners = [];
   for (let index = 0; index < 4; index += 1) {

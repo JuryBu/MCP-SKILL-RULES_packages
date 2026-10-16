@@ -56,7 +56,9 @@ function Write-StartupDiagnostic {
     $StartupDiagnostic.elapsedMs = $StartupClock.ElapsedMilliseconds
     if ($Message) { $StartupDiagnostic.error = $Message.Substring(0, [Math]::Min(4096, $Message.Length)) }
     $StartupDiagnostic.events = @($StartupDiagnostic.events | Select-Object -Last 15) + @([ordered]@{ at = [DateTimeOffset]::UtcNow.ToString('o'); stage = $Stage; status = $Status; elapsedMs = $StartupClock.ElapsedMilliseconds })
-    [IO.File]::WriteAllText($AttemptPath, ($StartupDiagnostic | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    $RecordPath = if ($Stage -eq 'existing_runtime' -and $Status -eq 'ready') { Join-Path $DiagnosticRoot 'latest-existing-runtime.json' } else { $AttemptPath }
+    [IO.File]::WriteAllText($RecordPath, ($StartupDiagnostic | ConvertTo-Json -Depth 6), [Text.UTF8Encoding]::new($false))
+    if ($RecordPath -ne $AttemptPath -and (Test-Path -LiteralPath $AttemptPath -PathType Leaf)) { [IO.File]::Delete($AttemptPath) }
   } catch {
     Write-Warning ('Startup diagnostic could not be saved: ' + $_.Exception.Message)
   }
@@ -65,7 +67,7 @@ function Write-StartupDiagnostic {
 function Remove-OldStartupDiagnostics {
   try {
   if ($StartupRecoveryMode -eq 'Plan' -or -not (Test-Path -LiteralPath $DiagnosticRoot)) { return }
-  foreach ($Old in @(Get-ChildItem -LiteralPath $DiagnosticRoot -Filter '*.json' -File | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 32)) {
+  foreach ($Old in @(Get-ChildItem -LiteralPath $DiagnosticRoot -Filter '*.json' -File | Where-Object { $_.BaseName -cmatch '^[a-f0-9-]{36}$' } | Sort-Object LastWriteTimeUtc -Descending | Select-Object -Skip 32)) {
     if ($Old.BaseName -cnotmatch '^[a-f0-9-]{36}$' -or $Old.FullName -eq $AttemptPath) { continue }
     try {
       $Previous = Get-Content -LiteralPath $Old.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -82,7 +84,6 @@ function Remove-OldStartupDiagnostics {
 }
 
 Write-StartupDiagnostic -Stage 'configuration'
-Remove-OldStartupDiagnostics
 try {
 . (Join-Path $PSScriptRoot "resolve-codex-outer-runtime-startup.ps1")
 $OuterRuntimeStartup = Resolve-CodexOuterRuntimeStartup -DataRoot $DataRoot
@@ -405,6 +406,7 @@ do {
 
 if ($null -eq $RuntimeState) { throw "Codex App Server proxy did not become ready within $StartupTimeoutSeconds seconds; runtime: $RuntimeStatePath" }
 Write-StartupDiagnostic -Stage 'ready' -Status 'ready'
+Remove-OldStartupDiagnostics
 [pscustomobject]@{
   started = $true
   pid = [int]$RuntimeState.pid
@@ -418,5 +420,6 @@ Write-StartupDiagnostic -Stage 'ready' -Status 'ready'
 } | ConvertTo-Json -Depth 12
 } catch {
   Write-StartupDiagnostic -Stage $StartupDiagnostic.stage -Status 'failed' -Message $_.Exception.Message
+  Remove-OldStartupDiagnostics
   throw
 }
