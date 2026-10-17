@@ -6,9 +6,14 @@ import path from "node:path";
 import test from "node:test";
 import { WebSocket, WebSocketServer } from "ws";
 import {
+  CodexAppServerProxy,
+  DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES,
+  DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES,
   createCodexAppServerProxy,
+  createDesktopTransportBudgetError,
   createWakeJournal,
 } from "../src/codex-app-server-proxy.mjs";
+import { createProxyClassCodeParticipant } from "../src/proxy-live-code-runtime.mjs";
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -773,6 +778,268 @@ test("large upstream text frames are forwarded without JSON materialization", { 
   desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 4, method: "initialize", params: {} }));
   await waitFor(() => responses.some(message => message.id === 4));
   assert.deepEqual(responses.find(message => message.id === 4).result, {});
+  assert.equal([...proxy.clients][0].desktopRequestIds.size, 0);
+});
+
+function desktopBudgetFixture(options = {}) {
+  const events = [];
+  const proxy = createCodexAppServerProxy({ controlToken: "isolated-budget-test", maxJsonParseBytes: 1024,
+    maxDesktopTransportBytes: 1024, onEvent: event => events.push(event), ...options });
+  const makeSocket = () => ({ readyState: WebSocket.OPEN, bufferedAmount: 0, sent: [],
+    send(data, _options, callback) { this.sent.push(Buffer.from(data)); callback?.(); },
+    close(code, reason) { this.readyState = WebSocket.CLOSING; this.closeCode = code; this.closeReason = reason; } });
+  const downstream = makeSocket();
+  const upstream = makeSocket();
+  const client = { downstream, upstream, upstreamReady: true, initialized: true, initializationRequestId: null,
+    desktopRequestIds: new Map(), forwardedRequestIds: new Map(), injected: new Map(), desktopRequestBytes: 0,
+    queued: [], queuedBytes: 0, connectedAt: "fixture", closed: false,
+    turnObserver: { observeUpstream() {}, markForwarded() {}, close() {} },
+    wakeVisibility: { close() {} }, displayPolicy: { close() {} }, reasoningPlaceholder: { close() {} } };
+  proxy.clients.add(client);
+  proxy.outerRuntime = { upstream: (_client, _message, input) => input.projectionMessage,
+    downstream() {}, closeClient() {}, orphanResponse() {} };
+  return { proxy, client, downstream, upstream, events,
+    track(requestId, method, upstreamId = requestId) {
+      client.desktopRequestIds.set(requestId, { bytes: 16, method, upstreamId });
+      client.desktopRequestBytes += 16;
+      if (requestId !== upstreamId) client.forwardedRequestIds.set(upstreamId, requestId);
+    },
+    receive(message) {
+      proxy._liveReceiveUpstream(client, upstream, null, Buffer.from(JSON.stringify(message)), false);
+    } };
+}
+
+test("final Desktop transport has an independent 96 MiB default and hot adoption fallback", () => {
+  assert.equal(DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES, 64 * 1024 * 1024);
+  assert.equal(DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES, 96 * 1024 * 1024);
+  assert.ok(DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES < 100 * 1024 * 1024);
+  const fixture = desktopBudgetFixture({ maxDesktopTransportBytes: 200 * 1024 * 1024 });
+  const proxy = createCodexAppServerProxy({ controlToken: "hot-budget-test", maxDesktopTransportBytes: 200 * 1024 * 1024 });
+  assert.equal(proxy.maxDesktopTransportBytes, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES);
+  delete proxy.maxDesktopTransportBytes;
+  const clients = proxy.clients;
+  const outerRuntime = proxy.outerRuntime;
+  const participant = createProxyClassCodeParticipant(proxy);
+  class AdoptedProxy extends CodexAppServerProxy {}
+  const snapshot = participant.activate(participant.prepare({ CodexAppServerProxy: AdoptedProxy }));
+  assert.equal(Object.getPrototypeOf(proxy), AdoptedProxy.prototype);
+  assert.equal(proxy.clients, clients);
+  assert.equal(proxy.outerRuntime, outerRuntime);
+  assert.equal(proxy.maxDesktopTransportBytes, undefined);
+  assert.equal(proxy.status().limits.maxDesktopTransportBytes, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES);
+  const payload = Buffer.alloc(2048, 120);
+  assert.equal(proxy._liveSendOrClose(fixture.client, fixture.downstream, payload, true, "fallback"), true);
+  assert.equal(fixture.downstream.sent[0].length, payload.length);
+  participant.restore(snapshot);
+  const error = createDesktopTransportBudgetError({ requestId: 7, method: "tools/call",
+    responseBytes: DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES + 1 });
+  assert.equal(error.error.data.limit, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES);
+  assert.equal(error.error.data.retrySameRequest, false);
+});
+
+test("final Desktop transport preserves small events, history and unknown responses", () => {
+  const fixture = desktopBudgetFixture();
+  const notification = { method: "turn/completed", params: { threadId: "fixture", turnId: "turn" } };
+  fixture.receive(notification);
+  fixture.track(0, "thread/items/list");
+  fixture.receive({ id: 0, result: { data: [], nextCursor: null } });
+  fixture.receive({ id: "unknown-small", result: {} });
+  assert.deepEqual(fixture.downstream.sent.map(bytes => JSON.parse(bytes.toString())),
+    [notification, { id: 0, result: { data: [], nextCursor: null } }, { id: "unknown-small", result: {} }]);
+  assert.equal(fixture.client.closed, false);
+  assert.equal(fixture.client.desktopRequestIds.size, 0);
+});
+
+test("final Desktop transport replaces matched generic responses and preserves later responses", () => {
+  for (const requestId of [0, "original-id"]) {
+    const fixture = desktopBudgetFixture();
+    const upstreamId = requestId === 0 ? 0 : -1000000001;
+    fixture.track(requestId, "tools/call", upstreamId);
+    fixture.receive({ id: upstreamId, result: { value: "x".repeat(2048) } });
+    const error = JSON.parse(fixture.downstream.sent[0].toString());
+    assert.equal(error.id, requestId);
+    assert.equal(error.error.data.reason, "DESKTOP_TRANSPORT_BUDGET_EXCEEDED");
+    assert.equal(error.error.data.retrySameRequest, false);
+    assert.equal(error.error.data.upstreamStateMayHaveChanged, true);
+    assert.equal(error.error.data.outcomeUnknown, true);
+    assert.ok(fixture.downstream.sent[0].length <= 1024);
+    fixture.track(2, "thread/read");
+    fixture.receive({ id: 2, result: { thread: { id: "still-alive" } } });
+    assert.equal(JSON.parse(fixture.downstream.sent[1].toString()).result.thread.id, "still-alive");
+    assert.equal(fixture.client.closed, false);
+    assert.equal(fixture.client.desktopRequestIds.size, 0);
+    assert.equal(fixture.client.forwardedRequestIds.size, 0);
+    assert.equal(fixture.client.desktopRequestBytes, 0);
+  }
+});
+
+test("history keeps its own budget and pagination guidance before the final Desktop limit", () => {
+  for (const method of ["thread/read", "thread/resume", "thread/turns/list", "thread/items/list"]) {
+    const fixture = desktopBudgetFixture({ maxDesktopResponseBytes: 1024, maxDesktopTransportBytes: 4096 });
+    fixture.track(7, method);
+    fixture.receive({ id: 7, result: { value: "x".repeat(2048) } });
+    const error = JSON.parse(fixture.downstream.sent[0].toString());
+    assert.equal(error.error.data.reason, "DESKTOP_RESPONSE_BUDGET_EXCEEDED");
+    assert.equal(error.error.data.pagination.useCursor, true);
+    assert.equal(error.error.data.retrySameRequest, false);
+    assert.equal(error.error.data.upstreamStateMayHaveChanged, method === "thread/resume");
+    assert.equal(fixture.client.closed, false);
+  }
+});
+
+test("oversized notifications, server requests and unknown response IDs close only their client", () => {
+  for (const message of [
+    { method: "item/completed", params: { value: "x".repeat(2048) } },
+    { id: 7, method: "item/tool/request", params: { value: "x".repeat(2048) } },
+    { id: "unknown", result: { value: "x".repeat(2048) } },
+  ]) {
+    const fixture = desktopBudgetFixture();
+    const otherClient = { closed: false };
+    fixture.proxy.clients.add(otherClient);
+    fixture.track(7, "tools/call");
+    fixture.receive(message);
+    assert.equal(fixture.downstream.sent.length, 0);
+    assert.equal(fixture.downstream.closeCode, 1009);
+    assert.equal(fixture.client.closed, true);
+    assert.equal(otherClient.closed, false);
+    assert.equal(fixture.proxy.clients.has(otherClient), true);
+    assert.equal(fixture.proxy.closed, false);
+    const diagnostic = fixture.events.find(event => event.type === "desktop_transport_budget_exceeded");
+    assert.equal(diagnostic.replaced, false);
+    assert.ok(JSON.stringify(diagnostic).length < 512);
+  }
+});
+
+test("final Desktop limit checks projection growth and does not mislabel projected server requests", () => {
+  for (const method of ["tools/call", "thread/read"]) {
+    const fixture = desktopBudgetFixture();
+    fixture.track(7, method);
+    fixture.proxy.outerRuntime.upstream = () => ({ id: 7, result: { value: "x".repeat(2048) } });
+    fixture.receive({ id: 7, result: {} });
+    const error = JSON.parse(fixture.downstream.sent[0].toString());
+    assert.equal(error.id, 7);
+    assert.equal(error.error.data.reason, "DESKTOP_TRANSPORT_BUDGET_EXCEEDED");
+    if (method === "thread/read") assert.equal(error.error.data.pagination.useCursor, true);
+  }
+  for (const projected of [
+    { method: "event/grown", params: { value: "x".repeat(2048) } },
+    { id: 7, method: "server/request", params: { value: "x".repeat(2048) } },
+    { id: 8, result: { value: "x".repeat(2048) } },
+  ]) {
+    const fixture = desktopBudgetFixture();
+    fixture.track(7, "tools/call");
+    fixture.proxy.outerRuntime.upstream = () => projected;
+    fixture.receive({ id: 7, result: {} });
+    assert.equal(fixture.client.closed, true);
+    assert.equal(fixture.downstream.sent.length, 0);
+  }
+});
+
+test("final Desktop limit counts UTF-8 bytes and accepts the exact boundary", () => {
+  const fixture = desktopBudgetFixture();
+  const message = { id: 7, result: { value: "猫".repeat(400) } };
+  const serialized = JSON.stringify(message);
+  assert.ok(serialized.length < 1024);
+  assert.ok(Buffer.byteLength(serialized) > 1024);
+  fixture.track(7, "tools/call");
+  fixture.receive(message);
+  assert.equal(JSON.parse(fixture.downstream.sent[0].toString()).error.data.bytes, Buffer.byteLength(serialized));
+  const exact = JSON.stringify({ method: "event", params: "" });
+  const boundary = { method: "event", params: "x".repeat(1024 - Buffer.byteLength(exact)) };
+  fixture.receive(boundary);
+  assert.equal(fixture.downstream.sent[1].length, 1024);
+  assert.equal(fixture.client.closed, false);
+});
+
+test("oversized error wrappers and local errors cannot bypass the final Desktop limit", () => {
+  for (const method of ["tools/call", "thread/read"]) {
+    const fixture = desktopBudgetFixture({ maxDesktopResponseBytes: 1024 });
+    const requestId = "r".repeat(900);
+    fixture.track(requestId, method);
+    fixture.receive({ id: requestId, result: { value: "x".repeat(2048) } });
+    assert.equal(fixture.downstream.sent.length, 0);
+    assert.equal(fixture.downstream.closeCode, 1009);
+    assert.ok(fixture.events.find(event => event.type === "desktop_transport_budget_exceeded").replacementBytes > 1024);
+  }
+  const fixture = desktopBudgetFixture();
+  assert.equal(fixture.proxy._liveSendOrClose(fixture.client, fixture.downstream,
+    JSON.stringify({ id: 1, error: { message: "x".repeat(2048) } }), false, "turn_preflight_error"), false);
+  assert.equal(fixture.downstream.sent.length, 0);
+});
+
+test("the final Desktop budget does not limit upstream requests", () => {
+  const fixture = desktopBudgetFixture();
+  const message = { id: 7, method: "tools/call", params: { value: "x".repeat(2048) } };
+  const bytes = Buffer.from(JSON.stringify(message));
+  fixture.proxy._liveReceiveDownstream(fixture.client, bytes, false);
+  assert.deepEqual(fixture.upstream.sent[0], bytes);
+  assert.equal(fixture.client.closed, false);
+  assert.equal(fixture.downstream.sent.length, 0);
+});
+
+test("final Desktop budget protects the real network chain without closing other clients", { timeout: 15000 }, async context => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const calls = [];
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", socket => socket.on("message", bytes => {
+    const message = JSON.parse(bytes.toString());
+    calls.push(message);
+    let result = { ok: true };
+    if (message.method === "tools/call") result = { value: "x".repeat(4096) };
+    if (message.method === "thread/read") result = { value: "x".repeat(8192) };
+    if (message.method === "large/upstream") result = { received: Buffer.byteLength(message.params.value) };
+    if (message.method === "overflow/notification") {
+      socket.send(JSON.stringify({ method: "item/completed", params: { value: "x".repeat(4096) } }));
+    } else if (message.method === "overflow/server") {
+      socket.send(JSON.stringify({ id: message.id, method: "server/request", params: { value: "x".repeat(4096) } }));
+    } else if (message.method === "overflow/unknown") {
+      socket.send(JSON.stringify({ id: "unknown", result: { value: "x".repeat(4096) } }));
+    } else socket.send(JSON.stringify({ id: message.id, result }));
+  }));
+  const proxy = createCodexAppServerProxy({ downstreamPort, controlPort, upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
+    controlToken: "network-budget-test", maxDesktopTransportBytes: 1024, maxDesktopResponseBytes: 2048,
+    maxJsonParseBytes: 1024 });
+  const desktops = [];
+  context.after(async () => {
+    for (const desktop of desktops) desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise(resolve => upstream.close(resolve));
+  });
+  await proxy.start();
+  const connect = async () => {
+    const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`, { maxPayload: 1024 });
+    desktops.push(desktop);
+    const responses = [];
+    desktop.on("message", bytes => responses.push(JSON.parse(bytes.toString())));
+    await new Promise((resolve, reject) => { desktop.once("open", resolve); desktop.once("error", reject); });
+    desktop.send(JSON.stringify({ id: 1, method: "initialize", params: {} }));
+    await waitFor(() => responses.some(message => message.id === 1));
+    return { desktop, responses };
+  };
+  const primary = await connect();
+  const survivor = await connect();
+  primary.desktop.send(JSON.stringify({ id: 2, method: "tools/call", params: {} }));
+  await waitFor(() => primary.responses.some(message => message.id === 2));
+  assert.equal(primary.responses.find(message => message.id === 2).error.data.outcomeUnknown, true);
+  primary.desktop.send(JSON.stringify({ id: 3, method: "thread/read", params: {} }));
+  await waitFor(() => primary.responses.some(message => message.id === 3));
+  assert.equal(primary.responses.find(message => message.id === 3).error.data.pagination.useCursor, true);
+  primary.desktop.send(JSON.stringify({ id: 4, method: "large/upstream", params: { value: "猫".repeat(2048) } }));
+  await waitFor(() => primary.responses.some(message => message.id === 4));
+  assert.equal(primary.responses.find(message => message.id === 4).result.received, 6144);
+  for (const kind of ["notification", "server", "unknown"]) {
+    const target = kind === "notification" ? primary : await connect();
+    target.desktop.send(JSON.stringify({ id: 5, method: `overflow/${kind}`, params: {} }));
+    await waitFor(() => target.desktop.readyState === WebSocket.CLOSED);
+    assert.equal(target.responses.some(message => message.id === 5), false);
+    assert.equal(survivor.desktop.readyState, WebSocket.OPEN);
+  }
+  survivor.desktop.send(JSON.stringify({ id: 6, method: "normal/after", params: {} }));
+  await waitFor(() => survivor.responses.some(message => message.id === 6));
+  assert.deepEqual(survivor.responses.find(message => message.id === 6).result, { ok: true });
+  assert.equal(calls.filter(message => message.method === "tools/call").length, 1);
+  assert.equal(proxy.closed, false);
   assert.equal([...proxy.clients][0].desktopRequestIds.size, 0);
 });
 

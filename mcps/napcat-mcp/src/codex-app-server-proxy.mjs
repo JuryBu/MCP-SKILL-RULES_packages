@@ -29,6 +29,7 @@ const MAX_RPC_ENVELOPE_FIELDS = 128;
 const MAX_RPC_ENVELOPE_VALUE_BYTES = 64 * 1024;
 
 export const DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES = 96 * 1024 * 1024;
 export const DESKTOP_RESPONSE_BUDGET_ERROR_CODE = -32010;
 const HISTORY_METHODS = new Set(["thread/read", "thread/resume", "thread/turns/list", "thread/items/list"]);
 
@@ -47,6 +48,24 @@ export function createDesktopResponseBudgetError({ requestId, method, responseBy
       hint: method === "thread/resume"
         ? "恢复请求可能已完成，请先核对线程状态，再用原 threadId 和 nextCursor 分页读取历史"
         : "使用原 threadId，先读取摘要，再用 nextCursor 分页读取回合与条目" } } };
+}
+
+export function createDesktopTransportBudgetError({ requestId, method, responseBytes,
+  limit = DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES } = {}) {
+  const validRequestId = typeof requestId === "string" || (typeof requestId === "number" && Number.isFinite(requestId));
+  if (!validRequestId || typeof method !== "string") return null;
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("Desktop transport limit must be a positive safe integer");
+  if (!Number.isSafeInteger(responseBytes) || responseBytes <= limit) return null;
+  const historyError = createDesktopResponseBudgetError({ requestId, method, responseBytes, limit });
+  if (historyError) {
+    historyError.error.data.reason = "DESKTOP_TRANSPORT_BUDGET_EXCEEDED";
+    return historyError;
+  }
+  return { id: requestId, error: { code: -32011,
+    message: "响应超过 Desktop 传输上限，操作结果需核对",
+    data: { reason: "DESKTOP_TRANSPORT_BUDGET_EXCEEDED", method: method.slice(0, 128), bytes: responseBytes, limit,
+      retrySameRequest: false, upstreamStateMayHaveChanged: true, outcomeUnknown: true,
+      hint: "请先核对上游权威状态和原操作结果，勿自动重试原请求" } } };
 }
 
 function isObject(value) {
@@ -645,6 +664,8 @@ export class CodexAppServerProxy {
     );
     this.maxDesktopResponseBytes = boundedInteger(options.maxDesktopResponseBytes,
       DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES, 1024, DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES);
+    this.maxDesktopTransportBytes = boundedInteger(options.maxDesktopTransportBytes,
+      DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES, 1024, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES);
     this.heartbeatIntervalMs = boundedInteger(
       options.heartbeatIntervalMs,
       DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -862,6 +883,8 @@ export class CodexAppServerProxy {
         maxQueuedMessages: this.maxQueuedMessages,
         maxQueuedBytes: this.maxQueuedBytes,
         maxBufferedBytes: this.maxBufferedBytes,
+        maxDesktopResponseBytes: this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES,
+        maxDesktopTransportBytes: this.maxDesktopTransportBytes ?? DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES,
         heartbeatIntervalMs: this.heartbeatIntervalMs,
         turnFirstOutputTimeoutMs: this.turnFirstOutputTimeoutMs,
       },
@@ -1057,6 +1080,7 @@ export class CodexAppServerProxy {
     let message = parseJsonMessage(data, this.maxJsonParseBytes, originalByteLength);
     let rpcMessage = message ?? envelope.message;
     const response = isRpcResponse(rpcMessage);
+    let desktopResponse = null;
     let metadataMessage = rpcMessage;
     let responseGeneration = metadataGeneration;
     if (response && client.forwardedRequestIds.has(rpcMessage.id)) {
@@ -1108,6 +1132,7 @@ export class CodexAppServerProxy {
       }
       const tracking = client.desktopRequestIds.get(rpcMessage.id);
       if (tracking?.upstreamId === upstreamId) {
+        desktopResponse = { requestId: rpcMessage.id, method: tracking.method };
         const budgetError = createDesktopResponseBudgetError({ requestId: rpcMessage.id, method: tracking.method,
           responseBytes: originalByteLength, limit: this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES });
         if (originalByteLength > 1024 * 1024) this.onEvent({ type: "desktop_large_rpc_response",
@@ -1140,7 +1165,7 @@ export class CodexAppServerProxy {
     if (!projected && message) return;
     if (client.downstream.readyState === this.WebSocketImpl.OPEN) {
       const payload = projected !== message ? JSON.stringify(projected) : data;
-      this._liveSendOrClose(client, client.downstream, payload, isBinary, "upstream_to_downstream");
+      this._liveSendOrClose(client, client.downstream, payload, isBinary, "upstream_to_downstream", desktopResponse);
     }
   }
 
@@ -1349,8 +1374,37 @@ export class CodexAppServerProxy {
     }
   }
 
-  _liveSendOrClose(client, socket, data, isBinary, source) {
-    if (socket.readyState !== this.WebSocketImpl.OPEN) return false;
+  _liveSendOrClose(client, socket, data, isBinary, source, desktopResponse = null) {
+    if (client.closed || socket.readyState !== this.WebSocketImpl.OPEN) return false;
+    if (socket === client.downstream) {
+      const limit = boundedInteger(this.maxDesktopTransportBytes, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES,
+        1, DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES);
+      const bytes = messageByteLength(data);
+      if (bytes > limit) {
+        let replacement = null;
+        if (desktopResponse) {
+          let finalMessage = null;
+          try { finalMessage = scanRpcEnvelope(data, this.maxJsonParseBytes).message; } catch {}
+          if (isRpcResponse(finalMessage) && finalMessage.id === desktopResponse.requestId) {
+            replacement = createDesktopTransportBudgetError({ ...desktopResponse, responseBytes: bytes, limit });
+          }
+        }
+        const replacementPayload = replacement ? JSON.stringify(replacement) : null;
+        const replacementBytes = replacementPayload === null ? null : messageByteLength(replacementPayload);
+        const replaced = replacementBytes !== null && replacementBytes <= limit;
+        this.onEvent({ type: "desktop_transport_budget_exceeded", bytes, limit, replaced, replacementBytes,
+          method: desktopResponse?.method?.slice(0, 128) ?? null });
+        if (!replaced) {
+          this._liveCloseClient(client, "desktop_transport_budget_exceeded", new CodexAppServerProxyError(
+            "DESKTOP_TRANSPORT_BUDGET_EXCEEDED", "Desktop 下行消息超过传输上限，已关闭当前客户端连接",
+            { details: { bytes, limit, replacementBytes } },
+          ), 1009);
+          return false;
+        }
+        data = replacementPayload;
+        isBinary = false;
+      }
+    }
     if ((socket.bufferedAmount ?? 0) > this.maxBufferedBytes) {
       this._liveCloseClient(client, `${source}_backpressure`, new CodexAppServerProxyError(
         "WEBSOCKET_BACKPRESSURE",
