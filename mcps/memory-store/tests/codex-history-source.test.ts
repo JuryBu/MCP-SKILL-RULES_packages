@@ -8,6 +8,8 @@ import {
     assertCodexHistorySourceAsync,
     codexHistorySegmentReadPath,
     parseCodexRolloutFilename,
+    resolveCodexHistoryFilePath,
+    resolveCodexHistoryFilePathAsync,
     resolveCodexHistorySource,
     resolveCodexHistorySourceAsync,
     type CodexHistorySource,
@@ -68,6 +70,28 @@ try {
     const noNewline = writeRollout(path.join(temp, "no-newline"), ROOT);
     fs.writeFileSync(noNewline.file, noNewline.text.trimEnd());
     const noNewlineSource = resolveCodexHistorySource(noNewline.file, { roots: [] });
+    assert.equal(resolveCodexHistoryFilePath(`${noNewline.file}.zst`), noNewline.file);
+    assert.equal(await resolveCodexHistoryFilePathAsync(`${noNewline.file}.zst`), noNewline.file);
+    assert.equal(resolveCodexHistorySource(`${noNewline.file}.zst`, { roots: [] }).revision, noNewlineSource.revision);
+    assert.equal((await resolveCodexHistorySourceAsync(`${noNewline.file}.zst`, { roots: [] })).revision, noNewlineSource.revision);
+    const absent = path.join(temp, filename(MISSING));
+    assert.throws(() => resolveCodexHistoryFilePath(absent), { code: "ENOENT" });
+    await assert.rejects(resolveCodexHistoryFilePathAsync(absent), { code: "ENOENT" });
+    const nonRollout = path.join(temp, "not-rollout.jsonl");
+    fs.writeFileSync(`${nonRollout}.zst`, "unrelated");
+    assert.throws(() => resolveCodexHistoryFilePath(nonRollout), { code: "ENOENT" });
+    const directorySource = path.join(temp, "directory", filename(ROOT));
+    fs.mkdirSync(directorySource, { recursive: true });
+    fs.writeFileSync(`${directorySource}.zst`, "unrelated");
+    assert.throws(() => resolveCodexHistoryFilePath(directorySource), /not a file/);
+    await assert.rejects(resolveCodexHistoryFilePathAsync(directorySource), /not a file/);
+    const statSync = fs.statSync;
+    fs.statSync = ((filePath, ...parameters) => {
+        if (filePath === noNewline.file) throw Object.assign(new Error("injected permission failure"), { code: "EACCES" });
+        return statSync(filePath, ...parameters);
+    }) as typeof fs.statSync;
+    try { assert.throws(() => resolveCodexHistoryFilePath(noNewline.file), { code: "EACCES" }); }
+    finally { fs.statSync = statSync; }
     assert.equal(noNewlineSource.segments[0]!.endByte, Buffer.byteLength(noNewline.text.trimEnd()));
     assert.equal(noNewlineSource.segments[0]!.unterminatedLeaf, true);
     assertCodexHistorySource(noNewlineSource);
@@ -222,7 +246,13 @@ try {
         await assert.rejects(resolveCodexHistorySourceAsync(`${compressedLeaf.file}.zst`, { roots: [compressedDirectory], archive }), /Conflicting/);
         fs.writeFileSync(`${compressedLeaf.file}.zst`, zlib.zstdCompressSync(Buffer.from(compressedLeaf.text)));
         fs.unlinkSync(compressedLeaf.file);
+        const stalePlainLeaf = resolveCodexHistorySource(compressedLeaf.file, { roots: [compressedDirectory], archive });
+        assert.equal(resolveCodexHistoryFilePath(compressedLeaf.file), `${compressedLeaf.file}.zst`);
+        assert.equal(await resolveCodexHistoryFilePathAsync(compressedLeaf.file), `${compressedLeaf.file}.zst`);
+        assert.equal(stalePlainLeaf.leafPath, `${compressedLeaf.file}.zst`);
+        assert.equal((await resolveCodexHistorySourceAsync(compressedLeaf.file, { roots: [compressedDirectory], archive })).revision, stalePlainLeaf.revision);
         const allCompressed = resolveCodexHistorySource(`${compressedLeaf.file}.zst`, { roots: [compressedDirectory], archive });
+        assert.equal(stalePlainLeaf.revision, allCompressed.revision);
         assert.ok(allCompressed.segments.every(segment => segment.archive && segment.readPath));
         assert.equal(allCompressed.leafPath, `${compressedLeaf.file}.zst`);
         assert.equal((await resolveCodexHistorySourceAsync(allCompressed.leafPath, { roots: [compressedDirectory], archive })).revision, allCompressed.revision);

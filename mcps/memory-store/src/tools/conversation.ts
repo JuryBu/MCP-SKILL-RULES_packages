@@ -2778,6 +2778,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                                         : "🚀 Codex 对话 fetch 已按 background=true 转入独立后台进程",
                                     `🆔 taskId: ${task.id}`,
                                     `📦 历史来源: ${((estimate.historySource?.totalBytes ?? estimate.sourceSize) / (1024 * 1024)).toFixed(1)} MiB | ${estimate.historySource?.segments.length ?? 1} 个文件 | 自动后台阈值 ${(estimate.thresholdBytes / (1024 * 1024)).toFixed(1)} MiB`,
+                                    ...(estimate.physicalArchiveEstimate ? ["压缩来源按物理文件估算，完整解压、来源链和逻辑字节校验在后台执行。"] : []),
                                     `📍 当前状态: ${task.status}${task.progress?.detail ? ` | ${task.progress.detail}` : ""}`,
                                     "💡 使用 background_task_status(taskId=\"...\", waitSeconds=30-45) 查询；取消时使用 background_task_cancel(taskId=\"...\")。",
                                     "♻️ 相同来源与 link/source 的在途请求可共用 taskId；轻量估算的新 fetch 会重新校验完整原文，已完成任务不作为本次校验结果。",

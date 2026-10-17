@@ -1,11 +1,12 @@
 import { fork } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertCodexSourceVersion, captureCodexSourceVersion, inspectCodexSourceVersionAsync, getCodexThread } from "./codex-client.js";
 import { stableJsonHash, type BackgroundTaskContext } from "./background-tasks.js";
 import type { Chain } from "./chain.js";
-import type { CodexHistorySource } from "./codex-history-source.js";
+import { resolveCodexHistoryFilePathAsync, type CodexHistorySource } from "./codex-history-source.js";
 import type { CodexFetchWorkerMessage, CodexFetchWorkerPayload, CodexFetchWorkerResult } from "./conversation-fetch-worker-types.js";
 
 const DEFAULT_GIANT_FETCH_BYTES = 256 * 1024 * 1024;
@@ -27,6 +28,7 @@ export interface CodexFetchWorkEstimate {
     thresholdBytes: number;
     shouldBackground: boolean;
     verificationDeferred?: boolean;
+    physicalArchiveEstimate?: boolean;
 }
 
 export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEstimate | null {
@@ -48,12 +50,44 @@ export function estimateCodexFetchWork(conversationId: string): CodexFetchWorkEs
 export async function estimateCodexFetchWorkAsync(conversationId: string): Promise<CodexFetchWorkEstimate | null> {
     const thread = getCodexThread(conversationId);
     if (!thread?.rolloutPath) return null;
-    try {
-        const sourceVersion = await inspectCodexSourceVersionAsync(thread.rolloutPath);
-        const thresholdBytes = readThreshold();
+    const thresholdBytes = readThreshold();
+    {
+        const sourcePath = await resolveCodexHistoryFilePathAsync(thread.rolloutPath);
+        let hasArchive = /\.jsonl\.zst$/iu.test(sourcePath);
+        if (!hasArchive) {
+            try { hasArchive = (await fs.promises.stat(`${sourcePath}.zst`)).isFile(); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        }
+        let needsWorker = hasArchive;
+        const handle = await fs.promises.open(sourcePath, "r");
+        try {
+            const stat = await handle.stat();
+            if (!needsWorker) {
+                const header = Buffer.alloc(Math.min(stat.size, 64 * 1024));
+                const { bytesRead } = await handle.read(header, 0, header.length, 0);
+                const end = header.subarray(0, bytesRead).indexOf(0x0a);
+                if (end < 0) needsWorker = true;
+                else {
+                    try {
+                        const record = JSON.parse(header.subarray(0, end).toString("utf8").replace(/^\uFEFF/u, ""));
+                        needsWorker = Boolean(record?.payload?.history_base);
+                    } catch { needsWorker = true; }
+                }
+            }
+            if (needsWorker) {
+                const anchorStartByte = Math.max(0, stat.size - 8192);
+                const buffer = Buffer.alloc(stat.size - anchorStartByte);
+                const { bytesRead } = await handle.read(buffer, 0, buffer.length, anchorStartByte);
+                if (bytesRead !== buffer.length) throw new Error("Codex archive changed during background estimate");
+                return {
+                    sourcePath, sourceSize: stat.size, sourceMtimeMs: Math.trunc(stat.mtimeMs), anchorStartByte,
+                    anchorSha256: crypto.createHash("sha256").update(buffer).digest("hex"), thresholdBytes,
+                    shouldBackground: true, verificationDeferred: true, physicalArchiveEstimate: hasArchive,
+                };
+            }
+        } finally { await handle.close(); }
+        const sourceVersion = await inspectCodexSourceVersionAsync(sourcePath);
         return { ...sourceVersion, thresholdBytes, shouldBackground: (sourceVersion.historySource?.totalBytes ?? sourceVersion.sourceSize) >= thresholdBytes, verificationDeferred: true };
-    } catch {
-        return null;
     }
 }
 
@@ -69,6 +103,7 @@ export function createCodexFetchWorkerPayload(input: {
     return {
         version: input.estimate.verificationDeferred ? 2 : 1,
         ...(input.estimate.verificationDeferred ? { verificationDeferred: true } : {}),
+        ...(input.estimate.verificationDeferred && input.link === "expand_children" ? { expansionLimitBytes: input.estimate.thresholdBytes } : {}),
         ...(input.forceRawCacheRebuild === true ? { forceRawCacheRebuild: true } : {}),
         conversationId: input.conversationId,
         link: input.link,

@@ -14,12 +14,15 @@ import {
     CodexHistorySourceMismatchError,
     parseCodexRolloutFilename,
     normalizeCodexHistoryPath,
+    resolveCodexHistoryFilePath,
+    resolveCodexHistoryFilePathAsync,
     resolveCodexHistorySource,
     resolveCodexHistorySourceAsync,
     type CodexHistorySource,
     type CodexHistorySegment,
 } from "./codex-history-source.js";
 import { CodexOrdinalValidator, CodexPrefixIdentityVerifier, hashCodexPrefix, type CodexOrdinalMode, type CodexPrefixIdentity } from "./codex-history-integrity.js";
+import { CodexHistoryArchiveLogicalLimitError, getCodexHistoryArchiveLogicalLimit } from "./codex-history-archive.js";
 import { getRoundSubagentSummaries, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
@@ -99,7 +102,7 @@ export interface CodexConversationData {
 export interface CodexChildThreadDiagnostic {
     threadId: string;
     nickname?: string;
-    reason: "thread_not_found" | "rollout_missing" | "load_failed";
+    reason: "thread_not_found" | "rollout_missing" | "load_failed" | "expansion_budget_exceeded";
     detail: string;
 }
 
@@ -125,6 +128,7 @@ export interface CodexDeepLocateHit {
     roundIndex: number;
     role: CodexContextProbeHit["role"];
     filePath: string;
+    readPath?: string;
     byteOffset: number;
     snippet: string;
     freshness: "fresh" | "unknown";
@@ -172,7 +176,7 @@ const CODEX_AGENTS_HEADER_LEGACY = "# AGENTS.md instructions for ";
 const CODEX_RECOMMENDED_PLUGINS_OPEN = "<recommended_plugins>";
 const CODEX_RECOMMENDED_PLUGINS_CLOSE = "</recommended_plugins>";
 const CODEX_AGENTS_FOLDED_MARKER = "[Codex AGENTS/RULES 注入已折叠";
-const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl$/iu;
+const CODEX_ROLLOUT_ID_RE = /rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})?\.jsonl(?:\.zst)?$/iu;
 const execFileAsync = promisify(execFile);
 
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -198,6 +202,41 @@ async function pathExistsAsync(targetPath: string): Promise<boolean> {
     } catch {
         return false;
     }
+}
+
+function existingCodexRolloutPath(filePath: string): string | null {
+    if (!filePath) return null;
+    try {
+        return resolveCodexHistoryFilePath(filePath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+    }
+}
+
+async function existingCodexRolloutPathAsync(filePath: string): Promise<string | null> {
+    if (!filePath) return null;
+    try {
+        return await resolveCodexHistoryFilePathAsync(filePath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
+    }
+}
+
+function codexRolloutReadPath(filePath: string): string {
+    if (!parseCodexRolloutFilename(filePath)) return resolveCodexHistoryFilePath(filePath);
+    return codexHistorySegmentReadPath(resolveCodexHistorySource(filePath).segments.at(-1)!);
+}
+
+async function codexRolloutReadPathAsync(filePath: string): Promise<string> {
+    if (!parseCodexRolloutFilename(filePath)) return resolveCodexHistoryFilePathAsync(filePath);
+    const source = await resolveCodexHistorySourceAsync(filePath, { metadataOnly: true });
+    return codexHistorySegmentReadPath(source.segments.at(-1)!);
+}
+
+function codexRolloutReplicaKey(filePath: string): string {
+    return canonicalCodexSourcePath(filePath).replace(/\.jsonl\.zst$/iu, ".jsonl");
 }
 
 function execPythonJson(script: string, args: string[]): any {
@@ -493,7 +532,7 @@ function threadFromSqliteRow(
 ): CodexThreadInfo {
     return applyCodexSessionIndexTitle({
         id: row.id,
-        rolloutPath: row.rollout_path,
+        rolloutPath: existingCodexRolloutPath(row.rollout_path) || row.rollout_path,
         cwd: row.cwd,
         title: row.title,
         sqliteTitle: row.title,
@@ -633,7 +672,9 @@ function isLikelyCodexIdLookup(query: string): boolean {
 
 function readSessionMetaFromRollout(rolloutPath: string): any | null {
     try {
-        const fd = fs.openSync(rolloutPath, "r");
+        const physicalPath = resolveCodexHistoryFilePath(rolloutPath);
+        if (/\.jsonl\.zst$/iu.test(physicalPath)) return null;
+        const fd = fs.openSync(physicalPath, "r");
         try {
             const buffer = Buffer.alloc(1024 * 1024);
             const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
@@ -644,14 +685,17 @@ function readSessionMetaFromRollout(rolloutPath: string): any | null {
         } finally {
             fs.closeSync(fd);
         }
-    } catch {
-        return null;
+    } catch (error) {
+        if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
     }
 }
 
 async function readSessionMetaFromRolloutAsync(rolloutPath: string): Promise<any | null> {
     try {
-        const handle = await fs.promises.open(rolloutPath, "r");
+        const physicalPath = await resolveCodexHistoryFilePathAsync(rolloutPath);
+        if (/\.jsonl\.zst$/iu.test(physicalPath)) return null;
+        const handle = await fs.promises.open(physicalPath, "r");
         try {
             const buffer = Buffer.alloc(1024 * 1024);
             const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
@@ -662,12 +706,14 @@ async function readSessionMetaFromRolloutAsync(rolloutPath: string): Promise<any
         } finally {
             await handle.close();
         }
-    } catch {
-        return null;
+    } catch (error) {
+        if (error instanceof SyntaxError || (error as NodeJS.ErrnoException).code === "ENOENT") return null;
+        throw error;
     }
 }
 
 function threadFromRolloutPath(rolloutPath: string): CodexThreadInfo | null {
+    rolloutPath = resolveCodexHistoryFilePath(rolloutPath);
     const match = path.basename(rolloutPath).match(CODEX_ROLLOUT_ID_RE);
     if (!match) return null;
     const meta = readSessionMetaFromRollout(rolloutPath);
@@ -689,6 +735,7 @@ function threadFromRolloutPath(rolloutPath: string): CodexThreadInfo | null {
 }
 
 async function threadFromRolloutPathAsync(rolloutPath: string): Promise<CodexThreadInfo | null> {
+    rolloutPath = await resolveCodexHistoryFilePathAsync(rolloutPath);
     const match = path.basename(rolloutPath).match(CODEX_ROLLOUT_ID_RE);
     if (!match) return null;
     const [meta, stat, sessionIndex] = await Promise.all([
@@ -717,12 +764,14 @@ function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
     if (!isLikelyCodexIdLookup(normalized)) return [];
     const roots = [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR].filter(root => fs.existsSync(root));
     const matches: CodexThreadInfo[] = [];
+    const seenRollouts = new Set<string>();
     const visit = (dir: string): boolean => {
         let entries: fs.Dirent[];
         try {
             entries = fs.readdirSync(dir, { withFileTypes: true });
-        } catch {
-            return false;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
         }
         for (const entry of entries) {
             const fullPath = path.join(dir, entry.name);
@@ -735,6 +784,9 @@ function findRolloutThreadByIdLookup(query: string): CodexThreadInfo[] {
             if (!match) continue;
             const id = match[1].toLowerCase();
             if (!id.startsWith(normalized)) continue;
+            const replicaKey = codexRolloutReplicaKey(fullPath);
+            if (seenRollouts.has(replicaKey)) continue;
+            seenRollouts.add(replicaKey);
             const thread = threadFromRolloutPath(fullPath);
             if (thread) matches.push(thread);
             if (matches.length >= 2) return true;
@@ -752,14 +804,16 @@ async function findRolloutThreadByIdLookupAsync(query: string): Promise<CodexThr
     if (!isLikelyCodexIdLookup(normalized)) return [];
     const roots = [CODEX_SESSIONS_DIR, CODEX_ARCHIVED_SESSIONS_DIR];
     const matches: CodexThreadInfo[] = [];
+    const seenRollouts = new Set<string>();
     let entriesSinceYield = 0;
 
     const visit = async (dir: string): Promise<boolean> => {
         let entries: fs.Dirent[];
         try {
             entries = await fs.promises.readdir(dir, { withFileTypes: true });
-        } catch {
-            return false;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+            throw error;
         }
         for (const entry of entries) {
             const fullPath = path.join(dir, entry.name);
@@ -769,7 +823,9 @@ async function findRolloutThreadByIdLookupAsync(query: string): Promise<CodexThr
                 const match = entry.name.match(CODEX_ROLLOUT_ID_RE);
                 if (match) {
                     const id = match[1].toLowerCase();
-                    if (id.startsWith(normalized)) {
+                    const replicaKey = codexRolloutReplicaKey(fullPath);
+                    if (id.startsWith(normalized) && !seenRollouts.has(replicaKey)) {
+                        seenRollouts.add(replicaKey);
                         const thread = await threadFromRolloutPathAsync(fullPath);
                         if (thread) matches.push(thread);
                         if (matches.length >= 2) return true;
@@ -1057,7 +1113,7 @@ finally:
                 const identifier = match?.[1].toLowerCase();
                 if (identifier && unresolvedIds.has(identifier)) {
                     const matches = rolloutMatches.get(identifier) || [];
-                    matches.push(childPath);
+                    if (!matches.some(existing => codexRolloutReplicaKey(existing) === codexRolloutReplicaKey(childPath))) matches.push(childPath);
                     rolloutMatches.set(identifier, matches);
                 }
             }
@@ -1551,8 +1607,11 @@ function makeSkippedRolloutLineEvent(reason: string, chars: number): any {
 }
 
 export function readRolloutEvents(rolloutPath: string, options: { endByte?: number; onEvent?: (event: any) => void; strict?: boolean; expectedPrefixSha256?: string; prefixIdentity?: CodexPrefixIdentity } = {}): any[] {
-    if (!fs.existsSync(rolloutPath)) {
-        if (options.strict) throw new Error("Codex history source is unavailable");
+    try {
+        const physicalPath = resolveCodexHistoryFilePath(rolloutPath);
+        rolloutPath = options.strict && !/\.jsonl\.zst$/iu.test(physicalPath) ? physicalPath : codexRolloutReadPath(physicalPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT" || options.strict) throw error;
         return [];
     }
     const events: any[] = [];
@@ -1643,7 +1702,7 @@ export async function readRolloutEventsAsync(rolloutPath: string): Promise<any[]
     const events: any[] = [];
     try {
         await forEachCodexJsonlLineAsync(
-            rolloutPath,
+            await codexRolloutReadPathAsync(rolloutPath),
             (line) => {
                 try {
                     events.push(sanitizeCodexEvent(JSON.parse(line)));
@@ -1667,7 +1726,12 @@ export async function readRolloutEventsAsync(rolloutPath: string): Promise<any[]
 }
 
 function readRolloutTailEvents(rolloutPath: string, maxBytes: number): any[] {
-    if (!fs.existsSync(rolloutPath)) return [];
+    try {
+        rolloutPath = codexRolloutReadPath(rolloutPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+    }
     const stat = fs.statSync(rolloutPath);
     const bytesToRead = Math.min(Math.max(maxBytes, 64 * 1024), stat.size);
     const start = Math.max(0, stat.size - bytesToRead);
@@ -1954,11 +2018,14 @@ function scanCodexRolloutForQuery(
         startedAt: number;
         isCancelled: () => boolean;
     },
-): { hits: CodexDeepLocateHit[]; scannedBytes: number; budgetExhausted: boolean; cancelled: boolean } {
-    if (!thread.rolloutPath || !fs.existsSync(thread.rolloutPath)) {
-        return { hits: [], scannedBytes: 0, budgetExhausted: false, cancelled: false };
+): { hits: CodexDeepLocateHit[]; scannedBytes: number; sourceSize: number; budgetExhausted: boolean; cancelled: boolean } {
+    const physicalPath = existingCodexRolloutPath(thread.rolloutPath);
+    if (!physicalPath) {
+        return { hits: [], scannedBytes: 0, sourceSize: 0, budgetExhausted: false, cancelled: false };
     }
-    const fd = fs.openSync(thread.rolloutPath, "r");
+    const readPath = codexRolloutReadPath(physicalPath);
+    const sourceSize = fs.statSync(readPath).size;
+    const fd = fs.openSync(readPath, "r");
     const decoder = new StringDecoder("utf8");
     const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
     const tokens = deepLocateTokens(query);
@@ -1982,7 +2049,8 @@ function scanCodexRolloutForQuery(
                 mode: options.mode,
                 roundIndex: entry.roundIndex,
                 role: entry.role,
-                filePath: thread.rolloutPath,
+                filePath: physicalPath,
+                ...(readPath === physicalPath ? {} : { readPath }),
                 byteOffset: offset,
                 snippet: snippet(entry.text),
                 freshness: "fresh",
@@ -2070,7 +2138,7 @@ function scanCodexRolloutForQuery(
         fs.closeSync(fd);
     }
 
-    return { hits, scannedBytes, budgetExhausted, cancelled };
+    return { hits, scannedBytes, sourceSize, budgetExhausted, cancelled };
 }
 
 export function deepLocateCodexConversations(
@@ -2085,11 +2153,16 @@ export function deepLocateCodexConversations(
     const deadlineMs = Math.max(1000, options.deadlineMs || 5 * 60 * 1000);
     const startedAt = Date.now();
     const selected = threads.slice(0, maxFiles);
-    const totalBytes = selected.reduce((sum, thread) => {
+    const estimatedSizes = new Map<CodexThreadInfo, number>();
+    let totalBytes = selected.reduce((sum, thread) => {
         try {
-            return sum + (thread.rolloutPath && fs.existsSync(thread.rolloutPath) ? fs.statSync(thread.rolloutPath).size : 0);
-        } catch {
-            return sum;
+            const physicalPath = existingCodexRolloutPath(thread.rolloutPath);
+            const size = physicalPath ? fs.statSync(physicalPath).size : 0;
+            estimatedSizes.set(thread, size);
+            return sum + size;
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "ENOENT") return sum;
+            throw error;
         }
     }, 0);
     const hits: CodexDeepLocateHit[] = [];
@@ -2124,6 +2197,7 @@ export function deepLocateCodexConversations(
             startedAt,
             isCancelled: () => Boolean(options.isCancelled?.()),
         });
+        totalBytes += result.sourceSize - (estimatedSizes.get(thread) || 0);
         scannedBytes += result.scannedBytes;
         hits.push(...result.hits);
         scannedFiles += 1;
@@ -2169,7 +2243,12 @@ export function matchCodexContextProbeInRollout(
     probe: string,
     options: { maxBytes?: number } = {},
 ): CodexContextProbeHit[] {
-    if (!fs.existsSync(rolloutPath)) return [];
+    try {
+        rolloutPath = codexRolloutReadPath(rolloutPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw error;
+    }
     const maxBytes = Math.max(64 * 1024, options.maxBytes || CODEX_CONTEXT_PROBE_MAX_BYTES);
     const stat = fs.statSync(rolloutPath);
     const events = stat.size <= maxBytes
@@ -2196,7 +2275,7 @@ export function findCodexContextProbeMatches(
 
     for (const thread of threads.slice(0, maxThreads)) {
         if (Date.now() - startedAt > deadlineMs) break;
-        if (!thread.rolloutPath || !fs.existsSync(thread.rolloutPath)) continue;
+        if (!thread.rolloutPath) continue;
         const hits = matchCodexContextProbeInRollout(thread.rolloutPath, normalizedProbe, { maxBytes: options.maxBytes });
         if (hits.length === 0) continue;
         const parentThread = getCodexParentThread(thread.id);
@@ -3574,22 +3653,37 @@ export async function readCodexRoundTail(
     options: CodexRoundTailReadOptions = {},
 ): Promise<CodexRoundTailReadResult> {
     let historySegment = options.historySegment;
-    if (!historySegment && /\.jsonl\.zst$/iu.test(rolloutPath)) {
-        historySegment = (await resolveCodexHistorySourceAsync(rolloutPath, { isCancelled: options.isCancelled })).segments.at(-1);
+    let physicalPath: string;
+    try {
+        physicalPath = await resolveCodexHistoryFilePathAsync(rolloutPath);
+        if (parseCodexRolloutFilename(physicalPath)) {
+            const currentSource = await resolveCodexHistorySourceAsync(physicalPath, {
+                endByte: options.endByte ?? historySegment?.endByte,
+                isCancelled: options.isCancelled,
+            });
+            historySegment ??= currentSource.segments.at(-1);
+        }
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        return codexTailRebuildRequired("source_unavailable", options.startByte || 0, 0);
     }
-    const readPath = historySegment ? codexHistorySegmentReadPath(historySegment) : rolloutPath;
+    if (historySegment && canonicalCodexSourcePath(physicalPath) !== canonicalCodexSourcePath(historySegment.path)) {
+        return codexTailRebuildRequired("source_replaced", options.startByte || 0, 0);
+    }
+    const readPath = historySegment ? codexHistorySegmentReadPath(historySegment) : physicalPath;
     const archive = historySegment?.archive;
     let before: fs.Stats;
     let readBefore: fs.Stats;
     try {
-        before = await fs.promises.stat(rolloutPath);
-        readBefore = readPath === rolloutPath ? before : await fs.promises.stat(readPath);
-    } catch {
+        before = await fs.promises.stat(physicalPath);
+        readBefore = readPath === physicalPath ? before : await fs.promises.stat(readPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         return codexTailRebuildRequired("source_unavailable", options.startByte || 0, 0);
     }
     if (!before.isFile()) return codexTailRebuildRequired("source_unavailable", options.startByte || 0, before.size);
     if (archive && (before.size !== archive.sourceSize || before.mtimeMs !== archive.sourceMtimeMs
-        || await hashCodexPrefix(rolloutPath, before.size, options.isCancelled) !== archive.sourceSha256)) {
+        || await hashCodexPrefix(physicalPath, before.size, options.isCancelled) !== archive.sourceSha256)) {
         return codexTailRebuildRequired("source_replaced", options.startByte || 0, readBefore.size);
     }
     const sourceSize = options.endByte ?? historySegment?.endByte ?? readBefore.size;
@@ -3628,7 +3722,8 @@ export async function readCodexRoundTail(
             if (anchor.anchorStartByte !== checkpoint.anchorStartByte || anchor.anchorSha256 !== checkpoint.anchorSha256) {
                 return codexTailRebuildRequired("source_replaced", startByte, sourceSize);
             }
-        } catch {
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
             return codexTailRebuildRequired("source_unavailable", startByte, sourceSize);
         }
         if (sourceSize === checkpoint.sourceSize && (archive || sourceMtimeMs === checkpoint.sourceMtimeMs)) {
@@ -3668,14 +3763,15 @@ export async function readCodexRoundTail(
     let after: fs.Stats;
     let readAfter: fs.Stats;
     try {
-        after = await fs.promises.stat(rolloutPath);
-        readAfter = readPath === rolloutPath ? after : await fs.promises.stat(readPath);
-    } catch {
+        after = await fs.promises.stat(physicalPath);
+        readAfter = readPath === physicalPath ? after : await fs.promises.stat(readPath);
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         return codexTailRebuildRequired("source_unavailable", startByte, sourceSize);
     }
     if (readAfter.size < sourceSize || (archive && (after.size !== before.size || after.mtimeMs !== before.mtimeMs
         || readAfter.size !== readBefore.size || readAfter.mtimeMs !== readBefore.mtimeMs
-        || await hashCodexPrefix(rolloutPath, after.size, options.isCancelled) !== archive.sourceSha256))) {
+        || await hashCodexPrefix(physicalPath, after.size, options.isCancelled) !== archive.sourceSha256))) {
         return codexTailRebuildRequired("source_changed_during_read", startByte, readAfter.size);
     }
     const sourceAnchor = await codexCheckpointAnchor(readPath, sourceSize);
@@ -3783,7 +3879,7 @@ export function loadCodexConversation(
                 });
                 continue;
             }
-            if (!childThread.rolloutPath || !fs.existsSync(childThread.rolloutPath)) {
+            if (!existingCodexRolloutPath(childThread.rolloutPath)) {
                 childDiagnostics.push({
                     threadId: child.threadId,
                     nickname: child.nickname,
@@ -3822,13 +3918,23 @@ export async function loadCodexConversationAsync(
     conversationId: string,
     link: ConversationLinkMode = "summary",
     depth = 0,
+    control: { expectedSource?: CodexSourceVersionExpectation; isCancelled?: () => boolean; expansionBudgetBytes?: number } = {},
 ): Promise<CodexConversationData | null> {
+    const throwIfCancelled = (): void => {
+        if (!control.isCancelled?.()) return;
+        const error = new Error("Codex conversation load cancelled");
+        error.name = "AbortError";
+        throw error;
+    };
+    throwIfCancelled();
     const thread = await getCodexThreadAsync(conversationId);
     if (!thread || !thread.rolloutPath) return null;
-    const historySource = await resolveCodexHistorySourceAsync(thread.rolloutPath);
+    await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "before expanded read", control.isCancelled);
+    const historySource = control.expectedSource?.historySource
+        || await resolveCodexHistorySourceAsync(thread.rolloutPath, { endByte: control.expectedSource?.sourceSize, isCancelled: control.isCancelled });
     const [parentThread, built, edgeChildren] = await Promise.all([
         getCodexParentThreadAsync(thread.id),
-        buildCodexRoundsFromHistoryAsync(historySource, link, { cwd: thread.cwd }),
+        buildCodexRoundsFromHistoryAsync(historySource, link, { cwd: thread.cwd, isCancelled: control.isCancelled }),
         readSpawnChildrenAsync(thread.id),
     ]);
     const sourceCheckpoint = built.sourceCheckpoints.some(item => item.kind === "round_start")
@@ -3847,9 +3953,12 @@ export async function loadCodexConversationAsync(
 
     const expandedChildren: Array<{ thread: CodexThreadInfo; rounds: ConversationRound[] }> = [];
     const childDiagnostics: CodexChildThreadDiagnostic[] = [];
+    const expansionBudgetBytes = control.expansionBudgetBytes ?? 256 * 1024 * 1024;
+    let expandedSourceBytes = historySource.totalBytes;
 
     if (link === "expand_children" && depth < 1) {
         for (const [index, child] of built.childThreads.entries()) {
+            throwIfCancelled();
             if (index > 0 && index % CODEX_JSONL_ASYNC_YIELD_INTERVAL === 0) await eventLoopYield();
             const childThread = await getCodexThreadAsync(child.threadId);
             if (!childThread) {
@@ -3861,7 +3970,7 @@ export async function loadCodexConversationAsync(
                 });
                 continue;
             }
-            if (!childThread.rolloutPath || !await pathExistsAsync(childThread.rolloutPath)) {
+            if (!await existingCodexRolloutPathAsync(childThread.rolloutPath)) {
                 childDiagnostics.push({
                     threadId: child.threadId,
                     nickname: child.nickname,
@@ -3870,7 +3979,26 @@ export async function loadCodexConversationAsync(
                 });
                 continue;
             }
-            const childConv = await loadCodexConversationAsync(child.threadId, "summary", depth + 1);
+            if (expandedSourceBytes >= expansionBudgetBytes) {
+                childDiagnostics.push({ threadId: child.threadId, nickname: child.nickname, reason: "expansion_budget_exceeded", detail: "父子来源累计超过本次展开字节预算，请按子对话ID单独fetch" });
+                continue;
+            }
+            let childSource: CodexSourceVersionExpectation;
+            try {
+                const childHistory = await resolveCodexHistorySourceAsync(childThread.rolloutPath, { isCancelled: control.isCancelled,
+                    archive: { maxDecompressedBytes: Math.min(expansionBudgetBytes - expandedSourceBytes, getCodexHistoryArchiveLogicalLimit()) } });
+                childSource = codexSourceVersionFromHistory(childHistory);
+            } catch (error) {
+                if (!(error instanceof CodexHistoryArchiveLogicalLimitError)) throw error;
+                childDiagnostics.push({ threadId: child.threadId, nickname: child.nickname, reason: "expansion_budget_exceeded", detail: "子压缩来源超过剩余展开或解码上限，已停止物化并保留引用，请按子对话ID单独fetch" });
+                continue;
+            }
+            const childBytes = childSource.historySource?.totalBytes ?? childSource.sourceSize;
+            if (childBytes > expansionBudgetBytes - expandedSourceBytes) {
+                childDiagnostics.push({ threadId: child.threadId, nickname: child.nickname, reason: "expansion_budget_exceeded", detail: "子来源完整逻辑大小超过剩余展开预算，已保留引用，请按子对话ID单独fetch" });
+                continue;
+            }
+            const childConv = await loadCodexConversationAsync(child.threadId, "summary", depth + 1, { expectedSource: childSource, isCancelled: control.isCancelled });
             if (!childConv) {
                 childDiagnostics.push({
                     threadId: child.threadId,
@@ -3881,8 +4009,11 @@ export async function loadCodexConversationAsync(
                 continue;
             }
             expandedChildren.push({ thread: childThread, rounds: childConv.rounds });
+            expandedSourceBytes += childBytes;
         }
     }
+    throwIfCancelled();
+    await assertCodexSourceVersion(thread.rolloutPath, control.expectedSource, "after expanded read", control.isCancelled);
 
     return {
         thread,
@@ -3983,6 +4114,7 @@ export async function assertCodexSourceVersion(
     const { runSharedCodexSourceWork } = await import("./codex-source-work.js");
     await runSharedCodexSourceWork(`assert:${stage}:${canonicalCodexSourcePath(rolloutPath)}:${JSON.stringify(expected)}`, async sharedIsCancelled => {
         if (expected.historySource) await assertCodexHistorySourceAsync(expected.historySource, sharedIsCancelled);
+        rolloutPath = await resolveCodexHistoryFilePathAsync(rolloutPath);
         const stat = await fs.promises.stat(rolloutPath);
         const leaf = expected.historySource?.segments.at(-1);
         if (leaf?.archive) {
@@ -4012,10 +4144,10 @@ export async function captureCodexSourceVersionAsync(filePath: string, isCancell
     const sourcePath = normalizeCodexHistoryPath(filePath);
     const { runSharedCodexSourceWork } = await import("./codex-source-work.js");
     return runSharedCodexSourceWork(`capture:${canonicalCodexSourcePath(sourcePath)}`, async sharedIsCancelled => {
-        const stat = await fs.promises.stat(sourcePath);
-        if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
         const historySource = parseCodexRolloutFilename(sourcePath) ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled: sharedIsCancelled }) : undefined;
         if (historySource) return codexSourceVersionFromHistory(historySource);
+        const stat = await fs.promises.stat(sourcePath);
+        if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
         const sourceSize = stat.size;
         const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
         return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
@@ -4024,12 +4156,12 @@ export async function captureCodexSourceVersionAsync(filePath: string, isCancell
 
 export async function inspectCodexSourceVersionAsync(filePath: string, isCancelled?: () => boolean): Promise<CodexSourceVersionExpectation> {
     const sourcePath = normalizeCodexHistoryPath(filePath);
-    const stat = await fs.promises.stat(sourcePath);
-    if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
     const historySource = parseCodexRolloutFilename(sourcePath)
         ? await resolveCodexHistorySourceAsync(sourcePath, { isCancelled, metadataOnly: true })
         : undefined;
     if (historySource) return codexSourceVersionFromHistory(historySource);
+    const stat = await fs.promises.stat(sourcePath);
+    if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
     const sourceSize = stat.size;
     const anchor = await codexCheckpointAnchor(sourcePath, sourceSize);
     return { sourcePath, sourceSize, sourceMtimeMs: Math.trunc(stat.mtimeMs), ...anchor, historySource };
@@ -4037,10 +4169,10 @@ export async function inspectCodexSourceVersionAsync(filePath: string, isCancell
 
 export function captureCodexSourceVersion(filePath: string): CodexSourceVersionExpectation {
     const sourcePath = normalizeCodexHistoryPath(filePath);
-    const stat = fs.statSync(sourcePath);
-    if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
     const historySource = parseCodexRolloutFilename(sourcePath) ? resolveCodexHistorySource(sourcePath) : undefined;
     if (historySource) return codexSourceVersionFromHistory(historySource);
+    const stat = fs.statSync(sourcePath);
+    if (!stat.isFile()) throw new Error(`Codex source is not a file: ${sourcePath}`);
     const sourceSize = stat.size;
     const anchor = codexCheckpointAnchorSync(sourcePath, sourceSize);
     return {
@@ -4060,14 +4192,16 @@ export function assertCodexSourceVersionSync(
 ): void {
     if (!expected) return;
     if (expected.historySource) assertCodexHistorySource(expected.historySource);
-    const actualPath = canonicalCodexSourcePath(rolloutPath);
     const expectedPath = canonicalCodexSourcePath(expected.sourcePath);
     let stat: fs.Stats;
     try {
+        rolloutPath = resolveCodexHistoryFilePath(rolloutPath);
         stat = fs.statSync(rolloutPath);
-    } catch {
+    } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         throw new Error(`Codex source changed ${stage}; start a fresh fetch`);
     }
+    const actualPath = canonicalCodexSourcePath(rolloutPath);
     const leaf = expected.historySource?.segments.at(-1);
     if (leaf?.archive) {
         if (actualPath !== expectedPath || !stat.isFile() || stat.size !== leaf.archive.sourceSize
@@ -4325,7 +4459,7 @@ async function authorizeCodexEvidenceRolloutPath(
     }
     let realPath: string;
     try {
-        realPath = await fs.promises.realpath(resolvedPath);
+        realPath = await fs.promises.realpath(await resolveCodexHistoryFilePathAsync(resolvedPath));
     } catch (error) {
         return {
             rolloutPath: null,
@@ -4910,6 +5044,7 @@ async function readCodexEvidenceRollout(rolloutPath: string, roots?: string[]): 
     let revisionSequence: number | null = null;
     let before: fs.Stats | null = null;
     try {
+        rolloutPath = await resolveCodexHistoryFilePathAsync(rolloutPath);
         before = await fs.promises.stat(rolloutPath);
         byteLength = before.size;
         revisionSequence = Number.isFinite(before.mtimeMs) && before.mtimeMs >= 0
@@ -5013,6 +5148,7 @@ async function listCodexEvidenceRolloutPaths(
     issues: SourceEvidenceIssue[],
 ): Promise<string[]> {
     const files: string[] = [];
+    const seenRollouts = new Set<string>();
     const visit = async (directory: string): Promise<void> => {
         let entries: fs.Dirent[];
         try {
@@ -5026,7 +5162,11 @@ async function listCodexEvidenceRolloutPaths(
             if (entry.isDirectory()) {
                 await visit(targetPath);
             } else if (entry.isFile() && CODEX_ROLLOUT_ID_RE.test(entry.name)) {
-                files.push(targetPath);
+                const replicaKey = codexRolloutReplicaKey(targetPath);
+                if (!seenRollouts.has(replicaKey)) {
+                    seenRollouts.add(replicaKey);
+                    files.push(targetPath);
+                }
             }
         }
     };
@@ -5061,12 +5201,12 @@ async function scanCodexSourceEvidence(options: CodexSourceEvidenceOptions): Pro
     const database = await readCodexEvidenceDatabase(paths.stateDbPath, options.enumerationLimit);
     const issues = [...database.errors];
     const allowedRolloutRoots = await resolveCodexEvidenceRolloutRoots(paths.rolloutRoots, paths.rootsExplicit, issues);
-    const rolloutPaths = new Set<string>();
+    const rolloutPaths = new Map<string, string>();
     for (const root of allowedRolloutRoots) {
         for (const rolloutPath of await listCodexEvidenceRolloutPaths(root.configuredPath, issues)) {
             const authorizedPath = await authorizeCodexEvidenceRolloutPath(rolloutPath, allowedRolloutRoots);
             issues.push(...authorizedPath.errors);
-            if (authorizedPath.rolloutPath) rolloutPaths.add(authorizedPath.rolloutPath);
+            if (authorizedPath.rolloutPath) rolloutPaths.set(codexRolloutReplicaKey(authorizedPath.rolloutPath), authorizedPath.rolloutPath);
         }
     }
     const threads: CodexThreadInfo[] = [];
@@ -5075,10 +5215,10 @@ async function scanCodexSourceEvidence(options: CodexSourceEvidenceOptions): Pro
         issues.push(...authorizedThread.errors);
         if (authorizedThread.thread) {
             threads.push(authorizedThread.thread);
-            rolloutPaths.add(authorizedThread.thread.rolloutPath);
+            rolloutPaths.set(codexRolloutReplicaKey(authorizedThread.thread.rolloutPath), authorizedThread.thread.rolloutPath);
         }
     }
-    const sortedRolloutPaths = [...rolloutPaths].sort((left, right) => left.localeCompare(right, "en"));
+    const sortedRolloutPaths = [...rolloutPaths.values()].sort((left, right) => left.localeCompare(right, "en"));
     const requestedLimit = options.enumerationLimit && options.enumerationLimit > 0 ? Math.floor(options.enumerationLimit) : null;
     const rolloutLimitReached = requestedLimit !== null && sortedRolloutPaths.length > requestedLimit;
     if (database.limitReached || rolloutLimitReached) {

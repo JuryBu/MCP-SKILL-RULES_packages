@@ -226,6 +226,7 @@ interface ConversationLoadOptions {
     forceRawCacheRebuild?: boolean;
     isCancelled?: () => boolean;
     expectedCodexSource?: CodexSourceVersionExpectation;
+    codexExpansionBudgetBytes?: number;
     requireCompactionMetadata?: boolean;
     sourceReadBudget?: DevinReadOptions;
 }
@@ -1478,7 +1479,11 @@ async function loadRawConversationData(
         };
     }
 
-    const codexData = await loadCodexConversationAsync(effectiveId, options.link || "summary");
+    const codexData = await loadCodexConversationAsync(effectiveId, options.link || "summary", 0, {
+        expectedSource: options.expectedCodexSource,
+        isCancelled: options.isCancelled,
+        expansionBudgetBytes: options.codexExpansionBudgetBytes,
+    });
     if (!codexData) return null;
     const rounds = mergeConsecutiveHumanRounds(codexData.rounds);
     const normalizedCheckpoints = normalizeCodexCacheCheckpoints(codexData, rounds.map(codexCacheRoundMapping));

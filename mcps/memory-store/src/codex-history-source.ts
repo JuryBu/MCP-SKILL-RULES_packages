@@ -73,6 +73,54 @@ export function normalizeCodexHistoryPath(filePath: string): string {
     return path.resolve(nativePath);
 }
 
+function historyFileCandidates(filePath: string): string[] {
+    const normalized = normalizeCodexHistoryPath(filePath);
+    if (!parseCodexRolloutFilename(normalized)) return [normalized];
+    return [normalized, /\.zst$/i.test(normalized) ? normalized.slice(0, -4) : `${normalized}.zst`];
+}
+
+function existingHistoryFiles(filePath: string): string[] {
+    const candidates = historyFileCandidates(filePath);
+    const existing: string[] = [];
+    let missing: unknown;
+    for (const candidate of candidates) {
+        try {
+            if (!fs.statSync(candidate).isFile()) throw new Error(`Codex rollout source is not a file: ${candidate}`);
+            existing.push(candidate);
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            missing ??= error;
+        }
+    }
+    if (existing.length === 0) throw missing;
+    return existing;
+}
+
+async function existingHistoryFilesAsync(filePath: string): Promise<string[]> {
+    const candidates = historyFileCandidates(filePath);
+    const existing: string[] = [];
+    let missing: unknown;
+    for (const candidate of candidates) {
+        try {
+            if (!(await fsPromises.stat(candidate)).isFile()) throw new Error(`Codex rollout source is not a file: ${candidate}`);
+            existing.push(candidate);
+        } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            missing ??= error;
+        }
+    }
+    if (existing.length === 0) throw missing;
+    return existing;
+}
+
+export function resolveCodexHistoryFilePath(filePath: string): string {
+    return existingHistoryFiles(filePath)[0]!;
+}
+
+export async function resolveCodexHistoryFilePathAsync(filePath: string): Promise<string> {
+    return (await existingHistoryFilesAsync(filePath))[0]!;
+}
+
 interface HistoryBase {
     rolloutId: string;
     endOrdinalExclusive: number;
@@ -521,12 +569,12 @@ function sourceFromSegments(leafPath: string, segments: CodexHistorySegment[]): 
 
 export function resolveCodexHistorySource(rolloutPath: string, options: { roots?: string[]; endByte?: number; archive?: CodexHistoryArchiveOptions } = {}): CodexHistorySource {
     throwIfCodexReadCancelled(options.archive?.isCancelled);
-    const leafPath = normalizeCodexHistoryPath(rolloutPath);
+    const requestedPath = normalizeCodexHistoryPath(rolloutPath);
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
     const reverseSegments: CodexHistorySegment[] = [];
-    const counterpart = /\.zst$/i.test(leafPath) ? leafPath.slice(0, -4) : `${leafPath}.zst`;
-    let current = fs.existsSync(counterpart) ? selectRolloutSync([leafPath, counterpart], options.archive, leafPath) : loadSync(leafPath, options.archive);
+    let current = selectRolloutSync(existingHistoryFiles(requestedPath), options.archive, requestedPath);
+    const leafPath = current.path;
     let currentEndByte = options.endByte === undefined ? lastCompleteLineEndSync(current.readPath, current.size) : finiteInteger(options.endByte, "endByte");
     let currentEndOrdinal: number | undefined;
     while (true) {
@@ -549,13 +597,13 @@ export function resolveCodexHistorySource(rolloutPath: string, options: { roots?
 
 export async function resolveCodexHistorySourceAsync(rolloutPath: string, options: { roots?: string[]; endByte?: number; isCancelled?: () => boolean; metadataOnly?: boolean; archive?: CodexHistoryArchiveOptions } = {}): Promise<CodexHistorySource> {
     throwIfCodexReadCancelled(options.isCancelled ?? options.archive?.isCancelled);
-    const leafPath = normalizeCodexHistoryPath(rolloutPath);
+    const requestedPath = normalizeCodexHistoryPath(rolloutPath);
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
     const reverseSegments: CodexHistorySegment[] = [];
     const archiveOptions = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
-    const counterpart = /\.zst$/i.test(leafPath) ? leafPath.slice(0, -4) : `${leafPath}.zst`;
-    let current = fs.existsSync(counterpart) ? await selectRollout([leafPath, counterpart], archiveOptions, leafPath) : await load(leafPath, archiveOptions);
+    let current = await selectRollout(await existingHistoryFilesAsync(requestedPath), archiveOptions, requestedPath);
+    const leafPath = current.path;
     let currentEndByte = options.endByte === undefined ? await lastCompleteLineEnd(current.readPath, current.size) : finiteInteger(options.endByte, "endByte");
     let currentEndOrdinal: number | undefined;
     while (true) {

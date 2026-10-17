@@ -34,7 +34,9 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
     };
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
     if (payload.version === 1) await assertSourceCurrent("before cache build");
-    const linkResolution = resolveCodexFetchWorkerLink(payload.link);
+    const allowExpandedChildren = payload.version === 2 && payload.expansionLimitBytes !== undefined
+        && (expectedSource.historySource?.totalBytes ?? expectedSource.sourceSize) < payload.expansionLimitBytes;
+    const linkResolution = resolveCodexFetchWorkerLink(payload.link, allowExpandedChildren);
     await send({ type: "progress", stage: "cache", detail: "独立进程正在构建或复用 Codex fetch 缓存" });
     const cacheStartedAt = Date.now();
     const loaded = await loadConversationData("codex", payload.conversationId, {
@@ -46,6 +48,7 @@ async function execute(payload: CodexFetchWorkerPayload): Promise<CodexFetchWork
         requestClass: "background",
         isCancelled: () => cancellationRequested,
         expectedCodexSource: expectedSource,
+        codexExpansionBudgetBytes: payload.expansionLimitBytes,
     });
     if (cancellationRequested) throw new Error("conversation fetch worker cancelled");
     await assertSourceCurrent("after cache build");

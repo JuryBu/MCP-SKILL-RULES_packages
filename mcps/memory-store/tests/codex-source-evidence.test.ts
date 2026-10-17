@@ -111,7 +111,7 @@ function createFixture(
     threads: Array<Omit<FixtureThread, "rolloutPath"> & { id: string }>,
     edges: Array<{ child: string; parent: string }> = [],
 ): CodexFixture {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-codex-evidence-"));
+    const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-codex-evidence-")));
     const sessionsRoot = path.join(root, "sessions");
     const stateDbPath = path.join(root, "state_5.sqlite");
     fs.mkdirSync(sessionsRoot, { recursive: true });

@@ -91,12 +91,30 @@ interface Frame {
     skippable?: boolean;
 }
 
+export class CodexHistoryArchiveLogicalLimitError extends CodexHistorySourceMismatchError {}
+
 function fail(message: string): never {
+    if (message === "exceeds the decompressed size limit") throw new CodexHistoryArchiveLogicalLimitError(`Codex history archive ${message}`);
     throw new CodexHistorySourceMismatchError(`Codex history archive ${message}`);
 }
 
+export function getCodexHistoryArchiveLogicalLimit(): number {
+    return limitsFor({}).logical;
+}
+
 function limitsFor(options: CodexHistoryArchiveOptions): Limits {
-    const values = { compressed: options.maxCompressedBytes ?? 256 * 1024 * 1024, logical: options.maxDecompressedBytes ?? 512 * 1024 * 1024, window: options.maxWindowBytes ?? 128 * 1024 * 1024, reserve: options.minFreeBytes ?? 64 * 1024 * 1024 };
+    const configured = (name: string, fallback: number): number => {
+        const raw = process.env[name];
+        if (raw === undefined) return fallback;
+        if (!/^\d+$/u.test(raw)) fail(`has invalid ${name} configuration`);
+        return Number(raw);
+    };
+    const values = {
+        compressed: options.maxCompressedBytes ?? configured("MEMORY_STORE_CODEX_HISTORY_MAX_COMPRESSED_BYTES", 2 * 1024 * 1024 * 1024),
+        logical: options.maxDecompressedBytes ?? configured("MEMORY_STORE_CODEX_HISTORY_MAX_DECOMPRESSED_BYTES", 4 * 1024 * 1024 * 1024),
+        window: options.maxWindowBytes ?? configured("MEMORY_STORE_CODEX_HISTORY_MAX_WINDOW_BYTES", 128 * 1024 * 1024),
+        reserve: options.minFreeBytes ?? configured("MEMORY_STORE_CODEX_HISTORY_MIN_FREE_BYTES", 64 * 1024 * 1024),
+    };
     for (const [name, value] of Object.entries(values)) if (!Number.isSafeInteger(value) || value < (name === "reserve" ? 0 : 1)) fail(`has invalid ${name} limit`);
     if (!Number.isSafeInteger(values.logical + values.reserve)) fail("has an unsafe disk-space reservation");
     return values;

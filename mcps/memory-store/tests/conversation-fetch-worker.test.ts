@@ -107,6 +107,9 @@ const payload = createCodexFetchWorkerPayload({
 
 try {
     writeFixture();
+    const expandedResolution = resolveCodexFetchWorkerLink("expand_children", true);
+    assert.equal(expandedResolution.effectiveLink, "expand_children");
+    assert.deepEqual(createCodexFetchWorkerLinkDiagnostics(expandedResolution, []), []);
     assert.equal(isCodexFetchWorkerPayload(payload), true);
     assert.equal(isCodexFetchWorkerPayload({ ...payload, modelChain: "windsurf" }), false);
     assert.equal(payload.forceRawCacheRebuild, undefined);

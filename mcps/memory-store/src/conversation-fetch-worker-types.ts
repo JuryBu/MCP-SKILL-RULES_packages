@@ -6,6 +6,7 @@ import type { CodexHistorySource } from "./codex-history-source.js";
 export interface CodexFetchWorkerPayload {
     version: 1 | 2;
     verificationDeferred?: boolean;
+    expansionLimitBytes?: number;
     forceRawCacheRebuild?: boolean;
     conversationId: string;
     link: "reference" | "summary" | "expand_children";
@@ -29,7 +30,7 @@ export interface CodexFetchWorkerThreadSummary {
     agentNickname?: string;
 }
 
-export type CodexFetchWorkerLoadLink = Exclude<CodexFetchWorkerPayload["link"], "expand_children">;
+export type CodexFetchWorkerLoadLink = CodexFetchWorkerPayload["link"];
 
 export interface CodexFetchWorkerLinkResolution {
     requestedLink: CodexFetchWorkerPayload["link"];
@@ -43,10 +44,10 @@ export interface CodexFetchWorkerLinkDiagnostic {
     nickname?: string;
 }
 
-export function resolveCodexFetchWorkerLink(link: CodexFetchWorkerPayload["link"]): CodexFetchWorkerLinkResolution {
+export function resolveCodexFetchWorkerLink(link: CodexFetchWorkerPayload["link"], allowExpandedChildren = false): CodexFetchWorkerLinkResolution {
     return {
         requestedLink: link,
-        effectiveLink: link === "expand_children" ? "reference" : link,
+        effectiveLink: link === "expand_children" && !allowExpandedChildren ? "reference" : link,
     };
 }
 
@@ -54,7 +55,7 @@ export function createCodexFetchWorkerLinkDiagnostics(
     resolution: CodexFetchWorkerLinkResolution,
     childThreads: Array<{ threadId: string; nickname?: string }>,
 ): CodexFetchWorkerLinkDiagnostic[] {
-    if (resolution.requestedLink !== "expand_children") return [];
+    if (resolution.requestedLink !== "expand_children" || resolution.effectiveLink === "expand_children") return [];
     return [
         {
             code: "expand_children_downgraded_to_reference",
@@ -118,6 +119,7 @@ export function isCodexFetchWorkerPayload(value: unknown): value is CodexFetchWo
         && (payload.link === "reference" || payload.link === "summary" || payload.link === "expand_children")
         && (payload.source === "auto" || payload.source === "local" || payload.source === "cache")
         && (payload.forceRawCacheRebuild === undefined || typeof payload.forceRawCacheRebuild === "boolean")
+        && (payload.expansionLimitBytes === undefined || (Number.isSafeInteger(payload.expansionLimitBytes) && payload.expansionLimitBytes >= 0))
         && !(payload.forceRawCacheRebuild === true && payload.source === "cache")
         && typeof payload.sourcePath === "string"
         && payload.sourcePath.length > 0
