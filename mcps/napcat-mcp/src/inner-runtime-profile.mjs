@@ -45,7 +45,7 @@ function boundedJson(filePath, expectedSha256, maximum = 65536) {
   if (bytes.length > maximum) fail("INNER_PROFILE_FILE_TOO_LARGE");
   if (expectedSha256 !== undefined && (!/^[0-9a-f]{64}$/u.test(expectedSha256)
     || digest(bytes) !== expectedSha256)) fail("INNER_PROFILE_SHA256_MISMATCH");
-  try { return JSON.parse(bytes.toString("utf8")); }
+  try { return JSON.parse(bytes.toString("utf8").replace(/^\uFEFF/u, "")); }
   catch { fail("INNER_PROFILE_INVALID_JSON"); }
 }
 

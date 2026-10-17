@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { WebSocket } from "ws";
 import { parseArguments, runManagedInnerProfile } from "../src/codex-app-server-proxy-runner.mjs";
 import { createManagedInnerProxySession, validateManagedSessionConfiguration } from "../src/inner-managed-session.mjs";
-import { validateInnerRuntimeProfile, readInnerRuntimeProfile } from "../src/inner-runtime-profile.mjs";
+import { validateInnerRuntimeProfile, readInnerRuntimeProfile, INNER_RUNTIME_STATE_MAX_BYTES } from "../src/inner-runtime-profile.mjs";
 import { isolatedHandoffConfiguration } from "../src/inner-runner-handoff-control.mjs";
 
 export const digest = value => crypto.createHash("sha256").update(value).digest("hex");
@@ -337,6 +337,67 @@ test("profile CLI SHA pair and exact original bytes fail closed on tamper", asyn
   assert.equal(fs.existsSync(value.profile.managedStatePath), false);
   assert.equal(fs.existsSync(value.options.lockPath), false);
   await assert.rejects(runManagedInnerProfile(options, [...argv, "--control-port", String(options.controlPort)]), /DUPLICATE_ARGUMENTS/);
+});
+
+test("profile JSON accepts only a leading UTF-8 BOM and hashes original bytes", async () => {
+  const value = await fixture();
+  try {
+    const original = fs.readFileSync(value.profilePath);
+    const bom = Buffer.from([239, 187, 191]);
+    for (const bytes of [original, Buffer.concat([bom, original])]) {
+      fs.writeFileSync(value.profilePath, bytes);
+      assert.equal(readInnerRuntimeProfile(value.profilePath, { options: { ...value.options,
+        innerManagedProfileSha256: digest(bytes) } }).mode, "production");
+    }
+    assert.throws(() => readInnerRuntimeProfile(value.profilePath, { options: { ...value.options,
+      innerManagedProfileSha256: digest(original) } }), /SHA256_MISMATCH/u);
+    for (const bytes of [Buffer.concat([bom, bom, original]), Buffer.concat([Buffer.from(" "), bom, original]),
+      Buffer.concat([original, bom]), Buffer.concat([bom, Buffer.from("{broken")])]) {
+      fs.writeFileSync(value.profilePath, bytes);
+      assert.throws(() => readInnerRuntimeProfile(value.profilePath), /INVALID_JSON/u);
+    }
+    fs.writeFileSync(value.profilePath, Buffer.concat([original, Buffer.alloc(65537, 32)]));
+    assert.throws(() => readInnerRuntimeProfile(value.profilePath), /FILE_TOO_LARGE/u);
+  } finally {
+    assert.ok(path.resolve(value.root).startsWith(path.resolve(os.tmpdir()) + path.sep));
+    fs.rmSync(value.root, { recursive: true, force: true });
+  }
+});
+
+test("previous runtime JSON retains BOM and non-BOM history above 74KB within the state limit", async () => {
+  const value = await fixture();
+  try {
+    const outer = { state: "stopped", appServerPid: null, retainedHistory: "before\uFEFFafter" + "x".repeat(74000) };
+    const managed = { ownerId: value.profile.ownerId, nativeSourceId: value.profile.nativeSourceId,
+      state: "closed", instanceToken: crypto.randomUUID(), retainedHistory: outer.retainedHistory };
+    const records = [[value.options.runtimeStatePath, outer], [value.profile.managedStatePath, managed]];
+    for (const prefix of [Buffer.alloc(0), Buffer.from([239, 187, 191])]) {
+      for (const [target, record] of records) {
+        const bytes = Buffer.concat([prefix, Buffer.from(JSON.stringify(record))]);
+        assert.ok(bytes.length >= 74000);
+        fs.writeFileSync(target, bytes);
+      }
+      assert.equal(readInnerRuntimeProfile(value.profilePath, { options: value.options }).mode, "production");
+      for (const [target, record] of records) {
+        const bytes = fs.readFileSync(target);
+        assert.equal(JSON.parse(bytes.toString("utf8").replace(/^\uFEFF/u, "")).retainedHistory, record.retainedHistory);
+      }
+    }
+    for (const [target, record] of records) fs.writeFileSync(target, JSON.stringify(record));
+    for (const [target, record] of records) {
+      const bytes = Buffer.from(JSON.stringify(record));
+      fs.writeFileSync(target, Buffer.concat([Buffer.from([239, 187, 191, 239, 187, 191]), bytes]));
+      assert.throws(() => readInnerRuntimeProfile(value.profilePath, { options: value.options }), /INVALID_JSON/u);
+      fs.writeFileSync(target, Buffer.concat([bytes, Buffer.alloc(INNER_RUNTIME_STATE_MAX_BYTES - bytes.length, 32)]));
+      assert.equal(readInnerRuntimeProfile(value.profilePath, { options: value.options }).mode, "production");
+      fs.appendFileSync(target, " ");
+      assert.throws(() => readInnerRuntimeProfile(value.profilePath, { options: value.options }), /FILE_TOO_LARGE/u);
+      fs.writeFileSync(target, bytes);
+    }
+  } finally {
+    assert.ok(path.resolve(value.root).startsWith(path.resolve(os.tmpdir()) + path.sep));
+    fs.rmSync(value.root, { recursive: true, force: true });
+  }
 });
 
 test("default isolated Temp validation retains its limits without production fields", async () => {

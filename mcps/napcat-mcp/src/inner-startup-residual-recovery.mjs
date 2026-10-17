@@ -47,6 +47,32 @@ function settledActivation(coordinator, interrupted = false) {
       coordinator.workers?.some(worker => worker.workerId === workerId));
 }
 
+function settledControlOperations(managed, preserveHistory) {
+  const operations = managed.controlOperations;
+  if (!Array.isArray(operations) || operations.length > 128) return false;
+  if (!preserveHistory) return operations.length === 0;
+  if (!operations.length) return true;
+  if (!Number.isSafeInteger(managed.controlRevision) || managed.controlRevision < 1) return false;
+  const requestIds = new Set();
+  let previousRevision = 0;
+  return operations.every(operation => {
+    if (!operation || typeof operation !== "object" || Array.isArray(operation)
+      || Object.keys(operation).sort().join(",") !== "actualMs,method,requestId,requestSha256,result,revision,state"
+      || operation.state !== "completed"
+      || !["prepare", "migrate", "activate", "rollback", "reconcile-terminal"].includes(operation.method)
+      || typeof operation.requestId !== "string" || !/^[a-zA-Z0-9_.:-]{1,128}$/u.test(operation.requestId)
+      || requestIds.has(operation.requestId)
+      || typeof operation.requestSha256 !== "string" || !/^[a-f0-9]{64}$/u.test(operation.requestSha256)
+      || !Number.isSafeInteger(operation.revision) || operation.revision <= previousRevision
+      || operation.revision > managed.controlRevision
+      || !Number.isSafeInteger(operation.actualMs) || operation.actualMs < 0
+      || !operation.result || typeof operation.result !== "object" || Array.isArray(operation.result)) return false;
+    requestIds.add(operation.requestId);
+    previousRevision = operation.revision;
+    return true;
+  });
+}
+
 function record(filePath, maximum = 1048576) {
   const target = checkedRuntimePath(filePath, { existing: true });
   const stat = fs.statSync(target);
@@ -161,7 +187,7 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
   if (!(preserveHistory ? ["running", "restarting", "degraded", "stopped", "waiting_for_desktop"] : ["running", "stopped"]).includes(outer.state)
     || (outer.state === "waiting_for_desktop" && (outer.waitingForDesktop !== true || outer.appServerPid !== null))
     || !(preserveHistory ? ["running", "closed"] : ["running"]).includes(managed.state) || (!preserveHistory && managed.healthy !== true)
-    || managed.controlBusy !== false || !Array.isArray(managed.controlOperations) || managed.controlOperations.length
+    || managed.controlBusy !== false || !settledControlOperations(managed, preserveHistory)
     || !managed.nativeSource || !Number.isSafeInteger(managed.nativeSource.delivered) || managed.nativeSource.delivered < 0
     || (!preserveHistory && (managed.nativeSource.healthy !== true || managed.nativeSource.delivered !== 0))
     || managed.coordinator?.transactionActive !== false || managed.coordinator.workerMaintenance !== false

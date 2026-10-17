@@ -32,10 +32,18 @@ test("dead interrupted snapshots retain clients, deferred threads and UNKNOWN hi
     managed.coordinator.activeHttp = 0;
     managed.coordinator.pendingControl = 0;
     const activationId = crypto.randomUUID();
-    managed.coordinator.threads = Array.from({ length: 256 }, (_, index) => ({ threadId: `thread-${index}`, phase: index > 253 ? "active" : "terminal",
+    managed.coordinator.threads = Array.from({ length: 256 }, (_, index) => ({ threadId: crypto.randomUUID(), turnId: crypto.randomUUID(),
+      phase: index >= 253 ? "active" : "terminal",
       workerId: index < 35 ? first.workerId : workerId, activeHttp: 0, pendingActivationId: index < 35 ? activationId : null, activationError: null }));
     managed.coordinator.activation = { activationId, active: true, sourceWorkerId: first.workerId, targetWorkerId: workerId,
       deferredThreadIds: managed.coordinator.threads.slice(0, 35).map(thread => thread.threadId) };
+    managed.controlRevision = 19;
+    managed.controlOperations = managed.coordinator.threads.slice(0, 19).map((thread, index) => ({
+      requestId: crypto.randomUUID(), method: "reconcile-terminal", revision: index + 1, state: "completed",
+      requestSha256: crypto.createHash("sha256").update(`request-${index}`).digest("hex"), actualMs: index + 1,
+      result: { threadId: thread.threadId, turnId: thread.turnId, phase: "terminal",
+        evidenceSha256: crypto.createHash("sha256").update(`evidence-${index}`).digest("hex") },
+    }));
     outer.proxy.clients = [{ id: "retained-desktop", connectedAt: outer.startedAt }];
     outer.proxy.clientCount = 1;
     outer.proxy.journal.unknownWakeCount = 2;
@@ -44,12 +52,65 @@ test("dead interrupted snapshots retain clients, deferred threads and UNKNOWN hi
       "unknown-a": { state: "unknown" }, "unknown-b": { state: "unknown" }
     } }));
     fs.writeFileSync(profile.outerPaths.runtimeStatePath, JSON.stringify(outer));
-    const writeManaged = value => fs.writeFileSync(profile.managedStatePath, JSON.stringify(value));
+    const writeManaged = value => fs.writeFileSync(profile.managedStatePath, JSON.stringify(value, null, 2));
     writeManaged(managed);
+    assert.ok(fs.statSync(profile.managedStatePath).size >= 74000);
+    assert.equal(managed.coordinator.threads.filter(thread => thread.phase === "terminal").length, 253);
+    assert.equal(managed.coordinator.threads.filter(thread => thread.phase === "active").length, 3);
     assert.throws(() => planInnerStartupRecovery({ ...input, allowInterruptedSnapshot: false }, emptyHost), /IDLE_PROOF_REQUIRED/u);
     const plan = planInnerStartupRecovery(input, emptyHost);
     assert.equal(plan.preservedHistory.threadCount, 256);
     assert.equal(plan.preservedHistory.journalReplayed, false);
+    assert.equal(plan.preservedHistory.unknownWakeCount, 2);
+    const powershell = path.join(process.env.SystemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+    const entry = fileURLToPath(new URL("../ops/start-codex-app-server-proxy.ps1", import.meta.url));
+    const officialPlan = spawnSync(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-File", entry,
+      "-DataRoot", input.dataRoot, "-DownstreamPort", String(input.ports.downstream),
+      "-ControlPort", String(input.ports.control), "-UpstreamPort", String(input.ports.upstream),
+      "-ProbePort", String(input.ports.probe), "-StartupRecoveryMode", "Plan"],
+    { encoding: "utf8", windowsHide: true, timeout: 30000, env: { ...process.env, CODEX_TOOLKIT_NODE_EXE: process.execPath } });
+    assert.equal(officialPlan.status, 0, officialPlan.stderr);
+    assert.equal(JSON.parse(officialPlan.stdout).recoverable, true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(profile.managedStatePath)), managed);
+    for (const change of [
+      value => { value.controlOperations = null; },
+      value => { value.controlOperations[0] = null; },
+      ...["pending", "unknown", "failed"].map(state => value => { value.controlOperations[0].state = state; }),
+      ...[true, false].map(pending => value => { value.controlOperations[0].publicationPending = pending; }),
+      value => { delete value.controlOperations[0].result; },
+      ...[null, [], "invalid"].map(result => value => { value.controlOperations[0].result = result; }),
+      value => { value.controlOperations[0].error = { code: "UNRESOLVED" }; },
+      value => { value.controlOperations[0].unexpected = true; },
+      value => { value.controlOperations[0].method = "unsupported"; },
+      value => { value.controlOperations[0].requestId = "invalid request"; },
+      value => { value.controlOperations[1].requestId = value.controlOperations[0].requestId; },
+      value => { value.controlOperations[0].requestSha256 = "invalid"; },
+      value => { value.controlOperations[0].actualMs = -1; },
+      value => { value.controlOperations[0].actualMs = null; },
+      value => { value.controlOperations[1].revision = value.controlOperations[0].revision; },
+      value => { value.controlOperations.reverse(); },
+      value => { value.controlOperations[18].revision = 20; },
+      value => { value.controlRevision = null; },
+      value => { value.controlOperations = Array.from({ length: 129 }, () => value.controlOperations[0]); },
+    ]) {
+      const altered = structuredClone(managed);
+      change(altered);
+      writeManaged(altered);
+      assert.throws(() => planInnerStartupRecovery(input, emptyHost), /STARTUP_RECOVERY_IDLE_PROOF_REQUIRED/u);
+    }
+    const strictManaged = { ...managed, nativeSource: { ...managed.nativeSource, delivered: 0 },
+      coordinator: { ...managed.coordinator, threads: [], activation: null } };
+    fs.writeFileSync(profile.managedStatePath, JSON.stringify(strictManaged));
+    fs.writeFileSync(profile.outerPaths.runtimeStatePath, JSON.stringify({ ...outer, state: "running", proxy: { ...outer.proxy,
+      clients: [], clientCount: 0, journal: { ...outer.proxy.journal, wakeCount: 0, unknownWakeCount: 0 } } }));
+    fs.writeFileSync(profile.outerPaths.journalPath, JSON.stringify({ schemaVersion: 2, wakes: {} }));
+    assert.throws(() => planInnerStartupRecovery({ ...input, historyPolicy: undefined, allowInterruptedSnapshot: false }, emptyHost),
+      /STARTUP_RECOVERY_IDLE_PROOF_REQUIRED/u);
+    fs.writeFileSync(profile.outerPaths.runtimeStatePath, JSON.stringify(outer));
+    fs.writeFileSync(profile.outerPaths.journalPath, JSON.stringify({ schemaVersion: 2, wakes: {
+      "unknown-a": { state: "unknown" }, "unknown-b": { state: "unknown" },
+    } }));
+    writeManaged(managed);
     for (const change of [
       value => { value.controlBusy = true; },
       value => { value.controlOperations = [{ state: "unknown" }]; },
@@ -91,10 +152,18 @@ test("dead interrupted snapshots retain clients, deferred threads and UNKNOWN hi
     assert.ok(fs.existsSync(profile.outerPaths.lockPath));
     const result = applyInnerStartupRecovery(input, planInnerStartupRecovery(input, emptyHost), emptyHost);
     assert.equal(result.recovered, true);
-    assert.deepEqual(JSON.parse(fs.readFileSync(profile.managedStatePath)).coordinator, managed.coordinator);
+    const recovered = JSON.parse(fs.readFileSync(profile.managedStatePath));
+    assert.deepEqual(recovered.coordinator, managed.coordinator);
+    assert.deepEqual(recovered.controlOperations, managed.controlOperations);
+    assert.equal(recovered.controlRevision, 19);
+    const manifest = JSON.parse(fs.readFileSync(path.join(result.evidenceRoot, "manifest.json")));
+    const backup = manifest.originals.find(original => original.path === profile.managedStatePath);
+    assert.deepEqual(JSON.parse(fs.readFileSync(backup.backupPath)), managed);
     assert.deepEqual(JSON.parse(fs.readFileSync(profile.outerPaths.runtimeStatePath)).proxy, outer.proxy);
     assert.deepEqual(fs.readFileSync(profile.outerPaths.journalPath), journalBefore);
     assert.equal(fs.existsSync(profile.outerPaths.lockPath), false);
+    console.log(JSON.stringify({ completedReceipts: recovered.controlOperations.length, terminalThreads: 253, activeThreads: 3,
+      unknownWakeCount: plan.preservedHistory.unknownWakeCount, managedSnapshotBytes: backup.bytes, journalReplayed: false }));
   } finally {
     assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
     fs.rmSync(root, { recursive: true, force: true });
