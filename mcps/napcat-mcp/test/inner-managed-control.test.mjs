@@ -13,6 +13,73 @@ import { createCodexAppServerProxy } from "../src/codex-app-server-proxy.mjs";
 
 const sleep = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
+test("lost completion is recovered from authoritative metadata before the next desktop turn", { timeout: 20000 }, async () => {
+  const value = await fixture();
+  const control = await startNormalEntry(value);
+  let client;
+  let sequence = 0;
+  const messages = [];
+  async function connect() {
+    client = new WebSocket(`ws://127.0.0.1:${control.options.downstreamPort}`);
+    await once(client, "open");
+    client.on("message", bytes => messages.push(JSON.parse(bytes.toString())));
+    await rpc("initialize", { clientInfo: { name: "lost-completion-test", version: "1" } });
+  }
+  async function rpc(method, params) {
+    const id = ++sequence;
+    client.send(JSON.stringify({ id, method, params }));
+    const deadline = Date.now() + 4000;
+    while (!messages.some(message => message.id === id) && Date.now() < deadline) await sleep(10);
+    const response = messages.find(message => message.id === id);
+    assert.ok(response, `${method} response`);
+    return response;
+  }
+  const threadId = "lost-completion-thread";
+  try {
+    await connect();
+    await rpc("turn/start", { threadId, input: [], fixtureTurnId: "first", fixtureHoldTurn: true });
+    await sleep(80);
+    const followUp = await rpc("turn/start", { threadId, input: [], fixtureFollowUp: true });
+    assert.equal(followUp.error, undefined);
+    assert.equal(followUp.result.followUpAccepted, true);
+    assert.equal(followUp.result.turn.id, "first");
+    assert.equal((await control.get()).body.coordinator.threads.find(thread => thread.threadId === threadId).turnId, "first");
+    await rpc("test/complete-silent", { threadId, turnId: "first" });
+    client.close();
+    await once(client, "close");
+    await connect();
+    const recovered = await rpc("turn/start", { threadId, input: [], fixtureTurnId: "second" });
+    assert.equal(recovered.error, undefined);
+    assert.equal(recovered.result.turn.id, "second");
+    const deadline = Date.now() + 3000;
+    let state;
+    do {
+      state = (await control.get()).body.coordinator;
+      if (state.threads.find(thread => thread.threadId === threadId)?.phase === "terminal") break;
+      await sleep(20);
+    } while (Date.now() < deadline);
+    const target = state.threads.find(thread => thread.threadId === threadId);
+    assert.equal(target.turnId, "second");
+    assert.equal(target.phase, "terminal");
+    assert.equal(state.nativeHealthy, true);
+    assert.equal((await rpc("test/tool", { value: "connection-survived" })).result.value, "connection-survived");
+    await rpc("turn/start", { threadId, input: [], fixtureTurnId: "third", fixtureHoldTurn: true });
+    await sleep(80);
+    await rpc("test/complete-silent", { threadId, turnId: "third" });
+    client.send(JSON.stringify({ method: "test/disconnect" }));
+    await once(client, "close");
+    await connect();
+    const afterGap = await rpc("turn/start", { threadId, input: [], fixtureTurnId: "fourth" });
+    assert.equal(afterGap.error, undefined);
+    assert.equal(afterGap.result.turn.id, "fourth");
+    assert.equal((await control.get()).body.coordinator.nativeHealthy, true);
+  } finally {
+    client?.terminate();
+    fs.writeFileSync(control.options.stopFilePath, "lost-completion-test-cleanup");
+    await control.task;
+  }
+});
+
 function buildOwnedCandidate(value, delayFirstReply = false, originalBytes = false) {
   const root = path.join(value.root, originalBytes ? "approved-original" : "approved-candidate");
   const target = path.join(root, "src");
@@ -168,6 +235,45 @@ test("normal managed HTTP prepare native turn migrate tool continuation restore 
   } finally {
     client?.terminate();
     if (!fs.existsSync(control.options.stopFilePath)) fs.writeFileSync(control.options.stopFilePath, "owned-http-test-cleanup");
+    await control.task;
+  }
+});
+
+test("managed HTTP reconciles only an exact idle turn and then accepts a new native turn", { timeout: 20000 }, async () => {
+  const value = await fixture();
+  const control = await startNormalEntry(value);
+  let client;
+  try {
+    client = new WebSocket(`ws://127.0.0.1:${control.options.downstreamPort}`);
+    await once(client, "open");
+    client.send(JSON.stringify({ id: 71, method: "initialize", params: { clientInfo: { name: "recovery-test", version: "1" } } }));
+    await sleep(50);
+    client.send(JSON.stringify({ id: 72, method: "turn/start", params: {
+      threadId: "recovery-thread", fixtureTurnId: "recovery-old", fixtureHoldTurn: true, input: [],
+    } }));
+    const deadline = Date.now() + 3000;
+    while (!(await control.get()).body.coordinator.threads.some(thread => thread.phase === "active") && Date.now() < deadline) await sleep(25);
+    const current = (await control.get()).body;
+    const fields = { threadId: "recovery-thread", turnId: "recovery-old", status: "completed", evidenceSha256: "a".repeat(64) };
+    for (const invalid of [{ turnId: "wrong-turn" }, { threadId: "wrong-thread" }, { status: "active" }, { evidenceSha256: "bad" }]) {
+      assert.equal((await control.post("reconcile-terminal", command(control, current, { ...fields, ...invalid }))).httpStatus, 409);
+    }
+    const input = command(control, current, fields);
+    const recovered = await control.post("reconcile-terminal", input);
+    assert.equal(recovered.httpStatus, 200, JSON.stringify(recovered));
+    assert.equal(recovered.body.result.phase, "terminal");
+    assert.equal((await control.post("reconcile-terminal", input)).httpStatus, 409);
+    client.send(JSON.stringify({ id: 73, method: "turn/start", params: {
+      threadId: "recovery-thread", fixtureTurnId: "recovery-new", fixtureHoldTurn: true, input: [],
+    } }));
+    const nextDeadline = Date.now() + 3000;
+    while (!(await control.get()).body.coordinator.threads.some(thread => thread.turnId === "recovery-new") && Date.now() < nextDeadline) await sleep(25);
+    const after = (await control.get()).body;
+    assert.equal(after.coordinator.threads.find(thread => thread.threadId === "recovery-thread")?.turnId, "recovery-new");
+    assert.equal(after.coordinator.nativeHealthy, true);
+  } finally {
+    client?.terminate();
+    fs.writeFileSync(control.options.stopFilePath, "owned-recovery-test-stop");
     await control.task;
   }
 });

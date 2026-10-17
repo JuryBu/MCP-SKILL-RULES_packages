@@ -28,6 +28,27 @@ const MAX_RPC_ENVELOPE_DEPTH = 128;
 const MAX_RPC_ENVELOPE_FIELDS = 128;
 const MAX_RPC_ENVELOPE_VALUE_BYTES = 64 * 1024;
 
+export const DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024;
+export const DESKTOP_RESPONSE_BUDGET_ERROR_CODE = -32010;
+const HISTORY_METHODS = new Set(["thread/read", "thread/resume", "thread/turns/list", "thread/items/list"]);
+
+export function createDesktopResponseBudgetError({ requestId, method, responseBytes,
+  limit = DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES } = {}) {
+  const validRequestId = typeof requestId === "string" || (typeof requestId === "number" && Number.isFinite(requestId));
+  if (!validRequestId || !HISTORY_METHODS.has(method)) return null;
+  if (!Number.isSafeInteger(limit) || limit < 1) throw new RangeError("Desktop response limit must be a positive safe integer");
+  if (!Number.isSafeInteger(responseBytes) || responseBytes < 0 || responseBytes <= limit) return null;
+  return { id: requestId, error: { code: DESKTOP_RESPONSE_BUDGET_ERROR_CODE,
+    message: "历史响应超过 Desktop 安全预算，请分页读取",
+    data: { reason: "DESKTOP_RESPONSE_BUDGET_EXCEEDED", method, bytes: responseBytes, limit,
+      retrySameRequest: false, upstreamStateMayHaveChanged: method === "thread/resume",
+      pagination: { summaryMethod: "thread/read", includeTurns: false, turnsMethod: "thread/turns/list",
+        itemsMethod: "thread/items/list", itemsView: "notLoaded", useCursor: true },
+      hint: method === "thread/resume"
+        ? "恢复请求可能已完成，请先核对线程状态，再用原 threadId 和 nextCursor 分页读取历史"
+        : "使用原 threadId，先读取摘要，再用 nextCursor 分页读取回合与条目" } } };
+}
+
 function isObject(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -622,6 +643,8 @@ export class CodexAppServerProxy {
       1024,
       this.maxWebSocketPayloadBytes,
     );
+    this.maxDesktopResponseBytes = boundedInteger(options.maxDesktopResponseBytes,
+      DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES, 1024, DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES);
     this.heartbeatIntervalMs = boundedInteger(
       options.heartbeatIntervalMs,
       DEFAULT_HEARTBEAT_INTERVAL_MS,
@@ -987,7 +1010,9 @@ export class CodexAppServerProxy {
         this._liveCloseClient(client, "desktop_request_tracking_conflict");
         return;
       }
-      client.desktopRequestIds.set(message.id, { bytes: requestIdBytes, upstreamId: message.id });
+      client.desktopRequestIds.set(message.id, { bytes: requestIdBytes, upstreamId: message.id,
+        method: message.method.slice(0, 128), threadId: message.params?.threadId?.slice?.(0, 512),
+        includeTurns: message.params?.includeTurns === true });
       client.desktopRequestBytes += requestIdBytes;
       if (this._liveIsInternalRequestId(message.id)) {
         const forwardedId = this._liveAllocateRequestId(client);
@@ -999,20 +1024,21 @@ export class CodexAppServerProxy {
       }
     }
     const payloadBytes = payload === data ? originalByteLength : messageByteLength(payload);
-    if (client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
-      if (this._liveSendOrClose(client, client.upstream, payload, isBinary, "downstream_to_upstream")) {
-        client.turnObserver.markForwarded(message);
-      }
+    const observation = { id: message.id, method: message.method, threadId: message.params?.threadId };
+    if ((!client.turnPreflightPending || isRpcResponse(message) || message.method === "initialized")
+      && client.upstreamReady && client.upstream?.readyState === this.WebSocketImpl.OPEN) {
+      this._liveForwardDesktopMessage(client, client.upstream, { data: payload, isBinary, bytes: payloadBytes, observation });
       return;
     }
-    if (client.queued.length >= this.maxQueuedMessages || client.queuedBytes + payloadBytes > this.maxQueuedBytes) {
+    if (client.queued.length >= this.maxQueuedMessages
+      || client.queuedBytes + (client.turnPreflightBytes ?? 0) + payloadBytes > this.maxQueuedBytes) {
       this._liveCloseClient(client, "downstream_queue_overflow", new CodexAppServerProxyError(
         "DOWNSTREAM_QUEUE_OVERFLOW",
         `App Server 启动期间累计消息超过安全上限，已关闭当前连接以避免无界占用`,
       ));
       return;
     }
-    client.queued.push({ data: payload, isBinary, bytes: payloadBytes, observation: { id: message.id, method: message.method } });
+    client.queued.push({ data: payload, isBinary, bytes: payloadBytes, observation });
     client.queuedBytes += payloadBytes;
   }
 
@@ -1082,8 +1108,21 @@ export class CodexAppServerProxy {
       }
       const tracking = client.desktopRequestIds.get(rpcMessage.id);
       if (tracking?.upstreamId === upstreamId) {
+        const budgetError = createDesktopResponseBudgetError({ requestId: rpcMessage.id, method: tracking.method,
+          responseBytes: originalByteLength, limit: this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES });
+        if (originalByteLength > 1024 * 1024) this.onEvent({ type: "desktop_large_rpc_response",
+          requestId: rpcMessage.id, method: tracking.method, threadId: tracking.threadId,
+          includeTurns: tracking.includeTurns, bytes: originalByteLength, blocked: Boolean(budgetError),
+          connectionGeneration: metadataGeneration });
+        if (budgetError) {
+          rpcMessage = budgetError;
+          message = budgetError;
+          data = JSON.stringify(budgetError);
+          isBinary = false;
+        }
         if (client.initializationRequestId !== null && rpcMessage.id === client.initializationRequestId && !rpcMessage.error) {
           client.initialized = true;
+          client.initializedUpstream = upstream;
         }
         client.turnObserver.observeUpstream(rpcMessage);
         client.desktopRequestBytes -= tracking.bytes;
@@ -1229,12 +1268,75 @@ export class CodexAppServerProxy {
 
   _liveFlushQueuedMessages(client, upstream) {
     if (client.closed || client.upstream !== upstream || upstream.readyState !== this.WebSocketImpl.OPEN) return;
-    for (const queued of client.queued.splice(0)) {
+    while (client.queued.length && !client.turnPreflightPending) {
+      const queued = client.queued.shift();
       client.queuedBytes -= queued.bytes;
-      if (!this._liveSendOrClose(client, upstream, queued.data, queued.isBinary, "queued_to_upstream")) break;
-      client.turnObserver.markForwarded(queued.observation);
+      this._liveForwardDesktopMessage(client, upstream, queued);
+      if (client.closed) break;
     }
     if (!client.queued.length) client.queuedBytes = 0;
+  }
+
+  _liveForwardDesktopMessage(client, upstream, queued) {
+    const observation = queued.observation;
+    if (observation.method === "turn/start" && !observation.threadId) {
+      const envelope = this._liveReadRpcEnvelope(client, queued.data, "queued");
+      if (!envelope) return;
+      observation.threadId = envelope.message.params?.threadId;
+    }
+    const forward = () => {
+      if (client.closed || client.upstream !== upstream) return;
+      if (this._liveSendOrClose(client, upstream, queued.data, queued.isBinary, "downstream_to_upstream")) {
+        client.turnObserver.markForwarded(observation);
+      }
+    };
+    if (observation.method !== "turn/start" || !observation.threadId || !this.managedInnerControl) {
+      forward();
+      return;
+    }
+    client.turnPreflightPending = true;
+    client.turnPreflightBytes = queued.bytes;
+    const recoverBeforeTurn = this._liveRecoverBeforeTurn.bind(this);
+    const connectionActive = () => !client.closed && client.upstream === upstream && upstream.readyState === this.WebSocketImpl.OPEN;
+    Promise.resolve().then(() => {
+      const tracking = client.desktopRequestIds.get(observation.id);
+      if (!tracking) throw new Error("INNER_TURN_REQUEST_ID_REQUIRED");
+      return recoverBeforeTurn(client, observation.threadId);
+    }).then(forward, error => {
+      if (!connectionActive()) return;
+      const tracking = client.desktopRequestIds.get(observation.id);
+      if (tracking) {
+        client.desktopRequestBytes -= tracking.bytes;
+        client.desktopRequestIds.delete(observation.id);
+        client.forwardedRequestIds.delete(tracking.upstreamId);
+      }
+      const response = { jsonrpc: "2.0", id: observation.id, error: { code: -32001,
+        message: "Previous turn recovery could not be confirmed; this turn was not started",
+        data: { reason: error.code ?? error.message } } };
+      client.turnObserver.observeUpstream(response);
+      this.outerRuntime.upstream(client, response, { projectionMessage: response });
+      this._liveSendOrClose(client, client.downstream, JSON.stringify(response), false, "turn_preflight_error");
+      this.onEvent({ type: "turn_preflight_rejected", threadId: observation.threadId, reason: error.code ?? error.message });
+    }).finally(() => {
+      client.turnPreflightPending = false;
+      client.turnPreflightBytes = 0;
+      if (connectionActive()) this._liveFlushQueuedMessages(client, upstream);
+    }).catch(error => this._liveCloseClient(client, "turn_preflight_failed", error));
+  }
+
+  _liveRecoverBeforeTurn(client, threadId) {
+    if (!this.managedInnerControl) return Promise.resolve();
+    const upstream = client.upstream;
+    const connectionActive = () => !client.closed && client.upstream === upstream
+      && upstream.readyState === this.WebSocketImpl.OPEN && client.initialized === true
+      && (client.initializedUpstream === undefined || client.initializedUpstream === upstream);
+    return this.managedInnerControl.dispatch("recover-before-turn", { threadId }, {
+      connectionActive,
+      lookupTurns: params => {
+        if (!connectionActive()) throw new Error("INNER_TURN_RECOVERY_CONNECTION_CHANGED");
+        return this._liveInjectRequest(client, "thread/turns/list", params, { timeoutMs: 1250 });
+      },
+    });
   }
 
   _liveReadRpcEnvelope(client, data, source) {
@@ -1297,6 +1399,14 @@ export class CodexAppServerProxy {
   }
 
   _liveInjectRequest(client, method, params, options = {}) {
+    if (method === "turn/start" && params?.threadId && !options.turnRecoveryChecked) {
+      const recoverBeforeTurn = this._liveRecoverBeforeTurn.bind(this);
+      const injectRequest = this._liveInjectRequest.bind(this);
+      return Promise.resolve().then(() => recoverBeforeTurn(client, params.threadId)).then(() => {
+        if (client.closed) throw new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 连接已关闭");
+        return injectRequest(client, method, params, { ...options, turnRecoveryChecked: true });
+      });
+    }
     if (client.upstream?.readyState !== this.WebSocketImpl.OPEN) {
       return Promise.reject(new CodexAppServerProxyError("UPSTREAM_NOT_OPEN", "App Server 上游连接未就绪"));
     }
@@ -1391,7 +1501,7 @@ export class CodexAppServerProxy {
       && crypto.timingSafeEqual(Buffer.from(authorization), Buffer.from(expectedAuthorization));
     if (!authorized) throw new CodexAppServerProxyError("UNAUTHORIZED", "代理控制口令不正确");
     const requestUrl = new URL(request.url ?? "/", `http://${this.controlHost}:${this.controlPort}`);
-    if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback)$/.test(requestUrl.pathname)) {
+    if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback|reconcile-terminal)$/.test(requestUrl.pathname)) {
       if (!this.managedInnerControl) {
         response.statusCode = 404;
         response.end(JSON.stringify({ ok: false, error: { code: "INNER_MANAGED_CONTROL_DISABLED" } }));

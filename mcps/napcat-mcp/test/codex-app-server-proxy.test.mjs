@@ -733,7 +733,7 @@ test("large upstream text frames are forwarded without JSON materialization", { 
     const message = JSON.parse(data.toString("utf8"));
     if (message.method === "initialize") {
       socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: {} }));
-    } else if (message.method === "large/result") {
+    } else if (["large/result", "thread/read"].includes(message.method)) {
       socket.send(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { value: largeValue } }));
     }
   }));
@@ -743,6 +743,7 @@ test("large upstream text frames are forwarded without JSON materialization", { 
     upstreamUrl: `ws://127.0.0.1:${upstreamPort}`,
     controlToken: "large-frame-token",
     maxJsonParseBytes: 1024,
+    maxDesktopResponseBytes: 64 * 1024,
     maxWebSocketPayloadBytes: 2 * 1024 * 1024,
   });
   await proxy.start();
@@ -765,6 +766,14 @@ test("large upstream text frames are forwarded without JSON materialization", { 
   await waitFor(() => responses.some((message) => message.id === 2));
   assert.equal(responses.find((message) => message.id === 2).result.value.length, largeValue.length);
   assert.equal(proxy.status().limits.maxJsonParseBytes, 1024);
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "thread/read", params: { threadId: "large-history", includeTurns: true } }));
+  await waitFor(() => responses.some(message => message.id === 3));
+  assert.equal(responses.find(message => message.id === 3).error.data.reason, "DESKTOP_RESPONSE_BUDGET_EXCEEDED");
+  assert.equal(desktop.readyState, WebSocket.OPEN);
+  desktop.send(JSON.stringify({ jsonrpc: "2.0", id: 4, method: "initialize", params: {} }));
+  await waitFor(() => responses.some(message => message.id === 4));
+  assert.deepEqual(responses.find(message => message.id === 4).result, {});
+  assert.equal([...proxy.clients][0].desktopRequestIds.size, 0);
 });
 
 test("startup queue is bounded by bytes as well as message count", { timeout: 15000 }, async (context) => {
@@ -900,6 +909,95 @@ test("managed upstream stays paused until verified and can move to another loopb
   proxy.resumeUpstream();
   await waitFor(() => connections[1] === 1);
   assert.deepEqual(connections,[1,1]);
+});
+
+test("hot adopted initialized connections retain desktop and injected turn recovery", { timeout: 10000 }, async context => {
+  const [upstreamPort, downstreamPort, controlPort] = await Promise.all([freePort(), freePort(), freePort()]);
+  const methods = [];
+  const upstream = new WebSocketServer({ host: "127.0.0.1", port: upstreamPort });
+  upstream.on("connection", socket => socket.on("message", bytes => {
+    const message = JSON.parse(bytes.toString());
+    methods.push(message.method);
+    const result = message.method === "thread/turns/list"
+      ? { data: [{ id: "old-turn", status: "completed" }], nextCursor: null }
+      : message.method === "turn/start" ? { turn: { id: "accepted-turn" } } : {};
+    const reply = () => socket.send(JSON.stringify({ id: message.id, result }));
+    if (message.method === "turn/start") setTimeout(reply, 50);
+    else reply();
+  }));
+  const proxy = createCodexAppServerProxy({ downstreamPort, controlPort,
+    upstreamUrl: `ws://127.0.0.1:${upstreamPort}`, controlToken: "hot-adoption-test" });
+  await proxy.start();
+  const desktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  const responses = [];
+  desktop.on("message", bytes => responses.push(JSON.parse(bytes.toString())));
+  context.after(async () => {
+    desktop.terminate();
+    await proxy.close();
+    for (const socket of upstream.clients) socket.terminate();
+    await new Promise(resolve => upstream.close(resolve));
+  });
+  await new Promise(resolve => desktop.once("open", resolve));
+  desktop.send(JSON.stringify({ id: 1, method: "initialize", params: {} }));
+  await waitFor(() => responses.some(response => response.id === 1));
+  const client = [...proxy.clients][0];
+  assert.equal(client.initialized, true);
+  delete client.initializedUpstream;
+  let recoveries = 0;
+  proxy.managedInnerControl = { dispatch: async (method, input, callbacks) => {
+    assert.equal(method, "recover-before-turn");
+    assert.equal(callbacks.connectionActive(), true);
+    const history = await callbacks.lookupTurns({ threadId: input.threadId, limit: 8, itemsView: "notLoaded" });
+    assert.equal(history.data[0].status, "completed");
+    recoveries += 1;
+  } };
+  desktop.send(JSON.stringify({ id: 2, method: "turn/start", params: { threadId: "desktop-thread", input: [] } }));
+  await waitFor(() => responses.some(response => response.id === 2));
+  assert.equal(responses.find(response => response.id === 2).error, undefined);
+  const injected = await proxy._liveInjectRequest(client, "turn/start", { threadId: "injected-thread", input: [] });
+  assert.equal(injected.turn.id, "accepted-turn");
+  assert.equal(recoveries, 2);
+  assert.deepEqual(methods, ["initialize", "thread/turns/list", "turn/start", "thread/turns/list", "turn/start"]);
+  assert.equal(desktop.readyState, WebSocket.OPEN);
+  const secondDesktop = new WebSocket(`ws://127.0.0.1:${downstreamPort}`);
+  const secondResponses = [];
+  secondDesktop.on("message", bytes => secondResponses.push(JSON.parse(bytes.toString())));
+  context.after(() => secondDesktop.terminate());
+  await new Promise(resolve => secondDesktop.once("open", resolve));
+  secondDesktop.send(JSON.stringify({ id: 10, method: "initialize", params: {} }));
+  await waitFor(() => secondResponses.some(response => response.id === 10));
+  for (const id of [3, 4]) desktop.send(JSON.stringify({ id, method: "turn/start", params: { threadId: "same-thread", input: [] } }));
+  secondDesktop.send(JSON.stringify({ id: 11, method: "turn/start", params: { threadId: "same-thread", input: [] } }));
+  const concurrentInjected = proxy._liveInjectRequest(client, "turn/start", { threadId: "same-thread", input: [] });
+  await waitFor(() => responses.some(response => response.id === 4) && secondResponses.some(response => response.id === 11));
+  assert.equal((await concurrentInjected).turn.id, "accepted-turn");
+  for (const id of [3, 4]) assert.equal(responses.find(response => response.id === id).error, undefined);
+  assert.equal(secondResponses.find(response => response.id === 11).error, undefined);
+  assert.equal(methods.filter(method => method === "turn/start").length, 6);
+  const currentPrototype = Object.getPrototypeOf(proxy);
+  const previousPrototype = Object.create(currentPrototype);
+  Object.assign(previousPrototype, { _liveRecoverBeforeTurn: undefined, _liveForwardDesktopMessage: undefined,
+    _liveFlushQueuedMessages: () => { assert.equal(client.queued.length, 0); } });
+  let rejectRecovery;
+  proxy.managedInnerControl.dispatch = () => new Promise((resolve, reject) => { rejectRecovery = reject; });
+  desktop.send(JSON.stringify({ id: 5, method: "turn/start", params: { threadId: "rollback-thread", input: [] } }));
+  await waitFor(() => Boolean(rejectRecovery));
+  Object.setPrototypeOf(proxy, previousPrototype);
+  rejectRecovery(new Error("fixture-readonly-timeout"));
+  await waitFor(() => responses.some(response => response.id === 5));
+  assert.equal(responses.find(response => response.id === 5).error.data.reason, "fixture-readonly-timeout");
+  assert.equal(client.turnPreflightPending, false);
+  assert.equal(client.desktopRequestIds.size, 0);
+  Object.setPrototypeOf(proxy, currentPrototype);
+  let resolveRecovery;
+  proxy.managedInnerControl.dispatch = () => new Promise(resolve => { resolveRecovery = resolve; });
+  const pendingInjected = proxy._liveInjectRequest(client, "turn/start", { threadId: "rollback-injected", input: [] });
+  await waitFor(() => Boolean(resolveRecovery));
+  previousPrototype._liveInjectRequest = () => { throw new Error("legacy-inject-must-not-replace-inflight-function"); };
+  Object.setPrototypeOf(proxy, previousPrototype);
+  resolveRecovery({ recovered: false });
+  assert.equal((await pendingInjected).turn.id, "accepted-turn");
+  Object.setPrototypeOf(proxy, currentPrototype);
 });
 
 test("corrupted wake journal fails closed instead of forgetting prior turns", () => {

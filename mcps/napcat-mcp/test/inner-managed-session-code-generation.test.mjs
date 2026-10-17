@@ -42,6 +42,46 @@ function identity(shared) {
     serviceCodeParticipant: shared.serviceCodeParticipant };
 }
 
+test("concurrent native progress during terminal relay preserves both incoming starts", async () => {
+  const thread = { threadId: "concurrent-thread", turnId: "old", workerId: "worker", phase: "active", activeHttp: 0 };
+  let finishRelay;
+  let completionEvents = 0;
+  const relay = new Promise(resolve => { finishRelay = resolve; });
+  const shared = { configuration: {}, options: {}, onEvent: () => {}, controlBusy: false,
+    coordinator: { status: () => ({ nativeHealthy: true, threads: [{ ...thread }] }) },
+    nativeSource: { status: () => ({ healthy: true }), observe: async message => {
+      if (!message) return;
+      completionEvents += 1;
+      thread.phase = "terminal";
+      await relay;
+    } } };
+  const implementation = sessionModule.createManagedInnerProxySessionImplementation(shared);
+  const callbacks = { connectionActive: () => true,
+    lookupTurns: async () => ({ data: [{ id: "old", status: "completed" }], nextCursor: null }) };
+  const first = implementation.dispatchControl("recover-before-turn", { threadId: thread.threadId }, callbacks);
+  await until(() => thread.phase === "terminal");
+  assert.equal((await implementation.dispatchControl("recover-before-turn", { threadId: thread.threadId }, callbacks)).recovered, false);
+  thread.turnId = "new";
+  thread.phase = "active";
+  finishRelay();
+  assert.deepEqual(await first, { recovered: false, reason: "native_progress" });
+  assert.equal(completionEvents, 1);
+  assert.equal(thread.turnId, "new");
+});
+
+test("in-progress metadata cannot bypass health changes during its lookup", async () => {
+  let healthy = true;
+  const thread = { threadId: "health-thread", turnId: "old", workerId: "worker", phase: "active", activeHttp: 1 };
+  const shared = { configuration: {}, options: {}, onEvent: () => {}, controlBusy: false,
+    coordinator: { status: () => ({ nativeHealthy: healthy, threads: [{ ...thread }] }) },
+    nativeSource: { status: () => ({ healthy }), observe: async () => {} } };
+  const implementation = sessionModule.createManagedInnerProxySessionImplementation(shared);
+  await assert.rejects(implementation.dispatchControl("recover-before-turn", { threadId: thread.threadId }, {
+    connectionActive: () => true,
+    lookupTurns: async () => { healthy = false; return { data: [{ id: "old", status: "inProgress" }] }; },
+  }), /INNER_TURN_RECOVERY_STATE_CHANGED/u);
+});
+
 test("same real isolated session switches old listeners to new factory while its held request completes once", { timeout: 20000 }, async context => {
   const value = await fixture(context);
   const { session, participant, shared } = value;
@@ -59,6 +99,10 @@ test("same real isolated session switches old listeners to new factory while its
   await value.turn(socket, "held-thread", "held-turn");
   const inflight = value.request("held-thread", "held-turn");
   await until(() => value.held.length === 1);
+  const activeFollowUp = await value.rpc(socket, "turn/start", { threadId: "held-thread", input: [], fixtureFollowUp: true });
+  assert.equal(activeFollowUp.error, undefined);
+  assert.equal(activeFollowUp.result.followUpAccepted, true);
+  assert.equal(activeFollowUp.result.turn.id, "held-turn");
   const delayedTool = value.rpc(socket, "test/tool", { value: "old-inflight", replyDelayMs: 350 });
   const before = participant.snapshot();
   const resources = identity(shared);
@@ -76,6 +120,10 @@ test("same real isolated session switches old listeners to new factory while its
   assert.strictEqual(session.serviceCodeParticipant(), value.serviceParticipants[0]);
   assert.deepEqual(session.status().coordinator.workers, workers);
   assert.deepEqual(shared.nativeSource.status(), nativeBefore);
+  const hotFollowUp = await value.rpc(socket, "turn/start", { threadId: "held-thread", input: [], fixtureFollowUp: true });
+  assert.equal(hotFollowUp.error, undefined);
+  assert.equal(hotFollowUp.result.followUpAccepted, true);
+  assert.equal(hotFollowUp.result.turn.id, "held-turn");
   assert.equal((await delayedTool).result.value, "old-inflight");
   await value.turn(socket, "new-thread", "new-turn");
   await until(() => markers.some(marker => marker.name === "handleNativeTurn"));
@@ -103,6 +151,30 @@ test("same real isolated session switches old listeners to new factory while its
   assert.ok(markers.some(marker => marker.name === "handleOuterFinished"));
   assert.equal((await completion).state, "stopped");
   assert.equal(shared.outerFinished, true);
+});
+
+test("authoritative completion waits for the old HTTP close before restoring its terminal state", { timeout: 20000 }, async context => {
+  const value = await fixture(context);
+  const socket = await value.connect();
+  await value.rpc(socket, "initialize", { clientInfo: { name: "completion-drain", version: "1" } });
+  await value.turn(socket, "draining-thread", "draining-turn");
+  const inflight = value.request("draining-thread", "draining-turn");
+  await until(() => value.held.length === 1);
+  await value.rpc(socket, "test/complete-silent", { threadId: "draining-thread", turnId: "draining-turn" });
+  let recovered = false;
+  const recovery = value.shared.dispatch("dispatchControl", "recover-before-turn", { threadId: "draining-thread" }, {
+    connectionActive: () => true,
+    lookupTurns: async params => (await value.rpc(socket, "thread/turns/list", params)).result,
+  }).then(result => { recovered = true; return result; });
+  await sleep(100);
+  assert.equal(recovered, false);
+  assert.equal(value.shared.coordinator.status().threads.find(thread => thread.threadId === "draining-thread").phase, "active");
+  value.release();
+  assert.equal((await inflight).status, 200);
+  assert.equal((await recovery).recovered, true);
+  const state = value.shared.coordinator.status();
+  assert.equal(state.threads.find(thread => thread.threadId === "draining-thread").phase, "terminal");
+  assert.equal(state.nativeHealthy, true);
 });
 
 test("pending control receipt and the original timers survive a switch and finish without replay", { timeout: 20000 }, async context => {
@@ -238,12 +310,14 @@ test("legacy native closure is replaced only on first live notification while ac
   assert.equal(stateBefore.threads.get("held-native-thread").phase, "terminal");
   const current = shared.nativeSource;
   shared.dispatch("handleOuterEvent", {}, { type: "upstream_session_lost" });
+  assert.equal(value.session.status().nativeSource.healthy, true);
+  current.invalidate("NATIVE_SOURCE_CONFLICTING_DUPLICATE");
   const unavailable = await generation(value, "lost-native", markers);
   participant.activate(unavailable);
   assert.throws(() => shared.dispatch("handleNativeTurn", started), /UNAVAILABLE/u);
   assert.strictEqual(shared.nativeSource, current);
-  assert.equal(value.session.status().nativeSource.failureCode, "APP_SERVER_EVENT_CONNECTION_LOST");
+  assert.equal(value.session.status().nativeSource.failureCode, "NATIVE_SOURCE_CONFLICTING_DUPLICATE");
   console.log(JSON.stringify({ case: "legacy-native-live-factory-handoff", prepareMutation: false, sameCoordinator: true,
     sameActiveState: true, sequenceBefore, sequenceAfterCompletion: stateBefore.nativeSequence, duplicateRelay: false,
-    connectionLossPreserved: true, productionActions: 0, modelRequests: 0 }));
+    eventGapPreservesSource: true, eventConflictPreserved: true, productionActions: 0, modelRequests: 0 }));
 });

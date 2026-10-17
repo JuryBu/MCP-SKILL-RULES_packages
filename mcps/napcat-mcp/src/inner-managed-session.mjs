@@ -258,6 +258,66 @@ export function createManagedInnerProxySessionImplementation(shared) {
       || input.instanceToken !== options.instanceToken) throw new Error("INNER_CONTROL_IDENTITY_MISMATCH");
   }
   async function dispatchControl(method, input, context = {}) {
+    if (method === "recover-before-turn" && typeof context.lookupTurns === "function"
+      && typeof context.connectionActive === "function") {
+      const originalSource = shared.nativeSource;
+      await originalSource.observe(null);
+      const before = coordinator.status();
+      if (!before.nativeHealthy || !originalSource.status().healthy) throw new Error("INNER_NATIVE_SOURCE_UNAVAILABLE");
+      const target = before.threads.find(thread => thread.threadId === input.threadId);
+      if (!target || target.phase !== "active") return { recovered: false };
+      if (!before.nativeHealthy || !shared.nativeSource.status().healthy || before.transactionActive
+        || before.workerMaintenance || shared.controlBusy) {
+        throw new Error("INNER_TURN_RECOVERY_BUSY");
+      }
+      let cursor;
+      let terminal;
+      const seen = new Set();
+      const deadline = Date.now() + 5000;
+      for (let page = 0; page < 4 && Date.now() < deadline; page += 1) {
+        const result = await context.lookupTurns({ threadId: input.threadId, limit: 8,
+          sortDirection: "desc", itemsView: "notLoaded", ...(cursor ? { cursor } : {}) });
+        if (!Array.isArray(result?.data)) throw new Error("INNER_TURN_RECOVERY_INVALID_HISTORY");
+        terminal = result.data.find(turn => turn.id === target.turnId);
+        if (terminal) break;
+        const next = result.nextCursor;
+        if (typeof next !== "string" || !next || next.length > 4096 || seen.has(next)) break;
+        seen.add(next);
+        cursor = next;
+      }
+      const checkedTarget = () => {
+        const current = coordinator.status();
+        const currentTarget = current.threads.find(thread => thread.threadId === input.threadId);
+        if (!context.connectionActive() || current.transactionActive || current.workerMaintenance || shared.controlBusy
+          || !current.nativeHealthy || shared.nativeSource !== originalSource || !originalSource.status().healthy
+          || !currentTarget || currentTarget.activationError) throw new Error("INNER_TURN_RECOVERY_STATE_CHANGED");
+        return currentTarget;
+      };
+      let currentTarget = checkedTarget();
+      if (currentTarget.turnId !== target.turnId) return { recovered: false, reason: "native_progress" };
+      if (terminal?.status === "inProgress") return { recovered: false, reason: "active_turn" };
+      if (!terminal || !["completed", "failed", "interrupted"].includes(terminal.status)) {
+        throw new Error("INNER_PREVIOUS_TURN_NOT_TERMINAL");
+      }
+      while (currentTarget.activeHttp !== 0) {
+        if (Date.now() >= deadline) throw new Error("INNER_PREVIOUS_TURN_HTTP_DRAIN_TIMEOUT");
+        await new Promise(resolve => setTimeout(resolve, 20));
+        currentTarget = checkedTarget();
+        if (currentTarget.turnId !== target.turnId) return { recovered: false, reason: "native_progress" };
+      }
+      if (currentTarget.phase === "terminal") return { recovered: false };
+      if (currentTarget.workerId !== target.workerId) throw new Error("INNER_TURN_RECOVERY_STATE_CHANGED");
+      await shared.nativeSource.observe({ method: "turn/completed",
+        params: { threadId: input.threadId, turn: { id: target.turnId, status: terminal.status } } });
+      const reconciled = checkedTarget();
+      if (reconciled.turnId !== target.turnId) return { recovered: false, reason: "native_progress" };
+      if (reconciled.phase !== "terminal") {
+        throw new Error("INNER_TURN_RECOVERY_NOT_CONFIRMED");
+      }
+      onEvent({ type: "authoritative_terminal_recovery", threadId: input.threadId, turnId: target.turnId,
+        status: terminal.status, source: "thread/turns/list" });
+      return { recovered: true };
+    }
     bindControl(input);
     const current = controlStatus();
     if (method === "status") return current;
@@ -275,6 +335,7 @@ export function createManagedInnerProxySessionImplementation(shared) {
       migrate: ["candidateId", "threadId", "compatibility", "live", "drainTimeoutMs"],
       activate: ["candidateId", "compatibility"],
       rollback: ["activationId"],
+      "reconcile-terminal": ["threadId", "turnId", "status", "evidenceSha256"],
     };
     const allowed = ["ownerId", "nativeSourceId", "instanceToken", "requestId", "expectedRevision", "selectedWorkerId", "selectedSourceHashes",
       ...(operationFields[method] ?? [])];
@@ -293,6 +354,14 @@ export function createManagedInnerProxySessionImplementation(shared) {
       }
       if (typeof input.threadId !== "string" || !input.threadId || input.threadId.length > 512
         || !current.coordinator.workers.some(worker => worker.workerId === input.candidateId && worker.alive)) throw new Error("INNER_CONTROL_TARGET_INVALID");
+    } else if (method === "reconcile-terminal") {
+      const target = current.coordinator.threads.find(thread => thread.threadId === input.threadId);
+      if (!/^[a-f0-9]{64}$/u.test(input.evidenceSha256 ?? "")
+        || !["completed", "failed", "interrupted"].includes(input.status)
+        || !target || target.turnId !== input.turnId || target.phase !== "active"
+        || target.activeHttp !== 0 || target.pendingActivationId || target.activationError
+        || current.coordinator.transactionActive || !current.coordinator.nativeHealthy
+        || !shared.nativeSource.status().healthy) throw new Error("INNER_CONTROL_RECONCILE_PRECONDITION_FAILED");
     } else {
       requireReady();
       if (method === "activate" && !current.coordinator.workers.some(worker => worker.workerId === input.candidateId && worker.alive)) {
@@ -310,6 +379,24 @@ export function createManagedInnerProxySessionImplementation(shared) {
     try { publish("running"); }
     catch (error) { shared.controlOperations.delete(input.requestId); shared.controlBusy = false; throw error; }
     const operation = Promise.resolve().then(() => {
+      if (method === "reconcile-terminal") {
+        const target = coordinator.status().threads.find(thread => thread.threadId === input.threadId);
+        if (!target || target.turnId !== input.turnId || target.phase !== "active" || target.activeHttp !== 0
+          || target.pendingActivationId || target.activationError || coordinator.status().transactionActive) {
+          throw new Error("INNER_CONTROL_RECONCILE_PRECONDITION_FAILED");
+        }
+        onEvent({ type: "operator_terminal_reconciliation", threadId: input.threadId, turnId: input.turnId,
+          status: input.status, evidenceSha256: input.evidenceSha256, requestId: input.requestId });
+        return shared.nativeSource.observe({ method: "turn/completed",
+          params: { threadId: input.threadId, turn: { id: input.turnId, status: input.status } } }).then(() => {
+          const after = coordinator.status();
+          const reconciled = after.threads.find(thread => thread.threadId === input.threadId);
+          if (!after.nativeHealthy || reconciled?.turnId !== input.turnId || reconciled.phase !== "terminal") {
+            throw new Error("INNER_CONTROL_RECONCILE_NOT_CONFIRMED");
+          }
+          return { threadId: input.threadId, turnId: input.turnId, phase: "terminal", evidenceSha256: input.evidenceSha256 };
+        });
+      }
       if (method === "prepare") return coordinator.prepareCandidate(specification);
       if (method === "activate") return coordinator.activate({ candidateId: input.candidateId, compatibility: input.compatibility });
       if (method === "rollback") return coordinator.rollbackActivation({ activationId: input.activationId });
@@ -397,7 +484,9 @@ export function createManagedInnerProxySessionImplementation(shared) {
       return shared.nativeSource.observe(message);
     },
     handleOuterEvent(proxyOptions, event) {
-      if (event.type === "upstream_session_lost") shared.nativeSource.invalidate("APP_SERVER_EVENT_CONNECTION_LOST");
+      if (event.type === "upstream_session_lost") {
+        onEvent({ type: "native_event_gap", reason: "APP_SERVER_EVENT_CONNECTION_LOST", instanceToken: options.instanceToken });
+      }
       proxyOptions.onEvent?.(event);
       onEvent({ type: "outer_event", event });
     },
