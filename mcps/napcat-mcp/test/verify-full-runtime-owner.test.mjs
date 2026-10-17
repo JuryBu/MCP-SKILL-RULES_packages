@@ -13,7 +13,7 @@ const hash = filename => crypto.createHash("sha256").update(fs.readFileSync(file
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const sourceManifestPath = process.env.OWNER_TEST_SOURCE_MANIFEST;
 const compilerPath = process.env.OWNER_TEST_COMPILER;
-async function fixture(context, fault) {
+async function fixture(context, fault, withRegistry = false) {
   assert.ok(sourceManifestPath && compilerPath, "Explicit fixture source and compiler required");
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-owner-hotcut-"));
   const candidateRoot = path.join(directory, "candidate");
@@ -28,20 +28,36 @@ async function fixture(context, fault) {
     helper: "thread-recovery-handoff.mjs", control: "inner-runner-handoff-control.mjs" }).map(([key, name]) => [key, sources.files.find(file => file.path === name).sha256]));
   const profilePath = path.join(directory, "profile.json");
   const managedStatePath = path.join(directory, "managed.json");
+  const stateRoot = path.join(directory, "state");
+  const registryPath = path.join(stateRoot, "inner-candidate-approvals.json");
+  if (withRegistry) fs.mkdirSync(stateRoot);
   fs.writeFileSync(managedStatePath, "{}");
-  fs.writeFileSync(profilePath, JSON.stringify({ installationRoot, managedStatePath, initial: { expectedHashes }, ownerId: "fixture-owner", nativeSourceId: "fixture-native" }));
+  fs.writeFileSync(profilePath, JSON.stringify({ installationRoot, managedStatePath, ...(withRegistry ? { stateRoot } : {}),
+    initial: { expectedHashes }, ownerId: "fixture-owner", nativeSourceId: "fixture-native" }));
   const tokenPath = path.join(directory, "token");
   fs.writeFileSync(tokenPath, "fixture-token");
   let status = { ok: true, instanceId: "fixture-instance", revision: 0, selected: { id: "original" }, candidateRegistrySha256: null,
     busy: false, failed: false, participants: [{}, {}, {}, {}, {}], prepared: [], preparedWorkers: [] };
   let manifestSha256;
+  let manifestPath;
+  let compatibility;
   let previousSelection;
+  let registeredRegistry;
   const posts = [];
   let failures = 0;
   const server = http.createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
     assert.equal(request.headers.authorization, "Bearer fixture-token");
-    if (request.method === "GET") return response.end(JSON.stringify(status));
+    if (request.method === "GET") {
+      if (posts.includes("activate") && !posts.includes("restore")) {
+        if (fault === "activated-status-error") {
+          response.statusCode = 503;
+          return response.end(JSON.stringify({ ok: false, error: { code: "SYNTHETIC_STATUS_UNAVAILABLE" } }));
+        }
+        if (fault === "activated-status-drift") return response.end(JSON.stringify({ ...status, revision: status.revision + 1 }));
+      }
+      return response.end(JSON.stringify(status));
+    }
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     const input = JSON.parse(Buffer.concat(chunks).toString());
@@ -60,16 +76,40 @@ async function fixture(context, fault) {
       assert.equal(hash(input.manifestPath), input.manifestSha256);
       assert.equal(actual.files.length, 48);
       manifestSha256 = input.manifestSha256;
+      manifestPath = input.manifestPath;
       status = { ...status, candidateRegistrySha256: "registered" };
+      if (withRegistry) {
+        fs.writeFileSync(registryPath, JSON.stringify({ schemaVersion: 1, selection: { candidateId: previousSelection.id,
+          manifestSha256: previousSelection.manifestSha256 ?? null }, candidates: [input.candidate] }));
+        registeredRegistry = fs.readFileSync(registryPath);
+        status.candidateRegistrySha256 = hash(registryPath);
+      }
     } else if (method === "prepare") {
       assert.equal(input.workerCandidateId, "same-source-proof");
+      compatibility = input.compatibility;
+      if (withRegistry && fault === "prepare-registry") fs.appendFileSync(registryPath, " ");
       return response.end(JSON.stringify({ ok: true, id: "prepared-id", revision: status.revision }));
     } else if (method === "activate") {
       assert.equal(input.preparationId, "prepared-id");
       status = { ...status, revision: status.revision + 1, selected: { id: "candidate", manifestSha256 } };
+      if (withRegistry) {
+        const registry = JSON.parse(fs.readFileSync(registryPath));
+        registry.selection = { candidateId: "same-source-proof", manifestPath, manifestSha256, compatibility };
+        fs.writeFileSync(registryPath, JSON.stringify(registry));
+        status.candidateRegistrySha256 = hash(registryPath);
+        if (fault === "activated-registry") fs.appendFileSync(registryPath, " ");
+        if (fault === "activated-response") status.candidateRegistrySha256 = "f".repeat(64);
+      }
       if (fault === "snapshot") fs.renameSync(managedStatePath, managedStatePath + ".retained");
+      const activationResponse = { ...status };
+      delete activationResponse.candidateRegistrySha256;
+      return response.end(JSON.stringify(activationResponse));
     } else if (method === "restore") {
       status = { ...status, revision: status.revision + 1, selected: previousSelection };
+      if (withRegistry) {
+        fs.writeFileSync(registryPath, registeredRegistry);
+        status.candidateRegistrySha256 = hash(registryPath);
+      }
     } else assert.fail("unexpected method");
     response.end(JSON.stringify(status));
   });
@@ -87,9 +127,234 @@ async function fixture(context, fault) {
   const inputPath = path.join(directory, "input.json");
   fs.writeFileSync(inputPath, JSON.stringify(input));
   context.diagnostic(JSON.stringify({ directory, productionActions: 0 }));
-  return { inputPath, inputSha: hash(inputPath), posts, input, change: callback => { status = callback(status); } };
+  return { inputPath, inputSha: hash(inputPath), posts, input, registryPath, change: callback => { status = callback(status); } };
 }
 const confirm = prompt => Promise.resolve(prompt.startsWith("Type ACTIVATE") ? "ACTIVATE" : prompt.startsWith("Type RESTORE") ? "RESTORE-SAME-RUNTIME" : "TEST-HOT-SWITCH");
+
+async function recoveryFixture(context, fault) {
+  const value = await fixture(context, fault, true);
+  value.input.requireRecoveryPreparation = true;
+  fs.writeFileSync(value.inputPath, JSON.stringify(value.input));
+  value.inputSha = hash(value.inputPath);
+  return value;
+}
+function prepareRecoveryFiles(context) {
+  const directory = path.dirname(context.inputPath);
+  const targetRegistryPath = path.join(directory, "recovery-target.json");
+  const sourceRegistryPath = path.join(directory, "recovery-source.json");
+  const recoveryPath = path.join(directory, "recovery.mjs");
+  const configurationPath = path.join(directory, "recovery-configuration.json");
+  fs.copyFileSync(context.registryPath, targetRegistryPath);
+  const source = JSON.parse(fs.readFileSync(targetRegistryPath));
+  source.selection = { candidateId: context.candidate.id, manifestPath: context.built.manifestPath,
+    manifestSha256: context.built.manifestSha256, compatibility: context.compatibility };
+  fs.writeFileSync(sourceRegistryPath, JSON.stringify(source));
+  fs.writeFileSync(recoveryPath, "export const fixtureRecovery = true;\n");
+  fs.writeFileSync(configurationPath, JSON.stringify({ registryPath: context.registryPath, sourceRegistryPath, targetRegistryPath,
+    pins: [sourceRegistryPath, targetRegistryPath, recoveryPath].map(filename => ({ path: filename, sha256: hash(filename) })) }));
+  return { registryPath: context.registryPath, sourceRegistryPath, sourceRegistrySha256: hash(sourceRegistryPath),
+    targetRegistryPath, targetRegistrySha256: hash(targetRegistryPath), configurationPath, configurationSha256: hash(configurationPath) };
+}
+function acceptanceRecords(value) {
+  return fs.readFileSync(path.join(path.dirname(value.inputPath), "acceptance-events.jsonl"), "utf8").trim().split("\n").map(line => JSON.parse(line));
+}
+
+test("required recovery hook is checked by Inspect without executing or creating a candidate", async context => {
+  const value = await recoveryFixture(context);
+  for (const action of ["Inspect", "Apply", "Run"]) {
+    await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, action, confirm, () => {}), /RECOVERY_PREPARATION_REQUIRED/);
+  }
+  const result = await executeOwnerAcceptance(value.inputPath, value.inputSha, "Inspect", confirm, () => {}, {
+    prepareRecovery: () => assert.fail("Inspect executed recovery hook"),
+  });
+  assert.equal(result.status, "READY_NOT_EXECUTED");
+  assert.deepEqual(value.posts, []);
+  assert.equal(fs.existsSync(value.input.installationRoot), false);
+  assert.equal(fs.existsSync(path.join(path.dirname(value.inputPath), "acceptance-events.jsonl")), false);
+});
+
+test("Inspect rejects required recovery without the pinned profile state root", async context => {
+  const value = await fixture(context);
+  value.input.requireRecoveryPreparation = true;
+  fs.writeFileSync(value.inputPath, JSON.stringify(value.input));
+  await assert.rejects(executeOwnerAcceptance(value.inputPath, hash(value.inputPath), "Inspect", confirm, () => {}, {
+    prepareRecovery: () => assert.fail("Inspect executed recovery hook"),
+  }), /RECOVERY_STATE_ROOT_REQUIRED/);
+  assert.deepEqual(value.posts, []);
+});
+
+test("required recovery failure preserves prepared evidence and never activates", async context => {
+  const value = await recoveryFixture(context);
+  const emitted = [];
+  await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, line => emitted.push(line), {
+    prepareRecovery: async hookContext => {
+      assert.deepEqual(value.posts, ["register", "prepare"]);
+      assert.equal(hash(hookContext.registryPath), hookContext.registered.candidateRegistrySha256);
+      throw new Error("SYNTHETIC_RECOVERY_FAILURE");
+    },
+  }), /SYNTHETIC_RECOVERY_FAILURE/);
+  assert.deepEqual(value.posts, ["register", "prepare"]);
+  assert.equal(acceptanceRecords(value).at(-1).phase, "failed_preserved");
+  assert.equal(JSON.parse(emitted.at(-1)).status, "FAILED_PRESERVED");
+});
+
+test("registry drift during prepare prevents calling recovery and activation", async context => {
+  const value = await recoveryFixture(context, "prepare-registry");
+  await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, () => {}, {
+    prepareRecovery: () => assert.fail("recovery called with drifted registered registry"),
+  }), /PIN_CHANGED/);
+  assert.deepEqual(value.posts, ["register", "prepare"]);
+  assert.equal(acceptanceRecords(value).at(-1).phase, "failed_preserved");
+});
+
+test("recovery awaits fixed isolated context between prepared and activation and binds actual registry", async context => {
+  const value = await recoveryFixture(context);
+  let receipt;
+  const result = await executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, () => {}, {
+    prepareRecovery: async hookContext => {
+      assert.deepEqual(Object.keys(hookContext).sort(), ["inputPath", "inputSha256", "action", "input", "profile", "sourceManifest",
+        "before", "registered", "prepared", "built", "candidate", "compatibility", "registryPath"].sort());
+      assert.equal(hookContext.inputSha256, value.inputSha);
+      assert.equal(hookContext.action, "Apply");
+      assert.equal(hookContext.prepared.id, "prepared-id");
+      assert.equal(hookContext.registryPath, value.registryPath);
+      assert.equal(acceptanceRecords(value).filter(entry => entry.phase === "prepared").length, 1);
+      await new Promise(resolve => setTimeout(resolve, 10));
+      assert.deepEqual(value.posts, ["register", "prepare"]);
+      receipt = prepareRecoveryFiles(hookContext);
+      hookContext.input.candidateId = "callback-mutated-copy";
+      hookContext.registered.candidateRegistrySha256 = "callback-mutated-copy";
+      return receipt;
+    },
+  });
+  assert.equal(result.status, "HOT_SWITCH_APPLIED");
+  assert.equal(result.evidenceWarnings.length, 0);
+  assert.equal(hash(value.registryPath), receipt.sourceRegistrySha256);
+  const phases = acceptanceRecords(value).map(entry => entry.phase);
+  assert.ok(phases.indexOf("prepared") < phases.indexOf("recovery_preparation_requested"));
+  assert.ok(phases.indexOf("recovery_preparation_requested") < phases.indexOf("recovery_prepared"));
+  assert.ok(phases.indexOf("recovery_prepared") < phases.indexOf("activate_requested"));
+  assert.deepEqual(value.posts, ["register", "prepare", "activate"]);
+  const restored = await executeOwnerAcceptance(value.inputPath, value.inputSha, "Restore", confirm, () => {});
+  assert.equal(restored.status, "RESTORED_ORIGINAL");
+});
+
+for (const mutation of ["registry-file", "registry-status", "source", "target", "configuration", "pin"]) {
+  test(`recovery ${mutation} drift at final confirmation never activates`, async context => {
+    const value = await recoveryFixture(context);
+    let receipt;
+    const mutateAtConfirmation = async prompt => {
+      if (prompt.startsWith("Type ACTIVATE")) {
+        if (mutation === "registry-status") value.change(status => ({ ...status, candidateRegistrySha256: "e".repeat(64) }));
+        else fs.appendFileSync(mutation === "registry-file" ? value.registryPath : mutation === "source" ? receipt.sourceRegistryPath
+          : mutation === "target" ? receipt.targetRegistryPath : mutation === "configuration" ? receipt.configurationPath
+          : JSON.parse(fs.readFileSync(receipt.configurationPath)).pins.at(-1).path, " ");
+      }
+      return confirm(prompt);
+    };
+    await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", mutateAtConfirmation, () => {}, {
+      prepareRecovery: hookContext => { receipt = prepareRecoveryFiles(hookContext); return receipt; },
+    }), /PIN_CHANGED|PRE_ACTIVATE_REGISTRY_CHANGED/);
+    assert.deepEqual(value.posts, ["register", "prepare"]);
+    assert.equal(acceptanceRecords(value).some(entry => entry.phase === "activate_requested"), false);
+    assert.equal(acceptanceRecords(value).at(-1).phase, "failed_preserved");
+  });
+}
+
+for (const mutation of ["missing-receipt", "strings-only", "wrong-registry-path", "wrong-target-sha", "source-sha", "configuration-sha", "empty-pins", "missing-source", "missing-target", "missing-pin", "pin-sha", "configuration-binding", "missing-registry-pin"]) {
+  test(`recovery receipt rejects ${mutation} without activation`, async context => {
+    const value = await recoveryFixture(context);
+    await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, () => {}, {
+      prepareRecovery: hookContext => {
+        const receipt = prepareRecoveryFiles(hookContext);
+        if (mutation === "missing-receipt") return undefined;
+        if (mutation === "strings-only") return { registryPath: receipt.registryPath, sourceRegistrySha256: receipt.sourceRegistrySha256,
+          targetRegistrySha256: receipt.targetRegistrySha256 };
+        if (mutation === "wrong-registry-path") receipt.registryPath = receipt.targetRegistryPath;
+        if (mutation === "wrong-target-sha") receipt.targetRegistrySha256 = "e".repeat(64);
+        if (mutation === "source-sha") receipt.sourceRegistrySha256 = "e".repeat(64);
+        if (mutation === "missing-source") receipt.sourceRegistryPath += ".missing";
+        if (mutation === "missing-target") receipt.targetRegistryPath += ".missing";
+        const configuration = JSON.parse(fs.readFileSync(receipt.configurationPath));
+        if (mutation === "empty-pins") configuration.pins = [];
+        if (mutation === "missing-pin") configuration.pins.at(-1).path += ".missing";
+        if (mutation === "pin-sha") configuration.pins.at(-1).sha256 = "e".repeat(64);
+        if (mutation === "configuration-binding") configuration.registryPath = receipt.targetRegistryPath;
+        if (mutation === "missing-registry-pin") configuration.pins.shift();
+        fs.writeFileSync(receipt.configurationPath, JSON.stringify(configuration));
+        receipt.configurationSha256 = hash(receipt.configurationPath);
+        if (mutation === "configuration-sha") receipt.configurationSha256 = "e".repeat(64);
+        return receipt;
+      },
+    }), /RECOVERY_RECEIPT_INVALID|RECOVERY_TARGET_REGISTRY_CHANGED|RECOVERY_PINS_INVALID|RECOVERY_CONFIGURATION_BINDING_CHANGED|RECOVERY_REGISTRY_PIN_MISSING|PIN_CHANGED|ENOENT/);
+    assert.deepEqual(value.posts, ["register", "prepare"]);
+    assert.equal(acceptanceRecords(value).at(-1).phase, "failed_preserved");
+  });
+}
+
+for (const fault of ["activated-registry", "activated-response"]) {
+  test(`${fault} SHA failure preserves activated state without warning-only success or restore`, async context => {
+    const value = await recoveryFixture(context, fault);
+    const emitted = [];
+    await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Run", confirm, line => emitted.push(line), {
+      prepareRecovery: prepareRecoveryFiles,
+    }), /PIN_CHANGED|ACTIVATED_RECOVERY_REGISTRY_CHANGED/);
+    assert.deepEqual(value.posts, ["register", "prepare", "activate"]);
+    const failed = acceptanceRecords(value).at(-1);
+    assert.equal(failed.phase, "failed_preserved");
+    assert.equal(failed.value.phase, "activated_recovery_binding");
+    assert.equal(failed.value.actual.revision, 1);
+    assert.equal(JSON.parse(emitted.at(-1)).status, "FAILED_PRESERVED");
+    assert.equal(JSON.parse(emitted.at(-1)).retryAllowed, false);
+  });
+}
+
+test("activation response without registry SHA verifies the real subsequent status and disk", async context => {
+  const value = await recoveryFixture(context);
+  const result = await executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, () => {}, {
+    prepareRecovery: prepareRecoveryFiles,
+  });
+  assert.equal(result.status, "HOT_SWITCH_APPLIED");
+  assert.deepEqual(value.posts, ["register", "prepare", "activate"]);
+  assert.equal(acceptanceRecords(value).some(entry => entry.phase === "failed_preserved"), false);
+});
+
+for (const fault of ["activated-status-error", "activated-status-drift"]) {
+  test(`${fault} preserves the already activated candidate`, async context => {
+    const value = await recoveryFixture(context, fault);
+    await assert.rejects(executeOwnerAcceptance(value.inputPath, value.inputSha, "Apply", confirm, () => {}, {
+      prepareRecovery: prepareRecoveryFiles,
+    }), /SYNTHETIC_STATUS_UNAVAILABLE|ACTIVATED_RECOVERY_STATE_CHANGED/);
+    assert.deepEqual(value.posts, ["register", "prepare", "activate"]);
+    assert.equal(acceptanceRecords(value).at(-1).value.phase, "activated_recovery_binding");
+  });
+}
+
+for (const flag of [undefined, false]) {
+  test(`an optional recovery callback is ignored when the input flag is ${flag}`, async context => {
+    const value = await fixture(context);
+    if (flag !== undefined) {
+      value.input.requireRecoveryPreparation = flag;
+      fs.writeFileSync(value.inputPath, JSON.stringify(value.input));
+    }
+    const result = await executeOwnerAcceptance(value.inputPath, hash(value.inputPath), "Run", confirm, () => {}, {
+      prepareRecovery: () => assert.fail("optional callback executed without flag"),
+    });
+    assert.equal(result.status, "HOT_SWITCH_AND_RESTORE_PASSED");
+    assert.deepEqual(value.posts, ["register", "prepare", "activate", "restore"]);
+  });
+}
+
+test("required recovery Run retains the original restore flow", async context => {
+  const value = await recoveryFixture(context);
+  let receipt;
+  const result = await executeOwnerAcceptance(value.inputPath, value.inputSha, "Run", confirm, () => {}, {
+    prepareRecovery: hookContext => { receipt = prepareRecoveryFiles(hookContext); return receipt; },
+  });
+  assert.equal(result.status, "HOT_SWITCH_AND_RESTORE_PASSED");
+  assert.equal(hash(value.registryPath), receipt.targetRegistrySha256);
+  assert.deepEqual(value.posts, ["register", "prepare", "activate", "restore"]);
+});
 
 test("a subsequent upgrade restores its exact already-selected baseline", async context => {
   const value = await fixture(context);

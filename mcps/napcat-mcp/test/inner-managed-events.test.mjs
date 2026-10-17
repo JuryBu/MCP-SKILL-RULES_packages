@@ -22,3 +22,20 @@ test("a diagnostic storage fault leaves the managed observer caller running", ()
   const observe = createManagedEventObserver({ writer: { append() { throw Object.assign(new Error("full"), { code: "ENOSPC" }); } } });
   assert.doesNotThrow(() => observe({ type: "request_rejected", code: "COORDINATOR_TURN_UNAVAILABLE" }));
 });
+
+test("managed rejection observer accepts only validated diagnostic scalars and hash16 identities", () => {
+  const values = [];
+  const observe = createManagedEventObserver({ writer: { append: value => values.push(value) } });
+  const fields = { reason: "turn_mismatch", decisionPoint: "after_adopt", phase: "active", nativeHealthy: true,
+    workerAlive: false, activeHttp: 1, workerActiveHttp: 2, coordinatorActiveHttp: 3,
+    threadHash: "1".repeat(16), turnHash: "2".repeat(16), currentTurnHash: "3".repeat(16), workerFingerprint: "4".repeat(16) };
+  observe({ type: "request_rejected", ...fields, threadId: "private-thread", turnId: "private-turn",
+    currentTurnId: "private-current", headers: { authorization: "private-token" }, body: "private-body", prompt: "private-prompt",
+    metadata: { thread_id: "private-thread" }, token: "private-token" });
+  for (const [name, value] of Object.entries(fields)) assert.equal(values[0][name], value);
+  assert.equal(JSON.stringify(values).includes("private"), false);
+  observe({ type: "request_rejected", reason: "private-reason", decisionPoint: "private-stage", phase: "private-phase",
+    nativeHealthy: "private-true", workerAlive: 1, activeHttp: -1, workerActiveHttp: 1.5, coordinatorActiveHttp: Number.MAX_SAFE_INTEGER + 1,
+    threadHash: "private-thread", turnHash: "A".repeat(16), currentTurnHash: "1".repeat(17), workerFingerprint: { token: "private" } });
+  assert.deepEqual(Object.keys(values[1]).sort(), ["at", "type"]);
+});

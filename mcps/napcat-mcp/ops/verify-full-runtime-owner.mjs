@@ -15,6 +15,28 @@ function pinned(filename, expected) {
     || digest(fs.readFileSync(filename)) !== expected) fail("PIN_CHANGED:" + filename);
 }
 function samePath(left, right) { return path.resolve(left).toLowerCase() === path.resolve(right).toLowerCase(); }
+function verifyRecoveryReceipt(receipt, registryPath, registeredSha256, currentSha256 = registeredSha256) {
+  if (!receipt || typeof receipt !== "object"
+    || ["registryPath", "sourceRegistryPath", "targetRegistryPath", "configurationPath"].some(key => typeof receipt[key] !== "string" || !path.isAbsolute(receipt[key]))
+    || !samePath(receipt.registryPath, registryPath)) fail("RECOVERY_RECEIPT_INVALID");
+  if (receipt.targetRegistrySha256 !== registeredSha256) fail("RECOVERY_TARGET_REGISTRY_CHANGED");
+  pinned(registryPath, currentSha256);
+  pinned(receipt.sourceRegistryPath, receipt.sourceRegistrySha256);
+  pinned(receipt.targetRegistryPath, receipt.targetRegistrySha256);
+  pinned(receipt.configurationPath, receipt.configurationSha256);
+  const configuration = readJson(receipt.configurationPath);
+  if (["registryPath", "sourceRegistryPath", "targetRegistryPath"].some(key => typeof configuration[key] !== "string"
+    || !samePath(configuration[key], receipt[key]))) fail("RECOVERY_CONFIGURATION_BINDING_CHANGED");
+  if (!Array.isArray(configuration.pins) || !configuration.pins.length || configuration.pins.length > 1024) fail("RECOVERY_PINS_INVALID");
+  for (const pin of configuration.pins) {
+    if (!pin || typeof pin.path !== "string" || !path.isAbsolute(pin.path)) fail("RECOVERY_PIN_INVALID");
+    pinned(pin.path, pin.sha256);
+  }
+  for (const kind of ["source", "target"]) {
+    if (!configuration.pins.some(pin => samePath(pin.path, receipt[kind + "RegistryPath"])
+      && pin.sha256 === receipt[kind + "RegistrySha256"])) fail("RECOVERY_REGISTRY_PIN_MISSING");
+  }
+}
 function under(root, child) {
   const relative = path.relative(fs.realpathSync(root), path.resolve(child));
   return relative && !relative.startsWith("..") && !path.isAbsolute(relative);
@@ -26,6 +48,7 @@ export async function inspectOwnerInput(inputPath, inputSha256, restoreOnly = fa
     || !/^[a-zA-Z0-9_-]{1,80}$/u.test(input.candidateId)) fail("INPUT_INVALID");
   if (input.expectedRegistrySha256 != null && !/^[a-f0-9]{64}$/u.test(input.expectedRegistrySha256)) fail("REGISTRY_BASELINE_INVALID");
   if (input.expectedRevision != null && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0)) fail("REVISION_BASELINE_INVALID");
+  if (input.requireRecoveryPreparation != null && typeof input.requireRecoveryPreparation !== "boolean") fail("RECOVERY_REQUIREMENT_INVALID");
   if (!restoreOnly) for (const pin of input.pins) pinned(pin.path, pin.sha256);
   if (!input.pins.some(pin => samePath(pin.path, input.profilePath))
     || !input.pins.some(pin => samePath(pin.path, input.builderPath))
@@ -77,6 +100,9 @@ export async function executeOwnerAcceptance(inputPath, inputSha256, action, con
   if (!["Inspect", "Run", "Apply", "Restore"].includes(action)) fail("ACTION_INVALID");
   const context = await inspectOwnerInput(inputPath, inputSha256, action === "Restore");
   const { input, profile, sourceManifest, request, verifyInstance, status: before } = context;
+  const requireRecovery = action !== "Restore" && input.requireRecoveryPreparation === true;
+  if (requireRecovery && typeof options.prepareRecovery !== "function") fail("RECOVERY_PREPARATION_REQUIRED");
+  if (requireRecovery && (typeof profile.stateRoot !== "string" || !path.isAbsolute(profile.stateRoot))) fail("RECOVERY_STATE_ROOT_REQUIRED");
   const baselineRevision = input.expectedRevision ?? 0;
   const baselineSelection = input.expectedSelection ?? { id: "original", manifestSha256: null };
   if (typeof baselineSelection.id !== "string" || !baselineSelection.id
@@ -196,15 +222,43 @@ export async function executeOwnerAcceptance(inputPath, inputSha256, action, con
     const prepared = await request("prepare", { ...binding(registered), manifestPath: built.manifestPath,
       manifestSha256: built.manifestSha256, workerCandidateId: candidate.id, ...(compatibility ? { compatibility } : {}) });
     record("prepared", prepared);
+    const registryPath = requireRecovery ? path.join(profile.stateRoot, "inner-candidate-approvals.json") : null;
+    let recovery;
+    if (requireRecovery) {
+      phase = "recovery_preparation";
+      verifyInstance();
+      pinned(registryPath, registered.candidateRegistrySha256);
+      record("recovery_preparation_requested", { registryPath, registeredRegistrySha256: registered.candidateRegistrySha256, preparationId: prepared.id });
+      recovery = structuredClone(await options.prepareRecovery(Object.freeze(structuredClone({ inputPath, inputSha256, action,
+        input, profile, sourceManifest, before, registered, prepared, built, candidate, compatibility, registryPath }))));
+      verifyRecoveryReceipt(recovery, registryPath, registered.candidateRegistrySha256);
+      record("recovery_prepared", recovery);
+    }
     emit(options.nonInteractive === true ? "CANDIDATE_READY. Continuing non-interactively." : "CANDIDATE_READY. Send READY in this Codex conversation, then type ACTIVATE here. Do not close Codex.");
     await confirmAction("Type ACTIVATE: ", "ACTIVATE");
     phase = "activate";
     verifyInstance();
     const current = await request();
     if (current.revision !== baselineRevision || current.instanceId !== input.instanceId || current.failed || current.busy) fail("PRE_ACTIVATE_STATE_CHANGED");
+    if (requireRecovery) {
+      if (current.candidateRegistrySha256 !== registered.candidateRegistrySha256 || !isBaselineSelection(current.selected)) fail("PRE_ACTIVATE_REGISTRY_CHANGED");
+      verifyRecoveryReceipt(recovery, registryPath, registered.candidateRegistrySha256);
+    }
     record("activate_requested", { ...binding(current), preparationId: prepared.id });
     const activated = await request("activate", { ...binding(current), preparationId: prepared.id });
     if (activated.selected?.manifestSha256 !== built.manifestSha256 || activated.revision !== baselineRevision + 1 || activated.failed || activated.busy) fail("ACTIVATION_NOT_CONFIRMED");
+    if (requireRecovery) {
+      phase = "activated_recovery_binding";
+      const activatedStatus = await request();
+      verifyInstance();
+      if (activatedStatus.instanceId !== input.instanceId || activatedStatus.revision !== baselineRevision + 1
+        || activatedStatus.selected?.id !== activated.selected?.id || activatedStatus.selected?.manifestSha256 !== built.manifestSha256
+        || activatedStatus.failed || activatedStatus.busy) fail("ACTIVATED_RECOVERY_STATE_CHANGED");
+      if (activatedStatus.candidateRegistrySha256 !== recovery.sourceRegistrySha256) fail("ACTIVATED_RECOVERY_REGISTRY_CHANGED");
+      verifyRecoveryReceipt(recovery, registryPath, registered.candidateRegistrySha256, recovery.sourceRegistrySha256);
+      const registry = readJson(registryPath);
+      if (registry.selection?.candidateId !== input.candidateId || registry.selection?.manifestSha256 !== built.manifestSha256) fail("ACTIVATED_REGISTRY_CHANGED");
+    }
     observe("activated", activated);
     if (profile.stateRoot) observe("activated_registry", () => {
       const registryPath = path.join(profile.stateRoot, "inner-candidate-approvals.json");

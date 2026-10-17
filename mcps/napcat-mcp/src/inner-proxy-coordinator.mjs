@@ -51,7 +51,8 @@ export function createInnerProxyCoordinator(options) {
     recycleRetiredWorkers: runtimeProfile?.workerLifecycle?.recycleRetiredWorkers !== false,
     workerSequence: 0, requestSequence: 0, nativeSequence: 0, httpSequence: 0, generation: 0,
     transactionActive: false, starting: false, closing: false, nativeHealthy: true, preparationTask: null,
-    workerMaintenance: false, relay: Promise.resolve(), server: null, implementation: null, implementationGeneration: 0 };
+    workerMaintenance: false, relay: Promise.resolve(), server: null, implementation: null, implementationGeneration: 0,
+    recentRejections: [] };
   state.dispatch = (method, ...args) => state.implementation[method](...args);
   state.bindDispatch = (method, ...bound) => (...args) => state.dispatch(method, ...bound, ...args);
   state.implementation = checkedImplementation(createInnerProxyCoordinatorImplementation(state));
@@ -95,6 +96,28 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   const recycleRetiredWorkers = runtimeProfile?.workerLifecycle?.recycleRetiredWorkers !== false;
   const emit = (type, fields = {}) => onEvent({ type, ...fields });
   const alive = worker => worker?.ready && worker.child.connected && worker.child.exitCode === null && worker.child.signalCode === null;
+  shared.recentRejections ??= [];
+  const rejectionErrors = shared.rejectionErrors ??= new WeakMap();
+  const rejectionDetails = (metadata, state, decisionPoint, reason) => {
+    const fields = { reason, decisionPoint, nativeHealthy: Boolean(shared.nativeHealthy), workerAlive: Boolean(alive(state?.worker)),
+      coordinatorActiveHttp: shared.requests.size };
+    for (const [name, value] of Object.entries({ threadHash: metadata?.thread_id, turnHash: metadata?.turn_id,
+      currentTurnHash: state?.turnId, workerFingerprint: state?.worker?.workerId })) {
+      if (validIdentity(value)) fields[name] = digest(value).slice(0, 16);
+    }
+    if (["active", "terminal"].includes(state?.phase)) fields.phase = state.phase;
+    for (const [name, value] of Object.entries({ activeHttp: state?.activeHttp, workerActiveHttp: state?.worker?.activeHttp })) {
+      if (Number.isSafeInteger(value) && value >= 0) fields[name] = value;
+    }
+    return fields;
+  };
+  const unavailableReason = (metadata, state) => !shared.nativeHealthy ? "native_unhealthy" : !state ? "thread_not_found"
+    : state.phase !== "active" ? "phase_not_active" : state.turnId !== metadata.turn_id ? "turn_mismatch" : "worker_dead";
+  const rejectRequest = (code, metadata, state, decisionPoint, reason) => {
+    const error = Object.assign(new Error(code), { code });
+    rejectionErrors.set(error, rejectionDetails(metadata, state, decisionPoint, reason));
+    throw error;
+  };
   const identity = worker => ({ pid: worker.child.pid, instanceToken: worker.ready.instanceToken,
     core: worker.ready.sourceHashes.core, helper: worker.ready.sourceHashes.helper });
   const threadStates = () => [...threads.values(), ...(shared.terminalThreads?.values() ?? [])];
@@ -475,6 +498,8 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   async function handleHttpRequest(request, response) {
     let state;
     let routed;
+    let metadata;
+    let decisionPoint = "request_validation";
     const requestPath = String(request.url ?? "").split("?")[0];
     const catalog = request.method === "GET" && requestPath === "/backend-api/codex/models";
     const image = request.method === "POST" && ["/backend-api/codex/images/generations", "/backend-api/codex/images/edits"].includes(requestPath);
@@ -484,11 +509,12 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       if (!request.url?.startsWith("/") || request.url.startsWith("//")) fail("COORDINATOR_INVALID_REQUEST_TARGET");
       const rawMetadata = request.headers["x-codex-turn-metadata"];
       if ((catalog || image || memory) && rawMetadata === undefined) {
-        if (!alive(shared.defaultWorker)) fail("COORDINATOR_WORKER_UNAVAILABLE");
+        if (!alive(shared.defaultWorker)) {
+          rejectRequest("COORDINATOR_WORKER_UNAVAILABLE", metadata, { worker: shared.defaultWorker }, "request_validation", "worker_dead");
+        }
         state = { threadId: null, turnId: null, worker: shared.defaultWorker, activeHttp: 0 };
       } else {
         if (typeof rawMetadata !== "string" || rawMetadata.length > 8192) fail("COORDINATOR_TURN_IDENTITY_REQUIRED");
-        let metadata;
         try { metadata = JSON.parse(rawMetadata); } catch { fail("COORDINATOR_TURN_IDENTITY_REQUIRED"); }
         for (;;) {
           await migrations.get(metadata.thread_id)?.done;
@@ -497,10 +523,16 @@ export function createInnerProxyCoordinatorImplementation(shared) {
           if (!migrations.has(metadata.thread_id) && observedRelay === shared.relay) break;
         }
         state = threads.get(metadata.thread_id);
-        if (!shared.nativeHealthy || !state || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) fail("COORDINATOR_TURN_UNAVAILABLE");
+        if (!shared.nativeHealthy || !state || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) {
+          rejectRequest("COORDINATOR_TURN_UNAVAILABLE", metadata, state, "before_adopt", unavailableReason(metadata, state));
+        }
+        decisionPoint = "during_adopt";
         await shared.dispatch("adoptForRequest", state, metadata, request, response);
-        if (!shared.nativeHealthy || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) fail("COORDINATOR_TURN_UNAVAILABLE");
+        if (!shared.nativeHealthy || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) {
+          rejectRequest("COORDINATOR_TURN_UNAVAILABLE", metadata, state, "after_adopt", unavailableReason(metadata, state));
+        }
       }
+      decisionPoint = "forwarding";
       if (request.aborted || response.destroyed) return;
       if (shared.closing) fail("COORDINATOR_CLOSING");
       const worker = state.worker;
@@ -524,8 +556,15 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       if (routed) shared.dispatch("releaseHttpRequest", routed);
       if (!response.headersSent) response.writeHead(503);
       response.end("COORDINATOR_REQUEST_NOT_ACCEPTED");
+      const diagnostics = rejectionErrors.get(error) ?? rejectionDetails(metadata, state, decisionPoint, "request_failed");
+      const recent = { at: new Date().toISOString(), ...diagnostics, pathSha256: digest(requestPath) };
+      const code = error.code ?? "COORDINATOR_REQUEST_NOT_ACCEPTED";
+      if (validIdentity(code)) recent.code = code;
+      if (typeof request.method === "string" && /^[A-Z]{1,16}$/u.test(request.method)) recent.method = request.method;
+      shared.recentRejections.push(recent);
+      if (shared.recentRejections.length > 32) shared.recentRejections.splice(0, shared.recentRejections.length - 32);
       emit("request_rejected", { code: error.code ?? "COORDINATOR_REQUEST_NOT_ACCEPTED", method: request.method,
-        path: catalog || image || memory ? requestPath : null, pathSha256: digest(requestPath) });
+        path: catalog || image || memory ? requestPath : null, pathSha256: digest(requestPath), ...diagnostics });
     }
   }
 
@@ -656,8 +695,14 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       const selected = state.pendingActivation;
       if (selected !== shared.activation || !selected.active) { delete state.pendingActivation; return; }
       if (state.activationError) fail(state.activationError);
-      if (state.phase !== "active" || state.turnId !== metadata.turn_id) fail("COORDINATOR_TURN_UNAVAILABLE");
-      if (!alive(state.worker) || !alive(selected.target)) fail("COORDINATOR_WORKER_UNAVAILABLE");
+      if (state.phase !== "active" || state.turnId !== metadata.turn_id) {
+        rejectRequest("COORDINATOR_TURN_UNAVAILABLE", metadata, state, "during_adopt",
+          state.phase !== "active" ? "phase_not_active" : "turn_mismatch");
+      }
+      if (!alive(state.worker) || !alive(selected.target)) {
+        rejectRequest("COORDINATOR_WORKER_UNAVAILABLE", metadata, state, "during_adopt",
+          !alive(state.worker) ? "worker_dead" : "adoption_target_dead");
+      }
       if (state.worker === selected.target) { delete state.pendingActivation; return; }
       const existing = adoptions.get(state.threadId);
       if (existing) { await existing; continue; }
@@ -801,6 +846,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       transactionActive: shared.transactionActive, defaultWorkerId: shared.defaultWorker?.workerId ?? null,
       liveCode: { stateSchema: coordinatorStateSchema, generation: shared.implementationGeneration },
       activeHttp: shared.requests.size, pendingControl: pending.size,
+      recentRejections: shared.recentRejections.map(entry => ({ ...entry })),
       sequences: { worker: shared.workerSequence, request: shared.requestSequence, native: shared.nativeSequence,
         http: shared.httpSequence, migration: shared.generation },
       activation: shared.activation ? { activationId: shared.activation.id, active: shared.activation.active, sourceWorkerId: shared.activation.source.workerId,
