@@ -86,6 +86,7 @@ function Remove-OldStartupDiagnostics {
 Write-StartupDiagnostic -Stage 'configuration'
 try {
 . (Join-Path $PSScriptRoot "resolve-codex-outer-runtime-startup.ps1")
+. (Join-Path $PSScriptRoot 'test-codex-startup-readiness.ps1')
 $OuterRuntimeStartup = Resolve-CodexOuterRuntimeStartup -DataRoot $DataRoot
 if (-not [string]::IsNullOrWhiteSpace($CodexExecutablePath)) {
   if ($CodexExecutablePath -notmatch '^[A-Za-z]:[\\/]' -and $CodexExecutablePath -notmatch '^\\\\[^\\/]+[\\/][^\\/]+[\\/]') {
@@ -123,7 +124,8 @@ function Test-ExpectedProxyRuntime {
   if ($RuntimeState.state -eq 'waiting_for_desktop' -and ($RuntimeState.waitingForDesktop -ne $true -or $null -ne $RuntimeState.appServerPid)) { return $false }
   $DownstreamOwner = Get-NetTCPConnection -State Listen -LocalPort $DownstreamPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @('127.0.0.1', '::1') } | Select-Object -First 1 -ExpandProperty OwningProcess
   $ControlOwner = Get-NetTCPConnection -State Listen -LocalPort $ControlPort -ErrorAction SilentlyContinue | Where-Object { $_.LocalAddress -in @('127.0.0.1', '::1') } | Select-Object -First 1 -ExpandProperty OwningProcess
-  return [int]$DownstreamOwner -eq [int]$RuntimeState.pid -and [int]$ControlOwner -eq [int]$RuntimeState.pid
+  if ([int]$DownstreamOwner -ne [int]$RuntimeState.pid -or [int]$ControlOwner -ne [int]$RuntimeState.pid) { return $false }
+  return Test-CodexManagedStartupReadiness -Startup $OuterRuntimeStartup -DataRoot $DataRoot -RuntimeState $RuntimeState -ControlPort $ControlPort -TokenFilePath $TokenFilePath
 }
 
 function Get-OuterRuntimeStartupStatus {
@@ -196,24 +198,22 @@ if ($StartupRecoveryMode -ne 'Plan' -and (Test-Path -LiteralPath $RuntimeStatePa
       if ([int]$ExistingState.pid -ne $ExistingPid -or [string]$ExistingState.instanceToken -cne $ExistingToken -or
           -not (Test-ExpectedProxyIdentity -RuntimeState $ExistingState -ProcessInfo $ExistingProcess)) { throw 'EXISTING_PROXY_CHANGED_PRESERVED' }
     }
-    if (Test-ExpectedProxyRuntime -RuntimeState $ExistingState -ProcessInfo $ExistingProcess) {
-      $StartupDiagnostic.observedRunnerPid = [int]$ExistingState.pid
-      Write-StartupDiagnostic -Stage 'existing_runtime' -Status 'ready'
-      [pscustomobject]@{
-        started = $false
-        reason = "already_running"
-        pid = [int]$ExistingState.pid
-        state = [string]$ExistingState.state
-        downstreamUrl = [string]$ExistingState.downstreamUrl
-        controlUrl = [string]$ExistingState.controlUrl
-        runtimeStatePath = $RuntimeStatePath
-        tokenFilePath = $TokenFilePath
-        fallbackRequired = [bool]$ExistingState.fallbackRequired
-        runtimeState = $ExistingState
-        outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $ExistingState -ProcessInfo $ExistingProcess -AppliedByThisStart $false
-      } | ConvertTo-Json -Depth 12
-      return
-    }
+    $StartupDiagnostic.observedRunnerPid = [int]$ExistingState.pid
+    Write-StartupDiagnostic -Stage 'existing_runtime' -Status 'ready'
+    [pscustomobject]@{
+      started = $false
+      reason = "already_running"
+      pid = [int]$ExistingState.pid
+      state = [string]$ExistingState.state
+      downstreamUrl = [string]$ExistingState.downstreamUrl
+      controlUrl = [string]$ExistingState.controlUrl
+      runtimeStatePath = $RuntimeStatePath
+      tokenFilePath = $TokenFilePath
+      fallbackRequired = [bool]$ExistingState.fallbackRequired
+      runtimeState = $ExistingState
+      outerRuntimeStartup = Get-OuterRuntimeStartupStatus -RuntimeState $ExistingState -ProcessInfo $ExistingProcess -AppliedByThisStart $false
+    } | ConvertTo-Json -Depth 12
+    return
   }
 }
 

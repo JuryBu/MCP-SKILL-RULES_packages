@@ -4,12 +4,16 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
+import http from "node:http";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { pathToFileURL, fileURLToPath } from "node:url";
 import { createProxyWholeRuntimeControl, createProxyWholeRuntimeControlImplementation } from "../src/proxy-whole-runtime-control.mjs";
-import { readInnerCandidateRegistry } from "../src/inner-runtime-profile.mjs";
+import { readInnerCandidateRegistry, saveInnerCandidateRegistry } from "../src/inner-runtime-profile.mjs";
 import { createProxyParentCodeRuntime } from "../src/proxy-live-parent-runtime.mjs";
 
 const digest = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
-function fixture(context, actualParent = false) {
+function fixture(context, actualParent = false, createRuntime = createProxyWholeRuntimeControl) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "whole-control-fixture-"));
   context.after(() => fs.rmSync(root, { recursive: true }));
   const installationRoot = path.join(root, "approved");
@@ -68,7 +72,7 @@ function fixture(context, actualParent = false) {
     discardCandidate({ workerId }) { state.workerCalls.push("discard"); const worker = workers.find(entry => entry.workerId === workerId);
       assert.notEqual(worker, state.defaultWorker); worker.alive = false; },
   };
-  const runtime = createProxyWholeRuntimeControl(actualParent ? null : parent, coordinator, profile, "instance", root);
+  const runtime = createRuntime(actualParent ? null : parent, coordinator, profile, "instance", root);
   let boundParent = parent;
   let writtenVersions = 0;
   const writeActualBundle = (version, failFactory = false) => {
@@ -106,6 +110,71 @@ function fixture(context, actualParent = false) {
   if (actualParent) Object.assign(input, writeActualBundle("owned-A"));
   return { runtime, state, input, profile, sourceRoot, workers, parent: boundParent, coordinator, original, root, writeActualBundle };
 }
+
+for (const failure of [false, true]) test(`startup gate real recover ${failure ? "failure preserves selection" : "slow success waits"}`, { skip: process.platform !== "win32" }, async context => {
+  const createRuntime = process.env.NAPCAT_STARTUP_SEED_ROOT
+    ? (await import(pathToFileURL(path.join(process.env.NAPCAT_STARTUP_SEED_ROOT, "src/proxy-whole-runtime-control.mjs")).href)).createProxyWholeRuntimeControl
+    : createProxyWholeRuntimeControl;
+  const value = fixture(context, true, createRuntime);
+  const selection = { candidateId: value.input.workerCandidateId, manifestPath: value.input.manifestPath,
+    manifestSha256: value.input.manifestSha256, compatibility: value.input.compatibility };
+  saveInnerCandidateRegistry(value.profile, value.profile.approvedCandidates, null, selection);
+  const registryPath = path.join(value.profile.stateRoot, "inner-candidate-approvals.json");
+  const registryBefore = fs.readFileSync(registryPath);
+  value.state.delayPreparation = true;
+  value.state.failPreparation = failure;
+  let recoveryError;
+  const recovering = value.runtime.recover().catch(error => { recoveryError = error.message; });
+  let requests = 0;
+  const server = http.createServer((request, response) => {
+    assert.equal(request.headers.authorization, "Bearer fixture-token");
+    response.setHeader("content-type", "application/json");
+    if (request.url === "/v1/full-runtime") {
+      requests += 1;
+      response.end(JSON.stringify({ ok: true, ...value.runtime.status() }));
+      if (!failure && requests === 2) setTimeout(() => value.state.releasePreparation(), 100);
+    } else response.end(JSON.stringify({ ok: true, ownerId: value.profile.ownerId, nativeSourceId: value.profile.nativeSourceId,
+      instanceToken: "instance", selectedWorkerId: value.state.defaultWorker.workerId, selectedSourceHashes: value.state.defaultWorker.sourceHashes,
+      coordinator: { running: true, nativeHealthy: true, workers: value.workers } }));
+  });
+  server.listen(0, "127.0.0.1"); await once(server, "listening");
+  context.after(() => server.close());
+  const tokenPath = path.join(value.root, "token.txt"); fs.writeFileSync(tokenPath, "fixture-token");
+  const managedPath = path.join(value.profile.stateRoot, "managed.json");
+  fs.writeFileSync(managedPath, JSON.stringify({ state: "running", pid: 54321, instanceToken: "instance",
+    ownerId: value.profile.ownerId, nativeSourceId: value.profile.nativeSourceId, livenessAt: new Date().toISOString() }));
+  const profilePath = path.join(value.root, "readiness-profile.json");
+  fs.writeFileSync(profilePath, JSON.stringify({ ...value.profile, managedStatePath: managedPath,
+    ports: { inner: 41435 }, controlTokenSha256: digest("fixture-token") }));
+  const helper = fileURLToPath(new URL("../ops/test-codex-startup-readiness.ps1", import.meta.url));
+  const script = `$ErrorActionPreference='Stop';. '${helper}';
+function Get-CodexInnerManagedStartupProfile {param($Startup,$DataRoot) Get-Content -LiteralPath $env:SEED_PROFILE -Raw -Encoding UTF8 | ConvertFrom-Json}
+function Assert-CodexStartupPathWithoutReparsePoint {param($Path)}
+function Get-NetTCPConnection {param($State,$LocalPort,$ErrorAction) [pscustomobject]@{LocalAddress='127.0.0.1';OwningProcess=54321}}
+$ready=$false
+for($attempt=0;$attempt -lt 20;$attempt++) {
+ if(Test-CodexManagedStartupReadiness -Startup ([pscustomobject]@{innerManagedProfilePath=$env:SEED_PROFILE}) -DataRoot $env:SEED_ROOT -RuntimeState ([pscustomobject]@{pid=54321;instanceToken='instance';state='running'}) -ControlPort ${server.address().port} -TokenFilePath $env:SEED_TOKEN){$ready=$true;break}
+ Start-Sleep -Milliseconds 75
+}
+[pscustomobject]@{ready=$ready;attempts=$attempt;psVersion=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json`;
+  const powershell = process.env.NAPCAT_TEST_POWERSHELL ?? "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe";
+  const child = spawn(powershell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true,
+    env: { ...process.env, SEED_PROFILE: profilePath, SEED_ROOT: value.root, SEED_TOKEN: tokenPath } });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", bytes => { stdout += bytes; }); child.stderr.on("data", bytes => { stderr += bytes; });
+  const [exitCode] = await once(child, "exit");
+  await recovering;
+  assert.equal(exitCode, 0, stderr);
+  const observed = JSON.parse(stdout);
+  assert.equal(observed.ready, !failure);
+  assert.ok(requests >= 2);
+  if (failure) {
+    assert.equal(recoveryError, "owned-worker-preparation-failure");
+    assert.deepEqual(fs.readFileSync(registryPath), registryBefore);
+    assert.equal(value.state.defaultWorker.workerId, "original");
+  } else assert.equal(value.runtime.status().selected.manifestSha256, selection.manifestSha256);
+  console.log(JSON.stringify({ seedRoot: process.env.NAPCAT_STARTUP_SEED_ROOT ?? "repository", failure, requests, ...observed }));
+});
 
 test("new same-source candidate registration persists across control reload and keeps the live approval array", async context => {
   const value = fixture(context);

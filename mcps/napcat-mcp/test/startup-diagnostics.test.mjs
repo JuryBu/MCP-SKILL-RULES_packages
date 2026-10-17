@@ -22,7 +22,7 @@ function fixture({ recovery = false, plan = false, failPlan = false, oldAttempts
   fs.mkdirSync(path.join(packageRoot, "ops"), { recursive: true });
   fs.mkdirSync(path.join(packageRoot, "src"));
   fs.mkdirSync(stateRoot, { recursive: true });
-  for (const name of ["start-codex-app-server-proxy.ps1", "resolve-napcat-data-root.ps1", "resolve-codex-outer-runtime-startup.ps1"]) {
+  for (const name of ["start-codex-app-server-proxy.ps1", "test-codex-startup-readiness.ps1", "resolve-napcat-data-root.ps1", "resolve-codex-outer-runtime-startup.ps1"]) {
     fs.copyFileSync(path.join(repository, "ops", name), path.join(packageRoot, "ops", name));
   }
   fs.writeFileSync(path.join(packageRoot, "src", "codex-app-server-proxy-runner.mjs"), runnerSource ?? "process.stdout.write('runner-started\\n');process.stderr.write('FIXTURE_RUNNER_CAUSE: missing dependency\\n');process.exitCode=17;\n");

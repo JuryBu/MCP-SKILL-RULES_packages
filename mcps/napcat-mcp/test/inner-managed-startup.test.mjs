@@ -8,7 +8,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 const repository = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const powershell = path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+const powershell = process.env.NAPCAT_TEST_POWERSHELL ?? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
 const resolver = path.join(repository, "ops", "resolve-codex-outer-runtime-startup.ps1");
 const entry = path.join(repository, "ops", "start-codex-app-server-proxy.ps1");
 const innerEntry = path.join(repository, "ops", "start-codex-model-stream-proxy.ps1");
@@ -57,11 +57,19 @@ $global:InnerMockPid=54321
 $global:InnerMockCommand=''
 function Get-CimInstance { param($ClassName,$Filter,$ErrorAction) [pscustomobject]@{CommandLine=$global:InnerMockCommand} }
 function Get-NetTCPConnection { param($State,$LocalPort,$ErrorAction) [pscustomobject]@{LocalAddress='127.0.0.1';OwningProcess=$global:InnerMockPid} }
-function Invoke-RestMethod { param($Uri,$Headers,$TimeoutSec) throw 'STUB_CONTROL_UNAVAILABLE' }
+function Invoke-RestMethod { param($Uri,$Headers,$TimeoutSec)
+  $hashes=[pscustomobject]@{runner=('a'*64);core=('a'*64);helper=('a'*64);control=('a'*64)}
+  if ($Uri.EndsWith('/v1/full-runtime')) { return [pscustomobject]@{ok=$true;instanceId=$global:InnerMockToken;busy=$false;failed=$false;candidateRegistrySha256=$null;selected=[pscustomobject]@{id='original';manifestSha256=$null}} }
+  if ($Uri.EndsWith('/v1/inner/status')) { return [pscustomobject]@{ok=$true;ownerId='startup-fixture';nativeSourceId='startup-native';instanceToken=$global:InnerMockToken;selectedWorkerId='worker-one';selectedSourceHashes=$hashes;coordinator=[pscustomobject]@{running=$true;nativeHealthy=$true;workers=@([pscustomobject]@{workerId='worker-one';alive=$true;sourceHashes=$hashes})}} }
+  throw 'STUB_CONTROL_UNAVAILABLE'
+}
 function Start-Process { param($FilePath,$ArgumentList,$WindowStyle,[switch]$PassThru)
   $global:InnerMockCommand=$ArgumentList
   $tokenMatch=[regex]::Match($ArgumentList,'"--instance-token"\\s+"([^"]+)"')
   $token=if($tokenMatch.Success){$tokenMatch.Groups[1].Value}else{'fixture-token'}
+  $global:InnerMockToken=$token
+  $profile=Get-Content -LiteralPath (Join-Path $env:INNER_TEST_ROOT 'state/inner profile.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($profile.managedStatePath) { [pscustomobject]@{state='running';pid=$global:InnerMockPid;instanceToken=$token;ownerId=$profile.ownerId;nativeSourceId=$profile.nativeSourceId;livenessAt=[DateTimeOffset]::UtcNow.ToString('o')} | ConvertTo-Json | Set-Content -LiteralPath $profile.managedStatePath -Encoding UTF8 }
   [pscustomobject]@{argumentLine=$ArgumentList;token=$token;windowStyle=$WindowStyle} | ConvertTo-Json | Set-Content -LiteralPath $env:INNER_TEST_CAPTURE -Encoding UTF8
   [pscustomobject]@{state='running';pid=$global:InnerMockPid;instanceToken=$token;proxy=[pscustomobject]@{outerRuntime=[pscustomobject]@{enabled=$true;instanceId=$token}}} | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $env:INNER_TEST_ROOT 'state\\codex-app-server-proxy-runtime.json') -Encoding UTF8
   [pscustomobject]@{pid=$global:InnerMockPid;token=$token} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:INNER_TEST_ROOT 'state\\codex-app-server-proxy.lock') -Encoding UTF8
@@ -135,7 +143,7 @@ test("normal managed startup dispatch binds the profile and generates a fresh la
   const tokens = [];
   for (const attempt of ["first", "second"]) {
     const context = fixture(`dispatch-${attempt}`);
-    configure(context);
+    configureManaged(context);
     const result = execute(context, stubbedEntry);
     assert.equal(result.status, 0, result.stderr);
     const capture = JSON.parse(fs.readFileSync(context.capturePath, "utf8").replace(/^\uFEFF/u, ""));
@@ -159,6 +167,7 @@ function configureManaged(context) {
   const tokenPath = path.join(context.stateRoot, "codex-app-server-proxy-token.txt");
   fs.writeFileSync(tokenPath, "owned-status-fixture-token");
   const profile = { schemaVersion: 1, mode: "production", ownerId: "startup-fixture", nativeSourceId: "startup-native",
+    initial: { expectedHashes: Object.fromEntries(["runner", "core", "helper", "control"].map(name => [name, "a".repeat(64)])) },
     innerPort: 41435, upstreamOrigin: "http://127.0.0.1:41436", stateRoot: path.join(context.stateRoot, "inner-managed"),
     managedStatePath: path.join(context.stateRoot, "inner-managed", "managed-runtime.json"),
     ports: { inner: 41435, downstream: 41432, control: 41431, upstream: 41433, probe: 41434 },

@@ -51,7 +51,7 @@ function collect(relative) {
   }
 }
 for (const relative of ["src/codex-app-server-proxy-runner.mjs", "src/codex-model-stream-proxy-runner.mjs",
-  "ops/start-codex-model-stream-proxy.ps1", "ops/start-codex-app-server-proxy.ps1", "ops/get-codex-model-stream-proxy-status.ps1",
+  "ops/start-codex-model-stream-proxy.ps1", "ops/start-codex-app-server-proxy.ps1", "ops/test-codex-startup-readiness.ps1", "ops/get-codex-model-stream-proxy-status.ps1",
   "ops/resolve-codex-outer-runtime-startup.ps1", "ops/resolve-napcat-data-root.ps1"]) collect(relative);
 function collectPackage(directory) {
   for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
