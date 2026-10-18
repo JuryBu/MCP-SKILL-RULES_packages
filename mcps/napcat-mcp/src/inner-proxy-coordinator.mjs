@@ -99,10 +99,19 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   shared.recentRejections ??= [];
   const rejectionErrors = shared.rejectionErrors ??= new WeakMap();
   const rejectionDetails = (metadata, state, decisionPoint, reason) => {
+    const category = (value, allowed) => value === undefined ? "missing" : allowed.includes(value) ? value : "unknown";
+    const current = threads.get(metadata?.thread_id);
+    const terminal = current ? undefined : shared.terminalThreads?.get(metadata?.thread_id);
     const fields = { reason, decisionPoint, nativeHealthy: Boolean(shared.nativeHealthy), workerAlive: Boolean(alive(state?.worker)),
-      coordinatorActiveHttp: shared.requests.size };
+      coordinatorActiveHttp: shared.requests.size,
+      requestKind: category(metadata?.request_kind, ["turn", "prewarm", "compaction", "memory"]),
+      subagentKind: category(metadata?.subagent_kind, ["review", "compact", "thread_spawn", "memory_consolidation"]),
+      threadRegistry: current ? "current" : terminal ? "terminal_history" : "absent" };
+    if (terminal && validIdentity(metadata?.turn_id) && validIdentity(terminal.turnId)) {
+      fields.terminalTurnMatches = terminal.turnId === metadata.turn_id;
+    }
     for (const [name, value] of Object.entries({ threadHash: metadata?.thread_id, turnHash: metadata?.turn_id,
-      currentTurnHash: state?.turnId, workerFingerprint: state?.worker?.workerId })) {
+      currentTurnHash: state?.turnId, workerFingerprint: state?.worker?.workerId, parentThreadHash: metadata?.parent_thread_id })) {
       if (validIdentity(value)) fields[name] = digest(value).slice(0, 16);
     }
     if (["active", "terminal"].includes(state?.phase)) fields.phase = state.phase;

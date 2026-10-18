@@ -8,6 +8,7 @@ import { once } from "node:events";
 import test from "node:test";
 import * as coordinatorModule from "../src/inner-proxy-coordinator.mjs";
 import { createManagedEventObserver } from "../src/inner-managed-events.mjs";
+import { createManagedInnerProxySessionImplementation } from "../src/inner-managed-session.mjs";
 
 const threadId = "11111111-1111-4111-8111-111111111111";
 const turnId = "22222222-2222-4222-8222-222222222222";
@@ -54,7 +55,7 @@ async function fixture(context, { legacyObserver = false } = {}) {
         authorization: "private-token", "content-type": "application/json" }, body: '{"prompt":"private-body"}' });
     return { status: response.status, body: await response.text() };
   };
-  return { coordinator, participant, shared, state, worker, events, observed, calls, request };
+  return { root, coordinator, participant, shared, state, worker, events, observed, calls, request };
 }
 
 const beforeCases = [
@@ -260,4 +261,98 @@ test("metadata-free catalog keeps its original native-health bypass and worker f
   assert.equal(recent.reason, "worker_dead");
   assert.equal(recent.code, "COORDINATOR_WORKER_UNAVAILABLE");
   assert.equal(recent.nativeHealthy, false);
+});
+
+test("rejection categories and parent hashes identify request purpose without changing admission", async context => {
+  const value = await fixture(context);
+  const parentId = "44444444-4444-4444-8444-444444444444";
+  value.shared.threads.clear();
+  for (const requestKind of ["turn", "prewarm", "compaction", "memory"]) {
+    for (const subagentKind of ["review", "compact", "thread_spawn", "memory_consolidation"]) {
+      assert.deepEqual(await value.request({ thread_id: threadId, turn_id: turnId, request_kind: requestKind,
+        subagent_kind: subagentKind, parent_thread_id: parentId }),
+      { status: 503, body: "COORDINATOR_REQUEST_NOT_ACCEPTED" });
+      const recent = value.coordinator.status().recentRejections.at(-1);
+      assert.equal(recent.requestKind, requestKind);
+      assert.equal(recent.subagentKind, subagentKind);
+      assert.equal(recent.parentThreadHash, hash16(parentId));
+      assert.equal(recent.threadRegistry, "absent");
+      assert.equal(recent.reason, "thread_not_found");
+      assert.equal(Object.hasOwn(recent, "terminalTurnMatches"), false);
+    }
+  }
+  assert.equal(value.calls.length, 0);
+  assert.equal(JSON.stringify([value.events, value.coordinator.status().recentRejections]).includes(parentId), false);
+  value.shared.threads.set(threadId, value.state);
+  assert.equal((await value.request({ thread_id: threadId, turn_id: turnId,
+    request_kind: "private-custom", subagent_kind: {}, parent_thread_id: "private/parent" })).status, 200);
+});
+
+test("diagnostic categories redact unknown values and validate parent identities", async context => {
+  const value = await fixture(context);
+  value.shared.threads.clear();
+  for (const field of [undefined, null, 123, {}, [], "", "private-custom", "x".repeat(129)]) {
+    assert.equal((await value.request({ thread_id: threadId, turn_id: turnId,
+      request_kind: field, subagent_kind: field, parent_thread_id: field })).status, 503);
+    const recent = value.coordinator.status().recentRejections.at(-1);
+    assert.equal(recent.requestKind, field === undefined ? "missing" : "unknown");
+    assert.equal(recent.subagentKind, field === undefined ? "missing" : "unknown");
+    assert.equal(Object.hasOwn(recent, "parentThreadHash"), field === "private-custom");
+  }
+  const evidence = JSON.stringify([value.events, value.observed, value.coordinator.status().recentRejections]);
+  for (const secret of ["private-custom", "private-token", "private-body", threadId, turnId]) {
+    assert.equal(evidence.includes(secret), false);
+  }
+});
+
+test("rejection registry separates current terminal, retained history, and absent records", async context => {
+  const value = await fixture(context);
+  value.state.phase = "terminal";
+  assert.equal((await value.request()).status, 503);
+  assert.equal(value.coordinator.status().recentRejections.at(-1).threadRegistry, "current");
+  assert.equal(value.coordinator.status().recentRejections.at(-1).phase, "terminal");
+  value.shared.threads.delete(threadId);
+  value.shared.terminalThreads.set(threadId, value.state);
+  for (const requestedTurn of [turnId, otherTurnId, "private/invalid"]) {
+    assert.equal((await value.request({ thread_id: threadId, turn_id: requestedTurn })).status, 503);
+    const recent = value.coordinator.status().recentRejections.at(-1);
+    assert.equal(recent.threadRegistry, "terminal_history");
+    assert.equal(recent.reason, "thread_not_found");
+    assert.equal(recent.terminalTurnMatches, requestedTurn === "private/invalid" ? undefined : requestedTurn === turnId);
+  }
+  value.shared.terminalThreads.clear();
+  assert.equal((await value.request()).status, 503);
+  assert.equal(value.coordinator.status().recentRejections.at(-1).threadRegistry, "absent");
+  assert.equal(value.calls.length, 0);
+});
+
+test("origin diagnostics survive hot adoption and restore in the managed publication file", async context => {
+  const value = await fixture(context, { legacyObserver: true });
+  const statePath = path.join(value.root, "managed-state.json");
+  const publishedEvents = [];
+  const managed = createManagedInnerProxySessionImplementation({ configuration: { ownerId: "diagnostics-test",
+    nativeSourceId: "diagnostics-native" }, onEvent: event => publishedEvents.push(event), serviceDependencies: {}, options: {},
+    runtimeProfile: { managedStatePath: statePath }, coordinator: value.coordinator, nativeSource: { status: () => ({ healthy: true }) },
+    controlOperations: new Map(), publicationStarted: true });
+  const observer = value.shared.onEvent;
+  const original = value.participant.activate(value.participant.prepare(coordinatorModule));
+  value.shared.threads.clear();
+  assert.equal((await value.request({ thread_id: threadId, turn_id: turnId, request_kind: "compaction",
+    parent_thread_id: otherTurnId, subagent_kind: "compact" })).status, 503);
+  managed.handleCoordinatorEvent(value.events.at(-1));
+  const readPublished = () => JSON.parse(fs.readFileSync(statePath, "utf8")).coordinator.recentRejections;
+  const recorded = readPublished();
+  assert.equal(recorded[0].requestKind, "compaction");
+  assert.equal(recorded[0].parentThreadHash, hash16(otherTurnId));
+  assert.equal(recorded[0].subagentKind, "compact");
+  assert.equal(recorded[0].threadRegistry, "absent");
+  assert.equal(Object.hasOwn(value.observed[0], "requestKind"), false);
+  value.participant.restore(original);
+  managed.refreshPublishedStatus();
+  assert.deepEqual(readPublished(), recorded);
+  assert.strictEqual(value.shared.onEvent, observer);
+  assert.equal(publishedEvents.some(event => event.type === "managed_state_publish_failed"), false);
+  for (const secret of [threadId, turnId, otherTurnId, "private-body", "private-token"]) {
+    assert.equal(JSON.stringify(recorded).includes(secret), false);
+  }
 });
