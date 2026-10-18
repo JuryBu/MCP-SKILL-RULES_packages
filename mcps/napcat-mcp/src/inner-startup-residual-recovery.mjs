@@ -20,6 +20,8 @@ function canonicalPath(value) {
 
 const samePath = (left, right) => canonicalPath(left) === canonicalPath(right);
 const validPid = value => Number.isSafeInteger(value) && value > 0;
+const recoverableRequestCount = (value, interrupted) => interrupted
+  ? Number.isSafeInteger(value) && value >= 0 : value === 0;
 const uuid = value => typeof value === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/iu.test(value);
 const validWorkerId = value => {
   const match = typeof value === "string" && /^(.{36})-worker-([1-9][0-9]*)$/u.exec(value);
@@ -38,9 +40,9 @@ function settledActivation(coordinator, interrupted = false) {
         && activation.deferredThreadIds.every(threadId => coordinator.threads?.some(thread =>
           thread.threadId === threadId && thread.pendingActivationId === activation.activationId))
       : activation.deferredThreadIds.length === 0)
-    && coordinator.activeHttp === 0 && coordinator.pendingControl === 0
+    && recoverableRequestCount(coordinator.activeHttp, interrupted) && coordinator.pendingControl === 0
     && Array.isArray(coordinator.threads) && coordinator.threads.every(thread => (interrupted || thread.phase === "terminal")
-      && thread.activeHttp === 0 && (thread.pendingActivationId == null || (interrupted && activation.active
+      && recoverableRequestCount(thread.activeHttp, interrupted) && (thread.pendingActivationId == null || (interrupted && activation.active
         && thread.pendingActivationId === activation.activationId && activation.deferredThreadIds.includes(thread.threadId)))
       && thread.activationError == null)
     && [activation.sourceWorkerId, activation.targetWorkerId].every(workerId =>
@@ -192,11 +194,11 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     || (!preserveHistory && (managed.nativeSource.healthy !== true || managed.nativeSource.delivered !== 0))
     || managed.coordinator?.transactionActive !== false || managed.coordinator.workerMaintenance !== false
     || !(preserveHistory ? settledActivation(managed.coordinator, interrupted) : managed.coordinator.activation == null)
-    || (interrupted && (managed.coordinator.activeHttp !== 0 || managed.coordinator.pendingControl !== 0))
+    || (interrupted && (!recoverableRequestCount(managed.coordinator.activeHttp, true) || managed.coordinator.pendingControl !== 0))
     || !Array.isArray(managed.coordinator.threads)
     || (!preserveHistory && managed.coordinator.threads.length)
     || managed.coordinator.threads.some(thread => !["active", "terminal"].includes(thread.phase)
-      || thread.activeHttp !== 0 || (!interrupted && thread.pendingActivationId != null)
+      || !recoverableRequestCount(thread.activeHttp, interrupted) || (!interrupted && thread.pendingActivationId != null)
       || (thread.pendingActivationId != null && managed.coordinator.activation == null))
     || !Array.isArray(managed.coordinator.workers) || !managed.coordinator.workers.length
     || (interrupted && managed.coordinator.threads.some(thread => !managed.coordinator.workers.some(worker => worker.workerId === thread.workerId)))
@@ -205,12 +207,15 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     || !Number.isSafeInteger(outer.proxy.journal?.unknownWakeCount) || outer.proxy.journal.unknownWakeCount < 0
     || (!preserveHistory && outer.proxy.journal.unknownWakeCount !== 0) || outer.proxy.outerRuntime?.instanceId !== outer.instanceToken
     || outer.proxy.outerRuntime.busy !== false
-    || ["activeOperationCount", "trackedRequestCount", "pendingToolCount"].some(name => outer.proxy.outerRuntime[name] !== 0)) {
+    || ["activeOperationCount", "trackedRequestCount", "pendingToolCount"].some(name => !recoverableRequestCount(outer.proxy.outerRuntime[name], interrupted))) {
     fail("STARTUP_RECOVERY_IDLE_PROOF_REQUIRED");
   }
   if (fs.existsSync(profile.outerPaths.journalPath)) {
     const journal = json(read(profile.outerPaths.journalPath, preserveHistory ? 67108864 : undefined));
-    if (![1, 2].includes(journal.schemaVersion) || !journal.wakes || Array.isArray(journal.wakes)
+    const object = value => value !== null && typeof value === "object" && !Array.isArray(value);
+    if (![1, 2].includes(journal.schemaVersion) || !object(journal.wakes)
+      || (journal.schemaVersion === 2 && !object(journal.subscriptions))
+      || Object.values(journal.wakes).some(wake => !object(wake))
       || (!preserveHistory && Object.keys(journal.wakes).length)) {
       fail("STARTUP_RECOVERY_WAKE_RESULT_UNRESOLVED");
     }
@@ -255,7 +260,7 @@ export function planInnerStartupRecovery(input, inspectHost = inspectStartupReco
     const workerLease = json(read(path.join(workerRoot, "codex-model-stream-proxy.lock.json"), 65536));
     if (runtime.pid !== worker.pid || !uuid(runtime.instanceToken) || workerLease.pid !== worker.pid
       || workerLease.instanceToken !== runtime.instanceToken || workerLease.startedAt !== runtime.startedAt
-      || runtime.upstreamOrigin !== profile.upstreamOrigin || runtime.activeRequests !== 0
+      || runtime.upstreamOrigin !== profile.upstreamOrigin || !recoverableRequestCount(runtime.activeRequests, interrupted)
       || !Number.isSafeInteger(runtime.counters?.total) || runtime.counters.total < 0
       || (!preserveHistory && runtime.counters.total !== 0)) {
       fail("STARTUP_RECOVERY_WORKER_IDLE_OR_IDENTITY_UNKNOWN");

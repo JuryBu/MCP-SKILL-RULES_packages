@@ -20,7 +20,7 @@ test("dead native business instance retains completed and interrupted history an
     assert.equal(managed.coordinator.threads.length, 2);
     assert.deepEqual(new Set(managed.coordinator.threads.map(thread => thread.phase)), new Set(["active", "terminal"]));
     assert.ok(managed.nativeSource.delivered >= 3);
-    const journal = Buffer.from(JSON.stringify({ schemaVersion: 2, wakes: {
+    const journal = Buffer.from(JSON.stringify({ schemaVersion: 2, subscriptions: {}, wakes: {
       "owned-unknown": { status: "unknown", command: "never-replay", outcomeUnknown: true, text: "retained".repeat(150000) },
       "owned-completed": { status: "completed", turnId: "completed-turn" },
     } }));

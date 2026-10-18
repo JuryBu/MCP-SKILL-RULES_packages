@@ -10,6 +10,17 @@ const sourceFiles = ["src/control-plane.mjs", "src/codex-thread-bridge.mjs", "sr
   "src/inner-startup-residual-recovery.mjs", "ops/Run-NapCatSupervisorWatchdog.ps1"];
 
 export function repairDesktopLauncher(content) {
+  if (content.includes("$ClaimsActive=") || content.includes("-gate-backup")) {
+    const startMarker = "  try {\n    $Stamp=(Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')";
+    const endMarker = "  } catch {}\n  $StatePath=Join-Path $ActivationRoot 'transition.json'";
+    const start = content.indexOf(startMarker);
+    const end = content.indexOf(endMarker, start);
+    const block = content.slice(start, end);
+    if (start < 0 || end < 0 || content.indexOf(startMarker, start + 1) >= 0
+      || !["$ClaimsActive=", "$PortsBusy=", "function Test-PidAlive", "$Mg.coordinator=$null", ".crash-$Stamp-gate-backup"]
+        .every(marker => block.includes(marker)) || block.length > 8000) throw new Error("DESKTOP_RECOVERY_SOURCE_UNRECOGNIZED");
+    content = content.slice(0, start) + content.slice(end + "  } catch {}\n".length);
+  }
   if (content.includes("gate_resolved_unclean_exit")) {
     const start = content.indexOf("    try {\n      $MpPath=Join-Path $Plan.dataRoot");
     const end = content.indexOf("    $StartModelArgs=@{", start);

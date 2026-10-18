@@ -2,6 +2,25 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { repairDesktopLauncher } from "../ops/build-startup-repair.mjs";
 
+test("desktop recovery retires only the recognized pre-plan emergency gate", () => {
+  const source = `  $Plan=Get-Content -LiteralPath $PlanPath
+  try {
+    $Stamp=(Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+    $PortsBusy=@()
+    function Test-PidAlive([object]$P){ return $false }
+    $ClaimsActive=$true
+    $backup='.crash-$Stamp-gate-backup'
+    $Mg.coordinator=$null
+  } catch {}
+  $StatePath=Join-Path $ActivationRoot 'transition.json'
+  $State=$null`;
+  const repaired = repairDesktopLauncher(source);
+  assert.equal(repaired, "  $Plan=Get-Content -LiteralPath $PlanPath\n  $StatePath=Join-Path $ActivationRoot 'transition.json'\n  $State=$null");
+  assert.equal(repairDesktopLauncher(repaired), repaired);
+  assert.throws(() => repairDesktopLauncher(source.replace("$Mg.coordinator=$null", "$Other=$null")), /SOURCE_UNRECOGNIZED/u);
+  assert.throws(() => repairDesktopLauncher(source + "\n" + source), /SOURCE_UNRECOGNIZED/u);
+});
+
 test("desktop recovery removes the emergency history trimming and fails managed readiness without a second start", () => {
   const source = `function Start-RequiredRuntime {
     try {
