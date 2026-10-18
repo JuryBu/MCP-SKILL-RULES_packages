@@ -16,7 +16,8 @@ const [codexPath, launcherPath, evidencePath] = process.argv.slice(2);
 if (![codexPath, evidencePath].every(value => value && path.isAbsolute(value))
   || (launcherPath !== "-" && !path.isAbsolute(launcherPath ?? ""))) throw new Error("ABSOLUTE_INPUTS_REQUIRED");
 const repository = fileURLToPath(new URL("../", import.meta.url));
-const root = fs.mkdtempSync(path.join(os.tmpdir(), "startup-busy-native-"));
+const temporaryRoot = fs.realpathSync.native(os.tmpdir());
+const root = fs.mkdtempSync(path.join(temporaryRoot, "startup-busy-native-"));
 const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
 const read = target => JSON.parse(fs.readFileSync(target, "utf8").replace(/^\uFEFF/u, ""));
 const write = (target, value) => fs.writeFileSync(target, JSON.stringify(value));
@@ -174,9 +175,20 @@ try {
   if (socket && socket.readyState < WebSocket.CLOSING) { const closed = once(socket, "close"); socket.close(); await closed; }
   try {
     const runtime = profile && fs.existsSync(profile.outerPaths.runtimeStatePath) && read(profile.outerPaths.runtimeStatePath);
+    const workerPids = profile && fs.existsSync(profile.managedStatePath)
+      ? (read(profile.managedStatePath).coordinator?.workers ?? []).map(worker => worker.pid) : [];
+    const ownedPids = [runtime?.pid, runtime?.appServerPid, ...workerPids].filter(value => Number.isSafeInteger(value) && value > 0);
     if (runtime?.pid && originalInstance && runtime.instanceToken !== originalInstance && runtime.state !== "stopped") {
       if (!fs.existsSync(profile.outerPaths.stopFilePath)) write(profile.outerPaths.stopFilePath, { ownerId: profile.ownerId, instanceToken: runtime.instanceToken, testStop: true });
       await until(() => read(profile.managedStatePath).state === "closed", "owned-stop");
+    }
+    if (runtime && originalInstance && runtime.instanceToken !== originalInstance) {
+      await until(() => {
+        const inventory = inspectStartupRecoveryHost();
+        result.remainingOwnedProcesses = inventory.processes.filter(entry => ownedPids.includes(entry.ProcessId)
+          || ownedPids.includes(entry.ParentProcessId));
+        return inventory.complete && result.remainingOwnedProcesses.length === 0;
+      }, "owned-process-tree-exited");
     }
     result.portsReleased = [];
     for (const port of Object.values(profile?.ports ?? {})) {
@@ -188,12 +200,22 @@ try {
     clean = true;
   } catch (error) { result.cleanupError = String(error); process.exitCode = 1; }
   if (upstream?.listening) { upstream.closeAllConnections(); await new Promise(resolve => upstream.close(resolve)); }
+  result.cleaned = false;
+  result.cleanupPending = clean && !result.error;
   result.finishedAt = new Date().toISOString();
+  write(evidencePath, result);
   if (clean) {
-    assert.ok(path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep));
-    result.cleaned = !result.error;
-    if (!result.error) fs.rmSync(root, { recursive: true, force: true });
+    try {
+      assert.ok(path.resolve(root).startsWith(temporaryRoot + path.sep));
+      if (!result.error) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      result.cleaned = !result.error;
+    } catch (error) {
+      result.cleanupError = String(error.stack ?? error);
+      process.exitCode = 1;
+    }
   }
+  result.cleanupPending = false;
+  result.finishedAt = new Date().toISOString();
   write(evidencePath, result);
   console.log(JSON.stringify({ evidencePath, root, ready: result.ready, verified: result.verified,
     error: result.error ?? null, cleanupError: result.cleanupError ?? null, cleaned: result.cleaned, portsReleased: result.portsReleased }));
