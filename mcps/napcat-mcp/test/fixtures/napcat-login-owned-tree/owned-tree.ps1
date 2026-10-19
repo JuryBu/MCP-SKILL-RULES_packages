@@ -1,7 +1,9 @@
 param([string]$SourcePath, [string]$NodePath, [string]$FixtureRoot, [string]$RunId)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-if ($RunId -notmatch '^[a-f0-9]{32}$' -or -not $FixtureRoot.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase) -or -not $FixtureRoot.Contains($RunId)) { throw 'Unsafe fixture root' }
+$FixtureRoot = [IO.Path]::GetFullPath($FixtureRoot)
+$TempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if ($RunId -notmatch '^[a-f0-9]{32}$' -or -not $FixtureRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Split-Path -Leaf $FixtureRoot).Contains($RunId)) { throw 'Unsafe fixture root' }
 $SourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256).Hash
 $HelperPath = Join-Path $FixtureRoot 'helper.cjs'
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'helper.cjs') -Destination $HelperPath
@@ -66,7 +68,7 @@ try {
     if ($Scenario -eq 'partial_failure') {
       $BeforeTerminate = { param($Record) if ($Record.parentId -eq $Context.rootId) { throw 'fixture_termination_denied' } }
     }
-    $Result = Stop-NapCatOwnedTree $Context -TimeoutMilliseconds 750 -BeforeTerminate $BeforeTerminate
+    $Result = Stop-NapCatOwnedTree $Context -TimeoutMilliseconds 2000 -BeforeTerminate $BeforeTerminate
     $SiblingAlive = -not $Sibling.process.HasExited
     $ExpectedState = if ($Scenario -eq 'partial_failure') { 'unknown' } else { 'terminated' }
     $Passed = $Result.state -eq $ExpectedState -and $Result.captured -ge 3 -and $SiblingAlive

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawnSync } from "./helpers/powershell-process.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";

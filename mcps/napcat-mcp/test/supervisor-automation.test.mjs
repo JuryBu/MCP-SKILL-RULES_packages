@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "./helpers/powershell-process.mjs";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,13 +22,13 @@ function spawnIsolatedLogin(fixtureRoot, argumentsList, options) {
   const command = [
     "$ErrorActionPreference = 'Stop'",
     "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)",
-    `$global:LoginFixtureRoot = ${quote(fixtureRoot)}`,
+    `$global:LoginFixtureRoots = @(${[fixtureRoot, fs.realpathSync.native(fixtureRoot)].map(quote).join(", ")})`,
     "function Get-CimInstance {",
     "  [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter)",
     "  if ($ClassName -ne 'Win32_Process') { throw 'Unexpected fixture CIM class' }",
     "  $all = @(CimCmdlets\\Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)",
     "  $owned = @{}",
-    "  foreach ($entry in $all) { if ($entry.ProcessId -ne $PID -and ([string]$entry.CommandLine).IndexOf($global:LoginFixtureRoot + '\\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { $owned[[int]$entry.ProcessId] = $true } }",
+    "  foreach ($entry in $all) { foreach ($root in $global:LoginFixtureRoots) { if ($entry.ProcessId -ne $PID -and ([string]$entry.CommandLine).IndexOf($root + '\\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { $owned[[int]$entry.ProcessId] = $true } } }",
     "  do { $changed = $false; foreach ($entry in $all) { if ($entry.ProcessId -ne $PID -and $owned.ContainsKey([int]$entry.ParentProcessId) -and -not $owned.ContainsKey([int]$entry.ProcessId)) { $owned[[int]$entry.ProcessId] = $true; $changed = $true } } } while ($changed)",
     "  $selected = @($all | Where-Object { $owned.ContainsKey([int]$_.ProcessId) })",
     "  if ($Filter) { if ($Filter -notmatch '^ProcessId\\s*=\\s*(\\d+)$') { throw 'Unexpected fixture CIM filter' }; $targetId = [int]$Matches[1]; return @($selected | Where-Object { [int]$_.ProcessId -eq $targetId }) }",

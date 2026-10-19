@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "./helpers/powershell-process.mjs";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -268,7 +268,9 @@ exit 0
       const observed = await invokeStage(executable, fixture, parameters);
       assert.equal(observed.code, 0, observed.stderr);
       const { OutputPath, ...expected } = parameters;
-      assert.deepEqual(JSON.parse(fs.readFileSync(outputPath, "utf8")), { ...expected, WorkingDirectory: fixture.directory });
+      const { WorkingDirectory, ...received } = JSON.parse(fs.readFileSync(outputPath, "utf8"));
+      assert.deepEqual(received, expected);
+      assert.equal(fs.realpathSync.native(WorkingDirectory), fs.realpathSync.native(fixture.directory));
       assert.equal(fs.existsSync(markerPath), false);
       assert.equal(sha256(observed.result.requestPath), observed.result.requestSha256);
       assert.throws(() => fs.writeFileSync(observed.result.requestPath, "{}"));

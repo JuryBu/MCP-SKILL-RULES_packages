@@ -1,7 +1,9 @@
 param([string]$SourcePath, [string]$NodePath, [string]$FixtureRoot, [string]$RunId)
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
-if ($RunId -notmatch '^[a-f0-9]{32}$' -or -not $FixtureRoot.StartsWith([IO.Path]::GetTempPath(), [StringComparison]::OrdinalIgnoreCase) -or -not $FixtureRoot.Contains($RunId)) { throw 'Unsafe fixture root' }
+$FixtureRoot = [IO.Path]::GetFullPath($FixtureRoot)
+$TempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+if ($RunId -notmatch '^[a-f0-9]{32}$' -or -not $FixtureRoot.StartsWith($TempRoot, [StringComparison]::OrdinalIgnoreCase) -or -not (Split-Path -Leaf $FixtureRoot).Contains($RunId)) { throw 'Unsafe fixture root' }
 $SourceHash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256).Hash
 . (Join-Path (Split-Path -Parent $SourcePath) 'napcat-process-identity.ps1')
 $Tokens = $null

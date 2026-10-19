@@ -5,7 +5,8 @@ const { spawn } = require("node:child_process");
 
 const [runId, directory, scenario, levelText = "0"] = process.argv.slice(2);
 const level = Number(levelText);
-if (!/^[a-f0-9]{32}$/.test(runId) || !path.resolve(directory).startsWith(`${os.tmpdir()}${path.sep}`) || !directory.includes(runId)) {
+const relativeDirectory = path.relative(fs.realpathSync.native(os.tmpdir()), fs.realpathSync.native(directory));
+if (!/^[a-f0-9]{32}$/.test(runId) || !relativeDirectory || relativeDirectory === ".." || relativeDirectory.startsWith(`..${path.sep}`) || path.isAbsolute(relativeDirectory) || !directory.includes(runId)) {
   throw new Error("Fixture must have an owned GUID in Temp");
 }
 fs.mkdirSync(directory, { recursive: true });

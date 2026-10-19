@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync } from "./helpers/powershell-process.mjs";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -139,8 +139,8 @@ function runWithModuleVerificationFailure(fixture, modulePaths, failureModuleInd
       NAPCAT_TEST_DATA_ROOT: fixture.dataRoot,
       NAPCAT_TEST_NAPCAT_ROOT: fixture.napcatRoot,
       NAPCAT_TEST_QQ_USER_DATA_DIR: fixture.qqUserDataDir,
-      NAPCAT_TEST_PRIMARY_MODULE: modulePaths[0],
-      NAPCAT_TEST_SECOND_MODULE: modulePaths[1],
+      NAPCAT_TEST_PRIMARY_MODULE: fs.realpathSync.native(modulePaths[0]),
+      NAPCAT_TEST_SECOND_MODULE: fs.realpathSync.native(modulePaths[1]),
       NAPCAT_TEST_FAILURE_MODULE_INDEX: String(failureModuleIndex),
     },
   });
@@ -164,7 +164,7 @@ for (const failureModuleIndex of [1, 2]) {
 
       const result = runWithModuleVerificationFailure(fixture, modulePaths, failureModuleIndex);
       assert.equal(result.caught, `INJECTED_POSTWRITE_READ_FAILURE_${failureModuleIndex}`);
-      assert.deepEqual(result.postWriteReadPaths, modulePaths.slice(0, failureModuleIndex));
+      assert.deepEqual(result.postWriteReadPaths.map((modulePath) => fs.realpathSync.native(modulePath)), modulePaths.slice(0, failureModuleIndex).map((modulePath) => fs.realpathSync.native(modulePath)));
       for (const [moduleIndex, modulePath] of modulePaths.entries()) {
         assert.deepEqual(fs.readFileSync(modulePath), originalModules[moduleIndex], modulePath);
       }
@@ -197,9 +197,9 @@ test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节�
     assert.equal(applied.changed, true);
     assert.equal(fs.existsSync(applied.backupPath), true);
     const runtime = JSON.parse(fs.readFileSync(fixture.runtimePath, "utf8"));
-    assert.equal(runtime.napCatRoot, path.resolve(fixture.napcatRoot));
-    assert.equal(runtime.qqExePath, path.resolve(fixture.qqExePath));
-    assert.equal(runtime.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
+    assert.equal(fs.realpathSync.native(runtime.napCatRoot), fs.realpathSync.native(fixture.napcatRoot));
+    assert.equal(fs.realpathSync.native(runtime.qqExePath), fs.realpathSync.native(fixture.qqExePath));
+    assert.equal(runtime.qqUserDataDir, path.join(fs.realpathSync.native(fixture.root), "qq-user-data"));
     assert.equal(runtime.preserved, "yes");
 
     fs.rmSync(fixture.runtimePath);
@@ -288,9 +288,9 @@ test("NapCat node runtime 不需要 QQ.exe，应用时会清除旧 qqExePath", {
     assert.equal(applied.nodeUserDataPatch.wouldChange, false);
     assert.equal(fs.existsSync(applied.nodeUserDataPatch.backupPath), true);
     const runtime = JSON.parse(fs.readFileSync(fixture.runtimePath, "utf8"));
-    assert.equal(runtime.napCatRoot, path.resolve(fixture.napcatRoot));
+    assert.equal(fs.realpathSync.native(runtime.napCatRoot), fs.realpathSync.native(fixture.napcatRoot));
     assert.equal(runtime.qqExePath, undefined);
-    assert.equal(runtime.qqUserDataDir, path.resolve(fixture.qqUserDataDir));
+    assert.equal(runtime.qqUserDataDir, path.join(fs.realpathSync.native(fixture.root), "qq-user-data"));
     assert.equal(runtime.preserved, "yes");
     const patchedModule = fs.readFileSync(napcatModulePath, "utf8");
     assert.equal((patchedModule.match(/NAPCAT_QQ_USER_DATA_DIR/g) ?? []).length, 2);
