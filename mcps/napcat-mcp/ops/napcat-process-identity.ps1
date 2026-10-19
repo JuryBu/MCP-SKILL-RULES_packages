@@ -97,7 +97,9 @@ function Test-NapCatIdentityPath {
 function ConvertTo-NapCatCanonicalPath {
   param([string]$Value)
   if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-  return ConvertTo-NapCatIdentityPath ([IO.Path]::GetFullPath($Value))
+  if (($Value -replace '^[a-zA-Z]:', '') -match '["<>|?*:\x00-\x1f]') { return '' }
+  try { return ConvertTo-NapCatIdentityPath ([IO.Path]::GetFullPath($Value)) }
+  catch { return '' }
 }
 
 function Get-NapCatCommandEntry {
@@ -137,6 +139,7 @@ function Test-NapCatIdentityLink {
 function Get-NapCatProcessClassification {
   param([object[]]$Processes, [string]$NapCatRoot)
   $Root = ConvertTo-NapCatCanonicalPath $NapCatRoot
+  if (-not [string]::IsNullOrWhiteSpace($NapCatRoot) -and -not $Root) { throw '[NAPCAT_PROCESS_SCAN_UNKNOWN] Invalid NapCat root' }
   $Owned = @{}
   $Ordinary = @{}
   $Uncertain = @{}
@@ -149,23 +152,22 @@ function Get-NapCatProcessClassification {
     $Name = [string]$Record.Name
     $Command = ConvertTo-NapCatIdentityPath ([string]$Record.CommandLine)
     $Executable = ConvertTo-NapCatCanonicalPath ([string]$Record.ExecutablePath)
+    $PathUnknown = $Name -match '^(qq|qqnt|qqex|cmd|node|napcatwinbootmain|powershell|pwsh)(\.exe)?$' -and -not [string]::IsNullOrWhiteSpace([string]$Record.ExecutablePath) -and -not $Executable
     $MatchesRoot = $false
     if ($Root) {
       if ($Name -match '^napcatwinbootmain\.exe$') {
-        $CommandExecutable = ConvertTo-NapCatCanonicalPath (Get-NapCatCommandEntry $Command).executable
-        $MatchesRoot = $Executable -eq "$Root/napcatwinbootmain.exe" -or ((-not $Executable) -and $CommandExecutable -eq "$Root/napcatwinbootmain.exe")
+        $CommandEntry = (Get-NapCatCommandEntry $Command).executable
+        $CommandExecutable = ConvertTo-NapCatCanonicalPath $CommandEntry
+        if ($CommandEntry -and -not $CommandExecutable) { $PathUnknown = $true }
+        $MatchesRoot = $Executable -eq "$Root/napcatwinbootmain.exe" -or ([string]::IsNullOrWhiteSpace([string]$Record.ExecutablePath) -and $CommandExecutable -eq "$Root/napcatwinbootmain.exe")
       } elseif ($Name -match '^cmd(\.exe)?$') {
         $ArgumentsText = (Get-NapCatCommandEntry $Command).arguments
         if ($ArgumentsText -match '^(?:(?:/d|/s|/q)\s+)*\/[ck]\s+(?:call\s+)?(.+)$') {
           $RawInvocation = $Matches[1]
-          $Invocation = $RawInvocation -replace '^"+', ''
-          foreach ($Entry in @('launcher-user.bat','napcat.bat','napcatwinbootmain.exe')) {
-            $ExpectedEntry = "$Root/$Entry"
-            if ($Invocation.StartsWith($ExpectedEntry) -and $Invocation.Substring($ExpectedEntry.Length) -match '^(?:["\s]|$)') { $MatchesRoot = $true }
-          }
-          $InvocationEntry = (Get-NapCatCommandEntry ($RawInvocation -replace '^""', '"')).executable
+          $InvocationEntry = (Get-NapCatCommandEntry ($RawInvocation -replace '^"+', '"')).executable
           if ($InvocationEntry) {
             $CanonicalEntry = ConvertTo-NapCatCanonicalPath $InvocationEntry
+            if (-not $CanonicalEntry) { $PathUnknown = $true }
             if ($CanonicalEntry -in @("$Root/launcher-user.bat", "$Root/napcat.bat", "$Root/napcatwinbootmain.exe")) { $MatchesRoot = $true }
           }
         }
@@ -174,7 +176,9 @@ function Get-NapCatProcessClassification {
         while ($ArgumentsText -match '^--(?:inspect(?:-brk)?(?:=\S+)?|no-warnings|trace-warnings|enable-source-maps)(?:\s|$)') {
           $ArgumentsText = (Get-NapCatCommandEntry $ArgumentsText).arguments
         }
-        $EntryPath = ConvertTo-NapCatCanonicalPath (Get-NapCatCommandEntry $ArgumentsText).executable
+        $Entry = (Get-NapCatCommandEntry $ArgumentsText).executable
+        $EntryPath = ConvertTo-NapCatCanonicalPath $Entry
+        if ($Entry -and -not $EntryPath) { $PathUnknown = $true }
         foreach ($Entry in @('index.js','napcat.mjs','napcat/napcat.mjs')) {
           if ($EntryPath -eq "$Root/$Entry") { $MatchesRoot = $true }
         }
@@ -184,11 +188,13 @@ function Get-NapCatProcessClassification {
       if ($Name -match '^(qq|qqnt|qqex)(\.exe)?$' -and $Record.ModuleScanState -eq 'ok') {
         foreach ($Module in @($Record.ModulePaths)) {
           $ModulePath = ConvertTo-NapCatCanonicalPath ([string]$Module)
+          if (-not [string]::IsNullOrWhiteSpace([string]$Module) -and -not $ModulePath) { $PathUnknown = $true }
           if ($ModulePath -eq "$Root/napcatwinboothook.dll") { $MatchesRoot = $true }
         }
       }
     }
     if ($MatchesRoot) { $Owned[[int]$Record.ProcessId] = $true }
+    elseif ($PathUnknown) { $Uncertain[[int]$Record.ProcessId] = $true }
     elseif ($Name -match '^napcatwinbootmain\.exe$' -and ((-not $Executable) -or (-not $Command))) { $Uncertain[[int]$Record.ProcessId] = $true }
   }
   $Changed = $true
@@ -214,7 +220,7 @@ function Get-NapCatProcessClassification {
   while ($Changed) {
     $Changed = $false
     foreach ($Record in $Processes) {
-      if (-not $Ordinary.ContainsKey([int]$Record.ProcessId) -and -not $Owned.ContainsKey([int]$Record.ProcessId) -and [string]$Record.Name -match '^(qq|qqnt|qqex)(\.exe)?$' -and $Ordinary.ContainsKey([int]$Record.ParentProcessId) -and (Test-NapCatIdentityLink $Record $ByPid[[int]$Record.ParentProcessId]) -and $Record.ModuleScanState -eq 'ok') {
+      if (-not $Ordinary.ContainsKey([int]$Record.ProcessId) -and -not $Owned.ContainsKey([int]$Record.ProcessId) -and -not $Uncertain.ContainsKey([int]$Record.ProcessId) -and [string]$Record.Name -match '^(qq|qqnt|qqex)(\.exe)?$' -and $Ordinary.ContainsKey([int]$Record.ParentProcessId) -and (Test-NapCatIdentityLink $Record $ByPid[[int]$Record.ParentProcessId]) -and $Record.ModuleScanState -eq 'ok') {
         $Ordinary[[int]$Record.ProcessId] = $true
         $Changed = $true
       }

@@ -3,7 +3,11 @@ import path from "node:path";
 const qqName = /^(?:qq|qqnt|qqex)(?:\.exe)?$/i;
 const treeName = /^(?:qq|qqnt|qqex|cmd|node|napcatwinbootmain)(?:\.exe)?$/i;
 const normalizePath = (value) => String(value ?? "").trim().replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-const canonicalPath = (value) => normalizePath(path.win32.normalize(String(value ?? "")));
+const canonicalPath = (value) => {
+  const input = String(value ?? "");
+  if (!input.trim() || /["<>|?*:\x00-\x1f]/.test(input.replace(/^[a-z]:/i, ""))) return "";
+  return normalizePath(path.win32.normalize(input));
+};
 const field = (record, upper, lower) => record?.[upper] ?? record?.[lower];
 const pidOf = (record) => Number(field(record, "ProcessId", "processId") ?? record?.pid);
 const parentOf = (record) => Number(field(record, "ParentProcessId", "parentProcessId") ?? record?.parentPid);
@@ -30,30 +34,36 @@ function commandEntry(command) {
   return { executable: match?.[1] ?? match?.[2] ?? "", arguments: match?.[3] ?? "" };
 }
 
-function ownRoot(record, root) {
+function ownRoot(record, root, markUnknown) {
   if (!root) return false;
   const name = String(field(record, "Name", "name") ?? "");
   const command = normalizePath(field(record, "CommandLine", "commandLine"));
-  const executable = field(record, "ExecutablePath", "executablePath") ? canonicalPath(field(record, "ExecutablePath", "executablePath")) : "";
+  const rawExecutable = String(field(record, "ExecutablePath", "executablePath") ?? "");
+  const entryPath = (value) => {
+    const result = canonicalPath(value);
+    if (String(value ?? "").trim() && !result) markUnknown();
+    return result;
+  };
+  const executable = canonicalPath(rawExecutable);
+  if (rawExecutable.trim() && !executable && /^(?:qq|qqnt|qqex|cmd|node|napcatwinbootmain|powershell|pwsh)(?:\.exe)?$/i.test(name)) markUnknown();
   if (/^napcatwinbootmain\.exe$/i.test(name)) {
+    const commandExecutable = entryPath(commandEntry(command).executable);
     return executable === `${root}/napcatwinbootmain.exe`
-      || (!executable && canonicalPath(commandEntry(command).executable) === `${root}/napcatwinbootmain.exe`);
+      || (!rawExecutable.trim() && commandExecutable === `${root}/napcatwinbootmain.exe`);
   }
   if (/^cmd(?:\.exe)?$/i.test(name)) {
     const argumentsText = commandEntry(command).arguments;
     const rawInvocation = /^(?:(?:\/d|\/s|\/q)\s+)*\/[ck]\s+(?:call\s+)?(.+)$/i.exec(argumentsText)?.[1] ?? "";
-    const invocation = rawInvocation.replace(/^"+/, "");
-    const canonicalEntry = canonicalPath(commandEntry(rawInvocation.replace(/^""/, '"')).executable);
+    const canonicalEntry = entryPath(commandEntry(rawInvocation.replace(/^"+/, '"')).executable);
     return ["launcher-user.bat", "napcat.bat", "napcatwinbootmain.exe"]
-      .some((entry) => invocation.startsWith(`${root}/${entry}`)
-        && /^(?:["\s]|$)/.test(invocation.slice(`${root}/${entry}`.length)) || canonicalEntry === `${root}/${entry}`);
+      .some((entry) => canonicalEntry === `${root}/${entry}`);
   }
   if (/^node(?:\.exe)?$/i.test(name)) {
     let argumentsText = commandEntry(command).arguments;
     while (/^--(?:inspect(?:-brk)?(?:=\S+)?|no-warnings|trace-warnings|enable-source-maps)(?:\s|$)/.test(argumentsText)) {
       argumentsText = commandEntry(argumentsText).arguments;
     }
-    const entry = canonicalPath(commandEntry(argumentsText).executable);
+    const entry = entryPath(commandEntry(argumentsText).executable);
     return ["index.js", "napcat.mjs", "napcat/napcat.mjs"]
       .some((script) => entry === `${root}/${script}`);
   }
@@ -71,6 +81,7 @@ export function classifyNapCatProcesses(processes, napcatRoot) {
     throw new Error("NAPCAT_PROCESS_SCAN_UNKNOWN: missing process names");
   }
   const root = napcatRoot ? normalizePath(path.win32.isAbsolute(napcatRoot) ? path.win32.normalize(napcatRoot) : path.resolve(napcatRoot)) : "";
+  if (String(napcatRoot ?? "").trim() && !canonicalPath(napcatRoot)) throw new Error("NAPCAT_PROCESS_SCAN_UNKNOWN: invalid NapCat root");
   const records = processes.filter((record) => record && Number.isSafeInteger(pidOf(record)) && pidOf(record) > 0);
   const byPid = new Map(records.map((record) => [pidOf(record), record]));
   const owned = new Set();
@@ -78,12 +89,15 @@ export function classifyNapCatProcesses(processes, napcatRoot) {
   const uncertain = new Set();
   for (const record of records) {
     const name = String(field(record, "Name", "name") ?? "");
+    let invalidPath = false;
     const modules = record.ModulePaths ?? record.modulePaths ?? [];
     const hook = qqName.test(name) && (record.ModuleScanState ?? record.moduleScanState) === "ok" && Array.isArray(modules) && modules.some((modulePath) => {
       const normalized = canonicalPath(modulePath);
+      if (String(modulePath ?? "").trim() && !normalized) invalidPath = true;
       return root && normalized === `${root}/napcatwinboothook.dll`;
     });
-    if (ownRoot(record, root) || hook) owned.add(pidOf(record));
+    if (ownRoot(record, root, () => { invalidPath = true; }) || hook) owned.add(pidOf(record));
+    else if (invalidPath) uncertain.add(pidOf(record));
     else if (/^napcatwinbootmain\.exe$/i.test(name)
       && (!field(record, "ExecutablePath", "executablePath") || !field(record, "CommandLine", "commandLine"))) uncertain.add(pidOf(record));
   }
@@ -117,7 +131,7 @@ export function classifyNapCatProcesses(processes, napcatRoot) {
   while (changed) {
     changed = false;
     for (const record of records) {
-      if (!ordinary.has(pidOf(record)) && !owned.has(pidOf(record))
+      if (!ordinary.has(pidOf(record)) && !owned.has(pidOf(record)) && !uncertain.has(pidOf(record))
         && qqName.test(String(field(record, "Name", "name") ?? ""))
         && ordinary.has(parentOf(record)) && linked(record, byPid.get(parentOf(record)))
         && (record.ModuleScanState ?? record.moduleScanState) === "ok") {
