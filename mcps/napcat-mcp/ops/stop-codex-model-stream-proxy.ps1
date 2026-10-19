@@ -6,7 +6,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($DataRoot)) { $DataRoot = Join-Path $env:USERPROFILE ".codex-toolkit\napcat-mcp" }
+. (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
+$DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $RunnerPath = Join-Path $NapCatMcpRoot "src\codex-model-stream-proxy-runner.mjs"
 $StateRoot = Join-Path $DataRoot "state"

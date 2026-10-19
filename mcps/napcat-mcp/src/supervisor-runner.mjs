@@ -8,6 +8,8 @@ import { createBoundedJsonlWriter } from "./bounded-jsonl-log.mjs";
 import { createTaskRegistry } from "./task-registry.mjs";
 import { createTaskRouterController } from "./task-router-controller.mjs";
 import { acquireInstanceLock, readPrivateEnvironment } from "./task-router-runner.mjs";
+import { classifyNapCatProcesses } from "./napcat-process-identity.mjs";
+import { windowsPowerShellEnvironment } from "./windows-powershell-environment.mjs";
 
 export const DEFAULT_SUPERVISOR_INTERVAL_MS = 15_000;
 export const DEFAULT_PROBE_TIMEOUT_MS = 4_000;
@@ -556,6 +558,7 @@ function execFilePromise(executable, args, options = {}) {
       timeout: options.timeoutMs,
       maxBuffer: options.maxBuffer ?? 1024 * 1024,
       cwd: options.cwd,
+      env: options.env,
       encoding: "utf8",
     }, (error, stdout, stderr) => {
       if (error) {
@@ -570,6 +573,7 @@ function execFilePromise(executable, args, options = {}) {
 }
 
 export async function invokePowerShellScript(scriptPath, scriptArguments = [], options = {}) {
+  const native = windowsPowerShellEnvironment(options.env ?? process.env);
   const normalizedScriptPath = resolveRequiredPath(scriptPath, "PowerShell 脚本");
   const argumentsList = [
     "-NoProfile",
@@ -582,10 +586,14 @@ export async function invokePowerShellScript(scriptPath, scriptArguments = [], o
     normalizedScriptPath,
     ...scriptArguments.map((value) => String(value)),
   ];
-  return execFilePromise(options.powershellPath ?? "powershell.exe", argumentsList, options);
+  return execFilePromise(options.powershellPath ?? native.executable, argumentsList, {
+    ...options,
+    env: options.powershellPath ? options.env : native.environment,
+  });
 }
 
 export async function invokePowerShellCommand(command, options = {}) {
+  const native = windowsPowerShellEnvironment(options.env ?? process.env);
   const argumentsList = [
     "-NoProfile",
     "-NonInteractive",
@@ -594,9 +602,12 @@ export async function invokePowerShellCommand(command, options = {}) {
     "-WindowStyle",
     "Hidden",
     "-Command",
-    String(command),
+    "[Console]::OutputEncoding = New-Object Text.UTF8Encoding($false); " + String(command),
   ];
-  const result = await execFilePromise(options.powershellPath ?? "powershell.exe", argumentsList, options);
+  const result = await execFilePromise(options.powershellPath ?? native.executable, argumentsList, {
+    ...options,
+    env: options.powershellPath ? options.env : native.environment,
+  });
   return { ...result, value: parseJsonOutput(result.stdout) };
 }
 
@@ -713,7 +724,8 @@ export async function checkBrokerHealth(options = {}) {
 }
 
 export async function listWindowsProcesses(options = {}) {
-  const command = "$items = @(Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,Name,CommandLine,CreationDate,ExecutablePath); if ($items.Count -eq 0) { '[]' } else { $items | ConvertTo-Json -Compress }";
+  const identityScript = fileURLToPath(new URL("../ops/napcat-process-identity.ps1", import.meta.url)).replaceAll("'", "''");
+  const command = `$ErrorActionPreference = 'Stop'; . '${identityScript}'; $items = @(Get-NapCatOwnershipSnapshot); ConvertTo-Json -InputObject $items -Depth 5 -Compress`;
   const result = await invokePowerShellCommand(command, options);
   return result.value;
 }
@@ -766,47 +778,8 @@ function normalizeProcessRecords(processes) {
   return processes.filter((item) => item && typeof item === "object");
 }
 
-function escapeRegExp(text) {
-  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 export function findNapCatProcesses(processes, napcatRoot, qqExePath = null) {
-  const normalizedRoot = napcatRoot ? path.resolve(napcatRoot).replaceAll("\\", "/").toLowerCase() : null;
-  const normalizedRootBare = normalizedRoot ? normalizedRoot.replace(/\/+$/, "") : null;
-  const normalizedRootPrefix = normalizedRootBare ? `${normalizedRootBare}/` : null;
-  const runtimeRootReferencePattern = normalizedRootBare
-    ? new RegExp(`${escapeRegExp(normalizedRootBare)}(?:[/"\\s]|$)`, "i")
-    : null;
-  const normalizedQqExePath = qqExePath ? path.resolve(qqExePath).replaceAll("\\", "/").toLowerCase() : null;
-  const isSupervisorOrProbeCommand = (text) => /(?:^|[\\/])(?:supervisor-runner\.mjs|start-napcat-supervisor\.ps1|stop-napcat-supervisor(?:-watchdog)?\.ps1|get-napcat-supervisor-status\.ps1|run-napcatsupervisorwatchdog\.ps1)(?:[\s"]|$)/i.test(text);
-  const isLoginScriptExecution = (text) => /(?:^|[\s"])-(?:file|f)\s+"?[^"\r\n]*[\\/]start-napcat-login\.ps1(?:["\s]|$)/i.test(text);
-  const isKnownQqProcessName = (value) => /^(?:qq|qqnt|qqex)(?:\.exe)?$/i.test(value);
-  return normalizeProcessRecords(processes).filter((item) => {
-    const text = processText(item).replaceAll("\\", "/");
-    const name = String(item?.Name ?? item?.name ?? "");
-    const commandLine = String(item?.CommandLine ?? item?.commandLine ?? "").trim().replaceAll("\\", "/").toLowerCase();
-    const unquotedCommandLine = commandLine.startsWith('"') ? commandLine.slice(1) : commandLine;
-    const belongsToRuntime = Boolean(normalizedRootPrefix && text.includes(normalizedRootPrefix));
-    const referencesRuntimeRoot = Boolean(runtimeRootReferencePattern?.test(text));
-    if (isSupervisorOrProbeCommand(text)) return false;
-    const isPinnedQq = Boolean(
-      normalizedQqExePath
-      && isKnownQqProcessName(name)
-      && (
-        unquotedCommandLine === normalizedQqExePath
-        || unquotedCommandLine === `${normalizedQqExePath}"`
-        || unquotedCommandLine.startsWith(`${normalizedQqExePath}" `)
-        || unquotedCommandLine.startsWith(`${normalizedQqExePath} `)
-      )
-    );
-    return Boolean(
-      (belongsToRuntime && /^napcatwinbootmain\.exe$/i.test(name))
-      || isPinnedQq
-      || (belongsToRuntime && /launcher-user\.bat/i.test(text))
-      || (referencesRuntimeRoot && /^(powershell|pwsh)(\.exe)?$/i.test(name) && isLoginScriptExecution(text))
-      || (belongsToRuntime && /^node(?:\.exe)?$/i.test(name) && /(?:^|[\\/])(?:index\.js|napcat[\\/]napcat\.mjs)(?:[\s"]|$)/i.test(text)),
-    );
-  });
+  return classifyNapCatProcesses(processes, napcatRoot).owned;
 }
 
 export function processTreeRootIds(processes) {
@@ -823,7 +796,7 @@ export function processTreeRootIds(processes) {
 }
 
 export async function stopWindowsProcessTrees(processes, options = {}) {
-  const roots = normalizeProcessRecords(processes).filter((item) => processTreeRootIds(processes).includes(processId(item)));
+  const roots = normalizeProcessRecords(processes);
   const rootIds = roots.map(processId).filter((pid) => pid !== Number(options.currentPid ?? process.pid));
   if (rootIds.length === 0) {
     const error = new Error("没有可安全停止的 NapCat 根进程");
@@ -834,26 +807,52 @@ export async function stopWindowsProcessTrees(processes, options = {}) {
     ...options,
     timeoutMs: options.timeoutMs ?? 15_000,
   });
-  const currentMatches = findNapCatProcesses(currentProcesses, options.napcatRoot, options.qqExePath);
+  const classification = classifyNapCatProcesses(currentProcesses, options.napcatRoot);
+  if (classification.unknown.length > 0) {
+    const error = new Error("QQ ownership is unknown; no process was stopped");
+    error.code = "NAPCAT_PROCESS_SCAN_UNKNOWN";
+    throw error;
+  }
+  const currentMatches = classification.owned;
+  if (currentMatches.some((item) => !rootIds.includes(processId(item)))) {
+    const error = new Error("New NapCat processes appeared; obtain a new snapshot before stopping");
+    error.code = "NAPCAT_PROCESS_IDENTITY_CHANGED";
+    throw error;
+  }
   const currentByPid = new Map(currentMatches.map((item) => [processId(item), item]));
-  const stopped = [];
+  const verified = [];
   for (const pid of rootIds) {
     const snapshot = roots.find((item) => processId(item) === pid);
     const current = currentByPid.get(pid);
     if (!current || processIdentityKey(current) !== String(snapshot?.identityKey ?? processIdentityKey(snapshot))) {
       continue;
     }
-    await execFilePromise(options.taskkillPath ?? path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "taskkill.exe"), [
-      "/PID", String(pid), "/T", "/F",
-    ], { ...options, timeoutMs: options.timeoutMs ?? 15_000 });
-    stopped.push(pid);
+    verified.push({
+      ProcessId: pid,
+      ParentProcessId: parentProcessId(current),
+      Name: String(current.Name ?? current.name ?? ""),
+      CommandLine: String(current.CommandLine ?? current.commandLine ?? ""),
+      CreationDate: String(current.CreationDate ?? current.creationDate ?? ""),
+      ExecutablePath: String(current.ExecutablePath ?? current.executablePath ?? ""),
+    });
   }
-  if (stopped.length === 0) {
+  if (verified.length !== rootIds.length) {
     const error = new Error("NapCat 进程身份已变化，拒绝按旧 PID 停止进程");
     error.code = "NAPCAT_PROCESS_IDENTITY_CHANGED";
     throw error;
   }
-  return { stopped: true, rootProcessIds: stopped };
+  const identityScript = fileURLToPath(new URL("../ops/napcat-process-identity.ps1", import.meta.url)).replaceAll("'", "''");
+  const payload = JSON.stringify(verified).replaceAll("'", "''");
+  const napcatRoot = String(options.napcatRoot ?? "").replaceAll("'", "''");
+  const command = `$ErrorActionPreference = 'Stop'; . '${identityScript}'; $expected = @('${payload}' | ConvertFrom-Json); Stop-NapCatVerifiedProcesses -Processes $expected -NapCatRoot '${napcatRoot}' | ConvertTo-Json -Depth 4 -Compress`;
+  const result = await invokePowerShellCommand(command, { ...options, timeoutMs: options.timeoutMs ?? 15_000 });
+  const cleanup = Array.isArray(result.value) && result.value.length === 1 ? result.value[0] : null;
+  if (cleanup?.stopped !== true || !Array.isArray(cleanup?.rootProcessIds)) {
+    const error = new Error("NapCat process cleanup returned no verified result");
+    error.code = "NAPCAT_PROCESS_CLEANUP_UNVERIFIED";
+    throw error;
+  }
+  return cleanup;
 }
 
 export function findCodexProcesses(processes) {
@@ -896,7 +895,13 @@ function processCheckResult(processes) {
 
 export async function checkNapCatProcesses(options = {}) {
   const processes = options.processes ?? await listWindowsProcesses(options);
-  return processCheckResult(findNapCatProcesses(processes, options.napcatRoot, options.qqExePath));
+  const classification = classifyNapCatProcesses(processes, options.napcatRoot);
+  if (classification.unknown.length > 0) {
+    const error = new Error(`QQ ownership is unverified: ${classification.unknown.map(processId).join(",")}`);
+    error.code = "NAPCAT_PROCESS_SCAN_UNKNOWN";
+    throw error;
+  }
+  return processCheckResult(classification.owned);
 }
 
 export async function checkCodexProcesses(options = {}) {
@@ -1556,6 +1561,8 @@ export async function runSupervisorService(options = {}) {
   const stopNapCatProcessTrees = options.stopNapCatProcesses
     ?? ((input) => stopWindowsProcessTrees(input.processes, {
       ...options,
+      napcatRoot: options.napcatRoot ?? dependencies.napcatRoot,
+      qqExePath: options.qqExePath ?? dependencies.qqExePath,
       currentPid: pid,
       timeoutMs: Math.max(15_000, probeTimeoutMs),
     }));

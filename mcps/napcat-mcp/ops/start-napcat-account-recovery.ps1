@@ -71,7 +71,7 @@ function Get-SafeStartupFailureEvidence {
   elseif ($SourcePath -eq $LoginScriptPath) { $ScriptName = 'login_entry' }
   elseif ($SourcePath -eq $RouterScriptPath) { $ScriptName = 'router_entry' }
   $Marker = 'unclassified'
-  if ($Record.Exception.Message -match '\[(NAPCAT_MANUAL_LOGIN_REQUIRED|NAPCAT_PROCESS_PRESENT|NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS|NAPCAT_RUNTIME_INCOMPLETE|STARTUP_MAINTENANCE_STOP|STARTUP_IDENTITY_DRIFT|STARTUP_ACCOUNT_MISMATCH|STARTUP_HISTORY_WRITE_FAILED|STARTUP_LOGIN_NONZERO|STARTUP_ROUTER_NONZERO)\]') { $Marker = $Matches[1] }
+  if ($Record.Exception.Message -match '\[(NAPCAT_MANUAL_LOGIN_REQUIRED|NAPCAT_PROCESS_PRESENT|NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS|NAPCAT_RUNTIME_INCOMPLETE|STARTUP_MAINTENANCE_STOP|STARTUP_IDENTITY_DRIFT|STARTUP_ACCOUNT_MISMATCH|STARTUP_HISTORY_WRITE_FAILED|STARTUP_LOGIN_NONZERO|STARTUP_ROUTER_NONZERO|STARTUP_PROFILE_MISSING|STARTUP_PROFILE_LAYOUT_UNKNOWN|STARTUP_PROFILE_ARGUMENT_MISMATCH)\]') { $Marker = $Matches[1] }
   $Evidence = [ordered]@{
     exceptionType = $Type; errorId = $ErrorId; errorMarker = $Marker; errorCategory = [string]$Record.CategoryInfo.Category
     scriptName = $ScriptName; scriptLine = $Record.InvocationInfo.ScriptLineNumber
@@ -132,6 +132,9 @@ function Record-UnfinishedStartupRuns {
 function Get-StartupDeploymentIdentity {
   param($Current)
   $Identity = [ordered]@{ account = [string]$Current.account }
+  $Identity.channel = [string]$Current.channel
+  $Identity.qqProfileLayout = if ($null -eq $Current.PSObject.Properties['qqProfileLayout']) { 'legacy_numeric' } else { [string]$Current.qqProfileLayout }
+  $Identity.qqUserDataDirArgument = [string]$Current.qqUserDataDirArgument
   foreach ($Name in @('dataRoot', 'brokerRoot', 'napCatRoot', 'qqExePath', 'qqUserDataDir')) {
     $Identity[$Name] = [IO.Path]::GetFullPath([string]$Current.$Name).ToUpperInvariant()
   }
@@ -167,6 +170,31 @@ function Assert-StartupAllowed {
   return $Current
 }
 
+function Resolve-StartupQqProfile {
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)]$Current)
+  if ([string]$Current.account -cne $ExpectedAccountId) { throw '[STARTUP_ACCOUNT_MISMATCH]' }
+  if ([string]::IsNullOrWhiteSpace([string]$Current.qqUserDataDir) -or -not [IO.Path]::IsPathRooted([string]$Current.qqUserDataDir)) { throw '[STARTUP_IDENTITY_DRIFT]' }
+  $UserDataDir = [IO.Path]::GetFullPath([string]$Current.qqUserDataDir)
+  $Layout = if ($null -eq $Current.PSObject.Properties['qqProfileLayout']) { 'legacy_numeric' } else { [string]$Current.qqProfileLayout }
+  if ($Layout -cnotin @('legacy_numeric', 'shared_root')) { throw '[STARTUP_PROFILE_LAYOUT_UNKNOWN]' }
+  $Argument = [string]$Current.qqUserDataDirArgument
+  if ($Layout -ceq 'shared_root' -or -not [string]::IsNullOrEmpty($Argument)) {
+    if ($Argument -cnotmatch '^--user-data-dir=(?:"([^"\r\n]+)"|([^"\s]+))$') { throw '[STARTUP_PROFILE_ARGUMENT_MISMATCH]' }
+    $ArgumentPath = if ([string]::IsNullOrEmpty($Matches[1])) { $Matches[2] } else { $Matches[1] }
+    if (-not [IO.Path]::IsPathRooted($ArgumentPath)) { throw '[STARTUP_PROFILE_ARGUMENT_MISMATCH]' }
+    try { $ArgumentPath = [IO.Path]::GetFullPath($ArgumentPath) }
+    catch { throw '[STARTUP_PROFILE_ARGUMENT_MISMATCH]' }
+    if ($ArgumentPath.TrimEnd([char[]]'\/') -ine $UserDataDir.TrimEnd([char[]]'\/')) { throw '[STARTUP_PROFILE_ARGUMENT_MISMATCH]' }
+  }
+  $ProfilePath = if ($Layout -ceq 'shared_root') { $UserDataDir } else { Join-Path $UserDataDir $ExpectedAccountId }
+  if (-not (Test-Path -LiteralPath $ProfilePath -PathType Container)) { throw '[STARTUP_PROFILE_MISSING]' }
+  return [pscustomobject]@{
+    layout = $Layout; userDataDir = $UserDataDir; profilePath = $ProfilePath
+    userDataDirArgument = $Argument; authenticationVerified = $false
+  }
+}
+
 function Assert-StartupPreflight {
   $Current = Assert-StartupAllowed
   if ([string]$Current.account -ne $ExpectedAccountId) { throw '[STARTUP_ACCOUNT_MISMATCH]' }
@@ -175,7 +203,7 @@ function Assert-StartupPreflight {
   }
   $Binding = Get-Content -LiteralPath (Join-Path $Current.dataRoot 'binding.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   if ([string]$Binding.expectedSelfId -ne $ExpectedAccountId) { throw '[STARTUP_ACCOUNT_MISMATCH]' }
-  if (-not (Test-Path -LiteralPath (Join-Path $Current.qqUserDataDir $ExpectedAccountId) -PathType Container)) { throw '[STARTUP_PROFILE_MISSING]' }
+  $null = Resolve-StartupQqProfile -Current $Current
   if (@($Current.criticalFiles).Count -eq 0) { throw '[STARTUP_IDENTITY_DRIFT]' }
   foreach ($File in $Current.criticalFiles) {
     if (-not [IO.Path]::IsPathRooted([string]$File.path) -or [string]$File.sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or (Get-FileHash -LiteralPath $File.path -Algorithm SHA256).Hash -ne $File.sha256) { throw '[STARTUP_IDENTITY_DRIFT]' }
@@ -188,7 +216,7 @@ function Assert-StartupPreflight {
 function Get-StartupFailure {
   param([Management.Automation.ErrorRecord]$Record)
   $Message = $Record.Exception.Message
-  if ($Message -match '\[STARTUP_MAINTENANCE_STOP\]') { return 'maintenance_stop' }
+  if ($Message -match '\[STARTUP_MAINTENANCE_STOP\]|EXISTING_STOP_REQUIREMENT_PRESERVED') { return 'maintenance_stop' }
   if ($Message -match '\[STARTUP_CONCURRENT_RUN\]|\[NAPCAT_LOGIN_ATTEMPT_IN_PROGRESS\]') { return 'concurrent_attempt' }
   if ($Message -match '\[NAPCAT_MANUAL_LOGIN_REQUIRED\]') { return 'manual_login_required' }
   if ($Message -match '\[NAPCAT_PROCESS_PRESENT\]') { return 'existing_process_not_ready' }
@@ -196,6 +224,8 @@ function Get-StartupFailure {
   if ($Message -match '\[STARTUP_IDENTITY_DRIFT\]|\[NAPCAT_RUNTIME_INCOMPLETE\]') { return 'identity_drift' }
   if ($Message -match '\[STARTUP_HISTORY_WRITE_FAILED\]') { return 'history_write_failed' }
   if ($Message -match '\[STARTUP_PROFILE_MISSING\]') { return 'profile_missing' }
+  if ($Message -match '\[STARTUP_PROFILE_LAYOUT_UNKNOWN\]') { return 'profile_layout_unknown' }
+  if ($Message -match '\[STARTUP_PROFILE_ARGUMENT_MISMATCH\]') { return 'profile_argument_mismatch' }
   $Exception = $Record.Exception
   while ($null -ne $Exception) {
     if ($Exception -is [UnauthorizedAccessException] -or $Exception -is [Security.SecurityException] -or $Exception -is [Management.Automation.PSSecurityException]) { return 'security_or_permission_denied' }
@@ -253,7 +283,7 @@ try {
         Assert-StartupNodeIdentity $Deployment
         $env:CODEX_TOOLKIT_NODE_EXE = $NodeExePath
         $global:LASTEXITCODE = 0
-        $RouterText = & $RouterScriptPath -DataRoot $Deployment.dataRoot -BrokerRoot $Deployment.brokerRoot
+        $RouterText = & $RouterScriptPath -DataRoot $Deployment.dataRoot -BrokerRoot $Deployment.brokerRoot -RequireNoStopMarker
         if ($LASTEXITCODE -ne 0) { throw '[STARTUP_ROUTER_NONZERO]' }
         $RouterResult = $RouterText | ConvertFrom-Json
         if ($RouterResult.started -isnot [bool]) { throw '[STARTUP_ROUTER_RESULT_INVALID]' }

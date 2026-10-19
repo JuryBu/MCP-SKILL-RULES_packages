@@ -434,12 +434,12 @@ try {
         $NapCatModuleBackupFile = Join-Path $BackupDirectory ("module-$ModuleIndex-$Leaf")
         [System.IO.File]::WriteAllBytes($NapCatModuleBackupFile, [System.IO.File]::ReadAllBytes($PatchModulePath))
         if ((Get-NormalizedHash -Path $NapCatModuleBackupFile) -ne $PatchModuleHash) { throw "NapCat module 备份字节哈希不匹配" }
+        $ModulePatch["backupPath"] = $NapCatModuleBackupFile
         Write-AtomicUtf8Text -Path $PatchModulePath -Value $PatchResult.source
         $PatchedNapCatSource = Get-Content -LiteralPath $PatchModulePath -Raw -Encoding UTF8
         $PatchedPreview = Convert-NapCatNodeUserDataPatch -Source $PatchedNapCatSource
         if ($PatchedPreview.changed) { throw "NapCat node 包数据目录补丁写入后仍未稳定" }
         $ModulePatch["changed"] = $true
-        $ModulePatch["backupPath"] = $NapCatModuleBackupFile
         $ModulePatch["afterSha256"] = Get-NormalizedHash -Path $PatchModulePath
       }
       $ModulePatch["wouldChange"] = $false

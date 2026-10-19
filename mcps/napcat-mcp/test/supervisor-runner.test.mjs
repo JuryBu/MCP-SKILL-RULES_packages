@@ -19,6 +19,7 @@ import {
   runSupervisorService,
   stopWindowsProcessTrees,
   invokePowerShellScript,
+  invokePowerShellCommand,
 } from "../src/supervisor-runner.mjs";
 
 function createFixture() {
@@ -301,22 +302,22 @@ test("进程识别不会把监督器自身、桌面 QQ 或任意 broker 路径�
     { ProcessId: 15, Name: "powershell.exe", CommandLine: `powershell.exe -NoProfile -File C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\ops\\start-napcat-login.ps1 -NapCatRoot "${napcatRoot}"` },
     { ProcessId: 16, Name: "powershell.exe", CommandLine: `powershell -NoProfile -Command "node supervisor-runner.mjs --login-script C:\\Users\\ExampleUser\\.codex\\mcp-http-broker\\napcat-mcp\\ops\\start-napcat-login.ps1 --napcat-root '${napcatRoot}'"` },
   ];
-  assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 11, 12, 15]);
+  assert.deepEqual(findNapCatProcesses(processes, napcatRoot, pinnedQqPath).map((item) => item.ProcessId), [3, 9, 10, 15]);
   assert.deepEqual(findBrokerProcesses(processes, "C:\\Users\\ExampleUser\\.codex\\mcp-http-broker").map((item) => item.ProcessId), [4]);
   assert.deepEqual(findCodexProcesses(processes).map((item) => item.ProcessId), [6, 7]);
 });
 
-test("进程识别会按固定 QQ 路径接受 QQNT 和 QQEx 进程名", () => {
+test("固定 QQ 路径本身不会把 QQNT 和 QQEx 认作 NapCat", () => {
   const qqntPath = "C:\\Users\\ExampleUser\\NapCat-QQ\\QQNT.exe";
   const qqexPath = "C:\\Users\\ExampleUser\\NapCat-QQ\\QQEX.exe";
   assert.deepEqual(findNapCatProcesses([
     { ProcessId: 21, Name: "QQNT.exe", CommandLine: `"${qqntPath}" --no-sandbox` },
     { ProcessId: 22, Name: "QQ.exe", CommandLine: '"C:\\Program Files\\Tencent\\QQNT\\QQ.exe"' },
-  ], null, qqntPath).map((item) => item.ProcessId), [21]);
+  ], null, qqntPath).map((item) => item.ProcessId), []);
   assert.deepEqual(findNapCatProcesses([
     { ProcessId: 23, Name: "QQEx.exe", CommandLine: `"${qqexPath}" --profile C:\\Users\\ExampleUser\\NapCatProfile` },
     { ProcessId: 24, Name: "QQ.exe", CommandLine: '"C:\\Program Files\\Tencent\\QQNT\\QQ.exe"' },
-  ], null, qqexPath).map((item) => item.ProcessId), [23]);
+  ], null, qqexPath).map((item) => item.ProcessId), []);
 });
 
 test("单次缺失 online 字段只开始未知状态宽限期，不会立即停止进程", async () => {
@@ -968,7 +969,7 @@ test("未知状态期间 NapCat 进程身份变化会重新开始宽限期", asy
   }
 });
 
-test("进程树根节点计算与 taskkill 调用只覆盖匹配根进程", async () => {
+test("停止调用逐个覆盖已确认进程，不递归终止未核验的子进程", async () => {
   const napcatRoot = "C:\\Users\\ExampleUser\\NapCat";
   const processes = [
     { pid: 6101, parentPid: 5000, name: "cmd.exe", commandLine: `cmd /c "${napcatRoot}\\launcher-user.bat"` },
@@ -980,17 +981,31 @@ test("进程树根节点计算与 taskkill 调用只覆盖匹配根进程", asyn
   await stopWindowsProcessTrees(processes, {
     currentPid: 9999,
     napcatRoot,
-    taskkillPath: "taskkill.exe",
     listProcesses: async () => processes,
     execFileImpl(file, args, options, callback) {
       calls.push({ file, args, options });
-      callback(null, "SUCCESS", "");
+      callback(null, JSON.stringify({ stopped: true, rootProcessIds: [6101, 6102, 6201] }), "");
     },
   });
-  assert.deepEqual(calls.map((call) => call.args), [
-    ["/PID", "6101", "/T", "/F"],
-    ["/PID", "6201", "/T", "/F"],
-  ]);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0].args.at(-1), /Stop-NapCatVerifiedProcesses/);
+  assert.match(calls[0].args.at(-1), /"ProcessId":6101/);
+  assert.match(calls[0].args.at(-1), /"ProcessId":6102/);
+  assert.match(calls[0].args.at(-1), /"ProcessId":6201/);
+  assert.doesNotMatch(calls[0].args.at(-1), /taskkill/);
+});
+
+test("停止前出现新的 owned 进程时保留全部进程等待重新核对", async () => {
+  const napcatRoot = "C:\\Users\\ExampleUser\\NapCat";
+  const snapshot = [{ pid: 6101, parentPid: 5000, name: "cmd.exe", commandLine: `cmd /c "${napcatRoot}\\launcher-user.bat"` }];
+  let calls = 0;
+  await assert.rejects(stopWindowsProcessTrees(snapshot, {
+    currentPid: 9999,
+    napcatRoot,
+    listProcesses: async () => [...snapshot, { pid: 6102, parentPid: 6101, name: "node.exe", commandLine: `node "${napcatRoot}\\index.js"` }],
+    execFileImpl() { calls += 1; },
+  }), (error) => error.code === "NAPCAT_PROCESS_IDENTITY_CHANGED");
+  assert.equal(calls, 0);
 });
 
 test("停止前 PID 身份改变时拒绝 taskkill", async () => {
@@ -1280,4 +1295,15 @@ test("PowerShell 调用默认隐藏，登录脚本通过 execFile 时仍保留 -
   assert.equal(calls[0].argumentsList.includes("-NoQr"), true);
   assert.equal(calls[0].argumentsList.includes("-WindowStyle"), true);
   assert.equal(calls[0].argumentsList[calls[0].argumentsList.indexOf("-WindowStyle") + 1], "Hidden");
+});
+
+test("监督器的 Windows PowerShell 子进程隔离 PS7 模块路径并保留中文", { skip: process.platform !== "win32" }, async () => {
+  const inherited = { ...process.env, PSModulePath: "C:\\Fixture\\PowerShell7\\Modules" };
+  const before = { ...inherited };
+  const command = "$row = Get-CimInstance Win32_Process -Filter ('ProcessId = ' + $PID) -ErrorAction Stop; [pscustomobject]@{name=$row.Name;text='中文 含空格';version=$PSVersionTable.PSVersion.ToString()} | ConvertTo-Json -Compress";
+  const result = await invokePowerShellCommand(command, { env: inherited, timeoutMs: 10_000 });
+  assert.equal(result.value[0].text, "中文 含空格");
+  assert.match(result.value[0].version, /^5\.1\./);
+  assert.equal(result.value[0].name.toLowerCase(), "powershell.exe");
+  assert.deepEqual(inherited, before);
 });

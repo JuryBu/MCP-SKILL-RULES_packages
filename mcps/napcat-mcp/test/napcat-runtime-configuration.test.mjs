@@ -108,6 +108,73 @@ function createNodeFixture(options = {}) {
   };
 }
 
+function runWithModuleVerificationFailure(fixture, modulePaths, failureModuleIndex) {
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    "$global:PostWriteReadPaths = @()",
+    "function Get-Content {",
+    "  [CmdletBinding()]param([string]$LiteralPath, [switch]$Raw, [string]$Encoding)",
+    "  if (($LiteralPath -eq $env:NAPCAT_TEST_PRIMARY_MODULE -or $LiteralPath -eq $env:NAPCAT_TEST_SECOND_MODULE) -and [IO.File]::ReadAllText($LiteralPath).Contains('NAPCAT_QQ_USER_DATA_DIR')) {",
+    "    $global:PostWriteReadPaths += $LiteralPath",
+    "    if ($global:PostWriteReadPaths.Count -eq [int]$env:NAPCAT_TEST_FAILURE_MODULE_INDEX) {",
+    "      throw ('INJECTED_POSTWRITE_READ_FAILURE_' + $env:NAPCAT_TEST_FAILURE_MODULE_INDEX)",
+    "    }",
+    "  }",
+    "  Microsoft.PowerShell.Management\\Get-Content @PSBoundParameters",
+    "}",
+    "$Caught = $null",
+    "try { & $env:NAPCAT_TEST_SCRIPT -DataRoot $env:NAPCAT_TEST_DATA_ROOT -NapCatRoot $env:NAPCAT_TEST_NAPCAT_ROOT -QqUserDataDir $env:NAPCAT_TEST_QQ_USER_DATA_DIR | Out-Null }",
+    "catch { $Caught = $_.Exception.Message }",
+    "[pscustomobject]@{ caught = $Caught; postWriteReadPaths = @($global:PostWriteReadPaths) } | ConvertTo-Json",
+  ].join("\n");
+  const output = execFileSync("powershell.exe", [
+    "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command,
+  ], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 15000,
+    env: {
+      ...process.env,
+      NAPCAT_TEST_SCRIPT: scriptPath,
+      NAPCAT_TEST_DATA_ROOT: fixture.dataRoot,
+      NAPCAT_TEST_NAPCAT_ROOT: fixture.napcatRoot,
+      NAPCAT_TEST_QQ_USER_DATA_DIR: fixture.qqUserDataDir,
+      NAPCAT_TEST_PRIMARY_MODULE: modulePaths[0],
+      NAPCAT_TEST_SECOND_MODULE: modulePaths[1],
+      NAPCAT_TEST_FAILURE_MODULE_INDEX: String(failureModuleIndex),
+    },
+  });
+  return JSON.parse(output.trim());
+}
+
+for (const failureModuleIndex of [1, 2]) {
+  test(`NapCat node runtime 第 ${failureModuleIndex} 个模块写入后复核失败时逐字节恢复全部模块与 runtime`, { skip: process.platform !== "win32" }, () => {
+    const fixture = createNodeFixture({ duplicateTopLevelModule: true });
+    try {
+      const modulePaths = [
+        path.join(fixture.napcatRoot, "napcat", "napcat.mjs"),
+        path.join(fixture.napcatRoot, "napcat.mjs"),
+      ];
+      const topLevelSource = fs.readFileSync(modulePaths[1], "utf8").replaceAll("\n", "\r\n");
+      fs.writeFileSync(modulePaths[1], `\uFEFF${topLevelSource}`, "utf8");
+      const runtimeSource = fs.readFileSync(fixture.runtimePath, "utf8").replaceAll("\n", "\r\n");
+      fs.writeFileSync(fixture.runtimePath, `\uFEFF${runtimeSource}`, "utf8");
+      const originalModules = modulePaths.map((modulePath) => fs.readFileSync(modulePath));
+      const originalRuntime = fs.readFileSync(fixture.runtimePath);
+
+      const result = runWithModuleVerificationFailure(fixture, modulePaths, failureModuleIndex);
+      assert.equal(result.caught, `INJECTED_POSTWRITE_READ_FAILURE_${failureModuleIndex}`);
+      assert.deepEqual(result.postWriteReadPaths, modulePaths.slice(0, failureModuleIndex));
+      for (const [moduleIndex, modulePath] of modulePaths.entries()) {
+        assert.deepEqual(fs.readFileSync(modulePath), originalModules[moduleIndex], modulePath);
+      }
+      assert.deepEqual(fs.readFileSync(fixture.runtimePath), originalRuntime);
+    } finally {
+      fixture.cleanup();
+    }
+  });
+}
+
 test("独立 QQ runtime 可先零写入验证，再原子应用并按原字节回滚", { skip: process.platform !== "win32" }, () => {
   const fixture = createFixture();
   try {

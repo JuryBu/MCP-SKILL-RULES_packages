@@ -11,6 +11,11 @@ $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "resolve-napcat-data-root.ps1")
 $ResolverBrokerRoot = if (Get-Variable -Name BrokerRoot -ErrorAction SilentlyContinue) { [string]$BrokerRoot } else { "" }
 $DataRoot = Resolve-NapCatDataRoot -ExplicitDataRoot $DataRoot -BrokerRoot $ResolverBrokerRoot
+$MaintenancePath = Join-Path $DataRoot "state\supervisor-maintenance.json"
+if (Test-Path -LiteralPath $MaintenancePath) {
+  [pscustomobject]@{ started = $false; reason = "maintenance"; maintenancePath = $MaintenancePath } | ConvertTo-Json -Depth 3
+  return
+}
 $NapCatMcpRoot = Split-Path -Parent $PSScriptRoot
 $NapCatParent = Split-Path -Parent $NapCatMcpRoot
 if ([string]::IsNullOrWhiteSpace($BrokerRoot)) {

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +9,43 @@ import test from "node:test";
 import { parseArguments, runSupervisorService } from "../src/supervisor-runner.mjs";
 
 const syncWaitBuffer = new Int32Array(new SharedArrayBuffer(4));
+const testPowerShell = process.env.NAPCAT_TEST_POWERSHELL || "powershell.exe";
+
+function spawnIsolatedLogin(fixtureRoot, argumentsList, options) {
+  assert.ok(path.resolve(fixtureRoot).startsWith(`${path.resolve(os.tmpdir())}${path.sep}`));
+  const fileIndex = argumentsList.indexOf("-File");
+  assert.ok(fileIndex >= 0);
+  const quote = (value) => `'${String(value).replaceAll("'", "''")}'`;
+  const invocation = argumentsList.slice(fileIndex + 1).map((value, index) => (
+    index > 0 && String(value).startsWith("-") ? value : quote(value)
+  )).join(" ");
+  const command = [
+    "$ErrorActionPreference = 'Stop'",
+    "[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)",
+    `$global:LoginFixtureRoot = ${quote(fixtureRoot)}`,
+    "function Get-CimInstance {",
+    "  [CmdletBinding()] param([Parameter(Position=0)][string]$ClassName, [string]$Filter)",
+    "  if ($ClassName -ne 'Win32_Process') { throw 'Unexpected fixture CIM class' }",
+    "  $all = @(CimCmdlets\\Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)",
+    "  $owned = @{}",
+    "  foreach ($entry in $all) { if ($entry.ProcessId -ne $PID -and ([string]$entry.CommandLine).IndexOf($global:LoginFixtureRoot + '\\', [StringComparison]::OrdinalIgnoreCase) -ge 0) { $owned[[int]$entry.ProcessId] = $true } }",
+    "  do { $changed = $false; foreach ($entry in $all) { if ($entry.ProcessId -ne $PID -and $owned.ContainsKey([int]$entry.ParentProcessId) -and -not $owned.ContainsKey([int]$entry.ProcessId)) { $owned[[int]$entry.ProcessId] = $true; $changed = $true } } } while ($changed)",
+    "  $selected = @($all | Where-Object { $owned.ContainsKey([int]$_.ProcessId) })",
+    "  if ($Filter) { if ($Filter -notmatch '^ProcessId\\s*=\\s*(\\d+)$') { throw 'Unexpected fixture CIM filter' }; $targetId = [int]$Matches[1]; return @($selected | Where-Object { [int]$_.ProcessId -eq $targetId }) }",
+    "  return $selected",
+    "}",
+    "function Invoke-RestMethod {",
+    "  param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)",
+    "  if ([string]$Uri -eq 'http://127.0.0.1:65534/get_status') { return [pscustomobject]@{ status='ok'; data=[pscustomobject]@{ online=$false; good=$false } } }",
+    "  throw 'Unexpected fixture HTTP request'",
+    "}",
+    `& ${invocation} -CodexHome ${quote(path.join(fixtureRoot, "codex"))} -QqUserDataDir ${quote(path.join(fixtureRoot, "profile", "QQ"))}`,
+  ].join("\r\n");
+  return spawnSync(testPowerShell, [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+    "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64"),
+  ], options);
+}
 
 function waitSync(milliseconds) {
   Atomics.wait(syncWaitBuffer, 0, 0, milliseconds);
@@ -220,9 +257,9 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /cache\\qrcode\.png/);
   assert.match(loginScript, /Get-FreshQrCode/);
   assert.match(loginScript, /\$NoQr -and \$null -ne \$QrCode/);
-  assert.match(loginScript, /CommandLineHints/);
-  assert.match(loginScript, /Stop-LaunchedProcessTree -RootProcessId \$ProcessId -CommandLineHints @\(\$NapCatRoot, \$QqExePath\)/);
-  assert.match(loginScript, /taskkill\.exe" \/PID \$RootProcessId \/T \/F/);
+  assert.match(loginScript, /OwnedTree/);
+  assert.match(loginScript, /Stop-LaunchedProcessTree -RootProcessId \$ProcessId -AttemptIdentity \$StartedProcessIdentity/);
+  assert.match(loginScript, /Stop-NapCatOwnedTree \$AttemptIdentity.ownedTree/);
   assert.doesNotMatch(loginScript, /Get-CimInstance Win32_Process\s*\|[\s\S]*Stop-Process/);
   assert.match(loginScript, /Test-PasswordFallbackNeedsHuman/);
   assert.match(loginScript, /proofWaterUrl/);
@@ -250,11 +287,11 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
   assert.match(loginScript, /Release-NapCatLoginAttemptLock -Lock \$LoginAttemptLock/);
   assert.match(loginScript, /Get-ExistingNapCatRuntimeProcesses/);
   assert.match(loginScript, /\[string\]\$QqExePath/);
-  assert.match(loginScript, /MatchesQqExePath/);
+  assert.match(loginScript, /Get-NapCatProcessClassification/);
   assert.match(loginScript, /\$Status\.data\.good -eq \$true/);
   assert.doesNotMatch(loginScript, /\$Haystack\.Contains\(\$Needle\)/);
-  assert.match(loginScript, /LooksLikeManagedWrapper/);
-  assert.match(loginScript, /supervisor-runner\\\.mjs/);
+  assert.match(loginScript, /NAPCAT_PROCESS_SCAN_UNKNOWN/);
+  assert.match(loginScript, /napcat-process-identity\.ps1/);
   assert.match(loginScript, /existing_napcat_runtime_detected/);
   assert.match(loginScript, /refuse_second_launch=true/);
   assert.match(loginScript, /NAPCAT_PROCESS_PRESENT/);
@@ -269,7 +306,7 @@ test("登录与监督器脚本从 runtime 读取独立 QQ，并保留未配置�
 });
 
 test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-qrcode-layout-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-qrcode-layout-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -302,7 +339,7 @@ test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断
 
   const scriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -324,7 +361,7 @@ test("Node 一键包生成嵌套二维码后 NoQr 立即进入人工登录阻断
 });
 
 test("登录脚本检测到已有 NapCat 运行态时拒绝启动第二个实例", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-existing-process-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-existing-process-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -362,9 +399,9 @@ test("登录脚本检测到已有 NapCat 运行态时拒绝启动第二个实例
   fs.mkdirSync(path.join(runtimeRoot, "napcat"), { recursive: true });
   const nestedCorePath = path.join(runtimeRoot, "napcat", "napcat.mjs");
   const holdScriptPath = path.join(runtimeRoot, "hold-napcat-runtime.js");
-  fs.writeFileSync(nestedCorePath, "export {};\n", "utf8");
+  fs.writeFileSync(nestedCorePath, "setInterval(() => {}, 1000);\n", "utf8");
   fs.writeFileSync(holdScriptPath, "setInterval(() => {}, 1000);\n", "utf8");
-  existingProcess = spawn(process.execPath, [holdScriptPath, nestedCorePath], {
+  existingProcess = spawn(process.execPath, [nestedCorePath], {
     cwd: runtimeRoot,
     stdio: "ignore",
     windowsHide: true,
@@ -375,7 +412,7 @@ test("登录脚本检测到已有 NapCat 运行态时拒绝启动第二个实例
 
   const scriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -399,7 +436,7 @@ test("登录脚本检测到已有 NapCat 运行态时拒绝启动第二个实例
 });
 
 test("登录脚本不会把 supervisor 自身误判成 NapCat 运行态", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-supervisor-process-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-supervisor-process-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -449,7 +486,7 @@ test("登录脚本不会把 supervisor 自身误判成 NapCat 运行态", { skip
   while (!isProcessAlive(supervisorProcess.pid) && Date.now() < processDeadline) waitSync(25);
   assert.equal(isProcessAlive(supervisorProcess.pid), true, "fixture supervisor process should still be alive before login");
 
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -472,7 +509,7 @@ test("登录脚本不会把 supervisor 自身误判成 NapCat 运行态", { skip
 });
 
 test("加密密码回退明确返回密码错误时才禁用 DPAPI 凭据", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-fallback-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-password-fallback-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -547,7 +584,7 @@ test("加密密码回退明确返回密码错误时才禁用 DPAPI 凭据", { sk
 
   const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -577,7 +614,7 @@ test("加密密码回退明确返回密码错误时才禁用 DPAPI 凭据", { sk
 });
 
 test("加密密码回退密码错误后进程立即退出也会阻断自动重试", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-fast-exit-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-password-fast-exit-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -628,7 +665,7 @@ test("加密密码回退密码错误后进程立即退出也会阻断自动重�
   const credentialPath = path.join(dataRoot, "private", "napcat-login", "credential.json");
   const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -651,7 +688,7 @@ test("加密密码回退密码错误后进程立即退出也会阻断自动重�
 });
 
 test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻断自动重试", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-password-captcha-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-password-captcha-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -702,7 +739,7 @@ test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻�
 
   const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -726,7 +763,7 @@ test("密码回退要求短信验证且没有二维码文件时 NoQr 也会阻�
 });
 
 test("登录进程提前退出前输出 KickedOffLine 时 NoQr 仍会持久阻断", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-fast-exit-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-fast-exit-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -756,7 +793,7 @@ test("登录进程提前退出前输出 KickedOffLine 时 NoQr 仍会持久阻�
   });
 
   const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -773,7 +810,7 @@ test("登录进程提前退出前输出 KickedOffLine 时 NoQr 仍会持久阻�
 });
 
 test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-login-stderr-captcha-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-login-stderr-captcha-test-${randomUUID()}-`));
   const runtimeRoot = path.join(root, "runtime");
   const dataRoot = path.join(root, "data");
   const brokerRoot = path.join(root, "broker");
@@ -823,7 +860,7 @@ test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip
 
   const loginScriptPath = fileURLToPath(new URL("../ops/start-napcat-login.ps1", import.meta.url));
   const startedAt = Date.now();
-  const result = spawnSync("powershell.exe", [
+  const result = spawnIsolatedLogin(root, [
     "-NoProfile",
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -846,7 +883,7 @@ test("密码回退把验证码写入 stderr 时 NoQr 也会停止重试", { skip
 });
 
 test("CodeRoot 与便携 broker release 分离时使用清单启动器并校验 BrokerRoot", { skip: process.platform !== "win32" }, (t) => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "napcat-supervisor-manifest-test-"));
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `napcat-supervisor-manifest-test-${randomUUID()}-`));
   const codeRoot = path.join(root, "code-root");
   const napcatMcpRoot = path.join(codeRoot, "napcat-mcp");
   const opsRoot = path.join(napcatMcpRoot, "ops");
