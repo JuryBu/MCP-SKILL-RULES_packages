@@ -100,6 +100,54 @@ async function modelRequest(port) {
   });
 }
 
+for (const scenario of [{ rate: 1000 }, { rate: 2000, file: true }, { rate: 3000, file: true, environment: true }]) {
+  test(`runner applies ${scenario.rate} ms per MiB to actual encoded request bytes`, async t => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-upload-runner-"));
+    const upstream = http.createServer((request, response) => {
+      request.resume();
+      request.on("end", () => {
+        response.writeHead(200, { "content-type": "text/event-stream" });
+        response.end(sse({ type: "response.output_text.delta", delta: "fixture" }) + sse({ type: "response.completed" }));
+      });
+    });
+    const upstreamPort = await listen(upstream);
+    const proxyPort = await reservePort();
+    if (scenario.file) fs.writeFileSync(path.join(root, "codex-model-upload-policy.json"),
+      JSON.stringify({ schemaVersion: 1, uploadAllowanceMsPerMiB: 2000 }));
+    const environment = { ...process.env, CODEX_MODEL_STREAM_PROXY_STATE_ROOT: root,
+      CODEX_MODEL_STREAM_PROXY_PORT: String(proxyPort), CODEX_MODEL_STREAM_PROXY_HEARTBEAT_INTERVAL_MS: "100",
+      CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN: `http://127.0.0.1:${upstreamPort}` };
+    delete environment.CODEX_MODEL_STREAM_PROXY_UPLOAD_ALLOWANCE_MS_PER_MIB;
+    delete environment.CODEX_MODEL_STREAM_PROXY_MAX_UPLOAD_ALLOWANCE_MS;
+    if (scenario.environment) environment.CODEX_MODEL_STREAM_PROXY_UPLOAD_ALLOWANCE_MS_PER_MIB = "3000";
+    const child = spawn(process.execPath, [runnerPath], { windowsHide: true, stdio: "ignore", env: environment });
+    t.after(async () => {
+      if (child.exitCode === null) {
+        fs.writeFileSync(path.join(root, "codex-model-stream-proxy.stop"), "fixture complete");
+        await Promise.race([once(child, "close"), new Promise(resolve => setTimeout(resolve, 2500))]);
+      }
+      if (child.exitCode === null) child.kill();
+      upstream.closeAllConnections?.();
+      await new Promise(resolve => upstream.close(resolve));
+      fs.rmSync(root, { recursive: true, force: true });
+    });
+    const runtimePath = path.join(root, "codex-model-stream-proxy-runtime.json");
+    await waitFor(() => fs.existsSync(runtimePath));
+    const runtime = JSON.parse(fs.readFileSync(runtimePath, "utf8"));
+    assert.equal(runtime.uploadAllowanceMsPerMiB, scenario.rate);
+    assert.equal(runtime.maxUploadAllowanceMs, 128 * scenario.rate);
+    assert.equal(runtime.maxConsecutiveAttempts, 6);
+    const response = await modelRequest(proxyPort);
+    assert.equal(response.statusCode, 200);
+    const events = readEvents(path.join(root, "codex-model-stream-proxy.jsonl"));
+    const body = events.find(event => event.type === "request_body_inspected");
+    const attempt = events.find(event => event.type === "turn_attempt_started");
+    assert.equal(attempt.uploadAllowanceMs, Math.ceil(body.encodedBytes / 1048576 * scenario.rate));
+    assert.equal(attempt.firstProgressDeadlineMs, attempt.firstProgressTimeoutMs + attempt.uploadAllowanceMs);
+    assert.equal(attempt.maxConsecutiveAttempts, 6);
+  });
+}
+
 test("runtime heartbeat write failure never aborts an active model stream and later recovers", async (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "codex-model-proxy-runner-test-"));
   const runtimePath = path.join(root, "codex-model-stream-proxy-runtime.json");

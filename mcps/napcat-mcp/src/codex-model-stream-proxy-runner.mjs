@@ -9,6 +9,7 @@ import { renameReplaceSync } from "./atomic-file.mjs";
 import { parseToolDeliveryProfile } from "./tool-delivery-profile.mjs";
 import { createAdaptiveDeliveryRegistry } from "./adaptive-delivery.mjs";
 import { isolatedHandoffConfiguration, attachInnerRunnerHandoffControl } from "./inner-runner-handoff-control.mjs";
+import { readUploadAllowancePolicy } from "./upload-allowance-policy.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
   const value = Number(process.env[name] ?? fallback);
@@ -115,6 +116,7 @@ function readAdaptiveState() {
   }
 }
 const proxy = createCodexModelStreamProxy({
+  ...readUploadAllowancePolicy(handoffConfig?.runtimeProfile?.stateRoot ?? stateRoot),
   onModelObservation: event => modelObserver.observe(event),
   instanceToken,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
@@ -169,6 +171,8 @@ function runtimeState(status = "running", error = null) {
     endpoint: `http://${proxy.status().host}:${proxy.status().port}`,
     upstreamOrigin: proxy.status().upstreamOrigin,
     firstProgressTimeoutMs: proxy.status().firstProgressTimeoutMs,
+    uploadAllowanceMsPerMiB: proxy.status().uploadAllowanceMsPerMiB,
+    maxUploadAllowanceMs: proxy.status().maxUploadAllowanceMs,
     toolPreparationGraceMs: proxy.status().toolPreparationGraceMs,
     bufferedToolPreparationGraceMs: proxy.status().bufferedToolPreparationGraceMs,
     bufferedToolProfileCount: proxy.status().bufferedToolProfileCount,
