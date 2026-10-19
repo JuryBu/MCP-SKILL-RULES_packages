@@ -54,9 +54,15 @@ function ownRoot(record, root, markUnknown) {
   if (/^cmd(?:\.exe)?$/i.test(name)) {
     const argumentsText = commandEntry(command).arguments;
     const rawInvocation = /^(?:(?:\/d|\/s|\/q)\s+)*\/[ck]\s+(?:call\s+)?(.+)$/i.exec(argumentsText)?.[1] ?? "";
-    const canonicalEntry = entryPath(commandEntry(rawInvocation.replace(/^"+/, '"')).executable);
-    return ["launcher-user.bat", "napcat.bat", "napcatwinbootmain.exe"]
-      .some((entry) => canonicalEntry === `${root}/${entry}`);
+    let canonicalEntry = canonicalPath(commandEntry(rawInvocation.replace(/^"+/, '"')).executable);
+    if (!canonicalEntry && rawInvocation.startsWith('"') && rawInvocation.endsWith('"') && rawInvocation.length > 1) {
+      canonicalEntry = canonicalPath(commandEntry(rawInvocation.slice(1, -1)).executable);
+    }
+    const entries = ["launcher-user.bat", "napcat.bat", "napcatwinbootmain.exe"].map((entry) => `${root}/${entry}`);
+    if (entries.includes(canonicalEntry)) return true;
+    if ((!canonicalEntry || rawInvocation.startsWith('"'))
+      && (rawInvocation.includes(`${root}/`) || entries.some((entry) => containsPath(rawInvocation, entry)))) markUnknown();
+    return false;
   }
   if (/^node(?:\.exe)?$/i.test(name)) {
     let argumentsText = commandEntry(command).arguments;

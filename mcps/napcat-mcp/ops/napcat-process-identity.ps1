@@ -165,11 +165,17 @@ function Get-NapCatProcessClassification {
         if ($ArgumentsText -match '^(?:(?:/d|/s|/q)\s+)*\/[ck]\s+(?:call\s+)?(.+)$') {
           $RawInvocation = $Matches[1]
           $InvocationEntry = (Get-NapCatCommandEntry ($RawInvocation -replace '^"+', '"')).executable
-          if ($InvocationEntry) {
+          $CanonicalEntry = ConvertTo-NapCatCanonicalPath $InvocationEntry
+          if (-not $CanonicalEntry -and $RawInvocation.StartsWith('"') -and $RawInvocation.EndsWith('"') -and $RawInvocation.Length -gt 1) {
+            $InvocationEntry = (Get-NapCatCommandEntry $RawInvocation.Substring(1, $RawInvocation.Length - 2)).executable
             $CanonicalEntry = ConvertTo-NapCatCanonicalPath $InvocationEntry
-            if (-not $CanonicalEntry) { $PathUnknown = $true }
-            if ($CanonicalEntry -in @("$Root/launcher-user.bat", "$Root/napcat.bat", "$Root/napcatwinbootmain.exe")) { $MatchesRoot = $true }
           }
+          foreach ($Entry in @('launcher-user.bat','napcat.bat','napcatwinbootmain.exe')) {
+            $ExpectedEntry = "$Root/$Entry"
+            if ($CanonicalEntry -eq $ExpectedEntry) { $MatchesRoot = $true }
+            elseif ((-not $CanonicalEntry -or $RawInvocation.StartsWith('"')) -and (Test-NapCatIdentityPath $RawInvocation $ExpectedEntry)) { $PathUnknown = $true }
+          }
+          if (-not $MatchesRoot -and (-not $CanonicalEntry -or $RawInvocation.StartsWith('"')) -and $RawInvocation.Contains("$Root/")) { $PathUnknown = $true }
         }
       } elseif ($Name -match '^node(\.exe)?$') {
         $ArgumentsText = (Get-NapCatCommandEntry $Command).arguments
