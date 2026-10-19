@@ -44,7 +44,7 @@ $RunnerStdoutPath = Join-Path $DiagnosticRoot ($AttemptId + '.stdout.log')
 $RunnerStderrPath = Join-Path $DiagnosticRoot ($AttemptId + '.stderr.log')
 $RecoveryOutputPath = Join-Path $DiagnosticRoot ($AttemptId + '.recovery.log')
 $StartupClock = [Diagnostics.Stopwatch]::StartNew()
-$StartupDiagnostic = [ordered]@{ schemaVersion = 1; attemptId = $AttemptId; startedAt = [DateTimeOffset]::UtcNow.ToString('o'); launcherPid = $PID; runnerPid = $null; stage = 'configuration'; status = 'running'; elapsedMs = 0; error = $null; stdoutPath = $RunnerStdoutPath; stderrPath = $RunnerStderrPath; recoveryOutputPath = $RecoveryOutputPath; events = @() }
+$StartupDiagnostic = [ordered]@{ schemaVersion = 1; attemptId = $AttemptId; startedAt = [DateTimeOffset]::UtcNow.ToString('o'); launcherPid = $PID; runnerPid = $null; stage = 'configuration'; status = 'running'; elapsedMs = 0; error = $null; stdoutPath = $RunnerStdoutPath; stderrPath = $RunnerStderrPath; recoveryOutputPath = $RecoveryOutputPath; phaseTimings = [ordered]@{ launchHashMs = $null; launchProcessMs = $null; launchPublicationMs = $null; launchToPublicationMs = $null }; events = @() }
 
 function Write-StartupDiagnostic {
   param([string]$Stage, [string]$Status = 'running', [string]$Message = '')
@@ -356,24 +356,57 @@ if ($ExpectedInstanceToken -or $LaunchReceiptPath) {
   $ArgumentLine = ($Arguments | ForEach-Object { Quote-Argument -Value $_ }) -join " "
 }
 if ($RequireNoStopMarker -and (Test-Path -LiteralPath $StopFilePath)) { throw 'EXISTING_STOP_REQUIREMENT_PRESERVED' }
-Write-StartupDiagnostic -Stage 'runner_launch'
-$RedirectOutput = @{}
+$LaunchStreams = [ordered]@{}
+$LaunchHashes = [ordered]@{}
 try {
-  [IO.File]::WriteAllText($RunnerStdoutPath, '', [Text.UTF8Encoding]::new($false))
-  [IO.File]::WriteAllText($RunnerStderrPath, '', [Text.UTF8Encoding]::new($false))
-  $RedirectOutput = @{ RedirectStandardOutput = $RunnerStdoutPath; RedirectStandardError = $RunnerStderrPath }
-} catch { Write-Warning ('Startup process output could not be captured: ' + $_.Exception.Message) }
-$Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru @RedirectOutput
-$PinnedHandle = $Process.Handle
-$StartupDiagnostic.runnerPid = $Process.Id
-Write-StartupDiagnostic -Stage 'runner_wait'
-if ($LaunchReceiptPath) {
-  $Launch = [ordered]@{ schemaVersion = 1; instanceToken = $ExpectedInstanceToken; pid = $Process.Id; createdAt = $Process.StartTime.ToUniversalTime().ToString('o'); nodePath = $NodePath; nodeSha256 = (Get-FileHash -LiteralPath $NodePath -Algorithm SHA256).Hash.ToLowerInvariant(); runnerPath = $RunnerPath; runnerSha256 = (Get-FileHash -LiteralPath $RunnerPath -Algorithm SHA256).Hash.ToLowerInvariant(); entrySha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash.ToLowerInvariant(); runtimeStatePath = $RuntimeStatePath; commandLine = $ArgumentLine; ports = @($DownstreamPort, $ControlPort, $UpstreamPort, $ProbePort); recordedAt = [DateTimeOffset]::UtcNow.ToString('o') }
-  $ReceiptStream = [IO.File]::Open($LaunchReceiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-  try { $ReceiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Launch | ConvertTo-Json -Depth 8 -Compress)); $ReceiptStream.Write($ReceiptBytes, 0, $ReceiptBytes.Length); $ReceiptStream.Flush($true) } finally { $ReceiptStream.Dispose() }
-  $Ready = [ordered]@{ instanceToken = $ExpectedInstanceToken; receiptSha256 = (Get-FileHash -LiteralPath $LaunchReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() }
-  $ReadyStream = [IO.File]::Open(($LaunchReceiptPath + '.ready'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
-  try { $ReadyBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Ready | ConvertTo-Json -Compress)); $ReadyStream.Write($ReadyBytes, 0, $ReadyBytes.Length); $ReadyStream.Flush($true) } finally { $ReadyStream.Dispose() }
+  if ($LaunchReceiptPath) {
+    Write-StartupDiagnostic -Stage 'launch_hash'
+    $LaunchHashClock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $LaunchFiles = [ordered]@{ node = $NodePath; runner = $RunnerPath; entry = $PSCommandPath }
+      foreach ($LaunchFileName in $LaunchFiles.Keys) {
+        Assert-CodexStartupPathWithoutReparsePoint -Path $LaunchFiles[$LaunchFileName]
+        $LaunchStreams[$LaunchFileName] = [IO.File]::Open($LaunchFiles[$LaunchFileName], [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+      }
+      foreach ($LaunchFileName in $LaunchFiles.Keys) {
+        $LaunchHashes[$LaunchFileName] = (Get-FileHash -InputStream $LaunchStreams[$LaunchFileName] -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($LaunchHashes[$LaunchFileName] -cnotmatch '^[a-f0-9]{64}$') { throw 'START_LAUNCH_FILE_HASH_INVALID' }
+      }
+    } finally { $StartupDiagnostic.phaseTimings.launchHashMs = $LaunchHashClock.ElapsedMilliseconds }
+  }
+  Write-StartupDiagnostic -Stage 'runner_launch'
+  $RedirectOutput = @{}
+  try {
+    [IO.File]::WriteAllText($RunnerStdoutPath, '', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($RunnerStderrPath, '', [Text.UTF8Encoding]::new($false))
+    $RedirectOutput = @{ RedirectStandardOutput = $RunnerStdoutPath; RedirectStandardError = $RunnerStderrPath }
+  } catch { Write-Warning ('Startup process output could not be captured: ' + $_.Exception.Message) }
+  $LaunchProcessClock = [Diagnostics.Stopwatch]::StartNew()
+  try {
+    $Process = Start-Process -FilePath $NodePath -ArgumentList $ArgumentLine -WindowStyle Hidden -PassThru @RedirectOutput
+    $PinnedHandle = $Process.Handle
+    $StartupDiagnostic.runnerPid = $Process.Id
+    $LaunchedAt = $Process.StartTime.ToUniversalTime()
+  } finally { $StartupDiagnostic.phaseTimings.launchProcessMs = $LaunchProcessClock.ElapsedMilliseconds }
+  Write-StartupDiagnostic -Stage 'runner_wait'
+  if ($LaunchReceiptPath) {
+    Write-StartupDiagnostic -Stage 'launch_publication'
+    $LaunchPublicationClock = [Diagnostics.Stopwatch]::StartNew()
+    try {
+      $Launch = [ordered]@{ schemaVersion = 1; instanceToken = $ExpectedInstanceToken; pid = $Process.Id; createdAt = $LaunchedAt.ToString('o'); nodePath = $NodePath; nodeSha256 = $LaunchHashes.node; runnerPath = $RunnerPath; runnerSha256 = $LaunchHashes.runner; entrySha256 = $LaunchHashes.entry; runtimeStatePath = $RuntimeStatePath; commandLine = $ArgumentLine; ports = @($DownstreamPort, $ControlPort, $UpstreamPort, $ProbePort); recordedAt = [DateTimeOffset]::UtcNow.ToString('o') }
+      $ReceiptStream = [IO.File]::Open($LaunchReceiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+      try { $ReceiptBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Launch | ConvertTo-Json -Depth 8 -Compress)); $ReceiptStream.Write($ReceiptBytes, 0, $ReceiptBytes.Length); $ReceiptStream.Flush($true) } finally { $ReceiptStream.Dispose() }
+      $Ready = [ordered]@{ instanceToken = $ExpectedInstanceToken; receiptSha256 = (Get-FileHash -LiteralPath $LaunchReceiptPath -Algorithm SHA256).Hash.ToLowerInvariant() }
+      $ReadyStream = [IO.File]::Open(($LaunchReceiptPath + '.ready'), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+      try { $ReadyBytes = (New-Object Text.UTF8Encoding($false)).GetBytes(($Ready | ConvertTo-Json -Compress)); $ReadyStream.Write($ReadyBytes, 0, $ReadyBytes.Length); $ReadyStream.Flush($true) } finally { $ReadyStream.Dispose() }
+    } finally {
+      $StartupDiagnostic.phaseTimings.launchPublicationMs = $LaunchPublicationClock.ElapsedMilliseconds
+      $StartupDiagnostic.phaseTimings.launchToPublicationMs = [Math]::Max(0, ([DateTime]::UtcNow - $LaunchedAt).TotalMilliseconds)
+    }
+    Write-StartupDiagnostic -Stage 'runner_wait'
+  }
+} finally {
+  foreach ($LaunchStream in $LaunchStreams.Values) { $LaunchStream.Dispose() }
 }
 
 $RuntimeState = $null
