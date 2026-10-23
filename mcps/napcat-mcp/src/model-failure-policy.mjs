@@ -17,6 +17,7 @@ const CODE_GROUPS = [
   ["authentication", true, false, ["authentication_error", "authentication_failed", "invalid_api_key", "invalid_authentication", "invalid_token", "token_expired", "unauthorized", "permission_denied", "access_denied", "forbidden"]],
   ["quota", true, false, ["usage_limit_exceeded", "usage_limit_reached", "insufficient_quota", "insufficient_credits", "quota_exceeded", "quota_exhausted", "billing_hard_limit_reached", "billing_hard_limit_exceeded", "billing_limit_exceeded", "billing_not_active", "credit_balance_too_low", "credits_exhausted", "credit_balance_exhausted", "organization_spend_limit_exceeded", "project_spend_limit_exceeded", "usage_not_included"]],
   ["payload_too_large", true, false, ["payload_too_large", "request_too_large", "message_too_big", "request_entity_too_large", "ws_message_too_large", "unsupported_image_prewarm", "session_bytes_exceeded"]],
+  ["transport_capacity", false, false, ["session_limit", "operation_limit"]],
   ["permanent", true, false, ["invalid_request_error", "invalid_request", "invalid_argument", "context_length_exceeded", "model_not_found", "unsupported_parameter", "unsupported_value"]],
   ["temporary", true, false, ["rate_limit_exceeded", "rate_limit_error", "too_many_requests", "overloaded_error", "engine_overloaded"]],
   ["temporary", false, false, ["server_error", "internal_server_error", "service_unavailable", "temporarily_unavailable"]],

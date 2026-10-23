@@ -1936,7 +1936,7 @@ export function createCodexModelStreamProxy(options = {}) {
           && !outcome.sawHostedTool && (!outcome.sawCompaction || compactionRequest && outcome.frames === 0);
         outcome.nativeRecovery = !compactionRequest && !outcome.sawCompaction
           && ["temporary", "acceptance_unknown"].includes(outcome.policy?.category) && !replayWithoutOutput;
-        const fallbackPayload = upstreamClient && outcome.policy?.category === "payload_too_large" && replayWithoutOutput;
+        const fallbackPayload = upstreamClient && ["payload_too_large", "transport_capacity"].includes(outcome.policy?.category) && replayWithoutOutput;
         if (key) operationLedger?.settle(key, fallbackPayload
           ? { ...outcome, policy: { ...outcome.policy, acceptance: "rejected" } } : outcome);
         if (upstreamClient && outcome.kind === "completed") websocketCooldowns.delete(identity.threadId);
@@ -1946,7 +1946,9 @@ export function createCodexModelStreamProxy(options = {}) {
           const retryAfterMs = deferWebsocket(identity.threadId);
           incrementalTransport.invalidate(identity.threadId, "http_fallback");
           forceHttp = true;
-          recoveryState({ phase: "retrying", reason: fallbackPayload ? "websocket_payload_requires_http" : "websocket_http_fallback",
+          recoveryState({ phase: "retrying", reason: fallbackPayload
+            ? (outcome.policy.category === "transport_capacity" ? "websocket_capacity_requires_http" : "websocket_payload_requires_http")
+            : "websocket_http_fallback",
             acceptance: outcome.policy.acceptance, willRetry: true, canContinueHttp: false, retryAfterMs, websocketAttempts });
           requestBody.approveReplay();
           continue;

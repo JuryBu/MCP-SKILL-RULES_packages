@@ -226,6 +226,27 @@ test("metadata and heartbeat before an accepted response do not prevent websocke
   assert.equal(response.text.includes("duplicate_operation"), false);
 });
 
+for (const resource of ["maxSessions", "maxOperations"]) {
+  test(`local WebSocket ${resource} exhaustion falls back without stopping the busy thread`, async context => {
+    let firstPacket;
+    let announceFirst;
+    const received = new Promise(resolve => { announceFirst = resolve; });
+    const setup = await fixture(context, { transportOptions: { [resource]: 1 },
+      onPacket: entry => { firstPacket = entry; announceFirst(); } });
+    const busy = setup.request({ threadId: "busy-thread", turnId: "busy-turn" });
+    await received;
+    const overflow = setup.request({ threadId: "overflow-thread", turnId: "overflow-turn" });
+    const response = await overflow.done;
+    complete(firstPacket.socket, "busy_completed");
+    await busy.done;
+    assert.equal(setup.httpRequests.length, 1);
+    assert.deepEqual(setup.httpRequests[0].body, overflow.encoded);
+    assert.equal(setup.packets.length, 1);
+    assert.equal(response.events.at(-1).response.id, "http_completed");
+    assert.equal(setup.proxy.status().counters.syntheticCompletions, 0);
+  });
+}
+
 test("1009 falls back once to full HTTP without resending the websocket packet", async context => {
   const setup = await fixture(context, { onPacket: entry => entry.socket.close(1009, "fixture limit") });
   const pending = setup.request();
