@@ -395,6 +395,76 @@ def test_v2_image_requires_exact_resource_index_private_key_and_hardlink_integri
     assert (tmp_path / "scoped-image-keys" / f"{hashlib.sha256(OWNER_KEY.encode()).hexdigest()}.json").is_file()
 
 
+@pytest.mark.parametrize(
+    ("case", "expected_error"),
+    [
+        ("single", False),
+        ("identical_duplicate", False),
+        ("identical_repeated", False),
+        ("different_resource", True),
+        ("different_blob_same_file_id", True),
+        ("missing", True),
+        ("missing_packed_info", True),
+        ("different_chat", False),
+        ("different_local_id", False),
+        ("different_server_id", False),
+    ],
+)
+def test_image_resource_index_deduplicates_only_exact_payloads(
+    tmp_path: Path, case: str, expected_error: bool
+) -> None:
+    resolver, _, decrypted, _ = _resolver(tmp_path)
+    file_id = "a" * 32
+    content_md5 = "b" * 32
+    _write_image_databases(
+        decrypted, local_id=10, server_id=102, file_id=file_id,
+        content_md5=content_md5, size=42,
+    )
+    resource = decrypted / "message" / "message_resource.db"
+    packed = b"\x12\x22\x0a\x20" + file_id.encode("ascii")
+    with sqlite3.connect(resource) as connection:
+        if case == "missing":
+            connection.execute("DELETE FROM MessageResourceInfo")
+        elif case == "missing_packed_info":
+            connection.execute("UPDATE MessageResourceInfo SET packed_info=NULL")
+        elif case != "single":
+            chat_id, local_id, server_id = 1, 10, 102
+            if case == "different_resource":
+                packed = b"\x12\x22\x0a\x20" + b"c" * 32
+            elif case == "different_blob_same_file_id":
+                packed += b"\x18\x01"
+            elif case == "different_chat":
+                chat_id = 2
+                connection.execute(
+                    "INSERT INTO ChatName2Id(rowid,user_name) VALUES(2,?)", ("other-room",)
+                )
+                packed = b"\x12\x22\x0a\x20" + b"c" * 32
+            elif case == "different_local_id":
+                local_id = 11
+                packed = b"\x12\x22\x0a\x20" + b"c" * 32
+            elif case == "different_server_id":
+                server_id = 103
+                packed = b"\x12\x22\x0a\x20" + b"c" * 32
+            for _ in range(3 if case == "identical_repeated" else 1):
+                connection.execute(
+                    "INSERT INTO MessageResourceInfo VALUES(?,?,?,?,?)",
+                    (chat_id, local_id, server_id, 3, packed),
+                )
+    before = resource.read_bytes()
+    attachment = _attachment(
+        kind="image", local_id=10, server_id=102, size=42, content_md5=content_md5
+    )
+    if expected_error:
+        with pytest.raises(LedgerError) as raised:
+            resolver._image_index(attachment, USERNAME)
+        assert raised.value.code == "ATTACHMENT_IMAGE_INDEX"
+    else:
+        assert resolver._image_index(attachment, USERNAME) == [
+            (file_id + "_h.dat", content_md5, 42)
+        ]
+    assert resource.read_bytes() == before
+
+
 def test_v2_image_waits_for_one_bounded_database_refresh(tmp_path: Path) -> None:
     _, ledger, decrypted, account = _resolver(tmp_path)
     local_id = 13

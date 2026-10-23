@@ -282,7 +282,7 @@ class WechatAttachmentSourceResolver:
             connection.row_factory = sqlite3.Row
             rows = connection.execute(
                 """
-                SELECT info.packed_info
+                SELECT DISTINCT info.packed_info
                 FROM MessageResourceInfo AS info
                 JOIN ChatName2Id AS chat ON chat.rowid=info.chat_id
                 WHERE chat.user_name=?
