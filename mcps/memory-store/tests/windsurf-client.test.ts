@@ -20,6 +20,9 @@ import {
 
 const tinyPng = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
 const jobsTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-wsf-jobs-test-"));
+process.env.MEMORY_STORE_DATA_ROOT = path.join(jobsTempDir, "data");
+process.env.MEMORY_STORE_DEVIN_CLI_DB_PATH = path.join(jobsTempDir, "absent-devin.db");
+process.env.MEMORY_STORE_DEVIN_DESKTOP_ROOT = path.join(jobsTempDir, "absent-desktop");
 const jobsPath = path.join(jobsTempDir, "jobs.json");
 const previousJobsPath = process.env.MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH;
 process.env.MEMORY_STORE_WSF_SUBAGENT_JOBS_PATH = jobsPath;

@@ -13,6 +13,8 @@ import {
     type LocalPbReadResult,
     type LocalPbStep,
     type LocalPbSourceFlavor,
+    type LocalPbActivity,
+    type LocalPbDiagnostic,
 } from "./local-pb-reader.js";
 import { mergeConsecutiveHumanRounds, type ConversationRound } from "./trajectory.js";
 import { readFiniteIntegerEnv, type ConversationSourceFingerprint } from "./conversation-source-cache.js";
@@ -35,6 +37,41 @@ export interface LocalPbConversationResult {
     candidateKinds: Array<"active" | "implicit">;
     partial: boolean;
     diagnostics: LocalPbCandidateDiagnostic[];
+    localPbActivities: LocalPbActivityData;
+}
+
+export interface LocalPbActivityData {
+    sourceFlavor: LocalPbSourceFlavor;
+    activityCount: number;
+    formalRoundCount: number;
+    partial: boolean;
+    entries: Array<{ stepIndex: number; activity: LocalPbActivity; diagnostics: LocalPbDiagnostic[] }>;
+    diagnostics: Array<LocalPbDiagnostic & { stepIndex: number }>;
+}
+
+export function formatLocalPbActivities(data: LocalPbActivityData, depth: "brief" | "normal" | "full" = "normal"): string {
+    const lines = [`## 本地 PB 活动：${data.sourceFlavor}，${data.activityCount}项活动／${data.formalRoundCount}个主人轮次${data.partial ? "（源内容不完整）" : ""}`];
+    for (const entry of data.entries) {
+        const activity = entry.activity;
+        lines.push(`### 活动 step ${entry.stepIndex}：${activity.kind} (${activity.sourceFlavor}.field_${activity.fieldNumber})`);
+        if (activity.uri) lines.push(`uri=${activity.uri}`);
+        if (activity.cwd) lines.push(`cwd=${activity.cwd}`);
+        if (activity.terminalId) lines.push(`terminalId=${activity.terminalId}`);
+        if (depth !== "brief") {
+            for (const field of activity.textFields) {
+                lines.push(`fieldPath=${field.fieldPath}`);
+                lines.push(depth === "full" ? field.text : `${field.text.slice(0, 500)}${field.text.length > 500 ? "\n[活动预览截断，depth=full读取完整字段]" : ""}`);
+            }
+            if (activity.lineSequence) {
+                lines.push(`fieldPath=${activity.lineSequence.fieldPath}，原始行记录（rawFlag保留原值）：`);
+                const selected = depth === "full" ? activity.lineSequence.lines : activity.lineSequence.lines.slice(0, 10);
+                lines.push(...selected.map(line => JSON.stringify(line)));
+                if (selected.length < activity.lineSequence.lines.length) lines.push(`[活动行预览 ${selected.length}/${activity.lineSequence.lines.length}，depth=full读取完整记录]`);
+            }
+        }
+    }
+    for (const diagnostic of data.diagnostics) lines.push(`PB诊断 step=${diagnostic.stepIndex} field=${diagnostic.fieldNumber ?? "unknown"} ${diagnostic.kind}: ${diagnostic.message}`);
+    return lines.join("\n");
 }
 
 interface LocalPbDiscoveredCandidate extends LocalPbFileCandidate {
@@ -101,6 +138,7 @@ function canonicalLocalPbStep(step: LocalPbStep): string {
         user: step.user,
         planner: step.planner,
         system: step.system,
+        activities: step.activities,
         toolVariants: step.toolVariants,
         diagnostics: step.diagnostics,
     });
@@ -236,6 +274,16 @@ export function localPbResultToRounds(result: LocalPbReadResult): ConversationRo
         }
         if (step.system) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.field_114", semanticRole: "system", kind: "system", text: step.system });
         if (step.timestamp?.iso) round.semanticEvents?.push({ stepIndex, rawRole: "local_pb.timestamp", semanticRole: "system", kind: "timestamp", text: step.timestamp.iso });
+        for (const activity of step.activities || []) {
+            const text = formatLocalPbActivities({ sourceFlavor: result.sourceFlavor, activityCount: 1, formalRoundCount: 0,
+                partial: step.diagnostics.some(diagnostic => diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant"),
+                entries: [{ stepIndex, activity, diagnostics: step.diagnostics }],
+                diagnostics: step.diagnostics.map(diagnostic => ({ ...diagnostic, stepIndex })),
+            }, "full");
+            round.semanticEvents?.push({ stepIndex, rawRole: `${result.sourceFlavor}.local_pb.field_${activity.fieldNumber}`,
+                semanticRole: "system", kind: "local_pb_activity", name: activity.kind, text });
+            round.fileViews = [...(round.fileViews || []), { stepIndex, kind: "local_pb_activity", title: activity.kind, textSummary: text }];
+        }
         if (step.planner) {
             const projected = projectLocalPbPlanner(step.planner);
             round.aiResponses.push({ stepIndex, response: projected.response, thinking: projected.thinking, toolCalls: [] });
@@ -351,13 +399,21 @@ export function loadLocalPbConversation(host: LocalPbSourceFlavor, conversationI
     }
     const selected = selectCompleteLocalPbResult(successfulCandidates.map(candidate => candidate.result));
     const rounds = localPbResultToRounds(selected);
+    const partial = diagnostics.some(diagnostic => diagnostic.status === "failed") || selected.partial === true
+        || selected.diagnostics.some(diagnostic => diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant");
+    const entries = selected.trajectory.steps.flatMap(step => (step.activities || []).map(activity => ({
+        stepIndex: step.index, activity, diagnostics: step.diagnostics,
+    })));
     return {
         selected,
         rounds,
         totalSteps: selected.trajectory.steps.length,
         fingerprint: fingerprintLocalPbCandidates(candidates),
         candidateKinds: successfulCandidates.map(candidate => candidate.candidate.kind),
-        partial: diagnostics.some(diagnostic => diagnostic.status === "failed"),
+        partial,
+        localPbActivities: { sourceFlavor: host, activityCount: entries.length, formalRoundCount: rounds.length, partial, entries,
+            diagnostics: selected.trajectory.steps.flatMap(step => step.diagnostics.map(diagnostic => ({ ...diagnostic, stepIndex: step.index }))),
+        },
         diagnostics,
     };
 }

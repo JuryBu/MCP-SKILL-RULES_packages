@@ -8,6 +8,7 @@ export interface CliConversation {
     compactions: DevinCompaction[];
     supplements: DevinDesktopMessage[];
     messageIds: Set<string>;
+    toolCallIds: Set<string>;
     hidden: boolean;
     empty: boolean;
     revision: string;
@@ -33,7 +34,7 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
     budget: ReadBudget, memo: Map<number, DevinMessageNode>, identityOnly = false): Promise<ChainResult> {
     if (head === null) return { nodes: [], compactions: [], warnings: ["DEVIN_MAIN_CHAIN_MISSING"] };
     const messageExpression = identityOnly
-        ? `CASE WHEN json_valid(chat_message) THEN CASE WHEN json_type(chat_message)='object' THEN json_object('role', json_extract(chat_message, '$.role'), 'metadata', json_object('created_at', json_extract(chat_message, '$.metadata.created_at'), 'extensions', json_object('chisel/client-message-id', json_extract(chat_message, '$.metadata.extensions."chisel/client-message-id"')))) ELSE chat_message END ELSE chat_message END`
+        ? `CASE WHEN json_valid(chat_message) THEN CASE WHEN json_type(chat_message)='object' THEN json_object('role', json_extract(chat_message, '$.role'), 'tool_call_id', json_extract(chat_message, '$.tool_call_id'), 'tool_calls', json((SELECT json_group_array(json_object('id',json_extract(call.value,'$.id'))) FROM json_each(chat_message,'$.tool_calls') AS call WHERE call.type='object')), 'metadata', json_object('created_at', json_extract(chat_message, '$.metadata.created_at'), 'extensions', json_object('chisel/client-message-id', json_extract(chat_message, '$.metadata.extensions."chisel/client-message-id"')))) ELSE chat_message END ELSE chat_message END`
         : "chat_message";
     const statement = database.prepare(`WITH selected AS (SELECT node_id, parent_node_id, created_at, metadata,
         ${messageExpression} AS chat_message FROM message_nodes WHERE session_id=? AND node_id=?)
@@ -198,7 +199,7 @@ async function cliSupplement(database: DatabaseSync, sessionId: string, filename
 }
 
 export async function readCliConversations(filename: string, budget: ReadBudget,
-    options: { identityOnly?: boolean; sessionId?: string } = {}): Promise<CliConversation[]> {
+    options: { identityOnly?: boolean; metadataOnly?: boolean; sessionId?: string; conversationIds?: string[]; acceptSummary?: (summary: DevinConversationSummary) => boolean; onConversation?: (conversation: CliConversation) => void; onSession?: () => void; onSessionError?: (id: string, error: unknown) => void } = {}): Promise<CliConversation[]> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         const sessionColumns = columns(database, "sessions");
         const nodeColumns = columns(database, "message_nodes");
@@ -207,34 +208,44 @@ export async function readCliConversations(filename: string, budget: ReadBudget,
             throw new DevinReadError("DEVIN_SCHEMA_UNSUPPORTED", "The Devin CLI database does not have the supported sessions/message_nodes schema.");
         }
         const selectedColumns = ["id", "main_chain_id", "working_directory", "workspace_dirs", "title", "created_at", "last_activity_at", "hidden", "metadata"];
-        const select = selectedColumns.map(column => sessionColumns.has(column) && !(options.identityOnly && column === "metadata") ? column : `NULL AS ${column}`).join(", ");
+        const select = selectedColumns.map(column => sessionColumns.has(column) && !((options.identityOnly || options.metadataOnly) && column === "metadata") ? column : `NULL AS ${column}`).join(", ");
         const results: CliConversation[] = [];
-        const sessions = database.prepare(`SELECT ${select} FROM sessions ${options.sessionId === undefined ? "" : "WHERE id=?"} ORDER BY id`);
-        for (const session of sessions.iterate(...(options.sessionId === undefined ? [] : [options.sessionId]))) {
+        const ids = options.sessionId !== undefined ? [options.sessionId] : options.conversationIds;
+        const sessions = database.prepare(`SELECT ${select} FROM sessions ${ids?.length ? `WHERE id IN (${ids.map(() => "?").join(",")})` : ""} ORDER BY ${sessionColumns.has("last_activity_at") ? "last_activity_at DESC," : ""} id`);
+        for (const session of sessions.iterate(...(ids || []))) {
             await budget.take(Buffer.byteLength(JSON.stringify(session)));
+            options.onSession?.();
             const sessionId = String(session.id);
-            const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
-            const memo = new Map<number, DevinMessageNode>();
-            const chain = empty ? { nodes: [], compactions: [], warnings: ["DEVIN_EMPTY_CONVERSATION"] }
-                : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
-            const supplement = options.identityOnly ? { messages: [], state: [], warnings: [] }
-                : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget);
-            const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
-            const summary: DevinConversationSummary = {
-                id: sessionId, canonicalId: sessionId, sessionId, aliases: [sessionId],
-                title: typeof session.title === "string" ? session.title : sessionId,
-                cwd: typeof session.working_directory === "string" ? session.working_directory : undefined,
-                workspaceUris: workspaceUris(session.working_directory, session.workspace_dirs),
-                createdAt: asTimestamp(session.created_at), updatedAt: asTimestamp(session.last_activity_at),
-                sourcePath: filename, desktopPaths: [], sourceKind: "devin-cli", matchedMessageIds: 0,
-                mainChainId: nodeId(session.main_chain_id) ?? undefined, partial: warnings.length > 0, warnings,
-            };
-            results.push({
-                summary, nodes: chain.nodes, compactions: chain.compactions, supplements: supplement.messages,
-                messageIds: collectMessageIds(chain.nodes), hidden: Number(session.hidden ?? 0) !== 0,
-                empty,
-                revision: digest([identity, schema, session, [...memo.values()], chain.compactions, supplement.state, warnings]),
-            });
+            try {
+                const empty = !database.prepare("SELECT 1 FROM message_nodes WHERE session_id=? LIMIT 1").get(sessionId);
+                const memo = new Map<number, DevinMessageNode>();
+                const chain = empty || options.metadataOnly ? { nodes: [], compactions: [], warnings: empty ? ["DEVIN_EMPTY_CONVERSATION"] : [] }
+                    : await readChain(database, sessionId, nodeId(session.main_chain_id), budget, memo, options.identityOnly);
+                const supplement = options.identityOnly || options.metadataOnly ? { messages: [], state: [], warnings: [] }
+                    : await cliSupplement(database, sessionId, filename, chain.nodes, memo, budget);
+                const warnings = [...new Set([...chain.warnings, ...supplement.warnings])];
+                const summary: DevinConversationSummary = {
+                    id: sessionId, canonicalId: sessionId, sessionId, aliases: [sessionId],
+                    title: typeof session.title === "string" ? session.title : sessionId,
+                    cwd: typeof session.working_directory === "string" ? session.working_directory : undefined,
+                    workspaceUris: workspaceUris(session.working_directory, session.workspace_dirs),
+                    createdAt: asTimestamp(session.created_at), updatedAt: asTimestamp(session.last_activity_at),
+                    sourcePath: filename, desktopPaths: [], sourceKind: "devin-cli", matchedMessageIds: 0,
+                    mainChainId: nodeId(session.main_chain_id) ?? undefined, partial: warnings.length > 0, warnings,
+                };
+                if (options.acceptSummary && !options.acceptSummary(summary)) continue;
+                results.push({
+                    summary, nodes: chain.nodes, compactions: chain.compactions, supplements: supplement.messages,
+                    messageIds: collectMessageIds(chain.nodes), toolCallIds: knownToolIds(chain.nodes), hidden: Number(session.hidden ?? 0) !== 0,
+                    empty,
+                    revision: digest([identity, schema, session, [...memo.values()], chain.compactions, supplement.state, warnings]),
+                });
+                options.onConversation?.(results[results.length - 1]);
+            } catch (error) {
+                budget.check();
+                if (!options.onSessionError || !(error instanceof DevinReadError) || /BUDGET|DEADLINE|ABORTED/u.test(error.code)) throw error;
+                options.onSessionError(sessionId, error);
+            }
         }
         return results;
     });

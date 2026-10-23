@@ -96,7 +96,7 @@ export function isFile(filename: string | null): filename is string {
 
 const desktopFilename = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.db$/i;
 
-export function desktopFiles(root: string | null, limit: number, check?: () => void): string[] {
+export function desktopFiles(root: string | null, limit: number, check?: () => void, onLimit?: (error: DevinReadError) => void): string[] {
     if (!root) return [];
     const filenames: string[] = [];
     let directory: fs.Dir;
@@ -109,7 +109,10 @@ export function desktopFiles(root: string | null, limit: number, check?: () => v
             check?.();
             if (!entry.isFile() || !desktopFilename.test(entry.name)) continue;
             if (filenames.length >= limit) {
-                throw new DevinReadError("DEVIN_DESKTOP_BUDGET", "Devin Desktop discovery exceeded maxDesktopFiles; alias uniqueness was not established.");
+                const error = new DevinReadError("DEVIN_DESKTOP_BUDGET", "Devin Desktop discovery exceeded maxDesktopFiles; alias uniqueness was not established.");
+                if (!onLimit) throw error;
+                onLimit(error);
+                break;
             }
             filenames.push(path.join(root, entry.name));
         }

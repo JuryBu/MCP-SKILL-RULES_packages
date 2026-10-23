@@ -9,6 +9,32 @@ export interface DevinReadOptions {
     deadlineMs?: number;
 }
 
+export interface DevinDiscoveryDiagnostic {
+    code: string;
+    message: string;
+    sourceKind: "devin-cli" | "devin-desktop";
+    sourcePath: string;
+    conversationId?: string;
+}
+
+export interface DevinDiscoveryOptions extends DevinReadOptions {
+    conversationIds?: string[];
+    query?: string;
+    workspaces?: string[];
+    workspaceMode?: "contains" | "exact" | "under" | "any" | "all";
+    workspaceScope?: "any" | "primary";
+    limit?: number;
+    verifyAliases?: boolean;
+}
+
+export interface DevinDiscoveryResult {
+    conversations: DevinConversationSummary[];
+    partial: boolean;
+    diagnostics: DevinDiscoveryDiagnostic[];
+    scannedSessions: number;
+    scannedDesktopFiles: number;
+}
+
 export interface DevinConversationSummary {
     id: string;
     canonicalId: string;
@@ -24,6 +50,8 @@ export interface DevinConversationSummary {
     desktopPaths: string[];
     sourceKind: "devin-cli" | "devin-desktop";
     matchedMessageIds: number;
+    matchedToolCallIds?: number;
+    identityEvidence?: "client-message-id" | "tool-call-id";
     mainChainId?: number;
     partial: boolean;
     warnings: string[];

@@ -5,7 +5,7 @@ import path from "path";
 import { buildCodexRoundsForTest } from "../src/codex-client.ts";
 import { formatRound } from "../src/trajectory.ts";
 import { TEMP_DIR } from "../src/temp-store.ts";
-import { materializeRoundAttachments } from "../src/conversation-attachments.ts";
+import { extractCodexEventUserAttachments, extractCodexMessageAttachments, materializeRoundAttachments } from "../src/conversation-attachments.ts";
 
 const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-codex-attachments-"));
 const localImage = path.join(cwd, "图片 样例(1).png");
@@ -74,13 +74,25 @@ assert.match(unmaterialized, /Codex JSONL 内联图片/u);
 assert.doesNotMatch(unmaterialized, /base64/u);
 assert.match(unmaterialized, /课程 OBE\(测试\)\.docx/u);
 
-const { rounds: displayRounds } = await materializeRoundAttachments(rounds, "test-codex-attachments", {
+const cachedInline = rounds[0].attachments?.find(item => item.source === "codex-data-url");
+assert.equal(cachedInline?.dataUrl, undefined);
+assert.match(cachedInline?.sha256 || "", /^sha256:[a-f0-9]{64}$/u);
+assert.equal(cachedInline?.sizeBytes, Buffer.byteLength("inline-image"));
+assert.match(cachedInline?.warning || "", /data URL omitted from cache/u);
+const { rounds: cachedDisplay } = await materializeRoundAttachments(rounds, "test-codex-attachments", { limit: 5 });
+assert.equal(cachedDisplay[0].attachments?.find(item => item.source === "codex-data-url")?.tempPath, undefined);
+assert.equal(cachedDisplay[0].attachments?.find(item => item.source === "codex-local-image")?.originalPath, localImage);
+
+const rawAttachments = [
+    ...extractCodexMessageAttachments([{ type: "input_image", image_url: dataUrl }], userText, { cwd }),
+    ...extractCodexEventUserAttachments({ local_images: [localImage] }, { cwd }),
+];
+assert.equal(rawAttachments.length, 3);
+const { rounds: displayRounds } = await materializeRoundAttachments([{ ...rounds[0], attachments: rawAttachments }], "test-codex-attachments", {
     limit: 5,
     concurrency: 2,
 });
 const inlineImage = displayRounds[0].attachments?.find(item => item.source === "codex-data-url");
-// EP-E 修复：内联 data-url 图不再因「同轮恰好有不相关的本地路径图」被误杀（旧 preferLocalRemaining 按数量配额跳过 data-url），
-// 改为精确判重（同一附件 originalPath+dataUrl，或 sha256 命中本地图才跳）。本场景本地图与内联图是两张不同的图 → 内联图应被 materialize 落盘。
 assert.ok(inlineImage?.tempPath, "EP-E 修复后内联图不应被同轮不相关本地图误杀，应 materialize");
 assert.equal(fs.existsSync(inlineImage.tempPath), true);
 assert.equal(inlineImage?.exists, true);
@@ -98,7 +110,8 @@ const dataUrlOnly = buildCodexRoundsForTest([
         },
     },
 ], "summary", { cwd });
-const { rounds: dataUrlOnlyDisplay } = await materializeRoundAttachments(dataUrlOnly.rounds, "test-codex-attachments", {
+assert.equal(dataUrlOnly.rounds[0].attachments?.[0].dataUrl, undefined);
+const { rounds: dataUrlOnlyDisplay } = await materializeRoundAttachments([{ ...dataUrlOnly.rounds[0], attachments: extractCodexMessageAttachments([{ type: "input_image", image_url: dataUrl }], "", { cwd }) }], "test-codex-attachments", {
     limit: 5,
     concurrency: 2,
 });
@@ -117,7 +130,8 @@ const oversizedDataUrlOnly = buildCodexRoundsForTest([
         },
     },
 ], "summary", { cwd });
-const { rounds: oversizedDisplay } = await materializeRoundAttachments(oversizedDataUrlOnly.rounds, "test-codex-attachments", {
+assert.equal(oversizedDataUrlOnly.rounds[0].attachments?.[0].dataUrl, undefined);
+const { rounds: oversizedDisplay } = await materializeRoundAttachments([{ ...oversizedDataUrlOnly.rounds[0], attachments: extractCodexMessageAttachments([{ type: "input_image", image_url: oversizedDataUrl }], "", { cwd }) }], "test-codex-attachments", {
     limit: 5,
     maxBytes: 64,
 });

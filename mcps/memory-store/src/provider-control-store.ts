@@ -228,8 +228,32 @@ export type ProviderRecoveredLeaseSettlement = {
     kind: "settled" | "already-settled";
 };
 
+export interface ProviderLeaseMaintenanceInput {
+    dataRoot: string;
+    identity: ProviderLeaseIdentity;
+    expectedRevision: number;
+    expectedStateSha256: string;
+    acknowledgedBy: string;
+    evidenceReference: string;
+    dryRun?: boolean;
+}
+
+export interface ProviderLeaseMaintenanceResult {
+    kind: "dry-run" | "reclaimed";
+    externalOutcome: "UNKNOWN";
+    noReplay: true;
+    operationId: string;
+    evidencePrefix?: string;
+    beforeRevision: number;
+    beforeSha256: string;
+    receipt?: ProviderControlDurabilityReceipt;
+    afterSha256?: string;
+    removedLeaseId: string;
+}
+
 export interface VerifyProviderControlReceiptOptions extends ProviderControlStoreOptions {
     nowMs?: number;
+    allowOwnerlessMaintenanceReceipt?: boolean;
 }
 
 export class ProviderControlStoreError extends Error {
@@ -552,6 +576,243 @@ export async function settleRecoveredProviderLease(
     }, input);
 }
 
+export async function maintainExpiredUncertainProviderLease(
+    input: ProviderLeaseMaintenanceInput,
+): Promise<ProviderLeaseMaintenanceResult> {
+    if (!input || typeof input.dataRoot !== "string" || !path.isAbsolute(input.dataRoot)) {
+        throw new ProviderControlPathSafetyError("maintenance dataRoot 必须是显式绝对路径");
+    }
+    const dataRootStat = await fs.promises.lstat(input.dataRoot);
+    if (!dataRootStat.isDirectory() || dataRootStat.isSymbolicLink()) {
+        throw new ProviderControlPathSafetyError("maintenance dataRoot 必须是已存在的真实目录");
+    }
+    assertProviderLeaseIdentity(input.identity);
+    const identityKeys = ["provider", "trafficClass", "attemptId", "leaseId", "ownerEpoch", "capacityGeneration", "acquiredAt", "expiresAt"];
+    if (Object.keys(input.identity).length !== identityKeys.length || Object.keys(input.identity).some(key => !identityKeys.includes(key))) {
+        throw new ProviderControlStoreError("maintenance identity 只允许完整八字段", "INVALID_MAINTENANCE_INPUT");
+    }
+    assertNonEmpty(input.acknowledgedBy, "acknowledgedBy");
+    assertNonEmpty(input.evidenceReference, "evidenceReference");
+    if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0
+        || !/^[a-f0-9]{64}$/u.test(input.expectedStateSha256)
+        || input.dryRun !== undefined && typeof input.dryRun !== "boolean") {
+        throw new ProviderControlStoreError("maintenance revision/SHA256/dryRun 非法", "INVALID_MAINTENANCE_INPUT");
+    }
+    const request = structuredClone(input);
+    const paths = resolveProviderControlPaths({ dataRoot: request.dataRoot });
+    const operationId = crypto.randomUUID();
+    const evidencePrefix = path.join(paths.dataRoot, `provider-lease-maintenance-${operationId}`);
+    const lock = await acquireProviderControlFileLock(paths, {});
+    let phase = "validate";
+    let stateMayHaveChanged = false;
+    let primaryError: Error | undefined;
+    let committedReceipt: ProviderControlDurabilityReceipt | undefined;
+    let maintenanceResult: ProviderLeaseMaintenanceResult | undefined;
+    try {
+        const digest = (bytes: Buffer) => crypto.createHash("sha256").update(bytes).digest("hex");
+        const save = async (suffix: string, bytes: Buffer): Promise<void> => {
+            const target = `${evidencePrefix}.${suffix}`;
+            await lock.assertHeld();
+            const safety = await assertSafeLayout(paths);
+            await ensureSafeTargetParent(paths, target);
+            const handle = await fs.promises.open(target, "wx");
+            try {
+                await handle.writeFile(bytes);
+                await handle.sync();
+            } finally {
+                await handle.close();
+            }
+            await assertSafeLayout(paths, safety);
+            if (digest(await fs.promises.readFile(target)) !== digest(bytes)) {
+                throw new ProviderControlStoreError("maintenance evidence 回读失败", "MAINTENANCE_EVIDENCE_FAILED");
+            }
+        };
+        const saveJson = (suffix: string, value: unknown) => save(suffix, Buffer.from(`${JSON.stringify(value, null, 2)}\n`));
+        const snapshot = async () => {
+            const current = await requireCurrent(paths);
+            const handle = await openNoFollow(paths.controlPath, fs.constants.O_RDONLY);
+            let raw: Buffer;
+            try { raw = await handle.readFile(); } finally { await handle.close(); }
+            if (JSON.stringify(JSON.parse(raw.toString("utf8"))) !== JSON.stringify(current.state)) {
+                throw new ProviderControlStoreError("maintenance 读取期间 state 漂移", "MAINTENANCE_STATE_DRIFT");
+            }
+            return { current, raw, sha256: digest(raw) };
+        };
+        const assertBaseline = (state: ProviderControlState, sha256: string) => {
+            assertExpectedRevision(state, request.expectedRevision);
+            if (sha256 !== request.expectedStateSha256) {
+                throw new ProviderControlStoreError("maintenance 原文件 SHA256 漂移", "MAINTENANCE_STATE_DRIFT");
+            }
+        };
+        const revision = (state: ProviderControlState, nowMs: number) => {
+            state.controlRevision += 1;
+            state.updatedAtMs = Math.max(state.updatedAtMs, nowMs);
+            state.publicationId = crypto.randomUUID();
+        };
+        try {
+            const before = await snapshot();
+            assertBaseline(before.current.state, before.sha256);
+            const nowMs = Date.now();
+            if (nowMs < before.current.state.lastObservedWallClockMs) {
+                throw new ProviderControlFencedError("maintenance 时钟早于已记录时间");
+            }
+            if (before.current.state.ownerLease && before.current.state.ownerLease.expiresAtMs > nowMs) {
+                throw new ProviderControlFencedError("maintenance 拒绝活跃 owner，禁止借用其 fence");
+            }
+            const pool = before.current.state.pools[request.identity.provider];
+            const related = [...pool.activeLeases, ...pool.uncertainLeases]
+                .filter(lease => lease.leaseId === request.identity.leaseId || lease.attemptId === request.identity.attemptId);
+            const target = pool.uncertainLeases.find(lease => matchesProviderLeaseIdentity(lease, request.identity));
+            if (related.length !== 1 || !target || !matchesProviderLeaseIdentity(related[0], request.identity)) {
+                throw new ProviderControlFencedError("maintenance 必须唯一匹配 uncertain 租约的完整八字段");
+            }
+            if (target.graceExpiresAtMs > nowMs) {
+                throw new ProviderControlStoreError("maintenance uncertain grace 尚未到期", "MAINTENANCE_GRACE_NOT_EXPIRED");
+            }
+            const result: ProviderLeaseMaintenanceResult = {
+                kind: request.dryRun === false ? "reclaimed" : "dry-run",
+                externalOutcome: "UNKNOWN", noReplay: true, operationId,
+                beforeRevision: before.current.state.controlRevision,
+                beforeSha256: before.sha256, removedLeaseId: target.leaseId,
+            };
+            if (request.dryRun !== false) return result;
+            phase = "preserve-before-owner";
+            await save("before.json", before.raw);
+            await saveJson("unknown-no-replay.json", {
+                schemaVersion: 1, kind: "provider-local-ttl-maintenance", operationId,
+                externalOutcome: "UNKNOWN", noReplay: true, replayProhibited: true,
+                reason: "expired-uncertain-local-capacity-only", identity: request.identity,
+                expectedRevision: request.expectedRevision, expectedStateSha256: request.expectedStateSha256,
+                graceExpiresAtMs: target.graceExpiresAtMs, acknowledgedBy: request.acknowledgedBy,
+                evidenceReference: request.evidenceReference, recordedAtMs: Date.now(),
+            });
+            const rechecked = await snapshot();
+            assertBaseline(rechecked.current.state, rechecked.sha256);
+            const claimNowMs = Date.now();
+            if (claimNowMs < nowMs) throw new ProviderControlFencedError("maintenance 时钟回退");
+            const owned = structuredClone(rechecked.current.state);
+            owned.ownerEpoch += 1;
+            owned.ownerLease = {
+                ownerId: `lease-maintenance:${operationId}`, leaseId: crypto.randomUUID(),
+                acquiredAtMs: claimNowMs, expiresAtMs: claimNowMs + 60_000,
+            };
+            revision(owned, claimNowMs);
+            phase = "claim-maintenance-owner";
+            stateMayHaveChanged = true;
+            const ownerReceipt = await publishProviderControlState(paths, owned, lock, true, rechecked.sha256);
+            await saveJson("owner-receipt.json", ownerReceipt);
+            const claimed = await snapshot();
+            if (claimed.current.state.controlRevision !== owned.controlRevision
+                || claimed.current.state.persistedHash !== owned.persistedHash
+                || claimed.current.state.publicationId !== owned.publicationId
+                || claimed.sha256 !== digest(Buffer.from(`${JSON.stringify(owned, null, 2)}\n`))) {
+                throw new ProviderControlStoreError("maintenance owner claim 后 state 漂移", "MAINTENANCE_STATE_DRIFT");
+            }
+            const commitNowMs = Date.now();
+            assertCurrentOwnerFence(claimed.current.state, {
+                ownerEpoch: owned.ownerEpoch, ownerLeaseId: owned.ownerLease!.leaseId,
+            }, commitNowMs);
+            if (commitNowMs < claimNowMs) throw new ProviderControlFencedError("maintenance 时钟回退");
+            const next = structuredClone(claimed.current.state);
+            const nextPool = next.pools[request.identity.provider];
+            nextPool.uncertainLeases = nextPool.uncertainLeases.filter(lease => !matchesProviderLeaseIdentity(lease, request.identity));
+            if (nextPool.breaker.probeLease?.leaseId === target.leaseId) nextPool.breaker.probeLease = null;
+            if (request.identity.provider === "agy") {
+                const admission = next.agy.admission;
+                if (admission.firstRunOverflowLeaseIds.includes(target.leaseId)) {
+                    admission.firstRunOverflowLeaseIds = admission.firstRunOverflowLeaseIds.filter(leaseId => leaseId !== target.leaseId);
+                    admission.firstRunOverflowBorrowedSlots = Math.max(0, admission.firstRunOverflowLeaseIds.length - admission.firstRunOverflowGuarantee);
+                }
+                if (admission.fallbackLeaseIds.includes(target.leaseId)) {
+                    admission.fallbackLeaseIds = admission.fallbackLeaseIds.filter(leaseId => leaseId !== target.leaseId);
+                    admission.fallbackBorrowedSlots = Math.max(0, admission.fallbackLeaseIds.length - admission.fallbackGuarantee);
+                }
+            }
+            next.ownerLease = null;
+            revision(next, commitNowMs);
+            const otherLeases = (state: ProviderControlState) => PROVIDER_IDS.map(provider => ({
+                provider, active: state.pools[provider].activeLeases,
+                uncertain: state.pools[provider].uncertainLeases.filter(lease => provider !== request.identity.provider || lease.leaseId !== target.leaseId),
+            }));
+            if (JSON.stringify(otherLeases(before.current.state)) !== JSON.stringify(otherLeases(next))) {
+                throw new ProviderControlStoreError("maintenance 修改了其他租约", "MAINTENANCE_SCOPE_DRIFT");
+            }
+            phase = "commit-target-and-release-owner";
+            const receipt = await publishProviderControlState(paths, next, lock, true, claimed.sha256);
+            committedReceipt = receipt;
+            const after = await snapshot();
+            if (after.current.state.persistedHash !== receipt.stateHash
+                || after.current.state.publicationId !== receipt.publicationId
+                || after.current.receipt.fileIdentity !== receipt.fileIdentity
+                || JSON.stringify(after.current.state) !== JSON.stringify(next)
+                || !await verifyProviderControlDurabilityReceipt(receipt, {
+                    dataRoot: request.dataRoot, nowMs: commitNowMs, allowOwnerlessMaintenanceReceipt: true,
+                })) {
+                throw new ProviderControlStoreError("maintenance 最终回执校验失败", "READBACK_MISMATCH");
+            }
+            phase = "preserve-receipt";
+            await save("after.json", after.raw);
+            const diff: Array<{ path: string; before: unknown; after: unknown }> = [];
+            const compare = (previous: unknown, following: unknown, field: string): void => {
+                if (JSON.stringify(previous) === JSON.stringify(following)) return;
+                if (previous && following && typeof previous === "object" && typeof following === "object"
+                    && !Array.isArray(previous) && !Array.isArray(following)) {
+                    const previousFields = previous as Record<string, unknown>;
+                    const followingFields = following as Record<string, unknown>;
+                    for (const key of new Set([...Object.keys(previousFields), ...Object.keys(followingFields)])) {
+                        compare(previousFields[key], followingFields[key], field ? `${field}.${key}` : key);
+                    }
+                } else diff.push({ path: field, before: previous, after: following });
+            };
+            compare(before.current.state, after.current.state, "");
+            await saveJson("receipt.json", {
+                ...result, evidencePrefix, receipt, afterSha256: after.sha256,
+                maintenanceOwnerReceipt: ownerReceipt, changedPaths: diff.map(change => change.path), diff,
+                removedIdentity: request.identity, externalOutcome: "UNKNOWN", noReplay: true,
+                otherLeaseEntriesPreserved: true, ownerReleased: true,
+            });
+            maintenanceResult = { ...result, evidencePrefix, receipt, afterSha256: after.sha256 };
+            return maintenanceResult;
+        } catch (error) {
+            primaryError = error instanceof Error ? error : asStoreError("maintenance 失败", "MAINTENANCE_FAILED", error);
+            if (request.dryRun === false) {
+                let preservationError: string | undefined;
+                try {
+                    const observed = await snapshot().catch(() => undefined);
+                    if (observed) await save("failure-state.json", observed.raw);
+                    await saveJson("failure.json", {
+                        operationId, phase, stateMayHaveChanged, externalOutcome: "UNKNOWN", noReplay: true,
+                        identity: request.identity, error: error instanceof Error ? error.message : String(error),
+                        observedRevision: observed?.current.state.controlRevision, observedSha256: observed?.sha256,
+                        action: "preserve-and-inspect-no-automatic-rollback-or-replay",
+                    });
+                } catch (failure) { preservationError = failure instanceof Error ? failure.message : String(failure); }
+                Object.assign(primaryError, {
+                    operationId, evidencePrefix, phase, stateMayHaveChanged, preservationError,
+                    receipt: committedReceipt, externalOutcome: "UNKNOWN", noReplay: true,
+                });
+            }
+            throw primaryError;
+        }
+    } finally {
+        try { await lock.release(); }
+        catch (releaseError) {
+            const failure = primaryError ?? (releaseError instanceof Error ? releaseError
+                : asStoreError("释放 maintenance lock 失败", "LOCK_RELEASE_FAILED", releaseError));
+            Object.assign(failure, {
+                operationId, evidencePrefix, phase, stateMayHaveChanged, receipt: committedReceipt, maintenanceResult,
+                primaryError: primaryError ? { message: primaryError.message, code: (primaryError as ProviderControlStoreError).code } : undefined,
+                lockReleaseError: {
+                    message: releaseError instanceof Error ? releaseError.message : String(releaseError),
+                    code: (releaseError as ProviderControlStoreError)?.code,
+                },
+                externalOutcome: "UNKNOWN", noReplay: true,
+            });
+            throw failure;
+        }
+    }
+}
+
 async function mutateProviderControlAsOwnerInternal<Value>(
     input: ProviderControlMutationInput<Value> & ProviderControlOwnerFence,
     allowClockRollbackFreeze: boolean,
@@ -700,10 +961,15 @@ export async function verifyProviderControlDurabilityReceipt(
     if (current.kind !== "current") return false;
     const verificationNowMs = options.nowMs ?? current.state.lastObservedWallClockMs;
     if (!Number.isSafeInteger(verificationNowMs) || verificationNowMs < current.state.lastObservedWallClockMs) return false;
-    if (receipt.ownerEpoch > 0 && (current.state.ownerLease === null
-        || current.state.ownerLease.leaseId !== receipt.ownerLeaseId
-        || current.state.ownerLease.expiresAtMs !== receipt.ownerLeaseExpiresAtMs
-        || verificationNowMs >= current.state.ownerLease.expiresAtMs)) return false;
+    if (receipt.ownerEpoch > 0) {
+        if (receipt.ownerLeaseId === null) {
+            if (options.allowOwnerlessMaintenanceReceipt !== true
+                || current.state.ownerLease !== null || receipt.ownerLeaseExpiresAtMs !== null) return false;
+        } else if (current.state.ownerLease === null
+            || current.state.ownerLease.leaseId !== receipt.ownerLeaseId
+            || current.state.ownerLease.expiresAtMs !== receipt.ownerLeaseExpiresAtMs
+            || verificationNowMs >= current.state.ownerLease.expiresAtMs) return false;
+    }
     return current.state.controlRevision === receipt.controlRevision
         && current.state.ownerEpoch === receipt.ownerEpoch
         && current.state.installation.initializationId === receipt.installationId
@@ -868,16 +1134,16 @@ async function readInstallManifest(paths: ProviderControlPaths): Promise<Auxilia
     }
 }
 
-async function publishProviderControlState(paths: ProviderControlPaths, state: ProviderControlState, lock: ProviderControlFileLock): Promise<ProviderControlDurabilityReceipt> {
+async function publishProviderControlState(paths: ProviderControlPaths, state: ProviderControlState, lock: ProviderControlFileLock, preserveRuntime = false, expectedBeforeSha256?: string): Promise<ProviderControlDurabilityReceipt> {
     await lock.assertHeld();
-    normalizeProviderControlState(state);
+    if (!preserveRuntime) normalizeProviderControlState(state);
     if (state.ownerLease && state.lastObservedWallClockMs >= state.ownerLease.expiresAtMs) {
         throw new ProviderControlFencedError("provider control owner lease 已过期，拒绝生成 mutation/grant receipt");
     }
     state.persistedHash = "";
     state.persistedHash = calculateProviderControlHash(state);
     assertProviderControlState(state);
-    await writeDurableJsonAtomic(paths, paths.controlPath, state, lock);
+    await writeDurableJsonAtomic(paths, paths.controlPath, state, lock, expectedBeforeSha256);
     await pathSafetyTestHook?.({ phase: "after-publish", paths });
     await assertSafeLayout(paths);
     const readBack = await readControlState(paths);
@@ -908,7 +1174,7 @@ async function createReceipt(paths: ProviderControlPaths, state: ProviderControl
     };
 }
 
-async function writeDurableJsonAtomic(paths: ProviderControlPaths, targetPath: string, value: unknown, lock: ProviderControlFileLock): Promise<void> {
+async function writeDurableJsonAtomic(paths: ProviderControlPaths, targetPath: string, value: unknown, lock: ProviderControlFileLock, expectedBeforeSha256?: string): Promise<void> {
     await lock.assertHeld();
     await ensureSafeTargetParent(paths, targetPath);
     const initialSafety = await assertSafeLayout(paths);
@@ -921,9 +1187,18 @@ async function writeDurableJsonAtomic(paths: ProviderControlPaths, targetPath: s
         await temporaryHandle.close();
         temporaryHandle = undefined;
         await pathSafetyTestHook?.({ phase: "before-publish", paths });
-        await lock.assertHeld();
-        await assertSafeLayout(paths, initialSafety);
-        await renameWithRetry(temporaryPath, targetPath, paths);
+        await renameWithRetry(temporaryPath, targetPath, paths, async () => {
+            await lock.assertHeld();
+            await assertSafeLayout(paths, initialSafety);
+            if (expectedBeforeSha256 !== undefined) {
+                const beforeHandle = await openNoFollow(targetPath, fs.constants.O_RDONLY);
+                let bytes: Buffer;
+                try { bytes = await beforeHandle.readFile(); } finally { await beforeHandle.close(); }
+                if (crypto.createHash("sha256").update(bytes).digest("hex") !== expectedBeforeSha256) {
+                    throw new ProviderControlStoreError("maintenance 发布前 state SHA256 漂移", "MAINTENANCE_STATE_DRIFT");
+                }
+            }
+        });
         await assertSafeLayout(paths, initialSafety);
         const persisted = await openNoFollow(targetPath, fs.constants.O_RDWR);
         try {
@@ -1546,7 +1821,7 @@ function stableJsonStringify(value: unknown): string {
     return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableJsonStringify(record[key])}`).join(",")}}`;
 }
 
-async function renameWithRetry(sourcePath: string, targetPath: string, paths: ProviderControlPaths): Promise<void> {
+async function renameWithRetry(sourcePath: string, targetPath: string, paths: ProviderControlPaths, beforeRename: () => Promise<void>): Promise<void> {
     let lastError: unknown;
     for (let attempt = 0; attempt < 5; attempt += 1) {
         try {
@@ -1557,6 +1832,7 @@ async function renameWithRetry(sourcePath: string, targetPath: string, paths: Pr
                 sourcePath,
                 targetPath,
             });
+            await beforeRename();
             await fs.promises.rename(sourcePath, targetPath);
             return;
         } catch (error) {

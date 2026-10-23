@@ -1,6 +1,7 @@
 import path from "node:path";
+import fs from "node:fs";
 import type { ConversationSourceFingerprint } from "./conversation-source-cache.js";
-import type { DevinConversationSummary, DevinDesktopMessage, DevinRawConversation, DevinReadOptions } from "./devin-types.js";
+import type { DevinConversationSummary, DevinDesktopMessage, DevinRawConversation, DevinReadOptions, DevinDiscoveryOptions, DevinDiscoveryResult, DevinDiscoveryDiagnostic } from "./devin-types.js";
 import { readCliConversations, type CliConversation } from "./devin-sqlite-cli.js";
 import { ReadBudget, DevinReadError, asTimestamp, columns, desktopFiles, devinPaths, digest, inSnapshot, isFile, jsonObject } from "./devin-sqlite-store.js";
 
@@ -10,6 +11,7 @@ interface DesktopConversation {
     summary: DevinConversationSummary;
     messages: DevinDesktopMessage[];
     messageIds: Set<string>;
+    toolCallIds: Set<string>;
     revision: string;
     hidden: boolean;
     empty: boolean;
@@ -74,6 +76,17 @@ function desktopMessageIds(messages: DevinDesktopMessage[]): Set<string> {
     return result;
 }
 
+function desktopToolCallIds(messages: DevinDesktopMessage[]): Set<string> {
+    const result = new Set<string>();
+    for (const message of messages) {
+        if (message.kind !== "tool_call") continue;
+        const payload = message.payload;
+        const id = payload.content?.toolCallId ?? payload.toolCallId ?? payload.id;
+        if (typeof id === "string" && id) result.add(id.replace(/^tool:/u, ""));
+    }
+    return result;
+}
+
 async function readDesktop(filename: string, budget: ReadBudget, identityOnly = false): Promise<DesktopConversation> {
     return inSnapshot(filename, budget, async (database, identity, schema) => {
         if (!["position", "kind", "payload"].every(column => columns(database, "messages").has(column)) ||
@@ -89,7 +102,7 @@ async function readDesktop(filename: string, budget: ReadBudget, identityOnly = 
         const info = jsonObject(metadata.info);
         const messages: DevinDesktopMessage[] = [];
         const payloadExpression = identityOnly
-            ? `CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload)='object' THEN json_object('content', json((SELECT json_group_array(json_object('_meta', json_object('cognition.ai/clientMessageId', json_extract(block.value, '$._meta."cognition.ai/clientMessageId"'), 'cognition.ai/timestamp', json_extract(block.value, '$._meta."cognition.ai/timestamp"'))))
+            ? `CASE WHEN json_valid(payload) THEN CASE WHEN json_type(payload)='object' THEN json_object('id',json_extract(payload,'$.id'),'toolCallId',coalesce(json_extract(payload,'$.content.toolCallId'),json_extract(payload,'$.toolCallId')),'content', json((SELECT json_group_array(json_object('_meta', json_object('cognition.ai/clientMessageId', json_extract(block.value, '$._meta."cognition.ai/clientMessageId"'), 'cognition.ai/timestamp', json_extract(block.value, '$._meta."cognition.ai/timestamp"'))))
                 FROM json_each(messages.payload, '$.content') AS block WHERE block.type='object'))) ELSE payload END ELSE payload END`
             : "payload";
         const statement = database.prepare(`WITH selected AS (SELECT position, kind, ${payloadExpression} AS payload FROM messages)
@@ -115,26 +128,32 @@ async function readDesktop(filename: string, budget: ReadBudget, identityOnly = 
                 createdAt: timestamps[0], updatedAt: timestamps.at(-1), sourcePath: filename,
                 desktopPaths: [filename], sourceKind: "devin-desktop", matchedMessageIds: 0, partial: true, warnings,
             },
-            messages, messageIds: desktopMessageIds(messages), revision: digest([identity, schema, metadata, messages]),
+            messages, messageIds: desktopMessageIds(messages), toolCallIds: desktopToolCallIds(messages), revision: digest([identity, schema, metadata, messages]),
             hidden: info.hidden === true || info.hidden === 1 || metadata.hidden === "1" || metadata.hidden === "true",
             empty: messages.length === 0,
         };
     });
 }
 
-async function readCatalog(budget: ReadBudget, identityOnly = false): Promise<CatalogEntry[]> {
+async function readCatalog(budget: ReadBudget, identityOnly = false, selectedDesktopFiles?: string[]): Promise<CatalogEntry[]> {
     const paths = devinPaths();
-    const filenames = desktopFiles(paths.desktop, budget.maxDesktopFiles, () => budget.check());
+    const filenames = selectedDesktopFiles ?? desktopFiles(paths.desktop, budget.maxDesktopFiles, () => budget.check());
     const cli = isFile(paths.cli) ? await readCliConversations(paths.cli, budget, { identityOnly }) : [];
     const results: CatalogEntry[] = cli.map(item => ({ summary: item.summary, cli: item, desktops: [], excludedFromList: item.hidden || item.empty }));
     const entryById = new Map(results.map(entry => [entry.summary.canonicalId, entry]));
-    const incompleteIdentityScan = cli.some(conversation => !conversation.empty && conversation.summary.partial && conversation.nodes.length === 0);
+    const incompleteIdentityScan = cli.some(conversation => !conversation.empty && conversation.summary.partial);
     const cliByMessageId = new Map<string, Set<CliConversation>>();
+    const cliByToolCallId = new Map<string, Set<CliConversation>>();
     for (const conversation of cli) {
         for (const id of conversation.messageIds) {
             const matches = cliByMessageId.get(id) ?? new Set<CliConversation>();
             matches.add(conversation);
             cliByMessageId.set(id, matches);
+        }
+        for (const id of conversation.toolCallIds) {
+            const matches = cliByToolCallId.get(id) ?? new Set<CliConversation>();
+            matches.add(conversation);
+            cliByToolCallId.set(id, matches);
         }
     }
     for (const filename of filenames) {
@@ -150,8 +169,20 @@ async function readCatalog(budget: ReadBudget, identityOnly = false): Promise<Ca
                 matches.set(candidate, (matches.get(candidate) ?? 0) + 1);
             }
         }
+        const hasUnidentifiedUsers = desktop.messages.some(message => message.kind === "user_message" && desktopMessageIds([message]).size === 0);
+        const toolIdentity = desktop.messageIds.size === 0 && !hasUnidentifiedUsers && desktop.toolCallIds.size >= 2;
+        if (toolIdentity) {
+            for (const toolId of desktop.toolCallIds) {
+                for (const candidate of cliByToolCallId.get(toolId) ?? []) matches.set(candidate, (matches.get(candidate) ?? 0) + 1);
+            }
+        }
         if (matches.size === 1 && !incompleteIdentityScan) {
-            const [candidate] = matches.entries().next().value!;
+            const [candidate, count] = matches.entries().next().value!;
+            if (toolIdentity && (count < 2 || [...desktop.toolCallIds].some(id => !candidate.toolCallIds.has(id)))) {
+                desktop.summary.warnings.push("DEVIN_TOOL_IDENTITY_INCOMPLETE");
+                results.push({ summary: desktop.summary, desktops: [desktop], excludedFromList: false });
+                continue;
+            }
             const entry = entryById.get(candidate.summary.canonicalId)!;
             entry.desktops.push(desktop);
             entry.summary = {
@@ -160,9 +191,12 @@ async function readCatalog(budget: ReadBudget, identityOnly = false): Promise<Ca
                 aliases: [...new Set([...entry.summary.aliases, desktop.summary.canonicalId])],
                 desktopPaths: [...entry.summary.desktopPaths, filename],
                 matchedMessageIds: new Set(entry.desktops.flatMap(item => [...item.messageIds].filter(id => candidate.messageIds.has(id)))).size,
-                partial: entry.summary.partial || [...desktop.messageIds].some(id => !candidate.messageIds.has(id)),
+                matchedToolCallIds: new Set(entry.desktops.flatMap(item => [...item.toolCallIds].filter(id => candidate.toolCallIds.has(id)))).size,
+                identityEvidence: entry.summary.identityEvidence === "client-message-id" || !toolIdentity ? "client-message-id" : "tool-call-id",
+                partial: entry.summary.partial || hasUnidentifiedUsers || desktop.summary.warnings.includes("DEVIN_DESKTOP_TRUNCATED") || [...desktop.messageIds].some(id => !candidate.messageIds.has(id)),
                 warnings: [...new Set([...entry.summary.warnings, ...desktop.summary.warnings.filter(warning => warning !== "DEVIN_DESKTOP_ONLY_PARTIAL")])],
             };
+            if (hasUnidentifiedUsers) entry.summary.warnings.push("DEVIN_DESKTOP_USER_ID_MISSING");
             if ([...desktop.messageIds].some(id => !candidate.messageIds.has(id))) entry.summary.warnings.push("DEVIN_DESKTOP_USER_HISTORY_NOT_IN_CLI");
         } else {
             if (matches.size > 1) desktop.summary.warnings.push("DEVIN_ALIAS_AMBIGUOUS");
@@ -222,6 +256,122 @@ export function isDevinStoreAvailable(): boolean {
     }
 }
 
+function discoveryPath(value: string): string {
+    let normalized = value.replace(/^file:\/\/\//iu, "");
+    try { normalized = decodeURIComponent(normalized); } catch {}
+    return normalized.replace(/\\/gu, "/").replace(/\/+$/u, "").toLowerCase();
+}
+
+function discoveryMatches(summary: DevinConversationSummary, options: DevinDiscoveryOptions, allowUnresolvedAlias = false): boolean {
+    if (options.conversationIds?.length && !options.conversationIds.some(id => summary.aliases.some(alias => alias.toLowerCase() === id.toLowerCase())) && !allowUnresolvedAlias) return false;
+    const normalize = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+    if (options.query?.trim()) {
+        const haystack = normalize([summary.title, summary.id, ...summary.aliases, ...summary.workspaceUris].join(" "));
+        const terms = options.query.split(/\s+/u).map(normalize).filter(Boolean);
+        if (terms.length && !terms.some(term => haystack.includes(term))) return false;
+    }
+    if (options.workspaces?.length) {
+        const known = (options.workspaceScope === "primary" ? [summary.cwd || ""] : summary.workspaceUris).map(discoveryPath).filter(Boolean);
+        if (known.length) {
+            const matches = options.workspaces.map(discoveryPath).filter(Boolean).map(requested => known.some(candidate => options.workspaceMode === "exact" ? candidate === requested
+                : options.workspaceMode === "under" ? candidate === requested || candidate.startsWith(`${requested}/`) : candidate.includes(requested)));
+            if (options.workspaceMode === "all" ? matches.some(match => !match) : !matches.some(Boolean)) return false;
+        }
+    }
+    return true;
+}
+
+async function readDesktopMetadata(filename: string, budget: ReadBudget): Promise<{ summary: DevinConversationSummary; hidden: boolean; empty: boolean }> {
+    return inSnapshot(filename, budget, async database => {
+        if (!["key", "value"].every(column => columns(database, "meta").has(column)) || !columns(database, "messages").has("position")) {
+            throw new DevinReadError("DEVIN_SCHEMA_UNSUPPORTED", "The Devin Desktop metadata schema is unsupported.");
+        }
+        const metadata: Record<string, string> = {};
+        for (const row of database.prepare(`SELECT key, CASE WHEN key='info' AND json_valid(value) THEN json_object('title',json_extract(value,'$.title'),'cwd',json_extract(value,'$.cwd'),'workingDirectory',json_extract(value,'$.workingDirectory'),'workspaceUris',json_extract(value,'$.workspaceUris'),'hidden',json_extract(value,'$.hidden'),'truncated',json_extract(value,'$.truncated')) ELSE value END AS value FROM meta WHERE key IN ('info','hidden','truncated')`).iterate()) {
+            await budget.take(Buffer.byteLength(String(row.value)));
+            metadata[String(row.key)] = String(row.value);
+        }
+        const info = jsonObject(metadata.info);
+        const uuid = path.parse(filename).name.toLowerCase();
+        const directories = [info.cwd, info.workingDirectory, ...(Array.isArray(info.workspaceUris) ? info.workspaceUris : [])].filter((value): value is string => typeof value === "string" && !!value);
+        const empty = !database.prepare("SELECT 1 FROM messages LIMIT 1").get();
+        return {
+            summary: { id: uuid, canonicalId: uuid, uuid, aliases: [uuid], title: typeof info.title === "string" ? info.title : uuid,
+                cwd: directories[0], workspaceUris: [...new Set(directories)], updatedAt: fs.statSync(filename).mtime.toISOString(),
+                sourcePath: filename, desktopPaths: [filename], sourceKind: "devin-desktop", matchedMessageIds: 0, partial: true,
+                warnings: ["DEVIN_DESKTOP_ONLY_PARTIAL", ...(metadata.truncated === "1" || info.truncated === true ? ["DEVIN_DESKTOP_TRUNCATED"] : [])] },
+            hidden: info.hidden === true || info.hidden === 1 || metadata.hidden === "1" || metadata.hidden === "true", empty,
+        };
+    });
+}
+
+export async function discoverDevinConversations(options: DevinDiscoveryOptions = {}): Promise<DevinDiscoveryResult> {
+    const budget = new ReadBudget(options);
+    const paths = devinPaths();
+    const result: DevinDiscoveryResult = { conversations: [], partial: false, diagnostics: [], scannedSessions: 0, scannedDesktopFiles: 0 };
+    const diagnose = (error: unknown, sourceKind: DevinDiscoveryDiagnostic["sourceKind"], sourcePath: string, conversationId?: string) => {
+        if (error instanceof DevinReadError && error.code === "DEVIN_ABORTED") throw error;
+        result.partial = true;
+        result.diagnostics.push({ code: error instanceof DevinReadError ? error.code : "DEVIN_DISCOVERY_READ", message: error instanceof Error ? error.message : String(error), sourceKind, sourcePath, conversationId });
+    };
+    const idsAreCliOnly = options.conversationIds?.length && options.conversationIds.every(id => !/^[\da-f]{8}-[\da-f-]{27,}$/iu.test(id));
+    try {
+        if (isFile(paths.cli)) {
+            await readCliConversations(paths.cli, budget, { metadataOnly: true,
+                conversationIds: idsAreCliOnly ? options.conversationIds : undefined,
+                acceptSummary: summary => discoveryMatches(summary, options, true), onSession: () => { result.scannedSessions++; },
+                onConversation: item => { if (!item.hidden && !item.empty) result.conversations.push(item.summary); },
+                onSessionError: (id, error) => diagnose(error, "devin-cli", paths.cli!, id) });
+        }
+    } catch (error) { diagnose(error, "devin-cli", paths.cli || ""); }
+    const selectedDesktopFiles: string[] = [];
+    try {
+        const filenames = idsAreCliOnly && options.verifyAliases === false ? [] : desktopFiles(paths.desktop, budget.maxDesktopFiles, () => budget.check(), error => diagnose(error, "devin-desktop", paths.desktop || ""));
+        for (const filename of filenames) {
+            try {
+                budget.check();
+                result.scannedDesktopFiles++;
+                const desktop = await readDesktopMetadata(filename, budget);
+                if (desktop.hidden || desktop.empty) continue;
+                selectedDesktopFiles.push(filename);
+                result.conversations.push(desktop.summary);
+            } catch (error) {
+                diagnose(error, "devin-desktop", filename, path.parse(filename).name);
+                if (error instanceof DevinReadError && /BUDGET|DEADLINE/u.test(error.code)) break;
+            }
+        }
+    } catch (error) { diagnose(error, "devin-desktop", paths.desktop || ""); }
+    if (selectedDesktopFiles.length && options.verifyAliases !== false && !result.partial) {
+        try {
+            const aliasBudget = new ReadBudget({ ...options, maxNodes: Math.min(budget.maxNodes - budget.nodes, 4096), maxBytes: Math.min(budget.remainingBytes, 16 * 1024 * 1024), deadlineMs: Math.min(budget.deadline, Date.now() + 1500) });
+            const entries = await readCatalog(aliasBudget, true, selectedDesktopFiles);
+            const selected = new Set(result.conversations.map(summary => summary.id));
+            for (const entry of entries) {
+                if (entry.excludedFromList || !entry.summary.aliases.some(id => selected.has(id))) continue;
+                result.conversations = result.conversations.filter(summary => !entry.summary.aliases.includes(summary.id));
+                result.conversations.push(entry.summary);
+            }
+        } catch (error) { diagnose(error, "devin-cli", paths.cli || "", "alias-verification"); }
+    }
+    result.conversations = result.conversations.filter(summary => discoveryMatches(summary, options));
+    for (const summary of result.conversations) {
+        for (const code of summary.warnings) {
+            if (code === "DEVIN_DESKTOP_ONLY_PARTIAL") continue;
+            result.diagnostics.push({ code, message: `Devin source reported ${code}.`, sourceKind: summary.sourceKind, sourcePath: summary.sourcePath, conversationId: summary.id });
+        }
+    }
+    result.conversations.sort((left, right) => (Date.parse(right.updatedAt || "") || 0) - (Date.parse(left.updatedAt || "") || 0) || left.id.localeCompare(right.id));
+    if (options.limit !== undefined && (!Number.isSafeInteger(options.limit) || options.limit < 0)) throw new DevinReadError("DEVIN_INVALID_BUDGET", "Devin discovery limit must be a non-negative safe integer.");
+    const limit = Math.min(options.limit ?? 20_000, 20_000);
+    if (result.conversations.length > limit) {
+        result.partial = true;
+        result.diagnostics.push({ code: "DEVIN_CANDIDATE_LIMIT", message: "Devin metadata candidates exceeded the requested limit.", sourceKind: "devin-cli", sourcePath: paths.cli || "" });
+    }
+    result.conversations = result.conversations.slice(0, limit);
+    result.partial ||= result.diagnostics.length > 0 || result.conversations.some(summary => summary.partial);
+    return result;
+}
+
 export async function listDevinConversations(options: DevinReadOptions = {}): Promise<DevinConversationSummary[]> {
     return (await readCatalog(new ReadBudget(options))).filter(entry => !entry.excludedFromList).map(entry => entry.summary);
 }
@@ -245,7 +395,7 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
         const sameIds = (left: Set<string>, right: Set<string>) => left.size === right.size && [...left].every(value => right.has(value));
         if (entry.cli) {
             const loaded = (await readCliConversations(entry.cli.summary.sourcePath, budget, { sessionId: entry.cli.summary.canonicalId }))[0];
-            if (!loaded || !sameIds(entry.cli.messageIds, loaded.messageIds)) {
+            if (!loaded || !sameIds(entry.cli.messageIds, loaded.messageIds) || !sameIds(entry.cli.toolCallIds, loaded.toolCallIds)) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.cli = loaded;
@@ -254,7 +404,7 @@ export async function readDevinRawConversation(id: string, options: DevinReadOpt
         }
         for (const [index, desktop] of entry.desktops.entries()) {
             const loaded = await readDesktop(desktop.summary.sourcePath, budget);
-            if (!sameIds(desktop.messageIds, loaded.messageIds)) {
+            if (!sameIds(desktop.messageIds, loaded.messageIds) || !sameIds(desktop.toolCallIds, loaded.toolCallIds)) {
                 throw new DevinReadError("DEVIN_IDENTITY_CHANGED", "Devin Desktop identity changed during source reading; retry with a fresh snapshot.");
             }
             entry.desktops[index] = loaded;

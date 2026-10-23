@@ -117,6 +117,7 @@ try {
     fs.utimesSync(leafPath, 1700000000, 1700000000);
     const beforeRace = await bridge.loadConversationData("codex", threadId, options);
     const beforeRaceVersion = await client.captureCodexSourceVersionAsync(leafPath);
+    fs.utimesSync(leafPath, 1700000000, 1700000000);
     const originalOpen = fs.promises.open;
     let mutated = false;
     const mutateLeaf = () => {

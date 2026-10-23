@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import { deepLocateCodexConversations, matchCodexContextProbeInRollout, getCodexThread, type CodexThreadInfo } from "./codex-client.js";
 import { deepLocateClaudeCodeConversations, matchClaudeCodeContextProbeInJsonl, getClaudeCodeThread, type ClaudeCodeThreadInfo } from "./claude-code-client.js";
-import { loadConversationData } from "./conversation-bridge.js";
+import { conversationSourceIsPartial, loadConversationData } from "./conversation-bridge.js";
 import { iterateCachedConversationSourceCacheRounds, readCachedConversationSourceCache } from "./conversation-source-cache.js";
 import type { ConversationRound } from "./trajectory.js";
 import { candidateHitIdentity, redactLocateText, type ContextLocateReadBudget, type ContextLocateScanResult, type ConversationContextLocateAdapters } from "./conversation-context-locate.js";
@@ -74,7 +74,7 @@ export const defaultContextLocateAdapters: ConversationContextLocateAdapters = {
             const cached = iterateCachedConversationSourceCacheRounds<ConversationRound>({ key: candidate.cacheKey, generation: candidate.cacheGeneration, startRound: firstRound });
             if (!cached) throw new Error("cache-only candidate rounds are unavailable");
             if (cached.roundsBytes > budget.maxBytes) return { rounds: [], partial: true, warnings: ["normalized cache exceeds remaining locate budget"] };
-            const partial = firstRound > 1 || candidate.sourcePartial || Boolean(loaded.snapshot.windsurfData?.partial || loaded.snapshot.cacheState === "stale");
+            const partial = firstRound > 1 || candidate.sourcePartial || conversationSourceIsPartial(loaded.snapshot) || loaded.snapshot.cacheState === "stale";
             return { rounds: cached.rounds, partial, freshness: "unknown", warnings: partial ? ["cache-only scan contains partial source or bounded recent rounds"] : undefined };
         }
         if (candidate.sourceBytes !== undefined && candidate.sourceBytes > budget.maxBytes) {
@@ -108,7 +108,7 @@ export const defaultContextLocateAdapters: ConversationContextLocateAdapters = {
         if (cached && cached.roundsBytes > budget.maxBytes) {
             return { rounds: [], partial: true, warnings: ["normalized source exceeds remaining locate budget; no oversized round was materialized"] };
         }
-        const partial = firstRound > 1 || candidate.sourcePartial || loaded.cacheState === "stale" || Boolean(loaded.cacheBuildFailure || loaded.windsurfData?.partial) || (!cached && !loaded.rounds.length);
+        const partial = firstRound > 1 || candidate.sourcePartial || loaded.cacheState === "stale" || Boolean(loaded.cacheBuildFailure) || conversationSourceIsPartial(loaded) || (!cached && !loaded.rounds.length);
         return {
             rounds: cached?.rounds || loaded.rounds.filter(round => round.roundIndex >= firstRound),
             partial,

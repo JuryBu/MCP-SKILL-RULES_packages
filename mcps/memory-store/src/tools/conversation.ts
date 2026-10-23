@@ -1,6 +1,9 @@
 ﻿import { createHash } from "crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { corpusToolResult, isCorpusAction, runCorpusAction, type CorpusToolImplementation } from "./conversation-corpus-tool.js";
+import { isProgressiveAction, runProgressiveAction } from "./conversation-progressive-tool.js";
+import type { CorpusSearchExpression } from "../conversation-corpus-types.js";
 import { touchActivity, appendTiming, isRecordAutoUpdateEnabledForHost } from "../lifecycle.js";
 import {
     formatRound,
@@ -31,7 +34,9 @@ import {
     findCodexContextProbeMatches,
     getCodexParentThread,
     getCodexThread,
+    getCodexThreadAsync,
     listCodexThreadsForMetadata,
+    listCodexThreadsForMetadataAsync,
     listRecentCodexThreads,
     type CodexDeepLocateResult,
     type CodexThreadInfo,
@@ -56,7 +61,9 @@ import {
     waitForBackgroundTask,
 } from "../background-tasks.js";
 import type { BackgroundTaskContext, BackgroundTaskProgress } from "../background-tasks.js";
+import type { BackgroundTask } from "../background-tasks.js";
 import { exportConversation, formatConversationExportResult } from "../conversation-exporter.js";
+import { formatLocalPbActivities } from "../conversation-source-adapters.js";
 import {
     listConversationCandidates,
     formatSourceStatuses,
@@ -111,6 +118,42 @@ import {
 
 const CONVERSATION_DATA_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness";
 const CONVERSATION_MODEL_CHAIN_ALLOWED = "auto|antigravity|codex|claude-code|cc|grok|agy";
+const corpusExpressionSchema: z.ZodType<CorpusSearchExpression> = z.lazy(() => z.object({
+    term: z.string().min(1).max(4096).optional(),
+    all: z.array(corpusExpressionSchema).max(100).optional(),
+    any: z.array(corpusExpressionSchema).max(100).optional(),
+    not: corpusExpressionSchema.optional(),
+}).strict());
+
+export function codexDirectListQueryId(query: string): string | undefined {
+    const value = query.trim().replace(/^codex:\/\/threads\//iu, "");
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(value)
+        ? value.toLowerCase()
+        : undefined;
+}
+
+export async function loadCodexListQueryThreads(
+    query: string,
+    limit = Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000),
+    dependencies: {
+        direct: (id: string) => Promise<CodexThreadInfo | null>;
+        metadata: (limit: number) => Promise<CodexThreadInfo[]>;
+    } = { direct: getCodexThreadAsync, metadata: listCodexThreadsForMetadataAsync },
+): Promise<CodexThreadInfo[]> {
+    const id = codexDirectListQueryId(query);
+    if (id) {
+        const thread = await dependencies.direct(id);
+        return thread ? [thread] : [];
+    }
+    return dependencies.metadata(limit);
+}
+
+export function assertDeepLocateTaskOwner(task: BackgroundTask | null | undefined, conversationId: string): void {
+    if (!task || task.kind !== "conversation-deep-locate") throw new Error("deep_locate 任务不存在");
+    const payload = parseDeepLocateResumePayload(task.resumePayload);
+    if (!payload.ownerConversationId) throw new Error("该历史定位任务缺少持久调用者身份，保留原任务，请由维护线核对归属");
+    if (payload.ownerConversationId !== conversationId.trim()) throw new Error("deep_locate 任务属于另一调用者");
+}
 
 function conversationDataChainValueSchema(parameterName = "dataChain", description?: string) {
     const schemaDescription = description
@@ -1770,7 +1813,7 @@ export function formatDeepLocateResult(result: CodexDeepLocateResult | ClaudeCod
     ];
     if (result.reason) lines.push(`⚠️ 原因: ${result.reason}`);
     if ("resolution" in result) {
-        lines.push(`身份判断: ${result.resolution}；仅针对已列出的候选范围，不代表全库唯一，不自动选择 ID。`);
+        lines.push(`身份判断: ${result.resolution}；已查范围为列出的候选对话，命中项附来源位置供继续精读。`);
         if (result.resolution === "single_match_in_partial_scan") lines.push("已找到一个匹配对话，不是多命中歧义；其它候选未完整检查，不能保证全范围唯一。");
         lines.push(...result.warnings.map(warning => `⚠️ ${warning}`));
     }
@@ -1895,6 +1938,7 @@ registerBackgroundTaskRecoveryHandler("conversation-batch-export", async (task) 
  *   deep_locate — 五源有预算正文定位，Codex / Claude Code 保持流式 JSONL 扫描
  */
 export function registerConversation(server: McpServer, dependencies: {
+    corpus?: CorpusToolImplementation;
     listCandidates?: typeof listConversationCandidates;
     runDeepLocate?: typeof runConversationDeepLocate;
     loadConversation?: typeof loadConversationData;
@@ -1912,14 +1956,54 @@ export function registerConversation(server: McpServer, dependencies: {
   recall — 自动、按轮次或全量恢复 context-only 上下文
   export — 将可读对话原文持久化导出为 Markdown / PDF
   deep_locate — 五个数据源后台有预算地深搜正文片段，Codex/Claude Code 保持流式 JSONL 读取
+  search_all — 本机全部Codex正文组合搜索；conversationId是当前调用者，conversationIds/workspaces可选限定目标，默认双方正文
+  search_all_status/cancel/resume — 使用同一调用者conversationId和原taskId取得动态结果、取消或恢复；页面大小不截断扫描
+  read_hit — 使用命中项的目标conversationId、sourceRevision和轮次展开同一来源正文
+  read_fast — conversationId指定当前调用者，conversationIds可选一个目标；末N轮默认先准备就绪范围并返回可查询taskId，完整历史继续后台构建
+  prepare/prepare_status/cancel/resume — 分段准备历史，默认最新优先，buildOrder=oldest可从前构建；同一taskId持续反馈真实就绪范围
+  read_ready/search_ready/locate_ready/extract_ready — 在完整历史尚未构建完时使用已就绪范围，返回覆盖、暂计状态和稳定引用
 fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端拦截所有无 ID 调用，含 antigravity——跨 session 共享后端无法安全推断「当前对话」）。先用 action="list" 定位 ID。`,
         {
-            action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel"]).default("search")
-                .describe("操作模式：list=列出候选 / fetch=拉取缓存 / search=关键词搜索 / read=范围阅读 / recall=恢复压缩上下文 / export=导出 Markdown/PDF / deep_locate=后台深搜定位对话"),
+            action: z.enum(["list", "fetch", "search", "read", "recall", "export", "deep_locate", "deep_locate_status", "deep_locate_cancel", "search_all", "search_all_status", "search_all_cancel", "search_all_resume", "read_hit", "read_fast", "prepare", "prepare_status", "prepare_cancel", "prepare_resume", "read_ready", "search_ready", "locate_ready", "extract_ready"]).default("search")
+                .describe("list/fetch/search/read/recall/export=已有原文功能；deep_locate=有预算定位；search_all及status/cancel/resume=本机Codex完整正文组合搜索和动态任务；read_hit=按命中来源版本/轮次展开；read_fast=无需先完整fetch的指定轮次/近期正文"),
             conversationId: z.string().optional()
-                .describe("稳定对话 ID，WSF 同时接受已验证关联的 UUID/Devin 文字 ID；fetch/search/read/export 建议总是显式传入"),
+                .describe("稳定对话ID。search_all、read_fast与deep_locate系列填当前调用者ID，目标筛选使用conversationIds；read_hit和fetch/search/read/export填目标对话ID；WSF接受已验证的UUID/文字别名"),
             conversationIds: z.array(z.string()).optional()
-                .describe("[deep_locate] 可选：限制只扫描指定链路内的这些稳定 conversationId 或 WSF 别名"),
+                .describe("[deep_locate/search_all/read_fast] 可选目标范围；read_fast最多一个，省略读当前对话；单数conversationId指定调用者"),
+            allTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
+                .describe("[search_all] 全部包含的词；默认在同一对话满足，intersectionScope可改同轮/同消息"),
+            anyTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
+                .describe("[search_all] 至少包含其中一个词，与allTerms和excludeTerms组合"),
+            excludeTerms: z.array(z.string().min(1).max(4096)).max(100).optional()
+                .describe("[search_all] 排除词；完整扫描后最终确定是否满足"),
+            searchExpression: corpusExpressionSchema.optional()
+                .describe("[search_all] 可组合布尔表达式：term、all数组、any数组、not子表达式"),
+            intersectionScope: z.enum(["conversation", "round", "message"]).optional()
+                .describe("[search_all] 组合条件范围，默认conversation；可调round/message"),
+            searchSort: z.enum(["latest_match", "activity", "occurrences", "messages"]).optional()
+                .describe("[search_all] 默认latest_match按实际命中消息时间；其它按对话活动/词频/消息数"),
+            caseSensitive: z.boolean().optional()
+                .describe("[search_all] 区分大小写，默认false；中文短词使用原文子串精确计数"),
+            afterRevision: z.number().int().min(0).optional()
+                .describe("[search_all_status] 首次传0；续取传已消费的changes.throughRevision（或nextAfterRevision），changes.hasMore为true继续取；顶层revision是任务最新版本"),
+            sourceRevision: z.string().min(1).optional()
+                .describe("[read_hit] 搜索命中项的来源版本，确保轮次和原文对应"),
+            lastRounds: z.number().int().min(1).max(100000).optional()
+                .describe("[read_hit/read_fast] 读取最后几轮，与startRound/endRound择一；冷来源需扫描采用链以取得正式末轮"),
+            prepareCache: z.boolean().optional()
+                .describe("[read_fast] 默认true，并行准备完整正文缓存，返回可查询/取消/恢复的原taskId；false仅取得所需原文"),
+            progressive: z.boolean().optional()
+                .describe("[fetch/read_fast] 默认true，适用的Codex巨型fetch或末N轮先返回分段准备任务；false沿用完整原文路径"),
+            progressiveTaskId: z.string().optional()
+                .describe("[read/search] 读取已就绪范围时指定原prepare任务；conversationId填任务调用者"),
+            afterProgressRevision: z.string().regex(/^[a-f0-9]{64}$/).optional()
+                .describe("[prepare_status] 原样回传上次revision并设置waitSeconds，等待新增就绪内容、状态变化或到期"),
+            buildOrder: z.enum(["latest", "oldest"]).optional()
+                .describe("[prepare/fetch/read_fast] 分段构建优先顺序，默认latest从最新内容开始，oldest从最早内容开始"),
+            blockId: z.string().optional()
+                .describe("[read_ready/search_ready] 可选固定已发布块，局部轮号须随blockId使用"),
+            rangeRef: z.string().optional()
+                .describe("[locate_ready/read_ready/extract_ready] 已返回的稳定范围引用，旧历史加入后仍指向相同正文"),
             query: z.string().optional()
                 .describe("[list/search] 搜索关键词"),
             contextProbe: z.string().optional()
@@ -2017,6 +2101,17 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
             const startTime = Date.now();
 
             try {
+                if (isProgressiveAction(params) || (params.action === "read_fast" && params.lastRounds !== undefined && params.progressive !== false && !dependencies.corpus && !params.forceRefresh && params.source !== "cache" && params.source !== "ls")) {
+                    const split = resolveChainSplit({ chain: params.chain, dataChain: params.dataChain, modelChain: params.modelChain });
+                    if (isProgressiveAction(params) || split.dataChain === "codex") return corpusToolResult(await runProgressiveAction({ ...params, dataChain: split.dataChain }));
+                }
+                if (isCorpusAction(params.action)) {
+                    if (params.action === "search_all" && params.background === false) throw new Error("search_all使用可查询的后台任务，请省略background或设为true");
+                    const split = resolveChainSplit({ chain: params.chain, dataChain: params.dataChain, modelChain: params.modelChain });
+                    const result = await runCorpusAction({ ...params, dataChain: split.dataChain }, dependencies.corpus);
+                    if (!result || typeof result !== "object" || Array.isArray(result)) throw new Error("全库检索未返回有效状态对象");
+                    return corpusToolResult({ ...result, requestElapsedMs: Date.now() - startTime });
+                }
                 const {
                     action,
                     conversationId,
@@ -2089,14 +2184,20 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     }, startTime);
                 }
 
+                if (["deep_locate", "deep_locate_status", "deep_locate_cancel"].includes(action) && !conversationId?.trim()) {
+                    throw new Error("deep_locate 系列动作需要 conversationId 指定当前调用者；conversationIds 是可省略的目标范围，未知目标时保持省略");
+                }
+
                 if (action === "deep_locate_status") {
+                    assertDeepLocateTaskOwner(getBackgroundTask(taskId || ""), conversationId!);
                     const task = await waitForBackgroundTask(taskId || "", waitSeconds || 0);
                     return appendTiming({
-                        content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
+                        content: [{ type: "text" as const, text: `🆔 taskId: ${taskId}\n${formatBackgroundTask(task)}` }],
                     }, startTime);
                 }
 
                 if (action === "deep_locate_cancel") {
+                    assertDeepLocateTaskOwner(getBackgroundTask(taskId || ""), conversationId!);
                     const task = cancelBackgroundTask(taskId || "", "deep_locate_cancel");
                     return appendTiming({
                         content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
@@ -2116,6 +2217,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     }
                     const requestedMode = (mode === "fuzzy" ? "fuzzy" : "exact") as "exact" | "fuzzy";
                     const deepLocatePayload = buildDeepLocateResumePayload({
+                        ownerConversationId: conversationId!.trim(),
                         query,
                         dataChains: dataChains?.length ? dataChains : [chains.dataChain],
                         source, workspaces, workspaceMode, workspaceScope, threadMode,
@@ -2224,7 +2326,9 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         }, startTime);
                     }
 
-                    const normalizedQuery = normalizeListQuery(query || "");
+                    const directCodexId = resolved === "codex" ? codexDirectListQueryId(query || "") : undefined;
+                    const listQuery = directCodexId || query || "";
+                    const normalizedQuery = normalizeListQuery(listQuery);
                     const max = Math.min(Math.max(limit || 20, 1), 100);
                     const candidateLimit = normalizedQuery
                         ? Math.max(max * 3, Number(process.env.MEMORY_STORE_CONVERSATION_LIST_CANDIDATE_LIMIT || 300))
@@ -2248,12 +2352,12 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         }))
                         : resolved === "codex"
                             ? (codexThreads = normalizedQuery
-                                ? listCodexThreadsForMetadata(Number(process.env.MEMORY_STORE_CODEX_METADATA_THREAD_LIMIT || 20_000))
+                                ? await loadCodexListQueryThreads(listQuery)
                                 : listRecentCodexThreads(candidateLimit)).map(candidateFromCodexThread)
                             : resolved === "claude-code"
                                 ? (claudeCodeThreads = listRecentClaudeCodeThreads(claudeCodeCandidateLimit)).map(candidateFromClaudeCodeThread)
                                 : (windsurfThreads = await listRecentWindsurfThreads(candidateLimit)).map(candidateFromWindsurfThread);
-                    if (resolved === "codex" && normalizedQuery) {
+                    if (resolved === "codex" && normalizedQuery && !directCodexId) {
                         const exactThread = getCodexThread(query || "");
                         if (exactThread && !codexThreads.some(item => item.id === exactThread.id)) {
                             codexThreads = [exactThread, ...codexThreads];
@@ -2283,7 +2387,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                             ? annotateClaudeCodeContextProbeCandidates(candidates, claudeCodeThreads, contextProbe)
                         : { candidates, matchMode: "", hitCount: 0 };
 
-                    const queryTerms = splitListQueryTerms(query || "");
+                    const queryTerms = splitListQueryTerms(listQuery);
                     const directMatches = normalizedQuery
                         ? probeResult.candidates.filter(item => listCandidateMatchesQuery(item, normalizedQuery, queryTerms))
                         : probeResult.candidates;
@@ -2746,6 +2850,10 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                         }, startTime);
                     }
                     if (estimate && (background === true || estimate.shouldBackground)) {
+                        if (params.progressive !== false && !forceRefresh) {
+                            return corpusToolResult(await runProgressiveAction({ ...params, action: "prepare", dataChain: "codex",
+                                conversationIds: [conversationId], prepareCache: true, link }));
+                        }
                         const payload = createCodexFetchWorkerPayload({
                             conversationId,
                             link,
@@ -2814,6 +2922,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                 }
                 if (!loaded) {
                     return appendTiming({
+                        isError: true,
                         content: [{ type: "text" as const, text: source === "cache" || publishedCacheOnly || cacheGeneration
                             ? describeConversationCacheReadFailure(chains.dataChain, conversationId!, { link, logicalChain, cacheGeneration })
                             : `❌ 无法通过 dataChain=${chains.dataChain} 获取对话数据` }],
@@ -3118,6 +3227,17 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
                     const totalRoundCount = getConversationRoundIndexBounds(loaded).last;
                     const start = startRound || 1;
                     const end = endRound || totalRoundCount;
+                    if (totalRoundCount === 0 && loaded.localPbActivities?.activityCount) {
+                        const activityText = [formatLoadedOverview(loaded), `🔗 数据链路: ${loaded.chainUsed}`,
+                            formatLocalPbActivities(loaded.localPbActivities, depth as Depth)].filter(Boolean).join("\n\n");
+                        const { text } = formatPaginatedConversationReadText({
+                            conversationId: cascadeId, text: activityText, sourcePositions: [], continuationCursor, maxBytes,
+                            detail: [cacheReadDetail, windsurfSourceDiagnostics, formatConversationReadSegmentTiming(readTiming)].filter(Boolean).join("\n"),
+                            nextParams: { action: "read", conversationId: cascadeId, dataChain: loaded.chainUsed, depth,
+                                ...(maxBytes !== undefined ? { maxBytes } : {}), ...cacheNextParams },
+                        });
+                        return appendTiming({ content: [{ type: "text" as const, text }] }, startTime);
+                    }
                     const incompleteWindsurfWarning = formatWindsurfIncompleteReadWarning(loaded);
                     if (incompleteWindsurfWarning) {
                         const output = [
@@ -3298,6 +3418,7 @@ fetch/search/read/recall/export 必须传 conversationId（共享 broker 后端�
 
             } catch (error) {
                 return appendTiming({
+                    isError: true,
                     content: [{
                         type: "text" as const,
                         text: formatToolError(`conversation_read_original(${params.action})`, error, {

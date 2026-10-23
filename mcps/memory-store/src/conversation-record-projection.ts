@@ -7,9 +7,11 @@ export interface ConversationRecordProjectionMessage {
     semanticRole?: ConversationMessageRole;
     attachments?: ConversationRound["attachments"];
     mediaAttachments?: readonly string[];
+    annotations?: ConversationUserMessage["annotations"];
 }
 
 export interface ConversationRecordProjectionRound {
+    bodyMetadataVersion?: 2;
     roundIndex: number;
     messages: ConversationRecordProjectionMessage[];
 }
@@ -28,13 +30,16 @@ export function projectConversationRoundForRecord(
         if (message.semanticRole !== undefined) projection.semanticRole = message.semanticRole;
         if (message.attachments !== undefined) projection.attachments = message.attachments;
         if (message.mediaAttachments !== undefined) projection.mediaAttachments = message.mediaAttachments;
+        if (message.annotations !== undefined) projection.annotations = message.annotations.map(annotation => ({ ...annotation }));
         return projection;
     });
     for (const response of round.aiResponses) {
-        if (!response.response && response.toolCalls.length > 0) continue;
-        messages.push({ role: "assistant", text: response.response });
+        const attachments = (round.semanticEvents || []).filter(event => event.semanticRole === "model" && event.stepIndex === response.stepIndex).flatMap(event => event.attachments || []);
+        if (!response.response && response.toolCalls.length > 0 && !attachments.length) continue;
+        messages.push({ role: "assistant", text: response.response, ...(attachments.length ? { attachments } : {}) });
     }
     return {
+        bodyMetadataVersion: 2,
         roundIndex: round.roundIndex || index + 1,
         messages,
     };

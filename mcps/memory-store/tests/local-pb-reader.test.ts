@@ -3,7 +3,8 @@ import { createCipheriv, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { loadConversationData } from "../src/conversation-bridge.ts";
+import { conversationSourceIsPartial, loadConversationData } from "../src/conversation-bridge.ts";
+import { locateConversationContext } from "../src/conversation-context-locate.ts";
 import {
     compareConversationRoundCompleteness,
     discoverLocalPbCandidates,
@@ -277,6 +278,7 @@ const implicitPlaintext = fieldBytes(1, trajectory("implicit-trajectory", [step(
             );
             const bridged = await loadConversationData("antigravity", conversationId, { source: "local" });
             assert.equal(bridged?.totalSteps, 1, "bridge should retain the decoded local PB rounds");
+            assert.equal(bridged?.sourcePartial, true, "local PB partial status must be structured and persistable");
             assert.equal(bridged?.aiResponseCount, 1, "local PB cache overview must count decoded AI responses");
             assert.equal(bridged?.toolCallCount, 0, "wire-level local PB variants must not be counted as semantic tool calls");
             assert.equal(
@@ -286,6 +288,14 @@ const implicitPlaintext = fieldBytes(1, trajectory("implicit-trajectory", [step(
             );
             const cached = await loadConversationData("antigravity", conversationId, { source: "cache" });
             assert.equal(cached?.cacheGeneration, bridged?.cacheGeneration, "source=cache must read the latest explicit local fetch generation");
+            assert.equal(cached?.sourcePartial, true, "published cache must preserve source completeness");
+            assert.equal(conversationSourceIsPartial({ sourceDiagnostics: bridged?.sourceDiagnostics }), true, "older snapshots must recover partial status from retained PB diagnostics");
+            const located = await locateConversationContext([{
+                id: conversationId, dataChain: "antigravity", title: "Example", workspace: "", updatedAt: "", detail: "",
+            }], "active 用户", { source: "local", maxBytes: 16 * 1024 * 1024, deadlineMs: 30000 });
+            assert.ok(located.hits.some(hit => hit.role === "user"), "a genuine PB user message must remain searchable alongside system metadata in the same wire step");
+            assert.equal(located.resolution, "single_match_in_partial_scan", "partial Antigravity PB must not become a unique complete source during locate");
+            assert.equal(located.hits[0]?.freshness, "unknown");
             assert.equal(cached?.rounds[0]?.userMessage, "你好，active 用户", "source=cache must reuse the normalized local PB result");
             assert.equal(cached?.aiResponseCount, 1, "cache-only reads must preserve the full local PB AI response count");
             assert.equal(cached?.toolCallCount, 0, "cache-only reads must preserve semantic tool counts without counting PB wire variants");

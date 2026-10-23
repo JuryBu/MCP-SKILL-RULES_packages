@@ -4,6 +4,7 @@ import { locateConversationContext, locatePositiveInteger, type LocateMode, type
 
 export interface DeepLocateResumePayload {
     version: 2;
+    ownerConversationId?: string;
     query: string;
     dataChains: DataChainInput[];
     mode: LocateMode;
@@ -44,9 +45,10 @@ export function parseDeepLocateResumePayload(value: unknown): DeepLocateResumePa
     for (const field of ["conversationIds", "workspaces"]) {
         if (raw[field] !== undefined && (!Array.isArray(raw[field]) || (raw[field] as unknown[]).some(item => typeof item !== "string"))) throw new Error(`invalid deep_locate ${field}`);
     }
-    for (const field of ["parentConversationId", "parentQuery"]) {
+    for (const field of ["parentConversationId", "parentQuery", "ownerConversationId"]) {
         if (raw[field] !== undefined && typeof raw[field] !== "string") throw new Error(`invalid deep_locate ${field}`);
     }
+    if (raw.ownerConversationId !== undefined && !(raw.ownerConversationId as string).trim()) throw new Error("invalid deep_locate ownerConversationId");
     for (const field of ["maxFiles", "maxBytes", "maxHits", "deadlineMs"]) {
         if (raw[field] !== undefined && (!Number.isSafeInteger(raw[field]) || Number(raw[field]) <= 0)) throw new Error(`invalid deep_locate ${field}`);
     }

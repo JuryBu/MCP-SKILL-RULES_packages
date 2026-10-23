@@ -553,6 +553,9 @@ const yieldProbeData = Buffer.from(Array.from({ length: 256 }, (_, index) => JSO
     },
 })).join("\n"), "utf8");
 const fsPromises = fs.promises as { open: (...args: any[]) => Promise<any> };
+const yieldProbeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-codex-yield-probe-"));
+const yieldProbePath = path.join(yieldProbeDirectory, "yield-probe.jsonl");
+fs.writeFileSync(yieldProbePath, yieldProbeData);
 const originalOpen = fsPromises.open;
 let yieldProbeOffset = 0;
 let yieldProbeImmediateRan = false;
@@ -572,11 +575,12 @@ try {
         },
         close: async () => {},
     });
-    const yieldProbeEvents = await readRolloutEventsAsync("memory-store-codex-yield-probe.jsonl");
+    const yieldProbeEvents = await readRolloutEventsAsync(yieldProbePath);
     assert.equal(yieldProbeEvents.length, 256);
     assert.equal(yieldProbeImmediateRan, true, "async JSONL parser should yield before finishing a large in-memory chunk");
 } finally {
     fsPromises.open = originalOpen;
+    fs.rmSync(yieldProbeDirectory, { recursive: true, force: true });
 }
 
 const streamingRoundsTempDir = fs.mkdtempSync(path.join(os.tmpdir(), "memory-store-codex-rounds-stream-"));

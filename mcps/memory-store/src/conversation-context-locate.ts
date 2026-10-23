@@ -130,8 +130,9 @@ function* roundMessages(round: ConversationRound): Iterable<SearchableMessage> {
         yield message;
     };
     const hiddenSteps = new Set((round.semanticEvents || []).filter(event => event.semanticRole === "system").map(event => event.stepIndex));
+    const userSteps = new Set((round.semanticEvents || []).filter(event => event.semanticRole === "user" && !event.automation).map(event => event.stepIndex));
     for (const message of getRoundUserMessages(round)) {
-        if (message.stepIndex !== undefined && hiddenSteps.has(message.stepIndex)) continue;
+        if (message.stepIndex !== undefined && hiddenSteps.has(message.stepIndex) && !userSteps.has(message.stepIndex)) continue;
         yield* unique({ role: "user", rawRole: message.rawRole, text: message.text, stepIndex: message.stepIndex });
     }
     for (const response of round.aiResponses || []) {

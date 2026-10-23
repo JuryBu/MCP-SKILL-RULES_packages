@@ -382,10 +382,27 @@ function readManifest(key: ConversationSourceCacheKey, generation?: string): Con
     }
 }
 
-function readVerifiedFile(directory: string, descriptor: CacheFileDescriptor): Buffer | null {
+function readVerifiedFile(directory: string, descriptor: CacheFileDescriptor, maxBytes?: number): Buffer | null {
     const filePath = path.join(directory, descriptor.file);
     try {
-        const content = fs.readFileSync(filePath);
+        let content: Buffer;
+        if (maxBytes === undefined) content = fs.readFileSync(filePath);
+        else {
+            if (descriptor.bytes > maxBytes) return null;
+            const input = fs.openSync(filePath, "r");
+            try {
+                const physical = fs.fstatSync(input);
+                if (!physical.isFile() || physical.size !== descriptor.bytes) return null;
+                content = Buffer.alloc(descriptor.bytes);
+                let offset = 0;
+                while (offset < content.length) {
+                    const count = fs.readSync(input, content, offset, content.length - offset, offset);
+                    if (!count) return null;
+                    offset += count;
+                }
+                if (fs.fstatSync(input).size !== descriptor.bytes) return null;
+            } finally { fs.closeSync(input); }
+        }
         if (content.byteLength !== descriptor.bytes || sha256(content) !== descriptor.sha256) {
             diagnostics.corruptions += 1;
             return null;
@@ -432,14 +449,16 @@ function cacheState(manifest: ConversationSourceCacheManifest, index?: RoundOffs
 function readCachedInternal<TSnapshot>(
     options: ConversationSourceCacheReadOptions,
     cacheStateValue: "hit" | "built" | "stale" = "hit",
+    maxMetadataBytes?: number,
 ): ConversationSourceCacheReadResult<TSnapshot> | null {
     const manifest = readManifest(options.key, options.generation);
     if (!manifest) return null;
     if (options.expectedFingerprint !== undefined && !fingerprintsMatch(manifest.fingerprint, options.expectedFingerprint)) return null;
+    if (maxMetadataBytes !== undefined && (manifest.files.snapshot.bytes > maxMetadataBytes || manifest.files.roundIndex.bytes > maxMetadataBytes)) return null;
 
     const directory = entryDirectory(options.key);
-    const snapshotBytes = readVerifiedFile(directory, manifest.files.snapshot);
-    const indexBytes = readVerifiedFile(directory, manifest.files.roundIndex);
+    const snapshotBytes = readVerifiedFile(directory, manifest.files.snapshot, maxMetadataBytes);
+    const indexBytes = readVerifiedFile(directory, manifest.files.roundIndex, maxMetadataBytes);
     if (!snapshotBytes || !indexBytes || !verifyFileDescriptorSize(directory, manifest.files.rounds)) return null;
 
     try {
@@ -856,13 +875,25 @@ export function readConversationSourceCacheOnly<TSnapshot = unknown>(
     return readCachedConversationSourceCache<TSnapshot>(options);
 }
 
+export function readConversationSourceCacheMetadata<TSnapshot = unknown>(
+    options: ConversationSourceCacheReadOptions & { maxMetadataBytes: number },
+): ConversationSourceCacheReadResult<TSnapshot> | null {
+    if (!Number.isSafeInteger(options.maxMetadataBytes) || options.maxMetadataBytes < 1) throw new Error("Conversation cache metadata limit must be a positive safe integer");
+    return readCachedInternal<TSnapshot>(options, "hit", options.maxMetadataBytes);
+}
+
 export function getConversationSourceCacheReadStatus(
     options: ConversationSourceCacheReadOptions,
-): "missing" | "ready" | "corrupt" {
+): "missing" | "ready" | "corrupt" | "incompatible" {
     const filename = options.generation
         ? generationManifestPath(options.key, options.generation)
         : manifestPath(options.key);
     if (!fs.existsSync(filename)) return "missing";
+    try {
+        const manifest = JSON.parse(fs.readFileSync(filename, "utf8"));
+        if (["conversation-source-cache/v1", "conversation-source-cache/v2"].includes(manifest.format)
+            && manifest.key?.source === options.key.source && manifest.key?.conversationId === options.key.conversationId) return "incompatible";
+    } catch {}
     return readCachedInternal(options) ? "ready" : "corrupt";
 }
 

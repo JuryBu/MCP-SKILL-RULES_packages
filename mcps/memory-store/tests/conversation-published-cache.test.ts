@@ -62,6 +62,13 @@ try {
 
     const directory = cache.getConversationSourceCacheEntryDirectory(key);
     const manifest = JSON.parse(fs.readFileSync(path.join(directory, "manifest.json"), "utf8"));
+    const oldManifest = JSON.stringify({ ...manifest, format: "conversation-source-cache/v2" });
+    fs.writeFileSync(path.join(directory, "manifest.json"), oldManifest);
+    assert.equal(cache.getConversationSourceCacheReadStatus({ key }), "incompatible");
+    assert.match(describeConversationCacheReadFailure("codex", conversationId), /已退役格式/);
+    assert.equal(await loadConversationData("codex", conversationId, { publishedCacheOnly: true, includeRounds: false }), null);
+    assert.equal(fs.readFileSync(path.join(directory, "manifest.json"), "utf8"), oldManifest);
+    fs.writeFileSync(path.join(directory, "manifest.json"), JSON.stringify(manifest));
     fs.writeFileSync(path.join(directory, manifest.files.snapshot.file), "corrupted snapshot");
     assert.equal(cache.getConversationSourceCacheReadStatus({ key }), "corrupt");
     assert.match(describeConversationCacheReadFailure("codex", conversationId), /缓存损坏/);

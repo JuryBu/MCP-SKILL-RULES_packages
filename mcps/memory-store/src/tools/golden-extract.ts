@@ -1,7 +1,7 @@
 ﻿import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { touchActivity, appendTiming } from "../lifecycle.js";
-import { parseRounds, type ConversationRound } from "../trajectory.js";
+import { formatRoundForMessageRoles, type ConversationRound, type ConversationMessageRole } from "../trajectory.js";
 import { fuseSearch } from "../search.js";
 import { readWorkspaceIndex, readGeneralIndex, listWorkspaceHashes, workspaceHash } from "../store.js";
 import { type MemoryIndexEntry } from "../cache.js";
@@ -20,6 +20,20 @@ import { formatToolError } from "../error-format.js";
 import { dataChainInputSchema, modelChainInputSchema } from "./schema-utils.js";
 import type { ResumePayloadValue } from "../background-recovery.js";
 import { assertConversationConsumerSourceComplete } from "../devin-source-evidence.js";
+import { openProgressiveTaskCache } from "../conversation-progressive-task.js";
+import type { ProgressiveSource, ProgressiveRow } from "../conversation-progressive-types.js";
+
+export interface GoldenExtractDependencies {
+    loadConversation?: typeof loadConversationData;
+    openProgressiveCache?: typeof openProgressiveTaskCache;
+    callModel?: typeof callModelResponse;
+}
+
+const goldenExtractDefaults = {
+    loadConversation: loadConversationData,
+    openProgressiveCache: openProgressiveTaskCache,
+    callModel: callModelResponse,
+};
 
 /**
  * conversation_golden_extract — 黄金片段提取
@@ -33,6 +47,8 @@ import { assertConversationConsumerSourceComplete } from "../devin-source-eviden
 interface GoldenExtractResumePayload {
     version: 1;
     conversationId: string;
+    progressiveTaskId?: string;
+    rangeRefs?: string[];
     stepStart?: number;
     stepEnd?: number;
     autoCompare?: boolean;
@@ -42,7 +58,15 @@ interface GoldenExtractResumePayload {
 }
 
 async function buildGoldenExtractResumePayload(args: GoldenExtractArgs): Promise<GoldenExtractResumePayload | null> {
+    assertGoldenProgressiveSelection(args);
     const chains = resolveChainSplit(args);
+    if (args.rangeRefs?.length) {
+        return {
+            version: 1, conversationId: args.conversationId!, progressiveTaskId: args.progressiveTaskId,
+            rangeRefs: [...args.rangeRefs], autoCompare: args.autoCompare, workspace: args.workspace,
+            dataChain: chains.dataChain, modelChain: chains.modelChain,
+        };
+    }
     const dataChain = await resolveConversationChain(chains.dataChain);
     if (!dataChain) return null;
     const conversationId = await resolveConversationId(args.conversationId, dataChain);
@@ -65,7 +89,10 @@ function isGoldenExtractResumePayload(value: unknown): value is GoldenExtractRes
     return payload.version === 1
         && typeof payload.conversationId === "string"
         && typeof payload.dataChain === "string"
-        && typeof payload.modelChain === "string";
+        && typeof payload.modelChain === "string"
+        && (payload.rangeRefs === undefined || (Array.isArray(payload.rangeRefs)
+            && payload.rangeRefs.every(ref => typeof ref === "string" && Boolean(ref.trim()))
+            && (!payload.rangeRefs.length || typeof payload.progressiveTaskId === "string")));
 }
 
 registerBackgroundTaskRecoveryHandler("golden-extract", async (task) => {
@@ -91,12 +118,15 @@ registerBackgroundTaskRecoveryHandler("golden-extract", async (task) => {
     };
 });
 
-export function registerGoldenExtract(server: McpServer): void {
+export function registerGoldenExtract(server: McpServer, overrides: GoldenExtractDependencies = {}): void {
+    const dependencies = { ...goldenExtractDefaults, ...overrides };
     server.tool(
         "conversation_golden_extract",
         "从对话中提取关键信息（决策、发现、踩坑经验），并与现有记忆对比去重。帮助发现对话中值得持久化但尚未保存的知识。",
         {
-            conversationId: z.string().optional().describe("对话 ID（不填默认当前对话）"),
+            conversationId: z.string().optional().describe("对话 ID；选择progressive范围时必须显式填写当前调用者conversationId，用于任务归属核验"),
+            progressiveTaskId: z.string().optional().describe("已发布范围所属的progressive任务ID，必须与非空rangeRefs配套；两者均未提供时保留原完整缓存路线"),
+            rangeRefs: z.array(z.string().min(1)).optional().describe("明确选择的已发布pcache轮次引用；只提取所选范围，来源与partial标记随结果返回"),
             stepStart: z.number().optional().describe("起始步骤偏移（从对话的特定位置开始分析）"),
             stepEnd: z.number().optional().describe("结束步骤偏移"),
             autoCompare: z.boolean().optional().describe("是否自动与记忆对比去重（默认 true）"),
@@ -117,6 +147,11 @@ export function registerGoldenExtract(server: McpServer): void {
                     content: [{ type: "text" as const, text: formatBackgroundTask(task) }],
                 }, startTime);
             }
+            try { assertGoldenProgressiveSelection(args); }
+            catch (error) {
+                return appendTiming({ isError: true, content: [{ type: "text" as const,
+                    text: formatToolError("conversation_golden_extract", error, { conversationId: args.conversationId }) }] }, startTime);
+            }
             // C3 块B：三态 background 语义（详见 chain.ts decideBackground）。
             const chains = resolveChainSplit(args);
             const decision = decideBackground(args.background, chains.modelChain, "always");
@@ -132,6 +167,7 @@ export function registerGoldenExtract(server: McpServer): void {
                         { ...args, background: false, taskId: undefined, waitSeconds: undefined },
                         Date.now(),
                         taskContext,
+                        dependencies,
                     );
                     return result.content.map((item: { text: string }) => item.text).join("\n");
                 }, {
@@ -151,13 +187,15 @@ export function registerGoldenExtract(server: McpServer): void {
                 }, startTime);
             }
 
-            return runGoldenExtract(args, startTime);
+            return runGoldenExtract(args, startTime, undefined, dependencies);
         }
     );
 }
 
 type GoldenExtractArgs = {
     conversationId?: string;
+    progressiveTaskId?: string;
+    rangeRefs?: string[];
     stepStart?: number;
     stepEnd?: number;
     autoCompare?: boolean;
@@ -169,6 +207,55 @@ type GoldenExtractArgs = {
     taskId?: string;
     waitSeconds?: number;
 };
+
+function assertGoldenProgressiveSelection(args: GoldenExtractArgs): void {
+    if (args.progressiveTaskId === undefined && args.rangeRefs === undefined) return;
+    if (!args.conversationId?.trim() || !args.progressiveTaskId?.trim()) {
+        throw new Error("已发布范围提取必须显式提供当前conversationId、progressiveTaskId和rangeRefs");
+    }
+    if (!args.rangeRefs?.length || args.rangeRefs.some(ref => !ref.trim())) {
+        throw new Error("rangeRefs必须明确选择已发布的轮次引用");
+    }
+    if (args.stepStart !== undefined || args.stepEnd !== undefined) {
+        throw new Error("rangeRefs与stepStart/stepEnd请选择一种范围输入");
+    }
+}
+
+async function loadGoldenProgressiveSelection(args: GoldenExtractArgs, dependencies: typeof goldenExtractDefaults) {
+    assertGoldenProgressiveSelection(args);
+    const rows: ProgressiveRow[] = [];
+    let source: ProgressiveSource | undefined;
+    let sourceKey: string | undefined;
+    let fullSourceComplete = true;
+    const refs = [...new Set(args.rangeRefs!)];
+    for (const ref of refs) {
+        const opened = await dependencies.openProgressiveCache({ ownerId: args.conversationId!, taskId: args.progressiveTaskId! }, ref);
+        const row = opened.row;
+        if (!row || row.ref !== ref) throw new Error("范围引用尚未发布或未返回对应完整轮次");
+        const status = await opened.cache.status();
+        const published = status.blocks.some(block => block.blockId === row.blockId && block.anchorId === row.anchorId
+            && block.coverage.kind === row.kind && block.coverage.startRound <= row.round.roundIndex
+            && block.coverage.endRound >= row.round.roundIndex);
+        if (!published) throw new Error("所选范围尚未完成发布，请继续查询原progressiveTaskId");
+        if (source && (sourceKey !== status.sourceKey || source.conversationId !== status.source.conversationId
+            || source.host !== status.source.host || source.revision !== status.source.revision)) {
+            throw new Error("rangeRefs必须来自同一对话的同一来源版本");
+        }
+        source = status.source;
+        sourceKey = status.sourceKey;
+        fullSourceComplete &&= status.complete;
+        rows.push(row);
+    }
+    const selectedSource = source!;
+    const scopeText = `partial=true; source=${selectedSource.host}:${selectedSource.conversationId}; revision=${selectedSource.revision}; `
+        + `progressiveTaskId=${args.progressiveTaskId}; fullSourceComplete=${fullSourceComplete}\n`
+        + `rangeRefs=${JSON.stringify(refs)}\n选定范围=${JSON.stringify(rows.map(row => ({ kind: row.kind,
+            anchorId: row.anchorId, round: row.round.roundIndex, startStep: row.round.startStep, endStep: row.round.endStep })))}\n`
+        + "本次提取的结论范围限定为上述已发布轮次。";
+    return { conversationId: selectedSource.conversationId, chainUsed: selectedSource.host,
+        totalSteps: rows.reduce((total, row) => total + Math.max(0, row.round.endStep - row.round.startStep + 1), 0),
+        rounds: rows.map(row => row.round), scopeText };
+}
 
 function isGoldenTaskAborted(taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">): boolean {
     return Boolean(taskContext?.isCancelled() || taskContext?.isSettled());
@@ -186,13 +273,18 @@ function formatGoldenTaskAborted(startTime: number, taskContext?: Pick<Backgroun
 }
 
 async function runGoldenExtract(
-    { conversationId, stepStart, stepEnd, autoCompare, workspace, chain, dataChain, modelChain }: GoldenExtractArgs,
+    args: GoldenExtractArgs,
     startTime: number,
     taskContext?: Pick<BackgroundTaskContext, "isCancelled" | "isSettled">,
+    dependencies: typeof goldenExtractDefaults = goldenExtractDefaults,
 ) {
+    const { conversationId, stepStart, stepEnd, autoCompare, workspace, chain, dataChain, modelChain } = args;
     try {
+                assertGoldenProgressiveSelection(args);
                 const chains = resolveChainSplit({ chain, dataChain, modelChain });
-                const loaded = await loadConversationData(chains.dataChain, conversationId, { link: "summary" });
+                const progressive = args.rangeRefs?.length ? await loadGoldenProgressiveSelection(args, dependencies) : undefined;
+                const full = progressive ? undefined : await dependencies.loadConversation(chains.dataChain, conversationId, { link: "summary" });
+                const loaded = progressive || full;
                 if (!loaded) {
                     return appendTiming({
                         content: [{ type: "text" as const, text: `❌ 无法通过 dataChain=${chains.dataChain} 获取对话数据` }],
@@ -200,7 +292,9 @@ async function runGoldenExtract(
                 }
 
                 const cascadeId = loaded.conversationId;
-                if (loaded.windsurfData?.thread.sourceKind) assertConversationConsumerSourceComplete(loaded);
+                if (full?.windsurfData?.thread.sourceKind) assertConversationConsumerSourceComplete(full);
+                const scopeText = progressive?.scopeText;
+                const scoped = (text: string): string => scopeText ? `${scopeText}\n\n${text}` : text;
                 let rounds = loaded.rounds;
 
                 // 截取轮次范围（兼容旧 stepStart/stepEnd 参数名）
@@ -212,15 +306,19 @@ async function runGoldenExtract(
 
                 if (rounds.length === 0) {
                     return appendTiming({
-                        content: [{ type: "text" as const, text: "⚠️ 对话步骤中未解析到有效轮次。" }],
+                        content: [{ type: "text" as const, text: scoped("⚠️ 对话步骤中未解析到有效轮次。") }],
                     }, startTime);
                 }
 
                 // 从轮次中提取对话文本
-                const dialogueText = extractDialogueFromRounds(rounds);
+                const dialogueText = progressive
+                    ? rounds.map(round => formatRoundForMessageRoles(round, "full",
+                        ["tool_results", "code_actions", "code_diffs", "file_views"],
+                        new Set<ConversationMessageRole>(["user", "model", "assistant", "tool", "system", "subagent"]), "folded")).join("\n\n")
+                    : extractDialogueFromRounds(rounds);
                 if (dialogueText.length < 50) {
                     return appendTiming({
-                        content: [{ type: "text" as const, text: "⚠️ 对话内容过短，无法提取有价值的片段。" }],
+                        content: [{ type: "text" as const, text: scoped("⚠️ 对话内容过短，无法提取有价值的片段。") }],
                     }, startTime);
                 }
 
@@ -228,7 +326,7 @@ async function runGoldenExtract(
                 const truncatedText = dialogueText.slice(0, 8000);
 
                 // 调用 Flash 提取关键信息
-                const prompt = `分析以下对话片段，提取值得长期记忆的关键信息。
+                const prompt = `${scopeText ? `${scopeText}\ninputTruncated=${dialogueText.length > 8000}\n\n` : ""}分析以下对话片段，提取值得长期记忆的关键信息。
                 
 请从以下维度提取：
 1. [决策] 重要的技术决策和设计选择
@@ -246,7 +344,7 @@ ${truncatedText}
                     return formatGoldenTaskAborted(startTime, taskContext);
                 }
 
-                const flashResponse = await callModelResponse(
+                const flashResponse = await dependencies.callModel(
                     process.env.MEMORY_STORE_LS_MODEL || DEFAULT_ANTIGRAVITY_LS_MODEL,
                     prompt,
                     chains.modelChain,
@@ -258,7 +356,7 @@ ${truncatedText}
                 }
                 if (!flashResponse.text || flashResponse.text.trim() === "无") {
                     return appendTiming({
-                        content: [{ type: "text" as const, text: "ℹ️ 对话中未发现需要提取的关键信息。" }],
+                        content: [{ type: "text" as const, text: scoped("ℹ️ 对话中未发现需要提取的关键信息。") }],
                     }, startTime);
                 }
 
@@ -266,7 +364,7 @@ ${truncatedText}
                 const fragments = parseFragments(flashResponse.text);
                 if (fragments.length === 0) {
                     return appendTiming({
-                        content: [{ type: "text" as const, text: "ℹ️ 对话中未发现需要提取的关键信息。" }],
+                        content: [{ type: "text" as const, text: scoped("ℹ️ 对话中未发现需要提取的关键信息。") }],
                     }, startTime);
                 }
 
@@ -276,6 +374,7 @@ ${truncatedText}
                     ? `${chains.modelChain}/${flashResponse.chainUsed}:${flashResponse.modelUsed || "unknown"}`
                     : chains.modelChain;
                 let resultText = `🔍 黄金片段提取 — ${cascadeId.slice(0, 8)}... (data=${loaded.chainUsed}, model=${modelLabel}, grokContext=default, ${loaded.totalSteps}步, ${rounds.length}轮)\n\n`;
+                if (scopeText) resultText += `${scopeText}\ninputTruncated=${dialogueText.length > 8000}\n\n`;
                 resultText += `提取到 ${fragments.length} 条关键信息:\n\n`;
 
                 if (shouldCompare) {
@@ -315,6 +414,7 @@ ${truncatedText}
                 }, startTime);
     } catch (error) {
         return appendTiming({
+            isError: true,
             content: [{
                 type: "text" as const,
                 text: formatToolError("conversation_golden_extract", error, { conversationId, workspace }),

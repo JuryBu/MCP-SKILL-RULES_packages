@@ -3,6 +3,8 @@ import { createHash } from "node:crypto";
 import path from "path";
 import os from "os";
 import fs from "fs";
+import { fileURLToPath } from "node:url";
+import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic, type LocalPbDiscoveryOptions } from "./conversation-local-list.js";
 import {
     registerLsEntry,
     cleanDeadEntries,
@@ -759,12 +761,19 @@ export async function fetchLiveAntigravityConversation(cascadeId: string): Promi
     return null;
 }
 
-export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | null> {
+export async function fetchFirstPageSteps(cascadeId: string, options: Pick<LocalPbDiscoveryOptions, "deadlineAt" | "isCancelled"> = {}): Promise<any[] | null> {
+    const check = () => {
+        if (options.isCancelled?.()) throw new Error("Antigravity workspace discovery cancelled");
+        if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("Antigravity workspace discovery deadline exceeded");
+    };
+    check();
     // 尝试从单个 LS 拉第一页
     const tryLs = async (info: LsProcessInfo, port: number): Promise<any[] | null> => {
         try {
+            check();
             const result = await rpcCall(info, port, "GetCascadeTrajectorySteps",
-                { cascadeId, stepOffset: 0 }, 10000);
+                { cascadeId, stepOffset: 0 }, Math.max(1, Math.min(10000, (options.deadlineAt ?? Date.now() + 10000) - Date.now())));
+            check();
             const steps = result.data?.steps ?? [];
             return steps.length > 0 ? steps : null;
         } catch { return null; }
@@ -778,6 +787,7 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
 
     // Phase 1: 路由大脑解析真持有者（只拉第一页，命中即返）
     try {
+        check();
         const resolved = await resolveEndpointForConversation(cascadeId, "antigravity");
         if (resolved.endpoint) {
             const ep = resolved.endpoint;
@@ -789,6 +799,7 @@ export async function fetchFirstPageSteps(cascadeId: string): Promise<any[] | nu
         }
     } catch { /* swallow，预扫描要求快，失败返 null */ }
 
+    check();
     return null; // 不走 PowerShell 兜底（太慢，预扫描要求快）
 }
 
@@ -1027,21 +1038,27 @@ export function listConversationIds(): string[] {
  * 从 state.vscdb 读取有效对话标题（调用 Python 脚本）
  * 返回 Map<conversationId, { summary, steps }>
  */
-let _vscdbCache: { data: Map<string, { summary: string; steps: number | null }>; ts: number } | null = null;
+let _vscdbCache: { data: Map<string, { summary: string; steps: number | null }>; ts: number; diagnostic?: ConversationDiscoveryDiagnostic } | null = null;
 const VSCDB_CACHE_TTL = 120_000; // 2 分钟缓存
 
-export function readVscdbTitles(): Map<string, { summary: string; steps: number | null }> {
+export function readVscdbTitles(options: Pick<LocalPbDiscoveryOptions, "deadlineAt" | "isCancelled" | "onDiagnostic"> = {}): Map<string, { summary: string; steps: number | null }> {
+    if (options.isCancelled?.()) throw new Error("Antigravity title discovery cancelled");
     const now = Date.now();
-    if (_vscdbCache && now - _vscdbCache.ts < VSCDB_CACHE_TTL) return _vscdbCache.data;
+    if (_vscdbCache && now - _vscdbCache.ts < VSCDB_CACHE_TTL) {
+        if (_vscdbCache.diagnostic) options.onDiagnostic?.(_vscdbCache.diagnostic);
+        return _vscdbCache.data;
+    }
 
     const result = new Map<string, { summary: string; steps: number | null }>();
+    let diagnostic: ConversationDiscoveryDiagnostic | undefined;
     try {
-        const scriptPath = path.join(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Z]:)/, "$1")), "..", "scripts", "read_vscdb_titles.py");
-        if (!fs.existsSync(scriptPath)) return result;
+        if (options.deadlineAt !== undefined && now >= options.deadlineAt) throw new Error("Antigravity title discovery deadline exceeded");
+        const scriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "scripts", "read_vscdb_titles.py");
+        if (!fs.existsSync(scriptPath)) throw new Error("Antigravity title reader is unavailable");
 
         // execFileSync 已在文件头 import
         const stdout = execFileSync("python", [scriptPath], {
-            encoding: "utf-8", timeout: 8000, windowsHide: true,
+            encoding: "utf-8", timeout: Math.max(1, Math.min(8000, (options.deadlineAt ?? now + 8000) - Date.now())), windowsHide: true,
         });
         if (stdout.trim()) {
             const parsed = JSON.parse(stdout.trim());
@@ -1050,9 +1067,37 @@ export function readVscdbTitles(): Map<string, { summary: string; steps: number 
                 result.set(uuid, { summary, steps: steps ?? null });
             }
         }
-    } catch { /* silent */ }
-    _vscdbCache = { data: result, ts: now };
+    } catch (error) {
+        diagnostic = { code: "AGY_TITLE_METADATA_UNAVAILABLE", message: error instanceof Error ? error.message : String(error), sourceKind: "antigravity-vscdb" };
+        options.onDiagnostic?.(diagnostic);
+    }
+    if (options.isCancelled?.()) throw new Error("Antigravity title discovery cancelled");
+    _vscdbCache = { data: result, ts: now, diagnostic };
     return result;
+}
+
+export function discoverAntigravityConversations(options: LocalPbDiscoveryOptions & {
+    readTitles?: () => Map<string, { summary: string; steps: number | null }>;
+} = {}): {
+    conversations: Array<{ id: string; title?: string; mtime: Date; sizeKB: number; workspace?: string; kinds: Array<"active" | "implicit"> }>;
+    partial: boolean;
+    diagnostics: ConversationDiscoveryDiagnostic[];
+} {
+    const diagnostics: ConversationDiscoveryDiagnostic[] = [];
+    const report = (diagnostic: ConversationDiscoveryDiagnostic) => { diagnostics.push(diagnostic); options.onDiagnostic?.(diagnostic); };
+    const candidates = listLocalPbConversationCandidates("antigravity", { ...options, query: undefined, onDiagnostic: report });
+    let titles = new Map<string, { summary: string; steps: number | null }>();
+    try {
+        if (options.isCancelled?.()) throw new Error("Antigravity discovery cancelled");
+        if (options.deadlineAt === undefined || Date.now() < options.deadlineAt) titles = options.readTitles ? options.readTitles() : readVscdbTitles({ ...options, onDiagnostic: report });
+    }
+    catch (error) {
+        if (options.isCancelled?.()) throw error;
+        report({ code: "AGY_TITLE_METADATA_UNAVAILABLE", message: String(error), sourceKind: "antigravity-vscdb" });
+    }
+    return { conversations: candidates.map(candidate => ({ id: candidate.id, title: titles.get(candidate.id)?.summary,
+        mtime: new Date(candidate.updatedAt), sizeKB: candidate.bytes / 1024, kinds: candidate.kinds })),
+        partial: diagnostics.length > 0, diagnostics };
 }
 
 export function readVscdbTitlesFresh(): Map<string, { summary: string; steps: number | null }> {

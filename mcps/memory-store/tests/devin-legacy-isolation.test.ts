@@ -38,7 +38,10 @@ try {
     assert.equal(evidence.classification.state, "Present");
     const list = await windsurf.listRecentWindsurfThreads(10);
     assert.equal(list[0].id, "legacy-cascade");
-    assert.match(list[0].discoveryWarnings!.join(" "), /DEVIN_DISCOVERY_UNAVAILABLE/);
+    assert.match(list[0].discoveryWarnings!.join(" "), /DEVIN_SQLITE_READ/);
+    const discovery = await windsurf.discoverWindsurfThreads(10);
+    assert.equal(discovery.partial, true);
+    assert.ok(discovery.diagnostics.some(diagnostic => diagnostic.sourceKind === "devin-cli" && /SQLite|database/iu.test(diagnostic.message)));
     await assert.rejects(() => windsurf.resolveWindsurfThreadId("unknown-conversation"), /SQLite/);
     const beforeLocal = oldCalls;
     fs.writeFileSync(path.join(root, "legacy-local.pb"), "synthetic");
@@ -59,6 +62,8 @@ try {
     for (const failure of ["partial", "stale", "source unavailable"]) {
         await assert.rejects(() => execute(async () => ({ chainUsed: "windsurf" }), () => { throw new Error(failure); }), new RegExp(failure));
     }
+    windsurf.__setWindsurfEndpointResolverForTest(async () => []);
+    await assert.rejects(() => windsurf.listRecentWindsurfThreads(10), /DEVIN_SQLITE_READ/);
     console.log("PASS devin-legacy-isolation: corrupt database isolation, exact legacy identity, local-only boundaries and Guard second-read rejection");
 } finally {
     windsurf.__setWindsurfEndpointResolverForTest(null);

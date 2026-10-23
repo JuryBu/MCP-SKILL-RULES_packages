@@ -81,6 +81,7 @@ import {
     fingerprintLocalPbCandidates,
     loadLocalPbConversation,
     type ConversationRawSource,
+    type LocalPbActivityData,
 } from "./conversation-source-adapters.js";
 import fs from "node:fs";
 import {
@@ -91,7 +92,7 @@ import {
 import type { SourceRevision } from "./source-evidence-contracts.js";
 import { fingerprintDevinConversation, resolveDevinConversation } from "./devin-sqlite.js";
 import { readDevinConversation, splitDevinSubagentId, devinSubagentId, DEVIN_NORMALIZATION_VERSION } from "./devin-conversation.js";
-import { rememberDevinIdentity, resolveCachedDevinIdentity } from "./devin-identity.js";
+import { getDevinIdentityReadTargets, rememberDevinIdentity, resolveCachedDevinIdentity } from "./devin-identity.js";
 import { windsurfSummaryFromDevin } from "./windsurf-client.js";
 import type { DevinReadOptions } from "./devin-types.js";
 
@@ -127,11 +128,19 @@ export interface ConversationLoadResult {
     cacheFingerprint?: ConversationSourceFingerprint | null;
     sourceMode?: ConversationRawSource;
     sourceDiagnostics?: string[];
+    sourcePartial?: boolean;
+    localPbActivities?: LocalPbActivityData;
     sourceRevision?: SourceRevision;
     compactionMetadata?: ConversationCompactionMetadata;
 }
 
 type ConversationCacheAuthority = Extract<ConversationRawSource, "local" | "ls">;
+
+export function conversationSourceIsPartial(loaded: Pick<ConversationLoadResult, "sourcePartial" | "sourceDiagnostics" | "windsurfData">): boolean {
+    return Boolean(loaded.sourcePartial || loaded.windsurfData?.partial || loaded.sourceDiagnostics?.some(diagnostic =>
+        /部分候选解码失败|本地 PB (?:active|implicit): failed\//u.test(diagnostic)
+    ));
+}
 
 export function getConversationRoundIndexBounds(loaded: Pick<ConversationLoadResult, "rounds" | "roundCount" | "roundIndexBounds">): ConversationSourceCacheRoundBounds {
     if (loaded.roundIndexBounds) return loaded.roundIndexBounds;
@@ -405,6 +414,14 @@ async function loadFromResolvedChain(
         : await resolveConversationId(conversationId, resolved, options.cwd, options.requestClass, options.sourceReadBudget);
     if (!effectiveId) return null;
     if (resolved === "windsurf") {
+        if ((source === "cache" || options.publishedCacheOnly) && options.cacheGeneration) {
+            const readTargets = [...new Set([effectiveId, ...getDevinIdentityReadTargets(effectiveId)])];
+            for (const readId of readTargets) {
+                const cached = loadConversationCacheOnly(conversationSourceCacheKey(resolved, readId, options), "cache", options);
+                if (cached) return cached;
+            }
+            return null;
+        }
         if (source === "cache" || options.publishedCacheOnly) effectiveId = resolveCachedDevinIdentity(effectiveId);
         else {
             const child = splitDevinSubagentId(effectiveId);
@@ -1207,6 +1224,7 @@ function hydrateConversationCache(
     const { cacheAuthority: _cacheAuthority, ...snapshotData } = snapshot;
     const loaded: ConversationLoadResult = {
         ...snapshotData,
+        sourcePartial: conversationSourceIsPartial(snapshotData),
         rounds,
         roundCount,
         roundStart: options.roundRange?.startRound || 1,
@@ -1249,9 +1267,12 @@ export function describeConversationCacheReadFailure(
         : [normalized];
     const available: string[] = [];
     let corrupted = false;
+    let incompatible = false;
     for (const source of sources) {
         const requestedKey = conversationSourceCacheKey(source, conversationId, options);
-        corrupted ||= getConversationSourceCacheReadStatus({ key: requestedKey, generation: options.cacheGeneration }) === "corrupt";
+        const cacheStatus = getConversationSourceCacheReadStatus({ key: requestedKey, generation: options.cacheGeneration });
+        corrupted ||= cacheStatus === "corrupt";
+        incompatible ||= cacheStatus === "incompatible";
         const links: ConversationLinkMode[] = source === "codex" || source === "claude-code"
             ? ["summary", "reference", "expand_children"]
             : [requestedLink];
@@ -1262,7 +1283,7 @@ export function describeConversationCacheReadFailure(
         }
     }
     return [
-        corrupted ? "❌ 请求的已发布缓存损坏，无法读取" : "❌ 请求的已发布缓存不存在或该 generation 已清理",
+        incompatible ? "❌ 请求的已发布缓存使用已退役格式，需要重新fetch建立当前格式缓存，原缓存已保留" : corrupted ? "❌ 请求的已发布缓存损坏，无法读取" : "❌ 请求的已发布缓存不存在或该 generation 已清理",
         `conversationId=${conversationId} | dataChain=${normalized} | link=${requestedLink}${options.logicalChain ? ` | logicalChain=${options.logicalChain}` : ""}${options.cacheGeneration ? ` | generation=${options.cacheGeneration}` : ""}`,
         available.length ? `可用缓存视图：\n${available.join("\n")}` : "当前没有可用的已发布缓存视图",
         `恢复调用：conversation_read_original(action="fetch", conversationId=${JSON.stringify(conversationId)}, dataChain=${JSON.stringify(normalized)}, link=${JSON.stringify(requestedLink)}${options.logicalChain ? `, logicalChain=${JSON.stringify(options.logicalChain)}` : ""}, source="auto", background=true)`,
@@ -1277,10 +1298,13 @@ function localPbToConversationResult(
     const local = loadLocalPbConversation(resolved, conversationId);
     if (!local) return null;
     const diagnostics = [
-        `本地 PB: ${local.candidateKinds.join("+")}，${local.rounds.length} 轮/${local.totalSteps} 步${local.partial ? "（部分候选解码失败）" : ""}`,
+        `本地 PB: ${local.candidateKinds.join("+")}，${local.rounds.length} 个主人轮次/${local.totalSteps} 步，${local.localPbActivities.activityCount}项活动${local.partial ? "（部分候选解码失败或源内容不完整）" : ""}`,
         ...local.diagnostics.map(diagnostic => (
             `本地 PB ${diagnostic.kind}: ${diagnostic.status}${diagnostic.errorCode ? `/${diagnostic.errorCode}` : ""}，${diagnostic.message}`
         )),
+        ...local.localPbActivities.diagnostics.map(diagnostic => `本地 PB ${resolved} step=${diagnostic.stepIndex} field=${diagnostic.fieldNumber ?? "unknown"} ${diagnostic.kind}: ${diagnostic.message}`),
+        ...(local.selected.trajectory.id && local.selected.trajectory.id !== conversationId
+            ? [`本地 PB 文件ID=${conversationId}; payload trajectoryId=${local.selected.trajectory.id}; 保留独立原始标识`] : []),
     ];
     if (resolved === "antigravity") {
         return {
@@ -1289,6 +1313,8 @@ function localPbToConversationResult(
             rounds: local.rounds,
             totalSteps: local.totalSteps,
             cacheAuthority: "local",
+            sourcePartial: local.partial,
+            ...{ localPbActivities: local.localPbActivities },
             trajectory: {
                 id: local.selected.trajectory.id || conversationId,
                 steps: local.selected.trajectory.steps,
@@ -1315,7 +1341,8 @@ function localPbToConversationResult(
         partial: local.partial,
         warnings: diagnostics,
     };
-    return { chainUsed: resolved, conversationId, rounds: local.rounds, totalSteps: local.totalSteps, cacheAuthority: "local", windsurfData, sourceDiagnostics: diagnostics };
+    return { chainUsed: resolved, conversationId, rounds: local.rounds, totalSteps: local.totalSteps, cacheAuthority: "local", windsurfData, sourceDiagnostics: diagnostics, sourcePartial: local.partial,
+        ...{ localPbActivities: local.localPbActivities } };
 }
 
 async function lsConversationResult(
@@ -1349,6 +1376,7 @@ async function lsConversationResult(
         totalSteps: windsurfData.totalSteps,
         cacheAuthority: "ls",
         windsurfData: { ...windsurfData, rounds },
+        sourcePartial: windsurfData.partial,
         sourceDiagnostics: [`Windsurf LS: ${windsurfData.totalSteps} 步${windsurfData.partial ? "（不完整）" : ""}`],
     };
 }
@@ -1370,7 +1398,7 @@ async function loadRawConversationData(
             const totalSteps = devin.raw.nodes.length || devin.raw.desktopMessages.length;
             return {
                 chainUsed: "windsurf", conversationId: devin.raw.summary.canonicalId,
-                rounds: devin.rounds, totalSteps, cacheAuthority: "local",
+                rounds: devin.rounds, totalSteps, cacheAuthority: "local", sourcePartial: devin.raw.partial,
                 windsurfData: {
                     normalizationVersion: DEVIN_NORMALIZATION_VERSION,
                     cascadeId: devin.raw.summary.canonicalId, thread: windsurfSummaryFromDevin(devin.raw.summary),

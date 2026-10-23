@@ -23,6 +23,7 @@ import {
 } from "./codex-history-source.js";
 import { CodexOrdinalValidator, CodexPrefixIdentityVerifier, hashCodexPrefix, type CodexOrdinalMode, type CodexPrefixIdentity } from "./codex-history-integrity.js";
 import { CodexHistoryArchiveLogicalLimitError, getCodexHistoryArchiveLogicalLimit } from "./codex-history-archive.js";
+import { CODEX_JSONL_DEFAULT_RECORD_BYTES, codexJsonlRecordByteLimit } from "./codex-jsonl-record-limit.js";
 import { getRoundSubagentSummaries, getRoundUserMessages, type ConversationRound } from "./trajectory.js";
 import type { ConversationLinkMode } from "./chain.js";
 import {
@@ -168,7 +169,16 @@ const SESSION_INDEX = path.join(CODEX_HOME, "session_index.jsonl");
 const CODEX_SESSIONS_DIR = path.join(CODEX_HOME, "sessions");
 const CODEX_ARCHIVED_SESSIONS_DIR = path.join(CODEX_HOME, "archived_sessions");
 const CODEX_JSONL_READ_CHUNK_BYTES = Number(process.env.MEMORY_STORE_CODEX_JSONL_READ_CHUNK_BYTES || 1024 * 1024);
-const CODEX_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CODEX_JSONL_MAX_LINE_CHARS || 64 * 1024 * 1024);
+const CODEX_JSONL_MAX_LINE_CHARS = Number(process.env.MEMORY_STORE_CODEX_JSONL_MAX_LINE_CHARS || CODEX_JSONL_DEFAULT_RECORD_BYTES);
+const CODEX_JSONL_CUSTOM_LINE_LIMIT = Boolean(process.env.MEMORY_STORE_CODEX_JSONL_MAX_LINE_CHARS);
+
+function codexClientRecordByteLimit(prefix: string, allowCompaction: boolean): number {
+    return allowCompaction ? codexJsonlRecordByteLimit(Buffer.from(prefix.slice(0, 4096), "utf8").subarray(0, 4096)) : CODEX_JSONL_DEFAULT_RECORD_BYTES;
+}
+
+function assertCodexParsedRecordLimit(event: any, line: string): void {
+    if (event?.type !== "compacted" && line.length > CODEX_JSONL_DEFAULT_RECORD_BYTES / 3 && Buffer.byteLength(line, "utf8") > CODEX_JSONL_DEFAULT_RECORD_BYTES) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+}
 const CODEX_CONTEXT_PROBE_MAX_BYTES = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES || 16 * 1024 * 1024);
 const CODEX_CONTEXT_PROBE_DEADLINE_MS = Number(process.env.MEMORY_STORE_CODEX_CONTEXT_PROBE_DEADLINE_MS || 12_000);
 const CODEX_AGENTS_HEADER_PREFIX = "# AGENTS.md instructions";
@@ -340,7 +350,8 @@ async function forEachCodexJsonlLineAsync(
     const decoder = new StringDecoder("utf8");
     const strictDecoder = options.strict ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }) : undefined;
     const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
-    const maxLineChars = options.maxLineChars || CODEX_JSONL_MAX_LINE_CHARS;
+    const maxLineChars = options.maxLineChars ?? CODEX_JSONL_MAX_LINE_CHARS;
+    const allowCompaction = options.maxLineChars === undefined && !CODEX_JSONL_CUSTOM_LINE_LIMIT;
     const startByte = options.startByte ?? 0;
     const endByte = options.endByte;
     if (!Number.isSafeInteger(startByte) || startByte < 0 || (endByte !== undefined && (!Number.isSafeInteger(endByte) || endByte < startByte || endByte > (stat?.size ?? 0)))) {
@@ -350,7 +361,10 @@ async function forEachCodexJsonlLineAsync(
     const handle = await fs.promises.open(filePath, "r");
     const contentHash = options.expectedPrefixSha256 ? createHash("sha256") : undefined;
     const previousHash = options.previousPrefix ? createHash("sha256") : undefined;
-    let pending = "";
+    let pending: string[] = [];
+    let pendingChars = 0;
+    let pendingBytes = 0;
+    let pendingPrefix = "";
     let position = contentHash || previousHash || identityVerifier ? 0 : startByte;
     let lineOffset = startByte;
     let skippingOversizedLine = false;
@@ -376,9 +390,10 @@ async function forEachCodexJsonlLineAsync(
     const processLine = async (line: string, terminated: boolean) => {
         throwIfCancelled();
         const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
-        if (options.strict && line.length > maxLineChars) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+        const lineBytes = Buffer.byteLength(line, "utf8");
+        if (options.strict && ((lineBytes > CODEX_JSONL_DEFAULT_RECORD_BYTES && lineBytes > codexClientRecordByteLimit(line, allowCompaction)) || (!allowCompaction && line.length > maxLineChars))) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
         const byteOffset = lineOffset;
-        lineOffset += Buffer.byteLength(line, "utf8") + (terminated ? 1 : 0);
+        lineOffset += lineBytes + (terminated ? 1 : 0);
         if (trimmed.trim()) await onLine(trimmed, byteOffset);
         throwIfCancelled();
         await yieldAfterLine();
@@ -423,31 +438,44 @@ async function forEachCodexJsonlLineAsync(
                 skippedBytes = 0;
             }
 
-            pending += chunk;
-            let newlineIndex = pending.indexOf("\n");
-            while (newlineIndex >= 0) {
-                await processLine(pending.slice(0, newlineIndex), true);
-                pending = pending.slice(newlineIndex + 1);
-                newlineIndex = pending.indexOf("\n");
+            let offset = 0;
+            for (let newlineIndex = chunk.indexOf("\n"); newlineIndex >= 0; newlineIndex = chunk.indexOf("\n", offset)) {
+                const part = chunk.slice(offset, newlineIndex);
+                await processLine(pending.length ? pending.join("") + part : part, true);
+                pending = [];
+                pendingChars = 0;
+                pendingBytes = 0;
+                pendingPrefix = "";
+                offset = newlineIndex + 1;
             }
-
-            if (pending.length > maxLineChars) {
+            if (offset < chunk.length) {
+                const part = chunk.slice(offset);
+                pending.push(part);
+                pendingChars += part.length;
+                pendingBytes += Buffer.byteLength(part, "utf8");
+                if (pendingPrefix.length < 4096) pendingPrefix += part.slice(0, 4096 - pendingPrefix.length);
+            }
+            if ((pendingBytes > CODEX_JSONL_DEFAULT_RECORD_BYTES && pendingBytes > codexClientRecordByteLimit(pendingPrefix, allowCompaction)) || (!allowCompaction && pendingChars > maxLineChars)) {
+                if (options.strict) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
                 skippingOversizedLine = true;
-                skippedChars = pending.length;
-                skippedBytes = Buffer.byteLength(pending, "utf8");
-                pending = "";
+                skippedChars = pendingChars;
+                skippedBytes = pendingBytes;
+                pending = [];
+                pendingChars = 0;
+                pendingBytes = 0;
+                pendingPrefix = "";
             }
             await yieldAfterChunk();
         }
 
         if (endByte !== undefined && position !== endByte) throw new Error("Codex history source shortened during parsing");
         const tail = strictDecoder ? strictDecoder.decode() : decoder.end();
-        if (tail) pending += tail;
+        if (tail) { pending.push(tail); pendingChars += tail.length; }
         if (skippingOversizedLine) {
-            skippedChars += pending.length;
+            skippedChars += pendingChars;
             await options.onOversizedLine?.(skippedChars, true);
-        } else if (pending) {
-            await processLine(pending, false);
+        } else if (pending.length) {
+            await processLine(pending.join(""), false);
         }
         if (contentHash && contentHash.digest("hex") !== options.expectedPrefixSha256) throw new CodexHistorySourceMismatchError("Codex history content changed during parsing");
         identityVerifier?.finish();
@@ -941,6 +969,10 @@ export function resolveCodexThreadId(input: string): string | null {
         ? readThreadById(queryLower)
         : null;
     if (exactById) return exactById.id;
+    if (isLikelyCodexIdLookup(queryLower) && queryLower.length === 36) {
+        const matches = findRolloutThreadByIdLookup(queryLower);
+        return matches.length === 1 ? matches[0].id : null;
+    }
 
     if (isLikelyCodexIdLookup(queryLower)) {
         const sqlitePrefixMatches = readThreadsByIdPrefix(queryLower, 2);
@@ -973,6 +1005,10 @@ export async function resolveCodexThreadIdAsync(input: string): Promise<string |
         ? await readThreadByIdAsync(queryLower)
         : null;
     if (exactById) return exactById.id;
+    if (isLikelyCodexIdLookup(queryLower) && queryLower.length === 36) {
+        const matches = await findRolloutThreadByIdLookupAsync(queryLower);
+        return matches.length === 1 ? matches[0].id : null;
+    }
 
     if (isLikelyCodexIdLookup(queryLower)) {
         const sqlitePrefixMatches = await readThreadsByIdPrefixAsync(queryLower, 2);
@@ -997,6 +1033,13 @@ export async function resolveCodexThreadIdAsync(input: string): Promise<string |
 }
 
 export function getCodexThread(conversationId: string): CodexThreadInfo | null {
+    const exactId = conversationId.trim().toLowerCase();
+    if (isLikelyCodexIdLookup(exactId) && exactId.length === 36) {
+        const exact = readThreadById(exactId);
+        if (exact) return exact;
+        const matches = findRolloutThreadByIdLookup(exactId);
+        return matches.length === 1 ? matches[0] : null;
+    }
     const resolvedId = resolveCodexThreadId(conversationId);
     if (!resolvedId) return null;
     const exactById = readThreadById(resolvedId);
@@ -1009,6 +1052,13 @@ export function getCodexThread(conversationId: string): CodexThreadInfo | null {
 }
 
 export async function getCodexThreadAsync(conversationId: string): Promise<CodexThreadInfo | null> {
+    const exactId = conversationId.trim().toLowerCase();
+    if (isLikelyCodexIdLookup(exactId) && exactId.length === 36) {
+        const exact = await readThreadByIdAsync(exactId);
+        if (exact) return exact;
+        const matches = await findRolloutThreadByIdLookupAsync(exactId);
+        return matches.length === 1 ? matches[0] : null;
+    }
     const resolvedId = await resolveCodexThreadIdAsync(conversationId);
     if (!resolvedId) return null;
     const exactById = await readThreadByIdAsync(resolvedId);
@@ -1489,7 +1539,7 @@ function setCodexToolCallResult(
     overwrite = false,
 ): void {
     const resultFull = serializeCodexCacheValue(result);
-    if (overwrite || !toolCall.resultSummary) toolCall.resultSummary = truncate(serializeCodexCacheValue(summary), 500);
+    if (overwrite || !toolCall.resultSummary) toolCall.resultSummary = truncate(summary === result ? resultFull : serializeCodexCacheValue(summary), 500);
     if (overwrite || !toolCall.resultFull) toolCall.resultFull = resultFull;
 }
 
@@ -1620,7 +1670,8 @@ export function readRolloutEvents(rolloutPath: string, options: { endByte?: numb
     const processLine = (line: string) => {
         const trimmed = line.endsWith("\r") ? line.slice(0, -1) : line;
         if (!trimmed.trim()) return;
-        if (options.strict && trimmed.length > CODEX_JSONL_MAX_LINE_CHARS) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+        const lineBytes = Buffer.byteLength(line, "utf8");
+        if (options.strict && ((lineBytes > CODEX_JSONL_DEFAULT_RECORD_BYTES && lineBytes > codexClientRecordByteLimit(line, !CODEX_JSONL_CUSTOM_LINE_LIMIT)) || (CODEX_JSONL_CUSTOM_LINE_LIMIT && line.length > CODEX_JSONL_MAX_LINE_CHARS))) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
         let event: any;
         try {
             event = sanitizeCodexEvent(JSON.parse(trimmed.replace(/^\uFEFF/u, "")));
@@ -1628,6 +1679,7 @@ export function readRolloutEvents(rolloutPath: string, options: { endByte?: numb
             if (options.strict) throw new Error("Codex history contains invalid JSON");
             return;
         }
+        if (options.strict) assertCodexParsedRecordLimit(event, line);
         addEvent(event);
     };
 
@@ -1637,7 +1689,10 @@ export function readRolloutEvents(rolloutPath: string, options: { endByte?: numb
     const strictDecoder = options.strict ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }) : undefined;
     const contentHash = options.expectedPrefixSha256 ? createHash("sha256") : undefined;
     const buffer = Buffer.allocUnsafe(Math.max(64 * 1024, CODEX_JSONL_READ_CHUNK_BYTES));
-    let pending = "";
+    let pending: string[] = [];
+    let pendingChars = 0;
+    let pendingBytes = 0;
+    let pendingPrefix = "";
     let skippingOversizedLine = false;
     let skippedChars = 0;
     let bytesRemaining = options.endByte ?? Infinity;
@@ -1664,30 +1719,42 @@ export function readRolloutEvents(rolloutPath: string, options: { endByte?: numb
                 skippedChars = 0;
             }
 
-            pending += chunk;
-            let newlineIndex = pending.indexOf("\n");
-            while (newlineIndex >= 0) {
-                processLine(pending.slice(0, newlineIndex));
-                pending = pending.slice(newlineIndex + 1);
-                newlineIndex = pending.indexOf("\n");
+            let offset = 0;
+            for (let newlineIndex = chunk.indexOf("\n"); newlineIndex >= 0; newlineIndex = chunk.indexOf("\n", offset)) {
+                const part = chunk.slice(offset, newlineIndex);
+                processLine(pending.length ? pending.join("") + part : part);
+                pending = [];
+                pendingChars = 0;
+                pendingBytes = 0;
+                pendingPrefix = "";
+                offset = newlineIndex + 1;
             }
-
-            if (pending.length > CODEX_JSONL_MAX_LINE_CHARS) {
+            if (offset < chunk.length) {
+                const part = chunk.slice(offset);
+                pending.push(part);
+                pendingChars += part.length;
+                pendingBytes += Buffer.byteLength(part, "utf8");
+                if (pendingPrefix.length < 4096) pendingPrefix += part.slice(0, 4096 - pendingPrefix.length);
+            }
+            if ((pendingBytes > CODEX_JSONL_DEFAULT_RECORD_BYTES && pendingBytes > codexClientRecordByteLimit(pendingPrefix, !CODEX_JSONL_CUSTOM_LINE_LIMIT)) || (CODEX_JSONL_CUSTOM_LINE_LIMIT && pendingChars > CODEX_JSONL_MAX_LINE_CHARS)) {
                 if (options.strict) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
                 skippingOversizedLine = true;
-                skippedChars = pending.length;
-                pending = "";
+                skippedChars = pendingChars;
+                pending = [];
+                pendingChars = 0;
+                pendingBytes = 0;
+                pendingPrefix = "";
             }
         }
 
         if (options.endByte !== undefined && bytesRemaining !== 0) throw new Error("Codex history source shortened during parsing");
         const tail = strictDecoder ? strictDecoder.decode() : decoder.end();
-        if (tail) pending += tail;
+        if (tail) { pending.push(tail); pendingChars += tail.length; }
         if (skippingOversizedLine) {
-            skippedChars += pending.length;
+            skippedChars += pendingChars;
             addEvent(makeSkippedRolloutLineEvent("Codex rollout 尾部单行超过安全上限", skippedChars));
         } else {
-            processLine(pending);
+            processLine(pending.join(""));
         }
         if (contentHash && contentHash.digest("hex") !== options.expectedPrefixSha256) throw new CodexHistorySourceMismatchError("Codex history content changed during parsing");
         identityVerifier?.finish();
@@ -1705,7 +1772,9 @@ export async function readRolloutEventsAsync(rolloutPath: string): Promise<any[]
             await codexRolloutReadPathAsync(rolloutPath),
             (line) => {
                 try {
-                    events.push(sanitizeCodexEvent(JSON.parse(line)));
+                    const event = sanitizeCodexEvent(JSON.parse(line));
+                    assertCodexParsedRecordLimit(event, line);
+                    events.push(event);
                 } catch {
                 }
             },
@@ -2736,6 +2805,7 @@ class CodexRoundBuilder {
     private readonly toolCallMap = new Map<string, { round: ConversationRound; index: number }>();
     private currentRound: ConversationRound | null = null;
     private currentRoundHasModelOutput = false;
+    private currentRoundProjectionToolActivity = false;
     private roundIndex = 0;
     private syntheticStep = 0;
     private pendingThinking = "";
@@ -2766,6 +2836,7 @@ class CodexRoundBuilder {
             cwd?: string;
             onRound?: (round: ConversationRound) => void;
             retainRounds?: boolean;
+            bodyOnly?: boolean;
         },
     ) {}
 
@@ -3025,6 +3096,7 @@ class CodexRoundBuilder {
         }
         this.currentRound = null;
         this.currentRoundHasModelOutput = false;
+        this.currentRoundProjectionToolActivity = false;
         this.currentRoundStartByte = null;
         this.currentRoundStartOrdinal = undefined;
     }
@@ -3161,6 +3233,22 @@ class CodexRoundBuilder {
 
         const round = this.currentRound;
         if (!round) return;
+        if (this.options.bodyOnly) {
+            const reasoning = (type === "response_item" && payload.type === "reasoning") || (type === "event_msg" && payload.type === "agent_reasoning");
+            const call = type === "response_item" && (payload.type === "function_call" || payload.type === "custom_tool_call");
+            const result = type === "response_item" && (payload.type === "function_call_output" || payload.type === "custom_tool_call_output");
+            const completion = type === "event_msg" && (payload.type === "exec_command_end" || payload.type === "mcp_tool_call_end");
+            const patch = type === "event_msg" && payload.type === "patch_apply_end";
+            const item = type === "event_msg" && payload.type === "item_completed";
+            if (reasoning || call || result || completion || patch || item) {
+                if (!this.currentRoundProjectionToolActivity && (call || completion || (patch && Object.keys(payload.changes || {}).length > 0))) {
+                    (round.semanticEvents ||= []).push({ stepIndex: this.syntheticStep, semanticRole: "tool", kind: "body_projection_activity" });
+                    this.currentRoundProjectionToolActivity = true;
+                }
+                this.currentRoundHasModelOutput = true;
+                return;
+            }
+        }
         if (type === "response_item" && payload.type === "reasoning") {
             this.appendThinking(round, sanitizeCodexCacheText(extractReasoningText(payload)));
             this.recordSourceCheckpoint("thinking", round, sourceByte);
@@ -3338,7 +3426,7 @@ class CodexRoundEventCollector {
     private totalSteps = 0;
     private peakBufferedEvents = 0;
 
-    constructor(link: ConversationLinkMode, options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean }) {
+    constructor(link: ConversationLinkMode, options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean; bodyOnly?: boolean }) {
         this.builder = new CodexRoundBuilder(link, options);
     }
 
@@ -3387,6 +3475,15 @@ class CodexRoundEventCollector {
     }
 }
 
+export function createCodexRoundCollector(options: {
+    cwd?: string;
+    onRound?: (round: ConversationRound) => void;
+    retainRounds?: boolean;
+    bodyOnly?: boolean;
+} = {}): { addEvent(event: any, sourceByte?: number): void; finish(): CodexRoundBuildResult } {
+    return new CodexRoundEventCollector("summary", options);
+}
+
 function buildCodexRoundsFromEvents(events: any[], link: ConversationLinkMode, options: { cwd?: string } = {}): CodexRoundBuildResult {
     const collector = new CodexRoundEventCollector(link, options);
     for (const event of events) collector.addEvent(event);
@@ -3412,6 +3509,7 @@ async function forEachCodexHistoryEventAsync(
             } catch {
                 throw new Error(`Codex history contains invalid JSON at byte ${sourceByte}`);
             }
+            assertCodexParsedRecordLimit(event, line);
             validator.add(event);
             onEvent(event, isLeaf ? sourceByte : undefined);
         }, {
@@ -3480,6 +3578,7 @@ async function buildCodexRoundsFromRolloutAsync(
         retainRounds?: boolean;
         isCancelled?: () => boolean;
         strict?: boolean;
+        maxLineChars?: number;
         expectedPrefixSha256?: string;
         prefixIdentity?: CodexPrefixIdentity;
         previousPrefix?: { endByte: number; sha256: string };
@@ -3496,6 +3595,7 @@ async function buildCodexRoundsFromRolloutAsync(
                 if (options.strict) throw new Error(`Codex history contains invalid JSON at byte ${sourceByte}`);
                 return;
             }
+            if (options.strict) assertCodexParsedRecordLimit(event, line);
             options.ordinalValidator?.add(event);
             collector.addEvent(event, sourceByte);
         }, {
@@ -3510,6 +3610,7 @@ async function buildCodexRoundsFromRolloutAsync(
             },
             isCancelled: options.isCancelled,
             strict: options.strict,
+            maxLineChars: options.maxLineChars,
             expectedPrefixSha256: options.expectedPrefixSha256,
             prefixIdentity: options.prefixIdentity,
             previousPrefix: options.previousPrefix,
@@ -3532,7 +3633,7 @@ export function buildCodexRoundsForTest(
 export async function buildCodexRoundsFromRolloutForTest(
     rolloutPath: string,
     link: ConversationLinkMode,
-    options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean; isCancelled?: () => boolean } = {},
+    options: { cwd?: string; onRound?: (round: ConversationRound) => void; retainRounds?: boolean; isCancelled?: () => boolean; strict?: boolean; maxLineChars?: number } = {},
 ): Promise<CodexRoundBuildResult> {
     return buildCodexRoundsFromRolloutAsync(rolloutPath, link, options);
 }
@@ -3614,7 +3715,7 @@ function codexCheckpointAnchorSync(filePath: string, sourceSize: number): { anch
     }
 }
 
-function rebaseCodexRoundTail(rounds: ConversationRound[], roundIndexOffset: number, stepIndexOffset: number): void {
+export function rebaseCodexRoundTail(rounds: ConversationRound[], roundIndexOffset: number, stepIndexOffset: number): void {
     const stepCollections = ["aiResponses", "toolCalls", "taskBoundaries", "codeActions", "fileViews", "userMessages", "semanticEvents", "attachments"];
     for (const round of rounds) {
         round.roundIndex += roundIndexOffset;

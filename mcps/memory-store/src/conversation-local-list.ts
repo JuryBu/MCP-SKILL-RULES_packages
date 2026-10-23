@@ -11,6 +11,23 @@ export interface LocalPbConversationCandidate {
     files: number;
 }
 
+export interface ConversationDiscoveryDiagnostic {
+    code: string;
+    message: string;
+    sourceKind: string;
+    sourcePath?: string;
+    conversationId?: string;
+}
+
+export interface LocalPbDiscoveryOptions {
+    limit?: number;
+    query?: string;
+    conversationIds?: string[];
+    deadlineAt?: number;
+    isCancelled?: () => boolean;
+    onDiagnostic?: (diagnostic: ConversationDiscoveryDiagnostic) => void;
+}
+
 function rootsForHost(host: LocalPbSourceFlavor): Array<{ kind: "active" | "implicit"; root: string }> {
     const home = os.homedir();
     if (host === "windsurf") {
@@ -33,31 +50,53 @@ function safePbId(fileName: string): string | null {
 
 export function listLocalPbConversationCandidates(
     host: LocalPbSourceFlavor,
-    options: { limit?: number; query?: string } = {},
+    options: LocalPbDiscoveryOptions = {},
 ): LocalPbConversationCandidate[] {
     const merged = new Map<string, { kinds: Set<"active" | "implicit">; updatedAtMs: number; bytes: number; files: number }>();
     const query = (options.query || "").trim().toLowerCase();
+    const check = () => {
+        if (options.isCancelled?.()) throw new Error("PB discovery cancelled");
+        if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("PB_DISCOVERY_DEADLINE");
+    };
     for (const { kind, root } of rootsForHost(host)) {
-        if (!fs.existsSync(root)) continue;
-        const realRoot = fs.realpathSync(root);
-        for (const entry of fs.readdirSync(realRoot, { withFileTypes: true })) {
-            if (!entry.isFile()) continue;
-            const id = safePbId(entry.name);
-            if (!id || (query && !id.toLowerCase().includes(query))) continue;
-            const filePath = path.join(realRoot, entry.name);
-            const realFile = fs.realpathSync(filePath);
-            const relative = path.relative(realRoot, realFile);
-            if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
-            const stat = fs.lstatSync(realFile);
-            if (!stat.isFile()) continue;
-            const current = merged.get(id) || { kinds: new Set<"active" | "implicit">(), updatedAtMs: 0, bytes: 0, files: 0 };
-            current.kinds.add(kind);
-            current.updatedAtMs = Math.max(current.updatedAtMs, stat.mtimeMs);
-            current.bytes += stat.size;
-            current.files += 1;
-            merged.set(id, current);
-        }
+        let directory: fs.Dir | undefined;
+        try {
+            check();
+            if (!fs.existsSync(root)) continue;
+            const realRoot = fs.realpathSync(root);
+            directory = fs.opendirSync(realRoot);
+            for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+                check();
+                if (!entry.isFile()) continue;
+                const id = safePbId(entry.name);
+                if (!id || (query && !id.toLowerCase().includes(query)) || (options.conversationIds?.length && !options.conversationIds.includes(id))) continue;
+                try {
+                    const filePath = path.join(realRoot, entry.name);
+                    const realFile = fs.realpathSync(filePath);
+                    const relative = path.relative(realRoot, realFile);
+                    if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) continue;
+                    const stat = fs.lstatSync(realFile);
+                    if (!stat.isFile()) continue;
+                    const current = merged.get(id) || { kinds: new Set<"active" | "implicit">(), updatedAtMs: 0, bytes: 0, files: 0 };
+                    current.kinds.add(kind);
+                    current.updatedAtMs = Math.max(current.updatedAtMs, stat.mtimeMs);
+                    current.bytes += stat.size;
+                    current.files += 1;
+                    merged.set(id, current);
+                } catch (error) {
+                    if (!options.onDiagnostic) throw error;
+                    options.onDiagnostic({ code: "PB_FILE_DISCOVERY_FAILED", message: String(error), sourceKind: `${host}-pb`, sourcePath: root, conversationId: id });
+                }
+            }
+        } catch (error) {
+            if (options.isCancelled?.() || !options.onDiagnostic) throw error;
+            const deadline = error instanceof Error && error.message === "PB_DISCOVERY_DEADLINE";
+            options.onDiagnostic({ code: deadline ? "PB_DISCOVERY_DEADLINE" : "PB_DISCOVERY_FAILED", message: String(error), sourceKind: `${host}-pb`, sourcePath: root });
+            if (deadline) break;
+        } finally { directory?.closeSync(); }
     }
+    const limit = Math.min(Math.max(options.limit ?? 50, 0), 20_000);
+    if (merged.size > limit) options.onDiagnostic?.({ code: "PB_CANDIDATE_LIMIT", message: "PB metadata candidates exceeded the requested limit.", sourceKind: `${host}-pb` });
     return [...merged.entries()]
         .map(([id, value]) => ({
             id,
@@ -67,5 +106,5 @@ export function listLocalPbConversationCandidates(
             files: value.files,
         }))
         .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
-        .slice(0, Math.min(Math.max(options.limit || 50, 1), 20_000));
+        .slice(0, limit);
 }

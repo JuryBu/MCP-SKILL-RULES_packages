@@ -16,10 +16,11 @@ import {
     type RouterEndpoint,
 } from "./conversation-router.js";
 import { windsurfCascadeExistsLocally } from "./windsurf-local-store.js";
-import { isDevinStoreAvailable, listDevinConversations, resolveDevinConversation } from "./devin-sqlite.js";
+import { discoverDevinConversations, isDevinStoreAvailable, resolveDevinConversation } from "./devin-sqlite.js";
 import { readDevinConversation, splitDevinSubagentId, devinSubagentId } from "./devin-conversation.js";
 import { rememberDevinIdentity } from "./devin-identity.js";
-import type { DevinConversationSummary, DevinReadOptions } from "./devin-types.js";
+import type { DevinConversationSummary, DevinReadOptions, DevinDiscoveryOptions } from "./devin-types.js";
+import type { ConversationDiscoveryDiagnostic } from "./conversation-local-list.js";
 import type { ConversationLinkMode } from "./chain.js";
 import type { ConversationSourceFingerprint } from "./conversation-source-cache.js";
 import {
@@ -143,12 +144,21 @@ export interface WindsurfLsTransportDiagnostics {
 
 export interface WindsurfLsTransportCallOptions {
     timeoutMs?: number;
+    maxResponseBytes?: number;
     deadlineAt?: number;
     shouldCancel?: () => boolean;
     cancelMessage?: string;
     timeoutMessage?: string;
     requestClass?: ConcurrencyGateRequestClass;
     onConcurrencyEvent?: (diagnostics: WindsurfLsTransportDiagnostics) => void;
+}
+
+export type WindsurfDiscoveryOptions = DevinDiscoveryOptions & Pick<WindsurfLsTransportCallOptions, "requestClass" | "deadlineAt" | "shouldCancel">;
+
+export interface WindsurfDiscoveryResult {
+    conversations: WindsurfConversationSummary[];
+    partial: boolean;
+    diagnostics: ConversationDiscoveryDiagnostic[];
 }
 
 export type WindsurfLsTransport = (
@@ -439,10 +449,10 @@ function remainingTimeoutMs(deadlineAt: number, now = Date.now()): number {
 
 function normalizeWindsurfTransportError(method: string, error: unknown): Error {
     const message = error instanceof Error ? redactSensitive(error.message) : redactSensitive(String(error));
-    if (message.startsWith(`WSF LS ${method} failed:`)) {
-        return new Error(message);
-    }
-    return new Error(`WSF LS ${method} failed: ${message}`);
+    const normalized = new Error(message.startsWith(`WSF LS ${method} failed:`) ? message : `WSF LS ${method} failed: ${message}`);
+    const code = (error as { code?: unknown } | null)?.code;
+    if (typeof code === "string" && /^[A-Z0-9_]+$/u.test(code)) Object.assign(normalized, { code });
+    return normalized;
 }
 
 function isAbortLikeError(error: unknown): boolean {
@@ -1212,6 +1222,7 @@ export function windsurfSummaryFromDevin(summary: DevinConversationSummary): Win
         summary: summary.title, stepCount: 0, createdTime: summary.createdAt,
         lastModifiedTime: summary.updatedAt, cwd: summary.cwd, workspaceUris: summary.workspaceUris,
         sourceKind: summary.sourceKind, sourcePath: summary.sourcePath, partial: summary.partial,
+        discoveryWarnings: summary.warnings.length ? summary.warnings : undefined,
         isChildThread: summary.isChildThread, parentConversationId: summary.parentConversationId,
     };
 }
@@ -1302,6 +1313,7 @@ function createRawWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsT
         if (remainingMs <= 0) {
             throw new Error(options.timeoutMessage || "timed out before request started");
         }
+        if (options.maxResponseBytes !== undefined && (!Number.isSafeInteger(options.maxResponseBytes) || options.maxResponseBytes < 0)) throw new Error("WSF maxResponseBytes must be a non-negative safe integer");
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), remainingMs);
         timer.unref?.();
@@ -1326,7 +1338,26 @@ function createRawWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsT
                 body: JSON.stringify(payload),
                 signal: controller.signal,
             });
-            const text = await response.text();
+            let text: string;
+            if (options.maxResponseBytes === undefined) text = await response.text();
+            else {
+                const chunks: Uint8Array[] = [];
+                let bytes = 0;
+                const reader = response.body?.getReader();
+                try {
+                    while (reader) {
+                        const chunk = await reader.read();
+                        if (chunk.done) break;
+                        bytes += chunk.value.byteLength;
+                        if (bytes > options.maxResponseBytes) {
+                            controller.abort();
+                            throw Object.assign(new Error("WSF response exceeded its byte budget"), { code: "WSF_RESPONSE_BYTE_BUDGET" });
+                        }
+                        chunks.push(chunk.value);
+                    }
+                } finally { reader?.releaseLock(); }
+                text = Buffer.concat(chunks).toString("utf8");
+            }
             responseBodyComplete = true;
             if (!response.ok) {
                 reportOutcome({
@@ -1353,7 +1384,7 @@ function createRawWindsurfLsTransport(endpoint: WindsurfLsEndpoint): WindsurfLsT
             }
             reportOutcome({
                 success: false,
-                errorKind: fetchStarted && !responseBodyComplete ? "network" : "unknown",
+                errorKind: (error as { code?: string }).code !== "WSF_RESPONSE_BYTE_BUDGET" && fetchStarted && !responseBodyComplete ? "network" : "unknown",
             });
             throw error;
         } finally {
@@ -1448,7 +1479,7 @@ export function normalizeWindsurfTrajectoryList(response: unknown): WindsurfConv
 
 export async function listWindsurfConversations(
     transport: WindsurfLsTransport,
-    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass" | "deadlineAt" | "shouldCancel" | "maxResponseBytes"> = {},
 ): Promise<WindsurfConversationSummary[]> {
     return normalizeWindsurfTrajectoryList(await transport("GetAllCascadeTrajectories", {}, options));
 }
@@ -1497,16 +1528,23 @@ export function windsurfListContainsId(data: unknown, cascadeId: string): boolea
  */
 async function listLegacyWindsurfThreads(
     limit = 50,
-    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+    options: Pick<WindsurfLsTransportCallOptions, "requestClass" | "deadlineAt" | "shouldCancel" | "maxResponseBytes"> & { onDiagnostic?: (diagnostic: ConversationDiscoveryDiagnostic) => void } = {},
 ): Promise<WindsurfConversationSummary[]> {
+    if (options.shouldCancel?.()) throw new Error("WSF discovery cancelled");
+    if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("WSF discovery deadline exceeded");
     const endpoints = await getWindsurfEndpointPool();
+
+    if (options.shouldCancel?.()) throw new Error("WSF discovery cancelled");
+    if (options.deadlineAt !== undefined && Date.now() >= options.deadlineAt) throw new Error("WSF discovery deadline exceeded");
 
     const merged = new Map<string, WindsurfConversationSummary>();
     const lists = endpoints.length
         ? await Promise.all(endpoints.map(async ep => {
             try {
                 return await listWindsurfConversations(makeTransport(ep), options);
-            } catch {
+            } catch (error) {
+                if (options.shouldCancel?.()) throw error;
+                options.onDiagnostic?.({ code: (error as { code?: string }).code || "WSF_LS_DISCOVERY_FAILED", message: error instanceof Error ? error.message : String(error), sourceKind: "windsurf-ls" });
                 return [] as WindsurfConversationSummary[];
             }
         }))
@@ -1552,26 +1590,47 @@ async function listLegacyWindsurfThreads(
 
 export async function listRecentWindsurfThreads(
     limit = 50,
-    options: Pick<WindsurfLsTransportCallOptions, "requestClass"> = {},
+    options: WindsurfDiscoveryOptions = {},
 ): Promise<WindsurfConversationSummary[]> {
-    const legacy = await listLegacyWindsurfThreads(limit, options);
-    let devin;
-    try {
-        devin = await listDevinConversations();
-    } catch (error) {
-        if (!legacy.length) throw error;
-        return legacy.map(item => ({ ...item, discoveryWarnings: ["DEVIN_DISCOVERY_UNAVAILABLE: legacy candidates only"] }));
+    const result = await discoverWindsurfThreads(limit, options);
+    if (limit > 0 && !result.conversations.length && result.diagnostics.length) {
+        throw Object.assign(new Error(result.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`).join("; ")), { partial: true, diagnostics: result.diagnostics });
     }
+    return result.conversations.map(item => result.diagnostics.length
+        ? { ...item, discoveryWarnings: [...(item.discoveryWarnings || []), ...result.diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`)] }
+        : item);
+}
+
+export async function discoverWindsurfThreads(limit = 50, options: WindsurfDiscoveryOptions = {}): Promise<WindsurfDiscoveryResult> {
+    const diagnostics: ConversationDiscoveryDiagnostic[] = [];
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, options.deadlineMs ?? Date.now() + 12_000);
+    const isCancelled = () => Boolean(options.isCancelled?.() || options.shouldCancel?.() || options.signal?.aborted);
+    const [devin, legacy] = await Promise.all([
+        discoverDevinConversations({ ...options, limit, deadlineMs: deadlineAt, isCancelled }),
+        listLegacyWindsurfThreads(limit, { ...options, maxResponseBytes: options.maxBytes ?? 16 * 1024 * 1024, deadlineAt, shouldCancel: isCancelled, onDiagnostic: diagnostic => diagnostics.push(diagnostic) }).catch(error => {
+            if (isCancelled()) throw error;
+            diagnostics.push({ code: "WSF_LS_DISCOVERY_FAILED", message: String(error), sourceKind: "windsurf-ls" });
+            return [] as WindsurfConversationSummary[];
+        }),
+    ]);
+    if (isCancelled()) throw new Error("WSF discovery cancelled");
+    diagnostics.push(...devin.diagnostics);
     const merged = new Map(legacy.map(item => [item.id, item]));
-    for (const summary of devin) {
+    for (const summary of devin.conversations) {
         const item = windsurfSummaryFromDevin(summary);
-        if (merged.has(item.id)) throw new Error(`WSF conversation identity collides between Cascade and Devin: ${item.id}`);
+        if (merged.has(item.id)) {
+            merged.delete(item.id);
+            diagnostics.push({ code: "WSF_IDENTITY_COLLISION", message: `Cascade and Devin share an unverified identity: ${item.id}`, sourceKind: "windsurf", conversationId: item.id });
+            continue;
+        }
         merged.set(item.id, item);
     }
-    return [...merged.values()].sort((left, right) =>
+    if (merged.size > limit) diagnostics.push({ code: "WSF_CANDIDATE_LIMIT", message: "Combined WSF/Devin metadata candidates exceeded the requested limit.", sourceKind: "windsurf" });
+    const conversations = [...merged.values()].sort((left, right) =>
         (Date.parse(right.lastModifiedTime || right.createdTime || "") || 0)
         - (Date.parse(left.lastModifiedTime || left.createdTime || "") || 0),
     ).slice(0, Math.max(0, limit));
+    return { conversations, partial: devin.partial || diagnostics.length > 0, diagnostics };
 }
 
 export async function withLegacyWindsurfFallback<Result>(
@@ -1787,7 +1846,7 @@ export async function readWindsurfCascadeSteps(
         offset = nextOffsetFromResponse(response, offset, pageSteps.length);
     }
 
-    return { steps, pagesRead: seenOffsets.size, skippedSteps, partial: skippedSteps.length > 0 };
+    return { steps, pagesRead: seenOffsets.size, skippedSteps, partial: true };
 }
 
 export async function readWindsurfConversation(

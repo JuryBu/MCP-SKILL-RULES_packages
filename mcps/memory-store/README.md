@@ -1,4 +1,18 @@
-# MCP Memory Store v1.25.10
+# MCP Memory Store v1.26.0
+
+## 本地检索与分段就绪读取
+
+`conversation_read_original(action="search_all")` 在本地Codex对话正文中组合关键词，支持工作区、对话、角色范围，以及交集、并集和排除条件。返回持久任务，使用同一调用者 `conversationId` 与原 `taskId` 查询动态结果、取消或恢复；命中附带次数、轮次和来源版本，可继续 `read_hit` 定点读取。
+
+Codex的末N轮 `read_fast` 和适用的大型 `fetch` 默认先返回分段准备任务。独立使用 `prepare` 时，`conversationId` 表示调用者，`conversationIds` 指定一个目标；`buildOrder="latest"` 优先最新内容，`oldest` 优先最早内容，`lastRounds` 设置优先准备的轮数。`prepareCache=false` 只准备所需窗口；默认继续补齐完整缓存。
+
+有范围就绪后，即可用同一 `taskId` 执行 `read_ready`、`search_ready`、`locate_ready` 和 `extract_ready`，其余范围继续准备。`prepare_status` 返回真实覆盖、任务状态与不透明 `revision`；把它原样传入 `afterProgressRevision` 并设置 `waitSeconds=30`，可等待新结果。`prepare_cancel` 保留已发布范围，`prepare_resume` 在原worker退出后沿原task恢复。
+
+初期轮号属于各自块，配合 `blockId` 使用；稳定 `rangeRef` 可直接定位原轮，补齐旧历史或切换到完整轮号后仍有效。只有完整来源校验并发布结束，`fullSourceComplete` 才为true。搜索同时报告已查范围与暂计状态，调用者可逐次取得增长结果。常规Record、Guard和recall继续使用完整缓存。
+
+`conversation_golden_extract` 可以显式提供 `progressiveTaskId` 与 `rangeRefs`，只分析已选择的完整轮对象，结果保留来源与范围说明。省略这两个参数时沿用完整历史提取。将 `progressive=false` 可选择旧的完整读取路线；压缩来源的完整性校验、资源限额和取消保护保持有效。
+
+跨对话搜索默认逐项持久提交，完成队列与已校验索引复用减少重复工作。有界批量发布保留为内部可选策略，采用前应对实际数据验证收益和恢复结果。
 
 ## Record归属核查
 
@@ -252,6 +266,8 @@ v1.19.0 起，WSF `fetch` 强制刷新并写入 last-good cache，后续 `read/s
 
 ### 对话定位
 
+本机 Codex 的全库正文组合搜索、动态结果和指定轮次快读见[本地全文搜索与快速读取](docs/local-corpus-search.md)。`search_all` 使用一个可查询、取消和恢复的持久任务；`read_fast` 可直接取得所需正文，并行准备完整正文缓存。
+
 `conversation_read_original(action="list")` 可按标题、工作区路径、ID 片段、已有 Record 摘要和近期上下文指纹列出候选对话，适合只知道界面标题、短 ID 或当前对话片段但不知道完整 `conversationId` 的场景。Codex 链路支持唯一 ID 前缀解析，Record 的 read/edit/delete 也支持唯一短前缀。标题、ID、来源、工作区和主/子线程筛选走轻量元数据定位；`query` 中用空格分开的词会按“或”匹配候选，完整 ID/标题仍优先。正文片段检索仍应使用 `search` 或 `deep_locate`，避免把古老超长对话全量塞进同步 list。
 
 从 v1.13.0 起，Codex 链路的 `list(mode="auto")` 是快查入口；v1.14.0 起 Claude Code 也走同类快查：会查标题/ID/工作区、Record / reader index 轻量内容和最近尾部 `contextProbe`，但 query 未命中时不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 搜索。若 query 实际是古老正文片段，`list` 会明确提示需要后续 deep locate 后台深搜，而不是把快查拖到 60 秒 MCP 超时。Antigravity 链路保持旧的 auto 兼容行为；显式 `mode="smart"` 只在轻量候选材料上使用 smart，不做全库原文扫描。
@@ -263,6 +279,7 @@ v1.19.0 起，WSF `fetch` 强制刷新并写入 last-good cache，后续 `read/s
 ```text
 conversation_read_original(
   action="deep_locate",
+  conversationId="当前调用者的稳定ID",
   dataChain="codex|claude-code",
   query="某段正文片段",
   mode="exact|fuzzy",
@@ -270,7 +287,7 @@ conversation_read_original(
 )
 ```
 
-启动后用 `conversation_read_original(action="deep_locate_status", taskId="...", waitSeconds=30)` 轮询；需要中止时用 `conversation_read_original(action="deep_locate_cancel", taskId="...")`。deep locate 支持 Codex 与 Claude Code，默认后台、低并发、预算受控，不使用 smart 做全库召回；Windsurf 首版会明确返回 unsupported，不做 `.pb` 或大缓存扫描。
+启动后用 `conversation_read_original(action="deep_locate_status", conversationId="原调用者ID", taskId="...", waitSeconds=30)` 轮询；中止使用同一调用者和任务 ID 的 `deep_locate_cancel`。目标已知时可传 `conversationIds`，未知时省略。deep locate 对启用的来源做有预算的正文定位，返回候选、覆盖范围及来源诊断；需要完整本机 Codex 字面组合搜索时使用 `search_all`。
 
 Codex / Claude Code 链路的 `list` 额外支持 `contextProbe`：调用方可从当前可见对话截取 50-120 字有辨识度的上下文片段传入，工具会在最近本地 JSONL 中做 fixed-string 语义的硬匹配，并在候选列表中标记 `contextProbe` 命中项。Codex 命中子代理线程时会同时补标 parent/root 候选，且优先把可能的主线母线程排在子线程前；多个线程命中时只标记和排序，不自动选中或写入。Codex 可用 `MEMORY_STORE_CODEX_CONTEXT_PROBE_SCAN_LIMIT`、`MEMORY_STORE_CODEX_CONTEXT_PROBE_MAX_BYTES` 调整；Claude Code 可用 `MEMORY_STORE_CC_CONTEXT_PROBE_SCAN_LIMIT`、`MEMORY_STORE_CC_CONTEXT_PROBE_MAX_BYTES` 和 `MEMORY_STORE_CC_CONTEXT_PROBE_DEADLINE_MS` 调整。
 
@@ -313,7 +330,7 @@ Antigravity LS 模型默认值：`MEMORY_STORE_LS_MODEL` 未设置时使用 `MOD
 - 子线程索引缺失、rollout 文件缺失或解析失败时，会在“子代理线程诊断”里显式列出，不再静默跳过
 - Record、Guard、黄金片段提取等功能应明确区分主线程正文与外链附件
 
-## 11 个 MCP 工具
+## 13 个 MCP 工具
 
 | 工具 | 说明 |
 |------|------|

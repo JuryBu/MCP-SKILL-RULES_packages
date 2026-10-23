@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import * as zlib from "node:zlib";
 import { Decompress } from "fzstd";
-import { CodexHistorySourceMismatchError, throwIfCodexReadCancelled } from "./codex-history-integrity.js";
+import { CodexHistorySourceMismatchError, hashCodexPrefix, hashCodexPrefixSync, throwIfCodexReadCancelled } from "./codex-history-integrity.js";
 
 const CHUNK_BYTES = 64 * 1024;
 const FORMAT = "memory-store-codex-history-view-v1";
@@ -60,6 +60,8 @@ export interface CodexHistoryArchiveOptions {
     minFreeBytes?: number;
     isCancelled?: () => boolean;
     decoder?: "auto" | "fzstd";
+    streamChunkBytes?: number;
+    calculateLogicalSha256?: boolean;
 }
 
 export interface CodexHistoryArchiveView {
@@ -74,6 +76,90 @@ export interface CodexHistoryArchiveView {
     logicalSha256: string;
     rebuildable: true;
     cleanupCondition: string;
+}
+
+export interface CodexHistoryArchiveStreamIdentity {
+    sourceSha256: string;
+    logicalSha256?: string;
+    logicalSize: number;
+    decoder: "native" | "fzstd";
+}
+
+export async function* streamCodexHistoryArchive(
+    filePath: string,
+    options: CodexHistoryArchiveOptions & { onComplete?: (identity: CodexHistoryArchiveStreamIdentity) => void } = {},
+): AsyncGenerator<Buffer> {
+    throwIfCodexReadCancelled(options.isCancelled);
+    const streamChunkBytes = options.streamChunkBytes ?? 1024 * 1024;
+    if (!Number.isSafeInteger(streamChunkBytes) || streamChunkBytes < 16 * 1024 || streamChunkBytes > 4 * 1024 * 1024) throw new Error("Codex archive stream chunk size is outside its bounded range");
+    const sourcePath = path.resolve(filePath);
+    const limits = limitsFor(options);
+    const source = checkedSource(sourcePath, limits);
+    const input = fs.openSync(sourcePath, "r");
+    const physicalHash = crypto.createHash("sha256");
+    const logicalHash = options.calculateLogicalSha256 === false ? undefined : crypto.createHash("sha256");
+    const native = options.decoder !== "fzstd" && typeof zlib.createZstdDecompress === "function";
+    let logicalSize = 0;
+    try {
+        for (const frame of frames(input, source.size, limits, options.isCancelled)) {
+            let frameSize = 0;
+            const accept = (value: Buffer): Buffer => {
+                throwIfCodexReadCancelled(options.isCancelled);
+                logicalSize += value.length;
+                frameSize += value.length;
+                if (logicalSize > limits.logical) fail("exceeds the decompressed size limit");
+                logicalHash?.update(value);
+                return value;
+            };
+            if (frame.skippable) {
+                const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
+                for (let position = frame.start; position < frame.end;) {
+                    throwIfCodexReadCancelled(options.isCancelled);
+                    const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, frame.end - position), position);
+                    if (!count) fail("shortened during decompression");
+                    physicalHash.update(buffer.subarray(0, count));
+                    position += count;
+                }
+                continue;
+            }
+            if (native) {
+                const raw = fs.createReadStream(sourcePath, { start: frame.start, end: frame.end - 1, highWaterMark: streamChunkBytes });
+                const decoder = zlib.createZstdDecompress({ chunkSize: streamChunkBytes });
+                raw.on("data", value => physicalHash.update(value as Buffer));
+                raw.on("error", error => decoder.destroy(error));
+                raw.pipe(decoder);
+                try {
+                    for await (const chunk of decoder) yield accept(chunk as Buffer);
+                } finally { raw.destroy(); decoder.destroy(); }
+            } else {
+                const checksum = frame.checksum === undefined ? undefined : new Checksum64();
+                let output: Buffer[] = [];
+                const decoder = new Decompress(chunk => {
+                    const value = Buffer.from(chunk);
+                    checksum?.update(value);
+                    output.push(accept(value));
+                });
+                const buffer = Buffer.allocUnsafe(4 * 1024);
+                for (let position = frame.start; position < frame.end;) {
+                    throwIfCodexReadCancelled(options.isCancelled);
+                    const count = fs.readSync(input, buffer, 0, Math.min(buffer.length, frame.end - position), position);
+                    if (!count) fail("shortened during decompression");
+                    physicalHash.update(buffer.subarray(0, count));
+                    position += count;
+                    decoder.push(Buffer.from(buffer.subarray(0, count)), position === frame.end);
+                    for (const value of output) yield value;
+                    output = [];
+                    await new Promise<void>(resolve => setImmediate(resolve));
+                }
+                if (checksum && checksum.digest() !== frame.checksum) fail("zstd content checksum mismatch");
+            }
+            if (frame.contentSize !== undefined && frameSize !== frame.contentSize) fail("declared content size disagrees with decoded bytes");
+        }
+        const sourceSha256 = physicalHash.digest("hex");
+        if (!sameStat(source, regularFile(sourcePath)) || await fileHashAsync(sourcePath, options.isCancelled) !== sourceSha256) fail("changed during decompression");
+        throwIfCodexReadCancelled(options.isCancelled);
+        options.onComplete?.({ sourceSha256, logicalSha256: logicalHash?.digest("hex"), logicalSize, decoder: native ? "native" : "fzstd" });
+    } finally { fs.closeSync(input); }
 }
 
 interface Limits {
@@ -91,6 +177,11 @@ interface Frame {
     skippable?: boolean;
 }
 
+const FRAME_LAYOUT_SOURCE_LIMIT = 64;
+const FRAME_LAYOUT_RECORD_LIMIT = 4096;
+const frameLayouts = new Map<string, readonly Frame[]>();
+let frameLayoutRecords = 0;
+
 export class CodexHistoryArchiveLogicalLimitError extends CodexHistorySourceMismatchError {}
 
 function fail(message: string): never {
@@ -100,6 +191,10 @@ function fail(message: string): never {
 
 export function getCodexHistoryArchiveLogicalLimit(): number {
     return limitsFor({}).logical;
+}
+
+export function resolveCodexHistoryArchiveLimits(options: CodexHistoryArchiveOptions = {}): Readonly<Limits> {
+    return limitsFor(options);
 }
 
 function limitsFor(options: CodexHistoryArchiveOptions): Limits {
@@ -133,70 +228,114 @@ function regularFile(filePath: string): fs.Stats {
 }
 
 function fileHash(filePath: string, isCancelled?: () => boolean): string {
-    const descriptor = fs.openSync(filePath, "r");
-    const hash = crypto.createHash("sha256");
-    const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
-    try {
-        for (;;) {
-            throwIfCodexReadCancelled(isCancelled);
-            const count = fs.readSync(descriptor, buffer, 0, buffer.length, null);
-            if (!count) break;
-            hash.update(buffer.subarray(0, count));
-        }
-        return hash.digest("hex");
-    } finally { fs.closeSync(descriptor); }
+    throwIfCodexReadCancelled(isCancelled);
+    const digest = hashCodexPrefixSync(filePath, regularFile(filePath).size, undefined, isCancelled);
+    throwIfCodexReadCancelled(isCancelled);
+    return digest;
 }
 
 async function fileHashAsync(filePath: string, isCancelled?: () => boolean): Promise<string> {
-    const hash = crypto.createHash("sha256");
-    for await (const chunk of fs.createReadStream(filePath, { highWaterMark: CHUNK_BYTES })) {
-        throwIfCodexReadCancelled(isCancelled);
-        hash.update(chunk as Buffer);
-    }
-    throwIfCodexReadCancelled(isCancelled);
-    return hash.digest("hex");
+    return hashCodexPrefix(filePath, regularFile(filePath).size, isCancelled, undefined, "stream");
 }
 
-function readBytes(descriptor: number, position: number, count: number, size: number): Buffer {
-    if (position + count > size) fail("has an incomplete zstd frame");
-    const value = Buffer.alloc(count);
-    if (fs.readSync(descriptor, value, 0, count, position) !== count) fail("changed during frame inspection");
-    return value;
+function frameReader(descriptor: number, size: number): (position: number, count: number) => Buffer {
+    const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
+    let start = -1;
+    let bytes = 0;
+    return (position, count) => {
+        if (position + count > size) fail("has an incomplete zstd frame");
+        if (position < start || position + count > start + bytes) {
+            start = position;
+            bytes = fs.readSync(descriptor, buffer, 0, Math.min(buffer.length, size - position), position);
+            if (bytes < count) fail("changed during frame inspection");
+        }
+        return buffer.subarray(position - start, position - start + count);
+    };
+}
+
+function frameLayoutIdentity(descriptor: number, size: number): string {
+    const stats = fs.fstatSync(descriptor, { bigint: true });
+    if (!stats.isFile() || stats.size !== BigInt(size)) fail("changed during frame inspection");
+    return [stats.dev, stats.ino, stats.size, stats.mtimeNs, stats.ctimeNs, stats.birthtimeNs].join(":");
 }
 
 function* frames(descriptor: number, size: number, limits: Limits, isCancelled?: () => boolean): Generator<Frame> {
+    throwIfCodexReadCancelled(isCancelled);
+    const physical = frameLayoutIdentity(descriptor, size);
+    const key = `${physical}:${JSON.stringify(limits)}`;
+    let layout = frameLayouts.get(key);
+    if (layout) {
+        frameLayouts.delete(key);
+        frameLayouts.set(key, layout);
+    } else {
+        const inspected: Frame[] = [];
+        const iterator = inspectFrames(descriptor, size, limits, isCancelled);
+        for (const frame of iterator) {
+            if (inspected.length === FRAME_LAYOUT_RECORD_LIMIT) {
+                if (physical !== frameLayoutIdentity(descriptor, size)) fail("changed during frame inspection");
+                for (const prior of inspected) {
+                    throwIfCodexReadCancelled(isCancelled);
+                    yield prior;
+                }
+                throwIfCodexReadCancelled(isCancelled);
+                yield frame;
+                yield* iterator;
+                return;
+            }
+            inspected.push(frame);
+        }
+        throwIfCodexReadCancelled(isCancelled);
+        if (physical !== frameLayoutIdentity(descriptor, size)) fail("changed during frame inspection");
+        while (frameLayouts.size >= FRAME_LAYOUT_SOURCE_LIMIT || frameLayoutRecords + inspected.length > FRAME_LAYOUT_RECORD_LIMIT) {
+            const oldest = frameLayouts.keys().next().value!;
+            frameLayoutRecords -= frameLayouts.get(oldest)!.length;
+            frameLayouts.delete(oldest);
+        }
+        layout = inspected;
+        frameLayouts.set(key, layout);
+        frameLayoutRecords += layout.length;
+    }
+    if (physical !== frameLayoutIdentity(descriptor, size)) fail("changed before frame layout reuse");
+    for (const frame of layout) {
+        throwIfCodexReadCancelled(isCancelled);
+        yield frame;
+    }
+}
+
+function* inspectFrames(descriptor: number, size: number, limits: Limits, isCancelled?: () => boolean): Generator<Frame> {
     let position = 0;
     let frameCount = 0;
+    const readBytes = frameReader(descriptor, size);
     while (position < size) {
         throwIfCodexReadCancelled(isCancelled);
         if (++frameCount > 100000) fail("exceeds the frame count limit");
         const start = position;
-        const magic = readBytes(descriptor, position, 4, size).readUInt32LE();
+        const magic = readBytes(position, 4).readUInt32LE();
         position += 4;
         if ((magic & 0xfffffff0) === 0x184d2a50) {
-            const skipped = readBytes(descriptor, position, 4, size).readUInt32LE();
+            const skipped = readBytes(position, 4).readUInt32LE();
             position += 4 + skipped;
             if (position > size) fail("has an incomplete skippable frame");
             yield { start, end: position, skippable: true };
             continue;
         }
         if (magic !== 0xfd2fb528) fail("has invalid zstd magic or trailing data");
-        const flags = readBytes(descriptor, position++, 1, size)[0]!;
+        const flags = readBytes(position++, 1)[0]!;
         if (flags & 0x18) fail("has unsupported reserved zstd flags");
         const single = Boolean(flags & 0x20);
         let window = 0;
         if (!single) {
-            const descriptorByte = readBytes(descriptor, position++, 1, size)[0]!;
+            const descriptorByte = readBytes(position++, 1)[0]!;
             const windowBase = 2 ** (10 + (descriptorByte >> 3));
             window = windowBase + windowBase / 8 * (descriptorByte & 7);
         }
         const dictionaryBytes = [0, 1, 2, 4][flags & 3]!;
-        if (dictionaryBytes && readBytes(descriptor, position, dictionaryBytes, size).some(value => value !== 0)) fail("requires an unsupported zstd dictionary");
+        if (dictionaryBytes && readBytes(position, dictionaryBytes).some(value => value !== 0)) fail("requires an unsupported zstd dictionary");
         position += dictionaryBytes;
         const contentBytes = (flags >> 6) === 0 ? (single ? 1 : 0) : 2 ** (flags >> 6);
         let contentSize: number | undefined;
         if (contentBytes) {
-            const value = readBytes(descriptor, position, contentBytes, size);
+            const value = readBytes(position, contentBytes);
             const declared = contentBytes === 8 ? value.readBigUInt64LE() : BigInt(value.readUIntLE(0, contentBytes));
             if (declared > BigInt(limits.logical)) fail("exceeds the decompressed size limit");
             contentSize = Number(declared) + (contentBytes === 2 ? 256 : 0);
@@ -207,7 +346,7 @@ function* frames(descriptor: number, size: number, limits: Limits, isCancelled?:
         if (contentSize !== undefined && contentSize > limits.logical) fail("exceeds the decompressed size limit");
         for (;;) {
             throwIfCodexReadCancelled(isCancelled);
-            const block = readBytes(descriptor, position, 3, size).readUIntLE(0, 3);
+            const block = readBytes(position, 3).readUIntLE(0, 3);
             position += 3;
             const type = (block >> 1) & 3;
             const blockSize = block >> 3;
@@ -216,7 +355,7 @@ function* frames(descriptor: number, size: number, limits: Limits, isCancelled?:
             if (position > size) fail("has an incomplete zstd block");
             if (block & 1) break;
         }
-        const checksum = flags & 4 ? readBytes(descriptor, position, 4, size).readUInt32LE() : undefined;
+        const checksum = flags & 4 ? readBytes(position, 4).readUInt32LE() : undefined;
         if (checksum !== undefined) position += 4;
         yield { start, end: position, contentSize, checksum };
     }

@@ -201,13 +201,24 @@ try {
         assert.equal(toolLists.at(-1).contextProbe, marker);
     }
     assert.equal(toolLists[0].source, "local");
-    const background = await handler({ action: "deep_locate", dataChains: ["wsf", "dsh"], workspaces: [workspace], query: marker });
+    const missingOwner = await handler({ action: "deep_locate", dataChains: ["wsf", "dsh"], query: marker });
+    assert.match(missingOwner.content[0].text, /当前调用者/u);
+    const background = await handler({ action: "deep_locate", conversationId: "caller-a", dataChains: ["wsf", "dsh"], workspaces: [workspace], query: marker });
     const taskId = background.content[0].text.match(/taskId: ([^\s]+)/u)?.[1];
     assert.ok(taskId);
     await waitForBackgroundTask(taskId, 2);
     assert.equal(getBackgroundTask(taskId)?.status, "done");
     assert.deepEqual((getBackgroundTask(taskId)?.resumePayload as any).dataChains, ["windsurf", "dsh"]);
     assert.deepEqual((getBackgroundTask(taskId)?.resumePayload as any).workspaces, [workspace]);
+    assert.equal((getBackgroundTask(taskId)?.resumePayload as any).ownerConversationId, "caller-a");
+    assert.equal((getBackgroundTask(taskId)?.resumePayload as any).conversationIds, undefined, "caller identity must not become a target restriction");
+    const ownStatus = await handler({ action: "deep_locate_status", conversationId: "caller-a", taskId });
+    assert.match(ownStatus.content[0].text, new RegExp(taskId, "u"));
+    const foreignStatus = await handler({ action: "deep_locate_status", conversationId: "caller-b", taskId });
+    assert.match(foreignStatus.content[0].text, /另一调用者/u);
+    const foreignCancel = await handler({ action: "deep_locate_cancel", conversationId: "caller-b", taskId });
+    assert.match(foreignCancel.content[0].text, /另一调用者/u);
+    assert.equal(getBackgroundTask(taskId)?.status, "done");
 
     const { DatabaseSync } = await import("node:sqlite");
     const cli = new DatabaseSync(process.env.MEMORY_STORE_DEVIN_CLI_DB_PATH);

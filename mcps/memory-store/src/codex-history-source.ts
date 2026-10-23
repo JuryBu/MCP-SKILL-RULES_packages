@@ -3,8 +3,9 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { materializeCodexHistoryArchive, materializeCodexHistoryArchiveSync, type CodexHistoryArchiveOptions, type CodexHistoryArchiveView } from "./codex-history-archive.js";
-import { CodexHistorySourceMismatchError, hashCodexPrefix, hashCodexPrefixSync, throwIfCodexReadCancelled, type CodexOrdinalMode } from "./codex-history-integrity.js";
+import { materializeCodexHistoryArchive, materializeCodexHistoryArchiveSync, streamCodexHistoryArchive, type CodexHistoryArchiveOptions, type CodexHistoryArchiveView, type CodexHistoryArchiveStreamIdentity } from "./codex-history-archive.js";
+import { CodexHistorySourceMismatchError, CodexOrdinalValidator, hashCodexPrefix, hashCodexPrefixSync, throwIfCodexReadCancelled, type CodexOrdinalMode } from "./codex-history-integrity.js";
+import { codexJsonlRecordByteLimit, codexJsonlRecordExceedsLimit } from "./codex-jsonl-record-limit.js";
 export { CodexHistorySourceMismatchError } from "./codex-history-integrity.js";
 
 const MAX_HEADER_BYTES = 64 * 1024 * 1024;
@@ -57,6 +58,15 @@ export interface CodexHistorySource {
     segments: CodexHistorySegment[];
     revision: string;
     totalBytes: number;
+}
+
+const verifiedHistorySources = new WeakMap<CodexHistorySource, { revision: string; identities: Array<{ path: string; identity: string }> }>();
+
+async function historyValidationIdentities(source: { segments: Array<Pick<CodexHistorySegment, "path" | "readPath" | "replicas">> }): Promise<Array<{ path: string; identity: string }>> {
+    const paths = [...new Set(source.segments.flatMap(segment => [segment.path, ...(segment.readPath ? [segment.readPath] : []), ...(segment.replicas || []).flatMap(replica => [replica.path, ...(replica.archive ? [replica.archive.viewPath] : [])])]))].sort();
+    const identities = [];
+    for (const filePath of paths) identities.push({ path: filePath, identity: JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(filePath))) });
+    return identities;
 }
 
 export function parseCodexRolloutFilename(filePath: string): { threadId: string; rolloutId: string } | null {
@@ -143,6 +153,9 @@ interface LoadedRollout {
     mtimeMs: number;
     header: RolloutHeader;
 }
+
+const streamingHeaderCache = new Map<string, { header: RolloutHeader; physical: CodexHistoryPhysicalIdentity }>();
+let streamingHeaderCacheBytes = 0;
 
 function sha256(value: Buffer | string): string {
     return crypto.createHash("sha256").update(value).digest("hex");
@@ -385,7 +398,7 @@ function indexRootsSync(roots: string[], isCancelled?: () => boolean): Map<strin
     return index;
 }
 
-async function indexRoots(roots: string[], isCancelled?: () => boolean): Promise<Map<string, string[]>> {
+export async function indexCodexHistorySourcePaths(roots: string[], isCancelled?: () => boolean): Promise<Map<string, string[]>> {
     const index = new Map<string, string[]>();
     const add = (filePath: string) => {
         const parsed = parseCodexRolloutFilename(filePath);
@@ -411,6 +424,8 @@ async function indexRoots(roots: string[], isCancelled?: () => boolean): Promise
     for (const root of roots) await visit(root);
     return index;
 }
+
+const indexRoots = indexCodexHistorySourcePaths;
 
 function uniqueRoots(rolloutPath: string, roots?: string[]): string[] {
     const selectedRoots = roots === undefined ? [...defaultRoots(), path.dirname(rolloutPath)] : roots;
@@ -601,6 +616,7 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
     let index: Map<string, string[]> | undefined;
     const seen = new Set<string>();
     const reverseSegments: CodexHistorySegment[] = [];
+    const validatedIdentities: Array<{ path: string; identity: string }> = [];
     const archiveOptions = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
     let current = await selectRollout(await existingHistoryFilesAsync(requestedPath), archiveOptions, requestedPath);
     const leafPath = current.path;
@@ -612,7 +628,14 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         if (seen.has(currentKey)) throw new Error(`Circular Codex history_base reference for rollout: ${currentKey}`);
         seen.add(currentKey);
         const startOrdinal = current.header.historyBase?.endOrdinalExclusive || 0;
+        const proofSource = { segments: [{ path: current.path, readPath: current.readPath, replicas: current.replicas }] };
+        const before = options.metadataOnly ? [] : await historyValidationIdentities(proofSource);
         reverseSegments.push(await segmentFor(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined, options.isCancelled, options.metadataOnly));
+        if (!options.metadataOnly) {
+            const after = await historyValidationIdentities(proofSource);
+            if (JSON.stringify(before) !== JSON.stringify(after)) throw new CodexHistorySourceMismatchError("Codex history changed during source capture");
+            validatedIdentities.push(...after);
+        }
         const base = current.header.historyBase;
         if (!base || base.endByte === 0) break;
         index ??= await indexRoots(uniqueRoots(leafPath, options.roots), archiveOptions.isCancelled);
@@ -622,7 +645,11 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         currentEndByte = base.endByte;
         currentEndOrdinal = base.endOrdinalExclusive;
     }
-    return sourceFromSegments(leafPath, reverseSegments.reverse());
+    const source = sourceFromSegments(leafPath, reverseSegments.reverse());
+    if (!options.metadataOnly && JSON.stringify(await historyValidationIdentities(source)) === JSON.stringify([...new Map(validatedIdentities.map(entry => [entry.path, entry])).values()].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0))) {
+        verifiedHistorySources.set(source, { revision: source.revision, identities: await historyValidationIdentities(source) });
+    }
+    return source;
 }
 
 export function assertCodexHistoryManifest(source: CodexHistorySource): void {
@@ -678,7 +705,16 @@ export function assertCodexHistorySource(source: CodexHistorySource): void {
 }
 
 export async function assertCodexHistorySourceAsync(source: CodexHistorySource, isCancelled?: () => boolean): Promise<void> {
+    return assertCodexHistorySourceAttempt(source, isCancelled, 0);
+}
+
+async function assertCodexHistorySourceAttempt(source: CodexHistorySource, isCancelled: (() => boolean) | undefined, attempt: number): Promise<void> {
     assertCodexHistoryManifest(source);
+    throwIfCodexReadCancelled(isCancelled);
+    const identities = await historyValidationIdentities(source).catch(() => undefined);
+    throwIfCodexReadCancelled(isCancelled);
+    const previous = verifiedHistorySources.get(source);
+    if (identities && previous?.revision === source.revision && JSON.stringify(previous.identities) === JSON.stringify(identities)) return;
     for (const segment of source.segments) {
         throwIfCodexReadCancelled(isCancelled);
         const loaded = await load(segment.path, { ...archiveOptionsForSegment(segment), isCancelled });
@@ -704,6 +740,19 @@ export async function assertCodexHistorySourceAsync(source: CodexHistorySource, 
             if (current.size !== replica.size || await hashCodexPrefix(current.readPath, current.size, isCancelled) !== replica.sha256) throw new CodexHistorySourceMismatchError("Codex history replica changed");
         }
     }
+    const after = await historyValidationIdentities(source).catch(() => undefined);
+    if (identities && after && JSON.stringify(identities) !== JSON.stringify(after)) {
+        const leaf = source.segments.at(-1)!;
+        const beforeLeaf = identities.find(entry => entry.path === leaf.path);
+        const afterLeaf = after.find(entry => entry.path === leaf.path);
+        const otherPathsUnchanged = identities.length === after.length && identities.every(entry => entry.path === leaf.path || after.some(current => current.path === entry.path && current.identity === entry.identity));
+        if (attempt < 2 && !leaf.archive && !leaf.replicas?.length && otherPathsUnchanged && beforeLeaf && afterLeaf && plainAppend(JSON.parse(beforeLeaf.identity), JSON.parse(afterLeaf.identity))) {
+            return assertCodexHistorySourceAttempt(source, isCancelled, attempt + 1);
+        }
+        throw new CodexHistorySourceMismatchError("Codex history changed during source validation");
+    }
+    throwIfCodexReadCancelled(isCancelled);
+    if (after) verifiedHistorySources.set(source, { revision: source.revision, identities: after });
 }
 
 function archiveOptionsForSegment(segment: { archive?: CodexHistoryArchiveView }): CodexHistoryArchiveOptions | undefined {
@@ -713,4 +762,357 @@ function archiveOptionsForSegment(segment: { archive?: CodexHistoryArchiveView }
 
 function assertArchiveIdentity(expected?: CodexHistoryArchiveView, actual?: CodexHistoryArchiveView): void {
     if (JSON.stringify(expected && archiveIdentity(expected)) !== JSON.stringify(actual && archiveIdentity(actual))) throw new CodexHistorySourceMismatchError("Codex history physical archive changed");
+}
+
+export interface CodexHistoryPhysicalIdentity {
+    size: number;
+    mtimeMs: number;
+    ctimeMs: number;
+    birthtimeMs: number;
+    ino: number;
+    dev: number;
+}
+
+export interface CodexStreamingHistorySegment {
+    path: string;
+    replicas: string[];
+    rolloutId: string;
+    threadId: string;
+    startOrdinal: number;
+    endOrdinalExclusive?: number;
+    endByte?: number;
+    headerSha256: string;
+    ordinalMode: CodexOrdinalMode;
+    physical: CodexHistoryPhysicalIdentity;
+}
+
+export interface CodexStreamingHistorySource {
+    leafPath: string;
+    segments: CodexStreamingHistorySegment[];
+}
+
+export interface CodexStreamingHistoryPosition {
+    path: string;
+    startByte: number;
+    endByte: number;
+    ordinal: number;
+}
+
+export interface CodexStreamingHistoryVerification {
+    revision: string;
+    sourceBytes: number;
+    segments: Array<CodexStreamingHistorySegment & {
+        endByte: number;
+        prefixSha256: string;
+        physicalSha256?: string;
+        adoptedPrefixCache?: { generation: string; sourceRevision: string };
+        nextOrdinal: number;
+        replicaIdentities: Array<{ path: string; physical: CodexHistoryPhysicalIdentity; sha256: string }>;
+    }>;
+}
+
+export interface CodexStreamingPrefixProof {
+    path: string;
+    endByte: number;
+    sha256: string;
+    replicasVerified?: boolean;
+}
+
+function plainAppend(before: CodexHistoryPhysicalIdentity, after: CodexHistoryPhysicalIdentity): boolean {
+    return after.size > before.size && after.dev === before.dev && after.ino === before.ino && after.birthtimeMs === before.birthtimeMs;
+}
+
+export async function assertCodexStreamingRangeSource(source: CodexStreamingHistorySource, proofs: CodexStreamingPrefixProof[], isCancelled?: () => boolean, archive: CodexHistoryArchiveOptions = {}): Promise<void> {
+    for (const segment of source.segments) {
+        throwIfCodexReadCancelled(isCancelled);
+        const expected = [segment.path, ...segment.replicas].map(candidate => path.resolve(candidate).toLowerCase()).sort();
+        const currentPaths = [...new Set((await Promise.all([segment.path, ...segment.replicas].map(existingHistoryFilesAsync))).flat().map(candidate => path.resolve(candidate).toLowerCase()))].sort();
+        if (JSON.stringify(expected) !== JSON.stringify(currentPaths)) throw new CodexHistorySourceMismatchError("Codex history replica set changed during fast range read");
+        const current = codexHistoryPhysicalIdentity(await fsPromises.stat(segment.path));
+        const proof = proofs.find(candidate => candidate.path === segment.path);
+        if (JSON.stringify(current) !== JSON.stringify(segment.physical)) {
+            if (/\.zst$/iu.test(segment.path) || !plainAppend(segment.physical, current) || sha256(await readFirstLine(segment.path)) !== segment.headerSha256) throw new CodexHistorySourceMismatchError("Codex history changed during fast range read");
+            if (proof && await hashCodexPrefix(segment.path, proof.endByte, isCancelled) !== proof.sha256) throw new CodexHistorySourceMismatchError("Codex history prefix changed during fast range read");
+        }
+        if (!proof || proof.replicasVerified) continue;
+        for (const replica of segment.replicas) {
+            const before = codexHistoryPhysicalIdentity(await fsPromises.stat(replica));
+            const hash = crypto.createHash("sha256");
+            let bytes = 0;
+            for await (const chunk of streamingHistoryBytes(replica, before, { ...archive, isCancelled: () => Boolean(isCancelled?.() || archive.isCancelled?.()), plainEndByte: proof.endByte })) {
+                const selected = chunk.subarray(0, proof.endByte - bytes);
+                hash.update(selected);
+                bytes += selected.length;
+                if (bytes === proof.endByte) break;
+            }
+            if (bytes !== proof.endByte || hash.digest("hex") !== proof.sha256 || JSON.stringify(before) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(replica)))) throw new CodexHistorySourceMismatchError("Conflicting plaintext/compressed Codex history replicas in requested range");
+        }
+    }
+}
+
+export function codexHistoryPhysicalIdentity(stats: fs.Stats): CodexHistoryPhysicalIdentity {
+    if (!stats.isFile()) throw new CodexHistorySourceMismatchError("Codex history requires a regular file");
+    return { size: stats.size, mtimeMs: stats.mtimeMs, ctimeMs: stats.ctimeMs, birthtimeMs: stats.birthtimeMs, ino: stats.ino, dev: stats.dev };
+}
+
+async function* streamingHistoryBytes(filePath: string, physical: CodexHistoryPhysicalIdentity, options: CodexHistoryArchiveOptions & { onComplete?: (identity: CodexHistoryArchiveStreamIdentity) => void; plainEndByte?: number }): AsyncGenerator<Buffer> {
+    if (/\.zst$/iu.test(filePath)) {
+        yield* streamCodexHistoryArchive(filePath, { ...options, calculateLogicalSha256: false });
+        return;
+    }
+    const endByte = Math.min(physical.size, options.plainEndByte ?? physical.size);
+    if (endByte === 0) return;
+    const input = fs.createReadStream(filePath, { start: 0, end: endByte - 1, highWaterMark: 1024 * 1024 });
+    try {
+        for await (const chunk of input) {
+            throwIfCodexReadCancelled(options.isCancelled);
+            yield chunk as Buffer;
+        }
+    } finally { input.destroy(); }
+}
+
+async function streamingHeader(filePath: string, options: CodexHistoryArchiveOptions): Promise<{ header: RolloutHeader; physical: CodexHistoryPhysicalIdentity }> {
+    options = { ...options, streamChunkBytes: 64 * 1024 };
+    throwIfCodexReadCancelled(options.isCancelled);
+    const physical = codexHistoryPhysicalIdentity(await fsPromises.stat(filePath));
+    const previous = streamingHeaderCache.get(filePath);
+    if (previous && JSON.stringify(previous.physical) === JSON.stringify(physical)) return previous;
+    if (previous) { streamingHeaderCacheBytes -= previous.header.header.length; streamingHeaderCache.delete(filePath); }
+    const remember = (header: RolloutHeader) => {
+        const entry = { header, physical };
+        if (header.header.length <= 1024 * 1024) {
+            while (streamingHeaderCacheBytes + header.header.length > 8 * 1024 * 1024 || streamingHeaderCache.size >= 128) {
+                const oldest = streamingHeaderCache.entries().next().value;
+                if (!oldest) break;
+                streamingHeaderCacheBytes -= oldest[1].header.header.length;
+                streamingHeaderCache.delete(oldest[0]);
+            }
+            streamingHeaderCache.set(filePath, entry);
+            streamingHeaderCacheBytes += header.header.length;
+        }
+        return entry;
+    };
+    if (!/\.zst$/iu.test(filePath)) return remember(parseHeader(filePath, await readFirstLine(filePath)));
+    const chunks: Buffer[] = [];
+    let bytes = 0;
+    for await (const chunk of streamingHistoryBytes(filePath, physical, options)) {
+        const newline = chunk.indexOf(0x0a);
+        const selected = newline < 0 ? chunk : chunk.subarray(0, newline);
+        chunks.push(selected);
+        bytes += selected.length;
+        if (bytes > MAX_HEADER_BYTES) throw new Error("Codex session header exceeds the safe read limit");
+        if (newline >= 0) return remember(parseHeader(filePath, Buffer.concat(chunks)));
+    }
+    throw new Error("Codex compressed history has no complete session header");
+}
+
+export async function readCodexStreamingSessionMeta(filePath: string, options: CodexHistoryArchiveOptions = {}): Promise<Record<string, unknown>> {
+    const sourcePath = await resolveCodexHistoryFilePathAsync(filePath);
+    const { header } = await streamingHeader(sourcePath, options);
+    return JSON.parse(header.header.toString("utf8").replace(/^\uFEFF/u, "")).payload;
+}
+
+export async function resolveCodexStreamingHistorySource(
+    rolloutPath: string,
+    options: { roots?: string[]; pathsByRolloutId?: Map<string, string[]>; archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean } = {},
+): Promise<CodexStreamingHistorySource> {
+    const archive = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
+    const requestedPath = normalizeCodexHistoryPath(rolloutPath);
+    let index = options.pathsByRolloutId ?? await indexRoots(uniqueRoots(requestedPath, options.roots), archive.isCancelled);
+    const requestedIdentity = parseCodexRolloutFilename(requestedPath);
+    let matches = [...new Set([...await existingHistoryFilesAsync(requestedPath), ...(requestedIdentity ? index.get(requestedIdentity.rolloutId) || [] : [])])];
+    const seen = new Set<string>();
+    const reverse: CodexStreamingHistorySegment[] = [];
+    let endByte: number | undefined;
+    let endOrdinalExclusive: number | undefined;
+    let leafPath = "";
+    for (;;) {
+        throwIfCodexReadCancelled(archive.isCancelled);
+        const currentMatches = await Promise.all(matches.map(async candidate => {
+            try { return await existingHistoryFilesAsync(candidate); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+        }));
+        matches = [...new Set(currentMatches.flat())];
+        assertReplicaPair(matches);
+        const selectedPath = matches.includes(requestedPath) ? requestedPath : [...matches].sort((left, right) => Number(/\.zst$/iu.test(left)) - Number(/\.zst$/iu.test(right)) || left.localeCompare(right))[0]!;
+        const { header, physical } = await streamingHeader(selectedPath, archive);
+        if (!leafPath) leafPath = selectedPath;
+        if (seen.has(header.identity.rolloutId)) throw new Error("Circular Codex history_base reference");
+        seen.add(header.identity.rolloutId);
+        reverse.push({ path: selectedPath, replicas: matches.filter(candidate => candidate !== selectedPath), ...header.identity, startOrdinal: header.historyBase?.endOrdinalExclusive || 0, endOrdinalExclusive, endByte, headerSha256: sha256(header.header), ordinalMode: header.ordinalMode, physical });
+        const base = header.historyBase;
+        if (!base || base.endByte === 0) break;
+        index ??= await indexRoots(uniqueRoots(leafPath, options.roots), archive.isCancelled);
+        matches = [...new Set(index.get(base.rolloutId) || [])];
+        if (!matches.length && options.pathsByRolloutId) {
+            index = await indexRoots(uniqueRoots(leafPath, options.roots), archive.isCancelled);
+            for (const [rolloutId, paths] of index) options.pathsByRolloutId.set(rolloutId, paths);
+            matches = [...new Set(index.get(base.rolloutId) || [])];
+        }
+        if (!matches.length) throw new Error(`Missing Codex history_base rollout: ${base.rolloutId}`);
+        endByte = base.endByte;
+        endOrdinalExclusive = base.endOrdinalExclusive;
+    }
+    return { leafPath, segments: reverse.reverse() };
+}
+
+export async function scanCodexStreamingHistory(
+    source: CodexStreamingHistorySource,
+    onEvent: (event: any, position: CodexStreamingHistoryPosition) => void | Promise<void>,
+    options: { archive?: CodexHistoryArchiveOptions; isCancelled?: () => boolean; onProgress?: (bytes: number) => void; replayFrom?: CodexStreamingHistoryPosition; previousVerification?: CodexStreamingHistoryVerification; onPrefixProof?: (proof: CodexStreamingPrefixProof) => void } = {},
+): Promise<CodexStreamingHistoryVerification> {
+    const verified: CodexStreamingHistoryVerification["segments"] = [];
+    const archive = { ...options.archive, isCancelled: options.isCancelled ?? options.archive?.isCancelled };
+    let previousMode: CodexOrdinalMode | undefined;
+    let nextOrdinal = 0;
+    let sourceBytes = 0;
+    const utf8 = new TextDecoder("utf-8", { fatal: true });
+    for (const segment of source.segments) {
+        throwIfCodexReadCancelled(archive.isCancelled);
+        if (segment.startOrdinal !== nextOrdinal) throw new CodexHistorySourceMismatchError("Codex history prefix ordinal mismatch");
+        const currentPhysical = codexHistoryPhysicalIdentity(await fsPromises.stat(segment.path));
+        if (JSON.stringify(currentPhysical) !== JSON.stringify(segment.physical) && (/\.zst$/iu.test(segment.path) || !plainAppend(segment.physical, currentPhysical) || sha256(await readFirstLine(segment.path)) !== segment.headerSha256)) throw new CodexHistorySourceMismatchError("Codex history changed after discovery");
+        const previous = options.previousVerification?.segments.find(candidate => candidate.path === segment.path);
+        const replay = options.replayFrom?.path === segment.path ? options.replayFrom : undefined;
+        if (options.replayFrom && !replay && previous && previous.endByte === segment.endByte && previous.endOrdinalExclusive === segment.endOrdinalExclusive && previous.headerSha256 === segment.headerSha256 && JSON.stringify(previous.physical) === JSON.stringify(segment.physical)) {
+            const replicaPaths = (replicas: string[]) => replicas.map(replica => normalizeCodexHistoryPath(replica).replace(/\\/gu, "/").toLowerCase()).sort();
+            if (JSON.stringify(replicaPaths(segment.replicas)) !== JSON.stringify(replicaPaths(previous.replicaIdentities.map(replica => replica.path)))) throw new CodexHistorySourceMismatchError("Codex history replica inventory changed before incremental replay");
+            for (const replica of previous.replicaIdentities) {
+                if (JSON.stringify(replica.physical) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(replica.path)))) throw new CodexHistorySourceMismatchError("Codex history replica changed before incremental replay");
+            }
+            verified.push(previous);
+            nextOrdinal = previous.nextOrdinal;
+            previousMode = previous.ordinalMode;
+            continue;
+        }
+        if (options.replayFrom && !replay) throw new CodexHistorySourceMismatchError("Codex incremental replay requires unchanged adopted prefixes");
+        const validator = new CodexOrdinalValidator(replay?.ordinal ?? segment.startOrdinal, segment.ordinalMode, previousMode);
+        const contentHash = crypto.createHash("sha256");
+        const previousPrefixHash = replay && previous ? crypto.createHash("sha256") : undefined;
+        const compressed = /\.zst$/iu.test(segment.path);
+        const logicalHash = segment.replicas.length ? crypto.createHash("sha256") : undefined;
+        const physicalHash = compressed ? undefined : crypto.createHash("sha256");
+        let archivePhysicalSha256 = "";
+        let pending: Buffer[] = [];
+        let pendingBytes = 0;
+        let pendingPrefix = Buffer.alloc(0);
+        let position = 0;
+        let consumed = 0;
+        let adopted = 0;
+        let first = true;
+        const emit = (raw: Buffer, terminated: boolean): boolean | Promise<boolean> => {
+            throwIfCodexReadCancelled(archive.isCancelled);
+            const end = position + raw.length;
+            const line = raw.subarray(0, raw.length - (terminated ? 1 : 0));
+            if ((first && line.length > MAX_HEADER_BYTES) || codexJsonlRecordExceedsLimit(line)) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+            if (first) {
+                if (sha256(line) !== segment.headerSha256) throw new CodexHistorySourceMismatchError("Codex history header changed during parsing");
+                first = false;
+            }
+            if (replay && position < replay.startByte) {
+                if (end > replay.startByte) throw new CodexHistorySourceMismatchError("Codex replay byte is not a record boundary");
+                contentHash.update(raw);
+                position = end;
+                adopted = end;
+                return true;
+            }
+            let event: any;
+            try { event = JSON.parse(utf8.decode(line).replace(/^\uFEFF/u, "")); }
+            catch (error) {
+                if (!terminated && segment.endByte === undefined) return false;
+                throw new CodexHistorySourceMismatchError(`Invalid Codex history JSON at byte ${position}: ${String(error)}`);
+            }
+            if (line.length > MAX_HEADER_BYTES && event?.type !== "compacted") throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+            const ordinal = validator.nextOrdinal;
+            validator.add(event);
+            contentHash.update(raw);
+            try {
+                const completion = onEvent(event, { path: segment.path, startByte: position, endByte: end, ordinal: typeof event.ordinal === "number" ? event.ordinal : ordinal });
+                if (completion && typeof completion.then === "function") return Promise.resolve(completion).then(() => {
+                    throwIfCodexReadCancelled(archive.isCancelled);
+                    position = end;
+                    adopted = end;
+                    return true;
+                }, error => { options.onPrefixProof?.({ path: segment.path, endByte: end, sha256: contentHash.copy().digest("hex") }); throw error; });
+            }
+            catch (error) { options.onPrefixProof?.({ path: segment.path, endByte: end, sha256: contentHash.copy().digest("hex") }); throw error; }
+            position = end;
+            adopted = end;
+            return true;
+        };
+        const plainEndByte = !segment.replicas.length ? segment.endByte : undefined;
+        for await (const raw of streamingHistoryBytes(segment.path, segment.physical, { ...archive, plainEndByte, onComplete: identity => { archivePhysicalSha256 = identity.sourceSha256; } })) {
+            sourceBytes += raw.length;
+            options.onProgress?.(sourceBytes);
+            logicalHash?.update(raw);
+            physicalHash?.update(raw);
+            let selected = segment.endByte === undefined ? raw : raw.subarray(0, Math.max(0, Math.min(raw.length, segment.endByte - consumed)));
+            if (previousPrefixHash && previous && consumed < previous.endByte) previousPrefixHash.update(raw.subarray(0, Math.min(raw.length, previous.endByte - consumed)));
+            consumed += raw.length;
+            if (replay && !first && position < replay.startByte) {
+                if (pendingBytes) {
+                    if (position + pendingBytes > replay.startByte) throw new CodexHistorySourceMismatchError("Codex replay byte is not a record boundary");
+                    for (const part of pending) contentHash.update(part);
+                    position += pendingBytes;
+                    pending = [];
+                    pendingBytes = 0;
+                    pendingPrefix = Buffer.alloc(0);
+                }
+                const skipped = Math.min(selected.length, replay.startByte - position);
+                contentHash.update(selected.subarray(0, skipped));
+                position += skipped;
+                adopted = position;
+                if (position === replay.startByte && skipped > 0 && selected[skipped - 1] !== 0x0a) throw new CodexHistorySourceMismatchError("Codex replay byte is not a record boundary");
+                selected = selected.subarray(skipped);
+            }
+            let offset = 0;
+            for (let newline = selected.indexOf(0x0a); newline >= 0; newline = selected.indexOf(0x0a, offset)) {
+                const part = selected.subarray(offset, newline + 1);
+                const line = pending.length ? Buffer.concat([...pending, part], pendingBytes + part.length) : part;
+                const completion = emit(line, true);
+                if (typeof completion !== "boolean") await completion;
+                pending = [];
+                pendingBytes = 0;
+                pendingPrefix = Buffer.alloc(0);
+                offset = newline + 1;
+            }
+            if (offset < selected.length) {
+                const part = selected.subarray(offset);
+                pending.push(Buffer.from(part));
+                pendingBytes += selected.length - offset;
+                if (pendingPrefix.length < 4096) pendingPrefix = Buffer.concat([pendingPrefix, part.subarray(0, 4096 - pendingPrefix.length)]);
+                if (pendingBytes > MAX_HEADER_BYTES && (first || pendingBytes > codexJsonlRecordByteLimit(pendingPrefix))) throw new Error("Codex history contains a JSONL line exceeding the safe read limit");
+            }
+        }
+        if (pendingBytes && segment.endByte !== undefined) throw new CodexHistorySourceMismatchError("Codex history adopted prefix is not a complete line");
+        if (pendingBytes) {
+            const completion = emit(Buffer.concat(pending, pendingBytes), false);
+            if (typeof completion !== "boolean") await completion;
+        }
+        if (segment.endByte !== undefined && adopted !== segment.endByte) throw new CodexHistorySourceMismatchError("Codex history byte boundary exceeds source size");
+        if (previousPrefixHash && previousPrefixHash.digest("hex") !== previous!.prefixSha256) throw new CodexHistorySourceMismatchError("Codex cached prefix changed during incremental replay");
+        validator.finish(segment.endOrdinalExclusive);
+        nextOrdinal = validator.nextOrdinal;
+        previousMode = validator.mode ?? previousMode;
+        const physicalSha256 = compressed ? archivePhysicalSha256 : physicalHash!.digest("hex");
+        const after = codexHistoryPhysicalIdentity(await fsPromises.stat(segment.path));
+        if (JSON.stringify(after) !== JSON.stringify(segment.physical)) {
+            const appended = !/\.zst$/iu.test(segment.path) && plainAppend(segment.physical, after);
+            if (!appended || await hashCodexPrefix(segment.path, Math.min(segment.physical.size, plainEndByte ?? segment.physical.size), archive.isCancelled) !== physicalSha256) throw new CodexHistorySourceMismatchError("Codex history changed during parsing");
+        }
+        const fullHash = logicalHash?.digest("hex");
+        const replicaIdentities: CodexStreamingHistoryVerification["segments"][number]["replicaIdentities"] = [];
+        for (const replica of segment.replicas) {
+            const physical = codexHistoryPhysicalIdentity(await fsPromises.stat(replica));
+            const hash = crypto.createHash("sha256");
+            for await (const chunk of streamingHistoryBytes(replica, physical, archive)) hash.update(chunk);
+            if (hash.digest("hex") !== fullHash || JSON.stringify(physical) !== JSON.stringify(codexHistoryPhysicalIdentity(await fsPromises.stat(replica)))) throw new CodexHistorySourceMismatchError("Conflicting plaintext/compressed Codex history replicas");
+            replicaIdentities.push({ path: replica, physical, sha256: await hashCodexPrefix(replica, physical.size, archive.isCancelled) });
+        }
+        const prefixSha256 = contentHash.digest("hex");
+        verified.push({ ...segment, endByte: adopted, prefixSha256, physicalSha256, nextOrdinal, replicaIdentities });
+        options.onPrefixProof?.({ path: segment.path, endByte: adopted, sha256: prefixSha256, replicasVerified: true });
+    }
+    throwIfCodexReadCancelled(archive.isCancelled);
+    return { revision: sha256(JSON.stringify(verified)), sourceBytes, segments: verified };
 }

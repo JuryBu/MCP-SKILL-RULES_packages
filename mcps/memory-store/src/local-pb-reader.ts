@@ -11,7 +11,10 @@ export type LocalPbErrorCode =
     | "TRUNCATED"
     | "MALFORMED_WIRE"
     | "UNSAFE_VARINT"
-    | "PAYLOAD_TOO_LARGE";
+    | "PAYLOAD_TOO_LARGE"
+    | "INVALID_RANGE"
+    | "CANCELLED"
+    | "DEADLINE_EXCEEDED";
 
 export class LocalPbReaderError extends Error {
     constructor(
@@ -34,6 +37,23 @@ export interface LocalPbReaderOptions {
     sourceFlavor: LocalPbSourceFlavor;
     /** Upper bound after authenticated decryption, default 64 MiB. */
     maxPayloadBytes?: number;
+    stepRange?: LocalPbStepRangeRequest;
+    signal?: AbortSignal;
+    isCancelled?: () => boolean;
+    deadlineMs?: number;
+}
+
+export type LocalPbStepRangeRequest =
+    | { startStep: number; endStepExclusive?: number }
+    | { tailSteps: number };
+
+export interface LocalPbStepCoverage {
+    unit: "step";
+    startStep: number;
+    endStepExclusive: number;
+    totalSteps: number;
+    complete: boolean;
+    encryptedEnvelopeVerified: true;
 }
 
 export interface LocalPbCandidate {
@@ -75,6 +95,21 @@ export interface LocalPbToolVariant {
     rawSubfields: LocalPbWireSummary[];
 }
 
+export interface LocalPbActivity {
+    kind: "file_context" | "file_change" | "terminal_command" | "terminal_output";
+    sourceFlavor: LocalPbSourceFlavor;
+    fieldNumber: 10 | 14 | 28 | 37;
+    uri?: string;
+    cwd?: string;
+    terminalId?: string;
+    textFields: Array<{ fieldPath: string; text: string }>;
+    lineSequence?: {
+        fieldPath: string;
+        lines: Array<{ text?: string; rawFlag?: string }>;
+    };
+    rawSubfields: LocalPbWireSummary[];
+}
+
 export interface LocalPbDiagnostic {
     kind: "checkpoint" | "partial" | "unknown_variant";
     message: string;
@@ -88,6 +123,7 @@ export interface LocalPbStep {
     user?: string;
     planner?: LocalPbPlannerResponse;
     system?: string;
+    activities?: LocalPbActivity[];
     toolVariants: LocalPbToolVariant[];
     diagnostics: LocalPbDiagnostic[];
 }
@@ -105,6 +141,8 @@ export interface LocalPbReadResult {
     decryptedBytes: number;
     trajectory: LocalPbTrajectory;
     diagnostics: LocalPbDiagnostic[];
+    partial?: boolean;
+    coverage?: LocalPbStepCoverage;
 }
 
 export interface LocalPbCandidateOutcome {
@@ -129,6 +167,7 @@ const DEFAULT_KEY_ENV = "MEMORY_STORE_LOCAL_PB_KEY";
 const DEFAULT_APPLICATION_KEY = "safeCodeiumworldKeYsecretBalloon";
 const DEFAULT_MAX_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true });
+const LITERAL_UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * Reads a nonce-prefixed AES-256-GCM payload. The layout is exactly
@@ -162,7 +201,10 @@ export function decryptLocalPb(encrypted: Uint8Array, options: LocalPbReaderOpti
 
 /** Parse one encrypted active or implicit PB candidate without touching any client or cache. */
 export function readLocalPbCandidate(candidate: LocalPbCandidate, options: LocalPbReaderOptions): LocalPbReadResult {
+    checkLocalPbReadBudget(options);
+    if (options.stepRange) resolveLocalPbStepCoverage(options.stepRange, 0);
     const decrypted = decryptLocalPb(candidate.encrypted, options);
+    checkLocalPbReadBudget(options);
     const root = parseProtoMessage(decrypted);
     const trajectory = findTrajectory(root, candidate.kind);
 
@@ -170,12 +212,22 @@ export function readLocalPbCandidate(candidate: LocalPbCandidate, options: Local
         throw new LocalPbReaderError("MALFORMED_WIRE", "Local PB has no trajectory-shaped protobuf message");
     }
 
-    const parsedSteps = bytesFields(trajectory, 2).map((field, index) => {
+    const stepFields = bytesFields(trajectory, 2);
+    const coverage = options.stepRange ? resolveLocalPbStepCoverage(options.stepRange, stepFields.length) : undefined;
+    const startStep = coverage?.startStep ?? 0;
+    const endStepExclusive = coverage?.endStepExclusive ?? stepFields.length;
+    const parsedSteps = stepFields.slice(startStep, endStepExclusive).map((field, offset) => {
+        checkLocalPbReadBudget(options);
         const message = parseNested(field, "trajectory step");
-        return parseStep(message, index);
+        return parseStep(message, startStep + offset, options.sourceFlavor);
     });
+    checkLocalPbReadBudget(options);
     const id = firstTextField(trajectory, 1);
     const diagnostics = parsedSteps.flatMap(step => step.diagnostics);
+    if (coverage && !coverage.complete) diagnostics.push({
+        kind: "partial",
+        message: `PB step range [${coverage.startStep}, ${coverage.endStepExclusive}) of ${coverage.totalSteps}; omitted step bodies were not decoded`,
+    });
 
     return {
         sourceFlavor: options.sourceFlavor,
@@ -188,16 +240,54 @@ export function readLocalPbCandidate(candidate: LocalPbCandidate, options: Local
             steps: parsedSteps,
         },
         diagnostics,
+        partial: diagnostics.some(diagnostic => diagnostic.kind === "partial" || diagnostic.kind === "unknown_variant"),
+        ...(coverage ? { coverage } : {}),
     };
 }
 
 /** Read a filesystem candidate only; no writes, discovery, cache, or live-client calls occur. */
 export function readLocalPbFileCandidate(candidate: LocalPbFileCandidate, options: LocalPbReaderOptions): LocalPbReadResult {
+    checkLocalPbReadBudget(options);
     return readLocalPbCandidate({
         kind: candidate.kind,
         encrypted: fs.readFileSync(candidate.filePath),
         ...(candidate.label ? { label: candidate.label } : {}),
     }, options);
+}
+
+function checkLocalPbReadBudget(options: LocalPbReaderOptions): void {
+    if (options.signal?.aborted || options.isCancelled?.()) {
+        throw new LocalPbReaderError("CANCELLED", "Local PB read cancelled");
+    }
+    if (options.deadlineMs !== undefined && Date.now() >= options.deadlineMs) {
+        throw new LocalPbReaderError("DEADLINE_EXCEEDED", "Local PB read deadline exceeded");
+    }
+}
+
+function resolveLocalPbStepCoverage(request: LocalPbStepRangeRequest, totalSteps: number): LocalPbStepCoverage {
+    const validIndex = (value: number) => Number.isSafeInteger(value) && value >= 0;
+    let startStep: number;
+    let endStepExclusive: number;
+    if ("tailSteps" in request) {
+        if (!validIndex(request.tailSteps) || request.tailSteps === 0 || "startStep" in request || "endStepExclusive" in request) {
+            throw new LocalPbReaderError("INVALID_RANGE", "PB tailSteps must be a positive safe integer without absolute bounds");
+        }
+        startStep = Math.max(0, totalSteps - request.tailSteps);
+        endStepExclusive = totalSteps;
+    } else {
+        const requestedEnd = request.endStepExclusive ?? totalSteps;
+        if (!validIndex(request.startStep) || !validIndex(requestedEnd)
+            || (request.endStepExclusive !== undefined && requestedEnd < request.startStep)) {
+            throw new LocalPbReaderError("INVALID_RANGE", "PB step bounds must be nonnegative safe integers in ascending order");
+        }
+        startStep = Math.min(totalSteps, request.startStep);
+        endStepExclusive = Math.min(totalSteps, Math.max(requestedEnd, startStep));
+    }
+    return {
+        unit: "step", startStep, endStepExclusive, totalSteps,
+        complete: startStep === 0 && endStepExclusive === totalSteps,
+        encryptedEnvelopeVerified: true,
+    };
 }
 
 /**
@@ -359,14 +449,24 @@ function findTrajectory(root: ProtoMessage, kind: LocalPbCandidateKind): ProtoMe
     return best;
 }
 
-function parseStep(message: ProtoMessage, index: number): LocalPbStep {
+function parseStep(message: ProtoMessage, index: number, sourceFlavor: LocalPbSourceFlavor): LocalPbStep {
     const plannerMessage = firstNestedField(message, 20);
     const metadataMessage = firstNestedField(message, 5);
     const timestamp = extractTimestamp(message);
     const contextTokens = metadataMessage ? firstVarintField(metadataMessage, 25) : undefined;
-    const toolVariants = extractUnknownVariants(message);
+    const activities = message.fields.flatMap(field => {
+        const activity = parseActivity(field, message, sourceFlavor);
+        return activity ? [activity] : [];
+    });
+    const mappedFields = new Set<number>(activities.map(activity => activity.fieldNumber));
+    const toolVariants = extractUnknownVariants(message, mappedFields);
     const diagnostics = [
-        ...detectMarkerDiagnostics(message),
+        ...detectMarkerDiagnostics({ fields: message.fields.filter(field => !mappedFields.has(field.fieldNumber)) }),
+        ...activities.filter(activity => activity.textFields.some(field =>
+            (field.fieldPath === "28.21.1" || field.fieldPath === "37.9" || field.fieldPath === "37.12")
+            && /^<truncated \d+ lines?>/mu.test(field.text)))
+            .map(activity => ({ kind: "partial" as const, fieldNumber: activity.fieldNumber,
+                message: "PB terminal output contains an explicit truncated-lines marker" })),
         ...toolVariants.map(variant => ({
             kind: "unknown_variant" as const,
             fieldNumber: variant.fieldNumber,
@@ -385,9 +485,125 @@ function parseStep(message: ProtoMessage, index: number): LocalPbStep {
             ...(firstTextField(plannerMessage, 3) ? { modifiedResponse: firstTextField(plannerMessage, 3) } : {}),
         } } : {}),
         ...(firstTextFromNestedField(message, 114) ? { system: firstTextFromNestedField(message, 114) } : {}),
+        activities,
         toolVariants,
         diagnostics,
     };
+}
+
+function hasWireShape(message: ProtoMessage, allowed: Record<number, number>, repeated: number[] = []): boolean {
+    const seen = new Set<number>();
+    return message.fields.every(field => {
+        if (allowed[field.fieldNumber] !== field.wireType) return false;
+        if (seen.has(field.fieldNumber) && !repeated.includes(field.fieldNumber)) return false;
+        seen.add(field.fieldNumber);
+        return true;
+    });
+}
+
+function directTextField(message: ProtoMessage, fieldNumber: number): string | undefined {
+    const field = bytesFields(message, fieldNumber)[0];
+    if (!field?.bytes) return undefined;
+    return field.bytes.byteLength === 0 ? "" : decodeUtf8(field.bytes, true);
+}
+
+function parseActivity(field: ProtoField, step: ProtoMessage, sourceFlavor: LocalPbSourceFlavor): LocalPbActivity | undefined {
+    const expectedTypes: Record<number, number> = { 10: 5, 14: 8, 28: 21, 37: 28 };
+    if (!expectedTypes[field.fieldNumber] || field.wireType !== 2 || !field.bytes) return undefined;
+    if (step.fields.filter(item => item.fieldNumber === field.fieldNumber).length !== 1) return undefined;
+    if (firstVarintField(step, 1) !== expectedTypes[field.fieldNumber] || firstVarintField(step, 4) !== 3) return undefined;
+    if (sourceFlavor === "antigravity" && field.fieldNumber !== 10) return undefined;
+    try {
+        const nested = parseNested(field, "activity variant");
+        const base = { sourceFlavor, rawSubfields: nested.fields.map(summarizeField) };
+        if (field.fieldNumber === 10) return parseFileContext(nested, sourceFlavor);
+        if (field.fieldNumber === 14) {
+            if (!hasWireShape(nested, { 1: 2, 2: 0, 3: 0, 4: 2, 9: 2, 17: 0 })) return undefined;
+            const uri = directTextField(nested, 1);
+            const content = directTextField(nested, 4);
+            const snapshot = directTextField(nested, 9);
+            if (!uri?.startsWith("file://") || content === undefined || snapshot === undefined
+                || firstVarintField(nested, 3) === undefined || firstVarintField(nested, 17) === undefined) return undefined;
+            return { ...base, kind: "file_change", fieldNumber: 14, uri,
+                textFields: [{ fieldPath: "14.4", text: content }, { fieldPath: "14.9", text: snapshot }] };
+        }
+        if (field.fieldNumber === 28) {
+            if (!hasWireShape(nested, { 2: 2, 6: 0, 11: 0, 13: 2, 21: 2, 22: 0, 23: 2, 25: 2 })) return undefined;
+            const cwd = directTextField(nested, 2);
+            const command = directTextField(nested, 23);
+            const alternateCommand = directTextField(nested, 25);
+            const terminalId = directTextField(nested, 13);
+            const output = firstNestedField(nested, 21);
+            const hasStatus = firstVarintField(nested, 11) !== undefined;
+            if (!cwd || command === undefined || alternateCommand === undefined || !output
+                || !hasWireShape(output, { 1: 2 }) || hasStatus === (terminalId !== undefined)
+                || firstVarintField(nested, 6) === undefined || firstVarintField(nested, 22) === undefined) return undefined;
+            const text = directTextField(output, 1);
+            if (output.fields.length && text === undefined) return undefined;
+            return { ...base, kind: "terminal_command", fieldNumber: 28, cwd,
+                ...(terminalId !== undefined ? { terminalId } : {}),
+                textFields: [
+                    { fieldPath: "28.23", text: command },
+                    { fieldPath: "28.25", text: alternateCommand },
+                    ...(text !== undefined ? [{ fieldPath: "28.21.1", text }] : []),
+                ] };
+        }
+        if (!hasWireShape(nested, { 1: 2, 2: 0, 5: 0, 9: 2, 12: 2 })) return undefined;
+        const terminalId = directTextField(nested, 1);
+        const output = directTextField(nested, 9);
+        const alternateOutput = directTextField(nested, 12);
+        if (!terminalId || output === undefined || firstVarintField(nested, 2) === undefined
+            || (firstVarintField(nested, 5) !== undefined) !== (alternateOutput !== undefined)) return undefined;
+        return { ...base, kind: "terminal_output", fieldNumber: 37, terminalId,
+            textFields: [{ fieldPath: "37.9", text: output },
+                ...(alternateOutput !== undefined ? [{ fieldPath: "37.12", text: alternateOutput }] : [])] };
+    } catch {
+        return undefined;
+    }
+}
+
+function parseFileContext(nested: ProtoMessage, sourceFlavor: LocalPbSourceFlavor): LocalPbActivity | undefined {
+    if (!hasWireShape(nested, { 1: 2, 2: 2 })) return undefined;
+    const input = firstNestedField(nested, 1);
+    const output = firstNestedField(nested, 2);
+    if (!input || !isFileContextInput(input, sourceFlavor)
+        || !output || !hasWireShape(output, { 1: 2 })) return undefined;
+    const resource = firstNestedField(output, 1);
+    if (!resource || !hasWireShape(resource, sourceFlavor === "windsurf" ? { 2: 2, 8: 2, 10: 2 } : { 2: 2, 8: 2, 11: 0 })) return undefined;
+    const uri = directTextField(resource, 8);
+    const content = firstNestedField(resource, 2);
+    if (!uri?.startsWith("file://") || !content
+        || !hasWireShape(content, sourceFlavor === "windsurf" ? { 1: 0, 2: 0, 3: 2 } : { 3: 2 })) return undefined;
+    const lineMessage = firstNestedField(content, 3);
+    if (!lineMessage || !hasWireShape(lineMessage, { 3: 2 }, [3])) return undefined;
+    const lines: Array<{ text?: string; rawFlag?: string }> = [];
+    for (const lineField of lineMessage.fields) {
+        const line = parseNested(lineField, "file context line");
+        if (!hasWireShape(line, { 1: 2, 2: 0 })) return undefined;
+        const text = directTextField(line, 1);
+        const rawFlag = line.fields.find(item => item.fieldNumber === 2)?.value?.toString();
+        if (rawFlag === undefined || (bytesFields(line, 1).length && text === undefined)) return undefined;
+        lines.push({ ...(text !== undefined ? { text } : {}), rawFlag });
+    }
+    const snapshot = directTextField(resource, 10);
+    if (bytesFields(resource, 10).length && snapshot === undefined) return undefined;
+    return { kind: "file_context", sourceFlavor, fieldNumber: 10, uri,
+        textFields: snapshot === undefined ? [] : [{ fieldPath: "10.2.1.10", text: snapshot }],
+        lineSequence: { fieldPath: "10.2.1.2.3.3", lines },
+        rawSubfields: nested.fields.map(summarizeField) };
+}
+
+function isFileContextInput(input: ProtoMessage, sourceFlavor: LocalPbSourceFlavor): boolean {
+    if (input.fields.length !== 1 || !hasWireShape(input, sourceFlavor === "windsurf" ? { 1: 2, 4: 2 } : { 2: 2, 4: 2 })) return false;
+    const outerNumber = input.fields[0].fieldNumber;
+    const outer = firstNestedField(input, outerNumber);
+    const innerNumber = outerNumber === 1 ? 7 : outerNumber === 2 ? 2 : 1;
+    if (!outer || !hasWireShape(outer, { [innerNumber]: 2 })) return false;
+    const inner = firstNestedField(outer, innerNumber);
+    if (!inner) return false;
+    return outerNumber === 1
+        ? hasWireShape(inner, { 1: 2, 2: 0, 3: 0 }) && directTextField(inner, 1)?.startsWith("file://") === true
+        : hasWireShape(inner, { 5: 2 }) && directTextField(inner, 5)?.startsWith("file://") === true;
 }
 
 function firstVarintField(message: ProtoMessage, fieldNumber: number): number | undefined {
@@ -450,9 +666,9 @@ function firstTextLeaf(message: ProtoMessage, remainingDepth = 3): string | unde
     return undefined;
 }
 
-function decodeUtf8(bytes: Uint8Array): string | undefined {
+function decodeUtf8(bytes: Uint8Array, literal = false): string | undefined {
     try {
-        const text = UTF8_DECODER.decode(bytes);
+        const text = (literal ? LITERAL_UTF8_DECODER : UTF8_DECODER).decode(bytes);
         return text.length > 0 && !/[\u0000-\u0008\u000e-\u001f]/u.test(text) ? text : undefined;
     } catch {
         return undefined;
@@ -460,7 +676,8 @@ function decodeUtf8(bytes: Uint8Array): string | undefined {
 }
 
 function extractTimestamp(message: ProtoMessage): LocalPbTimestamp | undefined {
-    const candidates: ProtoMessage[] = [message];
+    const candidates = [firstNestedField(message, 5), firstNestedField(message, 4)]
+        .filter((candidate): candidate is ProtoMessage => candidate !== undefined);
     for (let index = 0; index < candidates.length && index < 32; index += 1) {
         for (const field of candidates[index].fields) {
             if (!field.bytes) continue;
@@ -488,22 +705,26 @@ function extractTimestamp(message: ProtoMessage): LocalPbTimestamp | undefined {
     return undefined;
 }
 
-function extractUnknownVariants(message: ProtoMessage): LocalPbToolVariant[] {
+function extractUnknownVariants(message: ProtoMessage, mappedFields: Set<number>): LocalPbToolVariant[] {
     const reserved = new Set([5, 19, 20, 114]);
     const variants: LocalPbToolVariant[] = [];
     for (const field of message.fields) {
-        if (reserved.has(field.fieldNumber) || field.wireType !== 2 || !field.bytes) continue;
+        if (reserved.has(field.fieldNumber) || mappedFields.has(field.fieldNumber) || field.wireType !== 2 || !field.bytes) continue;
         try {
             const nested = parseNested(field, `variant field ${field.fieldNumber}`);
-            if (nested.fields.length === 0) continue;
-            if (containsTimestampMessage(nested) || hasDiagnosticMarker(nested)) continue;
+            if (field.fieldNumber === 4 && containsTimestampMessage(nested)) continue;
+            if (field.fieldNumber === 60 && hasDiagnosticMarker(nested)) continue;
             variants.push({
                 variantName: `field_${field.fieldNumber}`,
                 fieldNumber: field.fieldNumber,
                 rawSubfields: nested.fields.map(summarizeField),
             });
         } catch {
-            // Length-delimited text and binary blobs are not represented as tool variants.
+            variants.push({
+                variantName: `field_${field.fieldNumber}`,
+                fieldNumber: field.fieldNumber,
+                rawSubfields: [summarizeField(field)],
+            });
         }
     }
     return variants;

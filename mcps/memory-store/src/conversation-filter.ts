@@ -13,12 +13,14 @@ import {
 import {
     detectWorkspaceFromSteps,
     fetchFirstPageSteps,
-    listConversationsByMtime,
+    discoverAntigravityConversations,
 } from "./ls-client.js";
 import {
     listRecentWindsurfThreads,
+    discoverWindsurfThreads,
     resolveWindsurfThreadId,
     type WindsurfConversationSummary,
+    type WindsurfDiscoveryResult,
 } from "./windsurf-client.js";
 import {
     listDshSessionSnapshots,
@@ -28,7 +30,8 @@ import {
 import { canonicalWorkspacePath } from "./store.js";
 import type { ConversationContextLocateAdapters, ConversationContextLocateResult, LocateRawSource } from "./conversation-context-locate.js";
 import type { DevinConversationSummary } from "./devin-types.js";
-import { listLocalPbConversationCandidates } from "./conversation-local-list.js";
+import { listLocalPbConversationCandidates, type ConversationDiscoveryDiagnostic } from "./conversation-local-list.js";
+import { discoverDevinConversations } from "./devin-sqlite.js";
 import type { ConversationSourceCacheKey } from "./conversation-source-cache.js";
 import { listCachedContextCandidates } from "./conversation-context-locate-cache.js";
 import { discoverDevinChildCandidates } from "./devin-child-discovery.js";
@@ -77,6 +80,8 @@ export interface SourceStatus {
     count: number;
     error?: string;
     warnings?: string[];
+    partial?: boolean;
+    diagnostics?: ConversationDiscoveryDiagnostic[];
 }
 
 export interface ListConversationCandidatesOptions {
@@ -99,6 +104,7 @@ export interface ListConversationCandidatesOptions {
     maxBytes?: number;
     maxHits?: number;
     deadlineMs?: number;
+    deadlineAt?: number;
     isCancelled?: () => boolean;
     conversationIds?: string[];
 }
@@ -139,9 +145,11 @@ export interface ConversationSourceAdapters {
     };
     antigravity: {
         list(limit: number): Promise<Array<{ id: string; title?: string; mtime: Date; sizeKB?: number; workspace?: string }>> | Array<{ id: string; title?: string; mtime: Date; sizeKB?: number; workspace?: string }>;
+        discover?: (limit: number, options: ListConversationCandidatesOptions) => ReturnType<typeof discoverAntigravityConversations> | Promise<ReturnType<typeof discoverAntigravityConversations>>;
     };
     windsurf: {
         list(limit: number): Promise<WindsurfConversationSummary[]> | WindsurfConversationSummary[];
+        discover?: (limit: number, options: ListConversationCandidatesOptions) => Promise<WindsurfDiscoveryResult>;
         resolve(id: string): Promise<string | null> | string | null;
     };
     dsh?: {
@@ -164,10 +172,16 @@ const DEFAULT_ADAPTERS: ConversationSourceAdapters = {
         get: id => getClaudeCodeThread(id),
     },
     antigravity: {
-        list: limit => listConversationsByMtime({ limit }),
+        list: limit => discoverAntigravityConversations({ limit }).conversations,
+        discover: (limit, options) => discoverAntigravityConversations({ limit, conversationIds: options.conversationIds, deadlineAt: options.deadlineAt, isCancelled: options.isCancelled }),
     },
     windsurf: {
         list: limit => listRecentWindsurfThreads(limit),
+        discover: (limit, options) => discoverWindsurfThreads(limit, {
+            conversationIds: options.conversationIds?.map(id => splitDevinSubagentId(id)?.parentId || id),
+            workspaces: options.workspaces, workspaceMode: options.workspaceMode, workspaceScope: options.workspaceScope,
+            maxBytes: options.maxBytes, deadlineAt: options.deadlineAt, isCancelled: options.isCancelled,
+        }),
         resolve: id => resolveWindsurfThreadId(id),
     },
     dsh: {
@@ -378,6 +392,7 @@ export function candidateFromDevinConversation(item: DevinConversationSummary): 
         id: item.canonicalId || item.id, aliases: item.aliases, uuid: item.uuid, sessionId: item.sessionId,
         sourceKind: item.sourceKind, sourcePath: item.sourcePath, dataChain: "windsurf",
         sourcePartial: item.partial,
+        discoveryWarnings: item.warnings.length ? item.warnings : undefined,
         title: item.title, workspace: item.cwd || "", workspaces: item.workspaceUris,
         updatedAt: item.updatedAt || item.createdAt || "", detail: item.sourceKind,
         searchAliases: item.aliases, isChildThread: item.isChildThread,
@@ -385,28 +400,21 @@ export function candidateFromDevinConversation(item: DevinConversationSummary): 
     };
 }
 
-async function listLocalSourceCandidates(source: "antigravity" | "windsurf", limit: number, options: ListConversationCandidatesOptions = {}): Promise<UnifiedConversationCandidate[]> {
-    const pbCandidates = options.conversationIds?.length
-        ? options.conversationIds.flatMap(id => listLocalPbConversationCandidates(source, { limit, query: id }))
-        : listLocalPbConversationCandidates(source, { limit });
+async function listLocalSourceCandidates(source: "antigravity" | "windsurf", limit: number, options: ListConversationCandidatesOptions = {}, diagnostics: ConversationDiscoveryDiagnostic[] = []): Promise<UnifiedConversationCandidate[]> {
+    const pbCandidates = listLocalPbConversationCandidates(source, { limit, conversationIds: options.conversationIds,
+        deadlineAt: options.deadlineAt, isCancelled: options.isCancelled, onDiagnostic: diagnostic => diagnostics.push(diagnostic) });
     const candidates: UnifiedConversationCandidate[] = pbCandidates.map(item => ({
         id: item.id, dataChain: source, title: "", workspace: "", updatedAt: item.updatedAt,
         sourceKind: "cascade-pb", sourceBytes: item.bytes,
         detail: `${item.kinds.join("+")} / ${item.bytes} bytes / ${item.files} files`,
     }));
     if (source === "windsurf") {
-        const { listDevinConversations, listDevinConversationIdentities } = await import("./devin-sqlite.js");
-        try {
-            candidates.push(...(await (options.contextProbe ? listDevinConversationIdentities : listDevinConversations)({
-                maxBytes: options.maxBytes || (options.contextProbe ? 16 * 1024 * 1024 : 128 * 1024 * 1024),
-                deadlineMs: Date.now() + (options.deadlineMs || 12_000),
-                isCancelled: options.isCancelled,
-            })).map(candidateFromDevinConversation));
-        } catch (error) {
-            if (!candidates.length) throw error;
-            candidates[0].sourcePartial = true;
-            candidates[0].detail += ` / workspaceProbeWarning=Devin discovery failed: ${error instanceof Error ? error.message : String(error)}`;
-        }
+        const discovered = await discoverDevinConversations({ limit, maxBytes: options.maxBytes,
+            conversationIds: options.conversationIds?.map(id => splitDevinSubagentId(id)?.parentId || id),
+            workspaces: options.workspaces, workspaceMode: options.workspaceMode, workspaceScope: options.workspaceScope,
+            deadlineMs: options.deadlineAt ?? Date.now() + (options.deadlineMs ?? 12_000), isCancelled: options.isCancelled });
+        diagnostics.push(...discovered.diagnostics);
+        candidates.push(...discovered.conversations.map(candidateFromDevinConversation));
     }
     const seen = new Set<string>();
     return candidates.filter(candidate => {
@@ -529,9 +537,10 @@ async function listSourceCandidates(
     adapters: ConversationSourceAdapters,
     probeWorkspace = false,
     options: ListConversationCandidatesOptions = {},
+    diagnostics: ConversationDiscoveryDiagnostic[] = [],
 ): Promise<UnifiedConversationCandidate[]> {
     if (options.source === "local" && (source === "antigravity" || source === "windsurf")) {
-        return (adapters.localList || listLocalSourceCandidates)(source, limit, options);
+        return adapters.localList ? adapters.localList(source, limit, options) : listLocalSourceCandidates(source, limit, options, diagnostics);
     }
     if (source === "codex") {
         const parentMap = options.adapters ? new Map<string, string>() : readCodexThreadParentMap();
@@ -547,9 +556,12 @@ async function listSourceCandidates(
         return rows.map(candidateFromClaudeCodeThread);
     }
     if (source === "windsurf") {
-        const candidates = (await adapters.windsurf.list(limit)).map(candidateFromWindsurfThread);
+        const discovered = await adapters.windsurf.discover?.(limit, options);
+        if (discovered) diagnostics.push(...discovered.diagnostics);
+        const candidates = (discovered?.conversations || await adapters.windsurf.list(limit)).map(candidateFromWindsurfThread);
         for (const id of options.conversationIds || []) {
             if (candidates.some(item => item.id === id || item.aliases?.includes(id))) continue;
+            if (!options.adapters) continue;
             const resolved = await adapters.windsurf.resolve(id);
             const existing = candidates.find(item => item.id === resolved);
             if (existing) existing.aliases = [...new Set([...(existing.aliases || []), id])];
@@ -567,7 +579,9 @@ async function listSourceCandidates(
             : await dsh.list(limit);
         return rows.map(candidateFromDshSession);
     }
-    const rows = await adapters.antigravity.list(limit);
+    const discovered = await adapters.antigravity.discover?.(limit, options);
+    if (discovered) diagnostics.push(...discovered.diagnostics);
+    const rows = discovered?.conversations || await adapters.antigravity.list(limit);
     const candidates = rows.map(item => ({
         id: item.id,
         dataChain: "antigravity",
@@ -582,7 +596,10 @@ async function listSourceCandidates(
     await Promise.all(candidates.slice(0, probeLimit).map(async candidate => {
         if (candidate.workspace) return;
         try {
-            const steps = await withTimeout(fetchFirstPageSteps(candidate.id), timeoutMs);
+            if (options.isCancelled?.()) throw new Error("Antigravity workspace discovery cancelled");
+            const remainingMs = Math.min(timeoutMs, (options.deadlineAt ?? Date.now() + timeoutMs) - Date.now());
+            if (remainingMs <= 0) throw new Error("Antigravity workspace discovery deadline exceeded");
+            const steps = await withTimeout(fetchFirstPageSteps(candidate.id, options), remainingMs);
             const workspace = steps ? detectWorkspaceFromSteps(steps) : null;
             if (workspace) candidate.workspace = workspace;
             if (!workspace) {
@@ -609,7 +626,7 @@ function conversationSourceFetchLimit(source: ConversationSource, sourceLimit: n
         || options.threadMode === "all"
     );
     if (!needsMetadataLocate) return baseLimit;
-    if (source !== "codex" && source !== "claude-code" && source !== "windsurf") return baseLimit;
+    if (source !== "codex" && source !== "claude-code" && source !== "windsurf" && source !== "antigravity") return baseLimit;
     const sourceSpecific = source === "claude-code"
         ? process.env.MEMORY_STORE_CLAUDE_CODE_METADATA_THREAD_LIMIT
         : source === "windsurf"
@@ -709,15 +726,18 @@ export async function listConversationCandidates(options: ListConversationCandid
     const collected: UnifiedConversationCandidate[] = [];
     const rawBySource = new Map<ConversationSource, UnifiedConversationCandidate[]>();
     let partial = false;
-    const deadlineAt = Date.now() + (options.deadlineMs || 12_000);
+    const deadlineAt = Math.min(options.deadlineAt ?? Infinity, Date.now() + (options.deadlineMs ?? 12_000));
+    const diagnosticsBySource = new Map<ConversationSource, ConversationDiscoveryDiagnostic[]>();
 
     const settled = await Promise.allSettled(sources.map(async source => {
         if (options.isCancelled?.()) throw new Error("candidate discovery cancelled");
         if (options.threadMode === "children" && options.parentDataChain && normalizeDataChain(options.parentDataChain) !== source) return { source, filtered: [], warnings: [] };
         const fetchLimit = conversationSourceFetchLimit(source, sourceLimit, options);
+        const diagnostics: ConversationDiscoveryDiagnostic[] = [];
+        diagnosticsBySource.set(source, diagnostics);
         const cacheListing = options.source === "cache" ? listCachedContextCandidates(source, fetchLimit, options) : undefined;
-        const raw = cacheListing?.candidates || await listSourceCandidates(source, fetchLimit, adapters, source === "antigravity" && Boolean(options.workspaces?.length), options);
-        const warnings = [...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []), ...(cacheListing?.warnings || [])];
+        const raw = cacheListing?.candidates || await listSourceCandidates(source, fetchLimit, adapters, source === "antigravity" && Boolean(options.workspaces?.length), { ...options, deadlineAt }, diagnostics);
+        const warnings = [...raw.flatMap(candidateWarnings), ...raw.flatMap(candidate => candidate.discoveryWarnings || []), ...(cacheListing?.warnings || []), ...diagnostics.map(diagnostic => `${diagnostic.code}: ${diagnostic.message}`)];
         if (cacheListing?.partial && !warnings.length) warnings.push("cache_candidate_budget");
         const needsChildren = options.threadMode === "children" || options.threadMode === "all" || Boolean(options.contextProbe?.trim() || options.query?.trim())
             || options.conversationIds?.some(id => Boolean(splitDevinSubagentId(id)));
@@ -772,12 +792,14 @@ export async function listConversationCandidates(options: ListConversationCandid
         const source = sources[idx];
         if (item.status === "fulfilled") {
             partial ||= item.value.warnings.length > 0;
-            statuses.push({ dataChain: source, status: "ok", count: item.value.filtered.length, warnings: item.value.warnings.length ? item.value.warnings : undefined });
+            const diagnostics = diagnosticsBySource.get(source);
+            statuses.push({ dataChain: source, status: "ok", count: item.value.filtered.length, warnings: item.value.warnings.length ? item.value.warnings : undefined,
+                partial: item.value.warnings.length > 0 || undefined, diagnostics: diagnostics?.length ? diagnostics : undefined });
             collected.push(...item.value.filtered);
         } else {
             partial = true;
             const error = item.reason instanceof Error ? item.reason.message : String(item.reason);
-            statuses.push({ dataChain: source, status: "failed", count: 0, error });
+            statuses.push({ dataChain: source, status: "failed", count: 0, error, partial: true, diagnostics: diagnosticsBySource.get(source) });
         }
     }
 
