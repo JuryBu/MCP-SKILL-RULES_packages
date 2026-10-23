@@ -64,11 +64,12 @@ class CodexWakeNotifier:
         self.token_file = Path(token_file)
         self.source_machine = source_machine
         self.target_machine = target_machine
-        self.client = client or httpx.Client(timeout=10.0)
+        self.client = client or httpx.Client(timeout=10.0, trust_env=False)
         self.retry_interval_seconds = max(1.0, retry_interval_seconds)
         self.reminder_cooldown_seconds = reminder_cooldown_seconds
         self.message_visibility = normalize_wake_message_visibility(message_visibility)
         self._last_attempt: dict[str, float] = {}
+        self._last_errors: dict[str, dict[str, str]] = {}
 
     def readiness(self) -> dict[str, Any]:
         try:
@@ -84,8 +85,16 @@ class CodexWakeNotifier:
 
     def submit_pending(self, limit: int = 100) -> dict[str, Any]:
         candidates = self._list_wakes(limit)
+        candidate_ids = {wake.get("notification_id", wake["wake_id"]) for wake in candidates}
+        if len(candidates) < limit:
+            self._last_errors = {
+                notification_id: error
+                for notification_id, error in self._last_errors.items()
+                if notification_id in candidate_ids
+            }
         summary: dict[str, Any] = {
             "candidate_count": len(candidates),
+            "attempted_count": 0,
             "submitted_count": 0,
             "duplicate_count": 0,
             "unknown_count": 0,
@@ -99,8 +108,12 @@ class CodexWakeNotifier:
             last_attempt = self._last_attempt.get(notification_id)
             if last_attempt is not None and now - last_attempt < self.retry_interval_seconds:
                 summary["deferred_count"] += 1
+                if notification_id in self._last_errors:
+                    summary["errors"].append(dict(self._last_errors[notification_id]))
                 continue
             self._last_attempt[notification_id] = now
+            summary["attempted_count"] += 1
+            previous_error_count = len(summary["errors"])
             try:
                 response = self.client.post(
                     f"{self._control_url().rstrip('/')}/v1/wakes",
@@ -156,6 +169,15 @@ class CodexWakeNotifier:
                         "code": self._error_code(error),
                     }
                 )
+            if len(summary["errors"]) > previous_error_count:
+                self._last_errors[notification_id] = dict(summary["errors"][-1])
+            else:
+                self._last_errors.pop(notification_id, None)
+        summary["errors"].extend(
+            dict(error)
+            for notification_id, error in self._last_errors.items()
+            if notification_id not in candidate_ids
+        )
         return summary
 
     def _list_wakes(self, limit: int) -> list[dict[str, Any]]:
@@ -235,6 +257,23 @@ class CodexWakeNotifier:
             return error.code
         if isinstance(error, httpx.HTTPStatusError):
             return f"PROXY_HTTP_{error.response.status_code}"
+        transport_errors = (
+            (httpx.ConnectTimeout, "PROXY_CONNECT_TIMEOUT"),
+            (httpx.ReadTimeout, "PROXY_READ_TIMEOUT"),
+            (httpx.WriteTimeout, "PROXY_WRITE_TIMEOUT"),
+            (httpx.PoolTimeout, "PROXY_POOL_TIMEOUT"),
+            (httpx.ConnectError, "PROXY_CONNECT_ERROR"),
+            (httpx.ReadError, "PROXY_READ_ERROR"),
+            (httpx.WriteError, "PROXY_WRITE_ERROR"),
+            (httpx.CloseError, "PROXY_CLOSE_ERROR"),
+            (httpx.ProxyError, "PROXY_CONNECTION_ERROR"),
+            (httpx.RemoteProtocolError, "PROXY_REMOTE_PROTOCOL_ERROR"),
+            (httpx.LocalProtocolError, "PROXY_LOCAL_PROTOCOL_ERROR"),
+            (httpx.UnsupportedProtocol, "PROXY_UNSUPPORTED_PROTOCOL"),
+        )
+        for exception_type, code in transport_errors:
+            if isinstance(error, exception_type):
+                return code
         if isinstance(error, httpx.HTTPError):
             return "PROXY_TRANSPORT_ERROR"
         if isinstance(error, ValueError):
