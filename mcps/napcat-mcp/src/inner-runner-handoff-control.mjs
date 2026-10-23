@@ -5,6 +5,8 @@ import crypto from "node:crypto";
 import { fixedHandoffCompatibility, acceptHandoffVersion } from "./inner-handoff-compatibility.mjs";
 import { validateInnerMigrationPlan } from "./inner-migration-plan.mjs";
 import { validateInnerRuntimeProfile } from "./inner-runtime-profile.mjs";
+import { signRecoveryEnvelope, canContinueRecovery } from "./model-recovery-notifications.mjs";
+import { createModelOperationLedger } from "./model-operation-ledger.mjs";
 
 export const HANDOFF_CHANNEL = "inner-runner-handoff-v1";
 const MAX_MESSAGE_BYTES = 16 * 1024;
@@ -79,6 +81,7 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
   let lastCoordinatorRequest = 0;
   let closed = false;
   let pendingReplies = 0;
+  const recoveryActions = new Set();
   const findNativeTurn = threadId => nativeTurns.get(threadId) ?? terminalTurns.get(threadId);
   const pinnedThread = threadId => prepared.has(threadId)
     || (migrationPlan?.threadId === threadId && migrationPlan.expiresAt > Date.now());
@@ -221,6 +224,27 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
   }
 
   function execute(message) {
+    if (message.method === "bindRecovery") {
+      const native = nativeTurns.get(message.threadId);
+      if (native?.phase !== "active" || native.turnId !== message.turnId || native.connectionGeneration
+        || !validIdentity(message.connectionGeneration)) fail("RECOVERY_BINDING_INVALID");
+      native.connectionGeneration = message.connectionGeneration;
+      return { bound: true };
+    }
+    if (message.method === "continueHttp") {
+      const native = nativeTurns.get(message.threadId);
+      const current = proxy.recoveryStates?.().find(event => event.threadId === message.threadId
+        && event.turnId === message.turnId && event.requestId === message.recoveryRequestId);
+      const actionKey = JSON.stringify([message.recoveryRequestId, message.sequence]);
+      if (native?.phase !== "active" || native.turnId !== message.turnId
+        || native.connectionGeneration !== message.connectionGeneration || !validIdentity(message.connectionGeneration)
+        || message.producerId !== instanceToken || message.producerPid !== process.pid
+        || message.nativeSourceId !== config.nativeSourceId || current?.sequence !== message.sequence
+        || !canContinueRecovery(current) || recoveryActions.has(actionKey)) fail("RECOVERY_ACTION_STALE_OR_DISABLED");
+      if (recoveryActions.size >= MAX_REQUESTS) fail("RECOVERY_ACTION_LIMIT");
+      recoveryActions.add(actionKey);
+      return proxy.continueWithHttp({ threadId: message.threadId, turnId: message.turnId, requestId: message.recoveryRequestId });
+    }
     if (message.method === "check") {
       const status = proxy.status();
       const native = findNativeTurn(message.threadId) ?? null;
@@ -229,8 +253,21 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
         && status.running && !status.draining && status.activeRequests === 0 && !pinnedThread(message.threadId)) {
         const snapshot = proxy.prepareThreadHandoff(message.threadId);
         try {
-          const entries = Object.values(snapshot.state).reduce((total, values) => total + values.length, 0);
+          const channels = ["attempts", "emptyIdleTurns", "businessProgress", "waitTerminals"];
+          if (snapshot.schemaVersion !== 1 || snapshot.threadId !== message.threadId || !snapshot.state
+            || Object.keys(snapshot.state).sort().join(",") !== [...channels].sort().join(",")
+            || channels.some(channel => !Array.isArray(snapshot.state[channel]))) fail("RECOVERY_HISTORICAL_STATE_UNVERIFIED");
+          const recoveryEntries = channels.reduce((total, channel) => total + snapshot.state[channel].length, 0);
+          let operationEntries = 0;
+          if (snapshot.operationState !== undefined) {
+            if (snapshot.operationState?.threadHash !== digest(message.threadId)) fail("RECOVERY_HISTORICAL_STATE_UNVERIFIED");
+            const verified = createModelOperationLedger({ state: snapshot.operationState }).exportThread(message.threadId);
+            operationEntries = verified.entries.length;
+            if (operationEntries !== snapshot.operationState.entries.length) fail("RECOVERY_HISTORICAL_STATE_UNVERIFIED");
+          } else if (status.managedRecovery || status.operationLedger) fail("RECOVERY_HISTORICAL_STATE_UNVERIFIED");
+          const entries = recoveryEntries + operationEntries;
           historicalRecovery = { threadId: message.threadId, empty: entries === 0, entries,
+            recoveryEntries, operationEntries, operationStateVerified: true,
             capturedAt: snapshot.capturedAt, snapshotSha256: digest(JSON.stringify(snapshot)) };
         } finally { proxy.cancelThreadHandoff(message.threadId, snapshot.token); }
       }
@@ -265,6 +302,7 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
       if (!nativeTurns.has(event.threadId)) reserveNativeSlot(event.threadId);
       terminalTurns.delete(event.threadId);
       nativeTurns.set(event.threadId, { phase: event.phase, turnId: event.turnId, sequence: event.sequence,
+        ...(event.connectionGeneration ? { connectionGeneration: event.connectionGeneration } : {}),
         ...(event.phase === "terminal" ? { status: event.status } : {}) });
       lastSequence = event.sequence;
       return { recorded: true, sequence: lastSequence };
@@ -316,6 +354,19 @@ export function attachInnerRunnerHandoffControl({ config, proxy, instanceToken, 
   ipc.once("disconnect", disconnected);
   send({ event: "ready", ownerId: config.ownerId, status: proxy.status() });
   return {
+    publishRecovery(event) {
+      if (closed || isStopping() || !ipc.connected) return false;
+      const native = nativeTurns.get(event.threadId);
+      const current = proxy.recoveryStates?.().find(state => state.requestId === event.requestId
+        && state.threadId === event.threadId && state.turnId === event.turnId);
+      if (native?.phase !== "active" || native.turnId !== event.turnId || !validIdentity(native.connectionGeneration)
+        || current?.sequence !== event.sequence || current.phase !== event.phase) return false;
+      const envelope = signRecoveryEnvelope({ ownerId: config.ownerId, nativeSourceId: config.nativeSourceId,
+        producerId: instanceToken, producerPid: process.pid, sourceHashes,
+        connectionGeneration: native.connectionGeneration }, event, config.capability);
+      send({ event: "recovery", envelope });
+      return true;
+    },
     close() {
       closed = true;
       ipc.removeListener("message", receive);

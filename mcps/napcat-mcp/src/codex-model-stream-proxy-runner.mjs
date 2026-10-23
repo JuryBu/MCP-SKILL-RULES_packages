@@ -10,21 +10,40 @@ import { parseToolDeliveryProfile } from "./tool-delivery-profile.mjs";
 import { createAdaptiveDeliveryRegistry } from "./adaptive-delivery.mjs";
 import { isolatedHandoffConfiguration, attachInnerRunnerHandoffControl } from "./inner-runner-handoff-control.mjs";
 import { readUploadAllowancePolicy } from "./upload-allowance-policy.mjs";
+import { createIncrementalResponsesTransport } from "./incremental-responses-transport.mjs";
+import { readModelRuntimeEnvironment } from "./model-runtime-policy.mjs";
 
 function integerEnvironment(name, fallback, minimum, maximum) {
-  const value = Number(process.env[name] ?? fallback);
+  const value = Number(effectiveEnvironment[name] ?? fallback);
   if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
     throw new Error(`${name} must be an integer between ${minimum} and ${maximum}`);
   }
   return value;
 }
 
+function booleanEnvironment(name, fallback = false) {
+  const value = effectiveEnvironment[name];
+  if (value === undefined) return fallback;
+  if (value !== "0" && value !== "1") throw new Error(`${name} must be 0 or 1`);
+  return value === "1";
+}
+
 function writeJsonAtomic(filePath, value) {
-  const temporaryPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+  const temporaryPath = `${filePath}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  let descriptor;
   try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    descriptor = fs.openSync(temporaryPath, "wx");
+    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
     renameReplaceSync(temporaryPath, filePath);
+    if (process.platform !== "win32") {
+      const directory = fs.openSync(path.dirname(filePath), "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    }
   } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
     try { fs.unlinkSync(temporaryPath); } catch {}
     throw error;
   }
@@ -38,11 +57,24 @@ const stopPath = path.join(stateRoot, "codex-model-stream-proxy.stop");
 const lockPath = path.join(stateRoot, "codex-model-stream-proxy.lock.json");
 const deliveryProfilePath = path.join(stateRoot, "codex-model-stream-delivery-profiles.json");
 const adaptiveStatePath = path.join(stateRoot, "codex-model-adaptive-delivery.json");
+const operationStatePath = path.join(stateRoot, "codex-model-operation-state.json");
+const durableRecoveryStatePath = path.join(stateRoot, "codex-model-recovery-state.json");
 const handoffConfig = isolatedHandoffConfiguration({
   stateRoot,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
 });
+const effectiveEnvironment = readModelRuntimeEnvironment({ stateRoot: handoffConfig?.runtimeProfile?.stateRoot ?? stateRoot,
+  corePath: new URL("./codex-model-stream-proxy.mjs", import.meta.url) });
+const managedRecovery = booleanEnvironment("CODEX_MODEL_STREAM_PROXY_MANAGED_RECOVERY");
+const incrementalEnabled = booleanEnvironment("CODEX_MODEL_STREAM_PROXY_INCREMENTAL_WS");
+const incrementalImagesEnabled = booleanEnvironment("CODEX_MODEL_STREAM_PROXY_INCREMENTAL_IMAGES");
+if (incrementalEnabled && !managedRecovery) throw new Error("Incremental WS requires managed recovery");
+if (incrementalImagesEnabled && !incrementalEnabled) throw new Error("Incremental images require incremental WS");
+const incrementalUpstreamUrl = process.env.CODEX_MODEL_STREAM_PROXY_WS_UPSTREAM_URL;
+if (incrementalEnabled && !/^wss?:\/\//u.test(incrementalUpstreamUrl ?? "")) {
+  throw new Error("Incremental WS requires an explicit ws or wss upstream URL");
+}
 fs.mkdirSync(stateRoot, { recursive: true });
 
 function readToolDeliveryProfile() {
@@ -63,15 +95,17 @@ const ANOMALY_EVENT_TYPES = new Set([
   "native_retry_signal",
   "local_tool_phase_retry_signal",
   "local_tool_phase_timeout",
-  "retry_exhausted_completed_idle",
-  "usage_limit_completed_idle",
-  "permanent_failure_completed_idle",
-  "safety_policy_completed_idle",
+  "retry_exhausted_terminal_failure",
+  "usage_limit_terminal_failure",
+  "permanent_failure_terminal_failure",
   "safety_policy_terminal_failure",
   "compaction_retry_signal",
   "guarded_request_error",
   "guarded_error_retry_signal",
-  "guarded_error_completed_idle",
+  "guarded_error_terminal_failure",
+  "model_terminal_failure",
+  "request_acceptance_unresolved",
+  "model_recovery_state",
   "passthrough_error",
   "adaptive_delivery_probe_started",
   "adaptive_delivery_mode_changed",
@@ -115,13 +149,43 @@ function readAdaptiveState() {
     return undefined;
   }
 }
+function readOperationState() {
+  if (!fs.existsSync(operationStatePath)) return undefined;
+  if (fs.statSync(operationStatePath).size > 2 * 1024 * 1024) throw new Error("MODEL_OPERATION_STATE_TOO_LARGE");
+  const state = JSON.parse(fs.readFileSync(operationStatePath, "utf8"));
+  if (!state || typeof state !== "object" || Array.isArray(state)) throw new Error("MODEL_OPERATION_STATE_INVALID");
+  return state;
+}
+function readDurableRecoveryState() {
+  if (!fs.existsSync(durableRecoveryStatePath)) return undefined;
+  if (fs.statSync(durableRecoveryStatePath).size > 2 * 1024 * 1024) throw new Error("MODEL_OPERATION_RECOVERY_STATE_TOO_LARGE");
+  return JSON.parse(fs.readFileSync(durableRecoveryStatePath, "utf8"));
+}
+const incrementalTransport = incrementalEnabled ? createIncrementalResponsesTransport({
+  allowImagePrewarm: incrementalImagesEnabled,
+  maxSessions: integerEnvironment("CODEX_MODEL_STREAM_PROXY_WS_MAX_SESSIONS", 32, 1, 128),
+  maxSessionBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_WS_MAX_SESSION_BYTES", 64 * 1024 * 1024, 1024, 256 * 1024 * 1024),
+  maxMessageBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_WS_MAX_MESSAGE_BYTES", 1024 * 1024, 1024, 16 * 1024 * 1024),
+}) : null;
 const proxy = createCodexModelStreamProxy({
-  ...readUploadAllowancePolicy(handoffConfig?.runtimeProfile?.stateRoot ?? stateRoot),
+  ...readUploadAllowancePolicy(handoffConfig?.runtimeProfile?.stateRoot ?? stateRoot, effectiveEnvironment),
   onModelObservation: event => modelObserver.observe(event),
   instanceToken,
   host: process.env.CODEX_MODEL_STREAM_PROXY_HOST ?? "127.0.0.1",
   port: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PORT", 18435, handoffConfig ? 0 : 1, 65535),
   upstreamOrigin: process.env.CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN ?? "https://chatgpt.com",
+  heartbeatIntervalMs,
+  managedRecovery,
+  managedRetryBaseMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_MANAGED_RETRY_BASE_MS", 5000, 10, 60000),
+  largeHttpBodyBytes: integerEnvironment("CODEX_MODEL_STREAM_PROXY_LARGE_HTTP_BODY_BYTES", 4 * 1024 * 1024, 1024, 256 * 1024 * 1024),
+  operationState: readOperationState(),
+  onOperationStateChange(state) { writeJsonAtomic(operationStatePath, state); },
+  durableRecoveryState: readDurableRecoveryState(),
+  onDurableRecoveryStateChange(state) { writeJsonAtomic(durableRecoveryStatePath, state); },
+  onRecoveryState(event) { handoffControl?.publishRecovery(event); },
+  incrementalTransport,
+  incrementalUpstreamUrl,
+  incrementalImagesEnabled,
   firstProgressTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_FIRST_PROGRESS_TIMEOUT_MS", 40_000, 1_000, 300_000),
   progressIdleTimeoutMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_PROGRESS_IDLE_TIMEOUT_MS", 40_000, 1_000, 300_000),
   adaptiveWaitLimitMs: integerEnvironment("CODEX_MODEL_STREAM_PROXY_ADAPTIVE_WAIT_LIMIT_MS", 300_000, 1_000, 300_000),
@@ -188,6 +252,12 @@ function runtimeState(status = "running", error = null) {
     drainTimeoutMs,
     draining: proxy.status().draining,
     activeRequests: proxy.status().activeRequests,
+    managedRecovery: proxy.status().managedRecovery,
+    incrementalEnabled,
+    incrementalImagesEnabled,
+    recoveryWaitingRequests: proxy.status().recoveryWaitingRequests,
+    operationLedger: proxy.status().operationLedger,
+    incrementalTransport: proxy.status().incrementalTransport,
     maxBufferedRequestBytes: proxy.status().maxBufferedRequestBytes,
     maxDecodedRequestBytes: proxy.status().maxDecodedRequestBytes,
     requestBuffer: proxy.status().requestBuffer,

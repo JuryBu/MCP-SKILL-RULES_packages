@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB, MAX_UPLOAD_ALLOWANCE_MS } from "./request-wait-budget.mjs";
 
 export function readUploadAllowancePolicy(stateRoot, environment = process.env) {
   const policyPath = path.join(stateRoot, "codex-model-upload-policy.json");
@@ -26,8 +27,8 @@ export function readUploadAllowancePolicy(stateRoot, environment = process.env) 
     return value;
   };
   const uploadAllowanceMsPerMiB = integer("CODEX_MODEL_STREAM_PROXY_UPLOAD_ALLOWANCE_MS_PER_MIB",
-    policy.uploadAllowanceMsPerMiB ?? 1000, 60_000);
+    policy.uploadAllowanceMsPerMiB ?? DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB, 60_000);
   const maxUploadAllowanceMs = integer("CODEX_MODEL_STREAM_PROXY_MAX_UPLOAD_ALLOWANCE_MS",
-    policy.maxUploadAllowanceMs ?? Math.min(600_000, 128 * uploadAllowanceMsPerMiB), 600_000);
+    policy.maxUploadAllowanceMs ?? Math.min(MAX_UPLOAD_ALLOWANCE_MS, 128 * uploadAllowanceMsPerMiB), MAX_UPLOAD_ALLOWANCE_MS);
   return { uploadAllowanceMsPerMiB, maxUploadAllowanceMs };
 }

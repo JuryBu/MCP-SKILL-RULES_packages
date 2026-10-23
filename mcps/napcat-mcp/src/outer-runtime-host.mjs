@@ -32,5 +32,6 @@ export function createOuterRuntimeHost(options) {
     maintenanceStatus: options.maintenanceStatus,
     recordError: gated(options.recordError),
     injectRequest: gated(options.injectRequest),
+    notifyRecoveryState: gated(options.notifyRecoveryState),
   });
 }

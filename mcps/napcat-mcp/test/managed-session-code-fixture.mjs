@@ -50,6 +50,7 @@ export async function fixture(context, { start = true, parent = false, productio
   const turns = [];
   const serviceParticipants = [];
   const cleanup = [];
+  const expectedWorkerExits = new Set();
   const upstream = http.createServer((request, response) => {
     request.resume();
     request.once("end", () => {
@@ -158,7 +159,7 @@ export async function fixture(context, { start = true, parent = false, productio
     for (const deadline of shared.resources.controlTimers) clearTimeout(deadline.timer);
     assert.equal(shared.resources.controlTimers.size, 0);
     const workers = shared.coordinator.status().workers;
-    assert.ok(workers.every(worker => !worker.alive && worker.exitCode === 0));
+    assert.ok(workers.every(worker => !worker.alive && (worker.exitCode === 0 || expectedWorkerExits.has(worker.pid))));
     assert.ok(children.every(child => child.exitCode !== null || child.signalCode !== null));
     assert.equal(fs.readFileSync(history, "utf8"), '{"synthetic":"preserved"}');
     upstream.closeAllConnections();
@@ -185,6 +186,7 @@ export async function fixture(context, { start = true, parent = false, productio
     }
     await session.close();
     await shared.outerTask;
+    turns.length = 0;
     const argumentsNext = [...configuration.outerArguments];
     argumentsNext[argumentsNext.indexOf("--instance-token") + 1] = crypto.randomUUID();
     configuration.outerArguments = argumentsNext;
@@ -235,5 +237,5 @@ export async function fixture(context, { start = true, parent = false, productio
   }
   return { root, candidateRoot, ports, sourceRoot, get session() { return session; }, get participant() { return participant; },
     get shared() { return shared; }, get endpoint() { return endpoint; }, restart,
-    events, calls, held, release, connect, rpc, turn, request, serviceParticipants, cleanup };
+    events, calls, held, release, connect, rpc, turn, request, serviceParticipants, cleanup, expectedWorkerExits };
 }

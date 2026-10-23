@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { createProxyLiveCodeRuntime } from "./proxy-live-code-runtime.mjs";
 import { createOuterRuntime } from "./outer-runtime.mjs";
 import { createOuterRuntimeHost } from "./outer-runtime-host.mjs";
+import { createRecoveryNotificationRouter } from "./model-recovery-notifications.mjs";
 import { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
 export { CodexAppServerProxyError } from "./outer-runtime-contract.mjs";
 import fs from "node:fs";
@@ -32,6 +33,7 @@ export const DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES = 64 * 1024 * 1024;
 export const DEFAULT_DESKTOP_TRANSPORT_LIMIT_BYTES = 96 * 1024 * 1024;
 export const DESKTOP_RESPONSE_BUDGET_ERROR_CODE = -32010;
 const HISTORY_METHODS = new Set(["thread/read", "thread/resume", "thread/turns/list", "thread/items/list"]);
+const NATIVE_TURN_START_METHODS = new Set(["turn/start", "thread/compact/start"]);
 
 export function createDesktopResponseBudgetError({ requestId, method, responseBytes,
   limit = DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES } = {}) {
@@ -733,6 +735,10 @@ export class CodexAppServerProxy {
       candidateRoot: options.displayPolicyRoot, instanceId: options.instanceToken ?? this.writerEpoch, onEvent: this.onEvent,
     });
     this.clients = new Set();
+    this.modelRecovery = options.modelRecoveryControl ? createRecoveryNotificationRouter({
+      ...options.modelRecoveryControl,
+      sendNotification: (client, notification, binding) => this._liveNotifyClient(client, notification, binding),
+    }) : null;
     this.liveCodeRuntime = createProxyLiveCodeRuntime(this, {
       candidateRoot: options.outerRuntimeRoot, instanceId: options.instanceToken ?? this.writerEpoch,
     });
@@ -763,6 +769,7 @@ export class CodexAppServerProxy {
         injectRequest: (client, method, params, requestOptions = {}) => {
           return this._liveInjectRequest(client, method, params, { ...requestOptions, outerEntry: entry });
         },
+        notifyRecoveryState: envelope => this.publishRecoveryState(envelope),
       }),
     });
   }
@@ -936,6 +943,20 @@ export class CodexAppServerProxy {
     );
   }
 
+  _liveNotifyClient(client, notification, binding) {
+    if (this.closed || !this.clients.has(client) || client.closed || !client.initialized || !client.upstreamReady
+      || client.metadataUpstreamGeneration !== binding?.connectionGeneration
+      || client.downstream.readyState !== this.WebSocketImpl.OPEN
+      || client.upstream?.readyState !== this.WebSocketImpl.OPEN
+      || notification?.method !== "error" || Object.hasOwn(notification, "id")) return false;
+    return this._liveSendOrClose(client, client.downstream, JSON.stringify(notification), false, "model_recovery_notification");
+  }
+
+  publishRecoveryState(envelope) {
+    if (this.closed) return { accepted: false };
+    return this.modelRecovery?.accept(envelope) ?? { accepted: false };
+  }
+
   _liveMaintenanceStatus() {
     if (!this.maintenanceFilePath) return { active: false, reasons: [] };
     try {
@@ -1107,6 +1128,7 @@ export class CodexAppServerProxy {
             details: { method: pending.method, id: pending.id, bytes: envelope.bytes.length, maxJsonParseBytes: this.maxJsonParseBytes } },
         ));
       } else if (message.error) {
+        this.modelRecovery?.rejectExpectedTurn?.(client, pending.id, metadataGeneration);
         pending.reject(new CodexAppServerProxyError(
           "APP_SERVER_RPC_ERROR",
           message.error.message ?? `App Server 请求失败：${pending.method}`,
@@ -1132,6 +1154,7 @@ export class CodexAppServerProxy {
       }
       const tracking = client.desktopRequestIds.get(rpcMessage.id);
       if (tracking?.upstreamId === upstreamId) {
+        if (Object.hasOwn(rpcMessage, "error")) this.modelRecovery?.rejectExpectedTurn?.(client, upstreamId, metadataGeneration);
         desktopResponse = { requestId: rpcMessage.id, method: tracking.method };
         const budgetError = createDesktopResponseBudgetError({ requestId: rpcMessage.id, method: tracking.method,
           responseBytes: originalByteLength, limit: this.maxDesktopResponseBytes ?? DEFAULT_DESKTOP_RESPONSE_LIMIT_BYTES });
@@ -1154,9 +1177,12 @@ export class CodexAppServerProxy {
         client.desktopRequestIds.delete(rpcMessage.id);
       }
     } else if (typeof rpcMessage.method === "string" && !Object.hasOwn(rpcMessage, "id")) {
+      const recoverySubscribed = this.modelRecovery?.observeNative(client, rpcMessage, metadataGeneration) === true;
       if (this.onNativeTurn && ["turn/started", "turn/completed"].includes(rpcMessage.method)) {
         try {
-          Promise.resolve(this.onNativeTurn(structuredClone(rpcMessage))).catch(error => this._liveRecordError("native_turn_observer", error));
+          Promise.resolve(this.onNativeTurn(structuredClone(rpcMessage), {
+            ...(recoverySubscribed ? { connectionGeneration: metadataGeneration } : {}),
+          })).catch(error => this._liveRecordError("native_turn_observer", error));
         } catch (error) { this._liveRecordError("native_turn_observer", error); }
       }
       client.turnObserver.observeUpstream(rpcMessage);
@@ -1221,7 +1247,7 @@ export class CodexAppServerProxy {
     client.nextReconnectAt = null;
     const upstream = new this.WebSocketImpl(this.upstreamUrl, { maxPayload: this.maxWebSocketPayloadBytes });
     client.upstream = upstream;
-    const metadataGeneration = this._liveNewMetadataGeneration();
+    const metadataGeneration = this._liveNewMetadataGeneration() ?? (this.modelRecovery ? crypto.randomUUID() : null);
     client.metadataUpstreamGeneration = metadataGeneration;
     upstream.on("open", () => this._liveUpstreamOpened(client, upstream));
     upstream.on("message", (data, isBinary) => this._liveReceiveUpstream(client, upstream, metadataGeneration, data, isBinary));
@@ -1304,7 +1330,7 @@ export class CodexAppServerProxy {
 
   _liveForwardDesktopMessage(client, upstream, queued) {
     const observation = queued.observation;
-    if (observation.method === "turn/start" && !observation.threadId) {
+    if (NATIVE_TURN_START_METHODS.has(observation.method) && !observation.threadId) {
       const envelope = this._liveReadRpcEnvelope(client, queued.data, "queued");
       if (!envelope) return;
       observation.threadId = envelope.message.params?.threadId;
@@ -1312,10 +1338,12 @@ export class CodexAppServerProxy {
     const forward = () => {
       if (client.closed || client.upstream !== upstream) return;
       if (this._liveSendOrClose(client, upstream, queued.data, queued.isBinary, "downstream_to_upstream")) {
+        if (NATIVE_TURN_START_METHODS.has(observation.method)) this.modelRecovery?.expectTurn(client, observation.threadId,
+          client.desktopRequestIds.get(observation.id)?.upstreamId ?? observation.id, client.metadataUpstreamGeneration);
         client.turnObserver.markForwarded(observation);
       }
     };
-    if (observation.method !== "turn/start" || !observation.threadId || !this.managedInnerControl) {
+    if (!NATIVE_TURN_START_METHODS.has(observation.method) || !observation.threadId || !this.managedInnerControl) {
       forward();
       return;
     }
@@ -1453,7 +1481,7 @@ export class CodexAppServerProxy {
   }
 
   _liveInjectRequest(client, method, params, options = {}) {
-    if (method === "turn/start" && params?.threadId && !options.turnRecoveryChecked) {
+    if (NATIVE_TURN_START_METHODS.has(method) && params?.threadId && !options.turnRecoveryChecked) {
       const recoverBeforeTurn = this._liveRecoverBeforeTurn.bind(this);
       const injectRequest = this._liveInjectRequest.bind(this);
       return Promise.resolve().then(() => recoverBeforeTurn(client, params.threadId)).then(() => {
@@ -1494,6 +1522,7 @@ export class CodexAppServerProxy {
         this._liveObserveRequestMetadata("downstream", client.metadataUpstreamGeneration, request, messageByteLength(payload));
         client.upstream.send(payload);
         pending.written = true;
+        if (NATIVE_TURN_START_METHODS.has(method)) this.modelRecovery?.expectTurn(client, params?.threadId, id, client.metadataUpstreamGeneration);
         this.displayPolicyControl.observeRpc("written", id, method);
       } catch (cause) {
         client.injected.delete(id);
@@ -1511,6 +1540,7 @@ export class CodexAppServerProxy {
   _liveCloseClient(client, reason, error = null, closeCode = 1000) {
     if (client.closed) return;
     client.closed = true;
+    this.modelRecovery?.closeClient(client);
     this._liveCloseMetadataConnection(client.metadataDownstreamGeneration);
     this._liveCloseMetadataConnection(client.metadataUpstreamGeneration);
     client.metadataDownstreamGeneration = null;
@@ -1549,13 +1579,43 @@ export class CodexAppServerProxy {
 
   async _liveHandleControlRequest(request, response) {
     response.setHeader("content-type", "application/json; charset=utf-8");
+    const requestUrl = new URL(request.url ?? "/", `http://${this.controlHost === "::1" ? "[::1]" : this.controlHost}:${this.controlPort}`);
+    if (requestUrl.pathname.startsWith("/v1/inner/")) {
+      response.setHeader("cache-control", "no-store");
+      response.setHeader("referrer-policy", "no-referrer");
+      response.setHeader("x-content-type-options", "nosniff");
+      const port = this.controlServer?.address()?.port ?? this.controlPort;
+      const origin = `http://${this.controlHost === "::1" ? "[::1]" : this.controlHost}:${port}`;
+      if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)
+        || request.headers.host !== new URL(origin).host
+        || (request.headers.origin && request.headers.origin !== origin)
+        || request.headers["sec-fetch-site"] === "cross-site") {
+        response.statusCode = 403;
+        response.end(JSON.stringify({ ok: false, error: { code: "INNER_CONTROL_SAME_ORIGIN_REQUIRED" } }));
+        return;
+      }
+      if (requestUrl.pathname === "/v1/inner/recovery") {
+        if (!this.managedInnerControl || request.method !== "GET" || requestUrl.search) {
+          response.statusCode = !this.managedInnerControl ? 404 : requestUrl.search ? 400 : 405;
+          response.end(JSON.stringify({ ok: false, error: { code: "INNER_RECOVERY_PAGE_UNAVAILABLE" } }));
+          return;
+        }
+        const nonce = crypto.randomBytes(24).toString("hex");
+        response.setHeader("content-type", "text/html; charset=utf-8");
+        response.setHeader("content-security-policy", `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'nonce-${nonce}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`);
+        response.setHeader("x-frame-options", "DENY");
+        response.setHeader("cross-origin-opener-policy", "same-origin");
+        const { renderInnerRecoveryControlPage } = await import("./inner-recovery-control-page.mjs");
+        response.end(renderInnerRecoveryControlPage(nonce));
+        return;
+      }
+    }
     const authorization = String(request.headers.authorization ?? "");
     const expectedAuthorization = `Bearer ${this.controlToken}`;
     const authorized = authorization.length === expectedAuthorization.length
       && crypto.timingSafeEqual(Buffer.from(authorization), Buffer.from(expectedAuthorization));
     if (!authorized) throw new CodexAppServerProxyError("UNAUTHORIZED", "代理控制口令不正确");
-    const requestUrl = new URL(request.url ?? "/", `http://${this.controlHost}:${this.controlPort}`);
-    if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback|reconcile-terminal)$/.test(requestUrl.pathname)) {
+    if (/^\/v1\/inner\/(status|prepare|migrate|activate|rollback|reconcile-terminal|continue-http)$/.test(requestUrl.pathname)) {
       if (!this.managedInnerControl) {
         response.statusCode = 404;
         response.end(JSON.stringify({ ok: false, error: { code: "INNER_MANAGED_CONTROL_DISABLED" } }));

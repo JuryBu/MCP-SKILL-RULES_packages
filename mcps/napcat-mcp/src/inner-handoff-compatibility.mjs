@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { createModelOperationLedger } from "./model-operation-ledger.mjs";
 
 const MAX_EDGES = 4;
 const MAX_MANIFEST_BYTES = 8 * 1024;
@@ -42,12 +43,31 @@ export function fixedHandoffCompatibility(input) {
   return Object.freeze({ manifest: normalized, sha256: input.sha256 });
 }
 
+export function reverseHandoffCompatibility(compatibility) {
+  if (!compatibility) return undefined;
+  const approved = fixedHandoffCompatibility(compatibility);
+  const manifest = { schemaVersion: 1, edges: approved.manifest.edges.map(edge => ({ ...edge, source: edge.target, target: edge.source })) };
+  return fixedHandoffCompatibility({ manifest, sha256: digest(JSON.stringify(manifest)) });
+}
+
 export function acceptHandoffVersion({ compatibility, payload, targetHashes, currentTargetHashes }) {
   if (!sameVersion(targetHashes, currentTargetHashes)) fail("CHECKPOINT_TARGET_BYTES_CHANGED");
   const snapshot = payload.snapshot;
-  if (payload.schemaVersion !== 1 || !keys(snapshot, SNAPSHOT_FIELDS) || snapshot.schemaVersion !== 1
+  const snapshotFields = Object.hasOwn(snapshot ?? {}, "operationState")
+    ? [...SNAPSHOT_FIELDS, "operationState"] : SNAPSHOT_FIELDS;
+  if (payload.schemaVersion !== 1 || !keys(snapshot, snapshotFields) || snapshot.schemaVersion !== 1
     || !keys(snapshot.state, STATE_CHANNELS) || !STATE_CHANNELS.every(channel => Array.isArray(snapshot.state[channel]))) {
     fail("CHECKPOINT_INCOMPATIBLE_STATE_FORMAT");
+  }
+  if (Object.hasOwn(snapshot, "operationState")) {
+    if (!keys(snapshot.operationState, ["schemaVersion", "threadHash", "entries"])) {
+      fail("CHECKPOINT_INCOMPATIBLE_STATE_FORMAT");
+    }
+    try {
+      createModelOperationLedger().importThread(snapshot.threadId, snapshot.operationState);
+    } catch {
+      fail("CHECKPOINT_INCOMPATIBLE_STATE_FORMAT");
+    }
   }
   const sourceHashes = payload.source?.sourceHashes;
   if (!hash(sourceHashes?.core) || !hash(sourceHashes?.helper)) fail("CHECKPOINT_IDENTITY_MISMATCH");

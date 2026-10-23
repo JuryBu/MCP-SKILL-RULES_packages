@@ -74,6 +74,16 @@ function inspect() {
     return failure("invalid_json_object", decodedBytes);
   }
   const validModel = typeof payload.model === "string" && payload.model.length <= 256;
+  let hasImages = false;
+  if (workerData.includePayload === true) {
+    const pending = [payload.input];
+    while (pending.length && !hasImages) {
+      const value = pending.pop();
+      if (value === null || typeof value !== "object") continue;
+      if (value.type === "input_image" || Object.hasOwn(value, "image_url")) hasImages = true;
+      else for (const child of Object.values(value)) if (child && typeof child === "object") pending.push(child);
+    }
+  }
   return { ok: true, value: {
     model: validModel ? payload.model : null,
     modelInvalid: payload.model != null && !validModel,
@@ -81,6 +91,7 @@ function inspect() {
     contextHint: classifyContextHint(payload),
     decodedBytes,
     contentEncoding,
+    ...(workerData.includePayload === true ? { payload, hasImages } : {}),
   } };
 }
 

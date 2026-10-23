@@ -333,9 +333,11 @@ test("activation rollback restores default and pending source requests without r
   assert.equal(restored.selectionRestored, true);
   assert.deepEqual(restored.retainedThreadIds, []);
   assert.equal(restored.defaultWorkerId, state.endpoint.workerId);
-  await followup;
+  await pause(40);
+  assert.equal(state.calls.length, 1);
   state.release();
   await original;
+  await followup;
   assert.equal(state.calls.length, 2);
   assert.ok(state.events.filter(event => event.type === "request_routed").every(event => event.workerId === state.endpoint.workerId));
   assert.equal(state.coordinator.status().threads[0].pendingActivationId, null);

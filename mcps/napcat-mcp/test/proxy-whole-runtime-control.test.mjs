@@ -238,10 +238,13 @@ test("registration reclaims retired workers before trimming four live source app
       alive: true, ready: true, sourceHashes: candidate.expectedHashes }));
     value.workers.push(...registeredWorkers);
     let reclamations = 0;
+    let deferredRollback;
     value.coordinator.liveCodeParticipant = () => ({ snapshot: () => ({ state: { dispatch: async method => {
       assert.equal(method, "reclaimRetiredWorkers");
       reclamations += 1;
       assert.equal(value.runtime.status().busy, true);
+      deferredRollback = value.runtime.recover({ automaticRollback: { type: "activation_automatically_rolled_back",
+        activationId: "completed-activation", failedWorkerId: "retired-worker" } });
       if (release) registeredWorkers[0].alive = false;
     } } }) });
     if (release) {
@@ -254,6 +257,7 @@ test("registration reclaims retired workers before trimming four live source app
       assert.deepEqual(value.profile.approvedCandidates.map(candidate => candidate.id), ["source-0", "source-1", "source-2", "source-3"]);
     }
     assert.equal(reclamations, 1);
+    assert.deepEqual(await deferredRollback, { selectionRestored: false, reason: "selection_changed" });
     assert.equal(value.runtime.status().busy, false);
   }
 });
@@ -309,6 +313,80 @@ test("a fresh control recovers the durable version and an independent restore cl
   await fresh.restore({ instanceId: "fresh-instance", expectedRevision: fresh.status().revision });
   assert.equal(readInnerCandidateRegistry(value.profile).selection, null);
   assert.deepEqual(value.state.defaultWorker.sourceHashes, value.profile.initial.expectedHashes);
+});
+
+test("automatic worker rollback restores durable selection and a fresh control never boots the failed candidate", async context => {
+  const value = fixture(context);
+  const prepared = await value.runtime.prepare(value.input);
+  await value.runtime.activate({ instanceId: "instance", expectedRevision: 0, preparationId: prepared.id });
+  assert.equal(readInnerCandidateRegistry(value.profile).selection.candidateId, "owned-candidate");
+  value.coordinator.rollbackActivation();
+  const receipt = await value.runtime.recover({ automaticRollback: { type: "activation_automatically_rolled_back",
+    activationId: "activation", failedWorkerId: prepared.workerId } });
+  assert.equal(receipt.selectionRestored, true);
+  assert.equal(readInnerCandidateRegistry(value.profile).selection, null);
+  const previousCalls = value.state.workerCalls.length;
+  const fresh = createProxyWholeRuntimeControl(value.parent, value.coordinator, value.profile, "restarted", value.root);
+  await fresh.recover();
+  assert.equal(value.state.workerCalls.length, previousCalls);
+  assert.equal(value.state.defaultWorker, value.original);
+  assert.equal((await value.runtime.recover({ automaticRollback: { type: "activation_automatically_rolled_back",
+    activationId: "activation", failedWorkerId: prepared.workerId } })).selectionRestored, true);
+});
+
+test("automatic rollback refuses a changed durable selection instead of overwriting another activation", async context => {
+  const value = fixture(context);
+  const prepared = await value.runtime.prepare(value.input);
+  await value.runtime.activate({ instanceId: "instance", expectedRevision: 0, preparationId: prepared.id });
+  const registry = readInnerCandidateRegistry(value.profile);
+  const foreign = { ...registry.selection, manifestSha256: "b".repeat(64) };
+  const registryPath = path.join(value.profile.stateRoot, "inner-candidate-approvals.json");
+  const bytes = fs.readFileSync(registryPath);
+  const changed = JSON.parse(bytes);
+  changed.selection = foreign;
+  fs.writeFileSync(registryPath, JSON.stringify(changed));
+  await assert.rejects(value.runtime.recover({ automaticRollback: { type: "activation_automatically_rolled_back",
+    activationId: "activation", failedWorkerId: prepared.workerId } }));
+  assert.equal(JSON.parse(fs.readFileSync(registryPath)).selection.manifestSha256, foreign.manifestSha256);
+});
+
+test("automatic rollback retains the existing previousSelection instead of always clearing registry selection", async context => {
+  const value = fixture(context, true);
+  const first = await value.runtime.prepare(value.input);
+  await value.runtime.activate({ instanceId: "instance", expectedRevision: 0, preparationId: first.id });
+  const previousSelection = readInnerCandidateRegistry(value.profile).selection;
+  const secondBundle = value.writeActualBundle("owned-B");
+  const second = await value.runtime.prepare({ ...value.input, ...secondBundle, expectedRevision: value.state.revision + 1 });
+  await value.runtime.activate({ instanceId: "instance", expectedRevision: value.runtime.status().revision, preparationId: second.id });
+  const active = value.runtime.liveCodeParticipant().snapshot().state.selected;
+  assert.deepEqual(active.previousSelection, previousSelection);
+  value.coordinator.rollbackActivation();
+  await value.runtime.recover({ automaticRollback: { type: "activation_automatically_rolled_back",
+    activationId: active.activationId, failedWorkerId: second.workerId } });
+  assert.deepEqual(readInnerCandidateRegistry(value.profile).selection, previousSelection);
+});
+
+test("automatic rollback publication failure stays visible and can retry the same prior selection", async context => {
+  const value = fixture(context);
+  const prepared = await value.runtime.prepare(value.input);
+  await value.runtime.activate({ instanceId: "instance", expectedRevision: 0, preparationId: prepared.id });
+  value.coordinator.rollbackActivation();
+  const event = { type: "activation_automatically_rolled_back", activationId: "activation", failedWorkerId: prepared.workerId };
+  const originalRename = fs.renameSync;
+  try {
+    fs.renameSync = (source, target) => {
+      if (path.basename(target) === "inner-candidate-approvals.json") throw Object.assign(new Error("owned save failure"), { code: "EACCES" });
+      return originalRename(source, target);
+    };
+    await assert.rejects(value.runtime.recover({ automaticRollback: event }), { code: "EACCES" });
+    assert.equal(value.runtime.status().selectionRecoveryError, "EACCES");
+    assert.equal(value.runtime.status().failed, true);
+    assert.equal(readInnerCandidateRegistry(value.profile).selection.candidateId, "owned-candidate");
+  } finally { fs.renameSync = originalRename; }
+  assert.equal((await value.runtime.recover({ automaticRollback: event })).selectionRestored, true);
+  assert.equal(value.runtime.status().selectionRecoveryError, null);
+  assert.equal(value.runtime.status().failed, false);
+  assert.equal(readInnerCandidateRegistry(value.profile).selection, null);
 });
 
 test("preparing a whole control implementation cannot mutate nested live approvals or call a coordinator action", context => {

@@ -198,14 +198,16 @@ export function createManagedInnerProxySessionImplementation(shared) {
     const current = coordinator.status();
     const source = shared.nativeSource.status();
     const healthy = state === "running" && !shared.outerFinished && source.healthy && current.running
-      && current.nativeHealthy && current.workers.some(worker => worker.workerId === current.defaultWorkerId && worker.alive);
+      && current.nativeHealthy && !shared.selectionRecoveryError
+      && current.workers.some(worker => worker.workerId === current.defaultWorkerId && worker.alive);
     try {
       fs.writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, state: state === "running" && !healthy ? "degraded" : state,
         healthy, livenessAt: new Date().toISOString(), ownerId: configuration.ownerId,
         nativeSourceId: configuration.nativeSourceId, pid: process.pid, instanceToken: options.instanceToken,
         front: { pid: process.pid, host: "127.0.0.1", port: shared.innerEndpoint?.port ?? null, listening: current.running },
         innerEndpoint: shared.innerEndpoint, nativeSource: source, stopFilePath: options.stopFilePath, outerResult: shared.outerResult,
-        error: shared.cleanupError, coordinator: current, controlRevision: shared.controlRevision, controlBusy: shared.controlBusy,
+        error: shared.cleanupError, selectionRecoveryError: shared.selectionRecoveryError ?? null,
+        coordinator: current, controlRevision: shared.controlRevision, controlBusy: shared.controlBusy,
         controlOperations: [...shared.controlOperations.values()] }), { flag: "wx" });
       fs.renameSync(temporary, statePath);
     } finally { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
@@ -321,6 +323,10 @@ export function createManagedInnerProxySessionImplementation(shared) {
     bindControl(input);
     const current = controlStatus();
     if (method === "status") return current;
+    if (method === "continue-http") {
+      const result = await coordinator.recoveryControl(method, input);
+      return { ok: result.accepted === true, ...result };
+    }
     if (shared.controlOperations.has(input.requestId)) throw new Error("INNER_CONTROL_DUPLICATE_REQUEST_CHECK_STATUS");
     if (shared.controlBusy) throw new Error("INNER_CONTROL_BUSY");
     if (typeof input.requestId !== "string" || !/^[a-zA-Z0-9_.:-]{1,128}$/u.test(input.requestId)
@@ -429,9 +435,12 @@ export function createManagedInnerProxySessionImplementation(shared) {
   }
   function createOuterProxy(proxyOptions) {
     const proxy = createCodexAppServerProxy({ ...proxyOptions,
+      modelRecoveryControl: { ownerId: configuration.ownerId, nativeSourceId: configuration.nativeSourceId,
+        bindingFor: (threadId, turnId, requestId) => coordinator.recoveryControl("binding", { threadId, turnId, requestId }) },
       ...(shared.managedInnerControl ? { managedInnerControl: shared.managedInnerControl } : {}),
       onNativeTurn: shared.bindDispatch("handleNativeTurn"),
       onEvent: shared.bindDispatch("handleOuterEvent", proxyOptions) });
+    shared.recoveryProxy = proxy;
     if (options.outerRuntimeRoot && shared.serviceCodeParticipant) {
       const wholeControl = runtimeProfile ? createProxyWholeRuntimeControl(null, coordinator, runtimeProfile,
         proxyOptions.instanceToken, options.outerRuntimeRoot) : null;
@@ -472,16 +481,34 @@ export function createManagedInnerProxySessionImplementation(shared) {
   return {
     dispatchControl, createOuterProxy, handleOuterFinished, refreshPublishedStatus,
     handleCoordinatorEvent(event) {
+      if (event.type === "model_recovery_state") shared.recoveryProxy?.publishRecoveryState(event.envelope);
+      if (event.type === "activation_automatically_rolled_back" && shared.parentCodeRuntime?.recover) {
+        shared.selectionRecoveryTask = Promise.resolve(shared.parentCodeRuntime.recover({ automaticRollback: event }))
+          .then(receipt => {
+            shared.selectionRecoveryError = null;
+            onEvent({ type: receipt.selectionRestored ? "automatic_rollback_selection_saved" : "automatic_rollback_selection_skipped",
+              activationId: event.activationId, ...receipt });
+            if (runtimeProfile && shared.publicationStarted && !shared.closed) refreshPublishedStatus();
+          }, error => {
+            shared.selectionRecoveryError = error.code ?? error.message;
+            onEvent({ type: "automatic_rollback_selection_failed", activationId: event.activationId,
+              code: shared.selectionRecoveryError });
+            if (runtimeProfile && shared.publicationStarted && !shared.closed) refreshPublishedStatus();
+          });
+      }
       onEvent(event);
       if (runtimeProfile && shared.publicationStarted && !shared.closed) refreshPublishedStatus();
     },
-    handleNativeTurn(message) {
+    handleNativeTurn(message, context = {}) {
       if (shared.nativeSourceGeneration !== nativeSourceGeneration && shared.nativeSource.status().healthy) {
         shared.nativeSource = createInnerNativeTurnSource({ sourceId: configuration.nativeSourceId, coordinator,
           previousSource: shared.nativeSource });
         shared.nativeSourceGeneration = nativeSourceGeneration;
       }
-      return shared.nativeSource.observe(message);
+      const observed = shared.nativeSource.observe(context.connectionGeneration
+        ? { ...message, recoveryConnectionGeneration: context.connectionGeneration } : message);
+      return context.connectionGeneration ? coordinator.recoveryControl("bind-native", {
+        threadId: message.params.threadId, turnId: message.params.turn.id, connectionGeneration: context.connectionGeneration }) : observed;
     },
     handleOuterEvent(proxyOptions, event) {
       if (event.type === "upstream_session_lost") {

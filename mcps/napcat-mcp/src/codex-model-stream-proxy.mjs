@@ -6,15 +6,17 @@ import { createRequestInspector, RequestInspectionError } from "./request-body-i
 import { collectRequestBody, createRequestBodyOwner, createRequestBufferBudget } from "./request-body-buffer.mjs";
 import { createRequestObservation } from "./model-observation-hooks.mjs";
 import { correlationQuality, hashIdentity } from "./observability-utils.mjs";
-import { createStreamRecovery, waitForRetry } from "./codex-stream-recovery.mjs";
+import { createStreamRecovery, waitForRetry, waitForRecoveryAction } from "./codex-stream-recovery.mjs";
 import { createToolPreparationDeadline } from "./tool-preparation-deadline.mjs";
 import { createReasoningProgressTracker } from "./reasoning-progress.mjs";
 import { partialResponsesSseProgress } from "./partial-response-progress.mjs";
 import { parseToolDeliveryProfile, toolIdentityHash } from "./tool-delivery-profile.mjs";
 import { createAdaptiveDeliveryRegistry, deliveryProfileKey } from "./adaptive-delivery.mjs";
-import { createRequestProgressTracker, createRequestWaitBudget, mergeRequestProgressState, mergeRequestWaitState, requestUploadAllowanceMs } from "./request-wait-budget.mjs";
+import { createRequestProgressTracker, createRequestWaitBudget, mergeRequestProgressState, mergeRequestWaitState, requestUploadAllowanceMs, DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB, MAX_UPLOAD_ALLOWANCE_MS } from "./request-wait-budget.mjs";
 import { createThreadRecoveryHandoff } from "./thread-recovery-handoff.mjs";
 import { createModelStreamFailureDiagnostics } from "./model-stream-failure-diagnostics.mjs";
+import { classifyModelFailure } from "./model-failure-policy.mjs";
+import { createModelOperationLedger } from "./model-operation-ledger.mjs";
 
 const DEFAULT_FIRST_PROGRESS_TIMEOUT_MS = 40_000;
 const DEFAULT_PROGRESS_IDLE_TIMEOUT_MS = 40_000;
@@ -281,9 +283,11 @@ function responseFailureDetails(event) {
   const capacity = !explicitPermanent && !usageLimit && (CAPACITY_CODES.has(code)
     || (!knownTransient && /selected model is at capacity|server overloaded/iu.test(message)));
   const permanent = explicitPermanent || (!knownTransient && !usageLimit && !capacity && EXPLICIT_PERMANENT_MESSAGE.test(message));
+  const statusCode = source?.status ?? source?.status_code ?? event?.status ?? event?.status_code;
   return {
     code: code || null,
     message: message.slice(0, 512) || null,
+    statusCode: Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599 ? statusCode : null,
     safetyPolicy,
     category: safetyPolicy ? "permanent" : usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
   };
@@ -503,27 +507,6 @@ function sseFrame(event) {
   return `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`;
 }
 
-function syntheticCompletion(requestId, notice) {
-  const compactId = requestId.replaceAll("-", "");
-  const responseId = `resp_proxy_${compactId}`;
-  const messageId = `msg_proxy_${compactId}`;
-  const message = {
-    type: "message",
-    id: messageId,
-    role: "assistant",
-    status: "completed",
-    content: [{ type: "output_text", text: notice }],
-    phase: "final_answer",
-  };
-  return [
-    { type: "response.created", sequence_number: 0, response: { id: responseId, status: "in_progress" } },
-    { type: "response.output_item.added", sequence_number: 1, output_index: 0, item: { ...message, status: "in_progress", content: [] } },
-    { type: "response.output_text.delta", sequence_number: 2, output_index: 0, item_id: messageId, content_index: 0, delta: notice },
-    { type: "response.output_item.done", sequence_number: 3, output_index: 0, item: message },
-    { type: "response.completed", sequence_number: 4, response: { id: responseId, status: "completed", output: [message] } },
-  ].map(sseFrame).join("");
-}
-
 function attemptKey(identity) {
   if (!identity.threadId || !identity.turnId || !identity.requestKind) return null;
   return `${identity.threadId}\u0000${identity.turnId}\u0000${identity.requestKind}`;
@@ -549,11 +532,6 @@ function forwardPassthrough(request, response, targetUrl, onEvent) {
   request.once("aborted", () => upstream.destroy());
   response.once("close", () => upstream.destroy());
   request.pipe(upstream);
-}
-
-function sendSyntheticCompletion(response, requestId, notice, headers = {}) {
-  ensureSseHead(response, headers);
-  response.end(syntheticCompletion(requestId, notice));
 }
 
 function isToolInputProgressType(type) {
@@ -582,6 +560,8 @@ function executeTurnAttempt(options) {
     consecutiveWaitLimitMs = adaptiveWaitLimitMs,
     priorWaitState,
     uploadAllowanceMs = 0,
+    uploadAllowanceMsPerMiB = 1000,
+    maxUploadAllowanceMs = 128_000,
     compactionRequest = false,
     upstreamIdleTimeoutMs,
     adaptiveStreamMinSpanMs,
@@ -590,9 +570,10 @@ function executeTurnAttempt(options) {
     requestState,
     observation,
     nativeAttempt,
+    upstreamClient,
   } = options;
   return new Promise((resolve) => {
-    const client = requestClient(targetUrl);
+    const client = upstreamClient ?? requestClient(targetUrl);
     const startedAt = Date.now();
     const chainWaitBudget = compactionRequest ? null : createRequestWaitBudget({ startedAt, uploadAllowanceMs,
       waitLimitMs: consecutiveWaitLimitMs, previous: priorWaitState });
@@ -600,6 +581,14 @@ function executeTurnAttempt(options) {
       waitLimitMs: adaptiveWaitLimitMs });
     const waitBudget = chainWaitBudget ? { ...chainWaitBudget,
       deadline: () => Math.min(chainWaitBudget.deadline(), attemptWaitBudget.deadline()),
+      noteUpload(time, allowance) {
+        attemptWaitBudget.noteUpload(time, allowance);
+        chainWaitBudget.noteUpload(time, allowance);
+      },
+      notePreparation(time, allowance) {
+        attemptWaitBudget.notePreparation(time, allowance);
+        chainWaitBudget.notePreparation(time, allowance);
+      },
       noteProgress(time) { attemptWaitBudget.noteProgress(time); return chainWaitBudget.noteProgress(time); },
     } : null;
     const progressTracker = createRequestProgressTracker(priorWaitState?.progressIdentityState, `attempt-${nativeAttempt ?? startedAt}`);
@@ -651,6 +640,10 @@ function executeTurnAttempt(options) {
     let normalReason = "FIRST_PROGRESS_TIMEOUT";
     const failureDiagnostics = createModelStreamFailureDiagnostics();
     let diagnosticSocket = null;
+    let modelResponseStarted = false;
+    let upstreamStatusCode;
+    let explicitAcceptance;
+    let requestTransmissionState = "not_started";
     const noteConnection = () => failureDiagnostics.connected();
     const noteTlsConnection = () => failureDiagnostics.connected(true);
 
@@ -672,6 +665,8 @@ function executeTurnAttempt(options) {
       diagnosticSocket?.removeListener("secureConnect", noteTlsConnection);
       if (outcome.kind === "completed") adaptive?.complete(Date.now(), !sawCompaction);
       requestState.currentAbort = null;
+      requestState.onPreparationProgress = null;
+      requestState.onPacketSending = null;
       if (!upstream.writableFinished) upstream.destroy();
       upstreamResponse?.destroy();
       const phase = holdingToolDone ? "tool_completion_barrier" : sawLocalTool ? "tool_parameters"
@@ -679,10 +674,35 @@ function executeTurnAttempt(options) {
       const endCause = outcome.origin ?? (outcome.reason === "DOWNSTREAM_CANCELLED" ? "downstream_cancel_user_origin_unknown"
         : /^HTTP_/u.test(outcome.reason ?? "") ? "upstream_http"
         : terminalFailure ? "upstream_error" : outcome.kind === "completed" ? "upstream_completed" : "unknown");
-      resolve({ ...outcome, phase, endCause, contextPreparationHint: contextHint?.contextPreparationHint ?? null,
-        failureDiagnostics: failureDiagnostics.snapshot({ frames, progressObserved: lastProgressAt !== null }),
+      const diagnostics = failureDiagnostics.snapshot({ frames, progressObserved: lastProgressAt !== null });
+      const definitelyNotSent = !diagnostics.connectionObserved && !diagnostics.requestFinished
+        && !diagnostics.responseStarted && upstream.transport !== "websocket";
+      const rawAcceptance = upstream.operationAcceptance ?? explicitAcceptance;
+      const acceptance = rawAcceptance === "accepted" ? true
+        : ["rejected", "not_sent"].includes(rawAcceptance) ? false : rawAcceptance;
+      const transmission = upstream.requestTransmissionState ?? (definitelyNotSent ? "not_started" : requestTransmissionState);
+      const policy = classifyModelFailure({
+        source: terminalFailure ? "sse" : upstream.terminalEvidence ? "transport" : upstreamStatusCode >= 400 ? "http"
+          : outcome.origin === "upstream_transport" ? "transport" : "local",
+        statusCode: upstreamStatusCode,
+        code: outcome.failure?.code ?? outcome.reason,
+        message: outcome.failure?.message,
+        requestAccepted: acceptance,
+        requestTransmissionState: transmission,
+        responseStarted: modelResponseStarted,
+        terminalOutcome: upstream.terminalOutcome,
+        terminalEvidence: upstream.terminalEvidence,
+        progressObserved: lastProgressAt !== null,
+        toolDelivered: deliveredExecutableToolDone,
+        cancelled: outcome.kind === "cancelled",
+      });
+      resolve({ ...outcome, phase, endCause, policy, httpStatus: upstreamStatusCode,
+        requestAccepted: policy.acceptance,
+        requestTransmissionState: transmission, contextPreparationHint: contextHint?.contextPreparationHint ?? null,
+        failureDiagnostics: diagnostics,
         elapsedMs: Date.now() - startedAt, uploadAllowanceMs, firstProgressDelayMs: waitBudget?.firstProgressDelayMs() ?? null,
         ...(!sawCompaction ? { ...waitBudget?.snapshot(Date.now()), progressIdentityState: progressTracker.snapshot() } : {}),
+        progressObserved: lastProgressAt !== null,
         frames, sawContent, sawReplayUnsafeContent, sawSubstantiveWork, sawExecutableToolDone, deliveredExecutableToolDone, holdingToolDone, preparationPending: preparation.active(), sawTool, sawCompaction, sawHostedTool, toolItemTypes: [...toolItemTypes], toolNames: [...toolNames] });
     };
     const abortWith = (reason) => {
@@ -828,10 +848,42 @@ function executeTurnAttempt(options) {
       if (!settled && !waitingForDrain && !completionPending) upstreamResponse?.resume();
     };
     const noteProgress = (time, type) => {
+      requestState.onBusinessProgress?.({ progressType: type, observedAt: time });
       if (waitBudget?.noteProgress(time)) {
         onEvent({ type: "first_progress_observed", elapsedMs: time - startedAt, progressType: type,
           encodedBytes: requestBody.bytes, uploadAllowanceMs });
       }
+    };
+    let packetSequence = 0;
+    requestState.onPacketSending = (progress) => {
+      if (settled || requestState.cancelled || lastProgressAt !== null
+        || progress?.operationId !== requestState.requestId || progress?.sessionKey !== requestState.threadId
+        || progress.phase !== "packet_sending" || progress.businessProgress !== false
+        || !Number.isSafeInteger(progress.sequence) || progress.sequence <= packetSequence
+        || !Number.isSafeInteger(progress.wireBytes) || progress.wireBytes < 0) return 0;
+      packetSequence = progress.sequence;
+      const observedAt = Date.now();
+      const packetUploadAllowanceMs = requestUploadAllowanceMs(progress.wireBytes, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
+      waitBudget?.noteUpload(observedAt, packetUploadAllowanceMs);
+      armTimer(firstProgressTimeoutMs + packetUploadAllowanceMs, "FIRST_PROGRESS_TIMEOUT");
+      onEvent({ type: "incremental_packet_upload_started", requestId: requestState.requestId,
+        threadId: requestState.threadId, sequence: progress.sequence, generation: progress.generation,
+        packetWireBytes: progress.wireBytes, warm: progress.warm, uploadAllowanceMs: packetUploadAllowanceMs,
+        firstProgressDeadlineAt: normalDeadline, waitDeadlineAt: waitBudget?.deadline(), businessProgress: false });
+      return packetUploadAllowanceMs;
+    };
+    let preparationSequence = 0;
+    requestState.onPreparationProgress = (progress) => {
+      if (settled || requestState.cancelled || lastProgressAt !== null
+        || progress?.operationId !== requestState.requestId || progress?.sessionKey !== requestState.threadId
+        || progress.phase !== "prewarm_completed" || progress.businessProgress !== false
+        || !Number.isSafeInteger(progress.sequence) || progress.sequence <= preparationSequence) return;
+      preparationSequence = progress.sequence;
+      waitBudget?.notePreparation(Date.now());
+      onEvent({ type: "incremental_prewarm_progress", requestId: requestState.requestId,
+        threadId: requestState.threadId, sequence: progress.sequence,
+        preparedPackets: progress.preparedPackets, preparedInputItems: progress.preparedInputItems,
+        remainingPackets: progress.remainingPackets, businessProgress: false });
     };
     const completeFromUpstream = (wire) => {
       if (adaptiveDeadlineExpired()) return;
@@ -871,6 +923,7 @@ function executeTurnAttempt(options) {
       upstreamResponse = response;
       upstreamHeaders = response.headers;
       const statusCode = response.statusCode ?? 502;
+      upstreamStatusCode = statusCode;
       failureDiagnostics.responseStarted(statusCode, upstreamHeaders);
       response.on("data", (chunk) => failureDiagnostics.responseData(chunk.length));
       observation?.headers(response.headers, statusCode);
@@ -911,6 +964,7 @@ function executeTurnAttempt(options) {
         const parsed = parseSseFrame(frame);
         const event = parsed.event;
         const type = parsed.type;
+        if (type === "response.created" || type === "response.in_progress" || type === "response.completed") modelResponseStarted = true;
         const freshProgressEvent = progressTracker.observe(event);
         observation?.event(event);
         const now = Date.now();
@@ -968,6 +1022,7 @@ function executeTurnAttempt(options) {
         }
         if (type === "response.failed" || type === "response.incomplete" || type === "error") {
           terminalFailure = responseFailureDetails(event);
+          if (terminalFailure.statusCode !== null) upstreamStatusCode = terminalFailure.statusCode;
           const kind = terminalFailure.category === "usage_limit"
             ? "usage_limit"
             : terminalFailure.category === "permanent"
@@ -1085,19 +1140,27 @@ function executeTurnAttempt(options) {
       });
       response.once("error", (error) => {
         if (settled || requestState.cancelled) return;
+        explicitAcceptance = error.requestAccepted ?? explicitAcceptance;
+        if (error.requestTransmissionState) requestTransmissionState = error.requestTransmissionState;
+        if (Number.isInteger(error.httpStatus)) upstreamStatusCode = error.httpStatus;
         failureDiagnostics.transportError("response", error);
         finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
       });
     });
     upstream.once("error", (error) => {
       if (settled || requestState.cancelled) return;
+      explicitAcceptance = error.requestAccepted;
+      if (error.requestTransmissionState) requestTransmissionState = error.requestTransmissionState;
+      if (Number.isInteger(error.httpStatus)) upstreamStatusCode = error.httpStatus;
       failureDiagnostics.transportError("request", error);
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
     });
+    requestTransmissionState = "started";
     requestBody.submit(upstream, bodyBytes => {
+      requestTransmissionState = "finished";
       failureDiagnostics.requestFinished(bodyBytes);
       onEvent({ type: "upstream_request_finished", elapsedMs: Date.now() - startedAt, bodyBytes,
-        meaning: "local_os_handoff" });
+        meaning: upstream.transport === "websocket" ? "local_adapter_body_received" : "local_os_handoff" });
     });
     observation?.submitted(nativeAttempt);
   });
@@ -1131,6 +1194,8 @@ function executeBufferedCompactionAttempt(options) {
     const client = requestClient(targetUrl);
     let settled = false;
     let upstreamResponse = null;
+    let requestFinished = false;
+    let connectionObserved = false;
     const finish = (outcome) => {
       if (settled) return;
       settled = true;
@@ -1138,7 +1203,15 @@ function executeBufferedCompactionAttempt(options) {
       clearTimeout(timer);
       requestState.currentAbort = null;
       if (!upstream.writableFinished) upstream.destroy();
-      resolve(outcome);
+      const policy = classifyModelFailure({
+        source: outcome.statusCode >= 400 ? "http" : outcome.failure ? "sse" : "transport",
+        statusCode: outcome.statusCode, code: outcome.failure?.code ?? outcome.reason,
+        message: outcome.failure?.message,
+        requestTransmissionState: !connectionObserved && !requestFinished && !upstreamResponse ? "not_started"
+          : requestFinished ? "finished" : "started",
+        cancelled: outcome.kind === "cancelled",
+      });
+      resolve({ ...outcome, policy });
     };
     const timer = setTimeout(() => {
       if (settled || requestState.cancelled) return;
@@ -1150,6 +1223,11 @@ function executeBufferedCompactionAttempt(options) {
     const upstream = client.request(targetUrl, {
       method,
       headers: { ...sanitizeForwardHeaders(headers, targetUrl.host, requestBody.bytes), "accept-encoding": "identity" },
+    });
+    upstream.once("socket", socket => {
+      if (!socket.connecting) connectionObserved = true;
+      socket.once("connect", () => { connectionObserved = true; });
+      socket.once("secureConnect", () => { connectionObserved = true; });
     });
     requestState.currentAbort = () => {
       upstreamResponse?.destroy();
@@ -1218,6 +1296,7 @@ function executeBufferedCompactionAttempt(options) {
       finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR" });
     });
     requestBody.submit(upstream, bodyBytes => {
+      requestFinished = true;
       onEvent?.({ type: "upstream_request_finished", bodyBytes, meaning: "local_os_handoff" });
     });
     observation?.submitted();
@@ -1246,8 +1325,8 @@ export function createCodexModelStreamProxy(options = {}) {
     Math.max(firstProgressTimeoutMs, Math.min(DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS,
       Math.round(firstProgressTimeoutMs * DEFAULT_RETRY_PROGRESS_IDLE_TIMEOUT_MS / DEFAULT_FIRST_PROGRESS_TIMEOUT_MS))),
     10, 300_000, "retryFirstProgressTimeoutMs");
-  const uploadAllowanceMsPerMiB = integerOption(options.uploadAllowanceMsPerMiB, 1000, 0, 60_000, "uploadAllowanceMsPerMiB");
-  const maxUploadAllowanceMs = integerOption(options.maxUploadAllowanceMs, 128_000, 0, 600_000, "maxUploadAllowanceMs");
+  const uploadAllowanceMsPerMiB = integerOption(options.uploadAllowanceMsPerMiB, DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB, 0, 60_000, "uploadAllowanceMsPerMiB");
+  const maxUploadAllowanceMs = integerOption(options.maxUploadAllowanceMs, 128 * uploadAllowanceMsPerMiB, 0, MAX_UPLOAD_ALLOWANCE_MS, "maxUploadAllowanceMs");
   const progressIdleTimeoutMs = integerOption(options.progressIdleTimeoutMs, DEFAULT_PROGRESS_IDLE_TIMEOUT_MS, 10, 300_000, "progressIdleTimeoutMs");
   const reasoningProgressIdleTimeoutMs = integerOption(options.reasoningProgressIdleTimeoutMs,
     Math.max(progressIdleTimeoutMs, Math.min(DEFAULT_REASONING_PROGRESS_IDLE_TIMEOUT_MS,
@@ -1274,6 +1353,14 @@ export function createCodexModelStreamProxy(options = {}) {
   const requestInspectionTimeoutMs = integerOption(options.requestInspectionTimeoutMs, 15_000, 10, 60_000, "requestInspectionTimeoutMs");
   const requestInspector = createRequestInspector({ maxDecodedBytes: maxDecodedRequestBytes, concurrency: 1, maxQueued: 16, timeoutMs: requestInspectionTimeoutMs });
   const requestBufferBudget = createRequestBufferBudget(maxTotalRequestBytes);
+  const managedRecovery = options.managedRecovery === true;
+  const managedRetryBaseMs = integerOption(options.managedRetryBaseMs, 5000, 10, 60_000, "managedRetryBaseMs");
+  const largeHttpBodyBytes = integerOption(options.largeHttpBodyBytes, 4 * 1024 * 1024, 1024, 256 * 1024 * 1024, "largeHttpBodyBytes");
+  const incrementalTransport = options.incrementalTransport ?? null;
+  const incrementalUpstreamUrl = options.incrementalUpstreamUrl ? new URL(options.incrementalUpstreamUrl) : null;
+  if (incrementalTransport && (!incrementalUpstreamUrl || !["ws:", "wss:"].includes(incrementalUpstreamUrl.protocol))) {
+    throw new Error("Incremental transport requires an explicit ws or wss upstream URL");
+  }
   const maxBufferedResponseBytes = integerOption(options.maxBufferedResponseBytes, DEFAULT_MAX_BUFFERED_RESPONSE_BYTES, 1_024, 256 * 1024 * 1024, "maxBufferedResponseBytes");
   const maxConsecutiveAttempts = integerOption(options.maxConsecutiveAttempts, DEFAULT_MAX_CONSECUTIVE_ATTEMPTS, 1, 20, "maxConsecutiveAttempts");
   const consecutiveWaitLimitMs = integerOption(options.consecutiveWaitLimitMs,
@@ -1296,15 +1383,33 @@ export function createCodexModelStreamProxy(options = {}) {
     }
     : () => {};
   const active = new Map();
+  const operationClaims = new Map();
   const attempts = new Map();
   const emptyIdleTurns = new Map();
   const businessProgress = new Map();
   const waitTerminals = new Map();
+  const websocketCooldowns = new Map();
+  const websocketNow = typeof options.websocketNow === "function" ? options.websocketNow : Date.now;
+  const deferWebsocket = threadId => {
+    const failures = (websocketCooldowns.get(threadId)?.failures ?? 0) + 1;
+    const delayMs = [60_000, 300_000, 900_000][Math.min(failures - 1, 2)];
+    websocketCooldowns.delete(threadId);
+    websocketCooldowns.set(threadId, { failures, retryAt: websocketNow() + delayMs });
+    if (websocketCooldowns.size > 2048) websocketCooldowns.delete(websocketCooldowns.keys().next().value);
+    return delayMs;
+  };
+  const operationLedger = managedRecovery || incrementalTransport ? createModelOperationLedger({
+    state: options.operationState, onStateChange: options.onOperationStateChange,
+    maxEntries: options.maxUnresolvedOperations,
+  }) : null;
   const recoveryHandoff = createThreadRecoveryHandoff({
+    state: options.durableRecoveryState,
+    onStateChange: options.onDurableRecoveryStateChange,
     maps: { attempts, emptyIdleTurns, businessProgress, waitTerminals },
     active,
+    operationLedger,
     policy: { upstreamOrigin: upstreamOrigin.origin, attemptStateTtlMs, maxConsecutiveAttempts,
-      consecutiveWaitLimitMs, adaptiveWaitLimitMs },
+      consecutiveWaitLimitMs, adaptiveWaitLimitMs, operationLedgerSchema: operationLedger ? 1 : null },
   });
   const sockets = new Set();
   let draining = false;
@@ -1327,7 +1432,9 @@ export function createCodexModelStreamProxy(options = {}) {
     for (const [key, state] of attempts) if (state.updatedAt < cutoff) attempts.delete(key);
     for (const [key, state] of emptyIdleTurns) if (state.updatedAt < cutoff) emptyIdleTurns.delete(key);
     for (const [key, state] of businessProgress) if (state.updatedAt < cutoff) businessProgress.delete(key);
-    for (const [key, state] of waitTerminals) if (state.updatedAt < cutoff) waitTerminals.delete(key);
+    for (const [key, state] of waitTerminals) {
+      if (state.updatedAt < cutoff && !["unknown", "accepted"].includes(state.acceptance)) waitTerminals.delete(key);
+    }
   };
   const recordBusinessProgress = (identity) => {
     const key = attemptKey(identity);
@@ -1345,17 +1452,9 @@ export function createCodexModelStreamProxy(options = {}) {
     if (!identity.threadId || !identity.turnId) return 0;
     const previous = emptyIdleTurns.get(identity.threadId);
     const count = previous?.turnId === identity.turnId ? previous.count : (previous?.count ?? 0) + 1;
-    emptyIdleTurns.set(identity.threadId, {
-      count,
-      turnId: identity.turnId,
-      terminalTurnId: count >= 3 ? identity.turnId : previous?.terminalTurnId ?? null,
-      updatedAt: Date.now(),
-    });
+    emptyIdleTurns.set(identity.threadId, { count, turnId: identity.turnId,
+      terminalTurnId: count >= 3 ? identity.turnId : previous?.terminalTurnId ?? null, updatedAt: Date.now() });
     return count;
-  };
-  const isTerminalEmptyTurn = (identity) => {
-    return Boolean(identity.threadId && identity.turnId
-      && emptyIdleTurns.get(identity.threadId)?.terminalTurnId === identity.turnId);
   };
 
   const server = http.createServer(async (request, response) => {
@@ -1413,6 +1512,17 @@ export function createCodexModelStreamProxy(options = {}) {
     counters.total += 1;
     pruneAttempts();
     const identity = classifyCodexModelRequest(request);
+    const key = attemptKey(identity);
+    if (managedRecovery && identity.guarded && !key) {
+      request.resume();
+      response.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ error: { code: "proxy_operation_identity_required",
+        message: "Managed recovery requires a stable thread, turn and request-kind identity." } }));
+      return;
+    }
+    const credentialIdentity = crypto.createHash("sha256")
+      .update(String(request.headers.authorization ?? "")).update("\0")
+      .update(String(request.headers["chatgpt-account-id"] ?? "")).digest("hex");
     if (identity.guarded && recoveryHandoff.blocked(identity.threadId)) {
       response.writeHead(503, { "content-type": "application/json", "connection": "close" });
       response.end(JSON.stringify({ error: { type: "thread_handoff_pending", message: "This thread is moving to another proxy generation." } }));
@@ -1426,11 +1536,22 @@ export function createCodexModelStreamProxy(options = {}) {
       : "unsupported";
     const observation = createRequestObservation({ emit: options.onModelObservation,
       producerInstance: observationInstance, requestId, endpoint });
-    const requestState = { threadId: identity.threadId, cancelled: false, currentAbort: null, downstreamFrames: 0, inspectionAbort: new AbortController() };
+    const requestState = { requestId, threadId: identity.threadId, turnId: identity.turnId,
+      requestKind: identity.requestKind, recoverySequence: 0, cancelled: false, currentAbort: null,
+      downstreamFrames: 0, inspectionAbort: new AbortController() };
+    if (key && operationClaims.has(key)) {
+      request.resume();
+      response.writeHead(409, { "content-type": "application/json; charset=utf-8" });
+      response.end(JSON.stringify({ error: { code: "proxy_operation_in_progress",
+        message: "This operation already has an active request. No duplicate upstream request was started." } }));
+      observation?.ended("failed");
+      return;
+    }
+    if (key) operationClaims.set(key, requestId);
     const compactionDeadlineAt = identity.requestKind === "compaction" ? Date.now() + compactionAttemptTimeoutMs : null;
     let compactionPreparationTimer = null;
     const bodyLease = requestBufferBudget.lease();
-    const requestBody = createRequestBodyOwner(bodyLease);
+    const requestBody = createRequestBodyOwner(bodyLease, { retainUntilReleased: managedRecovery || Boolean(incrementalTransport) });
     requestState.recovery = createStreamRecovery(requestId);
     active.set(requestId, requestState);
     const threadHash = hashIdentity(identity.threadId);
@@ -1451,7 +1572,6 @@ export function createCodexModelStreamProxy(options = {}) {
       guarded: identity.guarded,
       headerState: summarizeRequestHeaders(request.headers),
     });
-    const key = attemptKey(identity);
     const rememberAttemptFailure = (failures, startedAt, details = {}) => {
       if (!key) return;
       const previous = attempts.get(key);
@@ -1471,28 +1591,29 @@ export function createCodexModelStreamProxy(options = {}) {
           && Boolean(details.firstProgressRetryProbePending || previous?.firstProgressRetryProbePending),
       });
     };
-    const finishSoftTerminal = (notice, eventType, details = {}, headers = {}) => {
-      observation?.synthetic();
-      const canCountEmptyIdle = identity.requestKind === "turn" && Boolean(key) && details.category !== "safety_policy";
-      const emptyIdleCount = canCountEmptyIdle && !hasBusinessProgress(identity)
-        ? recordEmptyIdleTurn(identity)
-        : 0;
+    const finishTerminalFailure = (notice, eventType, details = {}, headers = {}) => {
+      observation?.ended("failed");
+      const canCountEmptyIdle = identity.requestKind === "turn" && Boolean(key)
+        && !["safety_policy", "safety", "local_state"].includes(details.category);
+      const emptyIdleCount = canCountEmptyIdle && !hasBusinessProgress(identity) ? recordEmptyIdleTurn(identity) : 0;
+      const repeatedEmptyIdle = emptyIdleCount >= 3;
+      const code = repeatedEmptyIdle ? "proxy_repeated_empty_idle" : details.code ?? details.reason ?? "proxy_request_failed";
+      const message = repeatedEmptyIdle && details.code !== code && details.reason !== code
+        ? `${notice}\n连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续。` : notice;
       ensureSseHead(response, headers);
-      if (canCountEmptyIdle && emptyIdleCount >= 3) {
-        response.end(requestState.recovery.fail(
-          "proxy_repeated_empty_idle",
-          "Three distinct turns ended without model text or completed tool work. The proxy stopped native retry for this turn.",
-        ));
-        counters.failed += 1;
-        emit({ type: "empty_idle_terminal_failure", emptyIdleCount, ...details });
-        return { hardFailure: true, emptyIdleCount };
+      if (key) waitTerminals.set(key, { notice: message, reason: code,
+        category: details.category, acceptance: details.acceptance, credentialIdentity, updatedAt: Date.now() });
+      const hardFailure = repeatedEmptyIdle || details.category === "local_state" || details.category === "acceptance_unknown"
+        || eventType === "request_acceptance_unresolved";
+      response.end(hardFailure ? requestState.recovery.fail(code, message) : requestState.recovery.finish(message));
+      if (hardFailure) counters.failed += 1;
+      else {
+        counters.syntheticCompletions += 1;
+        counters.softCompletions += 1;
       }
-      response.end(requestState.recovery.finish(notice));
-      counters.syntheticCompletions += 1;
-      counters.softCompletions += 1;
-      emit({ type: eventType, emptyIdleCount, ...details });
-      if (!key) emit({ type: "untracked_identity_soft_terminal", reason: details.reason ?? null });
-      return { hardFailure: false, emptyIdleCount };
+      emit({ type: repeatedEmptyIdle ? "empty_idle_terminal_failure" : eventType, emptyIdleCount, hardFailure, ...details });
+      if (!key) emit({ type: "untracked_identity_terminal_failure", reason: details.reason ?? null });
+      return { hardFailure, emptyIdleCount };
     };
     const finishAdaptiveWait = (reason, headers = {}) => {
       if (key) attempts.delete(key);
@@ -1500,13 +1621,48 @@ export function createCodexModelStreamProxy(options = {}) {
         ? `\n\n本次模型请求已达到${Math.ceil(adaptiveWaitLimitMs / 1000)}秒等待上限，已停止自动重试。`
         : "\n\n上游连接长时间未发送任何有效事件，本轮无法安全自动重试，已停止，请核对已有输出后继续。";
       if (key) waitTerminals.set(key, { notice, reason, updatedAt: Date.now() });
-      finishSoftTerminal(notice, "adaptive_wait_stopped", { reason, category: "wait_budget" }, headers);
+      finishTerminalFailure(notice, "adaptive_wait_stopped", { reason, category: "wait_budget" }, headers);
+    };
+    const recoveryState = state => {
+      requestState.recoverySequence += 1;
+      requestState.recoveryWait = { ...state, sequence: requestState.recoverySequence };
+      const event = { type: "model_recovery_state", requestId, threadId: identity.threadId, turnId: identity.turnId,
+        requestKind: identity.requestKind, ...requestState.recoveryWait };
+      emit(event);
+      try { options.onRecoveryState?.(event); } catch { emit({ type: "recovery_state_observer_failed" }); }
+    };
+    requestState.onBusinessProgress = progress => {
+      if (!["waiting", "retrying"].includes(requestState.recoveryWait?.phase)) return;
+      recoveryState({ ...requestState.recoveryWait, phase: "resumed", willRetry: false,
+        canContinueHttp: false, ...progress });
+    };
+    const waitForRecovery = async ({ delayMs, reason, acceptance, canContinueHttp = false,
+      retryNumber = 0, httpStatusCode = null, streamKeepalive = true }) => {
+      const state = { phase: "waiting", reason, acceptance, canContinueHttp, retryNumber,
+        willRetry: delayMs !== null, startedAt: Date.now(),
+        httpStatusCode: Number.isInteger(httpStatusCode) && httpStatusCode >= 100 && httpStatusCode <= 599
+          ? httpStatusCode : null };
+      recoveryState(state);
+      if (streamKeepalive) ensureSseHead(response);
+      const action = await waitForRecoveryAction(delayMs, requestState, { canContinueHttp,
+        keepaliveIntervalMs: Math.max(100, Math.min(1000, options.heartbeatIntervalMs ?? 1000)),
+        onKeepalive: () => {
+          if (response.destroyed || response.writableEnded) {
+            requestState.cancelled = true;
+            return;
+          }
+          if (streamKeepalive) response.write('event: ping\ndata: {"type":"ping"}\n\n');
+        },
+      });
+      recoveryState({ ...state, phase: action === "cancel" ? "stopped" : "retrying", willRetry: action !== "cancel" });
+      return action;
     };
     const finish = () => {
       observation?.ended(requestState.cancelled ? "cancelled" : "ended_unknown");
       clearTimeout(compactionPreparationTimer);
       requestBody.releaseUnused();
       active.delete(requestId);
+      if (key && operationClaims.get(key) === requestId) operationClaims.delete(key);
     };
     response.once("close", () => {
       if (response.writableFinished) return;
@@ -1554,7 +1710,14 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       requestBody.assign(await collectRequestBody(request, maxBufferedRequestBytes, bodyLease, requestState.inspectionAbort.signal,
         { idleTimeoutMs: requestInspectionTimeoutMs }));
-      const inspected = await requestInspector.inspect(requestBody.body, request.headers["content-encoding"], { signal: requestState.inspectionAbort.signal });
+      const inspected = await requestInspector.inspect(requestBody.body, request.headers["content-encoding"], {
+        signal: requestState.inspectionAbort.signal, includePayload: Boolean(incrementalTransport),
+      });
+      if (incrementalTransport && !bodyLease.reserve(inspected.decodedBytes)) {
+        throw Object.assign(new Error("Decoded request cannot fit the aggregate request budget"), {
+          code: "REQUEST_BUFFER_BUSY", statusCode: 503, errorType: "proxy_request_capacity", localRequestFailure: true,
+        });
+      }
       clearTimeout(compactionPreparationTimer);
       if (requestState.cancelled) return;
       const compactionRemainingMs = compactionDeadlineAt === null ? compactionAttemptTimeoutMs : Math.max(0, compactionDeadlineAt - Date.now());
@@ -1564,40 +1727,72 @@ export function createCodexModelStreamProxy(options = {}) {
         contentEncoding: inspected.contentEncoding, decodedLimit: maxDecodedRequestBytes });
       counters.guarded += 1;
       const contextHint = inspected.contextHint;
-      if (identity.requestKind === "turn" && key && waitTerminals.has(key)) {
-        finishSoftTerminal(waitTerminals.get(key).notice, "adaptive_wait_terminal_replayed", { reason: waitTerminals.get(key).reason });
+      if (key && waitTerminals.get(key)?.category === "authentication"
+        && waitTerminals.get(key).acceptance === "rejected"
+        && waitTerminals.get(key).credentialIdentity !== credentialIdentity) {
+        waitTerminals.delete(key);
+        attempts.delete(key);
+      }
+      const protectedOperation = key && operationLedger?.get(key);
+      if (key && waitTerminals.has(key) && !protectedOperation) {
+        const terminal = waitTerminals.get(key);
+        if (identity.requestKind === "compaction" && terminal.httpFailure) {
+          response.writeHead(terminal.httpFailure.statusCode, { "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store", ...terminal.httpFailure.headers });
+          response.end(JSON.stringify({ error: terminal.httpFailure.error }));
+          return;
+        }
+        finishTerminalFailure(terminal.notice, "adaptive_wait_terminal_replayed", terminal);
+        return;
+      }
+      if (protectedOperation) {
+        const code = "proxy_operation_recovery_protected";
+        const notice = "此前请求已发送，上游结果尚未核实，已保留恢复记录并停止重发。请取消当前回合，核对已有输出后再开始新回合。";
+        recoveryState({ phase: "failed", reason: code, acceptance: protectedOperation.acceptance,
+          category: "acceptance_unknown", willRetry: false, canContinueHttp: false });
+        finishTerminalFailure(notice, "request_acceptance_unresolved", {
+          code, reason: protectedOperation.reason, acceptance: protectedOperation.acceptance, category: "acceptance_unknown",
+        });
         return;
       }
       emit({ type: "request_phase_observed", ...contextHint });
+      if (identity.requestKind === "compaction" && identity.threadId) {
+        incrementalTransport?.invalidate(identity.threadId, "compaction");
+      }
       const transport = identity.requestKind === "compaction"
         ? compactionTransport(targetUrl, inspected, request.headers)
         : "sampling_sse";
-      if (identity.requestKind === "turn" && isTerminalEmptyTurn(identity)) {
-        observation?.synthetic();
-        observation?.ended("failed");
-        ensureSseHead(response);
-        response.end(requestState.recovery.fail(
-          "proxy_repeated_empty_idle",
-          "Three distinct turns ended without model text or completed tool work. The proxy stopped native retry for this turn.",
-        ));
-        counters.failed += 1;
-        emit({ type: "empty_idle_terminal_replayed" });
-        return;
-      }
 
       if (identity.requestKind === "compaction" && transport !== "sampling_sse") {
         emit({ type: "compaction_attempt_started", internalAttempt: 1, timeoutMs: compactionRemainingMs, classifiedTimeoutMs: compactionAttemptTimeoutMs });
-        const outcome = await executeBufferedCompactionAttempt({
+        let outcome;
+        let compactionRetryNumber = 0;
+        for (;;) {
+          if (key) operationLedger?.begin(key);
+          outcome = await executeBufferedCompactionAttempt({
           requestBody,
           headers: request.headers,
           method: request.method,
           targetUrl,
-          timeoutMs: compactionRemainingMs,
+          timeoutMs: Math.max(1, compactionDeadlineAt - Date.now()),
           maxBufferedResponseBytes,
           requestState,
           observation,
           onEvent: emit,
-        });
+          });
+          if (key) operationLedger?.settle(key, outcome);
+          if (!managedRecovery || requestState.cancelled || outcome.kind === "completed" || !outcome.policy?.retryable) break;
+          compactionRetryNumber += 1;
+          const remaining = compactionDeadlineAt - Date.now();
+          if (remaining <= 0) break;
+          const delayMs = Math.min(remaining, 60_000, managedRetryBaseMs * 2 ** Math.min(6, compactionRetryNumber - 1));
+          const action = await waitForRecovery({ delayMs, reason: outcome.policy.reasonCode,
+            acceptance: outcome.policy.acceptance, httpStatusCode: outcome.statusCode,
+            retryNumber: compactionRetryNumber, canContinueHttp: true, streamKeepalive: false });
+          if (action === "cancel" || requestState.cancelled) return;
+          if (Date.now() >= compactionDeadlineAt) break;
+          requestBody.approveReplay();
+        }
         emit({ type: "compaction_attempt_finished", internalAttempt: 1, kind: outcome.kind, reason: outcome.reason ?? null });
         if (requestState.cancelled || outcome?.kind === "cancelled") return;
         if (outcome.failure?.safetyPolicy) {
@@ -1609,7 +1804,18 @@ export function createCodexModelStreamProxy(options = {}) {
           return;
         }
         const preserveUpstreamError = outcome?.kind === "permanent_failure"
-          || outcome?.failure?.category === "usage_limit";
+          || ["authentication", "quota", "safety", "permanent", "payload_too_large"].includes(outcome.policy?.category);
+        if (preserveUpstreamError && key && outcome.kind !== "completed") {
+          const statusCode = outcome.statusCode >= 400 ? outcome.statusCode
+            : outcome.policy.category === "authentication" ? 401 : outcome.policy.category === "quota" ? 429 : 400;
+          waitTerminals.set(key, { notice: outcome.failure?.message ?? "Compaction request failed.",
+            reason: outcome.policy.reasonCode, category: outcome.policy.category, acceptance: outcome.policy.acceptance,
+            credentialIdentity, updatedAt: Date.now(), httpFailure: { statusCode,
+              headers: typeof outcome.headers?.["www-authenticate"] === "string"
+                ? { "www-authenticate": outcome.headers["www-authenticate"].slice(0, 2048) } : {},
+              error: { code: outcome.policy.reasonCode, type: outcome.policy.reasonCode,
+                message: outcome.failure?.message ?? "Compaction request failed." } } });
+        }
         if (outcome?.kind === "completed" || preserveUpstreamError) {
           writeHeadOnce(response, outcome.statusCode ?? 502, outcome.statusMessage, outcome.headers ?? {});
           response.end(outcome.body ?? Buffer.alloc(0));
@@ -1673,17 +1879,35 @@ export function createCodexModelStreamProxy(options = {}) {
         progressIdleTimeoutMs,
         reasoningProgressIdleTimeoutMs,
         toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs, progressRetryProbe });
-      const outcome = await executeTurnAttempt({
+      let outcome;
+      let managedRetryNumber = 0;
+      let websocketAttempts = 0;
+      let forceHttp = (websocketCooldowns.get(identity.threadId)?.retryAt ?? 0) > websocketNow();
+      for (;;) {
+        if (key) operationLedger?.begin(key);
+        const websocketHeaders = { ...request.headers,
+          "openai-beta": [request.headers["openai-beta"], "responses_websockets=2026-02-06"].filter(Boolean).join(", "),
+          originator: request.headers.originator ?? "codex_cli_rs",
+        };
+        const upstreamClient = incrementalTransport && key && !forceHttp && !compactionRequest
+          && (!inspected.hasImages || options.incrementalImagesEnabled === true)
+          ? incrementalTransport.createRequestClient({ sessionKey: identity.threadId, operationId: requestId,
+            retryWithoutOutput: managedRetryNumber > 0,
+            payload: inspected.payload, url: incrementalUpstreamUrl.href, headers: websocketHeaders,
+            onPreparationProgress: (progress) => requestState.onPreparationProgress?.(progress),
+            onPacketSending: (progress) => requestState.onPacketSending?.(progress) }) : null;
+        if (upstreamClient) websocketAttempts += 1;
+        outcome = await executeTurnAttempt({
         requestBody,
         downstream: response,
-        headers: request.headers,
+        headers: upstreamClient ? websocketHeaders : request.headers,
         method: request.method,
         targetUrl,
         firstProgressTimeoutMs: attemptFirstProgressTimeoutMs,
         progressIdleTimeoutMs,
         reasoningProgressIdleTimeoutMs,
         toolInputProgressIdleTimeoutMs: attemptToolInputProgressIdleTimeoutMs,
-        compactionAttemptTimeoutMs: compactionRequest ? compactionRemainingMs : compactionAttemptTimeoutMs,
+        compactionAttemptTimeoutMs: compactionRequest ? Math.max(1, compactionDeadlineAt - Date.now()) : compactionAttemptTimeoutMs,
         toolPreparationGraceMs,
         bufferedToolIdentityHashes,
         bufferedToolPreparationGraceMs,
@@ -1694,6 +1918,8 @@ export function createCodexModelStreamProxy(options = {}) {
         consecutiveWaitLimitMs: chainWaitLimitMs,
         priorWaitState: prior,
         uploadAllowanceMs,
+        uploadAllowanceMsPerMiB,
+        maxUploadAllowanceMs,
         compactionRequest,
         upstreamIdleTimeoutMs,
         adaptiveStreamMinSpanMs,
@@ -1703,7 +1929,46 @@ export function createCodexModelStreamProxy(options = {}) {
         requestState,
         observation,
         nativeAttempt: attemptNumber,
+        upstreamClient,
       });
+        const replayWithoutOutput = !outcome.progressObserved && !outcome.sawReplayUnsafeContent
+          && !outcome.sawSubstantiveWork && !outcome.sawTool && !outcome.deliveredExecutableToolDone
+          && !outcome.sawHostedTool && (!outcome.sawCompaction || compactionRequest && outcome.frames === 0);
+        outcome.nativeRecovery = !compactionRequest && !outcome.sawCompaction
+          && ["temporary", "acceptance_unknown"].includes(outcome.policy?.category) && !replayWithoutOutput;
+        const fallbackPayload = upstreamClient && outcome.policy?.category === "payload_too_large" && replayWithoutOutput;
+        if (key) operationLedger?.settle(key, fallbackPayload
+          ? { ...outcome, policy: { ...outcome.policy, acceptance: "rejected" } } : outcome);
+        if (upstreamClient && outcome.kind === "completed") websocketCooldowns.delete(identity.threadId);
+        const fallbackNetwork = upstreamClient && replayWithoutOutput && outcome.policy?.retryable && websocketAttempts >= 2;
+        if (upstreamClient && outcome.nativeRecovery) deferWebsocket(identity.threadId);
+        if (managedRecovery && !compactionRequest && (fallbackPayload || fallbackNetwork) && !requestState.cancelled) {
+          const retryAfterMs = deferWebsocket(identity.threadId);
+          incrementalTransport.invalidate(identity.threadId, "http_fallback");
+          forceHttp = true;
+          recoveryState({ phase: "retrying", reason: fallbackPayload ? "websocket_payload_requires_http" : "websocket_http_fallback",
+            acceptance: outcome.policy.acceptance, willRetry: true, canContinueHttp: false, retryAfterMs, websocketAttempts });
+          requestBody.approveReplay();
+          continue;
+        }
+        if (!managedRecovery || requestState.cancelled || outcome.kind === "completed"
+          || !outcome.policy?.retryable || !replayWithoutOutput) break;
+        managedRetryNumber += 1;
+        const remainingCompactionMs = compactionRequest ? compactionDeadlineAt - Date.now() : null;
+        if (remainingCompactionMs !== null && remainingCompactionMs <= 0) break;
+        const largeHttpWait = !upstreamClient && requestBody.bytes >= largeHttpBodyBytes;
+        const action = await waitForRecovery({
+          delayMs: Math.min(remainingCompactionMs ?? Infinity,
+            60_000, managedRetryBaseMs * 2 ** Math.min(6, managedRetryNumber - 1)),
+          reason: largeHttpWait ? "large_http_retransmission_waiting" : outcome.policy.reasonCode,
+          acceptance: outcome.policy.acceptance, retryNumber: managedRetryNumber,
+          httpStatusCode: outcome.httpStatus ?? outcome.failureDiagnostics?.statusCode,
+        });
+        if (action === "cancel" || requestState.cancelled) return;
+        if (remainingCompactionMs !== null && Date.now() >= compactionDeadlineAt) break;
+        forceHttp = forceHttp || action === "continue_http";
+        requestBody.approveReplay();
+      }
       emit({
         type: "turn_attempt_finished",
         attemptNumber,
@@ -1737,9 +2002,32 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       if (outcome.kind === "completed") {
         if (key) attempts.delete(key);
+        recoveryState({ phase: "completed", reason: "upstream_completed", acceptance: "accepted",
+          willRetry: false, canContinueHttp: false });
         if (outcome.sawSubstantiveWork || outcome.sawExecutableToolDone) recordBusinessProgress(identity);
         counters.completed += 1;
         counters.actualCompletions += 1;
+        return;
+      }
+      if (outcome.sawSubstantiveWork || outcome.deliveredExecutableToolDone) recordBusinessProgress(identity);
+      const nativeRetryFallback = ["temporary", "acceptance_unknown"].includes(outcome.policy?.category)
+        && !outcome.sawCompaction && identity.requestKind !== "compaction";
+      if (outcome.policy && !outcome.policy.retryable && !nativeRetryFallback) {
+        const policy = outcome.policy;
+        const unresolved = ["accepted", "unknown"].includes(policy.acceptance)
+          && !["authentication", "quota", "safety", "permanent"].includes(policy.category);
+        const notice = unresolved
+          ? "上游是否完成了本次请求仍待核对，已保留操作状态并停止自动重发，避免重复生成或执行工具。"
+          : policy.category === "authentication" ? "模型认证失败，请重新登录或刷新认证后继续。"
+            : policy.category === "quota" ? USAGE_LIMIT_NOTICE
+              : policy.category === "safety" ? safetyPolicyNotice(outcome.failure)
+                : permanentFailureNotice(outcome.failure);
+        if (key) attempts.delete(key);
+        recoveryState({ phase: "failed", reason: policy.reasonCode, acceptance: policy.acceptance,
+          category: policy.category, willRetry: false, canContinueHttp: false });
+        finishTerminalFailure(notice, unresolved ? "request_acceptance_unresolved" : "model_terminal_failure", {
+          category: policy.category, code: policy.reasonCode, reason: outcome.reason, acceptance: policy.acceptance,
+        }, outcome.upstreamHeaders);
         return;
       }
       if (outcome.sawSubstantiveWork) recordBusinessProgress(identity);
@@ -1779,7 +2067,7 @@ export function createCodexModelStreamProxy(options = {}) {
           counters.failed += 1;
           emit({ type: "safety_policy_terminal_failure", ...details });
         } else {
-          finishSoftTerminal(`\n\n${notice}`, "safety_policy_completed_idle", details, outcome.upstreamHeaders);
+          finishTerminalFailure(`\n\n${notice}`, "safety_policy_terminal_failure", details, outcome.upstreamHeaders);
         }
         return;
       }
@@ -1811,7 +2099,7 @@ export function createCodexModelStreamProxy(options = {}) {
         if (key) {
           waitTerminals.set(key, { notice, reason: outcome.reason, updatedAt: Date.now() });
         }
-        finishSoftTerminal(notice, "local_tool_phase_timeout", {
+        finishTerminalFailure(notice, "local_tool_phase_timeout", {
           category: outcome.failure.category, reason: outcome.reason, safeLocalRetry, attemptNumber, maxAttempts: localAttemptLimit,
         }, outcome.upstreamHeaders);
         return;
@@ -1844,7 +2132,7 @@ export function createCodexModelStreamProxy(options = {}) {
           : outcome.kind === "permanent_failure"
             ? permanentFailureNotice(outcome.failure)
             : NETWORK_EXHAUSTED_NOTICE;
-        finishSoftTerminal(notice, "untracked_identity_soft_terminal", {
+        finishTerminalFailure(notice, "untracked_identity_terminal_failure", {
           reason: outcome.reason,
           category: outcome.failure?.category ?? "network",
         }, outcome.upstreamHeaders);
@@ -1852,7 +2140,7 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       if (outcome.kind === "permanent_failure") {
         attempts.delete(key);
-        finishSoftTerminal(permanentFailureNotice(outcome.failure), "permanent_failure_completed_idle", {
+        finishTerminalFailure(permanentFailureNotice(outcome.failure), "permanent_failure_terminal_failure", {
           code: outcome.failure?.code ?? null,
           reason: outcome.reason,
         }, outcome.upstreamHeaders);
@@ -1860,7 +2148,7 @@ export function createCodexModelStreamProxy(options = {}) {
       }
       if (outcome.kind === "usage_limit") {
         attempts.delete(key);
-        finishSoftTerminal(USAGE_LIMIT_NOTICE, "usage_limit_completed_idle", {
+        finishTerminalFailure(USAGE_LIMIT_NOTICE, "usage_limit_terminal_failure", {
           reason: outcome.reason,
         }, outcome.upstreamHeaders);
         return;
@@ -1872,7 +2160,7 @@ export function createCodexModelStreamProxy(options = {}) {
         if (retryableAdaptiveIdle || prior?.waitBudgetSpentMs) {
           waitTerminals.set(key, { notice, reason: "RETRY_EXHAUSTED", updatedAt: Date.now() });
         }
-        finishSoftTerminal(notice, "retry_exhausted_completed_idle", {
+        finishTerminalFailure(notice, "retry_exhausted_terminal_failure", {
           attemptNumber,
           category: outcome.failure?.category ?? "network",
           reason: outcome.reason,
@@ -1916,6 +2204,17 @@ export function createCodexModelStreamProxy(options = {}) {
       if (requestState.cancelled || error.code === "REQUEST_ABORTED") return;
       counters.failed += 1;
       observation?.ended("failed");
+      if (/^MODEL_OPERATION_/u.test(error.code ?? "")) {
+        const notice = error.code === "MODEL_OPERATION_LEDGER_FULL"
+          ? "尚未核实的操作记录已达到保护上限，请先核对已有操作，再开始新请求。"
+          : "操作保护记录暂时无法安全保存，已停止发送新请求，请检查本机状态文件。";
+        const acceptance = ["accepted", "unknown"].includes(error.requestAccepted) ? error.requestAccepted : "not_sent";
+        recoveryState({ phase: "failed", reason: error.code, acceptance, category: "local_state",
+          willRetry: false, canContinueHttp: false });
+        finishTerminalFailure(notice, "operation_state_terminal_failure", { code: error.code,
+          category: "local_state", acceptance });
+        return;
+      }
       if (error instanceof RequestInspectionError || error.localRequestFailure) {
         emit({ type: "request_body_rejected", code: error.code, stage: error.stage ?? "inspect",
           encodedBytes: error.encodedBytes ?? null, decodedBytes: error.decodedBytes ?? null,
@@ -1924,7 +2223,7 @@ export function createCodexModelStreamProxy(options = {}) {
           && !/\/responses\/compact\/?$/u.test(targetUrl.pathname)) {
           if (!response.destroyed && !response.headersSent) {
             ensureSseHead(response);
-            response.end(requestState.recovery.finish(LOCAL_REQUEST_TOO_LARGE_NOTICE));
+            response.end(requestState.recovery.fail("request_too_large", LOCAL_REQUEST_TOO_LARGE_NOTICE));
           }
           return;
         }
@@ -1961,14 +2260,14 @@ export function createCodexModelStreamProxy(options = {}) {
           return;
         }
         if (!key) {
-          finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "untracked_identity_soft_terminal", {
+          finishTerminalFailure(PERMANENT_FAILURE_NOTICE, "untracked_identity_terminal_failure", {
             reason: error.code ?? "UNEXPECTED_ERROR",
           });
           return;
         }
         if (nextFailure >= maxConsecutiveAttempts) {
           attempts.delete(key);
-          finishSoftTerminal(PERMANENT_FAILURE_NOTICE, "guarded_error_completed_idle", {
+          finishTerminalFailure(PERMANENT_FAILURE_NOTICE, "guarded_error_terminal_failure", {
             attemptNumber: nextFailure,
             reason: error.code ?? "UNEXPECTED_ERROR",
           });
@@ -1993,6 +2292,17 @@ export function createCodexModelStreamProxy(options = {}) {
   });
 
   return {
+    continueWithHttp({ threadId, turnId, requestId }) {
+      const state = [...active.values()].find(item => item.threadId === threadId && item.turnId === turnId
+        && (!requestId || item.requestId === requestId));
+      return { accepted: state?.recoveryControl?.continueHttp() === true };
+    },
+    recoveryStates() {
+      return [...active.values()].filter(state => state.recoveryWait).map(state => ({
+        requestId: state.requestId, threadId: state.threadId, turnId: state.turnId,
+        requestKind: state.requestKind, ...state.recoveryWait,
+      }));
+    },
     prepareThreadHandoff(threadId) { return recoveryHandoff.prepare(threadId); },
     cancelThreadHandoff(threadId, token) { return recoveryHandoff.cancel(threadId, token); },
     acceptThreadHandoff(snapshot) { return recoveryHandoff.accept(snapshot); },
@@ -2015,6 +2325,7 @@ export function createCodexModelStreamProxy(options = {}) {
         state.currentAbort?.();
       }
       await requestInspector.close();
+      await incrementalTransport?.close?.();
       if (!server.listening) return;
       const closed = new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       for (const socket of sockets) socket.destroy();
@@ -2038,6 +2349,11 @@ export function createCodexModelStreamProxy(options = {}) {
         port: typeof address === "object" && address ? address.port : port,
         upstreamOrigin: upstreamOrigin.origin,
         activeRequests: active.size,
+        operationLedger: operationLedger?.status() ?? null,
+        managedRecovery,
+        recoveryWaitingRequests: [...active.values()].filter(state => state.recoveryWait?.phase === "waiting").length,
+        unresolvedOperations: [...waitTerminals.values()].filter(state => ["unknown", "accepted"].includes(state.acceptance)).length,
+        incrementalTransport: incrementalTransport?.status?.() ?? null,
         attemptChains: attempts.size,
         firstProgressTimeoutMs,
         firstLastProgressTimeoutMs,

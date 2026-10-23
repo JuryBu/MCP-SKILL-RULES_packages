@@ -6,8 +6,12 @@ import crypto from "node:crypto";
 import { fork } from "node:child_process";
 import { once } from "node:events";
 import { HANDOFF_CHANNEL } from "./inner-runner-handoff-control.mjs";
-import { fixedHandoffCompatibility } from "./inner-handoff-compatibility.mjs";
+import { validateRecoveryEnvelope, canContinueRecovery } from "./model-recovery-notifications.mjs";
+import { fixedHandoffCompatibility, reverseHandoffCompatibility } from "./inner-handoff-compatibility.mjs";
 import { validateInnerRuntimeProfile, approvedInnerCandidate, seedInnerWorkerState } from "./inner-runtime-profile.mjs";
+import { acquireInnerColdStart } from "./inner-cold-start-state.mjs";
+import { readFailedWorkerRecovery, readRecoveredWorkerOperation, seedFailedWorkerRecovery, writeWorkerRecoveryCheckpoint } from "./inner-worker-recovery-state.mjs";
+import { createStreamRecovery } from "./codex-stream-recovery.mjs";
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
 const digest = value => crypto.createHash("sha256").update(value).digest("hex");
@@ -24,6 +28,7 @@ const implementationMethods = Object.freeze([
   "handleControlTimeout", "handleControlSendError", "relayNativeEvent", "handleNativeRelayFailure",
   "handleHttpResponse", "handleHttpStreamError", "handleHttpError", "handleHttpAborted", "handleHttpClose",
   "releaseHttpRequest",
+  "recoveryControl",
 ]);
 const checkedImplementation = implementation => {
   if (!implementation || implementationMethods.some(name => typeof implementation[name] !== "function")) {
@@ -45,7 +50,7 @@ export function createInnerProxyCoordinator(options) {
   if (!runtimeProfile && (!inside(fs.realpathSync(os.tmpdir()), root) || upstream.protocol !== "http:"
     || upstream.hostname !== "127.0.0.1" || upstream.username || upstream.password)) fail("COORDINATOR_ISOLATED_ONLY");
   const state = { options, ownerId, nativeSourceId, root, upstreamOrigin, onEvent, environment, runtimeProfile,
-    sessionId: runtimeProfile ? crypto.randomUUID() : null, capability: crypto.randomBytes(32).toString("hex"),
+    sessionId: crypto.randomUUID(), capability: crypto.randomBytes(32).toString("hex"),
     workers: new Map(), reclaimedWorkers: [], threads: new Map(), terminalThreads: new Map(), migrations: new Map(), pending: new Map(),
     adoptions: new Map(), requests: new Map(), activation: null, maxThreads: 128, defaultWorker: null,
     recycleRetiredWorkers: runtimeProfile?.workerLifecycle?.recycleRetiredWorkers !== false,
@@ -87,6 +92,7 @@ export function createInnerProxyCoordinator(options) {
     },
   });
   return { ...Object.fromEntries(implementationMethods.slice(0, 9).map(name => [name, state.bindDispatch(name)])),
+    recoveryControl: state.bindDispatch("recoveryControl"),
     liveCodeParticipant: () => participant };
 }
 
@@ -97,6 +103,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   const emit = (type, fields = {}) => onEvent({ type, ...fields });
   const alive = worker => worker?.ready && worker.child.connected && worker.child.exitCode === null && worker.child.signalCode === null;
   shared.recentRejections ??= [];
+  const recoveryRecords = shared.recoveryRecords ??= new Map();
   const rejectionErrors = shared.rejectionErrors ??= new WeakMap();
   const rejectionDetails = (metadata, state, decisionPoint, reason) => {
     const category = (value, allowed) => value === undefined ? "missing" : allowed.includes(value) ? value : "unknown";
@@ -129,6 +136,19 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   };
   const identity = worker => ({ pid: worker.child.pid, instanceToken: worker.ready.instanceToken,
     core: worker.ready.sourceHashes.core, helper: worker.ready.sourceHashes.helper });
+  const workerSpecification = worker => {
+    if (worker?.specification) return worker.specification;
+    const runnerPaths = worker?.child.spawnargs?.filter(argument => path.isAbsolute(argument)
+      && path.basename(argument) === "codex-model-stream-proxy-runner.mjs") ?? [];
+    if (!worker?.ready || runnerPaths.length !== 1) fail("WORKER_RECOVERY_SOURCE_UNAVAILABLE");
+    const specification = { runnerPath: runnerPaths[0], expectedHashes: { ...worker.ready.sourceHashes } };
+    if (runtimeProfile) {
+      const candidate = runtimeProfile.approvedCandidates?.find(entry => path.resolve(entry.runnerPath) === path.resolve(specification.runnerPath)
+        && Object.entries(specification.expectedHashes).every(([key, hash]) => entry.expectedHashes[key] === hash));
+      if (candidate) specification.candidateApprovalId = candidate.id;
+    }
+    return specification;
+  };
   const threadStates = () => [...threads.values(), ...(shared.terminalThreads?.values() ?? [])];
   const findThread = threadId => threads.get(threadId) ?? shared.terminalThreads?.get(threadId);
   const historyOwners = threadId => [...workers.values()].filter(worker => worker.threadHistory.has(threadId)
@@ -189,7 +209,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     entry.reject(error);
   }
 
-  async function launchWorker(specification) {
+  async function launchWorker(specification, { recoverySeed } = {}) {
     if (shared.closing) fail("COORDINATOR_WORKER_LIMIT");
     if (!path.isAbsolute(specification.runnerPath)) fail("COORDINATOR_RUNNER_PATH_REQUIRED");
     const runnerPath = fs.realpathSync(specification.runnerPath);
@@ -212,12 +232,15 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       || Object.entries(runtimeProfile.initial.expectedHashes).some(([key, value]) => specification.expectedHashes[key] !== value))) {
       fail("COORDINATOR_UNVERIFIED_SOURCE");
     }
-    if (recycleRetiredWorkers) await shared.dispatch("reclaimRetiredWorkers");
+    if (recycleRetiredWorkers && !recoverySeed) await shared.dispatch("reclaimRetiredWorkers");
     if ([...workers.values()].filter(worker => worker.child.exitCode === null && worker.child.signalCode === null).length >= 4) fail("COORDINATOR_WORKER_LIMIT");
     const workerId = `${sessionId ? `${sessionId}-` : ""}worker-${++shared.workerSequence}`;
     const stateRoot = path.join(runtimeProfile?.stateRoot ?? root, workerId);
     if (fs.existsSync(stateRoot)) fail("COORDINATOR_STATE_EXISTS");
     seedInnerWorkerState(runtimeProfile, stateRoot);
+    if (!shared.coldStart) fail("COLD_START_PROTECTION_REQUIRED");
+    shared.coldStart.seed(stateRoot, workerId);
+    if (recoverySeed) seedFailedWorkerRecovery(stateRoot, recoverySeed);
     const stderrPath = path.join(root, `${workerId}.stderr.log`);
     const descriptor = fs.openSync(stderrPath, "wx");
     let child;
@@ -228,13 +251,22 @@ export function createInnerProxyCoordinatorImplementation(shared) {
           ...(runtimeProfile ? { CODEX_HOME: runtimeProfile.codexHome } : {}),
           CODEX_MODEL_STREAM_PROXY_STATE_ROOT: stateRoot, CODEX_MODEL_STREAM_PROXY_HOST: "127.0.0.1",
           CODEX_MODEL_STREAM_PROXY_PORT: String(specification.port ?? 0), CODEX_MODEL_STREAM_PROXY_UPSTREAM_ORIGIN: upstreamOrigin,
-          CODEX_MODEL_STREAM_PROXY_HANDOFF_CONTROL: JSON.stringify({ schemaVersion: 1, mode: runtimeProfile ? "production" : "isolated", ownerId,
+          CODEX_MODEL_STREAM_PROXY_HANDOFF_CONTROL: JSON.stringify({ schemaVersion: 1, mode: runtimeProfile ? "production" : "isolated", ownerId, nativeSourceId,
             capability, checkpointRoot: root, allowRuntimeCompatibility: true,
             ...(runtimeProfile ? { nativeSourceId, runtimeProfile: { ...sourceProfile, initial: specification } } : {}) }) } });
+      shared.coldStart.started(stateRoot, workerId, child.pid);
+    } catch (error) {
+      if (child) {
+        child.once("error", () => {});
+        child.kill();
+        await once(child, "exit").catch(() => {});
+      }
+      throw error;
     } finally { fs.closeSync(descriptor); }
     const worker = { workerId, child, stateRoot, stderrPath, ready: null, nativeSequence: 0, createdAt: new Date().toISOString(),
       threadHistory: new Set(), releasedThreadHistory: new Set(), activeHttp: 0, retired: false, cleanupPending: false, reclamation: null,
-      preparedCandidate: false, wasDefault: false, wasActivated: false };
+      preparedCandidate: false, wasDefault: false, wasActivated: false,
+      specification: structuredClone(specification), nativeDelivered: new Map() };
     workers.set(workerId, worker);
     const ready = new Promise((resolve, reject) => {
       worker.startup = { resolve, reject, specification,
@@ -258,6 +290,31 @@ export function createInnerProxyCoordinatorImplementation(shared) {
 
   function handleWorkerMessage(worker, message) {
     if (message?.channel !== HANDOFF_CHANNEL || message.pid !== worker.child.pid) return;
+    if (message.event === "recovery") {
+      const envelope = message.envelope;
+      const event = envelope?.recovery;
+      const state = threads.get(event?.threadId);
+      const expected = recoveryBinding(state);
+      if (!shared.nativeHealthy || shared.closing || state?.phase !== "active" || state.worker !== worker
+        || message.instanceToken !== worker.ready?.instanceToken || !alive(worker)
+        || !validateRecoveryEnvelope(envelope, { ...expected, threadId: state.threadId, turnId: state.turnId }, capability)) return;
+      const previous = recoveryRecords.get(event.requestId);
+      if (previous && (previous.envelope.recovery.threadId !== event.threadId || previous.envelope.recovery.turnId !== event.turnId
+        || previous.terminal || event.sequence <= previous.envelope.recovery.sequence)) return;
+      if (!previous && ![...shared.requests.values()].some(request => request.thread === state && request.worker === worker)) return;
+      if (!previous && recoveryRecords.size >= 128) {
+        for (const [requestId, record] of recoveryRecords) {
+          const active = threads.get(record.envelope.recovery.threadId);
+          if (active?.phase !== "active" || active.turnId !== record.envelope.recovery.turnId) recoveryRecords.delete(requestId);
+        }
+        if (recoveryRecords.size >= 128) return;
+      }
+      const actionToken = canContinueRecovery(event) ? crypto.randomBytes(24).toString("hex") : null;
+      recoveryRecords.set(event.requestId, { envelope: structuredClone(envelope), actionToken, consumed: false,
+        terminal: ["completed", "failed", "stopped"].includes(event.phase) });
+      emit("model_recovery_state", { envelope: structuredClone(envelope) });
+      return;
+    }
     if (message.event === "ready") {
       if (worker.ready || message.ownerId !== ownerId || !validIdentity(message.instanceToken)
         || !message.status?.running || !Number.isInteger(message.status.port) || message.status.port < 1
@@ -297,11 +354,102 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       awaiting.reject(new Error("COORDINATOR_WORKER_EXITED"));
     }
     emit("worker_exited", { workerId: worker.workerId, pid: worker.child.pid, code, signal });
+    if (shared.closing || worker.reclamation === "stopping" || worker.recoveryTask
+      || (!threadStates().some(state => state.worker === worker) && shared.defaultWorker !== worker)) return;
+    worker.recoveryEvents = threadStates().filter(state => state.worker === worker)
+      .flatMap(state => [state.start, state.completion].filter(Boolean)).map(event => ({ ...event }));
+    const previous = shared.failureRecoveryTask ?? Promise.resolve();
+    worker.recoveryTask = previous.catch(() => {}).then(() => recoverFailedWorker(worker));
+    shared.failureRecoveryTask = worker.recoveryTask;
+    worker.recoveryTask.catch(error => {
+      worker.recoveryError = error.code ?? error.message;
+      emit("worker_recovery_failed", { workerId: worker.workerId, code: worker.recoveryError });
+    });
+  }
+
+  async function recoverFailedWorker(worker) {
+    const deadline = Date.now() + 15000;
+    while (shared.transactionActive || shared.workerMaintenance || shared.preparationTask) {
+      if (shared.closing || Date.now() >= deadline) fail("WORKER_RECOVERY_BUSY");
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    if (shared.closing) return;
+    const activation = shared.activation;
+    const failedCandidate = activation?.target === worker;
+    const fallback = failedCandidate ? activation.source : worker;
+    if (failedCandidate && activation.active) {
+      activation.active = false;
+      if (alive(fallback)) { shared.defaultWorker = fallback; fallback.retired = false; }
+      for (const state of threadStates()) if (state.pendingActivation === activation) {
+        delete state.pendingActivation;
+        delete state.activationError;
+      }
+      worker.retired = true;
+      emit("activation_automatically_rolled_back", { activationId: activation.id, failedWorkerId: worker.workerId,
+        defaultWorkerId: shared.defaultWorker?.workerId });
+    }
+    const affected = threadStates().filter(state => state.worker === worker);
+    if (!affected.length && shared.defaultWorker !== worker) return;
+    if (!fallback || worker.recoveredFrom) fail("WORKER_RECOVERY_SOURCE_UNAVAILABLE");
+    const fallbackSpecification = workerSpecification(fallback);
+    const seed = readFailedWorkerRecovery({ root: runtimeProfile?.stateRoot ?? root, worker,
+      ownerId, nativeSourceId, sessionId, threadIds: affected.map(state => state.threadId) });
+    shared.workerMaintenance = true;
+    let replacement;
+    try {
+      replacement = await shared.dispatch("launchWorker", fallbackSpecification, { recoverySeed: seed });
+      replacement.recoveredFrom = worker.workerId;
+      replacement.wasActivated = true;
+      const validThreads = new Set(affected.map(state => state.threadId));
+      let eventIndex = 0;
+      const relayRecoveryEvents = async () => {
+        while (eventIndex < worker.recoveryEvents.length) {
+          const event = worker.recoveryEvents[eventIndex++];
+          if (validThreads.has(event.threadId)) await shared.dispatch("relayNative", replacement, event);
+        }
+      };
+      await relayRecoveryEvents();
+      for (const state of affected) {
+        const health = await shared.dispatch("control", replacement, "check", { threadId: state.threadId });
+        const plan = { schemaVersion: 1, id: crypto.randomUUID(), generation: ++shared.generation,
+          threadId: state.threadId, expiresAt: Date.now() + 120000, source: identity(worker), target: identity(replacement),
+          compatibility: failedCandidate ? reverseHandoffCompatibility(activation?.compatibility) ?? null : null };
+        await shared.dispatch("control", replacement, "authorizeMigration", { role: "target", plan });
+        const checkpoint = writeWorkerRecoveryCheckpoint({ root, ownerId, capability, worker, threadId: state.threadId,
+          native: health.native, plan, seed });
+        await shared.dispatch("control", replacement, "accept", checkpoint);
+      }
+      await relayRecoveryEvents();
+      if (!alive(replacement) || shared.closing) fail("WORKER_RECOVERY_TARGET_UNAVAILABLE");
+      for (const state of affected) {
+        if (state.worker !== worker) fail("WORKER_RECOVERY_OWNER_CHANGED");
+        state.worker = replacement;
+        delete state.pendingActivation;
+        delete state.activationError;
+        delete state.migrationCleanupError;
+        worker.releasedThreadHistory.add(state.threadId);
+      }
+      if (shared.defaultWorker === worker) { shared.defaultWorker = replacement; replacement.wasDefault = true; }
+      worker.replacementWorker = replacement;
+      emit("worker_recovered", { workerId: worker.workerId, replacementWorkerId: replacement.workerId,
+        threadIds: affected.map(state => state.threadId), protectedOperations: seed.operationState.entries.length });
+    } catch (error) {
+      if (replacement) {
+        replacement.retired = true;
+        try { await releaseWorker(replacement, candidate => !threadStates().some(state => state.worker === candidate)
+          && candidate !== shared.defaultWorker && candidate.activeHttp === 0, "failed_recovery"); }
+        catch { replacement.cleanupPending = true; }
+      }
+      throw error;
+    } finally { shared.workerMaintenance = false; }
   }
 
   function relayNative(worker, event) {
+    worker.nativeDelivered ??= new Map();
+    if ((worker.nativeDelivered.get(event.threadId) ?? -1) >= event.sequence) return Promise.resolve();
     worker.threadHistory.add(event.threadId);
-    return shared.dispatch("control", worker, "nativeTurn", { event: { ...event, sequence: ++worker.nativeSequence } });
+    return shared.dispatch("control", worker, "nativeTurn", { event: { ...event, sequence: ++worker.nativeSequence } })
+      .then(result => { worker.nativeDelivered.set(event.threadId, event.sequence); return result; });
   }
 
   async function releaseWorker(worker, eligible, reason) {
@@ -417,6 +565,9 @@ export function createInnerProxyCoordinatorImplementation(shared) {
               const native = health.native;
               if (!native && health.historicalRecovery?.empty === true
                 && health.historicalRecovery.threadId === threadId && health.historicalRecovery.entries === 0
+                && health.historicalRecovery.recoveryEntries === 0 && health.historicalRecovery.operationEntries === 0
+                && health.historicalRecovery.operationStateVerified === true
+                && (health.status.operationLedger?.protectedOperations ?? 0) === 0
                 && health.status.running && !health.status.draining && health.status.activeRequests === 0
                 && transferable() && !findThread(threadId) && historyOwners(threadId).length === 1) {
                 (worker.releasedThreadHistory ??= new Set()).add(threadId);
@@ -467,6 +618,9 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     const previous = findThread(threadId);
     if (previous?.turnId === turnId && ((!terminal && previous.phase === "active")
       || (terminal && previous.phase === "terminal" && previous.completion?.status === message.params.turn.status))) {
+      if (!terminal && !previous.start.connectionGeneration && validIdentity(message.recoveryConnectionGeneration)) {
+        queueRecoveryBinding(previous, { threadId, turnId, connectionGeneration: message.recoveryConnectionGeneration });
+      }
       return shared.relay;
     }
     if ((!previous && terminal) || (previous && terminal && (previous.phase !== "active" || previous.turnId !== turnId))
@@ -475,14 +629,17 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     if (owners.length > 1) fail("COORDINATOR_THREAD_OWNER_AMBIGUOUS");
     if (!threads.has(threadId)) reserveThreadSlot(threadId);
     const event = { sequence: ++shared.nativeSequence, threadId, turnId, phase: terminal ? "terminal" : "active",
+      ...(!terminal && validIdentity(message.recoveryConnectionGeneration) ? { connectionGeneration: message.recoveryConnectionGeneration } : {}),
       ...(terminal ? { status: message.params.turn.status } : {}) };
     const state = Object.assign(previous ?? {}, { threadId, turnId, phase: event.phase, epoch: event.sequence,
       worker: previous?.worker ?? owners[0] ?? shared.defaultWorker, activeHttp: previous?.activeHttp ?? 0,
       nativeRelays: (previous?.nativeRelays ?? 0) + 1,
       start: terminal ? previous.start : event, completion: terminal ? event : null });
+    if (!terminal) delete state.recoveryBindingError;
     if (!terminal && shared.activation?.active && state.worker !== shared.activation.target) state.pendingActivation = shared.activation;
     shared.terminalThreads?.delete(threadId);
     threads.set(threadId, state);
+    if (state.worker.recoveryTask && !state.worker.replacementWorker) state.worker.recoveryEvents.push({ ...event });
     shared.relay = shared.relay.then(shared.bindDispatch("relayNativeEvent", event))
       .catch(shared.bindDispatch("handleNativeRelayFailure"));
     return shared.relay;
@@ -492,11 +649,91 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     const current = findThread(event.threadId);
     try {
       await migrations.get(event.threadId)?.done;
+      const recovering = current.worker;
+      if (recovering.recoveryTask) {
+        try { await recovering.recoveryTask; }
+        catch (error) {
+          emit("native_turn_retained", { threadId: event.threadId, turnId: event.turnId,
+            workerId: recovering.workerId, code: error.code ?? "WORKER_RECOVERY_FAILED" });
+          return;
+        }
+      }
       await shared.dispatch("relayNative", current.worker, event);
       current.worker.releasedThreadHistory?.delete(event.threadId);
       emit("native_turn_relayed", { threadId: event.threadId, turnId: event.turnId, phase: event.phase,
         workerId: current.worker.workerId, sequence: event.sequence });
+    } catch (error) {
+      if (!alive(current.worker)) {
+        emit("native_turn_retained", { threadId: event.threadId, turnId: event.turnId,
+          workerId: current.worker.workerId, code: error.code ?? "WORKER_RECOVERY_PENDING" });
+        return;
+      }
+      throw error;
     } finally { if (current?.nativeRelays > 0) current.nativeRelays -= 1; }
+  }
+
+  function recoveryBinding(state) {
+    if (!state || state.phase !== "active" || !alive(state.worker) || !state.start?.connectionGeneration) return null;
+    return { ownerId, nativeSourceId, producerId: state.worker.ready.instanceToken, producerPid: state.worker.child.pid,
+      sourceHashes: state.worker.ready.sourceHashes, connectionGeneration: state.start.connectionGeneration };
+  }
+
+  function queueRecoveryBinding(state, input) {
+    const start = state.start;
+    state.nativeRelays = (state.nativeRelays ?? 0) + 1;
+    const binding = shared.relay.then(async () => {
+      await migrations.get(input.threadId)?.done;
+      let current = findThread(input.threadId);
+      if (current?.worker.recoveryTask) await current.worker.recoveryTask;
+      current = findThread(input.threadId);
+      if (!shared.nativeHealthy || shared.closing || current !== state || current.start !== start
+        || current.phase !== "active" || current.turnId !== input.turnId || !alive(current.worker)) fail("RECOVERY_BINDING_INVALID");
+      if (start.connectionGeneration === input.connectionGeneration) return;
+      if (start.connectionGeneration) fail("RECOVERY_BINDING_CONFLICT");
+      const worker = current.worker;
+      const result = await shared.dispatch("control", worker, "bindRecovery", input);
+      if (current.start !== start || current.phase !== "active" || current.worker !== worker || !alive(worker)) fail("RECOVERY_BINDING_INVALID");
+      start.connectionGeneration = input.connectionGeneration;
+      delete current.recoveryBindingError;
+      emit("native_binding_confirmed", { threadId: input.threadId, turnId: input.turnId, workerId: worker.workerId });
+      return result;
+    }).catch(error => {
+      if (state.start === start) state.recoveryBindingError = error.code ?? error.message;
+      emit("native_binding_failed", { threadId: input.threadId, turnId: input.turnId,
+        workerId: state.worker.workerId, code: error.code ?? "RECOVERY_BINDING_FAILED" });
+      throw error;
+    }).finally(() => { state.nativeRelays -= 1; });
+    shared.relay = binding.catch(() => {});
+    return binding;
+  }
+
+  function recoveryControl(method, input) {
+    const state = threads.get(input.threadId);
+    if (method === "bind-native") {
+      if (!shared.nativeHealthy || state?.phase !== "active" || state.turnId !== input.turnId
+        || !validIdentity(input.connectionGeneration)) fail("RECOVERY_BINDING_INVALID");
+      if (state.start.connectionGeneration === input.connectionGeneration) return shared.relay;
+      if (state.start.connectionGeneration) fail("RECOVERY_BINDING_CONFLICT");
+      return queueRecoveryBinding(state, { ...input });
+    }
+    const binding = recoveryBinding(state);
+    const record = recoveryRecords.get(input.requestId);
+    if (method === "binding") return binding && state.turnId === input.turnId ? {
+      ...binding, current: record?.envelope ?? null } : null;
+    if (method !== "continue-http" || !shared.nativeHealthy || shared.closing || !binding || state.turnId !== input.turnId
+      || !record || record.terminal || record.consumed || !canContinueRecovery(record.envelope.recovery)
+      || input.sequence !== record.envelope.recovery.sequence || input.actionToken !== record.actionToken
+      || !validateRecoveryEnvelope(record.envelope, { ...binding, threadId: input.threadId,
+        turnId: input.turnId, requestId: input.requestId }, capability)
+      || ["ownerId", "nativeSourceId", "producerId", "producerPid", "connectionGeneration"].some(key => input[key] !== binding[key])
+      || Object.entries(binding.sourceHashes).some(([key, value]) => input.sourceHashes?.[key] !== value)) {
+      fail("RECOVERY_ACTION_STALE_OR_DISABLED");
+    }
+    record.consumed = true;
+    record.actionToken = null;
+    return shared.dispatch("control", state.worker, "continueHttp", { threadId: input.threadId, turnId: input.turnId,
+      recoveryRequestId: input.requestId, sequence: input.sequence, nativeSourceId, producerId: binding.producerId,
+      producerPid: binding.producerPid, connectionGeneration: binding.connectionGeneration });
   }
 
   function handleNativeRelayFailure(error) {
@@ -532,19 +769,43 @@ export function createInnerProxyCoordinatorImplementation(shared) {
           if (!migrations.has(metadata.thread_id) && observedRelay === shared.relay) break;
         }
         state = threads.get(metadata.thread_id);
+        if (state?.worker.recoveryTask) await state.worker.recoveryTask;
         if (!shared.nativeHealthy || !state || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) {
           rejectRequest("COORDINATOR_TURN_UNAVAILABLE", metadata, state, "before_adopt", unavailableReason(metadata, state));
         }
+        if (state.migrationCleanupError) fail("COORDINATOR_THREAD_CLEANUP_PENDING");
         decisionPoint = "during_adopt";
         await shared.dispatch("adoptForRequest", state, metadata, request, response);
+        while (state.activeHttp > 0 && alive(state.worker) && state.phase === "active" && state.turnId === metadata.turn_id) {
+          if (request.aborted || response.destroyed || shared.closing) return;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        if (state.worker.recoveryTask) await state.worker.recoveryTask;
         if (!shared.nativeHealthy || state.phase !== "active" || state.turnId !== metadata.turn_id || !alive(state.worker)) {
           rejectRequest("COORDINATOR_TURN_UNAVAILABLE", metadata, state, "after_adopt", unavailableReason(metadata, state));
         }
+        if (state.migrationCleanupError) fail("COORDINATOR_THREAD_CLEANUP_PENDING");
       }
       decisionPoint = "forwarding";
       if (request.aborted || response.destroyed) return;
       if (shared.closing) fail("COORDINATOR_CLOSING");
       const worker = state.worker;
+      const protectedOperation = readRecoveredWorkerOperation(worker, metadata, request);
+      if (protectedOperation) {
+        const code = "proxy_recovery_failed";
+        const message = "此前代理退出时，上游操作尚未核实，已保留状态并停止自动重发。可以发送新消息继续。";
+        request.resume();
+        if (protectedOperation.requestKind === "compaction") {
+          response.writeHead(409, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
+          response.end(JSON.stringify({ error: { code, message } }));
+        } else {
+          response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-store" });
+          response.end(createStreamRecovery(crypto.randomUUID()).fail(code, message));
+        }
+        emit("recovered_operation_failed", { threadId: state.threadId, turnId: state.turnId,
+          workerId: worker.workerId, acceptance: protectedOperation.entry.acceptance });
+        return;
+      }
       state.activeHttp += 1;
       worker.activeHttp += 1;
       routed = { id: `http-${++shared.httpSequence}`, thread: state, worker, request, response, onward: null,
@@ -588,6 +849,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   }
 
   function handleHttpError(routed) {
+    if (routed.response.headersSent) { routed.response.destroy(); return; }
     if (!routed.response.headersSent) routed.response.writeHead(502);
     routed.response.end("COORDINATOR_UPSTREAM_UNAVAILABLE");
   }
@@ -689,7 +951,11 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       let cancelled = !prepared;
       if (prepared && !committed) {
         try { await shared.dispatch("control", source, "cancel", { threadId, token: prepared.token }); cancelled = true; }
-        catch { shared.nativeHealthy = false; }
+        catch (cancelError) {
+          const state = findThread(threadId) ?? historicalState;
+          if (state?.worker === source) state.migrationCleanupError = cancelError.code ?? cancelError.message;
+          source.cleanupPending = true;
+        }
       }
       emit("migration_preserved_source", { threadId, code: error.code ?? error.message, cancelled });
       throw error;
@@ -784,6 +1050,11 @@ export function createInnerProxyCoordinatorImplementation(shared) {
   }
 
   function rollbackActivation({ activationId }) {
+    if (shared.activation?.id === activationId && !shared.activation.active
+      && shared.activation.target.recoveryTask) return { activationId,
+        selectionRestored: alive(shared.defaultWorker) && shared.defaultWorker !== shared.activation.target,
+        defaultWorkerId: shared.defaultWorker?.workerId, retainedThreadIds: threadStates()
+          .filter(state => state.worker === shared.activation.target).map(state => state.threadId) };
     if (!shared.activation?.active || shared.activation.id !== activationId) fail("COORDINATOR_ACTIVATION_NOT_CURRENT");
     if (shared.transactionActive || shared.workerMaintenance || shared.preparationTask
       || shared.closing || !alive(shared.activation.source)) fail("COORDINATOR_ACTIVATION_BUSY");
@@ -806,6 +1077,8 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       if (shared.defaultWorker || shared.starting || shared.closing) fail("COORDINATOR_ALREADY_STARTED");
       shared.starting = true;
       try {
+        shared.coldStart ??= acquireInnerColdStart({ stateRoot: runtimeProfile?.stateRoot ?? root,
+          ownerId, nativeSourceId, sessionId });
         shared.defaultWorker = await shared.dispatch("launchWorker", initial);
         shared.defaultWorker.wasDefault = true;
         shared.server.listen(options.port ?? 0, "127.0.0.1");
@@ -851,11 +1124,30 @@ export function createInnerProxyCoordinatorImplementation(shared) {
     handleHttpAborted,
     handleHttpClose,
     releaseHttpRequest,
+    recoveryControl,
     status() { return { running: shared.server.listening, nativeHealthy: shared.nativeHealthy,
+      coldStart: shared.coldStart?.status ?? null,
       transactionActive: shared.transactionActive, defaultWorkerId: shared.defaultWorker?.workerId ?? null,
       liveCode: { stateSchema: coordinatorStateSchema, generation: shared.implementationGeneration },
       activeHttp: shared.requests.size, pendingControl: pending.size,
       recentRejections: shared.recentRejections.map(entry => ({ ...entry })),
+      recoveryStates: [...recoveryRecords.values()].map(record => {
+        const event = record.envelope.recovery;
+        const active = threads.get(event.threadId);
+        const binding = recoveryBinding(active);
+        const enabled = !record.consumed && !record.terminal && active?.phase === "active" && active.turnId === event.turnId
+          && Boolean(binding) && canContinueRecovery(event)
+          && validateRecoveryEnvelope(record.envelope, { ...binding, threadId: event.threadId,
+            turnId: event.turnId, requestId: event.requestId }, capability);
+        return { ...record.envelope, ...event, canContinueHttp: enabled,
+          displayState: active?.turnId === event.turnId && active.phase === "terminal"
+            ? active.completion?.status === "interrupted" ? "cancelled" : active.completion?.status
+            : event.phase === "stopped" ? "cancelled" : event.phase,
+          actionRequired: active?.phase === "terminal" || record.terminal || record.consumed ? "none"
+            : enabled ? "choose_http_or_cancel" : event.acceptance === "unknown" ? "verify_request_state"
+            : event.phase === "waiting" && !event.willRetry ? "cancel_or_verify" : "none",
+          actionToken: enabled ? record.actionToken : null, actionConsumed: record.consumed };
+      }),
       sequences: { worker: shared.workerSequence, request: shared.requestSequence, native: shared.nativeSequence,
         http: shared.httpSequence, migration: shared.generation },
       activation: shared.activation ? { activationId: shared.activation.id, active: shared.activation.active, sourceWorkerId: shared.activation.source.workerId,
@@ -864,9 +1156,13 @@ export function createInnerProxyCoordinatorImplementation(shared) {
       terminalHistory: { retained: shared.terminalThreads?.size ?? 0, limit: maxThreads },
       threads: threadStates().map(state => ({ threadId: state.threadId, turnId: state.turnId, phase: state.phase,
         workerId: state.worker.workerId, activeHttp: state.activeHttp,
+        recoveryState: state.worker.recoveryError ? "failed" : state.worker.recoveryTask && !state.worker.replacementWorker ? "recovering" : "ready",
+        recoveryError: state.worker.recoveryError ?? null,
+        migrationCleanupError: state.migrationCleanupError ?? null, recoveryBindingError: state.recoveryBindingError ?? null,
         pendingActivationId: state.pendingActivation?.id ?? null, activationError: state.activationError ?? null })),
       workers: [...workers.values()].map(worker => ({ workerId: worker.workerId, pid: worker.child.pid, ready: Boolean(worker.ready),
         alive: alive(worker), sourceHashes: worker.ready?.sourceHashes ?? null, exitCode: worker.child.exitCode, signalCode: worker.child.signalCode,
+        recoveryError: worker.recoveryError ?? null, replacementWorkerId: worker.replacementWorker?.workerId ?? null,
         ...(runtimeProfile ? { retired: worker.retired, cleanupPending: worker.cleanupPending,
           threadHistoryCount: worker.threadHistory.size, reclamation: worker.reclamation } : {}) })) }; },
     async close() {
@@ -888,6 +1184,7 @@ export function createInnerProxyCoordinatorImplementation(shared) {
           } finally { clearTimeout(timer); }
         }
       }
+      shared.coldStart?.release();
     },
   };
 }

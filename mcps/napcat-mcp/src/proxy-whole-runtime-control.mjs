@@ -1,7 +1,6 @@
-import crypto from "node:crypto";
 import path from "node:path";
 import { approvedInnerCandidate, readInnerCandidateRegistry, saveInnerCandidateRegistry } from "./inner-runtime-profile.mjs";
-import { fixedHandoffCompatibility } from "./inner-handoff-compatibility.mjs";
+import { fixedHandoffCompatibility, reverseHandoffCompatibility as reverseCompatibility } from "./inner-handoff-compatibility.mjs";
 import { inspectProxyLiveBundle } from "./proxy-live-code-runtime.mjs";
 
 const fail = code => { throw Object.assign(new Error(code), { code }); };
@@ -100,20 +99,24 @@ export function createProxyWholeRuntimeControlImplementation(state) {
     return { runnerPath: candidate.runnerPath, expectedHashes: candidate.expectedHashes, candidateApprovalId: candidate.id };
   };
   const guard = input => {
-    if (state.busy || state.failed) fail("LIVE_WHOLE_RUNTIME_BUSY_OR_FAILED");
+    if (state.busy || state.failed || state.selectionRecoveryError) fail("LIVE_WHOLE_RUNTIME_BUSY_OR_FAILED");
     const status = parent().status();
     if (status.busy || status.failed) fail("LIVE_WHOLE_RUNTIME_BUSY_OR_FAILED");
     if (input.instanceId !== instanceId || input.expectedRevision !== status.revision) fail("LIVE_WHOLE_STALE_BINDING");
   };
-  const reverseCompatibility = compatibility => {
-    if (!compatibility) return undefined;
-    const manifest = { schemaVersion: 1, edges: compatibility.manifest.edges.map(edge => ({ ...edge, source: edge.target, target: edge.source })) };
-    return fixedHandoffCompatibility({ manifest, sha256: crypto.createHash("sha256").update(JSON.stringify(manifest)).digest("hex") });
+  const drainAutomaticRollback = async () => {
+    const pending = state.pendingAutomaticRollback;
+    if (!pending) return;
+    delete state.pendingAutomaticRollback;
+    try { pending.resolve(await state.implementation.recover({ automaticRollback: pending.event })); }
+    catch (error) { pending.reject(error); throw error; }
   };
   return {
     status() {
       const status = parent().status();
-      return { ...status, instanceId, busy: state.busy || status.busy, failed: state.failed || status.failed,
+      return { ...status, instanceId, busy: state.busy || status.busy,
+        failed: state.failed || status.failed || Boolean(state.selectionRecoveryError),
+        selectionRecoveryError: state.selectionRecoveryError ?? null,
         preparedWorkers: [...preparations].map(([id, value]) => ({ id, workerId: value.workerId })),
         candidateRegistrySha256: profile.stateRoot ? readInnerCandidateRegistry(profile)?.sha256 ?? null : null,
         approvedCandidateIds: (profile.approvedCandidates ?? []).map(candidate => candidate.id),
@@ -167,7 +170,7 @@ export function createProxyWholeRuntimeControlImplementation(state) {
           state.busy = false;
           guard(input);
           return commit();
-        }).finally(() => { state.busy = false; });
+        }).finally(async () => { state.busy = false; await drainAutomaticRollback(); });
       }
     },
     async prepare(input) {
@@ -208,7 +211,10 @@ export function createProxyWholeRuntimeControlImplementation(state) {
         if (prepared) parent().discard({ instanceId, expectedRevision: prepared.revision, preparationId: prepared.id });
         if (worker) await coordinator.discardCandidate({ workerId: worker.workerId });
         throw error;
-      } finally { state.busy = false; }
+      } finally {
+        state.busy = false;
+        await drainAutomaticRollback();
+      }
     },
     async activate(input) {
       guard(input);
@@ -244,7 +250,10 @@ export function createProxyWholeRuntimeControlImplementation(state) {
         parent().discard({ instanceId, expectedRevision: parent().status().revision, preparationId: input.preparationId });
         if (!activation) await coordinator.discardCandidate({ workerId: candidate.workerId });
         throw error;
-      } finally { state.busy = false; }
+      } finally {
+        state.busy = false;
+        await drainAutomaticRollback();
+      }
     },
     async restore(input) {
       guard(input);
@@ -276,9 +285,38 @@ export function createProxyWholeRuntimeControlImplementation(state) {
         } catch (rollbackError) { state.failed = true; throw Object.assign(error, { recoveryError: rollbackError.code ?? rollbackError.message }); }
         throw error;
       }
-      finally { state.busy = false; }
+      finally {
+        state.busy = false;
+        await drainAutomaticRollback();
+      }
     },
-    async recover() {
+    async recover(input) {
+      if (input?.automaticRollback) {
+        const event = input.automaticRollback;
+        if (event.type !== "activation_automatically_rolled_back") fail("LIVE_WHOLE_ROLLBACK_EVENT_INVALID");
+        if (state.busy) {
+          if (state.pendingAutomaticRollback) fail("LIVE_WHOLE_ROLLBACK_PENDING");
+          return new Promise((resolve, reject) => { state.pendingAutomaticRollback = { event: structuredClone(event), resolve, reject }; });
+        }
+        const selection = state.selected;
+        if (!selection || selection.activationId !== event.activationId || selection.workerId !== event.failedWorkerId) {
+          return { selectionRestored: false, reason: "selection_changed" };
+        }
+        try {
+          const registry = profile.stateRoot ? readInnerCandidateRegistry(profile) : null;
+          if (registry && JSON.stringify(registry.selection) !== JSON.stringify(selection.previousSelection)) {
+            const expected = { candidateId: selection.candidateApprovalId, manifestPath: selection.manifestPath,
+              manifestSha256: selection.manifestSha256, compatibility: selection.compatibility ?? null };
+            if (JSON.stringify(registry.selection) !== JSON.stringify(expected)) fail("LIVE_WHOLE_REGISTRY_CHANGED");
+            saveInnerCandidateRegistry(profile, profile.approvedCandidates, registry.sha256, selection.previousSelection);
+          }
+          state.selectionRecoveryError = null;
+        } catch (error) { state.selectionRecoveryError = error.code ?? error.message; throw error; }
+        state.selected = { ...selection, automaticRollback: true };
+        return { selectionRestored: true, activationId: event.activationId,
+          previousSelection: selection.previousSelection, candidateRegistrySha256: profile.stateRoot
+            ? readInnerCandidateRegistry(profile)?.sha256 ?? null : null };
+      }
       const registry = profile.stateRoot ? readInnerCandidateRegistry(profile) : null;
       if (!registry?.selection || state.selected) return this.status();
       const selection = registry.selection;

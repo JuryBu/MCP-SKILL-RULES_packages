@@ -85,7 +85,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
     active.add(task);
     try {
       task.worker = new Worker(WORKER_URL, {
-        workerData: { body: task.body, contentEncoding: task.contentEncoding, maxDecodedBytes },
+        workerData: { body: task.body, contentEncoding: task.contentEncoding, maxDecodedBytes, includePayload: task.includePayload },
         resourceLimits: { maxOldGenerationSizeMb: WORKER_HEAP_MB },
       });
       task.body = null;
@@ -120,7 +120,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
     });
   }
 
-  function inspect(body, contentEncoding, { signal } = {}) {
+  function inspect(body, contentEncoding, { signal, includePayload = false } = {}) {
     if (!Buffer.isBuffer(body) && !(body instanceof Uint8Array)) {
       return Promise.reject(new TypeError("body must be a Buffer or Uint8Array"));
     }
@@ -136,7 +136,7 @@ export function createRequestInspector({ maxDecodedBytes = 96 * 1024 * 1024, con
       return Promise.reject(new RequestInspectionError("inspection_queue_full", { limit: maxDecodedBytes }));
     }
     return new Promise((resolve, reject) => {
-      const task = { body, contentEncoding, signal, resolve, reject, settled: false, terminalError: null,
+      const task = { body, contentEncoding, signal, includePayload, resolve, reject, settled: false, terminalError: null,
         worker: null, result: null };
       body = null;
       task.done = new Promise(complete => { task.complete = complete; });

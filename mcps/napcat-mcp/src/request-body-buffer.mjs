@@ -27,27 +27,33 @@ export function createRequestBufferBudget(maxBytes) {
   };
 }
 
-export function createRequestBodyOwner(lease) {
+export function createRequestBodyOwner(lease, { retainUntilReleased = false } = {}) {
   let body = null;
   let bytes = 0;
   let submitted = false;
+  let replayApproved = false;
   return {
     get body() { return body; },
     get bytes() { return bytes; },
+    approveReplay() {
+      if (!retainUntilReleased || body === null || !submitted) throw new Error("Retained request body is unavailable for replay");
+      replayApproved = true;
+    },
     assign(value) {
       if (body !== null || submitted) throw new Error("Request body already assigned");
       body = value;
       bytes = value.length;
     },
     releaseUnused() {
-      if (submitted) return;
+      if (submitted && !retainUntilReleased) return;
       body = null;
       lease.release();
     },
     submit(upstream, onFinished) {
-      if (submitted || body === null) throw new Error("Request body cannot be submitted twice");
+      if (submitted && !replayApproved || body === null) throw new Error("Request body cannot be submitted twice");
       submitted = true;
-      const release = () => lease.release();
+      replayApproved = false;
+      const release = () => { if (!retainUntilReleased) lease.release(); };
       upstream.once("finish", () => {
         release();
         if (!upstream.destroyed) onFinished?.(bytes);
@@ -55,7 +61,7 @@ export function createRequestBodyOwner(lease) {
       upstream.once("close", release);
       try { upstream.end(body); }
       catch (error) { upstream.destroy(); throw error; }
-      finally { body = null; }
+      finally { if (!retainUntilReleased) body = null; }
     },
   };
 }

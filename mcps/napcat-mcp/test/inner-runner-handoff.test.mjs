@@ -198,6 +198,15 @@ test("signed file handoff preserves real core state; tampering, half files and d
   }
   const saved = await old.rpc("prepare", { threadId: "thread-a", fileName: "inner-runner-real.json" });
   const envelope = JSON.parse(fs.readFileSync(saved.filePath, "utf8"));
+  const expectedState = structuredClone(envelope.payload.snapshot.state);
+  assert.deepEqual(Object.keys(expectedState).sort(), ["attempts", "businessProgress", "emptyIdleTurns", "waitTerminals"]);
+  assert.deepEqual(expectedState.attempts, []);
+  assert.deepEqual(expectedState.businessProgress, []);
+  assert.equal(expectedState.emptyIdleTurns.length, 1);
+  assert.equal(expectedState.emptyIdleTurns[0][0], "thread-a");
+  assert.deepEqual(expectedState.waitTerminals.map(([key]) => key).sort(), ["thread-a\u0000one\u0000turn", "thread-a\u0000two\u0000turn"]);
+  assert.ok(expectedState.waitTerminals.every(([, value]) => value.category === "quota"
+    && value.reason === "usage_limit_reached" && value.acceptance === "rejected"));
   assert.equal(envelope.payload.snapshot.state.emptyIdleTurns[0][1].count, 2);
   assert.equal((await state.request(old, "blocked")).status, 503);
   const accept = (fileName, bytes, overrides = {}) => candidate.rpc("accept", { threadId: "thread-a", fileName,
@@ -221,8 +230,11 @@ test("signed file handoff preserves real core state; tampering, half files and d
   await candidate.rpc("cancel", { threadId: "thread-a", token: untouched.token });
   const accepted = await accept("inner-runner-real.json", bytes);
   assert.equal(accepted.readSha256, saved.sha256);
-  assert.equal(accepted.importedEntries, 1);
+  assert.equal(accepted.importedEntries, Object.values(expectedState).reduce((total, entries) => total + entries.length, 0));
   await assert.rejects(accept("inner-runner-real.json", bytes), { code: "RECOVERY_HANDOFF_THREAD_ALREADY_USED" });
+  const transferred = await candidate.rpc("prepare", { threadId: "thread-a", fileName: "inner-runner-transferred.json" });
+  assert.deepEqual(JSON.parse(fs.readFileSync(transferred.filePath, "utf8")).payload.snapshot.state, expectedState);
+  await candidate.rpc("cancel", { threadId: "thread-a", token: transferred.token });
   await state.turn(candidate, 5, "three", "active");
   assert.match((await state.request(candidate, "three")).body, /proxy_repeated_empty_idle/u);
   const before = state.calls();

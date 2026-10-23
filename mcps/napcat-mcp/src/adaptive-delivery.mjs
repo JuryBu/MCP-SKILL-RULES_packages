@@ -122,7 +122,8 @@ export function createAdaptiveDeliveryRegistry(options = {}) {
         deadline(normalDeadline, normalReason, phaseDeadline = null) {
           if (!extended) return { at: normalDeadline, reason: normalReason };
           let next = { at: waitBudget?.deadline() ?? waitDeadlineAt, reason: "ADAPTIVE_WAIT_LIMIT" };
-          const startupEndAt = waitBudget?.hasProgress() ? startedAt : startedAt + uploadAllowanceMs;
+          const startupEndAt = waitBudget?.uploadDeadline?.()
+            ?? (waitBudget?.hasProgress() ? startedAt : startedAt + uploadAllowanceMs);
           const idle = { at: Math.max(lastUpstreamAt ?? startedAt, startupEndAt) + upstreamIdleTimeoutMs,
             reason: "ADAPTIVE_UPSTREAM_IDLE_TIMEOUT" };
           if (idle.at < next.at) next = idle;

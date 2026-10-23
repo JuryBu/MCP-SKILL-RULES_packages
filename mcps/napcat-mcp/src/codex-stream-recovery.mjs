@@ -7,7 +7,7 @@ function safeMessageItem(item) {
 }
 
 function messageHasContent(item) {
-  return Array.isArray(item?.content) && item.content.some((part) => {
+  return Array.isArray(item?.content) && item.content.some(part => {
     return part && typeof part === "object" && Object.keys(part).length > 0;
   });
 }
@@ -63,7 +63,7 @@ export function createStreamRecovery(requestId) {
         };
         items.set(outputIndex, entry);
       }
-      if (entry.item.type === "message") {
+      if (entry.item?.type === "message") {
         entry.item.content ??= [];
         const contentIndex = event.content_index ?? 0;
         entry.item.content[contentIndex] ??= { type: "output_text", text: "" };
@@ -164,5 +164,41 @@ export function waitForRetry(delayMs, requestState, options = {}) {
     }
     timer = setTimeout(() => finish(!requestState.cancelled), delayMs);
     timer.unref?.();
+  });
+}
+
+export function waitForRecoveryAction(delayMs, requestState, { onKeepalive, keepaliveIntervalMs = 5000,
+  canContinueHttp = false } = {}) {
+  if (requestState.cancelled) return Promise.resolve("cancel");
+  return new Promise(resolve => {
+    let timer;
+    let keepaliveTimer;
+    let settled = false;
+    const finish = action => {
+      if (settled) return false;
+      settled = true;
+      clearTimeout(timer);
+      clearInterval(keepaliveTimer);
+      if (requestState.currentAbort === cancel) requestState.currentAbort = null;
+      if (requestState.recoveryControl === control) requestState.recoveryControl = null;
+      resolve(action);
+      return true;
+    };
+    const cancel = () => finish("cancel");
+    const control = { continueHttp: () => canContinueHttp && !requestState.cancelled && finish("continue_http") };
+    requestState.currentAbort = cancel;
+    requestState.recoveryControl = control;
+    const keepalive = () => {
+      if (requestState.cancelled) return finish("cancel");
+      try { onKeepalive?.(); } catch { finish("cancel"); }
+    };
+    keepalive();
+    if (settled) return;
+    keepaliveTimer = setInterval(keepalive, Math.max(10, keepaliveIntervalMs));
+    keepaliveTimer.unref?.();
+    if (delayMs !== null) {
+      timer = setTimeout(() => finish(requestState.cancelled ? "cancel" : "retry"), Math.max(0, delayMs));
+      timer.unref?.();
+    }
   });
 }

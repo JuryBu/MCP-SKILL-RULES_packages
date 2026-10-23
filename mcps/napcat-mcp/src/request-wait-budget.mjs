@@ -1,4 +1,6 @@
 const MEBIBYTE = 1024 * 1024;
+export const DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB = Math.ceil(MEBIBYTE * 8 / 250_000 * 1000);
+export const MAX_UPLOAD_ALLOWANCE_MS = 2_147_483_647 - 600_000;
 const MAX_PROGRESS_RESPONSES = 64;
 const MAX_COMPLETED_PROGRESS_ITEMS = 4096;
 
@@ -56,7 +58,8 @@ export function createRequestProgressTracker(previous, attemptIdentity) {
   };
 }
 
-export function requestUploadAllowanceMs(encodedBytes, millisecondsPerMiB = 1000, maximumMs = 128_000) {
+export function requestUploadAllowanceMs(encodedBytes, millisecondsPerMiB = DEFAULT_UPLOAD_ALLOWANCE_MS_PER_MIB,
+  maximumMs = 128 * millisecondsPerMiB) {
   if (![encodedBytes, millisecondsPerMiB, maximumMs].every(value => Number.isSafeInteger(value) && value >= 0)) {
     throw new RangeError("Upload allowance inputs must be nonnegative safe integers");
   }
@@ -81,6 +84,22 @@ export function createRequestWaitBudget({ startedAt, uploadAllowanceMs, waitLimi
   let progressAt = previousState.waitBudgetProgressAt ?? 0;
   let firstProgressAt = null;
   return {
+    noteUpload(time, nextUploadAllowanceMs) {
+      if (!Number.isSafeInteger(nextUploadAllowanceMs) || nextUploadAllowanceMs < 0) {
+        throw new RangeError("Upload allowance must be a nonnegative safe integer");
+      }
+      spentMs = Math.min(waitLimitMs, spentMs + Math.max(0, time - anchorAt - allowanceMs));
+      anchorAt = time;
+      allowanceMs = nextUploadAllowanceMs;
+    },
+    notePreparation(time, nextUploadAllowanceMs = 0) {
+      if (!Number.isSafeInteger(nextUploadAllowanceMs) || nextUploadAllowanceMs < 0) {
+        throw new RangeError("Upload allowance must be a nonnegative safe integer");
+      }
+      anchorAt = time;
+      allowanceMs = nextUploadAllowanceMs;
+      spentMs = 0;
+    },
     noteProgress(time) {
       const first = firstProgressAt === null;
       firstProgressAt ??= time;
@@ -91,6 +110,7 @@ export function createRequestWaitBudget({ startedAt, uploadAllowanceMs, waitLimi
       return first;
     },
     hasProgress: () => firstProgressAt !== null,
+    uploadDeadline: () => firstProgressAt === null ? anchorAt + allowanceMs : startedAt,
     firstProgressDelayMs: () => firstProgressAt === null ? null : firstProgressAt - startedAt,
     deadline: () => anchorAt + allowanceMs + Math.max(0, waitLimitMs - spentMs),
     remainingMs(time) {
