@@ -54,7 +54,7 @@ function mergeHeaders(...sources) {
     }
   }
   for (const key of Object.keys(headers)) {
-    if (["host", "content-length", "connection", "upgrade", "transfer-encoding", "sec-websocket-key", "sec-websocket-version"].includes(key.toLowerCase())) delete headers[key];
+    if (["host", "content-length", "content-encoding", "content-type", "expect", "connection", "upgrade", "transfer-encoding", "sec-websocket-key", "sec-websocket-version"].includes(key.toLowerCase())) delete headers[key];
   }
   return headers;
 }

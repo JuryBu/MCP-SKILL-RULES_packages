@@ -135,6 +135,22 @@ function start(fixtureState, operationId, payload, settings = {}) {
   return { request, done };
 }
 
+test("decoded WebSocket packets discard HTTP entity headers while preserving authentication", async context => {
+  const state = await fixture(context);
+  const result = await start(state, "compressed-http-origin", body([message("decoded input")]), {
+    headers: { ...fixtureHeaders, "Content-Encoding": "zstd", "Content-Type": "application/json", Expect: "100-continue" },
+    requestHeaders: { "content-length": "42000", "transfer-encoding": "chunked" },
+  }).done;
+  assert.equal(result.error, undefined);
+  const headers = state.connections[0].headers;
+  for (const name of ["content-encoding", "content-type", "expect", "content-length", "transfer-encoding"]) {
+    assert.equal(headers[name], undefined, name);
+  }
+  assert.equal(headers.authorization, fixtureHeaders.Authorization);
+  assert.equal(headers["openai-beta"], fixtureHeaders["OpenAI-Beta"]);
+  assert.deepEqual(state.messages[0].packet.input, [message("decoded input")]);
+});
+
 test("frozen API forwards raw SSE, keeps headers, and sends only new input with terminal previous id", async context => {
   const output = [assistant("fixture output")];
   const state = await fixture(context, entry => complete(entry.socket, `resp_${entry.index}`, output, "raw delta"));
