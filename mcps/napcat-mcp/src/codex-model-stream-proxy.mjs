@@ -46,7 +46,7 @@ const MAX_METADATA_HEADER_BYTES = 64 * 1024;
 const COMPACTION_CONTROL_TYPES = new Set(["compaction", "compaction_trigger", "context_compaction", "compaction_summary"]);
 const CONTEXT_CONTROL_FUNCTION_NAMES = new Set(["new_context", "functions.new_context"]);
 const RETRY_SAFE_REASONING_DELTAS = new Set(["response.reasoning_summary_text.delta", "response.reasoning_text.delta"]);
-const IMPLEMENTATION_VERSION = "2026-10-03.1";
+const IMPLEMENTATION_VERSION = "2026-10-24.1";
 const SAFETY_POLICY_NOTICE = "触发栅栏检查，可能是误报，请避免类似内容";
 const LEGACY_SAFETY_POLICY_CODES = new Set(["bio_policy", "content_filter", "content_policy_violation"]);
 const SAFETY_POLICY_CODES = new Set([...LEGACY_SAFETY_POLICY_CODES, "cyber_policy", "misalignment_policy_violation", "invalid_prompt"]);
@@ -274,6 +274,8 @@ function responseFailureDetails(event) {
   const rawMessage = typeof source?.message === "string" ? source.message : incompleteReason;
   const code = rawCode.trim().toLowerCase();
   const message = rawMessage.replace(/[\r\n]+/gu, " ").trim();
+  const parameter = typeof source?.param === "string" && /^[A-Za-z_][\w.[\]-]{0,159}$/u.test(source.param)
+    ? source.param : null;
   const safetyPolicy = SAFETY_POLICY_CODES.has(code);
   const explicitPermanent = safetyPolicy || EXPLICIT_PERMANENT_CODES.has(code) || EXPLICIT_PERMANENT_CODE.test(code);
   const knownTransient = TRANSIENT_CODES.has(code) || /^(?:internal_server_error|internal_error|flex_unavailable)$/u.test(code);
@@ -283,14 +285,23 @@ function responseFailureDetails(event) {
   const capacity = !explicitPermanent && !usageLimit && (CAPACITY_CODES.has(code)
     || (!knownTransient && /selected model is at capacity|server overloaded/iu.test(message)));
   const permanent = explicitPermanent || (!knownTransient && !usageLimit && !capacity && EXPLICIT_PERMANENT_MESSAGE.test(message));
-  const statusCode = source?.status ?? source?.status_code ?? event?.status ?? event?.status_code;
+  const statusCode = [source?.status, source?.status_code, source?.httpStatus, source?.http_status,
+    event?.status, event?.status_code, event?.httpStatus, event?.http_status]
+    .map(value => typeof value === "string" && /^\d{3}$/u.test(value) ? Number(value) : value)
+    .find(value => Number.isInteger(value) && value >= 400 && value <= 599);
   return {
     code: code || null,
+    parameter,
     message: message.slice(0, 512) || null,
     statusCode: Number.isInteger(statusCode) && statusCode >= 400 && statusCode <= 599 ? statusCode : null,
     safetyPolicy,
     category: safetyPolicy ? "permanent" : usageLimit ? "usage_limit" : capacity ? "capacity" : permanent ? "permanent" : "transient",
   };
+}
+
+function safeFailureIdentity(failure) {
+  const details = responseFailureDetails({ error: failure });
+  return { code: details.code, parameter: details.parameter };
 }
 
 function safetyPolicyNotice(failure) {
@@ -616,6 +627,9 @@ function executeTurnAttempt(options) {
     const toolItemTypes = new Set();
     const toolNames = new Set();
     let terminalFailure = null;
+    let upstreamFailure = null;
+    let localRejection = false;
+    let previousFailure;
     let heldAfterTool = [];
     let heldBytes = 0;
     let holdingToolDone = false;
@@ -667,6 +681,7 @@ function executeTurnAttempt(options) {
       requestState.currentAbort = null;
       requestState.onPreparationProgress = null;
       requestState.onPacketSending = null;
+      requestState.onUploadProgress = null;
       if (!upstream.writableFinished) upstream.destroy();
       upstreamResponse?.destroy();
       const phase = holdingToolDone ? "tool_completion_barrier" : sawLocalTool ? "tool_parameters"
@@ -678,25 +693,27 @@ function executeTurnAttempt(options) {
       const definitelyNotSent = !diagnostics.connectionObserved && !diagnostics.requestFinished
         && !diagnostics.responseStarted && upstream.transport !== "websocket";
       const rawAcceptance = upstream.operationAcceptance ?? explicitAcceptance;
-      const acceptance = rawAcceptance === "accepted" ? true
+      const acceptance = localRejection ? false : rawAcceptance === "accepted" ? true
         : ["rejected", "not_sent"].includes(rawAcceptance) ? false : rawAcceptance;
-      const transmission = upstream.requestTransmissionState ?? (definitelyNotSent ? "not_started" : requestTransmissionState);
+      const transmission = localRejection ? "not_sent"
+        : upstream.requestTransmissionState ?? (definitelyNotSent ? "not_started" : requestTransmissionState);
       const policy = classifyModelFailure({
         source: terminalFailure ? "sse" : upstream.terminalEvidence ? "transport" : upstreamStatusCode >= 400 ? "http"
           : outcome.origin === "upstream_transport" ? "transport" : "local",
         statusCode: upstreamStatusCode,
         code: outcome.failure?.code ?? outcome.reason,
-        message: outcome.failure?.message,
+        message: localRejection ? undefined : upstreamFailure ?? outcome.failure?.message,
         requestAccepted: acceptance,
         requestTransmissionState: transmission,
-        responseStarted: modelResponseStarted,
-        terminalOutcome: upstream.terminalOutcome,
-        terminalEvidence: upstream.terminalEvidence,
+        responseStarted: !localRejection && modelResponseStarted,
+        terminalOutcome: localRejection ? undefined : upstream.terminalOutcome,
+        terminalEvidence: localRejection ? undefined : upstream.terminalEvidence,
         progressObserved: lastProgressAt !== null,
         toolDelivered: deliveredExecutableToolDone,
         cancelled: outcome.kind === "cancelled",
       });
       resolve({ ...outcome, phase, endCause, policy, httpStatus: upstreamStatusCode,
+        ...(localRejection ? { localRejection, previousFailure } : {}),
         requestAccepted: policy.acceptance,
         requestTransmissionState: transmission, contextPreparationHint: contextHint?.contextPreparationHint ?? null,
         failureDiagnostics: diagnostics,
@@ -855,6 +872,9 @@ function executeTurnAttempt(options) {
       }
     };
     let packetSequence = 0;
+    let packetGeneration = null;
+    let packetWireBytes = 0;
+    let acknowledgedBytes = 0;
     requestState.onPacketSending = (progress) => {
       if (settled || requestState.cancelled || lastProgressAt !== null
         || progress?.operationId !== requestState.requestId || progress?.sessionKey !== requestState.threadId
@@ -862,15 +882,37 @@ function executeTurnAttempt(options) {
         || !Number.isSafeInteger(progress.sequence) || progress.sequence <= packetSequence
         || !Number.isSafeInteger(progress.wireBytes) || progress.wireBytes < 0) return 0;
       packetSequence = progress.sequence;
+      packetGeneration = progress.generation;
+      packetWireBytes = progress.wireBytes;
+      acknowledgedBytes = 0;
       const observedAt = Date.now();
       const packetUploadAllowanceMs = requestUploadAllowanceMs(progress.wireBytes, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
       waitBudget?.noteUpload(observedAt, packetUploadAllowanceMs);
       armTimer(firstProgressTimeoutMs + packetUploadAllowanceMs, "FIRST_PROGRESS_TIMEOUT");
       onEvent({ type: "incremental_packet_upload_started", requestId: requestState.requestId,
         threadId: requestState.threadId, sequence: progress.sequence, generation: progress.generation,
-        packetWireBytes: progress.wireBytes, warm: progress.warm, uploadAllowanceMs: packetUploadAllowanceMs,
+        packetWireBytes: progress.wireBytes, warm: progress.warm, uploadAllowanceMs: packetUploadAllowanceMs, cacheDecision: progress.cacheDecision,
         firstProgressDeadlineAt: normalDeadline, waitDeadlineAt: waitBudget?.deadline(), businessProgress: false });
       return packetUploadAllowanceMs;
+    };
+    requestState.onUploadProgress = (progress) => {
+      if (settled || requestState.cancelled || lastProgressAt !== null
+        || progress?.operationId !== requestState.requestId || progress?.sessionKey !== requestState.threadId
+        || progress.phase !== "packet_upload_progress" || progress.businessProgress !== false
+        || progress.sequence !== packetSequence || progress.generation !== packetGeneration
+        || progress.wireBytes !== packetWireBytes || !Number.isSafeInteger(progress.acknowledgedBytes)
+        || progress.acknowledgedBytes <= acknowledgedBytes || progress.acknowledgedBytes > packetWireBytes) return;
+      acknowledgedBytes = progress.acknowledgedBytes;
+      const observedAt = Date.now();
+      const remainingBytes = packetWireBytes - acknowledgedBytes;
+      const remainingAllowanceMs = requestUploadAllowanceMs(remainingBytes, uploadAllowanceMsPerMiB, maxUploadAllowanceMs);
+      waitBudget?.noteUpload(observedAt, remainingAllowanceMs);
+      armTimer(firstProgressTimeoutMs + remainingAllowanceMs, "FIRST_PROGRESS_TIMEOUT");
+      onEvent({ type: "incremental_packet_upload_progress", requestId: requestState.requestId,
+        threadId: requestState.threadId, sequence: packetSequence, generation: packetGeneration,
+        packetWireBytes, acknowledgedBytes, remainingBytes, uploadAllowanceMs: remainingAllowanceMs,
+        firstProgressDeadlineAt: normalDeadline, waitDeadlineAt: waitBudget?.deadline(), businessProgress: false });
+      return remainingAllowanceMs;
     };
     let preparationSequence = 0;
     requestState.onPreparationProgress = (progress) => {
@@ -910,6 +952,7 @@ function executeTurnAttempt(options) {
       if (socket.encrypted) socket.once("secureConnect", noteTlsConnection);
     });
     requestState.currentAbort = () => {
+      upstream.cancelAndDrain?.();
       upstreamResponse?.destroy();
       upstream.destroy();
       finish({ kind: "cancelled", reason: "DOWNSTREAM_CANCELLED" });
@@ -958,6 +1001,7 @@ function executeTurnAttempt(options) {
       }
 
       ensureSseHead(downstream, upstreamHeaders);
+      downstream.flushHeaders?.();
       parser = createSseFrameParser((wire, frame) => {
         if (adaptiveDeadlineExpired()) return;
         frames += 1;
@@ -1021,6 +1065,7 @@ function executeTurnAttempt(options) {
           }
         }
         if (type === "response.failed" || type === "response.incomplete" || type === "error") {
+          upstreamFailure = event?.response?.error ?? event?.error ?? event;
           terminalFailure = responseFailureDetails(event);
           if (terminalFailure.statusCode !== null) upstreamStatusCode = terminalFailure.statusCode;
           const kind = terminalFailure.category === "usage_limit"
@@ -1140,20 +1185,28 @@ function executeTurnAttempt(options) {
       });
       response.once("error", (error) => {
         if (settled || requestState.cancelled) return;
+        upstreamFailure = error.upstreamError ?? upstreamFailure;
+        localRejection = error.localRejection === true;
+        previousFailure = error.previousFailure;
         explicitAcceptance = error.requestAccepted ?? explicitAcceptance;
         if (error.requestTransmissionState) requestTransmissionState = error.requestTransmissionState;
         if (Number.isInteger(error.httpStatus)) upstreamStatusCode = error.httpStatus;
         failureDiagnostics.transportError("response", error);
-        finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
+        finish({ kind: "retryable_failure", reason: error.code ?? "STREAM_ERROR", origin: "upstream_transport", upstreamHeaders,
+          diagnosticFailure: upstreamFailure ? safeFailureIdentity(upstreamFailure) : null });
       });
     });
     upstream.once("error", (error) => {
       if (settled || requestState.cancelled) return;
+      upstreamFailure = error.upstreamError ?? upstreamFailure;
+      localRejection = error.localRejection === true;
+      previousFailure = error.previousFailure;
       explicitAcceptance = error.requestAccepted;
       if (error.requestTransmissionState) requestTransmissionState = error.requestTransmissionState;
       if (Number.isInteger(error.httpStatus)) upstreamStatusCode = error.httpStatus;
       failureDiagnostics.transportError("request", error);
-      finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders });
+      finish({ kind: "retryable_failure", reason: error.code ?? "UPSTREAM_ERROR", origin: "upstream_transport", upstreamHeaders,
+        diagnosticFailure: upstreamFailure ? safeFailureIdentity(upstreamFailure) : null });
     });
     requestTransmissionState = "started";
     requestBody.submit(upstream, bodyBytes => {
@@ -1550,6 +1603,7 @@ export function createCodexModelStreamProxy(options = {}) {
     if (key) operationClaims.set(key, requestId);
     const compactionDeadlineAt = identity.requestKind === "compaction" ? Date.now() + compactionAttemptTimeoutMs : null;
     let compactionPreparationTimer = null;
+    let recoveryKeepaliveTimer = null;
     const bodyLease = requestBufferBudget.lease();
     const requestBody = createRequestBodyOwner(bodyLease, { retainUntilReleased: managedRecovery || Boolean(incrementalTransport) });
     requestState.recovery = createStreamRecovery(requestId);
@@ -1601,7 +1655,7 @@ export function createCodexModelStreamProxy(options = {}) {
       const message = repeatedEmptyIdle && details.code !== code && details.reason !== code
         ? `${notice}\n连续三个回合没有模型文本或已完成的工具工作，本回合已停止自动继续。` : notice;
       ensureSseHead(response, headers);
-      if (key) waitTerminals.set(key, { notice: message, reason: code,
+      if (key && !details.localRejection) waitTerminals.set(key, { notice: message, reason: code,
         category: details.category, acceptance: details.acceptance, credentialIdentity, updatedAt: Date.now() });
       const hardFailure = repeatedEmptyIdle || details.category === "local_state" || details.category === "acceptance_unknown"
         || eventType === "request_acceptance_unresolved";
@@ -1636,6 +1690,14 @@ export function createCodexModelStreamProxy(options = {}) {
       recoveryState({ ...requestState.recoveryWait, phase: "resumed", willRetry: false,
         canContinueHttp: false, ...progress });
     };
+    const writeRecoveryKeepalive = () => {
+      if (requestState.cancelled || response.destroyed || response.writableEnded) {
+        clearInterval(recoveryKeepaliveTimer);
+        recoveryKeepaliveTimer = null;
+        return;
+      }
+      response.write('event: ping\ndata: {"type":"ping"}\n\n');
+    };
     const waitForRecovery = async ({ delayMs, reason, acceptance, canContinueHttp = false,
       retryNumber = 0, httpStatusCode = null, streamKeepalive = true }) => {
       const state = { phase: "waiting", reason, acceptance, canContinueHttp, retryNumber,
@@ -1644,6 +1706,12 @@ export function createCodexModelStreamProxy(options = {}) {
           ? httpStatusCode : null };
       recoveryState(state);
       if (streamKeepalive) ensureSseHead(response);
+      if (streamKeepalive && identity.requestKind === "turn" && !recoveryKeepaliveTimer) {
+        writeRecoveryKeepalive();
+        recoveryKeepaliveTimer = setInterval(writeRecoveryKeepalive,
+          Math.max(100, Math.min(1000, options.heartbeatIntervalMs ?? 1000)));
+        recoveryKeepaliveTimer.unref?.();
+      }
       const action = await waitForRecoveryAction(delayMs, requestState, { canContinueHttp,
         keepaliveIntervalMs: Math.max(100, Math.min(1000, options.heartbeatIntervalMs ?? 1000)),
         onKeepalive: () => {
@@ -1651,7 +1719,7 @@ export function createCodexModelStreamProxy(options = {}) {
             requestState.cancelled = true;
             return;
           }
-          if (streamKeepalive) response.write('event: ping\ndata: {"type":"ping"}\n\n');
+          if (streamKeepalive && !recoveryKeepaliveTimer) writeRecoveryKeepalive();
         },
       });
       recoveryState({ ...state, phase: action === "cancel" ? "stopped" : "retrying", willRetry: action !== "cancel" });
@@ -1660,11 +1728,15 @@ export function createCodexModelStreamProxy(options = {}) {
     const finish = () => {
       observation?.ended(requestState.cancelled ? "cancelled" : "ended_unknown");
       clearTimeout(compactionPreparationTimer);
+      clearInterval(recoveryKeepaliveTimer);
+      recoveryKeepaliveTimer = null;
       requestBody.releaseUnused();
       active.delete(requestId);
       if (key && operationClaims.get(key) === requestId) operationClaims.delete(key);
     };
     response.once("close", () => {
+      clearInterval(recoveryKeepaliveTimer);
+      recoveryKeepaliveTimer = null;
       if (response.writableFinished) return;
       requestState.cancelled = true;
       requestState.inspectionAbort.abort();
@@ -1883,6 +1955,7 @@ export function createCodexModelStreamProxy(options = {}) {
       let managedRetryNumber = 0;
       let websocketAttempts = 0;
       let forceHttp = (websocketCooldowns.get(identity.threadId)?.retryAt ?? 0) > websocketNow();
+      let approvedFallback = false;
       for (;;) {
         if (key) operationLedger?.begin(key);
         const websocketHeaders = { ...request.headers,
@@ -1895,7 +1968,8 @@ export function createCodexModelStreamProxy(options = {}) {
             retryWithoutOutput: managedRetryNumber > 0,
             payload: inspected.payload, url: incrementalUpstreamUrl.href, headers: websocketHeaders,
             onPreparationProgress: (progress) => requestState.onPreparationProgress?.(progress),
-            onPacketSending: (progress) => requestState.onPacketSending?.(progress) }) : null;
+            onPacketSending: (progress) => requestState.onPacketSending?.(progress),
+            onUploadProgress: (progress) => requestState.onUploadProgress?.(progress) }) : null;
         if (upstreamClient) websocketAttempts += 1;
         outcome = await executeTurnAttempt({
         requestBody,
@@ -1937,19 +2011,30 @@ export function createCodexModelStreamProxy(options = {}) {
         outcome.nativeRecovery = !compactionRequest && !outcome.sawCompaction
           && ["temporary", "acceptance_unknown"].includes(outcome.policy?.category) && !replayWithoutOutput;
         const fallbackPayload = upstreamClient && ["payload_too_large", "transport_capacity"].includes(outcome.policy?.category) && replayWithoutOutput;
-        if (key) operationLedger?.settle(key, fallbackPayload
+        const fallbackCompatibility = upstreamClient && replayWithoutOutput
+          && outcome.policy?.httpCompatibilityFallback === true;
+        if (key) operationLedger?.settle(key, fallbackPayload || fallbackCompatibility
           ? { ...outcome, policy: { ...outcome.policy, acceptance: "rejected" } } : outcome);
+        if (outcome.failure?.category === "capacity") break;
+        if (!upstreamClient && websocketAttempts > 0 && outcome.kind === "completed") {
+          incrementalTransport?.completeHttpFallback?.(requestId, { approvedFallback });
+        }
         if (upstreamClient && outcome.kind === "completed") websocketCooldowns.delete(identity.threadId);
         const fallbackNetwork = upstreamClient && replayWithoutOutput && outcome.policy?.retryable && websocketAttempts >= 2;
         if (upstreamClient && outcome.nativeRecovery) deferWebsocket(identity.threadId);
-        if (managedRecovery && !compactionRequest && (fallbackPayload || fallbackNetwork) && !requestState.cancelled) {
+        if (managedRecovery && !compactionRequest && (fallbackPayload || fallbackNetwork || fallbackCompatibility) && !requestState.cancelled) {
           const retryAfterMs = deferWebsocket(identity.threadId);
           incrementalTransport.invalidate(identity.threadId, "http_fallback");
           forceHttp = true;
+          approvedFallback = true;
           recoveryState({ phase: "retrying", reason: fallbackPayload
             ? (outcome.policy.category === "transport_capacity" ? "websocket_capacity_requires_http" : "websocket_payload_requires_http")
-            : "websocket_http_fallback",
+            : fallbackCompatibility ? "websocket_parameters_require_http" : "websocket_http_fallback",
             acceptance: outcome.policy.acceptance, willRetry: true, canContinueHttp: false, retryAfterMs, websocketAttempts });
+          if (fallbackCompatibility) emit({ type: "websocket_compatibility_fallback",
+            code: outcome.failure?.code ?? outcome.diagnosticFailure?.code,
+            parameter: outcome.failure?.parameter ?? outcome.diagnosticFailure?.parameter ?? null,
+            terminalOutcome: outcome.policy.terminalOutcome ?? null });
           requestBody.approveReplay();
           continue;
         }
@@ -1980,6 +2065,8 @@ export function createCodexModelStreamProxy(options = {}) {
         failureDiagnostics: outcome.failureDiagnostics,
         contextPreparationHint: outcome.contextPreparationHint,
         reason: outcome.reason,
+        failureParameter: outcome.failure?.parameter ?? outcome.diagnosticFailure?.parameter ?? null,
+        terminalOutcome: outcome.policy?.terminalOutcome ?? null,
         elapsedMs: outcome.elapsedMs,
         frames: outcome.frames,
         sawContent: outcome.sawContent,
@@ -1991,6 +2078,15 @@ export function createCodexModelStreamProxy(options = {}) {
         sawHostedTool: outcome.sawHostedTool,
         toolItemTypes: outcome.toolItemTypes,
       });
+      if (outcome.localRejection) {
+        if (key) attempts.delete(key);
+        recoveryState({ phase: "failed", reason: outcome.reason, category: "local_state",
+          acceptance: "not_sent", willRetry: false, canContinueHttp: false });
+        finishTerminalFailure("本地重复操作保护已拒绝本次发送，原操作状态已保留，请核对已有输出后继续。",
+          "local_operation_rejected", { code: outcome.reason, category: "local_state", acceptance: "not_sent",
+            localRejection: true, previousFailure: outcome.previousFailure }, outcome.upstreamHeaders);
+        return;
+      }
       const replayUnsafe = Boolean(prior?.replayUnsafe
         || outcome.sawReplayUnsafeContent || outcome.sawSubstantiveWork || outcome.sawTool
         || outcome.sawExecutableToolDone || outcome.sawCompaction || outcome.sawHostedTool);

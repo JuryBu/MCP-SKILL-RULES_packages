@@ -226,6 +226,97 @@ test("metadata and heartbeat before an accepted response do not prevent websocke
   assert.equal(response.text.includes("duplicate_operation"), false);
 });
 
+for (const mode of ["incomplete", "failed-empty-reasoning", "empty-delta", "empty-reasoning", "server-no-status", "rate-no-status", "failed-no-created", "string-status"]) {
+  test(`no-output ${mode} retries WS then completes full HTTP without duplicate or a ledger lock`, async context => {
+    const setup = await fixture(context, { onPacket: entry => {
+      const id = `empty-${entry.index}`;
+      const error = mode === "rate-no-status" ? { code: "rate_limit_exceeded" }
+        : { code: "server_error", ...(!["server-no-status", "failed-no-created"].includes(mode) ? { status: mode === "string-status" ? "503" : 503 } : {}) };
+      if (mode !== "failed-no-created") entry.socket.send(JSON.stringify({ type: "response.created", response: { id, status: "in_progress", output: [] } }));
+      if (mode === "empty-delta") entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "" }));
+      if (mode === "empty-reasoning") entry.socket.send(JSON.stringify({ type: "response.output_item.done", item: { type: "reasoning", id: "empty-reasoning", summary: [], encrypted_content: "" } }));
+      const output = mode === "failed-empty-reasoning" ? [{ type: "reasoning", summary: [], encrypted_content: "" }] : [];
+      const event = ["server-no-status", "rate-no-status"].includes(mode) ? { type: "error", error }
+        : { type: mode === "incomplete" ? "response.incomplete" : "response.failed", response: { id, status: mode === "incomplete" ? "incomplete" : "failed", output, error } };
+      entry.socket.send(JSON.stringify(event));
+    } });
+    const pending = setup.request();
+    const result = await pending.done;
+    assert.equal(setup.packets.length, 2);
+    assert.equal(setup.httpRequests.length, 1);
+    assert.deepEqual(setup.httpRequests[0].body, pending.encoded);
+    assert.equal(result.events.at(-1).response.id, "http_completed");
+    assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+    assert.equal(result.text.includes("duplicate_operation"), false);
+    const appended = await setup.request({ input: [inputMessage("hello"), inputMessage("new input")] }).done;
+    assert.equal(appended.events.at(-1).response.id, "http_completed");
+    assert.equal(setup.httpRequests.length, 2);
+  });
+}
+
+test("local duplicate rejection releases only its fresh ledger claim and leaves the next input usable", async context => {
+  const setup = await fixture(context, { onPacket: entry => entry.socket.terminate() });
+  const original = setup.transport.createRequestClient;
+  setup.transport.createRequestClient = options => original({ ...options, retryWithoutOutput: false });
+  const rejected = await setup.request().done;
+  assert.equal(rejected.events.at(-1).type, "response.failed");
+  assert.equal(rejected.events.at(-1).response.error.code, "duplicate_operation");
+  assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+  setup.transport.createRequestClient = original;
+  const next = await setup.request({ input: [inputMessage("new user input")] }).done;
+  assert.equal(next.events.at(-1).response.id, "http_completed");
+  assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+});
+
+test("ledger local rejection preserves an older unresolved entry and releases a fresh unsent claim", () => {
+  const ledger = createModelOperationLedger();
+  const key = "local-thread\u0000local-turn\u0000turn";
+  ledger.begin(key);
+  ledger.settle(key, { kind: "retryable_failure", localRejection: true });
+  assert.equal(ledger.get(key), null);
+  ledger.begin(key);
+  ledger.settle(key, { kind: "permanent_failure", policy: { acceptance: "accepted", category: "permanent", reasonCode: "original_failure" } });
+  const previous = ledger.snapshot();
+  ledger.settle(key, { kind: "retryable_failure", localRejection: true });
+  assert.deepEqual(ledger.snapshot(), previous);
+});
+
+test("delivered tool executes once while its same-turn result recovers and new user input stays usable", async context => {
+  const call = { type: "function_call", call_id: "execute-once", name: "fixture_tool", arguments: "{}" };
+  let executions = 0;
+  const setup = await fixture(context, { onPacket: entry => {
+    if (entry.index === 1) {
+      entry.socket.send(JSON.stringify({ type: "response.output_item.done", item: call }));
+      complete(entry.socket, "tool_delivered", [call]);
+    } else {
+      entry.socket.send(JSON.stringify({ type: "response.incomplete", response: { id: `recover-${entry.index}`,
+        status: "incomplete", output: [], error: { code: "server_error", status: 503 } } }));
+    }
+  } });
+  const input = [inputMessage("use the tool once")];
+  const first = await setup.request({ input }).done;
+  const execute = events => events.filter(event => event.type === "response.output_item.done" && event.item?.call_id === call.call_id)
+    .map(() => { executions += 1; return { type: "function_call_output", call_id: call.call_id, output: "executed once" }; });
+  const results = execute(first.events);
+  assert.equal(executions, 1);
+  const nextInput = [...input, call, ...results];
+  const pending = setup.request({ input: nextInput });
+  const second = await pending.done;
+  execute(second.events);
+  assert.equal(executions, 1);
+  assert.equal(setup.packets.length, 3);
+  assert.equal(setup.packets[1].packet.previous_response_id, "tool_delivered");
+  assert.deepEqual(setup.packets[1].packet.input, results);
+  assert.deepEqual(setup.packets[2].packet.input, nextInput);
+  assert.deepEqual(setup.httpRequests[0].body, pending.encoded);
+  assert.equal(second.events.at(-1).response.id, "http_completed");
+  const third = await setup.request({ input: [...nextInput, inputMessage("continue with new input")] }).done;
+  execute(third.events);
+  assert.equal(executions, 1);
+  assert.equal(third.events.at(-1).response.id, "http_completed");
+  assert.equal(setup.proxy.status().operationLedger.protectedOperations, 0);
+});
+
 for (const resource of ["maxSessions", "maxOperations"]) {
   test(`local WebSocket ${resource} exhaustion falls back without stopping the busy thread`, async context => {
     let firstPacket;
@@ -256,6 +347,28 @@ test("1009 falls back once to full HTTP without resending the websocket packet",
   assert.equal(setup.httpRequests.length, 1);
   assert.deepEqual(setup.httpRequests[0].body, pending.encoded);
   assert.equal(response.events.at(-1).type, "response.completed");
+});
+
+test("HTTP fallback completion releases failed websocket capacity for later healthy requests", async context => {
+  let successful = false;
+  let now = 0;
+  const setup = await fixture(context, {
+    transportOptions: { maxOperations: 2 }, proxyOptions: { websocketNow: () => now },
+    onPacket: entry => successful ? complete(entry.socket, `resp_${entry.index}`) : entry.socket.terminate(),
+  });
+  for (const threadId of ["failed-first", "failed-second"]) {
+    const result = await setup.request({ threadId, turnId: `${threadId}-turn` }).done;
+    assert.ok(result.events.some(event => event.type === "response.completed"));
+  }
+  assert.equal(setup.packets.length, 4);
+  assert.equal(setup.httpRequests.length, 2);
+  successful = true;
+  now = 60_001;
+  const result = await setup.request({ threadId: "failed-first", turnId: "after-cooldown" }).done;
+  assert.ok(result.events.some(event => event.type === "response.completed"));
+  assert.equal(setup.packets.length, 5);
+  assert.equal(setup.httpRequests.length, 2);
+  assert.equal(setup.transport.status().unknownOperations, 0);
 });
 
 test("natural new requests probe websocket after 1 5 and 15 minute cooldowns and reset on success", async context => {

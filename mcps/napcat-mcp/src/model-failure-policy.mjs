@@ -183,12 +183,20 @@ export function classifyModelFailure(failure = {}) {
     && (acceptance === "not_sent" || acceptance === "rejected" || terminalNoOutput);
   const invalidateSession = statusCode === 503 || wsCloseCode === 1009 || category === "payload_too_large"
     || source === "transport" || diagnosis?.networkFailure === true || acceptance === "accepted" || acceptance === "unknown";
+  const reasonCode = signals.code?.code ?? diagnosis?.reasonCode ?? "unknown_failure";
+  const httpCompatibilityFallback = category === "permanent" && signals.complete
+    && ["unsupported_parameter", "unsupported_value"].includes(reasonCode)
+    && ![401, 402, 403, 451].includes(statusCode)
+    && !["safety", "authentication", "quota"].includes(messageDiagnosis(signals.messages)?.category)
+    && failure.progressObserved === false && failure.toolDelivered !== true && failure.cancelled !== true
+    && (["not_sent", "rejected"].includes(acceptance) || terminalNoOutput);
   return Object.freeze({
     category,
     retryable,
     acceptance,
     invalidateSession,
-    reasonCode: signals.code?.code ?? diagnosis?.reasonCode ?? "unknown_failure",
+    reasonCode,
+    ...(httpCompatibilityFallback ? { httpCompatibilityFallback: true } : {}),
     ...(terminalNoOutput ? { terminalOutcome: "failed_no_output" } : {}),
   });
 }

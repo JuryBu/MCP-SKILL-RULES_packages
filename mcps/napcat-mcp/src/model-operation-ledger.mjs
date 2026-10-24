@@ -62,11 +62,12 @@ export function createModelOperationLedger({ state, onStateChange, maxEntries = 
     settle(key, outcome) {
       const hash = operationHash(key);
       if (!entries.has(hash)) return;
+      if (outcome.localRejection && entries.get(hash).phase !== "submitting") return;
       const acceptance = outcome.policy?.acceptance ?? "unknown";
       const replayableWithoutTool = outcome.kind === "cancelled" || outcome.policy?.retryable === true
         || (["temporary", "acceptance_unknown"].includes(outcome.policy?.category)
           && !outcome.deliveredExecutableToolDone && !outcome.sawCompaction);
-      if (outcome.kind === "completed" || ["rejected", "not_sent"].includes(acceptance)
+      if (outcome.localRejection || outcome.kind === "completed" || ["rejected", "not_sent"].includes(acceptance)
         || outcome.policy?.terminalOutcome === "failed_no_output" || replayableWithoutTool) {
         const previous = entries.get(hash);
         entries.delete(hash);

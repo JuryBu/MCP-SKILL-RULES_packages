@@ -788,8 +788,15 @@ export class CodexAppServerProxy {
       this.websocketServer.on("error", (error) => this._liveRecordError("downstream_server", error));
       await this._liveWaitForListening(this.websocketServer, "WebSocket");
 
+      const handleDiscardRequest = this._liveHandleControlRequest;
+      const handleControlRequest = async (request, response) => {
+        const pathname = new URL(request.url ?? "/", "http://127.0.0.1").pathname;
+        const handler = request.method === "POST" && pathname === "/v1/full-runtime/discard"
+          ? handleDiscardRequest : this._liveHandleControlRequest;
+        return handler.call(this, request, response);
+      };
       this.controlServer = http.createServer((request, response) => {
-        this._liveHandleControlRequest(request, response).catch((error) => {
+        handleControlRequest(request, response).catch((error) => {
           if (!/^\/v1\/display-policy(?:\/|\?|$)/.test(request.url ?? "")) this._liveRecordError("control_request", error);
           if (!response.headersSent) response.setHeader("content-type", "application/json; charset=utf-8");
           response.statusCode = error?.code === "UNAUTHORIZED"
@@ -1066,6 +1073,14 @@ export class CodexAppServerProxy {
         tracking.idJson = Buffer.from(envelope.bytes.subarray(idRange.start, idRange.end));
         payload = rewriteRpcId(envelope, JSON.stringify(forwardedId));
       }
+    }
+    if (message?.method === "thread/list" && isObject(message.params) && message.params.archived === true
+      && (!Object.hasOwn(message.params, "modelProviders") || message.params.modelProviders === null)) {
+      const providerEnvelope = payload === data ? envelope : scanRpcEnvelope(payload, this.maxJsonParseBytes);
+      const paramsRange = providerEnvelope.fields.get("params");
+      payload = Buffer.concat([providerEnvelope.bytes.subarray(0, paramsRange.start),
+        Buffer.from(JSON.stringify({ ...message.params, modelProviders: [] })),
+        providerEnvelope.bytes.subarray(paramsRange.end)]);
     }
     const payloadBytes = payload === data ? originalByteLength : messageByteLength(payload);
     const observation = { id: message.id, method: message.method, threadId: message.params?.threadId };
@@ -1653,7 +1668,7 @@ export class CodexAppServerProxy {
       response.end(JSON.stringify({ ok: true, ...this.liveCodeRuntime.status() }));
       return;
     }
-    if (request.method === "POST" && /^\/v1\/full-runtime\/(register|prepare|activate|restore)$/.test(requestUrl.pathname)) {
+    if (request.method === "POST" && /^\/v1\/full-runtime\/(register|prepare|discard|activate|restore)$/.test(requestUrl.pathname)) {
       if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(request.socket.remoteAddress)) throw new Error("LIVE_CODE_LOOPBACK_REQUIRED");
       const input = JSON.parse(await this._liveReadBody(request, 16 * 1024));
       const result = await this.liveCodeRuntime[requestUrl.pathname.split("/").at(-1)](input);

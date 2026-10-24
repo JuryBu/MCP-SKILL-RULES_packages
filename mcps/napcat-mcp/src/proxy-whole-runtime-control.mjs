@@ -19,10 +19,16 @@ const frozenClone = value => {
 export function createProxyWholeRuntimeControl(parent, coordinator, profile, instanceId, candidateRoot) {
   const state = { parent, coordinator, profile, instanceId, candidateRoot,
     preparations: new Map(), busy: false, failed: false, selected: null, implementation: null, generation: 0 };
-  const methods = ["status", "register", "prepare", "activate", "restore", "recover"];
+  const methods = ["status", "register", "prepare", "discard", "activate", "restore", "recover"];
   const checked = implementation => {
-    if (!implementation || methods.some(method => typeof implementation[method] !== "function")) fail("LIVE_WHOLE_IMPLEMENTATION_INVALID");
-    return implementation;
+    if (!implementation || methods.some(method => method !== "discard" && typeof implementation[method] !== "function")
+      || (implementation.discard !== undefined && typeof implementation.discard !== "function")) fail("LIVE_WHOLE_IMPLEMENTATION_INVALID");
+    return typeof implementation.discard === "function" ? implementation : { ...implementation,
+      discard: input => createProxyWholeRuntimeControlImplementation(state).discard(input),
+      activate(input) {
+        if (state.preparations.get(input?.preparationId)?.discardPending) fail("LIVE_WHOLE_DISCARD_PENDING");
+        return implementation.activate(input);
+      } };
   };
   state.implementation = checked(createProxyWholeRuntimeControlImplementation(state));
   const snapshots = new WeakSet();
@@ -117,7 +123,8 @@ export function createProxyWholeRuntimeControlImplementation(state) {
       return { ...status, instanceId, busy: state.busy || status.busy,
         failed: state.failed || status.failed || Boolean(state.selectionRecoveryError),
         selectionRecoveryError: state.selectionRecoveryError ?? null,
-        preparedWorkers: [...preparations].map(([id, value]) => ({ id, workerId: value.workerId })),
+        preparedWorkers: [...preparations].map(([id, value]) => ({ id, workerId: value.workerId,
+          ...(value.discardPending ? { discardPending: true } : {}) })),
         candidateRegistrySha256: profile.stateRoot ? readInnerCandidateRegistry(profile)?.sha256 ?? null : null,
         approvedCandidateIds: (profile.approvedCandidates ?? []).map(candidate => candidate.id),
         controlGeneration: state.generation,
@@ -216,10 +223,35 @@ export function createProxyWholeRuntimeControlImplementation(state) {
         await drainAutomaticRollback();
       }
     },
+    async discard(input) {
+      guard(input);
+      if (typeof profile.ownerId !== "string" || !profile.ownerId || input.ownerId !== profile.ownerId) fail("LIVE_WHOLE_OWNER_MISMATCH");
+      const allowed = ["instanceId", "expectedRevision", "ownerId", "preparationId"];
+      if (typeof input.preparationId !== "string" || !input.preparationId
+        || Object.keys(input).some(key => !allowed.includes(key))) fail("LIVE_WHOLE_DISCARD_INVALID");
+      if (parent().status().selected?.id === input.preparationId) fail("LIVE_WHOLE_CANDIDATE_PROTECTED");
+      const candidate = preparations.get(input.preparationId);
+      if (!candidate) fail("LIVE_WHOLE_PREPARATION_REQUIRED");
+      if (candidate.revision !== input.expectedRevision) fail("LIVE_WHOLE_STALE_PREPARATION");
+      if (candidate.workerId === state.selected?.workerId
+        || candidate.workerId === coordinator.status().defaultWorkerId) fail("LIVE_WHOLE_CANDIDATE_PROTECTED");
+      state.busy = true;
+      preparations.set(input.preparationId, { ...candidate, discardPending: true });
+      try {
+        const worker = await coordinator.discardCandidate({ workerId: candidate.workerId });
+        const result = parent().discard({ instanceId, expectedRevision: input.expectedRevision, preparationId: input.preparationId });
+        preparations.delete(input.preparationId);
+        return { ...result, discarded: true, preparationId: input.preparationId, worker };
+      } finally {
+        state.busy = false;
+        await drainAutomaticRollback();
+      }
+    },
     async activate(input) {
       guard(input);
       const candidate = preparations.get(input.preparationId);
       if (!candidate) fail("LIVE_WHOLE_PREPARATION_REQUIRED");
+      if (candidate.discardPending) fail("LIVE_WHOLE_DISCARD_PENDING");
       if (candidate.revision !== input.expectedRevision) fail("LIVE_WHOLE_STALE_PREPARATION");
       if (currentWorker().workerId !== candidate.sourceWorkerId) fail("LIVE_WHOLE_SELECTION_CHANGED");
       if (profile.stateRoot && (readInnerCandidateRegistry(profile)?.sha256 ?? null) !== candidate.registrySha256) fail("LIVE_WHOLE_REGISTRY_CHANGED");

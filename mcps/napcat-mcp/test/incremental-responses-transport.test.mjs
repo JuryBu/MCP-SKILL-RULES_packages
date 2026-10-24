@@ -111,6 +111,7 @@ function start(fixtureState, operationId, payload, settings = {}) {
     headers: settings.headers ?? fixtureHeaders,
     onPreparationProgress: settings.onPreparationProgress,
     onPacketSending: settings.onPacketSending,
+    retryWithoutOutput: settings.retryWithoutOutput,
   });
   const request = client.request(url, { signal: settings.signal, headers: settings.requestHeaders });
   let response;
@@ -134,6 +135,135 @@ function start(fixtureState, operationId, payload, settings = {}) {
   if (settings.end !== false) request.end("Ignored raw bytes: deliberately not JSON");
   return { request, done };
 }
+
+test("cancelled downstream can drain a matching completed response without replaying its output", async context => {
+  const firstInput = [message("initial")];
+  const firstOutput = [assistant("already delivered")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "already delivered" }));
+  });
+  const first = start(state, "cancel-drain-first", body(firstInput));
+  await waitFor(() => state.transport.getOperation("cancel-drain-first")?.acceptance === true);
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  const cancelled = await first.done;
+  assert.equal(cancelled.error?.code, "ABORT_ERR");
+  const next = start(state, "cancel-drain-next", body([...firstInput, ...firstOutput, message("new instruction")]));
+  await delay(20);
+  state.messages[0].socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_first", status: "completed", output: firstOutput } }));
+  assert.equal((await next.done).error, undefined);
+  assert.equal(state.connections.length, 1);
+  assert.equal(state.messages[1].packet.previous_response_id, "resp_first");
+  assert.deepEqual(state.messages[1].packet.input, [message("new instruction")]);
+  assert.equal(cancelled.sse.includes('"type":"response.completed"'), false);
+});
+
+test("drain expiry remains bounded and rebuilds the next real input", async context => {
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+  });
+  const first = start(state, "cancel-expire-first", body([message("initial")]));
+  await waitFor(() => state.transport.getOperation("cancel-expire-first")?.acceptance === true);
+  const started = performance.now();
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  await first.done;
+  await delay(150);
+  assert.equal(first.request.cancelAndDrain(), true);
+  const input = [message("initial"), message("changed")];
+  const next = await start(state, "cancel-expire-next", body(input)).done;
+  assert.equal(next.error, undefined);
+  assert.ok(performance.now() - started < 800);
+  assert.equal(state.connections.length, 2);
+  assert.equal(state.messages[1].packet.previous_response_id, undefined);
+  assert.deepEqual(state.messages[1].packet.input, input);
+});
+
+test("a truly cancelled queued request is never sent after the held response completes", async context => {
+  const input = [message("initial")];
+  const output = [assistant("delivered")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "delivered" }));
+  });
+  const first = start(state, "queue-first", body(input));
+  await waitFor(() => state.transport.getOperation("queue-first")?.acceptance === true);
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  await first.done;
+  const superseded = start(state, "queue-superseded", body([...input, ...output, message("first update")]));
+  let gotHeaders = false;
+  superseded.request.once("response", () => { gotHeaders = true; });
+  await waitFor(() => gotHeaders);
+  superseded.request.destroy();
+  assert.equal((await superseded.done).error?.code, "ABORT_ERR");
+  const finalInput = [...input, ...output, message("first update"), message("second update")];
+  const next = start(state, "queue-current", body(finalInput));
+  state.messages[0].socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_first", status: "completed", output } }));
+  assert.equal((await next.done).error, undefined);
+  assert.equal(state.messages.length, 2);
+  assert.deepEqual(state.messages[1].packet.input, finalInput.slice(2));
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().queued, 0);
+});
+
+test("requests queued before downstream cancellation receive headers and can be cancelled before sending", async context => {
+  const input = [message("initial")];
+  const output = [assistant("delivered")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "delivered" }));
+  });
+  const first = start(state, "queue-before-first", body(input));
+  await waitFor(() => state.transport.getOperation("queue-before-first")?.acceptance === true);
+  const superseded = start(state, "queue-before-superseded", body([...input, ...output, message("first update")]));
+  let gotHeaders = false;
+  superseded.request.once("response", () => { gotHeaders = true; });
+  await waitFor(() => state.transport.status().queued === 1);
+  assert.equal(gotHeaders, false);
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  await first.done;
+  await waitFor(() => gotHeaders);
+  superseded.request.destroy();
+  assert.equal((await superseded.done).error?.code, "ABORT_ERR");
+  const finalInput = [...input, ...output, message("first update"), message("second update")];
+  const next = start(state, "queue-before-current", body(finalInput));
+  state.messages[0].socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_first", status: "completed", output } }));
+  assert.equal((await next.done).error, undefined);
+  assert.equal(state.messages.length, 2);
+  assert.deepEqual(state.messages[1].packet.input, finalInput.slice(2));
+  assert.equal(state.transport.status().active, 0);
+  assert.equal(state.transport.status().queued, 0);
+});
+
+test("late output excluded from native history forces a full rebuild after draining", async context => {
+  const input = [message("initial")];
+  const state = await fixture(context, entry => {
+    if (entry.index !== 1) return complete(entry.socket, `resp_${entry.index}`);
+    entry.socket.send(JSON.stringify({ type: "response.created", response: { id: "resp_first", status: "in_progress" } }));
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "partial" }));
+  });
+  const first = start(state, "late-first", body(input));
+  await waitFor(() => state.transport.getOperation("late-first")?.acceptance === true);
+  assert.equal(first.request.cancelAndDrain(), true);
+  first.request.destroy();
+  const cancelled = await first.done;
+  const nextInput = [...input, message("new instruction")];
+  const next = start(state, "late-next", body(nextInput));
+  state.messages[0].socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "LATE_IGNORED" }));
+  state.messages[0].socket.send(JSON.stringify({ type: "response.completed", response: { id: "resp_first", status: "completed", output: [assistant("LATE_IGNORED")] } }));
+  assert.equal((await next.done).error, undefined);
+  assert.equal(cancelled.sse.includes("LATE_IGNORED"), false);
+  assert.equal(state.connections.length, 2);
+  assert.deepEqual(state.messages[1].packet.input, nextInput);
+});
 
 test("decoded WebSocket packets discard HTTP entity headers while preserving authentication", async context => {
   const state = await fixture(context);
@@ -682,7 +812,20 @@ test("missing terminal times out without fabricated completion or replay", async
   assert.equal(state.transport.status().connections, 0);
 });
 
-test("resource limits reject unsent work without evicting unknown operation protection", async context => {
+test("unsent failed operations are reclaimed before they exhaust the operation capacity", async context => {
+  const state = await fixture(context, null, { maxOperations: 2, maxSessionBytes: 2048 });
+  for (let index = 0; index < 5; index += 1) {
+    const rejected = await start(state, `unsent-${index}`, body([message("X".repeat(3000))])).done;
+    assert.equal(rejected.error.code, "session_bytes_exceeded");
+    assert.equal(rejected.error.requestAccepted, false);
+  }
+  const result = await start(state, "after-unsent-rejections", body([message("healthy")])).done;
+  assert.equal(result.error, undefined);
+  assert.equal(state.messages.length, 1);
+  assert.equal(state.transport.status().operations, 2);
+});
+
+test("resource limits reclaim unsent work without evicting unknown operation protection", async context => {
   const state = await fixture(context, () => {}, { maxSessions: 1, maxOperations: 3, maxSessionBytes: 2048 });
   const active = start(state, "resource-active", body([message("active")]));
   await waitFor(() => state.messages.length === 1);
@@ -691,13 +834,37 @@ test("resource limits reject unsent work without evicting unknown operation prot
   assert.equal(other.error.requestAccepted, false);
   const large = await start(state, "resource-large", body([message("X".repeat(3000))])).done;
   assert.equal(large.error.code, "session_bytes_exceeded");
-  const limitResult = await start(state, "resource-operation-limit", body([])).done;
-  assert.equal(limitResult.error.code, "operation_limit");
+  const limitResult = await start(state, "resource-operation-limit", body([]), { sessionKey: "session-b" }).done;
+  assert.equal(limitResult.error.code, "session_limit");
+  assert.equal(state.transport.getOperation("resource-other"), null);
   active.request.destroy();
   await active.done;
   state.transport.invalidate("session-a");
   assert.equal(state.transport.getOperation("resource-active").acceptance, "unknown");
   assert.equal(state.transport.getOperation("resource-active").canRetry, false);
+});
+
+test("unresolved and substantive operations retain protection under capacity and fallback notifications", async context => {
+  const state = await fixture(context, () => {}, { maxOperations: 1 });
+  const active = start(state, "protected-active", body([message("active")]));
+  await waitFor(() => state.messages.length === 1);
+  assert.equal(state.transport.completeHttpFallback("protected-active"), false);
+  assert.equal(state.transport.completeHttpFallback("missing"), false);
+  active.request.destroy();
+  await active.done;
+  const limited = await start(state, "another", body([message("next")])).done;
+  assert.equal(limited.error.code, "operation_limit");
+  assert.equal(state.transport.getOperation("protected-active").acceptance, "unknown");
+  const duplicate = await start(state, "protected-active", body([message("active")])).done;
+  assert.equal(duplicate.error.code, "duplicate_operation");
+
+  const outputState = await fixture(context, entry => {
+    entry.socket.send(JSON.stringify({ type: "response.output_text.delta", delta: "delivered" }));
+    entry.socket.close();
+  });
+  await start(outputState, "substantive", body([message("output")])).done;
+  assert.equal(outputState.transport.completeHttpFallback("substantive"), false);
+  assert.equal((await start(outputState, "substantive", body([message("output")])).done).error.code, "duplicate_operation");
 });
 
 test("only explicit ws/wss endpoints are accepted; sensitive headers never select an address", async context => {
@@ -998,6 +1165,59 @@ function synchronousFixture(context, handler, options = {}) {
   });
   return { transport, packets, sockets, url: "ws://127.0.0.1:9/responses" };
 }
+
+test("explicit no-output failures retain their original classification and allow the same internal operation", async context => {
+  for (const error of [{ code: "server_error" }, { type: "server_error" }, { code: "rate_limit_exceeded" }, { code: "server_error", status: 503 }]) {
+    const state = synchronousFixture(context, (socket, _packet, index) => {
+      if (index === 1) socket.event({ type: "error", error });
+      else socket.complete("recovered");
+    });
+    const input = body([message("recover original operation")]);
+    const first = await start(state, "raw-failure", input).done;
+    assert.deepEqual(first.error.upstreamError, error);
+    const retry = await start(state, "raw-failure", input, { retryWithoutOutput: true }).done;
+    assert.equal(retry.error, undefined);
+    assert.equal(state.packets.length, 2);
+    assert.equal(state.transport.getOperation("raw-failure").attempt, 2);
+  }
+});
+
+test("a local duplicate preserves the original operation and its raw failure", async context => {
+  const error = { code: "server_error", message: "original unavailable" };
+  const state = synchronousFixture(context, socket => socket.event({ type: "error", error }));
+  const input = body([message("original")]);
+  await start(state, "local-rejection", input).done;
+  const previous = state.transport.getOperation("local-rejection");
+  const duplicate = await start(state, "local-rejection", input).done;
+  assert.equal(duplicate.error.localRejection, true);
+  assert.deepEqual(duplicate.error.upstreamError, error);
+  assert.equal(duplicate.error.previousFailure.upstreamCode, "server_error");
+  assert.deepEqual(state.transport.getOperation("local-rejection"), previous);
+  assert.equal(state.packets.length, 1);
+});
+
+test("real output and permanent upstream failures remain protected from an internal replay", async context => {
+  const cases = [
+    { error: { code: "server_error", status: 503 }, output: [assistant("real output")] },
+    { error: { code: "server_error", status: 503 }, output: [{ type: "reasoning", encrypted_content: "real reasoning" }] },
+    { error: { code: "server_error", status: 503 }, output: [{ type: "function_call", name: "fixture", call_id: "protected-call", arguments: "{}" }] },
+    ...["invalid_api_key", "insufficient_quota", "content_policy_violation", "unrecognized_failure"].map(code => ({ error: { code }, output: [] })),
+  ];
+  for (const scenario of cases) {
+    const state = synchronousFixture(context, socket => {
+      socket.event({ type: "response.created", response: { id: "protected", status: "in_progress" } });
+      socket.event({ type: "response.failed", response: { id: "protected", status: "failed", ...scenario } });
+    });
+    const input = body([message("protected")]);
+    await start(state, "protected-output", input).done;
+    const previous = state.transport.getOperation("protected-output");
+    assert.equal(previous.canRetry, false);
+    const retry = await start(state, "protected-output", input, { retryWithoutOutput: true }).done;
+    assert.equal(retry.error.code, "duplicate_operation");
+    assert.deepEqual(state.transport.getOperation("protected-output"), previous);
+    assert.equal(state.packets.length, 1);
+  }
+});
 
 test("synchronous terminal consumer sees committed state and destruction leaves the next operation incremental", async context => {
   const output = [assistant("trusted output")];

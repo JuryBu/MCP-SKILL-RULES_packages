@@ -5,6 +5,9 @@ import { classifyModelFailure, createModelFailureTerminalEvidence } from "./mode
 import { MAX_UPLOAD_ALLOWANCE_MS } from "./request-wait-budget.mjs";
 
 const require = createRequire(import.meta.url);
+const websocketFragmentBytes = 64 * 1024;
+const websocketAcknowledgementBytes = 256 * 1024;
+const websocketAcknowledgementTimeoutMs = 30000;
 const ignoredFields = new Set(["input", "previous_response_id", "generate", "stream", "background", "stream_id", "type"]);
 const noop = () => {};
 const byteLength = value => Buffer.byteLength(JSON.stringify(value), "utf8");
@@ -14,17 +17,35 @@ const canonical = value => JSON.stringify(value, (_key, entry) => {
 });
 const digest = value => createHash("sha256").update(canonical(value)).digest("hex");
 
+function canonicalInput(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return canonical(item);
+  const comparable = { ...item };
+  if (item.type === "reasoning" && Array.isArray(item.content) && item.content.length === 0) delete comparable.content;
+  for (const [field, traceKeys] of [
+    ["internal_chat_message_metadata_passthrough", ["turn_id", "content_item_kinds"]],
+    ["metadata", ["turn_id"]],
+  ]) {
+    const metadata = item[field];
+    if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) continue;
+    const stableMetadata = { ...metadata };
+    for (const key of traceKeys) delete stableMetadata[key];
+    if (Object.keys(stableMetadata).length) comparable[field] = stableMetadata;
+    else delete comparable[field];
+  }
+  return canonical(comparable);
+}
+
 function cacheConfiguration(config) {
   const metadata = config.client_metadata;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return config;
   const stableMetadata = { ...metadata };
-  for (const key of ["turn_id", "root_turn_id", "turn_started_at_unix_ms"]) delete stableMetadata[key];
+  for (const key of ["turn_id", "root_turn_id", "parent_turn_id", "turn_started_at_unix_ms"]) delete stableMetadata[key];
   const rawTurnMetadata = stableMetadata["x-codex-turn-metadata"];
   if (typeof rawTurnMetadata === "string") {
     try {
       const turnMetadata = JSON.parse(rawTurnMetadata);
       if (turnMetadata && typeof turnMetadata === "object" && !Array.isArray(turnMetadata)) {
-        for (const key of ["turn_id", "root_turn_id", "turn_started_at_unix_ms"]) delete turnMetadata[key];
+        for (const key of ["turn_id", "root_turn_id", "parent_turn_id", "turn_started_at_unix_ms", "turn_trigger"]) delete turnMetadata[key];
         stableMetadata["x-codex-turn-metadata"] = turnMetadata;
       }
     } catch {}
@@ -79,12 +100,17 @@ function atomicGroups(input) {
   return groups;
 }
 
+function errorStatuses(event) {
+  const candidates = [event?.status, event?.status_code, event?.httpStatus, event?.http_status,
+    event?.error?.status, event?.error?.status_code, event?.error?.httpStatus, event?.error?.http_status,
+    event?.response?.error?.status, event?.response?.error?.status_code,
+    event?.response?.error?.httpStatus, event?.response?.error?.http_status];
+  return candidates.map(value => typeof value === "string" && /^\d{3}$/.test(value) ? Number(value) : value)
+    .filter(value => Number.isInteger(value) && value >= 100 && value <= 599);
+}
+
 function errorStatus(event) {
-  const candidate = event?.status ?? event?.status_code ?? event?.httpStatus ?? event?.http_status
-    ?? event?.error?.status ?? event?.error?.status_code ?? event?.error?.http_status
-    ?? event?.response?.error?.status ?? event?.response?.error?.status_code;
-  const status = typeof candidate === "string" && /^\d{3}$/.test(candidate) ? Number(candidate) : candidate;
-  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+  return errorStatuses(event)[0];
 }
 
 function isBusinessProgress(event) {
@@ -106,6 +132,20 @@ function isBusinessProgress(event) {
     return typeof event.part?.text === "string" && event.part.text.length > 0;
   }
   return /^response\.(?:web_search_call|file_search_call|code_interpreter_call|mcp_call|image_generation_call)\.(?:in_progress|searching|interpreting|generating|partial_image|completed)$/.test(event.type);
+}
+
+function itemHasOutput(item) {
+  if (!item || typeof item !== "object") return false;
+  if (!["message", "reasoning"].includes(item.type)) return true;
+  if (typeof item.encrypted_content === "string" && item.encrypted_content.trim()) return true;
+  return [item.content, item.summary].some(parts => Array.isArray(parts) && parts.some(part =>
+    ["text", "refusal", "audio", "data"].some(key => typeof part?.[key] === "string" && part[key].length > 0)));
+}
+
+function eventHasOutput(event) {
+  if (isBusinessProgress(event) || itemHasOutput(event.item)) return true;
+  const output = event.response?.output;
+  return output !== undefined && (!Array.isArray(output) || output.some(itemHasOutput));
 }
 
 export function createIncrementalResponsesTransport(options = {}) {
@@ -142,9 +182,11 @@ export function createIncrementalResponsesTransport(options = {}) {
       closeCode: record.closeCode,
       wsErrorCode: record.wsErrorCode,
       attempt: record.attempt,
-      canRetry: (record.acceptance === false || record.terminalOutcome === "failed_no_output") && ["failed", "cancelled"].includes(record.state),
+      canRetry: (record.acceptance === false || record.terminalOutcome === "failed_no_output" && record.retryableWithoutOutput === true)
+        && ["failed", "cancelled"].includes(record.state),
       requiresReconciliation: record.acceptance !== false && record.state !== "completed" && record.terminalOutcome !== "failed_no_output",
       ...(record.terminalOutcome ? { terminalOutcome: record.terminalOutcome } : {}),
+      ...(record.fallbackCompletion ? { fallbackCompletion: { ...record.fallbackCompletion } } : {}),
     };
   }
 
@@ -156,7 +198,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     if (record.terminalOutcome) error.terminalOutcome = record.terminalOutcome;
     if (record.terminalEvidence) error.terminalEvidence = record.terminalEvidence;
     error.transport = "websocket";
-    for (const key of ["direction", "closeCode", "wsErrorCode"]) {
+    for (const key of ["direction", "closeCode", "wsErrorCode", "upstreamError", "localRejection", "previousFailure"]) {
       if (record[key] !== undefined) error[key] = record[key];
     }
     if (httpStatus !== undefined) error.httpStatus = httpStatus;
@@ -200,8 +242,10 @@ export function createIncrementalResponsesTransport(options = {}) {
   function releaseJob(job) {
     if (job.released) return;
     job.released = true;
+    job.fragmentCleanup?.();
     clearTimeout(job.timer);
     clearTimeout(job.requestTimer);
+    clearTimeout(job.drainTimer);
     job.signal?.removeEventListener("abort", job.onAbort);
     job.payload = null;
     job.headers = null;
@@ -213,6 +257,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     job.plan = null;
     job.onPreparationProgress = null;
     job.onPacketSending = null;
+    job.onUploadProgress = null;
     job.packet = null;
     job.bytes = 0;
     pendingJobs.delete(job);
@@ -223,11 +268,16 @@ export function createIncrementalResponsesTransport(options = {}) {
     job.settled = true;
     job.record.state = code ? (cancelled ? "cancelled" : "failed") : "completed";
     job.record.reasonCode = code ?? "response_completed";
-    job.record.retryableWithoutOutput = Boolean(code && !job.outputObserved && (cancelled && code === "ABORT_ERR" || classifyModelFailure({
+    const failurePolicy = code ? classifyModelFailure({
       source: "transport", statusCode: httpStatus, code, requestAccepted: job.record.acceptance,
+      message: job.record.upstreamError,
       requestTransmissionState: job.record.requestTransmissionState,
-      progressObserved: job.outputObserved === true, terminalEvidence: job.record.terminalEvidence,
-    }).retryable));
+      progressObserved: job.outputObserved === true, terminalEvidence: job.record.terminalEvidence, cancelled,
+    }) : null;
+    job.record.retryableWithoutOutput = Boolean(code && !job.record.localRejection && !job.outputObserved
+      && (cancelled && code === "ABORT_ERR" || failurePolicy?.retryable));
+    job.record.httpFallbackEligible = Boolean(code && !cancelled && !job.record.localRejection && !job.outputObserved
+      && (failurePolicy?.httpCompatibilityFallback || ["payload_too_large", "transport_capacity"].includes(failurePolicy?.category)));
     if (!code) {
       job.record.acceptance = true;
       job.record.requestTransmissionState = "completed";
@@ -239,12 +289,12 @@ export function createIncrementalResponsesTransport(options = {}) {
       if (session.active === job) session.active = null;
     }
     releaseJob(job);
-    publish?.();
+    if (!job.draining) publish?.();
     if (code) {
       const error = transportError(code, job.record, httpStatus);
       job.response?.destroy(error);
       if (!job.request.destroyed) job.request.destroy(error);
-    } else {
+    } else if (!job.draining) {
       job.response?.end();
     }
     if (session) queueMicrotask(() => pump(session));
@@ -268,6 +318,37 @@ export function createIncrementalResponsesTransport(options = {}) {
     settle(job, code, undefined, true);
   }
 
+  function expireDrain(job) {
+    if (!job.draining || job.settled) return false;
+    const remaining = job.drainDeadline - performance.now();
+    if (remaining > 0) {
+      clearTimeout(job.drainTimer);
+      job.drainTimer = setTimeout(() => expireDrain(job), remaining);
+      job.drainTimer.unref?.();
+      return false;
+    }
+    job.draining = false;
+    cancel(job);
+    return true;
+  }
+
+  function cancelAndDrain(job) {
+    if (job.draining) return !expireDrain(job);
+    const session = job.session;
+    if (job.settled || session?.active !== job || job.packet?.warm !== false
+      || session.socket?.readyState !== 1 || session.wireBytes !== 0
+      || !job.outputObserved || job.record.acceptance !== true) return false;
+    job.draining = true;
+    job.drainDeadline = performance.now() + 300;
+    job.record.downstreamCancelled = true;
+    job.session.socket.resume?.();
+    expireDrain(job);
+    for (const queued of session.queue) {
+      if (!queued.settled && !queued.response) createResponse(queued);
+    }
+    return true;
+  }
+
   function getSession(key) {
     if (sessions.has(key)) return sessions.get(key);
     if (sessions.size >= maxSessions) {
@@ -279,7 +360,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     const session = {
       key, queue: [], active: null, socket: null, connecting: null, connectReject: null,
       connectTimer: null, connectionState: "disconnected", generation: 0, binding: null,
-      prefix: [], previousId: null, cacheBytes: 0, wireBytes: 0, streams: new Set(), receiving: new Set(), completedIds: new Map(),
+      prefix: [], previousId: null, cacheBytes: 0, wireBytes: 0, streams: new Set(), receiving: new Set(), completedIds: new Map(), bindingConfigHashes: null,
     };
     sessions.set(key, session);
     return session;
@@ -337,7 +418,14 @@ export function createIncrementalResponsesTransport(options = {}) {
   }
 
   function packetFor(job, input, warm, previousId) {
-    const packet = { ...job.config, type: "response.create", store: false, input };
+    const wireInput = input.map(item => {
+      if (item?.type !== "message" || item.role !== "assistant" || item.status !== "completed"
+        || !/^msg_proxy_[a-f0-9]{32}$/u.test(item.id ?? "") || !Array.isArray(item.content) || !item.content.length
+        || !item.content.every(part => part?.type === "output_text" && typeof part.text === "string")) return item;
+      const { id: localId, ...message } = item;
+      return message;
+    });
+    const packet = { ...job.config, type: "response.create", store: false, input: wireInput };
     if (previousId) packet.previous_response_id = previousId;
     if (warm) packet.generate = false;
     return packet;
@@ -393,7 +481,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     try {
       uploadAllowanceMs = job.onPacketSending?.(Object.freeze({
         sessionKey: session.key, operationId: job.operationId, generation: session.generation,
-        phase: "packet_sending", sequence: job.sentPackets, wireBytes, warm, businessProgress: false,
+          phase: "packet_sending", sequence: job.sentPackets, wireBytes, warm, businessProgress: false, cacheDecision: job.cacheDecision,
       })) ?? 0;
     } catch { return failConnection(session, "WS_UPLOAD_BUDGET_INVALID"); }
     if (!Number.isSafeInteger(uploadAllowanceMs) || uploadAllowanceMs < 0 || uploadAllowanceMs > MAX_UPLOAD_ALLOWANCE_MS) {
@@ -405,23 +493,79 @@ export function createIncrementalResponsesTransport(options = {}) {
     session.wireBytes = wireBytes;
     const socket = session.socket;
     const pendingPacket = job.packet;
+    const current = () => session.socket === socket && session.active === job && !job.settled && job.packet === pendingPacket;
+    const sent = error => {
+      if (!current()) return;
+      job.fragmentCleanup?.();
+      session.wireBytes = 0;
+      if (error) failConnection(session, "WS_SEND_ERROR", undefined, socketFailure(error, "send"));
+    };
     refreshPacketTimeout(session, job, pendingPacket, uploadAllowanceMs);
     try {
-      socket.send(wire, error => {
-        if (session.socket !== socket || session.active !== job || job.settled || job.packet !== pendingPacket) return;
-        session.wireBytes = 0;
-        if (error) failConnection(session, "WS_SEND_ERROR", undefined, socketFailure(error, "send"));
-      });
+      if (wireBytes <= websocketFragmentBytes) return socket.send(wire, sent);
+      const payload = Buffer.from(wire, "utf8");
+      let offset = 0;
+      const waitForRemoteRead = () => {
+        const token = createHash("sha256").update(`${session.generation}:${job.operationId}:${job.sentPackets}:${offset}`).digest().subarray(0, 16);
+        let timer;
+        const cleanup = () => {
+          clearTimeout(timer);
+          socket.off("pong", onPong);
+          if (job.fragmentCleanup === cleanup) job.fragmentCleanup = null;
+        };
+        const onPong = data => {
+          if (!current() || !Buffer.from(data).equals(token)) return;
+          cleanup();
+          let remainingAllowanceMs;
+          try {
+            remainingAllowanceMs = job.onUploadProgress?.(Object.freeze({
+              sessionKey: session.key, operationId: job.operationId, generation: session.generation,
+              phase: "packet_upload_progress", sequence: job.sentPackets, wireBytes,
+              acknowledgedBytes: offset, warm, businessProgress: false,
+            })) ?? Math.ceil(uploadAllowanceMs * (payload.length - offset) / payload.length);
+          } catch { return failConnection(session, "WS_UPLOAD_BUDGET_INVALID"); }
+          if (!Number.isSafeInteger(remainingAllowanceMs) || remainingAllowanceMs < 0 || remainingAllowanceMs > MAX_UPLOAD_ALLOWANCE_MS) {
+            return failConnection(session, "WS_UPLOAD_BUDGET_INVALID");
+          }
+          if (!current()) return;
+          refreshPacketTimeout(session, job, pendingPacket, remainingAllowanceMs);
+          setImmediate(sendFragment);
+        };
+        job.fragmentCleanup = cleanup;
+        socket.on("pong", onPong);
+        timer = setTimeout(() => {
+          cleanup();
+          sent(Object.assign(new Error("WebSocket upload acknowledgement timed out"), { code: "WS_PONG_TIMEOUT" }));
+        }, websocketAcknowledgementTimeoutMs);
+        timer.unref?.();
+        try { socket.ping(token, error => { if (error) { cleanup(); sent(error); } }); }
+        catch (error) { cleanup(); sent(error); }
+      };
+      const sendFragment = () => {
+        if (!current()) return;
+        if (socket.readyState !== 1) return failConnection(session, "WS_CONNECTION_CLOSED");
+        const end = Math.min(offset + websocketFragmentBytes, payload.length);
+        try {
+          socket.send(payload.subarray(offset, end), { binary: false, fin: end === payload.length }, error => {
+            if (!current()) return;
+            if (error) return sent(error);
+            offset = end;
+            if (offset === payload.length) sent();
+            else if (offset % websocketAcknowledgementBytes === 0) waitForRemoteRead();
+            else setImmediate(sendFragment);
+          });
+        } catch (error) { sent(error); }
+      };
+      sendFragment();
     } catch (error) {
-      if (session.socket === socket && session.active === job && !job.settled && job.packet === pendingPacket) {
-        failConnection(session, "WS_SEND_ERROR", undefined, socketFailure(error, "send"));
-      }
+      sent(error);
     }
   }
 
   function receive(session, data) {
     const job = session.active;
     if (!job?.packet || job.settled) return;
+    if (expireDrain(job)) return;
     const packet = job.packet;
     const socket = session.socket;
     const current = () => !job.settled && session.active === job && job.packet === packet && session.socket === socket;
@@ -449,8 +593,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     if (typeof event?.type !== "string") return failConnection(session, "WS_INVALID_EVENT");
     if (event.type === "response.created" && typeof event?.response?.id === "string"
       && event.response.id && event.response.status === "in_progress") packet.establishedResponseId = event.response.id;
-    if (event.type.startsWith("response.") && !["response.created", "response.in_progress", "response.queued", "response.completed", "response.failed"].includes(event.type)
-      || event.response?.output !== undefined && (!Array.isArray(event.response.output) || event.response.output.length > 0)) {
+    if (eventHasOutput(event)) {
       packet.outputObserved = true;
       job.outputObserved = true;
     }
@@ -460,7 +603,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     }
     if (!packet.warm && isBusinessProgress(event)) refreshPacketTimeout(session, job, packet);
     let sse;
-    if (!packet.warm) {
+    if (!packet.warm && !job.draining) {
       const eventLine = /^[\w.:-]+$/.test(event.type) ? `event: ${event.type}\n` : "";
       sse = `${eventLine}${raw.split(/\r?\n/).map(line => `data: ${line}`).join("\n")}\n\n`;
       if (retainedBytes(session) + Buffer.byteLength(sse) > maxSessionBytes) return failConnection(session, "session_bytes_exceeded");
@@ -471,6 +614,16 @@ export function createIncrementalResponsesTransport(options = {}) {
     };
     if (["error", "response.failed", "response.incomplete"].includes(event.type)) {
       const status = errorStatus(event);
+      job.record.upstreamError = event.response?.error ?? event.error
+        ?? { code: event.response?.incomplete_details?.reason ?? event.code, type: event.type, message: event.message };
+      if (event.type === "error" && !packet.responseId && !job.outputObserved && job.record.acceptance !== true
+        && event.error?.type === "invalid_request_error"
+        && ["unsupported_parameter", "unsupported_value"].includes(event.error.code)
+        && typeof event.error.param === "string" && /^[A-Za-z_][\w.[\]-]{0,159}$/u.test(event.error.param)
+        && errorStatuses(event).every(value => value === 400 || value === 422)
+        && classifyModelFailure({ source: "sse", statusCode: status, message: event, progressObserved: false }).httpCompatibilityFallback === true) {
+        job.record.acceptance = false;
+      }
       if (event.type === "response.failed" && event.response?.status === "failed"
         && event.response.id === packet.establishedResponseId && !job.outputObserved
         && Array.isArray(event.response.output) && event.response.output.length === 0) {
@@ -538,15 +691,31 @@ export function createIncrementalResponsesTransport(options = {}) {
   }
 
   async function pump(session) {
+    if (session.active?.draining) expireDrain(session.active);
     if (closed || session.active || !session.queue.length) return;
     const job = session.queue.shift();
     if (job.settled) return pump(session);
     session.active = job;
     try {
-      const prefixMatches = session.prefix.length <= job.payload.input.length
-        && session.prefix.every((item, index) => canonical(item) === canonical(job.payload.input[index]));
+      const mismatchIndex = session.prefix.findIndex((item, index) => canonicalInput(item) !== canonicalInput(job.payload.input[index]));
+      const prefixMatches = session.prefix.length <= job.payload.input.length && mismatchIndex < 0;
+      const configHashes = Object.fromEntries(Object.entries(cacheConfiguration(job.config)).map(([key, value]) => [key, value === undefined ? "absent" : digest(value)]));
+      const changedConfigFields = session.bindingConfigHashes ? [...new Set([...Object.keys(session.bindingConfigHashes), ...Object.keys(configHashes)])]
+        .filter(key => session.bindingConfigHashes[key] !== configHashes[key]).slice(0, 12) : [];
+      const before = mismatchIndex >= 0 ? JSON.parse(canonicalInput(session.prefix[mismatchIndex])) : null;
+      const afterValue = mismatchIndex >= 0 ? canonicalInput(job.payload.input[mismatchIndex]) : null;
+      const after = afterValue ? JSON.parse(afterValue) : null;
+      const shape = value => value === undefined ? "absent" : value === null ? "null" : Array.isArray(value) ? `array:${value.length}` : typeof value;
+      const changedItemFields = before && after && typeof before === "object" && typeof after === "object"
+        ? [...new Set([...Object.keys(before), ...Object.keys(after)])].filter(key => canonical(before[key]) !== canonical(after[key])).slice(0, 8)
+          .map(key => ({ field: key, before: shape(before[key]), after: shape(after[key]) })) : [];
+      job.cacheDecision = { reason: !session.binding ? "initial" : session.binding !== job.binding ? "configuration_or_identity_changed"
+        : !prefixMatches ? "input_prefix_changed" : session.socket?.readyState !== 1 ? "connection_unavailable" : "reused",
+      changedConfigFields, mismatchIndex, mismatchItemType: before?.type ?? null, changedItemFields,
+      previousInputItems: session.prefix.length, incomingInputItems: job.payload.input.length };
       if (session.binding !== job.binding || !prefixMatches) resetConnection(session);
       session.binding = job.binding;
+      session.bindingConfigHashes = configHashes;
       const input = job.payload.input.slice(session.prefix.length);
       job.groups = atomicGroups(input);
       job.groupBytes = job.groups.map(group => byteLength(group) - 2);
@@ -597,7 +766,7 @@ export function createIncrementalResponsesTransport(options = {}) {
     }
   }
 
-  function createRequestClient({ sessionKey, operationId, payload, url, headers, onPreparationProgress, onPacketSending,
+  function createRequestClient({ sessionKey, operationId, payload, url, headers, onPreparationProgress, onPacketSending, onUploadProgress,
     retryWithoutOutput = false } = {}) {
     let currentRecord;
     return {
@@ -606,7 +775,7 @@ export function createIncrementalResponsesTransport(options = {}) {
       get requestTransmissionState() { return currentRecord?.requestTransmissionState ?? "not_sent"; },
       request(targetUrl, requestOptions = {}) {
         const existing = operations.get(operationId);
-        const retryable = (existing?.acceptance === false || existing?.terminalOutcome === "failed_no_output"
+        const retryable = (existing?.acceptance === false || existing?.terminalOutcome === "failed_no_output" && existing?.retryableWithoutOutput === true
           || retryWithoutOutput && existing?.retryableWithoutOutput === true)
           && ["failed", "cancelled"].includes(existing.state);
         const duplicate = existing && !retryable;
@@ -614,10 +783,17 @@ export function createIncrementalResponsesTransport(options = {}) {
           state: "receiving_body", acceptance: false, reasonCode: null, requestTransmissionState: "not_sent",
           phase: "none", generation: 0, attempt: (existing?.attempt ?? 0) + 1,
         };
+        if (duplicate) {
+          record.localRejection = true;
+          record.previousFailure = { code: existing.reasonCode, acceptance: existing.acceptance,
+            requestTransmissionState: existing.requestTransmissionState,
+            upstreamCode: existing.upstreamError?.code ?? existing.upstreamError?.type };
+        }
         if (duplicate && record.acceptance === false) record.acceptance = "unknown";
         const job = { record, operationId, settled: false, bytes: 0, session: null, response: null, timer: null,
           signal: requestOptions.signal, onPreparationProgress: onPreparationProgress ?? options.onPreparationProgress,
-          onPacketSending: onPacketSending ?? options.onPacketSending };
+          onPacketSending: onPacketSending ?? options.onPacketSending,
+          onUploadProgress: onUploadProgress ?? options.onUploadProgress };
         currentRecord = record;
         pendingJobs.add(job);
         const request = new Writable({
@@ -637,11 +813,15 @@ export function createIncrementalResponsesTransport(options = {}) {
               if (retainedBytes(session) + job.bytes > maxSessionBytes) return settle(job, "session_bytes_exceeded");
               record.state = "queued";
               session.queue.push(job);
+              if (session.active?.draining && !job.response) createResponse(job);
               pump(session);
             });
           },
           destroy(error, callback) {
-            if (!job.settled) {
+            if (job.draining && !job.settled) {
+              job.response?.destroy();
+              callback(transportError("ABORT_ERR", record));
+            } else if (!job.settled) {
               cancel(job);
               callback(transportError(record.reasonCode, record));
             } else {
@@ -659,6 +839,7 @@ export function createIncrementalResponsesTransport(options = {}) {
           terminalEvidence: { get: () => record.terminalEvidence },
         });
         request.abort = () => request.destroy();
+        request.cancelAndDrain = () => cancelAndDrain(job);
         request.flushHeaders = noop;
         request.setTimeout = (milliseconds, callback) => {
           clearTimeout(job.requestTimer);
@@ -672,7 +853,8 @@ export function createIncrementalResponsesTransport(options = {}) {
         if (!duplicate && !existing && operations.size >= maxOperations) {
           const liveRecords = new Set([...pendingJobs].map(pending => pending.record));
           for (const [key, value] of operations) {
-            if (value.state === "completed" && !liveRecords.has(value)) {
+            if (!liveRecords.has(value) && (value.state === "completed"
+              || ["failed", "cancelled"].includes(value.state) && value.acceptance === false)) {
               operations.delete(key);
               break;
             }
@@ -737,6 +919,21 @@ export function createIncrementalResponsesTransport(options = {}) {
   return {
     createRequestClient,
     getOperation(operationId) { return metadata(operations.get(operationId)); },
+    completeHttpFallback(operationId, { approvedFallback = false } = {}) {
+      const record = operations.get(operationId);
+      if (!record || !["failed", "cancelled"].includes(record.state)
+        || !(record.retryableWithoutOutput || approvedFallback && record.httpFallbackEligible) || record.localRejection
+        || [...pendingJobs].some(job => job.record === record)) return false;
+      record.state = "completed";
+      record.reasonCode = "http_fallback_completed";
+      record.fallbackCompletion = { transport: "http", websocketAcceptance: record.acceptance,
+        websocketTransmissionState: record.requestTransmissionState };
+      record.acceptance = true;
+      record.requestTransmissionState = "completed";
+      record.retryableWithoutOutput = false;
+      record.httpFallbackEligible = false;
+      return true;
+    },
     invalidate(sessionKey, _reason) {
       const session = sessions.get(sessionKey);
       if (!session) return false;
