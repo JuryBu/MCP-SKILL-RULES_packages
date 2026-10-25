@@ -69,6 +69,7 @@ const planPath = writeFixture("Plan_6_8_Real.md", [
     "## 目标",
     "真实桌面验收必须保留安全边界和可验证证据。",
     "",
+    "## U100 历史阶段",
     longPlanFiller,
     "",
     "## U102 Update - Taskbar Structured Targets And Usability Metrics (2026-05-14)",
@@ -94,19 +95,19 @@ const bundle = buildGuardInputBundle([planPath, mapPath], [taskPath], "Stage54-U
 assert.match(bundle.taskContent, /工作原则/u);
 assert.match(bundle.taskContent, /### U102 任务栏结构化目标/u);
 assert.match(bundle.taskContent, /待复核\/小本本追加：U102/u);
-assert.match(bundle.taskContent, /U105 最新尾部/u);
+assert.doesNotMatch(bundle.taskContent, /U105 最新尾部/u);
 assert.doesNotMatch(bundle.taskContent, /OLD-FILLER-3000/u);
 
 assert.match(bundle.planContent, /真实桌面验收必须保留安全边界/u);
 assert.match(bundle.planContent, /U102 Update - Taskbar Structured Targets/u);
-assert.match(bundle.planContent, /Plan 6\.8 附录/u);
-assert.match(bundle.planContent, /U103 - Complex Interface Numbered Regions/u);
+assert.match(bundle.planContent, /U102 - Taskbar Structured Targets/u);
+assert.doesNotMatch(bundle.planContent, /U103 - Complex Interface Numbered Regions/u);
 assert.doesNotMatch(bundle.planContent, /PLAN-FILLER-1200/u);
 
 assert.match(bundle.coverageText, /Task\.md/u);
 assert.match(bundle.coverageText, /stage-section/u);
 assert.match(bundle.coverageText, /guard-note/u);
-assert.match(bundle.coverageText, /full-map/u);
+assert.match(bundle.coverageText, /global-rules/u);
 
 assert.ok(bundle.evidenceManifest.commands.some(command => command.includes("npm run build")));
 assert.ok(bundle.evidenceManifest.commands.some(command => command.includes("npm run test:stage54-observe-targets")));
@@ -129,6 +130,7 @@ const hugeTaskPath = writeFixture("HugeTask.md", [
     "# Huge Task",
     "## 工作原则",
     "Stage Guard must preserve evidence coverage.",
+    "### U100 历史阶段",
     ...Array.from({ length: 6400 }, (_, index) => `HUGE-OLD-${index}: old stage material that should not be injected`),
     "### U102 Taskbar Structured Targets And Usability Metrics",
     "目标：U102 target section should be retained fully.",
@@ -145,6 +147,7 @@ const hugePlanPath = writeFixture("HugePlan.md", [
     "# Huge Plan",
     "## 目标",
     "Acceptance head must be retained.",
+    "## U100 历史阶段",
     ...Array.from({ length: 2500 }, (_, index) => `HUGE-PLAN-OLD-${index}: old plan material`),
     "## U102 Update - Taskbar Structured Targets And Usability Metrics",
     "Plan U102 section retained.",
@@ -154,9 +157,9 @@ const hugePlanPath = writeFixture("HugePlan.md", [
 
 const hugeBundle = buildGuardInputBundle([hugePlanPath, mapPath], [hugeTaskPath], "Stage54-U102 taskbar structured targets and usability metrics");
 
-assert.match(hugeBundle.taskContent, /Huge Task/u);
+assert.match(hugeBundle.taskContent, /HugeTask\.md/u);
 assert.match(hugeBundle.taskContent, /U102 target section should be retained fully/u);
-assert.match(hugeBundle.taskContent, /TAIL-299/u);
+assert.doesNotMatch(hugeBundle.taskContent, /TAIL-299/u);
 assert.doesNotMatch(hugeBundle.taskContent, /HUGE-OLD-3000/u);
 assert.match(hugeBundle.planContent, /Acceptance head must be retained/u);
 assert.match(hugeBundle.planContent, /Plan U102 section retained/u);
@@ -176,7 +179,7 @@ const parsedLocator = parseLocatorSuggestions([
     }),
     "```",
 ].join("\n"));
-const materializedLocator = materializeLocatorSuggestions(parsedLocator, [hugePlanPath], [hugeTaskPath]);
+const materializedLocator = materializeLocatorSuggestions(parsedLocator, [hugePlanPath], [hugeTaskPath], "Stage54-U102");
 assert.equal(materializedLocator.taskSegments.length, 1);
 assert.equal(materializedLocator.planSegments.length, 0);
 assert.match(materializedLocator.taskSegments[0], /model-locator/u);
@@ -185,3 +188,4 @@ assert.doesNotMatch(materializedLocator.taskSegments[0], /TAIL-200/u);
 assert.ok(materializedLocator.evidenceSources.some(source => source.includes("stage54-u102-taskbar-structured-targets-usability-report.md")));
 
 console.log("guard-engine-evidence ok");
+fs.rmSync(tmp, { recursive: true, force: true });

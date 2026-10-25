@@ -17,8 +17,8 @@ function guardResult(summary: string, missingItems: string[]): GuardCheckResult 
 const selfReference = resolveGuardSelfReferenceResult(guardResult(
     "Stage 8.4 原功能证据看起来充分，但本轮复检收口没有执行结果证据。",
     [
-        "Stage 8.4 Subagent 求问复检收口 未做：执行记录停在“按规则 appeal 一次”，没有第二次 Guard/appeal 结果或 cancel 锁证据。",
-        "Stage 8.4 完成标记 未做：缺少 Guard 通过后才能写入的完成记录。",
+        "Stage 8.4 本次 Guard 返回结果 未做：当前check还没有返回结果。",
+        "Stage 8.4 完成标记 未做：缺少本次 Guard 通过后才能写入的完成记录。",
     ],
 ));
 
@@ -27,6 +27,19 @@ assert.equal(selfReference.selfReferenceResolved, true);
 assert.deepEqual(selfReference.missingItems, []);
 assert.equal(selfReference.selfReferenceItems?.length, 2);
 assert.match(selfReference.summary, /Guard 自指收口项/u);
+
+assert.equal(resolveGuardSelfReferenceResult(guardResult("实质证据已充分", ["[Stage63] 本次 Guard 返回结果缺少"])).passed, true);
+for (const item of [
+    "本次 Guard 返回结果缺少 [验收报告.pdf]",
+    "本次 Guard 返回结果缺少 [evidence.data]",
+    "[Stage63 验收说明] 本次 Guard 返回结果缺少",
+    "本次 Guard 返回结果缺少 [Stage63]",
+]) {
+    const checked = resolveGuardSelfReferenceResult(guardResult("实质证据已充分", [item]));
+    assert.equal(checked.passed, false, item);
+    assert.equal(checked.selfReferenceResolved, undefined, item);
+    assert.deepEqual(checked.missingItems, [item]);
+}
 
 const realMissing = resolveGuardSelfReferenceResult(guardResult(
     "Stage 3 证据不足，缺少实现和测试。",
@@ -81,4 +94,17 @@ const infrastructureFailure: GuardCheckResult = {
 assert.equal(isGuardInfrastructureError(infrastructureFailure), true);
 assert.equal(resolveGuardSelfReferenceResult(infrastructureFailure), infrastructureFailure);
 
-console.log("guard-engine-self-reference ok");
+for (const missing of [
+    ["本次 Guard 检查缺少 HTTP 原始日志"],
+    ["本次 Guard 检查缺少 HTTP 原始日志和测试报告"],
+    ["本次 Guard 返回结果尚未写入", "HTTP 原件缺失"],
+    ["另一个Guard的旧通过记录未见"],
+    ["本次Guard复核缺少业务报告"],
+    ["本次 Guard 返回结果缺少 PDF"],
+    ["历史Guard通过后才能写入的完成记录缺失"],
+]) {
+    const checked = resolveGuardSelfReferenceResult(guardResult("实质证据已充分，但缺少 HTTP 原始日志", missing));
+    assert.equal(checked.passed, false);
+    assert.deepEqual(checked.missingItems, missing);
+}
+console.log("guard-engine-self-reference ok: current-check closure only; HTTP/raw artifacts, mixed gaps and other Guards remain blocked");

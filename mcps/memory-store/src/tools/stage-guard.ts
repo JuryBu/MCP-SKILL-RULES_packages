@@ -3,7 +3,7 @@ import { z } from "zod";
 import path from "path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { touchActivity } from "../lifecycle.js";
-import { isGuardEvidenceInsufficient, isGuardInfrastructureError, runGuardCheck } from "../guard-engine.js";
+import { findDeclaredGuardPlanFiles, isGuardEvidenceInsufficient, isGuardInfrastructureError, runGuardCheck, validateGuardTargetScope } from "../guard-engine.js";
 import {
     readGuardState, writeGuardState, clearGuardState,
     insertLockMark, removeLockMark, addCheckResult,
@@ -47,11 +47,11 @@ const StageGuardSchema = z.object({
     action: z.enum(["start", "check", "status", "cancel"])
         .describe("操作类型：start=注册守卫, check=执行检查, status=查看状态, cancel=取消。⚠️ 项目有 Plan_x + Task.md 时，Stage 开始前必须 start，完成后必须 check 通过才能标记完成并通知用户"),
     taskFiles: z.array(z.string()).optional()
-        .describe("start 时必填：Task.md 路径列表（至少 1 个）"),
+        .describe("start 时必填：至少一个可读Task.md完整绝对路径；check若提供必须与注册一致"),
     planFiles: z.array(z.string()).optional()
-        .describe("start 时可选：Plan 文件路径列表"),
+        .describe("有Plan/Task的工程在start时显式提供可读Plan完整绝对路径；单文件小任务可省略；check若提供必须与注册一致"),
     stageId: z.string().optional()
-        .describe("start 时可选：Stage 标识，如 'Stage 3'"),
+        .describe("有Plan或多阶段Task时在start明确具体Stage，如 'Stage 3'；单文件小任务可省略"),
     childScopeId: z.string().optional()
         .describe("可选：子任务 Guard 的稳定范围 ID；传入时必须同时传 scopeSelectors"),
     scopeSelectors: z.array(z.string().min(1)).optional()
@@ -79,9 +79,9 @@ const StageGuardSchema = z.object({
         path: z.string().describe("外部证据文件绝对路径或相对路径"),
         label: z.string().optional().describe("证据标签，便于 Guard 报告显示"),
         type: z.string().optional().describe("可选类型提示：text/csv/image/pdf/doc/sheet/epub/video/binary"),
-        role: z.string().optional().describe("证据角色，如 report/screenshot/spec/output"),
+        role: z.string().optional().describe("reference/context/optional为参考，其它角色及省略值均为必需；如report/screenshot/spec/output"),
         range: z.string().optional().describe("可选范围提示，如 1-80、first200、last120"),
-        maxChars: z.number().optional().describe("该文件索引进入 Guard prompt 的最大字符数"),
+        maxChars: z.number().optional().describe("单项完整序列化字符硬限，包含正文、路径、标签和诊断；不足时报告完整所需及差额"),
     })).optional()
         .describe("check 时可选：结构化外部证据文件输入，比 evidenceFiles 能提供更多标签和范围信息"),
     evidenceIndexMode: z.enum(["auto", "reuse", "rebuild", "off"]).optional()
@@ -238,23 +238,83 @@ async function resolveGuardConversationId(params: z.infer<typeof StageGuardSchem
 
 // ============= Action Handlers =============
 
+function validateTargetFiles(files: string[], requireAbsolute: boolean): string[] {
+    const errors: string[] = [];
+    for (const file of files) {
+        if (!file.trim() || file.includes("\0")) {
+            errors.push("目标文件路径为空或含无效字符");
+            continue;
+        }
+        if (requireAbsolute && !path.isAbsolute(file)) {
+            errors.push(`目标文件须提供完整绝对路径: ${file}`);
+            continue;
+        }
+        try {
+            if (!fs.statSync(file).isFile()) {
+                errors.push(`目标路径须为普通文件: ${file}`);
+                continue;
+            }
+            fs.accessSync(file, fs.constants.R_OK);
+        } catch (error) {
+            errors.push(`目标文件不存在或不可读: ${file} (${error instanceof Error ? error.message : String(error)})`);
+        }
+    }
+    return errors;
+}
+
+function comparableTargetFiles(files: string[]): string[] {
+    return [...new Set(files.map(file => {
+        const absolute = path.resolve(file.trim());
+        return process.platform === "win32" ? absolute.toLowerCase() : absolute;
+    }))].sort();
+}
+
+function targetBindingErrors(params: z.infer<typeof StageGuardSchema>, state: GuardState): string[] {
+    const errors: string[] = [];
+    for (const [name, requested, registered] of [
+        ["taskFiles", params.taskFiles, state.taskFiles],
+        ["planFiles", params.planFiles, state.planFiles],
+    ] as const) {
+        if (requested !== undefined && JSON.stringify(comparableTargetFiles(requested)) !== JSON.stringify(comparableTargetFiles(registered))) {
+            errors.push(`${name} 与原Guard绑定不一致，仍保留原目标: ${registered.join("；") || "(无)"}`);
+        }
+    }
+    if (params.scopeSelectors !== undefined
+        && JSON.stringify(normalizeScopeSelectors(params.scopeSelectors).sort()) !== JSON.stringify(normalizeScopeSelectors(state.scopeSelectors).sort())) {
+        errors.push(`scopeSelectors 与原Guard绑定不一致: ${state.scopeSelectors.join("；") || "(无)"}`);
+    }
+    return errors;
+}
+
+function targetBindingLines(state: Pick<GuardState, "taskFiles" | "planFiles" | "stageId">): string[] {
+    return [
+        `📋 审查阶段: ${state.stageId || "单文件完整任务"}`,
+        `📄 任务完整路径: ${state.taskFiles.join("；")}`,
+        state.planFiles.length ? `📄 计划完整路径: ${state.planFiles.join("；")}` : "",
+    ].filter(Boolean);
+}
+
 async function handleStart(params: z.infer<typeof StageGuardSchema>) {
-    const taskFiles = params.taskFiles;
+    const taskFiles = params.taskFiles?.map(file => file.trim());
     if (!taskFiles || taskFiles.length === 0) {
         return text("❌ start 操作需要 taskFiles 参数（至少 1 个 Task.md 路径）");
     }
 
-    // 验证文件存在
-    const missing: string[] = [];
-    for (const f of taskFiles) {
-        if (!fs.existsSync(f)) missing.push(f);
+    const planFiles = (params.planFiles || []).map(file => file.trim());
+    const stageId = params.stageId?.trim() || "";
+    const scopeSelectors = normalizeScopeSelectors(params.scopeSelectors);
+    const targetErrors = validateTargetFiles([...taskFiles, ...planFiles], true);
+    if (planFiles.length > 0 && !stageId) targetErrors.push("有Plan/Task的工程须明确stageId，指向本次要审的具体阶段");
+    if (targetErrors.length === 0) {
+        const requestedPlans = comparableTargetFiles(planFiles);
+        for (const declaredPlan of findDeclaredGuardPlanFiles(taskFiles)) {
+            if (!requestedPlans.includes(comparableTargetFiles([declaredPlan])[0])) {
+                targetErrors.push(`Task明确声明了目标计划，请在planFiles中显式绑定: ${declaredPlan}`);
+            }
+        }
     }
-    for (const f of params.planFiles || []) {
-        if (!fs.existsSync(f)) missing.push(f);
-    }
-    if (missing.length > 0) {
-        return text(`❌ 文件不存在:\n${missing.map(f => `  - ${f}`).join("\n")}`);
-    }
+    if (targetErrors.length === 0) targetErrors.push(...validateGuardTargetScope(taskFiles, planFiles, stageId, scopeSelectors));
+    if (targetErrors.length) return text(`❌ 审查目标需要补齐，尚未注册或替换Guard:\n${targetErrors.map(error => `  - ${error}`).join("\n")}`);
 
     const hasExplicitStartBoundary = Boolean(params.conversationId?.trim() && Number.isFinite(params.startRound) && (params.startRound || 0) > 0);
     const resolved = hasExplicitStartBoundary
@@ -267,13 +327,12 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
         return text("❌ Stage Guard start 不读取对话正文；当前没有可用 fetch 缓存元数据，请先 fetch 或显式传 startRound。");
     }
     const conversationId = resolved.conversationId;
-    const scopeSelectors = normalizeScopeSelectors(params.scopeSelectors);
     if (params.childScopeId !== undefined && scopeSelectors.length === 0) {
         return text("❌ childScopeId 必须同时提供至少一个非空 scopeSelectors，job_id 本身不能定义审核范围。");
     }
     const childScopeId = normalizeChildScopeId(params.childScopeId);
 
-    const equivalents = await findEquivalentGuards(conversationId, resolved.dataChain, params.stageId || "", childScopeId);
+    const equivalents = await findEquivalentGuards(conversationId, resolved.dataChain, stageId, childScopeId);
     if (equivalents.length > 1) {
         return text(`❌ 同一对话别名对应多个活跃 Guard，拒绝覆盖，请先按原始身份处理冲突。\n${formatAmbiguousGuardCandidates(equivalents)}`);
     }
@@ -311,11 +370,11 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
         conversationId,
         chain: resolved.dataChain,
         modelChain: resolveModelChain(params),
-        stageId: params.stageId || "",
+        stageId,
         childScopeId,
         scopeSelectors,
-        taskFiles,
-        planFiles: params.planFiles || [],
+        taskFiles: taskFiles.map(file => path.resolve(file)),
+        planFiles: planFiles.map(file => path.resolve(file)),
         startRound,
         startedAt: new Date().toISOString(),
         checkHistory: [],
@@ -331,10 +390,7 @@ async function handleStart(params: z.infer<typeof StageGuardSchema>) {
         state.stageId ? `📋 Stage: ${state.stageId}` : "",
         `🧩 子范围: ${state.childScopeId}`,
         state.scopeSelectors.length > 0 ? `🎯 审核选择器: ${state.scopeSelectors.join("；")}` : "",
-        `📄 任务文件: ${taskFiles.map(basename).join(", ")}`,
-        state.planFiles.length > 0
-            ? `📄 计划文件: ${state.planFiles.map(basename).join(", ")}`
-            : "",
+        ...targetBindingLines(state),
         ...summarizeLockResults(lockResults),
         `🔗 对话链路: ${resolved.dataChain}`,
         `🧠 模型链路: ${state.modelChain || DEFAULT_CHAIN}`,
@@ -744,6 +800,11 @@ async function handleCheck(
     if ("error" in resolvedGuard) return text(resolvedGuard.error);
     const { state, conversationId: convId } = resolvedGuard;
     if (expectedGuard && state.guardId !== expectedGuard.guardId) return staleGuardCheckText();
+    const bindingErrors = targetBindingErrors(params, state);
+    if (bindingErrors.length) return text(`❌ 检查目标与原注册冲突，原Guard未变:\n${bindingErrors.map(error => `  - ${error}`).join("\n")}`);
+    const targetErrors = validateTargetFiles([...state.taskFiles, ...state.planFiles], false);
+    if (targetErrors.length === 0) targetErrors.push(...validateGuardTargetScope(state.taskFiles, state.planFiles, state.stageId, state.scopeSelectors));
+    if (targetErrors.length) return text(`🛡 审查目标不可用，尚未调用模型，原Guard保持:\n${targetErrors.map(error => `  - ${error}`).join("\n")}`);
     if (isBackgroundTaskAborted(taskContext)) {
         return formatAbortedGuardCheckText(taskContext);
     }
@@ -791,6 +852,7 @@ async function handleCheck(
             existingTask ? "♻️ 已复用相同 Guard 与规范化输入的已有后台任务" : "",
             decision.auto ? "（未显式指定 background，已自动转后台；如需同步请传 background=false）" : "",
             `🆔 taskId: ${task.id}`,
+            ...targetBindingLines(state),
             `🧠 modelChain: ${resolveModelChain(params)}`,
             "💡 后续调用 stage_guard(action=\"check\", taskId=\"...\") 查询结果",
         ].filter(Boolean).join("\n"));
@@ -826,9 +888,12 @@ async function handleCheck(
         onProgress: stage => taskContext?.updateProgress({ stage: `guard:${stage}`, detail: `Stage Guard ${stage}` }),
     });
     if (result.codexDiagnostics) retainDiagnostic?.(result.codexDiagnostics);
-    const diagnosticNotice = result.codexDiagnostics
-        ? `🧾 CLI诊断: ${result.codexDiagnostics.manifestPath || result.codexDiagnostics.callId}；事件覆盖=${result.codexDiagnostics.eventCoverage}；观察到的拒绝=${result.codexDiagnostics.rejectedCommandCount}${diagnosticLinked ? "" : "；原task诊断关联保存失败，请保留本路径"}`
-        : "";
+    const diagnosticNotice = [
+        ...targetBindingLines(state),
+        result.codexDiagnostics
+            ? `🧾 CLI诊断: ${result.codexDiagnostics.manifestPath || result.codexDiagnostics.callId}；事件覆盖=${result.codexDiagnostics.eventCoverage}；观察到的拒绝=${result.codexDiagnostics.rejectedCommandCount}${diagnosticLinked ? "" : "；原task诊断关联保存失败，请保留本路径"}`
+            : "",
+    ].filter(Boolean).join("\n");
     if (result.cancelled || isBackgroundTaskAborted(taskContext)) {
         return text([responseText(formatAbortedGuardCheckText(taskContext)), diagnosticNotice].filter(Boolean).join("\n"));
     }
@@ -993,10 +1058,7 @@ async function handleStatus(params: z.infer<typeof StageGuardSchema>) {
         state.stageId ? `📋 Stage: ${state.stageId}` : "",
         `🧩 子范围: ${state.childScopeId || "main"}`,
         state.scopeSelectors.length > 0 ? `🎯 审核选择器: ${state.scopeSelectors.join("；")}` : "",
-        `📄 任务文件: ${state.taskFiles.map(basename).join(", ")}`,
-        state.planFiles.length > 0
-            ? `📄 计划文件: ${state.planFiles.map(basename).join(", ")}`
-            : "",
+        ...targetBindingLines(state),
         `🔒 文件锁: ${state.taskFiles.map(f => `${basename(f)}=${getGuardLocks(f).length}`).join(", ")}`,
         `⏱ 激活时间: ${state.startedAt}`,
         `🔗 对话链路: ${state.chain || DEFAULT_CHAIN}`,

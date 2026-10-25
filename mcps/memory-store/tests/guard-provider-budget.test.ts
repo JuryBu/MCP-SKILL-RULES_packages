@@ -31,6 +31,35 @@ assert.equal(agy.prompt.length < grok.prompt.length, true, "agy fallback 应按�
 assert.equal(agy.budget.compressionReasons.some(reason => reason.includes("provider=agy")), true, "agy 返回必须说明压缩原因");
 assert.equal(agy.budget.sections.length, 8, "返回必须包含各输入部分的占用");
 
+const requiredBlock = "R".repeat(70_418);
+const priorityInput: GuardPromptInput = {
+    planContent: "P".repeat(3420), taskContent: "T".repeat(14400),
+    executionRecord: "C".repeat(25000), executionRecordSourceChars: 500000,
+    coverageText: "confidence: high", evidenceText: "current target commands",
+    evidenceIndexText: requiredBlock, requiredExternalBlocks: [requiredBlock],
+    executionEvidenceRole: "reference", hasRequiredExternalAssets: true,
+};
+const priority = renderGuardPromptForProvider(priorityInput, "codex");
+assert.ok(priority.prompt.includes(requiredBlock));
+assert.ok(priority.budget.sections.find(section => section.name === "executionRecord")!.includedChars < 25000);
+assert.deepEqual(priority.budget.requiredGaps, []);
+assert.doesNotMatch(priority.prompt, /执行记录是 ground truth|必须在执行记录中找到|必须在执行记录（/u);
+assert.match(priority.prompt, /reference（参考）/u);
+assert.match(priority.prompt, /HTTP原始日志/u);
+const tooSmall = renderGuardPromptForProvider(priorityInput, "agy");
+assert.ok(tooSmall.budget.requiredGaps?.length);
+assert.ok(tooSmall.prompt.length <= 24000);
+const invalidReference = renderGuardPromptForProvider({ ...priorityInput, planContent: "plan", taskContent: "task", executionRecord: "", evidenceIndexText: "", requiredExternalBlocks: [], hasRequiredExternalAssets: false }, "codex");
+assert.ok(invalidReference.budget.requiredGaps?.some(gap => gap.includes("requires explicit required external evidence")));
+
+const requiredSmall = "COMPLETE-REQUIRED".repeat(50);
+const mixedPriority = renderGuardPromptForProvider({
+    planContent: "plan", taskContent: "task", executionRecord: "", coverageText: "high", evidenceText: "current",
+    evidenceIndexText: `reference ${"x".repeat(120000)}\n${requiredSmall}`, requiredExternalBlocks: [requiredSmall], hasRequiredExternalAssets: true,
+}, "codex");
+assert.ok(mixedPriority.prompt.includes(requiredSmall));
+assert.deepEqual(mixedPriority.budget.requiredGaps, []);
+
 const previousAgyBudget = process.env.MEMORY_STORE_GUARD_AGY_PROMPT_BUDGET;
 const previousGrokBudget = process.env.MEMORY_STORE_GUARD_GROK_PROMPT_BUDGET;
 const previousAgyReserve = process.env.MEMORY_STORE_GUARD_AGY_OUTPUT_RESERVE;

@@ -151,6 +151,7 @@ interface LoadedRollout {
     replicas?: CodexHistoryReplica[];
     size: number;
     mtimeMs: number;
+    physical?: CodexHistoryPhysicalIdentity;
     header: RolloutHeader;
 }
 
@@ -457,7 +458,7 @@ async function load(filePath: string, options?: CodexHistoryArchiveOptions): Pro
     }
     const stats = await fsPromises.stat(filePath);
     if (!stats.isFile()) throw new Error(`Codex rollout source is not a file: ${filePath}`);
-    return { path: filePath, readPath: filePath, size: stats.size, mtimeMs: stats.mtimeMs, header: parseHeader(filePath, await readFirstLine(filePath)) };
+    return { path: filePath, readPath: filePath, size: stats.size, mtimeMs: stats.mtimeMs, physical: codexHistoryPhysicalIdentity(stats), header: parseHeader(filePath, await readFirstLine(filePath)) };
 }
 
 function assertReplicaPair(matches: string[]): void {
@@ -630,11 +631,15 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         const startOrdinal = current.header.historyBase?.endOrdinalExclusive || 0;
         const proofSource = { segments: [{ path: current.path, readPath: current.readPath, replicas: current.replicas }] };
         const before = options.metadataOnly ? [] : await historyValidationIdentities(proofSource);
+        if (current.physical) {
+            const original = before.find(entry => entry.path === current.path);
+            if (original) original.identity = JSON.stringify(current.physical);
+        }
         reverseSegments.push(await segmentFor(current, startOrdinal, currentEndOrdinal, currentEndByte, reverseSegments.length === 0 && options.endByte === undefined, options.isCancelled, options.metadataOnly));
         if (!options.metadataOnly) {
             const after = await historyValidationIdentities(proofSource);
-            if (JSON.stringify(before) !== JSON.stringify(after)) throw new CodexHistorySourceMismatchError("Codex history changed during source capture");
-            validatedIdentities.push(...after);
+            if (JSON.stringify(before) !== JSON.stringify(after) && !(reverseSegments.length === 1 && pinnedLeafAppend(current, before, after))) throw new CodexHistorySourceMismatchError("Codex history changed during source capture");
+            validatedIdentities.push(...before);
         }
         const base = current.header.historyBase;
         if (!base || base.endByte === 0) break;
@@ -646,10 +651,32 @@ export async function resolveCodexHistorySourceAsync(rolloutPath: string, option
         currentEndOrdinal = base.endOrdinalExclusive;
     }
     const source = sourceFromSegments(leafPath, reverseSegments.reverse());
-    if (!options.metadataOnly && JSON.stringify(await historyValidationIdentities(source)) === JSON.stringify([...new Map(validatedIdentities.map(entry => [entry.path, entry])).values()].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0))) {
-        verifiedHistorySources.set(source, { revision: source.revision, identities: await historyValidationIdentities(source) });
-    }
+    if (!options.metadataOnly) await verifyCapturedHistorySource(source, validatedIdentities, archiveOptions.isCancelled);
     return source;
+}
+
+function pinnedLeafAppend(leaf: Pick<CodexHistorySegment, "path" | "archive" | "replicas">, before: Array<{ path: string; identity: string }>, after: Array<{ path: string; identity: string }>): boolean {
+    if (leaf.archive || leaf.replicas?.length || before.length !== after.length) return false;
+    const beforeLeaf = before.find(entry => entry.path === leaf.path);
+    const afterLeaf = after.find(entry => entry.path === leaf.path);
+    return Boolean(beforeLeaf && afterLeaf && before.every(entry => entry.path === leaf.path || after.some(current => current.path === entry.path && current.identity === entry.identity)) && plainAppend(JSON.parse(beforeLeaf.identity), JSON.parse(afterLeaf.identity)));
+}
+
+async function verifyCapturedHistorySource(source: CodexHistorySource, identities: Array<{ path: string; identity: string }>, isCancelled?: () => boolean): Promise<void> {
+    let before = [...new Map(identities.map(entry => [entry.path, entry])).values()].sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+    const leaf = source.segments.at(-1)!;
+    for (let attempt = 0; ; attempt += 1) {
+        throwIfCodexReadCancelled(isCancelled);
+        const after = await historyValidationIdentities(source);
+        if (JSON.stringify(before) === JSON.stringify(after)) {
+            throwIfCodexReadCancelled(isCancelled);
+            verifiedHistorySources.set(source, { revision: source.revision, identities: after });
+            return;
+        }
+        if (attempt >= 2 || !pinnedLeafAppend(leaf, before, after)) throw new CodexHistorySourceMismatchError("Codex history changed during source capture");
+        if (await hashCodexPrefix(codexHistorySegmentReadPath(leaf), leaf.endByte, isCancelled, leaf) !== leaf.prefixSha256) throw new CodexHistorySourceMismatchError(`Codex history source content changed during source capture: ${leaf.path}`);
+        before = after;
+    }
 }
 
 export function assertCodexHistoryManifest(source: CodexHistorySource): void {
@@ -743,10 +770,7 @@ async function assertCodexHistorySourceAttempt(source: CodexHistorySource, isCan
     const after = await historyValidationIdentities(source).catch(() => undefined);
     if (identities && after && JSON.stringify(identities) !== JSON.stringify(after)) {
         const leaf = source.segments.at(-1)!;
-        const beforeLeaf = identities.find(entry => entry.path === leaf.path);
-        const afterLeaf = after.find(entry => entry.path === leaf.path);
-        const otherPathsUnchanged = identities.length === after.length && identities.every(entry => entry.path === leaf.path || after.some(current => current.path === entry.path && current.identity === entry.identity));
-        if (attempt < 2 && !leaf.archive && !leaf.replicas?.length && otherPathsUnchanged && beforeLeaf && afterLeaf && plainAppend(JSON.parse(beforeLeaf.identity), JSON.parse(afterLeaf.identity))) {
+        if (attempt < 2 && pinnedLeafAppend(leaf, identities, after)) {
             return assertCodexHistorySourceAttempt(source, isCancelled, attempt + 1);
         }
         throw new CodexHistorySourceMismatchError("Codex history changed during source validation");

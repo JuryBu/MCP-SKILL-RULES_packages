@@ -20,6 +20,8 @@ import { iterateCachedConversationSourceCacheRounds } from "./conversation-sourc
 import type { Chain, DataChain } from "./chain.js";
 import { DEFAULT_ANTIGRAVITY_LS_MODEL } from "./ls-model-defaults.js";
 import { hasCodexModelRefusalClaim, type CodexBridgeDiagnostics, type CodexDiagnosticContext } from "./codex-bridge-diagnostics.js";
+import { resolveGuardTargetDocument, sanitizeGuardTargetLines } from "./guard-target-scope.js";
+export { validateGuardTargetScope, findDeclaredGuardPlanFiles } from "./guard-target-scope.js";
 
 /**
  * Stage Guard 比对引擎
@@ -42,6 +44,13 @@ const PLAN_DOC_BUDGET = Number(process.env.MEMORY_STORE_GUARD_PLAN_DOC_BUDGET ||
 const RECORD_CONTEXT_BUDGET = Number(process.env.MEMORY_STORE_GUARD_RECORD_CONTEXT_BUDGET || 40_000);
 const EXECUTION_RECORD_BUDGET = Number(process.env.MEMORY_STORE_GUARD_EXECUTION_BUDGET || 120_000);
 const EVIDENCE_CONTEXT_BUDGET = Number(process.env.MEMORY_STORE_GUARD_EVIDENCE_BUDGET || 80_000);
+let guardModelResponse = callModelResponse;
+let guardModelCandidates = resolveModelChainCandidates;
+
+export function __testSetGuardModelBridge(overrides?: { call?: typeof callModelResponse; candidates?: typeof resolveModelChainCandidates }): void {
+    guardModelResponse = overrides?.call || callModelResponse;
+    guardModelCandidates = overrides?.candidates || resolveModelChainCandidates;
+}
 
 function configuredPromptBudget(name: string, defaultValue: number): number {
     const raw = process.env[name];
@@ -120,6 +129,7 @@ export interface GuardPromptBudgetUsage {
     templateChars: number;
     sections: GuardPromptSectionUsage[];
     compressionReasons: string[];
+    requiredGaps?: string[];
 }
 
 export interface GuardPromptInput {
@@ -167,6 +177,7 @@ interface GuardSourceCoverage {
     anchors: string[];
     fallbackUsed: boolean;
     truncated: boolean;
+    requiredGaps?: string[];
 }
 
 interface GuardEvidenceManifest {
@@ -229,6 +240,8 @@ interface FlashCallResult {
     text: string | null;
     error?: string;
     infrastructureError?: boolean;
+    evidenceInsufficient?: boolean;
+    evidenceInsufficientReason?: string;
     chainUsed?: Chain | null;
     modelUsed?: string | null;
     promptBudget?: GuardPromptBudgetUsage;
@@ -239,6 +252,8 @@ interface FlashCallResult {
     timedOut?: boolean;
     cancelled?: boolean;
 }
+
+class GuardPromptBudgetError extends RangeError {}
 
 export function isGuardInfrastructureError(result: GuardCheckResult): boolean {
     return result.infrastructureError === true;
@@ -298,7 +313,7 @@ async function callFlashWithChain(
         signal: AbortSignal.timeout(timeoutMs),
         diagnosticContext: options.diagnosticContext,
     };
-    const candidates = await resolveModelChainCandidates(modelChain || "auto", bridgeOptions);
+    const candidates = await guardModelCandidates(modelChain || "auto", bridgeOptions);
     if (bridgeOptions.signal.aborted || shouldAbortGuardRun(options)) {
         return { text: null, error: shouldAbortGuardRun(options) ? "Guard 模型调用已取消" : "Guard 模型预检超过总时限 [phase=preflight]", infrastructureError: true };
     }
@@ -324,17 +339,31 @@ async function callFlashWithChain(
             return {
                 text: null,
                 error: error instanceof Error ? error.message : String(error),
-                infrastructureError: true,
+                infrastructureError: !(error instanceof GuardPromptBudgetError),
+                evidenceInsufficient: error instanceof GuardPromptBudgetError,
+                evidenceInsufficientReason: error instanceof GuardPromptBudgetError ? "REQUIRED_EVIDENCE_INCOMPLETE" : undefined,
                 promptBudget: lastRender?.budget,
                 codexDiagnostics: diagnosticAttempts.at(-1), codexDiagnosticAttempts: [...diagnosticAttempts],
             };
         }
         lastRender = rendered;
+        if (rendered.budget.requiredGaps?.length) {
+            return {
+                text: null,
+                error: `Guard provider=${candidate} 必需输入不足，模型调用已阻止：${rendered.budget.requiredGaps.join("；")}`,
+                infrastructureError: false,
+                evidenceInsufficient: true,
+                evidenceInsufficientReason: "REQUIRED_EVIDENCE_INCOMPLETE",
+                promptBudget: rendered.budget,
+                codexDiagnostics: diagnosticAttempts.at(-1),
+                codexDiagnosticAttempts: [...diagnosticAttempts],
+            };
+        }
         const remainingMs = Math.floor(timeoutMs - (performance.now() - modelCallStartedAt));
         if (remainingMs <= 0) {
             return { text: null, error: "Guard 模型调用超过总时限 [phase=preflight]", infrastructureError: true, promptBudget: rendered.budget, codexDiagnostics: diagnosticAttempts.at(-1), codexDiagnosticAttempts: [...diagnosticAttempts] };
         }
-        const response = await callModelResponse(FLASH_MODEL, rendered.prompt, candidate, remainingMs, { ...bridgeOptions, preResolvedCandidate: candidate });
+        const response = await guardModelResponse(FLASH_MODEL, rendered.prompt, candidate, remainingMs, { ...bridgeOptions, preResolvedCandidate: candidate });
         if (response.codexDiagnostics) {
             diagnosticAttempts.push(response.codexDiagnostics);
             options.onCodexDiagnostics?.(response.codexDiagnostics);
@@ -526,43 +555,6 @@ function lineMatchesAnyAnchor(line: string, anchors: string[]): boolean {
     return anchors.some(anchor => anchor && lower.includes(anchor.toLowerCase()));
 }
 
-function findHeadingSection(headings: HeadingLine[], lines: string[], anchors: string[]): { startLine: number; endLine: number; anchor: string } | null {
-    if (headings.length === 0 || anchors.length === 0) return null;
-    const matches = headings
-        .filter(heading => lineMatchesAnyAnchor(`${heading.text} ${lines[heading.lineNumber - 1] || ""}`, anchors))
-        .sort((a, b) => b.lineNumber - a.lineNumber);
-    const selected = matches[0];
-    if (!selected) return null;
-
-    const next = headings.find(heading => heading.lineNumber > selected.lineNumber && heading.level <= selected.level);
-    return {
-        startLine: selected.lineNumber,
-        endLine: next ? next.lineNumber - 1 : lines.length,
-        anchor: selected.text,
-    };
-}
-
-function findHeadingKeywordSections(headings: HeadingLine[], lines: string[], anchors: string[], keywords: RegExp[], maxCount = 4): Array<{ startLine: number; endLine: number; anchor: string }> {
-    const results: Array<{ startLine: number; endLine: number; anchor: string }> = [];
-    for (let index = 0; index < headings.length; index++) {
-        const heading = headings[index];
-        const headingLine = lines[heading.lineNumber - 1] || heading.text;
-        const hasKeyword = keywords.some(pattern => pattern.test(headingLine));
-        if (!hasKeyword) continue;
-        const hasStageAnchor = anchors.length === 0 || lineMatchesAnyAnchor(headingLine, anchors);
-        const nearTail = heading.lineNumber >= Math.max(1, lines.length - 300);
-        if (!hasStageAnchor && !nearTail) continue;
-        const next = headings.slice(index + 1).find(item => item.level <= heading.level);
-        results.push({
-            startLine: heading.lineNumber,
-            endLine: next ? next.lineNumber - 1 : lines.length,
-            anchor: heading.text,
-        });
-        if (results.length >= maxCount) break;
-    }
-    return results;
-}
-
 function findEvidenceWindows(lines: string[], anchors: string[], maxWindows = 12): Array<{ startLine: number; endLine: number; anchor: string }> {
     const patterns = [
         /npm\s+run|node\s+scripts\/|npx\s+/iu,
@@ -640,109 +632,50 @@ function extractGuardDocument(
     stageId?: string,
     maxChars = mode === "task" ? TASK_DOC_BUDGET : PLAN_DOC_BUDGET,
     scopeSelectors?: string[],
-): { text: string; coverage: GuardSourceCoverage; evidenceSourceText: string } | null {
-    if (!fs.existsSync(filePath)) return null;
-    const content = fs.readFileSync(filePath, "utf-8");
-    const lines = content.split(/\r?\n/u);
+): { text: string; coverage: GuardSourceCoverage; evidenceSourceText: string } {
+    const document = resolveGuardTargetDocument(filePath, mode, stageId, normalizeGuardScopeSelectors(scopeSelectors));
+    const lines = document.lines;
     const basename = path.basename(filePath);
-    const headings = parseHeadings(lines);
-    const anchors = deriveGuardAnchors(stageId);
-    const normalizedSelectors = normalizeGuardScopeSelectors(scopeSelectors);
-    const ranges: Array<{ startLine: number; endLine: number; label: string; reason: string }> = [];
-
-    const isShortDensePlan = normalizedSelectors.length === 0 && mode === "plan" && lines.length <= 260 && content.length <= 60_000;
-    if (normalizedSelectors.length > 0) {
-        ranges.push(...findScopeSelectorRanges(lines, headings, normalizedSelectors));
-    } else if (isShortDensePlan) {
-        ranges.push({ startLine: 1, endLine: lines.length, label: "full-map", reason: "short dense plan/map file" });
-    } else {
-        const headEnd = mode === "task" ? Math.min(120, lines.length) : Math.min(60, lines.length);
-        ranges.push({ startLine: 1, endLine: headEnd, label: "head-rules", reason: mode === "task" ? "task rules and guard contract" : "plan goals and acceptance anchors" });
-
-        const stageSection = findHeadingSection(headings, lines, anchors);
-        if (stageSection) {
-            ranges.push({
-                startLine: stageSection.startLine,
-                endLine: stageSection.endLine,
-                label: "stage-section",
-                reason: `stage anchor: ${stageSection.anchor}`,
-            });
-        } else if (anchors.length > 0) {
-            const matchIndex = lines.findIndex(line => lineMatchesAnyAnchor(line, anchors));
-            if (matchIndex >= 0) {
-                ranges.push({
-                    startLine: clamp(matchIndex + 1 - 80, 1, lines.length),
-                    endLine: clamp(matchIndex + 1 + 160, 1, lines.length),
-                    label: "anchor-window",
-                    reason: `fallback anchor window: ${anchors.slice(0, 3).join(", ")}`,
-                });
-            }
-        }
-
-        const guardSections = findHeadingKeywordSections(headings, lines, anchors, [/待复核|小本本|追加|Guard|证据可见性/iu]);
-        for (const section of guardSections) {
-            ranges.push({
-                startLine: section.startLine,
-                endLine: section.endLine,
-                label: "guard-note",
-                reason: `guard/addendum anchor: ${section.anchor}`,
-            });
-        }
-
-        const tailLines = mode === "task" ? 180 : 100;
-        ranges.push({
-            startLine: Math.max(1, lines.length - tailLines + 1),
-            endLine: lines.length,
-            label: "tail",
-            reason: "latest tail and handoff notes",
-        });
-
-        for (const window of findEvidenceWindows(lines, anchors)) {
-            ranges.push({
-                startLine: window.startLine,
-                endLine: window.endLine,
-                label: "evidence-window",
-                reason: `evidence pattern: ${window.anchor}`,
-            });
-        }
-    }
-
-    const merged = mergeRanges(ranges);
+    const merged = mergeRanges(document.ranges);
     const parts: string[] = [];
     const segments: GuardExtractionSegment[] = [];
-    let usedChars = 0;
+    const opening = `### ${filePath}（${mode === "task" ? "Task" : "Plan"} 已确认范围）\n\n`;
+    let usedChars = opening.length;
     let truncated = false;
     for (const range of merged) {
-        const remain = Math.max(0, maxChars - usedChars);
-        if (remain <= 500) {
+        const separator = parts.length ? "\n\n---\n\n" : "";
+        const remain = Math.max(0, maxChars - usedChars - separator.length);
+        const label = [...new Set(range.labels)].join("+");
+        const reason = [...new Set(range.reasons)].join("; ");
+        const header = `#### ${basename} [${label} ${lineRangeLabel(range.startLine, range.endLine)}]\n原因: ${reason}\n\n`;
+        if (remain <= header.length) {
             truncated = true;
             break;
         }
-        const label = [...new Set(range.labels)].join("+");
-        const reason = [...new Set(range.reasons)].join("; ");
-        const perSegmentMax = Math.max(500, remain);
-        const formatted = formatDocumentSegment(basename, label, range.startLine, range.endLine, reason, lines, perSegmentMax);
-        usedChars += formatted.text.length + 20;
-        if (formatted.truncated) truncated = true;
-        parts.push(formatted.text);
-        segments.push(formatted.segment);
+        const body = lines.slice(range.startLine - 1, range.endLine).join("\n");
+        const selected = truncateGuardPromptSection(body, remain - header.length);
+        truncated ||= selected.length < body.length;
+        parts.push(header + selected);
+        usedChars += separator.length + header.length + selected.length;
+        segments.push({ label, startLine: range.startLine, endLine: range.endLine, reason, chars: selected.length });
     }
 
     const coverage: GuardSourceCoverage = {
         file: filePath,
         basename,
         totalLines: lines.length,
-        totalChars: content.length,
+        totalChars: document.totalChars,
         mode,
         segments,
         unreadRanges: unreadRanges(lines.length, segments),
-        anchors: [...anchors, ...normalizedSelectors],
-        fallbackUsed: segments.some(segment => segment.label.includes("anchor-window")) || segments.length === 0,
+        anchors: [stageId || "", ...normalizeGuardScopeSelectors(scopeSelectors)].filter(Boolean),
+        fallbackUsed: document.gaps.length > 0,
         truncated,
+        requiredGaps: document.gaps,
     };
 
     return {
-        text: `### ${basename}（${mode === "task" ? "Task 局部片段" : "Plan 局部片段"}）\n\n${parts.join("\n\n---\n\n")}`,
+        text: parts.length ? opening + parts.join("\n\n---\n\n") : "",
         coverage,
         evidenceSourceText: parts.join("\n\n"),
     };
@@ -773,6 +706,7 @@ function extractEvidenceManifest(text: string): GuardEvidenceManifest {
 
 function formatEvidenceManifest(manifest: GuardEvidenceManifest, maxChars = EVIDENCE_CONTEXT_BUDGET): string {
     const lines = [
+        "以下是已确认当前目标中的命令与文件定位线索；逐项结合原件核验，清单本身不作为执行完成证据。",
         `### 命令 (${manifest.commands.length})`,
         ...manifest.commands.map(item => `- ${item}`),
         ``,
@@ -823,7 +757,7 @@ function formatCoverageText(bundle: Pick<GuardInputBundle, "coverage">): string 
         lines.push(`executionEvidence: requestedFrom=${execution.startRound}, includedRounds=${execution.includedRounds}, includedRange=${execution.firstIncludedRound ?? "none"}-${execution.lastIncludedRound ?? "none"}, included/source=${execution.includedChars}/${execution.sourceChars} chars, sourceCharsKnown=${execution.sourceCharsKnown}`, "");
     }
     for (const source of coverage.sources) {
-        lines.push(`### ${source.basename} (${source.totalLines} 行, ${source.totalChars} 字, ${source.mode})`);
+        lines.push(`### ${source.file} (${source.totalLines} 行, ${source.totalChars} 字, ${source.mode})`);
         for (const segment of source.segments) {
             lines.push(`- ${segment.label} ${lineRangeLabel(segment.startLine, segment.endLine)}: ${segment.reason}`);
         }
@@ -843,13 +777,14 @@ export function mergeGuardFinalCoverage(
     const coverageGaps = [...base.coverageGaps];
     const requiredAssets = external.items.filter(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
     const referenceExecution = base.executionEvidence?.role === "reference" && requiredAssets.length > 0;
-    const requiredGaps = [...(base.requiredGaps || []), ...base.sources.filter(source => source.truncated).map(source => `${source.basename}: selected scope truncated`)];
+    const requiredGaps = [...(base.requiredGaps || []), ...(promptBudget?.requiredGaps || []), ...base.sources.filter(source => source.truncated).map(source => `${source.basename}: selected scope truncated`)];
     if (!referenceExecution) requiredGaps.push(...(base.executionEvidence?.coverageGaps || []));
     if (base.executionEvidence?.role === "reference" && !referenceExecution) requiredGaps.push("executionEvidenceRole=reference requires explicit required external evidence");
     coverageGaps.push(...(base.executionEvidence?.coverageGaps || []));
     coverageGaps.push(...external.coverage.coverageGaps);
     for (const item of requiredAssets) {
         if (item.readStatus !== "complete") requiredGaps.push(`${item.label || path.basename(item.path)}: ${item.readStatus || "unknown"}`);
+        if (item.budget && (!item.budget.completeSourceKnown || item.budget.shortfallChars > 0)) requiredGaps.push(`${item.label || item.path}: required=${item.budget.requiredChars}, granted=${item.budget.grantedChars}, shortfall=${item.budget.shortfallChars}, completeSourceKnown=${item.budget.completeSourceKnown}`);
     }
     const requiredSections = new Set(["planContent", "taskContent", "evidence", "appealNote", "executionRecord", "evidenceText"]);
     if (referenceExecution) requiredSections.delete("executionRecord");
@@ -897,11 +832,15 @@ export function applyGuardCoverageConstraints(result: GuardCheckResult, coverage
 
 function computeCoverage(sources: GuardSourceCoverage[]) {
     const coverageGaps: string[] = [];
+    const requiredGaps = sources.flatMap(source => [
+        ...(source.requiredGaps || []),
+        ...(source.truncated ? [`${source.file}: selected scope truncated`] : []),
+    ]);
     for (const source of sources) {
         if (source.segments.length === 0) coverageGaps.push(`${source.basename}: no segments extracted`);
         if (source.fallbackUsed) coverageGaps.push(`${source.basename}: fallback extraction used`);
         if (source.truncated) coverageGaps.push(`${source.basename}: segment truncated`);
-        if (!source.segments.some(segment => segment.label.includes("stage-section") || segment.label.includes("full-map") || segment.label.includes("scope-selector"))) {
+        if (!source.segments.some(segment => /stage-section|full-map|scope-selector|global-rules/u.test(segment.label))) {
             coverageGaps.push(`${source.basename}: no stage section/full map`);
         }
     }
@@ -915,7 +854,7 @@ function computeCoverage(sources: GuardSourceCoverage[]) {
         : sources.some(source => source.segments.length === 0 || source.fallbackUsed)
             ? "low"
             : "medium";
-    return { confidence, truncationRisk, sources, coverageGaps } as GuardInputBundle["coverage"];
+    return { confidence, truncationRisk, sources, coverageGaps, requiredGaps } as GuardInputBundle["coverage"];
 }
 
 export function buildGuardInputBundle(
@@ -933,6 +872,11 @@ export function buildGuardInputBundle(
 
     const sources = [...taskResults, ...planResults].map(item => item.coverage);
     const coverage = computeCoverage(sources);
+    if (!taskFiles.length) {
+        coverage.requiredGaps = [...(coverage.requiredGaps || []), "taskFiles: at least one Task document is required"];
+        coverage.confidence = "low";
+        coverage.truncationRisk = "high";
+    }
     const evidenceSourceText = [...taskResults, ...planResults].map(item => item.evidenceSourceText).join("\n\n");
     const evidenceManifest = extractEvidenceManifest(evidenceSourceText);
     const partialBundle = { coverage } as GuardInputBundle;
@@ -950,14 +894,14 @@ export function buildGuardInputBundle(
     };
 }
 
-function buildLocatorFileMap(filePaths: string[], stageId?: string): string {
+function buildLocatorFileMap(planFiles: string[], taskFiles: string[], stageId?: string): string {
     const anchors = deriveGuardAnchors(stageId);
     const sections: string[] = [];
-    for (const filePath of filePaths) {
-        if (!fs.existsSync(filePath)) continue;
-        const content = fs.readFileSync(filePath, "utf-8");
-        const lines = content.split(/\r?\n/u);
-        const headings = parseHeadings(lines).slice(0, 120).map(heading =>
+    for (const filePath of [...taskFiles, ...planFiles]) {
+        const document = resolveGuardTargetDocument(filePath, taskFiles.includes(filePath) ? "task" : "plan", stageId);
+        if (document.gaps.length) continue;
+        const lines = document.lines.map((line, index) => document.ranges.some(range => index + 1 >= range.startLine && index + 1 <= range.endLine) ? line : "");
+        const headings = parseHeadings(sanitizeGuardTargetLines(lines.join("\n"))).slice(0, 120).map(heading =>
             `L${heading.lineNumber} ${"#".repeat(heading.level)} ${heading.text}`
         );
         const anchorLines = lines
@@ -967,7 +911,7 @@ function buildLocatorFileMap(filePaths: string[], stageId?: string): string {
             .map(item => `L${item.lineNumber}: ${sliceUnicodeSafe(item.line, 0, 220)}`);
         sections.push([
             `### ${filePath}`,
-            `totalLines=${lines.length}, totalChars=${content.length}`,
+            `totalLines=${lines.length}, totalChars=${document.totalChars}`,
             `#### headings`,
             headings.join("\n") || "(none)",
             `#### candidate evidence lines`,
@@ -1000,6 +944,8 @@ export function materializeLocatorSuggestions(
     suggestions: GuardLocatorSuggestion[],
     planFiles: string[],
     taskFiles: string[],
+    stageId?: string,
+    scopeSelectors?: string[],
 ): GuardMaterializedLocatorSuggestions {
     const allFiles = [...taskFiles, ...planFiles].filter(file => fs.existsSync(file));
     const allowed = new Map(allFiles.map(file => [path.resolve(file).toLowerCase(), file]));
@@ -1011,16 +957,20 @@ export function materializeLocatorSuggestions(
         const resolved = path.resolve(suggestion.file).toLowerCase();
         const filePath = allowed.get(resolved);
         if (!filePath || !fs.existsSync(filePath)) continue;
-        const lines = fs.readFileSync(filePath, "utf-8").split(/\r?\n/u);
+        const document = resolveGuardTargetDocument(filePath, taskFiles.includes(filePath) ? "task" : "plan", stageId, scopeSelectors);
+        if (document.gaps.length) continue;
+        const lines = document.lines;
         const startLine = clamp(Math.min(suggestion.startLine, suggestion.endLine), 1, lines.length);
         const endLine = clamp(Math.max(suggestion.startLine, suggestion.endLine), startLine, Math.min(lines.length, startLine + 119));
-        const formatted = formatDocumentSegment(path.basename(filePath), "model-locator", startLine, endLine, suggestion.reason || "model assisted locator validated locally", lines, 16_000);
-        if (taskFiles.some(file => path.resolve(file).toLowerCase() === resolved)) {
-            taskSegments.push(formatted.text);
-        } else {
-            planSegments.push(formatted.text);
+        for (const range of document.ranges) {
+            const boundedStart = Math.max(startLine, range.startLine);
+            const boundedEnd = Math.min(endLine, range.endLine);
+            if (boundedStart > boundedEnd) continue;
+            const formatted = formatDocumentSegment(path.basename(filePath), "model-locator", boundedStart, boundedEnd, suggestion.reason || "validated target scope", lines, 16_000);
+            if (taskFiles.some(file => path.resolve(file).toLowerCase() === resolved)) taskSegments.push(formatted.text);
+            else planSegments.push(formatted.text);
+            evidenceSources.push(formatted.text);
         }
-        evidenceSources.push(formatted.text);
     }
 
     return { taskSegments, planSegments, evidenceSources };
@@ -1042,8 +992,7 @@ async function enhanceGuardInputBundleWithModelLocator(
     );
     if (!shouldLocate) return bundle;
 
-    const allFiles = [...taskFiles, ...planFiles].filter(file => fs.existsSync(file));
-    const fileMap = buildLocatorFileMap(allFiles, stageId);
+    const fileMap = buildLocatorFileMap(planFiles, taskFiles, stageId);
     if (!fileMap.trim()) return bundle;
 
     const prompt = [
@@ -1064,7 +1013,7 @@ async function enhanceGuardInputBundleWithModelLocator(
     ].join("\n");
 
     try { options.onProgress?.("locator"); } catch {}
-    const response = await callModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), {
+    const response = await guardModelResponse(FLASH_MODEL, prompt, modelChain || "auto", Math.min(FLASH_TIMEOUT, 45_000), {
         grokContext: "default",
         shouldCancel: () => shouldAbortGuardRun(options),
         diagnosticContext: options.diagnosticContext,
@@ -1081,7 +1030,7 @@ async function enhanceGuardInputBundleWithModelLocator(
     }
 
     const suggestions = parseLocatorSuggestions(response.text);
-    const { taskSegments, planSegments, evidenceSources } = materializeLocatorSuggestions(suggestions, planFiles, taskFiles);
+    const { taskSegments, planSegments, evidenceSources } = materializeLocatorSuggestions(suggestions, planFiles, taskFiles, stageId);
 
     if (taskSegments.length === 0 && planSegments.length === 0) {
         return {
@@ -1272,21 +1221,26 @@ function buildGuardPrompt(
     scopeSelectors?: string[],
     appealNote?: string,
     evidence?: string,
+    executionEvidenceRole: "required" | "reference" = "required",
+    hasRequiredExternalAssets = false,
 ): string {
+    const referenceExecution = executionEvidenceRole === "reference" && hasRequiredExternalAssets;
     let prompt = `你是一个独立的任务完整性审核助手。你的职责是防止 AI 虚标任务完成。
 
 ## 任务
-对比【计划要求】和【实际执行记录】，检查任务是否被真正完成。
+对比【已确认的当前目标及适用全局要求】和【实际原件与执行证据】，检查任务是否被真正完成。
 ${stageId ? `\n**重点关注范围**：${stageId}。只检查与 ${stageId} 直接相关的任务项，忽略其他 Stage 的历史遗留未完成项。\n` : ""}
-${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("；")}。只把这些选择器命中的任务项视为本次审核义务，同一 Stage 中未命中的任务项必须忽略，不能作为缺口。\n` : ""}
+${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("；")}。本次义务包括命中的任务项，以及输入中明确标为global-rules的适用全局要求。其他子任务不纳入本次验收。\n` : ""}
 ## 核心原则（最重要）
-**执行记录是 ground truth，Task.md 标记不可信。**
-- AI 可能标记了 [x] 但实际没做——你必须在执行记录中找到对应的代码修改、工具调用或文件操作作为证据
+${referenceExecution
+        ? "**对话执行记录角色：reference（参考）。**聊天不可读、缺失或压缩仅作为覆盖说明；依据必需外部原件逐项独立判断，无需在聊天中重复找到相同操作。"
+        : "**对话执行记录角色：required（必需）。**必须结合对话原文、工具结果和实际原件核对操作，执行记录覆盖不足时保留证据缺口。"}
+- Task.md的勾选是任务自述，每项完成判断都须有对应的实质原件；核对原件与本阶段要求的关系
 - AI 可能说"差不多了"就标完成——"差不多"不算完成，必须与 Plan 要求精确匹配
 - AI 的实际操作可能偏离用户原始要求——对照用户消息检查是否存在方向性偏差
 
 ## 评判标准
-- [x] 标记的项目：必须在执行记录（对话原文、代码 diff、工具调用）中找到对应证据，无证据则视为虚标
+- [x] 标记的项目：核对对应代码、测试输出、产物等实际证据；缺少必需原件时输出EVIDENCE_INSUFFICIENT，实际未做时输出FAIL
 - [ ] 或 [/] 标记的项目：视为未完成
 - 用户明确说"跳过"或"不做了"的项目：视为已完成
 - Plan 中的关键要求：检查是否被实际落实，而非仅在 Task 中标记
@@ -1299,7 +1253,7 @@ ${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("�
 后续行（仅 FAIL 时）: 每个遗漏项一行，格式:
 - MISSING: [任务标识] 具体描述（标注是"未做"还是"虚标"还是"偏离用户要求"）
 
-如果 coverage 明确显示关键证据可能未进入输入，或强制执行证据区为空但未读区间可能包含证据，请输出 EVIDENCE_INSUFFICIENT，而不是 FAIL。
+如果coverage显示必需证据未进入输入，请输出EVIDENCE_INSUFFICIENT。reference聊天的覆盖缺口按参考角色处理；HTTP原始日志、测试输出和实际产物等必需原件的缺失仍须阻断。命令及路径清单只供定位，参考材料出现的历史命令不会增加本阶段验收义务。
 `;
 
     if (coverageText) {
@@ -1307,7 +1261,7 @@ ${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("�
     }
 
     if (evidenceText) {
-        prompt += `\n## 强制执行证据区（优先于 Task/Record 自述）\n\n${evidenceText}\n`;
+        prompt += `\n## 当前目标命令与文件定位线索（需结合实际原件核验）\n\n${evidenceText}\n`;
     }
 
     if (evidenceIndexText) {
@@ -1321,7 +1275,7 @@ ${scopeSelectors?.length ? `\n**子范围选择器**：${scopeSelectors.join("�
     prompt += `\n## 任务文件内容\n\n${taskContent}\n`;
 
     if (executionRecord) {
-        prompt += `\n## 执行记录\n\n${executionRecord}\n`;
+        prompt += `\n## 执行记录（${referenceExecution ? "reference，仅作参考" : "required，必需证据"}）\n\n${executionRecord}\n`;
     }
 
     if (appealNote) {
@@ -1355,6 +1309,8 @@ function buildGuardPromptFromInput(input: GuardPromptInput): string {
         input.scopeSelectors,
         input.appealNote,
         input.evidence,
+        input.executionEvidenceRole,
+        input.hasRequiredExternalAssets,
     )].filter(Boolean).join("\n\n");
 }
 
@@ -1374,14 +1330,22 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
         { name: "evidence", text: input.evidence || "", sourceChars: (input.evidence || "").length },
     ];
     const availableChars = new Map(sections.map(section => [section.name, section.text.length]));
+    const referenceExecution = input.executionEvidenceRole === "reference" && input.hasRequiredExternalAssets === true;
+    const requiredSections = new Set<GuardPromptTextSection>(["planContent", "taskContent", "evidence", "appealNote", "executionRecord", "coverageText", "evidenceText"]);
+    if (referenceExecution) requiredSections.delete("executionRecord");
+    const externalIncomplete = () => input.requiredExternalBlocks
+        ? input.requiredExternalBlocks.some(block => !sections[5].text.includes(block))
+        : input.hasRequiredExternalAssets !== false && sections[5].text.length < (availableChars.get("evidenceIndexText") || 0);
+    const requiredGaps = () => [
+        ...(input.coverageState?.requiredGaps || []),
+        ...(input.executionEvidenceRole === "reference" && !input.hasRequiredExternalAssets ? ["executionEvidenceRole=reference requires explicit required external evidence"] : []),
+        ...sections.filter(section => requiredSections.has(section.name) && section.sourceChars > section.text.length)
+            .map(section => `${section.name}: required=${section.sourceChars}, included=${section.text.length}, shortfall=${section.sourceChars - section.text.length}, provider=${provider}`),
+        ...(externalIncomplete() ? [`evidenceIndexText: required external blocks incomplete, provider=${provider}`] : []),
+    ];
     const currentInput = (): GuardPromptInput => {
         const reduced = sections.filter(section => section.sourceChars > section.text.length);
-        const requiredSections = new Set(["planContent", "taskContent", "evidence", "appealNote", "executionRecord", "evidenceText"]);
-        if (input.executionEvidenceRole === "reference" && input.hasRequiredExternalAssets) requiredSections.delete("executionRecord");
-        const externalIncomplete = input.requiredExternalBlocks
-            ? input.requiredExternalBlocks.some(block => !sections[5].text.includes(block))
-            : input.hasRequiredExternalAssets !== false && sections[5].text.length < (availableChars.get("evidenceIndexText") || 0);
-        const requiredIncomplete = Boolean(input.coverageState?.requiredGaps?.length) || externalIncomplete || reduced.some(section => requiredSections.has(section.name));
+        const requiredIncomplete = requiredGaps().length > 0;
         const confidence = requiredIncomplete ? "low" : input.coverageState?.confidence === "low" ? "low" : reduced.length ? "medium" : input.coverageState?.confidence || "high";
         const truncationRisk = requiredIncomplete ? "high" : reduced.length ? "low" : input.coverageState?.truncationRisk || "none";
         const finalCoverageNotice = [
@@ -1407,6 +1371,21 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
     const compressionReasons: string[] = [];
     if (prompt.length > providerBudget.inputChars) {
         compressionReasons.push(`provider=${provider} 输入上限 ${providerBudget.inputChars} chars；输出预留估计 ${providerBudget.outputReserveChars} chars，非模型输出硬上限`);
+        const reduceReference = (section: typeof sections[number], minimumChars = 0) => {
+            while (prompt.length > providerBudget.inputChars && section.text.length > minimumChars) {
+                const target = Math.max(minimumChars, section.text.length - Math.max(1, prompt.length - providerBudget.inputChars));
+                section.text = truncateGuardPromptSection(section.text, target);
+                prompt = buildGuardPromptFromInput(currentInput());
+            }
+        };
+        if (referenceExecution) reduceReference(sections[2]);
+        if (prompt.length > providerBudget.inputChars) {
+            if (input.hasRequiredExternalAssets === false) reduceReference(sections[5]);
+            else if (input.requiredExternalBlocks && input.requiredExternalBlocks.every(block => sections[5].text.includes(block))) {
+                sections[5].text = input.requiredExternalBlocks.join("\n\n---\n\n");
+                prompt = buildGuardPromptFromInput(currentInput());
+            }
+        }
         while (prompt.length > providerBudget.inputChars) {
             const reducible = sections.filter(section => section.text.length > 0)
                 .sort((left, right) => right.text.length - left.text.length)[0];
@@ -1420,7 +1399,7 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
         }
     }
     if (prompt.length > providerBudget.inputChars) {
-        throw new RangeError(`Guard provider=${provider} 输入预算 ${providerBudget.inputChars} chars 小于必需模板 ${prompt.length} chars，模型调用已阻止`);
+        throw new GuardPromptBudgetError(`Guard provider=${provider} 输入预算 ${providerBudget.inputChars} chars 小于必需模板 ${prompt.length} chars，模型调用已阻止`);
     }
     const usages = sections.map(section => ({
         name: section.name,
@@ -1451,6 +1430,7 @@ export function renderGuardPromptForProvider(input: GuardPromptInput, provider: 
             templateChars: prompt.length - usages.reduce((total, section) => total + section.includedChars, 0),
             sections: usages,
             compressionReasons,
+            requiredGaps: [...new Set(requiredGaps())],
         },
     };
 }
@@ -1504,23 +1484,15 @@ function summaryAcknowledgesEvidence(summary: string): boolean {
 }
 
 function isGuardSelfReferenceMissingItem(item: string): boolean {
-    const hasGuardClosureSubject = hasAnyPattern(item, [
-        /Guard|stage_guard|check|PASS|appeal|cancel/i,
-        /复检|复核|收口|自指|咬尾巴|锁/u,
-        /通过结论|通过记录|完成标记|完成记录|本轮.*结果|检查结果|处理结果|返回结果/u,
-    ]);
-    const hasOnlyAfterCheckEvidence = hasAnyPattern(item, [
-        /本轮|此次|当前|这次/u,
-        /只显示|停在|没有看到|未看到|未见|缺少|未提供|未出现/u,
-        /Guard.*结果|check.*结果|appeal.*结果|cancel.*结果/i,
-        /通过|PASS|完成标记|完成记录|收口|落盘|报告/u,
-    ]);
-    const hasSubstantiveMissingSignal = hasAnyPattern(item, [
-        /未新增|未修改|未实现|未补齐|缺少代码|缺少测试|没有测试|没有实现|没有文件|未运行测试/u,
-        /npm|build|单元测试|集成测试|截图|源码|配置|schema|fixture|README|Plan|Task\.md/i,
-    ]);
-
-    return hasGuardClosureSubject && hasOnlyAfterCheckEvidence && !hasSubstantiveMissingSignal;
+    if (/HTTP|原始|原件|日志|测试|构建|截图|源码|代码|配置|schema|fixture|README|npm|\bbuild\b|业务|产物|实现|未执行|未运行/iu.test(item)) return false;
+    if (!/本次|本轮|当前|此次|这次/u.test(item) || /上次|历史|另一个|其他|第二次|cancel|appeal/iu.test(item)) return false;
+    const afterCheck = /(?:Guard|stage_guard|check)\s*通过后|通过后才能|通过之后才能/iu.test(item)
+        && /完成(?:标记|记录)|通过记录|PASS\s*(?:记录|标记)|收口记录/iu.test(item);
+    const currentReturn = /(?:本次|本轮|当前|此次|这次).{0,12}(?:Guard|stage_guard|check).{0,12}(?:返回结果|检查结果|通过记录|PASS\s*记录|完成标记)/iu.test(item);
+    const remainder = item.replace(/^\s*\[\s*(?:stage\s*\d+(?:\.\d+)*(?:-\w+)?|U\d+)\s*\]\s*/iu, "").replace(/\bstage\s*\d+(?:\.\d+)*(?:-\w+)?/giu, "")
+        .replace(/本次|本轮|当前|此次|这次|stage_guard|Guard|check|PASS|返回结果|检查结果|通过记录|完成标记|完成记录|收口记录|通过后才能写入的|通过后才能写入|通过后|缺少|没有看到|未看到|未见|未做|未提供|未写入|尚未写入|没有|还|结果|返回|记录|写入|完成|通过|的|才能|尚未|尚无|未落盘|落盘|不存在|缺失|缺|未/giu, "")
+        .replace(/[\s:：,，。;；()（）“”"'`-]/gu, "");
+    return (afterCheck || currentReturn) && remainder.length === 0;
 }
 
 export function resolveGuardSelfReferenceResult(result: GuardCheckResult): GuardCheckResult {
@@ -1548,6 +1520,28 @@ function resolveGuardModelChain(state: GuardState): Chain {
     return state.chain || "auto";
 }
 
+function formatRequiredAssetBudgets(external: GuardEvidenceIndexResult): string {
+    return external.items.filter(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()))
+        .map(item => {
+            const budget = item.budget;
+            return `${item.label || item.path}: body=${budget?.sourceBodyChars ?? "unknown"}, metadata=${budget?.sourceMetadataChars ?? "unknown"}, required=${budget?.requiredChars ?? "unknown"}, granted=${budget?.grantedChars ?? item.includedChars ?? "unknown"}, shortfall=${budget?.shortfallChars ?? "unknown"}, completeSourceKnown=${budget?.completeSourceKnown ?? "unknown (legacy item)"}, readStatus=${item.readStatus || "unknown"}`;
+        }).join("\n");
+}
+
+function guardPreflightResult(state: GuardState, coverage: GuardCoverage, external?: GuardEvidenceIndexResult, requestedAssets?: GuardEvidenceAssetInput[]): GuardCheckResult {
+    const summary = `本次必需范围或证据不完整：${coverage.requiredGaps?.join("；") || coverage.coverageGaps.join("；")}`;
+    const reportPath = saveTempFile(`stage_guard_preflight_${Date.now()}`, "Stage Guard 调用前检查报告", [
+        "# Stage Guard 调用前检查报告", `Guard Id: ${state.guardId}`, `Stage: ${state.stageId || "完整文档"}`,
+        "结果: EVIDENCE_INSUFFICIENT", "本次未发起最终审核模型请求。", summary,
+        "## 实际覆盖", formatCoverageText({ coverage }), "## 必需原件配额", external ? formatRequiredAssetBudgets(external) : [
+            "尚未读取外部原件：目标范围未确认。",
+            ...(requestedAssets || []).filter(asset => !["reference", "context", "optional"].includes((asset.role || "").trim().toLowerCase()))
+                .map(asset => `${asset.label || asset.path}: range=${asset.range || "complete source"}, body=unknown, metadata=unknown, required=unknown, granted=0, shortfall=unknown, completeSourceKnown=false`),
+        ].join("\n"),
+    ].join("\n\n"));
+    return { passed: false, summary, missingItems: [], rawResponse: "", evidenceInsufficient: true, infrastructureError: false, evidenceInsufficientReason: "REQUIRED_EVIDENCE_INCOMPLETE", reportPath, coverage, evidenceIndexManifestPath: external?.manifestPath };
+}
+
 export async function runGuardCheck(
     state: GuardState,
     appealNote?: string,
@@ -1572,6 +1566,7 @@ export async function runGuardCheck(
     const scopeSelectors = normalizeGuardScopeSelectors(state.scopeSelectors);
     const initialInputBundle = buildGuardInputBundle(state.planFiles, state.taskFiles, state.stageId, scopeSelectors);
     if (shouldAbortGuardRun(options)) return createAbortedGuardResult(Boolean(options.isCancelled?.()));
+    if (initialInputBundle.coverage.requiredGaps?.length) return guardPreflightResult(state, initialInputBundle.coverage, undefined, options.evidenceAssets);
     const diagnosticContext = { conversationId: state.conversationId, guardId: state.guardId, childScopeId: state.childScopeId, stageId: state.stageId, backgroundTaskId: options.backgroundTaskId };
     const inputBundle = scopeSelectors.length > 0
         ? initialInputBundle
@@ -1632,9 +1627,7 @@ export async function runGuardCheck(
         ? `### Guard 执行范围\n\n仅注入对话第 ${state.startRound} 轮及之后的执行记录；无轮次边界的 Record 摘要不会作为本次 Guard 证据。`
         : "";
     const executionRecord = [roundScopeNotice, recordContext, conversationExecution.text].filter(Boolean).join("\n\n===\n\n");
-    const runtimeEvidence = extractEvidenceManifest(executionRecord);
-    const externalEvidenceManifest = extractEvidenceManifest(externalEvidence.text);
-    const mergedEvidenceManifest = mergeEvidenceManifest([inputBundle.evidenceManifest, runtimeEvidence, externalEvidenceManifest]);
+    const mergedEvidenceManifest = inputBundle.evidenceManifest;
     const evidenceTextSource = formatEvidenceManifest(mergedEvidenceManifest, Number.MAX_SAFE_INTEGER);
     const evidenceText = truncateText(evidenceTextSource, EVIDENCE_CONTEXT_BUDGET);
     if (shouldAbortGuardRun(options)) {
@@ -1648,8 +1641,12 @@ export async function runGuardCheck(
     const { text: executionText, ...executionEvidence } = conversationExecution;
     const hasRequiredAssets = externalEvidence.items.some(item => !["reference", "context", "optional"].includes((item.role || "").trim().toLowerCase()));
     const referenceExecution = options.executionEvidenceRole === "reference" && hasRequiredAssets;
-    const baseCoverage = { ...inputBundle.coverage, executionEvidence: { ...executionEvidence, role: referenceExecution ? "reference" as const : "required" as const }, requiredGaps: options.executionEvidenceRole === "reference" && !hasRequiredAssets ? ["executionEvidenceRole=reference requires explicit required external evidence"] : [] };
+    const baseCoverage = { ...inputBundle.coverage, executionEvidence: { ...executionEvidence, role: referenceExecution ? "reference" as const : "required" as const }, requiredGaps: [
+        ...(inputBundle.coverage.requiredGaps || []),
+        ...(options.executionEvidenceRole === "reference" && !hasRequiredAssets ? ["executionEvidenceRole=reference requires explicit required external evidence"] : []),
+    ] };
     const initialCoverage = mergeGuardFinalCoverage(baseCoverage, externalEvidence);
+    if (initialCoverage.requiredGaps?.length) return guardPreflightResult(state, initialCoverage, externalEvidence);
 
     const promptInput: GuardPromptInput = {
         planContent,
@@ -1693,6 +1690,8 @@ export async function runGuardCheck(
             missingItems: [],
             rawResponse: "",
             infrastructureError: response.infrastructureError ?? true,
+            evidenceInsufficient: response.evidenceInsufficient,
+            evidenceInsufficientReason: response.evidenceInsufficientReason,
             modelChainUsed: response.chainUsed,
             modelUsed: response.modelUsed,
             promptBudget: response.promptBudget,
@@ -1735,6 +1734,7 @@ export async function runGuardCheck(
     reportLines.push(`## 取证覆盖范围`, ``, "```", finalCoverageText, "```", ``);
     reportLines.push(`## 强制执行证据`, ``, "```", evidenceText, "```", ``);
     reportLines.push(`## Prompt 预算与压缩`, ``, "```", formatGuardPromptBudgetUsage(response.promptBudget), "```", ``);
+    reportLines.push("## 必需原件配额（索引分配，序列化字符数）", "", "provider总额与最终输入删减另见Prompt预算与压缩；调用前发现必需内容不足时，本候选模型不会收到请求。", "", "```", formatRequiredAssetBudgets(externalEvidence), "```", "");
     if (externalEvidence.text) {
         reportLines.push(`## 外部证据文件索引`, ``, "```", externalEvidence.text, "```", ``);
     }

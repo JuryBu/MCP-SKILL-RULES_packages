@@ -48,6 +48,15 @@ export interface GuardEvidenceAssetInput {
     maxChars?: number;
 }
 
+export interface GuardEvidenceBudget {
+    sourceBodyChars: number;
+    sourceMetadataChars: number;
+    requiredChars: number;
+    grantedChars: number;
+    shortfallChars: number;
+    completeSourceKnown: boolean;
+}
+
 export interface GuardEvidenceIndexItem {
     path: string;
     label?: string;
@@ -71,6 +80,7 @@ export interface GuardEvidenceIndexItem {
     coverageGaps: string[];
     includedStart?: number;
     includedEnd?: number;
+    budget?: GuardEvidenceBudget;
 }
 
 type GuardEvidenceSourceItem = Omit<GuardEvidenceIndexItem, "sourceChars" | "includedChars">;
@@ -943,6 +953,7 @@ function serializeItem(item: GuardEvidenceSourceItem, index: number): string {
     return [
         `### 证据文件 ${index + 1}: ${item.label || path.basename(item.path)}`,
         `- path: ${item.path}`,
+        `- role: ${item.role || "required"}`,
         `- kind: ${item.kind}`,
         `- ingestMode: ${item.ingestMode}`,
         `- parser: ${item.parser}`,
@@ -961,7 +972,21 @@ function serializeItem(item: GuardEvidenceSourceItem, index: number): string {
 
 function fitItem(source: GuardEvidenceSourceItem, index: number, maxChars: number, fileLimited: boolean): { item: GuardEvidenceIndexItem; block: string } {
     const sourceChars = serializeItem(source, index).length;
-    const item: GuardEvidenceIndexItem = { ...source, warnings: [...source.warnings], coverageGaps: [...source.coverageGaps], sourceChars, includedChars: 0 };
+    const item: GuardEvidenceIndexItem = {
+        ...source,
+        warnings: [...source.warnings],
+        coverageGaps: [...source.coverageGaps],
+        sourceChars,
+        includedChars: 0,
+        budget: {
+            sourceBodyChars: source.text.length,
+            sourceMetadataChars: sourceChars - source.text.length,
+            requiredChars: sourceChars,
+            grantedChars: Math.min(sourceChars, maxChars),
+            shortfallChars: Math.max(0, sourceChars - maxChars),
+            completeSourceKnown: source.sourceReadStatus === "complete",
+        },
+    };
     if (sourceChars <= maxChars) {
         const block = serializeItem(item, index);
         item.includedChars = block.length;
@@ -1014,11 +1039,11 @@ export async function buildGuardEvidenceIndexes(
         requestedAssets: requestedInputs.length, completeAssets: 0, partialAssets: 0, unreadAssets: 0,
         sourceChars: 0, includedChars: 0, truncated: false, coverageGaps: [],
     };
-    const items: GuardEvidenceIndexItem[] = [];
+    const items: GuardEvidenceIndexItem[] = new Array(requestedInputs.length);
     const blocks: string[] = [];
     const preambleChars = requestedInputs.length ? coveragePreamble(coverage, manifestPath).length : 0;
     let usedChars = preambleChars;
-    for (const [index, rawInput] of requestedInputs.entries()) {
+    const prioritizedInputs = requestedInputs.map((rawInput, index) => {
         const input: GuardEvidenceAssetInput = {
             path: typeof rawInput?.path === "string" ? rawInput.path : "",
             label: typeof rawInput?.label === "string" ? rawInput.label : undefined,
@@ -1027,13 +1052,27 @@ export async function buildGuardEvidenceIndexes(
             range: typeof rawInput?.range === "string" ? rawInput.range : undefined,
             maxChars: rawInput?.maxChars,
         };
+        let estimatedChars = Number.MAX_SAFE_INTEGER;
+        if (input.path.trim() && !input.path.includes("\0")) {
+            try {
+                estimatedChars = fs.statSync(path.resolve(input.path)).size + input.path.length + (input.label?.length || 0);
+            } catch {
+                estimatedChars = Number.MAX_SAFE_INTEGER;
+            }
+        }
+        const reference = ["reference", "context", "optional"].includes((input.role || "").trim().toLowerCase());
+        return { index, input, estimatedChars, reference };
+    }).sort((left, right) => Number(left.reference) - Number(right.reference)
+        || left.estimatedChars - right.estimatedChars
+        || left.index - right.index);
+    for (const { index, input } of prioritizedInputs) {
         const validPath = Boolean(input.path.trim()) && !input.path.includes("\0");
         const resolvedPath = validPath ? path.resolve(input.path) : "[invalid evidence path]";
         const kind = classifyEvidencePath(resolvedPath, input.type);
         const remainingChars = Math.max(0, normalizedOptions.maxTotalChars - usedChars - (blocks.length ? ITEM_SEPARATOR.length : 0));
         const fileChars = normalizeBudget(input.maxChars, normalizedOptions.maxFileChars);
         const minimumHeaderChars = serializeItem({
-            path: resolvedPath, label: input.label, kind, ingestMode: "unreadable_stub", parser: "stub", ok: false,
+            path: resolvedPath, label: input.label, role: input.role, kind, ingestMode: "unreadable_stub", parser: "stub", ok: false,
             text: "", warnings: [], requestedRange: input.range, sourceReadStatus: "unread", readStatus: "unread", truncated: true, coverageGaps: [],
         }, index).length;
         let source: GuardEvidenceSourceItem;
@@ -1050,7 +1089,7 @@ export async function buildGuardEvidenceIndexes(
             source = await buildOneIndex(input, normalizedOptions);
         }
         const { item, block } = fitItem(source, index, Math.min(fileChars, remainingChars), fileChars <= remainingChars);
-        items.push(item);
+        items[index] = item;
         if (block) {
             item.includedStart = usedChars + (blocks.length ? ITEM_SEPARATOR.length : 0);
             item.includedEnd = item.includedStart + block.length;

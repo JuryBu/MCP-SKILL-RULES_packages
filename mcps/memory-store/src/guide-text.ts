@@ -246,22 +246,24 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - ⚠️ 当项目有 Plan_x 和 Task.md 时，每个 Stage 开始前必须 start，完成后必须 check 通过才能标记完成
 - 四层防御网防止 CHECKPOINT 压缩导致任务遗漏
 - action: start(注册守卫) / check(Flash比对验证) / status(查看状态) / cancel(取消)
-- start 时传入 taskFiles + planFiles + stageId，自动获取当前轮次；同一 GuardKey 已活跃时默认拒绝，只有 force=true 才会先精确清理旧锁再替换
+- 有Plan/Task时start明确传入taskFiles、planFiles的完整绝对路径及具体stageId；工具先核可读文件和阶段，再注册或force替换。单文件小任务可省Plan，旧注册身份与原任务恢复保留
 - GuardKey = conversationId + stageId + childScopeId（默认 main）；guardId 标识某一次不可变实例，旧后台 check 返回时会先比对 guardId，过期结果不得写历史、移锁或清理新 Guard
 - 子任务 Guard 传 childScopeId 时必须同时传 scopeSelectors（Task 编号、小标题或稳定锚点）；scopeSelectors 才定义审核内容，childScopeId/job_id 只负责区分实例
 - check/status/cancel 在选择器不完整且存在多个候选时会返回候选列表，拒绝静默选取；status(listAll=true) 直接扫描状态目录，不读取任何对话
 - start 时可手动设 startRound 为更早轮次以覆盖已完成的工作
 - check 时审核模型独立比对 Plan/Task vs 执行记录；v1.13.4 起输入由分段取证器构建，不再整篇读取超长 Plan/Task/Record
-- Plan/Task 取证优先保留当前 Stage section、头部规则、尾部、小本本、标题邻近块和命令/报告/文件路径证据窗口
+- Plan/Task取证限定当前阶段与明确适用的全局要求，标题和Plan表格共用阶段身份；命令清单、辅助定位及最终提示沿用同一范围，排除旧阶段、代码示例与Guard锁块
 - Record 取证优先使用 Reader 局部视图（state/outputs/verification/risks）和少量锚点窗口；对话原文会展开工具结果、代码编辑、diff 和文件视图，但仍受总预算控制
 - check 报告会保存 extraction manifest 与 evidence manifest，说明读取了哪些行、哪些区间没读、命中了哪些命令/报告/run/obs/文件证据
 - coverage 不足、锚点缺失或截断风险时，工具返回证据不足/审查未完成，不累计未通过次数，也不触发三次失败裁定
 - check 时可传 evidence 补录证据（如 Guard start 之前完成的修改）
 - check 时可传 evidenceFiles 或 evidenceAssets 追加外部证据文件；evidenceAssets 支持 path、label、type、role、range、maxChars，适合报告、截图、PDF、Word、Excel、视频和原始日志
+- maxChars是单项正文、路径、标签和诊断的完整序列化硬限；manifest的budget分别记录正文/元数据/完整所需/分配/差额与完整来源是否已知。必需短原件先分配，items保持输入顺序，includedStart/includedEnd指向实际优先顺序的提示位置
+- executionEvidenceRole默认required；有显式必需外证时可设reference，程序与提示均按必需原件核验，参考聊天缺口单列。参考资产role使用reference/context/optional，其它角色及省略值均为必需
 - evidenceIndexMode: auto(默认，复用缓存或按需重建) / reuse(只用已有索引) / rebuild(强制重建) / off(只登记文件元数据，不读取内容)
 - 外部证据索引写入 temp/stage-guard-evidence-indexes，artifact 内有 <<<GUARD_EVIDENCE_INDEX>>> 标记；Guard prompt 只注入短索引和 artifactPath，不直接塞入大文件、图片 base64 或完整 PDF/Word 内容
 - 图片默认只登记尺寸和元数据；需要真正理解图片内容时可开启 CLI 索引或改用支持视觉的模型链路，Guard 会显式提示“未读取图片视觉内容”
-- 核心原则：执行记录是 ground truth，Task.md 标记不可信，防止 AI 虚标
+- 核心原则：以本次必需原件核验完成情况，Task.md勾选只作为任务自述；真正缺少原日志或实际未完成时保留阻断
 - 按 GuardKey 隔离：同一对话、同一 Stage 的不同 childScope 可以并存，不会互相覆盖
 - 同一 Task.md 支持多个 Guard 独立锁块；pass/cancel/force 按 guardId 精确处理，保留其它活跃 Guard 锁
 - Guard 对话数据固定绑定当前宿主的明确 conversationId，不跨宿主操作异源 Guard

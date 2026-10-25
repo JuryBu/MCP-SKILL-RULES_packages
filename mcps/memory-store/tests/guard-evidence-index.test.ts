@@ -27,6 +27,7 @@ function sourceBlock(item: GuardEvidenceIndexItem, index: number): string {
     return [
         `### 证据文件 ${index + 1}: ${cached.label || path.basename(cached.path)}`,
         `- path: ${cached.path}`,
+        `- role: ${cached.role || "required"}`,
         `- kind: ${cached.kind}`,
         `- ingestMode: ${cached.ingestMode}`,
         `- parser: ${cached.parser}`,
@@ -163,7 +164,9 @@ async function main() {
     const multiFull = await buildGuardEvidenceIndexes(multiInputs, { indexMode: "rebuild", maxTotalChars: 50_000, maxFileChars: 30_000 });
     assertManifest(multiFull, 2, 50_000);
     assert.equal(multiFull.coverage.completeAssets, 2);
-    const expectedBlocks = multiFull.items.map(sourceBlock);
+    const expectedBlocks = multiFull.items.map((item, index) => ({ item, block: sourceBlock(item, index) }))
+        .sort((left, right) => (left.item.includedStart || 0) - (right.item.includedStart || 0))
+        .map(entry => entry.block);
     const expectedPreamble = [
         "## 外部证据文件索引",
         "- coverage: requested=2, complete=2, partial=0, unread=0",

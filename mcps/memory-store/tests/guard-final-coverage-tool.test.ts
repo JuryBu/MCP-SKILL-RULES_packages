@@ -106,7 +106,7 @@ guard.__testSetStageGuardCheckRunner(async (state, appealNote, evidence, options
     checkRunnerCalls++;
     assert.equal(state.conversationId, conversationId);
     assert.equal(state.childScopeId, scopeForCase(state.stageId));
-    assert.deepEqual(state.scopeSelectors, state.stageId === "locator-rejection" ? [] : identity.scopeSelectors);
+    assert.deepEqual(state.scopeSelectors, state.stageId === "scope-preflight" ? [] : identity.scopeSelectors);
     executionRoles.set(state.stageId, [...(executionRoles.get(state.stageId) || []), options?.executionEvidenceRole]);
     const running = runGuardCheck({ ...state, conversationId: "" }, appealNote, evidence, {
         ...options,
@@ -131,7 +131,7 @@ guard.__testSetStageGuardCheckRunner(async (state, appealNote, evidence, options
 guard.registerStageGuard(server);
 
 function scopeForCase(stageId: string): string {
-    return stageId === "locator-rejection" ? "main" : identity.childScopeId;
+    return stageId === "scope-preflight" ? "main" : identity.childScopeId;
 }
 
 function toolText(response: any): string {
@@ -139,7 +139,7 @@ function toolText(response: any): string {
 }
 
 async function callTool(stageId: string, parameters: Record<string, unknown>): Promise<string> {
-    const requestIdentity = stageId === "locator-rejection" ? { conversationId, chain: "auto", dataChain: "codex", modelChain: "codex" } : identity;
+    const requestIdentity = stageId === "scope-preflight" ? { conversationId, chain: "auto", dataChain: "codex", modelChain: "codex" } : identity;
     const response = await client.callTool({ name: "stage_guard", arguments: { ...requestIdentity, stageId, ...parameters } });
     assert.notEqual(response.isError, true, toolText(response));
     return toolText(response);
@@ -229,12 +229,33 @@ function inspectResult(stageId: string, response: string) {
     return { result, report, evidenceManifest, diagnostics, invocation, section };
 }
 
+function inspectPreflightResult(stageId: string, response: string) {
+    const result = observed.get(stageId);
+    assert.ok(result, `real runGuardCheck result missing for ${stageId}`);
+    assert.equal(result.passed, false);
+    assert.equal(result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
+    assert.equal(result.infrastructureError, false);
+    assert.equal(result.rawResponse, "", "a rejected request must not fabricate a model reply");
+    assert.equal(result.codexDiagnostics, undefined);
+    assert.equal(invocations(stageId).length, 0, "known incomplete required evidence must not reach the CLI");
+    assert.ok(result.reportPath, response);
+    assert.ok(result.evidenceIndexManifestPath);
+    const report = readArtifact(result.reportPath);
+    const evidenceManifest = JSON.parse(readArtifact(result.evidenceIndexManifestPath));
+    assert.deepEqual(result.coverage?.externalEvidence, evidenceManifest.coverage);
+    assert.match(report, /EVIDENCE_INSUFFICIENT/u);
+    assert.ok(response.includes(result.reportPath));
+    console.log(JSON.stringify({ stageId, preflight: true, reason: result.evidenceInsufficientReason, coverage: evidenceManifest.coverage, reportSha256: sha256(report), promptBudget: result.promptBudget }));
+    return { result, report, evidenceManifest };
+}
+
 async function startCase(stageId: string, mode = "pass"): Promise<void> {
     process.env.GUARD_TOOL_FIXTURE_STAGE = stageId;
     process.env.GUARD_TOOL_FIXTURE_MODE = mode;
     process.env.MEMORY_STORE_GUARD_CODEX_PROMPT_BUDGET = "60000";
     const taskFile = path.join(fixtureDirectory, `${stageId}-Task.md`);
-    fs.writeFileSync(taskFile, "# Synthetic Task\n\n## Fixture evidence\n- [x] Verify isolated evidence through the registered MCP tool\n", "utf8");
+    const taskText = "# Synthetic Task\n\n## Fixture evidence\n- [x] Verify isolated evidence through the registered MCP tool\n";
+    fs.writeFileSync(taskFile, taskText + (stageId === "scope-preflight" ? "\n## scope-preflight\n" + "fixture reference detail\n".repeat(6000) : ""), "utf8");
     taskFiles.set(stageId, taskFile);
     const response = await callTool(stageId, { action: "start", startRound: 1, taskFiles: [taskFile] });
     assert.match(response, /已激活/u);
@@ -393,7 +414,8 @@ async function runExecutionRoleRegression(): Promise<void> {
     fs.writeFileSync(partialFile, "partial required evidence\n".repeat(1200), "utf8");
     const requiredAssets: GuardEvidenceAssetInput[] = [{ path: completeFile, role: "required" }];
     const partialAssets: GuardEvidenceAssetInput[] = [{ path: partialFile, role: "required", maxChars: 1400 }];
-    const runCheck = async (stageId: string, assets: GuardEvidenceAssetInput[], role?: "required" | "reference", background = false, appealNote?: string) => {
+    const runCheck = async (stageId: string, assets: GuardEvidenceAssetInput[], role?: "required" | "reference", background = false, appealNote?: string, expectPreflight = false) => {
+        const callsBefore = invocations(stageId).length;
         let response = await callTool(stageId, { action: "check", evidenceAssets: assets, executionEvidenceRole: role, background, appealNote });
         let taskId: string | undefined;
         if (background) {
@@ -408,12 +430,20 @@ async function runExecutionRoleRegression(): Promise<void> {
             response = await callTool(stageId, { action: "check", taskId });
         }
         const result = observed.get(stageId)!;
-        assert.ok(result?.codexDiagnostics?.manifestPath, response);
+        assert.ok(result, response);
         assert.equal(executionRoles.get(stageId)?.at(-1), role || "required");
-        assert.equal(result.rawResponse.split("\n")[0], "PASS");
         assert.ok(response.includes(result.reportPath!));
-        assert.ok(readArtifact(result.reportPath!).includes("模型原始首行"));
-        assert.equal(sha256(readArtifact(result.codexDiagnostics.manifestPath)), result.codexDiagnostics.manifestSha256);
+        if (expectPreflight) {
+            assert.equal(result.codexDiagnostics, undefined, "known evidence gaps stop before CLI dispatch");
+            assert.equal(result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
+            assert.equal(result.rawResponse, "", "preflight does not fabricate a model reply");
+            assert.equal(invocations(stageId).length, callsBefore, "preflight must not create a model request");
+        } else {
+            assert.ok(result.codexDiagnostics?.manifestPath, response);
+            assert.equal(result.rawResponse.split("\n")[0], "PASS");
+            assert.ok(readArtifact(result.reportPath!).includes("模型原始首行"));
+            assert.equal(sha256(readArtifact(result.codexDiagnostics.manifestPath)), result.codexDiagnostics.manifestSha256);
+        }
         return { result, taskId };
     };
     await startCase("role-default");
@@ -429,7 +459,7 @@ async function runExecutionRoleRegression(): Promise<void> {
     assertReleased("role-reference");
     for (const item of [{ stageId: "role-no-required", assets: [] }, { stageId: "role-only-reference", assets: [{ path: completeFile, role: "reference" }] }]) {
         await startCase(item.stageId);
-        const checked = await runCheck(item.stageId, item.assets, "reference");
+        const checked = await runCheck(item.stageId, item.assets, "reference", false, undefined, true);
         assert.equal(checked.result.passed, false);
         assert.equal(checked.result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
         assert.equal(checked.result.coverage?.executionEvidence?.role, "required");
@@ -437,13 +467,13 @@ async function runExecutionRoleRegression(): Promise<void> {
         assertRetained(item.stageId);
     }
     await startCase("role-partial-required");
-    const partial = await runCheck("role-partial-required", partialAssets, "reference", true);
+    const partial = await runCheck("role-partial-required", partialAssets, "reference", true, undefined, true);
     assert.equal(partial.result.passed, false);
     assert.equal(partial.result.coverage?.executionEvidence?.role, "reference");
     assert.equal(partial.result.coverage?.externalEvidence?.partialAssets, 1);
     assert.ok(partial.result.coverage?.requiredGaps?.length);
     assertRetained("role-partial-required");
-    const required = await runCheck("role-partial-required", partialAssets, undefined, true);
+    const required = await runCheck("role-partial-required", partialAssets, undefined, true, undefined, true);
     assert.notEqual(required.taskId, partial.taskId);
     assert.equal(required.result.coverage?.executionEvidence?.role, "required");
     const beforeEquivalent = checkRunnerCalls;
@@ -475,7 +505,7 @@ async function runExecutionRoleRegression(): Promise<void> {
     }
     assert.equal(checkRunnerCalls, 8);
     assert.equal(conversationLoads, 0);
-    console.log("PASS execution evidence role: MCP enum validation and explicit option forwarding, default/appealNote/legacy payload stay required, missing or optional-only required assets block PASS, partial required external evidence blocks PASS, complete required assets permit reference, role-sensitive task identity and same original task recovery preserve role and diagnostic query; 8 real runGuardCheck/Fake CLI checks, stable 11-case suite not repeated");
+    console.log("PASS execution evidence role: MCP schema/forwarding/default/reference/recovery preserved; 8 real engine checks, 4 required-evidence preflights made no CLI request, complete originals used the real Fake CLI bridge and diagnostics; stable 11-case suite not repeated");
 }
 
 try {
@@ -518,48 +548,45 @@ try {
     await waitForBackgroundTask(taskId, 20);
     assert.equal(getBackgroundTask(taskId)?.status, "done");
     const requiredResponse = await callTool("required-truncated", { action: "check", taskId });
-    const required = inspectResult("required-truncated", requiredResponse);
+    const required = inspectPreflightResult("required-truncated", requiredResponse);
     assert.equal(required.result.passed, false);
     assert.equal(required.result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
-    assert.equal(required.result.rawResponse.split("\n")[0], "PASS");
-    assert.match(required.report, /\*\*结果\*\*: EVIDENCE_INSUFFICIENT/u);
+    assert.equal(required.result.rawResponse, "");
     assert.equal(required.evidenceManifest.items[0].sourceReadStatus, "complete");
     assert.equal(required.evidenceManifest.items[0].readStatus, "partial");
     assert.equal(required.result.coverage?.confidence, "low");
     assert.equal(required.result.coverage?.truncationRisk, "high");
-    assert.ok(required.section.sourceChars > required.section.includedChars);
+    assert.ok(required.evidenceManifest.coverage.sourceChars > required.evidenceManifest.coverage.includedChars);
     assertRetained("required-truncated");
     const previousCalls = checkRunnerCalls;
     const persistedTask = JSON.parse(readArtifact(path.join(process.env.MEMORY_STORE_DATA_ROOT!, "tasks", `${taskId}.json`)));
     assert.equal(persistedTask.status, "done");
     assert.ok(persistedTask.result.includes(required.result.reportPath));
-    assert.ok(persistedTask.result.includes(required.result.codexDiagnostics!.manifestPath));
-    assert.ok(getBackgroundTask(taskId)?.result?.includes(required.result.codexDiagnostics!.manifestPath!));
+    assert.equal(readBackgroundTaskDiagnostics(taskId)?.references.length || 0, 0);
     assert.equal(await callTool("required-truncated", { action: "check", taskId }), requiredResponse);
     assert.equal(checkRunnerCalls, previousCalls);
-    assert.equal(invocations("required-truncated").length, 1);
+    assert.equal(invocations("required-truncated").length, 0);
     assertRetained("required-truncated");
-    console.log("PASS required truncation: actual MCP background task done, immutable task/result diagnostics, repeated polling runs neither check runner nor CLI, lock retained and checkHistory unchanged");
+    console.log("PASS required truncation: actual MCP background preflight persists an immutable report without CLI diagnostics, repeated polling runs neither check runner nor CLI, lock retained and checkHistory unchanged");
 
     await startCase("required-total-budget");
     const tailAsset = path.join(fixtureDirectory, "unread-tail-evidence.txt");
-    fs.writeFileSync(tailAsset, "UNREAD_TAIL_SENTINEL\n", "utf8");
-    const totalLimited = inspectResult("required-total-budget", await checkCase("required-total-budget", [
+    fs.writeFileSync(tailAsset, "SHORT_REQUIRED_SENTINEL\n", "utf8");
+    const totalLimited = inspectPreflightResult("required-total-budget", await checkCase("required-total-budget", [
         { path: largeAsset, maxChars: 9000 }, { path: largeAsset, maxChars: 9000 }, { path: tailAsset },
     ]));
     assert.equal(totalLimited.result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
     assert.equal(totalLimited.evidenceManifest.coverage.requestedAssets, 3);
     assert.equal(totalLimited.evidenceManifest.coverage.partialAssets, 2);
-    assert.equal(totalLimited.evidenceManifest.coverage.unreadAssets, 1);
-    assert.equal(totalLimited.evidenceManifest.items[2].readStatus, "unread");
-    assert.equal(totalLimited.evidenceManifest.items[2].sourceReadStatus, "unread");
-    assert.equal(totalLimited.evidenceManifest.items[2].includedChars, 0);
-    assert.ok(totalLimited.evidenceManifest.items[2].coverageGaps.some((gap: string) => gap.includes("total_budget_skipped")));
-    assert.doesNotMatch(totalLimited.invocation.prompt, /UNREAD_TAIL_SENTINEL/u);
-    assert.ok(totalLimited.section.sourceChars > totalLimited.section.includedChars);
+    assert.equal(totalLimited.evidenceManifest.coverage.unreadAssets, 0);
+    assert.equal(totalLimited.evidenceManifest.coverage.completeAssets, 1);
+    assert.equal(totalLimited.evidenceManifest.items[2].readStatus, "complete");
+    assert.equal(totalLimited.evidenceManifest.items[2].sourceReadStatus, "complete");
+    assert.ok(totalLimited.evidenceManifest.items[2].includedChars > 0);
+    assert.ok(totalLimited.evidenceManifest.coverage.sourceChars > totalLimited.evidenceManifest.coverage.includedChars);
     assert.ok(totalLimited.evidenceManifest.coverage.includedChars <= 18000);
     assertRetained("required-total-budget");
-    console.log("PASS total budget: all three requested assets counted, two partial and final asset unread, source count exceeds included count, model PASS cannot clear lock/history");
+    console.log("PASS total budget: all three requested assets counted, short required original included before two partial large originals, preflight makes no model request and retains lock/history");
 
     await startCase("declared-range");
     const ranged = inspectResult("declared-range", await checkCase("declared-range", [{ path: rangedAsset, range: "2-3" }]));
@@ -589,17 +616,15 @@ try {
 
     await startCase("provider-truncated");
     process.env.MEMORY_STORE_GUARD_CODEX_PROMPT_BUDGET = "6500";
-    const provider = inspectResult("provider-truncated", await checkCase("provider-truncated", [{ path: providerAsset }]));
+    const provider = inspectPreflightResult("provider-truncated", await checkCase("provider-truncated", [{ path: providerAsset }]));
     assert.equal(provider.evidenceManifest.items[0].readStatus, "complete");
     assert.equal(provider.evidenceManifest.coverage.completeAssets, 1);
-    assert.equal(provider.section.preCompressedChars, 0);
-    assert.ok(provider.section.includedChars < provider.section.availableChars!);
-    assert.ok(provider.invocation.prompt.length <= 6500);
+    assert.ok(provider.result.promptBudget?.requiredGaps?.length || /预算|budget/iu.test(provider.result.summary));
     assert.equal(provider.result.passed, false);
     assert.equal(provider.result.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
     assert.match(provider.report, /\*\*结果\*\*: EVIDENCE_INSUFFICIENT/u);
     assertRetained("provider-truncated");
-    console.log("PASS provider compression: complete acquired asset becomes incomplete final model input; report and original PASS stay distinct");
+    console.log("PASS provider budget: complete acquired original cannot fit the selected provider, request is stopped before CLI with a readable evidence shortage report");
 
     await startCase("structured-rejection", "structured-rejection");
     const rejectedResponse = await checkCase("structured-rejection", [{ path: rangedAsset, range: "2-3" }]);
@@ -618,51 +643,39 @@ try {
     assertRetained("structured-rejection");
     console.log("PASS structured rejection: fixture writes -o PASS before declined event, bridge safely stops even without returned model text, exact command evidence retained and tool gives no chain/retry advice");
 
-    await startCase("locator-rejection", "structured-rejection");
-    const locating = await checkCase("locator-rejection", [], true);
-    const locatorTaskId = locating.match(/taskId:\s*([A-Za-z0-9._-]+)/)?.[1];
-    assert.ok(locatorTaskId, locating);
-    caseTaskIds.set("locator-rejection", locatorTaskId);
-    await waitForBackgroundTask(locatorTaskId, 10);
-    assert.equal(getBackgroundTask(locatorTaskId)?.status, "done");
-    const locatorResult = observed.get("locator-rejection")!;
-    assert.ok(locatorResult);
-    assert.equal(locatorResult.evidenceInsufficientReason, "COMMAND_REJECTED");
-    assert.equal(locatorResult.safetyStopped, true);
-    assert.equal(locatorResult.passed, false);
-    assert.equal(locatorResult.coverage?.confidence, "low");
-    assert.equal(locatorResult.promptBudget, undefined);
-    assert.deepEqual(progressStages.get("locator-rejection"), ["input", "locator"]);
-    const locatorCalls = invocations("locator-rejection");
-    assert.equal(locatorCalls.length, 1);
-    assert.match(locatorCalls[0].prompt, /受限定位器/u);
-    assert.ok(locatorCalls[0].prompt.includes("目标 Stage: locator-rejection"));
-    assert.equal(fs.existsSync(withinFixture(locatorCalls[0].outputPath)), false);
-    const locatorDiagnostic = locatorResult.codexDiagnostics!;
-    assert.ok(locatorDiagnostic?.manifestPath);
-    assert.equal(locatorDiagnostic.rejectedCommandCount, 1);
-    assert.equal(sha256(readArtifact(locatorDiagnostic.manifestPath)), locatorDiagnostic.manifestSha256);
-    assert.equal(diagnosticCallbacks.get("locator-rejection")?.length, 1);
-    assert.equal(diagnosticCallbacks.get("locator-rejection")?.[0].callId, locatorDiagnostic.callId);
-    assert.equal(locatorResult.codexDiagnosticAttempts?.length, 1);
-    const locatorManifest = JSON.parse(readArtifact(locatorDiagnostic.manifestPath));
-    assert.equal(locatorManifest.metadata.context.guardId, guardIds.get("locator-rejection"));
-    assert.equal(locatorManifest.metadata.context.stageId, "locator-rejection");
-    assert.equal(locatorManifest.metadata.context.childScopeId, "main");
-    assert.equal(locatorManifest.metadata.context.backgroundTaskId, locatorTaskId);
-    const locatorReport = readArtifact(locatorResult.reportPath!);
-    assert.ok(locatorReport.includes(`Guard Id: ${guardIds.get("locator-rejection")}`));
-    assert.ok(locatorReport.includes(locatorDiagnostic.manifestPath));
-    assert.match(locatorReport, /结果: EVIDENCE_INSUFFICIENT/u);
-    assert.match(locatorReport, /最终检查未发起/u);
-    const locatorPoll = await callTool("locator-rejection", { action: "check", taskId: locatorTaskId });
-    assert.ok(locatorPoll.includes(locatorResult.reportPath!));
-    assert.ok(locatorPoll.includes(locatorDiagnostic.manifestPath));
-    assert.equal(readBackgroundTaskDiagnostics(locatorTaskId)?.guardId, guardIds.get("locator-rejection"));
-    assert.equal(readBackgroundTaskDiagnostics(locatorTaskId)?.references[0].callId, locatorDiagnostic.callId);
-    assert.equal(invocations("locator-rejection").length, 1);
-    assertRetained("locator-rejection");
-    console.log("PASS locator rejection: absent scopeSelectors and nonmatching stage trigger low coverage, one real locator CLI rejection stops before evidence/final-model progress, final model calls=0, report/callback/original MCP task preserve the same guard identity");
+    await startCase("scope-preflight", "structured-rejection");
+    const scopeStarted = await checkCase("scope-preflight", [], true);
+    const scopeTaskId = scopeStarted.match(/taskId:\s*([A-Za-z0-9._-]+)/)?.[1];
+    assert.ok(scopeTaskId, scopeStarted);
+    caseTaskIds.set("scope-preflight", scopeTaskId);
+    await waitForBackgroundTask(scopeTaskId, 10);
+    assert.equal(getBackgroundTask(scopeTaskId)?.status, "done");
+    const scopeResult = observed.get("scope-preflight")!;
+    assert.ok(scopeResult);
+    assert.equal(scopeResult.evidenceInsufficientReason, "REQUIRED_EVIDENCE_INCOMPLETE");
+    assert.notEqual(scopeResult.safetyStopped, true);
+    assert.equal(scopeResult.passed, false);
+    assert.notEqual(scopeResult.coverage?.confidence, "high");
+    assert.ok(scopeResult.coverage?.requiredGaps?.some(gap => gap.includes("selected scope truncated")));
+    assert.equal(scopeResult.promptBudget, undefined);
+    assert.equal(scopeResult.codexDiagnostics, undefined);
+    assert.equal(scopeResult.rawResponse, "");
+    assert.deepEqual(progressStages.get("scope-preflight"), ["input"]);
+    assert.equal(invocations("scope-preflight").length, 0);
+    assert.equal(diagnosticCallbacks.get("scope-preflight")?.length || 0, 0);
+    const scopeReport = readArtifact(scopeResult.reportPath!);
+    assert.ok(scopeReport.includes(`Guard Id: ${guardIds.get("scope-preflight")}`));
+    assert.match(scopeReport, /结果: EVIDENCE_INSUFFICIENT/u);
+    assert.match(scopeReport, /未发起最终审核模型请求/u);
+    const scopeCalls = checkRunnerCalls;
+    const scopePoll = await callTool("scope-preflight", { action: "check", taskId: scopeTaskId });
+    assert.ok(scopePoll.includes(scopeResult.reportPath!));
+    assert.equal(checkRunnerCalls, scopeCalls);
+    assert.equal(readBackgroundTaskDiagnostics(scopeTaskId)?.guardId, guardIds.get("scope-preflight"));
+    assert.equal(readBackgroundTaskDiagnostics(scopeTaskId)?.references.length, 0);
+    assert.equal(invocations("scope-preflight").length, 0);
+    assertRetained("scope-preflight");
+    console.log("PASS scope preflight: selected scope truncation stops before locator/evidence/final-model progress, zero CLI calls and diagnostic references, repeated polling preserves the original background task and guard identity");
 
     await startCase("model-claim", "model-claim");
     const claimedResponse = await checkCase("model-claim", [{ path: rangedAsset, range: "2-3" }]);
@@ -754,7 +767,7 @@ try {
     assert.equal(conversationLoads, 0);
     assert.equal(checkRunnerCalls, 11);
     assert.equal(fs.readdirSync(temporaryDirectory).filter(name => name.startsWith("memory-store-codex-bridge-")).length, 0);
-    console.log("PASS Guard final coverage MCP integration: 11 real runGuardCheck/Fake CLI checks including locator rejection and cancelled/error late diagnostics; permanent Chinese plus space CLI path; no real model, research/history fetch, original rejected command, or production data used");
+    console.log("PASS Guard final coverage MCP integration: 11 real engine checks, 4 incomplete-input preflights without CLI and actual Fake CLI positive/rejection/cancel/timeout paths; permanent Chinese plus space CLI path; no real model, research/history fetch, original rejected command, or production data used");
     completed = true;
     }
     }

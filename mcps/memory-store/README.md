@@ -92,7 +92,7 @@ Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库�
 - **离线目录与压缩回溯 Recall** (v1.22.3+)：Windsurf/Antigravity 即使 IDE 与 Language Server 都关闭，也能从 active/implicit PB 元数据列出本地对话；五宿主 fetch cache generation 保存压缩边界元数据。`conversation_read_original(action="recall", recallMode="auto|manual|full")` 会先增量更新 fetch 缓存，再只从同一已提交 generation 恢复人类可见上下文；排除 thinking、工具结果、diff、Rules 注入和压缩摘要。`auto/manual` 继续遵守约 100K 分段交付，`full` 只返回带 SHA256 的临时文件。
 - **旧 fetch 缓存自动迁移** (v1.22.9+)：缓存格式升级为 `conversation-source-cache/v3`，首次访问旧 generation 时按原始来源单航班重建，确保自动事件移出人类轮后全局轮号与统计同步重排；搜索继续安全处理历史对象/数组字段。
 - **本地 PB 全量统计** (v1.22.5+)：Windsurf/Antigravity 的 fetch 缓存保存整段对话的 AI 回复与工具调用总数；范围读取继续显示全量统计，旧缓存缺少统计字段时首次访问自动重建。
-- **Record/Guard 缓存稳定性** (v1.22+)：Record 只使用已校验的不可变 fetch cache generation，不再回读可能达到 2GB 的原始对话文件；为保证 Phase 回滚正确性，会物化完整规范化缓存而非仅保存尾部。Stage Guard 的 `start` 以常数时间 O(1) 建立状态，遵守模型预算并保持稳定 `taskId`，让重试与恢复指向同一任务。
+- **Record/Guard 缓存稳定性** (v1.22+)：Record 只使用已校验的不可变 fetch cache generation，不再回读可能达到 2GB 的原始对话文件；为保证 Phase 回滚正确性，会物化完整规范化缓存而非仅保存尾部。Stage Guard 的 `start` 核验绑定的任务文件和缓存元数据，保持稳定 `taskId`，让重试与恢复指向同一任务。
 - **公开文档边界**：公开说明只覆盖可公开协议与行为；固定应用 key 属于本地 PB 格式兼容常量，不作为用户秘密。用户自定义覆盖值、真实样本以及执行 Plan/Task 不会进入 README、CHANGELOG 或 npm 发布包。
 - **Record 自动触发可靠性** (v1.10+)：MCP 退出时等待 pending Record 生成，阈值 5→3 轮
 - **Record Reader 读侧治理** (v1.12+)：Record markdown 仍是唯一事实源；新增 reader index、结构化 `read`、block 级 `search`、带来源 `guide`，支持只读 outline/state/outputs/phase 等局部内容，避免 70KB-100KB Record 每次整篇塞进上下文。
@@ -106,7 +106,7 @@ Devin 使用 Node.js 内置 SQLite，只读事务兼容正在写入的数据库�
 - **Codex list 快查止血与 deep_locate 骨架** (v1.13.0+)：Codex `conversation_read_original(list, mode="auto")` 收紧为标题/ID/工作区/Record/reader index/contextProbe 快查；query 未命中时不再自动读取多个超大 JSONL 原文预览，也不再自动触发 smart 模型搜索。新增 `deep_locate` 后台骨架，用 exact/fuzzy 流式扫描 Codex JSONL 来定位正文片段，支持进度、预算、partial hits 和取消入口；smart rerank、checkpoint/resume 与轻索引在后续阶段推进。
 - **Record superseded 环、list ID 排序与阶段 ETA 修复** (v1.13.1+)：Record 归属 sidecar 若出现 `A → B → A` 这类 superseded 互指环，不再把所有副本都隐藏，列表和搜索会继续按覆盖轮次、更新时间和大小选择最可信副本；`conversation_read_original(list)` 用完整 ID 查询时真实 ID 命中优先于标题正文提及；后台任务预计剩余时间改按当前阶段开始时间估算，避免把上一阶段耗时算入新阶段。
 - **Guard/Record 链路失败分类与旧 Phase 范围标题兼容** (v1.13.2+)：`stage_guard` 遇到模型链路不可用、Codex 模型桥退出等基础设施失败时返回“审查未完成”，不再计入未通过次数或触发三次失败裁定；Record Local Compose 解析兼容 `## Phase 1-36` / `## Phase 37-61` 这类旧压缩范围标题，避免把范围起点误当 Phase 编号导致 `1 -> 37` 跳号。
-- **Stage Guard 索引驱动分段取证** (v1.13.4+)：`stage_guard(check)` 不再全量吞入超长 Plan/Task/Record；会按 `stageId`、标题、头部规则、尾部、小本本和证据窗口抽取局部内容，并固定注入命令、报告、run/obs ID、文件路径等证据清单。coverage 不足、锚点缺失或截断风险会返回“证据不足/未完成”，不计入未通过次数。
+- **Stage Guard 范围与证据预算** (v1.26.1+)：按明确绑定的目标路径和阶段提取当前要求及适用全局规则，必需原件优先，正文与包装成本分别记录；参考聊天和真实缺证据分别处理。使用方法见[单轮Guard审查](docs/stage-guard.md)。
 - **Record 正文覆盖自愈** (v1.13.6+)：`record_manage(update)` 会校验旧 Record 正文实际覆盖轮次与索引 `lastUpdatedRound` 是否一致；若索引声称 97 轮但正文只覆盖 3 轮，会先向下修正索引并从未覆盖轮次继续生成。`force=true` 对单个 update 生效，会绕过“已是最新”短路；v1.15.14 起旧 Record 可解析时默认保留稳定 Phase、回滚尾部并继续合成，结构化 read 会提示正文/索引覆盖不一致。
 - **RecordPatch 检查点与中文格式自愈** (v1.13.6+)：并行 Record 生成会把成功的 map / compress 中间 `RecordPatch` 写入检查点；后续重试可复用已完成区段，只隔离 timeout / failed / invalid 节点。Record 解析兼容旧 `Rounds X-Y`，写入前会把 Phase 标题规范为中文“轮次 X-Y”，避免英文格式漂移导致覆盖误判。
 - **Stage Guard 外部证据索引** (v1.13.7+)：`stage_guard(check)` 新增 `evidenceFiles` / `evidenceAssets` / `evidenceIndexMode`；PDF、Word、Excel、EPUB、图片、视频和复杂文件会先生成带 artifactPath/warnings 的纯文本索引，再进入 Guard prompt。索引走临时文件协议和大小校验，避免大文件、大 stdout 或完整二进制内容堆进主进程内存。
@@ -350,6 +350,8 @@ Antigravity LS 模型默认值：`MEMORY_STORE_LS_MODEL` 未设置时使用 `MOD
 
 ### Stage Guard 调用约束
 
+有Plan/Task的工程在 `start` 时同时传入 `planFiles`、`taskFiles` 的完整绝对路径和具体 `stageId`。工具先核文件可读性和阶段范围，再建立或替换Guard；检查时回显绑定路径，显式传入的目标须与原注册一致。单文件小任务可只传 `taskFiles`，旧注册的身份和恢复记录继续保留。完整示例及预算字段见[单轮Guard审查](docs/stage-guard.md)。
+
 Guard 分别记录材料读取、索引序列化和最终模型输入的覆盖情况。外部材料默认是必需证据；`role="reference|context|optional"` 表示参考材料，`range` 则限定本次要求读取的范围。必需材料未读、执行原文缺失或必需内容被裁剪时，即使模型返回 PASS，程序仍保留 `EVIDENCE_INSUFFICIENT` 与原始模型回复。参考材料的缺口单独显示，完整保留的必需材料按其实际内容验收。
 
 长对话可在明确提供必需外部材料时，显式设置 `executionEvidenceRole="reference"`，让本次验收以完整的必需材料为依据，对话执行记录的缺口继续展示。默认值为 `required`；缺少必需外部材料时，参考设置会返回证据不足。该角色随后台任务保存，恢复后沿用原要求。
@@ -387,7 +389,7 @@ v1.20.0 的 `force × stale_only` 批量候选矩阵如下；四类候选先完�
 
 `stage_guard(action="cancel")` 会按完整 GuardKey 选择目标并按 `guardId` 精确移除锁块；若候选不唯一则要求补充 stageId/childScopeId。取消已经启动的后台 Guard check 或其它 task-backed 任务应使用 `background_task_cancel(taskId)`；`record_manage(action="cancel")` 与 `conversation_read_original(action="deep_locate_cancel")` 只是兼容入口。
 
-Stage Guard 从 v1.13.4 起使用索引驱动分段取证：超长 `Task.md` / `Plan_x.md` 会先按当前 `stageId`、标题、头部规则、尾部、“待复核/小本本”和证据窗口裁剪；Record 使用 Reader 的 state/outputs/verification/risks 局部视图加少量锚点窗口；对话原文只保留从 Guard 开始轮次之后的工具结果、文件编辑、命令输出等高证据片段。工具会生成 coverage / evidence manifest 临时文件；若定位不到当前阶段、证据被截断或覆盖不足，返回“证据不足/审查未完成”，不累计 Guard 失败次数。
+Stage Guard 按绑定的当前阶段及明确适用的全局要求提取Plan/Task，标题段落和Plan表格共用阶段身份，代码示例及Guard锁块从要求中排除。命令清单和辅助定位沿用同一范围；阶段缺失或歧义会给出具体缺项。Record 使用 Reader 的 state/outputs/verification/risks 局部视图，对话原文保留从Guard开始轮次之后的执行片段。工具生成coverage及证据清单，定位或必需覆盖不足时返回“证据不足/审查未完成”，不累计Guard失败次数。
 
 Stage Guard 从 v1.13.7 起支持外部证据文件索引：
 
