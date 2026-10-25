@@ -822,6 +822,7 @@ export function compactContent(content: string, mode: OutputMode = "compact"): s
 // ===== safePageEvaluate：导航安全的 page.evaluate 封装 =====
 
 import type { Page } from "playwright-core";
+import { readDuringNavigation } from './navigation-read.js';
 
 /**
  * 安全执行 page.evaluate，在遇到 "Execution context was destroyed" 时
@@ -838,45 +839,12 @@ export async function safePageEvaluate<T>(
     args?: any,
     maxRetries = 2,
 ): Promise<T> {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            return args !== undefined
-                ? await page.evaluate(fn, args)
-                : await page.evaluate(fn);
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            if (msg.includes('context was destroyed') || msg.includes('Execution context')) {
-                if (attempt < maxRetries) {
-                    // 等待导航稳定后重试
-                    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-                    await page.waitForTimeout(500);
-                    continue;
-                }
-            }
-            throw error;
-        }
-    }
-    throw new Error('safePageEvaluate: unreachable');
+    return readDuringNavigation(page, () => args !== undefined ? page.evaluate(fn, args) : page.evaluate(fn), { phase: 'content.evaluate', maxRetries });
 }
 
 /**
  * 安全执行 page.content()，在遇到 context destroyed 时自动等待并重试
  */
 export async function safePageContent(page: Page, maxRetries = 2): Promise<string> {
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            return await page.content();
-        } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error);
-            if (msg.includes('context was destroyed') || msg.includes('Execution context')) {
-                if (attempt < maxRetries) {
-                    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-                    await page.waitForTimeout(500);
-                    continue;
-                }
-            }
-            throw error;
-        }
-    }
-    throw new Error('safePageContent: unreachable');
+    return readDuringNavigation(page, () => page.content(), { phase: 'content.html', maxRetries });
 }

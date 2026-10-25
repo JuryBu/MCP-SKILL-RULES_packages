@@ -68,7 +68,7 @@ const HEARTBEAT_BROWSER_TIMEOUT = 20 * 60 * 1000; // 20 分钟无活动 → 关�
 // 创建 MCP Server 实例
 const server = new McpServer({
     name: "web-fetcher-mcp-server",
-    version: "7.3.2",
+    version: "7.3.3",
 });
 
 // 注册所有工具
@@ -164,6 +164,12 @@ server.registerResource(
             "- 新 Cookie 会同步到已有浏览器上下文，旧状态不能覆盖更新的备份；localStorage 按 origin 隔离并在新导航恢复，不自动刷新用户现有页面。纯 localStorage 登录不要求 Cookie 数量大于零。",
             "- 主 context 与 bareContext 在 close/closeBrowser 时都会关闭并清理 profile。",
             "",
+            "## 跳转中的安全读取（7.3.3）",
+            "",
+            "- 正文、HTML和就绪采样遇到文档切换时，在原请求总期限内最多恢复两次；重新获取当前文档/选择器，文档变化后重置稳定窗口，稳定页不增加固定恢复等待。",
+            "- 读取失败的_meta.webFetcherReadFailure包含code、phase、requestedUrl、finalUrl、retries和cause；先核实际阶段和最终页面，挑战与登录状态仍看pageAccess，humanAssistance=never保持不开窗。",
+            "- 自动恢复仅用于内部读取，不重放用户点击、输入、提交或任意evaluate；截图继续等待图片、字体和懒加载，partial仍说明未完成范围。",
+            "",
             "## 空闲休眠与自动唤醒（7.3.2）",
             "",
             "- 非Antigravity LS后端一小时没有工具调用且没有正在处理的请求时，按现有规则退出释放资源；共享broker收到下一次调用会按需启动。20分钟浏览器空闲回收保持不变。",
@@ -228,7 +234,7 @@ server.registerResource(
         contents: [
             {
                 uri: "web-fetcher://test/hello",
-                text: "MCP Web Fetcher v7.3.2 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
+                text: "MCP Web Fetcher v7.3.3 - Resource 机制正常\n\n可用于将抓取结果存储为 resource，AI 按需读取。",
                 mimeType: "text/plain",
             },
         ],
@@ -331,7 +337,7 @@ async function heartbeatCheck(): Promise<void> {
 
 // 启动 stdio 传输
 async function main(): Promise<void> {
-    console.error(`[web-fetcher] MCP Server v7.3.2 启动中... (ppid=${process.ppid})`);
+    console.error(`[web-fetcher] MCP Server v7.3.3 启动中... (ppid=${process.ppid})`);
     logStdinEvent("STARTED");
 
     // 清理遗留的临时目录（防止意外中断导致堆积）
@@ -365,7 +371,7 @@ async function main(): Promise<void> {
     await server.connect(transport);
     runtimeLifecycle.ready();
 
-    console.error(`[web-fetcher] MCP Server v7.3.2 已启动，绑定父 LS PID=${process.ppid}`);
+    console.error(`[web-fetcher] MCP Server v7.3.3 已启动，绑定父 LS PID=${process.ppid}`);
     logStdinEvent(`BOUND to parent LS PID=${process.ppid}`);
 
     // === 非 LS 环境兜底超时 ===

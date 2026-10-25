@@ -1,8 +1,11 @@
 import { z } from "zod";
+import type { Page } from 'playwright';
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
 import { CHARACTER_LIMIT, appendTiming } from "../constants.js";
 import { touchActivity } from "../lifecycle.js";
+import { readDuringNavigation, pageReadFailure, formatPageReadFailure } from '../navigation-read.js';
+import { assertPageAccessible, readFinalPageAccess } from '../page-access.js';
 
 const FetchHtmlInputSchema = z.object({
     url: z
@@ -65,7 +68,7 @@ export function registerFetchHtml(server: McpServer): void {
         async (params: FetchHtmlInput) => {
             touchActivity();
             const startTime = Date.now();
-            let page;
+            let page: Page | undefined;
             try {
                 page = await browserManager.navigateTo(params.url, {
                     waitFor: params.selector,
@@ -73,25 +76,18 @@ export function registerFetchHtml(server: McpServer): void {
                     scrollCount: params.scrollCount,
                 });
 
-                let html: string;
-
-                if (params.selector) {
-                    const element = await page.$(params.selector);
-                    if (!element) {
-                        return {
-                            isError: true,
-                            content: [
-                                {
-                                    type: "text" as const,
-                                    text: `未找到选择器 "${params.selector}" 匹配的元素`,
-                                },
-                            ],
-                        };
-                    }
-                    html = await element.evaluate((el) => el.outerHTML);
-                } else {
-                    html = await page.content();
+                const snapshot = await readDuringNavigation(page, async () => {
+                    const html = params.selector
+                        ? await page!.locator(params.selector).first().evaluateAll((elements: Element[]) => elements[0]?.outerHTML ?? null)
+                        : await page!.content();
+                    const access = await readFinalPageAccess(page, { url: params.url, waitFor: params.selector });
+                    return { html, access };
+                }, { phase: params.selector ? 'html.selector' : 'html.content' });
+                await assertPageAccessible(page, { url: params.url, waitFor: params.selector }, snapshot.access);
+                if (snapshot.html === null) {
+                    return { isError: true, content: [{ type: 'text' as const, text: `未找到选择器 "${params.selector}" 匹配的元素` }] };
                 }
+                let html = snapshot.html;
 
                 // 截断过长内容
                 if (html.length > CHARACTER_LIMIT) {
@@ -109,16 +105,16 @@ export function registerFetchHtml(server: McpServer): void {
                     ],
                 }, startTime, browserManager.lastRetryCount);
             } catch (error) {
-                const message =
-                    error instanceof Error ? error.message : String(error);
+                const failure = pageReadFailure(error, 'html.navigation', params.url, page?.url());
                 return {
                     isError: true,
                     content: [
                         {
                             type: "text" as const,
-                            text: `获取 HTML 失败: ${message}`,
+                            text: `获取 HTML 失败: ${formatPageReadFailure(failure)}`,
                         },
                     ],
+                    _meta: { webFetcherReadFailure: failure },
                 };
             } finally {
                 if (page) {

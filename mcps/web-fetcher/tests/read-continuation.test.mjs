@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { EventEmitter } from "node:events";
 import { test } from "node:test";
 import sharp from "sharp";
 import { browserManager } from "../src/browser.ts";
@@ -31,7 +32,13 @@ function fakePage() {
         isClosed: () => false,
         content: async () => html,
         title: async () => "Readable article",
-        evaluate: async callback => String(callback).includes('querySelectorAll("iframe")') ? [] : null,
+        evaluate: async callback => {
+            const source = String(callback);
+            if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
+            if (source.includes('scriptUrls:')) return { title: 'Readable article', visibleText: 'Useful article content. '.repeat(24), html, readyState: 'complete', scriptUrls: [], iframeUrls: [], hasPasswordInput: false, hasBusinessForm: false, hasVisualContent: false };
+            if (source.includes('documentVersion:')) return { title: 'Readable article', documentVersion: 1 };
+            return null;
+        },
         screenshot: async () => { shots += 1; return jpeg; },
         viewportSize: () => ({ width: 1280, height: 720 }),
         close: async () => { closes += 1; },
@@ -113,5 +120,128 @@ test("old challenge cache is invalidated before ai_summary, but ordinary short c
     } finally {
         pageCache.clear();
         browserManager.navigateTo = originalNavigate;
+    }
+});
+
+for (const filename of ["report.pdf", "report.odt"]) {
+    test("local " + filename + " keeps its original filename when pdf.js renders about:blank", async () => {
+        const originalNavigate = browserManager.navigateTo;
+        const originalCheck = browserManager.checkAndHandleVerification;
+        const requestedUrl = "file:///C:/fixtures/" + filename;
+        const documentText = "Original local document text. ".repeat(24);
+        const page = fakePage();
+        let navigations = 0;
+        let postSnapshotChecks = 0;
+        page.url = () => "about:blank";
+        page.evaluate = async callback => {
+            const source = String(callback);
+            if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
+            if (source.includes("__mcpPdfInfo")) return { texts: { 1: documentText }, totalPages: 1 };
+            if (source.includes("documentVersion:")) return { title: "", documentVersion: 1 };
+            if (source.includes("scriptUrls:")) return {
+                title: "", visibleText: "", html: "<canvas></canvas>", readyState: "complete",
+                scriptUrls: [], iframeUrls: [], hasPasswordInput: false, hasBusinessForm: false, hasVisualContent: true,
+            };
+            return null;
+        };
+        try {
+            pageCache.clear();
+            browserManager.navigateTo = async actualUrl => {
+                assert.equal(actualUrl, requestedUrl);
+                navigations++;
+                return page;
+            };
+            browserManager.checkAndHandleVerification = async () => {
+                postSnapshotChecks++;
+                return page;
+            };
+            const result = await tool(registerFetchPage).callback({ url: requestedUrl, outputMode: "full" });
+            assert.equal(result.isError, undefined, text(result));
+            assert.ok(text(result).startsWith("# " + filename + "\n"), text(result));
+            assert.match(text(result), /Original local document text/);
+            assert.doesNotMatch(text(result), /# about:blank/);
+            assert.equal(navigations, 1);
+            assert.equal(postSnapshotChecks, 0);
+            assert.equal(page.closes, 1);
+        } finally {
+            pageCache.clear();
+            browserManager.navigateTo = originalNavigate;
+            browserManager.checkAndHandleVerification = originalCheck;
+        }
+    });
+}
+
+test("HTTP content uses its frozen final URL after another document commits", async () => {
+    const originalNavigate = browserManager.navigateTo;
+    const originalCheck = browserManager.checkAndHandleVerification;
+    const requestedUrl = "https://example.test/short";
+    const finalUrl = "https://example.test/articles/2026/entry";
+    const lateUrl = "https://example.test/after-snapshot/another";
+    const linkedHtml = html.replace("</article>", '<p><a href="../related">Related page</a></p></article>');
+    const frame = {};
+    const page = new EventEmitter();
+    let currentUrl = finalUrl;
+    let contentRead = false;
+    let commitsAfterSnapshot = 0;
+    let postSnapshotUrlReads = 0;
+    let postSnapshotChecks = 0;
+    let closes = 0;
+    const removeListener = page.off.bind(page);
+    page.off = (event, listener) => {
+        removeListener(event, listener);
+        if (event === "framenavigated" && contentRead && commitsAfterSnapshot === 0 && page.listenerCount(event) === 0) {
+            currentUrl = lateUrl;
+            commitsAfterSnapshot++;
+            page.emit("framenavigated", frame);
+        }
+        return page;
+    };
+    Object.assign(page, {
+        url: () => {
+            if (commitsAfterSnapshot) postSnapshotUrlReads++;
+            return currentUrl;
+        },
+        mainFrame: () => frame,
+        isClosed: () => false,
+        waitForLoadState: async () => {},
+        close: async () => { closes++; },
+        content: async () => { contentRead = true; return linkedHtml; },
+        evaluate: async callback => {
+            const source = String(callback);
+            if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
+            if (source.includes("__mcpPdfInfo")) return null;
+            if (source.includes("documentVersion:")) return { title: "Readable article", documentVersion: 1 };
+            if (source.includes("scriptUrls:")) return {
+                title: "Readable article", visibleText: "Useful article content. ".repeat(24), html: linkedHtml,
+                readyState: "complete", scriptUrls: [], iframeUrls: [], hasPasswordInput: false,
+                hasBusinessForm: false, hasVisualContent: false,
+            };
+            return null;
+        },
+    });
+    try {
+        pageCache.clear();
+        browserManager.navigateTo = async actualUrl => {
+            assert.equal(actualUrl, requestedUrl);
+            return page;
+        };
+        browserManager.checkAndHandleVerification = async () => {
+            postSnapshotChecks++;
+            return page;
+        };
+        const result = await tool(registerFetchPage).callback({ url: requestedUrl, outputMode: "full" });
+        assert.equal(result.isError, undefined, text(result));
+        assert.match(text(result), /\[Related page\]\(https:\/\/example\.test\/articles\/related\)/);
+        assert.doesNotMatch(text(result), /after-snapshot/);
+        assert.equal(commitsAfterSnapshot, 1);
+        assert.equal(postSnapshotUrlReads, 0);
+        assert.equal(postSnapshotChecks, 0);
+        assert.match(pageCache.get(requestedUrl), /https:\/\/example\.test\/articles\/related/);
+        assert.equal(page.listenerCount("framenavigated"), 0);
+        assert.equal(closes, 1);
+    } finally {
+        pageCache.clear();
+        browserManager.navigateTo = originalNavigate;
+        browserManager.checkAndHandleVerification = originalCheck;
     }
 });

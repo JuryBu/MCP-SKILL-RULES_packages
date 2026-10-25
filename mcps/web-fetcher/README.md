@@ -44,6 +44,12 @@
 
 `npm run runtime:status` 只读查看保存的状态，不启动后端。连接后可通过 `web_list_sessions` 或资源 `web-fetcher://runtime` 获取诊断；确认为空闲退出后的首个成功工具结果会附带一次简短唤醒提示和后端启动耗时。缺失记录、启动失败和未知退出分别呈现，详见 [docs/7.3.2-runtime-status.md](docs/7.3.2-runtime-status.md)。
 
+### 7.3.3 跳转中的安全读取
+
+正文、HTML 和就绪检查在页面切换文档时，会重新读取当前文档，最多恢复两次，始终受原请求总期限、取消和页面关闭约束。正常稳定页面不增加固定恢复等待，截图仍检查图片、字体和懒加载。
+
+读取失败时，文本和 `_meta.webFetcherReadFailure` 提供阶段、原地址、最终地址和恢复次数。恢复只用于内部页面采样；用户点击、输入、提交和任意 `evaluate` 不自动重放。验证码、登录和访问权限继续按原机制处理，`humanAssistance="never"` 保持不开窗。详见 [docs/7.3.3-navigation-reads.md](docs/7.3.3-navigation-reads.md)。
+
 | 工具名 | 功能 |
 |--------|------|
 | `web_fetch_page` | 抓取网页/本地文档正文，返回 Markdown（支持 EPUB 与 ai_summary 智能摘要模式） |

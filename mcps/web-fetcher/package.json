@@ -1,6 +1,6 @@
 {
   "name": "web-fetcher-mcp-server",
-  "version": "7.3.2",
+  "version": "7.3.3",
   "description": "MCP Server - 使用已登录浏览器 Cookie 抓取网页内容",
   "type": "module",
   "main": "dist/index.js",
@@ -25,7 +25,9 @@
     "test:contract": "npm run build && node --test tests/release-contract.test.mjs",
     "test:verification": "node --import tsx --test --test-concurrency=1 tests/page-access.test.mjs tests/background-lifecycle.test.mjs tests/read-continuation.test.mjs tests/assisted-ownership.test.mjs",
     "test:verification:browser": "node --test tests/assisted-continuation-http.test.mjs",
-    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:runtime-status && node --test tests/inspection-runtime-assets.test.mjs"
+    "test:navigation": "node --import tsx --test --test-concurrency=1 tests/navigation-read.test.mjs tests/navigation-read-lease.test.mjs tests/readiness-navigation-budget.test.mjs",
+    "test:navigation:browser": "node --import tsx --test --test-concurrency=1 tests/navigation-read-browser.test.mjs",
+    "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:navigation && npm run test:runtime-status && node --test tests/inspection-runtime-assets.test.mjs"
   },
   "engines": {
     "node": ">=18"

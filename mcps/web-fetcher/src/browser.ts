@@ -46,7 +46,9 @@ import { getRequestContext, getActiveRequestCount, remainingRequestMs, throwIfRe
 import { PageAdmissionController, type PageLease } from './page-admission.js';
 import { getRuntimeMemorySampler } from './memory-sampler.js';
 import { applyExplicitViewport, assertViewportTarget, type ResponsiveViewport } from './viewport.js';
-import { assertPageAccessible } from './page-access.js';
+import { assertPageAccessible, PageAccessError } from './page-access.js';
+import { readDuringNavigation, isNavigationReadError, NavigationReadError, pageReadFailure } from './navigation-read.js';
+import { RequestAdmissionError } from './request-context.js';
 
 function readPositiveIntEnv(name: string, fallback: number): number {
     const raw = process.env[name];
@@ -800,7 +802,7 @@ class BrowserManager {
         // WAF 拦截的典型表现：返回完全空白的 HTML（如 <html><head></head><body></body></html>）
         // 降级策略：Level 3 → Level 1，清除 Cookie 后用裸奔模式重试
             const domainForStealth = this.extractDomain(url);
-            const isWafBlocked = await page.evaluate(() => {
+            const isWafBlocked = await readDuringNavigation(page, () => page.evaluate(() => {
             const html = document.documentElement?.outerHTML || '';
             const bodyText = (document.body?.innerText || '').trim();
             const title = (document.title || '').trim();
@@ -812,7 +814,7 @@ class BrowserManager {
                 if (/\b(400|403|412)\b/.test(combined) && /bad request|forbidden|precondition/i.test(combined)) return true;
             }
             return false;
-            }).catch(() => false);
+            }), { phase: 'navigation.waf-probe' });
 
             if (isWafBlocked && !this.domainStealthLevel.has(domainForStealth)) {
             // v6.4 双 context 架构：WAF 拦截后，标记域名 → 用裸奔 context 重试
@@ -866,8 +868,10 @@ class BrowserManager {
                 throw error;
             }
         } catch (error) {
+            const failure = error instanceof PageAccessError || error instanceof RequestAdmissionError
+                ? error : new NavigationReadError(pageReadFailure(error, 'navigation', url, page.url()));
             await this.closeFailedPage(page, "navigation-error");
-            throw error;
+            throw failure;
         }
     }
 
@@ -1077,8 +1081,10 @@ class BrowserManager {
     async scrollPage(page: Page, count: number, direction: 'up' | 'down' = 'down'): Promise<void> {
         for (let i = 0; i < count; i++) {
             try {
-                const prevScroll = await page.evaluate(() => window.scrollY);
-                const prevHeight = await page.evaluate(() => document.body.scrollHeight);
+                throwIfRequestExpired();
+                const previous = await readDuringNavigation(page, () => page.evaluate(() => ({ scroll: window.scrollY, height: document.body.scrollHeight })), { phase: 'scroll.before' });
+                const prevScroll = previous.scroll;
+                const prevHeight = previous.height;
 
                 if (direction === 'up') {
                     // v6.8: 向上滚动 — 用于加载 SPA 页面顶部的懒加载内容
@@ -1093,8 +1099,9 @@ class BrowserManager {
 
                 await waitForPageReadiness(page, { mode: 'content', maxWait: 4000, minimumObserveMs: 1000 });
 
-                const newScroll = await page.evaluate(() => window.scrollY);
-                const newHeight = await page.evaluate(() => document.body.scrollHeight);
+                const current = await readDuringNavigation(page, () => page.evaluate(() => ({ scroll: window.scrollY, height: document.body.scrollHeight })), { phase: 'scroll.after' });
+                const newScroll = current.scroll;
+                const newHeight = current.height;
 
                 console.error(
                     `[web-fetcher] 滚动${direction === 'up' ? '↑' : '↓'} ${i + 1}/${count}，scrollY: ${prevScroll} → ${newScroll}，页面高度: ${prevHeight} → ${newHeight}`
@@ -1106,12 +1113,10 @@ class BrowserManager {
                     break;
                 }
             } catch (error) {
-                const msg = error instanceof Error ? error.message : String(error);
-                if (msg.includes('context was destroyed') || msg.includes('Execution context')) {
-                    console.error(`[web-fetcher] 滚动 ${i + 1}/${count} 时页面发生导航，等待稳定后继续`);
-                    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => { });
-                    await page.waitForTimeout(1000);
-                    break;
+                if (isNavigationReadError(error)) {
+                    console.error(`[web-fetcher] 滚动 ${i + 1}/${count} 时页面发生导航，等待当前文档后处理下一步`);
+                    await waitForPageReadiness(page, { mode: 'content', maxWait: Math.min(4000, remainingRequestMs()), minimumObserveMs: 500 });
+                    continue;
                 }
                 throw error;
             }

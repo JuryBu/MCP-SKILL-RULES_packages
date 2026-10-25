@@ -1,6 +1,7 @@
 import type { Page } from 'playwright';
 import { performance } from 'node:perf_hooks';
 import { remainingRequestMs, throwIfRequestExpired, withRequestStage } from './request-context.js';
+import { isNavigationReadError, NavigationReadError, readDuringNavigation } from './navigation-read.js';
 
 export interface ReadinessResult {
     waited: number;
@@ -34,16 +35,22 @@ async function pause(duration: number): Promise<void> {
     throwIfRequestExpired();
 }
 
-async function primeLazyImages(page: Page, deadline: number): Promise<boolean> {
-    const original = await page.evaluate(() => ({ x: scrollX, y: scrollY, height: innerHeight }));
+async function primeLazyImages(page: Page, deadline: number): Promise<{ complete: boolean; documentVersion: number }> {
+    const remaining = Math.max(0, deadline - performance.now());
+    const workDeadline = deadline - Math.min(250, remaining / 4);
+    const original = await readDuringNavigation(page, () => page.evaluate(() => ({ x: scrollX, y: scrollY, height: innerHeight, documentVersion: performance.timeOrigin })), { phase: 'readiness.visual.scroll-state', timeoutMs: Math.max(0, workDeadline - performance.now()) });
     let reachedBottom = false;
+    let moved = false;
+    let restored = false;
     try {
-        for (let step = 0; step < 30 && performance.now() + 100 < deadline; step++) {
+        for (let step = 0; step < 30 && performance.now() + 100 < workDeadline; step++) {
             const position = step * Math.max(200, original.height - 80);
-            const result = await page.evaluate(top => {
+            moved = true;
+            const result = await readDuringNavigation(page, () => page.evaluate(top => {
                 window.scrollTo({ top, behavior: 'instant' as ScrollBehavior });
-                return { bottom: scrollY + innerHeight, height: document.documentElement.scrollHeight };
-            }, position);
+                return { bottom: scrollY + innerHeight, height: document.documentElement.scrollHeight, documentVersion: performance.timeOrigin };
+            }, position), { phase: 'readiness.visual.lazy-scroll', maxRetries: 0, timeoutMs: Math.max(0, workDeadline - performance.now()) });
+            if (result.documentVersion !== original.documentVersion) break;
             await pause(80);
             if (result.bottom >= result.height - 2) {
                 reachedBottom = true;
@@ -51,11 +58,16 @@ async function primeLazyImages(page: Page, deadline: number): Promise<boolean> {
             }
         }
     } finally {
-        if (!page.isClosed()) {
-            await page.evaluate(position => window.scrollTo({ left: position.x, top: position.y, behavior: 'instant' as ScrollBehavior }), original);
+        throwIfRequestExpired();
+        if (moved && !page.isClosed() && performance.now() < deadline) {
+            await readDuringNavigation(page, () => page.evaluate(position => {
+                if (performance.timeOrigin === position.documentVersion) window.scrollTo({ left: position.x, top: position.y, behavior: 'instant' as ScrollBehavior });
+            }, original), { phase: 'readiness.visual.restore-scroll', maxRetries: 0, timeoutMs: Math.max(0, deadline - performance.now()) }).then(() => { restored = true; }).catch(error => {
+                if (!isNavigationReadError(error) && !(error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout')) throw error;
+            });
         }
     }
-    return reachedBottom;
+    return { complete: reachedBottom && (!moved || restored), documentVersion: original.documentVersion };
 }
 
 export async function waitForPageReadiness(page: Page, options: ReadinessOptions): Promise<ReadinessResult> {
@@ -66,8 +78,18 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
         const deadline = started + budget;
         const minimumObserve = options.minimumObserveMs ?? (options.mode === 'visual' ? 1500 : 500);
         const quietMs = options.quietMs ?? (options.mode === 'visual' ? 500 : 350);
-        const lazyComplete = options.mode !== 'visual' || !options.fullPage
-            || await primeLazyImages(page, Math.min(deadline, started + Math.min(3000, budget / 3)));
+        let lazyComplete = options.mode !== 'visual' || !options.fullPage;
+        let lazyDocumentVersion: number | undefined;
+        if (!lazyComplete) {
+            try {
+                const primed = await primeLazyImages(page, Math.min(deadline, started + Math.min(3000, budget / 3)));
+                lazyComplete = primed.complete;
+                lazyDocumentVersion = primed.documentVersion;
+            }
+            catch (error) {
+                if (!isNavigationReadError(error) && !(error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout')) throw error;
+            }
+        }
         let lastSignature = '';
         let stableSince = performance.now();
         let final: ReadinessResult = {
@@ -76,7 +98,7 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
         };
         while (performance.now() < deadline) {
             throwIfRequestExpired();
-            const snapshot = await page.evaluate(({ visual, fullPage }) => {
+            const sampling = readDuringNavigation(page, () => page.evaluate(({ visual, fullPage }) => {
                 const probeKey = '__webFetcherVisualProbes_v1';
                 const host = window as typeof window & { [probeKey]?: Map<string, HTMLImageElement> };
                 const probes = host[probeKey] ??= new Map<string, HTMLImageElement>();
@@ -188,9 +210,31 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
                     total, ready, failed, pending: total - ready - failed,
                     fontsReady,
                     scanLimited, meaningful, uninspectedFrames, primaryBusy, emptyRoot,
-                    signature: `${primaryBusy}|${emptyRoot}|${nodes.length + frameNodes.length}|${text.length + frameTextLength}|${text.slice(0, 300)}|${text.slice(-100)}|${total}|${ready}|${failed}|${layout.join(';')}`,
+                    documentVersion: performance.timeOrigin, documentAgeMs: performance.now(),
+                    signature: `${performance.timeOrigin}|${location.href}|${primaryBusy}|${emptyRoot}|${nodes.length + frameNodes.length}|${text.length + frameTextLength}|${text.slice(0, 300)}|${text.slice(-100)}|${total}|${ready}|${failed}|${layout.join(';')}`,
                 };
-            }, { visual: options.mode === 'visual', fullPage: !!options.fullPage });
+            }, { visual: options.mode === 'visual', fullPage: !!options.fullPage }), { phase: `readiness.${options.mode}.sample`, timeoutMs: Math.max(0, deadline - performance.now()) });
+            let snapshot: Awaited<typeof sampling>;
+            try { snapshot = await sampling; }
+            catch (error) {
+                if (error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout' && performance.now() >= deadline) break;
+                throw error;
+            }
+            if (options.mode === 'visual' && options.fullPage && lazyDocumentVersion !== snapshot.documentVersion) {
+                lazyComplete = false;
+                if (performance.now() + 300 < deadline) {
+                    try {
+                        const primed = await primeLazyImages(page, Math.min(deadline, performance.now() + 3000));
+                        lazyComplete = primed.complete;
+                        lazyDocumentVersion = primed.documentVersion;
+                    } catch (error) {
+                        if (!isNavigationReadError(error) && !(error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout')) throw error;
+                    }
+                    lastSignature = '';
+                    stableSince = performance.now();
+                    continue;
+                }
+            }
             const now = performance.now();
             if (snapshot.signature !== lastSignature) {
                 lastSignature = snapshot.signature;
@@ -199,7 +243,7 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
             const settled = options.mode === 'visual'
                 ? snapshot.pending === 0 && snapshot.fontsReady && !snapshot.primaryBusy && !snapshot.emptyRoot
                 : snapshot.meaningful && snapshot.pending === 0;
-            const stable = now - stableSince >= quietMs && now - started >= minimumObserve;
+            const stable = now - stableSince >= quietMs && now - started >= minimumObserve && snapshot.documentAgeMs >= minimumObserve;
             final = {
                 waited: Math.round(now - started), total: snapshot.total, ready: snapshot.ready,
                 pending: snapshot.pending, failed: snapshot.failed, fontsReady: snapshot.fontsReady,

@@ -34,9 +34,9 @@ test('real server advertises additive 7.3 tool and resource contracts', { timeou
         assert.equal(await fs.readFile(path.join(recentVideo, 'sentinel.txt'), 'utf8'), marker);
         assert.equal(await fs.readFile(path.join(unrelatedDirectory, 'sentinel.txt'), 'utf8'), marker);
         await assert.rejects(fs.stat(staleVideo), { code: 'ENOENT' });
-        assert.equal(client.getServerVersion()?.version, '7.3.2');
+        assert.equal(client.getServerVersion()?.version, '7.3.3');
         const hello = await client.readResource({ uri: 'web-fetcher://test/hello' });
-        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.2')));
+        assert.ok(hello.contents.some(item => item.text?.includes('v7.3.3')));
         const listed = await client.listTools();
         assert.equal(listed.tools.length, 33);
         const byName = new Map(listed.tools.map(tool => [tool.name, tool]));

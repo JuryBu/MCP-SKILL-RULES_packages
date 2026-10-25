@@ -1,11 +1,14 @@
 import { z } from "zod";
+import type { Page } from 'playwright';
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { browserManager } from "../browser.js";
 import { sessionManager } from "../session.js";
-import { samePageTarget } from "../page-access.js";
+import { samePageTarget, assertPageAccessible, readFinalPageAccess, type PageAccessAssessment } from "../page-access.js";
+import { pageReadFailure, formatPageReadFailure, readDuringNavigation } from '../navigation-read.js';
+import { throwIfRequestExpired, remainingRequestMs } from '../request-context.js';
 import { detectHumanVerificationSignals } from "../human-verification.js";
 import { viewportSchema, assertViewportTarget, applyExplicitViewport } from "../viewport.js";
-import { extractContent, truncateContent, compactContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, safePageContent, type OutputMode } from "../extractor.js";
+import { extractContent, truncateContent, compactContent, cleanFooterGarbage, detectSPAIssue, detectEncodingIssue, type OutputMode } from "../extractor.js";
 import { pageCache } from "../cache.js";
 import { touchActivity } from "../lifecycle.js";
 import { SUMMARY_CHAIN_VALUES, SUMMARY_PREVIEW_LENGTH, TEMP_PAGE_PREFIX, appendTiming, resolveSummaryModelChain, type SummaryChain } from "../constants.js";
@@ -315,7 +318,7 @@ export function registerFetchPage(server: McpServer): void {
                 }
             }
 
-            let page;
+            let page: Page | null | undefined;
             try {
                 if (params.sessionId) {
                     page = sessionManager.get(params.sessionId, params.ownerId);
@@ -344,18 +347,23 @@ export function registerFetchPage(server: McpServer): void {
 
                 // === iframe 内容智能提取 ===
                 let iframeHtmlParts: string[] = [];
+                let iframeDocumentVersion: number | undefined;
                 try {
-                    const iframeNames = await page.evaluate(() => {
+                    const topology = await readDuringNavigation<{ names: string[]; documentVersion: number }>(page, () => page!.evaluate(() => {
                         const iframes = document.querySelectorAll("iframe");
-                        return Array.from(iframes)
+                        const names = Array.from(iframes)
                             .map((el) => (el as HTMLIFrameElement).name || (el as HTMLIFrameElement).id)
                             .filter((n) => n.length > 0);
-                    });
+                        return { names, documentVersion: performance.timeOrigin };
+                    }), { phase: 'content.frames' });
+                    const iframeNames = topology.names;
+                    iframeDocumentVersion = topology.documentVersion;
 
                     if (iframeNames.length > 0) {
                         console.error(`[web-fetcher] 检测到 ${iframeNames.length} 个 iframe: ${iframeNames.join(", ")}`);
 
                         for (const frameName of iframeNames) {
+                            throwIfRequestExpired();
                             try {
                                 const frame = page.frame({ name: frameName });
                                 if (!frame) continue;
@@ -363,6 +371,7 @@ export function registerFetchPage(server: McpServer): void {
                                 // 智能轮询等待 iframe 内容就绪
                                 let contentLoaded = false;
                                 for (let round = 0; round < 2 && !contentLoaded; round++) {
+                                    throwIfRequestExpired();
                                     if (round === 1) {
                                         if (borrowedPage) break;
                                         const pageUrl = page.url();
@@ -373,7 +382,7 @@ export function registerFetchPage(server: McpServer): void {
                                                 window.location.hash = hash;
                                                 window.dispatchEvent(new HashChangeEvent("hashchange"));
                                             });
-                                            await page.waitForTimeout(2000);
+                                            await page.waitForTimeout(Math.min(2000, remainingRequestMs()));
                                         } else {
                                             break;
                                         }
@@ -382,10 +391,11 @@ export function registerFetchPage(server: McpServer): void {
                                     let lastLength = 0;
                                     let stableCount = 0;
                                     for (let attempt = 0; attempt < 16; attempt++) {
+                                        throwIfRequestExpired();
                                         try {
-                                            const currentLength = await frame.evaluate(
+                                            const currentLength = await readDuringNavigation(frame, () => frame.evaluate(
                                                 () => document.body?.innerHTML?.length || 0
-                                            );
+                                            ), { phase: 'content.frame-sample' });
                                             if (currentLength > 200) {
                                                 if (currentLength === lastLength) {
                                                     stableCount++;
@@ -399,13 +409,13 @@ export function registerFetchPage(server: McpServer): void {
                                             }
                                             lastLength = currentLength;
                                         } catch { /* frame 尚不可访问 */ }
-                                        await page.waitForTimeout(500);
+                                        await page.waitForTimeout(Math.min(500, remainingRequestMs()));
                                     }
                                 }
 
                                 // 提取并清理 iframe 内容
                                 try {
-                                    const frameHtml = await frame.evaluate(() => {
+                                    const frameHtml = await readDuringNavigation(frame, () => frame.evaluate(() => {
                                         const cleanSelectors = [
                                             "script", "style", "noscript", "textarea",
                                             "input", "select", "button",
@@ -420,7 +430,7 @@ export function registerFetchPage(server: McpServer): void {
                                             clone.querySelectorAll(sel).forEach((el) => el.remove());
                                         }
                                         return clone.innerHTML;
-                                    });
+                                    }), { phase: 'content.frame-html' });
                                     if (frameHtml.length > 100) {
                                         iframeHtmlParts.push(frameHtml);
                                     }
@@ -429,22 +439,40 @@ export function registerFetchPage(server: McpServer): void {
                         }
                     }
                 } catch { /* iframe 检测出错不影响正常功能 */ }
+                throwIfRequestExpired();
 
                 // === 内容提取 ===
                 let resultContent: string;
 
                 // PDF 文件：优先使用 pdf.js getTextContent 精确提取的文本
-                const pdfTexts = await page.evaluate(() => (window as any).__mcpPdfInfo?.texts).catch(() => null);
+                const snapshot = await readDuringNavigation<{
+                    pdfInfo?: { texts?: Record<string, string>; totalPages?: number };
+                    title: string;
+                    useIframes: boolean;
+                    html: string;
+                    access: PageAccessAssessment;
+                    url: string;
+                }>(page, async () => {
+                    const pdfInfo = await page!.evaluate(() => (window as any).__mcpPdfInfo);
+                    const documentInfo = await page!.evaluate(() => ({ title: document.title, documentVersion: performance.timeOrigin }));
+                    const useIframes = iframeHtmlParts.length > 0 && documentInfo.documentVersion === iframeDocumentVersion;
+                    const hasPdfText = pdfInfo?.texts && Object.keys(pdfInfo.texts).length > 0;
+                    const html = hasPdfText || useIframes ? '' : await page!.content();
+                    const access = await readFinalPageAccess(page, { url: sourceUrl, waitFor: params.waitFor });
+                    return { pdfInfo, title: documentInfo.title, useIframes, html, access, url: page!.url() };
+                }, { phase: 'content.extract' });
+                await assertPageAccessible(page, { url: sourceUrl, waitFor: params.waitFor }, snapshot.access);
+                sourceUrl = snapshot.pdfInfo ? sourceUrl : snapshot.url;
+                const pdfTexts = snapshot.pdfInfo?.texts;
                 if (pdfTexts && typeof pdfTexts === 'object' && Object.keys(pdfTexts).length > 0) {
-                    const pdfInfo = await page.evaluate(() => (window as any).__mcpPdfInfo);
-                    const totalPages = pdfInfo?.totalPages || 0;
+                    const totalPages = snapshot.pdfInfo?.totalPages || 0;
                     const pageNums = Object.keys(pdfTexts).map(Number).sort((a, b) => a - b);
                     const textParts = pageNums.map(pn =>
                         `## 第 ${pn} 页\n\n${pdfTexts[pn]}`
                     );
                     const fileName = sourceUrl.split('/').pop() || 'PDF';
                     resultContent = `# ${decodeURIComponent(fileName)}\n\n> PDF 文档，共 ${totalPages} 页，提取了 ${pageNums.length} 页文本\n\n${textParts.join('\n\n---\n\n')}`;
-                } else if (iframeHtmlParts.length > 0) {
+                } else if (snapshot.useIframes) {
                     const td = new TurndownService({
                         headingStyle: "atx",
                         codeBlockStyle: "fenced",
@@ -454,10 +482,10 @@ export function registerFetchPage(server: McpServer): void {
                     const iframeMarkdown = iframeHtmlParts
                         .map((h) => td.turndown(h))
                         .join("\n\n");
-                    const pageTitle = await page.title() || "无标题";
+                    const pageTitle = snapshot.title || "无标题";
                     resultContent = cleanFooterGarbage(truncateContent(`# ${pageTitle}\n\n${iframeMarkdown}`));
                 } else {
-                    const html = await safePageContent(page);
+                    const html = snapshot.html;
                     let { content } = extractContent(html, sourceUrl);
 
                     // v5.2: NGA 等 GBK 编码站点修复 — 检测到锟斤拷乱码时，
@@ -517,19 +545,14 @@ export function registerFetchPage(server: McpServer): void {
                     resultContent = content;
                 }
 
-                // v6.1: UAV 人机验证检测已下沉到 navigateTo 层级统一处理
-                // 所有工具（screenshot/rich/page/html/interact）自动受益
-
                 // v5.2: SPA 空壳检测 — 内容过少时提示用户添加 scrollCount
-                await browserManager.checkAndHandleVerification(page, page.url(), { waitFor: params.waitFor });
-                sourceUrl = page.url();
                 const spaHint = detectSPAIssue(resultContent, sourceUrl);
                 if (spaHint) {
                     resultContent += spaHint;
                 }
 
                 // v5.2: URL 跳转诊断 — 检测 B站视频页等被重定向的情况
-                const finalUrl = page.url();
+                const finalUrl = sourceUrl;
                 if (params.url && finalUrl !== params.url) {
                     const requestedVideo = params.url.match(/bilibili\.com\/video\/(BV[a-zA-Z0-9]+)/);
                     if (requestedVideo && !finalUrl.includes('/video/')) {
@@ -544,27 +567,17 @@ export function registerFetchPage(server: McpServer): void {
 
                 return appendTiming(await formatOutput(resultContent, sourceUrl, outputMode, modelChain, params.background), startTime, browserManager.lastRetryCount);
             } catch (error) {
-                const message =
-                    error instanceof Error ? error.message : String(error);
-
-                let hint = "可能的原因:\n- URL 无效或无法访问\n- 页面加载超时（可尝试增加 timeout 参数）\n- 指定的 waitFor 选择器未找到";
-
-                if (message.includes("ERR_CONNECTION_CLOSED") || message.includes("ERR_CONNECTION_RESET")) {
-                    hint = "⚠️ 连接被目标网站关闭，最常见的原因是 Cookie/登录态过期。\n\n建议操作:\n1. 使用 web_login_browser 工具重新登录该网站\n2. 登录完成后关闭浏览器窗口\n3. 然后重试此请求";
-                } else if (message.includes("ERR_SSL") || message.includes("ERR_CERT")) {
-                    hint = "⚠️ SSL/证书错误，网站可能存在安全问题或被拦截。";
-                } else if (message.includes("Timeout") || message.includes("timeout")) {
-                    hint = "⏱️ 页面加载超时。建议:\n- 增加 timeout 参数（如 60000）\n- 某些网站首次访问较慢，可重试一次";
-                }
+                const failure = pageReadFailure(error, 'content.navigation', sourceUrl, page?.url());
 
                 return {
                     isError: true,
                     content: [
                         {
                             type: "text" as const,
-                            text: `抓取页面失败: ${message}\n\n${hint}`,
+                            text: `抓取页面失败: ${formatPageReadFailure(failure)}`,
                         },
                     ],
+                    _meta: { webFetcherReadFailure: failure },
                 };
             } finally {
                 if (page && !borrowedPage) {

@@ -1,5 +1,6 @@
 import { detectHumanVerificationSignals, type HumanVerificationDetectionInput } from './human-verification.js';
-import { getRequestContext, remainingRequestMs } from './request-context.js';
+import { getRequestContext, remainingRequestMs, RequestAdmissionError, throwIfRequestExpired } from './request-context.js';
+import { readDuringNavigation } from './navigation-read.js';
 
 export type PageAccessStatus = 'content_ready' | 'challenge_required' | 'login_required' | 'loading' | 'access_denied' | 'unknown';
 
@@ -90,11 +91,9 @@ export function samePageTarget(actual: string, requested: string): boolean {
 }
 
 export async function readPageAccess(page: any, options: { url?: string; waitFor?: string } = {}): Promise<PageAccessAssessment> {
-    const url = typeof page.url === 'function' ? page.url() : options.url ?? '';
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let url = typeof page.url === 'function' ? page.url() : options.url ?? '';
     try {
-        const snapshot = await Promise.race([
-            page.evaluate((selector?: string) => {
+        const snapshot = await readDuringNavigation<Omit<AccessSnapshot, 'url'>>(page, () => page.evaluate((selector?: string) => {
                 const isVisible = (element: Element) => {
                     const rect = element.getBoundingClientRect();
                     const style = getComputedStyle(element);
@@ -117,16 +116,13 @@ export async function readPageAccess(page: any, options: { url?: string; waitFor
                     hasVisualContent: [...document.querySelectorAll('img,canvas,video,svg')].slice(0, 80).some(isVisible),
                     waitForMatched,
                 };
-            }, options.waitFor),
-            new Promise<never>((_, reject) => {
-                timer = setTimeout(() => reject(new Error('Page access probe timed out')), Math.max(1, Math.min(2500, remainingRequestMs(2500))));
-                timer.unref?.();
-            }),
-        ]);
+            }, options.waitFor), { phase: 'access.sample', timeoutMs: 2500 });
+        url = typeof page.url === 'function' ? page.url() : url;
         return assessPageAccess({ ...snapshot, url, targetMatched: !options.url || samePageTarget(url, options.url) });
-    } catch {
+    } catch (error) {
+        if (error instanceof RequestAdmissionError || page.isClosed?.() || page.isDetached?.()) throw error;
         return { url, status: 'unknown', blocked: false, reasonCodes: ['access-probe-unavailable'], targetMatched: false, contentConfirmed: false };
-    } finally { if (timer) clearTimeout(timer); }
+    }
 }
 
 export function pageAccessResult(issue: PageAccessIssue) {
@@ -137,7 +133,7 @@ export function pageAccessResult(issue: PageAccessIssue) {
     };
 }
 
-export async function assertPageAccessible(page: any, options: { url?: string; waitFor?: string; early?: boolean } = {}): Promise<PageAccessAssessment> {
+export async function readFinalPageAccess(page: any, options: { url?: string; waitFor?: string; early?: boolean } = {}): Promise<PageAccessAssessment> {
     const assistedTarget = assistedPages.get(page);
     let assessment = await readPageAccess(page, { ...options, url: assistedTarget ?? options.url });
     if (options.early && assessment.provisional && !assistedTarget) return assessment;
@@ -154,6 +150,14 @@ export async function assertPageAccessible(page: any, options: { url?: string; w
         }
     }
     if (assistedTarget && (!assessment.contentConfirmed || !assessment.targetMatched || assessment.status !== 'content_ready')) assessment.blocked = true;
+    return assessment;
+}
+
+export async function assertPageAccessible(page: any, options: { url?: string; waitFor?: string; early?: boolean } = {}, initialAssessment?: PageAccessAssessment): Promise<PageAccessAssessment> {
+    throwIfRequestExpired();
+    const assistedTarget = assistedPages.get(page);
+    const assessment = initialAssessment ?? await readFinalPageAccess(page, options);
+    if (options.early && assessment.provisional && !assistedTarget) return assessment;
     if (!assessment.blocked) return assessment;
     const context = getRequestContext();
     const issue: PageAccessIssue = { ...assessment, nextAction: '页面受阻；不要重复抓取或自动重放写操作。' };
