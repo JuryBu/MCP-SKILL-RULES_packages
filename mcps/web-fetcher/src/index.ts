@@ -166,6 +166,7 @@ server.registerResource(
             "",
             "## 跳转中的安全读取（7.3.3）",
             "",
+            "- HTTP重定向保留原状态码和Location，由浏览器到达最终地址；相对图片/链接按最终地址解析，303/307/308提交沿原浏览器语义执行一次。解析空文档在原期限内等待就绪。",
             "- 正文、HTML和就绪采样遇到文档切换时，在原请求总期限内最多恢复两次；重新获取当前文档/选择器，文档变化后重置稳定窗口，稳定页不增加固定恢复等待。",
             "- 读取失败的_meta.webFetcherReadFailure包含code、phase、requestedUrl、finalUrl、retries和cause；先核实际阶段和最终页面，挑战与登录状态仍看pageAccess，humanAssistance=never保持不开窗。",
             "- 自动恢复仅用于内部读取，不重放用户点击、输入、提交或任意evaluate；截图继续等待图片、字体和懒加载，partial仍说明未完成范围。",

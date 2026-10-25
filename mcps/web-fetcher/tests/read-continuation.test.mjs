@@ -30,10 +30,12 @@ function fakePage() {
     return {
         url: () => url,
         isClosed: () => false,
+        waitForFunction: async () => ({ dispose: async () => {} }),
         content: async () => html,
         title: async () => "Readable article",
         evaluate: async callback => {
             const source = String(callback);
+            if (/document\.readyState\s*!==\s*["']loading["']/.test(source)) return true;
             if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
             if (source.includes('scriptUrls:')) return { title: 'Readable article', visibleText: 'Useful article content. '.repeat(24), html, readyState: 'complete', scriptUrls: [], iframeUrls: [], hasPasswordInput: false, hasBusinessForm: false, hasVisualContent: false };
             if (source.includes('documentVersion:')) return { title: 'Readable article', documentVersion: 1 };
@@ -135,6 +137,7 @@ for (const filename of ["report.pdf", "report.odt"]) {
         page.url = () => "about:blank";
         page.evaluate = async callback => {
             const source = String(callback);
+            if (/document\.readyState\s*!==\s*["']loading["']/.test(source)) return true;
             if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
             if (source.includes("__mcpPdfInfo")) return { texts: { 1: documentText }, totalPages: 1 };
             if (source.includes("documentVersion:")) return { title: "", documentVersion: 1 };
@@ -204,10 +207,12 @@ test("HTTP content uses its frozen final URL after another document commits", as
         mainFrame: () => frame,
         isClosed: () => false,
         waitForLoadState: async () => {},
+        waitForFunction: async () => ({ dispose: async () => {} }),
         close: async () => { closes++; },
         content: async () => { contentRead = true; return linkedHtml; },
         evaluate: async callback => {
             const source = String(callback);
+            if (/document\.readyState\s*!==\s*["']loading["']/.test(source)) return true;
             if (source.includes('querySelectorAll("iframe")')) return { names: [], documentVersion: 1 };
             if (source.includes("__mcpPdfInfo")) return null;
             if (source.includes("documentVersion:")) return { title: "Readable article", documentVersion: 1 };

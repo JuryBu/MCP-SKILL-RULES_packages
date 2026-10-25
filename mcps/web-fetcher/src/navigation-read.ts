@@ -8,6 +8,7 @@ export interface NavigationReadOptions {
     phase: string;
     maxRetries?: number;
     timeoutMs?: number;
+    requireDocumentReady?: boolean;
 }
 
 export interface PageReadFailure {
@@ -26,7 +27,7 @@ export class NavigationReadError extends Error {
     }
 }
 
-class DocumentChangedError extends Error {
+export class DocumentChangedError extends Error {
     constructor() { super('读取期间页面已切换文档'); }
 }
 
@@ -109,7 +110,13 @@ export async function readDuringNavigation<Result>(target: ReadTarget, read: () 
                 assertTargetOpen(target);
                 const version = documentVersion;
                 try {
+                    if (options.requireDocumentReady) await boundedRead(async () => {
+                        const ready = await target.waitForFunction(() => document.readyState !== 'loading' && !!document.documentElement, undefined,
+                            { timeout: Math.max(1, deadline - performance.now()) });
+                        await ready.dispose();
+                    }, deadline, mustSettle);
                     const result = await boundedRead(read, deadline, mustSettle);
+                    if (options.requireDocumentReady && !await boundedRead(() => target.evaluate(() => document.readyState !== 'loading'), deadline, mustSettle)) throw new DocumentChangedError();
                     assertTargetOpen(target);
                     if (version !== documentVersion) throw new DocumentChangedError();
                     return result;

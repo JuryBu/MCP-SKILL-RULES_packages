@@ -13,6 +13,7 @@ export interface ReadinessResult {
     fontsReady: boolean;
     scanLimited: boolean;
     uninspectedFrames?: number;
+    documentReady?: boolean;
     note?: string;
 }
 
@@ -204,20 +205,30 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
                 const busyRoots = document.querySelectorAll('body[aria-busy="true"], main[aria-busy="true"], [role="main"][aria-busy="true"], #root[aria-busy="true"], #app[aria-busy="true"], #__next[aria-busy="true"]');
                 const primaryBusy = Array.from(busyRoots).some(element => inScope(element));
                 const emptyRoot = !!root && root.children.length === 0 && !root.textContent?.trim();
+                const documentReady = !!document.body && document.readyState !== 'loading';
                 const meaningful = !primaryBusy && !emptyRoot && (text.length > 0 || frameTextLength > 0 || !!document.querySelector('img[src],video,canvas,svg,input,button')
                     || (!!root && root.children.length > 0 && visibleCount > 0));
                 return {
                     total, ready, failed, pending: total - ready - failed,
                     fontsReady,
                     scanLimited, meaningful, uninspectedFrames, primaryBusy, emptyRoot,
+                    documentReady,
                     documentVersion: performance.timeOrigin, documentAgeMs: performance.now(),
-                    signature: `${performance.timeOrigin}|${location.href}|${primaryBusy}|${emptyRoot}|${nodes.length + frameNodes.length}|${text.length + frameTextLength}|${text.slice(0, 300)}|${text.slice(-100)}|${total}|${ready}|${failed}|${layout.join(';')}`,
+                    signature: `${performance.timeOrigin}|${location.href}|${documentReady}|${primaryBusy}|${emptyRoot}|${nodes.length + frameNodes.length}|${text.length + frameTextLength}|${text.slice(0, 300)}|${text.slice(-100)}|${total}|${ready}|${failed}|${layout.join(';')}`,
                 };
             }, { visual: options.mode === 'visual', fullPage: !!options.fullPage }), { phase: `readiness.${options.mode}.sample`, timeoutMs: Math.max(0, deadline - performance.now()) });
             let snapshot: Awaited<typeof sampling>;
             try { snapshot = await sampling; }
             catch (error) {
                 if (error instanceof NavigationReadError && error.diagnostics.code === 'page_read_timeout' && performance.now() >= deadline) break;
+                if ((isNavigationReadError(error) || (error instanceof NavigationReadError && error.diagnostics.code === 'navigation_read_interrupted')) && performance.now() < deadline) {
+                    lastSignature = '';
+                    stableSince = performance.now();
+                    final.complete = false;
+                    final.documentReady = false;
+                    await pause(Math.min(200, Math.max(0, deadline - performance.now())));
+                    continue;
+                }
                 throw error;
             }
             if (options.mode === 'visual' && options.fullPage && lazyDocumentVersion !== snapshot.documentVersion) {
@@ -240,14 +251,15 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
                 lastSignature = snapshot.signature;
                 stableSince = now;
             }
-            const settled = options.mode === 'visual'
+            const settled = snapshot.documentReady !== false && (options.mode === 'visual'
                 ? snapshot.pending === 0 && snapshot.fontsReady && !snapshot.primaryBusy && !snapshot.emptyRoot
-                : snapshot.meaningful && snapshot.pending === 0;
+                : snapshot.meaningful && snapshot.pending === 0);
             const stable = now - stableSince >= quietMs && now - started >= minimumObserve && snapshot.documentAgeMs >= minimumObserve;
             final = {
                 waited: Math.round(now - started), total: snapshot.total, ready: snapshot.ready,
                 pending: snapshot.pending, failed: snapshot.failed, fontsReady: snapshot.fontsReady,
                 scanLimited: snapshot.scanLimited,
+                documentReady: snapshot.documentReady,
                 uninspectedFrames: snapshot.uninspectedFrames,
                 complete: settled && stable && snapshot.failed === 0 && !snapshot.scanLimited && lazyComplete && snapshot.uninspectedFrames === 0,
             };
@@ -257,6 +269,7 @@ export async function waitForPageReadiness(page: Page, options: ReadinessOptions
         final.waited = Math.round(performance.now() - started);
         if (!final.complete) {
             const reasons = [
+                final.documentReady === false ? '当前文档仍在解析' : '',
                 final.pending ? `${final.pending} 个可见资源仍在加载` : '',
                 final.failed ? `${final.failed} 个资源加载失败` : '',
                 !final.fontsReady ? '字体尚未就绪' : '',

@@ -26,7 +26,7 @@
     "test:verification": "node --import tsx --test --test-concurrency=1 tests/page-access.test.mjs tests/background-lifecycle.test.mjs tests/read-continuation.test.mjs tests/assisted-ownership.test.mjs",
     "test:verification:browser": "node --test tests/assisted-continuation-http.test.mjs",
     "test:navigation": "node --import tsx --test --test-concurrency=1 tests/navigation-read.test.mjs tests/navigation-read-lease.test.mjs tests/readiness-navigation-budget.test.mjs",
-    "test:navigation:browser": "node --import tsx --test --test-concurrency=1 tests/navigation-read-browser.test.mjs",
+    "test:navigation:browser": "node --import tsx --test --test-concurrency=1 tests/navigation-read-browser.test.mjs tests/navigation-read-document-gap.test.mjs tests/redirect-interception-browser.test.mjs",
     "test": "npm run build && npm run test:images && npm run test:login && npm run test:resources && npm run test:verification && npm run test:navigation && npm run test:runtime-status && node --test tests/inspection-runtime-assets.test.mjs"
   },
   "engines": {

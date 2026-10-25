@@ -82,7 +82,7 @@ export function registerFetchHtml(server: McpServer): void {
                         : await page!.content();
                     const access = await readFinalPageAccess(page, { url: params.url, waitFor: params.selector });
                     return { html, access };
-                }, { phase: params.selector ? 'html.selector' : 'html.content' });
+                }, { phase: params.selector ? 'html.selector' : 'html.content', requireDocumentReady: true });
                 await assertPageAccessible(page, { url: params.url, waitFor: params.selector }, snapshot.access);
                 if (snapshot.html === null) {
                     return { isError: true, content: [{ type: 'text' as const, text: `未找到选择器 "${params.selector}" 匹配的元素` }] };

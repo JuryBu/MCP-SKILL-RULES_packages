@@ -460,7 +460,7 @@ export function registerFetchPage(server: McpServer): void {
                     const html = hasPdfText || useIframes ? '' : await page!.content();
                     const access = await readFinalPageAccess(page, { url: sourceUrl, waitFor: params.waitFor });
                     return { pdfInfo, title: documentInfo.title, useIframes, html, access, url: page!.url() };
-                }, { phase: 'content.extract' });
+                }, { phase: 'content.extract', requireDocumentReady: true });
                 await assertPageAccessible(page, { url: sourceUrl, waitFor: params.waitFor }, snapshot.access);
                 sourceUrl = snapshot.pdfInfo ? sourceUrl : snapshot.url;
                 const pdfTexts = snapshot.pdfInfo?.texts;

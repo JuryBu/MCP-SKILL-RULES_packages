@@ -47,7 +47,7 @@ import { PageAdmissionController, type PageLease } from './page-admission.js';
 import { getRuntimeMemorySampler } from './memory-sampler.js';
 import { applyExplicitViewport, assertViewportTarget, type ResponsiveViewport } from './viewport.js';
 import { assertPageAccessible, PageAccessError } from './page-access.js';
-import { readDuringNavigation, isNavigationReadError, NavigationReadError, pageReadFailure } from './navigation-read.js';
+import { readDuringNavigation, isNavigationReadError, NavigationReadError, DocumentChangedError, pageReadFailure } from './navigation-read.js';
 import { RequestAdmissionError } from './request-context.js';
 
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -693,8 +693,9 @@ class BrowserManager {
                 const response = isLocalDevRequest
                     ? await route.fetch({
                         headers: this.withLocalDevNoCacheHeaders(route.request().headers()),
+                        maxRedirects: 0,
                     })
-                    : await route.fetch();
+                    : await route.fetch({ maxRedirects: 0 });
                 const contentType = response.headers()['content-type'] || '';
 
                 if (contentType.includes('text/html')) {
@@ -1079,10 +1080,19 @@ class BrowserManager {
      * 滚动页面以触发懒加载内容
      */
     async scrollPage(page: Page, count: number, direction: 'up' | 'down' = 'down'): Promise<void> {
+        const readPosition = (phase: string) => readDuringNavigation(page, async () => {
+            const position = await page.evaluate(() => document.body ? {
+                scroll: window.scrollY,
+                height: Math.max(document.body.scrollHeight, document.documentElement?.scrollHeight ?? 0),
+            } : null);
+            if (position) return position;
+            await page.locator('body').waitFor({ state: 'attached', timeout: Math.max(1, remainingRequestMs()) });
+            throw new DocumentChangedError();
+        }, { phase });
         for (let i = 0; i < count; i++) {
             try {
                 throwIfRequestExpired();
-                const previous = await readDuringNavigation(page, () => page.evaluate(() => ({ scroll: window.scrollY, height: document.body.scrollHeight })), { phase: 'scroll.before' });
+                const previous = await readPosition('scroll.before');
                 const prevScroll = previous.scroll;
                 const prevHeight = previous.height;
 
@@ -1092,14 +1102,14 @@ class BrowserManager {
                         window.scrollTo({ top: 0, behavior: "smooth" })
                     );
                 } else {
-                    await page.evaluate(() =>
-                        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" })
+                    await page.evaluate(top =>
+                        window.scrollTo({ top, behavior: "smooth" }), prevHeight
                     );
                 }
 
                 await waitForPageReadiness(page, { mode: 'content', maxWait: 4000, minimumObserveMs: 1000 });
 
-                const current = await readDuringNavigation(page, () => page.evaluate(() => ({ scroll: window.scrollY, height: document.body.scrollHeight })), { phase: 'scroll.after' });
+                const current = await readPosition('scroll.after');
                 const newScroll = current.scroll;
                 const newHeight = current.height;
 

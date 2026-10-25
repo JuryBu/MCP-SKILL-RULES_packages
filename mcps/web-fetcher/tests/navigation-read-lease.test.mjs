@@ -75,11 +75,13 @@ function makeFixture(closeSettlement) {
     page.isClosed = () => state.closed;
     page.mainFrame = () => mainFrame;
     page.waitForLoadState = async () => {};
+    page.waitForFunction = async () => ({ dispose: async () => {} });
     page.content = read;
     page.title = async () => 'Lease fixture';
     page.evaluate = async callback => {
         if (callback === readProbe) return read();
         const source = String(callback);
+        if (/document\.readyState\s*!==\s*["']loading["']/.test(source)) return true;
         if (/querySelectorAll\(["']iframe["']\)/.test(source)) return { names: [], documentVersion: 1 };
         if (source.includes('__mcpPdfInfo')) return undefined;
         if (source.includes('documentVersion:')) return { title: 'Lease fixture', documentVersion: 1 };
