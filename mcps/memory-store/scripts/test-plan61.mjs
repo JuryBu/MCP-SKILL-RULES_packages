@@ -19,7 +19,7 @@ let tests = [
     "conversation-progressive-state-write", "conversation-host-range-input", "conversation-host-adapter",
     "conversation-host-cache", "conversation-host-cold-window", "conversation-host-full-cache", "conversation-host-progressive-cold",
     "claude-code-corpus", "claude-code-client-tail-read", "dsh-incremental-reader", "dsh-session-reader", "dsh-client",
-    "conversation-host-binary", "conversation-host-devin", "devin-sqlite", "devin-fast-range",
+    "conversation-host-binary", "conversation-host-devin", "devin-sqlite", "devin-identity-scan", "devin-fast-range",
     "devin-conversation", "devin-bridge", "devin-consumers", "devin-identity-cache-bridge", "devin-legacy-isolation",
     "devin-discovery-offline", "conversation-source-fingerprint", "local-pb-prepared", "local-pb-reader",
     "local-pb-activity-bridge", "windsurf-read-timing", "windsurf-read-partial-empty", "conversation-context-locate",

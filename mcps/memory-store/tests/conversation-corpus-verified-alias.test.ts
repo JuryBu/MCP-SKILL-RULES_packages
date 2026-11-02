@@ -70,7 +70,12 @@ test("real SQLite Desktop UUID resolves through multi read/chunks/ranges to the 
     assert.ok(verifiedCorpusIdentity(full.conversation)?.aliases.includes(alias));
     const tail = await source.readFast(candidate!, { lastRounds: 1 });
     assert.deepEqual(tail.rounds?.map(round => round.roundIndex), [4]);
-    assert.equal(tail.revision, full.revision);
+    assert.equal(tail.conversation.id, alias);
+    assert.equal(tail.roundNumbering, "relative");
+    assert.equal(tail.complete, false);
+    assert.equal(tail.requestedRangeComplete, false);
+    assert.ok(tail.warnings.includes("DEVIN_ALIAS_VERIFICATION_PENDING"));
+    assert.notEqual(tail.revision, full.revision);
     const reopened = await provider().readRounds(candidate!, { revision: full.revision, startRound: 2, endRound: 2 });
     assert.equal(reopened.conversation.id, canonical);
     assert.deepEqual(reopened.rounds?.map(round => round.roundIndex), [2]);
@@ -150,6 +155,8 @@ test("real UUID progressive publication keeps requested source binding, canonica
     assert.equal(state.current.source.host, "windsurf");
     assert.equal(state.current.source.conversationId, alias);
     assert.equal(state.current.source.conversation.id, canonical);
+    assert.ok(!state.current.source.conversation.sourceWarnings.includes("DEVIN_ALIAS_VERIFICATION_PENDING"));
+    assert.ok(!state.current.source.conversation.sourceWarnings.includes("DEVIN_DESKTOP_ONLY_PARTIAL"));
     const cache = await openProgressiveCache({ root: state.current.directory, source: state.current.source });
     assert.equal((await cache.status()).complete, true);
     assert.equal((await cache.read({ direction: "oldest" })).rows.length, 4);
@@ -178,6 +185,30 @@ test("UUID preparation persists both the requested commit key and verified canon
     assert.equal(record.verifiedIdentity?.canonicalId, canonical);
     assert.equal(record.prepared?.sourceRevision, record.verifiedIdentity?.sourceRevision);
     assert.equal((await getCorpusSearchStatus(identity)).prepared?.conversationId, canonical);
+});
+
+test("a failed verified continuation preserves pending Desktop ranges and old refs after reopening", async () => {
+    const source = provider();
+    const [candidate] = await source.list({ dataChains: ["windsurf"], conversationIds: [alias] }, {});
+    const payload: ProgressiveTaskPayload = { version: 1, taskId: "progressive-22222222-2222-4222-8222-222222222222", directory: path.join(root, "progressive-failed-identity"),
+        request: { ownerId: "alias-owner", conversationId: alias, dataChain: "windsurf", initialRounds: 1,
+            buildFull: true, direction: "latest", messageRoles: ["user", "assistant"], depth: "normal" } };
+    const failing: CorpusRangeProvider = { ...source, read: async () => { throw new Error("verified continuation failed"); } };
+    await assert.rejects(executeHostProgressivePreparation(payload, { provider: failing, isCancelled: () => false,
+        onActive: () => {}, onProgress: async () => {} }), /verified continuation failed/u);
+    const ready = JSON.parse(fs.readFileSync(path.join(payload.directory, "ready.json"), "utf8"));
+    assert.equal(ready.current.source.conversationId, alias);
+    assert.equal(ready.current.source.conversation.id, alias);
+    assert.equal(ready.requestedRangeComplete, false);
+    assert.ok(ready.warnings.includes("DEVIN_ALIAS_VERIFICATION_PENDING"));
+    const opened = await openProgressiveCache({ root: ready.current.directory, source: ready.current.source });
+    assert.equal((await opened.status()).relativeReadyRounds, 1);
+    const before = await opened.read({ direction: "latest" });
+    const reopened = await openProgressiveCache({ root: ready.current.directory, source: ready.current.source });
+    assert.deepEqual(await reopened.read({ direction: "latest" }), before);
+    assert.equal((await reopened.status()).complete, false);
+    assert.equal(before.rows.length, 1);
+    assert.match(before.rows[0]!.round.userMessage, /needle question 4/u);
 });
 
 test("direct corpus task refuses a same-source alias assertion without reader-issued provenance", async () => {

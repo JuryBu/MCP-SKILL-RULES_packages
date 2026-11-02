@@ -1,4 +1,5 @@
 import type { DatabaseSync } from "node:sqlite";
+import { setImmediate as yieldImmediate } from "node:timers/promises";
 import type { DevinCompaction, DevinConversationSummary, DevinDesktopMessage, DevinMessageNode, DevinRoundCoverage, DevinRoundRange } from "./devin-types.js";
 import { ReadBudget, DevinReadError, asTimestamp, columns, digest, inSnapshot, jsonObject, nodeId } from "./devin-sqlite-store.js";
 
@@ -128,25 +129,59 @@ async function readChain(database: DatabaseSync, sessionId: string, head: number
 
 export async function findCliIdentityCandidates(filename: string, budget: ReadBudget, messageIds: string[], toolCallIds: string[]): Promise<{ sessionIds: string[]; uncertain: boolean }> {
     return inSnapshot(filename, budget, async database => {
-        const userMatch = messageIds.length ? `json_extract(message_blob,'$.metadata.extensions."chisel/client-message-id"') IN (SELECT value FROM json_each(?))` : "0";
-        const toolMatch = toolCallIds.length ? `json_extract(message_blob,'$.tool_call_id') IN (SELECT value FROM json_each(?))
-                    OR EXISTS (SELECT 1 FROM json_each(message_blob,'$.tool_calls') AS call WHERE call.type='object'
-                        AND json_extract(call.value,'$.id') IN (SELECT value FROM json_each(?)))` : "0";
-        const rows = database.prepare(`WITH projected AS (
-            SELECT session_id, metadata, CASE WHEN json_valid(chat_message) THEN jsonb(chat_message) END AS message_blob FROM message_nodes),
-            matches AS MATERIALIZED (SELECT session_id, CASE WHEN message_blob IS NULL OR json_type(message_blob)!='object'
-                OR (metadata IS NOT NULL AND metadata!='' AND (NOT json_valid(metadata) OR json_type(metadata) NOT IN ('object','null')))
+        const userMatch = messageIds.length ? `user_id IN (SELECT value FROM json_each(?))` : "0";
+        const toolMatch = toolCallIds.length ? `tool_id IN (SELECT value FROM json_each(?))
+                    OR EXISTS (SELECT 1 FROM json_each(tool_ids) AS call WHERE call.value IN (SELECT value FROM json_each(?)))` : "0";
+        const userProjection = messageIds.length ? `json_extract(chat_message,'$.metadata.extensions."chisel/client-message-id"')` : "NULL";
+        const toolProjection = toolCallIds.length ? `json_extract(chat_message,'$.tool_call_id')` : "NULL";
+        const toolIdsProjection = toolCallIds.length ? `(SELECT json_group_array(json_extract(call.value,'$.id'))
+            FROM json_each(chat_message,'$.tool_calls') AS call WHERE call.type='object')` : "NULL";
+        const query = (comparison: string) => database.prepare(`WITH page AS MATERIALIZED (
+            SELECT rowid AS identity_cursor FROM message_nodes
+            WHERE rowid ${comparison} ? ORDER BY rowid LIMIT 64),
+            projected AS MATERIALIZED (
+            SELECT page.identity_cursor, session_id,
+                CASE WHEN json_valid(chat_message) THEN json_type(chat_message) END AS message_kind,
+                CASE WHEN json_valid(chat_message) THEN ${userProjection} END AS user_id,
+                CASE WHEN json_valid(chat_message) THEN ${toolProjection} END AS tool_id,
+                CASE WHEN json_valid(chat_message) THEN ${toolIdsProjection} END AS tool_ids,
+                CASE WHEN metadata IS NOT NULL AND metadata!='' AND (NOT json_valid(metadata) OR json_type(metadata) NOT IN ('object','null')) THEN 1 ELSE 0 END AS invalid_metadata
+            FROM page JOIN message_nodes ON message_nodes.rowid=page.identity_cursor),
+            matches AS MATERIALIZED (SELECT identity_cursor, session_id, CASE WHEN message_kind IS NULL OR message_kind!='object' OR invalid_metadata=1
                 THEN 1 ELSE 0 END AS uncertain,
-                CASE WHEN message_blob IS NOT NULL AND json_type(message_blob)='object' THEN
+                CASE WHEN message_kind='object' THEN
                     ${userMatch} OR ${toolMatch} ELSE 0 END AS matched FROM projected)
-            SELECT DISTINCT session_id, uncertain FROM matches WHERE uncertain=1 OR matched=1`);
+            SELECT identity_cursor, session_id, uncertain, matched FROM matches ORDER BY identity_cursor`);
+        const firstPage = query(">=");
+        const nextPage = query(">");
+        firstPage.setReadBigInts(true);
+        nextPage.setReadBigInts(true);
         const sessionIds = new Set<string>();
+        const seen = new Set<string>();
         let uncertain = false;
         const parameters = [...(messageIds.length ? [JSON.stringify(messageIds)] : []), ...(toolCallIds.length ? [JSON.stringify(toolCallIds), JSON.stringify(toolCallIds)] : [])];
-        for (const row of rows.iterate(...parameters)) {
-            await budget.take(Buffer.byteLength(JSON.stringify(row)));
-            uncertain ||= Number(row.uncertain) === 1;
-            sessionIds.add(String(row.session_id));
+        let cursor = -9223372036854775808n;
+        let statement = firstPage;
+        for (;;) {
+            budget.check();
+            let count = 0;
+            for (const row of statement.iterate(cursor, ...parameters)) {
+                budget.check();
+                count++;
+                cursor = row.identity_cursor as bigint;
+                if (Number(row.uncertain) !== 1 && Number(row.matched) !== 1) continue;
+                const sessionId = String(row.session_id);
+                const isUncertain = Number(row.uncertain) === 1;
+                const identity = JSON.stringify([sessionId, isUncertain]);
+                if (seen.has(identity)) continue;
+                seen.add(identity);
+                await budget.take(Buffer.byteLength(JSON.stringify({ session_id: row.session_id, uncertain: Number(row.uncertain) })));
+                uncertain ||= isUncertain;
+                sessionIds.add(sessionId);
+            }
+            if (count < 64) break;
+            statement = nextPage;
+            await yieldImmediate();
         }
         return { sessionIds: [...sessionIds], uncertain };
     });

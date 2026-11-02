@@ -160,7 +160,12 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
         assertHostReadActive(control);
         if (source === "antigravity" || options.pbCandidates) return readPb(conversation, request, control);
         const ownedIdentityCache = options.devinOptions?.identityCache ? undefined : new DevinIdentityCache();
-        const devinOptions = { ...options.devinOptions, identityCache: options.devinOptions?.identityCache || ownedIdentityCache, isCancelled: control.isCancelled };
+        const physicalWindow = Boolean(request?.lastRounds && conversation.sourceKind === "devin-desktop"
+            && /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/iu.test(conversation.canonicalId || conversation.id));
+        const devinOptions = { ...options.devinOptions, identityCache: options.devinOptions?.identityCache || ownedIdentityCache,
+            deadlineMs: options.devinOptions?.deadlineMs ?? Date.now() + (request ? 30000 : 120000),
+            ...(physicalWindow ? { identityMode: "physical" as const, physicalSourceKind: "devin-desktop" as const } : {}),
+            isCancelled: control.isCancelled };
         try {
         const child = splitDevinSubagentId(conversation.canonicalId || conversation.id);
         const summary = await resolveDevinConversation(child?.parentId || conversation.canonicalId || conversation.id, devinOptions);
@@ -173,7 +178,7 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
         try {
             devin = await readDevinConversation(conversation.canonicalId || conversation.id, {
                 ...devinOptions, link: "reference", materializeAttachments: false,
-                roundRange: request && !child ? request.lastRounds ? { tailRounds: request.lastRounds } : { startRound: request.startRound || 1, endRound: request.endRound } : undefined,
+                roundRange: request && !child && !physicalWindow ? request.lastRounds ? { tailRounds: request.lastRounds } : { startRound: request.startRound || 1, endRound: request.endRound } : undefined,
             });
         } catch (error) {
             if (!request || (error as { code?: string }).code !== "DEVIN_RANGE_UNAVAILABLE") throw error;
@@ -194,7 +199,7 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
         const coverage = raw.coverage;
         const partial = raw.partial && raw.warnings.some(warning => warning !== "DEVIN_RANGE_MAIN_CHAIN_ONLY");
         const origin: CorpusConversation = { ...conversation, id: raw.summary.canonicalId, canonicalId: raw.summary.canonicalId, aliases: raw.summary.aliases,
-            title: raw.summary.title, workspace: raw.summary.cwd || conversation.workspace, sourceKind: raw.summary.sourceKind, rolloutPath: raw.summary.sourcePath,
+            title: raw.summary.title, workspace: raw.summary.cwd || conversation.workspace, sourceKind: raw.summary.sourceKind, sourceWarnings: raw.summary.warnings, rolloutPath: raw.summary.sourcePath,
             parentConversationId: raw.summary.parentConversationId, isChildThread: raw.summary.isChildThread };
         const revision = hostCorpusDigest(["host-devin/v1", DEVIN_NORMALIZATION_VERSION, raw.summary.canonicalId, physicalKey(before)]);
         if (!child && raw.summary.sourceKind === "devin-cli" && raw.summary.sessionId === raw.summary.canonicalId
@@ -206,10 +211,10 @@ export function createBinaryHostReader(source: "windsurf" | "antigravity", optio
                 evidence: hostCorpusDigest([raw.summary.identityEvidence, raw.summary.matchedMessageIds, raw.summary.matchedToolCallIds,
                     [...raw.summary.aliases].sort(), physicalKey(before)]) });
         }
-        const totalRounds = coverage?.totalRounds ?? devin.rounds.at(-1)?.roundIndex ?? 0;
+        const totalRounds = physicalWindow ? undefined : coverage?.totalRounds ?? devin.rounds.at(-1)?.roundIndex ?? 0;
         return { conversation: origin, revision,
-            rounds: devin.rounds, roundNumbering: "absolute", totalRounds, sourceComplete: !coverage || coverage.complete,
-            rangeComplete: !partial && (!coverage || (coverage.startRound === (request?.lastRounds ? Math.max(1, totalRounds - request.lastRounds + 1) : request?.startRound || 1) && coverage.endRound >= Math.min(request?.endRound || totalRounds, totalRounds))),
+            rounds: devin.rounds, roundNumbering: physicalWindow ? "relative" : "absolute", totalRounds, sourceComplete: !physicalWindow && (!coverage || coverage.complete),
+            rangeComplete: !physicalWindow && !partial && (!coverage || (coverage.startRound === (request?.lastRounds ? Math.max(1, totalRounds! - request.lastRounds + 1) : request?.startRound || 1) && coverage.endRound >= Math.min(request?.endRound || totalRounds!, totalRounds!))),
             partial, warnings: raw.warnings, sourceBytes: before.reduce((sum, item) => sum + item.size, 0),
             timings: { ...(raw.readMetrics || {}), identityCacheHit: Number(raw.readMetrics?.identityCacheHit),
                 bodyTotalMs: raw.readMetrics?.totalMs || 0, identityResolutionMs: identityResolvedAt - started,

@@ -54,4 +54,8 @@ Claude Code与DSH大日志的首次范围读取优先整理约4MiB首部或尾�
 
 Devin先发现元数据，再核目标身份和主链，按需要的轮次读取正文；来源版本包含SQLite和现有WAL内容，单看文件时间无法发现WAL-only修改。WSF/Antigravity的PB文件先认证，再投影所需步骤；需要比较多个候选时仍核它们的一致性。完整fetch与新范围入口都保留坏候选、未知字段和partial诊断。
 
+对明确的Devin Desktop UUID，`read_fast(lastRounds=N)`先从对应Desktop物理文件准备近期内容，使用相对轮次并保留`DEVIN_ALIAS_VERIFICATION_PENDING`和partial。后台继续核验CLI关联，完成后发布独立的完整版本，原相对引用仍指向原正文；身份核验失败、超时或取消时，已发布范围仍可读取。指定绝对轮次的读取继续要求身份核验，不使用这个初始窗口替代。
+
+任务级`warnings`保留构建过程中各个版本的诊断，当前范围是否已核验以`sourceRangeVerified`、`requestedRangeComplete`和返回的`source`为准。查看旧`rangeRef`时仍返回该引用原版本的覆盖状态。
+
 PB目录元数据缺少工作区时，按工作区筛选会列出 `pb_workspace_metadata_unavailable`及来源覆盖缺口；指定明确对话ID仍可读取。DSH未完成帧、PB未知变体等保留partial，工具不将它们计入完整来源。首次扫描、内容哈希、解密及完整构建仍有成本，接口持续报告实际进度与已就绪范围。
