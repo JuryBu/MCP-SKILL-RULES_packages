@@ -338,7 +338,11 @@ MCP memory-store保存工程知识，也保存跨对话的交流、理解与经�
 - 需要回溯旧对话的具体修复过程或决策上下文
 - 上下文被压缩后需要恢复细节
 
-流程：先 `list` 定位 `conversationId` → `search` 关键词 → `read` 精读 → 需要更多时 `depth="full"` 深度查看。
+按目的选入口：标题或ID未知时用`list`定位；按正文词语跨对话找内容用`search_all`，确定命中后`read_hit`展开；目标已知、只读末N轮或具体轮次时优先`read_fast/prepare`，所需范围就绪后即可读、搜、定位、提取，其余历史继续准备。完整整理、`recall`或`record_manage`需要完整来源时使用`fetch`及其缓存读取入口，避免日常定点读取先等待完整构建。
+
+五端新搜索与范围入口必须显式选择具体`dataChain`：当前Codex端填`codex`，其它端为`claude-code|windsurf|antigravity|dsh`；跨端搜索显式传`dataChains`，不省略或用`auto`猜来源。`conversationId`是当前调用者稳定ID，`conversationIds`选择目标；`read_hit/read_fast/prepare`单次选一个端、一个目标。参数与来源差异以工具当前schema和`memory-store://guide`为准。
+
+搜索沿原`taskId`使用`search_all_status/cancel/resume`；分段范围准备用`prepare_status/cancel/resume`。就绪后读取末N轮用原`taskId`与`lastRounds`，省略`rangeRef`；固定引用重读、提取或定位用原`taskId`与`rangeRef`，按引用返回单轮；`search_ready`的引用选择缓存版本，范围另由块或轮次限定。兼容直接快读若返回`cachePreparation.taskId`，按其搜索缓存任务操作，优先沿响应给出的`next`调用。`read_fast`的`source`省略或填`auto/local`，不使用`forceRefresh=true`，旧缓存与LS用支持它们的旧入口。默认近期优先，可选早期；相对轮号、`partial`和未覆盖须保留，身份及总轮次未核实前不当作绝对轮次。未知任务先查原状态，不重复健康或结果未知的工作。
 
 `fetch` 负责建立或更新 Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 等宿主共用结构的持久规范化缓存，后续 search/read/full/diff 都从该缓存派生，不重复解析原始 JSONL/PB/DSH session 日志。DSH 使用只读 `dataChain="dsh"` 或别名 `deepseek-harness`，不支持 `modelChain=dsh`；`source="auto|local|ls|cache"` 可选择原始来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默省略。
 

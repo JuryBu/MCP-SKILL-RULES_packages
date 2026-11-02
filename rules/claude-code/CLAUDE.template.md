@@ -238,15 +238,16 @@ plans/
 
 ---
 
-## 四源互通体系
+## 五端互通体系
 
-当前环境已部署四个 AI 宿主的共享 MCP 体系：
+共享 MCP 可读取五端对话来源：
 - **Antigravity**（反重力 IDE，Claude 模型）
 - **Codex**（OpenAI Codex，GPT 模型；含本地 GUI 客户端与 CLI 两种，我口中的「Codex」默认指**客户端**，协作方式详见「任务分发与协作」）
 - **Claude Code**（CC 桌面版，Claude 模型，即你自己）
-- **Windsurf**（WSF IDE，Codeium + 接入多模型）
+- **Windsurf / Devin**（旧 Cascade 与 Devin Desktop / Local 会话共用 `dataChain="windsurf"`）
+- **DeepSeek Harness**（DSH，本地会话只提供数据链路）
 
-四者通过共享 HTTP Broker 接入同一组 MCP 服务器，数据互通。
+各端通过已安装的共享 MCP 读取授权范围内的数据，实际接入与可用链路以接收方部署为准。
 
 ### 链路参数（chain / dataChain / modelChain）
 
@@ -257,7 +258,7 @@ plans/
 - `windsurf` / `wsf`：强制走 Windsurf 链路（仅 dataChain，modelChain 不支持）
 - `dsh` / `deepseek-harness`：只读 DeepSeek Harness 对话链路（仅 dataChain，modelChain 不支持）
 
-支持 `dataChain`（数据来源）/ `modelChain`（模型调用）拆分的工具，未填时继承 `chain`。
+支持拆分的工具分别使用 `dataChain`（数据来源）与 `modelChain`（模型调用），旧 `chain` 保留兼容；新正文搜索与范围接口须显式选择具体来源，查询本端也填写 `claude-code`，多端用 `dataChains` 明列，禁止用 `auto` 猜来源。
 速度参考：antigravity(~18s) > codex(~30s)。后台任务轮询 30-45s。
 
 ### 模型调用优先级
@@ -272,7 +273,7 @@ plans/
 
 ## MCP memory-store 工作记忆系统
 
-**记忆统一走 MCP memory-store（四源共享），不使用 CC 原生文件记忆。** CC 自带本地 `memory/` 目录记忆机制，但它是本地的，其他三源读不到。即使系统提示引导维护本地文件记忆，也以本规则为准——所有跨窗口记忆一律 `memory_write` 进 memory-store。
+**跨窗口记忆统一写入 MCP memory-store，供已接入的宿主共享。** CC 原生 `memory/` 是本地文件记忆，本规则中的跨宿主持久化入口为 `memory_write`。
 
 ### 核心使用规范
 
@@ -305,25 +306,24 @@ plans/
 ### 获取当前对话 ID
 
 CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对话并发时按下面优先级来，别上来就用方法1**：
-- **方法 3（首选）**：`conversation_read_original(action="list", dataChain="claude-code", query="当前对话里的独特内容")` 搜索定位。用当前对话刚发生、辨识度高的内容当 query 最稳，并发也不会认错窗口。
+- **方法 3（首选）**：`conversation_read_original(action="list", dataChain="claude-code", query="标题或工作区", contextProbe="当前可见的独特原文")` 列出候选，再核对来源与上下文；按正文跨对话查找使用下文 `search_all`。
 - **方法 2（次选）**：`conversation_read_original(action="list", dataChain="claude-code")` 列出 CC 侧对话列表，再靠标题/时间认出当前这个。
 - **方法 1（兜底）**：读取 `~/.claude/projects/` 下对应项目文件夹里的 `.jsonl` 文件名（文件名即对话 ID，UUID 格式）。⚠️ 多个 CC 窗口并发时「取最新修改的 jsonl」会认错对话，只在确定单开时用。
 
-- ⚠️ **CC 对话分裂 bug**：CC 偶发一个逆天 bug——UI 上看着是同一个对话，底层对话 ID 其实已经换了，表现为你突然上下文丢失、开始胡言乱语。少数情况但要警惕。所以**找 ID 时若匹配出多个 ID，别随手抓一个**：要确认哪个最新，并核对最新这个是否涵盖了之前几个 ID 的全部内容（上下文连续、没断档），再用它。
+- **对话分裂或恢复**后 ID 变化、出现多个候选时，核对物理会话、来源元数据与前驱关系，保留未确认的关联；需要自动合并 Claude 逻辑前驱链时使用完整 `fetch`。宿主归属按 `dataChain` 与来源证据确认，ID 前缀只作标识。
 
 获取到对话 ID 后可用于：跨宿主读取对话内容、Stage Guard 绑定、记忆写入来源标记、发起 Codex 客户端协作等。
 
 ### 对话原文读取（conversation_read_original）
 
-操作最佳实践：先搜后读，逐级升深
-1. `search(query="关键词", depth="brief")` → 定位所在轮次
-2. 信息已够则无需再 read
-3. 需要更多 → `read(startRound=N, endRound=M, depth="normal")`
-4. 需要思考过程 → `depth="full", extraTypes=["thinking"]`
+新 `search_all/read_hit/read_fast/prepare` 的 `conversationId` 固定为当前调用者，目标写入 `conversationIds`；本端显式用 `dataChain="claude-code"`，跨端选具体 `dataChain` 或 `dataChains`。
 
-跨链路读取时指定 `dataChain`：antigravity / codex / claude-code / windsurf / dsh
+- 按正文跨对话查找：`search_all` → `search_all_status`，取消/恢复用 `search_all_cancel/search_all_resume`，沿同一调用者和原 `taskId`；需要展开时 `read_hit` 原样传命中的来源、目标、`sourceRevision` 与轮次。
+- 末 N 轮或定点范围：`read_fast` / `prepare`，限单端单目标，末 N 轮用 `lastRounds=N`，默认近期优先，早期准备用 `buildOrder="oldest"`。分段准备沿原任务用 `prepare_status/prepare_cancel/prepare_resume`；兼容直接快读若带 `cachePreparation.taskId`，按其搜索缓存任务操作，优先遵循响应 `next`。
+- ready 沿原 `taskId`：末 N 轮 `read_ready(lastRounds=N)` 省略 `rangeRef`；固定引用 `read_ready/extract_ready` 用 `rangeRef`（单轮），`locate_ready` 必传 `taskId` 与 `rangeRef`；`search_ready` 的 `rangeRef` 仅选缓存版本，范围用 `blockId/startRound/endRound`。
+- 保留相对轮次、`partial` 和未覆盖范围；相对轮号仅用于原块，完整覆盖按返回状态核对，未查部分继续列为未覆盖。
 
-`fetch` 会把宿主原始数据规范化为可复用缓存，后续 search/read/full/diff 从该缓存派生，不反复解析原始 JSONL/PB/DSH session 日志。`source="auto|local|ls|cache"` 可选择来源，其中 `ls` 只适用于 Windsurf/Antigravity；一次返回默认约 100K 字符，超出时使用响应给出的 `continuationCursor` / 下一段参数继续，不把截断误当成完整结果。
+完整 `fetch` 用于完整规范化、recall、Record 和 Claude 逻辑前驱链合并，旧 `search/read` 可复用已提交完整缓存；局部查找按上述范围入口读取。`search_all/read_hit/read_fast` 的 `source` 省略或填 `auto/local`；`read_fast` 不使用 `forceRefresh=true`，刷新仅用于新建 `search_all`。旧完整缓存用 `search/read(source="cache")`，`ls` 通过支持的旧入口读取。参数与长例见工具 guide 和[五端正文搜索与范围读取](../../mcps/memory-store/docs/five-host-search.md)；超出单次返回预算时按 `continuationCursor` / artifact 继续。
 `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含用户/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 `messageRoles=["user"]` 只含真实用户消息与结构化批注，`messageRoles=["subagent"]` 单独读取带昵称和对话 ID 的子代理事件；批注搜索返回命中的单条 Annotation 与命中字段，不展开整个父轮。
 
@@ -335,16 +335,15 @@ CC 不会自动告诉你当前对话 ID，但你可以自己找到它。**多对
 
 Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record/Stage Guard 从排队、恢复到完成始终查询首次返回的同一公开 taskId，不因重试或后端恢复重复新建任务。
 
-对话的结构化过程日志，`record_manage(action="update")` 触发生成。
-跨链路走 Codex 模型时建议 `background=true`。
+对话的结构化过程日志由 `record_manage(action="update")` 显式触发，绑定稳定 `conversationId`、具体 `dataChain` 和受支持的 `modelChain`；本端数据用 `claude-code`。模型与自动更新是否启用按实际部署核对，长任务沿原 `taskId` 短轮询。
 
 ### Stage Guard
 
 项目有 Plan_x 和 Task.md 时：
-- 开始前：`stage_guard(action="start", taskFiles=[...], planFiles=[...])`
+- 开始前：`stage_guard start` 传当前稳定 `conversationId`、`dataChain="claude-code"`、Plan/Task 完整绝对路径与具体 `stageId`，审核模型用受支持的 `modelChain` 选择
 - 完成后：`stage_guard(action="check")`，通过后才能标记完成
 - 连续 3 次未通过则上报用户
-- 建议传 `stageId`（如"Stage 3"）
+- 证据角色、范围与预算见[单轮 Guard 审查](../../mcps/memory-store/docs/stage-guard.md)，后台检查沿原 `taskId` 以 30～45 秒短轮询
 
 ---
 
@@ -428,7 +427,7 @@ Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record
 
 ### Codex 客户端（我平常说的「Codex」默认指这个，≠ 下面的 CLI）
 
-- **是什么**：本地另一个 GUI 客户端（四源之一，GPT 模型），通过共享 MCP 与我们这边对话互读来协作。**你（CC）启动不了它**，只能由我中转。
+- **是什么**：本地另一个 GUI 客户端（五端之一，GPT 模型），通过共享 MCP 与我们这边对话互读来协作。**你（CC）启动不了它**，只能由我中转。
 - **协作流程**：① 你把**当前对话 ID** + 要协作的具体内容告诉我 → ② 我让本地 Codex 客户端用 MCP（`conversation_read_original`, dataChain=claude-code）读你这边的对话并干活 → ③ 它干完，我把**它那边的对话 ID** 给你 → ④ 你用 `conversation_read_original`（dataChain=codex）读它的产出。
 - ⚠️ 给我对话 ID 前，先按「获取当前对话 ID」里的**对话分裂**那条确认 ID 准确、内容完整，别把分裂掉的半截对话甩过去。
 - **适合干**：大规模、严谨的代码协同实现、code review、材料寻找、搜索、内容核查。
@@ -448,7 +447,7 @@ Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record
 ## 上下文效率
 
 - 大文件先定位再精读，不要整个读完
-- record/conversation 先 search 定位，信息够就不 read 全轮
+- Record 先 search 定位，对话原文按上方正文搜索或范围入口读取，信息够时停止展开
 - memory_query 批量用 depth=summary，重要单条再 full
 - ⚠️ 文件写入安全：Python `open("w")` 截断文件，重要文件用原子写入（先临时文件→os.replace）
 

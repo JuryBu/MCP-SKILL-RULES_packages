@@ -1174,7 +1174,7 @@ export async function runStageGuard(input: Omit<z.infer<typeof StageGuardSchema>
 export function registerStageGuard(server: McpServer): void {
     server.tool(
         "stage_guard",
-        "任务完整性自动验证：start 注册守卫 → check Flash比对检查 → status 查看状态 → cancel 取消。" +
+        "任务完整性自动验证：start 注册守卫 → check 按模型链路独立检查 → status 查看状态 → cancel 取消。" +
         "配合 RULES 强制调用，每个 Stage 完成前必须 check 通过后才能标记完成。",
         StageGuardSchema.shape,
         async (params) => runStageGuard(params),

@@ -89,6 +89,11 @@ try {
     assert.ok(firstRef);
     const located = await call({ action: "locate_ready", taskId, rangeRef: firstRef });
     assert.equal(located.messages.find((message: any) => message.role === "user").text, "question-116");
+    const fixed = await call({ action: "read_ready", taskId, rangeRef: firstRef, lastRounds: 5 });
+    assert.equal(fixed.rounds.length, 1);
+    assert.equal(fixed.messages.find((message: any) => message.role === "user").text, "question-116");
+    await assert.rejects(() => call({ action: "read_ready", lastRounds: 5 }), /taskId/u);
+    await assert.rejects(() => call({ action: "locate_ready", taskId }), /rangeRef/u);
     const search = await call({ action: "search_ready", taskId, query: "question-" });
     assert.equal(search.scannedRounds, 120);
     const extracted = await call({ action: "extract_ready", taskId, rangeRef: firstRef });

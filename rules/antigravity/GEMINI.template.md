@@ -49,7 +49,7 @@ memory_query、record_manage(action="search")、conversation_read_original(actio
 Codex 轮询：sandbox_codex(action="check") 建议 30-60s 间隔
 大文件操作：超过 100 行的 Plan/Task 文件修改时用精确行号替换，100 行以内可全文重写
 记忆恢复：批量查询用 depth=summary 级别概览，重要单条可直接 depth=full
-conversation_read_original：`fetch` 负责建立或更新可复用的规范化缓存，后续 search/read/full/diff 都从同一份缓存派生，不重复解析原始源。单次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续，不静默丢内容；`maxBytes` 仍可显式收紧或放宽。
+conversation_read_original：正文查找和范围读取按下文「关于对话原文读取」选择入口；完整 `fetch` 用于完整规范化、recall、Record 等需要完整缓存的操作。单次返回默认约 100K 字符，超出时按响应给出的 `continuationCursor` / 下一段参数继续；`maxBytes` 仍可显式收紧或放宽。
 `conversation_read_original(action="recall")` 只从调用前更新并完整提交的同一 fetch cache generation 恢复上下文；`auto` 按宿主压缩信号恢复到压缩前规模约 60%，`manual` 用 `startRound/endRound`，`full` 返回临时文件。输出只含主人/引导/批注、模型可见回复与附件引用，排除 thinking、工具结果、diff、Rules 注入和压缩摘要，超约 100K 时继续使用 continuation/artifact。
 批注与子代理语义：`messageRoles=["user"]` 只含真实主人消息与结构化批注，`messageRoles=["subagent"]` 单独读取子代理事件；批注搜索返回命中的单条 Annotation、命中字段和有限片段，不展开整个父轮。
 
@@ -66,73 +66,63 @@ conversation_read_original：`fetch` 负责建立或更新可复用的规范化�
 - 对话即将结束或我要求你保存记忆时，用 memory_write/update 将本次对话的关键信息持久化，供下一个对话窗口的你使用
 - 写入记忆时要写好 searchSummary（包含关键词、近义词、技术栈），方便未来检索
 - 因为新对话的你不能知晓老对话的临时文件如浏览器子代理的图片、对话中的记录等，所以记忆系统是你和下一个窗口自己交流的黄金渠道，务必细致
-- memory-store / web-fetcher / sandbox 这几套共享 MCP 后续支持双向跨链路访问；工具支持 `chain` 参数时，统一使用 `auto | antigravity | codex` 三个取值
-- `chain="auto"` 表示优先走当前宿主；当前宿主不可用或模型调用失败时才尝试另一侧链路
-- `chain="antigravity"` 表示强制走 Antigravity 自身链路；目标宿主不在线时直接报错
-- `chain="codex"` 表示强制走 Codex 线程索引或模型桥链路；目标宿主不在线时直接报错
-- 支持 `dataChain` / `modelChain` 的工具优先使用拆分参数：`dataChain` 控制对话数据来源，`modelChain` 控制模型调用；未填时分别继承 `chain`，`chain` 未填时默认 `auto`
+- 共享 MCP 的 `dataChain` 选择对话来源，`modelChain` 选择模型，具体取值按当前工具 schema；旧 `chain` 保留兼容用途
+- memory-store 的五端数据来源为 `codex`、`claude-code`、`windsurf`（含 Devin）、`antigravity`、`dsh`；Windsurf 与 DSH 只提供数据链路，审核或摘要模型另选受支持的 `modelChain`
+- 新正文搜索与范围接口须显式指定具体 `dataChain`，查询本端也填写 `antigravity`；多端查询用 `dataChains` 明列来源，调用方负责填写，禁止用 `auto` 猜来源
 - `record_manage(update)`、`conversation_golden_extract`、`conversation_read_original(search, mode="smart")` 可拆分数据链路和模型链路；`memory_query`、`memory_batch(query)`、`memory_write`、`memory_update`、`memory_stats(enhance)`、`web_fetch_page ai_summary`、`web_fetch_rich ai_summary`、`web_inspect ai_review`、`smart_search(mode="smart")` 只使用 `modelChain`，旧 `chain` 继续作为兼容别名
 - `stage_guard` 的对话数据必须绑定当前宿主的明确 `conversationId`，不要跨宿主操作异源 Guard；可通过 `modelChain` 选择审核模型
-- Codex 链路的 MCP 模型桥默认使用 `gpt-5.5`、`model_reasoning_effort=medium`、`model_speed_tier=fast`；如需调试可通过各 MCP 的环境变量覆盖
+- Codex 链路的 MCP 模型桥按当前组件配置选择模型、推理强度与速度档位，核对实际调用参数，不沿用旧型号说明
 - Codex 侧同步 MCP 调用存在宿主超时窗口；跨链路调用 Codex 做 Record、Stage Guard、Golden Extract 这类长模型任务时，优先使用后台模式拿 `taskId`，再用同工具短轮询结果
 - 跨链路调用 Codex 做 `web_fetch_page(outputMode="ai_summary", modelChain="codex")` 时，长网页也建议加 `background=true`，再用 `web_fetch_page(taskId="...", waitSeconds=45)` 查询摘要结果
 - 跨链路调用 Codex 做 `smart_search(mode="smart", modelChain="codex")` 时，大目录或长文件建议加 `background=true`，再用 `smart_search(taskId="...", waitSeconds=45)` 查询；`sandbox_codex` 继续使用其原有后台任务机制
 - 后台任务轮询不要把 `waitSeconds` 设到 60 秒以上；Codex MCP 客户端自身通常有约 60 秒请求上限，建议用 30-45 秒短轮询
 
 关于对话原文读取
-当前已部署 conversation_read_original 工具（v1.23+），可绕过 CHECKPOINT 上下文压缩机制，并为 Codex、Claude Code、Windsurf、Antigravity、DeepSeek Harness 建立同结构的持久 fetch 缓存。DSH 只作为只读 `dataChain="dsh"`，不提供模型链；`source="auto"` 以本地 JSONL/PB/DSH session 日志为一等来源并按需比较 LS，`local` 只读本地源，`ls` 仅用于 Windsurf/Antigravity，`cache` 只读上一份完整可用的 fetch 缓存。
-v1.8+: LS 对话数据不可用时自动降级到 Record（对话过程日志）；Antigravity LS 环境下 fetch 后新增轮次≥3 自动后台触发 Record 更新。Codex wrapper 环境默认关闭隐式自动 Record，需要显式调用 record_manage(action="update", dataChain="codex", modelChain="codex", conversationId="...", background=true)。
+conversation_read_original 支持五端正文搜索、范围准备和完整规范化缓存。本端填写 `dataChain="antigravity"`；跨端按目标来源填写，宿主归属以来源元数据核对。`search_all/read_hit/read_fast` 的 `source` 省略或填 `auto/local`；`read_fast` 不使用 `forceRefresh=true`，刷新仅用于新建 `search_all`。旧完整缓存用 `search/read(source="cache")`，`ls` 通过支持的旧入口读取。
 - 触发场景（应主动使用）：
   · CHECKPOINT 压缩后需要恢复丢失的上下文细节（最常见场景）
-  · 新对话中需要回溯旧对话的具体操作过程（传 conversationId 参数）
+  · 新对话中需要回溯旧对话的具体操作过程
   · 主人问及历史操作的具体细节（"怎么修的"、"怎么探索的"等过程性知识）
   · 对历史结论拿不准时，搜索原文做事实核查
 - 行为信号（识别到以下信号时应主动触发搜索，不要凭压缩摘要回答）：
-  · 主人说"我们之前讨论过"、"你之前做的"、"之前定的方案" → 先 search 确认原文再回答
-  · 主人提到具体技术细节但你只有模糊印象（可能被 CHECKPOINT 压缩了）→ search 核实
+  · 主人说"我们之前讨论过"、"你之前做的"、"之前定的方案" → 按下方正文搜索入口核对原文再回答
+  · 主人提到具体技术细节但你只有模糊印象（可能被 CHECKPOINT 压缩了）→ 查原文核实
   · 上方有 CHECKPOINT 标记且主人在问细节 → 你读到的只是摘要，必须查原文
-  · 别的 AI/对话反馈的问题涉及当前对话中的设计决策 → search 找到当时的决策上下文
-- 操作最佳实践（先搜后读，逐级升深）：
-  0. 只知道标题或短 ID 时，先 `conversation_read_original(action="list", query="标题或短ID", dataChain="codex|antigravity")` 找完整 `conversationId`
-  1. search(query="关键词", depth="brief") → 定位关键词所在轮次 + 前后上下文
-  2. search 结果已包含匹配轮次的上下文片段，如果信息已足够则无需再 read 同一轮次（避免重复占用上下文）
-  3. 仅当需要更多细节时 → read(startRound=N, endRound=M, depth="normal") 精读 search 中未覆盖的轮次
-  4. 仍需思考过程/工具结果 → read(..., depth="full", extraTypes=["thinking"]) 深度查看
-  · 不需要手动 fetch，search/read 会自动触发拉取
-  · fetch/search/read/export 必须显式传稳定 `conversationId`；共享 broker 后端不能安全推断调用方的“当前对话”
+  · 别的 AI/对话反馈的问题涉及当前对话中的设计决策 → 查找当时的决策上下文
+- 操作入口（参数和长例见工具 guide 与[五端正文搜索与范围读取](../../mcps/memory-store/docs/five-host-search.md)）：
+  · 新 `search_all/read_hit/read_fast/prepare` 的 `conversationId` 固定为当前调用者，目标放 `conversationIds`；本端明确用 `dataChain="antigravity"`，跨端用具体 `dataChain` 或 `dataChains`。只知道标题或短 ID 时先 `list` 核对目标，ID 前缀只作标识
+  · 按正文跨对话找内容用 `search_all` → `search_all_status`；取消/恢复用 `search_all_cancel/search_all_resume`，沿同一调用者和原 `taskId`。需要展开时 `read_hit` 原样传命中的来源、目标、`sourceRevision` 与轮次
+  · 末 N 轮或定点范围用 `read_fast` / `prepare`，限单端单目标；末 N 轮用 `lastRounds=N`，默认近期优先，早期准备用 `buildOrder="oldest"`。分段准备沿原任务用 `prepare_status/prepare_cancel/prepare_resume`；兼容直接快读若带 `cachePreparation.taskId`，按其搜索缓存任务操作，优先遵循响应 `next`
+  · ready 沿原 `taskId`：末 N 轮 `read_ready(lastRounds=N)` 省略 `rangeRef`；固定引用 `read_ready/extract_ready` 用 `rangeRef`（单轮），`locate_ready` 必传 `taskId` 与 `rangeRef`；`search_ready` 的 `rangeRef` 仅选缓存版本，范围用 `blockId/startRound/endRound`
+  · 保留相对轮次、`partial` 和未覆盖范围；相对轮号只用于原块，完整覆盖按返回状态核对，未查部分继续列为未覆盖
+  · 完整 `fetch` 继续用于完整规范化、recall、Record 和 Claude 逻辑前驱链合并；旧 `search/read` 可复用已提交完整缓存，局部查找按上述范围入口读取
   · extraTypes（thinking/tool_results/code_diffs）体积大，仅在明确需要时拉取
   · 读取对话历史时如果遇到图片/附件路径（如临时目录下的 .png、.jpg 文件），要主动用 view_file 查看内容，不要只报路径给主人——图片往往是理解对话上下文的关键信息
 - 与 memory_query 的分工：
   · memory 存的是跨对话持久化的精炼知识 → 优先查 memory
   · conversation_read_original 读的是单次对话原始完整记录 → memory 没有再查原文
-  · 主人通过 @[conversation:...] 引用对话时，brain/{conversation-id}/ 只有 AI 生成的 artifacts，不是完整对话内容 → 需要详情就用 conversation_read_original(conversationId=该ID) 主动搜索
+  · 主人通过 @[conversation:...] 引用对话时，用 `conversationIds` 指定目标并核对来源，再查原文；brain/{conversation-id}/ 保存的是 AI 生成的 artifacts
   · 两个工具不是孤立的——如果你对某个概念有模糊印象（如"水桶理论"），应自然地先 memory_query 搜精炼知识，如果记忆中提到了来源对话或你需要更多上下文，就顺着用 conversation_read_original 去那个对话里深入搜索；反过来如果主人 @ 了一个对话让你看，你也可以在搜到关键信息后检查 memory 里是否已有相关精炼总结可以直接用
 - 如果显式指定 `dataChain="codex"`，则对话原文来自 Codex 的本地线程索引和原始事件流，轮次是重建结果
 - `Codex` 链路下如果出现子代理线程，默认优先显示引用卡片或摘要，不直接揉进主线程正文；只有明确需要时才展开子线程全文
-- 如果只知道对话标题、短 ID 或关键词，例如“修复 Plan_3 功能”，先用 `conversation_read_original(action="list", dataChain="codex", query="修复 Plan_3 功能")` 或 `record_manage(action="search", query="Plan_3", scope="global")` 定位完整 ID，再按轮次 `search/read` 精读
 
 关于对话记录 Record（v1.8+）
-Record 是对话粒度的结构化过程日志（Phase-based），由 Flash 自动生成，永久存储在 records/ 目录，抗 LS 过期。
-- 用 record_manage(action="update") 手动触发生成/更新当前或指定对话的 Record；需要跨组合时用 `dataChain` 指定对话来源、`modelChain` 指定生成模型；跨链路走 Codex 模型时建议加 `background=true`，再用 `record_manage(action="task_status", taskId="...", waitSeconds=45)` 查询；Codex 后台 Record 每批模型调用默认允许 5 分钟，可用 `MEMORY_STORE_CODEX_RECORD_BACKGROUND_TIMEOUT` 覆盖
+Record 是对话粒度的结构化过程日志，按实际选择的模型生成，持久保存在 records/ 目录。
+- 在授权范围内用 `record_manage(action="update")` 生成或更新，显式填写稳定 `conversationId`、具体 `dataChain` 与受支持的 `modelChain`；本端数据用 `antigravity`。沿返回的原 `taskId` 用 `task_status` 短轮询，自动更新是否启用以实际部署状态为准
 - Record 只接纳已校验且未过期的 fetch 缓存 generation；后台 Record/Guard 从排队、恢复到完成始终查询首次返回的同一公开 taskId，不因重试或后端恢复重复新建任务
-- record_manage 支持 9 个 action: update/list/read/search/edit/delete/batch_update/batch_delete/task_status
-- 自动触发：Antigravity LS 环境下所有工具调用自动节流检查（60s 间隔），当前对话轮次增量≥3 后台异步更新 Record；Codex wrapper 环境默认只响应显式 record_manage update
-- Flash 重试：首次失败自动等 5s 重试 1 次，降低随机超时失败率
-- 批量更新：batch_update 后台 2 并发 worker 池，waitSeconds 等待查询进度
 - 原始源暂时不可用时可显式 `source="cache"` 读取上一份完整可用的 fetch 缓存；Record 是独立的结构化过程日志，只在没有原文缓存、且任务只需过程摘要时作为降级材料，不能冒充完整原文
-- 编辑 Record 时 append 模式会自动标记 [手动补充]，后续 Flash 更新会保留这些内容
+- 编辑 Record 时 append 模式会标记 [手动补充]，后续模型更新保留这些内容
 - Record 定位：介于原始对话（太重）和精炼记忆（太轻）之间的中等粒度日志，适合查阅历史操作决策过程
-- `record_manage`、`conversation_golden_extract`、`conversation_read_original` 这些工具在支持双向跨链路后，默认优先使用 `chain="auto"`；需要跨宿主取数或验证时再显式指定 `dataChain` / `modelChain`
+- `record_manage`、`conversation_golden_extract` 按实际来源与模型分别填写链路；新原文接口继续遵循上方显式来源要求
 
 关于 Stage Guard 任务完整性验证
-当项目有 Plan_x 和 Task.md 时，每个 Stage 开始前调用 stage_guard(action="start", taskFiles=[...], planFiles=[...])，完成后调用 stage_guard(action="check")。check 通过后才能标记 Stage 完成并通知主人。跨链路走 Codex 模型时建议 `stage_guard(action="check", modelChain="codex", background=true)`，再用 `stage_guard(action="check", taskId="...", waitSeconds=45)` 查询。
+当项目有 Plan_x 和 Task.md 时，`stage_guard start` 绑定当前调用者的稳定 `conversationId`、`dataChain="antigravity"`、Plan/Task 完整绝对路径与具体 `stageId`，审核模型用受支持的 `modelChain` 选择。完成后 `check`，通过后再标记 Stage 完成；后台检查用 `background=true`，沿原 `taskId` 以 30～45 秒短轮询。证据角色、范围和预算见[单轮 Guard 审查](../../mcps/memory-store/docs/stage-guard.md)。
 - start 会在 Task.md 头部插入 🔒 标记，check 通过后自动移除
 - 连续 3 次 check 未通过则必须上报主人裁定
-- 如认为 Flash 误判，可在 check 时传入 appealNote 说明理由
+- 如认为审核结论有误，可在 check 时传入 appealNote 与依据
 - 主人可随时调用 stage_guard(action="status") 查看或 stage_guard(action="cancel") 取消
-- 建议 start 时传入 stageId（如"Stage 3"），Flash 会聚焦检查当前 Stage 而非翻出所有历史遗留未完成项
 - 如果显式要求使用另一侧模型链路，先确认目标宿主在线；不要在主人明确指定链路后悄悄回退到本地链路
-- 在 Codex 侧使用 stage_guard 时必须显式传入稳定的 `conversationId`；如果不知道当前线程 ID，先用 `conversation_read_original(action="list", dataChain="codex", query="标题或关键词")` 定位完整 ID，再把同一个 ID 用于后续 `start/status/check/cancel`
+- 不知道当前对话 ID 时，先 `conversation_read_original(action="list", dataChain="antigravity", query="标题或工作区")` 核对来源，再把同一个 ID 用于后续 `start/status/check/cancel`
 
 关于旧版工作记忆的兼容
 有些老项目根文件夹下可能存在「工作记忆」或「对话记忆」文件夹，里面有手写的 memory_x_yyy.md 系列文件，这是 MCP memory-store 部署前的旧方案。如果你在项目中看到这类文件夹，应当阅读理解其中内容作为上下文，并考虑将有价值的内容迁移到 MCP memory-store 中。新项目不再使用这种手动方式。

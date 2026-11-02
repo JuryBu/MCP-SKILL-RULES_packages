@@ -4,7 +4,7 @@
 
 ## 选择来源和目标
 
-`conversationId` 始终填写当前调用者的稳定ID。新查询必须显式填写具体 `dataChain`；查询当前端时，调用者也填写当前端的具体值。多个端同时查找用 `dataChains`。`auto`无法指定本次搜索范围，省略来源会返回修正参数的提示。
+本页新入口的`conversationId`填写当前调用者的稳定ID，`conversationIds`选择目标；旧`fetch/read/search/export`的`conversationId`按对应schema指定目标。新查询必须显式填写具体 `dataChain`；查询当前端时，调用者也填写当前端的具体值。多个端同时查找用 `dataChains`。`auto`无法指定本次搜索范围，省略来源会返回修正参数的提示。
 
 | 参数 | 作用 | 示例 |
 |---|---|---|
@@ -35,7 +35,9 @@
 
 `read_fast(lastRounds=N)`默认优先准备最新N轮，`prepare`还可用 `buildOrder="oldest"`优先早期内容。`prepareCache=false`只准备所需窗口；默认后台继续完整构建。状态、取消与恢复分别使用 `prepare_status`、`prepare_cancel`、`prepare_resume`，始终沿原任务操作。
 
-范围就绪后可立即 `read_ready`、`search_ready`、`locate_ready`、`extract_ready`，无需等待其它历史。`rangeRef`绑定原来源、版本和块，完整历史构建后旧引用仍可读。相对轮号仅用于该块，确认总轮次后再使用绝对轮号。
+范围就绪后，读取末N轮用原`taskId`与`lastRounds`并省略`rangeRef`；固定引用重读或提取用原`taskId`与`rangeRef`，返回该引用的一轮，`locate_ready`也必须同时传两项。`search_ready`的`rangeRef`只选择缓存版本，查询范围由`blockId/startRound/endRound`限定，无需等待其它历史。`rangeRef`绑定原来源、版本和块，完整历史构建后旧引用仍可读。相对轮号仅用于该块，确认总轮次后再使用绝对轮号。
+
+默认末N轮快读使用上述分段任务，`prepare_status`通过`afterProgressRevision`等待新增内容。指定`startRound/endRound`或显式`progressive=false`时直接返回正文；若响应附带`cachePreparation.taskId`，该搜索缓存任务使用`search_all_status/cancel/resume`。`read_fast`的`source`省略或填写`auto/local`，不使用`forceRefresh=true`；旧缓存和LS来源使用支持它们的旧入口。以实际响应给出的`next`与任务种类继续，不混用状态入口，详见[完整参数示例](local-corpus-search.md)。
 
 | 字段 | 含义 |
 |---|---|

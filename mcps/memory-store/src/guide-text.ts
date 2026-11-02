@@ -16,6 +16,22 @@ export const GUIDE_TEXT = `# MCP Memory Store v${VERSION} 使用指南
 - 全局概览: memory_query(scope="global") 查看所有工作区
 - 写入记忆: memory_write(title, content, searchSummary, tags, workspace)
 
+## 五端搜索与构建好即用（v1.27）
+
+Codex、Claude Code、Windsurf/Devin、Antigravity、DeepSeek Harness 共用正文组合搜索和范围准备入口。新请求必须显式选择具体 dataChain：codex、claude-code、windsurf、antigravity 或 dsh；多端正文搜索使用 dataChains。查询当前端时也由调用者填写当前端的具体值，不省略来源或使用 auto 猜测。
+
+这些新入口的conversationId是当前调用者的稳定ID，conversationIds是目标对话ID数组；旧fetch/read/search/export的conversationId按其schema指定目标。单次新范围读取或命中展开只选择一个端、一个目标。不同端的相同ID分别保留，桌面ID与词对ID只在来源核验后关联。WSF和DSH只提供对话数据，不能作为modelChain。
+
+- 按标题或ID找对话：list；按正文词语跨对话搜索：search_all，使用 allTerms/anyTerms/excludeTerms 组合交集、并集、排除，workspaces/conversationIds/messageRoles 限定范围。intersectionScope 可选同一对话、同轮或同消息。结果带来源、次数、命中轮次、原文片段和 sourceRevision。
+- 动态搜索：沿原调用者和 taskId 使用 search_all_status；afterRevision 消费增量，search_all_cancel/search_all_resume 取消或继续原任务。read_hit 同时传当前调用者conversationId、命中的dataChain、目标conversationIds、sourceRevision及startRound/endRound。pending修订尚未核验时，先用read_fast获取当前范围。
+- 已知目标先准备所需范围：prepare或默认read_fast(lastRounds=N)返回分段准备taskId，buildOrder="latest|oldest"选择近期或早期优先，prepareCache=false只准备所需范围；默认同一任务继续完整构建。沿原taskId使用prepare_status/prepare_cancel/prepare_resume；prepare_status用afterProgressRevision等待新增内容，不把准备任务交给search_all_status。
+- read_fast指定startRound/endRound或显式progressive=false时直接返回正文；响应若带cachePreparation.taskId，使用其中原任务的search_all_status/cancel/resume。read_fast的source省略或填写auto/local，不使用forceRefresh=true；强刷仅用于新建search_all，旧完整缓存使用旧search/read(source="cache")，LS来源通过支持它的旧入口读取。优先使用响应给出的next调用，不混用两类任务。
+- 范围就绪后，read_ready读取末N轮用原taskId与lastRounds，省略rangeRef；read_ready/extract_ready固定引用重读或提取用原taskId与rangeRef，返回该引用的一轮。locate_ready必须同时传这两项；search_ready的rangeRef选择缓存版本，范围由blockId/startRound/endRound限定。其它历史继续准备。messageRoles默认正文，可按需要选择工具或子代理内容。相对轮号只属于该块，身份或总轮次未核实时保留partial和缺口，不当作绝对轮次；已发布旧引用在完整构建和进程重开后保持对应原内容。
+
+完整fetch继续用于完整规范化缓存、recall及Record等需要完整来源的任务；日常快读和关键词找对话直接选择对应新入口。requestedRangeComplete表示本次所需范围可确认完整，fullSourceComplete表示整个来源完成，未查范围不能计作零命中。来源改变后核修订，失败保留已发布缓存，不跳过内容认证。
+
+单端搜索示例：{"action":"search_all","conversationId":"caller-id","dataChain":"claude-code","allTerms":["缓存","轮次"]}。多端搜索将dataChain替换为dataChains:["codex","windsurf"]。快读示例：{"action":"read_fast","conversationId":"caller-id","dataChain":"dsh","conversationIds":["target-id"],"lastRounds":3}。完整参数与来源差异见随包docs/five-host-search.md；详细搜索教程见docs/local-corpus-search.md。
+
 ## 长对话查询与缓存（v1.25.6）
 
 Codex 的 search/read 省略 source 时只读已发布缓存。响应显示 generation、缓存时间/年龄、实际视图与本次原文校验状态；显式 source="auto" 或 "local"、fetch 继续检查原始来源，source="cache" 保持离线读取。缺少所需 link 视图或缓存损坏时，按响应里的同设置 fetch 调用恢复，完成后沿用返回的实际 link。
@@ -24,7 +40,7 @@ search 支持 messageRoles 和 startRound/endRound，先筛选再匹配、限量
 
 长 fetch 的文件头/边界检查仅用于进入后台任务，完整前缀 SHA 在 worker 内捕获并在发布前校验。在途同源同视图刷新共用原 taskId，完成后的新刷新重新校验；background_task_status 的一次等待取消与 background_task_cancel(taskId) 的任务级取消分别处理。严格刷新失败仍保留上一份完整缓存，需读旧代时显式使用 source="cache"。
 
-## 11 个工具
+## 工具说明
 
 ### Record归属核查范围与续页（v1.25.7）
 
@@ -103,7 +119,7 @@ format="json"和structuredContent包含items、selection、coverage、sourceTimi
 
 ### conversation_read_original — 读取对话原文 (v1.4+)
 - 绕过 CHECKPOINT 压缩机制，读取对话的真实完整内容
-- 六类操作：list(列出候选) / fetch(拉取缓存) / search(关键词搜索) / read(范围阅读) / export(持久导出 Markdown/PDF) / deep_locate(后台深搜定位)
+- 按需选择：list定位标题/ID；search_all跨对话正文组合搜索；read_hit展开确定命中；read_fast/prepare先准备所需范围并用ready入口读取；fetch/read/search提供完整规范化缓存路径；export持久导出；deep_locate后台候选定位
 - list/search 均支持 mode="auto|exact|fuzzy|smart"；list 会综合标题、ID、工作区、Record 摘要和近期上下文指纹定位对话
 - list 的标题、ID、来源、工作区和主/子线程查询走轻量元数据定位；只有正文搜索才使用候选预算和 deep_locate
 - Codex list 快查止血(v1.13.0): dataChain="codex" 且 mode="auto" 时，query 未命中不会自动读取多个超大 JSONL 原文预览，也不会自动触发 smart 模型搜索；若 query 是古老正文片段，会提示后续使用 deep_locate 后台深搜能力
@@ -175,11 +191,11 @@ format="json"和structuredContent包含items、selection、coverage、sourceTimi
 
 ### Auto Summary 双轨制 (v1.5+)
 - memory_write 的 searchSummary 参数现在是可选的
-- 写入后系统自动用 Gemini 3 Flash 生成 autoSummary（异步，不阻塞返回）
+- 写入后系统异步生成autoSummary，默认模型链路Grok优先，显式modelChain保持指定范围，不阻塞返回
 - 搜索时 autoSummary 和 searchSummary 合并匹配，大幅提升检索召回率
 - memory_update 修改 content/append 时自动重新生成 autoSummary
 - memory_stats(action="enhance"): 批量为所有缺少 autoSummary 的老记忆生成
-- 需要 LS 可用（IDE 运行中），LS 不可用时静默跳过
+- 新建、更新和补缺统一校验完整停用通知、服务错误包装与空响应，记录实际provider/model、时间及失败来源；生成失败保留已有摘要，正文改变时提交前重新核版本。确认异常的旧摘要使用docs/auto-summary-repair.md的定点检查/备份/恢复流程，正常摘要不批量重生
 
 ### conversation_golden_extract — 黄金片段提取 (v1.5+)
 - 从对话中提取关键决策、发现、踩坑经验
@@ -198,7 +214,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - **诊断日志**：%TEMP%\\mcp-memory-stdin-log.txt
 
 ### record_manage — 对话记录管理 (v1.8+ / Reader v1.12+)
-- Record 是对话过程日志，Flash 自动生成，永久存于 records/，抗 LS 过期
+- Record是对话的结构化过程日志，按modelChain调用模型生成，永久存于records/并保留来源和版本
 - action: update/list/read/search/guide/edit/delete/batch_update/bulk_update/batch_delete/task_status/cancel/recover/audit_ownership/repair_ownership/migrate_unknown_chain/stale_check
 - 自动触发: Antigravity LS 环境下所有工具调用自动节流检查（60s 间隔），轮次增量≥3 后台更新；同一对话同一工作区已有 pending 时跳过重复触发
 - Codex wrapper 环境默认关闭后台自动 Record，避免普通查询隐式拉起模型桥；需要时可设 MEMORY_STORE_CODEX_AUTO_RECORD=1 显式开启
@@ -245,7 +261,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 ### stage_guard — 任务完整性验证 (v1.9+ / 分段取证 v1.13.4+ / 外部证据 v1.13.7+)
 - ⚠️ 当项目有 Plan_x 和 Task.md 时，每个 Stage 开始前必须 start，完成后必须 check 通过才能标记完成
 - 四层防御网防止 CHECKPOINT 压缩导致任务遗漏
-- action: start(注册守卫) / check(Flash比对验证) / status(查看状态) / cancel(取消)
+- action: start(注册守卫) / check(按modelChain独立核验) / status(查看状态) / cancel(取消)
 - 有Plan/Task时start明确传入taskFiles、planFiles的完整绝对路径及具体stageId；工具先核可读文件和阶段，再注册或force替换。单文件小任务可省Plan，旧注册身份与原任务恢复保留
 - GuardKey = conversationId + stageId + childScopeId（默认 main）；guardId 标识某一次不可变实例，旧后台 check 返回时会先比对 guardId，过期结果不得写历史、移锁或清理新 Guard
 - 子任务 Guard 传 childScopeId 时必须同时传 scopeSelectors（Task 编号、小标题或稳定锚点）；scopeSelectors 才定义审核内容，childScopeId/job_id 只负责区分实例
@@ -276,7 +292,7 @@ MCP 进程与父 LS 绑定（ppid），与窗口同生共死：
 - Record search / conversation list+search / memory_query / memory_batch(query) 均已升级
 - exact: 多词分词 AND 匹配（precise grep）
 - fuzzy: Fuse.js 模糊匹配（“大概记得”场景）
-- smart: Flash 语义搜索（自然语言问题）
+- smart: 按modelChain执行语义搜索（自然语言问题）
 - auto: exact → fuzzy fallback（默认）
 - Record search 已去掉 ~ 前缀 hack，默认走 auto 模式
 

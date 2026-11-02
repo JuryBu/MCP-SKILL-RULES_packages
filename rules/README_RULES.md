@@ -11,6 +11,7 @@ This folder contains privacy-scrubbed Rules templates for each host:
 - `codex/system-prompt.template.md` → common Codex baseline paired with the profile AGENTS.
 - `antigravity/GEMINI.template.md` → merge into the receiver's Antigravity rules file.
 - `claude-code/CLAUDE.template.md` → merge into the receiver's Claude Code rules file.
+- `dsh/60-context-memory.template.md` → merge the minimal Memory Store fragment into the existing `~/.dsh/rules/60-context-memory.md` section; preserve host context/Record/thread rules and verify actual request loading separately.
 - `windsurf/global_rules.template.md` → short per-conversation Windsurf rules.
 - `windsurf/system_rules/*.template.md` → long-lived Windsurf system rules, split by concern; on Devin Desktop (Devin Local) install them under `~/.devin/rules/` with a `trigger: always_on` frontmatter.
 - `windsurf/DEPLOYMENT.md` → host-neutral deployment, compatibility, and rollback guidance, including the Devin Desktop layout and rule budget.
@@ -31,6 +32,10 @@ For selective cross-machine updates, compare both rule files and preserve receiv
 Reinstallation replaces the composed AGENTS file: supply the receiver's existing private `-LocalOverridePath` on every rebuild/install. The installer does not extract a private tail from an old mixed AGENTS file. Before updating such a file, separate and verify its private overlay; do not treat an installation without that argument as automatic preservation. Existing files are backed up, and unrelated private guidance files are left untouched.
 
 Shared MCP capabilities vary by host. Use `chain`, `dataChain`, and `modelChain` only when the installed tool documents them, and treat Windsurf-specific automation as opt-in rather than a default shared capability.
+
+The new five-host search/range entrypoints use the caller's stable `conversationId` and `conversationIds` to select targets, with an explicit concrete `dataChain` or multi-source `dataChains` for search; range reads select one host and one target. The caller fills its own host rather than inferring it through `auto`. Windsurf/Devin and DSH are data-only sources. Keep workflows in each host's memory fragment and long examples in the tool guide and [five-host search reference](../mcps/memory-store/docs/five-host-search.md).
+
+`read_fast` accepts an omitted `source` or `auto/local` without `forceRefresh=true`; refresh applies only to a new `search_all`. Ready selectors differ by action: follow response `next` and the host memory fragment rather than requiring `rangeRef` for every ready call.
 
 After import, the receiver should set personal style, host-specific paths, installed tools, model preferences, and authorization locally.
 

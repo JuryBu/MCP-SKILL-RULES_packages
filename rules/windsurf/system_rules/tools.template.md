@@ -35,8 +35,8 @@
 
 ## MCP 跨链路访问
 
-共享 MCP 支持跨宿主，参数拆为 dataChain（对话数据来源：auto|antigravity|codex|claude-code|cc|windsurf|wsf|dsh|deepseek-harness）与 modelChain（smart 搜索/摘要调用的模型：auto|antigravity|codex|claude-code|cc|grok|agy，其中 grok / agy 仅在接收方安装了对应本地代理或 CLI 时可用）；旧参数 chain 仍兼容，按取值自动归入其一。
-dataChain=windsurf 读 WSF 对话——memory-store ≥1.25 起旧 Windsurf Cascade（.pb）与 Devin Desktop / Devin Local 会话（`sessions.db` + `acp-messages`）内部自动路由，UUID 与 Devin 文字会话 ID 皆可；Devin 会话 source 用 auto/local/cache，`ls` 仅旧 Cascade。dataChain=dsh 只读 DeepSeek Harness session；modelChain 不支持 windsurf 或 dsh。速度：antigravity(~18s)>codex(~30s)。后台轮询 30-45s。
+共享 MCP 的 `dataChain` 选择对话数据来源，`modelChain` 选择模型，取值以当前工具 schema 为准；旧 `chain` 保留兼容。新原文搜索和范围接口须由调用方显式填写具体来源，本端为 `windsurf`，多端用 `dataChains` 明列；来源/刷新限制与各类 ready 参数统一见 `memory` 片段，优先遵循响应 `next`。
+`dataChain="windsurf"` 同时覆盖旧 Cascade 与 Devin Desktop / Local；Devin 的旧读取入口可用 `source="auto|local|cache"`，`ls` 仅适用于支持它的旧 Cascade / Antigravity 入口。`dataChain="dsh"` 只读 DeepSeek Harness；Windsurf 与 DSH 都只提供数据链路，模型另选受支持的 `modelChain`。后台沿原 `taskId` 以 30～45 秒短轮询。
 
 ## MCP web-fetcher
 

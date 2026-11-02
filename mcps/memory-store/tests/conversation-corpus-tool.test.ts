@@ -64,6 +64,8 @@ assert.equal(calls.filter(call => call.operation === "prepare").length, preparat
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "caller-a", conversationIds: ["target", "other"], lastRounds: 1 }, api), /一个目标/u);
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", sourceRevision: "old", lastRounds: 1 }, api), /read_hit/u);
 await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", startRound: 4, endRound: 3 }, api), /startRound/u);
+for (const source of ["cache", "ls"] as const) await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", source, lastRounds: 1 }, api), /source=auto\/local/u);
+await assert.rejects(() => runCorpusAction({ action: "read_fast", conversationId: "target", forceRefresh: true, lastRounds: 1 }, api), /forceRefresh仅用于新建search_all/u);
 await assert.rejects(() => runCorpusAction({ action: "search_all", query: "word" }, api), /调用者/u);
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", startRound: 1 }, api), /sourceRevision/u);
 await assert.rejects(() => runCorpusAction({ action: "read_hit", conversationId: "target", sourceRevision: "revision-a" }, api), /限定读取范围/u);

@@ -33,11 +33,11 @@ import { modelChainInputSchema } from "./schema-utils.js";
 export function registerWrite(server: McpServer): void {
     server.tool(
         "memory_write",
-        "写入一条新的记忆。自动检测当前工作区下是否有相似记忆并提醒。searchSummary 可选（v1.5+），系统会自动用 Flash 生成 autoSummary 补充。",
+        "写入一条新的记忆。自动检测当前工作区下是否有相似记忆并提醒。searchSummary 可选，系统异步按模型链路生成 autoSummary，默认 Grok 优先，并校验服务通知和记录实际来源。",
         {
             title: z.string().describe("简短标题（建议 < 50 字）"),
             content: z.string().describe("markdown 格式正文（上限 15KB）"),
-            searchSummary: z.string().optional().describe("AI 撰写的搜索优化摘要（可选，Flash 会自动生成 autoSummary 补充）"),
+            searchSummary: z.string().optional().describe("AI 撰写的搜索优化摘要（可选，系统会按模型链路生成 autoSummary 补充）"),
             tags: z.array(z.string()).describe("标签数组"),
             workspace: z.string().optional().describe("工作区路径，不传使用 general"),
             category: z.enum(["problem-solution", "technical-note", "conversation", "general"]).optional().describe("分类，默认 general"),

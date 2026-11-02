@@ -1,4 +1,4 @@
-# MCP Memory Store v1.27.0
+# MCP Memory Store v1.27.1
 
 ## 本地检索与分段就绪读取
 
@@ -274,7 +274,7 @@ v1.19.0 起，WSF `fetch` 强制刷新并写入 last-good cache，后续 `read/s
 
 ### 对话定位
 
-本机 Codex 的全库正文组合搜索、动态结果和指定轮次快读见[本地全文搜索与快速读取](docs/local-corpus-search.md)。`search_all` 使用一个可查询、取消和恢复的持久任务；`read_fast` 可直接取得所需正文，并行准备完整正文缓存。
+五端正文组合搜索、动态结果和指定轮次快读的参数及示例见[本地全文搜索与快速读取](docs/local-corpus-search.md)，来源差异见[五端搜索与范围读取](docs/five-host-search.md)。`search_all` 使用可查询、取消和恢复的持久搜索任务；`prepare`和默认末N轮`read_fast`沿分段准备任务先发布所需正文，随后继续补齐。直接范围快读若返回`cachePreparation.taskId`则按搜索缓存任务继续，优先使用响应给出的`next`，分别使用对应的状态、取消与恢复入口。
 
 `conversation_read_original(action="list")` 可按标题、工作区路径、ID 片段、已有 Record 摘要和近期上下文指纹列出候选对话，适合只知道界面标题、短 ID 或当前对话片段但不知道完整 `conversationId` 的场景。Codex 链路支持唯一 ID 前缀解析，Record 的 read/edit/delete 也支持唯一短前缀。标题、ID、来源、工作区和主/子线程筛选走轻量元数据定位；`query` 中用空格分开的词会按“或”匹配候选，完整 ID/标题仍优先。正文片段检索仍应使用 `search` 或 `deep_locate`，避免把古老超长对话全量塞进同步 list。
 

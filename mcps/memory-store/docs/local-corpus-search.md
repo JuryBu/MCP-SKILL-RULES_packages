@@ -1,10 +1,10 @@
 # 本地对话全文搜索与快速读取
 
-`conversation_read_original` 的 `search_all` 在本机 Codex 对话中按正文查找，覆盖会话目录和归档目录里的明文、压缩历史。结果按对话分组，提供命中轮次、原文片段、各词出现次数、命中消息数和来源版本。默认读取真实用户与主助手正文，工具和子代理内容按 `messageRoles` 选择。
+`conversation_read_original` 的 `search_all` 支持本机Codex、Claude Code、Windsurf/Devin、Antigravity和DeepSeek Harness五端正文查找。Codex覆盖会话目录和归档目录里的明文、压缩历史，其它端使用各自来源适配器。结果按来源和对话分组，提供命中轮次、原文片段、各词出现次数、命中消息数和来源版本。默认读取真实用户与主助手正文，工具和子代理内容按 `messageRoles` 选择。五端差异及完整性字段见[五端搜索与范围读取](five-host-search.md)。
 
 ## 先搜索，再展开命中轮次
 
-启动时用 `conversationId` 指定当前调用者的稳定 ID。`conversationIds` 用于限定目标对话，省略时搜索全部本地候选；`workspaces` 可限定一个或多个工作区。
+启动时用 `conversationId` 指定当前调用者的稳定 ID，单端必须显式填写具体 `dataChain`，多端用 `dataChains`，当前端也填写具体值，不省略或用 `auto`。`conversationIds` 用于限定目标对话，省略时搜索所选端的全部本地候选；`workspaces` 可限定一个或多个工作区。
 
 ```json
 {
@@ -42,7 +42,8 @@
 ```json
 {
   "action": "read_hit",
-  "conversationId": "matched-thread-id",
+  "conversationId": "current-thread-id",
+  "conversationIds": ["matched-thread-id"],
   "dataChain": "codex",
   "sourceRevision": "matched-source-revision",
   "startRound": 12,
@@ -74,7 +75,7 @@
 
 ## 已知目标时直接读取
 
-`read_fast` 无需先等待完整 `fetch`。`conversationId` 仍是当前调用者，`conversationIds` 可指定一个目标，省略时读取当前对话。
+`read_fast` 无需先等待完整 `fetch`。`conversationId` 仍是当前调用者，`conversationIds` 明确指定一个目标，同时填写该目标的具体 `dataChain`。
 
 ```json
 {
@@ -88,9 +89,11 @@
 
 也可使用 `startRound/endRound`，与 `lastRounds` 择一。只给 `startRound` 时读取该单轮，冷热路径保持相同范围。有效正文缓存可直接复用；旧缓存已提供规范轮次映射时，只展开请求所需的旧轮次，完整正文准备沿独立任务继续。无轮次映射时，读取晚期轮次或最后几轮仍需确定采用历史的正式轮次。首次准备、已有缓存读取和增量更新的时间分别记录。
 
-默认并行准备完整正文缓存，响应中的 `cachePreparation.taskId` 可用 `search_all_status/cancel/resume` 管理；`prepareCache=false` 只读取所需范围。重复请求按调用者和目标复用健康准备任务。完整正文缓存与含工具详情的旧 `fetch` 快照分别保存，详细原文仍沿原 `fetch/read` 能力读取。
+默认的`read_fast(lastRounds=N)`返回分段准备任务，使用原 `taskId` 调用 `prepare_status/prepare_cancel/prepare_resume`，`prepare_status`以`afterProgressRevision`等待新增就绪内容。`prepare`的`buildOrder="latest|oldest"`选择近期或早期优先。就绪后读取末N轮用原`taskId`与`lastRounds`，省略`rangeRef`；固定引用重读或提取用原`taskId`与`rangeRef`，返回该引用的一轮，`locate_ready`也必须同时传两项。`search_ready`的`rangeRef`只选择缓存版本，查询范围由`blockId/startRound/endRound`限定。其余历史继续准备；`prepareCache=false`只准备所需范围。
 
-`requestedRangeComplete` 表示本次请求范围已读完，`fullSourceProjectionComplete` 表示完整来源正文投影已建立。范围读取成功后，完整准备可以继续后台运行。完整缓存发布失败时保留上一份已验证结果及失败状态。
+指定`startRound/endRound`或显式`progressive=false`时，`read_fast`直接返回正文；如果带`cachePreparation.taskId`，该任务使用`search_all_status/cancel/resume`。`read_fast`的`source`省略或填写`auto/local`，不使用`forceRefresh=true`；强刷仅用于新建`search_all`，旧完整缓存使用旧`search/read(source="cache")`，LS来源通过支持它的旧入口读取。根据实际响应的`next`与任务种类选择操作，分段准备任务和搜索缓存任务不能混用。重复请求按调用者和目标复用健康任务，含工具详情的完整原文仍可沿原`fetch/read`读取。
+
+分段准备响应的`requestedRangeComplete`表示本次请求范围已读完并经来源确认，`fullSourceComplete`表示完整来源已校验并发布；兼容直接读取响应的`fullSourceProjectionComplete`表示该来源正文投影完整。相对轮号只属于对应的`rangeRef`块，未核实总轮次或身份时保留部分覆盖诊断。范围读取成功后，完整准备可以继续后台运行。完整缓存发布失败时保留上一份已验证结果及失败状态。
 
 明文与压缩副本同时存在时，完整读取核验完整副本，提前返回的范围读取核验所采用的字节前缀；范围外内容继续保留为未完整读取。复用缓存前也会检查新增副本及原来源身份。图片、文件与媒体引用在直接读取和旧缓存复用中保留，内联二进制仅保留哈希及引用元信息。
 

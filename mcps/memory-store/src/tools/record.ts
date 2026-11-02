@@ -1505,9 +1505,9 @@ export function registerRecord(server: McpServer): void {
     ensureRecordRecoveryHandlersRegistered();
     server.tool(
         "record_manage",
-        `管理对话记录（Record）。Record 是对话的结构化过程日志，由 Flash 自动生成，抗 LS 过期。
+        `管理对话记录（Record）。Record 是对话的结构化过程日志，按模型链路生成并保存来源和版本。
 action:
-- update: 触发 Record 生成/更新（拉取对话内容 → Flash 生成）
+- update: 触发 Record 生成/更新（拉取对话内容 → 按 modelChain 生成）
 - list: 列出工作区下所有 Record 概览
 - read: 读取指定 Record（支持行范围）
 - search: 在 Record 中搜索关键词
